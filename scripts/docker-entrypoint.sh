@@ -24,14 +24,16 @@ ensure_bin() {
   name="$1"
   dest="$ROOT/bin/$name"
   src="$IMAGE_BIN/$name"
-  if [ -f "$src" ]; then
-    cp "$src" "$dest"
-    chmod 755 "$dest"
+  if [ ! -f "$src" ]; then
+    if [ -f "$dest" ]; then
+      chmod 755 "$dest" || true
+    fi
     return 0
   fi
-  if [ -f "$dest" ]; then
-    chmod 755 "$dest" || true
-  fi
+  tmp="$dest.new"
+  cp "$src" "$tmp"
+  chmod 755 "$tmp"
+  mv -f "$tmp" "$dest"
 }
 ensure_bin kin-kernel
 ensure_bin kin-egress
