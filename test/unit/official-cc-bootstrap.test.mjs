@@ -534,7 +534,7 @@ test('settings persist keeps sync_telemetry explicit on and off', () => {
   assert.equal(back.wipe, false)
 })
 
-test('repo routing.json and the frozen console expose init telemetry sync', () => {
+test('repo routing.json and the Vite console expose init telemetry sync', () => {
   const here = path.dirname(fileURLToPath(import.meta.url))
   const gw = path.resolve(here, '../..')
   const routing = JSON.parse(fs.readFileSync(path.join(gw, 'src/config/routing.json'), 'utf8'))
@@ -543,19 +543,21 @@ test('repo routing.json and the frozen console expose init telemetry sync', () =
   assert.equal(routing.official_cc.inference, 'cli-hop')
   assert.equal(routing.official_cc.memory, '500m')
 
-  const canonical = path.join(gw, 'public/console.html')
-  assert.ok(fs.existsSync(canonical), 'public/console.html (frozen emergency console) must exist')
-  const html = fs.readFileSync(canonical, 'utf8')
-  assert.match(html, /id="occ_sync_tel"/)
-  assert.match(html, /id="occ_resident"/)
-  assert.match(html, /sync_telemetry/)
-  assert.match(html, /同步遥测/)
-  assert.match(html, /hello 后常驻/)
-  assert.match(html, /500 MB（推荐）/)
-  assert.match(html, /settings: \['设置'/)
-  assert.match(html, /telemetry: '写入遥测'/)
-  assert.match(html, /already_initialized/)
-  assert.match(html, /此槽已初装过/)
+  const pane = fs.readFileSync(path.join(gw, 'web/src/features/settings/official-cc-pane.tsx'), 'utf8')
+  assert.match(pane, /id=\{`occ-\$\{key\}`\}/)
+  assert.match(pane, /id='occ-resident'/)
+  assert.match(pane, /sync_telemetry/)
+  assert.match(pane, /同步遥测/)
+  assert.match(pane, /hello 后常驻/)
+  assert.match(pane, /500 MB（推荐）/)
+
+  const nav = fs.readFileSync(path.join(gw, 'web/src/config/nav.ts'), 'utf8')
+  assert.match(nav, /settings: '设置'/)
+
+  const card = fs.readFileSync(path.join(gw, 'web/src/features/vm/official-cc-card.tsx'), 'utf8')
+  assert.match(card, /telemetry: '写入遥测'/)
+  assert.match(card, /already_initialized/)
+  assert.match(card, /此槽已初装过/)
 })
 
 function writeOfficialClaudeBin(home) {

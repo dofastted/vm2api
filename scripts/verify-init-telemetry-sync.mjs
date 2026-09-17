@@ -171,11 +171,11 @@ function liveFiles() {
   const routing = JSON.parse(fs.readFileSync(routingFile, 'utf8'))
   const occ = normalizeOfficialCcConfig(routing.official_cc)
   record('routing.json sync_telemetry default on', occ.sync_telemetry === true)
-  const canonical = path.join(projectRoot, 'public/console.html')
-  const exists = fs.existsSync(canonical)
-  const html = exists ? fs.readFileSync(canonical, 'utf8') : ''
-  const htmlOk = exists && html.includes('occ_sync_tel') && html.includes('同步遥测') && html.includes('写入遥测')
-  record(`frozen console copy ${canonical}`, htmlOk)
+  const pane = path.join(projectRoot, 'web/src/features/settings/official-cc-pane.tsx')
+  const exists = fs.existsSync(pane)
+  const html = exists ? fs.readFileSync(pane, 'utf8') : ''
+  const htmlOk = exists && html.includes('occ-') && html.includes('同步遥测') && html.includes('sync_telemetry')
+  record(`Vite official-cc pane ${pane}`, htmlOk)
   return htmlOk
 }
 
