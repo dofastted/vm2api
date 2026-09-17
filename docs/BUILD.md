@@ -1,6 +1,6 @@
 # 版本与构建
 
-源码和 linux amd64 `bin/kin-{kernel,egress,worker,codex-kernel}`、`share/wrap-cli` 进 git。GitHub Release 仍挂一份 ELF。当前发布线：**1.1.3**（tag `v1.1.3`）。
+源码和 linux amd64 `bin/kin-{kernel,egress,worker,codex-kernel}`、`share/wrap-cli` 进 git。GitHub Release 仍挂一份 ELF。当前发布线：**1.1.4**（tag `v1.1.4`）。
 
 ## 版本怎么记
 
@@ -18,8 +18,8 @@
 仓库要有 `contents: write`。流程在 `.github/workflows/release.yml`。
 
 ```bash
-git tag -a v1.1.3 -m "vm2api v1.1.3"
-git push origin v1.1.3
+git tag -a v1.1.4 -m "vm2api v1.1.4"
+git push origin v1.1.4
 ```
 
 `v*` tag 推上去之后，Actions 在 `ubuntu-latest` 编 linux amd64，并挂到该 tag 的 Release：

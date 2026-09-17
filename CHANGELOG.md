@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.1.4 — 2026-09-17
+
+补齐 cli-hop CI 夹具，和源仓 simulated job_error / CONNECT 桥一致。
+
+- simulated CLI 对 `[job_error]` 发 `kin_job_error`，槽可回收
+- 补回 `scripts/http_to_socks.py`，适配 `crates/kin-kernel` 布局
+
 ## 1.1.3 — 2026-09-17
 
 gateway-worker 对齐源仓：local_cli 走 wrap CLI，不再 HTTP hop 到 Anthropic。
