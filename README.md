@@ -1,13 +1,12 @@
 # vm2api
 
 **把 Setup Token 做成 Console 可用 API。**  
-虚拟机拟真 + Claude Code 原生 subagent。Claude 看到的是 **Console API**，不是 OAuth，因此 **0 提示词注入**。
+虚拟机拟真 + Claude Code 原生 subagent。**0 提示词注入**。
 
 [![Release](https://img.shields.io/github/v/release/dofastted/vm2api?display_name=tag)](https://github.com/dofastted/vm2api/releases)
 [![License](https://img.shields.io/badge/License-Noncommercial-yellow.svg)](LICENSE)
 [![Telegram](https://img.shields.io/badge/Telegram-@VM2API-blue?logo=telegram)](https://t.me/VM2API)
 
-控制面清洗协议、调度槽位。推理在虚拟机里走 Claude Code 原生 subagent，再 TCP 打到 Console API。回包原样给调用方。
 
 > **许可**：个人学习与非商用自建可用。**商用必须先取得书面授权**。联系 [Telegram @VM2API](https://t.me/VM2API)。全文见 [LICENSE](LICENSE)。
 
