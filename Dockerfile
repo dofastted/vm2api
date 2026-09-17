@@ -1,4 +1,4 @@
-# Control plane only. Slot guests still run on the host Docker engine.
+# Control plane. linux amd64 bins ship in git (bin/kin-*). Slot guests run on the host engine.
 FROM node:22-bookworm-slim AS web
 WORKDIR /web
 RUN corepack enable && corepack prepare pnpm@10.18.2 --activate
@@ -18,9 +18,11 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY src ./src
 COPY scripts ./scripts
+COPY docker/kin-os ./docker/kin-os
 COPY --from=web /web/dist ./web/dist
+COPY bin/kin-kernel bin/kin-egress bin/kin-worker /opt/vm2api/image-bin/
 COPY scripts/docker-entrypoint.sh /usr/local/bin/vm2api-entrypoint
-RUN chmod +x /usr/local/bin/vm2api-entrypoint \
+RUN chmod 755 /usr/local/bin/vm2api-entrypoint /opt/vm2api/image-bin/kin-kernel /opt/vm2api/image-bin/kin-egress /opt/vm2api/image-bin/kin-worker \
   && mkdir -p /opt/vm2api/vms /opt/vm2api/data /opt/vm2api/bin
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \

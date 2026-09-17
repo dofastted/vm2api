@@ -15,7 +15,11 @@ hypervisor/*.env
 **/.env.*
 !.env.example
 *.bak*
-bin/
+bin/*
+!bin/kin-kernel
+!bin/kin-egress
+!bin/kin-worker
+share/
 .workflow/
 __pycache__/
 web/dist/

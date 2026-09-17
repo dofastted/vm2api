@@ -3,7 +3,10 @@
 node_modules
 web/node_modules
 web/dist
-bin
+bin/*
+!bin/kin-kernel
+!bin/kin-egress
+!bin/kin-worker
 vms
 data
 .env

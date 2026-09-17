@@ -71,7 +71,7 @@ export VM2API_DB_SECRET='再换一串，加密库用'
 | 在容器里 | 必须在宿主机 |
 |---|---|
 | Node 控制面、`/console`、`/v1` | Docker 引擎、槽位容器、`kin-os/*` 客户镜像 |
-| `docker` CLI（经 `docker.sock`） | Release 二进制目录 `bin/`（挂进去，**755**） |
+| `docker` CLI（经 `docker.sock`） | `./bin`（compose 从仓内 `bin/kin-*` 拷入，**755**） |
 | `kin-egress` 进程 + iptables（`network_mode: host` + `NET_ADMIN`） | 桥接网卡、透明出口 |
 
 约束：
@@ -79,8 +79,8 @@ export VM2API_DB_SECRET='再换一串，加密库用'
 1. 仓库放在 **`/opt/vm2api`**。槽位 `-v /opt/vm2api/vms/…` 由宿主机 Docker 解释，内外路径必须相同。
 2. `network_mode: host`。远程 SOCKS 出口要在主机网络命名空间里 REDIRECT。
 3. 挂 `/var/run/docker.sock`。这等于给容器宿主机级 Docker 权限。
-4. 把 `kin-kernel` / `kin-egress` / `kin-worker` 放进 `./bin`（[Release](https://github.com/dofastted/vm2api/releases)），`chmod 755`。槽 UID 是 `10000+序号`，`700` 会 `permission denied`。
-5. 槽位镜像 `kin-os/ubuntu:24.04` 等要已经在宿主机 `docker images` 里。Compose **不**编这些 OS；用 `node docker/kin-os/build.mjs ubuntu`（不加参数编四套）。
+4. 仓内已有 linux amd64 的 `bin/kin-kernel` / `kin-egress` / `kin-worker`。入口脚本拷到挂载的 `./bin` 并 `chmod 755`。槽 UID 是 `10000+序号`，`700` 会 `permission denied`。
+5. 缺 `kin-os/ubuntu:24.04` 时入口脚本会编。其它 OS：`node docker/kin-os/build.mjs`（不加参数编四套）。
 
 ```bash
 git clone https://github.com/dofastted/vm2api.git /opt/vm2api
@@ -89,11 +89,6 @@ cp .env.example .env
 chmod 600 .env
 # 填写三项密钥
 
-mkdir -p bin
-# 下载 v1.1.1 linux amd64 到 bin/ 后：
-chmod 755 bin/kin-kernel bin/kin-egress bin/kin-worker
-
-node docker/kin-os/build.mjs ubuntu
 docker compose up -d --build
 curl -sS --noproxy '*' http://127.0.0.1:8787/health
 ```

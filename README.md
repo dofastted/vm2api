@@ -52,19 +52,12 @@ cp .env.example .env
 chmod 600 .env
 # 填写 VM2API_API_KEY / VM2API_ADMIN_PASSWORD / VM2API_DB_SECRET
 
-mkdir -p bin
-# 从 https://github.com/dofastted/vm2api/releases 取 linux amd64
-# kin-kernel / kin-egress / kin-worker 放进 bin/
-chmod 755 bin/kin-kernel bin/kin-egress bin/kin-worker
-
-# 宿主机槽位镜像（Compose 只编控制面）
-node docker/kin-os/build.mjs ubuntu
-
 docker compose up -d --build
 curl -sS --noproxy '*' http://127.0.0.1:8787/health
 ```
 
-`bin/` 必须 **755**。槽进程 UID 是 `10000+序号`，`chmod +x` 若得到 `700` 会 `permission denied`。
+`--build` 拷仓内 `bin/kin-kernel` / `kin-egress` / `kin-worker` 到 `./bin`（**755**）。缺槽位镜像时入口脚本编 `kin-os/ubuntu:24.04`。其它发行版：`node docker/kin-os/build.mjs`。槽 UID 是 `10000+序号`，不要 `700`。
+
 
 Docker Desktop（含 WSL2）的 host 网络在 Desktop Linux VM 里，WSL/macOS 的 `127.0.0.1:8787` 可能连不上。改用：
 

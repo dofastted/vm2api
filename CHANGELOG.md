@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 仓内携带 linux amd64 `bin/kin-kernel` / `kin-egress` / `kin-worker`；Compose 直接拷贝，启动写入 `./bin` 并在缺镜像时编 `kin-os/ubuntu:24.04`
+
 ## 1.1.1 — 2026-09-17
 
 补回授权链接换票缺件。

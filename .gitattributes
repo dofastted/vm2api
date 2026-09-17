@@ -4,3 +4,6 @@ Dockerfile text eol=lf
 docker-compose.yml text eol=lf
 .env.example text eol=lf
 .dockerignore text eol=lf
+bin/kin-kernel binary
+bin/kin-egress binary
+bin/kin-worker binary

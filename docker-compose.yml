@@ -1,6 +1,6 @@
 # 控制面容器 + 宿主机 Docker 管槽位。
 # 仓库请放在 /opt/vm2api，否则槽位 -v 路径对不上。
-# 需要：Linux、Docker、把 Release 二进制放到 ./bin/
+# `docker compose build` 拷仓内 bin/kin-*；启动写入 ./bin 并在缺镜像时编 kin-os/ubuntu。
 services:
   vm2api:
     image: vm2api:1.1.1
