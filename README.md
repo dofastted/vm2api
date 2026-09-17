@@ -43,7 +43,13 @@
 
 ### Docker Compose（推荐）
 
-生产就用这条。槽位跑在**宿主机** Docker 里；控制面进容器：`network_mode: host` + 挂 `docker.sock`，才能建槽、改 iptables。仓库必须在 **`/opt/vm2api`**，和容器内路径一致。
+生产就用这条。仓库必须在 **`/opt/vm2api`**（容器内外路径一致）。
+
+**运行形态（不是一个父容器里一堆子进程）：**
+
+- Compose **只起 1 个** `vm2api` 控制面（面板、`/v1`、调度）
+- 每个**已启动**的槽另起 1 个宿主机容器 `kin-<槽>`（独立家目录 / 出口 / 指纹 / 遥测）
+- 未启动的槽不占容器。`docker ps` 里其它名字是同机别的项目，不是 vm2api
 
 ```bash
 git clone https://github.com/dofastted/vm2api.git /opt/vm2api
@@ -56,7 +62,8 @@ docker compose up -d --build
 curl -sS --noproxy '*' http://127.0.0.1:8787/health
 ```
 
-`--build` 拷仓内 `bin/kin-{kernel,egress,worker,codex-kernel}` 和 `share/wrap-cli`。缺槽位镜像时入口脚本编 `kin-os/ubuntu:24.04`。其它发行版：`node docker/kin-os/build.mjs`。槽 UID 是 `10000+序号`，`bin/kin-*` 不要 `700`。
+`--build` 拷仓内 `bin/kin-{kernel,egress,worker,codex-kernel}` 和 `share/wrap-cli`，**不在服务器上编 Rust/Go**。缺槽位 OS 时入口编 `kin-os/ubuntu:24.04`。其它发行版：`node docker/kin-os/build.mjs`。槽 UID 是 `10000+序号`，`bin/kin-*` 必须 **755**，不要 `700`。
+
 
 
 Docker Desktop（含 WSL2）的 host 网络在 Desktop Linux VM 里，WSL/macOS 的 `127.0.0.1:8787` 可能连不上。改用：
@@ -80,7 +87,7 @@ docker exec vm2api python3 -c 'import urllib.request; print(urllib.request.urlop
    npm run build:web
    ```
 
-   内核 / 网关：从 [GitHub Release](https://github.com/dofastted/vm2api/releases) 取 linux amd64，或本机 `npm run build:kernel && npm run build:egress`。
+   内核 / 网关：仓内 `bin/kin-*` 已是 linux amd64。也可本机重编或从 [Release](https://github.com/dofastted/vm2api/releases) 覆盖。
 
 2. **写环境变量和占位槽**
 
@@ -210,14 +217,14 @@ VM2API_DB_SECRET=       # 库加密
 
 ## 版本与构建
 
-当前发布：**v1.1.1**
+当前发布：**v1.1.2**
 
 ```bash
-git tag -a v1.1.1 -m "vm2api v1.1.1"
-git push origin v1.1.1
+git tag -a v1.1.2 -m "vm2api v1.1.2"
+git push origin v1.1.2
 ```
 
-`v*` tag 会触发 [Release 工作流](.github/workflows/release.yml)，编 linux amd64：`kin-kernel`、`kin-egress`、`kin-worker`（telemetry）。本机构建与升级步骤：[BUILD.md](docs/BUILD.md)
+`v*` tag 会触发 [Release 工作流](.github/workflows/release.yml)，再挂一份 linux amd64 ELF。仓内 `bin/` 已可直接部署。步骤：[BUILD.md](docs/BUILD.md)
 
 
 ---
@@ -261,10 +268,14 @@ git push origin v1.1.1
    仓库在 `/opt/vm2api`、`bin/kin-*` 为 **755**、宿主机有 `kin-os/*`、挂了 `docker.sock`。先添加本地出口再启动槽。1.1.0 已对齐 egress 的 `name`/`network` 字段。
 
 8. **`exec: "/usr/local/bin/kin-kernel": permission denied`？**  
-   `chmod 755 bin/kin-kernel bin/kin-egress bin/kin-worker`。不要用 `700`。
+   `chmod 755 bin/kin-kernel bin/kin-egress bin/kin-worker bin/kin-codex-kernel`。不要用 `700`。
 
 9. **本机 `curl 127.0.0.1:8787` 失败，容器却是 healthy？**  
    Docker Desktop 的 `network_mode: host` 不在 WSL/macOS localhost。用 `docker exec vm2api …` 探活，或改 Ubuntu + Docker Engine。
+
+10. **`docker ps` 怎么这么多容器？**  
+    vm2api 只要 `vm2api` + 每个已启动槽一个 `kin-*`。postgres / newapi / hermes 等同机其它栈，不是本项目子进程。不能把多槽塞进一个容器当多进程，否则指纹/遥测糊成一台。
+
 
 ---
 

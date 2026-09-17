@@ -23,16 +23,19 @@ Debian 12（glibc 2.36）上新 Claude kernel 常常起不来，优先 Ubuntu 24
 
 ```text
 /opt/vm2api/
-  src/server.mjs      控制面
-  web/dist/           管理台（Compose 镜像内已构建）
-  bin/kin-kernel      Rust 内核（必须 755）
-  bin/kin-egress      远程 SOCKS5 透明网关
-  bin/kin-worker      只跑 telemetry，不是推理 hop
-  docker/kin-os/      槽位客户镜像配方（宿主机编）
-  vms/                槽位 JSON + 槽家目录
-  data/               SQLite 等
+  src/server.mjs           控制面
+  web/dist/                管理台（Compose 镜像内已构建）
+  bin/kin-kernel           Rust 内核（仓内带，必须 755）
+  bin/kin-egress           远程 SOCKS5 透明网关
+  bin/kin-worker           只跑 telemetry，不是推理 hop
+  bin/kin-codex-kernel     Codex 槽
+  share/wrap-cli/          wrap 母样本（bun / cli-dist / kernel.bin）
+  docker/kin-os/           槽位客户镜像配方
+  vms/                     槽位 JSON + 槽家目录
+  data/                    SQLite 等
   src/config/routing.json
 ```
+
 
 
 环境变量 `KIN_PROJECT_ROOT` 默认就是仓库根。`KIN_DATA_DIR` 不设时落在 `src/data`；自建请显式设成仓库 `data/`。
@@ -66,7 +69,13 @@ export VM2API_DB_SECRET='再换一串，加密库用'
 
 ## Docker Compose
 
-**推荐。** 控制面用 Compose 起；槽位仍由**宿主机** Docker 引擎创建。这不是把整套推理塞进一个无特权应用容器。
+**推荐。** 控制面用 Compose 起；槽位仍由**宿主机** Docker 引擎创建。这不是把整套推理塞进一个无特权应用容器，也不是「一个父 Docker 里多个子进程」。
+
+| 该有的容器 | 说明 |
+|---|---|
+| `vm2api` | 控制面。Compose **只起这一个** |
+| `kin-<槽>` | 每个**已启动**的账号槽 1 个。独立家目录、出口、指纹、遥测 |
+| （没有） | 未启动的槽、同机其它项目的 postgres/newapi/hermes |
 
 | 在容器里 | 必须在宿主机 |
 |---|---|
@@ -81,6 +90,7 @@ export VM2API_DB_SECRET='再换一串，加密库用'
 3. 挂 `/var/run/docker.sock`。这等于给容器宿主机级 Docker 权限。
 4. 仓内已有 linux amd64 `bin/kin-{kernel,egress,worker,codex-kernel}` 和 wrap 母样本 `share/wrap-cli`。入口脚本拷到挂载目录并 `chmod 755`。槽 UID 是 `10000+序号`，`700` 会 `permission denied`。
 5. 缺 `kin-os/ubuntu:24.04` 时入口脚本会编。其它 OS：`node docker/kin-os/build.mjs`（不加参数编四套）。
+
 
 ```bash
 git clone https://github.com/dofastted/vm2api.git /opt/vm2api

@@ -2,7 +2,14 @@
 
 ## Unreleased
 
-- 仓内携带全部 Docker 部署二进制：`bin/kin-{kernel,egress,worker,codex-kernel}` 与 `share/wrap-cli`；Compose 拷贝到 `./bin` / `./share`，缺镜像时编 `kin-os/ubuntu:24.04`
+## 1.1.2 — 2026-09-17
+
+仓内携带部署二进制；文档写清运行形态。
+
+- git 带 linux amd64 `bin/kin-{kernel,egress,worker,codex-kernel}` 和 wrap 母样本 `share/wrap-cli`
+- Compose 拷到 `./bin` / `./share`，不再在服务器上编 Rust/Go；缺 `kin-os/ubuntu:24.04` 才编槽位 OS
+- 入口用 `mv` 替换占用中的 `kin-kernel`，避免 `Text file busy` 重启循环
+- 文档：1 个控制面容器 + 每个已启动槽 1 个 `kin-*` 容器，不是父容器多进程
 
 ## 1.1.1 — 2026-09-17
 
