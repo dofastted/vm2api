@@ -1,0 +1,37 @@
+{
+  "model": "claude-sonnet-5",
+  "max_tokens": 1024,
+  "stream": false,
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "查询指定城市的实时天气。当用户询问某个城市的天气、温度或气象情况时调用此工具。",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string",
+            "description": "需要查询天气的城市名称，例如：上海、东京、New York"
+          },
+          "unit": {
+            "type": "string",
+            "enum": ["celsius", "fahrenheit"],
+            "description": "温度单位，celsius 表示摄氏度，fahrenheit 表示华氏度"
+          }
+        },
+        "required": ["city", "unit"],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "tool_choice": {
+    "type": "tool",
+    "name": "get_weather"
+  },
+  "messages": [
+    {
+      "role": "user",
+      "content": "请查询东京现在的天气，使用摄氏度。"
+    }
+  ]
+}

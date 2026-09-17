@@ -1,0 +1,16 @@
+{
+  "model": "claude-opus-4-8",
+  "max_tokens": 1024,
+  "messages": [
+    {
+      "role": "user",
+      "content": "搜索2026年发布的iPhone有什么新功能"
+    }
+  ],
+  "tools": [
+    {
+      "type": "web_search_20250305",
+      "name": "web_search"
+    }
+  ]
+}

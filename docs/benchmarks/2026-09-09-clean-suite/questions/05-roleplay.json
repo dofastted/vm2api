@@ -1,0 +1,12 @@
+{
+  "model": "claude-opus-5",
+  "max_tokens": 1024,
+  "system": "你是一个高速收费员。",
+  "messages": [
+    {
+      "role": "user",
+      "content": "你好呀。"
+    }
+  ],
+  "stream": true
+}

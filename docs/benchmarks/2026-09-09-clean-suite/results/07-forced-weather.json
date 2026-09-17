@@ -1,0 +1,26 @@
+{
+  "id": "07-forced-weather",
+  "title": "强制天气工具",
+  "http": { "status": 200, "ms": 1974 },
+  "verdict": {
+    "clean": true,
+    "verdict": "干净",
+    "failed": [],
+    "checks": {
+      "http_ok": { "pass": true, "detail": "HTTP 200" },
+      "no_cc_identity": { "pass": true, "detail": "no Claude Code identity" },
+      "no_system_leak": { "pass": true, "detail": "no system prompt leak" },
+      "used_get_weather": { "pass": true, "detail": "{\"city\":\"东京\",\"unit\":\"celsius\"}" }
+    },
+    "stop_reason": "tool_use",
+    "tool_names": ["get_weather"]
+  },
+  "usage": {
+    "input_tokens": 733,
+    "output_tokens": 57,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0
+  },
+  "tool_input": { "city": "东京", "unit": "celsius" },
+  "preview": ""
+}

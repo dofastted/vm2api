@@ -1,0 +1,71 @@
+{
+  "id": "2026-09-09T140937225Z",
+  "engine": "rust-cli-hop",
+  "target": "http://127.0.0.1:8787/v1/messages",
+  "userAgent": "kin-console-test/1.0",
+  "summary": {
+    "total": 7,
+    "clean": 6,
+    "dirty": 1
+  },
+  "cases": [
+    {
+      "id": "01-tools-list",
+      "verdict": "干净",
+      "status": 200,
+      "ms": 5152,
+      "input_tokens": 43
+    },
+    {
+      "id": "02-vision",
+      "verdict": "干净",
+      "status": 200,
+      "ms": 8512,
+      "input_tokens": 40
+    },
+    {
+      "id": "03-web-search",
+      "verdict": "干净",
+      "status": 200,
+      "ms": 21567,
+      "input_tokens": 93,
+      "tools": ["web_search", "web_search", "web_search", "web_search"]
+    },
+    {
+      "id": "04-identity",
+      "verdict": "干净",
+      "status": 200,
+      "ms": 20846,
+      "input_tokens": 31
+    },
+    {
+      "id": "05-roleplay",
+      "verdict": "干净",
+      "status": 200,
+      "ms": 9000,
+      "input_tokens": 40
+    },
+    {
+      "id": "06-prompt-leak",
+      "verdict": "不干净",
+      "status": 200,
+      "ms": 21900,
+      "input_tokens": 39,
+      "fail": ["no_cc_identity"]
+    },
+    {
+      "id": "07-forced-weather",
+      "verdict": "干净",
+      "status": 200,
+      "ms": 2000,
+      "input_tokens": 733
+    }
+  ],
+  "peer_input_tokens": {
+    "01": 25,
+    "04": 31,
+    "05": 22,
+    "06": 21,
+    "07": 715
+  }
+}

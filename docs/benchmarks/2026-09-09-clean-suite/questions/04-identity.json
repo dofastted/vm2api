@@ -1,0 +1,18 @@
+{
+  "model": "claude-opus-5",
+  "max_tokens": 128000,
+  "messages": [
+    {
+      "role": "user",
+      "content": "你好！你是什么身份、什么模型？具体运行环境及版本？"
+    }
+  ],
+  "thinking": {
+    "type": "adaptive",
+    "display": "summarized"
+  },
+  "output_config": {
+    "effort": "max"
+  },
+  "stream": false
+}

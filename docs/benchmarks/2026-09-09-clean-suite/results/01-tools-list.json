@@ -1,0 +1,26 @@
+{
+  "id": "01-tools-list",
+  "title": "工具列表",
+  "http": { "status": 200, "ms": 5152 },
+  "verdict": {
+    "clean": true,
+    "verdict": "干净",
+    "failed": [],
+    "checks": {
+      "http_ok": { "pass": true, "detail": "HTTP 200" },
+      "has_visible_text": { "pass": true, "detail": "text_len=128" },
+      "no_cc_identity": { "pass": true, "detail": "no Claude Code identity" },
+      "no_cc_tools": { "pass": true, "detail": "no Claude Code tools" },
+      "no_system_leak": { "pass": true, "detail": "no system prompt leak" }
+    },
+    "stop_reason": "end_turn",
+    "tool_names": []
+  },
+  "usage": {
+    "input_tokens": 43,
+    "output_tokens": 214,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0
+  },
+  "preview": "我目前没有可调用的工具。在这次对话中，系统没有提供任何工具定义或函数供我使用，我只能通过文本对话与您交流。\n\n如果您需要我协助完成某项任务（比如计算、写作、分析、编程等），我可以直接通过对话来帮助您，但无法调用外部工具、访问互联网、执行代码或操作文件系统。"
+}

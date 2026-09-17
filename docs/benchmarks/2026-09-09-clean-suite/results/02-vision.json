@@ -1,0 +1,26 @@
+{
+  "id": "02-vision",
+  "title": "识图",
+  "http": { "status": 200, "ms": 8512 },
+  "verdict": {
+    "clean": true,
+    "verdict": "干净",
+    "failed": [],
+    "checks": {
+      "http_ok": { "pass": true, "detail": "HTTP 200" },
+      "has_visible_text": { "pass": true, "detail": "text_len=170" },
+      "no_cc_identity": { "pass": true, "detail": "no Claude Code identity" },
+      "no_system_leak": { "pass": true, "detail": "no system prompt leak" },
+      "vision_mentions_image": { "pass": true, "detail": "mentions image content" }
+    },
+    "stop_reason": null,
+    "tool_names": []
+  },
+  "usage": {
+    "input_tokens": 40,
+    "output_tokens": 9,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0
+  },
+  "preview": "# Google Doodle（Google 涂鸦）\n\n这是一个 **Google Doodle**，即 Google 为了纪念特定事件或节日而在其搜索首页上展示的特别版 logo。\n\n这个 Doodle 的特点是：\n- 保留了 **Google** 的字母标识\n- 融入了一个 **⚽ 足球** 的元素\n- 采用了 **紫色** 的配色方"
+}

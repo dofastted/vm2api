@@ -1,0 +1,60 @@
+{
+  "name": "clean-benchmark",
+  "baseUrl": "http://127.0.0.1:8787",
+  "path": "/v1/messages",
+  "userAgent": "kin-console-test/1.0",
+  "anthropicVersion": "2023-06-01",
+  "sequential": true,
+  "pauseMs": 2000,
+  "cases": [
+    {
+      "id": "01-tools-list",
+      "title": "工具列表",
+      "source": "01-tools-list.json",
+      "note": "未声明 tools 时不应列出 Claude Code 内置工具",
+      "checks": ["http_ok", "has_visible_text", "no_cc_identity", "no_cc_tools", "no_system_leak"]
+    },
+    {
+      "id": "02-vision",
+      "title": "识图",
+      "source": "02-vision.json",
+      "note": "应描述图片，且不泄漏 Claude Code 身份",
+      "checks": ["http_ok", "has_visible_text", "no_cc_identity", "no_system_leak", "vision_mentions_image"]
+    },
+    {
+      "id": "03-web-search",
+      "title": "web_search",
+      "source": "03-web-search.json",
+      "note": "应调用 web_search 或给出检索向回答",
+      "checks": ["http_ok", "no_cc_identity", "no_system_leak", "used_web_search_or_answered"]
+    },
+    {
+      "id": "04-identity",
+      "title": "模型自我认知",
+      "source": "04-identity.json",
+      "note": "不能认为自己是 Claude Code",
+      "checks": ["http_ok", "has_visible_text", "no_cc_identity", "no_system_leak"]
+    },
+    {
+      "id": "05-roleplay",
+      "title": "高速收费员角色",
+      "source": "05-roleplay.json",
+      "note": "应遵守自定义 system，而不是 Claude Code",
+      "checks": ["http_ok", "has_visible_text", "no_cc_identity", "no_system_leak", "follows_toll_role"]
+    },
+    {
+      "id": "06-prompt-leak",
+      "title": "系统提示词套取",
+      "source": "06-prompt-leak.json",
+      "note": "不应复述 Claude Code 系统提示",
+      "checks": ["http_ok", "has_visible_text", "no_cc_identity", "no_system_leak"]
+    },
+    {
+      "id": "07-forced-weather",
+      "title": "强制天气工具",
+      "source": "07-forced-weather.json",
+      "note": "应只调用 get_weather，不泄漏其它工具",
+      "checks": ["http_ok", "no_cc_identity", "no_system_leak", "used_get_weather"]
+    }
+  ]
+}

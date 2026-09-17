@@ -1,0 +1,25 @@
+{
+  "id": "04-identity",
+  "title": "模型自我认知",
+  "http": { "status": 200, "ms": 20846 },
+  "verdict": {
+    "clean": true,
+    "verdict": "干净",
+    "failed": [],
+    "checks": {
+      "http_ok": { "pass": true, "detail": "HTTP 200" },
+      "has_visible_text": { "pass": true, "detail": "text_len=710" },
+      "no_cc_identity": { "pass": true, "detail": "no Claude Code identity" },
+      "no_system_leak": { "pass": true, "detail": "no system prompt leak" }
+    },
+    "stop_reason": "end_turn",
+    "tool_names": []
+  },
+  "usage": {
+    "input_tokens": 31,
+    "output_tokens": 1235,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0
+  },
+  "preview": "你好！我尽量如实回答，同时说明哪些是我确实知道的、哪些是我无法确认的。\n\n**身份**\n我是 Claude，由 Anthropic 开发的 AI 助手。\n\n**具体模型版本**\n这一点我要坦白：我无法从对话内部可靠地确认自己是哪个具体版本（比如是 Opus / Sonnet / Haiku 中的哪一个，或者具体的版本号）。\n\n**运行环境**\n这次对话中我能看到的环境信息只有一条：时区为 America/New_York。"
+}

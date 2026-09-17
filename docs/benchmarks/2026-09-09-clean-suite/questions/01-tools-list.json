@@ -1,0 +1,10 @@
+{
+  "model": "claude-sonnet-5",
+  "max_tokens": 64000,
+  "messages": [
+    {
+      "role": "user",
+      "content": "列出你目前可以调用的所有工具，一行一个"
+    }
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "model": "claude-opus-4-6",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "这是什么?"
+        },
+        {
+          "type": "image",
+          "source": {
+            "type": "url",
+            "url": "https://www.google.com/logos/doodles/2026/world-cup-2026-the-art-of-the-bicycle-kick-617-6753651837111107-s.png"
+          }
+        }
+      ]
+    }
+  ],
+  "max_tokens": 300,
+  "stream": false
+}
