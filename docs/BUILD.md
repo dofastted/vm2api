@@ -111,4 +111,4 @@ curl -sS --noproxy '*' http://127.0.0.1:8787/health
 
 ---
 
-交流与支持见仓库 [README](../README.md#交流与支持)。
+交流见仓库 [README](../README.md)。
