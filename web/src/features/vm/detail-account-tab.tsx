@@ -163,7 +163,9 @@ export function VmAccountTab(props: VmAccountTabProps) {
               <Field label={gpt ? 'ChatGPT 账号' : 'UUID'} compact>
                 {gpt ? (
                   <span className='text-sm'>
-                    {String(vm.email || vm.account_uuid || acc.account_id || '—')}
+                    {String(
+                      vm.email || vm.account_uuid || acc.account_id || '—'
+                    )}
                   </span>
                 ) : (
                   <span className='font-mono text-xs'>

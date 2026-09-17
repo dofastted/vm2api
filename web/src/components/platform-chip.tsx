@@ -60,7 +60,7 @@ export function SlotIdentity({
   return (
     <span
       className={cn(
-        'flex min-w-0 max-w-full items-center gap-1.5 overflow-hidden',
+        'flex max-w-full min-w-0 items-center gap-1.5 overflow-hidden',
         compact && 'text-[12px] leading-[1.3] tracking-[-0.01em]',
         className
       )}

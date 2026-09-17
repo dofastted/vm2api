@@ -30,7 +30,9 @@ describe('usedPctOf', () => {
   })
 
   it('falls back to utilization ratio', () => {
-    expect(usedPctOf({ utilization_5h: 0.12, utilization_7d: 0.4 }, '7d')).toBe(40)
+    expect(usedPctOf({ utilization_5h: 0.12, utilization_7d: 0.4 }, '7d')).toBe(
+      40
+    )
   })
 })
 

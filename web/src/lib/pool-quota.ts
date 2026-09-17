@@ -93,7 +93,9 @@ export function poolQuota(vms: Vm[]): {
       usedPct: usedPctOf(vm, '5h'),
       probed: Boolean(
         vm.utilization_5h != null ||
-          vm.codex_usage?.windows?.some((w) => w.id === '5h' && w.used_percent != null),
+        vm.codex_usage?.windows?.some(
+          (w) => w.id === '5h' && w.used_percent != null
+        )
       ),
       resetAt: expiresAtToMs(vm.reset_5h),
     })
@@ -103,7 +105,9 @@ export function poolQuota(vms: Vm[]): {
       usedPct: usedPctOf(vm, '7d'),
       probed: Boolean(
         vm.utilization_7d != null ||
-          vm.codex_usage?.windows?.some((w) => w.id === '7d' && w.used_percent != null),
+        vm.codex_usage?.windows?.some(
+          (w) => w.id === '7d' && w.used_percent != null
+        )
       ),
       resetAt: expiresAtToMs(vm.reset_7d),
     })

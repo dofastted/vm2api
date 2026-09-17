@@ -38,6 +38,8 @@ web/dist/
 .pi/
 .trellis/
 .vscode/
+!web/.vscode/
+!web/.vscode/settings.json
 .agents/
 .codex/
 .impeccable/

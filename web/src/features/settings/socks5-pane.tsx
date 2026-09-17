@@ -13,8 +13,8 @@ export function Socks5Pane() {
         </CardHeader>
         <CardContent className='space-y-2 text-sm text-muted-foreground'>
           <p>
-            一条 SOCKS5 起一台透明网关。egress 是虚拟机的默认路由。槽内只推理，不
-            Dial SOCKS、不设 HTTPS_PROXY。
+            一条 SOCKS5 起一台透明网关。egress
+            是虚拟机的默认路由。槽内只推理，不 Dial SOCKS、不设 HTTPS_PROXY。
           </p>
           <p>
             住宅 NAT 大约 15 分钟掐空闲 TCP。网关 7 分钟无字节拆两边，并开 15s

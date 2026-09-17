@@ -26,9 +26,9 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { PlatformChip, SlotIdentity } from '@/components/platform-chip'
-import { OpenaiPlanBadge } from '@/features/vm/openai-plan-badge'
 import { StatusMark } from '@/components/status-mark'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
+import { OpenaiPlanBadge } from '@/features/vm/openai-plan-badge'
 import { SchedulableSwitch } from '@/features/vm/schedulable-switch'
 import {
   StatusBarOptions,

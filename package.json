@@ -20,8 +20,8 @@
     "build:web": "pnpm -C web build",
     "test:kernel": "cargo test --manifest-path crates/kin-kernel/Cargo.toml && cargo test --manifest-path crates/codex-kernel/Cargo.toml",
     "test:web": "pnpm -C web test",
-    "format": "biome format --write && gofmt -w worker",
-    "format:check": "biome format && node scripts/check-gofmt.mjs"
+    "format": "biome format --write && gofmt -w worker && pnpm -C web format",
+    "format:check": "biome format && node scripts/check-gofmt.mjs && pnpm -C web format:check"
   },
   "dependencies": {
     "node-fetch": "^2.7.0",

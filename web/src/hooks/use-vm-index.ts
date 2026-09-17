@@ -1,7 +1,7 @@
 import { useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { dashboardQueryOptions } from '@/features/overview/queries'
 import { indexVms } from '@/lib/vm-kind'
+import { dashboardQueryOptions } from '@/features/overview/queries'
 
 /** 总览已缓存的槽位表，给日志 / 计费 / 用量拼邮箱和平台徽标。 */
 export function useVmIndex() {

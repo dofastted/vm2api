@@ -282,7 +282,10 @@ export function ProxiesPage() {
           onAddLocal={() => addLocal.mutate()}
           addingLocal={addLocal.isPending}
           hasLocal={list.some(
-            (item) => item.kind === 'local' || item.scheme === 'local' || item.id === 'px-local'
+            (item) =>
+              item.kind === 'local' ||
+              item.scheme === 'local' ||
+              item.id === 'px-local'
           )}
         />
         <ProxyTable

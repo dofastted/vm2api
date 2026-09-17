@@ -69,7 +69,11 @@ export function BillingStrip({
           value={fmtUsd(claudeCost)}
           hint='Anthropic 官方价 · 累计'
         />
-        <StatCell label='GPT' value={fmtUsd(gptCost)} hint='OpenAI 官方价 · 累计' />
+        <StatCell
+          label='GPT'
+          value={fmtUsd(gptCost)}
+          hint='OpenAI 官方价 · 累计'
+        />
       </div>
       {rows.length ? (
         <div className='flex flex-wrap gap-2 border-t bg-card px-4 py-3'>
@@ -77,11 +81,7 @@ export function BillingStrip({
             const vm = row.vm_id ? byId.get(row.vm_id) : undefined
             const chipContent = (
               <>
-                <SlotIdentity
-                  vm={vm}
-                  vmId={row.vm_id}
-                  email={row.email}
-                />
+                <SlotIdentity vm={vm} vmId={row.vm_id} email={row.email} />
                 <b className='font-semibold tabular-nums'>
                   {fmtUsd(row.today_cost || 0)}
                 </b>

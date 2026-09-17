@@ -13,8 +13,8 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { QueryGate } from '@/components/query-gate'
 import { SlotIdentity } from '@/components/platform-chip'
+import { QueryGate } from '@/components/query-gate'
 import { StatusMark } from '@/components/status-mark'
 import { LatencyBreakdownBar } from '@/features/logs/latency-breakdown-bar'
 
@@ -415,12 +415,7 @@ function TraceTab({
   return (
     <div className='space-y-3'>
       {attempts.map((attempt, index) => (
-        <AttemptBlock
-          key={index}
-          attempt={attempt}
-          index={index}
-          vms={vms}
-        />
+        <AttemptBlock key={index} attempt={attempt} index={index} vms={vms} />
       ))}
     </div>
   )

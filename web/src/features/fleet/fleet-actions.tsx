@@ -153,8 +153,8 @@ export function FleetActions() {
             <DialogTitle>全槽更新</DialogTitle>
           </DialogHeader>
           <p className='text-sm text-muted-foreground'>
-            滚动处理全部槽位的 kernel / slot runtime。不重启控制面，不
-            docker rm，不启动 Go worker hop。
+            滚动处理全部槽位的 kernel / slot runtime。不重启控制面，不 docker
+            rm，不启动 Go worker hop。
           </p>
           <p className='text-sm text-muted-foreground'>
             重载会吃到新二进制再采集 guest 特征。KVM

@@ -58,6 +58,15 @@ npm run build:worker      # bin/kin-worker（telemetry）
 # 可选 npm run build:codex-kernel
 ```
 
+格式（和 CI 同一套，全文 LF）：
+
+```bash
+npm run format        # biome src/test/scripts + gofmt worker + prettier web
+npm run format:check
+```
+
+不要对本机 Node 源码跑 Prettier，也不要对 `web/` 跑 Biome。
+
 对应命令：
 
 ```bash

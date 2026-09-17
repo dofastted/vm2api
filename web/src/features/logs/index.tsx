@@ -15,6 +15,7 @@ import {
 } from '@/lib/log-mute'
 import { opsSince } from '@/lib/ops-window'
 import { cn } from '@/lib/utils'
+import { useVmIndex } from '@/hooks/use-vm-index'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -33,7 +34,6 @@ import { Switch } from '@/components/ui/switch'
 import { PageHeader } from '@/components/page-header'
 import { TableSkeleton } from '@/components/page-skeletons'
 import { QueryGate } from '@/components/query-gate'
-import { useVmIndex } from '@/hooks/use-vm-index'
 import { meQueryOptions } from '@/features/auth/queries'
 import {
   LOGS_QUERY_KEY,
@@ -73,8 +73,7 @@ export function LogsPage() {
         kind?: unknown
       }
       return {
-        error_class:
-          typeof raw.error_class === 'string' ? raw.error_class : '',
+        error_class: typeof raw.error_class === 'string' ? raw.error_class : '',
         kind: raw.kind === 'error' ? 'error' : '',
       }
     },

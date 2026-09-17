@@ -74,8 +74,8 @@ export function ApiEndpointsPage() {
       >
         {items.length === 0 ? (
           <p className='rounded-xl border border-dashed p-8 text-center text-sm text-muted-foreground'>
-            还没有直连上游地址。添加一个 base_url + key 池，协议密钥就能按 prefix
-            路由过去。
+            还没有直连上游地址。添加一个 base_url + key 池，协议密钥就能按
+            prefix 路由过去。
           </p>
         ) : (
           <div className='space-y-4'>

@@ -63,9 +63,9 @@ describe('kindFromModel / slotAccountLabel', () => {
     expect(compactEmail('someone.with.a.very.long.name@gmail.com', 22)).toBe(
       'someone.wit…@gmail.com'
     )
-    expect(
-      compactEmail('user@verylongcorporatedomain.example.com', 22)
-    ).toBe('user@example.com')
+    expect(compactEmail('user@verylongcorporatedomain.example.com', 22)).toBe(
+      'user@example.com'
+    )
     expect(compactEmail('no-at-but-extremely-long-label-here', 12)).toBe(
       'no-at-but-e…'
     )

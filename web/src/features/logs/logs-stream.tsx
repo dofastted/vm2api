@@ -225,7 +225,9 @@ export function LogsStream({
                       >
                         <LogRow
                           row={row}
-                          vm={row.vm_id ? vms?.get(String(row.vm_id)) : undefined}
+                          vm={
+                            row.vm_id ? vms?.get(String(row.vm_id)) : undefined
+                          }
                           onOpenDetail={onOpenDetail}
                           showIngress={showIngress}
                           highlighted={newIds.has(rid)}

@@ -9,6 +9,7 @@
     "test": "vitest run",
     "typecheck": "tsc -b",
     "lint": "eslint .",
+    "format": "prettier --write src package.json vite.config.ts eslint.config.js",
     "format:check": "prettier --check src package.json vite.config.ts eslint.config.js",
     "test:contract": "vitest run src/features/vm/engine-contract.test.ts",
     "preview": "vite preview"

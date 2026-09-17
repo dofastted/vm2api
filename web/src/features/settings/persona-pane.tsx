@@ -429,8 +429,8 @@ export function PersonaPane({
         </CardHeader>
         <CardContent className='space-y-2 text-xs text-muted-foreground'>
           <p>
-            <b>缓存 TTL</b>：默认 5m（1.25×）；请求头可升 1h{' '}
-            或入站 <code>cache_control</code> 为 1h 时才升到 1h（2×）。TTL
+            <b>缓存 TTL</b>：默认 5m（1.25×）；请求头可升 1h 或入站{' '}
+            <code>cache_control</code> 为 1h 时才升到 1h（2×）。TTL
             只给断点定时，断点由下面「缓存断点」决定 —— 一个断点都没有时 TTL
             不产生任何缓存。
           </p>

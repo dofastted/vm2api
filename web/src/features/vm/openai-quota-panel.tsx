@@ -1,12 +1,12 @@
 import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { toast } from 'sonner'
 import type { Vm } from '@/types/panel-vm'
+import { toast } from 'sonner'
 import { api } from '@/lib/api'
-import { ConfirmDialog } from '@/components/confirm-dialog'
 import { Button } from '@/components/ui/button'
-import { Meter, ResetAt } from '@/features/vm/detail-section-primitives'
+import { ConfirmDialog } from '@/components/confirm-dialog'
 import { dashboardQueryOptions } from '@/features/overview/queries'
+import { Meter, ResetAt } from '@/features/vm/detail-section-primitives'
 import { vmQueryOptions } from '@/features/vm/queries'
 
 type QuotaPayload = {
@@ -52,7 +52,9 @@ export function OpenaiQuotaPanel({
       await refreshAll()
       const count = Number(data?.reset_credits?.available_count)
       toast.success(
-        Number.isFinite(count) ? `已查询，可用重置券 ${count} 张` : '已刷新 GPT 额度'
+        Number.isFinite(count)
+          ? `已查询，可用重置券 ${count} 张`
+          : '已刷新 GPT 额度'
       )
     },
     onError: (error: Error) => toast.error(error.message),
@@ -104,7 +106,9 @@ export function OpenaiQuotaPanel({
           disabled={busy}
           onClick={() => queryQuota.mutate()}
         >
-          {queryQuota.isPending ? '查询中…' : `查询重置券${credits ? ` ${available}` : ''}`}
+          {queryQuota.isPending
+            ? '查询中…'
+            : `查询重置券${credits ? ` ${available}` : ''}`}
         </Button>
         <Button
           size='sm'

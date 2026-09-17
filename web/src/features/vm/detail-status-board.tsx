@@ -193,7 +193,9 @@ export function VmStatusBoard(props: Props) {
             <Field label='邮箱' compact>
               <SlotIdentity
                 vm={vm}
-                email={vm.email || (typeof acc.email === 'string' ? acc.email : null)}
+                email={
+                  vm.email || (typeof acc.email === 'string' ? acc.email : null)
+                }
                 compact
               />
             </Field>

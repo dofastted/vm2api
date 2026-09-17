@@ -5,6 +5,7 @@ import { VIEW_TITLES } from '@/config/nav'
 import type { BillingItem } from '@/types/panel-billing'
 import { fmtNum, fmtUsd } from '@/lib/format'
 import { type VmKind, vmKindOf } from '@/lib/vm-kind'
+import { useVmIndex } from '@/hooks/use-vm-index'
 import { Button } from '@/components/ui/button'
 import {
   Table,
@@ -21,7 +22,6 @@ import { SlotIdentity } from '@/components/platform-chip'
 import { QueryGate } from '@/components/query-gate'
 import { StatCard } from '@/components/stat-card'
 import { billingQueryOptions } from '@/features/billing/queries'
-import { useVmIndex } from '@/hooks/use-vm-index'
 
 type PlatformFilter = 'all' | VmKind
 

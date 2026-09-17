@@ -5,12 +5,12 @@ import { maskPresentedKey } from '@/lib/log-mute'
 import { errorClassTone, statusTone } from '@/lib/log-tone'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
-import { SlotIdentity } from '@/components/platform-chip'
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
+import { SlotIdentity } from '@/components/platform-chip'
 import { StatusMark } from '@/components/status-mark'
 
 /** 后端时间字段是 `ts`（ISO），不是 `created_at` —— 表里只显示 HH:MM:SS。 */

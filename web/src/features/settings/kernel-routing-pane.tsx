@@ -15,7 +15,9 @@ export function KernelRoutingPane(_props: {
           <span className='text-sm'>Rust · Claude Code cli-hop</span>
         </SettingRow>
         <SettingRow label='凭证归属'>
-          <span className='text-sm'>宿主机写 credentials.json，槽内 kernel / CLI 只读</span>
+          <span className='text-sm'>
+            宿主机写 credentials.json，槽内 kernel / CLI 只读
+          </span>
         </SettingRow>
         <p className='py-3 text-xs text-muted-foreground'>
           公开仓只走 Rust 内核调度 Claude Code 原生 subagent。Go HTTP

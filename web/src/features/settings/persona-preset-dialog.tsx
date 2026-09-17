@@ -372,9 +372,9 @@ export function PersonaPresetDialog({
 
           {preset === 'zero' ? (
             <Notice tone='caution'>
-              wrap / cli-hop 的 CLI 0 注入 layout 不读本页
-              JSONL；改这里不会改 Claude Code 出站 system 文本。usage hide 是
-              gateway <code>personaHideForCliZero</code>，尚未接{' '}
+              wrap / cli-hop 的 CLI 0 注入 layout 不读本页 JSONL；改这里不会改
+              Claude Code 出站 system 文本。usage hide 是 gateway{' '}
+              <code>personaHideForCliZero</code>，尚未接{' '}
               <code>persona_hides</code>。
             </Notice>
           ) : null}

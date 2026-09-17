@@ -8,8 +8,8 @@ import { credTypeFromMode } from '@/lib/cred-type'
 import { concInfo, defaultConc, fableState, rpmInfo } from '@/lib/fable-status'
 import { fmtNum, fmtUsd, pct } from '@/lib/format'
 import { cn } from '@/lib/utils'
-import { cacheHitPct, isLeftoverUsageAccount } from '@/lib/vm-usage'
 import { indexVms } from '@/lib/vm-kind'
+import { cacheHitPct, isLeftoverUsageAccount } from '@/lib/vm-usage'
 import { Progress } from '@/components/ui/progress'
 import { EmptyState } from '@/components/empty-state'
 import { PageHeader } from '@/components/page-header'
@@ -139,11 +139,7 @@ function AccountRow({ row, vm }: { row: UsageAccountRow; vm?: Vm }) {
     >
       <div className='min-w-[160px] flex-[1.6] truncate py-2 pl-3'>
         <div className='truncate'>
-          <SlotIdentity
-            vm={vm}
-            vmId={row.vm_id}
-            email={row.email}
-          />
+          <SlotIdentity vm={vm} vmId={row.vm_id} email={row.email} />
         </div>
         <div className='flex items-center gap-1.5 truncate text-xs text-muted-foreground'>
           {row.vm_id ? (

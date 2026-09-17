@@ -88,8 +88,7 @@ export function compactEmail(email: string, max = 22): string {
   if (at <= 0) return `${value.slice(0, Math.max(1, max - 1))}…`
   const local = value.slice(0, at)
   const domain = value.slice(at + 1)
-  const keepDomain =
-    domain.length <= 12 ? domain : domainTail(domain, 12)
+  const keepDomain = domain.length <= 12 ? domain : domainTail(domain, 12)
   if (local.length + 1 + keepDomain.length <= max) {
     return `${local}@${keepDomain}`
   }

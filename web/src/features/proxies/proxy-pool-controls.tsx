@@ -45,7 +45,9 @@ export function ProxyPoolControls(props: ProxyPoolControlsProps) {
   return (
     <>
       <p className='mb-3 max-w-3xl text-sm text-muted-foreground'>
-        一条 SOCKS5 起一台透明网关；也可以加「本地出口」走宿主机默认路由。槽走默认路由做推理。探测只问出口是否在，不打 Anthropic。
+        一条 SOCKS5
+        起一台透明网关；也可以加「本地出口」走宿主机默认路由。槽走默认路由做推理。探测只问出口是否在，不打
+        Anthropic。
       </p>
       <div className='mb-4 flex flex-wrap items-center gap-3 text-sm'>
         <label className='flex items-center gap-2'>
