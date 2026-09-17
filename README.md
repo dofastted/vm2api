@@ -1,6 +1,5 @@
 # vm2api
 
-**把 Setup Token 做成 Console 可用 API。**  
 虚拟机拟真 + Claude Code 原生 subagent。**0 提示词注入**。
 
 [![Release](https://img.shields.io/github/v/release/dofastted/vm2api?display_name=tag)](https://github.com/dofastted/vm2api/releases)
@@ -13,9 +12,6 @@
 💬 **加入讨论**：[Telegram @VM2API](https://t.me/VM2API)
 
 主路线图解：[技术路线](docs/技术路线.md) · 自建：[部署说明](docs/DEPLOY.md) · 打二进制：[版本构建](docs/BUILD.md)
-
-> 公开产品面只走 **Rust 内核 + Claude Code**。Go HTTP hop 已删除。远程 SOCKS5 用透明网关；也可以在代理池里加 **本地出口**（宿主机 NAT）。
-
 ---
 
 ## 核心能力
