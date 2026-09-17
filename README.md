@@ -56,7 +56,7 @@ docker compose up -d --build
 curl -sS --noproxy '*' http://127.0.0.1:8787/health
 ```
 
-`--build` 拷仓内 `bin/kin-kernel` / `kin-egress` / `kin-worker` 到 `./bin`（**755**）。缺槽位镜像时入口脚本编 `kin-os/ubuntu:24.04`。其它发行版：`node docker/kin-os/build.mjs`。槽 UID 是 `10000+序号`，不要 `700`。
+`--build` 拷仓内 `bin/kin-{kernel,egress,worker,codex-kernel}` 和 `share/wrap-cli`。缺槽位镜像时入口脚本编 `kin-os/ubuntu:24.04`。其它发行版：`node docker/kin-os/build.mjs`。槽 UID 是 `10000+序号`，`bin/kin-*` 不要 `700`。
 
 
 Docker Desktop（含 WSL2）的 host 网络在 Desktop Linux VM 里，WSL/macOS 的 `127.0.0.1:8787` 可能连不上。改用：

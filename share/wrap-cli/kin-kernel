@@ -1,0 +1,11 @@
+#!/bin/sh
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+BIN="$DIR/kin-kernel.bin"
+LOADER="$DIR/glibc239/ld-linux-x86-64.so.2"
+if [ -x "$LOADER" ] && [ -x "$BIN" ]; then
+  exec "$LOADER" --library-path "$DIR/glibc239" "$BIN" "$@"
+fi
+if [ -x "$BIN" ]; then
+  exec "$BIN" "$@"
+fi
+exec "$DIR/kin-kernel.real" "$@"

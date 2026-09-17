@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+HERE=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+export PATH="$HERE:$PATH"
+exec "$HERE/bun" "$HERE/cli-dist/cli-node.js" "$@"

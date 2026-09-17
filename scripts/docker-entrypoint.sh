@@ -36,11 +36,17 @@ ensure_bin() {
 ensure_bin kin-kernel
 ensure_bin kin-egress
 ensure_bin kin-worker
+ensure_bin kin-codex-kernel
 
 KERNEL="${KIN_KERNEL_BIN:-$ROOT/bin/kin-kernel}"
 if [ ! -x "$KERNEL" ]; then
   echo "vm2api: $KERNEL missing or not executable after image-bin copy. Rebuild with docker compose build, or put linux amd64 Release files in $ROOT/bin." >&2
   exit 1
+fi
+mkdir -p "$ROOT/share"
+if [ -d /opt/vm2api/image-wrap-cli ] && [ ! -f "$ROOT/share/wrap-cli/bun" ]; then
+  rm -rf "$ROOT/share/wrap-cli"
+  cp -a /opt/vm2api/image-wrap-cli "$ROOT/share/wrap-cli"
 fi
 
 if [ ! -S /var/run/docker.sock ]; then

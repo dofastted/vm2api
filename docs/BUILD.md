@@ -1,6 +1,6 @@
 # 版本与构建
 
-源码和 linux amd64 `bin/kin-kernel` / `kin-egress` / `kin-worker` 进 git。GitHub Release 仍挂一份。当前发布线：**1.1.1**（tag `v1.1.1`）。
+源码和 linux amd64 `bin/kin-{kernel,egress,worker,codex-kernel}`、`share/wrap-cli` 进 git。GitHub Release 仍挂一份 ELF。当前发布线：**1.1.1**（tag `v1.1.1`）。
 
 ## 版本怎么记
 
@@ -41,7 +41,7 @@ install -m 755 kin-kernel kin-egress kin-worker /opt/vm2api/bin/
 
 然后按 [DEPLOY.md](DEPLOY.md) 指环境变量。槽进程不是 root：权限必须是 `755`，不要 `700`。
 
-控制面镜像：`docker compose build` 拷仓内 `bin/kin-*`（见 [DEPLOY.md](DEPLOY.md#docker-compose)）。槽位 `kin-os/*` 首次启动编 ubuntu，或 `node docker/kin-os/build.mjs`。
+控制面镜像：`docker compose build` 拷仓内 `bin/kin-*` 与 `share/wrap-cli`（见 [DEPLOY.md](DEPLOY.md#docker-compose)）。槽位 `kin-os/*` 首次启动编 ubuntu，或 `node docker/kin-os/build.mjs`。
 
 ## 本机构建
 

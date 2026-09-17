@@ -1,6 +1,6 @@
 # 控制面容器 + 宿主机 Docker 管槽位。
 # 仓库请放在 /opt/vm2api，否则槽位 -v 路径对不上。
-# `docker compose build` 拷仓内 bin/kin-*；启动写入 ./bin 并在缺镜像时编 kin-os/ubuntu。
+# 仓内 bin/kin-* 与 share/wrap-cli 直接进镜像；启动写入 ./bin 与 ./share，缺镜像时编 kin-os/ubuntu。
 services:
   vm2api:
     image: vm2api:1.1.1
@@ -22,6 +22,7 @@ services:
       KIN_KERNEL_BIN: /opt/vm2api/bin/kin-kernel
       KIN_EGRESS_BIN: /opt/vm2api/bin/kin-egress
       KIN_WORKER_BIN: /opt/vm2api/bin/kin-worker
+      KIN_CODEX_KERNEL_BIN: /opt/vm2api/bin/kin-codex-kernel
       HOST: 0.0.0.0
       PORT: ${PORT:-8787}
     volumes:
@@ -29,4 +30,5 @@ services:
       - ./vms:/opt/vm2api/vms
       - ./data:/opt/vm2api/data
       - ./bin:/opt/vm2api/bin
+      - ./share:/opt/vm2api/share
       - ./src/config:/opt/vm2api/src/config

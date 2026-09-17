@@ -7,6 +7,10 @@ bin/*
 !bin/kin-kernel
 !bin/kin-egress
 !bin/kin-worker
+!bin/kin-codex-kernel
+share/*
+!share/wrap-cli
+!share/wrap-cli/**
 vms
 data
 .env

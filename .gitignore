@@ -19,7 +19,10 @@ bin/*
 !bin/kin-kernel
 !bin/kin-egress
 !bin/kin-worker
-share/
+!bin/kin-codex-kernel
+share/*
+!share/wrap-cli/
+!share/wrap-cli/**
 .workflow/
 __pycache__/
 web/dist/

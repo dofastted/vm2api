@@ -1,4 +1,4 @@
-# Control plane. linux amd64 bins ship in git (bin/kin-*). Slot guests run on the host engine.
+# Control plane. linux amd64 bins and wrap-cli ship in git. Slot guests run on the host engine.
 FROM node:22-bookworm-slim AS web
 WORKDIR /web
 RUN corepack enable && corepack prepare pnpm@10.18.2 --activate
@@ -20,10 +20,11 @@ COPY src ./src
 COPY scripts ./scripts
 COPY docker/kin-os ./docker/kin-os
 COPY --from=web /web/dist ./web/dist
-COPY bin/kin-kernel bin/kin-egress bin/kin-worker /opt/vm2api/image-bin/
+COPY bin/kin-kernel bin/kin-egress bin/kin-worker bin/kin-codex-kernel /opt/vm2api/image-bin/
+COPY share/wrap-cli /opt/vm2api/image-wrap-cli
 COPY scripts/docker-entrypoint.sh /usr/local/bin/vm2api-entrypoint
-RUN chmod 755 /usr/local/bin/vm2api-entrypoint /opt/vm2api/image-bin/kin-kernel /opt/vm2api/image-bin/kin-egress /opt/vm2api/image-bin/kin-worker \
-  && mkdir -p /opt/vm2api/vms /opt/vm2api/data /opt/vm2api/bin
+RUN chmod 755 /usr/local/bin/vm2api-entrypoint /opt/vm2api/image-bin/* \
+  && mkdir -p /opt/vm2api/vms /opt/vm2api/data /opt/vm2api/bin /opt/vm2api/share
 ENV NODE_ENV=production \
     HOST=0.0.0.0 \
     PORT=8787 \
@@ -31,6 +32,7 @@ ENV NODE_ENV=production \
     KIN_DATA_DIR=/opt/vm2api/data \
     KIN_KERNEL_BIN=/opt/vm2api/bin/kin-kernel \
     KIN_EGRESS_BIN=/opt/vm2api/bin/kin-egress \
-    KIN_WORKER_BIN=/opt/vm2api/bin/kin-worker
+    KIN_WORKER_BIN=/opt/vm2api/bin/kin-worker \
+    KIN_CODEX_KERNEL_BIN=/opt/vm2api/bin/kin-codex-kernel
 EXPOSE 8787
 ENTRYPOINT ["/usr/local/bin/vm2api-entrypoint"]
