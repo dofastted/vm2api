@@ -129,7 +129,9 @@ test('queryOpenaiQuota persists 5h/7d extra and reset credits', async () => {
       if (String(url).startsWith(CHATGPT_RESET_CREDITS_URL)) {
         return {
           status: 200,
-          json: async () => [{ expiresAt: '2026-07-04T04:05:06Z', reset_type: 'codex_rate_limits', status: 'available' }],
+          json: async () => [
+            { expiresAt: '2026-07-04T04:05:06Z', reset_type: 'codex_rate_limits', status: 'available' },
+          ],
         }
       }
       throw new Error(`unexpected ${url}`)
@@ -163,8 +165,18 @@ test('resetOpenaiQuota posts redeem_request_id then re-queries', async () => {
           status: 200,
           json: async () => ({
             rate_limit: {
-              primary_window: { used_percent: 0, limit_window_seconds: 18000, reset_after_seconds: 10, reset_at: 1_800_000_000 },
-              secondary_window: { used_percent: 1, limit_window_seconds: 604800, reset_after_seconds: 20, reset_at: 1_800_100_000 },
+              primary_window: {
+                used_percent: 0,
+                limit_window_seconds: 18000,
+                reset_after_seconds: 10,
+                reset_at: 1_800_000_000,
+              },
+              secondary_window: {
+                used_percent: 1,
+                limit_window_seconds: 604800,
+                reset_after_seconds: 20,
+                reset_at: 1_800_100_000,
+              },
             },
             rate_limit_reset_credits: { available_count: 0, credits: [] },
           }),

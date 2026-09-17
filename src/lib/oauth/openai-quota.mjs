@@ -7,25 +7,12 @@ import crypto from 'node:crypto'
 import { getVm } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { boundProxyUrl } from '../vm/egress.mjs'
-import {
-  readCodexAccounts,
-  upsertCodexAccount,
-  persistCodexQuotaSnapshot,
-} from '../vm/codex-slot.mjs'
-import {
-  buildCodexUsageView,
-  extraToCodexSnapshot,
-  normalizeCodexLimits,
-} from '../protocol/codex-usage.mjs'
-import {
-  CODEX_OAUTH_ORIGINATOR,
-  makeSocksFetch,
-  refreshCodexAccessToken,
-} from '../protocol/codex-models.mjs'
+import { readCodexAccounts, upsertCodexAccount, persistCodexQuotaSnapshot } from '../vm/codex-slot.mjs'
+import { buildCodexUsageView, extraToCodexSnapshot, normalizeCodexLimits } from '../protocol/codex-usage.mjs'
+import { CODEX_OAUTH_ORIGINATOR, makeSocksFetch, refreshCodexAccessToken } from '../protocol/codex-models.mjs'
 
 export const CHATGPT_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
-export const CHATGPT_RESET_CREDITS_URL =
-  'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits'
+export const CHATGPT_RESET_CREDITS_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits'
 export const CHATGPT_RESET_CONSUME_URL = `${CHATGPT_RESET_CREDITS_URL}/consume`
 export const OPENAI_QUOTA_TIMEOUT_MS = 20_000
 const CODEX_BETA = 'codex-1'
@@ -165,18 +152,17 @@ export function parseResetCreditDetails(body) {
     }
   }
   if (Array.isArray(raw)) {
-    const credits = raw.filter(isCodexResetCredit).map((row) => ({ expires_at: creditExpiresAt(row) })).filter((row) => row.expires_at)
+    const credits = raw
+      .filter(isCodexResetCredit)
+      .map((row) => ({ expires_at: creditExpiresAt(row) }))
+      .filter((row) => row.expires_at)
     return { available_count: credits.length, credits, list_present: true }
   }
   if (!raw || typeof raw !== 'object') return empty
-  const listed = asCreditList(
-    raw.credits || raw.rate_limit_reset_credits || raw.items || raw.data,
-  )
+  const listed = asCreditList(raw.credits || raw.rate_limit_reset_credits || raw.items || raw.data)
   const listPresent = !!(raw.credits || raw.rate_limit_reset_credits || raw.items || raw.data)
   const filtered = listed.filter(isCodexResetCredit)
-  const credits = filtered
-    .map((row) => ({ expires_at: creditExpiresAt(row) }))
-    .filter((row) => row.expires_at)
+  const credits = filtered.map((row) => ({ expires_at: creditExpiresAt(row) })).filter((row) => row.expires_at)
   const counted = num(raw.available_count ?? raw.availableCount)
   return {
     available_count: counted != null && counted >= 0 ? Math.trunc(counted) : filtered.length,
@@ -268,7 +254,8 @@ async function loadSlot(projectRoot, vmId) {
 
 async function quotaFetch(url, { method = 'GET', headers, body, proxyUrl, fetchImpl, timeoutMs } = {}) {
   const fetchFn = fetchImpl || makeSocksFetch(proxyUrl, timeoutMs || OPENAI_QUOTA_TIMEOUT_MS)
-  if (!fetchImpl && !proxyUrl) return { ok: false, error: 'proxy_required', message: 'GPT 槽未绑定 SOCKS5', status: 400 }
+  if (!fetchImpl && !proxyUrl)
+    return { ok: false, error: 'proxy_required', message: 'GPT 槽未绑定 SOCKS5', status: 400 }
   try {
     const res = await fetchFn(url, {
       method,
@@ -280,7 +267,12 @@ async function quotaFetch(url, { method = 'GET', headers, body, proxyUrl, fetchI
     return { ok: status > 0 && status < 400, status, payload }
   } catch (e) {
     const aborted = e?.name === 'AbortError' || /aborted/i.test(String(e?.message || e))
-    return { ok: false, error: aborted ? 'timeout' : 'fetch_failed', message: aborted ? '上游超时' : '上游请求失败', status: 502 }
+    return {
+      ok: false,
+      error: aborted ? 'timeout' : 'fetch_failed',
+      message: aborted ? '上游超时' : '上游请求失败',
+      status: 502,
+    }
   }
 }
 
@@ -319,8 +311,7 @@ async function queryUpstream(slot, { fetchImpl, rotate = true, projectRoot, vmId
     return fail('proxy_required', 'GPT 槽未绑定 SOCKS5', 400)
   }
   let current = slot
-  const headersOf = (access) =>
-    buildOpenaiQuotaHeaders({ accessToken: access, accountId: current.accountId })
+  const headersOf = (access) => buildOpenaiQuotaHeaders({ accessToken: access, accountId: current.accountId })
 
   const run = async (access) => {
     const usage = await quotaFetch(CHATGPT_USAGE_URL, {
@@ -367,13 +358,14 @@ async function queryUpstream(slot, { fetchImpl, rotate = true, projectRoot, vmId
     usageCredits && typeof usageCredits === 'object'
       ? {
           available_count: num(usageCredits.available_count ?? usageCredits.availableCount) || 0,
-          credits: asCreditList(usageCredits.credits).map((row) => ({ expires_at: creditExpiresAt(row) })).filter((row) => row.expires_at),
+          credits: asCreditList(usageCredits.credits)
+            .map((row) => ({ expires_at: creditExpiresAt(row) }))
+            .filter((row) => row.expires_at),
         }
       : null,
     detailCredits,
   )
-  const persistable =
-    resetCredits.available_count <= 0 || resetCredits.credits.length > 0 ? resetCredits : null
+  const persistable = resetCredits.available_count <= 0 || resetCredits.credits.length > 0 ? resetCredits : null
   persistCodexQuotaSnapshot(projectRoot, vmId, {
     extra,
     ...(persistable ? { resetCredits: persistable } : {}),

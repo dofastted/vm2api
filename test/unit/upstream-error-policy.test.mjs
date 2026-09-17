@@ -378,7 +378,11 @@ test('confirmed 401 revoked still parks the grant', () => {
       status: 401,
       terminalState: 'rejected',
       body: {
-        error: { type: 'authentication_error', message: 'OAuth access token has been revoked.', request_id: 'req_live' },
+        error: {
+          type: 'authentication_error',
+          message: 'OAuth access token has been revoked.',
+          request_id: 'req_live',
+        },
       },
     },
     { hasRefresh: true },
