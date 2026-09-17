@@ -1,16 +1,39 @@
-MIT License
+vm2api License
 
 Copyright (c) 2026 vm2api contributors
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+本仓库源码公开，便于个人学习、研究与非商用自建。
+Commercial use requires a separate written authorization.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+联系授权：Telegram @VM2API · https://t.me/VM2API
+
+
+1. Non-commercial use
+
+You may use, copy, modify, and run this software for personal learning,
+research, evaluation, and non-commercial self-hosting, provided you keep
+this copyright notice and license text.
+
+You may not use this software for any commercial purpose without a
+separate written authorization from the copyright holder. Commercial
+purpose includes, without limitation:
+
+- selling access, hosting, or support as a paid service
+- using the software to operate, market, or deliver a business
+- redistributing the software or a derivative for a fee
+- using it inside a company or organization for production revenue
+
+2. Commercial use
+
+Obtain written authorization before any commercial use. Unauthorized
+commercial use is prohibited.
+
+3. No trademark license
+
+This license does not grant rights in the names vm2api, Claude, Claude
+Code, Anthropic, or any other marks of their respective owners.
+
+4. Disclaimer
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
@@ -19,3 +42,10 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+中文摘要（与上文英文条款冲突时，以英文条款为准）
+
+- 个人学习、研究、非商用自建：可以使用、复制、修改和运行，并须保留本许可全文。
+- 商用（含对外收费、作为付费服务、公司生产营收、收费再分发等）：必须先取得书面授权。
+- 未授权商用禁止。申请授权请联系 Telegram @VM2API。

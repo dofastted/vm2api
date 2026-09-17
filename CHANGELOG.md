@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- README 恢复详细说明；许可改为非商用开源，商用需书面授权
+
 ## 1.1.4 — 2026-09-17
 
 补齐 cli-hop CI 夹具，和源仓 simulated job_error / CONNECT 桥一致。
