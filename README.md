@@ -79,7 +79,7 @@ curl -sS http://127.0.0.1:8787/v1/messages \
 | [PANEL_API.md](docs/PANEL_API.md) | 管理台 API |
 | [CHANGELOG.md](CHANGELOG.md) | 版本记录 |
 
-当前发布：**v1.1.2**
+当前发布：**v1.1.3**
 
 ---
 

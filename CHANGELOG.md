@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.1.3 — 2026-09-17
+
+gateway-worker 对齐源仓：local_cli 走 wrap CLI，不再 HTTP hop 到 Anthropic。
+
+- `provider=local_cli` 启动 MultiplexCli，`/internal/v1/messages` 走 cli-hop
+- 去掉 anthropic_api HTTP hop，避免 OAuth extra usage 429
+
 ## 1.1.2 — 2026-09-17
 
 仓内携带部署二进制；文档写清运行形态。
