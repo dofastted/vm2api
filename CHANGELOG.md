@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.1.1 — 2026-09-17
+
+补回授权链接换票缺件。
+
+- 补回 `scripts/session-import-cffi.py`（源仓 CookieAuth / Chrome TLS），控制面镜像安装 `curl_cffi`
+- 补回官方 Claude Code 常驻脚本 `scripts/official-cc-resident.py`
+
+
 ## 1.1.0 — 2026-09-17
 
 推荐 Docker Compose 部署，并修槽位启动。

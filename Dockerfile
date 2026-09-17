@@ -9,7 +9,8 @@ RUN pnpm build
 
 FROM node:22-bookworm-slim
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates iptables iproute2 python3 \
+  && apt-get install -y --no-install-recommends ca-certificates iptables iproute2 python3 python3-pip \
+  && pip3 install --no-cache-dir --break-system-packages curl_cffi \
   && rm -rf /var/lib/apt/lists/*
 COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker
 WORKDIR /opt/vm2api

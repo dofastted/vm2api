@@ -11,7 +11,7 @@
 | 项 | 建议 |
 |---|---|
 | OS | Ubuntu 24.04（glibc 够新，wrap / Claude kernel 才能起） |
-| 运行时 | Node 22、Docker、iptables |
+| 运行时 | Node 22、Docker、iptables、python3 + `curl_cffi`（授权链接 / sessionKey CookieAuth） |
 | 编译（本机构建时） | Rust stable、Go 1.25、pnpm 10 |
 | 网 | 每槽一条出口：远程 SOCKS5，或代理池里的 **本地出口** |
 
@@ -90,7 +90,7 @@ chmod 600 .env
 # 填写三项密钥
 
 mkdir -p bin
-# 下载 v1.1.0 linux amd64 到 bin/ 后：
+# 下载 v1.1.1 linux amd64 到 bin/ 后：
 chmod 755 bin/kin-kernel bin/kin-egress bin/kin-worker
 
 node docker/kin-os/build.mjs ubuntu
@@ -118,6 +118,7 @@ git clone https://github.com/dofastted/vm2api.git /opt/vm2api
 cd /opt/vm2api
 npm ci
 pnpm -C web install --frozen-lockfile
+pip3 install --break-system-packages curl_cffi
 
 # 本机构建，或从 Release 把 linux amd64 丢进 bin/
 npm run build:kernel

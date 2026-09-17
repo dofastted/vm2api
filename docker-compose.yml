@@ -3,7 +3,7 @@
 # 需要：Linux、Docker、把 Release 二进制放到 ./bin/
 services:
   vm2api:
-    image: vm2api:1.1.0
+    image: vm2api:1.1.1
     build:
       context: .
       dockerfile: Dockerfile

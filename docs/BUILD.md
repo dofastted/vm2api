@@ -1,6 +1,6 @@
 # 版本与构建
 
-源码在 git。ELF 只放 GitHub Release，不进仓库。当前发布线：**1.1.0**（tag `v1.1.0`）。
+源码在 git。ELF 只放 GitHub Release，不进仓库。当前发布线：**1.1.1**（tag `v1.1.1`）。
 
 ## 版本怎么记
 
@@ -18,8 +18,8 @@
 仓库要有 `contents: write`。流程在 `.github/workflows/release.yml`。
 
 ```bash
-git tag -a v1.1.0 -m "vm2api v1.1.0"
-git push origin v1.1.0
+git tag -a v1.1.1 -m "vm2api v1.1.1"
+git push origin v1.1.1
 ```
 
 `v*` tag 推上去之后，Actions 在 `ubuntu-latest` 编 linux amd64，并挂到该 tag 的 Release：
@@ -45,7 +45,7 @@ install -m 755 kin-kernel kin-egress kin-worker /opt/vm2api/bin/
 
 ## 本机构建
 
-依赖：Node 22、Rust stable、Go 1.25、pnpm 10。Windows 上 Go/Rust 能编，槽位运行面按 Linux + Docker 写。
+依赖：Node 22、Rust stable、Go 1.25、pnpm 10、python3 + `curl_cffi`（授权码换票）。Windows 上 Go/Rust 能编，槽位运行面按 Linux + Docker 写。
 
 ```bash
 npm ci
