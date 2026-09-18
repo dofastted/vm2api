@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- wrap 复用槽内 `.claude` 配置目录，submit 先写 `kin_job_start`（源仓 c359cf4）
+
 
 ## 1.1.5 — 2026-09-18
 
