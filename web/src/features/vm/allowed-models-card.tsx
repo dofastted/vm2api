@@ -12,6 +12,7 @@ import { meQueryOptions } from '@/features/auth/queries'
 import { modelPolicyQueryOptions } from '@/features/models/queries'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { vmQueryOptions } from '@/features/vm/queries'
+import { matchesAllowedModel, toggleAllowedModel } from './allowed-models'
 
 type CatalogItem = { id: string; label: string; family?: string }
 
@@ -60,18 +61,11 @@ function allowedListOf(vm: Vm): string[] | null {
   return Array.isArray(a) && a.length ? a : null
 }
 
-/** Prefix-tolerant match, mirroring the gateway's own slot model gate. */
-function matches(modelId: string, entry: string) {
-  const low = String(modelId).toLowerCase()
-  const x = String(entry).toLowerCase()
-  return low === x || low.startsWith(`${x}-`) || x.startsWith(`${low}-`)
-}
-
 function isChecked(vm: Vm, id: string) {
   if (isFableId(id) && claudeTier(vm).key === 'pro') return false
   const allowed = allowedListOf(vm)
   if (!allowed) return true
-  return allowed.some((a) => matches(id, a))
+  return allowed.some((a) => matchesAllowedModel(id, a))
 }
 
 export function AllowedModelsCard({ vm }: { vm: Vm }) {
@@ -110,9 +104,7 @@ export function AllowedModelsCard({ vm }: { vm: Vm }) {
           return true
         })
     } else {
-      next = current.slice()
-      if (checked && !next.includes(id)) next.push(id)
-      if (!checked) next = next.filter((a) => a !== id)
+      next = toggleAllowedModel(current, id, checked)
       if (pro) next = next.filter((a) => !isFableId(a))
     }
     // selecting everything is the same as inheriting — store null, not a full list
@@ -121,7 +113,7 @@ export function AllowedModelsCard({ vm }: { vm: Vm }) {
       .map((m) => m.id)
     const covers =
       expected.length &&
-      expected.every((mid) => next.some((a) => matches(mid, a)))
+      expected.every((mid) => next.some((a) => matchesAllowedModel(mid, a)))
     save.mutate(covers ? null : next)
   }
 

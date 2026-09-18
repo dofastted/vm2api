@@ -190,7 +190,13 @@ export function resolveCatalogModel(raw, ids = cache.ids) {
 export function setModelCatalog(ids, { source = 'go-slot-worker' } = {}) {
   cache = {
     at: Date.now(),
-    ids: [...new Set((ids || []).filter((id) => isCatalogModelId(id)))],
+    ids: [
+      ...new Set(
+        (ids || [])
+          .map((id) => (id === 'claude-fable-5.1' ? 'claude-fable-5-1' : id))
+          .filter((id) => isCatalogModelId(id)),
+      ),
+    ],
     aliases: [...FAMILY_ALIASES.keys()],
     source,
   }

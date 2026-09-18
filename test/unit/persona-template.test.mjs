@@ -37,7 +37,26 @@ import {
   wrapMandatoryConstraint,
 } from '../../src/lib/identity/crs-persona.mjs'
 import { validatePersonaRoutingPatch } from '../../src/lib/admin/panel-api.mjs'
-import { buildOfficialEnvironmentSection } from '../../src/lib/identity/official-cc-system-2.1.241.mjs'
+import {
+  buildOfficialEnvironmentSection,
+  buildOverwriteEnvironmentSection,
+  displayNameForModel,
+} from '../../src/lib/identity/official-cc-system-2.1.241.mjs'
+
+test('Fable 5.1 display names support canonical and legacy model IDs', () => {
+  for (const modelId of ['claude-fable-5-1', 'claude-fable-5.1']) {
+    for (const suffix of ['', '[1m]']) {
+      const id = modelId + suffix
+      assert.equal(displayNameForModel(id), 'Fable 5.1')
+      assert.ok(
+        buildOverwriteEnvironmentSection({ modelId: id }).includes(
+          `You are powered by the model named Fable 5.1. The exact model ID is ${modelId}.`,
+        ),
+      )
+    }
+  }
+  assert.equal(displayNameForModel('claude-fable-5'), 'Fable 5')
+})
 
 function withRoutingFile(compatibility, fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-tpl-'))

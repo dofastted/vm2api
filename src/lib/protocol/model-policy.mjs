@@ -36,6 +36,8 @@ function isCatalogModelId(id) {
 
 const SETTINGS_KEY = 'model_policy'
 const CONTEXT_1M = CONTEXT_1M_BETA
+const FABLE_51_ID = 'claude-fable-5-1'
+const FABLE_51_LEGACY_ID = 'claude-fable-5.1'
 
 const CAP_HAIKU = {
   context_window: 200000,
@@ -275,7 +277,7 @@ export function seedDefaultPolicy() {
     aliases: ['fable'],
   })
 
-  add('claude-fable-5.1', {
+  add(FABLE_51_ID, {
     display_name: 'Fable 5.1',
     family: 'fable',
     sort: 41,
@@ -287,7 +289,7 @@ export function seedDefaultPolicy() {
       on_adaptive: 'passthrough',
       on_enabled: 'passthrough',
     },
-    aliases: [],
+    aliases: [FABLE_51_LEGACY_ID],
   })
 
   return {
@@ -312,6 +314,7 @@ export function seedDefaultPolicy() {
       'claude-3-5-haiku': 'claude-haiku-4-5-20251001',
       'claude-3-5-haiku-latest': 'claude-haiku-4-5-20251001',
       fable: 'claude-fable-5',
+      [FABLE_51_LEGACY_ID]: FABLE_51_ID,
     },
     catalog_mode: 'policy_only',
   }
@@ -343,8 +346,11 @@ export function normalizePolicy(raw) {
   if (!raw || typeof raw !== 'object') return seed
   const models = { ...seed.models }
   if (raw.models && typeof raw.models === 'object') {
+    // Old releases stored the unsupported dotted id. Preserve its overrides;
+    // an explicitly configured canonical entry wins field-by-field below.
+    models[FABLE_51_ID] = deepMergeEntry(models[FABLE_51_ID], raw.models[FABLE_51_LEGACY_ID])
     for (const [id, cfg] of Object.entries(raw.models)) {
-      if (!id) continue
+      if (!id || id === FABLE_51_LEGACY_ID) continue
       const base =
         models[id] ||
         entry({
@@ -363,6 +369,15 @@ export function normalizePolicy(raw) {
       models[id] = deepMergeEntry(base, cfg)
     }
   }
+  models[FABLE_51_ID].aliases = [
+    ...new Set([
+      FABLE_51_LEGACY_ID,
+      ...[raw.models?.[FABLE_51_LEGACY_ID]?.aliases, raw.models?.[FABLE_51_ID]?.aliases].flatMap((aliases) =>
+        Array.isArray(aliases) ? aliases : [],
+      ),
+    ]),
+  ]
+  if ('id' in models[FABLE_51_ID]) models[FABLE_51_ID].id = FABLE_51_ID
   for (const [id, cfg] of Object.entries(models)) {
     if (cfg.params?.on_enabled === 'convert_to_adaptive') {
       cfg.params = { ...cfg.params, on_enabled: 'passthrough' }
@@ -378,6 +393,11 @@ export function normalizePolicy(raw) {
   }
   const rawDefaults = raw.defaults && typeof raw.defaults === 'object' ? raw.defaults : {}
   const hasWhitelist = Object.prototype.hasOwnProperty.call(rawDefaults, 'context_1m_whitelist')
+  const aliases = { ...seed.aliases, ...(raw.aliases || {}) }
+  for (const [alias, target] of Object.entries(aliases)) {
+    if (String(target).trim().toLowerCase() === FABLE_51_LEGACY_ID) aliases[alias] = FABLE_51_ID
+  }
+  aliases[FABLE_51_LEGACY_ID] = FABLE_51_ID
   return {
     version: Number(raw.version) || 1,
     updated_at: raw.updated_at || new Date().toISOString(),
@@ -390,7 +410,7 @@ export function normalizePolicy(raw) {
         : [...seed.defaults.context_1m_whitelist],
     },
     models,
-    aliases: { ...seed.aliases, ...(raw.aliases || {}) },
+    aliases,
     catalog_mode: raw.catalog_mode || seed.catalog_mode,
   }
 }
@@ -675,7 +695,9 @@ export function getPolicyCatalogIds({ enabledOnly = false } = {}) {
 export function filterPublicModelIds(workerIds = []) {
   if (!loaded) loadModelPolicy()
   const mode = policy.catalog_mode || 'policy_only'
-  const ids = [...new Set((workerIds || []).filter(Boolean))]
+  const ids = [
+    ...new Set((workerIds || []).filter(Boolean).map((id) => (id === FABLE_51_LEGACY_ID ? FABLE_51_ID : id))),
+  ]
 
   if (mode === 'worker_only') return ids
 
@@ -693,7 +715,8 @@ export function listPolicyModels() {
 export function syncWorkerModelsIntoPolicy(workerIds = []) {
   if (!loaded) loadModelPolicy()
   let changed = false
-  for (const id of workerIds || []) {
+  for (const workerId of workerIds || []) {
+    const id = workerId === FABLE_51_LEGACY_ID ? FABLE_51_ID : workerId
     if (!id || !isCatalogModelId(id)) continue
     if (/^gpt/i.test(id)) continue
     if (policy.models[id]) continue
