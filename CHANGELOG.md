@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.1.7 — 2026-09-19
+
+Opus/Sonnet extra-usage 429 与 GPT `/v1/messages` 未绑槽一并修掉。
+
+- wrap/kernel `CLAUDE_CODE_ENTRYPOINT=cli`，订阅 OAuth 不再按 sdk-cli extra usage 429
+- HTTP 2xx leftover `stream_incomplete` 不再刷成超时
+- GPT 模型打 `/v1/messages` 转到 Codex 槽，回 Anthropic 信封，日志带 `vm_id`
+
 ## 1.1.6 — 2026-09-18
 
 同步源仓 wrap 内核：复用槽内 `.claude`，submit 更快起 job。
