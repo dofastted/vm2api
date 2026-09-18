@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 本地与 CI 统一格式：Biome / gofmt / Prettier，全文 LF
 - README 恢复详细说明；许可改为非商用开源，商用需书面授权
 
 ## 1.1.4 — 2026-09-17

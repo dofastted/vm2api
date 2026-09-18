@@ -2,6 +2,7 @@
 
 - [DEPLOY.md](DEPLOY.md) — 安装与升级
 - [BUILD.md](BUILD.md) — 版本与构建
+- [FORMAT.md](FORMAT.md) — 本地与 CI 同一套格式（Biome / gofmt / Prettier，LF）
 - [API.md](API.md) — `/v1`
 - [PANEL_API.md](PANEL_API.md) — 管理台 API
 - 抄本：[deploy/env.example](deploy/env.example) · [deploy/vm2api.service](deploy/vm2api.service)
