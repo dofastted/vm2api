@@ -731,6 +731,20 @@ export function syncWorkerModelsIntoPolicy(workerIds = []) {
   return policy
 }
 
+/** Last-resort fill when the model has no policy default. Probe / short tests use this. */
+export const FALLBACK_MAX_TOKENS = 4096
+
+/** Official per-model default for a missing caller max_tokens. Never overwrites inbound. */
+export function defaultMaxTokensForModel(modelId = '') {
+  if (!loaded) loadModelPolicy()
+  const params = getModelParams(modelId)
+  const n = Number(params.max_tokens_default)
+  const cap = Number(params.max_tokens_cap)
+  let out = Number.isFinite(n) && n > 0 ? n : FALLBACK_MAX_TOKENS
+  if (Number.isFinite(cap) && cap > 0 && out > cap) out = cap
+  return out
+}
+
 export function applyMaxTokensCap(body = {}) {
   if (!body || typeof body !== 'object') return body
   const params = getModelParams(body.model || '')

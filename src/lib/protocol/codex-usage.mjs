@@ -18,6 +18,85 @@ function int(value) {
   return n == null ? null : Math.trunc(n)
 }
 
+/**
+ * Live `x-codex-*` rate-limit headers -> extra keys.
+ *
+ * The ChatGPT Codex backend stamps the metered windows on every Responses
+ * reply (the 429 included). `-reset-at` is absolute unix seconds; older
+ * builds only send the relative `-reset-after-seconds`, so both are read and
+ * the absolute form wins. Window lengths are never assumed: `window_minutes`
+ * decides which side is the 5h and which is the 7d window.
+ */
+export function extraFromCodexHeaders(headers = {}, now = Date.now()) {
+  const h = lowerHeaders(headers)
+  if (!h) return null
+  const extra = {}
+  let seen = false
+  for (const role of ['primary', 'secondary']) {
+    const used = num(h[`x-codex-${role}-used-percent`])
+    const minutes = int(h[`x-codex-${role}-window-minutes`])
+    const resetAtEpoch = int(h[`x-codex-${role}-reset-at`])
+    const resetAfter = int(h[`x-codex-${role}-reset-after-seconds`])
+    if (used == null && minutes == null && resetAtEpoch == null && resetAfter == null) continue
+    seen = true
+    const resetMs =
+      resetAtEpoch != null && resetAtEpoch > 0
+        ? resetAtEpoch * 1000
+        : resetAfter != null
+          ? now + resetAfter * 1000
+          : null
+    extra[`codex_${role}_used_percent`] = used
+    extra[`codex_${role}_window_minutes`] = minutes
+    extra[`codex_${role}_reset_at`] = resetMs == null ? null : new Date(resetMs).toISOString()
+    extra[`codex_${role}_reset_after_seconds`] =
+      resetAfter != null ? resetAfter : resetMs == null ? null : Math.max(0, Math.round((resetMs - now) / 1000))
+  }
+  if (!seen) return null
+  const overSecondary = num(h['x-codex-primary-over-secondary-limit-percent'])
+  if (overSecondary != null) extra.codex_primary_over_secondary_percent = overSecondary
+  const reached = String(h['x-codex-rate-limit-reached-type'] || '').trim()
+  extra.codex_rate_limit_reached_type = reached || null
+  extra.codex_usage_updated_at = new Date(now).toISOString()
+  return extra
+}
+
+/** Fallback park when upstream says "spent" but ships no reset clock. */
+export const CODEX_DEFAULT_PARK_MS = 60_000
+
+/**
+ * Park verdict for a slot: a window at its cap with a future reset, or an
+ * explicit `usage_limit_reached`, means the credential is spent until the
+ * soonest window reset.
+ */
+export function codexQuotaPark(extra = {}, now = Date.now()) {
+  const limits = normalizeCodexLimits(extraToCodexSnapshot(extra))
+  let until = null
+  let liveCap = false
+  for (const key of ['5h', '7d']) {
+    const used = num(limits[`used_${key}_percent`])
+    const resetMs = Date.parse(limits[`reset_${key}_at`] || '')
+    if (used == null || used < 100) continue
+    if (Number.isFinite(resetMs) && resetMs <= now) continue
+    liveCap = true
+    if (Number.isFinite(resetMs) && resetMs > now && (until == null || resetMs < until)) until = resetMs
+  }
+  const manual = Date.parse(extra?.codex_limited_until || '')
+  const manualLive = Number.isFinite(manual) && manual > now
+  if (manualLive && (until == null || manual < until)) until = manual
+  if (liveCap && until == null && !Number.isFinite(manual)) until = now + CODEX_DEFAULT_PARK_MS
+  return { limited: until != null, until }
+}
+
+function lowerHeaders(headers) {
+  if (!headers || typeof headers !== 'object') return null
+  const out = {}
+  for (const [key, value] of Object.entries(headers)) {
+    if (value == null) continue
+    out[String(key).toLowerCase()] = Array.isArray(value) ? value.join(',') : String(value)
+  }
+  return out
+}
+
 export function extraToCodexSnapshot(extra = {}) {
   if (!extra || typeof extra !== 'object') return emptySnapshot()
   return {

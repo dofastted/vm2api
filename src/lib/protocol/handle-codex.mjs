@@ -2,13 +2,15 @@
  * Codex hop from handle-protocol. Claude convert/pool/CRS never runs here.
  */
 import path from 'node:path'
-import { getVm, listVms } from '../vm/vm-registry.mjs'
+import { getVm, listVms, persistCodexUsage, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { isCodexProtocolAllowed, isCodexVm, normalizeCodexRouting } from './codex-route.mjs'
 import { restrictCodexClient } from './codex-restriction.mjs'
 import { responsesSseToChatChunk, toCodexResponses } from './codex-convert.mjs'
+import { extraFromCodexHeaders, codexQuotaPark, CODEX_DEFAULT_PARK_MS } from './codex-usage.mjs'
 import { streamCodexKernel } from '../transport/codex-kernel-client.mjs'
 import { ensureCodexKernel, writeCodexKernelConfig } from '../transport/codex-kernel-supervisor.mjs'
 import { boundProxyUrl } from '../vm/egress.mjs'
+import { pickCodexSlots, isCodexFailoverError, CODEX_FAILOVER_MAX } from '../pool/codex-slot-pool.mjs'
 
 function sessionFrom(req, body) {
   const headers = req.headers || {}
@@ -30,17 +32,33 @@ function pinnedVmId(req) {
   return /^vm-[a-z0-9-]+$/i.test(pinVmRaw) ? pinVmRaw : null
 }
 
-function pickCodexVm(projectRoot, req) {
+export function pickCodexCandidates(projectRoot, req) {
   const pin = pinnedVmId(req)
   if (pin) {
     const vm = getVm(projectRoot, pin)
-    if (!vm || !isCodexVm(vm)) return { error: 'platform_mismatch', pin }
-    return { vm }
+    if (!vm || !isCodexVm(vm)) return { error: 'platform_mismatch', pin, ids: [] }
+    return { ids: [vm.id], pin }
   }
-  const summary = listVms(projectRoot).find((item) => isCodexVm(item))
-  const vm = summary?.id ? getVm(projectRoot, summary.id) : null
-  if (!vm || !isCodexVm(vm)) return { error: 'no_codex_vm' }
-  return { vm }
+  for (const item of listVms(projectRoot)) {
+    if (!isCodexVm(item)) continue
+    syncCodexQuotaSchedule(projectRoot, getVm(projectRoot, item.id) || item)
+  }
+  return pickCodexSlots(listVms(projectRoot))
+}
+
+function ingestCodexHop(projectRoot, vmId, result, now = Date.now()) {
+  const headers = result?.headers || {}
+  const extra = extraFromCodexHeaders(headers, now)
+  let limitedUntil = null
+  if (
+    isCodexFailoverError(result) &&
+    (Number(result?.status) === 429 || /usage_limit_reached/.test(String(result?.body?.error?.code || '')))
+  ) {
+    const park = extra ? codexQuotaPark(extra, now) : { limited: true, until: now + CODEX_DEFAULT_PARK_MS }
+    limitedUntil = park.until || now + CODEX_DEFAULT_PARK_MS
+  }
+  if (!extra && !limitedUntil) return null
+  return persistCodexUsage(projectRoot, vmId, { headers, extra, limitedUntil, now })
 }
 
 function execFor(projectRoot, vm) {
@@ -127,7 +145,7 @@ export async function handleCodexProtocol({
       },
     })
   }
-  const picked = pickCodexVm(projectRoot, req)
+  const picked = pickCodexCandidates(projectRoot, req)
   if (picked.error === 'platform_mismatch') {
     stats.errors++
     logBag.via = 'codex-kernel'
@@ -140,8 +158,8 @@ export async function handleCodexProtocol({
       },
     })
   }
-  const vm = picked.vm
-  if (!vm) {
+  const candidateIds = (picked.ids || []).slice(0, CODEX_FAILOVER_MAX)
+  if (!candidateIds.length) {
     stats.errors++
     logBag.via = 'codex-kernel'
     logBag.error_code = 'no_codex_vm'
@@ -150,74 +168,94 @@ export async function handleCodexProtocol({
     })
   }
   logBag.via = 'codex-kernel'
-  logBag.vm_id = vm.id
-  writeCodexKernelConfig(projectRoot, vm, {
-    proxyUrl: boundProxyUrl(vm.proxy),
-    proxyRequired: true,
-  })
-  const ready = await ensureCodexKernel(execFor(projectRoot, vm))
-  if (!ready?.ok) {
-    stats.errors++
-    logBag.error_code = 'codex_kernel_unavailable'
-    return json(res, 503, {
-      error: {
-        type: 'api_error',
-        code: 'codex_kernel_unavailable',
-        message: `Codex kernel 未就绪（${ready?.reason || 'not_ready'}）。GPT 槽走独立 kernel，不是 wrap cli-hop。`,
-      },
-    })
-  }
   stats.requests++
   stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
 
   const stream = inbound?.stream !== false && ctx.body?.stream !== false
   const session = sessionFrom(req, converted.body)
   const outboundBody = { ...converted.body, stream: true }
-  const chunks = []
   const hop = ops.streamCodexKernel || streamCodexKernel
-  const result = await runCodexKernelHop({
-    hop,
-    args: {
-      exec: execFor(projectRoot, vm),
-      body: outboundBody,
-      reqHeaders: req.headers,
-      envelope: { body: outboundBody, stream: true, session },
-    },
-    onEvent: async (line) => {
-      if (!stream) {
-        chunks.push(line)
-        return
+  const writeCfg = ops.writeCodexKernelConfig || writeCodexKernelConfig
+  const ensure = ops.ensureCodexKernel || ensureCodexKernel
+  let last = null
+  for (let i = 0; i < candidateIds.length; i++) {
+    const vm = getVm(projectRoot, candidateIds[i])
+    if (!vm || !isCodexVm(vm)) continue
+    logBag.vm_id = vm.id
+    writeCfg(projectRoot, vm, {
+      proxyUrl: boundProxyUrl(vm.proxy),
+      proxyRequired: true,
+    })
+    const ready = await ensure(execFor(projectRoot, vm))
+    if (!ready?.ok) {
+      last = {
+        ok: false,
+        status: 503,
+        committed: false,
+        body: {
+          error: {
+            type: 'api_error',
+            code: 'codex_kernel_unavailable',
+            message: `Codex kernel 未就绪（${ready?.reason || 'not_ready'}）。GPT 槽走独立 kernel，不是 wrap cli-hop。`,
+          },
+        },
       }
-      if (!res.headersSent) writeSSEHeaders(res)
-      if (protocol === 'openai.chat' || protocol === 'openai.completions') {
-        const mapped = responsesSseToChatChunk(line)
-        if (mapped) res.write(mapped)
-        return
-      }
-      res.write(line.endsWith('\n') ? `${line}\n` : `${line}\n`)
-    },
-  })
-  if (result?.transport_retried) logBag.transport_retried = true
-  if (!result?.ok) {
-    stats.errors++
-    logBag.error_code = result?.body?.error?.code || 'codex_upstream'
-    logBag.upstream_status = result?.status || 0
-    if (!res.headersSent) {
-      return json(res, result?.status || 502, result?.body || { error: { type: 'api_error', code: 'codex_upstream' } })
+      if (i + 1 < candidateIds.length && !res.headersSent) continue
+      stats.errors++
+      logBag.error_code = 'codex_kernel_unavailable'
+      return json(res, 503, last.body)
     }
-    return res.end()
+    const chunks = []
+    const result = await runCodexKernelHop({
+      hop,
+      args: {
+        exec: execFor(projectRoot, vm),
+        body: outboundBody,
+        reqHeaders: req.headers,
+        envelope: { body: outboundBody, stream: true, session },
+      },
+      onEvent: async (line) => {
+        if (!stream) {
+          chunks.push(line)
+          return
+        }
+        if (!res.headersSent) writeSSEHeaders(res)
+        if (protocol === 'openai.chat' || protocol === 'openai.completions') {
+          const mapped = responsesSseToChatChunk(line)
+          if (mapped) res.write(mapped)
+          return
+        }
+        res.write(line.endsWith('\n') ? `${line}\n` : `${line}\n`)
+      },
+    })
+    ingestCodexHop(projectRoot, vm.id, result)
+    if (result?.transport_retried) logBag.transport_retried = true
+    last = result
+    if (result?.ok) {
+      const usage = result.usage || result.body?.usage || result.body?.response?.usage || null
+      logBag.usage = usage
+      logBag.input_tokens = usage?.input_tokens ?? usage?.prompt_tokens ?? null
+      logBag.output_tokens = usage?.output_tokens ?? usage?.completion_tokens ?? null
+      logBag.cache_read_tokens = usage?.input_tokens_details?.cached_tokens ?? usage?.cache_read_tokens ?? null
+      logBag.first_token_ms = result.ttftMs ?? null
+      logBag.final_state = result.terminalState || 'verified'
+      logBag.upstream_model = converted.body.model
+      if (i > 0) logBag.codex_failed_over = true
+      if (!stream) return json(res, 200, result.body)
+      if (!res.headersSent) writeSSEHeaders(res)
+      return res.end()
+    }
+    if (res.headersSent) {
+      stats.errors++
+      logBag.error_code = result?.body?.error?.code || 'codex_upstream'
+      logBag.upstream_status = result?.status || 0
+      return res.end()
+    }
+    if (i + 1 < candidateIds.length && isCodexFailoverError(result)) continue
+    break
   }
-  const usage = result.usage || result.body?.usage || result.body?.response?.usage || null
-  logBag.usage = usage
-  logBag.input_tokens = usage?.input_tokens ?? usage?.prompt_tokens ?? null
-  logBag.output_tokens = usage?.output_tokens ?? usage?.completion_tokens ?? null
-  logBag.cache_read_tokens = usage?.input_tokens_details?.cached_tokens ?? usage?.cache_read_tokens ?? null
-  logBag.first_token_ms = result.ttftMs ?? null
-  logBag.final_state = result.terminalState || 'verified'
-  logBag.upstream_model = converted.body.model
-  if (!stream) {
-    return json(res, 200, result.body)
-  }
-  if (!res.headersSent) writeSSEHeaders(res)
-  return res.end()
+  stats.errors++
+  logBag.error_code = last?.body?.error?.code || 'codex_upstream'
+  logBag.upstream_status = last?.status || 0
+  return json(res, last?.status || 502, last?.body || { error: { type: 'api_error', code: 'codex_upstream' } })
 }

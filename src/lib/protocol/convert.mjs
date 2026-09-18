@@ -5,6 +5,7 @@
  */
 
 import { applyStructuredOutput, openaiResponseFormatToOutputConfig, sanitizeAnthropicBody } from './sanitize.mjs'
+import { defaultMaxTokensForModel } from './model-policy.mjs'
 import { inboundHasOpenAIToolShape } from '../identity/crs-persona.mjs'
 import { openaiReasoningToClaudeThinking, claudeThinkingToOpenAIReasoning } from './thinking.mjs'
 import { openaiContentToClaudeContent } from './images.mjs'
@@ -250,7 +251,7 @@ export function toClaudeMessages(protocol, body, opts = { rewrite: false, model_
   if (protocol === 'anthropic.messages' && !opts.rewrite) {
     const normalized = normalizeOpenAIToolsOnMessages(body)
     const out = sanitizeAnthropicBody(normalized, { strictPassthrough: opts.strict_passthrough })
-    if (!out.max_tokens) out.max_tokens = 4096
+    if (!out.max_tokens) out.max_tokens = defaultMaxTokensForModel(out.model)
     return { claude: withUpstreamStream(out), mode: inboundHasOpenAIToolShape(body) ? 'convert' : 'passthrough' }
   }
 
@@ -281,7 +282,7 @@ function openaiToClaude(body, opts) {
   const { systemParts, messages } = openaiMessagesToClaude(body.messages || [])
   const out = {
     model: mapModel(body.model, { allowMap: opts.model_map !== false }),
-    max_tokens: body.max_tokens || body.max_completion_tokens || 4096,
+    max_tokens: body.max_tokens || body.max_completion_tokens || defaultMaxTokensForModel(body.model),
     messages,
   }
   if (systemParts.length) out.system = systemParts.join('\n\n')

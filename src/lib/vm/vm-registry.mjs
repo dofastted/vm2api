@@ -11,7 +11,15 @@ import { isManualScheduleLocked } from '../pool/schedule-policy.mjs'
 import { manualScheduleLevelOf, parseScheduleLevelInput } from '../pool/credential-weight.mjs'
 import { normalizeOwnerId, vmOriginOf } from '../admin/resource-owner.mjs'
 import { normalizeVmKind } from './vm-kind.mjs'
+import {
+  extraFromCodexHeaders,
+  extraToCodexSnapshot,
+  buildCodexUsageView,
+  codexQuotaPark,
+} from '../protocol/codex-usage.mjs'
+
 import { summarizeCodexSlot } from './codex-slot.mjs'
+import { evaluateCodexQuotaSchedule } from '../pool/codex-slot-pool.mjs'
 
 export { isCodexVm, normalizeVmKind } from './vm-kind.mjs'
 
@@ -127,6 +135,47 @@ export function persistAccountTier(projectRoot, vmId, tier) {
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm, { mode: 0o600 })
   return vm
+}
+
+/**
+ * Merge live `x-codex-*` headers (and optional park-until) into vm.codex.
+ * Cluster 5H/7D meters read this via summarizeCodexSlot -> usage.quota.
+ */
+export function persistCodexUsage(projectRoot, vmId, { headers, extra, limitedUntil, now = Date.now() } = {}) {
+  if (!projectRoot || !vmId) return null
+  const file = path.join(projectRoot, 'vms', `${vmId}.json`)
+  if (!fs.existsSync(file)) return null
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.codex = { ...(vm.codex || {}) }
+  const fromHeaders = extraFromCodexHeaders(headers || {}, now)
+  const merged = { ...(vm.codex.extra || {}), ...(fromHeaders || {}), ...(extra || {}) }
+  if (limitedUntil) {
+    merged.codex_limited_until = new Date(limitedUntil).toISOString()
+  } else {
+    const parked = codexQuotaPark({ ...merged, codex_limited_until: null }, now)
+    if (parked.limited) merged.codex_limited_until = new Date(parked.until).toISOString()
+    else delete merged.codex_limited_until
+  }
+  vm.codex.extra = merged
+  vm.codex.usage = buildCodexUsageView(extraToCodexSnapshot(merged))
+  vm.updated_at = new Date(now).toISOString()
+  atomicWriteJson(file, vm, { mode: 0o600 })
+  syncCodexQuotaSchedule(projectRoot, vm, { now })
+  return getVm(projectRoot, vmId) || vm
+}
+
+/**
+ * Extra 5h/7d auto-toggle, same contract as PoolScheduler.syncQuotaSchedule.
+ */
+export function syncCodexQuotaSchedule(projectRoot, vm, { now = Date.now() } = {}) {
+  if (!projectRoot || !vm?.id) return { action: 'keep', reason: null }
+  const ev = evaluateCodexQuotaSchedule(vm, now)
+  if (ev.action === 'disable') {
+    setVmSchedulable(projectRoot, vm.id, false, ev.reason, { preserveStatus: true, source: 'force' })
+  } else if (ev.action === 'enable') {
+    setVmSchedulable(projectRoot, vm.id, true, null, { preserveStatus: true, source: 'force' })
+  }
+  return ev
 }
 
 export function persistAllowedModels(projectRoot, vmId, models) {

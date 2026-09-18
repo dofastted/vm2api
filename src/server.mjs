@@ -51,7 +51,14 @@ import {
 } from './lib/transport/api-kernel-client.mjs'
 import { PanelUserStore } from './lib/admin/panel-users.mjs'
 import { RequestLogStore } from './lib/admin/request-log.mjs'
-import { listVms, getVm, getActiveVmId, setVmSchedulable } from './lib/vm/vm-registry.mjs'
+import {
+  listVms,
+  getVm,
+  getActiveVmId,
+  setVmSchedulable,
+  isCodexVm,
+  syncCodexQuotaSchedule,
+} from './lib/vm/vm-registry.mjs'
 import { makeError, ErrorType, ErrorCode } from './lib/core/errors.mjs'
 import * as panel from './lib/admin/panel-api.mjs'
 import { ProxyPool } from './lib/vm/proxy-pool.mjs'
@@ -407,6 +414,12 @@ usageProbeMonitor = createUsageProbeMonitor({
   accountForVm: accountForUsageProbe,
   reconcile: (vm, account) => {
     const id = account?.account_id || vm?.claude?.account_uuid || vm?.account_uuid || vm?.id
+    if (isCodexVm(vm)) {
+      try {
+        syncCodexQuotaSchedule(cfg.paths.project, getVm(cfg.paths.project, vm.id) || vm)
+      } catch {}
+      return
+    }
     try {
       accountQuota.persistEffectiveWindows(id)
     } catch {}
