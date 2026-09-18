@@ -1,7 +1,13 @@
 # Changelog
 
 ## Unreleased
-- wrap 复用槽内 `.claude` 配置目录，submit 先写 `kin_job_start`（源仓 c359cf4）
+
+## 1.1.6 — 2026-09-18
+
+同步源仓 wrap 内核：复用槽内 `.claude`，submit 更快起 job。
+
+- wrap 指向凭证父目录，不再写临时 config + dummy OAuth
+- `kin_job_start` 先于 extra maps；热路径不再 `await retire_idle`
 
 
 ## 1.1.5 — 2026-09-18
