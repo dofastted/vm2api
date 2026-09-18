@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.1.5 — 2026-09-18
+
+同步源仓内核/后端补丁：wrap Extra 5h 头、slot 回收、官方 max_tokens、GPT 额度 failover。
+
+- wrap `kin_job_done` Extra 5h 头进 trailer；ReadyBlocked 不再 30m 误杀；job 后清 tenant
+- 缺 `max_tokens` 填官方 per-model 默认，不覆盖调用方
+- GPT `x-codex-*` 入库，5h/7d 调度关，429 最多 4 槽 failover
 - 本地与 CI 统一格式：Biome / gofmt / Prettier，全文 LF
 - README 恢复详细说明；许可改为非商用开源，商用需书面授权
 

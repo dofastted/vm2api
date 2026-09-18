@@ -214,11 +214,11 @@ VM2API_DB_SECRET=       # 库加密
 
 ## 版本与构建
 
-当前发布：**v1.1.4**
+当前发布：**v1.1.5**
 
 ```bash
-git tag -a v1.1.4 -m "vm2api v1.1.4"
-git push origin v1.1.4
+git tag -a v1.1.5 -m "vm2api v1.1.5"
+git push origin v1.1.5
 ```
 
 `v*` tag 会触发 [Release 工作流](.github/workflows/release.yml)，再挂一份 linux amd64 ELF。仓内 `bin/` 已可直接部署。步骤：[BUILD.md](docs/BUILD.md)
