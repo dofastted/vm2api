@@ -1,18 +1,17 @@
 /**
  * Create/reset Linux workstation identity for a slot.
  * Official ~/.claude.json machineID still overwrites device_id after init.
- * US timezone list is inlined to avoid an import cycle with vm-runtime.
  */
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { US_TIMEZONES, validTimezone } from '../core/timezone.mjs'
 import { workstationFamily, workstationKernel, workstationSkuId } from './workstation-profile.mjs'
 
 export const HOSTNAME_RE = /^[a-z]+-[0-9a-f]{4}$/
 export const DEVICE_ID_RE = /^[0-9a-f]{64}$/i
 export const MACHINE_ID_RE = /^[0-9a-f]{32}$/i
 export const STANDARD_LOCALE = 'en_US.UTF-8'
-const US_TIMEZONES = Object.freeze(['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles'])
 
 export function isHexDeviceId(value) {
   return DEVICE_ID_RE.test(String(value || '').trim())
@@ -45,9 +44,7 @@ function hex(n) {
 }
 
 function pickTimezone(vm = {}) {
-  const cur = String(vm.timezone || '').trim()
-  if (cur.startsWith('America/')) return cur
-  return US_TIMEZONES[crypto.randomInt(0, US_TIMEZONES.length)]
+  return validTimezone(vm.timezone) || US_TIMEZONES[crypto.randomInt(0, US_TIMEZONES.length)]
 }
 
 export function generateWorkstationFingerprint(vm = {}, { taken, now } = {}) {
