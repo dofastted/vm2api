@@ -4,6 +4,10 @@ import {
   chatToCodexResponses,
   normalizeCodexResponsesInput,
   responsesSseToChatChunk,
+  responsesSseToAnthropicEvents,
+  createAnthropicSseState,
+  assembleCodexBodyFromSse,
+  codexBodyToAnthropicMessage,
   stripCodexIdentity,
   toCodexResponses,
 } from '../../src/lib/protocol/codex-convert.mjs'
@@ -89,4 +93,44 @@ test('responses SSE maps to chat chunks', () => {
   assert.match(done, /\[DONE\]/)
   assert.match(done, /"prompt_tokens":41/)
   assert.match(done, /"completion_tokens":12/)
+})
+
+test('responses SSE maps to Anthropic message events', () => {
+  const state = createAnthropicSseState()
+  const start = responsesSseToAnthropicEvents('data: {"type":"response.output_text.delta","delta":"Hi"}', state)
+  assert.match(start, /event: message_start/)
+  assert.match(start, /text_delta/)
+  assert.match(start, /Hi/)
+  const done = responsesSseToAnthropicEvents(
+    'data: {"type":"response.completed","response":{"usage":{"output_tokens":3}}}',
+    state,
+  )
+  assert.match(done, /event: message_stop/)
+  assert.match(done, /end_turn/)
+})
+
+test('Codex JSON body maps to Anthropic message', () => {
+  const msg = codexBodyToAnthropicMessage(
+    {
+      id: 'resp_1',
+      model: 'gpt-6-astra',
+      output: [{ content: [{ type: 'output_text', text: 'hello' }] }],
+      usage: { input_tokens: 4, output_tokens: 2 },
+    },
+    'gpt-6-astra',
+  )
+  assert.equal(msg.type, 'message')
+  assert.equal(msg.content[0].text, 'hello')
+  assert.equal(msg.usage.output_tokens, 2)
+})
+
+test('assembles Codex SSE chunks into Anthropic text', () => {
+  const assembled = assembleCodexBodyFromSse([
+    'data: {"type":"response.output_text.delta","delta":"Hel"}',
+    'data: {"type":"response.output_text.delta","delta":"lo"}',
+    'data: {"type":"response.completed","response":{"usage":{"output_tokens":2}}}',
+  ])
+  const msg = codexBodyToAnthropicMessage(assembled, 'gpt-6-astra')
+  assert.equal(msg.content[0].text, 'Hello')
+  assert.equal(msg.usage.output_tokens, 2)
 })

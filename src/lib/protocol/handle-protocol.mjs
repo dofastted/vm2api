@@ -33,6 +33,7 @@ import { fingerprintRequest } from './client-fingerprint.mjs'
 import { validateOfficialModel } from './models.mjs'
 import { handleCodexProtocol } from './handle-codex.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
+import { normalizeCodexRouting } from './codex-route.mjs'
 import { hasClaudeCode1mSuffix } from './context-1m.mjs'
 import {
   HEALTH_REAL_HEADER,
@@ -425,22 +426,33 @@ export function createHandleProtocol(deps) {
       return json(res, errorResult.status, errorResult.body)
     }
     if (platform.platform === 'openai') {
-      if (protocol === 'anthropic.messages') {
-        stats.errors++
-        logBag.error_code = 'protocol_not_allowed'
-        return json(
-          res,
-          400,
-          makeError({
-            type: ErrorType.INVALID_REQUEST,
-            code: 'protocol_not_allowed',
-            message: 'GPT models are not accepted on /v1/messages',
-            status: 400,
-            param: 'model',
-          }).body,
-        )
-      }
       const routing = getRouting() || {}
+      if (protocol === 'anthropic.messages') {
+        const codex = normalizeCodexRouting(routing.codex)
+        return handleCodexProtocol({
+          req,
+          res,
+          protocol,
+          ctx,
+          inbound,
+          logBag,
+          stats,
+          json,
+          writeSSEHeaders,
+          routing: {
+            ...routing,
+            codex: {
+              ...codex,
+              protocols: {
+                ...codex.protocols,
+                'anthropic.messages': { mode: 'convert', enabled: true },
+              },
+              convert: { ...codex.convert, anthropic_to_codex: true },
+            },
+          },
+          projectRoot: cfg.paths.project,
+        })
+      }
       return handleCodexProtocol({
         req,
         res,

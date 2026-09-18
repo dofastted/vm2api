@@ -215,3 +215,66 @@ test('persistCodexUsage restores 调度关 after the 5h window opens', () => {
   assert.equal(restored.schedule_disabled_reason, null)
   fs.rmSync(root, { recursive: true, force: true })
 })
+
+test('GPT on anthropic.messages converts and pins a GPT slot', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-anth-'))
+  writeGptVm(root, 'vm-gpt-a')
+  const writes = []
+  const res = {
+    headersSent: false,
+    write(chunk) {
+      this.headersSent = true
+      writes.push(String(chunk))
+    },
+    end() {
+      this.ended = true
+    },
+  }
+  const logBag = {}
+  await handleCodexProtocol({
+    req: { headers: { 'user-agent': 'curl/8.0' } },
+    res,
+    protocol: 'anthropic.messages',
+    ctx: {
+      body: {
+        model: 'gpt-6-astra',
+        max_tokens: 32,
+        messages: [{ role: 'user', content: 'hello' }],
+        stream: true,
+      },
+    },
+    inbound: { stream: true },
+    logBag,
+    stats: { errors: 0, requests: 0, by_route: {} },
+    json: (_res, status, body) => {
+      res.statusCode = status
+      res.body = body
+      return body
+    },
+    writeSSEHeaders() {
+      res.headersSent = true
+    },
+    routing: {
+      codex: {
+        protocols: { 'anthropic.messages': { mode: 'convert', enabled: true } },
+        convert: { anthropic_to_codex: true },
+        clients: { unknown: 'allow', openai_compatible: 'allow' },
+      },
+    },
+    projectRoot: root,
+    ops: {
+      writeCodexKernelConfig() {},
+      ensureCodexKernel: async () => ({ ok: true }),
+      streamCodexKernel: async ({ onEvent }) => {
+        await onEvent('data: {"type":"response.output_text.delta","delta":"Hi"}')
+        await onEvent('data: {"type":"response.completed"}')
+        return { ok: true, status: 200, terminalState: 'verified' }
+      },
+    },
+  })
+  assert.equal(logBag.vm_id, 'vm-gpt-a')
+  assert.equal(logBag.error_code, undefined)
+  assert.match(writes.join(''), /message_start/)
+  assert.match(writes.join(''), /Hi/)
+  fs.rmSync(root, { recursive: true, force: true })
+})

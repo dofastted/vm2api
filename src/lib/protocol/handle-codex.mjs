@@ -5,7 +5,14 @@ import path from 'node:path'
 import { getVm, listVms, persistCodexUsage, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { isCodexProtocolAllowed, isCodexVm, normalizeCodexRouting } from './codex-route.mjs'
 import { restrictCodexClient } from './codex-restriction.mjs'
-import { responsesSseToChatChunk, toCodexResponses } from './codex-convert.mjs'
+import {
+  responsesSseToChatChunk,
+  responsesSseToAnthropicEvents,
+  createAnthropicSseState,
+  assembleCodexBodyFromSse,
+  codexBodyToAnthropicMessage,
+  toCodexResponses,
+} from './codex-convert.mjs'
 import { extraFromCodexHeaders, codexQuotaPark, CODEX_DEFAULT_PARK_MS } from './codex-usage.mjs'
 import { streamCodexKernel } from '../transport/codex-kernel-client.mjs'
 import { ensureCodexKernel, writeCodexKernelConfig } from '../transport/codex-kernel-supervisor.mjs'
@@ -177,6 +184,7 @@ export async function handleCodexProtocol({
   const hop = ops.streamCodexKernel || streamCodexKernel
   const writeCfg = ops.writeCodexKernelConfig || writeCodexKernelConfig
   const ensure = ops.ensureCodexKernel || ensureCodexKernel
+  const anthropicSse = protocol === 'anthropic.messages' ? createAnthropicSseState() : null
   let last = null
   for (let i = 0; i < candidateIds.length; i++) {
     const vm = getVm(projectRoot, candidateIds[i])
@@ -225,6 +233,11 @@ export async function handleCodexProtocol({
           if (mapped) res.write(mapped)
           return
         }
+        if (protocol === 'anthropic.messages') {
+          const mapped = responsesSseToAnthropicEvents(line, anthropicSse)
+          if (mapped) res.write(mapped)
+          return
+        }
         res.write(line.endsWith('\n') ? `${line}\n` : `${line}\n`)
       },
     })
@@ -241,7 +254,12 @@ export async function handleCodexProtocol({
       logBag.final_state = result.terminalState || 'verified'
       logBag.upstream_model = converted.body.model
       if (i > 0) logBag.codex_failed_over = true
-      if (!stream) return json(res, 200, result.body)
+      if (!stream) {
+        const assembled = assembleCodexBodyFromSse(chunks, result.body || {})
+        const body =
+          protocol === 'anthropic.messages' ? codexBodyToAnthropicMessage(assembled, converted.body.model) : assembled
+        return json(res, 200, body)
+      }
       if (!res.headersSent) writeSSEHeaders(res)
       return res.end()
     }

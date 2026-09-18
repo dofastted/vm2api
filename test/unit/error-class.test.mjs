@@ -66,6 +66,8 @@ test('classifyRequestError maps known codes and statuses', () => {
   )
   assert.equal(classifyRequestError({ status: 200, error_code: 'ECONNRESET' }), null)
   assert.equal(classifyRequestError({ status: 200, error_code: 'client_cancelled' }), null)
+  assert.equal(classifyRequestError({ status: 200, error_code: 'stream_incomplete' }), null)
+  assert.equal(classifyRequestError({ status: 200, error_message: 'stream first-byte timeout' }), null)
 })
 
 test('collectErrors groups by class and code', () => {

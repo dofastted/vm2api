@@ -232,3 +232,158 @@ function openaiChatUsage(usage) {
   const c = Number.isFinite(completion) ? completion : 0
   return { prompt_tokens: p, completion_tokens: c, total_tokens: p + c }
 }
+
+function parseSseData(line) {
+  const trimmed = String(line || '').trim()
+  if (!trimmed.startsWith('data:')) return { skip: true }
+  const data = trimmed.slice(5).trim()
+  if (!data || data === '[DONE]') return { done: true }
+  try {
+    return { event: JSON.parse(data) }
+  } catch {
+    return { skip: true }
+  }
+}
+
+function outputTextFromCodex(body = {}) {
+  const resp = body.response && typeof body.response === 'object' ? body.response : body
+  const chunks = []
+  const walk = (node) => {
+    if (!node) return
+    if (typeof node === 'string') {
+      chunks.push(node)
+      return
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item)
+      return
+    }
+    if (typeof node !== 'object') return
+    if (typeof node.text === 'string') chunks.push(node.text)
+    if (typeof node.output_text === 'string') chunks.push(node.output_text)
+    walk(node.content)
+    walk(node.output)
+  }
+  walk(resp.output)
+  if (!chunks.length && typeof resp.output_text === 'string') chunks.push(resp.output_text)
+  return chunks.join('')
+}
+
+export function createAnthropicSseState() {
+  return { started: false, id: 'msg_codex', model: '', text: '' }
+}
+
+function anthropicEvent(type, payload) {
+  return `event: ${type}\ndata: ${JSON.stringify({ type, ...payload })}\n\n`
+}
+
+export function responsesSseToAnthropicEvents(line, state = createAnthropicSseState()) {
+  const parsed = parseSseData(line)
+  if (parsed.skip) return null
+  const event = parsed.event || {}
+  const type = event.type || ''
+  if (event.response?.id) state.id = event.response.id
+  if (event.response?.model) state.model = event.response.model
+  const frames = []
+  const ensureStart = () => {
+    if (state.started) return
+    state.started = true
+    frames.push(
+      anthropicEvent('message_start', {
+        message: {
+          id: state.id,
+          type: 'message',
+          role: 'assistant',
+          model: state.model || 'gpt',
+          content: [],
+          stop_reason: null,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      }),
+    )
+    frames.push(
+      anthropicEvent('content_block_start', {
+        index: 0,
+        content_block: { type: 'text', text: '' },
+      }),
+    )
+  }
+  if (
+    type === 'response.output_text.delta' ||
+    (event.delta && type !== 'response.completed' && type !== 'response.done')
+  ) {
+    const content = event.delta || event.text || ''
+    if (!content) return null
+    ensureStart()
+    state.text += content
+    frames.push(
+      anthropicEvent('content_block_delta', {
+        index: 0,
+        delta: { type: 'text_delta', text: content },
+      }),
+    )
+    return frames.join('')
+  }
+  if (type === 'response.completed' || type === 'response.done' || parsed.done) {
+    ensureStart()
+    const usage = event.response?.usage || event.usage || {}
+    const output = Number(usage.output_tokens ?? usage.completion_tokens) || 0
+    frames.push(anthropicEvent('content_block_stop', { index: 0 }))
+    frames.push(
+      anthropicEvent('message_delta', {
+        delta: { stop_reason: 'end_turn' },
+        usage: { output_tokens: output },
+      }),
+    )
+    frames.push(anthropicEvent('message_stop', {}))
+    return frames.join('')
+  }
+  return null
+}
+
+export function assembleCodexBodyFromSse(chunks = [], fallback = {}) {
+  let text = outputTextFromCodex(fallback)
+  let usage = fallback.usage || fallback.response?.usage || {}
+  let id = fallback.id || fallback.response?.id
+  let model = fallback.model || fallback.response?.model
+  const deltas = []
+  for (const line of chunks) {
+    const parsed = parseSseData(line)
+    if (parsed.skip || !parsed.event) continue
+    const ev = parsed.event
+    if (ev.response?.id) id = ev.response.id
+    if (ev.response?.model) model = ev.response.model
+    if (
+      ev.type === 'response.output_text.delta' ||
+      (ev.delta && ev.type !== 'response.completed' && ev.type !== 'response.done')
+    ) {
+      const piece = ev.delta || ev.text || ''
+      if (piece) deltas.push(piece)
+    }
+    if (ev.response?.usage || ev.usage) usage = ev.response?.usage || ev.usage
+  }
+  if (deltas.length) text = deltas.join('')
+  return {
+    ...fallback,
+    id: id || fallback.id,
+    model: model || fallback.model,
+    output: [{ content: [{ type: 'output_text', text }] }],
+    usage,
+  }
+}
+
+export function codexBodyToAnthropicMessage(body = {}, model = '') {
+  const resp = body?.response && typeof body.response === 'object' ? body.response : body
+  const usage = resp?.usage || body?.usage || {}
+  const input = Number(usage.input_tokens ?? usage.prompt_tokens) || 0
+  const output = Number(usage.output_tokens ?? usage.completion_tokens) || 0
+  return {
+    id: resp?.id || 'msg_codex',
+    type: 'message',
+    role: 'assistant',
+    model: resp?.model || model || 'gpt',
+    content: [{ type: 'text', text: outputTextFromCodex(resp) }],
+    stop_reason: 'end_turn',
+    usage: { input_tokens: input, output_tokens: output },
+  }
+}
