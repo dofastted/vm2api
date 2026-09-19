@@ -70,13 +70,13 @@ export function stripCliOwnedSystem(system) {
   return kept.length ? kept : undefined
 }
 
-/** Wrap CLI already stamps tools + system. Extra tails here overflow the 4-breakpoint cap → 400, often surfaced as Connection error. */
+/** Wrap CLI already stamps tools + system. Extra tails overflow the 4-breakpoint cap. */
 export const CLI_HOP_CACHE_BREAKPOINTS = Object.freeze({
   enabled: true,
   preserve_client: true,
   system_tail: false,
   tools_tail: false,
-  messages: 'rewrite',
+  messages: 'cli-hop',
 })
 
 function dropNodeCacheControl(node) {
@@ -92,12 +92,19 @@ function dropCliOwnedBreakpoints(body) {
   return out
 }
 
-/** Wrap CLI stamps the current last user. Drop ours so the leftover is sub2api's penultimate user when messages >= 4. */
-function dropLastMessageBreakpoint(body) {
+function dropLastUserBreakpoint(body) {
   const messages = body?.messages
   if (!Array.isArray(messages) || messages.length === 0) return body
-  const idx = messages.length - 1
+  let idx = -1
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === 'user') {
+      idx = i
+      break
+    }
+  }
+  if (idx < 0) return body
   const last = messages[idx]
+  if (typeof last?.content === 'string') return body
   if (!last || !Array.isArray(last.content)) return body
   const content = last.content.map(dropNodeCacheControl)
   const next = messages.slice()
@@ -121,8 +128,6 @@ export function prepareCliHopBody(
   const leftover = stripCliOwnedSystem(body.system)
   if (leftover == null) delete body.system
   else body.system = leftover
-  // Repair already converted thinking→text and deleted body.thinking.
-  // Do not refill adaptive or clear_thinking, or the retry 400s again.
   if (!repaired) {
     body = ensureUnofficialAdaptiveThinking(body)
     normalizeThinkingForModel(body)
@@ -134,20 +139,17 @@ export function prepareCliHopBody(
   body = alignSamplingWithThinking(body)
   body = stripIllegalCacheControlFields(body)
   if (cacheTtl) body = applyCacheTtlToBody(body, cacheTtl)
-  if (cacheBreakpoints) {
-    body = applyCacheBreakpoints(body, {
-      ttl: cacheTtl || undefined,
-      config: { ...cacheBreakpoints, system_tail: false, tools_tail: false },
-      inbound: body,
-    })
-  }
+  body = applyCacheBreakpoints(body, {
+    ttl: cacheTtl || undefined,
+    config: { ...CLI_HOP_CACHE_BREAKPOINTS, system_tail: false, tools_tail: false, messages: 'cli-hop' },
+    inbound: body,
+  })
   body = dropCliOwnedBreakpoints(body)
-  body = dropLastMessageBreakpoint(body)
+  body = dropLastUserBreakpoint(body)
   body = enforceCacheTtlOrder(body)
   enforceCacheLimit(body, cacheControlLimit)
   return body
 }
-
 /** Wrap CLI process is spawned as sonnet-5/adaptive. Haiku rejects thinking. */
 export function pinHaikuCliThinking(body = {}) {
   if (!body || typeof body !== 'object') return body

@@ -24,7 +24,7 @@ test('prepareCliHopBody drops metadata and CLI-owned system but keeps official a
   assert.equal(body.system.length, 1)
   assert.equal(body.system[0].text, CRS_OFFICIAL_AGENT_PROMPT)
   assert.equal(body.model, 'claude-sonnet-5')
-  assert.deepEqual(body.messages[0].content, [{ type: 'text', text: 'hi' }])
+  assert.equal(body.messages[0].content, 'hi')
   assert.equal(body.stream, true)
 })
 
@@ -152,7 +152,7 @@ test('prepareCliHopBody disables Haiku adaptive thinking', () => {
   assert.equal(body.thinking.type, 'disabled')
 })
 
-test('cli-hop keeps caller message 1h and strips tool/system markers for wrap CLI', () => {
+test('cli-hop strips tool/system/message cache_control for wrap CLI', () => {
   const body = prepareCliHopBody(
     {
       model: 'claude-sonnet-5',
@@ -183,7 +183,7 @@ test('cli-hop keeps caller message 1h and strips tool/system markers for wrap CL
   assert.equal(body.messages[0].content[0].cache_control, undefined)
 })
 
-test('cli-hop default 5m stamps only the message tail', () => {
+test('cli-hop default 5m leaves last user unmarked for wrap', () => {
   const body = prepareCliHopBody(
     {
       model: 'claude-sonnet-5',
@@ -205,18 +205,27 @@ test('cli-hop default 5m stamps only the message tail', () => {
   assert.equal(body.messages[0].content[0].cache_control, undefined)
 })
 
-test('cli-hop rewrite keeps sub2api penultimate user after dropping CLI last-user stamp', () => {
+test('cli-hop strips Claude Code last tool_use/tool_result markers', () => {
   const body = prepareCliHopBody({
     model: 'claude-sonnet-5',
     max_tokens: 256,
     messages: [
       { role: 'user', content: [{ type: 'text', text: 'u1' }] },
-      { role: 'assistant', content: [{ type: 'text', text: 'a1' }] },
-      { role: 'user', content: [{ type: 'text', text: 'u2', cache_control: { type: 'ephemeral', ttl: '5m' } }] },
-      { role: 'assistant', content: [{ type: 'text', text: 'a2' }] },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'x', signature: 'sig' },
+          { type: 'tool_use', id: 't1', name: 'Read', input: {}, cache_control: { type: 'ephemeral' } },
+        ],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok', cache_control: { type: 'ephemeral' } }],
+      },
     ],
   })
-  assert.deepEqual(body.messages[0].content[0].cache_control, { type: 'ephemeral', ttl: '5m' })
-  assert.equal(body.messages[2].content[0].cache_control, undefined)
-  assert.equal(body.messages[3].content[0].cache_control, undefined)
+  const asstBlocks = body.messages[1].content
+  const userBlocks = body.messages[2].content
+  assert.equal(asstBlocks.find((b) => b.type === 'tool_use')?.cache_control, undefined)
+  assert.equal(userBlocks.find((b) => b.type === 'tool_result')?.cache_control, undefined)
 })
