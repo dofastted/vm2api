@@ -50,7 +50,7 @@ function AlertChip({
   tone,
 }: {
   t: string
-  to: '/import' | '/usage' | '/cluster' | '/overview' | '/logs'
+  to: '/import' | '/usage' | '/cluster' | '/overview' | '/logs' | '/vm'
   tone: AlertTone
 }) {
   return (
@@ -128,7 +128,7 @@ export function OverviewPage() {
   ).length
   const alerts: {
     t: string
-    to: '/import' | '/usage' | '/cluster' | '/overview' | '/logs'
+    to: '/import' | '/usage' | '/cluster' | '/overview' | '/logs' | '/vm'
     tone: AlertTone
   }[] = []
   if (available === 0 && withToken)
@@ -142,7 +142,7 @@ export function OverviewPage() {
   if (fableCool > 0)
     alerts.push({
       t: `Fable 冷却 ${fableCool}`,
-      to: '/cluster',
+      to: '/vm',
       tone: 'caution',
     })
   if (errs > 0) alerts.push({ t: `错误 ${errs}`, to: '/logs', tone: 'bad' })

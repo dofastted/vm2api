@@ -468,7 +468,7 @@ export function vmBuckets(vms: Vm[]) {
   return b
 }
 
-/** Coarse fleet grouping shared by the cluster and vm lists (index.html parity). */
+/** Coarse fleet grouping for the VM list (index.html parity). */
 export function fleetGroup(vm: Vm): 'pool' | 'off' | 'none' | 'bad' | 'revoke' {
   const k = poolStatus(vm).key
   if (k === 'revoke') return 'revoke'

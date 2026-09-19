@@ -5,10 +5,10 @@ import {
   Gauge,
   KeyRound,
   LayoutDashboard,
-  LayoutGrid,
   LineChart,
   List,
   Monitor,
+  Network,
   Puzzle,
   ScrollText,
   Settings,
@@ -58,7 +58,7 @@ export const NAV_ITEMS: {
   icon: typeof LayoutDashboard
 }[] = [
   { id: 'overview', url: '/overview', icon: LayoutDashboard },
-  { id: 'cluster', url: '/cluster', icon: LayoutGrid },
+  { id: 'cluster', url: '/cluster', icon: Network },
   { id: 'vm', url: '/vm', icon: Monitor },
   { id: 'import', url: '/import', icon: Download },
   { id: 'usage', url: '/usage', icon: LineChart },
