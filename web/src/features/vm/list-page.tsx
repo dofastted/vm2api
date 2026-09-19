@@ -2,17 +2,32 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { VIEW_TITLES } from '@/config/nav'
 import type { Vm } from '@/types/panel-vm'
+import {
+  ArrowDownWideNarrow,
+  ArrowUpNarrowWide,
+  LayoutGrid,
+  List,
+} from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
+import { cn } from '@/lib/utils'
 import { fleetCounts, poolStatus } from '@/lib/vm-status'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
+import { Separator } from '@/components/ui/separator'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { EmptyState } from '@/components/empty-state'
 import { PageHeader } from '@/components/page-header'
 import { SlotIdentity } from '@/components/platform-chip'
 import { QueryGate } from '@/components/query-gate'
-import { StatCard } from '@/components/stat-card'
+import { StatusMark } from '@/components/status-mark'
 import { meQueryOptions } from '@/features/auth/queries'
 import { usageQueryOptions } from '@/features/overview/queries'
 import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
@@ -29,7 +44,7 @@ import {
 } from '@/features/vm/vm-table'
 
 // fleetGroup 粗分 5 档。revoke 单列：吊销要换票，过期可能自动刷回来。
-// 细分口径没丢：顶部统计卡仍单独报「冷却 / 额度紧」。
+// 冷却 / 额度紧被并进「在池」，单独作为异常提示补在筛选行末尾。
 const POOL_CHIPS = [
   ['all', '全部'],
   ['pool', '在池'],
@@ -83,15 +98,16 @@ export function VmListPage() {
   const canCreate =
     me.data?.role === 'admin' ||
     (me.data?.role === 'user' && (me.data.vm_create_quota || 0) > 0)
-  // chips 走 fleetGroup 粗分；顶部 StatCard 的前三张仍要
-  // poolStatus 的细分，才能单独报「冷却 / 额度紧」—— 两套计数并存是有意的。
-  // 最后一张回到 fleetCounts：无效凭证要含 revoke，与 chip 计数对得上。
+  // chips 的计数走 fleetGroup 粗分（无效凭证含 revoke，与档位口径一致）。
+  // 冷却 / 额度紧在粗分里被并进「在池」，只有它们需要 poolStatus 的细分 key。
   const scoped = filterVms(vms, '', 'all', kind)
   const counts = fleetCounts(scoped)
-  const fine = { pool: 0, cool: 0, quota: 0, off: 0, none: 0 }
+  let cooling = 0
+  let limited = 0
   for (const vm of scoped) {
-    const key = poolStatus(vm).key as keyof typeof fine
-    if (key in fine) fine[key] += 1
+    const key = poolStatus(vm).key
+    if (key === 'cool') cooling += 1
+    else if (key === 'quota') limited += 1
   }
   const list = sortVms(filterVms(vms, q, filter, kind), sort, dir, accounts)
 
@@ -110,85 +126,115 @@ export function VmListPage() {
         error={vmsQ.error}
         skeleton={<VmListSkeleton />}
       >
-        <div className='mb-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4'>
-          <StatCard label='在池' value={String(fine.pool)} />
-          <StatCard
-            label='冷却 / 额度紧'
-            value={String(fine.cool + fine.quota)}
-            tone={fine.cool + fine.quota > 0 ? 'caution' : 'neutral'}
-          />
-          <StatCard
-            label='调度关'
-            value={String(fine.off)}
-            tone={fine.off > 0 ? 'warn' : 'neutral'}
-          />
-          <StatCard
-            label='无效凭证 / 未使用'
-            value={String(counts.bad + counts.revoke + counts.none)}
-            tone={
-              counts.bad + counts.revoke + counts.none > 0 ? 'bad' : 'neutral'
-            }
-          />
-        </div>
-        <div className='mb-3 flex flex-wrap gap-2'>
-          <Input
-            className='w-64'
-            placeholder='搜索名称 / 邮箱 / 代理'
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-          />
+        <div className='mb-3 flex flex-wrap items-center gap-2'>
           <KindFilterChips vms={vms} kind={kind} onChange={setKind} />
-          <div className='ms-auto flex gap-2'>
-            <Button
-              size='sm'
-              variant={view === 'list' ? 'default' : 'outline'}
-              onClick={() => setView('list')}
-            >
-              列表
-            </Button>
-            <Button
-              size='sm'
-              variant={view === 'grid' ? 'default' : 'outline'}
-              onClick={() => setView('grid')}
-            >
-              网格
-            </Button>
-          </div>
-        </div>
-        <div className='mb-4 flex flex-wrap items-center gap-2'>
+          <Separator orientation='vertical' className='mx-1 h-5' />
           {POOL_CHIPS.map(([key, label]) => (
             <Button
               key={key}
               size='sm'
               variant={filter === key ? 'default' : 'outline'}
+              aria-pressed={filter === key}
               onClick={() =>
                 setFilter(filter === key && key !== 'all' ? 'all' : key)
               }
             >
-              {label} {counts[key]}
+              {label}
+              <span
+                className={cn(
+                  'tabular-nums',
+                  filter === key ? 'opacity-75' : 'text-muted-foreground'
+                )}
+              >
+                {counts[key]}
+              </span>
             </Button>
           ))}
+          {cooling || limited ? (
+            <div className='ms-auto flex items-center gap-3'>
+              {cooling ? (
+                <StatusMark
+                  tone={{
+                    cls: 'caution',
+                    key: 'cool',
+                    text: `冷却中 ${cooling} 台`,
+                    label: `冷却 ${cooling}`,
+                  }}
+                />
+              ) : null}
+              {limited ? (
+                <StatusMark
+                  tone={{
+                    cls: 'warn',
+                    key: 'quota',
+                    text: `额度紧 ${limited} 台`,
+                    label: `额度紧 ${limited}`,
+                  }}
+                />
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+        <div className='mb-4 flex flex-wrap items-center gap-2'>
+          <Input
+            className='h-8 w-64'
+            type='search'
+            placeholder='搜索名称 / 邮箱 / 代理'
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+          />
           <div className='ms-auto flex flex-wrap items-center gap-2'>
             <span className='text-xs text-muted-foreground'>排序</span>
-            {SORT_CHIPS.map(([key, label]) => (
-              <Button
-                key={key}
-                size='sm'
-                variant={sort === key ? 'default' : 'outline'}
-                aria-pressed={sort === key}
-                onClick={() => {
-                  if (sort === key) {
-                    setDir(dir === 'asc' ? 'desc' : 'asc')
-                  } else {
-                    setSort(key)
-                    setDir(key === 'name' ? 'asc' : 'desc')
-                  }
-                }}
-              >
-                {label}
-                {sort === key ? (dir === 'asc' ? ' ↑' : ' ↓') : ''}
-              </Button>
-            ))}
+            <Select
+              value={sort}
+              onValueChange={(next) => {
+                setSort(next as VmSortKey)
+                setDir(next === 'name' ? 'asc' : 'desc')
+              }}
+            >
+              <SelectTrigger size='sm' className='w-28' aria-label='排序字段'>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent align='end'>
+                {SORT_CHIPS.map(([key, label]) => (
+                  <SelectItem key={key} value={key}>
+                    {label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Button
+              size='sm'
+              variant='outline'
+              title={dir === 'asc' ? '升序' : '降序'}
+              aria-label={
+                dir === 'asc' ? '当前升序，切到降序' : '当前降序，切到升序'
+              }
+              onClick={() => setDir(dir === 'asc' ? 'desc' : 'asc')}
+            >
+              {dir === 'asc' ? <ArrowUpNarrowWide /> : <ArrowDownWideNarrow />}
+            </Button>
+            <Separator orientation='vertical' className='mx-1 h-5' />
+            <Button
+              size='sm'
+              variant={view === 'list' ? 'default' : 'outline'}
+              aria-pressed={view === 'list'}
+              aria-label='列表视图'
+              title='列表'
+              onClick={() => setView('list')}
+            >
+              <List />
+            </Button>
+            <Button
+              size='sm'
+              variant={view === 'grid' ? 'default' : 'outline'}
+              aria-pressed={view === 'grid'}
+              aria-label='网格视图'
+              title='网格'
+              onClick={() => setView('grid')}
+            >
+              <LayoutGrid />
+            </Button>
           </div>
         </div>
         {list.length ? (
