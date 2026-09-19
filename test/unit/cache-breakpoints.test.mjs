@@ -221,7 +221,7 @@ test('fill leaves a body that already carries caller message breakpoints alone',
   assert.equal(applyMessageBreakpoints(body, '5m', 'fill'), body)
 })
 
-test('fill marks the last message and the previous message', () => {
+test('fill marks the last message and the penultimate user when length >= 4', () => {
   const out = applyMessageBreakpoints(
     {
       messages: [
@@ -236,7 +236,7 @@ test('fill marks the last message and the previous message', () => {
   )
   assert.deepEqual(
     breakpoints(out).map((h) => h.where),
-    ['messages[2][0]', 'messages[3][0]'],
+    ['messages[0][0]', 'messages[3][0]'],
   )
 })
 
@@ -264,7 +264,7 @@ test('rewrite drops caller markers before re-marking the stable positions', () =
   )
   assert.deepEqual(
     breakpoints(out).map((h) => h.where),
-    ['messages[2][0]', 'messages[3][0]'],
+    ['messages[0][0]', 'messages[3][0]'],
   )
 })
 

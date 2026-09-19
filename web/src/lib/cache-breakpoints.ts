@@ -37,7 +37,7 @@ export function messagesModeExplain(mode: MessagesBreakpointMode): string {
   if (mode === 'off')
     return '不碰 messages。调用方自己打的断点照旧生效，网关只管 system 和 tools。'
   if (mode === 'rewrite')
-    return '先清掉调用方在 messages 里的全部断点，再打最后一条和上一条消息。上一轮尾断点下一轮仍是有效前缀，避免 cache_read 冻在 system。'
+    return '先清掉调用方在 messages 里的全部断点，再打最后一条；messages≥4 时再打倒数第二个 user。cli-hop 会丢掉最后一条，留给 wrap CLI 重打当前 last user。'
   return '只在 messages 一个断点都没有时补齐。已经自己打过断点的客户端保持原样。'
 }
 

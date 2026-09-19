@@ -100,7 +100,7 @@ test('prepareCliHopBody strips unsigned empty dummy and short thinking history',
   assert.equal(body.temperature, 1)
   assert.deepEqual(body.messages[1].content, [
     { type: 'thinking', thinking: 'keep-me', signature: 'sig_real_1234567890abcdef' },
-    { type: 'text', text: 'hello', cache_control: { type: 'ephemeral', ttl: '5m' } },
+    { type: 'text', text: 'hello' },
   ])
 })
 
@@ -127,7 +127,7 @@ test('prepareCliHopBody repaired does not refill thinking after signature downgr
   assert.equal(body.context_management, undefined)
   assert.deepEqual(body.messages[1].content, [
     { type: 'text', text: 'plan' },
-    { type: 'text', text: 'hello', cache_control: { type: 'ephemeral', ttl: '5m' } },
+    { type: 'text', text: 'hello' },
   ])
 })
 
@@ -205,7 +205,7 @@ test('cli-hop default 5m stamps only the message tail', () => {
   assert.equal(body.messages[0].content[0].cache_control, undefined)
 })
 
-test('cli-hop rewrite drops a wandering last-user marker and restamps stable positions', () => {
+test('cli-hop rewrite keeps sub2api penultimate user after dropping CLI last-user stamp', () => {
   const body = prepareCliHopBody({
     model: 'claude-sonnet-5',
     max_tokens: 256,
@@ -216,7 +216,7 @@ test('cli-hop rewrite drops a wandering last-user marker and restamps stable pos
       { role: 'assistant', content: [{ type: 'text', text: 'a2' }] },
     ],
   })
-  assert.equal(body.messages[0].content[0].cache_control, undefined)
-  assert.deepEqual(body.messages[2].content[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.deepEqual(body.messages[0].content[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.equal(body.messages[2].content[0].cache_control, undefined)
   assert.equal(body.messages[3].content[0].cache_control, undefined)
 })
