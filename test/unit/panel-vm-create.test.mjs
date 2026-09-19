@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 
-function makeCreateHandler(project, body) {
+function makeCreateHandler(project, body, proxyPool) {
   const response = {}
   const handlePanel = createPanelHandler({
     cfg: { paths: { project } },
@@ -20,7 +20,7 @@ function makeCreateHandler(project, body) {
       return true
     },
     readBody: async () => body,
-    proxyPool: {
+    proxyPool: proxyPool || {
       allocateForVm() {
         throw new Error('no healthy SOCKS5')
       },
@@ -123,6 +123,46 @@ test('create preserves Tokyo timezone in the VM, fingerprint, and CLI seed files
     assert.equal(settings.env.TZ, 'Asia/Tokyo')
     assert.equal(seed.timezone, 'Asia/Tokyo')
   } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('create returns the persisted VM when runtime start fails', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-boot-'))
+  const proxy = {
+    id: 'px-boot',
+    host: '127.0.0.1',
+    port: 1080,
+    url: 'socks5://127.0.0.1:1080',
+  }
+  const prevPath = process.env.PATH
+  process.env.PATH = '/var/empty'
+  try {
+    const { handlePanel, response } = makeCreateHandler(
+      root,
+      { name: 'boot-fail', start: true, auto_allocate_proxy: true },
+      {
+        allocateForVm() {
+          return proxy
+        },
+        getProxyForVm() {
+          return proxy
+        },
+      },
+    )
+    await handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/create'))
+    assert.equal(response.status, 200, response.body?.error?.message || JSON.stringify(response.body))
+    assert.equal(response.body?.ok, true)
+    const vm = response.body?.data?.vm
+    assert.ok(vm?.id)
+    assert.equal(vm.status, 'error')
+    assert.equal(typeof response.body?.data?.start_error, 'string')
+    assert.ok(response.body.data.start_error)
+    const saved = JSON.parse(fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`), 'utf8'))
+    assert.equal(saved.status, 'error')
+    assert.ok(saved.schedule_disabled_reason)
+  } finally {
+    process.env.PATH = prevPath
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
