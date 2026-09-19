@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.0 — 2026-09-19
+
+messages 缓存断点对齐 sub2api/Parrot。
+
+- 最后一条 + 仅当 messages≥4 打倒数第二个 user
+- cli-hop 丢掉 last 后留下倒数第二个 user，wrap CLI 重打当前 last user，不再重复
+
 ## 1.1.9 — 2026-09-19
 
 cli-hop prompt cache restamp；环境时区可自定义；代理出口地理检测。

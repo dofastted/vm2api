@@ -92,7 +92,7 @@ function dropCliOwnedBreakpoints(body) {
   return out
 }
 
-/** CLI stamps the current last user. Keeping ours on the tail overflows the 4-cap. */
+/** Wrap CLI stamps the current last user. Drop ours so the leftover is sub2api's penultimate user when messages >= 4. */
 function dropLastMessageBreakpoint(body) {
   const messages = body?.messages
   if (!Array.isArray(messages) || messages.length === 0) return body

@@ -550,13 +550,24 @@ function stampMessageTail(messages, idx, ttl) {
 }
 
 /**
- * Last message plus the previous message: the previous tail stays a live
- * breakpoint next turn. Second-to-last *user* is too far back or moves every
- * user turn, so cache_read freezes at the system prefix (~43.5k).
+ * Last message plus, when messages.length >= 4, the second-to-last user
+ * (sub2api/Parrot addMessageCacheBreakpoints). CLI hop then drops the last
+ * marker because wrap CLI restamps the current last user.
  *
  * `fill` leaves a body that already carries caller breakpoints alone.
  * `rewrite` drops everything, then re-mark.
  */
+function penultimateUserIndex(messages) {
+  if (!Array.isArray(messages) || messages.length < 4) return -1
+  let userCount = 0
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role !== 'user') continue
+    userCount++
+    if (userCount === 2) return i
+  }
+  return -1
+}
+
 export function applyMessageBreakpoints(body, ttl = DEFAULT_CACHE_TTL, mode = DEFAULT_CACHE_BREAKPOINTS.messages) {
   const resolved = normalizeMessagesBreakpointMode(mode)
   if (resolved === 'off') return body
@@ -565,9 +576,8 @@ export function applyMessageBreakpoints(body, ttl = DEFAULT_CACHE_TTL, mode = DE
   const target = normalizeCacheTtl(ttl)
   let messages = resolved === 'rewrite' ? dropMessageBreakpoints(body.messages) : body.messages
   messages = stampMessageTail(messages, messages.length - 1, target)
-  if (messages.length >= 2) {
-    messages = stampMessageTail(messages, messages.length - 2, target)
-  }
+  const prevUser = penultimateUserIndex(messages)
+  if (prevUser >= 0) messages = stampMessageTail(messages, prevUser, target)
   return messages === body.messages ? body : { ...body, messages }
 }
 
