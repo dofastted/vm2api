@@ -26,7 +26,7 @@ import {
 } from './quota-window.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from './quota-tiers.mjs'
 import { SessionLimitRegistry } from './session-limit.mjs'
-import { isFableUnavailablePro, isOfficialUsageRateLimited } from '../oauth/crs-usage-probe.mjs'
+import { isFableUnavailablePro, isInventedFableWindow, isOfficialUsageRateLimited } from '../oauth/crs-usage-probe.mjs'
 import { normalizeUsage } from '../admin/pricing.mjs'
 import { isTestProbeSource } from './schedule-eligibility.mjs'
 
@@ -323,39 +323,66 @@ export class AccountQuota {
       }
     }
     const usageOk = probe.ok === true || (probe.usage_status > 0 && probe.usage_status < 400)
+    const leftoverFable = acc.unified.fable || {}
+    const hasFableUsage =
+      probe.usage_has_fable === true ||
+      (!isInventedFableWindow(probe.fable || leftoverFable, {
+        utilization_7d_oi: oiNorm,
+        reset_7d_oi: oi?.resets_at || oi?.reset,
+        status_7d_oi: oi?.status,
+        '7d_oi': oi,
+      }) &&
+        (oiNorm != null || oi?.resets_at || oi?.reset || oi?.status))
+    if (probe.usage_has_fable === true || hasFableUsage) acc.unified.usage_has_fable = true
+    else if (probe.usage_has_fable === false) acc.unified.usage_has_fable = false
     if (probe.fable && !fableTransport) {
       const fableRevokeNoise =
         usageOk &&
+        !hasFableUsage &&
         (probe.fable.banned ||
           probe.fable.status === 401 ||
           /revoked|oauth|authentication/i.test(String(probe.fable.error || '')))
       const fable429Pro =
         usageOk &&
+        !hasFableUsage &&
         !oiNorm &&
         !oi?.resets_at &&
         !oi?.reset &&
         (Number(probe.fable.status) === 429 || !!probe.fable.limited)
+      const planDenied = !hasFableUsage && (!!probe.fable.plan_denied || fableRevokeNoise || fable429Pro)
       acc.unified.fable = {
         limited: oiRejected,
         banned: !!probe.fable.banned && !usageOk && (probe.usage_status === 401 || probe.usage_status === 403),
-        plan_denied: !!probe.fable.plan_denied || fableRevokeNoise || fable429Pro,
-        ok: !!probe.fable.ok && !oiRejected,
+        plan_denied: planDenied,
+        ok: (!!probe.fable.ok && !oiRejected) || hasFableUsage,
         status: probe.fable.status || 0,
         reset: probe.fable.reset_at || acc.unified['7d_oi']?.reset || null,
         utilization: oiNorm ?? probe.fable.utilization ?? acc.unified['7d_oi']?.utilization ?? null,
         model: probe.fable.model || 'claude-fable-5',
-        error: fableRevokeNoise ? 'plan_denied' : probe.fable.error || null,
+        error: planDenied ? (fableRevokeNoise ? 'plan_denied' : probe.fable.error || null) : probe.fable.error || null,
         probed_at: probe.probed_at || new Date().toISOString(),
       }
       const stored = String(acc.unified.account_tier || '').toLowerCase()
-      if (acc.unified.fable.ok) acc.unified.account_tier = 'max'
+      if (hasFableUsage || acc.unified.fable.ok) acc.unified.account_tier = 'max'
       else if (acc.unified.fable.plan_denied && stored !== 'max') acc.unified.account_tier = 'pro'
     } else if (usageOk) {
-      const leftover = acc.unified.fable || {}
+      const leftover = leftoverFable
       const stored = String(acc.unified.account_tier || '').toLowerCase()
-      if (
+      if (hasFableUsage) {
+        acc.unified.account_tier = 'max'
+        if (leftover.plan_denied || leftover.ok === false) {
+          acc.unified.fable = {
+            ...leftover,
+            plan_denied: false,
+            ok: true,
+            error: null,
+            probed_at: probe.probed_at || leftover.probed_at || new Date().toISOString(),
+          }
+        }
+      } else if (
         stored !== 'max' &&
-        (stored === 'pro' ||
+        (probe.usage_has_fable === false ||
+          stored === 'pro' ||
           isFableUnavailablePro(leftover, {
             utilization_7d_oi: acc.unified['7d_oi']?.utilization,
             reset_7d_oi: acc.unified['7d_oi']?.reset,

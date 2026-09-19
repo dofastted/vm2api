@@ -621,7 +621,12 @@ export async function buildProbeOne({ cfg, accountQuota, id, force = false, usag
         ...(probeFromPassiveHeaders(acc?.unified || {}) || {}),
       }
     : await cache.load(accountId, () => probeAccount({ exec, vm, includeFable }), { force: !!force })
-  if (!includeFable && (String(storedTier || '').toLowerCase() === 'pro' || isFableUnavailablePro(q.fable || {}, q))) {
+  const usageListsFable = result.usage_has_fable === true || !!result.seven_day_oi
+  if (
+    !includeFable &&
+    !usageListsFable &&
+    (String(storedTier || '').toLowerCase() === 'pro' || isFableUnavailablePro(q.fable || {}, q))
+  ) {
     result = {
       ...result,
       fable: {
@@ -651,11 +656,12 @@ export async function buildProbeOne({ cfg, accountQuota, id, force = false, usag
   const tier = inferClaudeTier(
     {
       has_token: true,
-      account_tier: storedTier,
+      account_tier: after?.unified?.account_tier || storedTier,
       fable: qAfter.fable,
       utilization_7d_oi: qAfter.utilization_7d_oi,
       reset_7d_oi: qAfter.reset_7d_oi,
       status_7d_oi: qAfter.status_7d_oi,
+      usage_has_fable: qAfter.usage_has_fable ?? result.usage_has_fable,
     },
     qAfter,
   ).key
@@ -941,8 +947,8 @@ function quotaFromAccount(acc, quotaConfig) {
     utilization_7d_sonnet: sonnet.utilization != null ? Number(sonnet.utilization) : null,
     utilization_7d_oi:
       oi.utilization != null ? Number(oi.utilization) : fable?.utilization != null ? Number(fable.utilization) : null,
-    reset_5h: listed.reset_5h || null,
-    reset_7d: listed.reset_7d || null,
+    reset_5h: listed.reset_5h || u.official?.['5h']?.reset || u['5h']?.reset || null,
+    reset_7d: listed.reset_7d || u.official?.['7d']?.reset || u['7d']?.reset || null,
     reset_7d_sonnet: sonnet.reset || null,
     reset_7d_oi: oi.reset || listed.reset_7d_oi || null,
     status_5h: listed.status_5h || null,
@@ -954,6 +960,7 @@ function quotaFromAccount(acc, quotaConfig) {
     last_probe: acc?.last_probe || u.last_probe || null,
     probe_source: u.source || acc?.last_probe?.source || null,
     account_tier: u.account_tier || null,
+    usage_has_fable: u.usage_has_fable === true,
   }
   const cfg = weeklySplitConfig(quotaConfig || {})
   const split = publicWeeklySplit(
@@ -1116,6 +1123,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
           utilization_7d_oi: q.utilization_7d_oi,
           reset_7d_oi: q.reset_7d_oi,
           status_7d_oi: q.status_7d_oi,
+          usage_has_fable: q.usage_has_fable,
         },
         q,
       ).key
@@ -1238,7 +1246,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
         }
       : null,
     account_tier: tierKey,
-    availability,
+    usage_has_fable: isCodex ? false : !!q.usage_has_fable,
     cred_status: credStatusFromAvailability(availability),
     refresh_error: v.refresh_error || v.claude?.refresh_error || runtime?.refresh_error || null,
     sessions,

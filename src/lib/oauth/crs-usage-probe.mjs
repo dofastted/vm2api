@@ -6,9 +6,11 @@ import { isCrsMock } from '../transport/crs-mock.mjs'
 import { callGoWorker, callWorkerGet } from '../transport/go-worker-client.mjs'
 import {
   compareUsageInterpretations,
+  fableScopeText,
   interpretOfficialUsage,
   normLegacyMixed,
   normUsagePercent,
+  usageFablePresence,
 } from './usage-interpret.mjs'
 
 export const FABLE_PROBE_MODEL = 'claude-fable-5'
@@ -77,19 +79,20 @@ export function parseFableScopedWindow(data = {}) {
   if (direct) return direct
   for (const item of Array.isArray(data.limits) ? data.limits : []) {
     if (!item || typeof item !== 'object') continue
-    const kind = String(item.kind || '').toLowerCase()
-    const name = item.scope?.model?.display_name || item.scope?.display_name || item.display_name || item.model || ''
+    const kind = String(item.kind || item.type || '').toLowerCase()
     const scoped = kind === 'weekly_scoped' || kind === 'seven_day_overage_included' || kind === '7d_oi'
-    if (!scoped || !fableScopeName(name)) continue
+    if (!scoped || !fableScopeName(fableScopeText(item))) continue
     return windowOf(item, 'percent')
   }
   for (const item of Array.isArray(data.model_scoped) ? data.model_scoped : []) {
     if (!item || typeof item !== 'object') continue
-    if (!fableScopeName(item.display_name || item.name)) continue
+    if (!fableScopeName(fableScopeText(item))) continue
     return windowOf(item, 'percent')
   }
   return null
 }
+
+export { usageFablePresence, usageHasFableModel } from './usage-interpret.mjs'
 
 export function windowFromRateLimitHeaders(headers = {}, prefix = '7d_oi') {
   const h = {}
@@ -112,6 +115,7 @@ export function parseOAuthUsage(data = {}) {
     seven_day_sonnet: windowOf(data.seven_day_sonnet),
     seven_day_opus: windowOf(data.seven_day_opus || data.seven_day_sonnet),
     seven_day_oi: parseFableScopedWindow(data),
+    usage_has_fable: usageFablePresence(data),
     extra_usage:
       extra && typeof extra === 'object'
         ? {
@@ -199,8 +203,11 @@ export function isFableUnavailablePro(fb = {}, quota = {}) {
   return isInventedFableWindow(fb, quota)
 }
 
-/** Already-Pro slots skip the Fable model hop. Usage 5h/7d still probes. */
 export function shouldProbeFable({ fable = {}, quota = {}, storedTier = null } = {}) {
+  if (quota.usage_has_fable === true) return false
+  if (quota.utilization_7d_oi != null || quota.reset_7d_oi || quota.status_7d_oi || quota['7d_oi']?.reset) {
+    return false
+  }
   const stored = String(storedTier || quota.account_tier || '').toLowerCase()
   if (stored === 'pro') return false
   return !isFableUnavailablePro(fable, quota)
@@ -310,6 +317,7 @@ export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 2000
         seven_day_sonnet: null,
         seven_day_opus: null,
         seven_day_oi: null,
+        usage_has_fable: null,
         extra_usage: null,
       }
 
@@ -328,9 +336,11 @@ export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 2000
       // the slot's stored Claude Code betas, not overwrite them.
     })
     fable = parseFableProbe(fableRes)
-    // Usage API succeeding means the slot grant is not revoked.
-    // A Fable-only 401 is Pro / format noise, not 整号吊销.
-    if (
+    const hasFableUsage = parsed.usage_has_fable === true || !!parsed.seven_day_oi
+    // Usage listing a Fable model is Max. Hop 401/403 is format noise, not Pro.
+    if (usageRes.ok && fable && hasFableUsage) {
+      fable = { ...fable, banned: false, plan_denied: false }
+    } else if (
       usageRes.ok &&
       fable &&
       (fable.banned || fable.status === 401 || /revoked|oauth|authentication/i.test(String(fable.error || '')))

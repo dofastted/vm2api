@@ -1,9 +1,10 @@
 /**
  * Per-tier concurrency + quota thresholds.
  *
- * Account tier comes from the Fable probe (see inferClaudeTier): a plan that
- * rejects Fable is `pro`, one that serves it is `max`. Anything not yet probed
- * (`unknown` / `none`) falls back to the `default` tier.
+ * Account tier comes from official /usage Fable presence (see inferClaudeTier):
+ * a plan that lists a Fable model is `max`; no Fable after a successful usage
+ * probe is `pro`. Anything not yet probed (`unknown` / `none`) falls back to
+ * the `default` tier.
  *
  * Resolution order for every field: tier entry → `default` entry → legacy
  * single-value config (quota.safety_ratio / concurrency.default_max_per_account).

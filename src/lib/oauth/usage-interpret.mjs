@@ -33,6 +33,55 @@ export function statusFromUsedFrac(u) {
   return 'allowed'
 }
 
+export function fableScopeText(item = {}) {
+  if (!item || typeof item !== 'object') return ''
+  const model = item.scope?.model
+  const modelObj = model && typeof model === 'object' ? model : null
+  const modelStr = typeof model === 'string' ? model : typeof item.model === 'string' ? item.model : ''
+  return [
+    modelObj?.display_name,
+    modelObj?.id,
+    modelObj?.name,
+    item.scope?.display_name,
+    item.scope?.id,
+    item.display_name,
+    item.name,
+    modelStr,
+    typeof item.model === 'object' ? item.model?.id || item.model?.display_name : '',
+  ]
+    .filter(Boolean)
+    .join(' ')
+}
+
+function fableCatalogItems(data = {}) {
+  const limits = Array.isArray(data.limits) ? data.limits : []
+  const scoped = Array.isArray(data.model_scoped) ? data.model_scoped : []
+  return [...limits, ...scoped]
+}
+
+/** True when official /usage lists a Fable model. Presence is Max; missing catalog is unknown. */
+export function usageHasFableModel(data = {}) {
+  if (!data || typeof data !== 'object') return false
+  if (data.seven_day_overage_included || data.seven_day_oi || data.seven_day_fable) return true
+  return fableCatalogItems(data).some((item) => item && typeof item === 'object' && /fable/i.test(fableScopeText(item)))
+}
+
+/** `true` / `false` when limits or fable windows exist; `null` when usage has no model catalog. */
+export function usageFablePresence(data = {}) {
+  if (!data || typeof data !== 'object') return null
+  if (usageHasFableModel(data)) return true
+  if (
+    Array.isArray(data.limits) ||
+    Array.isArray(data.model_scoped) ||
+    data.seven_day_oi === null ||
+    data.seven_day_fable === null ||
+    data.seven_day_overage_included === null
+  ) {
+    return false
+  }
+  return null
+}
+
 function viewWindow(rawWin, scale) {
   if (!rawWin || typeof rawWin !== 'object') return null
   const raw = rawNumber(rawWin.utilization ?? rawWin.percent)
@@ -58,10 +107,9 @@ function fableFromLimits(data = {}, scale) {
   if (direct) return viewWindow(direct, scale)
   for (const item of Array.isArray(data.limits) ? data.limits : []) {
     if (!item || typeof item !== 'object') continue
-    const kind = String(item.kind || '').toLowerCase()
-    const name = item.scope?.model?.display_name || item.scope?.display_name || item.display_name || item.model || ''
+    const kind = String(item.kind || item.type || '').toLowerCase()
     const scoped = kind === 'weekly_scoped' || kind === 'seven_day_overage_included' || kind === '7d_oi'
-    if (!scoped || !/fable/i.test(String(name))) continue
+    if (!scoped || !/fable/i.test(fableScopeText(item))) continue
     return viewWindow(item, scale)
   }
   return null

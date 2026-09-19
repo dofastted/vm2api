@@ -490,6 +490,37 @@ test('pro usage probe without fable hop clears leftover 429 as plan_denied', () 
   assert.equal(acc.unified.account_tier, 'pro')
 })
 
+test('usage listing Fable flips stored Pro to Max even if hop is plan_denied', () => {
+  const q = new AccountQuota({
+    dataDir: tmpDir(),
+    config: { quota: { safety_ratio: 0.95, block_on_5h: true, block_on_7d: true } },
+  })
+  q.ingestOAuthUsage('acc-mispro', {
+    ok: true,
+    usage_status: 200,
+    five_hour: { utilization: 0.1, status: 'allowed' },
+    seven_day: { utilization: 0.2, status: 'allowed' },
+    fable: { ok: false, plan_denied: true, status: 403, model: 'claude-fable-5' },
+    probed_at: '2026-08-22T00:00:00Z',
+  })
+  assert.equal(q.repo.get('acc-mispro').unified.account_tier, 'pro')
+  q.ingestOAuthUsage('acc-mispro', {
+    ok: true,
+    usage_status: 200,
+    usage_has_fable: true,
+    five_hour: { utilization: 0.1, status: 'allowed' },
+    seven_day: { utilization: 0.2, resets_at: '2026-08-24T00:00:00Z', status: 'allowed' },
+    seven_day_oi: { utilization: 0.21, resets_at: '2026-08-24T00:00:00Z', status: 'allowed' },
+    fable: { ok: false, plan_denied: true, status: 403, model: 'claude-fable-5' },
+    probed_at: '2026-08-24T00:00:00Z',
+  })
+  const acc = q.repo.get('acc-mispro')
+  assert.equal(acc.unified.account_tier, 'max')
+  assert.equal(acc.unified.usage_has_fable, true)
+  assert.equal(acc.unified.fable.plan_denied, false)
+  assert.equal(acc.unified.fable.ok, true)
+})
+
 test('7d_oi window is Fable-only and does not block the account', () => {
   const q = new AccountQuota({
     dataDir: tmpDir(),

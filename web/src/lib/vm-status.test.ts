@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   accountStatus,
   accountUsable,
+  claudeTier,
   credentialStatus,
   poolStatus,
 } from './vm-status'
@@ -211,5 +212,42 @@ describe('health probe must not paint a live ticket unavailable', () => {
       text: '无效凭证',
     })
     expect(poolStatus(vm).text).toBe('无效凭证')
+  })
+})
+
+describe('claudeTier follows usage Fable presence', () => {
+  it('treats usage Fable as Max even when stored Pro and hop denied', () => {
+    expect(
+      claudeTier(
+        liveVm({
+          account_tier: 'pro',
+          usage_has_fable: true,
+          fable: { plan_denied: true, ok: false, status: 403 },
+        })
+      ).key
+    ).toBe('max')
+  })
+
+  it('treats a real 7d_oi window as Max over stored Pro', () => {
+    expect(
+      claudeTier(
+        liveVm({
+          account_tier: 'pro',
+          utilization_7d_oi: 0.21,
+          reset_7d_oi: '2026-08-24T00:00:00Z',
+        })
+      ).key
+    ).toBe('max')
+  })
+
+  it('keeps Pro when usage has no Fable evidence', () => {
+    expect(
+      claudeTier(
+        liveVm({
+          account_tier: 'pro',
+          fable: { plan_denied: true, status: 403 },
+        })
+      ).key
+    ).toBe('pro')
   })
 })
