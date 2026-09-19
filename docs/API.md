@@ -53,7 +53,7 @@ x-api-key: sk-vm-…
 | `content-type: application/json` | 必填 |
 | `x-session-id` / `x-conversation-id` / `x-claude-code-session-id` | sticky 键（见 `routing.sticky`） |
 | 交付模式 `verified` | 缓冲到 `message_stop` 再回放 |
-| 缓存 TTL `1h` | 出站 cache 升 1h（默认 5m） |
+| 缓存 TTL `1h` | 出站 cache 默认 1h；`x-kin-cache-ttl: 5m` 可降到 5m |
 | 调试开关 | 单请求日志模式 |
 | 钉槽（仅 master） | 虚拟机测试 loopback |
 | `X-Request-ID` | 原样回写响应头 |

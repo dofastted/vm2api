@@ -4,7 +4,6 @@ import {
   PERSONA_PRESET_OPTIONS,
   PERSONA_PRESETS,
   overlayDisabledByPersona,
-  personaExplain,
   presetSeed,
   templateOrFollowPreset,
   validatePersonaTemplate,
@@ -72,11 +71,5 @@ describe('persona template contract', () => {
       )
     ).toEqual([])
     expect(validatePersonaTemplate(DEFAULT_PERSONA_TEMPLATES.zero)).toEqual([])
-  })
-
-  it('keeps official Claude Code inbound skip copy on every scheme', () => {
-    for (const preset of PERSONA_PRESETS) {
-      expect(personaExplain(preset)).toMatch(/官方 Claude Code/)
-    }
   })
 })

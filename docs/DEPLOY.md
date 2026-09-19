@@ -43,7 +43,7 @@ curl -sS --noproxy '*' http://127.0.0.1:8787/health
 
 二进制在仓内 `bin/`，Compose 会拷到挂载目录。`bin/kin-*` 必须 **755**。缺槽位系统镜像时会编 `kin-os/ubuntu:24.04`。
 
-升级到 **v1.2.3** 见下面「已部署机升级到 1.2.3」。已在 1.2.2 只需控制面重启。从更早版本来，槽内 kernel 仍不会跟着 Compose 自动换 ELF，要顺带做 1.2.2 那步 sync。
+升级到 **v1.2.4** 见下面「已部署机升级到 1.2.4」。控制面重启即可，不必换槽内 kernel。
 
 Docker Desktop / WSL 下 `curl 127.0.0.1:8787` 可能失败：
 
@@ -79,6 +79,20 @@ location / {
 ## 本机 Node（备选）
 
 仓内已有 `bin/kin-*`。还要 `npm ci`、`pnpm -C web install --frozen-lockfile && npm run build:web`，以及占位 `vms/active.json`。单元：[deploy/vm2api.service](deploy/vm2api.service)。细节见 [BUILD.md](BUILD.md)。
+
+## 已部署机升级到 1.2.4
+
+1.2.4 只动**控制面 Node + web**（协议页简化 UI、缓存 TTL 默认 1h）。不必换槽内 kin-kernel，也不要 `docker rm` 槽。
+
+```bash
+cd /opt/vm2api
+git fetch --tags
+git checkout v1.2.4
+docker compose up -d --build
+curl -sS --noproxy '*' http://127.0.0.1:8787/health
+```
+
+本机 systemd：`git checkout v1.2.4` → `npm ci` → `pnpm -C web install --frozen-lockfile && npm run build:web` → `systemctl restart vm2api` **一次**。
 
 ## 已部署机升级到 1.2.3
 
