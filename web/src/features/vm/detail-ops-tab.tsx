@@ -1,4 +1,4 @@
-import type { Vm } from '@/types/panel-vm'
+import type { Vm, VmProxySnap } from '@/types/panel-vm'
 import { type CredType, credTypeLabel } from '@/lib/cred-type'
 import { isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
@@ -11,14 +11,19 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { Field } from '@/features/vm/detail-section-primitives'
+import { VmEnvironmentCard } from '@/features/vm/environment-card'
 
 type VmOpsTabProps = {
   vm: Vm
+  proxy: VmProxySnap
   officialCc: boolean
   credType: CredType
   canRefresh: boolean
   refreshBlocked: string
+  savingTimezone: boolean
   onAction: (path: string, body?: unknown) => void
+  onTimezoneSave: (timezone: string) => void
+  onTimezoneFollowProxy: () => void
   onReset: () => void
   onDelete: () => void
 }
@@ -26,11 +31,15 @@ type VmOpsTabProps = {
 export function VmOpsTab(props: VmOpsTabProps) {
   const {
     vm,
+    proxy,
     officialCc,
     credType,
     canRefresh,
     refreshBlocked,
+    savingTimezone,
     onAction,
+    onTimezoneSave,
+    onTimezoneFollowProxy,
     onReset,
     onDelete,
   } = props
@@ -63,6 +72,13 @@ export function VmOpsTab(props: VmOpsTabProps) {
           </Field>
         </CardContent>
       </Card>
+      <VmEnvironmentCard
+        vm={vm}
+        proxy={proxy}
+        saving={savingTimezone}
+        onSave={onTimezoneSave}
+        onFollowProxy={onTimezoneFollowProxy}
+      />
       <div className='flex flex-wrap gap-2'>
         <Button
           size='sm'

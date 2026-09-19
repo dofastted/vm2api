@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { importErrorMessage } from '@/lib/import-errors'
+import { validTimezone } from '@/lib/timezone'
 import { nextVmSeq, vmIdOf, vmNameOf } from '@/lib/vm-name'
 import { Button } from '@/components/ui/button'
 import {
@@ -34,10 +35,10 @@ import {
   VM_REGION_AUTO,
   VM_REGIONS,
   VM_TEMPLATES,
-  VM_TIMEZONES,
   VM_WEIGHT_OPTIONS,
 } from '@/features/vm/create-options'
 import { KernelFeatTags } from '@/features/vm/kernel-feat-tags'
+import { TimezonePicker } from '@/features/vm/timezone-picker'
 
 /** 「之后」的 5 档，对齐 index.html `createVmFromPage()` 的派生逻辑。 */
 export type CreateVmAfter = 'idle' | 'start' | 'proxy' | 'active' | 'full'
@@ -135,7 +136,7 @@ export function CreateVmFields({
           id,
           name: effectiveName,
           kernel,
-          timezone: tz,
+          timezone: tz.trim(),
           locale,
           // 「自动」是纯 UI 哨兵值，不发给后端（对齐 index.html 的 `region || undefined`）。
           region: region === VM_REGION_AUTO ? undefined : region,
@@ -240,18 +241,7 @@ export function CreateVmFields({
           </div>
           <div className='space-y-1'>
             <Label>时区</Label>
-            <Select value={tz} onValueChange={setTz}>
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {VM_TIMEZONES.map(([v, l]) => (
-                  <SelectItem key={v} value={v}>
-                    {l}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <TimezonePicker value={tz} onChange={setTz} />
           </div>
           <div className='space-y-1'>
             <Label>语言</Label>
@@ -320,7 +310,7 @@ export function CreateVmFields({
         ) : null}
         <Button
           onClick={() => create.mutate()}
-          disabled={create.isPending}
+          disabled={create.isPending || !validTimezone(tz)}
           loading={create.isPending}
         >
           {submitLabel}

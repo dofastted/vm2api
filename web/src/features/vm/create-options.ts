@@ -116,13 +116,47 @@ export const VM_REGIONS: [string, string][] = [
   ['ap-southeast', '亚太东南'],
 ]
 
+/**
+ * 「自定义」的哨兵值，与 `VM_REGION_AUTO` 同理：Radix `Select` 不接受空串选项。
+ * 选中它时由调用方渲染输入框，提交的是输入框里的 IANA 名称。
+ * 不能写成某个真实时区，否则自定义输入被清空时会静默提交这个时区。
+ */
+export const VM_TIMEZONE_CUSTOM = '__custom__'
+
+/**
+ * 环境时区预设。后端只校验 IANA 可解析（`validTimezone()`），不限美国区，
+ * 所以这里是覆盖常见出口地区的快捷入口，真正的兜底是「自定义」。
+ */
 export const VM_TIMEZONES: [string, string][] = [
   ['America/Los_Angeles', '洛杉矶 PT'],
   ['America/Denver', '丹佛 MT'],
   ['America/Chicago', '芝加哥 CT'],
   ['America/New_York', '纽约 ET'],
-  ['Asia/Tokyo', '东京 JST (UTC+9)'],
+  ['America/Sao_Paulo', '圣保罗 BRT'],
+  ['Europe/London', '伦敦 GMT/BST'],
+  ['Europe/Paris', '巴黎 CET'],
+  ['Europe/Berlin', '柏林 CET'],
+  ['Europe/Moscow', '莫斯科 MSK'],
+  ['Asia/Dubai', '迪拜 GST'],
+  ['Asia/Kolkata', '加尔各答 IST'],
+  ['Asia/Bangkok', '曼谷 ICT'],
+  ['Asia/Shanghai', '上海 CST'],
+  ['Asia/Hong_Kong', '香港 HKT'],
+  ['Asia/Taipei', '台北 CST'],
+  ['Asia/Singapore', '新加坡 SGT'],
+  ['Asia/Seoul', '首尔 KST'],
+  ['Asia/Tokyo', '东京 JST'],
+  ['Australia/Sydney', '悉尼 AEST'],
+  ['UTC', 'UTC'],
+  [VM_TIMEZONE_CUSTOM, '自定义…'],
 ]
+
+/** 预设里是否已有这个时区（决定下拉该选预设项还是「自定义」）。 */
+export function isPresetTimezone(value: string): boolean {
+  return VM_TIMEZONES.some(
+    ([id]) => id === value && id !== VM_TIMEZONE_CUSTOM
+  )
+}
 
 export const VM_LOCALES: [string, string][] = [
   ['en_US.UTF-8', 'English'],

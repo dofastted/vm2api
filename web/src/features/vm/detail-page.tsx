@@ -127,6 +127,18 @@ export function VmDetailPage() {
     },
     onError: (error: Error) => toast.error(error.message),
   })
+  const saveTimezone = useMutation({
+    mutationFn: (body: Record<string, unknown>) =>
+      api(`/api/panel/vms/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: async (_data, body) => {
+      toast.success(body.timezone_follow_proxy ? '已跟随代理时区' : '已保存时区')
+      await refreshAll()
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
   const testChat = useMutation({
     mutationFn: () =>
       postVm<TestChatResult>(id, '/test-chat', {
@@ -424,11 +436,17 @@ export function VmDetailPage() {
           />
           <VmOpsTab
             vm={vm}
+            proxy={proxy}
             officialCc={officialCc}
             credType={credType}
             canRefresh={canRefresh}
             refreshBlocked={refreshBlocked}
+            savingTimezone={saveTimezone.isPending}
             onAction={(path, body) => act.mutate({ path, body })}
+            onTimezoneSave={(timezone) => saveTimezone.mutate({ timezone })}
+            onTimezoneFollowProxy={() =>
+              saveTimezone.mutate({ timezone_follow_proxy: true })
+            }
             onReset={() => {
               setResetInput('')
               setConfirmReset(true)

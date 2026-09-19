@@ -65,6 +65,12 @@ test('dashboard and vm detail merge pool health onto bound VM', async () => {
   bound.status = 'ok'
   bound.latency_ms = 12
   bound.last_probe_at = '2026-01-01T00:00:00Z'
+  bound.geo_ip = '203.0.113.9'
+  bound.geo_country = 'Japan'
+  bound.geo_country_code = 'JP'
+  bound.geo_city = 'Shinjuku'
+  bound.geo_timezone = 'Asia/Tokyo'
+  bound.geo_checked_at = '2026-01-01T00:00:00Z'
   pool.save()
   pool.stopScheduler()
 
@@ -87,6 +93,8 @@ test('dashboard and vm detail merge pool health onto bound VM', async () => {
   assert.equal(vm.proxy.status, 'ok')
   assert.equal(vm.proxy.latency_ms, 12)
   assert.equal(vm.proxy.host, '10.8.8.8')
+  assert.equal(vm.proxy.geo.timezone, 'Asia/Tokyo')
+  assert.equal(vm.proxy.geo.country_code, 'JP')
   assert.equal(vm.proxy.url, undefined)
   const listed = await buildVmList({ cfg, accountQuota: quota, routingConfig: {}, proxyPool: pool })
   const listedVm = listed.data.items.find((item) => item.id === 'vm-02')
@@ -99,6 +107,7 @@ test('dashboard and vm detail merge pool health onto bound VM', async () => {
   assert.equal(detail.data.vm.schedule_level, listedVm.schedule_level)
   assert.equal(detail.data.vm.schedule_level_mode, listedVm.schedule_level_mode)
   assert.equal(detail.data.proxy.status, 'ok')
+  assert.equal(detail.data.proxy.geo.timezone, 'Asia/Tokyo')
   assert.equal(detail.data.proxy_pool.bound, 1)
 })
 

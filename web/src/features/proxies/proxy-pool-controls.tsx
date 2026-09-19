@@ -8,6 +8,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 
 const BIND_LIMITS = [1, 2, 3, 4, 5, 8, 10, 16, 20, 32]
@@ -20,6 +21,8 @@ type ProxyPoolControlsProps = {
   importing: boolean
   onBindLimitChange: (value: number) => void
   onProbeMinChange: (value: number) => void
+  followProxyTimezone: boolean
+  onFollowProxyTimezoneChange: (value: boolean) => void
   onRawChange: (value: string) => void
   onImport: () => void
   onAddLocal?: () => void
@@ -35,6 +38,8 @@ export function ProxyPoolControls(props: ProxyPoolControlsProps) {
     importing,
     onBindLimitChange,
     onProbeMinChange,
+    followProxyTimezone,
+    onFollowProxyTimezoneChange,
     onRawChange,
     onImport,
     onAddLocal,
@@ -85,6 +90,17 @@ export function ProxyPoolControls(props: ProxyPoolControlsProps) {
               ))}
             </SelectContent>
           </Select>
+        </label>
+        <label className='flex items-center gap-2'>
+          <Switch
+            checked={followProxyTimezone}
+            onCheckedChange={onFollowProxyTimezoneChange}
+            aria-label='绑定后跟随代理时区'
+          />
+          绑定后跟随代理时区
+          <span className='text-xs text-muted-foreground'>
+            手动钉过时区的槽位不受影响
+          </span>
         </label>
       </div>
       <Card className='mb-4'>

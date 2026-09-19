@@ -35,6 +35,7 @@ type ProxyTableProps = {
   copyingId: string
   onToggleSort: (key: ProxySortKey) => void
   onProbe: (id: string) => void
+  onGeo: (id: string) => void
   onDelete: (id: string) => void
   onEdit: (id: string) => void
   onCopy: (id: string) => void
@@ -54,6 +55,7 @@ export function ProxyTable(props: ProxyTableProps) {
     copyingId,
     onToggleSort,
     onProbe,
+    onGeo,
     onDelete,
     onEdit,
     onCopy,
@@ -68,7 +70,7 @@ export function ProxyTable(props: ProxyTableProps) {
         <EmptyState reason='还没有代理。粘贴 SOCKS5 行再点导入。' />
       ) : (
         <div className='overflow-x-auto rounded-lg border border-border/60'>
-          <div className='min-w-[900px]'>
+          <div className='min-w-[1060px]'>
             <div className='flex h-8 items-center border-b bg-muted/30 text-[11px] font-medium tracking-wide text-muted-foreground/80'>
               <SortHead
                 label='代理'
@@ -85,6 +87,14 @@ export function ProxyTable(props: ProxyTableProps) {
                 dir={sortDir}
                 onToggle={onToggleSort}
                 className='min-w-[120px] flex-[1] px-1.5'
+              />
+              <SortHead
+                label='出口地区'
+                col='geo'
+                current={sortKey}
+                dir={sortDir}
+                onToggle={onToggleSort}
+                className='min-w-[160px] flex-[1.2] px-1.5'
               />
               <SortHead
                 label='绑定'
@@ -113,6 +123,7 @@ export function ProxyTable(props: ProxyTableProps) {
                 bindLimit={bindLimit}
                 busy={busy}
                 onProbe={() => p.id && onProbe(p.id)}
+                onGeo={() => p.id && onGeo(p.id)}
                 onDelete={() => p.id && onDelete(p.id)}
                 onEdit={() => p.id && onEdit(p.id)}
                 onCopy={() => p.id && onCopy(p.id)}
@@ -169,6 +180,7 @@ function ProxyRow({
   bindLimit,
   busy,
   onProbe,
+  onGeo,
   onDelete,
   onEdit,
   onCopy,
@@ -184,6 +196,7 @@ function ProxyRow({
   bindLimit: number
   busy: boolean
   onProbe: () => void
+  onGeo: () => void
   onDelete: () => void
   onEdit: () => void
   onCopy: () => void
@@ -232,6 +245,24 @@ function ProxyRow({
         <span className={cn('field-metric text-xs', proxyFieldClass(latTone))}>
           {lat}
         </span>
+      </div>
+      <div className='flex min-w-[160px] flex-[1.2] flex-col justify-center px-1.5 text-xs'>
+        {item.geo?.timezone || item.geo?.country ? (
+          <>
+            <span className='truncate'>
+              {[item.geo.country_code || item.geo.country, item.geo.city]
+                .filter(Boolean)
+                .join(' · ')}
+            </span>
+            <span className='truncate text-[11px] text-muted-foreground'>
+              {item.geo.timezone || '时区未知'}
+            </span>
+          </>
+        ) : (
+          <span className='text-muted-foreground'>
+            {item.geo?.error ? '检测失败' : '未检测'}
+          </span>
+        )}
       </div>
       <div className='flex min-w-[220px] flex-[1.8] flex-wrap items-center gap-1 px-1.5 text-xs'>
         <span className='field-count text-muted-foreground'>
@@ -323,6 +354,16 @@ function ProxyRow({
           onClick={onProbe}
         >
           测
+        </Button>
+        <Button
+          size='sm'
+          variant='ghost'
+          className='px-2'
+          disabled={busy}
+          onClick={onGeo}
+          title='经这条代理查出口 IP 的国家 / 城市 / 时区'
+        >
+          地理
         </Button>
         <Button
           size='sm'

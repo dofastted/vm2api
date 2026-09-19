@@ -101,7 +101,10 @@ import {
   persistSlotEnginePolicy,
   persistVmScheduleLevel,
   persistVmOwner,
+  persistVmTimezone,
 } from '../vm/vm-registry.mjs'
+import { syncVmTimezoneFromProxy } from '../vm/proxy-timezone.mjs'
+import { validTimezone } from '../core/timezone.mjs'
 import { stampVmKind, isCodexVm } from '../vm/vm-kind.mjs'
 import { parseAllowedModelsPatch } from '../pool/slot-model-gate.mjs'
 import { parseScheduleLevelInput } from '../pool/credential-weight.mjs'
@@ -1303,22 +1306,69 @@ export function createPanelHandler(ctx) {
         const hasModels = body && Object.prototype.hasOwnProperty.call(body, 'allowed_models')
         const hasAuthScheme = body && (body.auth_scheme != null || body.authScheme != null)
         const hasScheduleLevel = body && Object.prototype.hasOwnProperty.call(body, 'schedule_level')
+        const hasTimezone = body && Object.prototype.hasOwnProperty.call(body, 'timezone')
+        // `timezone_follow_proxy: true` re-attaches the slot to its exit node's
+        // zone, undoing an earlier hand-pinned value.
+        const followProxyTz = body?.timezone_follow_proxy === true || body?.timezoneFollowProxy === true
         const hasSlotPolicy =
           body &&
           (Object.prototype.hasOwnProperty.call(body, 'inference_engine') ||
             Object.prototype.hasOwnProperty.call(body, 'persona_preset'))
-        if (next == null && nextRpm == null && !hasModels && !hasAuthScheme && !hasSlotPolicy && !hasScheduleLevel) {
+        if (
+          next == null &&
+          nextRpm == null &&
+          !hasModels &&
+          !hasAuthScheme &&
+          !hasSlotPolicy &&
+          !hasScheduleLevel &&
+          !hasTimezone &&
+          !followProxyTz
+        ) {
           return json(res, 400, {
             ok: false,
             error: {
               message:
-                'max_concurrency, max_rpm, allowed_models, auth_scheme, inference_engine, persona_preset or schedule_level required',
+                'max_concurrency, max_rpm, allowed_models, auth_scheme, inference_engine, persona_preset, schedule_level, timezone or timezone_follow_proxy required',
             },
           })
         }
         const parsedScheduleLevel = hasScheduleLevel ? parseScheduleLevelInput(body.schedule_level) : null
         if (parsedScheduleLevel && !parsedScheduleLevel.ok) {
           return json(res, 400, { ok: false, error: { message: parsedScheduleLevel.error } })
+        }
+        let timezoneSync = null
+        if (hasTimezone) {
+          // Any IANA zone is allowed — the US presets are UI defaults, not a
+          // whitelist. Reject only what Intl (and therefore the container TZ)
+          // cannot resolve, so a typo never reaches `docker run -e TZ=`.
+          const zone = validTimezone(body.timezone)
+          if (!zone) {
+            return json(res, 400, {
+              ok: false,
+              error: {
+                type: 'invalid_request_error',
+                code: 'invalid_timezone',
+                message: '时区必须是有效的 IANA 名称，如 Asia/Tokyo',
+                param: 'timezone',
+              },
+            })
+          }
+          const vm = persistVmTimezone(cfg.paths.project, id, zone, { source: 'manual' })
+          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          timezoneSync = { applied: true, timezone: zone, source: 'manual' }
+        } else if (followProxyTz) {
+          const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, { force: true })
+          if (!synced.ok) {
+            return json(res, 400, {
+              ok: false,
+              error: {
+                type: 'invalid_request_error',
+                code: synced.reason || 'proxy_timezone_unknown',
+                message: '未能从代理节点取到时区，请先检测代理地理位置',
+              },
+            })
+          }
+          timezoneSync = { applied: synced.applied, timezone: synced.timezone, source: 'proxy_geo' }
         }
         if (next != null) {
           const vm = applyVmConcurrency(id, next, { override: true })
@@ -1392,6 +1442,7 @@ export function createPanelHandler(ctx) {
             runtime: slotPolicyResult.runtime,
           }
         }
+        if (timezoneSync && detail?.data) detail.data.timezone_sync = timezoneSync
         return json(res, 200, detail)
       }
       // POST /api/panel/vms/:id/probe
@@ -2029,6 +2080,9 @@ export function createPanelHandler(ctx) {
           status: startNow ? 'running' : body.status || 'stopped',
           kernel: wantKernel,
           timezone: normalizeTimezone(generated.timezone),
+          // An explicitly requested zone is a pin: a later proxy bind must not
+          // silently move a slot the operator placed on purpose.
+          timezone_source: validTimezone(body.timezone) ? 'manual' : 'auto',
           locale: generated.locale || STANDARD_LOCALE,
           region: body.region || body.zone || null,
           note: body.note || `${(OS_CATALOG[wantKernel] || {}).pretty || wantKernel} · Go slot worker`,
@@ -3096,11 +3150,16 @@ export function createPanelHandler(ctx) {
         const bindVmId = String(body.bind_vm_id || body.vm_id || '').trim()
         let bound = null
         let worker = null
+        let timezone = null
         if (bindVmId && result.items?.[0]?.id) {
           const bind = proxyPool.bind(result.items[0].id, bindVmId)
           if (bind.ok) {
             bindVmProxy(cfg.paths.project, bindVmId, proxyPool.getProxyForVm(bindVmId))
             bound = bind.proxy
+            // Before the reload: the worker reads vm.timezone when it starts.
+            timezone = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, bindVmId, {
+              proxyId: result.items[0].id,
+            })
             const vm = getVm(cfg.paths.project, bindVmId)
             if (vm?.status === 'running' && process.env.KIN_CRS_MOCK !== '1') {
               setVmSchedulable(cfg.paths.project, bindVmId, false, 'proxy_rebind_worker_reload')
@@ -3111,7 +3170,15 @@ export function createPanelHandler(ctx) {
             }
           }
         }
-        return json(res, 200, panel.ok({ ...result, bound, worker }))
+        return json(res, 200, panel.ok({ ...result, bound, worker, timezone }))
+      }
+      if (req.method === 'POST' && p === '/api/panel/proxies/geo') {
+        const body = await readBody(req, 8192).catch(() => ({}))
+        const result = await proxyPool.detectGeoAll({
+          onlyEnabled: body?.only_enabled !== false,
+          force: body?.force === true,
+        })
+        return json(res, 200, panel.ok(result))
       }
       if (req.method === 'POST' && p === '/api/panel/proxies/probe') {
         const result = await proxyPool.probeAll({ onlyEnabled: true })
@@ -3197,6 +3264,38 @@ export function createPanelHandler(ctx) {
           })
         return json(res, 200, panel.ok(result))
       }
+      if (req.method === 'POST' && /^\/api\/panel\/proxies\/[^/]+\/geo$/.test(p)) {
+        const id = p.split('/')[4]
+        const body = await readBody(req, 8192).catch(() => ({}))
+        const result = await proxyPool.detectGeo(id, { force: body?.force !== false })
+        if (!result.ok && result.error === 'proxy_not_found') {
+          return json(res, 404, {
+            ok: false,
+            error: { type: 'not_found_error', code: result.error, message: result.error },
+          })
+        }
+        if (!result.ok) {
+          return json(res, 502, {
+            ok: false,
+            error: {
+              type: 'upstream_error',
+              code: 'geo_lookup_failed',
+              message: String(result.error || 'geo lookup failed').slice(0, 200),
+              details: { proxy: result.proxy || null },
+            },
+          })
+        }
+        // A slot already bound to this proxy adopts the freshly learned zone.
+        const timezones = []
+        for (const vmId of result.proxy?.bound_vm_ids || []) {
+          const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, vmId, {
+            proxyId: id,
+            detect: false,
+          })
+          timezones.push({ vm_id: vmId, applied: synced.applied, timezone: synced.timezone, reason: synced.reason })
+        }
+        return json(res, 200, panel.ok({ ...result, timezones }))
+      }
       if (req.method === 'POST' && /^\/api\/panel\/proxies\/[^/]+\/enable$/.test(p)) {
         const id = p.split('/')[4]
         const result = proxyPool.setEnabled(id, true)
@@ -3249,6 +3348,8 @@ export function createPanelHandler(ctx) {
           ensureProxyEgress(cfg.paths.project, proxyPool.getProxyForVm(vmId) || proxyPool.getProxyByIdWithAuth(id))
         }
         let worker = null
+        // Runs before the reload so the worker starts with the exit node's zone.
+        const timezone = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, vmId, { proxyId: id })
         const vm = getVm(cfg.paths.project, vmId)
         if (vm?.status === 'running' && process.env.KIN_CRS_MOCK !== '1') {
           setVmSchedulable(cfg.paths.project, vmId, false, 'proxy_rebind_worker_reload')
@@ -3257,7 +3358,7 @@ export function createPanelHandler(ctx) {
           })
           if (worker.ok) restoreSchedulableIfReady(vmId)
         }
-        return json(res, 200, panel.ok({ proxy: result.proxy, worker }))
+        return json(res, 200, panel.ok({ proxy: result.proxy, worker, timezone }))
       }
       if (req.method === 'POST' && /^\/api\/panel\/proxies\/[^/]+\/unbind$/.test(p)) {
         const id = p.split('/')[4]
@@ -3315,6 +3416,9 @@ export function createPanelHandler(ctx) {
         bindVmProxy(cfg.paths.project, vmId, proxyPool.getProxyForVm(vmId))
         if (egressEnabled()) ensureProxyEgress(cfg.paths.project, proxyPool.getProxyForVm(vmId))
         let worker = null
+        const timezone = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, vmId, {
+          proxyId: allocated?.id || null,
+        })
         const vm = getVm(cfg.paths.project, vmId)
         if (vm?.status === 'running' && process.env.KIN_CRS_MOCK !== '1') {
           setVmSchedulable(cfg.paths.project, vmId, false, 'proxy_rebind_worker_reload')
@@ -3323,7 +3427,7 @@ export function createPanelHandler(ctx) {
           })
           if (worker.ok) restoreSchedulableIfReady(vmId)
         }
-        return json(res, 200, panel.ok({ proxy: allocated, worker }))
+        return json(res, 200, panel.ok({ proxy: allocated, worker, timezone }))
       }
 
       return json(res, 404, {

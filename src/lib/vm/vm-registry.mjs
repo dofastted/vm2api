@@ -11,6 +11,7 @@ import { isManualScheduleLocked } from '../pool/schedule-policy.mjs'
 import { manualScheduleLevelOf, parseScheduleLevelInput } from '../pool/credential-weight.mjs'
 import { normalizeOwnerId, vmOriginOf } from '../admin/resource-owner.mjs'
 import { normalizeVmKind } from './vm-kind.mjs'
+import { validTimezone } from '../core/timezone.mjs'
 import {
   extraFromCodexHeaders,
   extraToCodexSnapshot,
@@ -86,6 +87,7 @@ export function summarizeVm(vm, projectRoot = null) {
     weight: vm.policy?.weight ?? 1,
     schedule_level_manual: manualScheduleLevelOf(vm),
     timezone: vm.timezone || null,
+    timezone_source: vm.timezone_source || 'auto',
     locale: vm.locale || null,
     proxy: vm.proxy ? { ...vm.proxy, password: vm.proxy.password ? '***' : (vm.proxy.password ?? null) } : null,
     claude_code_version: vm.claude_code_version || null,
@@ -309,6 +311,29 @@ export function bindVmProxy(projectRoot, id, proxyInfo) {
       }
     : null
   if (proxyInfo) vm.proxy_cli_enabled = true
+  atomicWriteJson(file, vm)
+  return summarizeVm(vm)
+}
+
+/**
+ * Write the slot's environment timezone (`TZ` inside the container, `# Environment`
+ * in the persona). `source` records who decided it: `manual` pins the value so a
+ * later proxy bind will not overwrite it, `proxy_geo` marks it as following the
+ * bound exit node.
+ *
+ * The fingerprint carries its own copy of the zone — leaving that stale would
+ * make the workstation identity disagree with the container clock.
+ */
+export function persistVmTimezone(projectRoot, id, timezone, { source = 'manual' } = {}) {
+  const zone = validTimezone(timezone)
+  if (!zone) return null
+  const file = path.join(projectRoot, 'vms', `${id}.json`)
+  if (!fs.existsSync(file)) return null
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.timezone = zone
+  vm.timezone_source = source
+  if (vm.fingerprint && typeof vm.fingerprint === 'object') vm.fingerprint.timezone = zone
+  vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm)
   return summarizeVm(vm)
 }

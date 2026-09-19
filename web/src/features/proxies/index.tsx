@@ -129,6 +129,35 @@ export function ProxiesPage() {
     },
     onError: (error: Error) => toast.error(error.message),
   })
+  const geoOne = useMutation({
+    mutationFn: (id: string) =>
+      api<{ geo?: { timezone?: string | null; country?: string | null } }>(
+        `/api/panel/proxies/${encodeURIComponent(id)}/geo`,
+        { method: 'POST' }
+      ),
+    onSuccess: async (data) => {
+      const where = [data.geo?.country, data.geo?.timezone]
+        .filter(Boolean)
+        .join(' · ')
+      toast.success(where ? `出口位置 ${where}` : '已检测')
+      await refresh()
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
+  const geoAll = useMutation({
+    mutationFn: () =>
+      api<{ results?: { ok?: boolean }[] }>('/api/panel/proxies/geo', {
+        method: 'POST',
+        body: JSON.stringify({ force: true }),
+      }),
+    onSuccess: async (data) => {
+      const rows = data.results || []
+      const ok = rows.filter((r) => r.ok).length
+      toast.success(`地理检测完成 ${ok}/${rows.length}`)
+      await refresh()
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
   const remove = useMutation({
     mutationFn: (id: string) =>
       api(`/api/panel/proxies/${encodeURIComponent(id)}`, {
@@ -210,6 +239,7 @@ export function ProxiesPage() {
 
   const busy =
     probeOne.isPending ||
+    geoOne.isPending ||
     remove.isPending ||
     saveConfig.isPending ||
     setEnabled.isPending ||
@@ -230,15 +260,26 @@ export function ProxiesPage() {
     <PageHeader
       title={VIEW_TITLES.proxies}
       extra={
-        <Button
-          variant='outline'
-          title='只测 SOCKS TCP，不打 Anthropic'
-          onClick={() => probeAll.mutate()}
-          disabled={probeAll.isPending}
-          loading={probeAll.isPending}
-        >
-          测通
-        </Button>
+        <>
+          <Button
+            variant='outline'
+            title='经每条代理查出口 IP 的国家 / 城市 / 时区'
+            onClick={() => geoAll.mutate()}
+            disabled={geoAll.isPending}
+            loading={geoAll.isPending}
+          >
+            测地理
+          </Button>
+          <Button
+            variant='outline'
+            title='只测 SOCKS TCP，不打 Anthropic'
+            onClick={() => probeAll.mutate()}
+            disabled={probeAll.isPending}
+            loading={probeAll.isPending}
+          >
+            测通
+          </Button>
+        </>
       }
     >
       <QueryGate
@@ -277,6 +318,10 @@ export function ProxiesPage() {
           onProbeMinChange={(value) =>
             saveConfig.mutate({ probe_interval_min: value })
           }
+          followProxyTimezone={cfg.follow_proxy_timezone !== false}
+          onFollowProxyTimezoneChange={(value) =>
+            saveConfig.mutate({ follow_proxy_timezone: value })
+          }
           onRawChange={setRaw}
           onImport={() => importPx.mutate()}
           onAddLocal={() => addLocal.mutate()}
@@ -298,6 +343,7 @@ export function ProxiesPage() {
           copyingId={copyUri.isPending ? copyUri.variables : ''}
           onToggleSort={toggleSort}
           onProbe={(id) => probeOne.mutate(id)}
+          onGeo={(id) => geoOne.mutate(id)}
           onDelete={setDelId}
           onEdit={setEditId}
           onCopy={(id) => copyUri.mutate(id)}

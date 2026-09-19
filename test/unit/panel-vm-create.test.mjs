@@ -114,6 +114,7 @@ test('create preserves Tokyo timezone in the VM, fingerprint, and CLI seed files
     assert.equal(vm.timezone, 'Asia/Tokyo')
     const saved = JSON.parse(fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`), 'utf8'))
     assert.equal(saved.timezone, 'Asia/Tokyo')
+    assert.equal(saved.timezone_source, 'manual')
     assert.equal(saved.fingerprint.timezone, 'Asia/Tokyo')
     assert.equal(saved.locale, 'en_US.UTF-8')
     const claudeDir = path.join(root, 'vms', vm.id, 'cli-home', '.claude')

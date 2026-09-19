@@ -31,7 +31,7 @@
 | GET | `/dashboard` | 总览：健康、KPI、`proxy_pool`、`ops`（默认近 1h SLA/TTFT）、`billing` |
 | GET | `/vms` | 列表（`has_token`、`cred_status`、`proxy_configured`、`can_import_credential`、`account_tier`、`schedule_level`、`schedule_level_mode`、`worker_credential`、Fable 轨） |
 | GET | `/vms/:id` | 详情 + 调度等级 + 代理健康 + `billing.today/window_5h/window_7d/by_model` + `account.runtime_window` |
-| PATCH | `/vms/:id` | 热改并发、模型白名单、槽策略或 `schedule_level`（不重启槽） |
+| PATCH | `/vms/:id` | 热改并发、模型白名单、槽策略、`schedule_level` 或 `timezone`（不重启槽）。`timezone` 为任意有效 IANA 名称，会钉住该槽（后续绑定不覆盖）；`timezone_follow_proxy: true` 重新跟随已绑代理的出口时区 |
 | POST | `/vms/:id/probe` | 槽 SOCKS5 探官方 `/usage` + Fable（Pro 跳过 Fable） |
 | POST | `/vms/:id/schedulable` | `{ schedulable }` 是否入池；不改容器 |
 | POST | `/vms/:id/cooldown/clear` | 清账号/模型冷却、粘性钉和 `/usage` 429 旗标，重新入池 |
@@ -190,13 +190,21 @@ Claude 槽测试与能力探针走官方 CC 入站（`/v1/messages`）。GPT/Cod
 | GET | `/backups/:id/download` |
 | POST | `/backups/:id/restore` 须 `{ "confirm": true }` |
 | GET | `/proxies` |
-| POST | `/proxies/import` · `/proxies/probe` |
+| POST | `/proxies/import` · `/proxies/probe` · `/proxies/geo` |
 | GET/PUT | `/proxies/config` |
 | PUT | `/proxies/:id` 改 host/port/账密 |
-| POST | `/proxies/:id/enable` · `/disable` · `/bind` · `/unbind` · `/reveal` |
+| POST | `/proxies/:id/enable` · `/disable` · `/bind` · `/unbind` · `/reveal` · `/geo` |
 | DELETE | `/proxies/:id` |
 
 恢复期间协议口 503。每个槽位必须绑定 SOCKS5。`PUT /proxies/config` 的 `disconnect_on_error`（默认 false）：运行时 SOCKS 错误立刻停该槽调度、回写失败并重建 worker；其它健康槽仍可 failover。
+
+`PUT /proxies/config` 的 `follow_proxy_timezone`（默认 true）：绑定一条代理后，该槽采用出口节点的 IANA 时区（persona `# Environment`、指纹、容器 `TZ`）。操作者在创建时或 `PATCH /vms/:id` 手动指定过时区的槽不受影响。
+
+### `POST /proxies/geo` · `POST /proxies/:id/geo`
+
+经该代理本身去查出口 IP 的国家 / 城市 / 时区（本地出口走宿主机默认路由）。结果落在 `proxies.geo_*` 列，列表响应的 `geo` 字段回显。单条成功后，已绑槽位在 `follow_proxy_timezone` 开启且未被手动钉住时会改用该时区。
+
+响应 `{ proxy, geo, cached, timezones }`（单条）或 `{ total, results }`（批量）。错误：`404 proxy_not_found`、`502 geo_lookup_failed`。`force: true` 忽略缓存重查。
 
 ### `PUT /proxies/:id`
 

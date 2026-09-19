@@ -1,6 +1,6 @@
 import type { VmProxySnap } from '@/types/panel-vm'
 
-export type ProxySortKey = 'host' | 'status' | 'vm'
+export type ProxySortKey = 'host' | 'status' | 'vm' | 'geo'
 
 export function proxyBoundIds(prx: VmProxySnap | undefined): string[] {
   if (!prx) return []
@@ -124,6 +124,12 @@ export function sortedProxies(
       )
     }
     if (key === 'status') return cmp(a.status || '', b.status || '', dir)
+    if (key === 'geo') {
+      // 未检测的排在最后：它们是「待办」，不是某个国家。
+      const ga = a.geo?.country_code || a.geo?.country || '\uffff'
+      const gb = b.geo?.country_code || b.geo?.country || '\uffff'
+      return cmp(ga, gb, dir)
+    }
     return cmp(proxyBoundIds(a)[0] || '', proxyBoundIds(b)[0] || '', dir)
   })
   return rows

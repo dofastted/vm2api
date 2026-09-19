@@ -14,6 +14,8 @@ import crypto from 'node:crypto'
 import { resolveStoreDb } from '../db/database.mjs'
 import { ProxiesRepo } from '../db/repos/proxies-repo.mjs'
 import { canBindProxyToVm, normalizeOwnerId, proxyOwnerId } from '../admin/resource-owner.mjs'
+import { validTimezone } from '../core/timezone.mjs'
+import { lookupProxyGeo } from './proxy-geo.mjs'
 import { LOCAL_EGRESS_ID, isLocalEgressProxy } from './egress.mjs'
 
 export const MAX_VMS_PER_PROXY = 5
@@ -26,6 +28,10 @@ const DEFAULT_CONFIG = {
   max_failures: 2, // consecutive failures before disable
   enabled: true,
   disconnect_on_error: false, // experimental: stop slot + tear SOCKS on runtime errors
+  geo_timeout_ms: 8000,
+  // Bind a proxy -> the slot adopts that exit node's timezone unless the
+  // operator pinned one by hand (vm.timezone_source === 'manual').
+  follow_proxy_timezone: true,
   bind_limit: MAX_VMS_PER_PROXY,
 }
 
@@ -84,6 +90,27 @@ export function boundVmIdsOf(proxy) {
 export function proxyHasVm(proxy, vmId) {
   if (!proxy || !vmId) return false
   return boundVmIdsOf(proxy).includes(String(vmId))
+}
+
+/**
+ * Flat `geo_*` columns -> one nested object, or null when the row was never
+ * resolved. A failed lookup still returns an object (carrying `error`) so the
+ * panel can tell "detection failed" from "not detected yet".
+ */
+export function proxyGeoOf(proxy) {
+  if (!proxy) return null
+  if (!proxy.geo_checked_at && !proxy.geo_ip && !proxy.geo_error) return null
+  return {
+    ip: proxy.geo_ip || null,
+    country: proxy.geo_country || null,
+    country_code: proxy.geo_country_code || null,
+    region: proxy.geo_region || null,
+    city: proxy.geo_city || null,
+    isp: proxy.geo_isp || null,
+    timezone: proxy.geo_timezone || null,
+    checked_at: proxy.geo_checked_at || null,
+    error: proxy.geo_error || null,
+  }
 }
 
 function setBoundVmIds(proxy, ids) {
@@ -229,7 +256,16 @@ export function parseSocks5Line(line) {
 }
 
 export class ProxyPool {
-  constructor({ dataDir, db, onDisableVm, onDisconnectVm, onEnableVm, egressCheck, repairEgress } = {}) {
+  constructor({
+    dataDir,
+    db,
+    onDisableVm,
+    onDisconnectVm,
+    onEnableVm,
+    egressCheck,
+    repairEgress,
+    geoLookup,
+  } = {}) {
     this.db = resolveStoreDb({ db, dataDir })
     this.repo = new ProxiesRepo(this.db)
     this.onDisableVm = onDisableVm // (vmId, reason, proxyId) => void
@@ -237,6 +273,8 @@ export class ProxyPool {
     this.onEnableVm = onEnableVm // (vmId, reason, proxyId) => void
     this.egressCheck = egressCheck
     this.repairEgress = repairEgress
+    // Injectable so geo detection is testable without leaving the machine.
+    this.geoLookup = geoLookup || lookupProxyGeo
     this.state = { config: { ...DEFAULT_CONFIG }, proxies: [] }
     this._timer = null
     this._probing = false
@@ -329,6 +367,7 @@ export class ProxyPool {
       created_at: p.created_at,
       kind: isLocalEgressProxy(p) ? 'local' : 'socks5',
       scheme: isLocalEgressProxy(p) ? 'local' : p.scheme || 'socks5',
+      geo: proxyGeoOf(p),
     }
   }
 
@@ -573,6 +612,12 @@ export class ProxyPool {
     if (patch.probe_timeout_ms != null) {
       this.state.config.probe_timeout_ms = Math.max(1000, Number(patch.probe_timeout_ms) || 8000)
     }
+    if (patch.geo_timeout_ms != null) {
+      this.state.config.geo_timeout_ms = Math.max(1000, Number(patch.geo_timeout_ms) || 8000)
+    }
+    if (patch.follow_proxy_timezone != null) {
+      this.state.config.follow_proxy_timezone = !!patch.follow_proxy_timezone
+    }
     if (patch.max_failures != null) {
       this.state.config.max_failures = Math.max(1, Number(patch.max_failures) || 2)
     }
@@ -776,6 +821,79 @@ export class ProxyPool {
     } finally {
       this._probing = false
     }
+  }
+
+  /** Config switch for "a freshly bound slot adopts its proxy's timezone". */
+  followProxyTimezoneEnabled() {
+    return this.state.config?.follow_proxy_timezone !== false
+  }
+
+  /**
+   * Resolve one proxy's exit-node location through the proxy itself.
+   * `force` re-queries a row that already has a location; without it a cached
+   * hit is returned untouched so bind-time detection stays cheap.
+   */
+  async detectGeo(proxyId, { force = false } = {}) {
+    const p = this.state.proxies.find((x) => x.id === proxyId)
+    if (!p) return { ok: false, error: 'proxy_not_found' }
+    if (!force && p.geo_checked_at && p.geo_ip) {
+      return { ok: true, cached: true, proxy: this.publicProxy(p), geo: proxyGeoOf(p) }
+    }
+    // Local egress has no SOCKS URL: the lookup then leaves over the host
+    // default route, which is precisely that row's exit path.
+    const url = isLocalEgressProxy(p) ? '' : this._withAuth(p).url
+    const result = await this.geoLookup(url, { timeoutMs: this.state.config?.geo_timeout_ms })
+    this._applyGeoResult(p, result)
+    this.save()
+    if (!result?.ok) return { ok: false, error: result?.error || 'geo_lookup_failed', proxy: this.publicProxy(p) }
+    return { ok: true, cached: false, proxy: this.publicProxy(p), geo: proxyGeoOf(p) }
+  }
+
+  async detectGeoAll({ onlyEnabled = true, force = false } = {}) {
+    const list = this.state.proxies.filter((p) => (onlyEnabled ? p.enabled : true))
+    const results = []
+    for (const p of list) {
+      const result = await this.detectGeo(p.id, { force })
+      results.push({
+        id: p.id,
+        ok: !!result.ok,
+        cached: !!result.cached,
+        error: result.ok ? null : result.error || null,
+        geo: result.ok ? result.geo : null,
+      })
+    }
+    return { ok: true, total: results.length, results }
+  }
+
+  _applyGeoResult(p, result) {
+    p.geo_checked_at = new Date().toISOString()
+    if (!result?.ok) {
+      // Keep the previous location: a transient lookup failure should not blank
+      // out a known exit node the slot timezone may already follow.
+      p.geo_error = String(result?.error || 'geo_lookup_failed').slice(0, 200)
+      return
+    }
+    const geo = result.geo || {}
+    p.geo_error = null
+    p.geo_ip = geo.ip || null
+    p.geo_country = geo.country || null
+    p.geo_country_code = geo.country_code || null
+    p.geo_region = geo.region || null
+    p.geo_city = geo.city || null
+    p.geo_isp = geo.isp || null
+    p.geo_timezone = validTimezone(geo.timezone) || null
+  }
+
+  /** Detected IANA zone of one proxy, '' when unknown. */
+  proxyTimezone(proxyId) {
+    const p = this.state.proxies.find((x) => x.id === proxyId)
+    return p ? validTimezone(p.geo_timezone) : ''
+  }
+
+  /** Detected IANA zone of whatever proxy currently serves this VM, '' when unknown. */
+  timezoneForVm(vmId) {
+    const p = this.state.proxies.find((x) => proxyHasVm(x, vmId))
+    return p ? validTimezone(p.geo_timezone) : ''
   }
 
   _applyProbeResult(p, result, { cascade = true } = {}) {

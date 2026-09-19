@@ -62,6 +62,7 @@ export function buildRecreatedVmRecord(prev, generated) {
     status: 'stopped',
     kernel: prev.kernel || 'ubuntu-24.04',
     timezone,
+    timezone_source: prev.timezone_source || 'auto',
     locale,
     region: prev.region || null,
     note: prev.note || null,

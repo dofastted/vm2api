@@ -13,6 +13,7 @@ test('recreated record keeps slot identity and drops credentials', () => {
     name: '07',
     kernel: 'debian-12',
     timezone: 'America/Chicago',
+    timezone_source: 'manual',
     locale: 'en_US.UTF-8',
     note: 'keep me',
     proxy: { id: 'px-7', url: 'socks5h://127.0.0.1:1080' },
@@ -33,6 +34,7 @@ test('recreated record keeps slot identity and drops credentials', () => {
   assert.equal(next.name, '07')
   assert.equal(next.kernel, 'debian-12')
   assert.equal(next.timezone, 'America/Chicago')
+  assert.equal(next.timezone_source, 'manual')
   assert.deepEqual(next.proxy, prev.proxy)
   assert.equal(next.policy.maxConcurrency, 12)
   assert.equal(next.policy.weight, 3)
