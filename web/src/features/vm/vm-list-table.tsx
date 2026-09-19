@@ -2,14 +2,13 @@ import { useNavigate } from '@tanstack/react-router'
 import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
 import type { StatusTone } from '@/types/status'
-import { fableState, fmtResetClock } from '@/lib/fable-status'
+import { expiresAtToMs, fableState, fmtResetClock } from '@/lib/fable-status'
 import { fmtNum, fmtUsd, remainPct, usedPctOf } from '@/lib/format'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
 import { isCodexVm } from '@/lib/vm-kind'
 import {
   claudeTier,
-  credExpiry,
   fleetGroup,
   poolStatus,
   vmCooldown,
@@ -240,20 +239,27 @@ function PriorityChip({ vm }: { vm: Vm }) {
 
 function PlanCell({ vm, now }: { vm: Vm; now: number }) {
   const skin = tierVisual(vm)
-  const exp = credExpiry(vm)
-  const left = exp.ms != null ? exp.ms - now : null
-  const due =
-    left != null && left <= 0
-      ? { text: '已过期', cls: 'text-[color:var(--status-bad)]' }
-      : left != null && left < 7 * 86400000
-        ? { text: '7d到期', cls: 'text-[color:var(--status-caution)]' }
-        : null
+  const hasToken = Boolean(vm.has_token)
+  const resetAt = vm.reset_7d || vm.reset_7d_oi
+  const clock = hasToken ? fmtResetClock(resetAt) : null
+  const resetMs = clock ? expiresAtToMs(resetAt) : 0
+  const due = clock
+    ? {
+        text: clock,
+        cls:
+          resetMs > 0 && resetMs <= now
+            ? 'text-[color:var(--status-bad)]'
+            : 'text-muted-foreground',
+      }
+    : null
   if (isCodexVm(vm)) {
     return (
       <div className='flex flex-col items-start gap-1'>
         <OpenaiPlanBadge vm={vm} />
         {due ? (
-          <span className={cn('text-sm font-medium', due.cls)}>{due.text}</span>
+          <span className={cn('font-mono text-sm tabular-nums', due.cls)}>
+            {due.text}
+          </span>
         ) : null}
       </div>
     )
@@ -274,7 +280,9 @@ function PlanCell({ vm, now }: { vm: Vm; now: number }) {
         <span className='text-muted-foreground'>—</span>
       )}
       {due ? (
-        <span className={cn('text-sm font-medium', due.cls)}>{due.text}</span>
+        <span className={cn('font-mono text-sm tabular-nums', due.cls)}>
+          {due.text}
+        </span>
       ) : null}
     </div>
   )

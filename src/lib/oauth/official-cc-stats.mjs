@@ -45,10 +45,10 @@ function windowFromText(text, patterns) {
 }
 
 export function inferTierFromOfficialStats(text = '', structured = {}) {
+  if (structured?.seven_day_oi || structured?.fable?.ok || structured?.usage_has_fable) return 'max'
   const blob = `${text} ${JSON.stringify(structured || {})}`.toLowerCase()
   if (/\b(claude\s+max|max\s*20x|max plan|plan:\s*max)\b/.test(blob)) return 'max'
   if (/\b(claude\s+pro|pro plan|plan:\s*pro)\b/.test(blob)) return 'pro'
-  if (structured?.seven_day_oi || structured?.fable?.ok) return 'max'
   if (structured?.fable?.plan_denied) return 'pro'
   return null
 }
@@ -98,6 +98,7 @@ export function parseOfficialCcStats(raw) {
     seven_day_sonnet: fromOfficialApi?.seven_day_sonnet || fromNested?.seven_day_sonnet || null,
     seven_day_oi: sevenDayOi,
     extra_usage: extra,
+    usage_has_fable: fromOfficialApi?.usage_has_fable === true || fromNested?.usage_has_fable === true,
   }
   const accountTier = inferTierFromOfficialStats(text, { ...usage, fable: structured?.fable })
   return {

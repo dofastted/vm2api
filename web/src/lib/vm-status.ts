@@ -440,18 +440,18 @@ export function claudeTier(vm: Vm | undefined): StatusTone {
   if (!vm?.has_token) return { key: 'none', label: '—', cls: 'none', text: '—' }
   const fb = vm.fable || {}
   const raw = String(vm.account_tier || '').toLowerCase()
-  // 落盘的 Max 压过 Fable 拒绝：Max 套餐也可能没有 Fable 权限，一次 403
-  // 不是 Pro 的证据。顺序与后端 inferClaudeTier / claude-tier.mjs 一致。
-  if (raw === 'max')
-    return { key: 'max', label: 'Max', cls: 'max', text: 'Max' }
-  if (raw === 'pro' || fablePlanDenied(fb))
-    return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
   const oi = vm.utilization_7d_oi
   const oiN =
     oi == null ? null : Number(oi) > 1.5 ? Number(oi) / 100 : Number(oi)
   const realFable =
-    Boolean(fb.ok) || (oiN != null && Boolean(vm.reset_7d_oi || oiN < 1))
-  if (realFable) return { key: 'max', label: 'Max', cls: 'max', text: 'Max' }
+    vm.usage_has_fable === true ||
+    Boolean(fb.ok) ||
+    (oiN != null && Boolean(vm.reset_7d_oi || oiN < 1))
+  // Usage 里有 Fable 就是 Max。落盘 pro / hop 403 不能盖掉。
+  if (realFable || raw === 'max')
+    return { key: 'max', label: 'Max', cls: 'max', text: 'Max' }
+  if (raw === 'pro' || fablePlanDenied(fb))
+    return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
   return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
 }
 

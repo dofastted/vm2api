@@ -51,6 +51,33 @@ test('oauth usage parse: Fable weekly_scoped from limits[]', () => {
   assert.equal(p.seven_day_oi.resets_at, '2026-08-24T00:00:00Z')
 })
 
+test('oauth usage parse: Fable model id in limits is Max evidence', () => {
+  const p = parseOAuthUsage({
+    five_hour: { utilization: 10, resets_at: '2026-08-18T20:00:00Z' },
+    seven_day: { utilization: 20, resets_at: '2026-08-24T00:00:00Z' },
+    limits: [
+      {
+        kind: 'weekly_scoped',
+        percent: 3,
+        resets_at: '2026-08-24T00:00:00Z',
+        scope: { model: { id: 'claude-fable-5-1' } },
+      },
+    ],
+  })
+  assert.equal(p.usage_has_fable, true)
+  assert.equal(p.seven_day_oi.utilization, 0.03)
+})
+
+test('oauth usage parse: limits without Fable is not Max', () => {
+  const p = parseOAuthUsage({
+    five_hour: { utilization: 10 },
+    seven_day: { utilization: 20 },
+    limits: [{ kind: 'weekly_all', percent: 20, scope: { model: { display_name: 'Sonnet' } } }],
+  })
+  assert.equal(p.usage_has_fable, false)
+  assert.equal(p.seven_day_oi, null)
+})
+
 test('normUtilization header/legacy: 85 is 0.85, 0.85 stays 0.85', () => {
   assert.equal(normUtilization(85), 0.85)
   assert.equal(normUtilization(0.85), 0.85)
@@ -96,15 +123,16 @@ test('fable probe reads 7d_oi utilization from response headers', () => {
   assert.equal(r.reset_at, '2026-08-24T00:00:00Z')
 })
 
-test('Pro slots skip Fable model probe', () => {
+test('Pro slots skip Fable model probe unless usage already listed Fable', () => {
   assert.equal(shouldProbeFable({ storedTier: 'pro' }), false)
   assert.equal(shouldProbeFable({ fable: { plan_denied: true, status: 403 } }), false)
   assert.equal(shouldProbeFable({ fable: { ok: false, status: 429, error: 'Error' } }), false)
   assert.equal(
     shouldProbeFable({ fable: { ok: true }, quota: { utilization_7d_oi: 0.21, reset_7d_oi: '2026-08-24T00:00:00Z' } }),
-    true,
+    false,
   )
   assert.equal(shouldProbeFable({ fable: {}, storedTier: 'max' }), true)
+  assert.equal(shouldProbeFable({ storedTier: 'pro', quota: { usage_has_fable: true } }), false)
 })
 
 test('Fable 429 without a real 7d_oi window is Pro', () => {

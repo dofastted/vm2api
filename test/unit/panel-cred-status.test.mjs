@@ -476,5 +476,19 @@ test('Claude tier: no token is none, plan denied is Pro, Fable window is Max', (
     ).key,
     'max',
   )
+  assert.equal(
+    inferClaudeTier(
+      { has_token: true, account_tier: 'pro' },
+      { utilization_7d_oi: 0.21, reset_7d_oi: '2026-08-24T00:00:00Z' },
+    ).key,
+    'max',
+  )
+  assert.equal(
+    inferClaudeTier(
+      { has_token: true, account_tier: 'pro' },
+      { usage_has_fable: true, fable: { plan_denied: true, ok: false, status: 403 } },
+    ).key,
+    'max',
+  )
   assert.equal(inferClaudeTier({ has_token: true }).key, 'unknown')
 })

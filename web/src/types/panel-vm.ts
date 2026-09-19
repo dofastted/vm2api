@@ -159,6 +159,8 @@ export type Vm = {
   fable?: Record<string, unknown>
   weekly_split?: Record<string, unknown>
   account_tier?: string
+  /** Official /usage listed a Fable model. Overrides leftover Pro stamps. */
+  usage_has_fable?: boolean
   /** anthropic | openai。缺省按 Claude 槽展示。 */
   platform?: string | null
   /** claude | codex */
