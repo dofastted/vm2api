@@ -19,7 +19,7 @@ data
 **/*.dek
 docs/images
 test
-crates/*/target
+crates
 worker/bin
 *.md
 !README.md

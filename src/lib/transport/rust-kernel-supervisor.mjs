@@ -226,7 +226,7 @@ async function killWrapDataplane(container, runDockerExec) {
       [
         'pkill -f /home/kincli/.kin/kin-kernel.bin',
         'pkill -f /home/kincli/.kin/glibc239/ld-linux',
-        'pkill -f /home/kincli/.kin/cli-dist/cli-node.js',
+        'pkill -f /home/kincli/.kin/cli-node',
         'true',
       ].join(' >/dev/null 2>&1; '),
     ],
@@ -240,7 +240,7 @@ export function wrapNewerThanKernel(exec) {
   if (!home) return false
   const kin = path.join(home, '.kin')
   let wrapM = 0
-  for (const name of ['kin-kernel', 'kin-kernel.bin', path.join('cli-dist', 'cli-node.js')]) {
+  for (const name of ['kin-kernel', 'kin-kernel.bin', 'cli-node']) {
     try {
       wrapM = Math.max(wrapM, fs.statSync(path.join(kin, name)).mtimeMs)
     } catch {}

@@ -2,7 +2,6 @@
   "source_vm": "vm-13",
   "captured_at": "2026-09-13T09:03:27.449686Z",
   "files": [
-    "bun",
     "cli-node"
   ],
   "kernel": "kin-kernel.bin",

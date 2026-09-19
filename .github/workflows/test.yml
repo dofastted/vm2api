@@ -1,4 +1,4 @@
-# Required PR/main gate: unit + egress/telemetry Go + rust kernels + web.
+# Required PR/main gate: unit + egress/telemetry Go + prebuilt kernel ELFs + web.
 name: ci
 
 on:
@@ -52,18 +52,16 @@ jobs:
 
   kernel:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: cargo test kin-kernel
-        run: cargo test --manifest-path crates/kin-kernel/Cargo.toml
-      - name: cargo test codex-kernel
-        run: cargo test --manifest-path crates/codex-kernel/Cargo.toml
-      - name: release build
+      - name: prebuilt kernel ELFs
         run: |
-          cargo build --release --manifest-path crates/kin-kernel/Cargo.toml
-          cargo build --release --manifest-path crates/codex-kernel/Cargo.toml
+          set -e
+          for b in bin/kin-kernel bin/kin-codex-kernel share/wrap-cli/kin-kernel.bin share/wrap-cli/cli-node; do
+            test -x "$b"
+            file "$b" | grep -q 'ELF 64-bit'
+          done
 
   web:
     runs-on: ubuntu-latest

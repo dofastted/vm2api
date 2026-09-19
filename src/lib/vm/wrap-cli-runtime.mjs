@@ -1,6 +1,6 @@
 /**
  * Wrap inference CLI lives in the slot home, next to the Go worker.
- * Create/start copies a prebuilt patched dist (not `npm i` + in-slot patch).
+ * Create/start copies a prebuilt cli-node ELF (not JS dist / in-slot patch).
  * Engine rust|go only chooses which process serves /v1; both stay on disk.
  * CLI always pre-opens 20 native_messages slots; Node maxConcurrency uses N.
  *
@@ -12,8 +12,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { kernelBinPath } from '../transport/rust-kernel-supervisor.mjs'
 
-export const WRAP_CLI_FILES = Object.freeze(['bun', 'cli-node'])
-export const WRAP_CLI_DIST = 'cli-dist'
+export const WRAP_CLI_FILES = Object.freeze(['cli-node'])
 export const WRAP_KERNEL_BIN = 'kin-kernel.bin'
 export const WRAP_KERNEL_WRAPPER = 'kin-kernel'
 export const WRAP_GLIBC_DIR = 'glibc239'
@@ -77,15 +76,6 @@ export function inspectWrapCliDir(dir) {
     if (!isFile(p)) {
       return { ok: false, code: 'wrap_cli_incomplete', error: `wrap CLI missing ${name}` }
     }
-  }
-  const dist = path.join(dir, WRAP_CLI_DIST)
-  const entry = path.join(dist, 'cli.js')
-  const entryNode = path.join(dist, 'cli-node.js')
-  if (!isDir(dist)) {
-    return { ok: false, code: 'wrap_cli_incomplete', error: 'wrap CLI missing cli-dist' }
-  }
-  if (!fs.existsSync(entry) && !fs.existsSync(entryNode)) {
-    return { ok: false, code: 'wrap_cli_incomplete', error: 'wrap CLI missing cli-dist/cli.js' }
   }
   if (!hasKernelPayload(dir)) {
     return { ok: false, code: 'wrap_cli_incomplete', error: 'wrap CLI missing kin-kernel' }
@@ -237,7 +227,6 @@ export function materializeWrapCli(projectRoot, vm, { uid = null, gid = null } =
   for (const name of WRAP_CLI_FILES) {
     copyFile(path.join(src, name), path.join(dest, name))
   }
-  copyDir(path.join(src, WRAP_CLI_DIST), path.join(dest, WRAP_CLI_DIST))
   installKernelPayload(src, dest)
   chownTree(dest, uid, gid)
   return {
@@ -258,8 +247,6 @@ function copyWrapTree(src, dest) {
     if (SECRET_NAMES.has(name)) continue
     copyFile(from, path.join(dest, name))
   }
-  const dist = path.join(src, WRAP_CLI_DIST)
-  if (isDir(dist)) copyDir(dist, path.join(dest, WRAP_CLI_DIST))
   const glibc = path.join(src, WRAP_GLIBC_DIR)
   if (isDir(glibc)) copyDir(glibc, path.join(dest, WRAP_GLIBC_DIR))
   const bin = isFile(path.join(src, WRAP_KERNEL_BIN))
@@ -350,7 +337,7 @@ export function makeWrapSample(projectRoot, { glibcFromDir = '' } = {}) {
   if (!check.ok) {
     return {
       ...check,
-      error: `${check.error}。单独制作需要 share/wrap-cli 已有 bun、cli-node、cli-dist；kernel 可从主机 kin-kernel 补。不要从正在跑 wrap 的槽原地覆盖。`,
+      error: `${check.error}。单独制作需要 share/wrap-cli 已有 cli-node；kernel 可从主机 kin-kernel 补。不要从正在跑 wrap 的槽原地覆盖。`,
     }
   }
   fs.writeFileSync(

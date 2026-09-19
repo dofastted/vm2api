@@ -1,6 +1,6 @@
 # 版本与构建
 
-源码和 linux amd64 `bin/kin-{kernel,egress,worker,codex-kernel,cookie-auth}`、`share/wrap-cli` 进 git。GitHub Release 仍挂一份 ELF。当前发布线：**1.2.4**（tag `v1.2.4`）。
+linux amd64 `bin/kin-{kernel,egress,worker,codex-kernel,cookie-auth}`、`share/wrap-cli` 进 git。kernel / wrap 只带预编译 ELF，不带过程源码。GitHub Release 仍挂一份 ELF。当前发布线：**1.2.5**（tag `v1.2.5`）。
 
 ## 版本怎么记
 
@@ -18,15 +18,15 @@
 仓库要有 `contents: write`。流程在 `.github/workflows/release.yml`。
 
 ```bash
-git tag -a v1.2.4 -m "vm2api v1.2.4"
-git push origin v1.2.4
+git tag -a v1.2.5 -m "vm2api v1.2.5"
+git push origin v1.2.5
 ```
 
-`v*` tag 推上去之后，Actions 在 `ubuntu-latest` 编 linux amd64，并挂到该 tag 的 Release：
+`v*` tag 推上去之后，Actions 在 `ubuntu-latest` 编 Go linux amd64，并挂仓内预编译 kernel / wrap ELF 到该 tag 的 Release：
 
 | 文件 | 角色 |
 |---|---|
-| `kin-kernel` | Claude Code Rust 内核（推理必带） |
+| `kin-kernel` | Claude Code 槽内核（仓内预编译，推理必带） |
 | `kin-egress` | 远程 SOCKS5 透明网关 |
 | `kin-worker` | **只** `telemetry`，不是 hop |
 | `kin-codex-kernel` | Codex 槽；仓内 `bin/` 已带 |
@@ -46,17 +46,15 @@ install -m 755 kin-kernel kin-egress kin-worker kin-codex-kernel kin-cookie-auth
 
 ## 本机构建
 
-依赖：Node 22、Rust stable、Go 1.25、pnpm 10、python3（官方 CLI PTY 脚本）。换票走仓内 `bin/kin-cookie-auth`。Windows 上 Go/Rust 能编，槽位运行面按 Linux + Docker 写。
+依赖：Node 22、Go 1.25、pnpm 10、python3（官方 CLI PTY 脚本）。换票走仓内 `bin/kin-cookie-auth`。kernel / wrap CLI 用仓内 ELF，不要在本机 cargo / 重编 Claude Code。
 
 ```bash
 npm ci
 pnpm -C web install --frozen-lockfile
 
-npm run build:kernel      # bin/kin-kernel
 npm run build:egress      # bin/kin-egress
 npm run build:web         # web/dist
 npm run build:worker      # bin/kin-worker（telemetry）
-# 可选 npm run build:codex-kernel
 ```
 
 格式：和 CI 同一套，全文 LF。说明见 [FORMAT.md](FORMAT.md)。
@@ -71,8 +69,6 @@ npm run format:check
 ```bash
 CGO_ENABLED=0 go build -trimpath -o bin/kin-egress ./worker/cmd/kin-egress
 CGO_ENABLED=0 go build -trimpath -o bin/kin-worker ./worker/cmd/kin-worker
-cargo build --release --manifest-path crates/kin-kernel/Cargo.toml
-cp crates/kin-kernel/target/release/kin-kernel bin/kin-kernel
 pnpm -C web build
 ```
 
@@ -87,15 +83,14 @@ kin-worker telemetry --config /path/to/worker.json
 ```bash
 npm test                  # unit + worker Go（egress / proxy / config / telemetry）
 npm run test:web          # 要先 pnpm -C web install
-npm run test:kernel
 node --check src/server.mjs
 ```
 
-CI（`.github/workflows/test.yml`）在 push / PR 上跑：Node unit、Go、Rust kernel、web 测试和构建。
+CI（`.github/workflows/test.yml`）在 push / PR 上跑：Node unit、Go、预编译 kernel ELF 检查、web 测试和构建。
 
 ## 升级一台已部署的机
 
-升 **v1.2.4**：只更新控制面 Node（含 web）并重启一次。不必换槽内 kernel。步骤见 [DEPLOY.md · 已部署机升级到 1.2.4](DEPLOY.md#已部署机升级到-124)。
+升 **v1.2.5**：更新控制面并 `wrap-cli/sync` 换槽内 CLI。步骤见 [DEPLOY.md · 已部署机升级到 1.2.5](DEPLOY.md#已部署机升级到-125)。
 
 **Compose（其它版本通用）**
 
@@ -106,13 +101,13 @@ docker compose up -d --build
 curl -sS --noproxy '*' http://127.0.0.1:8787/health
 ```
 
-槽位容器不会被这次升级 `docker rm`。1.2.4 相对 1.2.2 不必 kernel sync；从 1.2.1 及更早来仍要做。
+槽位容器不会被这次升级 `docker rm`。1.2.5 要 `wrap-cli/sync`；1.2.4 相对 1.2.2 不必 kernel sync。
 
 **本机 Node + systemd**
 
 1. `git pull` 或检出目标 tag。
 2. `npm ci`；有 web 改动则 `pnpm -C web install --frozen-lockfile && npm run build:web`。
-3. 换 Release 二进制或本地重编 `bin/`（`install -m 755`）。
+3. 换仓内 `bin/` ELF（`install -m 755`）。1.2.5 再 `POST /api/panel/wrap-cli/sync`。
 4. `node --check src/server.mjs`。
 5. `systemctl restart vm2api` **一次**。确认 `/health`。
 

@@ -1,6 +1,6 @@
 {
   "name": "vm2api",
-  "version": "1.2.4",
+  "version": "1.2.5",
   "private": true,
   "description": "VM-fidelity subscription-to-API gateway",
   "type": "module",
@@ -15,10 +15,7 @@
     "test:all": "npm run test:unit && npm run test:go",
     "build:worker": "mkdir -p bin && cd worker && CGO_ENABLED=0 go build -trimpath -o ../bin/kin-worker ./cmd/kin-worker",
     "build:egress": "mkdir -p bin && cd worker && CGO_ENABLED=0 go build -trimpath -o ../bin/kin-egress ./cmd/kin-egress",
-    "build:kernel": "mkdir -p bin && cargo build --release --manifest-path crates/kin-kernel/Cargo.toml && cp crates/kin-kernel/target/release/kin-kernel bin/kin-kernel",
-    "build:codex-kernel": "mkdir -p bin && cargo build --release --manifest-path crates/codex-kernel/Cargo.toml && cp crates/codex-kernel/target/release/kin-codex-kernel bin/kin-codex-kernel",
     "build:web": "pnpm -C web build",
-    "test:kernel": "cargo test --manifest-path crates/kin-kernel/Cargo.toml && cargo test --manifest-path crates/codex-kernel/Cargo.toml",
     "test:web": "pnpm -C web test",
     "format": "biome format --write && gofmt -w worker && pnpm -C web format",
     "format:check": "biome format && node scripts/check-gofmt.mjs && pnpm -C web format:check"

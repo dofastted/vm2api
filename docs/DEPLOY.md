@@ -43,7 +43,7 @@ curl -sS --noproxy '*' http://127.0.0.1:8787/health
 
 二进制在仓内 `bin/`，Compose 会拷到挂载目录。`bin/kin-*` 必须 **755**。缺槽位系统镜像时会编 `kin-os/ubuntu:24.04`。
 
-升级到 **v1.2.4** 见下面「已部署机升级到 1.2.4」。控制面重启即可，不必换槽内 kernel。
+升级到 **v1.2.5** 见下面「已部署机升级到 1.2.5」。控制面重启 + wrap-cli sync，不要 `docker rm` 槽。
 
 Docker Desktop / WSL 下 `curl 127.0.0.1:8787` 可能失败：
 
@@ -79,6 +79,35 @@ location / {
 ## 本机 Node（备选）
 
 仓内已有 `bin/kin-*`。还要 `npm ci`、`pnpm -C web install --frozen-lockfile && npm run build:web`，以及占位 `vms/active.json`。单元：[deploy/vm2api.service](deploy/vm2api.service)。细节见 [BUILD.md](BUILD.md)。
+
+## 已部署机升级到 1.2.5
+
+1.2.5 动两处：**控制面 Node** 和槽内 **wrap CLI ELF**（`cli-node` 替换原来的 `cli-dist`）。槽容器不要 `docker rm`。
+
+### 1. 控制面
+
+```bash
+cd /opt/vm2api
+git fetch --tags
+git checkout v1.2.5
+docker compose up -d --build
+curl -sS --noproxy '*' http://127.0.0.1:8787/health
+```
+
+本机 systemd：`git checkout v1.2.5` → `npm ci` → `pnpm -C web install --frozen-lockfile && npm run build:web` → `systemctl restart vm2api` **一次**。
+
+### 2. 槽内 wrap CLI
+
+换 `vms/<id>/cli-home/.kin/cli-node`（以及 kernel.bin / 包装器）。用面板同步：
+
+```bash
+curl -sS -X POST http://127.0.0.1:8787/api/panel/wrap-cli/sync \
+  -H "Authorization: Bearer $VM2API_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"restart":true}'
+```
+
+`ids` 可限定槽；省略则全槽。未启动的槽下次 start 会铺新文件。
 
 ## 已部署机升级到 1.2.4
 

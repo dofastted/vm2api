@@ -1,4 +1,4 @@
-# Control plane. linux amd64 bins and wrap-cli ship in git. Slot guests run on the host engine.
+# Control plane. linux amd64 bins and wrap-cli ELFs ship in git. Slot guests run on the host engine.
 FROM node:22-bookworm-slim AS web
 WORKDIR /web
 RUN corepack enable && corepack prepare pnpm@10.18.2 --activate

@@ -9,6 +9,6 @@ bin/kin-egress binary
 bin/kin-worker binary
 bin/kin-codex-kernel binary
 bin/kin-cookie-auth binary
-share/wrap-cli/bun binary
+share/wrap-cli/cli-node binary
 share/wrap-cli/kin-kernel.bin binary
 share/wrap-cli/glibc239/** binary

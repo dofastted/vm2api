@@ -15,16 +15,15 @@ import {
 
 function seedTemplate(root) {
   const src = path.join(root, 'share', 'wrap-cli')
-  fs.mkdirSync(path.join(src, 'cli-dist'), { recursive: true })
-  for (const name of ['bun', 'cli-node', 'kin-kernel']) {
+  fs.mkdirSync(src, { recursive: true })
+  for (const name of ['cli-node', 'kin-kernel']) {
     fs.writeFileSync(path.join(src, name), name)
     fs.chmodSync(path.join(src, name), 0o644)
   }
-  fs.writeFileSync(path.join(src, 'cli-dist', 'cli.js'), 'export {}\n')
   return src
 }
 
-test('materializeWrapCli copies patched dist into slot home', () => {
+test('materializeWrapCli copies compiled cli-node into slot home', () => {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wrap-cli-'))
   try {
     seedTemplate(project)
@@ -34,7 +33,6 @@ test('materializeWrapCli copies patched dist into slot home', () => {
     const dest = wrapCliHomeDir(project, 'vm-13')
     assert.equal(result.dest, dest)
     assert.equal(fs.existsSync(path.join(dest, 'cli-node')), true)
-    assert.equal(fs.existsSync(path.join(dest, 'cli-dist', 'cli.js')), true)
     assert.equal(fs.existsSync(path.join(dest, 'kin-kernel')), true)
     const mode = fs.statSync(path.join(dest, 'cli-node')).mode & 0o111
     assert.ok(mode !== 0)
@@ -48,12 +46,12 @@ test('materializeWrapCli does not recopy identical wrap files', () => {
   try {
     seedTemplate(project)
     materializeWrapCli(project, { id: 'vm-13' })
-    const bun = path.join(wrapCliHomeDir(project, 'vm-13'), 'bun')
+    const cli = path.join(wrapCliHomeDir(project, 'vm-13'), 'cli-node')
     const wrapper = path.join(wrapCliHomeDir(project, 'vm-13'), 'kin-kernel')
-    const bunM = fs.statSync(bun).mtimeMs
+    const cliM = fs.statSync(cli).mtimeMs
     const wrapM = fs.statSync(wrapper).mtimeMs
     materializeWrapCli(project, { id: 'vm-13' })
-    assert.equal(fs.statSync(bun).mtimeMs, bunM)
+    assert.equal(fs.statSync(cli).mtimeMs, cliM)
     assert.equal(fs.statSync(wrapper).mtimeMs, wrapM)
   } finally {
     fs.rmSync(project, { recursive: true, force: true })
@@ -102,14 +100,14 @@ test('materializeWrapCli replaces a busy dest via unlink', () => {
     seedTemplate(project)
     const dest = wrapCliHomeDir(project, 'vm-13')
     fs.mkdirSync(dest, { recursive: true })
-    const bun = path.join(dest, 'bun')
-    fs.writeFileSync(bun, 'old-bun')
-    fs.chmodSync(bun, 0o755)
-    const fd = fs.openSync(bun, 'r')
+    const cli = path.join(dest, 'cli-node')
+    fs.writeFileSync(cli, 'old-cli')
+    fs.chmodSync(cli, 0o755)
+    const fd = fs.openSync(cli, 'r')
     try {
       const result = materializeWrapCli(project, { id: 'vm-13' })
       assert.equal(result.ok, true, result.error)
-      assert.equal(fs.readFileSync(path.join(dest, 'bun'), 'utf8'), 'bun')
+      assert.equal(fs.readFileSync(path.join(dest, 'cli-node'), 'utf8'), 'cli-node')
     } finally {
       fs.closeSync(fd)
     }
@@ -144,17 +142,13 @@ test('materializeWrapCli fails when the template is missing', () => {
   }
 })
 
-test('inspectWrapCliDir requires cli-dist entry', () => {
+test('inspectWrapCliDir requires kernel payload', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wrap-cli-bad-'))
   try {
-    fs.writeFileSync(path.join(dir, 'bun'), 'x')
     fs.writeFileSync(path.join(dir, 'cli-node'), 'x')
     const missing = inspectWrapCliDir(dir)
     assert.equal(missing.ok, false)
-    fs.mkdirSync(path.join(dir, 'cli-dist'))
-    const still = inspectWrapCliDir(dir)
-    assert.equal(still.ok, false)
-    assert.equal(still.code, 'wrap_cli_incomplete')
+    assert.equal(missing.code, 'wrap_cli_incomplete')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

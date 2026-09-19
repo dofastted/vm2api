@@ -2,7 +2,7 @@
 # Local Docker slot: start kin-kernel --gateway-worker and prove health + mock SSE.
 set -euo pipefail
 
-BIN="${KIN_KERNEL_BIN:-/mnt/x/project/kin-kernel-20slot/kin-kernel-20slot/service/kernel/target/release/kin-kernel}"
+BIN="${KIN_KERNEL_BIN:-$(cd "$(dirname "$0")/.." && pwd)/bin/kin-kernel}"
 IMAGE="${KIN_VERIFY_IMAGE:-kin-os/ubuntu:24.04}"
 NAME=kin-local-rust-verify
 WORKDIR="$(mktemp -d /tmp/kin-local-rust.XXXXXX)"

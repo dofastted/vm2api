@@ -1,4 +1,4 @@
-# Publish linux amd64 binaries. Source stays in git; ELF stays on the Release.
+# Publish linux amd64 binaries from git (prebuilt kernel; Go still built here).
 name: release
 
 on:
@@ -18,17 +18,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25.x'
-      - uses: dtolnay/rust-toolchain@stable
       - name: build
         run: |
           mkdir -p dist
           (cd worker && CGO_ENABLED=0 go build -trimpath -o ../dist/kin-worker ./cmd/kin-worker)
           (cd worker && CGO_ENABLED=0 go build -trimpath -o ../dist/kin-egress ./cmd/kin-egress)
-          cargo build --release --manifest-path crates/kin-kernel/Cargo.toml
-          cargo build --release --manifest-path crates/codex-kernel/Cargo.toml
-          cp crates/kin-kernel/target/release/kin-kernel dist/kin-kernel
-          cp crates/codex-kernel/target/release/kin-codex-kernel dist/kin-codex-kernel
-          cp bin/kin-cookie-auth dist/kin-cookie-auth
+          test -x bin/kin-kernel && cp bin/kin-kernel dist/kin-kernel
+          test -x bin/kin-codex-kernel && cp bin/kin-codex-kernel dist/kin-codex-kernel
+          test -x bin/kin-cookie-auth && cp bin/kin-cookie-auth dist/kin-cookie-auth
       - uses: actions/upload-artifact@v4
         with:
           name: linux-amd64

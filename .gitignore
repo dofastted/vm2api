@@ -24,10 +24,13 @@ bin/*
 share/*
 !share/wrap-cli/
 !share/wrap-cli/**
+share/wrap-cli/cli-dist/
+share/wrap-cli/bun
 .workflow/
 __pycache__/
 web/dist/
-**/target/
+crates/
+patches/
 .local/
 
 # keep example
