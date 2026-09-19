@@ -1,6 +1,6 @@
 # 版本与构建
 
-源码和 linux amd64 `bin/kin-{kernel,egress,worker,codex-kernel}`、`share/wrap-cli` 进 git。GitHub Release 仍挂一份 ELF。当前发布线：**1.2.1**（tag `v1.2.1`）。
+源码和 linux amd64 `bin/kin-{kernel,egress,worker,codex-kernel,cookie-auth}`、`share/wrap-cli` 进 git。GitHub Release 仍挂一份 ELF。当前发布线：**1.2.2**（tag `v1.2.2`）。
 
 ## 版本怎么记
 
@@ -18,8 +18,8 @@
 仓库要有 `contents: write`。流程在 `.github/workflows/release.yml`。
 
 ```bash
-git tag -a v1.2.1 -m "vm2api v1.2.1"
-git push origin v1.2.1
+git tag -a v1.2.2 -m "vm2api v1.2.2"
+git push origin v1.2.2
 ```
 
 `v*` tag 推上去之后，Actions 在 `ubuntu-latest` 编 linux amd64，并挂到该 tag 的 Release：
@@ -30,13 +30,14 @@ git push origin v1.2.1
 | `kin-egress` | 远程 SOCKS5 透明网关 |
 | `kin-worker` | **只** `telemetry`，不是 hop |
 | `kin-codex-kernel` | Codex 槽；仓内 `bin/` 已带 |
+| `kin-cookie-auth` | sessionKey / 授权码换票 helper；仓内预编译，控制面不带过程源码 |
 
 没有 tag、只点 workflow_dispatch 时，产物进 artifact，不会建 Release。
 
 装到机器上（Compose 部署可跳过，仓内 `bin/` 已有同名文件）：
 
 ```bash
-install -m 755 kin-kernel kin-egress kin-worker kin-codex-kernel /opt/vm2api/bin/
+install -m 755 kin-kernel kin-egress kin-worker kin-codex-kernel kin-cookie-auth /opt/vm2api/bin/
 ```
 
 然后按 [DEPLOY.md](DEPLOY.md) 指环境变量。槽进程不是 root：权限必须是 `755`，不要 `700`。
@@ -45,7 +46,7 @@ install -m 755 kin-kernel kin-egress kin-worker kin-codex-kernel /opt/vm2api/bin
 
 ## 本机构建
 
-依赖：Node 22、Rust stable、Go 1.25、pnpm 10、python3 + `curl_cffi`（授权码换票）。Windows 上 Go/Rust 能编，槽位运行面按 Linux + Docker 写。
+依赖：Node 22、Rust stable、Go 1.25、pnpm 10、python3（官方 CLI PTY 脚本）。换票走仓内 `bin/kin-cookie-auth`。Windows 上 Go/Rust 能编，槽位运行面按 Linux + Docker 写。
 
 ```bash
 npm ci
