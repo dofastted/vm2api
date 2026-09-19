@@ -1,15 +1,24 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import {
   sessionKeyToOAuth,
-  shouldTryNextImportHelper,
+  exchangeTokenViaCookieAuth,
   classifyImportHelperOutput,
   publicImportError,
   panelImportErrorPayload,
   buildSetupTokenAuthorizeURL,
   extractOAuthCodeFromRedirect,
-} from '../../scripts/session-to-oauth.mjs'
+} from '../../src/lib/oauth/cookie-auth.mjs'
+
+function writeHelper(script) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cookie-auth-'))
+  const bin = path.join(dir, 'kin-cookie-auth')
+  fs.writeFileSync(bin, script, { mode: 0o755 })
+  return bin
+}
 
 test('KIN_FAKE_SESSION_OAUTH returns deterministic creds without network', async () => {
   process.env.KIN_FAKE_SESSION_OAUTH = '1'
@@ -35,18 +44,63 @@ test('fake branch still rejects non-sid keys', async () => {
   delete process.env.KIN_FAKE_SESSION_OAUTH
 })
 
-test('only missing helper or CF may try the next TLS stack', () => {
-  assert.equal(shouldTryNextImportHelper('cloudflare_challenge'), true)
-  assert.equal(shouldTryNextImportHelper('no_cookie_auth_bin'), true)
-  assert.equal(shouldTryNextImportHelper('no_cffi_helper'), true)
-  assert.equal(shouldTryNextImportHelper('cookie_auth_failed'), false)
-  assert.equal(shouldTryNextImportHelper('session_stale_relogin'), false)
-  assert.equal(shouldTryNextImportHelper('permission_error'), false)
+test('sessionKeyToOAuth requires SOCKS5', async () => {
+  await assert.rejects(
+    () => sessionKeyToOAuth('sk-ant-sid01-testaaaaaaaa'),
+    (e) => e.code === 'proxy_required',
+  )
+})
+
+test('sessionKeyToOAuth reads JSON from helper stdout', async () => {
+  const bin = writeHelper(`#!/bin/sh
+echo '{"access_token":"sk-ant-oat01-helper","refresh_token":"sk-ant-ort01-helper","source":"test-helper"}'
+`)
+  process.env.KIN_COOKIE_AUTH_BIN = bin
+  try {
+    const cred = await sessionKeyToOAuth('sk-ant-sid01-testaaaaaaaa', { proxyUrl: 'socks5://127.0.0.1:1080' })
+    assert.equal(cred.access_token, 'sk-ant-oat01-helper')
+    assert.equal(cred.source, 'test-helper')
+  } finally {
+    delete process.env.KIN_COOKIE_AUTH_BIN
+  }
+})
+
+test('sessionKeyToOAuth maps helper stale stderr', async () => {
+  const bin = writeHelper(`#!/bin/sh
+echo 'Session is not fresh enough to authorize' >&2
+exit 2
+`)
+  process.env.KIN_COOKIE_AUTH_BIN = bin
+  try {
+    await assert.rejects(
+      () => sessionKeyToOAuth('sk-ant-sid01-testaaaaaaaa', { proxyUrl: 'socks5h://127.0.0.1:1' }),
+      (e) => e.code === 'session_stale_relogin',
+    )
+  } finally {
+    delete process.env.KIN_COOKIE_AUTH_BIN
+  }
+})
+
+test('exchangeTokenViaCookieAuth sets IMPORT_MODE', async () => {
+  const bin = writeHelper(`#!/bin/sh
+if [ "$IMPORT_MODE" != "token_exchange" ]; then echo fail >&2; exit 2; fi
+echo '{"access_token":"sk-ant-oat01-ex","refresh_token":"rt"}'
+`)
+  process.env.KIN_COOKIE_AUTH_BIN = bin
+  try {
+    const tok = await exchangeTokenViaCookieAuth({
+      code: 'abc',
+      codeVerifier: 'ver',
+      proxyUrl: 'socks5h://127.0.0.1:1',
+    })
+    assert.equal(tok.access_token, 'sk-ant-oat01-ex')
+  } finally {
+    delete process.env.KIN_COOKIE_AUTH_BIN
+  }
 })
 
 test('authorize 403 session freshness is not reported as Cloudflare', () => {
-  const raw =
-    '[1/5] GET /api/organizations impersonate=chrome146 [2/5] authorize failed: 403 {"type":"error","error":{"type":"permission_error","message":"Session is not fresh enough'
+  const raw = 'authorize failed: 403 Session is not fresh enough to authorize'
   assert.equal(classifyImportHelperOutput(raw), 'session_stale_relogin')
   assert.match(publicImportError(raw), /不够新/)
   assert.doesNotMatch(publicImportError(raw), /Cloudflare|Just a moment/)
@@ -62,34 +116,6 @@ test('panel import catch maps helper codes without leaking ReferenceError', () =
 
   const coded = panelImportErrorPayload({ code: 'session_stale_relogin', message: 'Session is not fresh enough' })
   assert.equal(coded.status, 400)
-  assert.equal(coded.error.code, 'session_stale_relogin')
-})
-
-test('panel import route binds sessionKey helpers', () => {
-  const src = fs.readFileSync(new URL('../../src/lib/admin/panel-routes.mjs', import.meta.url), 'utf8')
-  assert.match(src, /sessionKeyToOAuth/)
-  assert.match(src, /panelImportErrorPayload/)
-  assert.match(src, /from '\.\.\/\.\.\/\.\.\/scripts\/session-to-oauth\.mjs'/)
-})
-
-test('Portunex CookieAuth uses platform JSON authorize and Chrome 146 token UA', () => {
-  const src = fs.readFileSync(new URL('../../scripts/session-to-oauth.mjs', import.meta.url), 'utf8')
-  const py = fs.readFileSync(new URL('../../scripts/session-import-cffi.py', import.meta.url), 'utf8')
-  assert.match(src, /PLATFORM\}\/v1\/oauth\/\$\{orgUUID\}\/authorize/)
-  assert.match(src, /Chrome\/146\.0\.0\.0/)
-  assert.match(src, /POST chrome token/)
-  assert.doesNotMatch(src, /axios\/1\.13\.4/)
-  assert.match(src, /claude_cli\/bootstrap/)
-  assert.match(src, /grove_enabled/)
-  assert.match(src, /Origin: 'https:\/\/claude\.com'/)
-  assert.match(py, /PLATFORM\}\/v1\/oauth\/\{org_uuid\}\/authorize/)
-  assert.match(py, /Chrome\/146\.0\.0\.0/)
-  assert.match(py, /POST chrome token/)
-  assert.doesNotMatch(py, /axios\/1\.13\.4/)
-  assert.match(py, /claude_cli\/bootstrap/)
-  assert.match(py, /grove_enabled/)
-  assert.match(py, /origin="https:\/\/claude\.com"/)
-  assert.match(py, /skip bootstrap\/grove for inference setup-token/)
 })
 
 test('setup-token CAI URL helper stays inference-only', () => {

@@ -59,7 +59,7 @@ docker compose up -d --build
 curl -sS --noproxy '*' http://127.0.0.1:8787/health
 ```
 
-`--build` 拷仓内 `bin/kin-{kernel,egress,worker,codex-kernel}` 和 `share/wrap-cli`，**不在服务器上编 Rust/Go**。缺槽位 OS 时入口编 `kin-os/ubuntu:24.04`。其它发行版：`node docker/kin-os/build.mjs`。槽 UID 是 `10000+序号`，`bin/kin-*` 必须 **755**，不要 `700`。
+`--build` 拷仓内 `bin/kin-{kernel,egress,worker,codex-kernel,cookie-auth}` 和 `share/wrap-cli`，**不在服务器上编 Rust/Go**。缺槽位 OS 时入口编 `kin-os/ubuntu:24.04`。其它发行版：`node docker/kin-os/build.mjs`。槽 UID 是 `10000+序号`，`bin/kin-*` 必须 **755**，不要 `700`。
 
 
 
@@ -214,11 +214,11 @@ VM2API_DB_SECRET=       # 库加密
 
 ## 版本与构建
 
-当前发布：**v1.2.1**
+当前发布：**v1.2.2**
 
 ```bash
-git tag -a v1.2.1 -m "vm2api v1.2.1"
-git push origin v1.2.1
+git tag -a v1.2.2 -m "vm2api v1.2.2"
+git push origin v1.2.2
 ```
 
 `v*` tag 会触发 [Release 工作流](.github/workflows/release.yml)，再挂一份 linux amd64 ELF。仓内 `bin/` 已可直接部署。步骤：[BUILD.md](docs/BUILD.md)
@@ -265,7 +265,7 @@ git push origin v1.2.1
    仓库在 `/opt/vm2api`、`bin/kin-*` 为 **755**、宿主机有 `kin-os/*`、挂了 `docker.sock`。先添加本地出口再启动槽。1.1.0 已对齐 egress 的 `name`/`network` 字段。
 
 8. **`exec: "/usr/local/bin/kin-kernel": permission denied`？**  
-   `chmod 755 bin/kin-kernel bin/kin-egress bin/kin-worker bin/kin-codex-kernel`。不要用 `700`。
+   `chmod 755 bin/kin-kernel bin/kin-egress bin/kin-worker bin/kin-codex-kernel bin/kin-cookie-auth`。不要用 `700`。
 
 9. **本机 `curl 127.0.0.1:8787` 失败，容器却是 healthy？**  
    Docker Desktop 的 `network_mode: host` 不在 WSL/macOS localhost。用 `docker exec vm2api …` 探活，或改 Ubuntu + Docker Engine。

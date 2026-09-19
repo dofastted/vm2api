@@ -19,7 +19,7 @@ import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { parseCodexImportPayload, upsertCodexAccount, readCodexAccounts } from '../vm/codex-slot.mjs'
 import { generateAuthUrl, exchangeAuthCode, normalizeOauthFlavor } from '../oauth/oauth-auth-url.mjs'
-import { sessionKeyToOAuth, panelImportErrorPayload } from '../../../scripts/session-to-oauth.mjs'
+import { sessionKeyToOAuth, panelImportErrorPayload } from '../oauth/cookie-auth.mjs'
 import { generateCodexAuthUrl, exchangeCodexAuthCode } from '../oauth/codex-oauth.mjs'
 import {
   completeClaudeSetupToken,
@@ -2325,7 +2325,6 @@ export function createPanelHandler(ctx) {
               String(body.scope || '').toLowerCase() === 'inference'
             oauth = await sessionKeyToOAuth(String(sessionKey).trim(), {
               proxyUrl,
-              allowDirectFallback: false,
               scope: inference ? 'inference' : 'full',
             })
             if (inference) {

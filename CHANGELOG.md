@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.2 — 2026-09-20
+
+修复缓存问题；换票逻辑更新。
+
+- 额度缓存空刷新不再覆盖仍有效的 reset credits
+- sessionKey / 授权码换票改走仓内 `bin/kin-cookie-auth`，控制面不再带过程源码
+
 ## 1.2.1 — 2026-09-19
 
 模型测试路径不再因缺 `message_stop` 刷成 api_error。

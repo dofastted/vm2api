@@ -28,6 +28,7 @@ jobs:
           cargo build --release --manifest-path crates/codex-kernel/Cargo.toml
           cp crates/kin-kernel/target/release/kin-kernel dist/kin-kernel
           cp crates/codex-kernel/target/release/kin-codex-kernel dist/kin-codex-kernel
+          cp bin/kin-cookie-auth dist/kin-cookie-auth
       - uses: actions/upload-artifact@v4
         with:
           name: linux-amd64
@@ -41,3 +42,4 @@ jobs:
             dist/kin-codex-kernel
             dist/kin-worker
             dist/kin-egress
+            dist/kin-cookie-auth

@@ -6,11 +6,7 @@
 sessionKey（默认 Setup Token）或 授权码
    │ 必须先有 VM + 槽位 SOCKS5（禁止 direct fallback）
    ▼
-Portunex CookieAuth（Chrome 146 同一身份）
-  GET  claude.ai/api/organizations
-  POST platform.claude.com/v1/oauth/{org}/authorize   Origin claude.com
-  POST platform.claude.com/v1/oauth/token             Chrome 146，不用 axios
-  完整 OAuth 才 bootstrap/grove（claude-code UA）
+bin/kin-cookie-auth（控制面 spawn；过程不在 Node）
    │ POST /internal/credential/import
    ▼
 Go slot worker credentials.json   ← 活票只在这里
@@ -31,7 +27,7 @@ commitImportedOauth → 仅完整 OAuth 排队官方 Claude Code 初装
 
 | 入口 | 路径 | 说明 |
 |------|------|------|
-| sessionKey（默认） | `POST /api/panel/vms/import` `{ type: "setup-token", sessionKey }` | 面板默认。Portunex CookieAuth：`sk-ant-sid*` → orgs → JSON authorize → token，整链 Chrome 146（Origin `claude.com`）。scope 只有 `user:inference`，不打 bootstrap/grove，不跑官方初装。无 `type` 仍是完整 OAuth（同链 + CLI bootstrap/grove）。 |
+| sessionKey（默认） | `POST /api/panel/vms/import` `{ type: "setup-token", sessionKey }` | 面板默认。`sk-ant-sid*` 经槽 SOCKS5 交给 `kin-cookie-auth`，scope 只有 `user:inference`，不跑官方初装。无 `type` 仍是完整 OAuth。 |
 | 已有 OAuth → Setup Token | `POST /api/panel/vms/:id/oauth/to-setup-token` | 读 worker 活票，改 `type=setup-token`，保留 access/refresh/真实过期。禁止把短 oat 盖成一年期。 |
 | 授权链接 | `POST /api/panel/vms/:id/oauth/generate-auth-url` | 完整 OAuth 用。默认 CAI / sub2api。`{ flavor: "claude_code" }` 走官方 Claude Code 授权页。Setup Token 不走 CLI；`{ flavor: "setup_token" }` 只是 PKCE `user:inference`。服务端 PKCE，30min；无代理不能生成 URL。 |
 | 粘贴授权码 | `POST /api/panel/vms/:id/oauth/exchange-code` | 经槽 SOCKS5 换票，redirect / token URL 以服务端 session 为准，再 `commitImportedOauth` |
@@ -103,11 +99,11 @@ commitImportedOauth → 仅完整 OAuth 排队官方 Claude Code 初装
 
 面板探测走官方 `GET /api/oauth/usage`（worker + 槽 SOCKS5）：
 
-- `five_hour` / `seven_day` utilization 0–100  
-- Fable `weekly_scoped` → `7d_oi`  
-- 同包可带 Sub2API 对照；旧 KIN「窗口滚过后仍 100%」刻度已废弃  
+- `five_hour` / `seven_day` utilization 0–100
+- Fable `weekly_scoped` → `7d_oi`；limits / model_scoped 里出现 Fable 模型即 Max
+- 同包可带 Sub2API 对照；旧 KIN「窗口滚过后仍 100%」刻度已废弃
 
-已判定 Pro（Fable 套餐拒绝 / 无真实 7d_oi）的槽只探 5h/7d，不再 hop Fable。Fable 不可用、7d_oi、家族冷却 **不**把账号标成整号限制。探测早于 `refreshed_at` 不算整号吊销。
+已判定 Pro（usage 无 Fable 模型 / 套餐拒绝）的槽只探 5h/7d，不再 hop Fable。usage 一旦列出 Fable，即使 hop 403/401 或落盘 pro 也改判 Max。Fable 不可用、7d_oi、家族冷却 **不**把账号标成整号限制。探测早于 `refreshed_at` 不算整号吊销。
 
 ## 调度资格
 

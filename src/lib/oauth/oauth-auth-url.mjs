@@ -4,7 +4,7 @@
  * then exchange via the slot SOCKS5. Never dials Anthropic without a proxy.
  */
 import crypto from 'node:crypto'
-import { exchangeTokenViaCffi } from '../../../scripts/session-to-oauth.mjs'
+import { exchangeTokenViaCookieAuth } from './cookie-auth.mjs'
 
 export const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 export const SESSION_TTL_MS = 30 * 60 * 1000
@@ -161,7 +161,7 @@ function parseAuthCode(fullCode) {
 async function exchangeCodeForToken(authCode, codeVerifier, state, proxyUrl, session) {
   const px = normalizeSocks(proxyUrl)
   if (!px) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
-  return exchangeTokenViaCffi({
+  return exchangeTokenViaCookieAuth({
     code: authCode,
     codeVerifier,
     state,
