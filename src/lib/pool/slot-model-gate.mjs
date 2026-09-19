@@ -33,6 +33,9 @@ function keysIntersect(left, right) {
   for (const a of left) {
     for (const b of right) {
       if (a === b) return true
+      // The corrected 5-1 id must not widen a Fable 5 allowlist (or vice versa).
+      const fable51 = /^claude-fable-5(?:-1|\.1)(?:-|$)/
+      if (fable51.test(a) !== fable51.test(b)) continue
       if (a.startsWith(`${b}-`) || b.startsWith(`${a}-`)) return true
     }
   }

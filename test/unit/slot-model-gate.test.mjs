@@ -43,6 +43,23 @@ test('fable requires max even if the allowlist includes it', () => {
   assert.equal(max.ok, true)
 })
 
+test('legacy Fable 5.1 allowlists accept the corrected id without allowing Fable 5', () => {
+  assert.equal(modelMatchesAllowlist('claude-fable-5-1', ['claude-fable-5.1']), true)
+  assert.equal(modelMatchesAllowlist('claude-fable-5.1', ['claude-fable-5-1']), true)
+  assert.equal(modelMatchesAllowlist('claude-fable-5-1-20260918', ['claude-fable-5.1']), true)
+  assert.equal(modelMatchesAllowlist('claude-fable-5-1', ['claude-fable-5']), false)
+  assert.equal(modelMatchesAllowlist('claude-fable-5', ['claude-fable-5-1']), false)
+  assert.equal(modelMatchesAllowlist('claude-fable-5', ['claude-fable-5.1']), false)
+  assert.deepEqual(parseAllowedModelsPatch(['claude-fable-5.1']), { ok: true, value: ['claude-fable-5-1'] })
+  const vm = { claude: { account_tier: 'max' }, policy: { allowed_models: ['claude-fable-5.1'] } }
+  assert.deepEqual(slotAllowsModel({ vm, model: 'claude-fable-5-1' }), { ok: true })
+  assert.deepEqual(slotAllowsModel({ vm, model: 'claude-fable-5' }), { ok: false, reason: 'model_not_allowed' })
+  assert.deepEqual(slotAllowsModel({ vm: { ...vm, claude: { account_tier: 'pro' } }, model: 'claude-fable-5-1' }), {
+    ok: false,
+    reason: 'fable_requires_max',
+  })
+})
+
 test('parseAllowedModelsPatch rejects unknown ids', () => {
   const bad = parseAllowedModelsPatch(['not-a-claude-model'])
   assert.equal(bad.ok, false)

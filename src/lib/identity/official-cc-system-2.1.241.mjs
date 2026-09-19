@@ -153,7 +153,7 @@ export function parseInboundEnvFacts(texts = []) {
 
 export function displayNameForModel(modelId = '') {
   const id = String(modelId || '').split('[')[0]
-  if (/fable-5\.1/i.test(id)) return 'Fable 5.1'
+  if (/fable-5[-.]1/i.test(id)) return 'Fable 5.1'
   if (/fable-5/i.test(id)) return 'Fable 5'
   if (/opus-5/i.test(id)) return 'Opus 5'
   if (/sonnet-5/i.test(id)) return 'Sonnet 5'

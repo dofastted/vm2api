@@ -17,7 +17,7 @@ import { seedDefaultPolicy } from '../../src/lib/protocol/model-policy.mjs'
 
 test('isCatalogModelId rejects fragments', () => {
   assert.equal(isCatalogModelId('claude-sonnet-5'), true)
-  assert.equal(isCatalogModelId('claude-fable-5.1'), true)
+  assert.equal(isCatalogModelId('claude-fable-5-1'), true)
   assert.equal(isCatalogModelId('claude-3'), false)
   assert.equal(isCatalogModelId('claude-fable-5.md'), false)
   assert.equal(isCatalogModelId('claude-haiku-'), false)
@@ -82,27 +82,41 @@ test('seed catalog matches the console model-policy matrix including opus-5', ()
   assert.ok(SEED_MODEL_IDS.includes('claude-opus-5'))
   assert.ok(SEED_MODEL_IDS.includes('claude-sonnet-5'))
   assert.ok(SEED_MODEL_IDS.includes('claude-fable-5'))
-  assert.ok(SEED_MODEL_IDS.includes('claude-fable-5.1'))
+  assert.ok(SEED_MODEL_IDS.includes('claude-fable-5-1'))
+  assert.ok(!SEED_MODEL_IDS.includes('claude-fable-5.1'))
   clearModelsCache()
   const cat = gatewayModelCatalog()
   const ids = cat.data.map((m) => m.id)
   assert.ok(ids.includes('claude-opus-5'))
-  assert.ok(ids.includes('claude-fable-5.1'))
+  assert.ok(ids.includes('claude-fable-5-1'))
+  assert.ok(!ids.includes('claude-fable-5.1'))
   assert.equal(validateOfficialModel('claude-opus-5').ok, true)
   assert.equal(validateOfficialModel('opus').ok, true)
   assert.equal(validateOfficialModel('opus').model, 'claude-opus-5')
-  assert.equal(validateOfficialModel('claude-fable-5.1').ok, true)
+  assert.equal(validateOfficialModel('claude-fable-5-1').model, 'claude-fable-5-1')
+  assert.equal(validateOfficialModel('claude-fable-5.1').model, 'claude-fable-5-1')
+  assert.equal(validateOfficialModel('anthropic/claude-fable-5.1').model, 'claude-fable-5-1')
+  assert.equal(validateOfficialModel('fable').model, 'claude-fable-5-1')
+  assert.equal(validateOfficialModel('claude-fable-5.1[1m]').model, 'claude-fable-5-1')
+  assert.equal(validateOfficialModel('claude-fable-5.1[1m]').want1m, true)
   clearModelsCache()
 })
 
-test('claude-fable-5.1 shares fable-5 policy params', () => {
+test('claude-fable-5-1 shares fable-5 policy params', () => {
   const seed = seedDefaultPolicy()
   const a = seed.models['claude-fable-5']
-  const b = seed.models['claude-fable-5.1']
+  const b = seed.models['claude-fable-5-1']
   assert.equal(b.family, 'fable')
   assert.deepEqual(b.params, a.params)
   assert.deepEqual(b.capabilities, a.capabilities)
   assert.equal(b.betas.pass_context_1m, a.betas.pass_context_1m)
+})
+
+test('old worker catalogs cannot restore the unsupported dotted Fable 5.1 id', () => {
+  setModelCatalog(['claude-fable-5.1', 'claude-fable-5-1'])
+  assert.deepEqual(getCatalogIds(), ['claude-fable-5-1'])
+  assert.equal(validateOfficialModel('claude-fable-5.1').model, 'claude-fable-5-1')
+  clearModelsCache()
 })
 
 test('gatewayModelCatalog stays local and never hops', () => {
