@@ -89,6 +89,23 @@ export function VmProxyTab(props: VmProxyTabProps) {
             </span>
           </Field>
           <Field label='认证'>{proxy.has_auth ? '有' : '无'}</Field>
+          <Field label='出口地区'>
+            <span className='text-xs'>
+              {[proxy.geo?.country, proxy.geo?.region, proxy.geo?.city]
+                .filter(Boolean)
+                .join(' · ') || (proxy.geo?.error ? '检测失败' : '未检测')}
+            </span>
+          </Field>
+          <Field label='出口时区'>
+            <span className='flex items-center gap-2 text-xs'>
+              <span className='field-host'>{proxy.geo?.timezone || '—'}</span>
+              {proxy.geo?.timezone && proxy.geo.timezone !== vm.timezone ? (
+                <span className='text-muted-foreground'>
+                  槽位为 {vm.timezone || '—'}，可在「运维 · 环境」跟随
+                </span>
+              ) : null}
+            </span>
+          </Field>
         </CardContent>
       </Card>
       <div className='flex flex-wrap gap-2'>

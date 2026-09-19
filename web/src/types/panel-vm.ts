@@ -14,6 +14,20 @@ export type AuthScheme = 'x_api_key' | 'authorization_bearer'
  */
 export type OauthFlavor = 'cai' | 'claude_code' | 'setup_token'
 
+/** 代理出口节点的地理位置。`checked_at` 有值而 `ip` 为空即检测失败，见 `error`。 */
+export type ProxyGeo = {
+  ip?: string | null
+  country?: string | null
+  country_code?: string | null
+  region?: string | null
+  city?: string | null
+  isp?: string | null
+  /** IANA 时区，绑定后槽位默认跟随它。 */
+  timezone?: string | null
+  checked_at?: string | null
+  error?: string | null
+}
+
 export type VmProxySnap = {
   id?: string
   host?: string
@@ -33,6 +47,8 @@ export type VmProxySnap = {
   created_at?: string
   kind?: 'local' | 'socks5' | string
   scheme?: string
+  /** 出口地理位置；从未检测过为 null。 */
+  geo?: ProxyGeo | null
 }
 
 export type InferenceEngine = 'auto' | 'go' | 'rust'
@@ -154,6 +170,10 @@ export type Vm = {
   resolved_persona_preset?: string | null
   kernel?: string
   region?: string
+  /** 槽位环境时区（容器 `TZ` + persona `# Environment`）。 */
+  timezone?: string | null
+  /** `manual` = 手动钉住，绑定代理不会覆盖；`proxy_geo` = 跟随代理出口。 */
+  timezone_source?: 'auto' | 'manual' | 'proxy_geo' | string
   zone?: string
   active?: boolean
   max_concurrency?: number
