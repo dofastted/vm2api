@@ -1,9 +1,11 @@
 # Changelog
 
-## Unreleased
+## 1.1.9 — 2026-09-19
 
-环境时区可自定义；代理出口地理检测；绑定后默认跟随代理时区。
+cli-hop prompt cache restamp；环境时区可自定义；代理出口地理检测。
 
+- 默认 messages 断点 rewrite：重打最后一条 + 上一条，避免 cache_read 冻在 ~43.5k system
+- cli-hop 只打 conversation 断点，剥 tools/system 和 last-message 让 wrap CLI 落点，不超 4 断点上限
 - 创建槽位和环境设置支持任意 IANA 时区（自定义输入）
 - `POST /proxies/geo` · `POST /proxies/:id/geo` 经 SOCKS5 查出口 IP 的国家 / 城市 / 时区
 - 绑定代理后槽位默认采用出口时区；手动钉过的时区不被覆盖
