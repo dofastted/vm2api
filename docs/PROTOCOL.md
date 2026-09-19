@@ -26,7 +26,7 @@
 | `persona_preset` | `official_full` | 使用独立的完整官方模板；`official` 保留原有官方提示词 |
 | `overlay_preset` | `off` | 不向首条 user 注入 overlay |
 | `persona_park` | `false` | 与 `overlay_preset=off` 对齐 |
-| `cache_ttl` | `5m` | 出站 cache_control 默认 5m；入站或 `x-kin-cache-ttl: 1h` 才升 1h |
+| `cache_ttl` | `1h` | 出站 cache_control 默认 1h；可改为 5m，或用 `x-kin-cache-ttl` 覆盖 |
 
 **official 模板**保留 billing + Agent SDK identity + 可选 caller_agent / caller_system；不会自动追加完整 agent prompt。
 

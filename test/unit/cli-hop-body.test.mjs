@@ -205,6 +205,26 @@ test('cli-hop default 5m leaves last user unmarked for wrap', () => {
   assert.equal(body.messages[0].content[0].cache_control, undefined)
 })
 
+test('cli-hop disabled keeps caller conversation breakpoints except last user', () => {
+  const body = prepareCliHopBody(
+    {
+      model: 'claude-sonnet-5',
+      max_tokens: 256,
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'u1', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'a1' }] },
+        { role: 'user', content: [{ type: 'text', text: 'u2', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'a2' }] },
+        { role: 'user', content: [{ type: 'text', text: 'u3', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+      ],
+    },
+    { cacheBreakpoints: { enabled: false } },
+  )
+  assert.equal(body.messages[0].content[0].cache_control.ttl, '1h')
+  assert.equal(body.messages[2].content[0].cache_control.ttl, '1h')
+  assert.equal(body.messages[4].content[0].cache_control, undefined)
+})
+
 test('cli-hop strips Claude Code last tool_use/tool_result markers', () => {
   const body = prepareCliHopBody({
     model: 'claude-sonnet-5',

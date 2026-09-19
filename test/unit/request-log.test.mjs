@@ -240,7 +240,7 @@ test('finish prices OpenAI-shaped usage from third-party clients', () => {
   assert.equal(sum.total_cost, 2.2)
 })
 
-test('cache breakdown falls back to the 5m bucket (sub2api normalization)', () => {
+test('cache breakdown falls back to the default 1h bucket', () => {
   const store = tmpStore('normal')
   const ctx = store.start(
     { method: 'POST', headers: {}, socket: {} },
@@ -252,8 +252,8 @@ test('cache breakdown falls back to the 5m bucket (sub2api normalization)', () =
     upstream_model: 'claude-sonnet-5',
     usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 9 },
   })
-  assert.equal(sum.cache_creation_5m_tokens, 9)
-  assert.equal(sum.cache_creation_1h_tokens, 0)
+  assert.equal(sum.cache_creation_5m_tokens, 0)
+  assert.equal(sum.cache_creation_1h_tokens, 9)
   assert.equal(sum.model_mismatch, 0)
 })
 

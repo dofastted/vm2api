@@ -11,12 +11,14 @@ import {
 } from '../../src/lib/protocol/cache-ttl.mjs'
 import { calculateCost } from '../../src/lib/admin/pricing.mjs'
 
-test('default and aliases normalize to 5m or 1h', () => {
+test('default and aliases normalize to 1h or 5m', () => {
   assert.equal(normalizeCacheTtl(undefined), DEFAULT_CACHE_TTL)
+  assert.equal(DEFAULT_CACHE_TTL, '1h')
   assert.equal(normalizeCacheTtl('5m'), '5m')
   assert.equal(normalizeCacheTtl('1h'), '1h')
   assert.equal(normalizeCacheTtl('1hour'), '1h')
-  assert.equal(normalizeCacheTtl('bogus'), '5m')
+  assert.equal(normalizeCacheTtl('default'), '1h')
+  assert.equal(normalizeCacheTtl('bogus'), '1h')
 })
 
 test('header overrides routing default', () => {
@@ -25,7 +27,8 @@ test('header overrides routing default', () => {
     '1h',
   )
   assert.equal(resolveCacheTtl({ headers: {}, routing: { compatibility: { cache_ttl: '1h' } } }), '1h')
-  assert.equal(resolveCacheTtl({ headers: {}, routing: { compatibility: {} } }), '5m')
+  assert.equal(resolveCacheTtl({ headers: {}, routing: { compatibility: {} } }), '1h')
+  assert.equal(resolveCacheTtl({ headers: {}, routing: { compatibility: { cache_ttl: '5m' } } }), '5m')
 })
 
 test('official traffic keeps caller TTLs instead of applying gateway policy', () => {
@@ -45,7 +48,7 @@ test('official traffic keeps caller TTLs instead of applying gateway policy', ()
   )
 })
 
-test('inbound 1h cache_control upgrades resolved ttl; default stays 5m', () => {
+test('inbound 1h cache_control upgrades resolved ttl; routing 5m stays 5m', () => {
   assert.equal(
     resolveCacheTtl({
       headers: {},
@@ -188,12 +191,13 @@ test('stripIllegalCacheControlFields drops ephemeral.scope', () => {
   assert.deepEqual(out.messages[0].content[0].cache_control, { type: 'ephemeral', ttl: '5m' })
 })
 
-test('1h request without breakdown bills the 1h rate not 5m', () => {
-  const as5m = calculateCost({ cache_creation_tokens: 1_000_000 }, 'claude-sonnet-5')
+test('unclassified cache_creation without ttl bills the default 1h rate', () => {
+  const asDefault = calculateCost({ cache_creation_tokens: 1_000_000 }, 'claude-sonnet-5')
+  const as5m = calculateCost({ cache_creation_tokens: 1_000_000, cache_ttl: '5m' }, 'claude-sonnet-5')
   const as1h = calculateCost({ cache_creation_tokens: 1_000_000, cache_ttl: '1h' }, 'claude-sonnet-5')
+  assert.equal(asDefault.cache_creation_cost, 4)
   assert.equal(as5m.cache_creation_cost, 2.5)
   assert.equal(as1h.cache_creation_cost, 4)
-  assert.equal(as1h.cache_creation_1h_tokens, 1_000_000)
   assert.equal(as1h.total_cost - as5m.total_cost, 1.5)
 })
 

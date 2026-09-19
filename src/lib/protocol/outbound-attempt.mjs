@@ -36,6 +36,7 @@ import {
   applyCacheTtlToBody,
   applyCacheBreakpoints,
   enforceCacheTtlOrder,
+  normalizeCacheBreakpoints,
   stripIllegalCacheControlFields,
 } from './cache-ttl.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
@@ -139,9 +140,16 @@ export function prepareCliHopBody(
   body = alignSamplingWithThinking(body)
   body = stripIllegalCacheControlFields(body)
   if (cacheTtl) body = applyCacheTtlToBody(body, cacheTtl)
+  const cfg = normalizeCacheBreakpoints(cacheBreakpoints)
   body = applyCacheBreakpoints(body, {
     ttl: cacheTtl || undefined,
-    config: { ...CLI_HOP_CACHE_BREAKPOINTS, system_tail: false, tools_tail: false, messages: 'cli-hop' },
+    config: {
+      enabled: cfg.enabled,
+      preserve_client: cfg.preserve_client,
+      system_tail: false,
+      tools_tail: false,
+      messages: 'cli-hop',
+    },
     inbound: body,
   })
   body = dropCliOwnedBreakpoints(body)

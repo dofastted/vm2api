@@ -19,10 +19,6 @@ export function KernelRoutingPane(_props: {
             宿主机写 credentials.json，槽内 kernel / CLI 只读
           </span>
         </SettingRow>
-        <p className='py-3 text-xs text-muted-foreground'>
-          公开仓只走 Rust 内核调度 Claude Code 原生 subagent。Go HTTP
-          转发不再启用，失败也不会回落。
-        </p>
       </CardContent>
     </Card>
   )
