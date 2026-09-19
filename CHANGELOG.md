@@ -1,6 +1,13 @@
 # Changelog
 
+## 1.2.1 — 2026-09-19
+
+模型测试路径不再因缺 `message_stop` 刷成 api_error。
+
+- wrap JobDone 若未带 `message_stop`，kernel 补发，hop 不再标 incomplete
+
 ## 1.2.0 — 2026-09-19
+
 
 messages 缓存断点对齐 sub2api/Parrot。
 
