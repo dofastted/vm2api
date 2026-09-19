@@ -22,6 +22,7 @@ import { resolveStoreDb } from '../db/database.mjs'
 import { UsageLogsRepo } from '../db/repos/usage-logs-repo.mjs'
 import { classifyRequestError, resolveMutedErrorClasses } from './error-class.mjs'
 import { costColumnsFromUsage, normalizeUsage } from './pricing.mjs'
+import { normalizeCacheTtl } from '../protocol/cache-ttl.mjs'
 
 /** Persist the token a client actually sent — only for failed ingress auth. */
 export function presentedApiKeyForLog(token) {
@@ -104,7 +105,8 @@ function summarizeBody(body) {
 /**
  * Cache-creation TTL breakdown, normalized like Sub2API:
  * prefer usage.cache_creation.ephemeral_5m/1h; when the breakdown is absent
- * but cache_creation_input_tokens > 0, attribute everything to the 5m bucket.
+ * but cache_creation_input_tokens > 0, attribute everything to the resolved TTL
+ * (default 1h).
  */
 function cacheCreationBreakdown(usage) {
   if (!usage || typeof usage !== 'object') {
@@ -115,7 +117,7 @@ function cacheCreationBreakdown(usage) {
   let hour = Number(nested?.ephemeral_1h_input_tokens) || 0
   const total = Number(usage.cache_creation_input_tokens ?? usage.cache_creation_tokens) || 0
   if (five === 0 && hour === 0 && total > 0) {
-    if (String(usage.cache_ttl || '').toLowerCase() === '1h') hour = total
+    if (normalizeCacheTtl(usage.cache_ttl) === '1h') hour = total
     else five = total
   }
   if (five === 0 && hour === 0) {

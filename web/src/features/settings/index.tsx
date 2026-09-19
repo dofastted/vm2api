@@ -9,12 +9,11 @@ import { toast } from 'sonner'
 import { api, patchVm } from '@/lib/api'
 import {
   cacheBreakpointsFromCompat,
+  cacheTtlFromCompat,
   detectProxiedOfficialCcFromCompat,
 } from '@/lib/cache-breakpoints'
 import { cleanPersonaRules, personaRulesFromCompat } from '@/lib/persona-rules'
 import {
-  overlayDisabledByPersona,
-  overlayPresetFromCompat,
   personaInjectFromPreset,
   personaPresetFromCompat,
   personaPresetLabel,
@@ -76,22 +75,26 @@ export function SettingsPage() {
       const compat = (body.compatibility as Record<string, unknown>) || {}
       if (tab === 'protocol' || tab === 'whitelist') {
         const preset = personaPresetFromCompat(compat)
-        const forced = overlayDisabledByPersona(preset)
-        const overlay = forced ? 'off' : overlayPresetFromCompat(compat)
         const rules = cleanPersonaRules(personaRulesFromCompat(compat))
+        const breakpoints = cacheBreakpointsFromCompat(compat)
         body.compatibility = {
           ...compat,
           persona_preset: preset,
-          overlay_preset: overlay,
+          overlay_preset: 'off',
           persona_standing: String(compat.persona_standing ?? ''),
           persona_leak_append: '',
           persona_inject: personaInjectFromPreset(
             preset,
             compat.persona_inject
           ),
-          persona_park: overlay !== 'off',
-          cache_ttl: '5m',
-          cache_breakpoints: cacheBreakpointsFromCompat(compat),
+          persona_park: false,
+          cache_ttl: cacheTtlFromCompat(compat),
+          cache_breakpoints: {
+            ...breakpoints,
+            system_tail: false,
+            tools_tail: false,
+            messages: 'cli-hop',
+          },
           detect_proxied_official_cc: detectProxiedOfficialCcFromCompat(compat),
           persona_rules: rules,
         }

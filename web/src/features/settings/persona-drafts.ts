@@ -70,16 +70,6 @@ export function overlayTemplatesPayload(drafts: OverlayDrafts) {
   return out
 }
 
-export const PERSONA_SCHEME_BLURB: Record<PersonaPreset, string> = {
-  official:
-    'billing / identity / 调用方 agent / leftover。无 Environment，默认不遮罩 usage。',
-  official_full:
-    '官方全文 + Environment。billing / identity / agent_official / env_official / leftover。',
-  zero: '与 official_full 同槽位；身份折进 prompt_version；identity/agent 零宽占位；强制关 overlay。',
-  custom:
-    '完全按 JSONL 组装。空数组会静默回落官方提示词，不是「什么都不注入」。',
-}
-
 export function personaDraftStoresEmpty(
   text: string,
   key: PersonaPreset

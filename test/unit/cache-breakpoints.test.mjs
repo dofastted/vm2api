@@ -13,6 +13,7 @@ import path from 'node:path'
 
 import {
   DEFAULT_CACHE_BREAKPOINTS,
+  DEFAULT_CACHE_TTL,
   DEFAULT_MIN_CACHEABLE_TOKENS,
   applyCacheBreakpoints,
   applyMessageBreakpoints,
@@ -132,7 +133,7 @@ test('a system long enough to be cached gets the tail breakpoint', () => {
     hits.map((h) => h.where),
     ['system[1]', 'messages[0][0]'],
   )
-  assert.ok(hits.every((h) => h.type === 'ephemeral' && h.ttl === '5m'))
+  assert.ok(hits.every((h) => h.type === 'ephemeral' && h.ttl === DEFAULT_CACHE_TTL))
 })
 
 test('the official four-block system keeps its own boundary on the agent slot', () => {
@@ -165,7 +166,7 @@ test('the tail block is chosen so the caller system stays inside the cached pref
   })
   assert.equal(out.system[0].cache_control, undefined)
   assert.equal(out.system[1].cache_control, undefined)
-  assert.deepEqual(out.system[2].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.deepEqual(out.system[2].cache_control, { type: 'ephemeral', ttl: DEFAULT_CACHE_TTL })
 })
 
 test('an existing ttl is never overwritten', () => {
@@ -184,7 +185,7 @@ test('a cache_control without ttl is filled in place', () => {
   const out = injectSystemTailBreakpoint({
     system: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral' } }],
   })
-  assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral', ttl: DEFAULT_CACHE_TTL })
 })
 
 test('tools tail skips server tools and deferred tools', () => {
@@ -196,7 +197,7 @@ test('tools tail skips server tools and deferred tools', () => {
     ],
   })
   assert.equal(out.tools[0].cache_control, undefined)
-  assert.deepEqual(out.tools[1].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.deepEqual(out.tools[1].cache_control, { type: 'ephemeral', ttl: DEFAULT_CACHE_TTL })
   assert.equal(out.tools[2].cache_control, undefined)
 })
 
@@ -207,7 +208,7 @@ test('a deferred tool loses the marker Anthropic rejects', () => {
       { name: 'Lazy', input_schema: {}, defer_loading: true, cache_control: { type: 'ephemeral', ttl: '5m' } },
     ],
   })
-  assert.deepEqual(out.tools[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.deepEqual(out.tools[0].cache_control, { type: 'ephemeral', ttl: DEFAULT_CACHE_TTL })
   assert.equal(out.tools[1].cache_control, undefined)
 })
 
