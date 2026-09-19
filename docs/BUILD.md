@@ -1,6 +1,6 @@
 # 版本与构建
 
-源码和 linux amd64 `bin/kin-{kernel,egress,worker,codex-kernel,cookie-auth}`、`share/wrap-cli` 进 git。GitHub Release 仍挂一份 ELF。当前发布线：**1.2.2**（tag `v1.2.2`）。
+源码和 linux amd64 `bin/kin-{kernel,egress,worker,codex-kernel,cookie-auth}`、`share/wrap-cli` 进 git。GitHub Release 仍挂一份 ELF。当前发布线：**1.2.3**（tag `v1.2.3`）。
 
 ## 版本怎么记
 
@@ -18,8 +18,8 @@
 仓库要有 `contents: write`。流程在 `.github/workflows/release.yml`。
 
 ```bash
-git tag -a v1.2.2 -m "vm2api v1.2.2"
-git push origin v1.2.2
+git tag -a v1.2.3 -m "vm2api v1.2.3"
+git push origin v1.2.3
 ```
 
 `v*` tag 推上去之后，Actions 在 `ubuntu-latest` 编 linux amd64，并挂到该 tag 的 Release：
@@ -95,7 +95,7 @@ CI（`.github/workflows/test.yml`）在 push / PR 上跑：Node unit、Go、Rust
 
 ## 升级一台已部署的机
 
-升 **v1.2.2**：控制面 Node 更新并重启一次，再 `POST /api/panel/wrap-cli/sync`（`restart: true`）换槽内 `.kin/kin-kernel.bin` 并 bounce kernel。不要重装 wrap，不要 `docker rm` 槽。步骤见 [DEPLOY.md · 已部署机升级到 1.2.2](DEPLOY.md#已部署机升级到-122)。
+升 **v1.2.3**：只更新控制面 Node（含 web）并重启一次。已在 1.2.2 不必再换槽内 kernel。从更早版本来，先做 [1.2.2 的 kernel sync](DEPLOY.md#已部署机升级到-122)。步骤见 [DEPLOY.md · 已部署机升级到 1.2.3](DEPLOY.md#已部署机升级到-123)。
 
 **Compose（其它版本通用）**
 
@@ -106,7 +106,7 @@ docker compose up -d --build
 curl -sS --noproxy '*' http://127.0.0.1:8787/health
 ```
 
-槽位容器不会被这次升级 `docker rm`。1.2.2 还要做上面的 kernel sync。
+槽位容器不会被这次升级 `docker rm`。1.2.3 相对 1.2.2 不必 kernel sync；从 1.2.1 及更早来仍要做。
 
 **本机 Node + systemd**
 

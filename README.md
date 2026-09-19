@@ -59,7 +59,7 @@ docker compose up -d --build
 curl -sS --noproxy '*' http://127.0.0.1:8787/health
 ```
 
-`--build` 拷仓内 `bin/kin-{kernel,egress,worker,codex-kernel,cookie-auth}` 和 `share/wrap-cli`，**不在服务器上编 Rust/Go**。缺槽位 OS 时入口编 `kin-os/ubuntu:24.04`。其它发行版：`node docker/kin-os/build.mjs`。槽 UID 是 `10000+序号`，`bin/kin-*` 必须 **755**，不要 `700`。已部署机升 **v1.2.2**：控制面重启一次 + `POST /api/panel/wrap-cli/sync` 换槽内 kernel，见 [DEPLOY.md](docs/DEPLOY.md#已部署机升级到-122)。
+`--build` 拷仓内 `bin/kin-{kernel,egress,worker,codex-kernel,cookie-auth}` 和 `share/wrap-cli`，**不在服务器上编 Rust/Go**。缺槽位 OS 时入口编 `kin-os/ubuntu:24.04`。其它发行版：`node docker/kin-os/build.mjs`。槽 UID 是 `10000+序号`，`bin/kin-*` 必须 **755**，不要 `700`。已部署机升 **v1.2.3**：控制面重启一次即可；已在 1.2.2 不必再 `wrap-cli/sync`。见 [DEPLOY.md](docs/DEPLOY.md#已部署机升级到-123)。
 
 
 
@@ -214,11 +214,11 @@ VM2API_DB_SECRET=       # 库加密
 
 ## 版本与构建
 
-当前发布：**v1.2.2**
+当前发布：**v1.2.3**
 
 ```bash
-git tag -a v1.2.2 -m "vm2api v1.2.2"
-git push origin v1.2.2
+git tag -a v1.2.3 -m "vm2api v1.2.3"
+git push origin v1.2.3
 ```
 
 `v*` tag 会触发 [Release 工作流](.github/workflows/release.yml)，再挂一份 linux amd64 ELF。仓内 `bin/` 已可直接部署。步骤：[BUILD.md](docs/BUILD.md)
