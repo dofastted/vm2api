@@ -60,7 +60,7 @@ export function createRoutingRuntime(ctx) {
     vm.policy = { ...(vm.policy || {}), maxConcurrency: value, concurrencyOverride: override }
     vm.updated_at = new Date().toISOString()
     atomicWriteJson(vmPath, vm, { mode: 0o600 })
-    ctx.accountQuota.setMaxConcurrency(vm.claude?.account_uuid || vm.id, value)
+    ctx.accountQuota.setMaxConcurrency(vm.claude?.account_uuid || vm.id, value, { override })
     return vm
   }
 
@@ -210,7 +210,6 @@ export function createRoutingRuntime(ctx) {
     const prevUsageProbe = routingConfig.usage_probe
     const prevNotify = routingConfig.notify
     const prevTiers = routingConfig.tiers
-    routingConfig = { ...routingConfig, ...body }
     setRouting(routingConfig)
     if (body.sticky) routingConfig.sticky = { ...(routingConfig.sticky || {}), ...body.sticky }
     if (body.quota) routingConfig.quota = { ...(routingConfig.quota || {}), ...body.quota }
@@ -255,9 +254,19 @@ export function createRoutingRuntime(ctx) {
     ctx.accountQuota.reloadConfig(routingConfig)
     getPool()?.reloadConfig?.(poolSchedulerConfig())
     if (body.pool || body.failover) initPoolRuntime()
-    return {
-      concurrency: applyRoutingTierConcurrency(routingConfig.tiers),
-      rpm: applyRoutingTierRpm(routingConfig.tiers),
+    try {
+      return {
+        concurrency: applyRoutingTierConcurrency(routingConfig.tiers),
+        rpm: applyRoutingTierRpm(routingConfig.tiers),
+      }
+    } catch (err) {
+      console.error(
+        JSON.stringify({
+          event: 'routing_tier_apply_failed',
+          error: String(err?.message || err),
+        }),
+      )
+      return { concurrency: { skipped: 0 }, rpm: { skipped: 0 } }
     }
   }
 

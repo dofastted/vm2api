@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+控制面板分档配额（5h/7d、RPM、并发、session）保存后立刻走 live policy，不再被账户落盘副本挡住；session 占用保持到空闲超时。
+
 ## 1.1.7 — 2026-09-19
 
 Opus/Sonnet extra-usage 429 与 GPT `/v1/messages` 未绑槽一并修掉。

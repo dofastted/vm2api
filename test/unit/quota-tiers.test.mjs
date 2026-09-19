@@ -185,3 +185,42 @@ test('saving Pro 5h=80% lands on policyFor limit_5h', () => {
   q.ingestHeaders('pro-80', { 'anthropic-ratelimit-unified-5h-utilization': '0.81' })
   assert.equal(q.canAccept('pro-80').reason, 'quota_5h_safety')
 })
+
+test('reloadConfig applies conc rpm sessions without rewriting account rows', () => {
+  const q = new AccountQuota({
+    dataDir: tmpDir(),
+    config: {
+      quota: { block_on_5h: true, block_on_7d: true },
+      tiers: { default: { max_concurrency: 2, max_rpm: 0, max_sessions: 0 } },
+    },
+  })
+  q.ensure({ account_id: 'live' })
+  const acc = q.repo.get('live')
+  assert.equal(q.limitFor(acc), 2)
+  assert.equal(q.rpmLimitFor(acc), 0)
+  q.reloadConfig({
+    quota: { block_on_5h: true, block_on_7d: true },
+    tiers: { default: { max_concurrency: 8, max_rpm: 12, max_sessions: 2, session_idle_min: 5 } },
+  })
+  assert.equal(q.limitFor(q.repo.get('live')), 8)
+  assert.equal(q.rpmLimitFor(q.repo.get('live')), 12)
+  q.sessions.touch('live', 's1')
+  q.sessions.release('live', 's1')
+  q.sessions.touch('live', 's2')
+  q.sessions.release('live', 's2')
+  assert.equal(q.canAccept('live', { sessionKey: 's3' }).reason, 'session_limit')
+  assert.equal(q.canAccept('live', { sessionKey: 's1' }).ok, true)
+})
+
+test('manual conc and rpm pins ignore live tier', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ensure({ account_id: 'pin' })
+  q.setMaxConcurrency('pin', 1, { override: true })
+  q.setMaxRpm('pin', 2, { override: true })
+  q.reloadConfig({
+    quota: { block_on_5h: true, block_on_7d: true },
+    tiers: { default: { max_concurrency: 8, max_rpm: 60 } },
+  })
+  assert.equal(q.limitFor(q.repo.get('pin')), 1)
+  assert.equal(q.rpmLimitFor(q.repo.get('pin')), 2)
+})

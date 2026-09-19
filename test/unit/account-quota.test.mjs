@@ -182,7 +182,10 @@ test('cli rate_limit_event copies unifiedWindows utilization', () => {
 })
 
 test('tryAcquire enforces and releases the configured concurrency cap', () => {
-  const q = new AccountQuota({ dataDir: tmpDir(), accounts: [{ account_id: 'acc-reserve', max_concurrency: 1 }] })
+  const q = new AccountQuota({
+    dataDir: tmpDir(),
+    accounts: [{ account_id: 'acc-reserve', max_concurrency: 1, concurrency_override: 1 }],
+  })
   assert.equal(q.tryAcquire('acc-reserve').ok, true)
   assert.equal(q.tryAcquire('acc-reserve').reason, 'concurrency_limit')
   q.release('acc-reserve')
@@ -218,7 +221,7 @@ test('allocations trimmed to 50 per account', () => {
 test('max_concurrency 0 blocks instead of treating as unlimited', () => {
   const q = new AccountQuota({ dataDir: tmpDir(), config: { concurrency: { default_max_per_account: 20 } } })
   q.ensure({ account_id: 'zero', max_concurrency: 0 })
-  q.setMaxConcurrency('zero', 0)
+  q.setMaxConcurrency('zero', 0, { override: true })
   const gate = q.canAccept('zero')
   assert.equal(gate.ok, false)
   assert.equal(gate.reason, 'concurrency_limit')
@@ -237,6 +240,7 @@ test('rebindToVm moves the UUID row onto the new slot', () => {
 test('concurrency inflight gate stays in memory', () => {
   const q = new AccountQuota({ dataDir: tmpDir(), config: { concurrency: { default_max_per_account: 1 } } })
   q.ensure({ account_id: 'a7' })
+  q.setMaxConcurrency('a7', 1, { override: true })
   q.acquire('a7')
   const gate = q.canAccept('a7')
   assert.equal(gate.ok, false)
@@ -247,7 +251,8 @@ test('concurrency inflight gate stays in memory', () => {
 
 test('rpm window blocks then recovers', () => {
   const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
-  q.ensure({ account_id: 'rpm-acc', max_concurrency: 8, max_rpm: 2 })
+  q.ensure({ account_id: 'rpm-acc', max_concurrency: 8 })
+  q.setMaxRpm('rpm-acc', 2, { override: true })
   assert.equal(q.tryAcquire('rpm-acc').ok, true)
   q.release('rpm-acc')
   assert.equal(q.tryAcquire('rpm-acc').ok, true)

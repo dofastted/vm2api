@@ -367,8 +367,8 @@ export function evaluateAccount({
   }
 
   const accountId = account.account_id || account.accountId || vm.id || null
-  const maxSessions = Number(account.max_sessions ?? pol.max_sessions ?? 0)
-  const idleMin = Number(account.session_idle_min ?? pol.session_idle_min ?? 5)
+  const maxSessions = Number(pol.max_sessions ?? account.max_sessions ?? 0)
+  const idleMin = Number(pol.session_idle_min ?? account.session_idle_min ?? 5)
   let sessions = null
   if (sessionLimit && typeof sessionLimit.snapshot === 'function') {
     sessions = sessionLimit.snapshot(accountId, { max: maxSessions, idleMin, now })
