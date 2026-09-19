@@ -97,6 +97,7 @@ impl StreamAssembler {
                                 .unwrap_or("")
                                 .to_string(),
                             input: block.get("input").cloned().unwrap_or(json!({})),
+                            cache_control: None,
                         };
                         // Real Anthropic streams always send an empty `input: {}`
                         // placeholder here; the actual arguments arrive as
@@ -120,6 +121,7 @@ impl StreamAssembler {
                                 .unwrap_or("")
                                 .to_string(),
                             input: block.get("input").cloned().unwrap_or(json!({})),
+                            cache_control: None,
                         };
                         // Same placeholder-input pitfall as `tool_use` above:
                         // real args arrive via `input_json_delta` and are
@@ -134,6 +136,7 @@ impl StreamAssembler {
                                 .unwrap_or("")
                                 .to_string(),
                             content: block.get("content").cloned().unwrap_or(Value::Null),
+                            cache_control: None,
                         };
                     }
                     _ => {}

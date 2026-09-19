@@ -283,7 +283,7 @@ export function applyCacheTtlToBody(body, ttl = DEFAULT_CACHE_TTL) {
   return enforceCacheTtlOrder(out, { honorHour })
 }
 
-export const MESSAGES_BREAKPOINT_MODES = Object.freeze(['off', 'fill', 'rewrite'])
+export const MESSAGES_BREAKPOINT_MODES = Object.freeze(['off', 'fill', 'rewrite', 'cli-hop'])
 
 /**
  * Anthropic only caches a prefix that ends at a breakpoint, so a body with no
@@ -305,6 +305,7 @@ export function normalizeMessagesBreakpointMode(value) {
     .trim()
     .toLowerCase()
   if (raw === 'off' || raw === 'none' || raw === 'false' || raw === '0' || raw === 'disabled') return 'off'
+  if (raw === 'cli-hop' || raw === 'cli' || raw === 'leftover') return 'cli-hop'
   if (raw === 'rewrite' || raw === 'replace' || raw === 'restamp' || raw === 'auto') return 'rewrite'
   if (raw === 'fill' || raw === 'true' || raw === '1') return 'fill'
   return DEFAULT_CACHE_BREAKPOINTS.messages
@@ -574,7 +575,10 @@ export function applyMessageBreakpoints(body, ttl = DEFAULT_CACHE_TTL, mode = DE
   if (!body || typeof body !== 'object' || !Array.isArray(body.messages) || body.messages.length === 0) return body
   if (resolved === 'fill' && hasMessageBreakpoint(body.messages)) return body
   const target = normalizeCacheTtl(ttl)
-  let messages = resolved === 'rewrite' ? dropMessageBreakpoints(body.messages) : body.messages
+  let messages = resolved === 'fill' ? body.messages : dropMessageBreakpoints(body.messages)
+  if (resolved === 'cli-hop') {
+    return messages === body.messages ? body : { ...body, messages }
+  }
   messages = stampMessageTail(messages, messages.length - 1, target)
   const prevUser = penultimateUserIndex(messages)
   if (prevUser >= 0) messages = stampMessageTail(messages, prevUser, target)

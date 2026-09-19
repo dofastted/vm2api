@@ -1652,7 +1652,9 @@ impl Provider for MultiplexCliProvider {
     ) -> Result<crate::provider::StreamRx, KernelError> {
         let runtime = self.runtime().await?;
         let (tx, rx) = job_event_channel();
-        runtime.submit(request.clone(), context.clone(), tx).await?;
+        let mut stamped = request.clone();
+        crate::model::stamp_cli_hop_message_breakpoints(&mut stamped);
+        runtime.submit(stamped, context.clone(), tx).await?;
         Ok(rx)
     }
 }
@@ -2061,6 +2063,7 @@ mod tests {
                     tool_use_id: id,
                     content: json!("ok"),
                     is_error: false,
+                    cache_control: None,
                 }]),
                 tool_call_id: None,
                 tool_calls: Vec::new(),
@@ -2413,7 +2416,9 @@ mod tests {
         assert_eq!(response_1.usage.output_tokens, 12);
         assert_eq!(response_1.usage.input_tokens, 34);
         let tool_use_id = match &response_1.content[0] {
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 assert_eq!(name, "echo");
                 assert_eq!(input, &json!({"text": "hi"}));
                 id.clone()
@@ -2450,6 +2455,7 @@ mod tests {
                 tool_use_id: tool_use_id.clone(),
                 content: json!("ok"),
                 is_error: false,
+                cache_control: None,
             }]),
             tool_call_id: None,
             tool_calls: Vec::new(),

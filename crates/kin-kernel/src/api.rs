@@ -612,7 +612,9 @@ fn to_chat_response(response: MessageResponse) -> ChatResponse {
     for block in response.content {
         match block {
             ContentBlock::Text { text: value, .. } => text.push_str(&value),
-            ContentBlock::ToolUse { id, name, input } => tool_calls.push(ChatToolCall {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => tool_calls.push(ChatToolCall {
                 id,
                 r#type: "function".into(),
                 function: ChatToolCallFunction {

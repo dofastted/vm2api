@@ -67,11 +67,11 @@ impl MessageRequest {
                         serde_json::to_value(blocks).unwrap_or(Value::Null)
                     }
                 };
-                message.role = "user".into();
                 message.content = MessageContent::Blocks(vec![ContentBlock::ToolResult {
                     tool_use_id: id,
                     content,
                     is_error: false,
+                    cache_control: None,
                 }]);
                 message.tool_call_id = None;
             }
@@ -95,6 +95,7 @@ impl MessageRequest {
                         id: call.id,
                         name: call.function.name,
                         input,
+                        cache_control: None,
                     });
                 }
                 message.content = MessageContent::Blocks(blocks);
@@ -126,6 +127,95 @@ impl MessageRequest {
 
 fn json_or_string(raw: &str) -> Value {
     Value::String(raw.to_string())
+}
+
+fn ephemeral_cache_control() -> Value {
+    serde_json::json!({"type": "ephemeral"})
+}
+
+fn drop_text_cache_control(block: &mut ContentBlock) {
+    if let Some(cc) = block_cache_slot(block) {
+        *cc = None;
+    }
+}
+
+fn block_cache_slot(block: &mut ContentBlock) -> Option<&mut Option<Value>> {
+    match block {
+        ContentBlock::Text { cache_control, .. }
+        | ContentBlock::ToolUse { cache_control, .. }
+        | ContentBlock::ToolResult { cache_control, .. }
+        | ContentBlock::ServerToolUse { cache_control, .. }
+        | ContentBlock::WebSearchToolResult { cache_control, .. } => Some(cache_control),
+        _ => None,
+    }
+}
+
+fn is_thinking_block(block: &ContentBlock) -> bool {
+    matches!(
+        block,
+        ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
+    )
+}
+
+fn stamp_message_tail(content: &mut MessageContent) {
+    match content {
+        MessageContent::Text(text) => {
+            *content = MessageContent::Blocks(vec![ContentBlock::Text {
+                text: std::mem::take(text),
+                cache_control: Some(ephemeral_cache_control()),
+            }]);
+        }
+        MessageContent::Blocks(blocks) if !blocks.is_empty() => {
+            for block in blocks.iter_mut() {
+                drop_text_cache_control(block);
+            }
+            for block in blocks.iter_mut().rev() {
+                if is_thinking_block(block) {
+                    continue;
+                }
+                if let Some(cc) = block_cache_slot(block) {
+                    *cc = Some(ephemeral_cache_control());
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn leftover_user_index(messages: &[Message]) -> Option<usize> {
+    let users: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "user")
+        .map(|(i, _)| i)
+        .collect();
+    if users.len() < 2 {
+        return None;
+    }
+    Some(users[users.len() - 2])
+}
+
+/// Wrap `wireMessages` skips Claude Code addCacheBreakpoints. Stamp last
+/// non-thinking block plus the previous user so Anthropic prefixes overlap.
+pub fn stamp_cli_hop_message_breakpoints(request: &mut MessageRequest) {
+    if request.messages.is_empty() {
+        return;
+    }
+    for message in &mut request.messages {
+        if let MessageContent::Blocks(blocks) = &mut message.content {
+            for block in blocks.iter_mut() {
+                drop_text_cache_control(block);
+            }
+        }
+    }
+    let last = request.messages.len() - 1;
+    stamp_message_tail(&mut request.messages[last].content);
+    if let Some(prev) = leftover_user_index(&request.messages) {
+        if prev != last {
+            stamp_message_tail(&mut request.messages[prev].content);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -202,6 +292,8 @@ pub enum ContentBlock {
         name: String,
         #[serde(default)]
         input: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<Value>,
     },
     ToolResult {
         tool_use_id: String,
@@ -209,6 +301,8 @@ pub enum ContentBlock {
         content: Value,
         #[serde(default)]
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<Value>,
     },
     Thinking {
         thinking: String,
@@ -224,11 +318,15 @@ pub enum ContentBlock {
         name: String,
         #[serde(default)]
         input: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<Value>,
     },
     WebSearchToolResult {
         tool_use_id: String,
         #[serde(default)]
         content: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<Value>,
     },
 }
 

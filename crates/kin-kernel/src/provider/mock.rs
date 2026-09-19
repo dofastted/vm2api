@@ -79,6 +79,7 @@ fn mock_turn(
                 id: format!("toolu_{}", Uuid::new_v4().simple()),
                 name: tool_name,
                 input: json!({"location": "Shanghai"}),
+                cache_control: None,
             }],
             StopReason::ToolUse,
         ));
@@ -134,7 +135,9 @@ fn mock_events(response: &MessageResponse) -> Vec<Value> {
                 }
                 events.push(json!({ "type": "content_block_stop", "index": index }));
             }
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 events.push(json!({
                     "type": "content_block_start",
                     "index": index,
