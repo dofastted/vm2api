@@ -3,7 +3,7 @@
 # 仓内 bin/kin-* 与 share/wrap-cli 直接进镜像；启动写入 ./bin 与 ./share，缺镜像时编 kin-os/ubuntu。
 services:
   vm2api:
-    image: vm2api:1.2.0
+    image: vm2api:1.2.1
     build:
       context: .
       dockerfile: Dockerfile

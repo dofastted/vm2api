@@ -1,6 +1,6 @@
 {
   "name": "vm2api",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "description": "VM-fidelity subscription-to-API gateway",
   "type": "module",
