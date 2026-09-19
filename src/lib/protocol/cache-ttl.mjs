@@ -295,7 +295,9 @@ export const DEFAULT_CACHE_BREAKPOINTS = Object.freeze({
   preserve_client: true,
   system_tail: true,
   tools_tail: true,
-  messages: 'fill',
+  // rewrite: Claude Code stamps the current last user; fill would leave that
+  // wandering marker and freeze hits at the system prefix (~43.5k).
+  messages: 'rewrite',
 })
 
 export function normalizeMessagesBreakpointMode(value) {
@@ -303,8 +305,8 @@ export function normalizeMessagesBreakpointMode(value) {
     .trim()
     .toLowerCase()
   if (raw === 'off' || raw === 'none' || raw === 'false' || raw === '0' || raw === 'disabled') return 'off'
-  if (raw === 'rewrite' || raw === 'replace' || raw === 'restamp') return 'rewrite'
-  if (raw === 'fill' || raw === 'auto' || raw === 'true' || raw === '1') return 'fill'
+  if (raw === 'rewrite' || raw === 'replace' || raw === 'restamp' || raw === 'auto') return 'rewrite'
+  if (raw === 'fill' || raw === 'true' || raw === '1') return 'fill'
   return DEFAULT_CACHE_BREAKPOINTS.messages
 }
 
@@ -548,14 +550,12 @@ function stampMessageTail(messages, idx, ttl) {
 }
 
 /**
- * Two positions that stay stable as a conversation grows: the last message, and
- * the second-to-last user turn once there is history. Callers (Claude Code
- * especially) tend to mark "the current last user message", which becomes a
- * middle message next turn and shifts the cached prefix.
+ * Last message plus the previous message: the previous tail stays a live
+ * breakpoint next turn. Second-to-last *user* is too far back or moves every
+ * user turn, so cache_read freezes at the system prefix (~43.5k).
  *
- * `fill` leaves a body that already carries caller breakpoints alone — their
- * positions are usually fine and re-stamping costs one miss. `rewrite` is the
- * sub2api behaviour: drop everything, then re-mark.
+ * `fill` leaves a body that already carries caller breakpoints alone.
+ * `rewrite` drops everything, then re-mark.
  */
 export function applyMessageBreakpoints(body, ttl = DEFAULT_CACHE_TTL, mode = DEFAULT_CACHE_BREAKPOINTS.messages) {
   const resolved = normalizeMessagesBreakpointMode(mode)
@@ -565,16 +565,8 @@ export function applyMessageBreakpoints(body, ttl = DEFAULT_CACHE_TTL, mode = DE
   const target = normalizeCacheTtl(ttl)
   let messages = resolved === 'rewrite' ? dropMessageBreakpoints(body.messages) : body.messages
   messages = stampMessageTail(messages, messages.length - 1, target)
-  if (messages.length >= 4) {
-    let seen = 0
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i]?.role !== 'user') continue
-      seen++
-      if (seen === 2) {
-        messages = stampMessageTail(messages, i, target)
-        break
-      }
-    }
+  if (messages.length >= 2) {
+    messages = stampMessageTail(messages, messages.length - 2, target)
   }
   return messages === body.messages ? body : { ...body, messages }
 }

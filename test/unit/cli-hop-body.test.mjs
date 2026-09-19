@@ -24,7 +24,7 @@ test('prepareCliHopBody drops metadata and CLI-owned system but keeps official a
   assert.equal(body.system.length, 1)
   assert.equal(body.system[0].text, CRS_OFFICIAL_AGENT_PROMPT)
   assert.equal(body.model, 'claude-sonnet-5')
-  assert.equal(body.messages[0].content, 'hi')
+  assert.deepEqual(body.messages[0].content, [{ type: 'text', text: 'hi' }])
   assert.equal(body.stream, true)
 })
 
@@ -100,7 +100,7 @@ test('prepareCliHopBody strips unsigned empty dummy and short thinking history',
   assert.equal(body.temperature, 1)
   assert.deepEqual(body.messages[1].content, [
     { type: 'thinking', thinking: 'keep-me', signature: 'sig_real_1234567890abcdef' },
-    { type: 'text', text: 'hello' },
+    { type: 'text', text: 'hello', cache_control: { type: 'ephemeral', ttl: '5m' } },
   ])
 })
 
@@ -127,7 +127,7 @@ test('prepareCliHopBody repaired does not refill thinking after signature downgr
   assert.equal(body.context_management, undefined)
   assert.deepEqual(body.messages[1].content, [
     { type: 'text', text: 'plan' },
-    { type: 'text', text: 'hello' },
+    { type: 'text', text: 'hello', cache_control: { type: 'ephemeral', ttl: '5m' } },
   ])
 })
 
@@ -152,7 +152,7 @@ test('prepareCliHopBody disables Haiku adaptive thinking', () => {
   assert.equal(body.thinking.type, 'disabled')
 })
 
-test('cli-hop keeps caller message 1h and upgrades earlier tool 5m', () => {
+test('cli-hop keeps caller message 1h and strips tool/system markers for wrap CLI', () => {
   const body = prepareCliHopBody(
     {
       model: 'claude-sonnet-5',
@@ -178,12 +178,12 @@ test('cli-hop keeps caller message 1h and upgrades earlier tool 5m', () => {
     },
     { cacheTtl: '5m' },
   )
-  assert.equal(body.tools[1].cache_control.ttl, '1h')
-  assert.deepEqual(body.system[0].cache_control, { type: 'ephemeral', ttl: '1h' })
-  assert.deepEqual(body.messages[0].content[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.equal(body.tools[1].cache_control, undefined)
+  assert.equal(body.system[0].cache_control, undefined)
+  assert.equal(body.messages[0].content[0].cache_control, undefined)
 })
 
-test('cli-hop default 5m retargets leftover system 1h when caller has no 1h', () => {
+test('cli-hop default 5m stamps only the message tail', () => {
   const body = prepareCliHopBody(
     {
       model: 'claude-sonnet-5',
@@ -200,7 +200,23 @@ test('cli-hop default 5m retargets leftover system 1h when caller has no 1h', ()
     },
     { cacheTtl: '5m' },
   )
-  assert.equal(body.tools[0].cache_control.ttl, '5m')
-  assert.deepEqual(body.system[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.equal(body.tools[0].cache_control, undefined)
+  assert.equal(body.system[0].cache_control, undefined)
   assert.equal(body.messages[0].content[0].cache_control, undefined)
+})
+
+test('cli-hop rewrite drops a wandering last-user marker and restamps stable positions', () => {
+  const body = prepareCliHopBody({
+    model: 'claude-sonnet-5',
+    max_tokens: 256,
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'u1' }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'a1' }] },
+      { role: 'user', content: [{ type: 'text', text: 'u2', cache_control: { type: 'ephemeral', ttl: '5m' } }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'a2' }] },
+    ],
+  })
+  assert.equal(body.messages[0].content[0].cache_control, undefined)
+  assert.deepEqual(body.messages[2].content[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.equal(body.messages[3].content[0].cache_control, undefined)
 })

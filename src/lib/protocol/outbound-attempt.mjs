@@ -10,6 +10,7 @@ import {
   ensureClearThinkingContextManagement,
   stripInvalidThinkingBlocks,
   alignSamplingWithThinking,
+  enforceCacheLimit,
 } from './anthropic-policy.mjs'
 import { ensureUnofficialAdaptiveThinking, ensureUnofficialEffortHigh, normalizeThinkingForModel } from './thinking.mjs'
 import {
@@ -31,7 +32,12 @@ import {
   CRS_AGENT_EXPANSION,
   CRS_OFFICIAL_AGENT_IDENTITY,
 } from '../identity/official-cc-system-2.1.241.mjs'
-import { applyCacheTtlToBody, enforceCacheTtlOrder, stripIllegalCacheControlFields } from './cache-ttl.mjs'
+import {
+  applyCacheTtlToBody,
+  applyCacheBreakpoints,
+  enforceCacheTtlOrder,
+  stripIllegalCacheControlFields,
+} from './cache-ttl.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
 import { isApiKeyMode, isSetupTokenMode } from '../oauth/credential-mode.mjs'
 
@@ -64,8 +70,52 @@ export function stripCliOwnedSystem(system) {
   return kept.length ? kept : undefined
 }
 
+/** Wrap CLI already stamps tools + system. Extra tails here overflow the 4-breakpoint cap → 400, often surfaced as Connection error. */
+export const CLI_HOP_CACHE_BREAKPOINTS = Object.freeze({
+  enabled: true,
+  preserve_client: true,
+  system_tail: false,
+  tools_tail: false,
+  messages: 'rewrite',
+})
+
+function dropNodeCacheControl(node) {
+  if (!node || typeof node !== 'object' || !node.cache_control) return node
+  const { cache_control: _drop, ...rest } = node
+  return rest
+}
+
+function dropCliOwnedBreakpoints(body) {
+  const out = { ...body }
+  if (Array.isArray(out.tools)) out.tools = out.tools.map(dropNodeCacheControl)
+  if (Array.isArray(out.system)) out.system = out.system.map(dropNodeCacheControl)
+  return out
+}
+
+/** CLI stamps the current last user. Keeping ours on the tail overflows the 4-cap. */
+function dropLastMessageBreakpoint(body) {
+  const messages = body?.messages
+  if (!Array.isArray(messages) || messages.length === 0) return body
+  const idx = messages.length - 1
+  const last = messages[idx]
+  if (!last || !Array.isArray(last.content)) return body
+  const content = last.content.map(dropNodeCacheControl)
+  const next = messages.slice()
+  next[idx] = { ...last, content }
+  return { ...body, messages: next }
+}
+
 /** Caller fields only. CLI owns UA / billing / metadata / layoutSystemBlocks. */
-export function prepareCliHopBody(canonicalBody, { stream = true, repaired = false, cacheTtl = null } = {}) {
+export function prepareCliHopBody(
+  canonicalBody,
+  {
+    stream = true,
+    repaired = false,
+    cacheTtl = null,
+    cacheBreakpoints = CLI_HOP_CACHE_BREAKPOINTS,
+    cacheControlLimit = 4,
+  } = {},
+) {
   let body = officialMessagesBody(canonicalBody, { stream })
   delete body.metadata
   const leftover = stripCliOwnedSystem(body.system)
@@ -82,11 +132,20 @@ export function prepareCliHopBody(canonicalBody, { stream = true, repaired = fal
   }
   body = stripInvalidThinkingBlocks(body)
   body = alignSamplingWithThinking(body)
-  // rust cli-hop skips prepareOutboundAttempt, so mixed caller 5m tools +
-  // leftover/user 1h would 400: ttl=1h must not come after ttl=5m.
   body = stripIllegalCacheControlFields(body)
   if (cacheTtl) body = applyCacheTtlToBody(body, cacheTtl)
-  return enforceCacheTtlOrder(body)
+  if (cacheBreakpoints) {
+    body = applyCacheBreakpoints(body, {
+      ttl: cacheTtl || undefined,
+      config: { ...cacheBreakpoints, system_tail: false, tools_tail: false },
+      inbound: body,
+    })
+  }
+  body = dropCliOwnedBreakpoints(body)
+  body = dropLastMessageBreakpoint(body)
+  body = enforceCacheTtlOrder(body)
+  enforceCacheLimit(body, cacheControlLimit)
+  return body
 }
 
 /** Wrap CLI process is spawned as sonnet-5/adaptive. Haiku rejects thinking. */

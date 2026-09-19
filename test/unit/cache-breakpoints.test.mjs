@@ -73,10 +73,12 @@ function withRoutingFile(compatibility, fn) {
 
 test('defaults are on, and messages mode aliases normalize', () => {
   assert.deepEqual(normalizeCacheBreakpoints(undefined), { ...DEFAULT_CACHE_BREAKPOINTS })
-  assert.equal(normalizeMessagesBreakpointMode('auto'), 'fill')
+  assert.equal(DEFAULT_CACHE_BREAKPOINTS.messages, 'rewrite')
+  assert.equal(normalizeMessagesBreakpointMode('auto'), 'rewrite')
   assert.equal(normalizeMessagesBreakpointMode('disabled'), 'off')
   assert.equal(normalizeMessagesBreakpointMode('restamp'), 'rewrite')
-  assert.equal(normalizeMessagesBreakpointMode('nonsense'), 'fill')
+  assert.equal(normalizeMessagesBreakpointMode('nonsense'), 'rewrite')
+  assert.equal(normalizeMessagesBreakpointMode('fill'), 'fill')
   assert.equal(normalizeCacheBreakpoints({ enabled: false }).enabled, false)
 })
 
@@ -219,7 +221,7 @@ test('fill leaves a body that already carries caller message breakpoints alone',
   assert.equal(applyMessageBreakpoints(body, '5m', 'fill'), body)
 })
 
-test('fill marks the last message and the second-to-last user turn', () => {
+test('fill marks the last message and the previous message', () => {
   const out = applyMessageBreakpoints(
     {
       messages: [
@@ -234,7 +236,7 @@ test('fill marks the last message and the second-to-last user turn', () => {
   )
   assert.deepEqual(
     breakpoints(out).map((h) => h.where),
-    ['messages[0][0]', 'messages[3][0]'],
+    ['messages[2][0]', 'messages[3][0]'],
   )
 })
 
@@ -262,7 +264,7 @@ test('rewrite drops caller markers before re-marking the stable positions', () =
   )
   assert.deepEqual(
     breakpoints(out).map((h) => h.where),
-    ['messages[0][0]', 'messages[3][0]'],
+    ['messages[2][0]', 'messages[3][0]'],
   )
 })
 

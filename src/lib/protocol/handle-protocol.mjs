@@ -752,6 +752,8 @@ export function createHandleProtocol(deps) {
               stream: upstreamStream,
               repaired,
               cacheTtl,
+              cacheBreakpoints,
+              cacheControlLimit: Number(getRouting()?.compatibility?.cache_control_limit) || 4,
             })
             hopBody = await materializeRemoteImageSources(hopBody)
             const cliHide = personaHideForCliZero(personaIn, hopBody, {

@@ -24,7 +24,7 @@ export const DEFAULT_CACHE_BREAKPOINTS: CacheBreakpoints = {
   preserve_client: true,
   system_tail: true,
   tools_tail: true,
-  messages: 'fill',
+  messages: 'rewrite',
 }
 
 export const MESSAGES_BREAKPOINT_OPTIONS: [MessagesBreakpointMode, string][] = [
@@ -37,7 +37,7 @@ export function messagesModeExplain(mode: MessagesBreakpointMode): string {
   if (mode === 'off')
     return '不碰 messages。调用方自己打的断点照旧生效，网关只管 system 和 tools。'
   if (mode === 'rewrite')
-    return '先清掉调用方在 messages 里的全部断点，再打末条消息与倒数第二条 user。对话前缀稳定时命中率最高，但会盖掉调用方自己调好的位置。'
+    return '先清掉调用方在 messages 里的全部断点，再打最后一条和上一条消息。上一轮尾断点下一轮仍是有效前缀，避免 cache_read 冻在 system。'
   return '只在 messages 一个断点都没有时补齐。已经自己打过断点的客户端保持原样。'
 }
 
@@ -54,8 +54,8 @@ export function normalizeMessagesBreakpointMode(
     .trim()
     .toLowerCase()
   if (['off', 'none', 'false', '0', 'disabled'].includes(raw)) return 'off'
-  if (['rewrite', 'replace', 'restamp'].includes(raw)) return 'rewrite'
-  if (['fill', 'auto', 'true', '1'].includes(raw)) return 'fill'
+  if (['rewrite', 'replace', 'restamp', 'auto'].includes(raw)) return 'rewrite'
+  if (['fill', 'true', '1'].includes(raw)) return 'fill'
   return DEFAULT_CACHE_BREAKPOINTS.messages
 }
 

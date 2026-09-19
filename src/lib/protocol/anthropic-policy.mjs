@@ -65,7 +65,7 @@ function normalizeCacheTTL(_body) {
   // Official 2.1.241 uses ephemeral 1h. Do not coerce 1h back to 5m.
 }
 
-function enforceCacheLimit(body, maximum = 4) {
+export function enforceCacheLimit(body, maximum = 4) {
   const locations = cacheControlLocations(body)
   // Anthropic rejects the marker on a thinking block regardless of the budget.
   for (const location of locations) {
