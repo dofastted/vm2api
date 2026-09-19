@@ -42,6 +42,11 @@ export const DEFAULT_DISTILL_RULES = {
     'as an internal monologue',
     'Please reason step by step, and put your final answer within \\boxed{}',
     'Respond in the following format: <think>',
+    'Memory-stage-one extractor',
+    'Persistable response items',
+    'You MUST extract durable memory now',
+    'MUST distill reusable, durable rollout knowledge',
+    'x-anthropic-billing-header',
   ],
   fingerprints: [
     'Let  $a,b,A,B$  be given reals. We consider the function defined by',
@@ -87,9 +92,15 @@ function contentToText(content) {
 
 function systemText(body) {
   if (!body || typeof body !== 'object') return ''
-  if (typeof body.system === 'string') return body.system
-  if (Array.isArray(body.system)) return contentToText(body.system)
-  return ''
+  const parts = []
+  if (typeof body.system === 'string') parts.push(body.system)
+  else if (Array.isArray(body.system)) parts.push(contentToText(body.system))
+  const messages = Array.isArray(body.messages) ? body.messages : []
+  for (const m of messages) {
+    const role = String(m?.role || '').toLowerCase()
+    if (role === 'system' || role === 'developer') parts.push(contentToText(m.content))
+  }
+  return parts.filter(Boolean).join('\n')
 }
 
 function userTexts(body) {

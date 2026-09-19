@@ -25,7 +25,12 @@
     "systematic long thinking process",
     "as an internal monologue",
     "Please reason step by step, and put your final answer within \\boxed{}",
-    "Respond in the following format: <think>"
+    "Respond in the following format: <think>",
+    "Memory-stage-one extractor",
+    "Persistable response items",
+    "You MUST extract durable memory now",
+    "MUST distill reusable, durable rollout knowledge",
+    "x-anthropic-billing-header"
   ],
   "fingerprints": [
     "Let  $a,b,A,B$  be given reals. We consider the function defined by",

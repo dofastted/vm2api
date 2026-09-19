@@ -50,6 +50,44 @@ test('prompt template needles are blocked without waiting for structure', () => 
   )
 })
 
+test('openai chat memory-extractor harvest is blocked without structure gates', () => {
+  const hit = detectDistill({
+    inbound: {
+      model: 'claude-opus-5',
+      max_tokens: 4096,
+      stream: true,
+      messages: [
+        {
+          role: 'system',
+          content:
+            "x-anthropic-billing-header: cc_version=2.1.257.039; You are Claude Code, Anthropic's official CLI for Claude.Memory-stage-one extractor.\nMUST distill reusable, durable rollout knowledge.",
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: 'thread_id: abc\n\nPersistable response items (JSON):\n[{"role":"user","text":"ui显示效果追加"}]\n\nYou MUST extract durable memory now.',
+            },
+          ],
+        },
+      ],
+    },
+  })
+  assert.equal(hit.action, 'block')
+  assert.equal(
+    hit.hits.some((h) => h.rule === 'needle'),
+    true,
+  )
+})
+
+test('plain cluster VM email UI prompt is not distill', () => {
+  const hit = detectDistill({
+    inbound: inbound('ui显示效果追加.\ncluster 和 vm页面\n槽 命名下面需要显示 账号邮箱信息.'),
+  })
+  assert.equal(hit.action, 'pass')
+})
+
 test('contest harvest with inbound thinking text is blocked', () => {
   const hit = detectDistill({
     inbound: inbound('Prove that if alpha, beta, gamma are the angles of a triangle, then cos a + cos b > 0.', {
