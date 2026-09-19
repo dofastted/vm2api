@@ -95,7 +95,9 @@ CI（`.github/workflows/test.yml`）在 push / PR 上跑：Node unit、Go、Rust
 
 ## 升级一台已部署的机
 
-**Compose（推荐）**
+升 **v1.2.2**：控制面 Node 更新并重启一次，再 `POST /api/panel/wrap-cli/sync`（`restart: true`）换槽内 `.kin/kin-kernel.bin` 并 bounce kernel。不要重装 wrap，不要 `docker rm` 槽。步骤见 [DEPLOY.md · 已部署机升级到 1.2.2](DEPLOY.md#已部署机升级到-122)。
+
+**Compose（其它版本通用）**
 
 ```bash
 cd /opt/vm2api
@@ -104,7 +106,7 @@ docker compose up -d --build
 curl -sS --noproxy '*' http://127.0.0.1:8787/health
 ```
 
-槽位容器不会被这次升级 `docker rm`。
+槽位容器不会被这次升级 `docker rm`。1.2.2 还要做上面的 kernel sync。
 
 **本机 Node + systemd**
 

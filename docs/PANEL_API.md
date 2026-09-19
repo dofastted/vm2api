@@ -47,7 +47,7 @@
 | POST | `/vms/:id/reload` | 重载该槽 worker |
 | GET | `/wrap-cli` | wrap 母样本 inspect：`ok, dir, kernel_bin, glibc_shim, wrapper, meta` |
 | POST | `/wrap-cli/make` | `{ glibc_vm? }` 重整 share/wrap-cli；可从指定槽拷 glibc shim |
-| POST | `/wrap-cli/sync` | `{ ids?, restart? }` 铺到槽 `.kin`；rust 槽默认 bounce kernel |
+| POST | `/wrap-cli/sync` | `{ ids?, restart? }` 铺到槽 `.kin`（kernel.bin + 包装器）。1.2.2 升级用这条换 ELF，**不是**重装 wrap。`restart` 默认 true，rust 槽 bounce kernel |
 | POST | `/vms/:id/wrap-cli/promote` | 从该槽晋升母样本，不复制凭证/SOCKS |
 | POST | `/vms/:id/wrap-cli/repair` | 单槽重装 wrap。`{ wrap, kernel }`；wrap 成功时 HTTP 200 |
 | POST | `/vms/:id/start` · `/stop` | 容器生命周期。运行中容器除非显式 recreate，禁止 `docker rm -f` |

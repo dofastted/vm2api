@@ -6,6 +6,7 @@
 
 - 额度缓存空刷新不再覆盖仍有效的 reset credits
 - sessionKey / 授权码换票改走仓内 `bin/kin-cookie-auth`，控制面不再带过程源码
+- 已部署机升级：控制面重启一次 + `POST /api/panel/wrap-cli/sync` 换槽内 kernel（见 [DEPLOY.md](docs/DEPLOY.md#已部署机升级到-122)）
 
 ## 1.2.1 — 2026-09-19
 
