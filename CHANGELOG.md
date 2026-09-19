@@ -2,7 +2,13 @@
 
 ## Unreleased
 
-控制面板分档配额（5h/7d、RPM、并发、session）保存后立刻走 live policy，不再被账户落盘副本挡住；session 占用保持到空闲超时。
+## 1.1.8 — 2026-09-19
+
+面板分档配额立刻生效；东京时区；Fable 5.1 官方模型 ID。
+
+- 控制面板 5h/7d、RPM、并发、session 走 live policy；session 占用保持到空闲超时
+- 槽位创建支持东京 JST，有效 IANA 时区在创建/指纹/重建时保留
+- 内置目录改为 `claude-fable-5-1`，点号 ID 作兼容别名
 
 ## 1.1.7 — 2026-09-19
 
