@@ -31,19 +31,19 @@ test('idle timeout drops a stale key', () => {
   assert.equal(r.canAccept('a', 'new', { max: 1, idleMin: 5, now: now + 6 * 60_000 }).ok, true)
 })
 
-test('release drops a key; extra release is a no-op', () => {
+test('release keeps the key until idle prune', () => {
   const r = new SessionLimitRegistry()
   r.touch('a', 's1')
   r.touch('a', 's2')
-  assert.equal(r.release('a', 's1'), 1)
-  assert.equal(r.snapshot('a', { max: 4 }).active, 1)
-  assert.equal(r.release('a', 's1'), 1)
-  assert.equal(r.snapshot('a', { max: 4 }).active, 1)
-  assert.equal(r.release('a', 's2'), 0)
-  assert.equal(r.snapshot('a', { max: 4 }).active, 0)
+  assert.equal(r.release('a', 's1'), 2)
+  assert.equal(r.snapshot('a', { max: 4 }).active, 2)
+  assert.equal(r.release('a', 's1'), 2)
+  assert.equal(r.snapshot('a', { max: 4 }).active, 2)
+  assert.equal(r.canAccept('a', 's3', { max: 2 }).ok, false)
+  assert.equal(r.canAccept('a', 's1', { max: 2 }).ok, true)
 })
 
-test('shared key stays until the last reservation releases', () => {
+test('shared key stays occupied after the last reservation releases', () => {
   const r = new SessionLimitRegistry()
   r.touch('a', 'shared')
   r.touch('a', 'shared')
@@ -52,6 +52,17 @@ test('shared key stays until the last reservation releases', () => {
   assert.equal(r.snapshot('a', { max: 4 }).active, 1)
   assert.equal(r.canAccept('a', 'new', { max: 1 }).ok, false)
   r.release('a', 'shared')
-  assert.equal(r.snapshot('a', { max: 4 }).active, 0)
-  assert.equal(r.canAccept('a', 'new', { max: 1 }).ok, true)
+  assert.equal(r.snapshot('a', { max: 4 }).active, 1)
+  assert.equal(r.canAccept('a', 'new', { max: 1 }).ok, false)
+  assert.equal(r.canAccept('a', 'shared', { max: 1 }).ok, true)
+})
+
+test('idle prune frees a released key', () => {
+  const r = new SessionLimitRegistry()
+  const now = Date.now()
+  r.touch('a', 's1', now)
+  r.release('a', 's1')
+  assert.equal(r.snapshot('a', { max: 1, idleMin: 5, now }).active, 1)
+  assert.equal(r.canAccept('a', 's2', { max: 1, idleMin: 5, now }).ok, false)
+  assert.equal(r.canAccept('a', 's2', { max: 1, idleMin: 5, now: now + 6 * 60_000 }).ok, true)
 })

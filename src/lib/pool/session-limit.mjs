@@ -3,8 +3,8 @@
  * Existing keys renew; a new key is refused once active >= max.
  * max_sessions = 0 means off.
  *
- * Occupancy is refcounted: PoolScheduler.reserve() touches, release() drops.
- * Idle prune stays as a safety net for abandoned keys.
+ * Occupancy is a conversation window: PoolScheduler.reserve() touches,
+ * release() drops inflight refs but keeps the key until idle prune.
  */
 
 function lastSeenOf(entry) {
@@ -17,7 +17,7 @@ function refsOf(entry) {
   if (entry == null) return 0
   if (typeof entry === 'object') {
     const n = Number(entry.refs)
-    return Number.isFinite(n) && n > 0 ? n : 1
+    return Number.isFinite(n) && n >= 0 ? n : 1
   }
   return 1
 }
@@ -109,13 +109,9 @@ export class SessionLimitRegistry {
     if (!bag) return 0
     const prev = bag.get(key)
     if (prev == null) return bag.size
-    const refs = refsOf(prev) - 1
-    if (refs > 0) {
-      bag.set(key, { lastSeen: lastSeenOf(prev), refs })
-      return bag.size
-    }
-    bag.delete(key)
-    if (!bag.size) this.byAccount.delete(id)
+    // Drop inflight refs but keep the key until idle prune. max_sessions is a
+    // conversation cap, not a concurrent-request cap.
+    bag.set(key, { lastSeen: lastSeenOf(prev) || Date.now(), refs: Math.max(0, refsOf(prev) - 1) })
     return bag.size
   }
 

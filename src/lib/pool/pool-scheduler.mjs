@@ -111,6 +111,10 @@ function maxConcurrencyOf(vm, fallback = 2) {
   return parseConcurrency(vm?.policy?.maxConcurrency, fallback)
 }
 
+function vmTierOf(vm) {
+  return vm?.claude?.account_tier || vm?.account_tier || null
+}
+
 function priorityOf(vm, account, now) {
   return resolveCredentialScheduleLevel({ vm, unified: account?.unified || {}, now }).level
 }
@@ -273,7 +277,11 @@ export class PoolScheduler {
         sessionKey,
       })
       if (!eligibility.ok) continue
-      const maxConcurrency = maxConcurrencyOf(vm, parseConcurrency(this.config.default_max_per_account, 2))
+      const maxConcurrency = this.effectiveMaxConcurrency(
+        vm,
+        eligibility.account,
+        parseConcurrency(this.config.default_max_per_account, 2),
+      )
       const inflight = this.inflight.get(accountId) || 0
       candidates.push({
         ok: true,
@@ -327,7 +335,7 @@ export class PoolScheduler {
       const modelGate = slotAllowsModel({ vm, account, model })
       if (!modelGate.ok) return modelGate
       if (account) {
-        const policy = this.accountQuota?.policyFor?.(account) || null
+        const policy = this.accountQuota?.policyFor?.(account, { tier: vmTierOf(vm) }) || null
         const lastUsedAt = this.lastUsed.get(accountId) || state?.last_used_at || null
         const ev = evaluateAccount({
           vm,
@@ -402,7 +410,7 @@ export class PoolScheduler {
     }
     if (isCredentialRuntimeBlocked(state, now, vm)) return { ok: false, reason: 'credential_blocked' }
     const fallbackCap = parseConcurrency(this.config.default_max_per_account, 2)
-    const maxConcurrency = maxConcurrencyOf(vm, fallbackCap)
+    const maxConcurrency = this.effectiveMaxConcurrency(vm, account, fallbackCap)
     if (maxConcurrency <= 0) return { ok: false, reason: 'concurrency_disabled' }
     let busy = false
     let availableAt = null
@@ -443,7 +451,7 @@ export class PoolScheduler {
       if (familyInflight >= fableCap) markWait('fable_concurrency')
     }
     if (this.accountQuota && !pinned) {
-      const quotaGate = this.accountQuota.canAccept(accountId, { sessionKey })
+      const quotaGate = this.accountQuota.canAccept(accountId, { sessionKey, tier: vmTierOf(vm) })
       if (!quotaGate.ok) {
         if (quotaGate.reason === 'concurrency_limit') markWait('concurrency_limit')
         else if (quotaGate.reason === 'rpm_limit') markWait('rpm_limit', quotaGate.detail?.reset_at)
@@ -697,6 +705,16 @@ export class PoolScheduler {
     if (byFamily.size === 0) this.inflightFamily.delete(accountId)
   }
 
+  effectiveMaxConcurrency(vm, account, fallback = 2) {
+    if (vm?.policy?.concurrencyOverride) return maxConcurrencyOf(vm, fallback)
+    const fromQuota = this.accountQuota?.limitFor?.(
+      account,
+      this.accountQuota?.policyFor?.(account, { tier: vmTierOf(vm) }),
+    )
+    if (fromQuota != null && Number.isFinite(Number(fromQuota))) return Math.max(0, Number(fromQuota))
+    return maxConcurrencyOf(vm, fallback)
+  }
+
   reloadConfig(config = {}) {
     this.config = normalizePoolConfig(config)
   }
@@ -717,6 +735,7 @@ export class PoolScheduler {
     const quotaReservation = this.accountQuota?.tryAcquire?.(candidate.accountId, {
       sessionKey,
       skipGate: !!skipQuota,
+      tier: vmTierOf(candidate.vm),
     })
     if (quotaReservation && !quotaReservation.ok) return null
     if (sessionKey) {
@@ -885,7 +904,7 @@ export class PoolScheduler {
             probe_source: account.unified.source,
           }
         : {},
-      policy: this.accountQuota?.policyFor?.(account) || null,
+      policy: this.accountQuota?.policyFor?.(account, { tier: vmTierOf(vm) }) || null,
       now,
     })
     if (!ev.accept && isQuotaWindowReason(ev.reason)) {

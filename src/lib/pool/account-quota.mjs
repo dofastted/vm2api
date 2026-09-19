@@ -108,7 +108,9 @@ export class AccountQuota {
         email: account.email || null,
         type: account.type || 'oauth',
         max_concurrency: account.max_concurrency ?? this.defaultMax(),
+        concurrency_override: account.concurrency_override ? 1 : 0,
         max_rpm: account.max_rpm ?? this.defaultRpm(),
+        rpm_override: account.rpm_override ? 1 : 0,
         requests: 0,
         tokens_in: 0,
         tokens_out: 0,
@@ -465,20 +467,20 @@ export class AccountQuota {
    * Pre-flight check: can this account take another request?
    * @returns {{ ok: true } | { ok: false, reason, detail }}
    */
-  policyFor(acc) {
+  policyFor(acc, { tier } = {}) {
     return resolveTierPolicy(
       {
         tiers: this.tiers,
         quota: this.config,
         concurrency: this.concurrency,
       },
-      accountTierKey(acc),
+      acc?.unified?.account_tier || acc?.account_tier || tier,
     )
   }
 
-  canAccept(accountId, { sessionKey = null } = {}) {
+  canAccept(accountId, { sessionKey = null, tier = null } = {}) {
     const acc = this.ensure({ account_id: accountId })
-    const policy = this.policyFor(acc)
+    const policy = this.policyFor(acc, { tier })
     const ratio = Number(policy.limit_5h ?? policy.safety_ratio ?? this.config.safety_ratio ?? 0.85)
     const weeklyRatio = Number(
       policy.limit_7d ?? policy.weekly_safety_ratio ?? this.config.weekly_safety_ratio ?? ratio,
@@ -486,7 +488,7 @@ export class AccountQuota {
     const warnRatio = Number(policy.warn_ratio ?? this.config.warn_ratio ?? 0.75)
     const inflight = this.inflight.get(accountId) || 0
 
-    const limit = this.limitFor(acc)
+    const limit = this.limitFor(acc, policy)
     if (inflight >= limit) {
       return {
         ok: false,
@@ -562,7 +564,7 @@ export class AccountQuota {
       }
     }
 
-    const maxSessions = Number(acc.max_sessions ?? policy.max_sessions ?? 0)
+    const maxSessions = Number(policy.max_sessions ?? acc.max_sessions ?? 0)
     if (maxSessions > 0 && sessionKey) {
       const sess = this.sessions.canAccept(accountId, sessionKey, {
         max: maxSessions,
@@ -598,7 +600,7 @@ export class AccountQuota {
     }
     const acc = this.ensure({ account_id: accountId })
     const inflight = this.inflight.get(accountId) || 0
-    const limit = this.limitFor(acc)
+    const limit = this.limitFor(acc, this.policyFor(acc, { tier: opts.tier }))
     if (inflight >= limit) {
       return { ok: false, reason: 'concurrency_limit', detail: { inflight, max: limit, source: 'quota-reservation' } }
     }
@@ -831,8 +833,14 @@ export class AccountQuota {
     return Number.isFinite(n) && n >= 0 ? n : 2
   }
 
-  /** 0 = reject. Missing/invalid falls back to routing default. */
-  limitFor(acc) {
+  /** 0 = reject. Manual pin uses the stored cap; otherwise the live tier. */
+  limitFor(acc, policy = null) {
+    if (acc?.concurrency_override) {
+      const n = Number(acc.max_concurrency)
+      if (Number.isFinite(n) && n >= 0) return n
+    }
+    const fromPolicy = Number((policy || this.policyFor(acc))?.max_concurrency)
+    if (Number.isFinite(fromPolicy) && fromPolicy >= 0) return fromPolicy
     const n = Number(acc?.max_concurrency)
     if (Number.isFinite(n) && n >= 0) return n
     return this.defaultMax()
@@ -843,11 +851,13 @@ export class AccountQuota {
     return Number.isFinite(n) && n >= 0 ? n : 0
   }
 
-  /** 0 = unlimited. Missing/invalid falls back to routing default. */
+  /** 0 = unlimited. Manual pin uses the stored cap; otherwise the live tier. */
   rpmLimitFor(acc, policy = null) {
-    const n = Number(acc?.max_rpm)
-    if (Number.isFinite(n) && n >= 0) return n
-    const fromPolicy = Number(policy?.max_rpm)
+    if (acc?.rpm_override) {
+      const n = Number(acc?.max_rpm)
+      return Number.isFinite(n) && n >= 0 ? n : 0
+    }
+    const fromPolicy = Number((policy || this.policyFor(acc))?.max_rpm)
     if (Number.isFinite(fromPolicy) && fromPolicy >= 0) return fromPolicy
     return this.defaultRpm()
   }
@@ -927,10 +937,11 @@ export class AccountQuota {
     return this.repo.save(acc)
   }
 
-  setMaxConcurrency(accountId, n) {
+  setMaxConcurrency(accountId, n, { override = false } = {}) {
     const acc = this.ensure({ account_id: accountId })
     if (!acc) return null
     acc.max_concurrency = Math.max(0, Math.min(256, Number(n) || 0))
+    acc.concurrency_override = override ? 1 : 0
     return this.repo.save(acc)
   }
 
@@ -963,7 +974,7 @@ export class AccountQuota {
     const acc = this.ensure({ account_id: accountId })
     if (!acc) return null
     acc.max_rpm = Math.max(0, Math.min(1e6, Number(n) || 0))
-    if (override) acc.rpm_override = 1
+    acc.rpm_override = override ? 1 : 0
     return this.repo.save(acc)
   }
 
@@ -1001,11 +1012,12 @@ export class AccountQuota {
     const skip = new Set(skipIds || [])
     const out = []
     for (const a of this.repo.list()) {
-      if (skip.has(a.account_id) || skip.has(a.vm_id)) continue
+      if (skip.has(a.account_id) || skip.has(a.vm_id) || a.concurrency_override) continue
       const key = accountTierKey(a)
       const v = Math.max(0, Math.min(256, Number(policies[key]?.max_concurrency) || 2))
       if (Number(a.max_concurrency) === v) continue
       a.max_concurrency = v
+      a.concurrency_override = 0
       out.push(this.repo.save(a))
     }
     return out

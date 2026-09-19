@@ -646,6 +646,44 @@ test('maxConcurrency 8 is the actual reserve cap', async (t) => {
   for (const item of held) item.release()
 })
 
+test('unpinned slot follows live tier concurrency after reloadConfig', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const file = path.join(root, 'vms', 'vm-01.json')
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.policy.maxConcurrency = 2
+  vm.policy.concurrencyOverride = false
+  fs.writeFileSync(file, JSON.stringify(vm))
+  const accountQuota = new AccountQuota({
+    dataDir: path.join(root, 'data'),
+    config: { tiers: { max: { max_concurrency: 2, max_rpm: 0, max_sessions: 0 } } },
+    accounts: [{ account_id: 'account-1', vm_id: 'vm-01', max_concurrency: 2 }],
+  })
+  accountQuota.setAccountTier('account-1', 'max')
+  const pool = scheduler(root, { accountQuota })
+  accountQuota.reloadConfig({
+    quota: { block_on_5h: true, block_on_7d: true },
+    tiers: { max: { max_concurrency: 3, max_rpm: 0, max_sessions: 0 } },
+  })
+  const held = []
+  for (let i = 0; i < 3; i++) {
+    const selected = await pool.selectAndReserve({
+      model: 'claude-test',
+      excluded: new Set(['account-2']),
+      allowWait: false,
+    })
+    assert.equal(selected.ok, true, `reserve ${i}`)
+    held.push(selected)
+  }
+  const fourth = await pool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-2']),
+    allowWait: false,
+  })
+  assert.equal(fourth.ok, false)
+  for (const item of held) item.release()
+})
+
 test('worker health generation bump clears auth cooldown only', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -1146,7 +1184,7 @@ test('allowed_models prefix matches dated fable ids', async (t) => {
   selected.release()
 })
 
-test('reserve release drops session occupancy', async (t) => {
+test('reserve release keeps session occupancy until idle prune', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const sessions = new SessionLimitRegistry()
@@ -1166,10 +1204,12 @@ test('reserve release drops session occupancy', async (t) => {
   assert.equal(selected.ok, true)
   assert.equal(sessions.snapshot(selected.accountId, { max: 4 }).active, 1)
   selected.release()
-  assert.equal(sessions.snapshot(selected.accountId, { max: 4 }).active, 0)
+  assert.equal(sessions.snapshot(selected.accountId, { max: 4 }).active, 1)
+  assert.equal(sessions.canAccept(selected.accountId, 'sess-1', { max: 1 }).ok, true)
+  assert.equal(sessions.canAccept(selected.accountId, 'sess-2', { max: 1 }).ok, false)
 })
 
-test('overlapping same session key stays until both reservations release', async (t) => {
+test('overlapping same session key stays occupied after both reservations release', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const sessions = new SessionLimitRegistry()
@@ -1198,7 +1238,9 @@ test('overlapping same session key stays until both reservations release', async
   first.release()
   assert.equal(sessions.snapshot('account-1', { max: 4 }).active, 1)
   second.release()
-  assert.equal(sessions.snapshot('account-1', { max: 4 }).active, 0)
+  assert.equal(sessions.snapshot('account-1', { max: 4 }).active, 1)
+  assert.equal(sessions.canAccept('account-1', 'shared', { max: 1 }).ok, true)
+  assert.equal(sessions.canAccept('account-1', 'other', { max: 1 }).ok, false)
 })
 
 test('syncQuotaSchedule turns Extra 5h reject into 调度关 and restores when open', (t) => {
