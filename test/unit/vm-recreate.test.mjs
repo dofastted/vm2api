@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { US_TIMEZONES } from '../../src/lib/core/timezone.mjs'
 import { buildRecreatedVmRecord, recreateVmFiles } from '../../src/lib/vm/vm-recreate.mjs'
 import { destroyVmRuntime } from '../../src/lib/vm/vm-runtime.mjs'
 
@@ -56,6 +57,22 @@ test('recreated record keeps slot identity and drops credentials', () => {
   assert.equal(next.persona_preset, 'zero')
 })
 
+test('recreated records preserve and normalize non-US timezones', () => {
+  for (const timezone of ['Asia/Tokyo', ' asia/tokyo ']) {
+    const next = buildRecreatedVmRecord({ id: 'vm-07', timezone })
+    assert.equal(next.timezone, 'Asia/Tokyo')
+    assert.equal(next.fingerprint.timezone, 'Asia/Tokyo')
+  }
+})
+
+test('recreated records use the generated US fallback for missing or invalid timezones', () => {
+  for (const timezone of [undefined, 'Invalid/Zone', 'America/Not_A_Zone', '+09:00']) {
+    const next = buildRecreatedVmRecord({ id: 'vm-07', timezone })
+    assert.ok(US_TIMEZONES.includes(next.timezone))
+    assert.equal(next.fingerprint.timezone, next.timezone)
+  }
+})
+
 test('recreateVmFiles wipes home leftover and reseeds settings', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-recreate-'))
   const id = 'vm-03'
@@ -69,7 +86,7 @@ test('recreateVmFiles wipes home leftover and reseeds settings', () => {
       id,
       name: '03',
       kernel: 'ubuntu-24.04',
-      timezone: 'America/New_York',
+      timezone: 'Asia/Tokyo',
       locale: 'en_US.UTF-8',
       proxy: { id: 'px-3', url: 'socks5h://127.0.0.1:1080' },
       policy: { maxConcurrency: 8, weight: 1 },
@@ -87,8 +104,11 @@ test('recreateVmFiles wipes home leftover and reseeds settings', () => {
     fs.readFileSync(path.join(root, 'vms', id, 'cli-home', '.claude', 'settings.json'), 'utf8'),
   )
   assert.equal(settings.env.DISABLE_TELEMETRY, '1')
+  assert.equal(settings.env.TZ, 'Asia/Tokyo')
   const saved = JSON.parse(fs.readFileSync(path.join(root, 'vms', `${id}.json`), 'utf8'))
   assert.equal(saved.proxy.id, 'px-3')
+  assert.equal(saved.timezone, 'Asia/Tokyo')
+  assert.equal(saved.fingerprint.timezone, 'Asia/Tokyo')
   assert.match(saved.fingerprint.device_id, /^[0-9a-f]{64}$/)
   assert.equal(
     fs.readFileSync(path.join(root, 'vms', id, 'machine-id'), 'utf8').trim(),

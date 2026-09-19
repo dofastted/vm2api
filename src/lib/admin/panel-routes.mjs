@@ -125,7 +125,7 @@ import { reloadActiveVm } from '../core/config.mjs'
 import {
   OS_CATALOG,
   kernelForIndex,
-  normalizeUsTimezone,
+  normalizeTimezone,
   nextNumericIndex,
   padVm,
   STANDARD_LOCALE,
@@ -2028,7 +2028,7 @@ export function createPanelHandler(ctx) {
           name: body.name || padVm(idx),
           status: startNow ? 'running' : body.status || 'stopped',
           kernel: wantKernel,
-          timezone: normalizeUsTimezone(generated.timezone),
+          timezone: normalizeTimezone(generated.timezone),
           locale: generated.locale || STANDARD_LOCALE,
           region: body.region || body.zone || null,
           note: body.note || `${(OS_CATALOG[wantKernel] || {}).pretty || wantKernel} · Go slot worker`,

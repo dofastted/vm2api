@@ -57,6 +57,31 @@ test('import-style create succeeds without seed_policy or SOCKS5', async () => {
   }
 })
 
+test('create preserves Tokyo in the slot, fingerprint and settings', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-tokyo-'))
+  try {
+    const { handlePanel, response } = makeCreateHandler(root, {
+      name: 'tokyo-slot',
+      timezone: ' asia/tokyo ',
+      start: false,
+      auto_allocate_proxy: false,
+    })
+    await handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/create'))
+    assert.equal(response.status, 200, response.body?.error?.message || JSON.stringify(response.body))
+    const id = response.body?.data?.vm?.id
+    const saved = JSON.parse(fs.readFileSync(path.join(root, 'vms', `${id}.json`), 'utf8'))
+    assert.equal(saved.timezone, 'Asia/Tokyo')
+    assert.equal(saved.fingerprint.timezone, 'Asia/Tokyo')
+    assert.equal(saved.locale, 'en_US.UTF-8')
+    const settings = JSON.parse(
+      fs.readFileSync(path.join(root, 'vms', id, 'cli-home', '.claude', 'settings.json'), 'utf8'),
+    )
+    assert.equal(settings.env.TZ, 'Asia/Tokyo')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('create does not 409 when proxy allocation fails', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-proxy-'))
   try {
@@ -69,6 +94,33 @@ test('create does not 409 when proxy allocation fails', async () => {
     assert.notEqual(response.status, 409)
     assert.equal(response.status, 200, response.body?.error?.message || JSON.stringify(response.body))
     assert.equal(response.body?.data?.vm?.status, 'stopped')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('create preserves Tokyo timezone in the VM, fingerprint, and CLI seed files', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-tokyo-'))
+  try {
+    const { handlePanel, response } = makeCreateHandler(root, {
+      name: 'tokyo-slot',
+      timezone: 'Asia/Tokyo',
+      start: false,
+      auto_allocate_proxy: false,
+    })
+    await handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/create'))
+    assert.equal(response.status, 200, response.body?.error?.message || JSON.stringify(response.body))
+    const vm = response.body?.data?.vm
+    assert.equal(vm.timezone, 'Asia/Tokyo')
+    const saved = JSON.parse(fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`), 'utf8'))
+    assert.equal(saved.timezone, 'Asia/Tokyo')
+    assert.equal(saved.fingerprint.timezone, 'Asia/Tokyo')
+    assert.equal(saved.locale, 'en_US.UTF-8')
+    const claudeDir = path.join(root, 'vms', vm.id, 'cli-home', '.claude')
+    const settings = JSON.parse(fs.readFileSync(path.join(claudeDir, 'settings.json'), 'utf8'))
+    const seed = JSON.parse(fs.readFileSync(path.join(claudeDir, 'kin-seed.json'), 'utf8'))
+    assert.equal(settings.env.TZ, 'Asia/Tokyo')
+    assert.equal(seed.timezone, 'Asia/Tokyo')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

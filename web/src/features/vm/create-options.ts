@@ -121,6 +121,7 @@ export const VM_TIMEZONES: [string, string][] = [
   ['America/Denver', '丹佛 MT'],
   ['America/Chicago', '芝加哥 CT'],
   ['America/New_York', '纽约 ET'],
+  ['Asia/Tokyo', '东京 JST (UTC+9)'],
 ]
 
 export const VM_LOCALES: [string, string][] = [

@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { normalizeTimezone, US_TIMEZONES } from '../core/timezone.mjs'
 import { runtimeKind } from './runtime-kind.mjs'
 import { buildWorkerTelemetry } from './worker-telemetry.mjs'
 import { kernelBinPath, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
@@ -34,7 +35,7 @@ export const OS_CATALOG = {
 }
 
 export const OS_ORDER = ['ubuntu-24.04', 'debian-12', 'archlinux', 'fedora-41']
-export const US_TIMEZONES = ['America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles']
+export { normalizeTimezone, normalizeTimezone as normalizeUsTimezone, US_TIMEZONES } from '../core/timezone.mjs'
 export const STANDARD_LOCALE = 'en_US.UTF-8'
 
 export function kernelForIndex(i) {
@@ -43,12 +44,6 @@ export function kernelForIndex(i) {
 
 export function timezoneForIndex(i) {
   return US_TIMEZONES[(Number(i) - 1) % US_TIMEZONES.length]
-}
-
-export function normalizeUsTimezone(tz) {
-  const s = String(tz || '').trim()
-  if (s.startsWith('America/')) return s
-  return 'America/Los_Angeles'
 }
 
 export function imageForKernel(kernel) {
@@ -401,7 +396,7 @@ export function startVmRuntime(vm, projectRoot, { recreate = false } = {}) {
   const host = String(vm.fingerprint?.hostname || '').trim() || slotName
   const kernel = vm.kernel && OS_CATALOG[vm.kernel] ? vm.kernel : 'ubuntu-24.04'
   vm.kernel = kernel
-  vm.timezone = normalizeUsTimezone(vm.timezone)
+  vm.timezone = normalizeTimezone(vm.timezone)
   vm.locale = vm.locale || STANDARD_LOCALE
   const image = imageForKernel(kernel)
   const home = path.join(projectRoot, 'vms', vm.id, 'cli-home')

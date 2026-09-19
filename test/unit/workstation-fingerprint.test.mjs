@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { normalizeTimezone, US_TIMEZONES } from '../../src/lib/core/timezone.mjs'
 import {
   applyGeneratedFingerprint,
   DEVICE_ID_RE,
@@ -62,6 +63,22 @@ test('explicit America timezone is kept', () => {
     timezone: 'America/Denver',
   })
   assert.equal(pack.timezone, 'America/Denver')
+})
+
+test('explicit Tokyo timezone survives fingerprint generation and slot normalization', () => {
+  const pack = generateWorkstationFingerprint({ id: 'vm-01', timezone: ' asia/tokyo ' })
+  const fingerprint = applyGeneratedFingerprint({}, pack)
+  assert.equal(pack.timezone, 'Asia/Tokyo')
+  assert.equal(fingerprint.timezone, 'Asia/Tokyo')
+  assert.equal(normalizeTimezone(pack.timezone), 'Asia/Tokyo')
+  assert.equal(pack.locale, 'en_US.UTF-8')
+})
+
+test('invalid fingerprint timezone retains the existing US random fallback', () => {
+  for (const timezone of ['', 'Asia/Not_A_Zone', 'America/Not_A_Zone', '+09:00']) {
+    const pack = generateWorkstationFingerprint({ id: 'vm-01', timezone })
+    assert.ok(US_TIMEZONES.includes(pack.timezone))
+  }
 })
 
 test('applyGeneratedFingerprint drops official ids for reconcile to refill', () => {

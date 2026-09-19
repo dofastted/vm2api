@@ -5,6 +5,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import { normalizeTimezone, validTimezone } from '../core/timezone.mjs'
 import { atomicWriteJson } from './vm-file.mjs'
 import { defaultSeedPolicy } from '../protocol/seed-policy.mjs'
 import { writeSlotSeedFiles } from './slot-seed.mjs'
@@ -53,7 +54,7 @@ export function buildRecreatedVmRecord(prev, generated) {
   const allowed = Array.isArray(policy.allowed_models)
     ? [...new Set(policy.allowed_models.map((id) => String(id || '').trim()).filter(Boolean))]
     : []
-  const timezone = prev.timezone || pack.timezone
+  const timezone = validTimezone(prev.timezone) || normalizeTimezone(pack.timezone)
   const locale = prev.locale || pack.locale
   const next = {
     id: prev.id,
