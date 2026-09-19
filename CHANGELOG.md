@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.3 — 2026-09-20
+
+控制面：拦截 memory-extractor 收割；创建槽开机失败仍可见；控制台集群/列表改版。
+
+- 非官方 OpenAI chat 冒充 Claude Code、索要 durable-memory JSON 的 payload 在 hop 前拦截
+- 创建槽位开机失败改 200 + `start_error`，列表立刻出现 error 行，不再当创建失败
+- 集群页改为本机 VPS + 扩展节点拓扑（控制面尚未接入，示意为 RFC 5737）
+- 虚拟机列表去掉重复 KPI 卡，筛选/工具收成两行
+
+已部署机升级：只更新控制面 Node（含 web）并重启一次。已在 1.2.2 不必再 `wrap-cli/sync`。见 [DEPLOY.md](docs/DEPLOY.md#已部署机升级到-123)
+
 ## 1.2.2 — 2026-09-20
 
 修复缓存问题；换票逻辑更新。
