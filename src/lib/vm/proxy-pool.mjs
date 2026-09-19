@@ -256,16 +256,7 @@ export function parseSocks5Line(line) {
 }
 
 export class ProxyPool {
-  constructor({
-    dataDir,
-    db,
-    onDisableVm,
-    onDisconnectVm,
-    onEnableVm,
-    egressCheck,
-    repairEgress,
-    geoLookup,
-  } = {}) {
+  constructor({ dataDir, db, onDisableVm, onDisconnectVm, onEnableVm, egressCheck, repairEgress, geoLookup } = {}) {
     this.db = resolveStoreDb({ db, dataDir })
     this.repo = new ProxiesRepo(this.db)
     this.onDisableVm = onDisableVm // (vmId, reason, proxyId) => void

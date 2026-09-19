@@ -153,9 +153,7 @@ export const VM_TIMEZONES: [string, string][] = [
 
 /** 预设里是否已有这个时区（决定下拉该选预设项还是「自定义」）。 */
 export function isPresetTimezone(value: string): boolean {
-  return VM_TIMEZONES.some(
-    ([id]) => id === value && id !== VM_TIMEZONE_CUSTOM
-  )
+  return VM_TIMEZONES.some(([id]) => id === value && id !== VM_TIMEZONE_CUSTOM)
 }
 
 export const VM_LOCALES: [string, string][] = [

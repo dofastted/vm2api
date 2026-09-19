@@ -134,7 +134,9 @@ export function VmDetailPage() {
         body: JSON.stringify(body),
       }),
     onSuccess: async (_data, body) => {
-      toast.success(body.timezone_follow_proxy ? '已跟随代理时区' : '已保存时区')
+      toast.success(
+        body.timezone_follow_proxy ? '已跟随代理时区' : '已保存时区'
+      )
       await refreshAll()
     },
     onError: (error: Error) => toast.error(error.message),
