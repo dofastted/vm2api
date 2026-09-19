@@ -23,9 +23,8 @@ jobs:
           mkdir -p dist
           (cd worker && CGO_ENABLED=0 go build -trimpath -o ../dist/kin-worker ./cmd/kin-worker)
           (cd worker && CGO_ENABLED=0 go build -trimpath -o ../dist/kin-egress ./cmd/kin-egress)
-          test -x bin/kin-kernel && cp bin/kin-kernel dist/kin-kernel
-          test -x bin/kin-codex-kernel && cp bin/kin-codex-kernel dist/kin-codex-kernel
-          test -x bin/kin-cookie-auth && cp bin/kin-cookie-auth dist/kin-cookie-auth
+          chmod a+x bin/kin-kernel bin/kin-codex-kernel bin/kin-cookie-auth
+          cp bin/kin-kernel bin/kin-codex-kernel bin/kin-cookie-auth dist/
       - uses: actions/upload-artifact@v4
         with:
           name: linux-amd64
@@ -33,7 +32,12 @@ jobs:
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          generate_release_notes: true
+          generate_release_notes: false
+          name: vm2api ${{ github.ref_name }}
+          body: |
+            仓内预编译 linux amd64 二进制，clone / compose 即可部署，不必在服务器上编 kernel 与 wrap CLI。
+
+            升级见 [CHANGELOG.md](https://github.com/dofastted/vm2api/blob/main/CHANGELOG.md) 与 [docs/DEPLOY.md](https://github.com/dofastted/vm2api/blob/main/docs/DEPLOY.md)。
           files: |
             dist/kin-kernel
             dist/kin-codex-kernel

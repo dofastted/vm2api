@@ -1,6 +1,6 @@
 # 版本与构建
 
-linux amd64 `bin/kin-{kernel,egress,worker,codex-kernel,cookie-auth}`、`share/wrap-cli` 进 git。kernel / wrap 只带预编译 ELF，不带过程源码。GitHub Release 仍挂一份 ELF。当前发布线：**1.2.5**（tag `v1.2.5`）。
+linux amd64 `bin/kin-{kernel,egress,worker,codex-kernel,cookie-auth}`、`share/wrap-cli` 进 git。kernel / wrap 为预编译 ELF，clone 即可部署。GitHub Release 仍挂一份 ELF。当前发布线：**1.2.5**（tag `v1.2.5`）。
 
 ## 版本怎么记
 
@@ -30,7 +30,7 @@ git push origin v1.2.5
 | `kin-egress` | 远程 SOCKS5 透明网关 |
 | `kin-worker` | **只** `telemetry`，不是 hop |
 | `kin-codex-kernel` | Codex 槽；仓内 `bin/` 已带 |
-| `kin-cookie-auth` | sessionKey / 授权码换票 helper；仓内预编译，控制面不带过程源码 |
+| `kin-cookie-auth` | sessionKey / 授权码换票 helper；仓内预编译 ELF |
 
 没有 tag、只点 workflow_dispatch 时，产物进 artifact，不会建 Release。
 

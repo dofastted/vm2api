@@ -2,10 +2,9 @@
 
 ## 1.2.5 — 2026-09-20
 
-仓内只保留可执行二进制：Claude Code wrap 与 Rust kernel 过程源码不再进 git。
+仓内预编译 linux amd64 二进制，clone / compose 即可部署，不必在服务器上编 kernel 与 wrap CLI。
 
-- `share/wrap-cli/cli-node` 为编译后的 ELF；不再带 `cli-dist` / bun 源码树
-- `bin/kin-kernel`、`bin/kin-codex-kernel` 为预编译产物；CI / Release 不再 cargo build
+- `bin/kin-{kernel,codex-kernel,cookie-auth,egress,worker}` 与 `share/wrap-cli` 进 git；Release 再挂一份 ELF
 - 已部署机升级：控制面重启一次 + `POST /api/panel/wrap-cli/sync` 换槽内 CLI（见 [DEPLOY.md](docs/DEPLOY.md#已部署机升级到-125)）
 
 ## 1.2.4 — 2026-09-20

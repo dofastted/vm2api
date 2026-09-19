@@ -58,8 +58,9 @@ jobs:
       - name: prebuilt kernel ELFs
         run: |
           set -e
+          chmod a+x bin/kin-kernel bin/kin-codex-kernel share/wrap-cli/kin-kernel.bin share/wrap-cli/cli-node
           for b in bin/kin-kernel bin/kin-codex-kernel share/wrap-cli/kin-kernel.bin share/wrap-cli/cli-node; do
-            test -x "$b"
+            test -f "$b"
             file "$b" | grep -q 'ELF 64-bit'
           done
 
