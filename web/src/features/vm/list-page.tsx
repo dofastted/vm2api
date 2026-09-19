@@ -28,10 +28,8 @@ import {
   type VmSortKey,
 } from '@/features/vm/vm-table'
 
-// 与集群页 FLEET_CHIPS 共用同一套档位与标签，两页词汇必须一致。
-// 早先这里是 poolStatus 的细分 7 档（冷却 / 额度紧单列），与集群页对不上，已统一。
+// fleetGroup 粗分 5 档。revoke 单列：吊销要换票，过期可能自动刷回来。
 // 细分口径没丢：顶部统计卡仍单独报「冷却 / 额度紧」。
-// revoke 单列一档：吊销要换票，过期可能自动刷回来，处置方式不同。
 const POOL_CHIPS = [
   ['all', '全部'],
   ['pool', '在池'],
@@ -85,7 +83,7 @@ export function VmListPage() {
   const canCreate =
     me.data?.role === 'admin' ||
     (me.data?.role === 'user' && (me.data.vm_create_quota || 0) > 0)
-  // chips 走 fleetGroup 粗分（与集群页同口径）；顶部 StatCard 的前三张仍要
+  // chips 走 fleetGroup 粗分；顶部 StatCard 的前三张仍要
   // poolStatus 的细分，才能单独报「冷却 / 额度紧」—— 两套计数并存是有意的。
   // 最后一张回到 fleetCounts：无效凭证要含 revoke，与 chip 计数对得上。
   const scoped = filterVms(vms, '', 'all', kind)

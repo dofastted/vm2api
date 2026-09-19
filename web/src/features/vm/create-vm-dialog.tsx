@@ -81,7 +81,7 @@ export type CreateVmFieldsProps = {
 }
 
 /**
- * 创建槽位的字段集 + 提交逻辑。不含弹窗外壳 —— 导入向导 / 集群页 / 槽位页共用。
+ * 创建槽位的字段集 + 提交逻辑。不含弹窗外壳 —— 导入向导 / 槽位页共用。
  * 创建不再提交 seed_policy 或槽内 SOCKS5；出口由外层透明转发，种子用网关 standard 默认。
  */
 export function CreateVmFields({
@@ -337,7 +337,7 @@ export function CreateVmFields({
   )
 }
 
-/** `CreateVmFields` 的弹窗外壳，给集群页 / 槽位列表页用。 */
+/** `CreateVmFields` 的弹窗外壳，给槽位列表页用。 */
 export function CreateVmDialog({
   open,
   onOpenChange,

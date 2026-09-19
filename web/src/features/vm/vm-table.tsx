@@ -367,7 +367,7 @@ function deadCmp(a: Vm, b: Vm): number {
 
 /**
  * 按状态优先级排序，同级内按名称（无效凭证组例外，见 `deadCmp`）。
- * 集群页与虚拟机页的默认顺序，让运维一眼先看到还能用的槽位，坏的沉到底部。
+ * 默认顺序让运维先看到还能用的槽位，坏的沉到底部。
  */
 export function sortVmsByStatus(vms: Vm[]): Vm[] {
   return vms.slice().sort((a, b) => {
@@ -420,8 +420,7 @@ export function sortVms(
 }
 
 /**
- * 集群页与虚拟机页共用：按 fleetGroup 粗分档位筛选 + 全文搜索。
- * 两页的 chip 集合已统一，所以不再有 per-page 的 mode/tier/cred 分支；
+ * 按 fleetGroup 粗分档位筛选 + 全文搜索。
  * 等级与凭证类型仍参与全文搜索（可以直接搜 "Max" / "OAuth"）。
  * `kind` 切 Claude / GPT 凭证面，默认全部。
  */
