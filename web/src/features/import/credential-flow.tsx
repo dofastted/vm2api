@@ -454,7 +454,7 @@ export function CredentialFlow() {
               }
             >
               <div className='flex items-center gap-2'>
-                <Select value={vmId} onValueChange={setVmId}>
+                <Select value={vmId || undefined} onValueChange={setVmId}>
                   <SelectTrigger className='flex-1' aria-label='待导入虚拟机'>
                     <SelectValue
                       placeholder={empty.length ? '选择空槽' : '没有空槽'}
@@ -546,7 +546,8 @@ export function CredentialFlow() {
         // 导入流程下不自动分配代理 —— 第 2 步要手选。对齐 index.html:3687
         // `state.view === 'import' ? 'idle' : tpl.after`。
         defaultAfter='idle'
-        onCreated={() => {
+        onCreated={(id) => {
+          setVmId(id)
           setBackTo(null)
         }}
       />
