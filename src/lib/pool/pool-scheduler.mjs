@@ -436,8 +436,10 @@ export class PoolScheduler {
           policy,
           sessionKey,
           sessionLimit: this.accountQuota?.sessions,
-          cooldownUntil: state?.cooldown_until || vm.claude?.temp_unschedulable_until || vm.temp_unschedulable_until || null,
-          cooldownReason: state?.cooldown_reason || vm.claude?.temp_unschedulable_reason || vm.temp_unschedulable_reason || null,
+          cooldownUntil:
+            state?.cooldown_until || vm.claude?.temp_unschedulable_until || vm.temp_unschedulable_until || null,
+          cooldownReason:
+            state?.cooldown_reason || vm.claude?.temp_unschedulable_reason || vm.temp_unschedulable_reason || null,
           now,
         })
         if (!ev.accept) {
@@ -981,7 +983,8 @@ export class PoolScheduler {
     const waitable = candidates.filter((candidate) => candidate.busy && !this.isReservable(candidate))
     const peek = this.peekRank(waitable)
     const ranked = [...waitable].sort(
-      (left, right) => left.lastUsedAt - right.lastUsedAt || String(left.accountId).localeCompare(String(right.accountId)),
+      (left, right) =>
+        left.lastUsedAt - right.lastUsedAt || String(left.accountId).localeCompare(String(right.accountId)),
     )
     const order = peek ? [peek, ...ranked.filter((candidate) => candidate.accountId !== peek.accountId)] : ranked
     for (const candidate of order) {

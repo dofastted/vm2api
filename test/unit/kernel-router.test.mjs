@@ -80,7 +80,10 @@ test('waitForReadySlot times out instead of hopping into a full kernel', async (
 test('hop slot wait uses remaining wait-plan budget instead of a second 30s', () => {
   assert.equal(resolveHopSlotWaitMs({ remainingBudgetMs: 0 }), 0)
   assert.equal(resolveHopSlotWaitMs({ remainingBudgetMs: 5000 }), 5000)
-  assert.equal(resolveHopSlotWaitMs({ remainingBudgetMs: 45_000, routing: { inference: { slot_wait_ms: 8000 } } }), 8000)
+  assert.equal(
+    resolveHopSlotWaitMs({ remainingBudgetMs: 45_000, routing: { inference: { slot_wait_ms: 8000 } } }),
+    8000,
+  )
   assert.equal(resolveHopSlotWaitMs({}), 30_000)
 })
 

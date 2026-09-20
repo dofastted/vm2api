@@ -509,7 +509,8 @@ export function resolveScheduleState({
   if (restricted) {
     return {
       schedule_state: 'restricted',
-      restriction_reason: restrictionReason || availability.reason || (leftover ? scheduleDisabledReason : null) || null,
+      restriction_reason:
+        restrictionReason || availability.reason || (leftover ? scheduleDisabledReason : null) || null,
       restriction_until: liveRestriction ? until : availability.until || null,
     }
   }

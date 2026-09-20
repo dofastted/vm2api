@@ -1,6 +1,10 @@
 import { classifyUpstreamResult, repairAnthropicRequest, shouldContinue } from './upstream-error-policy.mjs'
 import { listQuotaFromHeaders } from './quota-window.mjs'
-import { isCompleteAssistantMessage, isIncompleteAssistantMessage, incompleteAssistantClientError } from '../core/errors.mjs'
+import {
+  isCompleteAssistantMessage,
+  isIncompleteAssistantMessage,
+  incompleteAssistantClientError,
+} from '../core/errors.mjs'
 import { hasRefreshPresence } from '../oauth/oauth-credentials.mjs'
 import { resolveOfficialCcInference } from '../vm/slot-engine.mjs'
 
@@ -86,7 +90,12 @@ function selectedUsage(selected, accountQuota = null) {
   return listQuotaFromHeaders(unified)
 }
 
-function classifyAttempt(result, selected, { model, repaired, oauth401CooldownMs, signatureRepair }, accountQuota = null) {
+function classifyAttempt(
+  result,
+  selected,
+  { model, repaired, oauth401CooldownMs, signatureRepair },
+  accountQuota = null,
+) {
   return classifyUpstreamResult(result, {
     model,
     repaired,

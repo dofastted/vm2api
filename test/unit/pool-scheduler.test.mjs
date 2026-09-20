@@ -93,8 +93,7 @@ function scheduler(root, extras = {}) {
     runtimeRepo: extras.runtimeRepo || new RuntimeRepo(),
     stickyRouter: extras.stickyRouter || null,
     accountQuota: extras.accountQuota || { canAccept: () => ({ ok: true }) },
-    workerHealth:
-      extras.workerHealth || (async () => ({ ok: true, credential: { generation: 1, has_access: true } })),
+    workerHealth: extras.workerHealth || (async () => ({ ok: true, credential: { generation: 1, has_access: true } })),
     config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
   })
 }
