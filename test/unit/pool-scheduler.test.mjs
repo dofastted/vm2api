@@ -298,7 +298,8 @@ test('cooldown is waitable and becomes selectable after it expires', async (t) =
     runtimeRepo: repo,
     accountQuota: { canAccept: () => ({ ok: true }) },
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
-    config: { fallback_wait_timeout_ms: 200, sticky_wait_timeout_ms: 200 },
+    // clampWaitTimeoutMs floor is 1000ms
+    config: { fallback_wait_timeout_ms: 2000, sticky_wait_timeout_ms: 2000 },
   })
   pool.markCooldown(
     {
@@ -306,7 +307,7 @@ test('cooldown is waitable and becomes selectable after it expires', async (t) =
       vmId: 'vm-01',
     },
     {
-      until: Date.now() + 40,
+      until: Date.now() + 120,
       reason: 'provider_transient_error',
     },
   )
@@ -317,7 +318,7 @@ test('cooldown is waitable and becomes selectable after it expires', async (t) =
   })
   assert.equal(selected.ok, true)
   assert.equal(selected.accountId, 'account-1')
-  assert.ok(selected.waitMs >= 30)
+  assert.ok(selected.waitMs >= 80)
   selected.release()
 })
 
