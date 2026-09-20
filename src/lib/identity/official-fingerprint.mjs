@@ -1,7 +1,11 @@
 /**
- * Official Claude Code init (~/.claude.json userID / machineID) is the
- * only device identity. Slot-generated UUIDs and leftover
- * ~/.claude/.claude.json never win once official IDs exist.
+ * Official Claude Code init userID / machineID is the only device identity.
+ * Slot-generated UUIDs never win once official IDs exist.
+ *
+ * Compose slots set CLAUDE_CONFIG_DIR=/home/kincli/.claude, so the official
+ * CLI writes ~/.claude/.claude.json — not ~/.claude.json. Treat that file as
+ * the identity source and promote it; only delete it when it conflicts with
+ * a canonical ~/.claude.json that already has IDs.
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -11,11 +15,22 @@ export const OFFICIAL_IDENTITY_SOURCE = 'official-cc-init'
 
 const STALE_FP_KEYS = Object.freeze(['machineID', 'userID', 'machineId', 'userId'])
 
-export function readOfficialCcIdentity(homeDir) {
-  let doc = {}
+function readClaudeJsonFile(file) {
   try {
-    doc = JSON.parse(fs.readFileSync(path.join(homeDir, '.claude.json'), 'utf8'))
-  } catch {}
+    return JSON.parse(fs.readFileSync(file, 'utf8'))
+  } catch {
+    return {}
+  }
+}
+
+function claudeJsonHasIds(doc) {
+  return !!(doc && (doc.userID || doc.machineID))
+}
+
+export function readOfficialCcIdentity(homeDir) {
+  const canonical = readClaudeJsonFile(path.join(homeDir, '.claude.json'))
+  const nested = readClaudeJsonFile(path.join(homeDir, '.claude', '.claude.json'))
+  const doc = claudeJsonHasIds(canonical) ? canonical : claudeJsonHasIds(nested) ? nested : canonical
   const account = doc.oauthAccount && typeof doc.oauthAccount === 'object' ? doc.oauthAccount : {}
   const billing = account.billingType || account.subscriptionType || account.seatTier || null
   return {
@@ -52,25 +67,38 @@ export function reconcileFingerprint(prev = {}, official = {}) {
 
 export function discardLeftoverClaudeJson(homeDir) {
   const leftover = path.join(homeDir, '.claude', '.claude.json')
-  if (!fs.existsSync(leftover)) return { removed: false, conflict: false }
-  let leftoverDoc = {}
-  try {
-    leftoverDoc = JSON.parse(fs.readFileSync(leftover, 'utf8'))
-  } catch {}
-  const official = readOfficialCcIdentity(homeDir)
-  const conflict = !!(
-    (leftoverDoc.machineID && leftoverDoc.machineID !== official.machine_id) ||
-    (leftoverDoc.userID && leftoverDoc.userID !== official.user_id)
-  )
+  const canonical = path.join(homeDir, '.claude.json')
+  if (!fs.existsSync(leftover)) return { removed: false, conflict: false, promoted: false }
+  const leftoverDoc = readClaudeJsonFile(leftover)
+  const canonicalDoc = readClaudeJsonFile(canonical)
+  const leftoverHas = claudeJsonHasIds(leftoverDoc)
+  const canonicalHas = claudeJsonHasIds(canonicalDoc)
+  if (leftoverHas && !canonicalHas) {
+    try {
+      atomicWriteJson(canonical, leftoverDoc, { mode: 0o600 })
+    } catch {}
+    return { removed: false, conflict: false, promoted: true }
+  }
+  if (leftoverHas && canonicalHas) {
+    const conflict = !!(
+      (leftoverDoc.machineID && leftoverDoc.machineID !== canonicalDoc.machineID) ||
+      (leftoverDoc.userID && leftoverDoc.userID !== canonicalDoc.userID)
+    )
+    if (!conflict) return { removed: false, conflict: false, promoted: false }
+    try {
+      fs.rmSync(leftover, { force: true })
+    } catch {}
+    return { removed: true, conflict: true, promoted: false }
+  }
   try {
     fs.rmSync(leftover, { force: true })
   } catch {}
-  return { removed: true, conflict }
+  return { removed: true, conflict: false, promoted: false }
 }
 
 export function applyOfficialFingerprintToVm(vmPath, homeDir) {
-  const official = readOfficialCcIdentity(homeDir)
   const leftover = discardLeftoverClaudeJson(homeDir)
+  const official = readOfficialCcIdentity(homeDir)
   if (!vmPath || !fs.existsSync(vmPath)) {
     return { wrote: false, official: !!(official.machine_id || official.user_id), leftover }
   }
@@ -108,7 +136,7 @@ export function applyOfficialFingerprintToVm(vmPath, homeDir) {
       machine_id: next.machine_id,
       identity_source: next.identity_source,
     })
-  if (!changed && !leftover.removed && !identityWrote) {
+  if (!changed && !leftover.removed && !leftover.promoted && !identityWrote) {
     return { wrote: false, official: !!(official.machine_id || official.user_id), leftover }
   }
   if (changed) {
@@ -117,7 +145,7 @@ export function applyOfficialFingerprintToVm(vmPath, homeDir) {
     atomicWriteJson(vmPath, vm, { mode: 0o600 })
   }
   return {
-    wrote: changed || leftover.removed || identityWrote,
+    wrote: changed || leftover.removed || leftover.promoted || identityWrote,
     official: !!(official.machine_id || official.user_id),
     leftover,
     replaced_device: !!(official.machine_id && prev.device_id && prev.device_id !== official.machine_id),

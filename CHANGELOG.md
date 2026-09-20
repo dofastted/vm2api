@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 官方初装遥测：`CLAUDE_CONFIG_DIR` 下的 `~/.claude/.claude.json` 视为官方身份，提升到 `~/.claude.json`，不再当 leftover 删掉导致 sidecar 停在 `waiting_official_identity`
+
 ## 1.2.13 — 2026-09-20
 
 修正 Compose 镜像名。不必换槽内 kernel。

@@ -7,6 +7,7 @@ import {
   reconcileFingerprint,
   applyOfficialFingerprintToVm,
   discardLeftoverClaudeJson,
+  readOfficialCcIdentity,
   OFFICIAL_IDENTITY_SOURCE,
 } from '../../src/lib/identity/official-fingerprint.mjs'
 
@@ -79,6 +80,57 @@ test('applyOfficialFingerprintToVm writes vm.json and drops leftover claude.json
 
 test('discardLeftoverClaudeJson is a no-op when missing', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fp-miss-'))
-  assert.deepEqual(discardLeftoverClaudeJson(root), { removed: false, conflict: false })
+  assert.deepEqual(discardLeftoverClaudeJson(root), { removed: false, conflict: false, promoted: false })
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('CLAUDE_CONFIG_DIR nested claude.json is official identity and is promoted', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fp-nested-'))
+  const home = path.join(root, 'cli-home')
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true })
+  const machine = 'ee'.repeat(32)
+  const user = 'ff'.repeat(32)
+  fs.writeFileSync(
+    path.join(home, '.claude', '.claude.json'),
+    JSON.stringify({
+      machineID: machine,
+      userID: user,
+      oauthAccount: { accountUuid: 'acc-nested', emailAddress: 'n@example.com' },
+    }),
+  )
+  const ident = readOfficialCcIdentity(home)
+  assert.equal(ident.machine_id, machine)
+  assert.equal(ident.user_id, user)
+  assert.equal(ident.account_uuid, 'acc-nested')
+
+  const vmPath = path.join(root, 'vm-02.json')
+  fs.writeFileSync(vmPath, JSON.stringify({ id: 'vm-02', fingerprint: { device_id: 'slot-uuid' } }))
+  const result = applyOfficialFingerprintToVm(vmPath, home)
+  assert.equal(result.wrote, true)
+  assert.equal(result.official, true)
+  assert.equal(result.leftover.promoted, true)
+  assert.equal(result.leftover.removed, false)
+  assert.equal(fs.existsSync(path.join(home, '.claude.json')), true)
+  assert.equal(fs.existsSync(path.join(home, '.claude', '.claude.json')), true)
+  const canonical = JSON.parse(fs.readFileSync(path.join(home, '.claude.json'), 'utf8'))
+  assert.equal(canonical.machineID, machine)
+  assert.equal(canonical.userID, user)
+  const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+  assert.equal(vm.fingerprint.device_id, machine)
+  assert.equal(vm.fingerprint.official_user_id, user)
+  assert.equal(vm.fingerprint.identity_source, OFFICIAL_IDENTITY_SOURCE)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('matching nested claude.json is kept when canonical already has the same IDs', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fp-match-'))
+  const home = path.join(root, 'cli-home')
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true })
+  const doc = { machineID: '11'.repeat(32), userID: '22'.repeat(32) }
+  fs.writeFileSync(path.join(home, '.claude.json'), JSON.stringify(doc))
+  fs.writeFileSync(path.join(home, '.claude', '.claude.json'), JSON.stringify(doc))
+  const out = discardLeftoverClaudeJson(home)
+  assert.deepEqual(out, { removed: false, conflict: false, promoted: false })
+  assert.equal(fs.existsSync(path.join(home, '.claude', '.claude.json')), true)
   fs.rmSync(root, { recursive: true, force: true })
 })

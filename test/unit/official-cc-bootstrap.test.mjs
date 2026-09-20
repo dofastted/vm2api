@@ -498,6 +498,49 @@ test('finalizeOfficialCcTelemetry reloads the engine-aware slot after writing id
   fs.rmSync(root, { recursive: true, force: true })
 })
 
+test('finalizeOfficialCcTelemetry reads CLAUDE_CONFIG_DIR nested claude.json', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-nested-'))
+  const vmId = 'vm-02'
+  const home = path.join(root, 'vms', vmId, 'cli-home')
+  const runDir = path.join(root, 'vms', vmId, 'run')
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true })
+  fs.mkdirSync(runDir, { recursive: true })
+  const machine = 'ab'.repeat(32)
+  const user = 'cd'.repeat(32)
+  fs.writeFileSync(
+    path.join(home, '.claude', '.claude.json'),
+    JSON.stringify({
+      machineID: machine,
+      userID: user,
+      oauthAccount: { accountUuid: 'acc-2', organizationUuid: 'org-2', emailAddress: 'slot@example.com' },
+    }),
+  )
+  fs.writeFileSync(path.join(runDir, 'worker.json'), JSON.stringify({ vm_id: vmId, proxy_required: false }))
+  fs.writeFileSync(
+    path.join(root, 'vms', `${vmId}.json`),
+    JSON.stringify({
+      id: vmId,
+      seed_policy: { telemetry_disabled: false },
+      fingerprint: { session_id: 'sess-2' },
+    }),
+  )
+  const summary = summarizeOfficialCcHome(home)
+  assert.equal(summary.has_user_id, true)
+  assert.equal(summary.has_machine_id, true)
+  assert.equal(summary.has_oauth_account, true)
+  const out = await finalizeOfficialCcTelemetry(root, vmId, { reload: false })
+  assert.equal(out.enabled, true)
+  assert.equal(out.official, true)
+  const worker = JSON.parse(fs.readFileSync(path.join(runDir, 'worker.json'), 'utf8'))
+  assert.equal(worker.telemetry.enabled, true)
+  assert.equal(worker.telemetry.identity.device_id, machine)
+  assert.equal(worker.telemetry.identity.user_id, user)
+  assert.equal(worker.telemetry.identity.source, 'official-cc-init')
+  assert.equal(fs.existsSync(path.join(home, '.claude.json')), true)
+  assert.equal(fs.existsSync(path.join(home, '.claude', '.claude.json')), true)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
 test('finalize without official IDs keeps sidecar off', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-noid-'))
   const vmId = 'vm-99'
