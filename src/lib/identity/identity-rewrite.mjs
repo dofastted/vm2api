@@ -3,11 +3,14 @@
  *
  *   device_id     → slot (VM) device
  *   account_uuid  → real OAuth account of the slot
- *   session_id    → official Claude Code keeps the caller's session;
- *                   unofficial mints a UUID (stable hash of the caller token,
- *                   or randomUUID if the caller sent none). Outbound always
- *                   has a session. Email never goes in metadata.user_id
- *                   (Anthropic 400 has_at).
+ *   session_id    → official Claude Code keeps the caller's session.
+ *                   Unofficial hashes the caller token. With no caller
+ *                   session, derive a UUID from account + client + first
+ *                   user text (sub2api buildStableSessionSeed). Never
+ *                   randomUUID while any of those anchors exist. A sticky
+ *                   row for the same account reuses the id it already stored.
+ *                   Outbound always has a session. Email never goes in
+ *                   metadata.user_id (Anthropic 400 has_at).
  *
  * Client settings/env/identity fields are always dropped.
  * Pool sticky prefers metadata.user_id.device_id (parent + sub-agent family),
@@ -42,6 +45,62 @@ export const CALLER_SESSION_BODY_KEYS = Object.freeze([
 ])
 
 export const UNOFFICIAL_SESSION_SEED = 'kin-unofficial-session:'
+
+/** Prefix so a stable seed cannot collide with an unofficial caller hash. */
+export const STABLE_SESSION_SEED = 'kin-stable-session:'
+
+const SESSION_UA_PRODUCT = /([A-Za-z0-9._-]+)\/[A-Za-z0-9._-]+/g
+const SESSION_UA_VERSION = /\bv?\d+(?:\.\d+){1,3}\b/g
+
+/**
+ * Product names only, sorted. CLI version bumps must not mint a new session.
+ * Same rule as sub2api NormalizeSessionUserAgent.
+ */
+export function normalizeSessionUserAgent(raw) {
+  const text = String(raw || '').trim()
+  if (!text) return ''
+  const products = []
+  const seen = new Set()
+  for (const match of text.matchAll(SESSION_UA_PRODUCT)) {
+    const product = String(match[1] || '')
+      .trim()
+      .toLowerCase()
+    if (!product || seen.has(product)) continue
+    seen.add(product)
+    products.push(product)
+  }
+  if (!products.length) {
+    return text.toLowerCase().replace(SESSION_UA_VERSION, '').replace(/\s+/g, ' ').trim()
+  }
+  products.sort()
+  return products.join('+')
+}
+
+/** IP + normalized UA + API key. Separates clients that share a first message. */
+export function sessionContextDiscriminator({ clientIp = '', userAgent = '', apiKeyId = '' } = {}) {
+  const ip = String(clientIp || '').trim()
+  const ua = normalizeSessionUserAgent(userAgent)
+  const key = apiKeyId == null || apiKeyId === '' ? '' : String(apiKeyId).trim()
+  return `${ip}:${ua}:${key}`
+}
+
+/**
+ * Account + client + first user text. Appending later messages does not
+ * change the seed. This is not the pool sticky key.
+ */
+export function buildStableSessionSeed(accountId, clientDiscriminator, firstUserText) {
+  return `${String(accountId ?? '').trim()}::${String(clientDiscriminator ?? '')}::${String(firstUserText ?? '')}`
+}
+
+function stableSessionMaterial(accountId, clientDiscriminator, firstUserText) {
+  if (String(accountId || '').trim()) return true
+  if (String(firstUserText || '').trim()) return true
+  return (
+    String(clientDiscriminator || '')
+      .replace(/:/g, '')
+      .trim() !== ''
+  )
+}
 
 /** Deterministic v4-shaped UUID. Used for unofficial outbound session_id. */
 export function uuidFromSeed(seed) {
@@ -117,14 +176,36 @@ export function sessionIdFromOutboundBody(body = {}) {
 }
 
 /**
- * Official Claude Code: keep the caller's session (mint only if missing).
- * Unofficial: never send the caller's raw token upstream; hash it to a UUID
- * so the same inbound conversation stays stable. Always returns a session.
+ * Official Claude Code: keep the caller's session.
+ * Unofficial: hash the caller token so the raw value never goes upstream.
+ * No caller session: reuse the sticky row's outbound id for this account,
+ * otherwise a deterministic UUID. randomUUID only when nothing identifies
+ * the conversation.
  */
-export function resolveOutboundSessionId(callerSession, { officialClient = false } = {}) {
+export function resolveOutboundSessionId(callerSession, opts = {}) {
   const caller = String(callerSession || '').trim()
-  if (officialClient) return caller || crypto.randomUUID()
-  if (caller) return uuidFromSeed(UNOFFICIAL_SESSION_SEED + caller)
+  const officialClient = opts.officialClient === true
+  if (officialClient && caller) return caller
+  if (!officialClient && caller) return uuidFromSeed(UNOFFICIAL_SESSION_SEED + caller)
+
+  const accountId = String(opts.accountId || '').trim()
+  const boundAccountId = String(opts.boundAccountId || '').trim()
+  const boundSessionId = String(opts.boundSessionId || '').trim()
+  const sameAccount = !boundAccountId || !accountId || boundAccountId === accountId
+  if (boundSessionId && sameAccount) return boundSessionId
+
+  const discriminator =
+    opts.clientDiscriminator != null
+      ? String(opts.clientDiscriminator)
+      : sessionContextDiscriminator({
+          clientIp: opts.clientIp,
+          userAgent: opts.userAgent,
+          apiKeyId: opts.apiKeyId,
+        })
+  const firstUserText = String(opts.firstUserText || '')
+  if (stableSessionMaterial(accountId, discriminator, firstUserText)) {
+    return uuidFromSeed(STABLE_SESSION_SEED + buildStableSessionSeed(accountId, discriminator, firstUserText))
+  }
   return crypto.randomUUID()
 }
 
@@ -146,7 +227,17 @@ export function applyCrsIdentityReplace(body, identity, inbound = {}, reqHeaders
   const officialClient = opts.officialClient === true
   const sessionId =
     String(opts.sessionId || '').trim() ||
-    resolveOutboundSessionId(extractCallerSession({ inbound, body, headers: reqHeaders }), { officialClient })
+    resolveOutboundSessionId(extractCallerSession({ inbound, body, headers: reqHeaders }), {
+      officialClient,
+      accountId: opts.accountId || identity?.accountId || identity?.vmId || '',
+      boundSessionId: opts.boundSessionId,
+      boundAccountId: opts.boundAccountId,
+      clientDiscriminator: opts.clientDiscriminator,
+      clientIp: opts.clientIp,
+      userAgent: opts.userAgent || headerValue(reqHeaders, 'user-agent'),
+      apiKeyId: opts.apiKeyId,
+      firstUserText: opts.firstUserText,
+    })
 
   const md = {}
   if (out.metadata && typeof out.metadata === 'object') {

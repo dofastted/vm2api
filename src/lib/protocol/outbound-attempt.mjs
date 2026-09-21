@@ -23,6 +23,7 @@ import { resolveCrsHeaders } from '../identity/crs-headers.mjs'
 import { hasClaudeCode1mSuffix } from './context-1m.mjs'
 import {
   refreshOfficialSystemEnvironment,
+  stampBillingPromptId,
   CRS_OFFICIAL_SYSTEM,
   CRS_OFFICIAL_CLI_SYSTEM,
   CRS_COMPACT_IDENTITY,
@@ -209,27 +210,50 @@ export function prepareOutboundAttempt({
   reqHeaders = {},
   officialClient,
   sessionId: sessionIdOverride,
+  accountId = '',
+  boundSessionId = '',
+  boundAccountId = '',
+  clientDiscriminator = undefined,
+  clientIp = '',
+  userAgent = '',
+  apiKeyId = '',
+  firstUserText = '',
   authScheme,
   credentialMode,
 } = {}) {
   const inferenceOnly = isSetupTokenMode(credentialMode) || isApiKeyMode(credentialMode)
   const keepCallerSession = officialClient === true || (officialClient == null && !unofficial)
+  const sessionContext = {
+    officialClient: keepCallerSession,
+    accountId,
+    boundSessionId,
+    boundAccountId,
+    clientDiscriminator,
+    clientIp,
+    userAgent: userAgent || reqHeaders?.['user-agent'] || '',
+    apiKeyId,
+    firstUserText,
+  }
   const sessionId =
     String(sessionIdOverride || '').trim() ||
-    resolveOutboundSessionId(extractCallerSession({ inbound, body: canonicalBody, headers: reqHeaders }), {
-      officialClient: keepCallerSession,
-    })
+    resolveOutboundSessionId(
+      extractCallerSession({ inbound, body: canonicalBody, headers: reqHeaders }),
+      sessionContext,
+    )
   let identified = applyCrsIdentityReplace(
     officialMessagesBody(canonicalBody, { stream }),
     identity,
     inbound,
     reqHeaders,
-    { officialClient: keepCallerSession, sessionId },
+    { officialClient: keepCallerSession, sessionId, ...sessionContext },
   )
   const callerSessionId = sessionIdFromOutboundBody(identified)
   if (identity && callerSessionId) identity.callerSessionId = callerSessionId
   if (identity) {
     identified = refreshOfficialSystemEnvironment(identified, identity, identified.model)
+  }
+  if (!keepCallerSession && String(sessionIdOverride || '').trim()) {
+    identified = stampBillingPromptId(identified, sessionId, firstUserText)
   }
   // Official Claude Code places its own breakpoints; adding ours would shift the
   // prefix it already caches.
@@ -273,6 +297,14 @@ export function prepareOutboundEnvelope({
   homeDir = '',
   officialClient,
   sessionId,
+  accountId = '',
+  boundSessionId = '',
+  boundAccountId = '',
+  clientDiscriminator,
+  clientIp = '',
+  userAgent = '',
+  apiKeyId = '',
+  firstUserText = '',
   authScheme,
   credentialMode,
   want1m,
@@ -290,6 +322,14 @@ export function prepareOutboundEnvelope({
     reqHeaders,
     officialClient,
     sessionId,
+    accountId,
+    boundSessionId,
+    boundAccountId,
+    clientDiscriminator,
+    clientIp,
+    userAgent,
+    apiKeyId,
+    firstUserText,
     authScheme,
     credentialMode,
   })

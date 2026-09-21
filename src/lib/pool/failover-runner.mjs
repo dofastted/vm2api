@@ -322,9 +322,14 @@ export class FailoverRunner {
     const excluded = new Set()
     const sameAccountRetries = new Map()
     const bindKeys = uniqueStickyKeys(stickyKey, stickyKeys)
+    let outboundSessionId = ''
+    let outboundSessionAccountId = ''
     const bindAll = (account, opts) => {
       if (!this.stickyRouter?.bind || !account) return
       const sessions = this.scheduler?.accountQuota?.sessions
+      const sessionId = account.sessionId || (account.accountId === outboundSessionAccountId ? outboundSessionId : '')
+      const payload = { accountId: account.accountId, vmId: account.vmId }
+      if (sessionId) payload.sessionId = sessionId
       for (const key of bindKeys) {
         const prev = this.stickyRouter.resolve?.(key)
         if (prev?.accountId && prev.accountId !== account.accountId) {
@@ -332,7 +337,7 @@ export class FailoverRunner {
             sessions?.drop?.(prev.accountId, key)
           } catch {}
         }
-        this.stickyRouter.bind(key, account, opts)
+        this.stickyRouter.bind(key, payload, opts)
       }
     }
     let lastResult = null
@@ -439,6 +444,14 @@ export class FailoverRunner {
           Object.prototype.hasOwnProperty.call(prepared, 'meta')
         const body = wrappedAttempt ? prepared.body : prepared
         const attemptMeta = wrappedAttempt ? prepared.meta : null
+        if (attemptMeta?.sessionId) {
+          outboundSessionId = String(attemptMeta.sessionId)
+          outboundSessionAccountId = selected.accountId
+          bindAll(
+            { accountId: selected.accountId, vmId: selected.vmId, sessionId: outboundSessionId },
+            { countHit: false },
+          )
+        }
         result = await callAttempt({
           candidate: selected,
           body,

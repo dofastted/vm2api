@@ -145,6 +145,34 @@ test('verified hop binds family and session sticky keys to the same account', as
   assert.ok(commits.every((b) => b.value.accountId === 'account-1' && b.value.vmId === 'vm-01'))
 })
 
+test('verified hop stores the outbound session on every sticky alias', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const bindings = []
+  const runner = new FailoverRunner({
+    scheduler,
+    stickyRouter: {
+      bind: (key, value, opts) => bindings.push({ key, value, opts }),
+    },
+  })
+  const result = await runner.run({
+    requestId: 'req-stable-session',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: 'dev:aabbcc',
+    stickyKeys: ['dev:aabbcc', 'ch:first'],
+    applyAttempt: () => ({
+      body: { model: 'claude-opus-test' },
+      meta: { sessionId: '11111111-1111-4111-8111-111111111111', toolNames: {} },
+    }),
+    callAttempt: () => success(),
+  })
+  assert.equal(result.ok, true)
+  const stored = bindings.filter((b) => b.value.sessionId)
+  assert.deepEqual(stored.map((b) => b.key).sort(), ['ch:first', 'dev:aabbcc', 'ch:first', 'dev:aabbcc'].sort())
+  assert.ok(stored.every((b) => b.value.sessionId === '11111111-1111-4111-8111-111111111111'))
+  assert.ok(stored.every((b) => b.value.accountId === 'account-1'))
+})
+
 test('request-scoped entitlement error does not walk the pool', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const runner = new FailoverRunner({ scheduler })

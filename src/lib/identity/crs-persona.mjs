@@ -334,6 +334,37 @@ export function billingPromptId(sessionId = '', firstUserText = '', cliVersion =
   return uuidFromSeed(raw || `prompt:${ver}:${fp}`)
 }
 
+const BILLING_PROMPT_ID_RE = /cc_prompt_id=[^;\s]*/g
+
+/** Point an owned billing header at the outbound session. No-op if absent. */
+export function stampBillingPromptId(body, sessionId, firstUserText = '') {
+  if (!body || typeof body !== 'object') return body
+  const promptId = billingPromptId(sessionId, firstUserText)
+  const next = `cc_prompt_id=${promptId}`
+  const rewrite = (text) =>
+    String(text).includes('cc_prompt_id=') ? String(text).replace(BILLING_PROMPT_ID_RE, next) : text
+  if (typeof body.system === 'string') {
+    const system = rewrite(body.system)
+    return system === body.system ? body : { ...body, system }
+  }
+  if (!Array.isArray(body.system)) return body
+  let changed = false
+  const system = body.system.map((block) => {
+    if (typeof block === 'string') {
+      const text = rewrite(block)
+      if (text === block) return block
+      changed = true
+      return text
+    }
+    if (!block || typeof block.text !== 'string') return block
+    const text = rewrite(block.text)
+    if (text === block.text) return block
+    changed = true
+    return { ...block, text }
+  })
+  return changed ? { ...body, system } : body
+}
+
 export function buildBillingAttributionText(firstUserText, cliVersion = DEFAULT_CLI_VERSION, sessionId = '') {
   const ver = parseCliVersion(cliVersion)
   const fp = computeClaudeCodeFingerprint(firstUserText ?? '', ver)

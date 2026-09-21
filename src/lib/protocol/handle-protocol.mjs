@@ -71,10 +71,16 @@ import { officialMessagesBody } from './anthropic-messages.mjs'
 import { prepareOutboundEnvelope, prepareCliHopBody, CLI_HOP_CACHE_TTL } from './outbound-attempt.mjs'
 import { loadVmIdentity, OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import { touchTelemetrySession } from '../vm/worker-telemetry.mjs'
-import { extractCallerSession, resolveOutboundSessionId } from '../identity/identity-rewrite.mjs'
+import {
+  extractCallerSession,
+  resolveOutboundSessionId,
+  sessionContextDiscriminator,
+} from '../identity/identity-rewrite.mjs'
+import { clientIp } from '../pool/sticky-router.mjs'
 import {
   applyCrsUnofficialPersona,
   detectProxiedOfficialCcFromRoutingFile,
+  extractFirstUserText,
   isOfficialClaudeCodeTraffic,
   isProxiedOfficialClaudeCode,
   personaHidesUsageFromRoutingFile,
@@ -537,8 +543,28 @@ export function createHandleProtocol(deps) {
     const officialTraffic =
       isOfficialClaudeCodeTraffic(req.headers, inbound) ||
       (detectProxiedOfficialCcFromRoutingFile(routingConfigPath) && isProxiedOfficialClaudeCode(inbound))
-    const outboundSessionId = resolveOutboundSessionId(extractCallerSession({ inbound, headers: req.headers }), {
+    const callerSession = extractCallerSession({ inbound, body: ctx.body, headers: req.headers })
+    const firstUserText = extractFirstUserText(ctx.body?.messages) || extractFirstUserText(inbound?.messages)
+    const clientDiscriminator = sessionContextDiscriminator({
+      clientIp: clientIp(req),
+      userAgent: req.headers['user-agent'] || '',
+      apiKeyId: req.apiKeyRecord?.id ?? '',
+    })
+    const sessionContext = {
       officialClient: officialTraffic,
+      clientDiscriminator,
+      firstUserText,
+    }
+    // Family device_id wins when already bound so a child hop cannot open a second VM session.
+    const stickyKey = stickyRouter?.extractPoolKey?.(req, inbound, { platform: 'anthropic' }) || null
+    const stickyKeys = stickyRouter?.collectPoolKeys?.(req, inbound, { platform: 'anthropic' }) || []
+    const stickyBound =
+      stickyKey && typeof stickyRouter?.resolve === 'function' ? stickyRouter.resolve(stickyKey) : null
+    const outboundSessionId = resolveOutboundSessionId(callerSession, {
+      ...sessionContext,
+      accountId: stickyBound?.accountId || '',
+      boundSessionId: stickyBound?.sessionId || '',
+      boundAccountId: stickyBound?.accountId || '',
     })
     const requestedCacheTtl = resolveCacheTtl({
       headers: req.headers,
@@ -684,10 +710,6 @@ export function createHandleProtocol(deps) {
     }
 
     const canonicalBody = officialMessagesBody(ctx.body)
-    // One platform key. Family device_id wins when it is already bound so a
-    // child hop cannot open a second VM session.
-    const stickyKey = stickyRouter.extractPoolKey(req, inbound, { platform: 'anthropic' })
-    const stickyKeys = stickyRouter.collectPoolKeys(req, inbound, { platform: 'anthropic' })
     const streamKeepaliveMs = Number(
       getRouting()?.failover?.stream_keepalive_ms ?? cfg.limits.stream_keepalive_ms ?? 15_000,
     )
@@ -749,6 +771,12 @@ export function createHandleProtocol(deps) {
             touchTelemetrySession(cfg.paths.project, selected.vmId)
           } catch {}
           const identity = loadVmIdentity(selected.exec)
+          const attemptSessionId = resolveOutboundSessionId(callerSession, {
+            ...sessionContext,
+            accountId: selected.accountId,
+            boundSessionId: stickyBound?.sessionId || '',
+            boundAccountId: stickyBound?.accountId || '',
+          })
           const credMode = credentialModeFromOauth(selected.vm?.claude || {})
           const modeOverride = slotPersonaModeOverride(selected.vm)
           const routingNow = getRouting()
@@ -764,7 +792,7 @@ export function createHandleProtocol(deps) {
                 routingFile: routingConfigPath,
                 mode: resolvedPersona,
                 headers: req.headers,
-                sessionId: outboundSessionId,
+                sessionId: attemptSessionId,
                 model: personaIn?.model,
                 cliVersion: OFFICIAL_CLI_VERSION,
                 identity,
@@ -792,7 +820,7 @@ export function createHandleProtocol(deps) {
             logBag.official_cc_inference = 'cli-hop'
             logBag.provider = 'local_cli'
             logBag.outbound_summary = summarizeBody(hopBody)
-            return { body: hopBody, meta: { toolNames: {} } }
+            return { body: hopBody, meta: { toolNames: {}, sessionId: attemptSessionId } }
           }
 
           cacheTtl = requestedCacheTtl
@@ -802,7 +830,7 @@ export function createHandleProtocol(deps) {
               routingFile: routingConfigPath,
               mode: modeOverride,
               headers: req.headers,
-              sessionId: outboundSessionId,
+              sessionId: attemptSessionId,
               model: personaIn?.model,
               cliVersion: OFFICIAL_CLI_VERSION,
               identity,
@@ -824,7 +852,13 @@ export function createHandleProtocol(deps) {
             identity,
             unofficial: !officialTraffic,
             officialClient: officialTraffic,
-            sessionId: outboundSessionId,
+            sessionId: attemptSessionId,
+            accountId: selected.accountId,
+            boundSessionId: stickyBound?.sessionId || '',
+            boundAccountId: stickyBound?.accountId || '',
+            clientDiscriminator,
+            firstUserText,
+            apiKeyId: req.apiKeyRecord?.id ?? '',
             stream: upstreamStream,
             cacheControlLimit: Number(getRouting()?.compatibility?.cache_control_limit) || 4,
             toolNameRewrite: openaiCompat ? false : getRouting()?.compatibility?.tool_name_rewrite !== false,
@@ -839,7 +873,7 @@ export function createHandleProtocol(deps) {
           if (getRouting()?.logging?.mode === 'debug') logBag.outbound_body = prepared.body
           logBag.outbound_headers = redactHeaders(prepared.headers || {})
           logBag.outbound_summary = summarizeBody(prepared.body)
-          return { body: prepared.body, meta: { toolNames: prepared.toolNames } }
+          return { body: prepared.body, meta: { toolNames: prepared.toolNames, sessionId: attemptSessionId } }
         },
         callAttempt: async ({ candidate, body, attemptMeta, deliveryMode: attemptDelivery, signal, onCommit }) => {
           if (!clientStream) {
