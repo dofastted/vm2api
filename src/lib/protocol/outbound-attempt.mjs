@@ -38,6 +38,7 @@ import {
   applyCacheBreakpoints,
   enforceCacheTtlOrder,
   normalizeCacheBreakpoints,
+  normalizeCacheTtl,
   stripIllegalCacheControlFields,
 } from './cache-ttl.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
@@ -81,7 +82,11 @@ export const CLI_HOP_CACHE_BREAKPOINTS = Object.freeze({
   messages: 'rewrite',
 })
 
-/** Wrap CLI and kernel emit ttl-less ephemeral markers, which Anthropic treats as 5m. */
+/**
+ * Fallback only. The console `compatibility.cache_ttl` is the authority and is
+ * threaded in per request; probe-class callers that resolve no console value
+ * fall back to the ttl-less 5m the wrap CLI and kernel emit on their own markers.
+ */
 export const CLI_HOP_CACHE_TTL = '5m'
 
 function dropNodeCacheControl(node) {
@@ -141,6 +146,7 @@ export function prepareCliHopBody(
     stream = true,
     repaired = false,
     cacheBreakpoints = CLI_HOP_CACHE_BREAKPOINTS,
+    cacheTtl = CLI_HOP_CACHE_TTL,
     cacheControlLimit = 4,
     unofficial: _unofficial = false,
   } = {},
@@ -163,12 +169,14 @@ export function prepareCliHopBody(
   body = alignSamplingWithThinking(body)
   body = stripIllegalCacheControlFields(body)
   // Node rewrites last + penultimate user, then removes the current tail so
-  // the kernel can restamp it after transport conversion. Keep every Node
-  // marker at 5m because wrap-owned tools/system markers are ttl-less (=5m).
+  // the kernel can restamp it after transport conversion. The console TTL is
+  // the authority for every marker Node still owns; wrap-owned tools/system
+  // markers stay ttl-less (=5m), so a 1h console value is decided upstream.
+  const ttl = normalizeCacheTtl(cacheTtl)
   if (cacheBreakpoints) {
     const cfg = normalizeCacheBreakpoints(cacheBreakpoints)
     body = applyCacheBreakpoints(body, {
-      ttl: CLI_HOP_CACHE_TTL,
+      ttl,
       config: {
         enabled: cfg.enabled,
         preserve_client: cfg.preserve_client,
@@ -181,7 +189,8 @@ export function prepareCliHopBody(
   }
   body = dropCliOwnedBreakpoints(body)
   body = dropLastMessageBreakpoint(body)
-  body = enforceCacheTtlOrder(body)
+  // honorHour lifts an older 5m leftover instead of wiping the console 1h.
+  body = enforceCacheTtlOrder(body, { honorHour: ttl === '1h' })
   enforceCacheLimit(body, cacheControlLimit)
   return body
 }

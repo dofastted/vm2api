@@ -68,7 +68,7 @@ import {
 } from '../core/errors.mjs'
 import { resolveWorkspaceMode, isOfficialClaudeClient } from './workspace-mode.mjs'
 import { officialMessagesBody } from './anthropic-messages.mjs'
-import { prepareOutboundEnvelope, prepareCliHopBody } from './outbound-attempt.mjs'
+import { prepareOutboundEnvelope, prepareCliHopBody, CLI_HOP_CACHE_TTL } from './outbound-attempt.mjs'
 import { loadVmIdentity, OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import { touchTelemetrySession } from '../vm/worker-telemetry.mjs'
 import { extractCallerSession, resolveOutboundSessionId } from '../identity/identity-rewrite.mjs'
@@ -759,6 +759,8 @@ export function createHandleProtocol(deps) {
               stream: upstreamStream,
               repaired,
               cacheBreakpoints,
+              // 控制台 cache_ttl 是权威值；官方入站自带断点，保持 wrap 的 5m。
+              cacheTtl: cacheTtl || CLI_HOP_CACHE_TTL,
               cacheControlLimit: Number(getRouting()?.compatibility?.cache_control_limit) || 4,
               unofficial: !officialTraffic,
             })

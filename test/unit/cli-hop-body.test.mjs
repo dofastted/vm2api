@@ -373,3 +373,41 @@ test('cli-hop strips Claude Code last tool_use/tool_result markers', () => {
   assert.equal(asstBlocks.find((b) => b.type === 'tool_use')?.cache_control, undefined)
   assert.equal(userBlocks.find((b) => b.type === 'tool_result')?.cache_control, undefined)
 })
+
+test('cli-hop writes the console 1h on the marker Node still owns', () => {
+  const body = prepareCliHopBody(
+    {
+      model: 'claude-sonnet-5',
+      max_tokens: 256,
+      messages: [
+        { role: 'user', content: 'u1' },
+        { role: 'assistant', content: 'a1' },
+        { role: 'user', content: 'u2' },
+        { role: 'assistant', content: 'a2' },
+        { role: 'user', content: 'u3' },
+      ],
+    },
+    { cacheTtl: '1h' },
+  )
+  assert.deepEqual(body.messages[2].content[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.equal(body.messages[4].content[0].cache_control, undefined)
+})
+
+test('cli-hop console 1h survives an earlier caller 5m system marker', () => {
+  const body = prepareCliHopBody(
+    {
+      model: 'claude-sonnet-5',
+      max_tokens: 256,
+      system: [{ type: 'text', text: 'caller prefix', cache_control: { type: 'ephemeral', ttl: '5m' } }],
+      messages: [
+        { role: 'user', content: 'u1' },
+        { role: 'assistant', content: 'a1' },
+        { role: 'user', content: 'u2' },
+        { role: 'assistant', content: 'a2' },
+        { role: 'user', content: 'u3' },
+      ],
+    },
+    { cacheTtl: '1h' },
+  )
+  assert.deepEqual(body.messages[2].content[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+})

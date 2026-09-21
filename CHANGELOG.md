@@ -3,6 +3,7 @@
 ## Unreleased
 
 - `VERSION` 成为唯一应用版本源；控制台从运行态 `/api/panel/me` 显示版本，Release 校验 tag，HostDzire 打包自动重建前端，避免旧构建版本漂移
+- 设置页缓存 TTL 恢复为出站权威值：cli-hop 不再把 Node 自己的会话断点钉死在 5m，控制台 `compatibility.cache_ttl`（及 `x-kin-cache-ttl` 单请求覆盖）直接决定写入的 ttl，计费与真正写入值一致
 
 ## 1.3.8 — 2026-09-21
 
