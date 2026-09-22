@@ -8,6 +8,7 @@ import {
   rewriteToolNames,
   sanitizeAnthropicBodyForBetaTokens,
   ensureClearThinkingContextManagement,
+  modelSupportsMidConversationSystem,
   stripInvalidThinkingBlocks,
   alignSamplingWithThinking,
   enforceCacheLimit,
@@ -190,6 +191,63 @@ function liftTrailingSystemMessages(body) {
   })
 }
 
+/** Fold every role=system message into the message before it, as an extra text
+ * block. Official Claude Code presents reminders inside user content; a hop
+ * that cannot end on role=system still has to move it into the conversational
+ * turn it belongs to. Folding is deterministic, so replayed history folds
+ * identically and every earlier request stays a prefix of the next one. */
+function systemMessageText(message) {
+  const content = message?.content
+  if (typeof content === 'string') return content.trim() ? content : ''
+  if (!Array.isArray(content)) return ''
+  return content
+    .map((block) =>
+      typeof block === 'string' ? block : block?.type === 'text' ? String(block.text || '') : '',
+    )
+    .filter((text) => text.trim())
+    .join('\n\n')
+}
+
+function foldTextIntoMessage(message, text) {
+  const content = message?.content
+  if (typeof content === 'string') {
+    return [...(content ? [{ type: 'text', text: content }] : []), { type: 'text', text }]
+  }
+  if (Array.isArray(content)) return [...content, { type: 'text', text }]
+  return [{ type: 'text', text }]
+}
+
+function foldSystemMessages(body) {
+  const messages = Array.isArray(body?.messages) ? body.messages : []
+  let changed = false
+  const out = []
+  for (const message of messages) {
+    if (message?.role !== 'system') {
+      out.push(message)
+      continue
+    }
+    changed = true
+    const text = systemMessageText(message)
+    if (!text) continue
+    const prev = out[out.length - 1]
+    if (prev && typeof prev === 'object' && prev.role !== 'system') {
+      out[out.length - 1] = { ...prev, content: foldTextIntoMessage(prev, text) }
+    } else {
+      out.push({ role: 'user', content: [{ type: 'text', text }] })
+    }
+  }
+  if (!changed) return body
+  return { ...body, messages: out }
+}
+
+/** KIN_CLI_HOP_SYSTEM_MODE: official (default) | lift | fold. */
+export function cliHopSystemMode() {
+  const raw = String(process.env.KIN_CLI_HOP_SYSTEM_MODE || '')
+    .trim()
+    .toLowerCase()
+  return raw === 'lift' || raw === 'fold' || raw === 'official' ? raw : 'official'
+}
+
 /** Caller fields only. CLI owns UA / billing / metadata / layoutSystemBlocks. */
 export function prepareCliHopBody(
   canonicalBody,
@@ -213,7 +271,18 @@ export function prepareCliHopBody(
   const leftover = stripCliOwnedSystem(body.system)
   if (leftover == null) delete body.system
   else body.system = leftover
-  body = liftTrailingSystemMessages(body)
+  const systemMode = cliHopSystemMode()
+  if (systemMode === 'fold') {
+    body = foldSystemMessages(body)
+  } else if (systemMode === 'official' && modelSupportsMidConversationSystem(body.model)) {
+    // Official Claude Code keeps mid-conversation role=system turns and lands
+    // the current one at the tail of messages. A live counter there sits behind
+    // the read boundary instead of ahead of every message, so it cannot shift
+    // the cached prefix. Haiku has no such beta and still needs lift+pin.
+    body = stabilizeSystemBudget(body)
+  } else {
+    body = liftTrailingSystemMessages(body)
+  }
   body = stabilizeMessageBudgets(body)
 
   if (!repaired) {

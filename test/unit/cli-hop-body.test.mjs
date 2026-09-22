@@ -373,85 +373,89 @@ test('unofficial cli-hop rewrite matches official penultimate-user leftover', ()
   )
 })
 
-test('cli-hop lifts trailing system constraints so the hop ends with a user turn', () => {
-  const leftover = {
-    model: 'claude-sonnet-5',
-    max_tokens: 256,
-    system: [{ type: 'text', text: 'persona system prefix' }],
-    messages: [
-      { role: 'user', content: 'u1' },
-      { role: 'system', content: 'caller constraint after current user' },
-    ],
-  }
-  const firstTurn = prepareCliHopBody(leftover, { unofficial: true })
-  assert.equal(firstTurn.messages.length, 1)
-  assert.equal(firstTurn.messages[0].role, 'user')
-  assert.equal(firstTurn.messages[0].content[0].text, 'u1')
-  assert.equal(firstTurn.system.at(-1).text, 'caller constraint after current user')
-  assert.equal(firstTurn.messages[0].content[0].cache_control, undefined)
-  assert.ok(firstTurn.system.every((block) => block.cache_control == null))
+test('cli-hop lift mode ends the hop on a user turn by lifting trailing system constraints', () => {
+  withSystemMode('lift', () => {
+    const leftover = {
+      model: 'claude-sonnet-5',
+      max_tokens: 256,
+      system: [{ type: 'text', text: 'persona system prefix' }],
+      messages: [
+        { role: 'user', content: 'u1' },
+        { role: 'system', content: 'caller constraint after current user' },
+      ],
+    }
+    const firstTurn = prepareCliHopBody(leftover, { unofficial: true })
+    assert.equal(firstTurn.messages.length, 1)
+    assert.equal(firstTurn.messages[0].role, 'user')
+    assert.equal(firstTurn.messages[0].content[0].text, 'u1')
+    assert.equal(firstTurn.system.at(-1).text, 'caller constraint after current user')
+    assert.equal(firstTurn.messages[0].content[0].cache_control, undefined)
+    assert.ok(firstTurn.system.every((block) => block.cache_control == null))
 
-  const later = prepareCliHopBody({
-    ...leftover,
-    messages: [
-      { role: 'user', content: 'u1' },
-      { role: 'system', content: 'historical constraint' },
-      { role: 'assistant', content: 'a1' },
-      { role: 'user', content: 'u2' },
-      { role: 'system', content: 'current constraint' },
-    ],
+    const later = prepareCliHopBody({
+      ...leftover,
+      messages: [
+        { role: 'user', content: 'u1' },
+        { role: 'system', content: 'historical constraint' },
+        { role: 'assistant', content: 'a1' },
+        { role: 'user', content: 'u2' },
+        { role: 'system', content: 'current constraint' },
+      ],
+    })
+    assert.equal(later.messages[1].role, 'system')
+    assert.equal(later.messages.at(-1).role, 'user')
+    assert.equal(later.messages.at(-1).content[0].text, 'u2')
+    assert.equal(later.system.at(-1).text, 'current constraint')
+    assert.equal(later.messages[0].content[0].cache_control, undefined)
+    assert.equal(later.messages[1].content[0].cache_control, undefined)
+    assert.equal(later.messages.at(-1).content[0].cache_control, undefined)
+    assert.ok(later.system.every((block) => block.cache_control == null))
   })
-  assert.equal(later.messages[1].role, 'system')
-  assert.equal(later.messages.at(-1).role, 'user')
-  assert.equal(later.messages.at(-1).content[0].text, 'u2')
-  assert.equal(later.system.at(-1).text, 'current constraint')
-  assert.equal(later.messages[0].content[0].cache_control, undefined)
-  assert.equal(later.messages[1].content[0].cache_control, undefined)
-  assert.equal(later.messages.at(-1).content[0].cache_control, undefined)
-  assert.ok(later.system.every((block) => block.cache_control == null))
 })
 
-test('cli-hop freezes the lifted 2.1.278 context budget so the next turn can read', () => {
-  const budget = (n) => `<system-reminder>\n<total_tokens>${n} tokens left</total_tokens>\n</system-reminder>`
-  const stable = budget(15000000)
-  const first = prepareCliHopBody({
-    model: 'claude-sonnet-5',
-    max_tokens: 256,
-    system: [{ type: 'text', text: 'persona' }],
-    messages: [
-      { role: 'user', content: 'u1' },
-      { role: 'assistant', content: 'a1' },
-      { role: 'user', content: 'u2' },
-      { role: 'system', content: budget(14955783) },
-    ],
+test('cli-hop lift mode freezes the lifted 2.1.278 context budget so the next turn can read', () => {
+  withSystemMode('lift', () => {
+    const budget = (n) => `<system-reminder>\n<total_tokens>${n} tokens left</total_tokens>\n</system-reminder>`
+    const stable = budget(15000000)
+    const first = prepareCliHopBody({
+      model: 'claude-sonnet-5',
+      max_tokens: 256,
+      system: [{ type: 'text', text: 'persona' }],
+      messages: [
+        { role: 'user', content: 'u1' },
+        { role: 'assistant', content: 'a1' },
+        { role: 'user', content: 'u2' },
+        { role: 'system', content: budget(14955783) },
+      ],
+    })
+    const second = prepareCliHopBody({
+      model: 'claude-sonnet-5',
+      max_tokens: 256,
+      system: [{ type: 'text', text: 'persona' }],
+      messages: [
+        { role: 'user', content: 'u1' },
+        { role: 'assistant', content: 'a1' },
+        { role: 'user', content: 'u2' },
+        { role: 'system', content: budget(14955783) },
+        { role: 'assistant', content: 'a2' },
+        { role: 'user', content: 'u3' },
+        { role: 'system', content: budget(14947383) },
+      ],
+    })
+    assert.equal(first.system.at(-1).text, stable)
+    assert.equal(second.system.at(-1).text, stable)
+    assert.deepEqual(
+      first.system.map((block) => block.text),
+      second.system.map((block) => block.text),
+    )
+    assert.equal(second.messages[3].role, 'system')
+    assert.equal(second.messages[3].content[0].text, stable)
+    assert.equal(second.messages[2].content[0].cache_control, undefined)
+    assert.deepEqual(
+      second.messages.slice(0, 3).map((message) => message.content[0].text),
+      first.messages.map((message) => message.content[0].text),
+    )
   })
-  const second = prepareCliHopBody({
-    model: 'claude-sonnet-5',
-    max_tokens: 256,
-    system: [{ type: 'text', text: 'persona' }],
-    messages: [
-      { role: 'user', content: 'u1' },
-      { role: 'assistant', content: 'a1' },
-      { role: 'user', content: 'u2' },
-      { role: 'system', content: budget(14955783) },
-      { role: 'assistant', content: 'a2' },
-      { role: 'user', content: 'u3' },
-      { role: 'system', content: budget(14947383) },
-    ],
-  })
-  assert.equal(first.system.at(-1).text, stable)
-  assert.equal(second.system.at(-1).text, stable)
-  assert.deepEqual(
-    first.system.map((block) => block.text),
-    second.system.map((block) => block.text),
-  )
-  assert.equal(second.messages[3].role, 'system')
-  assert.equal(second.messages[3].content[0].text, stable)
-  assert.equal(second.messages[2].content[0].cache_control, undefined)
-  assert.deepEqual(
-    second.messages.slice(0, 3).map((message) => message.content[0].text),
-    first.messages.map((message) => message.content[0].text),
-  )
 })
 
 test('cli-hop strips Claude Code last tool_use/tool_result markers', () => {
@@ -500,4 +504,138 @@ test('prepareCliHopBody clamps small max_tokens to 1024 for automated probe test
     messages: [{ role: 'user', content: 'hello' }],
   })
   assert.equal(normal.max_tokens, 4096)
+})
+
+function withSystemMode(mode, fn) {
+  const prev = process.env.KIN_CLI_HOP_SYSTEM_MODE
+  if (mode === undefined) delete process.env.KIN_CLI_HOP_SYSTEM_MODE
+  else process.env.KIN_CLI_HOP_SYSTEM_MODE = mode
+  try {
+    return fn()
+  } finally {
+    if (prev === undefined) delete process.env.KIN_CLI_HOP_SYSTEM_MODE
+    else process.env.KIN_CLI_HOP_SYSTEM_MODE = prev
+  }
+}
+
+test('cli-hop keeps mid-conversation system turns on non-Haiku models', () => {
+  withSystemMode(undefined, () => {
+    const body = prepareCliHopBody(
+      {
+        model: 'claude-sonnet-5',
+        max_tokens: 256,
+        system: [{ type: 'text', text: 'persona' }],
+        messages: [
+          { role: 'user', content: 'u1' },
+          { role: 'assistant', content: 'a1' },
+          { role: 'user', content: 'u2' },
+          { role: 'system', content: '<total_tokens>14955783 tokens left</total_tokens>' },
+        ],
+      },
+      { cacheTtl: '1h' },
+    )
+    // Official shape: the live counter stays at the tail of messages...
+    assert.equal(body.messages.at(-1).role, 'system')
+    assert.equal(body.messages.at(-1).content[0].text, '<total_tokens>15000000 tokens left</total_tokens>')
+    assert.equal(body.system.length, 1)
+    assert.equal(body.system[0].text, 'persona')
+  })
+})
+
+test('cli-hop keeps the live counter inside the replay prefix', () => {
+  withSystemMode(undefined, () => {
+    const live = (n) => ({ role: 'system', content: `<system-reminder>live state ${n} alpha</system-reminder>` })
+    const first = prepareCliHopBody(
+      {
+        model: 'claude-sonnet-5',
+        max_tokens: 256,
+        messages: [{ role: 'user', content: 'u1' }, live(7)],
+      },
+      { cacheTtl: '1h' },
+    )
+    const later = prepareCliHopBody(
+      {
+        model: 'claude-sonnet-5',
+        max_tokens: 256,
+        messages: [
+          { role: 'user', content: 'u1' },
+          live(7),
+          { role: 'assistant', content: 'a1' },
+          { role: 'user', content: 'u2' },
+          live(8),
+        ],
+      },
+      { cacheTtl: '1h' },
+    )
+    // Replayed history keeps the same bytes (markers aside): first request is a prefix.
+    const plain = (message) =>
+      JSON.stringify({
+        role: message.role,
+        content: (Array.isArray(message.content) ? message.content : [{ type: 'text', text: message.content }]).map(
+          ({ cache_control: _marker, ...block }) => block,
+        ),
+      })
+    assert.equal(plain(first.messages[0]), plain(later.messages[0]))
+    assert.equal(plain(first.messages[1]), plain(later.messages[1]))
+    assert.equal(later.messages.at(-1).role, 'system')
+  })
+})
+
+test('cli-hop still lifts for Haiku, which has no mid-conversation system', () => {
+  withSystemMode(undefined, () => {
+    const body = prepareCliHopBody(
+      {
+        model: 'claude-haiku-4-5',
+        max_tokens: 256,
+        messages: [
+          { role: 'user', content: 'u1' },
+          { role: 'system', content: '<total_tokens>14955783 tokens left</total_tokens>' },
+        ],
+      },
+      { cacheTtl: '5m' },
+    )
+    assert.equal(body.messages.at(-1).role, 'user')
+    assert.equal(body.messages.at(-1).content[0].text, 'u1')
+    assert.equal(body.system.at(-1).text, '<total_tokens>15000000 tokens left</total_tokens>')
+  })
+})
+
+test('cli-hop system mode fold moves every system turn into user content', () => {
+  withSystemMode('fold', () => {
+    const body = prepareCliHopBody(
+      {
+        model: 'claude-sonnet-5',
+        max_tokens: 256,
+        messages: [
+          { role: 'user', content: 'u1' },
+          { role: 'system', content: 'mid reminder' },
+          { role: 'assistant', content: 'a1' },
+          { role: 'user', content: 'u2' },
+          { role: 'system', content: 'tail reminder' },
+        ],
+      },
+      { cacheTtl: '1h' },
+    )
+    assert.ok(body.messages.every((message) => message.role !== 'system'))
+    assert.ok(body.messages[0].content.some((block) => block.text === 'mid reminder'))
+    assert.ok(body.messages.at(-1).content.some((block) => block.text === 'tail reminder'))
+  })
+})
+
+test('cli-hop system mode lift keeps upstream lift+pin when forced', () => {
+  withSystemMode('lift', () => {
+    const body = prepareCliHopBody(
+      {
+        model: 'claude-sonnet-5',
+        max_tokens: 256,
+        messages: [
+          { role: 'user', content: 'u1' },
+          { role: 'system', content: '<total_tokens>14955783 tokens left</total_tokens>' },
+        ],
+      },
+      { cacheTtl: '1h' },
+    )
+    assert.equal(body.messages.at(-1).role, 'user')
+    assert.equal(body.system.at(-1).text, '<total_tokens>15000000 tokens left</total_tokens>')
+  })
 })
