@@ -221,3 +221,24 @@ test('ensureLocal adds a single local egress row', () => {
   assert.equal(auth.scheme, 'local')
   assert.equal(auth.url, '')
 })
+
+test('local egress probe stays direct when kin-egress is down', async () => {
+  const disabled = []
+  const pool = new ProxyPool({
+    dataDir: tmpDir(),
+    egressCheck: () => ({ ok: false, reason: 'local_network_missing' }),
+    onDisableVm: (vmId) => disabled.push(vmId),
+  })
+  pool.stopScheduler()
+  pool.ensureLocal()
+  pool.bind('px-local', 'vm-01')
+  const row = pool.state.proxies.find((p) => p.id === 'px-local')
+  const result = await pool.probeOne(row)
+  assert.equal(result.ok, true)
+  assert.equal(result.scope, 'local')
+  assert.equal(result.mode, 'direct')
+  pool._applyProbeResult(row, result)
+  assert.equal(row.status, 'ok')
+  assert.equal(row.enabled, true)
+  assert.equal(disabled.length, 0)
+})

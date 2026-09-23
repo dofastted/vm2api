@@ -1,7 +1,9 @@
 /**
- * One transparent forwarder per SOCKS5. VMs bound to that proxy join its
- * docker net; kin-egress on the host REDIRECTs the bridge into SOCKS5.
- * `px-local` / scheme=local 是本机出口：Docker MASQUERADE，不启 kin-egress。
+ * Remote SOCKS5: one docker net per proxy, kin-egress REDIRECTs that bridge.
+ * Local egress (`px-local` / scheme=local) is the host default route. Do not
+ * start kin-egress and do not treat a missing helper as "no proxy".
+ * Slot start still attaches a masquerade net so the container is not on a
+ * redirected SOCKS bridge.
  */
 import { execFileSync, spawn } from 'node:child_process'
 import fs from 'node:fs'
@@ -41,8 +43,8 @@ export function localEgressStatus(proxyOrId, run = docker) {
 }
 
 export function proxyEgressReady(proxy, projectRoot, timeoutMs = 400) {
-  const local = localEgressStatus(proxy)
-  if (local) return local
+  // Direct exit. kin-egress not running is success, not egress_down.
+  if (isLocalEgressProxy(proxy)) return { ok: true, mode: 'direct' }
   return egressListening(projectRoot, proxy?.id, timeoutMs)
 }
 
@@ -309,8 +311,9 @@ export function inspectEgressProcess(projectRoot, proxyId) {
 }
 
 export function egressListening(projectRoot, proxyId, timeoutMs = 400) {
-  const local = localEgressStatus(proxyId)
-  if (local) return local
+  if (isLocalEgressProxy(typeof proxyId === 'object' ? proxyId : { id: proxyId })) {
+    return { ok: true, mode: 'direct' }
+  }
   const st = inspectEgressProcess(projectRoot, proxyId)
   if (!st.ok) return st
   const spec = String(st.listen_tcp || '')

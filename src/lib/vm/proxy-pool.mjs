@@ -698,20 +698,8 @@ export class ProxyPool {
    */
   async probeOne(proxy) {
     if (isLocalEgressProxy(proxy)) {
-      if (typeof this.egressCheck !== 'function') {
-        return { ok: true, scope: 'local', latency_ms: 0 }
-      }
-      let eg = this.egressCheck(proxy)
-      if (!eg?.ok && typeof this.repairEgress === 'function') {
-        try {
-          this.repairEgress(proxy)
-        } catch {
-          /* keep */
-        }
-        eg = this.egressCheck(proxy)
-      }
-      if (eg?.ok) return { ok: true, scope: 'local', latency_ms: 0 }
-      return { ok: false, scope: 'egress', socks_ok: true, latency_ms: 0, error: eg?.reason || 'local_network_missing' }
+      // Host default route. A down kin-egress is not "no proxy".
+      return { ok: true, scope: 'local', mode: 'direct', latency_ms: 0 }
     }
     const socks = await this._probeSocks(proxy)
     if (!socks.ok) return { ...socks, scope: 'socks' }

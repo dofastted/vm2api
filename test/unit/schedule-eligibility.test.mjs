@@ -268,6 +268,13 @@ test('proxy desync is fail-closed before hop', () => {
   assert.equal(evaluateProxySync({ vm: v, workerProxyEndpoint: null, egressMode: 'transparent' }).ok, true)
 })
 
+test('local egress stays schedulable when the worker proxy url is empty', () => {
+  const v = vm()
+  v.proxy = { id: 'px-local', scheme: 'local', host: 'local', port: 0, url: null }
+  assert.equal(evaluateProxySync({ vm: v, workerProxyEndpoint: null }).ok, true)
+  assert.equal(evaluateProxySync({ vm: v, workerProxyEndpoint: '' }).ok, true)
+})
+
 test('paused slot without SOCKS is proxy_required even if pin would skip unschedulable', () => {
   const paused = {
     id: 'vm-01',

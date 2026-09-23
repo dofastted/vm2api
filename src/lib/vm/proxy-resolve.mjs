@@ -34,6 +34,8 @@ function socksUrlFromVm(vm) {
 
 export function poolProxyUnavailable(hit) {
   if (!hit) return false
+  // Direct exit. A stale fail/dead from the old kin-egress probe is not "no proxy".
+  if (isLocalEgressProxy(hit)) return hit.enabled === false
   return !hit.enabled || hit.status === 'dead' || hit.status === 'fail'
 }
 

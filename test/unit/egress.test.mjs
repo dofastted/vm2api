@@ -15,6 +15,8 @@ import {
   iptablesPlan,
   isLocalEgressProxy,
   localEgressStatus,
+  egressListening,
+  proxyEgressReady,
   networkName,
   portsForProxy,
   slotNetworkForVm,
@@ -108,4 +110,13 @@ test('local egress health follows the masquerade net for any local row', () => {
   assert.equal(miss.ok, false)
   assert.equal(miss.reason, 'local_network_missing')
   assert.equal(localEgressStatus({ id: 'px-socks', host: '10.0.0.1', port: 1080 }), null)
+})
+
+test('local egress readiness is direct and does not require kin-egress', () => {
+  const ready = proxyEgressReady({ id: LOCAL_EGRESS_ID, scheme: 'local', host: 'local', port: 0 })
+  assert.equal(ready.ok, true)
+  assert.equal(ready.mode, 'direct')
+  const listen = egressListening('/tmp/does-not-matter', LOCAL_EGRESS_ID)
+  assert.equal(listen.ok, true)
+  assert.equal(listen.mode, 'direct')
 })

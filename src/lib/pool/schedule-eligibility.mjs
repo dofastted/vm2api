@@ -2,7 +2,7 @@
  * Single schedulability gate shared by the pool picker and the panel.
  * Green on the console must mean the scheduler will actually select the slot.
  */
-import { hasBoundExit } from '../vm/egress.mjs'
+import { hasBoundExit, isLocalEgressProxy } from '../vm/egress.mjs'
 import { isVmScheduleReady, vmHasClaudeCredential, isCodexVm } from '../vm/vm-registry.mjs'
 import { expiresAtToMs, hasRefreshPresence } from '../oauth/oauth-credentials.mjs'
 import { rustKernelBusy } from '../transport/rust-kernel-client.mjs'
@@ -96,6 +96,7 @@ export function evaluateSlotGate(vm) {
 export const WORKER_PROXY_UNKNOWN = undefined
 
 export function evaluateProxySync({ vm, workerProxyEndpoint = WORKER_PROXY_UNKNOWN, egressMode = '' } = {}) {
+  if (isLocalEgressProxy(vm?.proxy)) return { ok: true }
   if (String(egressMode || '').trim() === 'transparent') return { ok: true }
   const wantHost = vm?.proxy?.host
   const wantPort = vm?.proxy?.port

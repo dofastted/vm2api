@@ -134,6 +134,7 @@ export function containerHasKernelMount(name) {
 }
 
 function vmWantsOuterSocks(vm) {
+  if (isLocalEgressProxy(vm?.proxy)) return false
   return !!(vm?.proxy_cli_enabled && vm?.proxy && (vm.proxy.host || vm.proxy.url))
 }
 
@@ -143,6 +144,9 @@ export function socksUidFor(vm) {
 }
 
 export function ensureOuterSocks(vm) {
+  if (isLocalEgressProxy(vm?.proxy)) {
+    return { ok: true, uid: socksUidFor(vm), transport: 'direct', direct: true }
+  }
   if (vm?.proxy_required === false && !vmWantsOuterSocks(vm)) {
     return { ok: true, uid: socksUidFor(vm), transport: 'go-explicit-socks5', proxy_optional: true }
   }
