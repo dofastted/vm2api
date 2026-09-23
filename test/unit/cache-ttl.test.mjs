@@ -3,9 +3,11 @@ import assert from 'node:assert/strict'
 import {
   applyCacheTtlToBody,
   applyCacheTtlToUsage,
+  clearConversationCacheTtls,
   DEFAULT_CACHE_TTL,
   enforceCacheTtlOrder,
   normalizeCacheTtl,
+  pinConversationCacheTtl,
   resolveCacheTtl,
   stripIllegalCacheControlFields,
 } from '../../src/lib/protocol/cache-ttl.mjs'
@@ -29,21 +31,32 @@ test('header overrides routing default', () => {
   assert.equal(resolveCacheTtl({ headers: {}, routing: { compatibility: { cache_ttl: '5m' } } }), '5m')
 })
 
-test('official traffic keeps caller TTLs instead of applying gateway policy', () => {
-  assert.equal(
-    resolveCacheTtl({
-      officialTraffic: true,
-      headers: { 'x-kin-cache-ttl': '5m' },
-      body: {
-        system: [{ cache_control: { type: 'ephemeral', ttl: '1h' } }],
-        messages: [
-          { role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral', ttl: '5m' } }] },
-        ],
-      },
-      routing: { compatibility: { cache_ttl: '5m' } },
-    }),
-    null,
-  )
+test('ttl-less markers (official Claude Code) take the settings menu value', () => {
+  const body = {
+    system: [{ type: 'text', text: 's', cache_control: { type: 'ephemeral' } }],
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral' } }] }],
+  }
+  assert.equal(resolveCacheTtl({ headers: {}, body, routing: { compatibility: { cache_ttl: '1h' } } }), '1h')
+  assert.equal(resolveCacheTtl({ headers: {}, body, routing: { compatibility: { cache_ttl: '5m' } } }), '5m')
+  const out = applyCacheTtlToBody(body, '1h')
+  assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.deepEqual(out.messages[0].content[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+})
+
+test('a conversation keeps its first TTL until that cache would have expired', () => {
+  clearConversationCacheTtls()
+  const t0 = 1_000_000
+  assert.equal(pinConversationCacheTtl('conv-a', '5m', t0), '5m')
+  // Menu flipped to 1h mid-conversation: still 5m while the 5m cache is warm.
+  assert.equal(pinConversationCacheTtl('conv-a', '1h', t0 + 4 * 60_000), '5m')
+  // Each turn refreshes the window.
+  assert.equal(pinConversationCacheTtl('conv-a', '1h', t0 + 8 * 60_000), '5m')
+  // Idle longer than 5m: the cache is gone, so the new value applies.
+  assert.equal(pinConversationCacheTtl('conv-a', '1h', t0 + 14 * 60_000), '1h')
+  assert.equal(pinConversationCacheTtl('conv-b', '5m', t0), '5m', 'conversations are independent')
+  assert.equal(pinConversationCacheTtl('', '5m', t0), '5m')
+  assert.equal(pinConversationCacheTtl('', '1h', t0), '1h', 'no key means no pin')
+  clearConversationCacheTtls()
 })
 
 test('explicit inbound 5m or 1h overrides the console default', () => {

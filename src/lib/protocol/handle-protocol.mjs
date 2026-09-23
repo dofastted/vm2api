@@ -94,7 +94,12 @@ import {
   personaHideForUnofficial,
   personaHideForCliZero,
 } from '../identity/crs-persona-usage.mjs'
-import { applyCacheTtlToUsage, cacheBreakpointsFromRoutingFile, resolveCacheTtl } from './cache-ttl.mjs'
+import {
+  applyCacheTtlToUsage,
+  cacheBreakpointsFromRoutingFile,
+  pinConversationCacheTtl,
+  resolveCacheTtl,
+} from './cache-ttl.mjs'
 import { ensureClaudeWebSearch, shouldInjectClaudeWebSearch } from './web-search.mjs'
 import { dispatchStreamInference } from '../transport/kernel-router.mjs'
 import { syncClaudeKernelConfigsFromFile } from '../transport/rust-kernel-supervisor.mjs'
@@ -575,12 +580,10 @@ export function createHandleProtocol(deps) {
       boundSessionId: stickyBound?.sessionId || '',
       boundAccountId: stickyBound?.accountId || '',
     })
-    const requestedCacheTtl = resolveCacheTtl({
-      headers: req.headers,
-      body: inbound,
-      routingFile: routingConfigPath,
-      officialTraffic,
-    })
+    const requestedCacheTtl = pinConversationCacheTtl(
+      outboundSessionId,
+      resolveCacheTtl({ headers: req.headers, body: inbound, routingFile: routingConfigPath }),
+    )
     let cacheTtl = requestedCacheTtl
     let preserveCacheBreakpoints = false
     const cacheBreakpoints = cacheBreakpointsFromRoutingFile(routingConfigPath)
