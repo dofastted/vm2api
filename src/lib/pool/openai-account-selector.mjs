@@ -39,7 +39,8 @@ export function capacityUtilization(candidate, defaultConcurrency) {
 export function smartScore(candidate, defaultConcurrency) {
   const load = 1 - Math.min(1, Math.max(0, capacityUtilization(candidate, defaultConcurrency)))
   const rank = candidate?.quotaRemainingRank
-  const quota = rank == null || !Number.isFinite(Number(rank)) ? 0.5 : Math.min(10_000, Math.max(0, Number(rank))) / 10_000
+  const quota =
+    rank == null || !Number.isFinite(Number(rank)) ? 0.5 : Math.min(10_000, Math.max(0, Number(rank))) / 10_000
   const failureBps = Math.min(10_000, Math.max(0, Number(candidate?.failureRateBps || 0)))
   const failure = 1 - failureBps / 10_000
   const latencyMs = Number(candidate?.firstOutputLatencyMs)

@@ -400,4 +400,3 @@ test('nested Responses cached_tokens reaches the request log cache column', asyn
   assert.equal(logBag.cache_read_tokens, 8)
   fs.rmSync(root, { recursive: true, force: true })
 })
-

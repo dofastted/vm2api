@@ -1,10 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import {
-  orderOpenAIAccounts,
-  selectOpenAIAccount,
-  smartScore,
-} from '../../src/lib/pool/openai-account-selector.mjs'
+import { orderOpenAIAccounts, selectOpenAIAccount, smartScore } from '../../src/lib/pool/openai-account-selector.mjs'
 import {
   reportOpenAIAttempt,
   resetOpenAIAccountRuntime,
