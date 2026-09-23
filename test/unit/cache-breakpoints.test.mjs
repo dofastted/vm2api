@@ -273,12 +273,51 @@ test('off leaves messages untouched', () => {
   const body = { messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }] }] }
   assert.equal(applyMessageBreakpoints(body, '5m', 'off'), body)
 })
+test('tail mode marks only the current message', () => {
+  const out = applyMessageBreakpoints(
+    {
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'u1' }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'a1' }] },
+        { role: 'user', content: [{ type: 'text', text: 'u2' }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'a2' }] },
+        { role: 'user', content: [{ type: 'text', text: 'u3' }] },
+      ],
+    },
+    '1h',
+    'tail',
+  )
+  assert.equal(out.messages[2].content[0].cache_control, undefined)
+  assert.deepEqual(out.messages[4].content[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+})
 
 test('a string content block is promoted so the marker has somewhere to live', () => {
   const out = applyMessageBreakpoints({ messages: [{ role: 'user', content: 'plain' }] }, '5m', 'fill')
   assert.deepEqual(out.messages[0].content, [
     { type: 'text', text: 'plain', cache_control: { type: 'ephemeral', ttl: '5m' } },
   ])
+})
+
+test('rewrite stamps the last non-thinking content block', () => {
+  const out = applyMessageBreakpoints(
+    {
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'answer' },
+            { type: 'thinking', thinking: 'hidden', signature: 'sig' },
+            { type: 'redacted_thinking', data: 'redacted' },
+          ],
+        },
+      ],
+    },
+    '1h',
+    'rewrite',
+  )
+  assert.deepEqual(out.messages[0].content[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.equal(out.messages[0].content[1].cache_control, undefined)
+  assert.equal(out.messages[0].content[2].cache_control, undefined)
 })
 
 test('an inbound 1h request is injected at 1h so enforceCacheTtlOrder cannot downgrade it', () => {
@@ -336,15 +375,12 @@ test('a thinking block never keeps cache_control', () => {
   assert.equal(breakpoints(out).length, 0)
 })
 
-test('over the four-breakpoint budget, tools are sacrificed and system is kept', () => {
+test('over the four-breakpoint budget, message anchors are kept over system extras', () => {
   const mark = { type: 'ephemeral', ttl: '5m' }
   const out = prepareAnthropicRequest({
     model: 'claude-opus-4-6',
     max_tokens: 4096,
-    tools: [
-      { name: 'a', input_schema: {}, cache_control: { ...mark } },
-      { name: 'b', input_schema: {}, cache_control: { ...mark } },
-    ],
+    tools: [{ name: 'a', input_schema: {}, cache_control: { ...mark } }],
     system: [
       { type: 'text', text: 's1', cache_control: { ...mark } },
       { type: 'text', text: 's2', cache_control: { ...mark } },

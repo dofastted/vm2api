@@ -10,7 +10,6 @@ import {
   ensureClearThinkingContextManagement,
   stripInvalidThinkingBlocks,
   alignSamplingWithThinking,
-  enforceCacheLimit,
 } from './anthropic-policy.mjs'
 import { ensureUnofficialAdaptiveThinking, ensureUnofficialEffortHigh, normalizeThinkingForModel } from './thinking.mjs'
 import {
@@ -37,8 +36,7 @@ import {
 import {
   applyCacheTtlToBody,
   enforceCacheTtlOrder,
-  injectToolsTailBreakpoint,
-  normalizeCacheTtl,
+  removeCacheControlFields,
   stripIllegalCacheControlFields,
 } from './cache-ttl.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
@@ -73,16 +71,6 @@ export function stripCliOwnedSystem(system) {
   const kept = system.filter((block) => !isCliOwnedSystemText(systemBlockText(block)))
   return kept.length ? kept : undefined
 }
-
-/** sub2api default: keep the caller's system and message anchors. Node only
- * fills the last non-deferred tool, which is the stable tools prefix. */
-export const CLI_HOP_CACHE_BREAKPOINTS = Object.freeze({
-  enabled: true,
-  preserve_client: true,
-  system_tail: false,
-  tools_tail: true,
-  messages: 'off',
-})
 
 /** Official Claude Code 2.1.278 context block. A live counter here changes the cached prefix. */
 const OFFICIAL_CONTEXT_BUDGET = '<total_tokens>15000000 tokens left</total_tokens>'
@@ -192,17 +180,7 @@ function liftTrailingSystemMessages(body) {
 }
 
 /** Caller fields only. CLI owns UA / billing / metadata / layoutSystemBlocks. */
-export function prepareCliHopBody(
-  canonicalBody,
-  {
-    stream = true,
-    repaired = false,
-    cacheBreakpoints = CLI_HOP_CACHE_BREAKPOINTS,
-    cacheControlLimit = 4,
-    cacheTtl = null,
-    unofficial: _unofficial = false,
-  } = {},
-) {
+export function prepareCliHopBody(canonicalBody, { stream = true, repaired = false } = {}) {
   let body = officialMessagesBody(canonicalBody, { stream })
   delete body.metadata
   // Wrap CLI (Claude Code) throws a fatal "max_output_tokens" error if response reaches max_tokens.
@@ -228,14 +206,7 @@ export function prepareCliHopBody(
   body = applyOpus55RequestRules(body)
   body = alignSamplingWithThinking(body)
   body = stripIllegalCacheControlFields(body)
-  // Menu cache_ttl (default 1h). Do not pin a second value here.
-  const ttl = normalizeCacheTtl(cacheTtl)
-  if (cacheBreakpoints?.enabled !== false) {
-    body = injectToolsTailBreakpoint(body, ttl)
-    body = applyCacheTtlToBody(body, ttl)
-  }
-  body = enforceCacheTtlOrder(body)
-  enforceCacheLimit(body, cacheControlLimit)
+  body = removeCacheControlFields(body)
   return body
 }
 /** Wrap CLI process is spawned as sonnet-5/adaptive. Haiku rejects thinking. */

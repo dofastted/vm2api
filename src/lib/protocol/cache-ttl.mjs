@@ -135,6 +135,27 @@ export function stripIllegalCacheControlFields(body) {
   }
   return out
 }
+/** Native Claude Code owns final cache markers; Node must not leak stale anchors. */
+export function removeCacheControlFields(body) {
+  if (!body || typeof body !== 'object') return body
+  const out = { ...body }
+  delete out.cache_control
+  const clearNode = (node) => {
+    if (!node || typeof node !== 'object') return node
+    const next = { ...node }
+    delete next.cache_control
+    return next
+  }
+  if (Array.isArray(out.tools)) out.tools = out.tools.map(clearNode)
+  if (Array.isArray(out.system)) out.system = out.system.map(clearNode)
+  if (Array.isArray(out.messages)) {
+    out.messages = out.messages.map((message) => {
+      if (!Array.isArray(message?.content)) return message
+      return { ...message, content: message.content.map(clearNode) }
+    })
+  }
+  return out
+}
 
 function dropScopeOnNode(node) {
   if (!node || typeof node !== 'object' || !node.cache_control) return node
@@ -255,7 +276,7 @@ export function applyCacheTtlToBody(body, ttl = DEFAULT_CACHE_TTL) {
   )
 }
 
-export const MESSAGES_BREAKPOINT_MODES = Object.freeze(['off', 'fill', 'rewrite', 'cli-hop'])
+export const MESSAGES_BREAKPOINT_MODES = Object.freeze(['off', 'fill', 'rewrite', 'tail', 'cli-hop'])
 
 /**
  * Anthropic only caches a prefix that ends at a breakpoint, so a body with no
@@ -267,8 +288,8 @@ export const DEFAULT_CACHE_BREAKPOINTS = Object.freeze({
   preserve_client: true,
   system_tail: true,
   tools_tail: true,
-  // rewrite: Claude Code stamps the current last user; fill would leave that
-  // wandering marker and freeze hits at the system prefix (~43.5k).
+  // rewrite removes caller-owned markers before rebuilding proxy-owned anchors.
+  // cli-hop overrides this with the current Claude Code single-tail policy.
   messages: 'rewrite',
 })
 
@@ -278,6 +299,7 @@ export function normalizeMessagesBreakpointMode(value) {
     .toLowerCase()
   if (raw === 'off' || raw === 'none' || raw === 'false' || raw === '0' || raw === 'disabled') return 'off'
   if (raw === 'cli-hop' || raw === 'cli' || raw === 'leftover') return 'cli-hop'
+  if (raw === 'tail' || raw === 'current-tail' || raw === 'single') return 'tail'
   if (raw === 'rewrite' || raw === 'replace' || raw === 'restamp' || raw === 'auto') return 'rewrite'
   if (raw === 'fill' || raw === 'true' || raw === '1') return 'fill'
   return DEFAULT_CACHE_BREAKPOINTS.messages
@@ -501,7 +523,7 @@ function dropMessageBreakpoints(messages) {
   return changed ? next : messages
 }
 
-/** A string content block has no place to hang the marker, so promote it first. */
+/** Promote strings and stamp the last non-thinking content block. */
 function stampMessageTail(messages, idx, ttl) {
   const message = messages[idx]
   if (!message || typeof message !== 'object') return messages
@@ -512,23 +534,26 @@ function stampMessageTail(messages, idx, ttl) {
     return next
   }
   if (!Array.isArray(content) || content.length === 0) return messages
-  const last = content.length - 1
-  const stamped = stampNode(content[last], ttl)
-  if (stamped === content[last]) return messages
+  let target = -1
+  for (let i = content.length - 1; i >= 0; i--) {
+    if (content[i]?.type === 'thinking' || content[i]?.type === 'redacted_thinking') continue
+    target = i
+    break
+  }
+  if (target < 0) return messages
+  const stamped = stampNode(content[target], ttl)
+  if (stamped === content[target]) return messages
   const nextContent = content.slice()
-  nextContent[last] = stamped
+  nextContent[target] = stamped
   const next = messages.slice()
   next[idx] = { ...message, content: nextContent }
   return next
 }
 
 /**
- * Last message plus, when messages.length >= 4, the second-to-last user
- * (sub2api/Parrot addMessageCacheBreakpoints). CLI hop then drops the last
- * marker because wrap CLI restamps the current last user.
- *
- * `fill` leaves a body that already carries caller breakpoints alone.
- * `rewrite` drops everything, then re-mark.
+ * `tail` matches current Claude Code: exactly one message-level marker on the
+ * current tail. `rewrite` retains the generic Messages two-anchor policy.
+ * `fill` preserves caller markers and uses that policy only when none exist.
  */
 function penultimateUserIndex(messages) {
   if (!Array.isArray(messages) || messages.length < 4) return -1
@@ -552,8 +577,10 @@ export function applyMessageBreakpoints(body, ttl = DEFAULT_CACHE_TTL, mode = DE
     return messages === body.messages ? body : { ...body, messages }
   }
   messages = stampMessageTail(messages, messages.length - 1, target)
-  const prevUser = penultimateUserIndex(messages)
-  if (prevUser >= 0) messages = stampMessageTail(messages, prevUser, target)
+  if (resolved !== 'tail') {
+    const prevUser = penultimateUserIndex(messages)
+    if (prevUser >= 0) messages = stampMessageTail(messages, prevUser, target)
+  }
   return messages === body.messages ? body : { ...body, messages }
 }
 

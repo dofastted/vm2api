@@ -73,10 +73,11 @@ export function enforceCacheLimit(body, maximum = 4) {
   }
   const live = locations.filter((location) => location.block?.cache_control)
   if (live.length <= maximum) return
-  // Sacrifice tools first, then messages, and give up system breakpoints last:
-  // system covers the longest prefix shared across every request on the account.
+  // Keep the message anchors: they advance the cache prefix on every turn.
+  // Tools are the cheapest to sacrifice, while system breakpoints preserve the
+  // stable persona prefix shared by the whole session.
   const bySection = (name) => live.filter((location) => location.section === name)
-  const order = [...bySection('tools').reverse(), ...bySection('messages'), ...bySection('system').reverse()]
+  const order = [...bySection('tools').reverse(), ...bySection('system').reverse(), ...bySection('messages')]
   for (const location of order.slice(0, live.length - maximum)) {
     delete location.block.cache_control
   }

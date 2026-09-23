@@ -794,10 +794,11 @@ export function createHandleProtocol(deps) {
           const cliHop = resolveOfficialCcInference(selected.vm, routingNow) === 'cli-hop'
           let hopBody = body
           if (cliHop) {
-            preserveCacheBreakpoints = true
             const repaired = extra.repaired === true
             const resolvedPersona = resolveSlotPersonaPreset(selected.vm, routingNow)
-            if (!officialTraffic) {
+            const cliAppliesNodePersona =
+              !officialTraffic && resolvedPersona !== 'zero' && resolvedPersona !== 'official_full'
+            if (cliAppliesNodePersona) {
               hopBody = applyCrsUnofficialPersona(structuredClone(personaIn), {
                 officialClient: false,
                 routingFile: routingConfigPath,
@@ -809,14 +810,9 @@ export function createHandleProtocol(deps) {
                 identity,
               })
             }
-            const cliAppliesNodePersona = !officialTraffic && resolvedPersona !== 'zero'
             hopBody = prepareCliHopBody(repaired ? body : hopBody, {
               stream: upstreamStream,
               repaired,
-              cacheBreakpoints,
-              cacheControlLimit: Number(getRouting()?.compatibility?.cache_control_limit) || 4,
-              cacheTtl,
-              unofficial: !officialTraffic,
             })
             hopBody = await materializeRemoteImageSources(hopBody)
             if (identity) {
