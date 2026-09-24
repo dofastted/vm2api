@@ -269,12 +269,30 @@ export type Vm = {
   [key: string]: unknown
 }
 
+/** `billing.by_model` 一行：同一上游模型按计费档位（tier / speed / 长上下文）拆开。 */
+export type VmBillingModelRow = {
+  model: string
+  /** 规范化后的 OpenAI 档位：`fast`（含 priority）、`flex` 或其它原值；标准档为 null */
+  service_tier?: string | null
+  /** Anthropic fast 模式为 `fast`，否则 null */
+  speed?: string | null
+  long_context?: number
+  requests: number
+  unpriced_requests?: number
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_creation_tokens: number
+  total_cost: number
+}
+
 export type VmDetailPayload = {
   vm?: Vm
   kernel?: VmKernelSnapshot | null
   proxy?: VmProxySnap | null
   account?: Record<string, unknown> | null
-  billing?: Record<string, unknown> | null
+  billing?:
+    (Record<string, unknown> & { by_model?: VmBillingModelRow[] }) | null
   [key: string]: unknown
 }
 

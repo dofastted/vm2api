@@ -48,6 +48,7 @@ test('ownerBilling and query hide other tenants', () => {
   assert.equal(billed.items.length, 1)
   assert.equal(billed.items[0].vm_id, 'vm-a')
   assert.equal(billed.items[0].cost_usd, 1)
+  assert.equal(billed.items[0].official_cost_usd, 1)
 
   const listed = logs.query({ owner_user_id: 'user-a' })
   assert.equal(listed.total, 1)
@@ -55,4 +56,14 @@ test('ownerBilling and query hide other tenants', () => {
 
   assert.equal(logs.belongsToOwner('r1', 'user-a'), true)
   assert.equal(logs.belongsToOwner('r2', 'user-a'), false)
+})
+
+test('ownerBilling exposes official cost next to rate-multiplied cost', () => {
+  const { logs } = tmpRepo()
+  logs.insertSummary(row({ id: 'm1', request_id: 'rm1', vm_id: 'vm-x', total_cost: 1, actual_cost: 2 }))
+  const billed = logs.ownerBilling({ groupBy: 'vm' })
+  assert.equal(billed.totals.cost_usd, 2)
+  assert.equal(billed.totals.official_cost_usd, 1)
+  assert.equal(billed.items[0].cost_usd, 2)
+  assert.equal(billed.items[0].official_cost_usd, 1)
 })

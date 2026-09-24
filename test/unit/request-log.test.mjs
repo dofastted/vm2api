@@ -142,6 +142,68 @@ test('backfillMissingCosts restores actual cost with the stored group multiplier
   assert.equal(store.repo.backfillMissingCosts(), 0)
 })
 
+function finishWith(store, model, usage) {
+  const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { protocol: 'x', pathName: '/v1' })
+  return store.finish(ctx, { status: 200, model, upstream_model: model, vm_id: 'vm-t', account_id: 'acc-t', usage })
+}
+
+test('tier-unpriced rows stay unpriced after backfill', () => {
+  const store = tmpStore('normal')
+  // gpt-5.5 publishes no >272K fast column; gpt-5.3-codex has no flex band.
+  const a = finishWith(store, 'gpt-5.5', { input_tokens: 1_000_000, output_tokens: 0, service_tier: 'priority' })
+  const b = finishWith(store, 'gpt-5.3-codex', { input_tokens: 1000, output_tokens: 0, service_tier: 'flex' })
+  assert.equal(a.total_cost, null)
+  assert.equal(a.pricing_model, 'unpriced')
+  assert.equal(a.service_tier, 'priority')
+  assert.equal(b.pricing_model, 'unpriced')
+  store.repo.billingStats()
+  const rows = store.db.prepare('SELECT total_cost, actual_cost, pricing_model FROM usage_logs ORDER BY id').all()
+  for (const r of rows) {
+    assert.equal(r.total_cost, null)
+    assert.equal(r.actual_cost, null)
+    assert.equal(r.pricing_model, 'unpriced')
+  }
+})
+
+test('backfill reprices with the stored service tier and speed', () => {
+  const store = tmpStore('normal')
+  const insert = store.db.prepare(`
+    INSERT INTO usage_logs (id, request_id, created_at, model, upstream_model, status,
+      input_tokens, output_tokens, service_tier, speed)
+    VALUES (?, ?, ?, ?, ?, 200, ?, 0, ?, ?)
+  `)
+  const now = new Date().toISOString()
+  // 100K stays under the 272K long-context threshold → plain flex band ($2.5/MTok input).
+  insert.run('log_bf_flex', 'rid_bf_flex', now, 'gpt-5.5', 'gpt-5.5', 100_000, 'flex', null)
+  insert.run('log_bf_fast', 'rid_bf_fast', now, 'claude-opus-4-8', 'claude-opus-4-8', 1_000_000, null, 'fast')
+  insert.run('log_bf_weird', 'rid_bf_weird', now, 'gpt-5.5', 'gpt-5.5', 1000, 'weird', null)
+  store.repo.backfillMissingCosts()
+  const got = Object.fromEntries(
+    store.db
+      .prepare("SELECT id, total_cost, pricing_model FROM usage_logs WHERE id LIKE 'log_bf_%'")
+      .all()
+      .map((r) => [r.id, [r.total_cost, r.pricing_model]]),
+  )
+  assert.deepEqual(got.log_bf_flex, [0.25, 'gpt-5.5'])
+  assert.deepEqual(got.log_bf_fast, [10, 'opus-4.5'])
+  assert.deepEqual(got.log_bf_weird, [null, 'unpriced'])
+  assert.equal(store.repo.backfillMissingCosts(), 0)
+})
+
+test('costByModel splits rows by billing band', () => {
+  const store = tmpStore('normal')
+  finishWith(store, 'claude-opus-4-8', { input_tokens: 1_000_000, output_tokens: 0, speed: 'fast' })
+  finishWith(store, 'claude-opus-4-8', { input_tokens: 1_000_000, output_tokens: 0 })
+  const rows = store.repo.costByModel({ vmId: 'vm-t' })
+  assert.equal(rows.length, 2)
+  const fast = rows.find((r) => r.speed === 'fast')
+  const std = rows.find((r) => r.speed !== 'fast')
+  assert.equal(fast.total_cost, 10)
+  assert.equal(fast.requests, 1)
+  assert.equal(std.total_cost, 5)
+  assert.equal(std.long_context, 0)
+})
+
 test('zero group multiplier keeps usage and key counters but charges no USD', () => {
   const store = tmpStore('normal')
   const groups = new GroupsRepo(store.db)

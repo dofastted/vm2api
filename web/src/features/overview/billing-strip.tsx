@@ -27,10 +27,12 @@ export function BillingStrip({
   const byId = indexVms(vms)
   let claudeCost = 0
   let gptCost = 0
+  // 与今日/累计同口径：官方价（total_cost），不乘分组倍率。
   for (const item of owned.data?.items || []) {
     const vm = item.vm_id ? byId.get(item.vm_id) : undefined
-    if (isCodexVm(vm)) gptCost += Number(item.cost_usd || 0)
-    else claudeCost += Number(item.cost_usd || 0)
+    const cost = Number(item.official_cost_usd ?? 0)
+    if (isCodexVm(vm)) gptCost += cost
+    else claudeCost += cost
   }
   if (!owned.data?.items?.length) {
     for (const vm of vms || []) {

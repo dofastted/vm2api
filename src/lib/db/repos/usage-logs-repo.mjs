@@ -17,7 +17,7 @@ import {
   ingressAuthSql,
   slaOkErrorSqlList,
 } from '../../admin/error-class.mjs'
-import { calculateCost, emptyCostBucket, shanghaiDayStartIso } from '../../admin/pricing.mjs'
+import { calculateCost, emptyCostBucket, shanghaiDayStartIso, UNPRICED_MODEL } from '../../admin/pricing.mjs'
 import { cacheHitStats } from '../../admin/cache-metrics.mjs'
 
 const IGNORED_CODES_SQL = ignoredErrorSqlList()
@@ -76,6 +76,9 @@ const SUMMARY_COLUMNS = [
   'group_id',
   'actual_cost',
   'rate_multiplier',
+  'service_tier',
+  'speed',
+  'long_context',
 ]
 
 function toRow(rec) {
@@ -433,17 +436,19 @@ export class UsageLogsRepo {
   }
 
   /**
-   * Fill official-standard cost on rows that predate the billing columns.
-   * Idempotent; skips rows that already have total_cost.
+   * Fill official cost on rows that predate the billing columns, re-pricing with the
+   * stored service_tier / speed. Rows the pricer cannot price are marked 'unpriced'
+   * (cost stays NULL) so they are never guessed at standard rates. Idempotent.
    */
   backfillMissingCosts({ limit = 4000 } = {}) {
     const rows = this.db
       .prepare(`
       SELECT id, model, upstream_model, requested_model,
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-             cache_creation_5m_tokens, cache_creation_1h_tokens, rate_multiplier
+             cache_creation_5m_tokens, cache_creation_1h_tokens, rate_multiplier,
+             service_tier, speed
       FROM usage_logs
-      WHERE total_cost IS NULL
+      WHERE total_cost IS NULL AND pricing_model IS NULL
       LIMIT ?
     `)
       .all(Math.max(1, Math.min(20000, Number(limit) || 4000)))
@@ -451,7 +456,8 @@ export class UsageLogsRepo {
     const upd = this.db.prepare(`
       UPDATE usage_logs
          SET input_cost = ?, output_cost = ?, cache_read_cost = ?,
-             cache_creation_cost = ?, total_cost = ?, actual_cost = ?, pricing_model = ?
+             cache_creation_cost = ?, total_cost = ?, actual_cost = ?, pricing_model = ?,
+             long_context = ?
        WHERE id = ?
     `)
     this.db.exec('BEGIN')
@@ -459,17 +465,21 @@ export class UsageLogsRepo {
       for (const r of rows) {
         const model = r.upstream_model || r.model || r.requested_model
         const c = calculateCost(r, model)
+        if (!c.known) {
+          upd.run(null, null, null, null, null, null, UNPRICED_MODEL, null, r.id)
+          continue
+        }
         const parsedRate = r.rate_multiplier == null ? 1 : Number(r.rate_multiplier)
         const rate = Number.isFinite(parsedRate) ? parsedRate : 1
-        const totalCost = c.known ? c.total_cost : 0
         upd.run(
-          c.known ? c.input_cost : 0,
-          c.known ? c.output_cost : 0,
-          c.known ? c.cache_read_cost : 0,
-          c.known ? c.cache_creation_cost : 0,
-          totalCost,
-          totalCost * rate,
+          c.input_cost,
+          c.output_cost,
+          c.cache_read_cost,
+          c.cache_creation_cost,
+          c.total_cost,
+          c.total_cost * rate,
           c.pricing_key,
+          c.long_context ? 1 : 0,
           r.id,
         )
       }
@@ -557,13 +567,25 @@ export class UsageLogsRepo {
     }))
   }
 
-  /** Official-standard cost grouped by upstream model for one credential / slot. */
+  /**
+   * Official cost grouped by upstream model and billing band for one credential / slot.
+   * service_tier is folded to fast / flex / other-raw (standard aliases → NULL);
+   * speed is 'fast' or NULL. unpriced_requests counts rows left without an estimate.
+   */
   costByModel({ vmId = null, accountId = null, since = null, until = null } = {}) {
     const { cond, params } = filterCond({ since, until, vmId, accountId })
     const rows = this.db
       .prepare(`
       SELECT COALESCE(NULLIF(upstream_model, ''), NULLIF(model, ''), NULLIF(requested_model, ''), '—') AS model,
+             CASE
+               WHEN service_tier IS NULL OR service_tier IN ('', 'default', 'auto', 'standard') THEN NULL
+               WHEN service_tier IN ('priority', 'fast') THEN 'fast'
+               ELSE service_tier
+             END AS service_tier,
+             CASE WHEN speed = 'fast' THEN 'fast' ELSE NULL END AS speed,
+             COALESCE(long_context, 0) AS long_context,
              COUNT(*) AS requests,
+             SUM(CASE WHEN pricing_model = '${UNPRICED_MODEL}' THEN 1 ELSE 0 END) AS unpriced_requests,
              COALESCE(SUM(input_tokens), 0) AS input_tokens,
              COALESCE(SUM(output_tokens), 0) AS output_tokens,
              COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
@@ -574,14 +596,18 @@ export class UsageLogsRepo {
              COALESCE(SUM(cache_creation_cost), 0) AS cache_creation_cost,
              COALESCE(SUM(total_cost), 0) AS total_cost
       FROM usage_logs ${cond}
-      GROUP BY 1
+      GROUP BY 1, 2, 3, 4
       ORDER BY total_cost DESC, requests DESC
       LIMIT 24
     `)
       .all(...params)
     return rows.map((r) => ({
       model: r.model,
+      service_tier: r.service_tier || null,
+      speed: r.speed || null,
+      long_context: Number(r.long_context || 0),
       requests: Number(r.requests || 0),
+      unpriced_requests: Number(r.unpriced_requests || 0),
       input_tokens: Number(r.input_tokens || 0),
       output_tokens: Number(r.output_tokens || 0),
       cache_read_tokens: Number(r.cache_read_tokens || 0),
@@ -687,7 +713,8 @@ export class UsageLogsRepo {
              SUM(CASE WHEN ${ERROR_PRED} THEN 1 ELSE 0 END) AS fail,
              COALESCE(SUM(input_tokens), 0) AS tokens_in,
              COALESCE(SUM(output_tokens), 0) AS tokens_out,
-             COALESCE(SUM(COALESCE(actual_cost, total_cost, 0)), 0) AS cost_usd
+             COALESCE(SUM(COALESCE(actual_cost, total_cost, 0)), 0) AS cost_usd,
+             COALESCE(SUM(COALESCE(total_cost, 0)), 0) AS official_cost_usd
       FROM usage_logs ${cond}
     `)
       .get(...params)
@@ -699,7 +726,8 @@ export class UsageLogsRepo {
              SUM(CASE WHEN ${ERROR_PRED} THEN 1 ELSE 0 END) AS fail,
              COALESCE(SUM(input_tokens), 0) AS tokens_in,
              COALESCE(SUM(output_tokens), 0) AS tokens_out,
-             COALESCE(SUM(COALESCE(actual_cost, total_cost, 0)), 0) AS cost_usd
+             COALESCE(SUM(COALESCE(actual_cost, total_cost, 0)), 0) AS cost_usd,
+             COALESCE(SUM(COALESCE(total_cost, 0)), 0) AS official_cost_usd
       FROM usage_logs ${cond}
       GROUP BY ${groupCol}
       ORDER BY cost_usd DESC
@@ -717,6 +745,7 @@ export class UsageLogsRepo {
         tokens_in: num(totals, 'tokens_in'),
         tokens_out: num(totals, 'tokens_out'),
         cost_usd: num(totals, 'cost_usd'),
+        official_cost_usd: num(totals, 'official_cost_usd'),
       },
       items: items.map((row) => ({
         vm_id: grouped === 'vm' ? row.id || null : undefined,
@@ -727,6 +756,7 @@ export class UsageLogsRepo {
         tokens_in: num(row, 'tokens_in'),
         tokens_out: num(row, 'tokens_out'),
         cost_usd: num(row, 'cost_usd'),
+        official_cost_usd: num(row, 'official_cost_usd'),
       })),
     }
   }

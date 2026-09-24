@@ -317,6 +317,19 @@ function emptyCost(extra = {}) {
   }
 }
 
+export const UNPRICED_MODEL = 'unpriced'
+
+/** Raw billing band inputs, persisted so a later backfill re-prices with the same band. */
+export function billingBandFromUsage(usage = {}) {
+  const tier = String(usage?.service_tier ?? '')
+    .trim()
+    .toLowerCase()
+  const speed = String(usage?.speed ?? usage?.requested_speed ?? '')
+    .trim()
+    .toLowerCase()
+  return { service_tier: tier || null, speed: speed || null }
+}
+
 export function costColumnsFromUsage(usage, model) {
   const c = calculateCost(usage, model)
   return {
@@ -325,7 +338,10 @@ export function costColumnsFromUsage(usage, model) {
     cache_read_cost: c.known ? c.cache_read_cost : null,
     cache_creation_cost: c.known ? c.cache_creation_cost : null,
     total_cost: c.known ? c.total_cost : null,
-    pricing_model: c.pricing_key,
+    // 'unpriced' marks a deliberate no-estimate so backfill never guesses a price for it.
+    pricing_model: c.known ? c.pricing_key : UNPRICED_MODEL,
+    ...billingBandFromUsage(normalizeUsage(usage)),
+    long_context: c.known ? (c.long_context ? 1 : 0) : null,
   }
 }
 
