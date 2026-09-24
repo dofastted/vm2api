@@ -91,6 +91,16 @@ export type VmKernelSnapshot = {
   codex_health?: VmKernelHealth | null
 }
 
+export type VmCircuit = {
+  account_id?: string
+  state: 'closed' | 'open' | 'half_open'
+  failures: number
+  threshold: number
+  /** 毫秒时间戳；仅 open 时有值 */
+  open_until: number | null
+  open_ms: number
+}
+
 export type Vm = {
   id: string
   name?: string
@@ -133,6 +143,8 @@ export type Vm = {
   schedule_state?: 'on' | 'restricted' | 'off'
   restriction_reason?: string | null
   restriction_until?: number | null
+  /** Claude 单元熔断（Codex 为 null）。连续 5xx 达阈值后打开，到期只放 1 个探测。 */
+  circuit?: VmCircuit | null
   cooldown_until?: number
   cooldown_reason?: string
   utilization_5h?: number

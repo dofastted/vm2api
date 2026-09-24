@@ -32,6 +32,7 @@ import { StatusMark } from '@/components/status-mark'
 import { CodexKernelHealthFields } from '@/features/vm/codex-kernel-health-card'
 import { ConcRpmEditor } from '@/features/vm/conc-rpm-editor'
 import { dataplaneLabel } from '@/features/vm/dataplane-contract'
+import { CircuitField } from '@/features/vm/detail-circuit-field'
 import {
   Field,
   Meter,
@@ -251,6 +252,7 @@ export function VmStatusBoard(props: Props) {
             <Field label='冷却' compact>
               {restrictionCopy(vm)}
             </Field>
+            <CircuitField vm={vm} now={now} />
           </div>
         </div>
 

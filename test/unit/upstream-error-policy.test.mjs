@@ -281,7 +281,7 @@ test('transport timeout is not treated as a dead proxy', () => {
   assert.equal(policy.cooldownUntil, null)
 })
 
-test('529 opens the unit circuit instead of a fixed cooldown', () => {
+test('529 stays on the overload column and does not open the unit circuit', () => {
   const policy = classifyUpstreamResult(
     {
       status: 529,
@@ -293,7 +293,7 @@ test('529 opens the unit circuit instead of a fixed cooldown', () => {
   assert.equal(policy.action, 'continue')
   assert.equal(policy.reason, 'provider_overloaded')
   assert.equal(policy.cooldownUntil, null)
-  assert.equal(policy.circuit, true)
+  assert.equal(policy.circuit, undefined)
   assert.equal(policy.decision.action, 'next_unit')
 })
 

@@ -12,12 +12,7 @@
 const CIRCUIT_KEY = '__circuit'
 
 export class UnitCircuit {
-  constructor({
-    repo = null,
-    failureThreshold = 3,
-    openMs = 30_000,
-    now = () => Date.now(),
-  } = {}) {
+  constructor({ repo = null, failureThreshold = 3, openMs = 30_000, now = () => Date.now() } = {}) {
     this.repo = repo
     this.failureThreshold = Math.max(1, Number(failureThreshold) || 3)
     this.openMs = Math.max(1, Number(openMs) || 30_000)
@@ -29,8 +24,30 @@ export class UnitCircuit {
     this.repo = repo || null
   }
 
+  configure({ failureThreshold, openMs } = {}) {
+    if (failureThreshold != null) this.failureThreshold = Math.max(1, Number(failureThreshold) || 3)
+    if (openMs != null) this.openMs = Math.max(1000, Number(openMs) || 30_000)
+  }
+
   snapshot(accountId) {
     return this.units.get(accountId) || this._load(accountId)
+  }
+
+  /**
+   * Read the gate without taking the half-open probe. Eligibility scans every
+   * VM; only reserve() may call admit().
+   */
+  inspect(accountId, now = this.now()) {
+    if (!accountId) return { ok: true, state: 'closed' }
+    const unit = this._ensure(accountId, now)
+    if (unit.state === 'closed') return { ok: true, state: 'closed' }
+    if (unit.state === 'open') {
+      return { ok: false, reason: 'circuit_open', until: unit.openUntil, state: 'open' }
+    }
+    if (unit.probeHeld) {
+      return { ok: false, reason: 'circuit_probe', until: now + this.openMs, state: 'half_open' }
+    }
+    return { ok: true, state: 'half_open', probeAvailable: true }
   }
 
   /**
@@ -93,6 +110,26 @@ export class UnitCircuit {
       unit.failures = 0
       this._save(accountId, unit)
     }
+    return { ...unit }
+  }
+
+  /** Panel view. Reads without taking the probe; open past its window reads as half_open. */
+  view(accountId, now = this.now()) {
+    const unit = accountId ? this._ensure(accountId, now) : { state: 'closed', failures: 0, openUntil: 0 }
+    return {
+      state: unit.state,
+      failures: unit.failures,
+      threshold: this.failureThreshold,
+      open_until: unit.state === 'open' ? unit.openUntil : null,
+      open_ms: this.openMs,
+    }
+  }
+
+  /** Operator reset: close the unit and clear the failure streak. */
+  reset(accountId) {
+    if (!accountId) return null
+    const unit = { state: 'closed', failures: 0, openUntil: 0, probeHeld: false }
+    this._save(accountId, unit)
     return { ...unit }
   }
 

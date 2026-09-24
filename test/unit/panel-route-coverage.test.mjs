@@ -45,6 +45,7 @@ const PANEL_ROUTE_SAMPLES = [
   ['DELETE', '/api/panel/vms/vm-01'],
   ['POST', '/api/panel/vms/vm-01/schedulable'],
   ['POST', '/api/panel/vms/vm-01/cooldown/clear'],
+  ['POST', '/api/panel/vms/vm-01/circuit/reset'],
   ['POST', '/api/panel/vms/vm-01/reload'],
   ['POST', '/api/panel/vms/vm-01/collect-identity'],
   ['POST', '/api/panel/vms/vm-01/probe'],

@@ -2068,3 +2068,22 @@ test('passive quota sync never clears a live 429 block', async (t) => {
   assert.equal(runtimeRepo.get('account-1').cooldown_until, until)
   assert.equal(runtimeRepo.get('account-1').rate_limit_reset_at, until)
 })
+
+test('pinVmId still reaches a slot whose unit circuit is open', async (t) => {
+  const root = project()
+  const { unitCircuit } = await import('../../src/lib/pool/unit-circuit.mjs')
+  t.after(() => {
+    unitCircuit.reset('account-2')
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const pool = scheduler(root)
+  for (let i = 0; i < 5; i++) unitCircuit.recordFailure('account-2')
+  const open = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(open.vmId, 'vm-01')
+  open.release()
+  const pinned = await pool.selectAndReserve({ model: 'claude-test', pinVmId: 'vm-02', allowWait: false })
+  assert.equal(pinned.ok, true)
+  assert.equal(pinned.vmId, 'vm-02')
+  pinned.release()
+  assert.equal(unitCircuit.snapshot('account-2').state, 'open')
+})

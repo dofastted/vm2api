@@ -71,10 +71,16 @@
     "fallback_wait_timeout_ms": 30000,
     "sticky_wait_timeout_ms": 45000,
     "worker_health_ttl_ms": 5000,
-    "heartbeat_stale_ms": 15000
+    "heartbeat_stale_ms": 15000,
+    "circuit_failure_threshold": 3,
+    "circuit_open_ms": 30000
   },
   "failover": {
-    "max_total_attempts": 12
+    "max_total_attempts": 12,
+    "max_account_switches": 10,
+    "max_same_account_retries": 1,
+    "same_account_retry_delay_ms": 500,
+    "total_retry_deadline_ms": 120000
   },
   "inference": {
     "engine": "rust",

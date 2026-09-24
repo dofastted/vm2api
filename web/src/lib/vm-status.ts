@@ -197,6 +197,58 @@ export function credExpiry(vm: Vm): StatusTone & { ms: number | null } {
   return { cls: 'ok', key: 'ok', text: '有效', ms }
 }
 
+/**
+ * Claude 单元熔断的展示态。closed 返回 null。
+ * open 到期但还没人来探测时，后端 view 已折算成 half_open。
+ */
+export function vmCircuit(
+  vm: Vm | undefined,
+  now = Date.now()
+): {
+  state: 'open' | 'half_open'
+  failures: number
+  threshold: number
+  until: number | null
+  left: number
+} | null {
+  const c = vm?.circuit
+  if (!c || c.state === 'closed') return null
+  const until = c.state === 'open' ? Number(c.open_until || 0) || null : null
+  if (c.state === 'open' && until && until <= now) {
+    return {
+      state: 'half_open',
+      failures: c.failures,
+      threshold: c.threshold,
+      until: null,
+      left: 0,
+    }
+  }
+  return {
+    state: c.state,
+    failures: c.failures,
+    threshold: c.threshold,
+    until,
+    left: until ? until - now : 0,
+  }
+}
+
+export function vmCircuitTitle(vm: Vm | undefined, now = Date.now()): string {
+  const c = vmCircuit(vm, now)
+  if (!c) return '熔断关闭'
+  if (c.state === 'half_open')
+    return '熔断半开 · 下一个请求作为探测，成功即恢复'
+  const sec = Math.max(1, Math.ceil(c.left / 1000))
+  return `熔断中 · 连续 ${c.failures}/${c.threshold} 次 5xx · ${sec}s 后放行探测`
+}
+
+function circuitTone(vm: Vm | undefined): StatusTone | null {
+  const c = vmCircuit(vm)
+  if (!c) return null
+  return c.state === 'open'
+    ? { key: 'circuit', text: '熔断中', cls: 'bad' }
+    : { key: 'circuit', text: '熔断探测', cls: 'caution' }
+}
+
 export function vmCooldown(
   vm: Vm
 ): { until: number; reason: string; left: number } | null {
@@ -430,6 +482,11 @@ export function poolStatus(vm: Vm | undefined): StatusTone {
   // 吊销 / 废票先判：它可能同时带着 off / quota 的 availability.key，照 key
   // 判会显示成「调度关」，把真正的死因盖掉。
   if (parkedGrantDeath(vm) || vmRevoked(vm)) return invalidCredTone(vm)
+  // 调度关优先于熔断：操作员关掉的槽不显示熔断。
+  if (vm?.schedule_state !== 'off') {
+    const circuit = circuitTone(vm)
+    if (circuit) return circuit
+  }
   const restricted = restrictionTone(vm)
   if (restricted) return restricted
   if (vm?.schedule_state === 'off') {

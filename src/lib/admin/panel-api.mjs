@@ -37,6 +37,8 @@ import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from '
 import { inferClaudeTier } from '../pool/claude-tier.mjs'
 import { listQuotaFromHeaders } from '../pool/quota-window.mjs'
 import { hardBlockOf } from '../pool/rate-limit-service.mjs'
+import { unitCircuit } from '../pool/unit-circuit.mjs'
+import { accountIdOf } from '../pool/pool-scheduler.mjs'
 import { resolveCredentialScheduleLevel } from '../pool/credential-weight.mjs'
 import {
   evaluateAccount,
@@ -215,6 +217,38 @@ export function clearVmCooldown({ cfg, accountQuota, stickyRouter = null, poolSc
     usage_flag_cleared: usageFlagCleared,
     headers_refreshed: headersRefreshed,
   })
+}
+
+/** Same key as PoolScheduler: full vm record (listVms summaries drop `claude`), slot identity first. */
+function circuitViewFor(vm, projectRoot) {
+  try {
+    const full = (projectRoot && vm?.id && getVm(projectRoot, vm.id)) || vm
+    const accountId = accountIdOf(full, projectRoot || null)
+    return accountId ? { account_id: accountId, ...unitCircuit.view(accountId) } : null
+  } catch {
+    return null
+  }
+}
+
+/** POST /vms/:id/circuit/reset — operator closes a tripped Claude unit circuit. */
+export function resetVmCircuit({ cfg, poolScheduler = null, id } = {}) {
+  const vm = getVm(cfg?.paths?.project, id)
+  if (!vm) {
+    return fail(
+      makeError({
+        type: ErrorType.NOT_FOUND,
+        code: ErrorCode.VM_NOT_FOUND,
+        message: `VM '${id}' not found`,
+        status: 404,
+      }),
+    )
+  }
+  const accountId = accountIdOf(vm, cfg.paths.project)
+  if (accountId) unitCircuit.reset(accountId)
+  try {
+    poolScheduler?.notifyCapacity?.(accountId)
+  } catch {}
+  return ok({ id: vm.id, circuit: circuitViewFor(vm, cfg.paths.project) })
 }
 
 /** A stored 100% / rejected window would re-park the slot on the next schedule. */
@@ -1456,6 +1490,8 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     schedule_state: triad.schedule_state,
     restriction_reason: triad.restriction_reason,
     restriction_until: triad.restriction_until,
+    // Claude unit circuit (Codex has its own failover set and never trips it).
+    circuit: isCodex ? null : circuitViewFor(v, extras.projectRoot),
     refresh_error: v.refresh_error || v.claude?.refresh_error || runtime?.refresh_error || null,
     sessions,
     session_active: sessions.active,

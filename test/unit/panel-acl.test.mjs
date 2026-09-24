@@ -53,6 +53,7 @@ test('super can schedule VMs but cannot touch credentials or delete', () => {
   assert.equal(authorizePanelRoute('GET', '/api/panel/vms/vm-01', 'super').ok, true)
   assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/schedulable', 'super').ok, true)
   assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/cooldown/clear', 'super').ok, true)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/circuit/reset', 'super').ok, true)
   assert.equal(authorizePanelRoute('POST', '/api/panel/vms/import', 'super').ok, false)
   assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/oauth/refresh', 'super').ok, false)
   assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/oauth/generate-auth-url', 'super').ok, false)

@@ -261,3 +261,29 @@ test('GPT vm detail exposes codex_health and hides Claude kernel/official_cc', a
     },
   })
 })
+
+test('VM list exposes the Claude unit circuit and reset closes it', async (t) => {
+  const { unitCircuit } = await import('../../src/lib/pool/unit-circuit.mjs')
+  const { resetVmCircuit } = await import('../../src/lib/admin/panel-api.mjs')
+  const project = tmpDir()
+  t.after(() => {
+    unitCircuit.reset('acct-circuit')
+    fs.rmSync(project, { recursive: true, force: true })
+  })
+  writeVm(project, { id: 'vm-c1', name: 'c1', claude: { account_uuid: 'acct-circuit' } })
+  writeVm(project, { id: 'vm-x1', name: 'x1', platform: 'openai', family: 'codex' })
+  for (let i = 0; i < unitCircuit.failureThreshold; i++) unitCircuit.recordFailure('acct-circuit')
+  const cfg = { paths: { project } }
+  const listed = await buildVmList({ cfg, accountQuota: fakeQuota(), routingConfig: {} })
+  const claude = listed.data.items.find((item) => item.id === 'vm-c1')
+  assert.equal(claude.circuit.state, 'open')
+  assert.equal(claude.circuit.account_id, 'acct-circuit')
+  assert.ok(claude.circuit.open_until > Date.now())
+  assert.equal(listed.data.items.find((item) => item.id === 'vm-x1').circuit, null)
+
+  const reset = resetVmCircuit({ cfg, id: 'vm-c1' })
+  assert.equal(reset.ok, true)
+  assert.equal(reset.data.circuit.state, 'closed')
+  assert.equal(reset.data.circuit.failures, 0)
+  assert.equal(resetVmCircuit({ cfg, id: 'nope' }).status, 404)
+})

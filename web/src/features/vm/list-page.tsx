@@ -27,6 +27,7 @@ import { SlotIdentity } from '@/components/platform-chip'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
 import { usageQueryOptions } from '@/features/overview/queries'
+import { clearVmRestriction } from '@/features/vm/clear-restriction'
 import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
 import { FleetPulse } from '@/features/vm/fleet-pulse'
 import { VmListSkeleton } from '@/features/vm/list-skeleton'
@@ -94,13 +95,9 @@ export function VmListPage() {
     onError: (error: Error) => toast.error(error.message),
   })
   const clearCooldown = useMutation({
-    mutationFn: (id: string) =>
-      api(`/api/panel/vms/${encodeURIComponent(id)}/cooldown/clear`, {
-        method: 'POST',
-        body: JSON.stringify({}),
-      }),
+    mutationFn: (vm: Vm) => clearVmRestriction(vm),
     onSuccess: async () => {
-      toast.success('已恢复冷却并刷新状态')
+      toast.success('已清除冷却 / 熔断并刷新状态')
       await qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey })
     },
     onError: (error: Error) => toast.error(error.message),
@@ -204,7 +201,7 @@ export function VmListPage() {
             <VmCards
               vms={list}
               accounts={accounts}
-              onClearCooldown={(vm) => clearCooldown.mutate(vm.id)}
+              onClearCooldown={(vm) => clearCooldown.mutate(vm)}
               onReset={(vm) => {
                 setResetInput('')
                 setResetTarget(vm)
@@ -218,7 +215,7 @@ export function VmListPage() {
             <VmTable
               vms={list}
               accounts={accounts}
-              onClearCooldown={(vm) => clearCooldown.mutate(vm.id)}
+              onClearCooldown={(vm) => clearCooldown.mutate(vm)}
               onReset={(vm) => {
                 setResetInput('')
                 setResetTarget(vm)

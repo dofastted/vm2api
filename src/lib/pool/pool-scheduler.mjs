@@ -107,7 +107,7 @@ function selectionSnapshot(candidates = [], available = [], extras = {}) {
   }
 }
 
-function accountIdOf(vm, projectRoot = null) {
+export function accountIdOf(vm, projectRoot = null) {
   if (projectRoot && vm?.id) {
     const slot = readSlotCredentialIdentity(vmCliHomePath(projectRoot, vm.id))
     if (slot?.account_uuid) return slot.account_uuid
@@ -165,7 +165,8 @@ function stickyShouldWait(waitReason, cooldownReason = null) {
     waitReason === 'fable_concurrency' ||
     waitReason === 'rpm_limit' ||
     waitReason === 'slot_busy' ||
-    waitReason === 'session_slots_full'
+    waitReason === 'session_slots_full' ||
+    waitReason === 'circuit_probe'
   ) {
     return true
   }
@@ -285,7 +286,7 @@ export class PoolScheduler {
       const reserveMisses = []
       const attempted = new Set()
       while (selected) {
-        const reservation = this.reserve(selected, { sessionKey: stickyKey, skipQuota: pinned })
+        const reservation = this.reserve(selected, { sessionKey: stickyKey, skipQuota: pinned, pinned })
         if (reservation) return finishReserve(selected, reservation)
         // A sticky hit that loses the race stays on that account and waits.
         // Dropping the key here is how one conversation lands on a second session.
@@ -445,9 +446,11 @@ export class PoolScheduler {
     // passive Extra reading or health hop. Pins are diagnostics and still reach the slot.
     const hardBlock = pinned ? null : hardBlockOf(state, now)
     if (hardBlock) return { ok: false, reason: hardBlock.reason, until: hardBlock.until }
+    let circuitProbeUntil = null
     if (!pinned) {
-      const circuit = this.unitCircuit?.admit?.(accountId, now)
-      if (circuit && !circuit.ok) return { ok: false, reason: circuit.reason, until: circuit.until }
+      const circuit = this.unitCircuit?.inspect?.(accountId, now)
+      if (circuit?.reason === 'circuit_open') return { ok: false, reason: circuit.reason, until: circuit.until }
+      if (circuit?.reason === 'circuit_probe') circuitProbeUntil = circuit.until
     }
     const gate = evaluateSlotGate(vm)
     if (!gate.ok && gate.reason !== 'no_credential') {
@@ -616,6 +619,7 @@ export class PoolScheduler {
       }
     }
 
+    if (circuitProbeUntil) markWait('circuit_probe', circuitProbeUntil)
     if (this.usedSlotCount(vm.id) >= sessionSlots) markWait('session_slots_full')
     if (inflight >= maxConcurrency) markWait('concurrency_limit')
     const fableCap = Number(this.config.fable_max_per_account)
@@ -915,7 +919,7 @@ export class PoolScheduler {
     this.config = normalizePoolConfig(config)
   }
 
-  reserve(candidate, { sessionKey = null, skipQuota = false } = {}) {
+  reserve(candidate, { sessionKey = null, skipQuota = false, pinned = false } = {}) {
     const requestInflight = this.inflight.get(candidate.accountId) || 0
     if (!candidate.maxConcurrency || requestInflight >= candidate.maxConcurrency) return null
     const slot = this.acquireSlot(candidate.vmId, sessionKey, candidate.sessionSlots)
@@ -945,6 +949,18 @@ export class PoolScheduler {
         this.accountQuota?.sessions?.touch?.(candidate.accountId, sessionKey)
       } catch {}
     }
+    // A pin is an operator diagnostic: it reaches the slot without taking the probe.
+    const circuitHold = pinned ? null : this.unitCircuit?.admit?.(candidate.accountId)
+    if (circuitHold && !circuitHold.ok) {
+      if (slot?.created) this.releaseSlotHold(candidate.vmId, slot.holdKey)
+      if (sessionKey) {
+        try {
+          this.accountQuota?.sessions?.release?.(candidate.accountId, sessionKey)
+        } catch {}
+      }
+      this.accountQuota?.release?.(candidate.accountId)
+      return null
+    }
     this.inflight.set(candidate.accountId, requestInflight + 1)
     this.bumpFamily(candidate.accountId, family, 1)
     let released = false
@@ -964,6 +980,7 @@ export class PoolScheduler {
           } catch {}
         }
         this.accountQuota?.release?.(candidate.accountId)
+        if (circuitHold?.probe) this.unitCircuit?.releaseProbe?.(candidate.accountId)
         if (slot?.ephemeral) this.releaseSlotHold(candidate.vmId, slot.holdKey)
         this.notifyCapacity(candidate.accountId)
       },

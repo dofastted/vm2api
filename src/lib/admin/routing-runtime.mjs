@@ -13,6 +13,7 @@ import { accountTierKey, mergeTierMaps, normalizeTiers } from '../pool/quota-tie
 import { setManualScheduleWins } from '../pool/schedule-policy.mjs'
 import { PoolScheduler } from '../pool/pool-scheduler.mjs'
 import { FailoverRunner } from '../pool/failover-runner.mjs'
+import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { RateLimitService } from '../pool/rate-limit-service.mjs'
 import { AccountRuntimeRepo } from '../db/repos/account-runtime-repo.mjs'
 import { RequestAttemptsRepo } from '../db/repos/request-attempts-repo.mjs'
@@ -384,6 +385,10 @@ export function createRoutingRuntime(ctx) {
       config: poolSchedulerConfig(),
     })
     setPool(poolScheduler)
+    unitCircuit.configure({
+      failureThreshold: routingConfig.pool?.circuit_failure_threshold,
+      openMs: routingConfig.pool?.circuit_open_ms,
+    })
     ctx.accountQuota.onQuotaCooldownCleared = () => {
       try {
         poolScheduler.notifyCapacity()

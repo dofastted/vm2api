@@ -2005,6 +2005,13 @@ export function createPanelHandler(ctx) {
         if (result.status) return json(res, result.status, result.body)
         return json(res, 200, result)
       }
+      // POST /api/panel/vms/:id/circuit/reset — close a tripped Claude unit circuit
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/circuit\/reset$/.test(p)) {
+        const id = decodeURIComponent(p.split('/')[4])
+        const result = panel.resetVmCircuit({ cfg, poolScheduler: ctx.poolScheduler, id })
+        if (result.status) return json(res, result.status, result.body)
+        return json(res, 200, result)
+      }
       // POST /api/panel/vms/:id/activate
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/activate$/.test(p)) {
         const id = p.split('/')[4]

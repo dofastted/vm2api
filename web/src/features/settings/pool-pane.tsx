@@ -23,12 +23,15 @@ export function PoolPane(props: PoolPaneProps) {
       <CardHeader>
         <CardTitle>账号池</CardTitle>
         <p className='text-xs text-muted-foreground'>
-          调度三态：开 / 受限 /
-          关。操作员开关只拨开或关；额度、429、冷却写成受限，窗口到了自动恢复，不会拨成调度关。
+          只调度 Claude VM。三态是开 / 受限 /
+          关。操作员开关只拨开或关；额度、429、冷却和熔断写成受限，窗口或探测成功后自动恢复，不会拨成调度关。
         </p>
       </CardHeader>
       <CardContent className='divide-y'>
-        <SettingRow label='策略'>
+        <SettingRow
+          label='策略'
+          desc='只作用于 Claude VM。同优先级里先取最低负载，再按这里的方式挑选。'
+        >
           <Select
             value={String(pool.strategy || 'weighted-round-robin')}
             onValueChange={(strategy) => onPoolChange({ ...pool, strategy })}
@@ -43,7 +46,77 @@ export function PoolPane(props: PoolPaneProps) {
             </SelectContent>
           </Select>
         </SettingRow>
-        <SettingRow label='切号上限' desc='单次请求失败转移时最多切换的账号数'>
+        <SettingRow
+          label='同 VM 重试'
+          desc='空响应或可重试错误时，换号前在同一台 Claude VM 上再试的次数'
+        >
+          <Input
+            className='w-24'
+            type='number'
+            min={0}
+            max={5}
+            value={Number(failover.max_same_account_retries ?? 1)}
+            onChange={(event) =>
+              onFailoverChange({
+                ...failover,
+                max_same_account_retries: Number(event.target.value),
+              })
+            }
+          />
+        </SettingRow>
+        <SettingRow label='同 VM 重试间隔' desc='毫秒，默认 500'>
+          <Input
+            className='w-24'
+            type='number'
+            min={0}
+            value={Number(failover.same_account_retry_delay_ms ?? 500)}
+            onChange={(event) =>
+              onFailoverChange({
+                ...failover,
+                same_account_retry_delay_ms: Number(event.target.value),
+              })
+            }
+          />
+        </SettingRow>
+        <SettingRow
+          label='熔断失败次数'
+          desc='同一台 Claude VM 连续 5xx 达到该次数后打开熔断，529 和 401 不计入'
+        >
+          <Input
+            className='w-24'
+            type='number'
+            min={1}
+            max={20}
+            value={Number(pool.circuit_failure_threshold ?? 3)}
+            onChange={(event) =>
+              onPoolChange({
+                ...pool,
+                circuit_failure_threshold: Number(event.target.value),
+              })
+            }
+          />
+        </SettingRow>
+        <SettingRow
+          label='熔断打开时长'
+          desc='毫秒。到期后只放行 1 个探测请求，默认 30000'
+        >
+          <Input
+            className='w-24'
+            type='number'
+            min={1000}
+            value={Number(pool.circuit_open_ms ?? 30000)}
+            onChange={(event) =>
+              onPoolChange({
+                ...pool,
+                circuit_open_ms: Number(event.target.value),
+              })
+            }
+          />
+        </SettingRow>
+        <SettingRow
+          label='切号上限'
+          desc='单次请求失败转移时最多切换的 Claude VM 数'
+        >
           <Input
             className='w-24'
             type='number'

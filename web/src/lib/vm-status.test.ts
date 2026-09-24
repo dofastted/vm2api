@@ -11,6 +11,8 @@ import {
   poolStatus,
   restrictionCopy,
   scheduleStateLabel,
+  vmCircuit,
+  vmCircuitTitle,
 } from './vm-status'
 
 function liveVm(over: Partial<Vm> = {}): Vm {
@@ -414,5 +416,69 @@ describe('fleetGroup splits 受限 from 在池 and 关闭调用', () => {
       text: '7d 警告',
     })
     expect(fleetGroup(fallback7d)).toBe('pool')
+  })
+})
+
+describe('unit circuit', () => {
+  const circuit = (over: Partial<NonNullable<Vm['circuit']>> = {}) => ({
+    state: 'closed' as const,
+    failures: 0,
+    threshold: 3,
+    open_until: null,
+    open_ms: 30000,
+    ...over,
+  })
+
+  it('closed circuit leaves pool status alone', () => {
+    const vm = liveVm({ circuit: circuit() })
+    expect(vmCircuit(vm)).toBeNull()
+    expect(poolStatus(vm).cls).toBe('ok')
+  })
+
+  it('open circuit paints the pool status and counts down', () => {
+    const now = 1_000_000
+    const vm = liveVm({
+      circuit: circuit({
+        state: 'open',
+        failures: 3,
+        open_until: now + 12_000,
+      }),
+    })
+    expect(vmCircuit(vm, now)).toMatchObject({ state: 'open', left: 12_000 })
+    expect(vmCircuitTitle(vm, now)).toBe(
+      '熔断中 · 连续 3/3 次 5xx · 12s 后放行探测'
+    )
+    expect(
+      poolStatus({
+        ...vm,
+        circuit: { ...vm.circuit!, open_until: Date.now() + 5000 },
+      })
+    ).toMatchObject({
+      key: 'circuit',
+      text: '熔断中',
+      cls: 'bad',
+    })
+  })
+
+  it('expired open reads as half-open probe', () => {
+    const vm = liveVm({
+      circuit: circuit({ state: 'open', failures: 3, open_until: 10 }),
+    })
+    expect(vmCircuit(vm, 20)?.state).toBe('half_open')
+    expect(poolStatus(vm)).toMatchObject({ text: '熔断探测', cls: 'caution' })
+  })
+
+  it('operator off wins over circuit', () => {
+    const vm = liveVm({
+      schedule_state: 'off',
+      schedulable: false,
+      availability: { key: 'off', usable: false, text: '调度关' },
+      circuit: circuit({
+        state: 'open',
+        failures: 3,
+        open_until: Date.now() + 5000,
+      }),
+    })
+    expect(poolStatus(vm).key).toBe('off')
   })
 })

@@ -505,7 +505,16 @@ function classifyUpstreamResultRaw(
       cooldownUntil: accountLimitUntil(reset, usage, now, message),
     }
   }
-  if (status === 529) return overloadedUnit(now)
+  if (status === 529) {
+    // Original gate: RateLimitService writes overload_until. Do not also open the unit circuit.
+    return {
+      scope: 'provider',
+      action: 'continue',
+      reason: 'provider_overloaded',
+      cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
   if (status === 408 || status === 502 || status === 503 || status === 504 || status >= 500) {
     if (workerCode === 'slot_busy' || /no free slot|slot_busy/i.test(hay)) {
       return continueWithoutCooldown({
