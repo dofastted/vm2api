@@ -16,6 +16,19 @@ function makePool() {
   return pool
 }
 
+test('proxy pool persists a selected DNS upstream and rejects unknown choices', () => {
+  const dir = tmpDir()
+  const pool = new ProxyPool({ dataDir: dir })
+  pool.stopScheduler()
+  assert.equal(pool.snapshot().config.dns_upstream, 'https://1.1.1.1/dns-query')
+  assert.equal(pool.updateConfig({ dns_upstream: 'https://dns.google/dns-query' }).ok, true)
+  assert.equal(pool.updateConfig({ dns_upstream: 'https://invalid.example/dns-query' }).error, 'invalid_dns_upstream')
+  assert.equal(pool.snapshot().config.dns_upstream, 'https://dns.google/dns-query')
+  const reopened = new ProxyPool({ dataDir: dir })
+  reopened.stopScheduler()
+  assert.equal(reopened.snapshot().config.dns_upstream, 'https://dns.google/dns-query')
+})
+
 test('clampBindLimit defaults to 5 and stays in 1..32', () => {
   assert.equal(clampBindLimit(undefined), MAX_VMS_PER_PROXY)
   assert.equal(clampBindLimit(5), 5)

@@ -16,7 +16,7 @@ import { ProxiesRepo } from '../db/repos/proxies-repo.mjs'
 import { canBindProxyToVm, normalizeOwnerId, proxyOwnerId } from '../admin/resource-owner.mjs'
 import { validTimezone } from '../core/timezone.mjs'
 import { lookupProxyGeo } from './proxy-geo.mjs'
-import { LOCAL_EGRESS_ID, isLocalEgressProxy } from './egress.mjs'
+import { LOCAL_EGRESS_ID, isLocalEgressProxy, DNS_UPSTREAM_DEFAULT, DNS_UPSTREAM_OPTIONS } from './egress.mjs'
 
 export const MAX_VMS_PER_PROXY = 5
 export const BIND_LIMIT_MIN = 1
@@ -33,6 +33,7 @@ const DEFAULT_CONFIG = {
   // operator pinned one by hand (vm.timezone_source === 'manual').
   follow_proxy_timezone: true,
   bind_limit: MAX_VMS_PER_PROXY,
+  dns_upstream: DNS_UPSTREAM_DEFAULT,
 }
 
 export function clampBindLimit(value, fallback = MAX_VMS_PER_PROXY) {
@@ -596,6 +597,10 @@ export class ProxyPool {
 
   updateConfig(patch = {}) {
     const allowed = [5, 10, 30, 60]
+    if (patch.dns_upstream != null && !DNS_UPSTREAM_OPTIONS.includes(patch.dns_upstream)) {
+      return { ok: false, error: 'invalid_dns_upstream', allowed: DNS_UPSTREAM_OPTIONS }
+    }
+    if (patch.dns_upstream != null) this.state.config.dns_upstream = patch.dns_upstream
     if (patch.probe_interval_min != null) {
       const n = Number(patch.probe_interval_min)
       if (!allowed.includes(n)) {

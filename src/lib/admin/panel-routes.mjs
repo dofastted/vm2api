@@ -3392,13 +3392,25 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'PUT' && p === '/api/panel/proxies/config') {
         const body = await readBody(req, 64 * 1024)
+        const previousDnsUpstream = proxyPool.snapshot().config.dns_upstream
         const result = proxyPool.updateConfig(body)
         if (!result.ok)
           return json(res, 400, {
             ok: false,
             error: { type: 'invalid_request_error', code: result.error, message: result.error, details: result },
           })
-        return json(res, 200, panel.ok(result.config))
+        // An upstream change must reach already-running egress helpers. Slots stay intact.
+        const egress = []
+        if (body.dns_upstream != null && body.dns_upstream !== previousDnsUpstream && process.env.KIN_CRS_MOCK !== '1') {
+          for (const proxy of proxyPool.snapshot().proxies) {
+            if (isLocalEgressProxy(proxy) || !proxy.bound_vm_ids?.length) continue
+            const updated = ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(proxy.id), {
+              dnsUpstream: result.config.dns_upstream,
+            })
+            egress.push({ proxy_id: proxy.id, ok: updated.ok, error: updated.ok ? null : updated.error })
+          }
+        }
+        return json(res, 200, panel.ok({ ...result.config, egress }))
       }
       // Must stay BELOW /proxies/config: `[^/]+` matches "config" too, and this
       // route shares its method, so ordering alone decides the winner. The

@@ -102,12 +102,21 @@ export function ProxiesPage() {
   })
   const saveConfig = useMutation({
     mutationFn: (patch: Record<string, unknown>) =>
-      api('/api/panel/proxies/config', {
+      api<{
+        egress?: { proxy_id: string; ok: boolean; error?: string | null }[]
+      }>('/api/panel/proxies/config', {
         method: 'PUT',
         body: JSON.stringify(patch),
       }),
-    onSuccess: async (_data, patch) => {
-      if (patch.bind_limit != null) {
+    onSuccess: async (data, patch) => {
+      const failed = (data.egress || []).filter((entry) => !entry.ok)
+      if (failed.length) {
+        toast.warning(
+          `DNS 设置已保存，但 ${failed.length} 个出口重载失败：${failed.map((entry) => entry.proxy_id).join('、')}`
+        )
+      } else if (patch.dns_upstream != null) {
+        toast.success('DNS 上游已保存，已同步运行中的出口')
+      } else if (patch.bind_limit != null) {
         toast.success(`每条最多绑 ${String(patch.bind_limit)} 台`)
       } else if (patch.probe_interval_min != null) {
         toast.success(`探测间隔 ${String(patch.probe_interval_min)} 分钟`)
@@ -310,6 +319,7 @@ export function ProxiesPage() {
         <ProxyPoolControls
           bindLimit={bindLimit}
           probeMin={probeMin}
+          dnsUpstream={String(cfg.dns_upstream || 'https://1.1.1.1/dns-query')}
           raw={raw}
           importing={importPx.isPending}
           onBindLimitChange={(value) =>
@@ -317,6 +327,9 @@ export function ProxiesPage() {
           }
           onProbeMinChange={(value) =>
             saveConfig.mutate({ probe_interval_min: value })
+          }
+          onDnsUpstreamChange={(value) =>
+            saveConfig.mutate({ dns_upstream: value })
           }
           followProxyTimezone={cfg.follow_proxy_timezone !== false}
           onFollowProxyTimezoneChange={(value) =>

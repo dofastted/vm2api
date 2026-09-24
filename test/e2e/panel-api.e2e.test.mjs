@@ -191,6 +191,37 @@ test('sessionKey import rejected when bound proxy is dead', async () => {
   }
 })
 
+test('proxy DNS upstream setting persists via API and rejects unknown targets', async () => {
+  const gw = await startGateway()
+  try {
+    const login = await fetch(gw.baseUrl + '/api/panel/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: 'admin', password: 'testpass' }),
+    })
+    assert.equal(login.status, 200)
+    const cookie = login.headers.get('set-cookie') || ''
+    const call = async (method, body) => {
+      const response = await fetch(gw.baseUrl + '/api/panel/proxies/config', {
+        method,
+        headers: { cookie, 'content-type': 'application/json' },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      })
+      return { status: response.status, data: await response.json() }
+    }
+    assert.equal((await call('GET')).data.data.dns_upstream, 'https://1.1.1.1/dns-query')
+    const updated = await call('PUT', { dns_upstream: 'https://dns.google/dns-query' })
+    assert.equal(updated.status, 200)
+    assert.equal(updated.data.data.dns_upstream, 'https://dns.google/dns-query')
+    assert.equal((await call('GET')).data.data.dns_upstream, 'https://dns.google/dns-query')
+    const rejected = await call('PUT', { dns_upstream: 'http://unknown.example/dns-query' })
+    assert.equal(rejected.status, 400)
+    assert.equal((await call('GET')).data.data.dns_upstream, 'https://dns.google/dns-query')
+  } finally {
+    await gw.stop()
+  }
+})
+
 test('proxy disconnect_on_error can be toggled via config', async () => {
   const gw = await startGateway()
   try {

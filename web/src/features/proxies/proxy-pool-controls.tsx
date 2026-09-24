@@ -13,14 +13,22 @@ import { Textarea } from '@/components/ui/textarea'
 
 const BIND_LIMITS = [1, 2, 3, 4, 5, 8, 10, 16, 20, 32]
 const PROBE_MINS = [5, 10, 30, 60]
+const DNS_UPSTREAM_CHOICES = [
+  { value: 'https://1.1.1.1/dns-query', label: 'Cloudflare DoH（默认）' },
+  { value: 'https://dns.google/dns-query', label: 'Google DoH' },
+  { value: '8.8.8.8:53', label: 'Google DNS · TCP 53（明文）' },
+  { value: '1.1.1.1:53', label: 'Cloudflare DNS · TCP 53（明文）' },
+]
 
 type ProxyPoolControlsProps = {
   bindLimit: number
   probeMin: number
+  dnsUpstream: string
   raw: string
   importing: boolean
   onBindLimitChange: (value: number) => void
   onProbeMinChange: (value: number) => void
+  onDnsUpstreamChange: (value: string) => void
   followProxyTimezone: boolean
   onFollowProxyTimezoneChange: (value: boolean) => void
   onRawChange: (value: string) => void
@@ -34,10 +42,12 @@ export function ProxyPoolControls(props: ProxyPoolControlsProps) {
   const {
     bindLimit,
     probeMin,
+    dnsUpstream,
     raw,
     importing,
     onBindLimitChange,
     onProbeMinChange,
+    onDnsUpstreamChange,
     followProxyTimezone,
     onFollowProxyTimezoneChange,
     onRawChange,
@@ -92,6 +102,24 @@ export function ProxyPoolControls(props: ProxyPoolControlsProps) {
           </Select>
         </label>
         <label className='flex items-center gap-2'>
+          透明出口 DNS
+          <Select value={dnsUpstream} onValueChange={onDnsUpstreamChange}>
+            <SelectTrigger
+              className='h-8 w-[245px]'
+              aria-label='透明出口 DNS 上游'
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {DNS_UPSTREAM_CHOICES.map((choice) => (
+                <SelectItem key={choice.value} value={choice.value}>
+                  {choice.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </label>
+        <label className='flex items-center gap-2'>
           <Switch
             checked={followProxyTimezone}
             onCheckedChange={onFollowProxyTimezoneChange}
@@ -103,6 +131,10 @@ export function ProxyPoolControls(props: ProxyPoolControlsProps) {
           </span>
         </label>
       </div>
+      <p className='mb-4 text-xs text-muted-foreground'>
+        适用于所有远程 SOCKS5 透明出口；修改后重启出口网关，不重建槽位。TCP 53
+        不加密，出口网络可见 DNS 查询。
+      </p>
       <Card className='mb-4'>
         <CardHeader>
           <CardTitle className='text-base'>追加 SOCKS5</CardTitle>

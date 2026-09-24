@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { ProxyPool } from '../../src/lib/vm/proxy-pool.mjs'
 import {
   LOCAL_EGRESS_ID,
   boundProxyUrl,
@@ -20,7 +21,34 @@ import {
   networkName,
   portsForProxy,
   slotNetworkForVm,
+  egressConfig,
+  egressConfigMatches,
+  DNS_UPSTREAM_DEFAULT,
+  readDnsUpstream,
 } from '../../src/lib/vm/egress.mjs'
+
+test('egress reads the persisted pool DNS choice', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'egress-dns-choice-'))
+  try {
+    const pool = new ProxyPool({ dataDir: path.join(root, 'data') })
+    pool.stopScheduler()
+    assert.equal(readDnsUpstream(root), DNS_UPSTREAM_DEFAULT)
+    assert.equal(pool.updateConfig({ dns_upstream: 'https://dns.google/dns-query' }).ok, true)
+    assert.equal(readDnsUpstream(root), 'https://dns.google/dns-query')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('egress config defaults to Cloudflare DoH and accepts selected upstream', () => {
+  const base = { proxyId: 'px-test', proxyUrl: 'socks5://127.0.0.1:1080', listenTcp: '172.20.0.1:20000', listenDns: '172.20.0.1:20001' }
+  const defaultConfig = egressConfig(base)
+  assert.equal(defaultConfig.dns_upstream, DNS_UPSTREAM_DEFAULT)
+  const selected = egressConfig({ ...base, dnsUpstream: 'https://dns.google/dns-query' })
+  assert.equal(selected.dns_upstream, 'https://dns.google/dns-query')
+  assert.equal(egressConfigMatches(defaultConfig, selected), false)
+  assert.equal(egressConfigMatches(selected, selected), true)
+})
 
 test('names stay short and stable per proxy id', () => {
   assert.equal(networkName('px-a1b2c3d4'), 'kin-eg-px-a1b2c3d4')
