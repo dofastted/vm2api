@@ -126,6 +126,10 @@ func (s *Store) Load() (Credential, map[string]any, error) {
 	if oauth == nil {
 		oauth = document
 	}
+	if oauth == nil {
+		return Credential{}, nil, errors.New("credentials oauth object is missing")
+	}
+	scopes := stringSlice(firstValue(oauth, "scopes", "scope"))
 	credential := Credential{
 		Type:         NormalizeType(firstString(document, "type")),
 		AccessToken:  firstString(oauth, "accessToken", "access_token"),
@@ -135,11 +139,14 @@ func (s *Store) Load() (Credential, map[string]any, error) {
 		Email:        firstString(oauth, "email", "emailAddress", "email_address"),
 		AccountUUID:  firstString(oauth, "accountUuid", "account_uuid"),
 		OrgUUID:      firstString(oauth, "orgUuid", "org_uuid", "organization_uuid"),
-		Scopes:       stringSlice(oauth["scopes"]),
+		Scopes:       scopes,
 		AuthScheme:   firstString(document, "authScheme", "auth_scheme"),
 	}
 	if typed := firstString(oauth, "type"); typed != "" && credential.Type == TypeOAuth {
 		credential.Type = NormalizeType(typed)
+	}
+	if hasFullOAuthScope(scopes) {
+		credential.Type = TypeOAuth
 	}
 	if api := nestedMap(document, "anthropicApiKey"); api != nil {
 		if key := firstString(api, "apiKey", "api_key"); key != "" {
@@ -177,6 +184,9 @@ func (s *Store) Save(credential Credential, document map[string]any) (Credential
 		document = make(map[string]any)
 	}
 	credential.Type = NormalizeType(credential.Type)
+	if hasFullOAuthScope(credential.Scopes) {
+		credential.Type = TypeOAuth
+	}
 	credential.AuthScheme = NormalizeAuthScheme(credential.AuthScheme, credential.Type)
 	document["type"] = credential.Type
 	document["authScheme"] = credential.AuthScheme
@@ -404,6 +414,14 @@ func asInt64(value any) int64 {
 		return 0
 	}
 }
+func hasFullOAuthScope(scopes []string) bool {
+	for _, scope := range scopes {
+		if scope == "user:profile" || scope == "user:office" || scope == "user:sessions:claude_code" {
+			return true
+		}
+	}
+	return false
+}
 
 func stringSlice(value any) []string {
 	switch typed := value.(type) {
@@ -454,6 +472,9 @@ func DecodeImport(reader io.Reader, maxBytes int64) (Credential, error) {
 		expiry = time.Now().Add(time.Duration(payload.ExpiresIn) * time.Second).UnixMilli()
 	}
 	typ := NormalizeType(payload.Type)
+	if hasFullOAuthScope(payload.Scopes) {
+		typ = TypeOAuth
+	}
 	apiKey := strings.TrimSpace(payload.APIKey)
 	if apiKey == "" && typ == TypeAPIKey {
 		apiKey = strings.TrimSpace(payload.AccessToken)

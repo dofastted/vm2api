@@ -159,6 +159,21 @@ func TestSaveSetupTokenClearsRefresh(t *testing.T) {
 	}
 }
 
+func TestFullScopeSetupTokenLabelLoadsAsOAuth(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "credentials.json")
+	seed := `{"type":"setup-token","claudeAiOauth":{"accessToken":"full","refreshToken":"refresh","scopes":["user:profile","user:inference","user:sessions:claude_code"]}}`
+	if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, _, err := NewStore(path).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Type != TypeOAuth || loaded.RefreshToken != "refresh" {
+		t.Fatalf("loaded = %#v, want full OAuth", loaded)
+	}
+}
+
 func TestStoreRoundTripAPIKey(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "credentials.json")
 	store := NewStore(path)
