@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.62 — 2026-09-26
+
+- 修复带 `type: setup-token` 标签但实际包含 `user:profile` / `user:sessions:claude_code` 的完整 OAuth 导入被错误降级为 inference-only。现在以实际 scope 集合为准，保留 profile 权限并允许官方 `/profile` / `/usage`。
+
+## Unreleased
+
 ## 1.3.61 — 2026-09-26
 
 - 修复 native CLI 被 OOM 杀死或管道关闭后，Rust 内核仍宣告槽可用并持续返回 `native stdin: Broken pipe`：退出统一清理在途任务与调度状态，健康清零后由 watchdog 恢复，不重放推理。
@@ -10,7 +16,7 @@
 
 已部署机升级：覆盖控制面、前端与 kernel 并重启 Node 一次；同步 Claude 槽内 kernel，不 `docker rm` 槽。
 
-## Unreleased
+
 
 ## 1.3.60 — 2026-09-26
 
