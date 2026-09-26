@@ -255,7 +255,7 @@ export function upsertCodexAccount(projectRoot, vmId, patch = {}) {
   return cur
 }
 
-export function persistCodexQuotaSnapshot(projectRoot, vmId, { extra, resetCredits } = {}) {
+export function persistCodexQuotaSnapshot(projectRoot, vmId, { extra, resetCredits, planType } = {}) {
   if (!projectRoot || !vmId) throw new Error('projectRoot and vmId required')
   const file = path.join(projectRoot, 'vms', `${vmId}.json`)
   let vm = {}
@@ -269,6 +269,8 @@ export function persistCodexQuotaSnapshot(projectRoot, vmId, { extra, resetCredi
     vm.codex.extra = { ...(vm.codex.extra || {}), ...extra }
     vm.codex.usage = buildCodexUsageView(extraToCodexSnapshot(vm.codex.extra))
   }
+  const plan = String(planType || '').trim()
+  if (plan) vm.codex.plan_type = plan
   if (resetCredits && typeof resetCredits === 'object') {
     vm.codex.reset_credits = {
       available_count: Math.max(0, Number(resetCredits.available_count) || 0),
@@ -289,7 +291,8 @@ export function summarizeCodexSlot(projectRoot, vm = {}) {
   const accounts = projectRoot && vm?.id ? readCodexAccounts(projectRoot, vm.id) : []
   const first = accounts[0] || {}
   const extra = vm.codex?.extra || vm.codex_extra || {}
-  const usage = buildCodexUsageView(vm.codex?.usage || extraToCodexSnapshot(extra))
+  // extra is the source of truth; the stored view is only a fallback for slots without extra.
+  const usage = buildCodexUsageView(Object.keys(extra).length ? extraToCodexSnapshot(extra) : vm.codex?.usage || {})
   const hasAccess = !!(first.access_token || vm.codex?.has_access)
   const hasRefresh = !!(first.refresh_token || vm.codex?.has_refresh)
   return {
@@ -303,5 +306,6 @@ export function summarizeCodexSlot(projectRoot, vm = {}) {
     account_count: accounts.length,
     usage,
     reset_credits: vm.codex?.reset_credits || null,
+    plan_type: vm.codex?.plan_type || null,
   }
 }

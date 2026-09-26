@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.63 — 2026-09-27
+
+- 修复 GPT 槽 5h / 7d 额度在 Web 上显示为 0%、无重置时间：落盘的 usage 视图读回时被当成原始 extra 二次解析而全部清空；现从 `codex.extra` 重建，并兼容已存视图。
+- GPT 槽额度查询时持久化上游 `plan_type`，Web 套餐标识按 codex-proxy-rs 映射显示（如 team → Business）；内部 tier key 仍为 `codex`。
+
+已部署机升级：覆盖控制面与前端并重启 Node；额度数值立即恢复，套餐标识需点一次「查询」后出现。
+
 ## 1.3.62 — 2026-09-26
 
 - 修复带 `type: setup-token` 标签但实际包含 `user:profile` / `user:sessions:claude_code` 的完整 OAuth 导入被错误降级为 inference-only。现在以实际 scope 集合为准，保留 profile 权限并允许官方 `/profile` / `/usage`。

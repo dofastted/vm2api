@@ -168,6 +168,8 @@ export type Vm = {
       utilization_7d?: number
     }
   } | null
+  /** Raw OpenAI `plan_type` from wham/usage (GPT slots only). */
+  plan_type?: string | null
   reset_credits?: {
     available_count?: number
     credits?: Array<{ expires_at?: string }>
