@@ -58,7 +58,7 @@ commitImportedOauth → 仅完整 OAuth 排队官方 Claude Code 初装
 以下请求共用该槽绑定的 SOCKS5（控制面 host 或 kernel 透明出口），不允许 VPS 直连 Anthropic：
 
 - `/v1/messages`（Rust kernel cli-hop）
-- `/api/oauth/usage`、`/api/oauth/profile`、`/v1/models`（额度与等级，槽内 worker；完整 OAuth 与短效 Setup Token 都打。Setup Token 仍不跑官方初装）
+- `/api/oauth/usage`、`/v1/models`（额度与模型，槽内 worker；完整 OAuth 可打官方 usage。Setup Token 只有 `user:inference` 时 usage 会报 scope 不足，仍不跑官方初装）
 - `/v1/oauth/token`（refresh / 授权码）
 - 健康 / 额度探测
 - 遥测 sidecar 的 event_logging / eval（若开启）
@@ -85,7 +85,7 @@ commitImportedOauth → 仅完整 OAuth 排队官方 Claude Code 初装
 1. wipe 初装文件  
 2. 物化 `~/.claude/.credentials.json`（worker 活票）  
 3. 官方 CLI 经 HTTP CONNECT → 槽 SOCKS5 跑 `hello`  
-4. 槽内 CLI `/usage` 写 5h/7d/Fable 刻度，失败再试 2 次。账号等级以官方 profile 为准
+4. 槽内 CLI `/usage` 写 5h/7d/Fable 刻度，失败再试 2 次。账号等级只用成功且完整的官方 `/usage` 判定 Pro/Max
 5. 后置播种（含强制 env：`DISABLE_TELEMETRY` 等按 seed_policy）  
 6. `~/.claude.json` 的 userID/machineID 写入槽位指纹；清 leftover `.claude/.claude.json`  
 7. `sync_telemetry`：写 `kin-identity.json` + `worker.json.telemetry`，reload 槽位拉 sidecar  
@@ -96,13 +96,14 @@ commitImportedOauth → 仅完整 OAuth 排队官方 Claude Code 初装
 
 ## 用量刻度
 
-面板探测走槽内 `kin-worker oauth`（profile、usage、models）。完整 OAuth 与短效 Setup Token 都打官方 `/api/oauth/usage`。出口是槽的 SOCKS5 或透明网络，Node 不直连 Anthropic：
+面板探测走槽内 `kin-worker oauth`（usage、models）。完整 OAuth 打官方 `/api/oauth/usage`；Setup Token 若只有 `user:inference` 会得到 scope 错误，面板保留失败原因并提示需完整 OAuth。出口是槽的 SOCKS5 或透明网络，Node 不直连 Anthropic：
 
 - `five_hour` / `seven_day` utilization 0–100
-- Fable `weekly_scoped` → `7d_oi`；limits / model_scoped 里出现 Fable 模型即 Max
+- 成功且完整的官方 `/usage`：有 5h、7d，且能确定 Fable 7d 是否存在；有 Fable 即 Max，没有即 Pro。失败、scope 不足、只有 5h 或 CLI 文本不完整都不改套餐
+- Fable `weekly_scoped` → `7d_oi`
 - 同包可带 Sub2API 对照；旧 KIN「窗口滚过后仍 100%」刻度已废弃
 
-已判定 Pro（usage 无 Fable 模型 / 套餐拒绝）的槽只探 5h/7d，不再 hop Fable。usage 一旦列出 Fable，即使 hop 403/401 或落盘 pro 也改判 Max。Fable 不可用、7d_oi、家族冷却 **不**把账号标成整号限制。探测早于 `refreshed_at` 不算整号吊销。
+已判定 Pro（完整 usage 无 Fable 模型）的槽只探 5h/7d，不再 hop Fable。完整 usage 一旦列出 Fable，即使 hop 403/401 或落盘 pro 也改判 Max。Fable 不可用、7d_oi、家族冷却 **不**把账号标成整号限制。探测早于 `refreshed_at` 不算整号吊销。
 
 ## 调度资格
 

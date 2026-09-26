@@ -125,9 +125,12 @@ test('no header samples reports unavailable and persists the attempt without fak
   assert.equal(check.ok, false)
   assert.equal(check.data_at, result.probed_at)
   assert.equal(f.quota.repo.get('account-test').unified.last_probe?.ok, false)
+  const detail = await f.detail(f.reopen())
+  assert.equal(detail.vm.account_tier, 'pro')
+  assert.equal(detail.vm.usage_has_fable, null)
 })
 
-test('Setup Token probe marks Max when the Fable hop succeeds and does not keep the Pro badge', async (t) => {
+test('Setup Token Fable hop does not classify the plan without complete official usage', async (t) => {
   const f = fixture(t)
   f.quota.setAccountTier('account-test', 'pro')
   const result = (
@@ -140,12 +143,49 @@ test('Setup Token probe marks Max when the Fable hop succeeds and does not keep 
       }),
     })
   ).data
-  assert.equal(result.account_tier, 'max')
-  assert.equal(f.quota.repo.get('account-test').unified.account_tier, 'max')
-  assert.equal(f.quota.repo.get('account-test').unified.usage_has_fable, true)
+  assert.equal(result.account_tier, 'pro')
+  assert.equal(f.quota.repo.get('account-test').unified.account_tier, 'pro')
+  assert.equal(f.quota.repo.get('account-test').unified.usage_has_fable, undefined)
+  assert.equal(f.quota.repo.get('account-test').unified.fable.ok, false)
   assert.equal(f.quota.repo.get('account-test').unified.fable.plan_denied, false)
   const detail = await f.detail(f.reopen())
-  assert.equal(detail.vm.account_tier, 'max')
+  assert.equal(detail.vm.account_tier, 'pro')
+})
+
+test('Setup Token usage scope failure reports auth scope and preserves history', async (t) => {
+  const f = fixture(t)
+  f.quota.setAccountTier('account-test', 'max', { source: 'usage' })
+  let fableCalled = false
+  const result = (
+    await buildProbeOne({
+      ...f.args,
+      accountQuota: f.quota,
+      usageCache: usageCache({
+        ok: false,
+        source: 'official-cc-usage',
+        via: 'worker',
+        usage_status: 403,
+        usage_scope_missing: true,
+        credential_scope_required: 'user:profile',
+        usage_error: '当前凭证缺少 user:profile scope，需导入完整 OAuth 后才能探测官方 /usage',
+        probed_at: '2026-09-26T12:00:00Z',
+      }),
+      fableProbe: async () => {
+        fableCalled = true
+        return { tier: 'max', fable: { ok: true, status: 200, model: 'claude-fable-5-1' } }
+      },
+    })
+  ).data
+  assert.equal(result.ok, false)
+  assert.equal(result.usage_scope_missing, true)
+  assert.match(result.error, /完整 OAuth|user:profile/)
+  assert.equal(result.account_tier, 'max')
+  assert.equal(fableCalled, false)
+  const acc = f.quota.repo.get('account-test')
+  assert.equal(acc.unified.account_tier, 'max')
+  assert.equal(acc.unified.fable, undefined)
+  assert.equal(acc.unified.last_probe.ok, false)
+  assert.match(acc.unified.last_probe.error, /user:profile/)
 })
 
 test('official OAuth probe still ingests real usage and exposes its actual result to the card', async (t) => {
@@ -175,4 +215,62 @@ test('official OAuth probe still ingests real usage and exposes its actual resul
   assert.equal(detail.account.last_probe_check.ok, false)
   assert.equal(detail.account.last_probe_check.error, 'probe_failed')
   assert.equal(detail.account.last_probe.error, 'probe_failed')
+})
+
+test('confirmed usage revoke parks the VM and reports revoked status', async (t) => {
+  const f = fixture(t, { mode: 'oauth' })
+  const result = (
+    await buildProbeOne({
+      ...f.args,
+      accountQuota: f.quota,
+      usageCache: usageCache({
+        ok: false,
+        source: 'official-cc-usage',
+        via: 'worker',
+        usage_status: 401,
+        usage_error: 'OAuth access token has been revoked.',
+        probed_at: '2026-09-26T12:00:00Z',
+      }),
+    })
+  ).data
+  assert.equal(result.ok, false)
+  const vm = JSON.parse(fs.readFileSync(path.join(f.args.cfg.paths.project, 'vms/vm-02.json'), 'utf8'))
+  assert.equal(vm.schedulable, false)
+  assert.equal(vm.schedule_disabled_reason, 'oauth_revoked')
+  const detail = await f.detail(f.reopen())
+  assert.equal(detail.vm.cred_status.key, 'bad')
+  assert.equal(detail.vm.cred_status.text, 'revoke')
+})
+
+test('complete Pro usage replaces stale Max windows in persisted panel data', async (t) => {
+  const f = fixture(t, { mode: 'oauth' })
+  f.quota.ingestOAuthUsage('account-test', {
+    ok: true,
+    usage_status: 200,
+    limits_present: true,
+    usage_has_fable: true,
+    seven_day_oi: { utilization: 0.2, resets_at: '2099-01-01T00:00:00Z' },
+  })
+  const result = (
+    await buildProbeOne({
+      ...f.args,
+      accountQuota: f.quota,
+      usageCache: usageCache({
+        ok: true,
+        usage_status: 200,
+        limits_present: true,
+        usage_has_fable: false,
+        account_tier: 'pro',
+        five_hour: { utilization: 0.1 },
+        seven_day: { utilization: 0.2 },
+        probed_at: '2026-09-26T12:00:00Z',
+      }),
+    })
+  ).data
+  assert.equal(result.account_tier, 'pro')
+  assert.equal(result.quota.account_tier, 'pro')
+  const detail = await f.detail(f.reopen())
+  assert.equal(detail.vm.account_tier, 'pro')
+  assert.equal(detail.vm.usage_has_fable, false)
+  assert.equal(detail.vm.utilization_7d_oi, null)
 })

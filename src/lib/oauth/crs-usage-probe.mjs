@@ -130,6 +130,24 @@ export function parseOAuthUsage(data = {}) {
   }
 }
 
+export function isCompleteOAuthUsage(data = {}, parsed = null) {
+  const p = parsed || parseOAuthUsage(data)
+  if (!p.five_hour || !p.seven_day) return false
+  if (p.usage_has_fable !== null) return true
+  return (
+    data.seven_day_fable === null ||
+    data.seven_day_oi === null ||
+    data.seven_day_overage_included === null ||
+    Array.isArray(data.limits) ||
+    Array.isArray(data.model_scoped)
+  )
+}
+
+function usageScopeMissing(res = {}) {
+  const msg = String(res.body?.error?.message || res.body?.error || '')
+  return Number(res.status || 0) === 403 && /scope requirement|does not meet scope|user:profile/i.test(msg)
+}
+
 export function parseFableProbe({ status, body, transportError, headers } = {}) {
   const err = body?.error || {}
   const msg = String(err.message || body?.message || err.code || '')
@@ -338,6 +356,7 @@ export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 2000
       source: 'official-cc-usage',
       via: 'crs-mock',
       interpretations: compareUsageInterpretations(raw),
+      limits_present: true,
       ...parsed,
       five_hour: official.five_hour || parsed.five_hour,
       seven_day: official.seven_day || parsed.seven_day,
@@ -365,6 +384,7 @@ export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 2000
       usage_error: usageRes.body?.error?.message || usageRes.body?.error,
       rate_limited: false,
     })
+  const usageMissingScope = usageScopeMissing(usageRes)
   const rawBody = usageRes.ok && usageRes.body && typeof usageRes.body === 'object' ? usageRes.body : {}
   const official = usageRes.ok ? interpretOfficialUsage(rawBody) : null
   const parsed = usageRes.ok
@@ -380,7 +400,7 @@ export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 2000
       }
 
   let fable = null
-  if (includeFable) {
+  if (includeFable && !usageMissingScope) {
     // Do not send inbound anthropic-beta — unofficial probes must replay
     // the slot's stored Claude Code betas, not overwrite them.
     fable = (await probeFableEntitlement({ exec, timeoutMs, identity })).fable
@@ -416,9 +436,14 @@ export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 2000
     source: 'official-cc-usage',
     via: usageRes.via || 'go-worker',
     usage_status: usageRes.status,
+    limits_present: usageRes.ok ? isCompleteOAuthUsage(rawBody, parsed) : false,
+    usage_scope_missing: usageMissingScope,
+    credential_scope_required: usageMissingScope ? 'user:profile' : null,
     usage_error: usageRes.ok
       ? null
-      : usageRes.body?.error?.message || usageRes.body?.error || `http_${usageRes.status}`,
+      : usageMissingScope
+        ? '当前凭证缺少 user:profile scope，需导入完整 OAuth 后才能探测官方 /usage'
+        : usageRes.body?.error?.message || usageRes.body?.error || `http_${usageRes.status}`,
     ...parsed,
     five_hour: official?.five_hour || parsed.five_hour,
     seven_day: official?.seven_day || parsed.seven_day,

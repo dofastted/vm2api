@@ -26,7 +26,8 @@ export const RUNTIME = 'docker'
 const WORKER_BIN = process.env.KIN_WORKER_BIN || '/opt/kin-gateway/bin/kin-worker'
 const GID = String(process.env.KIN_VM_GID || 987)
 const UID_BASE = Number(process.env.KIN_VM_UID_BASE || 10000)
-export const SLOT_MEMORY = process.env.KIN_VM_MEMORY || '500m'
+// The resident native host and an official CLI probe can exceed 500 MiB together.
+export const SLOT_MEMORY = process.env.KIN_VM_MEMORY || '1g'
 const MEM = SLOT_MEMORY
 const NET = process.env.KIN_VM_NETWORK || 'bridge'
 const PUBLIC_IP = process.env.PUBLIC_HOST || '166.88.96.199'

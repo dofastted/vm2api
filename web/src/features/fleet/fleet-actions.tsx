@@ -20,6 +20,7 @@ import {
   usageQueryOptions,
 } from '@/features/overview/queries'
 import { proxiesQueryOptions } from '@/features/proxies/queries'
+import { vmsListQueryOptions } from '@/features/vm/queries'
 
 type FleetAction = 'roll' | 'collect'
 
@@ -30,11 +31,43 @@ type FleetReport = {
   items?: { id?: string; ok?: boolean }[]
 }
 
+type ProbeItem = {
+  vm_id?: string
+  id?: string
+  ok?: boolean
+  error?: unknown
+}
+
+function errorText(value: unknown): string {
+  if (!value) return ''
+  if (typeof value === 'string') return value
+  if (value instanceof Error) return value.message
+  if (typeof value === 'object') {
+    const rec = value as Record<string, unknown>
+    const nested = rec.error as Record<string, unknown> | undefined
+    return String(
+      rec.message ||
+        nested?.message ||
+        rec.code ||
+        nested?.code ||
+        JSON.stringify(value)
+    )
+  }
+  return String(value)
+}
+
 async function invalidateFleet(qc: QueryClient) {
   await Promise.all([
     qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
     qc.invalidateQueries({ queryKey: usageQueryOptions().queryKey }),
     qc.invalidateQueries({ queryKey: proxiesQueryOptions().queryKey }),
+    qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey }),
+    qc.invalidateQueries({
+      predicate: (q) =>
+        Array.isArray(q.queryKey) &&
+        q.queryKey[0] === 'panel' &&
+        q.queryKey[1] === 'vm',
+    }),
   ])
 }
 
@@ -47,14 +80,27 @@ export function FleetActions() {
   })
   const probe = useMutation({
     mutationFn: () =>
-      api<{ items?: { ok?: boolean }[] }>('/api/panel/probe', {
+      api<{ items?: ProbeItem[] }>('/api/panel/probe', {
         method: 'POST',
-        body: JSON.stringify({}),
+        body: JSON.stringify({ hop: true, force: true }),
       }),
     onSuccess: async (data) => {
       const items = data.items || []
       const ok = items.filter((x) => x && x.ok).length
-      toast.success(`探测完成 ${ok}/${items.length}`)
+      const failed = items.filter((x) => x && !x.ok)
+      if (failed.length) {
+        const reasons = failed
+          .slice(0, 2)
+          .map(
+            (x) => `${x.vm_id || x.id || '?'} ${errorText(x.error) || '失败'}`
+          )
+          .join('；')
+        toast.error(
+          `探测 ${ok}/${items.length} · 失败 ${failed.length}${reasons ? ` · ${reasons}` : ''}`
+        )
+      } else {
+        toast.success(`探测完成 ${ok}/${items.length}`)
+      }
       await invalidateFleet(qc)
     },
     onError: (error: Error) => toast.error(error.message),

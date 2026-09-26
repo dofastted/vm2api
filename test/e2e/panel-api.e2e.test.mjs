@@ -244,6 +244,25 @@ test('generate-auth-url then exchange-code writes fake oauth', async () => {
   }
 })
 
+test('pasted setup token survives identity enrichment and persists inference credentials', async () => {
+  const gw = await startGateway({ oauth: false })
+  try {
+    const result = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/exchange-code', {
+      body: { code: 'sk-ant-oat01-' + 'F'.repeat(96), flavor: 'claude_setup_token' },
+    })
+    assert.equal(result.status, 200, result.text)
+    const vm = JSON.parse(fs.readFileSync(path.join(gw.project, 'vms', 'vm-sim-01.json'), 'utf8'))
+    assert.equal(vm.claude.mode, 'setup-token')
+    assert.equal(vm.claude.has_access, true)
+    assert.equal(vm.claude.has_refresh, false)
+    assert.equal(vm.claude.scope, 'user:inference')
+    assert.equal(result.json.data.official_cc_bootstrap.scheduled, false)
+  } finally {
+    await gw.stop()
+    fs.rmSync(gw.project, { recursive: true, force: true })
+  }
+})
+
 test('generate-auth-url claude_code flavor then exchange-code', async () => {
   const gw = await startGateway({ oauth: false })
   try {

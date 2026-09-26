@@ -321,6 +321,7 @@ export class AccountQuota {
       }
     }
     const usageOk = probe.ok === true || (probe.usage_status > 0 && probe.usage_status < 400)
+    const completeOfficialUsage = usageOk && probe.limits_present === true
     const leftoverFable = acc.unified.fable || {}
     const hasFableUsage =
       probe.usage_has_fable === true ||
@@ -331,15 +332,26 @@ export class AccountQuota {
         '7d_oi': oi,
       }) &&
         (oiNorm != null || oi?.resets_at || oi?.reset || oi?.status))
-    if (probe.usage_has_fable === true || hasFableUsage) acc.unified.usage_has_fable = true
-    else if (probe.usage_has_fable === false) acc.unified.usage_has_fable = false
+    if (completeOfficialUsage && (probe.usage_has_fable === true || hasFableUsage)) acc.unified.usage_has_fable = true
+    else if (completeOfficialUsage && probe.usage_has_fable === false) {
+      acc.unified.usage_has_fable = false
+      delete acc.unified['7d_oi']
+      if (acc.unified.headers) delete acc.unified.headers['7d_oi']
+      delete acc.unified.fable
+    }
+    if (completeOfficialUsage) {
+      if (probe.usage_has_fable === true || hasFableUsage) acc.unified.account_tier = 'max'
+      else if (probe.usage_has_fable === false) acc.unified.account_tier = 'pro'
+      if (acc.unified.account_tier === 'pro' || acc.unified.account_tier === 'max')
+        acc.unified.account_tier_source = 'usage'
+    }
     if (probe.fable && !fableTransport) {
-      const planDenied = usageOk && !hasFableUsage && isFablePlanDenied(probe.fable)
+      const planDenied = completeOfficialUsage && !hasFableUsage && isFablePlanDenied(probe.fable)
       acc.unified.fable = {
         limited: oiRejected,
         banned: !!probe.fable.banned && !usageOk && (probe.usage_status === 401 || probe.usage_status === 403),
         plan_denied: planDenied,
-        ok: (!!probe.fable.ok && !oiRejected) || hasFableUsage,
+        ok: completeOfficialUsage && hasFableUsage,
         status: probe.fable.status || 0,
         reset: probe.fable.reset_at || acc.unified['7d_oi']?.reset || null,
         utilization: oiNorm ?? probe.fable.utilization ?? acc.unified['7d_oi']?.utilization ?? null,
@@ -347,15 +359,16 @@ export class AccountQuota {
         error: usageOk && Number(probe.fable.status) === 401 ? null : probe.fable.error || null,
         probed_at: probe.probed_at || new Date().toISOString(),
       }
-      const stored = String(acc.unified.account_tier || '').toLowerCase()
-      // Official /api/oauth/profile is authoritative; Fable signals only fill in when it is absent.
-      const fromProfile = acc.unified.account_tier_source === 'profile'
-      if (!fromProfile && (hasFableUsage || acc.unified.fable.ok)) acc.unified.account_tier = 'max'
-      else if (!fromProfile && acc.unified.fable.plan_denied && stored !== 'max') acc.unified.account_tier = 'pro'
+      // Only a complete official /usage classifies the plan; Fable hop only fills metadata.
+      if (completeOfficialUsage && hasFableUsage) {
+        acc.unified.account_tier = 'max'
+        acc.unified.account_tier_source = 'usage'
+      }
     } else if (usageOk) {
       const leftover = leftoverFable
-      if (hasFableUsage) {
-        if (acc.unified.account_tier_source !== 'profile') acc.unified.account_tier = 'max'
+      if (completeOfficialUsage && hasFableUsage) {
+        acc.unified.account_tier = 'max'
+        acc.unified.account_tier_source = 'usage'
         if (leftover.plan_denied || leftover.ok === false) {
           acc.unified.fable = {
             ...leftover,
@@ -913,8 +926,7 @@ export class AccountQuota {
     if (!accountId || (key !== 'pro' && key !== 'max')) return null
     const acc = this.repo.get(accountId)
     if (!acc) return null
-    // Only a newer profile read may change a profile-sourced tier.
-    if (acc.unified?.account_tier_source === 'profile' && source !== 'profile') return acc
+    if (acc.unified?.account_tier_source === 'profile' && source !== 'profile' && source !== 'usage') return acc
     if (acc.unified?.account_tier === key && (acc.unified?.account_tier_source || null) === source) return acc
     acc.unified = acc.unified || {}
     acc.unified.account_tier = key

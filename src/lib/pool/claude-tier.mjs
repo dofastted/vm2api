@@ -1,4 +1,4 @@
-import { isFableUnavailablePro, isInventedFableWindow } from '../oauth/crs-usage-probe.mjs'
+import { isInventedFableWindow } from '../oauth/crs-usage-probe.mjs'
 
 function quotaView(vm = {}, quota = {}) {
   return {
@@ -13,9 +13,8 @@ function quotaView(vm = {}, quota = {}) {
 /** Official /usage listing a Fable model, or a real 7d_oi window, is Max. */
 export function hasClaudeFableUsage(vm = {}, quota = {}) {
   const q = quotaView(vm, quota)
-  if (q.usage_has_fable === true) return true
+  if (q.usage_has_fable != null) return q.usage_has_fable === true
   const fb = quota.fable || vm.fable || {}
-  if (fb.ok) return true
   const oi = q['7d_oi'] || {}
   const hasOi =
     q.utilization_7d_oi != null ||
@@ -37,14 +36,14 @@ export function hasClaudeFableUsage(vm = {}, quota = {}) {
 export function inferClaudeTier(vm = {}, quota = {}) {
   const hasToken = !!(vm.has_token || vm.has_access)
   if (!hasToken) return { key: 'none', label: null }
-  const fb = quota.fable || vm.fable || {}
   const q = quotaView(vm, quota)
+  if (q.usage_has_fable === false) return { key: 'pro', label: 'Pro' }
   const stored = String(vm.account_tier || quota.account_tier || '').toLowerCase()
   if (hasClaudeFableUsage(vm, quota) || stored === 'max') {
     return { key: 'max', label: 'Max' }
   }
-  if (stored === 'pro' || isFableUnavailablePro(fb, q)) {
+  if (stored === 'pro') {
     return { key: 'pro', label: 'Pro' }
   }
-  return { key: 'unknown', label: null }
+  return { key: 'pro', label: 'Pro' }
 }

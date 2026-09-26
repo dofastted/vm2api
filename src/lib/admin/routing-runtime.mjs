@@ -120,7 +120,9 @@ export function createRoutingRuntime(ctx) {
     const stored = String(vm.account_tier || vm.claude?.account_tier || '').toLowerCase()
     if (stored === 'pro' || stored === 'max') return stored
     const acc = ctx.accountQuota.repo.get(vm.claude?.account_uuid || vm.account_uuid || vm.id)
-    return accountTierKey(acc)
+    const accountTier = accountTierKey(acc)
+    if (accountTier !== 'default') return accountTier
+    return vm.claude?.has_access || vm.has_token ? 'pro' : accountTier
   }
 
   function applyRoutingTierConcurrency(tiers) {

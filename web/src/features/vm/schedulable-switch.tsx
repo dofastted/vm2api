@@ -47,9 +47,9 @@ export function SchedulableSwitch({
   className?: string
 }) {
   const qc = useQueryClient()
-  const [optimistic, setOptimistic] = useState<boolean | null>(null)
   const restricted = scheduleState === 'restricted'
-  const checked = optimistic ?? (restricted || schedulable)
+  const [optimistic, setOptimistic] = useState<boolean | null>(null)
+  const checked = optimistic ?? schedulable
   const mutation = useMutation({
     mutationFn: (next: boolean) =>
       api(`/api/panel/vms/${encodeURIComponent(vmId)}/schedulable`, {

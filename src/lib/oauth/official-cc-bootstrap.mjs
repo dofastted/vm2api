@@ -1418,10 +1418,8 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       step: 'profile',
     })
     const account = await collectOfficialCcAccount({ vmId, homeDir, vm }, { slotOauth })
-    let tierSource = account.account_tier ? 'profile' : null
-    if (account.account_tier) {
-      stats = { ...(stats || {}), account_tier: account.account_tier }
-    } else if (stats && !stats.account_tier) {
+    let tierSource = null
+    if (stats?.limits_present === true && !stats.account_tier) {
       const accountTier = inferTierFromOfficialStats('', stats)
       if (accountTier) stats = { ...stats, account_tier: accountTier }
     }

@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.61 — 2026-09-26
+
+- 修复 native CLI 被 OOM 杀死或管道关闭后，Rust 内核仍宣告槽可用并持续返回 `native stdin: Broken pipe`：退出统一清理在途任务与调度状态，健康清零后由 watchdog 恢复，不重放推理。
+- 原生槽默认内存由 `500m` 调整为 `1g`，保留 `KIN_VM_MEMORY` 显式覆盖；已有容器需单独调整限制。
+- 完整成功的官方 usage 按 Fable 7d 判 Max，否则默认 Pro；修复额度探测旧参数、失败结果传递、旧 Max 窗口覆盖新 Pro，以及未确认套餐显示。
+- 修复 OAuth / Setup Token 授权码导入的 `Assignment to constant variable`，并让 revoke / 无效凭证自动关闭调度、在 Web 显示准确状态。
+- 修复 Web 手动调度开关刷新后回弹；新增相关 Node/Web/Rust 回归覆盖。
+
+已部署机升级：覆盖控制面、前端与 kernel 并重启 Node 一次；同步 Claude 槽内 kernel，不 `docker rm` 槽。
+
 ## Unreleased
 
 ## 1.3.60 — 2026-09-26

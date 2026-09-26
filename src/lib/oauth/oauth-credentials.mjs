@@ -472,6 +472,10 @@ export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false } = {})
   }
   if (n.source) vm.claude.source = n.source
   vm.claude.mode = mode
+  if (mode !== 'apikey' && vm.claude.account_tier !== 'max') {
+    vm.claude.account_tier = 'pro'
+    vm.claude.account_tier_source = vm.claude.account_tier_source || 'default'
+  }
   vm.claude.auth_scheme = resolveAuthScheme({
     mode,
     auth_scheme: cred.auth_scheme || cred.authScheme || prev.auth_scheme,
