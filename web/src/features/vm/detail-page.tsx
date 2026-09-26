@@ -254,8 +254,15 @@ export function VmDetailPage() {
   const todayWriteCache = Number(
     acc.today_cache_creation_tokens ?? vm.today_cache_creation_tokens ?? 0
   )
-  const todayInput = Number(acc.tokens_in ?? vm.tokens_in ?? 0)
-  const todayHit = cacheHitPct(todayInput, todayReadCache, todayWriteCache)
+  const todayInput = Number(
+    acc.today_input_tokens ?? vm.today_input_tokens ?? acc.tokens_in ?? vm.tokens_in ?? 0
+  )
+  const todayHit = cacheHitPct(
+    todayInput,
+    todayReadCache,
+    todayWriteCache,
+    isCodexVm(vm) ? 'openai' : 'anthropic'
+  )
   const credType = credTypeOf(vm)
   const officialCc = supportsOfficialCc(vm)
   const canRefresh = canRefreshCredential(vm)

@@ -12,6 +12,9 @@ import {
   parseLimitResetFromMessage,
   isPlanLimitMessage,
   limitWindowFromMessage,
+  hasOfficialUsageSample,
+  hasLiveExtraSample,
+  extraWindowSince,
 } from '../../src/lib/pool/quota-window.mjs'
 
 test('officialWindow prefers official over headers and leftover flat percent', () => {
@@ -166,6 +169,28 @@ test('parseLimitResetFromMessage follows DST in the named zone', () => {
   // 2026-11-01: US leaves DST. 11am ET the next day is UTC-5.
   const now = Date.parse('2026-11-01T20:00:00Z')
   assert.equal(parseLimitResetFromMessage('resets 11am (America/New_York)', now), Date.parse('2026-11-02T16:00:00Z'))
+})
+
+test('extraWindowSince uses reset minus duration, elapsed reset, or null', () => {
+  const now = Date.parse('2026-09-26T12:00:00.000Z')
+  assert.equal(
+    extraWindowSince('2026-09-26T16:00:00.000Z', WINDOW_5H_MS, now),
+    Date.parse('2026-09-26T11:00:00.000Z'),
+  )
+  assert.equal(extraWindowSince('2026-09-26T10:00:00.000Z', WINDOW_5H_MS, now), Date.parse('2026-09-26T10:00:00.000Z'))
+  assert.equal(extraWindowSince(null, WINDOW_5H_MS, now), null)
+})
+
+test('official /usage sample is detected without treating Extra as live', () => {
+  const now = Date.parse('2026-09-26T12:00:00.000Z')
+  const unified = {
+    source: 'vm-oauth-usage',
+    official: {
+      '5h': { utilization: 0.22, status: 'allowed', reset: '2026-09-26T16:00:00.000Z' },
+    },
+  }
+  assert.equal(hasOfficialUsageSample(unified), true)
+  assert.equal(hasLiveExtraSample(unified, { now }), false)
 })
 
 test('isPlanLimitMessage matches CLI limit text but not the entitlement error', () => {

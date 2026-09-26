@@ -195,8 +195,15 @@ test('refusal-cache count_tokens returns 500 and never peeks or hops', async () 
   assert.equal(cap.calls[0].body.error.code, 'refusal_guard')
 })
 
-test('setup-token usage returns unsupported', async () => {
+test('setup-token usage uses Extra and does not hop', async () => {
   const cap = jsonCapture()
+  let probes = 0
+  const unified = {
+    headers: {
+      '5h': { utilization: 0.12, status: 'active', reset: 'r5' },
+      '7d': { utilization: 0.34, status: 'ok', reset: 'r7' },
+    },
+  }
   await handleUserUsage(
     {},
     {},
@@ -204,16 +211,25 @@ test('setup-token usage returns unsupported', async () => {
       json: cap.json,
       requireAuth: () => true,
       stickyRouter: { extractPoolKey: () => null },
+      accountQuota: { repo: { get: () => ({ unified }) } },
       getPoolScheduler: () => ({
         peekAccount: async () => ({
           ok: true,
+          accountId: 'acc-1',
+          vmId: 'vm-01',
           vm: { credential_mode: 'setup-token' },
+          exec: {},
         }),
       }),
+      probeAccount: async () => {
+        probes += 1
+        return { ok: true }
+      },
     },
   )
-  assert.equal(cap.calls[0].status, 400)
-  assert.equal(cap.calls[0].body.error.code, 'usage_unsupported')
+  assert.equal(probes, 0)
+  assert.equal(cap.calls[0].status, 200)
+  assert.equal(cap.calls[0].body.source, 'extra')
 })
 
 test('oauth usage uses Extra and does not hop', async () => {

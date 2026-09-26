@@ -1,8 +1,9 @@
 /**
  * Periodic Extra reconcile for live credential slots.
  *
- * Healthy windows stay on Messages headers. Official GET /api/oauth/usage is
- * only polled for an elapsed Extra reset or a stale Pro classification.
+ * Healthy Extra windows stay on Messages headers. Official GET /api/oauth/usage
+ * hops when Extra never sampled (setup-token / first import), an Extra reset
+ * elapsed, or a stale Pro classification needs a Fable recheck.
  * A window whose reset has already passed is not a real 0% sample: cli-hop
  * often stops sending fresh rate-limit headers, and the
  * wipe would otherwise pin the panel at 0 while usage_logs keep growing.
@@ -11,7 +12,7 @@
 import { shouldProbeFable, usageProbeBackoffRemainingMs } from './crs-usage-probe.mjs'
 import { hasRefreshPresence } from './oauth-credentials.mjs'
 import { vmHasProxyPath } from './credential-refresh-monitor.mjs'
-import { parseResetMs } from '../pool/quota-window.mjs'
+import { hasLiveExtraSample, hasOfficialUsageSample, parseResetMs } from '../pool/quota-window.mjs'
 export const DEFAULT_USAGE_PROBE = Object.freeze({
   enabled: true,
   interval_sec: 60,
@@ -81,8 +82,8 @@ function elapsedExtraResetMs(unified = {}, now = Date.now()) {
 }
 
 /**
- * Hop /usage after a 5h/7d Extra reset has elapsed or a Pro tier needs rechecking.
- * A live or never-sampled window stays passive.
+ * Hop /usage after Extra never sampled, a 5h/7d Extra reset elapsed, or Pro recheck.
+ * Live Extra or an existing official sample stays passive.
  * @returns {{ due: boolean, reason?: string }}
  */
 export function isUsageProbeDue(account = {}, opts = {}) {
@@ -101,8 +102,24 @@ export function isUsageProbeDue(account = {}, opts = {}) {
     }
   }
   const resetMs = elapsedExtraResetMs(unified, now)
-  if (resetMs == null) return { due: false, reason: 'list_passive_only' }
   const probedAt = Date.parse(account?.last_probe?.at || unified.last_probe?.at || unified.last_probe?.probed_at || '')
+  if (resetMs == null) {
+    if (hasOfficialUsageSample(unified) || hasLiveExtraSample(unified, { now })) {
+      return { due: false, reason: 'list_passive_only' }
+    }
+    const sampledAt = Date.parse(
+      account?.last_probe?.at ||
+        unified.last_probe?.at ||
+        unified.last_probe?.probed_at ||
+        unified.fable_probe_attempted_at ||
+        unified.fable?.probed_at ||
+        '',
+    )
+    if (Number.isFinite(sampledAt) && now - sampledAt < STALE_USAGE_PROBE_GAP_MS) {
+      return { due: false, reason: 'probed_recently' }
+    }
+    return { due: true, reason: 'never_sampled_official' }
+  }
   if (Number.isFinite(probedAt) && probedAt > resetMs && now - probedAt < STALE_USAGE_PROBE_GAP_MS) {
     return { due: false, reason: 'probed_recently' }
   }

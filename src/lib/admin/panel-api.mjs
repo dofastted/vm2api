@@ -440,7 +440,7 @@ export async function buildDashboard({
     vms,
     (() => {
       try {
-        return attachBillingMeta(requestLog?.billingStats?.(), accounts)
+        return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), accounts)
       } catch {
         return null
       }
@@ -579,19 +579,19 @@ export async function buildVmDetail({
   const acc = findAccount(accountQuota, summary)
   const billing = (() => {
     try {
-      return requestLog?.billingStats?.() || null
+      return panelBillingStats(requestLog, accountQuota, [summary])
     } catch {
       return null
     }
   })()
   const cost = lookupBilling(indexBillingAccounts(billing), acc || summary)
-  applyCostFields(summary, cost)
+  const gpt = isCodexVm(vm)
+  applyCostFields(summary, cost, { scheme: gpt ? 'openai' : 'anthropic' })
   const detail = buildAccountBilling(cost, billing, {
     vmId: summary.id,
     accountId: acc?.account_id || summary.account_uuid,
     requestLog,
   })
-  const gpt = isCodexVm(vm)
   const inferenceEngine = gpt ? null : summary.resolved_inference_engine || 'rust'
   let goHealth = null
   let rustHealth = null
@@ -820,6 +820,11 @@ export async function buildProbeOne({
     vm,
   }
   const accountId = vm.claude?.account_uuid || vm.id
+  if (vm.claude?.account_uuid) {
+    try {
+      accountQuota.rebindToVm(vm.claude.account_uuid, vm.id, { email: vm.claude?.email || null })
+    } catch {}
+  }
   accountQuota.ensure({
     account_id: accountId,
     vm_id: vm.id,
@@ -883,8 +888,8 @@ export async function buildProbeOne({
     qAfter,
   ).key
   if (tier === 'pro' || tier === 'max') {
-    accountQuota.setAccountTier(accountId, tier)
-    persistAccountTier(cfg.paths.project, id, tier)
+    accountQuota.setAccountTier(accountId, tier, { source: 'usage' })
+    persistAccountTier(cfg.paths.project, id, tier, { source: 'usage' })
   }
   const availability = evaluateAccount({
     vm,
@@ -936,10 +941,15 @@ export async function buildProbeOne({
     quota: {
       utilization_5h: qAfter.utilization_5h,
       utilization_7d: qAfter.utilization_7d,
+      utilization_7d_oi: qAfter.utilization_7d_oi,
       status_5h: qAfter.status_5h,
       status_7d: qAfter.status_7d,
+      status_7d_oi: qAfter.status_7d_oi,
       reset_5h: qAfter.reset_5h,
       reset_7d: qAfter.reset_7d,
+      reset_7d_oi: qAfter.reset_7d_oi,
+      account_tier: tier,
+      usage_has_fable: qAfter.usage_has_fable,
     },
     availability,
     cred_status: credStatusFromAvailability(availability),
@@ -988,9 +998,10 @@ export async function buildProbeAll({ cfg, accountQuota, hop = false, force = fa
 
 export function buildUsage({ accountQuota, cfg, requestLog = null }) {
   const snap = accountQuota.snapshot()
+  const listed = listVms(cfg?.paths?.project)
   const billing = (() => {
     try {
-      return requestLog?.billingStats?.() || null
+      return panelBillingStats(requestLog, accountQuota, listed)
     } catch {
       return null
     }
@@ -1030,6 +1041,12 @@ export function buildUsage({ accountQuota, cfg, requestLog = null }) {
       today: cost?.today || null,
       window_5h: cost?.window_5h || null,
       window_7d: cost?.window_7d || null,
+      cache_hit_rate: cacheHitStats({
+        input_tokens: cost?.today_input_tokens || cost?.today?.input_tokens || 0,
+        cache_read_tokens: cost?.today_cache_read_tokens || cost?.today?.cache_read_tokens || 0,
+        cache_creation_tokens: cost?.today_cache_creation_tokens || cost?.today?.cache_creation_tokens || 0,
+        scheme: isCodexVm(vm) ? 'openai' : 'anthropic',
+      }).cache_hit_rate,
       near_limit:
         accountQuota?.nearLimit?.(a) ??
         isNearLimit(
@@ -1129,7 +1146,7 @@ export async function snapshotAccountPool({
     vms,
     (() => {
       try {
-        return attachBillingMeta(requestLog?.billingStats?.(), accounts)
+        return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), accounts)
       } catch {
         return null
       }
@@ -1790,11 +1807,57 @@ function attachBillingMeta(billing, accounts = []) {
   }
 }
 
+function accountWindowsForBilling(accountQuota, vms = []) {
+  const listed = Array.isArray(vms) ? vms : []
+  const byVm = new Map(listed.map((vm) => [vm.id, vm]))
+  const accounts = (() => {
+    try {
+      return accountQuota?.snapshot?.().accounts || []
+    } catch {
+      return []
+    }
+  })()
+  const windows = []
+  const seen = new Set()
+  for (const acc of accounts) {
+    const vm = byVm.get(acc.vm_id) || (acc.vm_id ? { id: acc.vm_id } : {})
+    const q = quotaFromAccount(acc)
+    const key = `${acc.account_id || ''}\0${acc.vm_id || ''}`
+    seen.add(key)
+    windows.push({
+      account_id: acc.account_id,
+      vm_id: acc.vm_id,
+      reset_5h: q.reset_5h,
+      reset_7d: q.reset_7d,
+      scheme: isCodexVm(vm) ? 'openai' : 'anthropic',
+    })
+  }
+  for (const vm of listed) {
+    const key = `${vm.account_uuid || vm.id}\0${vm.id}`
+    if (seen.has(key) || seen.has(`${vm.account_uuid || ''}\0${vm.id}`)) continue
+    const acc = findAccount(accountQuota, vm)
+    const q = quotaFromAccount(acc)
+    windows.push({
+      account_id: acc?.account_id || vm.account_uuid || vm.id,
+      vm_id: vm.id,
+      reset_5h: q.reset_5h || vm.reset_5h || null,
+      reset_7d: q.reset_7d || vm.reset_7d || null,
+      scheme: isCodexVm(vm) ? 'openai' : 'anthropic',
+    })
+  }
+  return windows
+}
+
+function panelBillingStats(requestLog, accountQuota, vms) {
+  if (!requestLog?.billingStats) return null
+  return requestLog.billingStats({ accountWindows: accountWindowsForBilling(accountQuota, vms) })
+}
+
 function stampVmBilling(vms, billing) {
   if (!billing) return null
   const index = indexBillingAccounts(billing)
   for (const vm of vms || []) {
-    applyCostFields(vm, lookupBilling(index, vm))
+    applyCostFields(vm, lookupBilling(index, vm), { scheme: isCodexVm(vm) ? 'openai' : 'anthropic' })
   }
   return billing
 }
@@ -1820,7 +1883,7 @@ function periodView(row) {
   }
 }
 
-function applyCostFields(target, cost) {
+function applyCostFields(target, cost, { scheme } = {}) {
   if (!target) return
   const today = cost?.today && typeof cost.today === 'object' ? cost.today : null
   const todayInput = Number(cost?.today_input_tokens ?? (today?.input_tokens || 0))
@@ -1838,6 +1901,7 @@ function applyCostFields(target, cost) {
     input_tokens: todayInput,
     cache_read_tokens: todayRead,
     cache_creation_tokens: todayWrite,
+    scheme: scheme || (isCodexVm(target) ? 'openai' : 'anthropic'),
   }).cache_hit_rate
   target.window_5h_cost = cost?.window_5h_cost || 0
   target.window_5h_requests = cost?.window_5h_requests || 0

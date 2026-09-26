@@ -1,5 +1,6 @@
 import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
+import { isCodexVm } from '@/lib/vm-kind'
 
 function num(v: unknown): number {
   const n = Number(v)
@@ -114,11 +115,13 @@ export function vmTodayView(vm: Vm, accounts?: UsageAccountRow[]): Vm {
 export function cacheHitPct(
   input: unknown,
   read: unknown,
-  write: unknown
+  write: unknown,
+  scheme: 'anthropic' | 'openai' = 'anthropic'
 ): number | null {
-  const prompt = num(input) + num(read) + num(write)
+  const prompt =
+    scheme === 'openai' ? num(input) : num(input) + num(read) + num(write)
   if (!prompt) return null
-  return (num(read) / prompt) * 100
+  return Math.min(100, (num(read) / prompt) * 100)
 }
 
 /** Prefers the gateway's own `cache_hit_rate` (0–1) and falls back to local math. */
@@ -132,7 +135,8 @@ export function vmCacheHitPct(
   return cacheHitPct(
     row.today_input_tokens,
     row.today_cache_read_tokens,
-    row.today_cache_creation_tokens
+    row.today_cache_creation_tokens,
+    isCodexVm(vm) ? 'openai' : 'anthropic'
   )
 }
 

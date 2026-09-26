@@ -20,9 +20,9 @@ test('normalizeCredentialMode maps aliases', () => {
   assert.equal(normalizeCredentialMode(''), 'oauth')
 })
 
-test('setup-token cannot official-cc or usage, can refresh', () => {
+test('setup-token cannot official-cc, can official usage and refresh', () => {
   assert.equal(canOfficialCc('setup-token'), false)
-  assert.equal(canOfficialUsage('setup-token'), false)
+  assert.equal(canOfficialUsage('setup-token'), true)
   assert.equal(canCountTokens('setup-token'), true)
   assert.equal(canRefreshCredential('setup-token'), true)
 })

@@ -7,9 +7,11 @@ sessionKey（默认 Setup Token）或 授权码
    │ 必须先有 VM + 槽位 SOCKS5（禁止 direct fallback）
    ▼
 bin/kin-cookie-auth（控制面 spawn；过程不在 Node）
-   │ 写入槽 credentials.json
+   │ 先展平 helper/token 里的 oauth_account / account
+   │ 身份仍缺则经同一条槽 SOCKS5 GET /api/claude_cli/bootstrap
+   │ 不靠官方初装，不 PATCH Grove
    ▼
-槽 ~/.claude/credentials.json   ← 活票只在这里
+槽 ~/.claude/credentials.json   ← 活票只在这里（含 email / account_uuid / org_uuid）
    │ host RefreshIfNeeded（推理临期 或 面板显式 refresh）
    │ 无后台定时器；401 不强制换票
    │ GET /v1/models 走 host SOCKS，避免 401 烧 refresh
@@ -56,7 +58,7 @@ commitImportedOauth → 仅完整 OAuth 排队官方 Claude Code 初装
 以下请求共用该槽绑定的 SOCKS5（控制面 host 或 kernel 透明出口），不允许 VPS 直连 Anthropic：
 
 - `/v1/messages`（Rust kernel cli-hop）
-- `/api/oauth/usage`、`/api/oauth/profile`、`/v1/models`（额度与等级，槽内 worker）
+- `/api/oauth/usage`、`/api/oauth/profile`、`/v1/models`（额度与等级，槽内 worker；完整 OAuth 与短效 Setup Token 都打。Setup Token 仍不跑官方初装）
 - `/v1/oauth/token`（refresh / 授权码）
 - 健康 / 额度探测
 - 遥测 sidecar 的 event_logging / eval（若开启）
@@ -94,7 +96,7 @@ commitImportedOauth → 仅完整 OAuth 排队官方 Claude Code 初装
 
 ## 用量刻度
 
-面板探测走槽内 `kin-worker oauth`（profile、usage、models）。出口是槽的 SOCKS5 或透明网络，Node 不直连 Anthropic：
+面板探测走槽内 `kin-worker oauth`（profile、usage、models）。完整 OAuth 与短效 Setup Token 都打官方 `/api/oauth/usage`。出口是槽的 SOCKS5 或透明网络，Node 不直连 Anthropic：
 
 - `five_hour` / `seven_day` utilization 0–100
 - Fable `weekly_scoped` → `7d_oi`；limits / model_scoped 里出现 Fable 模型即 Max

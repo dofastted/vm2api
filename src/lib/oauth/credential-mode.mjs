@@ -2,6 +2,8 @@
  * Slot credential kinds: full OAuth, Setup Token (inference-only OAuth),
  * and Anthropic Console API Key.
  */
+import { flattenOauthIdentity } from './oauth-identity.mjs'
+
 export const CREDENTIAL_OAUTH = 'oauth'
 export const CREDENTIAL_SETUP_TOKEN = 'setup-token'
 export const CREDENTIAL_APIKEY = 'apikey'
@@ -28,8 +30,10 @@ export function canOfficialCc(raw) {
   return normalizeCredentialMode(raw) === CREDENTIAL_OAUTH
 }
 
+/** Official GET /api/oauth/usage|/profile. Setup-token oat is the same short-lived grant. */
 export function canOfficialUsage(raw) {
-  return normalizeCredentialMode(raw) === CREDENTIAL_OAUTH
+  const mode = normalizeCredentialMode(raw)
+  return mode === CREDENTIAL_OAUTH || mode === CREDENTIAL_SETUP_TOKEN
 }
 
 export function canCountTokens(raw) {
@@ -90,15 +94,16 @@ export function liveOauthToSetupToken(oauth = {}) {
   ) {
     throw fail('credential_kind_mismatch', 'Console API Key 不能转为 Setup Token')
   }
+  const identity = flattenOauthIdentity(oauth)
   return {
     type: CREDENTIAL_SETUP_TOKEN,
     mode: CREDENTIAL_SETUP_TOKEN,
     access_token: access,
     refresh_token: String(oauth.refresh_token || oauth.refreshToken || ''),
     expires_at: oauth.expires_at || oauth.expiresAt || null,
-    email: oauth.email || oauth.email_address || null,
-    account_uuid: oauth.account_uuid || oauth.accountUuid || null,
-    org_uuid: oauth.org_uuid || oauth.orgUuid || null,
+    email: identity.email,
+    account_uuid: identity.account_uuid,
+    org_uuid: identity.org_uuid,
     scope: 'user:inference',
     scopes: ['user:inference'],
     source: 'oauth-to-setup-token',

@@ -14,6 +14,7 @@ import { atomicWriteJson } from '../vm/vm-file.mjs'
 import { isManualScheduleLocked } from '../pool/schedule-policy.mjs'
 import { credentialModeFromOauth, isApiKeyMode } from './credential-mode.mjs'
 import { resolveAuthScheme } from './auth-scheme.mjs'
+import { flattenOauthIdentity } from './oauth-identity.mjs'
 
 export const REFRESH_SKEW_MS = 5 * 60 * 1000
 
@@ -55,13 +56,14 @@ export function normalizeOauth(cred = {}) {
   if (exp && exp > 10_000_000_000) exp = Math.floor(exp / 1000)
   if (!exp && cred.expires_in) exp = Math.floor(Date.now() / 1000) + Number(cred.expires_in)
   const scopes = Array.isArray(cred.scopes) ? cred.scopes.filter(Boolean) : []
+  const identity = flattenOauthIdentity(cred)
   return {
     access_token: access,
     refresh_token: refresh,
     expires_at: exp || null,
-    email: cred.email || cred.email_address || cred.emailAddress || null,
-    account_uuid: cred.account_uuid || cred.accountUuid || null,
-    org_uuid: cred.org_uuid || cred.orgUuid || null,
+    email: identity.email,
+    account_uuid: identity.account_uuid,
+    org_uuid: identity.org_uuid,
     scope: cred.scope || (scopes.length ? scopes.join(' ') : null),
     source: cred.source || null,
     session_key: cred.session_key || cred.sessionKey || null,

@@ -51,6 +51,10 @@ test('sessionKeyToOAuth requires SOCKS5', async () => {
   )
 })
 
+function skipBootstrap() {
+  return async () => ({ ok: false, status: 404, json: async () => ({}) })
+}
+
 test('sessionKeyToOAuth on local egress hops without PROXY_URL', async () => {
   const bin = writeHelper(`#!/bin/sh
 if [ -n "$PROXY_URL" ]; then echo fail >&2; exit 2; fi
@@ -58,7 +62,10 @@ echo '{"access_token":"sk-ant-oat01-direct","source":"direct"}'
 `)
   process.env.KIN_COOKIE_AUTH_BIN = bin
   try {
-    const cred = await sessionKeyToOAuth('sk-ant-sid01-testaaaaaaaa', { proxyUrl: '' })
+    const cred = await sessionKeyToOAuth('sk-ant-sid01-testaaaaaaaa', {
+      proxyUrl: '',
+      fetchImpl: skipBootstrap(),
+    })
     assert.equal(cred.access_token, 'sk-ant-oat01-direct')
   } finally {
     delete process.env.KIN_COOKIE_AUTH_BIN
@@ -71,9 +78,45 @@ echo '{"access_token":"sk-ant-oat01-helper","refresh_token":"sk-ant-ort01-helper
 `)
   process.env.KIN_COOKIE_AUTH_BIN = bin
   try {
-    const cred = await sessionKeyToOAuth('sk-ant-sid01-testaaaaaaaa', { proxyUrl: 'socks5://127.0.0.1:1080' })
+    const cred = await sessionKeyToOAuth('sk-ant-sid01-testaaaaaaaa', {
+      proxyUrl: 'socks5://127.0.0.1:1080',
+      fetchImpl: skipBootstrap(),
+    })
     assert.equal(cred.access_token, 'sk-ant-oat01-helper')
     assert.equal(cred.source, 'test-helper')
+  } finally {
+    delete process.env.KIN_COOKIE_AUTH_BIN
+  }
+})
+
+const unixTest = process.platform === 'win32' ? test.skip : test
+
+unixTest('sessionKeyToOAuth fills identity from bootstrap after helper tokens', async () => {
+  const bin = writeHelper(`#!/bin/sh
+echo '{"access_token":"sk-ant-oat01-need","refresh_token":"sk-ant-ort01-need","source":"test-helper"}'
+`)
+  process.env.KIN_COOKIE_AUTH_BIN = bin
+  try {
+    const cred = await sessionKeyToOAuth('sk-ant-sid01-testaaaaaaaa', {
+      proxyUrl: 'socks5h://127.0.0.1:1',
+      scope: 'inference',
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          oauth_account: {
+            account_uuid: 'acct-sk',
+            account_email: 'sk@example.com',
+            organization_uuid: 'org-sk',
+          },
+        }),
+      }),
+    })
+    assert.equal(cred.type, 'setup-token')
+    assert.equal(cred.email, 'sk@example.com')
+    assert.equal(cred.account_uuid, 'acct-sk')
+    assert.equal(cred.org_uuid, 'org-sk')
+    assert.equal(cred.refresh_token, 'sk-ant-ort01-need')
   } finally {
     delete process.env.KIN_COOKIE_AUTH_BIN
   }

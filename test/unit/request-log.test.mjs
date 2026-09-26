@@ -243,6 +243,51 @@ test('zero group multiplier keeps usage and key counters but charges no USD', ()
   assert.equal(stored.usage_5h, 0)
 })
 
+test('billingStats Extra window excludes older logs outside reset-5h', () => {
+  const store = tmpStore('normal')
+  const now = Date.parse('2026-09-26T12:00:00.000Z')
+  const ctxOld = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+  )
+  store.finish(ctxOld, {
+    status: 200,
+    model: 'claude-opus-5',
+    upstream_model: 'claude-opus-5',
+    vm_id: 'vm-01',
+    account_id: 'acc-1',
+    usage: { input_tokens: 1_000_000, output_tokens: 0 },
+  })
+  store.repo.db
+    .prepare('UPDATE usage_logs SET created_at = ? WHERE vm_id = ?')
+    .run('2026-09-26T08:00:00.000Z', 'vm-01')
+  const ctxNew = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+  )
+  store.finish(ctxNew, {
+    status: 200,
+    model: 'claude-opus-5',
+    upstream_model: 'claude-opus-5',
+    vm_id: 'vm-01',
+    account_id: 'acc-1',
+    usage: { input_tokens: 200_000, output_tokens: 0 },
+  })
+  store.repo.db
+    .prepare("UPDATE usage_logs SET created_at = '2026-09-26T11:30:00.000Z' WHERE created_at > '2026-09-26T10:00:00.000Z'")
+    .run()
+  const reset5h = '2026-09-26T16:00:00.000Z'
+  const bill = store.billingStats({
+    now,
+    accountWindows: [{ account_id: 'acc-1', vm_id: 'vm-01', reset_5h: reset5h }],
+  })
+  assert.equal(bill.accounts[0].window_5h_requests, 1)
+  assert.ok(bill.accounts[0].window_5h_cost < 2)
+  assert.equal(bill.accounts[0].window_5h_cost, bill.window_5h.total_cost)
+  const rolling = store.billingStats({ now })
+  assert.equal(rolling.accounts[0].window_5h_requests, 2)
+})
+
 test('billingStats aggregates official cost per account and today', () => {
   const store = tmpStore('normal')
   const ctx = store.start(

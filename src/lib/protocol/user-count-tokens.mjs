@@ -36,7 +36,7 @@ export function usageUnsupportedError() {
   return makeError({
     type: ErrorType.INVALID_REQUEST,
     code: ErrorCode.USAGE_UNSUPPORTED,
-    message: 'usage 只支持完整 OAuth 账户，Setup Token / API Key 请用 POST /v1/messages/count_tokens',
+    message: 'usage 只支持 OAuth / Setup Token 账户，API Key 请用 POST /v1/messages/count_tokens',
     status: 400,
   })
 }

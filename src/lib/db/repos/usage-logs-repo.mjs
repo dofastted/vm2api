@@ -17,8 +17,9 @@ import {
   ingressAuthSql,
   slaOkErrorSqlList,
 } from '../../admin/error-class.mjs'
-import { calculateCost, emptyCostBucket, shanghaiDayStartIso, UNPRICED_MODEL } from '../../admin/pricing.mjs'
+import { calculateCost, emptyCostBucket, shanghaiDayStartIso, sumCostBuckets, UNPRICED_MODEL } from '../../admin/pricing.mjs'
 import { cacheHitStats } from '../../admin/cache-metrics.mjs'
+import { extraWindowSince, WINDOW_5H_MS, WINDOW_7D_MS } from '../../pool/quota-window.mjs'
 
 const IGNORED_CODES_SQL = ignoredErrorSqlList()
 const SLA_OK_CODES_SQL = slaOkErrorSqlList()
@@ -123,6 +124,56 @@ function timeCond(since, until) {
     params.push(new Date(until).toISOString())
   }
   return { cond: where.length ? `WHERE ${where.join(' AND ')}` : '', params }
+}
+
+function accountEventKey(row) {
+  return `${row?.account_id || ''}\0${row?.vm_id || ''}`
+}
+
+function resolveAccountWindow(windows, row) {
+  const list = Array.isArray(windows) ? windows : []
+  return (
+    list.find((w) => w.account_id === row.account_id && (w.vm_id || null) === (row.vm_id || null)) ||
+    list.find((w) => w.account_id && w.account_id === row.account_id) ||
+    list.find((w) => w.vm_id && w.vm_id === row.vm_id) ||
+    null
+  )
+}
+
+function groupCostEvents(rows = []) {
+  const map = new Map()
+  for (const row of rows) {
+    const key = accountEventKey(row)
+    const list = map.get(key) || []
+    list.push(row)
+    map.set(key, list)
+  }
+  return map
+}
+
+function bucketEventsSince(rows = [], sinceMs) {
+  const since = Number(sinceMs)
+  const picked = rows.filter((row) => {
+    const at = Date.parse(row.created_at)
+    return Number.isFinite(at) && (!Number.isFinite(since) || at >= since)
+  })
+  if (!picked.length) return emptyCostBucket()
+  return sumCostBuckets(
+    picked.map((row) => ({
+      requests: 1,
+      success: Number(row.success || 0),
+      errors: Number(row.errors || 0),
+      input_tokens: Number(row.input_tokens || 0),
+      output_tokens: Number(row.output_tokens || 0),
+      cache_read_tokens: Number(row.cache_read_tokens || 0),
+      cache_creation_tokens: Number(row.cache_creation_tokens || 0),
+      input_cost: Number(row.input_cost || 0),
+      output_cost: Number(row.output_cost || 0),
+      cache_read_cost: Number(row.cache_read_cost || 0),
+      cache_creation_cost: Number(row.cache_creation_cost || 0),
+      total_cost: Number(row.total_cost || 0),
+    })),
+  )
 }
 
 function ownerPred(ownerUserId) {
@@ -621,27 +672,43 @@ export class UsageLogsRepo {
   }
 
   /** Official-standard totals: all-time + Shanghai calendar today + per account. */
-  billingStats() {
+  billingStats({ accountWindows = null, now = Date.now() } = {}) {
     try {
       this.backfillMissingCosts()
     } catch {}
     const todayStart = shanghaiDayStartIso()
     const total = this._costSelect('', [])
     const today = this._costSelect('WHERE created_at >= ?', [todayStart])
-    const fiveHStart = new Date(Date.now() - 5 * 3600_000).toISOString()
-    const sevenDStart = new Date(Date.now() - 7 * 86400_000).toISOString()
+    const fiveHStart = new Date(now - WINDOW_5H_MS).toISOString()
+    const sevenDStart = new Date(now - WINDOW_7D_MS).toISOString()
     const accountsTotal = this.costByAccount()
     const accountsToday = this.costByAccount({ since: todayStart })
-    const accounts5h = this.costByAccount({ since: fiveHStart })
-    const accounts7d = this.costByAccount({ since: sevenDStart })
     const keyOf = (a) => a.account_id + '\0' + (a.vm_id || '')
     const todayById = new Map(accountsToday.map((a) => [keyOf(a), a]))
-    const fiveById = new Map(accounts5h.map((a) => [keyOf(a), a]))
-    const sevenById = new Map(accounts7d.map((a) => [keyOf(a), a]))
+    const aligned = Array.isArray(accountWindows) && accountWindows.length > 0
+    const events = aligned ? this._costEventsSince(sevenDStart) : null
+    const fiveById = aligned
+      ? null
+      : new Map(this.costByAccount({ since: fiveHStart }).map((a) => [keyOf(a), a]))
+    const sevenById = aligned
+      ? null
+      : new Map(this.costByAccount({ since: sevenDStart }).map((a) => [keyOf(a), a]))
+    const eventsByKey = aligned ? groupCostEvents(events) : null
     const accounts = accountsTotal.map((a) => {
       const t = todayById.get(keyOf(a)) || emptyCostBucket()
-      const w = fiveById.get(keyOf(a)) || emptyCostBucket()
-      const w7 = sevenById.get(keyOf(a)) || emptyCostBucket()
+      const win = aligned ? resolveAccountWindow(accountWindows, a) : null
+      const since5 = aligned
+        ? extraWindowSince(win?.reset_5h, WINDOW_5H_MS, now) ?? Date.parse(fiveHStart)
+        : null
+      const since7 = aligned
+        ? extraWindowSince(win?.reset_7d, WINDOW_7D_MS, now) ?? Date.parse(sevenDStart)
+        : null
+      const w = aligned
+        ? bucketEventsSince(eventsByKey.get(keyOf(a)) || [], since5)
+        : fiveById.get(keyOf(a)) || emptyCostBucket()
+      const w7 = aligned
+        ? bucketEventsSince(eventsByKey.get(keyOf(a)) || [], since7)
+        : sevenById.get(keyOf(a)) || emptyCostBucket()
       return {
         ...a,
         today: { ...t },
@@ -666,25 +733,63 @@ export class UsageLogsRepo {
         window_5h_input_cost: Number(w.input_cost || 0),
         window_5h_output_cost: Number(w.output_cost || 0),
         window_5h_cache_cost: Number(w.cache_read_cost || 0) + Number(w.cache_creation_cost || 0),
+        window_5h_start: aligned ? new Date(since5).toISOString() : fiveHStart,
         window_7d_cost: Number(w7.total_cost || 0),
         window_7d_requests: Number(w7.requests || 0),
         window_7d_success: Number(w7.success || 0),
         window_7d_errors: Number(w7.errors || 0),
         window_7d_tokens: Number(w7.input_tokens || 0) + Number(w7.output_tokens || 0),
+        window_7d_start: aligned ? new Date(since7).toISOString() : sevenDStart,
       }
     })
+    const window5h = aligned
+      ? { ...sumCostBuckets(accounts.map((a) => a.window_5h)), ...cacheHitStats(sumCostBuckets(accounts.map((a) => a.window_5h))) }
+      : this._costSelect('WHERE created_at >= ?', [fiveHStart])
+    const window7d = aligned
+      ? { ...sumCostBuckets(accounts.map((a) => a.window_7d)), ...cacheHitStats(sumCostBuckets(accounts.map((a) => a.window_7d))) }
+      : this._costSelect('WHERE created_at >= ?', [sevenDStart])
     return {
       source: 'anthropic-official',
       currency: 'USD',
       today_start: todayStart,
-      window_5h_start: fiveHStart,
-      window_7d_start: sevenDStart,
+      window_5h_start: aligned
+        ? accounts.reduce((min, a) => (!min || a.window_5h_start < min ? a.window_5h_start : min), fiveHStart)
+        : fiveHStart,
+      window_7d_start: aligned
+        ? accounts.reduce((min, a) => (!min || a.window_7d_start < min ? a.window_7d_start : min), sevenDStart)
+        : sevenDStart,
       today,
-      window_5h: this._costSelect('WHERE created_at >= ?', [fiveHStart]),
-      window_7d: this._costSelect('WHERE created_at >= ?', [sevenDStart]),
+      window_5h: window5h,
+      window_7d: window7d,
       total,
       accounts,
     }
+  }
+
+  _costEventsSince(since) {
+    return this.db
+      .prepare(
+        `
+      SELECT
+        COALESCE(NULLIF(final_account_id, ''), NULLIF(account_id, ''), vm_id, '—') AS account_id,
+        vm_id,
+        created_at,
+        CASE WHEN ${SLA_SUCCESS_PRED} THEN 1 ELSE 0 END AS success,
+        CASE WHEN ${SLA_ERROR_PRED} THEN 1 ELSE 0 END AS errors,
+        COALESCE(input_tokens, 0) AS input_tokens,
+        COALESCE(output_tokens, 0) AS output_tokens,
+        COALESCE(cache_read_tokens, 0) AS cache_read_tokens,
+        COALESCE(cache_creation_tokens, 0) AS cache_creation_tokens,
+        COALESCE(input_cost, 0) AS input_cost,
+        COALESCE(output_cost, 0) AS output_cost,
+        COALESCE(cache_read_cost, 0) AS cache_read_cost,
+        COALESCE(cache_creation_cost, 0) AS cache_creation_cost,
+        COALESCE(total_cost, 0) AS total_cost
+      FROM usage_logs
+      WHERE created_at >= ?
+    `,
+      )
+      .all(since)
   }
 
   ownerBilling({ ownerUserId = null, since = null, until = null, groupBy = 'vm' } = {}) {

@@ -10,6 +10,18 @@
 export const WINDOW_5H_MS = 5 * 3600_000
 export const WINDOW_7D_MS = 7 * 24 * 3600_000
 
+/**
+ * Inclusive start of the current Extra window.
+ * Future reset → [reset − duration, reset). Elapsed reset → new window started at reset.
+ * Missing reset → null so the caller can fall back to a wall-clock lookback.
+ */
+export function extraWindowSince(reset, durationMs, now = Date.now()) {
+  const resetMs = parseResetMs(reset)
+  const duration = Number(durationMs)
+  if (!Number.isFinite(resetMs) || !Number.isFinite(duration) || duration <= 0) return null
+  return resetMs > now ? resetMs - duration : resetMs
+}
+
 export function parseResetMs(reset) {
   if (reset == null || reset === '') return NaN
   if (typeof reset === 'number' && Number.isFinite(reset)) {
@@ -262,6 +274,34 @@ export function listQuotaFromHeaders(unified = {}, { now = Date.now() } = {}) {
     '5h': w5,
     '7d': w7,
   }
+}
+
+function officialSample(unified = {}, key = '5h') {
+  if (windowHasData(unified?.official?.[key])) return unified.official[key]
+  const officialSource =
+    OFFICIAL_SOURCES.has(String(unified?.source || '')) ||
+    OFFICIAL_SOURCES.has(String(unified?.last_probe?.source || ''))
+  if (officialSource && windowHasData(unified?.[key])) return unified[key]
+  return null
+}
+
+/** Official /usage has a real 5h/7d sample (not the empty officialWindow default). */
+export function hasOfficialUsageSample(unified = {}) {
+  return !!(officialSample(unified, '5h') || officialSample(unified, '7d'))
+}
+
+/** Extra 5h/7d still inside its reset — stay on headers, do not hop. */
+export function hasLiveExtraSample(unified = {}, { now = Date.now() } = {}) {
+  const headers = unified?.headers
+  if (!headers || typeof headers !== 'object') return false
+  for (const key of ['5h', '7d']) {
+    const window = headers[key]
+    if (!windowHasData(window)) continue
+    const resetMs = parseResetMs(window.reset)
+    const elapsed = window.stale_reason === 'reset_elapsed' || (Number.isFinite(resetMs) && resetMs <= now)
+    if (!elapsed) return true
+  }
+  return false
 }
 
 /** Extra/ingest is 0–1; leftover official Settings numbers are 0–100. Never ×100 twice. */

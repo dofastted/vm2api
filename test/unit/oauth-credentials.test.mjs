@@ -380,6 +380,31 @@ test('persistOauthToVm writes scope from scopes array', () => {
   assert.equal(vm.claude.scope, 'user:inference')
 })
 
+test('persistOauthToVm writes flattened oauth_account identity', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-ident-'))
+  const vmPath = path.join(dir, 'vm-06.json')
+  fs.writeFileSync(vmPath, JSON.stringify({ id: 'vm-06', claude: { mode: 'setup-token' } }))
+  persistOauthToVm(
+    vmPath,
+    {
+      type: 'setup-token',
+      access_token: 'sk-ant-oat01-ID',
+      refresh_token: 'sk-ant-ort01-ID',
+      oauth_account: {
+        account_uuid: 'acct-persist',
+        account_email: 'persist@example.com',
+        organization_uuid: 'org-persist',
+      },
+    },
+    { acceptLiveGrant: true },
+  )
+  const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+  assert.equal(vm.claude.email, 'persist@example.com')
+  assert.equal(vm.claude.account_uuid, 'acct-persist')
+  assert.equal(vm.claude.org_uuid, 'org-persist')
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
 test('official setup-token persist omits refresh and marks mode', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-setup-token-'))
   const vmPath = path.join(dir, 'vm-05.json')

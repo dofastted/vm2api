@@ -14,6 +14,7 @@ import { collectSlotIdentity } from '../vm/guest-identity.mjs'
 import { importWorkerCredential } from '../transport/go-worker-client.mjs'
 import { credentialModeFromOauth, canOfficialCc } from './credential-mode.mjs'
 import { resolveAuthScheme } from './auth-scheme.mjs'
+import { flattenOauthIdentity } from './oauth-identity.mjs'
 import { persistOauthToVm, writeWorkerCredentialFile } from './oauth-credentials.mjs'
 import {
   officialCcUidGid,
@@ -57,6 +58,7 @@ export function createImportCommit(ctx) {
       auth_scheme: oauth.auth_scheme || oauth.authScheme,
       extra: oauth.extra,
     })
+    const identity = flattenOauthIdentity(oauth)
     if (mode === 'apikey') {
       const apiKey = String(oauth.api_key || oauth.apiKey || oauth.access_token || oauth.accessToken || '').trim()
       return {
@@ -67,9 +69,9 @@ export function createImportCommit(ctx) {
         refresh_token: null,
         expires_at: null,
         base_url: oauth.base_url || oauth.baseUrl || 'https://api.anthropic.com',
-        email: oauth.email || oauth.email_address || existing.claude?.email || null,
-        account_uuid: oauth.account_uuid || oauth.accountUuid || null,
-        org_uuid: oauth.org_uuid || oauth.orgUuid || null,
+        email: identity.email || existing.claude?.email || null,
+        account_uuid: identity.account_uuid || existing.claude?.account_uuid || null,
+        org_uuid: identity.org_uuid || existing.claude?.org_uuid || null,
         scopes: [],
         auth_scheme,
       }
@@ -83,9 +85,9 @@ export function createImportCommit(ctx) {
         oauth.expires_at ||
         oauth.expiresAt ||
         (oauth.expires_in ? Math.floor(Date.now() / 1000) + Number(oauth.expires_in) : null),
-      email: oauth.email || oauth.email_address || oauth.profile?.email || existing.claude?.email || null,
-      account_uuid: oauth.account_uuid || oauth.accountUuid || null,
-      org_uuid: oauth.org_uuid || oauth.orgUuid || null,
+      email: identity.email || existing.claude?.email || null,
+      account_uuid: identity.account_uuid || existing.claude?.account_uuid || null,
+      org_uuid: identity.org_uuid || existing.claude?.org_uuid || null,
       scopes: Array.isArray(oauth.scopes)
         ? oauth.scopes
         : String(oauth.scope || '')

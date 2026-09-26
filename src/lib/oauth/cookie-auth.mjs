@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { enrichOauthIdentity } from './oauth-identity.mjs'
 
 export const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 export const REDIRECT_URI = 'https://platform.claude.com/oauth/code/callback'
@@ -253,7 +254,7 @@ function fakeOauth(scope) {
   }
 }
 
-export async function sessionKeyToOAuth(sessionKey, { scope = 'full', proxyUrl = null } = {}) {
+export async function sessionKeyToOAuth(sessionKey, { scope = 'full', proxyUrl = null, fetchImpl = null } = {}) {
   const sk = String(sessionKey || '')
     .trim()
     .replace(/^["']|["']$/g, '')
@@ -273,7 +274,7 @@ export async function sessionKeyToOAuth(sessionKey, { scope = 'full', proxyUrl =
   try {
     const cred = await spawnCookieHelper({ SCOPE: scope, ...(px ? { PROXY_URL: px } : {}) }, sk)
     console.log('[import]', cred.source || 'cookie-auth', 'socks5h', redact(cred.access_token || ''))
-    return cred
+    return enrichOauthIdentity(cred, { proxyUrl: px, fetchImpl })
   } catch (e) {
     const err = new Error(publicImportError(e.message || 'session import failed'))
     err.code = e.code || 'cookie_auth_failed'

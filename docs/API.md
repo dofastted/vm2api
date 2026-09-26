@@ -176,7 +176,7 @@ curl -sS https://ccmax20.cc/v1/usage -H "Authorization: Bearer $KEY"
 }
 ```
 
-`utilization` 0–100。有 Messages Extra 用 Extra；两窗都空才走一次带缓存的官方 `/api/oauth/usage`（`source=oauth-usage`）。Setup Token / API Key 调 `/v1/usage` → `400 usage_unsupported`。窗缺失为 `null`，不伪装 0%。
+`utilization` 0–100。有 Messages Extra 用 Extra；两窗都空才走一次带缓存的官方 `/api/oauth/usage`（`source=oauth-usage`）。完整 OAuth 与短效 Setup Token（oat/ort）都走这条。Console API Key 调 `/v1/usage` → `400 usage_unsupported`。窗缺失为 `null`，不伪装 0%。
 
 
 
