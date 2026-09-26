@@ -137,6 +137,21 @@ test('normalizeOauth and import commit keep nested oauth_account', () => {
   assert.equal(imported.type, 'setup-token')
 })
 
+test('full-scope setup-token export stays OAuth during import', () => {
+  const { importedCredentialFromOauth } = createImportCommit({})
+  const imported = importedCredentialFromOauth(
+    {
+      type: 'setup-token',
+      access_token: 'sk-ant-oat01-FULL',
+      refresh_token: 'sk-ant-ort01-FULL',
+      scopes: ['user:profile', 'user:inference', 'user:sessions:claude_code'],
+    },
+    {},
+  )
+  assert.equal(imported.type, 'oauth')
+  assert.deepEqual(imported.scopes, ['user:profile', 'user:inference', 'user:sessions:claude_code'])
+})
+
 test('liveOauthToSetupToken keeps flattened identity', () => {
   const out = liveOauthToSetupToken({
     access_token: 'sk-ant-oat01-LIVE',

@@ -61,14 +61,16 @@ export function credentialModeFromOauth(oauth = {}) {
   const typed = oauth.type || oauth.mode || oauth.credential_mode
   const labeled = typed ? normalizeCredentialMode(typed) : ''
   if (labeled === CREDENTIAL_APIKEY) return CREDENTIAL_APIKEY
-  if (labeled === CREDENTIAL_SETUP_TOKEN) return CREDENTIAL_SETUP_TOKEN
   if (looksLikeConsoleApiKey(oauth.api_key || oauth.apiKey || oauth.access_token || oauth.accessToken)) {
     return CREDENTIAL_APIKEY
   }
   const scope = String(oauth.scope || (Array.isArray(oauth.scopes) ? oauth.scopes.join(' ') : ''))
-  if (scope && /user:inference/.test(scope) && !/user:profile|user:sessions:claude_code/.test(scope)) {
-    return CREDENTIAL_SETUP_TOKEN
-  }
+  // Some account exports label a full OAuth grant as setup-token. The actual
+  // scope set is authoritative: preserve profile/session scopes instead of
+  // rewriting the grant to inference-only during worker credential import.
+  if (/user:profile|user:sessions:claude_code/.test(scope)) return CREDENTIAL_OAUTH
+  if (labeled === CREDENTIAL_SETUP_TOKEN) return CREDENTIAL_SETUP_TOKEN
+  if (scope && /user:inference/.test(scope)) return CREDENTIAL_SETUP_TOKEN
   if (oauth.flavor === 'setup_token' || oauth.flavor === 'setup-token') return CREDENTIAL_SETUP_TOKEN
   return labeled || CREDENTIAL_OAUTH
 }
