@@ -98,7 +98,7 @@ function quotaView(vm, account) {
     status_7d_oi: unified.status_7d_oi || unified['7d_oi']?.status || vm?.status_7d_oi,
     '7d_oi': unified['7d_oi'],
     account_tier: unified.account_tier || vm?.claude?.account_tier || vm?.account_tier,
-    usage_has_fable: unified.usage_has_fable === true || vm?.usage_has_fable === true,
+    usage_has_fable: unified.usage_has_fable ?? vm?.usage_has_fable ?? null,
   }
 }
 

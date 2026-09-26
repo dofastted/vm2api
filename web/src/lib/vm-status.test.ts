@@ -216,9 +216,9 @@ describe('health probe must not paint a live ticket unavailable', () => {
     })
     expect(accountStatus(vm)).toMatchObject({
       key: 'revoke',
-      text: '无效凭证',
+      text: '已吊销',
     })
-    expect(poolStatus(vm).text).toBe('无效凭证')
+    expect(poolStatus(vm).text).toBe('已吊销')
   })
 })
 
@@ -258,9 +258,9 @@ describe('claudeTier follows usage Fable presence', () => {
     ).toBe('pro')
   })
 
-  it('does not paint an unclassified account as Pro', () => {
-    expect(claudeTier(liveVm({ account_tier: 'unknown' })).key).toBe('none')
-    expect(claudeTier(liveVm({})).key).toBe('none')
+  it('defaults token accounts to Pro until Max evidence appears', () => {
+    expect(claudeTier(liveVm({ account_tier: 'unknown' })).key).toBe('pro')
+    expect(claudeTier(liveVm({})).key).toBe('pro')
     expect(claudeTier(liveVm({ account_tier: 'max' })).key).toBe('max')
   })
 

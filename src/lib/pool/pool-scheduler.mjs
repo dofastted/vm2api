@@ -143,7 +143,8 @@ function maxSessionsOf(vm, accountQuota, account) {
 }
 
 function vmTierOf(vm) {
-  return vm?.claude?.account_tier || vm?.account_tier || null
+  if (vm?.claude?.account_tier || vm?.account_tier) return vm.claude?.account_tier || vm.account_tier
+  return vm?.claude?.has_access || vm?.has_token ? 'pro' : null
 }
 
 function priorityOf(vm, account, now) {

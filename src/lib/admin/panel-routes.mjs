@@ -1980,6 +1980,17 @@ export function createPanelHandler(ctx) {
         if (typeof body?.schedulable !== 'boolean') {
           return json(res, 400, { ok: false, error: { message: 'schedulable required' } })
         }
+        const currentVm = getVm(cfg.paths.project, id)
+        const credentialFailure =
+          /oauth_revoked|oauth_invalid_grant|invalid_grant|refresh_token_missing|token has been revoked/i.test(
+            `${currentVm?.claude?.refresh_error || ''} ${currentVm?.schedule_disabled_reason || ''}`,
+          )
+        if (body.schedulable && credentialFailure) {
+          return json(res, 409, {
+            ok: false,
+            error: { code: 'credential_unavailable', message: '凭证已失效或吊销，请重新导入凭证后再开启调度' },
+          })
+        }
         const reason = body.schedulable ? null : body.reason || 'disabled'
         const summary = setVmSchedulable(cfg.paths.project, id, body.schedulable, reason, {
           preserveStatus: true,
@@ -2833,7 +2844,7 @@ export function createPanelHandler(ctx) {
           }
           const code = body.code || body.auth_code || ''
           const flavor = body.flavor || body.type || ''
-          const oauth = looksLikeOfficialSetupToken(code)
+          let oauth = looksLikeOfficialSetupToken(code)
             ? await completeClaudeSetupToken({
                 projectRoot: cfg.paths.project,
                 vmId: id,
@@ -3096,8 +3107,8 @@ export function createPanelHandler(ctx) {
       // POST /api/panel/probe
       if (req.method === 'POST' && p === '/api/panel/probe') {
         const body = await readBody(req, 4096).catch(() => ({}))
-        const hop = body?.hop !== false
-        const force = body?.force !== false
+        const hop = body?.hop ?? true
+        const force = body?.force ?? true
         const result = await panel.buildProbeAll({ cfg, accountQuota, hop, force })
         return json(res, 200, result)
       }

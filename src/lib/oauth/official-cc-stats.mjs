@@ -3,7 +3,7 @@
  * 2.1.28x) into quota + a fallback account tier. Accepts stream-json event
  * lines, --output-format json envelopes, or raw CLI text. Never logs secrets.
  */
-import { normUtilization, parseOAuthUsage } from './crs-usage-probe.mjs'
+import { isCompleteOAuthUsage, normUtilization, parseOAuthUsage } from './crs-usage-probe.mjs'
 
 export function officialStatsText(raw) {
   if (raw == null) return ''
@@ -62,6 +62,7 @@ export function tierFromOauthProfile(profile = {}) {
 
 export function inferTierFromOfficialStats(text = '', structured = {}) {
   if (structured?.seven_day_oi || structured?.fable?.ok || structured?.usage_has_fable) return 'max'
+  if (structured?.usage_has_fable === false) return 'pro'
   const blob = `${text} ${JSON.stringify(structured || {})}`.toLowerCase()
   if (/\b(claude\s+max|max\s*20x|max plan|plan:\s*max)\b/.test(blob)) return 'max'
   if (/\b(claude\s+pro|pro plan|plan:\s*pro)\b/.test(blob)) return 'pro'
@@ -133,6 +134,7 @@ export function usageFromText(text = '') {
     else if (/^sonnet only$/i.test(scope)) out.seven_day_sonnet = { utilization: pct }
     else out.limits.push({ kind: 'weekly_scoped', percent: pct, scope: { model: { display_name: scope } } })
   }
+  out.limits_present = !!(out.five_hour && out.seven_day)
   return out
 }
 
@@ -143,7 +145,7 @@ export function parseOfficialCcStats(raw) {
     const base = parseOfficialCcStats(fromReport || events.result || '')
     // null limits = the CLI answered from a cached/seeded read without the
     // server rows; that is where Max accounts lose the Fable window.
-    return { ...base, limits_present: !!fromReport || base.limits_present === true }
+    return { ...base, limits_present: base.limits_present === true }
   }
   let structured = null
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) structured = raw
@@ -157,12 +159,13 @@ export function parseOfficialCcStats(raw) {
     const fromText = usageFromText(officialStatsText(raw))
     if (fromText) {
       const base = parseOfficialCcStats({ ...fromText, fable: structured?.fable })
-      return { ...base, limits_present: fromText.limits.length > 0 }
+      const limitsPresent = fromText.limits_present === true
+      return { ...base, account_tier: limitsPresent ? base.account_tier : null, limits_present: limitsPresent }
     }
   }
 
   const fromOfficialApi =
-    structured && (structured.five_hour || structured.seven_day || structured.limits)
+    structured && (structured.five_hour || structured.seven_day || structured.limits || structured.model_scoped)
       ? parseOAuthUsage(structured)
       : null
   const nested = structured?.usage || structured?.stats || structured?.data || null
@@ -196,13 +199,14 @@ export function parseOfficialCcStats(raw) {
     seven_day_sonnet: fromOfficialApi?.seven_day_sonnet || fromNested?.seven_day_sonnet || null,
     seven_day_oi: sevenDayOi,
     extra_usage: extra,
-    usage_has_fable: fromOfficialApi?.usage_has_fable === true || fromNested?.usage_has_fable === true,
+    usage_has_fable: fromOfficialApi?.usage_has_fable ?? fromNested?.usage_has_fable ?? null,
   }
   const accountTier = inferTierFromOfficialStats(text, { ...usage, fable: structured?.fable })
+  const limitsPresent = structured ? isCompleteOAuthUsage(structured, fromOfficialApi) : false
   return {
     ok: !!(fiveHour || sevenDay || sevenDayOi || extra || accountTier),
-    account_tier: accountTier,
-    limits_present: Array.isArray(structured?.limits),
+    account_tier: limitsPresent ? accountTier : null,
+    limits_present: limitsPresent,
     source: 'official-cc-usage-cli',
     text_len: text.length,
     ...usage,

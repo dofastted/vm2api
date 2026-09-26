@@ -176,7 +176,19 @@ curl -sS http://127.0.0.1:8787/v1/usage -H "Authorization: Bearer $KEY"
 }
 ```
 
-`utilization` 0–100。有 Messages Extra 用 Extra；两窗都空才走一次带缓存的官方 `/api/oauth/usage`（`source=oauth-usage`）。完整 OAuth 与短效 Setup Token（oat/ort）都走这条。Console API Key 调 `/v1/usage` → `400 usage_unsupported`。窗缺失为 `null`，不伪装 0%。
+`utilization` 0–100。有 Messages Extra 用 Extra；两窗都空才走一次带缓存的官方 `/api/oauth/usage`（`source=oauth-usage`）。Setup Token 只有 `user:inference` 时官方 usage 会返回 scope 错误；服务端保留失败原因，不把它当吊销/封禁，也不改历史套餐。Console API Key 调 `/v1/usage` → `400 usage_unsupported`。窗缺失为 `null`，不伪装 0%。
+
+## 面板额度探测
+
+`POST /api/panel/probe` 是手动 fresh 探测，默认等同：
+
+```json
+{ "hop": true, "force": true }
+```
+
+可传 `{ "hop": false }` 只读最近 Messages 响应头缓存；`force:false` 则允许复用 usage cache。返回 `items[]`，每项 `ok:false` 会带 `error`，顶栏按成功/失败分别提示。
+
+套餐判定只认成功且完整的官方 usage：必须有 5h、7d，并能确定 Fable 7d 是否存在；有 Fable 7d 即 Max，没有即 Pro。失败、scope 不足、只有 5h、CLI 文本不完整都不改套餐。未知但有票的账号在面板显示为“待探测/未确认”，不是第三套餐。
 
 
 

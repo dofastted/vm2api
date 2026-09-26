@@ -702,6 +702,7 @@ test('slot /usage stops once Fable limits arrive', async () => {
         ? 'boom'
         : usageLines([
             { kind: 'session', percent: 10, resets_at: null },
+            { kind: 'weekly_all', percent: 30, resets_at: null },
             { kind: 'weekly_scoped', percent: 21, resets_at: null, scope: { model: { display_name: 'Fable' } } },
           ]),
     )

@@ -214,7 +214,10 @@ function PlanCell({ vm, now }: { vm: Vm; now: number }) {
       </div>
     )
   }
-  const label = skin.key === 'pro' || skin.key === 'max' ? skin.label : null
+  const label =
+    skin.key === 'pro' || skin.key === 'max' || skin.key === 'unknown'
+      ? skin.label
+      : null
   return (
     <div className='flex flex-col items-start gap-1'>
       {label ? (
@@ -227,7 +230,7 @@ function PlanCell({ vm, now }: { vm: Vm; now: number }) {
           {label}
         </span>
       ) : (
-        <span className='text-muted-foreground'>—</span>
+        <span className='text-muted-foreground'>{skin.label}</span>
       )}
       {due ? (
         <span className={cn('font-mono text-sm tabular-nums', due.cls)}>

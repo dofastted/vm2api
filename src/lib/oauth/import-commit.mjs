@@ -102,11 +102,11 @@ export function createImportCommit(ctx) {
       const accountId = accountUuid || getVm(ctx.cfg.paths.project, vmId)?.claude?.account_uuid || vmId
       if (stats?.five_hour || stats?.seven_day || stats?.seven_day_oi || stats?.extra_usage) {
         try {
-          ctx.accountQuota.ingestOAuthUsage(accountId, stats)
+          ctx.accountQuota.ingestOAuthUsage(accountId, { usage_status: 200, ok: true, ...stats })
         } catch {}
       }
-      if (stats?.account_tier === 'pro' || stats?.account_tier === 'max') {
-        const source = stats.account_tier_source || null
+      if ((stats?.account_tier === 'pro' || stats?.account_tier === 'max') && stats?.limits_present === true) {
+        const source = 'usage'
         try {
           ctx.accountQuota.setAccountTier(accountId, stats.account_tier, { source })
         } catch {}

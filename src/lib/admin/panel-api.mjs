@@ -19,7 +19,7 @@ import {
   isCodexVm,
   setVmSchedulable,
 } from '../vm/vm-registry.mjs'
-import { clearRecoverableVmCooldown } from '../oauth/oauth-credentials.mjs'
+import { clearRecoverableVmCooldown, markVmRefreshError } from '../oauth/oauth-credentials.mjs'
 import {
   resolveInferenceEngine,
   resolveKernelDataplane,
@@ -723,36 +723,36 @@ export async function buildOpenaiQuotaReset({ cfg, id, rotate = true } = {}) {
   })
 }
 
-function applyFableEntitlement(accountQuota, projectRoot, vmId, accountId, found) {
+function applyFableProbeResult(accountQuota, accountId, found) {
   if (found?.tier !== 'pro' && found?.tier !== 'max') return null
-  const current = accountQuota.repo.get(accountId)
-  const locked =
-    current?.unified?.account_tier_source === 'profile' &&
-    current.unified.account_tier &&
-    current.unified.account_tier !== found.tier
-  if (locked) return current.unified.account_tier
-  accountQuota.setAccountTier(accountId, found.tier, { source: 'fable' })
-  persistAccountTier(projectRoot, vmId, found.tier, { source: 'fable' })
   const saved = accountQuota.repo.get(accountId)
   if (!saved || !found.fable) return found.tier
   const prev = saved.unified?.fable || {}
   saved.unified = saved.unified || {}
   saved.unified.fable = {
     ...prev,
-    ok: found.tier === 'max',
-    plan_denied: found.tier === 'pro',
+    ok: prev.ok === true,
+    plan_denied: prev.plan_denied === true,
     limited: !!found.fable.limited && found.tier !== 'max',
     banned: false,
     status: found.fable.status || 0,
     model: found.fable.model || prev.model || null,
-    error: found.tier === 'max' ? null : found.fable.error || null,
+    error: found.fable.error || prev.error || null,
     utilization: found.fable.utilization ?? prev.utilization ?? null,
     reset: found.fable.reset_at || prev.reset || null,
     probed_at: new Date().toISOString(),
   }
-  if (found.tier === 'max') saved.unified.usage_has_fable = true
   accountQuota.repo.save(saved)
   return found.tier
+}
+function fatalUsageCredentialFailure(result = {}) {
+  if (result?.ok === true || result?.usage_scope_missing) return false
+  const status = Number(result?.usage_status || result?.status || 0)
+  const text = String(result?.usage_error || result?.error || result?.fable?.error || '').toLowerCase()
+  return (
+    status === 401 ||
+    /oauth_revoked|token has been revoked|invalid_grant|oauth_invalid_grant|refresh token not found/.test(text)
+  )
 }
 
 export async function buildProbeOne({
@@ -854,16 +854,20 @@ export async function buildProbeOne({
         ...(headerProbe ? { ...headerProbe, error: null } : {}),
       }
     : await cache.load(accountId, () => probeAccount({ exec, vm, includeFable }), { force: !!force })
-  if (!skipHop) accountQuota.ingestOAuthUsage(accountId, result)
-  if (isSetupTokenMode(credentialModeOfVm(vm)) && (force || includeFable)) {
+  if (fatalUsageCredentialFailure(result)) {
     try {
-      await applyFableEntitlement(
-        accountQuota,
-        cfg.paths.project,
-        id,
-        accountId,
-        await fableProbe({ exec, timeoutMs: 20000 }),
-      )
+      markVmRefreshError(path.join(cfg.paths.project, 'vms', `${id}.json`), {
+        error: {
+          code: result.usage_status === 401 ? 'oauth_revoked' : 'invalid_grant',
+          message: result.usage_error || result.error || 'OAuth credential was rejected',
+        },
+      })
+    } catch {}
+  }
+  if (!skipHop) accountQuota.ingestOAuthUsage(accountId, result)
+  if (isSetupTokenMode(credentialModeOfVm(vm)) && (force || includeFable) && !result.usage_scope_missing) {
+    try {
+      await applyFableProbeResult(accountQuota, accountId, await fableProbe({ exec, timeoutMs: 20000 }))
     } catch {}
   }
   const after = accountQuota.repo.get(accountId)
@@ -878,7 +882,7 @@ export async function buildProbeOne({
   const tier = inferClaudeTier(
     {
       has_token: true,
-      account_tier: after?.unified?.account_tier || storedTier,
+      account_tier: after?.unified?.account_tier || null,
       fable: qAfter.fable,
       utilization_7d_oi: qAfter.utilization_7d_oi,
       reset_7d_oi: qAfter.reset_7d_oi,
@@ -887,7 +891,11 @@ export async function buildProbeOne({
     },
     qAfter,
   ).key
-  if (tier === 'pro' || tier === 'max') {
+  const completeUsage = result.ok === true && result.limits_present === true
+  if (completeUsage && (result.account_tier === 'pro' || result.account_tier === 'max')) {
+    accountQuota.setAccountTier(accountId, result.account_tier, { source: 'usage' })
+    persistAccountTier(cfg.paths.project, id, result.account_tier, { source: 'usage' })
+  } else if (completeUsage && (tier === 'pro' || tier === 'max')) {
     accountQuota.setAccountTier(accountId, tier, { source: 'usage' })
     persistAccountTier(cfg.paths.project, id, tier, { source: 'usage' })
   }
@@ -953,9 +961,9 @@ export async function buildProbeOne({
     },
     availability,
     cred_status: credStatusFromAvailability(availability),
-    fable: after?.unified?.fable || result.fable || q.fable || null,
-    fable_probed: includeFable && !skipHop,
-    account_tier: tier,
+    fable: result.usage_scope_missing ? q.fable || null : after?.unified?.fable || result.fable || q.fable || null,
+    fable_probed: includeFable && !skipHop && !result.usage_scope_missing,
+    account_tier: completeUsage ? result.account_tier || tier : tier,
     probed_at: result.probed_at,
     ok: !!(result.ok || passive || (rateLimited && cachedWindow)),
     rate_limited: rateLimited,
@@ -965,6 +973,8 @@ export async function buildProbeOne({
         : rateLimited
           ? '官方 /usage 限流，请稍后再试'
           : result.error || result.usage_error || null,
+    usage_scope_missing: result.usage_scope_missing === true,
+    credential_scope_required: result.credential_scope_required || null,
   }
   // Display metadata is separate from the authoritative usage/auth probe.
   // Reading cached headers must not heal credential failures or clear backoff.
@@ -982,13 +992,14 @@ export async function buildProbeOne({
   return ok(data)
 }
 
-export async function buildProbeAll({ cfg, accountQuota, hop = false, force = false } = {}) {
+export async function buildProbeAll({ cfg, accountQuota, hop = true, force = true } = {}) {
   const vms = listVms(cfg.paths.project)
   const items = []
   for (const s of vms) {
     const one = await buildProbeOne({ cfg, accountQuota, id: s.id, hop, force })
     if (one.ok === false || one.status) {
-      items.push({ vm_id: s.id, ok: false, error: one.body?.error || one })
+      const err = one.body?.error || one
+      items.push({ vm_id: s.id, ok: false, error: err?.message || err?.code || String(err || 'probe_failed') })
     } else {
       items.push(one.data)
     }
@@ -1217,7 +1228,7 @@ function quotaFromAccount(acc, quotaConfig) {
     last_probe_check: u.last_probe_check || null,
     probe_source: u.source || acc?.last_probe?.source || null,
     account_tier: u.account_tier || null,
-    usage_has_fable: u.usage_has_fable === true,
+    usage_has_fable: u.usage_has_fable ?? null,
   }
   const cfg = weeklySplitConfig(quotaConfig || {})
   const split = publicWeeklySplit(
@@ -1551,7 +1562,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
         }
       : null,
     account_tier: tierKey,
-    usage_has_fable: isCodex ? false : !!q.usage_has_fable,
+    usage_has_fable: isCodex ? null : q.usage_has_fable,
     availability,
     cred_status: credStatusFromAvailability(availability),
     cooldown_until: Number(restrictionUntil) > Date.now() ? Number(restrictionUntil) : null,

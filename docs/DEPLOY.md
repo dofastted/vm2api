@@ -28,6 +28,10 @@ VM2API_DB_SECRET='再一串'
 
 不是一个父容器里多个子进程。
 
+原生 Claude 槽默认内存上限为 `1g`，可用 `KIN_VM_MEMORY` 显式覆盖。常驻 native host 与临时官方 CLI 同时运行会超过旧的 `500m` 上限；额度 API 探测本身不应额外启动推理 CLI。已有容器不会因控制面升级自动扩大限制，可在核对宿主余量后使用 `docker update --memory 1g --memory-swap 1g kin-<槽>`，不重建容器。
+
+出现 `native stdin: Broken pipe` 时同时检查容器 OOM 事件与 CLI 子进程，不能只看 Rust PID 1 是否存活。CLI 退出或输出管道关闭后，内核必须清零 `cli_pid` / `ready_slots`、终止在途请求并拒绝新任务，由宿主 watchdog 恢复槽；不重放已发送的推理请求。
+
 挂 `docker.sock`，`network_mode: host`。安装目录不再限定 `/opt/vm2api`：控制面自省 `docker inspect vm2api` 的 Mounts，把槽的 `-v` 源换算成宿主路径；也可用 `VM2API_HOST_ROOT` 显式指定。
 
 ## 安装
