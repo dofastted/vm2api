@@ -573,11 +573,52 @@ export function vmRunning(vm: Vm | undefined): boolean {
   return Boolean(vm.active || s === 'running' || s === 'ok' || !s)
 }
 
+/** Same mapping as codex-proxy-rs `plan_type_display`; unknown raw values pass through. */
+export function openaiPlanLabel(planType: unknown): string {
+  const raw = String(planType || '').trim()
+  switch (raw.toLowerCase()) {
+    case '':
+      return 'GPT'
+    case 'free':
+    case 'free_workspace':
+    case 'guest':
+      return 'Free'
+    case 'go':
+      return 'Go'
+    case 'plus':
+      return 'Plus'
+    case 'pro':
+    case 'prolite':
+      return 'Pro'
+    case 'team':
+    case 'self_serve_business_prolite':
+    case 'self_serve_business_usage_based':
+      return 'Business'
+    case 'business':
+    case 'ent26':
+    case 'enterprise_cbp_automation':
+    case 'enterprise_cbp_usage_based':
+    case 'enterprise':
+    case 'hc':
+      return 'Enterprise'
+    case 'edu':
+    case 'education':
+      return 'Edu'
+    case 'edu_plus':
+      return 'Edu Plus'
+    case 'edu_pro':
+      return 'Edu Pro'
+    default:
+      return raw
+  }
+}
+
 export function claudeTier(vm: Vm | undefined): StatusTone {
   if (isCodexVm(vm)) {
     if (!vm?.has_token)
       return { key: 'none', label: '—', cls: 'none', text: '—' }
-    return { key: 'codex', label: 'GPT', cls: 'codex', text: 'GPT' }
+    const plan = openaiPlanLabel(vm?.plan_type)
+    return { key: 'codex', label: plan, cls: 'codex', text: plan }
   }
   if (!vm?.has_token) return { key: 'none', label: '—', cls: 'none', text: '—' }
   if (vm.usage_has_fable === false)

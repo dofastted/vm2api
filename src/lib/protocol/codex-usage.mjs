@@ -195,13 +195,18 @@ function statusFromPercent(percent) {
   return 'ok'
 }
 
+function isCodexSnapshot(value) {
+  return !!value && typeof value === 'object' && Object.hasOwn(value, 'primary_used_percent')
+}
+
+/** Accepts extra, a snapshot, or a previously built view (`{ snapshot, ... }`). */
 export function buildCodexUsageView(extraOrSnapshot = {}) {
-  const snapshot =
-    extraOrSnapshot.primary_used_percent != null || extraOrSnapshot.codex_5h_used_percent != null
-      ? extraOrSnapshot.primary_used_percent != null
-        ? extraOrSnapshot
-        : extraToCodexSnapshot(extraOrSnapshot)
-      : extraToCodexSnapshot(extraOrSnapshot)
+  const input = extraOrSnapshot && typeof extraOrSnapshot === 'object' ? extraOrSnapshot : {}
+  const snapshot = isCodexSnapshot(input)
+    ? input
+    : isCodexSnapshot(input.snapshot)
+      ? input.snapshot
+      : extraToCodexSnapshot(input)
   const limits = normalizeCodexLimits(snapshot)
   const quota = codexLimitsToQuota(limits)
   return {

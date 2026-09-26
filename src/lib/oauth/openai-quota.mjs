@@ -371,6 +371,7 @@ async function queryUpstream(slot, { fetchImpl, rotate = true, projectRoot, vmId
   const persistable = resetCredits.available_count <= 0 || resetCredits.credits.length > 0 ? resetCredits : null
   persistCodexQuotaSnapshot(projectRoot, vmId, {
     extra,
+    planType: pack.usage.payload?.plan_type || pack.usage.payload?.planType,
     ...(persistable ? { resetCredits: persistable } : {}),
   })
   return {

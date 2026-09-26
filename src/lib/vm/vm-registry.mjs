@@ -125,6 +125,7 @@ export function summarizeVm(vm, projectRoot = null) {
     status_7d: quota.status_7d ?? null,
     codex_usage: codex?.usage || null,
     reset_credits: codex?.reset_credits || null,
+    plan_type: codex?.plan_type || null,
   }
 }
 

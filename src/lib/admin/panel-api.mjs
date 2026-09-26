@@ -1533,6 +1533,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     status_7d_oi: isCodex ? null : q.status_7d_oi,
     codex_usage: v.codex_usage || null,
     reset_credits: isCodex ? v.reset_credits || v.codex?.reset_credits || null : null,
+    plan_type: isCodex ? v.plan_type || null : null,
     ...(q.weekly_split ? { weekly_split: q.weekly_split } : {}),
     fable_inflight: fablePool.fable_inflight,
     fable_max: fablePool.fable_max,
