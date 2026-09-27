@@ -432,6 +432,27 @@ export function VmDetailPage() {
                 })
                 .catch((error: Error) => toast.error(error.message))
             }
+            onProbe={() =>
+              api(`/api/panel/proxies/${boundId}/probe`, { method: 'POST' })
+                .then(() => {
+                  toast.success('探测完成')
+                  return refreshAll()
+                })
+                .catch((error: Error) => toast.error(error.message))
+            }
+            onGeo={() =>
+              api<{
+                geo?: { timezone?: string | null; country?: string | null }
+              }>(`/api/panel/proxies/${boundId}/geo`, { method: 'POST' })
+                .then((data) => {
+                  const where = [data.geo?.country, data.geo?.timezone]
+                    .filter(Boolean)
+                    .join(' · ')
+                  toast.success(where ? `出口位置 ${where}` : '已检测')
+                  return refreshAll()
+                })
+                .catch((error: Error) => toast.error(error.message))
+            }
           />
           <VmTestTab
             models={models}

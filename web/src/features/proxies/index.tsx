@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { VIEW_TITLES } from '@/config/nav'
 import type { Vm } from '@/types/panel-vm'
+import { Activity, MapPin } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -26,6 +27,25 @@ import {
   sortedProxies,
 } from './proxy-sort'
 
+function latestTimestamp(values: (string | null | undefined)[]): number {
+  let max = 0
+  for (const raw of values) {
+    if (!raw) continue
+    const ms = Date.parse(raw)
+    if (Number.isFinite(ms) && ms > max) max = ms
+  }
+  return max
+}
+
+function timeAgoLabel(ms: number): string {
+  if (!ms) return '从未探测'
+  const diff = Date.now() - ms
+  if (diff < 60_000) return '刚刚探测过'
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前探测`
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前探测`
+  return `${Math.floor(diff / 86_400_000)} 天前探测`
+}
+
 export function ProxiesPage() {
   const px = useQuery(proxiesQueryOptions())
   const dash = useQuery(dashboardQueryOptions())
@@ -39,7 +59,7 @@ export function ProxiesPage() {
     id: string
     vmId: string
   } | null>(null)
-  const list = px.data?.proxies || []
+  const list = useMemo(() => px.data?.proxies || [], [px.data?.proxies])
   const tot = px.data?.totals || {}
   const cfg = px.data?.config || {}
   const vms: Vm[] = dash.data?.vms || []
@@ -53,6 +73,14 @@ export function ProxiesPage() {
   const total = Number(tot.total ?? list.length)
   const slotsUsed = Number(tot.slots_used ?? tot.bound ?? 0)
   const slotsCap = Number(tot.slots_cap ?? total * bindLimit)
+  const lastProbeAt = useMemo(
+    () => latestTimestamp(list.map((p) => p.last_probe_at)),
+    [list]
+  )
+  const lastGeoAt = useMemo(
+    () => latestTimestamp(list.map((p) => p.geo?.checked_at)),
+    [list]
+  )
   const rows = useMemo(
     () => sortedProxies(list, sortKey, sortDir),
     [list, sortKey, sortDir]
@@ -272,20 +300,22 @@ export function ProxiesPage() {
         <>
           <Button
             variant='outline'
-            title='经每条代理查出口 IP 的国家 / 城市 / 时区'
+            title={`经每条代理查出口 IP 的国家 / 城市 / 时区 · ${timeAgoLabel(lastGeoAt)}`}
             onClick={() => geoAll.mutate()}
             disabled={geoAll.isPending}
             loading={geoAll.isPending}
           >
+            <MapPin className='size-4' />
             测地理
           </Button>
           <Button
             variant='outline'
-            title='只测 SOCKS TCP，不打 Anthropic'
+            title={`只测 SOCKS TCP，不打 Anthropic · ${timeAgoLabel(lastProbeAt)}`}
             onClick={() => probeAll.mutate()}
             disabled={probeAll.isPending}
             loading={probeAll.isPending}
           >
+            <Activity className='size-4' />
             测通
           </Button>
         </>
@@ -315,6 +345,7 @@ export function ProxiesPage() {
           totals={tot}
           slotsUsed={slotsUsed}
           slotsCap={slotsCap}
+          list={list}
         />
         <ProxyPoolControls
           bindLimit={bindLimit}

@@ -4,15 +4,10 @@ import type { Vm, VmProxySnap } from '@/types/panel-vm'
 import { Lock } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select'
+import { Progress } from '@/components/ui/progress'
 import { EmptyState } from '@/components/empty-state'
 import { StatusMark } from '@/components/status-mark'
+import { ProxyBindPicker } from '@/features/proxies/proxy-bind-picker'
 import {
   type ProxySortKey,
   proxyBindLimit,
@@ -24,6 +19,7 @@ import {
   proxyFieldClass,
   proxyLatencyTone,
 } from '@/features/proxies/proxy-tone'
+import { proxyOwnHealthOf } from '@/features/vm/proxy-health'
 
 type ProxyTableProps = {
   rows: VmProxySnap[]
@@ -212,6 +208,7 @@ function ProxyRow({
   const latTone = proxyLatencyTone(item)
   const lat = item.latency_ms != null ? `${item.latency_ms}ms` : '—'
   const off = item.enabled === false
+  const health = proxyOwnHealthOf(item)
   // 候选排除已绑在本条上的，对齐 index.html `vmBindOptions(keepIds)`。
   const candidates = vms.filter((v) => !ids.includes(v.id))
   return (
@@ -234,17 +231,33 @@ function ProxyRow({
           />
         ) : null}
       </div>
-      <div className='flex min-w-[120px] flex-[1] items-center gap-2 px-1.5'>
-        <StatusMark
-          tone={{
-            key: item.status || '',
-            text: proxyStatusLabel(item),
-            cls: item.status === 'ok' ? 'ok' : dead ? 'bad' : 'caution',
-          }}
-        />
-        <span className={cn('field-metric text-xs', proxyFieldClass(latTone))}>
-          {lat}
+      <div className='flex min-w-[120px] flex-[1] flex-col justify-center gap-1 px-1.5'>
+        <span className='flex items-center gap-2'>
+          <StatusMark
+            tone={{
+              key: item.status || '',
+              text: proxyStatusLabel(item),
+              cls: item.status === 'ok' ? 'ok' : dead ? 'bad' : 'caution',
+            }}
+          />
+          <span
+            className={cn('field-metric text-xs', proxyFieldClass(latTone))}
+          >
+            {lat}
+          </span>
         </span>
+        <Progress
+          value={health.score}
+          className='h-[3px] w-full'
+          indicatorClassName={cn(
+            health.tone.cls === 'ok' && 'bg-[var(--status-ok-solid)]',
+            health.tone.cls === 'caution' && 'bg-[var(--status-caution-solid)]',
+            health.tone.cls === 'warn' && 'bg-[var(--status-warn-solid)]',
+            health.tone.cls === 'bad' && 'bg-[var(--status-bad-solid)]',
+            health.tone.cls === 'none' && 'bg-[var(--status-none)]'
+          )}
+          title={health.tone.label}
+        />
       </div>
       <div className='flex min-w-[160px] flex-[1.2] flex-col justify-center px-1.5 text-xs'>
         {item.geo?.timezone || item.geo?.country ? (
@@ -294,36 +307,23 @@ function ProxyRow({
         ))}
         {ids.length >= limit ? (
           <span className='text-muted-foreground'>已满 {limit}</span>
-        ) : candidates.length ? (
-          <span className='inline-flex items-center gap-1'>
-            <Select value={pick} onValueChange={setPick}>
-              <SelectTrigger className='h-7 w-[128px]' aria-label='绑定虚拟机'>
-                <SelectValue placeholder='选槽位' />
-              </SelectTrigger>
-              <SelectContent>
-                {candidates.map((v) => (
-                  <SelectItem key={v.id} value={v.id}>
-                    {v.name || v.id}
-                    {takenVmIds.has(v.id) ? ' · 已有代理' : ''}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Button
-              size='sm'
-              variant='outline'
-              className='h-7 px-2'
-              disabled={busy || !pick}
-              onClick={() => {
-                onBind(pick)
-                setPick('')
-              }}
-            >
-              绑定
-            </Button>
-          </span>
         ) : (
-          <span className='text-muted-foreground'>无可绑槽位</span>
+          <ProxyBindPicker
+            options={candidates.map((v) => ({
+              value: v.id,
+              label: v.name || v.id,
+              hint: takenVmIds.has(v.id) ? '已有代理' : undefined,
+            }))}
+            value={pick}
+            onValueChange={setPick}
+            onConfirm={() => {
+              onBind(pick)
+              setPick('')
+            }}
+            busy={busy}
+            placeholder='选槽位'
+            emptyText='无可绑槽位'
+          />
         )}
       </div>
       <div className='flex min-w-[200px] flex-[1.1] items-center justify-end gap-0.5 pr-3'>
