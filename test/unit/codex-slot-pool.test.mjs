@@ -2,11 +2,13 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   pickCodexSlots,
+  codexAccountCandidate,
   orderCodexSessionSlots,
   isCodexSlotParked,
   isCodexFailoverError,
   evaluateCodexQuotaSchedule,
 } from '../../src/lib/pool/codex-slot-pool.mjs'
+import { orderOpenAIAccounts } from '../../src/lib/pool/openai-account-selector.mjs'
 import { SessionLimitRegistry } from '../../src/lib/pool/session-limit.mjs'
 
 function gpt(id, patch = {}) {
@@ -20,6 +22,19 @@ function gpt(id, patch = {}) {
     ...patch,
   }
 }
+
+test('Codex candidate uses the panel concurrency from summarized VMs', () => {
+  const candidate = codexAccountCandidate(
+    gpt('vm-a', { max_concurrency: 4 }),
+    Date.now(),
+    { inFlight: 3 },
+  )
+  assert.equal(candidate.concurrency, 4)
+  assert.deepEqual(orderOpenAIAccounts([candidate]).ids, ['vm-a'])
+
+  candidate.inFlight = 4
+  assert.deepEqual(orderOpenAIAccounts([candidate]).ids, [])
+})
 
 test('ready slots sort by remaining 5h/7d stress', () => {
   const picked = pickCodexSlots([

@@ -151,7 +151,7 @@ export function codexAccountStatus(vm, now = Date.now()) {
 
 export function codexAccountCandidate(vm, now = Date.now(), signals = null) {
   const runtime = signals || openAIRuntimeSignals(vm?.id, now)
-  const concurrency = Number(vm?.policy?.maxConcurrency)
+  const concurrency = Number(vm?.max_concurrency ?? vm?.policy?.maxConcurrency)
   return {
     id: vm.id,
     weight: Number(vm?.policy?.weight ?? vm?.weight ?? 1) || 1,
