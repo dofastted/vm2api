@@ -12,11 +12,13 @@ import {
 } from '@/components/ui/select'
 import { TabsContent } from '@/components/ui/tabs'
 import { StatusMark } from '@/components/status-mark'
+import { HealthDonut } from '@/features/overview/health-gauge'
 import {
   proxyFieldClass,
   proxyLatencyTone,
 } from '@/features/proxies/proxy-tone'
 import { Field } from '@/features/vm/detail-section-primitives'
+import { proxyHealthOf } from '@/features/vm/proxy-health'
 
 type VmProxyTabProps = {
   vm: Vm
@@ -28,6 +30,8 @@ type VmProxyTabProps = {
   onUnbind: () => void
   onAllocate: () => void
   onBind: () => void
+  onProbe: () => void
+  onGeo: () => void
 }
 
 export function VmProxyTab(props: VmProxyTabProps) {
@@ -41,7 +45,10 @@ export function VmProxyTab(props: VmProxyTabProps) {
     onUnbind,
     onAllocate,
     onBind,
+    onProbe,
+    onGeo,
   } = props
+  const health = proxyHealthOf(vm, proxy)
 
   return (
     <TabsContent value='proxy' className='space-y-3 pt-4'>
@@ -52,67 +59,105 @@ export function VmProxyTab(props: VmProxyTabProps) {
         <p className='px-6 pb-2 text-xs text-muted-foreground'>
           出站经这条代理的 egress 网关。槽内不 Dial SOCKS。
         </p>
-        <CardContent className='divide-y pt-0'>
-          <Field label='绑定 ID'>
-            <span className='field-host text-xs'>{boundId || '—'}</span>
-          </Field>
-          <Field label='地址'>
-            <span className='field-host text-xs'>
-              {String(proxy.host || '—')}
-              {proxy.port != null ? `:${proxy.port}` : ''}
-            </span>
-          </Field>
-          <Field label='状态'>
-            <span className='flex items-center gap-2'>
-              {String(proxy.status || '—')}
-              {vm.has_token && !proxy.host && !vm.proxy_id ? (
-                <StatusMark
-                  variant='pill'
-                  tone={{
-                    key: 'bad',
-                    text: '缺 SOCKS5',
-                    cls: 'bad',
-                    label: '缺 SOCKS5 · fail closed',
-                  }}
-                />
-              ) : null}
-            </span>
-          </Field>
-          <Field label='延迟'>
-            <span
-              className={cn(
-                'field-metric text-sm',
-                proxyFieldClass(proxyLatencyTone(proxy))
-              )}
-            >
-              {proxy.latency_ms != null ? `${proxy.latency_ms}ms` : '—'}
-            </span>
-          </Field>
-          <Field label='认证'>{proxy.has_auth ? '有' : '无'}</Field>
-          <Field label='出口地区'>
-            <span className='text-xs'>
-              {[proxy.geo?.country, proxy.geo?.region, proxy.geo?.city]
-                .filter(Boolean)
-                .join(' · ') || (proxy.geo?.error ? '检测失败' : '未检测')}
-            </span>
-          </Field>
-          <Field label='出口时区'>
-            <span className='flex items-center gap-2 text-xs'>
-              <span className='field-host'>{proxy.geo?.timezone || '—'}</span>
-              {proxy.geo?.timezone && proxy.geo.timezone !== vm.timezone ? (
-                <span className='text-muted-foreground'>
-                  槽位为 {vm.timezone || '—'}，可在「运维 · 环境」跟随
+        <CardContent className='flex flex-wrap gap-6 pt-0'>
+          <HealthDonut score={health.score} label='健康' size={80} />
+          <div className='min-w-0 flex-1 divide-y'>
+            <Field label='绑定 ID'>
+              <span className='field-host text-xs'>{boundId || '—'}</span>
+            </Field>
+            <Field label='地址'>
+              <span className='field-host text-xs'>
+                {String(proxy.host || '—')}
+                {proxy.port != null ? `:${proxy.port}` : ''}
+              </span>
+            </Field>
+            <Field label='状态'>
+              <span className='flex items-center gap-2'>
+                {String(proxy.status || '—')}
+                {vm.has_token && !proxy.host && !vm.proxy_id ? (
+                  <StatusMark
+                    variant='pill'
+                    tone={{
+                      key: 'bad',
+                      text: '缺 SOCKS5',
+                      cls: 'bad',
+                      label: '缺 SOCKS5 · fail closed',
+                    }}
+                  />
+                ) : null}
+              </span>
+            </Field>
+            <Field label='延迟'>
+              <span
+                className={cn(
+                  'field-metric text-sm',
+                  proxyFieldClass(proxyLatencyTone(proxy))
+                )}
+              >
+                {proxy.latency_ms != null ? `${proxy.latency_ms}ms` : '—'}
+              </span>
+            </Field>
+            <Field label='认证'>{proxy.has_auth ? '有' : '无'}</Field>
+            <Field label='出口'>
+              {proxy.geo?.country || proxy.geo?.timezone ? (
+                <span className='flex flex-wrap items-center gap-1.5'>
+                  {[proxy.geo.country_code || proxy.geo.country, proxy.geo.city]
+                    .filter(Boolean)
+                    .map((v) => (
+                      <StatusMark
+                        key={v}
+                        variant='pill'
+                        tone={{ key: 'none', text: String(v), cls: 'none' }}
+                      />
+                    ))}
+                  {proxy.geo.timezone ? (
+                    <>
+                      <StatusMark
+                        variant='pill'
+                        tone={{
+                          key: 'none',
+                          text: proxy.geo.timezone,
+                          cls:
+                            proxy.geo.timezone !== vm.timezone
+                              ? 'caution'
+                              : 'none',
+                        }}
+                      />
+                      {proxy.geo.timezone !== vm.timezone ? (
+                        <span className='text-[11px] text-muted-foreground'>
+                          槽位为 {vm.timezone || '—'}，可在「运维 · 环境」跟随
+                        </span>
+                      ) : null}
+                    </>
+                  ) : null}
+                  {proxy.geo.isp ? (
+                    <span className='text-[11px] text-muted-foreground'>
+                      {proxy.geo.isp}
+                    </span>
+                  ) : null}
                 </span>
-              ) : null}
-            </span>
-          </Field>
+              ) : (
+                <span className='text-xs text-muted-foreground'>
+                  {proxy.geo?.error ? '检测失败' : '未检测'}
+                </span>
+              )}
+            </Field>
+          </div>
         </CardContent>
       </Card>
       <div className='flex flex-wrap gap-2'>
         {boundId ? (
-          <Button size='sm' variant='outline' onClick={onUnbind}>
-            解绑
-          </Button>
+          <>
+            <Button size='sm' variant='outline' onClick={onProbe}>
+              测通
+            </Button>
+            <Button size='sm' variant='outline' onClick={onGeo}>
+              测地理
+            </Button>
+            <Button size='sm' variant='outline' onClick={onUnbind}>
+              解绑
+            </Button>
+          </>
         ) : null}
         <Button size='sm' variant='outline' onClick={onAllocate}>
           分配空闲 SOCKS5

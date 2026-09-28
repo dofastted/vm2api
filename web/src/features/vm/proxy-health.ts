@@ -37,6 +37,14 @@ export function proxyHealthOf(vm: Vm, proxy: VmProxySnap): ProxyHealth {
     }
   }
 
+  return proxyOwnHealthOf(proxy)
+}
+
+/**
+ * 代理自身的健康分，不掺 VM 绑定关系。一条代理可能绑 0~N 台 VM，
+ * 没有单一 vm 可传给 `proxyHealthOf`。
+ */
+export function proxyOwnHealthOf(proxy: VmProxySnap): ProxyHealth {
   const status = String(proxy.status || '').toLowerCase()
   if (status === 'dead' || status === 'down' || status === 'error') {
     return {
