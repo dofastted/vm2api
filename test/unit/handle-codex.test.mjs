@@ -648,22 +648,30 @@ test('#A11: an OpenAI pool that stays full answers 429 pool_overloaded', async (
   const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
   rt.resetOpenAIAccountRuntime()
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-full-'))
-  writeGptVm(root, 'vm-gpt-a')
-  const file = path.join(root, 'vms', 'vm-gpt-a.json')
+  const vmId = 'vm-gpt-full'
+  writeGptVm(root, vmId)
+  const file = path.join(root, 'vms', `${vmId}.json`)
   fs.writeFileSync(
     file,
     JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), policy: { maxConcurrency: 1 } }),
   )
-  const held = rt.tryAcquireOpenAISlot('vm-gpt-a', { concurrency: 1 })
+  const held = rt.tryAcquireOpenAISlot(vmId, { concurrency: 1 })
   const args = codexArgs(root, { ensureCodexKernel: async () => ({ ok: true }) })
   args.routing = { pool: { fallback_wait_timeout_ms: 1000 } }
-  const out = await handleCodexProtocol(args)
-  assert.equal(out.status, 429)
-  assert.equal(out.body.error.code, 'pool_overloaded')
-  assert.equal(out.body.error.message, '号池负载过高，稍后再试')
-  held.release()
-  rt.resetOpenAIAccountRuntime()
-  fs.rmSync(root, { recursive: true, force: true })
+  // Waiter timers are unref'd so a systemd process can idle-exit. Keep one
+  // ref'd handle so this isolated file cannot drain before the 1s deadline.
+  const keepAlive = setTimeout(() => {}, 15_000)
+  try {
+    const out = await handleCodexProtocol(args)
+    assert.equal(out.status, 429)
+    assert.equal(out.body.error.code, 'pool_overloaded')
+    assert.equal(out.body.error.message, '号池负载过高，稍后再试')
+  } finally {
+    clearTimeout(keepAlive)
+    held.release()
+    rt.resetOpenAIAccountRuntime()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 function emptyCodexRes() {
