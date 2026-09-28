@@ -198,7 +198,7 @@ import { normalizeHealthProbeConfig } from './health-probe.mjs'
 import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
 import { publicNotifyConfig, publicRoutingNotify } from './notify.mjs'
 
-async function commitImportedCodexVm({ cfg, vmPath, existing, account }) {
+async function commitImportedCodexVm({ cfg, vmPath, existing, account, catalogClientVersion = 'auto' }) {
   const saved = upsertCodexAccount(cfg.paths.project, existing.id, account)
   existing.platform = 'openai'
   existing.family = 'codex'
@@ -219,6 +219,7 @@ async function commitImportedCodexVm({ cfg, vmPath, existing, account }) {
       projectRoot: cfg.paths.project,
       vmId: existing.id,
       rotate: true,
+      catalogClientVersion,
     })
   } catch {
     catalog = null
@@ -2621,7 +2622,13 @@ export function createPanelHandler(ctx) {
               account.id_token = tok.id_token || account.id_token
               account.expires_at = tok.expires_at || account.expires_at
             }
-            const committed = await commitImportedCodexVm({ cfg, vmPath, existing, account })
+            const committed = await commitImportedCodexVm({
+              cfg,
+              vmPath,
+              existing,
+              account,
+              catalogClientVersion: ctx.routingConfig.codex?.catalog_client_version,
+            })
             return json(res, 200, panel.ok(committed))
           }
 
@@ -2834,6 +2841,7 @@ export function createPanelHandler(ctx) {
               cfg,
               vmPath,
               existing,
+              catalogClientVersion: ctx.routingConfig.codex?.catalog_client_version,
               account: {
                 access_token: oauth.access_token,
                 refresh_token: oauth.refresh_token,
@@ -3260,16 +3268,28 @@ export function createPanelHandler(ctx) {
           projectRoot: cfg.paths.project,
           vmId: body?.vm_id || body?.vmId || url.searchParams.get('vm_id') || '',
           rotate: true,
+          catalogClientVersion:
+            body?.catalog_client_version ||
+            body?.catalogClientVersion ||
+            ctx.routingConfig.codex?.catalog_client_version ||
+            'auto',
         })
         if (!result.ok) {
           const status =
-            result.error === 'no_codex_slot' || result.error === 'proxy_required' || result.error === 'invalid_request'
+            result.error === 'no_codex_slot' ||
+            result.error === 'proxy_required' ||
+            result.error === 'invalid_request' ||
+            result.error === 'invalid_catalog_version'
               ? 400
               : 502
           return json(res, status, {
             ok: false,
             error: { code: result.error, message: result.message || result.error },
-            data: { vm_id: result.vm_id || null, synced: 0 },
+            data: {
+              vm_id: result.vm_id || null,
+              catalog_version: result.catalog_version || null,
+              synced: 0,
+            },
           })
         }
         return json(
@@ -3283,6 +3303,7 @@ export function createPanelHandler(ctx) {
             synced: result.synced,
             source: result.source,
             vm_id: result.vm_id,
+            catalog_version: result.catalog_version,
             ids: result.ids,
           }),
         )

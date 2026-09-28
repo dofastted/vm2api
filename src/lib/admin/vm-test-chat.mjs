@@ -27,7 +27,12 @@ import { credentialModeFromOauth, credentialModeOfVm } from '../oauth/credential
 import { isModelEnabled, getModelParams, getCapabilities, listPolicyModels } from '../protocol/model-policy.mjs'
 import { listGptPolicyModels, isGptModelEnabled, syncGptIdsIntoPolicy } from '../protocol/gpt-model-policy.mjs'
 import { listOfficialModels, validateOfficialModel } from '../protocol/models.mjs'
-import { fetchChatgptModelCatalog, refreshCodexAccessToken, CODEX_USER_AGENT } from '../protocol/codex-models.mjs'
+import {
+  fetchChatgptModelCatalog,
+  refreshCodexAccessToken,
+  resolveCodexCatalogVersion,
+  CODEX_USER_AGENT,
+} from '../protocol/codex-models.mjs'
 import { isGptSeriesId } from '../protocol/gpt-ids.mjs'
 import {
   resolveInferenceEngine,
@@ -146,7 +151,13 @@ function persistRefreshedCodexAccount(projectRoot, vmId, patch = {}, previous = 
  * rotate=true (panel sync) may refresh OAuth via refresh_token.
  * rotate=false (test-models probe) never rotates.
  */
-export async function syncCodexCatalog({ projectRoot, vmId, fetchImpl, rotate = true } = {}) {
+export async function syncCodexCatalog({
+  projectRoot,
+  vmId,
+  fetchImpl,
+  rotate = true,
+  catalogClientVersion = 'auto',
+} = {}) {
   if (!projectRoot) {
     return { ok: false, error: 'invalid_request', message: 'projectRoot required', ids: [], synced: 0 }
   }
@@ -154,6 +165,24 @@ export async function syncCodexCatalog({ projectRoot, vmId, fetchImpl, rotate = 
   const targets = listCodexVmsForCatalog(projectRoot, vm && isCodexVm(vm) ? vm : null)
   if (!targets.length) {
     return { ok: false, error: 'no_codex_slot', message: '没有可用的 GPT OAuth 槽', ids: [], synced: 0 }
+  }
+  const catalogVersion = await resolveCodexCatalogVersion({
+    configuredVersion: catalogClientVersion,
+    cachePath: path.join(
+      String(process.env.KIN_DATA_DIR || '').trim() || path.join(projectRoot, 'data'),
+      'codex-catalog-client.json',
+    ),
+    // Unit callers can provide the already resolved version while keeping
+    // their fetch mock reserved for ChatGPT catalog traffic.
+  })
+  if (!catalogVersion.ok) {
+    return {
+      ok: false,
+      error: catalogVersion.error,
+      message: '无法获取 Codex catalog client 版本',
+      ids: [],
+      synced: 0,
+    }
   }
   const merged = new Map()
   let usedVm = null
@@ -183,6 +212,7 @@ export async function syncCodexCatalog({ projectRoot, vmId, fetchImpl, rotate = 
           proxyUrl,
           fetchImpl,
           direct,
+          catalogVersion: catalogVersion.version,
         })
       let live = await fetchOnce()
       if (live.error === 'upstream_auth' && rotate && refreshToken) {
@@ -235,6 +265,7 @@ export async function syncCodexCatalog({ projectRoot, vmId, fetchImpl, rotate = 
       error: lastError?.error || 'empty_catalog',
       message: lastError?.message || '同步 GPT 目录失败',
       vm_id: lastError?.vm_id || targets[0].id,
+      catalog_version: catalogVersion.version,
       ids: [],
       synced: 0,
     }
@@ -244,18 +275,20 @@ export async function syncCodexCatalog({ projectRoot, vmId, fetchImpl, rotate = 
   return {
     ok: true,
     vm_id: usedVm,
+    catalog_version: catalogVersion.version,
     ids: models.map((row) => row.id),
     synced: models.length,
     source: 'chatgpt',
   }
 }
 
-async function refreshCodexCatalogFromSlot({ projectRoot, vm, fetchImpl } = {}) {
+async function refreshCodexCatalogFromSlot({ projectRoot, vm, fetchImpl, catalogClientVersion = 'auto' } = {}) {
   const result = await syncCodexCatalog({
     projectRoot,
     vmId: vm?.id,
     fetchImpl,
     rotate: false,
+    catalogClientVersion,
   })
   if (!result.ok) return { ok: false, error: result.error, ids: result.ids || [] }
   return { ok: true, ids: result.ids, source: result.source }
@@ -265,7 +298,14 @@ async function refreshCodexCatalogFromSlot({ projectRoot, vm, fetchImpl } = {}) 
  * Panel test-model dropdown. vm_id wins over platform.
  * refresh=true hops ChatGPT /backend-api/models via the slot SOCKS; 401 does not rotate OAuth.
  */
-export async function resolveTestModels({ projectRoot, vmId, platform, refresh = false, fetchImpl } = {}) {
+export async function resolveTestModels({
+  projectRoot,
+  vmId,
+  platform,
+  refresh = false,
+  fetchImpl,
+  catalogClientVersion = 'auto',
+} = {}) {
   const vm = vmId && projectRoot ? getVm(projectRoot, vmId) : null
   const kind = vm ? (isCodexVm(vm) ? 'openai' : 'anthropic') : normalizeTestPlatform(platform)
   let source = 'policy'
@@ -274,6 +314,7 @@ export async function resolveTestModels({ projectRoot, vmId, platform, refresh =
       projectRoot,
       vm: vm && isCodexVm(vm) ? vm : null,
       fetchImpl,
+      catalogClientVersion,
     })
     if (live.ok) source = 'chatgpt'
   }

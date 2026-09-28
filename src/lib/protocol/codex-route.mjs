@@ -9,6 +9,9 @@ export const CODEX_PROTOCOLS = Object.freeze(['openai.responses', 'openai.chat',
 
 export const DEFAULT_CODEX_ROUTING = Object.freeze({
   enabled: true,
+  // `auto` resolves the official Codex catalog client version at sync time,
+  // falling back to 0.158.0 when the registry is unavailable.
+  catalog_client_version: 'auto',
   protocols: {
     'openai.responses': { mode: 'native', enabled: true },
     'openai.chat': { mode: 'convert', enabled: true },
@@ -41,6 +44,10 @@ export function normalizeCodexRouting(raw = {}) {
   }
   return {
     enabled: raw.enabled !== false,
+    catalog_client_version:
+      typeof raw.catalog_client_version === 'string' && raw.catalog_client_version.trim()
+        ? raw.catalog_client_version.trim()
+        : 'auto',
     protocols,
     convert: {
       chat_to_codex: raw.convert?.chat_to_codex !== false,

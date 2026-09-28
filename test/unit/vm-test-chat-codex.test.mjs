@@ -244,6 +244,7 @@ test('resolveTestModels refresh merges ChatGPT ids and ignores 401', async (t) =
     projectRoot: root,
     vmId: 'vm-codex-01',
     refresh: true,
+    catalogClientVersion: '0.158.0',
     fetchImpl: async () => ({ ok: false, status: 401, json: async () => ({}) }),
   })
   assert.equal(denied.source, 'policy')
@@ -259,6 +260,7 @@ test('syncCodexCatalog refreshes OAuth on 401 then merges GPT ids', async (t) =>
     projectRoot: root,
     vmId: 'vm-codex-01',
     rotate: true,
+    catalogClientVersion: '0.158.0',
     fetchImpl: async (url) => {
       const href = String(url)
       if (href.includes('/oauth/token')) {
