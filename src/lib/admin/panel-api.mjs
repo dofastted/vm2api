@@ -35,7 +35,7 @@ import { filterVmsForPanel } from './resource-owner.mjs'
 import { computeWeeklySplit, publicWeeklySplit, weeklySplitConfig } from '../pool/weekly-split.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from '../pool/quota-tiers.mjs'
 import { inferClaudeTier } from '../pool/claude-tier.mjs'
-import { listQuotaFromHeaders } from '../pool/quota-window.mjs'
+import { listQuotaFromHeaders, isOfficialWindowLimited } from '../pool/quota-window.mjs'
 import { hardBlockOf } from '../pool/rate-limit-service.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { accountIdOf } from '../pool/pool-scheduler.mjs'
@@ -1224,7 +1224,7 @@ function hostStats() {
   }
 }
 
-function quotaFromAccount(acc, quotaConfig) {
+export function quotaFromAccount(acc, quotaConfig) {
   const u = acc?.unified || {}
   const listed = listQuotaFromHeaders(u)
   const sonnet = u.seven_day_sonnet || {}
@@ -1234,18 +1234,30 @@ function quotaFromAccount(acc, quotaConfig) {
       : u['7d_oi'] || {}
   const fable = u.fable || null
   const extra = u.extra_usage || null
+  const o5 = u.official?.['5h'] || u['5h'] || {}
+  const o7 = u.official?.['7d'] || u['7d'] || {}
+  const o5Limited = isOfficialWindowLimited(o5)
+  const o7Limited = isOfficialWindowLimited(o7)
+  const effectiveU5 = o5Limited
+    ? 1.0
+    : (listed.utilization_5h != null ? listed.utilization_5h : (o5.utilization != null ? Number(o5.utilization) : null))
+  const effectiveU7 = o7Limited
+    ? 1.0
+    : (listed.utilization_7d != null ? listed.utilization_7d : (o7.utilization != null ? Number(o7.utilization) : null))
+  const effectiveStatus5 = o5Limited ? 'rejected' : (listed.status_5h || o5.status || null)
+  const effectiveStatus7 = o7Limited ? 'rejected' : (listed.status_7d || o7.status || null)
   const q = {
-    utilization_5h: listed.utilization_5h,
-    utilization_7d: listed.utilization_7d,
+    utilization_5h: effectiveU5,
+    utilization_7d: effectiveU7,
     utilization_7d_sonnet: sonnet.utilization != null ? Number(sonnet.utilization) : null,
     utilization_7d_oi:
       oi.utilization != null ? Number(oi.utilization) : fable?.utilization != null ? Number(fable.utilization) : null,
-    reset_5h: listed.reset_5h || u.official?.['5h']?.reset || u['5h']?.reset || null,
-    reset_7d: listed.reset_7d || u.official?.['7d']?.reset || u['7d']?.reset || null,
+    reset_5h: listed.reset_5h || o5.reset || null,
+    reset_7d: listed.reset_7d || o7.reset || null,
     reset_7d_sonnet: sonnet.reset || null,
     reset_7d_oi: oi.reset || listed.reset_7d_oi || null,
-    status_5h: listed.status_5h || null,
-    status_7d: listed.status_7d || null,
+    status_5h: effectiveStatus5,
+    status_7d: effectiveStatus7,
     status_7d_sonnet: sonnet.status || null,
     status_7d_oi: oi.status || listed.status_7d_oi || null,
     extra_usage: extra,
