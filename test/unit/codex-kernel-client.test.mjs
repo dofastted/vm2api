@@ -30,6 +30,7 @@ test('writeCodexKernelConfig writes bound SOCKS proxy', () => {
   assert.equal(cfg.proxy_url, 'socks5h://127.0.0.1:1080')
   assert.equal(cfg.socket_path, written.socketPath)
   assert.equal(cfg.internal_token, 'secret')
+  assert.equal(cfg.max_request_bytes, 32 * 1024 * 1024)
   fs.rmSync(root, { recursive: true, force: true })
 })
 

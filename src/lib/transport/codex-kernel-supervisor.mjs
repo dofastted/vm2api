@@ -61,6 +61,10 @@ export function writeCodexKernelConfig(projectRoot, vm, { token, proxyUrl, proxy
     proxy_url: proxy,
     proxy_required: required,
     internal_token: secret,
+    // Keep Codex slots aligned with the 32 MiB body budget in the bundled
+    // kernel. Newer kernels can read this value; older binaries use the
+    // patched 32 MiB default directly.
+    max_request_bytes: 32 * 1024 * 1024,
     test_endpoints: process.env.KIN_CODEX_TEST_ENDPOINTS === '1',
   }
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 })
