@@ -10,6 +10,8 @@ import {
 import {
   CHATGPT_MODELS_URL,
   CODEX_MODELS_URL,
+  CODEX_APP_VERSION,
+  CODEX_CATALOG_ORIGINATOR,
   CODEX_OAUTH_TOKEN_URL,
   fetchChatgptModelCatalog,
   parseChatgptModelIds,
@@ -89,7 +91,9 @@ test('fetchChatgptModelCatalog hits /codex/models and does not treat 401 as succ
   assert.equal(ok.models[0].display_name, 'GPT-5.6')
   assert.match(String(calls[0].url), /\/backend-api\/codex\/models/)
   assert.equal(calls[0].headers.authorization, 'Bearer tok')
-  assert.equal(calls[0].headers.originator, 'Codex Desktop')
+  assert.equal(calls[0].headers.originator, CODEX_CATALOG_ORIGINATOR)
+  assert.equal(calls[0].headers.version, CODEX_APP_VERSION)
+  assert.match(String(calls[0].url), new RegExp(`client_version=${CODEX_APP_VERSION.replace(/\./g, '\\.')}`))
   assert.equal(calls[0].headers['chatgpt-account-id'], 'acct')
   assert.equal(CODEX_MODELS_URL, CHATGPT_MODELS_URL)
 

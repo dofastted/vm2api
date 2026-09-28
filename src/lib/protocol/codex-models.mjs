@@ -20,8 +20,15 @@ export const CODEX_OAUTH_REDIRECT_URI = 'http://localhost:1455/auth/callback'
 export const CODEX_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 export const CODEX_OAUTH_SCOPE = 'openid profile email offline_access api.connectors.read api.connectors.invoke'
 export const CODEX_OAUTH_ORIGINATOR = 'Codex Desktop'
-export const CODEX_APP_VERSION = '0.153.4'
-export const CODEX_USER_AGENT = 'codex_cli_rs/0.153.4 (linux x86_64)'
+// Keep the catalog request on a current official Codex client version. The
+// ChatGPT catalog is version-gated; stale versions can return an older catalog
+// without the models exposed to current Codex clients.
+export const CODEX_APP_VERSION = '0.158.0'
+// The model endpoint validates that Originator matches the User-Agent prefix.
+// OAuth still uses CODEX_OAUTH_ORIGINATOR (the desktop login surface), while
+// catalog and inference requests use the Codex CLI identity below.
+export const CODEX_CATALOG_ORIGINATOR = 'codex_cli_rs'
+export const CODEX_USER_AGENT = `${CODEX_CATALOG_ORIGINATOR}/${CODEX_APP_VERSION} (linux x86_64)`
 
 function isCodexRequestSlug(id) {
   return isSyncableGptCatalogId(id)
@@ -209,7 +216,7 @@ export async function fetchChatgptModelCatalog(opts = {}) {
     accept: 'application/json',
     authorization: `Bearer ${token}`,
     'user-agent': CODEX_USER_AGENT,
-    originator: CODEX_OAUTH_ORIGINATOR,
+    originator: CODEX_CATALOG_ORIGINATOR,
     version: CODEX_APP_VERSION,
   }
   const accountId = String(opts.accountId || '').trim()
