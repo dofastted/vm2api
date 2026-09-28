@@ -1,4 +1,5 @@
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { SettingRow } from '@/components/setting-row'
 
@@ -23,6 +24,7 @@ export function GptPane({
   onChange: (next: CodexBlock) => void
 }) {
   const convert = (value.convert as Record<string, unknown>) || {}
+  const catalogClientVersion = String(value.catalog_client_version ?? 'auto')
   const update = (patch: CodexBlock) => onChange({ ...value, ...patch })
   const setProtocol = (key: string, enabled: boolean, mode: string) => {
     const protocols = {
@@ -83,6 +85,21 @@ export function GptPane({
           <Switch
             checked={clientEntry(value, 'official_codex') === 'allow'}
             onCheckedChange={(allow) => setClient('official_codex', allow)}
+          />
+        </SettingRow>
+        <SettingRow
+          label='Codex 目录客户端版本'
+          desc='auto 会从官方 @openai/codex 获取并缓存版本；失败时默认使用 0.158.0。需要固定版本时可直接填写。'
+        >
+          <Input
+            className='w-32'
+            maxLength={20}
+            value={catalogClientVersion}
+            placeholder='auto'
+            aria-label='Codex 目录客户端版本'
+            onChange={(e) =>
+              update({ catalog_client_version: e.target.value || 'auto' })
+            }
           />
         </SettingRow>
         <SettingRow label='OpenAI 兼容客户端'>
