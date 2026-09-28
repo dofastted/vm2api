@@ -205,7 +205,10 @@ test('GPT-6 Sol and Luna use the official standard rates', () => {
 })
 
 test('GPT-6 Sol and Luna use the published Flex and Fast bands', () => {
-  const solFlex = calculateCost({ input_tokens: 1_000_000, output_tokens: 1_000_000, service_tier: 'flex' }, 'gpt-6-sol')
+  const solFlex = calculateCost(
+    { input_tokens: 1_000_000, output_tokens: 1_000_000, service_tier: 'flex' },
+    'gpt-6-sol',
+  )
   assert.equal(solFlex.known, true)
   assert.equal(solFlex.total_cost, 6)
 
