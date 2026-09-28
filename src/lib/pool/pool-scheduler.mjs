@@ -223,6 +223,7 @@ export class PoolScheduler {
     this.lastUsed = new Map()
     this.cooldownTimers = new Map()
     this.vmSlots = new Map()
+    this.slotCooldown = new Map()
     this.unitCircuit = unitCircuit
     if (runtimeRepo) this.unitCircuit.bindRepo(runtimeRepo)
   }
@@ -1088,23 +1089,86 @@ export class PoolScheduler {
     if (book.inflight.size >= limit) return null
     const key = String(sessionKey || '')
     const preferred = key ? book.preferred.get(key) : null
+    const preferredCooling = Number.isInteger(preferred) && this.slotCooling(vmId, preferred)
     const busy = new Set(book.inflight.values())
     const ownsBusySeat =
       Number.isInteger(preferred) &&
+      !preferredCooling &&
       busy.has(preferred) &&
       [...book.inflight.keys()].some((hold) => String(hold).startsWith(`live:${key}:`))
     let index
-    if (Number.isInteger(preferred) && (!busy.has(preferred) || ownsBusySeat)) {
+    if (Number.isInteger(preferred) && !preferredCooling && (!busy.has(preferred) || ownsBusySeat)) {
       index = preferred
     } else {
       index = 0
-      while (busy.has(index)) index += 1
+      while (index < limit && (busy.has(index) || this.slotCooling(vmId, index))) index += 1
       if (index >= limit) return null
       if (key) book.preferred.set(key, index)
     }
     const holdKey = `live:${key || 'anon'}:${index}:${Date.now()}:${Math.random().toString(16).slice(2)}`
     book.inflight.set(holdKey, index)
-    return { index, holdKey, ephemeral: true, created: !Number.isInteger(preferred) }
+    return { index, holdKey, ephemeral: true, created: !Number.isInteger(preferred) || preferredCooling }
+  }
+
+  /** Empty hop or client cancel. Stays down until the CLI restarts. */
+  markSlotUnavailable(vmId, slotIndex) {
+    const index = Number(slotIndex)
+    const id = String(vmId || '')
+    if (!id || !Number.isInteger(index) || index < 0) return false
+    let bag = this.slotCooldown.get(id)
+    if (!bag) {
+      bag = new Map()
+      this.slotCooldown.set(id, bag)
+    }
+    bag.set(index, Number.POSITIVE_INFINITY)
+    return true
+  }
+
+  slotCooling(vmId, slotIndex, now = Date.now()) {
+    const id = String(vmId || '')
+    const bag = this.slotCooldown.get(id)
+    if (!bag) return false
+    const until = Number(bag.get(Number(slotIndex))) || 0
+    if (until <= now) {
+      bag.delete(Number(slotIndex))
+      if (!bag.size) this.slotCooldown.delete(id)
+      return false
+    }
+    return true
+  }
+
+  badSlotCount(vmId) {
+    const bag = this.slotCooldown.get(String(vmId || ''))
+    if (!bag) return 0
+    let count = 0
+    for (const index of bag.keys()) {
+      if (this.slotCooling(vmId, index)) count += 1
+    }
+    return count
+  }
+
+  slotsExhausted(vmId, cap = 20) {
+    const limit = Number(cap) || 20
+    return limit > 0 && this.badSlotCount(vmId) >= limit
+  }
+
+  clearSlotFaults(vmId) {
+    this.slotCooldown.delete(String(vmId || ''))
+  }
+
+  /** Every native seat failed. Hard-block the VM until the CLI restart clears it. */
+  markSlotsOverload(vmId, accountId, ttlMs = 60_000) {
+    if (!accountId || !vmId || !this.runtimeRepo?.updateWindow) return false
+    const ttl = Number(ttlMs)
+    const until = Date.now() + (Number.isFinite(ttl) && ttl > 0 ? ttl : 60_000)
+    this.runtimeRepo.updateWindow(accountId, { vmId, overloadUntil: until })
+    return true
+  }
+
+  clearSlotsOverload(vmId, accountId) {
+    this.clearSlotFaults(vmId)
+    if (!accountId || !this.runtimeRepo?.updateWindow) return
+    this.runtimeRepo.updateWindow(accountId, { vmId, overloadUntil: null })
   }
 
   dropSessionSlot(vmId, sessionKey) {

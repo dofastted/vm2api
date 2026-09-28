@@ -26,7 +26,12 @@ import { markVmRefreshError } from '../oauth/oauth-credentials.mjs'
 import { shouldMarkMissingRefresh } from '../pool/schedule-eligibility.mjs'
 import { normalizeCodexRouting } from '../protocol/codex-route.mjs'
 import { rustKernelHealth } from '../transport/rust-kernel-client.mjs'
-import { syncClaudeKernelConfigs } from '../transport/rust-kernel-supervisor.mjs'
+import {
+  deferWrapRecycle,
+  scheduleWrapRecycle,
+  syncClaudeKernelConfigs,
+  wrapHopInflight,
+} from '../transport/rust-kernel-supervisor.mjs'
 
 export function createRoutingRuntime(ctx) {
   const getRouting = () => (typeof ctx.getRoutingConfig === 'function' ? ctx.getRoutingConfig() : ctx.routingConfig)
@@ -412,6 +417,18 @@ export function createRoutingRuntime(ctx) {
       attemptsRepo,
       rateLimitService,
       config: routingConfig.failover || {},
+      recoverSlot: async (exec) => {
+        const pending = scheduleWrapRecycle(exec, { cooldownMs: 60_000 })?.pending
+        if (pending) await pending
+      },
+      idleRestartSlot: (exec) => {
+        const restart = () => {
+          const pending = scheduleWrapRecycle(exec, { cooldownMs: 60_000 })?.pending
+          pending?.then?.(() => poolScheduler.clearSlotFaults?.(exec?.vmId))
+        }
+        if (wrapHopInflight(exec) > 0) deferWrapRecycle(exec, restart)
+        else restart()
+      },
       onProxyFailure: (vmId, reason) => {
         ctx.proxyPool.reportRuntimeFailure(vmId, reason)
       },
