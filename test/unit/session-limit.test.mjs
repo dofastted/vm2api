@@ -20,15 +20,39 @@ test('new key is refused at cap; existing key renews', () => {
   assert.equal(r.snapshot('a', { max: 2 }).active, 2)
 })
 
-test('idle timeout drops a stale key', () => {
+test('idle timeout drops a stale released key', () => {
   const r = new SessionLimitRegistry()
   const now = Date.now()
   r.touch('a', 'old', now - 10 * 60_000)
+  r.release('a', 'old', { now: now - 10 * 60_000 })
   r.touch('a', 'fresh', now)
   const snap = r.snapshot('a', { max: 8, idleMin: 5, now })
   assert.equal(snap.active, 1)
   assert.equal(r.canAccept('a', 'new', { max: 1, idleMin: 5, now }).ok, false)
+  r.release('a', 'fresh', { now })
   assert.equal(r.canAccept('a', 'new', { max: 1, idleMin: 5, now: now + 6 * 60_000 }).ok, true)
+})
+
+test('a window with a live request outlives the idle TTL; idle starts at release', () => {
+  const r = new SessionLimitRegistry()
+  const start = Date.now()
+  r.touch('a', 'stream', start)
+  const later = start + 30 * 60_000
+  assert.equal(r.snapshot('a', { max: 1, idleMin: 5, now: later }).active, 1)
+  assert.equal(r.canAccept('a', 'other', { max: 1, idleMin: 5, now: later }).ok, false)
+  r.release('a', 'stream', { now: later })
+  assert.equal(r.canAccept('a', 'other', { max: 1, idleMin: 5, now: later + 4 * 60_000 }).ok, false)
+  assert.equal(r.canAccept('a', 'other', { max: 1, idleMin: 5, now: later + 6 * 60_000 }).ok, true)
+})
+
+test('a release from a dropped placement does not free the new placement', () => {
+  const r = new SessionLimitRegistry()
+  const now = Date.now()
+  const oldGen = r.touch('a', 's1', now)
+  r.drop('a', 's1')
+  r.touch('a', 's1', now)
+  r.release('a', 's1', { gen: oldGen, now })
+  assert.equal(r.snapshot('a', { max: 1, idleMin: 5, now: now + 60 * 60_000 }).active, 1)
 })
 
 test('release keeps the key until idle prune', () => {

@@ -12,7 +12,12 @@ import {
 import { ModelVendorIcon } from '@/components/model-vendor-icon'
 import { SlotIdentity } from '@/components/platform-chip'
 import { columnVisible, type HideableLogColumn } from './column-visibility'
-import { rowCost, showModelRedirect, statusBadge } from './log-badges'
+import {
+  UNASSIGNED_EXECUTION,
+  rowCost,
+  showModelRedirect,
+  statusBadge,
+} from './log-badges'
 import {
   CacheBadge,
   RateMultiplierBadge,
@@ -188,6 +193,7 @@ export function LogRow({
             vmId={row.vm_id}
             model={row.requested_model || row.model}
             protocol={row.protocol == null ? undefined : String(row.protocol)}
+            emptyLabel={UNASSIGNED_EXECUTION}
           />
         </div>
       ) : null}

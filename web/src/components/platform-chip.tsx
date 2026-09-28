@@ -43,6 +43,7 @@ export function SlotIdentity({
   email,
   model,
   protocol,
+  emptyLabel,
   compact = false,
   className,
 }: {
@@ -51,11 +52,12 @@ export function SlotIdentity({
   email?: string | null
   model?: string | null
   protocol?: string | null
+  emptyLabel?: string
   compact?: boolean
   className?: string
 }) {
   const kind = vm ? vmKindOf(vm) : kindFromModel(model, protocol)
-  const full = slotAccountLabel(vm, { email, vmId })
+  const full = slotAccountLabel(vm, { email, vmId, emptyLabel })
   const shown = compact && full.includes('@') ? compactEmail(full) : full
   return (
     <span

@@ -155,8 +155,8 @@ test('elapsed 5h reset is not a live park', () => {
 test('a bound OpenAI session stays on its VM and a full window is skipped', () => {
   const sessions = new SessionLimitRegistry()
   const vms = [
-    gpt('vm-a', { utilization_5h: 0.1, policy: { sessionSlots: 1 } }),
-    gpt('vm-b', { utilization_5h: 0.2, policy: { sessionSlots: 1 } }),
+    gpt('vm-a', { utilization_5h: 0.1, policy: { maxSessions: 1 } }),
+    gpt('vm-b', { utilization_5h: 0.2, policy: { maxSessions: 1 } }),
   ]
   sessions.touch('vm-a', 'conv-a')
   const again = orderCodexSessionSlots(vms, {
@@ -171,6 +171,9 @@ test('a bound OpenAI session stays on its VM and a full window is skipped', () =
   sessions.touch('vm-b', 'conv-b')
   const full = orderCodexSessionSlots(vms, { sessionKey: 'conv-c', sessionLimit: sessions })
   assert.equal(full.error, 'session_window_full')
+  // session_slots is an execution seat count, never a conversation window cap.
+  const seatsOnly = [gpt('vm-a', { policy: { sessionSlots: 1 } })]
+  assert.deepEqual(orderCodexSessionSlots(seatsOnly, { sessionKey: 'conv-z', sessionLimit: sessions }).ids, ['vm-a'])
 })
 
 test('panel max_concurrency on the listVms summary is the candidate cap (#150)', async () => {
@@ -182,28 +185,29 @@ test('panel max_concurrency on the listVms summary is the candidate cap (#150)',
     3,
   )
   const vms = [gpt('vm-a', { max_concurrency: 4 })]
-  const { acquireOpenAISlot, resetOpenAIAccountRuntime } = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  const { tryAcquireOpenAISlot, resetOpenAIAccountRuntime } = await import(
+    '../../src/lib/pool/openai-account-runtime.mjs'
+  )
   resetOpenAIAccountRuntime()
-  acquireOpenAISlot('vm-a')
-  acquireOpenAISlot('vm-a')
+  tryAcquireOpenAISlot('vm-a', { concurrency: 4 })
+  tryAcquireOpenAISlot('vm-a', { concurrency: 4 })
   assert.deepEqual(orderCodexSessionSlots(vms).ids, ['vm-a'])
-  acquireOpenAISlot('vm-a')
-  acquireOpenAISlot('vm-a')
+  tryAcquireOpenAISlot('vm-a', { concurrency: 4 })
+  tryAcquireOpenAISlot('vm-a', { concurrency: 4 })
   assert.equal(orderCodexSessionSlots(vms).error, 'capacity_unavailable')
+  assert.equal(tryAcquireOpenAISlot('vm-a', { concurrency: 4 }), null)
   resetOpenAIAccountRuntime()
 })
 
 test('panel max_rpm caps starts per minute on a GPT slot', async () => {
-  const { acquireOpenAISlot, releaseOpenAISlot, resetOpenAIAccountRuntime } = await import(
+  const { tryAcquireOpenAISlot, resetOpenAIAccountRuntime } = await import(
     '../../src/lib/pool/openai-account-runtime.mjs'
   )
   resetOpenAIAccountRuntime()
   const now = Date.parse('2026-09-27T00:00:00.000Z')
   const vms = [gpt('vm-a', { max_rpm: 2 }), gpt('vm-b', { max_rpm: 0 })]
-  for (let i = 0; i < 2; i++) {
-    acquireOpenAISlot('vm-a', now)
-    releaseOpenAISlot('vm-a')
-  }
+  for (let i = 0; i < 2; i++) tryAcquireOpenAISlot('vm-a', { concurrency: 2, maxRpm: 2, now }).release()
+  assert.equal(tryAcquireOpenAISlot('vm-a', { concurrency: 2, maxRpm: 2, now: now + 1000 }), null)
   assert.deepEqual(orderCodexSessionSlots(vms, { now: now + 1000 }).ids, ['vm-b'])
   assert.ok(orderCodexSessionSlots(vms, { now: now + 61_000 }).ids.includes('vm-a'))
   resetOpenAIAccountRuntime()
@@ -226,11 +230,12 @@ test('GPT wait queue wakes FIFO on release and caps at 100 waiters', async () =>
   const order = []
   const first = rt.waitForOpenAICapacity({ deadline }).then((r) => order.push(['a', r.woken]))
   const second = rt.waitForOpenAICapacity({ deadline }).then((r) => order.push(['b', r.woken]))
-  rt.acquireOpenAISlot('vm-a')
-  rt.releaseOpenAISlot('vm-a')
+  const lease = rt.tryAcquireOpenAISlot('vm-a')
+  lease.release()
   await first
   assert.deepEqual(order, [['a', true]])
-  rt.releaseOpenAISlot('vm-a')
+  lease.release()
+  rt.tryAcquireOpenAISlot('vm-a').release()
   await second
   assert.deepEqual(order, [
     ['a', true],
@@ -249,13 +254,12 @@ test('GPT wait queue wakes FIFO on release and caps at 100 waiters', async () =>
 })
 
 test('RPM-only capacity miss reports when the window reopens', async () => {
-  const { acquireOpenAISlot, releaseOpenAISlot, resetOpenAIAccountRuntime } = await import(
+  const { tryAcquireOpenAISlot, resetOpenAIAccountRuntime } = await import(
     '../../src/lib/pool/openai-account-runtime.mjs'
   )
   resetOpenAIAccountRuntime()
   const now = Date.parse('2026-09-27T00:00:00.000Z')
-  acquireOpenAISlot('vm-a', now)
-  releaseOpenAISlot('vm-a')
+  tryAcquireOpenAISlot('vm-a', { now }).release()
   const full = orderCodexSessionSlots([gpt('vm-a', { max_rpm: 1 })], { now: now + 1000 })
   assert.equal(full.error, 'capacity_unavailable')
   assert.equal(full.retryAt, now + 60_000)

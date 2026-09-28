@@ -228,7 +228,17 @@ curl -sS http://127.0.0.1:8787/health
 | `upstream_error` | 401/403/502 |
 | `api_error` | 500 |
 
-429 可能带 `retry-after`。恢复备份期间协议口 `503 restore_in_progress`。健康探测短请求在无缓存且 fail-closed 时 `503`。池耗尽返回明确耗尽，不伪装过载。
+429 可能带 `retry-after`。恢复备份期间协议口 `503 restore_in_progress`。健康探测短请求在无缓存且 fail-closed 时 `503`。
+
+号池结果分开返回，不互相伪装：
+
+| 情况 | HTTP | code | message |
+|---|---|---|---|
+| 所有合格执行位都忙，有界等待（或等待队列）用完 | 429 | `pool_overloaded` | 号池负载过高，稍后再试 |
+| 没有任何合格账号（未配置、额度 / 凭证 / 模型 / 人工关闭都不合格） | 503 | `pool_unavailable` | 号池当前没有可用账号 |
+| 已经执行过、最后一跳失败 | 上游本义 | 上游错误码（如 `incomplete_response`、429、401） | 上游本义 |
+
+`pool_overloaded` 只有在已知恢复时刻（冷却、RPM 窗口、会话窗口到期）时才带 `retry-after`。OpenAI 槽同样如此。续接 `previous_response_id` 的 Responses 请求只能在原 GPT 账号上继续；该账号已不可用时返回 `409 response_not_portable`，请带完整上下文重新发起。
 
 客户端断开不计 SLA、不处罚账号。
 
@@ -238,14 +248,14 @@ curl -sS http://127.0.0.1:8787/health
 {"error":{"type":"upstream_error","code":"incomplete_response","message":"Assistant hop ended without visible output or stop_reason"}}
 ```
 
-含义：请求已交给槽内 CLI，但这一轮结束时既没有可见输出（text / tool_use / refusal），也没有 `stop_reason`。只有 thinking 也算。网关最多在同账号、且上一次执行已经结束时再试一次，然后把这个 502 交回客户端。这一次请求不停调、不换号、不写账号冷却。一开始就没有可用账号时，仍然返回池耗尽。客户端主动断开是 `client_cancelled`，不是这个错误。诊断钉死在某一个槽时，停在该槽并返回这个错误。
+含义：请求已交给槽内 CLI，但这一轮结束时既没有可见输出（text / tool_use / refusal），也没有 `stop_reason`。只有 thinking 也算。上一次执行已经结束且尚未向客户端写出时，网关先换到别的空闲 VM 重放，没有空位才回到同一 VM；同一请求在同一 VM 上最多实际执行 3 次（含传输层隐藏重试）。都用完仍不完整，才把这个 502 交回客户端。这一次请求不停调、不写账号冷却，也不因计数重启 CLI。一开始就没有可用账号时，返回 `pool_unavailable`。客户端主动断开是 `client_cancelled`，不是这个错误。诊断钉死在某一个槽时，停在该槽并返回这个错误。
 
 常见原因与处理：
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
 | 同一个槽的请求**全部**失败，每次约 20–30 秒才返回；面板代理探测却是绿的 | 槽容器到宿主机 `kin-egress` 网关被宿主机防火墙拦截（常见于 UFW 入站默认拒绝）。容器内 DNS 和出站 TCP 都超时，CLI 重试到放弃，没有任何输出 | 放行 `keg*` 网卡到网关端口的入站，见 [DEPLOY.md「防火墙」](DEPLOY.md#防火墙ufw--firewalld) |
-| 偶发，重试后成功 | 上游流中断或模型只返回了 thinking | 客户端重试即可；网关已在同号自动重试一次 |
+| 偶发，重试后成功 | 上游流中断或模型只返回了 thinking | 客户端重试即可；网关已先换空闲 VM 重放，同一 VM 最多 3 次 |
 | 某个槽持续失败，重启槽后恢复 | 槽内 CLI 卡死，slot 未释放 | 面板重启该槽 |
 
 面板代理探测是从宿主机本机连网关端口，不经过「容器 → 网关」这一跳，所以防火墙拦截时它仍显示正常。确认方法：
@@ -274,7 +284,10 @@ stateDiagram-v2
 
 - **realtime（默认）**：第一段业务 SSE 写出后不再换账号。
 - **verified**：收齐 `message_stop` 再给客户端；不完整则继续换号。
-- sticky：同一 `x-session-id`（及 routing 里其它键）在终态成功后绑槽；槽冷却 / 死票会拆粘性再选。
+- sticky：同一会话（`x-session-id` 等键）在终态成功后绑槽。绑定是偏好，不是过滤：绑定槽忙（并发、RPM、执行位满、未知 429 短冷却）时，这一轮借用同平台别的空闲合格槽，绑定不动，下一轮仍回原槽；额度 / 凭证 / 暂停等确定失效才把会话连同会话窗口迁走。
+- 重试预算：每个 VM 每请求最多 3 次实际执行；准入竞争失败不算一次执行。`failover.max_total_attempts` / `max_account_switches` 用完后只再尝试本请求还没试过的 VM，直到 `total_retry_deadline_ms`。
+- 子请求：带显式 `parent_session_id` / `root_session_id` 且父会话在本地已有绑定时，子请求计入父会话的会话窗口，不新占 `max_sessions`；每个并行子请求仍各占一个执行位、并发与 RPM。没有显式父子字段时，同设备的新会话不会被当作子请求。
+- 裸 429（没有 5h/7d 头、没有套餐文案）不按模型名定范围：当前执行单元短暂让位并触发一次 `/usage` 探测，由真实用量决定是否是账号额度。上游文本点名模型的才按模型冷却，每分钟限流按 RPM 短冷却。
 
 ## 用量回包
 

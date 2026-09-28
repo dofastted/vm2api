@@ -48,7 +48,7 @@ export function PoolPane(props: PoolPaneProps) {
         </SettingRow>
         <SettingRow
           label='同 VM 重试'
-          desc='空响应或可重试错误时，换号前在同一台 Claude VM 上再试的次数'
+          desc='可重试错误时，没有别的空闲 VM 才回同一台再试的次数；空响应不受此限。同一 VM 每请求最多执行 3 次'
         >
           <Input
             className='w-24'
@@ -115,7 +115,7 @@ export function PoolPane(props: PoolPaneProps) {
         </SettingRow>
         <SettingRow
           label='切号上限'
-          desc='单次请求失败转移时最多切换的 Claude VM 数'
+          desc='用完后只再尝试本请求还没试过的 VM，直到总时限'
         >
           <Input
             className='w-24'
@@ -129,7 +129,10 @@ export function PoolPane(props: PoolPaneProps) {
             }
           />
         </SettingRow>
-        <SettingRow label='总尝试' desc='含重试在内的总尝试上限'>
+        <SettingRow
+          label='总尝试'
+          desc='用完后不再重复同一 VM，只尝试还没试过的 VM，直到总时限'
+        >
           <Input
             className='w-24'
             type='number'

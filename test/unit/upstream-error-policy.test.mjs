@@ -54,20 +54,54 @@ test('unified account 429 cools account until authoritative reset', () => {
   assert.equal(shouldContinue(policy), true)
 })
 
-test('model 429 stays on the model and does not open the unit circuit', () => {
+test('#163: a bare 429 is unknown for every model; the model name never decides scope', () => {
+  for (const model of ['claude-sonnet-4-5-20250929', 'claude-haiku-4-5', 'claude-opus-4-6', 'unknown-model']) {
+    const policy = classifyUpstreamResult(
+      { status: 429, body: { error: { type: 'rate_limit_error', message: 'Rate limited' } }, headers: {} },
+      { model, now: 1000 },
+    )
+    assert.equal(policy.reason, 'rate_limited_unknown', model)
+    assert.equal(policy.scope, 'account', model)
+    assert.equal(policy.cooldownUntil, 61_000, model)
+    assert.equal(policy.circuit, undefined, model)
+  }
+})
+
+test('#163: upstream text naming a model family limits only that model', () => {
   const policy = classifyUpstreamResult(
     {
       status: 429,
-      body: { error: { type: 'rate_limit_error', message: 'model capacity' } },
+      body: { error: { type: 'rate_limit_error', message: 'Opus usage limit reached for this period' } },
+      headers: { 'retry-after': '120' },
+    },
+    { model: 'claude-opus-4-6', now: 1000 },
+  )
+  assert.equal(policy.scope, 'model')
+  assert.equal(policy.reason, 'opus_rate_limited')
+  assert.equal(policy.model, 'claude-opus-4-6')
+  assert.equal(policy.decision.scope, 'model')
+})
+
+test('#163: per-minute evidence is an RPM cooldown, not an account quota', () => {
+  const byText = classifyUpstreamResult(
+    {
+      status: 429,
+      body: { error: { message: 'Number of requests has exceeded your per-minute rate limit' } },
       headers: {},
     },
     { model: 'claude-sonnet-test', now: 1000 },
   )
-  assert.equal(policy.scope, 'model')
-  assert.equal(policy.model, 'claude-sonnet-test')
-  assert.equal(policy.cooldownUntil, 61_000)
-  assert.equal(policy.circuit, undefined)
-  assert.equal(policy.decision.scope, 'model')
+  const byHeader = classifyUpstreamResult(
+    {
+      status: 429,
+      body: { error: { message: 'limited' } },
+      headers: { 'anthropic-ratelimit-requests-remaining': '0' },
+    },
+    { model: 'claude-sonnet-test', now: 1000 },
+  )
+  assert.equal(byText.reason, 'rpm_limited')
+  assert.equal(byHeader.reason, 'rpm_limited')
+  assert.equal(byText.scope, 'account')
 })
 
 test('entitlement 429 stops without poisoning pool', () => {

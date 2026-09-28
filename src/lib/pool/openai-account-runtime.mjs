@@ -63,22 +63,31 @@ export function bumpOpenAICursor() {
   return roundRobinCursor
 }
 
-export function acquireOpenAISlot(id, now = Date.now()) {
+/**
+ * One synchronous check-and-claim: concurrency and RPM are read and taken in
+ * the same tick, so two admissions can never both see the last free seat.
+ * Returns a lease whose release() is idempotent, or null when full.
+ */
+export function tryAcquireOpenAISlot(id, { concurrency = 1, maxRpm = 0, now = Date.now() } = {}) {
+  const cap = Number(concurrency) > 0 ? Number(concurrency) : 1
   const slot = slotOf(id)
+  if (slot.inFlight >= cap) return null
+  const rpm = Number(maxRpm) || 0
+  if (rpm > 0 && recentStarts(slot, now) >= rpm) return null
+  recentStarts(slot, now)
   slot.inFlight += 1
   slot.lastStartedAt = now
-  recentStarts(slot, now)
   slot.starts.push(now)
-  return slot.inFlight
-}
-
-export function releaseOpenAISlot(id) {
-  const key = String(id || '')
-  const slot = slots.get(key)
-  if (!slot) return 0
-  slot.inFlight = Math.max(0, slot.inFlight - 1)
-  wakeOpenAIWaiter()
-  return slot.inFlight
+  let released = false
+  return {
+    id: String(id || ''),
+    release() {
+      if (released) return
+      released = true
+      slot.inFlight = Math.max(0, slot.inFlight - 1)
+      wakeOpenAIWaiter()
+    },
+  }
 }
 
 export function openAIWaiterCount() {

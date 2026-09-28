@@ -20,8 +20,9 @@ test('VM without credentials is excluded and pool fails closed', async () => {
     })
     assert.equal(r.status, 503, r.text)
     const blob = JSON.stringify(r.json)
-    assert.match(blob, /号池负载过高/)
-    assert.equal(r.json?.error?.code, 'server_overloaded')
+    assert.match(blob, /号池当前没有可用账号/)
+    assert.doesNotMatch(blob, /负载过高/)
+    assert.equal(r.json?.error?.code, 'pool_unavailable')
     assert.doesNotMatch(blob, /eligible|no ready api|account_pool_exhausted/i)
   } finally {
     await gw.stop()

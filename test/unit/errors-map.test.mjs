@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import {
   mapUpstreamError,
   rewritePoolErrorForClient,
-  isPoolCapacityError,
+  poolErrorKind,
   isWrapConnectionError,
   isUsagePolicyErrorMessage,
   isAssistantMessageBody,
@@ -12,24 +12,34 @@ import {
   finalizeAssembledAssistantHop,
   mergeAssembledAssistantHop,
   CLIENT_POOL_BUSY_MESSAGE,
+  CLIENT_POOL_UNAVAILABLE_MESSAGE,
 } from '../../src/lib/core/errors.mjs'
 
-test('pool-empty codes rewrite to a generic overload for the client', () => {
+test('an empty pool is a 503 "no available account", never a load message', () => {
   const mapped = mapUpstreamError(503, {
     error: { type: 'api_error', code: 'account_pool_exhausted', message: 'No eligible Claude accounts remain' },
   })
   assert.equal(mapped.status, 503)
-  assert.equal(mapped.body.error.type, 'overloaded_error')
-  assert.equal(mapped.body.error.code, 'server_overloaded')
-  assert.equal(mapped.body.error.message, CLIENT_POOL_BUSY_MESSAGE)
+  assert.equal(mapped.body.error.code, 'pool_unavailable')
+  assert.equal(mapped.body.error.message, CLIENT_POOL_UNAVAILABLE_MESSAGE)
   assert.equal(mapped.body.error.details, undefined)
+})
+
+test('real capacity exhaustion is a 429 pool_overloaded', () => {
+  for (const code of ['pool_overloaded', 'pool_wait_queue_full']) {
+    const mapped = mapUpstreamError(429, { error: { type: 'rate_limit_error', code, message: 'busy' } })
+    assert.equal(mapped.status, 429, code)
+    assert.equal(mapped.body.error.type, 'rate_limit_error', code)
+    assert.equal(mapped.body.error.code, 'pool_overloaded', code)
+    assert.equal(mapped.body.error.message, CLIENT_POOL_BUSY_MESSAGE, code)
+  }
 })
 
 test('api pool empty message is not leaked to the client', () => {
   const mapped = mapUpstreamError(503, {
     error: { type: 'api_error', code: 'api_pool_exhausted', message: 'no ready api key for this model' },
   })
-  assert.equal(mapped.body.error.code, 'server_overloaded')
+  assert.equal(mapped.body.error.code, 'pool_unavailable')
   assert.doesNotMatch(mapped.body.error.message, /no ready api|eligible/i)
 })
 
@@ -45,8 +55,7 @@ test('rewritePoolErrorForClient strips leftover pool details', () => {
       },
     },
   })
-  assert.equal(rewritten.body.error.code, 'server_overloaded')
-  assert.equal(rewritten.body.error.message, CLIENT_POOL_BUSY_MESSAGE)
+  assert.equal(rewritten.body.error.code, 'pool_unavailable')
   assert.equal(rewritten.body.error.details, undefined)
 })
 
@@ -258,9 +267,11 @@ test('kernel slot_busy is overloaded, not upstream', () => {
   assert.match(mapped.body.error.message, /no free slot/)
 })
 
-test('isPoolCapacityError covers internal empty-pool codes', () => {
-  assert.equal(isPoolCapacityError('account_pool_exhausted'), true)
-  assert.equal(isPoolCapacityError('api_pool_exhausted'), true)
-  assert.equal(isPoolCapacityError('upstream_error', 'No eligible Claude accounts remain'), true)
-  assert.equal(isPoolCapacityError('upstream_rate_limit', 'Rate limit exceeded'), false)
+test('poolErrorKind separates capacity from nothing-eligible and leaves upstream errors alone', () => {
+  assert.equal(poolErrorKind('pool_overloaded'), 'overloaded')
+  assert.equal(poolErrorKind('account_pool_exhausted'), 'unavailable')
+  assert.equal(poolErrorKind('api_pool_exhausted'), 'unavailable')
+  assert.equal(poolErrorKind('upstream_error', 'No eligible Claude accounts remain'), 'unavailable')
+  assert.equal(poolErrorKind('upstream_rate_limit', 'Rate limit exceeded'), null)
+  assert.equal(poolErrorKind('incomplete_response'), null)
 })

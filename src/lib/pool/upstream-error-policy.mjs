@@ -108,12 +108,30 @@ function isUsagePolicyMessage(message) {
 
 export const FABLE_FAMILY_KEY = 'fable'
 
-function modelFamily(model) {
-  const value = String(model || '').toLowerCase()
+/** A model family the upstream text itself names; the request model does not count. */
+function modelFamilyInMessage(message) {
+  const value = String(message || '').toLowerCase()
   for (const family of ['opus', 'sonnet', 'haiku', 'fable']) {
-    if (value.includes(family)) return family
+    if (new RegExp(`\\b${family}\\b`).test(value)) return family
   }
   return null
+}
+
+const SHORT_WINDOW_MESSAGE = /per[- ]minute|\brpm\b|\btpm\b/i
+const SHORT_WINDOW_HEADERS = [
+  'anthropic-ratelimit-requests-remaining',
+  'anthropic-ratelimit-tokens-remaining',
+  'anthropic-ratelimit-input-tokens-remaining',
+  'anthropic-ratelimit-output-tokens-remaining',
+]
+
+/** Per-minute limit evidence. Retry-After alone only says when, not which window. */
+function isShortWindowLimit(message, headers) {
+  if (SHORT_WINDOW_MESSAGE.test(String(message || ''))) return true
+  return SHORT_WINDOW_HEADERS.some((name) => {
+    const value = header(headers, name)
+    return value != null && String(value).trim() === '0'
+  })
 }
 
 export function isFableModel(model) {
@@ -495,21 +513,36 @@ function classifyUpstreamResultRaw(
         cooldownUntil: fableReset || now + 60_000,
       }
     }
-    const family = modelFamily(model)
-    if (family) {
+    // The model name alone never decides scope (#163): only upstream text
+    // naming a model family proves a model limit, and only a per-minute
+    // limit proves RPM. A bare 429 stays unknown: this unit steps aside for
+    // this request and a bounded usage probe decides the real scope.
+    const namedFamily = modelFamilyInMessage(message)
+    if (namedFamily) {
       return {
         scope: 'model',
         action: 'continue-and-cooldown',
-        reason: `${family}_rate_limited`,
-        model: family === 'fable' ? FABLE_FAMILY_KEY : normalizeModelKey(model),
+        reason: `${namedFamily}_rate_limited`,
+        model: namedFamily === 'fable' ? FABLE_FAMILY_KEY : normalizeModelKey(model),
         cooldownUntil: reset || now + 60_000,
+        retrySameAccount: false,
+      }
+    }
+    if (isShortWindowLimit(message, result.headers)) {
+      return {
+        scope: 'account',
+        action: 'continue-and-cooldown',
+        reason: 'rpm_limited',
+        cooldownUntil: reset || now + 60_000,
+        retrySameAccount: false,
       }
     }
     return {
       scope: 'account',
       action: 'continue-and-cooldown',
-      reason: 'rate_limited',
-      cooldownUntil: accountLimitUntil(reset, usage, now, message),
+      reason: 'rate_limited_unknown',
+      cooldownUntil: reset || now + 60_000,
+      retrySameAccount: false,
     }
   }
   if (status === 529) {
