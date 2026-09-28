@@ -911,7 +911,7 @@ test('sticky provider pause rotates instead of failing closed', async (t) => {
   selected.release()
 })
 
-test('sticky concurrency still waits on the bound account', async (t) => {
+test('#A01: a busy sticky home lends the turn to a free seat and keeps the pin', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const file = path.join(root, 'vms', 'vm-01.json')
@@ -932,14 +932,18 @@ test('sticky concurrency still waits on the bound account', async (t) => {
   })
   assert.equal(first.ok, true)
   assert.equal(first.vmId, 'vm-01')
+  const started = Date.now()
   const second = await pool.selectAndReserve({
     model: 'claude-test',
     stickyKey: 'conversation-busy',
-    allowWait: false,
+    allowWait: true,
   })
-  assert.equal(second.ok, false)
-  assert.equal(second.reason, 'all_accounts_busy')
+  assert.equal(second.ok, true)
+  assert.equal(second.vmId, 'vm-02')
+  assert.equal(second.selectionReason, 'sticky-spill')
+  assert.ok(Date.now() - started < 50)
   assert.deepEqual(unbound, [])
+  second.release()
   first.release()
 })
 
@@ -982,7 +986,7 @@ test('sticky RPM still waits on the bound account', async (t) => {
   first.release()
 })
 
-test('sticky RPM waits instead of hopping to a free account', async (t) => {
+test('sticky RPM borrows a free account without unbinding', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const unbound = []
@@ -1005,9 +1009,11 @@ test('sticky RPM waits instead of hopping to a free account', async (t) => {
     stickyKey: 'conversation-rpm',
     allowWait: true,
   })
-  assert.equal(selected.ok, false)
-  assert.equal(selected.reason, 'all_accounts_busy')
+  assert.equal(selected.ok, true)
+  assert.equal(selected.accountId, 'account-2')
+  assert.equal(selected.selectionReason, 'sticky-spill')
   assert.deepEqual(unbound, [])
+  selected.release()
 })
 
 test('opus is not scheduled onto an OpenAI slot', async (t) => {
@@ -1664,6 +1670,7 @@ test('sticky wait uses sticky timeout; fallback wait uses fallback timeout', asy
   const stickyBusy = await pool.selectAndReserve({
     model: 'claude-test',
     stickyKey: 'conversation-wait',
+    excluded: new Set(['account-2']),
     allowWait: true,
   })
   const stickyElapsed = Date.now() - stickyStarted
@@ -1715,6 +1722,7 @@ test('failover deadline clips sticky wait instead of waiting the full plan', asy
   const selected = await pool.selectAndReserve({
     model: 'claude-test',
     stickyKey: 'conversation-deadline',
+    excluded: new Set(['account-2']),
     allowWait: true,
     deadline: Date.now() + 50,
   })
@@ -2209,7 +2217,7 @@ test('sticky slot_busy stays on the bound account', async (t) => {
   selected.release()
 })
 
-test('a sticky reserve miss waits on the bound account instead of moving the session', async (t) => {
+test('#A02: a sticky reserve miss takes the free seat elsewhere and keeps the pin', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const unbound = []
@@ -2220,22 +2228,23 @@ test('a sticky reserve miss waits on the bound account instead of moving the ses
     },
   })
   const real = pool.reserve.bind(pool)
-  let misses = 0
+  const tried = []
   pool.reserve = (candidate, opts) => {
-    if (candidate.accountId === 'account-1' && misses++ === 0) {
-      // The racing request that won the seat finishes shortly after.
-      setTimeout(() => pool.notifyCapacity('account-1'), 20)
-      return null
-    }
+    tried.push(candidate.accountId)
+    // The racing request that won account-1's last seat.
+    if (candidate.accountId === 'account-1') return null
     return real(candidate, opts)
   }
+  const started = Date.now()
   const selected = await pool.selectAndReserve({
     model: 'claude-test',
     stickyKey: 'conversation-one',
     deadline: Date.now() + 5000,
   })
   assert.equal(selected.ok, true)
-  assert.equal(selected.accountId, 'account-1')
+  assert.equal(selected.accountId, 'account-2')
+  assert.deepEqual(tried, ['account-1', 'account-2'])
+  assert.ok(Date.now() - started < 100)
   assert.deepEqual(unbound, [])
   selected.release()
 })
@@ -2275,6 +2284,129 @@ test('max sessions follow the conversation window and keep one conversation on o
   const third = await pool.selectAndReserve({ model: 'claude-test', stickyKey: 'conv-c', allowWait: false })
   assert.equal(third.ok, false)
   assert.equal(third.reason, 'no_eligible_accounts')
+})
+
+test('#A08: a refused reservation hands back exactly what it took; release is idempotent', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const sessions = new SessionLimitRegistry()
+  let refuse = false
+  let quotaInflight = 0
+  const pool = scheduler(root, {
+    accountQuota: {
+      canAccept: () => ({ ok: true }),
+      tryAcquire: () => {
+        if (refuse) return { ok: false, reason: 'quota_5h_safety' }
+        quotaInflight += 1
+        return { ok: true }
+      },
+      release: () => {
+        quotaInflight -= 1
+      },
+      sessions,
+    },
+  })
+  const [candidate] = await pool.eligibleCandidates({
+    model: 'claude-test',
+    sessionKey: 'conv-a',
+    excluded: new Set(['account-2']),
+  })
+  const first = pool.reserve(candidate, { sessionKey: 'conv-a' })
+  first.release()
+  assert.equal(pool.usedSlotCount('vm-01'), 0)
+  refuse = true
+  // The preferred seat is reused on the second claim; the refusal must still return its hold.
+  assert.equal(pool.reserve(candidate, { sessionKey: 'conv-a' }), null)
+  assert.equal(pool.reserve({ ...candidate, windowKey: 'conv-b' }, { sessionKey: 'conv-b' }), null)
+  assert.equal(pool.usedSlotCount('vm-01'), 0)
+  assert.equal(pool.inflight.get('account-1') || 0, 0)
+  assert.equal(quotaInflight, 0)
+  assert.equal(sessions.has('account-1', 'conv-b'), false)
+  refuse = false
+  const again = pool.reserve(candidate, { sessionKey: 'conv-a' })
+  assert.ok(again)
+  again.release()
+  again.release()
+  assert.equal(pool.usedSlotCount('vm-01'), 0)
+  assert.equal(pool.inflight.get('account-1') || 0, 0)
+  assert.equal(quotaInflight, 0)
+})
+
+test('#A05: an explicit child counts against the root window and a borrowed seat adds none', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  for (const id of ['vm-01', 'vm-02']) {
+    const file = path.join(root, 'vms', `${id}.json`)
+    const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+    vm.policy.maxSessions = 1
+    if (id === 'vm-01') vm.policy.maxConcurrency = 1
+    fs.writeFileSync(file, JSON.stringify(vm))
+  }
+  const sessions = new SessionLimitRegistry()
+  const bindings = new Map([['sess:root', { accountId: 'account-1', vmId: 'vm-01' }]])
+  const pool = scheduler(root, {
+    accountQuota: { canAccept: () => ({ ok: true }), sessions },
+    stickyRouter: {
+      resolve: (key) => bindings.get(key) || null,
+      bind: (key, value) => bindings.set(key, value),
+      unbind: (key) => bindings.delete(key),
+    },
+  })
+  const rootTurn = await pool.selectAndReserve({ model: 'claude-test', stickyKey: 'sess:root', allowWait: false })
+  assert.equal(rootTurn.accountId, 'account-1')
+  const spill = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'sess:child-1',
+    windowKey: 'sess:root',
+    allowWait: false,
+  })
+  assert.equal(spill.ok, true)
+  assert.equal(spill.accountId, 'account-2')
+  assert.equal(sessions.snapshot('account-2', { max: 1 }).active, 0)
+  spill.release()
+  rootTurn.release()
+  const home = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'sess:child-2',
+    windowKey: 'sess:root',
+    allowWait: false,
+  })
+  assert.equal(home.accountId, 'account-1')
+  assert.equal(sessions.snapshot('account-1', { max: 1 }).active, 1)
+  home.release()
+})
+
+test('#A15: a hard account exit moves every pinned conversation and its window but not live leases', async (t) => {
+  const root = project()
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  t.after(() => {
+    try {
+      sticky.db?.close?.()
+    } catch {}
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const sessions = new SessionLimitRegistry()
+  const pool = scheduler(root, { stickyRouter: sticky, accountQuota: { canAccept: () => ({ ok: true }), sessions } })
+  const held = await pool.selectAndReserve({
+    model: 'claude-test',
+    stickyKey: 'sess:old',
+    excluded: new Set(['account-2']),
+    allowWait: false,
+  })
+  sticky.bind('sess:old', { accountId: held.accountId, vmId: held.vmId })
+  sticky.bind('sess:other', { accountId: held.accountId, vmId: held.vmId })
+  sessions.touch(held.accountId, 'sess:other')
+  pool.releaseAccountSessions({ accountId: held.accountId, vmId: held.vmId })
+  assert.equal(sticky.resolve('sess:old'), null)
+  assert.equal(sticky.resolve('sess:other'), null)
+  assert.equal(sessions.has(held.accountId, 'sess:old'), false)
+  assert.equal(sessions.has(held.accountId, 'sess:other'), false)
+  assert.equal(pool.inflight.get(held.accountId), 1)
+  held.release()
+  assert.equal(pool.inflight.get(held.accountId) || 0, 0)
+  const moved = await pool.selectAndReserve({ model: 'claude-test', stickyKey: 'sess:old', allowWait: false })
+  assert.equal(moved.ok, true)
+  moved.release()
 })
 
 test('live rate_limit_reset_at gates the account and unbinds its sticky session', async (t) => {

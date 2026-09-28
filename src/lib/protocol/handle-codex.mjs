@@ -19,19 +19,14 @@ import { extractOpenaiUsage } from './openai-usage.mjs'
 import { streamCodexKernel } from '../transport/codex-kernel-client.mjs'
 import { ensureCodexKernel, writeCodexKernelConfig } from '../transport/codex-kernel-supervisor.mjs'
 import { boundProxyUrl } from '../vm/egress.mjs'
+import { orderCodexSessionSlots, codexSlotAllowsModel, isCodexFailoverError } from '../pool/codex-slot-pool.mjs'
 import {
-  orderCodexSessionSlots,
-  codexSlotAllowsModel,
-  isCodexFailoverError,
-  CODEX_FAILOVER_MAX,
-} from '../pool/codex-slot-pool.mjs'
-import {
-  acquireOpenAISlot,
-  releaseOpenAISlot,
   reportOpenAIAttempt,
+  tryAcquireOpenAISlot,
   waitForOpenAICapacity,
   wakeOpenAIWaiter,
 } from '../pool/openai-account-runtime.mjs'
+import { CLIENT_POOL_BUSY_MESSAGE } from '../core/errors.mjs'
 import { applyOpenaiWashLog } from './openai-wash.mjs'
 import { extractCallerSession, outboundSessionMode, resolveOutboundSessionId } from '../identity/identity-rewrite.mjs'
 import { extractFirstUserText } from '../identity/crs-persona.mjs'
@@ -83,14 +78,25 @@ function pinnedVmId(req) {
   return isValidVmId(pinVmRaw) ? pinVmRaw : null
 }
 
-export function pickCodexCandidates(projectRoot, req, { stickyRouter = null, sessions = null, body = null } = {}) {
+/**
+ * Current OpenAI candidates, re-read on every admission. A busy home keeps
+ * its pin; only a home that left the pool for good releases the session.
+ * A request that continues a stored response (`previous_response_id`) can
+ * only run where that response lives.
+ */
+export function pickCodexCandidates(
+  projectRoot,
+  req,
+  { stickyRouter = null, sessions = null, body = null, excluded = null } = {},
+) {
   const pin = pinnedVmId(req)
   const model = body?.model || null
   if (pin) {
     const vm = getVm(projectRoot, pin)
     if (!vm || !isCodexVm(vm)) return { error: 'platform_mismatch', pin, ids: [] }
     if (!codexSlotAllowsModel(vm, model)) return { error: 'model_not_allowed', pin, ids: [] }
-    return { ids: [vm.id], pin, sticky: false, sessionKey: null, stickyKeys: [] }
+    const ordered = orderCodexSessionSlots([vm], { pin, excluded })
+    return { ...ordered, pin, sticky: false, sessionKey: null, stickyKeys: [] }
   }
   for (const item of listVms(projectRoot)) {
     if (!isCodexVm(item)) continue
@@ -99,14 +105,23 @@ export function pickCodexCandidates(projectRoot, req, { stickyRouter = null, ses
   const stickyKeys = stickyRouter?.collectPoolKeys?.(req, body || {}, { platform: 'openai' }) || []
   const sessionKey = stickyRouter?.extractPoolKey?.(req, body || {}, { platform: 'openai' }) || stickyKeys[0] || null
   const bound = sessionKey ? stickyRouter?.resolve?.(sessionKey) : null
-  const ordered = orderCodexSessionSlots(listVms(projectRoot), {
+  const vms = listVms(projectRoot)
+  const continuesResponse = !!body?.previous_response_id && !!bound?.vmId
+  const ordered = orderCodexSessionSlots(continuesResponse ? vms.filter((vm) => vm.id === bound.vmId) : vms, {
     boundVmId: bound?.vmId || null,
     sessionKey,
     sessionLimit: sessions,
     model,
+    excluded,
   })
-  if (bound?.vmId && sessionKey && !ordered.sticky && !ordered.error) {
+  if (bound?.vmId && sessionKey && ordered.boundState === 'gone') {
     for (const key of stickyKeys.length ? stickyKeys : [sessionKey]) stickyRouter?.unbind?.(key)
+    try {
+      sessions?.drop?.(bound.vmId, sessionKey)
+    } catch {}
+  }
+  if (continuesResponse && (ordered.boundState === 'gone' || ordered.error === 'candidates_exhausted')) {
+    return { error: 'response_not_portable', ids: [], sessionKey, stickyKeys, boundVmId: bound.vmId }
   }
   return { ...ordered, sessionKey, stickyKeys }
 }
@@ -213,34 +228,38 @@ function clientGoneSignal(req, res) {
 }
 
 /**
- * Concurrency / RPM full queues like a Claude slot: wait for a released
- * seat or the RPM window, up to the pool wait timeout.
+ * Admission = fresh candidates + one synchronous seat claim. Candidates are
+ * re-read every round, so a seat taken while another request awaited kernel
+ * init is never double-sold. All full: FIFO wait for a release or the RPM
+ * window, up to the pool wait deadline.
  */
-async function pickCodexCandidatesWaiting(projectRoot, req, res, opts, routing) {
-  let picked = pickCodexCandidates(projectRoot, req, opts)
-  if (picked.error !== 'capacity_unavailable') return picked
-  const deadline = Date.now() + codexWaitTimeoutMs(routing)
-  const gone = clientGoneSignal(req, res)
-  try {
-    while (picked.error === 'capacity_unavailable') {
-      const now = Date.now()
-      if (now >= deadline) break
-      const retryAt = Number(picked.retryAt)
-      const sliceDeadline = Number.isFinite(retryAt) && retryAt > now ? Math.min(deadline, retryAt) : deadline
-      let waited
-      try {
-        waited = await waitForOpenAICapacity({ deadline: sliceDeadline, signal: gone.signal })
-      } catch (error) {
-        if (error?.code === 'pool_wait_queue_full') return { error: 'pool_wait_queue_full', ids: [] }
-        throw error
-      }
-      if (waited.aborted) return { error: 'client_cancelled', ids: [] }
-      picked = pickCodexCandidates(projectRoot, req, opts)
-      if (waited.woken && picked.error === 'capacity_unavailable') wakeOpenAIWaiter()
+async function admitCodexCandidate(projectRoot, req, opts, { deadline, signal }) {
+  let woken = false
+  for (;;) {
+    const picked = pickCodexCandidates(projectRoot, req, opts)
+    if (picked.error && picked.error !== 'capacity_unavailable') return { picked }
+    for (const candidate of picked.candidates || []) {
+      const lease = tryAcquireOpenAISlot(candidate.id, {
+        concurrency: candidate.concurrency,
+        maxRpm: candidate.maxRpm,
+      })
+      if (lease) return { picked, vmId: candidate.id, lease }
     }
-    return picked
-  } finally {
-    gone.settle()
+    // A woken waiter that still missed hands the wake to the next in line.
+    if (woken) wakeOpenAIWaiter()
+    const now = Date.now()
+    if (now >= deadline) return { picked: { ...picked, error: 'capacity_unavailable', ids: [] } }
+    const retryAt = Number(picked.retryAt)
+    const sliceDeadline = Number.isFinite(retryAt) && retryAt > now ? Math.min(deadline, retryAt) : deadline
+    let waited
+    try {
+      waited = await waitForOpenAICapacity({ deadline: sliceDeadline, signal })
+    } catch (error) {
+      if (error?.code === 'pool_wait_queue_full') return { picked: { error: 'pool_wait_queue_full', ids: [] } }
+      throw error
+    }
+    if (waited.aborted) return { picked: { error: 'client_cancelled', ids: [] } }
+    woken = !!waited.woken
   }
 }
 
@@ -321,81 +340,6 @@ export async function handleCodexProtocol({
     converted: converted.converted,
     outboundBody: converted.body,
   })
-  const picked = await pickCodexCandidatesWaiting(
-    projectRoot,
-    req,
-    res,
-    { stickyRouter, sessions, body: body || converted.body || inbound },
-    routing,
-  )
-  if (picked.error === 'client_cancelled') {
-    logBag.via = 'codex-kernel'
-    logBag.final_state = 'cancelled'
-    return
-  }
-  if (picked.error === 'platform_mismatch') {
-    stats.errors++
-    logBag.via = 'codex-kernel'
-    logBag.error_code = 'platform_mismatch'
-    return json(res, 400, {
-      error: {
-        type: 'invalid_request_error',
-        code: 'platform_mismatch',
-        message: `vm '${picked.pin}' is not a GPT slot`,
-      },
-    })
-  }
-  if (picked.error === 'model_not_allowed') {
-    stats.errors++
-    logBag.via = 'codex-kernel'
-    logBag.error_code = 'model_not_allowed'
-    return json(res, 400, {
-      error: {
-        type: 'invalid_request_error',
-        code: 'model_not_allowed',
-        message: `model '${converted.body?.model || ''}' is not allowed on any GPT slot`,
-        param: 'model',
-      },
-    })
-  }
-  if (
-    picked.error === 'session_window_full' ||
-    picked.error === 'quota_exhausted' ||
-    picked.error === 'capacity_unavailable' ||
-    picked.error === 'pool_wait_queue_full'
-  ) {
-    stats.errors++
-    logBag.via = 'codex-kernel'
-    logBag.error_code = picked.error
-    const message =
-      picked.error === 'session_window_full'
-        ? 'OpenAI 号池的会话窗口已满'
-        : picked.error === 'quota_exhausted'
-          ? 'OpenAI 号池额度已耗尽'
-          : picked.error === 'pool_wait_queue_full'
-            ? 'OpenAI 号池等待队列已满'
-            : 'OpenAI 号池并发已满，等待超时'
-    return json(res, 503, {
-      error: {
-        type: 'api_error',
-        code: picked.error,
-        message,
-      },
-    })
-  }
-  const candidateIds = (picked.ids || []).slice(0, CODEX_FAILOVER_MAX)
-  if (!candidateIds.length) {
-    stats.errors++
-    logBag.via = 'codex-kernel'
-    logBag.error_code = picked.error || 'no_codex_vm'
-    return json(res, 503, {
-      error: { type: 'api_error', code: picked.error || 'no_codex_vm', message: 'no Codex kernel VM is configured' },
-    })
-  }
-  logBag.via = 'codex-kernel'
-  stats.requests++
-  stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
-
   const stream = inbound?.stream !== false && ctx.body?.stream !== false
   const inboundSession = sessionFrom(req, converted.body)
   const sessionMode = outboundSessionMode(routing)
@@ -413,175 +357,276 @@ export async function handleCodexProtocol({
     protocol === 'openai.chat' || protocol === 'openai.completions'
       ? { id: 'codex', seq: 0, tools: new Map(), sawTool: false }
       : null
-  const stickyKeys = picked.stickyKeys?.length ? picked.stickyKeys : picked.sessionKey ? [picked.sessionKey] : []
-  const stickyBound = picked.sessionKey ? stickyRouter?.resolve?.(picked.sessionKey) : null
-  const bindSticky = (vm, sessionId = null) => {
-    if (!picked.sessionKey) return
-    if (stickyRouter?.bind) {
-      const payload = { accountId: vm.id, vmId: vm.id }
-      if (sessionId) payload.sessionId = sessionId
-      for (const key of stickyKeys) stickyRouter.bind(key, payload)
-    }
-    try {
-      sessions?.touch?.(vm.id, picked.sessionKey)
-    } catch {}
-  }
-  const leaveSticky = (vm) => {
-    try {
-      sessions?.drop?.(vm.id, picked.sessionKey)
-    } catch {}
-    if (!stickyRouter?.unbind || !picked.sessionKey) return
-    for (const key of stickyKeys) stickyRouter.unbind(key)
-  }
+  const pickOpts = { stickyRouter, sessions, body: body || converted.body || inbound, excluded: new Set() }
+  const deadline = Date.now() + codexWaitTimeoutMs(routing)
+  const gone = clientGoneSignal(req, res)
+  logBag.via = 'codex-kernel'
+  logBag.attempt_count = 0
   let last = null
-  for (let i = 0; i < candidateIds.length; i++) {
-    const vm = getVm(projectRoot, candidateIds[i])
-    if (!vm || !isCodexVm(vm)) continue
-    logBag.vm_id = vm.id
-    writeCfg(projectRoot, vm, {
-      proxyUrl: boundProxyUrl(vm.proxy),
-      proxyRequired: true,
-    })
-    const ready = await ensure(execFor(projectRoot, vm))
-    if (!ready?.ok) {
-      last = {
-        ok: false,
-        status: 503,
-        committed: false,
-        body: {
-          error: {
-            type: 'api_error',
-            code: 'codex_kernel_unavailable',
-            message: `Codex kernel 未就绪（${ready?.reason || 'not_ready'}）。GPT 槽走独立 kernel，不是 wrap cli-hop。`,
-          },
-        },
+  let hops = 0
+  let counted = false
+  try {
+    for (;;) {
+      const admitted = await admitCodexCandidate(projectRoot, req, pickOpts, { deadline, signal: gone.signal })
+      const picked = admitted.picked
+      if (!admitted.lease) {
+        if (picked.error === 'client_cancelled') {
+          logBag.final_state = 'cancelled'
+          return
+        }
+        // Real upstream failures already happened: report the last one, not the pool.
+        if (last) break
+        return rejectCodexAdmission({ res, json, stats, logBag, picked, model: converted.body?.model })
       }
-      if (i + 1 < candidateIds.length && !res.headersSent) {
-        leaveSticky(vm)
+      const vm = getVm(projectRoot, admitted.vmId)
+      const lease = admitted.lease
+      if (!vm || !isCodexVm(vm)) {
+        lease.release()
+        pickOpts.excluded.add(admitted.vmId)
         continue
       }
-      stats.errors++
-      logBag.error_code = 'codex_kernel_unavailable'
-      return json(res, 503, last.body)
-    }
-    acquireOpenAISlot(vm.id)
-    let attemptKind = 'failed'
-    try {
-      const chunks = []
-      let responseServiceTier = null
-      let streamedUsage = null
-      const attemptStartedAt = Date.now()
-      const outboundSessionId =
-        sessionMode === 'passthrough'
-          ? inboundSession.session_id
-          : resolveOutboundSessionId(callerSession, {
-              mode: sessionMode,
-              boundSessionId: stickyBound?.sessionId || '',
-              boundVmId: stickyBound?.vmId || '',
-              vmId: vm.id,
-              accountId: vm.id,
-              firstUserText,
-              clientIp: clientIp(req),
-              userAgent: req.headers?.['user-agent'] || '',
-              epoch: `${attemptStartedAt}:${vm.id}:${i}`,
-            })
-      const session = {
-        session_id: outboundSessionId,
-        previous_response_id: inboundSession.previous_response_id,
+      if (!counted) {
+        counted = true
+        stats.requests++
+        stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
       }
-      const outboundBody = applyCodexRebuildBody({ ...converted.body, stream: true }, outboundSessionId, sessionMode)
-      const result = await runCodexKernelHop({
-        hop,
-        args: {
-          exec: execFor(projectRoot, vm),
-          body: outboundBody,
-          reqHeaders: req.headers,
-          envelope: {
+      const stickyKeys = picked.stickyKeys?.length ? picked.stickyKeys : picked.sessionKey ? [picked.sessionKey] : []
+      const stickyBound = picked.sessionKey ? stickyRouter?.resolve?.(picked.sessionKey) : null
+      // The home (or first placement) owns the conversation window; a borrowed
+      // seat elsewhere takes only this request's execution lease.
+      const claimsWindow = !!picked.sessionKey && (!picked.home || picked.home === vm.id)
+      let windowGen = null
+      if (claimsWindow) {
+        try {
+          windowGen = sessions?.touch?.(vm.id, picked.sessionKey) ?? null
+        } catch {}
+      }
+      const ownsPin = !!stickyBound?.vmId && stickyBound.vmId === vm.id
+      const bindSticky = (sessionId = null) => {
+        if (!picked.sessionKey || !stickyRouter?.bind) return
+        const payload = { accountId: vm.id, vmId: vm.id }
+        if (sessionId) payload.sessionId = sessionId
+        for (const key of stickyKeys) stickyRouter.bind(key, payload)
+      }
+      const leaveSticky = () => {
+        if (!ownsPin || !picked.sessionKey) return
+        try {
+          sessions?.drop?.(vm.id, picked.sessionKey)
+        } catch {}
+        for (const key of stickyKeys) stickyRouter?.unbind?.(key)
+      }
+      let attemptKind = 'failed'
+      try {
+        writeCfg(projectRoot, vm, {
+          proxyUrl: boundProxyUrl(vm.proxy),
+          proxyRequired: true,
+        })
+        const ready = await ensure(execFor(projectRoot, vm))
+        if (!ready?.ok) {
+          // Kernel init failed: this seat goes back and the next candidate is re-admitted.
+          last = {
+            ok: false,
+            status: 503,
+            committed: false,
+            body: {
+              error: {
+                type: 'api_error',
+                code: 'codex_kernel_unavailable',
+                message: `Codex kernel 未就绪（${ready?.reason || 'not_ready'}）。GPT 槽走独立 kernel，不是 wrap cli-hop。`,
+              },
+            },
+          }
+          pickOpts.excluded.add(vm.id)
+          if (!res.headersSent) continue
+          stats.errors++
+          logBag.error_code = 'codex_kernel_unavailable'
+          return json(res, 503, last.body)
+        }
+        hops += 1
+        logBag.vm_id = vm.id
+        logBag.attempt_count = hops
+        const chunks = []
+        let responseServiceTier = null
+        let streamedUsage = null
+        const attemptStartedAt = Date.now()
+        const outboundSessionId =
+          sessionMode === 'passthrough'
+            ? inboundSession.session_id
+            : resolveOutboundSessionId(callerSession, {
+                mode: sessionMode,
+                boundSessionId: stickyBound?.sessionId || '',
+                boundVmId: stickyBound?.vmId || '',
+                vmId: vm.id,
+                accountId: vm.id,
+                firstUserText,
+                clientIp: clientIp(req),
+                userAgent: req.headers?.['user-agent'] || '',
+                epoch: `${attemptStartedAt}:${vm.id}:${hops}`,
+              })
+        const session = {
+          session_id: outboundSessionId,
+          previous_response_id: inboundSession.previous_response_id,
+        }
+        const outboundBody = applyCodexRebuildBody({ ...converted.body, stream: true }, outboundSessionId, sessionMode)
+        const result = await runCodexKernelHop({
+          hop,
+          args: {
+            exec: execFor(projectRoot, vm),
             body: outboundBody,
-            stream: true,
-            session,
+            reqHeaders: req.headers,
+            envelope: {
+              body: outboundBody,
+              stream: true,
+              session,
+            },
           },
-        },
-        onEvent: async (line) => {
-          const tier = serviceTierFromSseLine(line)
-          if (tier) responseServiceTier = tier
-          const seen = usageFromSseLine(line)
-          if (seen) streamedUsage = preferUsage(streamedUsage, seen)
+          onEvent: async (line) => {
+            const tier = serviceTierFromSseLine(line)
+            if (tier) responseServiceTier = tier
+            const seen = usageFromSseLine(line)
+            if (seen) streamedUsage = preferUsage(streamedUsage, seen)
+            if (!stream) {
+              chunks.push(line)
+              return
+            }
+            if (!res.headersSent) writeSSEHeaders(res)
+            if (protocol === 'openai.chat' || protocol === 'openai.completions') {
+              const mapped = responsesSseToChatChunk(line, 'codex', chatSse)
+              if (mapped) res.write(mapped)
+              return
+            }
+            if (protocol === 'anthropic.messages') {
+              const mapped = responsesSseToAnthropicEvents(line, anthropicSse)
+              if (mapped) res.write(mapped)
+              return
+            }
+            res.write(line.endsWith('\n') ? `${line}\n` : `${line}\n`)
+          },
+        })
+        ingestCodexHop(projectRoot, vm.id, result)
+        if (result?.transport_retried) logBag.transport_retried = true
+        last = result
+        const hopUsage = result.usage || result.body?.usage || result.body?.response?.usage || null
+        const usage = preferUsage(hopUsage, streamedUsage)
+        // Responses SSE is not a Claude assistant message, so the stream client
+        // reports ok:false / incomplete. A 200 hop that carried tokens still billed.
+        const delivered = result?.ok || (Number(result?.status) === 200 && usageTokens(usage) > 0)
+        if (delivered) {
+          attemptKind = 'succeeded'
+          bindSticky(outboundSessionId)
+          const extracted = extractOpenaiUsage(usage)
+          const serviceTier = responseServiceTier || converted.body?.service_tier || usage?.service_tier || null
+          logBag.usage = usage && serviceTier ? { ...usage, service_tier: serviceTier } : usage
+          logBag.input_tokens = extracted?.input_tokens ?? usage?.input_tokens ?? usage?.prompt_tokens ?? null
+          logBag.output_tokens = extracted?.output_tokens ?? usage?.output_tokens ?? usage?.completion_tokens ?? null
+          logBag.cache_read_tokens =
+            extracted?.cached_tokens ?? usage?.input_tokens_details?.cached_tokens ?? usage?.cache_read_tokens ?? null
+          logBag.cache_creation_tokens =
+            extracted?.cache_write_tokens ??
+            usage?.input_tokens_details?.cache_write_tokens ??
+            usage?.cache_creation_tokens ??
+            null
+          logBag.first_token_ms = result.ttftMs ?? null
+          reportOpenAIAttempt(vm.id, 'succeeded', result.ttftMs ?? null)
+          logBag.final_state = result?.ok ? result.terminalState || 'verified' : 'verified'
+          logBag.upstream_model = converted.body.model
+          if (hops > 1) logBag.codex_failed_over = true
           if (!stream) {
-            chunks.push(line)
-            return
+            const assembled = assembleCodexBodyFromSse(chunks, result.body || {})
+            const body =
+              protocol === 'anthropic.messages'
+                ? codexBodyToAnthropicMessage(assembled, converted.body.model)
+                : assembled
+            return json(res, 200, body)
           }
           if (!res.headersSent) writeSSEHeaders(res)
-          if (protocol === 'openai.chat' || protocol === 'openai.completions') {
-            const mapped = responsesSseToChatChunk(line, 'codex', chatSse)
-            if (mapped) res.write(mapped)
-            return
-          }
-          if (protocol === 'anthropic.messages') {
-            const mapped = responsesSseToAnthropicEvents(line, anthropicSse)
-            if (mapped) res.write(mapped)
-            return
-          }
-          res.write(line.endsWith('\n') ? `${line}\n` : `${line}\n`)
-        },
-      })
-      ingestCodexHop(projectRoot, vm.id, result)
-      if (result?.transport_retried) logBag.transport_retried = true
-      last = result
-      const hopUsage = result.usage || result.body?.usage || result.body?.response?.usage || null
-      const usage = preferUsage(hopUsage, streamedUsage)
-      // Responses SSE is not a Claude assistant message, so the stream client
-      // reports ok:false / incomplete. A 200 hop that carried tokens still billed.
-      const delivered = result?.ok || (Number(result?.status) === 200 && usageTokens(usage) > 0)
-      if (delivered) {
-        attemptKind = 'succeeded'
-        bindSticky(vm, outboundSessionId)
-        const extracted = extractOpenaiUsage(usage)
-        const serviceTier = responseServiceTier || converted.body?.service_tier || usage?.service_tier || null
-        logBag.usage = usage && serviceTier ? { ...usage, service_tier: serviceTier } : usage
-        logBag.input_tokens = extracted?.input_tokens ?? usage?.input_tokens ?? usage?.prompt_tokens ?? null
-        logBag.output_tokens = extracted?.output_tokens ?? usage?.output_tokens ?? usage?.completion_tokens ?? null
-        logBag.cache_read_tokens =
-          extracted?.cached_tokens ?? usage?.input_tokens_details?.cached_tokens ?? usage?.cache_read_tokens ?? null
-        logBag.cache_creation_tokens =
-          extracted?.cache_write_tokens ??
-          usage?.input_tokens_details?.cache_write_tokens ??
-          usage?.cache_creation_tokens ??
-          null
-        logBag.first_token_ms = result.ttftMs ?? null
-        reportOpenAIAttempt(vm.id, 'succeeded', result.ttftMs ?? null)
-        logBag.final_state = result?.ok ? result.terminalState || 'verified' : 'verified'
-        logBag.upstream_model = converted.body.model
-        if (i > 0) logBag.codex_failed_over = true
-        if (!stream) {
-          const assembled = assembleCodexBodyFromSse(chunks, result.body || {})
-          const body =
-            protocol === 'anthropic.messages' ? codexBodyToAnthropicMessage(assembled, converted.body.model) : assembled
-          return json(res, 200, body)
+          return res.end()
         }
-        if (!res.headersSent) writeSSEHeaders(res)
-        return res.end()
-      }
-      if (res.headersSent) {
         reportOpenAIAttempt(vm.id, attemptKind, result?.ttftMs ?? null)
-        stats.errors++
-        logBag.error_code = result?.body?.error?.code || 'codex_upstream'
-        logBag.upstream_status = result?.status || 0
-        return res.end()
+        if (res.headersSent) {
+          stats.errors++
+          logBag.error_code = result?.body?.error?.code || 'codex_upstream'
+          logBag.upstream_status = result?.status || 0
+          return res.end()
+        }
+        if (isCodexFailoverError(result)) {
+          pickOpts.excluded.add(vm.id)
+          leaveSticky()
+          continue
+        }
+        break
+      } finally {
+        lease.release()
+        if (claimsWindow) {
+          try {
+            sessions?.release?.(vm.id, picked.sessionKey, { gen: windowGen })
+          } catch {}
+        }
       }
-      if (i + 1 < candidateIds.length && isCodexFailoverError(result)) {
-        reportOpenAIAttempt(vm.id, attemptKind, result?.ttftMs ?? null)
-        leaveSticky(vm)
-        continue
-      }
-      reportOpenAIAttempt(vm.id, attemptKind, result?.ttftMs ?? null)
-      break
-    } finally {
-      releaseOpenAISlot(vm.id)
     }
+  } finally {
+    gone.settle()
   }
   stats.errors++
   logBag.error_code = last?.body?.error?.code || 'codex_upstream'
   logBag.upstream_status = last?.status || 0
   return json(res, last?.status || 502, last?.body || { error: { type: 'api_error', code: 'codex_upstream' } })
+}
+
+/** No seat was admitted and nothing ran: say which gate stopped the request. */
+function rejectCodexAdmission({ res, json, stats, logBag, picked, model }) {
+  stats.errors++
+  logBag.error_code = picked.error || 'no_codex_vm'
+  if (picked.error === 'platform_mismatch') {
+    return json(res, 400, {
+      error: {
+        type: 'invalid_request_error',
+        code: 'platform_mismatch',
+        message: `vm '${picked.pin}' is not a GPT slot`,
+      },
+    })
+  }
+  if (picked.error === 'model_not_allowed') {
+    return json(res, 400, {
+      error: {
+        type: 'invalid_request_error',
+        code: 'model_not_allowed',
+        message: `model '${model || ''}' is not allowed on any GPT slot`,
+        param: 'model',
+      },
+    })
+  }
+  if (picked.error === 'response_not_portable') {
+    return json(res, 409, {
+      error: {
+        type: 'invalid_request_error',
+        code: 'response_not_portable',
+        message: 'previous_response_id 所在的 GPT 账号已不可用；该响应无法在其他账号继续，请携带完整上下文重新发起',
+      },
+    })
+  }
+  if (
+    picked.error === 'capacity_unavailable' ||
+    picked.error === 'session_window_full' ||
+    picked.error === 'pool_wait_queue_full'
+  ) {
+    const waitMs = Number(picked.retryAt) - Date.now()
+    if (waitMs > 0) res.setHeader?.('retry-after', String(Math.ceil(waitMs / 1000)))
+    return json(res, 429, {
+      error: {
+        type: 'rate_limit_error',
+        code: 'pool_overloaded',
+        message: CLIENT_POOL_BUSY_MESSAGE,
+        details: { reason: picked.error },
+      },
+    })
+  }
+  if (picked.error === 'quota_exhausted') {
+    return json(res, 503, {
+      error: { type: 'api_error', code: 'quota_exhausted', message: 'OpenAI 号池额度已耗尽' },
+    })
+  }
+  return json(res, 503, {
+    error: { type: 'api_error', code: picked.error || 'no_codex_vm', message: 'no Codex kernel VM is configured' },
+  })
 }

@@ -10,6 +10,7 @@ export const ERROR_CLASSES = {
   rate_limit: { id: 'rate_limit', owner: 'provider', label: '限流' },
   quota: { id: 'quota', owner: 'platform', label: '额度' },
   overloaded: { id: 'overloaded', owner: 'provider', label: '过载排队' },
+  unavailable: { id: 'unavailable', owner: 'platform', label: '无可用账号' },
   timeout: { id: 'timeout', owner: 'provider', label: '超时' },
   credential: { id: 'credential', owner: 'platform', label: '凭证' },
   proxy: { id: 'proxy', owner: 'platform', label: '代理' },
@@ -47,7 +48,12 @@ const CODE_MAP = {
   api_key_quota_exhausted: 'quota',
   concurrency_limit: 'quota',
   api_key_concurrency_limit: 'quota',
-  account_pool_exhausted: 'overloaded',
+  pool_overloaded: 'overloaded',
+  pool_wait_queue_full: 'overloaded',
+  account_pool_exhausted: 'unavailable',
+  api_pool_exhausted: 'unavailable',
+  no_eligible_accounts: 'unavailable',
+  pool_unavailable: 'unavailable',
   server_overloaded: 'overloaded',
   upstream_overloaded: 'overloaded',
   slot_busy: 'overloaded',
@@ -192,7 +198,8 @@ export function classifyRequestError(row = {}) {
   let id = CODE_MAP[code] || null
 
   if (/signature|thinking block|skip_thought_signature|must contain thinking/.test(text)) id = 'signature'
-  else if ((id === 'upstream' || status === 503) && /overload|no eligible|负载过高/.test(text)) id = 'overloaded'
+  else if ((id === 'upstream' || (!id && status === 503)) && /overload|负载过高/.test(text)) id = 'overloaded'
+  else if (!id && /no eligible|无可用账号|没有可用账号/.test(text)) id = 'unavailable'
   if (!id) {
     if (/extra usage|entitlement|quota|5h|7d/.test(text) && (status === 429 || /quota|usage/.test(text))) id = 'quota'
     else if (/socks|proxy|cloudflare|just a moment/.test(text)) id = 'proxy'

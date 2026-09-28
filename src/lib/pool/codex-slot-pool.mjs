@@ -4,14 +4,11 @@
  * quota/auth before any SSE byte is committed.
  */
 import { isCodexVm } from '../vm/vm-kind.mjs'
-import { resolveSessionSlots } from '../vm/slot-engine.mjs'
 import { extraToCodexSnapshot, normalizeCodexLimits, codexQuotaPark } from '../protocol/codex-usage.mjs'
 import { isLeftoverQuotaScheduleOff, isQuotaWindowReason } from './availability.mjs'
 import { orderOpenAIAccounts } from './openai-account-selector.mjs'
 import { bumpOpenAICursor, openAIRuntimeSignals, readOpenAICursor } from './openai-account-runtime.mjs'
 import { modelMatchesAllowlist } from './slot-model-gate.mjs'
-
-export const CODEX_FAILOVER_MAX = 4
 
 // `stopped` is leftover Claude docker lifecycle. Codex kernel is independent.
 const HARD_UNAVAILABLE = new Set(['dead', 'error', 'disabled'])
@@ -187,6 +184,12 @@ export function codexAccountCandidate(vm, now = Date.now(), signals = null) {
  * OpenAI pool order. Session affinity is a preferred account.
  * Remaining ids are the same decision with that account excluded.
  * Quota-exhausted slots stay out of the hop list.
+ *
+ * `home` is the live bound slot. Only it (or any slot when there is none)
+ * owes the conversation a `max_sessions` window; any other slot lends this
+ * one request its execution seat. `session_slots` is not a window cap.
+ * `boundState` is `gone` only when the bound slot left the pool for good
+ * (quota, credential, operator, model); a busy home is still `live`.
  */
 export function orderCodexSessionSlots(
   vms,
@@ -201,28 +204,48 @@ export function orderCodexSessionSlots(
     requestIntervalMs = 0,
     roundRobinCursor = null,
     model = null,
+    excluded = null,
   } = {},
 ) {
   const list = Array.isArray(vms) ? vms : []
   const byId = new Map(list.map((vm) => [vm.id, vm]))
   const found = pickCodexSlots(vms, { pin, now })
   const picked = found.error ? found : withModelAllowed(found, byId, model)
-  if (picked.error || pin) return { ...picked, sticky: false }
+  if (picked.error) return { ...picked, sticky: false, candidates: [] }
+  const pool = picked.ids.filter((id) => !excluded?.has(id))
+  if (!pool.length)
+    return { error: 'candidates_exhausted', ids: [], ready: [], parked: [], sticky: false, candidates: [] }
+  if (pin) {
+    return {
+      ...picked,
+      ids: pool,
+      sticky: false,
+      candidates: pool.map((id) => codexAccountCandidate(byId.get(id), now)),
+    }
+  }
+  const home =
+    boundVmId && pool.includes(boundVmId) && codexAccountStatus(byId.get(boundVmId), now) === 'normal'
+      ? boundVmId
+      : null
+  const boundState = boundVmId ? (home ? 'live' : excluded?.has(boundVmId) ? 'excluded' : 'gone') : null
+  const claimsWindow = (id) => !!sessionKey && (!home || id === home)
   const accepts = (id) => {
-    if (!sessionKey || typeof sessionLimit?.canAccept !== 'function') return true
-    const cap = resolveSessionSlots(byId.get(id) || {})
+    if (!claimsWindow(id) || typeof sessionLimit?.canAccept !== 'function') return true
+    const cap = codexMaxSessions(byId.get(id))
     if (!cap) return true
     return sessionLimit.canAccept(id, sessionKey, { max: cap, idleMin, now }).ok !== false
   }
-  const ids = picked.ids.filter(accepts)
-  if (!ids.length) return { error: 'session_window_full', ids: [], ready: [], parked: [], sticky: false }
+  const ids = pool.filter(accepts)
+  if (!ids.length) {
+    return { error: 'session_window_full', ids: [], ready: [], parked: [], sticky: false, boundState, candidates: [] }
+  }
   const cursor = roundRobinCursor == null ? readOpenAICursor() : roundRobinCursor
   const candidates = ids.map((id) => codexAccountCandidate(byId.get(id), now))
   const ordered = orderOpenAIAccounts(candidates, {
     strategy,
     now,
     requestIntervalMs,
-    preferredAccountId: boundVmId && ids.includes(boundVmId) ? boundVmId : null,
+    preferredAccountId: home && ids.includes(home) ? home : null,
     preferredOverridesWeight: true,
     roundRobinCursor: cursor,
   })
@@ -236,6 +259,9 @@ export function orderCodexSessionSlots(
       ready: [],
       parked: picked.parked || [],
       sticky: false,
+      boundState,
+      home,
+      candidates: [],
     }
   }
   if (roundRobinCursor == null) bumpOpenAICursor()
@@ -247,7 +273,16 @@ export function orderCodexSessionSlots(
     parked: (picked.parked || []).filter((id) => ordered.ids.includes(id)),
     sticky,
     strategy,
+    boundState,
+    home,
+    candidates: ordered.ids.map((id) => candidates.find((candidate) => candidate.id === id)),
   }
+}
+
+/** Distinct conversation windows on a GPT slot. 0 = off. */
+export function codexMaxSessions(vm) {
+  const n = policyNumber(vm, 'max_sessions', 'maxSessions')
+  return n > 0 ? Math.round(n) : 0
 }
 
 /** Earliest RPM window opening among normal slots capped only by RPM. */

@@ -554,6 +554,118 @@ test('GPT slot at max concurrency queues until a seat frees instead of 503', asy
   fs.rmSync(root, { recursive: true, force: true })
 })
 
+function codexArgs(root, ops, extras = {}) {
+  return {
+    req: { headers: { 'user-agent': 'curl/8.0', ...(extras.headers || {}) }, apiKeyKind: 'user' },
+    res: { headersSent: false, write() {}, end() {} },
+    protocol: 'openai.responses',
+    ctx: { path: '/v1/responses', body: extras.body || { model: 'gpt-5.5', input: 'hi', stream: false } },
+    inbound: { stream: false },
+    logBag: extras.logBag || {},
+    stats: { errors: 0, requests: 0, by_route: {} },
+    json: (_res, status, body) => ({ status, body }),
+    writeSSEHeaders() {},
+    routing: { pool: { fallback_wait_timeout_ms: 5000 } },
+    projectRoot: root,
+    stickyRouter: extras.stickyRouter || null,
+    ops: { writeCodexKernelConfig() {}, ...ops },
+  }
+}
+
+test('#A07: two admissions racing through kernel init never exceed a cap of 1', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-atomic-'))
+  writeGptVm(root, 'vm-gpt-a')
+  const file = path.join(root, 'vms', 'vm-gpt-a.json')
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), policy: { maxConcurrency: 1 } }),
+  )
+  let active = 0
+  let maxActive = 0
+  const ops = {
+    ensureCodexKernel: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      return { ok: true }
+    },
+    streamCodexKernel: async ({ onEvent }) => {
+      active += 1
+      maxActive = Math.max(maxActive, active, rt.openAIRuntimeSignals('vm-gpt-a').inFlight)
+      await new Promise((resolve) => setTimeout(resolve, 10))
+      await onEvent('data: {"type":"response.completed"}')
+      active -= 1
+      return { ok: true, status: 200, terminalState: 'verified' }
+    },
+  }
+  const [a, b] = await Promise.all([
+    handleCodexProtocol(codexArgs(root, ops)),
+    handleCodexProtocol(codexArgs(root, ops)),
+  ])
+  assert.equal(a.status, 200)
+  assert.equal(b.status, 200)
+  assert.equal(maxActive, 1)
+  assert.equal(rt.openAIRuntimeSignals('vm-gpt-a').inFlight, 0)
+  rt.resetOpenAIAccountRuntime()
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('#A04: the fifth GPT slot is reached after four slots fail over', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-fifth-'))
+  const ids = ['vm-gpt-a', 'vm-gpt-b', 'vm-gpt-c', 'vm-gpt-d', 'vm-gpt-e']
+  for (const id of ids) writeGptVm(root, id)
+  const seen = []
+  const logBag = {}
+  const out = await handleCodexProtocol(
+    codexArgs(
+      root,
+      {
+        ensureCodexKernel: async () => ({ ok: true }),
+        streamCodexKernel: async ({ exec, onEvent }) => {
+          seen.push(exec.vm.id)
+          if (seen.length < 5) {
+            return { ok: false, status: 429, body: { error: { code: 'rate_limit_exceeded', message: 'slow down' } } }
+          }
+          await onEvent('data: {"type":"response.completed"}')
+          return { ok: true, status: 200, terminalState: 'verified' }
+        },
+      },
+      { logBag },
+    ),
+  )
+  assert.equal(out.status, 200)
+  assert.equal(seen.length, 5)
+  assert.equal(new Set(seen).size, 5)
+  assert.equal(logBag.attempt_count, 5)
+  assert.equal(logBag.vm_id, seen[4])
+  rt.resetOpenAIAccountRuntime()
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('#A11: an OpenAI pool that stays full answers 429 pool_overloaded', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-full-'))
+  writeGptVm(root, 'vm-gpt-a')
+  const file = path.join(root, 'vms', 'vm-gpt-a.json')
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), policy: { maxConcurrency: 1 } }),
+  )
+  const held = rt.tryAcquireOpenAISlot('vm-gpt-a', { concurrency: 1 })
+  const args = codexArgs(root, { ensureCodexKernel: async () => ({ ok: true }) })
+  args.routing = { pool: { fallback_wait_timeout_ms: 1000 } }
+  const out = await handleCodexProtocol(args)
+  assert.equal(out.status, 429)
+  assert.equal(out.body.error.code, 'pool_overloaded')
+  assert.equal(out.body.error.message, '号池负载过高，稍后再试')
+  held.release()
+  rt.resetOpenAIAccountRuntime()
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
 function emptyCodexRes() {
   return { headersSent: false, write() {}, end() {} }
 }

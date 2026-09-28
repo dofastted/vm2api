@@ -588,6 +588,15 @@ export class StickyRouter {
     return this.repo.removeByAccount({ accountId, vmId })
   }
 
+  /** Live keys pinned to this account or VM, so their windows leave with them. */
+  boundKeys({ accountId = null, vmId = null } = {}) {
+    if (!accountId && !vmId) return []
+    this._purge()
+    return Object.entries(this.repo.all() || {})
+      .filter(([, ent]) => (accountId && ent?.account_id === accountId) || (vmId && ent?.vm_id === vmId))
+      .map(([key, ent]) => ({ key, accountId: ent.account_id, vmId: ent.vm_id }))
+  }
+
   _purge() {
     this.repo.purgeExpired(Date.now())
   }

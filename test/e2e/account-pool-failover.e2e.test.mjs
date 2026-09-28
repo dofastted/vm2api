@@ -71,7 +71,7 @@ test('account1 quota exhaustion rotates to account2 and commits sticky final acc
   }
 })
 
-test('verified stream retries incomplete account1 once then replays account2', async () => {
+test('verified stream replays an incomplete account1 hop on free account2 first', async () => {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-pool-verified-'))
   const firstVm = seedVm({ project, id: 'vm-sim-01' })
   firstVm.claude.account_uuid = 'account-1'
@@ -113,14 +113,14 @@ test('verified stream retries incomplete account1 once then replays account2', a
     const ledger = await api(gw, 'GET', `/api/panel/request-logs/${requestId}/attempts`)
     assert.equal(ledger.status, 200, ledger.text)
     const attempts = ledger.json.data.attempts
-    assert.equal(attempts.length, 3, JSON.stringify(attempts))
+    assert.equal(attempts.length, 2, JSON.stringify(attempts))
     assert.deepEqual(
       attempts.map((attempt) => attempt.terminal_state),
-      ['incomplete', 'incomplete', 'verified'],
+      ['incomplete', 'verified'],
     )
     assert.deepEqual(
       attempts.map((attempt) => attempt.account_id),
-      ['account-1', 'account-1', 'account-2'],
+      ['account-1', 'account-2'],
     )
   } finally {
     await gw.stop()

@@ -193,7 +193,16 @@ export function createHandleProtocol(deps) {
     const summary = formatPoolSelectionSummary(details)
     logBag.error_code = originalCode || mapped.body?.error?.code
     logBag.error_message = summary || originalMessage || mapped.body?.error?.message || null
+    // Only a known wake time (cooldown / RPM / window reset) earns a Retry-After.
+    if (mapped.body?.error?.code === 'pool_overloaded' && Number(result?.retryAfterSec) > 0) {
+      mapped.retryAfterSec = Number(result.retryAfterSec)
+    }
     return mapped
+  }
+
+  function sendMapped(res, mapped) {
+    if (mapped.retryAfterSec) res.setHeader?.('retry-after', String(mapped.retryAfterSec))
+    return json(res, mapped.status, mapped.body)
   }
 
   function acceptAssistantHop(result) {
@@ -691,6 +700,10 @@ export function createHandleProtocol(deps) {
         ? stickyRouter.familyPoolKey(req, familySession, { trusted: familyTrusted })
         : stickyRouter?.familyKey?.(req, familySession, 'anthropic') || null
     const familyVmId = familyKey ? stickyRouter?.resolve?.(familyKey)?.vmId || null : null
+    // An explicit child counts against its root's conversation window, not a
+    // new one. Without a local root record there is no relation to trust.
+    const rootWindowKey = parentSession ? stickyRouter?.canonicalSessionKey?.(parentSession) || null : null
+    const windowKey = rootWindowKey && stickyRouter?.resolve?.(rootWindowKey) ? rootWindowKey : undefined
     const stickyBound =
       stickyKey && typeof stickyRouter?.resolve === 'function' ? stickyRouter.resolve(stickyKey) : null
     const outboundSessionId = resolveOutboundSessionId(callerSession, {
@@ -904,6 +917,7 @@ export function createHandleProtocol(deps) {
         deviceKey,
         skipSessionSeat: seatless,
         familyKey,
+        windowKey,
         familyVmId,
         pinVmId,
         ownerScope,
@@ -1166,7 +1180,8 @@ export function createHandleProtocol(deps) {
     logBag.vm_id = result?.vmId || null
     logBag.account_id = result?.accountId || null
     logBag.final_account_id = result?.accountId || null
-    logBag.attempt_count = result?.attemptCount || null
+    // Zero executions is a real 0, not unknown; the VM is the last one that ran.
+    logBag.attempt_count = result?.attemptCount ?? 0
     logBag.final_state = result?.finalState || result?.terminalState || null
     logBag.upstream_status = result?.status ?? null
     logBag.usage = result?.body?.usage || result?.usage || null
@@ -1229,7 +1244,7 @@ export function createHandleProtocol(deps) {
       if (!res.headersSent) {
         const mapped = mapProtocolClientError(result, logBag, result?.body?.error?.code || 'upstream_error')
         if (!isClientCancelledResult(result) && mapped.body?.error?.code !== 'client_cancelled') stats.errors++
-        return json(res, mapped.status, mapped.body)
+        return sendMapped(res, mapped)
       }
       if (result?.ok && protocol !== 'anthropic.messages') {
         res.write('data: [DONE]\n\n')
@@ -1248,7 +1263,7 @@ export function createHandleProtocol(deps) {
       const failed = isIncompleteAssistantMessage(result) ? incompleteAssistantClientError(result) : result
       const mapped = mapProtocolClientError(failed, logBag, failed?.body?.error?.code || 'upstream_error')
       if (mapped.body?.error?.code !== 'client_cancelled') stats.errors++
-      return json(res, mapped.status, mapped.body)
+      return sendMapped(res, mapped)
     }
 
     let output

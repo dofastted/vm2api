@@ -188,3 +188,69 @@ test('monitor hops /usage only for an elapsed Extra window', async () => {
   assert.equal(run.items.find((item) => item.vm_id === 'vm-05')?.reason, 'extra_window_elapsed')
   assert.equal(run.items.find((item) => item.vm_id === 'vm-13')?.reason, 'reconcile_extra')
 })
+
+test('#163 A17: an in-use account with a sample older than stale_sec hops even before reset', () => {
+  const now = Date.parse('2026-09-23T12:00:00.000Z')
+  const account = {
+    last_probe: { at: '2026-09-23T10:00:00.000Z', source: 'vm-oauth-usage' },
+    unified: {
+      source: 'vm-oauth-usage',
+      official: { '5h': { utilization: 0.3, status: 'allowed', reset: '2026-09-23T14:00:00.000Z' } },
+    },
+  }
+  const staleMs = 300_000
+  assert.deepEqual(isUsageProbeDue(account, { now, staleMs, active: true }), { due: true, reason: 'sample_stale' })
+  assert.deepEqual(isUsageProbeDue(account, { now, staleMs, active: false }), {
+    due: false,
+    reason: 'list_passive_only',
+  })
+  const edge = { ...account, last_probe: { at: new Date(now - staleMs + 1).toISOString() } }
+  assert.notEqual(isUsageProbeDue(edge, { now, staleMs, active: true }).reason, 'sample_stale')
+  const expired = { ...account, last_probe: { at: new Date(now - staleMs).toISOString() } }
+  assert.equal(isUsageProbeDue(expired, { now, staleMs, active: true }).reason, 'sample_stale')
+})
+
+test('#163 A18: timer and a 429 event share one inflight /usage hop per VM', async () => {
+  let calls = 0
+  let finish
+  const monitor = createUsageProbeMonitor({
+    config: { concurrency: 1, stale_sec: 60 },
+    listTargets: () => [live],
+    accountForVm: () => ({ unified: {} }),
+    isActive: () => true,
+    probeOne: () => {
+      calls += 1
+      return new Promise((resolve) => {
+        finish = resolve
+      })
+    },
+  })
+  const timed = monitor.runOnce()
+  await new Promise((resolve) => setImmediate(resolve))
+  const event = monitor.probeNow('vm-13', 'rate_limited_unknown')
+  assert.equal(calls, 1)
+  finish({ ok: true, source: 'oauth-usage' })
+  const [run, evented] = await Promise.all([timed, event])
+  assert.equal(calls, 1)
+  assert.equal(evented.ok, true)
+  assert.equal(run.items.find((item) => item.vm_id === 'vm-13').ok, true)
+})
+
+test('#163 A18: a failed hop keeps the old sample and backs off instead of retrying hot', async () => {
+  let calls = 0
+  const monitor = createUsageProbeMonitor({
+    config: { concurrency: 1, stale_sec: 60 },
+    listTargets: () => [live],
+    accountForVm: () => ({ unified: {} }),
+    isActive: () => true,
+    probeOne: async () => {
+      calls += 1
+      return { ok: false }
+    },
+  })
+  const first = await monitor.probeNow('vm-13')
+  assert.equal(first.ok, false)
+  const second = await monitor.probeNow('vm-13')
+  assert.equal(second.reason, 'probe_backoff')
+  assert.equal(calls, 1)
+})

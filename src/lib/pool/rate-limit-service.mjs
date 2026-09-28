@@ -96,18 +96,31 @@ export class RateLimitService {
 
   /**
    * sub2api HandleUpstreamError: writes the hard column for this failure. Returns the block, or null.
-   * The classifier decides the scope; a model / Fable 429 stays a model cooldown.
+   * The classifier decides the scope; a model / Fable / RPM 429 stays a short cooldown.
+   * An unknown bare 429 writes no hard block: the scope is unproven, so one
+   * bounded usage probe decides whether the account window is really spent.
    */
   handleUpstreamError({ accountId, vmId, result = {}, policy = null, now = Date.now() } = {}) {
     if (!accountId || !this.runtimeRepo || result?.committed) return null
     const reason = String(policy?.reason || '')
-    if (policy?.scope === 'account' && (reason === 'account_quota_exhausted' || reason === 'rate_limited')) {
+    if (policy?.scope === 'account' && reason === 'account_quota_exhausted') {
       return this.handle429({ accountId, vmId, result, now })
+    }
+    if (reason === 'rate_limited_unknown') {
+      this.requestUsageProbe({ accountId, vmId })
+      return null
     }
     if (reason === 'provider_overloaded' && Number(result?.status) === 529) {
       return this.handle529({ accountId, vmId, now })
     }
     return null
+  }
+
+  requestUsageProbe({ accountId, vmId }) {
+    if (typeof this.onUsageProbe !== 'function') return
+    try {
+      this.onUsageProbe({ accountId, vmId })
+    } catch {}
   }
 
   handle429({ accountId, vmId, result = {}, now = Date.now() }) {
@@ -130,11 +143,7 @@ export class RateLimitService {
         countRequest: false,
       })
     } catch {}
-    if (fallback && typeof this.onUsageProbe === 'function') {
-      try {
-        this.onUsageProbe({ accountId, vmId })
-      } catch {}
-    }
+    if (fallback) this.requestUsageProbe({ accountId, vmId })
     return { kind: 'rate_limited', until: resetAt, window: parsed?.window || null, fallback }
   }
 

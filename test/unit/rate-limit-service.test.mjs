@@ -104,6 +104,23 @@ test('model-scoped 429 does not write an account hard block', () => {
   }
 })
 
+test('#163: an unknown bare 429 asks for one usage probe and fabricates no 5h block', () => {
+  const { service, runtimeRepo, probes, close } = setup()
+  try {
+    const block = service.handleUpstreamError({
+      accountId: 'acc-1',
+      vmId: 'vm-01',
+      result: limitResult('Rate limited'),
+      policy: { scope: 'account', reason: 'rate_limited_unknown' },
+    })
+    assert.equal(block, null)
+    assert.equal(runtimeRepo.get('acc-1').rate_limit_reset_at, null)
+    assert.deepEqual(probes, [{ accountId: 'acc-1', vmId: 'vm-01' }])
+  } finally {
+    close()
+  }
+})
+
 test('529 writes overload_until for the configured minutes', () => {
   const { service, runtimeRepo, close } = setup({ overload_cooldown_min: 10 })
   try {

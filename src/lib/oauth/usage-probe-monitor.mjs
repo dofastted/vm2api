@@ -81,9 +81,26 @@ function elapsedExtraResetMs(unified = {}, now = Date.now()) {
   return resetMs
 }
 
+/** Newest real quota sample: a Messages header read or an official /usage hop. */
+export function latestUsageSampleMs(account = {}) {
+  const unified = account?.unified || {}
+  const times = [
+    unified.headers?.sampled_at,
+    account?.last_probe?.at,
+    unified.last_probe?.at,
+    unified.last_probe?.probed_at,
+  ]
+    .map((value) => Date.parse(value || ''))
+    .filter(Number.isFinite)
+  return times.length ? Math.max(...times) : null
+}
+
 /**
  * Hop /usage after Extra never sampled, a 5h/7d Extra reset elapsed, or Pro recheck.
- * Live Extra or an existing official sample stays passive.
+ * An account in use (serving traffic or holding pinned conversations) also
+ * hops once its newest real sample is older than `staleMs`: a reset still in
+ * the future says nothing about how fresh the utilization number is (#163).
+ * Live Extra or an existing official sample otherwise stays passive.
  * @returns {{ due: boolean, reason?: string }}
  */
 export function isUsageProbeDue(account = {}, opts = {}) {
@@ -100,6 +117,11 @@ export function isUsageProbeDue(account = {}, opts = {}) {
     if (!Number.isFinite(attemptedAt) || now - attemptedAt >= 60 * 60_000) {
       return { due: true, reason: 'pro_tier_recheck' }
     }
+  }
+  const staleMs = Number(opts.staleMs)
+  if (opts.active && Number.isFinite(staleMs) && staleMs > 0) {
+    const sampledMs = latestUsageSampleMs(account)
+    if (sampledMs == null || now - sampledMs >= staleMs) return { due: true, reason: 'sample_stale' }
   }
   const resetMs = elapsedExtraResetMs(unified, now)
   const probedAt = Date.parse(account?.last_probe?.at || unified.last_probe?.at || unified.last_probe?.probed_at || '')
@@ -126,16 +148,100 @@ export function isUsageProbeDue(account = {}, opts = {}) {
   return { due: true, reason: 'extra_window_elapsed' }
 }
 
+/** Queued probes beyond the running `concurrency` workers; more are dropped, never blocked on. */
+const MAX_QUEUED_PROBES = 64
+const PROBE_BACKOFF_BASE_MS = 60_000
+
+function withTimeout(promise, ms) {
+  let timer
+  const expired = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(Object.assign(new Error('usage probe timed out'), { code: 'probe_timeout' })), ms)
+    timer.unref?.()
+  })
+  return Promise.race([promise, expired]).finally(() => clearTimeout(timer))
+}
+
 export function createUsageProbeMonitor(opts = {}) {
   let config = normalizeUsageProbeConfig(opts.config)
   let timer = null
   let inflight = null
   let lastRun = null
   const nowFn = opts.now || (() => Date.now())
+  // One /usage hop per VM at a time, shared by the timer and 429 events.
+  const probing = new Map()
+  const backoff = new Map()
+  const queue = []
+  let running = 0
 
   const listTargets = () => {
     const vms = typeof opts.listTargets === 'function' ? opts.listTargets() || [] : []
     return vms.filter((vm) => isUsageProbeTarget(vm))
+  }
+
+  const takeWorker = () => {
+    if (running < config.concurrency) {
+      running += 1
+      return Promise.resolve(true)
+    }
+    if (queue.length >= MAX_QUEUED_PROBES) return null
+    return new Promise((resolve) => queue.push(resolve))
+  }
+
+  const giveWorker = () => {
+    const next = queue.shift()
+    if (next) next(true)
+    else running -= 1
+  }
+
+  /**
+   * Failures keep the old sample (never a 0%), back off exponentially, and
+   * surface in the run snapshot. A success clears the backoff.
+   */
+  const probeVm = (vm, reason) => {
+    const id = vm.id
+    if (probing.has(id)) return probing.get(id)
+    const parked = backoff.get(id)
+    if (parked && parked.until > nowFn()) {
+      return Promise.resolve({ vm_id: id, ok: false, reason: 'probe_backoff', source: null })
+    }
+    const worker = takeWorker()
+    if (!worker) return Promise.resolve({ vm_id: id, ok: false, reason: 'probe_queue_full', source: null })
+    const run = worker
+      .then(async () => {
+        try {
+          const result = await withTimeout(Promise.resolve(opts.probeOne(vm)), config.timeout_ms)
+          const ok = result?.ok !== false
+          if (ok) backoff.delete(id)
+          else {
+            const failures = (backoff.get(id)?.failures || 0) + 1
+            backoff.set(id, {
+              failures,
+              until: nowFn() + Math.min(STALE_USAGE_PROBE_GAP_MS, PROBE_BACKOFF_BASE_MS * 2 ** (failures - 1)),
+            })
+          }
+          return { vm_id: id, ok, reason, source: result?.source || (ok ? 'oauth-usage' : null) }
+        } catch (error) {
+          const failures = (backoff.get(id)?.failures || 0) + 1
+          backoff.set(id, {
+            failures,
+            until: nowFn() + Math.min(STALE_USAGE_PROBE_GAP_MS, PROBE_BACKOFF_BASE_MS * 2 ** (failures - 1)),
+          })
+          return { vm_id: id, ok: false, reason, source: null, error: error?.code || 'probe_failed' }
+        } finally {
+          giveWorker()
+        }
+      })
+      .finally(() => probing.delete(id))
+    probing.set(id, run)
+    return run
+  }
+
+  /** Event-driven hop (unknown 429, reset recheck). Same single-flight and bounds as the timer. */
+  const probeNow = (vmId, reason = 'event') => {
+    if (typeof opts.probeOne !== 'function') return Promise.resolve({ vm_id: vmId, ok: false, reason: 'no_prober' })
+    const vm = listTargets().find((item) => item.id === vmId)
+    if (!vm) return Promise.resolve({ vm_id: vmId, ok: false, reason: 'not_target', source: null })
+    return probeVm(vm, reason)
   }
 
   const runOnce = async () => {
@@ -145,6 +251,7 @@ export function createUsageProbeMonitor(opts = {}) {
       const targets = listTargets()
       const items = []
       const due = []
+      const staleMs = config.stale_sec * 1000
       for (const vm of targets) {
         const account = typeof opts.accountForVm === 'function' ? opts.accountForVm(vm) : null
         if (typeof opts.reconcile === 'function') {
@@ -152,7 +259,13 @@ export function createUsageProbeMonitor(opts = {}) {
             opts.reconcile(vm, account)
           } catch {}
         }
-        const decision = isUsageProbeDue(account || {}, { now: nowFn() })
+        let active = false
+        if (typeof opts.isActive === 'function') {
+          try {
+            active = !!opts.isActive(vm, account)
+          } catch {}
+        }
+        const decision = isUsageProbeDue(account || {}, { now: nowFn(), staleMs, active })
         if (!decision.due || typeof opts.probeOne !== 'function') {
           items.push({
             vm_id: vm.id,
@@ -162,33 +275,9 @@ export function createUsageProbeMonitor(opts = {}) {
           })
           continue
         }
-        due.push(vm)
+        due.push({ vm, reason: decision.reason })
       }
-      let cursor = 0
-      const workers = Math.min(config.concurrency, due.length)
-      await Promise.all(
-        Array.from({ length: workers }, async () => {
-          while (cursor < due.length) {
-            const vm = due[cursor++]
-            try {
-              const result = await opts.probeOne(vm)
-              items.push({
-                vm_id: vm.id,
-                ok: result?.ok !== false,
-                reason: 'extra_window_elapsed',
-                source: result?.source || 'oauth-usage',
-              })
-            } catch {
-              items.push({
-                vm_id: vm.id,
-                ok: false,
-                reason: 'extra_window_elapsed',
-                source: null,
-              })
-            }
-          }
-        }),
-      )
+      items.push(...(await Promise.all(due.map(({ vm, reason }) => probeVm(vm, reason)))))
       lastRun = {
         at: new Date(nowFn()).toISOString(),
         duration_ms: nowFn() - started,
@@ -235,6 +324,7 @@ export function createUsageProbeMonitor(opts = {}) {
     setConfig,
     getSnapshot: () => lastRun,
     runOnce,
+    probeNow,
     start,
     stop,
   }

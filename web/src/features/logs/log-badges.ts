@@ -8,6 +8,9 @@ export type LogBadge = {
   tone: LogBadgeTone
 }
 
+/** A request that never reached an execution seat. Not the same as a slot with no account. */
+export const UNASSIGNED_EXECUTION = '未分配执行位'
+
 function toneOf(cls: string | undefined): LogBadgeTone {
   if (
     cls === 'ok' ||

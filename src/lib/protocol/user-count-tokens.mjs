@@ -117,7 +117,7 @@ function poolFail(peeked) {
   return rewritePoolErrorForClient(
     makeError({
       type: ErrorType.OVERLOADED,
-      code: peeked?.code || ErrorCode.SERVER_OVERLOADED,
+      code: peeked?.code || ErrorCode.POOL_UNAVAILABLE,
       message: peeked?.code || 'no_eligible_accounts',
       status: 503,
     }),

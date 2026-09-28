@@ -17,6 +17,7 @@ import { SlotIdentity } from '@/components/platform-chip'
 import { QueryGate } from '@/components/query-gate'
 import { StatusMark } from '@/components/status-mark'
 import { LatencyBreakdownBar } from '@/features/logs/latency-breakdown-bar'
+import { UNASSIGNED_EXECUTION } from '@/features/logs/log-badges'
 
 const SECRET_KEY =
   /access_token|refresh_token|session_key|password|secret|authorization|cookie|master_key|api_key|proxy_url|oauth/i
@@ -223,6 +224,7 @@ function SummaryTab({
       vmId={item.vm_id}
       model={item.requested_model || item.model}
       protocol={item.protocol == null ? undefined : String(item.protocol)}
+      emptyLabel={UNASSIGNED_EXECUTION}
     />,
   ])
   rows.push(['尝试数', dash(item.attempt_count ?? attemptCount)])

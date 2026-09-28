@@ -79,21 +79,21 @@ export const ErrorCode = {
   COUNT_TOKENS_UNSUPPORTED: 'count_tokens_unsupported',
   USAGE_UNSUPPORTED: 'usage_unsupported',
   // pool — client-facing only; internal codes stay on the log bag
-  SERVER_OVERLOADED: 'server_overloaded',
+  POOL_OVERLOADED: 'pool_overloaded',
+  POOL_UNAVAILABLE: 'pool_unavailable',
 }
 
 export const CLIENT_POOL_BUSY_MESSAGE = '号池负载过高，稍后再试'
+export const CLIENT_POOL_UNAVAILABLE_MESSAGE = '号池当前没有可用账号'
 
-const POOL_CAPACITY_CODES = new Set([
-  'server_overloaded',
+/** Every eligible seat stayed busy until the bounded wait ran out. */
+const POOL_OVERLOADED_CODES = new Set(['pool_overloaded', 'pool_wait_queue_full'])
+/** Nothing eligible to wait for: configuration, quota, credentials, or model gates. */
+const POOL_UNAVAILABLE_CODES = new Set([
   'account_pool_exhausted',
   'api_pool_exhausted',
   'no_available_accounts',
   'no_eligible_accounts',
-  'pool_wait_queue_full',
-  'pool_deadline_exceeded',
-  'attempts_exhausted',
-  'max_account_switches_exceeded',
 ])
 
 const POOL_CAPACITY_MESSAGE = /no eligible|no ready api|account pool|号池没有|无可用账号|eligible claude/i
@@ -109,21 +109,37 @@ export function isUsagePolicyErrorMessage(message = '') {
   return USAGE_POLICY_MESSAGE.test(String(message || ''))
 }
 
-export function isPoolCapacityError(code, message = '') {
-  if (POOL_CAPACITY_CODES.has(String(code || '').trim())) return true
-  return POOL_CAPACITY_MESSAGE.test(String(message || ''))
+/** `overloaded` (real capacity, 429), `unavailable` (nothing eligible, 503), or null. */
+export function poolErrorKind(code, message = '') {
+  const key = String(code || '').trim()
+  if (POOL_OVERLOADED_CODES.has(key)) return 'overloaded'
+  if (POOL_UNAVAILABLE_CODES.has(key)) return 'unavailable'
+  if (POOL_CAPACITY_MESSAGE.test(String(message || ''))) return 'unavailable'
+  return null
+}
+
+function poolClientError(kind) {
+  if (kind === 'overloaded') {
+    return makeError({
+      type: ErrorType.RATE_LIMIT,
+      code: ErrorCode.POOL_OVERLOADED,
+      message: CLIENT_POOL_BUSY_MESSAGE,
+      status: 429,
+    })
+  }
+  return makeError({
+    type: ErrorType.OVERLOADED,
+    code: ErrorCode.POOL_UNAVAILABLE,
+    message: CLIENT_POOL_UNAVAILABLE_MESSAGE,
+    status: 503,
+  })
 }
 
 export function rewritePoolErrorForClient(mapped, originalBody = null) {
   const code = originalBody?.error?.code || mapped?.body?.error?.code
   const message = originalBody?.error?.message || mapped?.body?.error?.message || ''
-  if (!isPoolCapacityError(code, message)) return mapped
-  return makeError({
-    type: ErrorType.OVERLOADED,
-    code: ErrorCode.SERVER_OVERLOADED,
-    message: CLIENT_POOL_BUSY_MESSAGE,
-    status: 503,
-  })
+  const kind = poolErrorKind(code, message)
+  return kind ? poolClientError(kind) : mapped
 }
 
 export function makeError({
@@ -142,7 +158,6 @@ export function makeError({
   return { status, body: { error } }
 }
 
-const GATEWAY_OVERLOAD_CODES = new Set(['server_overloaded', 'account_pool_exhausted', 'api_pool_exhausted'])
 // Cancellation is decided by the request's own AbortSignal, never by transport
 // text: an upstream ECONNRESET or a local timeout is a real failure, not a cancel.
 const CLIENT_CANCEL_CODES = new Set(['client_cancelled', 'request_cancelled', 'client_aborted', 'selection_cancelled'])
@@ -301,14 +316,8 @@ export function mapUpstreamError(status, body, headers = {}) {
     })
   }
 
-  if (GATEWAY_OVERLOAD_CODES.has(String(inboundCode || '')) || isPoolCapacityError(inboundCode, msg)) {
-    return makeError({
-      type: ErrorType.OVERLOADED,
-      code: ErrorCode.SERVER_OVERLOADED,
-      message: CLIENT_POOL_BUSY_MESSAGE,
-      status: 503,
-    })
-  }
+  const poolKind = poolErrorKind(inboundCode, msg)
+  if (poolKind) return poolClientError(poolKind)
   if (isClientCancelledCode(inboundCode, msg)) {
     return makeError({
       type: ErrorType.TIMEOUT,

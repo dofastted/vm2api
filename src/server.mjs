@@ -232,8 +232,9 @@ const routingRt = createRoutingRuntime({
   get proxyPool() {
     return proxyPool
   },
-  // Lazy: panel is built after the runtime. One /usage hop when a 429 had no reset.
-  probeUsageOne: (vmId) => panel.buildProbeOne({ cfg, accountQuota, id: vmId }),
+  // Lazy: the monitor is built after the runtime. An unknown 429 asks for one
+  // /usage hop through the same single-flight, bounded queue as the timer.
+  probeUsageOne: (vmId) => usageProbeMonitor?.probeNow?.(vmId, 'rate_limited_unknown'),
 })
 
 const {
@@ -362,6 +363,17 @@ function accountForUsageProbe(vm) {
   }
 }
 
+const USAGE_ACTIVE_WINDOW_MS = 5 * 3600_000
+
+/** Serving traffic within one 5h window, or still holding pinned conversations (#163). */
+function usageProbeActive(vm, account) {
+  if (isCodexVm(vm)) return false
+  const id = account?.account_id || vm?.claude?.account_uuid || vm?.account_uuid || vm?.id
+  const lastUsed = Number(poolScheduler?.lastUsed?.get?.(id) || runtimeRepo?.get?.(id)?.last_used_at || 0)
+  if (lastUsed && Date.now() - lastUsed < USAGE_ACTIVE_WINDOW_MS) return true
+  return (stickyRouter?.boundKeys?.({ accountId: id, vmId: vm?.id }) || []).length > 0
+}
+
 function attachSlotRuntime(vm) {
   const acc = accountForUsageProbe(vm)
   const keys = [acc?.account_id, vm?.claude?.account_uuid, vm?.account_uuid, vm?.id].filter(Boolean)
@@ -428,6 +440,7 @@ usageProbeMonitor = createUsageProbeMonitor({
   config: routingConfig.usage_probe,
   listTargets: () => listVms(cfg.paths.project),
   accountForVm: accountForUsageProbe,
+  isActive: usageProbeActive,
   reconcile: (vm, account) => {
     const id = account?.account_id || vm?.claude?.account_uuid || vm?.account_uuid || vm?.id
     if (isCodexVm(vm)) {
