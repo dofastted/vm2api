@@ -917,14 +917,19 @@ export function createHandleProtocol(deps) {
           } catch {}
           const identity = loadVmIdentity(selected.exec)
           const attemptStartedAt = extra.attemptStartedAt ?? Date.now()
+          const keptSession = extra.freshSlot ? '' : stickyBound?.sessionId || ''
+          const keptAccount = extra.freshSlot ? '' : stickyBound?.accountId || ''
+          const keptVm = extra.freshSlot ? '' : stickyBound?.vmId || ''
           const attemptSessionId = resolveOutboundSessionId(callerSession, {
             ...sessionContext,
             accountId: selected.accountId,
-            boundSessionId: stickyBound?.sessionId || '',
-            boundAccountId: stickyBound?.accountId || '',
-            boundVmId: stickyBound?.vmId || '',
+            boundSessionId: keptSession,
+            boundAccountId: keptAccount,
+            boundVmId: keptVm,
             vmId: selected.vmId,
-            epoch: `${attemptStartedAt}:${selected.vmId || extra.attemptNo || ''}`,
+            epoch: extra.freshSlot
+              ? `slot:${selected.slotIndex ?? 'x'}:${attemptStartedAt}`
+              : `${attemptStartedAt}:${selected.vmId || extra.attemptNo || ''}`,
           })
           if (identity && attemptSessionId) identity.callerSessionId = attemptSessionId
           const credMode = credentialModeFromOauth(selected.vm?.claude || {})
@@ -966,10 +971,9 @@ export function createHandleProtocol(deps) {
                 officialClient: officialTraffic,
                 sessionId: attemptSessionId,
                 mode: sessionMode,
-                accountId: selected.accountId,
-                boundSessionId: stickyBound?.sessionId || '',
-                boundAccountId: stickyBound?.accountId || '',
-                boundVmId: stickyBound?.vmId || '',
+                boundSessionId: keptSession,
+                boundAccountId: keptAccount,
+                boundVmId: keptVm,
                 vmId: selected.vmId,
                 epoch: attemptStartedAt,
               })

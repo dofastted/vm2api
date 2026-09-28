@@ -815,3 +815,19 @@ test('isShortProbeRequest leaves conversations alone', () => {
   )
   assert.equal(isShortProbeRequest({ messages: [{ role: 'user', content: '  ' }] }), false)
 })
+
+test('replaceSession remints the outbound session on the same VM', () => {
+  const r = new StickyRouter({ dataDir: tmpDir(), config: { sticky: { enabled: true, ttl_seconds: 60 } } })
+  r.bind('sess:a', { accountId: 'acc', vmId: 'vm-05', sessionId: 'old-session', slotIndex: 0 })
+  r.bind(
+    'sess:a',
+    { accountId: 'acc', vmId: 'vm-05', sessionId: 'new-session', slotIndex: 1 },
+    { countHit: false, replaceSession: true },
+  )
+  assert.equal(r.resolve('sess:a').sessionId, 'new-session')
+  assert.equal(r.resolve('sess:a').slotIndex, 1)
+  r.bind('sess:a', { accountId: 'acc', vmId: 'vm-05' }, { countHit: false, replaceSession: true, clearSlot: true })
+  assert.equal(r.resolve('sess:a').sessionId, null)
+  assert.equal(r.resolve('sess:a').slotIndex, null)
+  r.db?.close?.()
+})

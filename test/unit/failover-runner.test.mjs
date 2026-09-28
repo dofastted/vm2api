@@ -512,8 +512,18 @@ test('cli-hop rust slot repairs signature 400 even when signature_repair is off'
   assert.equal(calls, 2)
 })
 
-test('thinking-only hop retries same account and returns the later text', async () => {
+test('thinking-only hop moves to the next slot and returns the later text', async () => {
   const scheduler = new Scheduler([candidate(1)])
+  scheduler.markSlotUnavailable = () => {}
+  scheduler.dropSessionSlot = () => {}
+  scheduler.slotsExhausted = () => false
+  let n = 0
+  const select = scheduler.selectAndReserve.bind(scheduler)
+  scheduler.selectAndReserve = async (args) => {
+    const selected = await select(args)
+    if (selected?.ok) selected.slotIndex = n++
+    return selected
+  }
   const runner = new FailoverRunner({
     scheduler,
     config: { same_account_retry_delay_ms: 0 },
@@ -582,7 +592,7 @@ test('repeated incomplete hop stays on the account and returns 502', async () =>
   assert.equal(result.status, 502)
   assert.equal(result.body.error.code, 'incomplete_response')
   assert.equal(result.vmId, 'vm-01')
-  assert.deepEqual(seen, ['vm-01', 'vm-01'])
+  assert.deepEqual(seen, ['vm-01'])
   assert.deepEqual(parked, [])
 })
 
@@ -1063,7 +1073,7 @@ test('thinking-only hop without message_stop returns 502 on the same account', a
   })
   assert.equal(result.status, 502)
   assert.equal(result.body.error.code, 'incomplete_response')
-  assert.deepEqual(seen, ['vm-01', 'vm-01'])
+  assert.deepEqual(seen, ['vm-01'])
 })
 
 test('incomplete hops without message_stop do not try the next account', async () => {
@@ -1095,7 +1105,7 @@ test('incomplete hops without message_stop do not try the next account', async (
   })
   assert.equal(result.status, 502)
   assert.equal(result.body.error.code, 'incomplete_response')
-  assert.deepEqual(seen, ['vm-01', 'vm-01'])
+  assert.deepEqual(seen, ['vm-01'])
 })
 
 test('same sticky session requests execute serially', async () => {
@@ -1254,4 +1264,158 @@ test('explicit VM pin is not redirected by a family locked elsewhere', async () 
   }
   assert.equal(scheduler.state.selects.length, 3)
   assert.equal(scheduler.state.inflight, 0)
+})
+
+function incompleteHop() {
+  return {
+    ok: false,
+    status: 200,
+    committed: false,
+    terminalState: 'incomplete',
+    body: { type: 'message', role: 'assistant', content: [], stop_reason: null },
+  }
+}
+
+test('incomplete hop leaves the slot and retries the next one', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const cooled = []
+  scheduler.markSlotUnavailable = (vmId, index) => cooled.push({ vmId, index })
+  scheduler.dropSessionSlot = () => {}
+  let n = 0
+  const select = scheduler.selectAndReserve.bind(scheduler)
+  scheduler.selectAndReserve = async (args) => {
+    const selected = await select(args)
+    if (selected?.ok) selected.slotIndex = n++
+    return selected
+  }
+  const recovers = []
+  const seen = []
+  const result = await new FailoverRunner({
+    scheduler,
+    config: { same_account_retry_delay_ms: 0 },
+    recoverSlot: async (exec) => recovers.push(exec.vmId),
+  }).run({
+    requestId: 'req-slot-switch',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: 'conversation-1',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.slotIndex)
+      return selected.slotIndex === 0 ? incompleteHop() : success('next-slot')
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.body.content[0].text, 'next-slot')
+  assert.deepEqual(seen, [0, 1])
+  assert.deepEqual(cooled, [{ vmId: 'vm-01', index: 0 }])
+  assert.deepEqual(recovers, [])
+  assert.equal(result.vmId, 'vm-01')
+})
+
+test('a second bad slot still does not restart the CLI', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  scheduler.markSlotUnavailable = () => {}
+  scheduler.dropSessionSlot = () => {}
+  scheduler.slotsExhausted = () => false
+  let n = 0
+  const select = scheduler.selectAndReserve.bind(scheduler)
+  scheduler.selectAndReserve = async (args) => {
+    const selected = await select(args)
+    if (selected?.ok) selected.slotIndex = n++
+    return selected
+  }
+  const recovers = []
+  const seen = []
+  const result = await new FailoverRunner({
+    scheduler,
+    config: { same_account_retry_delay_ms: 0 },
+    recoverSlot: async (exec) => recovers.push(exec.vmId),
+  }).run({
+    requestId: 'req-slot-skip',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: 'conversation-1',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.slotIndex)
+      return selected.slotIndex < 2 ? incompleteHop() : success('slot-6')
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.deepEqual(seen, [0, 1, 2])
+  assert.deepEqual(recovers, [])
+})
+
+test('all native slots bad marks the VM overloaded and restarts the CLI', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const cooled = []
+  const overloaded = []
+  scheduler.markSlotUnavailable = (_vmId, index) => cooled.push(index)
+  scheduler.dropSessionSlot = () => {}
+  scheduler.slotsExhausted = () => cooled.length >= 2
+  scheduler.markSlotsOverload = (vmId) => overloaded.push(vmId)
+  scheduler.clearSlotsOverload = () => cooled.splice(0, cooled.length)
+  let n = 0
+  const select = scheduler.selectAndReserve.bind(scheduler)
+  scheduler.selectAndReserve = async (args) => {
+    const selected = await select(args)
+    if (selected?.ok) selected.slotIndex = n++
+    return selected
+  }
+  const recovers = []
+  const seen = []
+  const result = await new FailoverRunner({
+    scheduler,
+    config: { same_account_retry_delay_ms: 0 },
+    recoverSlot: async (exec) => recovers.push(exec.vmId),
+  }).run({
+    requestId: 'req-slots-full',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: 'conversation-1',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.slotIndex)
+      return selected.slotIndex < 2 ? incompleteHop() : success('after-restart')
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.deepEqual(seen, [0, 1, 2])
+  assert.deepEqual(overloaded, ['vm-01'])
+  assert.deepEqual(recovers, ['vm-01'])
+})
+
+test('client cancel skips the slot and restarts the CLI only when idle', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const cooled = []
+  scheduler.markSlotUnavailable = (vmId, index) => cooled.push({ vmId, index })
+  scheduler.badSlotCount = () => cooled.length
+  const idles = []
+  const recovers = []
+  const controller = new AbortController()
+  const result = await new FailoverRunner({
+    scheduler,
+    recoverSlot: async (exec) => recovers.push(exec.vmId),
+    idleRestartSlot: (exec) => idles.push(exec.vmId),
+    stickyRouter: { bind() {}, resolve: () => null },
+  }).run({
+    requestId: 'req-cancel-slot',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: 'conversation-1',
+    signal: controller.signal,
+    callAttempt: ({ candidate: selected }) => {
+      selected.slotIndex = 3
+      controller.abort()
+      return {
+        ok: false,
+        status: 499,
+        clientCancelled: true,
+        terminalState: 'cancelled',
+        body: { type: 'error', error: { code: 'client_cancelled', message: 'Client closed the connection' } },
+      }
+    },
+  })
+  assert.equal(result.status, 499)
+  assert.deepEqual(cooled, [{ vmId: 'vm-01', index: 3 }])
+  assert.deepEqual(recovers, [])
+  assert.deepEqual(idles, ['vm-01'])
 })

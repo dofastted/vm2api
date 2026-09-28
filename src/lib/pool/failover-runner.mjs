@@ -26,6 +26,7 @@ const DEFAULTS = {
   same_account_retry_delay_ms: 500,
   same_account_retry_max_hop_ms: 10_000,
   signature_repair: false,
+  slot_error_cooldown_ms: 60_000,
 }
 
 function clone(value) {
@@ -235,7 +236,7 @@ function isCredentialDeath(policy) {
   return policy?.action === 'disable' || policy?.reason === 'oauth_no_refresh' || policy?.reason === 'oauth_revoked'
 }
 
-/** Empty / thinking-only hop. Same-account retry only; never a reason to walk the pool. */
+/** Empty / thinking-only hop. Skip that native slot; do not restart the CLI here. */
 function isRetryableEmptyHop(policy) {
   return policy?.reason === 'incomplete_assistant' || policy?.reason === 'empty_response'
 }
@@ -305,6 +306,8 @@ export class FailoverRunner {
     onCredentialFailure = null,
     onFablePlanDenied = null,
     onFableSuccess = null,
+    recoverSlot = null,
+    idleRestartSlot = null,
   } = {}) {
     this.scheduler = scheduler
     this.stickyRouter = stickyRouter
@@ -315,6 +318,8 @@ export class FailoverRunner {
     this.onCredentialFailure = onCredentialFailure
     this.onFablePlanDenied = onFablePlanDenied
     this.onFableSuccess = onFableSuccess
+    this.recoverSlot = recoverSlot
+    this.idleRestartSlot = idleRestartSlot
     this.sessionTails = new Map()
   }
 
@@ -326,6 +331,44 @@ export class FailoverRunner {
     else circuit.releaseProbe?.(selected.accountId)
   }
 
+  /**
+   * The seat that just failed stays down until the CLI restarts.
+   * Clearing the outbound session makes the next hop a new kernel slot.
+   */
+  quarantineSlot(selected, bindKeys) {
+    if (!selected?.vmId) return
+    if (Number.isInteger(selected.slotIndex)) {
+      this.scheduler.markSlotUnavailable?.(selected.vmId, selected.slotIndex)
+    }
+    for (const key of bindKeys || []) {
+      this.scheduler.dropSessionSlot?.(selected.vmId, key)
+      this.stickyRouter?.bind?.(
+        key,
+        { accountId: selected.accountId, vmId: selected.vmId },
+        { countHit: false, replaceSession: true, clearSlot: true },
+      )
+    }
+  }
+
+  abandonCancelledSlot(selected, bindKeys, idleExecs) {
+    this.quarantineSlot(selected, bindKeys)
+    this.rememberIdleRestart(selected, idleExecs)
+  }
+
+  rememberIdleRestart(selected, idleExecs) {
+    if (!idleExecs || !selected?.vmId) return
+    idleExecs.set(selected.vmId, selected.exec || { vmId: selected.vmId, vm: { id: selected.vmId } })
+  }
+
+  flushIdleSlotRestart(idleExecs) {
+    if (typeof this.idleRestartSlot !== 'function') return
+    for (const exec of idleExecs.values()) {
+      if ((this.scheduler.badSlotCount?.(exec.vmId) || 0) < 1) continue
+      try {
+        this.idleRestartSlot(exec)
+      } catch {}
+    }
+  }
   async recoverCredential(selected, policy) {
     if (policy?.reason !== 'oauth_refresh_required') return policy
     const exec = selected?.exec
@@ -428,6 +471,9 @@ export class FailoverRunner {
     // Accounts left only because the kernel had no free slot; their pins stay.
     const spilled = budget.spilled
     const bindKeys = uniqueStickyKeys(stickyKey, stickyKeys)
+    let cliRestarted = false
+    let freshSlot = false
+    const idleExecs = new Map()
     let outboundSessionId = ''
     let outboundSessionAccountId = ''
     let currentDeviceVmId = null
@@ -445,7 +491,9 @@ export class FailoverRunner {
           // A live pin on another account means this request only spilled for
           // capacity. Rewriting it would move the whole session off its slot.
           if (prev?.accountId && prev.accountId !== account.accountId) continue
-          const guard = prev ? { ...opts, ifGeneration: prev.generation || 0 } : opts
+          let guard = opts
+          if (prev) guard = { ...opts, ifGeneration: prev.generation || 0 }
+          if (freshSlot || opts?.replaceSession) guard = { ...guard, replaceSession: true }
           this.stickyRouter.bind(key, payload, guard)
         }
       }
@@ -467,259 +515,281 @@ export class FailoverRunner {
     let repaired = false
     let requestBody = clone(canonicalBody)
 
-    for (let attemptNo = 1; attemptNo <= this.config.max_total_attempts; attemptNo++) {
-      if (signal?.aborted || isClientCancelledResult(lastResult)) {
-        return { ...clientCancelledResult(lastResult || {}), via: 'pool-failover', attemptCount: attemptNo - 1 }
-      }
-      if (Date.now() >= deadline) {
-        return preferLastResult(
-          lastResult,
-          lastPolicy,
-          poolError('pool_deadline_exceeded', 'Account pool retry deadline exceeded', {
-            attempt_count: attemptNo - 1,
-            last_scope: lastPolicy?.scope || null,
-          }),
-          { attemptCount: attemptNo - 1 },
-        )
-      }
-      let selected
-      try {
-        currentDeviceVmId = deviceKey ? this.stickyRouter?.resolve?.(deviceKey)?.vmId || null : null
-        selected = await this.scheduler.selectAndReserve({
-          model,
-          stickyKey,
-          stickyKeys: bindKeys,
-          excluded,
-          spilled,
-          signal,
-          deadline,
-          allowWait: true,
-          pinVmId,
-          familyVmId,
-          deviceVmId: currentDeviceVmId,
-          skipSessionSlot: skipSessionSeat,
-          ownerScope,
-        })
-      } catch (error) {
-        if (error?.code === 'selection_cancelled') {
-          return { ...clientCancelledResult(), via: 'pool-failover', attemptCount: attemptNo - 1 }
+    try {
+      for (let attemptNo = 1; attemptNo <= this.config.max_total_attempts; attemptNo++) {
+        if (signal?.aborted || isClientCancelledResult(lastResult)) {
+          return { ...clientCancelledResult(lastResult || {}), via: 'pool-failover', attemptCount: attemptNo - 1 }
         }
-        if (error?.code === 'pool_wait_queue_full') {
-          return poolError('pool_wait_queue_full', 'Account pool wait queue is full', {
-            reason: 'pool_wait_queue_full',
-            attempt_count: attemptNo - 1,
-          })
-        }
-        throw error
-      }
-      const familyHome = familyKey ? this.stickyRouter?.resolve?.(familyKey) : null
-      const familySpilled = !!familyHome?.accountId && spilled.has(familyHome.accountId)
-      if (!selected?.ok && selected?.reason === 'family_vm_unavailable' && familyVmId && !familySpilled) {
-        // Whole family moves off a gated VM: drop the family pin so the next
-        // bind takes the new VM. Session pins on the old VM are released by
-        // the scheduler once that VM is no longer eligible.
-        if (familyKey) this.stickyRouter?.unbind?.(familyKey)
-        familyVmId = null
-        attemptNo -= 1
-        continue
-      }
-      if (!selected?.ok && selected?.reason === 'fable_requires_max') {
-        return fableRequiresMaxError({
-          wait_ms: selected?.waitMs ?? selected?.wait_ms ?? 0,
-          eligible: selected?.eligible ?? 0,
-          available: selected?.available ?? 0,
-          attempt_count: attemptNo - 1,
-        })
-      }
-
-      if (!selected?.ok) {
-        const exhausted = poolError('account_pool_exhausted', 'No eligible Claude accounts remain', {
-          excluded_accounts: [...excluded],
-          reason: selected?.reason || 'no_eligible_accounts',
-          wait_ms: selected?.waitMs ?? selected?.wait_ms ?? 0,
-          soonest_available_ms: selected?.soonest_available_ms ?? null,
-          wait_reasons: selected?.wait_reasons || [],
-          eligible: selected?.eligible ?? 0,
-          available: selected?.available ?? 0,
-          sticky_cleared: !!selected?.sticky_cleared,
-          attempt_count: attemptNo - 1,
-          last_reason: lastPolicy?.reason || null,
-          last_status: lastResult?.status ?? null,
-        })
-        return preferLastResult(lastResult, lastPolicy, exhausted, { attemptCount: attemptNo - 1 })
-      }
-      pinnedSlot = selected.slotIndex ?? null
-      bindAll(
-        {
-          accountId: selected.accountId,
-          vmId: selected.vmId,
-          slotIndex: pinnedSlot,
-        },
-        { countHit: false },
-      )
-      // An explicit VM pin outranks the family home. Without this, a pinned
-      // request reselects the same VM against a family locked elsewhere.
-      if (familyKey && !pinVmId) {
-        const locked = this.stickyRouter.resolve?.(familyKey)
-        if (locked?.vmId && locked.vmId !== selected.vmId) {
-          // The reservation is released only in the attempt's finally; this
-          // redirect never reaches it, so hand the seat back before reselecting.
-          selected.release?.()
-          familyVmId = locked.vmId
-          continue
-        }
-      }
-      const attemptStarted = Date.now()
-      this.attemptsRepo?.begin?.({
-        requestId,
-        attemptNo,
-        vmId: selected.vmId,
-        accountId: selected.accountId,
-        model,
-        selectionReason: selected.selectionReason,
-        waitMs: selected.waitMs,
-      })
-      let result
-      let policy
-      let committed = false
-      try {
-        const prepared =
-          typeof applyAttempt === 'function'
-            ? await applyAttempt(clone(requestBody), selected, {
-                attemptNo,
-                repaired,
-                attemptStartedAt: attemptStarted,
-              })
-            : clone(requestBody)
-        const wrappedAttempt =
-          prepared &&
-          typeof prepared === 'object' &&
-          Object.prototype.hasOwnProperty.call(prepared, 'body') &&
-          Object.prototype.hasOwnProperty.call(prepared, 'meta')
-        const body = wrappedAttempt ? prepared.body : prepared
-        const attemptMeta = wrappedAttempt ? prepared.meta : null
-        if (attemptMeta?.sessionId) {
-          outboundSessionId = String(attemptMeta.sessionId)
-          outboundSessionAccountId = selected.accountId
-          bindAll(
-            { accountId: selected.accountId, vmId: selected.vmId, sessionId: outboundSessionId },
-            { countHit: false },
+        if (Date.now() >= deadline) {
+          return preferLastResult(
+            lastResult,
+            lastPolicy,
+            poolError('pool_deadline_exceeded', 'Account pool retry deadline exceeded', {
+              attempt_count: attemptNo - 1,
+              last_scope: lastPolicy?.scope || null,
+            }),
+            { attemptCount: attemptNo - 1 },
           )
         }
-        result = await callAttempt({
-          candidate: selected,
-          body,
-          attemptMeta,
-          attemptNo,
-          stream,
-          deliveryMode: deliveryMode || this.config.delivery_mode,
-          signal,
-          onCommit: () => {
-            committed = true
-          },
-        })
-        if (result) result.committed = result.committed || committed
-        if (signal?.aborted || isClientCancelledResult(result)) {
-          return {
-            ...clientCancelledResult(result),
-            via: result?.via || 'pool-failover',
-            accountId: selected.accountId,
-            vmId: selected.vmId,
-            attemptCount: attemptNo,
-          }
-        }
-        policy = classifyAttempt(
-          result,
-          selected,
-          {
+        let selected
+        try {
+          currentDeviceVmId = deviceKey ? this.stickyRouter?.resolve?.(deviceKey)?.vmId || null : null
+          selected = await this.scheduler.selectAndReserve({
             model,
-            repaired,
-            oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
-            signatureRepair: signatureRepairEnabled(this.config, selected),
-          },
-          this.scheduler?.accountQuota,
-        )
-        // One writer for rate_limit_reset_at / overload_until (sub2api HandleUpstreamError).
-        const hardBlock =
-          !result?.committed && !pinVmId
-            ? this.rateLimitService?.handleUpstreamError?.({
-                accountId: selected.accountId,
-                vmId: selected.vmId,
-                result,
-                policy,
-              }) || null
-            : null
-        if (hardBlock?.until && policy.action === 'continue-and-cooldown' && policy.scope === 'account') {
-          policy = { ...policy, cooldownUntil: hardBlock.until }
-        }
-
-        lastResult = result
-        lastPolicy = policy
-        this.noteUnitHealth(selected, policy, result)
-        notifyProxyFailure(this.onProxyFailure, selected, policy)
-        if (policy.reason === 'fable_plan_denied' && typeof this.onFablePlanDenied === 'function') {
-          try {
-            this.onFablePlanDenied({ selected, policy })
-          } catch {}
-        }
-        const terminalState = result?.terminalState || (result?.ok ? 'unknown' : 'error')
-        this.attemptsRepo?.complete?.(requestId, attemptNo, {
-          upstreamStatus: result?.status ?? null,
-          errorScope: policy.scope,
-          action: policy.action,
-          cooldownUntil: policy.cooldownUntil,
-          downstreamCommitted: result?.committed || committed,
-          terminalState,
-          usage: usageOf(result),
-          ttftMs: result?.ttftMs ?? null,
-          latencyMs: Date.now() - attemptStarted,
-        })
-        if (typeof onAttempt === 'function') {
-          await onAttempt({ attemptNo, selected, result, policy })
-        }
-        if (policy.reason === 'content_filter_refusal') {
-          this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
-          bindAll({
-            accountId: selected.accountId,
-            vmId: selected.vmId,
+            stickyKey,
+            stickyKeys: bindKeys,
+            excluded,
+            spilled,
+            signal,
+            deadline,
+            allowWait: true,
+            pinVmId,
+            familyVmId,
+            deviceVmId: currentDeviceVmId,
+            skipSessionSlot: skipSessionSeat,
+            ownerScope,
           })
-          return {
-            ...result,
-            accountId: selected.accountId,
-            vmId: selected.vmId,
-            attemptCount: attemptNo,
-            finalState: 'content_filter',
-            policy,
+        } catch (error) {
+          if (error?.code === 'selection_cancelled') {
+            return { ...clientCancelledResult(), via: 'pool-failover', attemptCount: attemptNo - 1 }
           }
+          if (error?.code === 'pool_wait_queue_full') {
+            return poolError('pool_wait_queue_full', 'Account pool wait queue is full', {
+              reason: 'pool_wait_queue_full',
+              attempt_count: attemptNo - 1,
+            })
+          }
+          throw error
         }
-        if (verifiedSuccess(result)) {
-          this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
-          if (isFableModel(model) && typeof this.onFableSuccess === 'function') {
-            try {
-              this.onFableSuccess({ selected, model })
-            } catch {}
-          }
-          bindAll({
-            accountId: selected.accountId,
-            vmId: selected.vmId,
-          })
-          return {
-            ...result,
-            accountId: selected.accountId,
-            vmId: selected.vmId,
-            attemptCount: attemptNo,
-            finalState: 'verified',
-          }
-        }
-        if (policy.action === 'repair-and-retry' && !repaired && !result?.committed) {
-          repaired = true
-          requestBody = repairAnthropicRequest(requestBody, policy)
+        const familyHome = familyKey ? this.stickyRouter?.resolve?.(familyKey) : null
+        const familySpilled = !!familyHome?.accountId && spilled.has(familyHome.accountId)
+        if (!selected?.ok && selected?.reason === 'family_vm_unavailable' && familyVmId && !familySpilled) {
+          // Whole family moves off a gated VM: drop the family pin so the next
+          // bind takes the new VM. Session pins on the old VM are released by
+          // the scheduler once that VM is no longer eligible.
+          if (familyKey) this.stickyRouter?.unbind?.(familyKey)
+          familyVmId = null
+          attemptNo -= 1
           continue
         }
-        applyCooldown(this.scheduler, selected, policy, model, this.stickyRouter, { diagnosticPin: !!pinVmId })
-        if (!pinVmId && isCredentialDeath(policy)) {
-          this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
-          if (familyKey) {
+        if (!selected?.ok && selected?.reason === 'fable_requires_max') {
+          return fableRequiresMaxError({
+            wait_ms: selected?.waitMs ?? selected?.wait_ms ?? 0,
+            eligible: selected?.eligible ?? 0,
+            available: selected?.available ?? 0,
+            attempt_count: attemptNo - 1,
+          })
+        }
+
+        if (!selected?.ok) {
+          const exhausted = poolError('account_pool_exhausted', 'No eligible Claude accounts remain', {
+            excluded_accounts: [...excluded],
+            reason: selected?.reason || 'no_eligible_accounts',
+            wait_ms: selected?.waitMs ?? selected?.wait_ms ?? 0,
+            soonest_available_ms: selected?.soonest_available_ms ?? null,
+            wait_reasons: selected?.wait_reasons || [],
+            eligible: selected?.eligible ?? 0,
+            available: selected?.available ?? 0,
+            sticky_cleared: !!selected?.sticky_cleared,
+            attempt_count: attemptNo - 1,
+            last_reason: lastPolicy?.reason || null,
+            last_status: lastResult?.status ?? null,
+          })
+          return preferLastResult(lastResult, lastPolicy, exhausted, { attemptCount: attemptNo - 1 })
+        }
+        pinnedSlot = selected.slotIndex ?? null
+        bindAll(
+          {
+            accountId: selected.accountId,
+            vmId: selected.vmId,
+            slotIndex: pinnedSlot,
+          },
+          { countHit: false },
+        )
+        // An explicit VM pin outranks the family home. Without this, a pinned
+        // request reselects the same VM against a family locked elsewhere.
+        if (familyKey && !pinVmId) {
+          const locked = this.stickyRouter.resolve?.(familyKey)
+          if (locked?.vmId && locked.vmId !== selected.vmId) {
+            // The reservation is released only in the attempt's finally; this
+            // redirect never reaches it, so hand the seat back before reselecting.
+            selected.release?.()
+            familyVmId = locked.vmId
+            continue
+          }
+        }
+        const attemptStarted = Date.now()
+        this.attemptsRepo?.begin?.({
+          requestId,
+          attemptNo,
+          vmId: selected.vmId,
+          accountId: selected.accountId,
+          model,
+          selectionReason: selected.selectionReason,
+          waitMs: selected.waitMs,
+        })
+        let result
+        let policy
+        let committed = false
+        try {
+          const prepared =
+            typeof applyAttempt === 'function'
+              ? await applyAttempt(clone(requestBody), selected, {
+                  attemptNo,
+                  repaired,
+                  attemptStartedAt: attemptStarted,
+                  freshSlot,
+                })
+              : clone(requestBody)
+          const wrappedAttempt =
+            prepared &&
+            typeof prepared === 'object' &&
+            Object.prototype.hasOwnProperty.call(prepared, 'body') &&
+            Object.prototype.hasOwnProperty.call(prepared, 'meta')
+          const body = wrappedAttempt ? prepared.body : prepared
+          const attemptMeta = wrappedAttempt ? prepared.meta : null
+          if (attemptMeta?.sessionId) {
+            outboundSessionId = String(attemptMeta.sessionId)
+            outboundSessionAccountId = selected.accountId
+            bindAll(
+              { accountId: selected.accountId, vmId: selected.vmId, sessionId: outboundSessionId },
+              { countHit: false },
+            )
+          }
+          result = await callAttempt({
+            candidate: selected,
+            body,
+            attemptMeta,
+            attemptNo,
+            stream,
+            deliveryMode: deliveryMode || this.config.delivery_mode,
+            signal,
+            onCommit: () => {
+              committed = true
+            },
+          })
+          if (result) result.committed = result.committed || committed
+          if (signal?.aborted || isClientCancelledResult(result)) {
+            this.attemptsRepo?.complete?.(requestId, attemptNo, {
+              upstreamStatus: result?.status ?? null,
+              errorScope: 'request',
+              action: 'stop',
+              downstreamCommitted: !!(result?.committed || committed),
+              terminalState: 'cancelled',
+              latencyMs: Date.now() - attemptStarted,
+            })
+            this.abandonCancelledSlot(selected, bindKeys, idleExecs)
+            return {
+              ...clientCancelledResult(result),
+              via: result?.via || 'pool-failover',
+              accountId: selected.accountId,
+              vmId: selected.vmId,
+              attemptCount: attemptNo,
+            }
+          }
+          policy = classifyAttempt(
+            result,
+            selected,
+            {
+              model,
+              repaired,
+              oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
+              signatureRepair: signatureRepairEnabled(this.config, selected),
+            },
+            this.scheduler?.accountQuota,
+          )
+          // One writer for rate_limit_reset_at / overload_until (sub2api HandleUpstreamError).
+          const hardBlock =
+            !result?.committed && !pinVmId
+              ? this.rateLimitService?.handleUpstreamError?.({
+                  accountId: selected.accountId,
+                  vmId: selected.vmId,
+                  result,
+                  policy,
+                }) || null
+              : null
+          if (hardBlock?.until && policy.action === 'continue-and-cooldown' && policy.scope === 'account') {
+            policy = { ...policy, cooldownUntil: hardBlock.until }
+          }
+
+          lastResult = result
+          lastPolicy = policy
+          this.noteUnitHealth(selected, policy, result)
+          notifyProxyFailure(this.onProxyFailure, selected, policy)
+          if (policy.reason === 'fable_plan_denied' && typeof this.onFablePlanDenied === 'function') {
+            try {
+              this.onFablePlanDenied({ selected, policy })
+            } catch {}
+          }
+          const terminalState = result?.terminalState || (result?.ok ? 'unknown' : 'error')
+          this.attemptsRepo?.complete?.(requestId, attemptNo, {
+            upstreamStatus: result?.status ?? null,
+            errorScope: policy.scope,
+            action: policy.action,
+            cooldownUntil: policy.cooldownUntil,
+            downstreamCommitted: result?.committed || committed,
+            terminalState,
+            usage: usageOf(result),
+            ttftMs: result?.ttftMs ?? null,
+            latencyMs: Date.now() - attemptStarted,
+          })
+          if (typeof onAttempt === 'function') {
+            await onAttempt({ attemptNo, selected, result, policy })
+          }
+          if (policy.reason === 'content_filter_refusal') {
+            this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
+            bindAll({
+              accountId: selected.accountId,
+              vmId: selected.vmId,
+            })
+            return {
+              ...result,
+              accountId: selected.accountId,
+              vmId: selected.vmId,
+              attemptCount: attemptNo,
+              finalState: 'content_filter',
+              policy,
+            }
+          }
+          if (verifiedSuccess(result)) {
+            this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
+            if (isFableModel(model) && typeof this.onFableSuccess === 'function') {
+              try {
+                this.onFableSuccess({ selected, model })
+              } catch {}
+            }
+            bindAll({
+              accountId: selected.accountId,
+              vmId: selected.vmId,
+            })
+            return {
+              ...result,
+              accountId: selected.accountId,
+              vmId: selected.vmId,
+              attemptCount: attemptNo,
+              finalState: 'verified',
+            }
+          }
+          if (policy.action === 'repair-and-retry' && !repaired && !result?.committed) {
+            repaired = true
+            requestBody = repairAnthropicRequest(requestBody, policy)
+            continue
+          }
+          applyCooldown(this.scheduler, selected, policy, model, this.stickyRouter, { diagnosticPin: !!pinVmId })
+          if (!pinVmId && isCredentialDeath(policy)) {
+            this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
+            if (familyKey) {
+              return {
+                ...result,
+                accountId: selected.accountId,
+                vmId: selected.vmId,
+                attemptCount: attemptNo,
+                finalState: result?.terminalState || 'rejected',
+                policy,
+              }
+            }
+          }
+          if (!shouldContinue(policy)) {
             return {
               ...result,
               accountId: selected.accountId,
@@ -729,137 +799,136 @@ export class FailoverRunner {
               policy,
             }
           }
-        }
-        if (!shouldContinue(policy)) {
-          return {
-            ...result,
-            accountId: selected.accountId,
-            vmId: selected.vmId,
-            attemptCount: attemptNo,
-            finalState: result?.terminalState || 'rejected',
-            policy,
-          }
-        }
-        policy = await this.recoverCredential(selected, policy)
-        const hopMs = Date.now() - attemptStarted
-        if (isRetryableEmptyHop(policy)) {
-          const canRetry =
-            emptyHopReleased(result) &&
-            budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)
-          if (!canRetry) return incompleteHopResult(result, selected, policy, attemptNo)
-          budget.noteSameUnit(selected.accountId)
-          try {
-            await sleepWithSignal(this.config.same_account_retry_delay_ms, signal)
-          } catch {
-            return {
-              ...clientCancelledResult(result),
-              via: 'pool-failover',
-              accountId: selected.accountId,
-              vmId: selected.vmId,
-              attemptCount: attemptNo,
+          policy = await this.recoverCredential(selected, policy)
+          const hopMs = Date.now() - attemptStarted
+          if (isRetryableEmptyHop(policy)) {
+            if (!emptyHopReleased(result) || pinVmId) return incompleteHopResult(result, selected, policy, attemptNo)
+            if (!Number.isInteger(selected.slotIndex)) return incompleteHopResult(result, selected, policy, attemptNo)
+            this.quarantineSlot(selected, bindKeys)
+            this.rememberIdleRestart(selected, idleExecs)
+            const cap = Number(selected.sessionSlots) || 20
+            if (this.scheduler.slotsExhausted?.(selected.vmId, cap)) {
+              this.scheduler.markSlotsOverload?.(selected.vmId, selected.accountId)
+              if (!cliRestarted) {
+                cliRestarted = true
+                freshSlot = true
+                if (typeof this.recoverSlot === 'function') {
+                  try {
+                    await this.recoverSlot(selected.exec || { vmId: selected.vmId, vm: { id: selected.vmId } })
+                  } catch {}
+                }
+                this.scheduler.clearSlotsOverload?.(selected.vmId, selected.accountId)
+                if (signal?.aborted) {
+                  return {
+                    ...clientCancelledResult(result),
+                    via: 'pool-failover',
+                    accountId: selected.accountId,
+                    vmId: selected.vmId,
+                    attemptCount: attemptNo,
+                  }
+                }
+                continue
+              }
+              return incompleteHopResult(result, selected, policy, attemptNo)
             }
+            freshSlot = true
+            continue
           }
-          continue
-        }
-        if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
-          budget.noteSameUnit(selected.accountId)
-          try {
-            await sleepWithSignal(this.config.same_account_retry_delay_ms, signal)
-          } catch {
-            return {
-              ...clientCancelledResult(result),
-              via: 'pool-failover',
-              accountId: selected.accountId,
-              vmId: selected.vmId,
-              attemptCount: attemptNo,
+          if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
+            budget.noteSameUnit(selected.accountId)
+            try {
+              await sleepWithSignal(this.config.same_account_retry_delay_ms, signal)
+            } catch {
+              return {
+                ...clientCancelledResult(result),
+                via: 'pool-failover',
+                accountId: selected.accountId,
+                vmId: selected.vmId,
+                attemptCount: attemptNo,
+              }
             }
+            continue
           }
-          continue
-        }
 
-        const switchesExhausted = budget.noteSwitch(selected.accountId, selected.vmId, {
-          spill: policy.reason === 'slot_busy',
-        })
-        if (switchesExhausted) {
-          const exhausted = poolError('max_account_switches_exceeded', 'Maximum account switches exceeded', {
-            attempt_count: attemptNo,
-            last_scope: policy.scope,
+          const switchesExhausted = budget.noteSwitch(selected.accountId, selected.vmId, {
+            spill: policy.reason === 'slot_busy',
           })
-          const unfinished = unfinishedExhausted(result, policy, exhausted, {
-            accountId: selected.accountId,
-            vmId: selected.vmId,
-            attemptCount: attemptNo,
-          })
-          if (unfinished) return unfinished
-          return preferLastResult(result, policy, exhausted, {
-            accountId: selected.accountId,
-            vmId: selected.vmId,
-            attemptCount: attemptNo,
-          })
-        }
-      } catch (error) {
-        if (signal?.aborted || error?.code === 'selection_cancelled' || error?.code === 'request_cancelled') {
-          return {
-            ...clientCancelledResult({ committed }),
-            via: 'pool-failover',
-            accountId: selected.accountId,
-            vmId: selected.vmId,
-            attemptCount: attemptNo,
+          if (switchesExhausted) {
+            const exhausted = poolError('max_account_switches_exceeded', 'Maximum account switches exceeded', {
+              attempt_count: attemptNo,
+              last_scope: policy.scope,
+            })
+            const unfinished = unfinishedExhausted(result, policy, exhausted, {
+              accountId: selected.accountId,
+              vmId: selected.vmId,
+              attemptCount: attemptNo,
+            })
+            if (unfinished) return unfinished
+            return preferLastResult(result, policy, exhausted, {
+              accountId: selected.accountId,
+              vmId: selected.vmId,
+              attemptCount: attemptNo,
+            })
           }
-        }
-        result = {
-          ok: false,
-          status: 0,
-          transportError: true,
-          committed,
-          terminalState: committed ? 'incomplete' : 'transport_error',
-          body: {
-            type: 'error',
-            error: {
-              type: 'worker_error',
-              code: error.code || 'attempt_failed',
-              message: String(error.message || error).slice(0, 300),
+        } catch (error) {
+          if (signal?.aborted || error?.code === 'selection_cancelled' || error?.code === 'request_cancelled') {
+            this.attemptsRepo?.complete?.(requestId, attemptNo, {
+              upstreamStatus: 0,
+              errorScope: 'request',
+              action: 'stop',
+              downstreamCommitted: !!committed,
+              terminalState: 'cancelled',
+              latencyMs: Date.now() - attemptStarted,
+            })
+            this.abandonCancelledSlot(selected, bindKeys, idleExecs)
+            return {
+              ...clientCancelledResult({ committed }),
+              via: 'pool-failover',
+              accountId: selected.accountId,
+              vmId: selected.vmId,
+              attemptCount: attemptNo,
+            }
+          }
+          result = {
+            ok: false,
+            status: 0,
+            transportError: true,
+            committed,
+            terminalState: committed ? 'incomplete' : 'transport_error',
+            body: {
+              type: 'error',
+              error: {
+                type: 'worker_error',
+                code: error.code || 'attempt_failed',
+                message: String(error.message || error).slice(0, 300),
+              },
             },
-          },
-        }
-        policy = classifyAttempt(
-          result,
-          selected,
-          {
-            model,
-            repaired,
-            oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
-            signatureRepair: signatureRepairEnabled(this.config, selected),
-          },
-          this.scheduler?.accountQuota,
-        )
-        lastResult = result
-        lastPolicy = policy
-        this.noteUnitHealth(selected, policy, result)
-        notifyProxyFailure(this.onProxyFailure, selected, policy)
-        this.attemptsRepo?.complete?.(requestId, attemptNo, {
-          upstreamStatus: 0,
-          errorScope: policy.scope,
-          action: policy.action,
-          cooldownUntil: policy.cooldownUntil,
-          downstreamCommitted: committed,
-          terminalState: result.terminalState,
-          latencyMs: Date.now() - attemptStarted,
-        })
-        if (committed || !shouldContinue(policy)) {
-          return {
-            ...result,
-            accountId: selected.accountId,
-            vmId: selected.vmId,
-            attemptCount: attemptNo,
-            finalState: result.terminalState,
-            policy,
           }
-        }
-        applyCooldown(this.scheduler, selected, policy, model, this.stickyRouter, { diagnosticPin: !!pinVmId })
-        if (!pinVmId && isCredentialDeath(policy)) {
-          this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
-          if (familyKey) {
+          policy = classifyAttempt(
+            result,
+            selected,
+            {
+              model,
+              repaired,
+              oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
+              signatureRepair: signatureRepairEnabled(this.config, selected),
+            },
+            this.scheduler?.accountQuota,
+          )
+          lastResult = result
+          lastPolicy = policy
+          this.noteUnitHealth(selected, policy, result)
+          notifyProxyFailure(this.onProxyFailure, selected, policy)
+          this.attemptsRepo?.complete?.(requestId, attemptNo, {
+            upstreamStatus: 0,
+            errorScope: policy.scope,
+            action: policy.action,
+            cooldownUntil: policy.cooldownUntil,
+            downstreamCommitted: committed,
+            terminalState: result.terminalState,
+            latencyMs: Date.now() - attemptStarted,
+          })
+          if (committed || !shouldContinue(policy)) {
             return {
               ...result,
               accountId: selected.accountId,
@@ -869,36 +938,52 @@ export class FailoverRunner {
               policy,
             }
           }
-        }
-        policy = await this.recoverCredential(selected, policy)
-        const hopMs = Date.now() - attemptStarted
-        if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
-          budget.noteSameUnit(selected.accountId)
-          try {
-            await sleepWithSignal(this.config.same_account_retry_delay_ms, signal)
-          } catch {
-            return {
-              ...clientCancelledResult({ committed }),
-              via: 'pool-failover',
-              accountId: selected.accountId,
-              vmId: selected.vmId,
-              attemptCount: attemptNo,
+          applyCooldown(this.scheduler, selected, policy, model, this.stickyRouter, { diagnosticPin: !!pinVmId })
+          if (!pinVmId && isCredentialDeath(policy)) {
+            this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
+            if (familyKey) {
+              return {
+                ...result,
+                accountId: selected.accountId,
+                vmId: selected.vmId,
+                attemptCount: attemptNo,
+                finalState: result.terminalState,
+                policy,
+              }
             }
           }
-          continue
+          policy = await this.recoverCredential(selected, policy)
+          const hopMs = Date.now() - attemptStarted
+          if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
+            budget.noteSameUnit(selected.accountId)
+            try {
+              await sleepWithSignal(this.config.same_account_retry_delay_ms, signal)
+            } catch {
+              return {
+                ...clientCancelledResult({ committed }),
+                via: 'pool-failover',
+                accountId: selected.accountId,
+                vmId: selected.vmId,
+                attemptCount: attemptNo,
+              }
+            }
+            continue
+          }
+          budget.noteSwitch(selected.accountId, selected.vmId, {
+            spill: policy.reason === 'slot_busy',
+          })
+        } finally {
+          selected.release?.()
         }
-        budget.noteSwitch(selected.accountId, selected.vmId, {
-          spill: policy.reason === 'slot_busy',
-        })
-      } finally {
-        selected.release?.()
       }
+      const attemptsExhausted = poolError('attempts_exhausted', 'Maximum account attempts exhausted', {
+        max_attempts: this.config.max_total_attempts,
+      })
+      const unfinished = unfinishedExhausted(lastResult, lastPolicy, attemptsExhausted)
+      if (unfinished) return unfinished
+      return preferLastResult(lastResult, lastPolicy, attemptsExhausted)
+    } finally {
+      this.flushIdleSlotRestart(idleExecs)
     }
-    const attemptsExhausted = poolError('attempts_exhausted', 'Maximum account attempts exhausted', {
-      max_attempts: this.config.max_total_attempts,
-    })
-    const unfinished = unfinishedExhausted(lastResult, lastPolicy, attemptsExhausted)
-    if (unfinished) return unfinished
-    return preferLastResult(lastResult, lastPolicy, attemptsExhausted)
   }
 }
