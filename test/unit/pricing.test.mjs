@@ -179,6 +179,48 @@ test('GPT-5.6-sol bills uncached input plus official cache write', () => {
   assert.equal(c.total_cost, 0.0005725)
 })
 
+test('GPT-6 Sol and Luna use the official standard rates', () => {
+  const sol = calculateCost(
+    {
+      input_tokens: 3_000_000,
+      output_tokens: 1_000_000,
+      input_tokens_details: { cached_tokens: 1_000_000, cache_write_tokens: 1_000_000 },
+    },
+    'gpt-6-sol',
+  )
+  assert.equal(sol.known, true)
+  assert.equal(sol.pricing_key, 'gpt-6-sol')
+  assert.equal(sol.input_cost, 2)
+  assert.equal(sol.output_cost, 10)
+  assert.equal(sol.cache_read_cost, 0.2)
+  assert.equal(sol.cache_creation_cost, 2.5)
+  assert.equal(sol.total_cost, 14.7)
+
+  const luna = calculateCost({ input_tokens: 1_000_000, output_tokens: 1_000_000 }, 'gpt-6-luna')
+  assert.equal(luna.known, true)
+  assert.equal(luna.pricing_key, 'gpt-6-luna')
+  assert.equal(luna.input_cost, 0.1)
+  assert.equal(luna.output_cost, 0.5)
+  assert.equal(luna.total_cost, 0.6)
+})
+
+test('GPT-6 Sol and Luna use the published Flex and Fast bands', () => {
+  const solFlex = calculateCost(
+    { input_tokens: 1_000_000, output_tokens: 1_000_000, service_tier: 'flex' },
+    'gpt-6-sol',
+  )
+  assert.equal(solFlex.known, true)
+  assert.equal(solFlex.total_cost, 6)
+
+  const lunaFast = calculateCost(
+    { input_tokens: 1_000_000, output_tokens: 1_000_000, service_tier: 'priority' },
+    'gpt-6-luna',
+  )
+  assert.equal(lunaFast.known, true)
+  assert.equal(lunaFast.service_tier, 'fast')
+  assert.equal(lunaFast.total_cost, 1.2)
+})
+
 test('gpt-reserve has no published price and stays unbilled', () => {
   const c = calculateCost({ input_tokens: 100, output_tokens: 10 }, 'gpt-reserve')
   assert.equal(c.known, false)
