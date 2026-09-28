@@ -89,7 +89,7 @@ test('fetchChatgptModelCatalog hits /codex/models and does not treat 401 as succ
   assert.equal(ok.models[0].display_name, 'GPT-5.6')
   assert.match(String(calls[0].url), /\/backend-api\/codex\/models/)
   assert.equal(calls[0].headers.authorization, 'Bearer tok')
-  assert.equal(calls[0].headers.originator, 'Codex Desktop')
+  assert.equal(calls[0].headers.originator, 'codex_cli_rs')
   assert.equal(calls[0].headers['chatgpt-account-id'], 'acct')
   assert.equal(CODEX_MODELS_URL, CHATGPT_MODELS_URL)
 
