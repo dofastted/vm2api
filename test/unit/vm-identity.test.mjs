@@ -115,18 +115,19 @@ test('telemetry off writes kill-switch keys; telemetry on deletes them', () => {
   assert.equal(id.settings.env.CLAUDE_CODE_USE_BEDROCK, undefined)
   assert.equal(id.settings.env.CLAUDE_CODE_USE_VERTEX, undefined)
   assert.equal(id.settings.env.DO_NOT_TRACK, undefined)
+  assert.equal(id.settings.env.CLAUDE_CODE_GATEWAY_HINT_HEADERS, '1')
   assert.equal(id.settings.grove_enabled, false)
 })
 
-test('loadVmIdentity pins outbound UA to CLI 2.1.281', () => {
+test('loadVmIdentity pins outbound UA to CLI 2.1.284', () => {
   const id = loadVmIdentity({
     vmId: 'vm-29',
     homeDir: '/tmp/does-not-exist-kin',
     vm: { id: 'vm-29', timezone: 'America/Los_Angeles', locale: 'en_US.UTF-8' },
   })
-  assert.equal(id.cliVersion, '2.1.281')
-  assert.equal(id.userAgent, 'claude-cli/2.1.281 (external, sdk-cli)')
-  assert.equal(id.fingerprint.user_agent, 'claude-cli/2.1.281 (external, sdk-cli)')
+  assert.equal(id.cliVersion, '2.1.284')
+  assert.equal(id.userAgent, 'claude-cli/2.1.284 (external, sdk-cli)')
+  assert.equal(id.fingerprint.user_agent, 'claude-cli/2.1.284 (external, sdk-cli)')
   assert.equal(id.fingerprint.stainless_runtime_version, 'v26.3.0')
   assert.equal(id.fingerprint.stainless_package_version, '0.112.1')
   assert.equal(id.fingerprint.stainless_lang, 'js')

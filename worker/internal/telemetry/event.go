@@ -31,8 +31,8 @@ const (
 	defaultClientType  = "cli"
 	defaultTerminal    = "unknown"
 	defaultPlatform    = "linux"
-	officialCLIVersion = "2.1.281"
-	// Claude Code 2.1.281 official main Messages order, no context-1m.
+	officialCLIVersion = "2.1.284"
+	// Claude Code 2.1.284 official main Messages order, no context-1m. Same 13 betas as 2.1.281.
 	// Lockstep with fullClaudeCodeMimicryBetas() in claude-code-betas.mjs.
 	officialMainBetas = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,advanced-tool-use-2025-11-20,mid-conversation-system-clear-at-2026-08-21,effort-2025-11-24,thinking-binding-controls-2026-08-01,extended-cache-ttl-2025-04-11,cache-diagnosis-2026-04-07"
 )

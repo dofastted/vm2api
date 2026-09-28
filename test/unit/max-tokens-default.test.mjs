@@ -6,7 +6,8 @@ import { toClaudeMessages } from '../../src/lib/protocol/convert.mjs'
 
 test('missing max_tokens follows official per-model defaults', () => {
   assert.equal(defaultMaxTokensForModel('claude-haiku-4-5'), 8192)
-  assert.equal(defaultMaxTokensForModel('claude-sonnet-5'), 16384)
+  assert.equal(defaultMaxTokensForModel('claude-sonnet-5'), 64000)
+  assert.equal(defaultMaxTokensForModel('claude-sonnet-5-5'), 128000)
   assert.equal(defaultMaxTokensForModel('claude-opus-5'), 32000)
   assert.equal(defaultMaxTokensForModel('claude-opus-5-5'), 128000)
   assert.equal(defaultMaxTokensForModel('claude-opus-5.5'), 128000)
@@ -19,7 +20,7 @@ test('sanitize fills model default and never overwrites inbound', () => {
     model: 'claude-sonnet-5',
     messages: [{ role: 'user', content: 'hi' }],
   })
-  assert.equal(filled.max_tokens, 16384)
+  assert.equal(filled.max_tokens, 64000)
 
   const kept = sanitizeAnthropicBody({
     model: 'claude-sonnet-5',

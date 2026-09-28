@@ -149,14 +149,14 @@ func TestEventUsesConfiguredEnvAnd278Betas(t *testing.T) {
 	fallback := InitEvent(Identity{}, time.Date(2026, 8, 23, 1, 0, 0, 0, time.UTC))
 	raw, _ = json.Marshal(fallback)
 	body = string(raw)
-	if !strings.Contains(body, "thinking-binding-controls-2026-08-01") || !strings.Contains(body, `"version":"2.1.281"`) {
+	if !strings.Contains(body, "thinking-binding-controls-2026-08-01") || !strings.Contains(body, `"version":"2.1.284"`) {
 		t.Fatalf("fallback=%s", body)
 	}
 	if !strings.Contains(body, "advanced-tool-use-2025-11-20") || !strings.Contains(body, "mid-conversation-system-clear-at-2026-08-21") {
 		t.Fatalf("fallback betas=%s", body)
 	}
 	attrs := GrowthbookEval(Identity{UserID: "u"})["attributes"].(map[string]any)
-	if attrs["appVersion"] != "2.1.281" {
+	if attrs["appVersion"] != "2.1.284" {
 		t.Fatalf("appVersion=%v", attrs["appVersion"])
 	}
 }

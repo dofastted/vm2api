@@ -99,7 +99,7 @@ test('empty unofficial system still writes official 4 blocks', () => {
   assert.equal(out.system[0].cache_control, undefined)
   assert.match(
     out.system[0].text,
-    /^x-anthropic-billing-header: cc_version=2\.1\.281\.[0-9a-f]{3}; cc_entrypoint=sdk-cli; cch=[0-9a-f]{5}; cc_prompt_id=[0-9a-f-]{36};$/,
+    /^x-anthropic-billing-header: cc_version=2\.1\.284\.[0-9a-f]{3}; cc_entrypoint=sdk-cli; cch=[0-9a-f]{5}; cc_prompt_id=[0-9a-f-]{36}; cc_turn_origin=sdk; cc_prompt_index=0; cc_turn_index=1;$/,
   )
   assert.equal(out.system[1].text, CRS_OFFICIAL_SYSTEM)
   assert.equal(out.system[1].cache_control, undefined)

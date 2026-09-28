@@ -255,7 +255,7 @@ function makeStrictOAuthFetch(seen, opts = {}) {
       seen.push({ stage: 'token' })
       const body = JSON.parse(init.body)
       assert.equal(init.method, 'POST')
-      assert.equal(headers['user-agent'] || headers['User-Agent'], 'claude-cli/2.1.281 (external, sdk-cli)')
+      assert.equal(headers['user-agent'] || headers['User-Agent'], 'claude-cli/2.1.284 (external, sdk-cli)')
       assert.equal(headers['x-app'], 'cli')
       assert.equal(body.grant_type, 'authorization_code')
       assert.equal(body.redirect_uri, REDIRECT_URI)
@@ -278,7 +278,7 @@ function makeStrictOAuthFetch(seen, opts = {}) {
     if (url === 'https://api.anthropic.com/api/claude_cli/bootstrap?entrypoint=claude-vscode&model=claude-opus-5') {
       seen.push({ stage: 'bootstrap' })
       assert.equal(init.method, 'GET')
-      assert.equal(headers['user-agent'], 'claude-cli/2.1.281 (external, sdk-cli)')
+      assert.equal(headers['user-agent'], 'claude-cli/2.1.284 (external, sdk-cli)')
       assert.equal(headers['x-app'], 'cli')
       assert.equal(headers['anthropic-beta'], 'oauth-2025-04-20')
       assert.equal(headers.authorization, 'Bearer sk-ant-oat01-token')
@@ -293,7 +293,7 @@ function makeStrictOAuthFetch(seen, opts = {}) {
     if (url === 'https://platform.claude.com/api/oauth/account/settings') {
       seen.push({ stage: 'grove' })
       assert.equal(init.method, 'PATCH')
-      assert.equal(headers['user-agent'], 'claude-cli/2.1.281 (external, sdk-cli)')
+      assert.equal(headers['user-agent'], 'claude-cli/2.1.284 (external, sdk-cli)')
       assert.deepEqual(JSON.parse(init.body), { grove_enabled: true })
       if (opts.groveStatus) return response(opts.groveStatus, { error: 'unsupported path' })
       return response(200, { ok: true })

@@ -87,7 +87,10 @@ export function buildSlotSettingsEnv(pol = {}, { timezone, locale, extra } = {})
   }
   if (!isTelemetryEnabled(pol) && pol.do_not_track !== false) env.DO_NOT_TRACK = '1'
   else delete env.DO_NOT_TRACK
-  return applyRequiredSeedEnv(env, pol)
+  const out = applyRequiredSeedEnv(env, pol)
+  // 2.1.283+ sends x-claude-code-prompt-id only when this is set. Default on.
+  out.CLAUDE_CODE_GATEWAY_HINT_HEADERS = '1'
+  return out
 }
 
 export function buildSeedSettingsEnv(pol = {}, extra = {}) {

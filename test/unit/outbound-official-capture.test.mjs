@@ -166,9 +166,9 @@ const CAPTURE_281_FIRST_USER = (() => {
   return buf.toString('utf8')
 })()
 
-test('outbound headers align with Claude Code 2.1.281 capture', () => {
-  assert.equal(OFFICIAL_CLI_VERSION, '2.1.281')
-  assert.equal(DEFAULT_CLI_VERSION, '2.1.281')
+test('outbound headers align with Claude Code 2.1.284 and keep the 2.1.281 fingerprint vector', () => {
+  assert.equal(OFFICIAL_CLI_VERSION, '2.1.284')
+  assert.equal(DEFAULT_CLI_VERSION, '2.1.284')
   assert.equal(computeClaudeCodeFingerprint(CAPTURE_281_FIRST_USER, '2.1.281'), '6f0')
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-281-'))
   const identity = loadVmIdentity({
@@ -201,7 +201,7 @@ test('outbound headers align with Claude Code 2.1.281 capture', () => {
     firstUserText: CAPTURE_281_FIRST_USER,
   })
   const { headers, body } = envelope
-  assert.equal(headers['user-agent'], 'claude-cli/2.1.281 (external, sdk-cli)')
+  assert.equal(headers['user-agent'], 'claude-cli/2.1.284 (external, sdk-cli)')
   assert.equal(headers['anthropic-version'], '2023-06-01')
   assert.equal(headers['x-app'], 'cli')
   assert.equal(headers['anthropic-dangerous-direct-browser-access'], 'true')
@@ -215,7 +215,11 @@ test('outbound headers align with Claude Code 2.1.281 capture', () => {
   assert.equal(headers['x-stainless-timeout'], '600')
   assert.deepEqual(String(headers['anthropic-beta'] || '').split(','), CAPTURE_BETAS)
   assert.equal(CAPTURE_BETAS.length, 13)
-  assert.match(body.system[0].text, /cc_version=2\.1\.281\.6f0/)
+  assert.match(
+    body.system[0].text,
+    new RegExp(`cc_version=2\\.1\\.284\\.${computeClaudeCodeFingerprint(CAPTURE_281_FIRST_USER, '2.1.284')}`),
+  )
+  assert.match(body.system[0].text, /cc_prompt_index=0; cc_turn_index=1;/)
   const uid = JSON.parse(body.metadata.user_id)
   assert.equal(headers['x-claude-code-session-id'], uid.session_id)
   fs.rmSync(dir, { recursive: true, force: true })

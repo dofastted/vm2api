@@ -175,7 +175,7 @@ func userAgent(cfg config.Config) string {
 	if version := strings.TrimSpace(cfg.Telemetry.Identity.CLIVersion); version != "" {
 		return "claude-cli/" + version + " (external, cli)"
 	}
-	return "claude-cli/2.1.281 (external, cli)"
+	return "claude-cli/2.1.284 (external, cli)"
 }
 
 func mergeHeaders(base, extra map[string]string) map[string]string {

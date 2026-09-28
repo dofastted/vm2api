@@ -77,7 +77,7 @@ export const CRS_OFFICIAL_CLI_SYSTEM = "You are Claude Code, Anthropic's officia
 export const CRS_OFFICIAL_SYSTEM = CRS_OFFICIAL_AGENT_IDENTITY
 /** 0注入 prompt_version 短身份句。cl100k 计 8 token，必带 Anthropic 与 Claude。 */
 export const CRS_COMPACT_IDENTITY = 'You are Anthropic Claude Agent SDK.'
-export const DEFAULT_CLI_VERSION = '2.1.281'
+export const DEFAULT_CLI_VERSION = '2.1.284'
 export const PERSONA_MODES = Object.freeze(['rewrite', 'official_prompt', 'overwrite', 'zero', 'append', 'none'])
 export const DEFAULT_PERSONA_MODE = 'rewrite'
 export const DEFAULT_PERSONA_PARK = true
@@ -335,6 +335,41 @@ export function billingPromptId(sessionId = '', firstUserText = '', cliVersion =
   return uuidFromSeed(raw || `prompt:${ver}:${fp}`)
 }
 
+const BILLING_INDEX_MAX = 1e7
+
+function boundedBillingIndex(value, min) {
+  const n = typeof value === 'number' ? value : Number(value)
+  if (!Number.isInteger(n) || n < min || n > BILLING_INDEX_MAX) return null
+  return n
+}
+
+/** 2.1.284 appends both indexes, or neither. Entrypoint stays sdk-cli. */
+export function billingTurnSuffix(promptIndex, turnIndex) {
+  const prompt = boundedBillingIndex(promptIndex, 0)
+  const turn = boundedBillingIndex(turnIndex, 1)
+  if (prompt == null || turn == null) return ''
+  return ` cc_turn_origin=sdk; cc_prompt_index=${prompt}; cc_turn_index=${turn};`
+}
+
+function toolResultOnlyMessage(message) {
+  const content = message?.content
+  if (!Array.isArray(content) || content.length === 0) return false
+  return content.every((block) => block && typeof block === 'object' && block.type === 'tool_result')
+}
+
+/** promptIndex is the latest user prompt. turnIndex is the upcoming model turn. */
+export function billingIndexesFromMessages(messages) {
+  if (!Array.isArray(messages)) return null
+  let prompts = 0
+  let assistants = 0
+  for (const message of messages) {
+    if (message?.role === 'assistant') assistants += 1
+    else if (message?.role === 'user' && !toolResultOnlyMessage(message)) prompts += 1
+  }
+  if (prompts < 1) return null
+  return { promptIndex: prompts - 1, turnIndex: assistants + 1 }
+}
+
 const BILLING_PROMPT_ID_RE = /cc_prompt_id=[^;\s]*/g
 
 /** Point an owned billing header at the outbound session. No-op if absent. */
@@ -366,11 +401,17 @@ export function stampBillingPromptId(body, sessionId, firstUserText = '') {
   return changed ? { ...body, system } : body
 }
 
-export function buildBillingAttributionText(firstUserText, cliVersion = DEFAULT_CLI_VERSION, sessionId = '') {
+export function buildBillingAttributionText(
+  firstUserText,
+  cliVersion = DEFAULT_CLI_VERSION,
+  sessionId = '',
+  indexes = null,
+) {
   const ver = parseCliVersion(cliVersion)
   const fp = computeClaudeCodeFingerprint(firstUserText ?? '', ver)
   const promptId = billingPromptId(sessionId, firstUserText, ver)
-  return `x-anthropic-billing-header: cc_version=${ver}.${fp}; cc_entrypoint=sdk-cli; cch=${CCH_PLACEHOLDER}; cc_prompt_id=${promptId};`
+  const tail = billingTurnSuffix(indexes?.promptIndex, indexes?.turnIndex)
+  return `x-anthropic-billing-header: cc_version=${ver}.${fp}; cc_entrypoint=sdk-cli; cch=${CCH_PLACEHOLDER}; cc_prompt_id=${promptId};${tail}`
 }
 
 function extractSystemTexts(system) {
@@ -537,9 +578,9 @@ export function extractInboundCwd(body) {
   return extractInboundEnvFacts(body).cwd
 }
 
-function buildBillingAndOfficial(firstUserText, cliVersion, sessionId) {
+function buildBillingAndOfficial(firstUserText, cliVersion, sessionId, indexes = null) {
   return [
-    { type: 'text', text: buildBillingAttributionText(firstUserText, cliVersion, sessionId) },
+    { type: 'text', text: buildBillingAttributionText(firstUserText, cliVersion, sessionId, indexes) },
     { type: 'text', text: CRS_OFFICIAL_SYSTEM },
   ]
 }
@@ -717,7 +758,7 @@ export function officialSystemEnvFromIdentity(identity = {}, modelId = '', facts
       osVersion: inbound.osVersion || ws.os_version,
       kernel: inbound.kernel || ws.linux_kernel,
       osPretty: '',
-      modelId: modelId || 'claude-sonnet-5',
+      modelId: modelId || 'claude-sonnet-5-5',
       timezone: src.timezone || fp.timezone || '',
       locale: src.locale || fp.locale || inbound.locale || '',
     }
@@ -729,7 +770,7 @@ export function officialSystemEnvFromIdentity(identity = {}, modelId = '', facts
     platform: inbound.platform || '',
     osVersion: inbound.osVersion || '',
     kernel: inbound.kernel || '',
-    modelId: modelId || 'claude-sonnet-5',
+    modelId: modelId || 'claude-sonnet-5-5',
     timezone: src.timezone || fp.timezone || '',
     locale: inbound.locale || '',
   }
@@ -755,10 +796,17 @@ export function extractCallerAgentPrompt(system) {
   return out.join('\n\n')
 }
 
-function buildFourBlocks(firstUserText, cliVersion, env, sessionId, sourceTexts = [], { overwrite = false } = {}) {
+function buildFourBlocks(
+  firstUserText,
+  cliVersion,
+  env,
+  sessionId,
+  sourceTexts = [],
+  { overwrite = false, indexes = null } = {},
+) {
   const ttl = DEFAULT_CACHE_CONTROL_TTL
   return [
-    ...buildBillingAndOfficial(firstUserText, cliVersion, sessionId),
+    ...buildBillingAndOfficial(firstUserText, cliVersion, sessionId, indexes),
     overwrite
       ? {
           type: 'text',
@@ -1588,14 +1636,15 @@ function rewriteOfficialSystem(
   const messages = Array.isArray(body.messages) ? body.messages : []
   const firstUserText = extractFirstUserText(messages)
   const ver = parseCliVersion(cliVersion)
+  const indexes = billingIndexesFromMessages(messages)
   const extras = park ? collectPersonaRuleAppends(body, messages, routingFile) : []
   const { env, sourceTexts } = personaEnvForBody(body, { identity, model, overwrite })
   const leftover = collectCallerSystemAppend(body)
   let system
   if (shouldAttachSystemExpansion(body, routingFile)) {
-    system = buildFourBlocks(firstUserText, ver, env, sessionId, sourceTexts, { overwrite })
+    system = buildFourBlocks(firstUserText, ver, env, sessionId, sourceTexts, { overwrite, indexes })
   } else {
-    system = buildBillingAndOfficial(firstUserText, ver, sessionId)
+    system = buildBillingAndOfficial(firstUserText, ver, sessionId, indexes)
   }
   system = appendOfficialSystemPrompt(system, leftover)
   if (!extras.length) return { ...body, system, messages }
