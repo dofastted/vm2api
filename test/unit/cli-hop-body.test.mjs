@@ -351,35 +351,6 @@ test('cli-hop lifts role=system turns for models that reject them', () => {
   assert.ok(body.messages.every((message) => message.role !== 'system'))
   assert.equal(body.system.at(-1).text, 'reminder')
 })
-test('prepareCliHopBody clamps small max_tokens to 1024 for automated probe tests', () => {
-  const probe1 = prepareCliHopBody({
-    model: 'claude-haiku-4-5',
-    max_tokens: 1,
-    messages: [{ role: 'user', content: '.' }],
-  })
-  assert.equal(probe1.max_tokens, 1024)
-
-  const probe32 = prepareCliHopBody({
-    model: 'claude-haiku-4-5',
-    max_tokens: 32,
-    messages: [{ role: 'user', content: 'ping' }],
-  })
-  assert.equal(probe32.max_tokens, 1024)
-
-  const classifier64 = prepareCliHopBody({
-    model: 'claude-sonnet-5',
-    max_tokens: 64,
-    messages: [{ role: 'user', content: '<severity>0</severity>' }],
-  })
-  assert.equal(classifier64.max_tokens, 1024)
-
-  const normal = prepareCliHopBody({
-    model: 'claude-haiku-4-5',
-    max_tokens: 4096,
-    messages: [{ role: 'user', content: 'hello' }],
-  })
-  assert.equal(normal.max_tokens, 4096)
-})
 
 test('cli-hop makes Opus 5.5 acceptable to Claude Code 2.1.280', () => {
   const body = prepareCliHopBody({

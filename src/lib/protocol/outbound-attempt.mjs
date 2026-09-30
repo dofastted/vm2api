@@ -174,12 +174,6 @@ export function prepareCliHopBody(
 ) {
   let body = officialMessagesBody(canonicalBody, { stream })
   delete body.metadata
-  // Wrap CLI (Claude Code) throws a fatal "max_output_tokens" error if response reaches max_tokens.
-  // Probes, ping tests, and third-party UI connection checks send max_tokens: 1 (or small numbers).
-  // Ensure a safe minimum for cli-hop so output finishes with end_turn rather than hitting max_tokens.
-  if (body.max_tokens != null && Number(body.max_tokens) <= 64) {
-    body.max_tokens = 1024
-  }
   const leftover = stripCliOwnedSystem(body.system)
   if (leftover == null) delete body.system
   else body.system = leftover
