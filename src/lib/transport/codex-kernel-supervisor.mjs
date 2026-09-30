@@ -7,6 +7,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { boundProxyUrl, isLocalEgressProxy } from '../vm/egress.mjs'
+import { assertProxyAllowed } from '../vm/proxy-policy.mjs'
 import { codexKernelHealth, codexKernelPaths } from './codex-kernel-client.mjs'
 
 const starts = new Map()
@@ -35,6 +36,8 @@ export function codexKernelBinPath() {
 
 export function writeCodexKernelConfig(projectRoot, vm, { token, proxyUrl, proxyRequired } = {}) {
   if (!projectRoot || !vm?.id) return null
+  assertProxyAllowed(vm.proxy)
+  if (proxyUrl) assertProxyAllowed({ url: proxyUrl })
   const runDir = path.join(projectRoot, 'vms', vm.id, 'run')
   fs.mkdirSync(runDir, { recursive: true, mode: 0o700 })
   const socketPath = path.join(runDir, 'codex-kernel.sock')
@@ -115,6 +118,7 @@ export function stopCodexKernel(vmId) {
     } catch {}
     starts.delete(vmId)
   }
+  return child || null
 }
 
 export function stopAllCodexKernels() {

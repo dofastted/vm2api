@@ -29,6 +29,7 @@ import {
 import { OS_CATALOG } from '../vm/os-catalog.mjs'
 import { REMOTE_KERNEL_ENTRY, resolveKernelDataplane } from '../vm/slot-engine.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
+import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import {
   containerName,
   displayName,
@@ -159,6 +160,8 @@ export function slotEgressNames(vmId) {
  */
 export async function ensureRemoteEgress(session, vm, { imageRef }) {
   const proxy = vm.proxy
+  const blocked = proxyBlockedReason(proxy)
+  if (blocked) return { ok: false, code: blocked, error: blocked }
   if (isLocalEgressProxy(proxy)) {
     const id = proxy?.id || LOCAL_EGRESS_ID
     const net = await ensureRemoteNetwork(session.docker, {
@@ -238,6 +241,33 @@ export async function ensureRemoteEgress(session, vm, { imageRef }) {
     code: 'egress_iptables_failed',
   })
   return { ok: true, mode: 'socks', network: net.name, egress: names.egress }
+}
+/** Policy changes stop only the exit helper, preserving slot containers and bindings. */
+export async function setRemoteProxyEgressEnabled(vm, projectRoot, enabled) {
+  try {
+    const session = await nodeSession(vmNodeId(vm))
+    const current = vm.runtime?.egress_container || slotEgressNames(vm.id).egress
+    const legacy = `kin-egress-${proxyKey(vm.proxy?.id)}`
+    if (enabled) {
+      const blocked = proxyBlockedReason(vm.proxy)
+      if (blocked) return { ok: false, code: blocked, error: blocked }
+      const name = vm.runtime?.network === networkName(vm.proxy?.id) ? legacy : current
+      const existing = await inspectContainerOrNull(session.docker, name)
+      if (existing) {
+        if (!existing.State?.Running) await containerAction(session.docker, name, 'start')
+        return { ok: true }
+      }
+      const image = slotImageSpec(projectRoot, vm.kernel || 'ubuntu-24.04')
+      return ensureRemoteEgress(session, vm, { imageRef: image.ref })
+    }
+    for (const name of new Set([current, legacy])) {
+      const existing = await inspectContainerOrNull(session.docker, name)
+      if (existing?.State?.Running) await containerAction(session.docker, name, 'stop')
+    }
+    return { ok: true }
+  } catch (err) {
+    return failure(err)
+  }
 }
 
 /** Where a network's exit lives: per-slot (labelled), pre-1.3.88 per-proxy, or the shared px-local bridge. */

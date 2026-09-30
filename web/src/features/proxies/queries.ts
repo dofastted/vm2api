@@ -17,5 +17,7 @@ export function useRefreshProxies() {
     Promise.all([
       qc.invalidateQueries({ queryKey: proxiesQueryOptions().queryKey }),
       qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
+      qc.invalidateQueries({ queryKey: ['panel', 'vm'] }),
+      qc.invalidateQueries({ queryKey: ['panel', 'vms'] }),
     ])
 }

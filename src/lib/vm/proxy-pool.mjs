@@ -17,6 +17,8 @@ import { canBindProxyToVm, normalizeOwnerId, proxyOwnerId } from '../admin/resou
 import { validTimezone } from '../core/timezone.mjs'
 import { lookupProxyGeo } from './proxy-geo.mjs'
 import { DNS_PRIMARY_AUTO, DNS_UPSTREAMS, LOCAL_EGRESS_ID, isLocalEgressProxy, validDnsPrimary } from './egress.mjs'
+import { normalizeSocksHost, socksEndpoint, socksProxyUrl, socksProxyFamily } from './socks-address.mjs'
+import { proxyBlockedReason } from './proxy-policy.mjs'
 
 export const MAX_VMS_PER_PROXY = 5
 export const BIND_LIMIT_MIN = 1
@@ -35,6 +37,7 @@ const DEFAULT_CONFIG = {
   bind_limit: MAX_VMS_PER_PROXY,
   // Transparent-egress DNS tried first; the other built-ins remain as fallback.
   dns_primary: DNS_PRIMARY_AUTO,
+  ipv6_enabled: false,
 }
 
 export function clampBindLimit(value, fallback = MAX_VMS_PER_PROXY) {
@@ -125,7 +128,12 @@ function setBoundVmIds(proxy, ids) {
 function hydrateProxy(proxy) {
   if (!proxy) return proxy
   const ids = parseBoundVmIds(proxy.bound_vm_ids?.length ? proxy.bound_vm_ids : proxy.bound_vm_id)
-  return { ...proxy, bound_vm_ids: ids, bound_vm_id: ids[0] || null }
+  return {
+    ...proxy,
+    host: normalizeSocksHost(proxy.host) || proxy.host,
+    bound_vm_ids: ids,
+    bound_vm_id: ids[0] || null,
+  }
 }
 
 function uid(prefix = 'px') {
@@ -161,6 +169,7 @@ function localEgressRecord() {
 }
 
 function socks5Record({ host, port, username = null, password = null, raw = '' }) {
+  host = normalizeSocksHost(host)
   if (!looksLikeHost(host) || !isSocksPort(port)) return null
   const user = username == null || username === '' ? null : String(username)
   const pass = user == null ? null : password == null ? '' : String(password)
@@ -170,7 +179,7 @@ function socks5Record({ host, port, username = null, password = null, raw = '' }
     port: Number(port),
     username: user,
     password: pass,
-    raw: String(raw || `${host}:${port}`),
+    raw: String(raw || socksEndpoint(host, port)),
   }
 }
 
@@ -212,10 +221,9 @@ export function parseSocks5Line(line) {
     if (at > 0) {
       const cred = raw.slice(0, at)
       const hostPort = raw.slice(at + 1)
-      const segs = hostPort.split(':')
-      if (segs.length >= 2 && isSocksPort(segs[segs.length - 1])) {
-        const port = segs.pop()
-        const host = segs.join(':')
+      const match = hostPort.match(/^(\[[^\]]+\]|[^:]+):(\d+)$/)
+      if (match) {
+        const [, host, port] = match
         const colon = cred.indexOf(':')
         return socks5Record({
           host,
@@ -225,7 +233,15 @@ export function parseSocks5Line(line) {
           raw,
         })
       }
+      return null
     }
+    if (raw.includes('[') || raw.includes(']')) {
+      const match = raw.match(/^\[([^\]]+)\]:(\d+)(?::([^:]*)(?::(.*))?)?$/)
+      if (!match || !net.isIPv6(match[1])) return null
+      return socks5Record({ host: match[1], port: match[2], username: match[3], password: match[4], raw })
+    }
+    // A colon-delimited IPv6 endpoint has no unambiguous port boundary.
+    if (net.isIPv6(raw) || net.isIPv6(raw.slice(0, raw.lastIndexOf(':')))) return null
     const parts = raw.split(':')
     if (parts.length === 2) {
       return socks5Record({ host: parts[0], port: parts[1], raw })
@@ -271,6 +287,7 @@ export class ProxyPool {
     this.state = { config: { ...DEFAULT_CONFIG }, proxies: [] }
     this._timer = null
     this._probing = false
+    this._probeSockets = new Map()
     this.load()
   }
 
@@ -314,11 +331,12 @@ export class ProxyPool {
     const owner = ownerUserId === undefined ? undefined : normalizeOwnerId(ownerUserId)
     const proxies =
       ownerUserId === undefined ? this.state.proxies : this.state.proxies.filter((p) => proxyOwnerId(p) === owner)
-    const unused = proxies.filter((p) => p.enabled && boundVmIdsOf(p).length === 0 && p.status !== 'dead').length
-    const open = proxies.filter((p) => p.enabled && p.status !== 'dead' && boundVmIdsOf(p).length < limit).length
+    const available = proxies.filter((p) => !proxyBlockedReason(p, this.state.config.ipv6_enabled))
+    const unused = available.filter((p) => p.enabled && boundVmIdsOf(p).length === 0 && p.status !== 'dead').length
+    const open = available.filter((p) => p.enabled && p.status !== 'dead' && boundVmIdsOf(p).length < limit).length
     const bound = proxies.filter((p) => boundVmIdsOf(p).length > 0).length
     const dead = proxies.filter((p) => !p.enabled || p.status === 'dead').length
-    const ok = proxies.filter((p) => p.enabled && p.status === 'ok').length
+    const ok = available.filter((p) => p.enabled && p.status === 'ok').length
     const slotsUsed = proxies.reduce((n, p) => n + boundVmIdsOf(p).length, 0)
     return {
       config: { ...this.state.config, bind_limit: limit },
@@ -329,6 +347,7 @@ export class ProxyPool {
         bound,
         ok,
         dead,
+        blocked: proxies.length - available.length,
         probing: this._probing,
         slots_used: slotsUsed,
         slots_cap: proxies.length * limit,
@@ -341,6 +360,7 @@ export class ProxyPool {
   publicProxy(p) {
     const ids = boundVmIdsOf(p)
     const limit = this.bindLimit()
+    const blocked = proxyBlockedReason(p, this.state.config.ipv6_enabled)
     return {
       id: p.id,
       host: p.host,
@@ -348,6 +368,8 @@ export class ProxyPool {
       has_auth: !!(p.username || p.password),
       status: p.status, // unknown | ok | fail | dead
       enabled: p.enabled,
+      blocked_reason: blocked,
+      address_family: socksProxyFamily(p) || null,
       owner_user_id: proxyOwnerId(p),
       bound_vm_id: ids[0] || null,
       bound_vm_ids: ids,
@@ -400,12 +422,17 @@ export class ProxyPool {
     for (const parsed of records) {
       if (!parsed || parsed.__invalid || !parsed.host || !parsed.port) {
         const label = parsed?.__invalid || ''
-        if (label) skipped.push({ line: label, reason: 'parse_failed' })
+        if (label)
+          skipped.push({
+            line: label,
+            reason: 'parse_failed',
+            message: 'Invalid SOCKS5 endpoint; IPv6 requires [host]:port or socks5h://[host]:port',
+          })
         continue
       }
       const key = proxyKey(parsed)
       if (existing.has(key)) {
-        skipped.push({ line: `${parsed.host}:${parsed.port}`, reason: 'duplicate' })
+        skipped.push({ line: socksEndpoint(parsed.host, parsed.port), reason: 'duplicate' })
         continue
       }
       existing.add(key)
@@ -441,9 +468,13 @@ export class ProxyPool {
    */
   ensureBoundToVm(vmId, preferredId = null) {
     if (!vmId) return null
+    if (this.state.proxies.some((p) => proxyHasVm(p, vmId) && proxyBlockedReason(p, this.state.config.ipv6_enabled)))
+      return null
     const existing = this.getProxyForVm(vmId)
     if (existing) return existing
     if (preferredId) {
+      const preferred = this.state.proxies.find((p) => p.id === preferredId)
+      if (proxyBlockedReason(preferred, this.state.config.ipv6_enabled)) return null
       const bound = this.bind(preferredId, vmId)
       if (bound.ok) return this.getProxyForVm(vmId)
     }
@@ -453,13 +484,18 @@ export class ProxyPool {
   /** Allocate one healthy proxy with remaining capacity and bind to vmId */
   allocateForVm(vmId, { ownerUserId = null, role = 'admin' } = {}) {
     if (!vmId) return null
-    const existing = this.state.proxies.find((p) => p.enabled && proxyHasVm(p, vmId))
+    if (this.state.proxies.some((p) => proxyHasVm(p, vmId) && proxyBlockedReason(p, this.state.config.ipv6_enabled)))
+      return null
+    const existing = this.state.proxies.find(
+      (p) => p.enabled && !proxyBlockedReason(p, this.state.config.ipv6_enabled) && proxyHasVm(p, vmId),
+    )
     if (existing) return this.publicProxy(existing)
 
     const limit = this.bindLimit()
     const owner = normalizeOwnerId(ownerUserId)
     const candidates = this.state.proxies.filter((p) => {
       if (!p.enabled || p.status === 'dead' || p.status === 'fail') return false
+      if (proxyBlockedReason(p, this.state.config.ipv6_enabled)) return false
       if (boundVmIdsOf(p).length >= limit) return false
       return proxyOwnerId(p) === owner
     })
@@ -478,6 +514,8 @@ export class ProxyPool {
     const p = this.state.proxies.find((x) => x.id === proxyId)
     if (!p) return { ok: false, error: 'proxy_not_found' }
     if (!p.enabled || p.status === 'dead') return { ok: false, error: 'proxy_disabled' }
+    const blocked = proxyBlockedReason(p, this.state.config.ipv6_enabled)
+    if (blocked) return { ok: false, error: blocked }
     const vm = String(vmId || '').trim()
     if (!vm) return { ok: false, error: 'vm_id_required' }
     for (const x of this.state.proxies) {
@@ -591,13 +629,16 @@ export class ProxyPool {
     // Imported rows keep the original line in `raw`, which for a
     // socks5://user:pass@host form means a plaintext password sitting in the
     // store. Rewrite it to host:port so editing also cleans that up.
-    p.raw = `${next.host}:${next.port}`
+    p.raw = socksEndpoint(next.host, next.port)
     this.save()
     return { ok: true, proxy: this.publicProxy(p) }
   }
 
   updateConfig(patch = {}) {
     const allowed = [5, 10, 30, 60]
+    if (patch.ipv6_enabled != null && typeof patch.ipv6_enabled !== 'boolean') {
+      return { ok: false, error: 'invalid_ipv6_enabled' }
+    }
     if (patch.dns_primary != null && !validDnsPrimary(patch.dns_primary)) {
       return { ok: false, error: 'invalid_dns_primary', allowed: [DNS_PRIMARY_AUTO, ...DNS_UPSTREAMS] }
     }
@@ -630,7 +671,13 @@ export class ProxyPool {
       }
       this.state.config.bind_limit = n
     }
+    if (patch.ipv6_enabled != null) this.state.config.ipv6_enabled = patch.ipv6_enabled
     this.save()
+    if (patch.ipv6_enabled === false) {
+      for (const [socket, proxy] of this._probeSockets) {
+        if (socksProxyFamily(proxy) === 6) socket.destroy()
+      }
+    }
     this.restartScheduler()
     return { ok: true, config: this.state.config }
   }
@@ -650,6 +697,8 @@ export class ProxyPool {
     if (!vmId) return { ok: false, error: 'vm_id_required' }
     const p = this.state.proxies.find((x) => proxyHasVm(x, vmId))
     if (!p) return { ok: false, error: 'no_bound_proxy' }
+    const blocked = proxyBlockedReason(p, this.state.config.ipv6_enabled)
+    if (blocked) return { ok: true, skipped: true, reason: blocked }
     this._applyProbeResult(
       p,
       {
@@ -703,11 +752,14 @@ export class ProxyPool {
    * Full SOCKS5 auth handshake is best-effort.
    */
   async probeOne(proxy) {
+    const blocked = proxyBlockedReason(proxy, this.state.config.ipv6_enabled)
+    if (blocked) return { ok: false, scope: 'policy', error: blocked, latency_ms: null }
     if (isLocalEgressProxy(proxy)) {
       // Host default route. A down kin-egress is not "no proxy".
       return { ok: true, scope: 'local', mode: 'direct', latency_ms: 0 }
     }
     const socks = await this._probeSocks(proxy)
+    if (socks.scope === 'policy') return socks
     if (!socks.ok) return { ...socks, scope: 'socks' }
     if (typeof this.egressCheck !== 'function') return { ...socks, scope: 'socks' }
     let eg = this.egressCheck(proxy)
@@ -730,19 +782,30 @@ export class ProxyPool {
   }
 
   async _probeSocks(proxy) {
+    const blocked = proxyBlockedReason(proxy, this.state.config.ipv6_enabled)
+    if (blocked) return { ok: false, scope: 'policy', error: blocked, latency_ms: null }
+    const host = normalizeSocksHost(proxy.host)
+    if (!host) return { ok: false, error: 'invalid_proxy_host', latency_ms: null }
     const timeout = this.state.config.probe_timeout_ms || 8000
     const started = Date.now()
     return new Promise((resolve) => {
-      const socket = net.connect({ host: proxy.host, port: proxy.port })
+      const socket = net.connect({ host, port: proxy.port })
+      this._probeSockets.set(socket, proxy)
       let done = false
       let connected = false
       const finish = (ok, error) => {
         if (done) return
         done = true
+        this._probeSockets.delete(socket)
         try {
           socket.destroy()
         } catch {
           /* */
+        }
+        const reason = proxyBlockedReason(proxy, this.state.config.ipv6_enabled)
+        if (reason) {
+          resolve({ ok: false, scope: 'policy', error: reason, latency_ms: null })
+          return
         }
         resolve({
           ok,
@@ -795,6 +858,7 @@ export class ProxyPool {
     const results = []
     try {
       const list = this.state.proxies.filter((p) => {
+        if (proxyBlockedReason(p, this.state.config.ipv6_enabled)) return false
         if (!onlyEnabled) return true
         if (p.enabled) return true
         return p.status === 'fail' || (p.status === 'dead' && p.last_error)
@@ -824,6 +888,8 @@ export class ProxyPool {
   async detectGeo(proxyId, { force = false } = {}) {
     const p = this.state.proxies.find((x) => x.id === proxyId)
     if (!p) return { ok: false, error: 'proxy_not_found' }
+    const blocked = proxyBlockedReason(p, this.state.config.ipv6_enabled)
+    if (blocked) return { ok: false, error: blocked, proxy: this.publicProxy(p) }
     if (!force && p.geo_checked_at && p.geo_ip) {
       return { ok: true, cached: true, proxy: this.publicProxy(p), geo: proxyGeoOf(p) }
     }
@@ -885,6 +951,8 @@ export class ProxyPool {
   }
 
   _applyProbeResult(p, result, { cascade = true } = {}) {
+    // Disabled by policy is not a failed probe and must not damage health/history.
+    if (result.scope === 'policy' || proxyBlockedReason(p, this.state.config.ipv6_enabled)) return
     p.last_probe_at = new Date().toISOString()
     p.latency_ms = result.latency_ms
     if (result.scope === 'egress') {
@@ -941,7 +1009,13 @@ export class ProxyPool {
 
   /** For upstream: get socks URL for a VM */
   getProxyForVm(vmId) {
-    const p = this.state.proxies.find((x) => proxyHasVm(x, vmId) && x.enabled && x.status !== 'dead')
+    const p = this.state.proxies.find(
+      (x) =>
+        proxyHasVm(x, vmId) &&
+        x.enabled &&
+        x.status !== 'dead' &&
+        !proxyBlockedReason(x, this.state.config.ipv6_enabled),
+    )
     if (!p) return null
     return this._withAuth(p)
   }
@@ -975,10 +1049,9 @@ export class ProxyPool {
         password: null,
       }
     }
-    const auth = p.username != null ? `${encodeURIComponent(p.username)}:${encodeURIComponent(p.password || '')}@` : ''
     return {
       id: p.id,
-      url: `socks5://${auth}${p.host}:${p.port}`,
+      url: socksProxyUrl(p, 'socks5'),
       host: p.host,
       port: p.port,
       username: p.username || null,

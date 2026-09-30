@@ -34,6 +34,8 @@ export type VmProxySnap = {
   port?: number | string
   status?: string
   enabled?: boolean
+  blocked_reason?: 'ipv6_disabled' | null
+  address_family?: 4 | 6 | null
   latency_ms?: number
   last_error?: string
   last_probe_at?: string

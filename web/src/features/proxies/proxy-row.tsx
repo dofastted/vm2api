@@ -93,7 +93,7 @@ export function ProxyRow({
   const ids = proxyBoundIds(proxy)
   const limit = proxyBindLimit(proxy, poolLimit)
   const health = proxyHealthKey(proxy)
-  const dead = proxyIsInvalid(proxy)
+  const dead = proxyIsInvalid(proxy) && !proxy.blocked_reason
   const local = proxyIsLocal(proxy)
   const bindable = proxyBindable(proxy)
   const free = Math.max(0, limit - ids.length)
@@ -160,6 +160,9 @@ export function ProxyRow({
           >
             {proxyHostText(proxy)}
           </span>
+          {proxy.address_family === 6 ? (
+            <span className='shrink-0 text-xs text-muted-foreground'>IPv6</span>
+          ) : null}
           {proxy.has_auth ? (
             <Lock
               className='size-3 shrink-0 text-muted-foreground'
@@ -171,7 +174,7 @@ export function ProxyRow({
           <StatusMark tone={proxyStatusTone(proxy)} />
           <GeoLine proxy={proxy} />
         </div>
-        {proxy.last_error ? (
+        {proxy.last_error && !proxy.blocked_reason ? (
           <p
             className={cn(
               'field-host truncate text-[11px]',
@@ -260,6 +263,7 @@ export function ProxyRow({
           className='size-8'
           onClick={() => actions.onProbe(id)}
           loading={pending.probe === id}
+          disabled={!!proxy.blocked_reason}
           aria-label='测通'
           title='测通：只测 SOCKS TCP，不打 Anthropic'
         >
@@ -271,6 +275,7 @@ export function ProxyRow({
           className='size-8'
           onClick={() => actions.onGeo(id)}
           loading={pending.geo === id}
+          disabled={!!proxy.blocked_reason}
           aria-label='测地理'
           title='测地理：经这条代理查出口 IP 的国家 / 城市 / 时区'
         >

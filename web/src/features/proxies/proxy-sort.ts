@@ -1,4 +1,5 @@
 import type { VmProxySnap } from '@/types/panel-vm'
+import { proxyHostLabel } from '@/lib/vm-status'
 
 export type ProxySortKey = 'status' | 'latency' | 'seats' | 'geo' | 'host'
 
@@ -13,6 +14,7 @@ export const PROXY_HEALTH_KEYS = [
 export type ProxyHealthKey = (typeof PROXY_HEALTH_KEYS)[number]
 
 export function proxyHealthKey(prx: VmProxySnap): ProxyHealthKey {
+  if (prx.blocked_reason) return 'off'
   if (prx.enabled === false) return 'off'
   if (prx.status === 'dead') return 'dead'
   if (prx.status === 'fail') return 'fail'
@@ -26,7 +28,9 @@ export function proxyIsLocal(prx: VmProxySnap): boolean {
 
 export function proxyHostText(prx: VmProxySnap): string {
   if (proxyIsLocal(prx)) return '本地出口'
-  return `${prx.host || '?'}:${prx.port ?? '?'}`
+  if (!prx.host) return `?:${prx.port ?? '?'}`
+  const endpoint = proxyHostLabel(prx)
+  return prx.port == null ? `${endpoint}:?` : endpoint
 }
 
 /**
@@ -34,7 +38,7 @@ export function proxyHostText(prx: VmProxySnap): string {
  * 所以这里不能直接用 `proxyIsInvalid()`。
  */
 export function proxyBindable(prx: VmProxySnap): boolean {
-  return prx.enabled !== false && prx.status !== 'dead'
+  return !prx.blocked_reason && prx.enabled !== false && prx.status !== 'dead'
 }
 
 export function proxyBoundIds(prx: VmProxySnap | undefined): string[] {
@@ -55,10 +59,16 @@ export function proxyBindLimit(
 
 export function proxyIsInvalid(prx: VmProxySnap | undefined): boolean {
   if (!prx) return true
-  return prx.enabled === false || prx.status === 'dead' || prx.status === 'fail'
+  return (
+    !!prx.blocked_reason ||
+    prx.enabled === false ||
+    prx.status === 'dead' ||
+    prx.status === 'fail'
+  )
 }
 
 export function proxyStatusLabel(prx: VmProxySnap): string {
+  if (prx.blocked_reason === 'ipv6_disabled') return 'IPv6 已关闭'
   if (prx.enabled === false || prx.status === 'dead') return '失效'
   if (prx.status === 'fail') return '失败'
   if (prx.status === 'ok') return '正常'
@@ -78,7 +88,7 @@ export function proxyOptionLabel(
   const lat = prx.latency_ms != null ? `${prx.latency_ms}ms` : '—'
   const used = proxyBoundIds(prx).length
   const limit = proxyBindLimit(prx, poolBindLimit)
-  return `${prx.host || '?'}:${prx.port ?? '?'} · ${proxyStatusLabel(prx)} ${lat} · ${used}/${limit}`
+  return `${proxyHostText(prx)} · ${proxyStatusLabel(prx)} ${lat} · ${used}/${limit}`
 }
 
 /**

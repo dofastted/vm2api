@@ -5,6 +5,7 @@
  * vm.json as refresh_error → evaluateAccount shows 无效凭证.
  */
 import { isLocalEgressProxy } from '../vm/egress.mjs'
+import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { hasRefreshPresence, needsRefresh } from './oauth-credentials.mjs'
 
 export const DEFAULT_CREDENTIAL_REFRESH = Object.freeze({
@@ -45,6 +46,7 @@ export function normalizeCredentialRefreshConfig(raw = {}) {
 
 export function vmHasProxyPath(vm) {
   if (!vm) return false
+  if (proxyBlockedReason(vm.proxy)) return false
   if (isLocalEgressProxy(vm.proxy)) return true
   if (vm.proxy_cli_enabled && (vm.proxy?.url || vm.proxy?.host || vm.proxy_id)) return true
   return !!(vm.proxy?.url || (vm.proxy?.host && vm.proxy?.port))

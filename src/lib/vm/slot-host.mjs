@@ -14,6 +14,7 @@
  *   dockerEnv()     env for async docker CLI spawns (undefined = this host's daemon)
  *   execUser(vm)    `docker exec -u` for in-slot kin-worker commands
  *   start/reload/stop/destroy   same result contract as vm-runtime
+ *   setProxyEgressEnabled(vm, projectRoot, enabled) stop/resume only the proxy helper
  *   syncRun(vm, slotDir)        publish run/ (kernel.json, worker.json, token) where the slot reads it
  *   queueSyncRun(vm, slotDir)   fire-and-forget syncRun
  *   onImport(vm, slotDir)       an imported credential replaces the slot's copy
@@ -32,7 +33,13 @@ import {
   pushTelemetryTouch,
   queueSlotPush,
 } from '../cluster/remote-slot-files.mjs'
-import { destroyRemoteSlot, reloadRemoteSlot, startRemoteSlot, stopRemoteSlot } from '../cluster/remote-slot.mjs'
+import {
+  destroyRemoteSlot,
+  reloadRemoteSlot,
+  setRemoteProxyEgressEnabled,
+  startRemoteSlot,
+  stopRemoteSlot,
+} from '../cluster/remote-slot.mjs'
 import {
   CONTAINER_CC_NODE_BIN,
   CONTAINER_CLI_NODE_BIN,
@@ -40,6 +47,9 @@ import {
   REMOTE_CLI_NODE_BIN,
 } from './slot-engine.mjs'
 import { destroyVmRuntime, officialCcUidGid, reloadSlotWorker, startVmRuntime, stopVmRuntime } from './vm-runtime.mjs'
+import { ensureProxyEgress, inspectEgressProcess, stopEgressProcess } from './egress.mjs'
+import { isCodexVm } from './vm-kind.mjs'
+import { stopCodexKernel } from '../transport/codex-kernel-supervisor.mjs'
 
 const noop = async () => ({ skipped: true })
 
@@ -59,6 +69,33 @@ const LOCAL_HOST = Object.freeze({
   reload: (vm, projectRoot, opts) => reloadSlotWorker(vm, projectRoot, opts),
   stop: (vm) => stopVmRuntime(vm),
   destroy: (vm) => destroyVmRuntime(vm),
+  setProxyEgressEnabled: async (vm, projectRoot, enabled) => {
+    if (isCodexVm(vm)) {
+      if (enabled) return { ok: true }
+      const child = stopCodexKernel(vm.id)
+      if (!child || child.exitCode !== null || child.signalCode !== null) return { ok: true }
+      return new Promise((resolve) => {
+        const exited = () => {
+          clearTimeout(timeout)
+          resolve({ ok: true })
+        }
+        const timeout = setTimeout(() => {
+          child.off('exit', exited)
+          resolve({ ok: false, error: 'codex_stop_timeout' })
+        }, 2000)
+        child.once('exit', exited)
+      })
+    }
+    if (enabled) return ensureProxyEgress(projectRoot, vm.proxy)
+    const stopped = stopEgressProcess(projectRoot, vm.proxy?.id)
+    if (!stopped.ok) return stopped
+    const deadline = Date.now() + 2000
+    while (inspectEgressProcess(projectRoot, vm.proxy?.id).ok) {
+      if (Date.now() >= deadline) return { ok: false, error: 'egress_stop_timeout' }
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    return stopEgressProcess(projectRoot, vm.proxy?.id)
+  },
   // The container bind-mounts vms/<id>/ directly: every local write is already published.
   syncRun: noop,
   queueSyncRun: () => null,
@@ -82,6 +119,7 @@ function nodeHost(nodeId) {
     reload: (vm, projectRoot, opts) => reloadRemoteSlot(vm, projectRoot, opts),
     stop: (vm) => stopRemoteSlot(vm),
     destroy: (vm) => destroyRemoteSlot(vm),
+    setProxyEgressEnabled: (vm, projectRoot, enabled) => setRemoteProxyEgressEnabled(vm, projectRoot, enabled),
     syncRun: (vm, slotDir) => pushSlotFiles(vm, slotDir, ['run']),
     queueSyncRun: (vm, slotDir) => queueSlotPush(vm, slotDir, ['run']),
     onImport: (vm, slotDir) => pushSlotCredentials(vm, slotDir),

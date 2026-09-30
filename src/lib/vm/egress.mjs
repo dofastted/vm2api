@@ -10,6 +10,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { getDb, isDbOpen } from '../db/database.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { socksProxyUrl } from './socks-address.mjs'
+import { assertProxyAllowed, proxyBlockedReason } from './proxy-policy.mjs'
 
 export const EGRESS_BIN = process.env.KIN_EGRESS_BIN || '/opt/kin-gateway/bin/kin-egress'
 export const LOCAL_EGRESS_ID = 'px-local'
@@ -46,6 +48,8 @@ export function localEgressStatus(proxyOrId, run = docker) {
 
 export function proxyEgressReady(proxy, projectRoot, timeoutMs = 400) {
   // Direct exit. kin-egress not running is success, not egress_down.
+  const blocked = proxyBlockedReason(proxy)
+  if (blocked) return { ok: false, reason: blocked }
   if (isLocalEgressProxy(proxy)) return { ok: true, mode: 'direct' }
   return egressListening(projectRoot, proxy?.id, timeoutMs)
 }
@@ -284,6 +288,8 @@ export function startEgressProcess({
   bin = EGRESS_BIN,
   dnsUpstream = '',
 }) {
+  const blocked = proxyBlockedReason({ url: proxyUrl })
+  if (blocked) return { ok: false, error: blocked }
   if (!listenHost) return { ok: false, error: 'egress listen host required' }
   const dir = egressRunDir(projectRoot, proxyId)
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
@@ -335,11 +341,17 @@ export function stopEgressProcess(projectRoot, proxyId) {
   if (pid && pidAlive(pid)) {
     try {
       process.kill(pid, 'SIGTERM')
-    } catch {}
+    } catch (error) {
+      if (error.code !== 'ESRCH') return { ok: false, error: `egress_stop_failed: ${error.code || error.message}` }
+    }
+    // Keep the PID while termination is pending so policy reconciliation can verify/retry it.
+    if (pidAlive(pid)) return { ok: true }
   }
   try {
     fs.rmSync(pidFile, { force: true })
-  } catch {}
+  } catch (error) {
+    return { ok: false, error: `egress_pid_cleanup_failed: ${error.code || error.message}` }
+  }
   return { ok: true }
 }
 
@@ -373,12 +385,8 @@ export function egressListening(projectRoot, proxyId, timeoutMs = 400) {
 
 export function boundProxyUrl(proxy) {
   if (isLocalEgressProxy(proxy)) return ''
-  if (proxy?.url) return String(proxy.url).replace(/^socks5:\/\//i, 'socks5h://')
-  if (!proxy?.host || !proxy?.port) return ''
-  const auth = proxy.username
-    ? `${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password || '')}@`
-    : ''
-  return `socks5h://${auth}${proxy.host}:${proxy.port}`
+  assertProxyAllowed(proxy)
+  return socksProxyUrl(proxy)
 }
 
 function waitListen(host, port, timeoutMs = 8000) {
@@ -436,6 +444,8 @@ export function ensureProxyEgress(
   { runDocker = docker, runIptables = iptables, dnsUpstream = configuredDnsUpstream() } = {},
 ) {
   if (isLocalEgressProxy(proxy)) return ensureLocalProxyEgress(proxy, { runDocker })
+  const blocked = proxyBlockedReason(proxy)
+  if (blocked) return { ok: false, error: blocked }
   const proxyId = proxy?.id
   const proxyUrl = boundProxyUrl(proxy)
   if (!proxyId || !proxyUrl) return { ok: false, error: 'bound SOCKS5 id and url required; refusing fallback' }

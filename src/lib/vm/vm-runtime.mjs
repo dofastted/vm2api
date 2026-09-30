@@ -17,7 +17,9 @@ import { assertCliHopAllowed, resolveOfficialCcInference } from './slot-engine.m
 import { ensureSlotClaudeOwnership, chownSlotRuntimeFile, replaceSlotOwnedFile } from '../oauth/oauth-credentials.mjs'
 import { materializeWrapCli } from './wrap-cli-runtime.mjs'
 import { ensureGuestMachineIdFile } from '../identity/workstation-fingerprint.mjs'
-import { ensureProxyEgress, isLocalEgressProxy, slotNetworkForVm } from './egress.mjs'
+import { boundProxyUrl, ensureProxyEgress, isLocalEgressProxy, slotNetworkForVm } from './egress.mjs'
+import { socksProxyEndpoint } from './socks-address.mjs'
+import { assertProxyAllowed } from './proxy-policy.mjs'
 import { toHostPath } from './host-path.mjs'
 import { fileURLToPath } from 'node:url'
 import { OS_CATALOG, OS_ORDER, imageForKernel, buildDirForKernel } from './os-catalog.mjs'
@@ -219,31 +221,16 @@ function workerRuntimeExtra(worker) {
 
 function workerProxyUrl(vm) {
   if (!vmWantsOuterSocks(vm)) return null
-  if (vm.proxy?.url) return String(vm.proxy.url).replace(/^socks5:\/\//i, 'socks5h://')
-  if (!vm.proxy?.host || !vm.proxy?.port) return null
-  const auth = vm.proxy.username
-    ? `${encodeURIComponent(vm.proxy.username)}:${encodeURIComponent(vm.proxy.password || '')}@`
-    : ''
-  return `socks5h://${auth}${vm.proxy.host}:${vm.proxy.port}`
+  return boundProxyUrl(vm.proxy) || null
 }
 
 /** host:port only — never include userinfo. */
 export function proxyEndpointFromUrl(raw) {
-  const s = String(raw || '').trim()
-  if (!s) return null
-  try {
-    const u = new URL(s.replace(/^socks5h:/i, 'socks5:'))
-    if (!u.hostname || !u.port) return null
-    return `${u.hostname}:${u.port}`
-  } catch {
-    return null
-  }
+  return socksProxyEndpoint({ url: raw })
 }
 
 export function proxyEndpointFromVm(vm) {
-  const p = vm?.proxy || {}
-  if (p.host && p.port) return `${p.host}:${Number(p.port)}`
-  return proxyEndpointFromUrl(p.url)
+  return socksProxyEndpoint(vm?.proxy)
 }
 
 export function readWorkerProxyEndpoint(projectRoot, vmId) {
@@ -330,6 +317,7 @@ function readProjectRouting(projectRoot) {
 }
 
 export function writeWorkerFiles(vm, projectRoot, { transparent, routing } = {}) {
+  assertProxyAllowed(vm.proxy)
   const paths = workerPaths(projectRoot, vm.id)
   const uid = runtimeUidNum(vm)
   const gid = Number(GID)

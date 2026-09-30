@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- 修复 #194：SOCKS5 IPv6 地址在导入、持久化加载、探测、URL 生成和 endpoint 比较中统一规范化；socket 使用裸 IPv6，URL / 地址展示使用 `[host]:port`，保留 IPv4、hostname 和凭证编码行为。
+- 设置 → SOCKS5 新增「IPv6 代理出口」，默认关闭。开启后才能探测、绑定和使用 IPv6 literal 代理；关闭会停止对应运行出口，保留槽位、绑定和探测历史，不计作代理故障。代理池和槽位网络状态显示「IPv6 已关闭」，远端出口同步失败单独提示；槽位网桥仍为 IPv4，DNS / 路由策略不变。
+
 ## 1.3.89 — 2026-10-01
 
 - 集群 VM 放置：存在集群节点时，管理员可把 Claude / Rust VM 创建到 SSH 加入的 VPS。节点槽位使用自包含镜像 `vm2api/kin-slot-<kernel>:<VERSION>-<sha12>`（面板显式准备），经 SSH streamlocal 管理容器并中继 kernel / worker socket；凭据以节点副本为准，导入推送、刷新拉回。SOCKS5 出口在节点上按槽位成对部署（`kin-02` / `kin-02-egress`，网络 `kin-02-net`），槽位删除或换出口时回收；节点槽位允许使用与内存上限等量的 swap。本机/节点差异收敛到 `slotHost(vm)` 契约；Codex、官方 CC 初始化、wrap 修复/提升、引擎与 auth_scheme 切换在节点上返回 `remote_unsupported`。面板：VM 标出所在服务器（本机 `local`），集群页显示各节点 Docker 运行/总数，节点 Docker 列表按槽位把出口排在一起。新增 `POST /api/panel/cluster/nodes/:id/{preflight,slot-image}`。

@@ -156,6 +156,7 @@ import {
 import { recreateVmFiles, seedFreshCliHome } from '../vm/vm-recreate.mjs'
 import { preflightNode } from '../cluster/placement.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { syncIpv6ProxyEgress } from '../vm/proxy-policy-runtime.mjs'
 import { writeSlotSeedFiles } from '../vm/slot-seed.mjs'
 import {
   egressEnabled,
@@ -3714,6 +3715,9 @@ export function createPanelHandler(ctx) {
             egress.push({ proxy_id: proxy.id, ok: r.ok, error: r.ok ? null : r.error })
           }
         }
+        if (body.ipv6_enabled != null && process.env.KIN_CRS_MOCK !== '1') {
+          egress.push(...(await syncIpv6ProxyEgress(cfg.paths.project, proxyPool)))
+        }
         return json(res, 200, panel.ok({ ...result.config, egress }))
       }
       // Must stay BELOW /proxies/config: `[^/]+` matches "config" too, and this
@@ -3776,6 +3780,15 @@ export function createPanelHandler(ctx) {
       if (req.method === 'POST' && /^\/api\/panel\/proxies\/[^/]+\/probe$/.test(p)) {
         const id = p.split('/')[4]
         const result = await proxyPool.probeById(id)
+        if (result.probe?.scope === 'policy') {
+          return json(res, 409, {
+            ok: false,
+            error: {
+              code: result.probe.error,
+              message: 'IPv6 已关闭，请在设置 → SOCKS5 开启 IPv6 代理出口',
+            },
+          })
+        }
         if (!result.ok)
           return json(res, 404, {
             ok: false,
@@ -3787,6 +3800,15 @@ export function createPanelHandler(ctx) {
         const id = p.split('/')[4]
         const body = await readBody(req, 8192).catch(() => ({}))
         const result = await proxyPool.detectGeo(id, { force: body?.force !== false })
+        if (result.error === 'ipv6_disabled') {
+          return json(res, 409, {
+            ok: false,
+            error: {
+              code: result.error,
+              message: 'IPv6 已关闭，请在设置 → SOCKS5 开启 IPv6 代理出口',
+            },
+          })
+        }
         if (!result.ok && result.error === 'proxy_not_found') {
           return json(res, 404, {
             ok: false,

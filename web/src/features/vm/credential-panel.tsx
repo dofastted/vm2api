@@ -19,6 +19,7 @@ import {
   type ImportMethod,
 } from '@/lib/cred-type'
 import { importErrorMessage } from '@/lib/import-errors'
+import { proxyHostLabel } from '@/lib/vm-status'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -287,10 +288,7 @@ function ClaudeCredentialPanel({
 
   const busy = gen.isPending || exchange.isPending || importCred.isPending
   const proxyHint =
-    link.proxyHint ||
-    (vm.proxy?.host
-      ? `${vm.proxy.host}${vm.proxy.port ? `:${vm.proxy.port}` : ''}`
-      : '')
+    link.proxyHint || (vm.proxy?.host ? proxyHostLabel(vm.proxy) : '')
 
   return (
     <div className='space-y-3'>

@@ -45,6 +45,18 @@ export function proxyHealthOf(vm: Vm, proxy: VmProxySnap): ProxyHealth {
  * 没有单一 vm 可传给 `proxyHealthOf`。
  */
 export function proxyOwnHealthOf(proxy: VmProxySnap): ProxyHealth {
+  if (proxy.blocked_reason === 'ipv6_disabled') {
+    return {
+      score: 0,
+      tone: {
+        key: 'off',
+        text: 'IPv6 已关闭',
+        cls: 'off',
+        label: '设置 → SOCKS5 开启 IPv6 代理出口后才能使用',
+      },
+      reasons: ['IPv6 代理出口已关闭，保留绑定和探测历史，不计作代理故障'],
+    }
+  }
   const status = String(proxy.status || '').toLowerCase()
   if (status === 'dead' || status === 'down' || status === 'error') {
     return {

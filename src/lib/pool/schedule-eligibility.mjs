@@ -6,6 +6,8 @@ import { hasBoundExit, isLocalEgressProxy } from '../vm/egress.mjs'
 import { isVmScheduleReady, vmHasClaudeCredential, isCodexVm } from '../vm/vm-registry.mjs'
 import { expiresAtToMs, hasRefreshPresence } from '../oauth/oauth-credentials.mjs'
 import { rustKernelBusy } from '../transport/rust-kernel-client.mjs'
+import { socksProxyEndpoint } from '../vm/socks-address.mjs'
+import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 
 // Only a dead grant / operator disable should keep the slot out of the pool.
 // Stale access 401 (`authentication_failed_after_refresh`) is not fatal when
@@ -83,6 +85,8 @@ export function slotHasBoundProxy(vm) {
 
 export function evaluateSlotGate(vm) {
   if (isCodexVm(vm)) return { ok: false, reason: 'codex_vm' }
+  const blocked = proxyBlockedReason(vm?.proxy)
+  if (blocked) return { ok: false, reason: blocked }
   const oauthProjection = /^oauth_/.test(String(vm?.schedule_disabled_reason || ''))
   if (!isVmScheduleReady(vm, { allowMissingCredential: oauthProjection })) {
     if (!oauthProjection) return { ok: false, reason: 'vm_unschedulable' }
@@ -98,15 +102,7 @@ export const WORKER_PROXY_UNKNOWN = undefined
 export function evaluateProxySync({ vm, workerProxyEndpoint = WORKER_PROXY_UNKNOWN, egressMode = '' } = {}) {
   if (isLocalEgressProxy(vm?.proxy)) return { ok: true }
   if (String(egressMode || '').trim() === 'transparent') return { ok: true }
-  const wantHost = vm?.proxy?.host
-  const wantPort = vm?.proxy?.port
-  let want = null
-  if (wantHost && wantPort) want = `${wantHost}:${Number(wantPort)}`
-  else {
-    const url = String(vm?.proxy?.url || '')
-    const m = url.match(/^[a-z0-9+.-]+:\/\/(?:[^/@]+@)?([^:/?#]+):(\d+)/i)
-    if (m) want = `${m[1]}:${Number(m[2])}`
-  }
+  const want = socksProxyEndpoint(vm?.proxy)
   if (!want) return { ok: true }
   if (workerProxyEndpoint === WORKER_PROXY_UNKNOWN) return { ok: true }
   if (!workerProxyEndpoint) return { ok: false, reason: 'worker_proxy_missing' }

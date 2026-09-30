@@ -177,7 +177,7 @@ export function VmDetailPage() {
   const pool = proxies.data?.proxies || []
   const boundId = String(proxy.id || vm.proxy_id || '')
   const free = pool.filter((p) => {
-    if (!p.enabled || p.status === 'dead') return false
+    if (!p.enabled || p.status === 'dead' || p.blocked_reason) return false
     const ids = p.bound_vm_ids || (p.bound_vm_id ? [p.bound_vm_id] : [])
     return !ids.includes(id) && ids.length < (p.bind_limit || 5)
   })

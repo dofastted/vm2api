@@ -21,6 +21,7 @@ import {
   proxyIsInvalid,
   proxyOptionLabel,
   proxyStatusLabel,
+  proxyHostText,
   readPositive,
   sortedProxiesByAvailability,
 } from '@/features/proxies/proxy-sort'
@@ -46,8 +47,22 @@ function parseSocksHint(text: string): { host: string; port: string } | null {
       .map((s) => s.trim())
       .find(Boolean) || ''
   if (!line) return null
-  const m = line.match(/^socks5h?:\/\/(?:[^@]+@)?([^:/]+):(\d+)/i)
-  if (m) return { host: m[1], port: String(m[2]) }
+  try {
+    if (/^socks5h?:\/\//i.test(line)) {
+      const url = new URL(line)
+      return {
+        host: url.hostname.replace(/^\[|\]$/g, ''),
+        port: url.port || '1080',
+      }
+    }
+    const bracketed = line.match(/^(\[[^\]]+\]):(\d+)/)
+    if (bracketed) {
+      const url = new URL(`socks5://${bracketed[1]}:${bracketed[2]}`)
+      return { host: url.hostname.slice(1, -1), port: url.port }
+    }
+  } catch {
+    return null
+  }
   const parts = line.split(':')
   if (parts.length >= 2 && parts[0] && /^\d+$/.test(parts[1])) {
     return { host: parts[0], port: parts[1] }
@@ -203,10 +218,14 @@ export function ImportProxyStep({ vmId }: { vmId: string }) {
           <StatusMark
             tone={{
               key: 'proxy',
-              text: `${bound.host}:${bound.port} · ${proxyStatusLabel(bound)}${
+              text: `${proxyHostText(bound)} · ${proxyStatusLabel(bound)}${
                 bound.latency_ms != null ? ` ${bound.latency_ms}ms` : ''
               }`,
-              cls: proxyIsInvalid(bound) ? 'bad' : 'ok',
+              cls: bound.blocked_reason
+                ? 'off'
+                : proxyIsInvalid(bound)
+                  ? 'bad'
+                  : 'ok',
             }}
             variant='pill'
           />

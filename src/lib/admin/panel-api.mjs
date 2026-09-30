@@ -33,6 +33,8 @@ import { getUsageCache } from '../oauth/usage-cache.mjs'
 import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import { filterVmsForPanel } from './resource-owner.mjs'
 import { computeWeeklySplit, publicWeeklySplit, weeklySplitConfig } from '../pool/weekly-split.mjs'
+import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
+import { socksProxyFamily, normalizeSocksHost } from '../vm/socks-address.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from '../pool/quota-tiers.mjs'
 import { inferClaudeTier } from '../pool/claude-tier.mjs'
 import { listQuotaFromHeaders, isOfficialWindowLimited } from '../pool/quota-window.mjs'
@@ -1371,6 +1373,7 @@ function proxyConfigured(v, hit) {
 }
 
 function canImportCredential(v, hit) {
+  if (hit ? hit.blocked_reason : proxyBlockedReason(v.proxy)) return false
   if (hit) return !!(hit.enabled && hit.status !== 'dead' && hit.status !== 'fail')
   const base = v.proxy || {}
   const scheme = String(base.scheme || base.kind || '').toLowerCase()
@@ -1389,12 +1392,14 @@ function mergeVmProxy(v, poolSnap) {
   return {
     proxy: {
       id: hit?.id || base.id || v.proxy_id || null,
-      host: hit?.host || base.host || null,
+      host: normalizeSocksHost(hit?.host || base.host) || hit?.host || base.host || null,
       port: hit?.port ?? base.port ?? null,
       scheme: hit?.scheme || base.scheme || (hit?.id === 'px-local' || base.id === 'px-local' ? 'local' : 'socks5'),
       has_auth: hit?.has_auth ?? !!(base.url && /\/\/[^/@]+@/.test(base.url)),
       status: hit?.status ?? null,
       enabled: hit?.enabled ?? null,
+      blocked_reason: hit ? hit.blocked_reason || null : proxyBlockedReason(base),
+      address_family: hit?.address_family || socksProxyFamily(base) || null,
       latency_ms: hit?.latency_ms ?? null,
       last_error: hit?.last_error || null,
       last_probe_at: hit?.last_probe_at || null,

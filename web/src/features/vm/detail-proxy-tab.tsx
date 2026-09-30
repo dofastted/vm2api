@@ -1,6 +1,7 @@
 import { Link } from '@tanstack/react-router'
 import type { Vm, VmProxySnap } from '@/types/panel-vm'
 import { cn } from '@/lib/utils'
+import { proxyHostLabel } from '@/lib/vm-status'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
@@ -13,6 +14,7 @@ import {
 import { TabsContent } from '@/components/ui/tabs'
 import { StatusMark } from '@/components/status-mark'
 import { HealthDonut } from '@/features/overview/health-gauge'
+import { proxyStatusLabel } from '@/features/proxies/proxy-sort'
 import {
   proxyFieldClass,
   proxyLatencyTone,
@@ -67,13 +69,12 @@ export function VmProxyTab(props: VmProxyTabProps) {
             </Field>
             <Field label='地址'>
               <span className='field-host text-xs'>
-                {String(proxy.host || '—')}
-                {proxy.port != null ? `:${proxy.port}` : ''}
+                {proxyHostLabel(proxy)}
               </span>
             </Field>
             <Field label='状态'>
               <span className='flex items-center gap-2'>
-                {String(proxy.status || '—')}
+                {proxyStatusLabel(proxy)}
                 {vm.has_token && !proxy.host && !vm.proxy_id ? (
                   <StatusMark
                     variant='pill'
@@ -138,7 +139,11 @@ export function VmProxyTab(props: VmProxyTabProps) {
                 </span>
               ) : (
                 <span className='text-xs text-muted-foreground'>
-                  {proxy.geo?.error ? '检测失败' : '未检测'}
+                  {proxy.blocked_reason
+                    ? 'IPv6 已关闭'
+                    : proxy.geo?.error
+                      ? '检测失败'
+                      : '未检测'}
                 </span>
               )}
             </Field>
@@ -148,10 +153,20 @@ export function VmProxyTab(props: VmProxyTabProps) {
       <div className='flex flex-wrap gap-2'>
         {boundId ? (
           <>
-            <Button size='sm' variant='outline' onClick={onProbe}>
+            <Button
+              size='sm'
+              variant='outline'
+              onClick={onProbe}
+              disabled={!!proxy.blocked_reason}
+            >
               测通
             </Button>
-            <Button size='sm' variant='outline' onClick={onGeo}>
+            <Button
+              size='sm'
+              variant='outline'
+              onClick={onGeo}
+              disabled={!!proxy.blocked_reason}
+            >
               测地理
             </Button>
             <Button size='sm' variant='outline' onClick={onUnbind}>
@@ -180,7 +195,7 @@ export function VmProxyTab(props: VmProxyTabProps) {
             <SelectContent>
               {free.map((p) => (
                 <SelectItem key={p.id} value={p.id || ''}>
-                  {p.host}:{p.port}
+                  {proxyHostLabel(p)}
                 </SelectItem>
               ))}
             </SelectContent>

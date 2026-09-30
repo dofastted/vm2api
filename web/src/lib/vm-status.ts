@@ -738,7 +738,12 @@ export function proxyHostLabel(
   proxy: { host?: string; port?: number | string; id?: string } | undefined
 ): string {
   if (!proxy) return '—'
-  if (proxy.host)
-    return `${proxy.host}${proxy.port != null ? `:${proxy.port}` : ''}`
+  if (proxy.host) {
+    const host =
+      proxy.host.includes(':') && !proxy.host.startsWith('[')
+        ? `[${proxy.host}]`
+        : proxy.host
+    return `${host}${proxy.port != null ? `:${proxy.port}` : ''}`
+  }
   return proxy.id || '—'
 }

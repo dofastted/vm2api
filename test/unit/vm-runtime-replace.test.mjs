@@ -109,3 +109,16 @@ test('reload writes transparent egress for local exit without a SOCKS url', () =
   assert.notEqual(result.error, 'slot SOCKS5 proxy is required')
   fs.rmSync(root, { recursive: true, force: true })
 })
+
+test('IPv6 address spelling does not desynchronize a slot, a changed endpoint does', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-ipv6-sync-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const vm = { id: 'vm-03', proxy: { host: '[2001:0db8::1]', port: 1080 } }
+  const run = path.join(root, 'vms', vm.id, 'run')
+  fs.mkdirSync(run, { recursive: true })
+  const config = path.join(run, 'worker.json')
+  fs.writeFileSync(config, JSON.stringify({ proxy_url: 'socks5h://user:p%40ss@[2001:db8::1]:1080' }))
+  assert.equal(isSlotProxyDesynced(vm, root), false)
+  fs.writeFileSync(config, JSON.stringify({ proxy_url: 'socks5h://user:p%40ss@[2001:db8::2]:1080' }))
+  assert.equal(isSlotProxyDesynced(vm, root), true)
+})

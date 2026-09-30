@@ -9,12 +9,14 @@ import { isLeftoverQuotaScheduleOff, isQuotaWindowReason } from './availability.
 import { orderOpenAIAccounts } from './openai-account-selector.mjs'
 import { bumpOpenAICursor, openAIRuntimeSignals, readOpenAICursor } from './openai-account-runtime.mjs'
 import { modelMatchesAllowlist } from './slot-model-gate.mjs'
+import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 
 // `stopped` is leftover Claude docker lifecycle. Codex kernel is independent.
 const HARD_UNAVAILABLE = new Set(['dead', 'error', 'disabled'])
 
 export function isCodexSlotReady(vm) {
   if (!vm || !isCodexVm(vm)) return false
+  if (proxyBlockedReason(vm.proxy)) return false
   if (vm.schedulable === false && !isLeftoverQuotaScheduleOff(vm)) return false
   if (!vm.has_token) return false
   const status = String(vm.status || '').toLowerCase()
@@ -82,6 +84,8 @@ export function pickCodexSlots(vms, { pin = null, now = Date.now() } = {}) {
   if (pin) {
     const vm = list.find((item) => item?.id === pin) || null
     if (!vm || !isCodexVm(vm)) return { error: 'platform_mismatch', pin, ids: [], ready: [], parked: [] }
+    const blocked = proxyBlockedReason(vm.proxy)
+    if (blocked) return { error: blocked, pin, ids: [], ready: [], parked: [] }
     return { ids: [vm.id], pin, ready: [vm.id], parked: [] }
   }
   const ready = []
@@ -138,6 +142,7 @@ function quotaResetAt(vm) {
 
 export function codexAccountStatus(vm, now = Date.now()) {
   if (!vm || !isCodexVm(vm)) return 'error'
+  if (proxyBlockedReason(vm.proxy)) return 'disabled'
   if (vm.schedulable === false && !isLeftoverQuotaScheduleOff(vm)) return 'disabled'
   const status = String(vm.status || '').toLowerCase()
   if (status === 'disabled') return 'disabled'

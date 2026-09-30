@@ -44,9 +44,11 @@ export function createImportCommit(ctx) {
     const allowProxyBypass = process.env.KIN_CRS_MOCK === '1' && body.require_proxy === false
     if (!resolved.ok && !allowProxyBypass) {
       const message =
-        resolved.reason === 'proxy_unavailable'
-          ? '虚拟机 SOCKS5 不可用，请先更换或探测代理再转换凭证'
-          : '虚拟机未绑定 SOCKS5，请先分配代理再转换凭证'
+        resolved.reason === 'ipv6_disabled'
+          ? 'IPv6 已关闭，请在设置 → SOCKS5 开启 IPv6 代理出口'
+          : resolved.reason === 'proxy_unavailable'
+            ? '虚拟机 SOCKS5 不可用，请先更换或探测代理再转换凭证'
+            : '虚拟机未绑定 SOCKS5，请先分配代理再转换凭证'
       return { ok: false, status: 400, message, resolved }
     }
     return { ok: true, proxyUrl: resolved.proxyUrl, resolved }

@@ -21,10 +21,15 @@ export function ProxyChip({
 }) {
   const host = proxyHostLabel(vm.proxy)
   const tone = vmProxyTone(vm)
-  const lat = vm.proxy?.latency_ms
+  const blocked = vm.proxy?.blocked_reason === 'ipv6_disabled'
+  const lat = blocked ? null : vm.proxy?.latency_ms
   const bound = host !== '—'
   const label = bound ? host : tone === 'danger' ? '缺代理' : '直连'
-  const title = lat != null && bound ? `${host} · ${lat}ms` : label
+  const title = blocked
+    ? `${host} · IPv6 已关闭（设置 → SOCKS5 开启）`
+    : lat != null && bound
+      ? `${host} · ${lat}ms`
+      : label
 
   return (
     <div
@@ -44,11 +49,16 @@ export function ProxyChip({
           {compact ? null : (
             <span className='field-host truncate text-xs'>{host}</span>
           )}
+          {blocked ? (
+            <span className='shrink-0 text-[11px] text-muted-foreground'>
+              IPv6 已关闭
+            </span>
+          ) : null}
           {lat != null ? (
             <span className='field-metric shrink-0 text-[11px] tabular-nums'>
               {latencyDigits(lat)}
             </span>
-          ) : compact ? (
+          ) : compact && !blocked ? (
             <span className='text-[11px]'>{tone === 'ok' ? '通' : '未测'}</span>
           ) : null}
         </>

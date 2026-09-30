@@ -12,6 +12,7 @@ import {
   PROXY_HEALTH_LABEL,
   type ProxyFilter,
   proxyBindLimit,
+  proxyBindable,
   proxyBoundIds,
   proxyHealthKey,
   proxyHostText,
@@ -67,7 +68,7 @@ export function ProxyOverview({
   const loose = vms.filter((v) => !ownerOf.has(v.id))
   const stranded = loose.filter((v) => v.has_token).length
   const freeSeats = proxies.reduce((n, p) => {
-    if (p.enabled === false || p.status === 'dead') return n
+    if (!proxyBindable(p)) return n
     return (
       n + Math.max(0, proxyBindLimit(p, poolLimit) - proxyBoundIds(p).length)
     )

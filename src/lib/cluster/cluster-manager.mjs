@@ -12,6 +12,8 @@ import { DOCKER_SOCKET_PATH, dockerInfo, dockerPing, sshDocker } from './docker-
 import { collectLocalStatus } from './local-status.mjs'
 import { shellQuote } from './remote-fs.mjs'
 import { SocketRelay } from './socket-relay.mjs'
+import { configuredIpv6Enabled } from '../vm/proxy-policy.mjs'
+import { syncIpv6ProxyEgress } from '../vm/proxy-policy-runtime.mjs'
 import {
   ClusterError,
   connectSsh,
@@ -210,6 +212,12 @@ export class ClusterManager {
       docker = { ok: false, error: err.message }
     }
     if (link.client !== client) return
+    if (docker.ok && !configuredIpv6Enabled()) {
+      const exits = await syncIpv6ProxyEgress(null, null, { nodeId: id, vms: this.vmsOnNode(id) })
+      for (const exit of exits.filter((item) => !item.ok)) {
+        this.logger.warn('[ipv6-policy] exit not blocked', exit.vm_id, exit.error)
+      }
+    }
     this.health.set(id, {
       latency_ms: latencyMs == null ? null : Math.round(latencyMs),
       docker,

@@ -13,6 +13,7 @@ export const PROXY_LATENCY_WARN_MS = 300
 export type ProxyFieldTone = 'ok' | 'caution' | 'danger' | 'none'
 
 export function proxyLatencyTone(proxy: VmProxySnap): ProxyFieldTone {
+  if (proxy.blocked_reason) return 'none'
   if (proxyIsInvalid(proxy)) return 'danger'
   if (proxy.latency_ms != null && proxy.latency_ms > PROXY_LATENCY_WARN_MS) {
     return 'caution'
@@ -80,7 +81,14 @@ const HEALTH_MARK: Record<ProxyHealthKey, string> = {
 /** StatusMark 的形状编码：未测是虚线环，禁用是方块，不和故障混成一档。 */
 export function proxyStatusTone(proxy: VmProxySnap): StatusTone {
   const key = proxyHealthKey(proxy)
-  return { key, text: PROXY_HEALTH_LABEL[key], cls: HEALTH_MARK[key] }
+  return {
+    key,
+    text:
+      proxy.blocked_reason === 'ipv6_disabled'
+        ? 'IPv6 已关闭'
+        : PROXY_HEALTH_LABEL[key],
+    cls: HEALTH_MARK[key],
+  }
 }
 
 /** 延迟信号格数：≤150ms 三格，≤告警阈值两格，更慢一格，失效或未测零格。 */
