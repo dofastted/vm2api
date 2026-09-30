@@ -173,6 +173,12 @@ func (s *Server) handleTCP(ctx context.Context, conn net.Conn) {
 		log.Printf("kin-egress original dest: %v", err)
 		return
 	}
+	// A direct probe has no REDIRECT target: forwarding it through a local
+	// SOCKS proxy would connect back here and recursively create new sockets.
+	if dest == conn.LocalAddr().String() {
+		log.Printf("kin-egress refuse self-destined conn from %s dest=%s", conn.RemoteAddr(), dest)
+		return
+	}
 	if err = s.ForwardTCP(ctx, conn, dest); err != nil {
 		log.Printf("kin-egress %v", err)
 	}

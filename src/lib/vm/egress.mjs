@@ -385,15 +385,19 @@ function waitListen(host, port, timeoutMs = 8000) {
   const start = Date.now()
   const h = host || '127.0.0.1'
   while (Date.now() - start < timeoutMs) {
-    const r = sh(
-      [
-        'python3',
-        '-c',
-        `import socket,sys; s=socket.socket(); s.settimeout(0.2); sys.exit(0 if s.connect_ex(('${h}',${Number(port)}))==0 else 1)`,
-      ],
-      { timeout: 2000 },
+    // A TCP connect is traffic to the transparent forwarder, not a passive
+    // readiness check. Inspect LISTEN sockets without entering its data path.
+    const r = sh(['ss', '-H', '-ltn', `sport = :${Number(port)}`], { timeout: 2000 })
+    if (
+      r.ok &&
+      r.stdout.split('\n').some((line) => {
+        const local = line.trim().split(/\s+/)[3]
+        return (
+          local === `${h}:${port}` || local === `0.0.0.0:${port}` || local === `*:${port}` || local === `[::]:${port}`
+        )
+      })
     )
-    if (r.ok) return true
+      return true
     sh(['python3', '-c', 'import time; time.sleep(0.1)'], { timeout: 1000 })
   }
   return false

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import net from 'node:net'
 import {
   LOCAL_EGRESS_ID,
   boundProxyUrl,
@@ -18,6 +19,7 @@ import {
   isLocalEgressProxy,
   localEgressStatus,
   egressListening,
+  egressRunDir,
   proxyEgressReady,
   networkName,
   portsForProxy,
@@ -152,4 +154,28 @@ test('egress config carries dns_upstream only when configured', () => {
   const b = startEgressProcess({ ...base, proxyId: 'px-b', dnsUpstream: '8.8.8.8:53,1.1.1.1:53' })
   assert.equal(JSON.parse(fs.readFileSync(b.configPath, 'utf8')).dns_upstream, '8.8.8.8:53,1.1.1.1:53')
   fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('egress readiness checks the exact listener without opening a connection', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'egress-listen-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  let accepted = 0
+  const listener = net.createServer((socket) => {
+    accepted++
+    socket.destroy()
+  })
+  await new Promise((resolve) => listener.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => listener.close(resolve)))
+  const proxyId = 'px-passive-probe'
+  const dir = egressRunDir(root, proxyId)
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(path.join(dir, 'egress.pid'), String(process.pid))
+  const config = path.join(dir, 'egress.json')
+  const port = listener.address().port
+  fs.writeFileSync(config, JSON.stringify({ listen_tcp: `127.0.0.1:${port}` }))
+  assert.equal(egressListening(root, proxyId).ok, true)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(accepted, 0, 'readiness must not enter the transparent forwarding path')
+  fs.writeFileSync(config, JSON.stringify({ listen_tcp: `127.0.0.2:${port}` }))
+  assert.equal(egressListening(root, proxyId, 100).reason, 'not_listening')
 })
