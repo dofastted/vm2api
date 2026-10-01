@@ -16,6 +16,15 @@ import { assertProxyAllowed, proxyBlockedReason } from './proxy-policy.mjs'
 export const EGRESS_BIN = process.env.KIN_EGRESS_BIN || '/opt/kin-gateway/bin/kin-egress'
 export const LOCAL_EGRESS_ID = 'px-local'
 
+const LOCAL_PROXY_ENV_KEYS = Object.freeze([
+  'HTTPS_PROXY',
+  'https_proxy',
+  'HTTP_PROXY',
+  'http_proxy',
+  'ALL_PROXY',
+  'all_proxy',
+])
+
 export function isLocalEgressProxy(proxy) {
   if (!proxy || typeof proxy !== 'object') return false
   const id = String(proxy.id || '').trim()
@@ -26,6 +35,16 @@ export function isLocalEgressProxy(proxy) {
     .trim()
     .toLowerCase()
   return id === LOCAL_EGRESS_ID || scheme === 'local' || host === 'local'
+}
+
+/** Use the deployment's configured proxy for host-side requests on local egress. */
+export function localEgressProxyUrl(proxy, env = process.env) {
+  if (!isLocalEgressProxy(proxy)) return ''
+  for (const key of LOCAL_PROXY_ENV_KEYS) {
+    const value = String(env?.[key] || '').trim()
+    if (value) return value.replace(/^socks5:\/\//i, 'socks5h://')
+  }
+  return ''
 }
 
 /** Remote SOCKS (url or host:port) or local egress. Empty URL is not "unbound". */

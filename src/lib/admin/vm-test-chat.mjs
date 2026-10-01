@@ -17,7 +17,7 @@ import { readRoutingConfigFile } from '../core/config.mjs'
 import { getVm, vmHasClaudeCredential } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { summarizeCodexSlot, readCodexAccounts, writeCodexAccounts } from '../vm/codex-slot.mjs'
-import { boundProxyUrl, isLocalEgressProxy } from '../vm/egress.mjs'
+import { boundProxyUrl, isLocalEgressProxy, localEgressProxyUrl } from '../vm/egress.mjs'
 import { loadVmIdentity } from '../identity/vm-identity.mjs'
 import { snapshotOauth } from '../vm/execution-context.mjs'
 import { atomicWriteJson } from '../vm/vm-file.mjs'
@@ -188,8 +188,8 @@ export async function syncCodexCatalog({
   let usedVm = null
   let lastError = null
   for (const target of targets) {
-    const direct = isLocalEgressProxy(target.proxy)
-    const proxyUrl = boundProxyUrl(target.proxy)
+    const proxyUrl = boundProxyUrl(target.proxy) || localEgressProxyUrl(target.proxy)
+    const direct = isLocalEgressProxy(target.proxy) && !proxyUrl
     if (!proxyUrl && !fetchImpl && !direct) {
       lastError = {
         ok: false,

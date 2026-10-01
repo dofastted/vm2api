@@ -17,6 +17,7 @@ import {
   inspectEgressProcess,
   iptablesPlan,
   isLocalEgressProxy,
+  localEgressProxyUrl,
   localEgressStatus,
   egressListening,
   egressRunDir,
@@ -74,6 +75,13 @@ test('local egress is identified and has no SOCKS url', () => {
   assert.equal(isLocalEgressProxy({ host: '1.2.3.4', port: 1080 }), false)
   assert.equal(boundProxyUrl({ id: LOCAL_EGRESS_ID, host: 'local', port: 0 }), '')
   assert.equal(slotNetworkForVm({ proxy: { id: LOCAL_EGRESS_ID } }), 'kin-eg-px-local')
+})
+
+test('local egress uses configured proxy without embedding a port', () => {
+  const proxy = { id: LOCAL_EGRESS_ID }
+  assert.equal(localEgressProxyUrl(proxy, { HTTPS_PROXY: 'http://proxy.example:8443' }), 'http://proxy.example:8443')
+  assert.equal(localEgressProxyUrl(proxy, { ALL_PROXY: 'socks5://proxy.example:1080' }), 'socks5h://proxy.example:1080')
+  assert.equal(localEgressProxyUrl({ id: 'px-remote' }, { HTTPS_PROXY: 'http://proxy.example:8443' }), '')
 })
 
 test('inspectEgressNetwork exposes name and network for slot start', () => {

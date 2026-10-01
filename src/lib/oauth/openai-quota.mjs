@@ -6,7 +6,7 @@
 import crypto from 'node:crypto'
 import { getVm } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
-import { boundProxyUrl, isLocalEgressProxy } from '../vm/egress.mjs'
+import { boundProxyUrl, isLocalEgressProxy, localEgressProxyUrl } from '../vm/egress.mjs'
 import { readCodexAccounts, upsertCodexAccount, persistCodexQuotaSnapshot } from '../vm/codex-slot.mjs'
 import { buildCodexUsageView, extraToCodexSnapshot, normalizeCodexLimits } from '../protocol/codex-usage.mjs'
 import { CODEX_OAUTH_ORIGINATOR, makeSocksFetch, refreshCodexAccessToken } from '../protocol/codex-models.mjs'
@@ -249,7 +249,7 @@ async function loadSlot(projectRoot, vmId) {
   if (!access && !refresh) {
     return { ok: false, error: 'no_oauth_token', message: 'GPT 槽没有 OAuth 凭证', status: 400 }
   }
-  const proxyUrl = boundProxyUrl(vm.proxy)
+  const proxyUrl = boundProxyUrl(vm.proxy) || localEgressProxyUrl(vm.proxy)
   return {
     ok: true,
     vm,
@@ -258,7 +258,7 @@ async function loadSlot(projectRoot, vmId) {
     refresh,
     accountId: firstString(first.chatgpt_account_id, vm.codex?.chatgpt_account_id),
     proxyUrl,
-    direct: isLocalEgressProxy(vm.proxy),
+    direct: isLocalEgressProxy(vm.proxy) && !proxyUrl,
   }
 }
 
