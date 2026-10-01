@@ -52,13 +52,13 @@ export async function lookupProxyGeo(proxyUrl, { endpoint, timeoutMs, fetchImpl 
   const { default: nodeFetch } = await import('node-fetch')
   const impl = fetchImpl || nodeFetch
   const opts = { method: 'GET', headers: { accept: 'application/json' } }
-  if (proxyUrl) {
-    const { createSocksProxyAgent } = await import('./socks-transport.mjs')
-    opts.agent = createSocksProxyAgent(proxyUrl)
-  }
-  if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) opts.signal = AbortSignal.timeout(timeout)
   let res
   try {
+    if (proxyUrl) {
+      const { createSocksProxyAgent } = await import('./socks-transport.mjs')
+      opts.agent = createSocksProxyAgent(proxyUrl)
+    }
+    if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) opts.signal = AbortSignal.timeout(timeout)
     res = await impl(url, opts)
   } catch (error) {
     return { ok: false, error: `geo_transport_error:${String(error?.message || error).slice(0, 120)}` }

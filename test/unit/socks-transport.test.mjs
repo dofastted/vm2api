@@ -319,3 +319,68 @@ test('agent options still support trusted TLS through an IPv6 proxy', async (t) 
   assert.deepEqual(await res.json(), geoPayload)
   assert.equal(peer.connections, 1)
 })
+
+test('invalid proxy configuration rejects fetch and returns a Geo transport error without direct fallback', async (t) => {
+  const target = await upstream(t)
+  const endpoint = `http://127.0.0.1:${target.port}/invalid-proxy`
+  for (const proxyUrl of ['http://[::1]:1080', 'socks5h://[::1:1080', 'socks5h:///']) {
+    await assert.rejects(makeSocksFetch(proxyUrl, 30000)(endpoint))
+    const result = await lookupProxyGeo(proxyUrl, { endpoint })
+    assert.equal(result.ok, false)
+    assert.match(result.error, /^geo_transport_error:/)
+  }
+  assert.equal(target.requests.length, 0)
+  // A rejected agent constructor must not leave a 30-second abort timer alive.
+  await execFileAsync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `import assert from 'node:assert/strict';
+       import { makeSocksFetch } from './src/lib/protocol/codex-models.mjs';
+       await assert.rejects(makeSocksFetch('socks5h://[::1:1080', 30000)('http://127.0.0.1:1'));`,
+    ],
+    { cwd: fileURLToPath(new URL('../../', import.meta.url)), timeout: 10000 },
+  )
+})
+
+test('real pool Geo honors IPv6 policy and distinguishes forced transport from cached batch results', async (t) => {
+  const target = await upstream(t)
+  const peer = await socksPeer(t, { targetPort: target.port, auth: credentials })
+  const endpoint = `http://[::1]:${target.port}/pool-geo`
+  const pool = new ProxyPool({
+    db: openDatabase({ dbPath: ':memory:' }),
+    geoLookup: (url, options) => lookupProxyGeo(url, { ...options, endpoint }),
+  })
+  pool.updateConfig({ enabled: false })
+  t.after(() => {
+    pool.stopScheduler()
+    closeDatabase()
+  })
+  const id = pool.importLines(socksProxyUrl({ host: '::1', port: peer.port, ...credentials })).items[0].id
+  assert.equal((await pool.detectGeo(id, { force: true })).error, 'ipv6_disabled')
+  let batch = await pool.detectGeoAll({ force: true })
+  assert.equal(batch.results[0].error, 'ipv6_disabled')
+  assert.equal(peer.connections, 0)
+
+  pool.updateConfig({ ipv6_enabled: true })
+  const fresh = await pool.detectGeo(id)
+  assert.equal(fresh.ok, true)
+  assert.equal(fresh.cached, false)
+  assert.equal(fresh.geo.ip, geoPayload.query)
+  assert.equal(peer.connections, 1)
+  batch = await pool.detectGeoAll()
+  assert.equal(batch.results[0].cached, true)
+  assert.equal(peer.connections, 1)
+  batch = await pool.detectGeoAll({ force: true })
+  assert.equal(batch.results[0].ok, true)
+  assert.equal(batch.results[0].cached, false)
+  assert.equal(peer.connections, 2)
+
+  pool.updateConfig({ ipv6_enabled: false })
+  assert.equal((await pool.detectGeo(id)).error, 'ipv6_disabled')
+  batch = await pool.detectGeoAll({ force: true })
+  assert.equal(batch.results[0].error, 'ipv6_disabled')
+  assert.equal(peer.connections, 2)
+  assert.equal(target.requests.length, 2)
+})

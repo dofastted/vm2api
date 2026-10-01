@@ -173,12 +173,18 @@ export function makeSocksFetch(proxyUrl, timeoutMs = 15000) {
     .trim()
     .replace(/^socks5:\/\//i, 'socks5h://')
   const ms = Math.min(Math.max(Number(timeoutMs) || 15000, 3000), 30000)
-  return (url, init = {}) => {
+  return async (url, init = {}) => {
+    const opts = { ...init }
+    // Reject an invalid proxy before starting a timeout or making a request.
+    if (px) opts.agent = createSocksProxyAgent(px)
     const ac = new AbortController()
     const timer = setTimeout(() => ac.abort(), ms)
-    const opts = { ...init, signal: ac.signal }
-    if (px) opts.agent = createSocksProxyAgent(px)
-    return fetch(url, opts).finally(() => clearTimeout(timer))
+    opts.signal = ac.signal
+    try {
+      return await fetch(url, opts)
+    } finally {
+      clearTimeout(timer)
+    }
   }
 }
 
