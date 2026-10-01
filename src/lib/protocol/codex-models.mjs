@@ -7,7 +7,7 @@
 import fetch from 'node-fetch'
 import fs from 'node:fs'
 import path from 'node:path'
-import { SocksProxyAgent } from 'socks-proxy-agent'
+import { createSocksProxyAgent } from '../vm/socks-transport.mjs'
 import { isSyncableGptCatalogId } from './gpt-ids.mjs'
 
 export { SKIP_GPT, GPT_ID_PREFIX, isGptSeriesId, isSyncableGptCatalogId } from './gpt-ids.mjs'
@@ -177,7 +177,7 @@ export function makeSocksFetch(proxyUrl, timeoutMs = 15000) {
     const ac = new AbortController()
     const timer = setTimeout(() => ac.abort(), ms)
     const opts = { ...init, signal: ac.signal }
-    if (px) opts.agent = new SocksProxyAgent(px)
+    if (px) opts.agent = createSocksProxyAgent(px)
     return fetch(url, opts).finally(() => clearTimeout(timer))
   }
 }
