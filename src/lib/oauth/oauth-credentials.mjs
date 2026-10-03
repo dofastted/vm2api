@@ -276,13 +276,11 @@ export function replaceSlotOwnedFile(filePath, body, vm) {
 }
 
 export function slotUidGidFromHomeDir(homeDir) {
-  const m = String(homeDir || '')
-    .replace(/\\/g, '/')
-    .match(/\/(vm-\d+)\/cli-home\/?$/i)
+  const normalized = String(homeDir || '').replace(/\\/g, '/')
+  const m = normalized.match(/\/([^/]+)\/cli-home\/?$/i)
   if (!m) return null
-  const n = Number(String(m[1]).slice(3))
-  if (!Number.isFinite(n) || n < 1) return null
-  return { uid: 10000 + n, gid: Number(process.env.KIN_VM_GID || 987) }
+  // Custom slot ids use the same shared uid as other non-numeric slots.
+  return slotRuntimeOwner({ id: m[1] })
 }
 
 export function ensureSlotClaudeOwnership(homeDir, uid = null, gid = null) {
