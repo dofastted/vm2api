@@ -46,7 +46,7 @@ jobs:
             api-kernel/go.sum
       - name: gofmt
         run: |
-          files=$(gofmt -l worker api-kernel)
+          files=$(gofmt -l worker api-kernel codex-kernel)
           if [ -n "$files" ]; then
             printf 'gofmt needed:\n%s\n' "$files" >&2
             exit 1
@@ -55,14 +55,17 @@ jobs:
         run: |
           (cd worker && go test -race ./...)
           (cd api-kernel && go test -race ./...)
+          (cd codex-kernel && go test -race ./...)
       - name: go vet
         run: |
           (cd worker && go vet ./...)
           (cd api-kernel && go vet ./...)
+          (cd codex-kernel && go vet ./...)
       - name: build Go commands
         run: |
           (cd worker && CGO_ENABLED=0 go build -trimpath ./cmd/...)
           (cd api-kernel && CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/kin-api-kernel" ./cmd/kin-api-kernel)
+          (cd codex-kernel && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o "$RUNNER_TEMP/kin-codex-kernel" .)
 
   kernel:
     runs-on: ubuntu-latest
