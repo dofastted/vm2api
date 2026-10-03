@@ -276,13 +276,11 @@ export function replaceSlotOwnedFile(filePath, body, vm) {
 }
 
 export function slotUidGidFromHomeDir(homeDir) {
-  const m = String(homeDir || '')
+  const id = String(homeDir || '')
     .replace(/\\/g, '/')
-    .match(/\/(vm-\d+)\/cli-home\/?$/i)
-  if (!m) return null
-  const n = Number(String(m[1]).slice(3))
-  if (!Number.isFinite(n) || n < 1) return null
-  return { uid: 10000 + n, gid: Number(process.env.KIN_VM_GID || 987) }
+    .match(/\/([^/]+)\/cli-home\/?$/i)?.[1]
+  if (!id) return null
+  return slotRuntimeOwner({ id })
 }
 
 export function ensureSlotClaudeOwnership(homeDir, uid = null, gid = null) {
@@ -417,7 +415,11 @@ export function ensureSlotSubscriptionType(homeDir, accountTier = null) {
   }
   const oauth = doc?.claudeAiOauth
   if (!oauth || typeof oauth !== 'object') return { wrote: false, reason: 'no_oauth' }
-  if (normalizeSubscriptionType(oauth.subscriptionType)) return { wrote: false, reason: 'present' }
+  if (normalizeSubscriptionType(oauth.subscriptionType)) {
+    chownSlotCredentialFile(homeDir, file)
+    return { wrote: false, reason: 'present' }
+  }
+
   const tier = normalizeSubscriptionType(accountTier) || 'pro'
   oauth.subscriptionType = tier
   try {

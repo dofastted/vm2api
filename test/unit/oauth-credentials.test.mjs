@@ -401,8 +401,13 @@ test('ensureSlotSubscriptionType fills an old credential and keeps an existing p
   fs.rmSync(home, { recursive: true, force: true })
 })
 
-test('slotUidGidFromHomeDir maps numeric slot homes', () => {
+test('slotUidGidFromHomeDir maps numeric and named slot homes', () => {
   assert.deepEqual(slotUidGidFromHomeDir('/opt/kin-gateway-rust/vms/vm-03/cli-home'), { uid: 10003, gid: 987 })
+  assert.deepEqual(slotUidGidFromHomeDir('/opt/vm2api/vms/claude-ios-145/cli-home'), { uid: 10001, gid: 987 })
+  assert.deepEqual(slotUidGidFromHomeDir('/opt/kin-gateway/vms/bloat-ranges-3hicloudcom/cli-home'), {
+    uid: 10001,
+    gid: 987,
+  })
   assert.equal(slotUidGidFromHomeDir('/tmp/kin-slot-write-xxx'), null)
 })
 
