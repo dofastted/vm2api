@@ -37,6 +37,10 @@ import { clientIp } from '../pool/sticky-router.mjs'
 // the Codex kernel attaches the selected OAuth credential itself.
 const CODEX_KERNEL_HEADER_ALLOWLIST = Object.freeze([
   'originator',
+  'openai-beta',
+  'session-id',
+  'thread-id',
+  'x-client-request-id',
   'x-codex-beta-features',
   'x-codex-installation-id',
   'x-codex-parent-thread-id',

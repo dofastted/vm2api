@@ -753,6 +753,10 @@ test('codex kernel envelope preserves official routing headers without client au
     headers: {
       authorization: 'Bearer sub2api-key',
       originator: 'Codex Desktop',
+      'openai-beta': 'responses_websockets=2026-02-06',
+      'session-id': 'session:t',
+      'thread-id': 'thread:t',
+      'x-client-request-id': 'request:t',
       'x-codex-beta-features': 'remote_compaction_v2',
       'x-codex-turn-metadata': '{"thread_id":"t"}',
       'x-codex-window-id': 'window:2',
@@ -762,6 +766,10 @@ test('codex kernel envelope preserves official routing headers without client au
   })
   assert.deepEqual(envelopes[0].headers, {
     originator: 'Codex Desktop',
+    'openai-beta': 'responses_websockets=2026-02-06',
+    'session-id': 'session:t',
+    'thread-id': 'thread:t',
+    'x-client-request-id': 'request:t',
     'x-codex-beta-features': 'remote_compaction_v2',
     'x-codex-turn-metadata': '{"thread_id":"t"}',
     'x-codex-window-id': 'window:2',
