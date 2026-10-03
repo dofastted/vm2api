@@ -764,10 +764,11 @@ test('codex kernel envelope preserves official routing headers without client au
     },
     body: { model: 'gpt-6.1-sol', input: 'hi', stream: false, service_tier: 'priority' },
   })
+  const session = envelopes[0].session
   assert.deepEqual(envelopes[0].headers, {
     originator: 'Codex Desktop',
     'openai-beta': 'responses_websockets=2026-02-06',
-    'session-id': 'session:t',
+    'session-id': session.session_id,
     'thread-id': 'thread:t',
     'x-client-request-id': 'request:t',
     'x-codex-beta-features': 'remote_compaction_v2',
@@ -776,6 +777,8 @@ test('codex kernel envelope preserves official routing headers without client au
     'x-openai-internal-codex-responses-lite': 'true',
     'x-codex-routing-hint': 'model=gpt-6.1-sol;tier=priority',
   })
+  assert.notEqual(envelopes[0].headers['session-id'], 'session:t')
+  assert.equal(envelopes[0].headers['session-id'], session.session_id)
   assert.equal(envelopes[0].headers.authorization, undefined)
   sticky.db?.close?.()
   fs.rmSync(root, { recursive: true, force: true })

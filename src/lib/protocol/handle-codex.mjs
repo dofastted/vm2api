@@ -52,11 +52,18 @@ const CODEX_KERNEL_HEADER_ALLOWLIST = Object.freeze([
   'x-openai-subagent',
 ])
 
-function codexKernelHeaders(reqHeaders = {}, body = {}) {
+function codexKernelHeaders(reqHeaders = {}, body = {}, session = null) {
   const headers = {}
   for (const name of CODEX_KERNEL_HEADER_ALLOWLIST) {
     const value = reqHeaders?.[name]
     if (typeof value === 'string' && value) headers[name] = value
+  }
+
+  // Keep the routing header and body cache key on the same outbound session.
+  // In rebuild mode this prevents one client's inbound session id from being
+  // reused by another client sharing the same Codex VM.
+  if (typeof session?.session_id === 'string' && session.session_id) {
+    headers['session-id'] = session.session_id
   }
 
   const model = typeof body?.model === 'string' ? body.model.trim() : ''
@@ -512,7 +519,7 @@ export async function handleCodexProtocol({
             reqHeaders: req.headers,
             envelope: {
               body: outboundBody,
-              headers: codexKernelHeaders(req.headers, outboundBody),
+              headers: codexKernelHeaders(req.headers, outboundBody, session),
               stream: true,
               session,
             },
