@@ -32,6 +32,38 @@ import { extractCallerSession, outboundSessionMode, resolveOutboundSessionId } f
 import { extractFirstUserText } from '../identity/crs-persona.mjs'
 import { clientIp } from '../pool/sticky-router.mjs'
 
+// The official Codex client sends these compatibility headers to the ChatGPT
+// Responses backend. The client authorization header is deliberately excluded:
+// the Codex kernel attaches the selected OAuth credential itself.
+const CODEX_KERNEL_HEADER_ALLOWLIST = Object.freeze([
+  'originator',
+  'x-codex-beta-features',
+  'x-codex-installation-id',
+  'x-codex-parent-thread-id',
+  'x-codex-turn-metadata',
+  'x-codex-turn-state',
+  'x-codex-window-id',
+  'x-openai-internal-codex-responses-lite',
+  'x-openai-memgen-request',
+  'x-openai-subagent',
+])
+
+function codexKernelHeaders(reqHeaders = {}, body = {}) {
+  const headers = {}
+  for (const name of CODEX_KERNEL_HEADER_ALLOWLIST) {
+    const value = reqHeaders?.[name]
+    if (typeof value === 'string' && value) headers[name] = value
+  }
+
+  const model = typeof body?.model === 'string' ? body.model.trim() : ''
+  if (model) {
+    const requestedTier = typeof body?.service_tier === 'string' ? body.service_tier.trim().toLowerCase() : ''
+    const tier = requestedTier === 'fast' ? 'priority' : requestedTier
+    headers['x-codex-routing-hint'] = tier && tier !== 'default' ? `model=${model};tier=${tier}` : `model=${model}`
+  }
+  return headers
+}
+
 function sessionFrom(req, body) {
   const headers = req.headers || {}
   return {
@@ -476,6 +508,7 @@ export async function handleCodexProtocol({
             reqHeaders: req.headers,
             envelope: {
               body: outboundBody,
+              headers: codexKernelHeaders(req.headers, outboundBody),
               stream: true,
               session,
             },

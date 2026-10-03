@@ -251,6 +251,9 @@ export function normalizeCodexReasoningEffort(raw) {
 
 function stripUnsupportedCodexFields(body = {}) {
   const next = { ...body }
+  // The official Codex client uses the legacy wire value `priority` for Fast.
+  // ChatGPT's Codex endpoint rejects the newer public alias `fast`.
+  if (next.service_tier === 'fast') next.service_tier = 'priority'
   delete next.max_output_tokens
   delete next.max_tokens
   delete next.temperature

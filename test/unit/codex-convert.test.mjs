@@ -137,6 +137,15 @@ test('native responses string input becomes Codex list', () => {
   assert.equal(already.input[0].content[0].text, 'keep')
 })
 
+test('legacy fast service tier is sent as priority to Codex', () => {
+  const converted = toCodexResponses('openai.responses', {
+    model: 'gpt-6.1-sol',
+    input: 'hello',
+    service_tier: 'fast',
+  })
+  assert.equal(converted.body.service_tier, 'priority')
+})
+
 test('Codex hop drops max_output_tokens and keeps reasoning effort', () => {
   const converted = toCodexResponses('openai.responses', {
     model: 'gpt-5.5',
