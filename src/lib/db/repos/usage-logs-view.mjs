@@ -205,6 +205,24 @@ export function toUsageLogRow(row, names, chain = []) {
   }
 }
 
+const ATTEMPT_CLOCK_SLACK_MS = 1000
+
+/**
+ * request_id can come from the client's `x-request-id`, so an id can be reused
+ * across requests (and tenants) once one side's rows are purged. Only attach
+ * attempts that started inside this row's own request lifetime:
+ * [created_at - duration_ms, created_at], created_at being completion time.
+ */
+function attemptWithinRow(attempt, row) {
+  const started = Date.parse(attempt.started_at)
+  const finished = Date.parse(row.created_at)
+  if (!Number.isFinite(started) || !Number.isFinite(finished)) return false
+  if (started > finished + ATTEMPT_CLOCK_SLACK_MS) return false
+  const duration = Number(row.duration_ms)
+  if (row.duration_ms == null || !Number.isFinite(duration)) return true
+  return started >= finished - duration - ATTEMPT_CLOCK_SLACK_MS
+}
+
 function toProviderChainItem(r, names) {
   return {
     attemptNumber: num(r.attempt_no),
@@ -421,10 +439,14 @@ export class UsageLogsView {
     const chains = new Map()
     for (const a of attempts) {
       const list = chains.get(a.request_id) || []
-      list.push(toProviderChainItem(a, names))
+      list.push(a)
       chains.set(a.request_id, list)
     }
-    return rows.map((row) => toUsageLogRow(row, names, (row.request_id && chains.get(row.request_id)) || []))
+    return rows.map((row) => {
+      const own = (row.request_id && chains.get(row.request_id)) || []
+      const chain = own.filter((a) => attemptWithinRow(a, row)).map((a) => toProviderChainItem(a, names))
+      return toUsageLogRow(row, names, chain)
+    })
   }
 
   /**
@@ -630,12 +652,12 @@ export class UsageLogsView {
       FROM s
       JOIN usage_logs l ON l.id = (
         SELECT id FROM usage_logs
-        WHERE session_id = s.session_id AND created_at = s.last_at
+        WHERE session_id = s.session_id AND created_at = s.last_at${own.sql ? ` AND ${own.sql}` : ''}
         ORDER BY id DESC LIMIT 1
       )
       ORDER BY s.last_at DESC
     `)
-      .all(...params, n)
+      .all(...params, n, ...own.params)
     const names = lookupNames(this.db, {
       userIds: rows.map((r) => r.user_id),
       keyIds: rows.map((r) => r.api_key_id),

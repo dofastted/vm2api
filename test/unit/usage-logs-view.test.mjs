@@ -153,14 +153,22 @@ test('muting follows RequestLogStore: settings default, explicit list, include_m
 
 test('provider chains for a page come from one request_attempts query, ordered by attempt', () => {
   const db = freshDb()
-  const [a, b] = seed(db, [{ account_id: 'acc-a' }, { final_account_id: 'acc-b', vm_id: 'vm-b' }, {}])
-  const at = new Date().toISOString()
+  const [a, b, c] = seed(db, [
+    { account_id: 'acc-a' },
+    { final_account_id: 'acc-b', vm_id: 'vm-b', duration_ms: 2000 },
+    {},
+  ])
+  const before = (row, ms) => new Date(Date.parse(row.created_at) - ms).toISOString()
   const ins = db.prepare(
     'INSERT INTO request_attempts (request_id, attempt_no, vm_id, account_id, started_at, selection_reason, downstream_committed) VALUES (?, ?, ?, ?, ?, ?, ?)',
   )
-  ins.run(a.request_id, 2, 'vm-b', 'acc-b', at, 'failover', 1)
-  ins.run(a.request_id, 1, 'vm-a', 'acc-a', at, 'sticky', 0)
-  ins.run(b.request_id, 1, 'vm-b', 'acc-b', at, 'roundrobin', 1)
+  ins.run(a.request_id, 2, 'vm-b', 'acc-b', before(a, 200), 'failover', 1)
+  ins.run(a.request_id, 1, 'vm-a', 'acc-a', before(a, 500), 'sticky', 0)
+  ins.run(b.request_id, 1, 'vm-b', 'acc-b', before(b, 1500), 'roundrobin', 1)
+  // Client-chosen x-request-id reused by later / earlier requests: their attempts
+  // fall outside the row's own lifetime and must not be attached.
+  ins.run(b.request_id, 2, 'vm-a', 'acc-a', before(b, 60_000), 'sticky', 1)
+  ins.run(c.request_id, 1, 'vm-b', 'acc-b', before(c, -3600_000), 'sticky', 1)
 
   const attemptQueries = []
   const spy = {
@@ -189,7 +197,11 @@ test('provider chains for a page come from one request_attempts query, ordered b
   const rowB = logs.find((r) => r.requestId === b.request_id)
   assert.equal(rowB.providerName, 'Bee')
   assert.equal(rowB.vmName, 'Slot B')
-  assert.equal(logs.filter((r) => r.providerChain.length === 0).length, 1)
+  assert.deepEqual(
+    rowB.providerChain.map((c) => c.attemptNumber),
+    [1],
+  )
+  assert.deepEqual(logs.find((r) => r.requestId === c.request_id).providerChain, [])
 })
 
 test('filters: model/requested_model, status, attempts, session, debug, time, q', () => {
@@ -290,4 +302,26 @@ test('active sessions and session suggestions are owner-scoped and newest first'
   assert.deepEqual(view.sessionSuggestions({ q: 'abc', owner_user_id: 'u1' }), ['abc-1', 'abc-3'])
   assert.deepEqual(view.sessionSuggestions({ q: 'abc-2' }), ['abc-2'])
   assert.deepEqual(view.sessionSuggestions({ q: 'zzz' }), [])
+})
+
+test('active sessions never resolve the last row from another tenant sharing the session id', () => {
+  const db = freshDb()
+  const now = Date.now()
+  const at = new Date(now - 30_000).toISOString()
+  // Same client-chosen session id and completion instant; bob's row sorts later by id.
+  seed(db, [
+    { created_at: at, session_id: 'shared', api_key_id: 'k1', vm_id: 'vm-a', status: 200 },
+    {
+      created_at: at,
+      session_id: 'shared',
+      api_key_id: 'k2',
+      vm_id: 'vm-b',
+      status: 500,
+      error_code: 'upstream_error',
+    },
+  ])
+  const [s] = new UsageLogsView(db).activeSessions({ owner_user_id: 'u1', now }).sessions
+  assert.equal(s.keyName, 'alice-key')
+  assert.equal(s.vmId, 'vm-a')
+  assert.equal(s.lastStatus, 200)
 })
