@@ -1,5 +1,5 @@
 /**
- * SOCKS5 Proxy Pool (SQLite-backed)
+ * SOCKS5 / HTTP CONNECT Proxy Pool (SQLite-backed)
  * - Bulk import
  * - 1 proxy ↔ up to N VMs (`config.bind_limit`, default 5)
  * - Auto-assign a proxy with remaining capacity on VM create
@@ -10,6 +10,7 @@
  * Working set stays in memory (probe loop mutates it); save() writes through.
  */
 import net from 'node:net'
+import tls from 'node:tls'
 import crypto from 'node:crypto'
 import { resolveStoreDb } from '../db/database.mjs'
 import { ProxiesRepo } from '../db/repos/proxies-repo.mjs'
@@ -17,7 +18,13 @@ import { canBindProxyToVm, normalizeOwnerId, proxyOwnerId } from '../admin/resou
 import { validTimezone } from '../core/timezone.mjs'
 import { lookupProxyGeo } from './proxy-geo.mjs'
 import { DNS_PRIMARY_AUTO, DNS_UPSTREAMS, LOCAL_EGRESS_ID, isLocalEgressProxy, validDnsPrimary } from './egress.mjs'
-import { normalizeSocksHost, socksEndpoint, socksProxyUrl, socksProxyFamily } from './socks-address.mjs'
+import {
+  normalizeSocksHost,
+  socksEndpoint,
+  outboundProxyUrl,
+  proxyProtocol,
+  socksProxyFamily,
+} from './socks-address.mjs'
 import { proxyBlockedReason } from './proxy-policy.mjs'
 
 export const MAX_VMS_PER_PROXY = 5
@@ -170,13 +177,18 @@ function localEgressRecord() {
   }
 }
 
-function socks5Record({ host, port, username = null, password = null, raw = '' }) {
+function proxyRecord({ scheme = 'socks5', host, port, username = null, password = null, raw = '' }) {
+  scheme = String(scheme).trim().toLowerCase()
+  if (scheme === 'socks5h') scheme = 'socks5'
+  if (!['socks5', 'http', 'https'].includes(scheme)) return null
   host = normalizeSocksHost(host)
   if (!looksLikeHost(host) || !isSocksPort(port)) return null
   const user = username == null || username === '' ? null : String(username)
   const pass = user == null ? null : password == null ? '' : String(password)
+  if ((user && /[\r\n]/.test(user)) || (pass && /[\r\n]/.test(pass))) return null
+  if (scheme !== 'socks5' && user?.includes(':')) return null
   return {
-    scheme: 'socks5',
+    scheme,
     host: String(host).trim(),
     port: Number(port),
     username: user,
@@ -187,7 +199,14 @@ function socks5Record({ host, port, username = null, password = null, raw = '' }
 
 /** Structured host / port / username / password import. */
 export function parseSocks5Fields(fields = {}) {
-  return socks5Record({
+  if (
+    fields.scheme &&
+    fields.protocol &&
+    proxyProtocol({ scheme: fields.scheme }) !== proxyProtocol({ protocol: fields.protocol })
+  )
+    return null
+  return proxyRecord({
+    scheme: fields.protocol ?? fields.scheme ?? 'socks5',
     host: fields.host,
     port: fields.port,
     username: fields.username ?? fields.user,
@@ -199,6 +218,8 @@ export function parseSocks5Fields(fields = {}) {
 /** Parse line forms:
  *  socks5://user:pass@host:port
  *  socks5h://user:pass@host:port
+ *  http://user:pass@host:port
+ *  https://user:pass@host:port
  *  user:pass@host:port
  *  host:port
  *  host:port:user:pass
@@ -209,11 +230,15 @@ export function parseSocks5Line(line) {
   if (!raw || raw.startsWith('#')) return null
   raw = raw.replace(/^['"]|['"]$/g, '').trim()
   try {
-    if (/^socks5h?:\/\//i.test(raw)) {
-      const u = new URL(raw.replace(/^socks5h:\/\//i, 'socks5://'))
-      return socks5Record({
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
+      const u = new URL(raw)
+      const scheme = u.protocol.slice(0, -1)
+      if (!['socks5', 'socks5h', 'http', 'https'].includes(scheme)) return null
+      if ((u.pathname && u.pathname !== '/') || u.search || u.hash) return null
+      return proxyRecord({
+        scheme,
         host: u.hostname,
-        port: u.port || 1080,
+        port: u.port || (scheme === 'http' ? 80 : scheme === 'https' ? 443 : 1080),
         username: u.username ? decodeURIComponent(u.username) : null,
         password: u.password ? decodeURIComponent(u.password) : null,
         raw,
@@ -227,7 +252,7 @@ export function parseSocks5Line(line) {
       if (match) {
         const [, host, port] = match
         const colon = cred.indexOf(':')
-        return socks5Record({
+        return proxyRecord({
           host,
           port,
           username: colon >= 0 ? cred.slice(0, colon) : cred,
@@ -240,19 +265,19 @@ export function parseSocks5Line(line) {
     if (raw.includes('[') || raw.includes(']')) {
       const match = raw.match(/^\[([^\]]+)\]:(\d+)(?::([^:]*)(?::(.*))?)?$/)
       if (!match || !net.isIPv6(match[1])) return null
-      return socks5Record({ host: match[1], port: match[2], username: match[3], password: match[4], raw })
+      return proxyRecord({ host: match[1], port: match[2], username: match[3], password: match[4], raw })
     }
     // A colon-delimited IPv6 endpoint has no unambiguous port boundary.
     if (net.isIPv6(raw) || net.isIPv6(raw.slice(0, raw.lastIndexOf(':')))) return null
     const parts = raw.split(':')
     if (parts.length === 2) {
-      return socks5Record({ host: parts[0], port: parts[1], raw })
+      return proxyRecord({ host: parts[0], port: parts[1], raw })
     }
     if (parts.length === 3 && looksLikeHost(parts[0]) && isSocksPort(parts[1])) {
-      return socks5Record({ host: parts[0], port: parts[1], username: parts[2], password: '', raw })
+      return proxyRecord({ host: parts[0], port: parts[1], username: parts[2], password: '', raw })
     }
     if (parts.length >= 4 && looksLikeHost(parts[0]) && isSocksPort(parts[1])) {
-      return socks5Record({
+      return proxyRecord({
         host: parts[0],
         port: parts[1],
         username: parts[2],
@@ -261,7 +286,7 @@ export function parseSocks5Line(line) {
       })
     }
     if (parts.length >= 4 && isSocksPort(parts[parts.length - 1]) && looksLikeHost(parts[parts.length - 2])) {
-      return socks5Record({
+      return proxyRecord({
         host: parts[parts.length - 2],
         port: parts[parts.length - 1],
         username: parts[0],
@@ -383,7 +408,7 @@ export class ProxyPool {
       last_probe_at: p.last_probe_at || null,
       last_error: p.last_error || null,
       created_at: p.created_at,
-      kind: isLocalEgressProxy(p) ? 'local' : 'socks5',
+      kind: isLocalEgressProxy(p) ? 'local' : proxyProtocol(p),
       scheme: isLocalEgressProxy(p) ? 'local' : p.scheme || 'socks5',
       geo: proxyGeoOf(p),
     }
@@ -420,7 +445,7 @@ export class ProxyPool {
     const skipped = []
     // Credentials can select distinct proxies at the same endpoint. Encode a
     // tuple so colons inside credentials cannot collide with field separators.
-    const proxyKey = (p) => JSON.stringify([p.host, p.port, p.username || '', p.password || ''])
+    const proxyKey = (p) => JSON.stringify([proxyProtocol(p), p.host, p.port, p.username || '', p.password || ''])
     const existing = new Set(this.state.proxies.map(proxyKey))
     for (const parsed of records) {
       if (!parsed || parsed.__invalid || !parsed.host || !parsed.port) {
@@ -429,7 +454,7 @@ export class ProxyPool {
           skipped.push({
             line: label,
             reason: 'parse_failed',
-            message: 'Invalid SOCKS5 endpoint; IPv6 requires [host]:port or socks5h://[host]:port',
+            message: 'Invalid proxy endpoint; use socks5://, http:// or https:// with a valid host and port',
           })
         continue
       }
@@ -441,7 +466,7 @@ export class ProxyPool {
       existing.add(key)
       const proxy = {
         id: uid('px'),
-        scheme: 'socks5',
+        scheme: proxyProtocol(parsed),
         host: parsed.host,
         port: parsed.port,
         username: parsed.username,
@@ -600,14 +625,14 @@ export class ProxyPool {
    * caller can clear credentials (`username: ''`) without having to resend host
    * and port. Absent key = leave alone; empty string = clear.
    *
-   * The merged record goes through socks5Record() so this shares the exact
+   * The merged record goes through proxyRecord() so this shares the exact
    * validation and normalization the import path uses.
    */
   update(proxyId, patch = {}) {
     const p = this.state.proxies.find((x) => x.id === proxyId)
     if (!p) return { ok: false, error: 'proxy_not_found' }
     const has = (k) => Object.prototype.hasOwnProperty.call(patch, k)
-    const connection = ['host', 'port', 'username', 'password'].some(has)
+    const connection = ['scheme', 'protocol', 'host', 'port', 'username', 'password'].some(has)
     if (!connection && !has('label')) {
       return { ok: false, error: 'no_editable_fields' }
     }
@@ -623,22 +648,31 @@ export class ProxyPool {
       return { ok: true, proxy: this.publicProxy(p), connection_changed: false }
     }
     const username = has('username') ? patch.username : p.username
-    // SOCKS5 has no password-only auth: socks5Record() drops the password
+    // SOCKS5 has no password-only auth: proxyRecord() drops the password
     // whenever the username is empty. Setting one without the other would
     // therefore report ok while storing nothing — reject instead of no-op'ing.
     if (has('password') && patch.password !== '' && (username == null || username === '')) {
       return { ok: false, error: 'password_without_username' }
     }
-    const next = socks5Record({
+    if (
+      has('scheme') &&
+      has('protocol') &&
+      proxyProtocol({ scheme: patch.scheme }) !== proxyProtocol({ protocol: patch.protocol })
+    )
+      return { ok: false, error: 'invalid_proxy' }
+    const next = proxyRecord({
+      scheme: has('protocol') ? patch.protocol : has('scheme') ? patch.scheme : proxyProtocol(p),
       host: has('host') ? patch.host : p.host,
       port: has('port') ? patch.port : p.port,
       username,
-      // Clearing the username drops the password with it — socks5Record()
+      // Clearing the username drops the password with it — proxyRecord()
       // nulls the password whenever the username is empty, so mirror that here
       // rather than carrying over a password that can no longer be sent.
       password: has('password') ? patch.password : username ? p.password : null,
     })
     if (!next) return { ok: false, error: 'invalid_proxy' }
+    p.scheme = next.scheme
+    p.protocol = next.scheme
     p.host = next.host
     p.port = next.port
     p.username = next.username
@@ -817,7 +851,11 @@ export class ProxyPool {
     const timeout = this.state.config.probe_timeout_ms || 8000
     const started = Date.now()
     return new Promise((resolve) => {
-      const socket = net.connect({ host, port: proxy.port })
+      const scheme = proxyProtocol(proxy)
+      const socket =
+        scheme === 'https'
+          ? tls.connect({ host, port: proxy.port, servername: net.isIP(host) ? undefined : host })
+          : net.connect({ host, port: proxy.port })
       this._probeSockets.set(socket, proxy)
       let done = false
       let connected = false
@@ -842,8 +880,12 @@ export class ProxyPool {
         })
       }
       socket.setTimeout(timeout)
-      socket.on('connect', () => {
+      socket.on(scheme === 'https' ? 'secureConnect' : 'connect', () => {
         connected = true
+        if (scheme === 'http' || scheme === 'https') {
+          finish(true, null)
+          return
+        }
         // Offer no-auth and user/pass so a working endpoint is not 0xff-killed.
         socket.write(Buffer.from([0x05, 0x02, 0x00, 0x02]))
       })
@@ -1084,7 +1126,8 @@ export class ProxyPool {
     }
     return {
       id: p.id,
-      url: socksProxyUrl(p, 'socks5'),
+      scheme: proxyProtocol(p),
+      url: outboundProxyUrl(p, 'socks5'),
       host: p.host,
       port: p.port,
       username: p.username || null,

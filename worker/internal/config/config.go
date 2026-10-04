@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	kinproxy "github.com/dofastted/kin-gateway/worker/internal/proxy"
 )
 
 const (
@@ -195,17 +197,11 @@ func (c Config) Validate() error {
 		return errors.New("proxy_required but proxy_url is empty")
 	}
 	if c.ProxyURL != "" {
-		u, err := url.Parse(c.ProxyURL)
-		if err != nil {
+		if _, err := kinproxy.New(c.ProxyURL, 15*time.Second); err != nil {
 			return fmt.Errorf("invalid proxy_url: %w", err)
 		}
-		if u.Scheme != "socks5" && u.Scheme != "socks5h" {
-			return fmt.Errorf("proxy_url scheme must be socks5 or socks5h, got %q", u.Scheme)
-		}
-		if u.Hostname() == "" || u.Port() == "" {
-			return errors.New("proxy_url requires host and port")
-		}
 	}
+
 	if err := validateEndpoint(c.AnthropicBaseURL, "api.anthropic.com", c.TestEndpoints); err != nil {
 		return fmt.Errorf("anthropic_base_url: %w", err)
 	}

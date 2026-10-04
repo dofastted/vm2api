@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 )
 
 type Dialer struct {
+	Scheme   string
 	Address  string
 	Username string
 	Password string
@@ -23,15 +25,25 @@ type Dialer struct {
 func New(rawURL string, timeout time.Duration) (*Dialer, error) {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
-		return nil, fmt.Errorf("parse SOCKS5 URL: %w", err)
+		return nil, errors.New("invalid proxy URL")
 	}
-	if u.Scheme != "socks5" && u.Scheme != "socks5h" {
-		return nil, fmt.Errorf("unsupported SOCKS5 scheme %q", u.Scheme)
+	if u.Scheme != "socks5" && u.Scheme != "socks5h" && u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported proxy scheme %q", u.Scheme)
+	}
+	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return nil, errors.New("proxy URL must contain only host, port and optional credentials")
 	}
 	host := u.Hostname()
 	port := u.Port()
-	if host == "" || port == "" {
-		return nil, errors.New("SOCKS5 URL requires host and port")
+	if port == "" && u.Scheme == "http" {
+		port = "80"
+	}
+	if port == "" && u.Scheme == "https" {
+		port = "443"
+	}
+	n, portErr := strconv.Atoi(port)
+	if host == "" || portErr != nil || n < 1 || n > 65535 {
+		return nil, errors.New("proxy URL requires a valid host and port")
 	}
 	username := ""
 	password := ""
@@ -39,13 +51,17 @@ func New(rawURL string, timeout time.Duration) (*Dialer, error) {
 		username = u.User.Username()
 		password, _ = u.User.Password()
 	}
-	if len(username) > 255 || len(password) > 255 {
+	if strings.ContainsAny(username+password, "\r\n") || ((u.Scheme == "http" || u.Scheme == "https") && strings.Contains(username, ":")) {
+		return nil, errors.New("invalid proxy credentials")
+	}
+	if (u.Scheme == "socks5" || u.Scheme == "socks5h") && (len(username) > 255 || len(password) > 255) {
 		return nil, errors.New("SOCKS5 username/password exceeds 255 bytes")
 	}
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
 	return &Dialer{
+		Scheme:   u.Scheme,
 		Address:  net.JoinHostPort(host, port),
 		Username: username,
 		Password: password,
@@ -63,10 +79,15 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 	if sameHostPort(address, d.Address) {
 		return nil, fmt.Errorf("refusing SOCKS CONNECT to the proxy address %s; DialContext must receive the upstream host", d.Address)
 	}
+	if d.Scheme == "http" || d.Scheme == "https" {
+		if _, _, err := net.SplitHostPort(address); err != nil || strings.ContainsAny(address, "\r\n\t /@?#") {
+			return nil, errors.New("invalid HTTP CONNECT target")
+		}
+	}
 	base := &net.Dialer{Timeout: d.Timeout}
 	conn, err := base.DialContext(ctx, "tcp", d.Address)
 	if err != nil {
-		return nil, fmt.Errorf("connect SOCKS5 proxy: %w", err)
+		return nil, fmt.Errorf("connect proxy: %w", err)
 	}
 	ok := false
 	defer func() {
@@ -74,21 +95,40 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 			_ = conn.Close()
 		}
 	}()
+	rawConn := conn
+	ApplyTCPKeepAlive(rawConn)
 	stopCancel := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = conn.SetDeadline(time.Now())
+			_ = rawConn.SetDeadline(time.Now())
 		case <-stopCancel:
 		}
 	}()
 	defer close(stopCancel)
-	if deadline, has := ctx.Deadline(); has {
-		_ = conn.SetDeadline(deadline)
-	} else if d.Timeout > 0 {
-		_ = conn.SetDeadline(time.Now().Add(d.Timeout))
+	deadline := time.Now().Add(d.Timeout)
+	if ctxDeadline, has := ctx.Deadline(); has && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
 	}
-	if err = d.negotiate(conn, address); err != nil {
+	_ = conn.SetDeadline(deadline)
+	if d.Scheme == "https" {
+		host, _, _ := net.SplitHostPort(d.Address)
+		secure := tls.Client(conn, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
+		if err = secure.HandshakeContext(ctx); err != nil {
+			return nil, fmt.Errorf("HTTPS proxy TLS: %w", err)
+		}
+		conn = secure
+	}
+	if d.Scheme == "http" || d.Scheme == "https" {
+		var tunnel net.Conn
+		tunnel, err = d.connectHTTP(conn, address)
+		if err == nil {
+			conn = tunnel
+		}
+	} else {
+		err = d.negotiate(conn, address)
+	}
+	if err != nil {
 		return nil, err
 	}
 	if err = ctx.Err(); err != nil {

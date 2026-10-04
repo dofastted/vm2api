@@ -94,7 +94,7 @@ export function ProxyImportPanel({ hasLocal }: { hasLocal: boolean }) {
       }
     >
       <label htmlFor='proxy-import' className='sr-only'>
-        SOCKS5 列表，每行一条
+        代理列表，每行一条
       </label>
       <Textarea
         id='proxy-import'
@@ -113,7 +113,7 @@ export function ProxyImportPanel({ hasLocal }: { hasLocal: boolean }) {
         spellCheck={false}
         autoComplete='off'
         placeholder={
-          'host:port\nuser:pass@host:port\nsocks5://user:pass@host:port'
+          'host:port\nsocks5://user:pass@host:port\nhttp://user:pass@host:port'
         }
         className='field-host min-h-24 resize-y text-xs leading-relaxed'
       />

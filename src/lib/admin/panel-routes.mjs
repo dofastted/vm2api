@@ -3832,7 +3832,7 @@ export function createPanelHandler(ctx) {
         // Forward only the keys the caller actually sent — update() reads
         // presence, not value, to tell "leave alone" from "clear".
         const patch = {}
-        for (const key of ['host', 'port', 'username', 'password', 'label']) {
+        for (const key of ['scheme', 'protocol', 'host', 'port', 'username', 'password', 'label']) {
           if (Object.prototype.hasOwnProperty.call(body, key)) patch[key] = body[key]
         }
         const result = proxyPool.update(id, patch)

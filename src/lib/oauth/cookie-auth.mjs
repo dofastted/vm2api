@@ -7,6 +7,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { CAI_AUTHORIZE_URL, CLIENT_ID, FULL_OAUTH_SCOPE, REDIRECT_URI } from './oauth-contract.mjs'
+import { withOAuthProxy } from './http-proxy-bridge.mjs'
 
 export { CLIENT_ID, REDIRECT_URI }
 
@@ -30,6 +31,12 @@ function serviceFailure(code, message) {
 }
 
 function runOAuthAuthService(payload) {
+  return withOAuthProxy(payload.proxy_url, (proxyUrl) => runOAuthAuthProcess({ ...payload, proxy_url: proxyUrl }), {
+    timeoutMs: payload.timeout_ms,
+  })
+}
+
+function runOAuthAuthProcess(payload) {
   const bin = findOAuthAuthBin()
   if (!bin) return Promise.reject(serviceFailure('oauth_auth_bin_missing', 'kin-oauth-auth not found'))
   return new Promise((resolve, reject) => {

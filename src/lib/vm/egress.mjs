@@ -10,7 +10,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { getDb, isDbOpen } from '../db/database.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
-import { socksProxyUrl } from './socks-address.mjs'
+import { outboundProxyUrl } from './socks-address.mjs'
 import { assertProxyAllowed, proxyBlockedReason } from './proxy-policy.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 
@@ -459,7 +459,7 @@ export function egressListening(projectRoot, proxyId, timeoutMs = 400) {
 export function boundProxyUrl(proxy) {
   if (isLocalEgressProxy(proxy)) return ''
   assertProxyAllowed(proxy)
-  return socksProxyUrl(proxy)
+  return outboundProxyUrl(proxy)
 }
 
 // reqwest's order for an https destination; HTTP_PROXY only covers http:// destinations.

@@ -113,3 +113,18 @@ func TestLoadTelemetryKeepsEnvBetasAndSource(t *testing.T) {
 		t.Fatalf("headers=%v", tel.Headers)
 	}
 }
+
+func TestHTTPProxySchemesAllowed(t *testing.T) {
+	// Load validates the same defaults used by a real worker.
+	for _, scheme := range []string{"http", "https"} {
+		dir := t.TempDir()
+		filename := filepath.Join(dir, "worker.json")
+		raw := fmt.Sprintf(`{"vm_id":"fixture","socket_path":%q,"credential_path":%q,"proxy_url":%q}`, filepath.Join(dir, "worker.sock"), filepath.Join(dir, "credentials.json"), scheme+"://user:pass@proxy.invalid")
+		if err := os.WriteFile(filename, []byte(raw), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(filename); err != nil {
+			t.Fatalf("%s: %v", scheme, err)
+		}
+	}
+}

@@ -65,3 +65,28 @@ export function socksProxyEndpoint(proxy) {
     return null
   }
 }
+
+/** Keep explicit HTTP(S) exits intact; the legacy serializer remains SOCKS-only. */
+export function proxyProtocol(proxy) {
+  const value = proxy?.url ? new URL(proxy.url).protocol.slice(0, -1) : proxy?.protocol || proxy?.scheme || 'socks5'
+  const scheme = String(value).trim().toLowerCase()
+  return scheme === 'socks5h' ? 'socks5' : scheme
+}
+
+export function outboundProxyUrl(proxy, socksScheme = 'socks5h') {
+  if (!proxy) return ''
+  const scheme = proxyProtocol(proxy)
+  if (scheme === 'socks5') return socksProxyUrl(proxy, socksScheme)
+  if (scheme !== 'http' && scheme !== 'https') throw new Error('unsupported proxy scheme')
+  const u = proxy.url ? new URL(proxy.url) : null
+  if (u && ((u.pathname !== '/' && u.pathname !== '') || u.search || u.hash)) throw new Error('invalid proxy URL')
+  const endpoint = socksEndpoint(
+    u ? u.hostname : proxy.host,
+    u ? u.port || (scheme === 'https' ? 443 : 80) : proxy.port,
+  )
+  if (!endpoint) throw new Error('invalid proxy endpoint')
+  const username = u ? decodeURIComponent(u.username) : proxy.username || ''
+  const password = u ? decodeURIComponent(u.password) : proxy.password || ''
+  const auth = username || password ? `${encodeURIComponent(username)}:${encodeURIComponent(password)}@` : ''
+  return `${scheme}://${auth}${endpoint}`
+}
