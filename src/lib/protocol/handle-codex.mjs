@@ -28,8 +28,12 @@ import {
 } from '../pool/openai-account-runtime.mjs'
 import { CLIENT_POOL_BUSY_MESSAGE } from '../core/errors.mjs'
 import { applyOpenaiWashLog } from './openai-wash.mjs'
-import { extractCallerSession, outboundSessionMode, resolveOutboundSessionId } from '../identity/identity-rewrite.mjs'
-import { extractFirstUserText } from '../identity/crs-persona.mjs'
+import {
+  extractCallerSession,
+  firstUserContentFingerprint,
+  outboundSessionMode,
+  resolveOutboundSessionId,
+} from '../identity/identity-rewrite.mjs'
 import { clientIp } from '../pool/sticky-router.mjs'
 
 // Official Codex client headers for ChatGPT Responses. Auth is attached by the kernel.
@@ -87,23 +91,6 @@ function sessionFrom(req, body) {
       null,
     previous_response_id: body?.previous_response_id || null,
   }
-}
-
-function firstUserTextFromCodex(body = {}) {
-  if (typeof body?.input === 'string') return body.input
-  if (Array.isArray(body?.input)) {
-    for (const item of body.input) {
-      if (typeof item === 'string' && item.trim()) return item.trim()
-      if (typeof item?.content === 'string' && item.content.trim()) return item.content.trim()
-      if (Array.isArray(item?.content)) {
-        for (const part of item.content) {
-          if (typeof part === 'string' && part.trim()) return part.trim()
-          if (typeof part?.text === 'string' && part.text.trim()) return part.text.trim()
-        }
-      }
-    }
-  }
-  return extractFirstUserText(body?.messages) || String(body?.prompt || '')
 }
 
 function applyCodexRebuildBody(body, sessionId, mode) {
@@ -391,7 +378,7 @@ export async function handleCodexProtocol({
     body: converted.body,
     headers: req.headers,
   })
-  const firstUserText = firstUserTextFromCodex(converted.body)
+  const firstUserIdentity = firstUserContentFingerprint(converted.body) || firstUserContentFingerprint(inbound)
   const hop = ops.streamCodexKernel || streamCodexKernel
   const writeCfg = ops.writeCodexKernelConfig || writeCodexKernelConfig
   const ensure = ops.ensureCodexKernel || ensureCodexKernel
@@ -492,20 +479,27 @@ export async function handleCodexProtocol({
         let responseServiceTier = null
         let streamedUsage = null
         const attemptStartedAt = Date.now()
+        const sessionOptions = {
+          boundSessionId: stickyBound?.sessionId || '',
+          boundVmId: stickyBound?.vmId || '',
+          vmId: vm.id,
+          accountId: vm.id,
+          firstUserIdentity,
+          clientIp: clientIp(req),
+          userAgent: req.headers?.['user-agent'] || '',
+          epoch: `${attemptStartedAt}:${vm.id}:${hops}`,
+        }
+        // Passthrough keeps an explicit inbound session verbatim; without one it
+        // must still derive the deterministic first-user fallback (never null).
         const outboundSessionId =
           sessionMode === 'passthrough'
-            ? inboundSession.session_id
-            : resolveOutboundSessionId(callerSession, {
-                mode: sessionMode,
-                boundSessionId: stickyBound?.sessionId || '',
-                boundVmId: stickyBound?.vmId || '',
-                vmId: vm.id,
-                accountId: vm.id,
-                firstUserText,
-                clientIp: clientIp(req),
-                userAgent: req.headers?.['user-agent'] || '',
-                epoch: `${attemptStartedAt}:${vm.id}:${hops}`,
+            ? inboundSession.session_id ||
+              resolveOutboundSessionId(callerSession, {
+                ...sessionOptions,
+                mode: 'passthrough',
+                officialClient: true,
               })
+            : resolveOutboundSessionId(callerSession, { ...sessionOptions, mode: sessionMode })
         const session = {
           session_id: outboundSessionId,
           previous_response_id: inboundSession.previous_response_id,

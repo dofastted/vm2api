@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 修复无显式会话 ID 时，粘滞槽位与出站 session 的回退身份只取首条 user 消息的第一个文本块、且截断 4000 字符：同一开场块（日期 / 工作目录 system-reminder 等）下不同问题的会话会命中同一 sticky key 并共用出站 session。回退身份改为首条 user 消息的完整内容指纹：保持块类型与顺序、多模态块按内容参与、不截断；后续消息不参与，显式 session ID / device_id 的优先顺序不变。Codex passthrough 且无 inbound session 时同样派生出稳定回落 session（原先为 null）。persona 与计费文本函数不变（`firstUserText` 仍只用于计费）。
+
 ## 1.3.104 — 2026-10-04
 
 - 修复 1.3.103 起槽内 cli-node 守护进程把非内核的 `-p` 进程一律 SIGKILL：面板运维终端里的 `claude -p`、官方初装的 hello / `/usage` / 常驻以及 `setup-token` 会被杀（终端里显示 `Killed`）。守护现按进程环境识别：内核 CLI 认 `CLAUDE_CODE_KIN_NATIVE_SLOTS`（只留最早一个），初装带 `KIN_OFFICIAL_CC=1`、`setup-token` 带 `KIN_SETUP_TOKEN=1` 的不动，活跃面板会话里的任意 `claude` 不动，其余泄漏进程照旧清理；读不到环境的进程不再误杀。

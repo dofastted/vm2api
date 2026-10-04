@@ -247,41 +247,58 @@ test('extractKey ignores x-client-request-id and hashes first user', () => {
   assert.equal(a, b)
 })
 
-test('later blocks of the first user message stay on one session slot', () => {
+test('different openers stay apart even when the first block is identical', () => {
   const r = new StickyRouter({ dataDir: tmpDir(), config: { sticky: { enabled: true } } })
   const req = { apiKeyRecord: { id: 'key_f041' }, headers: {} }
-  const first = {
+  const opener = (question) => ({
     messages: [
       {
         role: 'user',
         content: [
-          { type: 'text', text: 'stable preamble' },
-          { type: 'text', text: 'turn-1 transcript that grows' },
+          {
+            type: 'text',
+            text: '<system-reminder>Today is 2026-10-04. Working directory: /work/demo</system-reminder>',
+          },
+          { type: 'text', text: question },
         ],
       },
     ],
+  })
+  const a = r.extractPoolKey(req, opener('会话 A 的问题'), { platform: 'anthropic' })
+  const b = r.extractPoolKey(req, opener('会话 B 的问题'), { platform: 'anthropic' })
+  assert.match(a, /^p:anthropic:kkey_f041:ch:/)
+  assert.notEqual(a, b)
+})
+
+test('an unchanged first user message keeps its slot when later turns grow', () => {
+  const r = new StickyRouter({ dataDir: tmpDir(), config: { sticky: { enabled: true } } })
+  const req = { apiKeyRecord: { id: 'key_f041' }, headers: {} }
+  const firstUser = {
+    role: 'user',
+    content: [
+      { type: 'text', text: 'stable preamble' },
+      { type: 'text', text: 'the original question' },
+    ],
   }
+  const first = { messages: [firstUser] }
   const next = {
-    messages: [
-      {
-        role: 'user',
-        content: [
-          { type: 'text', text: 'stable preamble' },
-          { type: 'text', text: 'turn-2 a different transcript' },
-        ],
-      },
-      { role: 'assistant', content: 'ok' },
-      { role: 'user', content: 'continue' },
-    ],
-  }
-  const other = {
-    messages: [{ role: 'user', content: [{ type: 'text', text: 'a different conversation' }] }],
+    messages: [firstUser, { role: 'assistant', content: 'ok' }, { role: 'user', content: 'continue' }],
   }
   const a = r.extractPoolKey(req, first, { platform: 'anthropic' })
   const b = r.extractPoolKey(req, next, { platform: 'anthropic' })
   assert.equal(a, b)
   assert.equal(r.collectPoolKeys(req, next, { platform: 'anthropic' }).length, 1)
-  assert.notEqual(a, r.extractPoolKey(req, other, { platform: 'anthropic' }))
+})
+
+test('an explicit session id keeps continuity when the client rewrites the opener', () => {
+  const r = new StickyRouter({ dataDir: tmpDir(), config: { sticky: { enabled: true } } })
+  const req = { apiKeyRecord: { id: 'key_f041' }, headers: {} }
+  const body = (text) => ({
+    metadata: { user_id: { session_id: 'trimmed-session' } },
+    messages: [{ role: 'user', content: [{ type: 'text', text }] }],
+  })
+  assert.equal(r.extractPoolKey(req, body('第一轮的问题')), 'kkey_f041:trimmed-session')
+  assert.equal(r.extractPoolKey(req, body('被裁剪成当前轮的问题')), 'kkey_f041:trimmed-session')
 })
 
 test('extractKey mode=ip uses forwarded address', () => {

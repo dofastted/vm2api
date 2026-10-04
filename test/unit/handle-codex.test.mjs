@@ -893,3 +893,34 @@ test('codex passthrough keeps the inbound session and cache key', async () => {
   sticky.db?.close?.()
   fs.rmSync(root, { recursive: true, force: true })
 })
+
+test('codex passthrough without an inbound session derives the first-user identity fallback', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-pass-fallback-'))
+  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  writeGptVm(root, 'vm-gpt-a')
+  const opener = (question) => ({
+    model: 'gpt-5.4',
+    stream: false,
+    input: [
+      {
+        type: 'message',
+        role: 'user',
+        content: [
+          { type: 'input_text', text: 'Today is 2026-10-04. Working directory: /work/demo' },
+          { type: 'input_text', text: question },
+        ],
+      },
+    ],
+  })
+  const routing = { sticky: { outbound_session: 'passthrough' } }
+  const first = await hopCodex({ root, stickyRouter: sticky, routing, body: opener('会话 A 的问题') })
+  const again = await hopCodex({ root, stickyRouter: sticky, routing, body: opener('会话 A 的问题') })
+  const other = await hopCodex({ root, stickyRouter: sticky, routing, body: opener('会话 B 的问题') })
+  const sessionId = first.envelopes[0].session.session_id
+  assert.match(sessionId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+  assert.equal(sessionId, again.envelopes[0].session.session_id)
+  assert.notEqual(sessionId, other.envelopes[0].session.session_id)
+  assert.equal(first.envelopes[0].headers['session-id'], sessionId)
+  sticky.db?.close?.()
+  fs.rmSync(root, { recursive: true, force: true })
+})

@@ -134,6 +134,7 @@ HTTP hop 那个 400 默认原样透传。`routing.failover.signature_repair=true
 
 - `device_id`：64 hex 原样出站（创建生成值或官方 `machineID`）。遗留 UUID 槽仍 sha256。官方初装成功后存储值被 `~/.claude.json` `machineID` 覆盖
 - `session_id`：官方 CC 保留调用方原值；非官方用 CRS hash
+- 无显式会话标识时的回退：sticky 键与出站 session 种子都取首条 user 消息的完整内容指纹（保持块类型与顺序、不截断；多模态块按内容参与）。后续消息不参与；客户端改写 / 裁剪首条消息时需带显式 `session_id` 保持连续
 - `metadata.user_id`：官方 `userID` + 凭证 email（不读残留 `.claude/.claude.json`）
 - guest locale / tz 进 fingerprint；`/etc/machine-id` 是 `guest_machine_id`（systemd 32 hex）；出站 hostname 是 `<distro>-<4hex>`
 

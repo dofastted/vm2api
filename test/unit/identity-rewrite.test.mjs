@@ -4,6 +4,7 @@ import {
   applyCrsIdentityReplace,
   buildStableSessionSeed,
   extractCallerSession,
+  firstUserContentFingerprint,
   normalizeSessionUserAgent,
   outboundSessionMode,
   rebuildOutboundSession,
@@ -253,6 +254,138 @@ test('missing caller session is stable across turns and not random', () => {
   assert.notEqual(resolveOutboundSessionId('', { ...base, accountId: 'vm-02' }), round1)
   assert.equal(resolveOutboundSessionId('', { ...base, userAgent: 'claude-cli/2.1.999 (external, sdk-cli)' }), round1)
   assert.notEqual(resolveOutboundSessionId('', { ...base, epoch: 99 }), round1)
+})
+
+test('first user content fingerprint is typed, ordered, untruncated and ignores later messages', () => {
+  const fp = (body) => firstUserContentFingerprint(body)
+  const text = (value) => ({ type: 'text', text: value })
+  const opener = (question) => ({
+    messages: [
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'Today is 2026-10-04. Working directory: /work/demo' }, text(question)],
+      },
+    ],
+  })
+
+  // messages / Codex input / legacy prompt describe the same first user text
+  assert.equal(
+    fp({ messages: [{ role: 'user', content: 'hello' }] }),
+    fp({ input: [{ role: 'user', content: [{ type: 'input_text', text: 'hello' }] }] }),
+  )
+  assert.equal(fp({ prompt: 'hello' }), fp({ messages: [{ role: 'user', content: 'hello' }] }))
+
+  // two openers that share a leading block stay apart, the same opener is stable
+  assert.notEqual(fp(opener('会话 A 的问题')), fp(opener('会话 B 的问题')))
+  assert.equal(fp(opener('会话 A 的问题')), fp(opener('会话 A 的问题')))
+
+  // block boundaries, order and whitespace normalization
+  assert.notEqual(
+    fp({ messages: [{ role: 'user', content: [text('a'), text('b')] }] }),
+    fp({ messages: [{ role: 'user', content: [text('ab')] }] }),
+  )
+  assert.notEqual(
+    fp({ messages: [{ role: 'user', content: [text('a'), text('b')] }] }),
+    fp({ messages: [{ role: 'user', content: [text('b'), text('a')] }] }),
+  )
+  assert.equal(
+    fp({ messages: [{ role: 'user', content: [text('a  b')] }] }),
+    fp({ messages: [{ role: 'user', content: [text('a b')] }] }),
+  )
+
+  // no 4000-char truncation
+  const long = 'x'.repeat(5000)
+  assert.notEqual(
+    fp({ messages: [{ role: 'user', content: `${long}A` }] }),
+    fp({ messages: [{ role: 'user', content: `${long}B` }] }),
+  )
+
+  // later messages never move the fingerprint
+  assert.equal(
+    fp({
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: 'a later turn' },
+      ],
+    }),
+    fp({ messages: [{ role: 'user', content: 'hello' }] }),
+  )
+
+  // multimodal blocks participate by content
+  const image = (data) => ({
+    messages: [
+      {
+        role: 'user',
+        content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data } }, text('look')],
+      },
+    ],
+  })
+  assert.equal(fp(image('QUJD')), fp(image('QUJD')))
+  assert.notEqual(fp(image('QUJD')), fp(image('QUJDRA==')))
+  assert.notEqual(fp(image('QUJD')), fp({ messages: [{ role: 'user', content: [text('look')] }] }))
+
+  // no usable first-user content
+  assert.equal(fp({}), '')
+  assert.equal(fp({ messages: [{ role: 'user', content: '' }] }), '')
+})
+
+test('firstUserIdentity seeds the session and outranks billing text', () => {
+  const base = {
+    officialClient: false,
+    accountId: 'vm-01',
+    clientIp: '203.0.113.9',
+    userAgent: 'claude-cli/2.1.241 (external, sdk-cli)',
+    apiKeyId: 'key-7',
+    epoch: 'pending',
+  }
+  const opener = (question) => ({
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Today is 2026-10-04. Working directory: /work/demo' },
+          { type: 'text', text: question },
+        ],
+      },
+    ],
+  })
+  const identityA = firstUserContentFingerprint(opener('会话 A 的问题'))
+  const identityB = firstUserContentFingerprint(opener('会话 B 的问题'))
+  const opts = { ...base, firstUserText: 'preamble', firstUserIdentity: identityA }
+  const first = resolveOutboundSessionId('', opts)
+  assert.equal(first, resolveOutboundSessionId('', { ...opts }))
+  assert.notEqual(first, resolveOutboundSessionId('', { ...opts, firstUserIdentity: identityB }))
+  // Billing text churn must not move the seed while the opener is unchanged.
+  assert.equal(first, resolveOutboundSessionId('', { ...opts, firstUserText: 'other billing text' }))
+  // Exact composition: prefixed fingerprint material inside the stable seed.
+  const seed = buildStableSessionSeed('vm-01', sessionContextDiscriminator(base), `first-user-content:${identityA}`)
+  assert.equal(first, rebuildOutboundSession({ identity: seed, epoch: 'pending' }))
+  // Legacy callers that only pass raw text keep the old seed.
+  assert.notEqual(first, resolveOutboundSessionId('', { ...base, firstUserText: 'preamble' }))
+})
+
+test('passthrough fallback also seeds from the first-user identity', () => {
+  const opts = {
+    officialClient: false,
+    mode: 'passthrough',
+    accountId: 'vm-01',
+    clientIp: '203.0.113.9',
+    userAgent: 'RikkaHub/1.0',
+    apiKeyId: 'key-7',
+    epoch: 'pending',
+    firstUserText: 'billing',
+    firstUserIdentity: firstUserContentFingerprint({ messages: [{ role: 'user', content: 'opener one' }] }),
+  }
+  const a = resolveOutboundSessionId('', opts)
+  assert.equal(a, resolveOutboundSessionId('', opts))
+  assert.notEqual(
+    a,
+    resolveOutboundSessionId('', {
+      ...opts,
+      firstUserIdentity: firstUserContentFingerprint({ messages: [{ role: 'user', content: 'opener two' }] }),
+    }),
+  )
 })
 
 test('sticky outbound id is reused for the same VM and reminted after failover', () => {

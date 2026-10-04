@@ -8,9 +8,11 @@
  *                   passthrough: official Claude Code keeps the caller
  *                   session; unofficial hashes the caller token. With no
  *                   caller session, derive a UUID from account + client +
- *                   first user text (sub2api buildStableSessionSeed). Never
- *                   randomUUID while any of those anchors exist. A sticky
- *                   row for the same VM reuses the id it already stored.
+ *                   first user content (sub2api buildStableSessionSeed).
+ *                   Callers pass the full first-user content fingerprint as
+ *                   firstUserIdentity; firstUserText stays billing-only.
+ *                   Never randomUUID while any of those anchors exist. A
+ *                   sticky row for the same VM reuses the id it already stored.
  *                   Outbound always has a session. Email never goes in
  *                   metadata.user_id (Anthropic 400 has_at).
  *
@@ -92,17 +94,99 @@ export function sessionContextDiscriminator({ clientIp = '', userAgent = '', api
   return `${ip}:${ua}:${key}`
 }
 
-/**
- * Account + client + first user text. Appending later messages does not
- * change the seed. This is not the pool sticky key.
- */
-export function buildStableSessionSeed(accountId, clientDiscriminator, firstUserText) {
-  return `${String(accountId ?? '').trim()}::${String(clientDiscriminator ?? '')}::${String(firstUserText ?? '')}`
+const FIRST_USER_TEXT_PART_TYPES = new Set(['text', 'input_text', 'output_text'])
+
+/** Whitespace inside one content block never acts as a block boundary. */
+function normalizeFirstUserText(text) {
+  return String(text ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
-function stableSessionMaterial(accountId, clientDiscriminator, firstUserText) {
+/**
+ * Stable JSON for multimodal blocks: key order cannot change the hash, and
+ * cache hints are transport state, not content.
+ */
+function canonicalFirstUserJson(value) {
+  if (value == null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(canonicalFirstUserJson).join(',')}]`
+  const keys = Object.keys(value)
+    .filter((key) => key !== 'cache_control')
+    .sort()
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalFirstUserJson(value[key])}`).join(',')}}`
+}
+
+/** One typed content block; text blocks compare by text, every other block by its full shape. */
+function canonicalFirstUserPart(part) {
+  if (typeof part === 'string') return ['text', normalizeFirstUserText(part)]
+  if (!part || typeof part !== 'object') return ['raw', String(part)]
+  const type = String(part.type || '').toLowerCase()
+  if (typeof part.text === 'string' && (!type || FIRST_USER_TEXT_PART_TYPES.has(type))) {
+    return ['text', normalizeFirstUserText(part.text)]
+  }
+  return ['part', canonicalFirstUserJson(part)]
+}
+
+/** First user message of messages / Codex input / legacy prompt bodies. */
+function firstUserMessageContent(body = {}) {
+  const messages = Array.isArray(body?.messages) ? body.messages : null
+  if (messages && messages.length) {
+    const user = messages.find((m) => String(m?.role || m?.type || '').toLowerCase() === 'user') || messages[0]
+    return user?.content ?? user?.text ?? user?.input ?? null
+  }
+  if (typeof body?.input === 'string') return body.input
+  if (Array.isArray(body?.input) && body.input.length) {
+    const user = body.input.find((m) => String(m?.role || m?.type || '').toLowerCase() === 'user') || body.input[0]
+    if (typeof user === 'string') return user
+    return user?.content ?? user?.text ?? null
+  }
+  if (typeof body?.prompt === 'string') return body.prompt
+  return null
+}
+
+/**
+ * Deterministic identity of the first user message: full typed, ordered
+ * content of every block, no length truncation. A leading system-reminder or
+ * date preamble shared by different openers cannot collide, while an unchanged
+ * opener stays stable across turns. Later messages never change the
+ * fingerprint. Returns '' when the request has no usable first-user content.
+ */
+export function firstUserContentFingerprint(body = {}) {
+  const content = firstUserMessageContent(body)
+  if (content == null) return ''
+  const parts = (Array.isArray(content) ? content.filter((part) => part != null) : [content]).map(
+    canonicalFirstUserPart,
+  )
+  if (!parts.length) return ''
+  if (parts.every((part) => part[0] === 'text' && part[1] === '')) return ''
+  return crypto.createHash('sha256').update(JSON.stringify(parts)).digest('hex')
+}
+
+/** Marks first-user content fingerprints inside stable session seeds. */
+export const FIRST_USER_CONTENT_SEED_PREFIX = 'first-user-content:'
+
+/**
+ * Session seed material: the caller's first-user content fingerprint when
+ * given (see firstUserContentFingerprint), otherwise legacy raw text for
+ * callers that have not migrated yet. firstUserText itself stays billing-only.
+ */
+function stableFirstUserMaterial(opts = {}) {
+  const identity = String(opts.firstUserIdentity || '').trim()
+  if (identity) return FIRST_USER_CONTENT_SEED_PREFIX + identity
+  return String(opts.firstUserText || '')
+}
+
+/**
+ * Account + client + first user identity material. Appending later messages
+ * does not change the material. This is not the pool sticky key.
+ */
+export function buildStableSessionSeed(accountId, clientDiscriminator, firstUserMaterial) {
+  return `${String(accountId ?? '').trim()}::${String(clientDiscriminator ?? '')}::${String(firstUserMaterial ?? '')}`
+}
+
+function stableSessionMaterial(accountId, clientDiscriminator, firstUserMaterial) {
   if (String(accountId || '').trim()) return true
-  if (String(firstUserText || '').trim()) return true
+  if (String(firstUserMaterial || '').trim()) return true
   return (
     String(clientDiscriminator || '')
       .replace(/:/g, '')
@@ -284,9 +368,9 @@ function resolvePassthroughOutboundSessionId(caller, opts) {
           userAgent: opts.userAgent,
           apiKeyId: opts.apiKeyId,
         })
-  const firstUserText = String(opts.firstUserText || '')
-  if (stableSessionMaterial(accountId, discriminator, firstUserText)) {
-    return uuidFromSeed(STABLE_SESSION_SEED + buildStableSessionSeed(accountId, discriminator, firstUserText))
+  const firstUserMaterial = stableFirstUserMaterial(opts)
+  if (stableSessionMaterial(accountId, discriminator, firstUserMaterial)) {
+    return uuidFromSeed(STABLE_SESSION_SEED + buildStableSessionSeed(accountId, discriminator, firstUserMaterial))
   }
   return crypto.randomUUID()
 }
@@ -316,9 +400,9 @@ export function resolveOutboundSessionId(callerSession, opts = {}) {
           userAgent: opts.userAgent,
           apiKeyId: opts.apiKeyId,
         })
-  const firstUserText = String(opts.firstUserText || '')
-  const identity = caller || buildStableSessionSeed(accountId, discriminator, firstUserText)
-  if (caller || stableSessionMaterial(accountId, discriminator, firstUserText)) {
+  const firstUserMaterial = stableFirstUserMaterial(opts)
+  const identity = caller || buildStableSessionSeed(accountId, discriminator, firstUserMaterial)
+  if (caller || stableSessionMaterial(accountId, discriminator, firstUserMaterial)) {
     return rebuildOutboundSession({ identity, epoch: opts.epoch ?? 'pending' })
   }
   return crypto.randomUUID()
@@ -357,6 +441,7 @@ export function applyCrsIdentityReplace(body, identity, inbound = {}, reqHeaders
       userAgent: opts.userAgent || headerValue(reqHeaders, 'user-agent'),
       apiKeyId: opts.apiKeyId,
       firstUserText: opts.firstUserText,
+      firstUserIdentity: opts.firstUserIdentity,
     })
 
   const md = {}

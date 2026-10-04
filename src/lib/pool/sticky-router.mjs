@@ -7,7 +7,12 @@ import crypto from 'node:crypto'
 import { ENVELOPE_NEEDLES, extractPrompt } from '../core/distill-detect.mjs'
 import { resolveStoreDb } from '../db/database.mjs'
 import { StickyRepo } from '../db/repos/sticky-repo.mjs'
-import { claudeCodeAgentRootSession, extractCallerSession, parseUserId } from '../identity/identity-rewrite.mjs'
+import {
+  claudeCodeAgentRootSession,
+  extractCallerSession,
+  firstUserContentFingerprint,
+  parseUserId,
+} from '../identity/identity-rewrite.mjs'
 
 export const DEFAULT_STICKY_HEADER_KEYS = [
   'x-session-id',
@@ -78,40 +83,16 @@ export function isPersistableEnvelope(body = {}, inbound = null) {
   return ENVELOPE_NEEDLES.some((item) => hay.includes(String(item).toLowerCase()))
 }
 
-/** First text block only. Later blocks of the same user message change every
- * turn and must not open another VM session slot. This matches
- * extractFirstUserText, which already seeds the outbound session id.
+/**
+ * Session-slot fingerprint: canonical full content of the first user message
+ * (typed, ordered, no length truncation). Later messages never participate, so
+ * a growing transcript keeps its slot, while a leading block shared by
+ * different openers (date/system-reminder preamble) cannot merge two
+ * conversations. An explicit session id is the only stable key when a client
+ * rewrites its first message.
  */
 export function firstUserFingerprint(body = {}) {
-  const msgs = Array.isArray(body?.messages) ? body.messages : Array.isArray(body?.input) ? body.input : []
-  const user = msgs.find((m) => String(m?.role || m?.type || '').toLowerCase() === 'user') || msgs[0]
-  let text = ''
-  if (user) {
-    const c = user.content ?? user.text ?? user.input
-    if (typeof c === 'string') text = c
-    else if (Array.isArray(c)) {
-      for (const part of c) {
-        if (typeof part === 'string' && part) {
-          text = part
-          break
-        }
-        if (part?.type === 'text' && typeof part.text === 'string' && part.text) {
-          text = part.text
-          break
-        }
-      }
-    }
-  } else if (typeof body?.input === 'string') {
-    text = body.input
-  } else if (typeof body?.prompt === 'string') {
-    text = body.prompt
-  }
-  text = String(text || '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 4000)
-  if (!text) return ''
-  return crypto.createHash('sha256').update(text).digest('hex').slice(0, 24)
+  return firstUserContentFingerprint(body).slice(0, 24)
 }
 
 /** Side queries spawned by a live parent turn. Not a new conversation. */
