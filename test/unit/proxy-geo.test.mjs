@@ -104,7 +104,10 @@ test('IPv6 geo lookup resolves geolocation through the proxy after a valid probe
   assert.equal(ok.geo.ip, '2001:db8::9')
   assert.equal(ok.geo.country_code, 'JP')
   assert.equal(calls.length, 2)
-  assert.equal(calls.every((c) => c.agent), true)
+  assert.equal(
+    calls.every((c) => c.agent),
+    true,
+  )
   assert.equal(calls[0].url, 'https://ipv6.test/ip')
   assert.match(calls[1].url, /2001%3Adb8%3A%3A9/)
 })

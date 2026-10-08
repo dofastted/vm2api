@@ -62,7 +62,8 @@ function geoLookupEndpointForIp(ip, template) {
   const base = String(template || DEFAULT_GEO_V6_LOOKUP_ENDPOINT).trim()
   if (!base) return null
   if (base.includes('{ip}')) return base.replace('{ip}', encodeURIComponent(ip))
-  if (base.endsWith('/')) return `${base}${encodeURIComponent(ip)}?fields=status,message,query,country,countryCode,regionName,city,timezone,isp`
+  if (base.endsWith('/'))
+    return `${base}${encodeURIComponent(ip)}?fields=status,message,query,country,countryCode,regionName,city,timezone,isp`
   if (base.includes('?')) return `${base}&query=${encodeURIComponent(ip)}`
   return `${base}/${encodeURIComponent(ip)}?fields=status,message,query,country,countryCode,regionName,city,timezone,isp`
 }
@@ -134,9 +135,7 @@ export async function lookupProxyGeoV6(proxyUrl, { ipEndpoint, geoEndpoint, time
   if (!net.isIPv6(ip)) return { ok: false, error: 'geo_ipv6_invalid_ip' }
 
   const geoUrl =
-    geoEndpoint ||
-    process.env.KIN_PROXY_GEO_V6_URL ||
-    geoLookupEndpointForIp(ip, DEFAULT_GEO_V6_LOOKUP_ENDPOINT)
+    geoEndpoint || process.env.KIN_PROXY_GEO_V6_URL || geoLookupEndpointForIp(ip, DEFAULT_GEO_V6_LOOKUP_ENDPOINT)
   const geoResult = await lookupProxyGeo(proxyUrl, { endpoint: geoUrl, timeoutMs, fetchImpl })
   if (!geoResult.ok) return geoResult
   const geo = { ...geoResult.geo, ip }
