@@ -83,21 +83,6 @@ test('generateAuthUrl setup_token uses full scope on CAI but keeps setup-token f
   assert.equal(session.source, 'oauth-setup-token')
 })
 
-test('exchangeAuthCode rejects callback state mismatch', async () => {
-  resetAuthUrlSessions()
-  const out = generateAuthUrl({ vmId: 'vm-01', proxyUrl: 'socks5h://127.0.0.1:1080' })
-  await assert.rejects(
-    () =>
-      exchangeAuthCode({
-        sessionId: out.session_id,
-        code: 'abc#wrong-state',
-        proxyUrl: 'socks5h://127.0.0.1:1080',
-        vmId: 'vm-01',
-      }),
-    (e) => e.code === 'state_mismatch',
-  )
-})
-
 test('buildAuthorizationURL matches sub2api parameter order', () => {
   const url = buildAuthorizationURL('st', 'ch')
   assert.ok(url.startsWith(`${AUTHORIZE_URL}?code=true&client_id=${CLIENT_ID}&response_type=code`))

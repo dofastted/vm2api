@@ -6,9 +6,12 @@ import https from 'node:https'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+import crypto from 'node:crypto'
+import { exchangeAuthCode, generateAuthUrl, peekAuthUrlSession } from '../../src/lib/oauth/oauth-auth-url.mjs'
+import { FULL_OAUTH_SCOPE } from '../../src/lib/oauth/oauth-contract.mjs'
 import { sessionKeyToOAuth } from '../../src/lib/oauth/cookie-auth.mjs'
 
-test('OAuth binary binds the organization in authorize before checking session freshness', {
+test('OAuth binary exchanges provider state with session PKCE and preserves cookie authorization', {
   timeout: 30000,
 }, async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-authorize-'))
@@ -33,7 +36,7 @@ test('OAuth binary binds the organization in authorize before checking session f
         '-subj',
         '/CN=claude.ai',
         '-addext',
-        'subjectAltName=DNS:claude.ai,DNS:platform.claude.com',
+        'subjectAltName=DNS:claude.ai,DNS:platform.claude.com,DNS:api.anthropic.com',
       ],
       { stdio: 'ignore' },
     )
@@ -43,10 +46,54 @@ test('OAuth binary binds the organization in authorize before checking session f
     return
   }
   const org = '12345678-1234-4234-8234-123456789abc'
+  let expectedExchange = null
+  let tokenRequests = 0
   const upstream = https.createServer({ key: fs.readFileSync(key), cert: fs.readFileSync(cert) }, async (req, res) => {
     const chunks = []
     for await (const chunk of req) chunks.push(chunk)
     res.setHeader('content-type', 'application/json')
+    if (req.method === 'POST' && req.url === '/v1/oauth/token') {
+      tokenRequests++
+      const payload = JSON.parse(Buffer.concat(chunks).toString())
+      const challenge = crypto.createHash('sha256').update(payload.code_verifier).digest('base64url')
+      if (
+        !expectedExchange ||
+        payload.code !== expectedExchange.code ||
+        challenge !== expectedExchange.challenge ||
+        payload.redirect_uri !== expectedExchange.redirectUri ||
+        payload.state !== expectedExchange.state ||
+        (expectedExchange.state === undefined && Object.hasOwn(payload, 'state'))
+      ) {
+        res.writeHead(400)
+        res.end(JSON.stringify({ error: 'invalid_grant' }))
+        return
+      }
+      res.end(
+        JSON.stringify({
+          access_token: 'sk-ant-oat01-binary-exchange',
+          refresh_token: 'sk-ant-ort01-binary-exchange',
+          expires_in: 28800,
+          scope: FULL_OAUTH_SCOPE,
+        }),
+      )
+      return
+    }
+    if (req.method === 'GET' && req.url.startsWith('/api/claude_cli/bootstrap?')) {
+      res.end(
+        JSON.stringify({
+          oauth_account: {
+            account_email: 'exchange@example.test',
+            account_uuid: 'account-exchange',
+            organization_uuid: org,
+          },
+        }),
+      )
+      return
+    }
+    if (req.method === 'PATCH' && req.url === '/api/oauth/account/settings') {
+      res.end('{}')
+      return
+    }
     if (req.method === 'GET' && req.url === '/api/organizations') {
       res.end(JSON.stringify([{ uuid: org, raven_type: 'team' }]))
       return
@@ -110,6 +157,38 @@ test('OAuth binary binds the organization in authorize before checking session f
     if (previousCerts === undefined) delete process.env.NODE_EXTRA_CA_CERTS
     else process.env.NODE_EXTRA_CA_CERTS = previousCerts
   })
+  const proxyUrl = `socks5h://127.0.0.1:${proxy.address().port}`
+  for (const scenario of [
+    { flavor: 'cai', returnedState: 'provider-exchange-state' },
+    { flavor: 'claude_code', returnedState: 'provider-cc-state' },
+    { flavor: 'cai', returnedState: undefined },
+    { flavor: 'setup_token', returnedState: 'session' },
+  ]) {
+    await t.test(`${scenario.flavor}: ${scenario.returnedState || 'no state suffix'}`, async () => {
+      const generated = generateAuthUrl({ vmId: 'vm-exchange', proxyUrl, flavor: scenario.flavor })
+      const url = new URL(generated.auth_url)
+      const state = scenario.returnedState === 'session' ? url.searchParams.get('state') : scenario.returnedState
+      expectedExchange = {
+        code: 'binary-auth-code',
+        challenge: url.searchParams.get('code_challenge'),
+        redirectUri: url.searchParams.get('redirect_uri'),
+        state,
+      }
+      const credential = await exchangeAuthCode({
+        sessionId: generated.session_id,
+        code: state ? `${expectedExchange.code}#${state}` : expectedExchange.code,
+        vmId: 'vm-exchange',
+        proxyUrl,
+      })
+      assert.equal(credential.access_token, 'sk-ant-oat01-binary-exchange')
+      assert.equal(credential.refresh_token, 'sk-ant-ort01-binary-exchange')
+      assert.equal(credential.email, 'exchange@example.test')
+      assert.equal(credential.account_uuid, 'account-exchange')
+      assert.equal(credential.org_uuid, org)
+      assert.equal(peekAuthUrlSession(generated.session_id), null)
+    })
+  }
+  assert.equal(tokenRequests, 4)
   await assert.rejects(
     sessionKeyToOAuth('sk-ant-sid01-testaaaaaaaa', {
       proxyUrl: `socks5h://127.0.0.1:${proxy.address().port}`,
