@@ -3,7 +3,13 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { normalizeGeoPayload, lookupProxyGeo } from '../../src/lib/vm/proxy-geo.mjs'
+import {
+  normalizeGeoPayload,
+  lookupProxyGeo,
+  lookupProxyGeoV6,
+  parsePlaintextIp,
+  DEFAULT_GEO_V6_IP_ENDPOINT,
+} from '../../src/lib/vm/proxy-geo.mjs'
 import { ProxyPool } from '../../src/lib/vm/proxy-pool.mjs'
 import { syncVmTimezoneFromProxy } from '../../src/lib/vm/proxy-timezone.mjs'
 
@@ -47,6 +53,72 @@ test('geo payload keeps named zones and reports provider-level failures', () => 
   assert.equal(normalizeGeoPayload({}), null)
 })
 
+test('plaintext IP parser trims whitespace', () => {
+  assert.equal(parsePlaintextIp('2001:db8::1\n'), '2001:db8::1')
+  assert.equal(parsePlaintextIp(''), null)
+})
+
+test('IPv6 geo lookup rejects IPv4 probe answers and requires a proxy agent', async () => {
+  let sawAgent = false
+  const v4 = await lookupProxyGeoV6('socks5h://127.0.0.1:1080', {
+    ipEndpoint: 'https://ipv6.test/ip',
+    fetchImpl: async (url, opts) => {
+      if (String(url).includes('ipv6.test')) {
+        sawAgent = !!opts.agent
+        return { ok: true, text: async () => '203.0.113.9' }
+      }
+      throw new Error('geo should not run after IPv4 probe')
+    },
+  })
+  assert.equal(v4.ok, false)
+  assert.equal(v4.error, 'geo_ipv6_got_ipv4')
+  assert.equal(sawAgent, true)
+
+  const bad = await lookupProxyGeoV6('', {
+    ipEndpoint: 'https://ipv6.test/ip',
+    fetchImpl: async () => ({ ok: true, text: async () => 'not-an-ip' }),
+  })
+  assert.equal(bad.error, 'geo_ipv6_invalid_ip')
+})
+
+test('IPv6 geo lookup resolves geolocation through the proxy after a valid probe', async () => {
+  const calls = []
+  const ok = await lookupProxyGeoV6('socks5h://127.0.0.1:1080', {
+    ipEndpoint: 'https://ipv6.test/ip',
+    fetchImpl: async (url, opts) => {
+      calls.push({ url: String(url), agent: !!opts.agent })
+      if (String(url).includes('ipv6.test')) return { ok: true, text: async () => '2001:db8::9' }
+      return {
+        ok: true,
+        json: async () => ({
+          status: 'success',
+          query: '2001:db8::9',
+          country: 'Japan',
+          countryCode: 'JP',
+          timezone: 'Asia/Tokyo',
+        }),
+      }
+    },
+  })
+  assert.equal(ok.ok, true)
+  assert.equal(ok.geo.ip, '2001:db8::9')
+  assert.equal(ok.geo.country_code, 'JP')
+  assert.equal(calls.length, 2)
+  assert.equal(calls.every((c) => c.agent), true)
+  assert.equal(calls[0].url, 'https://ipv6.test/ip')
+  assert.match(calls[1].url, /2001%3Adb8%3A%3A9/)
+})
+
+test('IPv6 geo lookup surfaces transport failures explicitly', async () => {
+  const down = await lookupProxyGeoV6('socks5h://127.0.0.1:1080', {
+    ipEndpoint: DEFAULT_GEO_V6_IP_ENDPOINT,
+    fetchImpl: async () => {
+      throw new Error('no route to host')
+    },
+  })
+  assert.match(down.error, /^geo_transport_error:no route to host/)
+})
+
 test('geo lookup surfaces transport and HTTP failures instead of throwing', async () => {
   const boom = await lookupProxyGeo('', {
     fetchImpl: async () => {
@@ -65,6 +137,10 @@ test('detectGeo caches per proxy and publishes location on the snapshot', async 
   const pool = makePool(async () => {
     calls += 1
     return { ok: true, geo: { ip: '203.0.113.9', country: 'Japan', country_code: 'JP', timezone: 'Asia/Tokyo' } }
+  })
+  pool.geoV6Lookup = async () => ({
+    ok: true,
+    geo: { ip: '2001:db8::9', country: 'Japan', country_code: 'JP', timezone: 'Asia/Tokyo' },
   })
   const imported = pool.importLines('1.2.3.4:1080')
   const id = imported.items[0].id
@@ -85,6 +161,36 @@ test('detectGeo caches per proxy and publishes location on the snapshot', async 
   assert.equal(snap.geo.country, 'Japan')
   assert.equal(snap.geo.timezone, 'Asia/Tokyo')
   assert.equal(snap.geo.error, null)
+  assert.equal(snap.geo_v6.ip, '2001:db8::9')
+  assert.equal(snap.geo_v6.error, null)
+})
+
+test('detectGeo keeps IPv4 and IPv6 results separate and records IPv6 unavailability', async () => {
+  const pool = makePool(async () => ({
+    ok: true,
+    geo: { ip: '203.0.113.9', country: 'Japan', timezone: 'Asia/Tokyo' },
+  }))
+  pool.geoV6Lookup = async () => ({ ok: false, error: 'geo_transport_error:timeout' })
+  const id = pool.importLines('1.2.3.4:1080').items[0].id
+  const result = await pool.detectGeo(id)
+  assert.equal(result.ok, true)
+  assert.equal(result.geo.ip, '203.0.113.9')
+  assert.equal(result.geo_v6.error, 'geo_transport_error:timeout')
+  assert.equal(result.geo_v6.ip, null)
+})
+
+test('detectGeo rejects IPv4 masquerading as IPv6 on the v6 path', async () => {
+  const pool = makePool(async () => ({
+    ok: true,
+    geo: { ip: '203.0.113.9', country: 'Japan', timezone: 'Asia/Tokyo' },
+  }))
+  pool.geoV6Lookup = async () => ({ ok: false, error: 'geo_ipv6_got_ipv4' })
+  const id = pool.importLines('1.2.3.4:1080').items[0].id
+  await pool.detectGeo(id)
+  const snap = pool.snapshot().proxies.find((p) => p.id === id)
+  assert.equal(snap.geo.ip, '203.0.113.9')
+  assert.equal(snap.geo_v6.error, 'geo_ipv6_got_ipv4')
+  assert.equal(snap.geo_v6.ip, null)
 })
 
 test('a failed lookup keeps the last known location and records the error', async () => {

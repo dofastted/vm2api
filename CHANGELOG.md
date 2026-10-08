@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.128 — 2026-10-08
+
+- SOCKS5 出口地理检测新增 IPv6：与现有 IPv4 `geo` 并列写入 `geo_v6`（`proxies.geo_v6_*`），经代理访问仅 AAAA 的 IP 探针确认公网 IPv6 后再查地理；探针返回 IPv4 记 `geo_ipv6_got_ipv4`，无 IPv6 出口记明确错误，不把 IPv4 当地理 IPv6。环境变量 `KIN_PROXY_GEO_V6_IP_URL` / `KIN_PROXY_GEO_V6_URL` 可覆盖探针与地理查询 URL（Fixes #307）。
+- 迁移 `033_proxy_geo_v6.sql` 启动时自动执行。
+
+已部署机升级：更新 Node 控制面并重启一次 Node。不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
 ## 1.3.127 — 2026-10-09
 
 - 仓库自带的 `src/config/routing.json` 有两个顶层 `codex` 键，后一个覆盖前一个，`codex.quota` 读不到。新装或用仓库默认配置首次启动时，会被当成旧版配置跑一次 OpenAI 限额迁移：重写 Codex 槽的 `policy`，并把 `routing.json` 改写成展开格式、权限改成 0600。现在合成一个 `codex` 块，取值不变（#308）。
