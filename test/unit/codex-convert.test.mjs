@@ -291,3 +291,172 @@ test('kernel Responses frames are re-emitted under their payload type', () => {
     ].join('\n'),
   )
 })
+
+function feedChatSse(events) {
+  const state = createChatSseState()
+  const tools = new Map()
+  let finish = null
+  for (const event of events) {
+    const out = responsesSseToChatChunk(`data: ${JSON.stringify(event)}`, 'codex', state)
+    if (!out) continue
+    for (const frame of out.split('\n\n')) {
+      const trimmed = frame.trim()
+      if (!trimmed.startsWith('data:') || trimmed === 'data: [DONE]') continue
+      const parsed = JSON.parse(trimmed.slice(5))
+      for (const call of parsed.choices?.[0]?.delta?.tool_calls || []) {
+        const tool = tools.get(call.index) || { args: '', headers: 0 }
+        if (call.id) {
+          tool.headers += 1
+          tool.id = call.id
+          tool.name = call.function?.name
+        }
+        tool.args += call.function?.arguments || ''
+        tools.set(call.index, tool)
+      }
+      const reason = parsed.choices?.[0]?.finish_reason
+      if (reason) finish = reason
+    }
+  }
+  return { tools, finish }
+}
+
+const fcAdded = (index, id, callId, name) => ({
+  type: 'response.output_item.added',
+  output_index: index,
+  item_id: id,
+  item: { type: 'function_call', id, call_id: callId, name, arguments: '' },
+})
+const fcDone = (index, id, args) => ({
+  type: 'response.function_call_arguments.done',
+  output_index: index,
+  item_id: id,
+  arguments: args,
+})
+const fcItemDone = (index, id, callId, name, args) => ({
+  type: 'response.output_item.done',
+  output_index: index,
+  item_id: id,
+  item: { type: 'function_call', id, call_id: callId, name, arguments: args },
+})
+
+test('parallel tool calls with args only in arguments.done keep their arguments', () => {
+  const { tools, finish } = feedChatSse([
+    fcAdded(0, 'fc_0', 'call_a', 'bash'),
+    fcAdded(1, 'fc_1', 'call_b', 'find'),
+    fcDone(0, 'fc_0', '{"x":1}'),
+    fcDone(1, 'fc_1', '{"y":2}'),
+    fcItemDone(0, 'fc_0', 'call_a', 'bash', '{"x":1}'),
+    fcItemDone(1, 'fc_1', 'call_b', 'find', '{"y":2}'),
+    { type: 'response.completed', response: { usage: { input_tokens: 3, output_tokens: 2 } } },
+  ])
+  assert.equal(tools.get(0).args, '{"x":1}')
+  assert.equal(tools.get(1).args, '{"y":2}')
+  assert.equal(tools.get(0).headers, 1)
+  assert.equal(tools.get(0).id, 'call_a')
+  assert.equal(tools.get(0).name, 'bash')
+  assert.equal(tools.get(1).headers, 1)
+  assert.equal(tools.get(1).id, 'call_b')
+  assert.equal(tools.get(1).name, 'find')
+  assert.equal(finish, 'tool_calls')
+})
+
+test('parallel tool calls with args only in output_item.done keep their arguments', () => {
+  const { tools, finish } = feedChatSse([
+    fcAdded(0, 'fc_0', 'call_a', 'bash'),
+    fcAdded(1, 'fc_1', 'call_b', 'find'),
+    fcItemDone(0, 'fc_0', 'call_a', 'bash', '{"x":1}'),
+    fcItemDone(1, 'fc_1', 'call_b', 'find', '{"y":2}'),
+    { type: 'response.completed', response: { usage: { input_tokens: 3, output_tokens: 2 } } },
+  ])
+  assert.equal(tools.get(0).args, '{"x":1}')
+  assert.equal(tools.get(1).args, '{"y":2}')
+  assert.equal(tools.get(0).headers, 1)
+  assert.equal(tools.get(0).id, 'call_a')
+  assert.equal(tools.get(0).name, 'bash')
+  assert.equal(tools.get(1).headers, 1)
+  assert.equal(tools.get(1).id, 'call_b')
+  assert.equal(tools.get(1).name, 'find')
+  assert.equal(finish, 'tool_calls')
+})
+
+test('tool args already streamed via deltas are not repeated by done events', () => {
+  const state = createChatSseState()
+  for (const event of [
+    fcAdded(0, 'fc_0', 'call_a', 'bash'),
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_0', delta: '{"x"' },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_0', delta: ':1}' },
+  ]) {
+    responsesSseToChatChunk(`data: ${JSON.stringify(event)}`, 'codex', state)
+  }
+  const done = responsesSseToChatChunk(`data: ${JSON.stringify(fcDone(0, 'fc_0', '{"x":1}'))}`, 'codex', state)
+  assert.equal(done, null)
+  const itemDone = responsesSseToChatChunk(
+    `data: ${JSON.stringify(fcItemDone(0, 'fc_0', 'call_a', 'bash', '{"x":1}'))}`,
+    'codex',
+    state,
+  )
+  assert.equal(itemDone, null)
+})
+
+test('arguments.done emits only the tail missing from streamed deltas', () => {
+  const state = createChatSseState()
+  const tools = new Map()
+  for (const event of [
+    fcAdded(0, 'fc_0', 'call_a', 'bash'),
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_0', delta: '{"x"' },
+    fcDone(0, 'fc_0', '{"x":1}'),
+  ]) {
+    const out = responsesSseToChatChunk(`data: ${JSON.stringify(event)}`, 'codex', state)
+    if (!out) continue
+    const parsed = JSON.parse(out.trim().slice(5))
+    for (const call of parsed.choices[0].delta.tool_calls || []) {
+      const tool = tools.get(call.index) || { args: '' }
+      tool.args += call.function?.arguments || ''
+      tools.set(call.index, tool)
+    }
+  }
+  assert.equal(tools.get(0).args, '{"x":1}')
+})
+
+test('custom_tool_call args arrive via output_item.done input', () => {
+  const { tools } = feedChatSse([
+    {
+      type: 'response.output_item.added',
+      output_index: 0,
+      item_id: 'ctc_0',
+      item: { type: 'custom_tool_call', id: 'ctc_0', call_id: 'call_c', name: 'apply_patch', input: '' },
+    },
+    {
+      type: 'response.output_item.done',
+      output_index: 0,
+      item_id: 'ctc_0',
+      item: { type: 'custom_tool_call', id: 'ctc_0', call_id: 'call_c', name: 'apply_patch', input: 'raw text' },
+    },
+  ])
+  assert.equal(tools.get(0).args, 'raw text')
+  assert.equal(tools.get(0).id, 'call_c')
+})
+
+test('output_item.done for a message item returns null', () => {
+  const out = responsesSseToChatChunk(
+    'data: {"type":"response.output_item.done","output_index":0,"item_id":"msg_0","item":{"type":"message","id":"msg_0","role":"assistant"}}',
+    'codex',
+    createChatSseState(),
+  )
+  assert.equal(out, null)
+})
+
+test('stateless output_item.done returns null while stateless arguments.done still emits', () => {
+  const itemDone = responsesSseToChatChunk(
+    'data: {"type":"response.output_item.done","output_index":0,"item_id":"fc_0","item":{"type":"function_call","id":"fc_0","call_id":"call_a","name":"bash","arguments":"{\\"x\\":1}"}}',
+  )
+  assert.equal(itemDone, null)
+  const done = responsesSseToChatChunk(
+    'data: {"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_0","arguments":"{\\"x\\":1}"}',
+  )
+  const parsed = JSON.parse(done.trim().slice(5))
+  const calls = parsed.choices[0].delta.tool_calls
+  assert.equal(calls.length, 2)
+  assert.equal(calls[0].function.arguments, '')
+  assert.equal(calls[1].function.arguments, '{"x":1}')
+})

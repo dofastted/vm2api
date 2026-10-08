@@ -344,7 +344,7 @@ function chatChunk(id, delta, finish, extra = {}) {
 function bindTool(state, keys, fields = {}) {
   const names = keys.filter((key) => key != null && key !== '').map(String)
   const existing = names.map((key) => state.tools.get(key)).find(Boolean)
-  const slot = existing || { index: state.seq++, id: '', name: '', header: false }
+  const slot = existing || { index: state.seq++, id: '', name: '', header: false, args: '' }
   if (fields.id) slot.id = fields.id
   if (fields.name) slot.name = fields.name
   for (const key of names) state.tools.set(key, slot)
@@ -361,6 +361,22 @@ function toolHeaderDelta(slot) {
     type: 'function',
     function: { name: slot.name, arguments: '' },
   }
+}
+
+function toolArgsDelta(slot, full) {
+  if (typeof full !== 'string' || full.length <= slot.args.length || !full.startsWith(slot.args)) return null
+  const piece = full.slice(slot.args.length)
+  slot.args = full
+  return { index: slot.index, function: { arguments: piece } }
+}
+
+function toolDoneChunk(session, slot, full) {
+  const calls = []
+  const header = toolHeaderDelta(slot)
+  if (header) calls.push(header)
+  const piece = toolArgsDelta(slot, full)
+  if (piece) calls.push(piece)
+  return calls.length ? chatChunk(session.id, { tool_calls: calls }) : null
 }
 
 export function responsesSseToChatChunk(line, id = 'codex', state = null) {
@@ -394,17 +410,25 @@ export function responsesSseToChatChunk(line, id = 'codex', state = null) {
     const header = toolHeaderDelta(slot)
     if (header) pieces.push(header)
     const args = typeof event.delta === 'string' ? event.delta : ''
-    if (args) pieces.push({ index: slot.index, function: { arguments: args } })
+    if (args) {
+      slot.args += args
+      pieces.push({ index: slot.index, function: { arguments: args } })
+    }
     return pieces.length ? chatChunk(session.id, { tool_calls: pieces }) : null
   }
   if (type === 'response.function_call_arguments.done' || type === 'response.custom_tool_call_input.done') {
     const slot = bindTool(session, [event.output_index, event.item_id], { name: event.name })
-    if (slot.header) return null
-    const header = toolHeaderDelta(slot)
-    const args = event.arguments || event.input || ''
-    const calls = header ? [header] : []
-    if (args) calls.push({ index: slot.index, function: { arguments: args } })
-    return calls.length ? chatChunk(session.id, { tool_calls: calls }) : null
+    return toolDoneChunk(session, slot, event.arguments || event.input)
+  }
+  if (
+    type === 'response.output_item.done' &&
+    (event.item?.type === 'function_call' || event.item?.type === 'custom_tool_call')
+  ) {
+    const keys = [event.output_index, event.item_id, event.item.call_id, event.item.id]
+    const known = keys.some((key) => key != null && key !== '' && session.tools.has(String(key)))
+    if (!known) return null
+    const slot = bindTool(session, keys, { id: event.item.call_id || event.item.id, name: event.item.name })
+    return toolDoneChunk(session, slot, event.item.arguments || event.item.input)
   }
   if (type.startsWith('response.reasoning_') && typeof event.delta === 'string' && event.delta) {
     return chatChunk(session.id, { reasoning_content: event.delta })
