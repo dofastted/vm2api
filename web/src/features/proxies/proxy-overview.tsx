@@ -17,6 +17,7 @@ import {
   proxyHealthKey,
   proxyLabel,
   proxyInFilter,
+  proxyViewId,
 } from './proxy-sort'
 import { PROXY_HEALTH_SOLID } from './proxy-tone'
 import { VmChip } from './vm-chip'
@@ -62,7 +63,7 @@ export function ProxyOverview({
     return out
   }, [proxies])
   const byId = useMemo(
-    () => new Map(proxies.map((p) => [p.id || '', p])),
+    () => new Map(proxies.map((p) => [proxyViewId(p), p])),
     [proxies]
   )
   const loose = vms.filter((v) => !ownerOf.has(v.id))
@@ -101,7 +102,7 @@ export function ProxyOverview({
           >
             {proxies.map((p, i) => (
               <SeatColumn
-                key={p.id}
+                key={proxyViewId(p)}
                 proxy={p}
                 limit={proxyBindLimit(p, poolLimit)}
                 height={colHeight}
@@ -230,7 +231,7 @@ function SeatColumn({
   hover: ProxyHover
   onLocate: (id: string) => void
 }) {
-  const id = proxy.id || ''
+  const id = proxyViewId(proxy)
   const lit = useProxyHovered(hover, id)
   const used = proxyBoundIds(proxy).length
   const color = PROXY_HEALTH_SOLID[proxyHealthKey(proxy)]

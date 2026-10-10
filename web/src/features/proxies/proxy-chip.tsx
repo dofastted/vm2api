@@ -2,6 +2,7 @@ import type { Vm } from '@/types/panel-vm'
 import { Globe } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { proxyHostLabel, proxyNamedLabel } from '@/lib/vm-status'
+import { proxyStatusLabel } from '@/features/proxies/proxy-sort'
 import { proxySurfaceClass, vmProxyTone } from '@/features/proxies/proxy-tone'
 import { useVpsIp } from '@/features/proxies/use-vps-ip'
 
@@ -20,11 +21,12 @@ export function ProxyChip({
   className?: string
   compact?: boolean
 }) {
-  // 本机槽的本地代理 IP 就是它绑定行（px-local）测出的出口 IP；节点槽取节点地址。
+  // 本地代理 IP 只取对应节点出口的实际探测结果。
   const vpsIp = useVpsIp(vm.node_id, vm.proxy ? [vm.proxy] : [])
   const host = proxyHostLabel(vm.proxy, vpsIp)
   const tone = vmProxyTone(vm)
-  const blocked = vm.proxy?.blocked_reason === 'ipv6_disabled'
+  const blocked = !!vm.proxy?.blocked_reason
+  const blockedLabel = blocked ? proxyStatusLabel(vm.proxy!) : ''
   const lat = blocked ? null : vm.proxy?.latency_ms
   const bound = host !== '—'
   // 芯片窄，起了名就只显示名称；完整的「名称 · 地址」放进 title。
@@ -35,7 +37,7 @@ export function ProxyChip({
       ? '缺代理'
       : '直连'
   const title = blocked
-    ? `${named} · IPv6 已关闭（设置 → SOCKS5 开启）`
+    ? `${named} · ${blockedLabel}${vm.proxy?.blocked_reason === 'ipv6_disabled' ? '（设置 → SOCKS5 开启）' : '（已有绑定保留）'}`
     : lat != null && bound
       ? `${named} · ${lat}ms`
       : bound
@@ -62,7 +64,7 @@ export function ProxyChip({
           )}
           {blocked ? (
             <span className='shrink-0 text-[11px] text-muted-foreground'>
-              IPv6 已关闭
+              {blockedLabel}
             </span>
           ) : null}
           {lat != null ? (

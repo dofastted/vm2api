@@ -22,6 +22,7 @@ import {
   type ProxyFilter,
   type ProxySortKey,
   proxyInFilter,
+  proxyViewId,
 } from './proxy-sort'
 
 const SORT_LABEL: Record<ProxySortKey, string> = {
@@ -215,7 +216,7 @@ export function ProxyList({
         <ul className='divide-y divide-border/60'>
           {rows.map((p) => (
             <ProxyRow
-              key={p.id}
+              key={proxyViewId(p)}
               proxy={p}
               vms={vms}
               vmById={vmById}

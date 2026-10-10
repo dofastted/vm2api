@@ -45,6 +45,18 @@ export function proxyHealthOf(vm: Vm, proxy: VmProxySnap): ProxyHealth {
  * 没有单一 vm 可传给 `proxyHealthOf`。
  */
 export function proxyOwnHealthOf(proxy: VmProxySnap): ProxyHealth {
+  if (proxy.blocked_reason === 'node_unavailable') {
+    return {
+      score: 0,
+      tone: {
+        key: 'warn',
+        text: '节点未连接',
+        cls: 'warn',
+        label: '已有绑定保留，节点连接恢复后才能绑定新槽位或探测',
+      },
+      reasons: ['节点未连接，暂时无法探测出口，已有绑定保留'],
+    }
+  }
   if (proxy.blocked_reason === 'ipv6_disabled') {
     return {
       score: 0,

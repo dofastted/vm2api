@@ -72,16 +72,14 @@ export function encodeBoundVmIds(ids) {
   return JSON.stringify(next)
 }
 
-function normalizeVmIds(list, limit = BIND_LIMIT_MAX) {
+function normalizeVmIds(list) {
   const out = []
   const seen = new Set()
-  const cap = clampBindLimit(limit, BIND_LIMIT_MAX)
   for (const item of list || []) {
     const id = String(item || '').trim()
     if (!id || seen.has(id)) continue
     seen.add(id)
     out.push(id)
-    if (out.length >= cap) break
   }
   return out
 }
@@ -302,6 +300,10 @@ export class ProxyPool {
     repairEgress,
     geoLookup,
     geoV6Lookup,
+    listVms = () => [],
+    listNodes = () => [],
+    getVmNodeId,
+    nodeExitProxyUrl,
   } = {}) {
     this.db = resolveStoreDb({ db, dataDir })
     this.repo = new ProxiesRepo(this.db)
@@ -313,12 +315,17 @@ export class ProxyPool {
     // Injectable so geo detection is testable without leaving the machine.
     this.geoLookup = geoLookup || lookupProxyGeo
     this.geoV6Lookup = geoV6Lookup || lookupProxyGeoV6
+    this.listVms = listVms
+    this.listNodes = listNodes
+    this.getVmNodeId = getVmNodeId
+    this.nodeExitProxyUrl = nodeExitProxyUrl
     this.state = { config: { ...DEFAULT_CONFIG }, proxies: [] }
     this._timer = null
     this._probing = false
     this._probeSockets = new Map()
     // Node exits are not pool rows: px-local's geo is the control plane's, a node slot leaves elsewhere.
     this._exitGeo = new Map()
+    this._nodeProbes = new Map()
     this.load()
   }
 
@@ -357,42 +364,84 @@ export class ProxyPool {
     return clampBindLimit(this.state.config?.bind_limit, MAX_VMS_PER_PROXY)
   }
 
-  snapshot({ ownerUserId = undefined } = {}) {
+  /** Placement stays on the VM; px-local remains the persisted/runtime proxy id. */
+  nodeIdForVm(vmId) {
+    if (typeof this.getVmNodeId === 'function') return this.getVmNodeId(vmId) || null
+    return this.listVms().find((vm) => vm.id === vmId)?.node_id || null
+  }
+
+  _scopeContext() {
+    return {
+      vmNodes: new Map(this.listVms().map((vm) => [vm.id, vm.node_id || null])),
+      nodes: this.listNodes(),
+    }
+  }
+
+  boundIdsForNode(proxy, nodeId, context = this._scopeContext()) {
+    // Historical/orphaned bindings remain visible on the control plane until reconciled.
+    return boundVmIdsOf(proxy).filter((id) => (context.vmNodes.get(id) || null) === (nodeId || null))
+  }
+
+  localExitViews(proxy, context = this._scopeContext()) {
+    const nodes = new Set(context.nodes.map((node) => node.id).filter(Boolean))
+    for (const id of boundVmIdsOf(proxy)) {
+      const nodeId = context.vmNodes.get(id)
+      if (nodeId) nodes.add(nodeId)
+    }
+    return [null, ...nodes].map((nodeId) => this.publicProxy(proxy, { nodeId, context }))
+  }
+
+  /** Public proxy for a VM's actual exit, useful to all panel/import entry points. */
+  proxyForVm(proxyId, vmId) {
+    const proxy = this.state.proxies.find((p) => p.id === proxyId)
+    if (!proxy) return null
+    const context = this._scopeContext()
+    return this.publicProxy(proxy, { nodeId: context.vmNodes.get(vmId) || null, context })
+  }
+
+  snapshot({ ownerUserId = undefined, nodeId = undefined } = {}) {
     const limit = this.bindLimit()
     const owner = ownerUserId === undefined ? undefined : normalizeOwnerId(ownerUserId)
-    const proxies =
+    const stored =
       ownerUserId === undefined ? this.state.proxies : this.state.proxies.filter((p) => proxyOwnerId(p) === owner)
-    const available = proxies.filter((p) => !proxyBlockedReason(p, this.state.config.ipv6_enabled))
+    const context = this._scopeContext()
+    const localExits = stored.filter(isLocalEgressProxy).flatMap((p) => this.localExitViews(p, context))
+    const proxies = stored.map((p) => this.publicProxy(p, { nodeId, context }))
+    const exits = nodeId === undefined ? [...proxies.filter((p) => !isLocalEgressProxy(p)), ...localExits] : proxies
+    const available = exits.filter((p) => !p.blocked_reason)
     const unused = available.filter((p) => p.enabled && boundVmIdsOf(p).length === 0 && p.status !== 'dead').length
     const open = available.filter((p) => p.enabled && p.status !== 'dead' && boundVmIdsOf(p).length < limit).length
-    const bound = proxies.filter((p) => boundVmIdsOf(p).length > 0).length
-    const dead = proxies.filter((p) => !p.enabled || p.status === 'dead').length
+    const bound = exits.filter((p) => boundVmIdsOf(p).length > 0).length
+    const dead = exits.filter((p) => !p.enabled || p.status === 'dead').length
     const ok = available.filter((p) => p.enabled && p.status === 'ok').length
-    const slotsUsed = proxies.reduce((n, p) => n + boundVmIdsOf(p).length, 0)
+    const slotsUsed = exits.reduce((n, p) => n + boundVmIdsOf(p).length, 0)
     return {
       config: { ...this.state.config, bind_limit: limit },
       totals: {
-        total: proxies.length,
+        total: exits.length,
         free: unused,
         open,
         bound,
         ok,
         dead,
-        blocked: proxies.length - available.length,
+        blocked: exits.length - available.length,
         probing: this._probing,
         slots_used: slotsUsed,
-        slots_cap: proxies.length * limit,
+        slots_cap: exits.length * limit,
         bind_limit: limit,
       },
-      proxies: proxies.map((p) => this.publicProxy(p)),
+      proxies,
+      local_exits: nodeId === undefined ? localExits : localExits.filter((p) => p.node_id === nodeId),
     }
   }
 
-  publicProxy(p) {
-    const ids = boundVmIdsOf(p)
+  publicProxy(p, { nodeId = undefined, context = undefined } = {}) {
+    const scoped = isLocalEgressProxy(p) && nodeId !== undefined
+    if (scoped && !context) context = this._scopeContext()
+    const ids = scoped ? this.boundIdsForNode(p, nodeId, context) : boundVmIdsOf(p)
     const limit = this.bindLimit()
     const blocked = proxyBlockedReason(p, this.state.config.ipv6_enabled)
-    return {
+    const result = {
       id: p.id,
       host: p.host,
       port: p.port,
@@ -417,6 +466,46 @@ export class ProxyPool {
       domain_forward: !!p.domain_forward,
       geo: proxyGeoOf(p),
       geo_v6: proxyGeoV6Of(p),
+    }
+    if (!scoped) return result
+    const node = nodeId ? context.nodes.find((item) => item.id === nodeId) : null
+    const previousProbe = this._nodeProbes.get(nodeId || null)
+    // Startup can precede SSH readiness; an old offline observation is not a failed exit probe.
+    const probe = previousProbe?.error === 'node_unavailable' && node?.link?.state === 'ready' ? null : previousProbe
+    return {
+      ...result,
+      view_id: `${p.id}@${nodeId || 'local'}`,
+      node_id: nodeId || null,
+      node_name: nodeId ? node?.name || nodeId : null,
+      ...(nodeId
+        ? {
+            // A node's SSH endpoint and the control-plane geo are not its observed exit IP.
+            label: null,
+            status: !p.enabled
+              ? 'dead'
+              : node?.link?.state !== 'ready'
+                ? 'fail'
+                : probe?.ok
+                  ? 'ok'
+                  : probe
+                    ? 'fail'
+                    : 'unknown',
+            blocked_reason: node?.link?.state !== 'ready' ? 'node_unavailable' : blocked,
+            latency_ms: probe?.latency_ms ?? null,
+            last_probe_at: probe?.checked_at || null,
+            last_error: node?.link?.state !== 'ready' ? 'node_unavailable' : probe?.error || null,
+            consecutive_failures: 0,
+            geo: this._exitGeo.get(`node:${nodeId}`) || null,
+            geo_v6: null,
+          }
+        : probe
+          ? {
+              status: !p.enabled ? 'dead' : probe.ok ? 'ok' : 'fail',
+              latency_ms: probe.latency_ms ?? null,
+              last_probe_at: probe.checked_at || null,
+              last_error: probe.error || null,
+            }
+          : {}),
     }
   }
 
@@ -535,38 +624,52 @@ export class ProxyPool {
    */
   ensureBoundToVm(vmId, preferredId = null) {
     if (!vmId) return null
+    const current = this.state.proxies.find((p) => proxyHasVm(p, vmId))
+    const preferred = this.state.proxies.find((p) => p.id === preferredId)
+    if (isLocalEgressProxy(current) || isLocalEgressProxy(preferred) || preferredId === LOCAL_EGRESS_ID) {
+      const nodeId = this.nodeIdForVm(vmId)
+      // An unavailable node cannot change a saved local exit into a different proxy on restart.
+      if (nodeId && !this.listNodes().some((node) => node.id === nodeId && node.link?.state === 'ready')) return null
+    }
     if (this.state.proxies.some((p) => proxyHasVm(p, vmId) && proxyBlockedReason(p, this.state.config.ipv6_enabled)))
       return null
     const existing = this.getProxyForVm(vmId)
     if (existing) return existing
     if (preferredId) {
-      const preferred = this.state.proxies.find((p) => p.id === preferredId)
       if (proxyBlockedReason(preferred, this.state.config.ipv6_enabled)) return null
       const bound = this.bind(preferredId, vmId)
       if (bound.ok) return this.getProxyForVm(vmId)
     }
-    return this.allocateForVm(vmId)
+    return this.allocateForVm(vmId) ? this.getProxyForVm(vmId) : null
   }
 
   /** Allocate one healthy proxy with remaining capacity and bind to vmId */
   allocateForVm(vmId, { ownerUserId = null, role = 'admin' } = {}) {
     if (!vmId) return null
+    const context = this._scopeContext()
+    const nodeId = context.vmNodes.get(vmId) || null
     if (this.state.proxies.some((p) => proxyHasVm(p, vmId) && proxyBlockedReason(p, this.state.config.ipv6_enabled)))
       return null
     const existing = this.state.proxies.find(
       (p) => p.enabled && !proxyBlockedReason(p, this.state.config.ipv6_enabled) && proxyHasVm(p, vmId),
     )
-    if (existing) return this.publicProxy(existing)
+    if (existing) {
+      const view = this.publicProxy(existing, { nodeId, context })
+      return view.blocked_reason ? null : view
+    }
 
     const limit = this.bindLimit()
     const owner = normalizeOwnerId(ownerUserId)
     const candidates = this.state.proxies.filter((p) => {
-      if (!p.enabled || p.status === 'dead' || p.status === 'fail') return false
-      if (proxyBlockedReason(p, this.state.config.ipv6_enabled)) return false
-      if (boundVmIdsOf(p).length >= limit) return false
+      const view = this.publicProxy(p, { nodeId, context })
+      if (!view.enabled || view.status === 'dead' || view.status === 'fail') return false
+      if (view.blocked_reason) return false
+      if (boundVmIdsOf(view).length >= limit) return false
       return proxyOwnerId(p) === owner
     })
     candidates.sort((a, b) => {
+      a = this.publicProxy(a, { nodeId, context })
+      b = this.publicProxy(b, { nodeId, context })
       const score = (x) => (x.status === 'ok' ? 0 : x.status === 'unknown' ? 1 : 2)
       if (score(a) !== score(b)) return score(a) - score(b)
       return boundVmIdsOf(a).length - boundVmIdsOf(b).length
@@ -577,7 +680,7 @@ export class ProxyPool {
     return bound.ok ? bound.proxy : null
   }
 
-  bind(proxyId, vmId) {
+  bind(proxyId, vmId, { nodeId = undefined } = {}) {
     const p = this.state.proxies.find((x) => x.id === proxyId)
     if (!p) return { ok: false, error: 'proxy_not_found' }
     if (!p.enabled || p.status === 'dead') return { ok: false, error: 'proxy_disabled' }
@@ -585,6 +688,20 @@ export class ProxyPool {
     if (blocked) return { ok: false, error: blocked }
     const vm = String(vmId || '').trim()
     if (!vm) return { ok: false, error: 'vm_id_required' }
+    const context = this._scopeContext()
+    const actualNodeId = context.vmNodes.get(vm) || null
+    if (isLocalEgressProxy(p) && nodeId !== undefined && nodeId !== actualNodeId) {
+      return { ok: false, error: 'proxy_node_mismatch' }
+    }
+    const view = this.publicProxy(p, { nodeId: actualNodeId, context })
+    if (view.blocked_reason) return { ok: false, error: view.blocked_reason }
+    const ids = boundVmIdsOf(p)
+    const scopedIds = boundVmIdsOf(view)
+    const limit = this.bindLimit()
+    // Check first: a rejected move must keep its previous binding intact.
+    if (!ids.includes(vm) && scopedIds.length >= limit) {
+      return { ok: false, error: 'proxy_bind_limit', max: limit, bound_vm_ids: scopedIds }
+    }
     for (const x of this.state.proxies) {
       if (x.id === proxyId) continue
       const ids = boundVmIdsOf(x)
@@ -594,29 +711,31 @@ export class ProxyPool {
           ids.filter((id) => id !== vm),
         )
     }
-    const ids = boundVmIdsOf(p)
     if (ids.includes(vm)) {
       this.save()
-      return { ok: true, proxy: this.publicProxy(p) }
-    }
-    const limit = this.bindLimit()
-    if (ids.length >= limit) {
-      return { ok: false, error: 'proxy_bind_limit', max: limit, bound_vm_ids: ids }
+      return { ok: true, proxy: this.publicProxy(p, { nodeId: actualNodeId, context }) }
     }
     setBoundVmIds(p, [...ids, vm])
     this.save()
-    return { ok: true, proxy: this.publicProxy(p) }
+    return { ok: true, proxy: this.publicProxy(p, { nodeId: actualNodeId, context }) }
   }
 
-  unbind(proxyId, vmId = null) {
+  unbind(proxyId, vmId = null, { nodeId = undefined } = {}) {
     const p = this.state.proxies.find((x) => x.id === proxyId)
     if (!p) return { ok: false, error: 'proxy_not_found' }
     const ids = boundVmIdsOf(p)
     const target = vmId == null || vmId === '' ? null : String(vmId).trim()
-    const removed = target ? ids.filter((id) => id === target) : ids.slice()
-    setBoundVmIds(p, target ? ids.filter((id) => id !== target) : [])
+    if (target && isLocalEgressProxy(p) && nodeId !== undefined && this.nodeIdForVm(target) !== nodeId) {
+      return { ok: false, error: 'proxy_node_mismatch' }
+    }
+    const scope = isLocalEgressProxy(p) && nodeId !== undefined ? this.boundIdsForNode(p, nodeId) : ids
+    const removed = target ? scope.filter((id) => id === target) : scope
+    setBoundVmIds(
+      p,
+      ids.filter((id) => !removed.includes(id)),
+    )
     this.save()
-    return { ok: true, proxy: this.publicProxy(p), unbound_vm_ids: removed }
+    return { ok: true, proxy: this.publicProxy(p, { nodeId }), unbound_vm_ids: removed }
   }
 
   unbindVm(vmId) {
@@ -800,6 +919,19 @@ export class ProxyPool {
     if (!p) return { ok: false, error: 'no_bound_proxy' }
     const blocked = proxyBlockedReason(p, this.state.config.ipv6_enabled)
     if (blocked) return { ok: true, skipped: true, reason: blocked }
+    if (isLocalEgressProxy(p)) {
+      const nodeId = this.nodeIdForVm(vmId)
+      const reason = String(error || 'runtime_socks_failure')
+      this._nodeProbes.set(nodeId, {
+        ok: false,
+        error: reason,
+        latency_ms: null,
+        checked_at: new Date().toISOString(),
+      })
+      const scoped = this.publicProxy(p, { nodeId })
+      this._cascadeDisconnectVm(scoped, `proxy_disconnect:${reason}`)
+      return { ok: true, skipped: false, proxy: scoped }
+    }
     this._applyProbeResult(
       p,
       {
@@ -944,13 +1076,57 @@ export class ProxyPool {
     })
   }
 
-  async probeById(proxyId) {
+  async probeById(proxyId, { nodeId = undefined } = {}) {
     const p = this.state.proxies.find((x) => x.id === proxyId)
     if (!p) return { ok: false, error: 'proxy_not_found' }
+    if (isLocalEgressProxy(p) && nodeId) {
+      const view = this.publicProxy(p, { nodeId })
+      const started = Date.now()
+      let result
+      try {
+        if (view.blocked_reason) throw new Error(view.blocked_reason)
+        const url = this.nodeExitProxyUrl?.(nodeId)
+        if (!url) throw new Error('node_egress_unavailable')
+        // Test a real request through the node's SSH-backed SOCKS forwarder.
+        const lookup = await this.geoLookup(url, { timeoutMs: this.state.config.probe_timeout_ms })
+        result = { ok: !!lookup?.ok, error: lookup?.ok ? null : lookup?.error || 'node_probe_failed' }
+      } catch (error) {
+        result = { ok: false, error: error?.code || error?.message || 'node_probe_failed' }
+      }
+      result = { ...result, scope: 'node', latency_ms: Date.now() - started, checked_at: new Date().toISOString() }
+      this._applyLocalProbeResult(p, nodeId, result)
+      // Node diagnostics must never change the shared row or cascade to sibling nodes.
+      return { ok: true, proxy: this.publicProxy(p, { nodeId }), probe: result }
+    }
     const result = await this.probeOne(p)
-    this._applyProbeResult(p, result)
+    if (isLocalEgressProxy(p)) {
+      const enabled = p.enabled
+      this._applyProbeResult(p, result, { cascade: false })
+      // Local enablement is an explicit global control, never inferred from one host's health.
+      p.enabled = enabled
+      if (!enabled) p.status = 'dead'
+      this._applyLocalProbeResult(p, null, result)
+    } else this._applyProbeResult(p, result)
     this.save()
-    return { ok: true, proxy: this.publicProxy(p), probe: result }
+    return { ok: true, proxy: this.publicProxy(p, { nodeId }), probe: result }
+  }
+
+  _applyLocalProbeResult(proxy, nodeId, result) {
+    const previous = this._nodeProbes.get(nodeId)
+    this._nodeProbes.set(nodeId, { ...result, checked_at: new Date().toISOString() })
+    if (!result.ok || !proxy.enabled) return
+    const scoped = this.publicProxy(proxy, { nodeId })
+    // The VM reason survives a server restart even though node probe caches do not.
+    const recoverable = new Set(
+      this.listVms()
+        .filter((vm) => {
+          const reason = String(vm.schedule_disabled_reason || '')
+          return reason.includes(`proxy=${proxy.id}`) || /egress_down|proxy_probe_failed/.test(reason)
+        })
+        .map((vm) => vm.id),
+    )
+    const ids = boundVmIdsOf(scoped).filter((id) => (previous && !previous.ok) || recoverable.has(id))
+    this._cascadeEnableVm({ ...scoped, bound_vm_ids: ids, bound_vm_id: ids[0] || null }, 'proxy_recovered')
   }
 
   async probeAll({ onlyEnabled = true } = {}) {
@@ -965,9 +1141,22 @@ export class ProxyPool {
         return p.status === 'fail' || (p.status === 'dead' && p.last_error)
       })
       for (const p of list) {
-        const result = await this.probeOne(p)
-        this._applyProbeResult(p, result)
-        results.push({ id: p.id, ...result, status: p.status, enabled: p.enabled })
+        if (isLocalEgressProxy(p)) {
+          for (const view of this.localExitViews(p)) {
+            const scoped = await this.probeById(p.id, { nodeId: view.node_id })
+            results.push({
+              id: p.id,
+              node_id: view.node_id,
+              ...scoped.probe,
+              status: scoped.proxy.status,
+              enabled: p.enabled,
+            })
+          }
+        } else {
+          const result = await this.probeOne(p)
+          this._applyProbeResult(p, result)
+          results.push({ id: p.id, ...result, status: p.status, enabled: p.enabled })
+        }
       }
       this.save()
       return { ok: true, total: results.length, results }
@@ -986,9 +1175,22 @@ export class ProxyPool {
    * `force` re-queries a row that already has a location; without it a cached
    * hit is returned untouched so bind-time detection stays cheap.
    */
-  async detectGeo(proxyId, { force = false } = {}) {
+  async detectGeo(proxyId, { force = false, nodeId = undefined } = {}) {
     const p = this.state.proxies.find((x) => x.id === proxyId)
     if (!p) return { ok: false, error: 'proxy_not_found' }
+    if (isLocalEgressProxy(p) && nodeId) {
+      const view = this.publicProxy(p, { nodeId })
+      if (view.blocked_reason) return { ok: false, error: view.blocked_reason, proxy: view }
+      try {
+        const url = this.nodeExitProxyUrl?.(nodeId)
+        if (!url) throw new Error('node_egress_unavailable')
+        const key = `node:${nodeId}`
+        const result = await this.exitGeo(key, url, { force })
+        return { ...result, proxy: this.publicProxy(p, { nodeId }), geo_v6: null }
+      } catch (error) {
+        return { ok: false, error: error?.code || error?.message || 'geo_lookup_failed', proxy: view }
+      }
+    }
     const blocked = proxyBlockedReason(p, this.state.config.ipv6_enabled)
     if (blocked) return { ok: false, error: blocked, proxy: this.publicProxy(p) }
     const v4Cached = !force && p.geo_checked_at && p.geo_ip
@@ -997,7 +1199,7 @@ export class ProxyPool {
       return {
         ok: true,
         cached: true,
-        proxy: this.publicProxy(p),
+        proxy: this.publicProxy(p, { nodeId }),
         geo: proxyGeoOf(p),
         geo_v6: proxyGeoV6Of(p),
       }
@@ -1011,7 +1213,7 @@ export class ProxyPool {
     let v6Result = v6Cached ? { ok: true } : await this.geoV6Lookup(url, { timeoutMs })
     if (!v6Cached) this._applyGeoV6Result(p, v6Result)
     this.save()
-    const pub = this.publicProxy(p)
+    const pub = this.publicProxy(p, { nodeId })
     if (!v4Result?.ok) {
       return {
         ok: false,
@@ -1031,12 +1233,15 @@ export class ProxyPool {
   }
 
   async detectGeoAll({ onlyEnabled = true, force = false } = {}) {
-    const list = this.state.proxies.filter((p) => (onlyEnabled ? p.enabled : true))
+    const list = this.state.proxies
+      .filter((p) => (onlyEnabled ? p.enabled : true))
+      .flatMap((p) => (isLocalEgressProxy(p) ? this.localExitViews(p) : [this.publicProxy(p)]))
     const results = []
     for (const p of list) {
-      const result = await this.detectGeo(p.id, { force })
+      const result = await this.detectGeo(p.id, { force, nodeId: p.node_id })
       results.push({
         id: p.id,
+        ...(p.node_id !== undefined ? { node_id: p.node_id } : {}),
         ok: !!result.ok,
         cached: !!result.cached,
         error: result.ok ? null : result.error || null,
@@ -1088,9 +1293,9 @@ export class ProxyPool {
    * looked up through that node's forwarder). Cached per key for the process;
    * failures are not cached so the next bind retries.
    */
-  async exitGeo(key, url, { detect = true } = {}) {
+  async exitGeo(key, url, { detect = true, force = false } = {}) {
     const hit = this._exitGeo.get(key)
-    if (hit) return { ok: true, cached: true, geo: hit }
+    if (hit && !force) return { ok: true, cached: true, geo: hit }
     if (!detect) return { ok: false, error: 'exit_geo_unknown' }
     const result = await this.geoLookup(url, { timeoutMs: this.state.config?.geo_timeout_ms })
     if (!result?.ok) return { ok: false, error: result?.error || 'geo_lookup_failed' }
@@ -1178,6 +1383,11 @@ export class ProxyPool {
         !proxyBlockedReason(x, this.state.config.ipv6_enabled),
     )
     if (!p) return null
+    if (isLocalEgressProxy(p)) {
+      const nodeId = this.nodeIdForVm(vmId)
+      if (nodeId && !this.listNodes().some((node) => node.id === nodeId && node.link?.state === 'ready')) return null
+    }
+    // Never return view_id as id: runtime derives its Docker network from this id.
     return this._withAuth(p)
   }
 

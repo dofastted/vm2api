@@ -30,13 +30,17 @@ export type ProxyGeo = {
 
 export type VmProxySnap = {
   id?: string
+  /** 展示行标识，不能作为代理操作的 ID。 */
+  view_id?: string
+  node_id?: string | null
+  node_name?: string | null
   host?: string
   port?: number | string
   /** 代理名称，运维手写（如对应哪台机器）；未填为 null。 */
   label?: string | null
   status?: string
   enabled?: boolean
-  blocked_reason?: 'ipv6_disabled' | null
+  blocked_reason?: 'ipv6_disabled' | 'node_unavailable' | null
   address_family?: 4 | 6 | null
   latency_ms?: number
   last_error?: string

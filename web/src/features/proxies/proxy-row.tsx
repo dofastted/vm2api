@@ -34,6 +34,8 @@ import {
   proxyHostText,
   proxyIsInvalid,
   proxyIsLocal,
+  proxyMatchesNode,
+  proxyViewId,
 } from './proxy-sort'
 import {
   PROXY_HEALTH_SOLID,
@@ -88,7 +90,7 @@ export function ProxyRow({
   pending: ProxyRowPending
   actions: ProxyRowActions
 }) {
-  const id = proxy.id || ''
+  const id = proxyViewId(proxy)
   const lit = useProxyHovered(hover, id)
   const [over, setOver] = useState(false)
   const ids = proxyBoundIds(proxy)
@@ -100,6 +102,8 @@ export function ProxyRow({
   const free = Math.max(0, limit - ids.length)
   const accepts =
     !!dragVm &&
+    !!vmById.get(dragVm) &&
+    proxyMatchesNode(proxy, vmById.get(dragVm)?.node_id) &&
     bindable &&
     free > 0 &&
     !ids.includes(dragVm) &&
@@ -168,7 +172,7 @@ export function ProxyRow({
             )}
             title={
               local
-                ? `${proxyHostText(proxy)} · ${LOCAL_PROXY_HINT}：槽位走所在 VPS（本机或集群节点）自身出口`
+                ? `${proxyHostText(proxy)} · ${proxy.view_id ? '所在节点直出 · 独立额度' : LOCAL_PROXY_HINT}：槽位走所在 VPS（本机或集群节点）自身出口`
                 : proxyHostText(proxy)
             }
           >
@@ -176,7 +180,7 @@ export function ProxyRow({
           </span>
           {local ? (
             <span className='shrink-0 text-xs text-muted-foreground'>
-              {LOCAL_PROXY_HINT}
+              {proxy.view_id ? '所在节点直出 · 独立额度' : LOCAL_PROXY_HINT}
             </span>
           ) : null}
           {proxy.address_family === 6 ? (
@@ -246,7 +250,7 @@ export function ProxyRow({
               key={vmId}
               vm={vmById.get(vmId)}
               vmId={vmId}
-              tone={dead ? 'bad' : 'ok'}
+              tone={dead ? 'bad' : proxy.blocked_reason ? 'none' : 'ok'}
               disabled={pending.binding}
               onUnbind={() => actions.onUnbind(id, vmId)}
               onDragChange={actions.onVmDragChange}
@@ -258,11 +262,15 @@ export function ProxyRow({
             </span>
           ) : !bindable ? (
             <span className='text-xs text-muted-foreground'>
-              {health === 'off' ? '已禁用，不接新槽位' : '已失效，不接新槽位'}
+              {proxy.blocked_reason === 'node_unavailable'
+                ? '节点未连接，已有绑定保留，暂不接新槽位'
+                : health === 'off'
+                  ? '已禁用，不接新槽位'
+                  : '已失效，不接新槽位'}
             </span>
           ) : free > 0 ? (
             <ProxyBindPicker
-              vms={vms}
+              vms={vms.filter((vm) => proxyMatchesNode(proxy, vm.node_id))}
               boundHere={ids}
               ownerOf={ownerOf}
               free={free}
@@ -284,7 +292,11 @@ export function ProxyRow({
           loading={pending.probe === id}
           disabled={!!proxy.blocked_reason}
           aria-label='测通'
-          title='测通：只测 SOCKS TCP，不打 Anthropic'
+          title={
+            local
+              ? '检测此节点的 local 出口'
+              : '测通：只测 SOCKS TCP，不打 Anthropic'
+          }
         >
           <Activity />
         </Button>
@@ -300,45 +312,43 @@ export function ProxyRow({
         >
           <Globe />
         </Button>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button
-              size='icon'
-              variant='ghost'
-              className='size-8'
-              aria-label='更多操作'
-              loading={pending.copy === id || pending.toggle === id}
-            >
-              <Ellipsis />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align='end' className='w-44'>
-            {local ? null : (
-              <>
-                <DropdownMenuItem onSelect={() => actions.onCopy(id)}>
-                  <Copy />
-                  复制地址（含账密）
-                </DropdownMenuItem>
-                <DropdownMenuItem onSelect={() => actions.onEdit(id)}>
-                  <Pencil />
-                  编辑 / 改名
-                </DropdownMenuItem>
-              </>
-            )}
-            <DropdownMenuItem onSelect={() => actions.onToggleEnabled(proxy)}>
-              {proxy.enabled === false ? <Power /> : <PowerOff />}
-              {proxy.enabled === false ? '启用' : '禁用'}
-            </DropdownMenuItem>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem
-              variant='destructive'
-              onSelect={() => actions.onDelete(id)}
-            >
-              <Trash2 />
-              删除
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
+        {!local ? (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                size='icon'
+                variant='ghost'
+                className='size-8'
+                aria-label='更多操作'
+                loading={pending.copy === id || pending.toggle === id}
+              >
+                <Ellipsis />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align='end' className='w-44'>
+              <DropdownMenuItem onSelect={() => actions.onCopy(id)}>
+                <Copy />
+                复制地址（含账密）
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => actions.onEdit(id)}>
+                <Pencil />
+                编辑 / 改名
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => actions.onToggleEnabled(proxy)}>
+                {proxy.enabled === false ? <Power /> : <PowerOff />}
+                {proxy.enabled === false ? '启用' : '禁用'}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                variant='destructive'
+                onSelect={() => actions.onDelete(id)}
+              >
+                <Trash2 />
+                删除
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        ) : null}
       </div>
     </li>
   )

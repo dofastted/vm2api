@@ -77,7 +77,7 @@ import { ClusterNodesRepo } from './lib/db/repos/cluster-nodes-repo.mjs'
 import { ClusterManager } from './lib/cluster/cluster-manager.mjs'
 import { createClusterRoutes } from './lib/cluster/cluster-routes.mjs'
 import { bindPlacement } from './lib/cluster/placement.mjs'
-import { startNodeEgressSocks } from './lib/cluster/node-egress-socks.mjs'
+import { nodeEgressProxyUrl, startNodeEgressSocks } from './lib/cluster/node-egress-socks.mjs'
 import { createSlotShell } from './lib/vm/slot-shell.mjs'
 
 import {
@@ -168,6 +168,7 @@ let stickyRouter
 let accountQuota
 let requestLog
 let proxyPool
+let clusterManager = null
 let runtimeRepo
 let attemptsRepo
 let poolScheduler
@@ -327,6 +328,19 @@ requestLog.startCleanupScheduler()
 
 proxyPool = new ProxyPool({
   dataDir,
+  listVms: () => listVms(cfg.paths.project),
+  getVmNodeId: (vmId) => getVm(cfg.paths.project, vmId)?.node_id || null,
+  listNodes: () =>
+    (clusterManager ? clusterManager.list() : new ClusterNodesRepo().list()).map((node) => ({
+      id: node.id,
+      name: node.label,
+      link: node.link || { state: 'idle' },
+    })),
+  nodeExitProxyUrl: (nodeId) => {
+    // A missing/disconnected node must never turn a local lookup into host egress.
+    clusterManager.client(nodeId)
+    return nodeEgressProxyUrl(nodeId)
+  },
   onDisableVm: (vmId, reason, proxyId) => {
     setVmSchedulable(cfg.paths.project, vmId, false, `${reason}|proxy=${proxyId}`)
   },
@@ -808,7 +822,7 @@ const { handleProtocol, handleSearch } = createHandleProtocol({
   },
 })
 
-const clusterManager = new ClusterManager({
+clusterManager = new ClusterManager({
   repo: new ClusterNodesRepo(),
   dataDir,
   listen: { host: cfg.host, port: cfg.port },

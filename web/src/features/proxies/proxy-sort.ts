@@ -1,3 +1,4 @@
+import type { ProxyPoolPayload } from '@/types/panel-proxy'
 import type { VmProxySnap } from '@/types/panel-vm'
 import { localProxyText, proxyHostLabel } from '@/lib/vm-status'
 
@@ -14,6 +15,7 @@ export const PROXY_HEALTH_KEYS = [
 export type ProxyHealthKey = (typeof PROXY_HEALTH_KEYS)[number]
 
 export function proxyHealthKey(prx: VmProxySnap): ProxyHealthKey {
+  if (prx.blocked_reason === 'node_unavailable') return 'fail'
   if (prx.blocked_reason) return 'off'
   if (prx.enabled === false) return 'off'
   if (prx.status === 'dead') return 'dead'
@@ -26,6 +28,45 @@ export function proxyIsLocal(prx: VmProxySnap): boolean {
   return prx.kind === 'local' || prx.scheme === 'local' || prx.id === 'px-local'
 }
 
+/** 展示节点 local 行时移除共享记录，避免容量和绑定重复计数。 */
+export function proxyRows(
+  payload: ProxyPoolPayload | undefined
+): VmProxySnap[] {
+  const proxies = payload?.proxies || []
+  if (!payload?.local_exits) return proxies
+  return [...payload.local_exits, ...proxies.filter((p) => !proxyIsLocal(p))]
+}
+
+export function proxyViewId(proxy: VmProxySnap): string {
+  return proxy.view_id || proxy.id || ''
+}
+
+/** 只有目标 VPS 的 local 可以用于该 VM；SOCKS5 不受放置节点限制。 */
+export function proxyMatchesNode(
+  proxy: VmProxySnap,
+  nodeId?: string | null
+): boolean {
+  return (
+    !proxyIsLocal(proxy) ||
+    !proxy.view_id ||
+    (proxy.node_id || null) === (nodeId || null)
+  )
+}
+
+export function proxiesForNode(
+  payload: ProxyPoolPayload | undefined,
+  nodeId?: string | null
+): VmProxySnap[] {
+  return proxyRows(payload).filter((proxy) => proxyMatchesNode(proxy, nodeId))
+}
+
+/** null 明确选择主控；省略范围只用于普通 SOCKS5 操作。 */
+export function proxyScope(proxy: VmProxySnap | undefined): {
+  node_id?: string | null
+} {
+  return proxy && proxyIsLocal(proxy) ? { node_id: proxy.node_id || null } : {}
+}
+
 /** 本地代理的含义：槽位所在 VPS（本机或集群节点）自身的出口，不是某一台固定机器。 */
 export const LOCAL_PROXY_HINT = '当前VPS的本地代理'
 
@@ -36,7 +77,11 @@ function localFirst(a: VmProxySnap, b: VmProxySnap): number {
 
 /** `vpsIp` 只作用于本地代理：它的出口随槽位所在 VPS 变。 */
 export function proxyHostText(prx: VmProxySnap, vpsIp?: string | null): string {
-  if (proxyIsLocal(prx)) return localProxyText(vpsIp)
+  if (proxyIsLocal(prx)) {
+    if (prx.view_id)
+      return `local:${prx.node_name || (prx.node_id ? prx.node_id : '主控')}`
+    return localProxyText(vpsIp)
+  }
   if (!prx.host) return `?:${prx.port ?? '?'}`
   const endpoint = proxyHostLabel(prx)
   return prx.port == null ? `${endpoint}:?` : endpoint
@@ -45,7 +90,8 @@ export function proxyHostText(prx: VmProxySnap, vpsIp?: string | null): string {
 /** 带代理名称的地址：`名称 · host:port`；没名称就退回纯地址。本地代理附带含义说明。 */
 export function proxyLabel(prx: VmProxySnap, vpsIp?: string | null): string {
   const host = proxyHostText(prx, vpsIp)
-  if (proxyIsLocal(prx)) return `${host} · ${LOCAL_PROXY_HINT}`
+  if (proxyIsLocal(prx))
+    return `${host} · ${prx.view_id ? '所在节点直出' : LOCAL_PROXY_HINT}`
   const name = prx.label?.trim()
   return name ? `${name} · ${host}` : host
 }
@@ -85,6 +131,7 @@ export function proxyIsInvalid(prx: VmProxySnap | undefined): boolean {
 }
 
 export function proxyStatusLabel(prx: VmProxySnap): string {
+  if (prx.blocked_reason === 'node_unavailable') return '节点未连接'
   if (prx.blocked_reason === 'ipv6_disabled') return 'IPv6 已关闭'
   if (prx.enabled === false || prx.status === 'dead') return '失效'
   if (prx.status === 'fail') return '失败'
@@ -279,6 +326,8 @@ export function proxyMatchesQuery(
   const hay = [
     proxyHostText(prx),
     prx.label,
+    prx.node_name,
+    prx.node_id,
     ...proxyBoundIds(prx).flatMap((id) => [id, vmName(id)]),
     prx.geo?.country,
     prx.geo?.country_code,
