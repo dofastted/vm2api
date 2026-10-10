@@ -33,8 +33,6 @@ test('fleet roll reloads then collects every target', async () => {
     concurrency: 2,
     reloadFn: (vm) => {
       reloads.push(vm.id)
-      if (vm.runtime?.type === 'kvm')
-        return { ok: false, code: 'kvm_not_configured', error: 'kvm runtime adapter is not configured' }
       return { ok: true, action: 'reloaded' }
     },
     collectFn: async (_root, vm) => {
@@ -45,13 +43,10 @@ test('fleet roll reloads then collects every target', async () => {
     readyTimeoutMs: 50,
   })
   assert.equal(report.total, 3)
-  assert.equal(report.ok_count, 2)
-  assert.equal(report.failed_count, 1)
+  assert.equal(report.ok_count, 3)
+  assert.equal(report.failed_count, 0)
   assert.deepEqual(reloads.sort(), ['vm-01', 'vm-02', 'vm-03'])
-  assert.deepEqual(collects.sort(), ['vm-01', 'vm-02'])
-  const kvm = report.items.find((row) => row.id === 'vm-03')
-  assert.equal(kvm.ok, false)
-  assert.equal(kvm.code, 'kvm_not_configured')
+  assert.deepEqual(collects.sort(), ['vm-01', 'vm-02', 'vm-03'])
   fs.rmSync(root, { recursive: true, force: true })
 })
 

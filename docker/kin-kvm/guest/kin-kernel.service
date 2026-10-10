@@ -1,0 +1,20 @@
+[Unit]
+Description=kin-kernel gateway worker
+After=kin-guest-setup.service
+Requires=kin-guest-setup.service
+
+[Service]
+User=kincli
+RuntimeDirectory=kin-guest
+RuntimeDirectoryMode=0770
+EnvironmentFile=-/run/kin-guest/slot.env
+Environment=HOME=/home/kincli
+Environment=CLAUDE_CONFIG_DIR=/home/kincli/.claude
+Environment=KIN_SUBMIT_WAIT_MS=30000
+ExecStart=/usr/local/sbin/kin-kernel-start
+Restart=always
+RestartSec=2
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

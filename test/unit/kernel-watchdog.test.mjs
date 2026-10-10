@@ -150,8 +150,8 @@ test('telemetry sidecar is checked once per window on every running slot', async
   await wd.tick()
   now = 599_999
   await wd.tick()
-  assert.deepEqual(checked, ['vm-live'])
+  assert.deepEqual(checked, ['vm-live', 'vm-kvm'])
   now = 600_000
   await wd.tick()
-  assert.deepEqual(checked, ['vm-live', 'vm-live'])
+  assert.deepEqual(checked, ['vm-live', 'vm-kvm', 'vm-live', 'vm-kvm'])
 })

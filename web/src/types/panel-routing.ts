@@ -1,3 +1,5 @@
+import type { RuntimeType } from '@/types/panel-vm'
+
 /** `routing.compatibility.persona_preset`。PUT 严格匹配，不做别名归一化。 */
 export type PersonaPreset = 'official' | 'official_full' | 'zero' | 'custom'
 
@@ -190,4 +192,23 @@ export type NotifyStatus = {
 
 export type BackupsPayload = {
   items?: BackupItem[]
+}
+
+/** `routing.vm`：槽位默认形态与机器规格。创建时覆盖 memory/vcpus/disk_gb 后固化到槽。 */
+export type VmRoutingSmbios = {
+  manufacturer: string
+  product: string
+  version: string
+  family: string
+}
+
+export type VmRoutingConfig = {
+  default_runtime: RuntimeType
+  memory: string
+  vcpus: number
+  disk_gb: number
+  cpu_model: string
+  smbios: VmRoutingSmbios
+  mac_oui: string
+  allow_tcg: boolean
 }

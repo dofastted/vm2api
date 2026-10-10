@@ -31,6 +31,7 @@ import {
 import { summarizeCodexSlot } from './codex-slot.mjs'
 import { evaluateCodexQuotaSchedule } from '../pool/codex-slot-pool.mjs'
 import { effectiveOpenAIPolicy, normalizeOpenAIQuotaPolicy } from '../pool/openai-quota-policy.mjs'
+import { runtimeKind } from './runtime-kind.mjs'
 
 export { isCodexVm, normalizeVmKind } from './vm-kind.mjs'
 
@@ -69,6 +70,8 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     name: vm.name,
     status: vm.status || 'unknown',
     kernel: vm.kernel || null,
+    runtime_type: runtimeKind(vm),
+    machine: vm.machine || null,
     inference_engine: vm.inference_engine || null,
     persona_preset: vm.persona_preset || null,
     seed_policy: vm.seed_policy || null,

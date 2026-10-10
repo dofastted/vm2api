@@ -57,7 +57,6 @@ const HARD_DOWN = new Set(['stopped', 'dead', 'error', 'disabled'])
 
 export function isKernelWatchdogTarget(vm) {
   if (!vm?.id) return false
-  if (vm.runtime_kind === 'kvm') return false
   if (HARD_DOWN.has(String(vm.status || '').toLowerCase())) return false
   const configured = normalizeInferenceEngine(vm.inference_engine, { inherit: true })
   if (configured === 'rust') return true
@@ -65,7 +64,7 @@ export function isKernelWatchdogTarget(vm) {
 }
 
 function isTelemetryHealTarget(vm) {
-  if (!vm?.id || vm.runtime_kind === 'kvm') return false
+  if (!vm?.id) return false
   return !HARD_DOWN.has(String(vm.status || '').toLowerCase())
 }
 
@@ -143,7 +142,7 @@ export function createKernelWatchdog({
     try {
       const vms = typeof listTargets === 'function' ? listTargets() || [] : []
       for (const vm of vms) {
-        // Every docker slot, not only kernel-restart targets: live slots carry no
+        // Every running slot, not only kernel-restart targets: live slots carry no
         // inference_engine / runtime.engine, so the target filter would skip them all.
         // Off the tick's critical path: a slow docker exec must not delay kernel restarts.
         // The due time is set before the check runs, so a slot never has two checks in flight.

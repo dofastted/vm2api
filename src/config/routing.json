@@ -205,5 +205,20 @@
       "bot_token": "",
       "chat_id": ""
     }
+  },
+  "vm": {
+    "default_runtime": "docker",
+    "memory": "512m",
+    "vcpus": 2,
+    "disk_gb": 20,
+    "cpu_model": "host",
+    "smbios": {
+      "manufacturer": "Dell Inc.",
+      "product": "OptiPlex 7090",
+      "version": "1.0",
+      "family": "OptiPlex"
+    },
+    "mac_oui": "52:54:00",
+    "allow_tcg": false
   }
 }

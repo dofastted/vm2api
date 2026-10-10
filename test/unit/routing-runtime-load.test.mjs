@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 import { createRoutingRuntime } from '../../src/lib/admin/routing-runtime.mjs'
 import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
 
@@ -351,4 +352,90 @@ test('OpenAI per-slot limit writes never invoke the Claude quota holder', () => 
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
+})
+
+function persistHarness(root, routingFile, routingConfig) {
+  return createRoutingRuntime({
+    cfg: { paths: { project: root } },
+    routingConfigPath: routingFile,
+    routingConfig,
+    stickyRouter: { reloadConfig() {} },
+    accountQuota: {
+      setMaxConcurrency() {},
+      setMaxRpm() {},
+      reloadConfig() {},
+      applyTierConcurrency() {},
+      applyTierRpm() {},
+      repo: { get: () => null },
+    },
+    requestLog: { setConfig() {} },
+  })
+}
+
+test('loadRoutingConfig normalizes a missing or invalid vm section', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-vm-load-'))
+  const file = path.join(root, 'routing.json')
+  try {
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        codex: { quota: { max_concurrency: 2 } },
+        vm: { memory: '3g', vcpus: 99, allow_tcg: 'yes' },
+      }),
+    )
+    const doc = runtimeFor(file).loadRoutingConfig()
+    assert.equal(doc.vm.memory, '512m')
+    assert.equal(doc.vm.vcpus, 2)
+    assert.equal(doc.vm.default_runtime, 'docker')
+    assert.equal(doc.vm.allow_tcg, false)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('persistRoutingPatch merges a valid vm patch', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-vm-persist-'))
+  const routingFile = path.join(root, 'routing.json')
+  const routingConfig = { concurrency: {}, tiers: {}, vm: { memory: '1g', vcpus: 2 } }
+  fs.mkdirSync(root, { recursive: true })
+  fs.writeFileSync(routingFile, JSON.stringify(routingConfig))
+  try {
+    const runtime = persistHarness(root, routingFile, routingConfig)
+    runtime.persistRoutingPatch({ vm: { memory: '4g', vcpus: 4, smbios: { product: 'Precision 5860' } } })
+    const saved = JSON.parse(fs.readFileSync(routingFile, 'utf8'))
+    assert.equal(saved.vm.memory, '4g')
+    assert.equal(saved.vm.vcpus, 4)
+    assert.equal(saved.vm.smbios.product, 'Precision 5860')
+    assert.equal(saved.vm.smbios.manufacturer, 'Dell Inc.')
+    assert.equal(saved.vm.allow_tcg, false)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('PUT /api/panel/routing rejects an invalid vm patch before persist', async () => {
+  const response = {}
+  const handlePanel = createPanelHandler({
+    cfg: { paths: { project: os.tmpdir() }, limits: { max_body_bytes: 4096 } },
+    routingConfig: {},
+    stickyRouter: { stats: () => ({}) },
+    persistRoutingPatch() {
+      throw new Error('must not persist invalid vm')
+    },
+    requireAuth(req) {
+      req.apiKeyKind = 'master'
+      req.panelRole = 'admin'
+      return true
+    },
+    json(_res, status, payload) {
+      response.status = status
+      response.body = payload
+      return true
+    },
+    readBody: async () => ({ vm: { memory: '3g' } }),
+  })
+  await handlePanel({ method: 'PUT' }, {}, new URL('http://localhost/api/panel/routing'))
+  assert.equal(response.status, 400)
+  assert.equal(response.body?.error?.code, 'invalid_vm_config')
+  assert.match(response.body?.error?.message, /memory/)
 })

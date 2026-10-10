@@ -27,8 +27,10 @@ import {
   officialCcUidGid,
   syncWorkerTelemetry,
   isSlotProxyDesynced,
-  SLOT_MEMORY,
 } from '../vm/vm-runtime.mjs'
+import { slotMemory } from '../vm/machine-spec.mjs'
+import { isKvmRuntime } from '../vm/runtime-kind.mjs'
+import { slotExecArgv } from '../vm/slot-exec.mjs'
 import { reloadSlotReady } from '../vm/slot-runtime.mjs'
 import {
   hasAccessPresence,
@@ -149,8 +151,8 @@ export function officialCcQuotaSucceeded(usage) {
   return !!(usage.five_hour || usage.seven_day || usage.seven_day_oi || usage.extra_usage || usage.account_tier)
 }
 
-export function slotIdleMemory() {
-  return SLOT_MEMORY
+export function slotIdleMemory(vm, routing) {
+  return slotMemory(vm, routing)
 }
 
 export function sameMemoryLimit(a, b) {
@@ -185,8 +187,9 @@ export function inspectContainerMemory(vmId) {
   return formatMemoryLimit(String(r.stdout || '').trim())
 }
 
-export function applyContainerMemory(vmId, memory) {
-  const mem = String(memory || slotIdleMemory())
+export function applyContainerMemory(vmId, memory, vm) {
+  if (isKvmRuntime(vm)) return { ok: true, skipped: true }
+  const mem = String(memory || slotIdleMemory(vm))
     .trim()
     .toLowerCase()
   return sh(['docker', 'update', '--memory', mem, '--memory-swap', mem, containerName(vmId)], { timeout: 15_000 })
@@ -203,17 +206,13 @@ function officialCcMarkedPidsScript(action) {
 }
 
 /** Kill leftover CLI. Do not call after a successful resident hello. */
-export function stopOfficialCcLeftovers(vmId) {
+export function stopOfficialCcLeftovers(vmId, vm) {
   return sh(
     [
       'docker',
-      'exec',
-      '-u',
-      '0',
-      containerName(vmId),
-      'sh',
-      '-c',
-      officialCcMarkedPidsScript('kill "${d#/proc/}" 2>/dev/null'),
+      ...slotExecArgv(vm || { id: vmId }, ['sh', '-c', officialCcMarkedPidsScript('kill "${d#/proc/}" 2>/dev/null')], {
+        user: '0',
+      }),
     ],
     {
       timeout: 10_000,
@@ -267,9 +266,12 @@ export function stopOfficialCcResident(vmId, projectRoot) {
   return stopOfficialCcLeftovers(vmId)
 }
 
-export function inspectOfficialCcResident(vmId) {
+export function inspectOfficialCcResident(vmId, vm) {
   const r = sh(
-    ['docker', 'exec', containerName(vmId), 'sh', '-c', officialCcMarkedPidsScript('echo "${d#/proc/}"; exit 0')],
+    [
+      'docker',
+      ...slotExecArgv(vm || { id: vmId }, ['sh', '-c', officialCcMarkedPidsScript('echo "${d#/proc/}"; exit 0')]),
+    ],
     { timeout: 8_000 },
   )
   const pid = Number(String(r.stdout || '').trim())
@@ -293,16 +295,42 @@ export function persistSlotRuntimeMemory(projectRoot, vmId, memory) {
   }
 }
 
-export function restoreSlotMemoryAfterOfficialCc(vmId, idleMemory, { keepCli = false } = {}) {
-  if (!keepCli) stopOfficialCcLeftovers(vmId)
-  return applyContainerMemory(vmId, idleMemory || slotIdleMemory())
+export function restoreSlotMemoryAfterOfficialCc(vmId, idleMemory, { keepCli = false, vm } = {}) {
+  if (!keepCli) stopOfficialCcLeftovers(vmId, vm)
+  return applyContainerMemory(vmId, idleMemory || slotIdleMemory(vm), vm)
 }
 
-export function startOfficialCcResidentProcess({ vmId, projectRoot, uid, gid, timezone, locale }) {
+export function startOfficialCcResidentProcess({ vmId, projectRoot, uid, gid, timezone, locale, vm }) {
   const script = path.join(scriptsDir(), 'official-cc-resident.py')
   const runDir = officialCcRunDir(projectRoot, vmId)
   fs.mkdirSync(runDir, { recursive: true, mode: 0o700 })
   const pidFile = officialCcPidPath(projectRoot, vmId, 'resident')
+  const execArgv = slotExecArgv(vm || { id: vmId }, [CONTAINER_CLI_NODE_BIN], {
+    user: `${uid}:${gid}`,
+    env: [
+      'HOME=/home/kincli',
+      'TMPDIR=/home/kincli/.cache/tmp',
+      `TZ=${timezone || 'UTC'}`,
+      `LANG=${locale || 'en_US.UTF-8'}`,
+      `LC_ALL=${locale || 'en_US.UTF-8'}`,
+      'PATH=/home/kincli/.local/bin:/usr/bin:/bin',
+      'CLAUDE_CODE_HOST_REFRESH=1',
+      `CLAUDE_CODE_VERSION=${OFFICIAL_CLI_VERSION}`,
+      'USER_TYPE=external',
+      OFFICIAL_CC_MARKER,
+      'CLAUDE_CODE_USE_BEDROCK=0',
+      'CLAUDE_CODE_USE_VERTEX=0',
+      'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=0',
+      'DISABLE_TELEMETRY=1',
+      'DO_NOT_TRACK=1',
+      'ANTHROPIC_BASE_URL=',
+      'ANTHROPIC_API_KEY=',
+      'ANTHROPIC_AUTH_TOKEN=',
+    ],
+    workdir: '/home/kincli',
+    interactive: true,
+    tty: true,
+  })
   const child = spawn('python3', [script], {
     env: {
       ...process.env,
@@ -314,6 +342,7 @@ export function startOfficialCcResidentProcess({ vmId, projectRoot, uid, gid, ti
       TZ: timezone || 'UTC',
       LANG: locale || 'en_US.UTF-8',
       LC_ALL: locale || 'en_US.UTF-8',
+      KIN_DOCKER_ARGV: JSON.stringify(execArgv),
     },
     detached: true,
     stdio: 'ignore',
@@ -323,8 +352,17 @@ export function startOfficialCcResidentProcess({ vmId, projectRoot, uid, gid, ti
   return { ok: true, host_pid: child.pid }
 }
 
-export async function keepOfficialCcResidentAfterHello({ vmId, projectRoot, uid, gid, timezone, locale, idleMemory }) {
-  restoreSlotMemoryAfterOfficialCc(vmId, idleMemory, { keepCli: true })
+export async function keepOfficialCcResidentAfterHello({
+  vmId,
+  projectRoot,
+  uid,
+  gid,
+  timezone,
+  locale,
+  idleMemory,
+  vm,
+}) {
+  restoreSlotMemoryAfterOfficialCc(vmId, idleMemory, { keepCli: true, vm })
   persistSlotRuntimeMemory(projectRoot, vmId, idleMemory)
   const started = startOfficialCcResidentProcess({
     vmId,
@@ -333,9 +371,10 @@ export async function keepOfficialCcResidentAfterHello({ vmId, projectRoot, uid,
     gid,
     timezone,
     locale,
+    vm,
   })
   await new Promise((resolve) => setTimeout(resolve, 1500))
-  const live = inspectOfficialCcResident(vmId)
+  const live = inspectOfficialCcResident(vmId, vm)
   return {
     ok: live.running === true,
     host_pid: started.host_pid,
@@ -397,7 +436,8 @@ export async function restoreOfficialCcResident(
     gid,
     timezone: vm.timezone || vm.fingerprint?.timezone || 'UTC',
     locale: vm.locale || vm.fingerprint?.locale || 'en_US.UTF-8',
-    idleMemory: slotIdleMemory(),
+    idleMemory: slotIdleMemory(vm),
+    vm,
   })
   const homeDir = officialCcHome(projectRoot, vmId)
   const prev = readOfficialCcStatus(homeDir) || {}
@@ -758,57 +798,43 @@ export function buildOfficialCcDockerArgs({
   locale = 'en_US.UTF-8',
   bridgeUrl,
   prompt = DEFAULT_PLAN_PROMPT,
+  vm,
 }) {
   const text = String(prompt || '').trim() || DEFAULT_PLAN_PROMPT
   const slash = isOfficialCcSlashPrompt(text)
-  return [
-    'exec',
-    '-u',
-    `${uid}:${gid}`,
-    '-e',
-    'HOME=/home/kincli',
-    '-e',
-    'TMPDIR=/home/kincli/.cache/tmp',
-    '-e',
-    `TZ=${timezone}`,
-    '-e',
-    `LANG=${locale}`,
-    '-e',
-    `LC_ALL=${locale}`,
-    '-e',
-    'PATH=/home/kincli/.local/bin:/usr/bin:/bin',
-    '-e',
-    'CLAUDE_CODE_HOST_REFRESH=1',
-    '-e',
-    OFFICIAL_CC_MARKER,
-    '-e',
-    `CLAUDE_CODE_VERSION=${OFFICIAL_CLI_VERSION}`,
-    '-e',
-    'USER_TYPE=external',
-    '-e',
-    'CLAUDE_CODE_USE_BEDROCK=0',
-    '-e',
-    'CLAUDE_CODE_USE_VERTEX=0',
-    '-e',
-    'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=0',
-    '-e',
-    'DISABLE_TELEMETRY=1',
-    '-e',
-    'DO_NOT_TRACK=1',
-    '-e',
-    'ANTHROPIC_BASE_URL=',
-    '-e',
-    'ANTHROPIC_API_KEY=',
-    '-e',
-    'ANTHROPIC_AUTH_TOKEN=',
-    '-w',
-    '/home/kincli',
-    containerName(vmId),
-    CONTAINER_CLI_NODE_BIN,
-    ...(slash
-      ? [text, '--print', '--permission-mode', 'bypassPermissions', '--output-format', 'stream-json', '--verbose']
-      : ['-p', text, '--permission-mode', 'bypassPermissions', '--output-format', 'json']),
-  ]
+  return slotExecArgv(
+    vm || { id: vmId },
+    [
+      CONTAINER_CLI_NODE_BIN,
+      ...(slash
+        ? [text, '--print', '--permission-mode', 'bypassPermissions', '--output-format', 'stream-json', '--verbose']
+        : ['-p', text, '--permission-mode', 'bypassPermissions', '--output-format', 'json']),
+    ],
+    {
+      user: `${uid}:${gid}`,
+      env: [
+        'HOME=/home/kincli',
+        'TMPDIR=/home/kincli/.cache/tmp',
+        `TZ=${timezone}`,
+        `LANG=${locale}`,
+        `LC_ALL=${locale}`,
+        'PATH=/home/kincli/.local/bin:/usr/bin:/bin',
+        'CLAUDE_CODE_HOST_REFRESH=1',
+        OFFICIAL_CC_MARKER,
+        `CLAUDE_CODE_VERSION=${OFFICIAL_CLI_VERSION}`,
+        'USER_TYPE=external',
+        'CLAUDE_CODE_USE_BEDROCK=0',
+        'CLAUDE_CODE_USE_VERTEX=0',
+        'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=0',
+        'DISABLE_TELEMETRY=1',
+        'DO_NOT_TRACK=1',
+        'ANTHROPIC_BASE_URL=',
+        'ANTHROPIC_API_KEY=',
+        'ANTHROPIC_AUTH_TOKEN=',
+      ],
+      workdir: '/home/kincli',
+    },
+  )
 }
 
 export function officialCcTurnSucceeded({ code, timedOut, raw, slash }) {
@@ -846,6 +872,7 @@ export async function runOfficialCcTurn({
   outFile,
   errFile,
   timeoutMs,
+  vm,
 }) {
   const out = fs.openSync(outFile, 'w', 0o600)
   const err = fs.openSync(errFile, 'w', 0o600)
@@ -859,6 +886,7 @@ export async function runOfficialCcTurn({
       locale,
       bridgeUrl,
       prompt,
+      vm,
     }),
     { stdio: ['ignore', out, err] },
   )
@@ -1080,10 +1108,10 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
 
   const keepResident = resident !== false && resolveOfficialCcInference(vm, routing) !== 'cli-hop'
   const idleMemory = keepResident
-    ? slotIdleMemory()
-    : chooseIdleMemory(inspectContainerMemory(vmId), memory, slotIdleMemory())
+    ? slotIdleMemory(vm, routing)
+    : chooseIdleMemory(inspectContainerMemory(vmId), memory, slotIdleMemory(vm, routing))
   stopOfficialCcResident(vmId, projectRoot)
-  applyContainerMemory(vmId, memory)
+  applyContainerMemory(vmId, memory, vm)
   let helloOk = false
   try {
     writeOfficialCcStatus(homeDir, {
@@ -1202,10 +1230,11 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       outFile: path.join(homeDir, '.claude', 'kin-official-hello.json'),
       errFile: path.join(homeDir, '.claude', 'kin-official-hello.err'),
       timeoutMs,
+      vm,
     })
     helloOk = !!hello.ok
     const turn = ({ prompt: text, outFile, errFile }) =>
-      runTurn({ vmId, uid, gid, timezone, locale, prompt: text, outFile, errFile, timeoutMs })
+      runTurn({ vmId, uid, gid, timezone, locale, prompt: text, outFile, errFile, timeoutMs, vm })
     writeOfficialCcStatus(homeDir, {
       status: 'running',
       vm_id: vmId,
@@ -1357,6 +1386,7 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
         timezone,
         locale,
         idleMemory,
+        vm,
       })
       writeOfficialCcStatus(homeDir, {
         ...status,
@@ -1378,7 +1408,7 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
     }
   } finally {
     if (!(keepResident && helloOk)) {
-      const restored = restoreSlotMemoryAfterOfficialCc(vmId, idleMemory)
+      const restored = restoreSlotMemoryAfterOfficialCc(vmId, idleMemory, { vm })
       try {
         const prev = readOfficialCcStatus(homeDir) || {}
         writeOfficialCcStatus(homeDir, {

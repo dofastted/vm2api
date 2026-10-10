@@ -4,6 +4,16 @@
 
 - 代理池按控制面和集群节点分别展示 local 出口，并按 VM 所在节点计算绑定上限；创建、自动分配和恢复绑定使用同一额度规则。已有 `px-local` 记录和运行网络保持兼容，节点探测与地理信息不再借用主控结果。local 的启停和删除仍是全部节点共享的管理操作，界面单独标明（#329）。
 
+## 1.3.136 — 2026-10-10
+
+- 槽位可创建为 KVM 虚拟机（与 Docker 子容器并存）。新增 `routing.vm`（默认形态、内存、vCPU、磁盘、CPU 型号、SMBIOS、MAC 前缀、`allow_tcg`）；创建时可覆盖内存 / vCPU / 磁盘并固化到 `vm.machine`。槽内存改为读 `vm.machine.memory` → `routing.vm.memory`（默认 `512m`），移除 `KIN_VM_MEMORY`。`GET /api/panel/cluster/local` 返回 `kvm: { ok, accel, error }`；节点 preflight 在 `runtime_type=kvm` 时含 `kvm` 检查。租户创建表单读 `GET /api/panel/vms/create-options`（与 `POST /vms/create` 同 ACL），因为 user 不能读 cluster/local 与 routing。
+- KVM 槽 runner 镜像 `ghcr.io/dofastted/kin-kvm-{ubuntu,debian,arch,fedora}`，`os-catalog` 每项有 `kvm.image` / `kvm.cloud_image`。Release 由 `.github/workflows/guest-images.yml` 构建，离线构建上下文 `docker/kin-kvm/`，本机构建 `node docker/kin-kvm/build.mjs`。
+- 控制台「导入」重做为一条上线流程：槽位（新建或选已有空槽）→ 出口 → 账号 → 上线，右栏随步骤显示进度与这台槽的规格；新建时按平台、形态、系统、规格顺序选择，KVM 不可用时选项禁用并写明原因。区域与语言单独成「环境」区：区域只写入槽位标签，语言写入槽位与指纹（`en_US` / `zh_CN` / `ja_JP` / `C`，非法值 400 `invalid_locale`）。创建不再单独指定并发与权重，跟随设置里的全局默认（并发创建后可在槽位详情钉住）。
+- 新增「规格」页（资源组，仅管理员）：默认形态、内存、vCPU、磁盘、CPU 型号、SMBIOS、MAC 前缀与 TCG 开关，右栏显示本机 KVM 状态与客户机将读到的硬件。各组默认收成一行当前值，点开再改。设置里的「虚拟机」分页移除。槽位页的快捷创建与导入流程共用同一套表单；创建时的「规格」同样默认收起。内存可选 `256m` / `512m` / `1g` / `2g` / `4g` / `8g` / `16g`；低于 1G 时表单提示 OOM 风险。
+- 修复槽位列表与总览接口缺少 `runtime_type` / `machine`，KVM 槽在列表中被标成容器。
+
+已部署机升级：更新 Node 控制面与 `web/dist`，重启一次 Node。原先用 `KIN_VM_MEMORY` 的部署，先在 `routing.json` 写 `vm.memory`（可选 256m / 512m / 1g / 2g / 4g / 8g / 16g），否则新槽回落 `512m`。不要覆盖 `vms/`、`data/`、`.env`。
+
 ## 1.3.135 — 2026-10-09
 
 - 对话中途 `role=system` 的模型白名单按官方文档补齐：Fable 5 / 5.1、Mythos 5 / 5.1、Opus 4.8 的这类轮次按原位发出，不再拼进顶层 `system`。之前这些模型的 `system` 每轮变长，提示缓存从 `system` 处断开，后面整段对话每轮重写 1h 缓存。文档列明 Sonnet 5 不支持，它的这类轮次改为挪进顶层 `system`（#324）。

@@ -12,6 +12,8 @@
 import { execDetached } from '../cluster/docker-remote.mjs'
 import { slotContainerName } from '../transport/rust-kernel-supervisor.mjs'
 import { isCodexVm } from './vm-kind.mjs'
+import { isKvmRuntime } from './runtime-kind.mjs'
+import { slotExecCmd } from './slot-exec.mjs'
 import { slotHost } from './slot-host.mjs'
 
 export const CLI_NODE_GUARD_INTERVAL_MS = 15_000
@@ -76,7 +78,11 @@ export function createCliNodeGuard({
         try {
           const connect = slotHost(vm).dockerApi()
           const container = slotContainerName({ vm })
-          await exec(connect, container, ['/bin/sh', '-c', GUARD_SCRIPT, 'guard', ...tokens])
+          const { Cmd, User } = slotExecCmd(vm, ['/bin/sh', '-c', GUARD_SCRIPT, 'guard', ...tokens], {
+            detach: true,
+            user: isKvmRuntime(vm) ? '0' : undefined,
+          })
+          await exec(connect, container, Cmd, { user: User })
         } catch (err) {
           logger.warn?.(`[cli-node-guard] ${vm.id} ${err?.message || err}`)
         }

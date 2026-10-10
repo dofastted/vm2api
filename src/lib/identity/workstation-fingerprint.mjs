@@ -12,6 +12,8 @@ export const HOSTNAME_RE = /^[a-z]+-[0-9a-f]{4}$/
 export const DEVICE_ID_RE = /^[0-9a-f]{64}$/i
 export const MACHINE_ID_RE = /^[0-9a-f]{32}$/i
 export const STANDARD_LOCALE = 'en_US.UTF-8'
+/** Locales a slot may be created with; the guest sees it as LANG and in the fingerprint. */
+export const SLOT_LOCALES = Object.freeze([STANDARD_LOCALE, 'zh_CN.UTF-8', 'ja_JP.UTF-8', 'C.UTF-8'])
 
 export function isHexDeviceId(value) {
   return DEVICE_ID_RE.test(String(value || '').trim())

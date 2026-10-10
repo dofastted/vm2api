@@ -3,11 +3,23 @@ import type {
   OfficialCcBootstrapPayload,
   SetupTokenSession,
   TestModelsPayload,
+  VmCreateOptions,
   VmCredentialResponse,
   VmDetailPayload,
   VmsListResponse,
 } from '@/types/panel-vm'
 import { api } from '@/lib/api'
+
+/** 创建表单默认规格 + 本机 KVM 能力。ACL 与 POST /vms/create 相同，租户可读。 */
+export function vmCreateOptionsQueryOptions() {
+  return queryOptions({
+    queryKey: ['panel', 'vms', 'create-options'] as const,
+    queryFn: () => api<VmCreateOptions>('/api/panel/vms/create-options'),
+    staleTime: 30_000,
+    refetchOnWindowFocus: false,
+    retry: false,
+  })
+}
 
 export function vmsListQueryOptions(refetchInterval?: number) {
   return queryOptions({

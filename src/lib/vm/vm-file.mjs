@@ -17,7 +17,7 @@ import crypto from 'node:crypto'
  * pointer, `<id>-chat.json` is a test-chat side file, and `create`/`import`
  * collide with the `/api/panel/vms/:id` route segments.
  */
-const RESERVED_VM_IDS = new Set(['active', 'create', 'import', 'package'])
+const RESERVED_VM_IDS = new Set(['active', 'create', 'create-options', 'import', 'package'])
 
 /** True when `id` must not be used for a slot record. */
 export function isReservedVmId(id) {

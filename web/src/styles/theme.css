@@ -131,6 +131,14 @@
      在中性/Pro/Max 三种卡面上都保持同样的凹陷深度。 */
   --track: oklch(0 0 0 / 8.5%);
 
+  /* 选择轴：表单里「当前选中 / 正在进行」的冷蓝。青绿只留给提交动作，
+     Pro 等级是 252°，这里偏青到 228° 并降饱和，免得被读成等级色。 */
+  --select-surface: oklch(0.966 0.018 228);
+  --select-border: oklch(0.6 0.11 228);
+  --select-fg: oklch(0.44 0.11 228);
+  --select-solid: oklch(0.56 0.12 228);
+  --select-solid-fg: oklch(0.99 0.005 228);
+
   /* 浏览器自带表面 */
   --selection: oklch(0.52 0.115 157 / 22%);
   --scrollbar-thumb: oklch(0.5 0.014 258 / 40%);
@@ -256,6 +264,12 @@
   --hairline: oklch(1 0 0 / 11%);
   --track: oklch(1 0 0 / 13%);
 
+  --select-surface: oklch(0.232 0.032 228);
+  --select-border: oklch(0.66 0.1 228);
+  --select-fg: oklch(0.85 0.08 228);
+  --select-solid: oklch(0.74 0.11 228);
+  --select-solid-fg: oklch(0.17 0.03 228);
+
   --selection: oklch(0.779 0.165 157 / 26%);
   --scrollbar-thumb: oklch(0.72 0.012 258 / 38%);
 
@@ -292,6 +306,11 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+  --color-select-surface: var(--select-surface);
+  --color-select-border: var(--select-border);
+  --color-select-fg: var(--select-fg);
+  --color-select-solid: var(--select-solid);
+  --color-select-solid-fg: var(--select-solid-fg);
   --color-ok-1: var(--ok-1);
   --color-ok-2: var(--ok-2);
   --color-ok-3: var(--ok-3);

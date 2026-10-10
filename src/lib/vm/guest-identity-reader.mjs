@@ -1,8 +1,8 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { containerName } from './vm-runtime.mjs'
 import { runtimeKind } from './runtime-kind.mjs'
 import { slotHost } from './slot-host.mjs'
+import { slotExecArgv } from './slot-exec.mjs'
 
 const runFile = promisify(execFile)
 
@@ -19,13 +19,11 @@ printf '%s\\000' "$(cat /etc/machine-id 2>/dev/null || true)" "\${TZ:-$(cat /etc
 
 export async function readGuestIdentity(exec, _requestPath, { timeoutMs = 5000, run = runFile } = {}) {
   const fail = (code, message) => ({ ok: false, status: 502, body: { error: { code, message } } })
-  if (runtimeKind(exec?.vm) !== 'docker') {
-    return fail('guest_identity_unsupported', 'Guest identity collection is not implemented for this runtime')
-  }
   if (!exec?.vmId) return fail('vm_required', 'vm required')
+  const vm = { ...(exec.vm || {}), id: exec.vmId || exec.vm?.id }
   try {
     const env = slotHost(exec.vm).dockerEnv()
-    const { stdout } = await run('docker', ['exec', containerName(exec.vmId), 'sh', '-c', READ_IDENTITY], {
+    const { stdout } = await run('docker', slotExecArgv(vm, ['sh', '-c', READ_IDENTITY]), {
       encoding: 'utf8',
       timeout: timeoutMs,
       maxBuffer: 64 * 1024,
@@ -42,7 +40,7 @@ export async function readGuestIdentity(exec, _requestPath, { timeoutMs = 5000, 
       body: {
         identity: {
           schema_version: '1',
-          runtime_kind: 'docker',
+          runtime_kind: runtimeKind(vm),
           hostname,
           os_id,
           os_pretty,

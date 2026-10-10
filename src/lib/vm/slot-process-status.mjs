@@ -5,6 +5,8 @@ import path from 'node:path'
 import { promisify } from 'node:util'
 import { slotContainerName } from '../transport/rust-kernel-supervisor.mjs'
 import { slotHost } from './slot-host.mjs'
+import { runtimeKind } from './runtime-kind.mjs'
+import { slotExecArgv } from './slot-exec.mjs'
 
 const exec = promisify(execFile)
 const PROBE = String.raw`
@@ -44,10 +46,12 @@ export async function readSlotProcessStatus({ projectRoot, vm, run = exec, timeo
   } catch {
     // Missing or unreadable config is unknown, never equivalent to disabled.
   }
-  if (vm.runtime?.type !== 'docker') return { ...unknown, telemetry: { enabled, running: null } }
+  const kind = runtimeKind(vm)
+  if (kind !== 'docker' && kind !== 'kvm') return { ...unknown, telemetry: { enabled, running: null } }
   try {
     const env = slotHost(vm).dockerEnv()
-    const { stdout } = await run('docker', ['exec', slotContainerName({ vm }), 'sh', '-c', PROBE], {
+    const target = { ...vm, runtime: { ...(vm.runtime || {}), container: slotContainerName({ vm }), type: kind } }
+    const { stdout } = await run('docker', slotExecArgv(target, ['sh', '-c', PROBE]), {
       timeout: timeoutMs,
       maxBuffer: 4096,
       encoding: 'utf8',
@@ -78,17 +82,13 @@ export async function ensureTelemetrySidecar({ projectRoot, vm, run = exec, time
   }
   try {
     const env = slotHost(vm).dockerEnv()
+    const kind = runtimeKind(vm)
+    const target = { ...vm, runtime: { ...(vm.runtime || {}), container: slotContainerName({ vm }), type: kind } }
     await run(
       'docker',
-      [
-        'exec',
-        '-d',
-        slotContainerName({ vm }),
-        '/usr/local/bin/kin-worker',
-        'telemetry',
-        '--config',
-        '/run/kin/worker.json',
-      ],
+      slotExecArgv(target, ['/usr/local/bin/kin-worker', 'telemetry', '--config', '/run/kin/worker.json'], {
+        detach: true,
+      }),
       { timeout: timeoutMs, maxBuffer: 4096, encoding: 'utf8', ...(env ? { env } : {}) },
     )
     return { ok: true, action: 'started' }

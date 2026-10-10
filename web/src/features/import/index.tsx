@@ -6,20 +6,23 @@ import { PageHeader } from '@/components/page-header'
 import { SectionSkeleton } from '@/components/page-skeletons'
 import { QueryGate } from '@/components/query-gate'
 import { dashboardQueryOptions } from '@/features/overview/queries'
-import { CredentialFlow } from './credential-flow'
+import { OnboardFlow } from './onboard-flow'
 import { VmPackageImportCard } from './vm-package-card'
 
 export function ImportPage() {
   const dash = useQuery(dashboardQueryOptions())
-  const [tab, setTab] = useState('create')
+  const [tab, setTab] = useState('onboard')
   return (
-    <PageHeader title={VIEW_TITLES.import}>
-      <Tabs value={tab} onValueChange={setTab} className='max-w-2xl gap-4'>
+    <PageHeader
+      title={VIEW_TITLES.import}
+      description='从一台空槽到可调度：建槽、绑出口、导入账号、初装。'
+    >
+      <Tabs value={tab} onValueChange={setTab} className='max-w-6xl gap-6'>
         <TabsList>
-          <TabsTrigger value='create'>创建vm</TabsTrigger>
-          <TabsTrigger value='import'>导入vm</TabsTrigger>
+          <TabsTrigger value='onboard'>上线一台</TabsTrigger>
+          <TabsTrigger value='package'>导入 JSON 包</TabsTrigger>
         </TabsList>
-        <TabsContent value='create'>
+        <TabsContent value='onboard'>
           <QueryGate
             loading={dash.isLoading}
             error={dash.error}
@@ -31,10 +34,10 @@ export function ImportPage() {
               />
             }
           >
-            <CredentialFlow />
+            <OnboardFlow />
           </QueryGate>
         </TabsContent>
-        <TabsContent value='import'>
+        <TabsContent value='package' className='max-w-2xl'>
           <VmPackageImportCard />
         </TabsContent>
       </Tabs>

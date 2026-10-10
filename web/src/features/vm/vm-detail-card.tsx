@@ -48,6 +48,7 @@ import { restrictionTitle } from '@/features/vm/clear-restriction'
 import { Field } from '@/features/vm/detail-section-primitives'
 import { NodeChip } from '@/features/vm/node-chip'
 import { OpenaiPlanBadge } from '@/features/vm/openai-plan-badge'
+import { RuntimeChip } from '@/features/vm/runtime-chip'
 import {
   SchedulableSwitch,
   vmSchedulableProps,
@@ -286,6 +287,7 @@ export function VmDetailCard({
         <DialogHeader>
           <DialogTitle className='flex min-w-0 items-center gap-1.5 text-base'>
             {vm ? <SlotIdentity vm={vm} compact /> : '槽位详情'}
+            {vm ? <RuntimeChip vm={vm} /> : null}
             {vm ? <NodeChip nodeId={vm.node_id} /> : null}
           </DialogTitle>
           <DialogDescription className='sr-only'>槽位详情</DialogDescription>

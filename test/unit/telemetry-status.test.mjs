@@ -136,13 +136,21 @@ test('invalid observations cannot fabricate stopped or running status', async (t
   assert.equal(result.process_topology, null)
 })
 
-test('unsupported runtime and invalid slot ID do not invoke Docker', async (t) => {
+test('kvm slots are observed through guest exec; invalid slot ID does not invoke Docker', async (t) => {
   const f = fixture(t, true)
+  const seen = []
+  const kvm = await readSlotProcessStatus({
+    ...f,
+    vm: { ...f.vm, runtime: { type: 'kvm' } },
+    run: async (_cmd, argv) => {
+      seen.push(argv)
+      return { stdout: observed }
+    },
+  })
+  assert.equal(kvm.telemetry.running, true)
+  assert.equal(seen[0][0], 'exec')
+  assert.equal(seen[0][2], '/usr/local/bin/kin-guest-exec')
   const run = async () => assert.fail('must not invoke Docker')
-  assert.equal(
-    (await readSlotProcessStatus({ ...f, vm: { ...f.vm, runtime: { type: 'kvm' } }, run })).telemetry.enabled,
-    true,
-  )
   assert.equal((await readSlotProcessStatus({ ...f, vm: { id: '../secret' }, run })).telemetry.enabled, null)
 })
 

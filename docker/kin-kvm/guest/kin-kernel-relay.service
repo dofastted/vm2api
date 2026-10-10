@@ -1,0 +1,13 @@
+[Unit]
+Description=kin-kernel TCP 7070 to unix relay
+After=kin-kernel.service kin-guest-setup.service
+Wants=kin-kernel.service
+
+[Service]
+ExecStart=/usr/local/sbin/kin-kernel-relay
+Restart=always
+RestartSec=1
+TimeoutStartSec=10
+
+[Install]
+WantedBy=multi-user.target

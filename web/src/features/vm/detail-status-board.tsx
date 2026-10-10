@@ -42,6 +42,7 @@ import { KernelFeatTags } from '@/features/vm/kernel-feat-tags'
 import { OpenaiPlanBadge } from '@/features/vm/openai-plan-badge'
 import { OpenaiQuotaPanel } from '@/features/vm/openai-quota-panel'
 import { proxyHealthOf } from '@/features/vm/proxy-health'
+import { RuntimeChip } from '@/features/vm/runtime-chip'
 import { VmSchedulingBlock } from '@/features/vm/vm-scheduling'
 import { telemetryView } from './telemetry-policy'
 import { telemetryStatusLabel } from './telemetry-status'
@@ -226,7 +227,10 @@ export function VmStatusBoard(props: Props) {
               <>
                 <Field label='镜像' compact>
                   <div className='space-y-1'>
-                    <div>{String(vm.kernel || '—')}</div>
+                    <div className='flex flex-wrap items-center gap-1.5'>
+                      <span>{String(vm.kernel || '—')}</span>
+                      <RuntimeChip vm={vm} />
+                    </div>
                     <KernelFeatTags kernel={vm.kernel} />
                   </div>
                 </Field>

@@ -1,0 +1,198 @@
+#!/bin/sh
+# Every boot: slot user, 9p mounts, payload links, identity, DNS.
+# Params come from guest.env on the NoCloud seed ISO (volid cidata),
+# regenerated each runner start; cloud-init itself runs once per overlay.
+set -eu
+
+log() { echo "kin-guest-setup: $*" >&2; }
+die() { echo "kin-guest-setup: $*" >&2; exit 1; }
+
+load_env() {
+  seed=''
+  for cand in /mnt/cidata /run/kin-seed; do
+    if [ -f "$cand/guest.env" ]; then
+      seed=$cand
+      break
+    fi
+  done
+  if [ -z "$seed" ]; then
+    mkdir -p /mnt/cidata
+    for dev in /dev/disk/by-label/cidata /dev/sr0 /dev/cdrom; do
+      [ -e "$dev" ] || continue
+      if mount -o ro "$dev" /mnt/cidata 2>/dev/null; then
+        seed=/mnt/cidata
+        break
+      fi
+    done
+  fi
+  [ -n "$seed" ] && [ -f "$seed/guest.env" ] || die "guest.env not found on cidata seed"
+  # shellcheck disable=SC1091
+  . "$seed/guest.env"
+}
+
+ensure_user() {
+  gname=kincli
+  if getent group "$KIN_KVM_GID" >/dev/null 2>&1; then
+    gname=$(getent group "$KIN_KVM_GID" | cut -d: -f1)
+  elif getent group kincli >/dev/null 2>&1; then
+    groupmod -g "$KIN_KVM_GID" kincli
+    gname=kincli
+  else
+    groupadd -g "$KIN_KVM_GID" kincli
+    gname=kincli
+  fi
+
+  if getent passwd kincli >/dev/null 2>&1; then
+    usermod -u "$KIN_KVM_UID" -g "$KIN_KVM_GID" -d /home/kincli -s /bin/bash kincli
+  elif getent passwd "$KIN_KVM_UID" >/dev/null 2>&1; then
+    existing=$(getent passwd "$KIN_KVM_UID" | cut -d: -f1)
+    if [ "$existing" != kincli ]; then
+      die "uid $KIN_KVM_UID already used by $existing"
+    fi
+  else
+    # -M: home is the 9p mount, do not populate /etc/skel
+    useradd -u "$KIN_KVM_UID" -g "$KIN_KVM_GID" -d /home/kincli -M -s /bin/bash kincli
+  fi
+  KIN_KVM_GNAME=$gname
+}
+
+load_9p() {
+  modprobe virtio_pci 2>/dev/null || true
+  modprobe 9pnet 2>/dev/null || true
+  modprobe 9pnet_virtio 2>/dev/null || true
+  modprobe 9p 2>/dev/null || true
+  if ! grep -q 9p /proc/filesystems; then
+    die "9p filesystem not available (modules 9p/9pnet_virtio missing)"
+  fi
+}
+
+mount_9p() {
+  tag=$1
+  dest=$2
+  cache=$3
+  mkdir -p "$dest"
+  if mountpoint -q "$dest" 2>/dev/null; then
+    return 0
+  fi
+  mount -t 9p -o "trans=virtio,version=9p2000.L,msize=524288,cache=${cache},access=any" "$tag" "$dest" \
+    || die "9p mount $tag → $dest failed"
+}
+
+has_share() {
+  wanted=$1
+  echo ",${KIN_KVM_SHARES:-home,run}," | grep -q ",${wanted},"
+}
+
+link_payload() {
+  if [ -d /opt/kin-payload/usr/local/bin ]; then
+    for f in /opt/kin-payload/usr/local/bin/*; do
+      [ -e "$f" ] || continue
+      ln -sfn "$f" "/usr/local/bin/$(basename "$f")"
+    done
+  fi
+  if [ -e /opt/kin-payload/opt/kin ] || [ -d /opt/kin-payload/opt/kin ]; then
+    ln -sfn /opt/kin-payload/opt/kin /opt/kin
+  fi
+}
+
+apply_identity() {
+  if [ -n "${KIN_KVM_HOSTNAME:-}" ]; then
+    echo "$KIN_KVM_HOSTNAME" > /etc/hostname
+    hostname "$KIN_KVM_HOSTNAME" 2>/dev/null || true
+    if command -v hostnamectl >/dev/null 2>&1; then
+      hostnamectl set-hostname "$KIN_KVM_HOSTNAME" --static 2>/dev/null || true
+    fi
+  fi
+
+  mid=$(printf '%s' "${KIN_KVM_MACHINE_ID:-}" | tr -d '-' | tr 'A-F' 'a-f')
+  if [ -n "$mid" ]; then
+    printf '%s\n' "$mid" > /etc/machine-id
+    mkdir -p /var/lib/dbus
+    # Ubuntu's dbus machine-id is a symlink to /etc/machine-id; don't cp onto itself.
+    if [ ! -L /var/lib/dbus/machine-id ]; then
+      printf '%s\n' "$mid" > /var/lib/dbus/machine-id
+    fi
+  fi
+
+  if [ -n "${TZ:-}" ] && [ -f "/usr/share/zoneinfo/$TZ" ]; then
+    ln -sfn "/usr/share/zoneinfo/$TZ" /etc/localtime
+    echo "$TZ" > /etc/timezone 2>/dev/null || true
+  fi
+
+  if [ -n "${LANG:-}" ]; then
+    printf 'LANG=%s\n' "$LANG" > /etc/locale.conf
+    printf 'LANG=%s\n' "$LANG" > /etc/default/locale
+  fi
+}
+
+apply_resolv() {
+  # systemd-resolved's stub plus slirp UDP DNS is flaky; spec pins 8.8.8.8 + use-vc.
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now systemd-resolved 2>/dev/null || true
+    systemctl mask systemd-resolved 2>/dev/null || true
+  fi
+  if [ -L /etc/resolv.conf ] || [ -f /etc/resolv.conf ]; then
+    rm -f /etc/resolv.conf
+  fi
+  printf 'nameserver 8.8.8.8\noptions use-vc\n' > /etc/resolv.conf
+}
+
+write_slot_env() {
+  mkdir -p /run/kin-guest /etc/systemd/system/kin-kernel.service.d
+  cat > /run/kin-guest/slot.env <<EOF
+HOME=/home/kincli
+CLAUDE_CONFIG_DIR=/home/kincli/.claude
+TZ=${TZ:-UTC}
+LANG=${LANG:-C.UTF-8}
+KIN_VM_ID=${KIN_VM_ID:-}
+KIN_VM_NAME=${KIN_VM_NAME:-}
+KIN_VM_OS=${KIN_VM_OS:-}
+KIN_SUBMIT_WAIT_MS=30000
+EOF
+  chown kincli:"$KIN_KVM_GID" /run/kin-guest /run/kin-guest/slot.env 2>/dev/null || true
+  chmod 0770 /run/kin-guest
+  cat > /etc/systemd/system/kin-kernel.service.d/slot.conf <<EOF
+[Service]
+Group=${KIN_KVM_GID}
+EOF
+  systemctl daemon-reload 2>/dev/null || true
+}
+
+relax_selinux() {
+  # 9p + Fedora SELinux otherwise denies home/run writes from virtio.
+  if [ -d /sys/fs/selinux ]; then
+    if command -v setenforce >/dev/null 2>&1; then
+      setenforce 0 2>/dev/null || true
+    fi
+    if [ -f /etc/selinux/config ]; then
+      sed -i 's/^SELINUX=enforcing/SELINUX=permissive/' /etc/selinux/config || true
+    fi
+  fi
+}
+
+load_env
+[ -n "${KIN_KVM_UID:-}" ] || die "KIN_KVM_UID missing in guest.env"
+[ -n "${KIN_KVM_GID:-}" ] || die "KIN_KVM_GID missing in guest.env"
+
+relax_selinux
+mkdir -p /run/sshd
+ensure_user
+load_9p
+
+if has_share home; then
+  mount_9p kinhome /home/kincli mmap
+fi
+if has_share claude; then
+  mkdir -p /home/kincli/.claude
+  mount_9p kinclaude /home/kincli/.claude mmap
+fi
+if has_share run; then
+  mount_9p kinrun /run/kin none
+fi
+mount_9p kinpayload /opt/kin-payload loose
+
+link_payload
+apply_identity
+apply_resolv
+write_slot_env
+log "ready uid=$KIN_KVM_UID gid=$KIN_KVM_GID host=${KIN_KVM_HOSTNAME:-} shares=${KIN_KVM_SHARES:-}"

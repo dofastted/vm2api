@@ -1,0 +1,374 @@
+#!/bin/bash
+# PID1 of the kin-kvm runner. Prepares overlay/seed/key, starts qemu
+# (dropped to KIN_KVM_UID:GID) and socat kernel.sock → guest:7070.
+set -eu
+
+die() { echo "kin-kvm: $*" >&2; exit 1; }
+log() {
+  printf 'kin-kvm: %s\n' "$*" >&2
+  if [ -d /slot/kvm ]; then
+    printf 'kin-kvm: %s\n' "$*" >> /slot/kvm/entry.log
+  fi
+}
+
+require() {
+  missing=()
+  for k in "$@"; do
+    eval "v=\${$k-}"
+    [ -n "$v" ] || missing+=("$k")
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    die "missing required env: ${missing[*]}"
+  fi
+}
+
+require \
+  KIN_VM_ID \
+  KIN_KVM_UID KIN_KVM_GID \
+  KIN_KVM_MEMORY_MB KIN_KVM_VCPUS KIN_KVM_DISK_GB \
+  KIN_KVM_CPU_MODEL KIN_KVM_MAC KIN_KVM_DISK_SERIAL \
+  KIN_KVM_HOSTNAME KIN_KVM_MACHINE_ID KIN_KVM_ACCEL \
+  KIN_KVM_SMBIOS_MANUFACTURER KIN_KVM_SMBIOS_PRODUCT \
+  KIN_KVM_SMBIOS_VERSION KIN_KVM_SMBIOS_FAMILY \
+  KIN_KVM_SMBIOS_SERIAL KIN_KVM_SMBIOS_UUID
+
+KIN_VM_NAME=${KIN_VM_NAME:-$KIN_VM_ID}
+KIN_VM_OS=${KIN_VM_OS:-ubuntu-24.04}
+TZ=${TZ:-UTC}
+LANG=${LANG:-C.UTF-8}
+KIN_KVM_SHARES=${KIN_KVM_SHARES:-home,run}
+
+case "$KIN_KVM_ACCEL" in
+  kvm|tcg) ;;
+  *) die "KIN_KVM_ACCEL must be kvm or tcg (got ${KIN_KVM_ACCEL})" ;;
+esac
+
+if [ "$KIN_KVM_ACCEL" = kvm ]; then
+  if [ ! -c /dev/kvm ] || [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+    die "KIN_KVM_ACCEL=kvm requires /dev/kvm read-write"
+  fi
+fi
+
+UID_NUM=$KIN_KVM_UID
+GID_NUM=$KIN_KVM_GID
+SLOT_KVM=/slot/kvm
+SLOT_RUN=/slot/run
+SLOT_HOME=/slot/home
+PAYLOAD=/opt/kin-guest
+BASE=/opt/kin-kvm/base.qcow2
+BASE_ID_FILE=/opt/kin-kvm/base.id
+[ -f "$BASE" ] || die "missing $BASE"
+[ -f "$BASE_ID_FILE" ] || die "missing $BASE_ID_FILE"
+BASE_ID=$(tr -d '[:space:]' < "$BASE_ID_FILE")
+
+mkdir -p "$SLOT_KVM" "$SLOT_RUN" "$SLOT_HOME" "$SLOT_HOME/.claude"
+mkdir -p "$PAYLOAD/usr/local/bin" "$PAYLOAD/opt/kin" 2>/dev/null || true
+
+if [ "$KIN_KVM_ACCEL" = tcg ]; then
+  ACCEL_ARG='tcg,thread=multi'
+  if [ "$KIN_KVM_CPU_MODEL" = host ]; then
+    CPU_MODEL=max
+    log "tcg: mapping cpu model host → max"
+  else
+    CPU_MODEL=$KIN_KVM_CPU_MODEL
+  fi
+else
+  ACCEL_ARG=kvm
+  CPU_MODEL=$KIN_KVM_CPU_MODEL
+fi
+
+find_ovmf() {
+  local code vars
+  for code in \
+    /usr/share/OVMF/OVMF_CODE_4M.fd \
+    /usr/share/OVMF/OVMF_CODE.fd \
+    /usr/share/qemu/OVMF_CODE_4M.fd \
+    /usr/share/qemu/OVMF_CODE.fd
+  do
+    [ -f "$code" ] && OVMF_CODE=$code && break
+  done
+  for vars in \
+    /usr/share/OVMF/OVMF_VARS_4M.fd \
+    /usr/share/OVMF/OVMF_VARS.fd \
+    /usr/share/qemu/OVMF_VARS_4M.fd \
+    /usr/share/qemu/OVMF_VARS.fd
+  do
+    [ -f "$vars" ] && OVMF_VARS_TEMPLATE=$vars && break
+  done
+  [ -n "${OVMF_CODE:-}" ] || die "OVMF_CODE firmware not found"
+  [ -n "${OVMF_VARS_TEMPLATE:-}" ] || die "OVMF_VARS template not found"
+}
+
+smbios_escape() {
+  # qemu smbios values use comma as field sep; double it.
+  printf '%s' "$1" | sed 's/,/,,/g'
+}
+
+ensure_overlay() {
+  local need=0
+  if [ ! -f "$SLOT_KVM/disk.qcow2" ]; then
+    need=1
+  elif [ ! -f "$SLOT_KVM/overlay.id" ] || [ "$(tr -d '[:space:]' < "$SLOT_KVM/overlay.id")" != "$BASE_ID" ]; then
+    log "base.id changed; recreating overlay"
+    need=1
+  elif [ ! -f "$SLOT_KVM/overlay.size" ] || [ "$(tr -d '[:space:]' < "$SLOT_KVM/overlay.size")" != "$KIN_KVM_DISK_GB" ]; then
+    log "disk_gb changed; recreating overlay"
+    need=1
+  fi
+  if [ "$need" = 1 ]; then
+    rm -f "$SLOT_KVM/disk.qcow2"
+    qemu-img create -f qcow2 -F qcow2 -b "$BASE" "$SLOT_KVM/disk.qcow2" "${KIN_KVM_DISK_GB}G" >/dev/null
+    printf '%s\n' "$BASE_ID" > "$SLOT_KVM/overlay.id"
+    printf '%s\n' "$KIN_KVM_DISK_GB" > "$SLOT_KVM/overlay.size"
+    cat /proc/sys/kernel/random/uuid > "$SLOT_KVM/instance-id"
+  fi
+  [ -f "$SLOT_KVM/instance-id" ] || cat /proc/sys/kernel/random/uuid > "$SLOT_KVM/instance-id"
+}
+
+ensure_key() {
+  if [ ! -f "$SLOT_KVM/id_ed25519" ]; then
+    ssh-keygen -t ed25519 -f "$SLOT_KVM/id_ed25519" -N '' -C "kin-kvm-$KIN_VM_ID" >/dev/null
+  fi
+  chmod 600 "$SLOT_KVM/id_ed25519"
+  chmod 644 "$SLOT_KVM/id_ed25519.pub"
+}
+
+ensure_ovmf_vars() {
+  if [ ! -f "$SLOT_KVM/OVMF_VARS.fd" ]; then
+    cp "$OVMF_VARS_TEMPLATE" "$SLOT_KVM/OVMF_VARS.fd"
+  fi
+}
+
+write_seed() {
+  local seed_dir pub instance
+  seed_dir=$(mktemp -d /tmp/kin-seed.XXXXXX)
+  pub=$(tr -d '\r\n' < "$SLOT_KVM/id_ed25519.pub")
+  instance=$(tr -d '[:space:]' < "$SLOT_KVM/instance-id")
+  cp -a /opt/kin-kvm/guest/. "$seed_dir/"
+  rm -rf "$seed_dir/__pycache__"
+  sed -e "s|{{SSH_PUBKEY}}|$pub|g" -e "s|{{HOSTNAME}}|$KIN_KVM_HOSTNAME|g" \
+    /opt/kin-kvm/guest/user-data > "$seed_dir/user-data"
+  cat > "$seed_dir/meta-data" <<EOF
+instance-id: $instance
+local-hostname: $KIN_KVM_HOSTNAME
+EOF
+  cat > "$seed_dir/guest.env" <<EOF
+KIN_VM_ID=$KIN_VM_ID
+KIN_VM_NAME=$KIN_VM_NAME
+KIN_VM_OS=$KIN_VM_OS
+KIN_KVM_UID=$KIN_KVM_UID
+KIN_KVM_GID=$KIN_KVM_GID
+KIN_KVM_HOSTNAME=$KIN_KVM_HOSTNAME
+KIN_KVM_MACHINE_ID=$KIN_KVM_MACHINE_ID
+KIN_KVM_SHARES=$KIN_KVM_SHARES
+TZ=$TZ
+LANG=$LANG
+EOF
+  # Files must sit at ISO root; passing a directory would nest them.
+  ( cd "$seed_dir" && genisoimage -quiet -output "$SLOT_KVM/seed.iso" -volid cidata -joliet -rock . )
+  rm -rf "$seed_dir"
+}
+
+qmp_cmd() {
+  local cmd=$1
+  python3 - "$SLOT_KVM/qmp.sock" "$cmd" <<'PY'
+import json, socket, sys
+path, cmd = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5)
+try:
+    s.connect(path)
+except OSError:
+    sys.exit(1)
+buf = b''
+while b'\n' not in buf:
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    buf += chunk
+s.sendall(b'{"execute":"qmp_capabilities"}\n')
+s.recv(4096)
+s.sendall(('{"execute":"%s"}\n' % cmd).encode())
+s.close()
+PY
+}
+
+QEMU_PID=''
+SOCAT_PID=''
+TAIL_PID=''
+STOPPING=0
+
+cleanup() {
+  rm -f "$SLOT_RUN/kernel.sock"
+  if [ -n "${SOCAT_PID:-}" ] && kill -0 "$SOCAT_PID" 2>/dev/null; then
+    kill "$SOCAT_PID" 2>/dev/null || true
+  fi
+  if [ -n "${TAIL_PID:-}" ] && kill -0 "$TAIL_PID" 2>/dev/null; then
+    kill "$TAIL_PID" 2>/dev/null || true
+  fi
+}
+
+powerdown() {
+  STOPPING=1
+  log "SIGTERM: QMP system_powerdown"
+  if [ -S "$SLOT_KVM/qmp.sock" ]; then
+    qmp_cmd system_powerdown || true
+  fi
+  local i=0
+  while [ "$i" -lt 25 ]; do
+    if [ -n "$QEMU_PID" ] && ! kill -0 "$QEMU_PID" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  if [ -n "$QEMU_PID" ] && kill -0 "$QEMU_PID" 2>/dev/null; then
+    log "qemu still running after 25s; QMP quit"
+    qmp_cmd quit || true
+    sleep 1
+  fi
+  if [ -n "$QEMU_PID" ] && kill -0 "$QEMU_PID" 2>/dev/null; then
+    log "qemu still running; SIGKILL"
+    kill -9 "$QEMU_PID" 2>/dev/null || true
+  fi
+  cleanup
+  exit 0
+}
+
+trap powerdown TERM INT
+trap cleanup EXIT
+
+find_ovmf
+ensure_overlay
+ensure_key
+ensure_ovmf_vars
+write_seed
+
+
+if ! getent group "$GID_NUM" >/dev/null 2>&1; then
+  groupadd -g "$GID_NUM" kinslot
+fi
+if ! getent passwd "$UID_NUM" >/dev/null 2>&1; then
+  useradd -u "$UID_NUM" -g "$GID_NUM" -M -d /slot/home -s /usr/sbin/nologin kinslot
+fi
+
+: > "$SLOT_KVM/console.log"
+rm -f "$SLOT_KVM/qmp.sock" "$SLOT_RUN/kernel.sock"
+for p in \
+  "$SLOT_KVM/disk.qcow2" \
+  "$SLOT_KVM/seed.iso" \
+  "$SLOT_KVM/console.log" \
+  "$SLOT_KVM/OVMF_VARS.fd" \
+  "$SLOT_KVM/id_ed25519" \
+  "$SLOT_KVM/id_ed25519.pub" \
+  "$SLOT_KVM" \
+  "$SLOT_RUN" \
+  "$SLOT_HOME"
+do
+  [ -e "$p" ] || continue
+  chown "$UID_NUM:$GID_NUM" "$p" || log "warning: chown $p failed"
+done
+if [ -d /slot/claude ]; then
+  chown "$UID_NUM:$GID_NUM" /slot/claude || log "warning: chown /slot/claude failed"
+fi
+
+has_share() {
+  echo ",${KIN_KVM_SHARES}," | grep -q ",$1,"
+}
+
+QEMU=(
+  qemu-system-x86_64
+  -nodefaults
+  -name "kin-$KIN_VM_ID"
+  -machine q35,smm=on
+  -accel "$ACCEL_ARG"
+  -cpu "$CPU_MODEL"
+  -m "$KIN_KVM_MEMORY_MB"
+  -smp "$KIN_KVM_VCPUS"
+  -uuid "$KIN_KVM_SMBIOS_UUID"
+  -smbios "type=1,manufacturer=$(smbios_escape "$KIN_KVM_SMBIOS_MANUFACTURER"),product=$(smbios_escape "$KIN_KVM_SMBIOS_PRODUCT"),version=$(smbios_escape "$KIN_KVM_SMBIOS_VERSION"),serial=$(smbios_escape "$KIN_KVM_SMBIOS_SERIAL"),uuid=$KIN_KVM_SMBIOS_UUID,family=$(smbios_escape "$KIN_KVM_SMBIOS_FAMILY")"
+  -drive "if=pflash,format=raw,unit=0,readonly=on,file=$OVMF_CODE"
+  -drive "if=pflash,format=raw,unit=1,file=$SLOT_KVM/OVMF_VARS.fd"
+  -drive "file=$SLOT_KVM/disk.qcow2,if=none,id=disk0,format=qcow2,cache=writeback,discard=unmap"
+  -device "virtio-blk-pci,drive=disk0,bootindex=1,serial=$KIN_KVM_DISK_SERIAL"
+  -cdrom "$SLOT_KVM/seed.iso"
+  -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:7070-:7070"
+  -device "virtio-net-pci,netdev=net0,mac=$KIN_KVM_MAC"
+  -object rng-random,id=rng0,filename=/dev/urandom
+  -device virtio-rng-pci,rng=rng0
+  -chardev "socket,id=qmp,path=$SLOT_KVM/qmp.sock,server=on,wait=off"
+  -mon chardev=qmp,mode=control
+  -serial "file:$SLOT_KVM/console.log"
+  -display none
+)
+
+if has_share home; then
+  QEMU+=(-fsdev "local,id=fs_home,path=$SLOT_HOME,security_model=none,multidevs=remap")
+  QEMU+=(-device "virtio-9p-pci,fsdev=fs_home,mount_tag=kinhome")
+fi
+if has_share run; then
+  QEMU+=(-fsdev "local,id=fs_run,path=$SLOT_RUN,security_model=none,multidevs=remap")
+  QEMU+=(-device "virtio-9p-pci,fsdev=fs_run,mount_tag=kinrun")
+fi
+if has_share claude; then
+  mkdir -p /slot/claude
+  QEMU+=(-fsdev "local,id=fs_claude,path=/slot/claude,security_model=none,multidevs=remap")
+  QEMU+=(-device "virtio-9p-pci,fsdev=fs_claude,mount_tag=kinclaude")
+fi
+QEMU+=(-fsdev "local,id=fs_payload,path=$PAYLOAD,security_model=none,multidevs=remap,readonly=on")
+QEMU+=(-device "virtio-9p-pci,fsdev=fs_payload,mount_tag=kinpayload")
+
+log "starting qemu accel=$KIN_KVM_ACCEL cpu=$CPU_MODEL mem=${KIN_KVM_MEMORY_MB}m smp=$KIN_KVM_VCPUS disk=${KIN_KVM_DISK_GB}g uid=$UID_NUM:$GID_NUM"
+# Trixie qemu 10 dropped -runas; drop with setpriv so 9p I/O is the slot uid.
+if [ "$UID_NUM" != 0 ]; then
+  setpriv --reuid="$UID_NUM" --regid="$GID_NUM" --clear-groups -- "${QEMU[@]}" &
+else
+  "${QEMU[@]}" &
+fi
+QEMU_PID=$!
+log "spawned pid=$QEMU_PID"
+sleep 0.5
+if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+  # PID 1 already reaped setpriv if it forked; qemu is then an orphan.
+  QEMU_PID=$(python3 -c 'import pathlib
+for d in pathlib.Path("/proc").iterdir():
+    if not d.name.isdigit():
+        continue
+    try:
+        c = open(d / "comm").read().strip()
+    except OSError:
+        continue
+    if c.startswith("qemu-system"):
+        print(d.name)
+        break
+')
+  log "bg pid died; qemu pid=${QEMU_PID:-none}"
+  [ -n "$QEMU_PID" ] || die "qemu exited immediately; see $SLOT_KVM/console.log"
+fi
+
+
+rm -f "$SLOT_RUN/kernel.sock"
+: > "$SLOT_KVM/socat.log"
+chown "$UID_NUM:$GID_NUM" "$SLOT_KVM/socat.log" || true
+# Subshell+exec so $! is socat itself (setsid forks and the parent exits
+# because PID 1 is already a session leader).
+(
+  exec socat UNIX-LISTEN:"$SLOT_RUN/kernel.sock",fork,mode=0660,user="${UID_NUM}",group="${GID_NUM}" \
+    TCP:127.0.0.1:7070
+) >>"$SLOT_KVM/socat.log" 2>&1 &
+SOCAT_PID=$!
+sleep 0.3
+if [ ! -S "$SLOT_RUN/kernel.sock" ]; then
+  log "socat did not bind kernel.sock: $(tr '\n' ' ' < "$SLOT_KVM/socat.log" 2>/dev/null || echo no-log)"
+else
+  log "kernel.sock ready pid=$SOCAT_PID"
+fi
+log "qemu pid=$QEMU_PID socat pid=$SOCAT_PID"
+st=0
+wait "$QEMU_PID" || st=$?
+cleanup
+if [ "$STOPPING" = 1 ]; then
+  exit 0
+fi
+log "qemu exited status=$st"
+exit "$st"

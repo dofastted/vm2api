@@ -6,7 +6,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { atomicWriteJson } from './vm-file.mjs'
-import { runtimeKind } from './runtime-kind.mjs'
+import { runtimeKind, isKvmRuntime } from './runtime-kind.mjs'
 import { slotExec } from './slot-runtime.mjs'
 import { readGuestIdentity } from './guest-identity-reader.mjs'
 import { OFFICIAL_STAINLESS } from '../identity/vm-identity.mjs'
@@ -91,10 +91,11 @@ export function mergeGuestFingerprint(prev = {}, guest = {}) {
   return next
 }
 
-export async function collectSlotIdentity(projectRoot, vm, { callGet = readGuestIdentity, timeoutMs = 5000 } = {}) {
+export async function collectSlotIdentity(projectRoot, vm, { callGet = readGuestIdentity, timeoutMs } = {}) {
   if (!vm?.id) return { ok: false, error: 'vm required' }
   const exec = slotExec(projectRoot, vm)
-  const res = await callGet(exec, '/internal/identity', { timeoutMs })
+  const ms = timeoutMs ?? (isKvmRuntime(vm) ? 20_000 : 5_000)
+  const res = await callGet(exec, '/internal/identity', { timeoutMs: ms })
   if (!res?.ok) {
     const message = res?.body?.error?.message || res?.body?.error || `identity status ${res?.status || 0}`
     return {

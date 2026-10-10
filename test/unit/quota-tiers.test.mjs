@@ -74,6 +74,18 @@ test('buildRouting returns tiers so the panel can re-render a save', () => {
   assert.equal(data.tiers.max.max_concurrency, 4)
 })
 
+test('buildRouting returns normalized vm defaults', () => {
+  const data = buildRouting({
+    routingConfig: { sticky: {}, quota: {}, concurrency: {} },
+    stickyRouter: { stats: () => ({ active_sessions: 0 }) },
+  }).data
+  assert.equal(data.vm.default_runtime, 'docker')
+  assert.equal(data.vm.memory, '512m')
+  assert.equal(data.vm.vcpus, 2)
+  assert.equal(data.vm.disk_gb, 20)
+  assert.equal(data.vm.allow_tcg, false)
+})
+
 test('buildRouting exposes effective Codex routing to the panel', () => {
   const data = buildRouting({
     routingConfig: { codex: { clients: { official_codex: 'allow' } } },

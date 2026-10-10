@@ -1,7 +1,6 @@
 /**
- * Host-side slot lifecycle. Docker is implemented; KVM is a same-shaped
- * adapter that refuses until a hypervisor is wired. Guest identity / SOCKS
- * / TLS stay inside the rust kernel and must not branch here.
+ * Host-side slot lifecycle. Docker and KVM share slotHost(vm); guest identity
+ * / SOCKS / TLS stay inside the rust kernel and must not branch here.
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -12,7 +11,7 @@ import {
   writeKernelConfig,
 } from '../transport/rust-kernel-supervisor.mjs'
 import { ensureCodexKernel, stopCodexKernel, writeCodexKernelConfig } from '../transport/codex-kernel-supervisor.mjs'
-import { runtimeKind, RUNTIME_KVM } from './runtime-kind.mjs'
+import { runtimeKind, isKvmRuntime } from './runtime-kind.mjs'
 import { getVm, listVms, isCodexVm, persistVmRuntime } from './vm-registry.mjs'
 import { resolveInferenceEngine } from './slot-engine.mjs'
 import {
@@ -28,22 +27,11 @@ import { slotHost } from './slot-host.mjs'
 
 export { runtimeKind }
 
-const KVM_NOT_CONFIGURED = {
-  ok: false,
-  code: 'kvm_not_configured',
-  error: 'kvm runtime adapter is not configured',
-}
-
-function kvmRefuse(action) {
-  return { ...KVM_NOT_CONFIGURED, action, runtime: RUNTIME_KVM }
-}
-
 function unsupportedOnHost(action) {
   return { ok: false, code: 'remote_unsupported', error: `集群节点上的槽位不支持：${action}` }
 }
 
 export function startSlot(vm, projectRoot, opts = {}) {
-  if (runtimeKind(vm) === RUNTIME_KVM) return kvmRefuse('start')
   return slotHost(vm).start(vm, projectRoot, opts)
 }
 
@@ -62,19 +50,16 @@ export async function startSlotReady(vm, projectRoot, opts = {}) {
 
 export async function stopSlot(vm) {
   if (isCodexVm(vm)) stopCodexKernel(vm.id)
-  if (runtimeKind(vm) === RUNTIME_KVM) return kvmRefuse('stop')
   return slotHost(vm).stop(vm)
 }
 
 /** Destroy the slot container. Used only by explicit reset / delete. */
 export async function destroySlot(vm) {
-  if (runtimeKind(vm) === RUNTIME_KVM) return kvmRefuse('destroy')
   return slotHost(vm).destroy(vm)
 }
 
 /** Reload guest worker so a new bind-mounted / virtiofs binary is picked up. Never docker rm. */
 export async function reloadSlot(vm, projectRoot, opts = {}) {
-  if (runtimeKind(vm) === RUNTIME_KVM) return kvmRefuse('reload')
   return slotHost(vm).reload(vm, projectRoot, opts)
 }
 
@@ -136,8 +121,8 @@ export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
   if (!slotHasCredential(vm, projectRoot)) {
     return { ok: true, skipped: true, reason: 'no_credential', engine: 'rust' }
   }
-  if (runtimeKind(vm) === RUNTIME_KVM) return kvmRefuse('ensure-rust')
   // A baked slot image ships kernel and CLIs; there is no .kin to materialize or kernel to mount.
+  // KVM bind-mounts payload at /opt/kin-guest, not /usr/local/bin/kin-kernel.
   if (!slotHost(vm).bakedKernel) {
     const dest = wrapCliHomeDir(projectRoot, vm.id)
     let wrap = inspectWrapCliDir(dest)
@@ -151,7 +136,7 @@ export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
         error: wrap?.error || 'wrap CLI is not installed in the slot home',
       }
     }
-    if (!wrapUsesSlotKernel(wrap)) {
+    if (!wrapUsesSlotKernel(wrap) && !isKvmRuntime(vm)) {
       const kernelBin = (opts.ops?.kernelBinPath || kernelBinPath)()
       const binaryError = kernelBinaryError(kernelBin)
       if (binaryError) return binaryError

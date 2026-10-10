@@ -64,6 +64,7 @@ import { VmTestTab } from '@/features/vm/detail-test-tab'
 import { NodeChip } from '@/features/vm/node-chip'
 import { probeOutcome, type ProbeCheck } from '@/features/vm/probe-status'
 import { vmQueryOptions, vmSeedQueryOptions } from '@/features/vm/queries'
+import { RuntimeChip } from '@/features/vm/runtime-chip'
 import {
   SchedulableSwitch,
   vmSchedulableProps,
@@ -282,6 +283,7 @@ export function VmDetailPage() {
             </Select>
           ) : null}
           <PlatformChip vm={vm} />
+          <RuntimeChip vm={vm} className='text-[11px]' />
           <NodeChip nodeId={vm.node_id} className='text-[11px]' />
           <StatusMark tone={accountStatus(vm)} variant='pill' />
           {claudeTier(vm).key !== 'none' ? (

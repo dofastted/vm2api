@@ -46,6 +46,7 @@ import { requestKernelReloadWhenIdle, syncClaudeKernelConfigs } from '../transpo
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { wakeOpenAIWaiter } from '../pool/openai-account-runtime.mjs'
+import { normalizeVmConfig } from '../vm/machine-spec.mjs'
 
 export function createRoutingRuntime(ctx) {
   const getRouting = () => (typeof ctx.getRoutingConfig === 'function' ? ctx.getRoutingConfig() : ctx.routingConfig)
@@ -428,6 +429,14 @@ export function createRoutingRuntime(ctx) {
       }
       routingConfig.codex = normalizeCodexRouting(nextCodex)
     }
+    if (body.vm) {
+      const prev = routingConfig.vm && typeof routingConfig.vm === 'object' ? routingConfig.vm : {}
+      const next = { ...prev, ...body.vm }
+      if (body.vm.smbios && typeof body.vm.smbios === 'object') {
+        next.smbios = { ...(prev.smbios || {}), ...body.vm.smbios }
+      }
+      routingConfig.vm = normalizeVmConfig(next)
+    }
     applyOfficialCcRoutingBody(body, prevOfficialCc)
     applyHealthProbeRoutingBody(body, prevHealthProbe)
     applyUsageProbeRoutingBody(body, prevUsageProbe)
@@ -508,6 +517,7 @@ export function createRoutingRuntime(ctx) {
       const hasOpenAIQuota = Object.prototype.hasOwnProperty.call(doc.codex || {}, 'quota')
       doc.codex = normalizeCodexRouting(doc.codex)
       doc.pool = normalizePoolRouting(doc.pool)
+      doc.vm = normalizeVmConfig(doc.vm)
       if (!hasOpenAIQuota) migrateLegacyOpenAIPolicies(doc)
       return doc
     } catch (error) {

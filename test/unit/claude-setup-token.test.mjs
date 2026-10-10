@@ -1,5 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import {
   extractSetupTokenAuthUrl,
   extractSetupTokenValue,
@@ -7,7 +10,9 @@ import {
   looksLikeOfficialSetupToken,
   officialSetupTokenToOauth,
   pickPreferredSetupToken,
+  stopClaudeSetupTokenSession,
 } from '../../src/lib/oauth/claude-setup-token.mjs'
+import { KVM_GUEST_EXEC } from '../../src/lib/vm/slot-exec.mjs'
 
 test('extractSetupTokenAuthUrl reads OSC-8 hyperlink', () => {
   const url =
@@ -73,4 +78,45 @@ test('setup-token session stays reusable after a 400 until force regenerate', ()
   assert.equal(isPersistentSetupTokenSession(session, { force: true }), false)
   assert.equal(isPersistentSetupTokenSession({ ...session, alive: false }), false)
   assert.equal(isPersistentSetupTokenSession({ ...session, expired: true }), false)
+})
+
+test('stopClaudeSetupTokenSession pkills via kin-guest-exec on kvm slots', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-setup-stop-kvm-'))
+  try {
+    fs.mkdirSync(path.join(root, 'vms'))
+    fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify({ id: 'vm-01', runtime: { type: 'kvm' } }))
+    const seen = []
+    await stopClaudeSetupTokenSession(root, 'vm-01', {
+      spawn: (bin, argv) => {
+        seen.push({ bin, argv })
+        return { status: 0 }
+      },
+    })
+    assert.equal(seen.length, 1)
+    assert.equal(seen[0].bin, 'docker')
+    assert.equal(seen[0].argv[0], 'exec')
+    assert.equal(seen[0].argv[1], 'kin-01')
+    assert.equal(seen[0].argv[2], KVM_GUEST_EXEC)
+    assert.ok(seen[0].argv.includes('--'))
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('stopClaudeSetupTokenSession docker pkill stays byte-identical', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-setup-stop-docker-'))
+  try {
+    fs.mkdirSync(path.join(root, 'vms'))
+    fs.writeFileSync(path.join(root, 'vms', 'vm-02.json'), JSON.stringify({ id: 'vm-02', runtime: { type: 'docker' } }))
+    const seen = []
+    await stopClaudeSetupTokenSession(root, 'vm-02', {
+      spawn: (bin, argv) => {
+        seen.push(argv)
+        return { status: 0 }
+      },
+    })
+    assert.deepEqual(seen[0].slice(0, 4), ['exec', 'kin-02', 'sh', '-lc'])
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })

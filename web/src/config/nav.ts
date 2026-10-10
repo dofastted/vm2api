@@ -3,6 +3,7 @@ export type ViewId =
   | 'cluster'
   | 'vm'
   | 'import'
+  | 'specs'
   | 'usage'
   | 'billing'
   | 'proxies'
@@ -23,6 +24,7 @@ export const VIEW_TITLES: Record<ViewId, string> = {
   cluster: '集群',
   vm: '虚拟机',
   import: '导入',
+  specs: '规格',
   usage: '用量',
   billing: '计费',
   proxies: '代理池',

@@ -85,6 +85,8 @@ import { MESSAGES_BREAKPOINT_MODES } from '../protocol/cache-ttl.mjs'
 import { normalizeCodexRouting } from '../protocol/codex-route.mjs'
 import { effectiveOpenAIPolicy, normalizeOpenAIQuotaPolicy } from '../pool/openai-quota-policy.mjs'
 import { openAIRuntimeSignals } from '../pool/openai-account-runtime.mjs'
+import { normalizeVmConfig } from '../vm/machine-spec.mjs'
+import { runtimeKind } from '../vm/runtime-kind.mjs'
 
 export function ok(data, meta) {
   const out = { ok: true, data }
@@ -168,6 +170,8 @@ export function publicVmBootView(vm) {
     persona_preset: vm.persona_preset || null,
     schedulable: vm.schedulable !== false,
     schedule_disabled_reason: vm.schedule_disabled_reason || null,
+    runtime_type: vm.runtime_type || runtimeKind(vm),
+    machine: vm.machine || null,
   }
 }
 
@@ -1260,6 +1264,7 @@ export function buildRouting({ routingConfig, stickyRouter }) {
     health_probe: normalizeHealthProbeConfig(routingConfig?.health_probe),
     usage_probe: normalizeUsageProbeConfig(routingConfig?.usage_probe),
     notify: publicNotifyConfig(routingConfig?.notify),
+    vm: normalizeVmConfig(routingConfig?.vm),
     sessions: stickyRouter.stats(),
   })
 }
@@ -1690,6 +1695,8 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     status: v.status,
     active: v.id === active,
     kernel: v.kernel || null,
+    runtime_type: runtimeKind(v),
+    machine: v.machine || null,
     inference_engine: v.inference_engine || null,
     persona_preset: v.persona_preset || null,
     dataplane: v.dataplane || null,

@@ -29,6 +29,7 @@ import { seedFreshCliHome } from './vm-recreate.mjs'
 import { atomicWriteJson, isValidVmId } from './vm-file.mjs'
 import { bindVmProxy, getVm, listVms } from './vm-registry.mjs'
 import { isCodexVm, stampVmKind } from './vm-kind.mjs'
+import { normalizeVmConfig, resolveMachineSpec } from './machine-spec.mjs'
 import {
   SESSION_SLOT_MAX,
   SESSION_SLOT_MIN,
@@ -631,6 +632,7 @@ export async function commitVmPackage({
       proxy_required: false,
       seed_policy: standardSeedPolicy(),
       runtime: { type: 'docker' },
+      machine: resolveMachineSpec({ config: normalizeVmConfig(), runtime: 'docker' }),
       owner_user_id: owner.role === 'user' ? normalizeOwnerId(owner.userId) : null,
       origin: owner.role === 'user' ? VM_ORIGIN.userCreated : VM_ORIGIN.platform,
     }

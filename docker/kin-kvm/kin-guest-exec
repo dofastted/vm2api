@@ -1,0 +1,121 @@
+#!/bin/sh
+# ssh into the guest as root, then setpriv down to the slot user.
+# Flags: [-u uid[:gid]] [-e K=V]... [-w dir] [-i] [-t] [-d] -- argv...
+set -eu
+
+uid=''
+gid=''
+workdir=''
+interactive=0
+tty=0
+detach=0
+# Newline-separated KEY=VAL so values may contain spaces.
+env_lines=''
+
+usage() {
+  echo "usage: kin-guest-exec [-u uid[:gid]] [-e K=V]... [-w dir] [-i] [-t] [-d] -- argv..." >&2
+  exit 2
+}
+
+posix_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -u)
+      [ $# -ge 2 ] || usage
+      uidgid=$2
+      uid=${uidgid%%:*}
+      case "$uidgid" in
+        *:*) gid=${uidgid#*:} ;;
+        *) gid=$uid ;;
+      esac
+      shift 2
+      ;;
+    -e)
+      [ $# -ge 2 ] || usage
+      case "$2" in
+        *=*) env_lines="${env_lines}${2}
+" ;;
+        *) echo "kin-guest-exec: -e expects KEY=VAL" >&2; exit 2 ;;
+      esac
+      shift 2
+      ;;
+    -w)
+      [ $# -ge 2 ] || usage
+      workdir=$2
+      shift 2
+      ;;
+    -i) interactive=1; shift ;;
+    -t) tty=1; shift ;;
+    -d) detach=1; shift ;;
+    --) shift; break ;;
+    -*) usage ;;
+    *) break ;;
+  esac
+done
+
+[ $# -gt 0 ] || usage
+
+KEY=/slot/kvm/id_ed25519
+if [ ! -r "$KEY" ]; then
+  echo "guest ssh unavailable" >&2
+  echo "kin-guest-exec: missing $KEY" >&2
+  exit 1
+fi
+
+inner=''
+
+# Build the remote script without a pipe so we keep the current shell.
+if [ -n "$env_lines" ]; then
+  oldifs=$IFS
+  IFS='
+'
+  for line in $env_lines; do
+    [ -n "$line" ] || continue
+    key=${line%%=*}
+    val=${line#*=}
+    inner="${inner}export ${key}=$(posix_quote "$val"); "
+  done
+  IFS=$oldifs
+fi
+if [ -n "$workdir" ]; then
+  inner="${inner}cd $(posix_quote "$workdir") || exit; "
+fi
+if [ -n "$uid" ]; then
+  inner="${inner}exec setpriv --reuid=$(posix_quote "$uid") --regid=$(posix_quote "$gid") --clear-groups --"
+else
+  inner="${inner}exec"
+fi
+for a in "$@"; do
+  inner="${inner} $(posix_quote "$a")"
+done
+
+if [ "$detach" -eq 1 ]; then
+  remote="setsid -f sh -c $(posix_quote "$inner") </dev/null >/dev/null 2>&1; exit 0"
+else
+  remote="sh -c $(posix_quote "$inner")"
+fi
+
+ssh_opts='-i '"$KEY"' -p 2222 -o BatchMode=yes -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null -o ConnectTimeout=3 -o LogLevel=ERROR'
+# Word-split ssh_opts is intentional (fixed tokens).
+# shellcheck disable=SC2086
+set -- $ssh_opts
+if [ "$detach" -eq 1 ]; then
+  set -- "$@" -n
+elif [ "$tty" -eq 1 ]; then
+  set -- "$@" -tt
+fi
+if [ "$detach" -eq 0 ] && [ "$interactive" -eq 1 ]; then
+  set -- "$@" -o RequestTTY=auto
+fi
+
+if ! timeout 8 ssh "$@" root@127.0.0.1 "$remote"; then
+  st=$?
+  if [ "$st" -eq 255 ] || [ "$st" -eq 124 ]; then
+    echo "guest ssh unavailable" >&2
+    exit 1
+  fi
+  exit "$st"
+fi

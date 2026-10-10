@@ -62,6 +62,7 @@ import {
 } from './egress.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { nodeEgressProxyUrl } from '../cluster/node-egress-socks.mjs'
+import { isKvmRuntime } from './runtime-kind.mjs'
 import { stopCodexKernel } from '../transport/codex-kernel-supervisor.mjs'
 
 const noop = async () => ({ skipped: true })
@@ -147,7 +148,10 @@ function nodeHost(nodeId) {
 
 export function slotHost(vm) {
   const nodeId = vmNodeId(vm)
-  return nodeId ? nodeHost(nodeId) : LOCAL_HOST
+  const base = nodeId ? nodeHost(nodeId) : LOCAL_HOST
+  if (!isKvmRuntime(vm)) return base
+  // Runner socat owns run/kernel.sock; deleting it severs the guest relay.
+  return { ...base, ownsSocketFiles: false }
 }
 
 /**

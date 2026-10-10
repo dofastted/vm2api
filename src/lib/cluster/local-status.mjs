@@ -13,6 +13,8 @@ import net from 'node:net'
 import os from 'node:os'
 import { dockerInfo, dockerJson, localDocker } from './docker-remote.mjs'
 import { execCollect } from './ssh-link.mjs'
+import { readRoutingConfigFile } from '../core/config.mjs'
+import { probeLocalKvm } from '../vm/kvm-host.mjs'
 
 /** `$SSH_CLIENT` = "<client ip> <client port> <server port>". */
 export function parseSshClient(raw) {
@@ -115,12 +117,21 @@ async function natStatus({ observer, control, addresses }) {
   }
 }
 
-export async function collectLocalStatus({ listen, containerName, observer, docker = localDocker() }) {
+export async function collectLocalStatus({ listen, containerName, observer, docker = localDocker(), routing } = {}) {
   const addresses = localAddresses()
-  const [control, dockerStatus] = await Promise.all([
+  let probeRouting = routing
+  if (!probeRouting) {
+    try {
+      probeRouting = readRoutingConfigFile()
+    } catch {
+      probeRouting = null
+    }
+  }
+  const [control, dockerStatus, kvm] = await Promise.all([
     controlPlane({ listen, containerName, docker }),
     localDockerStatus(docker),
+    probeLocalKvm({ routing: probeRouting }),
   ])
   const nat = await natStatus({ observer, control, addresses })
-  return { checked_at: new Date().toISOString(), control, nat, docker: dockerStatus }
+  return { checked_at: new Date().toISOString(), control, nat, docker: dockerStatus, kvm }
 }

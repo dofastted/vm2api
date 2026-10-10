@@ -1,0 +1,10 @@
+#!/bin/sh
+# First existing kernel binary, then gateway-worker against the 9p config.
+set -eu
+for p in /home/kincli/.kin/kin-kernel /usr/local/bin/kin-kernel /opt/kin/kin-kernel; do
+  if [ -x "$p" ]; then
+    exec "$p" --gateway-worker --config /run/kin/kernel.json
+  fi
+done
+echo "kin-kernel: no binary at /home/kincli/.kin/kin-kernel, /usr/local/bin/kin-kernel, or /opt/kin/kin-kernel" >&2
+exit 1

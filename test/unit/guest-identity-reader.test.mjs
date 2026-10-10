@@ -66,11 +66,54 @@ test('falls back to uname -n when the guest has no hostname command', async () =
   assert.equal(result.body.identity.hostname, (await promisify(execFile)('uname', ['-n'])).stdout.trim())
 })
 
-test('rejects unsupported runtimes without reading host identity', async () => {
-  const result = await readGuestIdentity({ vmId: 'vm-01', vm: { runtime: { type: 'kvm' } } }, '', {
-    run: () => assert.fail('must not run Docker for KVM'),
+test('collects kvm guest identity via kin-guest-exec', async () => {
+  const result = await readGuestIdentity({ vmId: 'vm-01', vm: { id: 'vm-01', runtime: { type: 'kvm' } } }, '', {
+    run: async (command, args) => {
+      assert.equal(command, 'docker')
+      assert.deepEqual(args.slice(0, 4), ['exec', 'kin-01', '/usr/local/bin/kin-guest-exec', '--'])
+      assert.equal(args.at(-1), READ_IDENTITY)
+      return { stdout: guestOutput }
+    },
   })
-  assert.equal(result.body.error.code, 'guest_identity_unsupported')
+  assert.equal(result.ok, true)
+  assert.equal(result.body.identity.runtime_kind, 'kvm')
+  assert.equal(result.body.identity.hostname, 'guest-01')
+})
+
+test('kvm collect-identity waits longer for guest ssh', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'guest-kvm-timeout-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.mkdirSync(path.join(root, 'vms'))
+  const vm = { id: 'vm-01', runtime: { type: 'kvm' }, fingerprint: {} }
+  fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify(vm))
+  let seen
+  const result = await collectSlotIdentity(root, vm, {
+    callGet: async (_exec, _path, options) => {
+      seen = options.timeoutMs
+      return {
+        ok: true,
+        status: 200,
+        body: {
+          identity: {
+            schema_version: '1',
+            runtime_kind: 'kvm',
+            hostname: 'guest-01',
+            os_id: 'ubuntu',
+            os_pretty: 'Ubuntu 24.04 LTS',
+            kernel_release: '6.8.0',
+            arch: 'x86_64',
+            machine_id: 'guest-machine',
+            timezone: 'UTC',
+            locale: 'en_US.UTF-8',
+            goos: 'linux',
+          },
+        },
+      }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(seen, 20_000)
+  assert.equal(result.runtime_kind, 'kvm')
 })
 
 test('reports stopped containers, timeouts and incomplete output as failures', async () => {

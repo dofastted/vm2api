@@ -124,6 +124,12 @@ def write_all(fd: int, data: bytes) -> bool:
 
 
 def build_argv() -> list[str]:
+    raw = os.environ.get("KIN_DOCKER_ARGV", "").strip()
+    if raw:
+        argv = json.loads(raw)
+        if not isinstance(argv, list) or not argv or argv[0] != "exec":
+            raise SystemExit(2)
+        return ["docker", *argv]
     container = os.environ["KIN_CONTAINER"]
     uid = os.environ["KIN_UID"]
     gid = os.environ["KIN_GID"]

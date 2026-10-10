@@ -17,6 +17,7 @@ function fixture(t, { bindLimit = 5 } = {}) {
     { id: 'node-b', name: 'Node B', host: '192.0.2.20', link: { state: 'ready' } },
   ]
   const preflights = []
+  const preflightOptions = []
   const pool = new ProxyPool({
     db,
     listVms: () => listVms(project),
@@ -86,8 +87,9 @@ function fixture(t, { bindLimit = 5 } = {}) {
         if (body instanceof Error) throw body
         return body
       },
-      preflightNode: async (nodeId) => {
+      preflightNode: async (nodeId, options) => {
         preflights.push(nodeId)
+        preflightOptions.push(options)
         assert.ok(nodes.some((node) => node.id === nodeId))
         return { ok: true, node_id: nodeId, checks: [], image: { present: true } }
       },
@@ -96,7 +98,7 @@ function fixture(t, { bindLimit = 5 } = {}) {
     return response
   }
 
-  return { project, cfg, accountQuota, pool, nodes, preflights, writeVm, bind, request }
+  return { project, cfg, accountQuota, pool, nodes, preflights, preflightOptions, writeVm, bind, request }
 }
 
 for (const [occupiedNode, targetNode] of [
@@ -137,6 +139,50 @@ for (const [occupiedNode, targetNode] of [
     assert.equal(getVm(f.project, 'vm-overflow'), null, 'capacity rejection must happen before creating the VM')
   })
 }
+
+test('remote KVM creation keeps node local capacity and forwards runtime to preflight', async (t) => {
+  const f = fixture(t, { bindLimit: 1 })
+  f.writeVm('vm-control')
+  f.bind('vm-control')
+
+  const created = await f.request('POST', '/api/panel/vms/create', {
+    id: 'vm-kvm',
+    node_id: 'node-a',
+    proxy_id: 'px-local',
+    kernel: 'ubuntu-24.04',
+    runtime_type: 'kvm',
+    machine: { memory: '4g', vcpus: 4, disk_gb: 40 },
+    locale: 'ja_JP.UTF-8',
+    timezone: 'Asia/Tokyo',
+    start: false,
+  })
+
+  assert.equal(created.status, 200, JSON.stringify(created.body))
+  assert.equal(created.body.data.proxy_error, undefined)
+  assert.deepEqual(f.preflights, ['node-a'])
+  assert.deepEqual(f.preflightOptions, [{ kernel: 'ubuntu-24.04', runtime: 'kvm' }])
+  const saved = getVm(f.project, 'vm-kvm')
+  assert.equal(saved.node_id, 'node-a')
+  assert.equal(saved.runtime.type, 'kvm')
+  assert.equal(saved.machine.memory, '4g')
+  assert.equal(saved.machine.vcpus, 4)
+  assert.equal(saved.machine.disk_gb, 40)
+  assert.equal(saved.locale, 'ja_JP.UTF-8')
+  assert.equal(saved.fingerprint.locale, 'ja_JP.UTF-8')
+  assert.equal(saved.proxy.id, 'px-local')
+  assert.equal(created.body.data.vm.runtime_type, 'kvm')
+  assert.deepEqual(created.body.data.vm.machine, saved.machine)
+  const allocated = created.body.data.allocated_proxy
+  assert.equal(allocated.node_id, 'node-a')
+  assert.equal(allocated.bound_count, 1)
+  assert.equal(allocated.bind_limit, 1)
+  assert.deepEqual(allocated.bound_vm_ids, ['vm-kvm'])
+  const control = f.pool.snapshot({ nodeId: null }).proxies.find((proxy) => proxy.id === 'px-local')
+  assert.equal(control.bound_count, 1)
+  assert.equal(control.bind_limit, 1)
+  assert.deepEqual(control.bound_vm_ids, ['vm-control'])
+  assert.equal(f.pool.getProxyForVm('vm-control').id, 'px-local')
+})
 
 test('a bind request cannot use a different local scope from the VM placement', async (t) => {
   const f = fixture(t)

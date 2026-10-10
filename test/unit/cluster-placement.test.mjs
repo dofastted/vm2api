@@ -277,6 +277,9 @@ test('slot image tag follows payload bytes only; a VERSION bump keeps the image'
 
   const a = slotImageSpec(root, 'ubuntu-24.04')
   assert.match(a.ref, /^vm2api\/kin-slot-ubuntu-24\.04:[0-9a-f]{12}$/)
+  const kvm = slotImageSpec(root, 'ubuntu-24.04', { runtime: 'kvm' })
+  assert.match(kvm.ref, /^vm2api\/kin-slot-kvm-ubuntu-24\.04:[0-9a-f]{12}$/)
+  assert.notEqual(kvm.ref, a.ref)
   fs.writeFileSync(path.join(root, 'VERSION'), '9.9.10\n')
   assert.equal(
     slotImageSpec(root, 'ubuntu-24.04').ref,

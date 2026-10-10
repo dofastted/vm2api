@@ -68,6 +68,7 @@ export type PreflightCheckId =
   | 'image'
   | 'hostd'
   | 'relay'
+  | 'kvm'
 
 /** `ok:false` + `level:'error'` 阻断创建；`warn` 只提示。 */
 export type PreflightCheck = {
@@ -170,6 +171,12 @@ export type ClusterLocalStatus = {
     running: number | null
     containers: number | null
     slots: number | null
+    error: string | null
+  }
+  /** 本机 KVM 能力。面板非 admin 可能 403，调用方按未知处理。 */
+  kvm?: {
+    ok: boolean
+    accel: 'kvm' | 'tcg' | null
     error: string | null
   }
 }

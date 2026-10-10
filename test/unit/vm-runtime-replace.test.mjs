@@ -12,6 +12,8 @@ import {
   isSlotProxyDesynced,
   reloadSlotWorker,
   slotKernelAlive,
+  writeWorkerFiles,
+  startVmRuntime,
 } from '../../src/lib/vm/vm-runtime.mjs'
 
 const running = { running: true, networkMode: 'host', image: 'kin-os/ubuntu:24.04' }
@@ -40,6 +42,39 @@ test('stopped slot is replaced only when net or image is wrong', () => {
   assert.equal(
     shouldReplaceSlotContainer({ existing: stopped, recreate: false, network: 'host', image: 'other' }),
     true,
+  )
+})
+
+test('stopped slot is replaced when runtime kind changes', () => {
+  assert.equal(
+    shouldReplaceSlotContainer({
+      existing: stopped,
+      recreate: false,
+      network: 'host',
+      image: stopped.image,
+      runtime: 'docker',
+    }),
+    false,
+  )
+  assert.equal(
+    shouldReplaceSlotContainer({
+      existing: stopped,
+      recreate: false,
+      network: 'host',
+      image: stopped.image,
+      runtime: 'kvm',
+    }),
+    true,
+  )
+  assert.equal(
+    shouldReplaceSlotContainer({
+      existing: { ...stopped, runtime: 'kvm' },
+      recreate: false,
+      network: 'host',
+      image: stopped.image,
+      runtime: 'kvm',
+    }),
+    false,
   )
 })
 
@@ -133,4 +168,42 @@ test('a running slot with a bound kernel.sock is live even though worker.sock ne
   assert.equal(slotKernelAlive({ running: true }, paths), true, 'reload must restart, not docker rm -f')
   assert.equal(slotKernelAlive({ running: false }, paths), true)
   assert.equal(slotKernelAlive(null, paths), true)
+})
+
+test('a running kvm runner is live even without the relay socket', (t) => {
+  const runDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kvm-alive-'))
+  t.after(() => fs.rmSync(runDir, { recursive: true, force: true }))
+  const paths = { socket: path.join(runDir, 'worker.sock'), kernelSocket: path.join(runDir, 'kernel.sock') }
+  const kvm = { id: 'vm-01', runtime: { type: 'kvm' } }
+  assert.equal(slotKernelAlive({ running: true }, paths, kvm), true)
+  assert.equal(slotKernelAlive({ running: true, runtime: 'kvm' }, paths), true)
+})
+
+test('writeWorkerFiles and startVmRuntime use defaults when routing.json is absent', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-no-routing-'))
+  const prev = process.env.KIN_ROUTING_FILE
+  delete process.env.KIN_ROUTING_FILE
+  try {
+    const vm = {
+      id: 'vm-09',
+      proxy_cli_enabled: true,
+      proxy: { id: 'px-local', scheme: 'local', host: 'local', port: 0, url: null },
+    }
+    const paths = writeWorkerFiles(vm, root, { transparent: true })
+    assert.ok(fs.existsSync(paths.config))
+    let thrown = null
+    let result
+    try {
+      result = startVmRuntime(vm, root)
+    } catch (error) {
+      thrown = error
+    }
+    assert.equal(thrown, null)
+    assert.ok(result)
+    assert.equal(/Routing config/.test(String(result?.error || '')), false)
+  } finally {
+    if (prev !== undefined) process.env.KIN_ROUTING_FILE = prev
+    else delete process.env.KIN_ROUTING_FILE
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })

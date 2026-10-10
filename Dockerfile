@@ -12,6 +12,7 @@ COPY src ./src
 COPY scripts ./scripts
 COPY VERSION CHANGELOG.md ./
 COPY docker/kin-os ./docker/kin-os
+COPY docker/kin-kvm ./docker/kin-kvm
 COPY web/dist ./web/dist
 COPY bin/kin-kernel bin/kin-egress bin/kin-worker bin/kin-codex-kernel bin/kin-oauth-auth /opt/vm2api/image-bin/
 COPY share/wrap-cli /opt/vm2api/image-wrap-cli

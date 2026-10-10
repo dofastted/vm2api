@@ -3,7 +3,15 @@ import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import { panelIdentity } from './panel-acl.mjs'
 import { canUserDeleteVm, normalizeOwnerId, proxyOwnerId, vmOwnerId } from './resource-owner.mjs'
 
-const VM_COLLECTION = new Set(['create', 'import', 'package', 'fleet-status', 'fleet-update', 'reconcile-fingerprints'])
+const VM_COLLECTION = new Set([
+  'create',
+  'create-options',
+  'import',
+  'package',
+  'fleet-status',
+  'fleet-update',
+  'reconcile-fingerprints',
+])
 
 export function panelVmIdFromPath(path) {
   const m = String(path || '').match(/^\/api\/panel\/vms\/([^/]+)/)

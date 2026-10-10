@@ -23,6 +23,7 @@ import {
 import { StatusMark } from '@/components/status-mark'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
 import { NodeChip } from '@/features/vm/node-chip'
+import { RuntimeChip } from '@/features/vm/runtime-chip'
 import {
   SchedulableSwitch,
   vmSchedulableProps,
@@ -84,6 +85,7 @@ function VmCard({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
               compact
               className='min-w-0 flex-1 font-[590]'
             />
+            <RuntimeChip vm={vm} />
             <NodeChip nodeId={vm.node_id} />
             <CredLaneChip vm={vm} />
           </div>

@@ -11,6 +11,7 @@ export const PANEL_VIEWS = [
   'cluster',
   'vm',
   'import',
+  'specs',
   'usage',
   'proxies',
   'models',
@@ -88,6 +89,7 @@ export function panelIdentity(req) {
 const USER_EXACT_GET = new Set([
   '/api/panel/me',
   '/api/panel/vms',
+  '/api/panel/vms/create-options',
   '/api/panel/pool/stream',
   '/api/panel/proxies',
   '/api/panel/proxies/config',
@@ -103,6 +105,7 @@ const USER_EXACT_POST = new Set(['/api/panel/vms/create', '/api/panel/vms/import
 const USER_VM_DENIED = new Set([
   'fleet-status',
   'fleet-update',
+  'create-options',
   'reconcile-fingerprints',
   'official-cc-bootstrap',
   'wrap-cli',
@@ -135,7 +138,7 @@ const LOG_STATS_GET = new Set([
 ])
 
 function isSuperVmRead(path) {
-  if (path === '/api/panel/vms/fleet-status') return false
+  if (path === '/api/panel/vms/fleet-status' || path === '/api/panel/vms/create-options') return false
   return /^\/api\/panel\/vms\/[^/]+$/.test(path)
 }
 

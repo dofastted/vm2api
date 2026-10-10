@@ -300,12 +300,17 @@ export async function createAndStartContainer(connect, input) {
   return { id, name: spec.name, image: spec.image }
 }
 
-export async function containerAction(connect, id, action) {
+export async function containerAction(connect, id, action, { t } = {}) {
   if (!['start', 'stop', 'restart'].includes(action)) {
     throw new ClusterError(400, 'invalid_action', '不支持的容器操作')
   }
   // 304 = already in the requested state; treat as success.
-  await dockerJson(connect, { method: 'POST', path: `${containerPath(id)}/${action}`, timeoutMs: 60_000 }, [204, 304])
+  const q = action === 'stop' && Number.isFinite(Number(t)) ? `?t=${Math.max(0, Number(t))}` : ''
+  await dockerJson(
+    connect,
+    { method: 'POST', path: `${containerPath(id)}/${action}${q}`, timeoutMs: 60_000 },
+    [204, 304],
+  )
 }
 
 export async function removeContainer(connect, id) {

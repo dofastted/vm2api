@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import path from 'node:path'
-import { containerName } from '../vm/vm-runtime.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { slotExecArgv } from '../vm/slot-exec.mjs'
 
 const WORKER_CONFIG = '/run/kin/worker.json'
 const WORKER_BIN = '/usr/local/bin/kin-worker'
@@ -97,8 +97,9 @@ export async function runSlotOauth(
   if (!OPS.has(op)) return failure('worker_op_invalid', `unsupported oauth operation: ${op}`)
 
   const host = slotHost(exec?.vm)
-  const user = host.execUser({ ...exec?.vm, id: exec?.vmId || exec?.vm?.id })
-  const argv = ['exec', '-i', '-u', user, containerName(exec?.vmId), WORKER_BIN, 'oauth', op, '--config', WORKER_CONFIG]
+  const vm = { ...(exec?.vm || {}), id: exec?.vmId || exec?.vm?.id }
+  const user = host.execUser(vm)
+  const argv = slotExecArgv(vm, [WORKER_BIN, 'oauth', op, '--config', WORKER_CONFIG], { interactive: true, user })
   if (force) argv.push('--force')
 
   const stdin =

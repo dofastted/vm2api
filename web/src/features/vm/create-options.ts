@@ -45,54 +45,6 @@ export function kernelProfile(id?: string | null): KernelProfile | null {
   return { id: k, name: k, base: '', size: '', feats: ['自定义内核'] }
 }
 
-/** 创建槽位的模板预设，与 index.html `VM_TEMPLATES` 一致。 */
-export const VM_TEMPLATES = [
-  {
-    id: 'std-ubuntu',
-    name: '标准 Ubuntu',
-    kernel: 'ubuntu-24.04',
-    after: 'start',
-    region: 'us-west',
-    tz: 'America/Los_Angeles',
-    locale: 'en_US.UTF-8',
-    conc: 2,
-    weight: 1,
-  },
-  {
-    id: 'std-debian',
-    name: '标准 Debian',
-    kernel: 'debian-12',
-    after: 'start',
-    region: 'us-east',
-    tz: 'America/New_York',
-    locale: 'en_US.UTF-8',
-    conc: 2,
-    weight: 1,
-  },
-  {
-    id: 'std-arch',
-    name: '标准 Arch',
-    kernel: 'archlinux',
-    after: 'start',
-    region: 'us-central',
-    tz: 'America/Chicago',
-    locale: 'en_US.UTF-8',
-    conc: 2,
-    weight: 1,
-  },
-  {
-    id: 'std-fedora',
-    name: '标准 Fedora',
-    kernel: 'fedora-41',
-    after: 'start',
-    region: 'us-west',
-    tz: 'America/Denver',
-    locale: 'en_US.UTF-8',
-    conc: 2,
-    weight: 1,
-  },
-] as const
-
 /**
  * 「自动选区」的哨兵值。不能直接用空串：Radix `Select` 把 `value === ''` 当作
  * 「未选中」并渲染 placeholder，空串选项永远无法在 trigger 上显示出文案。
@@ -100,12 +52,7 @@ export const VM_TEMPLATES = [
  */
 export const VM_REGION_AUTO = 'auto'
 
-/**
- * 创建槽位「高级」区的区域选项。
- * `us-central` 是 `VM_TEMPLATES.std-arch` 的预设值，index.html 的下拉里漏了它
- * （原生 select 会静默退回首项显示「自动」却仍提交 us-central），这里补齐，
- * 否则选中 Arch 模板后区域框会显示空白。
- */
+/** 创建槽位「环境」区的区域标签。只是写进槽位的地区标签，不影响出口。 */
 export const VM_REGIONS: [string, string][] = [
   [VM_REGION_AUTO, '自动'],
   ['us-west', '美西'],
@@ -162,9 +109,6 @@ export const VM_LOCALES: [string, string][] = [
   ['ja_JP.UTF-8', '日本語'],
   ['C.UTF-8', 'C'],
 ]
-
-export const VM_CONCURRENCY_OPTIONS = [1, 2, 4, 8, 16, 20, 32]
-export const VM_WEIGHT_OPTIONS = [1, 2, 3, 5]
 
 /** 创建槽位「之后」的 5 档，决定 start / auto_allocate_proxy / activate 三个布尔。 */
 export const VM_CREATE_AFTER: [string, string][] = [

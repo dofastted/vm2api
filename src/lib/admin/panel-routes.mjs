@@ -175,6 +175,9 @@ import {
 import { recreateVmFiles, seedFreshCliHome } from '../vm/vm-recreate.mjs'
 import { commitVmPackage, exportVmPackage, parseVmPackage } from '../vm/vm-package.mjs'
 import { preflightNode } from '../cluster/placement.mjs'
+import { probeLocalKvm } from '../vm/kvm-host.mjs'
+import { normalizeVmConfig, resolveMachineSpec, validateVmConfigPatch } from '../vm/machine-spec.mjs'
+import { RUNTIME_KVM } from '../vm/runtime-kind.mjs'
 import { hostProxyUrlForVm, slotHost } from '../vm/slot-host.mjs'
 import { syncIpv6ProxyEgress } from '../vm/proxy-policy-runtime.mjs'
 import { writeSlotSeedFiles } from '../vm/slot-seed.mjs'
@@ -192,6 +195,7 @@ import { personaPreviewVars } from '../identity/crs-persona.mjs'
 import {
   applyGeneratedFingerprint,
   generateWorkstationFingerprint,
+  SLOT_LOCALES,
   takenFingerprintKeys,
   writeGuestMachineIdFile,
 } from '../identity/workstation-fingerprint.mjs'
@@ -1746,6 +1750,19 @@ export function createPanelHandler(ctx) {
       if (req.method === 'GET' && p === '/api/panel/vms/fleet-status') {
         return json(res, 200, panel.ok({ items: fleetStatus(cfg.paths.project) }))
       }
+      // GET /api/panel/vms/create-options — same ACL as POST /vms/create; tenants cannot read cluster/local
+      if (req.method === 'GET' && p === '/api/panel/vms/create-options') {
+        const probe = typeof ctx.probeLocalKvm === 'function' ? ctx.probeLocalKvm : probeLocalKvm
+        const kvm = await probe({ routing: ctx.routingConfig })
+        return json(
+          res,
+          200,
+          panel.ok({
+            vm: normalizeVmConfig(ctx.routingConfig?.vm),
+            kvm,
+          }),
+        )
+      }
       // POST /api/panel/vms/fleet-update
       if (req.method === 'POST' && p === '/api/panel/vms/reconcile-fingerprints') {
         return json(res, 200, panel.ok(reconcileOfficialFingerprints(cfg.paths.project)))
@@ -2959,6 +2976,37 @@ export function createPanelHandler(ctx) {
         const startNow = body.start !== false && body.status !== 'stopped'
         const wantKernel = body.kernel && OS_CATALOG[body.kernel] ? body.kernel : kernelForIndex(idx)
         const nodeId = body.node_id ? String(body.node_id) : null
+        const vmDefaults = normalizeVmConfig(ctx.routingConfig?.vm)
+        const requestedRuntime = body.runtime_type
+        let runtime
+        if (requestedRuntime == null || requestedRuntime === '') {
+          runtime = vmDefaults.default_runtime
+        } else {
+          const kind = String(requestedRuntime).trim().toLowerCase()
+          if (kind !== 'docker' && kind !== 'kvm') {
+            return json(res, 400, {
+              ok: false,
+              error: {
+                type: 'invalid_request_error',
+                code: 'invalid_runtime_type',
+                message: 'runtime_type 必须是 docker 或 kvm',
+              },
+            })
+          }
+          runtime = kind
+        }
+        let machine
+        try {
+          machine = resolveMachineSpec({ config: vmDefaults, overrides: body.machine, runtime })
+        } catch (error) {
+          if (error?.status === 400 || error?.code === 'invalid_machine') {
+            return json(res, 400, {
+              ok: false,
+              error: { type: 'invalid_request_error', code: 'invalid_machine', message: error.message },
+            })
+          }
+          throw error
+        }
         if (nodeId) {
           if (ident.role !== 'admin') {
             return json(res, 403, {
@@ -2976,7 +3024,7 @@ export function createPanelHandler(ctx) {
           }
           let preflight
           try {
-            preflight = await (ctx.preflightNode || preflightNode)(nodeId, { kernel: wantKernel })
+            preflight = await (ctx.preflightNode || preflightNode)(nodeId, { kernel: wantKernel, runtime })
           } catch (e) {
             return json(res, e?.status || 500, {
               ok: false,
@@ -3013,9 +3061,26 @@ export function createPanelHandler(ctx) {
             })
           }
         }
+        if (runtime === RUNTIME_KVM && !nodeId) {
+          const probe = typeof ctx.probeLocalKvm === 'function' ? ctx.probeLocalKvm : probeLocalKvm
+          const kvm = await probe({ routing: ctx.routingConfig })
+          if (!kvm?.ok) {
+            return json(res, 409, {
+              ok: false,
+              error: { code: 'kvm_unavailable', message: kvm?.error || '本机 KVM 不可用' },
+            })
+          }
+        }
         const requestedTimezone = validTimezone(body.timezone)
+        const requestedLocale = body.locale == null || body.locale === '' ? STANDARD_LOCALE : String(body.locale)
+        if (!SLOT_LOCALES.includes(requestedLocale)) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'invalid_locale', message: `语言必须是 ${SLOT_LOCALES.join('、')}` },
+          })
+        }
         const generated = generateWorkstationFingerprint(
-          { id, kernel: wantKernel, timezone: requestedTimezone, locale: STANDARD_LOCALE },
+          { id, kernel: wantKernel, timezone: requestedTimezone, locale: requestedLocale },
           { taken: takenFingerprintKeys(existing) },
         )
         const vm = {
@@ -3051,7 +3116,8 @@ export function createPanelHandler(ctx) {
           proxy_cli_enabled: body.proxy_cli_enabled === true,
           proxy_required: false,
           seed_policy: standardSeedPolicy(),
-          runtime: { type: body.runtime_type === 'kvm' ? 'kvm' : 'docker' },
+          runtime: { type: runtime },
+          machine,
         }
         if (ident.role === 'user') {
           vm.owner_user_id = normalizeOwnerId(req.panelUserId)
@@ -3163,7 +3229,12 @@ export function createPanelHandler(ctx) {
         }
         let startError = null
         if (startNow && hasExit(vm)) {
-          const boot = await startSlotReady(vm, cfg.paths.project, { routing: ctx.routingConfig })
+          let boot
+          try {
+            boot = await startSlotReady(vm, cfg.paths.project, { routing: ctx.routingConfig })
+          } catch (e) {
+            boot = { ok: false, error: String(e?.message || e) }
+          }
           if (!boot.ok) {
             // Slot JSON is already on disk. 500 here makes the console treat
             // create as a no-op, so the new row never refetches into the list.
@@ -4046,6 +4117,15 @@ export function createPanelHandler(ctx) {
             })
           }
           throw error
+        }
+        if (body && Object.prototype.hasOwnProperty.call(body, 'vm')) {
+          const checked = validateVmConfigPatch(body.vm)
+          if (!checked.ok) {
+            return json(res, 400, {
+              ok: false,
+              error: { type: 'invalid_request_error', code: 'invalid_vm_config', message: checked.error },
+            })
+          }
         }
         const personaProblems = [...panel.validatePersonaRoutingPatch(body), ...validateInferenceRoutingPatch(body)]
         if (personaProblems.length) {

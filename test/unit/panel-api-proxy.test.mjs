@@ -113,6 +113,32 @@ test('dashboard and vm detail merge pool health onto bound VM', async () => {
   assert.equal(detail.data.proxy_pool.bound, 1)
 })
 
+test('dashboard and vm list report the slot form and fixed machine spec', async () => {
+  const project = tmpDir()
+  fs.mkdirSync(path.join(project, 'data'), { recursive: true })
+  const machine = { memory: '2g', vcpus: 4, disk_gb: 40 }
+  writeVm(project, { id: 'vm-kvm', status: 'stopped', runtime: { type: 'kvm' }, machine, claude: {} })
+  writeVm(project, { id: 'vm-old', status: 'stopped', claude: {} })
+  const cfg = { paths: { project }, rewrite: { enabled: false }, base_url: 'http://127.0.0.1' }
+  const quota = fakeQuota()
+  const dash = await buildDashboard({
+    cfg,
+    accountQuota: quota,
+    stickyRouter: { stats: () => ({ active_sessions: 0 }) },
+    routingConfig: {},
+    stats: {},
+  })
+  const listed = await buildVmList({ cfg, accountQuota: quota, routingConfig: {} })
+  for (const items of [dash.data.vms, listed.data.items]) {
+    const kvm = items.find((item) => item.id === 'vm-kvm')
+    assert.equal(kvm.runtime_type, 'kvm')
+    assert.deepEqual(kvm.machine, machine)
+    const old = items.find((item) => item.id === 'vm-old')
+    assert.equal(old.runtime_type, 'docker', 'slots without runtime predate KVM and are containers')
+    assert.equal(old.machine, null)
+  }
+})
+
 test('dead bound proxy blocks credential import', async () => {
   const project = tmpDir()
   const dataDir = path.join(project, 'data')

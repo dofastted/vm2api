@@ -1,0 +1,19 @@
+#cloud-config
+# SSH key and first-boot install only. Per-boot identity/mounts are
+# kin-guest-setup.service (instance-id is stable per overlay, so this
+# datasource runs once).
+hostname: {{HOSTNAME}}
+manage_etc_hosts: true
+fqdn: {{HOSTNAME}}
+disable_root: false
+ssh_pwauth: false
+users:
+  - name: root
+    lock_passwd: true
+    ssh_authorized_keys:
+      - {{SSH_PUBKEY}}
+ssh_authorized_keys:
+  - {{SSH_PUBKEY}}
+ssh_deletekeys: false
+runcmd:
+  - [sh, -c, "set -e; mkdir -p /mnt/cidata; if [ -e /dev/disk/by-label/cidata ]; then mount -o ro /dev/disk/by-label/cidata /mnt/cidata; elif [ -e /dev/sr0 ]; then mount -o ro /dev/sr0 /mnt/cidata; elif [ -e /dev/cdrom ]; then mount -o ro /dev/cdrom /mnt/cidata; fi; exec sh /mnt/cidata/install-guest.sh"]

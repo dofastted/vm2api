@@ -7,6 +7,7 @@ import type {
   NodePreflight,
   SlotImageJob,
 } from '@/types/panel-cluster'
+import type { RuntimeType } from '@/types/panel-vm'
 import { api } from '@/lib/api'
 
 export const CLUSTER_NODES_KEY = ['panel', 'cluster', 'nodes'] as const
@@ -68,11 +69,25 @@ function nodePath(nodeId: string) {
  * 放置预检。服务端是 POST（要实际 SSH 过去跑检查），但语义是只读观测，
  * 按 节点 + 内核 缓存成 query；不自动轮询，由调用方手动 refetch。
  */
-export function nodePreflightQueryOptions(nodeId: string, kernel: string) {
+export function nodePreflightQueryOptions(
+  nodeId: string,
+  kernel: string,
+  runtimeType: RuntimeType = 'docker'
+) {
   return queryOptions({
-    queryKey: ['panel', 'cluster', nodeId, 'preflight', kernel] as const,
+    queryKey: [
+      'panel',
+      'cluster',
+      nodeId,
+      'preflight',
+      kernel,
+      runtimeType,
+    ] as const,
     queryFn: () =>
-      api<NodePreflight>(`${nodePath(nodeId)}/preflight`, jsonBody({ kernel })),
+      api<NodePreflight>(
+        `${nodePath(nodeId)}/preflight`,
+        jsonBody({ kernel, runtime_type: runtimeType })
+      ),
     enabled: !!nodeId && !!kernel,
     staleTime: 0,
     refetchOnWindowFocus: false,
@@ -100,10 +115,14 @@ export function slotImageJobQueryOptions(
   })
 }
 
-export function startSlotImageBuild(nodeId: string, kernel: string) {
+export function startSlotImageBuild(
+  nodeId: string,
+  kernel: string,
+  runtimeType: RuntimeType = 'docker'
+) {
   return api<SlotImageJob>(
     `${nodePath(nodeId)}/slot-image`,
-    jsonBody({ kernel })
+    jsonBody({ kernel, runtime_type: runtimeType })
   )
 }
 

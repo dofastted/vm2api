@@ -23,6 +23,7 @@ import { Route as AuthenticatedModelsRouteImport } from './routes/_authenticated
 import { Route as AuthenticatedOverviewRouteImport } from './routes/_authenticated/overview'
 import { Route as AuthenticatedProxiesRouteImport } from './routes/_authenticated/proxies'
 import { Route as AuthenticatedRiskRouteImport } from './routes/_authenticated/risk'
+import { Route as AuthenticatedSpecsRouteImport } from './routes/_authenticated/specs'
 import { Route as AuthenticatedStatisticsRouteImport } from './routes/_authenticated/statistics'
 import { Route as AuthenticatedSystemRouteImport } from './routes/_authenticated/system'
 import { Route as AuthenticatedUsageRouteImport } from './routes/_authenticated/usage'
@@ -102,6 +103,11 @@ const AuthenticatedRiskRoute = AuthenticatedRiskRouteImport.update({
   path: '/risk',
   getParentRoute: () => AuthenticatedRouteRoute,
 } as any)
+const AuthenticatedSpecsRoute = AuthenticatedSpecsRouteImport.update({
+  id: '/specs',
+  path: '/specs',
+  getParentRoute: () => AuthenticatedRouteRoute,
+} as any)
 const AuthenticatedStatisticsRoute = AuthenticatedStatisticsRouteImport.update({
   id: '/statistics',
   path: '/statistics',
@@ -164,6 +170,7 @@ export interface FileRoutesByFullPath {
   '/overview': typeof AuthenticatedOverviewRoute
   '/proxies': typeof AuthenticatedProxiesRoute
   '/risk': typeof AuthenticatedRiskRoute
+  '/specs': typeof AuthenticatedSpecsRoute
   '/statistics': typeof AuthenticatedStatisticsRoute
   '/system': typeof AuthenticatedSystemRoute
   '/usage': typeof AuthenticatedUsageRoute
@@ -187,6 +194,7 @@ export interface FileRoutesByTo {
   '/overview': typeof AuthenticatedOverviewRoute
   '/proxies': typeof AuthenticatedProxiesRoute
   '/risk': typeof AuthenticatedRiskRoute
+  '/specs': typeof AuthenticatedSpecsRoute
   '/statistics': typeof AuthenticatedStatisticsRoute
   '/system': typeof AuthenticatedSystemRoute
   '/usage': typeof AuthenticatedUsageRoute
@@ -213,6 +221,7 @@ export interface FileRoutesById {
   '/_authenticated/overview': typeof AuthenticatedOverviewRoute
   '/_authenticated/proxies': typeof AuthenticatedProxiesRoute
   '/_authenticated/risk': typeof AuthenticatedRiskRoute
+  '/_authenticated/specs': typeof AuthenticatedSpecsRoute
   '/_authenticated/statistics': typeof AuthenticatedStatisticsRoute
   '/_authenticated/system': typeof AuthenticatedSystemRoute
   '/_authenticated/usage': typeof AuthenticatedUsageRoute
@@ -240,6 +249,7 @@ export interface FileRouteTypes {
     | '/overview'
     | '/proxies'
     | '/risk'
+    | '/specs'
     | '/statistics'
     | '/system'
     | '/usage'
@@ -263,6 +273,7 @@ export interface FileRouteTypes {
     | '/overview'
     | '/proxies'
     | '/risk'
+    | '/specs'
     | '/statistics'
     | '/system'
     | '/usage'
@@ -288,6 +299,7 @@ export interface FileRouteTypes {
     | '/_authenticated/overview'
     | '/_authenticated/proxies'
     | '/_authenticated/risk'
+    | '/_authenticated/specs'
     | '/_authenticated/statistics'
     | '/_authenticated/system'
     | '/_authenticated/usage'
@@ -405,6 +417,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedRiskRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
+    '/_authenticated/specs': {
+      id: '/_authenticated/specs'
+      path: '/specs'
+      fullPath: '/specs'
+      preLoaderRoute: typeof AuthenticatedSpecsRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
     '/_authenticated/statistics': {
       id: '/_authenticated/statistics'
       path: '/statistics'
@@ -483,6 +502,7 @@ interface AuthenticatedRouteRouteChildren {
   AuthenticatedOverviewRoute: typeof AuthenticatedOverviewRoute
   AuthenticatedProxiesRoute: typeof AuthenticatedProxiesRoute
   AuthenticatedRiskRoute: typeof AuthenticatedRiskRoute
+  AuthenticatedSpecsRoute: typeof AuthenticatedSpecsRoute
   AuthenticatedStatisticsRoute: typeof AuthenticatedStatisticsRoute
   AuthenticatedSystemRoute: typeof AuthenticatedSystemRoute
   AuthenticatedUsageRoute: typeof AuthenticatedUsageRoute
@@ -507,6 +527,7 @@ const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedOverviewRoute: AuthenticatedOverviewRoute,
   AuthenticatedProxiesRoute: AuthenticatedProxiesRoute,
   AuthenticatedRiskRoute: AuthenticatedRiskRoute,
+  AuthenticatedSpecsRoute: AuthenticatedSpecsRoute,
   AuthenticatedStatisticsRoute: AuthenticatedStatisticsRoute,
   AuthenticatedSystemRoute: AuthenticatedSystemRoute,
   AuthenticatedUsageRoute: AuthenticatedUsageRoute,

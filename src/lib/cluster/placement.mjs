@@ -13,9 +13,12 @@
  * the bridge is served by this same event loop. Remote lifecycle uses the Engine API.
  */
 
+import fs from 'node:fs'
 import { Transform } from 'node:stream'
 import { slotRuntimeOwner } from '../oauth/oauth-credentials.mjs'
-import { SLOT_MEMORY } from '../vm/vm-runtime.mjs'
+import { routingConfigFile } from '../core/config.mjs'
+import { normalizeVmConfig, slotMemory } from '../vm/machine-spec.mjs'
+import { runtimeKind } from '../vm/runtime-kind.mjs'
 import { buildImage, dockerInfo, imagePresent, sshDocker } from './docker-remote.mjs'
 import { runRemote, shellQuote } from './remote-fs.mjs'
 import { slotBuildContext, slotImageSpec } from './slot-image.mjs'
@@ -26,8 +29,8 @@ const IMAGE_LOG_MAX = 64 * 1024
 
 let bound = null
 
-export function bindPlacement({ manager, projectRoot }) {
-  bound = { manager, projectRoot }
+export function bindPlacement({ manager, projectRoot, getRouting }) {
+  bound = { manager, projectRoot, getRouting }
 }
 
 export function unbindPlacement() {
@@ -92,8 +95,30 @@ const imageJobs = new Map()
 // Completion per running job; kept off the job object because the job is the API payload.
 const imageJobDone = new WeakMap()
 
-export function slotImageJob(nodeId, kernel) {
-  return imageJobs.get(`${nodeId}:${kernel}`) || null
+function imageJobKey(nodeId, kernel, runtime) {
+  const kind = runtimeKind({ runtime_type: runtime })
+  return kind === 'kvm' ? `${nodeId}:${kernel}:kvm` : `${nodeId}:${kernel}`
+}
+
+function placementRouting() {
+  if (typeof bound?.getRouting === 'function') {
+    try {
+      return bound.getRouting()
+    } catch {
+      /* fall through to the on-disk file */
+    }
+  }
+  const root = bound?.projectRoot
+  if (!root) return null
+  try {
+    return JSON.parse(fs.readFileSync(routingConfigFile(root), 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+export function slotImageJob(nodeId, kernel, runtime) {
+  return imageJobs.get(imageJobKey(nodeId, kernel, runtime)) || null
 }
 
 /** Resolves when the node's running build for `kernel` ends; `{status}` is 'done' or 'failed'. */
@@ -105,11 +130,12 @@ export function awaitSlotImageBuild(job) {
  * Build the self-contained slot image on the node. One job per node+kernel;
  * a second call while running returns the running job.
  */
-export function startSlotImageBuild(nodeId, kernel) {
-  const key = `${nodeId}:${kernel}`
+export function startSlotImageBuild(nodeId, kernel, { runtime } = {}) {
+  const kind = runtimeKind({ runtime_type: runtime })
+  const key = imageJobKey(nodeId, kernel, kind)
   const current = imageJobs.get(key)
   if (current?.status === 'running') return current
-  const spec = slotImageSpec(state().projectRoot, kernel)
+  const spec = slotImageSpec(state().projectRoot, kernel, { runtime: kind })
   const client = clusterManager().client(nodeId)
   const job = {
     status: 'running',
@@ -165,18 +191,21 @@ export function startSlotImageBuild(nodeId, kernel) {
  * against the live node; error-level failures block creation, warn-level ones
  * are shown but do not.
  */
-export async function preflightNode(nodeId, { kernel }) {
+export async function preflightNode(nodeId, { kernel, runtime } = {}) {
   const { manager, projectRoot } = state()
+  const kind = runtimeKind({ runtime_type: runtime })
+  const routing = placementRouting()
+  const memStr = slotMemory(null, routing)
   const checks = []
   const add = (id, ok, level, message) => checks.push({ id, ok, level, message })
   let spec = null
   let specError = null
   try {
-    spec = slotImageSpec(projectRoot, kernel)
+    spec = slotImageSpec(projectRoot, kernel, { runtime: kind })
   } catch (err) {
     specError = err
   }
-  const image = { ref: spec?.ref || null, present: false, job: slotImageJob(nodeId, kernel) }
+  const image = { ref: spec?.ref || null, present: false, job: slotImageJob(nodeId, kernel, kind) }
   const result = () => ({
     node_id: nodeId,
     ok: !checks.some((c) => !c.ok && c.level === 'error'),
@@ -204,9 +233,23 @@ export async function preflightNode(nodeId, { kernel }) {
   if (info) {
     const arch = String(info.arch || '')
     add('arch', arch === 'x86_64' || arch === 'amd64', 'error', `架构 ${arch || '未知'}（槽位二进制只有 amd64）`)
-    const need = parseMemoryBytes(SLOT_MEMORY)
+    const need = parseMemoryBytes(memStr)
     const total = Number(info.mem_bytes) || 0
-    add('memory', total >= need, 'warn', `内存 ${gib(total)}，单槽上限 ${SLOT_MEMORY}`)
+    add('memory', total >= need, 'warn', `内存 ${gib(total)}，单槽上限 ${memStr}`)
+  }
+  if (kind === 'kvm') {
+    const allowTcg = normalizeVmConfig(routing?.vm).allow_tcg
+    try {
+      await runRemote(client, 'test -c /dev/kvm && test -r /dev/kvm && test -w /dev/kvm', { timeoutMs: 10_000 })
+      add('kvm', true, 'error', '节点 /dev/kvm 可用')
+    } catch {
+      add(
+        'kvm',
+        false,
+        allowTcg ? 'warn' : 'error',
+        allowTcg ? '节点无 /dev/kvm，将使用 TCG 软件模拟' : '节点没有可用的 /dev/kvm',
+      )
+    }
   }
   let host = null
   try {
@@ -248,7 +291,7 @@ export async function preflightNode(nodeId, { kernel }) {
     try {
       const kb = Number(await runRemote(client, `awk '/^SwapTotal:/{print $2}' /proc/meminfo`, { timeoutMs: 10_000 }))
       // Slots may swap up to their RAM cap; without host swap a small node fits few slots.
-      add('swap', kb * 1024 >= parseMemoryBytes(SLOT_MEMORY), 'warn', kb ? `Swap ${gib(kb * 1024)}` : '未开启 Swap')
+      add('swap', kb * 1024 >= parseMemoryBytes(memStr), 'warn', kb ? `Swap ${gib(kb * 1024)}` : '未开启 Swap')
     } catch (err) {
       add('swap', false, 'warn', `无法读取 Swap：${err.message}`)
     }

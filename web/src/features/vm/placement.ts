@@ -21,6 +21,7 @@ export const PREFLIGHT_CHECK_LABEL: Record<PreflightCheckId, string> = {
   image: '镜像',
   hostd: 'hostd',
   relay: '中继',
+  kvm: 'KVM',
 }
 
 export type PreflightMark = 'ok' | 'fail' | 'warn'

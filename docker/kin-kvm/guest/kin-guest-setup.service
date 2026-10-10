@@ -1,0 +1,15 @@
+[Unit]
+Description=kin guest per-boot setup (user, 9p, payload, identity)
+DefaultDependencies=no
+After=local-fs.target systemd-udev-settle.service
+Before=kin-kernel.service sshd.service ssh.service
+Wants=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/kin-guest-setup
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

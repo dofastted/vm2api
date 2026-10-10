@@ -1,7 +1,7 @@
 /**
  * Rolling update across all slots. Reloads the guest worker (new shared
  * binary) and/or collects guest identity. Never restarts kin-gateway.
- * Never docker rm. KVM slots use the same actions once the adapter exists.
+ * Never docker rm. KVM reloads the guest kernel unit, not the runner.
  */
 import { listVms, getVm } from './vm-registry.mjs'
 import { runtimeKind } from './runtime-kind.mjs'

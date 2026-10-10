@@ -36,6 +36,7 @@ const HINTS: Record<string, string> = {
   placement_preflight_failed: '目标节点预检未通过：按下方检查项修复后重试。',
   remote_unsupported:
     '远端节点暂不支持该操作（如 GPT / Codex 槽只能建在本机）。',
+  kvm_unavailable: '当前宿主或节点无法创建 KVM 虚拟机。',
 }
 
 export function importErrorMessage(error: unknown): string {

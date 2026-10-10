@@ -18,6 +18,8 @@ import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import { cacheTtlFromRouting, normalizeCacheTtl } from '../protocol/cache-ttl.mjs'
 import { setVmSchedulable, listVms, getVm } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
+import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
+import { slotExecArgv } from '../vm/slot-exec.mjs'
 import {
   CONTAINER_CLI_NODE_BIN,
   KERNEL_NATIVE_SLOT_COUNT,
@@ -35,6 +37,16 @@ import {
 import { slotHost } from '../vm/slot-host.mjs'
 
 const starts = new Map()
+const KVM_HEALTH_MS = { kvm: 120_000, tcg: 480_000 }
+
+function execArgv(exec, argv, opts) {
+  return slotExecArgv(exec?.vm || { id: exec?.vmId }, argv, opts)
+}
+
+function kvmBootBudget(vm, timeoutMs) {
+  const accel = vm?.runtime?.accel === 'kvm' ? 'kvm' : 'tcg'
+  return Math.max(Number(timeoutMs) || 0, KVM_HEALTH_MS[accel])
+}
 
 /** Bind the VM's docker daemon into an injectable runner. */
 function slotRunner(exec, run) {
@@ -116,7 +128,7 @@ export async function reconcileCliHopRuntime(exec, { runDockerExec = runDocker }
   const container = slotContainerName(exec)
   if (!container) return { ok: false, reason: 'missing' }
   const actions = []
-  await runDockerExec(['exec', container, 'kill', '-CHLD', '1'], { timeoutMs: 2000 })
+  await runDockerExec(execArgv(exec, ['kill', '-CHLD', '1']), { timeoutMs: 2000 })
   actions.push('reap_zombies')
   const root = projectRootFromExec(exec)
   const vmId = exec?.vmId || exec?.vm?.id
@@ -130,16 +142,15 @@ export async function reconcileCliHopRuntime(exec, { runDockerExec = runDocker }
 export function stopRustKernel(exec = {}) {
   const container = slotContainerName(exec)
   if (!container) return { ok: false, reason: 'container_missing' }
+  const env = slotHost(exec?.vm).dockerEnv()
   const result = spawnSync(
     process.env.KIN_DOCKER_BIN || 'docker',
-    [
-      'exec',
-      container,
+    execArgv(exec, [
       'sh',
       '-lc',
       'kill $(pidof kin-kernel) >/dev/null 2>&1 || true; kill $(pidof bun) >/dev/null 2>&1 || true',
-    ],
-    { encoding: 'utf8', timeout: 5000 },
+    ]),
+    { encoding: 'utf8', timeout: 5000, ...(env ? { env } : {}) },
   )
   return { ok: result.status === 0, code: result.status }
 }
@@ -198,16 +209,15 @@ async function waitForHealth(exec, timeoutMs) {
   return { ok: false, reason: 'health_timeout', health: last, error: last?.error || 'rust kernel health timeout' }
 }
 
-async function kernelProcessAlive(container, runDockerExec) {
+async function kernelProcessAlive(exec, runDockerExec) {
+  const container = slotContainerName(exec)
   if (!container) return false
   const result = await runDockerExec(
-    [
-      'exec',
-      container,
+    execArgv(exec, [
       'sh',
       '-c',
       'pgrep -f /home/kincli/.kin/kin-kernel.bin >/dev/null || pgrep -f /home/kincli/.kin/kin-kernel >/dev/null || pidof kin-kernel >/dev/null',
-    ],
+    ]),
     { timeoutMs: 1500 },
   )
   return result?.ok === true
@@ -222,9 +232,10 @@ async function waitForHealthOrExit(exec, { timeoutMs, container, runDockerExec, 
     if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
     last = await rustKernelHealth(exec, { timeoutMs: 400 })
     if (rustKernelReachable(last)) return { ok: true, reason: 'started_in_vm', health: last }
-    if (!checkedProcess && Date.now() - started >= 1200 && container) {
+    // KVM guest boot is minutes under TCG; a missing process at 1.2s is not failure.
+    if (!isKvmRuntime(exec?.vm) && !checkedProcess && Date.now() - started >= 1200 && container) {
       checkedProcess = true
-      const alive = await kernelProcessAlive(container, runDockerExec)
+      const alive = await kernelProcessAlive(exec, runDockerExec)
       if (!alive) {
         return {
           ok: false,
@@ -255,7 +266,8 @@ export async function ensureRustKernel(exec, { timeoutMs = 30000, runDockerExec 
   }
 }
 
-async function killWrapDataplane(container, runDockerExec) {
+async function killWrapDataplane(exec, runDockerExec) {
+  const container = slotContainerName(exec)
   if (!container) return
   // Match /proc/pid/exe, not pkill -f. The docker exec shell's own argv
   // contains these paths, so pkill -f signals that shell and can return
@@ -263,9 +275,7 @@ async function killWrapDataplane(container, runDockerExec) {
   // Under binfmt QEMU (ARM64 host, amd64 slot) exe is the emulator and the
   // real program is argv[1] (P flag), so identify the process by that.
   await runDockerExec(
-    [
-      'exec',
-      container,
+    execArgv(exec, [
       'sh',
       '-c',
       [
@@ -279,7 +289,7 @@ async function killWrapDataplane(container, runDockerExec) {
         'done',
         'true',
       ].join('\n'),
-    ],
+    ]),
     { timeoutMs: 3000 },
   )
 }
@@ -308,7 +318,7 @@ export function wrapNewerThanKernel(exec) {
 
 export async function restartRustKernel(exec, { timeoutMs = 30000, runDockerExec = runDocker } = {}) {
   const run = slotRunner(exec, runDockerExec)
-  await killWrapDataplane(slotContainerName(exec), run)
+  await killWrapDataplane(exec, run)
   const paths = rustKernelPaths(exec)
   // A relay socket path is not the kernel's file: removing it would cut the relay.
   try {
@@ -483,17 +493,51 @@ export async function recycleWrapIfIdle(
   return rec
 }
 
-async function containerKernelIsPid1(container, runDockerExec) {
+async function containerKernelIsPid1(container, runDockerExec, vm) {
+  if (isKvmRuntime(vm)) return false
   const info = await runDockerExec(['inspect', '--format', '{{.Path}}', container], { timeoutMs: 3000 })
   return /kin-kernel/.test(String(info?.stdout || ''))
 }
-
 function bootWaitMs(timeoutMs, { pid1Kernel, wedged }) {
   if (!pid1Kernel && !wedged) return 0
   const cap = WEDGED_READY_WAIT_MS
   const budget = Number(timeoutMs)
   if (Number.isFinite(budget) && budget > 0) return Math.min(budget, cap)
   return cap
+}
+
+async function startKvmGuestKernel(exec, { timeoutMs, control, runDockerExec, force, host, paths, container }) {
+  const budget = kvmBootBudget(exec.vm, timeoutMs)
+  if (!force) {
+    const waited = await waitForHealth(exec, budget)
+    if (waited?.ok) {
+      waited.reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
+      return waited
+    }
+  }
+  await killWrapDataplane(exec, runDockerExec)
+  const launched = await runDockerExec(execArgv(exec, ['systemctl', 'restart', 'kin-kernel.service'], { user: '0' }), {
+    timeoutMs: Math.min(budget, 30_000),
+  })
+  if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
+  if (!launched?.ok) {
+    const waited = await waitForHealth(exec, budget)
+    if (waited?.ok) {
+      waited.reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
+      return waited
+    }
+    const error = String(launched?.error || waited?.error || 'guest kernel restart failed')
+    return { ok: false, reason: 'health_timeout', error }
+  }
+  const started = await waitForHealthOrExit(exec, { timeoutMs: budget, container, runDockerExec, control })
+  if (started?.ok) {
+    started.reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
+    await runDockerExec(
+      execArgv(exec, ['/usr/local/bin/kin-worker', 'telemetry', '--config', '/run/kin/worker.json'], { detach: true }),
+      { timeoutMs: 5000 },
+    )
+  }
+  return started
 }
 
 async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force = false }) {
@@ -531,8 +575,11 @@ async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force 
   }
   const container = slotContainerName(exec)
   if (!container) return { ok: false, reason: 'container_missing' }
+  if (isKvmRuntime(exec?.vm)) {
+    return startKvmGuestKernel(exec, { timeoutMs, control, runDockerExec, force, host, paths, container })
+  }
   const wedged = rustKernelProcessUp(existing) && !rustKernelReachable(existing) && !occupied
-  const pid1Kernel = await containerKernelIsPid1(container, runDockerExec)
+  const pid1Kernel = await containerKernelIsPid1(container, runDockerExec, exec?.vm)
   const waitMs = force || staleWrap || slotMismatch ? 0 : bootWaitMs(timeoutMs, { pid1Kernel, wedged })
   if (waitMs > 0) {
     const waited = await waitForHealth(exec, waitMs)
@@ -544,23 +591,14 @@ async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force 
   try {
     if (host.ownsSocketFiles) fs.rmSync(paths.socketPath, { force: true })
   } catch {}
-  if (!pid1Kernel) await killWrapDataplane(container, runDockerExec)
+  if (!pid1Kernel) await killWrapDataplane(exec, runDockerExec)
   const launched = pid1Kernel
     ? await runDockerExec(['restart', container], { timeoutMs: Math.min(timeoutMs, 15000) })
     : await runDockerExec(
-        [
-          'exec',
-          '-d',
-          '-e',
-          'KIN_SUBMIT_WAIT_MS=30000',
-          '-e',
-          'KIN_SLOT_MAX_LIFETIME_SECS=604800',
-          container,
-          CONTAINER_KERNEL_BIN,
-          '--gateway-worker',
-          '--config',
-          CONTAINER_KERNEL_CONFIG,
-        ],
+        execArgv(exec, [CONTAINER_KERNEL_BIN, '--gateway-worker', '--config', CONTAINER_KERNEL_CONFIG], {
+          detach: true,
+          env: ['KIN_SUBMIT_WAIT_MS=30000', 'KIN_SLOT_MAX_LIFETIME_SECS=604800'],
+        }),
         { timeoutMs: Math.min(timeoutMs, 5000) },
       )
 
@@ -580,7 +618,9 @@ async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force 
     started.reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
     if (pid1Kernel) {
       await runDockerExec(
-        ['exec', '-d', container, '/usr/local/bin/kin-worker', 'telemetry', '--config', '/run/kin/worker.json'],
+        execArgv(exec, ['/usr/local/bin/kin-worker', 'telemetry', '--config', '/run/kin/worker.json'], {
+          detach: true,
+        }),
         { timeoutMs: 5000 },
       )
     }
@@ -650,9 +690,10 @@ export function writeKernelConfig(
   const previousIdleSeconds = Number(previous.idle_timeout_seconds)
   const idleMs = routing == null && previousIdleSeconds > 0 ? previousIdleSeconds * 1000 : streamIdleTimeoutMs(routing)
 
+  const kind = runtimeKind(record)
   const config = {
     vm_id: vm.id,
-    socket_path: '/run/kin/kernel.sock',
+    socket_path: kind === 'kvm' ? '/run/kin-guest/kernel.sock' : '/run/kin/kernel.sock',
     credential_path: '/home/kincli/.claude/credentials.json',
     proxy_url: '',
     proxy_required: false,
@@ -665,7 +706,7 @@ export function writeKernelConfig(
     max_request_bytes: 32 * 1024 * 1024,
     max_response_bytes: 64 * 1024 * 1024,
     max_event_bytes: 32 * 1024 * 1024,
-    runtime_kind: 'docker',
+    runtime_kind: kind,
     test_endpoints: testEndpoints,
     provider: 'local_cli',
     dataplane,

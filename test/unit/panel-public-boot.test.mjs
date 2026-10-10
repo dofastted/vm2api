@@ -119,6 +119,8 @@ test('publicVmBootView exposes state without account or infrastructure identifie
     persona_preset: 'official_full',
     schedulable: true,
     schedule_disabled_reason: null,
+    runtime_type: 'docker',
+    machine: null,
   })
   assert.doesNotMatch(JSON.stringify(view), /owner@example|secret|kin-01|10\.0\.0\.2/)
 })
