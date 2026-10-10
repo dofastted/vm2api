@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowUpCircle, Copy, ExternalLink, RefreshCw } from 'lucide-react'
 import { toast } from 'sonner'
@@ -21,10 +21,34 @@ async function copyText(text: string) {
 
 export function AboutPane() {
   const qc = useQueryClient()
-  const version = useQuery(versionQueryOptions())
+  const [upgradeTarget, setUpgradeTarget] = useState<string | null>(null)
+  const version = useQuery({
+    ...versionQueryOptions(),
+    refetchInterval: (query) =>
+      upgradeTarget || query.state.data?.upgrade?.state === 'running'
+        ? 2000
+        : false,
+  })
   const changelog = useQuery(changelogQueryOptions())
   const [confirmOpen, setConfirmOpen] = useState(false)
   const data = version.data
+  const updateRunning = !!upgradeTarget || data?.upgrade?.state === 'running'
+
+  useEffect(() => {
+    if (!upgradeTarget) return
+    if (data?.upgrade?.target !== upgradeTarget) return
+    if (data.upgrade.state === 'failed') {
+      setUpgradeTarget(null)
+      toast.error('升级失败，后端未完成验证，请检查更新日志')
+    } else if (
+      data.upgrade.state === 'succeeded' &&
+      data.current_tag === upgradeTarget
+    ) {
+      setUpgradeTarget(null)
+      window.location.reload()
+    }
+  }, [data, upgradeTarget])
+
   const upgrade = useMutation({
     mutationFn: () =>
       api<ReleaseStatus>('/api/panel/update', {
@@ -40,14 +64,11 @@ export function AboutPane() {
         toast.success(`已是最新 ${payload.current_tag}`)
         return
       }
-      toast.success(
-        payload?.started
-          ? `已开始升级到 ${payload.target || payload.latest_tag}，控制面会短暂中断，稍后刷新`
-          : '已返回升级命令'
-      )
-      await qc.invalidateQueries({
-        queryKey: versionQueryOptions().queryKey,
-      })
+      if (payload?.started) {
+        setUpgradeTarget(payload.target || payload.latest_tag)
+        qc.setQueryData(versionQueryOptions().queryKey, payload)
+        toast.info(`正在升级到 ${payload.target || payload.latest_tag}`)
+      }
     },
     onError: (error: Error) => {
       setConfirmOpen(false)
@@ -67,7 +88,8 @@ export function AboutPane() {
         error instanceof TypeError ||
         /failed to fetch|network|load failed/i.test(error.message)
       ) {
-        toast.success('控制面可能正在重启，稍后刷新本页')
+        toast.info('连接中断，正在检查后端更新状态')
+        void qc.invalidateQueries({ queryKey: versionQueryOptions().queryKey })
         return
       }
       toast.error(error.message)
@@ -130,6 +152,19 @@ export function AboutPane() {
               GitHub 不可达（{data.source_error}）。仍可复制宿主机命令。
             </p>
           ) : null}
+          {updateRunning ? (
+            <Alert>
+              <AlertTitle>
+                正在更新到 {upgradeTarget || data?.upgrade?.target}
+              </AlertTitle>
+              <AlertDescription>等待后端重启和版本验证。</AlertDescription>
+            </Alert>
+          ) : data?.upgrade?.state === 'failed' ? (
+            <Alert variant='destructive'>
+              <AlertTitle>更新失败</AlertTitle>
+              <AlertDescription>{data.upgrade.log_command}</AlertDescription>
+            </Alert>
+          ) : null}
           {data?.needs_wrap_cli_sync ? (
             <Alert>
               <AlertTitle>需要重装槽内 kernel</AlertTitle>
@@ -159,8 +194,7 @@ export function AboutPane() {
         </CardHeader>
         <CardContent className='space-y-3'>
           <p className='text-sm text-muted-foreground'>
-            在宿主机执行。保留 .env / vms / data，不 docker rm
-            槽。控制面源码在镜像里，真正升级走宿主机 git tag。
+            在宿主机执行。保留 .env / vms / data，不 docker rm 槽。
           </p>
           <pre className='overflow-x-auto rounded-md bg-muted px-3 py-2 font-mono text-xs'>
             {data?.upgrade_command ||
@@ -183,7 +217,9 @@ export function AboutPane() {
             </Button>
             <Button
               size='sm'
-              disabled={!data?.update_available || upgrade.isPending}
+              disabled={
+                !data?.update_available || upgrade.isPending || updateRunning
+              }
               onClick={() => setConfirmOpen(true)}
             >
               <ArrowUpCircle />
@@ -214,7 +250,7 @@ export function AboutPane() {
         open={confirmOpen}
         onOpenChange={setConfirmOpen}
         title={`升级到 ${data?.latest_tag || ''}？`}
-        desc='会重建控制面容器，面板短暂不可用。不删除槽位，不改 .env / vms / data。'
+        desc='会更新并重启控制面，面板短暂不可用。完成后自动刷新。保留槽位、配置和数据。'
         confirmText='开始升级'
         cancelBtnText='取消'
         destructive

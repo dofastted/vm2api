@@ -33,6 +33,12 @@ export type ReleaseStatus = {
   target?: string
   command?: string
   message?: string
+  upgrade?: {
+    state: 'running' | 'succeeded' | 'failed'
+    target: string
+    exit_code: number | null
+    log_command: string
+  }
 }
 
 export type ChangelogPayload = {

@@ -149,7 +149,13 @@ import { withVmLock, atomicWriteJson, isValidVmId } from '../vm/vm-file.mjs'
 import { snapshotDatabaseMetrics } from '../db/database-metrics.mjs'
 import { getUsageCache } from '../oauth/usage-cache.mjs'
 import { getDb, getDbPath } from '../db/database.mjs'
-import { readLocalVersion, loadChangelog, buildUpdateStatus, startHostUpgrade } from './release.mjs'
+import {
+  readLocalVersion,
+  loadChangelog,
+  buildUpdateStatus,
+  readHostUpgradeStatus,
+  startHostUpgrade,
+} from './release.mjs'
 import { downloadReleaseKernel, kernelReleaseHttpStatus } from './release-kernel.mjs'
 import { removeVmFromDb } from '../vm/vm-db-sync.mjs'
 import { normalizeCredentialMode } from '../oauth/credential-mode.mjs'
@@ -387,6 +393,8 @@ function slotProxyHint(px = {}, label = null) {
 }
 
 export function createPanelHandler(ctx) {
+  // A checkout can change under a live Node process; report its boot version.
+  const runningVersion = readLocalVersion(ctx.cfg?.paths?.project)
   const json = (...args) => ctx.json(...args)
   const hostUnsupported = (res, vm, cap) => {
     if (slotHost(vm).supports(cap)) return false
@@ -942,7 +950,7 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'GET' && p === '/api/panel/me') {
         const me = mePayload(req)
-        const version = readLocalVersion(cfg?.paths?.project)
+        const version = runningVersion
         const payload = { ...me, version }
         return json(res, 200, { ok: true, ...payload, data: payload })
       }
@@ -979,11 +987,15 @@ export function createPanelHandler(ctx) {
         return json(res, 200, panel.ok(snapshot))
       }
       if (req.method === 'GET' && p === '/api/panel/version') {
-        const status = await buildUpdateStatus({ projectRoot: cfg?.paths?.project })
+        const status = await buildUpdateStatus({
+          projectRoot: cfg?.paths?.project,
+          currentVersion: runningVersion,
+          upgrade: await readHostUpgradeStatus(),
+        })
         return json(res, 200, panel.ok(status))
       }
       if (req.method === 'GET' && p === '/api/panel/changelog') {
-        const current = readLocalVersion(cfg?.paths?.project)
+        const current = runningVersion
         const entries = loadChangelog(cfg?.paths?.project)
         return json(res, 200, panel.ok({ current, current_tag: `v${current}`, entries }))
       }
@@ -991,6 +1003,7 @@ export function createPanelHandler(ctx) {
         const body = await readBody(req, 8192).catch(() => ({}))
         const result = await startHostUpgrade({
           projectRoot: cfg?.paths?.project,
+          currentVersion: runningVersion,
           confirm: body?.confirm === true,
           version: body?.version,
         })

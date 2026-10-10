@@ -203,6 +203,7 @@ unixTest('dispatchStreamInference uses rust socket when ready', async () => {
   process.env.KIN_KERNEL_BIN = '/bin/true'
   const fx = await kernelFixture((req, res) => {
     assert.equal(req.headers['x-internal-token'], 'internal-test')
+    assert.equal(req.headers['x-kin-internal-token'], 'internal-test')
     res.writeHead(200, {
       'content-type': 'text/event-stream',
       trailer: 'x-usage, x-stop-reason',

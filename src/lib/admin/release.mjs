@@ -3,14 +3,18 @@
  * Host one-click upgrade lives in deploy/install.sh; the panel surfaces
  * the same command and (optionally) kicks it via docker.sock.
  */
-import { spawn } from 'node:child_process'
+import { execFile } from 'node:child_process'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { promisify } from 'node:util'
 import { toHostPath } from '../vm/host-path.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const MODULE_PROJECT = path.resolve(__dirname, '..', '..', '..')
+const execFileAsync = promisify(execFile)
+const UPGRADE_SCRIPT = fs.readFileSync(path.join(MODULE_PROJECT, 'scripts', 'panel-upgrade.sh'), 'utf8')
 
 export const GITHUB_REPO = 'dofastted/vm2api'
 export const INSTALL_SCRIPT_URL = `https://raw.githubusercontent.com/${GITHUB_REPO}/main/deploy/install.sh`
@@ -279,9 +283,9 @@ export function clearReleaseCache() {
   releaseCache.error = null
 }
 
-export async function buildUpdateStatus({ projectRoot: root, fetchImpl, now, cacheMs } = {}) {
+export async function buildUpdateStatus({ projectRoot: root, currentVersion, upgrade, fetchImpl, now, cacheMs } = {}) {
   const project = projectRoot(root)
-  const current = readLocalVersion(project)
+  const current = currentVersion || readLocalVersion(project)
   const entries = loadChangelog(project)
   const remote = await fetchLatestRelease({ fetchImpl, now, cacheMs })
   const latest = remote.release?.version || current
@@ -304,6 +308,7 @@ export async function buildUpdateStatus({ projectRoot: root, fetchImpl, now, cac
     check_command: `sudo bash ${hostRoot(root)}/deploy/install.sh check`,
     repo: GITHUB_REPO,
     source_error: remote.error,
+    ...(upgrade ? { upgrade } : {}),
   }
 }
 
@@ -337,17 +342,101 @@ export function canSpawnHostUpgrade({ dockerBin = which('docker'), sock = DOCKER
   return Boolean(dockerBin && fs.existsSync(sock))
 }
 
+async function inspectContainer(name, { dockerBin, execFileImpl }) {
+  const { stdout } = await execFileImpl(dockerBin, ['inspect', '--format', '{{json .}}', name], {
+    encoding: 'utf8',
+    timeout: 8000,
+    maxBuffer: 1024 * 1024,
+  })
+  return JSON.parse(stdout)
+}
+
+/** Only update the Compose deployment that owns this running control plane. */
+export async function hostUpgradeDeployment({
+  dockerBin = which('docker'),
+  sock = DOCKER_SOCK,
+  containerized = fs.existsSync('/.dockerenv') || fs.existsSync('/run/.containerenv'),
+  hostname = os.hostname(),
+  env = process.env,
+  execFileImpl = execFileAsync,
+} = {}) {
+  if (!containerized || !canSpawnHostUpgrade({ dockerBin, sock })) return null
+  const names = [...new Set([hostname, env.VM2API_CONTAINER_NAME].filter(Boolean))]
+  for (const name of names) {
+    try {
+      const container = await inspectContainer(name, { dockerBin, execFileImpl })
+      const labels = container.Config?.Labels || {}
+      const project = labels['com.docker.compose.project']
+      const root = labels['com.docker.compose.project.working_dir']
+      const files = String(labels['com.docker.compose.project.config_files'] || '')
+        .split(',')
+        .map((file) => file.trim())
+        .filter(Boolean)
+      if (
+        !container.State?.Running ||
+        !container.Id ||
+        container.Config?.Hostname !== hostname ||
+        labels['com.docker.compose.service'] !== 'vm2api' ||
+        !/^[a-z0-9][a-z0-9_-]*$/.test(project || '') ||
+        !path.isAbsolute(root || '') ||
+        !files.length ||
+        files.some((file) => !file.startsWith(`${root}/`))
+      ) {
+        continue
+      }
+      return {
+        root,
+        project,
+        files,
+        container: String(container.Name || name).replace(/^\//, ''),
+        id: container.Id,
+        helper: `vm2api-upgrade-${project}`,
+      }
+    } catch {
+      // Try the hostname when an explicitly configured name is stale.
+    }
+  }
+  return null
+}
+
+export async function readHostUpgradeStatus(options = {}) {
+  const deployment = options.deployment || (await hostUpgradeDeployment(options))
+  if (!deployment) return null
+  try {
+    const container = await inspectContainer(deployment.helper, {
+      dockerBin: options.dockerBin || which('docker'),
+      execFileImpl: options.execFileImpl || execFileAsync,
+    })
+    const target = container.Config?.Labels?.['vm2api.upgrade.target']
+    if (!isReleaseTag(target)) return null
+    const state = container.State || {}
+    return {
+      state: state.Status === 'exited' ? (state.ExitCode === 0 ? 'succeeded' : 'failed') : 'running',
+      target,
+      exit_code: state.Status === 'exited' ? state.ExitCode : null,
+      log_command: `docker logs ${deployment.helper}`,
+    }
+  } catch {
+    return null
+  }
+}
+
 /**
- * Kick a host-side upgrade. The running control-plane container is replaced
- * by `docker compose up -d --build`, so the HTTP request may die mid-flight.
- * Callers should POST with { confirm: true } and then poll /health.
+ * Start a Docker-managed helper which survives replacement of the HTTP server.
+ * Retain its exit status and logs so a failed upgrade cannot look successful.
  */
 export async function startHostUpgrade({
   projectRoot: root,
+  currentVersion,
   confirm = false,
   version,
   arch = process.arch,
-  spawnImpl = spawn,
+  dockerBin = which('docker'),
+  sock = DOCKER_SOCK,
+  containerized,
+  hostname,
+  env,
+  execFileImpl = execFileAsync,
   fetchImpl,
   now,
 } = {}) {
@@ -371,7 +460,7 @@ export async function startHostUpgrade({
       error: { message: `版本后缀 -${requested.arch} 与控制面架构 ${hostArch} 不符`, code: 'arch_mismatch' },
     }
   }
-  const status = await buildUpdateStatus({ projectRoot: root, fetchImpl, now })
+  const status = await buildUpdateStatus({ projectRoot: root, currentVersion, fetchImpl, now })
   const target = requested ? requested.tag : status.latest_tag
   if (!isReleaseTag(target)) {
     return {
@@ -379,7 +468,6 @@ export async function startHostUpgrade({
       error: { message: '无效版本', code: 'invalid_version' },
     }
   }
-  const imageTag = imageTagFor(target, hostArch)
   const command = upgradeCommand(target)
   if (!confirm) {
     return {
@@ -393,12 +481,13 @@ export async function startHostUpgrade({
       data: { ...status, started: false, target, command, message: 'already_latest' },
     }
   }
-  const dockerBin = which('docker')
-  if (!canSpawnHostUpgrade({ dockerBin })) {
+  const options = { dockerBin, sock, containerized, hostname, env, execFileImpl }
+  const deployment = await hostUpgradeDeployment(options)
+  if (!deployment) {
     return {
       status: 409,
       error: {
-        message: '控制面容器里没有 docker.sock，请到宿主机执行一键更新命令',
+        message: '当前控制面不是可识别的 Docker Compose 服务，请到宿主机更新并重启实际提供接口的后端',
         code: 'host_upgrade_required',
         command,
         target,
@@ -406,64 +495,53 @@ export async function startHostUpgrade({
       data: { ...status, started: false, target, command },
     }
   }
-  const rootDir = hostRoot(root)
-  // Image install (no .git): flip the arch-specific tag in .env and pull.
-  // Source install: keep the git flow. An ARM64 checkout must build through
-  // docker-compose.arm64.yml; without COMPOSE_FILE a bare `docker compose`
-  // would start the base service on ./vms and ./data instead of .local/arm64.
-  const script = [
-    'set -eu',
-    `TAG=${target}`,
-    `IMAGE_TAG=${imageTag}`,
-    'if [ -d .git ]; then',
-    ...(hostArch === 'arm64'
-      ? [
-          '  if ! grep -q "^COMPOSE_FILE=.*docker-compose.arm64.yml" .env 2>/dev/null; then',
-          '    echo "ARM64 source install lacks COMPOSE_FILE in .env; see docs/ARM64.md" >&2',
-          '    exit 1',
-          '  fi',
-        ]
-      : []),
-    '  export GIT_TERMINAL_PROMPT=0',
-    '  command -v git >/dev/null || apk add --no-cache git >/dev/null',
-    `  git config --global --add safe.directory ${rootDir} || true`,
-    '  git fetch --tags origin',
-    '  git checkout -f "$TAG"',
-    '  chmod 755 bin/kin-* 2>/dev/null || true',
-    '  grep -q "!CHANGELOG.md" .dockerignore 2>/dev/null || echo "!CHANGELOG.md" >> .dockerignore',
-    '  docker compose up -d --build',
-    'else',
-    '  touch .env',
-    '  if grep -q "^VM2API_IMAGE_TAG=" .env; then',
-    '    sed -i "s|^VM2API_IMAGE_TAG=.*|VM2API_IMAGE_TAG=$IMAGE_TAG|" .env',
-    '  else',
-    '    printf "VM2API_IMAGE_TAG=%s\\n" "$IMAGE_TAG" >> .env',
-    '  fi',
-    '  docker compose pull',
-    '  docker compose up -d',
-    'fi',
-  ].join('\n')
-  const child = spawnImpl(
-    dockerBin,
-    [
-      'run',
-      '--rm',
-      '--name',
-      'vm2api-upgrade',
-      '-v',
-      `${rootDir}:${rootDir}`,
-      '-v',
-      `${DOCKER_SOCK}:${DOCKER_SOCK}`,
-      '-w',
-      rootDir,
-      'docker:27-cli',
-      'sh',
-      '-c',
-      script,
-    ],
-    { detached: true, stdio: 'ignore' },
-  )
-  child.unref?.()
+  const previous = await readHostUpgradeStatus({ ...options, deployment })
+  if (previous?.state === 'running') {
+    return {
+      status: 409,
+      error: { message: '控制面更新正在进行', code: 'upgrade_in_progress' },
+      data: { ...status, started: false, target, command, upgrade: previous },
+    }
+  }
+  try {
+    if (previous) await execFileImpl(dockerBin, ['rm', deployment.helper], { timeout: 8000 })
+    await execFileImpl(
+      dockerBin,
+      [
+        'run',
+        '--detach',
+        '--name',
+        deployment.helper,
+        '--label',
+        `vm2api.upgrade.target=${target}`,
+        '-v',
+        `${deployment.root}:${deployment.root}`,
+        '-v',
+        `${DOCKER_SOCK}:${DOCKER_SOCK}`,
+        '-w',
+        deployment.root,
+        'docker:27-cli',
+        'sh',
+        '-c',
+        UPGRADE_SCRIPT,
+        'panel-upgrade',
+        deployment.root,
+        deployment.project,
+        deployment.container,
+        deployment.id,
+        target,
+        hostArch,
+        ...deployment.files,
+      ],
+      { encoding: 'utf8', timeout: 120000, maxBuffer: 1024 * 1024 },
+    )
+  } catch {
+    return {
+      status: 502,
+      error: { message: '无法启动控制面更新任务，请检查 Docker 和更新日志', code: 'upgrade_start_failed' },
+      data: { ...status, started: false, target, command },
+    }
+  }
   return {
     status: 202,
     data: {
@@ -472,6 +550,12 @@ export async function startHostUpgrade({
       target,
       command,
       message: 'upgrade_started',
+      upgrade: {
+        state: 'running',
+        target,
+        exit_code: null,
+        log_command: `docker logs ${deployment.helper}`,
+      },
     },
   }
 }

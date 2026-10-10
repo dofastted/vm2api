@@ -90,7 +90,11 @@ function workerRequest(
       requestHeaders['content-type'] = 'application/json'
       requestHeaders['content-length'] = String(payload.length)
     }
-    if (internalToken) requestHeaders['x-internal-token'] = internalToken
+    if (internalToken) {
+      // Rust/Codex kernels use the namespaced header; retain the legacy worker header.
+      requestHeaders['x-kin-internal-token'] = internalToken
+      requestHeaders['x-internal-token'] = internalToken
+    }
     let timer = null
     const clearTimer = () => {
       if (timer) {
