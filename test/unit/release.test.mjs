@@ -15,6 +15,8 @@ import {
   publicRelease,
   buildUpdateStatus,
   startHostUpgrade,
+  hostUpgradeDeployment,
+  readHostUpgradeStatus,
   upgradeCommand,
   clearReleaseCache,
   INSTALL_SCRIPT_URL,
@@ -46,6 +48,49 @@ const FIXTURE = `# Changelog
 
 - 已部署机升级：控制面重启一次 + \`POST /api/panel/wrap-cli/sync\` 换槽内 CLI
 `
+
+function dockerFixture(root, { job = null, runError = null, containerized = true } = {}) {
+  const calls = []
+  const container = {
+    Id: 'old-control-plane',
+    Name: '/custom-control',
+    State: { Running: true },
+    Config: {
+      Hostname: 'control-host',
+      Labels: {
+        'com.docker.compose.project': 'custom-stack',
+        'com.docker.compose.service': 'vm2api',
+        'com.docker.compose.project.working_dir': root,
+        'com.docker.compose.project.config_files': `${root}/docker-compose.yml,${root}/docker-compose.override.yml`,
+      },
+    },
+  }
+  return {
+    calls,
+    container,
+    options: {
+      dockerBin: '/fake/docker',
+      sock: path.join(root, 'VERSION'),
+      containerized,
+      hostname: 'control-host',
+      env: { VM2API_CONTAINER_NAME: 'custom-control' },
+      async execFileImpl(cmd, args, opts) {
+        calls.push({ cmd, args, opts })
+        if (args[0] === 'inspect') {
+          if (args.at(-1) === 'vm2api-upgrade-custom-stack') {
+            if (!job) throw new Error('No such container')
+            return { stdout: JSON.stringify(job) }
+          }
+          return { stdout: JSON.stringify(container) }
+        }
+        if (args[0] === 'run' && runError) throw new Error(runError)
+        return { stdout: 'helper-id\n' }
+      },
+    },
+  }
+}
+
+const releaseFetch = async () => ({ ok: true, json: async () => ({ tag_name: 'v1.2.7', body: '' }) })
 
 test('parseChangelog reads Keep-a-Changelog headings and wrap-cli flag', () => {
   const entries = parseChangelog(FIXTURE)
@@ -181,38 +226,37 @@ test('startHostUpgrade without confirm only returns the command', async () => {
   }
 })
 
-test('startHostUpgrade with confirm spawns a detached docker helper', async () => {
+test('startHostUpgrade launches a Docker-managed helper for the actual Compose deployment', async () => {
   clearReleaseCache()
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-release-'))
-  const spawned = []
   try {
     fs.writeFileSync(path.join(tmp, 'VERSION'), '1.2.6\n')
     fs.writeFileSync(path.join(tmp, 'CHANGELOG.md'), FIXTURE)
+    const docker = dockerFixture(tmp)
     const result = await startHostUpgrade({
+      ...docker.options,
       projectRoot: tmp,
       confirm: true,
-      fetchImpl: async () => ({
-        ok: true,
-        json: async () => ({ tag_name: 'v1.2.7', body: '' }),
-      }),
-      spawnImpl(cmd, args, opts) {
-        spawned.push({ cmd, args, opts })
-        return { unref() {} }
-      },
+      fetchImpl: releaseFetch,
     })
-    if (result.status === 409) {
-      assert.equal(result.error.code, 'host_upgrade_required')
-      assert.match(result.error.command, /upgrade --version v1\.2\.7/)
-      return
-    }
     assert.equal(result.status, 202)
     assert.equal(result.data.started, true)
-    assert.equal(spawned.length, 1)
-    assert.equal(spawned[0].opts.detached, true)
-    assert.ok(spawned[0].args.includes('vm2api-upgrade'))
-    assert.ok(spawned[0].args.includes('docker:27-cli'))
-    const script = spawned[0].args[spawned[0].args.indexOf('sh') + 2] || spawned[0].args.join(' ')
-    assert.match(String(script), /!CHANGELOG\.md/)
+    const run = docker.calls.find((call) => call.args[0] === 'run')
+    assert.ok(run.args.includes('--detach'))
+    assert.ok(run.args.includes('vm2api-upgrade-custom-stack'))
+    assert.ok(run.args.includes('docker:27-cli'))
+    assert.ok(!run.args.includes('--rm'), 'keep failure status and logs after exit')
+    assert.deepEqual(run.args.slice(run.args.indexOf('panel-upgrade') + 1), [
+      tmp,
+      'custom-stack',
+      'custom-control',
+      'old-control-plane',
+      'v1.2.7',
+      process.arch === 'arm64' ? 'arm64' : 'amd64',
+      `${tmp}/docker-compose.yml`,
+      `${tmp}/docker-compose.override.yml`,
+    ])
+    assert.equal(result.data.upgrade.state, 'running')
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
     clearReleaseCache()
@@ -280,32 +324,108 @@ test('startHostUpgrade rejects a suffix for another architecture before spawning
   assert.equal(result.error.code, 'arch_mismatch')
 })
 
-test('ARM64 host upgrade pins the arm64 image and refuses a source tree without the override', async () => {
+test('ARM64 host upgrade passes its architecture and the running override to the helper', async () => {
   clearReleaseCache()
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-release-'))
-  const spawned = []
   try {
     fs.writeFileSync(path.join(tmp, 'VERSION'), '1.2.6\n')
     fs.writeFileSync(path.join(tmp, 'CHANGELOG.md'), FIXTURE)
+    const docker = dockerFixture(tmp)
+    docker.container.Config.Labels['com.docker.compose.project.config_files'] =
+      `${tmp}/docker-compose.yml,${tmp}/docker-compose.arm64.yml`
     const result = await startHostUpgrade({
+      ...docker.options,
       projectRoot: tmp,
       confirm: true,
       version: 'v1.2.7-arm64',
       arch: 'arm64',
-      fetchImpl: async () => ({ ok: true, json: async () => ({ tag_name: 'v1.2.7', body: '' }) }),
-      spawnImpl(cmd, args, opts) {
-        spawned.push({ cmd, args, opts })
-        return { unref() {} }
-      },
+      fetchImpl: releaseFetch,
     })
-    if (result.status === 409) return
     assert.equal(result.status, 202)
     assert.equal(result.data.target, 'v1.2.7')
-    const script = spawned[0].args[spawned[0].args.indexOf('-c') + 1]
-    assert.match(script, /^TAG=v1\.2\.7$/m)
-    assert.match(script, /^IMAGE_TAG=v1\.2\.7-arm64$/m)
-    assert.match(script, /VM2API_IMAGE_TAG=\$IMAGE_TAG/)
-    assert.ok(script.indexOf('docker-compose.arm64.yml') < script.indexOf('git checkout'))
+    const run = docker.calls.find((call) => call.args[0] === 'run')
+    assert.deepEqual(run.args.slice(-3), ['arm64', `${tmp}/docker-compose.yml`, `${tmp}/docker-compose.arm64.yml`])
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+    clearReleaseCache()
+  }
+})
+
+test('native Node cannot claim to upgrade itself by launching an unrelated Compose stack', async () => {
+  clearReleaseCache()
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-release-'))
+  try {
+    fs.writeFileSync(path.join(tmp, 'VERSION'), '1.2.6\n')
+    const docker = dockerFixture(tmp, { containerized: false })
+    const result = await startHostUpgrade({
+      ...docker.options,
+      projectRoot: tmp,
+      confirm: true,
+      fetchImpl: releaseFetch,
+    })
+    assert.equal(result.status, 409)
+    assert.equal(result.error.code, 'host_upgrade_required')
+    assert.equal(docker.calls.length, 0)
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+    clearReleaseCache()
+  }
+})
+
+test('self discovery rejects another container and config files outside the mounted project', async () => {
+  const docker = dockerFixture(import.meta.dirname)
+  docker.options.sock = import.meta.filename
+  docker.container.Config.Hostname = 'another-host'
+  assert.equal(await hostUpgradeDeployment(docker.options), null)
+  docker.container.Config.Hostname = 'control-host'
+  docker.container.Config.Labels['com.docker.compose.project.config_files'] = '/elsewhere/compose.yml'
+  assert.equal(await hostUpgradeDeployment(docker.options), null)
+})
+
+test('helper startup failures are returned instead of upgrade_started', async () => {
+  clearReleaseCache()
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-release-'))
+  try {
+    fs.writeFileSync(path.join(tmp, 'VERSION'), '1.2.6\n')
+    const docker = dockerFixture(tmp, { runError: 'registry unavailable' })
+    const result = await startHostUpgrade({
+      ...docker.options,
+      projectRoot: tmp,
+      confirm: true,
+      fetchImpl: releaseFetch,
+    })
+    assert.equal(result.status, 502)
+    assert.equal(result.error.code, 'upgrade_start_failed')
+    assert.equal(result.data.started, false)
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+    clearReleaseCache()
+  }
+})
+
+test('running helper blocks a duplicate update and exited helpers expose their actual outcome', async () => {
+  clearReleaseCache()
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-release-'))
+  try {
+    fs.writeFileSync(path.join(tmp, 'VERSION'), '1.2.6\n')
+    const job = { Config: { Labels: { 'vm2api.upgrade.target': 'v1.2.7' } }, State: { Status: 'running' } }
+    const docker = dockerFixture(tmp, { job })
+    const result = await startHostUpgrade({
+      ...docker.options,
+      projectRoot: tmp,
+      confirm: true,
+      fetchImpl: releaseFetch,
+    })
+    assert.equal(result.status, 409)
+    assert.equal(result.error.code, 'upgrade_in_progress')
+    assert.ok(!docker.calls.some((call) => call.args[0] === 'run' || call.args[0] === 'rm'))
+    job.State = { Status: 'exited', ExitCode: 1 }
+    const failed = await readHostUpgradeStatus(docker.options)
+    assert.equal(failed.state, 'failed')
+    assert.equal(failed.exit_code, 1)
+    assert.equal(failed.log_command, 'docker logs vm2api-upgrade-custom-stack')
+    job.State.ExitCode = 0
+    assert.equal((await readHostUpgradeStatus(docker.options)).state, 'succeeded')
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
     clearReleaseCache()

@@ -215,7 +215,7 @@ sudo bash /opt/vm2api/deploy/install.sh upgrade --version v1.2.22
 sudo bash /opt/vm2api/deploy/install.sh check
 ```
 
-面板：`GET /api/panel/version`、`GET /api/panel/changelog`、`POST /api/panel/update`（`{ confirm: true }` 才会在已挂 `docker.sock` 的机器上拉起升级助手）。容器里没有宿主机 git 仓时返回 `409 host_upgrade_required`，响应里带同一条 curl 命令。
+面板：`GET /api/panel/version`、`GET /api/panel/changelog`、`POST /api/panel/update`。确认更新后，控制面会通过已挂载的 `docker.sock` 自省当前 Compose 项目和全部配置文件，拉起独立升级助手；助手按源码/镜像模式更新，`--force-recreate` 控制面并轮询健康检查和版本接口，完成后才报告成功。助手失败时保留 `docker logs vm2api-upgrade-<project>`；容器里没有可识别的 Compose 服务时返回 `409 host_upgrade_required`，响应里带同一条 curl 命令。
 
 ## 已部署机升级到 1.2.22
 
