@@ -40,6 +40,32 @@ async function runUpgrade({ source = true, arch = 'amd64', override, env = {} } 
       res.end('{"status":"ok"}')
     } else if (req.url === '/api/panel/version' && req.headers.authorization === 'Bearer test-key') {
       res.end(JSON.stringify({ ok: true, data: { current_tag: fs.readFileSync(bootVersion, 'utf8') } }))
+    } else if (req.url === '/api/panel/vms' && req.headers.authorization === 'Bearer test-key') {
+      res.end(
+        JSON.stringify({
+          ok: true,
+          data: env.NO_SLOTS === '1' ? [] : [{ id: 'vm-01', status: 'running' }],
+        }),
+      )
+    } else if (req.url === '/api/panel/vms/vm-01' && req.headers.authorization === 'Bearer test-key') {
+      const upgraded = fs.readFileSync(bootVersion, 'utf8') === 'v1.2.7'
+      const broken = env.PREEXISTING_SLOT_FAILURE === '1' || (upgraded && env.BROKEN_SLOT === '1')
+      res.end(
+        JSON.stringify({
+          ok: true,
+          data: {
+            kernel: {
+              rust_health: {
+                status: broken ? 401 : 200,
+                process_up: !broken,
+                healthy: true,
+                reachable: !broken && env.BUSY_SLOT !== '1',
+                ready_slots: env.BUSY_SLOT === '1' ? 0 : 20,
+              },
+            },
+          },
+        }),
+      )
     } else {
       res.writeHead(401).end('{}')
     }
@@ -47,11 +73,19 @@ async function runUpgrade({ source = true, arch = 'amd64', override, env = {} } 
   try {
     fs.mkdirSync(bin)
     fs.writeFileSync(path.join(bin, 'docker'), FAKE_DOCKER, { mode: 0o755 })
-    fs.writeFileSync(path.join(bin, 'git'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+    fs.writeFileSync(
+      path.join(bin, 'git'),
+      '#!/usr/bin/env node\n' +
+        'if (process.argv[2] === "checkout") ' +
+        'require("node:fs").writeFileSync("src/config/routing.json", "release defaults\\n")\n',
+      { mode: 0o755 },
+    )
     fs.writeFileSync(path.join(bin, 'sleep'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
     fs.writeFileSync(path.join(root, 'VERSION'), '1.2.6\n')
     fs.writeFileSync(bootVersion, 'v1.2.6')
     fs.writeFileSync(path.join(root, '.env'), 'VM2API_ADMIN_PASSWORD=keep-me\nVM2API_IMAGE_TAG=v1.2.6\n')
+    fs.mkdirSync(path.join(root, 'src/config'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'src/config/routing.json'), 'operator config\n')
     if (source) fs.mkdirSync(path.join(root, '.git'))
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
     const args = [
@@ -91,6 +125,7 @@ async function runUpgrade({ source = true, arch = 'amd64', override, env = {} } 
       calls: fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse) : [],
       env: fs.readFileSync(path.join(root, '.env'), 'utf8'),
       version: fs.readFileSync(path.join(root, 'VERSION'), 'utf8'),
+      routing: fs.readFileSync(path.join(root, 'src/config/routing.json'), 'utf8'),
     }
   } finally {
     await new Promise((resolve) => server.close(resolve))
@@ -115,6 +150,7 @@ test('source upgrade builds the backend, preserves overrides, recreates it, and 
   assert.ok(result.calls.some((args) => args[0] === 'exec'))
   assert.match(result.stdout, /restarted and verified at v1\.2\.7/)
   assert.match(result.env, /VM2API_ADMIN_PASSWORD=keep-me/)
+  assert.equal(result.routing, 'operator config\n', 'release checkout must preserve live routing config')
 })
 
 test('failed backend build never replaces the running control plane', async () => {
@@ -127,7 +163,7 @@ test('unchanged container ID cannot be reported as a successful restart', async 
   const result = await runUpgrade({ env: { SAME_CONTAINER: '1' } })
   assert.equal(result.code, 1)
   assert.match(result.stderr, /did not replace/)
-  assert.ok(!result.calls.some((args) => args[0] === 'exec'))
+  assert.ok(!result.calls.some((args) => args[0] === 'exec' && args.includes('verify')))
 })
 
 test('a healthy but stale backend is an upgrade failure', async () => {
@@ -135,6 +171,28 @@ test('a healthy but stale backend is an upgrade failure', async () => {
   assert.equal(result.code, 1)
   assert.match(result.stderr, /did not become healthy at v1\.2\.7/)
   assert.equal(result.version, '1.2.6\n', 'do not advance the host VERSION on failure')
+})
+
+test('a new backend version with broken kernel auth cannot report upgrade success', async () => {
+  const result = await runUpgrade({ source: false, env: { BROKEN_SLOT: '1' } })
+  assert.equal(result.code, 1)
+  assert.match(result.stdout, /Recording healthy slot kernels before upgrade: \["vm-01"\]/)
+  assert.match(result.stderr, /Previously healthy slot vm-01 failed kernel verification/)
+  assert.equal(result.version, '1.2.6\n')
+})
+
+test('busy but healthy kernels survive upgrade verification', async () => {
+  const result = await runUpgrade({ env: { BUSY_SLOT: '1' } })
+  assert.equal(result.code, 0, result.stderr)
+  assert.match(result.stdout, /Previously healthy slot kernels verified: \["vm-01"\]/)
+})
+
+test('empty installations and already unhealthy slots do not become false upgrade regressions', async () => {
+  for (const env of [{ NO_SLOTS: '1' }, { PREEXISTING_SLOT_FAILURE: '1' }]) {
+    const result = await runUpgrade({ env })
+    assert.equal(result.code, 0, result.stderr)
+    assert.match(result.stdout, /Recording healthy slot kernels before upgrade: \[\]/)
+  }
 })
 
 test('image upgrade pulls the pinned ARM64 release and records VERSION only after verification', async () => {
