@@ -253,6 +253,20 @@ export function readWorkerEgressMode(projectRoot, vmId) {
   }
 }
 
+/** Running container is still attached to a different kin-eg-* than vm.proxy.id. */
+export function slotContainerNetworkMismatch(existing, vm) {
+  const want = slotNetworkForVm(vm)
+  if (!want || !existing?.networkMode) return false
+  return existing.networkMode !== want
+}
+
+/** Reload must recreate (not restart) when the kernel is dead or egress network moved. */
+export function slotWorkerNeedsRecreate(existing, vm, paths) {
+  if (!existing) return false
+  if (!slotKernelAlive(existing, paths)) return true
+  return slotContainerNetworkMismatch(existing, vm)
+}
+
 /** Worker still dials a different SOCKS5 than vm.json — hop would refresh through the old exit. */
 export function isSlotProxyDesynced(vm, projectRoot) {
   if (readWorkerEgressMode(projectRoot, vm?.id) === 'transparent') return false
@@ -302,7 +316,7 @@ export function reloadSlotWorker(vm, projectRoot, { routing } = {}) {
   const name = containerName(vm.id)
   const existing = inspectContainer(name)
   if (!existing) return startVmRuntime(vm, projectRoot, { recreate: false, routing })
-  if (!slotKernelAlive(existing, paths)) {
+  if (slotWorkerNeedsRecreate(existing, vm, paths)) {
     return startVmRuntime(vm, projectRoot, { recreate: true, routing })
   }
   const cmd = existing.running ? ['docker', 'restart', name] : ['docker', 'start', name]
