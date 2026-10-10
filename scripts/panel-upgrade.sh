@@ -45,7 +45,8 @@ probe() {
     }
     try {
       if (mode === "snapshot") {
-        const vms = await json("/api/panel/vms")
+        const list = await json("/api/panel/vms")
+        const vms = Array.isArray(list) ? list : list.items
         if (!Array.isArray(vms)) throw new Error("Invalid slot list")
         const healthy = []
         for (const vm of vms.filter(vm => vm.status === "running")) {

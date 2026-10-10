@@ -44,7 +44,10 @@ async function runUpgrade({ source = true, arch = 'amd64', override, env = {} } 
       res.end(
         JSON.stringify({
           ok: true,
-          data: env.NO_SLOTS === '1' ? [] : [{ id: 'vm-01', status: 'running' }],
+          data:
+            env.LEGACY_SLOT_LIST === '1'
+              ? [{ id: 'vm-01', status: 'running' }]
+              : { items: env.NO_SLOTS === '1' ? [] : [{ id: 'vm-01', status: 'running' }] },
         }),
       )
     } else if (req.url === '/api/panel/vms/vm-01' && req.headers.authorization === 'Bearer test-key') {
@@ -185,6 +188,12 @@ test('busy but healthy kernels survive upgrade verification', async () => {
   const result = await runUpgrade({ env: { BUSY_SLOT: '1' } })
   assert.equal(result.code, 0, result.stderr)
   assert.match(result.stdout, /Previously healthy slot kernels verified: \["vm-01"\]/)
+})
+
+test('legacy array slot lists are still verified during updates', async () => {
+  const result = await runUpgrade({ env: { LEGACY_SLOT_LIST: '1', BROKEN_SLOT: '1' } })
+  assert.equal(result.code, 1)
+  assert.match(result.stderr, /Previously healthy slot vm-01 failed kernel verification/)
 })
 
 test('empty installations and already unhealthy slots do not become false upgrade regressions', async () => {
