@@ -17,6 +17,7 @@ import { StatusMark } from '@/components/status-mark'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import {
   proxyBindLimit,
+  proxiesForNode,
   proxyBoundIds,
   proxyIsInvalid,
   proxyOptionLabel,
@@ -82,7 +83,7 @@ export function ImportProxyStep({
   nodeId,
 }: {
   vmId: string
-  /** 槽位所在节点；本地代理按它标 `local:<IP>`。 */
+  /** 槽位所在节点；只选择该节点的 local 出口。 */
   nodeId?: string | null
 }) {
   const px = useQuery(proxiesQueryOptions())
@@ -90,7 +91,7 @@ export function ImportProxyStep({
   const pasteRef = useRef<HTMLTextAreaElement>(null)
   const [busy, setBusy] = useState(false)
 
-  const proxies = px.data?.proxies || []
+  const proxies = proxiesForNode(px.data, nodeId)
   const tot = (px.data?.totals || {}) as Record<string, unknown>
   const cfg = (px.data?.config || {}) as Record<string, unknown>
   // 回落序对齐 proxies 页：totals 先于 config，见 features/proxies/index.tsx:67。
@@ -115,7 +116,7 @@ export function ImportProxyStep({
     mutationFn: (id: string) =>
       api(`/api/panel/proxies/${encodeURIComponent(id)}/bind`, {
         method: 'POST',
-        body: JSON.stringify({ vm_id: vmId }),
+        body: JSON.stringify({ vm_id: vmId, node_id: nodeId || null }),
       }),
     onSuccess: async () => {
       toast.success('已绑到本槽')
@@ -163,7 +164,7 @@ export function ImportProxyStep({
           `/api/panel/proxies/${encodeURIComponent(existing.id)}/bind`,
           {
             method: 'POST',
-            body: JSON.stringify({ vm_id: vmId }),
+            body: JSON.stringify({ vm_id: vmId, node_id: nodeId || null }),
           }
         )
         toast.success('该条已在池中，已绑到本槽')

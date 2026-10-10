@@ -5,6 +5,7 @@ import {
   type ProxyHealthKey,
   proxyHealthKey,
   proxyIsInvalid,
+  proxyStatusLabel,
 } from '@/features/proxies/proxy-sort'
 
 /** 高延迟阈值。超过就用警告黄，即使探测状态仍是 ok。 */
@@ -13,6 +14,7 @@ export const PROXY_LATENCY_WARN_MS = 300
 export type ProxyFieldTone = 'ok' | 'caution' | 'danger' | 'none'
 
 export function proxyLatencyTone(proxy: VmProxySnap): ProxyFieldTone {
+  if (proxy.blocked_reason === 'node_unavailable') return 'caution'
   if (proxy.blocked_reason) return 'none'
   if (proxyIsInvalid(proxy)) return 'danger'
   if (proxy.latency_ms != null && proxy.latency_ms > PROXY_LATENCY_WARN_MS) {
@@ -83,10 +85,9 @@ export function proxyStatusTone(proxy: VmProxySnap): StatusTone {
   const key = proxyHealthKey(proxy)
   return {
     key,
-    text:
-      proxy.blocked_reason === 'ipv6_disabled'
-        ? 'IPv6 已关闭'
-        : PROXY_HEALTH_LABEL[key],
+    text: proxy.blocked_reason
+      ? proxyStatusLabel(proxy)
+      : PROXY_HEALTH_LABEL[key],
     cls: HEALTH_MARK[key],
   }
 }

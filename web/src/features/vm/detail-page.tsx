@@ -48,7 +48,11 @@ import { PlatformChip, SlotIdentity } from '@/components/platform-chip'
 import { QueryGate } from '@/components/query-gate'
 import { StatusMark } from '@/components/status-mark'
 import { dashboardQueryOptions } from '@/features/overview/queries'
-import { proxiesForVmBind } from '@/features/proxies/proxy-sort'
+import {
+  proxiesForVmBind,
+  proxiesForNode,
+  proxyIsLocal,
+} from '@/features/proxies/proxy-sort'
 import { proxiesQueryOptions } from '@/features/proxies/queries'
 import { routingQueryOptions } from '@/features/settings/queries'
 import { VmAccountTab } from '@/features/vm/detail-account-tab'
@@ -96,9 +100,22 @@ export function VmDetailPage() {
   const vm = ((data.vm as Vm | undefined) || listVm || { id }) as Vm
   const kernel = (data.kernel as VmKernelSnapshot | undefined) || null
   const acc = (data.account as Record<string, unknown> | undefined) || {}
-  const proxy = ((data.proxy as VmProxySnap | undefined) ||
+  const pool = proxiesForNode(proxies.data, vm.node_id)
+  const rawProxy = ((data.proxy as VmProxySnap | undefined) ||
     vm.proxy ||
     {}) as VmProxySnap
+  const proxy =
+    pool.find((p) => p.id === (rawProxy.id || vm.proxy_id)) ||
+    (vm.node_id && proxyIsLocal(rawProxy) && !rawProxy.view_id
+      ? {
+          ...rawProxy,
+          status: 'unknown',
+          geo: null,
+          geo_v6: null,
+          latency_ms: undefined,
+          last_probe_at: undefined,
+        }
+      : rawProxy)
   const test = useVmTestChat(vm)
   const refreshAll = async () => {
     await Promise.all([
@@ -175,10 +192,12 @@ export function VmDetailPage() {
     },
     onError: (error: Error) => toast.error(error.message),
   })
-  const pool = proxies.data?.proxies || []
   const boundId = String(proxy.id || vm.proxy_id || '')
   // 本地代理固定第一。已绑到本槽的留在下拉里，否则正在用它时列表里没有。
   const free = proxiesForVmBind(pool, id, 5)
+  const selectedBindId = free.some((p) => p.id === bindId)
+    ? bindId
+    : free[0]?.id || ''
   const pol =
     (seed.data?.seed_policy as Record<string, unknown> | undefined) || {}
   const syncTelemetry =
@@ -363,21 +382,27 @@ export function VmDetailPage() {
             boundId={boundId}
             free={free}
             pool={pool}
-            bindId={bindId}
+            bindId={selectedBindId}
             onBindIdChange={setBindId}
             onUnbind={() =>
               api(`/api/panel/proxies/${boundId}/unbind`, {
                 method: 'POST',
-                body: JSON.stringify({ vm_id: id }),
+                body: JSON.stringify({
+                  vm_id: id,
+                  node_id: vm.node_id || null,
+                }),
               })
                 .then(refreshAll)
                 .catch((error: Error) => toast.error(error.message))
             }
             onAllocate={() => act.mutate({ path: '/allocate-proxy' })}
             onBind={() =>
-              api(`/api/panel/proxies/${bindId || free[0].id}/bind`, {
+              api(`/api/panel/proxies/${selectedBindId}/bind`, {
                 method: 'POST',
-                body: JSON.stringify({ vm_id: id }),
+                body: JSON.stringify({
+                  vm_id: id,
+                  node_id: vm.node_id || null,
+                }),
               })
                 .then(() => {
                   toast.success('已绑定')
@@ -386,7 +411,10 @@ export function VmDetailPage() {
                 .catch((error: Error) => toast.error(error.message))
             }
             onProbe={() =>
-              api(`/api/panel/proxies/${boundId}/probe`, { method: 'POST' })
+              api(`/api/panel/proxies/${boundId}/probe`, {
+                method: 'POST',
+                body: JSON.stringify({ node_id: vm.node_id || null }),
+              })
                 .then(() => {
                   toast.success('探测完成')
                   return refreshAll()
@@ -396,7 +424,10 @@ export function VmDetailPage() {
             onGeo={() =>
               api<{
                 geo?: { timezone?: string | null; country?: string | null }
-              }>(`/api/panel/proxies/${boundId}/geo`, { method: 'POST' })
+              }>(`/api/panel/proxies/${boundId}/geo`, {
+                method: 'POST',
+                body: JSON.stringify({ node_id: vm.node_id || null }),
+              })
                 .then((data) => {
                   const where = [data.geo?.country, data.geo?.timezone]
                     .filter(Boolean)

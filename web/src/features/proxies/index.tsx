@@ -4,6 +4,7 @@ import { VIEW_TITLES } from '@/config/nav'
 import type { Vm, VmProxySnap } from '@/types/panel-vm'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
+import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { PageHeader } from '@/components/page-header'
 import { SectionSkeleton } from '@/components/page-skeletons'
@@ -15,6 +16,7 @@ import { ProxyImportPanel } from './proxy-import-panel'
 import { ProxyList } from './proxy-list'
 import { ProxyManagePanel } from './proxy-manage-panel'
 import { ProxyOverview } from './proxy-overview'
+import { ProxyPanel } from './proxy-panel'
 import type { ProxyRowActions } from './proxy-row'
 import {
   PROXY_SORT_DEFAULT_DIR,
@@ -24,6 +26,9 @@ import {
   proxyLabel,
   proxyInFilter,
   proxyIsLocal,
+  proxyRows,
+  proxyScope,
+  proxyViewId,
   proxyMatchesQuery,
   readPositive,
   sortedProxies,
@@ -72,7 +77,8 @@ export function ProxiesPage() {
   } | null>(null)
   const deferredQuery = useDeferredValue(query.trim().toLowerCase())
 
-  const list = useMemo(() => px.data?.proxies || [], [px.data?.proxies])
+  const list = useMemo(() => proxyRows(px.data), [px.data])
+  const canonicalLocal = px.data?.proxies?.find(proxyIsLocal)
   const tot = px.data?.totals || {}
   const cfg = px.data?.config || {}
   const vms: Vm[] = useMemo(() => dash.data?.vms || [], [dash.data?.vms])
@@ -110,16 +116,29 @@ export function ProxiesPage() {
       ),
     [sorted, filter, bindLimit, deferredQuery, vmById]
   )
-  const deleting = list.find((p) => p.id === delId)
+  const deleting = px.data?.proxies?.find((p) => p.id === delId)
   const delBound = proxyBoundIds(deleting).length
   const editing = list.find((p) => p.id === editId) || null
 
+  function rowRequest<T = unknown>(
+    viewId: string,
+    action: string,
+    body: Record<string, unknown> = {}
+  ): Promise<T> {
+    const row = list.find((p) => proxyViewId(p) === viewId)
+    if (!row?.id) return Promise.reject(new Error('出口已变化，请刷新后重试'))
+    return api<T>(
+      `/api/panel/proxies/${encodeURIComponent(row.id)}/${action}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ ...body, ...proxyScope(row) }),
+      }
+    )
+  }
+
   const probeOne = useMutation({
     mutationKey: PROBE_KEY,
-    mutationFn: (id: string) =>
-      api(`/api/panel/proxies/${encodeURIComponent(id)}/probe`, {
-        method: 'POST',
-      }),
+    mutationFn: (id: string) => rowRequest(id, 'probe'),
     onSuccess: async () => {
       toast.success('探测完成')
       await refresh()
@@ -129,10 +148,9 @@ export function ProxiesPage() {
   const geoOne = useMutation({
     mutationKey: GEO_KEY,
     mutationFn: (id: string) =>
-      api<{ geo?: { timezone?: string | null; country?: string | null } }>(
-        `/api/panel/proxies/${encodeURIComponent(id)}/geo`,
-        { method: 'POST' }
-      ),
+      rowRequest<{
+        geo?: { timezone?: string | null; country?: string | null }
+      }>(id, 'geo'),
     onSuccess: async (data) => {
       const where = [data.geo?.country, data.geo?.timezone]
         .filter(Boolean)
@@ -169,16 +187,13 @@ export function ProxiesPage() {
   })
   const bind = useMutation({
     mutationFn: ({ id, vmId }: { id: string; vmId: string }) =>
-      api(`/api/panel/proxies/${encodeURIComponent(id)}/bind`, {
-        method: 'POST',
-        body: JSON.stringify({ vm_id: vmId }),
-      }),
+      rowRequest(id, 'bind', { vm_id: vmId }),
     onSuccess: async (_data, { id, vmId }) => {
-      const to = list.find((p) => p.id === id)
+      const to = list.find((p) => proxyViewId(p) === id)
       const from = ownerOf.get(vmId)
       const name = vmById.get(vmId)?.name || vmId
       toast.success(
-        from && from.id !== id
+        from && proxyViewId(from) !== id
           ? `${name} 已从 ${proxyLabel(from)} 换绑到 ${to ? proxyLabel(to) : id}`
           : `${name} 已绑定`
       )
@@ -188,10 +203,7 @@ export function ProxiesPage() {
   })
   const unbind = useMutation({
     mutationFn: ({ id, vmId }: { id: string; vmId: string }) =>
-      api(`/api/panel/proxies/${encodeURIComponent(id)}/unbind`, {
-        method: 'POST',
-        body: JSON.stringify({ vm_id: vmId }),
-      }),
+      rowRequest(id, 'unbind', { vm_id: vmId }),
     onSuccess: async () => {
       toast.success('已解绑')
       setUnbindTarget(null)
@@ -257,8 +269,8 @@ export function ProxiesPage() {
 
   function locate(id: string) {
     // 目标被筛掉时先放开筛选，否则「点列定位」会落空。
-    const target = list.find((p) => p.id === id)
-    if (target && !rows.some((p) => p.id === id)) {
+    const target = list.find((p) => proxyViewId(p) === id)
+    if (target && !rows.some((p) => proxyViewId(p) === id)) {
       setFilter('all')
       setQuery('')
     }
@@ -319,7 +331,38 @@ export function ProxiesPage() {
               onLocate={locate}
               onVmDragChange={setDragVm}
             />
-            <ProxyImportPanel hasLocal={list.some(proxyIsLocal)} />
+            <ProxyImportPanel hasLocal={!!canonicalLocal} />
+            {canonicalLocal?.id ? (
+              <ProxyPanel title='所有节点的 local'>
+                <p className='text-xs text-muted-foreground'>
+                  各节点独立计算席位。以下操作作用于所有节点的 local 出口。
+                </p>
+                <div className='mt-3 flex gap-2'>
+                  <Button
+                    size='sm'
+                    variant='outline'
+                    disabled={setEnabled.isPending}
+                    onClick={() =>
+                      setEnabled.mutate({
+                        id: canonicalLocal.id!,
+                        on: canonicalLocal.enabled === false,
+                      })
+                    }
+                  >
+                    {canonicalLocal.enabled === false
+                      ? '启用全部 local'
+                      : '禁用全部 local'}
+                  </Button>
+                  <Button
+                    size='sm'
+                    variant='outline'
+                    onClick={() => setDelId(canonicalLocal.id!)}
+                  >
+                    删除全部 local
+                  </Button>
+                </div>
+              </ProxyPanel>
+            ) : null}
             <ProxyManagePanel
               proxies={list}
               bindLimit={bindLimit}
@@ -379,11 +422,17 @@ export function ProxiesPage() {
       <ConfirmDialog
         open={!!delId}
         onOpenChange={() => setDelId('')}
-        title='删除代理'
+        title={
+          deleting && proxyIsLocal(deleting)
+            ? '删除所有节点的 local'
+            : '删除代理'
+        }
         desc={
           delBound
-            ? `删除后 ${delBound} 台虚拟机将解绑，确认？`
-            : '删除这条 SOCKS5？'
+            ? `删除后${deleting && proxyIsLocal(deleting) ? '所有节点上的' : ''} ${delBound} 台虚拟机将解绑，确认？`
+            : deleting && proxyIsLocal(deleting)
+              ? '删除所有节点的 local 出口？'
+              : '删除这条 SOCKS5？'
         }
         confirmText='删除'
         cancelBtnText='取消'

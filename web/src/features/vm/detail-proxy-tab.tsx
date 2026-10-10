@@ -15,8 +15,8 @@ import { TabsContent } from '@/components/ui/tabs'
 import { StatusMark } from '@/components/status-mark'
 import { HealthDonut } from '@/features/overview/health-gauge'
 import {
-  LOCAL_PROXY_HINT,
   proxyIsLocal,
+  proxyHostText,
   proxyLabel,
   proxyStatusLabel,
 } from '@/features/proxies/proxy-sort'
@@ -62,8 +62,8 @@ export function VmProxyTab(props: VmProxyTabProps) {
   const health = proxyHealthOf(vm, proxy)
   const local = !!boundId && proxyIsLocal(proxy)
   const vpsIp = useVpsIp(vm.node_id, pool)
-  // 本地代理行的地理是控制面那台；节点槽从节点出网，那份地理不代表它。
-  const nodeLocal = local && !!vm.node_id
+  // 旧接口不带节点出口行时，不把主控地理当作子节点观测。
+  const unscopedNodeLocal = local && !!vm.node_id && !proxy.view_id
   const selectedId = bindId || free[0]?.id || ''
 
   return (
@@ -76,9 +76,14 @@ export function VmProxyTab(props: VmProxyTabProps) {
         </CardHeader>
         <p className='px-6 pb-2 text-xs text-muted-foreground'>
           {local
-            ? `${LOCAL_PROXY_HINT}：槽内流量与控制面代发请求（换票、刷新、测试）都从 ${localProxyText(vpsIp)} 出网。`
+            ? `槽内流量与控制面代发请求（换票、刷新、测试）都从 ${proxy.view_id ? proxyLabel(proxy) : localProxyText(vpsIp)} 出网，local 席位按所在 VPS 独立计算。`
             : '出站经这条代理的 egress 网关。槽内不 Dial SOCKS。'}
         </p>
+        {proxy.blocked_reason === 'node_unavailable' ? (
+          <p className='px-6 pb-2 text-xs text-caution-3'>
+            节点未连接，已有绑定保留；连接恢复后才能绑定新槽位或探测。
+          </p>
+        ) : null}
         <CardContent className='flex flex-wrap gap-6 pt-0'>
           <HealthDonut score={health.score} label='健康' size={80} />
           <div className='min-w-0 flex-1 divide-y'>
@@ -92,7 +97,8 @@ export function VmProxyTab(props: VmProxyTabProps) {
             ) : null}
             <Field label='地址'>
               <span className='field-host text-xs'>
-                {proxyHostLabel(proxy, vpsIp)}
+                {local ? proxyHostText(proxy, vpsIp) : proxyHostLabel(proxy)}
+                {local && vpsIp ? ` · ${vpsIp}` : ''}
               </span>
             </Field>
             <Field label='状态'>
@@ -123,7 +129,7 @@ export function VmProxyTab(props: VmProxyTabProps) {
             </Field>
             <Field label='认证'>{proxy.has_auth ? '有' : '无'}</Field>
             <Field label='出口'>
-              {nodeLocal ? (
+              {unscopedNodeLocal ? (
                 <span className='text-xs text-muted-foreground'>
                   随节点出口（时区按节点出口地理同步）
                 </span>
@@ -167,7 +173,7 @@ export function VmProxyTab(props: VmProxyTabProps) {
               ) : (
                 <span className='text-xs text-muted-foreground'>
                   {proxy.blocked_reason
-                    ? 'IPv6 已关闭'
+                    ? proxyStatusLabel(proxy)
                     : proxy.geo?.error
                       ? '检测失败'
                       : '未检测'}
@@ -192,7 +198,7 @@ export function VmProxyTab(props: VmProxyTabProps) {
               size='sm'
               variant='outline'
               onClick={onGeo}
-              disabled={!!proxy.blocked_reason || nodeLocal}
+              disabled={!!proxy.blocked_reason}
             >
               测地理
             </Button>

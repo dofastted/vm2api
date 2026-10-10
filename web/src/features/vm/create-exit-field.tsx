@@ -1,7 +1,6 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import type { VmProxySnap } from '@/types/panel-vm'
-import { localProxyText } from '@/lib/vm-status'
 import { Label } from '@/components/ui/label'
 import {
   Select,
@@ -11,8 +10,8 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import {
-  LOCAL_PROXY_HINT,
   proxyBindable,
+  proxiesForNode,
   proxyOptionLabel,
   proxyRemaining,
   readPositive,
@@ -35,13 +34,13 @@ export type CreateExit = {
 }
 
 /**
- * 创建槽位时的出口。本地代理固定第一，按目标 VPS 标成 `local:<IP>`：
+ * 创建槽位时的出口。本地代理固定第一，按目标 VPS 选择对应出口与容量：
  * 放到集群节点时它就是那台节点自身的出口。
  */
 export function useCreateExit(nodeId: string): CreateExit {
   const px = useQuery(proxiesQueryOptions())
   const [picked, setPicked] = useState(AUTO_EXIT)
-  const proxies = px.data?.proxies || []
+  const proxies = proxiesForNode(px.data, nodeId)
   const tot = (px.data?.totals || {}) as Record<string, unknown>
   const cfg = (px.data?.config || {}) as Record<string, unknown>
   const poolLimit = readPositive(
@@ -90,8 +89,8 @@ export function CreateExitField({
         </SelectContent>
       </Select>
       <p className='text-xs text-muted-foreground'>
-        本地代理 = {LOCAL_PROXY_HINT}（{localProxyText(exit.vpsIp)}
-        ）：槽位与控制面代发请求都从{remote ? '目标节点' : '本机'}自身出网。
+        本地代理按 VPS 独立计算席位：槽位与控制面代发请求都从
+        {remote ? '目标节点' : '主控'}自身出网。
       </p>
     </div>
   )

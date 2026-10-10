@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- 代理池按控制面和集群节点分别展示 local 出口，并按 VM 所在节点计算绑定上限；创建、自动分配和恢复绑定使用同一额度规则。已有 `px-local` 记录和运行网络保持兼容，节点探测与地理信息不再借用主控结果。local 的启停和删除仍是全部节点共享的管理操作，界面单独标明（#329）。
+
 ## 1.3.136 — 2026-10-10
 
 - 槽位可创建为 KVM 虚拟机（与 Docker 子容器并存）。新增 `routing.vm`（默认形态、内存、vCPU、磁盘、CPU 型号、SMBIOS、MAC 前缀、`allow_tcg`）；创建时可覆盖内存 / vCPU / 磁盘并固化到 `vm.machine`。槽内存改为读 `vm.machine.memory` → `routing.vm.memory`（默认 `512m`），移除 `KIN_VM_MEMORY`。`GET /api/panel/cluster/local` 返回 `kvm: { ok, accel, error }`；节点 preflight 在 `runtime_type=kvm` 时含 `kvm` 检查。租户创建表单读 `GET /api/panel/vms/create-options`（与 `POST /vms/create` 同 ACL），因为 user 不能读 cluster/local 与 routing。

@@ -429,6 +429,41 @@ export function createPanelHandler(ctx) {
   const refreshWorkerCredentialForVm = (...args) => ctx.refreshWorkerCredentialForVm(...args)
   const fetchWorkerModels = (...args) => ctx.fetchWorkerModels(...args)
 
+  function proxyNodeScope(body, res) {
+    if (!body || !Object.hasOwn(body, 'node_id')) return {}
+    if (body.node_id === null) return { nodeId: null }
+    if (typeof body.node_id === 'string' && body.node_id.trim()) return { nodeId: body.node_id.trim() }
+    json(res, 400, {
+      ok: false,
+      error: { code: 'invalid_node_id', message: 'node_id must be a node id or null for the control plane' },
+    })
+    return null
+  }
+
+  async function readProxyBody(req, res) {
+    try {
+      const body = await readBody(req, 8192)
+      if (body && typeof body === 'object' && !Array.isArray(body)) return body
+    } catch {}
+    // A malformed scoped request must not silently become an unscoped action.
+    json(res, 400, { ok: false, error: { code: 'invalid_json', message: 'Expected a JSON object' } })
+    return null
+  }
+
+  function rejectScopedLocalManagement(id, body, res) {
+    if (!body || !Object.hasOwn(body, 'node_id')) return false
+    const proxy = proxyPool.state?.proxies?.find((item) => item.id === id)
+    if (!isLocalEgressProxy(proxy)) return false
+    json(res, 400, {
+      ok: false,
+      error: {
+        code: 'local_scope_operation_unsupported',
+        message: 'local 的编辑、启停和删除作用于所有节点，请使用全部 local 管理操作',
+      },
+    })
+    return true
+  }
+
   function restoreSchedulableIfReady(vmId) {
     const vm = getVm(cfg.paths.project, vmId)
     if (!vmHasClaudeCredential(vm)) {
@@ -2989,7 +3024,7 @@ export function createPanelHandler(ctx) {
           }
           let preflight
           try {
-            preflight = await preflightNode(nodeId, { kernel: wantKernel, runtime })
+            preflight = await (ctx.preflightNode || preflightNode)(nodeId, { kernel: wantKernel, runtime })
           } catch (e) {
             return json(res, e?.status || 500, {
               ok: false,
@@ -3010,7 +3045,7 @@ export function createPanelHandler(ctx) {
         // An explicit exit (e.g. local egress for a node: that VPS's own route) replaces auto-allocation.
         const pickedProxyId = typeof body.proxy_id === 'string' ? body.proxy_id.trim() : ''
         if (pickedProxyId) {
-          const row = proxyPool.snapshot().proxies.find((proxy) => proxy.id === pickedProxyId)
+          const row = proxyPool.snapshot({ nodeId }).proxies.find((proxy) => proxy.id === pickedProxyId)
           const owner = ident.role === 'user' ? normalizeOwnerId(req.panelUserId) : null
           if (!row || !canBindProxyToVm(row, { owner_user_id: owner }, { role: ident.role })) {
             return json(res, 404, {
@@ -3225,7 +3260,7 @@ export function createPanelHandler(ctx) {
           200,
           panel.ok({
             vm: panel.publicVmBootView(summarizeVm(saved, cfg.paths.project, ctx.routingConfig)),
-            allocated_proxy: panel.publicAllocatedProxy(proxyPool, allocated),
+            allocated_proxy: panel.publicAllocatedProxy(proxyPool, allocated, { nodeId, role: ident.role }),
             ...(startError ? { start_error: startError } : {}),
             ...(proxyError ? { proxy_error: proxyError } : {}),
           }),
@@ -3264,7 +3299,10 @@ export function createPanelHandler(ctx) {
           200,
           panel.ok({
             vm: panel.publicVmBootView(summarizeVm(vm, cfg.paths.project, ctx.routingConfig)),
-            allocated_proxy: panel.publicAllocatedProxy(proxyPool, bound),
+            allocated_proxy: panel.publicAllocatedProxy(proxyPool, bound, {
+              nodeId: vm.node_id || null,
+              role: panelIdentity(req).role,
+            }),
             runtime: panel.publicRuntimeView(vm.runtime) || GATEWAY_CAPABILITIES.runtime,
             kernel: GATEWAY_CAPABILITIES.kernel,
             boot: panel.publicSlotBoot(boot),
@@ -4342,7 +4380,11 @@ export function createPanelHandler(ctx) {
       if (req.method === 'GET' && p === '/api/panel/proxies') {
         const ident = panelIdentity(req)
         const snap = ident.role === 'user' ? proxyPool.snapshot({ ownerUserId: req.panelUserId }) : proxyPool.snapshot()
-        if (ident.role !== 'admin') delete snap.config.dns_primary
+        if (ident.role !== 'admin') {
+          delete snap.config.dns_primary
+          // Node labels may contain SSH addresses, which belong to the admin-only cluster view.
+          for (const exit of snap.local_exits || []) exit.node_name = exit.node_id || null
+        }
         return json(res, 200, panel.ok(snap))
       }
       if (req.method === 'POST' && p === '/api/panel/proxies/local') {
@@ -4444,6 +4486,7 @@ export function createPanelHandler(ctx) {
       if (req.method === 'PUT' && /^\/api\/panel\/proxies\/(?!config$)[^/]+$/.test(p)) {
         const id = p.split('/')[4]
         const body = await readBody(req, 64 * 1024)
+        if (rejectScopedLocalManagement(id, body, res)) return
         // Forward only the keys the caller actually sent — update() reads
         // presence, not value, to tell "leave alone" from "clear".
         const patch = {}
@@ -4512,7 +4555,11 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'POST' && /^\/api\/panel\/proxies\/[^/]+\/probe$/.test(p)) {
         const id = p.split('/')[4]
-        const result = await proxyPool.probeById(id)
+        const body = await readProxyBody(req, res)
+        if (!body) return
+        const scope = proxyNodeScope(body, res)
+        if (!scope) return
+        const result = await proxyPool.probeById(id, scope)
         if (result.probe?.scope === 'policy') {
           return json(res, 409, {
             ok: false,
@@ -4531,8 +4578,11 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'POST' && /^\/api\/panel\/proxies\/[^/]+\/geo$/.test(p)) {
         const id = p.split('/')[4]
-        const body = await readBody(req, 8192).catch(() => ({}))
-        const result = await proxyPool.detectGeo(id, { force: body?.force !== false })
+        const body = await readProxyBody(req, res)
+        if (!body) return
+        const scope = proxyNodeScope(body, res)
+        if (!scope) return
+        const result = await proxyPool.detectGeo(id, { ...scope, force: body?.force !== false })
         if (result.error === 'ipv6_disabled') {
           return json(res, 409, {
             ok: false,
@@ -4572,6 +4622,9 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'POST' && /^\/api\/panel\/proxies\/[^/]+\/enable$/.test(p)) {
         const id = p.split('/')[4]
+        const body = await readProxyBody(req, res)
+        if (!body) return
+        if (rejectScopedLocalManagement(id, body, res)) return
         const result = proxyPool.setEnabled(id, true)
         if (!result.ok)
           return json(res, 404, {
@@ -4591,6 +4644,9 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'POST' && /^\/api\/panel\/proxies\/[^/]+\/disable$/.test(p)) {
         const id = p.split('/')[4]
+        const body = await readProxyBody(req, res)
+        if (!body) return
+        if (rejectScopedLocalManagement(id, body, res)) return
         const result = proxyPool.setEnabled(id, false)
         if (!result.ok)
           return json(res, 404, {
@@ -4608,10 +4664,23 @@ export function createPanelHandler(ctx) {
             ok: false,
             error: { type: 'invalid_request_error', code: 'missing_field', message: 'vm_id required', param: 'vm_id' },
           })
-        const result = proxyPool.bind(id, vmId)
+        const scope = proxyNodeScope(body, res)
+        if (!scope) return
+        const targetVm = getVm(cfg.paths.project, vmId)
+        const targetProxy = proxyPool.state?.proxies?.find((item) => item.id === id)
+        const ident = panelIdentity(req)
+        if (
+          !targetVm ||
+          !targetProxy ||
+          (ident.role === 'user' && normalizeOwnerId(targetVm.owner_user_id) !== normalizeOwnerId(req.panelUserId)) ||
+          !canBindProxyToVm(targetProxy, targetVm, { role: ident.role })
+        ) {
+          return json(res, 404, { ok: false, error: { code: 'proxy_not_found', message: '出口或槽位不存在' } })
+        }
+        const result = proxyPool.bind(id, vmId, scope)
         if (!result.ok) {
           const message =
-            result.error === 'proxy_bind_limit' ? `SOCKS5 最多绑定 ${result.max || 5} 台虚拟机` : result.error
+            result.error === 'proxy_bind_limit' ? `此出口最多绑定 ${result.max || 5} 台虚拟机` : result.error
           return json(res, 400, {
             ok: false,
             error: { type: 'invalid_request_error', code: result.error, message, details: result },
@@ -4638,7 +4707,9 @@ export function createPanelHandler(ctx) {
         const id = p.split('/')[4]
         const body = await readBody(req, 64 * 1024)
         const vmId = String(body.vm_id || '').trim()
-        const snap = proxyPool.snapshot().proxies.find((proxy) => proxy.id === id)
+        const scope = proxyNodeScope(body, res)
+        if (!scope) return
+        const snap = proxyPool.snapshot(scope).proxies.find((proxy) => proxy.id === id)
         const targets = vmId
           ? [vmId]
           : snap?.bound_vm_ids?.length
@@ -4646,9 +4717,9 @@ export function createPanelHandler(ctx) {
             : snap?.bound_vm_id
               ? [snap.bound_vm_id]
               : []
-        const result = proxyPool.unbind(id, vmId || null)
+        const result = proxyPool.unbind(id, vmId || null, scope)
         if (!result.ok)
-          return json(res, 404, {
+          return json(res, result.error === 'proxy_not_found' ? 404 : 400, {
             ok: false,
             error: { type: 'not_found_error', code: result.error, message: result.error },
           })
@@ -4656,13 +4727,17 @@ export function createPanelHandler(ctx) {
           bindVmProxy(cfg.paths.project, unboundId, null)
           setVmSchedulable(cfg.paths.project, unboundId, false, 'proxy_required')
         }
-        if (egressEnabled() && !(result.proxy?.bound_vm_ids || []).length) {
+        const remaining = proxyPool.snapshot().proxies.find((proxy) => proxy.id === id)
+        if (egressEnabled() && !(remaining?.bound_vm_ids || []).length) {
           stopProxyEgress(cfg.paths.project, id)
         }
         return json(res, 200, panel.ok(result.proxy))
       }
       if (req.method === 'DELETE' && /^\/api\/panel\/proxies\/[^/]+$/.test(p)) {
         const id = p.split('/').pop()
+        const body = await readProxyBody(req, res)
+        if (!body) return
+        if (rejectScopedLocalManagement(id, body, res)) return
         const snap = proxyPool.snapshot().proxies.find((proxy) => proxy.id === id)
         const targets = snap?.bound_vm_ids?.length ? snap.bound_vm_ids : snap?.bound_vm_id ? [snap.bound_vm_id] : []
         const result = proxyPool.remove(id)

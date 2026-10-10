@@ -36,6 +36,7 @@ import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import { filterVmsForPanel } from './resource-owner.mjs'
 import { computeWeeklySplit, publicWeeklySplit, weeklySplitConfig } from '../pool/weekly-split.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
+import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { socksProxyFamily, normalizeSocksHost } from '../vm/socks-address.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from '../pool/quota-tiers.mjs'
 import { applyVmQuotaConfig, applyVmQuotaPolicy, vmQuotaOverrideOf, vmQuotaView } from '../pool/vm-quota-override.mjs'
@@ -94,10 +95,19 @@ export function ok(data, meta) {
 }
 
 /** Start/create `allocated_proxy` must never carry SOCKS credentials. */
-export function publicAllocatedProxy(proxyPool, bound) {
+export function publicAllocatedProxy(proxyPool, bound, { nodeId = undefined, role = 'admin' } = {}) {
   if (!bound) return null
   const raw = bound.id && proxyPool?.state?.proxies?.find((p) => p.id === bound.id)
-  if (raw && typeof proxyPool.publicProxy === 'function') return proxyPool.publicProxy(raw)
+  if (raw && typeof proxyPool.publicProxy === 'function') {
+    const scope = nodeId !== undefined ? { nodeId } : Object.hasOwn(bound, 'node_id') ? { nodeId: bound.node_id } : {}
+    const proxy = proxyPool.publicProxy(raw, scope)
+    if (role !== 'admin') {
+      delete proxy.node_name
+      delete proxy.bound_vm_id
+      delete proxy.bound_vm_ids
+    }
+    return proxy
+  }
   return {
     id: bound.id || null,
     host: bound.host || null,
@@ -1478,7 +1488,9 @@ function poolProxyForVm(v, poolSnap) {
   const list = poolSnap?.proxies || []
   if (!list.length) return null
   const id = v.proxy_id || v.proxy?.id
-  return list.find((p) => (id && p.id === id) || proxyHasVm(p, v.id)) || null
+  const proxy = list.find((p) => (id && p.id === id) || proxyHasVm(p, v.id)) || null
+  if (!proxy || !isLocalEgressProxy(proxy) || !Array.isArray(poolSnap.local_exits)) return proxy
+  return poolSnap.local_exits.find((p) => p.id === proxy.id && (p.node_id || null) === (v.node_id || null)) || null
 }
 
 function proxyConfigured(v, hit) {
@@ -1506,6 +1518,14 @@ function mergeVmProxy(v, poolSnap) {
   return {
     proxy: {
       id: hit?.id || base.id || v.proxy_id || null,
+      ...(hit?.view_id
+        ? {
+            view_id: hit.view_id,
+            node_id: hit.node_id,
+            bound_count: hit.bound_count,
+            bind_limit: hit.bind_limit,
+          }
+        : {}),
       host: normalizeSocksHost(hit?.host || base.host) || hit?.host || base.host || null,
       port: hit?.port ?? base.port ?? null,
       label: hit?.label || null,

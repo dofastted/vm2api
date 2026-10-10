@@ -89,7 +89,7 @@ export function ProxyManagePanel({
       ) {
         toast.success('出口 DNS 已保存，本机出口已同步')
       } else if (patch.bind_limit != null) {
-        toast.success(`每条最多绑 ${String(patch.bind_limit)} 台`)
+        toast.success(`每个出口最多绑 ${String(patch.bind_limit)} 台`)
       } else if (patch.probe_interval_min != null) {
         toast.success(`探测间隔 ${String(patch.probe_interval_min)} 分钟`)
       } else {
@@ -145,7 +145,7 @@ export function ProxyManagePanel({
           onClick={() => probeAll.mutate()}
           disabled={probeAll.isPending || !proxies.length}
           loading={probeAll.isPending}
-          title='只测 SOCKS TCP，不打 Anthropic'
+          title='检测各出口可用性，不发送推理请求'
         >
           <Activity aria-hidden='true' />
           全部测通
@@ -170,7 +170,7 @@ export function ProxyManagePanel({
       <div className='mt-4 space-y-4 border-t pt-4'>
         <fieldset>
           <legend className='flex w-full items-baseline justify-between text-xs font-medium'>
-            每条代理最多绑
+            每个出口最多绑
             <span className='text-muted-foreground tabular-nums'>
               容量 {proxies.length} × {limitShown} ={' '}
               <b className='font-semibold text-foreground'>
@@ -193,7 +193,7 @@ export function ProxyManagePanel({
             />
           </div>
           <Segmented
-            label='每条代理最多绑定台数'
+            label='每个出口最多绑定台数'
             options={BIND_LIMITS}
             value={limitShown}
             disabled={saveConfig.isPending}
@@ -205,7 +205,7 @@ export function ProxyManagePanel({
               ? `${over.length} 条代理已绑超过 ${limitShown} 台：现有绑定保留，只是不再接新槽位。`
               : maxUsed
                 ? `亮格为当前绑得最多的一条（${maxUsed} 台）。`
-                : '调低不会踢掉已绑的槽位。'}
+                : '每台 VPS 的 local 独立计数；调低不会踢掉已绑的槽位。'}
           </p>
         </fieldset>
 
