@@ -350,7 +350,48 @@ async function admitCodexCandidate(projectRoot, req, opts, { deadline, signal })
   }
 }
 
-export async function runCodexKernelHop({ hop, args = {}, onEvent } = {}) {
+// Observed with gpt-6-astra + Responses Lite, not a documented upstream limit.
+// Retry only a failed full-history attempt, keeping the newest reasoning suffix.
+function reasoningHistoryFallback(args, result) {
+  if (process.env.KIN_CODEX_REASONING_HISTORY_FALLBACK === '0') return null
+  const body = args.body
+  const error = result?.body?.error || result?.body?.response?.error
+  if (result?.ok || result?.committed || result?.transportError || args.signal?.aborted) return null
+  if (![500, 502].includes(Number(result?.status)) || error?.code !== 'server_error') return null
+  if (body?.model !== 'gpt-6-astra' || body?.reasoning?.context !== 'all_turns' || !Array.isArray(body.input))
+    return null
+  if (String(args.envelope?.headers?.['x-openai-internal-codex-responses-lite']).toLowerCase() !== 'true') return null
+  if (body.previous_response_id || args.envelope?.session?.previous_response_id) return null
+  const encrypted = (item) =>
+    item?.type === 'reasoning' && typeof item.encrypted_content === 'string' && item.encrypted_content.length > 0
+  const history = body.input.filter(encrypted)
+  const originalBytes = Buffer.byteLength(JSON.stringify(history.map((item) => item.encrypted_content)))
+  if (originalBytes <= 128 * 1024) return null
+  let retainedBytes = 2
+  const keep = new Set()
+  for (let i = body.input.length - 1; i >= 0; i--) {
+    const item = body.input[i]
+    if (!encrypted(item)) continue
+    const bytes = Buffer.byteLength(JSON.stringify(item.encrypted_content)) + (keep.size ? 1 : 0)
+    if (retainedBytes + bytes > 120 * 1024) break
+    retainedBytes += bytes
+    keep.add(i)
+  }
+  if (!keep.size || keep.size === history.length) return null
+  const nextBody = { ...body, input: body.input.filter((item, i) => !encrypted(item) || keep.has(i)) }
+  return {
+    args: { ...args, body: nextBody, envelope: { ...args.envelope, body: nextBody } },
+    info: {
+      original_array_bytes: originalBytes,
+      retained_array_bytes: retainedBytes,
+      original_items: history.length,
+      retained_items: keep.size,
+      omitted_items: history.length - keep.size,
+    },
+  }
+}
+
+export async function runCodexKernelHop({ hop, args = {}, onEvent, onReasoningFallback } = {}) {
   let emitted = false
   const wrapped = async (line) => {
     emitted = true
@@ -359,6 +400,17 @@ export async function runCodexKernelHop({ hop, args = {}, onEvent } = {}) {
   let result = await hop({ ...args, onEvent: wrapped })
   if (!result?.ok && !emitted && isRetryableCodexTransport(result)) {
     result = { ...(await hop({ ...args, onEvent: wrapped })), transport_retried: true }
+  }
+  const fallback = !emitted && !result?.transport_retried ? reasoningHistoryFallback(args, result) : null
+  if (fallback) {
+    if (onReasoningFallback)
+      await onReasoningFallback({ originalResult: result, body: fallback.args.body, ...fallback.info })
+    if (args.signal?.aborted) return result
+    result = {
+      ...(await hop({ ...fallback.args, onEvent: wrapped })),
+      reasoning_history_retried: true,
+      reasoning_history_fallback: fallback.info,
+    }
   }
   return result
 }
@@ -577,6 +629,7 @@ export async function handleCodexProtocol({
           hop,
           args: {
             exec: execFor(projectRoot, vm),
+            signal: gone.signal,
             body: outboundBody,
             reqHeaders: req.headers,
             envelope: {
@@ -585,6 +638,9 @@ export async function handleCodexProtocol({
               stream: true,
               session,
             },
+          },
+          onReasoningFallback: ({ body: retryBody }) => {
+            if (captureOutbound) logBag.outbound_body = retryBody
           },
           onEvent: async (line) => {
             if (conversionError) return
@@ -627,6 +683,7 @@ export async function handleCodexProtocol({
         }
         ingestCodexHop(projectRoot, vm.id, result, Date.now(), normalizeCodexRouting(routing.codex).quota)
         if (result?.transport_retried) logBag.transport_retried = true
+        if (result?.reasoning_history_retried) logBag.attempt_count += 1
         last = result
         const hopUsage = result.usage || result.body?.usage || result.body?.response?.usage || null
         const usage = preferUsage(hopUsage, streamedUsage)
