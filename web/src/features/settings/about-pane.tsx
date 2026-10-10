@@ -32,8 +32,7 @@ export function AboutPane() {
   const changelog = useQuery(changelogQueryOptions())
   const [confirmOpen, setConfirmOpen] = useState(false)
   const data = version.data
-  const updateRunning =
-    !!upgradeTarget || data?.upgrade?.state === 'running'
+  const updateRunning = !!upgradeTarget || data?.upgrade?.state === 'running'
 
   useEffect(() => {
     if (!upgradeTarget) return
@@ -155,15 +154,15 @@ export function AboutPane() {
           ) : null}
           {updateRunning ? (
             <Alert>
-              <AlertTitle>正在更新到 {upgradeTarget || data?.upgrade?.target}</AlertTitle>
+              <AlertTitle>
+                正在更新到 {upgradeTarget || data?.upgrade?.target}
+              </AlertTitle>
               <AlertDescription>等待后端重启和版本验证。</AlertDescription>
             </Alert>
           ) : data?.upgrade?.state === 'failed' ? (
             <Alert variant='destructive'>
               <AlertTitle>更新失败</AlertTitle>
-              <AlertDescription>
-                {data.upgrade.log_command}
-              </AlertDescription>
+              <AlertDescription>{data.upgrade.log_command}</AlertDescription>
             </Alert>
           ) : null}
           {data?.needs_wrap_cli_sync ? (
@@ -195,8 +194,7 @@ export function AboutPane() {
         </CardHeader>
         <CardContent className='space-y-3'>
           <p className='text-sm text-muted-foreground'>
-            在宿主机执行。保留 .env / vms / data，不 docker rm
-            槽。
+            在宿主机执行。保留 .env / vms / data，不 docker rm 槽。
           </p>
           <pre className='overflow-x-auto rounded-md bg-muted px-3 py-2 font-mono text-xs'>
             {data?.upgrade_command ||
@@ -219,7 +217,9 @@ export function AboutPane() {
             </Button>
             <Button
               size='sm'
-              disabled={!data?.update_available || upgrade.isPending || updateRunning}
+              disabled={
+                !data?.update_available || upgrade.isPending || updateRunning
+              }
               onClick={() => setConfirmOpen(true)}
             >
               <ArrowUpCircle />
