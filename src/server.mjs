@@ -1039,7 +1039,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && (p === '/v1/completions' || p === '/completions')) {
       return await handleProtocol(req, res, 'openai.completions', p)
     }
-    if (req.method === 'POST' && (p === '/v1/responses' || p === '/responses')) {
+    if (
+      req.method === 'POST' &&
+      (p === '/v1/responses' || p === '/responses' || p === '/v1/responses/compact' || p === '/responses/compact')
+    ) {
       return await handleProtocol(req, res, 'openai.responses', p)
     }
     if (req.method === 'POST' && (p === '/v1/messages' || p === '/messages')) {

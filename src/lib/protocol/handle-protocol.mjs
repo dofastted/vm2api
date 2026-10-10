@@ -38,6 +38,7 @@ import { sanitizeInboundBody, defaultSeedPolicy } from './seed-policy.mjs'
 import { fingerprintRequest } from './client-fingerprint.mjs'
 import { validateOfficialModel } from './models.mjs'
 import { handleCodexProtocol, handleCodexSearch } from './handle-codex.mjs'
+import { isCodexCompactPath } from './codex-compact.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
 import { normalizeCodexRouting } from './codex-route.mjs'
 import { hasClaudeCode1mSuffix } from './context-1m.mjs'
@@ -405,12 +406,14 @@ export function createHandleProtocol(deps) {
   }
 
   async function handleProtocol(req, res, protocol, pathName) {
-    const logCtx = requestLog.start(req, { protocol, pathName })
+    const compact = protocol === 'openai.responses' && isCodexCompactPath(pathName)
+    const logProtocol = compact ? 'openai.responses.compact' : protocol
+    const logCtx = requestLog.start(req, { protocol: logProtocol, pathName })
     res._kinRequestId = logCtx.request_id
     // Registers its own 'finish' listener first so status/headers are final when finish() runs.
     requestLog.tapResponse?.(logCtx, res)
     const logBag = {
-      protocol,
+      protocol: logProtocol,
       model: null,
       stream: false,
       inbound_body: null,
@@ -484,13 +487,13 @@ export function createHandleProtocol(deps) {
     logBag.inbound_summary = summarizeBody(inbound)
     logBag.model = inbound?.model || null
     logBag.requested_model = inbound?.model || null
-    logBag.stream = isClientStream(inbound, req.headers)
+    logBag.stream = !compact && isClientStream(inbound, req.headers)
     logBag.has_tools = Array.isArray(inbound?.tools) && inbound.tools.length > 0
     logBag.session_id = sessionIdForLog(extractCallerSession({ inbound, headers: req.headers }))
     logBag.reasoning_effort = reasoningEffortOf(inbound)
 
     const fp = fingerprintRequest(req, inbound)
-    const healthDecision = getHealthMonitor()?.decide?.(req.headers, inbound, protocol)
+    const healthDecision = !compact && getHealthMonitor()?.decide?.(req.headers, inbound, protocol)
     if (healthDecision?.action === 'fail') {
       stats.requests++
       stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
@@ -547,10 +550,10 @@ export function createHandleProtocol(deps) {
     let ctx = {
       path: pathName,
       protocol,
-      body: sanitizeInboundBody(inbound, defaultSeedPolicy()),
+      body: compact ? inbound : sanitizeInboundBody(inbound, defaultSeedPolicy()),
       headers: { ...req.headers },
     }
-    ctx = applyIntercept(cfg.intercept.rules, 'before_convert', ctx)
+    if (!compact) ctx = applyIntercept(cfg.intercept.rules, 'before_convert', ctx)
     const bodyCheck = validateRequestBody(protocol, ctx.body)
     if (!bodyCheck.ok) {
       stats.errors++
@@ -574,6 +577,19 @@ export function createHandleProtocol(deps) {
       logBag.error_code = errorResult.body?.error?.code || 'model_not_supported'
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, errorResult.status, errorResult.body)
+    }
+    if (compact && platform.platform !== 'openai') {
+      stats.errors++
+      logBag.error_code = 'compact_model_unsupported'
+      logBag.error_message = 'responses/compact requires a Codex model'
+      return json(res, 400, {
+        error: {
+          type: 'invalid_request_error',
+          code: logBag.error_code,
+          message: logBag.error_message,
+          param: 'model',
+        },
+      })
     }
     const keyScope = keyScopeFromRequest(req)
     const poolDenial = vmPoolDenial(keyScope)
@@ -626,7 +642,10 @@ export function createHandleProtocol(deps) {
         return json(res, 200, mock)
       }
     }
-    if (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res })) {
+    if (
+      !compact &&
+      (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res }))
+    ) {
       return
     }
     if (platform.platform === 'openai') {

@@ -52,6 +52,13 @@ import {
   resolveOutboundSessionId,
 } from '../identity/identity-rewrite.mjs'
 import { clientIp } from '../pool/sticky-router.mjs'
+import {
+  isCodexCompactPath,
+  validateCodexCompact,
+  prepareCodexCompact,
+  compactHeaders,
+  createCodexCompactCollector,
+} from './codex-compact.mjs'
 
 // Official Codex client headers for ChatGPT Responses. Auth is attached by the kernel.
 const CODEX_KERNEL_HEADER_ALLOWLIST = Object.freeze([
@@ -350,14 +357,14 @@ async function admitCodexCandidate(projectRoot, req, opts, { deadline, signal })
   }
 }
 
-export async function runCodexKernelHop({ hop, args = {}, onEvent } = {}) {
+export async function runCodexKernelHop({ hop, args = {}, onEvent, retryTransport = true } = {}) {
   let emitted = false
   const wrapped = async (line) => {
     emitted = true
     if (onEvent) await onEvent(line)
   }
   let result = await hop({ ...args, onEvent: wrapped })
-  if (!result?.ok && !emitted && isRetryableCodexTransport(result)) {
+  if (retryTransport && !result?.ok && !emitted && isRetryableCodexTransport(result)) {
     result = { ...(await hop({ ...args, onEvent: wrapped })), transport_retried: true }
   }
   return result
@@ -381,6 +388,11 @@ export async function handleCodexProtocol({
   body = null,
   captureOutbound = false,
 }) {
+  const compact = protocol === 'openai.responses' && isCodexCompactPath(ctx.path)
+  if (compact && (req.aborted || res.destroyed)) {
+    logBag.final_state = 'cancelled'
+    return
+  }
   const codex = normalizeCodexRouting(routing.codex)
   const allowed = isCodexProtocolAllowed(protocol, { codex })
   if (!allowed.ok) {
@@ -404,6 +416,15 @@ export async function handleCodexProtocol({
       error: { type: 'permission_error', code: restriction.code, message: restriction.message },
     })
   }
+  const compactError = compact && validateCodexCompact(ctx.body)
+  if (compactError) {
+    stats.errors++
+    logBag.error_code = 'invalid_compact_request'
+    logBag.error_message = compactError
+    return json(res, 400, {
+      error: { type: 'invalid_request_error', code: 'invalid_compact_request', message: compactError },
+    })
+  }
   const converted = toCodexResponses(protocol, ctx.body, codex.convert)
   if (!converted.ok) {
     stats.errors++
@@ -422,13 +443,19 @@ export async function handleCodexProtocol({
       },
     })
   }
+  if (compact) converted.body = prepareCodexCompact(converted.body, req.headers)
   applyOpenaiWashLog(logBag, {
     inboundPath: ctx.path,
     inboundProtocol: protocol,
     converted: converted.converted,
     outboundBody: converted.body,
   })
-  const stream = inbound?.stream !== false && ctx.body?.stream !== false
+  if (compact) {
+    logBag.protocol = 'openai.responses.compact'
+    logBag.path = ctx.path
+    logBag.stream = false
+  }
+  const stream = !compact && inbound?.stream !== false && ctx.body?.stream !== false
   const inboundSession = sessionFrom(req, converted.body)
   const sessionMode = outboundSessionMode(routing)
   const callerSession = extractCallerSession({
@@ -484,7 +511,8 @@ export async function handleCodexProtocol({
       if (!counted) {
         counted = true
         stats.requests++
-        stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
+        const route = compact ? 'openai.responses.compact' : protocol
+        stats.by_route[route] = (stats.by_route[route] || 0) + 1
       }
       const stickyKeys = picked.stickyKeys?.length ? picked.stickyKeys : picked.sessionKey ? [picked.sessionKey] : []
       const stickyBound = picked.sessionKey ? stickyRouter?.resolve?.(picked.sessionKey) : null
@@ -542,6 +570,7 @@ export async function handleCodexProtocol({
         logBag.vm_id = vm.id
         logBag.attempt_count = hops
         const chunks = []
+        const compactCollector = compact ? createCodexCompactCollector(converted.body.input) : null
         const nameSseEvent = createResponsesSseEventNamer()
         let responseServiceTier = null
         let streamedUsage = null
@@ -570,15 +599,19 @@ export async function handleCodexProtocol({
         }
         logBag.outbound_session_id = sessionIdForLog(outboundSessionId)
         const outboundBody = applyCodexRebuildBody({ ...converted.body, stream: true }, outboundSessionId, sessionMode)
-        const outboundHeaders = codexKernelHeaders(req.headers, outboundBody, session)
+        const kernelHeaders = codexKernelHeaders(req.headers, outboundBody, session)
+        const outboundHeaders = compact ? compactHeaders(kernelHeaders) : kernelHeaders
         if (captureOutbound) logBag.outbound_body = outboundBody
         logBag.outbound_headers = redactHeaders(outboundHeaders)
+        const compactDeadline = compact ? AbortSignal.timeout(240000) : null
         const result = await runCodexKernelHop({
           hop,
+          retryTransport: !compact,
           args: {
             exec: execFor(projectRoot, vm),
             body: outboundBody,
             reqHeaders: req.headers,
+            ...(compact ? { signal: AbortSignal.any([gone.signal, compactDeadline]) } : {}),
             envelope: {
               body: outboundBody,
               headers: outboundHeaders,
@@ -588,6 +621,10 @@ export async function handleCodexProtocol({
           },
           onEvent: async (line) => {
             if (conversionError) return
+            if (compactCollector) {
+              compactCollector.accept(line)
+              return
+            }
             const tier = serviceTierFromSseLine(line)
             if (tier) responseServiceTier = tier
             const seen = usageFromSseLine(line)
@@ -619,6 +656,39 @@ export async function handleCodexProtocol({
             if (named) res.write(named)
           },
         })
+        if (compact && gone.signal.aborted) {
+          logBag.final_state = 'cancelled'
+          return
+        }
+        if (compact) {
+          logBag.upstream_status = compactDeadline.aborted ? 0 : result.status || 0
+          logBag.account_id = vm.id
+          if (compactDeadline.aborted) {
+            result.ok = false
+            result.status = 504
+            result.terminalState = 'timed_out'
+            result.body = {
+              error: {
+                type: 'timeout_error',
+                code: 'compaction_timeout',
+                message: 'Codex compaction did not complete within 240 seconds',
+              },
+            }
+          } else if (result.status >= 200 && result.status < 300) {
+            const compacted = compactCollector.finish()
+            result.ok = !!compacted
+            result.status = compacted ? 200 : 502
+            result.terminalState = compacted ? 'verified' : 'incomplete'
+            result.body = compacted || {
+              error: {
+                type: 'upstream_protocol_error',
+                code: 'compaction_incomplete',
+                message: 'Codex did not complete with exactly one encrypted compaction item',
+              },
+            }
+            if (compacted) result.usage = compacted.usage
+          }
+        }
         if (conversionError) {
           result.ok = false
           result.status = 502
@@ -632,7 +702,8 @@ export async function handleCodexProtocol({
         const usage = preferUsage(hopUsage, streamedUsage)
         // Responses SSE is not a Claude assistant message, so the stream client
         // reports ok:false / incomplete. A 200 hop that carried tokens still billed.
-        const delivered = !conversionError && (result?.ok || (Number(result?.status) === 200 && usageTokens(usage) > 0))
+        const delivered =
+          !conversionError && (result?.ok || (!compact && Number(result?.status) === 200 && usageTokens(usage) > 0))
         if (delivered) {
           attemptKind = 'succeeded'
           bindSticky(outboundSessionId)
@@ -654,6 +725,7 @@ export async function handleCodexProtocol({
           logBag.upstream_model = converted.body.model
           if (hops > 1) logBag.codex_failed_over = true
           if (!stream) {
+            if (compact) return json(res, 200, result.body)
             let body
             try {
               const assembled = assembleCodexBodyFromSse(chunks, result.body || {})
@@ -682,7 +754,7 @@ export async function handleCodexProtocol({
           logBag.upstream_status = result?.status || 0
           return res.end()
         }
-        if (isCodexFailoverError(result)) {
+        if (!compact && isCodexFailoverError(result)) {
           pickOpts.excluded.add(vm.id)
           leaveSticky()
           continue
@@ -702,7 +774,11 @@ export async function handleCodexProtocol({
   }
   stats.errors++
   logBag.error_code = last?.body?.error?.code || 'codex_upstream'
-  logBag.upstream_status = last?.status || 0
+  if (compact) {
+    logBag.error_message = last?.body?.error?.message || 'Codex compaction failed'
+    logBag.final_state = last?.terminalState || 'upstream_error'
+  }
+  logBag.upstream_status = compact ? (logBag.upstream_status ?? last?.status ?? 0) : last?.status || 0
   return json(res, last?.status || 502, last?.body || { error: { type: 'api_error', code: 'codex_upstream' } })
 }
 
