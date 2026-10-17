@@ -1590,13 +1590,20 @@ export function isValidOfficialUserId(raw) {
 /**
  * oh-my-pi / omp inbound: their own ROLE + PROJECT blocks, or the OAuth
  * stealth prefix (`cc_entrypoint=local-agent` + Agent SDK one-liner).
- * That prefix reuses the official identity string, so billing/identity
- * alone must not classify this as Claude Code.
+ * Claude Desktop shares that entrypoint, so its desktop headers let it continue
+ * through the existing official checks; OMP-specific system markers still reject it.
  */
-export function looksLikeOhMyPiSystem(system) {
+export function looksLikeOhMyPiSystem(system, headers = {}) {
   const text = systemToText(system)
   if (!text) return false
-  if (/cc_entrypoint\s*=\s*local-agent/i.test(text)) return true
+  const ua = String(headers['user-agent'] || headers['User-Agent'] || '').trim()
+  const desktop =
+    isOfficialClaudeUa(ua) &&
+    /[ (,]local-agent(?=[,)])/.test(ua) &&
+    /[ (,]agent-sdk\/\d+\.\d+\.\d+(?=[,)])/.test(ua) &&
+    headers['anthropic-client-platform'] === 'desktop_app' &&
+    /^\d+\.\d+\.\d+$/.test(String(headers['anthropic-client-version'] || '').trim())
+  if (/cc_entrypoint\s*=\s*local-agent/i.test(text) && !desktop) return true
   if (/<system-conventions>/i.test(text) && /Oh My Pi/i.test(text)) return true
   if (/<system-conventions>/i.test(text) && /<workstation>/i.test(text)) return true
   if (/^ROLE\s*\n\s*=+/m.test(text) && /^PROJECT\s*\n\s*=+/m.test(text)) return true
@@ -1614,8 +1621,8 @@ export function thirdPartyClientPrompt(system) {
 }
 
 /** Official CLI system: billing header, official entrypoint, identity, or child-hop prompt. */
-export function looksLikeOfficialClaudeSystem(system) {
-  if (looksLikeOhMyPiSystem(system)) return false
+export function looksLikeOfficialClaudeSystem(system, headers = {}) {
+  if (looksLikeOhMyPiSystem(system, headers)) return false
   const text = systemToText(system)
   if (!text) return false
   if (/x-anthropic-billing-header:/i.test(text)) return true
@@ -1642,10 +1649,10 @@ export function inboundHasOpenAIToolShape(body = {}) {
 export function isOfficialClaudeCodeTraffic(headers = {}, body = {}) {
   const ua = String(headers['user-agent'] || headers['User-Agent'] || '').trim()
   if (!isOfficialClaudeUa(ua) || !CLAUDE_CLI_UA_RE.test(ua)) return false
-  if (looksLikeOhMyPiSystem(body?.system)) return false
+  if (looksLikeOhMyPiSystem(body?.system, headers)) return false
   if (!isValidOfficialUserId(body?.metadata?.user_id)) return false
   if (inboundHasOpenAIToolShape(body)) return false
-  return looksLikeOfficialClaudeSystem(body?.system)
+  return looksLikeOfficialClaudeSystem(body?.system, headers)
 }
 
 /**

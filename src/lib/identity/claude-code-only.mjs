@@ -98,7 +98,7 @@ function isCliQuotaProbe(headers, body) {
  * Relayed Claude Code (UA rewritten) is admitted only while `detect_proxied_official_cc` is on.
  */
 export function isClaudeCodeFamilyRequest(headers = {}, body = {}, { routing = {}, countTokens = false } = {}) {
-  if (looksLikeOhMyPiSystem(body?.system) || inboundHasOpenAIToolShape(body)) return false
+  if (looksLikeOhMyPiSystem(body?.system, headers) || inboundHasOpenAIToolShape(body)) return false
   if (hasClaudeCodeClientHeaders(headers)) {
     if (countTokens || isCliQuotaProbe(headers, body)) return true
     if (
