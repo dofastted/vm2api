@@ -1,6 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
+import { resolveOutboundSessionId } from '../../src/lib/identity/identity-rewrite.mjs'
 
 class Scheduler {
   constructor(candidates) {
@@ -901,34 +906,59 @@ test('aborted signal stops before another account is tried', async () => {
   assert.equal(scheduler.cooldowns.length, 0)
 })
 
-test('client cancellation preserves sticky session and skips account cleanup', async () => {
-  const scheduler = new Scheduler([candidate(1)])
-  const controller = new AbortController()
-  const result = await new FailoverRunner({
-    scheduler,
-    stickyRouter: {},
-    config: { same_account_retry_delay_ms: 0 },
-  }).run({
-    requestId: 'req-cancel-preserve-session',
-    canonicalBody: { model: 'claude-opus-test' },
-    model: 'claude-opus-test',
-    stickyKey: 'parent-session',
-    signal: controller.signal,
-    callAttempt: () => {
-      controller.abort()
-      return {
-        ok: false,
-        status: 499,
-        clientCancelled: true,
-        terminalState: 'cancelled',
-        body: { type: 'error', error: { code: 'client_cancelled', message: 'Client closed the connection' } },
-      }
-    },
+for (const cancellation of ['result', 'throw']) {
+  test(`client cancellation via ${cancellation} preserves outbound session beyond fifty turns`, async (t) => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cancel-session-'))
+    const sticky = new StickyRouter({ dataDir, config: { sticky: { enabled: true } } })
+    t.after(() => {
+      sticky.db.close()
+      fs.rmSync(dataDir, { recursive: true, force: true })
+    })
+    const scheduler = new Scheduler([{ ...candidate(1), slotIndex: 3 }])
+    const runner = new FailoverRunner({ scheduler, stickyRouter: sticky })
+    const callerSession = 'cancelled-caller'
+    const stickyKey = sticky.canonicalSessionKey(callerSession)
+    let originalSession
+    for (let turn = 0; turn < 53; turn++) {
+      const controller = new AbortController()
+      const result = await runner.run({
+        requestId: `req-cancel-${cancellation}-${turn}`,
+        canonicalBody: { model: 'claude-opus-test' },
+        model: 'claude-opus-test',
+        stickyKey,
+        signal: controller.signal,
+        applyAttempt: (body, selected, extra) => {
+          const bound = extra.stickyBound
+          const sessionId = resolveOutboundSessionId(callerSession, {
+            boundSessionId: bound?.sessionId,
+            boundVmId: bound?.vmId,
+            vmId: selected.vmId,
+            epoch: `turn:${turn}`,
+          })
+          originalSession ??= sessionId
+          assert.equal(sessionId, originalSession, `outbound session changed at turn ${turn}`)
+          return { body, meta: { sessionId } }
+        },
+        callAttempt: () => {
+          if (turn !== 50) return success()
+          if (cancellation === 'throw') {
+            controller.abort()
+            throw Object.assign(new Error('Client closed the connection'), { code: 'request_cancelled' })
+          }
+          return { ok: false, status: 499, clientCancelled: true, terminalState: 'cancelled' }
+        },
+      })
+      assert.equal(result.status, turn === 50 ? 499 : 200)
+      if (turn === 50) assert.equal(result.body.error.code, 'client_cancelled')
+      const bound = sticky.resolve(stickyKey)
+      assert.equal(bound.sessionId, originalSession, `persisted session changed at turn ${turn}`)
+      assert.equal(bound.slotIndex, 3, `cancellation dropped the seat at turn ${turn}`)
+    }
+    assert.notEqual(originalSession, callerSession)
+    assert.deepEqual(scheduler.releasedAccounts, [])
+    assert.deepEqual(scheduler.cooldowns, [])
   })
-  assert.equal(result.status, 499)
-  assert.equal(result.body.error.code, 'client_cancelled')
-  assert.deepEqual(scheduler.releasedAccounts, [])
-})
+}
 
 test('streamed plan limit writes the hard block and rotates to another account', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])

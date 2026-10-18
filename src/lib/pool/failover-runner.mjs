@@ -476,9 +476,9 @@ export class FailoverRunner {
   }
 
   /**
-   * An empty or cancelled hop leaves the outbound session behind: the next
-   * hop on this VM opens a new one. No seat is penalized and no CLI restarts;
-   * planner seat indexes are not kernel native slots.
+   * An empty hop leaves the outbound session behind for a fresh-session retry.
+   * Client cancellation only ends its job; kernel cancel_ack fences slot reuse.
+   * Planner seat indexes are not kernel native slots.
    */
   retireOutboundSession(selected, bindKeys) {
     if (!selected?.vmId) return
@@ -866,7 +866,6 @@ export class FailoverRunner {
             terminalState: 'cancelled',
             latencyMs: Date.now() - attemptStarted,
           })
-          this.retireOutboundSession(selected, bindKeys)
           return { ...clientCancelledResult(result), via: result?.via || 'pool-failover', ...attribution() }
         }
         policy = classifyAttempt(
@@ -1035,7 +1034,6 @@ export class FailoverRunner {
             terminalState: 'cancelled',
             latencyMs: Date.now() - attemptStarted,
           })
-          this.retireOutboundSession(selected, bindKeys)
           return { ...clientCancelledResult({ committed }), via: 'pool-failover', ...attribution() }
         }
         result = {
