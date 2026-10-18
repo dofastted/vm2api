@@ -424,7 +424,9 @@ pause_schedulable_slots() {
   printf '%s' "$response" | python3 -c 'import json, sys
 d = json.load(sys.stdin)
 r = d.get("data") or {}
-print(f"schedule hold: paused={int(r.get("paused") or 0)} inflight={int(r.get("inflight") or 0)}")
+paused = int(r.get("paused") or 0)
+inflight = int(r.get("inflight") or 0)
+print(f"schedule hold: paused={paused} inflight={inflight}")
 raise SystemExit(0 if d.get("ok") else 1)'
 }
 
@@ -437,7 +439,8 @@ resume_schedulable_slots() {
   printf '%s' "$response" | python3 -c 'import json, sys
 d = json.load(sys.stdin)
 r = d.get("data") or {}
-print(f"schedule resume: restored={int(r.get("restored") or 0)}")
+restored = int(r.get("restored") or 0)
+print(f"schedule resume: restored={restored}")
 raise SystemExit(0 if d.get("ok") else 1)'
 }
 
