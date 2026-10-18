@@ -29,6 +29,9 @@ import { tarStream } from '../../src/lib/cluster/tar.mjs'
 import { SocketRelay } from '../../src/lib/cluster/socket-relay.mjs'
 import { connectSsh } from '../../src/lib/cluster/ssh-link.mjs'
 import { iptablesPlan } from '../../src/lib/vm/egress.mjs'
+import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
+import { getVm, listVms } from '../../src/lib/vm/vm-registry.mjs'
+import { atomicWriteJson } from '../../src/lib/vm/vm-file.mjs'
 
 const { Server, utils } = ssh2
 
@@ -167,6 +170,124 @@ test('explicit import replaces the node credential at 0600; identical pull is a 
   assert.equal(node.files.get(node.remoteCred).toString(), '{"rt":"imported"}')
   assert.equal(node.modes.get(node.remoteCred), 0o600, 'a 0777 local checkout must not leak its mode to the node')
   assert.deepEqual(await pullSlotCredentials(vm, slotDir, node.session), { pulled: false, reason: 'same' })
+})
+
+for (const identical of [false, true]) {
+  test(`node credential reconciliation restores platform-scoped scheduling with identical=${identical}`, async (t) => {
+    const root = tmpDir('kin-node-credential-metadata-')
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    const slotDir = path.join(root, 'vms', vm.id)
+    const credentialFile = path.join(slotDir, 'cli-home', '.claude', 'credentials.json')
+    const credential = JSON.stringify({
+      claudeAiOauth: {
+        accessToken: 'node-access',
+        refreshToken: 'node-refresh',
+        expiresAt: Date.now() + 3600_000,
+        accountUuid: 'node-account',
+        email: 'node@example.test',
+        kinGeneration: 7,
+      },
+    })
+    fs.mkdirSync(path.dirname(credentialFile), { recursive: true })
+    if (identical) fs.writeFileSync(credentialFile, credential, { mode: 0o600 })
+    atomicWriteJson(path.join(root, 'vms', `${vm.id}.json`), {
+      ...vm,
+      status: 'paused',
+      schedulable: false,
+      schedule_disabled_reason: 'no_credential',
+      proxy_cli_enabled: true,
+      proxy: { id: 'px-local', kind: 'local' },
+      claude: {},
+    })
+    const node = fakeNode()
+    node.files.set(node.remoteCred, Buffer.from(credential))
+    const target = { ...vm }
+    await reconcileSlotCredentials(target, slotDir, node.session)
+    assert.equal(target.claude.has_access, true)
+
+    const stored = getVm(root, vm.id)
+    assert.equal(stored.claude.has_access, true)
+    assert.equal(stored.claude.has_refresh, true)
+    assert.equal(stored.claude.account_uuid, 'node-account')
+    assert.equal(stored.claude.email, 'node@example.test')
+    assert.equal(stored.schedulable, true)
+    assert.equal(stored.schedule_disabled_reason, null)
+    assert.equal(JSON.stringify(stored).includes('node-access'), false)
+    assert.equal(JSON.stringify(stored).includes('node-refresh'), false)
+    assert.equal(listVms(root)[0].has_token, true)
+    assert.equal(node.files.get(node.remoteCred).toString(), credential)
+
+    const pool = new PoolScheduler({ projectRoot: root })
+    const selected = await pool.selectAndReserve({
+      model: 'claude-sonnet-4-6',
+      keyScope: { group_type: 'anthropic', allowed_vms: [vm.id] },
+      allowWait: false,
+    })
+    assert.equal(selected.ok, true)
+    assert.equal(selected.vmId, vm.id)
+    assert.equal(selected.accountId, 'node-account')
+    selected.release()
+    const denied = await pool.selectAndReserve({
+      model: 'claude-sonnet-4-6',
+      keyScope: { group_type: 'anthropic', allowed_vms: ['vm-other'] },
+      allowWait: false,
+    })
+    assert.equal(denied.ok, false)
+  })
+}
+
+for (const reason of ['disabled', 'oauth_revoked']) {
+  test(`pulling node credentials preserves ${reason} scheduling restrictions`, async (t) => {
+    const root = tmpDir('kin-node-credential-restriction-')
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    const slotDir = path.join(root, 'vms', vm.id)
+    fs.mkdirSync(slotDir, { recursive: true })
+    atomicWriteJson(path.join(root, 'vms', `${vm.id}.json`), {
+      ...vm,
+      schedulable: false,
+      schedule_manual: reason === 'disabled',
+      schedule_disabled_reason: reason,
+      claude: { refresh_error: reason === 'oauth_revoked' ? reason : null },
+    })
+    const node = fakeNode()
+    node.files.set(
+      node.remoteCred,
+      Buffer.from(
+        JSON.stringify({
+          claudeAiOauth: { accessToken: 'existing-access', refreshToken: 'existing-refresh' },
+        }),
+      ),
+    )
+    await pullSlotCredentials({ ...vm }, slotDir, node.session)
+    const stored = getVm(root, vm.id)
+    assert.equal(stored.claude.has_access, true)
+    assert.equal(stored.schedulable, false)
+    assert.equal(stored.schedule_disabled_reason, reason)
+  })
+}
+
+test('identical node credentials do not clear an existing authentication cooldown', async (t) => {
+  const root = tmpDir('kin-node-credential-cooldown-')
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const slotDir = path.join(root, 'vms', vm.id)
+  const credentialFile = path.join(slotDir, 'cli-home', '.claude', 'credentials.json')
+  fs.mkdirSync(path.dirname(credentialFile), { recursive: true })
+  const credential = JSON.stringify({ claudeAiOauth: { accessToken: 'access', refreshToken: 'refresh' } })
+  fs.writeFileSync(credentialFile, credential)
+  const record = {
+    ...vm,
+    claude: {
+      has_access: true,
+      has_refresh: true,
+      temp_unschedulable_reason: 'authentication_failed_after_refresh',
+      temp_unschedulable_until: Date.now() + 60_000,
+    },
+  }
+  atomicWriteJson(path.join(root, 'vms', `${vm.id}.json`), record)
+  const node = fakeNode()
+  node.files.set(node.remoteCred, Buffer.from(credential))
+  await pullSlotCredentials({ ...vm }, slotDir, node.session)
+  assert.deepEqual(getVm(root, vm.id), record)
 })
 
 test('a guest-planted symlink at the credential path is refused, not followed', async () => {

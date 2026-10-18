@@ -685,6 +685,7 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
       accel,
     }
     if (matches && existing.State?.Running) {
+      await reconcileSlotCredentials(vm, slotDir, session)
       applyRuntime(vm, { ...common, info: existing })
       return { ok: true, action: 'already-running', runtime: vm.runtime }
     }

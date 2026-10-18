@@ -20,6 +20,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { nodeSession, remoteSlotDir, remoteSlotOwner, vmNodeId } from './placement.mjs'
+import { hasCredentialPresence, mirrorWorkerCredentialsToVm } from '../oauth/oauth-credentials.mjs'
+import { readJsonCached } from '../vm/vm-file.mjs'
 import {
   openSftp,
   readRemoteFileNoFollow,
@@ -112,7 +114,7 @@ export async function pushSlotCredentials(vm, slotDir, session = null) {
   return { pushed: true }
 }
 
-/** Copy the remote credential over the local mirror when they differ. */
+/** Pull the node credential and repair its metadata even when local bytes already match. */
 export async function pullSlotCredentials(vm, slotDir, session = null) {
   const s = session || (await nodeSession(vmNodeId(vm)))
   const remote = await readRemoteFileNoFollow(
@@ -122,17 +124,27 @@ export async function pullSlotCredentials(vm, slotDir, session = null) {
   if (!remote) return { pulled: false, reason: 'remote_missing' }
   const local = path.join(slotDir, CREDENTIALS)
   let mode = 0o600
+  let same = false
   try {
-    if (fs.readFileSync(local).equals(remote)) return { pulled: false, reason: 'same' }
+    same = fs.readFileSync(local).equals(remote)
     mode = fs.statSync(local).mode & 0o777
   } catch {}
-  fs.mkdirSync(path.dirname(local), { recursive: true, mode: 0o700 })
-  const tmp = `${local}.${process.pid}.${Date.now()}.tmp`
-  fs.writeFileSync(tmp, remote, { mode })
-  // The create mode is umask-masked; the local seal (e.g. 0444) must survive whatever umask Node runs with.
-  fs.chmodSync(tmp, mode)
-  fs.renameSync(tmp, local)
-  return { pulled: true }
+  if (!same) {
+    fs.mkdirSync(path.dirname(local), { recursive: true, mode: 0o700 })
+    const tmp = `${local}.${process.pid}.${Date.now()}.tmp`
+    fs.writeFileSync(tmp, remote, { mode })
+    // The local seal must survive whatever umask Node runs with.
+    fs.chmodSync(tmp, mode)
+    fs.renameSync(tmp, local)
+  }
+  const vmPath = path.join(path.dirname(slotDir), `${vm.id}.json`)
+  let record = readJsonCached(vmPath)
+  // Unchanged credentials must not clear an existing auth cooldown on every start.
+  if (!same || !hasCredentialPresence(record?.claude)) {
+    record = mirrorWorkerCredentialsToVm(vmPath, path.join(slotDir, 'cli-home'))
+  }
+  if (record) vm.claude = record.claude
+  return same ? { pulled: false, reason: 'same' } : { pulled: true }
 }
 
 /**
