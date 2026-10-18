@@ -22,7 +22,7 @@ import path from 'node:path'
 import { isDbOpen, getDb } from '../db/database.mjs'
 import { VmsRepo } from '../db/repos/vms-repo.mjs'
 import { setVmWriteHook, atomicWriteJson, isVmRecordFile } from './vm-file.mjs'
-import { repairSlotSmbios, repairVmProxyCliEnabled } from './vm-registry.mjs'
+import { reclaimAssignedVms, repairSlotSmbios, repairVmProxyCliEnabled } from './vm-registry.mjs'
 
 let _repo = null
 let _watcher = null
@@ -152,6 +152,21 @@ export function initVmDbSync(projectRoot, { watch = true } = {}) {
     if (isVmJsonPath(filePath)) syncVmFile(filePath)
   })
   const result = reconcileVms(projectRoot)
+  // Older releases soft-deleted tenants without releasing their assigned slots.
+  // Only confirmed deletions qualify; disabled/missing users and private slots stay isolated.
+  const deletedOwners = isDbOpen()
+    ? new Set(
+        getDb()
+          .prepare('SELECT id FROM users WHERE deleted_at IS NOT NULL')
+          .all()
+          .map((row) => row.id),
+      )
+    : new Set()
+  result.reclaimed_vm_ids = reclaimAssignedVms(projectRoot, deletedOwners, {
+    onError: (error, name) => {
+      console.warn(`[vm] ownership recovery skipped ${name}: ${error.code || error.name}`)
+    },
+  })
   try {
     result.proxy_cli_repaired = repairVmProxyCliEnabled(projectRoot).length
   } catch {

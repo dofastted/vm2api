@@ -9,7 +9,7 @@ import { PanelUserStore, hashPassword, verifyPassword, publicUserView } from '..
 function tmpStore() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-panel-users-'))
   const db = createDatabase({ dataDir: dir })
-  return { dir, db, store: new PanelUserStore({ db }) }
+  return { dir, db, store: new PanelUserStore({ db, projectRoot: dir }) }
 }
 
 test('scrypt hash verifies and is not reversible', () => {
@@ -96,4 +96,85 @@ test('rejects bad username / short password / unknown role', () => {
   assert.throws(() => store.create({ username: '1bad', password: 'longenough', role: 'user' }), /用户名/)
   assert.throws(() => store.create({ username: 'okuser', password: 'short', role: 'user' }), /密码/)
   assert.throws(() => store.create({ username: 'okuser', password: 'longenough', role: 'root' }), /角色/)
+})
+
+function seedOwnedVm(project, id, owner, extra = {}) {
+  const dir = path.join(project, 'vms')
+  fs.mkdirSync(dir, { recursive: true })
+  const vm = {
+    id,
+    owner_user_id: owner,
+    origin: 'admin_assigned',
+    status: 'running',
+    schedulable: false,
+    schedule_disabled_reason: 'disabled',
+    claude: { has_access: true, has_refresh: true },
+    ...extra,
+  }
+  fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify(vm))
+  return vm
+}
+
+test('deleting a user reclaims assigned VMs while preserving private and unrelated slots', (t) => {
+  const { dir, db, store } = tmpStore()
+  t.after(() => {
+    db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  const user = store.create({ username: 'tenant', password: 'tenant-pass' })
+  const assigned = seedOwnedVm(dir, 'assigned', user.id)
+  seedOwnedVm(dir, 'legacy', user.id, { origin: undefined })
+  const privateVm = seedOwnedVm(dir, 'private', user.id, { origin: 'user_created' })
+  const otherVm = seedOwnedVm(dir, 'other', 'another-tenant')
+  const publicVm = seedOwnedVm(dir, 'public', null, { origin: 'platform' })
+
+  assert.equal(store.remove(user.id), true)
+  assert.equal(store.getById(user.id), null)
+  const read = (id) => JSON.parse(fs.readFileSync(path.join(dir, 'vms', `${id}.json`), 'utf8'))
+  const reclaimed = read('assigned')
+  assert.equal(reclaimed.owner_user_id, null)
+  assert.equal(reclaimed.origin, 'platform')
+  const { updated_at, ...rest } = reclaimed
+  assert.ok(updated_at)
+  assert.deepEqual(rest, { ...assigned, owner_user_id: null, origin: 'platform' })
+  assert.equal(read('legacy').owner_user_id, null)
+  assert.equal(read('legacy').origin, 'platform')
+  assert.deepEqual(read('private'), privateVm)
+  assert.deepEqual(read('other'), otherVm)
+  assert.deepEqual(read('public'), publicVm)
+})
+
+test('rejected user deletions leave assigned VMs with their owners', (t) => {
+  const { dir, db, store } = tmpStore()
+  t.after(() => {
+    db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  const admin = store.create({ username: 'admin', password: 'admin-pass', role: 'admin' })
+  const user = store.create({ username: 'tenant', password: 'tenant-pass' })
+  const assigned = seedOwnedVm(dir, 'assigned', user.id)
+  const adminVm = seedOwnedVm(dir, 'admin-vm', admin.id)
+
+  assert.throws(() => store.remove(user.id, { actorId: user.id }), /不能删除当前登录账号/)
+  assert.throws(() => store.remove(admin.id), /最后一个管理员/)
+  assert.equal(store.remove('missing-user'), false)
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'vms', 'assigned.json'), 'utf8')), assigned)
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'vms', 'admin-vm.json'), 'utf8')), adminVm)
+})
+
+test('a VM write failure does not soft-delete the user', (t) => {
+  const { dir, db, store } = tmpStore()
+  t.after(() => {
+    db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  const user = store.create({ username: 'tenant', password: 'tenant-pass' })
+  const assigned = seedOwnedVm(dir, 'assigned', user.id)
+  t.mock.method(fs, 'renameSync', () => {
+    throw new Error('simulated VM write failure')
+  })
+
+  assert.throws(() => store.remove(user.id), /simulated VM write failure/)
+  assert.ok(store.getById(user.id))
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'vms', 'assigned.json'), 'utf8')), assigned)
 })

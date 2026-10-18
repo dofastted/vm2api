@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { openDatabase, closeDatabase, getDb } from '../../src/lib/db/database.mjs'
 import { VmsRepo } from '../../src/lib/db/repos/vms-repo.mjs'
+import { UsersRepo } from '../../src/lib/db/repos/users-repo.mjs'
 import { encryptString, decryptString, isEncrypted } from '../../src/lib/db/secure.mjs'
 import { initVmDbSync, stopVmWatch, syncVmFile, removeVmFromDb, reconcileVms } from '../../src/lib/vm/vm-db-sync.mjs'
 import { setVmWriteHook, atomicWriteJson } from '../../src/lib/vm/vm-file.mjs'
@@ -64,6 +65,66 @@ test('initVmDbSync reconciles existing vm files into DB (credentials included)',
   assert.equal(row.vm.claude.has_access, true)
   assert.equal(row.vm.claude.has_refresh, true)
   assert.equal(repo.getActiveVmId(), 'vm-t1')
+})
+
+test('startup reclaims deleted users assigned VMs, including DB-only restored records', () => {
+  process.env.KIN_DB_SECRET = 'reclaim-test-secret'
+  const users = new UsersRepo(getDb())
+  for (const id of ['deleted-owner', 'live-owner', 'disabled-owner']) {
+    users.insert({ id, username: id, password_hash: 'unused', role: 'user', enabled: id !== 'disabled-owner' })
+  }
+  users.remove('deleted-owner')
+  seedVmFile('assigned', { owner_user_id: 'deleted-owner', origin: 'admin_assigned' })
+  seedVmFile('legacy', { owner_user_id: 'deleted-owner' })
+  seedVmFile('private', { owner_user_id: 'deleted-owner', origin: 'user_created' })
+  seedVmFile('live', { owner_user_id: 'live-owner', origin: 'admin_assigned' })
+  seedVmFile('disabled', { owner_user_id: 'disabled-owner', origin: 'admin_assigned' })
+  seedVmFile('unknown', { owner_user_id: 'unknown-owner', origin: 'admin_assigned' })
+  const restored = seedVmFile('restored', { owner_user_id: 'deleted-owner', origin: 'admin_assigned' })
+  const repo = new VmsRepo(getDb())
+  repo.upsertFromVmJson(restored)
+  fs.rmSync(path.join(project, 'vms', 'restored.json'))
+
+  const result = initVmDbSync(project, { watch: false })
+  assert.deepEqual(result.reclaimed_vm_ids.sort(), ['assigned', 'legacy', 'restored'])
+  for (const id of result.reclaimed_vm_ids) {
+    const vm = JSON.parse(fs.readFileSync(path.join(project, 'vms', `${id}.json`), 'utf8'))
+    assert.equal(vm.owner_user_id, null)
+    assert.equal(vm.origin, 'platform')
+    const row = repo.get(id)
+    assert.equal(row.vm.owner_user_id, null)
+    const raw = getDb().prepare('SELECT owner_user_id, origin FROM vms WHERE id = ?').get(id)
+    assert.equal(raw.owner_user_id, null)
+    assert.equal(raw.origin, 'platform')
+    assert.equal(row.vm.claude.has_access, true)
+    assert.equal(row.encrypted, true)
+  }
+  for (const [id, owner] of [
+    ['private', 'deleted-owner'],
+    ['live', 'live-owner'],
+    ['disabled', 'disabled-owner'],
+    ['unknown', 'unknown-owner'],
+  ]) {
+    assert.equal(repo.get(id).vm.owner_user_id, owner)
+  }
+  const before = fs.readFileSync(path.join(project, 'vms', 'assigned.json'), 'utf8')
+  assert.deepEqual(initVmDbSync(project, { watch: false }).reclaimed_vm_ids, [])
+  assert.equal(fs.readFileSync(path.join(project, 'vms', 'assigned.json'), 'utf8'), before)
+})
+
+test('startup ownership recovery skips an unreadable slot and continues with valid assignments', (t) => {
+  const users = new UsersRepo(getDb())
+  users.insert({ id: 'deleted-owner', username: 'deleted', password_hash: 'unused', role: 'user' })
+  users.remove('deleted-owner')
+  seedVmFile('assigned', { owner_user_id: 'deleted-owner', origin: 'admin_assigned' })
+  fs.writeFileSync(path.join(project, 'vms', 'broken.json'), '{')
+  const warnings = []
+  t.mock.method(console, 'warn', (message) => warnings.push(message))
+
+  const result = initVmDbSync(project, { watch: false })
+  assert.deepEqual(result.reclaimed_vm_ids, ['assigned'])
+  assert.ok(warnings.some((message) => /ownership recovery skipped broken.json/.test(message)))
+  assert.equal(new VmsRepo(getDb()).get('assigned').vm.owner_user_id, null)
 })
 
 test('write-through hook mirrors persistOauthToVm into DB', () => {

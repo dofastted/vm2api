@@ -7,6 +7,8 @@ import { PoolScheduler, formatPoolSelectionSummary } from '../../src/lib/pool/po
 import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { PanelUserStore } from '../../src/lib/admin/panel-users.mjs'
+import { persistVmOwner } from '../../src/lib/vm/vm-registry.mjs'
 import { kernelFaults } from '../../src/lib/transport/rust-kernel-client.mjs'
 import {
   applyCrsIdentityReplace,
@@ -1533,6 +1535,36 @@ test('platform scope skips tenant-owned VMs', async (t) => {
     pinVmId: 'vm-01',
   })
   assert.equal(miss.ok, false)
+})
+
+test('deleting a tenant makes its assigned spare selectable while the primary quota is exhausted', async (t) => {
+  const root = project()
+  const quota = new AccountQuota({ dataDir: path.join(root, 'data'), config: {} })
+  let pool
+  t.after(() => {
+    quota.db.close()
+    cleanupProject(root, pool)
+  })
+  const users = new PanelUserStore({ db: quota.db, projectRoot: root })
+  const user = users.create({ username: 'tenant', password: 'tenant-pass' })
+  persistVmOwner(root, 'vm-02', { ownerUserId: user.id, origin: 'admin_assigned' })
+  quota.ensure({ account_id: 'account-1', vm_id: 'vm-01' })
+  quota.ensure({ account_id: 'account-2', vm_id: 'vm-02' })
+  quota.ingestHeaders('account-1', {
+    'anthropic-ratelimit-unified-5h-utilization': '1',
+    'anthropic-ratelimit-unified-5h-status': 'rejected',
+    'anthropic-ratelimit-unified-5h-reset': new Date(Date.now() + 3600_000).toISOString(),
+  })
+  pool = scheduler(root, { accountQuota: quota })
+  const exhausted = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(exhausted.ok, false)
+
+  assert.equal(users.remove(user.id), true)
+  const recovered = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(recovered.ok, true)
+  assert.equal(recovered.vmId, 'vm-02')
+  assert.equal(recovered.accountId, 'account-2')
+  recovered.release()
 })
 
 function busyKernelHealth() {

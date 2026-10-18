@@ -46,9 +46,11 @@
 | GET | `/users` | 列表（含 `vm_create_quota`） |
 | POST | `/users` | `{ username, password, role, enabled, vm_create_quota? }` |
 | PATCH | `/users/:id` | 改角色/密码/启用/配额；改密会撤销该用户其它会话 |
-| DELETE | `/users/:id` | |
+| DELETE | `/users/:id` | 软删除用户并撤销会话；将其 `admin_assigned` VM 收回平台池，保留调度开关与额度冷却；`user_created` VM 保持原归属，不自动转入平台池 |
 | PATCH | `/vms/:id/owner` | admin：`{ user_id }` 分配，`{ user_id: null }` 收回（仅 `admin_assigned`） |
 | GET | `/billing` | 用户计费汇总。`from`/`until`/`group_by=vm|key`。user 隐式只看自己；admin 可 `user_id=` |
+
+启动时会修复旧版本遗留的已删除用户 VM 归属：仅收回 `admin_assigned`（旧记录未写 `origin` 时按已有归属规则推断），不收回租户自建 VM、停用用户或无用户记录的 VM。修改经 `vms/*.json` 写入并同步到 SQLite，不重启槽位。
 
 
 用户名 `^[a-zA-Z][a-zA-Z0-9._-]{1,31}$`，密码 8–128。`vm_create_quota` 整数 0–100，默认 0。

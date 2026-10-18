@@ -1,5 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { startGateway, api } from '../harness.mjs'
 
 async function login(gw, username, password) {
@@ -142,6 +145,40 @@ test('admin can create users and change passwords', async () => {
     assert.equal(short.json.error?.code, 'invalid_password')
   } finally {
     await gw.stop()
+  }
+})
+
+test('deleting a tenant reclaims its assigned VM in the runtime file and SQLite mirror', async () => {
+  const gw = await startGateway()
+  try {
+    const created = await api(gw, 'POST', '/api/panel/users', {
+      body: { username: 'tenant', password: 'tenant-pass', role: 'user' },
+    })
+    assert.equal(created.status, 201, created.text)
+    const userId = created.json.data.item.id
+    const session = await login(gw, 'tenant', 'tenant-pass')
+    assert.equal(session.status, 200)
+    const assigned = await api(gw, 'PATCH', '/api/panel/vms/vm-sim-01/owner', { body: { user_id: userId } })
+    assert.equal(assigned.status, 200, assigned.text)
+
+    const deleted = await api(gw, 'DELETE', `/api/panel/users/${userId}`)
+    assert.equal(deleted.status, 200, deleted.text)
+    const vm = JSON.parse(fs.readFileSync(path.join(gw.project, 'vms', 'vm-sim-01.json'), 'utf8'))
+    assert.equal(vm.owner_user_id, null)
+    assert.equal(vm.origin, 'platform')
+    assert.equal(vm.schedulable, true)
+    const db = new DatabaseSync(path.join(gw.project, 'data', 'kin.db'), { readOnly: true })
+    try {
+      const row = db.prepare('SELECT owner_user_id, origin FROM vms WHERE id = ?').get(vm.id)
+      assert.equal(row.owner_user_id, null)
+      assert.equal(row.origin, 'platform')
+    } finally {
+      db.close()
+    }
+    assert.equal((await panel(gw, 'GET', '/api/panel/me', { cookie: session.cookie })).status, 401)
+  } finally {
+    await gw.stop()
+    fs.rmSync(gw.project, { recursive: true, force: true })
   }
 })
 

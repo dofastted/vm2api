@@ -19,7 +19,7 @@ import { isCredentialRefreshFailed, isLeftoverQuotaScheduleOff } from '../pool/a
 import { manualScheduleLevelOf, parseScheduleLevelInput } from '../pool/credential-weight.mjs'
 import { vmQuotaOverrideOf } from '../pool/vm-quota-override.mjs'
 import { activeHoursOf, parseActiveHoursInput } from '../pool/active-hours.mjs'
-import { normalizeOwnerId, vmOriginOf } from '../admin/resource-owner.mjs'
+import { normalizeOwnerId, vmOriginOf, vmOwnerId, VM_ORIGIN } from '../admin/resource-owner.mjs'
 import { isCodexVm, normalizeVmKind } from './vm-kind.mjs'
 import { canClaudeResetCredits } from '../oauth/credential-mode.mjs'
 import { validTimezone } from '../core/timezone.mjs'
@@ -702,4 +702,24 @@ export function persistVmOwner(projectRoot, id, { ownerUserId = null, origin = n
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm, { mode: 0o600 })
   return vm
+}
+
+/** Return administrator-assigned slots to the platform when their tenant is removed. */
+export function reclaimAssignedVms(projectRoot, ownerIds, { onError = null } = {}) {
+  const reclaimed = []
+  if (!ownerIds.size) return reclaimed
+  const dir = path.join(projectRoot, 'vms')
+  for (const name of listVmRecordFiles(dir)) {
+    try {
+      const vm = readJsonCached(path.join(dir, name))
+      if (!vm?.id || !ownerIds.has(vmOwnerId(vm)) || vmOriginOf(vm) !== VM_ORIGIN.adminAssigned) continue
+      // Keep credentials, quota cooldowns and the operator's scheduling switch intact.
+      persistVmOwner(projectRoot, vm.id, { ownerUserId: null, origin: VM_ORIGIN.platform })
+      reclaimed.push(vm.id)
+    } catch (error) {
+      if (!onError) throw error
+      onError(error, name)
+    }
+  }
+  return reclaimed
 }

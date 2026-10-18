@@ -161,6 +161,9 @@ if (vmSync.upserted || vmSync.rebuilt) {
 if (vmSync.proxy_cli_repaired) {
   console.log(`[vm] repaired proxy_cli_enabled on ${vmSync.proxy_cli_repaired} slot(s)`)
 }
+if (vmSync.reclaimed_vm_ids.length) {
+  console.log(`[vm] reclaimed ${vmSync.reclaimed_vm_ids.length} slot(s) assigned to deleted users`)
+}
 
 // --- P3 sticky + quota ---
 
@@ -307,7 +310,7 @@ const apiScheduler = new ApiScheduler()
 apiScheduler.reload(apiEndpointStore.listRaw())
 ensureApiKernelToken(apiKernelPaths(cfg).tokenPath)
 startApiKernelProcess(cfg)
-const panelUsers = new PanelUserStore({ dataDir: cfg.paths.data })
+const panelUsers = new PanelUserStore({ dataDir: cfg.paths.data, projectRoot: cfg.paths.project })
 try {
   panelUsers.bootstrapFromEnv(getPanelAdmin())
 } catch (e) {
