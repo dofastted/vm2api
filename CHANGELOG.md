@@ -2,8 +2,13 @@
 
 ## 未发布
 
-- 保留路径不再给没有可用签名的 thinking 补 `signature: ""`：缺失、空、短于 24、dummy 的删掉；签名可用的留，空正文也留。这一支里的 `redacted_thinking` 不看 data 和签名，原样留；不走保留路径时仍按原规则删。5.5 的非保留路径仍接受短的非 dummy 签名。没有按账号归属过滤签名。
-- 协议页新增「thinking 显示」，`routing.compatibility.thinking_display` 默认 `summarized`。调用方打开 thinking 却要求隐藏（`omitted`、`updates`，或默认隐藏的模型上没写 display）时，出站改成 `summarized`；显式 `passthrough` 保留调用方的值。已保存的 `routing.json` 不写这个键也按 summarized 生效。
+## 1.3.200 — 2026-10-19
+
+- 保留路径（cli-hop 首跳 / 默认 HTTP hop）删除无可用签名的 thinking；可用签名保留（空正文也留）；redacted_thinking 原样留；分类器路径不经过出站 thinking display 改写。（#592）
+- 协议页新增 thinking 显示：`routing.compatibility.thinking_display` 默认 `summarized`；显式 passthrough 保留调用方。（#592）
+- 接入 payload-2026.10.19-kernel-cli：更新 kin-kernel（两处同哈希）与 cli-node（源码 2.1.296，UPX）；其余附件沿用 10.18。（#594）
+
+已部署机升级：更新 Node 控制面与 web/dist 后重启一次；**更换** Claude kin-kernel / cli-node（本版 payload）；集群需一键更新或 wrap-cli sync（keep）刷镜像；无迁移；不必单独重建槽。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
 ## 1.3.199 — 2026-10-19
 
