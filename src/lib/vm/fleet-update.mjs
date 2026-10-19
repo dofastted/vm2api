@@ -12,9 +12,12 @@ import { restartTelemetrySidecar } from './slot-process-status.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { restartRemoteServices } from '../cluster/remote-slot.mjs'
 import {
+  drainEgressForProxyConfig,
+  egressPidsForProxyConfig,
   ensureProxyEgress,
   inspectEgressProcess,
   isLocalEgressProxy,
+  readEgressListenTcp,
   stopEgressProcess,
   waitEgressExit,
   waitPortReleased,
@@ -29,12 +32,15 @@ export async function restartLocalEgress(projectRoot, vm, opts = {}) {
   const stopped = stopEgressProcess(projectRoot, proxyId)
   if (!stopped.ok) return { ok: false, action: 'egress_stop_failed', error: stopped.error }
   const pending = new Set(stopped.pending || [])
+  for (const pid of egressPidsForProxyConfig(projectRoot, proxyId)) pending.add(pid)
   if (running.ok && running.pid) pending.add(running.pid)
   for (const pid of pending) {
     const exited = await waitEgressExit(pid)
     if (!exited.ok) return { ok: false, action: 'egress_stop_failed', error: exited.error, pid }
   }
-  const spec = String(running.listen_tcp || '')
+  const drained = await drainEgressForProxyConfig(projectRoot, proxyId)
+  if (!drained.ok) return { ok: false, action: 'egress_stop_failed', error: drained.error, pid: drained.pid }
+  const spec = running.ok ? String(running.listen_tcp || '') : readEgressListenTcp(projectRoot, proxyId)
   const colon = spec.lastIndexOf(':')
   const host = colon > 0 ? spec.slice(0, colon) : ''
   const port = colon > 0 ? Number(spec.slice(colon + 1)) : 0
