@@ -2,6 +2,7 @@
 
 ## 未发布
 
+- 槽位种子页按当前槽 `settings.json` 列出真实配置；`claude.setting` 可编辑播种；缺失文件返回 `null`、空文件返回空串，不用策略默认冒充槽内文件；遥测开关与 sidecar 进程状态分开展示，保存不因遥测进程刷新失败而 502。
 - fleet 遥测刷新在 kin-egress 二进制被替换（含 `(deleted)` 旧进程与脏 pidfile）时，会按 egress 配置扫停全部 helper、等待 `/proc/<pid>` 消失后再绑定新二进制；同一 SOCKS 出口的 stop/start 与 `ensureProxyEgress` 共用 per-proxy 锁，避免并发 telemetry 互相 SIGTERM。（#604）
 - 面板：侧栏「GitHub / 文档」两枚链接不再折行，字体偏宽时「文档」不会逐字竖排，空间不够先缩箭头再省略文字；VM 列表搜索框关闭浏览器自动填充，不再被回填成登录邮箱。
 - 集群页「扩展节点」新增 CPU / 内存 / 容器三列：健康检查（每 30 秒）经同一条 SSH 连接读节点 `/proc` 和 cgroup，口径同本机宿主列；容器 = 节点上全部 Docker 容器内存合计（扣除 inactive_file，同 `docker stats`）。修复本机宿主列 CPU 最高只显示 10%（`Math.min(100, …×1000)/10` 写错上限）。链路列不再折行。
