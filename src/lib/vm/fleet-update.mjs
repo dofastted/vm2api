@@ -14,10 +14,11 @@ import { restartRemoteServices } from '../cluster/remote-slot.mjs'
 import {
   drainEgressForProxyConfig,
   egressPidsForProxyConfig,
-  ensureProxyEgress,
   inspectEgressProcess,
   isLocalEgressProxy,
   readEgressListenTcp,
+  runExclusiveProxyEgress,
+  startProxyEgress,
   stopEgressProcess,
   waitEgressExit,
   waitPortReleased,
@@ -28,29 +29,31 @@ const ACTIONS = new Set(['collect', 'reload', 'roll', 'telemetry'])
 export async function restartLocalEgress(projectRoot, vm, opts = {}) {
   if (isLocalEgressProxy(vm.proxy)) return { ok: true, egress: 'local' }
   const proxyId = vm.proxy?.id
-  const running = inspectEgressProcess(projectRoot, proxyId)
-  const stopped = stopEgressProcess(projectRoot, proxyId)
-  if (!stopped.ok) return { ok: false, action: 'egress_stop_failed', error: stopped.error }
-  const pending = new Set(stopped.pending || [])
-  for (const pid of egressPidsForProxyConfig(projectRoot, proxyId)) pending.add(pid)
-  if (running.ok && running.pid) pending.add(running.pid)
-  for (const pid of pending) {
-    const exited = await waitEgressExit(pid)
-    if (!exited.ok) return { ok: false, action: 'egress_stop_failed', error: exited.error, pid }
-  }
-  const drained = await drainEgressForProxyConfig(projectRoot, proxyId)
-  if (!drained.ok) return { ok: false, action: 'egress_stop_failed', error: drained.error, pid: drained.pid }
-  const spec = running.ok ? String(running.listen_tcp || '') : readEgressListenTcp(projectRoot, proxyId)
-  const colon = spec.lastIndexOf(':')
-  const host = colon > 0 ? spec.slice(0, colon) : ''
-  const port = colon > 0 ? Number(spec.slice(colon + 1)) : 0
-  if (host && Number.isFinite(port) && port > 0) {
-    const portFree = await waitPortReleased(host, port)
-    if (!portFree.ok) return { ok: false, action: 'egress_stop_failed', error: portFree.error }
-  }
-  const started = await ensureProxyEgress(projectRoot, vm.proxy, opts)
-  if (!started?.ok) return { ok: false, action: 'egress_start_failed', error: started?.error || 'kin-egress failed' }
-  return { ok: true, egress: 'restarted', pid: started.pid }
+  return runExclusiveProxyEgress(projectRoot, proxyId, async () => {
+    const running = inspectEgressProcess(projectRoot, proxyId)
+    const stopped = stopEgressProcess(projectRoot, proxyId)
+    if (!stopped.ok) return { ok: false, action: 'egress_stop_failed', error: stopped.error }
+    const pending = new Set(stopped.pending || [])
+    for (const pid of egressPidsForProxyConfig(projectRoot, proxyId)) pending.add(pid)
+    if (running.ok && running.pid) pending.add(running.pid)
+    for (const pid of pending) {
+      const exited = await waitEgressExit(pid)
+      if (!exited.ok) return { ok: false, action: 'egress_stop_failed', error: exited.error, pid }
+    }
+    const drained = await drainEgressForProxyConfig(projectRoot, proxyId)
+    if (!drained.ok) return { ok: false, action: 'egress_stop_failed', error: drained.error, pid: drained.pid }
+    const spec = running.ok ? String(running.listen_tcp || '') : readEgressListenTcp(projectRoot, proxyId)
+    const colon = spec.lastIndexOf(':')
+    const host = colon > 0 ? spec.slice(0, colon) : ''
+    const port = colon > 0 ? Number(spec.slice(colon + 1)) : 0
+    if (host && Number.isFinite(port) && port > 0) {
+      const portFree = await waitPortReleased(host, port)
+      if (!portFree.ok) return { ok: false, action: 'egress_stop_failed', error: portFree.error }
+    }
+    const started = await startProxyEgress(projectRoot, vm.proxy, opts)
+    if (!started?.ok) return { ok: false, action: 'egress_start_failed', error: started?.error || 'kin-egress failed' }
+    return { ok: true, egress: 'restarted', pid: started.pid }
+  })
 }
 
 async function restartLocalServices({ projectRoot, vm, enabled, egressOpts = {} }) {

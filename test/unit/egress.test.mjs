@@ -32,6 +32,7 @@ import {
   waitEgressExit,
   egressPidActive,
   ensureProxyEgress,
+  runExclusiveProxyEgress,
   waitPortReleased,
 } from '../../src/lib/vm/egress.mjs'
 import { hostProxyUrlForVm } from '../../src/lib/vm/slot-host.mjs'
@@ -613,6 +614,30 @@ test('DNS override changes restart the helper and disabling clears the override'
   const disabled = await fx.start()
   assert.equal(disabled.reused, false)
   assert.equal(JSON.parse(fs.readFileSync(fx.configPath, 'utf8')).dns_empty_types, undefined)
+})
+
+test('runExclusiveProxyEgress runs overlapping work for one proxy serially', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'egress-lock-'))
+  let depth = 0
+  let maxDepth = 0
+  const work = async (ms, label) => {
+    depth += 1
+    maxDepth = Math.max(maxDepth, depth)
+    await new Promise((resolve) => setTimeout(resolve, ms))
+    depth -= 1
+    return label
+  }
+  try {
+    const [first, second] = await Promise.all([
+      runExclusiveProxyEgress(root, 'px-lock', () => work(40, 'first')),
+      runExclusiveProxyEgress(root, 'px-lock', () => work(5, 'second')),
+    ])
+    assert.equal(maxDepth, 1)
+    assert.equal(first, 'first')
+    assert.equal(second, 'second')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('concurrent starts for one proxy spawn a single helper and record it', {

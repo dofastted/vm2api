@@ -766,13 +766,12 @@ export function ensureLocalProxyEgress(proxy, { runDocker = docker } = {}) {
 const egressStarts = new Map()
 
 /**
- * One start per proxy at a time: the pid file is written only after spawn, so two
- * overlapping starts would both spawn and record the helper that lost the bind.
+ * One stop/start sequence per proxy at a time. The pid file is written only after
+ * spawn, and fleet refresh stops every helper for the config before starting.
  */
-export async function ensureProxyEgress(projectRoot, proxy, opts = {}) {
-  if (isLocalEgressProxy(proxy)) return ensureLocalProxyEgress(proxy, { runDocker: opts.runDocker })
-  const key = egressRunDir(projectRoot || '', proxy?.id || '')
-  const run = (egressStarts.get(key) || Promise.resolve()).then(() => startProxyEgress(projectRoot, proxy, opts))
+export async function runExclusiveProxyEgress(projectRoot, proxyId, fn) {
+  const key = egressRunDir(projectRoot || '', proxyId || '')
+  const run = (egressStarts.get(key) || Promise.resolve()).then(() => fn())
   const tail = run.catch(() => {})
   egressStarts.set(key, tail)
   try {
@@ -782,7 +781,12 @@ export async function ensureProxyEgress(projectRoot, proxy, opts = {}) {
   }
 }
 
-async function startProxyEgress(
+export async function ensureProxyEgress(projectRoot, proxy, opts = {}) {
+  if (isLocalEgressProxy(proxy)) return ensureLocalProxyEgress(proxy, { runDocker: opts.runDocker })
+  return runExclusiveProxyEgress(projectRoot, proxy?.id, () => startProxyEgress(projectRoot, proxy, opts))
+}
+
+export async function startProxyEgress(
   projectRoot,
   proxy,
   {
