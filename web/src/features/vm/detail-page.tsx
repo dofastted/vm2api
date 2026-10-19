@@ -129,8 +129,15 @@ function VmDetailBody({
     enabled: perms.known && !perms.dashboard,
   })
   const proxies = useQuery({ ...proxiesQueryOptions(), enabled: perms.admin })
-  const detail = useQuery(vmQueryOptions(id))
-  const seed = useQuery({ ...vmSeedQueryOptions(id), enabled: perms.admin })
+  const detail = useQuery({
+    ...vmQueryOptions(id),
+    refetchInterval: wantedTab === 'seed' ? 2000 : false,
+  })
+  const seed = useQuery({
+    ...vmSeedQueryOptions(id),
+    enabled: perms.admin && wantedTab === 'seed',
+    refetchInterval: wantedTab === 'seed' ? 2000 : false,
+  })
   const routing = useQuery({ ...routingQueryOptions(), enabled: perms.admin })
   usePoolSeatStream()
 
@@ -260,8 +267,6 @@ function VmDetailBody({
   // 本地代理固定第一。已绑到本槽的留在下拉里，否则正在用它时列表里没有。
   const free = proxiesForVmBind(pool, id, 5, vm.node_id ?? null)
   const bindTarget = pickBindTarget(bindId, free)
-  const pol =
-    (seed.data?.seed_policy as Record<string, unknown> | undefined) || {}
   const syncTelemetry =
     (routing.data?.official_cc as { sync_telemetry?: boolean } | undefined)
       ?.sync_telemetry === true
@@ -564,13 +569,11 @@ function VmDetailBody({
                 }}
                 onDelete={() => setConfirmDel(true)}
               />
-              <TabsContent value='seed' className='space-y-3 pt-4'>
-                <p className='text-sm text-muted-foreground'>
-                  官方 Claude Code 初装之后的后置覆写。遥测只看这一只开关。
-                </p>
+              <TabsContent value='seed' className='pt-4'>
                 {seed.data ? (
                   <SeedPolicyCard
-                    policy={pol}
+                    seed={seed.data}
+                    telemetry={kernel?.telemetry}
                     saving={saveSeed.isPending}
                     syncTelemetry={syncTelemetry}
                     onSave={(next) => saveSeed.mutate(next)}

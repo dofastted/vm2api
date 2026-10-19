@@ -6,6 +6,7 @@ import type {
   VmCreateOptions,
   VmCredentialResponse,
   VmDetailPayload,
+  VmSeedSettings,
   VmsListResponse,
 } from '@/types/panel-vm'
 import { api } from '@/lib/api'
@@ -46,9 +47,10 @@ export function vmSeedQueryOptions(id: string) {
   return queryOptions({
     queryKey: ['panel', 'vm', id, 'seed'] as const,
     queryFn: () =>
-      api<Record<string, unknown>>(
+      api<VmSeedSettings>(
         `/api/panel/vms/${encodeURIComponent(id)}/seed-settings`
       ),
+    refetchInterval: false,
   })
 }
 
