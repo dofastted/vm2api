@@ -159,6 +159,52 @@ test('empty usage windows keep a null cache hit rate', () => {
   }
 })
 
+test('billingStats reuses identical panel snapshots but separates account windows', () => {
+  const { db, repo } = freshDb()
+  try {
+    let computes = 0
+    const compute = repo._computeBillingStats.bind(repo)
+    repo._computeBillingStats = (opts) => {
+      computes++
+      return compute(opts)
+    }
+
+    const winA = [{ account_id: 'acc-1', vm_id: 'vm-a', reset_5h: '2026-10-19T05:00:00.000Z' }]
+    const winAReordered = [{ vm_id: 'vm-a', reset_5h: '2026-10-19T05:00:00.000Z', account_id: 'acc-1' }]
+    const winB = [{ account_id: 'acc-1', vm_id: 'vm-a', reset_5h: '2026-10-19T06:00:00.000Z' }]
+
+    assert.equal(repo.billingStats({ accountWindows: winA }), repo.billingStats({ accountWindows: winAReordered }))
+    assert.equal(computes, 1)
+    repo.billingStats({ accountWindows: winB })
+    assert.equal(computes, 2)
+
+    // Explicit historical snapshots are deterministic test/report calls and must
+    // not be served from the live panel cache.
+    repo.billingStats({ accountWindows: winA, now: Date.parse('2026-10-19T00:00:00.000Z') })
+    repo.billingStats({ accountWindows: winA, now: Date.parse('2026-10-19T00:00:00.000Z') })
+    assert.equal(computes, 4)
+  } finally {
+    db.close()
+  }
+})
+
+test('billingStats rate-limits maintenance backfill independently of cache keys', () => {
+  const { db, repo } = freshDb()
+  try {
+    let backfills = 0
+    repo.backfillMissingCosts = () => {
+      backfills++
+      return 0
+    }
+    repo.billingStats()
+    repo.billingStats({ accountWindows: [{ account_id: 'acc-1', vm_id: 'vm-a' }] })
+    repo.billingStats({ accountWindows: [{ account_id: 'acc-2', vm_id: 'vm-a' }] })
+    assert.equal(backfills, 1)
+  } finally {
+    db.close()
+  }
+})
+
 test('aligned account windows re-sum per-row prompt tokens instead of mixed Anthropic formula', () => {
   const { db, repo } = freshDb()
   try {
