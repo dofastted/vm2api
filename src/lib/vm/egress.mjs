@@ -243,23 +243,63 @@ function readPid(file) {
   }
 }
 
-function ownsEgressProcess(pid, configPath) {
+function processExe(pid) {
+  const exe = fs.readlinkSync(`/proc/${pid}/exe`)
+  const deleted = exe.endsWith(' (deleted)')
+  return { path: deleted ? exe.slice(0, -' (deleted)'.length) : exe, deleted }
+}
+
+function ownsEgressProcess(pid, configPath, { allowDeleted = false } = {}) {
   if (!pidAlive(pid)) return false
   try {
     // PID files survive container restarts; a live PID may belong to another
     // process or another proxy. Verify both before reusing or signaling it.
-    const exe = fs.readlinkSync(`/proc/${pid}/exe`).replace(/ \(deleted\)$/, '')
+    // A replaced binary keeps the old inode in this process. Reusing it leaves
+    // the new file unrun and its listen port permanently busy.
+    const exe = processExe(pid)
+    if (exe.deleted && !allowDeleted) return false
     const args = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')
     const configIndex = args.indexOf('-config')
-    if (path.basename(exe) !== 'kin-egress' || configIndex <= 0 || !args[configIndex + 1]) return false
+    if (path.basename(exe.path) !== 'kin-egress' || configIndex <= 0 || !args[configIndex + 1]) return false
     const argument = args[configIndex + 1]
     const actualConfig = path.isAbsolute(argument)
       ? path.resolve(argument)
       : path.resolve(fs.readlinkSync(`/proc/${pid}/cwd`), argument)
-    return actualConfig === path.resolve(configPath)
+    return path.normalize(actualConfig) === path.normalize(path.resolve(configPath))
   } catch {
     return false
   }
+}
+
+function egressProcessPids() {
+  if (process.platform !== 'linux') return []
+  const marker = Buffer.from('/kin-egress')
+  const deleted = Buffer.from(' (deleted)')
+  const pids = []
+  for (const name of fs.readdirSync('/proc')) {
+    if (!/^[1-9][0-9]*$/.test(name)) continue
+    let exe
+    try {
+      exe = fs.readlinkSync(`/proc/${name}/exe`)
+    } catch {
+      continue
+    }
+    const bytes = Buffer.from(exe)
+    if (!bytes.includes(marker)) continue
+    const end = bytes.subarray(bytes.length - deleted.length).equals(deleted)
+      ? bytes.length - deleted.length
+      : bytes.length
+    if (path.basename(bytes.subarray(0, end).toString('utf8')) !== 'kin-egress') continue
+    pids.push(Number(name))
+  }
+  return pids
+}
+
+function staleEgressPids(configPath, exceptPid = 0) {
+  const wanted = path.resolve(configPath)
+  return egressProcessPids().filter(
+    (pid) => pid !== exceptPid && ownsEgressProcess(pid, wanted, { allowDeleted: true }),
+  )
 }
 export function inspectEgressNetwork(proxyId, run = docker) {
   const name = networkName(proxyId)
@@ -421,7 +461,8 @@ export async function startEgressProcess({
   const listenTcp = `${listenHost}:${tcpPort}`
   const listenDns = `${listenHost}:${dnsPort}`
   const existing = readPid(pidFile)
-  if (ownsEgressProcess(existing, cfgPath)) {
+  const configMatches = ownsEgressProcess(existing, cfgPath)
+  if (configMatches) {
     try {
       const old = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
       if (
@@ -430,24 +471,25 @@ export async function startEgressProcess({
         old.proxy_url === proxyUrl &&
         (old.dns_upstream || '') === dnsUpstream &&
         JSON.stringify(old.dns_empty_types || []) === JSON.stringify(dnsEmptyTypes) &&
-        !!old.domain_forward === !!domainForward
+        !!old.domain_forward === !!domainForward &&
+        staleEgressPids(cfgPath, existing).length === 0
       ) {
         return { ok: true, pid: existing, reused: true, configPath: cfgPath }
       }
     } catch {}
-    try {
-      process.kill(existing, 'SIGTERM')
-    } catch {}
-    const stopped = await waitEgressExit(existing)
-    if (!stopped.ok) return { ok: false, error: stopped.error, pid: existing }
-    if (tcpPort > 0) {
-      const portFree = await waitPortReleased(listenHost, tcpPort)
-      if (!portFree.ok) return { ok: false, error: portFree.error, pid: existing }
-    }
-    if (dnsPort > 0) {
-      const dnsFree = await waitPortReleased(listenHost, dnsPort)
-      if (!dnsFree.ok) return { ok: false, error: dnsFree.error, pid: existing }
-    }
+  }
+  const superseded = [...new Set([...(configMatches ? [existing] : []), ...staleEgressPids(cfgPath)])]
+  for (const pid of superseded) {
+    const stopped = await stopOwnedEgress(pid)
+    if (!stopped.ok) return { ok: false, error: stopped.error, pid }
+  }
+  if (tcpPort > 0) {
+    const portFree = await waitPortReleased(listenHost, tcpPort)
+    if (!portFree.ok) return { ok: false, error: portFree.error, pid: superseded[0] || existing }
+  }
+  if (dnsPort > 0) {
+    const dnsFree = await waitPortReleased(listenHost, dnsPort)
+    if (!dnsFree.ok) return { ok: false, error: dnsFree.error, pid: superseded[0] || existing }
   }
   if (!fs.existsSync(bin)) {
     return { ok: false, error: `kin-egress binary not found: ${bin}` }
@@ -471,15 +513,17 @@ export async function startEgressProcess({
 export function stopEgressProcess(projectRoot, proxyId) {
   const dir = egressRunDir(projectRoot, proxyId)
   const pidFile = path.join(dir, 'egress.pid')
-  const pid = readPid(pidFile)
-  if (ownsEgressProcess(pid, path.join(dir, 'egress.json'))) {
+  const cfgPath = path.join(dir, 'egress.json')
+  const recorded = readPid(pidFile)
+  const pids = [...new Set([...staleEgressPids(cfgPath), ...(ownsEgressProcess(recorded, cfgPath) ? [recorded] : [])])]
+  for (const pid of pids) {
     try {
       process.kill(pid, 'SIGTERM')
     } catch (error) {
       if (error.code !== 'ESRCH') return { ok: false, error: `egress_stop_failed: ${error.code || error.message}` }
     }
     // Keep the PID while termination is pending so policy reconciliation can verify/retry it.
-    if (ownsEgressProcess(pid, path.join(dir, 'egress.json'))) return { ok: true }
+    if (ownsEgressProcess(pid, cfgPath, { allowDeleted: true })) return { ok: true }
   }
   try {
     fs.rmSync(pidFile, { force: true })
@@ -487,6 +531,15 @@ export function stopEgressProcess(projectRoot, proxyId) {
     return { ok: false, error: `egress_pid_cleanup_failed: ${error.code || error.message}` }
   }
   return { ok: true }
+}
+
+async function stopOwnedEgress(pid) {
+  try {
+    process.kill(pid, 'SIGTERM')
+  } catch (error) {
+    if (error.code !== 'ESRCH') return { ok: false, error: `egress_stop_failed: ${error.code || error.message}` }
+  }
+  return waitEgressExit(pid)
 }
 
 export function inspectEgressProcess(projectRoot, proxyId) {
@@ -606,26 +659,32 @@ function spawnDetachedEgress(bin, cfgPath) {
   })
 }
 
-function portListening(host, port) {
+function portListening(host, port, ownerPid = 0) {
   const h = host || '127.0.0.1'
   // A TCP connect is traffic to the transparent forwarder, not a passive
   // readiness check. Inspect LISTEN sockets without entering its data path.
-  const r = sh(['ss', '-H', '-ltn', `sport = :${Number(port)}`], { timeout: 2000 })
+  const probe = ownerPid
+    ? ['ss', '-H', '-ltnp', `sport = :${Number(port)}`]
+    : ['ss', '-H', '-ltn', `sport = :${Number(port)}`]
+  const r = sh(probe, { timeout: 2000 })
   return (
     r.ok &&
     r.stdout.split('\n').some((line) => {
-      const local = line.trim().split(/\s+/)[3]
-      return (
+      const fields = line.trim().split(/\s+/)
+      const local = fields[3]
+      const addressMatches =
         local === `${h}:${port}` || local === `0.0.0.0:${port}` || local === `*:${port}` || local === `[::]:${port}`
-      )
+      if (!addressMatches) return false
+      if (!ownerPid) return true
+      return new RegExp(`pid=${ownerPid}(?:\\D|$)`).test(fields.at(-1) || '')
     })
   )
 }
 
-function waitListen(host, port, timeoutMs = 8000) {
+function waitListen(host, port, timeoutMs = 8000, ownerPid = 0) {
   const start = Date.now()
   while (Date.now() - start < timeoutMs) {
-    if (portListening(host, port)) return true
+    if (portListening(host, port, ownerPid)) return true
     sleepMsSync(100)
   }
   return false
@@ -719,8 +778,8 @@ async function startProxyEgress(
     ...(bin ? { bin } : {}),
   })
   if (!started.ok) return started
-  if (!waitListen(listenHost, ports.tcp))
-    return { ok: false, error: `kin-egress ${listenHost}:${ports.tcp} did not listen` }
+  if (!waitListen(listenHost, ports.tcp, 8000, ports.tcp > 0 ? started.pid : 0))
+    return { ok: false, error: `kin-egress ${listenHost}:${ports.tcp} did not listen`, pid: started.pid }
   const rules = applyIptables(plan, runIptables)
   if (!rules.ok) {
     stopEgressProcess(projectRoot, proxyId)
