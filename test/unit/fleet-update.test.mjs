@@ -217,7 +217,10 @@ test('concurrent fleet telemetry on two slots sharing one proxy restarts egress 
     assert.equal(report.failed_count, 0, JSON.stringify(report.items))
     const current = inspectEgressProcess(root, proxy.id)
     assert.equal(current.ok, true, JSON.stringify(current))
-    assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'data/run/egress/px-shared/egress.json'), 'utf8')).listen_tcp, `127.0.0.1:${port}`)
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(root, 'data/run/egress/px-shared/egress.json'), 'utf8')).listen_tcp,
+      `127.0.0.1:${port}`,
+    )
     process.kill(current.pid, 'SIGTERM')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
