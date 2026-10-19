@@ -343,6 +343,32 @@ test('unofficial Haiku uses short beta set without context-management', () => {
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
+test('gateway and wiggly Claude headers never reach outbound', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-drop-'))
+  const inbound = {
+    'user-agent': 'claude-cli/2.1.303 (external, cli)',
+    'x-app': 'cli',
+    'anthropic-version': '2023-06-01',
+    'anthropic-beta': 'claude-code-20250219,oauth-2025-04-20',
+    'x-stainless-lang': 'js',
+    'x-stainless-runtime': 'node',
+    'x-stainless-package-version': '0.128.0',
+    'x-claude-code-session-id': '3218348e-644b-49c0-a2d1-6d40d5eba9dc',
+    'x-claude-code-wiggly-dove': 'drop-me',
+    cc_gateway: 'drop-me',
+  }
+  const out = resolveCrsHeaders(
+    inbound,
+    dir,
+    { userAgent: 'claude-cli/2.1.296 (external, cli)', callerSessionId: 'slot-session' },
+    'claude-opus-5-5',
+  )
+  assert.equal(out['x-claude-code-wiggly-dove'], undefined)
+  assert.equal(out.cc_gateway, undefined)
+  assert.equal(out['x-claude-code-session-id'], 'slot-session')
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
 test('guest locale and amd64 arch map onto outbound /v1 headers', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-guest-'))
   const merged = mergeGuestFingerprint(
