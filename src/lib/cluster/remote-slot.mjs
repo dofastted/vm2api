@@ -951,9 +951,12 @@ export async function restartRemoteServices(vm, projectRoot, { telemetryEnabled 
     })
     await new Promise((resolve) => setTimeout(resolve, 150))
     if (telemetryEnabled === true) await startRemoteTelemetry(session.docker, vm, name)
-    const egress = slotEgressNames(vm.id).egress
-    const egressInfo = await inspectContainerOrNull(session.docker, egress)
-    if (egressInfo?.State?.Running) await containerAction(session.docker, egress, 'restart')
+    const image = slotImageSpec(projectRoot, vm.kernel || 'ubuntu-24.04')
+    const egress = await ensureRemoteEgress(session, vm, {
+      imageRef: image.ref,
+      binaryDigest: binaries.digest,
+    })
+    if (!egress.ok) return { ok: false, error: egress.error, code: egress.code || 'egress_update_failed' }
     return {
       ok: true,
       action: telemetryEnabled === true ? 'restarted' : 'stopped',

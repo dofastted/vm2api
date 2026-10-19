@@ -22,6 +22,7 @@ import crypto from 'node:crypto'
 import path from 'node:path'
 import { nodeSession, remoteSlotDir, remoteSlotOwner, vmNodeId } from './placement.mjs'
 import { hasCredentialPresence, mirrorWorkerCredentialsToVm } from '../oauth/oauth-credentials.mjs'
+import { EGRESS_BIN } from '../vm/egress.mjs'
 import { readJsonCached } from '../vm/vm-file.mjs'
 import {
   openSftp,
@@ -45,6 +46,11 @@ export const SLOT_FILE_SETS = Object.freeze({
 const CREDENTIALS = 'cli-home/.claude/credentials.json'
 const TOUCH_PUSH_MS = 30_000
 const SLOT_BINARIES = Object.freeze(['kin-worker', 'kin-egress'])
+
+function clusterBin(envKey, fallback) {
+  const value = process.env[envKey]
+  return value && String(value).trim() ? String(value).trim() : fallback
+}
 
 /** Local vms/<id>/ path → node path: the home's `.claude` lives in the host-owned `claude/` mount. */
 export function remoteSlotPath(rel) {
@@ -89,7 +95,6 @@ export async function pushSlotFiles(vm, slotDir, sets = ['run', 'seed'], session
   const remote = remoteSlotDir(s.host, vm.id)
   const owner = ownerFor(s, vm)
   const pushed = []
-  const digest = crypto.createHash('sha256')
   for (const rel of sets.flatMap((name) => SLOT_FILE_SETS[name] || [])) {
     const local = path.join(slotDir, rel)
     let data
@@ -113,9 +118,16 @@ export async function pushSlotBinaries(vm, projectRoot, session = null) {
   const remote = `${remoteSlotDir(s.host, vm.id)}/slot-bin`
   const owner = ownerFor(s, vm)
   const pushed = []
+  const digest = crypto.createHash('sha256')
   for (const name of SLOT_BINARIES) {
+    const defaultBin = path.join(projectRoot, 'bin', name)
     const local =
-      process.env[name === 'kin-worker' ? 'KIN_WORKER_BIN' : 'KIN_EGRESS_BIN'] || path.join(projectRoot, 'bin', name)
+      name === 'kin-worker'
+        ? clusterBin('KIN_CLUSTER_WORKER_BIN', clusterBin('KIN_WORKER_BIN', defaultBin))
+        : clusterBin(
+            'KIN_CLUSTER_EGRESS_BIN',
+            clusterBin('KIN_EGRESS_BIN', fs.existsSync(EGRESS_BIN) ? EGRESS_BIN : defaultBin),
+          )
     let data
     try {
       data = fs.readFileSync(local)

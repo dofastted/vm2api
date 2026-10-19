@@ -24,7 +24,9 @@ if (args[0] === 'compose') {
 } else if (args[0] === 'inspect') {
   console.log(process.env.SAME_CONTAINER === '1' ? 'old-id' : 'new-id')
 } else if (args[0] === 'exec') {
-  const result = spawnSync(process.execPath, args.slice(3), { stdio: 'inherit' })
+  const cmd = args.slice(3)
+  if (cmd.some((part) => String(part).includes('fleet-services.mjs'))) process.exit(0)
+  const result = spawnSync(process.execPath, cmd, { stdio: 'inherit' })
   process.exit(result.status ?? 1)
 } else { process.exit(2) }
 `

@@ -81,6 +81,25 @@ test('degraded worker without OAuth still counts as up', () => {
   assert.equal(isWorkerProcessUp({ code: 'worker_unavailable' }), false)
 })
 
+test('fleet telemetry uses injected telemetryFn with options object', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fleet-tel-'))
+  writeSlot(root, 'vm-01', { node_id: 'node-a' })
+  const calls = []
+  const report = await runFleetUpdate(root, {
+    action: 'telemetry',
+    telemetryFn: async (opts) => {
+      calls.push(opts)
+      return { ok: true, action: 'restarted' }
+    },
+  })
+  assert.equal(report.ok_count, 1)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].vm.id, 'vm-01')
+  assert.equal(calls[0].projectRoot, root)
+  assert.equal(calls[0].enabled, calls[0].telemetryEnabled)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
 test('fleet collect skips reload', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fleet-c-'))
   writeSlot(root, 'vm-01')

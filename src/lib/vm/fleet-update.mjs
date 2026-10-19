@@ -11,7 +11,14 @@ import { rustKernelHealth } from '../transport/rust-kernel-client.mjs'
 import { restartTelemetrySidecar } from './slot-process-status.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { restartRemoteServices } from '../cluster/remote-slot.mjs'
-import { ensureProxyEgress, isLocalEgressProxy, stopEgressProcess } from './egress.mjs'
+import {
+  ensureProxyEgress,
+  inspectEgressProcess,
+  isLocalEgressProxy,
+  stopEgressProcess,
+  waitEgressExit,
+  waitPortReleased,
+} from './egress.mjs'
 
 const ACTIONS = new Set(['collect', 'reload', 'roll', 'telemetry'])
 
@@ -19,8 +26,23 @@ async function restartLocalServices({ projectRoot, vm, enabled }) {
   const telemetry = await restartTelemetrySidecar({ projectRoot, vm, enabled })
   if (!telemetry.ok) return telemetry
   if (!isLocalEgressProxy(vm.proxy)) {
-    const stopped = stopEgressProcess(projectRoot, vm.proxy?.id)
+    const proxyId = vm.proxy?.id
+    const running = inspectEgressProcess(projectRoot, proxyId)
+    const stopped = stopEgressProcess(projectRoot, proxyId)
     if (!stopped.ok) return { ok: false, action: 'egress_stop_failed', error: stopped.error }
+    if (running.ok && running.pid) {
+      const exited = await waitEgressExit(running.pid)
+      if (!exited.ok) return { ok: false, action: 'egress_stop_failed', error: exited.error }
+      const spec = String(running.listen_tcp || '')
+      const colon = spec.lastIndexOf(':')
+      const host = colon > 0 ? spec.slice(0, colon) : ''
+      const port = colon > 0 ? Number(spec.slice(colon + 1)) : 0
+      if (host && Number.isFinite(port) && port > 0) {
+        const portFree = await waitPortReleased(host, port)
+        if (!portFree.ok) return { ok: false, action: 'egress_stop_failed', error: portFree.error }
+      }
+    }
+    stopEgressProcess(projectRoot, proxyId)
     const started = await ensureProxyEgress(projectRoot, vm.proxy)
     if (!started?.ok) return { ok: false, action: 'egress_start_failed', error: started?.error || 'kin-egress failed' }
   }
@@ -110,12 +132,12 @@ export async function updateOneSlot(
     if (action === 'telemetry') {
       const enabled =
         telemetryEnabled === undefined ? vm.seed_policy?.telemetry_disabled === false : telemetryEnabled === true
-      const changed = await (telemetryFn || (vmNodeId(vm) ? restartRemoteServices : restartLocalServices))({
-        projectRoot,
-        vm: getVm(projectRoot, id) || vm,
-        telemetryEnabled: enabled,
-        enabled,
-      })
+      const vmRef = getVm(projectRoot, id) || vm
+      const changed = telemetryFn
+        ? await telemetryFn({ projectRoot, vm: vmRef, telemetryEnabled: enabled, enabled })
+        : vmNodeId(vm)
+          ? await restartRemoteServices(vmRef, projectRoot, { telemetryEnabled: enabled })
+          : await restartLocalServices({ projectRoot, vm: vmRef, enabled })
       result.telemetry = changed
       if (!changed?.ok) {
         result.error = changed?.error || 'telemetry service update failed'
