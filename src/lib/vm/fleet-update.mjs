@@ -8,8 +8,24 @@ import { runtimeKind } from './runtime-kind.mjs'
 import { reloadSlotReady, slotExec } from './slot-runtime.mjs'
 import { collectSlotIdentity } from './guest-identity.mjs'
 import { rustKernelHealth } from '../transport/rust-kernel-client.mjs'
+import { restartTelemetrySidecar } from './slot-process-status.mjs'
+import { vmNodeId } from '../cluster/placement.mjs'
+import { restartRemoteServices } from '../cluster/remote-slot.mjs'
+import { ensureProxyEgress, isLocalEgressProxy, stopEgressProcess } from './egress.mjs'
 
-const ACTIONS = new Set(['collect', 'reload', 'roll'])
+const ACTIONS = new Set(['collect', 'reload', 'roll', 'telemetry'])
+
+async function restartLocalServices({ projectRoot, vm, enabled }) {
+  const telemetry = await restartTelemetrySidecar({ projectRoot, vm, enabled })
+  if (!telemetry.ok) return telemetry
+  if (!isLocalEgressProxy(vm.proxy)) {
+    const stopped = stopEgressProcess(projectRoot, vm.proxy?.id)
+    if (!stopped.ok) return { ok: false, action: 'egress_stop_failed', error: stopped.error }
+    const started = await ensureProxyEgress(projectRoot, vm.proxy)
+    if (!started?.ok) return { ok: false, action: 'egress_start_failed', error: started?.error || 'kin-egress failed' }
+  }
+  return { ...telemetry, egress: 'restarted' }
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -64,6 +80,8 @@ export async function updateOneSlot(
     reloadFn = reloadSlotReady,
     collectFn = collectSlotIdentity,
     healthFn = rustKernelHealth,
+    telemetryFn,
+    telemetryEnabled,
     readyTimeoutMs = 15000,
   } = {},
 ) {
@@ -89,6 +107,22 @@ export async function updateOneSlot(
         return result
       }
     }
+    if (action === 'telemetry') {
+      const enabled =
+        telemetryEnabled === undefined ? vm.seed_policy?.telemetry_disabled === false : telemetryEnabled === true
+      const changed = await (telemetryFn || (vmNodeId(vm) ? restartRemoteServices : restartLocalServices))({
+        projectRoot,
+        vm: getVm(projectRoot, id) || vm,
+        telemetryEnabled: enabled,
+        enabled,
+      })
+      result.telemetry = changed
+      if (!changed?.ok) {
+        result.error = changed?.error || 'telemetry service update failed'
+        result.code = changed?.code || 'telemetry_update_failed'
+        return result
+      }
+    }
     if (action === 'collect' || action === 'roll') {
       const collected = await collectFn(projectRoot, getVm(projectRoot, id) || vm)
       result.collect = collected
@@ -108,7 +142,18 @@ export async function updateOneSlot(
 
 export async function runFleetUpdate(
   projectRoot,
-  { action = 'roll', ids = null, concurrency = 4, routing = {}, reloadFn, collectFn, healthFn, readyTimeoutMs } = {},
+  {
+    action = 'roll',
+    ids = null,
+    concurrency = 4,
+    routing = {},
+    reloadFn,
+    collectFn,
+    healthFn,
+    telemetryFn,
+    telemetryEnabled,
+    readyTimeoutMs,
+  } = {},
 ) {
   const nextAction = ACTIONS.has(action) ? action : 'roll'
   const conc = Math.max(1, Math.min(8, Number(concurrency) || 4))
@@ -120,6 +165,8 @@ export async function runFleetUpdate(
       reloadFn,
       collectFn,
       healthFn,
+      telemetryFn,
+      telemetryEnabled,
       readyTimeoutMs,
     }),
   )

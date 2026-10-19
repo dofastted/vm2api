@@ -103,7 +103,7 @@
 | POST | `/vms/create` | 种子 VM + Claude Code home；依赖私有 `kin-computer`。未安装返回 400 `computer_service_missing`，身份生成失败返回 400 `computer_create_failed`。Docker 槽可在 `machine` 里可选传 `docker_cpus`（见下） |
 | POST | `/vms/import` | sessionKey 导入（必须已有 VM+代理） |
 | GET | `/vms/fleet-status` | 全槽更新状态 |
-| POST | `/vms/fleet-update` | 全槽 roll / 采集 |
+| POST | `/vms/fleet-update` | 全槽 roll / 采集；`action=telemetry` 只更新 Go telemetry/egress 服务，不重建 VM |
 | POST | `/vms/reconcile-fingerprints` | 用官方 `~/.claude.json` 对齐指纹 |
 | POST | `/probe` | 全量额度探测 |
 | GET/POST | `/health-probe` | 读/跑官方 hello 健康探测缓存 |

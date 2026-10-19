@@ -18,6 +18,7 @@
  */
 
 import fs from 'node:fs'
+import crypto from 'node:crypto'
 import path from 'node:path'
 import { nodeSession, remoteSlotDir, remoteSlotOwner, vmNodeId } from './placement.mjs'
 import { hasCredentialPresence, mirrorWorkerCredentialsToVm } from '../oauth/oauth-credentials.mjs'
@@ -43,6 +44,7 @@ export const SLOT_FILE_SETS = Object.freeze({
 })
 const CREDENTIALS = 'cli-home/.claude/credentials.json'
 const TOUCH_PUSH_MS = 30_000
+const SLOT_BINARIES = Object.freeze(['kin-worker', 'kin-egress'])
 
 /** Local vms/<id>/ path → node path: the home's `.claude` lives in the host-owned `claude/` mount. */
 export function remoteSlotPath(rel) {
@@ -62,7 +64,7 @@ async function prepareRemoteDir(session, vm) {
   const dir = remoteSlotDir(session.host, vm.id)
   const owner = remoteSlotOwner(session.host, vm)
   // Mount roots only: nothing here resolves through a path the guest can rewrite.
-  const roots = [`${dir}/run`, `${dir}/claude`, `${dir}/cli-home`].map(shellQuote).join(' ')
+  const roots = [`${dir}/run`, `${dir}/claude`, `${dir}/cli-home`, `${dir}/slot-bin`].map(shellQuote).join(' ')
   // Docker creates a missing bind source as root:root, which the slot uid cannot write.
   const chown = session.host.uid === 0 ? ` && chown ${owner.uid}:${owner.gid} ${shellQuote(dir)} ${roots}` : ''
   await runRemote(session.client, `umask 077 && mkdir -p ${roots} && chmod 700 ${shellQuote(dir)} ${roots}${chown}`, {
@@ -87,6 +89,7 @@ export async function pushSlotFiles(vm, slotDir, sets = ['run', 'seed'], session
   const remote = remoteSlotDir(s.host, vm.id)
   const owner = ownerFor(s, vm)
   const pushed = []
+  const digest = crypto.createHash('sha256')
   for (const rel of sets.flatMap((name) => SLOT_FILE_SETS[name] || [])) {
     const local = path.join(slotDir, rel)
     let data
@@ -100,6 +103,30 @@ export async function pushSlotFiles(vm, slotDir, sets = ['run', 'seed'], session
     pushed.push(rel)
   }
   return { pushed }
+}
+
+/** Publish Go service payloads into the persistent per-slot mount. */
+export async function pushSlotBinaries(vm, projectRoot, session = null) {
+  const s = session || (await nodeSession(vmNodeId(vm)))
+  await prepareRemoteDir(s, vm)
+  const sftp = await openSftp(s.client)
+  const remote = `${remoteSlotDir(s.host, vm.id)}/slot-bin`
+  const owner = ownerFor(s, vm)
+  const pushed = []
+  for (const name of SLOT_BINARIES) {
+    const local =
+      process.env[name === 'kin-worker' ? 'KIN_WORKER_BIN' : 'KIN_EGRESS_BIN'] || path.join(projectRoot, 'bin', name)
+    let data
+    try {
+      data = fs.readFileSync(local)
+    } catch {
+      continue
+    }
+    await writeRemoteFile(sftp, `${remote}/${name}`, data, { mode: 0o755, owner })
+    digest.update(name).update(data)
+    pushed.push(name)
+  }
+  return { pushed, digest: digest.digest('hex') }
 }
 
 /** Explicit import only: replace the remote credential with the local one. */

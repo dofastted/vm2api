@@ -9,6 +9,7 @@ import { runtimeKind } from './runtime-kind.mjs'
 import { slotExecArgv } from './slot-exec.mjs'
 
 const exec = promisify(execFile)
+export const SLOT_WORKER_BIN = '/usr/local/bin/kin-worker'
 const PROBE = String.raw`
 set -eu
 main=$(tr '\000' '\n' < /proc/1/cmdline | sed -n '1p')
@@ -86,7 +87,7 @@ export async function ensureTelemetrySidecar({ projectRoot, vm, run = exec, time
     const target = { ...vm, runtime: { ...(vm.runtime || {}), container: slotContainerName({ vm }), type: kind } }
     await run(
       'docker',
-      slotExecArgv(target, ['/usr/local/bin/kin-worker', 'telemetry', '--config', '/run/kin/worker.json'], {
+      slotExecArgv(target, [SLOT_WORKER_BIN, 'telemetry', '--config', '/run/kin/worker.json'], {
         detach: true,
       }),
       { timeout: timeoutMs, maxBuffer: 4096, encoding: 'utf8', ...(env ? { env } : {}) },
@@ -94,5 +95,37 @@ export async function ensureTelemetrySidecar({ projectRoot, vm, run = exec, time
     return { ok: true, action: 'started' }
   } catch (error) {
     return { ok: false, action: 'start_failed', error: String(error?.message || error) }
+  }
+}
+
+/** Replace only the Go telemetry child; the slot container and Rust process stay up. */
+export async function restartTelemetrySidecar({ projectRoot, vm, enabled, run = exec, timeoutMs = 15_000 } = {}) {
+  if (!projectRoot || !isSafeSlotId(vm?.id)) return { ok: false, action: 'invalid_vm' }
+  const kind = runtimeKind(vm)
+  if (kind !== 'docker' && kind !== 'kvm') return { ok: false, action: 'unsupported_runtime' }
+  const env = slotHost(vm).dockerEnv()
+  const target = { ...vm, runtime: { ...(vm.runtime || {}), container: slotContainerName({ vm }), type: kind } }
+  const stop = 'pkill -TERM -x kin-worker 2>/dev/null || true'
+  try {
+    await run('docker', slotExecArgv(target, ['sh', '-c', stop]), {
+      timeout: timeoutMs,
+      maxBuffer: 4096,
+      encoding: 'utf8',
+      ...(env ? { env } : {}),
+    })
+    if (enabled !== true) return { ok: true, action: 'stopped' }
+    await run(
+      'docker',
+      slotExecArgv(target, [SLOT_WORKER_BIN, 'telemetry', '--config', '/run/kin/worker.json'], { detach: true }),
+      {
+        timeout: timeoutMs,
+        maxBuffer: 4096,
+        encoding: 'utf8',
+        ...(env ? { env } : {}),
+      },
+    )
+    return { ok: true, action: 'restarted' }
+  } catch (error) {
+    return { ok: false, action: 'restart_failed', error: String(error?.message || error) }
   }
 }

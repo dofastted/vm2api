@@ -138,6 +138,11 @@ attempt=0
 while [ "$attempt" -lt 45 ]; do
   if probe verify "$TAG" "$BASELINE"; then
     [ -d .git ] || printf '%s\n' "${TAG#v}" > VERSION
+    # Replace the Go worker/egress payloads in-place; no VM/container rebuild.
+    if ! docker exec "$CONTAINER" node /opt/vm2api/scripts/fleet-services.mjs; then
+      echo "Go service-only update failed; inspect the per-slot report" >&2
+      exit 1
+    fi
     echo "Control plane restarted and verified at $TAG"
     echo "Previously healthy slot kernels verified: $BASELINE"
     exit 0

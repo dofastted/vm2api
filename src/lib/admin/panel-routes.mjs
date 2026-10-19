@@ -3580,10 +3580,18 @@ export function createPanelHandler(ctx) {
         vm.updated_at = new Date().toISOString()
         atomicWriteJson(vmPath, vm, { mode: 0o600 })
         const written = writeSlotSeedFiles(cfg.paths.project, vm, next)
-        if (next.telemetry_disabled === false && telemetryWasOff) {
-          try {
-            await reloadSlotReady(vm, cfg.paths.project, { routing: ctx.routingConfig })
-          } catch {}
+        let service = null
+        if (
+          vm.status === 'running' &&
+          (next.telemetry_disabled !== telemetryWasOff || body.telemetry_service_restart === true)
+        ) {
+          const report = await runFleetUpdate(cfg.paths.project, {
+            action: 'telemetry',
+            ids: [id],
+            concurrency: 1,
+            routing: ctx.routingConfig,
+          })
+          service = report.items?.[0] || report
         }
         return json(
           res,
@@ -3595,6 +3603,7 @@ export function createPanelHandler(ctx) {
             settings_json: written.settings || null,
             claude_setting: written.claude_setting || '',
             kin_seed: written.kin_seed || null,
+            service,
           }),
         )
       }

@@ -93,6 +93,9 @@ link_payload() {
   if [ -e /opt/kin-payload/opt/kin ] || [ -d /opt/kin-payload/opt/kin ]; then
     ln -sfn /opt/kin-payload/opt/kin /opt/kin
   fi
+  if [ -e /opt/kin-payload/opt/kin-live ] || [ -d /opt/kin-payload/opt/kin-live ]; then
+    ln -sfn /opt/kin-payload/opt/kin-live /opt/kin-live
+  fi
 }
 
 apply_identity() {

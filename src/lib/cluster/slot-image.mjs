@@ -27,7 +27,8 @@ import { codexKernelBinPath } from '../transport/codex-kernel-supervisor.mjs'
 import { ClusterError } from './ssh-link.mjs'
 import { tarStream } from './tar.mjs'
 
-export const REMOTE_WORKER_BIN = '/usr/local/bin/kin-worker'
+// Service binaries are supplied by the persistent per-slot slot-bin mount.
+export const REMOTE_WORKER_BIN = '/opt/kin-live/kin-worker'
 
 function binOr(envKey, fallback) {
   const env = String(process.env[envKey] || '').trim()

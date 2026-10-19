@@ -643,6 +643,7 @@ start_stack() {
     fi
     if KIN_AUTO_SYNC_WRAP="$auto_sync_wrap" compose up -d; then
       wait_health || true
+      refresh_slot_services
       return
     fi
     err "docker compose 失败。日志: docker logs ${SERVICE_NAME}"
@@ -655,6 +656,7 @@ start_stack() {
     cat "$log"
     rm -f "$log"
     wait_health || true
+    refresh_slot_services
     return
   fi
   cat "$log"
@@ -664,6 +666,7 @@ start_stack() {
     if KIN_AUTO_SYNC_WRAP="$auto_sync_wrap" compose up -d --build; then
       rm -f "$log"
       wait_health || true
+      refresh_slot_services
       return
     fi
     guide_changelog_error
@@ -674,6 +677,14 @@ start_stack() {
   guide_changelog_error
   rm -f "$log"
   exit 1
+}
+
+refresh_slot_services() {
+  # The control-plane image carries the freshly built Go binaries. Publish them
+  # into persistent slot-bin mounts and restart only kin-worker/kin-egress.
+  if ! docker exec "$SERVICE_NAME" node /opt/vm2api/scripts/fleet-services.mjs; then
+    warn "Go slot service refresh failed; VM containers were left untouched"
+  fi
 }
 
 print_banner() {

@@ -66,11 +66,18 @@ import {
   vmNodeId,
 } from './placement.mjs'
 import { openSftp, readRemoteFileNoFollow, runRemote, shellQuote, writeRemoteFile } from './remote-fs.mjs'
-import { pushSlotFiles, reconcileSlotCredentials, remoteSlotPath, removeRemoteSlotDir } from './remote-slot-files.mjs'
+import {
+  pushSlotBinaries,
+  pushSlotFiles,
+  reconcileSlotCredentials,
+  remoteSlotPath,
+  removeRemoteSlotDir,
+} from './remote-slot-files.mjs'
 import { REMOTE_WORKER_BIN, slotImageSpec } from './slot-image.mjs'
 
 /** Bump when the slot's mount layout changes; a running container with an older label is recreated. */
-const SLOT_LAYOUT = '2'
+const SLOT_LAYOUT = '3'
+const LIVE_BIN = '/opt/kin-live'
 
 function failure(err, fallbackCode = 'remote_slot_failed') {
   return { ok: false, code: err?.code || fallbackCode, error: String(err?.message || err) }
@@ -164,15 +171,22 @@ export function slotEgressNames(vmId) {
  * (kincli) could not open the root-owned file and crash-looped on EACCES. The
  * user is part of the digest so a helper created under the old spec is rebuilt.
  */
-export function remoteEgressContainer({ vmId, proxyId, dir, imageRef, body, host }) {
+export function remoteEgressContainer({ vmId, proxyId, dir, imageRef, body, host, binaryDigest = '' }) {
   const user = `${host.uid}:${host.gid}`
-  const digest = crypto.createHash('sha256').update(body).update(imageRef).update(user).digest('hex').slice(0, 16)
+  const digest = crypto
+    .createHash('sha256')
+    .update(body)
+    .update(imageRef)
+    .update(user)
+    .update(binaryDigest)
+    .digest('hex')
+    .slice(0, 16)
   return {
     digest,
     spec: {
       Image: imageRef,
       User: user,
-      Cmd: ['/usr/local/bin/kin-egress', '-config', '/etc/kin-egress/egress.json'],
+      Cmd: [`${LIVE_BIN}/kin-egress`, '-config', '/etc/kin-egress/egress.json'],
       Labels: {
         'kin.egress': '1',
         'kin.egress.vm': vmId,
@@ -182,7 +196,7 @@ export function remoteEgressContainer({ vmId, proxyId, dir, imageRef, body, host
       },
       HostConfig: {
         NetworkMode: 'host',
-        Binds: [`${dir}:/etc/kin-egress:ro`],
+        Binds: [`${dir}:/etc/kin-egress:ro`, `${path.posix.join(dir, '..', 'slot-bin')}:${LIVE_BIN}:ro`],
         RestartPolicy: { Name: 'unless-stopped' },
         ReadonlyRootfs: true,
         CapDrop: ['ALL'],
@@ -207,7 +221,7 @@ export function canReuseRemoteEgress(existing, digest) {
  * kin-egress (host-network container from the slot image) + iptables REDIRECT,
  * exactly like egress.mjs does on the control plane.
  */
-export async function ensureRemoteEgress(session, vm, { imageRef }) {
+export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest = '' }) {
   const proxy = vm.proxy
   const blocked = proxyBlockedReason(proxy)
   if (blocked) return { ok: false, code: blocked, error: blocked }
@@ -229,6 +243,12 @@ export async function ensureRemoteEgress(session, vm, { imageRef }) {
     return { ok: false, code: 'egress_sudo_required', error: '节点需要 root 或免密 sudo 才能为 SOCKS5 出口写 iptables' }
   }
   const names = slotEgressNames(vm.id)
+  // Keep the helper's executable on the persistent mount even when egress is
+  // enabled independently of a slot start/update.
+  await runRemote(
+    session.client,
+    `umask 077 && mkdir -p ${shellQuote(`${remoteSlotDir(session.host, vm.id)}/slot-bin`)}`,
+  )
   const net = await ensureRemoteNetwork(session.docker, {
     name: names.network,
     bridge: names.bridge,
@@ -248,7 +268,15 @@ export async function ensureRemoteEgress(session, vm, { imageRef }) {
   const body = `${JSON.stringify(cfg, null, 2)}\n`
   // Beside the slot tree, outside every guest bind: the guest never sees the proxy password.
   const dir = `${remoteSlotDir(session.host, vm.id)}/egress`
-  const { digest, spec } = remoteEgressContainer({ vmId: vm.id, proxyId, dir, imageRef, body, host: session.host })
+  const { digest, spec } = remoteEgressContainer({
+    vmId: vm.id,
+    proxyId,
+    dir,
+    imageRef,
+    body,
+    host: session.host,
+    binaryDigest,
+  })
   const existing = await inspectContainerOrNull(session.docker, names.egress)
   if (!canReuseRemoteEgress(existing, digest)) {
     await runRemote(session.client, `umask 077 && mkdir -p ${shellQuote(dir)} && chmod 700 ${shellQuote(dir)}`)
@@ -289,7 +317,8 @@ export async function setRemoteProxyEgressEnabled(vm, projectRoot, enabled) {
         return { ok: true }
       }
       const image = slotImageSpec(projectRoot, vm.kernel || 'ubuntu-24.04')
-      return ensureRemoteEgress(session, vm, { imageRef: image.ref })
+      const binaries = await pushSlotBinaries(vm, projectRoot, session)
+      return ensureRemoteEgress(session, vm, { imageRef: image.ref, binaryDigest: binaries.digest })
     }
     for (const name of new Set([current, legacy])) {
       const existing = await inspectContainerOrNull(session.docker, name)
@@ -448,6 +477,7 @@ function kvmSlotContainerBody(vm, { image, network, remoteDir, routing, accel, s
         `${remoteDir}/claude:/slot/claude`,
         `${remoteDir}/run:/slot/run`,
         `${remoteDir}/kvm:/slot/kvm`,
+        `${remoteDir}/slot-bin:/opt/kin-guest/opt/kin-live:ro`,
       ],
       NetworkMode: network,
       RestartPolicy: { Name: 'unless-stopped' },
@@ -508,6 +538,7 @@ export function slotContainerBody(vm, { image, network, remoteDir, user, routing
         `${remoteDir}/run:/run/kin`,
         `${remoteDir}/machine-id:/etc/machine-id:ro`,
         `${remoteDir}/machine-id:/var/lib/dbus/machine-id:ro`,
+        `${remoteDir}/slot-bin:${LIVE_BIN}:ro`,
       ],
       NetworkMode: network,
       RestartPolicy: { Name: 'unless-stopped' },
@@ -741,7 +772,8 @@ export function codexRoleMatches(info, vm) {
 
 async function startRemoteTelemetry(docker, vm, name) {
   const target = { ...vm, runtime: { ...(vm.runtime || {}), container: name, type: runtimeKind(vm) } }
-  const { Cmd, User } = slotExecCmd(target, [REMOTE_WORKER_BIN, 'telemetry', '--config', '/run/kin/worker.json'], {
+  const worker = isKvmRuntime(vm) ? '/opt/kin-payload/opt/kin-live/kin-worker' : REMOTE_WORKER_BIN
+  const { Cmd, User } = slotExecCmd(target, [worker, 'telemetry', '--config', '/run/kin/worker.json'], {
     detach: true,
   })
   await execDetached(docker, name, Cmd, { user: User }).catch(() => {})
@@ -766,7 +798,9 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
       if (!probe.ok) return { ok: false, code: 'kvm_unavailable', error: probe.error }
       accel = probe.accel
     }
-    const eg = await ensureRemoteEgress(session, vm, { imageRef: egressImage || image })
+    const binaries =
+      typeof pushSlotBinaries === 'function' ? await pushSlotBinaries(vm, projectRoot, session) : { digest: '' }
+    const eg = await ensureRemoteEgress(session, vm, { imageRef: egressImage || image, binaryDigest: binaries.digest })
     if (!eg.ok) return eg
     const name = containerName(vm.id)
     const relays = await clusterManager().ensureSlotRelays(nodeId, vm.id)
@@ -844,7 +878,12 @@ export async function reloadRemoteSlot(vm, projectRoot, { routing } = {}) {
     const p = await prepare(vm, projectRoot, routing)
     if (p.fail) return p.fail
     const { nodeId, session, image, user, remoteDir, slotDir } = p
-    const eg = await ensureRemoteEgress(session, vm, { imageRef: p.egressImage || image })
+    const binaries =
+      typeof pushSlotBinaries === 'function' ? await pushSlotBinaries(vm, projectRoot, session) : { digest: '' }
+    const eg = await ensureRemoteEgress(session, vm, {
+      imageRef: p.egressImage || image,
+      binaryDigest: binaries.digest,
+    })
     if (!eg.ok) return eg
     const name = containerName(vm.id)
     const existing = await inspectContainerOrNull(session.docker, name)
@@ -893,6 +932,36 @@ export async function reloadRemoteSlot(vm, projectRoot, { routing } = {}) {
     return { ok: true, action: running ? 'reloaded' : 'started', runtime: vm.runtime }
   } catch (err) {
     return failure(err)
+  }
+}
+
+/** Update a node slot's Go services without recreating its VM/container. */
+export async function restartRemoteServices(vm, projectRoot, { telemetryEnabled } = {}) {
+  try {
+    const session = await nodeSession(vmNodeId(vm))
+    const remoteDir = remoteSlotDir(session.host, vm.id)
+    const slotDir = path.join(projectRoot, 'vms', vm.id)
+    const name = vm.runtime?.container || containerName(vm.id)
+    const binaries = await pushSlotBinaries(vm, projectRoot, session)
+    await pushSlotFiles(vm, slotDir, ['run', 'seed'], session)
+    const target = { ...vm, runtime: { ...(vm.runtime || {}), container: name, type: runtimeKind(vm) } }
+    const stop = 'pkill -TERM -x kin-worker 2>/dev/null || true'
+    await execDetached(session.docker, name, slotExecCmd(target, ['sh', '-c', stop]).Cmd, {
+      user: slotExecCmd(target, ['sh', '-c', stop]).User,
+    })
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    if (telemetryEnabled === true) await startRemoteTelemetry(session.docker, vm, name)
+    const egress = slotEgressNames(vm.id).egress
+    const egressInfo = await inspectContainerOrNull(session.docker, egress)
+    if (egressInfo?.State?.Running) await containerAction(session.docker, egress, 'restart')
+    return {
+      ok: true,
+      action: telemetryEnabled === true ? 'restarted' : 'stopped',
+      remote_dir: remoteDir,
+      binary_digest: binaries.digest || null,
+    }
+  } catch (err) {
+    return failure(err, 'service_update_failed')
   }
 }
 
