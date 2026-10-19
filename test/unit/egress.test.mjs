@@ -31,6 +31,8 @@ import {
   stopEgressProcess,
   waitEgressExit,
   egressPidActive,
+  ensureProxyEgress,
+  waitPortReleased,
 } from '../../src/lib/vm/egress.mjs'
 import { hostProxyUrlForVm } from '../../src/lib/vm/slot-host.mjs'
 
@@ -570,6 +572,50 @@ test('DNS override changes restart the helper and disabling clears the override'
   const disabled = await fx.start()
   assert.equal(disabled.reused, false)
   assert.equal(JSON.parse(fs.readFileSync(fx.configPath, 'utf8')).dns_empty_types, undefined)
+})
+
+test('concurrent starts for one proxy spawn a single helper and record it', {
+  skip: process.platform !== 'linux',
+}, async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'egress-race-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const proxy = { id: 'px-race', url: 'socks5h://192.0.2.1:1080' }
+  const ports = portsForProxy(proxy.id)
+  const runDocker = (args) =>
+    args[0] === 'network' && args[1] === 'inspect' ? { ok: true, stdout: '172.31.250.0/24|127.0.0.1' } : { ok: true }
+  const runIptables = () => ({ ok: true })
+  const opts = { runDocker, runIptables, dnsUpstream: '', dnsEmptyTypes: [], bin: egressBin }
+  const results = await Promise.all([1, 2, 3].map(() => ensureProxyEgress(root, proxy, opts)))
+  const pids = results.map((r) => r.pid).filter(Boolean)
+  for (const pid of new Set(pids))
+    t.after(() => {
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch {}
+    })
+  assert.deepEqual(
+    results.map((r) => r.ok),
+    [true, true, true],
+    JSON.stringify(results),
+  )
+  assert.equal(new Set(pids).size, 1, `one helper expected, got ${pids}`)
+  const recorded = Number(fs.readFileSync(path.join(egressRunDir(root, proxy.id), 'egress.pid'), 'utf8'))
+  assert.equal(recorded, pids[0])
+  assert.equal(egressPidActive(recorded), true)
+  assert.equal(egressListening(root, proxy.id).ok, true, `listening on ${ports.tcp}`)
+})
+
+test('waitPortReleased returns at once for a free port without blocking the event loop', {
+  skip: process.platform !== 'linux',
+}, async () => {
+  let ticks = 0
+  const timer = setInterval(() => ticks++, 5)
+  const started = Date.now()
+  const result = await waitPortReleased('127.0.0.1', 1)
+  const elapsed = Date.now() - started
+  clearInterval(timer)
+  assert.equal(result.ok, true)
+  assert.ok(elapsed < 150, `took ${elapsed}ms`)
 })
 
 test('egress wait loops do not shell out to python3', () => {

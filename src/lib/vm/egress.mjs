@@ -573,7 +573,7 @@ export async function waitEgressExit(
 export async function waitPortReleased(host, port, timeoutMs = 3000) {
   const start = Date.now()
   while (Date.now() - start < timeoutMs) {
-    if (!waitListen(host, port, 200)) return { ok: true }
+    if (!portListening(host, port)) return { ok: true }
     await delay(EGRESS_POLL_MS)
   }
   return { ok: false, error: 'egress_port_busy', port }
@@ -606,23 +606,26 @@ function spawnDetachedEgress(bin, cfgPath) {
   })
 }
 
+function portListening(host, port) {
+  const h = host || '127.0.0.1'
+  // A TCP connect is traffic to the transparent forwarder, not a passive
+  // readiness check. Inspect LISTEN sockets without entering its data path.
+  const r = sh(['ss', '-H', '-ltn', `sport = :${Number(port)}`], { timeout: 2000 })
+  return (
+    r.ok &&
+    r.stdout.split('\n').some((line) => {
+      const local = line.trim().split(/\s+/)[3]
+      return (
+        local === `${h}:${port}` || local === `0.0.0.0:${port}` || local === `*:${port}` || local === `[::]:${port}`
+      )
+    })
+  )
+}
+
 function waitListen(host, port, timeoutMs = 8000) {
   const start = Date.now()
-  const h = host || '127.0.0.1'
   while (Date.now() - start < timeoutMs) {
-    // A TCP connect is traffic to the transparent forwarder, not a passive
-    // readiness check. Inspect LISTEN sockets without entering its data path.
-    const r = sh(['ss', '-H', '-ltn', `sport = :${Number(port)}`], { timeout: 2000 })
-    if (
-      r.ok &&
-      r.stdout.split('\n').some((line) => {
-        const local = line.trim().split(/\s+/)[3]
-        return (
-          local === `${h}:${port}` || local === `0.0.0.0:${port}` || local === `*:${port}` || local === `[::]:${port}`
-        )
-      })
-    )
-      return true
+    if (portListening(host, port)) return true
     sleepMsSync(100)
   }
   return false
@@ -655,7 +658,26 @@ export function ensureLocalProxyEgress(proxy, { runDocker = docker } = {}) {
   return { ok: true, mode: 'local', ...info, reused: false, proxy_id: proxyId }
 }
 
-export async function ensureProxyEgress(
+const egressStarts = new Map()
+
+/**
+ * One start per proxy at a time: the pid file is written only after spawn, so two
+ * overlapping starts would both spawn and record the helper that lost the bind.
+ */
+export async function ensureProxyEgress(projectRoot, proxy, opts = {}) {
+  if (isLocalEgressProxy(proxy)) return ensureLocalProxyEgress(proxy, { runDocker: opts.runDocker })
+  const key = egressRunDir(projectRoot || '', proxy?.id || '')
+  const run = (egressStarts.get(key) || Promise.resolve()).then(() => startProxyEgress(projectRoot, proxy, opts))
+  const tail = run.catch(() => {})
+  egressStarts.set(key, tail)
+  try {
+    return await run
+  } finally {
+    if (egressStarts.get(key) === tail) egressStarts.delete(key)
+  }
+}
+
+async function startProxyEgress(
   projectRoot,
   proxy,
   {
@@ -663,9 +685,9 @@ export async function ensureProxyEgress(
     runIptables = iptables,
     dnsUpstream = configuredDnsUpstream(),
     dnsEmptyTypes = configuredDnsEmptyTypes(),
+    bin,
   } = {},
 ) {
-  if (isLocalEgressProxy(proxy)) return ensureLocalProxyEgress(proxy, { runDocker })
   const blocked = proxyBlockedReason(proxy)
   if (blocked) return { ok: false, error: blocked }
   const proxyId = proxy?.id
@@ -694,6 +716,7 @@ export async function ensureProxyEgress(
     dnsUpstream,
     dnsEmptyTypes,
     domainForward: proxy?.domain_forward === true,
+    ...(bin ? { bin } : {}),
   })
   if (!started.ok) return started
   if (!waitListen(listenHost, ports.tcp))
