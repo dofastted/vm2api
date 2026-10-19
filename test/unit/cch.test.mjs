@@ -119,6 +119,36 @@ test('CCH fills missing values and replaces stale values without changing billin
   }
 })
 
+test('sealing writes the digest into system billing only and never throws on prompt literals', () => {
+  const placeholderLiteral = `x-anthropic-billing-header: cc_version=1; cch=${CCH_PLACEHOLDER};`
+  const body = {
+    model: 'claude-opus-5-5',
+    messages: [
+      { role: 'user', content: placeholderLiteral },
+      { role: 'user', content: 'x-anthropic-billing-header: x; cch=abcde;' },
+    ],
+    system: [{ type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.296.abc; cc_entrypoint=sdk-cli;' }],
+  }
+  const sealed = sealClaudeCodeCch(body)
+  assert.equal(sealed.messages[0].content, placeholderLiteral)
+  assert.equal(sealed.messages[1].content, body.messages[1].content)
+  const cch = sealed.system[0].text.match(/cch=([0-9a-f]{5});/)[1]
+  assert.notEqual(cch, CCH_PLACEHOLDER)
+  const unsealed = {
+    ...sealed,
+    system: [{ ...sealed.system[0], text: sealed.system[0].text.replace(cch, CCH_PLACEHOLDER) }],
+  }
+  const projected = JSON.stringify(unsealed).replace(/"model":"[^"]*"/g, '"model":""')
+  assert.equal(cch, computeClaudeCodeCch(Buffer.from(projected, 'utf8')))
+
+  const noBilling = {
+    model: 'm',
+    system: 'plain',
+    messages: [{ role: 'user', content: `literal cch=${CCH_PLACEHOLDER}` }],
+  }
+  assert.deepEqual(sealClaudeCodeCch(noBilling), noBilling)
+})
+
 test('CCH settings apply per hop and native sealing waits for final CLI serialization', () => {
   const body = {
     model: 'claude-opus-5-5',
