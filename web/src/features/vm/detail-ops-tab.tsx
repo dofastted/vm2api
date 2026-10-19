@@ -210,7 +210,6 @@ export function VmOpsTab(props: VmOpsTabProps) {
             <Button
               size='sm'
               variant='outline'
-              disabled={remote}
               loading={busy('/wrap-cli/repair')}
               onClick={() => onAction('/wrap-cli/repair')}
             >
@@ -218,7 +217,8 @@ export function VmOpsTab(props: VmOpsTabProps) {
             </Button>
             {remote ? (
               <span className='text-xs text-muted-foreground'>
-                {REMOTE_UNSUPPORTED_TEXT}
+                集群槽重装会按当前 kernel、cli-node 和 Go
+                遥测重建镜像并换容器，凭证和指纹保留。
               </span>
             ) : null}
           </div>

@@ -126,7 +126,7 @@ docker compose up -d --build
 curl -sS --noproxy '*' http://127.0.0.1:8787/health
 ```
 
-槽位容器不会被升级脚本 `docker rm`。从 1.2.22 开始，一键更新默认把 `share/wrap-cli` 同步到所有槽并重启槽内 dataplane；仅在明确需要延后时使用 `--no-sync-wrap`。
+槽位容器不会被升级脚本无条件 `docker rm`。从 1.2.22 开始，一键更新默认把 `share/wrap-cli` 同步到本机槽并重启槽内 dataplane；集群槽在同一次同步里重建内容哈希镜像并换容器。仅在明确需要延后时使用 `--no-sync-wrap`。
 
 **本机 Node + systemd**
 

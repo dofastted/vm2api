@@ -214,11 +214,12 @@ export function FleetActions() {
             <DialogTitle>全槽更新</DialogTitle>
           </DialogHeader>
           <p className='text-sm text-muted-foreground'>
-            滚动处理全部槽位的 kernel / slot runtime。不重启控制面，不 docker
-            rm，不启动 Go worker hop。
+            重装当前内核：本地槽换挂载的 kernel / cli-node
+            并重启进程；集群槽用同一份 kernel、cli-node 和 Go
+            遥测重建镜像，再换容器。凭证和指纹保留。
           </p>
           <p className='text-sm text-muted-foreground'>
-            重载会吃到新二进制再采集 guest 特征。KVM
+            全槽更新只重载已在跑的 runtime 并采集特征，不换二进制。KVM
             槽在适配器未接线时会失败并跳过。
           </p>
           <DialogFooter>

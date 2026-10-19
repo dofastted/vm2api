@@ -578,6 +578,113 @@ async function ensureNodeSlotImage(session, nodeId, projectRoot, kernel, runtime
   return spec
 }
 
+/**
+ * Current control-plane payload (kernel, cli-node, cc-node, kin-worker telemetry)
+ * as a slot image on this node. Same bytes local slots bind-mount; a node only
+ * sees them after the content-hashed image exists and the container is recreated.
+ */
+export async function refreshNodeSlotPayload(vm, projectRoot, { routing, startFn = startRemoteSlot } = {}) {
+  const id = vm?.id
+  const nodeId = vmNodeId(vm)
+  if (!id || !nodeId) return { id, ok: false, code: 'not_cluster_slot', error: '不是集群槽' }
+  const kernel = vm.kernel && OS_CATALOG[vm.kernel] ? vm.kernel : 'ubuntu-24.04'
+  const kind = runtimeKind(vm)
+  try {
+    const session = await nodeSession(nodeId)
+    const spec = await ensureNodeSlotImage(session, nodeId, projectRoot, kernel, kind)
+    if (spec.fail) return { id, node_id: nodeId, ...spec.fail }
+    if (kind === 'kvm') {
+      const dockerSpec = await ensureNodeSlotImage(session, nodeId, projectRoot, kernel, 'docker')
+      if (dockerSpec.fail) return { id, node_id: nodeId, ...dockerSpec.fail }
+    }
+    const running = vm.status === 'running'
+    if (!running) {
+      return {
+        id,
+        node_id: nodeId,
+        ok: true,
+        image: spec.ref,
+        kernel_changed: true,
+        restarted: false,
+        kernel: { ok: true, skipped: true, reason: 'vm_stopped' },
+      }
+    }
+    const boot = await startFn(vm, projectRoot, { recreate: true, routing })
+    if (!boot?.ok) {
+      return {
+        id,
+        node_id: nodeId,
+        ok: false,
+        code: boot?.code || 'slot_payload_refresh_failed',
+        error: boot?.error || '集群槽换镜像失败',
+        image: spec.ref,
+      }
+    }
+    return {
+      id,
+      node_id: nodeId,
+      ok: true,
+      image: spec.ref,
+      kernel_changed: true,
+      restarted: true,
+      kernel: { ok: true, action: boot.action || 'recreated' },
+    }
+  } catch (err) {
+    return {
+      id,
+      node_id: nodeId,
+      ok: false,
+      code: err?.code || 'slot_payload_refresh_failed',
+      error: String(err?.message || err).slice(0, 300),
+    }
+  }
+}
+
+/** One image build per node+kernel+runtime, then recreate each slot onto it. */
+export async function refreshClusterSlotPayloads(
+  projectRoot,
+  vms,
+  { routing, refreshFn = refreshNodeSlotPayload } = {},
+) {
+  const groups = new Map()
+  const items = []
+  for (const vm of vms || []) {
+    // Codex inference is the host Codex kernel. The slot has no cli-node or Go telemetry.
+    if (isCodexVm(vm)) continue
+    if (resolveKernelDataplane(vm, routing || {}) === 'crag' || vm?.dataplane === 'crag') {
+      items.push({
+        id: vm.id,
+        ok: false,
+        code: 'remote_unsupported',
+        error: 'crag 数据面暂不支持集群节点',
+        kernel_changed: false,
+      })
+      continue
+    }
+    const nodeId = vmNodeId(vm)
+    const kernel = vm.kernel && OS_CATALOG[vm.kernel] ? vm.kernel : 'ubuntu-24.04'
+    const kind = runtimeKind(vm)
+    const key = `${nodeId}\0${kernel}\0${kind}`
+    const group = groups.get(key) || []
+    group.push(vm)
+    groups.set(key, group)
+  }
+  for (const group of groups.values()) {
+    for (const vm of group) items.push(await refreshFn(vm, projectRoot, { routing }))
+  }
+  const failed = items.filter((item) => !item.ok)
+  const changed = items.filter((item) => item.kernel_changed === true)
+  return {
+    ok: failed.length === 0,
+    changed: changed.length > 0,
+    total: items.length,
+    ok_count: items.length - failed.length,
+    failed_count: failed.length,
+    changed_count: changed.length,
+    items,
+  }
+}
+
 async function prepare(vm, projectRoot, routing) {
   if (resolveKernelDataplane(vm, routing || {}) === 'crag') {
     return { fail: { ok: false, code: 'remote_unsupported', error: 'crag 数据面暂不支持集群节点' } }

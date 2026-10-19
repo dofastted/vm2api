@@ -52,7 +52,7 @@ sudo bash /opt/vm2api/deploy/install.sh check
 sudo bash /opt/vm2api/deploy/install.sh changelog
 ```
 
-保留 `.env` / `vms/` / `data/`。不要 `docker rm` 槽。一键更新会自动把新版 `share/wrap-cli`（包括 `kin-kernel.bin`）同步到所有槽并重启槽内 dataplane；如需暂时跳过可加 `--no-sync-wrap`。管理台 **设置 → 关于** 可复制同一条命令、看 changelog。指定版本：`--version v1.2.22`。
+保留 `.env` / `vms/` / `data/`。一键更新会把新版 `share/wrap-cli`（包括 `kin-kernel.bin`、`cli-node`、`cc-node`）同步到本机槽并重启槽内 dataplane；集群槽使用同一份二进制加上当前 Go `kin-worker` 遥测重建槽位镜像，再换容器，不改凭证和指纹。如需暂时跳过可加 `--no-sync-wrap`。管理台 **设置 → 关于** 可复制同一条命令、看 changelog。指定版本：`--version v1.2.22`。槽位重建可选「保留原数据」或「重建新特征」。
 
 首次登录后，在「用户」中找到当前管理员，点击「改密码」设置至少 8 位的新密码。默认密码管理员也会写入用户列表；修改后数据库密码优先，重启或更新不会被 `.env` 中的旧密码覆盖。
 

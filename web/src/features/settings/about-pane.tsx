@@ -198,7 +198,9 @@ export function AboutPane() {
         </CardHeader>
         <CardContent className='space-y-3'>
           <p className='text-sm text-muted-foreground'>
-            在宿主机执行。保留 .env / vms / data，不 docker rm 槽。
+            在宿主机执行。保留 .env / vms / data。本地槽同步 kernel 与
+            CLI；集群槽按同一份 kernel、cli-node 和 Go
+            遥测重建镜像并换容器，不改凭证和指纹。
           </p>
           <pre className='overflow-x-auto rounded-md bg-muted px-3 py-2 font-mono text-xs'>
             {data?.upgrade_command ||

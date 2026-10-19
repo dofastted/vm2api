@@ -214,12 +214,13 @@ function releaseFetch(
   }
 }
 
-function panelFor(project, { readBody, readRawBody, fetchImpl } = {}) {
+function panelFor(project, { readBody, readRawBody, fetchImpl, refreshClusterSlotPayloads } = {}) {
   const response = {}
   const handlePanel = createPanelHandler({
     cfg: { paths: { project } },
     routingConfig: {},
     fetchImpl,
+    refreshClusterSlotPayloads,
     requireAuth(req) {
       req.apiKeyKind = 'master'
       req.panelRole = 'admin'
@@ -293,6 +294,59 @@ test('github kernel release does not write a non-ELF payload', async () => {
     assert.equal(response.status, 400)
     assert.equal(response.body.error.code, 'kernel_not_elf')
     assert.equal(fs.existsSync(path.join(project, 'bin', 'kin-kernel')), false)
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
+
+test('wrap sync refreshes a cluster slot with the same kernel payload', async () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-panel-cluster-sync-'))
+  const seen = []
+  try {
+    seedWrapTemplate(project)
+    fs.mkdirSync(path.join(project, 'vms'), { recursive: true })
+    fs.writeFileSync(
+      path.join(project, 'vms', 'local-slot.json'),
+      JSON.stringify({ id: 'local-slot', name: 'local', status: 'stopped' }),
+    )
+    fs.writeFileSync(
+      path.join(project, 'vms', 'node-slot.json'),
+      JSON.stringify({ id: 'node-slot', name: 'node', status: 'stopped', node_id: 'node-a', kernel: 'ubuntu-24.04' }),
+    )
+    const { response, handlePanel } = panelFor(project, {
+      refreshClusterSlotPayloads: async (_root, vms) => {
+        seen.push(vms.map((vm) => vm.id))
+        return {
+          ok: true,
+          changed: true,
+          total: vms.length,
+          ok_count: vms.length,
+          failed_count: 0,
+          changed_count: vms.length,
+          items: vms.map((vm) => ({
+            id: vm.id,
+            node_id: vm.node_id,
+            ok: true,
+            kernel_changed: true,
+            image: 'vm2api/kin-slot-ubuntu-24.04:abc',
+            kernel: { ok: true, skipped: true, reason: 'vm_stopped' },
+          })),
+        }
+      },
+    })
+    await handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/wrap-cli/sync'))
+    assert.equal(response.status, 200, JSON.stringify(response.body))
+    assert.deepEqual(seen, [['node-slot']])
+    assert.equal(response.body.data.total, 2)
+    assert.equal(response.body.data.cluster.total, 1)
+    assert.equal(
+      response.body.data.items.find((item) => item.id === 'node-slot').image,
+      'vm2api/kin-slot-ubuntu-24.04:abc',
+    )
+    assert.equal(
+      fs.readFileSync(path.join(project, 'vms', 'local-slot', 'cli-home', '.kin', 'kin-kernel.bin'), 'utf8'),
+      'kin-kernel',
+    )
   } finally {
     fs.rmSync(project, { recursive: true, force: true })
   }
