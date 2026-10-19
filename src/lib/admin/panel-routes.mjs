@@ -3593,20 +3593,6 @@ export function createPanelHandler(ctx) {
           })
           service = report.items?.[0] || report
         }
-        if (service?.ok === false) {
-          return json(res, 502, {
-            ok: false,
-            error: {
-              message: service.error || 'telemetry service update failed',
-              code: service.code || 'telemetry_update_failed',
-            },
-            data: {
-              vm_id: id,
-              seed_policy: next,
-              service,
-            },
-          })
-        }
         return json(
           res,
           200,
