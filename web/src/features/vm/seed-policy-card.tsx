@@ -6,7 +6,6 @@ import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import {
-  DEFAULT_CLAUDE_SETTING,
   REJECT_FLAGS,
   seedDraftOf,
   seedSaveBody,
@@ -16,8 +15,6 @@ import {
   type SeedDraft,
 } from '@/features/vm/seed-settings'
 import { telemetryEnabled } from '@/features/vm/telemetry-policy'
-
-export { DEFAULT_CLAUDE_SETTING }
 
 type ObservedTelemetry = NonNullable<VmKernelSnapshot['telemetry']>
 
@@ -235,7 +232,7 @@ export function SeedPolicyCard({
             onChange={(event) => patch({ claude_setting: event.target.value })}
             className='min-h-28 font-mono text-xs'
             spellCheck={false}
-            placeholder={DEFAULT_CLAUDE_SETTING}
+            placeholder='每行 KEY=value'
           />
           <p className='text-xs text-muted-foreground'>
             {syncTelemetry

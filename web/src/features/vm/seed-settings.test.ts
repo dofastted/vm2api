@@ -82,12 +82,17 @@ describe('seed draft', () => {
     expect(draft.reject_client_settings).toBe(true)
   })
 
-  it('keeps an empty claude.setting file empty', () => {
-    const draft = seedDraftOf({
-      seed_policy: { claude_setting: 'FROM_POLICY=1' },
-      claude_setting: '',
-    })
-    expect(draft.claude_setting).toBe('')
+  it('keeps a missing or empty claude.setting empty', () => {
+    expect(
+      seedDraftOf({
+        seed_policy: { claude_setting: 'FROM_POLICY=1' },
+        claude_setting: '',
+      }).claude_setting
+    ).toBe('')
+    expect(
+      seedDraftOf({ seed_policy: { claude_setting: 'FROM_POLICY=1' } })
+        .claude_setting
+    ).toBe('')
   })
 })
 

@@ -7,9 +7,6 @@ import {
 } from '@/features/vm/telemetry-policy'
 import { telemetryStatusLabel } from '@/features/vm/telemetry-status'
 
-export const DEFAULT_CLAUDE_SETTING =
-  'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1'
-
 export const REJECT_FLAGS = [
   ['reject_client_settings', '拒客户端 settings'],
   ['reject_client_metadata_identity', '拒客户端身份'],
@@ -88,16 +85,9 @@ export function seedDraftOf(
 ): SeedDraft {
   const policy = asRecord(seed?.seed_policy) || {}
   const enabled = telemetryEnabled(policy)
-  // null/undefined: the file was not read, so the policy text is the only copy.
-  // An empty string is a real file and stays empty.
-  const fileSetting = settingText(seed?.claude_setting)
-  const policySetting = settingText(policy.claude_setting, '')
   return {
     ...telemetrySeedFlags(enabled),
-    claude_setting:
-      seed?.claude_setting == null
-        ? policySetting || DEFAULT_CLAUDE_SETTING
-        : fileSetting,
+    claude_setting: settingText(seed?.claude_setting),
     reject_client_settings:
       'reject_client_settings' in policy
         ? policy.reject_client_settings !== false
