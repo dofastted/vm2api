@@ -51,3 +51,7 @@ test('arbitrary origin is never echoed; response remains wildcard without creden
   assert.equal(headers['access-control-allow-credentials'], undefined)
   assert.equal(headers.vary, undefined)
 })
+
+test('preflight allows the Idempotency-Key the console sends on redeem', () => {
+  assert.match(corsHeadersForRequest(null)['access-control-allow-headers'], /(^|, )idempotency-key(,|$)/)
+})

@@ -243,6 +243,7 @@ import {
   wrapCliHomeDir,
 } from '../vm/wrap-cli-runtime.mjs'
 import { readRawBody as defaultReadRawBody } from '../http/respond.mjs'
+import { corsHeadersForRequest } from '../http/cors.mjs'
 import { restartRustKernel, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 
 import { countTokensViaWorker } from '../transport/go-worker-client.mjs'
@@ -1840,13 +1841,18 @@ export function createPanelHandler(ctx) {
         const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')
         const body = format === 'csv' ? logsToCsv(items) : logsToJsonl(items)
         const filename = `vm2api-logs-${stamp}.${format}`
-        res.writeHead(200, {
-          'content-type': format === 'csv' ? 'text/csv; charset=utf-8' : 'application/x-ndjson; charset=utf-8',
-          'content-disposition': `attachment; filename="${filename}"`,
-          'x-kin-export-count': String(items.length),
-          'x-kin-export-total': String(total),
-          'x-kin-export-truncated': items.length < total || capped ? '1' : '0',
-        })
+        res.writeHead(
+          200,
+          corsHeadersForRequest(req, {
+            'content-type': format === 'csv' ? 'text/csv; charset=utf-8' : 'application/x-ndjson; charset=utf-8',
+            'content-disposition': `attachment; filename="${filename}"`,
+            'x-kin-export-count': String(items.length),
+            'x-kin-export-total': String(total),
+            'x-kin-export-truncated': items.length < total || capped ? '1' : '0',
+            'access-control-expose-headers':
+              'content-disposition, x-kin-export-count, x-kin-export-total, x-kin-export-truncated',
+          }),
+        )
         res.end(body)
         return
       }
@@ -2005,12 +2011,16 @@ export function createPanelHandler(ctx) {
         if (!rec || !rec.file_path || !fs.existsSync(rec.file_path)) {
           return json(res, 404, { ok: false, error: { message: 'backup file not found' } })
         }
-        res.writeHead(200, {
-          'content-type': 'application/gzip',
-          'content-length': fs.statSync(rec.file_path).size,
-          'content-disposition': `attachment; filename="${rec.file_name}"`,
-          'x-kin-backup-sha256': rec.sha256 || '',
-        })
+        res.writeHead(
+          200,
+          corsHeadersForRequest(req, {
+            'content-type': 'application/gzip',
+            'content-length': fs.statSync(rec.file_path).size,
+            'content-disposition': `attachment; filename="${rec.file_name}"`,
+            'x-kin-backup-sha256': rec.sha256 || '',
+            'access-control-expose-headers': 'content-disposition, x-kin-backup-sha256',
+          }),
+        )
         fs.createReadStream(rec.file_path).pipe(res)
         return
       }

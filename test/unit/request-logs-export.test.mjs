@@ -53,7 +53,7 @@ seed([
   { session_id: 's9', user_id: 'u2', api_key_id: 'k2', status: 500, error_code: 'upstream_error' },
 ])
 
-async function exportLogs(query, { role = 'admin', userId = null } = {}) {
+async function exportLogs(query, { role = 'admin', userId = null, headers = {} } = {}) {
   const out = {}
   const handlePanel = createPanelHandler({
     cfg: { paths: { project: root }, vm: { id: null } },
@@ -81,7 +81,7 @@ async function exportLogs(query, { role = 'admin', userId = null } = {}) {
       out.body = body
     },
   }
-  await handlePanel({ method: 'GET', url, headers: {} }, res, new URL(`http://localhost${url}`))
+  await handlePanel({ method: 'GET', url, headers }, res, new URL(`http://localhost${url}`))
   assert.equal(out.status, 200, JSON.stringify(out.body).slice(0, 300))
   const rows = String(out.body || '')
     .split('\n')
@@ -118,6 +118,20 @@ test('tenant export stays owner-scoped and ignores user_id', async () => {
   const { rows } = await exportLogs('user_id=u2', { role: 'user', userId: 'u1' })
   assert.ok(rows.length > 0)
   assert.ok(!ids(rows).includes('req-7'))
+})
+
+test('a trusted cross-origin console can read the export and its count headers', async (t) => {
+  const prev = process.env.PANEL_CORS_ORIGINS
+  process.env.PANEL_CORS_ORIGINS = 'https://panel.example.com'
+  t.after(() => {
+    if (prev == null) delete process.env.PANEL_CORS_ORIGINS
+    else process.env.PANEL_CORS_ORIGINS = prev
+  })
+  const { headers } = await exportLogs('session_id=s2', { headers: { origin: 'https://panel.example.com' } })
+  assert.equal(headers['access-control-allow-origin'], 'https://panel.example.com')
+  assert.equal(headers['access-control-allow-credentials'], 'true')
+  assert.match(headers['access-control-expose-headers'], /x-kin-export-total/)
+  assert.equal(headers['x-kin-export-total'], '1')
 })
 
 test('legacy request-log keys still filter', async () => {

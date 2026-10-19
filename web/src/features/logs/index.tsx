@@ -185,7 +185,7 @@ export function LogsPage() {
       const qs = exportQuery(opts, filters, muted)
       const res = await panelFetch(`/api/panel/request-logs/export?${qs}`)
       if (!res.ok) throw new ApiError('导出失败', res.status)
-      // 三个头未列入 Access-Control-Expose-Headers，跨域代理下会是 null。
+      // 只有受信 Origin 能读到这三个头；其余跨域场景为 null，下方按缺失处理。
       const count = Number(res.headers.get('x-kin-export-count') ?? NaN)
       const total = Number(res.headers.get('x-kin-export-total') ?? NaN)
       const truncated = res.headers.get('x-kin-export-truncated') === '1'
