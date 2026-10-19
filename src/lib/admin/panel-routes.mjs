@@ -3535,7 +3535,7 @@ export function createPanelHandler(ctx) {
             .replace(/\r\n?/g, '\n')
             .replace(/\n+$/g, '')
         } catch {
-          claude_setting = defaultSeedPolicy(vm.seed_policy || {}).claude_setting
+          // Missing file stays null. The policy default is not this slot's file.
         }
         try {
           kin_seed = JSON.parse(fs.readFileSync(path.join(homeDir, '.claude', 'kin-seed.json'), 'utf8'))
