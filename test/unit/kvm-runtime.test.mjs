@@ -142,6 +142,51 @@ test('slot-guest-bin entries resolve inside the slot and follow host replacement
   fs.rmSync(root, { recursive: true, force: true })
 })
 
+test('slot-guest-bin stages the real file behind a symlinked host binary', {
+  skip: process.platform !== 'linux',
+}, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-guest-bin-'))
+  const deployBin = path.join(root, 'deploy-bin')
+  fs.mkdirSync(deployBin, { recursive: true })
+  const real = path.join(root, 'kin-kernel.real')
+  fs.writeFileSync(real, 'kernel-real', { mode: 0o755 })
+  const kernelBin = path.join(deployBin, 'kin-kernel')
+  fs.symlinkSync(real, kernelBin)
+  const stage = ensureSlotGuestBinDir(root, { kernelBin })
+  const st = fs.lstatSync(path.join(stage, 'kin-kernel'))
+  assert.equal(st.isSymbolicLink(), false)
+  assert.equal(fs.readFileSync(path.join(stage, 'kin-kernel'), 'utf8'), 'kernel-real')
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('slot-guest-bin copies when a hard link is refused and skips identical copies', {
+  skip: process.platform !== 'linux',
+}, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-guest-bin-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const deployBin = path.join(root, 'deploy-bin')
+  fs.mkdirSync(deployBin, { recursive: true })
+  const kernelBin = path.join(deployBin, 'kin-kernel')
+  fs.writeFileSync(kernelBin, 'kernel-v1', { mode: 0o755 })
+  const linkSync = fs.linkSync
+  t.after(() => {
+    fs.linkSync = linkSync
+  })
+  fs.linkSync = () => {
+    throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' })
+  }
+  const stage = ensureSlotGuestBinDir(root, { kernelBin })
+  const dest = path.join(stage, 'kin-kernel')
+  assert.equal(fs.readFileSync(dest, 'utf8'), 'kernel-v1')
+  assert.equal(fs.statSync(dest).mode & 0o777, 0o755)
+  const ino = fs.statSync(dest).ino
+  ensureSlotGuestBinDir(root, { kernelBin })
+  assert.equal(fs.statSync(dest).ino, ino, 'identical copy is not rewritten')
+  fs.writeFileSync(kernelBin, 'kernel-v2', { mode: 0o755 })
+  ensureSlotGuestBinDir(root, { kernelBin })
+  assert.equal(fs.readFileSync(dest, 'utf8'), 'kernel-v2')
+})
+
 test('slotGuestBinMountArgs falls back to file mounts without projectRoot', () => {
   assert.deepEqual(
     slotGuestBinMountArgs({
