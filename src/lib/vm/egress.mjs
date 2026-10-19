@@ -260,7 +260,12 @@ function ownsEgressProcess(pid, configPath, { allowDeleted = false } = {}) {
     if (exe.deleted && !allowDeleted) return false
     const args = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')
     const configIndex = args.indexOf('-config')
-    if (path.basename(exe.path) !== 'kin-egress' || configIndex <= 0 || !args[configIndex + 1]) return false
+    if (
+      !args.some((arg) => path.basename(String(arg || '').replace(/ \(deleted\)$/, '')).startsWith('kin-egress')) ||
+      configIndex <= 0 ||
+      !args[configIndex + 1]
+    )
+      return false
     const argument = args[configIndex + 1]
     const actualConfig = path.isAbsolute(argument)
       ? path.resolve(argument)
@@ -273,24 +278,16 @@ function ownsEgressProcess(pid, configPath, { allowDeleted = false } = {}) {
 
 function egressProcessPids() {
   if (process.platform !== 'linux') return []
-  const marker = Buffer.from('/kin-egress')
-  const deleted = Buffer.from(' (deleted)')
   const pids = []
   for (const name of fs.readdirSync('/proc')) {
     if (!/^[1-9][0-9]*$/.test(name)) continue
-    let exe
     try {
-      exe = fs.readlinkSync(`/proc/${name}/exe`)
+      const args = fs.readFileSync(`/proc/${name}/cmdline`).toString('utf8').split('\0')
+      if (args.some((arg) => path.basename(arg.replace(/ \(deleted\)$/, '')).startsWith('kin-egress')))
+        pids.push(Number(name))
     } catch {
-      continue
+      // Raced with exit, or a process whose /proc we cannot read.
     }
-    const bytes = Buffer.from(exe)
-    if (!bytes.includes(marker)) continue
-    const end = bytes.subarray(bytes.length - deleted.length).equals(deleted)
-      ? bytes.length - deleted.length
-      : bytes.length
-    if (path.basename(bytes.subarray(0, end).toString('utf8')) !== 'kin-egress') continue
-    pids.push(Number(name))
   }
   return pids
 }
@@ -516,6 +513,7 @@ export function stopEgressProcess(projectRoot, proxyId) {
   const cfgPath = path.join(dir, 'egress.json')
   const recorded = readPid(pidFile)
   const pids = [...new Set([...staleEgressPids(cfgPath), ...(ownsEgressProcess(recorded, cfgPath) ? [recorded] : [])])]
+  const pending = []
   for (const pid of pids) {
     try {
       process.kill(pid, 'SIGTERM')
@@ -523,14 +521,15 @@ export function stopEgressProcess(projectRoot, proxyId) {
       if (error.code !== 'ESRCH') return { ok: false, error: `egress_stop_failed: ${error.code || error.message}` }
     }
     // Keep the PID while termination is pending so policy reconciliation can verify/retry it.
-    if (ownsEgressProcess(pid, cfgPath, { allowDeleted: true })) return { ok: true }
+    if (ownsEgressProcess(pid, cfgPath, { allowDeleted: true })) pending.push(pid)
   }
+  if (pending.length) return { ok: true, pending }
   try {
     fs.rmSync(pidFile, { force: true })
   } catch (error) {
     return { ok: false, error: `egress_pid_cleanup_failed: ${error.code || error.message}` }
   }
-  return { ok: true }
+  return { ok: true, pending }
 }
 
 async function stopOwnedEgress(pid) {
@@ -745,6 +744,8 @@ async function startProxyEgress(
     dnsUpstream = configuredDnsUpstream(),
     dnsEmptyTypes = configuredDnsEmptyTypes(),
     bin,
+    ports,
+    listenHost: listenHostOverride,
   } = {},
 ) {
   const blocked = proxyBlockedReason(proxy)
@@ -754,23 +755,23 @@ async function startProxyEgress(
   if (!proxyId || !proxyUrl) return { ok: false, error: 'bound SOCKS5 id and url required; refusing fallback' }
   const net = ensureEgressNetwork(proxyId, runDocker)
   if (!net.ok) return net
-  const listenHost = net.gateway || gatewayFromSubnet(net.subnet)
+  const listenHost = listenHostOverride || net.gateway || gatewayFromSubnet(net.subnet)
   if (!listenHost) return { ok: false, error: 'egress network gateway missing' }
-  const ports = portsForProxy(proxyId)
+  const selectedPorts = ports || portsForProxy(proxyId)
   const chain = chainName(proxyId)
   const plan = iptablesPlan({
     chain,
     bridge: net.bridge,
     subnet: net.subnet,
-    tcpPort: ports.tcp,
-    dnsPort: ports.dns,
+    tcpPort: selectedPorts.tcp,
+    dnsPort: selectedPorts.dns,
   })
   const started = await startEgressProcess({
     projectRoot,
     proxyId,
     proxyUrl,
-    tcpPort: ports.tcp,
-    dnsPort: ports.dns,
+    tcpPort: selectedPorts.tcp,
+    dnsPort: selectedPorts.dns,
     listenHost,
     dnsUpstream,
     dnsEmptyTypes,
@@ -778,8 +779,8 @@ async function startProxyEgress(
     ...(bin ? { bin } : {}),
   })
   if (!started.ok) return started
-  if (!waitListen(listenHost, ports.tcp, 8000, ports.tcp > 0 ? started.pid : 0))
-    return { ok: false, error: `kin-egress ${listenHost}:${ports.tcp} did not listen`, pid: started.pid }
+  if (!waitListen(listenHost, selectedPorts.tcp, 8000, selectedPorts.tcp > 0 ? started.pid : 0))
+    return { ok: false, error: `kin-egress ${listenHost}:${selectedPorts.tcp} did not listen`, pid: started.pid }
   const rules = applyIptables(plan, runIptables)
   if (!rules.ok) {
     stopEgressProcess(projectRoot, proxyId)
@@ -791,7 +792,7 @@ async function startProxyEgress(
     bridge: net.bridge,
     subnet: net.subnet,
     gateway: listenHost,
-    ports,
+    ports: selectedPorts,
     pid: started.pid,
     proxy_id: proxyId,
   }

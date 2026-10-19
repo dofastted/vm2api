@@ -2,8 +2,10 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
+import net from 'node:net'
 import path from 'node:path'
-import { runFleetUpdate, fleetStatus, isWorkerProcessUp } from '../../src/lib/vm/fleet-update.mjs'
+import { runFleetUpdate, fleetStatus, isWorkerProcessUp, restartLocalEgress } from '../../src/lib/vm/fleet-update.mjs'
+import { startEgressProcess, inspectEgressProcess } from '../../src/lib/vm/egress.mjs'
 
 function writeSlot(root, id, extra = {}) {
   const dir = path.join(root, 'vms')
@@ -117,4 +119,66 @@ test('fleet collect skips reload', async () => {
   assert.equal(report.ok_count, 1)
   assert.equal(fleetStatus(root)[0].id, 'vm-01')
   fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('fleet refresh replaces an egress process whose binary was deleted', {
+  skip: process.platform !== 'linux',
+}, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fleet-egress-'))
+  const oldBin = path.join(root, 'kin-egress-old')
+  const newBin = path.join(root, 'kin-egress')
+  const source = process.env.KIN_EGRESS_BIN || path.resolve(import.meta.dirname, '../../bin/kin-egress')
+  fs.copyFileSync(source, oldBin)
+  fs.copyFileSync(source, newBin)
+  fs.chmodSync(oldBin, 0o755)
+  fs.chmodSync(newBin, 0o755)
+  const proxy = { id: 'px-fleet', scheme: 'socks5', host: '192.0.2.1', port: 1080, url: 'socks5://192.0.2.1:1080' }
+  writeSlot(root, 'vm-01', { proxy })
+  const probe = net.createServer()
+  const port = await new Promise((resolve) => probe.listen(0, '127.0.0.1', () => resolve(probe.address().port)))
+  await new Promise((resolve) => probe.close(resolve))
+  const previous = process.env.KIN_EGRESS_BIN
+  process.env.KIN_EGRESS_BIN = newBin
+  const orphan = await startEgressProcess({
+    projectRoot: root,
+    proxyId: proxy.id,
+    proxyUrl: 'socks5h://192.0.2.1:1080',
+    listenHost: '127.0.0.1',
+    tcpPort: port,
+    dnsPort: 0,
+    bin: oldBin,
+  })
+  assert.equal(orphan.ok, true, orphan.error)
+  fs.unlinkSync(oldBin)
+  fs.writeFileSync(path.join(root, 'data/run/egress/px-fleet/egress.pid'), '999999999\n')
+  const egressOpts = {
+    runDocker: (args) =>
+      args[0] === 'network' && args[1] === 'inspect' ? { ok: true, stdout: '127.0.0.0/8|127.0.0.1' } : { ok: true },
+    runIptables: () => ({ ok: true }),
+    listenHost: '127.0.0.1',
+    ports: { tcp: port, dns: 0 },
+    bin: newBin,
+  }
+  try {
+    const report = await runFleetUpdate(root, {
+      action: 'telemetry',
+      telemetryFn: async ({ projectRoot, vm }) => restartLocalEgress(projectRoot, vm, egressOpts),
+      healthFn: async () => ({ ok: true }),
+    })
+    assert.equal(report.failed_count, 0, JSON.stringify(report.items))
+    const current = inspectEgressProcess(root, proxy.id)
+    assert.equal(current.ok, true, JSON.stringify(current))
+    assert.notEqual(current.pid, orphan.pid)
+    assert.equal(fs.readlinkSync(`/proc/${current.pid}/exe`), newBin)
+    assert.equal(fs.existsSync(`/proc/${orphan.pid}`), false)
+    assert.equal(
+      JSON.parse(fs.readFileSync(path.join(root, 'data/run/egress/px-fleet/egress.json'), 'utf8')).listen_tcp,
+      `127.0.0.1:${port}`,
+    )
+    process.kill(current.pid, 'SIGTERM')
+  } finally {
+    if (previous === undefined) delete process.env.KIN_EGRESS_BIN
+    else process.env.KIN_EGRESS_BIN = previous
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })

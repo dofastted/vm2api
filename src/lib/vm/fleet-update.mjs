@@ -22,31 +22,37 @@ import {
 
 const ACTIONS = new Set(['collect', 'reload', 'roll', 'telemetry'])
 
-async function restartLocalServices({ projectRoot, vm, enabled }) {
+export async function restartLocalEgress(projectRoot, vm, opts = {}) {
+  if (isLocalEgressProxy(vm.proxy)) return { ok: true, egress: 'local' }
+  const proxyId = vm.proxy?.id
+  const running = inspectEgressProcess(projectRoot, proxyId)
+  const stopped = stopEgressProcess(projectRoot, proxyId)
+  if (!stopped.ok) return { ok: false, action: 'egress_stop_failed', error: stopped.error }
+  const pending = new Set(stopped.pending || [])
+  if (running.ok && running.pid) pending.add(running.pid)
+  for (const pid of pending) {
+    const exited = await waitEgressExit(pid)
+    if (!exited.ok) return { ok: false, action: 'egress_stop_failed', error: exited.error, pid }
+  }
+  const spec = String(running.listen_tcp || '')
+  const colon = spec.lastIndexOf(':')
+  const host = colon > 0 ? spec.slice(0, colon) : ''
+  const port = colon > 0 ? Number(spec.slice(colon + 1)) : 0
+  if (host && Number.isFinite(port) && port > 0) {
+    const portFree = await waitPortReleased(host, port)
+    if (!portFree.ok) return { ok: false, action: 'egress_stop_failed', error: portFree.error }
+  }
+  const started = await ensureProxyEgress(projectRoot, vm.proxy, opts)
+  if (!started?.ok) return { ok: false, action: 'egress_start_failed', error: started?.error || 'kin-egress failed' }
+  return { ok: true, egress: 'restarted', pid: started.pid }
+}
+
+async function restartLocalServices({ projectRoot, vm, enabled, egressOpts = {} }) {
   const telemetry = await restartTelemetrySidecar({ projectRoot, vm, enabled })
   if (!telemetry.ok) return telemetry
-  if (!isLocalEgressProxy(vm.proxy)) {
-    const proxyId = vm.proxy?.id
-    const running = inspectEgressProcess(projectRoot, proxyId)
-    const stopped = stopEgressProcess(projectRoot, proxyId)
-    if (!stopped.ok) return { ok: false, action: 'egress_stop_failed', error: stopped.error }
-    if (running.ok && running.pid) {
-      const exited = await waitEgressExit(running.pid)
-      if (!exited.ok) return { ok: false, action: 'egress_stop_failed', error: exited.error }
-      const spec = String(running.listen_tcp || '')
-      const colon = spec.lastIndexOf(':')
-      const host = colon > 0 ? spec.slice(0, colon) : ''
-      const port = colon > 0 ? Number(spec.slice(colon + 1)) : 0
-      if (host && Number.isFinite(port) && port > 0) {
-        const portFree = await waitPortReleased(host, port)
-        if (!portFree.ok) return { ok: false, action: 'egress_stop_failed', error: portFree.error }
-      }
-    }
-    stopEgressProcess(projectRoot, proxyId)
-    const started = await ensureProxyEgress(projectRoot, vm.proxy)
-    if (!started?.ok) return { ok: false, action: 'egress_start_failed', error: started?.error || 'kin-egress failed' }
-  }
-  return { ...telemetry, egress: 'restarted' }
+  const egress = await restartLocalEgress(projectRoot, vm, egressOpts)
+  if (!egress.ok) return egress
+  return { ...telemetry, egress: egress.egress }
 }
 
 function sleep(ms) {
