@@ -648,6 +648,30 @@ export function templateOrFollowPreset<K extends string>(
 
 /* ── 仅预览：以下渲染逻辑不参与任何请求 ───────────────────── */
 
+const LEGACY_AUTO_SCOPE_BLOCKS = new Set(['agent', 'agent_official'])
+
+/** 镜像后端 `dropLegacyAutoScope`：旧默认自带的 {ephemeral,1h,global} 不再下发。 */
+export function dropLegacyAutoScope(
+  preset: PersonaPreset,
+  blocks: readonly RawBlock[]
+): RawBlock[] {
+  if (preset === 'custom') return blocks as RawBlock[]
+  return blocks.map((block) => {
+    const cc = block?.cache_control as Record<string, unknown> | undefined
+    if (
+      !LEGACY_AUTO_SCOPE_BLOCKS.has(String(block?.id ?? '')) ||
+      !cc ||
+      typeof cc !== 'object' ||
+      Object.keys(cc).length !== 3 ||
+      cc.type !== 'ephemeral' ||
+      cc.ttl !== '1h' ||
+      cc.scope !== 'global'
+    )
+      return block
+    return { ...block, cache_control: { type: 'ephemeral', ttl: '1h' } }
+  })
+}
+
 /** 请求级变量在预览里用可辨认的占位，不是真实文本。 */
 export const PREVIEW_CALLER_AGENT = '‹调用方 agent prompt›'
 export const PREVIEW_CALLER_SYSTEM = '‹调用方 system›'

@@ -452,7 +452,36 @@ function templateFrom(templates, key, defaults) {
 
 /** Empty array means "use the built-in preset"; empty custom falls back to official. */
 export function resolvePersonaTemplate(preset, templates) {
-  return templateFrom(templates, normalizePersonaPreset(preset), DEFAULT_PERSONA_TEMPLATES)
+  const key = normalizePersonaPreset(preset)
+  return dropLegacyAutoScope(key, templateFrom(templates, key, DEFAULT_PERSONA_TEMPLATES))
+}
+
+const LEGACY_AUTO_SCOPE_BLOCKS = new Set(['agent', 'agent_official'])
+
+/**
+ * Edited built-in templates saved before the default stopped emitting scope still carry
+ * {ephemeral, 1h, global}, which upstream rejects with a 400. Only that exact old default is
+ * dropped; custom presets and any other explicit scope stay.
+ */
+function dropLegacyAutoScope(key, blocks) {
+  if (key === 'custom' || !Array.isArray(blocks)) return blocks
+  let changed = false
+  const out = blocks.map((block) => {
+    const cc = block?.cache_control
+    if (
+      !LEGACY_AUTO_SCOPE_BLOCKS.has(block?.id) ||
+      !cc ||
+      typeof cc !== 'object' ||
+      Object.keys(cc).length !== 3 ||
+      cc.type !== 'ephemeral' ||
+      cc.ttl !== '1h' ||
+      cc.scope !== 'global'
+    )
+      return block
+    changed = true
+    return { ...block, cache_control: { type: 'ephemeral', ttl: '1h' } }
+  })
+  return changed ? out : blocks
 }
 
 export function resolveOverlayTemplate(preset, templates) {

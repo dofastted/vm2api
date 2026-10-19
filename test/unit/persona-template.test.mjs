@@ -562,6 +562,41 @@ test('built-in templates omit cache_control.scope; custom explicit scope and cal
   )
 })
 
+test('edited built-in templates saved with the old global-scope default stop sending scope', () => {
+  const legacyCache = { type: 'ephemeral', ttl: '1h', scope: 'global' }
+  const legacy = (preset) =>
+    DEFAULT_PERSONA_TEMPLATES[preset].map((block) =>
+      block.id === 'agent' || block.id === 'agent_official'
+        ? { ...block, note: `${block.note || ''} edited`, cache_control: legacyCache }
+        : { ...block },
+    )
+  for (const preset of ['official', 'official_full']) {
+    withRoutingFile(
+      { persona_preset: preset, overlay_preset: 'off', persona_templates: { [preset]: legacy(preset) } },
+      (file) => {
+        const out = applyCrsUnofficialPersona({ messages: [{ role: 'user', content: 'hi' }] }, { routingFile: file })
+        const scoped = out.system.filter((block) => block?.cache_control?.scope)
+        assert.deepEqual(scoped, [], preset)
+        assert.ok(out.system.some((block) => block?.cache_control?.ttl === '1h'))
+      },
+    )
+  }
+  const explicit = DEFAULT_PERSONA_TEMPLATES.official_full.map((block) =>
+    block.id === 'agent_official'
+      ? { ...block, cache_control: { type: 'ephemeral', ttl: '5m', scope: 'global' } }
+      : { ...block },
+  )
+  withRoutingFile(
+    { persona_preset: 'official_full', overlay_preset: 'off', persona_templates: { official_full: explicit } },
+    (file) => {
+      const out = applyCrsUnofficialPersona({ messages: [{ role: 'user', content: 'hi' }] }, { routingFile: file })
+      assert.ok(
+        out.system.some((block) => block?.cache_control?.scope === 'global' && block.cache_control.ttl === '5m'),
+      )
+    },
+  )
+})
+
 test('custom overlay template replaces the reminder shell', () => {
   withRoutingFile(
     {

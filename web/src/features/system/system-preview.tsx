@@ -9,6 +9,7 @@ import {
   PREVIEW_REQUEST_VARS,
   agentStandingVar,
   applyPersonaEnvVars,
+  dropLegacyAutoScope,
   envTimezoneText,
   estimateTokens,
   personaHideEnabled,
@@ -101,7 +102,7 @@ export function SystemPreview({
   const env = envTimezoneText(timezone)
   const rendered = vars.data
     ? previewSystemBlocks(
-        blocks,
+        dropLegacyAutoScope(preset, blocks),
         applyPersonaEnvVars(
           {
             ...vars.data.vars,
