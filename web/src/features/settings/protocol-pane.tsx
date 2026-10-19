@@ -13,6 +13,7 @@ import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { SettingRow } from '@/components/setting-row'
 import {
+  cachedMicrocompactEnabledFromCompat,
   cchEnabledFromCompat,
   sessionIdleTtlFromInference,
 } from './protocol-authority'
@@ -45,6 +46,7 @@ export function ProtocolPane({
   const strict = compat.claude_code_only === true
   const relay = detectProxiedOfficialCcFromCompat(compat)
   const cch = cchEnabledFromCompat(compat)
+  const cachedMicrocompact = cachedMicrocompactEnabledFromCompat(compat)
   return (
     <div className='space-y-4'>
       <PaneSection
@@ -164,13 +166,13 @@ export function ProtocolPane({
       <PaneSection
         icon={Hash}
         title='CCH 统一附加'
-        desc='出站 billing 的 cch。开启后缺失也补，不区分试用或订阅。'
+        desc='出站 billing 的 cch。开启后改写已有摘要，不区分试用或订阅。'
       >
         <SettingRow
           label='强制附加 CCH'
           desc={
             cch
-              ? '开：出站补齐 cch；试用号缺失也写。保存后热写入各槽 kernel.json，不重启 CLI。'
+              ? '开：已有五位摘要也按最终请求重算。保存后热写入各槽 kernel.json，不重启 CLI。'
               : '关：固定发送 cch=00000;（5 个 0），不计算摘要。'
           }
         >
@@ -180,6 +182,28 @@ export function ProtocolPane({
               onCompatChange({ ...compat, cch_enabled: on })
             }
             aria-label='强制附加 CCH'
+          />
+        </SettingRow>
+      </PaneSection>
+      <PaneSection
+        icon={Database}
+        title='缓存编辑压缩'
+        desc='官方 cached microcompact。当前构建没有 cache-editing 实现，打开后请求会失败。'
+      >
+        <SettingRow
+          label='启用 cached microcompact'
+          desc={
+            cachedMicrocompact
+              ? '开：请求返回 cached_microcompact_unavailable，不会静默跳过。保存后热写入 kernel.json。'
+              : '关：不调用 cache editing。当前构建不支持时必须保持关闭。'
+          }
+        >
+          <Switch
+            checked={cachedMicrocompact}
+            onCheckedChange={(on) =>
+              onCompatChange({ ...compat, cached_microcompact_enabled: on })
+            }
+            aria-label='启用 cached microcompact'
           />
         </SettingRow>
       </PaneSection>

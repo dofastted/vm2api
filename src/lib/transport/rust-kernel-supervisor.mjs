@@ -693,6 +693,10 @@ export function writeKernelConfig(
   const previousMax = Number(previous.max_request_bytes)
   const requestBytes = routing == null && previousMax > 0 ? previousMax : maxRequestBytes(routing)
   const cchEnabled = routing == null ? previous.cch_enabled !== false : routing?.compatibility?.cch_enabled !== false
+  const cachedMicrocompactEnabled =
+    routing == null
+      ? previous.cached_microcompact_enabled === true
+      : routing?.compatibility?.cached_microcompact_enabled === true
   const sessionIdleTtlSeconds =
     routing == null
       ? normalizeSessionIdleTtlSeconds(previous.session_idle_ttl_seconds)
@@ -726,6 +730,7 @@ export function writeKernelConfig(
     cli_version: OFFICIAL_CLI_VERSION,
     default_cache_ttl: defaultCacheTtl,
     cch_enabled: cchEnabled,
+    cached_microcompact_enabled: cachedMicrocompactEnabled,
   }
 
   if (tz) config.timezone = tz

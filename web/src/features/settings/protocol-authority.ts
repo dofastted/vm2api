@@ -23,6 +23,12 @@ export function cchEnabledFromCompat(
 ): boolean {
   return compat?.cch_enabled !== false
 }
+/** `routing.compatibility.cached_microcompact_enabled`：缺省关，只有显式 true 才开。 */
+export function cachedMicrocompactEnabledFromCompat(
+  compat: Record<string, unknown> | undefined
+): boolean {
+  return compat?.cached_microcompact_enabled === true
+}
 
 /** `routing.inference.session_idle_ttl_seconds`：kernel 原生 sticky 槽空闲，默认 600。 */
 export function sessionIdleTtlFromInference(

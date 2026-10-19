@@ -14,6 +14,7 @@ import {
   buildBillingAttributionText,
 } from '../../src/lib/identity/crs-persona.mjs'
 import { finalizeWorkerPayload } from '../../src/lib/transport/go-worker-client.mjs'
+import { validatePersonaRoutingPatch } from '../../src/lib/admin/panel-api.mjs'
 
 test('xxh64 matches Python xxhash.xxh64 intdigest vectors', () => {
   const seed = CCH_XXH64_SEED
@@ -178,4 +179,12 @@ test('no inbound system still emits billing, identity, official prompt, and env'
   assert.equal(out.system[2].text, CRS_OFFICIAL_AGENT_PROMPT)
   assert.deepEqual(out.system[2].cache_control, { type: 'ephemeral', ttl: '1h' })
   assert.match(out.system[3].text, /^# Environment\n/)
+})
+test('cached microcompact rejects a non-boolean and accepts an explicit boolean', () => {
+  assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { cached_microcompact_enabled: 'yes' } }), [
+    'cached_microcompact_enabled 必须是布尔',
+  ])
+  assert.deepEqual(validatePersonaRoutingPatch({ compatibility: {} }), [])
+  assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { cached_microcompact_enabled: true } }), [])
+  assert.deepEqual(validatePersonaRoutingPatch({ compatibility: { cached_microcompact_enabled: false } }), [])
 })

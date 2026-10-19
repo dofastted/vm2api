@@ -690,7 +690,7 @@ test('writeKernelConfig cli-hop writes local_cli without secrets', () => {
       proxyUrl: 'socks5h://127.0.0.1:1080',
       proxyRequired: true,
       timezone: 'America/New_York',
-      routing: { compatibility: { cache_ttl: '5m' } },
+      routing: { compatibility: { cache_ttl: '5m', cached_microcompact_enabled: true } },
     },
   )
   const doc = JSON.parse(fs.readFileSync(written.configPath, 'utf8'))
@@ -702,6 +702,9 @@ test('writeKernelConfig cli-hop writes local_cli without secrets', () => {
   assert.equal(doc.system_layout, 'identity')
   assert.equal(doc.cli_version, OFFICIAL_CLI_VERSION)
   assert.equal(doc.default_cache_ttl, '5m')
+  assert.equal(doc.cached_microcompact_enabled, true)
+  const inherited = writeKernelConfig(root, { id: 'vm-05' }, { token: 'tok' })
+  assert.equal(JSON.parse(fs.readFileSync(inherited.configPath, 'utf8')).cached_microcompact_enabled, true)
   assert.equal(doc.timezone, 'America/New_York')
   assert.equal(doc.proxy_url, '')
   assert.equal(doc.proxy_required, false)

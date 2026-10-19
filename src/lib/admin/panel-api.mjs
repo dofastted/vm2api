@@ -474,6 +474,12 @@ export function validatePersonaRoutingPatch(body = {}) {
   if (Object.prototype.hasOwnProperty.call(compat, 'cch_enabled') && typeof compat.cch_enabled !== 'boolean') {
     problems.push('cch_enabled 必须是布尔')
   }
+  if (
+    Object.prototype.hasOwnProperty.call(compat, 'cached_microcompact_enabled') &&
+    typeof compat.cached_microcompact_enabled !== 'boolean'
+  ) {
+    problems.push('cached_microcompact_enabled 必须是布尔')
+  }
   if (compat.cache_breakpoints != null) {
     const bp = compat.cache_breakpoints
     if (typeof bp !== 'object' || Array.isArray(bp)) {
@@ -1394,6 +1400,7 @@ export function buildUsage({ accountQuota, cfg, requestLog = null }) {
 function presentCompatibility(compat) {
   const out = compat && typeof compat === 'object' && !Array.isArray(compat) ? { ...compat } : {}
   out.cch_enabled = out.cch_enabled !== false
+  out.cached_microcompact_enabled = out.cached_microcompact_enabled === true
   return out
 }
 

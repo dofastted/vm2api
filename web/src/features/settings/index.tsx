@@ -37,6 +37,7 @@ import { OpenaiPane } from '@/features/settings/openai-pane'
 import { PersonaRulesPane } from '@/features/settings/persona-rules-pane'
 import { PoolPane } from '@/features/settings/pool-pane'
 import {
+  cachedMicrocompactEnabledFromCompat,
   cchEnabledFromCompat,
   inheritProtocolOnSlots,
   sessionIdleTtlFromInference,
@@ -112,6 +113,8 @@ export function SettingsPage() {
           claude_code_only: compat.claude_code_only === true,
           official_cc_passthrough: compat.official_cc_passthrough === true,
           cch_enabled: cchEnabledFromCompat(compat),
+          cached_microcompact_enabled:
+            cachedMicrocompactEnabledFromCompat(compat),
           persona_rules: rules,
         }
       }
