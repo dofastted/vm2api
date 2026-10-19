@@ -3,6 +3,7 @@
  */
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { normalizeOpenAIQuotaPolicy } from '../pool/openai-quota-policy.mjs'
+import { normalizeCodexModelMappings, validateCodexModelMappingsPatch } from './codex-model-mapping.mjs'
 
 export { isCodexVm, normalizeVmKind } from '../vm/vm-kind.mjs'
 
@@ -103,6 +104,9 @@ export function validateInferenceWebsocketPatch(body = {}) {
   if (Object.prototype.hasOwnProperty.call(codex, 'analytics')) {
     validateEnabledToggle(codex.analytics, 'codex.analytics', 'invalid_codex_analytics')
   }
+  if (Object.prototype.hasOwnProperty.call(codex, 'model_mappings')) {
+    validateCodexModelMappingsPatch(codex.model_mappings)
+  }
 }
 
 export function inferenceWebsocketEnabled(routing = {}) {
@@ -144,6 +148,7 @@ export function normalizeCodexRouting(raw = {}) {
     },
     clients,
     quota: normalizeOpenAIQuotaPolicy(src.quota),
+    model_mappings: normalizeCodexModelMappings(src.model_mappings),
   }
 }
 

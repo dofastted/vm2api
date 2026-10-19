@@ -43,6 +43,7 @@ import { disjointOpenaiUsage } from './openai-usage.mjs'
 import { costColumnsFromUsage } from '../admin/pricing.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
 import { normalizeCodexRouting } from './codex-route.mjs'
+import { applyCodexInboundModelRewrite } from './codex-model-mapping.mjs'
 import { hasClaudeCode1mSuffix } from './context-1m.mjs'
 import {
   DEFAULT_HEALTH_PROBE,
@@ -635,6 +636,24 @@ export function createHandleProtocol(deps) {
     }
     const inferenceBackend = resolveInferenceBackend(req)
     let want1m = hasClaudeCode1mSuffix(inbound?.model) || hasClaudeCode1mSuffix(ctx.body?.model)
+    const modelRewrite = applyCodexInboundModelRewrite(ctx.body, getRouting() || {})
+    if (!modelRewrite.ok) {
+      stats.errors++
+      const errorResult = makeError({
+        type: ErrorType.INVALID_REQUEST,
+        code: modelRewrite.code || 'codex_model_mapping_invalid',
+        message: modelRewrite.message,
+        status: 400,
+        param: 'model',
+      })
+      logBag.error_code = errorResult.body?.error?.code || modelRewrite.code
+      logBag.error_message = errorResult.body?.error?.message || null
+      return json(res, errorResult.status, errorResult.body)
+    }
+    if (modelRewrite.mapped) {
+      ctx = { ...ctx, body: modelRewrite.body }
+      logBag.upstream_model = modelRewrite.upstreamModel || null
+    }
     const platform = detectInboundPlatform(ctx.body?.model)
     if (!platform.ok) {
       stats.errors++

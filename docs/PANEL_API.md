@@ -219,8 +219,17 @@ Claude PATCH `max_sessions` 返回 400 `claude_max_sessions_forbidden`；OpenAI 
 | `codex.catalog_client_version` | `auto` | 模型目录同步的客户端版本，与推理 UA 分开 |
 | `codex.client_features.enabled` | `false` | 显式开启后上送槽位独立安装 UUID 与官方 `client_metadata`；不使用 VM/硬件指纹 |
 | `codex.analytics.enabled` | `false` | 显式开启后独立上报运行环境 Analytics，不是推理成功的前提 |
+| `codex.model_mappings` | 见下 | 入站 `model` 精确别名 → 上游 GPT id（对标 [codex-proxy-rs `modelMappings`](https://github.com/zyycn/codex-proxy-rs)）；保存后随 `routing.json` 热读，无需重启 Node |
 
-任一 WS 闸关闭时，新 WS 握手被拒绝，HTTP/SSE 入口继续可用且上游强制 HTTP。传输、UA 与隐私选项通过每次内部 envelope 的 `options` 生效，不为修改这些设置而重启共享 kernel；已开始的请求保留其选定策略。
+**`codex.model_mappings`（MVP）**：键为客户端请求的模型 id（精确匹配，含 Codex CLI 硬编码的 `codex-auto-review`），值为出站 GPT 模型 id。未配置或空对象时仍应用内置默认：`codex-auto-review` → `gpt-6-luna`；若显式将该键设为空字符串，则回退 `gpt-6.1-sol`。其它别名需自行添加映射；未命中键的请求模型保持原样（不会默认透传未知 id）。目标必须是已启用的 `gpt*`；否则 400（`codex_model_mapping_invalid` / `model_disabled`），且不会误判为 Anthropic。映射在 `detectInboundPlatform` 之前执行；日志 `requested_model` 保留客户端值，`upstream_model` 为映射结果，计费按上游模型。
+
+示例（仅文档，可按需合并进 `routing.json`）：
+
+```json
+{"codex":{"model_mappings":{"codex-auto-review":"gpt-6-luna","my-alias":"gpt-6.1-sol"}}}
+```
+
+任一 WS 闸关闭时，新 WS 握手被拒绝，HTTP/SSE 入口继续可用且上游强制 HTTP。传输、UA 与隐私选项通过每次内部 envelope 的 `options` 生效，不为修改这些 settings 而重启共享 kernel；已开始的请求保留其选定策略。
 
 安装 UUID 存在槽位 `run/codex-installation-id`，不取 MAC、主机名、machine-id 或调用方安装 ID。每次 envelope 的 `options.installation_id` 使用该文件的 UUID，覆盖运行中 kernel 的旧启动身份；非法安装 ID 在拨号前拒绝，避免复用旧进程时重新上传 VM 指纹。关闭安装元数据时，不生成 `client_metadata`，并从调用方的 turn 元数据移除安装 ID；会话路由所需信息保留。
 
