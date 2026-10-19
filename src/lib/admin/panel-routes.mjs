@@ -3524,21 +3524,33 @@ export function createPanelHandler(ctx) {
         if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
         const homeDir = path.join(cfg.paths.project, 'vms', id, 'cli-home')
         let settings_json = null
+        let claude_setting = null
         let kin_seed = null
         try {
           settings_json = JSON.parse(fs.readFileSync(path.join(homeDir, '.claude', 'settings.json'), 'utf8'))
         } catch {}
         try {
+          claude_setting = fs
+            .readFileSync(path.join(homeDir, '.claude', 'claude.setting'), 'utf8')
+            .replace(/\r\n?/g, '\n')
+            .replace(/\n+$/g, '')
+        } catch {
+          claude_setting = defaultSeedPolicy(vm.seed_policy || {}).claude_setting
+        }
+        try {
           kin_seed = JSON.parse(fs.readFileSync(path.join(homeDir, '.claude', 'kin-seed.json'), 'utf8'))
         } catch {}
+        const seed_policy = defaultSeedPolicy(vm.seed_policy || {})
+        if (claude_setting !== null) seed_policy.claude_setting = claude_setting
         return json(
           res,
           200,
           panel.ok({
             vm_id: id,
-            seed_policy: defaultSeedPolicy(vm.seed_policy || {}),
-            ...seedTelemetryContract(defaultSeedPolicy(vm.seed_policy || {})),
+            seed_policy,
+            ...seedTelemetryContract(seed_policy),
             settings_json,
+            claude_setting,
             kin_seed,
             cli_home: homeDir,
           }),
@@ -3559,6 +3571,8 @@ export function createPanelHandler(ctx) {
         if (body.theme !== undefined) merged.theme = body.theme
         if (body.extra_env !== undefined) merged.extra_env = body.extra_env
         if (body.settings_json_override !== undefined) merged.settings_json_override = body.settings_json_override
+        if (body.claude_setting !== undefined) merged.claude_setting = body.claude_setting
+        if (body['claude.setting'] !== undefined) merged.claude_setting = body['claude.setting']
         const next = defaultSeedPolicy(merged)
         if (body.settings_json_override !== undefined) next.settings_json_override = body.settings_json_override
         if (body.extra_env !== undefined) next.extra_env = body.extra_env || {}
@@ -3579,6 +3593,7 @@ export function createPanelHandler(ctx) {
             seed_policy: next,
             ...seedTelemetryContract(next),
             settings_json: written.settings || null,
+            claude_setting: written.claude_setting || '',
             kin_seed: written.kin_seed || null,
           }),
         )

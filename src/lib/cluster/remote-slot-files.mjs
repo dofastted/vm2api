@@ -33,7 +33,12 @@ import {
 
 export const SLOT_FILE_SETS = Object.freeze({
   run: ['run/kernel.json', 'run/worker.json', 'run/internal.token'],
-  seed: ['cli-home/.claude/settings.json', 'cli-home/.claude/kin-seed.json', 'machine-id'],
+  seed: [
+    'cli-home/.claude/settings.json',
+    'cli-home/.claude/claude.setting',
+    'cli-home/.claude/kin-seed.json',
+    'machine-id',
+  ],
   touch: ['run/telemetry.touch'],
 })
 const CREDENTIALS = 'cli-home/.claude/credentials.json'

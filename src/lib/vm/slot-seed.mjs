@@ -46,10 +46,19 @@ export function writeSlotSeedFiles(projectRoot, vm, seedPolicy = null) {
     cli_version: OFFICIAL_CLI_VERSION,
   })
   fs.writeFileSync(path.join(claudeDir, 'settings.json'), JSON.stringify(settings, null, 2))
+  fs.writeFileSync(path.join(claudeDir, 'claude.setting'), `${pol.claude_setting}\n`, { mode: 0o600 })
   fs.writeFileSync(path.join(claudeDir, 'kin-seed.json'), JSON.stringify(seedDoc, null, 2))
   let telemetry = { wrote: false }
   try {
     telemetry = syncWorkerTelemetry({ ...vm, seed_policy: pol }, projectRoot)
   } catch {}
-  return { wrote: true, homeDir, seed_policy: pol, settings, kin_seed: seedDoc, telemetry }
+  return {
+    wrote: true,
+    homeDir,
+    seed_policy: pol,
+    settings,
+    claude_setting: pol.claude_setting,
+    kin_seed: seedDoc,
+    telemetry,
+  }
 }

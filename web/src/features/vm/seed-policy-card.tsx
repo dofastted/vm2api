@@ -3,31 +3,38 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
+import { Textarea } from '@/components/ui/textarea'
 import {
   telemetryEnabled,
   telemetrySeedFlags,
 } from '@/features/vm/telemetry-policy'
+
+export const DEFAULT_CLAUDE_SETTING =
+  'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1'
 
 const REJECT_FLAGS: [string, string][] = [
   ['reject_client_settings', '拒客户端 settings'],
   ['reject_client_metadata_identity', '拒客户端身份'],
 ]
 
-type SeedPolicy = Record<string, boolean>
+type SeedPolicy = Record<string, boolean | string>
 
 export const SEED_PRESETS: Record<string, SeedPolicy> = {
   standard: {
     ...telemetrySeedFlags(false),
+    claude_setting: DEFAULT_CLAUDE_SETTING,
     reject_client_settings: true,
     reject_client_metadata_identity: true,
   },
   open: {
     ...telemetrySeedFlags(true),
+    claude_setting: DEFAULT_CLAUDE_SETTING,
     reject_client_settings: false,
     reject_client_metadata_identity: false,
   },
   strict: {
     ...telemetrySeedFlags(false),
+    claude_setting: DEFAULT_CLAUDE_SETTING,
     reject_client_settings: true,
     reject_client_metadata_identity: true,
   },
@@ -62,6 +69,10 @@ export function matchSeedPreset(policy: Record<string, unknown>): string {
 
 function normalize(policy: Record<string, unknown>): SeedPolicy {
   const out: SeedPolicy = { ...telemetrySeedFlags(telemetryEnabled(policy)) }
+  out.claude_setting =
+    typeof policy.claude_setting === 'string'
+      ? policy.claude_setting
+      : DEFAULT_CLAUDE_SETTING
   for (const [k] of REJECT_FLAGS) {
     out[k] = k in policy ? !!policy[k] : !!SEED_PRESETS.standard[k]
   }
@@ -91,7 +102,8 @@ export function SeedPolicyCard({
   const saved = normalize(policy)
   const dirty =
     telemetryEnabled(draft) !== telemetryEnabled(saved) ||
-    REJECT_FLAGS.some(([k]) => !!draft[k] !== !!saved[k])
+    REJECT_FLAGS.some(([k]) => !!draft[k] !== !!saved[k]) ||
+    draft.claude_setting !== saved.claude_setting
   const on = telemetryEnabled(draft)
 
   return (
@@ -168,6 +180,27 @@ export function SeedPolicyCard({
             ? ' 外部初装「同步遥测」开着，下次换票会按那份配置把本槽遥测重新打开。'
             : ' 外部初装「同步遥测」关着，换票不会改写这里的遥测开关。'}
         </p>
+
+        <div className='space-y-2 border-t pt-3'>
+          <Label htmlFor='seed-claude-setting' className='text-sm font-normal'>
+            claude.setting
+          </Label>
+          <Textarea
+            id='seed-claude-setting'
+            value={String(draft.claude_setting || '')}
+            disabled={saving}
+            onChange={(e) =>
+              setDraft({ ...draft, claude_setting: e.target.value })
+            }
+            className='min-h-24 font-mono text-xs'
+            spellCheck={false}
+            placeholder={DEFAULT_CLAUDE_SETTING}
+          />
+          <p className='text-xs text-muted-foreground'>
+            每行一个 Claude 设置。默认写入 <code>{DEFAULT_CLAUDE_SETTING}</code>
+            。
+          </p>
+        </div>
 
         <div className='flex gap-2 border-t pt-3'>
           <Button

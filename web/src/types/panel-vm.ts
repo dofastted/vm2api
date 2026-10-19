@@ -570,6 +570,7 @@ export type VmSeedSettings = {
   required_env?: Record<string, string>
   note?: string
   settings_json?: Record<string, unknown> | null
+  claude_setting?: string | null
   kin_seed?: Record<string, unknown> | null
   [key: string]: unknown
 }
