@@ -455,10 +455,8 @@ export async function ensureRemoteEgress(session, vm, { imageRef, binaryDigest =
   const names = slotEgressNames(vm.id)
   // Keep the helper's executable on the persistent mount even when egress is
   // enabled independently of a slot start/update.
-  await runRemote(
-    session.client,
-    `umask 077 && mkdir -p ${shellQuote(`${remoteSlotDir(session.host, vm.id)}/slot-bin`)}`,
-  )
+  const slotBin = shellQuote(`${remoteSlotDir(session.host, vm.id)}/slot-bin`)
+  await runRemote(session.client, `umask 077 && mkdir -p ${slotBin} && chmod 755 ${slotBin}`)
   const net = await ensureRemoteNetwork(session.docker, {
     name: names.network,
     bridge: names.bridge,
