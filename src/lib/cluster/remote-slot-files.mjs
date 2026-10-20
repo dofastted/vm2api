@@ -70,12 +70,16 @@ async function prepareRemoteDir(session, vm) {
   const dir = remoteSlotDir(session.host, vm.id)
   const owner = remoteSlotOwner(session.host, vm)
   // Mount roots only: nothing here resolves through a path the guest can rewrite.
-  const roots = [`${dir}/run`, `${dir}/claude`, `${dir}/cli-home`, `${dir}/slot-bin`].map(shellQuote).join(' ')
+  const roots = [`${dir}/run`, `${dir}/claude`, `${dir}/cli-home`].map(shellQuote).join(' ')
+  const binDir = shellQuote(`${dir}/slot-bin`)
   // Docker creates a missing bind source as root:root, which the slot uid cannot write.
-  const chown = session.host.uid === 0 ? ` && chown ${owner.uid}:${owner.gid} ${shellQuote(dir)} ${roots}` : ''
-  await runRemote(session.client, `umask 077 && mkdir -p ${roots} && chmod 700 ${shellQuote(dir)} ${roots}${chown}`, {
-    timeoutMs: 20_000,
-  })
+  const chown =
+    session.host.uid === 0 ? ` && chown ${owner.uid}:${owner.gid} ${shellQuote(dir)} ${roots} ${binDir}` : ''
+  await runRemote(
+    session.client,
+    `umask 077 && mkdir -p ${roots} ${binDir} && chmod 700 ${shellQuote(dir)} ${roots} && chmod 755 ${binDir}${chown}`,
+    { timeoutMs: 20_000 },
+  )
   done.add(vm.id)
 }
 
