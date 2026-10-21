@@ -20,6 +20,7 @@ function fixture({
   mismatch = false,
   kind = 'docker',
   removeFails = false,
+  publication = null,
 } = {}) {
   const calls = []
   const target = {
@@ -60,7 +61,10 @@ function fixture({
       if (removeFails) throw new Error('remove denied')
       info = null
     },
-    writeWorkerFiles: () => calls.push('files'),
+    writeWorkerFiles: () => {
+      calls.push('files')
+      return { publication }
+    },
     ensureGuestMachineIdFile: () => {},
     pushSlotFiles: async () => {},
     migrateClaudeDir: async () => {},
@@ -115,6 +119,32 @@ test('failed restart-loop removal does not create or claim successful recovery',
   const f = fixture({ restarting: true, removeFails: true })
   assert.equal((await f.boot()).ok, false)
   assert.deepEqual(f.calls, ['remove'])
+})
+
+test('remote start awaits its original worker publication before creating or starting a container', async () => {
+  let finish
+  const publication = new Promise((resolve) => {
+    finish = resolve
+  })
+  const f = fixture({ missing: true, publication })
+  const starting = f.boot()
+  try {
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.deepEqual(f.calls, ['files'])
+  } finally {
+    finish()
+    await starting
+  }
+  assert.equal(f.calls.includes('create'), true)
+})
+
+test('remote start cannot hide a failed queued publication behind its later direct push', async () => {
+  const publication = Promise.reject(new Error('synthetic queued SFTP disconnect'))
+  publication.catch(() => {})
+  const f = fixture({ missing: true, publication })
+  const result = await f.boot()
+  assert.equal(result.ok, false)
+  assert.equal(f.calls.includes('create'), false)
 })
 
 test('watchdog revival reaches the remote lifecycle and clears a restart loop without spending another attempt', async () => {
