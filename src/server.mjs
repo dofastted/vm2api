@@ -1311,7 +1311,13 @@ const handlePanel = createPanelHandler({
 })
 
 const sockets = new Set()
+const httpResponses = new Set()
 const requestActivities = new WeakMap()
+
+function closeHttpKeepAlive(res) {
+  res.shouldKeepAlive = false
+  if (!res.headersSent) res.setHeader('Connection', 'close')
+}
 
 function noteRequestExecution(req, execution) {
   const state = requestActivities.get(req)
@@ -1588,6 +1594,15 @@ async function handleHttp(req, res) {
 }
 
 const server = http.createServer((req, res) => {
+  httpResponses.add(res)
+  res.once('close', () => httpResponses.delete(res))
+  res.once('finish', () => {
+    httpResponses.delete(res)
+    // An accepted stream must finish before its connection becomes idle.
+    // A continued keepalive client cannot keep that idle connection draining.
+    if (lifecycle.draining) server.closeIdleConnections?.()
+  })
+  if (lifecycle.draining) closeHttpKeepAlive(res)
   const url = parseRequestUrl(req)
   const probe = (req.method === 'GET' || req.method === 'HEAD') && ['/healthz', '/readyz'].includes(url?.pathname)
   const pending = probe ? handleHttp(req, res) : withRequestActivity(req, res, () => handleHttp(req, res))
@@ -1709,6 +1724,7 @@ async function shutdown(signal, { failed = false } = {}) {
     } catch {}
   }
   lifecycle.beginDrain()
+  for (const res of httpResponses) closeHttpKeepAlive(res)
   responsesWs.beginDrain()
   clusterRoutes.beginDrain()
   slotShell.beginDrain()
