@@ -445,6 +445,7 @@ export function createHandleProtocol(deps) {
     requestContext = null,
     routing = {},
     noGoFallback = false,
+    accountObservation = null,
   }) {
     const assembler = createClaudeMessageAssembler()
     const workerResult = await dispatchStreamInference({
@@ -472,6 +473,7 @@ export function createHandleProtocol(deps) {
       },
     })
     Object.assign(workerResult, mergeAssembledAssistantHop(workerResult, assembler.message))
+    workerResult.accountObservation = accountObservation
     if (workerResult?.body) {
       workerResult.body = restoreToolNames(workerResult.body, toolNames)
     }
@@ -1415,7 +1417,16 @@ export function createHandleProtocol(deps) {
             })
             noteCachePrefix(selected, attemptSessionId, hopBody)
             logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(hopBody) || attemptSessionId)
-            return { body: hopBody, meta: { toolNames: {}, sessionId: attemptSessionId, cliHop: true, requestContext } }
+            return {
+              body: hopBody,
+              meta: {
+                toolNames: {},
+                sessionId: attemptSessionId,
+                cliHop: true,
+                requestContext,
+                accountObservation: await accountQuota?.beginObservation?.(),
+              },
+            }
           }
 
           cacheTtl = requestedCacheTtl
@@ -1491,7 +1502,14 @@ export function createHandleProtocol(deps) {
           })
           noteCachePrefix(selected, attemptSessionId, prepared.body)
           logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(prepared.body) || attemptSessionId)
-          return { body: prepared.body, meta: { toolNames: prepared.toolNames, sessionId: attemptSessionId } }
+          return {
+            body: prepared.body,
+            meta: {
+              toolNames: prepared.toolNames,
+              sessionId: attemptSessionId,
+              accountObservation: await accountQuota?.beginObservation?.(),
+            },
+          }
         },
         callAttempt: async ({ candidate, body, attemptMeta, deliveryMode: attemptDelivery, signal, onCommit }) => {
           if (!clientStream) {
@@ -1511,6 +1529,7 @@ export function createHandleProtocol(deps) {
               want1m,
               routing: getRouting(),
               noGoFallback: !!pinVmId,
+              accountObservation: attemptMeta?.accountObservation,
             })
           }
           let state
@@ -1539,7 +1558,7 @@ export function createHandleProtocol(deps) {
           if (anthropicKeepalive) activeAttemptCommit = onCommit
           keepalive.arm()
           try {
-            return await dispatchStreamInference({
+            const workerResult = await dispatchStreamInference({
               exec: candidate.exec,
               onExecutionStart: candidate.bindExecution,
               onExecutionEnd: candidate.completeExecution,
@@ -1593,6 +1612,7 @@ export function createHandleProtocol(deps) {
                 writeChunks(claudeSSELineToResponsesEvents(line, state))
               },
             })
+            return { ...workerResult, accountObservation: attemptMeta?.accountObservation }
           } finally {
             if (anthropicKeepalive) {
               activeAttemptCommit = null
@@ -1663,6 +1683,7 @@ export function createHandleProtocol(deps) {
           exhausted,
           status: result.status,
           countRequest: !healthReal,
+          observation: result?.accountObservation,
         })
         const pool = typeof deps.getPoolScheduler === 'function' ? deps.getPoolScheduler() : deps.poolScheduler
         // Live `5h-status` on every response; `allowed` is the only early unblock.

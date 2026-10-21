@@ -3547,7 +3547,7 @@ export function createPanelHandler(ctx) {
           try {
             const repo = ctx.accountQuota?.repo
             const row = repo && typeof repo.get === 'function' ? await repo.get(id) : null
-            if (row && typeof repo.save === 'function') await repo.save({ ...row, email: null, name: id })
+            if (row && typeof repo.patch === 'function') repo.patch(id, { email: null, name: id })
           } catch {}
           const saved = getVm(cfg.paths.project, id) || vm
           return json(

@@ -141,6 +141,7 @@ export class RateLimitService {
         exhausted: true,
         status: 429,
         countRequest: false,
+        observation: result.accountObservation,
       })
     } catch {}
     if (fallback) this.requestUsageProbe({ accountId, vmId })

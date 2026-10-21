@@ -817,6 +817,7 @@ async function requireAuth(req, res) {
     refreshModelPolicy(snapshot.model_policy)
     refreshGptModelPolicy(snapshot.gpt_model_policy)
     invalidatePriceCatalog()
+    await accountQuota.refresh?.()
     await proxyPool.refresh?.()
   }
   // Panel session

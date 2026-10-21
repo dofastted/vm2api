@@ -68,3 +68,19 @@ test('Kubernetes request authentication reloads a model policy changed by anothe
     await gw.stop()
   }
 })
+
+test('Kubernetes panel proxy reads reload a record committed by another process connection', async () => {
+  const gw = await startGateway({ env })
+  try {
+    const added = await api(gw, 'POST', '/api/panel/proxies/import', { body: { text: '127.0.0.1:1080' } })
+    assert.equal(added.status, 200, added.text)
+    const id = (added.json.data || added.json).items[0].id
+    await gw.db.prepare('UPDATE proxies SET label = $2 WHERE id = $1').run(id, 'external-label')
+    const listed = await api(gw, 'GET', '/api/panel/proxies')
+    assert.equal(listed.status, 200, listed.text)
+    const current = (listed.json.data || listed.json).proxies.find((row) => row.id === id)
+    assert.equal(current?.label, 'external-label')
+  } finally {
+    await gw.stop()
+  }
+})
