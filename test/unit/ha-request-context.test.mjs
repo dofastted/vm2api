@@ -241,3 +241,38 @@ for (const mode of ['standalone', 'kubernetes']) {
     })
   })
 }
+
+test('a closed inherited context permits a newly admitted activity but cannot revive its original activity', async () => {
+  await fixture(async ({ db, activity, withHaRequestContext }) => {
+    let resume
+    const later = new Promise((resolve) => {
+      resume = resolve
+    })
+    let inherited
+    await withHaRequestContext({ db, activity, requestId: 'closed-parent' }, async () => {
+      inherited = later.then(async () => {
+        await assert.rejects(
+          withHaRequestContext({ db, activity, requestId: 'revived-parent' }, async () => {}),
+          { code: 'ha_request_context_closed' },
+        )
+        const fresh = await getActivityCoordinator(db).admit({ kind: 'request', requestId: 'fresh-after-closed' })
+        try {
+          await fresh.run(() =>
+            withHaRequestContext({ db, activity: fresh, requestId: 'fresh-after-closed' }, async () => {
+              const lease = await new ExecutionAdmissionsRepo(db).tryReserve(input())
+              assert.equal(lease.ok, true)
+              await lease.release()
+            }),
+          )
+        } finally {
+          await fresh.complete({ ended: true })
+        }
+      })
+      inherited.catch(() => {})
+    })
+    resume()
+    await inherited
+    assert.equal(await db.prepare('SELECT id FROM ha_request_contexts WHERE id=$1').get('revived-parent'), undefined)
+    assert.ok(await db.prepare('SELECT id FROM ha_request_contexts WHERE id=$1').get('fresh-after-closed'))
+  })
+})

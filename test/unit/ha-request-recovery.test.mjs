@@ -9,6 +9,7 @@ import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
 import { SharedExecutionAdmissions } from '../../src/lib/pool/shared-execution-admissions.mjs'
 import { SharedSessionTurns } from '../../src/lib/pool/shared-session-turns.mjs'
 import { RequestAttemptsRepo } from '../../src/lib/db/repos/request-attempts-repo.mjs'
+import { ExecutionAdmissionsRepo } from '../../src/lib/db/repos/execution-admissions-repo.mjs'
 import { syntheticFence } from '../fixtures/fake-slotgate.mjs'
 
 async function fixture(t) {
@@ -423,3 +424,51 @@ test('SIGKILL of a synthetic owner process releases only its connection lock, wi
     })
   })
 })
+
+for (const heldBy of ['pending-billing', 'sealed-recovery', 'normal-finished']) {
+  test(`execution history cleanup preserves original proof for ${heldBy}`, async (t) => {
+    const f = await fixture(t)
+    const original = await graph(f, 'old-history')
+    await f.first.stop()
+    const { HaRequestRecovery } = await import('../../src/lib/core/ha-request-recovery.mjs')
+    const recovery = new HaRequestRecovery(f.peer, { coordinator: f.second })
+    await f.gate.run(async () => {
+      if (heldBy === 'pending-billing') {
+        assert.equal(
+          (await recovery.recover('old-history', { readCompletion: async () => completed(original) })).recovered,
+          true,
+        )
+      } else {
+        if (heldBy === 'sealed-recovery') assert.equal((await recovery.seal('old-history')).sealed, true)
+        await f.peer
+          .prepare('UPDATE execution_jobs SET ended_at=clock_timestamp(),node_completion=$2::jsonb WHERE request_id=$1')
+          .run(original.commandId, JSON.stringify(completed(original)))
+        await f.peer
+          .prepare('UPDATE execution_admissions SET released_at=clock_timestamp() WHERE id=$1')
+          .run(original.admission.admissionId)
+        await f.peer
+          .prepare('UPDATE api_key_admissions SET released_at=clock_timestamp() WHERE id=$1')
+          .run(original.keyLease.reservationId)
+      }
+      await f.peer
+        .prepare("UPDATE execution_admissions SET created_at=clock_timestamp()-interval '2 minutes' WHERE id=$1")
+        .run(original.admission.admissionId)
+      await withHaRequestContext({ db: f.peer, requestId: 'fresh-request', activity: f.gate }, async () => {
+        const lease = await new ExecutionAdmissionsRepo(f.peer).tryReserve({
+          accountId: 'fixture-account',
+          vmId: 'vm-fixture',
+          accountLimit: 10,
+          vmLimit: 10,
+          fableLimit: 0,
+          rpmLimit: 0,
+        })
+        assert.equal(lease.ok, true)
+        await lease.release()
+      })
+      const job = await f.peer.prepare('SELECT * FROM execution_jobs WHERE request_id=$1').get(original.commandId)
+      if (heldBy === 'normal-finished') assert.equal(job, undefined)
+      else
+        assert.deepEqual(job?.node_completion, completed(original), 'the only durable node proof must survive cleanup')
+    })
+  })
+}
