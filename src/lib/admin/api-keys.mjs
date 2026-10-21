@@ -7,8 +7,8 @@
  *
  * Master env key KIN_API_KEY is separate and unlimited.
  * Managed keys live in the `api_keys` table (see lib/db/).
- * Transient state (inflight concurrency, RPM buckets) stays in memory,
- * mirroring sub2api's Redis-transient split.
+ * Standalone state (inflight concurrency, RPM buckets) stays in memory.
+ * Kubernetes admissions use PostgreSQL for cross-replica limits and quotas.
  *
  * Auth always goes through `key_hash` (HMAC). `key_secret` is a separate
  * at-rest copy of the plaintext — encrypted with KIN_DB_SECRET when set — so
@@ -24,6 +24,8 @@ import { ApiKeysRepo } from '../db/repos/api-keys-repo.mjs'
 import { maybeEncrypt, maybeDecrypt } from '../db/secure.mjs'
 import { calculateCost, normalizeUsage } from './pricing.mjs'
 import { UsersRepo } from '../db/repos/users-repo.mjs'
+import { ApiKeyAdmissionsRepo } from '../db/repos/api-key-admissions-repo.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 
 const KEY_PREFIX = 'sk-vm-'
 const HASH_MARKER = 'hmac:'
@@ -121,7 +123,7 @@ function timingSafeEqualStr(a, b) {
 }
 
 export class ApiKeyStore {
-  constructor({ dataDir, db, hashSecret } = {}) {
+  constructor({ dataDir, db, hashSecret, sharedAdmission = isKubernetesMode() } = {}) {
     this.db = resolveStoreDb({ db, dataDir })
     this.repo = new ApiKeysRepo(this.db)
     this.hashSecret = String(
@@ -137,6 +139,9 @@ export class ApiKeyStore {
     this.inflight = new Map() // id → count
     this.rpmBuckets = new Map() // id → number[] timestamps ms
     this.users = new UsersRepo(this.db)
+    this.sharedAdmission = sharedAdmission
+    this.admissionOwnerId = 'controller_' + crypto.randomUUID()
+    this.admissions = new ApiKeyAdmissionsRepo(this.db)
   }
 
   /** sub2api: an api key of a disabled/deleted user must not authenticate. */
@@ -159,10 +164,12 @@ export class ApiKeyStore {
     this.db = db
     this.repo = new ApiKeysRepo(db)
     this.users = new UsersRepo(db)
+    this.admissions = new ApiKeyAdmissionsRepo(db)
   }
 
   async list({ reveal = false } = {}) {
     const names = new Map()
+    const inflight = this.sharedAdmission ? await this.admissions.inflight() : this.inflight
     try {
       for (const pool of await new VmPoolsRepo(this.db).list()) names.set(pool.id, pool.name)
     } catch {
@@ -170,7 +177,7 @@ export class ApiKeyStore {
     }
     return (await this.repo.list()).map((k) => {
       const v = publicKeyView(k, { reveal })
-      v.inflight = this.inflight.get(k.id) || 0
+      v.inflight = inflight.get(k.id) || 0
       if (v.vm_pool_id) v.vm_pool_name = names.get(v.vm_pool_id) || null
       return v
     })
@@ -374,9 +381,9 @@ export class ApiKeyStore {
    * Pre-flight gate for a managed key. Does not acquire concurrency.
    * @returns {{ ok: true } | { ok: false, code, message, status }}
    */
-  async canAccept(rec, now = Date.now(), { reserve = false } = {}) {
-    const owner = rec?.user_id ? await this.users.getById(rec.user_id) : null
-    const ownedKeys = rec?.user_id ? await this.repo.list() : []
+  async canAccept(rec, now = Date.now(), { reserve = false, state = null } = {}) {
+    const owner = state ? state.owner : rec?.user_id ? await this.users.getById(rec.user_id) : null
+    const ownedKeys = !state && rec?.user_id ? await this.repo.list() : []
     if (!rec) return { ok: false, code: 'invalid_api_key', message: 'Invalid credentials', status: 401 }
     if (rec.status !== 'active') {
       if (rec.status === 'quota_exhausted') {
@@ -387,7 +394,13 @@ export class ApiKeyStore {
     if (this._expired(rec, now)) {
       return { ok: false, code: 'api_key_expired', message: 'API key has expired', status: 403 }
     }
-    if (rec.quota_requests > 0 && BigInt(rec.quota_requests_used ?? 0) >= BigInt(rec.quota_requests)) {
+    if (rec.user_id && (!owner || owner.status !== 'active')) {
+      return { ok: false, code: 'user_disabled', message: 'API key owner is disabled', status: 403 }
+    }
+    if (
+      rec.quota_requests > 0 &&
+      BigInt(rec.quota_requests_used ?? 0) + BigInt(state?.pendingRequests ?? 0) >= BigInt(rec.quota_requests)
+    ) {
       return {
         ok: false,
         code: 'api_key_quota_exhausted',
@@ -426,7 +439,7 @@ export class ApiKeyStore {
       }
     }
     if (rec.rpm > 0) {
-      const n = this._rpmCount(rec.id, now)
+      const n = state ? state.rpmCount : this._rpmCount(rec.id, now)
       if (n >= rec.rpm) {
         return {
           ok: false,
@@ -434,10 +447,11 @@ export class ApiKeyStore {
           message: `API key rate limit exceeded (${rec.rpm}/min)`,
           status: 429,
           detail: { rpm: rec.rpm, current: n },
+          ...(state?.retryAfterMs ? { retry_after_ms: state.retryAfterMs } : {}),
         }
       }
     }
-    const inflight = this.inflight.get(rec.id) || 0
+    const inflight = state ? state.inflight : this.inflight.get(rec.id) || 0
     if (rec.max_concurrency > 0 && inflight >= rec.max_concurrency) {
       return {
         ok: false,
@@ -452,10 +466,11 @@ export class ApiKeyStore {
     if (rec.user_id) {
       const cap = owner?.role === 'admin' ? 0 : Number(owner?.concurrency) || 0
       if (cap > 0) {
-        let total = 0
-        for (const k of ownedKeys) {
-          if (k.user_id === rec.user_id) total += this.inflight.get(k.id) || 0
-        }
+        let total = state ? state.userInflight : 0
+        if (!state)
+          for (const k of ownedKeys) {
+            if (k.user_id === rec.user_id) total += this.inflight.get(k.id) || 0
+          }
         if (total >= cap) {
           return {
             ok: false,
@@ -480,6 +495,59 @@ export class ApiKeyStore {
     return this.canAccept(rec, now, { reserve: true })
   }
 
+  /**
+   * Reserve before starting work, settle billable usage with { reservation },
+   * then await release in the request's outer finally. A failed settlement
+   * must retain its reservation until a fenced recovery can reconcile it.
+   */
+  async reserve(rec) {
+    if (!this.sharedAdmission) {
+      const gate = await this.acquire(rec)
+      if (!gate.ok) return gate
+      let released = false
+      return {
+        ok: true,
+        shared: false,
+        record: rec,
+        release: async () => {
+          if (released) return
+          released = true
+          this.release(rec)
+        },
+      }
+    }
+    const admissions = this.admissions
+    const gate = await admissions.reserve(rec?.id, this.admissionOwnerId, (current, state) => {
+      if (current && rec.key_hash !== current.key_hash) {
+        return { ok: false, code: 'invalid_api_key', message: 'Invalid credentials', status: 401 }
+      }
+      // Scope checks happen before this gate. Require authentication again
+      // if an operator changed the policy while this request was prepared.
+      if (
+        current &&
+        ['category', 'group_type', 'allowed_vms', 'vm_pool_id', 'user_id', 'group_id'].some(
+          (field) => (rec[field] ?? null) !== (current[field] ?? null),
+        )
+      ) {
+        return { ok: false, code: 'api_key_changed', message: 'API key policy changed; retry the request', status: 403 }
+      }
+      return this.canAccept(current, state.now, { state })
+    })
+    if (!gate.ok) return gate
+    let settled = false
+    return {
+      ...gate,
+      shared: true,
+      get settled() {
+        return settled
+      },
+      _markSettled() {
+        settled = true
+      },
+      release: () => admissions.release(gate),
+    }
+  }
+
   release(recOrId) {
     const id = typeof recOrId === 'string' ? recOrId : recOrId?.id
     if (!id) return
@@ -488,7 +556,7 @@ export class ApiKeyStore {
     else this.inflight.set(id, n)
   }
 
-  async recordUsage(recOrId, usage = {}, { model = null, rateMultiplier = 1, officialCost } = {}) {
+  async recordUsage(recOrId, usage = {}, { model = null, rateMultiplier = 1, officialCost, reservation } = {}) {
     const id = typeof recOrId === 'string' ? recOrId : recOrId?.id
     if (!(await this.repo.getById(id))) return null
     const normalized = normalizeUsage(usage)
@@ -504,14 +572,20 @@ export class ApiKeyStore {
     // key quota/windows track actual (group-rated) spend, sub2api-style
     const rate = Number.isFinite(Number(rateMultiplier)) ? Number(rateMultiplier) : 1
     const cost = billed * rate
-    const rec = await this.repo.recordUsage(id, {
-      tokens_in: integerValue(normalized.input_tokens ?? normalized.tokens_in),
-      tokens_out: integerValue(normalized.output_tokens ?? normalized.tokens_out),
-      cache_read_tokens: integerValue(normalized.cache_read_input_tokens ?? normalized.cache_read_tokens),
-      cache_creation_tokens: integerValue(normalized.cache_creation_input_tokens ?? normalized.cache_creation_tokens),
-      cost,
-    })
-    return rec
+    const write = () =>
+      this.repo.recordUsage(id, {
+        tokens_in: integerValue(normalized.input_tokens ?? normalized.tokens_in),
+        tokens_out: integerValue(normalized.output_tokens ?? normalized.tokens_out),
+        cache_read_tokens: integerValue(normalized.cache_read_input_tokens ?? normalized.cache_read_tokens),
+        cache_creation_tokens: integerValue(normalized.cache_creation_input_tokens ?? normalized.cache_creation_tokens),
+        cost,
+      })
+    if (reservation?.shared) {
+      const rec = await this.admissions.settle(id, reservation, write)
+      if (rec) reservation._markSettled?.()
+      return rec
+    }
+    return write()
   }
 
   async snapshot() {

@@ -235,7 +235,8 @@ test('deleting an executing key retains its owner concurrency until release', as
 test('pending quota arithmetic remains exact above the safe integer boundary', async () => {
   const [first, second] = await replicas()
   const key = await first.create({ max_concurrency: 0 })
-  await first.db.prepare('UPDATE api_keys SET quota_requests = $1, quota_requests_used = $2 WHERE id = $3')
+  await first.db
+    .prepare('UPDATE api_keys SET quota_requests = $1, quota_requests_used = $2 WHERE id = $3')
     .run('9007199254740994', '9007199254740993', key.id)
   const gate = await first.reserve(key)
   assert.equal(gate.ok, true)
