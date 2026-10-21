@@ -7,3 +7,7 @@ func readNodeCredential(string, string, Fence) ([]byte, error)       { return ni
 func checkCredentialLink(string, string, Fence, DockerLaunchPolicy) error {
 	return errPublishUnsupported
 }
+
+func publishCredentialProjection(string, string, Fence, DockerLaunchPolicy, []byte) error {
+	return errPublishUnsupported
+}

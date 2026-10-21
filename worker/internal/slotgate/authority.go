@@ -91,6 +91,8 @@ type CommandRecord struct {
 	Management      *ManagementIntent   `json:"management,omitempty"`
 	LaunchReceipt   *LaunchReceipt      `json:"launch_receipt,omitempty"`
 	TerminalReceipt *inferenceReceipt   `json:"terminal_receipt,omitempty"`
+	Refresh         *RefreshIntent      `json:"refresh,omitempty"`
+	RefreshReceipt  *RefreshReceipt     `json:"refresh_receipt,omitempty"`
 }
 
 // DockerLaunchTarget is recorded after create returns and before start. A
@@ -497,7 +499,7 @@ func (a *Authority) CompleteCommand(handle CommandHandle) error {
 	if command.Status != CommandPending {
 		return ErrCommandOwner
 	}
-	if command.Kind == commandPublish || (command.Kind == commandLaunch && command.Dispatched) {
+	if command.Kind == commandPublish || command.Kind == commandRefresh || (command.Kind == commandLaunch && command.Dispatched) {
 		return ErrAuthorityPhase
 	}
 	command.Status = CommandCompleted
@@ -678,6 +680,10 @@ func (a *Authority) persist(next authorityJournal) error {
 }
 
 func cloneState(state AuthorityState) AuthorityState {
+	if state.Credential != nil {
+		credential := *state.Credential
+		state.Credential = &credential
+	}
 	if state.InitialManifest != nil {
 		manifest := *state.InitialManifest
 		state.InitialManifest = &manifest
@@ -689,6 +695,14 @@ func cloneState(state AuthorityState) AuthorityState {
 	commands := make(map[string]CommandRecord, len(state.Commands))
 	for id, command := range state.Commands {
 		command.TerminalReceipt = cloneInferenceReceipt(command.TerminalReceipt)
+		if command.Refresh != nil {
+			intent := *command.Refresh
+			command.Refresh = &intent
+		}
+		if command.RefreshReceipt != nil {
+			receipt := *command.RefreshReceipt
+			command.RefreshReceipt = &receipt
+		}
 		if command.Management != nil {
 			intent := *command.Management
 			command.Management = &intent
@@ -821,8 +835,11 @@ func validateJournal(journal authorityJournal) error {
 			if id != command.ID || !validAuthorityID(id) || !validAuthorityID(command.Runtime) || !validAuthorityID(command.Token) || command.Fence.Generation == 0 || command.Fence.Generation > state.Fence.Generation || !validAuthorityID(command.Fence.Incarnation) {
 				return ErrInvalidAuthority
 			}
-			if command.Kind != CommandForward && command.Kind != CommandMutation && command.Kind != commandLaunch && command.Kind != commandPublish {
+			if command.Kind != CommandForward && command.Kind != CommandMutation && command.Kind != commandLaunch && command.Kind != commandPublish && command.Kind != commandRefresh {
 				return ErrInvalidAuthority
+			}
+			if err := validateRefreshCommand(vm, command); err != nil {
+				return err
 			}
 			if command.Kind == commandPublish && command.Management == nil {
 				return ErrInvalidAuthority

@@ -73,3 +73,37 @@ func checkCredentialLink(root, vm string, fence Fence, policy DockerLaunchPolicy
 	}
 	return nil
 }
+
+func publishCredentialProjection(root, vm string, fence Fence, policy DockerLaunchPolicy, data []byte) error {
+	parent, err := incarnationParent(root, vm, false)
+	if err != nil {
+		return err
+	}
+	defer parent.Close()
+	base, err := openDirectoryAt(parent, fence.Incarnation, false, os.Geteuid())
+	if err != nil {
+		return err
+	}
+	defer base.Close()
+	dir, err := openDirectoryAt(base, "claude", false, policy.UID)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	if _, err = readInitialFile(dir, "credentials.json", policy.UID, initialPublishMax); err != nil {
+		return err
+	}
+	id, err := randomAuthorityID()
+	if err != nil {
+		return err
+	}
+	name := ".node-credential-" + id
+	if err = writeInitialFile(dir, name, data, policy.UID, policy.GID, 0o400); err != nil {
+		return err
+	}
+	defer unix.Unlinkat(int(dir.Fd()), name, 0)
+	if err = unix.Renameat(int(dir.Fd()), name, int(dir.Fd()), "credentials.json"); err != nil {
+		return err
+	}
+	return dir.Sync()
+}
