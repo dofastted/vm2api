@@ -13,6 +13,7 @@ import {
   officialCcHome,
   readOfficialCcStatus,
   scheduleOfficialCcBootstrap,
+  runOfficialCcBootstrap,
 } from '../../src/lib/oauth/official-cc-bootstrap.mjs'
 import { writeWorkerCredentialFile } from '../../src/lib/oauth/oauth-credentials.mjs'
 
@@ -131,6 +132,40 @@ test('a raw bootstrap usage timeout keeps task and VM ownership and prevents a l
   assert.equal(claim.finished_at, null)
   assert.equal(calls, 1)
 })
+
+for (const auxiliary of ['profile', 'models', 'identity']) {
+  test(`raw bootstrap reports an unknown ${auxiliary} even when hello and usage succeed`, async (t) => {
+    const f = await fixture(t)
+    prepareRawBootstrap(f, t)
+    f.options.runTurn = async ({ prompt, outFile }) => {
+      fs.writeFileSync(
+        outFile,
+        prompt === '/usage'
+          ? JSON.stringify({ five_hour: { utilization: 0.1 }, seven_day: { utilization: 0.2 } })
+          : '{}',
+      )
+      return { ok: true, code: 0, timed_out: false }
+    }
+    const call = f.options.slotOauth
+    f.options.slotOauth = (exec, op) =>
+      op === auxiliary
+        ? { ok: false, status: 0, attemptFinished: false, body: { error: { code: 'timeout' } } }
+        : call(exec, op)
+    if (auxiliary === 'identity') f.options.collectIdentity = async () => ({ ok: false, error: 'synthetic timeout' })
+    let raw
+    f.options.runBootstrap = async (options) => {
+      raw = await runOfficialCcBootstrap(options)
+      return raw
+    }
+    await scheduleOfficialCcBootstrap(f.options)
+    await f.tasks.flush()
+    assert.equal(raw.ok, true)
+    assert.equal(raw.attemptFinished, false)
+    assert.equal(raw.vmOperationUncertain, true)
+    assert.equal((await f.other.tryAcquire({ vmId: f.vm.id })).ok, false)
+    assert.equal((await f.peer.prepare('SELECT finished_at FROM background_task_runs').get()).finished_at, null)
+  })
+}
 
 test('manual bootstrap rejects a busy VM before queued status or background effects are written', async (t) => {
   const f = await fixture(t)

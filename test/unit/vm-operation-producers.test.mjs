@@ -303,6 +303,29 @@ test('Kubernetes credential import awaits official initialization while holding 
   assert.equal(await f.active(), 0)
 })
 
+for (const auxiliary of ['profile', 'models', 'identity']) {
+  test(`credential import retains the VM operation after an unknown bootstrap ${auxiliary}`, async (t) => {
+    const f = await fixture(t)
+    process.env.KIN_CRS_MOCK = '0'
+    let calls = 0
+    const commit = createImportCommit({
+      ...f.ctx,
+      routingConfig: { official_cc: { enabled: true } },
+      reloadSlotReady: async () => ({ ok: true, runtime: {} }),
+      importWorkerCredential: async () => ({ ok: true }),
+      runOfficialCcBootstrap: async () => {
+        calls++
+        return { ok: true, status: { [`${auxiliary}_error`]: 'synthetic timeout' } }
+      },
+    }).commitImportedOauth
+    const result = await commit({ ...f.input, skipOfficialCc: false })
+    assert.equal(result.official_cc_bootstrap.completed, true)
+    assert.equal(calls, 1)
+    assert.equal(await f.active(), 1)
+    assert.equal((await admission(f.other)).code, 'vm_operation_active')
+  })
+}
+
 test('Kubernetes remote unsupported or disabled official initialization never falls back to local execution', async (t) => {
   const f = await fixture(t)
   process.env.KIN_CRS_MOCK = '0'

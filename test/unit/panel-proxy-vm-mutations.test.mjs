@@ -313,3 +313,39 @@ test('Kubernetes package creation refuses a committed alias missing from this Po
   assert.equal(h.response.status, 409)
   assert.equal(fs.existsSync(path.join(f.project, 'vms', 'new.json')), false)
 })
+
+for (const auxiliary of ['profile', 'models', 'identity']) {
+  test(`package bootstrap retains its VM and proxy claims after an unknown ${auxiliary}`, async (t) => {
+    const f = await fixture(t)
+    const body = buildVmPackage({
+      vm: { id: 'vm-new', timezone: 'UTC', claude: { mode: 'oauth' } },
+      proxy: f.pool.getProxyByIdWithAuth(f.proxyId),
+      claudeCred: { mode: 'oauth', access_token: 'synthetic-access', refresh_token: 'synthetic-refresh' },
+    })
+    let calls = 0
+    const h = f.handler(body, {
+      officialCcStatsHandler: () => async () => {},
+      accountQuota: {
+        snapshot: () => ({ accounts: [] }),
+        ensure() {},
+        repo: { get: () => ({ unified: {} }), observe: async () => {} },
+        beginObservation: async () => 'synthetic',
+        ingestOAuthUsage() {},
+        setAccountTier() {},
+        flush: async () => {},
+      },
+      vmMutationOps: {
+        startSlotReady: async () => ({ ok: true }),
+        runOfficialCcBootstrap: async () => {
+          calls++
+          return { ok: true, status: { [`${auxiliary}_error`]: 'synthetic timeout' } }
+        },
+      },
+    })
+    await h.request('POST', '/api/panel/vms/package')
+    assert.equal(h.response.status, 201, JSON.stringify(h.response.body))
+    assert.equal(calls, 1)
+    assert.equal((await f.otherOperations.tryAcquire({ vmId: 'vm-new' })).ok, false)
+    assert.equal((await new SharedProxyOperations(f.peer).tryAcquire()).ok, false)
+  })
+}
