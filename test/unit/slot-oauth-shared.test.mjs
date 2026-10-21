@@ -10,6 +10,9 @@ import { ExecutionAdmissionsRepo } from '../../src/lib/db/repos/execution-admiss
 import { readWorkerCredentialFile, writeWorkerCredentialFile } from '../../src/lib/oauth/oauth-credentials.mjs'
 import { runSlotOauth } from '../../src/lib/transport/slot-oauth.mjs'
 import { ensureWorkerCredential } from '../../src/lib/transport/go-worker-client.mjs'
+import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { SharedVmOperations } from '../../src/lib/vm/shared-vm-operations.mjs'
+import { SharedCredentialRefresh } from '../../src/lib/oauth/shared-credential-refresh.mjs'
 
 async function fixture(t) {
   const db = getDb()
@@ -50,6 +53,28 @@ async function fixture(t) {
   const run = (callback) =>
     coordinator.runActivity({ kind: 'fixture' }, async () => ({ ended: true, value: await callback() }))
   return { db, coordinator, homeDir, exec: { vmId: 'vm-01', homeDir, vm: {} }, run }
+}
+
+async function startDrain(f, scope) {
+  let draining
+  const began = new Promise((resolve) => {
+    draining = resolve
+  })
+  const pending = f.coordinator.beginMaintenance({ kind: 'backup', timeoutMs: 1000, onDraining: () => draining() })
+  pending.catch(() => {})
+  await began
+  return async () => {
+    await scope.complete({ ended: true })
+    const operation = await pending.catch(() => null)
+    if (!operation) return false
+    try {
+      await operation.resume()
+      await operation.finish()
+      return true
+    } finally {
+      await operation.close()
+    }
+  }
 }
 
 test('the actual slot OAuth refresh shares a committed attempt after bootstrap has closed', async (t) => {
@@ -145,4 +170,137 @@ test('implicit worker refresh commands cannot execute while another inference is
   } finally {
     await f.run(() => gate.release())
   }
+})
+
+test('a DRAINING refusal after bootstrap closes proves the refresh never started', async (t) => {
+  const f = await fixture(t)
+  const scope = await f.coordinator.admit()
+  const finish = await startDrain(f, scope)
+  let calls = 0
+  try {
+    await assert.rejects(
+      runSlotOauth(f.exec, 'refresh', {
+        runDocker: async () => {
+          calls++
+        },
+      }),
+      {
+        code: 'database_maintenance',
+        credentialRefreshNotStarted: true,
+      },
+    )
+    assert.equal(calls, 0)
+  } finally {
+    await finish()
+  }
+})
+
+test('a busy VM rejects refresh before mutation and completes its unused task claim', async (t) => {
+  const f = await fixture(t)
+  const operation = await f.run(() => new SharedVmOperations(f.db).tryAcquire({ vmId: 'vm-01' }))
+  let calls = 0
+  try {
+    await assert.rejects(
+      runSlotOauth(f.exec, 'refresh', {
+        runDocker: async () => {
+          calls++
+        },
+      }),
+      {
+        code: 'vm_operation_active',
+        credentialRefreshNotStarted: true,
+      },
+    )
+    assert.equal(calls, 0)
+    assert.equal(
+      (
+        await f.run(() =>
+          f.db.prepare('SELECT count(*) AS n FROM background_task_runs WHERE finished_at IS NULL').get(),
+        )
+      ).n,
+      0,
+    )
+  } finally {
+    await f.run(() => operation.release())
+  }
+})
+
+for (const ended of [true, false]) {
+  test(`runner handles a DRAINING refresh refusal with first job ended=${ended}`, async (t) => {
+    const f = await fixture(t)
+    const scope = await f.coordinator.admit()
+    let gate
+    await scope.run(async () => {
+      gate = await new ExecutionAdmissionsRepo(f.db).tryReserve({
+        accountId: 'slot-refresh-account',
+        vmId: 'vm-01',
+        accountLimit: 1,
+        vmLimit: 1,
+        rpmLimit: 0,
+        fableLimit: 0,
+      })
+      await gate.bindExecution({ requestId: 'before-draining' })
+      if (ended)
+        await gate.completeExecution({
+          requestId: 'before-draining',
+          started: true,
+          ended: true,
+          reason: 'body_complete',
+        })
+    })
+    const runner = new FailoverRunner({ scheduler: { accountQuota: { db: f.db } } })
+    const selected = { ...gate, exec: f.exec }
+    const finish = await startDrain(f, scope)
+    let drained
+    try {
+      await scope.run(async () => {
+        const recover = () =>
+          runner.recoverCredential(selected, { reason: 'oauth_refresh_required' }, { executionEnded: ended })
+        if (ended) {
+          const policy = await recover()
+          assert.equal(policy.credentialRefreshNotStarted, true)
+          assert.equal((await f.db.prepare('SELECT uncertain_at FROM execution_admissions').get()).uncertain_at, null)
+          assert.equal((await gate.release()).released, true)
+        } else {
+          await assert.rejects(recover(), { credentialRefreshNotStarted: true, executionUncertain: true })
+          assert.ok((await f.db.prepare('SELECT uncertain_at FROM execution_admissions').get()).uncertain_at)
+          assert.equal((await gate.release()).released, false)
+        }
+      })
+    } finally {
+      drained = await finish()
+    }
+    assert.equal(drained, ended)
+  })
+}
+
+test('the same maintenance error after entering refresh cannot claim it never started', async (t) => {
+  const f = await fixture(t)
+  let calls = 0
+  await assert.rejects(
+    new SharedCredentialRefresh(f.db).run(
+      {
+        platform: 'claude',
+        vmId: 'vm-01',
+        accountId: 'slot-refresh-account',
+        expectedGeneration: 'generation-one',
+      },
+      {
+        readCurrent: async () => ({ generation: 'generation-one', credential: { refresh_token: 'SYNTHETIC_RT' } }),
+        refresh: async () => {
+          calls++
+          throw Object.assign(new Error('synthetic in-flight error'), { code: 'database_maintenance' })
+        },
+        publish: async () => assert.fail('no publication'),
+      },
+    ),
+    (error) => {
+      assert.equal(error.credentialRefreshNotStarted, undefined)
+      return error.code === 'database_maintenance'
+    },
+  )
+  assert.equal(calls, 1)
+  const operation = await f.run(() => f.db.prepare('SELECT released_at,uncertain_at FROM vm_operations').get())
+  assert.equal(operation.released_at, null)
+  assert.ok(operation.uncertain_at)
 })
