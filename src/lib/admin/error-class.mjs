@@ -161,11 +161,11 @@ export function ingressAuthSql() {
   const codes = [...INGRESS_AUTH_ERROR_CODES].map((code) => `'${code}'`).join(', ')
   const cred = "'upstream_auth_error','oauth_need_reimport','oauth_refresh_failed'"
   return `(
-    IFNULL(error_code, '') IN (${codes})
+    COALESCE(error_code, '') IN (${codes})
     OR (
       status IN (401, 403)
-      AND IFNULL(vm_id, '') = ''
-      AND IFNULL(error_code, '') NOT IN (${cred})
+      AND COALESCE(vm_id, '') = ''
+      AND COALESCE(error_code, '') NOT IN (${cred})
     )
   )`
 }
@@ -180,7 +180,7 @@ function mutedAuthSql() {
     .filter((code) => CODE_MAP[code] !== 'auth')
     .map((code) => `'${code}'`)
     .join(',')
-  return `(${ingressAuthSql()} AND IFNULL(error_code, '') NOT IN (${classified}))`
+  return `(${ingressAuthSql()} AND COALESCE(error_code, '') NOT IN (${classified}))`
 }
 
 export function excludeErrorClassSql(classes) {

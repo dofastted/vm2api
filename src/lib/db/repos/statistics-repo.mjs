@@ -34,7 +34,8 @@ const DIMENSION_COLUMN = { user: 'user_id', key: 'api_key_id', model: 'model', v
 const TOKENS_SQL = TOTAL_TOKENS_SQL
 
 /** created_at (`YYYY-MM-DDTHH:MM:SS.sssZ`) floored to its 15-minute UTC slot. */
-const SLOT_SQL = "substr(created_at, 1, 14) || printf('%02d', (CAST(substr(created_at, 15, 2) AS INTEGER) / 15) * 15)"
+const SLOT_SQL =
+  "to_char(date_bin(interval '15 minutes', created_at::timestamptz, timestamptz '2000-01-01 00:00:00+00') AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI')"
 
 function num(v) {
   const n = Number(v)
@@ -104,9 +105,9 @@ export class StatisticsRepo {
   }
 
   _scope(sinceMs, untilMs, ownerUserId) {
-    const where = ['created_at >= ?', 'created_at < ?']
+    const where = ['created_at >= $1', 'created_at < $2']
     const params = [new Date(sinceMs).toISOString(), new Date(untilMs).toISOString()]
-    const own = ownerPred(ownerUserId)
+    const own = ownerPred(ownerUserId, params.length)
     if (own.sql) {
       where.push(own.sql)
       params.push(...own.params)
@@ -114,9 +115,9 @@ export class StatisticsRepo {
     return { cond: `WHERE ${where.join(' AND ')}`, params }
   }
 
-  _totals(sinceMs, untilMs, ownerUserId) {
+  async _totals(sinceMs, untilMs, ownerUserId) {
     const { cond, params } = this._scope(sinceMs, untilMs, ownerUserId)
-    const row = this.db
+    const row = await this.db
       .prepare(`
       SELECT COUNT(*) AS requests,
              COALESCE(SUM(CASE WHEN ${ERROR_PRED} THEN 1 ELSE 0 END), 0) AS errors,
@@ -153,10 +154,10 @@ export class StatisticsRepo {
     }
   }
 
-  _names(dimension, ids) {
+  async _names(dimension, ids) {
     const real = ids.filter((id) => id !== NONE_ID)
     if (dimension === 'model') return new Map(real.map((id) => [id, id]))
-    const names = lookupNames(this.db, {
+    const names = await lookupNames(this.db, {
       userIds: dimension === 'user' ? real : [],
       keyIds: dimension === 'key' ? real : [],
       vmIds: dimension === 'vm' ? real : [],
@@ -169,14 +170,14 @@ export class StatisticsRepo {
   }
 
   /** Stacked-area series (top 8 by cost + others), window totals, and deltas vs the previous equal window. */
-  statistics({ range = 'today', dimension = 'model', tz = 'UTC', owner_user_id = null, now = Date.now() } = {}) {
+  async statistics({ range = 'today', dimension = 'model', tz = 'UTC', owner_user_id = null, now = Date.now() } = {}) {
     const r = normalizeRange(range) || 'today'
     const dim = normalizeDimension(dimension) || 'model'
     const zone = reportTimezone(tz)
     const { since, until, resolution, buckets } = resolveWindow(r, zone, now)
     const col = DIMENSION_COLUMN[dim]
     const { cond, params } = this._scope(since, until, owner_user_id)
-    const rows = this.db
+    const rows = await this.db
       .prepare(`
       SELECT ${col} AS sid, ${SLOT_SQL} AS slot,
              COUNT(*) AS requests,
@@ -201,7 +202,7 @@ export class StatisticsRepo {
       (a, b) => b.cost - a.cost || b.requests - a.requests || a.id.localeCompare(b.id),
     )
     const kept = ranked.slice(0, MAX_SERIES)
-    const names = this._names(
+    const names = await this._names(
       dim,
       kept.map((s) => s.id),
     )
@@ -232,8 +233,8 @@ export class StatisticsRepo {
       }
     }
 
-    const totals = this._totals(since, until, owner_user_id)
-    const prev = this._totals(since - (until - since), since, owner_user_id)
+    const totals = await this._totals(since, until, owner_user_id)
+    const prev = await this._totals(since - (until - since), since, owner_user_id)
     return {
       range: r,
       resolution,
@@ -254,7 +255,7 @@ export class StatisticsRepo {
   }
 
   /** Per-entity totals over the same window, by official cost. */
-  leaderboard({
+  async leaderboard({
     range = 'today',
     scope = 'model',
     limit = LEADERBOARD_DEFAULT,
@@ -269,9 +270,9 @@ export class StatisticsRepo {
     const { since, until } = resolveWindow(r, zone, now)
     const col = DIMENSION_COLUMN[s]
     const { cond, params } = this._scope(since, until, owner_user_id)
-    const rows = this.db
+    const rows = await this.db
       .prepare(`
-      SELECT ${col} AS sid,
+      SELECT COALESCE(${col}, '') AS sid,
              COUNT(*) AS requests,
              COALESCE(SUM(CASE WHEN ${SUCCESS_PRED} THEN 1 ELSE 0 END), 0) AS success,
              COALESCE(SUM(CASE WHEN ${ERROR_PRED} THEN 1 ELSE 0 END), 0) AS errors,
@@ -285,13 +286,13 @@ export class StatisticsRepo {
              AVG(duration_ms) AS avg_duration_ms,
              AVG(first_token_ms) AS avg_ttft_ms
       FROM usage_logs ${cond}
-      GROUP BY IFNULL(${col}, '')
+      GROUP BY COALESCE(${col}, '')
       ORDER BY cost DESC, requests DESC
-      LIMIT ?
+      LIMIT $${params.length + 1}
     `)
       .all(...params, n)
     const ids = rows.map((row) => (row.sid == null || row.sid === '' ? NONE_ID : String(row.sid)))
-    const names = this._names(s, ids)
+    const names = await this._names(s, ids)
     return {
       scope: s,
       range: r,

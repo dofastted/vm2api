@@ -30,7 +30,7 @@ test('billing index keeps UUID row when leftover vm-id account is empty', () => 
   assert.equal(lookupBilling(index, { id: 'vm-50' }), real)
 })
 
-test('billing rows of an older account on a reused slot keep their own email', (t) => {
+test('billing rows of an older account on a reused slot keep their own email', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-billing-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const billing = {
@@ -48,7 +48,7 @@ test('billing rows of an older account on a reused slot keep their own email', (
       ],
     }),
   }
-  const usage = buildUsage({
+  const usage = await buildUsage({
     accountQuota,
     cfg: { paths: { project: root } },
     requestLog: { billingStats: () => billing },
@@ -95,12 +95,12 @@ test('VM list carries lifetime tokens from the same billing row as total_cost', 
   assert.equal(byId['vm-08'].total_tokens, 0)
 })
 
-test('usage rows of a deleted VM are not listed', (t) => {
+test('usage rows of a deleted VM are not listed', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-usage-deleted-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
   fs.writeFileSync(path.join(root, 'vms', 'vm-02.json'), JSON.stringify({ id: 'vm-02' }))
-  const usage = buildUsage({
+  const usage = await buildUsage({
     accountQuota: {
       snapshot: () => ({
         accounts: [
@@ -122,7 +122,7 @@ test('usage rows of a deleted VM are not listed', (t) => {
   assert.equal(usage.data.billing.accounts[0].email, 'three@example.com')
 })
 
-test('GPT usage row without pool email takes slot email', (t) => {
+test('GPT usage row without pool email takes slot email', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-gpt-usage-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
@@ -137,7 +137,7 @@ test('GPT usage row without pool email takes slot email', (t) => {
       codex: { email: 'lemeryvorhees@gmail.com' },
     }),
   )
-  const usage = buildUsage({
+  const usage = await buildUsage({
     accountQuota: {
       snapshot: () => ({
         accounts: [{ account_id: 'vm-codex-01', vm_id: 'vm-codex-01', email: null }],

@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { getDb } from '../../src/lib/db/database.mjs'
 import {
   classifyRequestError,
   collectErrors,
@@ -119,15 +120,14 @@ test('excludeErrorClassSql hides ingress auth without dropping oauth credential 
   const sql = excludeErrorClassSql('auth')
   assert.match(sql, /invalid_api_key/)
   assert.match(sql, /NOT \(/)
-  assert.match(sql, /IFNULL\(error_code/)
+  assert.match(sql, /COALESCE\(error_code/)
   assert.match(sql, /upstream_auth_error/)
 })
 
 test('default auth mute keeps policy 403s that already name a non-auth class', async () => {
-  const { DatabaseSync } = await import('node:sqlite')
-  const db = new DatabaseSync(':memory:')
-  db.exec('CREATE TABLE logs (status INTEGER, error_code TEXT, vm_id TEXT)')
-  const insert = db.prepare('INSERT INTO logs VALUES (?, ?, ?)')
+  const db = getDb()
+  await db.exec('CREATE TABLE logs (status INTEGER, error_code TEXT, vm_id TEXT)')
+  const insert = db.prepare('INSERT INTO logs VALUES ($1, $2, $3)')
   for (const row of [
     [401, 'invalid_api_key', null],
     [403, null, null],
@@ -136,11 +136,10 @@ test('default auth mute keeps policy 403s that already name a non-auth class', a
     [403, 'distill_blocked', null],
     [401, 'upstream_auth_error', null],
   ]) {
-    insert.run(...row)
+    await insert.run(...row)
   }
-  const kept = db
-    .prepare(`SELECT error_code FROM logs WHERE ${excludeErrorClassSql('auth')}`)
-    .all()
-    .map((r) => r.error_code)
+  const kept = (await db.prepare(`SELECT error_code FROM logs WHERE ${excludeErrorClassSql('auth')}`).all()).map(
+    (r) => r.error_code,
+  )
   assert.deepEqual(kept.sort(), ['claude_code_only', 'distill_blocked', 'key_group_mismatch', 'upstream_auth_error'])
 })
