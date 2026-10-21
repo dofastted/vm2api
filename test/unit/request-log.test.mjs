@@ -1123,6 +1123,39 @@ test('tenant log scope follows the slot owner at write time, not the current own
   assert.equal((await store.queryNormal({})).total, 2)
 })
 
+test('stopping retention scheduling still waits for its running cleanup during flush', async (t) => {
+  const store = tmpStore()
+  let run
+  t.mock.method(globalThis, 'setInterval', (callback) => {
+    run = callback
+    return { unref() {} }
+  })
+  t.mock.method(globalThis, 'clearInterval', () => {})
+  let releaseCleanup
+  const cleanupPending = new Promise((resolve) => { releaseCleanup = resolve })
+  let signalCleanup
+  const cleanupStarted = new Promise((resolve) => { signalCleanup = resolve })
+  store.cleanup = async () => {
+    signalCleanup()
+    await cleanupPending
+  }
+  store.startCleanupScheduler()
+  run()
+  await cleanupStarted
+  store.stopCleanupScheduler()
+  let settled = false
+  let pending
+  try {
+    pending = store.flush().then(() => { settled = true })
+    await Promise.resolve()
+    assert.equal(settled, false)
+  } finally {
+    releaseCleanup()
+  }
+  await pending
+  assert.equal(settled, true)
+})
+
 test('summary and debug write failures reject finish and response flush', async () => {
   const store = tmpStore('debug')
   const query = store.db.query.bind(store.db)
