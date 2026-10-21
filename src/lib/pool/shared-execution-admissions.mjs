@@ -94,7 +94,12 @@ export class SharedExecutionAdmissions {
           .prepare('SELECT count(*) AS count FROM execution_seats WHERE vm_id = $1 AND seat_key <> $2')
           .get(input.vmId, seatKey)
         if (count >= input.seatCap) return { ok: false, code: 'seat_limit', reason: 'seat_limit' }
-        if (!budgetAllows(input.seatHeadroom, count, input.seatReservePct))
+        const { count: accountSeats } = await this.db
+          .prepare(`SELECT count(*) AS count FROM execution_seats s WHERE s.account_id = $1 AND s.seat_key <> $2
+          AND (s.grace_until > clock_timestamp() OR EXISTS (SELECT 1 FROM execution_admissions a
+            WHERE a.seat_key = s.seat_key AND a.seat_generation = s.generation AND a.released_at IS NULL))`)
+          .get(input.accountId, seatKey)
+        if (!budgetAllows(input.seatHeadroom, accountSeats, input.seatReservePct))
           return { ok: false, code: 'seat_budget', reason: 'seat_budget' }
         const free = await this.db
           .prepare(`SELECT n AS slot_index FROM generate_series(0, $2::integer - 1) AS n

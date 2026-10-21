@@ -150,3 +150,13 @@ test('seat budget is shared by one account across different VMs', async (t) => {
   assert.equal(b.code, 'seat_budget')
   await a.release()
 })
+
+test('expired account seats on another VM do not consume the new-device budget', async (t) => {
+  const [first, second] = await replicas(t)
+  const a = await first.tryReserve(candidate({ seatHeadroom: 0.03, seatGraceMs: 1000 }))
+  await a.release()
+  await getDb().prepare("UPDATE execution_seats SET grace_until = clock_timestamp() - interval '1 second'").run()
+  const b = await second.tryReserve(candidate({ vmId: 'vm-2', seatKey: 'device-2', seatHeadroom: 0.03 }))
+  assert.equal(b.ok, true)
+  await b.release()
+})
