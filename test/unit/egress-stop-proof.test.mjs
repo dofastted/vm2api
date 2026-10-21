@@ -127,7 +127,7 @@ test('confirmed egress stop waits for its recorded execution and clears its rece
   const f = fixture(t)
   assert.equal((await f.start()).ok, true)
   const result = await egress.stopEgressProcessConfirmed(f.root, 'synthetic', { termTimeoutMs: 500, killGraceMs: 500 })
-  assert.equal(result.ok, true)
+  assert.equal(result.ok, true, JSON.stringify(result))
   assert.equal(result.ended, true)
   assert.equal(fs.existsSync(path.join(f.dir, 'egress.owner.json')), false)
   assert.equal(fs.existsSync(path.join(f.dir, 'egress.pid')), false)
@@ -272,18 +272,35 @@ test('a Kubernetes Codex exit-policy stop cannot infer another Pod kernel is abs
 
 test('Kubernetes fleet telemetry cannot bypass the persistent helper execution receipt', async () => {
   const source = fs.readFileSync(new URL('../../src/lib/vm/fleet-update.mjs', import.meta.url), 'utf8')
-  const body = source.slice(source.indexOf('export async function restartLocalEgress('), source.indexOf('async function restartLocalServices(')).replace('export ', '')
+  const body = source
+    .slice(
+      source.indexOf('export async function restartLocalEgress('),
+      source.indexOf('async function restartLocalServices('),
+    )
+    .replace('export ', '')
   let legacySignals = 0
   let starts = 0
   const restart = vmContext.runInNewContext(`${body}; restartLocalEgress`, {
-    isLocalEgressProxy: () => false, isKubernetesMode: () => true,
+    isLocalEgressProxy: () => false,
+    isKubernetesMode: () => true,
     runExclusiveProxyEgress: (_root, _id, callback) => callback(),
-    stopEgressProcessConfirmed: async () => ({ ok: false, code: 'egress_owner_unreachable', vmOperationUncertain: true }),
+    stopEgressProcessConfirmed: async () => ({
+      ok: false,
+      code: 'egress_owner_unreachable',
+      vmOperationUncertain: true,
+    }),
     inspectEgressProcess: () => ({ ok: false }),
-    stopEgressProcess: () => { legacySignals++; return { ok: true } },
-    egressPidsForProxyConfig: () => [], drainEgressForProxyConfig: async () => ({ ok: true }),
+    stopEgressProcess: () => {
+      legacySignals++
+      return { ok: true }
+    },
+    egressPidsForProxyConfig: () => [],
+    drainEgressForProxyConfig: async () => ({ ok: true }),
     readEgressListenTcp: () => '',
-    startProxyEgress: async () => { starts++; return { ok: true } },
+    startProxyEgress: async () => {
+      starts++
+      return { ok: true }
+    },
   })
   const result = await restart('/synthetic', { proxy: { id: 'synthetic' } })
   assert.equal(result.ok, false)

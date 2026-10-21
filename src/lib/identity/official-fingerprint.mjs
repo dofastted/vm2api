@@ -133,12 +133,14 @@ export function applyOfficialFingerprintToVm(vmPath, homeDir) {
   }
 }
 
-export function reconcileOfficialFingerprints(projectRoot) {
+export function reconcileOfficialFingerprints(projectRoot, { ids } = {}) {
   const vmsDir = path.join(projectRoot, 'vms')
   const summary = { scanned: 0, reconciled: 0, leftover_removed: 0, replaced_device: 0, skipped: 0 }
   if (!fs.existsSync(vmsDir)) return summary
+  const wanted = ids ? new Set(ids) : null
   for (const name of listVmRecordFiles(vmsDir)) {
     const vmId = name.slice(0, -5)
+    if (wanted && !wanted.has(vmId)) continue
     const vmPath = path.join(vmsDir, name)
     const homeDir = path.join(vmsDir, vmId, 'cli-home')
     summary.scanned += 1

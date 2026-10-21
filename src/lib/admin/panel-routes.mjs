@@ -2383,7 +2383,8 @@ export function createPanelHandler(ctx) {
       }
       // POST /api/panel/vms/fleet-update
       if (req.method === 'POST' && p === '/api/panel/vms/reconcile-fingerprints') {
-        return json(res, 200, panel.ok(reconcileOfficialFingerprints(cfg.paths.project)))
+        const ids = listVms(cfg.paths.project).map((vm) => vm.id)
+        return mutateVms(ids, () => json(res, 200, panel.ok(reconcileOfficialFingerprints(cfg.paths.project, { ids }))))
       }
       if (req.method === 'POST' && p === '/api/panel/vms/fleet-update') {
         const body = await readBody(req, 32 * 1024).catch(() => ({}))
@@ -2748,40 +2749,46 @@ export function createPanelHandler(ctx) {
       // POST /api/panel/vms/:id/collect-identity
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/collect-identity$/.test(p)) {
         const id = p.split('/')[4]
-        const vm = getVm(cfg.paths.project, id)
-        if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        const collected = await collectSlotIdentity(cfg.paths.project, vm)
-        if (!collected.ok) {
-          return json(res, 502, {
-            ok: false,
-            error: { message: collected.error || 'collect failed', code: collected.code },
-          })
-        }
-        return json(res, 200, panel.ok(collected))
+        return mutateVms([id], async (handles) => {
+          const vm = getVm(cfg.paths.project, id)
+          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const collected = await vmEffect(handles.get(id), () =>
+            (ctx.vmMutationOps?.collectSlotIdentity || collectSlotIdentity)(cfg.paths.project, vm),
+          )
+          if (!collected.ok) {
+            return json(res, 502, {
+              ok: false,
+              error: { message: collected.error || 'collect failed', code: collected.code },
+            })
+          }
+          return json(res, 200, panel.ok(collected))
+        })
       }
       if (req.method === 'PATCH' && /^\/api\/panel\/vms\/[^/]+\/owner$/.test(p)) {
         if (panelIdentity(req).role !== 'admin') {
           return json(res, 403, { ok: false, error: { code: 'forbidden', message: '当前权限无法执行此操作' } })
         }
         const id = p.split('/')[4]
-        const vm = getVm(cfg.paths.project, id)
-        if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        const body = await readBody(req, 8192).catch(() => ({}))
-        const nextOwner =
-          body.user_id === null || body.user_id === '' ? null : normalizeOwnerId(body.user_id || body.owner_user_id)
-        if (nextOwner && !(await panelUsers.getById(nextOwner))) {
-          return json(res, 404, { ok: false, error: { message: 'user not found' } })
-        }
-        const currentOrigin = vm.origin || VM_ORIGIN.platform
-        if (!nextOwner && currentOrigin === VM_ORIGIN.userCreated) {
-          return json(res, 400, {
-            ok: false,
-            error: { code: 'cannot_unassign_user_created', message: '自建 VM 不能收回进平台池，请删除' },
-          })
-        }
-        const origin = assignOriginForOwner(nextOwner, { previousOrigin: currentOrigin, actorRole: 'admin' })
-        const saved = persistVmOwner(cfg.paths.project, id, { ownerUserId: nextOwner, origin })
-        return json(res, 200, panel.ok({ vm: summarizeVm(saved, cfg.paths.project, ctx.routingConfig) }))
+        return mutateVms([id], async (handles) => {
+          const vm = getVm(cfg.paths.project, id)
+          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const body = await readBody(req, 8192).catch(() => ({}))
+          const nextOwner =
+            body.user_id === null || body.user_id === '' ? null : normalizeOwnerId(body.user_id || body.owner_user_id)
+          if (nextOwner && !(await panelUsers.getById(nextOwner))) {
+            return json(res, 404, { ok: false, error: { message: 'user not found' } })
+          }
+          const currentOrigin = vm.origin || VM_ORIGIN.platform
+          if (!nextOwner && currentOrigin === VM_ORIGIN.userCreated) {
+            return json(res, 400, {
+              ok: false,
+              error: { code: 'cannot_unassign_user_created', message: '自建 VM 不能收回进平台池，请删除' },
+            })
+          }
+          const origin = assignOriginForOwner(nextOwner, { previousOrigin: currentOrigin, actorRole: 'admin' })
+          const saved = persistVmOwner(cfg.paths.project, id, { ownerUserId: nextOwner, origin })
+          return json(res, 200, panel.ok({ vm: summarizeVm(saved, cfg.paths.project, ctx.routingConfig) }))
+        })
       }
 
       // GET /api/panel/vms/:id
@@ -3735,45 +3742,49 @@ export function createPanelHandler(ctx) {
       // POST /api/panel/vms/:id/reset-fingerprint
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/reset-fingerprint$/.test(p)) {
         const id = p.split('/')[4]
-        const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
-        if (!fs.existsSync(vmPath)) {
-          return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        let vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-        const generated = assignComputerFingerprint(cfg.paths.project, vm, {
-          taken: takenFingerprintKeys(listVms(cfg.paths.project), { exceptId: id }),
+        return mutateVms([id], async (handles) => {
+          const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
+          if (!fs.existsSync(vmPath)) {
+            return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          let vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+          const generated = assignComputerFingerprint(cfg.paths.project, vm, {
+            taken: takenFingerprintKeys(listVms(cfg.paths.project), { exceptId: id }),
+          })
+          vm.timezone = generated.timezone
+          vm.locale = generated.locale
+          vm.fingerprint = applyGeneratedFingerprint({}, generated)
+          vm.updated_at = generated.reset_at
+          atomicWriteJson(vmPath, vm, { mode: 0o600 })
+          writeGuestMachineIdFile(cfg.paths.project, id, generated.guest_machine_id)
+          applyOfficialFingerprintToVm(vmPath, path.join(cfg.paths.project, 'vms', id, 'cli-home'))
+          try {
+            vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+          } catch {}
+          return json(res, 200, panel.ok({ id, fingerprint: vm.fingerprint }))
         })
-        vm.timezone = generated.timezone
-        vm.locale = generated.locale
-        vm.fingerprint = applyGeneratedFingerprint({}, generated)
-        vm.updated_at = generated.reset_at
-        atomicWriteJson(vmPath, vm, { mode: 0o600 })
-        writeGuestMachineIdFile(cfg.paths.project, id, generated.guest_machine_id)
-        applyOfficialFingerprintToVm(vmPath, path.join(cfg.paths.project, 'vms', id, 'cli-home'))
-        try {
-          vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-        } catch {}
-        return json(res, 200, panel.ok({ id, fingerprint: vm.fingerprint }))
       }
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/reconcile-fingerprint$/.test(p)) {
         const id = p.split('/')[4]
-        const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
-        if (!fs.existsSync(vmPath)) {
-          return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        const result = applyOfficialFingerprintToVm(vmPath, officialCcHome(cfg.paths.project, id))
-        const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-        return json(
-          res,
-          200,
-          panel.ok({
-            vm_id: id,
-            ...result,
-            identity_source: vm.fingerprint?.identity_source || null,
-            has_official_user: !!vm.fingerprint?.official_user_id,
-            has_official_machine: !!vm.fingerprint?.official_machine_id,
-          }),
-        )
+        return mutateVms([id], async (handles) => {
+          const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
+          if (!fs.existsSync(vmPath)) {
+            return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          const result = applyOfficialFingerprintToVm(vmPath, officialCcHome(cfg.paths.project, id))
+          const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+          return json(
+            res,
+            200,
+            panel.ok({
+              vm_id: id,
+              ...result,
+              identity_source: vm.fingerprint?.identity_source || null,
+              has_official_user: !!vm.fingerprint?.official_user_id,
+              has_official_machine: !!vm.fingerprint?.official_machine_id,
+            }),
+          )
+        })
       }
 
       // GET /api/panel/vms/:id/seed-settings
@@ -3817,104 +3828,107 @@ export function createPanelHandler(ctx) {
       // PUT /api/panel/vms/:id/seed-settings
       if (req.method === 'PUT' && /^\/api\/panel\/vms\/[^/]+\/seed-settings$/.test(p)) {
         const id = p.split('/')[4]
-        const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
-        if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        const body = await readBody(req, 256 * 1024)
-        const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-        const telemetryWasOff = !isTelemetryEnabled(vm.seed_policy || {})
-        const merged = { ...(vm.seed_policy || {}), ...(body.seed_policy || {}) }
-        for (const k of ['telemetry_disabled', 'reject_client_settings', 'reject_client_metadata_identity']) {
-          if (body[k] !== undefined) merged[k] = !!body[k]
-        }
-        if (body.theme !== undefined) merged.theme = body.theme
-        if (body.extra_env !== undefined) merged.extra_env = body.extra_env
-        if (body.settings_json_override !== undefined) merged.settings_json_override = body.settings_json_override
-        if (body.claude_setting !== undefined) merged.claude_setting = body.claude_setting
-        if (body['claude.setting'] !== undefined) merged.claude_setting = body['claude.setting']
-        const next = defaultSeedPolicy(merged)
-        if (body.settings_json_override !== undefined) next.settings_json_override = body.settings_json_override
-        if (body.extra_env !== undefined) next.extra_env = body.extra_env || {}
-        const followProxyTz = body?.timezone_follow_proxy === true || body?.timezoneFollowProxy === true
-        const hasTimezone = body && Object.prototype.hasOwnProperty.call(body, 'timezone')
-        const hasLocale = body && Object.prototype.hasOwnProperty.call(body, 'locale')
-        let nextLocale = null
-        if (hasLocale) {
-          const requestedLocale = body.locale == null || body.locale === '' ? STANDARD_LOCALE : String(body.locale)
-          if (!SLOT_LOCALES.includes(requestedLocale)) {
-            return json(res, 400, {
-              ok: false,
-              error: { code: 'invalid_locale', message: `语言必须是 ${SLOT_LOCALES.join('、')}` },
+        return mutateProxyVms([id], async (handles) => {
+          const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
+          if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const body = await readBody(req, 256 * 1024)
+          const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+          const telemetryWasOff = !isTelemetryEnabled(vm.seed_policy || {})
+          const merged = { ...(vm.seed_policy || {}), ...(body.seed_policy || {}) }
+          for (const k of ['telemetry_disabled', 'reject_client_settings', 'reject_client_metadata_identity']) {
+            if (body[k] !== undefined) merged[k] = !!body[k]
+          }
+          if (body.theme !== undefined) merged.theme = body.theme
+          if (body.extra_env !== undefined) merged.extra_env = body.extra_env
+          if (body.settings_json_override !== undefined) merged.settings_json_override = body.settings_json_override
+          if (body.claude_setting !== undefined) merged.claude_setting = body.claude_setting
+          if (body['claude.setting'] !== undefined) merged.claude_setting = body['claude.setting']
+          const next = defaultSeedPolicy(merged)
+          if (body.settings_json_override !== undefined) next.settings_json_override = body.settings_json_override
+          if (body.extra_env !== undefined) next.extra_env = body.extra_env || {}
+          const followProxyTz = body?.timezone_follow_proxy === true || body?.timezoneFollowProxy === true
+          const hasTimezone = body && Object.prototype.hasOwnProperty.call(body, 'timezone')
+          const hasLocale = body && Object.prototype.hasOwnProperty.call(body, 'locale')
+          let nextLocale = null
+          if (hasLocale) {
+            const requestedLocale = body.locale == null || body.locale === '' ? STANDARD_LOCALE : String(body.locale)
+            if (!SLOT_LOCALES.includes(requestedLocale)) {
+              return json(res, 400, {
+                ok: false,
+                error: { code: 'invalid_locale', message: `语言必须是 ${SLOT_LOCALES.join('、')}` },
+              })
+            }
+            nextLocale = requestedLocale
+          }
+          if (hasTimezone) {
+            const zone = validTimezone(body.timezone)
+            if (!zone) {
+              return json(res, 400, {
+                ok: false,
+                error: {
+                  type: 'invalid_request_error',
+                  code: 'invalid_timezone',
+                  message: '时区必须是有效的 IANA 名称，如 Asia/Tokyo',
+                  param: 'timezone',
+                },
+              })
+            }
+            const pinned = persistVmTimezone(cfg.paths.project, id, zone, { source: 'manual' })
+            if (!pinned) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+            Object.assign(vm, pinned)
+          } else if (followProxyTz) {
+            const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, { force: true })
+            if (!synced.ok) {
+              return json(res, 400, {
+                ok: false,
+                error: {
+                  type: 'invalid_request_error',
+                  code: synced.reason || 'proxy_timezone_unknown',
+                  message: '未能从代理节点取到时区，请先检测代理地理位置',
+                },
+              })
+            }
+            if (synced.applied) {
+              const fresh = getVm(cfg.paths.project, id)
+              if (fresh) Object.assign(vm, fresh)
+            } else if (synced.timezone) {
+              vm.timezone = synced.timezone
+              vm.timezone_source = 'proxy_geo'
+            }
+          }
+          if (nextLocale) vm.locale = nextLocale
+          vm.seed_policy = next
+          vm.updated_at = new Date().toISOString()
+          atomicWriteJson(vmPath, vm, { mode: 0o600 })
+          const written = writeSlotSeedFiles(cfg.paths.project, vm, next)
+          let service = null
+          if (
+            vm.status === 'running' &&
+            (next.telemetry_disabled !== telemetryWasOff || body.telemetry_service_restart === true)
+          ) {
+            const report = await (ctx.vmMutationOps?.runFleetUpdate || runFleetUpdate)(cfg.paths.project, {
+              action: 'telemetry',
+              ids: [id],
+              concurrency: 1,
+              routing: ctx.routingConfig,
             })
+            service = report.items?.[0] || report
+            await vmEffect(handles.get(id), async () => service)
           }
-          nextLocale = requestedLocale
-        }
-        if (hasTimezone) {
-          const zone = validTimezone(body.timezone)
-          if (!zone) {
-            return json(res, 400, {
-              ok: false,
-              error: {
-                type: 'invalid_request_error',
-                code: 'invalid_timezone',
-                message: '时区必须是有效的 IANA 名称，如 Asia/Tokyo',
-                param: 'timezone',
-              },
-            })
-          }
-          const pinned = persistVmTimezone(cfg.paths.project, id, zone, { source: 'manual' })
-          if (!pinned) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-          Object.assign(vm, pinned)
-        } else if (followProxyTz) {
-          const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, { force: true })
-          if (!synced.ok) {
-            return json(res, 400, {
-              ok: false,
-              error: {
-                type: 'invalid_request_error',
-                code: synced.reason || 'proxy_timezone_unknown',
-                message: '未能从代理节点取到时区，请先检测代理地理位置',
-              },
-            })
-          }
-          if (synced.applied) {
-            const fresh = getVm(cfg.paths.project, id)
-            if (fresh) Object.assign(vm, fresh)
-          } else if (synced.timezone) {
-            vm.timezone = synced.timezone
-            vm.timezone_source = 'proxy_geo'
-          }
-        }
-        if (nextLocale) vm.locale = nextLocale
-        vm.seed_policy = next
-        vm.updated_at = new Date().toISOString()
-        atomicWriteJson(vmPath, vm, { mode: 0o600 })
-        const written = writeSlotSeedFiles(cfg.paths.project, vm, next)
-        let service = null
-        if (
-          vm.status === 'running' &&
-          (next.telemetry_disabled !== telemetryWasOff || body.telemetry_service_restart === true)
-        ) {
-          const report = await runFleetUpdate(cfg.paths.project, {
-            action: 'telemetry',
-            ids: [id],
-            concurrency: 1,
-            routing: ctx.routingConfig,
-          })
-          service = report.items?.[0] || report
-        }
-        return json(
-          res,
-          200,
-          panel.ok({
-            vm_id: id,
-            seed_policy: next,
-            ...seedTelemetryContract(next),
-            settings_json: written.settings || null,
-            claude_setting: written.claude_setting || '',
-            kin_seed: written.kin_seed || null,
-            service,
-          }),
-        )
+          return json(
+            res,
+            200,
+            panel.ok({
+              vm_id: id,
+              seed_policy: next,
+              ...seedTelemetryContract(next),
+              settings_json: written.settings || null,
+              claude_setting: written.claude_setting || '',
+              kin_seed: written.kin_seed || null,
+              service,
+            }),
+          )
+        })
       }
 
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/wrap-cli\/promote$/.test(p)) {
@@ -3928,56 +3942,63 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/wrap-cli\/repair$/.test(p)) {
         const id = p.split('/')[4]
-        const body = await readBody(req, 8 * 1024).catch(() => ({}))
-        const mode = body.mode === 'traits' ? 'traits' : 'keep'
-        const vm = getVm(cfg.paths.project, id)
-        if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        if (isCodexVm(vm)) {
-          return json(res, 409, {
-            ok: false,
-            error: { code: 'codex_kernel_only', message: 'Codex 槽只使用控制面 Codex kernel' },
-          })
-        }
-        if (slotHost(vm).bakedKernel) {
-          const refreshed = await refreshCluster(cfg.paths.project, [vm], { routing: ctx.routingConfig })
-          const item = refreshed.items[0] || {
-            ok: false,
-            code: 'slot_payload_refresh_failed',
-            error: '集群槽换镜像失败',
-          }
-          if (!item.ok) return json(res, 400, { ok: false, error: { code: item.code, message: item.error } })
-          return json(
-            res,
-            200,
-            panel.ok({ mode, wrap: { ok: true, baked: true, image: item.image }, kernel: item.kernel }),
-          )
-        }
-        if (mode === 'traits') {
-          const gone = await destroySlot(vm)
-          if (!gone.ok)
-            return json(res, 500, { ok: false, error: { code: gone.code, message: gone.error || '重建新特征失败' } })
-          const rebuilt = recreateVmFiles(cfg.paths.project, vm, { mode: 'traits' })
-          const boot = await startSlotReady(rebuilt.vm, cfg.paths.project, {
-            recreate: true,
-            routing: ctx.routingConfig,
-          })
-          if (!boot.ok)
-            return json(res, 500, {
+        return mutateVms([id], async (handles) => {
+          const body = await readBody(req, 8 * 1024).catch(() => ({}))
+          const mode = body.mode === 'traits' ? 'traits' : 'keep'
+          const vm = getVm(cfg.paths.project, id)
+          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          if (isCodexVm(vm)) {
+            return json(res, 409, {
               ok: false,
-              error: { code: boot.code, message: boot.error || '重建新特征后启动失败' },
+              error: { code: 'codex_kernel_only', message: 'Codex 槽只使用控制面 Codex kernel' },
             })
-          return json(res, 200, panel.ok({ mode, rebuild: 'traits', boot: panel.publicSlotBoot(boot) }))
-        }
-        const wrap = materializeWrapCli(cfg.paths.project, vm)
-        if (!wrap.ok) return json(res, 400, { ok: false, error: { code: wrap.code, message: wrap.error } })
-        writeKernelConfig(cfg.paths.project, vm, { routing: ctx.routingConfig })
+          }
+          if (slotHost(vm).bakedKernel) {
+            const refreshed = await refreshCluster(cfg.paths.project, [vm], { routing: ctx.routingConfig })
+            const item = refreshed.items[0] || {
+              ok: false,
+              code: 'slot_payload_refresh_failed',
+              error: '集群槽换镜像失败',
+            }
+            await vmEffect(handles.get(id), async () => item)
+            if (!item.ok) return json(res, 400, { ok: false, error: { code: item.code, message: item.error } })
+            return json(
+              res,
+              200,
+              panel.ok({ mode, wrap: { ok: true, baked: true, image: item.image }, kernel: item.kernel }),
+            )
+          }
+          if (mode === 'traits') {
+            const gone = await vmEffect(handles.get(id), () => (ctx.vmMutationOps?.destroySlot || destroySlot)(vm))
+            if (!gone.ok)
+              return json(res, 500, { ok: false, error: { code: gone.code, message: gone.error || '重建新特征失败' } })
+            const rebuilt = recreateVmFiles(cfg.paths.project, vm, { mode: 'traits' })
+            const boot = await vmEffect(handles.get(id), () =>
+              (ctx.vmMutationOps?.startSlotReady || startSlotReady)(rebuilt.vm, cfg.paths.project, {
+                recreate: true,
+                routing: ctx.routingConfig,
+              }),
+            )
+            if (!boot.ok)
+              return json(res, 500, {
+                ok: false,
+                error: { code: boot.code, message: boot.error || '重建新特征后启动失败' },
+              })
+            return json(res, 200, panel.ok({ mode, rebuild: 'traits', boot: panel.publicSlotBoot(boot) }))
+          }
+          const wrap = materializeWrapCli(cfg.paths.project, vm)
+          if (!wrap.ok) return json(res, 400, { ok: false, error: { code: wrap.code, message: wrap.error } })
+          writeKernelConfig(cfg.paths.project, vm, { routing: ctx.routingConfig })
 
-        let kernel = { ok: false, skipped: true, reason: 'engine_not_rust' }
-        if (resolveInferenceEngine(vm, ctx.routingConfig) === 'rust') {
-          kernel = await restartRustKernel(slotExec(cfg.paths.project, vm))
-        }
+          let kernel = { ok: false, skipped: true, reason: 'engine_not_rust' }
+          if (resolveInferenceEngine(vm, ctx.routingConfig) === 'rust') {
+            kernel = await vmEffect(handles.get(id), () =>
+              (ctx.vmMutationOps?.restartRustKernel || restartRustKernel)(slotExec(cfg.paths.project, vm)),
+            )
+          }
 
-        return json(res, 200, panel.ok({ mode, wrap, kernel }))
+          return json(res, 200, panel.ok({ mode, wrap, kernel }))
+        })
       }
 
       if (req.method === 'GET' && /^\/api\/panel\/vms\/[^/]+\/official-cc-bootstrap$/.test(p)) {

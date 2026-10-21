@@ -11,6 +11,7 @@ import { rustKernelHealth } from '../transport/rust-kernel-client.mjs'
 import { restartTelemetrySidecar } from './slot-process-status.mjs'
 import { isNativeNodeVm, vmNodeId } from '../cluster/placement.mjs'
 import { slotHost } from './slot-host.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 import { restartRemoteServices } from '../cluster/remote-slot.mjs'
 import {
   drainEgressForProxyConfig,
@@ -21,6 +22,7 @@ import {
   runExclusiveProxyEgress,
   startProxyEgress,
   stopEgressProcess,
+  stopEgressProcessConfirmed,
   waitEgressExit,
   waitPortReleased,
 } from './egress.mjs'
@@ -31,6 +33,13 @@ export async function restartLocalEgress(projectRoot, vm, opts = {}) {
   if (isLocalEgressProxy(vm.proxy)) return { ok: true, egress: 'local' }
   const proxyId = vm.proxy?.id
   return runExclusiveProxyEgress(projectRoot, proxyId, async () => {
+    if (isKubernetesMode()) {
+      const stopped = await stopEgressProcessConfirmed(projectRoot, proxyId)
+      if (!stopped.ok) return { ...stopped, action: 'egress_stop_failed' }
+      const started = await startProxyEgress(projectRoot, vm.proxy, opts)
+      if (!started?.ok) return { ...started, ok: false, action: 'egress_start_failed', vmOperationUncertain: true }
+      return { ok: true, egress: 'restarted', pid: started.pid }
+    }
     const running = inspectEgressProcess(projectRoot, proxyId)
     const stopped = stopEgressProcess(projectRoot, proxyId)
     if (!stopped.ok) return { ok: false, action: 'egress_stop_failed', error: stopped.error }
