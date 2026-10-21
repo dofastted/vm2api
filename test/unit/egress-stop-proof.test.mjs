@@ -211,6 +211,52 @@ test('a confirmed helper stop may retain the same network with known container e
   assert.equal(result.ended, false) // standalone legacy compatibility is not a termination proof.
 })
 
+test('known attached endpoints retain their network without attempting removal', async (t) => {
+  const f = fixture(t)
+  const result = await stopProxyEgress(f.root, 'synthetic', {
+    ...noDocker,
+    runDocker: (args) => {
+      assert.equal(args[1], 'inspect')
+      return {
+        ok: true,
+        stdout: '192.0.2.0/24|192.0.2.1|same-network-id|{"immutableContainer":{"Name":"kin-synthetic"}}',
+      }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.network_retained, true)
+})
+
+for (const mode of ['replacement', 'permission', 'malformed']) {
+  test(`attached endpoints cannot conceal an unknown network identity (${mode})`, async (t) => {
+    const f = fixture(t)
+    let inspected = false
+    const result = await stopProxyEgress(f.root, 'synthetic', {
+      ...noDocker,
+      runDocker: () => {
+        if (!inspected) {
+          inspected = true
+          return {
+            ok: true,
+            stdout: '192.0.2.0/24|192.0.2.1|original-network-id|{"immutableContainer":{"Name":"kin-synthetic"}}',
+          }
+        }
+        if (mode === 'permission') return { ok: false, stderr: 'permission denied connecting to Docker daemon' }
+        return {
+          ok: true,
+          stdout:
+            '192.0.2.0/24|192.0.2.1|' +
+            (mode === 'replacement' ? 'replacement-network-id' : 'original-network-id') +
+            '|' +
+            (mode === 'malformed' ? '{"immutableContainer":{}}' : '{"immutableContainer":{"Name":"kin-synthetic"}}'),
+        }
+      },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.vmOperationUncertain, true)
+  })
+}
+
 for (const mode of ['normal', 'noop', 'replacement']) {
   test(`proxy network teardown verifies immutable ID and observed absence (${mode})`, async (t) => {
     const f = fixture(t)

@@ -322,7 +322,13 @@ export function readEgressListenTcp(projectRoot, proxyId) {
 export function inspectEgressNetwork(proxyId, run = docker, { strict = false, target = null } = {}) {
   const name = target || networkName(proxyId)
   if (!name) return null
-  const r = run(['network', 'inspect', '-f', '{{range .IPAM.Config}}{{.Subnet}}|{{.Gateway}}{{end}}|{{.Id}}', name])
+  const r = run([
+    'network',
+    'inspect',
+    '-f',
+    '{{range .IPAM.Config}}{{.Subnet}}|{{.Gateway}}{{end}}|{{.Id}}|{{json .Containers}}',
+    name,
+  ])
   if (!r.ok) {
     if (
       strict &&
@@ -334,12 +340,29 @@ export function inspectEgressNetwork(proxyId, run = docker, { strict = false, ta
     }
     return null
   }
-  const [subnet, gateway, id] = String(r.stdout || '').split('|')
+  const [subnet, gateway, id, attached] = String(r.stdout || '').split('|')
   if (strict && !id?.trim())
     throw Object.assign(new Error('Docker network identity unavailable'), { code: 'egress_network_unknown' })
+  let containers = null
+  if (attached) {
+    try {
+      containers = JSON.parse(attached)
+      if (
+        !containers ||
+        Array.isArray(containers) ||
+        typeof containers !== 'object' ||
+        Object.values(containers).some((item) => !item || typeof item.Name !== 'string' || !item.Name)
+      )
+        throw new Error('Invalid Docker network endpoints')
+    } catch (error) {
+      if (strict) throw Object.assign(error, { code: 'egress_network_unknown' })
+      containers = null
+    }
+  }
   return {
     name,
     id: id?.trim() || null,
+    containers,
     network: name,
     subnet: String(subnet || '').trim(),
     gateway: String(gateway || '').trim() || gatewayFromSubnet(String(subnet || '').trim()),
@@ -1077,7 +1100,29 @@ export function stopProxyEgress(projectRoot, proxyId, { subnet, runDocker = dock
       const rules = removeIptables(plan, runIptables, { strict: true })
       if (!rules.ok) return { ...rules, vmOperationUncertain: true }
       if (net) {
-        runDocker(['network', 'rm', net.id])
+        const retained = () => {
+          const byId = inspectEgressNetwork(proxyId, runDocker, { strict: true, target: net.id })
+          const byName = inspectEgressNetwork(proxyId, runDocker, { strict: true })
+          if (
+            byId?.id !== net.id ||
+            byName?.id !== net.id ||
+            !Object.keys(byId.containers || {}).length ||
+            !Object.keys(byName.containers || {}).length
+          )
+            throw new Error('Attached egress network identity was not confirmed')
+          return { ok: true, ended: stopped.ended, network_retained: true, ...(stopped.legacy ? { legacy: true } : {}) }
+        }
+        // Unbinding edits VM metadata; an idle container may intentionally remain
+        // attached until its next recreation. Its network is not an active helper.
+        if (Object.keys(net.containers || {}).length) return retained()
+        const removed = runDocker(['network', 'rm', net.id])
+        if (
+          !removed.ok &&
+          /^Error response from daemon: error while removing network: network [^\r\n]+ has active endpoints(?:[^\r\n]*)$/i.test(
+            String(removed.stderr || '').trim(),
+          )
+        )
+          return retained()
         if (
           inspectEgressNetwork(proxyId, runDocker, { strict: true, target: net.id }) ||
           inspectEgressNetwork(proxyId, runDocker, { strict: true })
