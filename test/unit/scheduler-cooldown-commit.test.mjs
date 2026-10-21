@@ -61,7 +61,8 @@ test('a rejected cooldown observation cannot invalidate the current shared accou
   let releases = 0
   const runner = new FailoverRunner({
     scheduler: {
-      async selectAndReserve() {
+      async selectAndReserve({ excluded }) {
+        if (excluded.has('account-cooldown')) return { ok: false, reason: 'no_eligible_accounts' }
         return { ok: true, accountId: 'account-cooldown', vmId: 'vm-cooldown', release() {} }
       },
       async markCooldown() {
