@@ -4,8 +4,20 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { SlotgateClient } from '../../src/lib/transport/slotgate-client.mjs'
-import { workerHealth, ensureWorkerCredential, callGoWorker, streamGoWorker, callWorkerGet, countTokensViaWorker } from '../../src/lib/transport/go-worker-client.mjs'
-import { clearRustHealthCache, dispatchCallInference, rememberRustHealth, peekRustHealth } from '../../src/lib/transport/kernel-router.mjs'
+import {
+  workerHealth,
+  ensureWorkerCredential,
+  callGoWorker,
+  streamGoWorker,
+  callWorkerGet,
+  countTokensViaWorker,
+} from '../../src/lib/transport/go-worker-client.mjs'
+import {
+  clearRustHealthCache,
+  dispatchCallInference,
+  rememberRustHealth,
+  peekRustHealth,
+} from '../../src/lib/transport/kernel-router.mjs'
 import { fakeSlotgate, syntheticFence } from '../fixtures/fake-slotgate.mjs'
 
 function manifest(config) {
@@ -15,13 +27,26 @@ function manifest(config) {
 
 function receipt(config) {
   return {
-    intent: { action: 'launch', node_id: config.nodeId, vm_id: config.vmId,
-      allocation_id: 'synthetic-allocation', operation_id: 'synthetic-operation',
-      owner_id: 'synthetic-owner', command_id: 'synthetic-launch', epoch: '1',
+    intent: {
+      action: 'launch',
+      node_id: config.nodeId,
+      vm_id: config.vmId,
+      allocation_id: 'synthetic-allocation',
+      operation_id: 'synthetic-operation',
+      owner_id: 'synthetic-owner',
+      command_id: 'synthetic-launch',
+      epoch: '1',
       fence: { generation: 1, incarnation: config.fence.incarnation, executor: { kind: '', node_boot_id: '' } },
-      expected_manifest_revision: '1', manifest_revision: '1', payload_digest: '',
-      preset_id: 'claude-docker-v1', policy_digest: 'c'.repeat(64), manifest_digest: config.manifest.digest },
-    intent_digest: 'd'.repeat(64), manifest_revision: '1', manifest_digest: config.manifest.digest,
+      expected_manifest_revision: '1',
+      manifest_revision: '1',
+      payload_digest: '',
+      preset_id: 'claude-docker-v1',
+      policy_digest: 'c'.repeat(64),
+      manifest_digest: config.manifest.digest,
+    },
+    intent_digest: 'd'.repeat(64),
+    manifest_revision: '1',
+    manifest_digest: config.manifest.digest,
     fence: structuredClone(config.fence),
   }
 }
@@ -29,9 +54,12 @@ function receipt(config) {
 async function capture(config, patch = {}) {
   const { captureNodeExecution } = await import('../../src/lib/cluster/node-execution-capabilities.mjs')
   return captureNodeExecution({
-    db: { schema: 'synthetic_capability' }, vmId: config.vmId, accountId: 'synthetic-account',
+    db: { schema: 'synthetic_capability' },
+    vmId: config.vmId,
+    accountId: 'synthetic-account',
     trustedNodes: { [config.nodeId]: { ...config.link, presetId: 'claude-docker-v1', policyDigest: 'c'.repeat(64) } },
-    readLaunchReceipt: async () => receipt(config), ...patch,
+    readLaunchReceipt: async () => receipt(config),
+    ...patch,
   })
 }
 
@@ -45,7 +73,10 @@ test('capture obtains the original ACTIVE fence from the PG receipt and confirms
   assert.equal(result.nodeManifest.epoch, '1')
   assert.equal(Object.isFrozen(result.slotgate.link), true)
   assert.equal(Object.isFrozen(result.slotgate.fence.executor), true)
-  assert.deepEqual(fx.requests.map((value) => value.op), ['health'])
+  assert.deepEqual(
+    fx.requests.map((value) => value.op),
+    ['health'],
+  )
   assert.equal(fx.requests[0].manifest_revision, '1')
   assert.equal(fx.requests[0].manifest_digest, 'b'.repeat(64))
 })
@@ -53,10 +84,17 @@ test('capture obtains the original ACTIVE fence from the PG receipt and confirms
 test('capture rejects missing PG proof and untrusted links before a node request', async (t) => {
   const fx = await fakeSlotgate(t)
   manifest(fx.config)
-  await assert.rejects(capture(fx.config, { readLaunchReceipt: async () => null }), { code: 'node_capability_unavailable' })
+  await assert.rejects(capture(fx.config, { readLaunchReceipt: async () => null }), {
+    code: 'node_capability_unavailable',
+  })
   await assert.rejects(capture(fx.config, { trustedNodes: {} }), { code: 'node_capability_unavailable' })
   await assert.rejects(capture(fx.config, { nodeId: 'other-node' }), { code: 'node_capability_unavailable' })
-  await assert.rejects(capture(fx.config, { trustedNodes: { [fx.config.nodeId]: { ...fx.config.link, presetId: 'codex', policyDigest: 'c'.repeat(64) } } }), { code: 'node_capability_unavailable' })
+  await assert.rejects(
+    capture(fx.config, {
+      trustedNodes: { [fx.config.nodeId]: { ...fx.config.link, presetId: 'codex', policyDigest: 'c'.repeat(64) } },
+    }),
+    { code: 'node_capability_unavailable' },
+  )
   assert.equal(fx.requests.length, 0)
 })
 
@@ -64,33 +102,51 @@ test('capture does not adopt a fresh PG receipt after its original node health c
   const fx = await fakeSlotgate(t)
   manifest(fx.config)
   let reads = 0
-  await assert.rejects(capture(fx.config, { readLaunchReceipt: async () => {
-    const value = receipt(fx.config)
-    if (++reads > 1) value.intent.epoch = '2'
-    return value
-  } }), { code: 'node_capability_changed' })
+  await assert.rejects(
+    capture(fx.config, {
+      readLaunchReceipt: async () => {
+        const value = receipt(fx.config)
+        if (++reads > 1) value.intent.epoch = '2'
+        return value
+      },
+    }),
+    { code: 'node_capability_changed' },
+  )
   assert.equal(reads, 2)
-  assert.deepEqual(fx.requests.map((value) => value.op), ['health'])
+  assert.deepEqual(
+    fx.requests.map((value) => value.op),
+    ['health'],
+  )
 })
 
 test('capture refuses a different account without preparing inference', async (t) => {
   const fx = await fakeSlotgate(t)
   manifest(fx.config)
   await assert.rejects(capture(fx.config, { accountId: 'other-account' }), { code: 'node_account_mismatch' })
-  assert.deepEqual(fx.requests.map((value) => value.op), ['health'])
+  assert.deepEqual(
+    fx.requests.map((value) => value.op),
+    ['health'],
+  )
 })
 
 test('capture snapshots fixed TLS configuration before awaiting the PG receipt', async (t) => {
   const fx = await fakeSlotgate(t)
   manifest(fx.config)
-  const trustedNodes = new Map([[fx.config.nodeId, { ...fx.config.link, presetId: 'claude-docker-v1', policyDigest: 'c'.repeat(64) }]])
+  const trustedNodes = new Map([
+    [fx.config.nodeId, { ...fx.config.link, presetId: 'claude-docker-v1', policyDigest: 'c'.repeat(64) }],
+  ])
   let resume
-  const blocked = new Promise((resolve) => { resume = resolve })
+  const blocked = new Promise((resolve) => {
+    resume = resolve
+  })
   let reads = 0
-  const pending = capture(fx.config, { trustedNodes, readLaunchReceipt: async () => {
-    if (++reads === 1) await blocked
-    return receipt(fx.config)
-  } })
+  const pending = capture(fx.config, {
+    trustedNodes,
+    readLaunchReceipt: async () => {
+      if (++reads === 1) await blocked
+      return receipt(fx.config)
+    },
+  })
   // Wait until capture has entered its original lookup, not until node IO.
   await new Promise((resolve) => setImmediate(resolve))
   trustedNodes.get(fx.config.nodeId).certSha256 = '0'.repeat(64)
@@ -101,65 +157,122 @@ test('capture snapshots fixed TLS configuration before awaiting the PG receipt',
 
 for (const account of [undefined, null, '', 'other-account']) {
   test(`capture does not authorize account by display email or conflicting identity (${account})`, async (t) => {
-    const fx = await fakeSlotgate(t, { health: (command) => ({
-      ok: true, fence: command.fence, manifest_revision: command.manifest_revision, manifest_digest: command.manifest_digest,
-      health: { ok: true, credential: { has_access: true, account_uuid: account, email: 'synthetic-account' },
-        identity: { account_uuid: 'synthetic-account' } },
-    }) })
+    const fx = await fakeSlotgate(t, {
+      health: (command) => ({
+        ok: true,
+        fence: command.fence,
+        manifest_revision: command.manifest_revision,
+        manifest_digest: command.manifest_digest,
+        health: {
+          ok: true,
+          credential: { has_access: true, account_uuid: account, email: 'synthetic-account' },
+          identity: { account_uuid: 'synthetic-account' },
+        },
+      }),
+    })
     manifest(fx.config)
     await assert.rejects(capture(fx.config), { code: 'node_account_mismatch' })
-    assert.deepEqual(fx.requests.map((value) => value.op), ['health'])
+    assert.deepEqual(
+      fx.requests.map((value) => value.op),
+      ['health'],
+    )
   })
 }
 
 test('a PG receipt failure has no TLS or legacy fallback', async (t) => {
   const fx = await fakeSlotgate(t)
   manifest(fx.config)
-  await assert.rejects(capture(fx.config, { readLaunchReceipt: async () => { throw Object.assign(new Error('synthetic PG failure'), { code: 'synthetic_pg_failure' }) } }), { code: 'synthetic_pg_failure' })
+  await assert.rejects(
+    capture(fx.config, {
+      readLaunchReceipt: async () => {
+        throw Object.assign(new Error('synthetic PG failure'), { code: 'synthetic_pg_failure' })
+      },
+    }),
+    { code: 'synthetic_pg_failure' },
+  )
   assert.equal(fx.requests.length, 0)
 })
 
 test('health cache separates captured fences and manifests and VM invalidation clears each', async () => {
   clearRustHealthCache()
-  const first = { vmId: 'cache-vm', slotgate: { fence: syntheticFence(), manifest: { revision: '1', digest: 'a'.repeat(64) } } }
+  const first = {
+    vmId: 'cache-vm',
+    slotgate: { fence: syntheticFence(), manifest: { revision: '1', digest: 'a'.repeat(64) } },
+  }
   rememberRustHealth(first, { ok: true, health: { ok: true } })
   assert.equal(peekRustHealth(first, 1000).health.ok, true)
   const next = { ...first, slotgate: { ...first.slotgate, fence: syntheticFence('2') } }
   assert.equal(peekRustHealth(next, 1000), null)
-  const changedManifest = { ...first, slotgate: { ...first.slotgate, manifest: { revision: '2', digest: 'b'.repeat(64) } } }
+  const changedManifest = {
+    ...first,
+    slotgate: { ...first.slotgate, manifest: { revision: '2', digest: 'b'.repeat(64) } },
+  }
   assert.equal(peekRustHealth(changedManifest, 1000), null)
   clearRustHealthCache('cache-vm')
   assert.equal(peekRustHealth(first, 1000), null)
 })
 
 test('typed health returns only public fields and never needs a Pod kernel token', async (t) => {
-  const fx = await fakeSlotgate(t, { health: (command) => ({
-    ok: true, fence: command.fence, manifest_revision: command.manifest_revision, manifest_digest: command.manifest_digest,
-    health: { ok: true, engine: 'rust', ready_slots: 2, healthy: true, internal_token: 'must-not-escape',
-      credential: { has_access: true, has_refresh: true, generation: 'g1', expires_at: 1981929600000,
-        account_uuid: 'synthetic-account', org_uuid: 'synthetic-org', email: 'synthetic@example.invalid',
-        access_token: 'must-not-escape', refresh_token: 'must-not-escape', provider_extension: { secret: 'must-not-escape' } } },
-  }) })
+  const fx = await fakeSlotgate(t, {
+    health: (command) => ({
+      ok: true,
+      fence: command.fence,
+      manifest_revision: command.manifest_revision,
+      manifest_digest: command.manifest_digest,
+      health: {
+        ok: true,
+        engine: 'rust',
+        ready_slots: 2,
+        healthy: true,
+        internal_token: 'must-not-escape',
+        credential: {
+          has_access: true,
+          has_refresh: true,
+          generation: 'g1',
+          expires_at: 1981929600000,
+          account_uuid: 'synthetic-account',
+          org_uuid: 'synthetic-org',
+          email: 'synthetic@example.invalid',
+          access_token: 'must-not-escape',
+          refresh_token: 'must-not-escape',
+          provider_extension: { secret: 'must-not-escape' },
+        },
+      },
+    }),
+  })
   const config = manifest(fx.config)
   const value = await workerHealth({ vmId: config.vmId, slotgate: config })
   assert.equal(value.ok, true)
   assert.equal(value.credential.account_uuid, 'synthetic-account')
   assert.equal(JSON.stringify(value).includes('must-not-escape'), false)
-  assert.deepEqual(fx.requests.map((entry) => entry.op), ['health'])
+  assert.deepEqual(
+    fx.requests.map((entry) => entry.op),
+    ['health'],
+  )
 })
 
 for (const kind of ['fence', 'manifest', 'missing']) {
   test(`typed health rejects ${kind} proof and never prepares inference`, async (t) => {
-    const fx = await fakeSlotgate(t, { health: (command) => kind === 'missing' ? { ok: true, health: { ok: true } } : {
-      ok: true, fence: kind === 'fence' ? syntheticFence('2') : command.fence,
-      manifest_revision: kind === 'manifest' ? '2' : command.manifest_revision,
-      manifest_digest: command.manifest_digest, health: { ok: true, healthy: true, ready_slots: 1 },
-    } })
+    const fx = await fakeSlotgate(t, {
+      health: (command) =>
+        kind === 'missing'
+          ? { ok: true, health: { ok: true } }
+          : {
+              ok: true,
+              fence: kind === 'fence' ? syntheticFence('2') : command.fence,
+              manifest_revision: kind === 'manifest' ? '2' : command.manifest_revision,
+              manifest_digest: command.manifest_digest,
+              health: { ok: true, healthy: true, ready_slots: 1 },
+            },
+    })
     manifest(fx.config)
     const value = await workerHealth({ vmId: fx.config.vmId, slotgate: fx.config })
     assert.equal(value.ok, false)
     assert.equal(value.code, 'slotgate_health_unconfirmed')
-    assert.deepEqual(fx.requests.map((entry) => entry.op), ['health'])
+    assert.deepEqual(
+      fx.requests.map((entry) => entry.op),
+      ['health'],
+    )
   })
 }
 
@@ -170,7 +283,10 @@ test('typed health observes cancellation without a legacy cancel request', async
   const pending = client.health({ signal: controller.signal, timeoutMs: 1000 })
   setTimeout(() => controller.abort(), 40)
   await assert.rejects(pending, { code: 'ABORT_ERR' })
-  assert.equal(fx.requests.every((value) => value.op === 'health'), true)
+  assert.equal(
+    fx.requests.every((value) => value.op === 'health'),
+    true,
+  )
 })
 
 test('fenced router never creates Pod credential links or reads a host kernel binary', async (t) => {
@@ -188,7 +304,10 @@ test('fenced router never creates Pod credential links or reads a host kernel bi
   assert.equal(result.ok, true)
   assert.equal(result.execution.ended, true)
   assert.equal(fs.existsSync(homeDir), false)
-  assert.deepEqual(fx.requests.map((value) => value.op), ['health', 'prepare', 'forward', 'command'])
+  assert.deepEqual(
+    fx.requests.map((value) => value.op),
+    ['health', 'prepare', 'forward', 'command'],
+  )
 })
 
 test('fenced credential ensure fails before touching a Pod credential file', async (t) => {
@@ -210,10 +329,18 @@ test('HA transport refuses a missing trusted capability before mock or legacy ex
   process.env.VM2API_CONTROL_PLANE_MODE = 'kubernetes-ha'
   process.env.KIN_CRS_MOCK = '1'
   try {
-    await assert.rejects(callGoWorker({ exec: { vmId: 'legacy-vm' }, envelope: { body: {} } }), { code: 'slotgate_capability_required' })
-    await assert.rejects(streamGoWorker({ exec: { vmId: 'legacy-vm' }, envelope: { body: {} } }), { code: 'slotgate_capability_required' })
-    await assert.rejects(callWorkerGet({ vmId: 'legacy-vm' }, '/internal/v1/models'), { code: 'slotgate_capability_required' })
-    await assert.rejects(countTokensViaWorker({ vmId: 'legacy-vm' }, { body: {} }), { code: 'slotgate_capability_required' })
+    await assert.rejects(callGoWorker({ exec: { vmId: 'legacy-vm' }, envelope: { body: {} } }), {
+      code: 'slotgate_capability_required',
+    })
+    await assert.rejects(streamGoWorker({ exec: { vmId: 'legacy-vm' }, envelope: { body: {} } }), {
+      code: 'slotgate_capability_required',
+    })
+    await assert.rejects(callWorkerGet({ vmId: 'legacy-vm' }, '/internal/v1/models'), {
+      code: 'slotgate_capability_required',
+    })
+    await assert.rejects(countTokensViaWorker({ vmId: 'legacy-vm' }, { body: {} }), {
+      code: 'slotgate_capability_required',
+    })
   } finally {
     if (before == null) delete process.env.VM2API_CONTROL_PLANE_MODE
     else process.env.VM2API_CONTROL_PLANE_MODE = before

@@ -211,11 +211,11 @@ test('router preserves durable PG bind acknowledgement for the fenced worker cli
     else process.env.KIN_KERNEL_BIN = previous
   })
   const fx = await fakeSlotgate(t)
+  fx.config.manifest = { revision: '1', digest: 'b'.repeat(64) }
   let completed
   const result = await dispatchCallInference({
     exec: execFor(fx.config),
     envelope: { body: {} },
-    ensureRust: async () => ({ ok: true }),
     onExecutionStart: async (value) => acknowledged(value),
     onExecutionEnd: async (value) => {
       completed = value

@@ -26,6 +26,67 @@ function parse(value) {
   )
 }
 
+function publicHealth(value) {
+  if (!value || typeof value !== 'object' || typeof value.ok !== 'boolean') throw failure('slotgate_health_unconfirmed')
+  const out = {}
+  const copy = (source, target, booleans, numbers, strings) => {
+    for (const key of booleans)
+      if (Object.hasOwn(source, key)) {
+        if (typeof source[key] !== 'boolean') throw failure('slotgate_health_unconfirmed')
+        target[key] = source[key]
+      }
+    for (const key of numbers)
+      if (Object.hasOwn(source, key)) {
+        if (!Number.isSafeInteger(source[key]) || source[key] < 0) throw failure('slotgate_health_unconfirmed')
+        target[key] = source[key]
+      }
+    for (const key of strings)
+      if (Object.hasOwn(source, key)) {
+        if (
+          source[key] !== null &&
+          (typeof source[key] !== 'string' || source[key].length > 512 || /[\x00-\x1f\x7f]/.test(source[key]))
+        )
+          throw failure('slotgate_health_unconfirmed')
+        target[key] = source[key]
+      }
+  }
+  copy(
+    value,
+    out,
+    ['ok', 'healthy', 'recovering', 'classifier_request_context'],
+    ['ready_slots', 'closed_slots', 'cli_restarts', 'cli_pid'],
+    ['engine', 'provider', 'worker_version', 'version', 'unhealthy_reason'],
+  )
+  if (value.credential !== undefined) {
+    if (!value.credential || typeof value.credential !== 'object') throw failure('slotgate_health_unconfirmed')
+    out.credential = {}
+    copy(
+      value.credential,
+      out.credential,
+      ['has_access', 'has_refresh', 'needs_refresh'],
+      [],
+      ['account_uuid', 'org_uuid', 'email'],
+    )
+    for (const key of ['generation', 'expires_at'])
+      if (Object.hasOwn(value.credential, key)) {
+        const item = value.credential[key]
+        if (
+          item !== null &&
+          !(typeof item === 'string' && item.length > 0 && item.length <= 128 && !/[\x00-\x1f\x7f]/.test(item)) &&
+          !(Number.isSafeInteger(item) && item >= 0)
+        )
+          throw failure('slotgate_health_unconfirmed')
+        out.credential[key] = item
+      }
+  }
+  if (value.identity !== undefined) {
+    if (!value.identity || typeof value.identity !== 'object') throw failure('slotgate_health_unconfirmed')
+    out.identity = {}
+    copy(value.identity, out.identity, [], [], ['account_uuid', 'org_uuid', 'email'])
+  }
+  return out
+}
+
 // The gate reads the full request before replying OK. This Duplex sends HTTP
 // immediately, while consuming only the bounded gate prefix before HTTP parses.
 class ForwardSocket extends Duplex {
@@ -126,6 +187,17 @@ export class SlotgateClient {
       )
         throw failure('slotgate_capability_invalid')
       this.link = freeze({ address: link.address, port: link.port, token: link.token, certSha256: link.certSha256 })
+      if (config.manifest !== undefined) {
+        if (
+          !config.manifest ||
+          !/^[1-9][0-9]{0,19}$/.test(config.manifest.revision) ||
+          typeof config.manifest.revision !== 'string' ||
+          BigInt(config.manifest.revision) > 18446744073709551615n ||
+          !/^[a-f0-9]{64}$/.test(config.manifest.digest)
+        )
+          throw failure('slotgate_capability_invalid')
+        this.manifest = freeze({ revision: config.manifest.revision, digest: config.manifest.digest })
+      }
     } catch {
       throw failure('slotgate_capability_invalid')
     }
@@ -157,8 +229,9 @@ export class SlotgateClient {
     return value
   }
 
-  _connect(timeoutMs) {
+  _connect(timeoutMs, signal) {
     return new Promise((resolve, reject) => {
+      if (signal?.aborted) return reject(failure('ABORT_ERR'))
       let settled = false
       const socket = tls.connect({
         host: this.link.address,
@@ -171,10 +244,13 @@ export class SlotgateClient {
         if (settled) return
         settled = true
         clearTimeout(timer)
+        signal?.removeEventListener('abort', abort)
         socket.destroy()
         reject(error)
       }
       const timer = setTimeout(() => fail(failure('slotgate_timeout')), timeoutMs)
+      const abort = () => fail(failure('ABORT_ERR'))
+      signal?.addEventListener('abort', abort, { once: true })
       socket.once('error', fail)
       socket.once('close', () => fail(failure('slotgate_disconnected')))
       socket.once('secureConnect', () => {
@@ -182,6 +258,7 @@ export class SlotgateClient {
         if (pin !== this.link.certSha256) return fail(failure('slotgate_cert_mismatch'))
         settled = true
         clearTimeout(timer)
+        signal?.removeEventListener('abort', abort)
         socket.off('error', fail)
         // Install an error observer until the protocol consumer attaches.
         socket.on('error', () => {})
@@ -190,8 +267,8 @@ export class SlotgateClient {
     })
   }
 
-  async _rpc(command, timeoutMs = 3000) {
-    const socket = await this._connect(timeoutMs)
+  async _rpc(command, timeoutMs = 3000, signal) {
+    const socket = await this._connect(timeoutMs, signal)
     return new Promise((resolve, reject) => {
       let settled = false
       let buffer = Buffer.alloc(0)
@@ -199,12 +276,16 @@ export class SlotgateClient {
         if (settled) return
         settled = true
         clearTimeout(timer)
+        signal?.removeEventListener('abort', abort)
         socket.removeAllListeners('data')
         socket.destroy()
         if (error) reject(error)
         else resolve(value)
       }
       const timer = setTimeout(() => done(failure('slotgate_timeout')), timeoutMs)
+      const abort = () => done(failure('ABORT_ERR'))
+      signal?.addEventListener('abort', abort, { once: true })
+      if (signal?.aborted) return abort()
       socket.once('error', (error) => done(error))
       socket.once('end', () => done(failure('slotgate_bad_reply')))
       socket.once('close', () => done(failure('slotgate_disconnected')))
@@ -223,6 +304,32 @@ export class SlotgateClient {
       })
       socket.write(`KSG2 ${this.link.token}\n${wire(command)}\n`)
     })
+  }
+
+  async health({ timeoutMs = 3000, signal } = {}) {
+    if (!this.manifest) throw failure('slotgate_route_unavailable')
+    const reply = await this._rpc(
+      {
+        op: 'health',
+        vm_id: this.nodeBinding.vmId,
+        fence: this.nodeBinding.fence,
+        manifest_revision: this.manifest.revision,
+        manifest_digest: this.manifest.digest,
+      },
+      timeoutMs,
+      signal,
+    )
+    try {
+      if (
+        !sameNodeBinding({ ...this.nodeBinding, fence: reply.fence }, this.nodeBinding) ||
+        reply.manifest_revision !== this.manifest.revision ||
+        reply.manifest_digest !== this.manifest.digest
+      )
+        throw failure('slotgate_health_unconfirmed')
+      return { ...publicHealth(reply.health), status: 200, source: 'slotgate' }
+    } catch {
+      throw failure('slotgate_health_unconfirmed')
+    }
   }
 
   async prepare(requestId) {

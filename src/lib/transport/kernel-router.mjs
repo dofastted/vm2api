@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto'
 import { ensureWorkerCredential } from './go-worker-client.mjs'
 import { ensureOfficialCredentialLink, slotUidGidFromHomeDir } from '../oauth/oauth-credentials.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { isKubernetesHaMode } from '../core/control-plane-mode.mjs'
 import {
   streamRustKernel,
   callRustKernel,
@@ -81,12 +82,15 @@ export async function waitForReadySlot(exec, timeoutMs = DEFAULT_SLOT_WAIT_MS, p
 }
 
 export function clearRustHealthCache(vmId = null) {
-  if (vmId) rustHealthCache.delete(String(vmId))
-  else rustHealthCache.clear()
+  if (vmId) {
+    for (const key of rustHealthCache.keys())
+      if (key === String(vmId) || key.startsWith(`${vmId}:`)) rustHealthCache.delete(key)
+  } else rustHealthCache.clear()
 }
 
 function cacheKey(exec) {
-  return String(exec?.vmId || exec?.vm?.id || '')
+  const id = String(exec?.vmId || exec?.vm?.id || '')
+  return exec?.slotgate ? `${id}:${JSON.stringify(exec.slotgate.fence)}:${JSON.stringify(exec.slotgate.manifest)}` : id
 }
 
 export function rememberRustHealth(exec, ready) {
@@ -188,6 +192,16 @@ async function prepareSlotCredentials(exec) {
 }
 
 async function prepareRust(exec, { ensure, routing, slotWaitMs } = {}) {
+  if (exec?.slotgate != null) {
+    const health = await rustKernelHealth(exec, { timeoutMs: 800 })
+    // The node validates the captured fence and manifest. Never use the local
+    // credential, host binary/recycler or an injected legacy ensure callback.
+    return rustKernelReachable(health)
+      ? { ok: true, reason: 'node_health', health }
+      : { ok: false, reason: 'kernel_unavailable', health, error: health?.code || 'node health unavailable' }
+  }
+  if (isKubernetesHaMode())
+    throw Object.assign(new Error('trusted node capability required'), { code: 'slotgate_capability_required' })
   await awaitWrapRecycle(exec)
   const fault = kernelFaults.get(cacheKey(exec))
   if (fault) return { ok: false, reason: 'kernel_unavailable', error: fault }
@@ -226,8 +240,13 @@ async function prepareRust(exec, { ensure, routing, slotWaitMs } = {}) {
 }
 
 async function runHop({ mode, opts }) {
+  if (isKubernetesHaMode() && opts.exec?.slotgate == null)
+    throw Object.assign(new Error('trusted node capability required'), { code: 'slotgate_capability_required' })
   const routing = opts.routing || {}
-  const decision = resolveHopEngine(opts.exec?.vm, routing)
+  const decision =
+    opts.exec?.slotgate != null
+      ? { engine: 'rust', wanted: 'rust', reason: 'node_capability', fallback: false }
+      : resolveHopEngine(opts.exec?.vm, routing)
   let engine = 'rust'
   let reason = decision.reason
   if (!decision.blocked) {

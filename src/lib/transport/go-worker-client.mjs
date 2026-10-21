@@ -35,6 +35,12 @@ import {
 import { extraHeadersFromLimitError } from '../pool/quota-window.mjs'
 import { SlotgateClient } from './slotgate-client.mjs'
 import { credentialGeneration } from '../oauth/shared-credential-refresh.mjs'
+import { isKubernetesHaMode } from '../core/control-plane-mode.mjs'
+
+function requireNodeCapability(exec) {
+  if (isKubernetesHaMode() && exec?.slotgate == null)
+    throw Object.assign(new Error('trusted node capability required'), { code: 'slotgate_capability_required' })
+}
 
 const MAX_BODY = 64 * 1024 * 1024
 const credentialRefreshTail = new Map()
@@ -89,6 +95,7 @@ function workerRequest(
     return Promise.reject(
       Object.assign(new Error('fenced worker route unavailable'), { code: 'slotgate_route_unavailable' }),
     )
+  requireNodeCapability(exec)
   return new Promise((resolve, reject) => {
     const { socketPath } = workerPaths(exec)
     if (!socketPath) {
@@ -376,7 +383,9 @@ async function completeFencedExecution(client, handle, execution) {
 }
 
 function forwardFencedWorker(exec, client, handle, request) {
-  const token = readInternalToken(exec)
+  // Published manifests keep kernel authentication on the trusted node. Older
+  // explicitly injected test capabilities retain their legacy token contract.
+  const token = client.manifest ? '' : readInternalToken(exec)
   return client.forward(handle, {
     ...request,
     headers: {
@@ -594,8 +603,9 @@ export async function callGoWorker({
   requestId = randomUUID(),
   onExecutionStart,
 } = {}) {
+  requireNodeCapability(exec)
   const execution = { requestId, started: false, ended: true, reason: isCrsMock() ? 'mock' : 'not_started' }
-  if (isCrsMock()) {
+  if (isCrsMock() && exec?.slotgate == null) {
     const { body: outboundBody, headers } = finalizeWorkerPayload({
       body,
       reqHeaders,
@@ -738,8 +748,9 @@ export async function streamGoWorker({
   requestId = randomUUID(),
   onExecutionStart,
 } = {}) {
+  requireNodeCapability(exec)
   const execution = { requestId, started: false, ended: true, reason: isCrsMock() ? 'mock' : 'not_started' }
-  if (isCrsMock()) {
+  if (isCrsMock() && exec?.slotgate == null) {
     const { body: outboundBody, headers } = finalizeWorkerPayload({
       body,
       reqHeaders,
@@ -1085,6 +1096,14 @@ export async function streamGoWorker({
 }
 
 export async function workerHealth(exec, { timeoutMs = 3000, signal } = {}) {
+  requireNodeCapability(exec)
+  if (exec?.slotgate != null) {
+    try {
+      return await new SlotgateClient(exec.slotgate).health({ timeoutMs, signal })
+    } catch (error) {
+      return { ok: false, status: 0, code: error.code || 'slotgate_health_unconfirmed' }
+    }
+  }
   if (isCrsMock()) {
     const claude = exec?.vm?.claude || {}
     const hasCredential = hasCredentialPresence(claude)
@@ -1121,6 +1140,15 @@ export async function workerHealth(exec, { timeoutMs = 3000, signal } = {}) {
 }
 
 export async function ensureWorkerCredential(exec, { force = false, ...refreshOptions } = {}) {
+  requireNodeCapability(exec)
+  if (exec?.slotgate != null)
+    return {
+      ok: false,
+      status: 503,
+      refreshed: false,
+      credentialRefreshNotStarted: true,
+      error: { code: 'slotgate_route_unavailable', message: 'Node credential refresh is not available' },
+    }
   if (isCrsMock()) {
     return {
       ok: true,
@@ -1254,6 +1282,13 @@ function credentialSummary(credential, now = Date.now()) {
 }
 
 export async function importWorkerCredential(exec, credential, { timeoutMs = 60000, signal } = {}) {
+  requireNodeCapability(exec)
+  if (exec?.slotgate != null)
+    return {
+      ok: false,
+      status: 503,
+      error: { code: 'slotgate_route_unavailable', message: 'Node credential import is not available' },
+    }
   try {
     writeWorkerCredentialFile(exec.homeDir, credential)
     // Import is the one case where the control plane's credential replaces the slot's copy.
@@ -1278,6 +1313,17 @@ export async function importWorkerCredential(exec, credential, { timeoutMs = 600
 }
 
 export async function callWorkerGet(exec, requestPath, { timeoutMs = 30000, signal } = {}) {
+  requireNodeCapability(exec)
+  if (exec?.slotgate != null)
+    return {
+      ok: false,
+      status: 503,
+      body: { error: { code: 'slotgate_route_unavailable', message: 'Node auxiliary route is not available' } },
+      headers: {},
+      via: 'slotgate',
+      attemptFinished: true,
+      taskNotStarted: true,
+    }
   if (isCrsMock()) {
     if (requestPath === '/internal/v1/models') {
       return {
@@ -1370,6 +1416,17 @@ export async function callWorkerGet(exec, requestPath, { timeoutMs = 30000, sign
 }
 
 export async function countTokensViaWorker(exec, { body, headers = {}, timeoutMs = 45000 } = {}) {
+  requireNodeCapability(exec)
+  if (exec?.slotgate != null)
+    return {
+      ok: false,
+      status: 503,
+      body: { error: { code: 'slotgate_route_unavailable', message: 'Node count tokens is not available' } },
+      headers: {},
+      via: 'slotgate',
+      attemptFinished: true,
+      taskNotStarted: true,
+    }
   if (isCrsMock()) {
     return { ok: true, status: 200, body: { input_tokens: 8 }, headers: {}, via: 'go-worker-mock' }
   }

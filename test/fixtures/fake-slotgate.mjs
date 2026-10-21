@@ -23,7 +23,7 @@ export const assistant = {
   id: 'synthetic-message', type: 'message', role: 'assistant',
   content: [{ type: 'text', text: 'synthetic answer' }], stop_reason: 'end_turn',
 }
-const wire = (value) => JSON.stringify(value, (key, item) => key === 'generation' ? JSON.rawJSON(String(item)) : item)
+const wire = (value) => JSON.stringify(value, (key, item) => key === 'generation' && /^[1-9][0-9]*$/.test(String(item)) ? JSON.rawJSON(String(item)) : item)
 
 // A local protocol double, not a node/Docker or provider acceptance test.
 export async function fakeSlotgate(t, options = {}) {
