@@ -2,7 +2,6 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
 import { startGateway, api } from '../harness.mjs'
 
 async function login(gw, username, password) {
@@ -167,13 +166,13 @@ test('deleting a tenant reclaims its assigned VM in the runtime file and SQLite 
     assert.equal(vm.owner_user_id, null)
     assert.equal(vm.origin, 'platform')
     assert.equal(vm.schedulable, true)
-    const db = new DatabaseSync(path.join(gw.project, 'data', 'kin.db'), { readOnly: true })
+    const db = gw.db
     try {
-      const row = db.prepare('SELECT owner_user_id, origin FROM vms WHERE id = ?').get(vm.id)
+      const row = await db.prepare('SELECT owner_user_id, origin FROM vms WHERE id = $1').get(vm.id)
       assert.equal(row.owner_user_id, null)
       assert.equal(row.origin, 'platform')
     } finally {
-      db.close()
+      // The gateway harness owns this connection.
     }
     assert.equal((await panel(gw, 'GET', '/api/panel/me', { cookie: session.cookie })).status, 401)
   } finally {
