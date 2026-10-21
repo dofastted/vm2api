@@ -92,6 +92,48 @@ test('each scheduled proxy probe receives its own live activity', async (t) => {
   assert.equal(probes, 2)
 })
 
+test('a draining maintenance operation prevents scheduled proxy probes from starting', async (t) => {
+  const fx = await fixture(t)
+  const operation = await fx.coordinator.beginMaintenance({ kind: 'backup' })
+  const pool = new ProxyPool({ db: fx.db })
+  let probes = 0
+  pool.probeAll = async () => {
+    probes++
+    return { ok: true }
+  }
+  try {
+    const tick = intervals(t, () => pool.startScheduler())
+    await assert.rejects(pool.flush(), { code: 'database_maintenance' })
+    await tick()
+    await pool.flush()
+    assert.equal(probes, 0)
+  } finally {
+    pool.stopScheduler()
+    await operation.close()
+    await fx.coordinator.cancelDrain(operation.operationId)
+  }
+})
+
+test('a failed scheduled proxy probe retains an uncertain activity', async (t) => {
+  const fx = await fixture(t)
+  const pool = new ProxyPool({ db: fx.db })
+  pool.probeAll = async () => {
+    await fx.db.query('SELECT 1')
+    throw new Error('synthetic probe termination unknown')
+  }
+  intervals(t, () => pool.startScheduler())
+  t.after(() => pool.stopScheduler())
+  await assert.rejects(pool.flush(), /synthetic probe termination unknown/)
+  const rows = (
+    await fx.db.pool.query(
+      `SELECT completed_at, uncertain_at FROM ${fx.coordinator.qualified}.activities WHERE kind='proxy_probe'`,
+    )
+  ).rows
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].completed_at, null)
+  assert.ok(rows[0].uncertain_at)
+})
+
 test('file-watcher reconciliation can persist after initialization scope closes', async (t) => {
   const fx = await fixture(t)
   fs.mkdirSync(path.join(fx.root, 'vms'))

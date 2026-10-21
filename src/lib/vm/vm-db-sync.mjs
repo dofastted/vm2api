@@ -19,7 +19,7 @@
 
 import fs from 'node:fs'
 import path from 'node:path'
-import { isDbOpen, getDb } from '../db/database.mjs'
+import { isDbOpen, getDb, getActivityCoordinator } from '../db/database.mjs'
 import { VmsRepo } from '../db/repos/vms-repo.mjs'
 import { WriteQueue } from '../pool/write-queue.mjs'
 import { setVmWriteHook, atomicWriteJson, isVmRecordFile } from './vm-file.mjs'
@@ -28,6 +28,7 @@ import { reclaimAssignedVms, repairSlotSmbios, repairVmProxyCliEnabled } from '.
 let _repo = null
 let _watcher = null
 let _watchTimer = null
+const _watchPending = new Set()
 let _projectRoot = null
 let _writes = new WriteQueue()
 let _paused = false
@@ -97,6 +98,7 @@ export function flushVmDbSync() {
 export async function pauseVmDbSync() {
   _paused = true
   stopVmWatch()
+  while (_watchPending.size) await Promise.all([..._watchPending])
   await flushVmDbSync()
 }
 
@@ -240,11 +242,25 @@ export function startVmWatch(projectRoot) {
       if (_watchTimer) clearTimeout(_watchTimer)
       _watchTimer = setTimeout(async () => {
         _watchTimer = null
-        try {
-          reconcileDeletionsAndChanges(projectRoot).catch((error) => {
+        const pending = (async () => {
+          try {
+            const coordinator = isDbOpen() ? getActivityCoordinator(getDb()) : null
+            if (coordinator) {
+              await coordinator.runActivity({ kind: 'vm_file_watch' }, async () => ({
+                ended: true,
+                value: await reconcileDeletionsAndChanges(projectRoot),
+              }))
+            } else await reconcileDeletionsAndChanges(projectRoot)
+          } catch (error) {
             console.warn(`[vm] database mirror failed: ${error.code || error.name}`)
-          })
-        } catch {}
+          }
+        })()
+        _watchPending.add(pending)
+        try {
+          await pending
+        } finally {
+          _watchPending.delete(pending)
+        }
       }, 500)
       if (typeof _watchTimer.unref === 'function') _watchTimer.unref()
     })

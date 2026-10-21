@@ -12,7 +12,7 @@
 import { EventEmitter } from 'node:events'
 import net from 'node:net'
 import crypto from 'node:crypto'
-import { resolveStoreDb, withTransaction } from '../db/database.mjs'
+import { resolveStoreDb, withTransaction, getActivityCoordinator } from '../db/database.mjs'
 import { ProxiesRepo, PROXY_COLUMNS, PROXY_HEALTH_COLUMNS } from '../db/repos/proxies-repo.mjs'
 import { canBindProxyToVm, normalizeOwnerId, proxyOwnerId, vmOwnerId } from '../admin/resource-owner.mjs'
 import { validTimezone } from '../core/timezone.mjs'
@@ -1617,10 +1617,18 @@ export class ProxyPool extends EventEmitter {
     if (!this.state.config.enabled) return
     const min = this.state.config.probe_interval_min || 10
     const ms = min * 60 * 1000
-    void this.probeAll({ onlyEnabled: true }).catch(() => {})
-    this._timer = setInterval(async () => {
-      this.probeAll({ onlyEnabled: true }).catch(() => {})
-    }, ms)
+    const run = () => {
+      const coordinator = getActivityCoordinator(this.db)
+      const pending = coordinator
+        ? coordinator.runActivity({ kind: 'proxy_probe' }, async () => ({
+            ended: true,
+            value: await this.probeAll({ onlyEnabled: true }),
+          }))
+        : this.probeAll({ onlyEnabled: true })
+      return this._track(pending).catch(() => {})
+    }
+    void run()
+    this._timer = setInterval(run, ms)
     this._timer.unref?.()
   }
 

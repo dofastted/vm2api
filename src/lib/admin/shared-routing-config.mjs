@@ -1,5 +1,5 @@
 import fs from 'node:fs'
-import { getDb } from '../db/database.mjs'
+import { getDb, getActivityCoordinator } from '../db/database.mjs'
 import { RoutingConfigRepo } from '../db/repos/routing-config-repo.mjs'
 import { manageRoutingDocument, clearRoutingDocument, publishRoutingDocument } from '../core/routing-document.mjs'
 
@@ -66,7 +66,15 @@ export class SharedRoutingConfig {
     if (this.timer) return
     this.timer = setInterval(() => {
       if (this.refreshing) return
-      this.refreshing = this.refresh()
+      const coordinator = getActivityCoordinator(this.db)
+      this.refreshing = (
+        coordinator
+          ? coordinator.runActivity({ kind: 'routing_poll' }, async () => ({
+              ended: true,
+              value: await this.refresh(),
+            }))
+          : this.refresh()
+      )
         .catch((error) => {
           this.lastError = error.code || error.message
         })

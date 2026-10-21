@@ -18,7 +18,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { redactSecrets } from '../core/security.mjs'
-import { resolveStoreDb } from '../db/database.mjs'
+import { resolveStoreDb, getActivityCoordinator } from '../db/database.mjs'
 import { integerValue } from '../db/integers.mjs'
 import { UsageLogsRepo } from '../db/repos/usage-logs-repo.mjs'
 import { classifyRequestError, resolveMutedErrorClasses } from './error-class.mjs'
@@ -759,7 +759,9 @@ export class RequestLogStore {
         debugRetainDays: this.debugRetainDays,
         maxBytes: this.maxMb > 0 ? this.maxMb * 1024 * 1024 : 0,
       })
-    } catch {}
+    } catch (error) {
+      if (getActivityCoordinator(this.db)) throw error
+    }
     this._cleanupLegacyFiles(this.retainDays, this.root)
     this._cleanupLegacyFiles(this.debugRetainDays, path.join(this.root, 'debug'))
   }
@@ -770,7 +772,13 @@ export class RequestLogStore {
     const run = () => {
       const pending = (async () => {
         try {
-          await this.cleanup()
+          const coordinator = getActivityCoordinator(this.db)
+          if (coordinator) {
+            await coordinator.runActivity({ kind: 'request_log_cleanup' }, async () => ({
+              ended: true,
+              value: await this.cleanup(),
+            }))
+          } else await this.cleanup()
         } catch {}
       })()
       this._cleanupPending.add(pending)
