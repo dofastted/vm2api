@@ -349,3 +349,36 @@ for (const auxiliary of ['profile', 'models', 'identity']) {
     assert.equal((await new SharedProxyOperations(f.peer).tryAcquire()).ok, false)
   })
 }
+
+test('a completed bootstrap business failure releases package VM and proxy claims', async (t) => {
+  const f = await fixture(t)
+  const body = buildVmPackage({
+    vm: { id: 'vm-new', timezone: 'UTC', claude: { mode: 'oauth' } },
+    proxy: f.pool.getProxyByIdWithAuth(f.proxyId),
+    claudeCred: { mode: 'oauth', access_token: 'synthetic-access', refresh_token: 'synthetic-refresh' },
+  })
+  const h = f.handler(body, {
+    officialCcStatsHandler: () => async () => {},
+    accountQuota: {
+      snapshot: () => ({ accounts: [] }),
+      ensure() {},
+      repo: { get: () => ({ unified: {} }), observe: async () => {} },
+      beginObservation: async () => 'synthetic',
+      ingestOAuthUsage() {},
+      setAccountTier() {},
+      flush: async () => {},
+    },
+    vmMutationOps: {
+      startSlotReady: async () => ({ ok: true }),
+      runOfficialCcBootstrap: async () => ({ ok: false, attemptFinished: true, vmOperationUncertain: false }),
+    },
+  })
+  await h.request('POST', '/api/panel/vms/package')
+  assert.equal(h.response.status, 201, JSON.stringify(h.response.body))
+  assert.equal(h.response.body.data.official_cc_bootstrap.ok, false)
+  const nextVm = await f.otherOperations.tryAcquire({ vmId: 'vm-new' })
+  if (nextVm.ok) await nextVm.release()
+  const nextProxy = await new SharedProxyOperations(f.peer).tryAcquire()
+  if (nextProxy.ok) await nextProxy.release()
+  assert.deepEqual({ vm: nextVm.ok, proxy: nextProxy.ok }, { vm: true, proxy: true })
+})
