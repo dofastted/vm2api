@@ -338,7 +338,7 @@ export class GlobalMaintenanceCoordinator {
     const scope = { coordinator: this, id, epoch, kind, active: true, remoteStarted: false, pending: new Set() }
     const assertActive = () => {
       this._assertHealthy()
-      if ((!scope.active && !scope.transferredTo?.healthy) || scope.handoffPending) {
+      if ((!scope.active && !scope.transferredTo?.healthy) || scope.handoffPending || scope.completing) {
         throw failure('maintenance_activity_closed', 'The activity scope has completed or is transferring')
       }
     }
@@ -372,7 +372,7 @@ export class GlobalMaintenanceCoordinator {
     this._assertHealthy()
     for (let context = activities.getStore(); context; context = context.parent) {
       const { scope } = context
-      if ((!scope.active && !scope.transferredTo?.healthy) || scope.handoffPending) {
+      if ((!scope.active && !scope.transferredTo?.healthy) || scope.handoffPending || scope.completing) {
         throw failure('maintenance_activity_closed', 'An inherited activity scope has completed')
       }
       scope.operation?._assertHealthy()
@@ -385,38 +385,55 @@ export class GlobalMaintenanceCoordinator {
     const scope = this.assertActivity()
     const token = Symbol('persistence')
     scope.pending.add(token)
-    return () => scope.pending.delete(token)
+    return () => {
+      scope.pending.delete(token)
+      if (!scope.pending.size) {
+        for (const resolve of scope.waiters || []) resolve()
+        scope.waiters?.clear()
+      }
+    }
   }
 
   async _complete(scope, execution) {
     return this._exclusiveLocal(async () => {
       this._assertHealthy()
-      const result = await this._transaction(async (client) => {
-        const row = (
-          await client.query(
-            `SELECT * FROM ${this.qualified}.activities
+      if (execution?.ended === true && scope.pending.size) {
+        throw failure('maintenance_persistence_pending', 'Activity SQL must finish before confirming completion')
+      }
+      scope.completing = true
+      let result
+      try {
+        result = await this._transaction(async (client) => {
+          const row = (
+            await client.query(
+              `SELECT * FROM ${this.qualified}.activities
           WHERE id = $1 AND owner_id = $2 FOR UPDATE`,
-            [scope.id, this.ownerId],
-          )
-        ).rows[0]
-        if (!row) throw failure('maintenance_activity_missing', 'The durable activity is unavailable')
-        if (row.completed_at) return { ended: true, uncertain: false }
-        if (row.uncertain_at) return { ended: false, uncertain: true }
-        const ended = execution?.ended === true
-        await client.query(
-          `UPDATE ${this.qualified}.activities SET
+              [scope.id, this.ownerId],
+            )
+          ).rows[0]
+          if (!row) throw failure('maintenance_activity_missing', 'The durable activity is unavailable')
+          if (row.completed_at) return { ended: true, uncertain: false }
+          if (row.uncertain_at) return { ended: false, uncertain: true }
+          const ended = execution?.ended === true
+          await client.query(
+            `UPDATE ${this.qualified}.activities SET
           completed_at = CASE WHEN $3 THEN clock_timestamp() ELSE NULL END,
           uncertain_at = CASE WHEN $3 THEN NULL ELSE clock_timestamp() END,
           reason = $4 WHERE id = $1 AND owner_id = $2`,
-          [scope.id, this.ownerId, ended, execution?.reason || (ended ? 'completed' : 'execution_unknown')],
-        )
-        return { ended, uncertain: !ended }
-      })
+            [scope.id, this.ownerId, ended, execution?.reason || (ended ? 'completed' : 'execution_unknown')],
+          )
+          return { ended, uncertain: !ended }
+        })
+      } catch (error) {
+        scope.completing = false
+        throw error
+      }
       if (scope.active) {
         scope.active = false
         this._refs -= 1
         if (!this._refs) await this._releaseHolder()
       }
+      scope.completing = false
       return result
     })
   }
@@ -480,10 +497,10 @@ export class GlobalMaintenanceCoordinator {
     }
   }
 
-  async runScheduledMaintenance(plan, callback) {
+  async runScheduledMaintenance(plan, callback, { onDraining = null } = {}) {
     let operation
     try {
-      operation = await this._beginMaintenance({ kind: 'backup' }, null, plan)
+      operation = await this._beginMaintenance({ kind: 'backup', onDraining }, null, plan)
     } catch (error) {
       if (error.code === 'maintenance_already_completed') {
         return { ran: false, code: error.code, sharedResult: error.sharedResult }
@@ -542,13 +559,18 @@ export class GlobalMaintenanceCoordinator {
     })
   }
 
-  async _beginMaintenance({ kind, signal = null, timeoutMs = 60000 } = {}, sourceScope = null, schedule = null) {
+  async _beginMaintenance(
+    { kind, signal = null, timeoutMs = 60000, onDraining = null } = {},
+    sourceScope = null,
+    schedule = null,
+  ) {
     this._assertHealthy()
     if (!['backup', 'restore'].includes(kind)) throw new Error('invalid maintenance kind')
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error('invalid maintenance timeout')
     if (signal?.aborted) throw failure('maintenance_cancelled', 'Maintenance was cancelled before admission')
     const client = this._connection('maintenance')
     const operation = new MaintenanceOperation(this, client, kind)
+    operation.sourceActivityId = sourceScope?.id || null
     try {
       await client.connect()
       operation.backendPid = (await client.query('SELECT pg_backend_pid() AS pid')).rows[0].pid
@@ -636,6 +658,7 @@ export class GlobalMaintenanceCoordinator {
           throw error
         }
       })
+      if (onDraining) await operation.runAdmin(() => onDraining(operation))
       // DRAINING is committed before waiting. Existing scopes never reacquire this lock for their SQL.
       await client.query("SELECT set_config('statement_timeout', $1, false)", [String(timeoutMs)])
       const abort = () => {
@@ -649,6 +672,7 @@ export class GlobalMaintenanceCoordinator {
         signal?.removeEventListener('abort', abort)
       }
       operation._assertHealthy()
+      operation._drained = true
       await client.query("SELECT set_config('statement_timeout', '60000', false)")
       await this._checkClaims(client, operation.operationId)
       return operation
@@ -754,6 +778,12 @@ class MaintenanceOperation {
     try {
       return await activities.run({ scope, parent: activities.getStore() }, callback)
     } finally {
+      if (scope.pending.size) {
+        await new Promise((resolve) => {
+          scope.waiters ||= new Set()
+          scope.waiters.add(resolve)
+        })
+      }
       scope.active = false
     }
   }
@@ -795,6 +825,7 @@ class MaintenanceOperation {
   }
 
   async beginRestore() {
+    if (!this._drained) throw failure('maintenance_operation_changed', 'Drain all activities before replacing data')
     return this._transaction(async (row) => {
       if (this.kind !== 'restore' || row.phase !== 'draining')
         throw failure('maintenance_operation_changed', 'Restore is not in its pre-restore stage')
@@ -817,6 +848,7 @@ class MaintenanceOperation {
   }
 
   async resume() {
+    if (!this._drained) throw failure('maintenance_operation_changed', 'Drain all activities before resuming')
     const state = await this._transaction(async (row) => {
       if (
         (this.kind === 'restore' && row.phase !== 'rebinding') ||

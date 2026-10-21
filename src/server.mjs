@@ -641,9 +641,8 @@ backupService.onRestored(async (db) => {
   await loadSettingsState(db)
   await loadModelPolicy({ force: true })
   await loadGptModelPolicy({ force: true })
-  // A restore swaps the database pool and routing files. Rebuild every
-  // holder before reporting success; otherwise requests keep stale snapshots
-  // or silently write through statements owned by the closed connection.
+  // A restore replaces database objects. Rebuild every store and cache before
+  // reporting success so requests use the restored configuration and state.
   for (const store of [apiKeyStore, apiEndpointStore, panelUsers, accountQuota, stickyRouter, proxyPool, requestLog]) {
     await store.rebind(db)
   }
@@ -683,14 +682,21 @@ backupService.onRestored(async (db) => {
   reloadActiveVm(cfg)
   await vmTestSchedule.reload()
 })
-backupService.onMaintenance(async (enabled) => {
+backupService.onMaintenance(async (enabled, _reason, context = {}) => {
   if (enabled) {
     await routingRt.routingState?.stop()
     vmTestSchedule.stop()
     proxyPool.stopScheduler()
     requestLog.stopCleanupScheduler()
     for (const monitor of maintenanceMonitors()) await monitor?.stop?.()
-    while ([...activeRequests].some((request) => !/\/(?:backups)(?:\/|$)/.test(String(request.url || '')))) {
+    while (
+      [...activeRequests].some((request) => {
+        if (context.operation?.sourceActivityId) {
+          return requestActivities.get(request)?.gate.activityId !== context.operation.sourceActivityId
+        }
+        return activityCoordinator || !/\/(?:backups)(?:\/|$)/.test(String(request.url || ''))
+      })
+    ) {
       await new Promise((resolve) => setTimeout(resolve, 10))
     }
     for (const monitor of maintenanceMonitors()) await monitor?.flush?.()

@@ -1,7 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import pg from 'pg'
-import { getDb, quoteIdentifier, registerActivityCoordinator } from '../../src/lib/db/database.mjs'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { createDatabase, getDb, quoteIdentifier, registerActivityCoordinator } from '../../src/lib/db/database.mjs'
 import { GlobalMaintenanceCoordinator } from '../../src/lib/db/global-maintenance.mjs'
 import { runPgTool } from '../../src/lib/admin/backup-core.mjs'
 
@@ -127,10 +130,7 @@ test('a transferred restore owner death retains its phase and private unfinished
     null,
   )
   await assert.rejects(coordinator.admit({ kind: 'http' }), { code: 'database_maintenance' })
-  await assert.rejects(
-    async () => request.run(() => db.query('SELECT 1')),
-    { code: 'maintenance_activity_closed' },
-  )
+  await assert.rejects(async () => request.run(() => db.query('SELECT 1')), { code: 'maintenance_activity_closed' })
 })
 
 test('handoff never excludes another active or unknown background claim', async (t) => {
@@ -151,4 +151,77 @@ test('handoff never excludes another active or unknown background claim', async 
   await coordinator.cancelDrain(state.operationId)
   await request.run(() => db.query('SELECT 1'))
   await request.complete({ ended: true })
+})
+
+test('maintenance admin scope waits for its detached SQL before releasing ownership', async (t) => {
+  const { db, coordinator, operations } = await fixture(t)
+  const operation = await coordinator.beginMaintenance({ kind: 'backup' })
+  operations.push(operation)
+  const resource = 'synthetic-admin-sql:' + db.schema
+  const blocker = await db.pool.connect()
+  await blocker.query('SELECT pg_advisory_lock(hashtext(current_database()),hashtext($1))', [resource])
+  let finished = false
+  let released = false
+  let query
+  const admin = operation
+    .runAdmin(() => {
+      query = db
+        .query('SELECT pg_advisory_xact_lock(hashtext(current_database()),hashtext($1))', [resource])
+        .then(() => {
+          finished = true
+        })
+      return 'callback returned'
+    })
+    .then((value) => {
+      released = true
+      return value
+    })
+  try {
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(released, false)
+    await blocker.query('SELECT pg_advisory_unlock(hashtext(current_database()),hashtext($1))', [resource])
+    assert.equal(await admin, 'callback returned')
+    assert.equal(finished, true)
+    await operation.resume()
+  } finally {
+    await blocker.query('SELECT pg_advisory_unlock_all()')
+    blocker.release()
+    await query
+    await admin
+  }
+})
+
+test('new Kubernetes databases cannot run migrations through RESTORING or REBINDING', async (t) => {
+  const { db, coordinator, operations } = await fixture(t)
+  const migrationsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'maintenance-startup-'))
+  fs.writeFileSync(
+    path.join(migrationsDir, '999_should_not_run.sql'),
+    'CREATE TABLE should_not_run_during_restore(id integer);',
+  )
+  t.after(() => fs.rmSync(migrationsDir, { recursive: true, force: true }))
+  const operation = await coordinator.beginMaintenance({ kind: 'restore' })
+  operations.push(operation)
+  await operation.beginRestore()
+  for (const phase of ['restoring', 'rebinding']) {
+    if (phase === 'rebinding') await operation.beginRebind()
+    const previous = process.env.VM2API_CONTROL_PLANE_MODE
+    process.env.VM2API_CONTROL_PLANE_MODE = 'kubernetes'
+    try {
+      await assert.rejects(
+        createDatabase({ connectionString: db.connectionString, schema: db.schema, migrationsDir }),
+        { code: 'database_maintenance' },
+      )
+    } finally {
+      if (previous === undefined) delete process.env.VM2API_CONTROL_PLANE_MODE
+      else process.env.VM2API_CONTROL_PLANE_MODE = previous
+    }
+    assert.equal(
+      (await db.pool.query('SELECT to_regclass($1) AS name', [`${db.schema}.should_not_run_during_restore`])).rows[0]
+        .name,
+      null,
+    )
+    assert.equal((await coordinator.getState()).phase, phase)
+  }
+  await coordinator.acknowledgeEpoch(2)
+  await operation.resume()
 })

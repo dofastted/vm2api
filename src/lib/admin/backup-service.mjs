@@ -3,12 +3,13 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { Worker } from 'node:worker_threads'
-import { getDb, applyMigrations, quoteIdentifier } from '../db/database.mjs'
+import { getDb, applyMigrations, quoteIdentifier, getActivityCoordinator } from '../db/database.mjs'
 import { sha256FileAsync, runPgTool, runProcess, extractArchiveMember } from './backup-core.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { BackupRepo } from '../db/repos/backup-repo.mjs'
 import { invalidateReadCache } from '../vm/vm-file.mjs'
 import { backgroundTasksFor } from '../core/shared-background-tasks.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 
 // tarAvailability / sha256File / the runnable pipeline live in backup-core.mjs;
 // keep the historical export surface for tests and callers.
@@ -74,12 +75,33 @@ export class BackupService {
   async _enterMaintenance(reason) {
     if (this.isMaintaining) return false
     this.isMaintaining = true
-    await this._maintenance?.(true, reason)
+    const coordinator = getActivityCoordinator(getDb())
+    if (coordinator) {
+      try {
+        this._globalOperation = await coordinator.beginMaintenanceFromCurrentActivity({
+          kind: reason,
+          onDraining: async (operation) => {
+            this._globalOperation = operation
+            await this._maintenance?.(true, reason, { operation })
+          },
+        })
+      } catch (error) {
+        const state = await coordinator.getState()
+        if (state.phase === 'draining' && state.ownerId === coordinator.ownerId) {
+          await coordinator.cancelDrain(state.operationId)
+          this._globalOperation = null
+          await this._maintenance?.(false, reason)
+          this.isMaintaining = false
+        }
+        throw error
+      }
+    } else await this._maintenance?.(true, reason)
     return true
   }
 
   async _leaveMaintenance(reason) {
-    await this._maintenance?.(false, reason)
+    if (this._globalOperation && !this._globalOperation._resumed) await this._globalOperation.resume()
+    await this._maintenance?.(false, reason, { operation: this._globalOperation })
     this.isMaintaining = false
   }
 
@@ -148,15 +170,20 @@ export class BackupService {
   }
 
   /** Export a PostgreSQL snapshot while files are frozen, then dump in a worker. */
-  async _createBackup({ kind = 'manual', note = null } = {}) {
+  async _createBackup({ kind = 'manual', note = null, maintenanceOperation = null } = {}) {
     if (this._running) throw Object.assign(new Error('backup already in progress'), { code: 'backup_in_progress' })
     this._running = true
     const id = 'bak_' + crypto.randomBytes(6).toString('hex')
     const createdAt = new Date().toISOString()
     let client
     let entered = false
+    const previousOperation = this._globalOperation
+    let ownedOperation = null
     try {
-      entered = await this._enterMaintenance(kind === 'pre_restore' ? 'restore' : 'backup')
+      entered = maintenanceOperation
+        ? kind !== 'pre_restore'
+        : await this._enterMaintenance(kind === 'pre_restore' ? 'restore' : 'backup')
+      if (!previousOperation && !maintenanceOperation) ownedOperation = this._globalOperation
       const db = getDb()
       client = await db.pool.connect()
       await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
@@ -192,6 +219,7 @@ export class BackupService {
       }
       return stored
     } catch (error) {
+      if (this._globalOperation) this._globalOperation._completionUnknown = true
       try {
         if (!(await this._repo().get(id)))
           await this._repo().insert({
@@ -213,7 +241,14 @@ export class BackupService {
         }
       }
       this._running = false
-      if (entered) await this._leaveMaintenance('backup')
+      try {
+        if (entered) await this._leaveMaintenance('backup')
+      } finally {
+        if (ownedOperation) {
+          await ownedOperation.close()
+          this._globalOperation = null
+        }
+      }
     }
   }
 
@@ -387,7 +422,7 @@ export class BackupService {
         fs.chmodSync(path.join(target, name), 0o600)
       }
     }
-    if (this.configDir && fs.existsSync(path.join(tmp, 'config'))) {
+    if (!isKubernetesMode() && this.configDir && fs.existsSync(path.join(tmp, 'config'))) {
       fs.mkdirSync(this.configDir, { recursive: true })
       for (const name of fs.readdirSync(this.configDir)) {
         if (name.endsWith('.json') && !fs.lstatSync(path.join(this.configDir, name)).isDirectory())
@@ -402,6 +437,7 @@ export class BackupService {
   }
 
   async _applyArchive(archive) {
+    this._globalOperation?._assertHealthy()
     const db = getDb()
     // pg_restore --clean only removes objects present in the archive. Later
     // migrations can add tables (including login sessions) that must disappear
@@ -457,6 +493,7 @@ export class BackupService {
       ['--no-psqlrc', '--quiet', '--single-transaction', '--set=ON_ERROR_STOP=1', '--file', cleanup, '--file', restore],
       db.connectionString,
     )
+    this._globalOperation?._assertHealthy()
     this._restoreFiles(archive.tmp)
     await applyMigrations(getDb())
   }
@@ -501,23 +538,40 @@ export class BackupService {
       await this._enterMaintenance('restore')
       pre = await this.createBackup({ kind: 'pre_restore', note: `before restore of ${id}` })
       previous = await this._extractArchive(pre)
+      if (this._globalOperation) await this._globalOperation.beginRestore()
       changed = true
       await getDb().withMaintenance(async () => {
         await this._applyArchive(archive)
         await this._registerOrphanArchives([pre, rec])
+        if (this._globalOperation) await this._globalOperation.beginRebind()
         await this._rebindStores?.(getDb())
+        if (this._globalOperation) {
+          const coordinator = getActivityCoordinator(getDb())
+          await coordinator.acknowledgeEpoch((await coordinator.getState()).epoch)
+        }
       })
       await this._leaveMaintenance('restore')
       fs.rmSync(this.maintenanceFile)
       this.isRestoring = false
       return { ok: true, restored: id, pre_restore: pre.id }
     } catch (error) {
-      if (maintenanceStarted) {
-        this.isRestoring = true
-        this.isMaintaining = true
+      if (this._globalOperation?.healthy && !this._globalOperation._resumed) {
+        await this._globalOperation.failBlocked(error.code || 'restore_failed')
       }
-      if (changed && previous) {
+      if (maintenanceStarted) {
+        const coordinator = getActivityCoordinator(getDb())
+        if (coordinator && !changed && (await coordinator.getState()).phase === 'open') {
+          fs.rmSync(this.maintenanceFile, { force: true })
+          this.isRestoring = false
+          this.isMaintaining = false
+        } else {
+          this.isRestoring = true
+          this.isMaintaining = true
+        }
+      }
+      if (changed && previous && !this._globalOperation?._resumed) {
         try {
+          this._globalOperation?._assertHealthy()
           await getDb().withMaintenance(async () => {
             await this._applyArchive(previous)
             await this._registerOrphanArchives([pre])
@@ -532,6 +586,10 @@ export class BackupService {
       throw error
     } finally {
       this._restoreRunning = false
+      if (this._globalOperation) {
+        await this._globalOperation.close()
+        this._globalOperation = null
+      }
       for (const item of [archive, previous]) if (item) fs.rmSync(item.tmp, { recursive: true, force: true })
     }
   }
@@ -580,6 +638,43 @@ export class BackupService {
   /** Auto-backup checker: every checkIntervalMs + a catch-up run at boot. */
   runScheduled(generation = this._schedulerGeneration) {
     const pending = (async () => {
+      const coordinator = getActivityCoordinator(getDb())
+      if (coordinator) {
+        const config = await coordinator.runActivity({ kind: 'backup_schedule_check' }, async () => {
+          const now = Number(
+            (await getDb().query('SELECT extract(epoch FROM clock_timestamp()) * 1000 AS now')).rows[0].now,
+          )
+          const eligible = await this.shouldRunScheduled(now)
+          return {
+            ended: true,
+            value: eligible && generation === this._schedulerGeneration ? await this.getSchedule() : null,
+          }
+        })
+        if (!config) return null
+        try {
+          const result = await coordinator.runScheduledMaintenance(
+            { taskKey: 'scheduled-backup', intervalMs: Math.round(config.interval_hours * 3600_000) },
+            async (operation) => {
+              if (generation !== this._schedulerGeneration) {
+                await this._leaveMaintenance('backup')
+                return { ended: true, value: null }
+              }
+              const record = await this.createBackup({ kind: 'scheduled', maintenanceOperation: operation })
+              return { ended: record?.status === 'ok', value: record }
+            },
+            {
+              onDraining: async (operation) => {
+                this._globalOperation = operation
+                this.isMaintaining = true
+                await this._maintenance?.(true, 'backup', { operation })
+              },
+            },
+          )
+          return result.ran ? result.value : null
+        } finally {
+          this._globalOperation = null
+        }
+      }
       const now = this.sharedTasks ? await this.sharedTasks.now() : Date.now()
       if (!(await this.shouldRunScheduled(now)) || generation !== this._schedulerGeneration) return null
       const config = await this.getSchedule()
