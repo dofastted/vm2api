@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -110,5 +111,37 @@ func TestForwardStreamsTextDeltasBeforeUpstreamCompletes(t *testing.T) {
 	}
 	if !strings.Contains(string(rest), `"text":"second"`) {
 		t.Fatalf("missing second text delta: %q", rest)
+	}
+}
+
+func TestForwardDoesNotTurnTruncatedUpstreamIntoCleanEOF(t *testing.T) {
+	for _, contentType := range []string{"application/json", "text/event-stream"} {
+		t.Run(contentType, func(t *testing.T) {
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, writer, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				defer conn.Close()
+				_, _ = fmt.Fprintf(writer, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nTransfer-Encoding: chunked\r\n\r\nc\r\npartial body\r\n", contentType)
+				_ = writer.Flush() // Deliberately omit the final chunk.
+			}))
+			defer up.Close()
+			gateway := httptest.NewServer((&Server{Token: "t", Pool: pool.NewManager()}).Handler())
+			defer gateway.Close()
+			env, _ := json.Marshal(forwardEnv{URL: up.URL, Body: `{}`})
+			req, _ := http.NewRequest(http.MethodPost, gateway.URL+"/internal/forward", strings.NewReader(string(env)))
+			req.Header.Set("X-Kin-Internal-Token", "t")
+			resp, err := gateway.Client().Do(req)
+			if err != nil {
+				return // Aborting before headers also preserves the transport failure.
+			}
+			defer resp.Body.Close()
+			_, err = io.ReadAll(resp.Body)
+			if err == nil {
+				t.Fatal("truncated upstream was reported as a clean downstream EOF")
+			}
+		})
 	}
 }
