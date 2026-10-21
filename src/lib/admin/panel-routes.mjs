@@ -1,4 +1,5 @@
 import { flushPendingWrites } from '../db/pending-writes.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 /**
  * /admin and /api/panel routes. Login / logout / me and { ok, data }
  * envelopes are unchanged; slot start/reload go through startSlotReady.
@@ -5292,7 +5293,10 @@ export function createPanelHandler(ctx) {
             },
           })
         }
-        const engineRuntime = await prepareInheritedInferenceEngine(body)
+        const sharedRouting = isKubernetesMode()
+        const engineRuntime = sharedRouting
+          ? { ok: true, changed: false, items: [], ...(body?.inference ? { status: 'pending' } : {}) }
+          : await prepareInheritedInferenceEngine(body)
         if (!engineRuntime.ok) {
           return json(res, 503, {
             ok: false,
@@ -5308,7 +5312,7 @@ export function createPanelHandler(ctx) {
         try {
           applied = appliedDuringSwitch ?? (await persistRoutingPatch(body))
         } catch (error) {
-          await restoreRoutingRuntime(previousRoutingConfig)
+          if (!sharedRouting) await restoreRoutingRuntime(previousRoutingConfig)
           return json(res, 503, {
             ok: false,
             error: { code: 'routing_persist_failed', message: String(error?.message || error) },
@@ -5319,6 +5323,7 @@ export function createPanelHandler(ctx) {
           200,
           panel.ok({
             ...publicRoutingNotify(ctx.routingConfig),
+            ...(sharedRouting ? { routing_revision: applied.revision, application: applied.application } : {}),
             applied_concurrency: applied.concurrency,
             applied_rpm: applied.rpm,
             applied_session_slots: applied.session_slots,
