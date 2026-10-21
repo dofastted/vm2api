@@ -6,11 +6,19 @@ import path from 'node:path'
 import { createDatabase, getDb } from '../../src/lib/db/database.mjs'
 import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
 import { SharedBackgroundTasks } from '../../src/lib/core/shared-background-tasks.mjs'
-import { loadModelPolicy, getModelPolicy, syncWorkerModelsIntoPolicy } from '../../src/lib/protocol/model-policy.mjs'
+import {
+  loadModelPolicy,
+  getModelPolicy,
+  syncWorkerModelsIntoPolicy,
+  saveModelPolicy,
+  resetModelPolicy,
+} from '../../src/lib/protocol/model-policy.mjs'
 import {
   loadGptModelPolicy,
   getGptModelPolicy,
   syncGptIdsIntoPolicy,
+  saveGptModelPolicy,
+  resetGptModelPolicy,
 } from '../../src/lib/protocol/gpt-model-policy.mjs'
 import {
   syncClaudeCatalog,
@@ -78,6 +86,24 @@ test('failed catalog policy commits reject without publishing uncommitted models
   await assert.rejects(syncGptIdsIntoPolicy(['gpt-7-synthetic']), { code: 'P6485' })
   assert.equal(getGptModelPolicy().models['gpt-7-synthetic'], undefined)
 })
+
+for (const [name, write, read] of [
+  ['Claude save', saveModelPolicy, getModelPolicy],
+  ['Claude reset', resetModelPolicy, getModelPolicy],
+  ['GPT save', saveGptModelPolicy, getGptModelPolicy],
+  ['GPT reset', resetGptModelPolicy, getGptModelPolicy],
+]) {
+  test(`${name} rejects a PostgreSQL failure before publishing local policy`, async (t) => {
+    const { db } = await fixture(t)
+    const before = structuredClone(read())
+    await db.exec(`CREATE FUNCTION refuse_policy_write() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'synthetic policy write failure' USING ERRCODE='P6486'; END $$;
+      CREATE TRIGGER refuse_policy_write BEFORE INSERT OR UPDATE ON settings
+      FOR EACH ROW EXECUTE FUNCTION refuse_policy_write()`)
+    await assert.rejects(write({ ...before, source: 'synthetic-not-committed' }), { code: 'P6486' })
+    assert.deepEqual(read(), before)
+  })
+}
 
 test('concurrent Claude and GPT status writes preserve both platform fields', async (t) => {
   const { projectRoot } = await fixture(t)
