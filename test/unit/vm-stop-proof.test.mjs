@@ -14,7 +14,14 @@ function section(file, start, end) {
   return source.slice(source.indexOf(start), source.indexOf(end)).replaceAll('export ', '')
 }
 
-function localRuntime({ inspectError, running = true, restarting = false, noop = false, replace = false } = {}) {
+function localRuntime({
+  inspectError,
+  running = true,
+  restarting = false,
+  noop = false,
+  replace = false,
+  nameAbsent = false,
+} = {}) {
   const commands = []
   let present = true
   let replacement = false
@@ -23,6 +30,7 @@ function localRuntime({ inspectError, running = true, restarting = false, noop =
     if (argv[1] === 'inspect') {
       if (inspectError) return { ok: false, stderr: inspectError }
       const target = argv.at(-1)
+      if (nameAbsent && target === 'kin-synthetic') return { ok: false, stderr: `Error: No such object: ${target}` }
       if (!present && !(replacement && target === 'kin-synthetic')) {
         return { ok: false, stderr: `Error: No such object: ${target}` }
       }
@@ -114,6 +122,16 @@ test('known absent and already stopped containers remain successful', () => {
   )
   const f = localRuntime({ running: false })
   assert.equal(f.stopVmRuntime(f.vm).action, 'already-stopped')
+})
+
+test('a missing name cannot hide a still present recorded immutable local container', () => {
+  for (const action of ['stopVmRuntime', 'destroyVmRuntime']) {
+    const f = localRuntime({ nameAbsent: true, noop: true })
+    f.vm.runtime.container_id = 'original-id'
+    const result = f[action](f.vm)
+    assert.equal(result.ok, false)
+    assert.equal(result.vmOperationUncertain, true)
+  }
 })
 
 test('unconfirmed Docker termination retains the persistent VM operation', async () => {

@@ -5,7 +5,14 @@ import vmContext from 'node:vm'
 import { getDb } from '../../src/lib/db/database.mjs'
 import { SharedVmOperations } from '../../src/lib/vm/shared-vm-operations.mjs'
 
-function fixture({ noop = false, replace = false, inspectError = false, actionError = false, running = true } = {}) {
+function fixture({
+  noop = false,
+  replace = false,
+  inspectError = false,
+  actionError = false,
+  running = true,
+  nameAbsent = false,
+} = {}) {
   const source = fs.readFileSync(new URL('../../src/lib/cluster/remote-slot.mjs', import.meta.url), 'utf8')
   const body = source.slice(source.indexOf('export async function stopRemoteSlot(')).replaceAll('export ', '')
   let present = true
@@ -13,6 +20,7 @@ function fixture({ noop = false, replace = false, inspectError = false, actionEr
   const events = []
   const inspect = async (_docker, target) => {
     if (inspectError) throw new Error('Docker daemon unavailable')
+    if (target === 'kin-synthetic' && nameAbsent) return null
     if (target === 'kin-synthetic' && replacement) return { Id: 'replacement-id', State: { Running: true, Pid: 456 } }
     if (!present) return null
     return { Id: 'original-id', State: { Running: running, Restarting: false, Pid: running ? 123 : 0 }, HostConfig: {} }
@@ -101,6 +109,20 @@ test('remote command error can complete only after an independent terminal obser
 test('remote already stopped container remains successful', async () => {
   const f = fixture({ running: false })
   assert.equal((await f.stopRemoteSlot(f.vm)).ok, true)
+})
+
+test('a missing name cannot hide a still present recorded immutable remote container', async () => {
+  for (const action of ['stopRemoteSlot', 'destroyRemoteSlot']) {
+    const f = fixture({ nameAbsent: true, noop: true })
+    f.vm.runtime.container_id = 'original-id'
+    const result = await f[action](f.vm)
+    assert.equal(result.ok, false)
+    assert.equal(result.vmOperationUncertain, true)
+    assert.equal(
+      f.events.some(([name]) => name === 'files-remove'),
+      false,
+    )
+  }
 })
 
 test('unconfirmed remote stop keeps its persistent VM operation active', async () => {
