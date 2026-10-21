@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { setTimeout as delay } from 'node:timers/promises'
 import pg from 'pg'
 import { createDatabase, getDb, quoteIdentifier } from '../../src/lib/db/database.mjs'
+import { runPgTool } from '../../src/lib/admin/backup-core.mjs'
 
 async function fixture(t, { acknowledge = true } = {}) {
   const { GlobalMaintenanceCoordinator, coordinationSchemaFor } = await import(
@@ -305,4 +306,62 @@ test('stopping or losing a Pod preserves all of its unfinished durable activitie
   await assert.rejects(first.beginMaintenance({ kind: 'restore', timeoutMs: 2000 }), {
     code: 'maintenance_claims_active',
   })
+})
+
+test('startup migration is admitted before caches are bound and finishes before the exclusive drain', async (t) => {
+  const { db, first, second, operations } = await fixture(t, { acknowledge: false })
+  await first.acknowledgeEpoch(1)
+  const startup = await second.admitBootstrap()
+  const pending = first.beginMaintenance({ kind: 'backup', timeoutMs: 5000 })
+  await waitForPhase(second, 'draining')
+  await assert.rejects(first.admitBootstrap(), { code: 'database_maintenance' })
+  await startup.run(async () => {
+    second.assertActivity()
+    await db.exec('CREATE TABLE synthetic_startup (id integer)')
+    await second.acknowledgeEpoch(startup.epoch)
+  })
+  await startup.complete({ ended: true })
+  const operation = await pending
+  operations.push(operation)
+  await operation.resume()
+  await operation.close()
+  await assert.rejects(second.admitBootstrap(), { code: 'maintenance_bootstrap_bound' })
+})
+
+test('business-schema-only pg_dump excludes the persistent coordination latch and activities', async (t) => {
+  const { db, schema } = await fixture(t)
+  const dump = await runPgTool(
+    'pg_dump',
+    ['--schema-only', '--no-owner', '--no-privileges', `--schema=${db.schema}`],
+    db.connectionString,
+  )
+  assert.ok(dump.includes('CREATE TABLE ' + db.schema + '.settings'))
+  assert.equal(dump.includes(schema), false)
+  assert.equal(dump.includes('CREATE TABLE activities'), false)
+})
+
+test('an existing coordination schema cannot be adopted for another application binding', async (t) => {
+  const { db, peer, schema } = await fixture(t)
+  await db.pool.query(`UPDATE ${quoteIdentifier(schema)}.control SET application_schema = 'another_tenant' WHERE id=1`)
+  const { GlobalMaintenanceCoordinator } = await import('../../src/lib/db/global-maintenance.mjs')
+  const stranger = new GlobalMaintenanceCoordinator(peer, { ownerId: 'stranger' })
+  await assert.rejects(stranger.start(), { code: 'maintenance_schema_mismatch' })
+  assert.equal(
+    (await db.pool.query(`SELECT count(*) AS n FROM ${quoteIdentifier(schema)}.members WHERE owner_id='stranger'`))
+      .rows[0].n,
+    0,
+  )
+})
+
+test('a drain timeout preserves the pre-restore latch and only its original owner can cancel it', async (t) => {
+  const { first, second } = await fixture(t)
+  const gate = await second.admit({ kind: 'request' })
+  await assert.rejects(first.beginMaintenance({ kind: 'restore', timeoutMs: 30 }), { code: '57014' })
+  const state = await second.getState()
+  assert.equal(state.phase, 'draining')
+  assert.equal(state.epoch, 1)
+  await assert.rejects(second.cancelDrain(state.operationId), { code: 'maintenance_operation_changed' })
+  await gate.complete({ ended: true })
+  await first.cancelDrain(state.operationId)
+  assert.equal((await second.getState()).phase, 'open')
 })
