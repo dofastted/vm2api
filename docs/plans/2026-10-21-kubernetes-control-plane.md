@@ -24,7 +24,7 @@
 
 ## 为什么暂不开放多副本推理
 
-当前 key/user/账号/VM 并发与 RPM、Claude 座位、Codex 会话、同会话请求顺序、熔断及 OAuth single-flight 仍有进程内状态。AccountQuota 和 ProxyPool 的缓存快照存在跨实例覆盖问题。RuntimeSettings、路由、模型策略和 Sticky 映射也没有跨实例一致性协议。
+第一阶段发现的 key/user/账号/VM 并发与 RPM、设备座位、同会话顺序、Sticky 和缓存覆盖问题，已有后续共享状态实现。当前仍未完成执行端终止证明与自动接管、后台任务生产接线、一次性认证状态、全局维护、VM/凭据文件共享归属及所有管理入口的协调。共享熔断和 OAuth single-flight 也需继续核实。
 
 更关键的是，远端执行取消目前是 best-effort。控制面失联后，不能仅因租约过期就重新分配仍可能执行中的账号/VM 容量。安全的多活需要执行端 fencing 或可确认终止的 orphan 处理协议。活凭据、VM 文件和 Pod 本地 socket 的归属也必须先明确。
 
@@ -68,6 +68,13 @@
 
 `fb90450d` 已加入账号/VM/Fable/RPM 的共享准入、设备座位与 generation、发送前实际 kernel request ID 绑定，以及未知执行保留和停止重试。设备预算按账号跨 VM 计算。standalone 保留原同步调度路径。详细结果见 [共享执行验证](2026-10-21-kubernetes-execution-results.md)。全量 unit 为 3493 pass、7 fail、10 skip；全量 E2E 为 103 pass、17 fail、1 skip。失败差异和基线依据均在报告中列出。
 
-当前队列仍为进程内队列。同会话顺序和 Sticky 的跨副本条件更新未完成。HTTP/SSE EOF 终态还依赖正常 kernel 协议，尚无执行端 fencing；控制面死亡后的占位没有自动回收。独占锁和单副本限制继续保留。
+在 `fb90450d` 检查点，等待队列为进程内队列，同会话顺序和 Sticky 条件更新尚未实现；后续状态见下文共享快照增量。HTTP/SSE EOF 终态仍依赖正常 kernel 协议，尚无执行端 fencing；控制面死亡后的占位没有自动回收。独占锁和单副本限制继续保留。
 
-下一阶段需优先拆除整行快照覆盖：AccountQuota 的计数改为 PG 原子增量，响应头/probe 改为有数据库观测顺序的字段补丁，身份与并发/RPM 配置使用管理补丁。`panel-api` 的显示检查、Fable probe、手工清理以及 `panel-routes` 的身份修改也会调用整行 `save`，需要同时覆盖。保留已有 bigint 精度和 `countRequest:false` 行为。ProxyPool 的 probe 当前仍调用 `replaceAll` 删除重建代理表，需要拆成目标行配置、健康、绑定及删除操作，并校验 probe 对应的配置版本。
+该检查点之后已实施的快照改造起点为：AccountQuota 的计数改为 PG 原子增量，响应头/probe 改为有数据库观测顺序的字段补丁，身份与并发/RPM 配置使用管理补丁。`panel-api` 的显示检查、Fable probe、手工清理以及 `panel-routes` 的身份修改也会调用整行 `save`，需要同时覆盖。保留已有 bigint 精度和 `countRequest:false` 行为。ProxyPool 的 probe 当前仍调用 `replaceAll` 删除重建代理表，需要拆成目标行配置、健康、绑定及删除操作，并校验 probe 对应的配置版本。
+
+
+## 共享快照与请求接线增量
+
+固定源码 `6732a8648a4a57c6483abc7f685fce4d8cb28946` 已在独立检出完成全量检查：unit 3658 pass、7 fail、10 skip；E2E 104 pass、17 fail、1 skip。全部失败名称及断言文本与上一轮记录一致。AccountQuota/ProxyPool/SchedulingRuntime 字段更新、Sticky PG 条件更新与墓碑、共享同会话 FIFO、Codex 执行准入、PG 路由 revision 及准入事务校验均已接入。后续 Search 和面板路由状态接口另有定向验证。
+
+结果与范围见 [共享状态验证报告](2026-10-21-kubernetes-shared-snapshots-results.md)。控制面仍为单活动副本。后台任务接线、一次性认证状态、全局维护、所有 VM 管理入口、执行端 fencing 和多节点运行验收继续进行；没有因此关闭 #648。
