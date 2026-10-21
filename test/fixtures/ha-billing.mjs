@@ -43,7 +43,7 @@ export async function haBillingFixture(t) {
   return { db, peer, original, recovery, originalGate, recoveryGate }
 }
 
-export async function billingRequest(f, callback = async () => {}, { snapshot = syntheticBillingSnapshot(), jobs = 1 } = {}) {
+export async function billingRequest(f, callback = async () => {}, { snapshot = syntheticBillingSnapshot(), jobs = 1, stopOwner = true } = {}) {
   const nodeBinding = { protocol: 'KSG2', nodeId: 'original-node', vmId: 'vm-fixture', kind: 'kernel', fence: syntheticFence() }
   const data = { nodeBinding, commandIds: [] }
   await f.originalGate.run(() => withHaRequestContext({ db: f.db, requestId: 'billing-parent', activity: f.originalGate, recoveryKind: 'claude_messages' }, async () => {
@@ -64,7 +64,7 @@ export async function billingRequest(f, callback = async () => {}, { snapshot = 
     await data.admission.markUncertain()
   }))
   await f.originalGate.complete({ ended: false, reason: 'synthetic_owner_lost' })
-  await f.original.stop()
+  if (stopOwner) await f.original.stop()
   return data
 }
 
