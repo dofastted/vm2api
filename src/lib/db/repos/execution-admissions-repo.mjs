@@ -92,6 +92,10 @@ export class ExecutionAdmissionsRepo {
     const family = input.family == null ? null : identifier(input.family, 'family')
     return withTransaction(this.db, async () => {
       await this.lockResources({ accountId, vmIds: [vmId] })
+      const operation = await this.db
+        .prepare('SELECT id FROM vm_operations WHERE vm_id = $1 AND released_at IS NULL')
+        .get(vmId)
+      if (operation) return denied('vm_operation_active', 0, vmLimit)
       const { now } = await this.db.prepare('SELECT clock_timestamp() AS now').get()
       await this.db
         .prepare(`DELETE FROM execution_admissions WHERE account_id = $1
