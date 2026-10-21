@@ -1082,6 +1082,12 @@ export function createHandleProtocol(deps) {
     try {
       await syncClaudeKernelConfigsFromFile(cfg.paths?.project, routingConfigPath)?.publication
     } catch (error) {
+      if (
+        error?.publicationFinished === true &&
+        error?.executionUncertain !== true &&
+        error?.vmOperationUncertain !== true
+      )
+        throw error
       admission.executionStarted = true
       if (admission.lease?.shared) admission.lease.executionUncertain = true
       await observeExecution(req, admission, { started: true, ended: false, reason: 'remote_publication_unknown' })
@@ -1356,6 +1362,12 @@ export function createHandleProtocol(deps) {
           try {
             await touchTelemetrySession(cfg.paths.project, selected.vmId, selected.exec?.vm)?.publication
           } catch (error) {
+            if (
+              error?.publicationFinished === true &&
+              error?.executionUncertain !== true &&
+              error?.vmOperationUncertain !== true
+            )
+              throw error
             error.executionUncertain = true
             admission.executionStarted = true
             if (admission.lease?.shared) admission.lease.executionUncertain = true
