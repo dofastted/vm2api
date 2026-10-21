@@ -1292,7 +1292,8 @@ async function withRequestActivity(req, res, callback, kind = 'http') {
       '/v1/completions',
       '/completions',
     ].includes(pathname)
-  const trackHaRequest = haMode && (recoverable || kind === 'websocket_request')
+  const protocolContext = req.method === 'POST' && ['/v1/responses', '/responses'].includes(pathname)
+  const trackHaRequest = haMode && (recoverable || protocolContext || kind === 'websocket_request')
   const gate = await activityCoordinator.admit({ kind, requestId })
   const state = { gate, executions: new Map(), unknown: false }
   requestActivities.set(req, state)
