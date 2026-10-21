@@ -64,24 +64,36 @@ async function persist() {
   }
 }
 
+function normalizeGptPolicy(stored) {
+  if (!stored || typeof stored !== 'object' || !stored.models || typeof stored.models !== 'object') return null
+  const live = stored.source === 'codex' && Object.keys(stored.models).length
+  const seed = seedGptPolicy()
+  const normalized = {
+    ...(live ? stored : { ...seed, ...stored, models: { ...seed.models, ...stored.models } }),
+    platform: 'openai',
+  }
+  normalized.source = normalized.source || 'settings'
+  return normalized
+}
+
 export async function loadGptModelPolicy({ force = false } = {}) {
   if (loaded && !force) return policy
   try {
-    const stored = new SettingsRepo().get(SETTINGS_KEY, null)
-    if (stored && typeof stored === 'object' && stored.models && typeof stored.models === 'object') {
-      const live = stored.source === 'codex' && Object.keys(stored.models).length
-      policy = {
-        ...(live ? stored : { ...seedGptPolicy(), ...stored, models: { ...seedGptPolicy().models, ...stored.models } }),
-        platform: 'openai',
-      }
-      policy.source = policy.source || 'settings'
-    } else {
+    policy = normalizeGptPolicy(new SettingsRepo().get(SETTINGS_KEY, null))
+    if (!policy) {
       policy = seedGptPolicy()
       await persist()
     }
   } catch {
     policy = seedGptPolicy()
   }
+  loaded = true
+  return policy
+}
+
+/** Apply a refreshed settings value without persisting missing-policy defaults. */
+export function refreshGptModelPolicy(stored) {
+  policy = normalizeGptPolicy(stored) || seedGptPolicy()
   loaded = true
   return policy
 }

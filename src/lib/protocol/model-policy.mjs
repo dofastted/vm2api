@@ -624,6 +624,13 @@ async function persistHaiku55Model(repo, stored) {
   return next
 }
 
+/** Apply a refreshed settings value without running startup migrations or writes. */
+export function refreshModelPolicy(stored) {
+  policy = normalizePolicy(stored)
+  loaded = true
+  return policy
+}
+
 export function getModelPolicy() {
   return policy
 }
