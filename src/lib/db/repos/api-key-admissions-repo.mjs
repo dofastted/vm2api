@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import { withTransaction } from '../database.mjs'
 import { ApiKeysRepo } from './api-keys-repo.mjs'
 import { UsersRepo } from './users-repo.mjs'
+import { lockHaRequestContext } from '../../core/ha-request-context.mjs'
 
 /** Shared concurrency, request-quota reservations and the rolling RPM history. */
 export class ApiKeyAdmissionsRepo {
@@ -13,6 +14,7 @@ export class ApiKeyAdmissionsRepo {
 
   async reserve(keyId, ownerId, validate) {
     return withTransaction(this.db, async () => {
+      const context = await lockHaRequestContext(this.db)
       // Every admission locks key then owner. The owner lock serializes
       // requests made with different keys belonging to the same user.
       const record = await this.keys.getById(keyId, { forUpdate: true })
@@ -53,9 +55,9 @@ export class ApiKeyAdmissionsRepo {
       if (!gate.ok) return gate
       const reservationId = crypto.randomUUID()
       await this.db
-        .prepare(`INSERT INTO api_key_admissions (id, key_id, user_id, owner_id, created_at)
-        VALUES ($1, $2, $3, $4, $5)`)
-        .run(reservationId, keyId, record.user_id, ownerId, now)
+        .prepare(`INSERT INTO api_key_admissions (id, key_id, user_id, owner_id, created_at, ha_request_id)
+        VALUES ($1, $2, $3, $4, $5, $6)`)
+        .run(reservationId, keyId, record.user_id, ownerId, now, context?.requestId ?? null)
       return { ok: true, record, reservationId, ownerId }
     })
   }

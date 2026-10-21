@@ -32,9 +32,22 @@ async function fixture(callback) {
   }
 }
 
-const input = (requestId = 'unrelated-local-id') => ({ accountId: 'fixture-account', vmId: 'vm-fixture', requestId,
-  accountLimit: 5, vmLimit: 5, fableLimit: 0, rpmLimit: 0 })
-const binding = { protocol: 'KSG2', nodeId: 'fixture-node', vmId: 'vm-fixture', kind: 'kernel', fence: syntheticFence() }
+const input = (requestId = 'unrelated-local-id') => ({
+  accountId: 'fixture-account',
+  vmId: 'vm-fixture',
+  requestId,
+  accountLimit: 5,
+  vmLimit: 5,
+  fableLimit: 0,
+  rpmLimit: 0,
+})
+const binding = {
+  protocol: 'KSG2',
+  nodeId: 'fixture-node',
+  vmId: 'vm-fixture',
+  kind: 'kernel',
+  fence: syntheticFence(),
+}
 
 test('two PG connections see exact activity, key, turn, execution, attempt and original node-job links before submission', async () => {
   await fixture(async ({ db, peer, activity, withHaRequestContext, withHaRequestAttempt }) => {
@@ -46,15 +59,24 @@ test('two PG connections see exact activity, key, turn, execution, attempt and o
       const turn = await new SharedSessionTurns(db).enqueue('fixture-session', 'not-a-join-key')
       const lease = await new ExecutionAdmissionsRepo(db).tryReserve(input())
       assert.equal(lease.ok, true)
-      await new RequestAttemptsRepo(db).begin({ requestId: 'not-a-join-key', attemptNo: 1,
-        vmId: 'vm-fixture', accountId: 'fixture-account', model: 'claude-synthetic' })
+      await new RequestAttemptsRepo(db).begin({
+        requestId: 'not-a-join-key',
+        attemptNo: 1,
+        vmId: 'vm-fixture',
+        accountId: 'fixture-account',
+        model: 'claude-synthetic',
+      })
       await withHaRequestAttempt(1, () => lease.bindExecution({ requestId: 'node-command-one', nodeBinding: binding }))
       const request = await peer.prepare('SELECT * FROM ha_request_contexts WHERE id=$1').get('server-request-one')
       assert.equal(request.activity_id, activity.activityId)
       assert.equal(request.activity_owner_id, activity.ownerId)
       assert.equal(String(request.activity_epoch), String(activity.epoch))
       assert.equal(request.accepting_children, true)
-      for (const [table, id] of [['api_key_admissions', keyLease.reservationId], ['session_turns', turn.id], ['execution_admissions', lease.admissionId]]) {
+      for (const [table, id] of [
+        ['api_key_admissions', keyLease.reservationId],
+        ['session_turns', turn.id],
+        ['execution_admissions', lease.admissionId],
+      ]) {
         const row = await peer.prepare(`SELECT ha_request_id FROM ${table} WHERE id=$1`).get(id)
         assert.equal(row.ha_request_id, 'server-request-one')
       }
@@ -69,8 +91,14 @@ test('two PG connections see exact activity, key, turn, execution, attempt and o
     const ended = await peer.prepare('SELECT * FROM ha_request_contexts WHERE id=$1').get('server-request-one')
     assert.equal(ended.accepting_children, false)
     assert.ok(ended.handler_returned_at)
-    assert.equal((await peer.prepare('SELECT count(*) AS count FROM execution_admissions WHERE released_at IS NULL').get()).count, 1)
-    assert.equal((await peer.prepare('SELECT count(*) AS count FROM api_key_admissions WHERE released_at IS NULL').get()).count, 1)
+    assert.equal(
+      (await peer.prepare('SELECT count(*) AS count FROM execution_admissions WHERE released_at IS NULL').get()).count,
+      1,
+    )
+    assert.equal(
+      (await peer.prepare('SELECT count(*) AS count FROM api_key_admissions WHERE released_at IS NULL').get()).count,
+      1,
+    )
   })
 })
 
@@ -78,8 +106,12 @@ test('a late child waits for the parent SQL lock and is rejected after another c
   await fixture(async ({ db, peer, activity, withHaRequestContext }) => {
     await withHaRequestContext({ db, activity, requestId: 'sealed-request' }, async () => {
       let resume, locked
-      const waiting = new Promise((resolve) => { resume = resolve })
-      const ready = new Promise((resolve) => { locked = resolve })
+      const waiting = new Promise((resolve) => {
+        resume = resolve
+      })
+      const ready = new Promise((resolve) => {
+        locked = resolve
+      })
       const close = withTransaction(peer, async () => {
         await peer.prepare('SELECT id FROM ha_request_contexts WHERE id=$1 FOR UPDATE').get('sealed-request')
         locked()
@@ -103,11 +135,23 @@ test('a node job cannot bind an admission from a different HA request or an abse
     let lease
     await withHaRequestContext({ db, activity, requestId: 'request-a' }, async () => {
       lease = await new ExecutionAdmissionsRepo(db).tryReserve(input())
-      await assert.rejects(withHaRequestAttempt(1, () => lease.bindExecution({ requestId: 'missing-attempt', nodeBinding: binding })), { code: 'ha_request_attempt_missing' })
+      await assert.rejects(
+        withHaRequestAttempt(1, () => lease.bindExecution({ requestId: 'missing-attempt', nodeBinding: binding })),
+        { code: 'ha_request_attempt_missing' },
+      )
     })
     await withHaRequestContext({ db, activity, requestId: 'request-b' }, async () => {
-      await new RequestAttemptsRepo(db).begin({ requestId: 'request-b', attemptNo: 1, vmId: 'vm-fixture', accountId: 'fixture-account', model: 'claude-synthetic' })
-      await assert.rejects(withHaRequestAttempt(1, () => lease.bindExecution({ requestId: 'cross-request', nodeBinding: binding })), { code: 'ha_request_context_mismatch' })
+      await new RequestAttemptsRepo(db).begin({
+        requestId: 'request-b',
+        attemptNo: 1,
+        vmId: 'vm-fixture',
+        accountId: 'fixture-account',
+        model: 'claude-synthetic',
+      })
+      await assert.rejects(
+        withHaRequestAttempt(1, () => lease.bindExecution({ requestId: 'cross-request', nodeBinding: binding })),
+        { code: 'ha_request_context_mismatch' },
+      )
     })
     assert.equal((await peer.prepare('SELECT count(*) AS count FROM execution_jobs').get()).count, 0)
   })
@@ -115,8 +159,85 @@ test('a node job cannot bind an admission from a different HA request or an abse
 
 test('HA requires its original live activity and context before reserving execution', async () => {
   await fixture(async ({ db, peer, activity, withHaRequestContext }) => {
-    await assert.rejects(withHaRequestContext({ db, activity: { ...activity, activityId: 'other-activity' }, requestId: 'forged' }, async () => {}), { code: 'ha_request_activity_mismatch' })
+    await assert.rejects(
+      withHaRequestContext(
+        { db, activity: { ...activity, activityId: 'other-activity' }, requestId: 'forged' },
+        async () => {},
+      ),
+      { code: 'ha_request_activity_mismatch' },
+    )
     await assert.rejects(new ExecutionAdmissionsRepo(db).tryReserve(input()), { code: 'ha_request_context_required' })
     assert.equal((await peer.prepare('SELECT count(*) AS count FROM execution_admissions').get()).count, 0)
   })
 })
+
+test('sealing the SQL parent rejects late key reservations, turns and attempts without new child rows', async () => {
+  await fixture(async ({ db, peer, activity, withHaRequestContext }) => {
+    const keys = new ApiKeyStore({ db })
+    const key = await keys.create({ name: 'synthetic-sealed-key' })
+    await withHaRequestContext({ db, activity, requestId: 'sealed-all-children' }, async () => {
+      await peer
+        .prepare('UPDATE ha_request_contexts SET accepting_children=false WHERE id=$1')
+        .run('sealed-all-children')
+      await assert.rejects(keys.reserve(key), { code: 'ha_request_context_closed' })
+      await assert.rejects(new SharedSessionTurns(db).enqueue('late-session', 'late-request'), {
+        code: 'ha_request_context_closed',
+      })
+      await assert.rejects(new RequestAttemptsRepo(db).begin({ requestId: 'late-request', attemptNo: 1 }), {
+        code: 'ha_request_context_closed',
+      })
+      for (const table of ['api_key_admissions', 'session_turns', 'request_attempts'])
+        assert.equal((await peer.prepare(`SELECT count(*) AS count FROM ${table}`).get()).count, 0)
+    })
+  })
+})
+
+test('a waiting session turn cannot activate after another connection seals its request', async () => {
+  await fixture(async ({ db, peer, activity, withHaRequestContext }) => {
+    await withHaRequestContext({ db, activity, requestId: 'sealed-turn' }, async () => {
+      const turns = new SharedSessionTurns(db)
+      const handle = await turns.enqueue('sealed-session', 'untrusted-correlation')
+      await peer.prepare('UPDATE ha_request_contexts SET accepting_children=false WHERE id=$1').run('sealed-turn')
+      await assert.rejects(turns.tryActivate(handle), { code: 'ha_request_context_closed' })
+      assert.equal((await peer.prepare('SELECT state FROM session_turns WHERE id=$1').get(handle.id)).state, 'waiting')
+    })
+  })
+})
+
+test('a callback retained past its request wrapper cannot create another execution', async () => {
+  await fixture(async ({ db, peer, activity, withHaRequestContext }) => {
+    let resume
+    const blocked = new Promise((resolve) => {
+      resume = resolve
+    })
+    let pending
+    await withHaRequestContext({ db, activity, requestId: 'returned-request' }, async () => {
+      pending = blocked.then(() => new ExecutionAdmissionsRepo(db).tryReserve(input()))
+      pending.catch(() => {})
+    })
+    resume()
+    await assert.rejects(pending, { code: 'ha_request_context_closed' })
+    assert.equal((await peer.prepare('SELECT count(*) AS count FROM execution_admissions').get()).count, 0)
+  })
+})
+
+for (const mode of ['standalone', 'kubernetes']) {
+  test(`${mode} keeps nullable request links and does not require an HA wrapper`, async () => {
+    await fixture(async ({ db, peer, withHaRequestContext }) => {
+      process.env.VM2API_CONTROL_PLANE_MODE = mode
+      try {
+        await withHaRequestContext({ db, requestId: 'unused-legacy', activity: null }, async () => {
+          const lease = await new ExecutionAdmissionsRepo(db).tryReserve(input())
+          await lease.bindExecution({ requestId: 'legacy-job' })
+          await new SharedSessionTurns(db).enqueue('legacy-session', 'legacy-request')
+          await new RequestAttemptsRepo(db).begin({ requestId: 'legacy-request', attemptNo: 1 })
+          assert.equal((await peer.prepare('SELECT count(*) AS count FROM ha_request_contexts').get()).count, 0)
+          for (const table of ['execution_admissions', 'execution_jobs', 'session_turns', 'request_attempts'])
+            assert.equal((await peer.prepare(`SELECT ha_request_id FROM ${table}`).get()).ha_request_id, null)
+        })
+      } finally {
+        process.env.VM2API_CONTROL_PLANE_MODE = 'kubernetes-ha'
+      }
+    })
+  })
+}

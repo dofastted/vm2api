@@ -1,4 +1,5 @@
-import { getDb } from '../database.mjs'
+import { getDb, withTransaction } from '../database.mjs'
+import { lockHaRequestContext } from '../../core/ha-request-context.mjs'
 
 function parse(value, fallback = null) {
   if (value == null) return fallback
@@ -42,8 +43,8 @@ export class RequestAttemptsRepo {
         request_id, attempt_no, vm_id, account_id, model, selection_reason,
         started_at, completed_at, upstream_status, error_scope, action,
         cooldown_until, downstream_committed, terminal_state, usage_json,
-        wait_ms, ttft_ms, latency_ms
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+        wait_ms, ttft_ms, latency_ms, ha_request_id
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
     `)
     this._complete = db.prepare(`
       UPDATE request_attempts SET
@@ -61,28 +62,32 @@ export class RequestAttemptsRepo {
   }
 
   async begin({ requestId, attemptNo, vmId, accountId, model, selectionReason, waitMs = 0 }) {
-    const startedAt = new Date().toISOString()
-    await this._insert.run(
-      requestId,
-      attemptNo,
-      vmId ?? null,
-      accountId ?? null,
-      model ?? null,
-      selectionReason ?? null,
-      startedAt,
-      null,
-      null,
-      null,
-      null,
-      null,
-      0,
-      'started',
-      null,
-      waitMs ?? 0,
-      null,
-      null,
-    )
-    return (await this.list(requestId)).find((item) => item.attempt_no === attemptNo) || null
+    return withTransaction(this.db, async () => {
+      const context = await lockHaRequestContext(this.db)
+      const startedAt = new Date().toISOString()
+      await this._insert.run(
+        context?.requestId ?? requestId,
+        attemptNo,
+        vmId ?? null,
+        accountId ?? null,
+        model ?? null,
+        selectionReason ?? null,
+        startedAt,
+        null,
+        null,
+        null,
+        null,
+        null,
+        0,
+        'started',
+        null,
+        waitMs ?? 0,
+        null,
+        null,
+        context?.requestId ?? null,
+      )
+      return (await this.list(context?.requestId ?? requestId)).find((item) => item.attempt_no === attemptNo) || null
+    })
   }
 
   async complete(requestId, attemptNo, result = {}) {

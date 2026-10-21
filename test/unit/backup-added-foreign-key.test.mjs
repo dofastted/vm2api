@@ -26,5 +26,8 @@ test('an older snapshot restores after a later same-schema parent adds an FK to 
   await settings.set('synthetic-restore-marker', 'after')
   assert.equal((await service.restoreBackup(backup.id)).ok, true)
   assert.equal(await settings.get('synthetic-restore-marker'), 'before')
-  assert.equal((await db.prepare('SELECT to_regclass($1) AS name').get(`${db.schema}.fixture_later_request_context`)).name, null)
+  assert.equal(
+    (await db.prepare('SELECT to_regclass($1) AS name').get(`${db.schema}.fixture_later_request_context`)).name,
+    null,
+  )
 })

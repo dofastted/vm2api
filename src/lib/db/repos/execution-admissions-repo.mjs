@@ -4,6 +4,7 @@ import { physicalContainerName, physicalVmAliases } from '../../vm/vm-physical-t
 import { readWatchdogState } from '../../transport/kernel-watchdog-state.mjs'
 import { ExecutionCircuitsRepo } from './execution-circuits-repo.mjs'
 import { normalizeNodeBinding, normalizeNodeCompletion, sameNodeBinding } from '../../core/node-execution-proof.mjs'
+import { lockHaRequestContext } from '../../core/ha-request-context.mjs'
 
 function invalid(field) {
   return Object.assign(new Error(`Invalid execution admission ${field}`), { code: 'invalid_execution_admission' })
@@ -108,6 +109,7 @@ export class ExecutionAdmissionsRepo {
     const rpmLimit = limit(input.rpmLimit, 'rpmLimit')
     const family = input.family == null ? null : identifier(input.family, 'family')
     return withTransaction(this.db, async () => {
+      const context = await lockHaRequestContext(this.db)
       await this.assertRoutingRevision(input.routingRevision)
       await this.lockResources({ accountId, vmIds: [vmId] })
       const operation = await this.db
@@ -150,9 +152,19 @@ export class ExecutionAdmissionsRepo {
         input.circuit && !input.pinned ? await this.circuits.admit(accountId, admissionId, now, input.circuit) : null
       if (circuit && !circuit.ok) return circuit
       const record = await this.db
-        .prepare(`INSERT INTO execution_admissions (id, owner_id, request_id, account_id, vm_id, model_family, created_at, circuit_revision)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`)
-        .get(admissionId, ownerId, requestId, accountId, vmId, family, now, circuit?.revision ?? null)
+        .prepare(`INSERT INTO execution_admissions (id, owner_id, request_id, account_id, vm_id, model_family, created_at, circuit_revision, ha_request_id)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`)
+        .get(
+          admissionId,
+          ownerId,
+          context?.requestId ?? requestId,
+          accountId,
+          vmId,
+          family,
+          now,
+          circuit?.revision ?? null,
+          context?.requestId ?? null,
+        )
       const handle = { admissionId, ownerId }
       return {
         ok: true,
@@ -196,6 +208,7 @@ export class ExecutionAdmissionsRepo {
   async bindExecution(handle, execution) {
     const nodeBinding = execution?.nodeBinding === undefined ? null : normalizeNodeBinding(execution.nodeBinding)
     return withTransaction(this.db, async () => {
+      const context = await lockHaRequestContext(this.db)
       const before = await this.db
         .prepare('SELECT account_id, vm_id FROM execution_admissions WHERE id = $1 AND owner_id = $2')
         .get(handle.admissionId, handle.ownerId)
@@ -216,6 +229,16 @@ export class ExecutionAdmissionsRepo {
       if (typeof execution?.requestId !== 'string' || !execution.requestId.trim()) {
         throw jobError('invalid_execution_job')
       }
+      if ((admission.ha_request_id ?? null) !== (context?.requestId ?? null))
+        throw jobError('ha_request_context_mismatch')
+      if (context) {
+        if (!nodeBinding || !context.attemptNo) throw jobError('ha_request_attempt_missing')
+        const attempt = await this.db
+          .prepare(`SELECT id FROM request_attempts WHERE ha_request_id=$1
+          AND attempt_no=$2 AND vm_id=$3 AND account_id=$4`)
+          .get(context.requestId, context.attemptNo, admission.vm_id, admission.account_id)
+        if (!attempt) throw jobError('ha_request_attempt_missing')
+      }
       if (nodeBinding && nodeBinding.vmId !== admission.vm_id) throw jobError('execution_node_binding_mismatch')
       const operation = await this.db
         .prepare(`SELECT id FROM vm_operations WHERE released_at IS NULL
@@ -227,9 +250,15 @@ export class ExecutionAdmissionsRepo {
         .get(handle.admissionId)
       if (pending) throw jobError('execution_job_pending')
       const row = await this.db
-        .prepare(`INSERT INTO execution_jobs (request_id, admission_id, node_binding) VALUES ($1, $2, $3::jsonb)
+        .prepare(`INSERT INTO execution_jobs (request_id, admission_id, node_binding, ha_request_id, attempt_no) VALUES ($1, $2, $3::jsonb, $4, $5)
         ON CONFLICT (request_id) DO NOTHING RETURNING request_id`)
-        .get(execution.requestId, handle.admissionId, nodeBinding ? JSON.stringify(nodeBinding) : null)
+        .get(
+          execution.requestId,
+          handle.admissionId,
+          nodeBinding ? JSON.stringify(nodeBinding) : null,
+          context?.requestId ?? null,
+          context?.attemptNo ?? null,
+        )
       if (!row) throw jobError('execution_job_exists')
       return {
         bound: true,

@@ -1,4 +1,6 @@
 import { trackPendingWrite } from '../db/pending-writes.mjs'
+import { currentHaRequestContext } from '../core/ha-request-context.mjs'
+import { isKubernetesHaMode } from '../core/control-plane-mode.mjs'
 /**
  * /v1 protocol handler. URLs, auth, and response envelopes stay with the
  * server wiring; this factory owns convert → pool → Go/Rust hop → client.
@@ -546,6 +548,7 @@ export function createHandleProtocol(deps) {
 
   async function handleProtocolRequest(req, res, protocol, pathName, admission) {
     const logCtx = requestLog.start(req, { protocol, pathName })
+    if (isKubernetesHaMode()) logCtx.request_id = currentHaRequestContext().requestId
     res._kinRequestId = logCtx.request_id
     // Registers its own 'finish' listener first so status/headers are final when finish() runs.
     requestLog.tapResponse?.(logCtx, res)

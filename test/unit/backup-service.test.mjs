@@ -79,7 +79,8 @@ test('restoring the application schema preserves later writes in a neighboring s
 test('restoring a PG 001 snapshot removes later tables before reapplying current migrations', async () => {
   const db = getDb()
   await db.exec(
-    `DROP TABLE panel_sessions, api_key_admissions, gateway_rate_buckets, execution_jobs, execution_admissions, execution_seats, session_turns, vm_operations, background_task_runs, oauth_pkce_sessions, shell_tickets, execution_circuits;
+    `ALTER TABLE request_attempts DROP COLUMN ha_request_id;
+    DROP TABLE ha_request_contexts, panel_sessions, api_key_admissions, gateway_rate_buckets, execution_jobs, execution_admissions, execution_seats, session_turns, vm_operations, background_task_runs, oauth_pkce_sessions, shell_tickets, execution_circuits;
     ALTER TABLE accounts DROP COLUMN observation_versions;
     ALTER TABLE proxies DROP COLUMN config_revision;
     ALTER TABLE sticky_sessions DROP COLUMN deleted_at;
@@ -105,6 +106,7 @@ test('restoring a PG 001 snapshot removes later tables before reapplying current
     'execution_circuits',
     'execution_seats',
     'execution_jobs',
+    'ha_request_contexts',
     'session_turns',
     'vm_operations',
     'background_task_runs',
@@ -113,13 +115,14 @@ test('restoring a PG 001 snapshot removes later tables before reapplying current
   ]) {
     assert.equal((await db.prepare(`SELECT count(*) AS n FROM ${name}`).get()).n, 0)
   }
-  assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 18)
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 19)
 })
 
 test('an outside dependency refuses older-snapshot cleanup without changing either schema', async () => {
   const db = getDb()
   await db.exec(
-    `DROP TABLE panel_sessions, api_key_admissions, gateway_rate_buckets, execution_jobs, execution_admissions, execution_seats, session_turns, vm_operations, background_task_runs, oauth_pkce_sessions, shell_tickets, execution_circuits;
+    `ALTER TABLE request_attempts DROP COLUMN ha_request_id;
+    DROP TABLE ha_request_contexts, panel_sessions, api_key_admissions, gateway_rate_buckets, execution_jobs, execution_admissions, execution_seats, session_turns, vm_operations, background_task_runs, oauth_pkce_sessions, shell_tickets, execution_circuits;
     ALTER TABLE accounts DROP COLUMN observation_versions;
     ALTER TABLE proxies DROP COLUMN config_revision;
     ALTER TABLE sticky_sessions DROP COLUMN deleted_at;

@@ -25,6 +25,7 @@ import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 import { SharedSessionTurns } from './shared-session-turns.mjs'
 import { getDb } from '../db/database.mjs'
 import { withRefreshAdmission } from '../oauth/shared-credential-refresh.mjs'
+import { withHaRequestAttempt } from '../core/ha-request-context.mjs'
 
 // Seat wait for the one-shot repair hop when the rejected hop already spent the deadline.
 const REPAIR_HOP_WAIT_MS = 30_000
@@ -991,19 +992,21 @@ export class FailoverRunner {
             if (!bound) return stickyConflict()
           }
           callEntered = true
-          result = await this.withCredentialAdmission(selected, () =>
-            callAttempt({
-              candidate: selected,
-              body,
-              attemptMeta,
-              attemptNo,
-              stream,
-              deliveryMode: deliveryMode || this.config.delivery_mode,
-              signal,
-              onCommit: () => {
-                committed = true
-              },
-            }),
+          result = await withHaRequestAttempt(attemptNo, () =>
+            this.withCredentialAdmission(selected, () =>
+              callAttempt({
+                candidate: selected,
+                body,
+                attemptMeta,
+                attemptNo,
+                stream,
+                deliveryMode: deliveryMode || this.config.delivery_mode,
+                signal,
+                onCommit: () => {
+                  committed = true
+                },
+              }),
+            ),
           )
           executionEnded = result?.execution?.ended === true
           if (selected.bindExecution && (!executionEnded || result?.executionUncertain)) {

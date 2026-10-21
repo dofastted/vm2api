@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { getDb, withTransaction } from '../db/database.mjs'
+import { lockHaRequestContext } from '../core/ha-request-context.mjs'
 
 function cancelled() {
   return Object.assign(new Error('Request was cancelled'), { code: 'request_cancelled' })
@@ -44,24 +45,28 @@ export class SharedSessionTurns {
   async enqueue(sessionKey, requestId) {
     const id = randomUUID()
     return withTransaction(this.db, async () => {
+      const context = await lockHaRequestContext(this.db)
       // Allocate sequence under the same lock as activation, so an uncommitted
       // earlier insert cannot be invisible when a later waiter claims the head.
       await this.lock(sessionKey)
       await this.db
-        .prepare(`INSERT INTO session_turns (id, session_key, owner_id, request_id, state)
-          VALUES ($1,$2,$3,$4,'waiting')`)
-        .run(id, sessionKey, this.ownerId, requestId ?? null)
+        .prepare(`INSERT INTO session_turns (id, session_key, owner_id, request_id, state, ha_request_id)
+          VALUES ($1,$2,$3,$4,'waiting',$5)`)
+        .run(id, sessionKey, this.ownerId, context?.requestId ?? requestId ?? null, context?.requestId ?? null)
       return { id, sessionKey, ownerId: this.ownerId }
     })
   }
 
   async tryActivate(handle) {
     return withTransaction(this.db, async () => {
+      const context = await lockHaRequestContext(this.db)
       await this.lock(handle.sessionKey)
       const head = await this.db
         .prepare('SELECT * FROM session_turns WHERE session_key = $1 ORDER BY sequence LIMIT 1 FOR UPDATE')
         .get(handle.sessionKey)
       if (head?.id !== handle.id || head.owner_id !== handle.ownerId || head.state !== 'waiting') return false
+      if ((head.ha_request_id ?? null) !== (context?.requestId ?? null))
+        throw Object.assign(new Error('HA request context mismatch'), { code: 'ha_request_context_mismatch' })
       await this.db
         .prepare("UPDATE session_turns SET state = 'active', activated_at = clock_timestamp() WHERE id = $1")
         .run(handle.id)

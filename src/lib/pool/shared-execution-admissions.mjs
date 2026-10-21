@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import { getDb, withTransaction } from '../db/database.mjs'
 import { ExecutionAdmissionsRepo } from '../db/repos/execution-admissions-repo.mjs'
 import { budgetAllows } from './seat-planner.mjs'
+import { lockHaRequestContext } from '../core/ha-request-context.mjs'
 
 function invalid(field) {
   return Object.assign(new Error(`Invalid shared execution ${field}`), { code: 'invalid_execution_admission' })
@@ -68,6 +69,8 @@ export class SharedExecutionAdmissions {
       throw invalid('seatReservePct')
     if (input.seatHeadroom != null && !Number.isFinite(input.seatHeadroom)) throw invalid('seatHeadroom')
     const gate = await withTransaction(this.db, async () => {
+      // Match direct admission's parent -> device/account/VM lock order.
+      await lockHaRequestContext(this.db)
       await this.executions.assertRoutingRevision(input.routingRevision)
       await this.lockDevice(seatKey)
       const before = await this.readSeat(seatKey)
