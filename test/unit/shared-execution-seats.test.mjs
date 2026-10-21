@@ -140,3 +140,13 @@ test('a denied move preserves the original grace seat and its generation', async
   assert.equal(denied.code, 'vm_concurrency_limit')
   assert.deepEqual(await first.getSeat(candidate().seatKey), before)
 })
+
+test('seat budget is shared by one account across different VMs', async (t) => {
+  const [first, second] = await replicas(t)
+  const a = await first.tryReserve(candidate({ seatHeadroom: 0.03 }))
+  assert.equal(a.ok, true)
+  const b = await second.tryReserve(candidate({ vmId: 'vm-2', seatKey: 'device-2', seatHeadroom: 0.03 }))
+  assert.equal(b.ok, false)
+  assert.equal(b.code, 'seat_budget')
+  await a.release()
+})
