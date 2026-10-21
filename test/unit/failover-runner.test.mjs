@@ -106,6 +106,39 @@ test('unsupported classifier runtime stops without counting execution or cooling
   assert.equal(scheduler.selectCalls, 1)
 })
 
+test('a finished model job with uncertain credential refresh retains its admission and cannot fail over', async () => {
+  let marked = 0
+  const first = {
+    ...candidate(1),
+    bindExecution: async () => {},
+    markUncertain: async () => {
+      marked++
+    },
+  }
+  const scheduler = new Scheduler([first, candidate(2)])
+  const runner = new FailoverRunner({ scheduler })
+  let calls = 0
+  const result = await runner.run({
+    requestId: 'uncertain-refresh',
+    model: 'claude-test',
+    canonicalBody: { model: 'claude-test' },
+    callAttempt: async () => {
+      calls++
+      if (calls > 1) return success()
+      return {
+        ok: false,
+        status: 503,
+        execution: { ended: true },
+        executionUncertain: true,
+        body: { error: { code: 'credential_refresh_unknown' } },
+      }
+    },
+  })
+  assert.equal(calls, 1)
+  assert.equal(marked, 1)
+  assert.equal(result.executionUncertain, true)
+})
+
 test('invalid panel cache layout stops before execution without rotating or cooling accounts', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const attempts = new Attempts()

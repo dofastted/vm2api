@@ -491,6 +491,37 @@ unixTest('needs_refresh retries once via Go ensure', async () => {
   }
 })
 
+unixTest('an uncertain credential refresh stays distinct from the first completed kernel job', async () => {
+  const previous = process.env.KIN_KERNEL_BIN
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  let hits = 0
+  const fx = await kernelFixture((_req, res) => {
+    hits++
+    res.writeHead(401, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ type: 'error', error: { code: 'needs_refresh' } }))
+  })
+  try {
+    const result = await dispatchCallInference({
+      exec: fx.exec,
+      body: { model: 'claude-test', messages: [{ role: 'user', content: 'synthetic' }] },
+      ensureRust: async () => ({ ok: true }),
+      ensureCredential: async () => ({
+        ok: false,
+        attemptFinished: false,
+        credentialRefreshUnknown: true,
+        error: { code: 'worker_timeout' },
+      }),
+    })
+    assert.equal(hits, 1)
+    assert.equal(result.execution.ended, true)
+    assert.equal(result.executionUncertain, true)
+  } finally {
+    await fx.close()
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+  }
+})
+
 unixTest('failed Go credential ensure is not followed by a blind Rust retry', async () => {
   const previous = process.env.KIN_KERNEL_BIN
   process.env.KIN_KERNEL_BIN = '/bin/true'
