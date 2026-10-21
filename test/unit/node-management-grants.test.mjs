@@ -1,11 +1,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import pg from 'pg'
+import net from 'node:net'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
-import { nodeGrantNamespace, nodeGrantResource } from '../../src/lib/db/node-management-authority.mjs'
+import {
+  nodeAllocationTerminalState,
+  nodeGrantNamespace,
+  nodeGrantResource,
+} from '../../src/lib/db/node-management-authority.mjs'
 import { getDb, createDatabase, quoteIdentifier } from '../../src/lib/db/database.mjs'
 import { GlobalMaintenanceCoordinator } from '../../src/lib/db/global-maintenance.mjs'
 import { SharedVmOperations } from '../../src/lib/vm/shared-vm-operations.mjs'
@@ -359,5 +364,81 @@ test('a PG receipt write failure retains the unknown operation after a local all
     } finally {
       await node.close()
     }
+  })
+})
+
+test('allocation terminal upgrade is explicit, atomic across connections, and preserves unknown target reservations', async (t) => {
+  await usingFixture(t, async (fx) => {
+    const q = quoteIdentifier(fx.service.schema)
+    assert.equal((await nodeAllocationTerminalState(fx.db)).enabled, false)
+    const held = await fx.issue()
+    const peerService = new NodeManagementGrants(fx.peer)
+    const upgraded = await Promise.all([
+      fx.service.initializeAllocationTerminals(),
+      peerService.initializeAllocationTerminals(),
+    ])
+    assert.equal(
+      upgraded.every((value) => value.enabled),
+      true,
+    )
+    assert.equal(
+      (await fx.peer.query(`SELECT allocation_terminal_protocol_version FROM ${q}.meta`)).rows[0]
+        .allocation_terminal_protocol_version,
+      1,
+    )
+    const row = (await fx.peer.query(`SELECT * FROM ${q}.allocations`)).rows[0]
+    assert.equal(row.allocation_id, held.grant.allocationId)
+    assert.equal(row.not_started_at, null)
+    await assert.rejects(
+      fx.peer.query(
+        `INSERT INTO ${q}.allocations(allocation_id,node_id,vm_id,physical_target,operation_id,owner_id,action,epoch,intent_digest) SELECT 'conflicting',node_id,vm_id,physical_target,operation_id,owner_id,action,epoch,intent_digest FROM ${q}.allocations`,
+      ),
+      { code: '23505' },
+    )
+    await fx.db.query(
+      `ALTER TABLE ${quoteIdentifier(fx.maintenance.schema)}.node_authority_features DROP COLUMN allocation_terminal_protocol_version`,
+    )
+    await assert.rejects(nodeAllocationTerminalState(fx.db), { code: 'node_allocation_terminal_unavailable' })
+    await assert.rejects(fx.service.initializeAllocationTerminals(), { code: 'node_allocation_terminal_unavailable' })
+    assert.equal((await fx.peer.query(`SELECT count(*)::int AS n FROM ${q}.allocations`)).rows[0].n, 1)
+  })
+})
+
+test('an unupgraded authority keeps a proven unsent allocation held and reports the required trusted upgrade', async (t) => {
+  await usingFixture(t, async (fx) => {
+    const server = net.createServer()
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const port = server.address().port
+    await new Promise((resolve) => server.close(resolve))
+    fx.service.resolveNodeLink = async () => ({
+      address: '127.0.0.1',
+      port,
+      token: 's'.repeat(32),
+      certSha256: 'a'.repeat(64),
+    })
+    await assert.rejects(
+      new SharedVmOperations(fx.db).run(
+        'synthetic-vm',
+        (operation) =>
+          fx.service.allocate({ operation, nodeId: 'synthetic-node', vmId: 'synthetic-vm', allocationId: 'not-sent' }),
+        { kind: 'node_allocate' },
+      ),
+      (error) => {
+        assert.equal(error.code, 'node_allocation_terminal_unavailable')
+        assert.notEqual(error.vmOperationNotStarted, true)
+        assert.equal(error.vmOperationUncertain, true)
+        return true
+      },
+    )
+    const row = (
+      await fx.peer.query(`SELECT receipt,revoked_at FROM ${quoteIdentifier(fx.service.schema)}.allocations`)
+    ).rows[0]
+    assert.equal(row.receipt, null)
+    assert.ok(row.revoked_at)
+    const op = (await fx.peer.query("SELECT released_at,uncertain_at FROM vm_operations WHERE kind='node_allocate'"))
+      .rows[0]
+    assert.equal(op.released_at, null)
+    assert.ok(op.uncertain_at)
+    assert.equal((await nodeAllocationTerminalState(fx.db)).enabled, false)
   })
 })

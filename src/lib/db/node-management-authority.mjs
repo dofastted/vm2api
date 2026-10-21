@@ -146,6 +146,93 @@ export async function initializeNodeAuthority(db) {
   })
 }
 
+/** Allocation retirement is an explicitly installed feature; legacy grants stay held. */
+export async function nodeAllocationTerminalState(db) {
+  const base = await nodeAuthorityState(db)
+  if (!base.enabled) return base
+  const coord = quoteIdentifier(coordinationSchemaFor(db.schema))
+  const unavailable = () => nodeAuthorityError('node_allocation_terminal_unavailable')
+  try {
+    const columns = (
+      await db.query(
+        `SELECT
+        EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass($1) AND attname='allocation_terminal_protocol_version' AND NOT attisdropped) AS local_version,
+        EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass($2) AND attname='allocation_terminal_protocol_version' AND NOT attisdropped) AS marker_version,
+        EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass($3) AND attname='not_started_at' AND NOT attisdropped) AS terminal_column`,
+        [`${base.q}.meta`, `${coord}.node_authority_features`, `${base.q}.allocations`],
+      )
+    ).rows[0]
+    if (Object.values(columns).every((value) => value === false)) return { enabled: false, schema: base.schema }
+    if (!Object.values(columns).every((value) => value === true)) throw unavailable()
+    const version = (
+      await db.query(
+        `SELECT m.allocation_terminal_protocol_version AS local_version,f.allocation_terminal_protocol_version AS marker_version
+        FROM ${base.q}.meta m JOIN ${coord}.node_authority_features f ON f.application_schema=m.application_schema
+        WHERE m.id=1 AND f.authority_schema=$1`,
+        [base.schema],
+      )
+    ).rows[0]
+    const indexes = (
+      await db.query(
+        `SELECT count(*)::int AS n FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+        WHERE i.indrelid=to_regclass($1) AND i.indisunique AND i.indisvalid AND i.indnatts=1
+        AND pg_get_expr(i.indpred,i.indrelid)='(not_started_at IS NULL)'
+        AND ((c.relname='allocations_vm_id_key' AND pg_get_indexdef(i.indexrelid,1,true)='vm_id')
+          OR (c.relname='allocations_physical_target_key' AND pg_get_indexdef(i.indexrelid,1,true)='physical_target'))`,
+        [`${base.q}.allocations`],
+      )
+    ).rows[0]
+    if (version?.local_version !== 1 || version.marker_version !== 1 || indexes.n !== 2) throw unavailable()
+    return base
+  } catch {
+    throw unavailable()
+  }
+}
+
+/** Trusted initialization only. No runtime read/issuance path upgrades this schema. */
+export async function initializeNodeAllocationTerminals(db) {
+  return withTransaction(db, async () => {
+    await db.query('SELECT pg_advisory_xact_lock(hashtext(current_database()),hashtext($1))', [
+      `vm2api:node-authority-bootstrap:${db.schema}`,
+    ])
+    const base = await nodeAuthorityState(db)
+    if (!base.enabled) throw nodeAuthorityError('node_allocation_terminal_unavailable')
+    const existing = await nodeAllocationTerminalState(db)
+    if (existing.enabled) return existing
+    const { q, schema } = base,
+      coord = quoteIdentifier(coordinationSchemaFor(db.schema))
+    const phase = (await db.query(`SELECT phase FROM ${coord}.control WHERE id=1 FOR SHARE`)).rows[0]
+    if (phase?.phase !== 'open') throw nodeAuthorityError('node_allocation_terminal_unavailable')
+    await db.query(`ALTER TABLE ${q}.meta ADD COLUMN allocation_terminal_protocol_version integer NOT NULL DEFAULT 1 CHECK(allocation_terminal_protocol_version=1);
+      ALTER TABLE ${coord}.node_authority_features ADD COLUMN allocation_terminal_protocol_version integer NOT NULL DEFAULT 1 CHECK(allocation_terminal_protocol_version=1);
+      ALTER TABLE ${q}.allocations ADD COLUMN not_started_at timestamptz;
+      ALTER TABLE ${q}.allocations DROP CONSTRAINT allocations_vm_id_key, DROP CONSTRAINT allocations_physical_target_key;
+      CREATE UNIQUE INDEX allocations_vm_id_key ON ${q}.allocations(vm_id) WHERE not_started_at IS NULL;
+      CREATE UNIQUE INDEX allocations_physical_target_key ON ${q}.allocations(physical_target) WHERE not_started_at IS NULL;
+      CREATE OR REPLACE FUNCTION ${q}.allocation_current(p_allocation text) RETURNS boolean
+      LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $body$
+      DECLARE g record; app text; allowed boolean;
+      BEGIN
+        SELECT a.*,m.application_schema INTO g FROM ${q}.allocations a CROSS JOIN ${q}.meta m
+          JOIN ${q}.reader_roles r ON r.role_name=session_user
+          JOIN ${coord}.control c ON c.id=1
+          JOIN ${coord}.node_authority_features f ON f.application_schema=m.application_schema
+          WHERE a.allocation_id=p_allocation AND a.node_id=r.node_id AND a.revoked_at IS NULL AND a.not_started_at IS NULL AND a.action='allocate'
+            AND m.id=1 AND m.protocol_version=1 AND f.protocol_version=1 AND f.authority_schema='${schema}'
+            AND m.allocation_terminal_protocol_version=1 AND f.allocation_terminal_protocol_version=1
+            AND c.application_schema=m.application_schema AND c.phase='open' AND c.epoch=a.epoch;
+        IF NOT FOUND OR NOT EXISTS(SELECT 1 FROM ${q}.reader_identity()) THEN RETURN false; END IF;
+        app:=g.application_schema;
+        EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.vm_operations WHERE id=$1 AND owner_id=$2 AND vm_id=$3
+          AND kind=''node_allocate'' AND released_at IS NULL AND uncertain_at IS NULL)',app)
+          INTO allowed USING g.operation_id,g.owner_id,g.vm_id;
+        RETURN allowed;
+      EXCEPTION WHEN undefined_table OR invalid_schema_name THEN RETURN false;
+      END $body$`)
+    return nodeAllocationTerminalState(db)
+  })
+}
+
 /** New command authority is a separately and explicitly installed feature. */
 export async function nodeCommandAuthorityState(db) {
   const base = await nodeAuthorityState(db)

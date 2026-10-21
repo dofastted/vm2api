@@ -12,6 +12,7 @@ import { NodeManagementGrants } from '../../src/lib/cluster/node-management-gran
 import { getDb, createDatabase, quoteIdentifier } from '../../src/lib/db/database.mjs'
 import { GlobalMaintenanceCoordinator } from '../../src/lib/db/global-maintenance.mjs'
 import { realAllocationGate } from '../fixtures/real-allocation-gate.mjs'
+import { allocateNodeSlot } from '../../src/lib/transport/slotgate-management-client.mjs'
 
 const nodeId = 'command-node'
 const vmId = 'command-vm'
@@ -404,6 +405,22 @@ nodeCase(
     assert.match(first.err, /node_allocation_unconfirmed/)
     assert.equal(fx.calls.length, 0)
     const original = (await fx.peer.query(`SELECT * FROM ${fx.q}.allocations`)).rows[0]
+    await assert.rejects(
+      allocateNodeSlot({
+        link: fx.node.link,
+        grant: {
+          action: 'allocate',
+          nodeId: original.node_id,
+          vmId: original.vm_id,
+          allocationId: original.allocation_id,
+          operationId: original.operation_id,
+          ownerId: original.owner_id,
+          epoch: String(original.epoch),
+          intentDigest: original.intent_digest,
+        },
+      }),
+      { code: 'node_allocation_unconfirmed' },
+    )
     fx.config.node.certSha256 = originalPin
     fs.writeFileSync(fx.file, JSON.stringify(fx.config))
     const retry = await fx.cli('slot-create')
@@ -466,6 +483,13 @@ nodeCase(
       const row = (await fx.peer.query(`SELECT * FROM ${fx.q}.allocations`)).rows[0]
       assert.equal(row.receipt, null)
       assert.ok(row.revoked_at)
+      assert.equal(row.not_started_at, null)
+      await assert.rejects(
+        fx.peer.query(
+          `INSERT INTO ${fx.q}.allocations(allocation_id,node_id,vm_id,physical_target,operation_id,owner_id,action,epoch,intent_digest) SELECT 'different-allocation',node_id,vm_id,physical_target,operation_id,owner_id,action,epoch,intent_digest FROM ${fx.q}.allocations`,
+        ),
+        { code: '23505' },
+      )
       fx.config.node.port = fx.node.link.port
       fs.writeFileSync(fx.file, JSON.stringify(fx.config))
       const retry = await fx.cli('slot-create')
@@ -483,3 +507,32 @@ nodeCase(
     }
   },
 )
+
+nodeCase('an unsent allocation terminal commit failure retains its grant and both claims', async (fx) => {
+  const init = await fx.cli('trusted-init')
+  assert.equal(init.status, 0, init.out + init.err)
+  await fx.db.pool.query(fs.readFileSync(fx.output, 'utf8'))
+  await fx.db.query(
+    `CREATE FUNCTION reject_allocation_terminal() RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN RAISE EXCEPTION 'synthetic allocation terminal failure' USING ERRCODE='P648A'; END $body$; CREATE TRIGGER reject_allocation_terminal BEFORE UPDATE OF receipt ON ${fx.q}.allocations FOR EACH ROW EXECUTE FUNCTION reject_allocation_terminal()`,
+  )
+  fx.config.node.certSha256 = fx.config.node.certSha256 === '0'.repeat(64) ? '1'.repeat(64) : '0'.repeat(64)
+  fs.writeFileSync(fx.file, JSON.stringify(fx.config))
+  const first = await fx.cli('slot-create')
+  assert.equal(first.status, 1)
+  assert.match(first.err, /bootstrap_failed/)
+  const row = (await fx.peer.query(`SELECT * FROM ${fx.q}.allocations`)).rows[0]
+  assert.equal(row.receipt, null)
+  assert.equal(row.not_started_at, null)
+  assert.ok(row.revoked_at)
+  const op = (await fx.peer.query('SELECT released_at,uncertain_at FROM vm_operations WHERE id=$1', [row.operation_id]))
+    .rows[0]
+  assert.equal(op.released_at, null)
+  assert.ok(op.uncertain_at)
+  const bg = (
+    await fx.peer.query('SELECT unknown_at,finished_at FROM background_task_runs WHERE task_key=$1', [
+      `ha-node-bootstrap:${vmId}`,
+    ])
+  ).rows[0]
+  assert.ok(bg.unknown_at)
+  assert.equal(bg.finished_at, null)
+})

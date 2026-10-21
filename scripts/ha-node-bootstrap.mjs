@@ -195,6 +195,7 @@ async function trustedInit(db, c, output) {
   const grants = new NodeManagementGrants(db),
     refresh = new NodeCredentialRefreshGrants(db)
   await grants.initialize()
+  await grants.initializeAllocationTerminals()
   await grants.initializeCommands()
   await refresh.initialize()
   const sql =
@@ -227,7 +228,8 @@ async function slotCreate(db, c, input) {
   const tasks = new SharedBackgroundTasks(db),
     operations = new SharedVmOperations(db),
     grants = new NodeManagementGrants(db, { resolveNodeLink: async () => c.node })
-  let nodeCall = false
+  let nodeCall = false,
+    allocationConfirmed = false
   let result
   try {
     result = await tasks.run(
@@ -242,6 +244,7 @@ async function slotCreate(db, c, input) {
             nodeCall = true
             return grants.allocate({ operation, nodeId: c.node.id, vmId: c.vm.id, allocationId })
           })
+          allocationConfirmed = true
           const common = {
             nodeId: c.node.id,
             vmId: c.vm.id,
@@ -304,7 +307,10 @@ async function slotCreate(db, c, input) {
             sharedResult: { ok: true, vmId: c.vm.id, launchCommandId: launchId },
           }
         } catch (error) {
-          if (!nodeCall && ['vm_operation_active', 'vm_execution_active'].includes(error.code)) {
+          if (
+            (!nodeCall && ['vm_operation_active', 'vm_execution_active'].includes(error.code)) ||
+            (!allocationConfirmed && error.vmOperationNotStarted === true && !error.vmOperationUncertain)
+          ) {
             error.taskNotStarted = true
             error.activityEnded = true
           }

@@ -5,9 +5,10 @@ import { isDeepStrictEqual } from 'node:util'
 import crypto from 'node:crypto'
 import { normalizeNodeManagementGrant, normalizeNodeManagementReceipt } from '../core/node-management-command.mjs'
 
-function denied() {
+function denied(sent) {
   return Object.assign(new Error('node allocation acknowledgement unavailable'), {
     code: 'node_allocation_unconfirmed',
+    ...(sent === false ? { vmOperationNotStarted: true } : sent === true ? { vmOperationUncertain: true } : {}),
   })
 }
 function exact(value, keys) {
@@ -61,7 +62,7 @@ export function allocateNodeSlot({ link, grant }) {
     !/^[\x21-\x7e]{32,256}$/.test(link.token) ||
     !/^[a-f0-9]{64}$/.test(link.certSha256)
   )
-    return Promise.reject(denied())
+    return Promise.reject(denied(false))
   const request = {
     op: 'allocate',
     vm_id: grant.vmId,
@@ -71,6 +72,7 @@ export function allocateNodeSlot({ link, grant }) {
   }
   return new Promise((resolve, reject) => {
     let settled = false
+    let sent = false
     let buffer = Buffer.alloc(0)
     const socket = tls.connect({
       host: link.address,
@@ -86,19 +88,21 @@ export function allocateNodeSlot({ link, grant }) {
       if (error) reject(error)
       else resolve(value)
     }
-    const timer = setTimeout(() => finish(denied()), 8000)
-    socket.once('error', () => finish(denied()))
-    socket.once('close', () => finish(denied()))
+    const failed = () => finish(denied(sent))
+    const timer = setTimeout(failed, 8000)
+    socket.once('error', failed)
+    socket.once('close', failed)
     socket.once('secureConnect', () => {
       const pin = socket.getPeerCertificate()?.fingerprint256?.replaceAll(':', '').toLowerCase()
-      if (pin !== link.certSha256) return finish(denied())
+      if (pin !== link.certSha256) return failed()
+      sent = true
       socket.write(
         `KSG2 ${link.token}\n${JSON.stringify(request, (key, value) => (key === 'generation' ? JSON.rawJSON(String(value)) : value))}\n`,
       )
     })
     socket.on('data', (chunk) => {
       buffer = Buffer.concat([buffer, chunk])
-      if (buffer.length > 8192) return finish(denied())
+      if (buffer.length > 8192) return failed()
       const newline = buffer.indexOf(10)
       if (newline < 0) return
       try {
@@ -108,7 +112,7 @@ export function allocateNodeSlot({ link, grant }) {
         if (reply.ok !== true) throw denied()
         finish(null, normalizeAllocationReceipt(reply.allocation, grant))
       } catch {
-        finish(denied())
+        failed()
       }
     })
   })

@@ -28,6 +28,8 @@ import {
   nodeGrantResource,
   nodeCommandAuthorityState,
   initializeNodeCommandAuthority,
+  nodeAllocationTerminalState,
+  initializeNodeAllocationTerminals,
 } from '../db/node-management-authority.mjs'
 
 export { nodeAuthoritySchemaFor }
@@ -73,6 +75,10 @@ export class NodeManagementGrants {
 
   initializeCommands() {
     return initializeNodeCommandAuthority(this.db)
+  }
+
+  initializeAllocationTerminals() {
+    return initializeNodeAllocationTerminals(this.db)
   }
 
   async _commandEpoch() {
@@ -361,6 +367,7 @@ export class NodeManagementGrants {
       identifier(row.owner_id)
       const state = await nodeAuthorityState(this.db)
       if (!state.enabled) throw nodeAuthorityError()
+      const terminals = await nodeAllocationTerminalState(this.db)
       await lockNodeGrant(this.db, this.schema, nodeId, vmId)
       const epoch = (
         await this.db.query(
@@ -374,7 +381,7 @@ export class NodeManagementGrants {
         .digest('hex')
       const existing = (
         await this.db.query(
-          `SELECT * FROM ${state.q}.allocations WHERE allocation_id=$1 OR vm_id=$2 OR physical_target=$3`,
+          `SELECT * FROM ${state.q}.allocations WHERE allocation_id=$1 OR ((vm_id=$2 OR physical_target=$3)${terminals.enabled ? ' AND not_started_at IS NULL' : ''})`,
           [allocationId, vmId, physicalContainerName(vmId)],
         )
       ).rows[0]
@@ -409,9 +416,23 @@ export class NodeManagementGrants {
 
   async allocate(input) {
     const link = await this.resolveNodeLink(input.nodeId)
-    if (!link) throw nodeAuthorityError('node_link_unavailable')
+    if (!link) throw Object.assign(nodeAuthorityError('node_link_unavailable'), { vmOperationNotStarted: true })
     const grant = await this.issueAllocation(input)
-    const receipt = await allocateNodeSlot({ link, grant })
+    let receipt
+    try {
+      receipt = await allocateNodeSlot({ link, grant })
+    } catch (error) {
+      if (error.vmOperationNotStarted === true && !error.vmOperationUncertain) {
+        try {
+          await this._recordAllocationNotStarted(grant)
+        } catch (commitError) {
+          delete commitError.vmOperationNotStarted
+          commitError.vmOperationUncertain = true
+          throw commitError
+        }
+      } else delete error.vmOperationNotStarted
+      throw error
+    }
     await withTransaction(this.db, async () => {
       if (!currentVmOperationIds(this.db).has(grant.operationId))
         throw nodeAuthorityError('node_operation_scope_required')
@@ -447,6 +468,55 @@ export class NodeManagementGrants {
       ])
     })
     return receipt
+  }
+
+  async _recordAllocationNotStarted(grant) {
+    return withTransaction(this.db, async () => {
+      if (!currentVmOperationIds(this.db).has(grant.operationId))
+        throw nodeAuthorityError('node_operation_scope_required')
+      const operation = await this.db
+        .prepare('SELECT * FROM vm_operations WHERE id=$1 AND owner_id=$2 FOR UPDATE')
+        .get(grant.operationId, grant.ownerId)
+      if (
+        !operation ||
+        operation.vm_id !== grant.vmId ||
+        operation.kind !== 'node_allocate' ||
+        operation.released_at ||
+        operation.uncertain_at
+      )
+        throw nodeAuthorityError('node_operation_invalid')
+      const state = await nodeAllocationTerminalState(this.db)
+      if (!state.enabled) throw nodeAuthorityError('node_allocation_terminal_unavailable')
+      await lockNodeGrant(this.db, this.schema, grant.nodeId, grant.vmId)
+      const row = (
+        await this.db.query(`SELECT * FROM ${state.q}.allocations WHERE allocation_id=$1 FOR UPDATE`, [
+          grant.allocationId,
+        ])
+      ).rows[0]
+      if (
+        !row ||
+        row.revoked_at ||
+        row.not_started_at ||
+        row.receipt ||
+        row.node_id !== grant.nodeId ||
+        row.vm_id !== grant.vmId ||
+        row.operation_id !== grant.operationId ||
+        row.owner_id !== grant.ownerId ||
+        row.intent_digest !== grant.intentDigest ||
+        String(row.epoch) !== grant.epoch
+      )
+        throw nodeAuthorityError('node_allocation_conflict')
+      const terminal = {
+        not_started: true,
+        reason: 'application_data_not_sent',
+        allocation_id: grant.allocationId,
+        intent_digest: grant.intentDigest,
+      }
+      await this.db.query(
+        `UPDATE ${state.q}.allocations SET receipt=$2::jsonb,not_started_at=clock_timestamp(),revoked_at=clock_timestamp() WHERE allocation_id=$1`,
+        [grant.allocationId, JSON.stringify(terminal)],
+      )
+    })
   }
 
   // Explicit node-role installation instructions only. Runtime initialization
