@@ -30,6 +30,12 @@ export class ControlPlaneLock {
     if (this._healthy) return this
     if (this._starting) return this._starting
     if (this._lost) throw lockError('control_plane_lock_lost', 'Control-plane lock was lost; restart is required')
+    if (this.db.pool.options.max < 2) {
+      throw lockError(
+        'control_plane_pool_too_small',
+        'Control-plane mode requires a PostgreSQL connection pool with at least 2 connections',
+      )
+    }
     if (this._stopping) await this._stopping
     this._closing = false
     const pending = this._acquire()

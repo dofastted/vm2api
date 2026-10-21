@@ -51,7 +51,7 @@ test('one controller owns each database and schema until explicit stop', async (
 
 test('independent schemas do not block each other and stop releases the pool client', async () => {
   const db = getDb()
-  const other = await createDatabase({ connectionString: db.connectionString, schema: db.schema + '_other', max: 1 })
+  const other = await createDatabase({ connectionString: db.connectionString, schema: db.schema + '_other', max: 2 })
   const first = new ControlPlaneLock(db)
   const second = new ControlPlaneLock(other)
   try {
