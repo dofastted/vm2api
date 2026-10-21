@@ -65,3 +65,13 @@ test('shared routing PG failure does not restore a potentially newer local commi
   assert.equal(fx.response.status, 503)
   assert.equal(fx.restored(), 0)
 })
+
+
+test('shared routing engine changes are committed as pending application', async (t) => {
+  const fx = fixture(t, async () => ({ revision: 10, application: { status: 'pending', pending: [] } }))
+  fx.ctx.routingConfig.inference.engine = 'go'
+  fx.ctx.readBody = async () => ({ inference: { engine: 'rust' } })
+  await fx.run()
+  assert.equal(fx.response.status, 200)
+  assert.equal(fx.response.body.data.inference_runtime.status, 'pending')
+})
