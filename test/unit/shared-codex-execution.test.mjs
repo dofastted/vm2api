@@ -8,9 +8,10 @@ import { EventEmitter } from 'node:events'
 import { setTimeout as delay } from 'node:timers/promises'
 import { createDatabase, getDb } from '../../src/lib/db/database.mjs'
 import { SharedExecutionAdmissions } from '../../src/lib/pool/shared-execution-admissions.mjs'
-import { handleCodexProtocol } from '../../src/lib/protocol/handle-codex.mjs'
+import { handleCodexProtocol, pickCodexCandidates } from '../../src/lib/protocol/handle-codex.mjs'
 import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-runtime.mjs'
 import { SharedCodexRuntime } from '../../src/lib/pool/shared-codex-runtime.mjs'
+import { SharedRoutingConfig } from '../../src/lib/admin/shared-routing-config.mjs'
 
 const unixTest = process.platform === 'win32' ? test.skip : test
 const accountId = 'codex:synthetic-shared-account'
@@ -171,6 +172,81 @@ async function fixture(
     },
   }
 }
+
+async function sharedRouting(fx, quota) {
+  const file = path.join(fx.root, 'synthetic-routing.json')
+  fs.writeFileSync(file, JSON.stringify({ codex: { quota } }))
+  const state = new SharedRoutingConfig({
+    db: fx.db,
+    file,
+    normalize: (value) => value,
+    merge: (current, patch) => ({ ...current, ...patch }),
+    apply: async () => {},
+  })
+  await state.init()
+  return state
+}
+
+unixTest('shared Codex candidates retain the policy revision and inherited VM limits they read', async (t) => {
+  const fx = await fixture(t, undefined, { concurrency: 9 })
+  const file = path.join(fx.root, 'vms', `${vmId}.json`)
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.policy = { maxConcurrency: 9, concurrencyOverride: false, maxRpm: 999, rpmOverride: false }
+  fs.writeFileSync(file, JSON.stringify(vm))
+  const state = await sharedRouting(fx, { max_concurrency: 1, max_rpm: 2 })
+  const runtime = new SharedCodexRuntime(fx.db)
+  const options = { routing: { codex: { quota: { max_concurrency: 9, max_rpm: 999 } } }, sharedRuntime: runtime }
+  const req = { headers: {}, apiKeyKind: 'user' }
+  const picked = await pickCodexCandidates(fx.root, req, options)
+  assert.equal(picked.candidates[0].concurrency, 1)
+  assert.equal(picked.candidates[0].maxRpm, 2)
+  assert.equal(picked.candidates[0].routingRevision, 1)
+  assert.equal(picked.quotaPolicy.max_rpm, 2)
+  await state.patch({ codex: { quota: { max_concurrency: 2, max_rpm: 3 } } })
+  await assert.rejects(runtime.tryReserve(fx.root, vm, picked.candidates[0], picked.quotaPolicy), {
+    code: 'routing_config_stale',
+  })
+  assert.equal((await fx.counts()).vmInflight, 0)
+  const fresh = await pickCodexCandidates(fx.root, req, options)
+  assert.equal(fresh.candidates[0].concurrency, 2)
+  assert.equal(fresh.candidates[0].maxRpm, 3)
+  assert.equal(fresh.candidates[0].routingRevision, 2)
+  const lease = await runtime.tryReserve(fx.root, vm, fresh.candidates[0], fresh.quotaPolicy)
+  assert.ok(lease)
+  await lease.release()
+})
+
+unixTest('shared Codex reselects after a routing race before sending any kernel job', async (t) => {
+  const fx = await fixture(t, undefined, { concurrency: 2 })
+  const state = await sharedRouting(fx, { max_concurrency: 2 })
+  const runtime = new SharedCodexRuntime(fx.db)
+  const held = await new SharedExecutionAdmissions(fx.other).tryReserve({
+    accountId,
+    vmId: 'vm-shared-other',
+    accountLimit: 2,
+    vmLimit: 2,
+    fableLimit: 0,
+    rpmLimit: 0,
+  })
+  const reserve = runtime.tryReserve.bind(runtime)
+  let changed = false
+  runtime.tryReserve = async (...args) => {
+    if (!changed) {
+      changed = true
+      await state.patch({ codex: { quota: { max_concurrency: 1 } } })
+    }
+    return reserve(...args)
+  }
+  try {
+    const response = await fx.run({ sharedRuntime: runtime })
+    assert.equal(changed, true)
+    assert.equal(response.status, 429)
+    assert.equal(fx.messages.length, 0, 'the old candidate cannot authorize an execution under the new revision')
+    assert.equal((await fx.counts()).accountInflight, 1)
+  } finally {
+    await held.release()
+  }
+})
 
 unixTest('Kubernetes Codex persists its actual kernel job before submission and releases only after EOF', async (t) => {
   const fx = await fixture(t)
