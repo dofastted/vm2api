@@ -18,6 +18,7 @@ import { ExecutionAdmissionsRepo } from '../db/repos/execution-admissions-repo.m
 import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 import { currentVmOperationIds } from './shared-vm-operations.mjs'
 import { physicalVmAliases } from './vm-physical-target.mjs'
+import { assertCurrentProxyOperation } from './shared-proxy-operations.mjs'
 import { canBindProxyToVm, normalizeOwnerId, proxyOwnerId, vmOwnerId } from '../admin/resource-owner.mjs'
 import { validTimezone } from '../core/timezone.mjs'
 import { lookupProxyGeo, lookupProxyGeoV6 } from './proxy-geo.mjs'
@@ -432,6 +433,7 @@ export class ProxyPool extends EventEmitter {
   _mutate(change, { observation = false } = {}) {
     const operation = withTransaction(this.db, async () => {
       await this.repo.lockMutations()
+      if (!observation && isKubernetesMode()) await assertCurrentProxyOperation(this.db)
       const snapshot = await this.repo.snapshot()
       const working = { config: { ...DEFAULT_CONFIG, ...snapshot.config }, proxies: snapshot.proxies.map(hydrateProxy) }
       const before = structuredClone(working)
