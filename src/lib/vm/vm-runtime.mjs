@@ -1173,7 +1173,7 @@ export function destroyVmRuntime(vm) {
   if (!vm?.id) return { ok: false, error: 'vm required' }
   try {
     const name = containerName(vm.id)
-    const info = inspectContainer(name)
+    const info = inspectContainer(name) || (vm.runtime?.container_id ? inspectContainer(vm.runtime.container_id) : null)
     if (!info) {
       if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true, removed: true }
       return { ok: true, action: 'absent', runtime: vm.runtime || null }
@@ -1195,12 +1195,13 @@ export function destroyVmRuntime(vm) {
 export function stopVmRuntime(vm) {
   try {
     const name = containerName(vm.id)
-    const info = inspectContainer(name)
+    const info = inspectContainer(name) || (vm.runtime?.container_id ? inspectContainer(vm.runtime.container_id) : null)
     if (!info) {
       if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true }
       return { ok: true, action: 'absent', runtime: vm.runtime || null }
     }
     assertContainerIdentity(vm, info)
+    info.name = name
     if (containerStopped(info)) {
       runtimePatch(vm, info)
       vm.runtime.stopped = true

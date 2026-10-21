@@ -216,6 +216,27 @@ test('launchctl permission errors cannot prove native service termination', asyn
   await assert.rejects(api.bootout({}, 'gui/501', 'label'))
 })
 
+test('native stop returns uncertainty and keeps its durable VM claim when launchd inspection fails', async () => {
+  const api = nativeApi({ code: 1, stdout: '', stderr: 'Operation not permitted' })
+  const source = section(
+    '../../src/lib/cluster/native-slot.mjs',
+    'export async function stopNativeSlot(',
+    '/** Explicit delete / factory reset: both jobs',
+  )
+  const stop = vmContext.runInNewContext(`${source}; stopNativeSlot`, {
+    ...api,
+    nativeSession: async () => ({}),
+    launchdDomain: async () => 'gui/501',
+    nativeLabels: () => ({ kernel: 'kernel', telemetry: 'telemetry' }),
+    failure: (error) => ({ ok: false, error: error.message }),
+  })
+  const operations = new SharedVmOperations(getDb())
+  const result = await operations.run('vm-synthetic', () => stop({ id: 'vm-synthetic', runtime: {} }))
+  assert.equal(result.ok, false)
+  assert.equal(result.vmOperationUncertain, true)
+  assert.equal((await operations.tryAcquire({ vmId: 'vm-synthetic' })).ok, false)
+})
+
 test('launchd label disappearance alone does not prove the old PID exited', async () => {
   for (const process of [
     { code: 0, stdout: '123', stderr: '' },

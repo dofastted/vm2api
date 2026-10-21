@@ -1249,17 +1249,37 @@ export async function stopRemoteSlot(vm) {
   try {
     const session = await nodeSession(vmNodeId(vm))
     const name = containerName(vm.id)
-    const info = await inspectContainerOrNull(session.docker, name)
+    const info = await inspectRemoteStopTarget(session, vm, name)
     if (!info) {
       if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true }
       return { ok: true, action: 'absent', runtime: vm.runtime || null }
     }
+    if (remoteContainerStopped(info)) {
+      vm.runtime = { ...(vm.runtime || {}), pid: null, stopped: true }
+      return { ok: true, action: 'already-stopped', runtime: vm.runtime }
+    }
     const t = isKvmRuntime(vm) || runtimeLabelOf(info) === 'kvm' ? 30 : undefined
-    await containerAction(session.docker, name, 'stop', { t })
+    let commandError
+    try {
+      await containerAction(session.docker, info.Id, 'stop', { t })
+    } catch (error) {
+      commandError = error
+    }
+    const remaining = await inspectContainerOrNull(session.docker, info.Id)
+    const named = await inspectContainerOrNull(session.docker, name)
+    if (
+      (remaining && !remoteContainerStopped(remaining)) ||
+      (named && (named.Id !== info.Id || !remoteContainerStopped(named)))
+    ) {
+      return {
+        ...failure(commandError || new Error('Container termination was not confirmed')),
+        vmOperationUncertain: true,
+      }
+    }
     vm.runtime = { ...(vm.runtime || {}), pid: null, stopped: true }
     return { ok: true, action: 'stopped', runtime: vm.runtime }
   } catch (err) {
-    return failure(err)
+    return { ...failure(err), vmOperationUncertain: true }
   }
 }
 
@@ -1268,9 +1288,22 @@ export async function destroyRemoteSlot(vm) {
   try {
     const session = await nodeSession(vmNodeId(vm))
     const name = containerName(vm.id)
-    const info = await inspectContainerOrNull(session.docker, name)
+    const info = await inspectRemoteStopTarget(session, vm, name)
     if (info) {
-      await removeContainer(session.docker, name)
+      let commandError
+      try {
+        await removeContainer(session.docker, info.Id)
+      } catch (error) {
+        commandError = error
+      }
+      const remaining = await inspectContainerOrNull(session.docker, info.Id)
+      const named = await inspectContainerOrNull(session.docker, name)
+      if (remaining || named) {
+        return {
+          ...failure(commandError || new Error('Container removal was not confirmed')),
+          vmOperationUncertain: true,
+        }
+      }
       await releaseRemoteEgress(session, info.HostConfig?.NetworkMode)
     }
     await removeRemoteSlotDir(vm, session)
@@ -1278,6 +1311,20 @@ export async function destroyRemoteSlot(vm) {
     if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true, removed: true }
     return { ok: true, action: info ? 'removed' : 'absent', runtime: vm.runtime || null }
   } catch (err) {
-    return failure(err)
+    return { ...failure(err), vmOperationUncertain: true }
   }
+}
+
+async function inspectRemoteStopTarget(session, vm, name) {
+  const info =
+    (await inspectContainerOrNull(session.docker, name)) ||
+    (vm.runtime?.container_id ? await inspectContainerOrNull(session.docker, vm.runtime.container_id) : null)
+  if (info && (!info.Id || (vm.runtime?.container_id && vm.runtime.container_id !== info.Id))) {
+    throw new Error('Container identity changed')
+  }
+  return info
+}
+
+function remoteContainerStopped(info) {
+  return info.State?.Running === false && info.State?.Restarting === false && info.State?.Pid === 0
 }
