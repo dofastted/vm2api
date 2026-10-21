@@ -53,6 +53,7 @@ async function listen({ routing, requireAuth, handleProtocol, maxBodyBytes }) {
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
   const { port } = server.address()
   return {
+    handler,
     server,
     port,
     httpHits,
@@ -950,6 +951,64 @@ test('unexpected handler failures do not expose internal exception details', asy
     assert.doesNotMatch(JSON.stringify(frame), /private|credentials|secret-fixture-token/)
   } finally {
     opened.ws.close()
+    await live.close()
+  }
+})
+
+test('draining closes idle Responses sockets and rejects new upgrades', async () => {
+  const live = await listen({ routing: ENABLED, requireAuth: allowAuth, handleProtocol: async () => {} })
+  const opened = await openWs(live.url)
+  try {
+    const closed = once(opened.ws, 'close')
+    await live.handler.drain()
+    assert.equal((await closed)[0], 1001)
+    const rejected = await openWs(live.url)
+    assert.equal(rejected.status, 503)
+    assert.equal(rejected.body.error.code, 'control_plane_draining')
+  } finally {
+    opened.ws.terminate()
+    await live.close()
+  }
+})
+
+test('draining waits for an active Responses hop and refuses the next request', async () => {
+  let started
+  let release
+  let hops = 0
+  const running = new Promise((resolve) => { started = resolve })
+  const gate = new Promise((resolve) => { release = resolve })
+  const live = await listen({
+    routing: ENABLED,
+    requireAuth: allowAuth,
+    async handleProtocol(_req, res) {
+      hops += 1
+      started()
+      await gate
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end('data: {"type":"response.completed","response":{"id":"drained","output":[]}}\n\n')
+    },
+  })
+  const opened = await openWs(live.url)
+  try {
+    opened.ws.send(JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: 'first' }))
+    await running
+    let drained = false
+    const pending = live.handler.drain().then(() => { drained = true })
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(drained, false)
+    const rejected = nextFrame(opened.ws, (frame) => frame.error?.code === 'control_plane_draining')
+    opened.ws.send(JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: 'second' }))
+    await rejected
+    const completed = nextFrame(opened.ws, (frame) => frame.type === 'response.completed')
+    const closed = once(opened.ws, 'close')
+    release()
+    assert.equal((await completed).response.id, 'drained')
+    await pending
+    assert.equal((await closed)[0], 1001)
+    assert.equal(hops, 1)
+  } finally {
+    release()
+    opened.ws.terminate()
     await live.close()
   }
 })
