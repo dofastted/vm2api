@@ -333,6 +333,39 @@ import { semanticStatusForStreamError } from '../protocol/stream-error-status.mj
 
 export { semanticStatusForStreamError } from '../protocol/stream-error-status.mjs'
 
+function kernelExecutionUnconfirmed(body, httpStatus = 0) {
+  const error = body?.error || body?.response?.error
+  if (!error || (error.type !== 'worker_error' && error.code !== 'provider_error')) return false
+  const detail = `${error.code || ''} ${error.message || ''}`
+  // The existing payload can close its HTTP response while the CLI still owns
+  // the job. Cancellation/transport failures take precedence over status text.
+  if (
+    /client.*disconnect|cancel|abort|transport|timeout|timed out|internal|failed to (?:read|write)|broken pipe|unexpected eof|connection.*(?:reset|closed)/i.test(
+      detail,
+    )
+  )
+    return true
+  if (/^(?:needs_refresh|invalid_grant|oauth_revoked|authentication_error)$/.test(String(error.code || '')))
+    return false
+  // A kernel's generic 502 is not an upstream status. Recognized provider
+  // rejections retain their ordinary EOF semantics.
+  const status = semanticStatusForStreamError({
+    ...body,
+    status: Number(body?.status) === 502 ? undefined : body?.status,
+    error: { ...error, status: Number(error.status) === 502 ? undefined : error.status },
+  })
+  const rejected = (value) => (value >= 400 && value < 500 && value !== 408 && value !== 499) || value === 529
+  return !rejected(status) && !rejected(httpStatus)
+}
+
+function completeHttpExecution(execution, body, httpStatus) {
+  const uncertain = kernelExecutionUnconfirmed(body, httpStatus)
+  Object.assign(execution, {
+    ended: !uncertain,
+    reason: uncertain ? 'kernel_execution_unconfirmed' : 'eof',
+  })
+}
+
 /**
  * Kernel `map_kernel` folds every provider failure into 502 `provider_error`.
  * Restore recognized permission denials and plan-limit / overload statuses.
@@ -588,8 +621,8 @@ export async function callGoWorker({
       timeoutMs,
     })
     const data = await readAll(response)
-    Object.assign(execution, { ended: true, reason: 'eof' })
     const parsed = parseJson(data)
+    completeHttpExecution(execution, parsed, response.statusCode)
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     const ok = response.statusCode >= 200 && response.statusCode < 300 && parsed?.type !== 'error'
     if (ok) rememberThreadTurn(parsed?.id, prepared.thread)
@@ -783,12 +816,13 @@ export async function streamGoWorker({
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
       const data = await readAll(response, 1024 * 1024)
-      Object.assign(execution, { ended: true, reason: 'eof' })
+      const parsed = parseJson(data)
+      completeHttpExecution(execution, parsed, response.statusCode)
       return restoreKernelErrorStatus({
         ok: false,
         status: response.statusCode || 0,
         via: 'go-worker-stream',
-        body: parseJson(data),
+        body: parsed,
         headers,
         committed: false,
         terminalState: headers['x-terminal-state'] || 'error',
@@ -799,6 +833,7 @@ export async function streamGoWorker({
     }
     let buffer = ''
     let lastError = null
+    let unconfirmedKernelError = null
     let dataBuf = ''
     let sseUsage = null
     let sseModel = null
@@ -833,6 +868,7 @@ export async function streamGoWorker({
     }
     const observeSseEvent = (event) => {
       if (!event) return event
+      if (kernelExecutionUnconfirmed(event)) unconfirmedKernelError = event
       if (ttftMs == null && isFirstTokenEvent(event)) ttftMs = Date.now() - startedAt
       if (event.type === 'response_headers' && event.headers && typeof event.headers === 'object') {
         sseRateHeaders = { ...sseRateHeaders, ...event.headers }
@@ -900,7 +936,6 @@ export async function streamGoWorker({
           await emitLine(line)
         }
       }
-      Object.assign(execution, { ended: true, reason: 'eof' })
       if (buffer) {
         applyClaudeSSELineToMessage(buffer, assembler)
         await emitLine(buffer)
@@ -909,6 +944,7 @@ export async function streamGoWorker({
         const event = observeSseEvent(takeSseEvent())
         if (isDownstreamCommitEvent(event)) await flushCommit()
       }
+      completeHttpExecution(execution, unconfirmedKernelError || lastError, response.statusCode)
       const trailers = mergeRateLimitHeaders(publicHeaders(response.trailers))
       const meta = streamMetaFromHeaders({ ...headers, ...trailers })
       const assembled = assembler.message

@@ -68,7 +68,7 @@
 
 `fb90450d` 已加入账号/VM/Fable/RPM 的共享准入、设备座位与 generation、发送前实际 kernel request ID 绑定，以及未知执行保留和停止重试。设备预算按账号跨 VM 计算。standalone 保留原同步调度路径。详细结果见 [共享执行验证](2026-10-21-kubernetes-execution-results.md)。全量 unit 为 3493 pass、7 fail、10 skip；全量 E2E 为 103 pass、17 fail、1 skip。失败差异和基线依据均在报告中列出。
 
-在 `fb90450d` 检查点，等待队列为进程内队列，同会话顺序和 Sticky 条件更新尚未实现；后续状态见下文共享快照增量。HTTP/SSE EOF 终态仍依赖正常 kernel 协议，尚无执行端 fencing；控制面死亡后的占位没有自动回收。独占锁和单副本限制继续保留。
+在 `fb90450d` 检查点，等待队列为进程内队列，同会话顺序和 Sticky 条件更新尚未实现；后续状态见下文共享快照增量。普通响应的 HTTP/SSE EOF 终态仍依赖正常 kernel 协议；取消或内部 transport/timeout 等未确认 kernel 错误即使有完整响应也保留未知占位，`ready_slots` 汇总值不能证明单个 job 已结束。尚无执行端 fencing；控制面死亡后的占位没有自动回收。独占锁和单副本限制继续保留。
 
 该检查点之后已实施的快照改造起点为：AccountQuota 的计数改为 PG 原子增量，响应头/probe 改为有数据库观测顺序的字段补丁，身份与并发/RPM 配置使用管理补丁。`panel-api` 的显示检查、Fable probe、手工清理以及 `panel-routes` 的身份修改也会调用整行 `save`，需要同时覆盖。保留已有 bigint 精度和 `countRequest:false` 行为。ProxyPool 的 probe 当前仍调用 `replaceAll` 删除重建代理表，需要拆成目标行配置、健康、绑定及删除操作，并校验 probe 对应的配置版本。
 

@@ -8,7 +8,7 @@
 - `execution_seats` 与请求准入在同一事务中分配。设备的 VM、slot index 和 generation 从 PG 读取。有效座位数量按 VM 检查容量，按账号检查预算；同一账号跨 VM 共享预算。未知执行继续持有座位；最后一个已确认请求释放后才开始 grace。
 - `execution_jobs` 在发送前将实际 kernel request ID 绑定到持久准入。同一准入不能同时绑定两个未结束作业。释放在锁定准入行后重新检查 pending 作业；迟到的旧作业结果不能释放后来绑定的作业。
 - Kubernetes 调度器等待异步准入，进程内 inflight 不覆盖 PG 的容量判断。保留 standalone 同步路径。异步排队处理拒绝、错误、取消后的迟到准入及释放；退出时等待调度器任务。等待队列目前仍属于各进程，未实现全局 FIFO。
-- 工作客户端返回实际 kernel request ID 与 `execution.started/ended/reason`。`ended=true` 由完整 HTTP 响应或 SSE EOF 推断，依赖正常 kernel 协议在结束响应前停止对应执行的约定，尚不是独立的执行端终止证明。超时、连接中断和取消请求的成功返回不能作为执行结束证明。此元数据仅供控制面内部使用。
+- 工作客户端返回实际 kernel request ID 与 `execution.started/ended/reason`。普通响应的 `ended=true` 由完整 HTTP 响应或 SSE EOF 推断，依赖正常 kernel 协议在结束响应前停止对应执行的约定，尚不是独立的执行端终止证明。kernel 内部未确认错误是例外：现有 payload 在取消后可返回完整 HTTP 502 `worker_error/provider_error: client disconnected`，不能据此判定执行结束；此类取消、内部 transport/timeout 及无法识别为明确供应商拒绝的 kernel 错误保留 `ended=false`。超时、连接中断和取消请求的成功返回不能作为执行结束证明。`ready_slots` 是汇总状态，不带 request ID 或 epoch，不能作为单个 job 的结束证明。此元数据仅供控制面内部使用。
 - 共享准入下，kernel router 等待作业结果（包括结束未确认）写入 PG。未确认结束时禁止隐式重试。FailoverRunner 同时停止跨账号重试，并保留账号/VM 和 managed key 并发。用量结算与执行结束分别判断。
 - 作业绑定或完成记录失败时不继续发送新执行。mock 和预先取消而未提交的请求不完成未注册的作业。
 
