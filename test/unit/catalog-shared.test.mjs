@@ -27,6 +27,8 @@ import {
   createCatalogMonitor,
 } from '../../src/lib/admin/catalog-monitor.mjs'
 import { syncModelsDev } from '../../src/lib/admin/price-catalog.mjs'
+import { SharedVmOperations } from '../../src/lib/vm/shared-vm-operations.mjs'
+import { syncCodexCatalog } from '../../src/lib/admin/vm-test-chat.mjs'
 
 async function fixture(t) {
   const db = getDb()
@@ -39,6 +41,10 @@ async function fixture(t) {
   })
   await loadModelPolicy({ force: true })
   await loadGptModelPolicy({ force: true })
+  await new SettingsRepo(db).set('routing_config', {
+    revision: 1,
+    config: { codex: { catalog_client_version: '0.130.0' } },
+  })
   return { db, peer, projectRoot, repo: new SettingsRepo(peer) }
 }
 
@@ -153,4 +159,121 @@ test('a failed price fetch preserves the latest committed snapshot from another 
   const stored = await repo.get('price_catalog_modelsdev')
   assert.ok(stored.anthropic['claude-opus-6-synthetic'])
   assert.equal(stored.fetched_at, '2026-10-21T00:00:00.000Z')
+})
+
+test('Claude catalog work cannot execute while another Pod owns its VM mutation claim', async (t) => {
+  const { db, peer, projectRoot } = await fixture(t)
+  seedVm(projectRoot)
+  const occupied = await new SharedVmOperations(peer).tryAcquire({ vmId: 'catalog-vm', kind: 'synthetic' })
+  let calls = 0
+  try {
+    const result = await syncClaudeCatalog({
+      projectRoot,
+      sharedTasks: new SharedBackgroundTasks(db),
+      runOauth: async () => {
+        calls++
+        return { ok: true, body: { data: [] } }
+      },
+    })
+    assert.equal(calls, 0)
+    assert.equal(result.error, 'vm_operation_active')
+  } finally {
+    await occupied.release()
+  }
+})
+
+test('an unknown Claude worker result retains both its background and VM mutation claims', async (t) => {
+  const { db, projectRoot } = await fixture(t)
+  seedVm(projectRoot)
+  await syncClaudeCatalog({
+    projectRoot,
+    sharedTasks: new SharedBackgroundTasks(db),
+    runOauth: async () => ({ ok: false, transportError: true, body: { error: { code: 'synthetic_timeout' } } }),
+  })
+  const operation = (await db.query('SELECT released_at,uncertain_at FROM vm_operations')).rows[0]
+  assert.ok(operation?.uncertain_at)
+  assert.equal(operation.released_at, null)
+  const task = (await db.query('SELECT finished_at,unknown_at FROM background_task_runs')).rows[0]
+  assert.ok(task.unknown_at)
+  assert.equal(task.finished_at, null)
+})
+
+function seedCodex(projectRoot) {
+  fs.mkdirSync(path.join(projectRoot, 'vms', 'catalog-codex'))
+  fs.writeFileSync(
+    path.join(projectRoot, 'vms', 'catalog-codex.json'),
+    JSON.stringify({
+      id: 'catalog-codex',
+      status: 'running',
+      platform: 'openai',
+      family: 'codex',
+      codex: { has_access: true },
+      proxy: { url: 'socks5h://127.0.0.1:19099' },
+    }),
+  )
+  fs.writeFileSync(
+    path.join(projectRoot, 'vms', 'catalog-codex', 'codex-credentials.json'),
+    JSON.stringify({
+      accounts: [{ access_token: 'synthetic-access', refresh_token: 'synthetic-refresh' }],
+    }),
+  )
+}
+
+test('Codex catalog rotation cannot fetch credentials while another Pod owns that VM', async (t) => {
+  const { db, peer, projectRoot } = await fixture(t)
+  seedCodex(projectRoot)
+  const occupied = await new SharedVmOperations(peer).tryAcquire({ vmId: 'catalog-codex', kind: 'synthetic' })
+  let calls = 0
+  try {
+    const result = await syncCodexCatalog({
+      projectRoot,
+      rotate: true,
+      catalogClientVersion: '0.130.0',
+      operations: new SharedVmOperations(db),
+      fetchImpl: async () => {
+        calls++
+        return { status: 200, json: async () => ({ models: [{ slug: 'gpt-5.6' }] }) }
+      },
+    })
+    assert.equal(calls, 0)
+    assert.equal(result.error, 'vm_operation_active')
+  } finally {
+    await occupied.release()
+  }
+})
+
+test('a lost Codex token rotation response leaves its VM operation uncertain', async (t) => {
+  const { db, projectRoot } = await fixture(t)
+  seedCodex(projectRoot)
+  const result = await syncCodexCatalog({
+    projectRoot,
+    rotate: true,
+    catalogClientVersion: '0.130.0',
+    operations: new SharedVmOperations(db),
+    fetchImpl: async (url) => {
+      if (String(url).includes('/oauth/token')) throw new Error('synthetic lost rotation response')
+      return { status: 401, json: async () => ({}) }
+    },
+  })
+  assert.equal(result.executionUncertain, true)
+  const operation = (await db.query('SELECT released_at,uncertain_at FROM vm_operations')).rows[0]
+  assert.ok(operation?.uncertain_at)
+  assert.equal(operation.released_at, null)
+})
+
+test('a read-only Codex catalog failure does not occupy a VM mutation resource', async (t) => {
+  const { db, projectRoot } = await fixture(t)
+  seedCodex(projectRoot)
+  const result = await syncCodexCatalog({
+    projectRoot,
+    rotate: false,
+    catalogClientVersion: '0.130.0',
+    operations: new SharedVmOperations(db),
+    fetchImpl: async () => {
+      throw new Error('synthetic read timeout')
+    },
+  })
+  assert.equal(result.ok, false)
+  assert.notEqual(result.executionUncertain, true)
+  assert.equal((await db.query('SELECT count(*) AS n FROM vm_operations')).rows[0].n, 0)
 })
