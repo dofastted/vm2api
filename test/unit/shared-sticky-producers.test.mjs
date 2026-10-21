@@ -72,7 +72,7 @@ async function fixture(t) {
     key,
     response,
     jobs,
-    run({ ensure, hop, routing = {} } = {}) {
+    run({ ensure, hop, routing = {}, onExecutionState } = {}) {
       return handleCodexProtocol({
         req,
         res: response,
@@ -84,6 +84,7 @@ async function fixture(t) {
         projectRoot: root,
         stickyRouter: router,
         routing,
+        onExecutionState,
         json(_res, status, value) {
           response.status = status
           response.body = value
