@@ -4,6 +4,7 @@ import path from 'node:path'
 import { atomicWriteJson } from '../vm/vm-file.mjs'
 import { isKubernetesMode } from './control-plane-mode.mjs'
 import { PanelSessionsRepo } from '../db/repos/panel-sessions-repo.mjs'
+import { GatewayRateBucketsRepo } from '../db/repos/gateway-rate-buckets-repo.mjs'
 
 export function hashKey(key) {
   return crypto.createHash('sha256').update(String(key)).digest('hex')
@@ -37,7 +38,15 @@ export function extractApiKey(req) {
 }
 
 /** Simple token bucket per key */
-export function createRateLimiter({ capacity = 60, refillPerSec = 1 } = {}) {
+export function createRateLimiter({ capacity = 60, refillPerSec = 1, db = null } = {}) {
+  if (db || isKubernetesMode()) {
+    if (!Number.isFinite(capacity) || capacity < 0 || !Number.isFinite(refillPerSec) || refillPerSec < 0) {
+      throw new Error('Shared rate limits require finite non-negative capacity and refillPerSec')
+    }
+    return async function allow(key) {
+      return new GatewayRateBucketsRepo(db || undefined).allow(hashKey(key), { capacity, refillPerSec })
+    }
+  }
   const buckets = new Map()
   return function allow(key) {
     const now = Date.now()

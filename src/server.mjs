@@ -815,7 +815,7 @@ async function requireAuth(req, res) {
   // Panel session
   const session = await verifyPanelSession(token)
   if (session) {
-    if (!allowRate('panel:' + session.user)) {
+    if (!(await allowRate('panel:' + session.user))) {
       return rejectAuth(
         req,
         res,
@@ -836,7 +836,7 @@ async function requireAuth(req, res) {
   }
   // Master env API key — unlimited admin
   if (timingSafeEqualStr(token, cfg.api_key)) {
-    if (!allowRate(token)) {
+    if (!(await allowRate(token))) {
       return rejectAuth(
         req,
         res,
@@ -888,7 +888,7 @@ async function requireAuth(req, res) {
       }),
     )
   }
-  if (!allowRate(token)) {
+  if (!(await allowRate(token))) {
     return rejectAuth(
       req,
       res,
@@ -1264,6 +1264,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && p === '/v1/models') {
       if (!(await requireAuth(req, res))) return
       if (resolveInferenceBackend(req) === 'api') {
+        apiScheduler.reload(await apiEndpointStore.listRaw())
         return json(res, 200, apiScheduler.catalog())
       }
       const result = await fetchWorkerModels({ groupType: (await keyScopeFromRequest(req)).group_type })
