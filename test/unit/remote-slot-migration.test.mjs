@@ -189,8 +189,13 @@ test('remote service refresh forwards the migrated binary digest to egress', asy
     pushSlotFiles: async () => {},
     runtimeKind: () => 'docker',
     slotExecCmd: () => ({ Cmd: ['true'], User: '1000:1000' }),
-    execDetached: async () => {},
-    setTimeout: (done) => done(),
+    slotExecArgv: (vm) => {
+      assert.equal(vm.runtime.container, 'immutable-slot-id')
+      return ['exec', 'immutable-slot-id', 'true']
+    },
+    inspectContainerOrNull: async () => ({ Id: 'immutable-slot-id', State: { Running: true } }),
+    runRemote: async (_client, command) => assert.match(command, /immutable-slot-id/),
+    shellQuote: (s) => `'${s}'`,
     slotImageSpec: () => ({ ref: 'slot-image' }),
     ensureRemoteEgress: async (_session, _vm, { binaryDigest }) => {
       receivedDigest = binaryDigest

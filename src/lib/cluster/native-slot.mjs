@@ -224,22 +224,36 @@ export async function nativeServiceStatus(session, domain, label) {
   const r = await execCollect(session.client, `launchctl print ${shellQuote(`${domain}/${label}`)}`, {
     timeoutMs: LAUNCHCTL_TIMEOUT_MS,
   })
-  return parseLaunchctlPrint(`${r.stdout}\n${r.stderr}`, r.code)
+  const status = parseLaunchctlPrint(`${r.stdout}\n${r.stderr}`, r.code)
+  if ((r.code !== 0 && status.state !== 'missing') || status.state === 'unknown') {
+    throw new ClusterError(502, 'launchd_status_unknown', r.stderr || 'Unable to inspect launchd service')
+  }
+  return status
 }
 
 /** Remove a job and wait until launchd has really let go of the label (bootout returns early). */
 async function bootout(session, domain, label) {
   const target = shellQuote(`${domain}/${label}`)
-  await runRemote(
-    session.client,
-    [
-      `launchctl bootout ${target} >/dev/null 2>&1 || true`,
-      `i=0; while launchctl print ${target} >/dev/null 2>&1; do`,
-      `  i=$((i+1)); [ $i -ge ${BOOTOUT_WAIT_TRIES} ] && exit 1; sleep 0.2`,
-      'done',
-    ].join('\n'),
-    { timeoutMs: LAUNCHCTL_TIMEOUT_MS, code: 'launchd_bootout_failed' },
-  )
+  const before = await nativeServiceStatus(session, domain, label)
+  if (before.state === 'missing') return
+  const result = await execCollect(session.client, `launchctl bootout ${target}`, { timeoutMs: LAUNCHCTL_TIMEOUT_MS })
+  if (result.code !== 0 && parseLaunchctlPrint(`${result.stdout}\n${result.stderr}`, result.code).state !== 'missing') {
+    throw new ClusterError(502, 'launchd_bootout_failed', result.stderr || 'launchctl bootout failed')
+  }
+  for (let i = 0; i < BOOTOUT_WAIT_TRIES; i++) {
+    const current = await nativeServiceStatus(session, domain, label)
+    if (current.state === 'missing') {
+      if (!before.pid) return
+      const process = await execCollect(session.client, `ps -p ${before.pid} -o pid=`, {
+        timeoutMs: LAUNCHCTL_TIMEOUT_MS,
+      })
+      if (process.code === 1 && !process.stdout.trim() && !process.stderr.trim()) return
+      if (process.code !== 0)
+        throw new ClusterError(502, 'launchd_exit_unknown', process.stderr || 'Unable to inspect old launchd process')
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200))
+  }
+  throw new ClusterError(502, 'launchd_exit_unconfirmed', 'Old launchd process termination was not confirmed')
 }
 
 async function bootstrap(session, domain, plistPath) {
@@ -442,7 +456,7 @@ export async function stopNativeSlot(vm) {
     if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, stopped: true }
     return { ok: true, action: was.state === 'missing' ? 'absent' : 'stopped', runtime: vm.runtime || null }
   } catch (err) {
-    return failure(err)
+    return { ...failure(err), vmOperationUncertain: true }
   }
 }
 
@@ -460,7 +474,7 @@ export async function destroyNativeSlot(vm) {
     if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true, removed: true }
     return { ok: true, action: was.state === 'missing' ? 'absent' : 'removed', runtime: vm.runtime || null }
   } catch (err) {
-    return failure(err)
+    return { ...failure(err), vmOperationUncertain: true }
   }
 }
 

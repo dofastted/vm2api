@@ -1202,21 +1202,37 @@ export async function restartRemoteServices(vm, projectRoot, { telemetryEnabled 
     const slotDir = path.join(projectRoot, 'vms', vm.id)
     const name = vm.runtime?.container || containerName(vm.id)
     const migration = await migrateRemoteServiceContainers(vm, projectRoot)
-    if (!migration.ok) return migration
+    if (!migration.ok) return { ...migration, vmOperationUncertain: true }
     await pushSlotFiles(vm, slotDir, ['run', 'seed'], session)
-    const target = { ...vm, runtime: { ...(vm.runtime || {}), container: name, type: runtimeKind(vm) } }
-    const stop = 'pkill -TERM -x kin-worker 2>/dev/null || true'
-    await execDetached(session.docker, name, slotExecCmd(target, ['sh', '-c', stop]).Cmd, {
-      user: slotExecCmd(target, ['sh', '-c', stop]).User,
-    })
-    await new Promise((resolve) => setTimeout(resolve, 150))
+    const info = await inspectContainerOrNull(session.docker, name)
+    if (!info?.Id || info.State?.Running !== true || info.State?.Restarting) {
+      return { ok: false, code: 'worker_container_unknown', vmOperationUncertain: true }
+    }
+    const target = { ...vm, runtime: { ...(vm.runtime || {}), container: info.Id, type: runtimeKind(vm) } }
+    const stop = [
+      'pids=$(pgrep -x kin-worker 2>&1); rc=$?',
+      '[ "$rc" -eq 1 ] && [ -z "$pids" ] && exit 0',
+      '[ "$rc" -eq 0 ] || exit 2',
+      'kill -TERM $pids || exit 2',
+      'i=0; while :; do',
+      '  live=$(ps -p "$(echo "$pids" | tr "\\n" "," | sed "s/,$//")" -o pid= 2>&1); rc=$?',
+      '  [ "$rc" -eq 1 ] && [ -z "$live" ] && exit 0',
+      '  [ "$rc" -eq 0 ] || exit 2',
+      '  i=$((i+1)); [ "$i" -ge 25 ] && exit 3; sleep 0.2',
+      'done',
+    ].join('\n')
+    const argv = slotExecArgv(target, ['sh', '-c', stop], { user: slotExecCmd(target, ['true']).User })
+    await runRemote(session.client, ['docker', ...argv].map(shellQuote).join(' '), { timeoutMs: 30_000 })
+    const current = await inspectContainerOrNull(session.docker, name)
+    if (current?.Id !== info.Id) return { ok: false, code: 'worker_container_changed', vmOperationUncertain: true }
     if (telemetryEnabled === true) await startRemoteTelemetry(session.docker, vm, name)
     const image = slotImageSpec(projectRoot, vm.kernel || 'ubuntu-24.04')
     const egress = await ensureRemoteEgress(session, vm, {
       imageRef: image.ref,
       binaryDigest: migration.binary_digest,
     })
-    if (!egress.ok) return { ok: false, error: egress.error, code: egress.code || 'egress_update_failed' }
+    if (!egress.ok)
+      return { ok: false, error: egress.error, code: egress.code || 'egress_update_failed', vmOperationUncertain: true }
     return {
       ok: true,
       action: telemetryEnabled === true ? 'restarted' : 'stopped',
@@ -1225,7 +1241,7 @@ export async function restartRemoteServices(vm, projectRoot, { telemetryEnabled 
       migration: migration.migrated,
     }
   } catch (err) {
-    return failure(err, 'service_update_failed')
+    return { ...failure(err, 'service_update_failed'), vmOperationUncertain: true }
   }
 }
 

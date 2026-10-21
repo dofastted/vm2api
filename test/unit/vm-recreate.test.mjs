@@ -174,7 +174,17 @@ test('keep rebuild retains the account, fingerprint and credential file', () => 
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('destroy missing container is a no-op', () => {
+test('destroy missing container is a no-op', (t) => {
+  const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-missing-docker-'))
+  const previousPath = process.env.PATH
+  fs.writeFileSync(path.join(bin, 'docker'), '#!/bin/sh\necho "Error: No such object: synthetic" >&2\nexit 1\n', {
+    mode: 0o700,
+  })
+  process.env.PATH = bin
+  t.after(() => {
+    process.env.PATH = previousPath
+    fs.rmSync(bin, { recursive: true, force: true })
+  })
   const r = destroyVmRuntime({ id: 'vm-missing-slot' })
   assert.equal(r.ok, true)
   assert.equal(r.action, 'absent')

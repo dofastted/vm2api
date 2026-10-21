@@ -154,15 +154,28 @@ export function inspectContainer(name) {
     'docker',
     'inspect',
     '--format',
-    '{{.State.Running}}|{{.State.Pid}}|{{.HostConfig.NetworkMode}}|{{.State.StartedAt}}|{{.Config.Image}}|{{.Config.Hostname}}|{{index .Config.Labels "kin.vm.runtime"}}|{{index .Config.Labels "kin.vm.role"}}|{{.State.Restarting}}',
+    '{{.State.Running}}|{{.State.Pid}}|{{.HostConfig.NetworkMode}}|{{.State.StartedAt}}|{{.Config.Image}}|{{.Config.Hostname}}|{{index .Config.Labels "kin.vm.runtime"}}|{{index .Config.Labels "kin.vm.role"}}|{{.State.Restarting}}|{{.Id}}',
     name,
   ])
-  if (!r.ok) return null
-  const [running, pid, networkMode, startedAt, image, hostname, runtime, role, restarting] = r.stdout.split('|')
+  if (!r.ok) {
+    if (/^(?:Error(?: response from daemon)?: )?No such (?:object|container): [^\r\n]+$/i.test(r.stderr)) return null
+    throw Object.assign(new Error(r.stderr || 'docker inspect failed'), { code: 'container_inspect_failed' })
+  }
+  const [running, pid, networkMode, startedAt, image, hostname, runtime, role, restarting, id] = r.stdout.split('|')
+  if (
+    !['true', 'false'].includes(running) ||
+    !['true', 'false'].includes(restarting) ||
+    !id?.trim() ||
+    !/^\d+$/.test(pid)
+  ) {
+    throw Object.assign(new Error('Invalid docker inspect state'), { code: 'container_inspect_failed' })
+  }
   // Docker reports Running=true during a restart-policy backoff; nothing can be exec'd there.
   const crashLooping = restarting === 'true'
   return {
     name,
+    id: id.trim(),
+    stateRunning: running === 'true',
     running: running === 'true' && !crashLooping,
     restarting: crashLooping,
     pid: Number(pid) || 0,
@@ -1158,39 +1171,69 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
 /** Explicit factory reset / delete only. Never call from Node deploy. */
 export function destroyVmRuntime(vm) {
   if (!vm?.id) return { ok: false, error: 'vm required' }
-  const name = containerName(vm.id)
-  const info = inspectContainer(name)
-  if (!info) {
+  try {
+    const name = containerName(vm.id)
+    const info = inspectContainer(name)
+    if (!info) {
+      if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true, removed: true }
+      return { ok: true, action: 'absent', runtime: vm.runtime || null }
+    }
+    assertContainerIdentity(vm, info)
+    const r = sh(['docker', 'rm', '-f', info.id], { timeout: 60_000 })
+    const remaining = inspectContainer(info.id)
+    const named = inspectContainer(name)
+    if (remaining || named) {
+      return unconfirmedContainer(r.stderr || 'Container removal was not confirmed')
+    }
     if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true, removed: true }
-    return { ok: true, action: 'absent', runtime: vm.runtime || null }
+    return { ok: true, action: 'removed', runtime: vm.runtime || null }
+  } catch (error) {
+    return unconfirmedContainer(error.message, error.code)
   }
-  const r = sh(['docker', 'rm', '-f', name], { timeout: 60_000 })
-  if (!r.ok && inspectContainer(name)) {
-    return { ok: false, error: r.stderr || 'docker rm failed' }
-  }
-  if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true, removed: true }
-  return { ok: true, action: 'removed', runtime: vm.runtime || null }
 }
 
 export function stopVmRuntime(vm) {
-  const name = containerName(vm.id)
-  const info = inspectContainer(name)
-  if (!info) {
-    if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true }
-    return { ok: true, action: 'absent', runtime: vm.runtime || null }
-  }
-  if (!info.running) {
-    runtimePatch(vm, info)
+  try {
+    const name = containerName(vm.id)
+    const info = inspectContainer(name)
+    if (!info) {
+      if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true }
+      return { ok: true, action: 'absent', runtime: vm.runtime || null }
+    }
+    assertContainerIdentity(vm, info)
+    if (containerStopped(info)) {
+      runtimePatch(vm, info)
+      vm.runtime.stopped = true
+      return { ok: true, action: 'already-stopped', runtime: vm.runtime }
+    }
+    const grace = isKvmRuntime(vm) || info.runtime === 'kvm' ? '30' : '3'
+    const r = sh(['docker', 'stop', '-t', grace, info.id])
+    const remaining = inspectContainer(info.id)
+    const named = inspectContainer(name)
+    if ((remaining && !containerStopped(remaining)) || (named && (named.id !== info.id || !containerStopped(named)))) {
+      return unconfirmedContainer(r.stderr || 'Container termination was not confirmed')
+    }
+    runtimePatch(vm, named || (remaining ? { ...remaining, name } : null))
     vm.runtime.stopped = true
-    return { ok: true, action: 'already-stopped', runtime: vm.runtime }
+    vm.runtime.pid = null
+    return { ok: true, action: 'stopped', runtime: vm.runtime }
+  } catch (error) {
+    return unconfirmedContainer(error.message, error.code)
   }
-  const grace = isKvmRuntime(vm) || info.runtime === 'kvm' ? '30' : '3'
-  const r = sh(['docker', 'stop', '-t', grace, name])
-  if (!r.ok) return { ok: false, error: r.stderr || 'docker stop failed' }
-  runtimePatch(vm, inspectContainer(name))
-  vm.runtime.stopped = true
-  vm.runtime.pid = null
-  return { ok: true, action: 'stopped', runtime: vm.runtime }
+}
+
+function assertContainerIdentity(vm, info) {
+  if (vm.runtime?.container_id && vm.runtime.container_id !== info.id) {
+    throw Object.assign(new Error('Container identity changed'), { code: 'container_identity_changed' })
+  }
+}
+
+function containerStopped(info) {
+  return info.stateRunning === false && info.restarting === false && info.pid === 0
+}
+
+function unconfirmedContainer(error, code = 'container_termination_unconfirmed') {
+  return { ok: false, error, code, vmOperationUncertain: true }
 }
 
 export function listRuntimeVms() {
