@@ -180,12 +180,16 @@ export class AccountRuntimeRepo {
       const versions = account.observation_versions || {}
       if (
         atomic &&
-        Object.entries(fields).some(
+        (Object.entries(fields).some(
           ([field, value]) =>
             value !== undefined &&
             (Object.hasOwn(ACCOUNT_FIELDS, field) || Object.hasOwn(RUNTIME_FIELDS, field)) &&
             !accepts(versions, ['runtime', field], sequence),
-        )
+        ) ||
+          (clearModels && !accepts(versions, ['runtime', 'model_states'], sequence)) ||
+          Object.keys(modelPatch || {}).some(
+            (model) => !accepts(versions, ['runtime', 'model_states', model], sequence),
+          ))
       )
         return rejected()
       const acc = {}
@@ -285,7 +289,10 @@ export class AccountRuntimeRepo {
     return this.patch(accountId, fields, { vmId, observation, returnApplied: true, atomic: true })
   }
 
-  async markCooldown(accountId, { vmId, until, reason, model = null, status = 'cooldown', observation } = {}) {
+  async markCooldown(
+    accountId,
+    { vmId, until, reason, model = null, status = 'cooldown', observation, committed = false } = {},
+  ) {
     const cooldown = Number(until) || null
     if (model)
       return this.patch(
@@ -294,6 +301,8 @@ export class AccountRuntimeRepo {
         {
           vmId,
           observation,
+          returnApplied: committed,
+          atomic: committed,
           modelPatch: {
             [model]: { status, cooldown_until: cooldown, reason: reason || null, updated_at: new Date().toISOString() },
           },
@@ -309,8 +318,12 @@ export class AccountRuntimeRepo {
           ? { rate_limited_at: Date.now(), rate_limit_reset_at: cooldown }
           : {}),
       },
-      { vmId, observation },
+      { vmId, observation, returnApplied: committed, atomic: committed },
     )
+  }
+
+  markCooldownCommitted(accountId, options = {}) {
+    return this.markCooldown(accountId, { ...options, committed: true })
   }
 
   static AUTH_COOLDOWN = /authentication_failed_after_refresh|permission_denied/i

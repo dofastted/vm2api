@@ -205,6 +205,13 @@ export class SchedulingRuntime {
     )
   }
 
+  markCooldownCommitted(accountId, { observation, ...options } = {}) {
+    const ticket = this.ticket(observation)
+    return this.commit(accountId, () =>
+      this.persistence.markCooldownCommitted(accountId, { ...options, observation: ticket }),
+    )
+  }
+
   static AUTH_COOLDOWN = AccountRuntimeRepo.AUTH_COOLDOWN
   static GRANT_REVOKE_COOLDOWN = AccountRuntimeRepo.GRANT_REVOKE_COOLDOWN
   isAuthCooldown(current) {
