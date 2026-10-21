@@ -197,7 +197,7 @@ export function codexAccountCandidate(vm, now = Date.now(), signals = null, poli
     id: vm.id,
     weight: Number(vm?.policy?.weight ?? vm?.weight ?? 1) || 1,
     concurrency: effective.max_concurrency,
-    maxRpm: effective.max_rpm,
+    maxRpm: runtime.maxRpm ?? effective.max_rpm,
     maxSessions: effective.max_sessions,
     rpmCount: runtime.rpmCount || 0,
     rpmResetAt: runtime.rpmResetAt ?? null,
@@ -239,6 +239,7 @@ export function orderCodexSessionSlots(
     roundRobinCursor = null,
     model = null,
     excluded = null,
+    runtimeSignals = null,
   } = {},
 ) {
   const list = Array.isArray(vms) ? vms : []
@@ -258,7 +259,7 @@ export function orderCodexSessionSlots(
       ...picked,
       ids: pool,
       sticky: false,
-      candidates: pool.map((id) => codexAccountCandidate(byId.get(id), now, null, policy)),
+      candidates: pool.map((id) => codexAccountCandidate(byId.get(id), now, runtimeSignals?.get(id), policy)),
     }
   }
   const home =
@@ -286,7 +287,7 @@ export function orderCodexSessionSlots(
     return { error: 'session_window_full', ids: [], ready: [], parked: [], sticky: false, boundState, candidates: [] }
   }
   const cursor = roundRobinCursor == null ? readOpenAICursor() : roundRobinCursor
-  const candidates = ids.map((id) => codexAccountCandidate(byId.get(id), now, null, policy))
+  const candidates = ids.map((id) => codexAccountCandidate(byId.get(id), now, runtimeSignals?.get(id), policy))
   const ordered = orderOpenAIAccounts(candidates, {
     strategy,
     now,
