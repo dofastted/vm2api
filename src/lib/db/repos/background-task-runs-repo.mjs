@@ -18,9 +18,27 @@ export class BackgroundTaskRunsRepo {
     return (await this.db.prepare('SELECT extract(epoch FROM clock_timestamp()) * 1000 AS now_ms').get()).now_ms
   }
 
-  async tryClaim({ taskKey, executionId, intervalMs, ownerId }) {
+  async latest(taskKey) {
+    identifier(taskKey, 512)
+    const row = await this.db
+      .prepare(`SELECT execution_id,owner_id,finished_at,unknown_at,shared_result
+      FROM background_task_runs WHERE task_key=$1 ORDER BY claim_sequence DESC LIMIT 1`)
+      .get(taskKey)
+    return row
+      ? {
+          executionId: row.execution_id,
+          ownerId: row.owner_id,
+          finishedAt: row.finished_at,
+          unknownAt: row.unknown_at,
+          sharedResult: row.shared_result,
+        }
+      : null
+  }
+
+  async tryClaim({ taskKey, executionId, intervalMs, ownerId, ifPreviousExecutionId }) {
     identifier(taskKey, 512)
     identifier(ownerId, 200)
+    if (ifPreviousExecutionId != null) identifier(ifPreviousExecutionId, 1024)
     if (executionId == null) {
       if (!Number.isSafeInteger(intervalMs) || intervalMs <= 0) throw invalidPlan()
     } else {
@@ -37,6 +55,11 @@ export class BackgroundTaskRunsRepo {
         `vm2api:background:${this.db.schema}`,
         taskKey,
       ])
+      if (ifPreviousExecutionId !== undefined) {
+        const latest = await this.latest(taskKey)
+        if ((latest?.executionId ?? null) !== ifPreviousExecutionId)
+          return { ok: false, code: 'background_task_changed', latest }
+      }
       const active = await this.db
         .prepare('SELECT execution_id FROM background_task_runs WHERE task_key = $1 AND finished_at IS NULL')
         .get(taskKey)

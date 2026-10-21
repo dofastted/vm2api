@@ -105,7 +105,10 @@ export class SharedBackgroundTasks {
   }
 
   run(plan, callback) {
-    const pending = this._run(plan, callback)
+    return this.track(this._run(plan, callback))
+  }
+
+  track(pending) {
     this.pending.add(pending)
     pending.then(
       () => this.pending.delete(pending),

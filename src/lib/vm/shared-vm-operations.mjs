@@ -45,21 +45,55 @@ export class SharedVmOperations {
     this.executions = new ExecutionAdmissionsRepo(db, { ownerId: this.ownerId })
   }
 
-  async tryAcquire({ vmId, kind = 'mutation' } = {}) {
+  async _executionException({ vmId, accountId, admission }) {
+    if (!admission) return { ok: true, admissionId: null }
+    if (
+      !admission.db ||
+      admission.db.schema !== this.db.schema ||
+      admission.db.connectionString !== this.db.connectionString ||
+      admission.vmId !== vmId ||
+      admission.accountId !== accountId ||
+      !admission.admissionId ||
+      !admission.ownerId
+    )
+      return { ok: false, code: 'refresh_admission_invalid' }
+    const row = await this.db
+      .prepare(`SELECT * FROM execution_admissions WHERE id=$1 AND owner_id=$2 FOR UPDATE`)
+      .get(admission.admissionId, admission.ownerId)
+    if (!row || row.vm_id !== vmId || row.account_id !== accountId || row.released_at || row.uncertain_at)
+      return { ok: false, code: 'refresh_admission_invalid' }
+    const jobs = await this.db
+      .prepare(`SELECT count(*) AS total,
+      count(*) FILTER (WHERE ended_at IS NULL) AS pending FROM execution_jobs WHERE admission_id=$1`)
+      .get(row.id)
+    if (!jobs.total || jobs.pending) return { ok: false, code: 'refresh_execution_unfinished' }
+    return { ok: true, admissionId: row.id }
+  }
+
+  async _otherExecution(vmId, accountId, admissionId) {
+    return this.db
+      .prepare(`SELECT id FROM execution_admissions
+      WHERE released_at IS NULL AND (vm_id=ANY($1::text[]) OR ($2::text IS NOT NULL AND account_id=$2))
+      AND ($3::text IS NULL OR id<>$3) LIMIT 1`)
+      .get(physicalVmAliases(vmId), accountId ?? null, admissionId)
+  }
+
+  async tryAcquire({ vmId, kind = 'mutation', accountId = null, admission = null } = {}) {
     validateOperationVmId(vmId)
     identifier(kind)
+    if (accountId != null) identifier(accountId)
     // The claim must commit independently before its owner can perform remote effects.
     if (this.db.isTransaction) throw operationError('vm_operation_transaction_active', 500)
     return withTransaction(this.db, async () => {
       // Identical namespace and VM resource to ExecutionAdmissionsRepo.tryReserve.
-      await this.executions.lockVm(vmId)
+      await this.executions.lockResources({ accountId, vmIds: [vmId] })
       const active = await this.db
         .prepare('SELECT id FROM vm_operations WHERE vm_id = ANY($1::text[]) AND released_at IS NULL LIMIT 1')
         .get(physicalVmAliases(vmId))
       if (active) return { ok: false, code: 'vm_operation_active' }
-      const execution = await this.db
-        .prepare('SELECT id FROM execution_admissions WHERE vm_id = ANY($1::text[]) AND released_at IS NULL LIMIT 1')
-        .get(physicalVmAliases(vmId))
+      const exception = await this._executionException({ vmId, accountId, admission })
+      if (!exception.ok) return exception
+      const execution = await this._otherExecution(vmId, accountId, exception.admissionId)
       if (execution) return { ok: false, code: 'vm_execution_active' }
       const operationId = crypto.randomUUID()
       await this.db
@@ -135,7 +169,7 @@ export class SharedVmOperations {
     return { released: result.changes > 0 }
   }
 
-  async run(vmId, callback, { kind = 'mutation' } = {}) {
+  async run(vmId, callback, { kind = 'mutation', accountId = null, admission = null } = {}) {
     validateOperationVmId(vmId)
     const parents = callbacks.getStore() || []
     const nested = parents.findLast(
@@ -145,8 +179,25 @@ export class SharedVmOperations {
         context.db.schema === this.db.schema &&
         context.db.connectionString === this.db.connectionString,
     )
-    if (nested) return callback(nested.operation)
-    const operation = await this.tryAcquire({ vmId, kind })
+    if (nested) {
+      if (nested.operation.uncertain) throw operationError('vm_operation_inactive')
+      const valid = await withTransaction(this.db, async () => {
+        await this.executions.lockResources({ accountId, vmIds: [vmId] })
+        const current = await this.db
+          .prepare(`SELECT id FROM vm_operations
+          WHERE id=$1 AND owner_id=$2 AND vm_id=$3 AND released_at IS NULL AND uncertain_at IS NULL`)
+          .get(nested.operation.operationId, nested.operation.ownerId, vmId)
+        if (!current) return { ok: false, code: 'vm_operation_inactive' }
+        const exception = await this._executionException({ vmId, accountId, admission })
+        if (!exception.ok) return exception
+        return (await this._otherExecution(vmId, accountId, exception.admissionId))
+          ? { ok: false, code: 'vm_execution_active' }
+          : { ok: true }
+      })
+      if (!valid.ok) throw operationError(valid.code)
+      return callback(nested.operation)
+    }
+    const operation = await this.tryAcquire({ vmId, kind, accountId, admission })
     if (!operation.ok) throw operationError(operation.code)
     const context = { db: this.db, vmId, operation, active: true }
     let result
