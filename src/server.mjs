@@ -1538,6 +1538,7 @@ function maintenanceMonitors() {
 }
 
 async function flushRuntimeWrites() {
+  await poolScheduler?.flush?.()
   await requestLog.flush?.()
   await flushPendingWrites()
   await accountQuota.flush()
