@@ -1,13 +1,14 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { getDb, createDatabase } from '../../src/lib/db/database.mjs'
+import { getDb } from '../../src/lib/db/database.mjs'
+import { createRepositoryTestDatabase } from '../repository-database.mjs'
 import { ExecutionAdmissionsRepo } from '../../src/lib/db/repos/execution-admissions-repo.mjs'
 import { SharedVmOperations } from '../../src/lib/vm/shared-vm-operations.mjs'
 import { containerName } from '../../src/lib/vm/vm-runtime.mjs'
 
 async function fixture(t) {
   const db = getDb()
-  const other = await createDatabase({ connectionString: db.connectionString, schema: db.schema })
+  const other = await createRepositoryTestDatabase({ connectionString: db.connectionString, schema: db.schema })
   t.after(() => other.close())
   return {
     db,

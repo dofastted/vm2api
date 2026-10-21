@@ -9,6 +9,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { slotHost } from './slot-host.mjs'
+import { physicalContainerName } from './vm-physical-target.mjs'
 import { maxRequestBytes, readRoutingConfigFile, streamIdleTimeoutMs } from '../core/config.mjs'
 import { US_TIMEZONES, validTimezone } from '../core/timezone.mjs'
 import { runtimeKind, isKvmRuntime, RUNTIME_KVM } from './runtime-kind.mjs'
@@ -136,7 +137,7 @@ function sh(argv, opts = {}) {
 }
 
 export function containerName(vmId) {
-  return `kin-${String(vmId || '').replace(/^vm-/, '')}`
+  return physicalContainerName(vmId)
 }
 
 export function officialCcUidGid(vmId) {

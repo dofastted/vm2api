@@ -1,5 +1,6 @@
 import crypto from 'node:crypto'
 import { withTransaction } from '../database.mjs'
+import { physicalContainerName, physicalVmAliases } from '../../vm/vm-physical-target.mjs'
 
 function invalid(field) {
   return Object.assign(new Error(`Invalid execution admission ${field}`), { code: 'invalid_execution_admission' })
@@ -45,7 +46,10 @@ export class ExecutionAdmissionsRepo {
       })
     }
     if (!Array.isArray(vmIds)) throw invalid('vmIds')
-    const resources = vmIds.map((id) => 'vm:' + identifier(id, 'vmId'))
+    const resources = vmIds.flatMap((id) => {
+      identifier(id, 'vmId')
+      return [...physicalVmAliases(id).map((alias) => 'vm:' + alias), 'vm-target:' + physicalContainerName(id)]
+    })
     if (accountId != null) resources.push('account:' + identifier(accountId, 'accountId'))
     for (const resource of [...new Set(resources)].sort()) {
       await this.db.query('SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))', [
@@ -63,12 +67,12 @@ export class ExecutionAdmissionsRepo {
     const row = await this.db
       .prepare(`SELECT
         count(*) FILTER (WHERE account_id = $1 AND released_at IS NULL) AS account_inflight,
-        count(*) FILTER (WHERE vm_id = $2 AND released_at IS NULL) AS vm_inflight,
+        count(*) FILTER (WHERE vm_id = ANY($2::text[]) AND released_at IS NULL) AS vm_inflight,
         count(*) FILTER (WHERE account_id = $1 AND released_at IS NULL AND model_family = 'fable') AS fable_inflight,
         count(*) FILTER (WHERE account_id = $1 AND created_at > $3::timestamptz - interval '60 seconds') AS rpm_count,
         min(created_at) FILTER (WHERE account_id = $1 AND created_at > $3::timestamptz - interval '60 seconds') AS rpm_oldest
-        FROM execution_admissions WHERE account_id = $1 OR vm_id = $2`)
-      .get(accountId, vmId, now)
+        FROM execution_admissions WHERE account_id = $1 OR vm_id = ANY($2::text[])`)
+      .get(accountId, vmId == null ? [] : physicalVmAliases(vmId), now)
     return {
       accountInflight: row.account_inflight,
       vmInflight: row.vm_inflight,
@@ -101,9 +105,14 @@ export class ExecutionAdmissionsRepo {
       await this.assertRoutingRevision(input.routingRevision)
       await this.lockResources({ accountId, vmIds: [vmId] })
       const operation = await this.db
-        .prepare('SELECT id FROM vm_operations WHERE vm_id = $1 AND released_at IS NULL')
-        .get(vmId)
+        .prepare('SELECT id FROM vm_operations WHERE vm_id = ANY($1::text[]) AND released_at IS NULL LIMIT 1')
+        .get(physicalVmAliases(vmId))
       if (operation) return denied('vm_operation_active', 0, vmLimit)
+      const alias = await this.db
+        .prepare(`SELECT id FROM execution_admissions
+          WHERE vm_id = ANY($1::text[]) AND vm_id <> $2 AND released_at IS NULL LIMIT 1`)
+        .get(physicalVmAliases(vmId), vmId)
+      if (alias) return denied('vm_physical_target_conflict', 0, vmLimit)
       const { now } = await this.db.prepare('SELECT clock_timestamp() AS now').get()
       await this.db
         .prepare(`DELETE FROM execution_admissions WHERE account_id = $1

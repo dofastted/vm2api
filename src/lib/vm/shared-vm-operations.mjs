@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { withTransaction } from '../db/database.mjs'
 import { ExecutionAdmissionsRepo } from '../db/repos/execution-admissions-repo.mjs'
+import { physicalVmAliases } from './vm-physical-target.mjs'
 
 const callbacks = new AsyncLocalStorage()
 
@@ -38,12 +39,12 @@ export class SharedVmOperations {
       // Identical namespace and VM resource to ExecutionAdmissionsRepo.tryReserve.
       await this.executions.lockVm(vmId)
       const active = await this.db
-        .prepare('SELECT id FROM vm_operations WHERE vm_id = $1 AND released_at IS NULL')
-        .get(vmId)
+        .prepare('SELECT id FROM vm_operations WHERE vm_id = ANY($1::text[]) AND released_at IS NULL LIMIT 1')
+        .get(physicalVmAliases(vmId))
       if (active) return { ok: false, code: 'vm_operation_active' }
       const execution = await this.db
-        .prepare('SELECT id FROM execution_admissions WHERE vm_id = $1 AND released_at IS NULL LIMIT 1')
-        .get(vmId)
+        .prepare('SELECT id FROM execution_admissions WHERE vm_id = ANY($1::text[]) AND released_at IS NULL LIMIT 1')
+        .get(physicalVmAliases(vmId))
       if (execution) return { ok: false, code: 'vm_execution_active' }
       const operationId = crypto.randomUUID()
       await this.db
