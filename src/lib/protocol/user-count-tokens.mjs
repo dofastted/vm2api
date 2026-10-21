@@ -355,14 +355,17 @@ export async function resolveUsageWindows({
   if (!shouldHopOfficialUsage(acc?.unified, { hop: true })) return { listed, source }
   const cache = usageCache || getUsageCache()
   let result
+  let observation
   try {
+    observation = await accountQuota?.beginObservation?.()
     result = await cache.load(accountId, () => probe({ exec, vm, includeFable: false }))
   } catch {
     return { listed, source }
   }
   if (!result || isOfficialUsageRateLimited(result)) return { listed, source }
   try {
-    accountQuota?.ingestOAuthUsage?.(accountId, result)
+    accountQuota?.ingestOAuthUsage?.(accountId, result, { observation })
+    await accountQuota?.flush?.()
   } catch {}
   const next = accountQuota?.repo?.get?.(accountId) || acc
   listed = listQuotaFromHeaders(next?.unified || {})

@@ -1,7 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { createDatabase, getDb } from '../../src/lib/db/database.mjs'
 import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
+import { buildProbeOne } from '../../src/lib/admin/panel-api.mjs'
 
 async function pair(t) {
   const db = getDb()
@@ -121,4 +125,193 @@ test('an older probe finishing after a newer observation cannot overwrite the ne
   const saved = await left.persistence.get('shared-account')
   assert.equal(saved.unified['5h'].utilization, 0.81)
   assert.equal(left.repo.get('shared-account').unified['5h'].utilization, 0.81)
+})
+
+test('a fresh zero observation and an unchanged observation still supersede older tickets', async (t) => {
+  const { left, right } = await pair(t)
+  const older = await left.beginObservation()
+  const fresh = await right.beginObservation()
+  right.ingestOAuthUsage('shared-account', { ok: true, five_hour: { utilization: 0 } }, { observation: fresh })
+  await right.flush()
+  left.ingestOAuthUsage('shared-account', { ok: true, five_hour: { utilization: 50 } }, { observation: older })
+  await left.flush()
+  assert.equal((await left.persistence.get('shared-account')).unified['5h'].utilization, 0)
+})
+
+test('late header results keep additive usage but cannot replace a newer header observation', async (t) => {
+  const { left, right } = await pair(t)
+  const observation = await left.beginObservation()
+  right.ingestHeaders('shared-account', { 'anthropic-ratelimit-unified-5h-utilization': '0.81' })
+  await right.flush()
+  left.ingestHeaders(
+    'shared-account',
+    { 'anthropic-ratelimit-unified-5h-utilization': '0.12' },
+    { input_tokens: 7 },
+    { observation },
+  )
+  await left.flush()
+  const saved = await left.persistence.get('shared-account')
+  assert.equal(saved.requests, 2)
+  assert.equal(saved.tokens_in, 7)
+  assert.equal(saved.unified.headers['5h'].utilization, 0.81)
+})
+
+test('panel probes take their tickets before asynchronous I/O and preserve the newer quota and tier', async (t) => {
+  const { left, right } = await pair(t)
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'shared-account-probe-'))
+  t.after(() => fs.rmSync(project, { recursive: true, force: true }))
+  fs.mkdirSync(path.join(project, 'vms'))
+  fs.writeFileSync(
+    path.join(project, 'vms/vm-a.json'),
+    JSON.stringify({
+      id: 'vm-a',
+      status: 'stopped',
+      claude: { mode: 'oauth', has_access: true, account_uuid: 'shared-account' },
+    }),
+  )
+  let entered
+  let resume
+  const started = new Promise((resolve) => {
+    entered = resolve
+  })
+  const gate = new Promise((resolve) => {
+    resume = resolve
+  })
+  const args = { cfg: { paths: { project }, rewrite: {} }, id: 'vm-a', force: true, hop: true }
+  const oldResult = buildProbeOne({
+    ...args,
+    accountQuota: left,
+    usageCache: {
+      clear() {},
+      async load() {
+        entered()
+        await gate
+        return {
+          ok: true,
+          limits_present: true,
+          usage_has_fable: false,
+          account_tier: 'pro',
+          five_hour: { utilization: 12 },
+        }
+      },
+    },
+  })
+  await started
+  await buildProbeOne({
+    ...args,
+    accountQuota: right,
+    usageCache: {
+      clear() {},
+      async load() {
+        return {
+          ok: true,
+          limits_present: true,
+          usage_has_fable: true,
+          account_tier: 'max',
+          five_hour: { utilization: 81 },
+        }
+      },
+    },
+  })
+  resume()
+  await oldResult
+  await Promise.all([left.flush(), right.flush()])
+  const saved = await left.persistence.get('shared-account')
+  assert.equal(saved.unified['5h'].utilization, 0.81)
+  assert.equal(saved.unified.account_tier, 'max')
+  assert.equal(saved.unified.usage_has_fable, true)
+  assert.equal(JSON.parse(fs.readFileSync(path.join(project, 'vms/vm-a.json'))).claude.account_tier, 'max')
+})
+
+test('header observations preserve unrelated official and model fields from another replica', async (t) => {
+  const { left, right } = await pair(t)
+  right.ingestOAuthUsage('shared-account', { ok: true, seven_day: { utilization: 61 } })
+  right.markModelUnsupported('shared-account', 'claude-fable-5')
+  await right.flush()
+  left.ingestHeaders('shared-account', { 'anthropic-ratelimit-unified-5h-utilization': '0.2' })
+  await left.flush()
+  const saved = await left.persistence.get('shared-account')
+  assert.equal(saved.unified['7d'].utilization, 0.61)
+  assert.equal(saved.unified.headers['5h'].utilization, 0.2)
+  assert.ok(saved.unified.model_denied_until['claude-fable-5'] > Date.now())
+})
+
+test('a stale health check cannot replace remote header windows with an empty initialized object', async (t) => {
+  const { left, right } = await pair(t)
+  left.ingestHeaders('shared-account', { 'anthropic-ratelimit-unified-5h-utilization': '0.81' })
+  await left.flush()
+  right.ingestHeaders('shared-account', {}, null, { countRequest: false })
+  await right.flush()
+  assert.equal((await left.persistence.get('shared-account')).unified.headers['5h'].utilization, 0.81)
+})
+
+test('a stale test-chat or rate-limited probe preserves the successful usage probe from another replica', async (t) => {
+  const { left, right } = await pair(t)
+  left.recordLastProbe('shared-account', { ok: true, source: 'vm-oauth-usage' })
+  await left.flush()
+  right.recordLastProbe('shared-account', { ok: false, source: 'test-chat', error: 'expired', status: 401 })
+  await right.flush()
+  let saved = await left.persistence.get('shared-account')
+  assert.equal(saved.unified.last_probe.ok, true)
+  assert.equal(saved.unified.last_probe.source, 'vm-oauth-usage')
+  // A third, independently loaded stale cache must not synthesize a failed last_probe on 429.
+  const third = await new AccountQuota({ db: right.db, config: {} }).init()
+  left.recordLastProbe('shared-account', { ok: true, source: 'official-cc-usage' })
+  await left.flush()
+  third.ingestOAuthUsage('shared-account', { usage_status: 429, rate_limited: true })
+  await third.flush()
+  saved = await left.persistence.get('shared-account')
+  assert.equal(saved.unified.last_probe.ok, true)
+  assert.equal(saved.unified.last_probe.source, 'official-cc-usage')
+  assert.ok(saved.unified.usage_rate_limited_until)
+})
+
+test('an in-flight database result does not publish over a later synchronous local mutation', async (t) => {
+  const { left } = await pair(t)
+  const apply = left.persistence.applyChanges.bind(left.persistence)
+  let entered
+  let resume
+  let nextEntered
+  let nextResume
+  const started = new Promise((resolve) => {
+    entered = resolve
+  })
+  const gate = new Promise((resolve) => {
+    resume = resolve
+  })
+  const nextStarted = new Promise((resolve) => {
+    nextEntered = resolve
+  })
+  const nextGate = new Promise((resolve) => {
+    nextResume = resolve
+  })
+  let first = true
+  left.persistence.applyChanges = async (...args) => {
+    if (!first) {
+      nextEntered()
+      await nextGate
+    }
+    const saved = await apply(...args)
+    if (first) {
+      first = false
+      entered()
+      await gate
+    }
+    return saved
+  }
+  left.ingestHeaders('shared-account', {}, { input_tokens: 3 })
+  await started
+  left.setMaxConcurrency('shared-account', 17, { override: true })
+  left.ingestHeaders('shared-account', {}, { input_tokens: 7 })
+  resume()
+  await nextStarted
+  assert.equal(left.repo.get('shared-account').max_concurrency, 17)
+  assert.equal(left.repo.get('shared-account').tokens_in, 10)
+  nextResume()
+  await left.flush()
+  const saved = await left.persistence.get('shared-account')
+  assert.equal(saved.max_concurrency, 17)
+  assert.equal(saved.tokens_in, 10)
+  assert.equal(left.repo.get('shared-account').max_concurrency, 17)
+  assert.equal(left.repo.get('shared-account').tokens_in, 10)
 })

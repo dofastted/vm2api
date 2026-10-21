@@ -1099,7 +1099,9 @@ export async function runVmTestChat(opts = {}) {
 
   const timeoutMs = Math.min(Math.max(Number(opts.timeoutMs) || 90000, 10000), 180000)
   let result
+  let observation
   try {
+    if (!codex) observation = await opts.accountQuota?.beginObservation?.()
     result = await (codex ? postV1Responses : postV1Messages)({
       baseUrl,
       apiKey,
@@ -1197,12 +1199,16 @@ export async function runVmTestChat(opts = {}) {
     if (errObj.request_id) push('info', `request_id=${errObj.request_id}`)
     if (result?.status === 401 && /revoked/i.test(String(errObj.message || errObj.upstream_message || ''))) {
       try {
-        opts.accountQuota?.recordLastProbe?.(vm.claude?.account_uuid || vm.account_uuid || vmId, {
-          ok: false,
-          source: 'test-chat',
-          error: errObj.message,
-          status: 401,
-        })
+        opts.accountQuota?.recordLastProbe?.(
+          vm.claude?.account_uuid || vm.account_uuid || vmId,
+          {
+            ok: false,
+            source: 'test-chat',
+            error: errObj.message,
+            status: 401,
+          },
+          { observation },
+        )
       } catch {}
     }
   }

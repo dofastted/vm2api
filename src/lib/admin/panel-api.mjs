@@ -1009,7 +1009,7 @@ export async function buildClaudeResetRedeem({ cfg, id, idempotencyKey, transpor
   })
 }
 
-function applyFableProbeResult(accountQuota, accountId, found) {
+function applyFableProbeResult(accountQuota, accountId, found, observation) {
   if (found?.tier !== 'pro' && found?.tier !== 'max') return null
   const saved = accountQuota.repo.get(accountId)
   if (!saved || !found.fable) return found.tier
@@ -1028,7 +1028,7 @@ function applyFableProbeResult(accountQuota, accountId, found) {
     reset: found.fable.reset_at || prev.reset || null,
     probed_at: new Date().toISOString(),
   }
-  accountQuota.repo.save(saved)
+  accountQuota.repo.observe(saved, { observation, paths: [['unified', 'fable']] })
   return found.tier
 }
 function fatalUsageCredentialFailure(result = {}) {
@@ -1137,6 +1137,7 @@ export async function buildProbeOne({
   if (force) cache.clear(accountId)
   const skipHop = !shouldHopOfficialUsage(acc?.unified, { hop, force })
   const headerProbe = skipHop ? probeFromPassiveHeaders(acc?.unified || {}) : null
+  const observation = await accountQuota.beginObservation()
   const result = skipHop
     ? {
         ok: false,
@@ -1157,12 +1158,19 @@ export async function buildProbeOne({
       })
     } catch {}
   }
-  if (!skipHop) accountQuota.ingestOAuthUsage(accountId, result)
+  if (!skipHop) accountQuota.ingestOAuthUsage(accountId, result, { observation })
   if (isSetupTokenMode(credentialModeOfVm(vm)) && (force || includeFable) && !result.usage_scope_missing) {
     try {
-      await applyFableProbeResult(accountQuota, accountId, await fableProbe({ exec, timeoutMs: 20000 }))
+      const fableObservation = await accountQuota.beginObservation()
+      await applyFableProbeResult(
+        accountQuota,
+        accountId,
+        await fableProbe({ exec, timeoutMs: 20000 }),
+        fableObservation,
+      )
     } catch {}
   }
+  await accountQuota.flush()
   const after = accountQuota.repo.get(accountId)
   const qAfter = quotaFromAccount(after)
   const rateLimited = isOfficialUsageRateLimited(result)
@@ -1186,11 +1194,17 @@ export async function buildProbeOne({
   ).key
   const completeUsage = result.ok === true && result.limits_present === true
   if (completeUsage && (result.account_tier === 'pro' || result.account_tier === 'max')) {
-    accountQuota.setAccountTier(accountId, result.account_tier, { source: 'usage' })
-    persistAccountTier(cfg.paths.project, id, result.account_tier, { source: 'usage' })
+    accountQuota.setAccountTier(accountId, result.account_tier, { source: 'usage', observation })
+    await accountQuota.flush()
+    if (accountQuota.repo.get(accountId)?.unified?.account_tier === result.account_tier) {
+      persistAccountTier(cfg.paths.project, id, result.account_tier, { source: 'usage' })
+    }
   } else if (completeUsage && (tier === 'pro' || tier === 'max')) {
-    accountQuota.setAccountTier(accountId, tier, { source: 'usage' })
-    persistAccountTier(cfg.paths.project, id, tier, { source: 'usage' })
+    accountQuota.setAccountTier(accountId, tier, { source: 'usage', observation })
+    await accountQuota.flush()
+    if (accountQuota.repo.get(accountId)?.unified?.account_tier === tier) {
+      persistAccountTier(cfg.paths.project, id, tier, { source: 'usage' })
+    }
   }
   const availability = evaluateAccount({
     vm,
@@ -1287,7 +1301,7 @@ export async function buildProbeOne({
     error: data.error,
     data_at: data.via === 'passive-headers' ? checked.unified.headers?.sampled_at || null : data.probed_at,
   }
-  accountQuota.repo.save(checked)
+  accountQuota.repo.observe(checked, { observation, paths: [['unified', 'last_probe_check']] })
   return ok(data)
 }
 

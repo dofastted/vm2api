@@ -9,9 +9,91 @@
  */
 
 import { getDb, withTransaction } from '../database.mjs'
-import { integerValue } from '../integers.mjs'
+import { addInteger, integerValue } from '../integers.mjs'
+import { isDeepStrictEqual } from 'node:util'
 
 const MAX_ALLOCATIONS_PER_ACCOUNT = 50
+const COUNTERS = ['requests', 'tokens_in', 'tokens_out', 'cache_read_tokens', 'cache_creation_tokens']
+const FIELDS = {
+  vm_id: 'vm_id',
+  email: 'email',
+  name: 'name',
+  platform: 'platform',
+  type: 'type',
+  status: 'status',
+  priority: 'priority',
+  rate_multiplier: 'rate_multiplier',
+  schedulable: 'schedulable',
+  max_concurrency: 'concurrency',
+  concurrency_override: 'concurrency_override',
+  max_rpm: 'max_rpm',
+  rpm_override: 'rpm_override',
+}
+
+function observationChanges(before, after, path, out) {
+  if (isDeepStrictEqual(before, after)) return
+  if (after && typeof after === 'object' && !Array.isArray(after)) {
+    const previous = before && typeof before === 'object' && !Array.isArray(before) ? before : {}
+    for (const key of new Set([...Object.keys(previous), ...Object.keys(after)])) {
+      observationChanges(previous[key], after[key], [...path, key], out)
+    }
+  } else {
+    out.push({ path, value: after, before })
+  }
+}
+
+function touchObservation(before, after, path, out) {
+  if (after && typeof after === 'object' && !Array.isArray(after) && Object.keys(after).length) {
+    for (const key of Object.keys(after)) touchObservation(before?.[key], after[key], [...path, key], out)
+    return
+  }
+  if (!out.some((change) => isDeepStrictEqual(change.path, path))) out.push({ path, value: after, before })
+}
+
+/** Describe the caller's mutations, never persist the unchanged parts of its cached account. */
+export function accountChanges(before, after, { paths = [] } = {}) {
+  const fields = {}
+  const deltas = {}
+  const observations = []
+  for (const field of Object.keys(FIELDS)) {
+    if (!isDeepStrictEqual(before[field], after[field])) fields[field] = after[field] ?? null
+  }
+  for (const field of COUNTERS) {
+    const delta = addInteger(after[field], (-BigInt(integerValue(before[field]))).toString())
+    if (delta !== 0) deltas[field] = delta
+  }
+  for (const field of ['unified', 'last_blocked', 'last_cli_rate_limit']) {
+    observationChanges(before[field], after[field], [field], observations)
+  }
+  for (const path of paths) touchObservation(valueAt(before, path), valueAt(after, path), path, observations)
+  return { fields, deltas, observations }
+}
+
+function valueAt(object, path) {
+  return path.reduce((value, key) => value?.[key], object)
+}
+
+function setAt(object, path, value) {
+  let target = object
+  for (const key of path.slice(0, -1)) {
+    if (!Object.hasOwn(target, key) || !target[key] || typeof target[key] !== 'object' || Array.isArray(target[key])) {
+      Object.defineProperty(target, key, { value: {}, writable: true, enumerable: true, configurable: true })
+    }
+    target = target[key]
+  }
+  if (value === undefined) delete target[path.at(-1)]
+  else
+    Object.defineProperty(target, path.at(-1), {
+      value: structuredClone(value),
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    })
+}
+
+function overlapping(left, right) {
+  return left.slice(0, Math.min(left.length, right.length)).every((key, index) => key === right[index])
+}
 
 function parse(json, fallback = null) {
   if (json == null) return fallback
@@ -71,6 +153,7 @@ function buildExtra(acc) {
 export class AccountsRepo {
   constructor(db = getDb()) {
     this.db = db
+    this.snapshots = new WeakMap()
     this._get = db.prepare('SELECT * FROM accounts WHERE id = $1')
     this._list = db.prepare('SELECT * FROM accounts ORDER BY id')
     this._insert = db.prepare(`
@@ -81,15 +164,13 @@ export class AccountsRepo {
                             cache_read_tokens, cache_creation_tokens,
                             extra, created_at, updated_at)
       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+      ON CONFLICT (id) DO NOTHING
     `)
-    this._update = db.prepare(`
-      UPDATE accounts SET vm_id = $1, email = $2, name = $3, type = $4,
-                          concurrency = $5, concurrency_override = $6,
-                          max_rpm = $7, rpm_override = $8,
-                          requests = $9, tokens_in = $10, tokens_out = $11,
-                          cache_read_tokens = $12, cache_creation_tokens = $13,
-                          extra = $14, updated_at = $15
-      WHERE id = $16
+    this._nextObservation = db.prepare("SELECT nextval('account_observation_seq') AS observation")
+    this._lock = db.prepare('SELECT * FROM accounts WHERE id = $1 FOR UPDATE')
+    this._observe = db.prepare(`
+      UPDATE accounts SET extra = $1, observation_versions = $2::jsonb, updated_at = $3
+      WHERE id = $4
     `)
     this._insertAlloc = db.prepare(`
       INSERT INTO account_allocations (account_id, at, source, util_5h, util_7d, status_5h, status_7d, claim, tokens_in, tokens_out)
@@ -114,11 +195,17 @@ export class AccountsRepo {
   }
 
   async get(accountId) {
-    return rowToAccount(await this._get.get(accountId))
+    const account = rowToAccount(await this._get.get(accountId))
+    if (account) this.snapshots.set(account, structuredClone(account))
+    return account
   }
 
   async list() {
-    return (await this._list.all()).map(rowToAccount)
+    return (await this._list.all()).map((row) => {
+      const account = rowToAccount(row)
+      this.snapshots.set(account, structuredClone(account))
+      return account
+    })
   }
 
   /** Insert if missing, returns stored account. New accounts join the coding group (id=1). */
@@ -151,27 +238,89 @@ export class AccountsRepo {
     })
   }
 
-  /** Full-row save of a mutated account object. */
+  /** Compatibility for callers mutating a snapshot returned by this repository. */
   async save(acc) {
-    await this._update.run(
-      acc.vm_id ?? null,
-      acc.email ?? null,
-      acc.name ?? acc.email ?? acc.account_id,
-      acc.type ?? 'oauth',
-      acc.max_concurrency ?? 2,
-      acc.concurrency_override ? 1 : 0,
-      acc.max_rpm ?? 0,
-      acc.rpm_override ? 1 : 0,
-      integerValue(acc.requests),
-      integerValue(acc.tokens_in),
-      integerValue(acc.tokens_out),
-      integerValue(acc.cache_read_tokens),
-      integerValue(acc.cache_creation_tokens),
-      buildExtra(acc),
-      new Date().toISOString(),
-      acc.account_id,
+    for (const field of COUNTERS) integerValue(acc[field])
+    const before = this.snapshots.get(acc)
+    if (!before) throw new Error('account save requires a repository snapshot; use an explicit patch')
+    const stored = await this.applyChanges(acc.account_id, accountChanges(before, acc))
+    this.snapshots.set(acc, structuredClone(acc))
+    return stored
+  }
+
+  async beginObservation() {
+    return (await this._nextObservation.get()).observation
+  }
+
+  async patchFields(accountId, fields) {
+    const entries = Object.entries(fields)
+    for (const [field] of entries) {
+      if (!Object.hasOwn(FIELDS, field)) throw new Error(`unsupported account field: ${field}`)
+    }
+    if (!entries.length) return this.get(accountId)
+    const values = entries.map(([field, value]) =>
+      ['schedulable', 'concurrency_override', 'rpm_override'].includes(field) ? (value ? 1 : 0) : value,
     )
-    return await this.get(acc.account_id)
+    const assignments = entries.map(([field], index) => `${FIELDS[field]} = $${index + 1}`)
+    values.push(new Date().toISOString(), accountId)
+    const row = await this.db
+      .prepare(`UPDATE accounts SET ${assignments.join(', ')},
+      updated_at = $${values.length - 1} WHERE id = $${values.length} RETURNING *`)
+      .get(...values)
+    return rowToAccount(row)
+  }
+
+  async incrementUsage(accountId, deltas) {
+    const values = COUNTERS.map((field) => integerValue(deltas[field]))
+    values.push(new Date().toISOString(), accountId)
+    return rowToAccount(
+      await this.db
+        .prepare(`UPDATE accounts SET
+      ${COUNTERS.map((field, index) => `${field} = COALESCE(${field}, 0) + $${index + 1}::bigint`).join(', ')},
+      updated_at = $6 WHERE id = $7 RETURNING *`)
+        .get(...values),
+    )
+  }
+
+  async patchObservation(accountId, changes, observation, { conditional = false, probeBase } = {}) {
+    const sequence = BigInt(observation)
+    return withTransaction(this.db, async () => {
+      const row = await this._lock.get(accountId)
+      if (!row) return null
+      const extra = parse(row.extra, {}) || {}
+      const versions = row.observation_versions || {}
+      const probeChanged = probeBase !== undefined && !isDeepStrictEqual(extra.unified?.last_probe ?? null, probeBase)
+      let changed = false
+      for (const change of changes) {
+        if (!['unified', 'last_blocked', 'last_cli_rate_limit'].includes(change.path[0])) {
+          throw new Error('unsupported account observation')
+        }
+        if (
+          Object.entries(versions).some(
+            ([path, version]) => overlapping(JSON.parse(path), change.path) && BigInt(version) > sequence,
+          )
+        )
+          continue
+        if (probeChanged && change.path[0] === 'unified' && change.path[1] === 'last_probe') continue
+        if (conditional && !isDeepStrictEqual(valueAt(extra, change.path), change.before)) continue
+        setAt(extra, change.path, change.value)
+        versions[JSON.stringify(change.path)] = sequence.toString()
+        changed = true
+      }
+      if (changed)
+        await this._observe.run(JSON.stringify(extra), JSON.stringify(versions), new Date().toISOString(), accountId)
+      return this.get(accountId)
+    })
+  }
+
+  async applyChanges(accountId, { fields = {}, deltas = {}, observations = [] }, options = {}) {
+    const observation = observations.length ? await (options.observation ?? this.beginObservation()) : null
+    return withTransaction(this.db, async () => {
+      if (Object.keys(fields).length) await this.patchFields(accountId, fields)
+      if (Object.keys(deltas).length) await this.incrementUsage(accountId, deltas)
+      if (observations.length) await this.patchObservation(accountId, observations, observation, options)
+      return this.get(accountId)
+    })
   }
 
   async remove(accountId) {
