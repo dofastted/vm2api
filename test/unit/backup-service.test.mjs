@@ -60,6 +60,22 @@ test('tar is available in this environment', () => {
   assert.equal(tarAvailable(), true)
 })
 
+test('restoring the application schema preserves later writes in a neighboring schema', async () => {
+  const db = getDb()
+  const neighbor = `"${db.schema}_neighbor"`
+  await db.exec(
+    `CREATE SCHEMA ${neighbor}; CREATE TABLE ${neighbor}.sentinel(value text); INSERT INTO ${neighbor}.sentinel VALUES('before')`,
+  )
+  try {
+    const rec = await svc.createBackup()
+    await db.exec(`UPDATE ${neighbor}.sentinel SET value='after'`)
+    await svc.restoreBackup(rec.id)
+    assert.equal((await db.prepare(`SELECT value FROM ${neighbor}.sentinel`).get()).value, 'after')
+  } finally {
+    await db.exec(`DROP SCHEMA ${neighbor} CASCADE`)
+  }
+})
+
 test('createBackup produces tar.gz with manifest + db + vms + config, records ok', async () => {
   seedVm()
   await initVmDbSync(root, { watch: false })

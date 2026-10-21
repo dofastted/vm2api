@@ -42,9 +42,6 @@ jobs:
         with:
           go-version: '1.25.x'
           cache-dependency-path: worker/go.sum
-      - name: Keep disposable database cleanup immediate
-        run: |
-          docker exec ${{ job.services.postgres.id }} psql -U vm2api -d vm2api_test -v ON_ERROR_STOP=1 -c 'ALTER SYSTEM SET checkpoint_completion_target=0' -c 'SELECT pg_reload_conf()'
       - run: npm ci
       - name: PostgreSQL 17 backup clients
         run: |
