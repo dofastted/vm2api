@@ -56,6 +56,7 @@ export class GlobalMaintenanceCoordinator {
     this._closing = false
     this._held = false
     this._refs = 0
+    this._bootstrapUsed = false
     this._serial = Promise.resolve()
     this._onError = (error) => this._lose(error)
     this._onEnd = () => this._lose(failure('maintenance_connection_lost', 'Activity connection ended'))
@@ -215,7 +216,11 @@ export class GlobalMaintenanceCoordinator {
     this._assertHealthy()
     return this._transaction(async (client) => {
       const row = (await client.query(`SELECT * FROM ${this.qualified}.control WHERE id = 1 FOR SHARE`)).rows[0]
-      if (!Number.isSafeInteger(epoch) || Number(row.epoch) !== epoch || !['open', 'rebinding'].includes(row.phase)) {
+      if (
+        !Number.isSafeInteger(epoch) ||
+        Number(row.epoch) !== epoch ||
+        !['open', 'draining', 'rebinding'].includes(row.phase)
+      ) {
         throw failure('database_maintenance', 'The loaded application epoch cannot be acknowledged')
       }
       const updated = await client.query(
@@ -229,7 +234,16 @@ export class GlobalMaintenanceCoordinator {
   }
 
   /** New activities always use another session; session-lock reentry cannot bypass a restore waiter. */
-  async admit({ kind = 'request', requestId = null } = {}) {
+  admit(metadata = {}) {
+    return this._admit(metadata, false)
+  }
+
+  /** Hold across migrations and initial cache loading, before the first epoch acknowledgement. */
+  admitBootstrap({ requestId = null } = {}) {
+    return this._admit({ kind: 'bootstrap', requestId }, true)
+  }
+
+  async _admit({ kind = 'request', requestId = null }, bootstrap) {
     return this._exclusiveLocal(async () => {
       this._assertHealthy()
       try {
@@ -252,7 +266,13 @@ export class GlobalMaintenanceCoordinator {
               [this.ownerId],
             )
           ).rows[0]
-          if (!member || Number(member.bound_epoch) !== Number(row.epoch)) {
+          if (bootstrap && (this._bootstrapUsed || member?.bound_epoch != null)) {
+            throw failure(
+              'maintenance_bootstrap_bound',
+              'This Pod incarnation has already initialized its application state',
+            )
+          }
+          if (!member || (!bootstrap && Number(member.bound_epoch) !== Number(row.epoch))) {
             throw failure('maintenance_epoch_unbound', 'Pod caches have not loaded the current application epoch')
           }
           this._assertHealthy()
@@ -265,7 +285,8 @@ export class GlobalMaintenanceCoordinator {
         })
         this._assertHealthy()
         this._refs += 1
-        return this._gate(id, epoch)
+        if (bootstrap) this._bootstrapUsed = true
+        return this._gate(id, epoch, kind)
       } catch (error) {
         if (!this._refs) await this._releaseHolder()
         throw error
@@ -273,8 +294,8 @@ export class GlobalMaintenanceCoordinator {
     })
   }
 
-  _gate(id, epoch) {
-    const scope = { coordinator: this, id, epoch, active: true }
+  _gate(id, epoch, kind) {
+    const scope = { coordinator: this, id, epoch, kind, active: true }
     const assertActive = () => {
       this._assertHealthy()
       if (!scope.active) throw failure('maintenance_activity_closed', 'The activity scope has completed')
