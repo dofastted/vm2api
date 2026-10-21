@@ -7,6 +7,7 @@ import {
   normalizeNodeBinding,
   normalizeNodeCommand,
   normalizeNodeCompletion,
+  normalizeNodeReceipt,
   sameNodeBinding,
 } from '../core/node-execution-proof.mjs'
 
@@ -347,6 +348,40 @@ export class SlotgateClient {
     const handle = freeze({ requestId, ticket: reply.ticket })
     this.handles.add(handle)
     return handle
+  }
+
+  /** Query the original journal after controller loss. Notfound never proves no dispatch. */
+  async recoveryStatus(requestId, { timeoutMs = 3000, signal } = {}) {
+    if (
+      typeof requestId !== 'string' ||
+      !requestId ||
+      requestId.trim() !== requestId ||
+      requestId.length > 256 ||
+      /[\x00-\x1f\x7f]/.test(requestId)
+    )
+      throw failure('slotgate_request_invalid')
+    const reply = await this._rpc(
+      { op: 'recovery-status', vm_id: this.nodeBinding.vmId, fence: this.nodeBinding.fence, command_id: requestId },
+      timeoutMs,
+      signal,
+    )
+    try {
+      if (reply.found === false && reply.unknown === true && Object.keys(reply).length === 3)
+        return freeze({ found: false, unknown: true })
+      if (
+        reply.found !== true ||
+        Object.keys(reply).some((key) => !['ok', 'found', 'command', 'receipt'].includes(key))
+      )
+        throw failure('slotgate_recovery_unconfirmed')
+      const command = normalizeNodeCommand(reply.command, { requestId, nodeBinding: this.nodeBinding })
+      if (Object.hasOwn(reply, 'receipt')) {
+        normalizeNodeCompletion(command, { requestId, nodeBinding: this.nodeBinding })
+        return freeze({ found: true, command, receipt: normalizeNodeReceipt(reply.receipt) })
+      }
+      return freeze({ found: true, command })
+    } catch {
+      throw failure('slotgate_recovery_unconfirmed')
+    }
   }
 
   async completion(handle) {

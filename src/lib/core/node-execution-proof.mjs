@@ -106,3 +106,54 @@ export function normalizeNodeCompletion(value, binding) {
   if (command.status !== 'completed' || command.dispatched !== true) invalid()
   return command
 }
+
+/** Public node journal metadata only. Counts remain exact decimal strings. */
+export function normalizeNodeReceipt(value) {
+  const object = (item, required, optional = []) => {
+    if (
+      !item ||
+      typeof item !== 'object' ||
+      Array.isArray(item) ||
+      ![Object.prototype, null].includes(Object.getPrototypeOf(item)) ||
+      required.some((key) => !Object.hasOwn(item, key)) ||
+      Object.keys(item).some((key) => !required.includes(key) && !optional.includes(key))
+    )
+      invalid()
+  }
+  const count = (item) => {
+    if (typeof item !== 'string' || !/^(0|[1-9][0-9]{0,18})$/.test(item) || BigInt(item) > 9223372036854775807n)
+      invalid()
+    return item
+  }
+  object(value, ['id', 'usage_complete', 'usage'], ['model', 'speed', 'service_tier', 'stop_reason'])
+  if (typeof value.id !== 'string' || !/^[a-f0-9]{32}$/.test(value.id) || typeof value.usage_complete !== 'boolean')
+    invalid()
+  const result = { id: value.id, usage_complete: value.usage_complete, usage: {} }
+  for (const key of ['model', 'speed', 'service_tier', 'stop_reason']) {
+    if (!Object.hasOwn(value, key)) continue
+    const item = value[key]
+    if (
+      typeof item !== 'string' ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(item) ||
+      item.length > (key === 'model' ? 256 : 64)
+    )
+      invalid()
+    if (key === 'stop_reason' && !['end_turn', 'tool_use', 'max_tokens', 'stop_sequence'].includes(item)) invalid()
+    result[key] = item
+  }
+  const main = ['input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens']
+  object(value.usage, [], [...main, 'cache_creation', 'server_tool_use'])
+  for (const key of main) if (Object.hasOwn(value.usage, key)) result.usage[key] = count(value.usage[key])
+  for (const [key, fields] of [
+    ['cache_creation', ['ephemeral_5m_input_tokens', 'ephemeral_1h_input_tokens']],
+    ['server_tool_use', ['web_search_requests']],
+  ]) {
+    if (!Object.hasOwn(value.usage, key)) continue
+    const nested = value.usage[key]
+    object(nested, [], fields)
+    if (!Object.keys(nested).length) invalid()
+    result.usage[key] = Object.fromEntries(Object.entries(nested).map(([field, item]) => [field, count(item)]))
+  }
+  if (value.usage_complete && (!result.model || main.some((key) => !Object.hasOwn(result.usage, key)))) invalid()
+  return result
+}
