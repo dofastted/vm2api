@@ -164,6 +164,21 @@ test('process inspection permission failure retains its receipt and ownership', 
   assert.equal(fs.existsSync(path.join(f.dir, 'egress.owner.json')), true)
 })
 
+test('a failed signal retains both PID and execution receipt', { skip: process.platform !== 'linux' }, async (t) => {
+  const f = fixture(t)
+  const started = await f.start()
+  const kill = process.kill
+  t.mock.method(process, 'kill', (pid, signal) => {
+    if (pid === started.pid && signal === 'SIGTERM') throw Object.assign(new Error('signal denied'), { code: 'EPERM' })
+    return kill(pid, signal)
+  })
+  const result = await egress.stopEgressProcessConfirmed(f.root, 'synthetic')
+  assert.equal(result.ok, false)
+  assert.equal(result.vmOperationUncertain, true)
+  assert.equal(fs.existsSync(path.join(f.dir, 'egress.pid')), true)
+  assert.equal(fs.existsSync(path.join(f.dir, 'egress.owner.json')), true)
+})
+
 test('Docker network inspection failure cannot be treated as absent during proxy teardown', async (t) => {
   const f = fixture(t)
   const result = await stopProxyEgress(f.root, 'synthetic', {
@@ -173,6 +188,31 @@ test('Docker network inspection failure cannot be treated as absent during proxy
   assert.equal(result.ok, false)
   assert.equal(result.vmOperationUncertain, true)
 })
+
+for (const mode of ['normal', 'noop', 'replacement']) {
+  test(`proxy network teardown verifies immutable ID and observed absence (${mode})`, async (t) => {
+    const f = fixture(t)
+    let present = true
+    const removed = []
+    const result = await stopProxyEgress(f.root, 'synthetic', {
+      ...noDocker,
+      runDocker: (args) => {
+        if (args[1] === 'rm') {
+          removed.push(args.at(-1))
+          if (mode !== 'noop') present = false
+          return { ok: true, stdout: '' }
+        }
+        if (present) return { ok: true, stdout: '192.0.2.0/24|192.0.2.1|original-network-id' }
+        if (mode === 'replacement' && args.at(-1) !== 'original-network-id')
+          return { ok: true, stdout: '192.0.2.0/24|192.0.2.1|replacement-network-id' }
+        return { ok: false, stderr: 'Error: No such network: synthetic' }
+      },
+    })
+    assert.deepEqual(removed, ['original-network-id'])
+    assert.equal(result.ok, mode === 'normal')
+    if (mode !== 'normal') assert.equal(result.vmOperationUncertain, true)
+  })
+}
 
 function remoteFixture({ noop = false, permission = false } = {}) {
   const source = fs.readFileSync(new URL('../../src/lib/cluster/remote-slot.mjs', import.meta.url), 'utf8')
@@ -214,4 +254,18 @@ test('remote egress stop addresses immutable IDs and permission failures remain 
   assert.equal(f.ids[0], 'immutable-egress-id')
   const unknown = await remoteFixture({ permission: true }).stop({ id: 'vm-synthetic', proxy: {} }, '/synthetic', false)
   assert.equal(unknown.vmOperationUncertain, true)
+})
+
+test('a Kubernetes Codex exit-policy stop cannot infer another Pod kernel is absent', async () => {
+  const source = fs.readFileSync(new URL('../../src/lib/vm/slot-host.mjs', import.meta.url), 'utf8')
+  const body = source.slice(source.indexOf('  setProxyEgressEnabled: async'), source.indexOf('  localExitProxyUrl:'))
+  const stop = vmContext.runInNewContext(`({${body}}).setProxyEgressEnabled`, {
+    isCodexVm: () => true,
+    stopCodexKernel: () => null,
+    isKubernetesMode: () => true,
+    finishCodexRecycle: async () => ({ exited: true }),
+  })
+  const result = await stop({ id: 'vm-synthetic' }, '/synthetic', false)
+  assert.equal(result.ok, false)
+  assert.equal(result.vmOperationUncertain, true)
 })
