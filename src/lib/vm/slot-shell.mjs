@@ -381,8 +381,21 @@ export function createSlotShell({
   const liveTokens = new Set()
   let sessions = 0
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 })
+  const pendingTasks = new Set()
+  const connections = new Map()
+  let draining = false
+  let drainError = null
+  function track(task) {
+    const tracked = Promise.resolve(task)
+      .catch((error) => {
+        drainError ||= error
+      })
+      .finally(() => pendingTasks.delete(tracked))
+    pendingTasks.add(tracked)
+  }
 
   async function issueTicket(vmId, { login = false } = {}) {
+    if (draining) return refuse(503, 'control_plane_draining', 'Control plane is draining')
     const vm = getVm(projectRoot, vmId)
     if (!vm) return refuse(404, 'vm_not_found', 'vm not found')
     if (isCodexVm(vm)) return refuse(409, 'no_container', 'GPT 槽没有容器，无法打开终端')
@@ -393,6 +406,7 @@ export function createSlotShell({
         return refuse(409, err.code || 'auth_login_not_ready', err.message)
       }
     }
+    if (draining) return refuse(503, 'control_plane_draining', 'Control plane is draining')
     if (sessions >= MAX_SESSIONS) return refuse(429, 'shell_limit', `终端会话已达上限 ${MAX_SESSIONS}`)
     const now = Date.now()
     for (const [t, v] of tickets) if (v.exp <= now) tickets.delete(t)
@@ -420,6 +434,10 @@ export function createSlotShell({
     const url = new URL(req.url || '/', 'http://local')
     const sm = SHELL_RE.exec(url.pathname)
     if (!sm) return false
+    if (draining) {
+      rejectUpgrade(socket, 503, 'Service Unavailable')
+      return true
+    }
     const vmId = decodeURIComponent(sm[1])
     const ticket = url.searchParams.get('ticket') || ''
     const entry = consumeTicket(ticket, vmId)
@@ -439,6 +457,10 @@ export function createSlotShell({
     }
     const login = !!entry.login
     const accept = () => {
+      if (draining) {
+        rejectUpgrade(socket, 503, 'Service Unavailable')
+        return
+      }
       if (sessions >= MAX_SESSIONS) {
         rejectUpgrade(socket, 429, 'Too Many Requests')
         return
@@ -449,20 +471,27 @@ export function createSlotShell({
         rows: clampInt(url.searchParams.get('rows'), 5, 200, 24),
         login,
       }
-      wss.handleUpgrade(req, socket, head, (ws) => attach(ws, vm, size))
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        track(new Promise((resolve) => ws.once('close', resolve)))
+        track(attach(ws, vm, size))
+      })
     }
     if (!login) {
       accept()
       return true
     }
-    ;(upgradeLoginReady || authLoginReady || assertAuthLoginReady)(projectRoot, vm).then(accept, (err) =>
-      rejectUpgrade(
-        socket,
-        409,
-        String(err?.message || 'Conflict')
-          .replace(/[\r\n]+/g, ' ')
-          .slice(0, 120) || 'Conflict',
-      ),
+    track(
+      Promise.resolve()
+        .then(() => (upgradeLoginReady || authLoginReady || assertAuthLoginReady)(projectRoot, vm))
+        .then(accept, (err) =>
+          rejectUpgrade(
+            socket,
+            409,
+            String(err?.message || 'Conflict')
+              .replace(/[\r\n]+/g, ' ')
+              .slice(0, 120) || 'Conflict',
+          ),
+        ),
     )
     return true
   }
@@ -475,6 +504,11 @@ export function createSlotShell({
     let session = null
     let closed = false
     let released = false
+    let adoptTimer = null
+    connections.set(ws, () => {
+      clearInterval(adoptTimer)
+      ws.close(1001, 'Control plane is draining')
+    })
     const release = () => {
       if (released) return
       released = true
@@ -512,12 +546,16 @@ export function createSlotShell({
     }
     ws.on('close', () => {
       closed = true
+      connections.delete(ws)
+      clearInterval(adoptTimer)
       release()
       if (!session) return
       session.stream.destroy()
-      reap().catch((err) => {
-        logger.warn?.(`[slot-shell] ${vm.id} reap failed: ${err.message}`)
-      })
+      track(
+        reap().catch((err) => {
+          logger.warn?.(`[slot-shell] ${vm.id} reap failed: ${err.message}`)
+        }),
+      )
     })
     try {
       connect = slotHost(vm).dockerApi()
@@ -542,10 +580,10 @@ export function createSlotShell({
       ws.close(1011)
       return
     }
-    if (closed) {
+    if (closed || draining) {
       // The close handler ran before the session existed: reap here instead.
       session.stream.destroy()
-      reap().catch(() => {})
+      await reap().catch(() => {})
       return
     }
     // ConsoleSize on exec start is API >= 1.42; resize covers older daemons.
@@ -568,17 +606,30 @@ export function createSlotShell({
         if (report) send(JSON.stringify({ t: 'error', message: '官方登录凭证未能导入槽凭证' }))
       },
     })
-    const adoptTimer = size.login ? setInterval(() => void adoptLive(), 1000) : null
+    adoptTimer = size.login ? setInterval(() => track(adoptLive()), 1000) : null
     adoptTimer?.unref?.()
     let ended = false
-    const onEnd = async () => {
+    const onEnd = () => {
       if (ended) return
       ended = true
       clearInterval(adoptTimer)
-      if (size.login) await adoptLive(true)
-      const info = await inspectExec(connect, session.execId).catch(() => null)
-      send(JSON.stringify({ t: 'exit', code: info?.ExitCode ?? null }))
-      ws.close(1000)
+      track(
+        (async () => {
+          if (size.login) {
+            const adopted = await adoptLive(true)
+            if (
+              draining &&
+              adopted.error &&
+              !['auth_login_incomplete', 'auth_login_scope'].includes(adopted.error.code)
+            ) {
+              throw adopted.error
+            }
+          }
+          const info = await inspectExec(connect, session.execId).catch(() => null)
+          send(JSON.stringify({ t: 'exit', code: info?.ExitCode ?? null }))
+          ws.close(1000)
+        })(),
+      )
     }
     session.stream.on('data', (chunk) => send(chunk))
     session.stream.on('end', onEnd)
@@ -587,5 +638,22 @@ export function createSlotShell({
     for (const msg of pending.splice(0)) apply(msg)
   }
 
-  return { issueTicket, handleUpgrade, liveShellTokens: () => [...liveTokens] }
+  function beginDrain() {
+    draining = true
+    tickets.clear()
+    for (const close of connections.values()) close()
+  }
+
+  async function drain() {
+    beginDrain()
+    while (pendingTasks.size) await Promise.all([...pendingTasks])
+    if (drainError) throw drainError
+  }
+
+  function terminate() {
+    beginDrain()
+    for (const ws of connections.keys()) ws.terminate()
+  }
+
+  return { issueTicket, handleUpgrade, liveShellTokens: () => [...liveTokens], beginDrain, drain, terminate }
 }

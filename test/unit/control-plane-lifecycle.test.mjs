@@ -78,6 +78,9 @@ test('forced shutdown rejects an unfinished body before closing its response', a
   const body = readRawBody(req, 100).finally(handlerFinished)
   req.write('{')
   lifecycle.forceClose()
-  await assert.rejects(withTimeout(body, 30), { code: 'request_stream_error' })
+  await assert.rejects(withTimeout(body, 30), (error) => {
+    assert.equal(error.body?.error?.code, 'request_stream_error')
+    return true
+  })
   await lifecycle.waitForIdle()
 })

@@ -166,6 +166,17 @@ export function createClusterRoutes({ manager, json, readBody, ok }) {
   }
 
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 })
+  const pending = new Set()
+  let draining = false
+  let drainError = null
+  function track(task) {
+    const tracked = Promise.resolve(task)
+      .catch((error) => {
+        drainError ||= error
+      })
+      .finally(() => pending.delete(tracked))
+    pending.add(tracked)
+  }
 
   function rejectUpgrade(socket, status, text) {
     socket.write(`HTTP/1.1 ${status} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`)
@@ -177,6 +188,10 @@ export function createClusterRoutes({ manager, json, readBody, ok }) {
     const url = new URL(req.url || '/', 'http://local')
     const sm = SHELL_RE.exec(url.pathname)
     if (!sm) return false
+    if (draining) {
+      rejectUpgrade(socket, 503, 'Service Unavailable')
+      return true
+    }
     const id = sm[1]
     if (!manager.consumeShellTicket(url.searchParams.get('ticket') || '', id)) {
       rejectUpgrade(socket, 401, 'Unauthorized')
@@ -184,7 +199,10 @@ export function createClusterRoutes({ manager, json, readBody, ok }) {
     }
     const cols = clampInt(url.searchParams.get('cols'), 10, 500, 80)
     const rows = clampInt(url.searchParams.get('rows'), 5, 200, 24)
-    wss.handleUpgrade(req, socket, head, (ws) => attachShell(ws, id, { cols, rows }))
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      track(new Promise((resolve) => ws.once('close', resolve)))
+      track(attachShell(ws, id, { cols, rows }))
+    })
     return true
   }
 
@@ -231,5 +249,21 @@ export function createClusterRoutes({ manager, json, readBody, ok }) {
     for (const msg of pending.splice(0)) apply(msg)
   }
 
-  return { handle, handleUpgrade }
+  function beginDrain() {
+    draining = true
+    for (const ws of wss.clients) ws.close(1001, 'Control plane is draining')
+  }
+
+  async function drain() {
+    beginDrain()
+    while (pending.size) await Promise.all([...pending])
+    if (drainError) throw drainError
+  }
+
+  function terminate() {
+    draining = true
+    for (const ws of wss.clients) ws.terminate()
+  }
+
+  return { handle, handleUpgrade, beginDrain, drain, terminate }
 }

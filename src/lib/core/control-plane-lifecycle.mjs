@@ -85,8 +85,8 @@ export class ControlPlaneLifecycle {
 
   forceClose() {
     for (const { req, res } of this.requests) {
+      req.destroy?.(Object.assign(new Error('Control plane shutdown deadline exceeded'), { code: 'shutdown_timeout' }))
       res.destroy?.()
-      req.destroy?.()
     }
   }
 }

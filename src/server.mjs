@@ -1146,7 +1146,6 @@ const handlePanel = createPanelHandler({
 })
 
 const sockets = new Set()
-const terminalSockets = new Set()
 const server = http.createServer(async (req, res) => {
   const handlerFinished = lifecycle.trackHttp(req, res)
   activeRequests.add(req)
@@ -1343,7 +1342,6 @@ server.on('connection', (socket) => {
   sockets.add(socket)
   socket.once('close', () => {
     sockets.delete(socket)
-    terminalSockets.delete(socket)
   })
 })
 
@@ -1357,7 +1355,6 @@ server.on('upgrade', async (req, socket, head) => {
     return
   }
   if (await responsesWs.handleUpgrade(req, socket, head)) return
-  terminalSockets.add(socket)
   if (clusterRoutes.handleUpgrade(req, socket, head)) return
   if (!slotShell.handleUpgrade(req, socket, head)) socket.destroy()
 })
@@ -1416,11 +1413,15 @@ async function shutdown(signal, { failed = false } = {}) {
   _shuttingDown = true
   lifecycle.beginDrain()
   responsesWs.beginDrain()
+  clusterRoutes.beginDrain()
+  slotShell.beginDrain()
   console.log(`[shutdown] ${signal} — closing`)
   const deadline = Date.now() + shutdownGraceMs
   const forceClose = () => {
     lifecycle.forceClose()
     responsesWs.terminate()
+    clusterRoutes.terminate()
+    slotShell.terminate()
     server.closeAllConnections?.()
     for (const socket of sockets) socket.destroy()
   }
@@ -1465,9 +1466,17 @@ async function shutdown(signal, { failed = false } = {}) {
     stopVmWatch()
   } catch {}
   const serverClosed = new Promise((resolve) => server.close(resolve))
-  for (const socket of terminalSockets) socket.end()
   try {
-    await withTimeout(Promise.all([serverClosed, lifecycle.waitForIdle(), responsesWs.drain()]), shutdownGraceMs)
+    await withTimeout(
+      Promise.all([
+        serverClosed,
+        lifecycle.waitForIdle(),
+        responsesWs.drain(),
+        clusterRoutes.drain(),
+        slotShell.drain(),
+      ]),
+      shutdownGraceMs,
+    )
   } catch {
     failed = true
     console.error('[shutdown] request drain deadline exceeded')
@@ -1476,6 +1485,13 @@ async function shutdown(signal, { failed = false } = {}) {
   try {
     await withTimeout(
       (async () => {
+        // An interrupted connection can still be completing its cancellation or login import.
+        await Promise.allSettled([
+          lifecycle.waitForIdle(),
+          responsesWs.drain(),
+          clusterRoutes.drain(),
+          slotShell.drain(),
+        ])
         await backupService.flush()
         await pausePriceCatalog()
         for (const monitor of maintenanceMonitors()) await monitor?.flush?.()
