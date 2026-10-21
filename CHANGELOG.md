@@ -2,6 +2,8 @@
 
 ## 未发布
 
+- OpenAI Responses 上游：生命周期元数据（`response.created` / `queued` / `in_progress` / `metadata` / `keepalive`）之后若失败仍可 failover；首条真实输出前不 commit，避免仅 metadata 即锁定 attempt。（#645）
+
 ## 1.3.213 — 2026-10-22
 
 - 官方透传（`compatibility.official_cc_passthrough`、`codex.official_passthrough`）：system/instructions、messages/input、tools、cache_control、采样字段等 body 仍完全透传；outbound session 与 Codex `prompt_cache_key` 恢复 attempt/VM rebuild/mint（不再沿用入站 session 或调用方 cache key）；`metadata.user_id` 继续重绑槽位 device/account。默认开关仍关。（#676）
