@@ -9,6 +9,7 @@ import { GlobalMaintenanceCoordinator } from '../../src/lib/db/global-maintenanc
 import { ExecutionAdmissionsRepo } from '../../src/lib/db/repos/execution-admissions-repo.mjs'
 import { readWorkerCredentialFile, writeWorkerCredentialFile } from '../../src/lib/oauth/oauth-credentials.mjs'
 import { runSlotOauth } from '../../src/lib/transport/slot-oauth.mjs'
+import { ensureWorkerCredential } from '../../src/lib/transport/go-worker-client.mjs'
 
 async function fixture(t) {
   const db = getDb()
@@ -28,10 +29,14 @@ async function fixture(t) {
     account_uuid: 'slot-refresh-account',
   })
   const previous = process.env.VM2API_CONTROL_PLANE_MODE
+  const dockerBin = process.env.KIN_DOCKER_BIN
+  process.env.KIN_DOCKER_BIN = path.join(root, 'missing-synthetic-docker')
   process.env.VM2API_CONTROL_PLANE_MODE = 'kubernetes'
   t.after(async () => {
     if (previous == null) delete process.env.VM2API_CONTROL_PLANE_MODE
     else process.env.VM2API_CONTROL_PLANE_MODE = previous
+    if (dockerBin == null) delete process.env.KIN_DOCKER_BIN
+    else process.env.KIN_DOCKER_BIN = dockerBin
     await coordinator.stop()
     const client = new pg.Client({ connectionString: db.connectionString })
     await client.connect()
@@ -80,6 +85,37 @@ test('a slot refresh timeout retains its shared operation and task', async (t) =
   assert.equal(rows.rows.length, 1)
   assert.equal(rows.rows[0].released_at, null)
   assert.ok(rows.rows[0].uncertain_at)
+})
+
+test('ensure publishes its VM projection before the shared refresh and VM operation finish', async (t) => {
+  const f = await fixture(t)
+  let publications = 0
+  const result = await ensureWorkerCredential(f.exec, {
+    force: true,
+    runDocker: async () => {
+      writeWorkerCredentialFile(f.homeDir, {
+        ...readWorkerCredentialFile(f.homeDir),
+        access_token: 'SYNTHETIC_NEW_AT',
+        refresh_token: 'SYNTHETIC_NEW_RT',
+      })
+      return { code: 0, stdout: '{"ok":true,"status":200,"body":{"refreshed":true}}' }
+    },
+    publishCredential: async () => {
+      publications++
+      assert.equal((await f.db.prepare('SELECT count(*) AS n FROM vm_operations WHERE released_at IS NULL').get()).n, 1)
+      assert.equal(
+        (await f.db.prepare('SELECT count(*) AS n FROM background_task_runs WHERE finished_at IS NULL').get()).n,
+        1,
+      )
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.attemptFinished, true)
+  assert.equal(publications, 1)
+  assert.equal(
+    (await f.run(() => f.db.prepare('SELECT count(*) AS n FROM vm_operations WHERE released_at IS NULL').get())).n,
+    0,
+  )
 })
 
 test('implicit worker refresh commands cannot execute while another inference is active', async (t) => {
