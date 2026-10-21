@@ -10,6 +10,8 @@ import { ApiKeysRepo } from '../../src/lib/db/repos/api-keys-repo.mjs'
 import { UsageLogsRepo } from '../../src/lib/db/repos/usage-logs-repo.mjs'
 import { UsageLogsView } from '../../src/lib/db/repos/usage-logs-view.mjs'
 import { StatisticsRepo } from '../../src/lib/db/repos/statistics-repo.mjs'
+import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
+import { RequestLogStore } from '../../src/lib/admin/request-log.mjs'
 
 const LARGE = '9007199254740993'
 const INPUT_TOTAL = '9007199254740995'
@@ -79,9 +81,19 @@ test('bigint counter writers reject an already rounded unsafe Number', async () 
     RangeError,
   )
   const keys = new ApiKeysRepo(db)
+  await assert.rejects(
+    keys.insert({ id: 'unsafe-key', key: 'synthetic-unsafe-key', requests: Number(LARGE) }),
+    RangeError,
+  )
   await keys.insert({ id: 'key-a', key: 'synthetic-key-a', status: 'active' })
   await assert.rejects(keys.recordUsage('key-a', { tokens_in: Number(LARGE) }), RangeError)
   assert.equal((await keys.getById('key-a')).tokens_in, 0)
+  await assert.rejects(keys.update({ ...(await keys.getById('key-a')), requests: Number(LARGE) }), RangeError)
+  const accounts = new AccountsRepo(db)
+  await assert.rejects(accounts.insert({ account_id: 'unsafe-account', requests: Number(LARGE) }), RangeError)
+  await accounts.insert({ account_id: 'account-a', requests: 0 })
+  await assert.rejects(accounts.save({ ...(await accounts.get('account-a')), tokens_in: Number(LARGE) }), RangeError)
+  await assert.rejects(accounts.addAllocation('account-a', { tokens_in: Number(LARGE) }), RangeError)
 })
 
 test('API key usage preserves both large stored counters and exact string deltas', async () => {
@@ -112,6 +124,35 @@ test('account updates and allocation history preserve bigint counters', async ()
   assert.equal((await accounts.get('account-a')).tokens_in, LARGE)
   assert.equal((await accounts.get('account-a')).requests, LARGE)
   assert.equal((await accounts.recentAllocations('account-a'))[0].tokens_in, LARGE)
+})
+
+test('API key store forwards exact string token deltas to persistence', async () => {
+  const store = new ApiKeyStore({ db: getDb() })
+  const key = await store.create({ name: 'large usage' })
+  await store.recordUsage(key.id, { input_tokens: LARGE, cache_creation_input_tokens: LARGE })
+  const saved = await store.getById(key.id)
+  assert.equal(saved.tokens_in, LARGE)
+  assert.equal(saved.cache_creation_tokens, LARGE)
+})
+
+test('request logging preserves exact cache subdivisions and web search counts', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-bigint-request-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const store = new RequestLogStore({ db: getDb(), dataDir: dir })
+  const ctx = store.start({ method: 'POST', headers: {} })
+  await store.finish(ctx, {
+    status: 200,
+    usage: {
+      input_tokens: LARGE,
+      cache_creation_input_tokens: LARGE,
+      cache_creation: { ephemeral_5m_input_tokens: LARGE },
+      web_search_requests: LARGE,
+    },
+  })
+  const saved = await store.repo.getByRequestId(ctx.request_id)
+  assert.equal(saved.input_tokens, LARGE)
+  assert.equal(saved.cache_creation_5m_tokens, LARGE)
+  assert.equal(saved.web_search_requests, LARGE)
 })
 
 test('usage totals and billing windows return exact integer sums', async () => {
