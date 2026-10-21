@@ -174,3 +174,47 @@ test('same-session requests wait until asynchronous capacity release completes',
   assert.equal(releases, 2)
   assert.equal(calls, 2)
 })
+
+test('asynchronous proxy failure reporting finishes before releasing the selected reservation', async () => {
+  const entered = deferred()
+  const finish = deferred()
+  let releases = 0
+  let selections = 0
+  const scheduler = schedulerWithRelease(async () => releases++)
+  const runner = new FailoverRunner({
+    scheduler: {
+      ...scheduler,
+      selectAndReserve: () =>
+        ++selections === 1 ? scheduler.selectAndReserve() : { ok: false, reason: 'no_eligible_accounts' },
+      markCooldown() {},
+    },
+    config: { max_total_attempts: 1 },
+    onProxyFailure: async () => {
+      entered.resolve()
+      await finish.promise
+    },
+  })
+  const pending = runner.run(
+    request('async-proxy-release', {
+      callAttempt: () => ({
+        ok: false,
+        status: 0,
+        transportError: true,
+        terminalState: 'transport_error',
+        body: { error: { code: 'worker_transport_error', message: 'SOCKS proxy dial failed' } },
+      }),
+    }),
+  )
+  try {
+    await Promise.race([
+      entered.promise,
+      pending.then((result) => assert.fail(`proxy callback was not invoked: ${JSON.stringify(result.policy)}`)),
+    ])
+    await setImmediate()
+    assert.equal(releases, 0, 'asynchronous proxy state writes are part of the attempt lifecycle')
+  } finally {
+    finish.resolve()
+    await pending
+  }
+  assert.equal(releases, 1)
+})
