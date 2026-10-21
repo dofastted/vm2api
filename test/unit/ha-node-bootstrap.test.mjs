@@ -92,6 +92,8 @@ async function fixture(t) {
     )
     .digest('hex')
   const calls = []
+  let failStart = false,
+    beforeStart = null
   let spec
   const containerId = 'b'.repeat(64)
   engine = http.createServer(async (req, res) => {
@@ -110,7 +112,10 @@ async function fixture(t) {
       spec = JSON.parse(Buffer.concat(chunks).toString())
       return send({ Id: containerId }, 201)
     }
-    if (parsed.pathname === `/containers/${containerId}/start`) return res.writeHead(204).end()
+    if (parsed.pathname === `/containers/${containerId}/start`) {
+      if (beforeStart) await beforeStart()
+      return res.writeHead(failStart ? 500 : 204).end()
+    }
     if (parsed.pathname === `/containers/${containerId}/json`)
       return send({
         Id: containerId,
@@ -156,8 +161,9 @@ async function fixture(t) {
             file,
             ...extra,
           ],
-          { env, stdio: ['ignore', 'pipe', 'pipe'] },
+          { env, stdio: ['pipe', 'pipe', 'pipe'] },
         )
+        p.stdin.end(extra.includes('--credential-fd') ? payload : undefined)
         let out = '',
           err = ''
         p.stdout.on('data', (c) => (out += c))
@@ -178,6 +184,12 @@ async function fixture(t) {
     credentialFile,
     node,
     calls,
+    setFailStart: () => {
+      failStart = true
+    },
+    setBeforeStart: (fn) => {
+      beforeStart = fn
+    },
     root,
     close,
     q: quoteIdentifier(service.schema),
@@ -250,3 +262,128 @@ nodeCase('bootstrap refuses an existing VM without overwriting its fingerprint o
     'original',
   )
 })
+
+nodeCase('slot-create accepts credential FD input without persisting it in config or public output', async (fx) => {
+  const init = await fx.cli('trusted-init')
+  assert.equal(init.status, 0, init.out + init.err)
+  await fx.db.pool.query(fs.readFileSync(fx.output, 'utf8'))
+  fx.config.vm.fingerprint = { device_id: '9'.repeat(64), session_id: '11111111-2222-4333-8444-555555555555' }
+  delete fx.config.credentialFile
+  fs.writeFileSync(fx.file, JSON.stringify(fx.config))
+  const result = await fx.cli('slot-create', ['--credential-fd', '0'])
+  assert.equal(result.status, 0, result.out + result.err)
+  assert.equal(result.out.includes('synthetic-command-refresh'), false)
+  assert.deepEqual(
+    JSON.parse((await fx.peer.query('SELECT vm_json FROM vms WHERE id=$1', [vmId])).rows[0].vm_json).fingerprint,
+    fx.config.vm.fingerprint,
+  )
+})
+nodeCase('an unknown node launch retains bootstrap and VM claims and refuses replacement attempts', async (fx) => {
+  const init = await fx.cli('trusted-init')
+  assert.equal(init.status, 0, init.out + init.err)
+  await fx.db.pool.query(fs.readFileSync(fx.output, 'utf8'))
+  fx.setFailStart()
+  const result = await fx.cli('slot-create')
+  assert.equal(result.status, 1)
+  assert.match(result.err, /node_launch_unconfirmed/)
+  assert.equal((await fx.peer.query('SELECT count(*)::int AS n FROM vms')).rows[0].n, 0)
+  const bg = (
+    await fx.peer.query('SELECT unknown_at,finished_at FROM background_task_runs WHERE task_key=$1', [
+      `ha-node-bootstrap:${vmId}`,
+    ])
+  ).rows[0]
+  assert.ok(bg.unknown_at)
+  assert.equal(bg.finished_at, null)
+  assert.ok(
+    (await fx.peer.query("SELECT uncertain_at FROM vm_operations WHERE kind='node_launch'")).rows[0].uncertain_at,
+  )
+  const before = fx.calls.length,
+    retry = await fx.cli('slot-create')
+  assert.equal(retry.status, 1)
+  assert.match(retry.err, /bootstrap_claim_unavailable/)
+  assert.equal(fx.calls.length, before)
+})
+nodeCase('an existing VM inserted during node launch is not overwritten by metadata publication', async (fx) => {
+  const init = await fx.cli('trusted-init')
+  assert.equal(init.status, 0, init.out + init.err)
+  await fx.db.pool.query(fs.readFileSync(fx.output, 'utf8'))
+  fx.setBeforeStart(async () =>
+    fx.db.query('INSERT INTO vms(id,vm_json) VALUES($1,$2)', [
+      vmId,
+      JSON.stringify({ id: vmId, fingerprint: { device_id: 'racing-owner', session_id: 'racing-session' } }),
+    ]),
+  )
+  const result = await fx.cli('slot-create')
+  assert.equal(result.status, 1)
+  assert.match(result.err, /bootstrap_vm_exists/)
+  assert.equal(
+    JSON.parse((await fx.peer.query('SELECT vm_json FROM vms WHERE id=$1', [vmId])).rows[0].vm_json).fingerprint
+      .device_id,
+    'racing-owner',
+  )
+  const bg = (
+    await fx.peer.query('SELECT unknown_at,finished_at FROM background_task_runs WHERE task_key=$1', [
+      `ha-node-bootstrap:${vmId}`,
+    ])
+  ).rows[0]
+  assert.ok(bg.unknown_at)
+  assert.equal(bg.finished_at, null)
+})
+
+nodeCase('private credential permissions and exact account identity are checked before node admission', async (fx) => {
+  fs.chmodSync(fx.credentialFile, 0o644)
+  let result = await fx.cli('slot-create')
+  assert.equal(result.status, 1)
+  assert.match(result.err, /bootstrap_credential_invalid/)
+  fs.chmodSync(fx.credentialFile, 0o600)
+  const payload = JSON.parse(fs.readFileSync(fx.credentialFile, 'utf8'))
+  payload.credential.account_uuid = 'different-account'
+  fs.writeFileSync(fx.credentialFile, JSON.stringify(payload))
+  result = await fx.cli('slot-create')
+  assert.equal(result.status, 1)
+  assert.match(result.err, /bootstrap_credential_invalid/)
+  assert.equal(fx.calls.length, 0)
+})
+nodeCase('trusted-init rejects a symlink configuration without creating authority tables', async (fx) => {
+  const target = path.join(fx.root, 'real-config.json')
+  fs.renameSync(fx.file, target)
+  fs.symlinkSync(target, fx.file)
+  const result = await fx.cli('trusted-init')
+  assert.equal(result.status, 1)
+  assert.match(result.err, /bootstrap_config_invalid/)
+  assert.equal(
+    (await fx.peer.query('SELECT to_regclass($1) AS present', [`${fx.service.schema}.allocations`])).rows[0].present,
+    null,
+  )
+})
+
+nodeCase(
+  'a busy VM before the first node call is known not started and permits a later explicit invocation',
+  async (fx) => {
+    const init = await fx.cli('trusted-init')
+    assert.equal(init.status, 0, init.out + init.err)
+    await fx.db.pool.query(fs.readFileSync(fx.output, 'utf8'))
+    const { SharedVmOperations } = await import('../../src/lib/vm/shared-vm-operations.mjs')
+    const held = await new SharedVmOperations(fx.db).tryAcquire({
+      vmId,
+      accountId: 'synthetic-account',
+      kind: 'synthetic_hold',
+    })
+    try {
+      const first = await fx.cli('slot-create')
+      assert.equal(first.status, 1)
+      assert.equal(fx.calls.length, 0)
+      const bg = (
+        await fx.peer.query('SELECT finished_at,unknown_at FROM background_task_runs WHERE task_key=$1', [
+          `ha-node-bootstrap:${vmId}`,
+        ])
+      ).rows[0]
+      assert.ok(bg.finished_at)
+      assert.equal(bg.unknown_at, null)
+    } finally {
+      await held.release()
+    }
+    const retry = await fx.cli('slot-create')
+    assert.equal(retry.status, 0, retry.out + retry.err)
+  },
+)
