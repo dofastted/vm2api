@@ -1127,7 +1127,9 @@ export class PoolScheduler extends EventEmitter {
     if (hardBlock) return { ok: false, reason: hardBlock.reason, until: hardBlock.until }
     let circuitProbeUntil = null
     if (!pinned) {
-      const circuit = this.unitCircuit?.inspect?.(accountId, now)
+      const circuit = this.shared
+        ? await this.executionAdmissions.inspectCircuit?.(accountId, this.circuitConfig())
+        : this.unitCircuit?.inspect?.(accountId, now)
       if (circuit?.reason === 'circuit_open') return { ok: false, reason: circuit.reason, until: circuit.until }
       if (circuit?.reason === 'circuit_probe') circuitProbeUntil = circuit.until
     }
@@ -1691,6 +1693,10 @@ export class PoolScheduler extends EventEmitter {
     }
   }
 
+  circuitConfig() {
+    return { failureThreshold: this.config.circuit_failure_threshold, openMs: this.config.circuit_open_ms }
+  }
+
   async reserveShared(candidate, options) {
     if (!options.skipQuota) {
       const gate = this.accountQuota?.canAccept?.(candidate.accountId, {
@@ -1700,8 +1706,6 @@ export class PoolScheduler extends EventEmitter {
       if (gate && !gate.ok && !['concurrency_limit', 'rpm_limit', 'quota_band_inflight'].includes(gate.reason))
         return null
     }
-    const circuitHold = options.pinned ? null : this.unitCircuit?.admit?.(candidate.accountId)
-    if (circuitHold && !circuitHold.ok) return null
     const limits = this.executionLimits(candidate)
     let lease
     try {
@@ -1710,10 +1714,10 @@ export class PoolScheduler extends EventEmitter {
         vmId: candidate.vmId,
         ...limits,
         routingRevision: candidate.routingRevision,
+        circuit: this.circuitConfig(),
         ...options,
       })
     } catch (error) {
-      if (circuitHold?.probe) this.unitCircuit?.releaseProbe?.(candidate.accountId)
       if (error?.code === 'routing_config_stale' && this.routingState) {
         await this.routingState.refresh()
         return null
@@ -1721,7 +1725,6 @@ export class PoolScheduler extends EventEmitter {
       throw error
     }
     if (!lease.ok) {
-      if (circuitHold?.probe) this.unitCircuit?.releaseProbe?.(candidate.accountId)
       candidate.busy = true
       candidate.waitReason = lease.code
       if (lease.retry_after_ms) candidate.availableAt = Date.now() + lease.retry_after_ms
@@ -1770,7 +1773,6 @@ export class PoolScheduler extends EventEmitter {
             else this.inflight.delete(candidate.accountId)
             this.bumpFamily(candidate.accountId, limits.family, -1)
             this.bumpVmInflight(candidate.vmId, -1)
-            if (circuitHold?.probe) this.unitCircuit?.releaseProbe?.(candidate.accountId)
             this.planner.pump(candidate.vmId)
             this.notifyCapacity(candidate.accountId)
             return result

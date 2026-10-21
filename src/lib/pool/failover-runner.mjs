@@ -476,6 +476,9 @@ export class FailoverRunner {
   }
 
   noteUnitHealth(selected, policy, result) {
+    if (this.scheduler?.shared) {
+      return selected.noteCircuitResult?.(policy?.circuit ? 'failure' : verifiedSuccess(result) ? 'success' : 'neutral')
+    }
     const circuit = this.scheduler?.unitCircuit
     if (!circuit || !selected?.accountId) return
     if (policy?.circuit) circuit.recordFailure(selected.accountId)
@@ -1022,7 +1025,7 @@ export class FailoverRunner {
 
           lastResult = result
           lastPolicy = policy
-          this.noteUnitHealth(selected, policy, result)
+          await this.noteUnitHealth(selected, policy, result)
           await notifyProxyFailure(this.onProxyFailure, selected, policy)
           if (policy.reason === 'fable_plan_denied' && typeof this.onFablePlanDenied === 'function') {
             try {
@@ -1214,7 +1217,7 @@ export class FailoverRunner {
           )
           lastResult = result
           lastPolicy = policy
-          this.noteUnitHealth(selected, policy, result)
+          await this.noteUnitHealth(selected, policy, result)
           await notifyProxyFailure(this.onProxyFailure, selected, policy)
           await this.attemptsRepo?.complete?.(requestId, attemptNo, {
             upstreamStatus: 0,

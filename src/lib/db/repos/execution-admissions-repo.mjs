@@ -2,6 +2,7 @@ import crypto from 'node:crypto'
 import { withTransaction } from '../database.mjs'
 import { physicalContainerName, physicalVmAliases } from '../../vm/vm-physical-target.mjs'
 import { readWatchdogState } from '../../transport/kernel-watchdog-state.mjs'
+import { ExecutionCircuitsRepo } from './execution-circuits-repo.mjs'
 
 function invalid(field) {
   return Object.assign(new Error(`Invalid execution admission ${field}`), { code: 'invalid_execution_admission' })
@@ -31,6 +32,7 @@ export class ExecutionAdmissionsRepo {
     this.db = db
     this.ownerId = identifier(ownerId, 'ownerId')
     this.routingRevisionCheck = assertRoutingRevision
+    this.circuits = new ExecutionCircuitsRepo(this)
   }
 
   async assertRoutingRevision(revision) {
@@ -142,10 +144,13 @@ export class ExecutionAdmissionsRepo {
         })
       }
       const admissionId = crypto.randomUUID()
+      const circuit =
+        input.circuit && !input.pinned ? await this.circuits.admit(accountId, admissionId, now, input.circuit) : null
+      if (circuit && !circuit.ok) return circuit
       const record = await this.db
-        .prepare(`INSERT INTO execution_admissions (id, owner_id, request_id, account_id, vm_id, model_family, created_at)
-          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`)
-        .get(admissionId, ownerId, requestId, accountId, vmId, family, now)
+        .prepare(`INSERT INTO execution_admissions (id, owner_id, request_id, account_id, vm_id, model_family, created_at, circuit_revision)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`)
+        .get(admissionId, ownerId, requestId, accountId, vmId, family, now, circuit?.revision ?? null)
       const handle = { admissionId, ownerId }
       return {
         ok: true,
@@ -159,6 +164,15 @@ export class ExecutionAdmissionsRepo {
         markUncertain: () => this.markUncertain(handle),
         bindExecution: (execution) => this.bindExecution(handle, execution),
         completeExecution: (execution) => this.completeExecution(handle, execution),
+        noteCircuitResult: async (outcome) => {
+          if (!input.circuit || input.pinned) return { updated: false }
+          try {
+            return await this.circuits.noteResult(handle, outcome, input.circuit)
+          } catch (error) {
+            await this.markUncertain(handle)
+            throw error
+          }
+        },
       }
     })
   }
@@ -251,6 +265,7 @@ export class ExecutionAdmissionsRepo {
           WHERE id = $1 AND owner_id = $2 AND released_at IS NULL AND uncertain_at IS NULL
           AND NOT EXISTS (SELECT 1 FROM execution_jobs j WHERE j.admission_id = execution_admissions.id AND j.ended_at IS NULL)`)
         .run(handle.admissionId, handle.ownerId)
+      if (result.changes > 0) await this.circuits.releaseProbe(handle.admissionId)
       return { released: result.changes > 0 }
     })
   }

@@ -46,6 +46,9 @@ import { inferClaudeTier } from '../pool/claude-tier.mjs'
 import { listQuotaFromHeaders, isOfficialWindowLimited } from '../pool/quota-window.mjs'
 import { hardBlockOf } from '../pool/rate-limit-service.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { getDb } from '../db/database.mjs'
+import { ExecutionAdmissionsRepo } from '../db/repos/execution-admissions-repo.mjs'
 import { accountIdOf, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
 import { codexMaxSessions } from '../pool/codex-slot-pool.mjs'
 import { resolveCredentialScheduleLevel } from '../pool/credential-weight.mjs'
@@ -360,12 +363,35 @@ export async function clearVmCooldown({ cfg, accountQuota, stickyRouter = null, 
 
 /** Same key as PoolScheduler: full vm record (listVms summaries drop `claude`), slot identity first. */
 function circuitViewFor(vm, projectRoot) {
+  if (isKubernetesMode()) return null
   try {
     const full = (projectRoot && vm?.id && getVm(projectRoot, vm.id)) || vm
     const accountId = accountIdOf(full, projectRoot || null)
     return accountId ? { account_id: accountId, ...unitCircuit.view(accountId) } : null
   } catch {
     return null
+  }
+}
+
+function sharedCircuitConfig(routingConfig = {}) {
+  const pool = normalizePoolRouting(routingConfig.pool)
+  return { failureThreshold: pool.circuit_failure_threshold, openMs: pool.circuit_open_ms }
+}
+
+async function stampSharedCircuitViews(vms, projectRoot, routingConfig) {
+  if (!isKubernetesMode()) return
+  const circuits = new ExecutionAdmissionsRepo(getDb()).circuits
+  const config = sharedCircuitConfig(routingConfig)
+  const views = new Map()
+  for (const vm of vms) {
+    if (isCodexVm(vm)) continue
+    const accountId = accountIdOf(getVm(projectRoot, vm.id) || vm, projectRoot)
+    if (!accountId) continue
+    if (!views.has(accountId)) {
+      const { state, failures, threshold, open_until, open_ms } = await circuits.inspect(accountId, config)
+      views.set(accountId, { account_id: accountId, state, failures, threshold, open_until, open_ms })
+    }
+    vm.circuit = views.get(accountId)
   }
 }
 
@@ -383,6 +409,20 @@ export function resetVmCircuit({ cfg, poolScheduler = null, id } = {}) {
     )
   }
   const accountId = accountIdOf(vm, cfg.paths.project)
+  if (isKubernetesMode()) {
+    return (async () => {
+      if (accountId) {
+        const circuits = new ExecutionAdmissionsRepo(getDb()).circuits
+        await circuits.reset(accountId, poolScheduler?.circuitConfig?.() || sharedCircuitConfig())
+      }
+      const item = { ...vm }
+      await stampSharedCircuitViews([item], cfg.paths.project, {
+        pool: poolScheduler?.config || {},
+      })
+      poolScheduler?.notifyCapacity?.(accountId)
+      return ok({ id: vm.id, circuit: item.circuit || null })
+    })()
+  }
   if (accountId) unitCircuit.reset(accountId)
   try {
     poolScheduler?.notifyCapacity?.(accountId)
@@ -607,6 +647,7 @@ export async function buildDashboard({
     }),
   )
   const snap = accountQuota.snapshot()
+  await stampSharedCircuitViews(vms, cfg.paths.project, routingConfig)
   const accounts = liveAccounts(snap.accounts, listed)
   const peak5 = Math.max(0, ...accounts.map((a) => Number(a.unified?.['5h']?.utilization || 0)), 0)
   const peak7 = Math.max(0, ...accounts.map((a) => Number(a.unified?.['7d']?.utilization || 0)), 0)
@@ -736,6 +777,7 @@ export async function buildVmList({
       role,
     }),
   )
+  await stampSharedCircuitViews(vms, cfg.paths.project, routingConfig)
   const accounts = (() => {
     try {
       return accountQuota?.snapshot?.().accounts || []
@@ -803,6 +845,7 @@ export async function buildVmDetail({
     clusterNodes,
     role,
   })
+  await stampSharedCircuitViews([summary], cfg.paths.project, routingConfig)
   const acc = findAccount(accountQuota, summary)
   const billing = await (async () => {
     try {
@@ -1494,6 +1537,7 @@ export async function snapshotAccountPool({
       projectRoot: cfg.paths.project,
     }),
   )
+  await stampSharedCircuitViews(vms, cfg.paths.project, routingConfig)
   const accounts = (() => {
     try {
       return accountQuota?.snapshot?.().accounts || []

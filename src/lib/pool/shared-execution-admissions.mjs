@@ -49,6 +49,14 @@ export class SharedExecutionAdmissions {
     return this.executions.getCounts({ accountId, vmId })
   }
 
+  inspectCircuit(accountId, config) {
+    return this.executions.circuits.inspect(accountId, config)
+  }
+
+  resetCircuit(accountId, config) {
+    return this.executions.circuits.reset(accountId, config)
+  }
+
   async tryReserve(input) {
     const { seatKey } = input
     if (seatKey == null) return this.executions.tryReserve(input)

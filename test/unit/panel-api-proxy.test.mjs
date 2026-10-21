@@ -322,6 +322,41 @@ test('VM list exposes the Claude unit circuit and reset closes it', async (t) =>
   assert.equal(resetVmCircuit({ cfg, id: 'nope' }).status, 404)
 })
 
+test('Kubernetes VM list and reset use the shared circuit authority', async (t) => {
+  const { resetVmCircuit } = await import('../../src/lib/admin/panel-api.mjs')
+  const { getDb } = await import('../../src/lib/db/database.mjs')
+  const { SharedExecutionAdmissions } = await import('../../src/lib/pool/shared-execution-admissions.mjs')
+  const project = tmpDir()
+  const previous = process.env.VM2API_CONTROL_PLANE_MODE
+  process.env.VM2API_CONTROL_PLANE_MODE = 'kubernetes'
+  t.after(() => {
+    if (previous == null) delete process.env.VM2API_CONTROL_PLANE_MODE
+    else process.env.VM2API_CONTROL_PLANE_MODE = previous
+    fs.rmSync(project, { recursive: true, force: true })
+  })
+  writeVm(project, { id: 'vm-shared-circuit', claude: { account_uuid: 'shared-circuit-account' } })
+  const admissions = new SharedExecutionAdmissions(getDb())
+  const circuit = { failureThreshold: 1, openMs: 1000 }
+  const lease = await admissions.tryReserve({
+    accountId: 'shared-circuit-account',
+    vmId: 'vm-shared-circuit',
+    accountLimit: 4,
+    vmLimit: 4,
+    fableLimit: 0,
+    rpmLimit: 0,
+    circuit,
+  })
+  await lease.noteCircuitResult('failure')
+  await lease.release()
+  const cfg = { paths: { project } }
+  const listed = await buildVmList({ cfg, accountQuota: fakeQuota() })
+  assert.equal(listed.data.items[0].circuit.state, 'open')
+  assert.equal(listed.data.items[0].circuit.account_id, 'shared-circuit-account')
+  const reset = await resetVmCircuit({ cfg, id: 'vm-shared-circuit' })
+  assert.equal(reset.data.circuit.state, 'closed')
+  assert.equal((await admissions.inspectCircuit('shared-circuit-account', circuit)).failures, 0)
+})
+
 test('local proxy node labels are present for admin and absent for tenant', async (t) => {
   const project = tmpDir()
   const dataDir = path.join(project, 'data')
