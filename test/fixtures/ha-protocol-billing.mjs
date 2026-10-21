@@ -36,6 +36,7 @@ test(`HA protocol captures and settles original billable command: ${kind}`, asyn
   const assistant = { id: 'synthetic-message', type: 'message', role: 'assistant', model: 'claude-sonnet-4-5-20250929', content: [{ type: 'text', text: 'synthetic' }], stop_reason: 'end_turn', usage: { input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 20, cache_creation_input_tokens: 30 } }
   let rateReads = 0, receiptReads = 0
   dispatch = async (opts) => {
+    if (kind === 'not-started') return { ok: false, status: 400, body: { type: 'error', error: { type: 'invalid_request_error', code: 'invalid_cache_control', message: 'synthetic validation failure' } }, execution: { requestId: null, started: false, ended: true, reason: 'not_started' } }
     await opts.onExecutionStart({ requestId: commandId, nodeBinding })
     const job = (await f.peer.pool.query('SELECT * FROM execution_jobs WHERE request_id=$1', [commandId])).rows[0]
     assert.equal(job.billing_snapshot?.rate_multiplier, 2, 'dispatch permission requires the original PG-priced group snapshot')
@@ -69,7 +70,7 @@ test(`HA protocol captures and settles original billable command: ${kind}`, asyn
       try {
         const prepared = await args.applyAttempt(structuredClone(args.canonicalBody), candidate, { attemptNo: 1, attemptStartedAt: Date.now() })
         const result = await withHaRequestAttempt(1, () => args.callAttempt({ candidate, body: prepared.body, attemptMeta: prepared.meta, onCommit() {} }))
-        return { ...result, vmId: 'vm-fixture', accountId: 'fixture-account', finalState: 'verified', attemptCount: 1 }
+        return { ...result, vmId: 'vm-fixture', accountId: 'fixture-account', finalState: result.ok ? 'verified' : 'rejected', attemptCount: 1 }
       } finally { await admission.release() }
     } },
   })
@@ -77,15 +78,21 @@ test(`HA protocol captures and settles original billable command: ${kind}`, asyn
   req.headers = { 'user-agent': 'synthetic-ha-client' }
   const res = new EventEmitter(); res.setHeader = () => {}
   await f.originalGate.run(() => withHaRequestContext({ db: f.db, requestId: 'billing-parent', activity: f.originalGate, recoveryKind: 'claude_messages' }, () => handler.handleProtocol(req, res, 'anthropic.messages', '/v1/messages')))
-  assert.equal(res.statusCode, 200, JSON.stringify(res.body))
+  assert.equal(res.statusCode, kind === 'not-started' ? 400 : 200, JSON.stringify(res.body))
   assert.equal(rateReads, 1, 'group rates must not be reloaded after dispatch for billing')
-  assert.equal(receiptReads, 1)
+  assert.equal(receiptReads, kind === 'not-started' ? 0 : 1)
   await f.originalGate.run(async () => {
     const rows = await f.db.prepare('SELECT * FROM ha_request_settlements').all()
     const admission = await f.db.prepare('SELECT * FROM api_key_admissions WHERE ha_request_id=$1').get('billing-parent')
     if (kind === 'no-usage') {
       assert.equal(rows.length, 0)
       assert.equal(admission.released_at, null)
+      assert.equal((await keys.getById(key.id)).requests, 0)
+    } else if (kind === 'not-started') {
+      assert.equal(rows.length, 1)
+      assert.equal(rows[0].outcome, 'not_dispatched')
+      assert.equal(rows[0].actual_cost, null)
+      assert.ok(admission.released_at)
       assert.equal((await keys.getById(key.id)).requests, 0)
     } else {
       assert.equal(rows.length, 1)
