@@ -882,7 +882,11 @@ export class ClusterManager {
     if (!link) throw new ClusterError(404, 'node_not_found', '节点不存在')
     const paths = this.slotRelayPaths(nodeId, vmId)
     const getClient = () => (link.state === 'ready' ? link.client : null)
-    const remote = (name) => async () => `${(await this.remoteHost(nodeId)).root}/vms/${vmId}/run/${name}`
+    const remote = (name) => () =>
+      this._background(
+        'cluster_slot_path',
+        async () => `${(await this.remoteHost(nodeId)).root}/vms/${vmId}/run/${name}`,
+      )
     const entry = {
       nodeId,
       paths,
@@ -890,13 +894,13 @@ export class ClusterManager {
         socketPath: paths.kernel,
         remotePath: remote('kernel.sock'),
         getClient,
-        dialDirect: () => this._dialDirect(nodeId, vmId, 'kernel'),
+        dialDirect: () => this._background('cluster_slot_dial', () => this._dialDirect(nodeId, vmId, 'kernel')),
       }),
       worker: new SocketRelay({
         socketPath: paths.worker,
         remotePath: remote('worker.sock'),
         getClient,
-        dialDirect: () => this._dialDirect(nodeId, vmId, 'worker'),
+        dialDirect: () => this._background('cluster_slot_dial', () => this._dialDirect(nodeId, vmId, 'worker')),
       }),
     }
     entry.ready = Promise.all([entry.kernel.start(), entry.worker.start()])

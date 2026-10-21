@@ -96,7 +96,15 @@ export class SocketRelay {
     local.once('close', () => this.active.delete(local))
     local.on('error', () => {})
     if (this.dialDirect) {
-      const direct = await this.dialDirect().catch(() => null)
+      let direct
+      try {
+        direct = await this.dialDirect()
+      } catch {
+        // Only an explicit null authorizes SSH fallback. Admission failures
+        // must not acquire the same remote privileges through another path.
+        local.destroy()
+        return
+      }
       if (direct) {
         this._pipeDirect(local, direct)
         return
