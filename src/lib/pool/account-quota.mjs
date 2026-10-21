@@ -66,6 +66,8 @@ export class AccountQuota {
     this.writes = this.db.schedulingWriteQueue ||= new WriteQueue(this.db)
     this.rows = new Map()
     this.revisions = new Map()
+    this.refreshStarted = 0
+    this.refreshPublished = 0
     this.allocations = new Map()
     this.seedAccounts = accounts || []
     this.repo = this._workingSet()
@@ -105,6 +107,23 @@ export class AccountQuota {
     this.rows.clear()
     this.allocations.clear()
     return await this.init({ seed: false })
+  }
+
+  /** Refresh committed account rows without replacing transient state or allocation history. */
+  async refresh() {
+    await this.flush()
+    const refresh = ++this.refreshStarted
+    const revisions = new Map(this.revisions)
+    const rows = await this.persistence.list()
+    if (refresh < this.refreshPublished) return
+    this.refreshPublished = refresh
+    const present = new Set(rows.map((row) => row.account_id))
+    for (const row of rows) {
+      if (this.revisions.get(row.account_id) === revisions.get(row.account_id)) this.rows.set(row.account_id, row)
+    }
+    for (const id of this.rows.keys()) {
+      if (!present.has(id) && this.revisions.get(id) === revisions.get(id)) this.rows.delete(id)
+    }
   }
 
   flush() {
