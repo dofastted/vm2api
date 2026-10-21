@@ -51,6 +51,19 @@ type RefreshError struct {
 	Code      string
 	Message   string
 	Retryable bool
+	Unknown   bool
+	Cause     error
+}
+
+func (e *RefreshError) Unwrap() error { return e.Cause }
+
+func IsRefreshUnknown(err error) bool {
+	var refreshErr *RefreshError
+	return errors.As(err, &refreshErr) && refreshErr.Unknown
+}
+
+func unknownRefresh(status int, cause error) *RefreshError {
+	return &RefreshError{Status: status, Code: "refresh_outcome_unknown", Message: "OAuth refresh outcome is unknown", Unknown: true, Cause: cause}
 }
 
 func (e *RefreshError) Error() string {
@@ -124,6 +137,11 @@ func (r *Refresher) ensureLocked(ctx context.Context, force bool) (Result, error
 		}
 		refreshed, refreshErr := r.requestWithRetry(ctx, current)
 		if refreshErr != nil {
+			// Neither cancellation nor a later file observation proves what this
+			// accepted request did to the rotating refresh token.
+			if IsRefreshUnknown(refreshErr) {
+				return refreshErr
+			}
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -136,12 +154,12 @@ func (r *Refresher) ensureLocked(ctx context.Context, force bool) (Result, error
 			return refreshErr
 		}
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return unknownRefresh(0, ctx.Err())
 		}
 		refreshed.Generation = current.Generation
 		saved, saveErr := r.Store.Save(refreshed, document)
 		if saveErr != nil {
-			return saveErr
+			return unknownRefresh(0, saveErr)
 		}
 		result.Credential = saved
 		result.Refreshed = true
@@ -174,7 +192,9 @@ func (r *Refresher) requestWithRetry(ctx context.Context, current credential.Cre
 		}
 		lastErr = err
 		var refreshErr *RefreshError
-		if errors.As(err, &refreshErr) && !refreshErr.Retryable {
+		// Retry only a fully read, explicit provider rejection. Replaying a
+		// transport-unknown request can consume the same rotating token twice.
+		if !errors.As(err, &refreshErr) || refreshErr.Unknown || !refreshErr.Retryable {
 			break
 		}
 	}
@@ -200,15 +220,18 @@ func (r *Refresher) request(ctx context.Context, current credential.Credential) 
 	request.Header.Set("User-Agent", "axios/1.13.6")
 	response, err := r.Client.Do(request)
 	if err != nil {
-		return credential.Credential{}, fmt.Errorf("OAuth refresh transport: %w", err)
+		return credential.Credential{}, unknownRefresh(0, err)
 	}
 	defer response.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	data, err := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
 	if err != nil {
-		return credential.Credential{}, fmt.Errorf("read OAuth refresh response: %w", err)
+		return credential.Credential{}, unknownRefresh(response.StatusCode, err)
+	}
+	if len(data) > 1<<20 {
+		return credential.Credential{}, unknownRefresh(response.StatusCode, errors.New("OAuth refresh response exceeds limit"))
 	}
 	var decoded tokenResponse
-	_ = json.Unmarshal(data, &decoded)
+	decodeErr := json.Unmarshal(data, &decoded)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		code := strings.TrimSpace(decoded.Error)
 		message := strings.TrimSpace(decoded.Description)
@@ -229,8 +252,11 @@ func (r *Refresher) request(ctx context.Context, current credential.Credential) 
 			Retryable: retryable,
 		}
 	}
+	if decodeErr != nil {
+		return credential.Credential{}, unknownRefresh(response.StatusCode, decodeErr)
+	}
 	if strings.TrimSpace(decoded.AccessToken) == "" {
-		return credential.Credential{}, &RefreshError{Status: response.StatusCode, Code: "missing_access_token", Message: "refresh response has no access_token"}
+		return credential.Credential{}, &RefreshError{Status: response.StatusCode, Code: "missing_access_token", Message: "refresh response has no access_token", Unknown: true}
 	}
 	refreshToken := strings.TrimSpace(decoded.RefreshToken)
 	if refreshToken == "" {

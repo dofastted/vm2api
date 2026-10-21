@@ -235,6 +235,7 @@ async function runSlotOauthRaw(
     via: 'slot-worker',
     attemptFinished:
       result?.code === 0 &&
+      payload.refresh_unknown !== true &&
       payload.body?.error?.code !== 'upstream_transport_error' &&
       ((payload.ok && status >= 200 && status < 300) ||
         status >= 400 ||
