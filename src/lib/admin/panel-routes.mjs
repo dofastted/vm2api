@@ -65,7 +65,7 @@ import {
 } from '../oauth/sub2api-account.mjs'
 import { officialCcHome, readOfficialCcStatus, scheduleOfficialCcBootstrap } from '../oauth/official-cc-bootstrap.mjs'
 import { invalidateLiveCredentialCache } from './panel-live-credentials.mjs'
-import { ensureCodexKernel, stopCodexKernel } from '../transport/codex-kernel-supervisor.mjs'
+import { ensureCodexKernel, stopCodexKernel, finishCodexRecycle } from '../transport/codex-kernel-supervisor.mjs'
 import { listOfficialModels, seedModelCatalog } from '../protocol/models.mjs'
 import { getModelPolicy, saveModelPolicy, resetModelPolicy, listPolicyModels } from '../protocol/model-policy.mjs'
 import {
@@ -3286,7 +3286,7 @@ export function createPanelHandler(ctx) {
       // POST /api/panel/vms/:id/cooldown/clear — drop 401/quota leftover so the slot re-enters
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/cooldown\/clear$/.test(p)) {
         const id = p.split('/')[4]
-        const result = panel.clearVmCooldown({
+        const result = await panel.clearVmCooldown({
           cfg,
           accountQuota,
           stickyRouter,
@@ -3395,11 +3395,12 @@ export function createPanelHandler(ctx) {
         if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
         const body = await readBody(req, 32 * 1024).catch(() => ({}))
         const mode = body.mode === 'keep' ? 'keep' : 'traits'
-        return await withVmLock(vmPath, async () => {
+        return await withVmLock(vmPath, async (vmOperation) => {
           if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
           const prev = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-          const gone = await destroySlot(prev)
+          const gone = await (ctx.destroySlot || destroySlot)(prev)
           if (!gone.ok) {
+            if (vmOperation && gone.vmOperationNotStarted !== true) await vmOperation.markUncertain()
             return json(res, 500, { ok: false, error: { message: gone.error || 'destroy failed', code: gone.code } })
           }
           let { vm } = recreateVmFiles(cfg.paths.project, prev, { mode })
@@ -3422,6 +3423,7 @@ export function createPanelHandler(ctx) {
                 schedulable: false,
                 schedule_disabled_reason: 'slot SOCKS5 proxy is required',
               }) || vm
+            await flushVmDbSync()
             return json(res, 409, {
               ok: false,
               error: { code: 'proxy_required', message: 'No healthy SOCKS5 is available for this VM' },
@@ -3429,14 +3431,19 @@ export function createPanelHandler(ctx) {
               destroyed: gone.action,
             })
           }
-          const boot = await startSlotReady(vm, cfg.paths.project, { recreate: true, routing: ctx.routingConfig })
+          const boot = await (ctx.startSlotReady || startSlotReady)(vm, cfg.paths.project, {
+            recreate: true,
+            routing: ctx.routingConfig,
+          })
           if (!boot.ok) {
+            if (vmOperation && boot.vmOperationNotStarted !== true) await vmOperation.markUncertain()
             vm =
               patchVmRecord(cfg.paths.project, id, {
                 status: 'stopped',
                 schedulable: false,
                 schedule_disabled_reason: boot.error || 'runtime start failed',
               }) || vm
+            await flushVmDbSync()
             if (gone.action !== 'absent') {
               return json(res, 500, {
                 ok: false,
@@ -3463,6 +3470,7 @@ export function createPanelHandler(ctx) {
               schedulable: mode === 'keep' ? vm.schedulable !== false && !vm.schedule_disabled_reason : false,
               schedule_disabled_reason: mode === 'keep' ? vm.schedule_disabled_reason || null : 'no_credential',
             }) || vm
+          await flushVmDbSync()
           return json(
             res,
             200,
@@ -3488,7 +3496,7 @@ export function createPanelHandler(ctx) {
           return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'VM not found' } })
         }
         await readBody(req, 32 * 1024).catch(() => ({}))
-        return await withVmLock(vmPath, async () => {
+        return await withVmLock(vmPath, async (vmOperation) => {
           if (!fs.existsSync(vmPath)) {
             return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'VM not found' } })
           }
@@ -3507,7 +3515,9 @@ export function createPanelHandler(ctx) {
                 fs.rmSync(file, { force: true })
                 removed.push(path.relative(cfg.paths.project, file))
               }
-            } catch {}
+            } catch (error) {
+              if (vmOperation) throw error
+            }
           }
           const vm =
             patchVmRecord(cfg.paths.project, id, (record) => {
@@ -3533,23 +3543,45 @@ export function createPanelHandler(ctx) {
           // credential-less kernel back so the slot matches an empty slot.
           const kernel = { stopped: false, restarted: false, error: null }
           try {
-            kernel.stopped = !!stopCodexKernel(id)
+            const child = (ctx.stopCodexKernel || stopCodexKernel)(id)
+            if (child) {
+              const stopped = await (ctx.finishCodexRecycle || finishCodexRecycle)(child)
+              kernel.stopped = stopped.exited === true
+              if (!kernel.stopped) {
+                kernel.error = 'codex_kernel_stop_unconfirmed'
+                await vmOperation?.markUncertain()
+              }
+            } else if (isCodexVm(vm) && vmOperation) {
+              kernel.error = 'codex_kernel_owner_unknown'
+              await vmOperation.markUncertain()
+            }
             if (isCodexVm(vm)) {
-              const started = await ensureCodexKernel(slotExec(cfg.paths.project, getVm(cfg.paths.project, id) || vm), {
-                timeoutMs: 8000,
-              })
-              kernel.restarted = !!started?.ok
-              if (!started?.ok) kernel.error = started?.reason || 'codex_kernel_start_failed'
+              if (!kernel.error) {
+                const started = await (ctx.ensureCodexKernel || ensureCodexKernel)(
+                  slotExec(cfg.paths.project, getVm(cfg.paths.project, id) || vm),
+                  {
+                    timeoutMs: 8000,
+                  },
+                )
+                kernel.restarted = !!started?.ok
+                if (!started?.ok) {
+                  kernel.error = started?.reason || 'codex_kernel_start_failed'
+                  if (vmOperation && started?.vmOperationNotStarted !== true) await vmOperation.markUncertain()
+                }
+              }
             }
           } catch (e) {
             kernel.error = String(e?.message || e).slice(0, 160)
+            await vmOperation?.markUncertain()
           }
           try {
             const repo = ctx.accountQuota?.repo
             const row = repo && typeof repo.get === 'function' ? await repo.get(id) : null
-            if (row && typeof repo.patch === 'function') repo.patch(id, { email: null, name: id })
+            if (row && typeof repo.patchFields === 'function') await repo.patchFields(id, { email: null, name: id })
           } catch {}
           const saved = getVm(cfg.paths.project, id) || vm
+          await ctx.accountQuota?.flush?.()
+          await flushVmDbSync()
           return json(
             res,
             200,

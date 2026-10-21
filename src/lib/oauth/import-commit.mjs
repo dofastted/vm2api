@@ -1,7 +1,7 @@
 /**
  * Commit an imported OAuth / API-key / setup-token grant onto a slot.
  * Reloads the active slot service (and eager Rust kernel when routing says so)
- * before the slot-service credential import; official CC bootstrap is scheduled after persist.
+ * before the slot-service credential import; Kubernetes awaits official CC bootstrap after persist.
  */
 import fs from 'node:fs'
 import path from 'node:path'
@@ -26,10 +26,14 @@ import { persistOauthToVm, writeWorkerCredentialFile } from './oauth-credentials
 import {
   officialCcUidGid,
   scheduleOfficialCcBootstrap,
+  runOfficialCcBootstrap,
+  normalizeOfficialCcConfig,
+  loadOfficialCcConfig,
   materializeOfficialClaudeCredentials,
 } from './official-cc-bootstrap.mjs'
 import { normalizeTiers } from '../pool/quota-tiers.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { flushVmDbSync } from '../vm/vm-db-sync.mjs'
 
 export function createImportCommit(ctx) {
   function routing() {
@@ -146,128 +150,168 @@ export function createImportCommit(ctx) {
   }
 
   async function commitImportedOauth({ vmId, vmPath, existing, oauth, source, name, skipOfficialCc = false }) {
-    const importedCredential = importedCredentialFromOauth(oauth, existing)
-    const workerExec = {
-      vmId,
-      vm: existing,
-      homeDir: path.join(ctx.cfg.paths.project, 'vms', vmId, 'cli-home'),
-    }
-    const bound = ctx.proxyPool?.getProxyForVm?.(vmId)
-    if (bound) {
-      // Re-bind even when the id already matches: a prior stale write may have
-      // left proxy_cli_enabled=false on a bound slot (#332).
-      bindVmProxy(ctx.cfg.paths.project, vmId, bound)
-      adoptVmProxyBinding(existing, getVm(ctx.cfg.paths.project, vmId))
-    }
-    if (process.env.KIN_CRS_MOCK !== '1') {
-      const socket = existing.runtime?.worker_socket
-      const needReload = !socket || !fs.existsSync(socket) || isSlotProxyDesynced(existing, ctx.cfg.paths.project)
-      if (needReload) {
-        const boot = await reloadSlotReady(existing, ctx.cfg.paths.project, { routing: routing() })
-        if (!boot.ok) {
-          return { ok: false, status: 502, error: { code: 'worker_start_failed', message: boot.error } }
-        }
-        const written = patchVmRecord(ctx.cfg.paths.project, vmId, {
-          runtime: boot.runtime,
-          status: 'running',
-          schedulable: true,
-          schedule_disabled_reason: null,
-        })
-        if (written) Object.assign(existing, written)
-        else {
-          existing.runtime = boot.runtime
-          existing.status = 'running'
-          existing.schedulable = true
-          existing.schedule_disabled_reason = null
-        }
-        workerExec.vm = existing
-      }
-    }
-    const importCred =
-      typeof ctx.importWorkerCredential === 'function' ? ctx.importWorkerCredential : importWorkerCredential
-    let workerImport = null
-    for (let attempt = 0; attempt < 30; attempt++) {
-      workerImport = await importCred(workerExec, importedCredential)
-      if (workerImport.ok) break
-      if (process.env.KIN_CRS_MOCK === '1') break
-      await new Promise((resolve) => setTimeout(resolve, 100))
-    }
-    if (!workerImport.ok) {
-      return {
-        ok: false,
-        status: workerImport.status || 502,
-        error: {
-          type: 'worker_error',
-          code: 'worker_credential_import_failed',
-          message: workerImport.error?.message || 'Go slot worker rejected credential import',
-        },
-      }
-    }
-    await withVmLock(vmPath, () => {
-      persistOauthToVm(
-        vmPath,
-        {
-          ...importedCredential,
-          source: source || oauth.source || 'sessionKey-cookie-auth',
-          mode: importedCredential.mode || credentialModeFromOauth(oauth),
-          type: importedCredential.type || importedCredential.mode,
-        },
-        { acceptLiveGrant: true },
-      )
-      try {
-        const accountId = importedCredential.account_uuid || existing.claude?.account_uuid || vmId
-        ctx.accountQuota.clearGrantRevokeLeftover(accountId)
-        ctx.poolScheduler?.clearAuthCooldownFor?.(vmId, accountId)
-        ctx.poolScheduler?.clearGrantRevokeCooldownFor?.(vmId, accountId)
-      } catch {}
-      try {
-        rebindOauthAccount({ ...existing, ...JSON.parse(fs.readFileSync(vmPath, 'utf8')), id: vmId })
-      } catch {}
-      const refreshed = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-      if (name && refreshed.name !== name) {
-        const written = patchVmRecord(ctx.cfg.paths.project, vmId, { name })
-        Object.assign(existing, written || refreshed, { name })
-      } else {
-        Object.assign(existing, refreshed)
-      }
-    })
-    try {
-      writeWorkerCredentialFile(workerExec.homeDir, importedCredential)
-    } catch {}
-    try {
-      const ids = officialCcUidGid(vmId)
-      materializeOfficialClaudeCredentials(workerExec.homeDir, ids)
-    } catch {}
-    const mode = importedCredential.mode || credentialModeFromOauth(oauth)
-    const ccUnsupported = !slotHost(existing).supports('official_cc')
-    const skipCc = skipOfficialCc || ccUnsupported || isCodexVm(existing) || !canOfficialCc(mode)
-    const routingConfig = routing()
-    const officialCc = skipCc
-      ? {
-          scheduled: false,
-          reason: ccUnsupported
-            ? 'remote_unsupported'
-            : isCodexVm(existing)
-              ? 'gpt_slot'
-              : skipOfficialCc
-                ? 'credential_edit'
-                : 'credential_mode_unsupported',
-        }
-      : scheduleOfficialCcBootstrap({
+    return withVmLock(
+      vmPath,
+      async (vmOperation) => {
+        const current = getVm(ctx.cfg.paths.project, vmId)
+        if (!current) return { ok: false, status: 404, error: { code: 'vm_not_found', message: 'VM not found' } }
+        Object.assign(existing, current)
+        const importedCredential = importedCredentialFromOauth(oauth, existing)
+        const workerExec = {
           vmId,
-          projectRoot: ctx.cfg.paths.project,
-          force: true,
-          collectIdentity: collectSlotIdentity,
-          onStats: officialCcStatsHandler(vmId, existing.claude?.account_uuid),
-          routingFile: ctx.routingConfigPath,
-          config: routingConfig.official_cc,
-          credentialMode: mode,
-          incomingOauth: {
-            account_uuid: importedCredential.account_uuid,
-            email: importedCredential.email,
+          vm: existing,
+          homeDir: path.join(ctx.cfg.paths.project, 'vms', vmId, 'cli-home'),
+        }
+        const bound = ctx.proxyPool?.getProxyForVm?.(vmId)
+        if (bound) {
+          // Re-bind even when the id already matches: a prior stale write may have
+          // left proxy_cli_enabled=false on a bound slot (#332).
+          bindVmProxy(ctx.cfg.paths.project, vmId, bound)
+          adoptVmProxyBinding(existing, getVm(ctx.cfg.paths.project, vmId))
+        }
+        if (process.env.KIN_CRS_MOCK !== '1') {
+          const socket = existing.runtime?.worker_socket
+          const needReload = !socket || !fs.existsSync(socket) || isSlotProxyDesynced(existing, ctx.cfg.paths.project)
+          if (needReload) {
+            const boot = await (ctx.reloadSlotReady || reloadSlotReady)(existing, ctx.cfg.paths.project, {
+              routing: routing(),
+            })
+            if (!boot.ok) {
+              if (vmOperation && boot.vmOperationNotStarted !== true) await vmOperation.markUncertain()
+              await flushVmDbSync()
+              return { ok: false, status: 502, error: { code: 'worker_start_failed', message: boot.error } }
+            }
+            const written = patchVmRecord(ctx.cfg.paths.project, vmId, {
+              runtime: boot.runtime,
+              status: 'running',
+              schedulable: true,
+              schedule_disabled_reason: null,
+            })
+            if (written) Object.assign(existing, written)
+            else {
+              existing.runtime = boot.runtime
+              existing.status = 'running'
+              existing.schedulable = true
+              existing.schedule_disabled_reason = null
+            }
+            workerExec.vm = existing
+          }
+        }
+        const importCred =
+          typeof ctx.importWorkerCredential === 'function' ? ctx.importWorkerCredential : importWorkerCredential
+        let workerImport = null
+        for (let attempt = 0; attempt < 30; attempt++) {
+          workerImport = await importCred(workerExec, importedCredential)
+          if (workerImport.ok) break
+          if (vmOperation || process.env.KIN_CRS_MOCK === '1') break
+          await new Promise((resolve) => setTimeout(resolve, 100))
+        }
+        if (!workerImport.ok) {
+          if (vmOperation && workerImport.vmOperationNotStarted !== true) await vmOperation.markUncertain()
+          await flushVmDbSync()
+          return {
+            ok: false,
+            status: workerImport.status || 502,
+            error: {
+              type: 'worker_error',
+              code: 'worker_credential_import_failed',
+              message: workerImport.error?.message || 'Go slot worker rejected credential import',
+            },
+          }
+        }
+        persistOauthToVm(
+          vmPath,
+          {
+            ...importedCredential,
+            source: source || oauth.source || 'sessionKey-cookie-auth',
+            mode: importedCredential.mode || credentialModeFromOauth(oauth),
+            type: importedCredential.type || importedCredential.mode,
           },
-        })
-    return { ok: true, existing, official_cc_bootstrap: officialCc }
+          { acceptLiveGrant: true },
+        )
+        try {
+          const accountId = importedCredential.account_uuid || existing.claude?.account_uuid || vmId
+          ctx.accountQuota.clearGrantRevokeLeftover(accountId)
+          ctx.poolScheduler?.clearAuthCooldownFor?.(vmId, accountId)
+          ctx.poolScheduler?.clearGrantRevokeCooldownFor?.(vmId, accountId)
+        } catch {}
+        try {
+          rebindOauthAccount({ ...existing, ...JSON.parse(fs.readFileSync(vmPath, 'utf8')), id: vmId })
+        } catch {}
+        const refreshed = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+        if (name && refreshed.name !== name) {
+          const written = patchVmRecord(ctx.cfg.paths.project, vmId, { name })
+          Object.assign(existing, written || refreshed, { name })
+        } else {
+          Object.assign(existing, refreshed)
+        }
+        try {
+          writeWorkerCredentialFile(workerExec.homeDir, importedCredential)
+        } catch (error) {
+          if (vmOperation) throw error
+        }
+        try {
+          const ids = officialCcUidGid(vmId)
+          materializeOfficialClaudeCredentials(workerExec.homeDir, ids)
+        } catch (error) {
+          if (vmOperation) throw error
+        }
+        const mode = importedCredential.mode || credentialModeFromOauth(oauth)
+        const ccUnsupported = !slotHost(existing).supports('official_cc')
+        const routingConfig = routing() || {}
+        const ccConfig = normalizeOfficialCcConfig(
+          routingConfig.official_cc || loadOfficialCcConfig(ctx.routingConfigPath),
+        )
+        const ccMock = process.env.KIN_CRS_MOCK === '1'
+        const skipCc =
+          skipOfficialCc ||
+          ccUnsupported ||
+          isCodexVm(existing) ||
+          !canOfficialCc(mode) ||
+          ccMock ||
+          ccConfig.enabled === false
+        let officialCc = skipCc
+          ? {
+              scheduled: false,
+              reason: ccUnsupported
+                ? 'remote_unsupported'
+                : isCodexVm(existing)
+                  ? 'gpt_slot'
+                  : skipOfficialCc
+                    ? 'credential_edit'
+                    : !canOfficialCc(mode)
+                      ? 'credential_mode_unsupported'
+                      : ccMock
+                        ? 'mock'
+                        : 'disabled',
+            }
+          : null
+        if (!skipCc) {
+          const bootstrapOptions = {
+            vmId,
+            projectRoot: ctx.cfg.paths.project,
+            force: true,
+            collectIdentity: collectSlotIdentity,
+            onStats: officialCcStatsHandler(vmId, existing.claude?.account_uuid),
+            routingFile: ctx.routingConfigPath,
+            config: ccConfig,
+            credentialMode: mode,
+            incomingOauth: { account_uuid: importedCredential.account_uuid, email: importedCredential.email },
+          }
+          if (vmOperation) {
+            const completed = await (ctx.runOfficialCcBootstrap || runOfficialCcBootstrap)(bootstrapOptions)
+            if (!completed?.ok && completed?.vmOperationNotStarted !== true) await vmOperation.markUncertain()
+            officialCc = { scheduled: true, vmId, completed: true, ok: completed?.ok === true }
+          } else {
+            officialCc = scheduleOfficialCcBootstrap(bootstrapOptions)
+          }
+        }
+        await ctx.accountQuota?.flush?.()
+        await flushVmDbSync()
+        return { ok: true, existing, official_cc_bootstrap: officialCc }
+      },
+      { vmId, kind: 'credential-import' },
+    )
   }
 
   return {
