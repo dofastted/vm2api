@@ -39,7 +39,7 @@ test(`HA protocol captures and settles original billable command: ${kind}`, asyn
     await opts.onExecutionStart({ requestId: commandId, nodeBinding })
     const job = (await f.peer.pool.query('SELECT * FROM execution_jobs WHERE request_id=$1', [commandId])).rows[0]
     assert.equal(job.billing_snapshot?.rate_multiplier, 2, 'dispatch permission requires the original PG-priced group snapshot')
-    assert.equal(job.billing_snapshot.cache_ttl, '1h')
+    assert.equal(job.billing_snapshot.cache_ttl, null, 'native wire retains provider cache split rather than a menu override')
     assert.equal(job.billing_snapshot.model, opts.body.model)
     if (kind === 'deleted-key') await keys.remove(key.id)
     await opts.onExecutionEnd(execution)
@@ -58,6 +58,7 @@ test(`HA protocol captures and settles original billable command: ${kind}`, asyn
       assert.equal(input.requestId, commandId)
       assert.deepEqual(input.nodeBinding, nodeBinding)
       const receipt = syntheticUsageReceipt()
+      receipt.usage.cache_creation = { ephemeral_5m_input_tokens: '0', ephemeral_1h_input_tokens: '30' }
       if (kind === 'no-usage') { receipt.usage_complete = false; delete receipt.usage.output_tokens }
       return { found: true, command: execution.nodeCompletion, receipt }
     },

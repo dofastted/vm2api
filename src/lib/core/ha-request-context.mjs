@@ -73,6 +73,7 @@ export async function withHaRequestContext({ db = getDb(), requestId, activity, 
     activityId: scope.id,
     activityOwnerId: coordinator.ownerId,
     activityEpoch: scope.epoch,
+    recoveryKind,
     attemptNo: null,
     isActive: () => active,
     assertActive: () => {

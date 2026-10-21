@@ -92,7 +92,20 @@ async function graph({ db, first }, requestId, { withJob = true, graceMs = 30000
           accountId: 'fixture-account',
           model: 'claude-synthetic',
         })
-        await withHaRequestAttempt(1, () => admission.bindExecution({ requestId: 'command-' + requestId, nodeBinding }))
+        await withHaRequestAttempt(1, () =>
+          admission.bindExecution({
+            requestId: 'command-' + requestId,
+            nodeBinding,
+            billingSnapshot: {
+              version: 1,
+              model: 'claude-synthetic',
+              rate_multiplier: 1,
+              cache_ttl: '1h',
+              requested_speed: null,
+              resolved: null,
+            },
+          }),
+        )
       }
       await admission.markUncertain()
     }),

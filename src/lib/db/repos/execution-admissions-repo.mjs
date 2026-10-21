@@ -239,6 +239,12 @@ export class ExecutionAdmissionsRepo {
       }
       if ((admission.ha_request_id ?? null) !== (context?.requestId ?? null))
         throw jobError('ha_request_context_mismatch')
+      if (context?.recoveryKind === 'claude_messages' && !billingSnapshot) {
+        const managed = await this.db
+          .prepare('SELECT id FROM api_key_admissions WHERE ha_request_id=$1 LIMIT 1')
+          .get(context.requestId)
+        if (managed) throw jobError('ha_billing_snapshot_required')
+      }
       if (context) {
         if (!nodeBinding || !context.attemptNo) throw jobError('ha_request_attempt_missing')
         const attempt = await this.db

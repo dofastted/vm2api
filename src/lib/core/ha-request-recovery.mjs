@@ -232,7 +232,7 @@ export class HaRequestRecovery {
   }
 
   async _bill(requestId, readRecoveryStatus) {
-    const billing = await new HaRequestBilling(this.db).reconcile(requestId, { readRecoveryStatus })
+    const { record, ...billing } = await new HaRequestBilling(this.db).reconcile(requestId, { readRecoveryStatus })
     return { recovered: true, billingHeld: !billing.settled, billing }
   }
 }

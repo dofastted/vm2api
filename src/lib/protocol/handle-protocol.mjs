@@ -1,5 +1,6 @@
 import { trackPendingWrite } from '../db/pending-writes.mjs'
 import { currentHaRequestContext } from '../core/ha-request-context.mjs'
+import { captureHaBillingSnapshot } from '../core/ha-request-billing.mjs'
 import { isKubernetesHaMode } from '../core/control-plane-mode.mjs'
 /**
  * /v1 protocol handler. URLs, auth, and response envelopes stay with the
@@ -214,8 +215,42 @@ export function createHandleProtocol(deps) {
 
   async function attachPricing(
     logBag,
-    { managedKey = null, rateMultiplier = 1, bill = false, reservation = null } = {},
+    { managedKey = null, rateMultiplier = 1, bill = false, reservation = null, execution = null } = {},
   ) {
+    if (isKubernetesHaMode() && bill && managedKey && reservation?.shared) {
+      try {
+        let nodeStatus
+        if (execution?.requestId && execution?.nodeBinding) {
+          try {
+            nodeStatus = await deps.readNodeRecoveryStatus?.({
+              requestId: execution.requestId,
+              nodeBinding: execution.nodeBinding,
+            })
+          } catch {}
+        }
+        const settled = await apiKeyStore.recordHaUsage({ reservation, commandId: execution?.requestId, nodeStatus })
+        const price = settled.pricing
+        Object.assign(logBag, {
+          input_cost: price?.input_cost ?? null,
+          output_cost: price?.output_cost ?? null,
+          cache_read_cost: price?.cache_read_cost ?? null,
+          cache_creation_cost: price?.cache_creation_cost ?? null,
+          web_search_cost: price?.web_search_cost ?? null,
+          total_cost: price?.total_cost ?? null,
+          pricing_model: price?.pricing_key ?? 'unpriced',
+          price_source: price?.price_source ?? null,
+          price_version: price?.price_version ?? null,
+          service_tier: price?.service_tier ?? null,
+          speed: price?.speed ?? null,
+          long_context: price ? (price.long_context ? 1 : 0) : null,
+        })
+        if (!settled.settled) reservation.billingFailed = true
+      } catch (error) {
+        reservation.billingFailed = true
+        throw error
+      }
+      return
+    }
     const model = logBag.upstream_model || logBag.model
     const priced = costColumnsFromUsage(logBag.usage || {}, model)
     Object.assign(logBag, priced)
@@ -521,12 +556,12 @@ export function createHandleProtocol(deps) {
     if (admission.lease?.shared) admission.lease.executionUncertain = admission.pendingExecutions.size > 0
   }
 
-  function executionHooks(req, admission, candidate = {}) {
+  function executionHooks(req, admission, candidate = {}, billingSnapshot = null) {
     if (!deps.onExecutionState && !admission.lease?.shared && !candidate.bindExecution) return {}
     return {
       onExecutionStart: async (execution) => {
         await observeExecution(req, admission, { ...execution, started: true, ended: false })
-        return await candidate.bindExecution?.(execution)
+        return await candidate.bindExecution?.(billingSnapshot ? { ...execution, billingSnapshot } : execution)
       },
       onExecutionEnd: async (execution) => {
         await candidate.completeExecution?.(execution)
@@ -1612,7 +1647,16 @@ export function createHandleProtocol(deps) {
           }
         },
         callAttempt: async ({ candidate, body, attemptMeta, deliveryMode: attemptDelivery, signal, onCommit }) => {
-          const hooks = executionHooks(req, admission, candidate)
+          const billingSnapshot =
+            isKubernetesHaMode() && managedKey
+              ? captureHaBillingSnapshot({
+                  model: body.model,
+                  rateMultiplier: await deps.groupsRepo.rateMultiplier(managedKey.group_id ?? 1),
+                  cacheTtl,
+                  requestedSpeed: wantsFastMode(ctx.body) ? 'fast' : null,
+                })
+              : null
+          const hooks = executionHooks(req, admission, candidate, billingSnapshot)
           if (!clientStream) {
             return await streamAndAssembleClaudeMessage({
               ...hooks,
@@ -1804,8 +1848,9 @@ export function createHandleProtocol(deps) {
       await attachPricing(logBag, {
         managedKey,
         reservation: admission.lease,
-        rateMultiplier: await deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
+        rateMultiplier: isKubernetesHaMode() ? 1 : await deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
         bill: !!managedKey,
+        execution: result?.execution,
       })
     }
 
