@@ -86,17 +86,18 @@ export class PostgresDatabase {
 
   async query(sql, params = []) {
     if (this.closed) throw new Error('database is closed')
-    getActivityCoordinator(this)?.assertActivity()
     const tx = transactions.getStore()
     if (this.maintaining && maintenance.getStore() !== this && tx?.db !== this) {
       throw Object.assign(new Error('database maintenance in progress'), { code: 'database_maintenance' })
     }
+    const finishPersistence = getActivityCoordinator(this)?.trackPersistence()
     this.active += 1
     try {
       return await (tx?.db === this ? tx.client : this.pool).query(sql, params)
     } catch (error) {
       throw databaseError(error)
     } finally {
+      finishPersistence?.()
       this.active -= 1
       if (!this.active) for (const resolve of this.waiters.splice(0)) resolve()
     }
@@ -174,6 +175,7 @@ export async function withTransaction(db, fn) {
     throw Object.assign(new Error('database maintenance in progress'), { code: 'database_maintenance' })
   }
   // Count the entire transaction, including time between individual queries.
+  const finishPersistence = getActivityCoordinator(db)?.trackPersistence()
   db.active += 1
   let client
   try {
@@ -188,6 +190,7 @@ export async function withTransaction(db, fn) {
     if (client) await client.query('ROLLBACK').catch(() => {})
     throw error
   } finally {
+    finishPersistence?.()
     client?.release()
     db.active -= 1
     if (!db.active) for (const resolve of db.waiters.splice(0)) resolve()

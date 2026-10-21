@@ -67,7 +67,7 @@ test('coordination DDL belongs only to a private schema derived from this applic
       [schema],
     )
   ).rows.map((row) => row.table_name)
-  assert.deepEqual(tables, ['activities', 'control', 'members'])
+  assert.deepEqual(tables, ['activities', 'control', 'members', 'operations'])
   assert.equal((await db.pool.query('SELECT to_regclass($1) AS name', [`${db.schema}.activities`])).rows[0].name, null)
 })
 

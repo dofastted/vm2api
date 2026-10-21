@@ -57,6 +57,7 @@ export class GlobalMaintenanceCoordinator {
     this._held = false
     this._refs = 0
     this._bootstrapUsed = false
+    this._transfers = new Map()
     this._serial = Promise.resolve()
     this._onError = (error) => this._lose(error)
     this._onEnd = () => this._lose(failure('maintenance_connection_lost', 'Activity connection ended'))
@@ -177,6 +178,18 @@ export class GlobalMaintenanceCoordinator {
           reason text
         );
         CREATE INDEX IF NOT EXISTS activities_pending ON ${q}.activities (owner_id) WHERE completed_at IS NULL;
+        CREATE TABLE IF NOT EXISTS ${q}.operations (
+          id text PRIMARY KEY,
+          owner_id text NOT NULL,
+          kind text NOT NULL,
+          source_activity_id text,
+          task_key text,
+          execution_id text,
+          created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+          ended_at timestamptz,
+          shared_result jsonb,
+          UNIQUE (task_key, execution_id)
+        );
         REVOKE ALL ON ALL TABLES IN SCHEMA ${q} FROM PUBLIC`)
       await client.query(
         `INSERT INTO ${q}.control(id,application_schema,phase,epoch)
@@ -322,10 +335,12 @@ export class GlobalMaintenanceCoordinator {
   }
 
   _gate(id, epoch, kind) {
-    const scope = { coordinator: this, id, epoch, kind, active: true, remoteStarted: false }
+    const scope = { coordinator: this, id, epoch, kind, active: true, remoteStarted: false, pending: new Set() }
     const assertActive = () => {
       this._assertHealthy()
-      if (!scope.active) throw failure('maintenance_activity_closed', 'The activity scope has completed')
+      if ((!scope.active && !scope.transferredTo?.healthy) || scope.handoffPending) {
+        throw failure('maintenance_activity_closed', 'The activity scope has completed or is transferring')
+      }
     }
     const gate = {
       activityId: id,
@@ -342,6 +357,9 @@ export class GlobalMaintenanceCoordinator {
       },
       noteExecution: (execution) => {
         assertActive()
+        if (scope.transferredTo && execution?.started === true) {
+          throw failure('maintenance_handoff_started', 'Maintenance ownership cannot submit inference')
+        }
         if (execution?.started === true) scope.remoteStarted = true
       },
       complete: (execution) => this._complete(scope, execution),
@@ -354,10 +372,20 @@ export class GlobalMaintenanceCoordinator {
     this._assertHealthy()
     for (let context = activities.getStore(); context; context = context.parent) {
       const { scope } = context
-      if (!scope.active) throw failure('maintenance_activity_closed', 'An inherited activity scope has completed')
+      if ((!scope.active && !scope.transferredTo?.healthy) || scope.handoffPending) {
+        throw failure('maintenance_activity_closed', 'An inherited activity scope has completed')
+      }
+      scope.operation?._assertHealthy()
       if (scope.coordinator === this) return scope
     }
     throw failure('maintenance_activity_closed', 'SQL requires a live admitted activity scope')
+  }
+
+  trackPersistence() {
+    const scope = this.assertActivity()
+    const token = Symbol('persistence')
+    scope.pending.add(token)
+    return () => scope.pending.delete(token)
   }
 
   async _complete(scope, execution) {
@@ -399,7 +427,7 @@ export class GlobalMaintenanceCoordinator {
     this._held = false
   }
 
-  async _checkClaims(client) {
+  async _checkClaims(client, operationId = '') {
     const claims = {
       activities: Number(
         (
@@ -408,6 +436,15 @@ export class GlobalMaintenanceCoordinator {
         ).rows[0].count,
       ),
     }
+    claims.operations = Number(
+      (
+        await client.query(
+          `SELECT count(*) FROM ${this.qualified}.operations
+      WHERE ended_at IS NULL AND id <> $1`,
+          [operationId],
+        )
+      ).rows[0].count,
+    )
     for (const [table, condition] of BUSINESS_CLAIMS) {
       const name = `${quoteIdentifier(this.db.schema)}.${quoteIdentifier(table)}`
       if (!(await client.query('SELECT to_regclass($1) AS name', [name])).rows[0].name) {
@@ -421,7 +458,91 @@ export class GlobalMaintenanceCoordinator {
     return claims
   }
 
-  async beginMaintenance({ kind, signal = null, timeoutMs = 60000 } = {}) {
+  beginMaintenance(options) {
+    return this._beginMaintenance(options)
+  }
+
+  async beginMaintenanceFromCurrentActivity(options) {
+    const scope = this.assertActivity()
+    if (!scope.active || scope.operation)
+      throw failure('maintenance_activity_closed', 'An ordinary activity is required')
+    if (scope.remoteStarted)
+      throw failure('maintenance_handoff_started', 'Submitted remote work cannot transfer ownership')
+    if (scope.pending.size || this.db.isTransaction) {
+      throw failure('maintenance_persistence_pending', 'Finish activity persistence before transferring ownership')
+    }
+    scope.handoffPending = true
+    try {
+      return await this._beginMaintenance(options, scope)
+    } catch (error) {
+      scope.handoffPending = false
+      throw error
+    }
+  }
+
+  async runScheduledMaintenance(plan, callback) {
+    let operation
+    try {
+      operation = await this._beginMaintenance({ kind: 'backup' }, null, plan)
+    } catch (error) {
+      if (error.code === 'maintenance_already_completed') {
+        return { ran: false, code: error.code, sharedResult: error.sharedResult }
+      }
+      throw error
+    }
+    try {
+      const outcome = await operation.runAdmin(() => callback(operation))
+      if (outcome?.ended !== true) throw failure('maintenance_execution_unknown', 'Maintenance completion is unknown')
+      if (!operation._resumed) await operation.resume()
+      await operation.finish(outcome.value)
+      return { ran: true, value: outcome.value }
+    } catch (error) {
+      operation._completionUnknown = true
+      throw error
+    } finally {
+      await operation.close()
+    }
+  }
+
+  async _resumeTransfer(operationId) {
+    const scope = this._transfers.get(operationId)
+    if (!scope) return
+    await this._exclusiveLocal(async () => {
+      this._assertHealthy()
+      try {
+        if (!this._held) {
+          if (!(await this._client.query(TRY_SHARED, [this.activityResource])).rows[0].acquired) {
+            throw failure('database_maintenance', 'Cannot resume the transferred request during maintenance')
+          }
+          this._held = true
+        }
+        const epoch = await this._transaction(async (client) => {
+          if (!(await client.query(TRY_SHARED_TX, [this.activityResource])).rows[0].acquired)
+            throw failure('database_maintenance', 'Maintenance is queued')
+          const row = (await client.query(`SELECT phase, epoch FROM ${this.qualified}.control WHERE id=1 FOR SHARE`))
+            .rows[0]
+          if (row.phase !== 'open') throw failure('database_maintenance', 'Maintenance has not resumed')
+          const result = await client.query(
+            `UPDATE ${this.qualified}.activities SET completed_at=NULL, reason=NULL, epoch=$3
+            WHERE id=$1 AND owner_id=$2 AND completed_at IS NOT NULL AND reason='maintenance_handoff'`,
+            [scope.id, this.ownerId, row.epoch],
+          )
+          if (result.rowCount !== 1) throw failure('maintenance_activity_closed', 'The transferred request changed')
+          return Number(row.epoch)
+        })
+        scope.epoch = epoch
+        scope.active = true
+        scope.transferredTo = null
+        this._refs += 1
+        this._transfers.delete(operationId)
+      } catch (error) {
+        if (!this._refs) await this._releaseHolder()
+        throw error
+      }
+    })
+  }
+
+  async _beginMaintenance({ kind, signal = null, timeoutMs = 60000 } = {}, sourceScope = null, schedule = null) {
     this._assertHealthy()
     if (!['backup', 'restore'].includes(kind)) throw new Error('invalid maintenance kind')
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error('invalid maintenance timeout')
@@ -434,20 +555,87 @@ export class GlobalMaintenanceCoordinator {
       if (!(await client.query(TRY_EXCLUSIVE, [this.adminResource])).rows[0].acquired) {
         throw failure('maintenance_busy', 'Another maintenance or schema operation is active')
       }
-      await client.query('BEGIN')
-      try {
-        const row = (await client.query(`SELECT * FROM ${this.qualified}.control WHERE id = 1 FOR UPDATE`)).rows[0]
-        if (row.phase !== 'open') throw failure('database_maintenance', 'A durable maintenance operation is pending')
-        await client.query(
-          `UPDATE ${this.qualified}.control SET phase = 'draining', operation_id = $1,
+      await this._exclusiveLocal(async () => {
+        await client.query('BEGIN')
+        try {
+          const row = (await client.query(`SELECT * FROM ${this.qualified}.control WHERE id = 1 FOR UPDATE`)).rows[0]
+          if (row.phase !== 'open') throw failure('database_maintenance', 'A durable maintenance operation is pending')
+          let executionId = null
+          if (schedule) {
+            if (typeof schedule.taskKey !== 'string' || !schedule.taskKey || schedule.taskKey.length > 512)
+              throw new Error('invalid maintenance task key')
+            if (schedule.executionId != null) {
+              if (
+                typeof schedule.executionId !== 'string' ||
+                !schedule.executionId ||
+                schedule.executionId.length > 1024
+              )
+                throw new Error('invalid maintenance execution ID')
+              executionId = schedule.executionId
+            } else {
+              if (!Number.isSafeInteger(schedule.intervalMs) || schedule.intervalMs <= 0)
+                throw new Error('invalid maintenance interval')
+              const now = Number(
+                (await client.query('SELECT extract(epoch FROM clock_timestamp()) * 1000 AS now')).rows[0].now,
+              )
+              executionId = `interval:${schedule.intervalMs}:${Math.floor(now / schedule.intervalMs)}`
+            }
+            const previous = (
+              await client.query(
+                `SELECT ended_at, shared_result FROM ${this.qualified}.operations
+            WHERE task_key = $1 AND execution_id = $2`,
+                [schedule.taskKey, executionId],
+              )
+            ).rows[0]
+            if (previous)
+              throw failure(
+                previous.ended_at ? 'maintenance_already_completed' : 'maintenance_claims_active',
+                'Maintenance schedule has already been claimed',
+                { sharedResult: previous.shared_result },
+              )
+          }
+          await client.query(
+            `INSERT INTO ${this.qualified}.operations(id,owner_id,kind,source_activity_id,task_key,execution_id)
+          VALUES ($1,$2,$3,$4,$5,$6)`,
+            [
+              operation.operationId,
+              this.ownerId,
+              kind,
+              sourceScope?.id || null,
+              schedule?.taskKey || null,
+              executionId,
+            ],
+          )
+          await client.query(
+            `UPDATE ${this.qualified}.control SET phase = 'draining', operation_id = $1,
           owner_id = $2, kind = $3, reason = NULL, changed_at = clock_timestamp() WHERE id = 1`,
-          [operation.operationId, this.ownerId, kind],
-        )
-        await client.query('COMMIT')
-      } catch (error) {
-        await client.query('ROLLBACK').catch(() => {})
-        throw error
-      }
+            [operation.operationId, this.ownerId, kind],
+          )
+          if (sourceScope) {
+            const transferred = await client.query(
+              `UPDATE ${this.qualified}.activities
+            SET completed_at = clock_timestamp(), reason = 'maintenance_handoff'
+            WHERE id = $1 AND owner_id = $2 AND epoch = $3 AND completed_at IS NULL AND uncertain_at IS NULL`,
+              [sourceScope.id, this.ownerId, sourceScope.epoch],
+            )
+            if (transferred.rowCount !== 1)
+              throw failure('maintenance_activity_closed', 'Activity ownership changed before handoff')
+          }
+          await client.query('COMMIT')
+          operation._registered = true
+          if (sourceScope) {
+            sourceScope.active = false
+            sourceScope.handoffPending = false
+            sourceScope.transferredTo = operation
+            this._transfers.set(operation.operationId, sourceScope)
+            this._refs -= 1
+            if (!this._refs) await this._releaseHolder()
+          }
+        } catch (error) {
+          await client.query('ROLLBACK').catch(() => {})
+          throw error
+        }
+      })
       // DRAINING is committed before waiting. Existing scopes never reacquire this lock for their SQL.
       await client.query("SELECT set_config('statement_timeout', $1, false)", [String(timeoutMs)])
       const abort = () => {
@@ -462,7 +650,7 @@ export class GlobalMaintenanceCoordinator {
       }
       operation._assertHealthy()
       await client.query("SELECT set_config('statement_timeout', '60000', false)")
-      await this._checkClaims(client)
+      await this._checkClaims(client, operation.operationId)
       return operation
     } catch (error) {
       await operation.close()
@@ -480,6 +668,7 @@ export class GlobalMaintenanceCoordinator {
       if (!(await client.query(TRY_EXCLUSIVE, [this.adminResource])).rows[0].acquired) {
         throw failure('maintenance_busy', 'The maintenance owner is still active')
       }
+      await client.query('BEGIN')
       const result = await client.query(
         `UPDATE ${this.qualified}.control SET phase = 'open', operation_id = NULL,
         owner_id = NULL, kind = NULL, reason = NULL, changed_at = clock_timestamp()
@@ -488,8 +677,16 @@ export class GlobalMaintenanceCoordinator {
       )
       if (result.rowCount !== 1)
         throw failure('maintenance_operation_changed', 'The maintenance operation cannot be cancelled')
+      await client.query(
+        `UPDATE ${this.qualified}.operations SET ended_at=clock_timestamp()
+        WHERE id=$1 AND owner_id=$2 AND ended_at IS NULL`,
+        [operationId, this.ownerId],
+      )
+      await client.query('COMMIT')
+      await this._resumeTransfer(operationId)
       return this.getState()
     } finally {
+      await client.query('ROLLBACK').catch(() => {})
       await client.end().catch(() => {})
     }
   }
@@ -531,12 +728,45 @@ class MaintenanceOperation {
     this.backendPid = null
     this._closed = false
     this._lost = false
+    this._registered = false
+    this._resumed = false
     client.on('error', () => {
       this._lost = true
     })
     client.on('end', () => {
       this._lost = true
     })
+  }
+
+  get healthy() {
+    return !this._closed && !this._lost && this.coordinator.healthy
+  }
+
+  async runAdmin(callback) {
+    this._assertHealthy()
+    const scope = {
+      coordinator: this.coordinator,
+      kind: 'maintenance',
+      operation: this,
+      active: true,
+      pending: new Set(),
+    }
+    try {
+      return await activities.run({ scope, parent: activities.getStore() }, callback)
+    } finally {
+      scope.active = false
+    }
+  }
+
+  async finish(sharedResult) {
+    this._assertHealthy()
+    if (!this._resumed) throw failure('maintenance_operation_changed', 'Resume before completing maintenance history')
+    await this.client.query(
+      `UPDATE ${this.coordinator.qualified}.operations SET ended_at=COALESCE(ended_at,clock_timestamp()),
+      shared_result=CASE WHEN $3::jsonb IS NULL THEN shared_result ELSE $3::jsonb END
+      WHERE id=$1 AND owner_id=$2`,
+      [this.operationId, this.coordinator.ownerId, sharedResult === undefined ? null : JSON.stringify(sharedResult)],
+    )
   }
 
   _assertHealthy() {
@@ -568,7 +798,7 @@ class MaintenanceOperation {
     return this._transaction(async (row) => {
       if (this.kind !== 'restore' || row.phase !== 'draining')
         throw failure('maintenance_operation_changed', 'Restore is not in its pre-restore stage')
-      await this.coordinator._checkClaims(this.client)
+      await this.coordinator._checkClaims(this.client, this.operationId)
       if (!Number.isSafeInteger(Number(row.epoch) + 1)) throw new Error('application epoch exhausted')
       const result = await this.client.query(`UPDATE ${this.coordinator.qualified}.control SET phase = 'restoring',
         epoch = epoch + 1, changed_at = clock_timestamp() WHERE id = 1 RETURNING *`)
@@ -594,7 +824,7 @@ class MaintenanceOperation {
       ) {
         throw failure('maintenance_operation_changed', 'The maintenance phase does not permit resume')
       }
-      await this.coordinator._checkClaims(this.client)
+      await this.coordinator._checkClaims(this.client, this.operationId)
       const pending = (
         await this.client.query(
           `SELECT owner_id FROM ${this.coordinator.qualified}.members
@@ -612,6 +842,8 @@ class MaintenanceOperation {
       return stateOf(result.rows[0])
     })
     await this.client.query(UNLOCK_EXCLUSIVE, [this.coordinator.activityResource])
+    await this.coordinator._resumeTransfer(this.operationId)
+    this._resumed = true
     return state
   }
 
@@ -628,8 +860,12 @@ class MaintenanceOperation {
 
   async close() {
     if (this._closed) return
-    this._closed = true
-    // Closing releases session locks, never the durable latch or unfinished claims.
-    await this.client.end().catch(() => {})
+    try {
+      if (this._registered && this._resumed && this.healthy && !this._completionUnknown) await this.finish()
+    } finally {
+      this._closed = true
+      // A pre-restore or failed owner retains its latch and unfinished operation history.
+      await this.client.end().catch(() => {})
+    }
   }
 }
