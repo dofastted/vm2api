@@ -281,8 +281,9 @@ async function runHop({ mode, opts }) {
         typeof opts.onExecutionStart === 'function'
           ? async (execution) => {
               try {
-                await opts.onExecutionStart(execution)
+                const acknowledgement = await opts.onExecutionStart(execution)
                 bound = true
+                return acknowledgement
               } catch (error) {
                 startError = error
                 throw error

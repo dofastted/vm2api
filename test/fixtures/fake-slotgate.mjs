@@ -23,6 +23,7 @@ export const assistant = {
   id: 'synthetic-message', type: 'message', role: 'assistant',
   content: [{ type: 'text', text: 'synthetic answer' }], stop_reason: 'end_turn',
 }
+const wire = (value) => JSON.stringify(value, (key, item) => key === 'generation' ? JSON.rawJSON(String(item)) : item)
 
 // A local protocol double, not a node/Docker or provider acceptance test.
 export async function fakeSlotgate(t, options = {}) {
@@ -63,7 +64,7 @@ export async function fakeSlotgate(t, options = {}) {
           const held = commands.get(command.command_id)
           if (!held || held.ticket !== command.ticket) return socket.end('{"ok":false,"error":"ticket_invalid"}\n')
           const result = typeof options.status === 'function' ? options.status(command, held) : options.status
-          return socket.end(JSON.stringify(result || {
+          return socket.end(wire(result || {
             ok: true,
             command: { id: command.command_id, fence: command.fence, status: 'completed', dispatched: true },
           }) + '\n')
@@ -81,6 +82,7 @@ export async function fakeSlotgate(t, options = {}) {
       if (!held || held.ticket !== command.ticket) return socket.end('ERR ticket_invalid\n')
       held.envelope = envelope
       options.onForward?.(command, envelope)
+      if (options.hold) return
       const payload = options.body || JSON.stringify(assistant)
       if (options.truncated) return socket.end(`OK\nHTTP/1.1 200 OK\r\nContent-Length: ${Buffer.byteLength(payload) + 10}\r\n\r\n${payload}`)
       socket.end(`OK\nHTTP/1.1 ${options.statusCode || 200} Result\r\nContent-Type: ${options.sse ? 'text/event-stream' : 'application/json'}\r\nContent-Length: ${Buffer.byteLength(payload)}\r\nConnection: close\r\n\r\n${payload}`)

@@ -33,6 +33,7 @@ import {
   isWrapConnectionError,
 } from '../core/errors.mjs'
 import { extraHeadersFromLimitError } from '../pool/quota-window.mjs'
+import { SlotgateClient } from './slotgate-client.mjs'
 
 const MAX_BODY = 64 * 1024 * 1024
 const credentialRefreshTail = new Map()
@@ -81,6 +82,12 @@ function workerRequest(
   exec,
   { method = 'GET', requestPath, body = null, signal, timeoutMs = 180000, timeoutMode = 'overall', headers = {} } = {},
 ) {
+  // Ancillary legacy health/credential/cancel routes have no fenced adapter.
+  // An explicitly fenced executor must never reach the old UDS/SSH relay.
+  if (exec?.slotgate != null)
+    return Promise.reject(
+      Object.assign(new Error('fenced worker route unavailable'), { code: 'slotgate_route_unavailable' }),
+    )
   return new Promise((resolve, reject) => {
     const { socketPath } = workerPaths(exec)
     if (!socketPath) {
@@ -358,6 +365,15 @@ function kernelExecutionUnconfirmed(body, httpStatus = 0) {
   return !rejected(status) && !rejected(httpStatus)
 }
 
+async function completeFencedExecution(client, handle, execution) {
+  try {
+    execution.nodeCompletion = await client.completion(handle)
+    Object.assign(execution, { ended: true, reason: 'node_completed' })
+  } catch {
+    Object.assign(execution, { ended: false, reason: 'node_completion_unconfirmed' })
+  }
+}
+
 function completeHttpExecution(execution, body, httpStatus) {
   const uncertain = kernelExecutionUnconfirmed(body, httpStatus)
   Object.assign(execution, {
@@ -590,6 +606,8 @@ export async function callGoWorker({
       execution,
     }
   }
+  const fenced = exec?.slotgate == null ? null : new SlotgateClient(exec.slotgate)
+  let startError
   let stopCancel = () => {}
   try {
     if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
@@ -609,20 +627,35 @@ export async function callGoWorker({
           requestContext,
         })
     // The caller can durably bind this ID before any bytes reach the kernel.
-    if (onExecutionStart) await onExecutionStart({ requestId })
+    if (fenced) {
+      execution.nodeBinding = fenced.nodeBinding
+      try {
+        if (typeof onExecutionStart !== 'function')
+          throw Object.assign(new Error('durable node binding required'), { code: 'slotgate_binding_unconfirmed' })
+        const acknowledgement = await onExecutionStart({ requestId, nodeBinding: fenced.nodeBinding })
+        fenced.assertBinding(acknowledgement, requestId)
+      } catch (error) {
+        startError = error
+        throw error
+      }
+      Object.assign(execution, { ended: false, reason: 'node_prepared_unknown' })
+    } else if (onExecutionStart) await onExecutionStart({ requestId })
     if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
-    stopCancel = cancelOnAbort(exec, signal, requestId)
+    if (!fenced) stopCancel = cancelOnAbort(exec, signal, requestId)
+    const handle = fenced ? await fenced.prepare(requestId) : null
     Object.assign(execution, { started: true, ended: false, reason: 'in_progress' })
-    const response = await workerRequest(exec, {
+    const request = {
       method: 'POST',
       requestPath,
       body: { ...prepared.envelope, request_id: requestId },
       signal,
       timeoutMs,
-    })
+    }
+    const response = await (fenced ? fenced.forward(handle, request) : workerRequest(exec, request))
     const data = await readAll(response)
     const parsed = parseJson(data)
-    completeHttpExecution(execution, parsed, response.statusCode)
+    if (fenced) await completeFencedExecution(fenced, handle, execution)
+    else completeHttpExecution(execution, parsed, response.statusCode)
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     const ok = response.statusCode >= 200 && response.statusCode < 300 && parsed?.type !== 'error'
     if (ok) rememberThreadTurn(parsed?.id, prepared.thread)
@@ -641,6 +674,7 @@ export async function callGoWorker({
       execution,
     })
   } catch (error) {
+    if (startError) throw startError
     if (!execution.ended) {
       execution.reason = signal?.aborted
         ? 'client_aborted'
@@ -777,6 +811,8 @@ export async function streamGoWorker({
       execution,
     }
   }
+  const fenced = exec?.slotgate == null ? null : new SlotgateClient(exec.slotgate)
+  let startError
   let committed = false
   // Hop-relative TTFT. firstTokenAt is epoch ms so request logs subtract ingress t0.
   const startedAt = Date.now()
@@ -800,11 +836,24 @@ export async function streamGoWorker({
           cliHop,
           requestContext,
         })
-    if (onExecutionStart) await onExecutionStart({ requestId })
+    if (fenced) {
+      execution.nodeBinding = fenced.nodeBinding
+      try {
+        if (typeof onExecutionStart !== 'function')
+          throw Object.assign(new Error('durable node binding required'), { code: 'slotgate_binding_unconfirmed' })
+        const acknowledgement = await onExecutionStart({ requestId, nodeBinding: fenced.nodeBinding })
+        fenced.assertBinding(acknowledgement, requestId)
+      } catch (error) {
+        startError = error
+        throw error
+      }
+      Object.assign(execution, { ended: false, reason: 'node_prepared_unknown' })
+    } else if (onExecutionStart) await onExecutionStart({ requestId })
     if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
-    stopCancel = cancelOnAbort(exec, signal, requestId)
+    if (!fenced) stopCancel = cancelOnAbort(exec, signal, requestId)
+    const handle = fenced ? await fenced.prepare(requestId) : null
     Object.assign(execution, { started: true, ended: false, reason: 'in_progress' })
-    const response = await workerRequest(exec, {
+    const request = {
       method: 'POST',
       requestPath,
       body: { ...prepared.envelope, request_id: requestId },
@@ -812,12 +861,14 @@ export async function streamGoWorker({
       timeoutMs,
       timeoutMode: 'first-byte',
       headers: { te: 'trailers' },
-    })
+    }
+    const response = await (fenced ? fenced.forward(handle, request) : workerRequest(exec, request))
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
       const data = await readAll(response, 1024 * 1024)
       const parsed = parseJson(data)
-      completeHttpExecution(execution, parsed, response.statusCode)
+      if (fenced) await completeFencedExecution(fenced, handle, execution)
+      else completeHttpExecution(execution, parsed, response.statusCode)
       return restoreKernelErrorStatus({
         ok: false,
         status: response.statusCode || 0,
@@ -944,7 +995,8 @@ export async function streamGoWorker({
         const event = observeSseEvent(takeSseEvent())
         if (isDownstreamCommitEvent(event)) await flushCommit()
       }
-      completeHttpExecution(execution, unconfirmedKernelError || lastError, response.statusCode)
+      if (fenced) await completeFencedExecution(fenced, handle, execution)
+      else completeHttpExecution(execution, unconfirmedKernelError || lastError, response.statusCode)
       const trailers = mergeRateLimitHeaders(publicHeaders(response.trailers))
       const meta = streamMetaFromHeaders({ ...headers, ...trailers })
       const assembled = assembler.message
@@ -978,6 +1030,7 @@ export async function streamGoWorker({
       if (idleTimer) clearInterval(idleTimer)
     }
   } catch (error) {
+    if (startError) throw startError
     if (!execution.ended) {
       execution.reason = signal?.aborted
         ? 'client_aborted'

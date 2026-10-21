@@ -3,6 +3,7 @@ import { withTransaction } from '../database.mjs'
 import { physicalContainerName, physicalVmAliases } from '../../vm/vm-physical-target.mjs'
 import { readWatchdogState } from '../../transport/kernel-watchdog-state.mjs'
 import { ExecutionCircuitsRepo } from './execution-circuits-repo.mjs'
+import { normalizeNodeBinding, normalizeNodeCompletion, sameNodeBinding } from '../../core/node-execution-proof.mjs'
 
 function invalid(field) {
   return Object.assign(new Error(`Invalid execution admission ${field}`), { code: 'invalid_execution_admission' })
@@ -192,6 +193,7 @@ export class ExecutionAdmissionsRepo {
   }
 
   async bindExecution(handle, execution) {
+    const nodeBinding = execution?.nodeBinding === undefined ? null : normalizeNodeBinding(execution.nodeBinding)
     return withTransaction(this.db, async () => {
       const admission = await this._lockAdmission(handle)
       if (!admission || admission.released_at || admission.uncertain_at) {
@@ -200,16 +202,22 @@ export class ExecutionAdmissionsRepo {
       if (typeof execution?.requestId !== 'string' || !execution.requestId.trim()) {
         throw jobError('invalid_execution_job')
       }
+      if (nodeBinding && nodeBinding.vmId !== admission.vm_id) throw jobError('execution_node_binding_mismatch')
       const pending = await this.db
         .prepare('SELECT request_id FROM execution_jobs WHERE admission_id = $1 AND ended_at IS NULL LIMIT 1')
         .get(handle.admissionId)
       if (pending) throw jobError('execution_job_pending')
       const row = await this.db
-        .prepare(`INSERT INTO execution_jobs (request_id, admission_id) VALUES ($1, $2)
+        .prepare(`INSERT INTO execution_jobs (request_id, admission_id, node_binding) VALUES ($1, $2, $3::jsonb)
         ON CONFLICT (request_id) DO NOTHING RETURNING request_id`)
-        .get(execution.requestId, handle.admissionId)
+        .get(execution.requestId, handle.admissionId, nodeBinding ? JSON.stringify(nodeBinding) : null)
       if (!row) throw jobError('execution_job_exists')
-      return { bound: true, admissionId: handle.admissionId, requestId: execution.requestId }
+      return {
+        bound: true,
+        admissionId: handle.admissionId,
+        requestId: execution.requestId,
+        ...(nodeBinding ? { nodeBinding } : {}),
+      }
     })
   }
 
@@ -236,13 +244,38 @@ export class ExecutionAdmissionsRepo {
         await this.markUncertain(handle)
         return { error: 'execution_job_mismatch' }
       }
+      let nodeCompletion = null
+      if (job.node_binding) {
+        try {
+          if (!sameNodeBinding(execution.nodeBinding, job.node_binding))
+            throw jobError('execution_node_binding_mismatch')
+          if (execution.ended)
+            nodeCompletion = normalizeNodeCompletion(execution.nodeCompletion, {
+              requestId: execution.requestId,
+              nodeBinding: job.node_binding,
+            })
+        } catch {
+          await this.markUncertain(handle)
+          return { error: 'execution_node_unconfirmed' }
+        }
+      } else if (execution.nodeBinding !== undefined || execution.nodeCompletion !== undefined) {
+        await this.markUncertain(handle)
+        return { error: 'execution_node_binding_mismatch' }
+      }
       if (job.ended_at) return { ended: true, uncertain: !!admission.uncertain_at, requestId: execution.requestId }
       await this.db
         .prepare(`UPDATE execution_jobs SET
         ended_at = CASE WHEN $1 THEN clock_timestamp() ELSE ended_at END,
-        started = COALESCE(started, false) OR $2, reason = $3
+        started = COALESCE(started, false) OR $2, reason = $3, node_completion = $6::jsonb
         WHERE request_id = $4 AND admission_id = $5 AND ended_at IS NULL`)
-        .run(execution.ended, execution.started, execution.reason, execution.requestId, handle.admissionId)
+        .run(
+          execution.ended,
+          execution.started,
+          execution.reason,
+          execution.requestId,
+          handle.admissionId,
+          nodeCompletion ? JSON.stringify(nodeCompletion) : null,
+        )
       if (!execution.ended) await this.markUncertain(handle)
       return {
         ended: execution.ended,
