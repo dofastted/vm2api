@@ -447,6 +447,7 @@ export class BackupService {
     ).map(({ tablename }) => tablename)
     const extraTables = tables.filter((name) => !archive.tables.has(name))
     const tableName = (name) => `${quoteIdentifier(db.schema)}.${quoteIdentifier(name)}`
+    const sqlLiteral = (value) => "'" + value.replaceAll("'", "''") + "'"
     const cleanup = path.join(archive.tmp, 'cleanup.sql')
     const restore = path.join(archive.tmp, 'restore.sql')
     fs.writeFileSync(
@@ -465,6 +466,29 @@ export class BackupService {
             RAISE EXCEPTION 'restore refuses cross-schema inheritance or partitions';
           END IF;
         END $$;`,
+        // A later migration may add a FK from an archived table to a new
+        // parent. pg_restore will replace the archived table, but the parent
+        // must disappear first. Remove only that same-schema dependency;
+        // external dependencies still fail RESTRICT and roll back all changes.
+        extraTables.length && archive.tables.size
+          ? `DO $vm2api_restore_fk$ DECLARE dependency record; BEGIN
+            FOR dependency IN
+              SELECT source.relname AS source_name, constraint_row.conname
+              FROM pg_catalog.pg_constraint constraint_row
+              JOIN pg_catalog.pg_class source ON source.oid=constraint_row.conrelid
+              JOIN pg_catalog.pg_namespace source_schema ON source_schema.oid=source.relnamespace
+              JOIN pg_catalog.pg_class target ON target.oid=constraint_row.confrelid
+              JOIN pg_catalog.pg_namespace target_schema ON target_schema.oid=target.relnamespace
+              WHERE constraint_row.contype='f'
+                AND source_schema.nspname=${sqlLiteral(db.schema)}
+                AND target_schema.nspname=${sqlLiteral(db.schema)}
+                AND source.relname IN (${[...archive.tables].map(sqlLiteral).join(',')})
+                AND target.relname IN (${extraTables.map(sqlLiteral).join(',')})
+            LOOP
+              EXECUTE format('ALTER TABLE %I.%I DROP CONSTRAINT %I', ${sqlLiteral(db.schema)}, dependency.source_name, dependency.conname);
+            END LOOP;
+          END $vm2api_restore_fk$;`
+          : '',
         extraTables.length ? `DROP TABLE ${extraTables.map(tableName).join(', ')};` : '',
       ].join('\n'),
       { mode: 0o600 },
