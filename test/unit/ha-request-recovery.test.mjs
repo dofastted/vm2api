@@ -384,3 +384,42 @@ test('concurrent recoveries are idempotent and cannot extend recovered seat grac
     )
   })
 })
+
+test('SIGKILL of a synthetic owner process releases only its connection lock, with no timestamp timeout', async (t) => {
+  const { spawn } = await import('node:child_process')
+  const { fileURLToPath } = await import('node:url')
+  const f = await fixture(t)
+  const child = spawn(process.execPath, [fileURLToPath(new URL('../fixtures/orphan-owner.mjs', import.meta.url))], {
+    stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+  })
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+  })
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('synthetic owner readiness timeout')), 5000)
+    child.once('error', (error) => {
+      clearTimeout(timer)
+      reject(error)
+    })
+    child.once('exit', () => {
+      clearTimeout(timer)
+      reject(new Error('synthetic owner exited before readiness'))
+    })
+    child.once('message', (message) => {
+      clearTimeout(timer)
+      message.ready === true ? resolve() : reject(new Error('invalid readiness'))
+    })
+  })
+  await f.gate.run(async () => {
+    assert.deepEqual(await withTransaction(f.peer, () => f.second.lockAbsentOwner('synthetic-killed-owner')), {
+      absent: false,
+      reason: 'owner_connected',
+    })
+    const exited = new Promise((resolve) => child.once('exit', resolve))
+    assert.equal(child.kill('SIGKILL'), true)
+    await exited
+    assert.deepEqual(await withTransaction(f.peer, () => f.second.lockAbsentOwner('synthetic-killed-owner')), {
+      absent: true,
+    })
+  })
+})
