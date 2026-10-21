@@ -145,16 +145,142 @@ export async function initializeNodeAuthority(db) {
   })
 }
 
+/** New command authority is a separately and explicitly installed feature. */
+export async function nodeCommandAuthorityState(db) {
+  const base = await nodeAuthorityState(db)
+  if (!base.enabled) return { enabled: false, schema: base.schema }
+  const coord = quoteIdentifier(coordinationSchemaFor(db.schema))
+  const unavailable = () => nodeAuthorityError('node_command_authority_unavailable')
+  try {
+    const objects = (
+      await db.query(
+        `SELECT
+      EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass($1) AND attname='command_protocol_version' AND NOT attisdropped) AS meta_version,
+      EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid=to_regclass($2) AND attname='command_protocol_version' AND NOT attisdropped) AS marker_version,
+      to_regclass($3) IS NOT NULL AS grants,
+      to_regclass($4) IS NOT NULL AS view,
+      to_regprocedure($5) IS NOT NULL AS current_function`,
+        [
+          `${base.q}.meta`,
+          `${coord}.node_authority_features`,
+          `${base.q}.command_grants`,
+          `${base.q}.authorized_commands`,
+          `${base.q}.command_current(text)`,
+        ],
+      )
+    ).rows[0]
+    if (Object.values(objects).every((value) => value === false)) return { enabled: false, schema: base.schema }
+    if (!Object.values(objects).every((value) => value === true)) throw unavailable()
+    const versions = (
+      await db.query(
+        `SELECT m.command_protocol_version AS local_version,
+      f.command_protocol_version AS marker_version FROM ${base.q}.meta m
+      JOIN ${coord}.node_authority_features f ON f.application_schema=m.application_schema
+      WHERE m.id=1 AND f.authority_schema=$1`,
+        [base.schema],
+      )
+    ).rows[0]
+    if (versions?.local_version !== 1 || versions.marker_version !== 1) throw unavailable()
+    return base
+  } catch {
+    throw unavailable()
+  }
+}
+
+/** Trusted provisioning only. Startup/read/issuance paths never call this DDL. */
+export async function initializeNodeCommandAuthority(db) {
+  return withTransaction(db, async () => {
+    await db.query('SELECT pg_advisory_xact_lock(hashtext(current_database()),hashtext($1))', [
+      `vm2api:node-authority-bootstrap:${db.schema}`,
+    ])
+    const base = await nodeAuthorityState(db)
+    if (!base.enabled) throw nodeAuthorityError('node_command_authority_unavailable')
+    const existing = await nodeCommandAuthorityState(db)
+    if (existing.enabled) return existing
+    const { q, schema } = base
+    const coord = quoteIdentifier(coordinationSchemaFor(db.schema))
+    const state = (await db.query(`SELECT phase FROM ${coord}.control WHERE id=1 FOR SHARE`)).rows[0]
+    if (state?.phase !== 'open') throw nodeAuthorityError('node_command_authority_unavailable')
+    await db.query(`ALTER TABLE ${q}.meta ADD COLUMN command_protocol_version integer NOT NULL DEFAULT 1 CHECK(command_protocol_version=1);
+      ALTER TABLE ${coord}.node_authority_features ADD COLUMN command_protocol_version integer NOT NULL DEFAULT 1 CHECK(command_protocol_version=1);
+      CREATE TABLE ${q}.command_grants (
+        command_id text PRIMARY KEY, node_id text NOT NULL, vm_id text NOT NULL,
+        allocation_id text NOT NULL REFERENCES ${q}.allocations(allocation_id),
+        operation_id text NOT NULL, owner_id text NOT NULL,
+        action text NOT NULL CHECK(action IN ('publish-initial','launch')),
+        epoch bigint NOT NULL CHECK(epoch>0), intent_digest text NOT NULL CHECK(intent_digest ~ '^[a-f0-9]{64}$'),
+        intent jsonb NOT NULL, receipt jsonb, created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+        revoked_at timestamptz, UNIQUE(allocation_id,action));
+      CREATE INDEX command_grants_operation ON ${q}.command_grants(operation_id,owner_id) WHERE revoked_at IS NULL;
+      REVOKE ALL ON ${q}.command_grants FROM PUBLIC;
+      CREATE FUNCTION ${q}.command_current(p_command text) RETURNS boolean
+      LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $body$
+      DECLARE g record; allowed boolean;
+      BEGIN
+        IF NOT EXISTS(SELECT 1 FROM ${q}.reader_identity())
+          OR has_table_privilege(session_user,'${schema}.command_grants','INSERT,UPDATE,DELETE,TRUNCATE') THEN RETURN false; END IF;
+        SELECT a.*,m.application_schema INTO g FROM ${q}.command_grants a
+          JOIN ${q}.allocations origin ON origin.allocation_id=a.allocation_id
+          CROSS JOIN ${q}.meta m
+          JOIN ${q}.reader_roles r ON r.role_name=session_user
+          JOIN ${coord}.control c ON c.id=1
+          JOIN ${coord}.node_authority_features f ON f.application_schema=m.application_schema
+          WHERE a.command_id=p_command AND a.node_id=r.node_id AND a.revoked_at IS NULL
+            AND m.id=1 AND m.protocol_version=1 AND m.command_protocol_version=1
+            AND f.protocol_version=1 AND f.command_protocol_version=1 AND f.authority_schema='${schema}'
+            AND c.application_schema=m.application_schema AND c.phase='open' AND c.epoch=a.epoch
+            AND origin.node_id=a.node_id AND origin.vm_id=a.vm_id AND origin.epoch=a.epoch
+            AND origin.receipt->>'allocation_id'=a.allocation_id AND origin.receipt->>'epoch'=a.epoch::text
+            AND origin.receipt->'fence'->>'generation'='1'
+            AND a.intent->'fence'->>'generation'='1'
+            AND a.intent->'fence'->>'incarnation'=origin.receipt->'fence'->>'incarnation'
+            AND a.intent->'fence'->'executor'='{"kind":"","node_boot_id":""}'::jsonb
+            AND a.intent->>'action'=a.action AND a.intent->>'epoch'=a.epoch::text
+            AND a.intent->>'node_id'=a.node_id AND a.intent->>'vm_id'=a.vm_id
+            AND a.intent->>'allocation_id'=a.allocation_id AND a.intent->>'command_id'=a.command_id
+            AND a.intent->>'operation_id'=a.operation_id AND a.intent->>'owner_id'=a.owner_id
+            AND a.intent->>'preset_id'='claude-docker-v1' AND a.intent->>'manifest_revision'='1'
+            AND a.intent->>'policy_digest' ~ '^[a-f0-9]{64}$'
+            AND ((a.action='publish-initial' AND a.intent->>'expected_manifest_revision'='0'
+                AND a.intent->>'payload_digest' ~ '^[a-f0-9]{64}$' AND a.intent->>'manifest_digest'='')
+              OR (a.action='launch' AND a.intent->>'expected_manifest_revision'='1' AND a.intent->>'payload_digest'=''
+                AND EXISTS(SELECT 1 FROM ${q}.command_grants p WHERE p.allocation_id=a.allocation_id
+                  AND p.action='publish-initial' AND p.epoch=a.epoch AND p.receipt IS NOT NULL
+                  AND p.receipt->>'intent_digest'=p.intent_digest
+                  AND p.receipt->>'manifest_revision'='1'
+                  AND p.receipt->>'manifest_digest'=a.intent->>'manifest_digest'
+                  AND p.intent->>'policy_digest'=a.intent->>'policy_digest'
+                  AND p.intent->'fence'=a.intent->'fence')));
+        IF NOT FOUND THEN RETURN false; END IF;
+        EXECUTE format('SELECT EXISTS(SELECT 1 FROM %I.vm_operations WHERE id=$1 AND owner_id=$2 AND vm_id=$3
+          AND kind=$4 AND released_at IS NULL AND uncertain_at IS NULL)',g.application_schema)
+          INTO allowed USING g.operation_id,g.owner_id,g.vm_id,
+            CASE g.action WHEN 'publish-initial' THEN 'node_publish_initial' ELSE 'node_launch' END;
+        RETURN allowed;
+      EXCEPTION WHEN undefined_table OR invalid_schema_name THEN RETURN false;
+      END $body$;
+      REVOKE ALL ON FUNCTION ${q}.command_current(text) FROM PUBLIC;
+      CREATE VIEW ${q}.authorized_commands WITH(security_barrier=true) AS
+        SELECT command_id,node_id,vm_id,allocation_id,operation_id,owner_id,action,epoch,intent_digest
+          FROM ${q}.command_grants WHERE ${q}.command_current(command_id);
+      REVOKE ALL ON ${q}.authorized_commands FROM PUBLIC`)
+    return nodeCommandAuthorityState(db)
+  })
+}
+
 // Caller must already hold the exact VM operation row. This lock order also
 // governs issuance; the node's shared-lock path uses MVCC reads only.
 export async function revokeNodeOperationGrants(db, { operationId, ownerId }) {
   if (!db.isTransaction) throw nodeAuthorityError()
   const state = await nodeAuthorityState(db)
   if (!state.enabled) return
+  const commands = await nodeCommandAuthorityState(db)
   const rows = (
     await db.query(
-      `SELECT DISTINCT node_id,vm_id FROM ${state.q}.allocations
-    WHERE operation_id=$1 AND owner_id=$2 AND revoked_at IS NULL ORDER BY node_id,vm_id`,
+      `SELECT DISTINCT node_id,vm_id FROM (
+        SELECT node_id,vm_id FROM ${state.q}.allocations WHERE operation_id=$1 AND owner_id=$2 AND revoked_at IS NULL
+        ${commands.enabled ? `UNION ALL SELECT node_id,vm_id FROM ${state.q}.command_grants WHERE operation_id=$1 AND owner_id=$2 AND revoked_at IS NULL` : ''}
+      ) grants ORDER BY node_id,vm_id`,
       [operationId, ownerId],
     )
   ).rows
@@ -164,4 +290,10 @@ export async function revokeNodeOperationGrants(db, { operationId, ownerId }) {
     WHERE operation_id=$1 AND owner_id=$2 AND revoked_at IS NULL`,
     [operationId, ownerId],
   )
+  if (commands.enabled)
+    await db.query(
+      `UPDATE ${state.q}.command_grants SET revoked_at=clock_timestamp()
+      WHERE operation_id=$1 AND owner_id=$2 AND revoked_at IS NULL`,
+      [operationId, ownerId],
+    )
 }
