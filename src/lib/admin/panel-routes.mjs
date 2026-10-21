@@ -4597,7 +4597,7 @@ export function createPanelHandler(ctx) {
         }
         try {
           if (isCodexVm(existing)) {
-            const generated = generateCodexAuthUrl({
+            const generated = await generateCodexAuthUrl({
               vmId: id,
               proxyUrl: slotProxy.proxyUrl,
               installationId: existing.device_id || existing.codex?.installation_id,
@@ -4629,7 +4629,7 @@ export function createPanelHandler(ctx) {
               }),
             )
           }
-          const generated = generateAuthUrl({
+          const generated = await generateAuthUrl({
             vmId: id,
             proxyUrl: slotProxy.proxyUrl,
             flavor,

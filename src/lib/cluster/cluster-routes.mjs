@@ -82,7 +82,7 @@ export function createClusterRoutes({ manager, json, readBody, ok }) {
       return respond(res, 200, ok(await manager.setDirectLink(id, body)))
     }
     if (sub === '/direct-link' && m === 'DELETE') return respond(res, 200, ok(await manager.clearDirectLink(id)))
-    if (sub === '/shell-ticket' && m === 'POST') return respond(res, 200, ok(manager.issueShellTicket(id)))
+    if (sub === '/shell-ticket' && m === 'POST') return respond(res, 200, ok(await manager.issueShellTicket(id)))
 
     if (sub === '/docker/info' && m === 'GET') return respond(res, 200, ok(await dockerInfo(manager.docker(id))))
     if (sub === '/preflight' && m === 'POST') {
@@ -193,16 +193,20 @@ export function createClusterRoutes({ manager, json, readBody, ok }) {
       return true
     }
     const id = sm[1]
-    if (!manager.consumeShellTicket(url.searchParams.get('ticket') || '', id)) {
-      rejectUpgrade(socket, 401, 'Unauthorized')
-      return true
+    const accept = (authorized) => {
+      if (!authorized) return rejectUpgrade(socket, 401, 'Unauthorized')
+      if (draining || socket.destroyed) return rejectUpgrade(socket, 503, 'Service Unavailable')
+      const cols = clampInt(url.searchParams.get('cols'), 10, 500, 80)
+      const rows = clampInt(url.searchParams.get('rows'), 5, 200, 24)
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        track(new Promise((resolve) => ws.once('close', resolve)))
+        track(attachShell(ws, id, { cols, rows }))
+      })
     }
-    const cols = clampInt(url.searchParams.get('cols'), 10, 500, 80)
-    const rows = clampInt(url.searchParams.get('rows'), 5, 200, 24)
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      track(new Promise((resolve) => ws.once('close', resolve)))
-      track(attachShell(ws, id, { cols, rows }))
-    })
+    const consumed = manager.consumeShellTicket(url.searchParams.get('ticket') || '', id)
+    if (typeof consumed?.then === 'function') {
+      track(consumed.then(accept, () => rejectUpgrade(socket, 503, 'Service Unavailable')))
+    } else accept(consumed)
     return true
   }
 

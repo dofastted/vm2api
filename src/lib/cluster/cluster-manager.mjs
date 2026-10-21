@@ -5,7 +5,9 @@
  */
 
 import crypto from 'node:crypto'
-import { withTransaction } from '../db/database.mjs'
+import { getDb, withTransaction } from '../db/database.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { OneTimeAuthRepo } from '../db/repos/one-time-auth-repo.mjs'
 import fs from 'node:fs'
 import net from 'node:net'
 import path from 'node:path'
@@ -123,6 +125,7 @@ export class ClusterManager {
     onNodesChanged = null,
     onLinkState = null,
     assertNodeEditable = () => {},
+    authState = null,
     gateBin = process.env.KIN_CLUSTER_GATE_BIN || path.join(process.cwd(), 'bin', 'kin-slot-gate'),
   }) {
     this.gateBin = gateBin
@@ -154,6 +157,7 @@ export class ClusterManager {
     this.health = new Map()
     this.installs = new Map()
     this.tickets = new Map()
+    this.authState = isKubernetesMode() ? authState || new OneTimeAuthRepo(repo.db || getDb()) : null
     this._healthTimer = null
   }
 
@@ -657,6 +661,7 @@ export class ClusterManager {
           ? await this.repo.updateLabel(id, edit.spec.label, edit.node.updated_at)
           : await this.repo.update(id, edit.spec, edit.node.updated_at)
         if (!saved) throw nodeEditConflict()
+        if (candidate && this.authState) await this.authState.revokeShell('node', id)
         if (candidate) {
           // Reconnect and placement may change while PostgreSQL executes the CAS.
           // Keep this final check and adoption synchronous; a rejection rolls back the CAS.
@@ -992,6 +997,7 @@ export class ClusterManager {
 
   issueShellTicket(id) {
     this.client(id)
+    if (this.authState) return this.authState.issueShell('node', id, { ttlMs: SHELL_TICKET_TTL_MS })
     const now = Date.now()
     for (const [t, v] of this.tickets) if (v.exp <= now) this.tickets.delete(t)
     const ticket = crypto.randomBytes(24).toString('base64url')
@@ -999,8 +1005,9 @@ export class ClusterManager {
     return { ticket, expires_in: SHELL_TICKET_TTL_MS / 1000 }
   }
 
-  /** Single use: the ticket is burned whether or not it matches. */
+  /** Shared tickets reject a wrong resource without consuming the grant. */
   consumeShellTicket(ticket, id) {
+    if (this.authState) return this.authState.consumeShell('node', ticket, id).then(Boolean)
     const entry = this.tickets.get(ticket)
     this.tickets.delete(ticket)
     return !!entry && entry.nodeId === id && entry.exp > Date.now()

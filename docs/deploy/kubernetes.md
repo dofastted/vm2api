@@ -24,6 +24,10 @@ VM2API_API_KEY
 VM2API_DB_SECRET
 ```
 
+`VM2API_DB_SECRET` 是现有数据库字段加密密钥，兼容旧名 `KIN_DB_SECRET`。Kubernetes 模式下生成浏览器 OAuth 授权链接必须配置该密钥；缺失时拒绝发起 PKCE，不能将 verifier 明文存入 PostgreSQL。各副本使用同一密钥，不能在升级或导入时替换。字段示例见 `deploy/k8s/secret.example.yaml`；该文件不参与默认 Kustomize 部署，不能直接使用占位值。
+
+PKCE 会话通过 PostgreSQL claim 防止并发换票，成功后消费，供应商失败后恢复原会话供重试。进程在换票期间退出时，claim 保留至原会话到期，之后必须重新发起授权。终端 ticket 在 PostgreSQL 只存随机票据摘要，有效期为 30 秒，成功匹配资源后只能消费一次；错误节点、VM 或登录模式不消耗其他资源的票据。
+
 管理员用户名默认为 `admin`。已有 SQLite 安装应先按 PostgreSQL 文档完成离线导入，保留原业务加密密钥和对应的 VM、配置及备份文件，之后再启动 Pod。
 
 ```sh

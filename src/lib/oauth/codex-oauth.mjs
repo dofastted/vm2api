@@ -3,6 +3,8 @@
  * Matches codex-proxy-rs: loopback callback is pasted back, exchange via slot SOCKS5.
  */
 import crypto from 'node:crypto'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { OneTimeAuthRepo } from '../db/repos/one-time-auth-repo.mjs'
 import {
   CODEX_APP_VERSION,
   CODEX_OAUTH_AUTHORIZE_URL,
@@ -104,7 +106,7 @@ function buildDesktopAuthUrl({ state, codeChallenge, installationId }) {
   return outer.toString()
 }
 
-export function generateCodexAuthUrl({ vmId, proxyUrl, installationId } = {}) {
+export function generateCodexAuthUrl({ vmId, proxyUrl, installationId, db } = {}) {
   sweepExpired()
   if (!vmId) throw fail('vm_required', 'vm_id required (先创建虚拟机)')
   if (proxyUrl == null) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，请先分配代理再生成授权链接')
@@ -114,38 +116,48 @@ export function generateCodexAuthUrl({ vmId, proxyUrl, installationId } = {}) {
   const sessionId = crypto.randomBytes(16).toString('hex')
   const createdAt = Date.now()
   const install = String(installationId || crypto.randomUUID())
-  sessions.set(sessionId, {
+  const session = {
     state,
     codeVerifier,
     proxyUrl: proxyUrl === '' ? '' : String(proxyUrl),
     vmId: String(vmId),
     installationId: install,
     createdAt,
-  })
-  return {
+  }
+  const generated = {
     auth_url: buildDesktopAuthUrl({ state, codeChallenge, installationId: install }),
     session_id: sessionId,
     expires_at: createdAt + CODEX_OAUTH_SESSION_TTL_MS,
     vm_id: String(vmId),
     flavor: 'codex',
   }
+  if (isKubernetesMode()) {
+    return new OneTimeAuthRepo(db)
+      .issuePkce('codex', sessionId, session, CODEX_OAUTH_SESSION_TTL_MS)
+      .then(({ expiresAt }) => ({ ...generated, expires_at: expiresAt }))
+  }
+  sessions.set(sessionId, session)
+  return generated
 }
 
-export async function exchangeCodexAuthCode({ sessionId, code, proxyUrl, vmId, fetchImpl } = {}) {
+export async function exchangeCodexAuthCode({ sessionId, code, proxyUrl, vmId, fetchImpl, db } = {}) {
   sweepExpired()
-  const session = sessions.get(sessionId)
-  if (!session || Date.now() - session.createdAt > CODEX_OAUTH_SESSION_TTL_MS) {
+  const parsed = parseCodexOAuthCallback(code)
+  const store = isKubernetesMode() ? new OneTimeAuthRepo(db) : null
+  const validate = (session) => {
+    if (vmId && session.vmId && session.vmId !== String(vmId))
+      throw fail('session_vm_mismatch', '授权会话与当前虚拟机不匹配')
+    if (!parsed.code) throw fail('code_required', '请粘贴 Codex 回调 URL 或授权码')
+    if (parsed.state && parsed.state !== session.state) throw fail('state_mismatch', '回调 state 与授权会话不匹配')
+    if ((proxyUrl ?? session.proxyUrl) == null) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
+  }
+  const claim = store ? await store.claimPkce('codex', sessionId, validate) : null
+  const session = store ? claim.session : sessions.get(sessionId)
+  if (!session || (!store && Date.now() - session.createdAt > CODEX_OAUTH_SESSION_TTL_MS)) {
     if (session) sessions.delete(sessionId)
     throw fail('session_expired', '授权会话不存在或已过期，请重新生成授权链接')
   }
-  if (vmId && session.vmId && session.vmId !== String(vmId)) {
-    throw fail('session_vm_mismatch', '授权会话与当前虚拟机不匹配')
-  }
-  const parsed = parseCodexOAuthCallback(code)
-  if (!parsed.code) throw fail('code_required', '请粘贴 Codex 回调 URL 或授权码')
-  if (parsed.state && parsed.state !== session.state) {
-    throw fail('state_mismatch', '回调 state 与授权会话不匹配')
-  }
+  if (!store) validate(session)
   const px = proxyUrl ?? session.proxyUrl
   if (px == null) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
   const tok = await exchangeCodexAuthorizationCode({
@@ -155,9 +167,11 @@ export async function exchangeCodexAuthCode({ sessionId, code, proxyUrl, vmId, f
     fetchImpl,
   })
   if (!tok.ok) {
+    if (store) await store.finishPkce('codex', sessionId, claim.claimId, false)
     throw fail(tok.error || 'exchange_failed', 'Codex OAuth 换票失败，请重新生成授权链接')
   }
-  sessions.delete(sessionId)
+  if (store) await store.finishPkce('codex', sessionId, claim.claimId, true)
+  else sessions.delete(sessionId)
   return {
     access_token: tok.access_token,
     refresh_token: tok.refresh_token,

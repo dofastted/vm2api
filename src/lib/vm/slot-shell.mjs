@@ -24,6 +24,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { ensureRemoteOfficialCredentialLink, reconcileSlotCredentials } from '../cluster/remote-slot-files.mjs'
 import { officialCcUidGid } from './vm-runtime.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { OneTimeAuthRepo } from '../db/repos/one-time-auth-repo.mjs'
 
 const SHELL_RE = /^\/api\/panel\/vms\/([^/]+)\/shell$/
 const TICKET_TTL_MS = 30_000
@@ -376,8 +378,10 @@ export function createSlotShell({
   importOauth = null,
   authLoginReady = null,
   upgradeLoginReady = null,
+  db,
 } = {}) {
   const tickets = new Map()
+  const authState = isKubernetesMode() ? new OneTimeAuthRepo(db) : null
   const liveTokens = new Set()
   let sessions = 0
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 })
@@ -408,6 +412,21 @@ export function createSlotShell({
     }
     if (draining) return refuse(503, 'control_plane_draining', 'Control plane is draining')
     if (sessions >= MAX_SESSIONS) return refuse(429, 'shell_limit', `终端会话已达上限 ${MAX_SESSIONS}`)
+    if (authState) {
+      try {
+        return {
+          ok: true,
+          ...(await authState.issueShell('slot', vm.id, {
+            scope: login ? 'login' : 'ops',
+            ttlMs: TICKET_TTL_MS,
+            maxTickets: MAX_TICKETS,
+          })),
+        }
+      } catch (error) {
+        if (error.code === 'shell_limit') return refuse(429, 'shell_limit', '终端 ticket 过多，请稍后再试')
+        throw error
+      }
+    }
     const now = Date.now()
     for (const [t, v] of tickets) if (v.exp <= now) tickets.delete(t)
     if (tickets.size >= MAX_TICKETS) return refuse(429, 'shell_limit', '终端 ticket 过多，请稍后再试')
@@ -416,8 +435,12 @@ export function createSlotShell({
     return { ok: true, ticket, expires_in: TICKET_TTL_MS / 1000 }
   }
 
-  /** Single use: the ticket is burned whether or not it matches. */
-  function consumeTicket(ticket, vmId) {
+  /** Shared tickets reject a wrong VM or mode without consuming the grant. */
+  function consumeTicket(ticket, vmId, login) {
+    if (authState)
+      return authState
+        .consumeShell('slot', ticket, vmId, { scope: login ? 'login' : 'ops' })
+        .then((entry) => (entry ? { vmId: entry.resourceId, login: entry.scope === 'login' } : null))
     const entry = tickets.get(ticket)
     tickets.delete(ticket)
     if (!entry || entry.vmId !== vmId || entry.exp <= Date.now()) return null
@@ -440,60 +463,77 @@ export function createSlotShell({
     }
     const vmId = decodeURIComponent(sm[1])
     const ticket = url.searchParams.get('ticket') || ''
-    const entry = consumeTicket(ticket, vmId)
-    if (!entry) {
-      rejectUpgrade(socket, 401, 'Unauthorized')
-      return true
-    }
-    const vm = getVm(projectRoot, vmId)
-    if (!vm || isCodexVm(vm)) {
-      rejectUpgrade(socket, 404, 'Not Found')
-      return true
-    }
     const requestedLogin = url.searchParams.get('login') === '1'
-    if (requestedLogin !== !!entry.login) {
-      rejectUpgrade(socket, 409, 'Conflict')
-      return true
-    }
-    const login = !!entry.login
-    const accept = () => {
-      if (draining) {
-        rejectUpgrade(socket, 503, 'Service Unavailable')
-        return
-      }
-      if (sessions >= MAX_SESSIONS) {
-        rejectUpgrade(socket, 429, 'Too Many Requests')
-        return
-      }
-      sessions += 1
-      const size = {
-        cols: clampInt(url.searchParams.get('cols'), 10, 500, 80),
-        rows: clampInt(url.searchParams.get('rows'), 5, 200, 24),
-        login,
-      }
-      wss.handleUpgrade(req, socket, head, (ws) => {
-        track(new Promise((resolve) => ws.once('close', resolve)))
-        track(attach(ws, vm, size))
-      })
-    }
-    if (!login) {
-      accept()
-      return true
-    }
-    track(
-      Promise.resolve()
-        .then(() => (upgradeLoginReady || authLoginReady || assertAuthLoginReady)(projectRoot, vm))
-        .then(accept, (err) =>
-          rejectUpgrade(
-            socket,
-            409,
-            String(err?.message || 'Conflict')
-              .replace(/[\r\n]+/g, ' ')
-              .slice(0, 120) || 'Conflict',
+    if (authState) {
+      track(
+        consumeTicket(ticket, vmId, requestedLogin)
+          .then(acceptTicket)
+          .catch((error) =>
+            rejectUpgrade(
+              socket,
+              error.code === 'shell_ticket_scope_mismatch' ? 409 : 503,
+              error.code === 'shell_ticket_scope_mismatch' ? 'Conflict' : 'Service Unavailable',
+            ),
           ),
-        ),
-    )
-    return true
+      )
+      return true
+    }
+    return acceptTicket(consumeTicket(ticket, vmId))
+
+    function acceptTicket(entry) {
+      if (!entry) {
+        rejectUpgrade(socket, 401, 'Unauthorized')
+        return true
+      }
+      const vm = getVm(projectRoot, vmId)
+      if (!vm || isCodexVm(vm)) {
+        rejectUpgrade(socket, 404, 'Not Found')
+        return true
+      }
+      if (requestedLogin !== !!entry.login) {
+        rejectUpgrade(socket, 409, 'Conflict')
+        return true
+      }
+      const login = !!entry.login
+      const accept = () => {
+        if (draining || socket.destroyed) {
+          rejectUpgrade(socket, 503, 'Service Unavailable')
+          return
+        }
+        if (sessions >= MAX_SESSIONS) {
+          rejectUpgrade(socket, 429, 'Too Many Requests')
+          return
+        }
+        sessions += 1
+        const size = {
+          cols: clampInt(url.searchParams.get('cols'), 10, 500, 80),
+          rows: clampInt(url.searchParams.get('rows'), 5, 200, 24),
+          login,
+        }
+        wss.handleUpgrade(req, socket, head, (ws) => {
+          track(new Promise((resolve) => ws.once('close', resolve)))
+          track(attach(ws, vm, size))
+        })
+      }
+      if (!login) {
+        accept()
+        return true
+      }
+      track(
+        Promise.resolve()
+          .then(() => (upgradeLoginReady || authLoginReady || assertAuthLoginReady)(projectRoot, vm))
+          .then(accept, (err) =>
+            rejectUpgrade(
+              socket,
+              409,
+              String(err?.message || 'Conflict')
+                .replace(/[\r\n]+/g, ' ')
+                .slice(0, 120) || 'Conflict',
+            ),
+          ),
+      )
+      return true
+    }
   }
 
   async function attach(ws, vm, size) {
