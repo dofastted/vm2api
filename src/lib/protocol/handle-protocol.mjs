@@ -513,7 +513,7 @@ export function createHandleProtocol(deps) {
     return {
       onExecutionStart: async (execution) => {
         await observeExecution(req, admission, { ...execution, started: true, ended: false })
-        await candidate.bindExecution?.(execution)
+        return await candidate.bindExecution?.(execution)
       },
       onExecutionEnd: async (execution) => {
         await candidate.completeExecution?.(execution)
