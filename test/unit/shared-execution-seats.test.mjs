@@ -130,3 +130,13 @@ test('seat release and execution release roll back together and can be retried',
   await gate.release()
   assert.equal((await first.getSeat(candidate().seatKey)).inflight, 0)
 })
+
+test('a denied move preserves the original grace seat and its generation', async (t) => {
+  const [first, second] = await replicas(t)
+  const gate = await first.tryReserve(candidate({ seatGraceMs: 1000 }))
+  await gate.release()
+  const before = await first.getSeat(candidate().seatKey)
+  const denied = await second.tryReserve(candidate({ vmId: 'vm-2', moveSeat: true, vmLimit: 0 }))
+  assert.equal(denied.code, 'vm_concurrency_limit')
+  assert.deepEqual(await first.getSeat(candidate().seatKey), before)
+})
