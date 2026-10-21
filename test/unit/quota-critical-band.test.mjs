@@ -28,8 +28,8 @@ function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'kin-quota-band-'))
 }
 
-function quota(extra = {}) {
-  return new AccountQuota({
+async function quota(extra = {}) {
+  return await new AccountQuota({
     dataDir: tmpDir(),
     config: {
       quota: {
@@ -48,7 +48,7 @@ function quota(extra = {}) {
         max: { limit_5h: 0.8, limit_7d: 0.8, max_concurrency: 2 },
       },
     },
-  })
+  }).init()
 }
 
 const smallRisk = {
@@ -77,8 +77,8 @@ function setUtil(q, id, { u5 = null, u7 = null } = {}) {
   q.ingestHeaders(id, headers)
 }
 
-test('79% admits a small request and rejects a single large cold with inflight=0', () => {
-  const q = quota()
+test('79% admits a small request and rejects a single large cold with inflight=0', async () => {
+  const q = await quota()
   setUtil(q, 'a', { u5: 0.79 })
   assert.equal(q.canAccept('a', { requestRisk: smallRisk }).ok, true)
   const large = q.canAccept('a', { requestRisk: largeColdRisk })
@@ -88,8 +88,8 @@ test('79% admits a small request and rejects a single large cold with inflight=0
   assert.equal(q.inflight.get('a') || 0, 0)
 })
 
-test('5h and 7d bands are independent', () => {
-  const q = quota()
+test('5h and 7d bands are independent', async () => {
+  const q = await quota()
   setUtil(q, 'five', { u5: 0.79, u7: 0.2 })
   assert.equal(q.canAccept('five', { requestRisk: largeColdRisk }).reason, 'quota_guard_request_too_large')
   assert.equal(q.canAccept('five', { requestRisk: smallRisk }).ok, true)
@@ -102,8 +102,8 @@ test('5h and 7d bands are independent', () => {
   assert.equal(q.canAccept('open', { requestRisk: largeColdRisk }).ok, true)
 })
 
-test('past the line plus overshoot still blocks ordinary requests', () => {
-  const q = quota()
+test('past the line plus overshoot still blocks ordinary requests', async () => {
+  const q = await quota()
   setUtil(q, 'line', { u5: 0.8 })
   assert.equal(q.canAccept('line', { requestRisk: smallRisk }).ok, true, 'at the line, inside the 5% overshoot')
   setUtil(q, 'full', { u5: 0.85 })
@@ -112,8 +112,8 @@ test('past the line plus overshoot still blocks ordinary requests', () => {
   assert.equal(q.canAccept('over').reason, 'quota_5h_safety')
 })
 
-test('failed or cancelled release does not leave a reservation or stale band debt', () => {
-  const q = quota()
+test('failed or cancelled release does not leave a reservation or stale band debt', async () => {
+  const q = await quota()
   setUtil(q, 'rel', { u5: 0.79 })
   assert.equal(q.tryAcquire('rel', { requestRisk: smallRisk }).ok, true)
   assert.equal(q.inflight.get('rel'), 1)
@@ -123,8 +123,8 @@ test('failed or cancelled release does not leave a reservation or stale band deb
   assert.equal(q.canAccept('rel', { requestRisk: smallRisk }).ok, true)
 })
 
-test('stale reading after an in-band settle blocks the next large request', () => {
-  const q = quota()
+test('stale reading after an in-band settle blocks the next large request', async () => {
+  const q = await quota()
   setUtil(q, 'stale', { u5: 0.79 })
   assert.equal(q.tryAcquire('stale', { requestRisk: smallRisk }).ok, true)
   q.noteBandSettled('stale')
@@ -135,8 +135,8 @@ test('stale reading after an in-band settle blocks the next large request', () =
   assert.equal(q.canAccept('stale', { requestRisk: smallRisk }).reason, 'quota_5h_safety')
 })
 
-test('a same-percent header after settle keeps the stale large-cold block', () => {
-  const q = quota()
+test('a same-percent header after settle keeps the stale large-cold block', async () => {
+  const q = await quota()
   setUtil(q, 'lag', { u5: 0.78 })
   assert.equal(q.tryAcquire('lag', { requestRisk: smallRisk }).ok, true)
   q.noteBandSettled('lag')
@@ -145,8 +145,8 @@ test('a same-percent header after settle keeps the stale large-cold block', () =
   assert.equal(q.canAccept('lag', { requestRisk: largeColdRisk }).reason, 'quota_guard_request_too_large')
 })
 
-test('official usage refresh clears stale band debt', () => {
-  const q = quota()
+test('official usage refresh clears stale band debt', async () => {
+  const q = await quota()
   setUtil(q, 'off', { u5: 0.79 })
   assert.equal(q.tryAcquire('off', { requestRisk: smallRisk }).ok, true)
   q.noteBandSettled('off')
@@ -207,7 +207,7 @@ class RuntimeRepo {
 test('scheduler switches using requestRisk on the quotaRequest body estimate', async (t) => {
   const root = schedulerProject()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const accountQuota = quota()
+  const accountQuota = await quota()
   setUtil(accountQuota, 'account-1', { u5: 0.79 })
   setUtil(accountQuota, 'account-2', { u5: 0.2 })
   const orig = accountQuota.canAccept.bind(accountQuota)
@@ -234,7 +234,7 @@ test('scheduler switches using requestRisk on the quotaRequest body estimate', a
 test('all in-band accounts yield quota_guard_request_too_large', async (t) => {
   const root = schedulerProject()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const accountQuota = quota()
+  const accountQuota = await quota()
   setUtil(accountQuota, 'account-1', { u5: 0.79 })
   setUtil(accountQuota, 'account-2', { u5: 0.77 })
   const orig = accountQuota.canAccept.bind(accountQuota)
@@ -314,7 +314,7 @@ test('token estimate counts a long prompt as large cold on first turn', () => {
   assert.equal(risk.largeCold, true)
 })
 
-test('output ceiling does not make a short prompt large in the critical band', () => {
+test('output ceiling does not make a short prompt large in the critical band', async () => {
   clearCachePrefixSessions()
   const account = 'band'
   const session = 'sess-demo'
@@ -358,7 +358,7 @@ test('output ceiling does not make a short prompt large in the critical band', (
   assert.equal(omitted.largeCold, false)
   assert.ok(omitted.uncachedTokens < DEFAULT_LARGE_COLD_UNCACHED_TOKENS)
 
-  const q = quota()
+  const q = await quota()
   setUtil(q, account, { u5: 0.79 })
   const warmReq = { body: turn(2), sessionId: session }
   assert.equal(q.canAccept(account, { quotaRequest: warmReq }).ok, true)
@@ -381,7 +381,7 @@ test('output ceiling does not make a short prompt large in the critical band', (
   )
 })
 
-test('stale band still blocks a warm turn whose new user text is itself large', () => {
+test('stale band still blocks a warm turn whose new user text is itself large', async () => {
   clearCachePrefixSessions()
   const base = {
     model: 'claude-opus-5-5',
@@ -402,7 +402,7 @@ test('stale band still blocks a warm turn whose new user text is itself large', 
   assert.equal(risk.cold, false)
   assert.equal(risk.largeCold, false)
   assert.ok(risk.uncachedTokens >= DEFAULT_LARGE_COLD_UNCACHED_TOKENS)
-  const q = quota()
+  const q = await quota()
   setUtil(q, 'band', { u5: 0.79 })
   const quotaRequest = { body: extended, sessionId: 'sess' }
   assert.equal(q.canAccept('band', { quotaRequest }).ok, true)
@@ -423,9 +423,9 @@ test('quota_guard_request_too_large stays a 429 and is not rewritten to pool_una
   assert.equal(rewritten.body.error.code, 'quota_guard_request_too_large')
 })
 
-test('prompt estimate is skipped below the band and walked once for in-band accounts', () => {
+test('prompt estimate is skipped below the band and walked once for in-band accounts', async () => {
   resetPromptEstimateStats()
-  const q = quota()
+  const q = await quota()
   setUtil(q, 'low', { u5: 0.5, u7: 0.2 })
   setUtil(q, 'band-a', { u5: 0.79 })
   setUtil(q, 'band-b', { u5: 0.76 })
@@ -445,15 +445,15 @@ test('prompt estimate is skipped below the band and walked once for in-band acco
   q.release('band-a')
 })
 
-test('admission and the panel agree near the gate (vm-10: pro, 7d 90% of a 95% line)', () => {
+test('admission and the panel agree near the gate (vm-10: pro, 7d 90% of a 95% line)', async () => {
   const tier = { limit_5h: 0.95, limit_7d: 0.95, max_concurrency: 2 }
-  const q = new AccountQuota({
+  const q = await new AccountQuota({
     dataDir: tmpDir(),
     config: {
       quota: { block_on_5h: true, block_on_7d: true, critical_band: 0.05, gate_overshoot: 0.05 },
       tiers: { default: tier, pro: tier, max: tier },
     },
-  })
+  }).init()
   const panel = (u7) => {
     q.ingestHeaders('vm10', {
       'anthropic-ratelimit-unified-5h-utilization': '0.12',

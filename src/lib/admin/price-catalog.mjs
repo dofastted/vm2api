@@ -2,7 +2,7 @@
  * Three-layer price catalog: override > models.dev > builtin.
  * ID matching is exact / alias / Claude date-strip — no fuzzy family regex.
  */
-import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { RuntimeSettings as SettingsRepo } from '../db/settings-state.mjs'
 import { BUILTIN_ALIASES, BUILTIN_RATES, BUILTIN_SOURCE } from './builtin-rates.mjs'
 
 export const PRICE_FIELDS = ['input', 'output', 'cache_read', 'cache_5m', 'cache_1h']
@@ -27,6 +27,7 @@ let injectedFetch = null
 let backgroundRefresh = true
 let catalogMemo = null
 let refreshInflight = null
+let refreshPaused = false
 
 export function setPriceCatalogTestHooks(hooks = null) {
   if (!hooks) {
@@ -296,12 +297,12 @@ function readOverrides() {
   return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
 }
 
-function persistOverrides(next) {
-  settingsRepo().set(SETTINGS_OVERRIDES, next)
+async function persistOverrides(next) {
+  await settingsRepo().set(SETTINGS_OVERRIDES, next)
 }
 
-function persistSnapshot(next) {
-  settingsRepo().set(SETTINGS_SNAPSHOT, next)
+async function persistSnapshot(next) {
+  await settingsRepo().set(SETTINGS_SNAPSHOT, next)
 }
 
 function statusOf(snap) {
@@ -366,7 +367,7 @@ export async function syncModelsDev({ fetchImpl } = {}) {
       anthropic: parsed.anthropic,
       openai: parsed.openai,
     }
-    persistSnapshot(snap)
+    await persistSnapshot(snap)
     invalidatePriceCatalog()
     return statusOf(snap)
   } catch (e) {
@@ -377,7 +378,7 @@ export async function syncModelsDev({ fetchImpl } = {}) {
       anthropic: prev.anthropic || {},
       openai: prev.openai || {},
     }
-    persistSnapshot(snap)
+    await persistSnapshot(snap)
     invalidatePriceCatalog()
     return statusOf(snap)
   }
@@ -394,7 +395,7 @@ function canPersist() {
 }
 
 export function maybeRefreshModelsDev({ now } = {}) {
-  if (!backgroundRefresh) return
+  if (!backgroundRefresh || refreshPaused) return
   if (!canPersist()) return
   if (refreshInflight) return
   const snap = readSnapshot()
@@ -402,11 +403,20 @@ export function maybeRefreshModelsDev({ now } = {}) {
   const t = now ?? Date.now()
   if (fetchedAt && Number.isFinite(fetchedAt) && t - fetchedAt < MODELS_DEV_STALE_MS) return
   refreshInflight = Promise.resolve()
-    .then(() => syncModelsDev())
+    .then(async () => await syncModelsDev())
     .catch(() => {})
     .finally(() => {
       refreshInflight = null
     })
+}
+
+export async function pausePriceCatalog() {
+  refreshPaused = true
+  while (refreshInflight) await refreshInflight
+}
+
+export function resumePriceCatalog() {
+  refreshPaused = false
 }
 
 function storedPrice(entry, platform) {
@@ -584,7 +594,7 @@ export function listPriceOverrides() {
   return clone(readOverrides())
 }
 
-export function setPriceOverride(key, price) {
+export async function setPriceOverride(key, price) {
   const k = String(key || '').trim()
   if (!OVERRIDE_KEY_RE.test(k) || k === '*/*') {
     return { ok: false, error: 'invalid override key' }
@@ -592,7 +602,7 @@ export function setPriceOverride(key, price) {
   const overrides = { ...readOverrides() }
   if (price == null) {
     delete overrides[k]
-    persistOverrides(overrides)
+    await persistOverrides(overrides)
     invalidatePriceCatalog()
     return { ok: true }
   }
@@ -600,7 +610,7 @@ export function setPriceOverride(key, price) {
   const v = validatePrice(price, { platform: plat })
   if (!v.ok) return { ok: false, error: v.error }
   overrides[k] = { ...v.price, updated_at: new Date().toISOString() }
-  persistOverrides(overrides)
+  await persistOverrides(overrides)
   invalidatePriceCatalog()
   return { ok: true }
 }

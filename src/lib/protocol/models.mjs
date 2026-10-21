@@ -10,7 +10,6 @@ import {
   getModelEntry,
   getModelPolicy,
   getPolicyCatalogIds,
-  loadModelPolicy,
   seedDefaultPolicy,
 } from './model-policy.mjs'
 import { hasClaudeCode1mSuffix, stripClaudeCode1mSuffix } from './context-1m.mjs'
@@ -35,7 +34,6 @@ export function seedModelCatalog() {
   if (catalogIsTestPinned()) return cache
   let ids = [...SEED_MODEL_IDS]
   try {
-    loadModelPolicy()
     const fromPolicy = getPolicyCatalogIds()
     if (fromPolicy.length) ids = fromPolicy
   } catch {}
@@ -65,9 +63,6 @@ function listGptPublicModels() {
  */
 export function gatewayModelCatalog({ groupType = 'all' } = {}) {
   seedModelCatalog()
-  try {
-    loadModelPolicy()
-  } catch {}
   const gpt = groupType === 'anthropic' ? [] : listGptPublicModels()
   const claude = groupType === 'openai' ? [] : listOfficialModels()
   return {
@@ -142,7 +137,6 @@ export function latestIdForUndatedAlias(raw, ids) {
 
 function resolvePolicyAliasToCatalog(raw, ids) {
   try {
-    loadModelPolicy()
     const policy = getModelPolicy()
     const lower = String(raw || '').toLowerCase()
     const candidates = []
@@ -234,9 +228,6 @@ export function clearModelsCache() {
 }
 
 export function listOfficialModels() {
-  try {
-    loadModelPolicy()
-  } catch {}
   const ids = filterPublicModelIds(cache.ids || [])
   return ids.map((id) => {
     let display = id

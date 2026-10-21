@@ -62,11 +62,11 @@ function similarityRatio(value) {
   return n > 1 ? n / 100 : n
 }
 
-export function commitProtocolBlock(decision, { repo, devices, policy, requestId } = {}) {
+export async function commitProtocolBlock(decision, { repo, devices, policy, requestId } = {}) {
   if (!decision || decision.action !== 'block') return
   if (decision.kind === 'device') {
     try {
-      devices?.hit?.(decision.deviceId)
+      await devices?.hit?.(decision.deviceId)
     } catch {
       /* counter is best-effort */
     }
@@ -74,14 +74,14 @@ export function commitProtocolBlock(decision, { repo, devices, policy, requestId
   }
   if ((decision.kind === 'exact' || decision.kind === 'similar') && decision.fingerprint) {
     try {
-      repo?.hit?.(decision.fingerprint)
+      await repo?.hit?.(decision.fingerprint)
     } catch {
       /* counter is best-effort */
     }
   }
   if (decision.remember && policy?.enabled && repo && decision.fingerprint) {
     try {
-      repo.remember?.({
+      await repo.remember?.({
         fingerprint: decision.fingerprint,
         model: decision.model || '',
         requestId: requestId || null,
@@ -96,7 +96,7 @@ export function commitProtocolBlock(decision, { repo, devices, policy, requestId
   }
   if (!decision.banDevice || !policy?.enabled || !policy?.device_block_enabled || !decision.deviceId) return
   try {
-    deviceStore(devices)?.block?.({
+    await deviceStore(devices)?.block?.({
       deviceId: decision.deviceId,
       requestId: requestId || null,
       fingerprint: decision.fingerprint || null,
@@ -233,7 +233,7 @@ export async function evaluateProtocolIntercept({
   }
 
   if (policy?.enabled && repo && typeof repo.get === 'function') {
-    let match = matchStoredRefusal({
+    let match = await matchStoredRefusal({
       inbound,
       body,
       headers,
@@ -317,6 +317,6 @@ export async function evaluateProtocolIntercept({
 export async function runProtocolIntercept(ctx = {}) {
   const decision = await evaluateProtocolIntercept(ctx)
   if (decision.action !== 'block') return decision
-  commitProtocolBlock(decision, ctx)
+  await commitProtocolBlock(decision, ctx)
   return decision
 }

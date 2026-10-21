@@ -113,6 +113,9 @@ export function createCliNodeGuard({
       timer = setInterval(() => void tick(), intervalMs)
       timer.unref?.()
     },
+    async flush() {
+      while (inTick) await new Promise((resolve) => setTimeout(resolve, 10))
+    },
     stop() {
       if (timer) clearInterval(timer)
       timer = null

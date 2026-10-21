@@ -26,7 +26,7 @@ import { PoolScheduler, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
 import { FailoverRunner } from '../pool/failover-runner.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { RateLimitService } from '../pool/rate-limit-service.mjs'
-import { AccountRuntimeRepo } from '../db/repos/account-runtime-repo.mjs'
+import { SchedulingRuntime } from '../pool/scheduling-runtime.mjs'
 import { RequestAttemptsRepo } from '../db/repos/request-attempts-repo.mjs'
 import { normalizeOfficialCcConfig } from '../oauth/official-cc-bootstrap.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
@@ -429,7 +429,7 @@ export function createRoutingRuntime(ctx) {
     return applied
   }
 
-  function persistRoutingPatch(body = {}) {
+  async function persistRoutingPatch(body = {}) {
     const hasCodexQuota = body?.codex && Object.prototype.hasOwnProperty.call(body.codex, 'quota')
     if (hasCodexQuota) validateOpenAIQuotaPatch(body.codex.quota)
     validateInferenceWebsocketPatch(body)
@@ -508,7 +508,7 @@ export function createRoutingRuntime(ctx) {
     syncTierDefaultsIntoRouting()
     if (body.logging) {
       routingConfig.logging = normalizeLoggingConfig({ ...(routingConfig.logging || {}), ...body.logging })
-      ctx.requestLog.setConfig({
+      await ctx.requestLog.setConfig({
         mode: routingConfig.logging.mode,
         retainDays: routingConfig.logging.retain_days,
         debugRetainDays: routingConfig.logging.debug_retain_days,
@@ -682,15 +682,15 @@ export function createRoutingRuntime(ctx) {
     })
   }
 
-  function initPoolRuntime() {
+  async function initPoolRuntime() {
     const routingConfig = getRouting()
-    const runtimeRepo = new AccountRuntimeRepo()
+    const runtimeRepo = await new SchedulingRuntime().init()
     const attemptsRepo = new RequestAttemptsRepo()
     setRuntimeRepo(runtimeRepo)
     setAttemptsRepo(attemptsRepo)
     ctx.accountQuota.attachRuntimeRepo(runtimeRepo)
     try {
-      attemptsRepo.cleanup(routingConfig?.logging?.retain_days || 7)
+      await attemptsRepo.cleanup(routingConfig?.logging?.retain_days || 7)
     } catch {}
     const poolScheduler = new PoolScheduler({
       projectRoot: ctx.cfg.paths.project,

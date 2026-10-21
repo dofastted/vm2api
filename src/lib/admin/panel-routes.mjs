@@ -1,3 +1,4 @@
+import { flushPendingWrites } from '../db/pending-writes.mjs'
 /**
  * /admin and /api/panel routes. Login / logout / me and { ok, data }
  * envelopes are unchanged; slot start/reload go through startSlotReady.
@@ -26,7 +27,7 @@ import {
 } from '../protocol/jev-intercept.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
-import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { RuntimeSettings as SettingsRepo } from '../db/settings-state.mjs'
 import { parseCodexImportPayload, upsertCodexAccount, readCodexAccounts } from '../vm/codex-slot.mjs'
 import { generateAuthUrl, exchangeAuthCode, normalizeOauthFlavor } from '../oauth/oauth-auth-url.mjs'
 import { sessionKeyToOAuth, panelImportErrorPayload } from '../oauth/cookie-auth.mjs'
@@ -173,7 +174,7 @@ import { GATEWAY_CAPABILITIES } from '../vm/execution-context.mjs'
 import { withVmLock, atomicWriteJson, isValidVmId, invalidateVmSlotReadCache } from '../vm/vm-file.mjs'
 import { snapshotDatabaseMetrics } from '../db/database-metrics.mjs'
 import { getUsageCache } from '../oauth/usage-cache.mjs'
-import { getDb, getDbPath } from '../db/database.mjs'
+import { getDb } from '../db/database.mjs'
 import {
   readLocalVersion,
   loadChangelog,
@@ -182,7 +183,7 @@ import {
   startHostUpgrade,
 } from './release.mjs'
 import { downloadReleaseKernel, kernelReleaseHttpStatus } from './release-kernel.mjs'
-import { clearActiveVmFromDb, removeVmFromDb } from '../vm/vm-db-sync.mjs'
+import { clearActiveVmFromDb, removeVmFromDb, flushVmDbSync } from '../vm/vm-db-sync.mjs'
 import { normalizeCredentialMode } from '../oauth/credential-mode.mjs'
 import { reloadActiveVm } from '../core/config.mjs'
 import {
@@ -300,7 +301,7 @@ function clusterNodesOf(ctx) {
   }
 }
 
-function collectOnboardingFacts(req, ctx) {
+async function collectOnboardingFacts(req, ctx) {
   const ident = panelIdentity(req)
   const ownerUserId = ident.role === 'user' ? req.panelUserId : null
   const vms = listVms(ctx.cfg.paths.project, ctx.routingConfig)
@@ -311,24 +312,24 @@ function collectOnboardingFacts(req, ctx) {
     nodes: clusterNodesOf(ctx),
   })
   const visible = filterVmsForPanel(vms, { role: ident.role, userId: ownerUserId })
-  const keys = ctx.apiKeyStore.snapshot().keys || []
+  const keys = (await ctx.apiKeyStore.snapshot()).keys || []
   const mine =
     ident.role === 'user' ? keys.filter((k) => normalizeOwnerId(k.user_id) === normalizeOwnerId(req.panelUserId)) : keys
   const admin = getPanelAdmin()
   return {
     envPassword: admin.password,
-    envAdmin: ctx.panelUsers.getByUsername(admin.username),
+    envAdmin: await ctx.panelUsers.getByUsername(admin.username),
     proxyCount: (snap.proxies || []).length,
     ...vmStepFacts(visible),
     activeKeyCount: mine.filter((k) => k.status === 'active').length,
-    hasFirstRequest: ctx.requestLog.hasSuccessfulRequest({ owner_user_id: ownerUserId }),
+    hasFirstRequest: await ctx.requestLog.hasSuccessfulRequest({ owner_user_id: ownerUserId }),
   }
 }
 
-function onboardingPayloadFor(req, ctx) {
+async function onboardingPayloadFor(req, ctx) {
   const user = onboardingUserOf(req)
   const role = onboardingRoleOf(req)
-  const rec = recordOf(loadOnboardingState(new SettingsRepo()), user)
+  const rec = recordOf(await loadOnboardingState(new SettingsRepo()), user)
   return buildOnboardingPayload({
     user,
     role,
@@ -337,7 +338,7 @@ function onboardingPayloadFor(req, ctx) {
     guide_used: rec.guide_used,
     // Onboarding matches /health: base_url only when PUBLIC_* is configured; else null → browser origin.
     base_url: process.env.PUBLIC_BASE_URL || null,
-    facts: collectOnboardingFacts(req, ctx),
+    facts: await collectOnboardingFacts(req, ctx),
   })
 }
 
@@ -591,7 +592,27 @@ function slotProxyHint(px = {}, label = null) {
 export function createPanelHandler(ctx) {
   // A checkout can change under a live Node process; report its boot version.
   const runningVersion = readLocalVersion(ctx.cfg?.paths?.project)
-  const json = (...args) => ctx.json(...args)
+  const json = (...args) => {
+    const state = args[0]?._panelResponseState
+    if (state) {
+      state.response = args
+      return
+    }
+    return ctx.json(...args)
+  }
+  async function flushPanelWrites() {
+    for (const store of [ctx.accountQuota, ctx.stickyRouter, ctx.proxyPool, ctx.runtimeRepo]) {
+      await store?.writes?.flush?.()
+    }
+    await flushVmDbSync()
+  }
+  async function persistenceFailure(res, error) {
+    await ctx.onPersistenceFailure?.(error)
+    return ctx.json(res, 503, {
+      ok: false,
+      error: { code: 'database_persistence_failed', message: 'Database persistence failed; maintenance is required' },
+    })
+  }
   const hostUnsupported = (res, vm, cap) => {
     if (slotHost(vm).supports(cap)) return false
     json(res, 409, {
@@ -603,7 +624,7 @@ export function createPanelHandler(ctx) {
   const readBody = (...args) => ctx.readBody(...args)
   const readRawBody = (...args) => (ctx.readRawBody || defaultReadRawBody)(...args)
   const refreshCluster = ctx.refreshClusterSlotPayloads || refreshClusterSlotPayloads
-  const requireAuth = (...args) => ctx.requireAuth(...args)
+  const requireAuth = async (...args) => await ctx.requireAuth(...args)
   const cfg = ctx.cfg
   const routingConfigPath = ctx.routingConfigPath
   const stickyRouter = ctx.stickyRouter
@@ -617,13 +638,13 @@ export function createPanelHandler(ctx) {
   const vmTestSchedule = ctx.vmTestSchedule
   const backupService = ctx.backupService
   const stats = ctx.stats
-  const persistRoutingPatch = (...args) => ctx.persistRoutingPatch(...args)
+  const persistRoutingPatch = async (...args) => ctx.persistRoutingPatch(...args)
   const applyVmConcurrency = (...args) => ctx.applyVmConcurrency(...args)
   const applyVmRpm = (...args) => ctx.applyVmRpm(...args)
   const applyVmSessionSlots = (...args) => ctx.applyVmSessionSlots(...args)
   const inheritVmScheduling = (...args) => ctx.inheritVmScheduling(...args)
   const applyVmQuotaOverride = (...args) => ctx.applyVmQuotaOverride(...args)
-  const initPoolRuntime = (...args) => ctx.initPoolRuntime(...args)
+  const initPoolRuntime = async (...args) => ctx.initPoolRuntime(...args)
   const poolSchedulerConfig = (...args) => ctx.poolSchedulerConfig(...args)
   const commitImportedOauth = (...args) => ctx.commitImportedOauth(...args)
   const requireSlotProxy = (...args) => ctx.requireSlotProxy(...args)
@@ -639,8 +660,8 @@ export function createPanelHandler(ctx) {
     setVmSchedulable(cfg.paths.project, vmId, true)
   }
 
-  function fillTimezoneFromExit(id) {
-    return fillVmTimezoneFromExit(cfg.paths.project, proxyPool, id)
+  async function fillTimezoneFromExit(id) {
+    return await fillVmTimezoneFromExit(cfg.paths.project, proxyPool, id)
   }
 
   /**
@@ -752,7 +773,7 @@ export function createPanelHandler(ctx) {
       return json(res, 200, panel.ok({ schedule: vmTestSchedule.get(id) }))
     }
     if (req.method === 'DELETE') {
-      vmTestSchedule.remove(id)
+      await vmTestSchedule.remove(id)
       return json(res, 200, panel.ok({ schedule: null }))
     }
     let body
@@ -765,7 +786,7 @@ export function createPanelHandler(ctx) {
       })
     }
     try {
-      return json(res, 200, panel.ok({ schedule: vmTestSchedule.save(id, body) }))
+      return json(res, 200, panel.ok({ schedule: await vmTestSchedule.save(id, body) }))
     } catch (error) {
       const typed = error instanceof VmTestScheduleError
       return json(res, typed ? error.status : 500, {
@@ -793,10 +814,10 @@ export function createPanelHandler(ctx) {
     }
     try {
       if (body == null || body.schedule == null) {
-        vmTestSchedule.clearDefaultTemplate()
+        await vmTestSchedule.clearDefaultTemplate()
         return json(res, 200, panel.ok({ schedule: null }))
       }
-      return json(res, 200, panel.ok({ schedule: vmTestSchedule.saveDefaultTemplate(body.schedule) }))
+      return json(res, 200, panel.ok({ schedule: await vmTestSchedule.saveDefaultTemplate(body.schedule) }))
     } catch (error) {
       const typed = error instanceof VmTestScheduleError
       return json(res, typed ? error.status : 500, {
@@ -838,7 +859,7 @@ export function createPanelHandler(ctx) {
       body = { ...body, vm_ids: vmIds }
     }
     try {
-      const result = vmTestSchedule.syncSchedules({
+      const result = await vmTestSchedule.syncSchedules({
         scope: body?.scope,
         vmIds: body?.vm_ids,
         schedule: body?.schedule,
@@ -905,17 +926,17 @@ export function createPanelHandler(ctx) {
     return cfg.distill
   }
 
-  function refusalGuardSnapshot() {
+  async function refusalGuardSnapshot() {
     const settings = new SettingsRepo()
     const repo = new RefusalGuardsRepo()
     const devices = new RefusalDeviceBlocksRepo()
     const read = (key, fallback) => settings.get(key, fallback)
     return {
       ...refusalGuardPolicy(read),
-      count: repo.count(),
-      items: repo.list(),
-      device_count: devices.count(),
-      devices: devices.list(),
+      count: await repo.count(),
+      items: await repo.list(),
+      device_count: await devices.count(),
+      devices: await devices.list(),
     }
   }
 
@@ -1104,14 +1125,14 @@ export function createPanelHandler(ctx) {
     })
   }
 
-  function restoreRoutingRuntime(previous) {
+  async function restoreRoutingRuntime(previous) {
     ctx.routingConfig = previous
     setManualScheduleWins(ctx.routingConfig.pool?.manual_schedule_wins)
     ctx.healthMonitor?.setConfig(ctx.routingConfig.health_probe)
     ctx.usageProbeMonitor?.setConfig(ctx.routingConfig.usage_probe)
     ctx.notifyMonitor?.setConfig(ctx.routingConfig.notify)
     if (ctx.routingConfig.logging) {
-      requestLog.setConfig({
+      await requestLog.setConfig({
         mode: ctx.routingConfig.logging.mode,
         retainDays: ctx.routingConfig.logging.retain_days,
         debugRetainDays: ctx.routingConfig.logging.debug_retain_days,
@@ -1130,16 +1151,16 @@ export function createPanelHandler(ctx) {
     const target = normalizeInferenceConfig({ ...(ctx.routingConfig.inference || {}), ...body.inference }).engine
     if (previous === target) return { ok: true, changed: false, items: [] }
     const previousRoutingConfig = structuredClone(ctx.routingConfig)
-    return switchInheritedInferenceEngines({
+    return await switchInheritedInferenceEngines({
       projectRoot: cfg.paths.project,
       previousEngine: previous,
       targetEngine: target,
-      commit: () => {
+      commit: async () => {
         try {
-          return persistRoutingPatch(body)
+          return await persistRoutingPatch(body)
         } catch (error) {
-          restoreRoutingRuntime(previousRoutingConfig)
-          if (body.pool || body.failover) initPoolRuntime()
+          await restoreRoutingRuntime(previousRoutingConfig)
+          if (body.pool || body.failover) await initPoolRuntime()
           throw error
         }
       },
@@ -1161,12 +1182,13 @@ export function createPanelHandler(ctx) {
     }
   }
 
-  return async function handlePanel(req, res, url) {
+  async function handlePanel(req, res, url) {
     const p = url.pathname
+    if (req.method === 'GET') await flushPendingWrites()
     if (!p.startsWith('/admin') && !p.startsWith('/api/panel')) return false
 
     if (p.startsWith('/admin')) {
-      if (!requireAuth(req, res)) return true
+      if (!(await requireAuth(req, res))) return true
       if (panelIdentity(req).role !== 'admin') {
         json(
           res,
@@ -1184,7 +1206,7 @@ export function createPanelHandler(ctx) {
     if (p === '/admin/models/refresh') return false
 
     if (p === '/admin/routing' && req.method === 'GET') {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuth(req, res))) return
       return json(res, 200, {
         routing: publicRoutingNotify(ctx.routingConfig),
         sticky: stickyRouter.stats(),
@@ -1193,11 +1215,11 @@ export function createPanelHandler(ctx) {
       })
     }
     if (p === '/admin/routing' && (req.method === 'PUT' || req.method === 'POST')) {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuth(req, res))) return
       const body = await readBody(req, cfg.limits.max_body_bytes)
       let applied
       try {
-        applied = persistRoutingPatch(body)
+        applied = await persistRoutingPatch(body)
       } catch (error) {
         if (error instanceof TypeError || error instanceof RangeError) {
           return json(res, 400, {
@@ -1219,19 +1241,19 @@ export function createPanelHandler(ctx) {
       })
     }
     if (p === '/admin/quota' && req.method === 'GET') {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuth(req, res))) return
       return json(res, 200, accountQuota.snapshot())
     }
 
     // ---- Multi-VM + usage management ----
     if (req.method === 'GET' && p === '/admin/vms') {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuth(req, res))) return
       const active = getActiveVmId(cfg.paths.project)
       const vms = listVms(cfg.paths.project, ctx.routingConfig).map((v) => ({ ...v, active: v.id === active }))
       return json(res, 200, { vms, active_vm: active, total: vms.length })
     }
     if (req.method === 'GET' && p.startsWith('/admin/vms/') && !p.includes('/probe') && !p.endsWith('/activate')) {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuth(req, res))) return
       const id = p.split('/')[3]
       const vm = getVm(cfg.paths.project, id)
       if (!vm) return json(res, 404, { error: { message: 'vm not found' } })
@@ -1241,13 +1263,13 @@ export function createPanelHandler(ctx) {
       })
     }
     if (req.method === 'POST' && /^\/admin\/vms\/[^/]+\/activate$/.test(p)) {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuth(req, res))) return
       const id = p.split('/')[3]
       if (!getVm(cfg.paths.project, id)) return json(res, 404, { error: { message: 'vm not found' } })
       return json(res, 200, activateVmSlot(id))
     }
     if (req.method === 'POST' && /^\/admin\/vms\/[^/]+\/probe$/.test(p)) {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuth(req, res))) return
       const id = p.split('/')[3]
       const hop = (await readBody(req, 4096).catch(() => ({})))?.hop !== false
       const result = await panel.buildProbeOne({ cfg, accountQuota, id, hop, routingConfig: ctx.routingConfig })
@@ -1255,13 +1277,13 @@ export function createPanelHandler(ctx) {
       return json(res, 200, { vm_id: id, account_uuid: result.data?.account_uuid, probe: result.data })
     }
     if (req.method === 'POST' && p === '/admin/vms/probe-all') {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuth(req, res))) return
       const hop = (await readBody(req, 4096).catch(() => ({})))?.hop === true
       const result = await panel.buildProbeAll({ cfg, accountQuota, hop, routingConfig: ctx.routingConfig })
       return json(res, 200, result)
     }
     if (req.method === 'GET' && p === '/admin/usage/summary') {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuth(req, res))) return
       const snap = accountQuota.snapshot()
       const vms = listVms(cfg.paths.project, ctx.routingConfig)
       const accounts = snap.accounts || []
@@ -1297,16 +1319,16 @@ export function createPanelHandler(ctx) {
       const body = await readBody(req, 4096)
       const username = body.username || body.user || body.u || ''
       const password = body.password || body.pass || body.p || ''
-      const authed = verifyPanelLogin(username, password)
+      const authed = await verifyPanelLogin(username, password)
       if (!authed) {
         return json(res, 401, { ok: false, error: { message: '用户名或密码错误', type: 'auth' } })
       }
       if (authed.source === 'env') {
         try {
-          panelUsers.bootstrapFromEnv({ username: authed.username, password })
+          await panelUsers.bootstrapFromEnv({ username: authed.username, password })
         } catch {}
       }
-      const token = createPanelSession(authed.username, { role: authed.role })
+      const token = await createPanelSession(authed.username, { role: authed.role })
       const secure = panelCookieSecure(req)
       res.setHeader('Set-Cookie', panelSessionCookie(token, { secure }))
       const me = { user: authed.username, role: authed.role }
@@ -1329,7 +1351,7 @@ export function createPanelHandler(ctx) {
     }
 
     if (p.startsWith('/api/panel')) {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuth(req, res))) return
       // Managed client keys may only call protocol endpoints — never panel/admin.
       // Only panel session or master KIN_API_KEY may administer.
       const isPanelOperator = !!req.panelUser || req.apiKeyKind === 'master'
@@ -1386,10 +1408,10 @@ export function createPanelHandler(ctx) {
           try {
             const settings = new SettingsRepo()
             const user = onboardingUserOf(req)
-            const state = loadOnboardingState(settings)
+            const state = await loadOnboardingState(settings)
             let next
             if (body?.action === 'profile') {
-              applyUsageProfile({
+              await applyUsageProfile({
                 mode: body?.mode,
                 persistRouting: (patch) => persistRoutingPatch(patch),
                 settings,
@@ -1402,7 +1424,7 @@ export function createPanelHandler(ctx) {
             } else {
               next = applyOnboardingAction(state, user, body?.action)
             }
-            saveOnboardingState(settings, next)
+            await saveOnboardingState(settings, next)
           } catch (e) {
             if (e.code === 'invalid_action' || e.code === 'invalid_profile') {
               return json(res, 400, {
@@ -1413,13 +1435,12 @@ export function createPanelHandler(ctx) {
             throw e
           }
         }
-        return json(res, 200, panel.ok(onboardingPayloadFor(req, ctx)))
+        return json(res, 200, panel.ok(await onboardingPayloadFor(req, ctx)))
       }
-      if (p.startsWith('/api/panel/cluster/')) return ctx.clusterRoutes.handle(req, res, url)
+      if (p.startsWith('/api/panel/cluster/')) return ctx.clusterRoutes.handle(req, res, url, json)
       if (req.method === 'GET' && p === '/api/panel/database/metrics') {
-        const snapshot = snapshotDatabaseMetrics({
+        const snapshot = await snapshotDatabaseMetrics({
           db: getDb(),
-          dbPath: getDbPath(),
           usageCache: getUsageCache(),
         })
         return json(res, 200, panel.ok(snapshot))
@@ -1455,12 +1476,12 @@ export function createPanelHandler(ctx) {
         return json(res, result.status, panel.ok(result.data))
       }
       if (req.method === 'GET' && p === '/api/panel/users') {
-        return json(res, 200, panel.ok({ items: panelUsers.list() }))
+        return json(res, 200, panel.ok({ items: await panelUsers.list() }))
       }
       if (req.method === 'POST' && p === '/api/panel/users') {
         const body = await readBody(req, 8192).catch(() => ({}))
         try {
-          const rec = panelUsers.create({
+          const rec = await panelUsers.create({
             username: body.username || body.user,
             password: body.password || body.pass,
             role: body.role || 'user',
@@ -1480,8 +1501,8 @@ export function createPanelHandler(ctx) {
         const id = p.split('/').pop()
         const body = await readBody(req, 8192).catch(() => ({}))
         try {
-          const before = panelUsers.getById(id)
-          const rec = panelUsers.update(id, body || {}, { actorId: req.panelUserId })
+          const before = await panelUsers.getById(id)
+          const rec = await panelUsers.update(id, body || {}, { actorId: req.panelUserId })
           if (!rec) return json(res, 404, { ok: false, error: { message: 'user not found' } })
           // Sessions cache the role from login time, so a role or enable change must log them out.
           if (before && (before.role !== rec.role || !!before.enabled !== !!rec.enabled)) {
@@ -1500,9 +1521,9 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'DELETE' && /^\/api\/panel\/users\/[^/]+$/.test(p)) {
         const id = p.split('/').pop()
-        const existing = panelUsers.getById(id)
+        const existing = await panelUsers.getById(id)
         try {
-          const ok = panelUsers.remove(id, { actorId: req.panelUserId })
+          const ok = await panelUsers.remove(id, { actorId: req.panelUserId })
           if (!ok) return json(res, 404, { ok: false, error: { message: 'user not found' } })
           if (existing?.username) revokePanelSessionsForUser(existing.username)
           return json(res, 200, { ok: true, deleted: id })
@@ -1515,12 +1536,12 @@ export function createPanelHandler(ctx) {
         }
       }
       if (req.method === 'GET' && p === '/api/panel/vm-pools') {
-        return json(res, 200, panel.ok({ pools: vmPoolsFor(apiKeyStore.db).list() }))
+        return json(res, 200, panel.ok({ pools: await vmPoolsFor(apiKeyStore.db).list() }))
       }
       if (req.method === 'POST' && p === '/api/panel/vm-pools') {
         const body = await readBody(req, 64 * 1024).catch(() => ({}))
         try {
-          const pool = createVmPool(vmPoolsFor(apiKeyStore.db), body || {}, listVms(cfg.paths.project))
+          const pool = await createVmPool(vmPoolsFor(apiKeyStore.db), body || {}, listVms(cfg.paths.project))
           return json(res, 201, panel.ok({ pool }))
         } catch (e) {
           return json(res, vmPoolHttpStatus(e.code), {
@@ -1533,7 +1554,7 @@ export function createPanelHandler(ctx) {
         const id = decodeURIComponent(p.split('/').pop())
         const body = await readBody(req, 64 * 1024).catch(() => ({}))
         try {
-          const pool = updateVmPool(vmPoolsFor(apiKeyStore.db), id, body || {}, listVms(cfg.paths.project))
+          const pool = await updateVmPool(vmPoolsFor(apiKeyStore.db), id, body || {}, listVms(cfg.paths.project))
           if (!pool) return json(res, 404, { ok: false, error: { message: '账号池不存在', code: 'vm_pool_not_found' } })
           return json(res, 200, panel.ok({ pool }))
         } catch (e) {
@@ -1545,7 +1566,7 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'DELETE' && /^\/api\/panel\/vm-pools\/[^/]+$/.test(p)) {
         const id = decodeURIComponent(p.split('/').pop())
-        const result = deleteVmPool(vmPoolsFor(apiKeyStore.db), id)
+        const result = await deleteVmPool(vmPoolsFor(apiKeyStore.db), id)
         if (!result.ok) {
           return json(res, vmPoolHttpStatus(result.error), {
             ok: false,
@@ -1559,7 +1580,7 @@ export function createPanelHandler(ctx) {
         return json(res, 200, { ok: true, deleted: id })
       }
       if (req.method === 'GET' && p === '/api/panel/api-keys') {
-        const snap = apiKeyStore.snapshot()
+        const snap = await apiKeyStore.snapshot()
         if (panelIdentity(req).role === 'user') {
           const mine = (snap.keys || []).filter(
             (k) => normalizeOwnerId(k.user_id) === normalizeOwnerId(req.panelUserId),
@@ -1575,10 +1596,10 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'GET' && /^\/api\/panel\/api-keys\/[^/]+\/stats$/.test(p)) {
         const id = p.split('/')[4]
-        if (denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
-        const rec = apiKeyStore.getById(id)
+        if (await denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
+        const rec = await apiKeyStore.getById(id)
         if (!rec) return json(res, 404, { ok: false, error: { message: 'api key not found' } })
-        const usage_stats = requestLog?.keyUsageStats?.({ apiKeyId: id, days: 30 }) || null
+        const usage_stats = (await requestLog?.keyUsageStats?.({ apiKeyId: id, days: 30 })) || null
         return json(res, 200, { ok: true, item: publicKeyView(rec, { reveal: false }), usage_stats })
       }
       if (req.method === 'POST' && p === '/api/panel/api-keys') {
@@ -1598,14 +1619,14 @@ export function createPanelHandler(ctx) {
           }
           const scope = normalizeKeyScope(scopeInput)
           const pools = vmPoolsFor(apiKeyStore.db)
-          if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
+          if (scope.vm_pool_id) await assertVmPoolExists(pools, scope.vm_pool_id)
           else assertVmScope(keyScopeVms(req), scope)
           const defaultConc = Number(
             ctx.routingConfig?.concurrency?.default_key_concurrency ??
               ctx.routingConfig?.concurrency?.default_max_per_account ??
               20,
           )
-          const rec = apiKeyStore.create({
+          const rec = await apiKeyStore.create({
             name: body?.name,
             key: body?.key || body?.custom_key || undefined,
             category: body?.category,
@@ -1644,7 +1665,7 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'PATCH' && /^\/api\/panel\/api-keys\/[^/]+$/.test(p)) {
         const id = p.split('/').pop()
-        if (denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
+        if (await denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
         const body = await readBody(req, 8192).catch(() => ({}))
         const ident = panelIdentity(req)
         if (ident.role !== 'admin' && body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') {
@@ -1655,7 +1676,7 @@ export function createPanelHandler(ctx) {
         }
         try {
           const input = normalizePanelApiKeyInput(body || {}, req)
-          const currentRec = apiKeyStore.getById(id)
+          const currentRec = await apiKeyStore.getById(id)
           const scopeInput = { group_type: body?.group_type, allowed_vms: body?.allowed_vms }
           if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id
@@ -1666,13 +1687,13 @@ export function createPanelHandler(ctx) {
               scope.vm_pool_id = currentRec.vm_pool_id
             }
             const pools = vmPoolsFor(apiKeyStore.db)
-            if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
+            if (scope.vm_pool_id) await assertVmPoolExists(pools, scope.vm_pool_id)
             else assertVmScope(keyScopeVms(req), scope)
             input.group_type = scope.group_type
             input.allowed_vms = scope.allowed_vms
             input.vm_pool_id = scope.vm_pool_id
           }
-          const rec = apiKeyStore.update(id, input)
+          const rec = await apiKeyStore.update(id, input)
           if (!rec) {
             return json(res, 404, { ok: false, error: { message: 'api key not found' } })
           }
@@ -1686,8 +1707,8 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'POST' && /^\/api\/panel\/api-keys\/[^/]+\/reveal$/.test(p)) {
         const id = p.split('/')[4]
-        if (denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
-        const out = apiKeyStore.reveal(id)
+        if (await denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
+        const out = await apiKeyStore.reveal(id)
         if (!out) return json(res, 404, { ok: false, error: { message: 'api key not found' } })
         if (!out.ok) {
           return json(res, 409, {
@@ -1699,9 +1720,9 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'POST' && /^\/api\/panel\/api-keys\/[^/]+\/rotate$/.test(p)) {
         const id = p.split('/')[4]
-        if (denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
+        if (await denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
         try {
-          const rec = apiKeyStore.rotate(id)
+          const rec = await apiKeyStore.rotate(id)
           if (!rec) return json(res, 404, { ok: false, error: { message: 'api key not found' } })
           return json(res, 200, { ok: true, item: publicKeyView(rec, { reveal: true }) })
         } catch (e) {
@@ -1713,15 +1734,15 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'POST' && /^\/api\/panel\/api-keys\/[^/]+\/reset-quota$/.test(p)) {
         const id = p.split('/')[4]
-        if (denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
-        const rec = apiKeyStore.update(id, { reset_quota: true })
+        if (await denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
+        const rec = await apiKeyStore.update(id, { reset_quota: true })
         if (!rec) return json(res, 404, { ok: false, error: { message: 'api key not found' } })
         return json(res, 200, { ok: true, item: publicKeyView(rec, { reveal: false }) })
       }
       if (req.method === 'DELETE' && /^\/api\/panel\/api-keys\/[^/]+$/.test(p)) {
         const id = p.split('/').pop()
-        if (denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
-        const ok = apiKeyStore.remove(id)
+        if (await denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
+        const ok = await apiKeyStore.remove(id)
         if (!ok) return json(res, 404, { ok: false, error: { message: 'api key not found' } })
         return json(res, 200, { ok: true, deleted: id })
       }
@@ -1729,14 +1750,14 @@ export function createPanelHandler(ctx) {
       if (req.method === 'GET' && p === '/api/panel/api-endpoints') {
         return json(res, 200, {
           ok: true,
-          items: apiEndpointStore.list({ reveal: false }),
+          items: await apiEndpointStore.list({ reveal: false }),
           presets: API_ENDPOINT_PRESETS,
         })
       }
       if (req.method === 'POST' && p === '/api/panel/api-endpoints/fetch-models') {
         const body = await readBody(req, 8192).catch(() => ({}))
         try {
-          const saved = savedEndpointKey(apiEndpointStore, body?.key_id)
+          const saved = await savedEndpointKey(apiEndpointStore, body?.key_id)
           const proxyUrl = Object.prototype.hasOwnProperty.call(body || {}, 'proxy_id')
             ? resolveConsoleProxyUrl(proxyPool, body.proxy_id)
             : saved?.proxy_url || body?.proxy_url
@@ -1769,8 +1790,8 @@ export function createPanelHandler(ctx) {
               if (body?.proxy_id != null) entry.proxy_id = String(body.proxy_id || '').trim()
             }
           }
-          const rec = apiEndpointStore.create(body || {})
-          apiScheduler.reload(apiEndpointStore.listRaw())
+          const rec = await apiEndpointStore.create(body || {})
+          apiScheduler.reload(await apiEndpointStore.listRaw())
           return json(res, 201, { ok: true, item: publicEndpointView(rec, { reveal: true }) })
         } catch (e) {
           return json(res, 400, {
@@ -1784,24 +1805,24 @@ export function createPanelHandler(ctx) {
         const body = await readBody(req, 1 << 20).catch(() => ({}))
         try {
           const proxyUrl = body?.proxy_id ? resolveConsoleProxyUrl(proxyPool, body.proxy_id) : ''
-          const rec = apiEndpointStore.update(id, body || {})
+          const rec = await apiEndpointStore.update(id, body || {})
           if (!rec) return json(res, 404, { ok: false, error: { message: 'endpoint not found' } })
           const keyId = String(body?.key_id || '').trim()
           const apiKey = String(body?.api_key || '').trim()
           if (keyId) {
-            apiEndpointStore.updateKey(keyId, {
+            await apiEndpointStore.updateKey(keyId, {
               ...(apiKey ? { api_key: apiKey } : {}),
               ...(body?.proxy_id != null ? { proxy_url: proxyUrl, proxy_id: String(body.proxy_id || '').trim() } : {}),
             })
           } else if (apiKey) {
-            apiEndpointStore.addKey(id, {
+            await apiEndpointStore.addKey(id, {
               api_key: apiKey,
               proxy_url: proxyUrl,
               proxy_id: String(body?.proxy_id || '').trim(),
             })
           }
-          apiScheduler.reload(apiEndpointStore.listRaw())
-          const saved = apiEndpointStore.getRaw(id) || rec
+          apiScheduler.reload(await apiEndpointStore.listRaw())
+          const saved = (await apiEndpointStore.getRaw(id)) || rec
           return json(res, 200, { ok: true, item: publicEndpointView(saved) })
         } catch (e) {
           return json(res, 400, { ok: false, error: { message: String(e.message || e), code: e.code } })
@@ -1809,15 +1830,15 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'DELETE' && /^\/api\/panel\/api-endpoints\/[^/]+$/.test(p)) {
         const id = p.split('/').pop()
-        const ok = apiEndpointStore.remove(id)
+        const ok = await apiEndpointStore.remove(id)
         if (!ok) return json(res, 404, { ok: false, error: { message: 'endpoint not found' } })
-        apiScheduler.reload(apiEndpointStore.listRaw())
+        apiScheduler.reload(await apiEndpointStore.listRaw())
         return json(res, 200, { ok: true, deleted: id })
       }
       if (req.method === 'POST' && /^\/api\/panel\/api-endpoints\/[^/]+\/fetch-models$/.test(p)) {
         const id = p.split('/')[4]
         const body = await readBody(req, 8192).catch(() => ({}))
-        const ep = apiEndpointStore.getRaw(id)
+        const ep = await apiEndpointStore.getRaw(id)
         if (!ep) return json(res, 404, { ok: false, error: { message: 'endpoint not found' } })
         const key = (ep.api_key_entries || []).find((k) => !k.disabled && (body?.key_id ? k.id === body.key_id : true))
         if (!key)
@@ -1833,8 +1854,8 @@ export function createPanelHandler(ctx) {
             headers: ep.headers,
           })
           const apply = body?.apply !== false
-          const rec = apply ? apiEndpointStore.mergeFetchedModels(id, result.models) : ep
-          if (apply) apiScheduler.reload(apiEndpointStore.listRaw())
+          const rec = apply ? await apiEndpointStore.mergeFetchedModels(id, result.models) : ep
+          if (apply) apiScheduler.reload(await apiEndpointStore.listRaw())
           return json(res, 200, {
             ok: true,
             fetched: result.models.length,
@@ -1852,9 +1873,9 @@ export function createPanelHandler(ctx) {
         const id = p.split('/')[4]
         const body = await readBody(req, 8192).catch(() => ({}))
         try {
-          const key = apiEndpointStore.addKey(id, body || {})
-          apiScheduler.reload(apiEndpointStore.listRaw())
-          const view = publicEndpointView(apiEndpointStore.getRaw(id), { reveal: true })
+          const key = await apiEndpointStore.addKey(id, body || {})
+          apiScheduler.reload(await apiEndpointStore.listRaw())
+          const view = publicEndpointView(await apiEndpointStore.getRaw(id), { reveal: true })
           return json(res, 201, { ok: true, item: view?.api_key_entries?.find((k) => k.id === key.id) || key })
         } catch (e) {
           const status = e.code === 'endpoint_not_found' ? 404 : 400
@@ -1863,18 +1884,18 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'DELETE' && /^\/api\/panel\/api-endpoints\/[^/]+\/keys\/[^/]+$/.test(p)) {
         const kid = p.split('/').pop()
-        const ok = apiEndpointStore.removeKey(kid)
+        const ok = await apiEndpointStore.removeKey(kid)
         if (!ok) return json(res, 404, { ok: false, error: { message: 'key not found' } })
-        apiScheduler.reload(apiEndpointStore.listRaw())
+        apiScheduler.reload(await apiEndpointStore.listRaw())
         return json(res, 200, { ok: true, deleted: kid })
       }
       if (req.method === 'PATCH' && /^\/api\/panel\/api-endpoints\/[^/]+\/keys\/[^/]+$/.test(p)) {
         const kid = p.split('/').pop()
         const body = await readBody(req, 8192).catch(() => ({}))
-        const rec = apiEndpointStore.updateKey(kid, body || {})
+        const rec = await apiEndpointStore.updateKey(kid, body || {})
         if (!rec) return json(res, 404, { ok: false, error: { message: 'key not found' } })
-        apiScheduler.reload(apiEndpointStore.listRaw())
-        const ep = apiEndpointStore.getRaw(rec.endpoint_id)
+        apiScheduler.reload(await apiEndpointStore.listRaw())
+        const ep = await apiEndpointStore.getRaw(rec.endpoint_id)
         const item = publicEndpointView(ep)?.api_key_entries?.find((k) => k.id === kid)
         return json(res, 200, { ok: true, item })
       }
@@ -1908,8 +1929,8 @@ export function createPanelHandler(ctx) {
           return json(res, 200, {
             ok: true,
             mode: 'debug',
-            config: requestLog.snapshot(),
-            items: requestLog.listDebug({
+            config: await requestLog.snapshot(),
+            items: await requestLog.listDebug({
               limit,
               error_class: u.searchParams.get('error_class') || null,
               exclude_error_class: u.searchParams.get('exclude_error_class') || null,
@@ -1936,11 +1957,11 @@ export function createPanelHandler(ctx) {
           q: u.searchParams.get('q') || null,
           owner_user_id: panelIdentity(req).role === 'user' ? req.panelUserId : u.searchParams.get('user_id') || null,
         }
-        const { items, total } = requestLog.queryNormal(filters)
+        const { items, total } = await requestLog.queryNormal(filters)
         return json(res, 200, {
           ok: true,
           mode: 'normal',
-          config: requestLog.snapshot(),
+          config: await requestLog.snapshot(),
           items,
           total,
           limit: filters.limit,
@@ -1964,7 +1985,7 @@ export function createPanelHandler(ctx) {
           status_code: listed.status_code || (/^\d+$/.test(legacyStatus || '') ? legacyStatus : null),
           errors_only: legacyStatus === 'error',
         }
-        const { items, total, capped } = new UsageLogsView(getDb(), {
+        const { items, total, capped } = await new UsageLogsView(getDb(), {
           mutedErrorClasses: requestLog?.mutedErrorClasses,
         }).exportRows(filters)
         const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')
@@ -1998,17 +2019,17 @@ export function createPanelHandler(ctx) {
           bucket,
           since,
           until,
-          totals: tenant ? null : requestLog.totals(),
-          buckets: requestLog.aggregate({ since, until, bucket, owner_user_id }),
-          window: requestLog.windowStats({ since, until, owner_user_id }),
-          muted_error_classes: requestLog.snapshot().muted_error_classes,
-          config: tenant ? null : requestLog.snapshot(),
+          totals: tenant ? null : await requestLog.totals(),
+          buckets: await requestLog.aggregate({ since, until, bucket, owner_user_id }),
+          window: await requestLog.windowStats({ since, until, owner_user_id }),
+          muted_error_classes: (await requestLog.snapshot()).muted_error_classes,
+          config: tenant ? null : await requestLog.snapshot(),
         })
       }
       if (req.method === 'GET' && /^\/api\/panel\/request-logs\/[^/]+\/attempts$/.test(p)) {
         const requestId = p.split('/')[4]
         const owner_user_id = panelIdentity(req).role === 'user' ? req.panelUserId : null
-        if (owner_user_id && !requestLog.getDebug(requestId, { owner_user_id })) {
+        if (owner_user_id && !(await requestLog.getDebug(requestId, { owner_user_id }))) {
           return json(res, 404, { ok: false, error: { message: 'debug log not found' } })
         }
         return json(
@@ -2017,16 +2038,16 @@ export function createPanelHandler(ctx) {
           panel.ok({
             request_id: requestId,
             attempts:
-              (typeof ctx.getAttemptsRepo === 'function' ? ctx.getAttemptsRepo() : ctx.attemptsRepo)?.list?.(
+              (await (typeof ctx.getAttemptsRepo === 'function' ? ctx.getAttemptsRepo() : ctx.attemptsRepo)?.list?.(
                 requestId,
-              ) || [],
+              )) || [],
           }),
         )
       }
       if (req.method === 'GET' && /^\/api\/panel\/request-logs\/[^/]+$/.test(p)) {
         const id = p.split('/').pop()
         const owner_user_id = panelIdentity(req).role === 'user' ? req.panelUserId : null
-        const rec = requestLog.getDebug(id, { owner_user_id })
+        const rec = await requestLog.getDebug(id, { owner_user_id })
         if (!rec) return json(res, 404, { ok: false, error: { message: 'debug log not found' } })
         return json(res, 200, { ok: true, item: rec })
       }
@@ -2038,31 +2059,39 @@ export function createPanelHandler(ctx) {
       const tenantId = () => (panelIdentity(req).role === 'user' ? req.panelUserId : null)
       if (req.method === 'GET' && p === '/api/panel/usage-logs') {
         const u = new URL(req.url, 'http://x')
-        return json(res, 200, panel.ok(usageLogsView().listBatch(usageLogFilters(req, u))))
+        return json(res, 200, panel.ok(await usageLogsView().listBatch(usageLogFilters(req, u))))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/summary') {
         const u = new URL(req.url, 'http://x')
-        return json(res, 200, panel.ok(usageLogsView().summary(usageLogFilters(req, u))))
+        return json(res, 200, panel.ok(await usageLogsView().summary(usageLogFilters(req, u))))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/filter-options') {
-        return json(res, 200, panel.ok(usageLogsView().filterOptions({ owner_user_id: tenantId() })))
+        return json(res, 200, panel.ok(await usageLogsView().filterOptions({ owner_user_id: tenantId() })))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/session-suggestions') {
         const u = new URL(req.url, 'http://x')
         const q = u.searchParams.get('q') || ''
         const limit = u.searchParams.get('limit')
-        return json(res, 200, panel.ok(usageLogsView().sessionSuggestions({ q, limit, owner_user_id: tenantId() })))
+        return json(
+          res,
+          200,
+          panel.ok(await usageLogsView().sessionSuggestions({ q, limit, owner_user_id: tenantId() })),
+        )
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/active-sessions') {
         const u = new URL(req.url, 'http://x')
         const minutes = u.searchParams.get('minutes')
         const limit = u.searchParams.get('limit')
-        return json(res, 200, panel.ok(usageLogsView().activeSessions({ minutes, limit, owner_user_id: tenantId() })))
+        return json(
+          res,
+          200,
+          panel.ok(await usageLogsView().activeSessions({ minutes, limit, owner_user_id: tenantId() })),
+        )
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/overview') {
         const u = new URL(req.url, 'http://x')
         const tz = u.searchParams.get('tz') || 'UTC'
-        return json(res, 200, panel.ok(usageLogsView().overview({ tz, owner_user_id: tenantId() })))
+        return json(res, 200, panel.ok(await usageLogsView().overview({ tz, owner_user_id: tenantId() })))
       }
 
       // ---- Statistics page ----
@@ -2071,7 +2100,11 @@ export function createPanelHandler(ctx) {
         const q = statsParams(req, u, 'dimension')
         if (q.error) return json(res, 400, { ok: false, error: { message: q.error } })
         const { range, dimension, tz, owner_user_id } = q
-        return json(res, 200, panel.ok(new StatisticsRepo(getDb()).statistics({ range, dimension, tz, owner_user_id })))
+        return json(
+          res,
+          200,
+          panel.ok(await new StatisticsRepo(getDb()).statistics({ range, dimension, tz, owner_user_id })),
+        )
       }
       if (req.method === 'GET' && p === '/api/panel/statistics/leaderboard') {
         const u = new URL(req.url, 'http://x')
@@ -2082,7 +2115,7 @@ export function createPanelHandler(ctx) {
         return json(
           res,
           200,
-          panel.ok(new StatisticsRepo(getDb()).leaderboard({ range, scope, limit, tz, owner_user_id })),
+          panel.ok(await new StatisticsRepo(getDb()).leaderboard({ range, scope, limit, tz, owner_user_id })),
         )
       }
 
@@ -2093,16 +2126,16 @@ export function createPanelHandler(ctx) {
         const groupBy = u.searchParams.get('group_by') === 'key' ? 'key' : 'vm'
         const since = u.searchParams.get('from') || u.searchParams.get('since') || null
         const until = u.searchParams.get('until') || null
-        return json(res, 200, panel.ok(requestLog.ownerBilling({ ownerUserId, since, until, groupBy })))
+        return json(res, 200, panel.ok(await requestLog.ownerBilling({ ownerUserId, since, until, groupBy })))
       }
 
       // ---- Backups (local auto/manual, download, restore) ----
       if (req.method === 'GET' && p === '/api/panel/backups') {
         return json(res, 200, {
           ok: true,
-          items: backupService.list(),
-          config: backupService.getSchedule(),
-          next_auto_at: backupService.nextAutoAt(),
+          items: await backupService.list(),
+          config: await backupService.getSchedule(),
+          next_auto_at: await backupService.nextAutoAt(),
           restoring: backupService.isRestoring,
         })
       }
@@ -2121,22 +2154,22 @@ export function createPanelHandler(ctx) {
       if (req.method === 'GET' && p === '/api/panel/backups/config') {
         return json(res, 200, {
           ok: true,
-          config: backupService.getSchedule(),
-          next_auto_at: backupService.nextAutoAt(),
+          config: await backupService.getSchedule(),
+          next_auto_at: await backupService.nextAutoAt(),
         })
       }
       if (req.method === 'PUT' && p === '/api/panel/backups/config') {
         const body = await readBody(req, 8192).catch(() => ({}))
         try {
-          const config = backupService.updateSchedule(body || {})
-          return json(res, 200, { ok: true, config, next_auto_at: backupService.nextAutoAt() })
+          const config = await backupService.updateSchedule(body || {})
+          return json(res, 200, { ok: true, config, next_auto_at: await backupService.nextAutoAt() })
         } catch (e) {
           return json(res, 400, { ok: false, error: { message: String(e.message || e), code: e.code } })
         }
       }
       if (req.method === 'GET' && /^\/api\/panel\/backups\/[^/]+\/download$/.test(p)) {
         const id = p.split('/')[4]
-        const rec = backupService.get(id)
+        const rec = await backupService.get(id)
         if (!rec || !rec.file_path || !fs.existsSync(rec.file_path)) {
           return json(res, 404, { ok: false, error: { message: 'backup file not found' } })
         }
@@ -2181,7 +2214,8 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'DELETE' && /^\/api\/panel\/backups\/[^/]+$/.test(p)) {
         const id = p.split('/').pop()
-        if (!backupService.remove(id)) return json(res, 404, { ok: false, error: { message: 'backup not found' } })
+        if (!(await backupService.remove(id)))
+          return json(res, 404, { ok: false, error: { message: 'backup not found' } })
         return json(res, 200, { ok: true, deleted: id })
       }
 
@@ -2304,7 +2338,7 @@ export function createPanelHandler(ctx) {
         const previous = structuredClone(ctx.routingConfig)
         try {
           if (targets.all) {
-            persistRoutingPatch({
+            await persistRoutingPatch({
               inference: {
                 ...(ctx.routingConfig.inference || {}),
                 dataplane: parsed.value,
@@ -2637,7 +2671,7 @@ export function createPanelHandler(ctx) {
         const body = await readBody(req, 8192).catch(() => ({}))
         const nextOwner =
           body.user_id === null || body.user_id === '' ? null : normalizeOwnerId(body.user_id || body.owner_user_id)
-        if (nextOwner && !panelUsers.getById(nextOwner)) {
+        if (nextOwner && !(await panelUsers.getById(nextOwner))) {
           return json(res, 404, { ok: false, error: { message: 'user not found' } })
         }
         const currentOrigin = vm.origin || VM_ORIGIN.platform
@@ -3332,12 +3366,12 @@ export function createPanelHandler(ctx) {
         fs.unlinkSync(vmPath)
         invalidateVmSlotReadCache(cfg.paths.project, id)
         try {
-          vmTestSchedule.remove(id)
+          await vmTestSchedule.remove(id)
         } catch {}
         if (active === id) {
           clearActiveVm(cfg.paths.project)
           try {
-            clearActiveVmFromDb()
+            await clearActiveVmFromDb()
           } catch {}
           try {
             reloadActiveVm(cfg)
@@ -3345,7 +3379,7 @@ export function createPanelHandler(ctx) {
         }
         // drop the DB credential mirror row too
         try {
-          removeVmFromDb(id)
+          await removeVmFromDb(id)
         } catch {}
         // optional chat side files
         try {
@@ -3512,8 +3546,8 @@ export function createPanelHandler(ctx) {
           }
           try {
             const repo = ctx.accountQuota?.repo
-            const row = repo && typeof repo.get === 'function' ? repo.get(id) : null
-            if (row && typeof repo.save === 'function') repo.save({ ...row, email: null, name: id })
+            const row = repo && typeof repo.get === 'function' ? await repo.get(id) : null
+            if (row && typeof repo.save === 'function') await repo.save({ ...row, email: null, name: id })
           } catch {}
           const saved = getVm(cfg.paths.project, id) || vm
           return json(
@@ -3866,7 +3900,7 @@ export function createPanelHandler(ctx) {
         const ident = panelIdentity(req)
         if (parsed.ok && ident.role === 'user') {
           const ownerId = normalizeOwnerId(req.panelUserId)
-          const quota = clampVmCreateQuota(panelUsers.getById(ownerId)?.vm_create_quota, 0)
+          const quota = clampVmCreateQuota((await panelUsers.getById(ownerId))?.vm_create_quota, 0)
           const used = countUserCreatedVms(listVms(cfg.paths.project), ownerId)
           if (!ownerId || quota <= 0 || used >= quota) {
             return json(res, 403, {
@@ -3930,7 +3964,7 @@ export function createPanelHandler(ctx) {
         const ident = panelIdentity(req)
         if (ident.role === 'user') {
           const ownerId = normalizeOwnerId(req.panelUserId)
-          const quota = clampVmCreateQuota(panelUsers.getById(ownerId)?.vm_create_quota, 0)
+          const quota = clampVmCreateQuota((await panelUsers.getById(ownerId))?.vm_create_quota, 0)
           const used = countUserCreatedVms(existing, ownerId)
           if (!ownerId || quota <= 0 || used >= quota) {
             return json(res, 403, {
@@ -4994,7 +5028,7 @@ export function createPanelHandler(ctx) {
       }
       // GET /api/panel/usage
       if (req.method === 'GET' && p === '/api/panel/usage') {
-        return json(res, 200, panel.buildUsage({ accountQuota, cfg, requestLog }))
+        return json(res, 200, await panel.buildUsage({ accountQuota, cfg, requestLog }))
       }
       // GET /api/panel/models
       if (req.method === 'GET' && p === '/api/panel/models') {
@@ -5014,7 +5048,7 @@ export function createPanelHandler(ctx) {
           200,
           panel.ok({
             policy: pol,
-            models: listPolicyModels(),
+            models: await listPolicyModels(),
             effective: listOfficialModels(),
             platform: 'anthropic',
           }),
@@ -5024,18 +5058,18 @@ export function createPanelHandler(ctx) {
         const body = await readBody(req, 2 * 1024 * 1024)
         const platform = String(body.platform || url.searchParams.get('platform') || '').toLowerCase()
         if (platform === 'openai' || platform === 'gpt' || platform === 'codex') {
-          const saved = saveGptModelPolicy(body.policy || body)
+          const saved = await saveGptModelPolicy(body.policy || body)
           const models = listGptPolicyModels()
           return json(res, 200, panel.ok({ policy: saved, models, effective: models, platform: 'openai' }))
         }
-        const saved = saveModelPolicy(body.policy || body)
+        const saved = await saveModelPolicy(body.policy || body)
         seedModelCatalog()
         return json(
           res,
           200,
           panel.ok({
             policy: saved,
-            models: listPolicyModels(),
+            models: await listPolicyModels(),
             effective: listOfficialModels(),
             platform: 'anthropic',
           }),
@@ -5046,18 +5080,18 @@ export function createPanelHandler(ctx) {
         const body = await readBody(req, 8192).catch(() => ({}))
         const platform = String(body.platform || url.searchParams.get('platform') || '').toLowerCase()
         if (platform === 'openai' || platform === 'gpt' || platform === 'codex') {
-          const saved = resetGptModelPolicy()
+          const saved = await resetGptModelPolicy()
           const models = listGptPolicyModels()
           return json(res, 200, panel.ok({ policy: saved, models, effective: models, platform: 'openai' }))
         }
-        const saved = resetModelPolicy()
+        const saved = await resetModelPolicy()
         seedModelCatalog()
         return json(
           res,
           200,
           panel.ok({
             policy: saved,
-            models: listPolicyModels(),
+            models: await listPolicyModels(),
             effective: listOfficialModels(),
             platform: 'anthropic',
           }),
@@ -5078,7 +5112,7 @@ export function createPanelHandler(ctx) {
           200,
           panel.ok({
             policy: getModelPolicy(),
-            models: listPolicyModels(),
+            models: await listPolicyModels(),
             effective: listOfficialModels(),
             synced: status.added.length,
             added: status.added,
@@ -5088,12 +5122,12 @@ export function createPanelHandler(ctx) {
       }
       // GET /api/panel/pricing — effective price catalog for the 计费 tab
       if (req.method === 'GET' && p === '/api/panel/pricing') {
-        return json(res, 200, panel.ok(buildPricing({ requestLog })))
+        return json(res, 200, panel.ok(await buildPricing({ requestLog })))
       }
       // PUT /api/panel/pricing/overrides { key, price|null }
       if (req.method === 'PUT' && p === '/api/panel/pricing/overrides') {
         const body = await readBody(req, 256 * 1024)
-        const saved = setPriceOverride(String(body?.key || ''), body?.price ?? null)
+        const saved = await setPriceOverride(String(body?.key || ''), body?.price ?? null)
         if (!saved.ok) {
           return json(res, 400, { ok: false, error: { code: 'invalid_price', message: saved.error } })
         }
@@ -5114,7 +5148,7 @@ export function createPanelHandler(ctx) {
             error: { code: 'invalid_range', message: 'since/until must be ISO times with since < until' },
           })
         }
-        const result = requestLog.repo.repriceRange({
+        const result = await requestLog.repo.repriceRange({
           since: new Date(since).toISOString(),
           until: new Date(until).toISOString(),
         })
@@ -5240,9 +5274,9 @@ export function createPanelHandler(ctx) {
         const { applied: appliedDuringSwitch, ...publicEngineRuntime } = engineRuntime
         let applied
         try {
-          applied = appliedDuringSwitch ?? persistRoutingPatch(body)
+          applied = appliedDuringSwitch ?? (await persistRoutingPatch(body))
         } catch (error) {
-          restoreRoutingRuntime(previousRoutingConfig)
+          await restoreRoutingRuntime(previousRoutingConfig)
           return json(res, 503, {
             ok: false,
             error: { code: 'routing_persist_failed', message: String(error?.message || error) },
@@ -5282,11 +5316,11 @@ export function createPanelHandler(ctx) {
         return json(res, 200, panel.ok(cfg.distill))
       }
       if (req.method === 'GET' && p === '/api/panel/refusal-guards') {
-        return json(res, 200, panel.ok(refusalGuardSnapshot()))
+        return json(res, 200, panel.ok(await refusalGuardSnapshot()))
       }
       if (req.method === 'PUT' && p === '/api/panel/refusal-guards') {
         const body = await readBody(req, 8 * 1024).catch(() => ({}))
-        const patched = applyRefusalGuardPatch(new SettingsRepo(), body || {})
+        const patched = await applyRefusalGuardPatch(new SettingsRepo(), body || {})
         if (!patched.ok) {
           return json(res, 400, {
             ok: false,
@@ -5297,18 +5331,18 @@ export function createPanelHandler(ctx) {
             },
           })
         }
-        return json(res, 200, panel.ok(refusalGuardSnapshot()))
+        return json(res, 200, panel.ok(await refusalGuardSnapshot()))
       }
       if (req.method === 'DELETE' && /^\/api\/panel\/refusal-guards\/[0-9a-f]{64}$/i.test(p)) {
         const fp = p.split('/').pop()
-        const removed = new RefusalGuardsRepo().remove(fp)
+        const removed = await new RefusalGuardsRepo().remove(fp)
         if (!removed) {
           return json(res, 404, {
             ok: false,
             error: { type: 'not_found_error', code: 'refusal_guard_not_found', message: '指纹不存在' },
           })
         }
-        return json(res, 200, panel.ok(refusalGuardSnapshot()))
+        return json(res, 200, panel.ok(await refusalGuardSnapshot()))
       }
       if (req.method === 'DELETE' && p === '/api/panel/refusal-guards') {
         const body = await readBody(req, 8 * 1024).catch(() => ({}))
@@ -5322,21 +5356,21 @@ export function createPanelHandler(ctx) {
             },
           })
         }
-        new RefusalGuardsRepo().clear()
-        return json(res, 200, panel.ok(refusalGuardSnapshot()))
+        await new RefusalGuardsRepo().clear()
+        return json(res, 200, panel.ok(await refusalGuardSnapshot()))
       }
       if (req.method === 'DELETE' && p === '/api/panel/refusal-device-blocks') {
         const body = await readBody(req, 8 * 1024).catch(() => ({}))
         const repo = new RefusalDeviceBlocksRepo()
         const deviceId = String(body?.device_id || '').trim()
         if (deviceId) {
-          if (!repo.remove(deviceId)) {
+          if (!(await repo.remove(deviceId))) {
             return json(res, 404, {
               ok: false,
               error: { type: 'not_found_error', code: 'refusal_device_not_found', message: 'device 不存在' },
             })
           }
-          return json(res, 200, panel.ok(refusalGuardSnapshot()))
+          return json(res, 200, panel.ok(await refusalGuardSnapshot()))
         }
         if (body?.confirm !== true) {
           return json(res, 400, {
@@ -5348,18 +5382,18 @@ export function createPanelHandler(ctx) {
             },
           })
         }
-        repo.clear()
-        return json(res, 200, panel.ok(refusalGuardSnapshot()))
+        await repo.clear()
+        return json(res, 200, panel.ok(await refusalGuardSnapshot()))
       }
       if (req.method === 'GET' && p === '/api/panel/protocol-entry') {
-        return json(res, 200, panel.ok(requestLog.protocolEntryStats()))
+        return json(res, 200, panel.ok(await requestLog.protocolEntryStats()))
       }
       if (req.method === 'GET' && p === '/api/panel/jev-intercept') {
         return json(res, 200, panel.ok(jevInterceptSnapshot()))
       }
       if (req.method === 'PUT' && p === '/api/panel/jev-intercept') {
         const body = await readBody(req, 64 * 1024).catch(() => ({}))
-        const patched = applyJevPatch(new SettingsRepo(), body || {})
+        const patched = await applyJevPatch(new SettingsRepo(), body || {})
         if (!patched.ok) {
           return json(res, 400, {
             ok: false,
@@ -5862,7 +5896,7 @@ export function createPanelHandler(ctx) {
 
     // ---- intercept rules admin ----
     if (p === '/admin/intercept/rules') {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuth(req, res))) return
       if (req.method === 'GET') {
         return json(res, 200, { rules: reloadRules() })
       }
@@ -5884,11 +5918,11 @@ export function createPanelHandler(ctx) {
     }
 
     if (req.method === 'GET' && p === '/admin/vm/oauth') {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuth(req, res))) return
       return json(res, 200, await oauthStatusWithWorker())
     }
     if (req.method === 'POST' && p === '/admin/vm/oauth/refresh') {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuth(req, res))) return
       const body = await readBody(req, 4096).catch(() => ({}))
       const id = String(body.vm_id || getActiveVmId(cfg.paths.project) || '').trim()
       const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
@@ -5907,19 +5941,46 @@ export function createPanelHandler(ctx) {
 
     // Claude CLI inference/update was removed; workers are built and deployed separately.
     if (req.method === 'GET' && p === '/admin/vm/claude-code/version') {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuth(req, res))) return
       return json(res, 410, {
         error: { code: 'claude_cli_removed', message: 'Claude CLI runtime was replaced by the Go slot worker' },
       })
     }
     if (req.method === 'POST' && p === '/admin/vm/claude-code/update') {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuth(req, res))) return
       return json(res, 410, {
         error: { code: 'claude_cli_removed', message: 'Build and roll out the Go slot worker instead' },
       })
     }
 
     return false
+  }
+
+  return async (req, res, url) => {
+    if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return handlePanel(req, res, url)
+    try {
+      await flushPanelWrites()
+    } catch (error) {
+      return persistenceFailure(res, error)
+    }
+    const state = {}
+    let result
+    res._panelResponseState = state
+    try {
+      result = await handlePanel(req, res, url)
+    } finally {
+      delete res._panelResponseState
+    }
+    try {
+      await flushPanelWrites()
+    } catch (error) {
+      return persistenceFailure(res, error)
+    }
+    if (state.response) {
+      ctx.json(...state.response)
+      return true
+    }
+    return result
   }
 }
 

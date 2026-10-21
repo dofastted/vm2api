@@ -12,18 +12,27 @@ function setup({ failBefore = false } = {}) {
     json: (_res, status, body) => sent.push({ status, body }),
     readBody: async () => ({ enabled: false }),
     requireAuth: () => true,
-    clusterRoutes: { handle: (_req, res, _url, respond) => {
-      changed += 1
-      return respond(res, 201, { ok: true })
-    } },
-    onPersistenceFailure: () => { maintenance += 1 },
+    clusterRoutes: {
+      handle: (_req, res, _url, respond) => {
+        changed += 1
+        return respond(res, 201, { ok: true })
+      },
+    },
+    onPersistenceFailure: () => {
+      maintenance += 1
+    },
     proxyPool: {
-      writes: { flush: async () => {
-        writes += 1
-        if (failBefore || writes > 1) throw new Error('synthetic persistence failure')
-      } },
+      writes: {
+        flush: async () => {
+          writes += 1
+          if (failBefore || writes > 1) throw new Error('synthetic persistence failure')
+        },
+      },
       snapshot: () => ({ config: {}, proxies: [] }),
-      updateConfig: () => { changed += 1; return { ok: true, config: { enabled: false } } },
+      updateConfig: () => {
+        changed += 1
+        return { ok: true, config: { enabled: false } }
+      },
     },
   })
   return { handler, sent, changed: () => changed, maintenance: () => maintenance }
@@ -61,10 +70,16 @@ test('a staged panel response remains handled after persistence succeeds', async
   const handler = createPanelHandler({
     cfg: {},
     requireAuth: () => true,
-    json: (_res, status, body) => { sent.push({ status, body }) },
+    json: (_res, status, body) => {
+      sent.push({ status, body })
+    },
   })
 
-  const handled = await handler({ method: 'POST', apiKeyKind: 'managed' }, {}, new URL('http://test/admin/models/refresh'))
+  const handled = await handler(
+    { method: 'POST', apiKeyKind: 'managed' },
+    {},
+    new URL('http://test/admin/models/refresh'),
+  )
   assert.equal(handled, true)
   assert.equal(sent.length, 1)
   assert.equal(sent[0].status, 403)

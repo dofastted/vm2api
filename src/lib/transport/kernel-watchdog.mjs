@@ -332,6 +332,9 @@ export function createKernelWatchdog({
       timer = setInterval(() => void tick(), config.interval_sec * 1000)
       timer.unref?.()
     },
+    async flush() {
+      while (inTick) await new Promise((resolve) => setTimeout(resolve, 10))
+    },
     stop() {
       running = false
       clearInterval(timer)

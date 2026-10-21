@@ -94,20 +94,20 @@ test('layer precedence: override provider/model > provider/* > */model > models.
   assert.equal(fromDev.source, 'models.dev')
   assert.equal(fromDev.price.cache_read, 9)
 
-  assert.equal(setPriceOverride(`*/${id}`, { ...FULL, cache_read: 3 }).ok, true)
+  assert.equal((await setPriceOverride(`*/${id}`, { ...FULL, cache_read: 3 })).ok, true)
   assert.equal(resolvePrice(id).source, 'override')
   assert.equal(resolvePrice(id).price.cache_read, 3)
 
-  assert.equal(setPriceOverride('anthropic/*', { ...FULL, cache_read: 2 }).ok, true)
+  assert.equal((await setPriceOverride('anthropic/*', { ...FULL, cache_read: 2 })).ok, true)
   assert.equal(resolvePrice(id).price.cache_read, 2)
 
-  assert.equal(setPriceOverride(`anthropic/${id}`, { ...FULL, cache_read: 1 }).ok, true)
+  assert.equal((await setPriceOverride(`anthropic/${id}`, { ...FULL, cache_read: 1 })).ok, true)
   assert.equal(resolvePrice(id).price.cache_read, 1)
   assert.equal(resolvePrice(id).source, 'override')
 })
 
-test('a provider/* override on a dated id keeps the canonical model builtin fast mode', () => {
-  assert.equal(setPriceOverride('anthropic/*', FULL).ok, true)
+test('a provider/* override on a dated id keeps the canonical model builtin fast mode', async () => {
+  assert.equal((await setPriceOverride('anthropic/*', FULL)).ok, true)
   const hit = resolvePrice('claude-opus-5-5-20261001')
   assert.equal(hit.id, 'claude-opus-5-5')
   assert.equal(hit.source, 'override')
@@ -123,19 +123,19 @@ test('an override on the canonical id also prices its dated snapshot', async () 
       jsonResponse({ anthropic: { models: { [dated]: { cost: { input: 1, output: 5, cache_read: 0.1 } } } } }),
   })
   assert.equal(resolvePrice(dated).source, 'models.dev')
-  assert.equal(setPriceOverride('anthropic/claude-haiku-4-5', FULL).ok, true)
+  assert.equal((await setPriceOverride('anthropic/claude-haiku-4-5', FULL)).ok, true)
   const hit = resolvePrice(dated)
   assert.equal(hit.source, 'override')
   assert.equal(hit.price.input, FULL.input)
 })
 
-test('partial override is rejected', () => {
-  const missingRead = setPriceOverride('anthropic/claude-sonnet-5-5', { input: 1, output: 2 })
+test('partial override is rejected', async () => {
+  const missingRead = await setPriceOverride('anthropic/claude-sonnet-5-5', { input: 1, output: 2 })
   assert.equal(missingRead.ok, false)
   assert.match(missingRead.error, /cache_read/)
   assert.equal(resolvePrice('claude-sonnet-5-5').source, 'builtin')
 
-  const missingInput = setPriceOverride('openai/gpt-5.5', { output: 1, cache_read: 0 })
+  const missingInput = await setPriceOverride('openai/gpt-5.5', { output: 1, cache_read: 0 })
   assert.equal(missingInput.ok, false)
   assert.match(missingInput.error, /input/)
 })
@@ -259,10 +259,10 @@ test('validatePrice fills optional cache writes', () => {
   assert.equal(o.price.cache_1h, 0)
 })
 
-test('saving an override invalidates the memoized catalog', () => {
+test('saving an override invalidates the memoized catalog', async () => {
   const before = listPriceCatalog().find((e) => e.id === 'claude-sonnet-5-5')
   assert.equal(before.override, null)
-  assert.equal(setPriceOverride('anthropic/claude-sonnet-5-5', FULL).ok, true)
+  assert.equal((await setPriceOverride('anthropic/claude-sonnet-5-5', FULL)).ok, true)
   const after = listPriceCatalog().find((e) => e.id === 'claude-sonnet-5-5')
   assert.equal(after.source, 'override')
   assert.equal(after.override.input, 9)

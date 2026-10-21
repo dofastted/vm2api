@@ -142,13 +142,13 @@ function saveSessions() {
 
 loadSessions()
 
-export function createPanelSession(username, ttlMs = SESSION_TTL_MS, extra = {}) {
+export async function createPanelSession(username, ttlMs = SESSION_TTL_MS, extra = {}) {
   if (ttlMs && typeof ttlMs === 'object') {
     extra = ttlMs
     ttlMs = extra.ttlMs || SESSION_TTL_MS
   }
   const token = 'kin-panel-' + crypto.randomBytes(24).toString('hex')
-  const role = extra.role || (_lookupRole && _lookupRole(username)) || 'admin'
+  const role = extra.role || (_lookupRole && (await _lookupRole(username))) || 'admin'
   panelSessions.set(panelSessionKey(token), {
     user: username,
     role,
@@ -158,7 +158,7 @@ export function createPanelSession(username, ttlMs = SESSION_TTL_MS, extra = {})
   return token
 }
 
-export function verifyPanelSession(token) {
+export async function verifyPanelSession(token) {
   if (!token || !token.startsWith('kin-panel-')) return null
   const key = panelSessionKey(token)
   let s = panelSessions.get(key)
@@ -174,7 +174,7 @@ export function verifyPanelSession(token) {
     return null
   }
   if (!s.role && _lookupRole) {
-    s.role = _lookupRole(s.user) || null
+    s.role = (await _lookupRole(s.user)) || null
   }
   if (!s.role) {
     const admin = getPanelAdmin()
@@ -213,12 +213,12 @@ export function revokePanelSessionsForUser(username, { exceptToken } = {}) {
 /**
  * @returns {{ username: string, role: string, id?: string } | null}
  */
-export function verifyPanelLogin(username, password) {
+export async function verifyPanelLogin(username, password) {
   if (_authenticateUser) {
-    const rec = _authenticateUser(username, password)
+    const rec = await _authenticateUser(username, password)
     if (rec) return { username: rec.username, role: rec.role || 'user', id: rec.id }
     // Existing DB user (including disabled) must not fall through to env password.
-    if (_lookupRole && _lookupRole(username)) return null
+    if (_lookupRole && (await _lookupRole(username))) return null
   }
   const admin = getPanelAdmin()
   if (!admin.password) return null

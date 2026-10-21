@@ -12,10 +12,10 @@ function seed(root, vm) {
   fs.writeFileSync(path.join(dir, `${vm.id}.json`), JSON.stringify({ status: 'stopped', policy: {}, ...vm }))
 }
 
-function setup(t) {
+async function setup(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-exit-probe-'))
   const lookups = []
-  const pool = new ProxyPool({
+  const pool = await new ProxyPool({
     dataDir: path.join(root, 'data'),
     vmNodeOf: (vmId) => JSON.parse(fs.readFileSync(path.join(root, 'vms', `${vmId}.json`), 'utf8')).node_id || null,
     localExitUrl: (nodeId) => `socks5h://${nodeId}@127.0.0.1:1080`,
@@ -24,7 +24,7 @@ function setup(t) {
       return { ok: true, geo: { ip: '203.0.113.9', country: 'Japan', city: 'Tokyo', timezone: 'Asia/Tokyo' } }
     },
     geoV6Lookup: async () => ({ ok: false, error: 'no_v6' }),
-  })
+  }).init()
   pool.stopScheduler()
   t.after(() => {
     pool.stopScheduler()
@@ -52,7 +52,7 @@ function setup(t) {
 }
 
 test('an unbound slot has no exit to probe', async (t) => {
-  const { root, probe, lookups } = setup(t)
+  const { root, probe, lookups } = await setup(t)
   seed(root, { id: 'vm-free', proxy: null })
   const res = await probe('vm-free')
   assert.equal(res.status, 502)
@@ -61,7 +61,7 @@ test('an unbound slot has no exit to probe', async (t) => {
 })
 
 test('a node slot on local egress probes its own node row and refreshes it', async (t) => {
-  const { root, pool, probe, lookups } = setup(t)
+  const { root, pool, probe, lookups } = await setup(t)
   seed(root, { id: 'vm-tokyo', node_id: 'node-a', proxy: { id: 'px-local', host: 'local', scheme: 'local' } })
   pool.ensureLocal()
   assert.equal(pool.bind('px-local', 'vm-tokyo').proxy.id, 'px-local-node-a')
@@ -76,7 +76,7 @@ test('a node slot on local egress probes its own node row and refreshes it', asy
 })
 
 test('a control-plane Codex slot is probed through the deployment proxy', async (t) => {
-  const { root, pool, probe, lookups } = setup(t)
+  const { root, pool, probe, lookups } = await setup(t)
   const saved = process.env.HTTPS_PROXY
   process.env.HTTPS_PROXY = 'socks5://deploy.example:1080'
   t.after(() => {

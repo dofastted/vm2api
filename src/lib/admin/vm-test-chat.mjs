@@ -76,7 +76,7 @@ function gptRank(id) {
   return mini * 1000 - major * 10 - minor
 }
 
-export function listTestableModels(platform) {
+export async function listTestableModels(platform) {
   const kind = normalizeTestPlatform(platform)
   const rank = (id) => {
     if (kind === 'openai' || isGptSeriesId(id)) return gptRank(id)
@@ -100,17 +100,15 @@ export function listTestableModels(platform) {
   const effective = listOfficialModels().map((m) => map(m, 'effective'))
   const list = effective.length
     ? effective
-    : listPolicyModels()
-        .filter((m) => m.enabled !== false)
-        .map((m) => map(m, 'policy'))
+    : (await listPolicyModels()).filter((m) => m.enabled !== false).map((m) => map(m, 'policy'))
   const filtered = list.filter((m) => !isGptTestModel(m))
   return filtered.sort((a, b) => rank(a.id) - rank(b.id) || String(a.id).localeCompare(String(b.id)))
 }
 
-export function testModelsView(platform) {
+export async function testModelsView(platform) {
   const kind = normalizeTestPlatform(platform)
   return {
-    items: listTestableModels(kind),
+    items: await listTestableModels(kind),
     platform: kind,
     protocol: kind === 'openai' ? 'openai.responses' : kind === 'anthropic' ? 'anthropic.messages' : null,
     inbound_path: kind === 'openai' ? '/v1/responses' : kind === 'anthropic' ? '/v1/messages' : null,
@@ -207,8 +205,8 @@ export async function syncCodexCatalog({
       let access = account.access_token || target.codex?.access_token
       const accountId = account.chatgpt_account_id || target.codex?.chatgpt_account_id
       const refreshToken = account.refresh_token || target.codex?.refresh_token
-      const fetchOnce = () =>
-        fetchChatgptModelCatalog({
+      const fetchOnce = async () =>
+        await fetchChatgptModelCatalog({
           accessToken: access,
           accountId,
           proxyUrl,
@@ -273,7 +271,7 @@ export async function syncCodexCatalog({
     }
   }
   const models = [...merged.values()]
-  const { added } = syncGptIdsIntoPolicy(models, { displayNameOf: (id) => modelsDevMeta('openai', id)?.name })
+  const { added } = await syncGptIdsIntoPolicy(models, { displayNameOf: (id) => modelsDevMeta('openai', id)?.name })
   return {
     ok: true,
     vm_id: usedVm,
@@ -321,7 +319,7 @@ export async function resolveTestModels({
     })
     if (live.ok) source = 'chatgpt'
   }
-  return { ...testModelsView(kind), source }
+  return { ...(await testModelsView(kind)), source }
 }
 
 function extractText(body) {
@@ -851,11 +849,11 @@ async function postV1Loopback({ path, baseUrl, apiKey, inbound, headers, vmId, t
 }
 
 async function postV1Messages(opts) {
-  return postV1Loopback({ ...opts, path: '/v1/messages' })
+  return await postV1Loopback({ ...opts, path: '/v1/messages' })
 }
 
 async function postV1Responses(opts) {
-  return postV1Loopback({ ...opts, path: '/v1/responses' })
+  return await postV1Loopback({ ...opts, path: '/v1/responses' })
 }
 
 /**
@@ -968,7 +966,7 @@ export async function runVmTestChat(opts = {}) {
 
   let model = String(opts.model || '').trim()
   if (!model) {
-    const models = listTestableModels(codex ? 'openai' : 'anthropic')
+    const models = await listTestableModels(codex ? 'openai' : 'anthropic')
     model = models[0]?.id || (codex ? 'gpt-5.4' : 'claude-haiku-4-5-20251001')
   }
   push('info', `模型 ${model}`)

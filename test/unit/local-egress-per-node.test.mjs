@@ -17,9 +17,9 @@ import {
 
 const NODES = { 'vm-ctrl': null, 'vm-a1': 'node-a', 'vm-a2': 'node-a', 'vm-b1': 'node-b' }
 
-function makePool(t, opts = {}) {
+async function makePool(t, opts = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-local-node-'))
-  const pool = new ProxyPool({ dataDir: dir, vmNodeOf: (vmId) => NODES[vmId] ?? null, ...opts })
+  const pool = await new ProxyPool({ dataDir: dir, vmNodeOf: (vmId) => NODES[vmId] ?? null, ...opts }).init()
   pool.stopScheduler()
   t.after(() => {
     pool.stopScheduler()
@@ -43,8 +43,8 @@ test('local egress ids name their VPS and share one bridge per host', () => {
   assert.deepEqual(portsForProxy('px-local-node-a'), portsForProxy('px-local'))
 })
 
-test('a generic px-local bind lands on the slot’s own VPS row, with its own capacity', (t) => {
-  const pool = makePool(t)
+test('a generic px-local bind lands on the slot’s own VPS row, with its own capacity', async (t) => {
+  const pool = await makePool(t)
   pool.ensureLocal()
   pool.updateConfig({ bind_limit: 1 })
   assert.equal(pool.bind('px-local', 'vm-ctrl').proxy.id, 'px-local')
@@ -57,8 +57,8 @@ test('a generic px-local bind lands on the slot’s own VPS row, with its own ca
   assert.equal(pool.getProxyForVm('vm-a1').id, 'px-local-node-a')
 })
 
-test('another machine’s local row is refused', (t) => {
-  const pool = makePool(t)
+test('another machine’s local row is refused', async (t) => {
+  const pool = await makePool(t)
   pool.ensureLocal()
   pool.ensureLocalForNode('node-a')
   const wrong = pool.bind('px-local-node-a', 'vm-b1')
@@ -68,16 +68,16 @@ test('another machine’s local row is refused', (t) => {
   assert.equal(pool.bind('px-local-node-a', 'vm-ctrl').error, 'local_proxy_node_mismatch')
 })
 
-test('auto-allocation only offers the slot’s own local row', (t) => {
-  const pool = makePool(t)
+test('auto-allocation only offers the slot’s own local row', async (t) => {
+  const pool = await makePool(t)
   pool.ensureLocal()
   const picked = pool.allocateForVm('vm-b1')
   assert.equal(picked.id, 'px-local-node-b')
   assert.equal(pool.allocateForVm('vm-ctrl').id, 'px-local')
 })
 
-test('node rows follow the cluster and keep rows that still hold slots', (t) => {
-  const pool = makePool(t)
+test('node rows follow the cluster and keep rows that still hold slots', async (t) => {
+  const pool = await makePool(t)
   // No local egress in use: nothing is created for nodes.
   assert.deepEqual(pool.syncLocalNodes(['node-a']), { created: [], removed: [] })
   pool.ensureLocal()
@@ -90,8 +90,8 @@ test('node rows follow the cluster and keep rows that still hold slots', (t) => 
   assert.ok(pool.state.proxies.slice(0, 2).every((p) => isLocalEgressProxy(p)))
 })
 
-test('slots left on the shared row move to their node row, past a full limit', (t) => {
-  const pool = makePool(t)
+test('slots left on the shared row move to their node row, past a full limit', async (t) => {
+  const pool = await makePool(t)
   pool.ensureLocal()
   pool.updateConfig({ bind_limit: 1 })
   // Pre-split data: every local slot sits on px-local.
@@ -108,9 +108,10 @@ test('slots left on the shared row move to their node row, past a full limit', (
   assert.deepEqual(pool.adoptNodeLocalBindings(), [])
 })
 
-test('migration leaves ids of deleted slots alone', (t) => {
-  const pool = makePool(t, { vmNodeOf: (vmId) => (vmId === 'vm-gone' ? undefined : (NODES[vmId] ?? null)) })
+test('migration leaves ids of deleted slots alone', async (t) => {
+  const pool = await makePool(t, { vmNodeOf: (vmId) => (vmId === 'vm-gone' ? undefined : (NODES[vmId] ?? null)) })
   pool.ensureLocal()
+  await pool.flush()
   pool.state.proxies.find((p) => p.id === 'px-local').bound_vm_ids = ['vm-gone', 'vm-a1']
   assert.deepEqual(
     pool.adoptNodeLocalBindings().map((m) => m.vm_id),
@@ -121,7 +122,7 @@ test('migration leaves ids of deleted slots alone', (t) => {
 test('a node row probes its node link; a down link marks it failed without parking slots', async (t) => {
   let healthy = true
   const disabled = []
-  const pool = makePool(t, {
+  const pool = await makePool(t, {
     localExitHealth: (nodeId) =>
       healthy ? { ok: true, latency_ms: 42 } : { ok: false, error: `node_link_down:${nodeId}` },
     onDisableVm: (vmId) => disabled.push(vmId),
@@ -144,7 +145,7 @@ test('a node row probes its node link; a down link marks it failed without parki
 
 test('a node link still dialling leaves the row alone until it settles', async (t) => {
   let health = { pending: true, error: 'node_link_connecting' }
-  const pool = makePool(t, { localExitHealth: () => health })
+  const pool = await makePool(t, { localExitHealth: () => health })
   pool.ensureLocal()
   pool.bind('px-local', 'vm-a1')
   const row = pool.state.proxies.find((p) => p.id === 'px-local-node-a')
@@ -164,7 +165,7 @@ test('a node link still dialling leaves the row alone until it settles', async (
 test('a node row looks up its geo through that node’s route', async (t) => {
   const seen = []
   const geo = { ok: true, geo: { ip: '203.0.113.7', country: 'Japan', timezone: 'Asia/Tokyo' } }
-  const pool = makePool(t, {
+  const pool = await makePool(t, {
     localExitUrl: (nodeId) => `socks5h://${nodeId}@127.0.0.1:1080`,
     geoLookup: async (url) => {
       seen.push(url)
@@ -199,7 +200,7 @@ test('tearing down a node row never touches the control plane bridge', () => {
 
 test('an operator-disabled node row stays disabled through link changes', async (t) => {
   let health = { ok: false, error: 'node_link_backoff' }
-  const pool = makePool(t, { localExitHealth: () => health })
+  const pool = await makePool(t, { localExitHealth: () => health })
   pool.ensureLocal()
   pool.bind('px-local', 'vm-a1')
   const row = pool.state.proxies.find((p) => p.id === 'px-local-node-a')
@@ -213,9 +214,10 @@ test('an operator-disabled node row stays disabled through link changes', async 
   assert.equal(row.status, 'dead')
 })
 
-test('migration persists once for the whole batch', (t) => {
-  const pool = makePool(t)
+test('migration persists once for the whole batch', async (t) => {
+  const pool = await makePool(t)
   pool.ensureLocal()
+  await pool.flush()
   pool.state.proxies.find((p) => p.id === 'px-local').bound_vm_ids = ['vm-a1', 'vm-a2', 'vm-b1']
   let writes = 0
   const replaceAll = pool.repo.replaceAll.bind(pool.repo)
@@ -224,11 +226,12 @@ test('migration persists once for the whole batch', (t) => {
     return replaceAll(rows)
   }
   assert.equal(pool.adoptNodeLocalBindings().length, 3)
+  await pool.flush()
   assert.equal(writes, 1)
 })
 
-test('resolveLocalTarget lands a generic pick on the target VPS', (t) => {
-  const pool = makePool(t)
+test('resolveLocalTarget lands a generic pick on the target VPS', async (t) => {
+  const pool = await makePool(t)
   pool.ensureLocal()
   assert.deepEqual(pool.resolveLocalTarget('px-local', 'node-a'), { ok: true, id: 'px-local-node-a' })
   assert.ok(pool.state.proxies.some((p) => p.id === 'px-local-node-a'))

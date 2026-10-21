@@ -35,27 +35,27 @@ function clampInt(v, lo, hi, dflt) {
 }
 
 export function createClusterRoutes({ manager, json, readBody, ok }) {
-  function fail(res, err) {
+  function fail(res, err, respond = json) {
     const status = err instanceof ClusterError ? err.status : 500
     const code = err instanceof ClusterError ? err.code : 'cluster_error'
-    return json(res, status, { ok: false, error: { type: 'cluster', code, message: err.message || String(err) } })
+    return respond(res, status, { ok: false, error: { type: 'cluster', code, message: err.message || String(err) } })
   }
 
-  async function route(req, res, url) {
+  async function route(req, res, url, respond = json) {
     const p = url.pathname
     const m = req.method
 
-    if (p === `${PREFIX}/nodes` && m === 'GET') return json(res, 200, ok({ items: manager.list() }))
+    if (p === `${PREFIX}/nodes` && m === 'GET') return respond(res, 200, ok({ items: manager.list() }))
     if (p === `${PREFIX}/local` && m === 'GET') {
-      return json(res, 200, ok(await manager.localStatus({ refresh: url.searchParams.get('refresh') === '1' })))
+      return respond(res, 200, ok(await manager.localStatus({ refresh: url.searchParams.get('refresh') === '1' })))
     }
     if (p === `${PREFIX}/nodes` && m === 'POST') {
       const body = await readBody(req, MAX_BODY)
-      return json(res, 201, ok(manager.add(body)))
+      return respond(res, 201, ok(await manager.add(body)))
     }
     if (p === `${PREFIX}/nodes/probe` && m === 'POST') {
       const body = await readBody(req, MAX_BODY)
-      return json(res, 200, ok(await manager.probe(body)))
+      return respond(res, 200, ok(await manager.probe(body)))
     }
 
     const nm = NODE_RE.exec(p)
@@ -63,31 +63,31 @@ export function createClusterRoutes({ manager, json, readBody, ok }) {
     const id = nm[1]
     const sub = nm[2] || ''
 
-    if (sub === '' && m === 'GET') return json(res, 200, ok(manager.get(id)))
+    if (sub === '' && m === 'GET') return respond(res, 200, ok(manager.get(id)))
     if (sub === '' && m === 'PATCH') {
       const body = await readBody(req, MAX_BODY)
-      return json(res, 200, ok(await manager.update(id, body)))
+      return respond(res, 200, ok(await manager.update(id, body)))
     }
     if (sub === '/probe' && m === 'POST') {
       const body = await readBody(req, MAX_BODY)
-      return json(res, 200, ok(await manager.probeUpdate(id, body)))
+      return respond(res, 200, ok(await manager.probeUpdate(id, body)))
     }
     if (sub === '' && m === 'DELETE') {
       await manager.remove(id)
-      return json(res, 200, ok({ id }))
+      return respond(res, 200, ok({ id }))
     }
-    if (sub === '/reconnect' && m === 'POST') return json(res, 200, ok(manager.reconnect(id)))
+    if (sub === '/reconnect' && m === 'POST') return respond(res, 200, ok(manager.reconnect(id)))
     if (sub === '/direct-link' && m === 'PUT') {
       const body = await readBody(req, MAX_BODY)
-      return json(res, 200, ok(await manager.setDirectLink(id, body)))
+      return respond(res, 200, ok(await manager.setDirectLink(id, body)))
     }
-    if (sub === '/direct-link' && m === 'DELETE') return json(res, 200, ok(await manager.clearDirectLink(id)))
-    if (sub === '/shell-ticket' && m === 'POST') return json(res, 200, ok(manager.issueShellTicket(id)))
+    if (sub === '/direct-link' && m === 'DELETE') return respond(res, 200, ok(await manager.clearDirectLink(id)))
+    if (sub === '/shell-ticket' && m === 'POST') return respond(res, 200, ok(manager.issueShellTicket(id)))
 
-    if (sub === '/docker/info' && m === 'GET') return json(res, 200, ok(await dockerInfo(manager.docker(id))))
+    if (sub === '/docker/info' && m === 'GET') return respond(res, 200, ok(await dockerInfo(manager.docker(id))))
     if (sub === '/preflight' && m === 'POST') {
       const body = await readBody(req, MAX_BODY)
-      return json(
+      return respond(
         res,
         200,
         ok(
@@ -101,7 +101,7 @@ export function createClusterRoutes({ manager, json, readBody, ok }) {
     if (sub === '/slot-image' && m === 'POST') {
       const body = await readBody(req, MAX_BODY)
       manager.get(id)
-      return json(
+      return respond(
         res,
         202,
         ok(
@@ -111,20 +111,20 @@ export function createClusterRoutes({ manager, json, readBody, ok }) {
     }
     if (sub === '/slot-image' && m === 'GET') {
       manager.get(id)
-      return json(
+      return respond(
         res,
         200,
         ok(slotImageJob(id, kernelOf(url.searchParams.get('kernel')), url.searchParams.get('runtime_type'))),
       )
     }
-    if (sub === '/docker/install' && m === 'POST') return json(res, 202, ok(manager.startDockerInstall(id)))
-    if (sub === '/docker/install' && m === 'GET') return json(res, 200, ok(manager.get(id).install))
+    if (sub === '/docker/install' && m === 'POST') return respond(res, 202, ok(manager.startDockerInstall(id)))
+    if (sub === '/docker/install' && m === 'GET') return respond(res, 200, ok(manager.get(id).install))
     if (sub === '/docker/containers' && m === 'GET') {
-      return json(res, 200, ok({ items: await listContainers(manager.docker(id)) }))
+      return respond(res, 200, ok({ items: await listContainers(manager.docker(id)) }))
     }
     if (sub === '/docker/containers' && m === 'POST') {
       const body = await readBody(req, MAX_BODY)
-      return json(res, 201, ok(await createAndStartContainer(manager.docker(id), body)))
+      return respond(res, 201, ok(await createAndStartContainer(manager.docker(id), body)))
     }
 
     const cm = /^\/docker\/containers\/([^/]+)(?:\/(start|stop|restart|logs))?$/.exec(sub)
@@ -133,35 +133,35 @@ export function createClusterRoutes({ manager, json, readBody, ok }) {
       const action = cm[2]
       if (!action && m === 'DELETE') {
         await removeContainer(manager.docker(id), cid)
-        return json(res, 200, ok({ id: cid }))
+        return respond(res, 200, ok({ id: cid }))
       }
       if (action === 'logs' && m === 'GET') {
         const tail = clampInt(url.searchParams.get('tail'), 1, 5000, 200)
-        return json(res, 200, ok(await containerLogs(manager.docker(id), cid, { tail })))
+        return respond(res, 200, ok(await containerLogs(manager.docker(id), cid, { tail })))
       }
       if (action && action !== 'logs' && m === 'POST') {
         await containerAction(manager.docker(id), cid, action)
-        return json(res, 200, ok({ id: cid, action }))
+        return respond(res, 200, ok({ id: cid, action }))
       }
     }
     return false
   }
 
-  async function handle(req, res, url) {
+  async function handle(req, res, url, respond = json) {
     if (!url.pathname.startsWith(`${PREFIX}/`)) return false
     try {
-      const handled = await route(req, res, url)
+      const handled = await route(req, res, url, respond)
       if (handled === false)
-        return json(res, 404, { ok: false, error: { type: 'cluster', code: 'not_found', message: 'not found' } })
+        return respond(res, 404, { ok: false, error: { type: 'cluster', code: 'not_found', message: 'not found' } })
       return true
     } catch (err) {
       if (!(err instanceof ClusterError) && err?.status) {
-        return json(res, err.status, {
+        return respond(res, err.status, {
           ok: false,
           error: { type: 'cluster', code: 'bad_request', message: err.message },
         })
       }
-      return fail(res, err)
+      return fail(res, err, respond)
     }
   }
 

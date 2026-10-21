@@ -10,16 +10,16 @@ function tmpDir(prefix = 'kin-px-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
 }
 
-function makePool() {
-  const pool = new ProxyPool({ dataDir: tmpDir() })
+async function makePool() {
+  const pool = await new ProxyPool({ dataDir: tmpDir() }).init()
   pool.stopScheduler()
   return pool
 }
 
-test('proxy pool persists custom dns_primary and rejects invalid URLs without changing it', (t) => {
+test('proxy pool persists custom dns_primary and rejects invalid URLs without changing it', async (t) => {
   const dir = tmpDir()
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
-  const pool = new ProxyPool({ dataDir: dir })
+  const pool = await new ProxyPool({ dataDir: dir }).init()
   pool.stopScheduler()
   assert.equal(pool.updateConfig({ dns_primary: '8.8.8.8:53' }).ok, true)
   const primary = 'https://cloudflare-dns.com:8443/dns-query?key=a%2Cb'
@@ -37,15 +37,15 @@ test('proxy pool persists custom dns_primary and rejects invalid URLs without ch
     assert.equal(result.error, 'invalid_dns_primary', invalid)
     assert.equal(pool.snapshot().config.dns_primary, primary)
   }
-  const reopened = new ProxyPool({ dataDir: dir })
+  const reopened = await new ProxyPool({ dataDir: dir }).init()
   reopened.stopScheduler()
   assert.equal(reopened.snapshot().config.dns_primary, primary)
 })
 
-test('DNS type suppression persists both toggle states and rejects non-booleans', (t) => {
+test('DNS type suppression persists both toggle states and rejects non-booleans', async (t) => {
   const dir = tmpDir()
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
-  const pool = new ProxyPool({ dataDir: dir })
+  const pool = await new ProxyPool({ dataDir: dir }).init()
   pool.stopScheduler()
   assert.equal(pool.snapshot().config.dns_disable_svcb_https, false)
   assert.equal(pool.updateConfig({ dns_disable_svcb_https: true }).ok, true)
@@ -55,11 +55,11 @@ test('DNS type suppression persists both toggle states and rejects non-booleans'
     assert.equal(pool.snapshot().config.dns_disable_svcb_https, true)
     assert.equal(pool.snapshot().config.dns_primary, 'auto')
   }
-  const reopened = new ProxyPool({ dataDir: dir })
+  const reopened = await new ProxyPool({ dataDir: dir }).init()
   reopened.stopScheduler()
   assert.equal(reopened.snapshot().config.dns_disable_svcb_https, true)
   assert.equal(reopened.updateConfig({ dns_disable_svcb_https: false }).ok, true)
-  const disabled = new ProxyPool({ dataDir: dir })
+  const disabled = await new ProxyPool({ dataDir: dir }).init()
   disabled.stopScheduler()
   assert.equal(disabled.snapshot().config.dns_disable_svcb_https, false)
 })
@@ -74,8 +74,8 @@ test('clampBindLimit defaults to 5 and stays in 1..32', () => {
   assert.equal(clampBindLimit('x'), MAX_VMS_PER_PROXY)
 })
 
-test('bind_limit defaults to 5 and is configurable', () => {
-  const pool = makePool()
+test('bind_limit defaults to 5 and is configurable', async () => {
+  const pool = await makePool()
   pool.importLines('10.0.0.1:1080')
   const id = pool.snapshot().proxies[0].id
   assert.equal(pool.bindLimit(), 5)
@@ -106,8 +106,8 @@ test('bind_limit defaults to 5 and is configurable', () => {
   assert.equal(pool.bind(id, 'vm-03').max, 2)
 })
 
-test('remove deletes a proxy and updateConfig rejects bad bind_limit', () => {
-  const pool = makePool()
+test('remove deletes a proxy and updateConfig rejects bad bind_limit', async () => {
+  const pool = await makePool()
   pool.importLines('10.0.0.2:1080')
   const id = pool.snapshot().proxies[0].id
   const removed = pool.remove(id)
@@ -131,10 +131,10 @@ async function listenSocks() {
 
 test('probeOne marks egress_down after SOCKS greeting if helper is dead', async () => {
   const socks = await listenSocks()
-  const pool = new ProxyPool({
+  const pool = await new ProxyPool({
     dataDir: tmpDir(),
     egressCheck: () => ({ ok: false, reason: 'not_running' }),
-  })
+  }).init()
   pool.stopScheduler()
   try {
     pool.importLines(`${socks.host}:${socks.port}`)
@@ -150,13 +150,13 @@ test('probeOne marks egress_down after SOCKS greeting if helper is dead', async 
 test('probeOne repairs egress then passes', async () => {
   const socks = await listenSocks()
   let healthy = false
-  const pool = new ProxyPool({
+  const pool = await new ProxyPool({
     dataDir: tmpDir(),
     egressCheck: () => ({ ok: healthy }),
     repairEgress: () => {
       healthy = true
     },
-  })
+  }).init()
   pool.stopScheduler()
   try {
     pool.importLines(`${socks.host}:${socks.port}`)
@@ -173,14 +173,14 @@ test('startScheduler immediately repairs enabled egress', async () => {
   const socks = await listenSocks()
   let healthy = false
   let repairs = 0
-  const pool = new ProxyPool({
+  const pool = await new ProxyPool({
     dataDir: tmpDir(),
     egressCheck: () => ({ ok: healthy, reason: healthy ? null : 'not_running' }),
     repairEgress: () => {
       repairs += 1
       healthy = true
     },
-  })
+  }).init()
   try {
     pool.importLines(`${socks.host}:${socks.port}`)
     pool.startScheduler()
@@ -196,10 +196,10 @@ test('startScheduler immediately repairs enabled egress', async () => {
 
 test('egress_down does not mark a live SOCKS proxy dead', async () => {
   const socks = await listenSocks()
-  const pool = new ProxyPool({
+  const pool = await new ProxyPool({
     dataDir: tmpDir(),
     egressCheck: () => ({ ok: false, reason: 'not_running' }),
-  })
+  }).init()
   pool.stopScheduler()
   try {
     pool.importLines(`${socks.host}:${socks.port}`)
@@ -220,7 +220,7 @@ test('TCP connect then close is not a SOCKS death', async () => {
   const server = net.createServer((socket) => socket.destroy())
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
   const addr = server.address()
-  const pool = new ProxyPool({ dataDir: tmpDir() })
+  const pool = await new ProxyPool({ dataDir: tmpDir() }).init()
   pool.stopScheduler()
   try {
     pool.importLines(`${addr.address}:${addr.port}`)
@@ -234,7 +234,7 @@ test('TCP connect then close is not a SOCKS death', async () => {
 
 test('probeAll resurrects a probe-killed proxy', async () => {
   const socks = await listenSocks()
-  const pool = new ProxyPool({ dataDir: tmpDir() })
+  const pool = await new ProxyPool({ dataDir: tmpDir() }).init()
   pool.stopScheduler()
   try {
     pool.importLines(`${socks.host}:${socks.port}`)
@@ -253,8 +253,8 @@ test('probeAll resurrects a probe-killed proxy', async () => {
   }
 })
 
-test('ensureLocal adds a single local egress row', () => {
-  const pool = makePool()
+test('ensureLocal adds a single local egress row', async () => {
+  const pool = await makePool()
   const first = pool.ensureLocal()
   const second = pool.ensureLocal()
   assert.equal(first.ok, true)
@@ -272,11 +272,11 @@ test('ensureLocal adds a single local egress row', () => {
 
 test('local egress probe stays direct when kin-egress is down', async () => {
   const disabled = []
-  const pool = new ProxyPool({
+  const pool = await new ProxyPool({
     dataDir: tmpDir(),
     egressCheck: () => ({ ok: false, reason: 'local_network_missing' }),
     onDisableVm: (vmId) => disabled.push(vmId),
-  })
+  }).init()
   pool.stopScheduler()
   pool.ensureLocal()
   pool.bind('px-local', 'vm-01')

@@ -2,7 +2,7 @@
  * GPT catalog. Separate settings key from Claude model_policy.
  * Live ids from ChatGPT sync; seed is empty-catalog fallback.
  */
-import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { RuntimeSettings as SettingsRepo } from '../db/settings-state.mjs'
 import { isGptSeriesId, isSyncableGptCatalogId } from './gpt-ids.mjs'
 
 const SETTINGS_KEY = 'gpt_model_policy'
@@ -56,15 +56,15 @@ export function seedGptPolicy() {
 let policy = seedGptPolicy()
 let loaded = false
 
-function persist() {
+async function persist() {
   try {
-    new SettingsRepo().set(SETTINGS_KEY, policy)
+    await new SettingsRepo().set(SETTINGS_KEY, policy)
   } catch (e) {
     console.warn('[gpt-model-policy] persist failed', e?.message || e)
   }
 }
 
-export function loadGptModelPolicy({ force = false } = {}) {
+export async function loadGptModelPolicy({ force = false } = {}) {
   if (loaded && !force) return policy
   try {
     const stored = new SettingsRepo().get(SETTINGS_KEY, null)
@@ -77,7 +77,7 @@ export function loadGptModelPolicy({ force = false } = {}) {
       policy.source = policy.source || 'settings'
     } else {
       policy = seedGptPolicy()
-      persist()
+      await persist()
     }
   } catch {
     policy = seedGptPolicy()
@@ -87,11 +87,10 @@ export function loadGptModelPolicy({ force = false } = {}) {
 }
 
 export function getGptModelPolicy() {
-  if (!loaded) loadGptModelPolicy()
   return policy
 }
 
-export function saveGptModelPolicy(next) {
+export async function saveGptModelPolicy(next) {
   const seed = seedGptPolicy()
   const models = { ...(seed.models || {}) }
   if (next?.models && typeof next.models === 'object') {
@@ -108,11 +107,10 @@ export function saveGptModelPolicy(next) {
     updated_at: new Date().toISOString(),
     source: 'panel',
   }
-  persist()
+  await persist()
   return policy
 }
 export function listGptPolicyModels() {
-  if (!loaded) loadGptModelPolicy()
   return Object.entries(policy.models || {})
     .filter(([id, cfg]) => isGptSeriesId(id) && cfg?.enabled !== false)
     .map(([id, cfg]) => ({ id, ...cfg, family: 'codex' }))
@@ -120,7 +118,6 @@ export function listGptPolicyModels() {
 }
 
 export function getGptPolicyCatalogIds({ enabledOnly = false } = {}) {
-  if (!loaded) loadGptModelPolicy()
   return Object.entries(policy.models || {})
     .filter(([id, cfg]) => isGptSeriesId(id) && (!enabledOnly || cfg?.enabled !== false))
     .map(([id]) => id)
@@ -128,17 +125,16 @@ export function getGptPolicyCatalogIds({ enabledOnly = false } = {}) {
 
 export function isGptModelEnabled(id) {
   if (!isGptSeriesId(id)) return false
-  if (!loaded) loadGptModelPolicy()
   const row = policy.models?.[id]
   if (row) return row.enabled !== false
   if (policy.source === 'codex' && Object.keys(policy.models || {}).length) return false
   return true
 }
 
-export function resetGptModelPolicy() {
+export async function resetGptModelPolicy() {
   policy = seedGptPolicy()
   loaded = true
-  persist()
+  await persist()
   return policy
 }
 
@@ -147,8 +143,7 @@ export function resetGptModelPolicy() {
  * a GPT id the policy has never seen starts disabled until the admin enables it
  * (GPT has no worker_only mode).
  */
-export function syncGptIdsIntoPolicy(ids = [], { displayNameOf = null } = {}) {
-  if (!loaded) loadGptModelPolicy()
+export async function syncGptIdsIntoPolicy(ids = [], { displayNameOf = null } = {}) {
   const live = []
   const seen = new Set()
   for (const item of ids || []) {
@@ -182,7 +177,7 @@ export function syncGptIdsIntoPolicy(ids = [], { displayNameOf = null } = {}) {
     updated_at: new Date().toISOString(),
     source: 'codex',
   }
-  persist()
+  await persist()
   return {
     ok: true,
     synced: live.length,

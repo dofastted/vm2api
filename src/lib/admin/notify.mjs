@@ -958,6 +958,9 @@ export function createNotifyMonitor(opts = {}) {
     getStatus,
     runOnce,
     start,
+    flush: async () => {
+      while (inflight) await inflight
+    },
     stop,
   }
 }

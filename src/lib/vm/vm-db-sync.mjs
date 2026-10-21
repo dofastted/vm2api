@@ -1,7 +1,7 @@
 /**
- * VM/credential DB mirror — write-through + reconcile + fs.watch.
+ * VM metadata DB mirror — write-through + reconcile + fs.watch.
  *
- * Policy (user requirement: credentials must live in the database):
+ * Policy (VmsRepo omits active credentials and retains their presence flags):
  *   - vms/*.json stay the runtime single-writer surface (persistOauthToVm,
  *     CLI seed, execution context all read files — no behavior drift).
  *   - Every vm.json write is mirrored into the `vms` table:
@@ -21,6 +21,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { isDbOpen, getDb } from '../db/database.mjs'
 import { VmsRepo } from '../db/repos/vms-repo.mjs'
+import { WriteQueue } from '../pool/write-queue.mjs'
 import { setVmWriteHook, atomicWriteJson, isVmRecordFile } from './vm-file.mjs'
 import { reclaimAssignedVms, repairSlotSmbios, repairVmProxyCliEnabled } from './vm-registry.mjs'
 
@@ -28,6 +29,9 @@ let _repo = null
 let _watcher = null
 let _watchTimer = null
 let _projectRoot = null
+let _writes = new WriteQueue()
+let _paused = false
+const _deleted = new Set()
 
 function repo() {
   if (!isDbOpen()) return null
@@ -42,40 +46,63 @@ export function isVmJsonPath(filePath) {
   return isVmRecordFile(base) || base === 'active.json'
 }
 
-/** Mirror one vms/*.json file into the DB (safe no-op without DB). */
+/** Mirror a captured file snapshot in write order. Flush reports persistence errors. */
 export function syncVmFile(filePath) {
   const r = repo()
-  if (!r) return false
+  if (!r || _paused) return Promise.resolve(false)
+  let value
+  let mtimeMs
   try {
-    const base = path.basename(filePath)
-    if (base === 'active.json') {
-      const a = JSON.parse(fs.readFileSync(filePath, 'utf8'))
-      if (a?.active_vm) r.setActiveVmId(a.active_vm)
-      return true
-    }
-    const vm = JSON.parse(fs.readFileSync(filePath, 'utf8'))
-    if (!vm?.id) return false
-    const st = fs.statSync(filePath)
-    r.upsertFromVmJson(vm, { mtimeMs: st.mtimeMs })
-    return true
-  } catch {
-    return false
+    value = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+    mtimeMs = fs.statSync(filePath).mtimeMs
+  } catch (error) {
+    if (error.code === 'ENOENT') return Promise.resolve(false)
+    _writes.enqueue(() => {
+      throw error
+    })
+    return _writes.flush().then(() => false)
   }
+  const active = path.basename(filePath) === 'active.json'
+  if (!active && value?.id) _deleted.delete(value.id)
+  if (active ? !value?.active_vm : !value?.id) return Promise.resolve(false)
+  _writes.enqueue(() => (active ? r.setActiveVmId(value.active_vm) : r.upsertFromVmJson(value, { mtimeMs })))
+  return _writes.flush().then(() => true)
 }
 
-/** Remove a VM row (called when the vm.json file is deleted). */
-export function removeVmFromDb(id) {
+/** Deletes follow every previously captured upsert. */
+export async function removeVmFromDb(id) {
   const r = repo()
   if (!r || !id) return false
-  return r.remove(id)
+  _deleted.add(id)
+  let removed = false
+  _writes.enqueue(async () => {
+    removed = await r.remove(id)
+  })
+  await _writes.flush()
+  return removed
 }
 
-/** Forget settings.active_vm so startup reconcile does not rewrite active.json. */
-export function clearActiveVmFromDb() {
+export async function clearActiveVmFromDb() {
   const r = repo()
   if (!r) return false
-  r.clearActiveVmId()
+  _writes.enqueue(() => r.clearActiveVmId())
+  await _writes.flush()
   return true
+}
+
+export function flushVmDbSync() {
+  return _writes.flush()
+}
+
+export async function pauseVmDbSync() {
+  _paused = true
+  stopVmWatch()
+  await flushVmDbSync()
+}
+
+export function resumeVmDbSync() {
+  _paused = false
+  if (_projectRoot) startVmWatch(_projectRoot)
 }
 
 /**
@@ -84,61 +111,83 @@ export function clearActiveVmFromDb() {
  *   - DB row exists but file missing → rebuild file from vm_json
  * @returns {{ upserted: number, rebuilt: number, active: string|null }}
  */
-export function reconcileVms(projectRoot) {
+export async function reconcileVms(projectRoot) {
   const r = repo()
   if (!r) return { upserted: 0, rebuilt: 0, active: null }
   const dir = path.join(projectRoot, 'vms')
   const out = { upserted: 0, rebuilt: 0, active: null }
   const seen = new Set()
 
+  // The file snapshot and its conditional database write share the same queue
+  // as write hooks. A newer hook always executes after this snapshot.
   if (fs.existsSync(dir)) {
-    for (const f of fs.readdirSync(dir)) {
-      if (!isVmRecordFile(f)) continue
-      const file = path.join(dir, f)
-      try {
-        const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
-        if (!vm?.id) continue
+    for (const name of fs.readdirSync(dir)) {
+      if (!isVmRecordFile(name)) continue
+      _writes.enqueue(async () => {
+        const file = path.join(dir, name)
+        let vm
+        let stat
+        try {
+          vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+          stat = fs.statSync(file)
+        } catch (error) {
+          if (error.code === 'ENOENT' || error instanceof SyntaxError) return
+          throw error
+        }
+        if (!vm?.id || _deleted.has(vm.id)) return
         seen.add(vm.id)
-        const st = fs.statSync(file)
-        const row = r.get(vm.id)
-        if (!row || (row.file_mtime_ms || 0) < Math.floor(st.mtimeMs)) {
-          r.upsertFromVmJson(vm, { mtimeMs: st.mtimeMs })
+        const row = await r.get(vm.id)
+        if (!row || (row.file_mtime_ms || 0) < Math.floor(stat.mtimeMs)) {
+          await r.upsertFromVmJson(vm, { mtimeMs: stat.mtimeMs })
           out.upserted += 1
         }
-      } catch {}
+      })
     }
   }
+  await flushVmDbSync()
 
-  // DB rows without files → rebuild files (restore / disaster pull-up)
-  for (const row of r.list()) {
-    if (seen.has(row.id) || !row.vm) continue
-    try {
-      fs.mkdirSync(dir, { recursive: true })
+  let rows = []
+  _writes.enqueue(async () => {
+    rows = await r.list()
+  })
+  await flushVmDbSync()
+  for (const row of rows) {
+    if (seen.has(row.id)) continue
+    _writes.enqueue(async () => {
+      const current = await r.get(row.id)
       const file = path.join(dir, `${row.id}.json`)
-      atomicWriteJson(file, row.vm, { mode: 0o600 })
+      if (!current?.vm || _deleted.has(row.id) || fs.existsSync(file)) return
+      fs.mkdirSync(dir, { recursive: true })
+      atomicWriteJson(file, current.vm, { mode: 0o600 })
       out.rebuilt += 1
-    } catch {}
+    })
   }
+  await flushVmDbSync()
 
-  // active.json ↔ settings.active_vm
-  const activeFile = path.join(dir, 'active.json')
-  try {
+  _writes.enqueue(async () => {
+    const activeFile = path.join(dir, 'active.json')
     if (fs.existsSync(activeFile)) {
-      const a = JSON.parse(fs.readFileSync(activeFile, 'utf8'))
-      if (a?.active_vm) {
-        r.setActiveVmId(a.active_vm)
-        out.active = a.active_vm
+      let active
+      try {
+        active = JSON.parse(fs.readFileSync(activeFile, 'utf8'))
+      } catch (error) {
+        if (error instanceof SyntaxError) return
+        throw error
+      }
+      if (active?.active_vm && !_deleted.has(active.active_vm)) {
+        await r.setActiveVmId(active.active_vm)
+        out.active = active.active_vm
       }
     } else {
-      const dbActive = r.getActiveVmId()
-      if (dbActive) {
+      const active = await r.getActiveVmId()
+      if (active && !_deleted.has(active)) {
         fs.mkdirSync(dir, { recursive: true })
-        atomicWriteJson(activeFile, { active_vm: dbActive, updated_at: new Date().toISOString() })
-        out.active = dbActive
+        atomicWriteJson(activeFile, { active_vm: active, updated_at: new Date().toISOString() })
+        out.active = active
       }
     }
-  } catch {}
-
+  })
+  await flushVmDbSync()
   return out
 }
 
@@ -146,21 +195,20 @@ export function reconcileVms(projectRoot) {
  * Install the write-through hook + directory watcher.
  * Call once at server startup, after openDatabase().
  */
-export function initVmDbSync(projectRoot, { watch = true } = {}) {
+export async function initVmDbSync(projectRoot, { watch = true } = {}) {
   _projectRoot = projectRoot
-  setVmWriteHook((filePath) => {
-    if (isVmJsonPath(filePath)) syncVmFile(filePath)
+  await flushVmDbSync()
+  _writes = new WriteQueue(isDbOpen() ? getDb() : null)
+  _paused = false
+  _deleted.clear()
+  setVmWriteHook(async (filePath) => {
+    if (isVmJsonPath(filePath)) syncVmFile(filePath).catch(() => {})
   })
-  const result = reconcileVms(projectRoot)
+  const result = await reconcileVms(projectRoot)
   // Older releases soft-deleted tenants without releasing their assigned slots.
   // Only confirmed deletions qualify; disabled/missing users and private slots stay isolated.
   const deletedOwners = isDbOpen()
-    ? new Set(
-        getDb()
-          .prepare('SELECT id FROM users WHERE deleted_at IS NOT NULL')
-          .all()
-          .map((row) => row.id),
-      )
+    ? new Set((await getDb().prepare('SELECT id FROM users WHERE deleted_at IS NOT NULL').all()).map((row) => row.id))
     : new Set()
   result.reclaimed_vm_ids = reclaimAssignedVms(projectRoot, deletedOwners, {
     onError: (error, name) => {
@@ -177,6 +225,7 @@ export function initVmDbSync(projectRoot, { watch = true } = {}) {
   } catch {
     result.smbios_repaired = 0
   }
+  await flushVmDbSync()
   if (watch) startVmWatch(projectRoot)
   return result
 }
@@ -189,10 +238,12 @@ export function startVmWatch(projectRoot) {
   try {
     _watcher = fs.watch(dir, () => {
       if (_watchTimer) clearTimeout(_watchTimer)
-      _watchTimer = setTimeout(() => {
+      _watchTimer = setTimeout(async () => {
         _watchTimer = null
         try {
-          reconcileDeletionsAndChanges(projectRoot)
+          reconcileDeletionsAndChanges(projectRoot).catch((error) => {
+            console.warn(`[vm] database mirror failed: ${error.code || error.name}`)
+          })
         } catch {}
       }, 500)
       if (typeof _watchTimer.unref === 'function') _watchTimer.unref()
@@ -205,37 +256,21 @@ export function startVmWatch(projectRoot) {
   }
 }
 
-function reconcileDeletionsAndChanges(projectRoot) {
+async function reconcileDeletionsAndChanges(projectRoot) {
   const r = repo()
   if (!r) return
-  reconcileVmsChangesOnly(projectRoot, r)
+  if (!_paused) await reconcileVmsChangesOnly(projectRoot, r)
 }
 
 /** Watch-triggered pass: upsert changed files; DO NOT rebuild deleted files
  *  (a panel-initiated VM delete must stay deleted — server removes the row). */
-function reconcileVmsChangesOnly(projectRoot, r) {
+async function reconcileVmsChangesOnly(projectRoot) {
   const dir = path.join(projectRoot, 'vms')
   if (!fs.existsSync(dir)) return
-  for (const f of fs.readdirSync(dir)) {
-    if (!isVmRecordFile(f)) continue
-    const file = path.join(dir, f)
-    try {
-      const st = fs.statSync(file)
-      const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
-      if (!vm?.id) continue
-      const row = r.get(vm.id)
-      if (!row || (row.file_mtime_ms || 0) < Math.floor(st.mtimeMs)) {
-        r.upsertFromVmJson(vm, { mtimeMs: st.mtimeMs })
-      }
-    } catch {}
+  for (const file of fs.readdirSync(dir)) {
+    if (_paused) return
+    if (isVmRecordFile(file) || file === 'active.json') await syncVmFile(path.join(dir, file))
   }
-  const activeFile = path.join(dir, 'active.json')
-  try {
-    if (fs.existsSync(activeFile)) {
-      const a = JSON.parse(fs.readFileSync(activeFile, 'utf8'))
-      if (a?.active_vm && a.active_vm !== r.getActiveVmId()) r.setActiveVmId(a.active_vm)
-    }
-  } catch {}
 }
 
 export function stopVmWatch() {

@@ -4,15 +4,15 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createDatabase } from '../../src/lib/db/database.mjs'
-import { AccountRuntimeRepo } from '../../src/lib/db/repos/account-runtime-repo.mjs'
+import { SchedulingRuntime as AccountRuntimeRepo } from '../../src/lib/pool/scheduling-runtime.mjs'
 import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
 import { RateLimitService, anthropic429Reset, hardBlockOf } from '../../src/lib/pool/rate-limit-service.mjs'
 
-function setup(config = {}) {
+async function setup(config = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-rate-limit-'))
-  const db = createDatabase({ dataDir: dir })
-  const runtimeRepo = new AccountRuntimeRepo(db)
-  const accountQuota = new AccountQuota({ db, config: {} })
+  const db = await createDatabase({ dataDir: dir })
+  const runtimeRepo = await new AccountRuntimeRepo(db).init()
+  const accountQuota = await new AccountQuota({ db, config: {} }).init()
   accountQuota.attachRuntimeRepo(runtimeRepo)
   runtimeRepo.upsert({ account_id: 'acc-1', vm_id: 'vm-01', status: 'ready' })
   const probes = []
@@ -22,8 +22,8 @@ function setup(config = {}) {
     config,
     onUsageProbe: (item) => probes.push(item),
   })
-  const close = () => {
-    db.close()
+  const close = async () => {
+    await db.close()
     fs.rmSync(dir, { recursive: true, force: true })
   }
   return { service, runtimeRepo, accountQuota, probes, close }
@@ -41,8 +41,8 @@ function limitResult(message) {
   }
 }
 
-test('plan limit writes rate_limit_reset_at from the text and survives a passive Extra re-read', () => {
-  const { service, runtimeRepo, accountQuota, probes, close } = setup()
+test('plan limit writes rate_limit_reset_at from the text and survives a passive Extra re-read', async () => {
+  const { service, runtimeRepo, accountQuota, probes, close } = await setup()
   try {
     const now = Date.now()
     const block = service.handleUpstreamError({
@@ -64,12 +64,12 @@ test('plan limit writes rate_limit_reset_at from the text and survives a passive
     accountQuota.clearQuotaExhaustedCooldown('acc-1')
     assert.equal(runtimeRepo.get('acc-1').rate_limit_reset_at, state.rate_limit_reset_at)
   } finally {
-    close()
+    await close()
   }
 })
 
-test('plan limit without any reset falls back to the configured cooldown and asks for one /usage hop', () => {
-  const { service, runtimeRepo, probes, close } = setup({ fallback_cooldown_min: 30 })
+test('plan limit without any reset falls back to the configured cooldown and asks for one /usage hop', async () => {
+  const { service, runtimeRepo, probes, close } = await setup({ fallback_cooldown_min: 30 })
   try {
     const now = Date.now()
     const block = service.handleUpstreamError({
@@ -84,12 +84,12 @@ test('plan limit without any reset falls back to the configured cooldown and ask
     assert.equal(Math.abs(runtimeRepo.get('acc-1').rate_limit_reset_at - block.until) < 1000, true)
     assert.deepEqual(probes, [{ accountId: 'acc-1', vmId: 'vm-01' }])
   } finally {
-    close()
+    await close()
   }
 })
 
-test('model-scoped 429 does not write an account hard block', () => {
-  const { service, runtimeRepo, close } = setup()
+test('model-scoped 429 does not write an account hard block', async () => {
+  const { service, runtimeRepo, close } = await setup()
   try {
     const block = service.handleUpstreamError({
       accountId: 'acc-1',
@@ -100,12 +100,12 @@ test('model-scoped 429 does not write an account hard block', () => {
     assert.equal(block, null)
     assert.equal(runtimeRepo.get('acc-1').rate_limit_reset_at, null)
   } finally {
-    close()
+    await close()
   }
 })
 
-test('#163: an unknown bare 429 asks for one usage probe and fabricates no 5h block', () => {
-  const { service, runtimeRepo, probes, close } = setup()
+test('#163: an unknown bare 429 asks for one usage probe and fabricates no 5h block', async () => {
+  const { service, runtimeRepo, probes, close } = await setup()
   try {
     const block = service.handleUpstreamError({
       accountId: 'acc-1',
@@ -117,12 +117,12 @@ test('#163: an unknown bare 429 asks for one usage probe and fabricates no 5h bl
     assert.equal(runtimeRepo.get('acc-1').rate_limit_reset_at, null)
     assert.deepEqual(probes, [{ accountId: 'acc-1', vmId: 'vm-01' }])
   } finally {
-    close()
+    await close()
   }
 })
 
-test('529 writes overload_until for the configured minutes', () => {
-  const { service, runtimeRepo, close } = setup({ overload_cooldown_min: 10 })
+test('529 writes overload_until for the configured minutes', async () => {
+  const { service, runtimeRepo, close } = await setup({ overload_cooldown_min: 10 })
   try {
     const now = Date.now()
     const block = service.handleUpstreamError({
@@ -135,12 +135,12 @@ test('529 writes overload_until for the configured minutes', () => {
     assert.equal(block.until, now + 10 * 60_000)
     assert.equal(hardBlockOf(runtimeRepo.get('acc-1'), now).reason, 'overloaded')
   } finally {
-    close()
+    await close()
   }
 })
 
-test('only a live allowed header lifts a rate limit early', () => {
-  const { service, runtimeRepo, close } = setup()
+test('only a live allowed header lifts a rate limit early', async () => {
+  const { service, runtimeRepo, close } = await setup()
   try {
     const now = Date.now()
     service.handleUpstreamError({
@@ -170,12 +170,12 @@ test('only a live allowed header lifts a rate limit early', () => {
     assert.equal(hardBlockOf(state, now), null)
     assert.equal(state.session_window_end, Number(reset) * 1000)
   } finally {
-    close()
+    await close()
   }
 })
 
-test('an out-of-range 5h reset header is ignored for the session window', () => {
-  const { service, runtimeRepo, close } = setup()
+test('an out-of-range 5h reset header is ignored for the session window', async () => {
+  const { service, runtimeRepo, close } = await setup()
   try {
     const now = Date.now()
     service.updateSessionWindow({
@@ -188,12 +188,12 @@ test('an out-of-range 5h reset header is ignored for the session window', () => 
     })
     assert.equal(runtimeRepo.get('acc-1').session_window_end, null)
   } finally {
-    close()
+    await close()
   }
 })
 
-test('clearExpired drops elapsed rate limit and overload columns', () => {
-  const { runtimeRepo, close } = setup()
+test('clearExpired drops elapsed rate limit and overload columns', async () => {
+  const { runtimeRepo, close } = await setup()
   try {
     const now = Date.now()
     runtimeRepo.updateWindow('acc-1', { rateLimitResetAt: now - 1000, overloadUntil: now - 1000 })
@@ -202,12 +202,12 @@ test('clearExpired drops elapsed rate limit and overload columns', () => {
     assert.equal(state.rate_limit_reset_at, null)
     assert.equal(state.overload_until, null)
   } finally {
-    close()
+    await close()
   }
 })
 
-test('an incomplete hop does not write an empty_response cooldown', () => {
-  const { service, runtimeRepo, close } = setup({ empty_response_cooldown_sec: 60 })
+test('an incomplete hop does not write an empty_response cooldown', async () => {
+  const { service, runtimeRepo, close } = await setup({ empty_response_cooldown_sec: 60 })
   try {
     const block = service.handleUpstreamError({
       accountId: 'acc-1',
@@ -220,7 +220,7 @@ test('an incomplete hop does not write an empty_response cooldown', () => {
     assert.equal(runtimeRepo.get('acc-1').cooldown_until, null)
     assert.equal(typeof service.noteDistinctEmptyHop, 'undefined')
   } finally {
-    close()
+    await close()
   }
 })
 

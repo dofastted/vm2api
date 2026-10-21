@@ -14,12 +14,12 @@ function policyPrices() {
   return out
 }
 
-export function buildPricing({ requestLog = null } = {}) {
+export async function buildPricing({ requestLog = null } = {}) {
   const policy = policyPrices()
   const inPolicy = new Set(Object.values(policy).flatMap((row) => (row ? [row.id] : [])))
   let unpriced = []
   try {
-    unpriced = requestLog?.repo?.unpricedModels?.() || []
+    unpriced = (await requestLog?.repo?.unpricedModels?.()) || []
   } catch {
     unpriced = []
   }

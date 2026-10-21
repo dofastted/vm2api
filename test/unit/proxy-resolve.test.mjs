@@ -12,8 +12,8 @@ function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'kin-resolve-'))
 }
 
-test('prefers pool credentials over host-only vm.proxy', () => {
-  const pool = new ProxyPool({ dataDir: tmpDir() })
+test('prefers pool credentials over host-only vm.proxy', async () => {
+  const pool = await new ProxyPool({ dataDir: tmpDir() }).init()
   pool.importLines('socks5://user:s3cret@10.0.0.5:1080')
   const id = pool.snapshot().proxies[0].id
   pool.bind(id, 'vm-02')
@@ -26,8 +26,8 @@ test('prefers pool credentials over host-only vm.proxy', () => {
   assert.equal(resolved.proxyUrl, 'socks5h://user:s3cret@10.0.0.5:1080')
 })
 
-test('blocks import when bound proxy is fail or dead', () => {
-  const pool = new ProxyPool({ dataDir: tmpDir() })
+test('blocks import when bound proxy is fail or dead', async () => {
+  const pool = await new ProxyPool({ dataDir: tmpDir() }).init()
   pool.importLines('10.0.0.6:1080')
   const id = pool.snapshot().proxies[0].id
   pool.bind(id, 'vm-03')

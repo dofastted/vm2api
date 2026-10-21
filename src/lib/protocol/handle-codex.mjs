@@ -204,7 +204,7 @@ function pinnedVmId(req) {
  * A request that continues a stored response (`previous_response_id`) can
  * only run where that response lives.
  */
-export function pickCodexCandidates(
+export async function pickCodexCandidates(
   projectRoot,
   req,
   { stickyRouter = null, sessions = null, body = null, excluded = null, routing = {} } = {},
@@ -212,7 +212,7 @@ export function pickCodexCandidates(
   const pin = pinnedVmId(req)
   const model = body?.model || null
   const routingPolicy = normalizeCodexRouting(routing.codex || routing).quota
-  const scope = keyScopeFromRequest(req)
+  const scope = await keyScopeFromRequest(req)
   const poolDenial = vmPoolDenial(scope)
   if (poolDenial) return { error: 'vm_pool_unavailable', message: poolDenial.message, ids: [], candidates: [] }
   if (scope.group_type === 'anthropic') return { error: 'key_group_mismatch', ids: [], candidates: [] }
@@ -402,7 +402,7 @@ function clientGoneSignal(req, res) {
 async function admitCodexCandidate(projectRoot, req, opts, { deadline, signal }) {
   let woken = false
   for (;;) {
-    const picked = pickCodexCandidates(projectRoot, req, opts)
+    const picked = await pickCodexCandidates(projectRoot, req, opts)
     const livePolicy = normalizeCodexRouting(opts.routing?.codex || opts.routing).quota
     if (picked.error && picked.error !== 'capacity_unavailable') return { picked }
     for (const candidate of picked.candidates || []) {
@@ -739,8 +739,8 @@ export async function handleCodexProtocol({
         if (captureOutbound) logBag.outbound_body = outboundBody
         logBag.outbound_headers = redactHeaders(outboundHeaders)
         let hopEmitted = false
-        const runHop = () =>
-          runCodexKernelHop({
+        const runHop = async () =>
+          await runCodexKernelHop({
             hop,
             args: {
               exec: execFor(projectRoot, vm),
@@ -1034,7 +1034,7 @@ function searchCredentials(projectRoot, vm) {
  * refresh token on its own, so first adopt a token it wrote meanwhile; otherwise refresh
  * once per slot, shared by concurrent callers.
  */
-function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl, refresh }) {
+async function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl, refresh }) {
   const now = searchCredentials(projectRoot, vm)
   if (now.access && now.access !== usedAccess) return now.access
   if (!now.refresh) return ''

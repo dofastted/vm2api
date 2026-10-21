@@ -1,5 +1,5 @@
 import { getDb, isDbOpen } from '../db/database.mjs'
-import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { RuntimeSettings as SettingsRepo } from '../db/settings-state.mjs'
 import { socksProxyFamily } from './socks-address.mjs'
 
 export function configuredIpv6Enabled() {

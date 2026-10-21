@@ -75,13 +75,13 @@ test('relay restores the shipped quota and risk defaults only', () => {
   assert.equal(risk.refusal.enabled, true)
 })
 
-test('applyUsageProfile writes routing, distill, and risk settings', () => {
+test('applyUsageProfile writes routing, distill, and risk settings', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-profile-'))
   const distillFile = path.join(dir, 'distill-rules.json')
   const settings = memorySettings()
   const seen = []
   try {
-    const applied = applyUsageProfile({
+    const applied = await applyUsageProfile({
       mode: 'personal',
       persistRouting: (patch) => {
         seen.push(patch)
@@ -97,7 +97,7 @@ test('applyUsageProfile writes routing, distill, and risk settings', () => {
     assert.equal(readJevConfig((key, fallback) => settings.get(key, fallback)).hard_regex_enabled, false)
     assert.equal(refusalGuardPolicy((key, fallback) => settings.get(key, fallback)).enabled, false)
 
-    applyUsageProfile({
+    await applyUsageProfile({
       mode: 'relay',
       persistRouting: (patch) => {
         seen.push(patch)
@@ -115,11 +115,16 @@ test('applyUsageProfile writes routing, distill, and risk settings', () => {
   }
 })
 
-test('unknown profile is rejected and a saved profile survives complete', () => {
+test('unknown profile is rejected and a saved profile survives complete', async () => {
   assert.equal(routingPatchForProfile('nope'), null)
-  assert.throws(
-    () =>
-      applyUsageProfile({ mode: 'station', persistRouting() {}, settings: memorySettings(), distillFile: '/tmp/x' }),
+  await assert.rejects(
+    async () =>
+      await applyUsageProfile({
+        mode: 'station',
+        persistRouting() {},
+        settings: memorySettings(),
+        distillFile: '/tmp/x',
+      }),
     (error) => error.code === 'invalid_profile',
   )
   const saved = setOnboardingProfile({}, 'admin', 'personal', '2026-10-13T00:00:00.000Z')

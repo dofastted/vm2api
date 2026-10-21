@@ -628,9 +628,9 @@ export async function buildDashboard({
 
   const billing = stampVmBilling(
     vms,
-    (() => {
+    await (async () => {
       try {
-        return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), snap.accounts || [])
+        return attachBillingMeta(await panelBillingStats(requestLog, accountQuota, vms), snap.accounts || [])
       } catch {
         return null
       }
@@ -686,18 +686,18 @@ export async function buildDashboard({
     },
     gateway_stats: stats,
     // historic totals straight from the request_logs table (survives restarts)
-    db_totals: (() => {
+    db_totals: await (async () => {
       try {
-        return requestLog?.totals() || null
+        return (await requestLog?.totals()) || null
       } catch {
         return null
       }
     })(),
     billing,
     // last-hour ops cards (SLA / QPS / TTFT) — console can refetch other windows via /request-logs/stats
-    ops: (() => {
+    ops: await (async () => {
       try {
-        return requestLog?.windowStats?.({ since: new Date(Date.now() - 3600_000).toISOString() }) || null
+        return (await requestLog?.windowStats?.({ since: new Date(Date.now() - 3600_000).toISOString() })) || null
       } catch {
         return null
       }
@@ -744,9 +744,9 @@ export async function buildVmList({
   })()
   stampVmBilling(
     vms,
-    (() => {
+    await (async () => {
       try {
-        return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), accounts)
+        return attachBillingMeta(await panelBillingStats(requestLog, accountQuota, vms), accounts)
       } catch {
         return null
       }
@@ -803,9 +803,9 @@ export async function buildVmDetail({
     role,
   })
   const acc = findAccount(accountQuota, summary)
-  const billing = (() => {
+  const billing = await (async () => {
     try {
-      return panelBillingStats(requestLog, accountQuota, [summary])
+      return await panelBillingStats(requestLog, accountQuota, [summary])
     } catch {
       return null
     }
@@ -813,7 +813,7 @@ export async function buildVmDetail({
   const cost = lookupBilling(indexBillingAccounts(billing), acc || summary)
   const gpt = isCodexVm(vm)
   applyCostFields(summary, cost, { coveredSince: billing?.log_coverage_start })
-  const detail = buildAccountBilling(cost, billing, {
+  const detail = await buildAccountBilling(cost, billing, {
     vmId: summary.id,
     accountId: acc?.account_id || summary.account_uuid,
     requestLog,
@@ -1146,7 +1146,7 @@ export async function buildProbeOne({
         probed_at: new Date().toISOString(),
         ...(headerProbe ? { ...headerProbe, error: null } : {}),
       }
-    : await cache.load(accountId, () => probeAccount({ exec, vm, includeFable }), { force: !!force })
+    : await cache.load(accountId, async () => await probeAccount({ exec, vm, includeFable }), { force: !!force })
   if (fatalUsageCredentialFailure(result)) {
     try {
       markVmRefreshError(path.join(cfg.paths.project, 'vms', `${id}.json`), {
@@ -1306,12 +1306,12 @@ export async function buildProbeAll({ cfg, accountQuota, hop = true, force = tru
   return ok({ items, total: items.length })
 }
 
-export function buildUsage({ accountQuota, cfg, requestLog = null }) {
+export async function buildUsage({ accountQuota, cfg, requestLog = null }) {
   const snap = accountQuota.snapshot()
   const listed = listVms(cfg?.paths?.project)
-  const billing = (() => {
+  const billing = await (async () => {
     try {
-      return panelBillingStats(requestLog, accountQuota, listed)
+      return await panelBillingStats(requestLog, accountQuota, listed)
     } catch {
       return null
     }
@@ -1488,9 +1488,9 @@ export async function snapshotAccountPool({
   })()
   const billing = stampVmBilling(
     vms,
-    (() => {
+    await (async () => {
       try {
-        return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), accounts)
+        return attachBillingMeta(await panelBillingStats(requestLog, accountQuota, vms), accounts)
       } catch {
         return null
       }
@@ -1498,7 +1498,7 @@ export async function snapshotAccountPool({
   )
   let today = null
   try {
-    today = requestLog?.windowStats?.({ since: shanghaiDayStartIso() }) || null
+    today = (await requestLog?.windowStats?.({ since: shanghaiDayStartIso() })) || null
   } catch {
     today = null
   }
@@ -2318,9 +2318,9 @@ function billingWindowOf(accountId, vmId, vm, q) {
   }
 }
 
-function panelBillingStats(requestLog, accountQuota, vms) {
+async function panelBillingStats(requestLog, accountQuota, vms) {
   if (!requestLog?.billingStats) return null
-  return requestLog.billingStats({ accountWindows: accountWindowsForBilling(accountQuota, vms) })
+  return await requestLog.billingStats({ accountWindows: accountWindowsForBilling(accountQuota, vms) })
 }
 
 function stampVmBilling(vms, billing) {
@@ -2431,7 +2431,7 @@ function windowEstimates(quota, cost, coveredSince, codex) {
   }
 }
 
-function buildAccountBilling(cost, billing, { vmId, accountId, requestLog } = {}) {
+async function buildAccountBilling(cost, billing, { vmId, accountId, requestLog } = {}) {
   if (!cost && !vmId && !accountId) return null
   const today = periodView(cost?.today) || {
     requests: Number(cost?.today_requests || 0),
@@ -2475,14 +2475,14 @@ function buildAccountBilling(cost, billing, { vmId, accountId, requestLog } = {}
   const total = periodView(cost)
   let byModel = []
   try {
-    byModel = requestLog?.costByModel?.({ vmId, accountId }) || []
+    byModel = (await requestLog?.costByModel?.({ vmId, accountId })) || []
   } catch {
     byModel = []
   }
   if (!cost && !byModel.length) return null
   let usageStats = null
   try {
-    usageStats = vmId ? requestLog?.vmUsageStats?.({ vmId, days: 30 }) || null : null
+    usageStats = vmId ? (await requestLog?.vmUsageStats?.({ vmId, days: 30 })) || null : null
   } catch {
     usageStats = null
   }

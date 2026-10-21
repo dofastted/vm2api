@@ -148,9 +148,9 @@ export async function runApiInference({
     const retry = Number(upstream.headers['retry-after'] || 30)
     const until = new Date(Date.now() + Math.max(1, retry) * 1000).toISOString()
     try {
-      store.setKeyCooldown(picked.key.id, until)
+      await store.setKeyCooldown(picked.key.id, until)
     } catch {}
-    scheduler.reload(store.listRaw())
+    scheduler.reload(await store.listRaw())
   }
 
   const resultBase = {

@@ -537,7 +537,7 @@ export class FailoverRunner {
 
   async run(args = {}) {
     const sessionKey = String(args.stickyKey || '')
-    if (!sessionKey) return this.runOnce(args)
+    if (!sessionKey) return await this.runOnce(args)
     const previous = this.sessionTails.get(sessionKey) || Promise.resolve()
     let releaseTurn
     const turn = new Promise((resolve) => {
@@ -789,7 +789,7 @@ export class FailoverRunner {
       if (selected.seatMoved) seatMovedTo = selected.vmId
       bindAll({ accountId: selected.accountId, vmId: selected.vmId, slotIndex: pinnedSlot }, { countHit: false })
       const attemptStarted = Date.now()
-      this.attemptsRepo?.begin?.({
+      await this.attemptsRepo?.begin?.({
         requestId,
         attemptNo,
         vmId: selected.vmId,
@@ -858,7 +858,7 @@ export class FailoverRunner {
         noteHop(result)
         if (result) result.committed = result.committed || committed
         if (signal?.aborted || isClientCancelledResult(result)) {
-          this.attemptsRepo?.complete?.(requestId, attemptNo, {
+          await this.attemptsRepo?.complete?.(requestId, attemptNo, {
             upstreamStatus: result?.status ?? null,
             errorScope: 'request',
             action: 'stop',
@@ -908,7 +908,7 @@ export class FailoverRunner {
           } catch {}
         }
         const terminalState = result?.terminalState || (result?.ok ? 'unknown' : 'error')
-        this.attemptsRepo?.complete?.(requestId, attemptNo, {
+        await this.attemptsRepo?.complete?.(requestId, attemptNo, {
           upstreamStatus: result?.status ?? null,
           errorScope: policy.scope,
           action: policy.action,
@@ -988,7 +988,7 @@ export class FailoverRunner {
         const invalidCache = error?.status === 400 && error.body?.error?.code === 'invalid_cache_control'
         noteHop(invalidCache ? { upstreamExecutions: 0 } : null)
         if (error?.code === 'response_sent') {
-          this.attemptsRepo?.complete?.(requestId, attemptNo, {
+          await this.attemptsRepo?.complete?.(requestId, attemptNo, {
             upstreamStatus: 403,
             errorScope: 'request',
             action: 'stop',
@@ -1008,7 +1008,7 @@ export class FailoverRunner {
           }
         }
         if (invalidCache) {
-          this.attemptsRepo?.complete?.(requestId, attemptNo, {
+          await this.attemptsRepo?.complete?.(requestId, attemptNo, {
             upstreamStatus: 0,
             errorScope: 'request',
             action: 'stop',
@@ -1026,7 +1026,7 @@ export class FailoverRunner {
           }
         }
         if (signal?.aborted || error?.code === 'selection_cancelled' || error?.code === 'request_cancelled') {
-          this.attemptsRepo?.complete?.(requestId, attemptNo, {
+          await this.attemptsRepo?.complete?.(requestId, attemptNo, {
             upstreamStatus: 0,
             errorScope: 'request',
             action: 'stop',
@@ -1066,7 +1066,7 @@ export class FailoverRunner {
         lastPolicy = policy
         this.noteUnitHealth(selected, policy, result)
         notifyProxyFailure(this.onProxyFailure, selected, policy)
-        this.attemptsRepo?.complete?.(requestId, attemptNo, {
+        await this.attemptsRepo?.complete?.(requestId, attemptNo, {
           upstreamStatus: 0,
           errorScope: policy.scope,
           action: policy.action,

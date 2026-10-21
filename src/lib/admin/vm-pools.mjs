@@ -33,43 +33,43 @@ export function normalizePoolMembers(value, vms) {
   }
   return ids
 }
-export function createVmPool(repo, { name, vm_ids, enabled = true } = {}, vms = []) {
+export async function createVmPool(repo, { name, vm_ids, enabled = true } = {}, vms = []) {
   const ids = vm_ids == null ? null : normalizePoolMembers(vm_ids, vms)
-  const pool = repo.insert({ name: normalizePoolName(name), enabled: enabled !== false })
+  const pool = await repo.insert({ name: normalizePoolName(name), enabled: enabled !== false })
   if (ids == null) return pool
   try {
-    return repo.setMembers(pool.id, ids)
+    return await repo.setMembers(pool.id, ids)
   } catch (error) {
-    repo.remove(pool.id)
+    await repo.remove(pool.id)
     throw error
   }
 }
 
-export function updateVmPool(repo, id, patch = {}, vms = []) {
-  let pool = repo.get(id)
+export async function updateVmPool(repo, id, patch = {}, vms = []) {
+  let pool = await repo.get(id)
   if (!pool) return null
   if (patch.name != null) {
-    pool = repo.rename(id, normalizePoolName(patch.name))
+    pool = await repo.rename(id, normalizePoolName(patch.name))
   }
   if (patch.enabled != null) {
     if (typeof patch.enabled !== 'boolean') {
       throw Object.assign(new Error('enabled 必须是布尔值'), { code: 'invalid_vm_pool_enabled' })
     }
-    pool = repo.setEnabled(id, patch.enabled)
+    pool = await repo.setEnabled(id, patch.enabled)
   }
   if (Object.prototype.hasOwnProperty.call(patch, 'vm_ids')) {
-    pool = repo.setMembers(id, normalizePoolMembers(patch.vm_ids, vms))
+    pool = await repo.setMembers(id, normalizePoolMembers(patch.vm_ids, vms))
   }
   return pool
 }
 
-export function deleteVmPool(repo, id) {
-  if (!repo.get(id)) return { ok: false, error: 'vm_pool_not_found' }
-  const keys = repo.countKeys(id)
+export async function deleteVmPool(repo, id) {
+  if (!(await repo.get(id))) return { ok: false, error: 'vm_pool_not_found' }
+  const keys = await repo.countKeys(id)
   if (keys > 0) {
     return { ok: false, error: 'vm_pool_in_use', keys }
   }
-  repo.remove(id)
+  await repo.remove(id)
   return { ok: true }
 }
 
@@ -86,9 +86,9 @@ export function vmPoolHttpStatus(code) {
   return 400
 }
 
-export function assertVmPoolExists(repo, id) {
+export async function assertVmPoolExists(repo, id) {
   if (!id) return
-  if (!repo.get(id)) {
+  if (!(await repo.get(id))) {
     throw Object.assign(new Error('账号池不存在'), { code: 'vm_pool_unknown' })
   }
 }

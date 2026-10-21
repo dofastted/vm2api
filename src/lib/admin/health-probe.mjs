@@ -819,6 +819,9 @@ export function createHealthProbeMonitor(opts = {}) {
     decide,
     runRealProbe,
     start,
+    flush: async () => {
+      while (inflight) await inflight
+    },
     stop,
   }
 }
