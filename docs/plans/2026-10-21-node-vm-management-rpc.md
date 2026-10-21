@@ -43,7 +43,7 @@ publish 从节点私有 staging 开始；不向最终路径流式写入。禁止
 
 ## 权限迁移与未覆盖的异步写入
 
-现有 `placement.nodeSession:95` 返回 SSH client 和 sshDocker；`cluster-manager:798` 仍可向 Engine 发送请求。`remote-slot-files:56/106` 经 SFTP 写 run/seed、credential 与二进制；远端凭据在运行后权威。Pod 即使持有 PG claim，仍可能发送绕过 fence 的旧 SSH/SFTP 命令。
+现有 `placement.nodeSession:95` 返回 SSH client 和 sshDocker；`cluster-manager:798` 仍可向 Engine 发送请求。`remote-slot-files.mjs` 经 `remote-fs.mjs:56/106` 的受限文件操作写 run/seed、credential 与二进制；远端凭据在运行后权威。Pod 即使持有 PG claim，仍可能发送绕过 fence 的旧 SSH/SFTP 命令。
 
 另有需要先补的当前调用链：`rust-kernel-supervisor.writeKernelConfig:782` 调 `queueSyncRun`；`remote-slot-files.queueSlotPush:223` 只在本 Pod 串行、捕获错误后仅记录日志。现有管理 flush 不等待这些原始 Promise。这意味着局部文件更新测试不能证明远端写入已结束。迁移前应把本操作产生的 push Promise 显式返回并 await，传播错误；不能只加一个吞错的全局 flush。节点 publish 再以 fence/revision 拒绝跨 Pod 的迟到写入。
 
