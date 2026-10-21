@@ -79,7 +79,7 @@ test('restoring the application schema preserves later writes in a neighboring s
 test('restoring a PG 001 snapshot removes later tables before reapplying current migrations', async () => {
   const db = getDb()
   await db.exec(
-    "DROP TABLE panel_sessions, api_key_admissions, gateway_rate_buckets, execution_admissions, execution_seats; DELETE FROM schema_migrations WHERE version <> '001'",
+    "DROP TABLE panel_sessions, api_key_admissions, gateway_rate_buckets, execution_jobs, execution_admissions, execution_seats; DELETE FROM schema_migrations WHERE version <> '001'",
   )
   await new SettingsRepo(db).set('older-snapshot', 'before')
   const rec = await svc.createBackup()
@@ -96,16 +96,17 @@ test('restoring a PG 001 snapshot removes later tables before reapplying current
     'gateway_rate_buckets',
     'execution_admissions',
     'execution_seats',
+    'execution_jobs',
   ]) {
     assert.equal((await db.prepare(`SELECT count(*) AS n FROM ${name}`).get()).n, 0)
   }
-  assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 6)
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 7)
 })
 
 test('an outside dependency refuses older-snapshot cleanup without changing either schema', async () => {
   const db = getDb()
   await db.exec(
-    "DROP TABLE panel_sessions, api_key_admissions, gateway_rate_buckets, execution_admissions, execution_seats; DELETE FROM schema_migrations WHERE version <> '001'",
+    "DROP TABLE panel_sessions, api_key_admissions, gateway_rate_buckets, execution_jobs, execution_admissions, execution_seats; DELETE FROM schema_migrations WHERE version <> '001'",
   )
   await new SettingsRepo(db).set('older-snapshot', 'before')
   const rec = await svc.createBackup()
