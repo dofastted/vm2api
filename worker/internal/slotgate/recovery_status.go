@@ -9,10 +9,11 @@ import (
 // authorize dispatch and deliberately does not require a dead controller's
 // nonce/runtime or match the current generation of the slot.
 type recoveryCommandStatus struct {
-	ID         string        `json:"id"`
-	Fence      Fence         `json:"fence"`
-	Status     CommandStatus `json:"status"`
-	Dispatched bool          `json:"dispatched"`
+	ID         string            `json:"id"`
+	Fence      Fence             `json:"fence"`
+	Status     CommandStatus     `json:"status"`
+	Dispatched bool              `json:"dispatched"`
+	Receipt    *inferenceReceipt `json:"-"`
 }
 
 func (a *Authority) recoveryStatus(vm string, fence Fence, id string) (*recoveryCommandStatus, error) {
@@ -39,5 +40,5 @@ func (a *Authority) recoveryStatus(vm string, fence Fence, id string) (*recovery
 	if command.Kind != CommandForward {
 		return nil, ErrManagementDenied
 	}
-	return &recoveryCommandStatus{ID: command.ID, Fence: command.Fence, Status: command.Status, Dispatched: command.Dispatched}, nil
+	return &recoveryCommandStatus{ID: command.ID, Fence: command.Fence, Status: command.Status, Dispatched: command.Dispatched, Receipt: cloneInferenceReceipt(command.TerminalReceipt)}, nil
 }

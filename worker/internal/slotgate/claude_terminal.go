@@ -33,6 +33,7 @@ type claudeTerminal struct {
 	stopped   bool
 	blocks    map[int]bool
 	nextBlock int
+	receipt   inferenceReceiptBuilder
 }
 
 func observeClaudeTerminal(response *http.Response, request *http.Request, body []byte, commandID, kind string) *claudeTerminal {
@@ -220,6 +221,7 @@ func (o *claudeTerminal) observeEvent() {
 			return
 		}
 		o.started = true
+		o.receipt.sse(o.data, true)
 	case "message_stop":
 		if !o.started || o.stopped || len(o.blocks) != 0 {
 			o.reject()
@@ -278,6 +280,7 @@ func (o *claudeTerminal) observeEvent() {
 			o.reject()
 			return
 		}
+		o.receipt.sse(o.data, false)
 	case "ping", "response_headers":
 		// Kernel metadata may precede a message or follow message_stop. An
 		// error/unknown event still invalidates even an earlier message_stop.

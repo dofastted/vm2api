@@ -151,6 +151,9 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 			reply["found"] = command != nil
 			if command != nil {
 				reply["command"] = command
+				if command.Receipt != nil {
+					reply["receipt"] = command.Receipt
+				}
 			} else {
 				reply["unknown"] = true
 			}
@@ -416,7 +419,7 @@ func (s *Server) forwardFenced(ctx context.Context, conn net.Conn, reader *bufio
 		// read the authenticated command status before releasing its PG job.
 		// If this commit fails the Authority poisons itself and cannot report
 		// completed; no new execution or retry is issued here.
-		if err = s.authority.CompleteCommand(handle); err != nil {
+		if err = s.authority.completeInference(handle, terminal.inferenceReceipt()); err != nil {
 			return
 		}
 	}

@@ -78,17 +78,18 @@ type Fence struct {
 }
 
 type CommandRecord struct {
-	ID            string              `json:"id"`
-	Kind          CommandKind         `json:"kind"`
-	Status        CommandStatus       `json:"status"`
-	Fence         Fence               `json:"fence"`
-	Runtime       string              `json:"runtime"`
-	Token         string              `json:"token"`
-	Dispatched    bool                `json:"dispatched"`
-	TerminationID string              `json:"termination_id,omitempty"`
-	LaunchTarget  *DockerLaunchTarget `json:"launch_target,omitempty"`
-	Management    *ManagementIntent   `json:"management,omitempty"`
-	LaunchReceipt *LaunchReceipt      `json:"launch_receipt,omitempty"`
+	ID              string              `json:"id"`
+	Kind            CommandKind         `json:"kind"`
+	Status          CommandStatus       `json:"status"`
+	Fence           Fence               `json:"fence"`
+	Runtime         string              `json:"runtime"`
+	Token           string              `json:"token"`
+	Dispatched      bool                `json:"dispatched"`
+	TerminationID   string              `json:"termination_id,omitempty"`
+	LaunchTarget    *DockerLaunchTarget `json:"launch_target,omitempty"`
+	Management      *ManagementIntent   `json:"management,omitempty"`
+	LaunchReceipt   *LaunchReceipt      `json:"launch_receipt,omitempty"`
+	TerminalReceipt *inferenceReceipt   `json:"terminal_receipt,omitempty"`
 }
 
 // DockerLaunchTarget is recorded after create returns and before start. A
@@ -685,6 +686,7 @@ func cloneState(state AuthorityState) AuthorityState {
 	}
 	commands := make(map[string]CommandRecord, len(state.Commands))
 	for id, command := range state.Commands {
+		command.TerminalReceipt = cloneInferenceReceipt(command.TerminalReceipt)
 		if command.Management != nil {
 			intent := *command.Management
 			command.Management = &intent
@@ -808,6 +810,9 @@ func validateJournal(journal authorityJournal) error {
 			return ErrInvalidAuthority
 		}
 		for id, command := range state.Commands {
+			if receipt := command.TerminalReceipt; receipt != nil && (command.Kind != CommandForward || command.Status != CommandCompleted || !command.Dispatched || !validInferenceReceipt(*receipt)) {
+				return ErrInvalidAuthority
+			}
 			if id != command.ID || !validAuthorityID(id) || !validAuthorityID(command.Runtime) || !validAuthorityID(command.Token) || command.Fence.Generation == 0 || command.Fence.Generation > state.Fence.Generation || !validAuthorityID(command.Fence.Incarnation) {
 				return ErrInvalidAuthority
 			}

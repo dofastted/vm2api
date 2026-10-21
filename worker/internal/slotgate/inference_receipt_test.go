@@ -1,6 +1,7 @@
 package slotgate
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -110,6 +111,17 @@ func TestNodeInferenceReceiptPersistsExactPublicUsageWithOriginalCommand(t *test
 	if !ok || persisted["id"] != receipt["id"] || command["status"] != string(CommandCompleted) {
 		t.Fatalf("receipt not committed with original command: %+v", command)
 	}
+	state.Commands[request.CommandID].TerminalReceipt.Usage.CacheCreation.FiveMinute = "999"
+	if _, err = reopened.Revoke("v", request.Fence); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = reopened.Advance(context.Background(), "v", request.Fence); err != nil {
+		t.Fatal(err)
+	}
+	historical, err := reopened.recoveryStatus("v", request.Fence, request.CommandID)
+	if err != nil || historical == nil || historical.Receipt == nil || historical.Receipt.ID != receipt["id"] || historical.Receipt.Usage.CacheCreation.FiveMinute != "2" {
+		t.Fatalf("historical receipt mutated or disappeared across generation: %+v %v", historical, err)
+	}
 }
 
 func TestNodeInferenceReceiptMergesCumulativeSSEWithoutSumming(t *testing.T) {
@@ -150,5 +162,63 @@ func TestNodeInferenceReceiptSurvivesControllerDisconnect(t *testing.T) {
 	receipt := requireInferenceReceipt(t, receiptRecoveryReply(t, addr, request))
 	if receipt["usage_complete"] != true {
 		t.Fatalf("detached consumption lost usage: %+v", receipt)
+	}
+}
+
+func TestNodeInferenceReceiptRequiresObservedModelAndFinalSSEOutput(t *testing.T) {
+	for _, tc := range []struct{ name, media, body string }{
+		{"missing-model", "application/json", strings.Replace(receiptClaudeJSON, `"model":"claude-synthetic-actual",`, "", 1)},
+		{"final-output-missing", "text/event-stream", "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_final\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"claude-actual\",\"usage\":{\"input_tokens\":1,\"output_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}\n\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n"},
+		{"counter-overflow", "application/json", strings.Replace(receiptClaudeJSON, `"input_tokens":9007199254740993`, `"input_tokens":9223372036854775808`, 1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, _, request := receiptForward(t, tc.media, tc.body, false)
+			receipt := requireInferenceReceipt(t, receiptRecoveryReply(t, addr, request))
+			if receipt["usage_complete"] != false {
+				t.Fatalf("partial observed metadata was treated as billable: %+v", receipt)
+			}
+			if tc.name == "missing-model" && receipt["model"] != nil {
+				t.Fatal("receipt substituted the request model")
+			}
+		})
+	}
+}
+
+func TestNodeInferenceReceiptNeverPersistsForErrorTerminalOrBadTrailer(t *testing.T) {
+	for _, mode := range []string{"trailing-error", "bad-trailer"} {
+		t.Run(mode, func(t *testing.T) {
+			addr, root, server, state, _ := fencedGate(t)
+			unixHTTP(t, filepath.Join(root, "vms", "v", "incarnations", state.Fence.Incarnation, "run", "kernel.sock"), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if mode == "bad-trailer" {
+					w.Header().Set("Trailer", "X-Terminal-State")
+				}
+				fmt.Fprint(w, receiptClaudeJSON)
+				if mode == "bad-trailer" {
+					w.Header().Set("X-Terminal-State", "incomplete")
+				} else {
+					fmt.Fprint(w, `{"type":"error","error":{"message":"client disconnected"}}`)
+				}
+			}))
+			request := forwardRequest(t, addr, state, "receipt-invalid-terminal")
+			c, reader := gate2Connect(t, addr, testToken, request, claudeWire(request.CommandID))
+			defer c.Close()
+			if line, err := reader.ReadString('\n'); err != nil || line != "OK\n" {
+				t.Fatalf("forward: %q %v", line, err)
+			}
+			response, err := http.ReadResponse(reader, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err = io.Copy(io.Discard, response.Body); err != nil {
+				t.Fatal(err)
+			}
+			response.Body.Close()
+			reply := receiptRecoveryReply(t, addr, request)
+			current, _ := server.authority.State("v")
+			if reply["receipt"] != nil || current.Commands[request.CommandID].Status != CommandPending {
+				t.Fatalf("unconfirmed execution acquired a usage receipt: %+v", reply)
+			}
+		})
 	}
 }
