@@ -742,11 +742,13 @@ test('unbind and unbindByAccount drop dead bindings', async () => {
 test('proxy pool import/bind/config persist across re-open', async () => {
   const dir = tmpDir('kin-proxy-')
   const pool = await new ProxyPool({ dataDir: dir }).init()
-  const res = pool.importLines('socks5://user:pass@10.0.0.1:1080\n10.0.0.2:1080\nbadline:xx\n10.0.0.1:1080:user:pass')
+  const res = await pool.importLines(
+    'socks5://user:pass@10.0.0.1:1080\n10.0.0.2:1080\nbadline:xx\n10.0.0.1:1080:user:pass',
+  )
   assert.equal(res.added, 2)
   const id = pool.snapshot().proxies[0].id
-  assert.equal(pool.bind(id, 'vm-1').ok, true)
-  pool.updateConfig({ probe_interval_min: 30, max_failures: 3 })
+  assert.equal((await pool.bind(id, 'vm-1')).ok, true)
+  await pool.updateConfig({ probe_interval_min: 30, max_failures: 3 })
   pool.stopScheduler()
 
   const pool2 = await new ProxyPool({ dataDir: dir }).init()
@@ -763,11 +765,11 @@ test('proxy pool import/bind/config persist across re-open', async () => {
 test('proxy remove + unbindVm persist', async () => {
   const dir = tmpDir('kin-proxy-')
   const pool = await new ProxyPool({ dataDir: dir }).init()
-  pool.importLines('10.1.1.1:1080\n10.1.1.2:1080')
+  await pool.importLines('10.1.1.1:1080\n10.1.1.2:1080')
   const [a, b] = pool.snapshot().proxies.map((p) => p.id)
-  pool.bind(a, 'vm-z')
-  pool.unbindVm('vm-z')
-  pool.remove(b)
+  await pool.bind(a, 'vm-z')
+  await pool.unbindVm('vm-z')
+  await pool.remove(b)
   pool.stopScheduler()
 
   const pool2 = await new ProxyPool({ dataDir: dir }).init()
@@ -786,15 +788,15 @@ test('disconnect_on_error config persists and runtime failure disables slot', as
     onDisableVm: (vmId, reason, proxyId) => disabled.push({ vmId, reason, proxyId }),
     onDisconnectVm: (vmId, reason, proxyId) => disconnected.push({ vmId, reason, proxyId }),
   }).init()
-  pool.importLines('10.2.2.2:1080')
+  await pool.importLines('10.2.2.2:1080')
   const id = pool.snapshot().proxies[0].id
-  pool.bind(id, 'vm-err')
+  await pool.bind(id, 'vm-err')
   assert.equal(pool.snapshot().config.disconnect_on_error, false)
-  const skipped = pool.reportRuntimeFailure('vm-err', 'proxy_transport_failure')
+  const skipped = await pool.reportRuntimeFailure('vm-err', 'proxy_transport_failure')
   assert.equal(skipped.skipped, true)
   assert.equal(disconnected.length, 0)
 
-  const updated = pool.updateConfig({ enabled: false, disconnect_on_error: true, max_failures: 1 })
+  const updated = await pool.updateConfig({ enabled: false, disconnect_on_error: true, max_failures: 1 })
   assert.equal(updated.ok, true)
   assert.equal(updated.config.disconnect_on_error, true)
   pool.stopScheduler()
@@ -805,7 +807,7 @@ test('disconnect_on_error config persists and runtime failure disables slot', as
     onDisconnectVm: (vmId, reason, proxyId) => disconnected.push({ vmId, reason, proxyId }),
   }).init()
   assert.equal(pool2.snapshot().config.disconnect_on_error, true)
-  const reported = pool2.reportRuntimeFailure('vm-err', 'proxy_transport_failure')
+  const reported = await pool2.reportRuntimeFailure('vm-err', 'proxy_transport_failure')
   assert.equal(reported.ok, true)
   assert.equal(reported.skipped, false)
   assert.equal(reported.proxy.status, 'dead')

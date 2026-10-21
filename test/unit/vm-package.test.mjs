@@ -155,7 +155,10 @@ test('import creates the slot and rolls a colliding id forward', async (t) => {
   assert.equal(saved.claude.access_token, undefined)
   const cred = readWorkerCredentialFile(path.join(root, 'vms', 'vm-pkg', 'cli-home'))
   assert.equal(cred.access_token, 'sk-ant-oat01-PACKAGE')
-  assert.equal(pool.ensureSocks({ host: '10.2.2.2', port: 1080, username: 'alice', password: 's3cret' }).created, false)
+  assert.equal(
+    (await pool.ensureSocks({ host: '10.2.2.2', port: 1080, username: 'alice', password: 's3cret' })).created,
+    false,
+  )
 
   const again = makeHandler(root, doc, { pool })
   await again.handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/package'))
@@ -291,7 +294,7 @@ test('tenant import cannot bind px-local or another owner SOCKS and drops seed_p
   assert.equal(fs.existsSync(path.join(root, 'vms', 'vm-t-local.json')), false)
 
   // The platform already owns this SOCKS row; equal credentials must not hand it to the tenant.
-  pool.ensureSocks({ host: '10.2.2.2', port: 1080, username: 'alice', password: 's3cret' })
+  await pool.ensureSocks({ host: '10.2.2.2', port: 1080, username: 'alice', password: 's3cret' })
   const taken = await importAs(claudePackage('vm-t-taken'))
   assert.equal(taken.status, 403)
   assert.equal(taken.body.error.code, 'proxy_forbidden')

@@ -63,8 +63,8 @@ test('an unbound slot has no exit to probe', async (t) => {
 test('a node slot on local egress probes its own node row and refreshes it', async (t) => {
   const { root, pool, probe, lookups } = await setup(t)
   seed(root, { id: 'vm-tokyo', node_id: 'node-a', proxy: { id: 'px-local', host: 'local', scheme: 'local' } })
-  pool.ensureLocal()
-  assert.equal(pool.bind('px-local', 'vm-tokyo').proxy.id, 'px-local-node-a')
+  await pool.ensureLocal()
+  assert.equal((await pool.bind('px-local', 'vm-tokyo')).proxy.id, 'px-local-node-a')
   const res = await probe('vm-tokyo')
   assert.equal(res.status, 200, JSON.stringify(res.body))
   assert.equal(res.body.data.via, 'node')
@@ -89,8 +89,8 @@ test('a control-plane Codex slot is probed through the deployment proxy', async 
     family: 'codex',
     proxy: { id: 'px-local', host: 'local', scheme: 'local' },
   })
-  pool.ensureLocal()
-  pool.bind('px-local', 'vm-gpt')
+  await pool.ensureLocal()
+  await pool.bind('px-local', 'vm-gpt')
   const res = await probe('vm-gpt')
   assert.equal(res.status, 200, JSON.stringify(res.body))
   assert.equal(res.body.data.via, 'deploy_proxy')
