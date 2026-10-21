@@ -101,6 +101,29 @@ test('an in-flight snapshot cannot overwrite a newer local committed set or remo
   assert.equal(settings.has('runtime_local_remove'), false)
 })
 
+test('a newer failed refresh does not discard an older successful snapshot', async (t) => {
+  const db = getDb()
+  const settings = new RuntimeSettings(db)
+  const other = await otherConnection(t, db)
+  await settings.set('runtime_refresh_retry', 0)
+  await other.set('runtime_refresh_retry', 1)
+  const held = holdSnapshot(t, db)
+  const oldRefresh = loadSettingsState(db)
+  try {
+    await held.read
+    const query = db.query
+    db.query = async function (sql, params) {
+      if (sql === 'SELECT key, value, updated_at FROM settings ORDER BY key') throw new Error('synthetic read failure')
+      return query.call(this, sql, params)
+    }
+    await assert.rejects(settings.refresh(), /synthetic read failure/)
+  } finally {
+    held.resume()
+    await oldRefresh
+  }
+  assert.equal(settings.get('runtime_refresh_retry'), 1)
+})
+
 test('a failed refresh preserves the previously published settings snapshot', async () => {
   const db = getDb()
   const settings = new RuntimeSettings(db)
@@ -116,6 +139,23 @@ test('a failed refresh preserves the previously published settings snapshot', as
   } finally {
     db.query = query
   }
+})
+
+test('refresh inside a transaction does not publish uncommitted settings or a rolled-back snapshot', async () => {
+  const settings = new RuntimeSettings(getDb())
+  await settings.set('runtime_refresh_rollback', 1)
+  await assert.rejects(
+    withTransaction(getDb(), async () => {
+      await settings.set('runtime_refresh_rollback', 2)
+      await settings.refresh()
+      assert.equal(settings.get('runtime_refresh_rollback'), 1)
+      throw new Error('synthetic rollback')
+    }),
+    /synthetic rollback/,
+  )
+  assert.equal(settings.get('runtime_refresh_rollback'), 1)
+  await settings.refresh()
+  assert.equal(settings.get('runtime_refresh_rollback'), 1)
 })
 
 test('settings cache changes only when its transaction commits', async () => {

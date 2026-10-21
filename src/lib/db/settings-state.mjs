@@ -3,8 +3,7 @@ import { getDb } from './database.mjs'
 import { SettingsRepo } from './repos/settings-repo.mjs'
 
 export async function loadSettingsState(db = getDb()) {
-  const settings = await new SettingsRepo(db).all()
-  db.settingsState = new Map(Object.entries(settings))
+  await new SettingsRepo(db).all()
   return db.settingsState
 }
 
@@ -12,6 +11,12 @@ export class RuntimeSettings {
   constructor(db = getDb()) {
     this.db = db
     this.repo = new SettingsRepo(db)
+  }
+
+  /** Refresh the shared snapshot before calling synchronous policy readers. */
+  async refresh() {
+    await this.repo.all()
+    return this.all()
   }
 
   get(key, fallback = null) {

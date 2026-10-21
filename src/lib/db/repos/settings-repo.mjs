@@ -5,6 +5,17 @@
 
 import { getDb } from '../database.mjs'
 
+const cacheRevisions = new WeakMap()
+
+function cacheRevision(db) {
+  let revision = cacheRevisions.get(db)
+  if (!revision) {
+    revision = { refresh: 0, published: 0, write: 0 }
+    cacheRevisions.set(db, revision)
+  }
+  return revision
+}
+
 export class SettingsRepo {
   constructor(db = getDb()) {
     this.db = db
@@ -29,7 +40,10 @@ export class SettingsRepo {
 
   async set(key, value) {
     await this._set.run(key, JSON.stringify(value), new Date().toISOString())
-    this.db.afterCommit(() => this.db.settingsState?.set(key, value))
+    this.db.afterCommit(() => {
+      cacheRevision(this.db).write += 1
+      this.db.settingsState?.set(key, value)
+    })
     return value
   }
 
@@ -39,10 +53,16 @@ export class SettingsRepo {
 
   async remove(key) {
     await this._del.run(key)
-    this.db.afterCommit(() => this.db.settingsState?.delete(key))
+    this.db.afterCommit(() => {
+      cacheRevision(this.db).write += 1
+      this.db.settingsState?.delete(key)
+    })
   }
 
   async all() {
+    const revision = cacheRevision(this.db)
+    const refresh = ++revision.refresh
+    const write = revision.write
     const out = {}
     for (const row of await this._all.all()) {
       try {
@@ -52,7 +72,11 @@ export class SettingsRepo {
       }
     }
     this.db.afterCommit(() => {
-      this.db.settingsState = new Map(Object.entries(out))
+      // A delayed read must not replace a newer refresh or local commit.
+      if (revision.published < refresh && revision.write === write) {
+        revision.published = refresh
+        this.db.settingsState = new Map(Object.entries(out))
+      }
     })
     return out
   }
