@@ -22,6 +22,8 @@ import (
 const gate2LineMax = 8192
 const gate2RequestMax = 16 << 20
 
+var errGateTicketInvalid = errors.New("ticket_invalid")
+
 // KSG2 <token>\n followed by one bounded JSON command line. Only forward
 // commands continue with one parsed HTTP/1 request and an HTTP response after
 // OK\n. KSG1 raw splicing is never accepted when fenced mode is enabled.
@@ -68,7 +70,7 @@ func gate2Line(reader *bufio.Reader) ([]byte, error) {
 }
 
 func gate2Code(err error) string {
-	for _, known := range []error{ErrAuthorityUnavailable, ErrAuthorityPhase, ErrFenceMismatch, ErrCommandExists, ErrCommandOwner, ErrCommandDispatched, ErrPendingMutation, ErrInvalidAuthority, ErrTerminationProof} {
+	for _, known := range []error{ErrAuthorityUnavailable, ErrAuthorityPhase, ErrFenceMismatch, ErrCommandExists, ErrCommandOwner, ErrCommandDispatched, ErrPendingMutation, ErrInvalidAuthority, ErrTerminationProof, errGateTicketInvalid} {
 		if errors.Is(err, known) {
 			return known.Error()
 		}
@@ -139,6 +141,26 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 			break
 		}
 		state, err = s.launcher.Launch(ctx, request.VMID, request.Fence, request.CommandID)
+	case "command":
+		var handle CommandHandle
+		handle, err = s.forwardHandle(request)
+		if err != nil {
+			break
+		}
+		state, err = s.authority.State(handle.VMID)
+		if err == nil {
+			command, exists := state.Commands[handle.ID]
+			if !exists || state.Fence != request.Fence || command.Fence != request.Fence {
+				err = ErrFenceMismatch
+				break
+			}
+			reply["command"] = struct {
+				ID         string        `json:"id"`
+				Fence      Fence         `json:"fence"`
+				Status     CommandStatus `json:"status"`
+				Dispatched bool          `json:"dispatched"`
+			}{command.ID, command.Fence, command.Status, command.Dispatched}
+		}
 	default:
 		err = ErrInvalidAuthority
 	}
@@ -146,7 +168,7 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 		reply["error"] = gate2Code(err)
 	} else {
 		reply["ok"] = true
-		if request.Op != "prepare" {
+		if request.Op != "prepare" && request.Op != "command" {
 			reply["state"] = publicGateState(state)
 		}
 	}
@@ -168,7 +190,7 @@ func gate2Ticket(nonce string, request gate2Request) string {
 
 func (s *Server) forwardHandle(request gate2Request) (CommandHandle, error) {
 	if _, ok := kinds[request.Kind]; !ok {
-		return CommandHandle{}, errors.New("ticket_invalid")
+		return CommandHandle{}, errGateTicketInvalid
 	}
 	state, err := s.authority.State(request.VMID)
 	if err != nil {
@@ -179,11 +201,11 @@ func (s *Server) forwardHandle(request gate2Request) (CommandHandle, error) {
 	}
 	command, exists := state.Commands[request.CommandID]
 	if !exists || command.Kind != CommandForward || command.Fence != request.Fence {
-		return CommandHandle{}, errors.New("ticket_invalid")
+		return CommandHandle{}, errGateTicketInvalid
 	}
 	wanted := gate2Ticket(command.Token, request)
 	if !hmac.Equal([]byte(wanted), []byte(request.Ticket)) {
-		return CommandHandle{}, errors.New("ticket_invalid")
+		return CommandHandle{}, errGateTicketInvalid
 	}
 	return CommandHandle{VMID: request.VMID, ID: request.CommandID, Fence: request.Fence, runtime: command.Runtime, token: command.Token}, nil
 }
@@ -265,7 +287,18 @@ func (s *Server) forwardFenced(ctx context.Context, conn net.Conn, reader *bufio
 		return
 	}
 	response.Close = true
-	response.Write(conn)
-	// Even a full HTTP response remains pending in this batch. Classifying a
-	// kernel's normal terminal response is a separate trusted protocol adapter.
+	terminal := observeClaudeTerminal(response, req, body, request.CommandID, request.Kind)
+	response.Body = terminal
+	if err = response.Write(conn); err != nil {
+		return
+	}
+	if terminal.completed(response) {
+		// The HTTP body is not a durable acknowledgement. A KSG2 client must
+		// read the authenticated command status before releasing its PG job.
+		// If this commit fails the Authority poisons itself and cannot report
+		// completed; no new execution or retry is issued here.
+		if err = s.authority.CompleteCommand(handle); err != nil {
+			return
+		}
+	}
 }

@@ -29,7 +29,21 @@ KSG2 增加 `launch` 操作。客户端只提供 `vm_id`、创建操作时捕获
 
 只读预检失败不会创建 launch claim，也不会发送 create。进入 dispatched 后的 create/start/inspect 或持久化错误保留 pending，不自动重试。节点重新打开遇到 pending launch 会保留为 unknown，进入 `REVOKING`。pending launch 阻止 generation 推进。create 返回晚于 revoke 时仍保存目标 ID，但不继续 start 或 bind。
 
-客户端连接关闭、超时或控制面 owner 消失均不是终止证明。正常转发目前也继续保留 pending；普通 HTTP/SSE 终态分类仍未接入。当前状态机没有自动处理未知 launch 的恢复操作。
+客户端连接关闭、超时或控制面 owner 消失均不是终止证明。未知响应和不受支持的协议继续保留 pending。当前状态机没有自动处理未知 launch 的恢复操作。
+
+## 正常 Claude 终态与持久确认
+
+节点只为 kernel 的 `POST /internal/v1/messages` 识别正常 Claude 终态。请求 envelope 的 `request_id` 必须与 node command ID 相同。其他 endpoint、worker、Codex、错误响应以及 ID 不符时继续 pending。
+
+- JSON 必须是完整 HTTP 200 响应，包含合法 assistant message、非空 message ID、受支持的 content block 和明确 stop reason。当前只接受 `end_turn`、`tool_use`、`max_tokens`、`stop_sequence`。
+- SSE 必须包含合法 `message_start` 和 `message_stop`，content block 的 start/delta/stop 顺序须有效，且完整读取 HTTP body 与 trailers。仅 stop_reason 加 EOF 不会完成。message_stop 后仍会继续检查错误、未知帧及 trailers。
+- header 的 `verified`、HTTP EOF、普通拒绝、cancel ACK 和健康计数都不会单独完成命令。取消、内部错误、传输截断、已声明 terminal trailer 缺失或失效、重复 terminal、尾随错误、未知内容或超出解析上限时继续 pending。
+
+解析器按增量观察原响应，不修改响应内容。JSON 上限为 1 MiB；SSE 每行上限为 64 KiB、单事件上限为 1 MiB。超过上限仍可转发响应，但不会确认完成。新 stop reason、内容块类型和协议目前不会自动纳入允许范围。
+
+正常终态仅在 `CompleteCommand` 持久成功后成为 node 的 `completed`。新增只读 `command` RPC，要求原 captured fence、command ID、目标 kind 与 ticket，并只向已认证 token 返回状态，不暴露内部 nonce。客户端不能提交完成状态。
+
+已转发的 HTTP body 不等于持久确认。未来 KSG2 客户端必须在释放 PG job 前取得 node 的持久 `completed`。若 node 写盘失败，状态查询会失败，不能据 HTTP 成功释放。此客户端与 PG 绑定尚未接线。
 
 ## 容器与文件权限
 
@@ -54,7 +68,7 @@ Authority journal、其父目录、节点 agent 的可执行文件与配置，�
 - 把容器生命周期和文件写权限迁移到节点服务。runtime Pod 不得继续持有 root/docker-group SSH、raw Docker socket、可写 SFTP 或替换 gate 的权限。bootstrap 凭据须与 runtime 分离。
 - 迁移时撤销旧授权，并关闭已经建立的 SSH、SFTP、终端和 forwarding 会话。只修改新连接的认证方式不能阻止旧 owner 的延迟命令。
 - 将 KSG2、captured generation、PG admission/job/VM operation 和文件发布接入生产调用链。fenced 节点不得回退到 KSG1 或原始 SSH 路径。
-- 提供节点可信 allocate、文件发布、未知 launch 的有证据恢复，以及正常响应终态处理。恢复只能关闭同一 immutable executor/incarnation 映射的作业；不能靠 TTL、ready_slots 或 cancel ACK 释放。
+- 提供节点可信 allocate、文件发布、未知 launch 的有证据恢复，以及尚未覆盖的响应终态处理。恢复只能关闭同一 immutable executor/incarnation 映射的作业；不能靠 TTL、ready_slots 或 cancel ACK 释放。
 - 单独处理 KVM、原生 macOS 和 Codex 进程归属。现有 Codex Docker 容器仅持有身份和终端，停止它不能证明控制面 detached Codex 子进程已经终止。
 - 在两个不同节点上的控制面验证同时执行、旧命令迟到、节点服务崩溃、Engine 故障及安全接管。本批合成测试不能代替该验收。
 
