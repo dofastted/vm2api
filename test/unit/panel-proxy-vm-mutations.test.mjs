@@ -12,6 +12,7 @@ import { SharedVmOperations } from '../../src/lib/vm/shared-vm-operations.mjs'
 import { ExecutionAdmissionsRepo } from '../../src/lib/db/repos/execution-admissions-repo.mjs'
 import { SharedProxyOperations } from '../../src/lib/vm/shared-proxy-operations.mjs'
 import { buildVmPackage } from '../../src/lib/vm/vm-package.mjs'
+import { VmsRepo } from '../../src/lib/db/repos/vms-repo.mjs'
 
 async function fixture(t) {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'panel-proxy-claims-'))
@@ -267,7 +268,7 @@ test('Kubernetes package creation never renames outside its claimed identity', a
 
 test('Kubernetes package creation refuses a committed alias missing from this Pod files', async (t) => {
   const f = await fixture(t)
-  await f.peer.prepare("INSERT INTO vms (id, name) VALUES ('vm-new', 'synthetic')").run()
+  await new VmsRepo(f.peer).upsertFromVmJson({ id: 'vm-new', status: 'stopped' })
   const h = f.handler(buildVmPackage({ vm: { id: 'new', timezone: 'UTC' } }), { packageImportBringUp: false })
   await h.request('POST', '/api/panel/vms/package')
   assert.equal(h.response.status, 409)
