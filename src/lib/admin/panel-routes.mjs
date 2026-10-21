@@ -4005,12 +4005,14 @@ export function createPanelHandler(ctx) {
           })
         }
         const body = await readBody(req, 8 * 1024)
-        const scheduled = scheduleOfficialCcBootstrap({
+        const scheduled = await scheduleOfficialCcBootstrap({
           vmId: id,
           projectRoot: cfg.paths.project,
           force: body.force !== false,
           collectIdentity: collectSlotIdentity,
-          onStats: officialCcStatsHandler(id, vm.claude?.account_uuid),
+          onStats: isKubernetesMode() ? undefined : officialCcStatsHandler(id, vm.claude?.account_uuid),
+          onStatsFactory: isKubernetesMode() ? () => officialCcStatsHandler(id, vm.claude?.account_uuid) : undefined,
+          flush: flushPanelWrites,
           routingFile: routingConfigPath,
           config: ctx.routingConfig.official_cc,
           credentialMode: vm.claude?.mode,

@@ -21,6 +21,9 @@ import { spawn, execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { randomUUID } from 'node:crypto'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { backgroundTasksFor } from '../core/shared-background-tasks.mjs'
 
 import {
   parseVmIndex,
@@ -48,7 +51,9 @@ import { OFFICIAL_CLI_VERSION, loadVmIdentity, persistVmSettings } from '../iden
 import { applyOfficialFingerprintToVm, readOfficialCcIdentity } from '../identity/official-fingerprint.mjs'
 import { writeSlotSeedFiles, inferProjectRootFromCliHome } from '../vm/slot-seed.mjs'
 import { touchTelemetrySession } from '../vm/worker-telemetry.mjs'
-import { atomicWriteJson, listVmRecordFiles } from '../vm/vm-file.mjs'
+import { atomicWriteJson, listVmRecordFiles, withVmLock } from '../vm/vm-file.mjs'
+import { currentVmOperationIds } from '../vm/shared-vm-operations.mjs'
+import { flushVmDbSync } from '../vm/vm-db-sync.mjs'
 import { CONTAINER_CLI_NODE_BIN, normalizeOfficialCcInference, resolveOfficialCcInference } from '../vm/slot-engine.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
@@ -1084,15 +1089,15 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
     slotOauth,
     retryDelayMs,
   } = applyOfficialCcConfig(rawOpts, config)
-  if (!vmId || !projectRoot) return { ok: false, error: 'vmId and projectRoot required' }
+  if (!vmId || !projectRoot) return { ok: false, error: 'vmId and projectRoot required', vmOperationNotStarted: true }
   const vmPath = path.join(projectRoot, 'vms', `${vmId}.json`)
-  if (!fs.existsSync(vmPath)) return { ok: false, error: 'vm not found' }
+  if (!fs.existsSync(vmPath)) return { ok: false, error: 'vm not found', vmOperationNotStarted: true }
   let vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
   const homeDir = officialCcHome(projectRoot, vmId)
   const { uid, gid } = officialCcUidGid(vmId)
   const startedAt = new Date().toISOString()
   if (!canOfficialCc(credentialModeOfVm(vm))) {
-    return { ok: false, error: 'official Claude Code init requires full OAuth' }
+    return { ok: false, error: 'official Claude Code init requires full OAuth', vmOperationNotStarted: true }
   }
   if (!(hasAccessPresence(vm.claude) || hasRefreshPresence(vm.claude))) {
     const credFile = path.join(homeDir, '.claude', 'credentials.json')
@@ -1103,7 +1108,7 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       live = !!(oauth.accessToken || oauth.access_token || oauth.refreshToken || oauth.refresh_token)
     } catch {}
     if (!live) {
-      return { ok: false, error: 'slot has no live OAuth credential' }
+      return { ok: false, error: 'slot has no live OAuth credential', vmOperationNotStarted: true }
     }
   }
 
@@ -1454,6 +1459,7 @@ export function scheduleOfficialCcBootstrap(opts = {}) {
       return { scheduled: false, reason: 'already_initialized' }
     }
   }
+  if (isKubernetesMode()) return scheduleSharedOfficialCcBootstrap(merged)
   if (merged.projectRoot) {
     try {
       writeOfficialCcStatus(officialCcHome(merged.projectRoot, vmId), {
@@ -1484,4 +1490,108 @@ export function scheduleOfficialCcBootstrap(opts = {}) {
     })
   running.set(vmId, job)
   return { scheduled: true, vmId }
+}
+
+/** The background activity owns the original Promise, independently of the HTTP request. */
+async function scheduleSharedOfficialCcBootstrap(options) {
+  const { vmId, projectRoot } = options
+  const tasks = backgroundTasksFor(options.backgroundTasks)
+  const nested = currentVmOperationIds(tasks.db).size > 0
+  let resolveReady
+  let rejectReady
+  const ready = new Promise((resolve, reject) => {
+    resolveReady = resolve
+    rejectReady = reject
+  })
+  const job = tasks.run({ taskKey: `official_cc_bootstrap:${vmId}`, executionId: randomUUID() }, async () => {
+    let entered = false
+    try {
+      return await withVmLock(
+        path.join(projectRoot, 'vms', `${vmId}.json`),
+        async (operation) => {
+          entered = true
+          const vm = getVm(projectRoot, vmId)
+          if (!vm || !slotHost(vm).supports('official_cc')) {
+            throw Object.assign(new Error(vm ? 'remote official bootstrap unsupported' : 'VM not found'), {
+              code: vm ? 'remote_unsupported' : 'vm_not_found',
+              status: vm ? 409 : 404,
+              vmOperationNotStarted: true,
+              taskNotStarted: true,
+            })
+          }
+          writeOfficialCcStatus(officialCcHome(projectRoot, vmId), {
+            status: 'running',
+            vm_id: vmId,
+            started_at: new Date().toISOString(),
+            force: options.force !== false,
+            step: 'queued',
+          })
+          if (!nested) resolveReady({ scheduled: true, vmId })
+          try {
+            let auxiliaryUnknown = false
+            const observe = (callback) =>
+              callback &&
+              (async (...args) => {
+                try {
+                  const value = await callback(...args)
+                  if (value?.ok === false) auxiliaryUnknown = true
+                  return value
+                } catch (error) {
+                  auxiliaryUnknown = true
+                  throw error
+                }
+              })
+            const result = await (options.runBootstrap || runOfficialCcBootstrap)({
+              ...options,
+              vm,
+              collectIdentity: observe(options.collectIdentity),
+              onStats: observe(options.onStatsFactory ? options.onStatsFactory() : options.onStats),
+            })
+            await options.flush?.()
+            await flushVmDbSync()
+            // Normal successful foreground CLI completion follows the existing protocol.
+            // A resident CLI remains active; a timeout/error supplies no termination proof.
+            const notStarted = result?.notStarted === true || result?.vmOperationNotStarted === true
+            const terminal =
+              !auxiliaryUnknown &&
+              !result?.status?.profile_error &&
+              !result?.status?.models_error &&
+              !(options.syncTelemetry && result?.status?.telemetry_enabled && !result.status.sidecar_reloaded) &&
+              result?.vmOperationUncertain !== true &&
+              (notStarted || (result?.ok === true && !result.timed_out && options.resident !== true))
+            if (!terminal) await operation.markUncertain()
+            return { terminal, value: result }
+          } catch (error) {
+            writeOfficialCcStatus(officialCcHome(projectRoot, vmId), {
+              status: 'error',
+              vm_id: vmId,
+              finished_at: new Date().toISOString(),
+              error: String(error.message || error).slice(0, 300),
+            })
+            if (error.vmOperationNotStarted === true) error.taskNotStarted = true
+            throw error
+          }
+        },
+        { operations: options.vmOperations, kind: 'official-cc-bootstrap' },
+      )
+    } catch (error) {
+      if (!entered) error.taskNotStarted = true
+      throw error
+    }
+  })
+  running.set(vmId, job)
+  job
+    .then(
+      (result) =>
+        resolveReady(
+          result.ran
+            ? { scheduled: true, vmId, ...(nested ? { completed: true } : {}) }
+            : { scheduled: false, reason: result.code },
+        ),
+      rejectReady,
+    )
+    .finally(() => {
+      if (running.get(vmId) === job) running.delete(vmId)
+    })
+  return ready
 }
