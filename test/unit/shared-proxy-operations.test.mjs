@@ -5,6 +5,9 @@ import { createRepositoryTestDatabase } from '../repository-database.mjs'
 import { ProxyPool } from '../../src/lib/vm/proxy-pool.mjs'
 import { SharedVmOperations } from '../../src/lib/vm/shared-vm-operations.mjs'
 import { BackgroundTaskRunsRepo } from '../../src/lib/db/repos/background-task-runs-repo.mjs'
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
+import { createInterface } from 'node:readline'
 
 const TASK_KEY = 'proxy_operation:pool'
 
@@ -86,13 +89,14 @@ test('only the current exact task/execution/owner identity can edit or bind unde
   assert.equal((await f.firstPool.repo.getById(f.id)).port, 2080)
 })
 
-test('uncertain proxy operations survive DB reconnection and do not expire or authorize another same-owner request', async (t) => {
+test('uncertain proxy operations survive owner DB disconnection and do not expire', async (t) => {
   const f = await services(t)
-  const claim = await f.first.tryAcquire()
+  const claim = await f.second.tryAcquire()
   await claim.markUncertain()
   assert.equal((await claim.release()).released, false)
+  await f.peer.close()
   await f.db.prepare("UPDATE background_task_runs SET claimed_at = '2000-01-01' WHERE task_key = $1").run(TASK_KEY)
-  assert.equal((await f.second.tryAcquire()).ok, false)
+  assert.equal((await f.first.tryAcquire()).ok, false)
 })
 
 test('a normal callback without explicit terminal proof retains its persistent proxy operation', async (t) => {
@@ -132,4 +136,71 @@ test('expired callback contexts cannot authorize detached proxy mutations', asyn
   start()
   await assert.rejects(descendant, { code: 'proxy_operation_active' })
   await foreign.release()
+})
+
+test('completed callback contexts cannot fall back to unclaimed mutations when no new owner exists', async (t) => {
+  const f = await services(t)
+  let start
+  const pending = new Promise((resolve) => {
+    start = resolve
+  })
+  let descendant
+  await f.first.run(async () => {
+    descendant = pending.then(() => f.firstPool.update(f.id, { port: 2080 }))
+    return { terminal: true }
+  })
+  const mode = process.env.VM2API_CONTROL_PLANE_MODE
+  process.env.VM2API_CONTROL_PLANE_MODE = 'kubernetes'
+  t.after(() => {
+    if (mode == null) delete process.env.VM2API_CONTROL_PLANE_MODE
+    else process.env.VM2API_CONTROL_PLANE_MODE = mode
+  })
+  start()
+  await assert.rejects(descendant, { code: 'proxy_operation_inactive' })
+})
+
+test('nested pool operations reuse one claim and retain the value contract', async (t) => {
+  const f = await services(t)
+  await f.first.run(async () => {
+    const value = await f.second.run(async () => ({ terminal: true, value: 'synthetic' }))
+    assert.equal(value, 'synthetic')
+    assert.equal(
+      (
+        await f.peer
+          .prepare('SELECT count(*) AS n FROM background_task_runs WHERE task_key = $1 AND finished_at IS NULL')
+          .get(TASK_KEY)
+      ).n,
+      1,
+    )
+    return { terminal: true }
+  })
+})
+
+test('SIGKILL does not resell a proxy pool operation to another process', async (t) => {
+  const f = await services(t)
+  const repositoryUrl = new URL('../repository-database.mjs', import.meta.url).href
+  const serviceUrl = new URL('../../src/lib/vm/shared-proxy-operations.mjs', import.meta.url).href
+  const script = `import { createRepositoryTestDatabase } from ${JSON.stringify(repositoryUrl)};
+    import { SharedProxyOperations } from ${JSON.stringify(serviceUrl)};
+    const db = await createRepositoryTestDatabase({ connectionString: process.env.VM2API_TEST_DATABASE_URL, schema: process.env.KIN_DATABASE_SCHEMA });
+    const claim = await new SharedProxyOperations(db).tryAcquire();
+    process.stdout.write(JSON.stringify({ ok: claim.ok }) + '\\n');
+    setInterval(() => {}, 1000);`
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+    env: { ...process.env, KIN_DATABASE_SCHEMA: f.db.schema },
+    stdio: ['ignore', 'pipe', 'ignore'],
+  })
+  t.after(() => child.kill('SIGKILL'))
+  const lines = createInterface({ input: child.stdout })
+  const message = await Promise.race([
+    once(lines, 'line').then(([line]) => JSON.parse(line)),
+    once(child, 'exit').then(() => {
+      throw new Error('synthetic owner exited before reporting')
+    }),
+  ])
+  assert.equal(message.ok, true)
+  const exited = once(child, 'exit')
+  child.kill('SIGKILL')
+  await exited
+  assert.equal((await f.second.tryAcquire()).ok, false)
 })
