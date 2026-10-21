@@ -51,7 +51,8 @@ import { SeatPlanner, rankSeatCandidates } from './seat-planner.mjs'
 import { GATE_DRAINING } from './quota-gate.mjs'
 import { activeHoursOf, evaluateActiveHours } from './active-hours.mjs'
 import { vmNodeReady } from '../cluster/placement.mjs'
-import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { isKubernetesMode, isKubernetesHaMode } from '../core/control-plane-mode.mjs'
+import { haVmCatalog } from '../vm/ha-vm-catalog.mjs'
 import { getDb } from '../db/database.mjs'
 import { SharedExecutionAdmissions } from './shared-execution-admissions.mjs'
 
@@ -223,7 +224,7 @@ function selectionSnapshot(candidates = [], available = [], extras = {}) {
 }
 
 export function accountIdOf(vm, projectRoot = null) {
-  if (projectRoot && vm?.id) {
+  if (!isKubernetesHaMode() && projectRoot && vm?.id) {
     const slot = readSlotCredentialIdentity(vmCliHomePath(projectRoot, vm.id))
     if (slot?.account_uuid) return slot.account_uuid
   }
@@ -332,6 +333,7 @@ export class PoolScheduler extends EventEmitter {
     runtimeRepo = null,
     workerHealth = null,
     executionAdmissions = null,
+    captureNodeExecution = null,
     routingState = null,
     config = {},
   } = {}) {
@@ -344,6 +346,8 @@ export class PoolScheduler extends EventEmitter {
     this.runtimeRepo = runtimeRepo
     this.workerHealth = workerHealth
     this.shared = isKubernetesMode()
+    this.ha = isKubernetesHaMode()
+    this.captureNodeExecution = captureNodeExecution
     this.routingState = routingState
     this.executionAdmissions = this.shared
       ? executionAdmissions ||
@@ -1034,6 +1038,7 @@ export class PoolScheduler extends EventEmitter {
     keyScope = null,
     quotaRequest = null,
   } = {}) {
+    if (this.ha) await haVmCatalog().refresh()
     const routingRevision = this.routingState?.currentRevision
     const now = Date.now()
     this.runtimeRepo?.clearExpired?.(now)
@@ -1057,6 +1062,17 @@ export class PoolScheduler extends EventEmitter {
       if (!keyAllowsVm(keyScope, vm)) continue
       const accountId = accountIdOf(vm, this.projectRoot)
       if (!accountId || excluded.has(accountId) || excluded.has(vm.id)) continue
+      let captured = null
+      if (this.ha) {
+        if (!vm.node_id || typeof this.captureNodeExecution !== 'function') continue
+        try {
+          captured = await this.captureNodeExecution({ vmId: vm.id, accountId, nodeId: vm.node_id, signal })
+        } catch {
+          continue
+        }
+        if (!captured?.slotgate || captured.workerStatus?.ok !== true) continue
+      }
+      const exec = this.executionContext(vm, accountId, captured)
       const state = this.runtimeRepo?.get?.(accountId) || null
       const eligibility = await this.checkEligibility({
         vm,
@@ -1067,6 +1083,8 @@ export class PoolScheduler extends EventEmitter {
         signal,
         pinned: !!pin,
         quotaRequest,
+        exec,
+        capturedHealth: captured?.workerStatus,
       })
       if (!eligibility.ok) {
         const kind = eligibility.reason
@@ -1115,12 +1133,24 @@ export class PoolScheduler extends EventEmitter {
         cooldownReason: state?.cooldown_reason || null,
         quotaRequest,
         sharedCounts: eligibility.sharedCounts,
-        exec: this.executionContext(vm, accountId),
+        exec,
       })
     }
     return candidates
   }
-  async checkEligibility({ vm, accountId, state, model, now, signal, pinned = false, quotaRequest = null }) {
+  async checkEligibility({
+    vm,
+    accountId,
+    state,
+    model,
+    now,
+    signal,
+    pinned = false,
+    quotaRequest = null,
+    exec = null,
+    capturedHealth = null,
+  }) {
+    if (this.ha && !exec?.slotgate) return { ok: false, reason: 'node_capability_unavailable' }
     // sub2api IsSchedulable: rate_limit_reset_at / overload_until gate before any
     // passive Extra reading or health hop. Pins are diagnostics and still reach the slot.
     const hardBlock = pinned ? null : hardBlockOf(state, now)
@@ -1134,14 +1164,16 @@ export class PoolScheduler extends EventEmitter {
       if (circuit?.reason === 'circuit_probe') circuitProbeUntil = circuit.until
     }
     const gate = evaluateSlotGate(vm)
-    if (!gate.ok && gate.reason !== 'no_credential') {
+    if (!gate.ok && gate.reason !== 'no_credential' && !(this.ha && gate.reason === 'proxy_required')) {
       // Master pin may test a slot taken out of the pool, but SOCKS is still mandatory.
       if (!(pinned && gate.reason === 'vm_unschedulable')) return gate
     }
-    if (!slotHasBoundProxy(vm)) return { ok: false, reason: 'proxy_required' }
-    const workerProxyEndpoint = this.projectRoot ? readWorkerProxyEndpoint(this.projectRoot, vm.id) : undefined
-    const egressMode = this.projectRoot ? readWorkerEgressMode(this.projectRoot, vm.id) : ''
-    const proxySync = evaluateProxySync({ vm, workerProxyEndpoint, egressMode })
+    if (!this.ha && !slotHasBoundProxy(vm)) return { ok: false, reason: 'proxy_required' }
+    const workerProxyEndpoint =
+      !this.ha && this.projectRoot ? readWorkerProxyEndpoint(this.projectRoot, vm.id) : undefined
+    const egressMode = !this.ha && this.projectRoot ? readWorkerEgressMode(this.projectRoot, vm.id) : ''
+    // HA egress is fixed by the node's independently checked launch policy.
+    const proxySync = this.ha ? { ok: true } : evaluateProxySync({ vm, workerProxyEndpoint, egressMode })
     if (!proxySync.ok) {
       if (
         this.projectRoot &&
@@ -1207,6 +1239,7 @@ export class PoolScheduler extends EventEmitter {
         })
         if (!ev.accept) {
           if (
+            !this.ha &&
             this.projectRoot &&
             vm.schedulable !== false &&
             ev.reason === 'quota_refresh_failed' &&
@@ -1229,7 +1262,8 @@ export class PoolScheduler extends EventEmitter {
       const rest = evaluateActiveHours(activeHoursOf(vm), now, vm.timezone)
       if (!rest.active) return { ok: false, reason: 'rest_period', until: rest.until }
     }
-    const workerStatus = await this.getWorkerHealth(this.executionContext(vm, accountId), { signal })
+    const workerStatus =
+      capturedHealth || (await this.getWorkerHealth(exec || this.executionContext(vm, accountId), { signal }))
     const cred = evaluateCredentialEligibility({ vm, workerStatus, now })
     if (!cred.ok) return cred
     state = this.runtimeRepo?.get?.(accountId) || state
@@ -1321,7 +1355,7 @@ export class PoolScheduler extends EventEmitter {
       return { ok: false, reason: 'kernel_faulted' }
     }
     // Node offline or asleep: the relay has no link behind it, a pick would only fail. Back on reconnect.
-    if (!vmNodeReady(vm)) return { ok: false, reason: 'node_offline' }
+    if (!this.ha && !vmNodeReady(vm)) return { ok: false, reason: 'node_offline' }
     if (rustKernelBusy(workerStatus)) {
       markWait('slot_busy')
     } else if (workerStatus && rustKernelProcessUp(workerStatus) && !rustKernelReachable(workerStatus)) {
@@ -1330,7 +1364,23 @@ export class PoolScheduler extends EventEmitter {
     return { ok: true, account, workerStatus, busy, availableAt, waitReason, headroom, gateZone, sharedCounts }
   }
 
-  executionContext(vm, accountId) {
+  executionContext(vm, accountId, captured = null) {
+    if (this.ha) {
+      if (!captured?.slotgate)
+        throw Object.assign(new Error('HA node capability unavailable'), { code: 'node_capability_unavailable' })
+      return {
+        vmId: vm.id,
+        accountId,
+        vm,
+        slotgate: captured.slotgate,
+        nodeManifest: captured.nodeManifest,
+        nodeIdentity: captured.workerStatus,
+        seedPolicy: vm.seed_policy,
+        timezone: vm.timezone || 'UTC',
+        locale: vm.locale || 'en_US.UTF-8',
+        kernel: vm.kernel || null,
+      }
+    }
     const homeDir = vmCliHomePath(this.projectRoot, vm.id)
     const slot = readSlotCredentialIdentity(homeDir)
     return {
@@ -2072,6 +2122,9 @@ export class PoolScheduler extends EventEmitter {
    * schedule_manual is restored to on + restriction.
    */
   syncQuotaSchedule(vm, account = null) {
+    // Eligibility still reads live PG quota/runtime state. No Pod file can
+    // change the node-owned manifest or become the VM metadata authority.
+    if (this.ha) return { action: 'keep', reason: 'node_owned_manifest' }
     if (!this.projectRoot || !vm?.id) return { action: 'keep', reason: null }
     const accountId = account?.account_id || vm.claude?.account_uuid || vm.id
     account = account || this.accountQuota?.repo?.get?.(accountId) || null

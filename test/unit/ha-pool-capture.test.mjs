@@ -17,29 +17,51 @@ for (const available of [true, false]) {
     const db = getDb()
     const repo = new VmsRepo(db)
     await repo.upsertFromVmJson({
-      id: 'ha-pool-vm', node_id: 'ha-node', status: 'running', schedulable: true,
-      claude: { account_uuid: 'ha-pool-account', has_access: true, has_refresh: true, expires_at: Date.now() + 3600_000 },
+      id: 'ha-pool-vm',
+      node_id: 'ha-node',
+      status: 'running',
+      schedulable: true,
+      claude: {
+        account_uuid: 'ha-pool-account',
+        has_access: true,
+        has_refresh: true,
+        expires_at: Date.now() + 3600_000,
+      },
     })
     const catalog = new HaVmCatalog(db)
     bindHaVmCatalog(catalog)
     let captures = 0
     let legacyHealth = 0
     const capability = Object.freeze({
-      slotgate: Object.freeze({ trusted: true, pgBindingReady: true, vmId: 'ha-pool-vm', nodeId: 'ha-node',
-        fence: { generation: '1', incarnation: 'captured-incarnation' }, manifest: { revision: '1', digest: 'a'.repeat(64) } }),
+      slotgate: Object.freeze({
+        trusted: true,
+        pgBindingReady: true,
+        vmId: 'ha-pool-vm',
+        nodeId: 'ha-node',
+        fence: { generation: '1', incarnation: 'captured-incarnation' },
+        manifest: { revision: '1', digest: 'a'.repeat(64) },
+      }),
       nodeManifest: Object.freeze({ revision: '1', digest: 'a'.repeat(64) }),
-      workerStatus: Object.freeze({ ok: true, healthy: true, ready_slots: 1,
-        credential: { has_access: true, has_refresh: true, account_uuid: 'ha-pool-account', generation: 1 } }),
+      workerStatus: Object.freeze({
+        ok: true,
+        healthy: true,
+        ready_slots: 1,
+        credential: { has_access: true, has_refresh: true, account_uuid: 'ha-pool-account', generation: 1 },
+      }),
     })
     const scheduler = new PoolScheduler({
       projectRoot: '/nonexistent-ha-pod-project',
       captureNodeExecution: async ({ vmId, accountId, nodeId }) => {
         captures++
         assert.deepEqual([vmId, accountId, nodeId], ['ha-pool-vm', 'ha-pool-account', 'ha-node'])
-        if (!available) throw Object.assign(new Error('synthetic node unavailable'), { code: 'node_capability_unavailable' })
+        if (!available)
+          throw Object.assign(new Error('synthetic node unavailable'), { code: 'node_capability_unavailable' })
         return capability
       },
-      workerHealth: async () => { legacyHealth++; throw new Error('legacy worker health must not run') },
+      workerHealth: async () => {
+        legacyHealth++
+        throw new Error('legacy worker health must not run')
+      },
       executionAdmissions: {
         inspectCircuit: async () => ({ open: false }),
         getCounts: async () => ({ accountInflight: 0, vmInflight: 0, fableInflight: 0, rpmCount: 0 }),
