@@ -13,7 +13,7 @@ function gate() {
   return { promise, resolve }
 }
 
-async function reservation(t) {
+async function reservation(t, { seat = false } = {}) {
   const previous = process.env.VM2API_CONTROL_PLANE_MODE
   process.env.VM2API_CONTROL_PLANE_MODE = 'kubernetes'
   t.after(() => {
@@ -25,6 +25,7 @@ async function reservation(t) {
   const pool = new PoolScheduler({
     projectRoot: '/tmp',
     executionAdmissions: service,
+    config: { seat_grace_ms: 0 },
     accountQuota: {
       canAccept: () => ({ ok: true }),
       limitFor: () => 2,
@@ -33,14 +34,19 @@ async function reservation(t) {
     },
   })
   pool.unitCircuit = null
-  const selected = await pool.reserve({
+  const candidate = {
     accountId: 'release-account',
     vmId: 'release-vm',
     model: 'claude-test',
     maxConcurrency: 2,
+    seatCap: 2,
+    headroom: null,
     account: {},
     vm: { policy: { maxConcurrency: 2 } },
-  })
+  }
+  const selected = seat
+    ? (await pool.claimSeatShared('release-seat', candidate, 'test')).reservation
+    : await pool.reserve(candidate)
   const row = () => db.prepare('SELECT * FROM execution_admissions WHERE id = $1').get(selected.admissionId)
   return { db, service, pool, selected, row }
 }
@@ -68,7 +74,7 @@ test('a rolled-back PostgreSQL release can be retried through the scheduler rese
 })
 
 test('a PostgreSQL refusal to release preserves local counters and allows a later retry', async (t) => {
-  const { db, service, pool, selected, row } = await reservation(t)
+  const { db, service, pool, selected, row } = await reservation(t, { seat: true })
   await db.exec(`CREATE FUNCTION skip_scheduler_release() RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN IF NEW.released_at IS NOT NULL THEN RETURN NULL; END IF; RETURN NEW; END $$;
     CREATE TRIGGER skip_scheduler_release BEFORE UPDATE ON execution_admissions
@@ -78,11 +84,13 @@ test('a PostgreSQL refusal to release preserves local counters and allows a late
     assert.equal((await row()).released_at, null)
     assert.equal(pool.inflight.get('release-account'), 1)
     assert.equal(pool.vmInflight.get('release-vm'), 1)
+    assert.equal(pool.planner.seatOf('release-seat').inflight, 1)
     await db.exec('DROP TRIGGER skip_scheduler_release ON execution_admissions')
     await selected.release()
     assert.ok((await row()).released_at)
     assert.equal(pool.inflight.has('release-account'), false)
     assert.equal(pool.vmInflight.has('release-vm'), false)
+    assert.equal(pool.planner.seatOf('release-seat'), null)
   } finally {
     await db.exec('DROP TRIGGER IF EXISTS skip_scheduler_release ON execution_admissions')
     await service.release(selected)

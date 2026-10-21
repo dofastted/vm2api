@@ -834,10 +834,11 @@ export class PoolScheduler extends EventEmitter {
         release: (options) =>
           this.track(
             (async () => {
-              await releaseRequest(options)
-              if (released || reservation.uncertain) return
+              const result = await releaseRequest(options)
+              if (released || reservation.uncertain || result?.released === false) return result
               released = true
               this.planner.release(seat)
+              return result
             })(),
           ),
       },
@@ -1640,28 +1641,38 @@ export class PoolScheduler extends EventEmitter {
     this.bumpVmInflight(candidate.vmId, 1)
     let released = false
     let releasing = null
+    let marking = null
     const reservation = {
       ...lease,
       reserved: true,
       slotIndex: lease.slotIndex ?? null,
       uncertain: false,
-      markUncertain: () =>
-        this.track(
-          (async () => {
-            await lease.markUncertain()
-            reservation.uncertain = true
-          })(),
-        ),
+      markUncertain: () => {
+        if (released) return Promise.resolve({ uncertain: false })
+        // Stop ordinary release immediately, including while persistence is pending.
+        reservation.uncertain = true
+        if (marking) return marking
+        const task = this.track(Promise.resolve().then(() => lease.markUncertain()))
+        marking = task
+        task.then(
+          (result) => {
+            if (result?.uncertain === false && marking === task) marking = null
+          },
+          () => {
+            if (marking === task) marking = null
+          },
+        )
+        return task
+      },
       release: (releaseOptions) => {
-        if (released || reservation.uncertain) return Promise.resolve()
+        if (releaseOptions?.uncertain) return reservation.markUncertain()
+        if (released) return Promise.resolve({ released: false })
+        if (reservation.uncertain) return reservation.markUncertain()
         if (releasing) return releasing
-        releasing = this.track(
+        const task = this.track(
           (async () => {
-            await lease.release(releaseOptions)
-            if (releaseOptions?.uncertain) {
-              reservation.uncertain = true
-              return
-            }
+            const result = await lease.release(releaseOptions)
+            if (result?.released === false) return result
             released = true
             const next = Math.max(0, (this.inflight.get(candidate.accountId) || 1) - 1)
             if (next) this.inflight.set(candidate.accountId, next)
@@ -1671,9 +1682,19 @@ export class PoolScheduler extends EventEmitter {
             if (circuitHold?.probe) this.unitCircuit?.releaseProbe?.(candidate.accountId)
             this.planner.pump(candidate.vmId)
             this.notifyCapacity(candidate.accountId)
+            return result
           })(),
         )
-        return releasing
+        releasing = task
+        task.then(
+          () => {
+            if (!released && releasing === task) releasing = null
+          },
+          () => {
+            if (releasing === task) releasing = null
+          },
+        )
+        return task
       },
     }
     return reservation
