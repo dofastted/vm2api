@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { createDatabase } from '../../src/lib/db/database.mjs'
+import { createDatabase } from '../../src/lib/db/sqlite-legacy.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const MIGRATIONS = path.join(__dirname, '../../src/lib/db/migrations')
