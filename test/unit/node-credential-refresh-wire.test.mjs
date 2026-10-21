@@ -8,6 +8,7 @@ import os from 'node:os'
 import path from 'node:path'
 import http from 'node:http'
 import tls from 'node:tls'
+import net from 'node:net'
 import pg from 'pg'
 import { NodeCredentialRefreshGrants } from '../../src/lib/cluster/node-credential-refresh-grants.mjs'
 import { SharedCredentialRefresh } from '../../src/lib/oauth/shared-credential-refresh.mjs'
@@ -270,3 +271,151 @@ nodeCase('real PG reader and pinned TLS authorize node-owned refresh without Pod
     await new Promise((resolve) => kernel.close(resolve))
   }
 })
+
+async function launchedRefresh(fx) {
+  const published = await fx.run('node_publish_initial', (operation) => fx.service.publishInitial(fx.input(operation)))
+  return fx.run('node_launch', (operation) =>
+    fx.service.launch(fx.input(operation, { commandId: 'refresh-launch', manifestDigest: published.manifest_digest })),
+  )
+}
+
+async function closedPortLink(link) {
+  const server = net.createServer()
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+  await new Promise((resolve) => server.close(resolve))
+  return { ...link, address: '127.0.0.1', port }
+}
+
+function attemptRefresh(fx, launched, link) {
+  const current = { generation: '1', credential: { account_uuid: 'synthetic-account' } }
+  return new SharedCredentialRefresh(fx.db).run(
+    { platform: 'claude', vmId, accountId: 'synthetic-account', expectedGeneration: '1' },
+    {
+      readCurrent: async () => current,
+      refresh: async (_current, { operation }) => {
+        const receipt = await fx.refreshGrants.refresh(
+          {
+            operation,
+            nodeId,
+            vmId,
+            accountId: 'synthetic-account',
+            commandId: crypto.randomUUID(),
+            capturedFence: launched.fence,
+            expectedGeneration: '1',
+            force: false,
+          },
+          link,
+        )
+        return { finished: true, value: { ok: receipt.ok, generation: receipt.credential.generation } }
+      },
+      publish: async () => current,
+    },
+  )
+}
+
+nodeCase(
+  'a TLS connection refusal retires only the unsent grant and permits a fresh command at the same generation',
+  async (fx) => {
+    const launched = await launchedRefresh(fx)
+    await assert.rejects(attemptRefresh(fx, launched, await closedPortLink(fx.node.link)), {
+      code: 'node_refresh_unconfirmed',
+      vmOperationNotStarted: true,
+      credentialRefreshNotStarted: true,
+    })
+    const first = (await fx.peer.query(`SELECT * FROM ${fx.q}.refresh_grants`)).rows[0]
+    assert.ok(first.revoked_at)
+    const next = await attemptRefresh(fx, launched, fx.node.link)
+    assert.equal(next.finished, true)
+    assert.equal(next.unknown, false)
+    assert.equal(next.value.ok, true)
+    const rows = (await fx.peer.query(`SELECT receipt,revoked_at FROM ${fx.q}.refresh_grants ORDER BY created_at`)).rows
+    assert.equal(rows.length, 2)
+    assert.equal(rows[0].receipt.not_started, true)
+    assert.notEqual(rows[0].receipt.finished, true)
+    assert.equal(rows[1].receipt.credential.generation, '1')
+    assert.equal(
+      rows.every((row) => row.revoked_at),
+      true,
+    )
+  },
+)
+
+nodeCase('failure to commit an unsent grant terminal state retains both exact claims', async (fx) => {
+  const launched = await launchedRefresh(fx)
+  await fx.db.query(
+    `CREATE FUNCTION reject_unsent_refresh() RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN RAISE EXCEPTION 'synthetic unsent commit failure' USING ERRCODE='P648N'; END $body$; CREATE TRIGGER reject_unsent_refresh BEFORE UPDATE OF receipt ON ${fx.q}.refresh_grants FOR EACH ROW EXECUTE FUNCTION reject_unsent_refresh()`,
+  )
+  await assert.rejects(attemptRefresh(fx, launched, await closedPortLink(fx.node.link)), (error) => {
+    assert.equal(error.code, 'P648N')
+    assert.notEqual(error.vmOperationNotStarted, true)
+    assert.notEqual(error.credentialRefreshNotStarted, true)
+    assert.equal(error.vmOperationUncertain, true)
+    assert.equal(error.credentialRefreshUnknown, true)
+    return true
+  })
+  const op = (await fx.peer.query("SELECT uncertain_at,released_at FROM vm_operations WHERE kind='credential_refresh'"))
+    .rows[0]
+  assert.ok(op.uncertain_at)
+  assert.equal(op.released_at, null)
+  const bg = (
+    await fx.peer.query(
+      "SELECT unknown_at,finished_at FROM background_task_runs WHERE task_key='oauth-refresh:claude:synthetic-account'",
+    )
+  ).rows[0]
+  assert.ok(bg.unknown_at)
+  assert.equal(bg.finished_at, null)
+  const grant = (await fx.peer.query(`SELECT receipt,revoked_at FROM ${fx.q}.refresh_grants`)).rows[0]
+  assert.equal(grant.receipt, null)
+  assert.ok(grant.revoked_at)
+})
+
+nodeCase(
+  'TLS application data followed by a missing acknowledgement keeps generation occupied after revocation',
+  async (fx) => {
+    const launched = await launchedRefresh(fx)
+    let received = false
+    const sockets = new Set()
+    const server = tls.createServer(
+      {
+        cert: fs.readFileSync(path.join(fx.node.root, 'tls', 'cert.pem')),
+        key: fs.readFileSync(path.join(fx.node.root, 'tls', 'key.pem')),
+        minVersion: 'TLSv1.3',
+      },
+      (socket) => {
+        sockets.add(socket)
+        socket.once('close', () => sockets.delete(socket))
+        socket.once('data', () => {
+          received = true
+          socket.destroy()
+        })
+      },
+    )
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      await assert.rejects(attemptRefresh(fx, launched, { ...fx.node.link, port: server.address().port }), (error) => {
+        assert.equal(error.code, 'node_refresh_unconfirmed')
+        assert.equal(error.vmOperationUncertain, true)
+        assert.notEqual(error.vmOperationNotStarted, true)
+        assert.notEqual(error.credentialRefreshNotStarted, true)
+        return true
+      })
+      assert.equal(received, true)
+      const row = (await fx.peer.query(`SELECT receipt,revoked_at FROM ${fx.q}.refresh_grants`)).rows[0]
+      assert.equal(row.receipt, null)
+      assert.ok(row.revoked_at)
+      await assert.rejects(
+        fx.peer.query(
+          `INSERT INTO ${fx.q}.refresh_grants SELECT 'late-command',node_id,vm_id,allocation_id,operation_id,owner_id,account_id,bg_task_key,bg_execution_id,bg_owner_id,epoch,expected_generation,intent_digest,intent,receipt,created_at,revoked_at FROM ${fx.q}.refresh_grants`,
+        ),
+        { code: '23505' },
+      )
+      const next = await attemptRefresh(fx, launched, fx.node.link)
+      assert.equal(next.unknown, true)
+      assert.equal((await fx.peer.query(`SELECT count(*)::int AS n FROM ${fx.q}.refresh_grants`)).rows[0].n, 1)
+    } finally {
+      for (const socket of sockets) socket.destroy()
+      await new Promise((resolve) => server.close(resolve))
+    }
+  },
+)
