@@ -26,7 +26,7 @@ export const payload = Buffer.from(
   }),
 )
 
-export async function nodeManagementFixture(t) {
+export async function nodeManagementFixture(t, { listen } = {}) {
   const db = getDb()
   const peer = await createDatabase({ connectionString: db.connectionString, schema: db.schema })
   const coordinator = new GlobalMaintenanceCoordinator(db)
@@ -130,7 +130,7 @@ export async function nodeManagementFixture(t) {
   node = await realAllocationGate(
     t,
     { connection_string: url.toString(), authority_schema: service.schema, node_id: nodeId },
-    { launch: policy, dockerSocket: socket },
+    { launch: policy, dockerSocket: socket, ...(listen ? { listen } : {}) },
   )
   const run = (kind, callback) => new SharedVmOperations(db).run(vmId, callback, { kind })
   const allocated = await run('node_allocate', (operation) =>

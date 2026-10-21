@@ -5,7 +5,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-export async function realAllocationGate(t, management, { launch, dockerSocket } = {}) {
+export async function realAllocationGate(t, management, { launch, dockerSocket, listen = '127.0.0.1:0' } = {}) {
+  const address = /^(127\.0\.0\.1|10\.249\.248\.1):([0-9]{1,5})$/.exec(listen)
+  if (!address || Number(address[2]) > 65535) throw Object.assign(new Error('invalid synthetic node listener'), {code:'fixture_listener_invalid'})
   const root = fs.mkdtempSync(path.join(os.tmpdir(),'ag2-'))
   const worker = path.join(root,'worker')
   fs.cpSync(fileURLToPath(new URL('../../worker',import.meta.url)),worker,{recursive:true})
@@ -35,7 +37,7 @@ export async function realAllocationGate(t, management, { launch, dockerSocket }
     const runtime = path.join(root,'runtime')
     fs.mkdirSync(runtime,{mode:0o700})
     const configFile = path.join(root,'config.json')
-    fs.writeFileSync(configFile,JSON.stringify({listen:'127.0.0.1:0',root:runtime,token:'synthetic-node-allocation-token-000000',tls_dir:path.join(root,'tls'),
+    fs.writeFileSync(configFile,JSON.stringify({listen,root:runtime,token:'synthetic-node-allocation-token-000000',tls_dir:path.join(root,'tls'),
       fenced:true,authority_dir:path.join(root,'authority'),docker_socket:dockerSocket || path.join(root,'never-opened.sock'),management,
       ...(launch ? {launch} : {})}),{mode:0o600})
     child = spawn(binary,[configFile],{stdio:['ignore','pipe','pipe']})
@@ -54,6 +56,6 @@ export async function realAllocationGate(t, management, { launch, dockerSocket }
         try {resolve(JSON.parse(buffer.slice(0,newline)))} catch(error){reject(error)}
       })
     })
-    return {link,root,close}
+    return {link,root,close,pid:child.pid}
   } catch(error) {await close();throw error}
 }
