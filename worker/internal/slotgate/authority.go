@@ -58,13 +58,14 @@ const (
 // PID alone. ProcessScope must identify a node-owned scope containing every
 // descendant; a verifier must check the whole scope, not only its initial PID.
 type ExecutorIdentity struct {
-	Kind         string `json:"kind"`
-	NodeBootID   string `json:"node_boot_id"`
-	ContainerID  string `json:"container_id,omitempty"`
-	StartedAt    string `json:"started_at,omitempty"`
-	PID          int    `json:"pid,omitempty"`
-	ProcessStart uint64 `json:"process_start,omitempty"`
-	ProcessScope string `json:"process_scope,omitempty"`
+	Kind           string `json:"kind"`
+	NodeBootID     string `json:"node_boot_id"`
+	ContainerID    string `json:"container_id,omitempty"`
+	DockerDaemonID string `json:"docker_daemon_id,omitempty"`
+	StartedAt      string `json:"started_at,omitempty"`
+	PID            int    `json:"pid,omitempty"`
+	ProcessStart   uint64 `json:"process_start,omitempty"`
+	ProcessScope   string `json:"process_scope,omitempty"`
 }
 
 // Fence is captured when work is created. A delayed operation must never be
@@ -639,7 +640,7 @@ func validateExecutor(e ExecutorIdentity) error {
 			return ErrInvalidAuthority
 		}
 	case "process":
-		if e.PID <= 0 || e.ProcessStart == 0 || !validAuthorityID(e.ProcessScope) || e.ContainerID != "" || e.StartedAt != "" {
+		if e.PID <= 0 || e.ProcessStart == 0 || !validAuthorityID(e.ProcessScope) || e.ContainerID != "" || e.DockerDaemonID != "" || e.StartedAt != "" {
 			return ErrInvalidAuthority
 		}
 	default:

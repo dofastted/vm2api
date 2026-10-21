@@ -23,6 +23,10 @@ type fakeEngine struct {
 	absent          bool
 	status          int
 	keepAfterRemove bool
+	infoEmptyAfter  int
+	infoCalls       int
+	truncated404    bool
+	huge404         bool
 	calls           []string
 }
 
@@ -35,12 +39,24 @@ func (f *fakeEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/info" {
+		f.infoCalls++
+		if f.infoEmptyAfter > 0 && f.infoCalls > f.infoEmptyAfter {
+			fmt.Fprint(w, `{}`)
+			return
+		}
 		fmt.Fprint(w, `{"ID":"test-daemon"}`)
 		return
 	}
 	if r.Method == "GET" {
 		if f.absent {
+			if f.truncated404 {
+				w.Header().Set("Content-Length", "1000")
+			}
 			w.WriteHeader(404)
+			if f.huge404 {
+				fmt.Fprint(w, strings.Repeat("x", (1<<20)+1))
+				return
+			}
 			fmt.Fprint(w, `{"message":"No such container"}`)
 			return
 		}
@@ -188,6 +204,10 @@ func TestKSG2FencedModeRejectsKSG1AndUnauthenticatedState(t *testing.T) {
 	reply = gate2Control(t, addr, gate2Request{Op: "complete", VMID: "v", Fence: state.Fence})
 	if reply.OK {
 		t.Fatal("client completed a node command without a verifier")
+	}
+	reply = gate2Control(t, addr, gate2Request{Op: "prepare", VMID: "v", CommandID: "no-captured-fence", Kind: "kernel"})
+	if reply.OK {
+		t.Fatal("prepare omitted its captured fence")
 	}
 }
 
@@ -375,5 +395,55 @@ func TestDockerVerifierErrorsCannotAdvanceOrReleasePendingForward(t *testing.T) 
 	engine.mu.Unlock()
 	if _, err := verifier(context.Background(), executor); err == nil {
 		t.Fatal("remove response alone became termination proof")
+	}
+}
+
+func TestDockerVerifierFinalDaemonObservationCannotReuseEarlierFields(t *testing.T) {
+	socket, engine, executor := engineForTest(t)
+	engine.mu.Lock()
+	engine.infoEmptyAfter = 1
+	engine.mu.Unlock()
+	verifier, _ := newDockerVerifier(socket, executor.NodeBootID)
+	if _, err := verifier(context.Background(), executor); err == nil {
+		t.Fatal("missing final daemon ID reused an earlier observation")
+	}
+}
+
+func TestDockerVerifierIncompleteOrOversized404IsUnknown(t *testing.T) {
+	for _, which := range []string{"truncated", "oversized"} {
+		t.Run(which, func(t *testing.T) {
+			socket, engine, executor := engineForTest(t)
+			engine.mu.Lock()
+			engine.absent = true
+			engine.truncated404 = which == "truncated"
+			engine.huge404 = which == "oversized"
+			engine.mu.Unlock()
+			verifier, _ := newDockerVerifier(socket, executor.NodeBootID)
+			if _, err := verifier(context.Background(), executor); err == nil {
+				t.Fatal("incomplete/unbounded Engine response became absence proof")
+			}
+		})
+	}
+}
+
+func TestKSG2TwoControllersCanForwardWhileFirstResponseIsStillPending(t *testing.T) {
+	addr, root, _, state, _ := fencedGate(t)
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	defer close(release)
+	unixHTTP(t, filepath.Join(root, "vms", "v", "incarnations", state.Fence.Incarnation, "run", "kernel.sock"), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { entered <- struct{}{}; <-release; fmt.Fprint(w, "done") }))
+	for _, id := range []string{"controller-a", "controller-b"} {
+		req := forwardRequest(t, addr, state, id)
+		_, reader := gate2Connect(t, addr, testToken, req, "GET / HTTP/1.1\r\nHost: kernel\r\n\r\n")
+		if line, err := reader.ReadString('\n'); err != nil || line != "OK\n" {
+			t.Fatalf("send %s: %q %v", id, line, err)
+		}
+	}
+	for range 2 {
+		select {
+		case <-entered:
+		case <-time.After(time.Second):
+			t.Fatal("second controller waited for the first response")
+		}
 	}
 }
