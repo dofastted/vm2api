@@ -143,6 +143,16 @@ test('successful hello with an auxiliary profile timeout still retains ownership
   assert.equal((await f.other.tryAcquire({ vmId: f.vm.id })).ok, false)
 })
 
+test('the real bootstrap can release a credential validation failure before any command is sent', async (t) => {
+  const f = await fixture(t)
+  delete f.options.runBootstrap
+  await scheduleOfficialCcBootstrap(f.options)
+  await f.tasks.flush()
+  const next = await f.other.tryAcquire({ vmId: f.vm.id })
+  assert.equal(next.ok, true)
+  await next.release()
+})
+
 test('successful bootstrap keeps ownership until queued persistence has completed', async (t) => {
   const f = await fixture(t)
   let finishFlush
