@@ -63,6 +63,15 @@ test('two HA processes start with PG-only metadata and never enter legacy host b
   })
   assert.equal(blocked.status, 503)
   assert.equal((await blocked.json()).error.code, 'ha_operation_unsupported')
+  for (const endpoint of ['/v1/responses', '/responses']) {
+    const response = await fetch(`${gateways[1].baseUrl}${endpoint}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${gateways[1].apiKey}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-5', input: 'synthetic rejected request' }),
+    })
+    assert.equal(response.status, 400)
+    assert.equal((await response.json()).error.code, 'protocol_not_allowed')
+  }
   assert.equal(fs.existsSync(barrier) ? fs.readFileSync(barrier, 'utf8') : '', '')
   for (const gateway of gateways) {
     assert.equal(fs.existsSync(gateway.runtimeCallsFile) ? fs.readFileSync(gateway.runtimeCallsFile, 'utf8') : '', '')
