@@ -77,10 +77,18 @@ async function fixture(t, handle = (_req, res) => answer(res), { vms = 1 } = {})
       const chunks = []
       for await (const chunk of req) chunks.push(chunk)
       calls.push({ headers: req.headers, body: JSON.parse(Buffer.concat(chunks).toString()) })
-      bindings.push(
-        await other
+      const observe = () =>
+        other
           .prepare('SELECT * FROM execution_jobs WHERE request_id = $1')
-          .get(req.headers['x-client-request-id'] || ''),
+          .get(req.headers['x-client-request-id'] || '')
+      const coordinator = getActivityCoordinator(other)
+      bindings.push(
+        await (coordinator
+          ? coordinator.runActivity({ kind: 'synthetic_backend_observer' }, async () => ({
+              ended: true,
+              value: await observe(),
+            }))
+          : observe()),
       )
       await handle(req, res, calls.length)
     })().catch((error) => res.destroy(error))
