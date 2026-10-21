@@ -1,4 +1,4 @@
-import { getDb, withTransaction } from '../database.mjs'
+import { getDb, withTransaction, getActivityCoordinator } from '../database.mjs'
 import { lockHaRequestContext } from '../../core/ha-request-context.mjs'
 
 function parse(value, fallback = null) {
@@ -56,9 +56,6 @@ export class RequestAttemptsRepo {
     this._list = db.prepare(`
       SELECT * FROM request_attempts WHERE request_id = $1 ORDER BY attempt_no
     `)
-    this._removeOld = db.prepare(`
-      DELETE FROM request_attempts WHERE started_at < $1
-    `)
   }
 
   async begin({ requestId, attemptNo, vmId, accountId, model, selectionReason, waitMs = 0 }) {
@@ -115,6 +112,30 @@ export class RequestAttemptsRepo {
   async cleanup(retainDays = 7) {
     const days = Math.max(1, Number(retainDays) || 7)
     const cutoff = new Date(Date.now() - days * 86400_000).toISOString()
-    return (await this._removeOld.run(cutoff)).changes
+    return withTransaction(this.db, async () => {
+      const parents = await this.db
+        .prepare(`SELECT DISTINCT ha_request_id FROM request_attempts
+        WHERE started_at<$1 AND ha_request_id IS NOT NULL ORDER BY ha_request_id`)
+        .all(cutoff)
+      // Recovery reads an exact attempt graph under this same parent lock.
+      for (const parent of parents)
+        await this.db.prepare('SELECT id FROM ha_request_contexts WHERE id=$1 FOR UPDATE').get(parent.ha_request_id)
+      const coordinator = getActivityCoordinator(this.db)
+      const activityEnded = coordinator
+        ? `EXISTS (SELECT 1 FROM ${coordinator.qualified}.activities x
+        WHERE x.id=r.activity_id AND x.owner_id=r.activity_owner_id AND x.epoch=r.activity_epoch
+          AND x.completed_at IS NOT NULL)`
+        : 'false'
+      const removed = await this.db
+        .prepare(`DELETE FROM request_attempts t WHERE started_at<$1
+        AND NOT EXISTS (SELECT 1 FROM api_key_admissions k WHERE k.ha_request_id=t.ha_request_id AND k.released_at IS NULL)
+        AND NOT EXISTS (SELECT 1 FROM execution_admissions a WHERE a.ha_request_id=t.ha_request_id AND a.released_at IS NULL)
+        AND NOT EXISTS (SELECT 1 FROM execution_jobs j WHERE j.ha_request_id=t.ha_request_id AND j.ended_at IS NULL)
+        AND NOT EXISTS (SELECT 1 FROM ha_request_contexts r WHERE r.id=t.ha_request_id AND (r.accepting_children
+          OR (r.recovery_sealed_at IS NOT NULL AND r.execution_recovered_at IS NULL)
+          OR (r.execution_recovered_at IS NULL AND NOT ${activityEnded})))`)
+        .run(cutoff)
+      return removed.changes
+    })
   }
 }

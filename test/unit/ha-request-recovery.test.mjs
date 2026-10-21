@@ -462,6 +462,11 @@ for (const heldBy of ['pending-billing', 'sealed-recovery', 'normal-finished']) 
         await f.peer
           .prepare('UPDATE api_key_admissions SET released_at=clock_timestamp() WHERE id=$1')
           .run(original.keyLease.reservationId)
+        if (heldBy === 'normal-finished')
+          await f.peer.query(
+            `UPDATE ${f.second.qualified}.activities SET completed_at=clock_timestamp() WHERE id=$1 AND owner_id=$2`,
+            [original.activity.activityId, f.first.ownerId],
+          )
       }
       await f.peer
         .prepare("UPDATE execution_admissions SET created_at=clock_timestamp()-interval '2 minutes' WHERE id=$1")

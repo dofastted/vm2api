@@ -1,5 +1,5 @@
 import crypto from 'node:crypto'
-import { withTransaction } from '../database.mjs'
+import { withTransaction, getActivityCoordinator } from '../database.mjs'
 import { physicalContainerName, physicalVmAliases } from '../../vm/vm-physical-target.mjs'
 import { readWatchdogState } from '../../transport/kernel-watchdog-state.mjs'
 import { ExecutionCircuitsRepo } from './execution-circuits-repo.mjs'
@@ -131,14 +131,21 @@ export class ExecutionAdmissionsRepo {
         .get(physicalVmAliases(vmId), vmId)
       if (alias) return denied('vm_physical_target_conflict', 0, vmLimit)
       const { now } = await this.db.prepare('SELECT clock_timestamp() AS now').get()
+      const coordinator = getActivityCoordinator(this.db)
+      const activityEnded = coordinator
+        ? `EXISTS (SELECT 1 FROM ${coordinator.qualified}.activities x
+        WHERE x.id=r.activity_id AND x.owner_id=r.activity_owner_id AND x.epoch=r.activity_epoch
+          AND x.completed_at IS NOT NULL)`
+        : 'false'
       await this.db
         .prepare(`DELETE FROM execution_admissions WHERE account_id = $1
           AND released_at IS NOT NULL AND created_at <= $2::timestamptz - interval '60 seconds'
           AND NOT EXISTS (SELECT 1 FROM api_key_admissions k
             WHERE k.ha_request_id=execution_admissions.ha_request_id AND k.released_at IS NULL)
           AND NOT EXISTS (SELECT 1 FROM ha_request_contexts r
-            WHERE r.id=execution_admissions.ha_request_id AND r.recovery_sealed_at IS NOT NULL
-              AND r.execution_recovered_at IS NULL)`)
+            WHERE r.id=execution_admissions.ha_request_id AND (r.accepting_children
+              OR (r.recovery_sealed_at IS NOT NULL AND r.execution_recovered_at IS NULL)
+              OR (r.execution_recovered_at IS NULL AND NOT ${activityEnded})))`)
         .run(accountId, now)
       const counts = await this._counts(accountId, vmId, now)
       // Concurrency zero disables execution; RPM/Fable zero adds no sublimit.
