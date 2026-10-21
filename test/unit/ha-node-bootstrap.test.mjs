@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import http from 'node:http'
+import tls from 'node:tls'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { NodeManagementGrants } from '../../src/lib/cluster/node-management-grants.mjs'
@@ -386,5 +387,99 @@ nodeCase(
     }
     const retry = await fx.cli('slot-create')
     assert.equal(retry.status, 0, retry.out + retry.err)
+  },
+)
+
+nodeCase(
+  'an allocate pin mismatch records an unsent terminal grant and permits a later corrected invocation',
+  async (fx) => {
+    const init = await fx.cli('trusted-init')
+    assert.equal(init.status, 0, init.out + init.err)
+    await fx.db.pool.query(fs.readFileSync(fx.output, 'utf8'))
+    const originalPin = fx.config.node.certSha256
+    fx.config.node.certSha256 = originalPin === '0'.repeat(64) ? '1'.repeat(64) : '0'.repeat(64)
+    fs.writeFileSync(fx.file, JSON.stringify(fx.config))
+    const first = await fx.cli('slot-create')
+    assert.equal(first.status, 1)
+    assert.match(first.err, /node_allocation_unconfirmed/)
+    assert.equal(fx.calls.length, 0)
+    const original = (await fx.peer.query(`SELECT * FROM ${fx.q}.allocations`)).rows[0]
+    fx.config.node.certSha256 = originalPin
+    fs.writeFileSync(fx.file, JSON.stringify(fx.config))
+    const retry = await fx.cli('slot-create')
+    assert.equal(retry.status, 0, retry.out + retry.err)
+    const rows = (await fx.peer.query(`SELECT * FROM ${fx.q}.allocations ORDER BY created_at`)).rows
+    assert.equal(rows.length, 2)
+    assert.equal(rows[0].allocation_id, original.allocation_id)
+    assert.ok(rows[0].not_started_at)
+    assert.ok(rows[0].revoked_at)
+    assert.equal(rows[0].receipt.not_started, true)
+    assert.notEqual(rows[0].allocation_id, rows[1].allocation_id)
+    assert.equal(rows[1].not_started_at, null)
+    const firstOp = (
+      await fx.peer.query('SELECT released_at,uncertain_at FROM vm_operations WHERE id=$1', [original.operation_id])
+    ).rows[0]
+    assert.ok(firstOp.released_at)
+    assert.equal(firstOp.uncertain_at, null)
+    const activity = (
+      await fx.peer.query(
+        `SELECT uncertain_at,completed_at FROM ${quoteIdentifier(fx.coordinator.schema)}.activities WHERE kind='node_bootstrap_command'`,
+      )
+    ).rows
+    assert.equal(
+      activity.some((row) => row.uncertain_at !== null || row.completed_at === null),
+      false,
+    )
+  },
+)
+
+nodeCase(
+  'an allocate acknowledgement lost after application data keeps both target uniqueness and claims',
+  async (fx) => {
+    const init = await fx.cli('trusted-init')
+    assert.equal(init.status, 0, init.out + init.err)
+    await fx.db.pool.query(fs.readFileSync(fx.output, 'utf8'))
+    let received = false
+    const sockets = new Set()
+    const server = tls.createServer(
+      {
+        cert: fs.readFileSync(path.join(fx.node.root, 'tls', 'cert.pem')),
+        key: fs.readFileSync(path.join(fx.node.root, 'tls', 'key.pem')),
+        minVersion: 'TLSv1.3',
+      },
+      (socket) => {
+        sockets.add(socket)
+        socket.once('close', () => sockets.delete(socket))
+        socket.once('data', () => {
+          received = true
+          socket.destroy()
+        })
+      },
+    )
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    try {
+      fx.config.node.port = server.address().port
+      fs.writeFileSync(fx.file, JSON.stringify(fx.config))
+      const first = await fx.cli('slot-create')
+      assert.equal(first.status, 1)
+      assert.equal(received, true)
+      const row = (await fx.peer.query(`SELECT * FROM ${fx.q}.allocations`)).rows[0]
+      assert.equal(row.receipt, null)
+      assert.ok(row.revoked_at)
+      fx.config.node.port = fx.node.link.port
+      fs.writeFileSync(fx.file, JSON.stringify(fx.config))
+      const retry = await fx.cli('slot-create')
+      assert.equal(retry.status, 1)
+      assert.match(retry.err, /bootstrap_claim_unavailable/)
+      assert.equal((await fx.peer.query(`SELECT count(*)::int AS n FROM ${fx.q}.allocations`)).rows[0].n, 1)
+      const op = (
+        await fx.peer.query('SELECT released_at,uncertain_at FROM vm_operations WHERE id=$1', [row.operation_id])
+      ).rows[0]
+      assert.ok(op.uncertain_at)
+      assert.equal(op.released_at, null)
+    } finally {
+      for (const socket of sockets) socket.destroy()
+      await new Promise((resolve) => server.close(resolve))
+    }
   },
 )
