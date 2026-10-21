@@ -79,7 +79,7 @@ test('restoring the application schema preserves later writes in a neighboring s
 test('restoring a PG 001 snapshot removes later tables before reapplying current migrations', async () => {
   const db = getDb()
   await db.exec(
-    `DROP TABLE panel_sessions, api_key_admissions, gateway_rate_buckets, execution_jobs, execution_admissions, execution_seats, session_turns, vm_operations;
+    `DROP TABLE panel_sessions, api_key_admissions, gateway_rate_buckets, execution_jobs, execution_admissions, execution_seats, session_turns, vm_operations, background_task_runs;
     ALTER TABLE accounts DROP COLUMN observation_versions;
     ALTER TABLE proxies DROP COLUMN config_revision;
     ALTER TABLE sticky_sessions DROP COLUMN deleted_at;
@@ -106,16 +106,17 @@ test('restoring a PG 001 snapshot removes later tables before reapplying current
     'execution_jobs',
     'session_turns',
     'vm_operations',
+    'background_task_runs',
   ]) {
     assert.equal((await db.prepare(`SELECT count(*) AS n FROM ${name}`).get()).n, 0)
   }
-  assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 12)
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 13)
 })
 
 test('an outside dependency refuses older-snapshot cleanup without changing either schema', async () => {
   const db = getDb()
   await db.exec(
-    `DROP TABLE panel_sessions, api_key_admissions, gateway_rate_buckets, execution_jobs, execution_admissions, execution_seats, session_turns, vm_operations;
+    `DROP TABLE panel_sessions, api_key_admissions, gateway_rate_buckets, execution_jobs, execution_admissions, execution_seats, session_turns, vm_operations, background_task_runs;
     ALTER TABLE accounts DROP COLUMN observation_versions;
     ALTER TABLE proxies DROP COLUMN config_revision;
     ALTER TABLE sticky_sessions DROP COLUMN deleted_at;
