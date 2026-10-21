@@ -6,6 +6,9 @@ import { isKubernetesMode } from '../core/control-plane-mode.mjs'
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { backgroundTasksFor } from '../core/shared-background-tasks.mjs'
 import {
   verifyPanelLogin,
   createPanelSession,
@@ -301,6 +304,7 @@ function logsOwner(req, u) {
 }
 
 const LOCAL_PROXY_MISMATCH_MESSAGE = '本地代理只能绑定到它所在 VPS 上的槽位'
+const artifactCallbacks = new AsyncLocalStorage()
 
 function clusterNodesOf(ctx) {
   try {
@@ -495,8 +499,11 @@ async function syncInstalledKernels({
   routingConfig,
   body = {},
   refreshCluster = refreshClusterSlotPayloads,
+  targetIds,
+  effect = (_id, callback) => callback(),
 }) {
-  const all = listVms(project)
+  const allowed = targetIds ? new Set(targetIds) : null
+  const all = listVms(project).filter((vm) => !allowed || allowed.has(vm.id))
   const wanted = Array.isArray(body.ids) ? new Set(body.ids.map(String)) : null
   const selected = wanted ? all.filter((vm) => wanted.has(vm.id)) : all
   // Local slots bind the new binaries. Cluster slots bake the same kernel, CLIs
@@ -518,7 +525,7 @@ async function syncInstalledKernels({
       if (resolveInferenceEngine(vm, routingConfig) !== 'rust') continue
       writeKernelConfig(project, vm, { routing: routingConfig, timezone: vm.timezone })
       const exec = slotExec(project, vm)
-      item.kernel = await restartRustKernel(exec).catch((e) => ({
+      item.kernel = await effect(item.id, () => restartRustKernel(exec)).catch((e) => ({
         ok: false,
         error: String(e?.message || e).slice(0, 200),
       }))
@@ -536,7 +543,7 @@ async function syncInstalledKernels({
   if (traits) {
     for (const vm of localVms) {
       if (isCodexVm(vm)) continue
-      const gone = await destroySlot(vm)
+      const gone = await effect(vm.id, () => destroySlot(vm))
       if (!gone.ok) {
         const item = (local.items || []).find((row) => row.id === vm.id)
         if (item) {
@@ -547,7 +554,9 @@ async function syncInstalledKernels({
         continue
       }
       const rebuilt = recreateVmFiles(project, vm, { mode: 'traits' })
-      const boot = await startSlotReady(rebuilt.vm, project, { recreate: true, routing: routingConfig })
+      const boot = await effect(vm.id, () =>
+        startSlotReady(rebuilt.vm, project, { recreate: true, routing: routingConfig }),
+      )
       const item = (local.items || []).find((row) => row.id === vm.id) || {
         id: vm.id,
         ok: true,
@@ -584,6 +593,7 @@ async function syncInstalledKernels({
       : await refreshCluster(project, clusterVms, { routing: routingConfig, recreate: true })
     : null
   const failed = (local.items || []).filter((item) => !item.ok)
+  for (const item of cluster?.items || []) await effect(item.id, async () => item)
   local.ok = failed.length === 0
   local.ok_count = (local.items || []).length - failed.length
   local.failed_count = failed.length
@@ -646,6 +656,7 @@ export function createPanelHandler(ctx) {
     try {
       result = await callback()
     } catch (error) {
+      if (artifactCallbacks.getStore()) artifactCallbacks.getStore().uncertain = true
       await operation?.markUncertain?.()
       await markCurrentProxyOperationUncertain(getDb())
       throw error
@@ -656,17 +667,20 @@ export function createPanelHandler(ctx) {
       result?.report?.ok === false ||
       (result?.ok !== true && result?.notStarted !== true && result?.vmOperationNotStarted !== true)
     ) {
+      if (artifactCallbacks.getStore()) artifactCallbacks.getStore().uncertain = true
       await operation?.markUncertain?.()
       await markCurrentProxyOperationUncertain(getDb())
     }
     return result
   }
   async function mutateProxyVms(ids, callback) {
-    if (!isKubernetesMode() && !ctx.proxyOperations) return mutateVms(ids, callback)
+    if (!isKubernetesMode() && !ctx.proxyOperations)
+      return mutateVms(typeof ids === 'function' ? await ids() : ids, callback)
     return (ctx.proxyOperations || getSharedProxyOperations()).run(async () => {
       await ctx.proxyPool.refresh?.()
       const bindings = await getDb().prepare('SELECT bound_vm_id FROM proxies WHERE bound_vm_id IS NOT NULL').all()
-      const targets = [...new Set([...ids, ...bindings.flatMap((proxy) => parseBoundVmIds(proxy.bound_vm_id))])]
+      const requested = typeof ids === 'function' ? await ids() : ids
+      const targets = [...new Set([...requested, ...bindings.flatMap((proxy) => parseBoundVmIds(proxy.bound_vm_id))])]
       let entered = false
       try {
         const value = await mutateVms(targets, async (handles) => {
@@ -679,6 +693,40 @@ export function createPanelHandler(ctx) {
         throw error
       }
     })
+  }
+  async function mutateVmArtifacts(callback) {
+    if (!isKubernetesMode()) return callback(new Map())
+    const result = await backgroundTasksFor(ctx.backgroundTasks).run(
+      { taskKey: 'vm_artifact_mutation', executionId: randomUUID() },
+      async () => {
+        const state = { uncertain: false }
+        return artifactCallbacks.run(state, async () => {
+          let entered = false
+          try {
+            const value = await mutateProxyVms(
+              async () => {
+                const rows = await getDb().prepare('SELECT id FROM vms').all()
+                return [...new Set([...rows.map((vm) => vm.id), ...listVms(cfg.paths.project).map((vm) => vm.id)])]
+              },
+              async (handles) => {
+                entered = true
+                return callback(handles)
+              },
+            )
+            return { terminal: !state.uncertain, value }
+          } catch (error) {
+            if (!entered) error.taskNotStarted = true
+            throw error
+          }
+        })
+      },
+    )
+    if (!result.ran)
+      throw Object.assign(new Error('VM artifact operation is active'), {
+        code: 'vm_artifact_operation_active',
+        status: 409,
+      })
+    return result.value
   }
   function proxyEffect(handles, callback) {
     return vmEffect(
@@ -2415,172 +2463,194 @@ export function createPanelHandler(ctx) {
         )
       }
       if (req.method === 'POST' && p === '/api/panel/dataplane') {
-        const body = await readBody(req, 8 * 1024).catch(() => ({}))
-        const parsed = parseKernelDataplanePatch(body.dataplane)
-        if (!parsed.ok || !parsed.value) {
-          return json(res, 400, {
-            ok: false,
-            error: { code: 'invalid_dataplane', message: parsed.error || 'dataplane must be wrap, cc, or crag' },
-          })
-        }
-        const targets = parseSlotPolicyTargets({
-          ids: body.ids,
-          all: body.all === true || !Array.isArray(body.ids),
-        })
-        if (!targets.ok) {
-          return json(res, 400, { ok: false, error: { message: targets.error } })
-        }
-        const previous = structuredClone(ctx.routingConfig)
-        try {
-          if (targets.all) {
-            await persistRoutingPatch({
-              inference: {
-                ...(ctx.routingConfig.inference || {}),
-                dataplane: parsed.value,
-              },
+        return mutateVmArtifacts(async (handles) => {
+          const body = await readBody(req, 8 * 1024).catch(() => ({}))
+          const parsed = parseKernelDataplanePatch(body.dataplane)
+          if (!parsed.ok || !parsed.value) {
+            return json(res, 400, {
+              ok: false,
+              error: { code: 'invalid_dataplane', message: parsed.error || 'dataplane must be wrap, cc, or crag' },
             })
-          } else {
-            for (const id of targets.ids) {
-              persistSlotEnginePolicy(cfg.paths.project, id, { dataplane: parsed.value })
-            }
           }
-        } catch (error) {
-          ctx.routingConfig = previous
-          return json(res, 503, {
-            ok: false,
-            error: { code: 'dataplane_persist_failed', message: String(error?.message || error) },
+          const targets = parseSlotPolicyTargets({
+            ids: body.ids,
+            all: body.all === true || !Array.isArray(body.ids),
           })
-        }
-        const report = await syncInstalledKernels({
-          project: cfg.paths.project,
-          routingConfig: ctx.routingConfig,
-          body: {
-            ids: targets.all ? undefined : targets.ids,
-            restart: body.restart !== false,
-          },
+          if (!targets.ok) {
+            return json(res, 400, { ok: false, error: { message: targets.error } })
+          }
+          const previous = structuredClone(ctx.routingConfig)
+          try {
+            if (targets.all) {
+              await persistRoutingPatch({
+                inference: {
+                  ...(ctx.routingConfig.inference || {}),
+                  dataplane: parsed.value,
+                },
+              })
+            } else {
+              for (const id of targets.ids) {
+                persistSlotEnginePolicy(cfg.paths.project, id, { dataplane: parsed.value })
+              }
+            }
+          } catch (error) {
+            ctx.routingConfig = previous
+            await proxyEffect(handles, async () => ({ ok: false }))
+            return json(res, 503, {
+              ok: false,
+              error: { code: 'dataplane_persist_failed', message: String(error?.message || error) },
+            })
+          }
+          const report = await (ctx.vmMutationOps?.syncInstalledKernels || syncInstalledKernels)({
+            project: cfg.paths.project,
+            targetIds: isKubernetesMode() ? [...handles.keys()] : undefined,
+            effect: (id, callback) => vmEffect(handles.get(id), callback),
+            routingConfig: ctx.routingConfig,
+            body: {
+              ids: targets.all ? undefined : targets.ids,
+              restart: body.restart !== false,
+            },
+          })
+          for (const item of report.items || []) await vmEffect(handles.get(item.id), async () => item)
+          return json(
+            res,
+            report.ok ? 200 : 503,
+            panel.ok({
+              dataplane: parsed.value,
+              ...report,
+            }),
+          )
         })
-        return json(
-          res,
-          report.ok ? 200 : 503,
-          panel.ok({
-            dataplane: parsed.value,
-            ...report,
-          }),
-        )
       }
       if (req.method === 'POST' && p === '/api/panel/wrap-cli/crag-kernel') {
-        const raw = await readRawBody(req, 32 * 1024 * 1024)
-        const written = replaceCragKernelBinary(cfg.paths.project, raw)
-        if (!written.ok) {
-          return json(res, 400, { ok: false, error: { code: written.code, message: written.error } })
-        }
-        return json(res, 200, panel.ok(written))
+        return mutateVmArtifacts(async (handles) => {
+          const raw = await readRawBody(req, 32 * 1024 * 1024)
+          const written = replaceCragKernelBinary(cfg.paths.project, raw)
+          if (!written.ok) {
+            return json(res, 400, { ok: false, error: { code: written.code, message: written.error } })
+          }
+          return json(res, 200, panel.ok(written))
+        })
       }
       if (req.method === 'POST' && p === '/api/panel/wrap-cli/make') {
-        const body = await readBody(req, 8 * 1024).catch(() => ({}))
-        const glibcVm = String(body.glibc_vm || body.glibcVm || '').trim()
-        let glibcFromDir = ''
-        if (glibcVm) {
-          const candidate = path.join(wrapCliHomeDir(cfg.paths.project, glibcVm), 'glibc239')
-          if (fs.existsSync(candidate)) glibcFromDir = candidate
-        }
-        const made = makeWrapSample(cfg.paths.project, { glibcFromDir })
-        if (!made.ok) {
-          return json(res, 400, { ok: false, error: { code: made.code, message: made.error } })
-        }
-        return json(res, 200, panel.ok(made))
+        return mutateVmArtifacts(async (handles) => {
+          const body = await readBody(req, 8 * 1024).catch(() => ({}))
+          const glibcVm = String(body.glibc_vm || body.glibcVm || '').trim()
+          let glibcFromDir = ''
+          if (glibcVm) {
+            const candidate = path.join(wrapCliHomeDir(cfg.paths.project, glibcVm), 'glibc239')
+            if (fs.existsSync(candidate)) glibcFromDir = candidate
+          }
+          const made = makeWrapSample(cfg.paths.project, { glibcFromDir })
+          if (!made.ok) {
+            return json(res, 400, { ok: false, error: { code: made.code, message: made.error } })
+          }
+          return json(res, 200, panel.ok(made))
+        })
       }
       if (req.method === 'POST' && p === '/api/panel/wrap-cli/kernel/release') {
-        const body = await readBody(req, 8 * 1024).catch(() => ({}))
-        const downloaded = await downloadReleaseKernel({
-          tag: body.tag,
-          fetchImpl: ctx.fetchImpl,
-        })
-        if (!downloaded.ok) {
-          return json(res, kernelReleaseHttpStatus(downloaded.code), {
-            ok: false,
-            error: { code: downloaded.code, message: downloaded.error },
+        return mutateVmArtifacts(async (handles) => {
+          const body = await readBody(req, 8 * 1024).catch(() => ({}))
+          const downloaded = await downloadReleaseKernel({
+            tag: body.tag,
+            fetchImpl: ctx.fetchImpl,
           })
-        }
-        const replaced = replaceKernelBinary(cfg.paths.project, downloaded.bytes, {
-          source: 'github',
-          release_tag: downloaded.tag,
-        })
-        if (!replaced.ok) {
-          return json(res, 400, { ok: false, error: { code: replaced.code, message: replaced.error } })
-        }
-        const cliNode = replaceCliNodeBinary(cfg.paths.project, downloaded.cliNode?.bytes)
-        if (!cliNode.ok) {
-          return json(res, 400, { ok: false, error: { code: cliNode.code, message: cliNode.error } })
-        }
-        const ccNode = replaceCcNodeBinary(cfg.paths.project, downloaded.ccNode?.bytes)
-        if (!ccNode.ok) {
-          return json(res, 400, { ok: false, error: { code: ccNode.code, message: ccNode.error } })
-        }
-        const cragWritten = replaceCragKernelBinary(cfg.paths.project, downloaded.crag?.bytes)
-        if (!cragWritten.ok) {
-          return json(res, 400, { ok: false, error: { code: cragWritten.code, message: cragWritten.error } })
-        }
-        const report = await syncInstalledKernels({
-          project: cfg.paths.project,
-          routingConfig: ctx.routingConfig,
-          body,
-        })
-        const release = {
-          tag: downloaded.tag,
-          version: downloaded.version,
-          asset: downloaded.asset,
-          size: downloaded.size,
-          cli_node: downloaded.cliNode?.asset,
-          cli_node_size: cliNode.size,
-          cc_node: downloaded.ccNode?.asset,
-          cc_node_size: ccNode.size,
-          crag: downloaded.crag?.asset || null,
-          crag_size: cragWritten.size || 0,
-          crag_skipped: false,
-        }
-        if (!report.ok) {
-          return json(res, 400, {
-            ok: false,
-            error: {
-              code: 'kernel_sync_failed',
-              message: `已写入 ${downloaded.tag}，槽同步 ${report.ok_count}/${report.total} 失败`,
-            },
-            data: { release, kernel: replaced, sync: report },
+          if (!downloaded.ok) {
+            return json(res, kernelReleaseHttpStatus(downloaded.code), {
+              ok: false,
+              error: { code: downloaded.code, message: downloaded.error },
+            })
+          }
+          const replaced = replaceKernelBinary(cfg.paths.project, downloaded.bytes, {
+            source: 'github',
+            release_tag: downloaded.tag,
           })
-        }
-        return json(res, 200, panel.ok({ release, kernel: replaced, sync: report }))
+          if (!replaced.ok) {
+            return json(res, 400, { ok: false, error: { code: replaced.code, message: replaced.error } })
+          }
+          const cliNode = replaceCliNodeBinary(cfg.paths.project, downloaded.cliNode?.bytes)
+          if (!cliNode.ok) {
+            return json(res, 400, { ok: false, error: { code: cliNode.code, message: cliNode.error } })
+          }
+          const ccNode = replaceCcNodeBinary(cfg.paths.project, downloaded.ccNode?.bytes)
+          if (!ccNode.ok) {
+            return json(res, 400, { ok: false, error: { code: ccNode.code, message: ccNode.error } })
+          }
+          const cragWritten = replaceCragKernelBinary(cfg.paths.project, downloaded.crag?.bytes)
+          if (!cragWritten.ok) {
+            return json(res, 400, { ok: false, error: { code: cragWritten.code, message: cragWritten.error } })
+          }
+          const report = await (ctx.vmMutationOps?.syncInstalledKernels || syncInstalledKernels)({
+            project: cfg.paths.project,
+            targetIds: isKubernetesMode() ? [...handles.keys()] : undefined,
+            effect: (id, callback) => vmEffect(handles.get(id), callback),
+            routingConfig: ctx.routingConfig,
+            body,
+          })
+          for (const item of report.items || []) await vmEffect(handles.get(item.id), async () => item)
+          const release = {
+            tag: downloaded.tag,
+            version: downloaded.version,
+            asset: downloaded.asset,
+            size: downloaded.size,
+            cli_node: downloaded.cliNode?.asset,
+            cli_node_size: cliNode.size,
+            cc_node: downloaded.ccNode?.asset,
+            cc_node_size: ccNode.size,
+            crag: downloaded.crag?.asset || null,
+            crag_size: cragWritten.size || 0,
+            crag_skipped: false,
+          }
+          if (!report.ok) {
+            return json(res, 400, {
+              ok: false,
+              error: {
+                code: 'kernel_sync_failed',
+                message: `已写入 ${downloaded.tag}，槽同步 ${report.ok_count}/${report.total} 失败`,
+              },
+              data: { release, kernel: replaced, sync: report },
+            })
+          }
+          return json(res, 200, panel.ok({ release, kernel: replaced, sync: report }))
+        })
       }
 
       if (req.method === 'POST' && p === '/api/panel/wrap-cli/kernel') {
-        let buf
-        try {
-          buf = await readRawBody(req, cfg.limits?.max_body_bytes || 32 * 1024 * 1024)
-        } catch (error) {
-          const status = error?.status || 400
-          const body = error?.body || { error: { message: String(error?.message || error) } }
-          return json(res, status, { ok: false, ...body })
-        }
-        if (!Buffer.isBuffer(buf)) buf = Buffer.from(buf || [])
-        if (!buf.length) {
-          return json(res, 400, { ok: false, error: { code: 'kernel_empty', message: 'kernel binary required' } })
-        }
-        const replaced = replaceKernelBinary(cfg.paths.project, buf)
-        if (!replaced.ok) {
-          return json(res, 400, { ok: false, error: { code: replaced.code, message: replaced.error } })
-        }
-        return json(res, 200, panel.ok(replaced))
+        return mutateVmArtifacts(async (handles) => {
+          let buf
+          try {
+            buf = await readRawBody(req, cfg.limits?.max_body_bytes || 32 * 1024 * 1024)
+          } catch (error) {
+            const status = error?.status || 400
+            const body = error?.body || { error: { message: String(error?.message || error) } }
+            return json(res, status, { ok: false, ...body })
+          }
+          if (!Buffer.isBuffer(buf)) buf = Buffer.from(buf || [])
+          if (!buf.length) {
+            return json(res, 400, { ok: false, error: { code: 'kernel_empty', message: 'kernel binary required' } })
+          }
+          const replaced = replaceKernelBinary(cfg.paths.project, buf)
+          if (!replaced.ok) {
+            return json(res, 400, { ok: false, error: { code: replaced.code, message: replaced.error } })
+          }
+          return json(res, 200, panel.ok(replaced))
+        })
       }
 
       if (req.method === 'POST' && p === '/api/panel/wrap-cli/sync') {
-        const body = await readBody(req, 32 * 1024).catch(() => ({}))
-        const report = await syncInstalledKernels({
-          project: cfg.paths.project,
-          routingConfig: ctx.routingConfig,
-          body,
-          refreshCluster,
+        return mutateVmArtifacts(async (handles) => {
+          const body = await readBody(req, 32 * 1024).catch(() => ({}))
+          const report = await (ctx.vmMutationOps?.syncInstalledKernels || syncInstalledKernels)({
+            project: cfg.paths.project,
+            targetIds: isKubernetesMode() ? [...handles.keys()] : undefined,
+            effect: (id, callback) => vmEffect(handles.get(id), callback),
+            routingConfig: ctx.routingConfig,
+            body,
+            refreshCluster,
+          })
+          for (const item of report.items || []) await vmEffect(handles.get(item.id), async () => item)
+          return json(res, report.ok ? 200 : 400, panel.ok(report))
         })
-        return json(res, report.ok ? 200 : 400, panel.ok(report))
       }
       if (req.method === 'POST' && p === '/api/panel/vms/slot-policy') {
         const body = await readBody(req, 32 * 1024).catch(() => ({}))
@@ -3939,13 +4009,16 @@ export function createPanelHandler(ctx) {
       }
 
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/wrap-cli\/promote$/.test(p)) {
-        const id = p.split('/')[4]
-        const vm = getVm(cfg.paths.project, id)
-        if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        if (hostUnsupported(res, vm, 'wrap_cli')) return
-        const captured = captureWrapSample(cfg.paths.project, vm)
-        if (!captured.ok) return json(res, 400, { ok: false, error: { code: captured.code, message: captured.error } })
-        return json(res, 200, panel.ok(captured))
+        return mutateVmArtifacts(async () => {
+          const id = p.split('/')[4]
+          const vm = getVm(cfg.paths.project, id)
+          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          if (hostUnsupported(res, vm, 'wrap_cli')) return
+          const captured = captureWrapSample(cfg.paths.project, vm)
+          if (!captured.ok)
+            return json(res, 400, { ok: false, error: { code: captured.code, message: captured.error } })
+          return json(res, 200, panel.ok(captured))
+        })
       }
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/wrap-cli\/repair$/.test(p)) {
         const id = p.split('/')[4]
@@ -6363,6 +6436,7 @@ export function createPanelHandler(ctx) {
           'proxy_operation_active',
           'proxy_operation_inactive',
           'vm_mutation_claim_required',
+          'vm_artifact_operation_active',
         ].includes(error.code)
       ) {
         state.response = [res, error.status || 409, { ok: false, error: { code: error.code, message: error.message } }]

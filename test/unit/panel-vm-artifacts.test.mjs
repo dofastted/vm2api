@@ -107,9 +107,73 @@ test('an idle artifact upload completes its durable operation and releases VM ow
   const row = await f.peer
     .prepare('SELECT finished_at, unknown_at FROM background_task_runs WHERE task_key = $1')
     .get(TASK_KEY)
+  assert.ok(row)
   assert.notEqual(row?.finished_at, null)
   assert.equal(row?.unknown_at, null)
   const next = await f.other.tryAcquire({ vmId: 'vm-a' })
   assert.equal(next.ok, true)
   await next.release()
+})
+
+test('an overall successful artifact sync retains each explicit unknown target and the global claim', async (t) => {
+  const f = await fixture(t)
+  const h = f.handler(
+    {},
+    {
+      vmMutationOps: {
+        syncInstalledKernels: async () => ({ ok: true, items: [{ id: 'vm-a', ok: true, vmOperationUncertain: true }] }),
+      },
+    },
+  )
+  await h.request('/api/panel/wrap-cli/sync')
+  assert.equal(h.response.status, 200)
+  assert.equal((await f.other.tryAcquire({ vmId: 'vm-a' })).ok, false)
+  const row = await f.peer
+    .prepare('SELECT finished_at, unknown_at FROM background_task_runs WHERE task_key = $1')
+    .get(TASK_KEY)
+  assert.equal(row.finished_at, null)
+  assert.notEqual(row.unknown_at, null)
+})
+
+test('an empty fleet artifact download owns its original promise and rejects a concurrent writer', async (t) => {
+  const f = await fixture(t, { empty: true })
+  let finish
+  let enter
+  const pending = new Promise((resolve) => {
+    finish = resolve
+  })
+  const entered = new Promise((resolve) => {
+    enter = resolve
+  })
+  const h = f.handler(
+    { tag: 'v1.2.3' },
+    {
+      fetchImpl: async () => {
+        enter()
+        await pending
+        throw new Error('synthetic download ended')
+      },
+    },
+  )
+  const request = h.request('/api/panel/wrap-cli/kernel/release')
+  try {
+    await entered
+    const concurrent = f.handler()
+    await concurrent.request('/api/panel/wrap-cli/kernel')
+    assert.equal(concurrent.response.status, 409)
+    assert.equal(fs.existsSync(path.join(f.root, 'share')), false)
+    assert.equal(f.tasks.pending.size, 1)
+  } finally {
+    finish()
+    await request
+  }
+  assert.equal(h.response.status, 502)
+  assert.equal(
+    (
+      await f.peer
+        .prepare('SELECT count(*) AS n FROM background_task_runs WHERE task_key = $1 AND finished_at IS NULL')
+        .get(TASK_KEY)
+    ).n,
+    0,
+  )
 })
