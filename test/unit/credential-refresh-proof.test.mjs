@@ -4,13 +4,15 @@ import { runSlotOauth } from '../../src/lib/transport/slot-oauth.mjs'
 import { refreshCodexAccessToken } from '../../src/lib/protocol/codex-models.mjs'
 
 const exec = { vmId: 'vm-refresh-proof', vm: {} }
-const worker = (payload, extra = {}) => async () => ({
-  code: 0,
-  stdout: JSON.stringify(payload),
-  stderr: '',
-  timed_out: false,
-  ...extra,
-})
+const worker =
+  (payload, extra = {}) =>
+  async () => ({
+    code: 0,
+    stdout: JSON.stringify(payload),
+    stderr: '',
+    timed_out: false,
+    ...extra,
+  })
 
 test('a complete successful worker command proves its credential attempt finished', async () => {
   const result = await runSlotOauth(exec, 'refresh', {

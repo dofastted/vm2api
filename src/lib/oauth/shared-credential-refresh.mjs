@@ -1,9 +1,28 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { getDb, getActivityCoordinator, withTransaction } from '../db/database.mjs'
 import { getSharedBackgroundTasks } from '../core/shared-background-tasks.mjs'
 import { SharedVmOperations, currentVmOperationIds } from '../vm/shared-vm-operations.mjs'
 
 const services = new WeakMap()
+const admissionContext = new AsyncLocalStorage()
+
+export async function withRefreshAdmission(db, admission, callback) {
+  if (!admission?.admissionId) return admissionContext.run(null, callback)
+  const context = { db, admission: { ...admission, db }, active: true }
+  try {
+    return await admissionContext.run(context, callback)
+  } finally {
+    context.active = false
+  }
+}
+
+export function currentRefreshAdmission(db = getDb()) {
+  const context = admissionContext.getStore()
+  if (!context?.active || context.db.schema !== db.schema || context.db.connectionString !== db.connectionString)
+    return null
+  return context.admission
+}
 
 function failure(code) {
   return Object.assign(new Error(code.replaceAll('_', ' ')), { code, status: 409 })
@@ -118,7 +137,6 @@ export class SharedCredentialRefresh {
               outcome = await refresh(fresh)
               if (outcome?.finished !== true) {
                 state.unknown = true
-                await claim.markUnknown()
                 return {
                   finished: false,
                   unknown: true,
@@ -149,7 +167,10 @@ export class SharedCredentialRefresh {
           { kind: 'credential_refresh', accountId, admission },
         ),
       )
-      if (result.unknown) return result
+      if (result.unknown) {
+        await claim.markUnknown()
+        return result
+      }
       if (!(await claim.complete({ sharedResult: metadata })).completed)
         throw failure('credential_refresh_completion_unconfirmed')
       return result

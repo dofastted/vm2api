@@ -21,7 +21,10 @@ async function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-shared-slot-refresh-'))
   const homeDir = path.join(root, 'vms', 'vm-01', 'cli-home')
   writeWorkerCredentialFile(homeDir, {
-    type: 'oauth', access_token: 'SYNTHETIC_AT', refresh_token: 'SYNTHETIC_RT', expires_at: 1,
+    type: 'oauth',
+    access_token: 'SYNTHETIC_AT',
+    refresh_token: 'SYNTHETIC_RT',
+    expires_at: 1,
     account_uuid: 'slot-refresh-account',
   })
   const previous = process.env.VM2API_CONTROL_PLANE_MODE
@@ -32,10 +35,15 @@ async function fixture(t) {
     await coordinator.stop()
     const client = new pg.Client({ connectionString: db.connectionString })
     await client.connect()
-    try { await client.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(coordinator.schema)} CASCADE`) }
-    finally { await client.end(); fs.rmSync(root, { recursive: true, force: true }) }
+    try {
+      await client.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(coordinator.schema)} CASCADE`)
+    } finally {
+      await client.end()
+      fs.rmSync(root, { recursive: true, force: true })
+    }
   })
-  const run = (callback) => coordinator.runActivity({ kind: 'fixture' }, async () => ({ ended: true, value: await callback() }))
+  const run = (callback) =>
+    coordinator.runActivity({ kind: 'fixture' }, async () => ({ ended: true, value: await callback() }))
   return { db, coordinator, homeDir, exec: { vmId: 'vm-01', homeDir, vm: {} }, run }
 }
 
@@ -46,11 +54,16 @@ test('the actual slot OAuth refresh shares a committed attempt after bootstrap h
     calls++
     await new Promise((resolve) => setTimeout(resolve, 30))
     writeWorkerCredentialFile(f.homeDir, {
-      ...readWorkerCredentialFile(f.homeDir), access_token: 'SYNTHETIC_NEW_AT', refresh_token: 'SYNTHETIC_NEW_RT',
+      ...readWorkerCredentialFile(f.homeDir),
+      access_token: 'SYNTHETIC_NEW_AT',
+      refresh_token: 'SYNTHETIC_NEW_RT',
     })
     return { code: 0, stdout: '{"ok":true,"status":200,"body":{"refreshed":true}}' }
   }
-  const results = await Promise.all([runSlotOauth(f.exec, 'refresh', { runDocker }), runSlotOauth(f.exec, 'refresh', { runDocker })])
+  const results = await Promise.all([
+    runSlotOauth(f.exec, 'refresh', { runDocker }),
+    runSlotOauth(f.exec, 'refresh', { runDocker }),
+  ])
   assert.equal(calls, 1)
   assert.ok(results.every((result) => result.ok))
   const rows = await f.run(() => f.db.query('SELECT finished_at,shared_result FROM background_task_runs'))
@@ -71,15 +84,29 @@ test('a slot refresh timeout retains its shared operation and task', async (t) =
 
 test('implicit worker refresh commands cannot execute while another inference is active', async (t) => {
   const f = await fixture(t)
-  const gate = await f.run(() => new ExecutionAdmissionsRepo(f.db).tryReserve({
-    accountId: 'slot-refresh-account', vmId: 'vm-01', accountLimit: 2, vmLimit: 2, rpmLimit: 0, fableLimit: 0,
-  }))
+  const gate = await f.run(() =>
+    new ExecutionAdmissionsRepo(f.db).tryReserve({
+      accountId: 'slot-refresh-account',
+      vmId: 'vm-01',
+      accountLimit: 2,
+      vmLimit: 2,
+      rpmLimit: 0,
+      fableLimit: 0,
+    }),
+  )
   let calls = 0
   try {
-    await assert.rejects(runSlotOauth(f.exec, 'models', { runDocker: async () => {
-      calls++
-      return { code: 0, stdout: '{"ok":true,"status":200}' }
-    } }), { code: 'vm_execution_active' })
+    await assert.rejects(
+      runSlotOauth(f.exec, 'models', {
+        runDocker: async () => {
+          calls++
+          return { code: 0, stdout: '{"ok":true,"status":200}' }
+        },
+      }),
+      { code: 'vm_execution_active' },
+    )
     assert.equal(calls, 0)
-  } finally { await f.run(() => gate.release()) }
+  } finally {
+    await f.run(() => gate.release())
+  }
 })

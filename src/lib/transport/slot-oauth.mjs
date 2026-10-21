@@ -2,6 +2,17 @@ import { spawn } from 'node:child_process'
 import path from 'node:path'
 import { slotHost } from '../vm/slot-host.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
+import { getDb, getActivityCoordinator } from '../db/database.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { getSharedBackgroundTasks } from '../core/shared-background-tasks.mjs'
+import { SharedVmOperations } from '../vm/shared-vm-operations.mjs'
+import { flushVmDbSync } from '../vm/vm-db-sync.mjs'
+import { readWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
+import {
+  credentialGeneration,
+  currentRefreshAdmission,
+  getSharedCredentialRefresh,
+} from '../oauth/shared-credential-refresh.mjs'
 
 const WORKER_CONFIG = '/run/kin/worker.json'
 const WORKER_BIN = '/usr/local/bin/kin-worker'
@@ -89,7 +100,92 @@ function lastJsonLine(stdout) {
   }
 }
 
-export async function runSlotOauth(
+export function runSlotOauth(exec, op, options = {}) {
+  if (!isKubernetesMode() || process.env.KIN_CRS_MOCK === '1') return runSlotOauthRaw(exec, op, options)
+  const db = options.db || getDb()
+  return getSharedBackgroundTasks(db).track(runSharedSlotOauth(db, exec, op, options))
+}
+
+async function runSharedSlotOauth(db, exec, op, options) {
+  const readCurrent = async () => {
+    const credential = readWorkerCredentialFile(exec.homeDir)
+    if (!credential) throw Object.assign(new Error('credential unavailable'), { code: 'credential_required' })
+    return { credential, generation: credentialGeneration(credential) }
+  }
+  const current = await readCurrent()
+  const admission = options.admission || currentRefreshAdmission(db)
+  const vmId = exec.vmId || exec.vm?.id
+  const accountId =
+    options.accountId ||
+    admission?.accountId ||
+    current.credential.account_uuid ||
+    exec.vm?.claude?.account_uuid ||
+    vmId
+  if (op === 'refresh') {
+    const outcome = await getSharedCredentialRefresh(db).run(
+      {
+        platform: 'claude',
+        vmId,
+        accountId,
+        expectedGeneration: options.expectedGeneration || current.generation,
+        admission,
+      },
+      {
+        readCurrent,
+        refresh: async () => {
+          const value = await runSlotOauthRaw(exec, op, options)
+          return { finished: value?.attemptFinished === true, value }
+        },
+        publish: async (_previous, value) => {
+          await options.publishCredential?.(value)
+          await flushVmDbSync()
+          return readCurrent()
+        },
+      },
+    )
+    if (outcome.unknown)
+      return {
+        ...(outcome.value || failure('credential_refresh_unknown')),
+        attemptFinished: false,
+        credentialRefreshUnknown: true,
+      }
+    if (!outcome.shared) return outcome.value
+    return {
+      ok: outcome.value?.ok === true,
+      status: outcome.value?.ok ? 200 : 400,
+      body: outcome.value?.ok ? { refreshed: false } : { error: { code: outcome.value?.error || 'refresh_failed' } },
+      headers: {},
+      via: 'slot-worker',
+      attemptFinished: true,
+    }
+  }
+  const activity = await getActivityCoordinator(db)?.admit({ kind: 'slot_oauth', requestId: op })
+  let entered = false
+  let finished = false
+  let result
+  try {
+    const invoke = () =>
+      new SharedVmOperations(db).run(
+        vmId,
+        async () => {
+        entered = true
+        result = await runSlotOauthRaw(exec, op, options)
+        if (result?.attemptFinished === true && exec.homeDir)
+          await slotHost(exec.vm).afterRefresh(exec.vm, path.dirname(exec.homeDir))
+        await flushVmDbSync()
+        finished = result?.attemptFinished === true
+          return { ...result, vmOperationUncertain: result?.attemptFinished !== true }
+        },
+        { kind: `oauth_${op}`, accountId, admission },
+      )
+    return await (activity ? activity.run(invoke) : invoke())
+  } finally {
+    if (entered && !finished) await activity?.markUncertain('slot_oauth_unknown')
+    else await activity?.complete({ ended: true, reason: entered ? 'slot_oauth_completed' : 'slot_oauth_not_started' })
+  }
+}
+
+async function runSlotOauthRaw(
   exec,
   op,
   { body, headers, force = false, timeoutMs = 45000, runDocker = runDockerProcess } = {},

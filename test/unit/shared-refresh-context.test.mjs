@@ -17,7 +17,9 @@ test('refresh context carries only the exact database and active admission callb
 
 test('detached descendants cannot reuse a completed refresh admission scope', async () => {
   let release
-  const wait = new Promise((resolve) => { release = resolve })
+  const wait = new Promise((resolve) => {
+    release = resolve
+  })
   let detached
   await refresh.withRefreshAdmission(db, admission, async () => {
     detached = wait.then(() => refresh.currentRefreshAdmission(db))
