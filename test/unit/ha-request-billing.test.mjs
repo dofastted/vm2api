@@ -272,6 +272,82 @@ test('multiple commands without a durable billable choice stay held rather than 
   })
 })
 
+for (const commandId of [null, 'unbound-pre-dispatch-id']) {
+  test(`an existing job cannot become not_dispatched from an absent or unrelated final command: ${commandId}`, async (t) => {
+    const f = await haBillingFixture(t)
+    await billingRequest(f, async (current) => {
+      const settle = () => current.keys.recordHaUsage({ reservation: current.reservation, commandId })
+      if (commandId) await assert.rejects(settle(), { code: 'ha_billable_command_mismatch' })
+      else assert.equal((await settle()).settled, false)
+      assert.equal((await f.db.prepare('SELECT count(*) AS n FROM ha_request_settlements').get()).n, 0)
+      assert.equal(
+        (
+          await f.db
+            .prepare('SELECT released_at FROM api_key_admissions WHERE id=$1')
+            .get(current.reservation.reservationId)
+        ).released_at,
+        null,
+      )
+      assert.equal((await current.keys.getById(current.key.id)).requests, 0)
+      assert.equal(
+        (await f.db.prepare('SELECT accepting_children FROM ha_request_contexts WHERE id=$1').get('billing-parent'))
+          .accepting_children,
+        true,
+      )
+    })
+  })
+}
+
+test('a no-job handler ignores an unbound command ID, audits no dispatch and closes children before returning', async (t) => {
+  const f = await haBillingFixture(t)
+  const { withHaRequestAttempt } = await import('../../src/lib/core/ha-request-context.mjs')
+  await billingRequest(
+    f,
+    async (current) => {
+      const result = await current.keys.recordHaUsage({
+        reservation: current.reservation,
+        commandId: 'unbound-pre-dispatch-id',
+      })
+      assert.equal(result.settled, true)
+      assert.equal(result.outcome, 'not_dispatched')
+      assert.equal(current.reservation.settled, true)
+      assert.equal(current.reservation.billingFailed, undefined)
+      assert.equal(
+        (await f.db.prepare('SELECT accepting_children FROM ha_request_contexts WHERE id=$1').get('billing-parent'))
+          .accepting_children,
+        false,
+      )
+      await assert.rejects(
+        withHaRequestAttempt(1, () =>
+          current.admission.bindExecution({
+            requestId: 'late-command',
+            nodeBinding: current.nodeBinding,
+            billingSnapshot: syntheticBillingSnapshot(),
+          }),
+        ),
+        { code: 'ha_request_context_closed' },
+      )
+      await current.reservation.release()
+      const ledger = await f.db
+        .prepare('SELECT * FROM ha_request_settlements WHERE ha_request_id=$1')
+        .get('billing-parent')
+      assert.equal(ledger.command_id, null)
+      assert.equal(ledger.actual_cost, null)
+      assert.equal(ledger.tokens_in, null)
+      assert.equal((await f.db.prepare('SELECT count(*) AS n FROM execution_jobs').get()).n, 0)
+      assert.equal((await current.keys.getById(current.key.id)).requests, 0)
+      assert.ok(
+        (
+          await f.db
+            .prepare('SELECT released_at FROM api_key_admissions WHERE id=$1')
+            .get(current.reservation.reservationId)
+        ).released_at,
+      )
+    },
+    { jobs: 0 },
+  )
+})
+
 test('an explicit final command choice bills only that original command in a multiattempt request', async (t) => {
   const f = await haBillingFixture(t)
   const data = await billingRequest(

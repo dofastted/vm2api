@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { EventEmitter } from 'node:events'
 import { Readable } from 'node:stream'
+import { randomUUID } from 'node:crypto'
 import { haBillingFixture, syntheticUsageReceipt } from './ha-billing.mjs'
 import { syntheticFence } from './fake-slotgate.mjs'
 import { withHaRequestContext, withHaRequestAttempt } from '../../src/lib/core/ha-request-context.mjs'
@@ -12,8 +13,10 @@ import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
 import { ExecutionAdmissionsRepo } from '../../src/lib/db/repos/execution-admissions-repo.mjs'
 import { RequestAttemptsRepo } from '../../src/lib/db/repos/request-attempts-repo.mjs'
 import { readBody } from '../../src/lib/http/respond.mjs'
+import { clientCancelledResult } from '../../src/lib/core/errors.mjs'
 
 const kind = process.env.VM2API_HA_BILLING_CASE
+const undispatched = ['not-started', 'not-started-with-id', 'cancelled-before-dispatch'].includes(kind)
 const router = await import('../../src/lib/transport/kernel-router.mjs')
 const identity = await import('../../src/lib/identity/vm-identity.mjs')
 let dispatch
@@ -36,7 +39,14 @@ test(`HA protocol captures and settles original billable command: ${kind}`, asyn
   const assistant = { id: 'synthetic-message', type: 'message', role: 'assistant', model: 'claude-sonnet-4-5-20250929', content: [{ type: 'text', text: 'synthetic' }], stop_reason: 'end_turn', usage: { input_tokens: 100, output_tokens: 10, cache_read_input_tokens: 20, cache_creation_input_tokens: 30 } }
   let rateReads = 0, receiptReads = 0
   dispatch = async (opts) => {
-    if (kind === 'not-started') return { ok: false, status: 400, body: { type: 'error', error: { type: 'invalid_request_error', code: 'invalid_cache_control', message: 'synthetic validation failure' } }, execution: { requestId: null, started: false, ended: true, reason: 'not_started' } }
+    if (undispatched) {
+      const execution = { requestId: kind === 'not-started' ? null : randomUUID(), started: false, ended: true, reason: 'not_started' }
+      if (kind === 'cancelled-before-dispatch') {
+        res.closed = true
+        return clientCancelledResult({ execution })
+      }
+      return { ok: false, status: 400, body: { type: 'error', error: { type: 'invalid_request_error', code: 'invalid_cache_control', message: 'synthetic validation failure' } }, execution }
+    }
     await opts.onExecutionStart({ requestId: commandId, nodeBinding })
     const job = (await f.peer.pool.query('SELECT * FROM execution_jobs WHERE request_id=$1', [commandId])).rows[0]
     assert.equal(job.billing_snapshot?.rate_multiplier, 2, 'dispatch permission requires the original PG-priced group snapshot')
@@ -78,9 +88,11 @@ test(`HA protocol captures and settles original billable command: ${kind}`, asyn
   req.headers = { 'user-agent': 'synthetic-ha-client' }
   const res = new EventEmitter(); res.setHeader = () => {}
   await f.originalGate.run(() => withHaRequestContext({ db: f.db, requestId: 'billing-parent', activity: f.originalGate, recoveryKind: 'claude_messages' }, () => handler.handleProtocol(req, res, 'anthropic.messages', '/v1/messages')))
-  assert.equal(res.statusCode, kind === 'not-started' ? 400 : 200, JSON.stringify(res.body))
+  assert.equal(res.statusCode, kind === 'cancelled-before-dispatch' ? undefined : undispatched ? 400 : 200, JSON.stringify(res.body))
+  if (kind === 'cancelled-before-dispatch') assert.equal(res.body, undefined)
+  else if (undispatched) assert.equal(res.body.error.code, 'upstream_invalid_request')
   assert.equal(rateReads, 1, 'group rates must not be reloaded after dispatch for billing')
-  assert.equal(receiptReads, kind === 'not-started' ? 0 : 1)
+  assert.equal(receiptReads, undispatched ? 0 : 1)
   await f.originalGate.run(async () => {
     const rows = await f.db.prepare('SELECT * FROM ha_request_settlements').all()
     const admission = await f.db.prepare('SELECT * FROM api_key_admissions WHERE ha_request_id=$1').get('billing-parent')
@@ -88,12 +100,19 @@ test(`HA protocol captures and settles original billable command: ${kind}`, asyn
       assert.equal(rows.length, 0)
       assert.equal(admission.released_at, null)
       assert.equal((await keys.getById(key.id)).requests, 0)
-    } else if (kind === 'not-started') {
+    } else if (undispatched) {
       assert.equal(rows.length, 1)
       assert.equal(rows[0].outcome, 'not_dispatched')
       assert.equal(rows[0].actual_cost, null)
+      for (const field of ['command_id', 'node_binding', 'node_receipt', 'official_cost', 'tokens_in', 'tokens_out', 'cache_read_tokens', 'cache_creation_tokens']) assert.equal(rows[0][field], null, field)
       assert.ok(admission.released_at)
+      assert.equal(admission.settled_at, null)
       assert.equal((await keys.getById(key.id)).requests, 0)
+      assert.equal((await keys.getById(key.id)).quota_used, 0)
+      assert.equal((await f.db.prepare('SELECT count(*) AS n FROM execution_jobs WHERE ha_request_id=$1').get('billing-parent')).n, 0)
+      const parent = await f.db.prepare('SELECT accepting_children,billable_command_id FROM ha_request_contexts WHERE id=$1').get('billing-parent')
+      assert.equal(parent.accepting_children, false)
+      assert.equal(parent.billable_command_id, null)
     } else {
       assert.equal(rows.length, 1)
       assert.equal(rows[0].outcome, kind === 'deleted-key' ? 'key_deleted' : 'charged')
