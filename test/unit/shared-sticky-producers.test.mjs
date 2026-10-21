@@ -96,12 +96,20 @@ async function fixture(t) {
           writeCodexKernelConfig() {},
           ensureCodexKernel: ensure || (async () => ({ ok: true })),
           streamCodexKernel: async (args) => {
+            const execution = {
+              requestId: `synthetic-observer-${jobs.length + 1}`,
+              started: true,
+              ended: true,
+              reason: 'http_body_complete',
+            }
+            await args.onExecutionStart?.({ requestId: execution.requestId })
             jobs.push(args)
             if (hop) {
               const result = await hop(args)
               if (result) return result
             }
-            return { ok: true, status: 200, terminalState: 'verified', body: { id: 'resp-synthetic' } }
+            await args.onExecutionEnd?.(execution)
+            return { ok: true, status: 200, terminalState: 'verified', body: { id: 'resp-synthetic' }, execution }
           },
         },
       })
@@ -273,4 +281,34 @@ test('panel cooldown clearing awaits shared sticky deletion before returning', a
   }
   assert.equal((await pending).ok, true)
   assert.equal(await fx.peer.persistence.get(fx.key), null)
+})
+
+test('Codex protocol reports actual request execution boundaries to its observer', async (t) => {
+  const fx = await fixture(t)
+  const seen = []
+  await fx.run({
+    onExecutionState: async (req, execution) => {
+      assert.equal(req.headers['x-session-id'], 'shared-codex-session')
+      seen.push(execution)
+    },
+  })
+  assert.equal(seen.length, 2)
+  assert.equal(seen[0].started, true)
+  assert.equal(seen[0].ended, false)
+  assert.equal(seen[1].ended, true)
+  assert.equal(seen[0].requestId, seen[1].requestId)
+})
+
+test('Codex protocol does not send when its activity observer rejects execution', async (t) => {
+  const fx = await fixture(t)
+  const error = new Error('activity unavailable')
+  await assert.rejects(
+    fx.run({
+      onExecutionState: async () => {
+        throw error
+      },
+    }),
+    (actual) => actual === error,
+  )
+  assert.equal(fx.jobs.length, 0)
 })
