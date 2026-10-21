@@ -4,7 +4,12 @@ import pg from 'pg'
 import { getDb, quoteIdentifier, registerActivityCoordinator, withTransaction } from '../../src/lib/db/database.mjs'
 import { GlobalMaintenanceCoordinator, coordinationSchemaFor } from '../../src/lib/db/global-maintenance.mjs'
 import { createRepositoryTestDatabase } from '../repository-database.mjs'
-import { withHaRequestContext } from '../../src/lib/core/ha-request-context.mjs'
+import { withHaRequestContext, withHaRequestAttempt } from '../../src/lib/core/ha-request-context.mjs'
+import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
+import { SharedExecutionAdmissions } from '../../src/lib/pool/shared-execution-admissions.mjs'
+import { SharedSessionTurns } from '../../src/lib/pool/shared-session-turns.mjs'
+import { RequestAttemptsRepo } from '../../src/lib/db/repos/request-attempts-repo.mjs'
+import { syntheticFence } from '../fixtures/fake-slotgate.mjs'
 
 async function fixture(t) {
   const db = getDb()
@@ -42,6 +47,61 @@ async function parent(first, db, requestId, recoveryKind = 'claude_messages') {
   await activity.run(() => withHaRequestContext({ db, requestId, activity, recoveryKind }, async () => {}))
   await activity.complete({ ended: false, reason: 'synthetic_owner_lost' })
   return activity
+}
+
+async function graph({ db, first }, requestId, { withJob = true, graceMs = 30000 } = {}) {
+  const activity = await first.admit({ kind: 'request', requestId })
+  const nodeBinding = {
+    protocol: 'KSG2',
+    nodeId: 'original-node',
+    vmId: 'vm-fixture',
+    kind: 'kernel',
+    fence: syntheticFence(),
+  }
+  let keyLease, turn, admission
+  await activity.run(() =>
+    withHaRequestContext({ db, requestId, activity, recoveryKind: 'claude_messages' }, async () => {
+      const keys = new ApiKeyStore({ db })
+      const key = await keys.create({ name: 'synthetic-key-' + requestId })
+      keyLease = await keys.reserve(key)
+      assert.equal(keyLease.ok, true)
+      const turns = new SharedSessionTurns(db)
+      turn = await turns.enqueue('session-' + requestId, 'not-a-parent-link')
+      assert.equal(await turns.tryActivate(turn), true)
+      await turns.markUncertain(turn)
+      admission = await new SharedExecutionAdmissions(db).tryReserve({
+        accountId: 'fixture-account',
+        vmId: 'vm-fixture',
+        accountLimit: 10,
+        vmLimit: 10,
+        fableLimit: 0,
+        rpmLimit: 0,
+        seatKey: 'seat-' + requestId,
+        seatCap: 10,
+        seatGraceMs: graceMs,
+        seatReservePct: 0,
+        seatHeadroom: 1,
+      })
+      assert.equal(admission.ok, true)
+      if (withJob) {
+        await new RequestAttemptsRepo(db).begin({
+          requestId,
+          attemptNo: 1,
+          vmId: 'vm-fixture',
+          accountId: 'fixture-account',
+          model: 'claude-synthetic',
+        })
+        await withHaRequestAttempt(1, () => admission.bindExecution({ requestId: 'command-' + requestId, nodeBinding }))
+      }
+      await admission.markUncertain()
+    }),
+  )
+  await activity.complete({ ended: false, reason: 'synthetic_owner_lost' })
+  return { activity, keyLease, turn, admission, nodeBinding, commandId: 'command-' + requestId }
+}
+
+function completed(original) {
+  return { id: original.commandId, fence: original.nodeBinding.fence, status: 'completed', dispatched: true }
 }
 
 test('a live owner keeps its lifetime lock regardless of old member timestamps', async (t) => {
@@ -134,6 +194,193 @@ test('untyped legacy parents and stale epochs cannot be sealed from absent owner
       (await peer.prepare('SELECT count(*) AS n FROM ha_request_contexts WHERE recovery_sealed_at IS NOT NULL').get())
         .n,
       0,
+    )
+  })
+})
+
+test('original completed node proof recovers only exact execution, seat, turn and activity while billing stays held', async (t) => {
+  const f = await fixture(t)
+  const original = await graph(f, 'ended-request')
+  const unrelated = await graph(f, 'still-unknown')
+  await f.first.stop()
+  const { HaRequestRecovery } = await import('../../src/lib/core/ha-request-recovery.mjs')
+  const recovery = new HaRequestRecovery(f.peer, { coordinator: f.second })
+  await f.gate.run(async () => {
+    let calls = 0
+    const outcome = await recovery.recover('ended-request', {
+      readCompletion: async ({ requestId, nodeBinding }) => {
+        calls++
+        assert.equal(f.peer.isTransaction, false)
+        assert.equal(requestId, original.commandId)
+        assert.deepEqual(nodeBinding, original.nodeBinding)
+        return completed(original)
+      },
+    })
+    assert.equal(outcome.recovered, true)
+    assert.equal(outcome.billingHeld, true)
+    assert.equal(calls, 1)
+    const lease = await f.peer
+      .prepare('SELECT * FROM execution_admissions WHERE id=$1')
+      .get(original.admission.admissionId)
+    assert.ok(lease.released_at)
+    assert.ok(lease.uncertain_at, 'historical uncertainty remains in the audit row')
+    const seat = await f.peer
+      .prepare('SELECT *,clock_timestamp() AS now FROM execution_seats WHERE seat_key=$1')
+      .get(original.admission.seatKey)
+    assert.ok(seat.grace_until > seat.now)
+    assert.equal(
+      (await f.peer.prepare('SELECT count(*) AS n FROM session_turns WHERE id=$1').get(original.turn.id)).n,
+      0,
+    )
+    assert.ok(
+      (
+        await f.peer.query(`SELECT completed_at FROM ${f.second.qualified}.activities WHERE id=$1`, [
+          original.activity.activityId,
+        ])
+      ).rows[0].completed_at,
+    )
+    assert.equal(
+      (
+        await f.peer
+          .prepare('SELECT released_at FROM api_key_admissions WHERE id=$1')
+          .get(original.keyLease.reservationId)
+      ).released_at,
+      null,
+    )
+    assert.equal(
+      (
+        await f.peer
+          .prepare('SELECT released_at FROM execution_admissions WHERE id=$1')
+          .get(unrelated.admission.admissionId)
+      ).released_at,
+      null,
+    )
+    assert.equal(
+      (
+        await f.peer.query(`SELECT completed_at FROM ${f.second.qualified}.activities WHERE id=$1`, [
+          unrelated.activity.activityId,
+        ])
+      ).rows[0].completed_at,
+      null,
+    )
+    const job = await f.peer.prepare('SELECT * FROM execution_jobs WHERE request_id=$1').get(original.commandId)
+    assert.ok(job.ended_at)
+    assert.deepEqual(job.node_completion, completed(original))
+    assert.equal(
+      (await f.peer.prepare('SELECT terminal_state FROM request_attempts WHERE ha_request_id=$1').get('ended-request'))
+        .terminal_state,
+      'started',
+      'no usage/result is fabricated',
+    )
+  })
+})
+
+for (const scenario of ['notfound', 'pending', 'undispatched', 'different-command', 'different-fence']) {
+  test(`recovery preserves all claims when original node proof is ${scenario}`, async (t) => {
+    const f = await fixture(t)
+    const original = await graph(f, 'unproven')
+    await f.first.stop()
+    const { HaRequestRecovery } = await import('../../src/lib/core/ha-request-recovery.mjs')
+    const recovery = new HaRequestRecovery(f.peer, { coordinator: f.second })
+    const proof = completed(original)
+    if (scenario === 'pending') proof.status = 'pending'
+    if (scenario === 'undispatched') proof.dispatched = false
+    if (scenario === 'different-command') proof.id = 'new-command'
+    if (scenario === 'different-fence') proof.fence = { ...proof.fence, incarnation: 'replacement-container' }
+    await f.gate.run(async () => {
+      const outcome = await recovery.recover('unproven', {
+        readCompletion: async () => (scenario === 'notfound' ? null : proof),
+      })
+      assert.equal(outcome.recovered, false)
+      assert.equal(
+        (
+          await f.peer
+            .prepare('SELECT released_at FROM execution_admissions WHERE id=$1')
+            .get(original.admission.admissionId)
+        ).released_at,
+        null,
+      )
+      assert.equal(
+        (await f.peer.prepare('SELECT ended_at FROM execution_jobs WHERE request_id=$1').get(original.commandId))
+          .ended_at,
+        null,
+      )
+      assert.equal(
+        (await f.peer.prepare('SELECT count(*) AS n FROM session_turns WHERE id=$1').get(original.turn.id)).n,
+        1,
+      )
+      assert.equal(
+        (
+          await f.peer.query(`SELECT completed_at FROM ${f.second.qualified}.activities WHERE id=$1`, [
+            original.activity.activityId,
+          ])
+        ).rows[0].completed_at,
+        null,
+      )
+      assert.equal(
+        (
+          await f.peer
+            .prepare('SELECT released_at FROM api_key_admissions WHERE id=$1')
+            .get(original.keyLease.reservationId)
+        ).released_at,
+        null,
+      )
+    })
+  })
+}
+
+test('sealed supported requests with no bound node jobs can release execution and turns without inventing usage', async (t) => {
+  const f = await fixture(t)
+  const original = await graph(f, 'never-bound', { withJob: false, graceMs: 0 })
+  await f.first.stop()
+  const { HaRequestRecovery } = await import('../../src/lib/core/ha-request-recovery.mjs')
+  const recovery = new HaRequestRecovery(f.peer, { coordinator: f.second })
+  await f.gate.run(async () => {
+    const outcome = await recovery.recover('never-bound', {
+      readCompletion: async () => assert.fail('no original node job'),
+    })
+    assert.equal(outcome.recovered, true)
+    assert.equal(outcome.billingHeld, true)
+    assert.ok(
+      (
+        await f.peer
+          .prepare('SELECT released_at FROM execution_admissions WHERE id=$1')
+          .get(original.admission.admissionId)
+      ).released_at,
+    )
+    assert.equal(
+      await f.peer.prepare('SELECT seat_key FROM execution_seats WHERE seat_key=$1').get(original.admission.seatKey),
+      undefined,
+    )
+  })
+})
+
+test('concurrent recoveries are idempotent and cannot extend recovered seat grace on retry', async (t) => {
+  const f = await fixture(t)
+  const original = await graph(f, 'concurrent')
+  await f.first.stop()
+  const { HaRequestRecovery } = await import('../../src/lib/core/ha-request-recovery.mjs')
+  const recovery = new HaRequestRecovery(f.peer, { coordinator: f.second })
+  await f.gate.run(async () => {
+    const options = { readCompletion: async () => completed(original) }
+    const outcomes = await Promise.all([
+      recovery.recover('concurrent', options),
+      recovery.recover('concurrent', options),
+    ])
+    assert.equal(
+      outcomes.every((outcome) => outcome.recovered === true),
+      true,
+    )
+    const before = await f.peer
+      .prepare('SELECT grace_until FROM execution_seats WHERE seat_key=$1')
+      .get(original.admission.seatKey)
+    const again = await recovery.recover('concurrent', {
+      readCompletion: async () => assert.fail('already persisted original completion'),
+    })
+    assert.equal(again.recovered, true)
+    assert.deepEqual(
+      await f.peer.prepare('SELECT grace_until FROM execution_seats WHERE seat_key=$1').get(original.admission.seatKey),
+      before,
     )
   })
 })
