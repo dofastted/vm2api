@@ -26,6 +26,10 @@ import { resolveInferenceEngine } from '../vm/slot-engine.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { dockerRequest } from '../cluster/docker-remote.mjs'
 import { clusterManager, vmNodeId } from '../cluster/placement.mjs'
+import { backgroundTasksFor } from '../core/shared-background-tasks.mjs'
+import { SharedVmOperations } from '../vm/shared-vm-operations.mjs'
+import { physicalContainerName } from '../vm/vm-physical-target.mjs'
+import { flushVmDbSync } from '../vm/vm-db-sync.mjs'
 
 /** A failed observation is not evidence of a dead container. Use the slot's own host, including KVM runners. */
 export async function observeWatchdogContainer(
@@ -162,6 +166,8 @@ export function createKernelWatchdog({
   healBridges = null,
   probeVm = watchdogProbeVm,
   now = () => Date.now(),
+  sharedTasks,
+  operations = null,
 } = {}) {
   let config = normalizeKernelWatchdogConfig(initial)
   let timer = null
@@ -176,19 +182,37 @@ export function createKernelWatchdog({
   // vmId -> this tick's pending check/restart, so hold() can wait for it to settle.
   const inflight = new Map()
   let healingBridges = false
+  const tasks = backgroundTasksFor(sharedTasks)
+  const mutations = operations || (tasks ? new SharedVmOperations(tasks.db) : null)
+  const sideEffects = new Set()
+
+  function trackSideEffect(operation) {
+    sideEffects.add(operation)
+    operation.then(
+      () => sideEffects.delete(operation),
+      () => sideEffects.delete(operation),
+    )
+    return operation
+  }
 
   function healBridgesOffPath(vms) {
     if (typeof healBridges !== 'function' || healingBridges) return
     healingBridges = true
-    Promise.resolve()
-      .then(() => healBridges(vms))
+    const work = () => healBridges(vms)
+    const pending = tasks
+      ? tasks.run({ taskKey: 'kernel_bridge_heal', intervalMs: config.interval_sec * 1000 }, async () => ({
+          terminal: true,
+          value: await work(),
+        }))
+      : Promise.resolve().then(work)
+    trackSideEffect(pending)
       .catch((error) => console.warn(`[kernel-watchdog] bridge heal failed: ${error?.message || error}`))
       .finally(() => {
         healingBridges = false
       })
   }
 
-  async function healTelemetry(vm, at) {
+  async function healTelemetry(vm, at, markUnknown = () => {}) {
     if (typeof ensureTelemetry !== 'function' || at < (telemetryDue.get(vm.id) || 0)) return
     telemetryDue.set(vm.id, at + telemetryEveryMs)
     try {
@@ -197,13 +221,15 @@ export function createKernelWatchdog({
         console.warn(`[kernel-watchdog] ${vm.id} telemetry sidecar was missing; relaunched`)
       if (result?.ok === false)
         console.warn(`[kernel-watchdog] ${vm.id} telemetry sidecar relaunch failed: ${result.error}`)
+      if (tasks && result?.ok !== true) markUnknown()
     } catch (error) {
+      if (tasks) markUnknown()
       console.warn(`[kernel-watchdog] ${vm.id} telemetry sidecar check failed: ${error?.message || error}`)
     }
   }
 
   /** L4 gate: bounded container restarts with growing waits; spending them is L5. */
-  function admitRestart(vm, reason, at) {
+  async function admitRestart(vm, reason, at) {
     if (kernelFaults.has(vm.id)) return false
     const state = restarts.get(vm.id) || { attempts: [], nextAt: at + config.restart_backoff_sec[0] * 1000 }
     state.attempts = state.attempts.filter((t) => at - t < config.restart_window_sec * 1000)
@@ -216,7 +242,7 @@ export function createKernelWatchdog({
       console.error(`[kernel-watchdog] ${vm.id} faulted; scheduling skips it: ${fault}`)
       if (typeof onFault === 'function') {
         try {
-          onFault(vm, fault)
+          await onFault(vm, fault)
         } catch (error) {
           console.warn(`[kernel-watchdog] fault notify failed: ${error?.message || error}`)
         }
@@ -230,20 +256,21 @@ export function createKernelWatchdog({
   }
 
   /** One VM's check. `held` is re-read after every await: an operator cycle may start mid-check. */
-  async function reviveDownContainer(vm, state) {
+  async function reviveDownContainer(vm, state, markUnknown = () => {}) {
     if (vm.status !== 'running' || typeof revive !== 'function') return
-    if (!admitRestart(vm, `container ${state}`, now())) return
+    if (!(await admitRestart(vm, `container ${state}`, now()))) return
     const revived = await revive(vm)
+    if (tasks && revived?.ok !== true) markUnknown()
     if (!revived?.ok) console.warn(`[kernel-watchdog] ${vm.id} boot failed: ${revived?.error || revived?.code}`)
   }
 
-  async function checkVm(vm, routing) {
+  async function checkVm(vm, routing, markUnknown = () => {}) {
     const probed = probeVm(vm)
     if (!probed) {
       // The kernel cannot be probed without its relay; only a container that is really down is revived.
       const observed = await observeRuntime(vm)
       if (held.has(vm.id) || !['missing', 'stopped', 'restarting'].includes(observed?.state)) return
-      return reviveDownContainer(vm, observed.state)
+      return reviveDownContainer(vm, observed.state, markUnknown)
     }
     const exec = {
       vmId: vm.id,
@@ -261,7 +288,10 @@ export function createKernelWatchdog({
       // Config convergence, not a failure: outside the restart budget.
       if (kernelSlotMismatch(exec)) {
         const observed = await observeRuntime(vm)
-        if (!held.has(vm.id) && observed?.state === 'running') await ensure(exec, { timeoutMs: config.timeout_ms })
+        if (!held.has(vm.id) && observed?.state === 'running') {
+          const result = await ensure(exec, { timeoutMs: config.timeout_ms })
+          if (tasks && result?.ok !== true) markUnknown()
+        }
       }
       return
     }
@@ -270,10 +300,11 @@ export function createKernelWatchdog({
     if (held.has(vm.id)) return
     // Permission/transport failures and deliberately paused containers never authorize recovery.
     if (!['running', 'missing', 'stopped', 'restarting'].includes(observed?.state)) return
-    if (observed.state !== 'running') return reviveDownContainer(vm, observed.state)
-    if (!admitRestart(vm, reason, now())) return
+    if (observed.state !== 'running') return reviveDownContainer(vm, observed.state, markUnknown)
+    if (!(await admitRestart(vm, reason, now()))) return
     console.warn(`[kernel-watchdog] ${vm.id} restarting container: ${reason}`)
     const result = await ensure(exec, { timeoutMs: config.timeout_ms })
+    if (tasks && result?.ok !== true) markUnknown()
     if (held.has(vm.id)) return
     // The container itself is gone or exited: a kernel restart cannot help, a full boot can.
     if (result?.reason === 'container_unavailable' && typeof revive === 'function' && vm.status === 'running') {
@@ -282,6 +313,7 @@ export function createKernelWatchdog({
       if (held.has(vm.id) || !['missing', 'stopped', 'restarting'].includes(latest?.state)) return
       console.warn(`[kernel-watchdog] ${vm.id} container unavailable; booting slot`)
       const revived = await revive(vm).catch((error) => ({ ok: false, error: error?.message || String(error) }))
+      if (tasks && revived?.ok !== true) markUnknown()
       if (!revived?.ok) console.warn(`[kernel-watchdog] ${vm.id} boot failed: ${revived?.error || revived?.code}`)
     }
   }
@@ -301,9 +333,35 @@ export function createKernelWatchdog({
         // missing sidecar costs telemetry, not inference. Off the tick's critical
         // path so a slow docker exec cannot delay container restarts. The due time
         // is set before the check runs, so a slot never has two checks in flight.
-        if (isTelemetryHealTarget(vm)) void healTelemetry(vm, now())
-        if (!isKernelWatchdogTarget(vm, routing)) continue
-        const work = checkVm(vm, routing)
+        if (!tasks && isTelemetryHealTarget(vm)) void trackSideEffect(healTelemetry(vm, now()))
+        if (!isKernelWatchdogTarget(vm, routing) && !(tasks && isTelemetryHealTarget(vm))) continue
+        const work = tasks
+          ? tasks.run(
+              { taskKey: `kernel_watchdog:${physicalContainerName(vm.id)}`, intervalMs: config.interval_sec * 1000 },
+              async () => {
+                let unknown = false
+                try {
+                  await mutations.run(
+                    vm.id,
+                    async () => {
+                      const markUnknown = () => {
+                        unknown = true
+                      }
+                      if (isTelemetryHealTarget(vm)) await healTelemetry(vm, now(), markUnknown)
+                      if (isKernelWatchdogTarget(vm, routing)) await checkVm(vm, routing, markUnknown)
+                      await flushVmDbSync()
+                      return { vmOperationUncertain: unknown }
+                    },
+                    { kind: 'kernel_watchdog' },
+                  )
+                } catch (error) {
+                  if (['vm_execution_active', 'vm_operation_active'].includes(error.code)) error.taskNotStarted = true
+                  throw error
+                }
+                return { terminal: !unknown }
+              },
+            )
+          : checkVm(vm, routing)
         inflight.set(vm.id, work)
         try {
           await work
@@ -334,6 +392,7 @@ export function createKernelWatchdog({
     },
     async flush() {
       while (inTick) await new Promise((resolve) => setTimeout(resolve, 10))
+      while (sideEffects.size) await Promise.allSettled([...sideEffects])
     },
     stop() {
       running = false
