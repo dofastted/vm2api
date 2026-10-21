@@ -10,6 +10,7 @@ import { readSlotCredentialIdentity } from '../oauth/oauth-credentials.mjs'
 import { buildSlotSettingsEnv } from '../protocol/seed-policy.mjs'
 import { buildKinSeedJson } from './workstation-profile.mjs'
 import { isHexDeviceId } from './workstation-fingerprint.mjs'
+import { isKubernetesHaMode } from '../core/control-plane-mode.mjs'
 
 export function readJsonSafe(p, fallback = null) {
   try {
@@ -62,14 +63,56 @@ export function outboundDeviceId(raw, fallback = 'kin-vm') {
 }
 
 export function loadVmIdentity(exec = {}) {
+  if (isKubernetesHaMode()) return loadHaVmIdentity(exec)
   const home = exec.homeDir || ''
   const claudeDir = path.join(home, '.claude')
   const settings = readJsonSafe(path.join(claudeDir, 'settings.json'), {}) || {}
   const homeClaude = readJsonSafe(path.join(home, '.claude.json'), {}) || {}
   const dirClaude = readJsonSafe(path.join(claudeDir, '.claude.json'), {}) || {}
   const claudeJson = { ...dirClaude, ...homeClaude }
+  return buildVmIdentity(exec, settings, claudeJson, readSlotCredentialIdentity(home), exec.oauth || {})
+}
+
+/** Pure construction from the captured public node status and PG VM record. */
+export function loadHaVmIdentity(exec = {}) {
+  const node = exec.nodeIdentity
+  const credential = node?.credential
+  const fp = exec.vm?.fingerprint
+  const valid = (value) =>
+    typeof value === 'string' &&
+    !!value &&
+    value.trim() === value &&
+    value.length <= 512 &&
+    !/[\x00-\x1f\x7f]/.test(value)
+  if (
+    exec.slotgate?.trusted !== true ||
+    exec.slotgate.pgBindingReady !== true ||
+    exec.slotgate.vmId !== exec.vmId ||
+    exec.vm?.id !== exec.vmId ||
+    node?.ok !== true ||
+    !valid(exec.accountId) ||
+    credential?.account_uuid !== exec.accountId ||
+    (node.identity?.account_uuid !== undefined && node.identity.account_uuid !== exec.accountId) ||
+    !valid(fp?.device_id) ||
+    !valid(fp?.session_id) ||
+    (credential.org_uuid && node.identity?.org_uuid && credential.org_uuid !== node.identity.org_uuid)
+  )
+    throw Object.assign(new Error('Captured HA identity is unavailable'), { code: 'ha_identity_unavailable' })
+  return buildVmIdentity(
+    { ...exec, seedPolicy: exec.seedPolicy || exec.vm.seed_policy || {} },
+    {},
+    {},
+    {
+      account_uuid: credential.account_uuid,
+      org_uuid: credential.org_uuid ?? node.identity?.org_uuid ?? '',
+      email: credential.email ?? node.identity?.email ?? null,
+    },
+    {},
+  )
+}
+
+function buildVmIdentity(exec, settings, claudeJson, slotCred, oauth) {
   const fp = exec.vm?.fingerprint || {}
-  const oauth = exec.oauth || {}
   const seed = exec.seedPolicy || {}
 
   const timezone = fp.timezone || exec.timezone || 'UTC'
@@ -78,7 +121,6 @@ export function loadVmIdentity(exec = {}) {
   // machineID is never outbound — guest collect also never rotates device_id.
   const deviceId = outboundDeviceId(fp.device_id, exec.vmId || 'kin-vm')
   const sessionId = fp.session_id || crypto.randomUUID()
-  const slotCred = readSlotCredentialIdentity(home)
   // Slot worker credentials.json is the only credential location.
   // Do not take account identity from leftover .claude.json / client inbound.
   const accountUuid = slotCred?.account_uuid || oauth.account_uuid || ''
