@@ -4,6 +4,8 @@
 
 运行环境需要 Node.js 22、PostgreSQL 17 应用 owner 的连接，以及到所选节点的固定 TLS 链路。配置必须是当前操作者所有、权限恰为 `0600` 的普通文件；拒绝符号链接和 hard link。业务 schema 必须显式指定且不能是 `public`、PostgreSQL 系统 schema 或 node/coord 派生 schema。DBA 预先创建无继承、无成员关系、无超级用户/建库/建角色/复制/BYPASSRLS 权限的独立 LOGIN reader 角色。密码由 DBA 单独配置，不能写入命令参数。
 
+业务 schema 必须已由应用的授权迁移流程创建并升级到当前制品版本。两个命令都先只读核验现有 migration 集合、名称和 checksum，再进入私有 authority 操作；不会创建业务 schema 或应用业务迁移。缺失、落后、未知版本或 checksum 不符时返回 `database_migrations_not_current`。须先通过应用的授权迁移流程处理，不能修改迁移记录来绕过检查。
+
 以下是配置结构。用安全编辑器写入私有文件，示例字符串必须替换；不要把实际连接串、节点 token 或凭据贴到终端历史。
 
 ```json
@@ -24,7 +26,7 @@
 }
 ```
 
-node ID、VM ID、account UUID 使用原始值。TLS/policy 字段必须与应用的固定 HA trust 文件以及节点配置一致。`policyDigest` 的生成规则见 [节点初次发布协议](../plans/2026-10-22-node-initial-publication.md)，不能从未授权的 runtime State 猜测。`vm.fingerprint` 可显式提供 `{device_id:64位小写hex,session_id:UUID}`；未提供时仅在首次新记录中生成并与该记录原子保存。
+node ID、VM ID、account UUID 使用原始值。VM ID 遵循现有槽位 ID 校验，拒绝 `active`、`create`、`create-options`、`import`、`package` 和以 `-chat` 结尾的名称（不区分大小写）；该检查发生在任何节点动作前。TLS/policy 字段必须与应用的固定 HA trust 文件以及节点配置一致。`policyDigest` 的生成规则见 [节点初次发布协议](../plans/2026-10-22-node-initial-publication.md)，不能从未授权的 runtime State 猜测。`vm.fingerprint` 可显式提供 `{device_id:64位小写hex,session_id:UUID}`；未提供时仅在首次新记录中生成并与该记录原子保存。
 
 先运行：
 

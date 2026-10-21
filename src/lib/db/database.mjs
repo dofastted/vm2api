@@ -257,12 +257,52 @@ export async function applyMigrations(db, { migrationsDir = MIGRATIONS_DIR } = {
   })
 }
 
+/** Verify an operator-provisioned business schema without creating or migrating it. */
+async function verifyCurrentMigrations(db, { migrationsDir = MIGRATIONS_DIR } = {}) {
+  const unavailable = () =>
+    Object.assign(new Error('database migrations are not current'), {
+      code: 'database_migrations_not_current',
+    })
+  return withTransaction(db, async () => {
+    await db.exec('SET TRANSACTION READ ONLY')
+    await db.query('SELECT pg_advisory_xact_lock_shared(hashtext(current_database()),hashtext($1))', [
+      `vm2api:${db.schema}`,
+    ])
+    const present = (
+      await db.query('SELECT to_regnamespace($1) IS NOT NULL AND to_regclass($2) IS NOT NULL AS ready', [
+        db.schema,
+        `${quoteIdentifier(db.schema)}.schema_migrations`,
+      ])
+    ).rows[0]
+    if (!present.ready) throw unavailable()
+    const applied = new Map(
+      (await db.query(`SELECT version,name,checksum FROM ${quoteIdentifier(db.schema)}.schema_migrations`)).rows.map(
+        (row) => [row.version, row],
+      ),
+    )
+    const files = fs
+      .readdirSync(migrationsDir)
+      .filter((file) => /^\d+.*\.sql$/.test(file))
+      .sort()
+    if (applied.size !== files.length) throw unavailable()
+    for (const file of files) {
+      const row = applied.get(file.split('_')[0])
+      const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8').replaceAll('\r\n', '\n')
+      const checksum = crypto.createHash('sha256').update(sql).digest('hex')
+      if (row?.name !== file || row.checksum !== checksum) throw unavailable()
+    }
+  })
+}
+
 export async function createDatabase(options = {}) {
   if (options.dataDir && fs.existsSync(path.join(options.dataDir, 'restore-maintenance.json'))) {
     throw new Error('restore maintenance marker exists; complete offline recovery before startup')
   }
   const db = new PostgresDatabase({ ...options, schema: options.schema || process.env.KIN_DATABASE_SCHEMA || 'public' })
   try {
+    // Offline administration must verify before even private coordination DDL.
+    // The live bootstrap scope repeats this check before using the schema.
+    if (options.verifyMigrations === true) await verifyCurrentMigrations(db, options)
     if (isKubernetesMode()) {
       const { GlobalMaintenanceCoordinator } = await import('./global-maintenance.mjs')
       const coordinator = new GlobalMaintenanceCoordinator(db)
@@ -274,7 +314,8 @@ export async function createDatabase(options = {}) {
       const version = Number((await db.prepare('SHOW server_version_num').get()).server_version_num)
       if (version < 170000 || version >= 180000)
         throw new Error('vm2api requires PostgreSQL 17 and PostgreSQL 17 backup clients')
-      await applyMigrations(db, options)
+      if (options.verifyMigrations === true) await verifyCurrentMigrations(db, options)
+      else await applyMigrations(db, options)
       if (options.dataDir && fs.existsSync(path.join(options.dataDir, 'kin.db')) && !options.allowLegacySource) {
         const imported = await db.prepare("SELECT value FROM settings WHERE key = 'sqlite_import_done'").get()
         if (!imported) throw new Error('existing SQLite data requires db:import:sqlite before PostgreSQL startup')

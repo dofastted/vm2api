@@ -609,12 +609,43 @@ nodeCase('an outdated business schema remains at 020 when trusted-init has an in
     )
     assert.equal(await businessSnapshot(db), before)
     assert.match(result.err, /database_migrations_not_current/)
+    const slot = await fx.cli('slot-create')
+    assert.equal(slot.status, 1)
+    assert.match(slot.err, /database_migrations_not_current/)
+    assert.equal(await businessSnapshot(db), before)
     assert.equal(
       (await fx.peer.query('SELECT to_regnamespace($1) AS present', [coordinationSchemaFor(db.schema)])).rows[0]
         .present,
       null,
     )
   })
+})
+
+nodeCase('both CLI commands reject mismatched or unknown migrations without changing business state', async (fx) => {
+  for (const kind of ['checksum', 'future']) {
+    await targetSchema(fx, '_' + kind, async (db) => {
+      await applyMigrations(db)
+      if (kind === 'checksum') await db.query("UPDATE schema_migrations SET checksum='invalid' WHERE version='001'")
+      else
+        await db.query(
+          "INSERT INTO schema_migrations(version,name,checksum,applied_at) VALUES('999','999_future.sql','synthetic','synthetic')",
+        )
+      const before = await businessSnapshot(db)
+      fx.config.database.schema = db.schema
+      fs.writeFileSync(fx.file, JSON.stringify(fx.config))
+      for (const command of ['trusted-init', 'slot-create']) {
+        const result = await fx.cli(command)
+        assert.equal(result.status, 1)
+        assert.match(result.err, /database_migrations_not_current/)
+        assert.equal(await businessSnapshot(db), before)
+      }
+      assert.equal(
+        (await fx.peer.query('SELECT to_regnamespace($1) AS present', [coordinationSchemaFor(db.schema)])).rows[0]
+          .present,
+        null,
+      )
+    })
+  }
 })
 
 nodeCase('neither CLI command creates a missing business schema', async (fx) => {

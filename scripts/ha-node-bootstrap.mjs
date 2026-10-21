@@ -10,6 +10,7 @@ import { NodeCredentialRefreshGrants } from '../src/lib/cluster/node-credential-
 import { SharedVmOperations } from '../src/lib/vm/shared-vm-operations.mjs'
 import { SharedBackgroundTasks } from '../src/lib/core/shared-background-tasks.mjs'
 import { VmsRepo } from '../src/lib/db/repos/vms-repo.mjs'
+import { isValidVmId } from '../src/lib/vm/vm-file.mjs'
 
 function failure(code, ended = false) {
   return Object.assign(new Error(code), { code, ...(ended ? { activityEnded: true } : {}) })
@@ -109,6 +110,7 @@ function configFrom(file) {
   if (c.vm !== undefined) {
     shape(c.vm, ['id', 'accountId'], ['fingerprint'])
     id(c.vm.id)
+    if (!isValidVmId(c.vm.id)) throw failure('bootstrap_config_invalid', true)
     id(c.vm.accountId)
     if (c.vm.fingerprint !== undefined) {
       shape(c.vm.fingerprint, ['device_id', 'session_id'])
@@ -357,7 +359,11 @@ export async function main(args = process.argv.slice(2)) {
     }
     const input = command === 'slot-create' ? credentialFrom(config, credentialFd) : null
     process.env.VM2API_CONTROL_PLANE_MODE = 'kubernetes-ha'
-    db = await createDatabase({ connectionString: config.database.url, schema: config.database.schema })
+    db = await createDatabase({
+      connectionString: config.database.url,
+      schema: config.database.schema,
+      verifyMigrations: true,
+    })
     const coordinator = getActivityCoordinator(db),
       state = await coordinator.getState()
     await coordinator.acknowledgeEpoch(state.epoch)
