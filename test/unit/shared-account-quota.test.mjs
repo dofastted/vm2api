@@ -315,3 +315,82 @@ test('an in-flight database result does not publish over a later synchronous loc
   assert.equal(left.repo.get('shared-account').max_concurrency, 17)
   assert.equal(left.repo.get('shared-account').tokens_in, 10)
 })
+
+test('refresh reads remote account management changes without replacing transient state or allocations', async (t) => {
+  const { left, right } = await pair(t)
+  left.inflight.set('shared-account', 2)
+  const sessions = left.sessions
+  const allocations = left.allocations
+  const history = [{ source: 'synthetic-existing-history' }]
+  allocations.set('shared-account', history)
+  right.setMaxConcurrency('shared-account', 19, { override: true })
+  right.setMaxRpm('shared-account', 321, { override: true })
+  await right.flush()
+  assert.notEqual(left.repo.get('shared-account').max_concurrency, 19)
+  await left.refresh()
+  assert.equal(left.repo.get('shared-account').max_concurrency, 19)
+  assert.equal(left.repo.get('shared-account').max_rpm, 321)
+  assert.equal(left.inflight.get('shared-account'), 2)
+  assert.equal(left.sessions, sessions)
+  assert.equal(left.allocations, allocations)
+  assert.equal(left.allocations.get('shared-account'), history)
+})
+
+test('a delayed refresh cannot overwrite a local write started after the read', async (t) => {
+  const { left } = await pair(t)
+  const list = left.persistence.list.bind(left.persistence)
+  let entered
+  let resume
+  const started = new Promise((resolve) => {
+    entered = resolve
+  })
+  const gate = new Promise((resolve) => {
+    resume = resolve
+  })
+  left.persistence.list = async () => {
+    const rows = await list()
+    entered()
+    await gate
+    return rows
+  }
+  const refreshing = left.refresh()
+  await started
+  left.setMaxConcurrency('shared-account', 23, { override: true })
+  left.ingestHeaders('shared-account', {}, { input_tokens: 7 })
+  await left.flush()
+  resume()
+  await refreshing
+  assert.equal(left.repo.get('shared-account').max_concurrency, 23)
+  assert.equal(left.repo.get('shared-account').tokens_in, 7)
+})
+
+test('an older refresh finishing late cannot replace a newer committed remote snapshot', async (t) => {
+  const { left, right } = await pair(t)
+  const list = left.persistence.list.bind(left.persistence)
+  let entered
+  let resume
+  const started = new Promise((resolve) => {
+    entered = resolve
+  })
+  const gate = new Promise((resolve) => {
+    resume = resolve
+  })
+  let first = true
+  left.persistence.list = async () => {
+    const rows = await list()
+    if (first) {
+      first = false
+      entered()
+      await gate
+    }
+    return rows
+  }
+  const older = left.refresh()
+  await started
+  right.setMaxConcurrency('shared-account', 29, { override: true })
+  await right.flush()
+  await left.refresh()
+  resume()
+  await older
+  assert.equal(left.repo.get('shared-account').max_concurrency, 29)
+})
