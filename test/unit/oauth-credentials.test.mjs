@@ -426,12 +426,24 @@ for (const subscriptionType of [undefined, 'pro']) {
     )
     const source = fs.readFileSync(new URL('../../src/server.mjs', import.meta.url), 'utf8')
     const start = source.indexOf(
-      'for (const vm of listVms(cfg.paths.project)) {\n  if (isCodexVm(vm)) continue\n  try {\n    ensureSlotSubscriptionType',
+      'for (const vm of haMode ? [] : listVms(cfg.paths.project)) {\n  if (isCodexVm(vm)) continue\n  try {\n    ensureSlotSubscriptionType',
     )
     assert.ok(start >= 0, 'the startup credential migration must be exercised')
     const end = source.indexOf('\ncliNodeGuard =', start)
     assert.ok(end > start)
+    const original = fs.readFileSync(file, 'utf8')
     runInNewContext(source.slice(start, end), {
+      haMode: true,
+      listVms,
+      isCodexVm,
+      ensureSlotSubscriptionType,
+      path,
+      cfg: { paths: { project: root } },
+      console,
+    })
+    assert.equal(fs.readFileSync(file, 'utf8'), original, 'HA startup must not migrate Pod credentials')
+    runInNewContext(source.slice(start, end), {
+      haMode: false,
       listVms,
       isCodexVm,
       ensureSlotSubscriptionType,
@@ -447,6 +459,7 @@ for (const subscriptionType of [undefined, 'pro']) {
     const written = fs.readFileSync(file, 'utf8')
     const mtime = fs.statSync(file).mtimeMs
     runInNewContext(source.slice(start, end), {
+      haMode: false,
       listVms,
       isCodexVm,
       ensureSlotSubscriptionType,

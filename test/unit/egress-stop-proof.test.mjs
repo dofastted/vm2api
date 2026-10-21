@@ -16,10 +16,12 @@ function fixture(t) {
   const script = path.join(root, 'kin-egress-fixture.mjs')
   fs.writeFileSync(
     script,
-    "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 80)); setInterval(() => {}, 1000)\n",
+    `#!${process.execPath}\nprocess.on('SIGTERM', () => setTimeout(() => process.exit(0), 80)); setInterval(() => {}, 1000)\n`,
+    { mode: 0o700 },
   )
-  const bin = path.join(root, 'kin-egress-fixture.sh')
-  fs.writeFileSync(bin, `#!/bin/sh\nexec '${process.execPath}' '${script}' "$@"\n`, { mode: 0o700 })
+  // A shell wrapper can be receipted as sh just before exec changes its image.
+  // A direct shebang has the final Node image when the config argv is visible.
+  const bin = script
   const pids = []
   t.after(() => {
     for (const pid of pids) {
