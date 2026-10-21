@@ -1069,12 +1069,12 @@ const clusterManager = new ClusterManager({
     }
   },
   onNodesChanged: () => {
-    if (!backupService.isMaintaining) syncNodeLocalEgress()
+    if (!backupService.isMaintaining) return syncNodeLocalEgress()
   },
   // A node's local row follows its link: re-probe as soon as the link settles.
   onLinkState: (nodeId, state) => {
     if (!backupService.isMaintaining && (state === 'ready' || state === 'error' || state === 'backoff')) {
-      proxyPool.probeLocalNode(nodeId).catch(() => {})
+      return proxyPool.probeLocalNode(nodeId)
     }
   },
 })
@@ -1082,7 +1082,7 @@ localEgressCluster = clusterManager
 bindPlacement({ manager: clusterManager, projectRoot: cfg.paths.project })
 await startNodeEgressSocks({ clientFor: (nodeId) => clusterManager.client(nodeId) })
 await clusterManager.start()
-clusterManager.restoreSlotRelays()
+await clusterManager.restoreSlotRelays()
 await syncNodeLocalEgress()
 if (proxyPool.snapshot().config.ipv6_enabled !== true) {
   const exits = await syncIpv6ProxyEgress(cfg.paths.project, proxyPool)
