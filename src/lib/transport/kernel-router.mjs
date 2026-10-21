@@ -4,6 +4,7 @@
  * Credential import/ensure 仍可走 Go 客户端，但不参与推理 hop。
  */
 import { clientCancelledResult, isClientCancelledResult } from '../core/errors.mjs'
+import { randomUUID } from 'node:crypto'
 import { ensureWorkerCredential } from './go-worker-client.mjs'
 import { ensureOfficialCredentialLink, slotUidGidFromHomeDir } from '../oauth/oauth-credentials.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
@@ -142,6 +143,7 @@ function rustUnavailableResult(ready) {
     headers: {},
     terminalState: answered ? 'rejected' : 'transport_error',
     transportError: !answered,
+    execution: { requestId: null, started: false, ended: true, reason: 'not_started' },
   }
 }
 
@@ -239,6 +241,7 @@ async function runHop({ mode, opts }) {
           status: 400,
           terminalState: 'rejected',
           upstreamExecutions: 0,
+          execution: { requestId: null, started: false, ended: true, reason: 'not_started' },
           body: {
             type: 'error',
             error: {
@@ -265,26 +268,52 @@ async function runHop({ mode, opts }) {
     }
   }
   const send = mode === 'stream' ? streamRustKernel : callRustKernel
+  const sharedExecution = typeof opts.onExecutionStart === 'function' || typeof opts.onExecutionEnd === 'function'
+  const canRetry = (value) => !sharedExecution || value?.execution?.ended === true
+  let hop = 0
+  const sendHop = async () => {
+    let startError
+    const value = await send({
+      ...opts,
+      requestId: hop++ === 0 && opts.requestId != null ? opts.requestId : randomUUID(),
+      onExecutionStart:
+        typeof opts.onExecutionStart === 'function'
+          ? async (execution) => {
+              try {
+                await opts.onExecutionStart(execution)
+              } catch (error) {
+                startError = error
+                throw error
+              }
+            }
+          : opts.onExecutionStart,
+    })
+    // The worker returns transport results for errors, including callback errors.
+    // A failed durable start must retain the original exception and cannot retry.
+    if (startError) throw startError
+    if (typeof opts.onExecutionEnd === 'function') await opts.onExecutionEnd(value?.execution)
+    return value
+  }
   beginWrapHop(opts.exec)
   let result
   try {
-    result = await send(opts)
+    result = await sendHop()
     noteWrapHop(opts.exec)
     if (opts.signal?.aborted || isClientCancelledResult(result)) {
       result = clientCancelledResult(result)
-    } else if (result.transportError === true && result.committed !== true) {
-      result = await send(opts)
+    } else if (result.transportError === true && result.committed !== true && canRetry(result)) {
+      result = await sendHop()
       result = { ...result, rust_transport_retried: true }
       noteWrapHop(opts.exec)
     }
-    if (!isClientCancelledResult(result) && isNeedsRefreshResult(result)) {
+    if (!isClientCancelledResult(result) && isNeedsRefreshResult(result) && canRetry(result)) {
       const ensure = opts.ensureCredential || ensureWorkerCredential
       const ensured = await ensure(opts.exec, { force: true })
       if (ensured?.ok !== true) result = credentialEnsureFailure(result, ensured)
       else {
         // The CLI invalidates its OAuth cache from the shared credential file
         // before creating each API client. Recycling here kills sibling hops.
-        result = await send(opts)
+        result = await sendHop()
         result = { ...result, credential_retried: true }
         noteWrapHop(opts.exec)
       }
