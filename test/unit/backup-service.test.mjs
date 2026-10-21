@@ -232,6 +232,50 @@ test('shouldRunScheduled: true when never run, false right after a backup', asyn
   assert.equal(await svc.shouldRunScheduled(Date.now() + 25 * 3600_000), true)
 })
 
+test('stopping scheduling drains an in-flight check without starting a backup afterward', async (t) => {
+  let check
+  t.mock.method(globalThis, 'setInterval', (callback) => {
+    check = callback
+    return { unref() {} }
+  })
+  t.mock.method(globalThis, 'clearInterval', () => {})
+  let releaseCheck, signalCheck
+  const gate = new Promise((resolve) => {
+    releaseCheck = resolve
+  })
+  const started = new Promise((resolve) => {
+    signalCheck = resolve
+  })
+  svc.shouldRunScheduled = async () => {
+    signalCheck()
+    await gate
+    return true
+  }
+  let backups = 0
+  svc.createBackup = async () => {
+    backups += 1
+    return { size_bytes: 0 }
+  }
+  svc.startScheduler()
+  const checking = check()
+  await started
+  svc.stopScheduler()
+  let flushed = false
+  const pending = svc.flush().then(() => {
+    flushed = true
+  })
+  let flushedDuringCheck
+  try {
+    await new Promise((resolve) => setImmediate(resolve))
+    flushedDuringCheck = flushed
+  } finally {
+    releaseCheck()
+    await checking
+    await pending
+  }
+  assert.deepEqual({ flushedDuringCheck, backups }, { flushedDuringCheck: false, backups: 0 })
+})
+
 test('remove deletes record + file', async () => {
   seedVm()
   const rec = await svc.createBackup({ kind: 'manual' })
