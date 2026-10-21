@@ -1,6 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
+import { PassThrough } from 'node:stream'
+import { readRawBody } from '../../src/lib/http/respond.mjs'
 import { controlPlaneMode, shutdownTimeoutMs } from '../../src/lib/core/control-plane-mode.mjs'
 import { ControlPlaneLifecycle, withTimeout } from '../../src/lib/core/control-plane-lifecycle.mjs'
 
@@ -62,4 +64,20 @@ test('readiness and draining waits have bounded deadlines', async () => {
   lifecycle.markReady()
   assert.equal(await lifecycle.isReady(), false)
   await assert.rejects(withTimeout(new Promise(() => {}), 20), { code: 'shutdown_timeout' })
+})
+
+test('forced shutdown rejects an unfinished body before closing its response', async () => {
+  const lifecycle = new ControlPlaneLifecycle()
+  const req = new PassThrough()
+  const res = new EventEmitter()
+  res.destroy = () => {
+    req.destroy()
+    res.emit('close')
+  }
+  const handlerFinished = lifecycle.trackHttp(req, res)
+  const body = readRawBody(req, 100).finally(handlerFinished)
+  req.write('{')
+  lifecycle.forceClose()
+  await assert.rejects(withTimeout(body, 30), { code: 'request_stream_error' })
+  await lifecycle.waitForIdle()
 })
