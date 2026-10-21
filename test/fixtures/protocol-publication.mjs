@@ -102,7 +102,9 @@ test(`protocol waits for ${kind} publication and preserves unknown activity`, as
     if (kind.startsWith('sync')) assert.equal(runnerCalls, 0)
     assert.equal(states.some((state) => state.started === true && state.ended === false && !state.requestId), !finishedPublication)
     const row = await db.prepare('SELECT released_at FROM api_key_admissions WHERE key_id=$1').get(key.id)
-    if (finishedPublication) {
+    if (kind.startsWith('sync')) {
+      assert.equal(row, undefined, 'fleet publication precedes API key reservation')
+    } else if (finishedPublication) {
       assert.ok(row.released_at)
       const next = await store.reserve(key)
       assert.equal(next.ok, true)
