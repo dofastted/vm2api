@@ -404,16 +404,31 @@ export class BackupService {
     // pg_restore --clean only removes objects present in the archive. Later
     // migrations can add tables (including login sessions) that must disappear
     // before restoring an older snapshot and reapplying those migrations.
-    const extraTables = (await db.prepare('SELECT tablename FROM pg_tables WHERE schemaname=$1').all(db.schema))
-      .map(({ tablename }) => tablename)
-      .filter((name) => !archive.tables.has(name))
+    const tables = (
+      await db.prepare('SELECT tablename FROM pg_tables WHERE schemaname=$1 ORDER BY tablename').all(db.schema)
+    ).map(({ tablename }) => tablename)
+    const extraTables = tables.filter((name) => !archive.tables.has(name))
+    const tableName = (name) => `${quoteIdentifier(db.schema)}.${quoteIdentifier(name)}`
     const cleanup = path.join(archive.tmp, 'cleanup.sql')
     const restore = path.join(archive.tmp, 'restore.sql')
     fs.writeFileSync(
       cleanup,
-      extraTables.length
-        ? `DROP TABLE ${extraTables.map((name) => `${quoteIdentifier(db.schema)}.${quoteIdentifier(name)}`).join(', ')};\n`
-        : '',
+      [
+        tables.length ? `LOCK TABLE ${tables.map(tableName).join(', ')} IN ACCESS EXCLUSIVE MODE;` : '',
+        `DO $$ BEGIN
+          IF EXISTS (
+            SELECT 1 FROM pg_catalog.pg_inherits i
+            JOIN pg_catalog.pg_class p ON p.oid=i.inhparent
+            JOIN pg_catalog.pg_namespace pn ON pn.oid=p.relnamespace
+            JOIN pg_catalog.pg_class c ON c.oid=i.inhrelid
+            JOIN pg_catalog.pg_namespace cn ON cn.oid=c.relnamespace
+            WHERE pn.nspname='${db.schema}' AND cn.nspname<>'${db.schema}'
+          ) THEN
+            RAISE EXCEPTION 'restore refuses cross-schema inheritance or partitions';
+          END IF;
+        END $$;`,
+        extraTables.length ? `DROP TABLE ${extraTables.map(tableName).join(', ')};` : '',
+      ].join('\n'),
       { mode: 0o600 },
     )
     fs.writeFileSync(restore, '', { mode: 0o600 })
@@ -431,9 +446,10 @@ export class BackupService {
       ],
       db.connectionString,
     )
-    // Both the removal and restore must commit together. RESTRICT (the default)
-    // also refuses dependencies outside the application schema without deleting
-    // neighboring objects. psql streams the potentially multi-GB SQL file.
+    // Lock parents and descendants before checking: attaching or detaching a
+    // partition must not race the check. RESTRICT alone still drops partitions
+    // automatically, including ones outside this schema. All cleanup and restore
+    // statements commit together; psql streams the potentially multi-GB SQL file.
     await runPgTool(
       'psql',
       ['--no-psqlrc', '--quiet', '--single-transaction', '--set=ON_ERROR_STOP=1', '--file', cleanup, '--file', restore],
