@@ -137,6 +137,21 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 			reply["manifest_revision"] = request.ManifestRevision
 			reply["manifest_digest"] = request.ManifestDigest
 		}
+	case "recovery-status":
+		if request.Kind != "" || request.Ticket != "" || request.AllocationID != "" || request.OperationID != "" || request.OwnerID != "" || request.Management != nil || request.ContentLength != 0 {
+			err = ErrInvalidAuthority
+			break
+		}
+		var command *recoveryCommandStatus
+		command, err = s.authority.recoveryStatus(request.VMID, request.Fence, request.CommandID)
+		if err == nil {
+			reply["found"] = command != nil
+			if command != nil {
+				reply["command"] = command
+			} else {
+				reply["unknown"] = true
+			}
+		}
 	case "allocate":
 		if s.allocator == nil || request.Fence != (Fence{}) || request.CommandID != "" || request.Kind != "" || request.Ticket != "" {
 			err = ErrManagementDenied
@@ -233,7 +248,7 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 		reply["error"] = gate2Code(err)
 	} else {
 		reply["ok"] = true
-		if request.Op != "prepare" && request.Op != "command" && request.Op != "allocate" && request.Op != "publish-initial" && request.Op != "launch" && request.Op != "health" {
+		if request.Op != "prepare" && request.Op != "command" && request.Op != "allocate" && request.Op != "publish-initial" && request.Op != "launch" && request.Op != "health" && request.Op != "recovery-status" {
 			reply["state"] = publicGateState(state)
 		}
 	}

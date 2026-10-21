@@ -12,8 +12,16 @@
 
 测试只用 fake kernel、临时 Unix/TLS 监听和 controller RST，并验证错误终态不能 completed。没有真实 Docker、SSH、节点或 provider 操作。
 
-## 后续恢复状态和计费 receipt
+## 历史恢复状态
 
-当前本批尚未提供无 ticket 的历史 recovery-status、seal-not-started 或持久 usage receipt。后续只读查询必须使用 PG 保存的原 VM/Fence/command ID，不能从当前 state 重新授权。notfound 不等于未开始；未 dispatch 也不能直接释放，因为旧 owner 仍可能延迟发送。
+失败规格 `caab8b81` 证明原接口不能在 controller/node runtime 变化后读取历史完成记录。新增 authenticated KSG2 `recovery-status` 请求固定为 `{op,vm_id,fence,command_id}`，无需 ticket。fence 必须与该 command 的历史记录完全相等；不会拿当前 slot state 的 generation、executor 或新 nonce 替换旧身份。
+
+找到记录时返回 `{ok:true,found:true,command:{id,fence,status,dispatched}}`。历史 completed 跨 generation 保留；重启后 pending 变 unknown 的记录继续返回 unknown。接口仅查询 inference command，不提供管理动作的执行权限，不发送 kernel/Engine 请求，不创建或修改 command。
+
+找不到记录时仅返回 `{ok:true,found:false,unknown:true}`。它不证明未开始，也不产生 seal/tombstone；旧 owner 仍可能延迟 prepare/forward。调用方必须继续保留 PG 未知占位。输入错误、原 Fence 不匹配、节点 journal 不可用时拒绝，不退回当前 state 或其他传输。
+
+## 后续 seal 和计费 receipt
+
+当前本批尚未提供 seal-not-started 或持久 usage receipt。notfound 不等于未开始；未 dispatch 也不能直接释放，因为旧 owner 仍可能延迟发送。
 
 usage 缺失不得补零结算；节点只提供原始公开 model/usage/terminal 信息，PG 根据原 command 对应的 parent/attempt 和价格快照处理。node health、ready_slots 和取消 ACK 均不是恢复终止证明。以上节点能力不表示生产 HA 已完成。
