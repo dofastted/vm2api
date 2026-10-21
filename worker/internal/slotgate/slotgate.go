@@ -65,6 +65,7 @@ type Server struct {
 	publisher        *initialPublisher
 	authorizeCommand CommandAuthorizer
 	managementNodeID string
+	nodeBootID       string
 	// Internal injection for trusted adapters/tests. Config alone never grants
 	// unimplemented network mutations to a holder of the forwarding token.
 	authorizeManagement func(context.Context, gate2Request, func() error) error
@@ -105,6 +106,7 @@ func New(cfg Config) (*Server, error) {
 		if err != nil {
 			return nil, err
 		}
+		srv.nodeBootID = boot
 		socket := cfg.DockerSocket
 		if socket == "" {
 			socket = "/var/run/docker.sock"

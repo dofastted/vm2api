@@ -129,6 +129,9 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 	var state AuthorityState
 	switch request.Op {
 	case "health":
+		if err = s.currentBootFence(request.Fence); err != nil {
+			break
+		}
 		var health map[string]any
 		health, err = s.readHealth(ctx, request)
 		if err == nil {
@@ -165,6 +168,9 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 	case "state":
 		state, err = s.authority.State(request.VMID)
 	case "prepare":
+		if err = s.currentBootFence(request.Fence); err != nil {
+			break
+		}
 		if managed, e := s.authority.State(request.VMID); e == nil && managed.Allocation != nil && (managed.InitialManifest == nil || request.Kind != "kernel") {
 			err = ErrManagementDenied
 			break
@@ -296,6 +302,10 @@ func (s *Server) forwardHandle(request gate2Request) (CommandHandle, error) {
 }
 
 func (s *Server) forwardFenced(ctx context.Context, conn net.Conn, reader *bufio.Reader, request gate2Request) {
+	if err := s.currentBootFence(request.Fence); err != nil {
+		fmt.Fprintf(conn, "ERR %s\n", gate2Code(err))
+		return
+	}
 	handle, err := s.forwardHandle(request)
 	if err != nil {
 		code := gate2Code(err)
@@ -347,7 +357,10 @@ func (s *Server) forwardFenced(ctx context.Context, conn net.Conn, reader *bufio
 	}
 	conn.SetDeadline(time.Time{})
 	var target net.Conn
-	err = s.authority.DispatchCommand(handle, func(ExecutorIdentity) error {
+	err = s.authority.DispatchCommand(handle, func(executor ExecutorIdentity) error {
+		if executor.NodeBootID != s.nodeBootID || s.nodeBootID == "" {
+			return ErrFenceMismatch
+		}
 		if state.Allocation != nil {
 			token, e := readPublishedInitial(s.cfg.Root, request.VMID, request.Fence, s.launcher.policy, *state.InitialManifest, false)
 			if e != nil {
@@ -407,4 +420,14 @@ func (s *Server) forwardFenced(ctx context.Context, conn net.Conn, reader *bufio
 			return
 		}
 	}
+}
+
+// A surviving journal/socket is not evidence that an executor from a previous
+// host boot is still the captured executor. Only trusted recovery may replace
+// that identity; this rejection does not prove termination or release a job.
+func (s *Server) currentBootFence(fence Fence) error {
+	if s.nodeBootID == "" || fence.Executor.NodeBootID != s.nodeBootID {
+		return ErrFenceMismatch
+	}
+	return nil
 }

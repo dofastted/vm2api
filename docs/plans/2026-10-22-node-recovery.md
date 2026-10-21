@@ -20,6 +20,12 @@
 
 找不到记录时仅返回 `{ok:true,found:false,unknown:true}`。它不证明未开始，也不产生 seal/tombstone；旧 owner 仍可能延迟 prepare/forward。调用方必须继续保留 PG 未知占位。输入错误、原 Fence 不匹配、节点 journal 不可用时拒绝，不退回当前 state 或其他传输。
 
+## 节点启动标识
+
+节点启动时独立读取宿主 bootID。新 prepare、forward 和 health 必须匹配原 Fence 中 executor 的 bootID；forward 在 Dispatch 边界再次核对。旧 ACTIVE 日志和相同路径的 Unix socket 不能自动授权新启动环境中的执行。失败规格 `5824f8a9` 分别复现旧 boot 仍可 prepare、dispatch 和读取健康状态。
+
+bootID 不匹配仅拒绝新授权，不是旧 executor 终止证明，不更新 generation，也不释放 PG 容量。已有旧 boot 的 ACTIVE 状态仍需撤销、保留未知并走可信恢复。历史 recovery-status 按原 command/Fence 读取已持久结果，不要求当前 boot 或当前 generation 相同。
+
 ## 后续 seal 和计费 receipt
 
 当前本批尚未提供 seal-not-started 或持久 usage receipt。notfound 不等于未开始；未 dispatch 也不能直接释放，因为旧 owner 仍可能延迟发送。
