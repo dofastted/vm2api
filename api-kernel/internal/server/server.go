@@ -99,11 +99,15 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request) {
 	if mediaType == "text/event-stream" {
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
-			_, _ = io.Copy(flushingWriter{writer: w, flusher: flusher}, resp.Body)
+			if _, err := io.Copy(flushingWriter{writer: w, flusher: flusher}, resp.Body); err != nil {
+				panic(http.ErrAbortHandler)
+			}
 			return
 		}
 	}
-	_, _ = io.Copy(w, resp.Body)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		panic(http.ErrAbortHandler)
+	}
 }
 
 // Expose only Write so io.Copy cannot bypass flushing through ReaderFrom.
