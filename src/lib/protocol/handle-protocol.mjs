@@ -181,6 +181,17 @@ export function createHandleProtocol(deps) {
   const accountQuota = deps.accountQuota
   const apiKeyStore = deps.apiKeyStore
   const apiScheduler = deps.apiScheduler
+  const rejectHaOperation = (res) =>
+    json(
+      res,
+      503,
+      makeError({
+        type: ErrorType.INVALID_REQUEST,
+        code: 'ha_operation_unsupported',
+        message: '该操作暂不支持多副本部署',
+        status: 503,
+      }).body,
+    )
   const apiEndpointStore = deps.apiEndpointStore
   const stats = deps.stats
   const routingConfigPath = deps.routingConfigPath
@@ -638,6 +649,14 @@ export function createHandleProtocol(deps) {
     logBag.session_id = sessionIdForLog(extractCallerSession({ inbound, headers: req.headers }))
     logBag.reasoning_effort = reasoningEffortOf(inbound)
 
+    if (
+      isKubernetesHaMode() &&
+      (!['anthropic.messages', 'openai.chat', 'openai.completions', 'openai.responses'].includes(protocol) ||
+        resolveInferenceBackend(req) === 'api' ||
+        detectInboundPlatform(inbound?.model).platform === 'openai')
+    )
+      return rejectHaOperation(res)
+
     const fp = fingerprintRequest(req, inbound)
     // Before the health probe: its synthesized or fail-closed replies would otherwise answer
     // probe-shaped third-party traffic, and with the switch on no probe is answered at all.
@@ -752,6 +771,9 @@ export function createHandleProtocol(deps) {
       logBag.upstream_model = modelRewrite.upstreamModel || null
     }
     const platform = detectInboundPlatform(ctx.body?.model)
+    // A model mapping must not redirect an otherwise supported Claude request
+    // into the unfenced Codex backend after the initial capability check.
+    if (isKubernetesHaMode() && platform.ok && platform.platform !== 'anthropic') return rejectHaOperation(res)
     if (!platform.ok) {
       stats.errors++
       const errorResult = makeError({
@@ -1083,7 +1105,8 @@ export function createHandleProtocol(deps) {
     const cacheBreakpoints = cacheBreakpointsFromRoutingFile(routingConfigPath)
     const openaiCompat = String(protocol || '').startsWith('openai.')
     try {
-      await syncClaudeKernelConfigsFromFile(cfg.paths?.project, routingConfigPath)?.publication
+      if (!isKubernetesHaMode())
+        await syncClaudeKernelConfigsFromFile(cfg.paths?.project, routingConfigPath)?.publication
     } catch (error) {
       if (
         error?.publicationFinished === true &&
@@ -1363,7 +1386,8 @@ export function createHandleProtocol(deps) {
             }
           }
           try {
-            await touchTelemetrySession(cfg.paths.project, selected.vmId, selected.exec?.vm)?.publication
+            if (!isKubernetesHaMode())
+              await touchTelemetrySession(cfg.paths.project, selected.vmId, selected.exec?.vm)?.publication
           } catch (error) {
             if (
               error?.publicationFinished === true &&
@@ -1857,6 +1881,10 @@ export function createHandleProtocol(deps) {
 
   /** POST /v1/alpha/search (Codex web search): same logging, auth and body handling as handleProtocol. */
   async function handleSearch(req, res, pathName) {
+    if (isKubernetesHaMode()) {
+      if (!(await requireAuth(req, res))) return
+      return rejectHaOperation(res)
+    }
     const protocol = 'openai.search'
     const logCtx = requestLog.start(req, { protocol, pathName })
     res._kinRequestId = logCtx.request_id
