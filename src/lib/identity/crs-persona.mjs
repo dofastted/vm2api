@@ -1,3 +1,4 @@
+import { readRoutingDocument } from '../core/routing-document.mjs'
 /**
  * Unofficial OAuth outbound persona. Official Claude Code inbound is
  * never rewritten. Mode comes from routing.compatibility.persona_inject:
@@ -31,7 +32,6 @@
  */
 import { createHash } from 'node:crypto'
 import { resolveWorkstationProfile } from './workstation-profile.mjs'
-import fs from 'node:fs'
 import { uuidFromSeed } from './identity-rewrite.mjs'
 import { OFFICIAL_CLI_VERSION } from './vm-identity.mjs'
 import { CCH_PLACEHOLDER } from './cch.mjs'
@@ -1027,7 +1027,7 @@ export function personaExpansionToolsFromRouting(routing = {}) {
 export function personaExpansionFromRoutingFile(filePath) {
   if (!filePath) return { mode: DEFAULT_PERSONA_EXPANSION, extraNames: [] }
   try {
-    const routing = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+    const routing = readRoutingDocument(filePath)
     return {
       mode: personaExpansionFromRouting(routing),
       extraNames: personaExpansionToolsFromRouting(routing),
@@ -1047,7 +1047,7 @@ export const PERSONA_STANDING_MAX = 800
 export function standingConstraintFromRoutingFile(filePath) {
   if (filePath) {
     try {
-      const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'))?.compatibility?.persona_standing
+      const raw = readRoutingDocument(filePath)?.compatibility?.persona_standing
       const text = String(raw ?? '').trim()
       if (text) return text.slice(0, PERSONA_STANDING_MAX)
     } catch {
@@ -1250,7 +1250,7 @@ export function personaOptionsFromRoutingFile(filePath) {
     return { mode: DEFAULT_PERSONA_MODE, park: DEFAULT_PERSONA_PARK, agent: DEFAULT_PERSONA_AGENT }
   }
   try {
-    return personaOptionsFromRouting(JSON.parse(fs.readFileSync(filePath, 'utf8')))
+    return personaOptionsFromRouting(readRoutingDocument(filePath))
   } catch {
     return { mode: DEFAULT_PERSONA_MODE, park: DEFAULT_PERSONA_PARK, agent: DEFAULT_PERSONA_AGENT }
   }
@@ -1311,7 +1311,7 @@ export function personaTemplateSettingsFromRouting(routing = {}) {
 export function personaTemplateSettingsFromRoutingFile(filePath) {
   if (!filePath) return personaTemplateSettingsFallback()
   try {
-    return personaTemplateSettingsFromRouting(JSON.parse(fs.readFileSync(filePath, 'utf8')))
+    return personaTemplateSettingsFromRouting(readRoutingDocument(filePath))
   } catch {
     return personaTemplateSettingsFallback()
   }
@@ -1534,7 +1534,7 @@ export function detectProxiedOfficialCcFromRouting(routing = {}) {
 export function detectProxiedOfficialCcFromRoutingFile(filePath) {
   if (!filePath) return true
   try {
-    return detectProxiedOfficialCcFromRouting(JSON.parse(fs.readFileSync(filePath, 'utf8')))
+    return detectProxiedOfficialCcFromRouting(readRoutingDocument(filePath))
   } catch {
     return true
   }

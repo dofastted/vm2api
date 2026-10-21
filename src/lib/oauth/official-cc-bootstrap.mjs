@@ -1,3 +1,4 @@
+import { readRoutingDocument } from '../core/routing-document.mjs'
 /**
  * Required post-OAuth workflow: wipe first-use Claude Code files, start the
  * slot's cli-node (the same Claude Code build the kernel runs, no separate
@@ -106,7 +107,7 @@ export function normalizeOfficialCcConfig(raw = {}) {
 function loadRoutingDocument(routingFile) {
   if (!routingFile) return {}
   try {
-    return JSON.parse(fs.readFileSync(routingFile, 'utf8'))
+    return readRoutingDocument(routingFile)
   } catch {
     return {}
   }

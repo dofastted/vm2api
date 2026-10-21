@@ -315,7 +315,7 @@ const routingRt = createRoutingRuntime({
 
 const {
   persistRoutingPatch,
-  loadRoutingConfig,
+  initRoutingConfig,
   syncTierDefaultsIntoRouting,
   initPoolRuntime,
   poolSchedulerConfig,
@@ -329,8 +329,8 @@ const {
   migrateLegacyOpenAIPolicies,
 } = routingRt
 
-routingConfig = loadRoutingConfig()
-migrateLegacyOpenAIPolicies(routingConfig)
+routingConfig = await initRoutingConfig()
+if (!kubernetesMode) migrateLegacyOpenAIPolicies(routingConfig)
 setManualScheduleWins(routingConfig.pool?.manual_schedule_wins)
 if (routingConfig.official_cc) {
   routingConfig.official_cc = normalizeOfficialCcConfig(routingConfig.official_cc)
@@ -448,6 +448,7 @@ try {
 }
 
 await initPoolRuntime()
+routingRt.routingState?.start()
 try {
   applyRoutingTierConcurrency(routingConfig.tiers)
 } catch (e) {
@@ -633,8 +634,8 @@ backupService.onRestored(async (db) => {
   groupsRepo = new GroupsRepo(db)
   apiScheduler.reload(await apiEndpointStore.listRaw())
 
-  routingConfig = loadRoutingConfig()
-  migrateLegacyOpenAIPolicies(routingConfig)
+  routingConfig = routingRt.routingState ? await routingRt.routingState.rebind(db) : await initRoutingConfig()
+  if (!kubernetesMode) migrateLegacyOpenAIPolicies(routingConfig)
   setManualScheduleWins(routingConfig.pool?.manual_schedule_wins)
   if (routingConfig.official_cc) {
     routingConfig.official_cc = normalizeOfficialCcConfig(routingConfig.official_cc)
@@ -668,6 +669,7 @@ backupService.onRestored(async (db) => {
 })
 backupService.onMaintenance(async (enabled) => {
   if (enabled) {
+    await routingRt.routingState?.stop()
     vmTestSchedule.stop()
     proxyPool.stopScheduler()
     requestLog.stopCleanupScheduler()
@@ -682,6 +684,7 @@ backupService.onMaintenance(async (enabled) => {
     await pauseVmDbSync()
   } else {
     if (_shuttingDown) return
+    routingRt.routingState?.start()
     resumeVmDbSync()
     resumePriceCatalog()
     for (const monitor of maintenanceMonitors()) await monitor?.start?.({ immediate: false })
@@ -813,6 +816,7 @@ async function requireAuth(req, res) {
     )
   }
   if (kubernetesMode) {
+    await routingRt.refreshRouting()
     const snapshot = await new SettingsRepo().refresh()
     refreshModelPolicy(snapshot.model_policy)
     refreshGptModelPolicy(snapshot.gpt_model_policy)
@@ -1441,6 +1445,7 @@ async function shutdown(signal, { failed = false } = {}) {
     forceClose()
     process.exit(1)
   }, shutdownGraceMs + 5000)
+  await routingRt.routingState?.stop()
   try {
     vmTestSchedule.stop()
   } catch {}

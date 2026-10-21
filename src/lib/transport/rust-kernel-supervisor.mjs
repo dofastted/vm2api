@@ -1,3 +1,4 @@
+import { readRoutingDocument, routingDocumentRevision } from '../core/routing-document.mjs'
 /**
  * Rust gateway-worker lifecycle. kin-kernel is container PID 1.
  * Host writes credentials; slot kernel only reads AT for inference.
@@ -828,6 +829,8 @@ export function syncClaudeKernelConfigs(projectRoot, routing) {
  */
 export function syncClaudeKernelConfigsFromFile(projectRoot, routingFile) {
   if (!projectRoot || !routingFile) return { updated: 0, skipped: true }
+  const revision = routingDocumentRevision(routingFile)
+  if (revision !== null) return { updated: 0, skipped: true, pending: true, revision }
   let mtimeMs
   try {
     mtimeMs = fs.statSync(routingFile).mtimeMs
@@ -837,7 +840,7 @@ export function syncClaudeKernelConfigsFromFile(projectRoot, routingFile) {
   if (routingPersonaMtime.get(routingFile) === mtimeMs) return { updated: 0, skipped: true }
   let routing
   try {
-    routing = JSON.parse(fs.readFileSync(routingFile, 'utf8'))
+    routing = readRoutingDocument(routingFile)
   } catch {
     return { updated: 0, skipped: true }
   }
