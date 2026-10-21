@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
-import { openDatabase, closeDatabase, getDb, createDatabase } from '../../src/lib/db/database.mjs'
+import { openDatabase, closeDatabase, getDb, createDatabase, applyMigrations } from '../../src/lib/db/database.mjs'
 import { BackupRepo } from '../../src/lib/db/repos/backup-repo.mjs'
 import { sha256FileAsync } from '../../src/lib/admin/backup-core.mjs'
 import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
@@ -74,6 +74,22 @@ test('restoring the application schema preserves later writes in a neighboring s
   } finally {
     await db.exec(`DROP SCHEMA ${neighbor} CASCADE`)
   }
+})
+
+test('restoring a PG 001 snapshot removes later tables before reapplying migration 002', async () => {
+  const db = getDb()
+  await db.exec("DROP TABLE panel_sessions; DELETE FROM schema_migrations WHERE version='002'")
+  await new SettingsRepo(db).set('older-snapshot', 'before')
+  const rec = await svc.createBackup()
+  await applyMigrations(db)
+  await db
+    .prepare('INSERT INTO panel_sessions VALUES($1,$2,$3,$4)')
+    .run('after-snapshot', 'admin', 'admin', Date.now() + 60000)
+  await new SettingsRepo(db).set('older-snapshot', 'after')
+  assert.equal((await svc.restoreBackup(rec.id)).ok, true)
+  assert.equal(await new SettingsRepo(db).get('older-snapshot'), 'before')
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM panel_sessions').get()).n, 0)
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 2)
 })
 
 test('createBackup produces tar.gz with manifest + db + vms + config, records ok', async () => {
