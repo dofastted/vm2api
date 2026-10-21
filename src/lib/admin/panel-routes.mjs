@@ -2388,13 +2388,20 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'POST' && p === '/api/panel/vms/fleet-update') {
         const body = await readBody(req, 32 * 1024).catch(() => ({}))
-        const report = await runFleetUpdate(cfg.paths.project, {
-          action: body.action || 'roll',
-          ids: Array.isArray(body.ids) ? body.ids : null,
-          concurrency: body.concurrency,
-          routing: ctx.routingConfig,
+        const wanted = Array.isArray(body.ids) && body.ids.length ? new Set(body.ids.map(String)) : null
+        const ids = listVms(cfg.paths.project)
+          .filter((vm) => !wanted || wanted.has(vm.id))
+          .map((vm) => vm.id)
+        return mutateProxyVms(ids, async (handles) => {
+          const report = await (ctx.vmMutationOps?.runFleetUpdate || runFleetUpdate)(cfg.paths.project, {
+            action: body.action || 'roll',
+            targetIds: ids,
+            concurrency: body.concurrency,
+            routing: ctx.routingConfig,
+          })
+          for (const item of report.items || []) await vmEffect(handles.get(item.id), async () => item)
+          return json(res, 200, panel.ok(report))
         })
-        return json(res, 200, panel.ok(report))
       }
       if (req.method === 'GET' && p === '/api/panel/wrap-cli') {
         const sample = describeWrapSample(cfg.paths.project)

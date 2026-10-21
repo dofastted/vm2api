@@ -97,6 +97,23 @@ test('fleet does not treat a partial Rust reload as completed successfully', asy
   assert.equal(report.items[0].vmOperationUncertain, true)
 })
 
+test('fleet targetIds never expands a frozen or empty claimed target set', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fleet-fixed-targets-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeSlot(root, 'vm-a')
+  writeSlot(root, 'vm-b')
+  const calls = []
+  const collectFn = async (_root, vm) => {
+    calls.push(vm.id)
+    return { ok: true }
+  }
+  await runFleetUpdate(root, { action: 'collect', targetIds: ['vm-a'], collectFn })
+  assert.deepEqual(calls, ['vm-a'])
+  const empty = await runFleetUpdate(root, { action: 'collect', targetIds: [], collectFn })
+  assert.equal(empty.total, 0)
+  assert.deepEqual(calls, ['vm-a'])
+})
+
 test('fleet telemetry uses injected telemetryFn with options object', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fleet-tel-'))
   writeSlot(root, 'vm-01', { node_id: 'node-a' })

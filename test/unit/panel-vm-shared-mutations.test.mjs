@@ -139,6 +139,53 @@ test('fleet update claims every selected target before starting the first comman
   await next.release()
 })
 
+test('fleet update waits for all original work before releasing its global VM claims', async (t) => {
+  const f = await fixture(t)
+  f.seed('vm-a')
+  f.seed('vm-b')
+  let finish
+  let enter
+  const pending = new Promise((resolve) => {
+    finish = resolve
+  })
+  const entered = new Promise((resolve) => {
+    enter = resolve
+  })
+  const report = {
+    total: 2,
+    failed_count: 0,
+    items: [
+      { id: 'vm-a', ok: true },
+      { id: 'vm-b', ok: true },
+    ],
+  }
+  const h = f.handler(
+    { action: 'collect' },
+    {
+      vmMutationOps: {
+        runFleetUpdate: async (_root, options) => {
+          assert.deepEqual(options.targetIds, ['vm-a', 'vm-b'])
+          enter()
+          return pending
+        },
+      },
+    },
+  )
+  const request = h.request('POST', '/api/panel/vms/fleet-update')
+  try {
+    await entered
+    assert.equal((await f.otherOperations.tryAcquire({ vmId: 'vm-a' })).ok, false)
+    assert.equal((await f.otherOperations.tryAcquire({ vmId: 'vm-b' })).ok, false)
+  } finally {
+    finish(report)
+    await request
+  }
+  assert.equal(h.response.status, 200)
+  const next = await f.otherOperations.tryAcquire({ vmId: 'vm-b' })
+  assert.equal(next.ok, true)
+  await next.release()
+})
+
 test('create claims the new physical identity before writing a VM or fingerprint', async (t) => {
   const f = await fixture(t)
   await f.otherOperations.tryAcquire({ vmId: 'vm-synthetic' })
