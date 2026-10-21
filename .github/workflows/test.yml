@@ -42,6 +42,9 @@ jobs:
         with:
           go-version: '1.25.x'
           cache-dependency-path: worker/go.sum
+      - name: download worker modules for offline Go protocol fixtures
+        working-directory: worker
+        run: go mod download
       - run: npm ci
       - name: PostgreSQL 17 backup clients
         run: |
