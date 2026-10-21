@@ -90,7 +90,11 @@ export class SharedCredentialRefresh {
     const current = checkCurrent(await readCurrent())
     if (current.generation !== expectedGeneration)
       return { finished: true, unknown: false, shared: true, current, value: { ok: true } }
-    if (observed?.sharedResult?.ok && observed.sharedResult.inputGeneration === expectedGeneration)
+    if (
+      observed?.sharedResult?.ok &&
+      observed.sharedResult.inputGeneration === expectedGeneration &&
+      observed.sharedResult.generation !== expectedGeneration
+    )
       throw failure('credential_projection_stale')
     const claim = await this.tasks.tryClaim({
       taskKey,
