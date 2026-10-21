@@ -11,6 +11,7 @@ test('an unknown remote publication during preparation stops failover and preser
   const scheduler = {
     async selectAndReserve() {
       selections++
+      if (selections > 1) return { ok: false, reason: 'no_eligible_accounts' }
       return {
         ok: true,
         accountId: 'publication-account',
