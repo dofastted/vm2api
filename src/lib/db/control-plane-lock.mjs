@@ -1,16 +1,19 @@
-/** Single active controller guard. This does not fence remote execution or provide failover. */
+/** Excludes singleton controllers from shared HA mode; it does not fence remote execution. */
 
 const LOCK_SQL = 'SELECT pg_try_advisory_lock(hashtext(current_database()), hashtext($1)) AS acquired'
 const UNLOCK_SQL = 'SELECT pg_advisory_unlock(hashtext(current_database()), hashtext($1))'
+const SHARED_LOCK_SQL = 'SELECT pg_try_advisory_lock_shared(hashtext(current_database()), hashtext($1)) AS acquired'
+const SHARED_UNLOCK_SQL = 'SELECT pg_advisory_unlock_shared(hashtext(current_database()), hashtext($1))'
 
 function lockError(code, message) {
   return Object.assign(new Error(message), { code })
 }
 
 export class ControlPlaneLock {
-  constructor(db, { onLost = null } = {}) {
+  constructor(db, { onLost = null, shared = false } = {}) {
     this.db = db
     this.onLost = onLost
+    this.shared = shared === true
     this.resource = `vm2api:control-plane:${db.schema}`
     this._healthy = false
     this._client = null
@@ -57,7 +60,7 @@ export class ControlPlaneLock {
     client.on('error', this._onError)
     client.on('end', this._onEnd)
     try {
-      const result = await client.query(LOCK_SQL, [this.resource])
+      const result = await client.query(this.shared ? SHARED_LOCK_SQL : LOCK_SQL, [this.resource])
       if (!result.rows[0]?.acquired) {
         throw lockError('control_plane_already_active', 'Another control plane is active for this database and schema')
       }
@@ -109,7 +112,7 @@ export class ControlPlaneLock {
     this._detach(client)
     let failed = this._lost
     try {
-      if (!this._lost) await client.query(UNLOCK_SQL, [this.resource])
+      if (!this._lost) await client.query(this.shared ? SHARED_UNLOCK_SQL : UNLOCK_SQL, [this.resource])
     } catch (error) {
       failed = true
       throw error

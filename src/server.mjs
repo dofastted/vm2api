@@ -168,7 +168,7 @@ if (haCatalog) {
 }
 let controlPlaneLock = null
 const controlPlaneHealthy = () =>
-  !kubernetesMode || (activityCoordinator?.healthy === true && (haMode || controlPlaneLock?.healthy === true))
+  !kubernetesMode || (activityCoordinator?.healthy === true && controlPlaneLock?.healthy === true)
 let startupAborting = false
 const lifecycle = new ControlPlaneLifecycle({
   probe: async () => {
@@ -207,8 +207,9 @@ if (kubernetesMode) {
   process.once('uncaughtException', failStartup)
   process.once('unhandledRejection', failStartup)
 }
-if (kubernetesMode && !haMode) {
+if (kubernetesMode) {
   controlPlaneLock = new ControlPlaneLock(db, {
+    shared: haMode,
     onLost(error) {
       lifecycle.beginDrain()
       console.error('[control-plane] exclusive lock lost')
