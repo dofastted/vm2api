@@ -1,53 +1,13 @@
-/**
- * Local backup service — sub2api BackupService counterpart (no S3, per user).
- *
- * Backup artifact: data/backups/kin-backup-<stamp>.tar.gz (0600) containing
- *   manifest.json   {version, created_at, kind, includes, sha256s}
- *   db/kin.db       VACUUM INTO online-consistent snapshot (credentials
- *                   already mirrored into the `vms` table)
- *   vms/            slot *.json + active.json (double safety)
- *   config/         routing.json / intercept-rules.json …
- *
- * When `tar` is unavailable the service degrades to a gzipped DB snapshot
- * (kin-backup-<stamp>.db.gz) — still fully restorable because the DB holds
- * the credential mirror (vm files are rebuilt from vms.vm_json). That fallback
- * buffers the whole snapshot in memory, so it only works below ~2 GiB; the
- * tar path has no such limit.
- *
- * Staging lives on the data volume (`<dataDir>/tmp`, override with
- * KIN_BACKUP_TMPDIR), not os.tmpdir(): /tmp is a tmpfs sized to a fraction of
- * RAM and a multi-GB `VACUUM INTO` snapshot fails there with SQLITE_FULL
- * ("database or disk is full") while the real disk still has room.
- *
- * Scheduling (default ON, user requirement):
- *   settings.backup_schedule = { enabled: true, interval_hours: 24, retention: 7 }
- *   env overrides: KIN_BACKUP_DISABLED=1, KIN_BACKUP_INTERVAL_HOURS, KIN_BACKUP_RETENTION
- *   - checker runs every 10 min + a catch-up check shortly after boot
- *   - the job itself runs in a worker thread (backup-worker.mjs): the
- *     pipeline is synchronous for minutes, so running it in-process
- *     would stop the gateway from answering (Cloudflare 524)
- *   - retention prunes old ok backups (pre_restore keeps newest 3)
- *
- * Restore:
- *   verify manifest/sha256 → automatic pre_restore backup → close DB →
- *   swap kin.db (old one kept as kin.db.pre-restore) → restore vms/ +
- *   config/ files (or rebuild from DB) → reopen + migrate → rebind stores.
- *   `isRestoring` flag lets the server 503 protocol traffic meanwhile.
- */
-
+/** PostgreSQL backup scheduling, write maintenance and transactional restore. */
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
-import zlib from 'node:zlib'
-import { spawnSync } from 'node:child_process'
 import { Worker } from 'node:worker_threads'
-import { getDb, getDbPath, closeDatabase, openDatabase } from '../db/database.mjs'
-import { sha256File } from './backup-core.mjs'
+import { getDb, applyMigrations } from '../db/database.mjs'
+import { sha256FileAsync, runPgTool, runProcess, extractArchiveMember } from './backup-core.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { BackupRepo } from '../db/repos/backup-repo.mjs'
-import { reconcileVms } from '../vm/vm-db-sync.mjs'
-import { repairSlotSmbios, repairVmProxyCliEnabled } from '../vm/vm-registry.mjs'
-import { invalidateReadCache, isVmRecordFile } from '../vm/vm-file.mjs'
+import { invalidateReadCache } from '../vm/vm-file.mjs'
 
 // tarAvailability / sha256File / the runnable pipeline live in backup-core.mjs;
 // keep the historical export surface for tests and callers.
@@ -69,7 +29,11 @@ export class BackupService {
     this.backupDir = backupDir || path.join(dataDir, 'backups')
     this.tmpDir = tmpDir || path.join(dataDir, 'tmp')
     this.checkIntervalMs = checkIntervalMs
-    this.isRestoring = false
+    this.maintenanceFile = path.join(dataDir, 'restore-maintenance.json')
+    this.isRestoring = fs.existsSync(this.maintenanceFile)
+    this.isMaintaining = this.isRestoring
+    this._restoreRunning = false
+    this._maintenance = null
     this._running = false
     this._timer = null
     this._bootTimer = null
@@ -98,10 +62,27 @@ export class BackupService {
     this._rebindStores = typeof fn === 'function' ? fn : null
   }
 
+  /** The server pauses new writes, drains in-flight work, and resumes only after success. */
+  onMaintenance(fn) {
+    this._maintenance = typeof fn === 'function' ? fn : null
+  }
+
+  async _enterMaintenance(reason) {
+    if (this.isMaintaining) return false
+    this.isMaintaining = true
+    await this._maintenance?.(true, reason)
+    return true
+  }
+
+  async _leaveMaintenance(reason) {
+    await this._maintenance?.(false, reason)
+    this.isMaintaining = false
+  }
+
   // ---------- schedule config ----------
 
-  getSchedule() {
-    let cfg = { ...DEFAULT_SCHEDULE, ...(this._settings().get(SCHEDULE_KEY, {}) || {}) }
+  async getSchedule() {
+    let cfg = { ...DEFAULT_SCHEDULE, ...((await this._settings().get(SCHEDULE_KEY, {})) || {}) }
     if (process.env.KIN_BACKUP_DISABLED === '1') cfg.enabled = false
     if (process.env.KIN_BACKUP_INTERVAL_HOURS) {
       const n = Number(process.env.KIN_BACKUP_INTERVAL_HOURS)
@@ -114,8 +95,8 @@ export class BackupService {
     return cfg
   }
 
-  updateSchedule(patch = {}) {
-    const cur = { ...DEFAULT_SCHEDULE, ...(this._settings().get(SCHEDULE_KEY, {}) || {}) }
+  async updateSchedule(patch = {}) {
+    const cur = { ...DEFAULT_SCHEDULE, ...((await this._settings().get(SCHEDULE_KEY, {})) || {}) }
     if (patch.enabled != null) cur.enabled = !!patch.enabled
     if (patch.interval_hours != null) {
       const n = Number(patch.interval_hours)
@@ -131,99 +112,149 @@ export class BackupService {
       }
       cur.retention = n
     }
-    this._settings().set(SCHEDULE_KEY, cur)
+    await this._settings().set(SCHEDULE_KEY, cur)
     return this.getSchedule()
   }
 
-  nextAutoAt() {
-    const cfg = this.getSchedule()
+  async nextAutoAt() {
+    const cfg = await this.getSchedule()
     if (!cfg.enabled) return null
-    const last = this._repo().lastSuccessful({})
+    const last = await this._repo().lastSuccessful({})
     const base = last ? Date.parse(last.created_at) : 0
     return new Date(Math.max(Date.now(), base + cfg.interval_hours * 3600_000)).toISOString()
   }
 
   // ---------- create ----------
 
-  /**
-   * Run one backup off the main thread.
-   *
-   * The pipeline (VACUUM INTO + sha256 + tar.gz) is synchronous for minutes on a
-   * multi-GB database, so it runs in a worker with its own DB connection while
-   * the gateway keeps serving requests.
-   *
-   * @returns {Promise<backup record>}
-   */
-  async createBackup({ kind = 'manual', note = null } = {}) {
+  async flush() {
+    await Promise.all([this._pendingBackup, this._pendingRestore].filter(Boolean))
+  }
+
+  async createBackup(options = {}) {
+    if (this._restoreRunning && options.kind !== 'pre_restore')
+      throw Object.assign(new Error('restore already in progress'), { code: 'restore_in_progress' })
+    if (this._running) throw Object.assign(new Error('backup already in progress'), { code: 'backup_in_progress' })
+    const pending = this._createBackup(options)
+    this._pendingBackup = pending
+    try {
+      return await pending
+    } finally {
+      if (this._pendingBackup === pending) this._pendingBackup = null
+    }
+  }
+
+  /** Export a PostgreSQL snapshot while files are frozen, then dump in a worker. */
+  async _createBackup({ kind = 'manual', note = null } = {}) {
     if (this._running) throw Object.assign(new Error('backup already in progress'), { code: 'backup_in_progress' })
     this._running = true
     const id = 'bak_' + crypto.randomBytes(6).toString('hex')
     const createdAt = new Date().toISOString()
+    let client
+    let entered = false
     try {
-      return await this._runBackupWorker({
-        id,
-        createdAt,
-        kind,
-        note,
-        retention: this.getSchedule().retention,
-      })
-    } catch (e) {
-      // The worker records its own failure; this covers the cases where it never
-      // got that far (module error, OOM, kill) so the panel still shows the job.
+      entered = await this._enterMaintenance(kind === 'pre_restore' ? 'restore' : 'backup')
+      const db = getDb()
+      client = await db.pool.connect()
+      await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY')
+      const snapshot = (await client.query('SELECT pg_export_snapshot() AS snapshot')).rows[0].snapshot
+      const version = (await client.query('SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1'))
+        .rows[0]
+      const rec = await this._runBackupWorker(
+        { id, createdAt, kind, note },
+        {
+          connectionString: db.connectionString,
+          schema: db.schema,
+          snapshot,
+          schemaVersion: version?.version || null,
+        },
+        async () => {
+          if (entered) {
+            await this._leaveMaintenance('backup')
+            entered = false
+          }
+        },
+      )
+      await client.query('COMMIT')
+      client.release()
+      client = null
+      const stored = await this._repo().insert(rec)
+      const retention = (await this.getSchedule()).retention
+      for (const old of [
+        ...(await this._repo().beyondRetention(retention)),
+        ...(await this._repo().preRestoreBeyond(3)),
+      ]) {
+        if (old.file_path) fs.rmSync(old.file_path, { force: true })
+        await this._repo().remove(old.id)
+      }
+      return stored
+    } catch (error) {
       try {
-        if (!this._repo().get(id)) {
-          this._repo().insert({
+        if (!(await this._repo().get(id)))
+          await this._repo().insert({
             id,
             created_at: createdAt,
             kind,
             status: 'failed',
-            file_path: null,
-            file_name: null,
-            size_bytes: null,
-            sha256: null,
-            db_bytes: null,
-            includes: null,
-            error: String(e.message || e).slice(0, 500),
+            error: String(error.message || error).slice(0, 500),
             note,
           })
-        }
       } catch {}
-      throw e
+      throw error
     } finally {
+      if (client) {
+        try {
+          await client.query('ROLLBACK')
+        } finally {
+          client.release()
+        }
+      }
       this._running = false
+      if (entered) await this._leaveMaintenance('backup')
     }
   }
 
-  _runBackupWorker(job) {
+  _runBackupWorker(job, database, onFilesCopied) {
     return new Promise((resolve, reject) => {
       const worker = new Worker(new URL('./backup-worker.mjs', import.meta.url), {
         workerData: {
-          dataDir: this.dataDir,
           ctx: {
             projectRoot: this.projectRoot,
             configDir: this.configDir,
             backupDir: this.backupDir,
             tmpDir: this.tmpDir,
+            ...database,
           },
           job,
         },
       })
       let settled = false
+      let resumed = Promise.resolve()
       const finish = (fn, arg) => {
         if (settled) return
         settled = true
         fn(arg)
       }
-      worker.once('message', (msg) => {
-        if (msg && msg.ok) return finish(resolve, msg.rec)
-        finish(
-          reject,
-          Object.assign(new Error((msg && msg.error && msg.error.message) || 'backup failed'), {
-            code: (msg && msg.error && msg.error.code) || 'backup_failed',
-          }),
-        )
+      worker.on('message', (msg) => {
+        if (msg.type === 'files-copied') {
+          resumed = onFilesCopied()
+          // Keep the exported snapshot alive until the worker finishes even when resume failed.
+          resumed.catch(() => {})
+          return
+        }
+        if (msg.ok)
+          resumed.then(
+            () => finish(resolve, msg.rec),
+            (error) => finish(reject, error),
+          )
+        else
+          finish(
+            reject,
+            Object.assign(new Error(msg.error?.message || 'backup failed'), {
+              code: msg.error?.code || 'backup_failed',
+            }),
+          )
       })
-      worker.once('error', (e) => finish(reject, e))
+      worker.once('error', (error) => finish(reject, error))
       worker.once('exit', (code) => {
         if (code !== 0) finish(reject, new Error(`backup worker exited with code ${code}`))
       })
@@ -232,21 +263,19 @@ export class BackupService {
 
   // ---------- list / delete ----------
 
-  list({ limit = 100 } = {}) {
-    return this._repo()
-      .list({ limit })
-      .map((r) => ({
-        ...r,
-        file_exists: !!(r.file_path && fs.existsSync(r.file_path)),
-      }))
+  async list({ limit = 100 } = {}) {
+    return (await this._repo().list({ limit })).map((r) => ({
+      ...r,
+      file_exists: !!(r.file_path && fs.existsSync(r.file_path)),
+    }))
   }
 
-  get(id) {
+  async get(id) {
     return this._repo().get(id)
   }
 
-  remove(id) {
-    const rec = this._repo().get(id)
+  async remove(id) {
+    const rec = await this._repo().get(id)
     if (!rec) return false
     try {
       if (rec.file_path && fs.existsSync(rec.file_path)) fs.rmSync(rec.file_path, { force: true })
@@ -256,139 +285,208 @@ export class BackupService {
 
   // ---------- restore ----------
 
-  /**
-   * Restore from a recorded backup. Automatically snapshots the current
-   * state first (kind=pre_restore). Re-binds stores via onRestored callback.
-   */
-  async restoreBackup(id) {
-    const rec = this._repo().get(id)
-    if (!rec) throw Object.assign(new Error('backup not found'), { code: 'backup_not_found' })
-    if (rec.status !== 'ok')
-      throw Object.assign(new Error('backup record is not restorable'), { code: 'backup_not_ok' })
-    if (!rec.file_path || !fs.existsSync(rec.file_path)) {
-      throw Object.assign(new Error('backup file missing on disk'), { code: 'backup_file_missing' })
-    }
-    if (this.isRestoring) throw Object.assign(new Error('restore already in progress'), { code: 'restore_in_progress' })
-
-    // integrity: archive checksum must match the record
-    const actual = sha256File(rec.file_path)
-    if (rec.sha256 && actual !== rec.sha256) {
-      throw Object.assign(new Error('backup archive sha256 mismatch'), { code: 'backup_corrupt' })
-    }
-
-    this.isRestoring = true
-    let tmp = null
+  async _extractArchive(rec) {
+    if (!rec.file_name?.endsWith('.tar.gz'))
+      throw Object.assign(new Error('convert the SQLite backup with the offline import tool before restoring'), {
+        code: 'legacy_backup_conversion_required',
+      })
+    const tmp = this._mkdtemp('kin-restore-')
     try {
-      // 0. safety net snapshot of the current state
-      const pre = await this.createBackup({ kind: 'pre_restore', note: `before restore of ${rec.id}` })
-
-      // 1. extract / decompress
-      tmp = this._mkdtemp('kin-restore-')
-      let dbFile
-      let manifest = null
-      if (rec.file_name?.endsWith('.tar.gz')) {
-        const r = spawnSync('tar', ['-xzf', rec.file_path, '-C', tmp], { stdio: 'pipe' })
-        if (r.status !== 0) throw new Error(`tar extract failed: ${String(r.stderr || '').slice(0, 300)}`)
-        dbFile = path.join(tmp, 'db', 'kin.db')
-        try {
-          manifest = JSON.parse(fs.readFileSync(path.join(tmp, 'manifest.json'), 'utf8'))
-        } catch {}
-        if (manifest?.sha256s?.['db/kin.db']) {
-          if (sha256File(dbFile) !== manifest.sha256s['db/kin.db']) {
-            throw Object.assign(new Error('db snapshot sha256 mismatch inside archive'), { code: 'backup_corrupt' })
-          }
+      const entries = (await runProcess('tar', ['-tzf', rec.file_path])).split('\n').filter(Boolean)
+      const files = new Set()
+      const members = new Set()
+      for (const entry of entries) {
+        const name = entry.replace(/^\.\//, '')
+        if (!name || name === '.') continue
+        if (members.has(name)) throw new Error('invalid or duplicate backup archive path')
+        members.add(name)
+        if (name === 'db/kin.db')
+          throw Object.assign(new Error('convert the SQLite backup with the offline import tool before restoring'), {
+            code: 'legacy_backup_conversion_required',
+          })
+        if (/^(db|vms|config)\/$/.test(name)) {
+          fs.mkdirSync(path.join(tmp, name), { recursive: true, mode: 0o700 })
+          continue
         }
-      } else {
-        dbFile = path.join(tmp, 'kin.db')
-        fs.writeFileSync(dbFile, zlib.gunzipSync(fs.readFileSync(rec.file_path)))
-      }
-      if (!fs.existsSync(dbFile)) throw new Error('no db snapshot inside backup')
-
-      // 2. swap the live database
-      const dbPath = getDbPath()
-      closeDatabase()
-      const keep = `${dbPath}.pre-restore`
-      try {
-        fs.rmSync(keep, { force: true })
-      } catch {}
-      try {
-        fs.renameSync(dbPath, keep)
-      } catch {}
-      for (const suffix of ['-wal', '-shm']) {
-        try {
-          fs.rmSync(dbPath + suffix, { force: true })
-        } catch {}
-      }
-      fs.copyFileSync(dbFile, dbPath)
-      try {
-        fs.chmodSync(dbPath, 0o600)
-      } catch {}
-
-      // 3. restore vm + config files from the archive (tar flavor only)
-      const vmsDirSrc = path.join(tmp, 'vms')
-      if (this.projectRoot && fs.existsSync(vmsDirSrc)) {
-        const vmsDir = path.join(this.projectRoot, 'vms')
-        fs.mkdirSync(vmsDir, { recursive: true })
-        // replace vm json records with archive state (cli-home dirs untouched)
-        for (const f of fs.readdirSync(vmsDir)) {
-          if (isVmRecordFile(f) || f === 'active.json') {
-            try {
-              fs.rmSync(path.join(vmsDir, f), { force: true })
-            } catch {}
-          }
+        if (!/^(manifest\.json|db\/postgres\.dump|(vms|config)\/[^/]+\.json)$/.test(name) || files.has(name)) {
+          throw new Error('invalid or duplicate backup archive path')
         }
-        for (const f of fs.readdirSync(vmsDirSrc)) {
-          fs.copyFileSync(path.join(vmsDirSrc, f), path.join(vmsDir, f))
-          try {
-            fs.chmodSync(path.join(vmsDir, f), 0o600)
-          } catch {}
+        files.add(name)
+        await extractArchiveMember(rec.file_path, entry, path.join(tmp, name))
+      }
+      const manifest = JSON.parse(fs.readFileSync(path.join(tmp, 'manifest.json'), 'utf8'))
+      if (manifest.version !== 2 || manifest.engine !== 'postgresql')
+        throw Object.assign(new Error('convert the SQLite backup with the offline import tool before restoring'), {
+          code: 'legacy_backup_conversion_required',
+        })
+      if (manifest.schema !== getDb().schema) throw new Error('backup schema does not match this application')
+      if (!manifest.sha256s?.['db/postgres.dump']) throw new Error('backup database checksum is missing')
+      for (const [directory, required] of [
+        ['vms', !!this.projectRoot],
+        ['config', !!this.configDir],
+      ]) {
+        const count = [...files].filter((name) => name.startsWith(`${directory}/`)).length
+        if (manifest.includes?.[directory] !== count || (required && !fs.existsSync(path.join(tmp, directory)))) {
+          throw new Error('backup file snapshot is incomplete')
         }
       }
-      const cfgDirSrc = path.join(tmp, 'config')
-      if (this.configDir && fs.existsSync(cfgDirSrc)) {
-        fs.mkdirSync(this.configDir, { recursive: true })
-        for (const f of fs.readdirSync(cfgDirSrc)) {
-          fs.copyFileSync(path.join(cfgDirSrc, f), path.join(this.configDir, f))
+      for (const name of files) {
+        if (name !== 'manifest.json' && !manifest.sha256s[name]) throw new Error('backup contains an unchecked file')
+      }
+      for (const [name, digest] of Object.entries(manifest.sha256s)) {
+        if (
+          path.isAbsolute(name) ||
+          name.split('/').includes('..') ||
+          (await sha256FileAsync(path.join(tmp, name))) !== digest
+        ) {
+          throw Object.assign(new Error('backup file checksum mismatch'), { code: 'backup_corrupt' })
         }
       }
-
-      // 4. reopen + migrate (old backups upgrade automatically)
-      const db = openDatabase({ dataDir: this.dataDir, dbPath })
-
-      // 5. db-only backups: rebuild vm files from the credential mirror
-      if (this.projectRoot) {
-        invalidateReadCache()
-        try {
-          reconcileVms(this.projectRoot)
-          try {
-            repairVmProxyCliEnabled(this.projectRoot)
-          } catch {}
-          try {
-            repairSlotSmbios(this.projectRoot)
-          } catch {}
-        } catch {}
+      const dump = path.join(tmp, 'db', 'postgres.dump')
+      const listing = await runPgTool('pg_restore', ['--list', dump], getDb().connectionString)
+      const schema = getDb().schema
+      const allowed =
+        /^(TABLE DATA|SEQUENCE OWNED BY|SEQUENCE SET|FK CONSTRAINT|TABLE|SEQUENCE|DEFAULT|CONSTRAINT|INDEX|SCHEMA|COMMENT) (\S+) (.+)$/
+      for (const line of listing.split('\n')) {
+        if (!line || line.startsWith(';')) continue
+        const entry = line.replace(/^\d+; \d+ \d+ /, '')
+        if (/^(ENCODING - ENCODING|STDSTRINGS - STDSTRINGS|SEARCHPATH - SEARCHPATH)( |$)/.test(entry)) continue
+        if (entry.startsWith(`COMMENT - SCHEMA ${schema} `)) continue
+        if (entry.startsWith(`FUNCTION ${schema} ascii_fold(text) `)) continue
+        const item = entry.match(allowed)
+        if (
+          !item ||
+          (item[1] === 'SCHEMA' ? item[2] !== '-' || !item[3].startsWith(`${schema} `) : item[2] !== schema)
+        ) {
+          throw new Error('backup contains objects outside the application schema allowlist')
+        }
       }
+      return { tmp, dump, manifest }
+    } catch (error) {
+      fs.rmSync(tmp, { recursive: true, force: true })
+      throw error
+    }
+  }
 
-      // 6. the ledger itself rolled back with the DB — re-register the
-      //    pre_restore snapshot (and any other on-disk archives) so the
-      //    user can still see/undo from the panel.
-      try {
-        this._registerOrphanArchives([pre, rec])
-      } catch {}
+  _restoreFiles(tmp) {
+    if (this.projectRoot && fs.existsSync(path.join(tmp, 'vms'))) {
+      const target = path.join(this.projectRoot, 'vms')
+      fs.mkdirSync(target, { recursive: true })
+      for (const name of fs.readdirSync(target)) {
+        if (name.endsWith('.json') && !fs.lstatSync(path.join(target, name)).isDirectory())
+          fs.rmSync(path.join(target, name), { force: true })
+      }
+      for (const name of fs.readdirSync(path.join(tmp, 'vms'))) {
+        fs.copyFileSync(path.join(tmp, 'vms', name), path.join(target, name))
+        fs.chmodSync(path.join(target, name), 0o600)
+      }
+    }
+    if (this.configDir && fs.existsSync(path.join(tmp, 'config'))) {
+      fs.mkdirSync(this.configDir, { recursive: true })
+      for (const name of fs.readdirSync(this.configDir)) {
+        if (name.endsWith('.json') && !fs.lstatSync(path.join(this.configDir, name)).isDirectory())
+          fs.rmSync(path.join(this.configDir, name), { force: true })
+      }
+      for (const name of fs.readdirSync(path.join(tmp, 'config'))) {
+        fs.copyFileSync(path.join(tmp, 'config', name), path.join(this.configDir, name))
+        fs.chmodSync(path.join(this.configDir, name), 0o600)
+      }
+    }
+    invalidateReadCache()
+  }
 
-      // 7. re-bind stores to the fresh connection. A failed rebind leaves the
-      //    process partially attached to the closed database, so it must make
-      //    the restore fail instead of reporting a false success.
-      if (this._rebindStores) this._rebindStores(db)
+  async _applyArchive(archive) {
+    await runPgTool(
+      'pg_restore',
+      [
+        '--clean',
+        '--if-exists',
+        '--single-transaction',
+        '--no-owner',
+        '--no-privileges',
+        `--schema=${getDb().schema}`,
+        '--dbname',
+        decodeURIComponent(new URL(getDb().connectionString).pathname.slice(1)),
+        archive.dump,
+      ],
+      getDb().connectionString,
+    )
+    this._restoreFiles(archive.tmp)
+    await applyMigrations(getDb())
+  }
 
-      return { ok: true, restored: rec.id, pre_restore: pre.id }
+  async restoreBackup(id) {
+    if (this._restoreRunning || this._running)
+      throw Object.assign(new Error('restore already in progress'), { code: 'restore_in_progress' })
+    const pending = this._restoreBackup(id)
+    this._pendingRestore = pending
+    try {
+      return await pending
     } finally {
+      if (this._pendingRestore === pending) this._pendingRestore = null
+    }
+  }
+
+  /** Failure keeps maintenance enabled. The restore endpoint may explicitly retry. */
+  async _restoreBackup(id) {
+    if (this._restoreRunning || this._running)
+      throw Object.assign(new Error('restore already in progress'), { code: 'restore_in_progress' })
+    this._restoreRunning = true
+    let archive
+    let previous
+    let pre
+    let changed = false
+    let maintenanceStarted = false
+    try {
+      const rec = await this._repo().get(id)
+      if (!rec) throw Object.assign(new Error('backup not found'), { code: 'backup_not_found' })
+      if (rec.status !== 'ok') throw Object.assign(new Error('backup is not restorable'), { code: 'backup_not_ok' })
+      if (!rec.file_path || !fs.existsSync(rec.file_path))
+        throw Object.assign(new Error('backup file missing'), { code: 'backup_file_missing' })
+      if (rec.sha256 && (await sha256FileAsync(rec.file_path)) !== rec.sha256)
+        throw Object.assign(new Error('backup archive sha256 mismatch'), { code: 'backup_corrupt' })
+      archive = await this._extractArchive(rec)
+      fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 })
+      fs.writeFileSync(this.maintenanceFile, JSON.stringify({ backup_id: id, started_at: new Date().toISOString() }), {
+        mode: 0o600,
+      })
+      maintenanceStarted = true
+      this.isRestoring = true
+      await this._enterMaintenance('restore')
+      pre = await this.createBackup({ kind: 'pre_restore', note: `before restore of ${id}` })
+      previous = await this._extractArchive(pre)
+      changed = true
+      await getDb().withMaintenance(async () => {
+        await this._applyArchive(archive)
+        await this._registerOrphanArchives([pre, rec])
+        await this._rebindStores?.(getDb())
+      })
+      await this._leaveMaintenance('restore')
+      fs.rmSync(this.maintenanceFile)
       this.isRestoring = false
-      if (tmp) {
-        try {
-          fs.rmSync(tmp, { recursive: true, force: true })
-        } catch {}
+      return { ok: true, restored: id, pre_restore: pre.id }
+    } catch (error) {
+      if (maintenanceStarted) {
+        this.isRestoring = true
+        this.isMaintaining = true
       }
+      if (changed && previous) {
+        try {
+          await getDb().withMaintenance(async () => {
+            await this._applyArchive(previous)
+            await this._registerOrphanArchives([pre])
+            await this._rebindStores?.(getDb())
+          })
+        } catch {
+          throw Object.assign(new Error('restore and rollback failed; maintenance remains enabled'), {
+            code: 'restore_rollback_failed',
+          })
+        }
+      }
+      throw error
+    } finally {
+      this._restoreRunning = false
+      for (const item of [archive, previous]) if (item) fs.rmSync(item.tmp, { recursive: true, force: true })
     }
   }
 
@@ -397,15 +495,13 @@ export class BackupService {
    * record in the (freshly restored) DB. `known` records are inserted
    * verbatim; remaining orphans get kind='imported'.
    */
-  _registerOrphanArchives(known = []) {
+  async _registerOrphanArchives(known = []) {
     const repo = this._repo()
-    const existing = new Set(repo.list({ limit: 500 }).map((r) => r.file_name))
+    const existing = new Set((await repo.list({ limit: 500 })).map((r) => r.file_name))
     for (const rec of known) {
       if (rec?.file_name && !existing.has(rec.file_name) && rec.file_path && fs.existsSync(rec.file_path)) {
-        try {
-          repo.insert(rec)
-          existing.add(rec.file_name)
-        } catch {}
+        await repo.insert(rec)
+        existing.add(rec.file_name)
       }
     }
     if (!fs.existsSync(this.backupDir)) return
@@ -414,7 +510,7 @@ export class BackupService {
       const fp = path.join(this.backupDir, f)
       try {
         const st = fs.statSync(fp)
-        repo.insert({
+        await repo.insert({
           id: 'bak_' + crypto.randomBytes(6).toString('hex'),
           created_at: st.mtime.toISOString(),
           kind: 'imported',
@@ -422,7 +518,7 @@ export class BackupService {
           file_path: fp,
           file_name: f,
           size_bytes: st.size,
-          sha256: sha256File(fp),
+          sha256: await sha256FileAsync(fp),
           db_bytes: null,
           includes: null,
           error: null,
@@ -440,7 +536,7 @@ export class BackupService {
     this.stopScheduler()
     const check = async () => {
       try {
-        if (this.shouldRunScheduled()) {
+        if (await this.shouldRunScheduled()) {
           const rec = await this.createBackup({ kind: 'scheduled' })
           console.log(`[backup] scheduled backup completed (${Math.round((rec.size_bytes || 0) / 1048576)} MiB)`)
         }
@@ -455,10 +551,10 @@ export class BackupService {
     if (typeof this._bootTimer.unref === 'function') this._bootTimer.unref()
   }
 
-  shouldRunScheduled(now = Date.now()) {
-    const cfg = this.getSchedule()
-    if (!cfg.enabled || this._running || this.isRestoring) return false
-    const last = this._repo().lastSuccessful({})
+  async shouldRunScheduled(now = Date.now()) {
+    const cfg = await this.getSchedule()
+    if (!cfg.enabled || this._running || this._restoreRunning || this.isMaintaining) return false
+    const last = await this._repo().lastSuccessful({})
     if (!last) return true
     return now - Date.parse(last.created_at) >= cfg.interval_hours * 3600_000
   }
