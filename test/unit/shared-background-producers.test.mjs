@@ -253,6 +253,45 @@ test('stop prevents an already queued immediate monitor run from sending a new t
   assert.equal(calls, 0)
 })
 
+test('stop cancels a scheduled callback whose durable claim is still being acquired', async (t) => {
+  const f = await fixture(t)
+  const entered = deferred()
+  const finish = deferred()
+  const claim = f.first.tryClaim.bind(f.first)
+  f.first.tryClaim = async (plan) => {
+    const acquired = await claim(plan)
+    entered.resolve()
+    await finish.promise
+    return acquired
+  }
+  let tick
+  t.mock.method(globalThis, 'setInterval', (callback) => {
+    tick = callback
+    return { unref() {} }
+  })
+  t.mock.method(globalThis, 'clearInterval', () => {})
+  let calls = 0
+  const monitor = createCredentialRefreshMonitor({
+    sharedTasks: f.first,
+    listTargets: () => [live],
+    refreshOne: async () => {
+      calls++
+      return { ok: true }
+    },
+  })
+  monitor.start()
+  tick()
+  await entered.promise
+  const stopping = monitor.stop()
+  finish.resolve()
+  await stopping
+  await monitor.flush()
+  assert.equal(calls, 0)
+  const row = await f.other.prepare('SELECT unknown_at, finished_at FROM background_task_runs').get()
+  assert.equal(row.unknown_at, null)
+  assert.ok(row.finished_at)
+})
+
 test('scheduled backups execute once across services without touching business files', async (t) => {
   const f = await fixture(t)
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'synthetic-bg-backup-'))
