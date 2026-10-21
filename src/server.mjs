@@ -1280,6 +1280,19 @@ function noteRequestExecution(req, execution) {
 async function withRequestActivity(req, res, callback, kind = 'http') {
   if (!activityCoordinator || requestActivities.has(req)) return callback()
   const requestId = haMode ? crypto.randomUUID() : null
+  const pathname = parseRequestUrl(req)?.pathname
+  const recoverable =
+    haMode &&
+    req.method === 'POST' &&
+    [
+      '/v1/messages',
+      '/messages',
+      '/v1/chat/completions',
+      '/chat/completions',
+      '/v1/completions',
+      '/completions',
+    ].includes(pathname)
+  const trackHaRequest = haMode && (recoverable || kind === 'websocket_request')
   const gate = await activityCoordinator.admit({ kind, requestId })
   const state = { gate, executions: new Map(), unknown: false }
   requestActivities.set(req, state)
@@ -1294,13 +1307,19 @@ async function withRequestActivity(req, res, callback, kind = 'http') {
   try {
     return await gate.run(async () => {
       try {
-        const value = await withHaRequestContext({ db, requestId, activity: gate }, async () => {
+        const invoke = async () => {
           if (haCatalog) await haCatalog.refresh()
           const result = await callback(state)
           await responseDone
           await flushRuntimeWrites()
           return result
-        })
+        }
+        const value = trackHaRequest
+          ? await withHaRequestContext(
+              { db, requestId, activity: gate, recoveryKind: recoverable ? 'claude_messages' : null },
+              invoke,
+            )
+          : await invoke()
         return value
       } catch (error) {
         state.unknown = true
