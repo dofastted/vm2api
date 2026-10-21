@@ -76,15 +76,25 @@ exit 0
 
 /** A start response does not prove that the cleanup command has exited. */
 export async function runCliNodeGuardCommand(connect, container, cmd, { user, timeoutMs = 15000, pollMs = 100 } = {}) {
-  const created = await dockerJson(
-    connect,
-    {
-      method: 'POST',
-      path: `/containers/${encodeURIComponent(container)}/exec`,
-      body: { Cmd: cmd, AttachStdout: false, AttachStderr: false, ...(user ? { User: user } : {}) },
-    },
-    [201],
-  )
+  let created
+  try {
+    created = await dockerJson(
+      connect,
+      {
+        method: 'POST',
+        path: `/containers/${encodeURIComponent(container)}/exec`,
+        body: { Cmd: cmd, AttachStdout: false, AttachStderr: false, ...(user ? { User: user } : {}) },
+      },
+      [201],
+    )
+  } catch (error) {
+    // The daemon explicitly refused creation; no exec ID was allocated or started.
+    if (error.code === 'docker_api_error' && [404, 409].includes(error.status)) {
+      error.vmOperationNotStarted = true
+      error.taskNotStarted = true
+    }
+    throw error
+  }
   const execId = created.Id
   await dockerJson(
     connect,
