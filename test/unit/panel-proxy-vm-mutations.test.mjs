@@ -10,6 +10,7 @@ import { ProxyPool } from '../../src/lib/vm/proxy-pool.mjs'
 import { SharedVmOperations } from '../../src/lib/vm/shared-vm-operations.mjs'
 import { ExecutionAdmissionsRepo } from '../../src/lib/db/repos/execution-admissions-repo.mjs'
 import { SharedProxyOperations } from '../../src/lib/vm/shared-proxy-operations.mjs'
+import { buildVmPackage } from '../../src/lib/vm/vm-package.mjs'
 
 async function fixture(t) {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'panel-proxy-claims-'))
@@ -218,4 +219,32 @@ test('proxy unbind awaits confirmed helper stop before releasing its VM claim', 
   const next = await f.otherOperations.tryAcquire({ vmId: 'vm-a' })
   assert.equal(next.ok, true)
   await next.release()
+})
+
+test('package update rejects global executions before its first metadata or credential write', async (t) => {
+  const f = await fixture(t)
+  const file = path.join(f.project, 'vms', 'vm-a.json')
+  const before = fs.readFileSync(file, 'utf8')
+  await new ExecutionAdmissionsRepo(f.peer).tryReserve({
+    vmId: 'vm-a',
+    accountId: 'synthetic',
+    vmLimit: 1,
+    accountLimit: 1,
+  })
+  const body = buildVmPackage({ vm: { id: 'vm-a', name: 'must not be written', timezone: 'UTC' } })
+  const h = f.handler(body, { packageImportBringUp: false })
+  await h.request('PUT', '/api/panel/vms/vm-a/package')
+  assert.equal(h.response.status, 409)
+  assert.equal(fs.readFileSync(file, 'utf8'), before)
+})
+
+test('package create rejects a busy physical alias before assigning an identity', async (t) => {
+  const f = await fixture(t)
+  await f.otherOperations.tryAcquire({ vmId: 'vm-new' })
+  const body = buildVmPackage({ vm: { id: 'new', name: 'synthetic', timezone: 'UTC' } })
+  const h = f.handler(body, { packageImportBringUp: false })
+  await h.request('POST', '/api/panel/vms/package')
+  assert.equal(h.response.status, 409)
+  assert.equal(h.response.body.error.code, 'vm_operation_active')
+  assert.equal(fs.existsSync(path.join(f.project, 'vms', 'new.json')), false)
 })
