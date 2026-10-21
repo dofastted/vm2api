@@ -28,17 +28,19 @@ var errGateTicketInvalid = errors.New("ticket_invalid")
 // commands continue with one parsed HTTP/1 request and an HTTP response after
 // OK\n. KSG1 raw splicing is never accepted when fenced mode is enabled.
 type gate2Request struct {
-	Op            string            `json:"op"`
-	VMID          string            `json:"vm_id"`
-	Fence         Fence             `json:"fence"`
-	CommandID     string            `json:"command_id,omitempty"`
-	Kind          string            `json:"kind,omitempty"`
-	Ticket        string            `json:"ticket,omitempty"`
-	AllocationID  string            `json:"allocation_id,omitempty"`
-	OperationID   string            `json:"operation_id,omitempty"`
-	OwnerID       string            `json:"owner_id,omitempty"`
-	Management    *ManagementIntent `json:"management,omitempty"`
-	ContentLength int               `json:"content_length,omitempty"`
+	Op               string            `json:"op"`
+	VMID             string            `json:"vm_id"`
+	Fence            Fence             `json:"fence"`
+	CommandID        string            `json:"command_id,omitempty"`
+	Kind             string            `json:"kind,omitempty"`
+	Ticket           string            `json:"ticket,omitempty"`
+	AllocationID     string            `json:"allocation_id,omitempty"`
+	OperationID      string            `json:"operation_id,omitempty"`
+	OwnerID          string            `json:"owner_id,omitempty"`
+	Management       *ManagementIntent `json:"management,omitempty"`
+	ContentLength    int               `json:"content_length,omitempty"`
+	ManifestRevision string            `json:"manifest_revision,omitempty"`
+	ManifestDigest   string            `json:"manifest_digest,omitempty"`
 }
 
 type gate2State struct {
@@ -112,6 +114,10 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 		io.WriteString(conn, "ERR bad_request\n")
 		return
 	}
+	if request.Op != "health" && (request.ManifestRevision != "" || request.ManifestDigest != "") {
+		io.WriteString(conn, "ERR bad_request\n")
+		return
+	}
 	if request.Op == "forward" {
 		s.forwardFenced(ctx, conn, reader, request)
 		return
@@ -122,6 +128,15 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 	reply := map[string]any{"ok": false}
 	var state AuthorityState
 	switch request.Op {
+	case "health":
+		var health map[string]any
+		health, err = s.readHealth(ctx, request)
+		if err == nil {
+			reply["health"] = health
+			reply["fence"] = request.Fence
+			reply["manifest_revision"] = request.ManifestRevision
+			reply["manifest_digest"] = request.ManifestDigest
+		}
 	case "allocate":
 		if s.allocator == nil || request.Fence != (Fence{}) || request.CommandID != "" || request.Kind != "" || request.Ticket != "" {
 			err = ErrManagementDenied
@@ -218,7 +233,7 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 		reply["error"] = gate2Code(err)
 	} else {
 		reply["ok"] = true
-		if request.Op != "prepare" && request.Op != "command" && request.Op != "allocate" && request.Op != "publish-initial" && request.Op != "launch" {
+		if request.Op != "prepare" && request.Op != "command" && request.Op != "allocate" && request.Op != "publish-initial" && request.Op != "launch" && request.Op != "health" {
 			reply["state"] = publicGateState(state)
 		}
 	}

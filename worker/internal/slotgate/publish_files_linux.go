@@ -342,3 +342,22 @@ func readPublishedInitial(root, vm string, fence Fence, policy DockerLaunchPolic
 	defer base.Close()
 	return checkInitialTree(base, policy, manifest, credentials)
 }
+
+func readPublishedCredential(root, vm string, fence Fence, policy DockerLaunchPolicy) ([]byte, error) {
+	parent, err := incarnationParent(root, vm, false)
+	if err != nil {
+		return nil, err
+	}
+	defer parent.Close()
+	base, err := openDirectoryAt(parent, fence.Incarnation, false, os.Geteuid())
+	if err != nil {
+		return nil, err
+	}
+	defer base.Close()
+	dir, err := openDirectoryAt(base, "claude", false, policy.UID)
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	return readInitialFile(dir, "credentials.json", policy.UID, initialPublishMax)
+}

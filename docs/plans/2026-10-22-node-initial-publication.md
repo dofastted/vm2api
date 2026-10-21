@@ -25,7 +25,9 @@ publish 固定 `0→1`、`payload_digest=SHA256(payload bytes)`、空 `manifest_
 
 ## 固定内容和私有文件
 
-payload 只接受 `{credential:{type,access_token?,refresh_token?,api_key?,expires_at?,scopes?}}`。type 为 `oauth`、`setup-token`、`official-setup-token`、`apikey`。未知字段、重复字段、额外 JSON、文件名、路径、mode、UID、URL、env、argv 和原始 settings/config 均拒绝。单 token 上限 16 KiB；scopes 最多 32 项，每项 128 字符。setup-token 不接受 refresh token；API key 不与 OAuth 字段混用。
+payload 只接受 `{credential:{type,account_uuid,org_uuid?,email?,access_token?,refresh_token?,api_key?,expires_at?,scopes?}}`。type 为 `oauth`、`setup-token`、`official-setup-token`、`apikey`。account_uuid 必选，org_uuid/email 为受限公开字符串。未知字段、重复字段、额外 JSON、文件名、路径、mode、UID、URL、env、argv 和原始 settings/config 均拒绝。单 token 上限 16 KiB；scopes 最多 32 项，每项 128 字符。setup-token 不接受 refresh token；API key 不与 OAuth 字段混用。
+
+身份元数据来自可信 initial grant 批准的完整 payload，参与 payload/manifest digest，并写入节点私有 manifest。OAuth 按现有 `credential.Store` schema 写 `claudeAiOauth.accountUuid/orgUuid/email`；API key 按该 store 的 document fallback 保存同名元数据。没有唯一账号身份的旧发布输入被拒绝，不能从 Pod 后续 health 参数补充或猜测账号。
 
 节点生成固定 kernel config、256-bit 随机 internal token 和固定 `.credentials.json → credentials.json` link。内部 token 不返回 controller。批准的 image ID、network ID、UID/GID 来自 node-owned DockerLaunchPolicy；RPC 不能改变这些值。
 
@@ -49,6 +51,6 @@ managed forward 只允许 kernel `POST /internal/v1/messages`，无 query，body
 
 失败规格 `9c6fad09` 先复现未记录目录可以 launch，以及缺独立 publish 授权入口。后续专用测试覆盖完成 receipt、重放、错误 Fence/revision/大小/摘要、截断上传、PG authorizer hook 拒绝、rename 前 revoke、symbolic/hard link、目录冲突、journal fault/restart、不同 VM 并行、manifest-bound launch、node token 覆盖和管理 HTTP 拒绝。
 
-这些测试不代替配套 PG service 与 Go reader 的双连接组合验证，也不代替现成 payload 的实际启动与推理验收。未提供 health/credential-summary RPC、运行期 credential refresh/config 热更新、新 generation 再发布、native Mac/KVM/Codex executor 或自动未知状态恢复。
+这些测试不代替配套 PG service 与 Go reader 的双连接组合验证，也不代替现成 payload 的实际启动与推理验收。后续只读 health 见同目录 `2026-10-22-node-health.md`。未提供运行期 credential refresh/config 热更新、新 generation 再发布、native Mac/KVM/Codex executor 或自动未知状态恢复。
 
 runtime 的旧 SSH/SFTP/Docker 权限及已建立会话尚未撤销。节点服务、批准 image/network、受限 PG role 和文件权限仍需另行授权的可信初始化。因此本批不能作为生产开启多副本 HA 的条件。

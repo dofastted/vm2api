@@ -18,6 +18,9 @@ type initialCredential struct {
 	APIKey       string   `json:"api_key,omitempty"`
 	ExpiresAt    int64    `json:"expires_at,omitempty"`
 	Scopes       []string `json:"scopes,omitempty"`
+	AccountUUID  string   `json:"account_uuid"`
+	OrgUUID      string   `json:"org_uuid,omitempty"`
+	Email        string   `json:"email,omitempty"`
 }
 type initialPayload struct {
 	Credential initialCredential `json:"credential"`
@@ -31,6 +34,9 @@ func initialCredentialBytes(data []byte) ([]byte, error) {
 		return nil, ErrInvalidAuthority
 	}
 	c := payload.Credential
+	if !validCredentialIdentity(credentialIdentity{c.AccountUUID, c.OrgUUID, c.Email}) {
+		return nil, ErrInvalidAuthority
+	}
 	if len(c.AccessToken) > 16<<10 || len(c.RefreshToken) > 16<<10 || len(c.APIKey) > 16<<10 || c.ExpiresAt < 0 || len(c.Scopes) > 32 {
 		return nil, ErrInvalidAuthority
 	}
@@ -68,6 +74,17 @@ func initialCredentialBytes(data []byte) ([]byte, error) {
 		document = map[string]any{"type": c.Type, "authScheme": "authorization_bearer", "kinGeneration": 1, "claudeAiOauth": oauth}
 	default:
 		return nil, ErrInvalidAuthority
+	}
+	identity := document
+	if c.Type != "apikey" {
+		identity = document["claudeAiOauth"].(map[string]any)
+	}
+	identity["accountUuid"] = c.AccountUUID
+	if c.OrgUUID != "" {
+		identity["orgUuid"] = c.OrgUUID
+	}
+	if c.Email != "" {
+		identity["email"] = c.Email
 	}
 	return json.Marshal(document)
 }
@@ -201,6 +218,11 @@ func (p *initialPublisher) Publish(ctx context.Context, intent ManagementIntent,
 		return PublicationReceipt{}, err
 	}
 	manifest := initialManifest{Receipt: PublicationReceipt{Intent: intent, IntentDigest: intent.digest(), ManifestRevision: "1"}, KernelDigest: hashBytes(kernel), TokenDigest: hashText(token + "\n"), CredentialDigest: hashBytes(credential)}
+	var payload initialPayload
+	if err = json.Unmarshal(data, &payload); err != nil {
+		return PublicationReceipt{}, ErrInvalidAuthority
+	}
+	manifest.Identity = credentialIdentity{payload.Credential.AccountUUID, payload.Credential.OrgUUID, payload.Credential.Email}
 	manifest.Receipt.ManifestDigest = manifest.digest()
 	tree, err := stageInitialFiles(p.root, intent, p.policy, kernel, []byte(token+"\n"), credential, p.fault)
 	if err != nil {
@@ -280,7 +302,7 @@ func validateInitialManifest(vm string, state AuthorityState) error {
 		return nil
 	}
 	i := m.Receipt.Intent
-	if state.Allocation == nil || !validManagementIntent(i) || i.Action != "publish-initial" || i.VMID != vm || i.AllocationID != state.Allocation.AllocationID || i.NodeID != state.Allocation.NodeID || i.Fence != state.Allocation.Fence ||
+	if state.Allocation == nil || !validCredentialIdentity(m.Identity) || !validManagementIntent(i) || i.Action != "publish-initial" || i.VMID != vm || i.AllocationID != state.Allocation.AllocationID || i.NodeID != state.Allocation.NodeID || i.Fence != state.Allocation.Fence ||
 		m.Receipt.IntentDigest != i.digest() || m.Receipt.ManifestRevision != "1" || !validDigest(m.KernelDigest) || !validDigest(m.TokenDigest) || !validDigest(m.CredentialDigest) || m.Receipt.ManifestDigest != m.digest() {
 		return ErrInvalidAuthority
 	}

@@ -95,9 +95,20 @@ type initialManifest struct {
 	KernelDigest     string             `json:"kernel_digest"`
 	TokenDigest      string             `json:"token_digest"`
 	CredentialDigest string             `json:"credential_digest"`
+	Identity         credentialIdentity `json:"identity"`
+}
+
+type credentialIdentity struct {
+	AccountUUID string `json:"account_uuid"`
+	OrgUUID     string `json:"org_uuid,omitempty"`
+	Email       string `json:"email,omitempty"`
+}
+
+func validCredentialIdentity(identity credentialIdentity) bool {
+	return vmIDRe.MatchString(identity.AccountUUID) && (identity.OrgUUID == "" || vmIDRe.MatchString(identity.OrgUUID)) && publicHealthString(identity.Email)
 }
 
 func (m initialManifest) digest() string {
 	return hashText(strings.Join([]string{"slotgate-manifest-v1", m.Receipt.Intent.digest(), "1",
-		m.KernelDigest, m.TokenDigest, m.CredentialDigest}, "\x00"))
+		m.KernelDigest, m.TokenDigest, m.CredentialDigest, m.Identity.AccountUUID, m.Identity.OrgUUID, m.Identity.Email}, "\x00"))
 }

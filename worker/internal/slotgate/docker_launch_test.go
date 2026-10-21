@@ -146,7 +146,7 @@ func launchFixtureConfigured(t *testing.T, published bool, network string) (*Aut
 			}
 		}
 	} else {
-		payload := []byte(`{"credential":{"type":"oauth","access_token":"synthetic-access","refresh_token":"synthetic-refresh"}}`)
+		payload := []byte(`{"credential":{"type":"oauth","account_uuid":"synthetic-account","access_token":"synthetic-access","refresh_token":"synthetic-refresh"}}`)
 		intent := publicationIntentForTest(allocation, policy, payload)
 		publisher := initialPublisher{authority: a, root: root, nodeID: allocation.NodeID, policy: policy, authorize: allowNodeCommandForTest}
 		if _, err = publisher.Publish(context.Background(), intent, len(payload), strings.NewReader(string(payload))); err != nil {

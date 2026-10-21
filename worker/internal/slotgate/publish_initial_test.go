@@ -55,7 +55,7 @@ func publishingFixture(t *testing.T) *publicationFixture {
 	if err := os.RemoveAll(filepath.Join(root, "vms", "v", "incarnations", state.Fence.Incarnation)); err != nil {
 		t.Fatal(err)
 	}
-	payload := []byte(`{"credential":{"type":"oauth","access_token":"synthetic-access","refresh_token":"synthetic-refresh","scopes":["user:inference"]}}`)
+	payload := []byte(`{"credential":{"type":"oauth","account_uuid":"synthetic-account","access_token":"synthetic-access","refresh_token":"synthetic-refresh","scopes":["user:inference"]}}`)
 	intent := publicationIntentForTest(*state.Allocation, l.policy, payload)
 	return &publicationFixture{a: a, p: &initialPublisher{authority: a, root: root, nodeID: intent.NodeID, policy: l.policy, authorize: allowNodeCommandForTest}, l: l, engine: engine, state: state, root: root, intent: intent, payload: payload}
 }
@@ -271,10 +271,10 @@ func TestInitialPublishRejectsSymlinksHardlinksUnexpectedFilesAndChangedBytes(t 
 
 func TestInitialPublishRejectsArbitraryConfigAndMalformedCredentialPayload(t *testing.T) {
 	for _, payload := range []string{
-		`{"credential":{"type":"oauth","access_token":"synthetic"},"path":"../../authority.json"}`,
-		`{"credential":{"type":"oauth","access_token":"synthetic","base_url":"http://unapproved"}}`,
-		`{"credential":{"type":"oauth","access_token":"synthetic","access_token":"changed"}}`,
-		`{"credential":{"type":"oauth","access_token":"synthetic"}} {}`,
+		`{"credential":{"type":"oauth","account_uuid":"synthetic-account","access_token":"synthetic"},"path":"../../authority.json"}`,
+		`{"credential":{"type":"oauth","account_uuid":"synthetic-account","access_token":"synthetic","base_url":"http://unapproved"}}`,
+		`{"credential":{"type":"oauth","account_uuid":"synthetic-account","access_token":"synthetic","access_token":"changed"}}`,
+		`{"credential":{"type":"oauth","account_uuid":"synthetic-account","access_token":"synthetic"}} {}`,
 		`{"credential":{"type":"arbitrary","access_token":"synthetic"}}`,
 		`{"credential":{"type":"official-setup-token","access_token":"synthetic","refresh_token":"unexpected"}}`,
 	} {

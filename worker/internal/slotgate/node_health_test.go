@@ -192,3 +192,89 @@ func TestNodeHealthRejectsStaleManifestAndCredentialIdentityChange(t *testing.T)
 		})
 	}
 }
+
+func TestNodeHealthRejectsIncompleteInvalidAndContradictoryKernelResponses(t *testing.T) {
+	for _, kind := range []string{"truncated", "duplicate", "trailing", "counter", "credential-identity", "identity", "trailer", "status"} {
+		t.Run(kind, func(t *testing.T) {
+			f, addr, _, state := activeHealthGate(t)
+			unixHTTP(t, filepath.Join(f.private(), "run", "kernel.sock"), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch kind {
+				case "truncated":
+					w.Header().Set("Content-Length", "1000")
+					fmt.Fprint(w, `{"ok":true}`)
+				case "duplicate":
+					fmt.Fprint(w, `{"ok":true,"ok":false}`)
+				case "trailing":
+					fmt.Fprint(w, `{"ok":true} {"error":"synthetic"}`)
+				case "counter":
+					fmt.Fprint(w, `{"ok":true,"ready_slots":-1}`)
+				case "credential-identity":
+					fmt.Fprint(w, `{"ok":true,"credential":{"account_uuid":"different-account"}}`)
+				case "identity":
+					fmt.Fprint(w, `{"ok":true,"identity":{"account_uuid":"different-account"}}`)
+				case "trailer":
+					w.Header().Set("Trailer", "X-Internal-Error")
+					fmt.Fprint(w, `{"ok":true}`)
+					w.Header().Set("X-Internal-Error", "synthetic")
+				case "status":
+					w.WriteHeader(502)
+					fmt.Fprint(w, `{"ok":true}`)
+				}
+			}))
+			if reply := readNodeHealth(t, addr, capturedHealthRequest(state)); reply.OK || reply.Health != nil {
+				t.Fatalf("invalid response escaped as health proof: %+v", reply)
+			}
+		})
+	}
+}
+
+func TestNodeHealthCredentialRotationInvalidatesReadAndTokenTamperNeverSends(t *testing.T) {
+	for _, kind := range []string{"rotation", "token"} {
+		t.Run(kind, func(t *testing.T) {
+			f, addr, _, state := activeHealthGate(t)
+			var calls atomic.Int64
+			unixHTTP(t, filepath.Join(f.private(), "run", "kernel.sock"), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if kind == "rotation" {
+					file := filepath.Join(f.private(), "claude", "credentials.json")
+					if err := os.Chmod(file, 0o600); err != nil {
+						t.Error(err)
+					}
+					if err := os.WriteFile(file, []byte(`{"type":"oauth","claudeAiOauth":{"accessToken":"synthetic-rotated","accountUuid":"synthetic-account","kinGeneration":2}}`), 0o600); err != nil {
+						t.Error(err)
+					}
+				}
+				w.Header().Set("Content-Type", "application/json")
+				fmt.Fprint(w, `{"ok":true}`)
+			}))
+			if kind == "token" {
+				if err := os.WriteFile(filepath.Join(f.private(), "config", "internal.token"), []byte(strings.Repeat("d", 64)+"\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if reply := readNodeHealth(t, addr, capturedHealthRequest(state)); reply.OK {
+				t.Fatal("credential/token change accepted")
+			}
+			if kind == "token" && calls.Load() != 0 {
+				t.Fatal("tampered token reached kernel")
+			}
+		})
+	}
+}
+
+func TestNodeHealthCredentialSummaryUsesExistingSchemaAndExactGeneration(t *testing.T) {
+	data := []byte(`{"type":"oauth","claudeAiOauth":{"accessToken":"synthetic","refreshToken":"synthetic-refresh","accountUuid":"synthetic-account","orgUuid":"synthetic-org","email":"synthetic@example.test","kinGeneration":9007199254740993,"expiresAt":1700000000}}`)
+	summary, identity, err := nodeCredentialSummary(data, credentialIdentity{AccountUUID: "synthetic-account"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary["generation"] != "9007199254740993" || summary["expires_at"] != "1700000000000" || identity["account_uuid"] != "synthetic-account" || identity["org_uuid"] != "synthetic-org" || identity["email"] != "synthetic@example.test" {
+		t.Fatalf("credential summary changed stored semantics: %+v %+v", summary, identity)
+	}
+	for _, invalid := range []string{`{"type":"oauth","claudeAiOauth":{"accessToken":"synthetic"}}`, `{"type":"oauth","claudeAiOauth":{"accessToken":"synthetic","accountUuid":"synthetic-account","kinGeneration":true}}`, `{"type":"oauth","claudeAiOauth":{"accessToken":"synthetic","accountUuid":"synthetic-account","expiresAt":9223372036854775808}}`} {
+		if _, _, err = nodeCredentialSummary([]byte(invalid), credentialIdentity{AccountUUID: "synthetic-account"}); err == nil {
+			t.Fatal("invalid credential summary accepted")
+		}
+	}
+}

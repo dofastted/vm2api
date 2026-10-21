@@ -14,3 +14,7 @@ func (*initialFileTree) Close() {}
 func readPublishedInitial(string, string, Fence, DockerLaunchPolicy, initialManifest, bool) (string, error) {
 	return "", errPublishUnsupported
 }
+
+func readPublishedCredential(string, string, Fence, DockerLaunchPolicy) ([]byte, error) {
+	return nil, errPublishUnsupported
+}
