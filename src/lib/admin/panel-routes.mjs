@@ -85,6 +85,7 @@ import {
   resetGptModelPolicy,
 } from '../protocol/gpt-model-policy.mjs'
 import { refreshCodexAccessToken } from '../protocol/codex-models.mjs'
+import { refreshSharedCodexCredential } from '../oauth/shared-codex-refresh.mjs'
 import {
   defaultSeedPolicy,
   isTelemetryEnabled,
@@ -5257,62 +5258,99 @@ export function createPanelHandler(ctx) {
 
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/oauth\/refresh$/.test(p)) {
         const id = p.split('/')[4]
-        const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
-        if (!fs.existsSync(vmPath)) {
-          return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'VM not found' } })
-        }
-        const vm = getVm(cfg.paths.project, id)
-        if (isCodexVm(vm)) {
-          const first = readCodexAccounts(cfg.paths.project, id)[0] || {}
-          const refreshToken = String(first.refresh_token || '').trim()
-          if (!refreshToken) {
+        return mutateVms([id], async (handles) => {
+          const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
+          if (!fs.existsSync(vmPath)) {
+            return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'VM not found' } })
+          }
+          const vm = getVm(cfg.paths.project, id)
+          if (isCodexVm(vm)) {
+            const first = readCodexAccounts(cfg.paths.project, id)[0] || {}
+            const refreshToken = String(first.refresh_token || '').trim()
+            if (!refreshToken) {
+              return json(res, 400, {
+                ok: false,
+                error: { code: 'credential_mode_unsupported', message: 'GPT 槽没有 refresh_token，请重新导入 OAuth' },
+              })
+            }
+            if (isKubernetesMode()) {
+              if (!first.chatgpt_account_id || readCodexAccounts(cfg.paths.project, id).length !== 1)
+                return json(res, 400, {
+                  ok: false,
+                  error: { code: 'codex_credential_unavailable', message: 'GPT 槽需要完整的单账号 OAuth 凭证' },
+                })
+              const refreshed = await refreshSharedCodexCredential({
+                projectRoot: cfg.paths.project,
+                vm,
+                refresh: ctx.vmMutationOps?.refreshCodexAccessToken || refreshCodexAccessToken,
+                proxyUrl: hostProxyUrlForVm(vm),
+              })
+              if (refreshed.finished !== true || refreshed.unknown) {
+                await handles.get(id)?.markUncertain()
+                return json(res, 502, {
+                  ok: false,
+                  error: { code: 'credential_refresh_unknown', message: 'GPT OAuth 刷新结果未知，暂不能再次刷新' },
+                })
+              }
+              if (refreshed.value?.ok !== true)
+                return json(res, 502, {
+                  ok: false,
+                  error: {
+                    code: refreshed.value?.error || 'refresh_failed',
+                    message: 'GPT OAuth 刷新失败，请重新导入',
+                  },
+                })
+              return json(
+                res,
+                200,
+                panel.ok({ ok: true, refreshed: true, platform: 'openai', shared: refreshed.shared }),
+              )
+            }
+            const tok = await refreshCodexAccessToken({
+              refreshToken,
+              proxyUrl: hostProxyUrlForVm(vm),
+            })
+            if (!tok.ok) {
+              return json(res, 502, {
+                ok: false,
+                error: { code: tok.error || 'refresh_failed', message: 'GPT OAuth 刷新失败，请重新导入' },
+              })
+            }
+            upsertCodexAccount(cfg.paths.project, id, {
+              access_token: tok.access_token,
+              refresh_token: tok.refresh_token,
+              id_token: tok.id_token || first.id_token,
+              expires_at: tok.expires_at || first.expires_at,
+            })
+            return json(res, 200, panel.ok({ ok: true, refreshed: true, platform: 'openai' }))
+          }
+          if (isApiKeyMode(vm?.claude?.mode)) {
             return json(res, 400, {
               ok: false,
-              error: { code: 'credential_mode_unsupported', message: 'GPT 槽没有 refresh_token，请重新导入 OAuth' },
+              error: { code: 'credential_mode_unsupported', message: 'Console API Key 不能刷新' },
             })
           }
-          const tok = await refreshCodexAccessToken({
-            refreshToken,
-            proxyUrl: hostProxyUrlForVm(vm),
-          })
-          if (!tok.ok) {
-            return json(res, 502, {
+          if (
+            isOfficialSetupTokenMode(vm?.claude?.mode) ||
+            (isSetupTokenMode(vm?.claude?.mode) && !vm?.claude?.has_refresh)
+          ) {
+            return json(res, 400, {
               ok: false,
-              error: { code: tok.error || 'refresh_failed', message: 'GPT OAuth 刷新失败，请重新导入' },
+              error: { code: 'credential_mode_unsupported', message: '官方 Setup Token（无 refresh）不能刷新' },
             })
           }
-          upsertCodexAccount(cfg.paths.project, id, {
-            access_token: tok.access_token,
-            refresh_token: tok.refresh_token,
-            id_token: tok.id_token || first.id_token,
-            expires_at: tok.expires_at || first.expires_at,
+          const data = await refreshWorkerCredentialForVm({
+            vmId: id,
+            vmPath,
+            homeDir: path.join(cfg.paths.project, 'vms', id, 'cli-home'),
+            vm,
+            force: true,
           })
-          return json(res, 200, panel.ok({ ok: true, refreshed: true, platform: 'openai' }))
-        }
-        if (isApiKeyMode(vm?.claude?.mode)) {
-          return json(res, 400, {
-            ok: false,
-            error: { code: 'credential_mode_unsupported', message: 'Console API Key 不能刷新' },
-          })
-        }
-        if (
-          isOfficialSetupTokenMode(vm?.claude?.mode) ||
-          (isSetupTokenMode(vm?.claude?.mode) && !vm?.claude?.has_refresh)
-        ) {
-          return json(res, 400, {
-            ok: false,
-            error: { code: 'credential_mode_unsupported', message: '官方 Setup Token（无 refresh）不能刷新' },
-          })
-        }
-        const data = await refreshWorkerCredentialForVm({
-          vmId: id,
-          vmPath,
-          homeDir: path.join(cfg.paths.project, 'vms', id, 'cli-home'),
-          vm,
-          force: true,
+          if (data.credentialRefreshUnknown || data.vmOperationUncertain || data.attemptFinished === false)
+            await handles.get(id)?.markUncertain()
+          if (!data.ok) return json(res, 502, { ok: false, error: data.error, data })
+          return json(res, 200, panel.ok(data))
         })
-        if (!data.ok) return json(res, 502, { ok: false, error: data.error, data })
-        return json(res, 200, panel.ok(data))
       }
       if (req.method === 'GET' && p === '/api/panel/oauth') {
         return json(res, 200, panel.ok(await oauthStatusWithWorker()))
@@ -6391,14 +6429,20 @@ export function createPanelHandler(ctx) {
       if (!id || !fs.existsSync(vmPath)) {
         return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'VM not found' } })
       }
-      const data = await refreshWorkerCredentialForVm({
-        vmId: id,
-        vmPath,
-        homeDir: path.join(cfg.paths.project, 'vms', id, 'cli-home'),
-        vm: getVm(cfg.paths.project, id),
-        force: true,
+      return mutateVms([id], async (handles) => {
+        const vm = getVm(cfg.paths.project, id)
+        if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'VM not found' } })
+        const data = await refreshWorkerCredentialForVm({
+          vmId: id,
+          vmPath,
+          homeDir: path.join(cfg.paths.project, 'vms', id, 'cli-home'),
+          vm,
+          force: true,
+        })
+        if (data.credentialRefreshUnknown || data.vmOperationUncertain || data.attemptFinished === false)
+          await handles.get(id)?.markUncertain()
+        return json(res, data.ok ? 200 : 502, data)
       })
-      return json(res, data.ok ? 200 : 502, data)
     }
 
     // Claude CLI inference/update was removed; workers are built and deployed separately.
