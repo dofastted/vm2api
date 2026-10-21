@@ -43,7 +43,13 @@ KSG2 增加 `launch` 操作。客户端只提供 `vm_id`、创建操作时捕获
 
 正常终态仅在 `CompleteCommand` 持久成功后成为 node 的 `completed`。新增只读 `command` RPC，要求原 captured fence、command ID、目标 kind 与 ticket，并只向已认证 token 返回状态，不暴露内部 nonce。客户端不能提交完成状态。
 
-已转发的 HTTP body 不等于持久确认。未来 KSG2 客户端必须在释放 PG job 前取得 node 的持久 `completed`。若 node 写盘失败，状态查询会失败，不能据 HTTP 成功释放。此客户端与 PG 绑定尚未接线。
+已转发的 HTTP body 不等于持久确认。`SlotgateClient` 在完整读取响应后使用原 captured fence、command ID 与 ticket 查询 node 的持久状态。只有 `completed` 且 `dispatched=true` 才能确认执行结束。node 写盘失败、状态不可用、身份不符或 unknown 都会保留 PG job；pending 只允许短时重读原状态，不会重发执行。
+
+该客户端仅在可信调用方显式注入 `exec.slotgate` 时使用。配置必须包含 `trusted=true`、`pgBindingReady=true`、node/VM ID、immutable Docker fence 以及固定证书与 token 的 TLS link。构造时按值捕获并冻结 fence。generation 在控制面与 PG 使用无损十进制字符串，在 KSG2 wire 使用 uint64 数值。未知或多余身份字段拒绝。
+
+发送前的 `onExecutionStart` 必须先持久 `execution_jobs.node_binding`，并返回相同 request ID 和 node binding 的确认。绑定失败或确认不符时不会调用 node prepare/forward。每次 forward 的 command ID 与 kernel envelope 的 request ID 相同。完整响应后取得的原 node `completed` 保存到 `node_completion`；PG 不接受本地 EOF 或其他 generation 的完成声明。PG 完成记录失败仍保留 pending，不会重试执行。
+
+生产 capability 来源和节点权限迁移尚未接入，现有部署没有自动启用该路径。显式 fenced executor 拒绝旧 UDS/SSH 辅助入口；health、凭据管理、初始 allocate 与文件发布尚需 typed adapter。controller 在 prepare/forward 之后崩溃仍会保留未知作业，本批没有提供自动恢复或自动删除 prepared command。
 
 ## 容器与文件权限
 
@@ -67,7 +73,7 @@ Authority journal、其父目录、节点 agent 的可执行文件与配置，�
 
 - 把容器生命周期和文件写权限迁移到节点服务。runtime Pod 不得继续持有 root/docker-group SSH、raw Docker socket、可写 SFTP 或替换 gate 的权限。bootstrap 凭据须与 runtime 分离。
 - 迁移时撤销旧授权，并关闭已经建立的 SSH、SFTP、终端和 forwarding 会话。只修改新连接的认证方式不能阻止旧 owner 的延迟命令。
-- 将 KSG2、captured generation、PG admission/job/VM operation 和文件发布接入生产调用链。fenced 节点不得回退到 KSG1 或原始 SSH 路径。
+- 将已具备的 KSG2 客户端与 PG job 绑定接到可信 capability、captured VM operation 和文件发布生产调用链。fenced 节点不得回退到 KSG1 或原始 SSH 路径。
 - 提供节点可信 allocate、文件发布、未知 launch 的有证据恢复，以及尚未覆盖的响应终态处理。恢复只能关闭同一 immutable executor/incarnation 映射的作业；不能靠 TTL、ready_slots 或 cancel ACK 释放。
 - 单独处理 KVM、原生 macOS 和 Codex 进程归属。现有 Codex Docker 容器仅持有身份和终端，停止它不能证明控制面 detached Codex 子进程已经终止。
 - 在两个不同节点上的控制面验证同时执行、旧命令迟到、节点服务崩溃、Engine 故障及安全接管。本批合成测试不能代替该验收。

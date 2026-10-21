@@ -195,14 +195,31 @@ export class ExecutionAdmissionsRepo {
   async bindExecution(handle, execution) {
     const nodeBinding = execution?.nodeBinding === undefined ? null : normalizeNodeBinding(execution.nodeBinding)
     return withTransaction(this.db, async () => {
+      const before = await this.db
+        .prepare('SELECT account_id, vm_id FROM execution_admissions WHERE id = $1 AND owner_id = $2')
+        .get(handle.admissionId, handle.ownerId)
+      if (!before) throw jobError('execution_admission_inactive')
+      // Refresh may hold this exact admission after its previous job ended.
+      // Serialize with that operation before taking the admission row lock.
+      await this.lockResources({ accountId: before.account_id, vmIds: [before.vm_id] })
       const admission = await this._lockAdmission(handle)
-      if (!admission || admission.released_at || admission.uncertain_at) {
+      if (
+        !admission ||
+        admission.released_at ||
+        admission.uncertain_at ||
+        admission.account_id !== before.account_id ||
+        admission.vm_id !== before.vm_id
+      ) {
         throw jobError('execution_admission_inactive')
       }
       if (typeof execution?.requestId !== 'string' || !execution.requestId.trim()) {
         throw jobError('invalid_execution_job')
       }
       if (nodeBinding && nodeBinding.vmId !== admission.vm_id) throw jobError('execution_node_binding_mismatch')
+      const operation = await this.db
+        .prepare('SELECT id FROM vm_operations WHERE vm_id = ANY($1::text[]) AND released_at IS NULL LIMIT 1')
+        .get(physicalVmAliases(admission.vm_id))
+      if (operation) throw jobError('vm_operation_active')
       const pending = await this.db
         .prepare('SELECT request_id FROM execution_jobs WHERE admission_id = $1 AND ended_at IS NULL LIMIT 1')
         .get(handle.admissionId)
