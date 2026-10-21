@@ -794,6 +794,49 @@ function publicCredentialRefreshResult(vmId, result, { force = false } = {}) {
 }
 
 async function refreshWorkerCredentialForVm({ vmId, vmPath, homeDir, vm, force = false }) {
+  if (haMode) {
+    let captured
+    let current
+    try {
+      await haCatalog.refresh()
+      current = haCatalog.get(vmId)
+      if (!current?.node_id || !current?.claude?.account_uuid)
+        throw Object.assign(new Error('HA credential metadata unavailable'), { code: 'node_capability_unavailable' })
+      captured = await captureNodeExecution({
+        db,
+        trustedNodes,
+        vmId,
+        accountId: current.claude.account_uuid,
+        nodeId: current.node_id,
+      })
+    } catch (error) {
+      error.credentialRefreshNotStarted = true
+      error.vmOperationNotStarted = true
+      error.taskNotStarted = true
+      throw error
+    }
+    const result = await ensureWorkerCredential(
+      { ...captured, vm: current, nodeIdentity: captured.workerStatus },
+      { force: !!force, db },
+    )
+    const published = publicCredentialRefreshResult(vmId, result, { force })
+    return {
+      ...published,
+      refresh_owner: 'go-node-worker',
+      credential: {
+        ...published.credential,
+        account_uuid: captured.accountId,
+        ...(result.credential?.org_uuid ? { org_uuid: result.credential.org_uuid } : {}),
+        ...(result.credential?.email ? { email: result.credential.email } : {}),
+      },
+      taskTerminal: result.credentialRefreshUnknown !== true && (result.attemptFinished === true || result.ok === true),
+      ...(result.credentialRefreshUnknown === true ? { credentialRefreshUnknown: true } : {}),
+      ...(result.credentialRefreshNotStarted === true
+        ? { credentialRefreshNotStarted: true, taskNotStarted: true }
+        : {}),
+    }
+  }
+
   // Host RefreshIfNeeded is the credential writer. Slot workers only read AT.
   const result = await ensureWorkerCredential(
     { vmId, vm, homeDir },

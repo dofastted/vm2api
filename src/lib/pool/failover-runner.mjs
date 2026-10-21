@@ -517,8 +517,9 @@ export class FailoverRunner {
   async recoverCredential(selected, policy, { executionEnded = false } = {}) {
     if (policy?.reason !== 'oauth_refresh_required') return policy
     const exec = selected?.exec
-    if (!exec?.homeDir) return permanentOAuthRevoke(policy)
-    const before = readWorkerCredentialFile(exec.homeDir)
+    const nodeOwned = exec?.slotgate != null
+    if (!nodeOwned && !exec?.homeDir) return permanentOAuthRevoke(policy)
+    const before = nodeOwned ? null : readWorkerCredentialFile(exec.homeDir)
     const beforeRefresh = String(before?.refresh_token || '')
     let refreshed
     try {
@@ -540,14 +541,31 @@ export class FailoverRunner {
       }
       refreshed = { ok: false, error: { message: String(error?.message || error) } }
     }
-    if (selected.bindExecution && refreshed?.credentialRefreshUnknown) {
+    if (
+      nodeOwned &&
+      selected.bindExecution &&
+      executionEnded === true &&
+      refreshed?.credentialRefreshNotStarted === true
+    )
+      return {
+        ...policy,
+        retrySameAccount: false,
+        action: 'stop',
+        cooldownUntil: null,
+        reason: 'oauth_refresh_not_started',
+        credentialRefreshNotStarted: true,
+      }
+    if (
+      selected.bindExecution &&
+      (refreshed?.credentialRefreshUnknown || (nodeOwned && refreshed?.attemptFinished !== true))
+    ) {
       await selected.markUncertain()
       throw Object.assign(new Error('credential refresh termination is unknown'), {
         code: 'credential_refresh_unknown',
         executionUncertain: true,
       })
     }
-    const after = readWorkerCredentialFile(exec.homeDir)
+    const after = nodeOwned ? null : readWorkerCredentialFile(exec.homeDir)
     const afterRefresh = String(after?.refresh_token || '')
     const blob = `${refreshed?.error?.code || ''} ${refreshed?.error?.message || ''} ${refreshed?.refresh_class || ''}`
     const grantDead = /invalid_grant|token has been revoked|oauth_revoked/i.test(blob)
