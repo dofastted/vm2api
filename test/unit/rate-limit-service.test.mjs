@@ -238,3 +238,23 @@ test('anthropic429Reset prefers an exhausted 7d window over 5h', () => {
   assert.equal(out.window, '7d')
   assert.equal(out.resetAt, now + 86_400_000)
 })
+
+test('429 headers retain the ticket captured before the attempt began', async () => {
+  const { service, accountQuota, close } = await setup()
+  let options
+  accountQuota.ingestHeaders = (_accountId, _headers, _usage, value) => {
+    options = value
+  }
+  try {
+    service.handleUpstreamError({
+      accountId: 'acc-1',
+      vmId: 'vm-01',
+      result: { ...limitResult('rate limited'), accountObservation: 41 },
+      policy: quotaPolicy,
+    })
+    assert.equal(options.observation, 41)
+    assert.equal(options.countRequest, false)
+  } finally {
+    await close()
+  }
+})
