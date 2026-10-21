@@ -208,6 +208,10 @@ func (p *initialPublisher) Publish(ctx context.Context, intent ManagementIntent,
 	if err != nil {
 		return PublicationReceipt{}, err
 	}
+	projection, err := credentialProjection(credential)
+	if err != nil {
+		return PublicationReceipt{}, err
+	}
 	var secret [32]byte
 	if _, err = rand.Read(secret[:]); err != nil {
 		return PublicationReceipt{}, err
@@ -217,14 +221,17 @@ func (p *initialPublisher) Publish(ctx context.Context, intent ManagementIntent,
 	if err != nil {
 		return PublicationReceipt{}, err
 	}
-	manifest := initialManifest{Receipt: PublicationReceipt{Intent: intent, IntentDigest: intent.digest(), ManifestRevision: "1"}, KernelDigest: hashBytes(kernel), TokenDigest: hashText(token + "\n"), CredentialDigest: hashBytes(credential)}
+	manifest := initialManifest{Receipt: PublicationReceipt{Intent: intent, IntentDigest: intent.digest(), ManifestRevision: "1"}, KernelDigest: hashBytes(kernel), TokenDigest: hashText(token + "\n"), CredentialDigest: hashBytes(projection), CredentialAuthority: nodePrivateCredentialAuthority, PrivateCredentialDigest: hashBytes(credential)}
 	var payload initialPayload
 	if err = json.Unmarshal(data, &payload); err != nil {
 		return PublicationReceipt{}, ErrInvalidAuthority
 	}
 	manifest.Identity = credentialIdentity{payload.Credential.AccountUUID, payload.Credential.OrgUUID, payload.Credential.Email}
 	manifest.Receipt.ManifestDigest = manifest.digest()
-	tree, err := stageInitialFiles(p.root, intent, p.policy, kernel, []byte(token+"\n"), credential, p.fault)
+	if err = writeInitialNodeCredential(p.authority.root, intent.VMID, intent.Fence, credential); err != nil {
+		return PublicationReceipt{}, err
+	}
+	tree, err := stageInitialFiles(p.root, intent, p.policy, kernel, []byte(token+"\n"), projection, p.fault)
 	if err != nil {
 		return PublicationReceipt{}, err
 	}
@@ -292,6 +299,7 @@ func (a *Authority) completeInitialPublish(handle CommandHandle, intent Manageme
 	command.Status = CommandCompleted
 	state.Commands[handle.ID] = command
 	state.InitialManifest = &manifest
+	state.Credential = &nodeCredentialState{Generation: "1", CanonicalDigest: manifest.PrivateCredentialDigest, ProjectionDigest: manifest.CredentialDigest}
 	_, err = a.commit(handle.VMID, state)
 	return err
 }
@@ -304,6 +312,9 @@ func validateInitialManifest(vm string, state AuthorityState) error {
 	i := m.Receipt.Intent
 	if state.Allocation == nil || !validCredentialIdentity(m.Identity) || !validManagementIntent(i) || i.Action != "publish-initial" || i.VMID != vm || i.AllocationID != state.Allocation.AllocationID || i.NodeID != state.Allocation.NodeID || i.Fence != state.Allocation.Fence ||
 		m.Receipt.IntentDigest != i.digest() || m.Receipt.ManifestRevision != "1" || !validDigest(m.KernelDigest) || !validDigest(m.TokenDigest) || !validDigest(m.CredentialDigest) || m.Receipt.ManifestDigest != m.digest() {
+		return ErrInvalidAuthority
+	}
+	if m.CredentialAuthority != "" && (m.CredentialAuthority != nodePrivateCredentialAuthority || !validDigest(m.PrivateCredentialDigest) || !validNodeCredentialState(state.Credential)) {
 		return ErrInvalidAuthority
 	}
 	command, ok := state.Commands[i.CommandID]

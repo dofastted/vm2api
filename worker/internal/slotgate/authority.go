@@ -106,6 +106,7 @@ type DockerLaunchTarget struct {
 type AuthorityState struct {
 	Allocation      *AllocationReceipt       `json:"allocation,omitempty"`
 	InitialManifest *initialManifest         `json:"initial_manifest,omitempty"`
+	Credential      *nodeCredentialState     `json:"credential,omitempty"`
 	Fence           Fence                    `json:"fence"`
 	Phase           AuthorityPhase           `json:"phase"`
 	Commands        map[string]CommandRecord `json:"commands"`

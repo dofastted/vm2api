@@ -79,6 +79,12 @@ func (s *Server) readHealth(ctx context.Context, request gate2Request) (map[stri
 	if err != nil {
 		return nil, err
 	}
+	if snapshot.InitialManifest.CredentialAuthority == nodePrivateCredentialAuthority {
+		before, err = s.authority.readCanonicalCredential(s.cfg.Root, request.VMID, request.Fence, s.launcher.policy, snapshot)
+		if err != nil {
+			return nil, err
+		}
+	}
 	summary, identity, err := nodeCredentialSummary(before, snapshot.InitialManifest.Identity)
 	if err != nil {
 		return nil, err
@@ -129,6 +135,9 @@ func (s *Server) readHealth(ctx context.Context, request gate2Request) (map[stri
 		return nil, err
 	}
 	after, err := readPublishedCredential(s.cfg.Root, request.VMID, request.Fence, s.launcher.policy)
+	if snapshot.InitialManifest.CredentialAuthority == nodePrivateCredentialAuthority {
+		after, err = s.authority.readCanonicalCredential(s.cfg.Root, request.VMID, request.Fence, s.launcher.policy, snapshot)
+	}
 	if err != nil || !bytes.Equal(before, after) {
 		return nil, ErrManagementDenied
 	}

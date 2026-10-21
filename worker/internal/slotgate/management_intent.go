@@ -91,11 +91,13 @@ type LaunchReceipt struct {
 // Private file hashes stay in the journal; RPC receipts expose only the
 // aggregate manifest and never credentials, internal tokens or their hashes.
 type initialManifest struct {
-	Receipt          PublicationReceipt `json:"receipt"`
-	KernelDigest     string             `json:"kernel_digest"`
-	TokenDigest      string             `json:"token_digest"`
-	CredentialDigest string             `json:"credential_digest"`
-	Identity         credentialIdentity `json:"identity"`
+	Receipt                 PublicationReceipt `json:"receipt"`
+	KernelDigest            string             `json:"kernel_digest"`
+	TokenDigest             string             `json:"token_digest"`
+	CredentialDigest        string             `json:"credential_digest"`
+	Identity                credentialIdentity `json:"identity"`
+	CredentialAuthority     string             `json:"credential_authority,omitempty"`
+	PrivateCredentialDigest string             `json:"private_credential_digest,omitempty"`
 }
 
 type credentialIdentity struct {
@@ -109,6 +111,10 @@ func validCredentialIdentity(identity credentialIdentity) bool {
 }
 
 func (m initialManifest) digest() string {
-	return hashText(strings.Join([]string{"slotgate-manifest-v1", m.Receipt.Intent.digest(), "1",
-		m.KernelDigest, m.TokenDigest, m.CredentialDigest, m.Identity.AccountUUID, m.Identity.OrgUUID, m.Identity.Email}, "\x00"))
+	fields := []string{"slotgate-manifest-v1", m.Receipt.Intent.digest(), "1",
+		m.KernelDigest, m.TokenDigest, m.CredentialDigest, m.Identity.AccountUUID, m.Identity.OrgUUID, m.Identity.Email}
+	if m.CredentialAuthority != "" {
+		fields = append(fields, m.CredentialAuthority, m.PrivateCredentialDigest)
+	}
+	return hashText(strings.Join(fields, "\x00"))
 }
