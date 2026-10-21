@@ -3,11 +3,11 @@
 日期：2026-10-21（北京时间）  
 调研基线：`eee8f6ecb6ca04455e6edef0c8e498fb3be21f21`  
 实施分支：`codex/postgresql-migration`  
-状态：计划已制定，业务代码尚未迁移；各任务完成后填写实际提交和验证结果。
+状态：迁移实现已完成；全量回归与原始提交的失败对照见 [实施与验证报告](2026-10-21-postgresql-migration-results.md)。
 
 ## 1. 目标与边界
 
-将控制面的运行数据库统一为 PostgreSQL，包括用户、API 密钥、分组、账号、调度状态、代理、集群节点、虚拟机凭据镜像、请求日志、计费、备份记录和思考签名归属。
+将控制面的运行数据库统一为 PostgreSQL，包括用户、API 密钥、分组、账号、调度状态、代理、集群节点、虚拟机元数据镜像、请求日志、计费、备份记录和思考签名归属。
 
 应用运行、单元测试、端到端测试、运维查询和新备份都使用 PostgreSQL。SQLite 仅用于离线读取旧数据库、构造历史迁移测试数据及转换旧备份。运行时不保留双写或 SQLite 降级路径。
 
@@ -24,7 +24,7 @@
 | 版本迁移 | `src/lib/db/migrations/001_init.sql` 至 `041_usage_logs_inbound_device.sql`，逐文件事务和 SHA-256 校验 | PostgreSQL 建立独立迁移序列；原 SQLite 文件保持不变 |
 | 最终表结构 | 在临时 SQLite 执行 41 个迁移后，有 29 张非 SQLite 内部表，包含 `schema_migrations` 和 3 张 `_legacy` 表 | 建立逐表清单，核对列、索引、默认值、外键及保留数据 |
 | 额外表 | `src/lib/pool/thinking-owner.mjs` 在运行时创建 `thinking_signature_owners` | 纳入 PostgreSQL 正式迁移与存量导入 |
-| VM 凭据镜像 | `src/lib/vm/vm-db-sync.mjs` 通过写钩子、启动校对及文件监听镜像到数据库 | 异步写入必须可等待、可排空，删除顺序不能改变 |
+| VM 元数据镜像 | `src/lib/vm/vm-db-sync.mjs` 通过写钩子、启动校对及文件监听镜像到数据库；`VmsRepo` 移除活凭据，只保留元数据和凭据存在标记 | 异步写入必须可等待、可排空，删除顺序不能改变 |
 | 备份 | `src/lib/admin/backup-core.mjs` 使用 `VACUUM INTO`，归档含 `db/kin.db`、VM 和配置文件 | 更换数据库快照格式，保留原归档的其他内容 |
 | 恢复 | `backup-service.mjs` 关闭 SQLite、替换文件、重新绑定 store | PostgreSQL 恢复需维护模式、排空写入及恢复后重新加载 |
 | 恢复入口隔离 | `src/server.mjs` 的恢复标志目前主要拦截推理入口 | 需要同时控制面板和后台数据库写入 |
@@ -147,7 +147,7 @@ T2/T3 可按文件范围并行。T5 在数据库契约稳定后并行。T4 与 T
 
 选 PostgreSQL 17 作为首次实现和 CI 的固定主版本，匹配相同主版本客户端。使用专用本地测试数据库和合成数据，不读取现有部署的凭据或业务数据。测试配置独立于生产配置，名字与连接目标都必须通过 `_test` / 专用测试库保护检查。
 
-普通测试文件和派生网关实例有独立 schema；测试辅助工具向所有连接和子进程传播固定 search_path，并在结束后关闭连接再删除对应 schema。备份/恢复、数据库关闭和恢复维护模式测试使用独立的专用 `_test` 数据库，应用 schema 与归档保持一致。`pg_restore` 不承担跨 schema 重命名。测试用账号的建库权限仅限隔离测试环境，不作为生产账号要求。只清理由本测试实例创建的 schema/数据库。集成测试缺少 PG 时明确失败或由单独命令报告缺失，不静默改用 SQLite。
+所有测试只连接预建的专用 `_test` 数据库。每个测试和派生网关使用独立 schema；测试辅助工具向所有连接和子进程传播固定 search_path，并在结束后关闭连接再删除本测试的 schema。备份恢复显式限定应用 schema，应用 schema 与归档保持一致，`pg_restore` 不承担跨 schema 重命名。通过相邻 schema 的 sentinel 恢复测试验证范围。测试辅助工具不创建或删除数据库，不需要建库权限。集成测试缺少 PG 时明确失败，不静默改用 SQLite。
 
 ### 5.2 必须通过的场景
 
@@ -200,7 +200,7 @@ node --test test/unit/database.test.mjs test/unit/db-migration-sub2api.test.mjs 
 
 使用临时目录执行全部现有迁移并只读查询 schema：41 个迁移，29 张非 SQLite 内部表。临时目录已删除；未读取现有业务数据库。
 
-本机 Node.js 为 `v24.19.0`。调研时 `psql`、`postgres`、`initdb` 不在 PATH；Docker 查询返回 `permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`。PostgreSQL 运行、迁移、备份恢复及业务验证均未执行。实施前需提供有权限的隔离测试环境，不能据此推断 PostgreSQL 代码或业务失败。
+本机 Node.js 为 `v24.19.0`。调研阶段 `psql`、`postgres`、`initdb` 不在 PATH；Docker 首次查询返回 `permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`。实施阶段已通过工具权限审核创建本任务专用 PostgreSQL 17 容器，并取得匹配的客户端。该容器只含合成数据，不使用现有部署的连接或业务数据。
 
 参考官方资料：
 
@@ -211,3 +211,29 @@ node --test test/unit/database.test.mjs test/unit/db-migration-sub2api.test.mjs 
 - [PostgreSQL：Debian PGDG 客户端安装](https://www.postgresql.org/download/linux/debian/)
 
 计划已由两个只读审查任务分别核对数据层和运维/测试范围。已补充 schema 备份隔离、升级前检查、导出快照同步、客户端主版本、LIKE 语义、大整数源读取和自增高水位要求。该审查仅验证计划覆盖与源码事实，不代表迁移实现已经通过验证。
+
+## 7. 实施记录
+
+- `fa0decc2`：PostgreSQL 驱动、独立基线和离线 SQLite 模块。
+- `3225b073`：基础 repository 与异步 store。
+- `893cb3ce`：日志、统计和计费查询。
+- `720a0474`：只读 SQLite 快照导入、事务校验和旧备份转换。
+- `1a5a7520`：导出快照备份、受控恢复和失败后维护状态。
+- `c2e56a2d`：PostgreSQL 部署、升级预检、指标与页面。
+- `38f6db6e`：启动、请求、调度、VM 镜像、恢复与关闭的异步调用链。
+- `3fbdc4bc`：独立 PG 测试 schema、CI 和重启持久化验证。
+- `6cb132b6`、`71ea797b`：整数精度及合法小数权重、端点优先级修正。
+- `4ad444d7`：关闭时等待已进入的备份调度检查。
+- `6aa877de`：区分恢复与普通维护提示，隔离慢代理测试的自动备份时序干扰。
+
+具体实施时采用 `AsyncLocalStorage` 保持事务连接，savepoint 回滚同步丢弃未提交的缓存更新。保留 SQLite 字符串排序和 ASCII 大小写语义。SQLite 中声明为 INTEGER 的 `accounts.load_factor` 实际接受小数，PG 对应列使用 double precision，已用 1.25 权重导入回归验证。累计整数超出安全范围时以精确十进制字符串返回；余额、费用、平均值和比率保留原 double precision 语义。
+
+VM 活凭据继续保留在既有槽位和 CLI-home 存储中。数据库导入和顶层 JSON 归档不能重建这些凭据。迁移操作必须原样保留对应目录及原业务加密密钥。
+
+页面对照使用合成指标、相同组件依赖与样式、1440×900 窗口。用户已授权独立 Playwright 截图：
+
+| 原 SQLite 页面 | PostgreSQL 页面 |
+| --- | --- |
+| ![SQLite 原页面](evidence/postgresql/database-sqlite-1440.png) | ![PostgreSQL 页面](evidence/postgresql/database-postgresql-1440.png) |
+
+验证对象、实际结果和未验证项记录在同目录实施报告中。未对现有部署执行迁移、重启或发布，未推送分支。
