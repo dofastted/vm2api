@@ -27,6 +27,7 @@ import {
   officialCcUidGid,
   scheduleOfficialCcBootstrap,
   runOfficialCcBootstrap,
+  officialCcBootstrapFinished,
   normalizeOfficialCcConfig,
   loadOfficialCcConfig,
   materializeOfficialClaudeCredentials,
@@ -300,7 +301,7 @@ export function createImportCommit(ctx) {
           }
           if (vmOperation) {
             const completed = await (ctx.runOfficialCcBootstrap || runOfficialCcBootstrap)(bootstrapOptions)
-            if (!completed?.ok && completed?.vmOperationNotStarted !== true) await vmOperation.markUncertain()
+            if (!officialCcBootstrapFinished(completed, bootstrapOptions)) await vmOperation.markUncertain()
             officialCc = { scheduled: true, vmId, completed: true, ok: completed?.ok === true }
           } else {
             officialCc = scheduleOfficialCcBootstrap(bootstrapOptions)

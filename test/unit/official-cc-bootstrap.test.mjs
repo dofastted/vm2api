@@ -20,6 +20,7 @@ import {
   OFFICIAL_USAGE_RETRIES,
   runOfficialCcUsage,
   collectOfficialCcAccount,
+  officialCcBootstrapFinished,
   DEFAULT_OFFICIAL_CC_CONFIG,
   normalizeOfficialCcConfig,
   loadOfficialCcConfig,
@@ -728,6 +729,39 @@ test('collectOfficialCcAccount reads tier from profile and model ids via slot wo
   assert.deepEqual(ops.sort(), ['models', 'profile'])
   assert.equal(got.account_tier, 'max')
   assert.deepEqual(got.available_models, ['claude-fable-5', 'claude-sonnet-4-5'])
+})
+
+test('bootstrap completion requires execution proof separately from business success', () => {
+  assert.equal(officialCcBootstrapFinished({ ok: true, attemptFinished: false }), false)
+  assert.equal(officialCcBootstrapFinished({ ok: true, attemptFinished: true, vmOperationUncertain: true }), false)
+  assert.equal(officialCcBootstrapFinished({ ok: false, attemptFinished: true }), true)
+  assert.equal(officialCcBootstrapFinished({ ok: false, vmOperationNotStarted: true }), true)
+  assert.equal(officialCcBootstrapFinished({ ok: true, status: { models_error: 'timeout' } }), false)
+  assert.equal(officialCcBootstrapFinished({ ok: true, attemptFinished: true, resident: { ok: true } }), false)
+})
+
+test('account collection waits for both original operations when one rejects early', async () => {
+  let finish
+  const pending = new Promise((resolve) => {
+    finish = resolve
+  })
+  let completed = false
+  const collection = collectOfficialCcAccount(
+    {},
+    {
+      slotOauth: async (_exec, op) => {
+        if (op === 'profile') throw new Error('synthetic profile timeout')
+        return pending
+      },
+    },
+  ).then((value) => {
+    completed = true
+    return value
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(completed, false)
+  finish({ ok: true, attemptFinished: true, body: { data: [] } })
+  assert.equal((await collection).attemptFinished, false)
 })
 
 test('bootstrap source never calls Anthropic from the host', () => {

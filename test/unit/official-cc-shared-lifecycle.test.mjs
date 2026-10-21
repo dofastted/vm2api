@@ -133,7 +133,7 @@ test('a raw bootstrap usage timeout keeps task and VM ownership and prevents a l
   assert.equal(calls, 1)
 })
 
-for (const auxiliary of ['profile', 'models', 'identity']) {
+for (const auxiliary of ['profile', 'models', 'identity', 'stats']) {
   test(`raw bootstrap reports an unknown ${auxiliary} even when hello and usage succeed`, async (t) => {
     const f = await fixture(t)
     prepareRawBootstrap(f, t)
@@ -152,6 +152,10 @@ for (const auxiliary of ['profile', 'models', 'identity']) {
         ? { ok: false, status: 0, attemptFinished: false, body: { error: { code: 'timeout' } } }
         : call(exec, op)
     if (auxiliary === 'identity') f.options.collectIdentity = async () => ({ ok: false, error: 'synthetic timeout' })
+    if (auxiliary === 'stats')
+      f.options.onStats = async () => {
+        throw new Error('synthetic persistence failure')
+      }
     let raw
     f.options.runBootstrap = async (options) => {
       raw = await runOfficialCcBootstrap(options)
@@ -164,6 +168,44 @@ for (const auxiliary of ['profile', 'models', 'identity']) {
     assert.equal(raw.vmOperationUncertain, true)
     assert.equal((await f.other.tryAcquire({ vmId: f.vm.id })).ok, false)
     assert.equal((await f.peer.prepare('SELECT finished_at FROM background_task_runs').get()).finished_at, null)
+  })
+}
+
+for (const rejectProfile of [false, true]) {
+  test(`raw bootstrap releases after confirmed foreground completion (profile rejected: ${rejectProfile})`, async (t) => {
+    const f = await fixture(t)
+    prepareRawBootstrap(f, t)
+    f.options.runTurn = async ({ prompt, outFile }) => {
+      fs.writeFileSync(
+        outFile,
+        prompt === '/usage'
+          ? JSON.stringify({ five_hour: { utilization: 0.1 }, seven_day: { utilization: 0.2 } })
+          : '{}',
+      )
+      return { ok: true, code: 0, timed_out: false, attemptFinished: true }
+    }
+    if (rejectProfile) {
+      const call = f.options.slotOauth
+      f.options.slotOauth = (exec, op) =>
+        op === 'profile'
+          ? { ok: false, status: 403, attemptFinished: true, body: { error: { code: 'permission_denied' } } }
+          : call(exec, op)
+    }
+    let raw
+    f.options.runBootstrap = async (options) => {
+      raw = await runOfficialCcBootstrap(options)
+      return raw
+    }
+    await scheduleOfficialCcBootstrap(f.options)
+    await f.tasks.flush()
+    assert.equal(raw.ok, true)
+    assert.equal(raw.attemptFinished, true)
+    assert.equal(raw.status.attempt_finished, true)
+    assert.equal(raw.vmOperationUncertain, false)
+    const next = await f.other.tryAcquire({ vmId: f.vm.id })
+    assert.equal(next.ok, true)
+    await next.release()
+    assert.notEqual((await f.peer.prepare('SELECT finished_at FROM background_task_runs').get()).finished_at, null)
   })
 }
 

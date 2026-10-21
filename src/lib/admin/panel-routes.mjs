@@ -71,6 +71,7 @@ import {
   officialCcHome,
   readOfficialCcStatus,
   runOfficialCcBootstrap,
+  officialCcBootstrapFinished,
   scheduleOfficialCcBootstrap,
 } from '../oauth/official-cc-bootstrap.mjs'
 import { invalidateLiveCredentialCache } from './panel-live-credentials.mjs'
@@ -884,9 +885,10 @@ export function createPanelHandler(ctx) {
         credentialMode: credentialModeOfVm(vm),
       }
       if (isKubernetesMode()) {
-        const completed = await vmEffect(operation, () =>
-          (ctx.vmMutationOps?.runOfficialCcBootstrap || runOfficialCcBootstrap)(options),
-        )
+        const completed = await vmEffect(operation, async () => {
+          const result = await (ctx.vmMutationOps?.runOfficialCcBootstrap || runOfficialCcBootstrap)(options)
+          return officialCcBootstrapFinished(result, options) ? result : { ...result, vmOperationUncertain: true }
+        })
         bootstrap = { scheduled: true, vmId: id, completed: true, ok: completed?.ok === true }
       } else bootstrap = scheduleOfficialCcBootstrap(options)
     }

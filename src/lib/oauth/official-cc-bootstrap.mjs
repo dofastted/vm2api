@@ -302,8 +302,9 @@ export function persistSlotRuntimeMemory(projectRoot, vmId, memory) {
 }
 
 export function restoreSlotMemoryAfterOfficialCc(vmId, idleMemory, { keepCli = false, vm } = {}) {
-  if (!keepCli) stopOfficialCcLeftovers(vmId, vm)
-  return applyContainerMemory(vmId, idleMemory || slotIdleMemory(vm), vm)
+  const stopped = keepCli ? null : stopOfficialCcLeftovers(vmId, vm)
+  const restored = applyContainerMemory(vmId, idleMemory || slotIdleMemory(vm), vm)
+  return stopped?.ok === false ? { ...restored, vmOperationUncertain: true } : restored
 }
 
 export function startOfficialCcResidentProcess({ vmId, projectRoot, uid, gid, timezone, locale, vm }) {
@@ -602,6 +603,11 @@ export function writeOfficialCcStatus(homeDir, status) {
     resident_pid: Number.isFinite(Number(status.resident_pid)) ? Number(status.resident_pid) : null,
     bridge_port: Number.isFinite(Number(status.bridge_port)) ? Number(status.bridge_port) : null,
     error: status.error ? String(status.error).slice(0, 300) : null,
+    profile_error: status.profile_error || null,
+    models_error: status.models_error || null,
+    identity_error: status.identity_error || null,
+    stats_error: status.stats_error || null,
+    attempt_finished: status.attempt_finished === true,
     force: !!status.force,
   }
   fs.writeFileSync(officialCcStatusPath(homeDir), JSON.stringify(safe, null, 2) + '\n', { mode: 0o600 })
@@ -921,6 +927,7 @@ export async function runOfficialCcTurn({
   const ok = officialCcTurnSucceeded({ code: finished.code, timedOut: finished.timed_out, raw, slash })
   return {
     ok,
+    attemptFinished: officialCcTurnFinished(finished),
     timed_out: !!finished.timed_out,
     code: finished.code,
     error: finished.error || null,
@@ -969,17 +976,23 @@ export async function finalizeOfficialCcTelemetry(
   applySeedAfterOfficialInit(homeDir, vm, seed, projectRoot)
   const tel = writeOfficialCcTelemetry(projectRoot, vmId)
   let reloaded = false
+  let uncertain = false
   if (reload && tel.enabled) {
     try {
       const r = await reloadSlot(vm, projectRoot, { routing })
       reloaded = r?.ok === true && r?.rust_ok !== false
-    } catch {}
+      if (!reloaded || r.vmOperationUncertain === true) uncertain = true
+    } catch {
+      uncertain = true
+    }
   }
   let touched = false
   if (tel.enabled) {
     try {
       touched = !!touchTelemetrySession(projectRoot, vmId).wrote
-    } catch {}
+    } catch {
+      uncertain = true
+    }
   }
   return {
     wrote: !!tel.wrote,
@@ -990,6 +1003,7 @@ export async function finalizeOfficialCcTelemetry(
     seed_aligned: true,
     reloaded,
     touched,
+    vmOperationUncertain: uncertain,
   }
 }
 
@@ -1023,6 +1037,35 @@ export function writeOfficialCcTelemetry(projectRoot, vmId) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
+// A normal foreground docker-exec exit follows the existing CLI protocol. A
+// timeout only sends SIGTERM; it never proves that the guest command exited.
+function officialCcTurnFinished(result) {
+  return (
+    result?.vmOperationUncertain !== true &&
+    !result?.timed_out &&
+    result?.attemptFinished !== false &&
+    (result?.attemptFinished === true || Number.isInteger(result?.code))
+  )
+}
+
+/** Shared completion check for manual initialization, packages, and credential imports. */
+export function officialCcBootstrapFinished(result, { resident = false, syncTelemetry = false } = {}) {
+  if (!result || result.vmOperationUncertain === true || result.attemptFinished === false || result.timed_out)
+    return false
+  if (result.notStarted === true || result.vmOperationNotStarted === true) return true
+  if (resident || result.resident || result.status?.resident) return false
+  if (typeof result.attemptFinished === 'boolean') return result.attemptFinished
+  // Compatibility for injected/older producers without an explicit execution proof.
+  return (
+    result.ok === true &&
+    !result.status?.profile_error &&
+    !result.status?.models_error &&
+    !result.status?.identity_error &&
+    !result.status?.stats_error &&
+    !(syncTelemetry && result.status?.telemetry_enabled && !result.status.sidecar_reloaded)
+  )
+}
+
 /**
  * Official `/usage` inside the slot (egress = slot SOCKS5 / transparent exit).
  * One try plus OFFICIAL_USAGE_RETRIES. A reply without the server limits[]
@@ -1044,7 +1087,8 @@ export async function runOfficialCcUsage({
     try {
       stats = parseOfficialCcStats(fs.readFileSync(outFile, 'utf8'))
     } catch {}
-    last = { turn: result, stats, attempts: attempt + 1 }
+    last = { turn: result, stats, attempts: attempt + 1, attemptFinished: officialCcTurnFinished(result) }
+    if (!last.attemptFinished) break
     if (stats?.ok && stats.limits_present) break
   }
   return last
@@ -1053,13 +1097,15 @@ export async function runOfficialCcUsage({
 /** Tier (from /api/oauth/profile) and model ids (from /v1/models) via the slot worker. */
 export async function collectOfficialCcAccount(exec, { slotOauth } = {}) {
   const call = slotOauth || (await import('../transport/slot-oauth.mjs')).runSlotOauth
-  const [profile, models] = await Promise.all([
-    call(exec, 'profile', { timeoutMs: 30_000 }),
-    call(exec, 'models', { timeoutMs: 30_000 }),
+  const responses = await Promise.allSettled([
+    Promise.resolve().then(() => call(exec, 'profile', { timeoutMs: 30_000 })),
+    Promise.resolve().then(() => call(exec, 'models', { timeoutMs: 30_000 })),
   ])
+  const [profile, models] = responses.map((response) => (response.status === 'fulfilled' ? response.value : null))
   const tier = profile?.ok ? tierFromOauthProfile(profile.body) : null
   const list = Array.isArray(models?.body?.data) ? models.body.data : []
   return {
+    attemptFinished: profile?.attemptFinished === true && models?.attemptFinished === true,
     account_tier: tier,
     profile_ok: !!profile?.ok,
     profile_error: profile?.ok ? null : profile?.body?.error?.code || `http_${profile?.status || 0}`,
@@ -1116,10 +1162,31 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
   const idleMemory = keepResident
     ? slotIdleMemory(vm, routing)
     : chooseIdleMemory(inspectContainerMemory(vmId), memory, slotIdleMemory(vm, routing))
-  stopOfficialCcResident(vmId, projectRoot)
-  applyContainerMemory(vmId, memory, vm)
+  let uncertain = stopOfficialCcResident(vmId, projectRoot)?.ok === false
+  if (applyContainerMemory(vmId, memory, vm)?.ok === false) uncertain = true
+  let outcome
+  const complete = (value) => {
+    outcome = value
+    return value
+  }
+  const unknown = (step, error, extra = {}) => {
+    uncertain = true
+    return complete({
+      ok: false,
+      ...extra,
+      status: writeOfficialCcStatus(homeDir, {
+        ...(readOfficialCcStatus(homeDir) || {}),
+        status: 'error',
+        vm_id: vmId,
+        started_at: startedAt,
+        step,
+        error,
+      }),
+    })
+  }
   let helloOk = false
   try {
+    if (uncertain) return unknown('prepare', 'official Claude Code preparation did not confirm completion')
     writeOfficialCcStatus(homeDir, {
       status: 'running',
       vm_id: vmId,
@@ -1133,8 +1200,12 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       doWipe === false ? { wiped: false, kept_credentials: true } : wipeOfficialFirstUseHome(homeDir, { uid, gid })
     if (isSlotProxyDesynced(vm, projectRoot)) {
       try {
-        await reloadSlotReady(vm, projectRoot, { routing })
-      } catch {}
+        const reloaded = await reloadSlotReady(vm, projectRoot, { routing })
+        if (!reloaded?.ok || reloaded.rust_ok === false || reloaded.vmOperationUncertain === true) uncertain = true
+      } catch {
+        uncertain = true
+      }
+      if (uncertain) return unknown('reload', 'slot reload did not confirm completion')
       try {
         vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
       } catch {}
@@ -1157,6 +1228,8 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
         },
         { force: true, timeoutMs: 60_000 },
       )
+      if (refreshed?.vmOperationUncertain === true || refreshed?.attemptFinished === false)
+        return unknown('refresh', 'worker credential refresh did not confirm completion')
       if (!refreshed?.ok && refreshed?.status !== 200) {
         const status = writeOfficialCcStatus(homeDir, {
           status: 'error',
@@ -1167,7 +1240,7 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
           step: 'refresh',
           error: refreshed?.error?.message || `worker credential refresh failed (${refreshed?.status || 0})`,
         })
-        return { ok: false, error: status.error, status }
+        return complete({ ok: false, error: status.error, status })
       }
     }
     writeOfficialCcStatus(homeDir, {
@@ -1188,7 +1261,7 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
         wiped: wiped.wiped,
         error: login.error || 'failed to materialize official .credentials.json',
       })
-      return { ok: false, error: status.error, status }
+      return complete({ ok: false, error: status.error, status })
     }
     writeOfficialCcStatus(homeDir, {
       status: 'running',
@@ -1210,9 +1283,11 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
         wiped: wiped.wiped,
         error: 'slot cli-node missing; run wrap-cli sync first',
       })
-      return { ok: false, error: status.error, status }
+      return complete({ ok: false, error: status.error, status })
     }
-    const claudeVersion = (await spawnCaptured([cliNode, '--version'], { timeoutMs: 15_000 })).stdout || null
+    const version = await spawnCaptured([cliNode, '--version'], { timeoutMs: 15_000 })
+    if (!officialCcTurnFinished(version)) return unknown('version', 'slot cli-node version check did not confirm exit')
+    const claudeVersion = version.stdout || null
 
     const timezone = vm.timezone || vm.fingerprint?.timezone || 'UTC'
     const locale = vm.locale || vm.fingerprint?.locale || 'en_US.UTF-8'
@@ -1226,7 +1301,7 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       force,
       step: 'hello',
     })
-    const hello = await runOfficialCcTurn({
+    const hello = await runTurn({
       vmId,
       uid,
       gid,
@@ -1239,6 +1314,7 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       vm,
     })
     helloOk = !!hello.ok
+    if (!officialCcTurnFinished(hello)) return unknown('hello', 'official Claude Code hello did not confirm exit')
     const turn = ({ prompt: text, outFile, errFile }) =>
       runTurn({ vmId, uid, gid, timezone, locale, prompt: text, outFile, errFile, timeoutMs, vm })
     writeOfficialCcStatus(homeDir, {
@@ -1257,6 +1333,8 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       : { turn: { ok: false, code: null, timed_out: false, error: null }, stats: null, attempts: 0 }
     const statsTurn = usageRun.turn
     let stats = usageRun.stats
+    if (usageRun.attemptFinished === false)
+      return unknown('usage', 'official Claude Code /usage did not confirm exit', { stats })
 
     writeOfficialCcStatus(homeDir, {
       status: 'running',
@@ -1270,6 +1348,7 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       step: 'profile',
     })
     const account = await collectOfficialCcAccount({ vmId, homeDir, vm }, { slotOauth })
+    if (!account.attemptFinished) uncertain = true
     let tierSource = null
     if (stats?.limits_present === true && !stats.account_tier) {
       const accountTier = inferTierFromOfficialStats('', stats)
@@ -1277,10 +1356,18 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
     }
     if (!tierSource && stats?.account_tier) tierSource = 'usage'
     if (stats) stats = { ...stats, account_tier_source: tierSource }
+    let statsError = null
     if (typeof onStats === 'function' && stats) {
       try {
-        await onStats(stats, { vmId, projectRoot, homeDir })
-      } catch {}
+        const saved = await onStats(stats, { vmId, projectRoot, homeDir })
+        if (saved?.ok === false || saved?.vmOperationUncertain === true || saved?.attemptFinished === false) {
+          uncertain = true
+          statsError = 'stats_update_not_confirmed'
+        }
+      } catch {
+        uncertain = true
+        statsError = 'stats_update_failed'
+      }
     }
 
     const usageOk = officialCcQuotaSucceeded(stats)
@@ -1307,10 +1394,18 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       } catch {}
     }
     if (reconcileFingerprint !== false) persistOfficialCcFingerprint(vmPath, homeDir)
-    if (typeof collectIdentity === 'function') {
+    let identityError = null
+    if (!uncertain && typeof collectIdentity === 'function') {
       try {
-        await collectIdentity(projectRoot, JSON.parse(fs.readFileSync(vmPath, 'utf8')))
-      } catch {}
+        const identity = await collectIdentity(projectRoot, JSON.parse(fs.readFileSync(vmPath, 'utf8')))
+        if (identity?.ok === false || identity?.vmOperationUncertain === true || identity?.attemptFinished === false) {
+          uncertain = true
+          identityError = 'identity_not_confirmed'
+        }
+      } catch {
+        uncertain = true
+        identityError = 'identity_failed'
+      }
     }
     writeOfficialCcStatus(homeDir, {
       status: 'running',
@@ -1329,9 +1424,10 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       step: 'telemetry',
     })
     const telemetry =
-      syncTelemetry !== false && hello.ok
+      !uncertain && syncTelemetry !== false && hello.ok
         ? await finalizeOfficialCcTelemetry(projectRoot, vmId, { reload: true, enable: true, routing })
         : writeOfficialCcTelemetry(projectRoot, vmId)
+    if (telemetry.vmOperationUncertain === true) uncertain = true
 
     const homeAfter = summarizeOfficialCcHome(homeDir)
     const ok = !!(hello.ok && usageOk)
@@ -1357,6 +1453,8 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       available_models: account.available_models,
       profile_error: account.profile_error,
       models_error: account.models_error,
+      identity_error: identityError,
+      stats_error: statsError,
       force,
       step: ok ? 'done' : hello.ok ? 'usage' : 'hello',
       telemetry_wrote: telemetry.wrote,
@@ -1382,7 +1480,7 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
               `official claude hello=${hello.code} usage=${usageOk ? 'ok' : 'fail'}`,
     })
     let residentInfo = null
-    if (keepResident && hello.ok) {
+    if (!uncertain && keepResident && hello.ok) {
       writeOfficialCcStatus(homeDir, { ...status, step: 'resident', resident: true })
       residentInfo = await keepOfficialCcResidentAfterHello({
         vmId,
@@ -1405,27 +1503,38 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
         error: status.error,
       })
     }
-    return {
+    return complete({
       ok,
       status: readOfficialCcStatus(homeDir) || status,
       stats,
       memory: { init: memory, idle: idleMemory },
       resident: residentInfo,
-    }
+    })
   } finally {
     if (!(keepResident && helloOk)) {
-      const restored = restoreSlotMemoryAfterOfficialCc(vmId, idleMemory, { vm })
+      // Do not send cleanup commands after an unconfirmed foreground command.
+      // Cleanup cannot turn its timeout into proof that the original command ended.
+      const restored = uncertain ? null : restoreSlotMemoryAfterOfficialCc(vmId, idleMemory, { vm })
+      if (restored?.ok === false || restored?.vmOperationUncertain === true) uncertain = true
       try {
         const prev = readOfficialCcStatus(homeDir) || {}
         writeOfficialCcStatus(homeDir, {
           ...prev,
           memory_init: memory,
           memory_idle: idleMemory,
-          memory_restored: restored.ok !== false,
+          memory_restored: restored?.ok === true && restored?.vmOperationUncertain !== true,
           resident: false,
           resident_ok: false,
         })
       } catch {}
+    }
+    if (outcome) {
+      outcome.attemptFinished = !uncertain && !outcome.resident
+      outcome.vmOperationUncertain = !outcome.attemptFinished
+      outcome.status = writeOfficialCcStatus(homeDir, {
+        ...(readOfficialCcStatus(homeDir) || outcome.status),
+        attempt_finished: outcome.attemptFinished,
+      })
     }
   }
 }
@@ -1549,16 +1658,7 @@ async function scheduleSharedOfficialCcBootstrap(options) {
             })
             await options.flush?.()
             await flushVmDbSync()
-            // Normal successful foreground CLI completion follows the existing protocol.
-            // A resident CLI remains active; a timeout/error supplies no termination proof.
-            const notStarted = result?.notStarted === true || result?.vmOperationNotStarted === true
-            const terminal =
-              !auxiliaryUnknown &&
-              !result?.status?.profile_error &&
-              !result?.status?.models_error &&
-              !(options.syncTelemetry && result?.status?.telemetry_enabled && !result.status.sidecar_reloaded) &&
-              result?.vmOperationUncertain !== true &&
-              (notStarted || (result?.ok === true && !result.timed_out && options.resident !== true))
+            const terminal = !auxiliaryUnknown && officialCcBootstrapFinished(result, options)
             if (!terminal) await operation.markUncertain()
             return { terminal, value: result }
           } catch (error) {
