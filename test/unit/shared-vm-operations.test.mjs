@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { createInterface } from 'node:readline'
-import { createDatabase, getDb } from '../../src/lib/db/database.mjs'
+import { createDatabase, getDb, withTransaction } from '../../src/lib/db/database.mjs'
 import { ExecutionAdmissionsRepo } from '../../src/lib/db/repos/execution-admissions-repo.mjs'
 import { withVmLock, vmLockBusy } from '../../src/lib/vm/vm-file.mjs'
 
@@ -68,6 +68,7 @@ test('an active Kubernetes VM mutation blocks new execution on another PG connec
     await finish.promise
   })
   await entered.promise
+  assert.equal(vmLockBusy('/pod-a/vms/vm-a.json'), true)
   let gate
   try {
     gate = await new ExecutionAdmissionsRepo(other).tryReserve(execution())
@@ -77,6 +78,7 @@ test('an active Kubernetes VM mutation blocks new execution on another PG connec
     await gate?.release?.()
     finish.resolve()
     await running
+    assert.equal(vmLockBusy('/pod-a/vms/vm-a.json'), false)
   }
 })
 
@@ -243,4 +245,122 @@ test('Kubernetes canonical key validation and PG failures never execute a local 
   )
   assert.equal(called, false)
   assert.equal(vmLockBusy('explicit-key'), false)
+})
+
+test('two independent operation owners have one winner and unrelated VMs remain available', async (t) => {
+  const other = await otherDatabase(t)
+  const first = await operations(getDb(), 'owner-a')
+  const second = await operations(other, 'owner-b')
+  const claims = await Promise.all([first.tryAcquire({ vmId: 'vm-a' }), second.tryAcquire({ vmId: 'vm-a' })])
+  assert.equal(claims.filter((claim) => claim.ok).length, 1)
+  assert.equal(claims.find((claim) => !claim.ok).code, 'vm_operation_active')
+  const independent = await second.tryAcquire({ vmId: 'vm-b' })
+  assert.equal(independent.ok, true)
+  await independent.release()
+  const winner = claims.find((claim) => claim.ok)
+  assert.deepEqual(await winner.release(), { released: true })
+  assert.deepEqual(await winner.release(), { released: true })
+})
+
+test('a failed release remains persistent and retries PostgreSQL rather than caching its rejection', async (t) => {
+  const other = await otherDatabase(t)
+  const first = await operations(getDb(), 'owner-a')
+  const second = await operations(other, 'owner-b')
+  const claim = await first.tryAcquire({ vmId: 'vm-a' })
+  await getDb().exec(`CREATE FUNCTION refuse_vm_operation_release() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN IF NEW.released_at IS NOT NULL THEN RAISE EXCEPTION 'synthetic release failure'; END IF; RETURN NEW; END $$;
+    CREATE TRIGGER refuse_vm_operation_release BEFORE UPDATE ON vm_operations FOR EACH ROW EXECUTE FUNCTION refuse_vm_operation_release()`)
+  await assert.rejects(claim.release(), { code: 'P0001' })
+  assert.equal((await second.tryAcquire({ vmId: 'vm-a' })).code, 'vm_operation_active')
+  await getDb().exec('DROP TRIGGER refuse_vm_operation_release ON vm_operations')
+  assert.deepEqual(await claim.release(), { released: true })
+  const next = await second.tryAcquire({ vmId: 'vm-a' })
+  assert.equal(next.ok, true)
+  await next.release()
+})
+
+test('different schemas cannot reuse one another nested operation context', async (t) => {
+  const db = getDb()
+  const other = await createDatabase({ connectionString: db.connectionString, schema: db.schema + '_other' })
+  t.after(() => other.close())
+  const first = await operations(db, 'owner-a')
+  const second = await operations(other, 'owner-b')
+  await first.run('vm-a', async (outer) =>
+    second.run('vm-a', async (inner) => {
+      assert.notEqual(inner.operationId, outer.operationId)
+      assert.equal(
+        (await other.prepare('SELECT count(*) AS n FROM vm_operations WHERE released_at IS NULL').get()).n,
+        1,
+      )
+    }),
+  )
+})
+
+test('a claim cannot be created in an outer transaction whose later rollback would erase ownership', async () => {
+  const service = await operations(getDb(), 'owner-a')
+  let called = false
+  await assert.rejects(
+    withTransaction(getDb(), () =>
+      service.run('vm-a', () => {
+        called = true
+      }),
+    ),
+    { code: 'vm_operation_transaction_active' },
+  )
+  assert.equal(called, false)
+  assert.equal((await getDb().prepare('SELECT count(*) AS n FROM vm_operations').get()).n, 0)
+})
+
+test('async work escaping a finished callback cannot reuse its old claim', async (t) => {
+  const other = await otherDatabase(t)
+  const first = await operations(getDb(), 'owner-a')
+  const second = await operations(other, 'owner-b')
+  const proceed = deferred()
+  let late
+  await first.run('vm-a', async () => {
+    late = proceed.promise.then(() => first.run('vm-a', () => 'unexpected callback'))
+  })
+  const current = await second.tryAcquire({ vmId: 'vm-a' })
+  proceed.resolve()
+  await assert.rejects(late, { code: 'vm_operation_active' })
+  await current.release()
+})
+
+test('async work escaping a failed callback cannot reuse the claim while uncertainty is being persisted', async (t) => {
+  const other = await otherDatabase(t)
+  const first = await operations(getDb(), 'owner-a')
+  const second = await operations(other, 'owner-b')
+  const mark = first.markUncertain.bind(first)
+  const marking = deferred()
+  const finish = deferred()
+  const proceed = deferred()
+  first.markUncertain = async (identity) => {
+    marking.resolve()
+    await finish.promise
+    return mark(identity)
+  }
+  let late
+  const failed = assert.rejects(
+    first.run('vm-a', async () => {
+      late = proceed.promise.then(() => second.run('vm-a', () => 'unexpected callback'))
+      throw new Error('synthetic callback failure')
+    }),
+    /synthetic callback failure/,
+  )
+  await marking.promise
+  proceed.resolve()
+  try {
+    await assert.rejects(late, { code: 'vm_operation_active' })
+  } finally {
+    finish.resolve()
+    await failed
+  }
+})
+
+test('an explicitly supplied VM id still rejects reserved file identities', async (t) => {
+  kubernetes(t)
+  await assert.rejects(
+    withVmLock('explicit-key', () => {}, { vmId: 'active' }),
+    { code: 'invalid_vm_operation' },
+  )
 })
