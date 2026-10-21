@@ -17,6 +17,7 @@ import { hasLiveExtraSample, hasOfficialUsageSample, parseResetMs } from '../poo
 import { backgroundTasksFor } from '../core/shared-background-tasks.mjs'
 import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 import { getSharedRoutingState } from '../admin/shared-routing-config.mjs'
+import { getActivityCoordinator } from '../db/database.mjs'
 export const DEFAULT_USAGE_PROBE = Object.freeze({
   enabled: false,
   interval_sec: 60,
@@ -212,7 +213,13 @@ export function createUsageProbeMonitor(opts = {}) {
     if (!isKubernetesMode()) return
     const routing = getSharedRoutingState(sharedTasks?.repo.db)
     if (!routing) throw Object.assign(new Error('shared routing unavailable'), { code: 'routing_config_unavailable' })
-    await routing.refresh()
+    const coordinator = getActivityCoordinator(routing.db)
+    if (!coordinator)
+      throw Object.assign(new Error('activity coordinator unavailable'), { code: 'maintenance_unavailable' })
+    await coordinator.runActivity({ kind: 'usage_probe_configuration' }, async () => ({
+      ended: true,
+      value: await routing.refresh(),
+    }))
   }
 
   const listTargets = () => {

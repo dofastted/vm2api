@@ -14,6 +14,7 @@ import { detectInboundPlatform } from '../protocol/platform-detect.mjs'
 import { backgroundTasksFor } from '../core/shared-background-tasks.mjs'
 import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 import { getSharedRoutingState } from './shared-routing-config.mjs'
+import { getActivityCoordinator } from '../db/database.mjs'
 
 export const HEALTH_REAL_HEADER = 'x-kin-health-real'
 export const HEALTH_VIA_CACHE = 'health-cache'
@@ -831,7 +832,13 @@ export function createHealthProbeMonitor(opts = {}) {
         const routing = getSharedRoutingState(sharedTasks?.repo.db)
         if (!routing)
           throw Object.assign(new Error('shared routing unavailable'), { code: 'routing_config_unavailable' })
-        await routing.refresh()
+        const coordinator = getActivityCoordinator(routing.db)
+        if (!coordinator)
+          throw Object.assign(new Error('activity coordinator unavailable'), { code: 'maintenance_unavailable' })
+        await coordinator.runActivity({ kind: 'health_probe_configuration' }, async () => ({
+          ended: true,
+          value: await routing.refresh(),
+        }))
       }
       if (scheduled && (current !== generation || !config.enabled)) return getSnapshot('anthropic')
       const probe = async () => {

@@ -181,3 +181,91 @@ test('VM schedule cron preparation enters a fresh activity before refreshing set
   await runner._run(vm.id, plan.revision)
   assert.equal(calls, 1)
 })
+
+test('a monitor can replace the closed initialization scope inherited by an asynchronous callback', async (t) => {
+  const { db, coordinator, tasks } = await fixture(t)
+  let resume
+  const delayed = new Promise((resolve) => {
+    resume = resolve
+  })
+  let calls = 0
+  const monitor = createCredentialRefreshMonitor({
+    sharedTasks: tasks,
+    listTargets: () => [vm],
+    refreshOne: async () => {
+      await db.query('SELECT 1')
+      calls++
+      return { ok: true }
+    },
+  })
+  t.after(() => monitor.stop())
+  const initialization = await coordinator.admit({ kind: 'synthetic_initialization' })
+  const background = initialization.run(() => delayed.then(() => monitor.runOnce()))
+  await initialization.complete({ ended: true })
+  resume()
+  await background
+  assert.equal(calls, 1)
+})
+
+test('DRAINING rejects monitor configuration and VM discovery before any callback or claim', async (t) => {
+  const { db, root, coordinator, tasks } = await fixture(t)
+  let calls = 0
+  const callback = async () => {
+    calls++
+    return { ok: true }
+  }
+  const credential = createCredentialRefreshMonitor({
+    sharedTasks: tasks,
+    listTargets: () => [vm],
+    refreshOne: callback,
+  })
+  const health = createHealthProbeMonitor({ sharedTasks: tasks, listTargets: () => [vm], runChat: callback })
+  const usage = createUsageProbeMonitor({ sharedTasks: tasks, listTargets: () => [vm], probeOne: callback })
+  const runner = new VmTestScheduleRunner({
+    projectRoot: root,
+    sharedTasks: tasks,
+    settings: () => new RuntimeSettings(db),
+    list: () => [vm],
+    runTest: callback,
+  })
+  const operation = await coordinator.beginMaintenance({ kind: 'backup' })
+  try {
+    await assert.rejects(credential.runOnce(), { code: 'database_maintenance' })
+    await assert.rejects(health.runRealProbe(), { code: 'database_maintenance' })
+    await assert.rejects(usage.runOnce(), { code: 'database_maintenance' })
+    await assert.rejects(runner.start(), { code: 'database_maintenance' })
+    assert.equal(calls, 0)
+    assert.equal((await db.pool.query('SELECT count(*)::integer AS n FROM background_task_runs')).rows[0].n, 0)
+  } finally {
+    await Promise.all([credential.stop(), health.stop(), usage.stop(), runner.stop()])
+    await operation.close()
+    await coordinator.cancelDrain(operation.operationId)
+  }
+})
+
+test('the exact restore owner can reload VM schedules inside its trusted rebind scope', async (t) => {
+  const { db, root, coordinator, tasks } = await fixture(t)
+  const runner = new VmTestScheduleRunner({
+    projectRoot: root,
+    sharedTasks: tasks,
+    settings: () => new RuntimeSettings(db),
+    list: () => [vm],
+    runTest: async () => ({ ok: true }),
+  })
+  t.after(() => runner.stop())
+  const request = await coordinator.admit({ kind: 'http' })
+  await request.run(async () => {
+    const operation = await coordinator.beginMaintenanceFromCurrentActivity({ kind: 'restore' })
+    try {
+      await operation.beginRestore()
+      await operation.beginRebind()
+      await operation.runAdmin(() => runner.reload())
+      await runner.reload()
+      await coordinator.acknowledgeEpoch(2)
+      await operation.resume()
+    } finally {
+      await operation.close()
+    }
+  })
+  await request.complete({ ended: true })
+})

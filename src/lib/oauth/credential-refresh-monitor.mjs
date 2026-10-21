@@ -10,6 +10,7 @@ import { hasRefreshPresence, needsRefresh } from './oauth-credentials.mjs'
 import { backgroundTasksFor } from '../core/shared-background-tasks.mjs'
 import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 import { getSharedRoutingState } from '../admin/shared-routing-config.mjs'
+import { getActivityCoordinator } from '../db/database.mjs'
 
 export const DEFAULT_CREDENTIAL_REFRESH = Object.freeze({
   enabled: true,
@@ -118,7 +119,13 @@ export function createCredentialRefreshMonitor(opts = {}) {
         const routing = getSharedRoutingState(sharedTasks?.repo.db)
         if (!routing)
           throw Object.assign(new Error('shared routing unavailable'), { code: 'routing_config_unavailable' })
-        await routing.refresh()
+        const coordinator = getActivityCoordinator(routing.db)
+        if (!coordinator)
+          throw Object.assign(new Error('activity coordinator unavailable'), { code: 'maintenance_unavailable' })
+        await coordinator.runActivity({ kind: 'credential_refresh_configuration' }, async () => ({
+          ended: true,
+          value: await routing.refresh(),
+        }))
       }
       if (scheduled && (current !== generation || !config.enabled)) return lastRun
       const started = nowFn()

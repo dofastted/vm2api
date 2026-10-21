@@ -7,6 +7,8 @@ import { getVm, listVms } from '../vm/vm-registry.mjs'
 import { listTestableModels } from './vm-test-chat.mjs'
 import { backgroundTasksFor } from '../core/shared-background-tasks.mjs'
 import { VmTestScheduleResultsRepo } from '../db/repos/vm-test-schedule-results-repo.mjs'
+import { getActivityCoordinator } from '../db/database.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 
 export const VM_TEST_SCHEDULE_PREFIX = 'vm_test_schedule:'
 export const VM_TEST_SCHEDULE_DEFAULT_KEY = 'vm_test_schedule_default'
@@ -375,6 +377,25 @@ export class VmTestScheduleRunner {
     return settings
   }
 
+  async _activity(kind, callback) {
+    const coordinator = this.sharedTasks && getActivityCoordinator(this.sharedTasks.db)
+    if (!coordinator && isKubernetesMode())
+      throw Object.assign(new Error('activity coordinator unavailable'), { code: 'maintenance_unavailable' })
+    if (coordinator) {
+      try {
+        // Restore rebind is already owned by the exact maintenance operation;
+        // admitting an ordinary activity would correctly be refused in REBINDING.
+        const scope = coordinator.assertActivity()
+        if (scope.operation || scope.transferredTo) return callback()
+      } catch (error) {
+        if (error.code !== 'maintenance_activity_closed') throw error
+      }
+    }
+    return coordinator
+      ? coordinator.runActivity({ kind }, async () => ({ ended: true, value: await callback() }))
+      : callback()
+  }
+
   _vm(vmId) {
     return this.listVms().find((vm) => vm.id === vmId) || getVm(this.projectRoot, vmId)
   }
@@ -647,7 +668,7 @@ export class VmTestScheduleRunner {
 
   reload() {
     const generation = ++this.discoveryGeneration
-    const pending = this._reload(generation)
+    const pending = this._activity('vm_test_discovery', () => this._reload(generation))
     this.discoveries.add(pending)
     pending.then(
       () => this.discoveries.delete(pending),
@@ -708,21 +729,26 @@ export class VmTestScheduleRunner {
     if (!this.started || this.running.has(vmId)) return
     this.running.add(vmId)
     try {
-      const settings = this._settings()
-      if (this.sharedTasks) await settings.refresh?.()
-      if (!this.started) return
-      if (!this._vm(vmId)) {
-        await this.remove(vmId)
-        return
-      }
-      const schedule = this._stored(vmId)
-      if (!schedule?.enabled) return
-      if (expectedRevision != null && expectedRevision !== schedule.revision) {
-        this.discoveryGeneration++
-        this._syncJob(vmId, schedule)
-        return
-      }
-      const startedAt = this.sharedTasks ? await this.sharedTasks.now() : this.now()
+      const prepared = await this._activity('vm_test_prepare', async () => {
+        const settings = this._settings()
+        if (this.sharedTasks) await settings.refresh?.()
+        if (!this.started) return
+        if (!this._vm(vmId)) {
+          await this.remove(vmId)
+          return
+        }
+        const schedule = this._stored(vmId)
+        if (!schedule?.enabled) return
+        if (expectedRevision != null && expectedRevision !== schedule.revision) {
+          this.discoveryGeneration++
+          this._syncJob(vmId, schedule)
+          return
+        }
+        const startedAt = this.sharedTasks ? await this.sharedTasks.now() : this.now()
+        return { settings, schedule, startedAt }
+      })
+      if (!prepared) return
+      const { settings, schedule, startedAt } = prepared
       const execute = async () => {
         if (!this.started || (this.resultRepo && !(await this.resultRepo.isCurrent(vmId, schedule.revision)))) {
           return { notStarted: true }
