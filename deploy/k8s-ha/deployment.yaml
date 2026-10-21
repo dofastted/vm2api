@@ -35,8 +35,10 @@ spec:
             - name: run
               mountPath: /opt/vm2api/data/run
             - name: bin
+              mountPath: /opt/vm2api/bin
               $patch: delete
             - name: share
+              mountPath: /opt/vm2api/share
               $patch: delete
             - name: node-trust
               mountPath: /etc/vm2api
