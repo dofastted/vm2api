@@ -1,5 +1,5 @@
 /**
- * Multi API-key store (sub2api-inspired, SQLite-backed).
+ * Multi API-key store (sub2api-inspired, PostgreSQL-backed).
  *
  * Fields aligned to sub2api basics:
  *   name, status, expires_at, quota (+ used), rate windows → rpm,
@@ -18,7 +18,7 @@
 import { keyScopeFromRecord, normalizeKeyScope } from './key-scope.mjs'
 import { VmPoolsRepo } from '../db/repos/vm-pools-repo.mjs'
 import crypto from 'node:crypto'
-import { resolveStoreDb } from '../db/database.mjs'
+import { resolveStoreDb, withTransaction } from '../db/database.mjs'
 import { ApiKeysRepo } from '../db/repos/api-keys-repo.mjs'
 import { maybeEncrypt, maybeDecrypt } from '../db/secure.mjs'
 import { calculateCost, normalizeUsage } from './pricing.mjs'
@@ -139,10 +139,10 @@ export class ApiKeyStore {
   }
 
   /** sub2api: an api key of a disabled/deleted user must not authenticate. */
-  _ownerActive(rec) {
+  async _ownerActive(rec) {
     if (!rec?.user_id) return true // legacy unowned keys keep working
     try {
-      const owner = this.users.getById(rec.user_id)
+      const owner = await this.users.getById(rec.user_id)
       // soft-deleted owner is invisible here → key is revoked with them
       return !!owner && owner.status === 'active'
     } catch {
@@ -160,14 +160,14 @@ export class ApiKeyStore {
     this.users = new UsersRepo(db)
   }
 
-  list({ reveal = false } = {}) {
+  async list({ reveal = false } = {}) {
     const names = new Map()
     try {
-      for (const pool of new VmPoolsRepo(this.db).list()) names.set(pool.id, pool.name)
+      for (const pool of await new VmPoolsRepo(this.db).list()) names.set(pool.id, pool.name)
     } catch {
       // A database opened before migration 034 still lists keys.
     }
-    return this.repo.list().map((k) => {
+    return (await this.repo.list()).map((k) => {
       const v = publicKeyView(k, { reveal })
       v.inflight = this.inflight.get(k.id) || 0
       if (v.vm_pool_id) v.vm_pool_name = names.get(v.vm_pool_id) || null
@@ -175,34 +175,38 @@ export class ApiKeyStore {
     })
   }
 
-  getById(id) {
-    return this.repo.getById(id)
+  async getById(id) {
+    return await this.repo.getById(id)
   }
 
-  authenticate(token) {
+  async authenticate(token) {
     if (!token) return { ok: false, reason: 'missing' }
     const hash = this._hash(token)
-    const indexed = this.repo.getByHash(hash)
+    const indexed = await this.repo.getByHash(hash)
     if (indexed) {
-      if (!this._ownerActive(indexed)) return { ok: false, reason: 'user_disabled' }
+      if (!(await this._ownerActive(indexed))) return { ok: false, reason: 'user_disabled' }
       return { ok: true, record: indexed }
     }
     // One-time migration for legacy plaintext rows.
-    for (const rec of this.repo.list()) {
+    for (const rec of await this.repo.list()) {
       if (String(rec.key || '').startsWith(HASH_MARKER)) continue
       if (timingSafeEqualStr(token, rec.key)) {
-        rec.key_hash = hash
-        rec.key_prefix = String(token).slice(0, 10)
-        rec.key_suffix = String(token).slice(-4)
-        rec.key_secret = maybeEncrypt(token)
-        rec.key = HASH_MARKER + hash
-        return { ok: true, record: this.repo.update(rec) }
+        return withTransaction(this.db, async () => {
+          const current = await this.repo.getById(rec.id, { forUpdate: true })
+          if (!current || !timingSafeEqualStr(token, current.key)) return { ok: false, reason: 'invalid' }
+          current.key_hash = hash
+          current.key_prefix = String(token).slice(0, 10)
+          current.key_suffix = String(token).slice(-4)
+          current.key_secret = maybeEncrypt(token)
+          current.key = HASH_MARKER + hash
+          return { ok: true, record: await this.repo.update(current) }
+        })
       }
     }
     return { ok: false, reason: 'invalid' }
   }
 
-  create(input = {}) {
+  async create(input = {}) {
     const name =
       String(input.name || 'default')
         .trim()
@@ -213,7 +217,7 @@ export class ApiKeyStore {
       throw Object.assign(new Error('key has invalid characters'), { code: 'key_invalid' })
     }
     const keyHash = this._hash(key)
-    if (this.repo.getByHash(keyHash) || this.repo.getByKey(key)) {
+    if ((await this.repo.getByHash(keyHash)) || (await this.repo.getByKey(key))) {
       throw Object.assign(new Error('key already exists'), { code: 'key_exists' })
     }
 
@@ -256,65 +260,67 @@ export class ApiKeyStore {
     if (rec.expires_at && Number.isNaN(Date.parse(rec.expires_at))) {
       throw Object.assign(new Error('invalid expires_at'), { code: 'invalid_expires_at' })
     }
-    const stored = this.repo.insert(rec)
+    const stored = await this.repo.insert(rec)
     return { ...stored, key, _plain_key: key }
   }
 
-  update(id, patch = {}) {
-    const rec = this.repo.getById(id)
-    if (!rec) return null
-    if (patch.name != null) rec.name = String(patch.name).trim().slice(0, 100) || rec.name
-    if (patch.status != null) {
-      const st = String(patch.status).toLowerCase()
-      if (!['active', 'disabled'].includes(st)) {
-        throw Object.assign(new Error('invalid status'), { code: 'invalid_status' })
+  async update(id, patch = {}) {
+    return withTransaction(this.db, async () => {
+      const rec = await this.repo.getById(id, { forUpdate: true })
+      if (!rec) return null
+      if (patch.name != null) rec.name = String(patch.name).trim().slice(0, 100) || rec.name
+      if (patch.status != null) {
+        const st = String(patch.status).toLowerCase()
+        if (!['active', 'disabled'].includes(st)) {
+          throw Object.assign(new Error('invalid status'), { code: 'invalid_status' })
+        }
+        rec.status = st
       }
-      rec.status = st
-    }
-    if (patch.max_concurrency != null)
-      rec.max_concurrency = clampInt(patch.max_concurrency, 0, 128, rec.max_concurrency)
-    if (patch.quota_requests != null) rec.quota_requests = clampInt(patch.quota_requests, 0, 1e9, rec.quota_requests)
-    if (patch.quota != null) rec.quota = Math.max(0, Number(patch.quota) || 0)
-    if (patch.rate_limit_5h != null) rec.rate_limit_5h = Math.max(0, Number(patch.rate_limit_5h) || 0)
-    if (patch.rate_limit_1d != null) rec.rate_limit_1d = Math.max(0, Number(patch.rate_limit_1d) || 0)
-    if (patch.rate_limit_7d != null) rec.rate_limit_7d = Math.max(0, Number(patch.rate_limit_7d) || 0)
-    if (patch.group_id != null) rec.group_id = Number(patch.group_id) || 1
-    if (patch.user_id != null) rec.user_id = patch.user_id
-    if (patch.rpm != null) rec.rpm = clampInt(patch.rpm, 0, 1e6, rec.rpm)
-    if (patch.expires_at === null) rec.expires_at = null
-    else if (patch.expires_at != null) {
-      const iso = new Date(patch.expires_at).toISOString()
-      if (Number.isNaN(Date.parse(iso)))
-        throw Object.assign(new Error('invalid expires_at'), { code: 'invalid_expires_at' })
-      rec.expires_at = iso
-    }
-    if (patch.reset_quota === true) {
-      rec.quota_requests_used = 0
-      rec.quota_used = 0
-    }
-    // recover from quota_exhausted whenever spend is back under the cap
-    if (
-      rec.status === 'quota_exhausted' &&
-      !((rec.quota ?? 0) > 0 && (rec.quota_used ?? 0) >= rec.quota) &&
-      !(rec.quota_requests > 0 && (rec.quota_requests_used ?? 0) >= rec.quota_requests)
-    ) {
-      rec.status = 'active'
-    }
-    if (patch.category != null) {
-      rec.category = String(patch.category).toLowerCase() === 'api' ? 'api' : 'oauth'
-    }
-    const scope = normalizeKeyScope(patch, { partial: true, current: rec })
-    if (scope) Object.assign(rec, storedKeyScope(scope))
-    rec.updated_at = nowIso()
-    return this.repo.update(rec)
+      if (patch.max_concurrency != null)
+        rec.max_concurrency = clampInt(patch.max_concurrency, 0, 128, rec.max_concurrency)
+      if (patch.quota_requests != null) rec.quota_requests = clampInt(patch.quota_requests, 0, 1e9, rec.quota_requests)
+      if (patch.quota != null) rec.quota = Math.max(0, Number(patch.quota) || 0)
+      if (patch.rate_limit_5h != null) rec.rate_limit_5h = Math.max(0, Number(patch.rate_limit_5h) || 0)
+      if (patch.rate_limit_1d != null) rec.rate_limit_1d = Math.max(0, Number(patch.rate_limit_1d) || 0)
+      if (patch.rate_limit_7d != null) rec.rate_limit_7d = Math.max(0, Number(patch.rate_limit_7d) || 0)
+      if (patch.group_id != null) rec.group_id = Number(patch.group_id) || 1
+      if (patch.user_id != null) rec.user_id = patch.user_id
+      if (patch.rpm != null) rec.rpm = clampInt(patch.rpm, 0, 1e6, rec.rpm)
+      if (patch.expires_at === null) rec.expires_at = null
+      else if (patch.expires_at != null) {
+        const iso = new Date(patch.expires_at).toISOString()
+        if (Number.isNaN(Date.parse(iso)))
+          throw Object.assign(new Error('invalid expires_at'), { code: 'invalid_expires_at' })
+        rec.expires_at = iso
+      }
+      if (patch.reset_quota === true) {
+        rec.quota_requests_used = 0
+        rec.quota_used = 0
+      }
+      // recover from quota_exhausted whenever spend is back under the cap
+      if (
+        rec.status === 'quota_exhausted' &&
+        !((rec.quota ?? 0) > 0 && (rec.quota_used ?? 0) >= rec.quota) &&
+        !(rec.quota_requests > 0 && (rec.quota_requests_used ?? 0) >= rec.quota_requests)
+      ) {
+        rec.status = 'active'
+      }
+      if (patch.category != null) {
+        rec.category = String(patch.category).toLowerCase() === 'api' ? 'api' : 'oauth'
+      }
+      const scope = normalizeKeyScope(patch, { partial: true, current: rec })
+      if (scope) Object.assign(rec, storedKeyScope(scope))
+      rec.updated_at = nowIso()
+      return await this.repo.update(rec)
+    })
   }
 
   /**
    * Plaintext of a managed key for panel copy.
    * @returns {null | { ok: false, code: string } | { ok: true, id, name, key }}
    */
-  reveal(id) {
-    const rec = this.repo.getById(id)
+  async reveal(id) {
+    const rec = await this.repo.getById(id, { forUpdate: true })
     if (!rec) return null
     const key = plainApiKey(rec)
     if (!key) return { ok: false, code: 'key_not_recoverable' }
@@ -322,26 +328,28 @@ export class ApiKeyStore {
   }
 
   /** Issue a fresh plaintext on the same record; the old value stops working. */
-  rotate(id) {
-    const rec = this.repo.getById(id)
-    if (!rec) return null
-    const key = generateApiKey()
-    const keyHash = this._hash(key)
-    if (this.repo.getByHash(keyHash)) {
-      throw Object.assign(new Error('key already exists'), { code: 'key_exists' })
-    }
-    rec.key = HASH_MARKER + keyHash
-    rec.key_hash = keyHash
-    rec.key_prefix = key.slice(0, 10)
-    rec.key_suffix = key.slice(-4)
-    rec.key_secret = maybeEncrypt(key)
-    rec.updated_at = nowIso()
-    const stored = this.repo.update(rec)
-    return { ...stored, key, _plain_key: key }
+  async rotate(id) {
+    return withTransaction(this.db, async () => {
+      const rec = await this.repo.getById(id, { forUpdate: true })
+      if (!rec) return null
+      const key = generateApiKey()
+      const keyHash = this._hash(key)
+      if (await this.repo.getByHash(keyHash)) {
+        throw Object.assign(new Error('key already exists'), { code: 'key_exists' })
+      }
+      rec.key = HASH_MARKER + keyHash
+      rec.key_hash = keyHash
+      rec.key_prefix = key.slice(0, 10)
+      rec.key_suffix = key.slice(-4)
+      rec.key_secret = maybeEncrypt(key)
+      rec.updated_at = nowIso()
+      const stored = await this.repo.update(rec)
+      return { ...stored, key, _plain_key: key }
+    })
   }
 
-  remove(id) {
-    const removed = this.repo.remove(id)
+  async remove(id) {
+    const removed = await this.repo.remove(id)
     if (!removed) return false
     this.inflight.delete(id)
     this.rpmBuckets.delete(id)
@@ -365,7 +373,9 @@ export class ApiKeyStore {
    * Pre-flight gate for a managed key. Does not acquire concurrency.
    * @returns {{ ok: true } | { ok: false, code, message, status }}
    */
-  canAccept(rec, now = Date.now()) {
+  async canAccept(rec, now = Date.now(), { reserve = false } = {}) {
+    const owner = rec?.user_id ? await this.users.getById(rec.user_id) : null
+    const ownedKeys = rec?.user_id ? await this.repo.list() : []
     if (!rec) return { ok: false, code: 'invalid_api_key', message: 'Invalid credentials', status: 401 }
     if (rec.status !== 'active') {
       if (rec.status === 'quota_exhausted') {
@@ -439,17 +449,10 @@ export class ApiKeyStore {
     // sub2api user-level cap: sum of inflight across all of the owner's keys.
     // The operator (admin) is never capped: its traffic is the platform's own.
     if (rec.user_id) {
-      const owner = (() => {
-        try {
-          return this.users.getById(rec.user_id)
-        } catch {
-          return null
-        }
-      })()
       const cap = owner?.role === 'admin' ? 0 : Number(owner?.concurrency) || 0
       if (cap > 0) {
         let total = 0
-        for (const k of this.repo.list()) {
+        for (const k of ownedKeys) {
           if (k.user_id === rec.user_id) total += this.inflight.get(k.id) || 0
         }
         if (total >= cap) {
@@ -463,18 +466,17 @@ export class ApiKeyStore {
         }
       }
     }
+    if (reserve) {
+      this.inflight.set(rec.id, (this.inflight.get(rec.id) || 0) + 1)
+      const arr = this.rpmBuckets.get(rec.id) || []
+      arr.push(now)
+      this.rpmBuckets.set(rec.id, arr)
+    }
     return { ok: true }
   }
 
-  acquire(rec, now = Date.now()) {
-    const gate = this.canAccept(rec, now)
-    if (!gate.ok) return gate
-    const id = rec.id
-    this.inflight.set(id, (this.inflight.get(id) || 0) + 1)
-    const arr = this.rpmBuckets.get(id) || []
-    arr.push(now)
-    this.rpmBuckets.set(id, arr)
-    return { ok: true }
+  async acquire(rec, now = Date.now()) {
+    return this.canAccept(rec, now, { reserve: true })
   }
 
   release(recOrId) {
@@ -485,9 +487,9 @@ export class ApiKeyStore {
     else this.inflight.set(id, n)
   }
 
-  recordUsage(recOrId, usage = {}, { model = null, rateMultiplier = 1, officialCost } = {}) {
+  async recordUsage(recOrId, usage = {}, { model = null, rateMultiplier = 1, officialCost } = {}) {
     const id = typeof recOrId === 'string' ? recOrId : recOrId?.id
-    if (!this.repo.getById(id)) return null
+    if (!(await this.repo.getById(id))) return null
     const normalized = normalizeUsage(usage)
     let billed = officialCost
     if (billed == null) billed = usage.total_cost
@@ -501,22 +503,18 @@ export class ApiKeyStore {
     // key quota/windows track actual (group-rated) spend, sub2api-style
     const rate = Number.isFinite(Number(rateMultiplier)) ? Number(rateMultiplier) : 1
     const cost = billed * rate
-    const rec = this.repo.recordUsage(id, {
+    const rec = await this.repo.recordUsage(id, {
       tokens_in: Number(normalized.input_tokens) || Number(normalized.tokens_in) || 0,
       tokens_out: Number(normalized.output_tokens) || Number(normalized.tokens_out) || 0,
       cache_read_tokens: Number(normalized.cache_read_input_tokens ?? normalized.cache_read_tokens) || 0,
       cache_creation_tokens: Number(normalized.cache_creation_input_tokens ?? normalized.cache_creation_tokens) || 0,
       cost,
     })
-    // sub2api: the billing write flips the key when the USD quota runs out
-    if (rec && rec.status === 'active' && (rec.quota ?? 0) > 0 && (rec.quota_used ?? 0) >= rec.quota) {
-      this.repo.update({ ...rec, status: 'quota_exhausted', updated_at: nowIso() })
-    }
     return rec
   }
 
-  snapshot() {
-    const keys = this.list({ reveal: false })
+  async snapshot() {
+    const keys = await this.list({ reveal: false })
     return {
       total: keys.length,
       active: keys.filter((k) => k.status === 'active').length,

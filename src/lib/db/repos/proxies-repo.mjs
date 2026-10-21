@@ -64,19 +64,19 @@ export class ProxiesRepo {
     this._clear = db.prepare('DELETE FROM proxies')
     this._insert = db.prepare(`
       INSERT INTO proxies (${COLUMNS.join(', ')})
-      VALUES (${COLUMNS.map(() => '?').join(', ')})
+      VALUES (${COLUMNS.map((_, i) => '$' + (i + 1)).join(', ')})
     `)
   }
 
-  loadAll() {
-    return this._all.all().map(rowToProxy)
+  async loadAll() {
+    return (await this._all.all()).map(rowToProxy)
   }
 
-  replaceAll(proxies = []) {
-    withTransaction(this.db, () => {
-      this._clear.run()
+  async replaceAll(proxies = []) {
+    await withTransaction(this.db, async () => {
+      await this._clear.run()
       for (const p of proxies) {
-        this._insert.run(
+        await this._insert.run(
           ...COLUMNS.map((c) => {
             if (c === 'enabled') return p.enabled === false ? 0 : 1
             if (c === 'domain_forward') return p.domain_forward ? 1 : 0
@@ -89,11 +89,11 @@ export class ProxiesRepo {
     })
   }
 
-  getConfig(fallback = null) {
-    return this.settings.get(CONFIG_KEY, fallback)
+  async getConfig(fallback = null) {
+    return await this.settings.get(CONFIG_KEY, fallback)
   }
 
-  setConfig(config) {
-    return this.settings.set(CONFIG_KEY, config)
+  async setConfig(config) {
+    return await this.settings.set(CONFIG_KEY, config)
   }
 }

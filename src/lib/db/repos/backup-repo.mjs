@@ -34,49 +34,49 @@ export class BackupRepo {
     this.db = db
     this._insert = db.prepare(`
       INSERT INTO backup_records (${COLUMNS.join(', ')})
-      VALUES (${COLUMNS.map(() => '?').join(', ')})
+      VALUES (${COLUMNS.map((_, i) => '$' + (i + 1)).join(', ')})
     `)
-    this._get = db.prepare('SELECT * FROM backup_records WHERE id = ?')
-    this._list = db.prepare('SELECT * FROM backup_records ORDER BY created_at DESC LIMIT ?')
-    this._remove = db.prepare('DELETE FROM backup_records WHERE id = ?')
+    this._get = db.prepare('SELECT * FROM backup_records WHERE id = $1')
+    this._list = db.prepare('SELECT * FROM backup_records ORDER BY created_at DESC LIMIT $1')
+    this._remove = db.prepare('DELETE FROM backup_records WHERE id = $1')
   }
 
-  insert(rec) {
-    this._insert.run(
+  async insert(rec) {
+    await this._insert.run(
       ...COLUMNS.map((c) => {
         if (c === 'includes_json') return rec.includes ? JSON.stringify(rec.includes) : (rec.includes_json ?? null)
         return rec[c] ?? null
       }),
     )
-    return this.get(rec.id)
+    return await this.get(rec.id)
   }
 
-  get(id) {
-    return fromRow(this._get.get(id))
+  async get(id) {
+    return fromRow(await this._get.get(id))
   }
 
-  list({ limit = 100 } = {}) {
-    return this._list.all(Math.max(1, Math.min(500, Number(limit) || 100))).map(fromRow)
+  async list({ limit = 100 } = {}) {
+    return (await this._list.all(Math.max(1, Math.min(500, Number(limit) || 100)))).map(fromRow)
   }
 
-  remove(id) {
-    return this._remove.run(id).changes > 0
+  async remove(id) {
+    return (await this._remove.run(id)).changes > 0
   }
 
-  lastSuccessful({ kinds = null } = {}) {
-    const rows = this.list({ limit: 200 })
+  async lastSuccessful({ kinds = null } = {}) {
+    const rows = await this.list({ limit: 200 })
     return rows.find((r) => r.status === 'ok' && (!kinds || kinds.includes(r.kind))) || null
   }
 
   /** Successful non-pre_restore backups beyond `keep` newest. */
-  beyondRetention(keep) {
-    const rows = this.list({ limit: 500 }).filter((r) => r.status === 'ok' && r.kind !== 'pre_restore')
+  async beyondRetention(keep) {
+    const rows = (await this.list({ limit: 500 })).filter((r) => r.status === 'ok' && r.kind !== 'pre_restore')
     return rows.slice(Math.max(0, keep))
   }
 
   /** pre_restore backups beyond `keep` newest. */
-  preRestoreBeyond(keep = 3) {
-    const rows = this.list({ limit: 500 }).filter((r) => r.status === 'ok' && r.kind === 'pre_restore')
+  async preRestoreBeyond(keep = 3) {
+    const rows = (await this.list({ limit: 500 })).filter((r) => r.status === 'ok' && r.kind === 'pre_restore')
     return rows.slice(Math.max(0, keep))
   }
 }

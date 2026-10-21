@@ -16,49 +16,55 @@ function open() {
   return { dir, store, repo: new VmPoolsRepo(store.db) }
 }
 
-test('pool membership is shared by keys and applied on the next read', () => {
+test('pool membership is shared by keys and applied on the next read', async () => {
   const { dir, store, repo } = open()
   try {
-    const pool = createVmPool(repo, { name: 'Pool A', vm_ids: ['vm-01', 'vm-02'] }, vms)
-    const key = store.create({ name: 'a', vm_pool_id: pool.id })
-    const other = store.create({ name: 'b', vm_pool_id: pool.id })
+    const pool = await createVmPool(repo, { name: 'Pool A', vm_ids: ['vm-01', 'vm-02'] }, vms)
+    const key = await store.create({ name: 'a', vm_pool_id: pool.id })
+    const other = await store.create({ name: 'b', vm_pool_id: pool.id })
     assert.equal(key.vm_pool_id, pool.id)
     assert.equal(other.vm_pool_id, pool.id)
-    const before = applyVmPool(keyScopeFromRecord(store.getById(key.id)), (id) => repo.get(id))
+    const before = await applyVmPool(keyScopeFromRecord(await store.getById(key.id)), async (id) => await repo.get(id))
     assert.deepEqual(before.allowed_vms, ['vm-01', 'vm-02'])
-    updateVmPool(repo, pool.id, { vm_ids: ['vm-03'] }, vms)
-    const after = applyVmPool(keyScopeFromRecord(store.getById(other.id)), (id) => repo.get(id))
+    await updateVmPool(repo, pool.id, { vm_ids: ['vm-03'] }, vms)
+    const after = await applyVmPool(keyScopeFromRecord(await store.getById(other.id)), async (id) => await repo.get(id))
     assert.deepEqual(after.allowed_vms, ['vm-03'])
     assert.equal(after.vm_pool_error, null)
-    assert.throws(() => createVmPool(repo, { name: 'Pool B', vm_ids: ['vm-03'] }, vms), /其他账号池/)
+    await assert.rejects(async () => await createVmPool(repo, { name: 'Pool B', vm_ids: ['vm-03'] }, vms), /其他账号池/)
     assert.equal(
-      repo.list().some((item) => item.name === 'Pool B'),
+      (await repo.list()).some((item) => item.name === 'Pool B'),
       false,
     )
-    updateVmPool(repo, pool.id, { enabled: false }, vms)
-    const disabled = applyVmPool(keyScopeFromRecord(store.getById(key.id)), (id) => repo.get(id))
+    await updateVmPool(repo, pool.id, { enabled: false }, vms)
+    const disabled = await applyVmPool(
+      keyScopeFromRecord(await store.getById(key.id)),
+      async (id) => await repo.get(id),
+    )
     assert.equal(disabled.vm_pool_error, 'disabled')
     assert.deepEqual(disabled.allowed_vms, [])
-    assert.equal(deleteVmPool(repo, pool.id).error, 'vm_pool_in_use')
-    store.update(key.id, { vm_pool_id: null })
-    store.update(other.id, { vm_pool_id: null })
-    assert.equal(deleteVmPool(repo, pool.id).ok, true)
-    const gone = applyVmPool(keyScopeFromRecord({ vm_pool_id: pool.id, group_type: 'all' }), (id) => repo.get(id))
+    assert.equal((await deleteVmPool(repo, pool.id)).error, 'vm_pool_in_use')
+    await store.update(key.id, { vm_pool_id: null })
+    await store.update(other.id, { vm_pool_id: null })
+    assert.equal((await deleteVmPool(repo, pool.id)).ok, true)
+    const gone = await applyVmPool(
+      keyScopeFromRecord({ vm_pool_id: pool.id, group_type: 'all' }),
+      async (id) => await repo.get(id),
+    )
     assert.equal(gone.vm_pool_error, 'missing')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('an empty pool stays empty instead of meaning every VM', () => {
+test('an empty pool stays empty instead of meaning every VM', async () => {
   const { dir, store, repo } = open()
   try {
-    const pool = createVmPool(repo, { name: 'Empty' }, vms)
-    const key = store.create({ name: 'e', vm_pool_id: pool.id })
-    const scope = applyVmPool(keyScopeFromRecord(store.getById(key.id)), (id) => repo.get(id))
+    const pool = await createVmPool(repo, { name: 'Empty' }, vms)
+    const key = await store.create({ name: 'e', vm_pool_id: pool.id })
+    const scope = await applyVmPool(keyScopeFromRecord(await store.getById(key.id)), async (id) => await repo.get(id))
     assert.equal(scope.vm_pool_error, 'empty')
     assert.deepEqual(scope.allowed_vms, [])
-    assert.equal(store.list()[0].vm_pool_name, 'Empty')
+    assert.equal((await store.list())[0].vm_pool_name, 'Empty')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }

@@ -22,10 +22,10 @@ function rowToEntry(row) {
 export class StickyRepo {
   constructor(db = getDb()) {
     this.db = db
-    this._get = db.prepare('SELECT * FROM sticky_sessions WHERE key = ?')
+    this._get = db.prepare('SELECT * FROM sticky_sessions WHERE key = $1')
     this._upsert = db.prepare(`
       INSERT INTO sticky_sessions (key, account_id, vm_id, session_id, device_id, bound_at, expires_at, hits, generation, slot_index)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
       ON CONFLICT(key) DO UPDATE SET
         account_id = excluded.account_id,
         vm_id = excluded.vm_id,
@@ -37,28 +37,28 @@ export class StickyRepo {
         generation = excluded.generation,
         slot_index = excluded.slot_index
     `)
-    this._delete = db.prepare('DELETE FROM sticky_sessions WHERE key = ?')
-    this._deleteByAccount = db.prepare('DELETE FROM sticky_sessions WHERE account_id = ? OR vm_id = ?')
-    this._purge = db.prepare('DELETE FROM sticky_sessions WHERE expires_at < ?')
+    this._delete = db.prepare('DELETE FROM sticky_sessions WHERE key = $1')
+    this._deleteByAccount = db.prepare('DELETE FROM sticky_sessions WHERE account_id = $1 OR vm_id = $2')
+    this._purge = db.prepare('DELETE FROM sticky_sessions WHERE expires_at < $1')
     this._dropAlias = db.prepare(`
       DELETE FROM sticky_sessions
       WHERE key = 'envelope'
-        OR key LIKE 'ch:%'
-        OR key LIKE 'dev:%'
-        OR key LIKE '%:envelope'
-        OR key LIKE '%:ch:%'
-        OR key LIKE '%:dev:%'
+        OR ascii_fold(key) LIKE 'ch:%'
+        OR ascii_fold(key) LIKE 'dev:%'
+        OR ascii_fold(key) LIKE '%:envelope'
+        OR ascii_fold(key) LIKE '%:ch:%'
+        OR ascii_fold(key) LIKE '%:dev:%'
     `)
     this._all = db.prepare('SELECT * FROM sticky_sessions')
     this._count = db.prepare('SELECT COUNT(*) c FROM sticky_sessions')
   }
 
-  get(key) {
-    return rowToEntry(this._get.get(key))
+  async get(key) {
+    return rowToEntry(await this._get.get(key))
   }
 
-  upsert(key, ent) {
-    this._upsert.run(
+  async upsert(key, ent) {
+    await this._upsert.run(
       key,
       ent.account_id ?? null,
       ent.vm_id ?? null,
@@ -72,31 +72,31 @@ export class StickyRepo {
     )
   }
 
-  remove(key) {
-    this._delete.run(key)
+  async remove(key) {
+    await this._delete.run(key)
   }
 
-  removeByAccount({ accountId = null, vmId = null } = {}) {
+  async removeByAccount({ accountId = null, vmId = null } = {}) {
     if (!accountId && !vmId) return 0
-    return this._deleteByAccount.run(accountId || '', vmId || '').changes
+    return (await this._deleteByAccount.run(accountId || '', vmId || '')).changes
   }
 
-  purgeExpired(now = Date.now()) {
-    return this._purge.run(now).changes
+  async purgeExpired(now = Date.now()) {
+    return (await this._purge.run(now)).changes
   }
 
   /** Content fingerprints and device aliases are not conversation slots. */
-  dropAliasKeys() {
-    return this._dropAlias.run().changes
+  async dropAliasKeys() {
+    return (await this._dropAlias.run()).changes
   }
 
-  all() {
+  async all() {
     const out = {}
-    for (const row of this._all.all()) out[row.key] = rowToEntry(row)
+    for (const row of await this._all.all()) out[row.key] = rowToEntry(row)
     return out
   }
 
-  count() {
-    return this._count.get().c
+  async count() {
+    return (await this._count.get()).c
   }
 }

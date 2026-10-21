@@ -18,9 +18,9 @@ export class VmsRepo {
   constructor(db = getDb()) {
     this.db = db
     this.settings = new SettingsRepo(db)
-    this._get = db.prepare('SELECT * FROM vms WHERE id = ?')
+    this._get = db.prepare('SELECT * FROM vms WHERE id = $1')
     this._list = db.prepare('SELECT * FROM vms ORDER BY id')
-    this._remove = db.prepare('DELETE FROM vms WHERE id = ?')
+    this._remove = db.prepare('DELETE FROM vms WHERE id = $1')
     this._upsert = db.prepare(`
       INSERT INTO vms (
         id, name, status, schedulable, email, account_uuid, org_uuid,
@@ -28,7 +28,7 @@ export class VmsRepo {
         proxy_id, claude_code_version, timezone, locale,
         owner_user_id, origin,
         vm_json, encrypted, file_mtime_ms, synced_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
       ON CONFLICT(id) DO UPDATE SET
         name = excluded.name, status = excluded.status, schedulable = excluded.schedulable,
         email = excluded.email, account_uuid = excluded.account_uuid, org_uuid = excluded.org_uuid,
@@ -44,7 +44,7 @@ export class VmsRepo {
   }
 
   /** Mirror a parsed vm.json object into the table. */
-  upsertFromVmJson(vm, { mtimeMs = null } = {}) {
+  async upsertFromVmJson(vm, { mtimeMs = null } = {}) {
     if (!vm?.id) return null
     const now = new Date().toISOString()
     const c = vm.claude || {}
@@ -55,7 +55,7 @@ export class VmsRepo {
     })
     const safeVm = { ...vm, claude: safeClaude }
     const enc = encryptionEnabled()
-    this._upsert.run(
+    await this._upsert.run(
       vm.id,
       vm.name ?? null,
       vm.status ?? null,
@@ -81,43 +81,40 @@ export class VmsRepo {
       vm.created_at ?? now,
       now,
     )
-    return this.get(vm.id)
+    return await this.get(vm.id)
   }
 
   /** Returns {row, vm} — row has decrypted credential columns, vm is the parsed vm.json. */
-  get(id) {
-    return this._decode(this._get.get(id))
+  async get(id) {
+    return this._decode(await this._get.get(id))
   }
 
-  list() {
-    return this._list.all().map((r) => this._decode(r))
+  async list() {
+    return (await this._list.all()).map((r) => this._decode(r))
   }
 
-  ids() {
-    return this.db
-      .prepare('SELECT id FROM vms ORDER BY id')
-      .all()
-      .map((r) => r.id)
+  async ids() {
+    return (await this.db.prepare('SELECT id FROM vms ORDER BY id').all()).map((r) => r.id)
   }
 
-  remove(id) {
-    return this._remove.run(id).changes > 0
+  async remove(id) {
+    return (await this._remove.run(id)).changes > 0
   }
 
-  count() {
-    return this.db.prepare('SELECT COUNT(*) c FROM vms').get().c
+  async count() {
+    return (await this.db.prepare('SELECT COUNT(*) c FROM vms').get()).c
   }
 
-  getActiveVmId() {
-    return this.settings.get(ACTIVE_VM_KEY, null)
+  async getActiveVmId() {
+    return await this.settings.get(ACTIVE_VM_KEY, null)
   }
 
-  setActiveVmId(id) {
-    this.settings.set(ACTIVE_VM_KEY, id)
+  async setActiveVmId(id) {
+    await this.settings.set(ACTIVE_VM_KEY, id)
   }
 
-  clearActiveVmId() {
-    this.settings.remove(ACTIVE_VM_KEY)
+  async clearActiveVmId() {
+    await this.settings.remove(ACTIVE_VM_KEY)
   }
 
   _decode(row) {

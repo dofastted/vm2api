@@ -43,26 +43,26 @@ export class RequestAttemptsRepo {
         started_at, completed_at, upstream_status, error_scope, action,
         cooldown_until, downstream_committed, terminal_state, usage_json,
         wait_ms, ttft_ms, latency_ms
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
     `)
     this._complete = db.prepare(`
       UPDATE request_attempts SET
-        completed_at = ?, upstream_status = ?, error_scope = ?, action = ?,
-        cooldown_until = ?, downstream_committed = ?, terminal_state = ?,
-        usage_json = ?, ttft_ms = ?, latency_ms = ?
-      WHERE request_id = ? AND attempt_no = ?
+        completed_at = $1, upstream_status = $2, error_scope = $3, action = $4,
+        cooldown_until = $5, downstream_committed = $6, terminal_state = $7,
+        usage_json = $8, ttft_ms = $9, latency_ms = $10
+      WHERE request_id = $11 AND attempt_no = $12
     `)
     this._list = db.prepare(`
-      SELECT * FROM request_attempts WHERE request_id = ? ORDER BY attempt_no
+      SELECT * FROM request_attempts WHERE request_id = $1 ORDER BY attempt_no
     `)
     this._removeOld = db.prepare(`
-      DELETE FROM request_attempts WHERE started_at < ?
+      DELETE FROM request_attempts WHERE started_at < $1
     `)
   }
 
-  begin({ requestId, attemptNo, vmId, accountId, model, selectionReason, waitMs = 0 }) {
+  async begin({ requestId, attemptNo, vmId, accountId, model, selectionReason, waitMs = 0 }) {
     const startedAt = new Date().toISOString()
-    this._insert.run(
+    await this._insert.run(
       requestId,
       attemptNo,
       vmId ?? null,
@@ -82,11 +82,11 @@ export class RequestAttemptsRepo {
       null,
       null,
     )
-    return this.list(requestId).find((item) => item.attempt_no === attemptNo) || null
+    return (await this.list(requestId)).find((item) => item.attempt_no === attemptNo) || null
   }
 
-  complete(requestId, attemptNo, result = {}) {
-    this._complete.run(
+  async complete(requestId, attemptNo, result = {}) {
+    await this._complete.run(
       new Date().toISOString(),
       result.upstreamStatus ?? null,
       result.errorScope ?? null,
@@ -100,16 +100,16 @@ export class RequestAttemptsRepo {
       requestId,
       attemptNo,
     )
-    return this.list(requestId).find((item) => item.attempt_no === attemptNo) || null
+    return (await this.list(requestId)).find((item) => item.attempt_no === attemptNo) || null
   }
 
-  list(requestId) {
-    return this._list.all(requestId).map(rowToAttempt)
+  async list(requestId) {
+    return (await this._list.all(requestId)).map(rowToAttempt)
   }
 
-  cleanup(retainDays = 7) {
+  async cleanup(retainDays = 7) {
     const days = Math.max(1, Number(retainDays) || 7)
     const cutoff = new Date(Date.now() - days * 86400_000).toISOString()
-    return this._removeOld.run(cutoff).changes
+    return (await this._removeOld.run(cutoff)).changes
   }
 }
