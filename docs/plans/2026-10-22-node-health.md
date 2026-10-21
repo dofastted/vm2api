@@ -26,4 +26,4 @@ generation 保留原始数字文本或受限 opaque string，避免 JavaScript �
 
 这是原捕获身份的一次节点观察，不是某个推理 job 的终止证明。ready_slots、正常 health、HTTP 取消或连接关闭不能释放 unknown execution。controller 仍须在提交前用 PG 准入，并等待原 command 的持久完成。
 
-尚未提供节点 credential refresh、运行期 config 修改、controller 断连后独立 drain、无 ticket recovery receipt 或完整 HA 故障接管。这些不通过 health 隐式执行。旧 SSH/SFTP/Docker 权限迁移仍未完成，因此不能据此开启生产多副本 HA。
+controller 断连后的独立读取见同目录 `2026-10-22-node-recovery.md`。尚未提供节点 credential refresh、运行期 config 修改、无 ticket recovery receipt 或完整 HA 故障接管。这些不通过 health 隐式执行。旧 SSH/SFTP/Docker 权限迁移仍未完成，因此不能据此开启生产多副本 HA。

@@ -153,3 +153,16 @@ func TestNodeDetachedDrainKeepsIncompleteOrErrorTerminalUnknown(t *testing.T) {
 		})
 	}
 }
+
+func TestNodeDetachedDeliveryBoundsStalledControllerWithoutEndingKernelRead(t *testing.T) {
+	writer, reader := net.Pipe()
+	defer writer.Close()
+	defer reader.Close()
+	sink := &detachedResponseWriter{connection: writer, writeTimeout: 5 * time.Millisecond}
+	if n, err := sink.Write([]byte("first")); err != nil || n != 5 || !sink.detached {
+		t.Fatalf("stalled delivery: %d %v %t", n, err, sink.detached)
+	}
+	if n, err := sink.Write([]byte("remaining kernel bytes")); err != nil || n != 22 {
+		t.Fatalf("discarded delivery: %d %v", n, err)
+	}
+}

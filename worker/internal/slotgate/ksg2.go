@@ -367,9 +367,8 @@ func (s *Server) forwardFenced(ctx context.Context, conn net.Conn, reader *bufio
 	}
 	stop := context.AfterFunc(ctx, func() { target.Close() })
 	defer stop()
-	if _, err = io.WriteString(conn, "OK\n"); err != nil {
-		return
-	}
+	delivery := &detachedResponseWriter{connection: conn, writeTimeout: prefaceTimeout}
+	io.WriteString(delivery, "OK\n")
 	response, err := http.ReadResponse(bufio.NewReader(target), req)
 	if err != nil {
 		return
@@ -381,7 +380,7 @@ func (s *Server) forwardFenced(ctx context.Context, conn net.Conn, reader *bufio
 	response.Close = true
 	terminal := observeClaudeTerminal(response, req, body, request.CommandID, request.Kind)
 	response.Body = terminal
-	if err = response.Write(conn); err != nil {
+	if err = response.Write(delivery); err != nil {
 		return
 	}
 	if terminal.completed(response) {
