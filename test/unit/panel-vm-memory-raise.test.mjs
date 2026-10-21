@@ -113,9 +113,17 @@ test('standalone memory errors preserve the original failure without a database 
   const root = tmpProject('memory-error')
   const failure = new Error('synthetic memory failure')
   try {
-    const { handlePanel } = handler(root, { memory: '1g' }, {
-      raiseDockerSlotMemory: () => { throw failure },
-    })
+    const { handlePanel } = handler(
+      root,
+      { memory: '1g' },
+      {
+        raiseDockerSlotMemory: () => {
+          throw failure
+        },
+      },
+    )
     await assert.rejects(patchVm(handlePanel, 'memory-error'), (error) => error === failure)
-  } finally { fs.rmSync(root, { recursive: true, force: true }) }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })

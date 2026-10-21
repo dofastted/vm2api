@@ -660,7 +660,8 @@ export function createPanelHandler(ctx) {
     } catch (error) {
       if (artifactCallbacks.getStore()) artifactCallbacks.getStore().uncertain = true
       await operation?.markUncertain?.()
-      await markCurrentProxyOperationUncertain(getDb())
+      if (isKubernetesMode() || ctx.proxyOperations)
+        await markCurrentProxyOperationUncertain(ctx.proxyOperations?.db || getDb())
       throw error
     }
     if (
@@ -671,7 +672,8 @@ export function createPanelHandler(ctx) {
     ) {
       if (artifactCallbacks.getStore()) artifactCallbacks.getStore().uncertain = true
       await operation?.markUncertain?.()
-      await markCurrentProxyOperationUncertain(getDb())
+      if (isKubernetesMode() || ctx.proxyOperations)
+        await markCurrentProxyOperationUncertain(ctx.proxyOperations?.db || getDb())
     }
     return result
   }
