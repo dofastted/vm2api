@@ -1,0 +1,345 @@
+{
+  "checks": [
+    {
+      "source_sha": "ff4e43486fa98af21aee366f8c3779202e81e1d0",
+      "kind": "bootstrap_and_database_final",
+      "files_under_test": 2,
+      "files": 1,
+      "totals": {
+        "tests": 25,
+        "pass": 25,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failures": [],
+      "log_sha256": "819387c9bfc1e5b3b9d97949eabc2c54eecc435b43dfd51a47fe4b52ad7dd582"
+    },
+    {
+      "source_sha": "48aa2a284ab057c2b525d5426c6e7dd1c74a744d",
+      "kind": "targeted",
+      "files_under_test": 6,
+      "files": 1,
+      "totals": {
+        "tests": 50,
+        "pass": 50,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failures": [],
+      "log_sha256": "e901d9329ff2f8737a8a2991f119c2c2697d5f9c9dad5c428248be3a8ce211e7"
+    },
+    {
+      "source_sha": "f53e005f4794782b0a8e0b4bb152f68d4a3a7aa0",
+      "kind": "targeted",
+      "files": 1,
+      "totals": {
+        "tests": 73,
+        "pass": 73,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failures": [],
+      "log_sha256": "4913c39084d5bc1b02896629e1b8f8d0d1a5bb58c179702f217df03591fc9a6e"
+    },
+    {
+      "source_sha": "4de403f9ee5411fee1c2266ef80cfd4315267a4b",
+      "kind": "full_unit",
+      "files": 395,
+      "totals": {
+        "tests": 4373,
+        "pass": 4339,
+        "fail": 24,
+        "cancelled": 0,
+        "skipped": 10
+      },
+      "failures": [
+        {
+          "file": "test/unit/cli-hop-body.test.mjs",
+          "test": "prepareCliHopBody drops metadata and CLI-owned system but keeps official agent leftover",
+          "error_sha256": "1afab608e2476a88783807d547c9b239ad4ac831679731a3ed4d44812b0c31d2",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/unit/cli-hop-body.test.mjs",
+          "test": "every cli-hop system becomes the identity plus the caller body",
+          "error_sha256": "312320875ebe3fc483f8bb570b16a93bb368278d2b6a78f71a763436e2a81b3f",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/unit/cli-hop-body.test.mjs",
+          "test": "cli-hop normalizes mixed caller markers to the official template",
+          "error_sha256": "312320875ebe3fc483f8bb570b16a93bb368278d2b6a78f71a763436e2a81b3f",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/unit/cli-hop-body.test.mjs",
+          "test": "cli-hop drops caller system/tools markers and restamps last plus penultimate user",
+          "error_sha256": "7862d1144e6748d63aa6e98dabf5a9fa7d8d1582f7fbfe851d978eb15f6d5c92",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/unit/cli-hop-body.test.mjs",
+          "test": "cli-hop short history only marks the last message",
+          "error_sha256": "81b2ee3a4bb8b1ab4f351bede4398032dc9637c683b82b146630fd6857e94c2e",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/unit/cli-hop-body.test.mjs",
+          "test": "cli-hop uses the inbound session TTL on both message anchors",
+          "error_sha256": "01732f4307f58f479e9b3d8329d92a93d9c748c58028276022257d3645e77e87",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/unit/convert-cache-shape.test.mjs",
+          "test": "openai.chat multi-turn cli-hop marks last and penultimate user",
+          "error_sha256": "312320875ebe3fc483f8bb570b16a93bb368278d2b6a78f71a763436e2a81b3f",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/unit/ha-recovery-monitor.test.mjs",
+          "test": "HA monitor immediately scans 20 live-owner parents, advances its local cursor every five seconds and resumes after stop",
+          "error_sha256": "b80aa5a1ce275b6e57778f3d885c22a44b929c3c0d8ffc2447f8a48a74e9762c",
+          "matches_verified_baseline": false
+        },
+        {
+          "file": "test/unit/ha-recovery-monitor.test.mjs",
+          "test": "HA monitor leaves a connected owner alone then recovers its exact original proof and bills once after disconnection",
+          "error_sha256": "b80aa5a1ce275b6e57778f3d885c22a44b929c3c0d8ffc2447f8a48a74e9762c",
+          "matches_verified_baseline": false
+        },
+        {
+          "file": "test/unit/ha-recovery-monitor.test.mjs",
+          "test": "a real PG scan error completes only the scanner activity and logs its public code without retaining a scanner claim",
+          "error_sha256": "b80aa5a1ce275b6e57778f3d885c22a44b929c3c0d8ffc2447f8a48a74e9762c",
+          "matches_verified_baseline": false
+        },
+        {
+          "file": "test/unit/ha-recovery-monitor.test.mjs",
+          "test": "HA monitor retains original unknown execution and quota when the node is unavailable",
+          "error_sha256": "b80aa5a1ce275b6e57778f3d885c22a44b929c3c0d8ffc2447f8a48a74e9762c",
+          "matches_verified_baseline": false
+        },
+        {
+          "file": "test/unit/ha-recovery-monitor.test.mjs",
+          "test": "HA monitor retains original unknown execution and quota when the node is not_found",
+          "error_sha256": "b80aa5a1ce275b6e57778f3d885c22a44b929c3c0d8ffc2447f8a48a74e9762c",
+          "matches_verified_baseline": false
+        },
+        {
+          "file": "test/unit/ha-recovery-monitor.test.mjs",
+          "test": "HA monitor serializes runOnce and stop waits for its original in-flight read and durable settlement",
+          "error_sha256": "b80aa5a1ce275b6e57778f3d885c22a44b929c3c0d8ffc2447f8a48a74e9762c",
+          "matches_verified_baseline": false
+        },
+        {
+          "file": "test/unit/ha-recovery-scan.test.mjs",
+          "test": "scan paginates live-owner candidates and never treats old request timestamps as owner loss",
+          "error_sha256": "b80aa5a1ce275b6e57778f3d885c22a44b929c3c0d8ffc2447f8a48a74e9762c",
+          "matches_verified_baseline": false
+        },
+        {
+          "file": "test/unit/ha-recovery-scan.test.mjs",
+          "test": "scan continues after one exact recovery throws and excludes fully released settled requests",
+          "error_sha256": "b80aa5a1ce275b6e57778f3d885c22a44b929c3c0d8ffc2447f8a48a74e9762c",
+          "matches_verified_baseline": false
+        },
+        {
+          "file": "test/unit/ha-recovery-scan.test.mjs",
+          "test": "scan includes already paid but unreleased reservations and excludes broken activity/epoch links",
+          "error_sha256": "b80aa5a1ce275b6e57778f3d885c22a44b929c3c0d8ffc2447f8a48a74e9762c",
+          "matches_verified_baseline": false
+        },
+        {
+          "file": "test/unit/node-management-client.test.mjs",
+          "test": "real PostgreSQL grants drive pinned TLS initial publication and launch without holding a transaction over node I/O",
+          "error_sha256": "b80aa5a1ce275b6e57778f3d885c22a44b929c3c0d8ffc2447f8a48a74e9762c",
+          "matches_verified_baseline": false
+        },
+        {
+          "file": "test/unit/node-management-client.test.mjs",
+          "test": "a lost publication acknowledgement retains the original VM operation and does not issue another command",
+          "error_sha256": "b80aa5a1ce275b6e57778f3d885c22a44b929c3c0d8ffc2447f8a48a74e9762c",
+          "matches_verified_baseline": false
+        },
+        {
+          "file": "test/unit/node-management-client.test.mjs",
+          "test": "failure to commit the received node receipt retains ownership and never repeats the mutation",
+          "error_sha256": "b80aa5a1ce275b6e57778f3d885c22a44b929c3c0d8ffc2447f8a48a74e9762c",
+          "matches_verified_baseline": false
+        },
+        {
+          "file": "test/unit/node-management-client.test.mjs",
+          "test": "a payload digest mismatch is rejected before TLS or any publication bytes",
+          "error_sha256": "b80aa5a1ce275b6e57778f3d885c22a44b929c3c0d8ffc2447f8a48a74e9762c",
+          "matches_verified_baseline": false
+        },
+        {
+          "file": "test/unit/node-management-client.test.mjs",
+          "test": "DRAINING refusal before issuing a publication sends no bytes and releases only that unstarted operation",
+          "error_sha256": "b80aa5a1ce275b6e57778f3d885c22a44b929c3c0d8ffc2447f8a48a74e9762c",
+          "matches_verified_baseline": false
+        },
+        {
+          "file": "test/unit/node-management-client.test.mjs",
+          "test": "a certificate pin mismatch sends no application bytes and retains no active VM operation",
+          "error_sha256": "b80aa5a1ce275b6e57778f3d885c22a44b929c3c0d8ffc2447f8a48a74e9762c",
+          "matches_verified_baseline": false
+        },
+        {
+          "file": "test/unit/node-management-client.test.mjs",
+          "test": "an extra secret field in a completed node acknowledgement is rejected and never persisted or exposed",
+          "error_sha256": "b80aa5a1ce275b6e57778f3d885c22a44b929c3c0d8ffc2447f8a48a74e9762c",
+          "matches_verified_baseline": false
+        },
+        {
+          "file": "test/unit/node-management-client.test.mjs",
+          "test": "a lost launch acknowledgement preserves the exact launch operation after Docker start",
+          "error_sha256": "b80aa5a1ce275b6e57778f3d885c22a44b929c3c0d8ffc2447f8a48a74e9762c",
+          "matches_verified_baseline": false
+        }
+      ],
+      "log_sha256": "f8e4aae9e978bdc72a40df02adc395827c4f69c7932e73d0a6a2fd08af44b5bc"
+    },
+    {
+      "source_sha": "4de403f9ee5411fee1c2266ef80cfd4315267a4b",
+      "kind": "full_e2e",
+      "files": 35,
+      "totals": {
+        "tests": 135,
+        "pass": 117,
+        "fail": 17,
+        "cancelled": 0,
+        "skipped": 1
+      },
+      "failures": [
+        {
+          "file": "test/e2e/account-pool-failover.e2e.test.mjs",
+          "test": "account1 quota exhaustion rotates to account2 and commits sticky final account",
+          "error_sha256": "a25cb59468e4decc45b1d8b3a66b0a4fbd2195af9f498da39aa83e92169825b5",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/e2e/auto-mode.e2e.test.mjs",
+          "test": "classifier terminal/error/cancel/concurrency boundaries through actual ELF",
+          "error_sha256": "84e06146cf59485c3b46e05070f6a9a184ecb010a57ef8ab1b62a3ebae90c36a",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/e2e/completions.e2e.test.mjs",
+          "test": "POST /v1/completions old OpenAI prompt format",
+          "error_sha256": "fdb99383e1e333346a42b82cbf8092357575350f6a03f1ec297c9cee064b1e6d",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/e2e/credentials.e2e.test.mjs",
+          "test": "reset destroys home and recreates the same slot without oauth",
+          "error_sha256": "dfd84d60931072a864eb94f48ce13d4223e963ae919898236f1859bedc8d917e",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/e2e/crs-default.e2e.test.mjs",
+          "test": "default POST /v1/messages uses Go worker pool, not CLI",
+          "error_sha256": "fdb99383e1e333346a42b82cbf8092357575350f6a03f1ec297c9cee064b1e6d",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/e2e/errors.e2e.test.mjs",
+          "test": "unknown model is rejected without hop",
+          "error_sha256": "6ea819807eaee98e6a4c38817c9f011fb426e6a5ff499fa441d8f7bb07371461",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/e2e/health.e2e.test.mjs",
+          "test": "harness /health 200 and honest capabilities",
+          "error_sha256": "c23279127cad70a092d0cc7bb6ac400e05aff03e4614d1eaaa40252878c221c2",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/e2e/hermes.e2e.test.mjs",
+          "test": "Hermes unofficial: Go relay keeps persona/tools and never launches CLI",
+          "error_sha256": "97ae4156650fa0de2f613aa7753666781545cb2fe7818350a6df904ab696cdbc",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/e2e/hermes.e2e.test.mjs",
+          "test": "Hermes system blob without UA still classifies as hermes",
+          "error_sha256": "a2c6319267f1b752b63d96a41e15b1a5133952e88f0c145bc96dda53fd31cbe5",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/e2e/hop-meta.e2e.test.mjs",
+          "test": "CRS default keeps thinking + max_tokens + temperature in official body",
+          "error_sha256": "ebe0dbf58f38b7e1df9e2c55463c11e712927dcbc047102419ad10a8d38f1420",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/e2e/hop-meta.e2e.test.mjs",
+          "test": "CRS keeps a long caller system in the structured official prompt",
+          "error_sha256": "ba0ac5e90ea008839723c328e8b172228820837ab895e425d2190c1aa5caa708",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/e2e/hop-meta.e2e.test.mjs",
+          "test": "legacy CLI selector cannot drop HTTP request parameters",
+          "error_sha256": "ebe0dbf58f38b7e1df9e2c55463c11e712927dcbc047102419ad10a8d38f1420",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/e2e/messages.e2e.test.mjs",
+          "test": "HTTP worker preserves thinking, sampling and max_tokens",
+          "error_sha256": "8353154a58e84007d91c2d217c516dc771e359ddb43d527c7db6734ab5cff6ca",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/e2e/messages.e2e.test.mjs",
+          "test": "HTTP path preserves long system without CLI argv truncation",
+          "error_sha256": "085c13ab1e54fb324bce5520b12006fbf7f84b4a69a1c5cf9e09727b5b33da99",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/e2e/openai-responses.e2e.test.mjs",
+          "test": "POST /v1/responses non-stream shape: object + output_text + usage",
+          "error_sha256": "a7c7c455e65d737b0a872d5d7b4cbe5a5c2372e3117e3f361d6dbe8f223c1392",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/e2e/openai-responses.e2e.test.mjs",
+          "test": "POST /v1/responses stream includes [DONE]",
+          "error_sha256": "0be25feaedaa697c09835d15c8cfdae694de2710330cadfadcbdfa146625a099",
+          "matches_verified_baseline": true
+        },
+        {
+          "file": "test/e2e/openai-responses.e2e.test.mjs",
+          "test": "POST /v1/responses tools → function_call in output",
+          "error_sha256": "a7c7c455e65d737b0a872d5d7b4cbe5a5c2372e3117e3f361d6dbe8f223c1392",
+          "matches_verified_baseline": true
+        }
+      ],
+      "log_sha256": "c6a7bb44205cbc7a5d87fad73d37f508e2bbccc77f3fb5c130e19dd49a3d4098"
+    },
+    {
+      "source_sha": "0d9c434866532cfccd952ac990881400ed364dd1",
+      "kind": "isolated_runner_pg_fixture_recheck",
+      "files": 3,
+      "totals": {
+        "tests": 18,
+        "pass": 18,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failures": [],
+      "log_sha256": "b65a5919348845238e561354be2083d032fe522005725e04b189748df2073fb3"
+    }
+  ],
+  "note": "Full suites were not all green. 17 new unit failures were missing automatic test PG initialization; the runner fix was verified separately, not represented as a new full-suite pass.",
+  "final_static_checks": {
+    "source_sha": "ff4e43486fa98af21aee366f8c3779202e81e1d0",
+    "biome_files": 779,
+    "biome_pass": true,
+    "changed_mjs_syntax_pass": true
+  }
+}

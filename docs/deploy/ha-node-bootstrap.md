@@ -48,8 +48,10 @@ node scripts/ha-node-bootstrap.mjs slot-create --config /private/bootstrap.json
 
 也可从显式文件描述符读取凭据。此时从配置移除 `credentialFile`，调用 `slot-create --config /private/bootstrap.json --credential-fd 0` 并由操作者的受控 secret 管道提供 stdin。凭据内容不进入 argv、stdout 或 PostgreSQL VM 元数据。
 
-`slot-create` 持有一个持久 bootstrap BG claim，顺序执行独立的 allocate、publish-initial、launch VM operation。每一步都等待严格 receipt 后再进入下一步。RT 仅保存在节点未挂载的 canonical 路径；guest 只得到 AT 投影。launch receipt 确认后才原子新建公开 VM 元数据和指纹。已有 VM、并发插入或未知旧任务均拒绝，不覆盖记录。stdout 只输出公开 IDs、manifest 摘要与原 captured Fence；它证明节点 launch/元数据步骤，不证明真实模型推理成功。
+`slot-create` 持有一个持久 bootstrap BG claim，顺序执行独立的 allocate、publish-initial、launch VM operation。每一步都等待严格 receipt 后再进入下一步。refresh token（RT）仅保存在节点未挂载的 canonical 路径；guest 只得到 access token（AT）投影。launch receipt 确认后才原子新建公开 VM 元数据和指纹。已有 VM、并发插入或未知旧任务均拒绝，不覆盖记录。stdout 只输出公开 IDs、manifest 摘要与原 captured Fence；它证明节点 launch/元数据步骤，不证明真实模型推理成功。
 
 发生发送后的超时、断连、节点启动未知或元数据提交失败时，相关持久 claim 和目标占位保留。再次执行不会换 command ID 重发。首个节点回调前明确 busy 的拒绝会结束本次未提交任务。首个 allocate 在 TLS 应用数据发送前失败时，只有原 grant 的未开始终态及撤销已持久化后才结束本次任务；操作者修正 pin/连接配置后可显式再运行。终态写入失败仍保留未知占位。不能删 claim、改 VM ID 或重新发 allocation 来猜测恢复；须先按节点终止/恢复证据流程人工核实。CLI 不提供未知任务自动恢复，也不升级旧的 RT 已暴露 manifest。
 
-测试只覆盖合成凭据、任务 PostgreSQL、TLS 和 fake Engine；没有真实 provider 或现有节点操作。闭源 kernel 在投影更新后是否重新加载 AT，仍需独立业务验证。旧 HA credential monitor 不能因此直接启用。
+初始化 CLI 的测试覆盖合成凭据、任务 PostgreSQL、TLS 和 fake Engine，没有真实供应商或现有节点操作。另有 [预编译凭据投影测试](../../test/e2e/prebuilt-credential-projection.e2e.test.mjs)：实际预编译 ELF 内核和 CLI 在本机隔离环境中，向本地合成供应商分别发送原子替换前后的 AT；内核与 CLI 进程及 socket 保持不变，投影中不含 RT。该结果确认被测制品可读取更新后的 AT 投影。
+
+真实模型推理、真实 RT 刷新和既有生产节点行为仍未验证。普通 Claude Docker HA 的合成多节点验证范围见 [部署验证记录](kubernetes-ha.md#验证记录)。旧 HA credential monitor 仍保持停用；上述测试不改变支持范围，部署依赖 [#649](https://github.com/dofastted/vm2api/pull/649) 仍为 open。

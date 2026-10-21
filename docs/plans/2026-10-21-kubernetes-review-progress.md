@@ -1,6 +1,6 @@
 # Kubernetes 独立审查与定向验证（#648，进行中）
 
-本报告记录固定源码的检查结果，不作为多节点高可用验收。控制面仍保留 `ControlPlaneLock` 和 `replicas: 1`。已发布的 Draft PR #651 仍为早期提交；后续本地实现尚未推送。
+本报告前五轮记录单实例基础阶段的固定源码结果，不作为后续 HA 验收。显式 `kubernetes-ha` 和独立双节点部署验证已在后续增量加入，默认 `kubernetes` 清单仍为单实例。已发布的 Draft PR #651 仍为早期提交；后续本地实现尚未推送。
 
 ## 全量检查
 
@@ -60,3 +60,19 @@ NUL 问题动态复现得到 PostgreSQL `22021`。修复恢复依赖分支已有
 定向协议检查使用专用测试 PostgreSQL、合成请求、模拟节点或测试自己的子进程。KSG2 集成使用合成 executor 身份，没有调用真实 Docker Engine；它不能证明可信启动或权限隔离。旧 E2E harness 的 mock gateway 仍会创建真实本机 Docker 网络，已在 `f9f396dd` 隔离；此前资源按精确 fixture、network ID、无端点和无 helper 证据核对后，仅删除 10 个测试网络。6 个带业务端点的网络和 3 个固定名网络保留。生产 capability 来源、节点文件发布和管理授权、多节点运行及故障接管仍在实现。旧预编译 payload 继续复用。
 
 结构化统计、日志摘要与边界见 [验证证据](evidence/kubernetes/review-progress/verification.json)。已精确删除 9 个完成检查的 root 工作树或源码副本；另有固定检查脚本自行清理的目录。专用 PostgreSQL 与共享 Go 缓存在后续验证结束前保留。没有修改生产环境。
+
+## HA 增量的独立审查
+
+第六轮审查源码 `a6b67f3b664cb2616cd43aa053f20bcc8fac2f2f`，读取 95 文件增量。发现 1 项 P1、2 项 P2，分别涉及配置刷新重启旧 monitor、Responses 500 回归和旧 attempt 被清理。已用实际 PG/HTTP 复现并修复，见 [第六轮报告](evidence/kubernetes/review-progress/independent-review-a6b67f3b.md)。
+
+第七轮审查源码 `ceb2775221fb73549e542855356073bacf8e54a8`，独立会话 `01a15f94-f885-7b82-b9b0-879ec03faf2d`，读取 79 文件增量。发现 2 项 P2：明确未发送的刷新 grant 占用 generation；派发前取消的非空临时 command ID 导致计费预约保留。已分别通过真实 PG/TLS 和正常 handler 失败规格修复，见 [第七轮报告](evidence/kubernetes/review-progress/independent-review-ceb27752.md)。该轮没有覆盖后来的 bootstrap CLI、恢复扫描监控器和滚动终止修复。
+
+后续同行审查另复现 allocation pin 拒绝的未开始处理，以及扫描进程 SIGKILL 留下 activity 的问题。两项均已完成针对性修复。滚动更新测试还复现了已接受 SSE 的 keep-alive 连接在排空后持续复用。`f53e005f` 修正后，独立进程的完整 SSE 和正常退出检查通过；专用 k3d 的滚动期间 25 次业务请求均为 200，采样可用副本数至少为二。
+
+第八轮审查源码 `f53e005f`，独立会话 `01a15fb1-f02a-7761-9bf2-7cdaa751f3aa`，读取 27 文件增量。新增 2 项 P2：初始化 CLI 接受保留 VM ID，以及节点初始化隐式迁移业务 schema。`48aa2a28` 修正，相关固定源码检查 50/50。见 [第八轮报告](evidence/kubernetes/review-progress/independent-review-f53e005f.md)。
+
+第九轮审查源码 `48aa2a28`，独立会话 `01a15fc4-4eb3-72f3-a643-07fd87e6f797`，复核上述修复。新增混合大小写 schema 被 `to_regnamespace` 折叠小写而错误拒绝的 P2；实际 PG 失败规格 `9ae50abd` 先于一行修复 `ff4e4348`。见 [第九轮报告](evidence/kubernetes/review-progress/independent-review-48aa2a28.md)。
+
+多副本实现、固定源码检查、既有全量失败及运行镜像的具体证据，见 [HA 验证记录](2026-10-22-kubernetes-ha-verification.md)。此处保留早期记录的历史范围，不把早期单实例结果替换为 HA 验收。
+
+第十轮审查源码 `ff4e4348`，独立会话 `01a15fc9-6ab0-7da1-98e3-a3a61d0fe2e9`，确认混合大小写修复，未发现新增可证 P0/P1/P2。主会话的固定归档 CLI/数据库检查为 25/25，779 文件格式检查通过。见 [第十轮报告](evidence/kubernetes/review-progress/independent-review-ff4e4348.md)。

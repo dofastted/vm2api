@@ -1,4 +1,4 @@
-# Optional. Install metrics-server and choose limits for your available nodes.
+# Optional. Install metrics-server and reserve one extra node above maxReplicas for rolling updates.
 # Do not manage spec.replicas with kubectl apply after enabling this HPA.
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler

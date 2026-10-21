@@ -1,0 +1,348 @@
+{
+  "source_sha": "f53e005f4794782b0a8e0b4bb152f68d4a3a7aa0",
+  "namespace": "vm2api-648-ha-01a15dc9",
+  "checks": [
+    {
+      "name": "scale_two_to_three",
+      "passed": true,
+      "target": 3,
+      "requests": 19,
+      "minAvailable": 2,
+      "pods": [
+        {
+          "name": "vm2api-5cffcbb4c7-f42qm",
+          "uid": "ba415d10-1a01-475d-8bff-cbc185a0456e",
+          "node": "k3d-vm2api-648-01a15dc9-agent-0",
+          "imageID": "sha256:f2ce099f07273f1a187c01cfbbaffaee24f2cad57239b7627da917d17d5dcb3e"
+        },
+        {
+          "name": "vm2api-5cffcbb4c7-fwrgw",
+          "uid": "36a30ca6-278d-4451-bea8-951dc7be916f",
+          "node": "k3d-vm2api-648-01a15dc9-agent-1",
+          "imageID": "sha256:f2ce099f07273f1a187c01cfbbaffaee24f2cad57239b7627da917d17d5dcb3e"
+        },
+        {
+          "name": "vm2api-5cffcbb4c7-sx6tk",
+          "uid": "2c8e22da-76e7-44f9-b8eb-b3016311a67e",
+          "node": "k3d-vm2api-648-01a15dc9-server-0",
+          "imageID": "sha256:f2ce099f07273f1a187c01cfbbaffaee24f2cad57239b7627da917d17d5dcb3e"
+        }
+      ]
+    },
+    {
+      "name": "scale_three_to_two",
+      "passed": true,
+      "target": 2,
+      "requests": 1,
+      "minAvailable": 2,
+      "pods": [
+        {
+          "name": "vm2api-5cffcbb4c7-f42qm",
+          "uid": "ba415d10-1a01-475d-8bff-cbc185a0456e",
+          "node": "k3d-vm2api-648-01a15dc9-agent-0",
+          "imageID": "sha256:f2ce099f07273f1a187c01cfbbaffaee24f2cad57239b7627da917d17d5dcb3e"
+        },
+        {
+          "name": "vm2api-5cffcbb4c7-sx6tk",
+          "uid": "2c8e22da-76e7-44f9-b8eb-b3016311a67e",
+          "node": "k3d-vm2api-648-01a15dc9-server-0",
+          "imageID": "sha256:f2ce099f07273f1a187c01cfbbaffaee24f2cad57239b7627da917d17d5dcb3e"
+        }
+      ]
+    },
+    {
+      "name": "rolling_restart",
+      "passed": true,
+      "target": 2,
+      "requests": 25,
+      "minAvailable": 2,
+      "pods": [
+        {
+          "name": "vm2api-5ccbfd86f-68772",
+          "uid": "2ffcdd02-5520-4332-8934-0d4529e0e0f2",
+          "node": "k3d-vm2api-648-01a15dc9-server-0",
+          "imageID": "sha256:f2ce099f07273f1a187c01cfbbaffaee24f2cad57239b7627da917d17d5dcb3e"
+        },
+        {
+          "name": "vm2api-5ccbfd86f-9wjjb",
+          "uid": "b1be4ded-b032-467d-b803-4c374a140b2f",
+          "node": "k3d-vm2api-648-01a15dc9-agent-1",
+          "imageID": "sha256:f2ce099f07273f1a187c01cfbbaffaee24f2cad57239b7627da917d17d5dcb3e"
+        }
+      ]
+    }
+  ],
+  "requests": [
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 170
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 142
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 141
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 143
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 352
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 124
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 146
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 153
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 145
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 128
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 125
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 123
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 108
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 98
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 112
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 105
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 117
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 108
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 102
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 119
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 123
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 110
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 126
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 108
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 107
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 114
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 105
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 121
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 111
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 99
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 103
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 113
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 106
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 105
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 107
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 120
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 112
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 113
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 121
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 164
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 124
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 656
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 128
+    },
+    {
+      "status": 200,
+      "stream": true,
+      "ok": true,
+      "ms": 101
+    },
+    {
+      "status": 200,
+      "stream": false,
+      "ok": true,
+      "ms": 110
+    }
+  ],
+  "passed": true
+}
