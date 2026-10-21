@@ -56,6 +56,10 @@ export async function fakeSlotgate(t, options = {}) {
           key === 'generation' && typeof value === 'number' ? context.source : value)
         buffer = buffer.subarray(second + 1)
         requests.push(command)
+        if (command.op === 'recovery-status') {
+          const reply = typeof options.recoveryStatus === 'function' ? options.recoveryStatus(command) : options.recoveryStatus
+          return socket.end(wire(reply || { ok: true, found: false, unknown: true }) + '\n')
+        }
         if (command.op === 'health') {
           const reply = typeof options.health === 'function' ? options.health(command) : options.health
           if (options.holdHealth) return
