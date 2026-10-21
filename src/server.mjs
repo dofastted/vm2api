@@ -1119,8 +1119,8 @@ const server = http.createServer(async (req, res) => {
         503,
         makeError({
           type: ErrorType.OVERLOADED,
-          code: 'restore_in_progress',
-          message: 'Gateway is restoring from backup; retry shortly',
+          code: backupService.isRestoring ? 'restore_in_progress' : 'maintenance_in_progress',
+          message: 'Database maintenance in progress; retry shortly',
           status: 503,
         }).body,
       )

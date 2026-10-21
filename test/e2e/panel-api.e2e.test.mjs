@@ -202,7 +202,8 @@ test('sessionKey import without SOCKS5 is rejected', async () => {
 })
 
 test('sessionKey import rejected when bound proxy is dead', async () => {
-  const gw = await startGateway()
+  // Slow proxy probing must not overlap the independent boot backup timer.
+  const gw = await startGateway({ env: { KIN_BACKUP_DISABLED: '1' } })
   try {
     const added = await api(gw, 'POST', '/api/panel/proxies/import', {
       body: { text: '10.9.9.9:1080' },
@@ -304,7 +305,7 @@ test('generate-auth-url then exchange-code writes fake oauth', async () => {
 })
 
 test('local egress slot generates auth url and exchanges code', async () => {
-  const gw = await startGateway({ oauth: false })
+  const gw = await startGateway({ oauth: false, env: { KIN_BACKUP_DISABLED: '1' } })
   try {
     const bind = await api(gw, 'POST', '/api/panel/proxies/px-local/bind', { body: { vm_id: 'vm-sim-01' } })
     assert.equal(bind.status, 200, bind.text)
