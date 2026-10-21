@@ -102,8 +102,11 @@ test('an uncertain account refresh remains exclusive across VMs', async (t) => {
   const operation = await new SharedVmOperations(db).tryAcquire({ vmId: 'refresh-vm', accountId: 'refresh-account' })
   await operation.markUncertain()
   const gate = await new ExecutionAdmissionsRepo(peer).tryReserve(execution({ vmId: 'other-refresh-vm' }))
-  try { assert.equal(gate.ok, false) }
-  finally { await gate.release?.() }
+  try {
+    assert.equal(gate.ok, false)
+  } finally {
+    await gate.release?.()
+  }
 })
 
 test('a nested refresh binds its account to the manual VM operation until that operation ends', async (t) => {
@@ -112,8 +115,11 @@ test('a nested refresh binds its account to the manual VM operation until that o
   await operations.run('refresh-vm', async () => {
     await operations.run('refresh-vm', async () => {}, { accountId: 'refresh-account' })
     const gate = await new ExecutionAdmissionsRepo(peer).tryReserve(execution({ vmId: 'other-refresh-vm' }))
-    try { assert.equal(gate.ok, false) }
-    finally { await gate.release?.() }
+    try {
+      assert.equal(gate.ok, false)
+    } finally {
+      await gate.release?.()
+    }
   })
 })
 

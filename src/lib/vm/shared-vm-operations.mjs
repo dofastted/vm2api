@@ -88,8 +88,9 @@ export class SharedVmOperations {
       // Identical namespace and VM resource to ExecutionAdmissionsRepo.tryReserve.
       await this.executions.lockResources({ accountId, vmIds: [vmId] })
       const active = await this.db
-        .prepare('SELECT id FROM vm_operations WHERE vm_id = ANY($1::text[]) AND released_at IS NULL LIMIT 1')
-        .get(physicalVmAliases(vmId))
+        .prepare(`SELECT id FROM vm_operations WHERE released_at IS NULL
+          AND (vm_id = ANY($1::text[]) OR account_id=$2) LIMIT 1`)
+        .get(physicalVmAliases(vmId), accountId)
       if (active) return { ok: false, code: 'vm_operation_active' }
       const exception = await this._executionException({ vmId, accountId, admission })
       if (!exception.ok) return exception
@@ -97,9 +98,9 @@ export class SharedVmOperations {
       if (execution) return { ok: false, code: 'vm_execution_active' }
       const operationId = crypto.randomUUID()
       await this.db
-        .prepare('INSERT INTO vm_operations (id, vm_id, owner_id, kind) VALUES ($1, $2, $3, $4)')
-        .run(operationId, vmId, this.ownerId, kind)
-      return this._handle({ operationId, vmId, ownerId: this.ownerId, kind })
+        .prepare('INSERT INTO vm_operations (id, vm_id, owner_id, kind, account_id) VALUES ($1, $2, $3, $4, $5)')
+        .run(operationId, vmId, this.ownerId, kind, accountId)
+      return this._handle({ operationId, vmId, ownerId: this.ownerId, kind, accountId })
     })
   }
 
@@ -184,15 +185,26 @@ export class SharedVmOperations {
       const valid = await withTransaction(this.db, async () => {
         await this.executions.lockResources({ accountId, vmIds: [vmId] })
         const current = await this.db
-          .prepare(`SELECT id FROM vm_operations
+          .prepare(`SELECT id,account_id FROM vm_operations
           WHERE id=$1 AND owner_id=$2 AND vm_id=$3 AND released_at IS NULL AND uncertain_at IS NULL`)
           .get(nested.operation.operationId, nested.operation.ownerId, vmId)
         if (!current) return { ok: false, code: 'vm_operation_inactive' }
+        if (accountId && current.account_id && current.account_id !== accountId)
+          return { ok: false, code: 'vm_operation_account_mismatch' }
+        if (accountId) {
+          const other = await this.db
+            .prepare(`SELECT id FROM vm_operations
+            WHERE account_id=$1 AND id<>$2 AND released_at IS NULL LIMIT 1`)
+            .get(accountId, current.id)
+          if (other) return { ok: false, code: 'vm_operation_active' }
+        }
         const exception = await this._executionException({ vmId, accountId, admission })
         if (!exception.ok) return exception
-        return (await this._otherExecution(vmId, accountId, exception.admissionId))
-          ? { ok: false, code: 'vm_execution_active' }
-          : { ok: true }
+        if (await this._otherExecution(vmId, accountId, exception.admissionId))
+          return { ok: false, code: 'vm_execution_active' }
+        if (accountId && !current.account_id)
+          await this.db.prepare('UPDATE vm_operations SET account_id=$1 WHERE id=$2').run(accountId, current.id)
+        return { ok: true }
       })
       if (!valid.ok) throw operationError(valid.code)
       return callback(nested.operation)

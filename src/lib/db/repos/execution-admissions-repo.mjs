@@ -111,8 +111,9 @@ export class ExecutionAdmissionsRepo {
       await this.assertRoutingRevision(input.routingRevision)
       await this.lockResources({ accountId, vmIds: [vmId] })
       const operation = await this.db
-        .prepare('SELECT id FROM vm_operations WHERE vm_id = ANY($1::text[]) AND released_at IS NULL LIMIT 1')
-        .get(physicalVmAliases(vmId))
+        .prepare(`SELECT id FROM vm_operations WHERE released_at IS NULL
+          AND (vm_id = ANY($1::text[]) OR account_id=$2) LIMIT 1`)
+        .get(physicalVmAliases(vmId), accountId)
       if (operation) return denied('vm_operation_active', 0, vmLimit)
       // A candidate may have been read before a completed management hold.
       // Check every physical alias under the same VM locks after the hold commits.
@@ -217,8 +218,9 @@ export class ExecutionAdmissionsRepo {
       }
       if (nodeBinding && nodeBinding.vmId !== admission.vm_id) throw jobError('execution_node_binding_mismatch')
       const operation = await this.db
-        .prepare('SELECT id FROM vm_operations WHERE vm_id = ANY($1::text[]) AND released_at IS NULL LIMIT 1')
-        .get(physicalVmAliases(admission.vm_id))
+        .prepare(`SELECT id FROM vm_operations WHERE released_at IS NULL
+          AND (vm_id = ANY($1::text[]) OR account_id=$2) LIMIT 1`)
+        .get(physicalVmAliases(admission.vm_id), admission.account_id)
       if (operation) throw jobError('vm_operation_active')
       const pending = await this.db
         .prepare('SELECT request_id FROM execution_jobs WHERE admission_id = $1 AND ended_at IS NULL LIMIT 1')
