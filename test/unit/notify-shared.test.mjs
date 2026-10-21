@@ -1,9 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { createDatabase, getDb } from '../../src/lib/db/database.mjs'
+import pg from 'pg'
+import { createDatabase, getDb, getActivityCoordinator, quoteIdentifier } from '../../src/lib/db/database.mjs'
 import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
 import { SharedBackgroundTasks } from '../../src/lib/core/shared-background-tasks.mjs'
 import { createNotifyMonitor, dispatchNotify, summarizePoolAvailability } from '../../src/lib/admin/notify.mjs'
+import { withDatabaseActivities } from '../maintenance-fixture.mjs'
 
 const config = {
   enabled: true,
@@ -114,16 +116,90 @@ test('a truncated provider response cannot confirm the notification attempt ende
           ? { enabled: true, bot_token: 'synthetic-token', chat_id: 'synthetic-chat' }
           : { enabled: true, webhook: 'synthetic-key-1234' },
     }
-    const result = await dispatchNotify(cfg, { text: 'synthetic notification' }, {
-      fetch: async () => ({
-        ok: true,
-        status: 200,
-        text: async () => {
-          throw new Error('synthetic truncated provider body')
-        },
-      }),
-    })
+    const result = await dispatchNotify(
+      cfg,
+      { text: 'synthetic notification' },
+      {
+        fetch: async () => ({
+          ok: true,
+          status: 200,
+          text: async () => {
+            throw new Error('synthetic truncated provider body')
+          },
+        }),
+      },
+    )
     assert.equal(result.ok, false, channel)
     assert.equal(result.uncertain, true, channel)
+  }
+})
+
+test('a complete provider rejection ends its attempt and permits a later explicit check', async (t) => {
+  const { db, monitors } = await fixture(t)
+  const [first, peer] = monitors(() =>
+    dispatchNotify(
+      { telegram: { enabled: true, bot_token: 'synthetic', chat_id: 'synthetic' } },
+      { text: 'synthetic' },
+      { fetch: async () => ({ ok: false, status: 400, text: async () => '{"ok":false}' }) },
+    ),
+  )
+  await first.runOnce({ digest: true })
+  await peer.runOnce({ digest: true })
+  const claims = (await db.query('SELECT finished_at, unknown_at FROM background_task_runs')).rows
+  assert.equal(claims.length, 2)
+  assert.ok(claims.every((claim) => claim.finished_at && !claim.unknown_at))
+  assert.ok(peer.getStatus().last_error)
+})
+
+test('a failure committing completion after a send retains the claim and prevents another send', async (t) => {
+  const { db, monitors } = await fixture(t, { nextPlan: true })
+  await db.exec(`CREATE FUNCTION refuse_notify_completion() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN IF NEW.finished_at IS NOT NULL THEN RAISE EXCEPTION 'synthetic completion failure' USING ERRCODE='P6484'; END IF;
+    RETURN NEW; END $$;
+    CREATE TRIGGER refuse_notify_completion BEFORE UPDATE ON background_task_runs
+    FOR EACH ROW EXECUTE FUNCTION refuse_notify_completion()`)
+  let sends = 0
+  const [first, peer] = monitors(async () => {
+    sends++
+    return { ok: true }
+  })
+  await assert.rejects(first.runOnce(), { code: 'P6484' })
+  await peer.runOnce()
+  assert.equal(sends, 1)
+  const claim = (await db.query('SELECT finished_at FROM background_task_runs')).rows[0]
+  assert.equal(claim.finished_at, null)
+})
+
+test('shared checks run inside fresh durable activities and finish before global maintenance', async (t) => {
+  const { db, peer, monitors } = await fixture(t)
+  const cleanup = new pg.Client({ connectionString: db.connectionString })
+  let schema
+  t.after(async () => {
+    await getActivityCoordinator(db)?.stop()
+    await getActivityCoordinator(peer)?.stop()
+    await cleanup.connect()
+    try {
+      if (schema) await cleanup.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`)
+    } finally {
+      await cleanup.end()
+    }
+  })
+  let sends = 0
+  const [first, second] = monitors(async () => {
+    assert.equal(getActivityCoordinator(db).assertActivity().kind, 'background')
+    sends++
+    return { ok: true }
+  })
+  await withDatabaseActivities([db, peer], async () => {
+    schema = getActivityCoordinator(db).schema
+    await first.runOnce()
+    await second.runOnce()
+  })
+  assert.equal(sends, 1)
+  const operation = await getActivityCoordinator(db).beginMaintenance({ kind: 'backup' })
+  try {
+    await operation.resume()
+  } finally {
+    await operation.close()
   }
 })
