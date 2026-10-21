@@ -18,7 +18,9 @@ test('readiness requires initialization, database, control lock, and no maintena
   let locked = true
   let maintaining = false
   const lifecycle = new ControlPlaneLifecycle({
-    probe: async () => { if (!database) throw new Error('private connection details') },
+    probe: async () => {
+      if (!database) throw new Error('private connection details')
+    },
     lockHealthy: () => locked,
     isMaintaining: () => maintaining,
   })
@@ -44,7 +46,9 @@ test('HTTP drain waits for both the handler and the response to finish', async (
   const res = new EventEmitter()
   const handlerFinished = lifecycle.trackHttp(req, res)
   let drained = false
-  const pending = lifecycle.waitForIdle().then(() => { drained = true })
+  const pending = lifecycle.waitForIdle().then(() => {
+    drained = true
+  })
   handlerFinished()
   await new Promise((resolve) => setTimeout(resolve, 15))
   assert.equal(drained, false, 'a returned SSE handler still owns its open response')

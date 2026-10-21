@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { getDb } from '../../src/lib/db/database.mjs'
+import { PanelSessionsRepo } from '../../src/lib/db/repos/panel-sessions-repo.mjs'
 
 const PANEL_SESSION_TTL_MS = 7 * 24 * 3600 * 1000
 
@@ -50,7 +52,7 @@ test('panel session persistence stores only token hashes', async () => {
       fs.readdirSync(dir).filter((name) => name.includes('.tmp')),
       [],
     )
-    security.revokePanelSession(token)
+    await security.revokePanelSession(token)
     assert.equal(await security.verifyPanelSession(token), null)
   } finally {
     if (previous == null) delete process.env.KIN_DATA_DIR
@@ -155,5 +157,56 @@ test('existing loose panel session file is tightened on load', async () => {
     if (previous == null) delete process.env.KIN_DATA_DIR
     else process.env.KIN_DATA_DIR = previous
     fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Kubernetes sessions share PostgreSQL state and never use the local session file', async () => {
+  const previousMode = process.env.VM2API_CONTROL_PLANE_MODE
+  const previousDir = process.env.KIN_DATA_DIR
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-k8s-sessions-'))
+  process.env.VM2API_CONTROL_PLANE_MODE = 'kubernetes'
+  process.env.KIN_DATA_DIR = dir
+  try {
+    const first = await import(`../../src/lib/core/security.mjs?k8s-first=${Date.now()}`)
+    const second = await import(`../../src/lib/core/security.mjs?k8s-second=${Date.now()}`)
+    const token = await first.createPanelSession('shared-admin')
+    assert.equal((await second.verifyPanelSession(token)).user, 'shared-admin')
+    assert.equal(fs.existsSync(path.join(dir, 'panel-sessions.json')), false)
+    const row = await getDb().prepare('SELECT token_hash FROM panel_sessions WHERE username = $1').get('shared-admin')
+    assert.match(row.token_hash, /^[a-f0-9]{64}$/)
+    assert.notEqual(row.token_hash, token)
+    await first.revokePanelSession(token)
+    assert.equal(await second.verifyPanelSession(token), null)
+
+    const kept = await first.createPanelSession('shared-admin')
+    const removed = await second.createPanelSession('shared-admin')
+    assert.equal(await first.revokePanelSessionsForUser('shared-admin', { exceptToken: kept }), 1)
+    assert.equal(await second.verifyPanelSession(removed), null)
+    assert.ok(await second.verifyPanelSession(kept))
+  } finally {
+    if (previousMode == null) delete process.env.VM2API_CONTROL_PLANE_MODE
+    else process.env.VM2API_CONTROL_PLANE_MODE = previousMode
+    if (previousDir == null) delete process.env.KIN_DATA_DIR
+    else process.env.KIN_DATA_DIR = previousDir
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Kubernetes authentication fails closed when its session database is unavailable', async () => {
+  const previousMode = process.env.VM2API_CONTROL_PLANE_MODE
+  const get = PanelSessionsRepo.prototype.get
+  process.env.VM2API_CONTROL_PLANE_MODE = 'kubernetes'
+  try {
+    const security = await import(`../../src/lib/core/security.mjs?k8s-failure=${Date.now()}`)
+    const token = await security.createPanelSession('database-only')
+    assert.ok(await security.verifyPanelSession(token))
+    PanelSessionsRepo.prototype.get = async () => {
+      throw new Error('synthetic database unavailable')
+    }
+    await assert.rejects(security.verifyPanelSession(token), /synthetic database unavailable/)
+  } finally {
+    PanelSessionsRepo.prototype.get = get
+    if (previousMode == null) delete process.env.VM2API_CONTROL_PLANE_MODE
+    else process.env.VM2API_CONTROL_PLANE_MODE = previousMode
   }
 })

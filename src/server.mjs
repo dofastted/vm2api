@@ -104,6 +104,9 @@ import { createHandleProtocol } from './lib/protocol/handle-protocol.mjs'
 import { createResponsesWsHandler } from './lib/protocol/responses-ws.mjs'
 import { handleUserCountTokens, handleUserUsage } from './lib/protocol/user-count-tokens.mjs'
 import { createPanelHandler } from './lib/admin/panel-routes.mjs'
+import { isKubernetesMode, shutdownTimeoutMs } from './lib/core/control-plane-mode.mjs'
+import { ControlPlaneLifecycle, withTimeout } from './lib/core/control-plane-lifecycle.mjs'
+import { ControlPlaneLock } from './lib/db/control-plane-lock.mjs'
 
 const FEATURES = [
   'passthrough',
@@ -135,7 +138,8 @@ const cfg = loadConfig()
 if (!getPanelAdmin().password) {
   throw new Error('VM2API_ADMIN_PASSWORD must be set; insecure default panel credentials are disabled')
 }
-fs.mkdirSync(cfg.paths.captures, { recursive: true })
+const kubernetesMode = isKubernetesMode()
+const shutdownGraceMs = shutdownTimeoutMs()
 
 const allowRate = createRateLimiter({
   capacity: cfg.limits.rate_capacity,
@@ -146,7 +150,54 @@ const allowRate = createRateLimiter({
 const activeRequests = new Set()
 let _shuttingDown = false
 const dataDir = cfg.paths.data || path.join(cfg.paths.root, 'data')
-await openDatabase({ dataDir })
+const db = await openDatabase({ dataDir })
+let controlPlaneLock = null
+let startupAborting = false
+const lifecycle = new ControlPlaneLifecycle({
+  probe: () => db.prepare('SELECT 1').get(),
+  lockHealthy: () => !kubernetesMode || controlPlaneLock?.healthy === true,
+  isMaintaining: () => backupService.isMaintaining,
+})
+async function failStartup(error) {
+  if (startupAborting) return
+  startupAborting = true
+  lifecycle.beginDrain()
+  console.error(`[startup] failed: ${error?.code || error?.name || 'startup_failed'}`)
+  const deadline = setTimeout(() => process.exit(1), 5000)
+  try {
+    await controlPlaneLock?.stop()
+  } catch {}
+  try {
+    await closeDatabase()
+  } catch {}
+  clearTimeout(deadline)
+  process.exit(1)
+}
+if (kubernetesMode) {
+  process.once('uncaughtException', failStartup)
+  process.once('unhandledRejection', failStartup)
+  controlPlaneLock = new ControlPlaneLock(db, {
+    onLost(error) {
+      lifecycle.beginDrain()
+      console.error('[control-plane] exclusive lock lost')
+      if (!lifecycle.initialized) {
+        void failStartup(error)
+        return
+      }
+      void shutdown('control_plane_lock_lost', { failed: true })
+    },
+  })
+  try {
+    await controlPlaneLock.start()
+  } catch (error) {
+    await controlPlaneLock.stop()
+    await closeDatabase()
+    throw Object.assign(new Error(`Control plane startup failed: ${error.code || 'lock_unavailable'}`), {
+      code: error.code || 'lock_unavailable',
+    })
+  }
+}
+fs.mkdirSync(cfg.paths.captures, { recursive: true })
 const legacyImport = await runLegacyImport({ dataDir, projectRoot: cfg.paths.project })
 if (legacyImport?.imported) {
   console.log('[db] legacy JSON import done:', JSON.stringify(legacyImport.counts || {}))
@@ -915,6 +966,11 @@ const protocolHandlers = createHandleProtocol({
 })
 
 async function dispatchProtocol(name, req, res, ...args) {
+  if (lifecycle.draining || (kubernetesMode && controlPlaneLock?.healthy !== true)) {
+    return json(res, 503, {
+      error: { type: 'overloaded_error', code: 'control_plane_draining', message: 'Control plane is draining' },
+    })
+  }
   if (backupService.isMaintaining) {
     return json(res, 503, {
       error: { type: 'overloaded_error', code: 'maintenance_in_progress', message: 'Database maintenance in progress' },
@@ -1089,7 +1145,10 @@ const handlePanel = createPanelHandler({
   slotShell,
 })
 
+const sockets = new Set()
+const terminalSockets = new Set()
 const server = http.createServer(async (req, res) => {
+  const handlerFinished = lifecycle.trackHttp(req, res)
   activeRequests.add(req)
   try {
     res.req = req
@@ -1103,6 +1162,24 @@ const server = http.createServer(async (req, res) => {
       return json(res, 400, { error: { message: 'Invalid URL', type: 'invalid_request' } })
     }
     const p = url.pathname
+
+    if ((req.method === 'GET' || req.method === 'HEAD') && p === '/readyz') {
+      const ready = await lifecycle.isReady()
+      if (req.method === 'HEAD') {
+        res.writeHead(ready ? 200 : 503)
+        return res.end()
+      }
+      return json(res, ready ? 200 : 503, { status: ready ? 'ready' : 'not_ready' })
+    }
+    if (
+      (lifecycle.draining || (kubernetesMode && (!lifecycle.initialized || controlPlaneLock?.healthy !== true))) &&
+      p !== '/healthz' &&
+      p !== '/health'
+    ) {
+      return json(res, 503, {
+        error: { type: 'overloaded_error', code: 'control_plane_draining', message: 'Control plane is draining' },
+      })
+    }
 
     if (isTelemetryPath(p)) {
       return json(res, 200, telemetryInterceptResponse(p))
@@ -1258,15 +1335,29 @@ const server = http.createServer(async (req, res) => {
     }
   } finally {
     activeRequests.delete(req)
+    handlerFinished()
   }
 })
 
+server.on('connection', (socket) => {
+  sockets.add(socket)
+  socket.once('close', () => {
+    sockets.delete(socket)
+    terminalSockets.delete(socket)
+  })
+})
+
 server.on('upgrade', async (req, socket, head) => {
-  if (backupService.isMaintaining) {
+  if (
+    lifecycle.draining ||
+    (kubernetesMode && (!lifecycle.initialized || controlPlaneLock?.healthy !== true)) ||
+    backupService.isMaintaining
+  ) {
     socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n')
     return
   }
   if (await responsesWs.handleUpgrade(req, socket, head)) return
+  terminalSockets.add(socket)
   if (clusterRoutes.handleUpgrade(req, socket, head)) return
   if (!slotShell.handleUpgrade(req, socket, head)) socket.destroy()
 })
@@ -1320,10 +1411,24 @@ process.on('uncaughtException', (e) => console.error('[uncaught]', e))
 process.on('unhandledRejection', (e) => console.error('[unhandled]', e))
 
 // Graceful shutdown: stop schedulers/watchers, drain persistence, close the pool.
-async function shutdown(signal) {
+async function shutdown(signal, { failed = false } = {}) {
   if (_shuttingDown) return
   _shuttingDown = true
+  lifecycle.beginDrain()
+  responsesWs.beginDrain()
   console.log(`[shutdown] ${signal} — closing`)
+  const deadline = Date.now() + shutdownGraceMs
+  const forceClose = () => {
+    lifecycle.forceClose()
+    responsesWs.terminate()
+    server.closeAllConnections?.()
+    for (const socket of sockets) socket.destroy()
+  }
+  const hardStop = setTimeout(() => {
+    console.error('[shutdown] cleanup deadline exceeded')
+    forceClose()
+    process.exit(1)
+  }, shutdownGraceMs + 5000)
   try {
     vmTestSchedule.stop()
   } catch {}
@@ -1355,33 +1460,44 @@ async function shutdown(signal) {
   try {
     notifyMonitor?.stop?.()
   } catch {}
+  requestLog.stopCleanupScheduler()
   try {
     stopVmWatch()
   } catch {}
+  const serverClosed = new Promise((resolve) => server.close(resolve))
+  for (const socket of terminalSockets) socket.end()
   try {
-    stopAllRustKernels()
-  } catch {}
-  try {
-    clusterManager.stop()
-  } catch {}
-  try {
-    await new Promise((resolve) => server.close(resolve))
-  } catch {}
-  try {
-    await backupService.flush()
-    await pausePriceCatalog()
-    for (const monitor of maintenanceMonitors()) await monitor?.flush?.()
-    await vmTestSchedule.flush()
-    await flushRuntimeWrites()
-    await closeDatabase()
-  } catch (error) {
-    console.error(`[shutdown] persistence failed: ${error.code || error.name}`)
-    try {
-      await closeDatabase()
-    } catch {}
-    process.exit(1)
+    await withTimeout(Promise.all([serverClosed, lifecycle.waitForIdle(), responsesWs.drain()]), shutdownGraceMs)
+  } catch {
+    failed = true
+    console.error('[shutdown] request drain deadline exceeded')
+    forceClose()
   }
-  process.exit(0)
+  try {
+    await withTimeout(
+      (async () => {
+        await backupService.flush()
+        await pausePriceCatalog()
+        for (const monitor of maintenanceMonitors()) await monitor?.flush?.()
+        await vmTestSchedule.flush()
+        await flushRuntimeWrites()
+        stopAllRustKernels()
+        await clusterManager.stop()
+        await controlPlaneLock?.stop()
+        await closeDatabase()
+      })(),
+      Math.max(1, deadline - Date.now()) + 5000,
+    )
+  } catch (error) {
+    failed = true
+    console.error(`[shutdown] persistence failed: ${error.code || error.name}`)
+    forceClose()
+    try {
+      await withTimeout(controlPlaneLock?.stop(), 1000)
+    } catch {}
+  }
+  clearTimeout(hardStop)
+  process.exit(failed ? 1 : 0)
 }
 process.on('SIGTERM', async () => await shutdown('SIGTERM'))
 process.on('SIGINT', async () => await shutdown('SIGINT'))
@@ -1475,6 +1591,9 @@ server.listen(cfg.port, cfg.host, async () => {
   } catch (error) {
     console.warn('[worker-models] fetch failed', error.message)
   }
+  lifecycle.markReady()
+  process.off('uncaughtException', failStartup)
+  process.off('unhandledRejection', failStartup)
   console.log(
     JSON.stringify({
       event: 'vm2api-started',

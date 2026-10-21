@@ -455,6 +455,17 @@ export function createResponsesWsHandler({
   maxBodyBytes = DEFAULT_MAX_REQUEST_BYTES,
 } = {}) {
   const wss = new WebSocketServer({ noServer: true, maxPayload: maxBodyBytes })
+  const connections = new Map()
+  const tasks = new Set()
+  let draining = false
+
+  const drainingError = () =>
+    responsesWsErrorFrame({
+      status: 503,
+      type: 'overloaded_error',
+      code: 'control_plane_draining',
+      message: 'Control plane is draining',
+    })
 
   function handshakeRes(socket) {
     return {
@@ -512,12 +523,27 @@ export function createResponsesWsHandler({
         currentReq?.abort?.()
       } catch {}
     }
+    const closeIdle = () => {
+      if (draining && !busy && ws.readyState === ws.OPEN) ws.close(1001, 'Control plane is draining')
+    }
+    connections.set(ws, {
+      drain() {
+        if (queue.length) sendFrame(ws, drainingError())
+        queue.length = 0
+        queuedBytes = 0
+        closeIdle()
+      },
+      terminate() {
+        abortCurrent()
+        ws.terminate()
+      },
+    })
 
     const pump = async () => {
       if (busy) return
       busy = true
       try {
-        while (!closed && queue.length) {
+        while (!closed && !draining && queue.length) {
           const payload = queue.shift()
           queuedBytes -= Buffer.byteLength(payload)
           const decoded = decodeResponseCreate(payload)
@@ -634,6 +660,7 @@ export function createResponsesWsHandler({
       } finally {
         busy = false
         currentReq = null
+        closeIdle()
       }
     }
 
@@ -674,6 +701,10 @@ export function createResponsesWsHandler({
         sendFrame(ws, responseInterruptAcceptedFrame(clientMessage.value))
         return
       }
+      if (draining) {
+        sendFrame(ws, drainingError())
+        return
+      }
       const routing = typeof getRouting === 'function' ? getRouting() || {} : {}
       const bytes = Buffer.byteLength(raw)
       if (bytes + queuedBytes > inboundBodyLimit(routing, maxBodyBytes)) {
@@ -699,20 +730,25 @@ export function createResponsesWsHandler({
       }
       queue.push(raw)
       queuedBytes += bytes
-      pump().catch((error) => {
-        console.warn('[responses-ws] connection failed', error?.code || error?.name || 'unknown_error')
-        sendFrame(
-          ws,
-          responsesWsErrorFrame({
-            status: 500,
-            type: 'api_error',
-            code: 'api_error',
-            message: 'Responses connection failed',
-          }),
-        )
-      })
+      const task = pump()
+      tasks.add(task)
+      task
+        .catch((error) => {
+          console.warn('[responses-ws] connection failed', error?.code || error?.name || 'unknown_error')
+          sendFrame(
+            ws,
+            responsesWsErrorFrame({
+              status: 500,
+              type: 'api_error',
+              code: 'api_error',
+              message: 'Responses connection failed',
+            }),
+          )
+        })
+        .finally(() => tasks.delete(task))
     })
     ws.on('close', () => {
+      connections.delete(ws)
       closed = true
       queue.length = 0
       queuedBytes = 0
@@ -732,13 +768,36 @@ export function createResponsesWsHandler({
       return false
     }
     if (!isResponsesWsPath(pathname)) return false
+    if (draining) {
+      writeHttpSocket(socket, 503, { error: drainingError().error })
+      return true
+    }
     const routing = typeof getRouting === 'function' ? getRouting() || {} : {}
     if (rejectNewWs(socket, routing)) return true
     const res = handshakeRes(socket)
     if (typeof requireAuth === 'function' && !(await requireAuth(req, res))) return true
+    if (draining) {
+      writeHttpSocket(socket, 503, { error: drainingError().error })
+      return true
+    }
     wss.handleUpgrade(req, socket, head, (ws) => attach(ws, req))
     return true
   }
 
-  return { handleUpgrade, wss }
+  function beginDrain() {
+    draining = true
+    for (const connection of connections.values()) connection.drain()
+  }
+
+  async function drain() {
+    beginDrain()
+    while (tasks.size) await Promise.allSettled([...tasks])
+  }
+
+  function terminate() {
+    beginDrain()
+    for (const connection of connections.values()) connection.terminate()
+  }
+
+  return { handleUpgrade, wss, beginDrain, drain, terminate }
 }

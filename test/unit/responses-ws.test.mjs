@@ -975,8 +975,12 @@ test('draining waits for an active Responses hop and refuses the next request', 
   let started
   let release
   let hops = 0
-  const running = new Promise((resolve) => { started = resolve })
-  const gate = new Promise((resolve) => { release = resolve })
+  const running = new Promise((resolve) => {
+    started = resolve
+  })
+  const gate = new Promise((resolve) => {
+    release = resolve
+  })
   const live = await listen({
     routing: ENABLED,
     requireAuth: allowAuth,
@@ -993,7 +997,9 @@ test('draining waits for an active Responses hop and refuses the next request', 
     opened.ws.send(JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: 'first' }))
     await running
     let drained = false
-    const pending = live.handler.drain().then(() => { drained = true })
+    const pending = live.handler.drain().then(() => {
+      drained = true
+    })
     await new Promise((resolve) => setImmediate(resolve))
     assert.equal(drained, false)
     const rejected = nextFrame(opened.ws, (frame) => frame.error?.code === 'control_plane_draining')

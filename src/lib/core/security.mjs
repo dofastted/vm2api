@@ -2,6 +2,8 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { atomicWriteJson } from '../vm/vm-file.mjs'
+import { isKubernetesMode } from './control-plane-mode.mjs'
+import { PanelSessionsRepo } from '../db/repos/panel-sessions-repo.mjs'
 
 export function hashKey(key) {
   return crypto.createHash('sha256').update(String(key)).digest('hex')
@@ -140,7 +142,7 @@ function saveSessions() {
   }
 }
 
-loadSessions()
+if (!isKubernetesMode()) loadSessions()
 
 export async function createPanelSession(username, ttlMs = SESSION_TTL_MS, extra = {}) {
   if (ttlMs && typeof ttlMs === 'object') {
@@ -149,6 +151,10 @@ export async function createPanelSession(username, ttlMs = SESSION_TTL_MS, extra
   }
   const token = 'kin-panel-' + crypto.randomBytes(24).toString('hex')
   const role = extra.role || (_lookupRole && (await _lookupRole(username))) || 'admin'
+  if (isKubernetesMode()) {
+    await new PanelSessionsRepo().create({ tokenHash: panelSessionKey(token), username, role, ttlMs })
+    return token
+  }
   panelSessions.set(panelSessionKey(token), {
     user: username,
     role,
@@ -161,6 +167,15 @@ export async function createPanelSession(username, ttlMs = SESSION_TTL_MS, extra
 export async function verifyPanelSession(token) {
   if (!token || !token.startsWith('kin-panel-')) return null
   const key = panelSessionKey(token)
+  if (isKubernetesMode()) {
+    const repo = new PanelSessionsRepo()
+    const session = await repo.get(key)
+    if (!session) return null
+    if (session.exp - Date.now() < SESSION_TTL_MS / 2) {
+      return (await repo.renew(key, { expectedExp: session.exp, ttlMs: SESSION_TTL_MS })) || (await repo.get(key))
+    }
+    return session
+  }
   let s = panelSessions.get(key)
   if (!s) {
     // reload from disk once (multi-process / restart)
@@ -189,16 +204,18 @@ export async function verifyPanelSession(token) {
   return s
 }
 
-export function revokePanelSession(token) {
+export async function revokePanelSession(token) {
   if (!token) return
+  if (isKubernetesMode()) return new PanelSessionsRepo().remove(panelSessionKey(token))
   panelSessions.delete(panelSessionKey(token))
   saveSessions()
 }
 
-export function revokePanelSessionsForUser(username, { exceptToken } = {}) {
+export async function revokePanelSessionsForUser(username, { exceptToken } = {}) {
   const name = String(username || '')
   if (!name) return 0
   const exceptKey = exceptToken ? panelSessionKey(exceptToken) : null
+  if (isKubernetesMode()) return new PanelSessionsRepo().removeForUser(name, { exceptHash: exceptKey })
   let n = 0
   for (const [key, s] of panelSessions.entries()) {
     if (s.user !== name) continue

@@ -1344,7 +1344,7 @@ export function createPanelHandler(ctx) {
     }
     if (req.method === 'POST' && p === '/api/panel/logout') {
       const tok = extractPanelToken(req)
-      if (tok) revokePanelSession(tok)
+      if (tok) await revokePanelSession(tok)
       const secure = panelCookieSecure(req)
       res.setHeader('Set-Cookie', clearPanelSessionCookie({ secure }))
       return json(res, 200, { ok: true })
@@ -1506,9 +1506,9 @@ export function createPanelHandler(ctx) {
           if (!rec) return json(res, 404, { ok: false, error: { message: 'user not found' } })
           // Sessions cache the role from login time, so a role or enable change must log them out.
           if (before && (before.role !== rec.role || !!before.enabled !== !!rec.enabled)) {
-            revokePanelSessionsForUser(rec.username)
+            await revokePanelSessionsForUser(rec.username)
           } else if (body?.password) {
-            revokePanelSessionsForUser(rec.username, { exceptToken: extractPanelToken(req) })
+            await revokePanelSessionsForUser(rec.username, { exceptToken: extractPanelToken(req) })
           }
           return json(res, 200, panel.ok({ item: publicUserView(rec) }))
         } catch (e) {
@@ -1525,7 +1525,7 @@ export function createPanelHandler(ctx) {
         try {
           const ok = await panelUsers.remove(id, { actorId: req.panelUserId })
           if (!ok) return json(res, 404, { ok: false, error: { message: 'user not found' } })
-          if (existing?.username) revokePanelSessionsForUser(existing.username)
+          if (existing?.username) await revokePanelSessionsForUser(existing.username)
           return json(res, 200, { ok: true, deleted: id })
         } catch (e) {
           const status = e.code === 'last_admin' || e.code === 'self_delete' ? 409 : 400
