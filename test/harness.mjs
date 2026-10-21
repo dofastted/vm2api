@@ -119,11 +119,34 @@ export async function startGateway(opts = {}) {
   }
   if (opts.env) Object.assign(env, opts.env)
 
-  const child = spawn(process.execPath, [path.join(GATEWAY_ROOT, 'server.mjs')], {
-    env,
-    cwd: GATEWAY_ROOT,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
+  // Mock HTTP gateways must never create host bridges, change iptables, or exec
+  // a real slot. The loader supplies virtual egress; other Docker calls fail closed.
+  const boundaryDir = path.join(project, 'mock-runtime')
+  fs.mkdirSync(boundaryDir, { recursive: true })
+  const runtimeCallsFile = path.join(boundaryDir, 'commands.log')
+  for (const command of ['docker', 'iptables']) {
+    fs.writeFileSync(
+      path.join(boundaryDir, command),
+      `#!${process.execPath}\nconst fs = require('node:fs');\nfs.appendFileSync(${JSON.stringify(runtimeCallsFile)}, ${JSON.stringify(command + ' ')} + process.argv.slice(2, 4).join(' ') + '\\n');\nprocess.stderr.write('Error: No such object: mock gateway runtime\\n');\nprocess.exit(1);\n`,
+      { mode: 0o700 },
+    )
+  }
+  env.PATH = boundaryDir + path.delimiter + env.PATH
+  env.KIN_DOCKER_BIN = path.join(boundaryDir, 'docker')
+
+  const child = spawn(
+    process.execPath,
+    [
+      '--import',
+      path.join(REPO_ROOT, 'test/fixtures/mock-gateway-runtime-loader.mjs'),
+      path.join(GATEWAY_ROOT, 'server.mjs'),
+    ],
+    {
+      env,
+      cwd: GATEWAY_ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  )
   let stdout = ''
   let stderr = ''
   child.stdout.on('data', (d) => {
@@ -163,6 +186,7 @@ export async function startGateway(opts = {}) {
     port,
     project,
     traceFile,
+    runtimeCallsFile,
     apiKey: env.KIN_API_KEY,
     child,
     stdout: () => stdout,
