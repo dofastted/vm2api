@@ -52,6 +52,7 @@ const (
 	CommandUnknown    CommandStatus = "unknown"
 	CommandCompleted  CommandStatus = "completed"
 	CommandTerminated CommandStatus = "terminated"
+	CommandNotStarted CommandStatus = "not_started"
 )
 
 // ExecutorIdentity names an incarnation, never a reusable container name or
@@ -810,6 +811,9 @@ func validateJournal(journal authorityJournal) error {
 			return ErrInvalidAuthority
 		}
 		for id, command := range state.Commands {
+			if command.Status == CommandNotStarted && (command.Kind != CommandForward || command.Dispatched || command.TerminationID != "" || command.TerminalReceipt != nil || validateExecutor(command.Fence.Executor) != nil) {
+				return ErrInvalidAuthority
+			}
 			if receipt := command.TerminalReceipt; receipt != nil && (command.Kind != CommandForward || command.Status != CommandCompleted || !command.Dispatched || !validInferenceReceipt(*receipt)) {
 				return ErrInvalidAuthority
 			}
@@ -840,7 +844,7 @@ func validateJournal(journal authorityJournal) error {
 					return ErrInvalidAuthority
 				}
 			}
-			if command.Status != CommandPending && command.Status != CommandUnknown && command.Status != CommandCompleted && command.Status != CommandTerminated {
+			if command.Status != CommandPending && command.Status != CommandUnknown && command.Status != CommandCompleted && command.Status != CommandTerminated && command.Status != CommandNotStarted {
 				return ErrInvalidAuthority
 			}
 			if pendingCommand(command) && command.Fence != state.Fence {

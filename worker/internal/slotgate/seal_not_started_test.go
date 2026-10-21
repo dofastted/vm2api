@@ -2,8 +2,10 @@ package slotgate
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -158,10 +160,45 @@ func TestNodeSealNotStartedAndDispatchAreMutuallyExclusive(t *testing.T) {
 	}
 }
 
+func TestNodeSealNotStartedCannotBeOverwrittenByConcurrentPrepare(t *testing.T) {
+	_, addr, s, state := activeHealthGate(t)
+	for i := 0; i < 12; i++ {
+		request := gate2Request{Op: "seal-not-started", VMID: "v", Fence: state.Fence, CommandID: fmt.Sprintf("seal-prepare-race-%d", i)}
+		prepare := request
+		prepare.Op, prepare.Kind = "prepare", "kernel"
+		start := make(chan struct{})
+		type result struct {
+			reply recoveryStatusReply
+			err   error
+		}
+		sealed, prepared := make(chan result, 1), make(chan result, 1)
+		go func() {
+			<-start
+			reply, err := sealWire(addr, request)
+			sealed <- result{reply, err}
+		}()
+		go func() {
+			<-start
+			reply, err := sealWire(addr, prepare)
+			prepared <- result{reply, err}
+		}()
+		close(start)
+		a, b := <-sealed, <-prepared
+		if a.err != nil || b.err != nil {
+			t.Fatalf("prepare race transport: %v / %v", a.err, b.err)
+		}
+		requireNotStarted(t, a.reply, request)
+		current, _ := s.authority.State("v")
+		if current.Commands[request.CommandID].Status != "not_started" || current.Commands[request.CommandID].Dispatched {
+			t.Fatal("a late prepare replaced the durable seal")
+		}
+	}
+}
+
 func TestNodeSealNotStartedRejectsEveryDispatchedState(t *testing.T) {
 	_, addr, s, state := activeHealthGate(t)
-	for _, completed := range []bool{false, true} {
-		id := fmt.Sprintf("already-dispatched-%t", completed)
+	for _, status := range []CommandStatus{CommandPending, CommandCompleted, CommandUnknown, CommandTerminated} {
+		id := fmt.Sprintf("already-dispatched-%s", status)
 		handle, err := s.authority.BeginCommand("v", state.Fence, id, CommandForward)
 		if err != nil {
 			t.Fatal(err)
@@ -169,8 +206,21 @@ func TestNodeSealNotStartedRejectsEveryDispatchedState(t *testing.T) {
 		if err = s.authority.DispatchCommand(handle, func(ExecutorIdentity) error { return nil }); err != nil {
 			t.Fatal(err)
 		}
-		if completed {
+		if status == CommandCompleted {
 			if err = s.authority.CompleteCommand(handle); err != nil {
+				t.Fatal(err)
+			}
+		} else if status != CommandPending {
+			// Represent historical statuses directly so the dispatch guard is
+			// tested independently of a separate phase/generation rejection.
+			s.authority.mu.Lock()
+			stored := cloneState(s.authority.journal.Slots["v"])
+			command := stored.Commands[id]
+			command.Status = status
+			stored.Commands[id] = command
+			_, err = s.authority.commit("v", stored)
+			s.authority.mu.Unlock()
+			if err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -201,6 +251,106 @@ func TestNodeSealNotStartedRejectsNonManagedOrRelabeledAuthority(t *testing.T) {
 	current, _ := s.authority.State("v")
 	if len(current.Commands) != len(state.Commands) {
 		t.Fatal("rejected request created a tombstone")
+	}
+}
+
+func TestNodeSealNotStartedRejectsUnknownManagementAndOldBoot(t *testing.T) {
+	_, addr, s, state := activeHealthGate(t)
+	if _, err := s.authority.BeginCommand("v", state.Fence, "unknown-management-before-seal", CommandMutation); err != nil {
+		t.Fatal(err)
+	}
+	request := gate2Request{Op: "seal-not-started", VMID: "v", Fence: state.Fence, CommandID: "not-authorized-during-mutation"}
+	if reply := readSeal(t, addr, request); reply.OK || reply.Command != nil {
+		t.Fatalf("unknown management allowed a not_started proof: %+v", reply)
+	}
+	f := publishingFixture(t)
+	f.publish(t)
+	f.l.boot = "previous-node-boot"
+	state, _ = f.a.State("v")
+	if _, err := f.l.LaunchManifest(context.Background(), launchIntentForTest(state, "old-boot-seal-launch"), allowNodeCommandForTest); err != nil {
+		t.Fatal(err)
+	}
+	addr, s = publishingGate(t, f)
+	state, _ = s.authority.State("v")
+	request = gate2Request{Op: "seal-not-started", VMID: "v", Fence: state.Fence, CommandID: "old-boot-no-proof"}
+	if reply := readSeal(t, addr, request); reply.OK || reply.Command != nil {
+		t.Fatalf("old boot authorized a new tombstone: %+v", reply)
+	}
+}
+
+func TestNodeSealNotStartedDoesNotRelabelAbsentHistoryWithNewGeneration(t *testing.T) {
+	f := publishingFixture(t)
+	f.publish(t)
+	state, _ := f.a.State("v")
+	if _, err := f.l.LaunchManifest(context.Background(), launchIntentForTest(state, "historical-seal-launch"), allowNodeCommandForTest); err != nil {
+		t.Fatal(err)
+	}
+	state, _ = f.a.State("v")
+	original := state.Fence
+	if _, err := f.a.Revoke("v", original); err != nil {
+		t.Fatal(err)
+	}
+	next, err := f.a.Advance(context.Background(), "v", original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Trusted test adapter binds a subsequent executor but does not publish a
+	// new manifest. Neither its Fence nor the old manifest may reauthorize IDs.
+	handle, err := f.a.BeginLaunch("v", next.Fence, "trusted-subsequent-launch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = f.a.DispatchCommand(handle, func(ExecutorIdentity) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	executor := testExecutor("d")
+	executor.NodeBootID = f.l.boot
+	state, err = f.a.BindExecutor(handle, executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, s := publishingGate(t, f)
+	for _, fence := range []Fence{original, state.Fence} {
+		reply := readSeal(t, addr, gate2Request{Op: "seal-not-started", VMID: "v", Fence: fence, CommandID: "historically-absent-job"})
+		if reply.OK || reply.Command != nil {
+			t.Fatalf("historical absence was relabeled with new authority: %+v", reply)
+		}
+	}
+	current, _ := s.authority.State("v")
+	if _, exists := current.Commands["historically-absent-job"]; exists {
+		t.Fatal("a replacement manifest created a historical tombstone")
+	}
+}
+
+func TestNodeSealNotStartedJournalRejectsContradictoryDispatchedMarker(t *testing.T) {
+	_, addr, s, state := activeHealthGate(t)
+	request := gate2Request{Op: "seal-not-started", VMID: "v", Fence: state.Fence, CommandID: "contradictory-seal"}
+	requireNotStarted(t, readSeal(t, addr, request), request)
+	if err := s.authority.Close(); err != nil {
+		t.Fatal(err)
+	}
+	journal := filepath.Join(s.cfg.AuthorityDir, "authority.json")
+	data, err := os.ReadFile(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored authorityJournal
+	if err = json.Unmarshal(data, &stored); err != nil {
+		t.Fatal(err)
+	}
+	command := stored.Slots["v"].Commands[request.CommandID]
+	command.Dispatched = true
+	stored.Slots["v"].Commands[request.CommandID] = command
+	data, _ = json.Marshal(stored)
+	if err = os.WriteFile(journal, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := OpenAuthority(s.cfg.AuthorityDir, terminatedExecutor)
+	if opened != nil {
+		opened.Close()
+	}
+	if !errors.Is(err, ErrInvalidAuthority) {
+		t.Fatalf("contradictory not_started journal accepted: %v", err)
 	}
 }
 

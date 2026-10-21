@@ -158,6 +158,20 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 				reply["unknown"] = true
 			}
 		}
+	case "seal-not-started":
+		if request.Kind != "" || request.Ticket != "" || request.AllocationID != "" || request.OperationID != "" || request.OwnerID != "" || request.Management != nil || request.ContentLength != 0 {
+			err = ErrInvalidAuthority
+			break
+		}
+		if err = s.currentBootFence(request.Fence); err != nil {
+			break
+		}
+		var command *recoveryCommandStatus
+		command, err = s.authority.sealNotStarted(request.VMID, request.Fence, request.CommandID)
+		if err == nil {
+			reply["found"] = true
+			reply["command"] = command
+		}
 	case "allocate":
 		if s.allocator == nil || request.Fence != (Fence{}) || request.CommandID != "" || request.Kind != "" || request.Ticket != "" {
 			err = ErrManagementDenied
@@ -257,7 +271,7 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 		reply["error"] = gate2Code(err)
 	} else {
 		reply["ok"] = true
-		if request.Op != "prepare" && request.Op != "command" && request.Op != "allocate" && request.Op != "publish-initial" && request.Op != "launch" && request.Op != "health" && request.Op != "recovery-status" {
+		if request.Op != "prepare" && request.Op != "command" && request.Op != "allocate" && request.Op != "publish-initial" && request.Op != "launch" && request.Op != "health" && request.Op != "recovery-status" && request.Op != "seal-not-started" {
 			reply["state"] = publicGateState(state)
 		}
 	}
