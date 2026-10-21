@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { createDatabase, getDb } from '../../src/lib/db/database.mjs'
 import { ExecutionAdmissionsRepo } from '../../src/lib/db/repos/execution-admissions-repo.mjs'
+import { AccountsRepo } from '../../src/lib/db/repos/accounts-repo.mjs'
 import { createImportCommit } from '../../src/lib/oauth/import-commit.mjs'
 import { queryClaudeResetCredits, redeemClaudeResetCredit } from '../../src/lib/oauth/claude-reset-credits.mjs'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
@@ -254,4 +255,171 @@ test('credential clear cannot report SIGTERM delivery as confirmed kernel exit',
   assert.equal(starts, 0)
   assert.equal(await f.active(), 1)
   assert.equal(p.response.body.data.cleared.kernel.stopped, false)
+})
+
+test('a known not-started credential failure releases instead of reserving an unknown operation', async (t) => {
+  const f = await fixture(t)
+  const commit = createImportCommit({
+    ...f.ctx,
+    importWorkerCredential: async () => ({ ok: false, vmOperationNotStarted: true }),
+  }).commitImportedOauth
+  assert.equal((await commit(f.input)).ok, false)
+  assert.equal(await f.active(), 0)
+})
+
+test('Kubernetes credential import awaits official initialization while holding the VM operation', async (t) => {
+  const f = await fixture(t)
+  process.env.KIN_CRS_MOCK = '0'
+  let entered
+  let finish
+  const started = new Promise((resolve) => {
+    entered = resolve
+  })
+  const completing = new Promise((resolve) => {
+    finish = resolve
+  })
+  const commit = createImportCommit({
+    ...f.ctx,
+    routingConfig: { official_cc: { enabled: true } },
+    reloadSlotReady: async () => ({ ok: true, runtime: {} }),
+    importWorkerCredential: async () => ({ ok: true }),
+    runOfficialCcBootstrap: async () => {
+      entered()
+      await completing
+      return { ok: true }
+    },
+  }).commitImportedOauth
+  const pending = commit({ ...f.input, skipOfficialCc: false })
+  await started
+  try {
+    assert.equal(await f.active(), 1)
+    assert.equal((await admission(f.other)).code, 'vm_operation_active')
+  } finally {
+    finish()
+  }
+  const result = await pending
+  assert.equal(result.official_cc_bootstrap.completed, true)
+  assert.equal(await f.active(), 0)
+})
+
+test('Kubernetes remote unsupported or disabled official initialization never falls back to local execution', async (t) => {
+  const f = await fixture(t)
+  process.env.KIN_CRS_MOCK = '0'
+  let calls = 0
+  const ctx = {
+    ...f.ctx,
+    routingConfig: { official_cc: { enabled: false } },
+    reloadSlotReady: async () => ({ ok: true, runtime: {} }),
+    importWorkerCredential: async () => ({ ok: true }),
+    runOfficialCcBootstrap: async () => {
+      calls++
+      throw new Error('unexpected official initialization')
+    },
+  }
+  const commit = createImportCommit(ctx).commitImportedOauth
+  const disabled = await commit({ ...f.input, skipOfficialCc: false })
+  assert.equal(disabled.official_cc_bootstrap.reason, 'disabled')
+  const remoteVm = { ...JSON.parse(fs.readFileSync(f.vmPath)), node_id: 'synthetic-remote-node' }
+  fs.writeFileSync(f.vmPath, JSON.stringify(remoteVm))
+  ctx.routingConfig = { official_cc: { enabled: true } }
+  const remote = await commit({ ...f.input, skipOfficialCc: false })
+  assert.equal(remote.official_cc_bootstrap.reason, 'remote_unsupported')
+  assert.equal(calls, 0)
+  assert.equal(await f.active(), 0)
+})
+
+test('confirmed kernel exit and successful restart release credential clear normally', async (t) => {
+  const f = await fixture(t, { codex: true })
+  const events = []
+  const p = panel(f, {
+    stopCodexKernel: () => {
+      events.push('signal')
+      return {}
+    },
+    finishCodexRecycle: async () => {
+      events.push('exit')
+      return { exited: true }
+    },
+    ensureCodexKernel: async () => {
+      events.push('start')
+      return { ok: true }
+    },
+  })
+  await p.handler({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/vm-1/credential/clear'))
+  assert.deepEqual(events, ['signal', 'exit', 'start'])
+  assert.equal(await f.active(), 0)
+  assert.equal(p.response.body.data.cleared.kernel.stopped, true)
+})
+
+test('a confirmed destroy followed by an unknown start result keeps the reset operation', async (t) => {
+  const f = await fixture(t)
+  const vm = {
+    ...f.vm,
+    proxy: { id: 'synthetic-proxy', scheme: 'socks5', host: '127.0.0.1', port: 9, url: 'socks5://127.0.0.1:9' },
+  }
+  fs.writeFileSync(f.vmPath, JSON.stringify(vm))
+  const p = panel(f, {
+    readBody: async () => ({ mode: 'keep' }),
+    destroySlot: async () => ({ ok: true, action: 'removed' }),
+    startSlotReady: async () => ({ ok: false, error: 'synthetic start timeout' }),
+  })
+  await p.handler({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/vm-1/reset'))
+  assert.equal(p.response.status, 500)
+  assert.equal(await f.active(), 1)
+})
+
+test('a reset rejected before sending a destroy is known not-started and releases its operation', async (t) => {
+  const f = await fixture(t)
+  const p = panel(f, {
+    destroySlot: async () => ({ ok: false, error: 'synthetic preflight rejected', vmOperationNotStarted: true }),
+  })
+  await p.handler({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/vm-1/reset'))
+  assert.equal(p.response.status, 500)
+  assert.equal(await f.active(), 0)
+})
+
+test('credential clear awaits the account identity patch before releasing its VM operation', async (t) => {
+  const f = await fixture(t)
+  const repo = new AccountsRepo(f.other)
+  await repo.insert({ account_id: 'vm-1', email: 'synthetic@example.invalid', name: 'synthetic' })
+  let entered
+  let finish
+  let patched = false
+  let completed = false
+  const started = new Promise((resolve) => {
+    entered = resolve
+  })
+  const completing = new Promise((resolve) => {
+    finish = resolve
+  })
+  const p = panel(f, {
+    accountQuota: {
+      repo: {
+        get: (...args) => repo.get(...args),
+        async patchFields(...args) {
+          patched = true
+          entered()
+          await completing
+          return repo.patchFields(...args)
+        },
+      },
+    },
+    stopCodexKernel: () => null,
+  })
+  const pending = p
+    .handler({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/vm-1/credential/clear'))
+    .finally(() => {
+      completed = true
+    })
+  await Promise.race([started, pending])
+  try {
+    assert.equal(patched, true)
+    assert.equal(completed, false)
+    assert.equal(await f.active(), 1)
+  } finally {
+    finish()
+    await pending
+  }
+  assert.equal((await repo.get('vm-1')).email, null)
+  assert.equal(await f.active(), 0)
 })
