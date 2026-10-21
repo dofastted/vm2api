@@ -108,6 +108,12 @@ export class ExecutionAdmissionsRepo {
         .prepare('SELECT id FROM vm_operations WHERE vm_id = ANY($1::text[]) AND released_at IS NULL LIMIT 1')
         .get(physicalVmAliases(vmId))
       if (operation) return denied('vm_operation_active', 0, vmLimit)
+      // A candidate may have been read before a completed management hold.
+      // Check every physical alias under the same VM locks after the hold commits.
+      const held = await this.db
+        .prepare('SELECT id FROM vms WHERE id = ANY($1::text[]) AND schedulable IS DISTINCT FROM 1 LIMIT 1')
+        .get(physicalVmAliases(vmId))
+      if (held) return denied('vm_not_schedulable', 0, vmLimit)
       const alias = await this.db
         .prepare(`SELECT id FROM execution_admissions
           WHERE vm_id = ANY($1::text[]) AND vm_id <> $2 AND released_at IS NULL LIMIT 1`)

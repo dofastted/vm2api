@@ -35,6 +35,7 @@ function handler(project) {
       return true
     },
     readBody: async () => ({}),
+    vmMutationOps: { destroySlot: async () => ({ ok: true, action: 'absent' }) },
     proxyPool: { unbindVm() {} },
   })
   return { handlePanel, response, cfg }

@@ -9,6 +9,8 @@ import { VmsRepo } from '../../src/lib/db/repos/vms-repo.mjs'
 import { ExecutionAdmissionsRepo } from '../../src/lib/db/repos/execution-admissions-repo.mjs'
 import { SharedVmOperations } from '../../src/lib/vm/shared-vm-operations.mjs'
 import { createRepositoryTestDatabase } from '../repository-database.mjs'
+import { initVmDbSync, stopVmWatch } from '../../src/lib/vm/vm-db-sync.mjs'
+import { setVmWriteHook } from '../../src/lib/vm/vm-file.mjs'
 
 async function fixture(t) {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'panel-shared-vm-'))
@@ -164,5 +166,141 @@ test('a normal non-ok stop result preserves its durable claim', async (t) => {
   )
   await h.request('POST', '/api/panel/vms/vm-synthetic/stop')
   assert.equal(h.response.status, 500)
+  assert.equal((await f.otherOperations.tryAcquire({ vmId: 'vm-synthetic' })).ok, false)
+})
+
+test('a completed stop keeps its claim until SQL/file mirror writes finish', async (t) => {
+  const f = await fixture(t)
+  f.seed('vm-synthetic')
+  let finish
+  let flushing
+  const pending = new Promise((resolve) => {
+    finish = resolve
+  })
+  const started = new Promise((resolve) => {
+    flushing = resolve
+  })
+  let calls = 0
+  const h = f.handler(
+    {},
+    {
+      vmMutationOps: { stopSlot: async () => ({ ok: true, action: 'stopped' }) },
+      accountQuota: {
+        writes: {
+          flush: async () => {
+            if (++calls === 2) {
+              flushing()
+              await pending
+            }
+          },
+        },
+      },
+    },
+  )
+  const request = h.request('POST', '/api/panel/vms/vm-synthetic/stop')
+  await started
+  assert.equal((await f.otherOperations.tryAcquire({ vmId: 'vm-synthetic' })).ok, false)
+  finish()
+  await request
+  assert.equal(h.response.status, 200)
+  const next = await f.otherOperations.tryAcquire({ vmId: 'vm-synthetic' })
+  assert.equal(next.ok, true)
+  await next.release()
+})
+
+test('create HTTP success with a failed start keeps the VM operation unknown', async (t) => {
+  const f = await fixture(t)
+  const proxy = { id: 'synthetic-proxy', url: 'socks5://synthetic.invalid:1080' }
+  const h = f.handler(
+    { id: 'vm-synthetic', start: true, timezone: 'UTC' },
+    {
+      proxyPool: { allocateForVm: async () => proxy, getProxyForVm: () => proxy, snapshot: () => ({ proxies: [] }) },
+      vmMutationOps: {
+        startSlotReady: async () => ({
+          ok: false,
+          error: 'connection dropped after start',
+          vmOperationUncertain: true,
+        }),
+      },
+    },
+  )
+  await h.request('POST', '/api/panel/vms/create')
+  assert.equal(h.response.status, 200, JSON.stringify(h.response.body))
+  assert.equal(h.response.body.data.start_error, 'connection dropped after start')
+  assert.equal((await f.otherOperations.tryAcquire({ vmId: 'vm-synthetic' })).ok, false)
+})
+
+test('delete keeps files and claim when local destroy returns an unknown result', async (t) => {
+  const f = await fixture(t)
+  f.seed('vm-synthetic')
+  const h = f.handler(
+    {},
+    {
+      vmMutationOps: {
+        destroySlot: async () => ({ ok: false, code: 'synthetic_unknown', vmOperationUncertain: true }),
+      },
+    },
+  )
+  await h.request('DELETE', '/api/panel/vms/vm-synthetic')
+  assert.equal(h.response.status, 409)
+  assert.equal(fs.existsSync(path.join(f.project, 'vms', 'vm-synthetic.json')), true)
+  assert.equal((await f.otherOperations.tryAcquire({ vmId: 'vm-synthetic' })).ok, false)
+})
+
+test('an explicit not-started stop failure can release its claim', async (t) => {
+  const f = await fixture(t)
+  f.seed('vm-synthetic')
+  const h = f.handler(
+    {},
+    { vmMutationOps: { stopSlot: async () => ({ ok: false, code: 'synthetic_not_started', notStarted: true }) } },
+  )
+  await h.request('POST', '/api/panel/vms/vm-synthetic/stop')
+  assert.equal(h.response.status, 500)
+  const next = await f.otherOperations.tryAcquire({ vmId: 'vm-synthetic' })
+  assert.equal(next.ok, true)
+  await next.release()
+})
+
+test('a successful panel hold publishes PG state before releasing its global idle claims', async (t) => {
+  const f = await fixture(t)
+  f.seed('vm-synthetic')
+  await initVmDbSync(f.project, { watch: false })
+  t.after(() => {
+    stopVmWatch()
+    setVmWriteHook(null)
+  })
+  const h = f.handler({ reason: 'synthetic_maintenance' })
+  await h.request('POST', '/api/panel/vms/schedule/hold')
+  assert.equal(h.response.status, 200, JSON.stringify(h.response.body))
+  assert.equal(h.response.body.data.drained, true)
+  assert.equal((await f.peer.prepare('SELECT schedulable FROM vms WHERE id = $1').get('vm-synthetic')).schedulable, 0)
+  const stale = await new ExecutionAdmissionsRepo(f.peer).tryReserve({
+    vmId: 'vm-synthetic',
+    accountId: 'synthetic',
+    accountLimit: 2,
+    vmLimit: 2,
+    rpmLimit: 0,
+    fableLimit: 0,
+  })
+  assert.equal(stale.ok, false)
+  assert.equal(stale.code, 'vm_not_schedulable')
+})
+
+test('delete retains ownership and files when required proxy persistence is unconfirmed', async (t) => {
+  const f = await fixture(t)
+  f.seed('vm-synthetic')
+  const h = f.handler(
+    {},
+    {
+      vmMutationOps: { destroySlot: async () => ({ ok: true, action: 'removed' }) },
+      proxyPool: {
+        unbindVm: async () => {
+          throw new Error('SQL acknowledgement lost')
+        },
+      },
+    },
+  )
+  await assert.rejects(h.request('DELETE', '/api/panel/vms/vm-synthetic'), /SQL acknowledgement lost/)
+  assert.equal(fs.existsSync(path.join(f.project, 'vms', 'vm-synthetic.json')), true)
   assert.equal((await f.otherOperations.tryAcquire({ vmId: 'vm-synthetic' })).ok, false)
 })

@@ -173,6 +173,8 @@ import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import * as panel from './panel-api.mjs'
 import { GATEWAY_CAPABILITIES } from '../vm/execution-context.mjs'
 import { withVmLock, atomicWriteJson, isValidVmId, invalidateVmSlotReadCache } from '../vm/vm-file.mjs'
+import { withVmMutations } from '../vm/vm-mutations.mjs'
+import { physicalVmAliases } from '../vm/vm-physical-target.mjs'
 import { snapshotDatabaseMetrics } from '../db/database-metrics.mjs'
 import { getUsageCache } from '../oauth/usage-cache.mjs'
 import { getDb } from '../db/database.mjs'
@@ -614,6 +616,42 @@ export function createPanelHandler(ctx) {
       error: { code: 'database_persistence_failed', message: 'Database persistence failed; maintenance is required' },
     })
   }
+  async function mutateVms(ids, callback) {
+    if (!isKubernetesMode() && !ctx.vmOperations) return callback(new Map())
+    return withVmMutations(
+      ctx.cfg.paths.project,
+      ids,
+      async (handles) => {
+        const result = await callback(handles)
+        try {
+          await flushPanelWrites()
+        } catch (error) {
+          error.panelPersistenceFailure = true
+          throw error
+        }
+        return result
+      },
+      { operations: ctx.vmOperations },
+    )
+  }
+  async function vmEffect(operation, callback) {
+    let result
+    try {
+      result = await callback()
+    } catch (error) {
+      await operation?.markUncertain?.()
+      throw error
+    }
+    if (
+      result?.vmOperationUncertain ||
+      result?.rust_ok === false ||
+      result?.report?.ok === false ||
+      (result?.ok !== true && result?.notStarted !== true && result?.vmOperationNotStarted !== true)
+    ) {
+      await operation?.markUncertain?.()
+    }
+    return result
+  }
   const hostUnsupported = (res, vm, cap) => {
     if (slotHost(vm).supports(cap)) return false
     json(res, 409, {
@@ -1049,7 +1087,7 @@ export function createPanelHandler(ctx) {
 
   async function applySlotPolicyWithRuntime(id, patch) {
     const current = getVm(cfg.paths.project, id)
-    if (!current) return { ok: false, id, code: 'vm_not_found', error: 'vm not found' }
+    if (!current) return { ok: false, id, code: 'vm_not_found', error: 'vm not found', notStarted: true }
     const desired = vmWithSlotPolicyPatch(current, patch)
     const previousEngine = resolveInferenceEngine(current, ctx.routingConfig)
     const targetEngine = resolveInferenceEngine(desired, ctx.routingConfig)
@@ -2495,18 +2533,21 @@ export function createPanelHandler(ctx) {
         const targets = parseSlotPolicyTargets(body)
         if (!targets.ok) return json(res, 400, { ok: false, error: { message: targets.error } })
         const ids = targets.all ? listVms(cfg.paths.project).map((vm) => vm.id) : targets.ids
-        const results = []
-        for (const id of ids) results.push(await applySlotPolicyWithRuntime(id, parsed.patch))
-        const failed = results.filter((item) => !item.ok)
-        const report = {
-          updated: results.length - failed.length,
-          missing: failed.filter((item) => item.code === 'vm_not_found').map((item) => item.id),
-          failed: failed.map(({ id, code, error }) => ({ id, code, error })),
-          items: results
-            .filter((item) => item.ok)
-            .map((item) => summarizeVm(item.vm, cfg.paths.project, ctx.routingConfig)),
-        }
-        return json(res, 200, panel.ok(report))
+        return mutateVms(ids, async (handles) => {
+          const results = []
+          for (const id of ids)
+            results.push(await vmEffect(handles.get(id), () => applySlotPolicyWithRuntime(id, parsed.patch)))
+          const failed = results.filter((item) => !item.ok)
+          const report = {
+            updated: results.length - failed.length,
+            missing: failed.filter((item) => item.code === 'vm_not_found').map((item) => item.id),
+            failed: failed.map(({ id, code, error }) => ({ id, code, error })),
+            items: results
+              .filter((item) => item.ok)
+              .map((item) => summarizeVm(item.vm, cfg.paths.project, ctx.routingConfig)),
+          }
+          return json(res, 200, panel.ok(report))
+        })
       }
       // POST /api/panel/vms/pool-policy — batch slot policy
       // ({ ids: [...] } or { all: true }, plus any of weight / schedule_level /
@@ -2579,67 +2620,75 @@ export function createPanelHandler(ctx) {
           nextSessions = parsed.value
         }
         const ids = targets.all ? listVms(cfg.paths.project).map((vm) => vm.id) : targets.ids
-        const missing = []
-        const failed = []
-        const items = []
-        for (const id of ids) {
-          try {
-            let record = null
-            if (hasWeight || hasLevel) {
-              record = patchVmRecord(cfg.paths.project, id, (current) => {
-                const policy = { ...(current.policy || {}) }
-                if (hasWeight) policy.weight = nextWeight
-                if (hasLevel) {
-                  if (nextLevel == null) delete policy.priority
-                  else policy.priority = nextLevel
-                }
-                return { policy }
+        return mutateVms(ids, async (handles) => {
+          const missing = []
+          const failed = []
+          const items = []
+          for (const id of ids) {
+            try {
+              let record = null
+              if (hasWeight || hasLevel) {
+                record = patchVmRecord(cfg.paths.project, id, (current) => {
+                  const policy = { ...(current.policy || {}) }
+                  if (hasWeight) policy.weight = nextWeight
+                  if (hasLevel) {
+                    if (nextLevel == null) delete policy.priority
+                    else policy.priority = nextLevel
+                  }
+                  return { policy }
+                })
+              } else {
+                record = getVm(cfg.paths.project, id)
+              }
+              if (!record) {
+                missing.push(id)
+                continue
+              }
+              if (hasConc && nextConc !== null) applyVmConcurrency(id, nextConc, { override: true })
+              if (hasRpm && nextRpm !== null) applyVmRpm(id, nextRpm, { override: true })
+              if (hasSessions && nextSessions !== null) ctx.applyVmMaxSessions(id, nextSessions, { override: true })
+              const inherit = {}
+              if (hasConc && nextConc === null) inherit.concurrency = true
+              if (hasRpm && nextRpm === null) inherit.rpm = true
+              if (hasSessions && nextSessions === null) inherit.maxSessions = true
+              if (Object.keys(inherit).length) inheritVmScheduling(id, inherit)
+              const fresh = getVm(cfg.paths.project, id) || record
+              const policy = fresh.policy || {}
+              items.push({
+                id,
+                weight: Number(policy.weight ?? 1),
+                schedule_level: manualScheduleLevelOf(fresh) ?? 'auto',
+                max_concurrency: policy.maxConcurrency ?? null,
+                concurrency_override: !!policy.concurrencyOverride,
+                max_rpm: policy.maxRpm ?? null,
+                max_sessions: policy.maxSessions ?? null,
               })
-            } else {
-              record = getVm(cfg.paths.project, id)
+            } catch (error) {
+              failed.push({ id, error: (error && error.message) || String(error) })
             }
-            if (!record) {
-              missing.push(id)
-              continue
-            }
-            if (hasConc && nextConc !== null) applyVmConcurrency(id, nextConc, { override: true })
-            if (hasRpm && nextRpm !== null) applyVmRpm(id, nextRpm, { override: true })
-            if (hasSessions && nextSessions !== null) ctx.applyVmMaxSessions(id, nextSessions, { override: true })
-            const inherit = {}
-            if (hasConc && nextConc === null) inherit.concurrency = true
-            if (hasRpm && nextRpm === null) inherit.rpm = true
-            if (hasSessions && nextSessions === null) inherit.maxSessions = true
-            if (Object.keys(inherit).length) inheritVmScheduling(id, inherit)
-            const fresh = getVm(cfg.paths.project, id) || record
-            const policy = fresh.policy || {}
-            items.push({
-              id,
-              weight: Number(policy.weight ?? 1),
-              schedule_level: manualScheduleLevelOf(fresh) ?? 'auto',
-              max_concurrency: policy.maxConcurrency ?? null,
-              concurrency_override: !!policy.concurrencyOverride,
-              max_rpm: policy.maxRpm ?? null,
-              max_sessions: policy.maxSessions ?? null,
-            })
-          } catch (error) {
-            failed.push({ id, error: (error && error.message) || String(error) })
           }
-        }
-        return json(res, 200, panel.ok({ updated: items.length, missing, failed, items }))
+          return json(res, 200, panel.ok({ updated: items.length, missing, failed, items }))
+        })
       }
       // POST /api/panel/vms/:id/reload
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/reload$/.test(p)) {
         const id = p.split('/')[4]
-        const vm = getVm(cfg.paths.project, id)
-        if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        const reloaded = await reloadSlotReady(vm, cfg.paths.project, { routing: ctx.routingConfig })
-        if (!reloaded.ok) {
-          return json(res, 500, {
-            ok: false,
-            error: { message: reloaded.error || 'reload failed', code: reloaded.code },
-          })
-        }
-        return json(res, 200, panel.ok({ id, reload: reloaded }))
+        return mutateVms([id], async (handles) => {
+          const vm = getVm(cfg.paths.project, id)
+          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const reloaded = await vmEffect(handles.get(id), () =>
+            (ctx.vmMutationOps?.reloadSlotReady || reloadSlotReady)(vm, cfg.paths.project, {
+              routing: ctx.routingConfig,
+            }),
+          )
+          if (!reloaded.ok) {
+            return json(res, 500, {
+              ok: false,
+              error: { message: reloaded.error || 'reload failed', code: reloaded.code },
+            })
+          }
+          return json(res, 200, panel.ok({ id, reload: reloaded }))
+        })
       }
       // POST /api/panel/vms/:id/shell-ticket — single-use ticket for the slot terminal WebSocket
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/shell-ticket$/.test(p)) {
@@ -2710,335 +2759,339 @@ export function createPanelHandler(ctx) {
       if (req.method === 'PATCH' && /^\/api\/panel\/vms\/[^/]+$/.test(p)) {
         const id = p.split('/').pop()
         const body = await readBody(req, 8192).catch(() => ({}))
-        const currentVm = getVm(cfg.paths.project, id)
-        if (!currentVm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        const strictInteger = (value, min, max, label, { nullable = false } = {}) => {
-          if (nullable && value === null) return null
-          if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value)) {
-            throw new TypeError(`${label} must be an integer`)
+        return mutateVms([id], async (handles) => {
+          const currentVm = getVm(cfg.paths.project, id)
+          if (!currentVm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const strictInteger = (value, min, max, label, { nullable = false } = {}) => {
+            if (nullable && value === null) return null
+            if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value)) {
+              throw new TypeError(`${label} must be an integer`)
+            }
+            if (value < min || value > max) throw new RangeError(`${label} must be between ${min} and ${max}`)
+            return value
           }
-          if (value < min || value > max) throw new RangeError(`${label} must be between ${min} and ${max}`)
-          return value
-        }
-        const hasConcurrency =
-          Object.prototype.hasOwnProperty.call(body || {}, 'max_concurrency') ||
-          Object.prototype.hasOwnProperty.call(body || {}, 'maxConcurrency')
-        const hasRpm =
-          Object.prototype.hasOwnProperty.call(body || {}, 'max_rpm') ||
-          Object.prototype.hasOwnProperty.call(body || {}, 'maxRpm')
-        const next = Object.prototype.hasOwnProperty.call(body || {}, 'max_concurrency')
-          ? body.max_concurrency
-          : body.maxConcurrency
-        const nextRpm = Object.prototype.hasOwnProperty.call(body || {}, 'max_rpm') ? body.max_rpm : body.maxRpm
-        const hasMaxSessions = body && Object.prototype.hasOwnProperty.call(body, 'max_sessions')
-        // Explicit null = drop the slot's pin and follow its tier / global default again.
-        const inheritConc = body?.max_concurrency === null
-        const inheritRpm = body?.max_rpm === null
-        const hasSessionSlots = body && Object.prototype.hasOwnProperty.call(body, 'session_slots')
-        const hasQuotaOverride = body && Object.prototype.hasOwnProperty.call(body, 'quota_override')
-        const hasModels = body && Object.prototype.hasOwnProperty.call(body, 'allowed_models')
-        const hasAuthScheme = body && (body.auth_scheme != null || body.authScheme != null)
-        const hasScheduleLevel = body && Object.prototype.hasOwnProperty.call(body, 'schedule_level')
-        const hasActiveHours = body && Object.prototype.hasOwnProperty.call(body, 'active_hours')
-        const hasTimezone = body && Object.prototype.hasOwnProperty.call(body, 'timezone')
-        const hasWeight = body && Object.prototype.hasOwnProperty.call(body, 'weight')
-        const hasMemory =
-          body &&
-          (Object.prototype.hasOwnProperty.call(body, 'memory') ||
-            (body.machine &&
-              typeof body.machine === 'object' &&
-              !Array.isArray(body.machine) &&
-              Object.prototype.hasOwnProperty.call(body.machine, 'memory')))
-        // `timezone_follow_proxy: true` re-attaches the slot to its exit node's
-        // zone, undoing an earlier hand-pinned value.
-        const followProxyTz = body?.timezone_follow_proxy === true || body?.timezoneFollowProxy === true
-        const hasSlotPolicy =
-          body &&
-          (Object.prototype.hasOwnProperty.call(body, 'inference_engine') ||
-            Object.prototype.hasOwnProperty.call(body, 'persona_preset'))
-        if (
-          !hasConcurrency &&
-          !hasRpm &&
-          !inheritConc &&
-          !inheritRpm &&
-          !hasSessionSlots &&
-          !hasMaxSessions &&
-          !hasQuotaOverride &&
-          !hasModels &&
-          !hasAuthScheme &&
-          !hasSlotPolicy &&
-          !hasScheduleLevel &&
-          !hasActiveHours &&
-          !hasTimezone &&
-          !hasWeight &&
-          !hasMemory &&
-          !followProxyTz
-        ) {
-          return json(res, 400, {
-            ok: false,
-            error: {
-              message:
-                'max_concurrency, max_rpm, max_sessions, session_slots, quota_override, allowed_models, auth_scheme, inference_engine, persona_preset, schedule_level, active_hours, timezone, weight, machine.memory or timezone_follow_proxy required',
-            },
-          })
-        }
-        try {
-          if (hasConcurrency && next !== null) strictInteger(next, 1, 256, 'max_concurrency')
-          if (hasRpm && nextRpm !== null) strictInteger(nextRpm, 0, 1_000_000, 'max_rpm')
-          if (hasSessionSlots && body.session_slots !== null)
-            strictInteger(body.session_slots, SESSION_SLOT_MIN, SESSION_SLOT_MAX, 'session_slots')
-          if (hasMaxSessions && body.max_sessions !== null) strictInteger(body.max_sessions, 0, 256, 'max_sessions')
-          // null puts the slot back on the default weight of 1
-          if (hasWeight && body.weight !== null) strictInteger(body.weight, 1, 100, 'weight')
-        } catch (error) {
-          return json(res, 400, {
-            ok: false,
-            error: { code: 'invalid_scheduling_value', message: error.message },
-          })
-        }
-        const parsedScheduleLevel = hasScheduleLevel ? parseScheduleLevelInput(body.schedule_level) : null
-        if (parsedScheduleLevel && !parsedScheduleLevel.ok) {
-          return json(res, 400, { ok: false, error: { message: parsedScheduleLevel.error } })
-        }
-        const parsedActiveHours = hasActiveHours ? parseActiveHoursInput(body.active_hours) : null
-        if (parsedActiveHours && !parsedActiveHours.ok) {
-          return json(res, 400, { ok: false, error: { message: parsedActiveHours.error } })
-        }
-        const parsedQuotaOverride = hasQuotaOverride ? parseVmQuotaOverride(body.quota_override) : null
-        if (parsedQuotaOverride && !parsedQuotaOverride.ok) {
-          return json(res, 400, { ok: false, error: { message: parsedQuotaOverride.error } })
-        }
-        if (parsedQuotaOverride) {
-          if (isCodexVm(currentVm)) {
-            return json(res, 400, {
-              ok: false,
-              error: { code: 'gpt_quota_override_forbidden', message: 'GPT slots do not use Claude quota tiers' },
-            })
-          }
-        }
-        if (hasSessionSlots && isCodexVm(currentVm)) {
-          return json(res, 400, {
-            ok: false,
-            error: { code: 'gpt_session_slots_forbidden', message: 'GPT slots do not use native session slots' },
-          })
-        }
-        if (hasMaxSessions && !isCodexVm(currentVm)) {
-          return json(res, 400, {
-            ok: false,
-            error: { code: 'claude_max_sessions_forbidden', message: 'Claude 槽不使用 OpenAI 会话容量上限' },
-          })
-        }
-        if (hasAuthScheme && hostUnsupported(res, currentVm, 'auth_scheme')) return
-        if (
-          hasSlotPolicy &&
-          Object.prototype.hasOwnProperty.call(body, 'inference_engine') &&
-          (isCodexVm(currentVm) || hostUnsupported(res, currentVm, 'engine_switch'))
-        ) {
-          if (isCodexVm(currentVm)) {
-            return json(res, 400, {
-              ok: false,
-              error: { code: 'gpt_engine_forbidden', message: 'GPT slots do not use go or rust inference engines' },
-            })
-          }
-          return
-        }
-        if (hasModels) {
-          const parsed = parseAllowedModelsPatch(body.allowed_models, { vm: currentVm })
-          if (!parsed.ok) return json(res, 400, { ok: false, error: { message: parsed.error } })
-        }
-        if (hasSlotPolicy) {
-          const parsed = parseSlotEnginePolicyPatch(body)
-          if (!parsed.ok) return json(res, 400, { ok: false, error: { message: parsed.error } })
-        }
-        let timezoneSync = null
-        if (hasTimezone) {
-          // Any IANA zone is allowed — the US presets are UI defaults, not a
-          // whitelist. Reject only what Intl (and therefore the container TZ)
-          // cannot resolve, so a typo never reaches `docker run -e TZ=`.
-          const zone = validTimezone(body.timezone)
-          if (!zone) {
+          const hasConcurrency =
+            Object.prototype.hasOwnProperty.call(body || {}, 'max_concurrency') ||
+            Object.prototype.hasOwnProperty.call(body || {}, 'maxConcurrency')
+          const hasRpm =
+            Object.prototype.hasOwnProperty.call(body || {}, 'max_rpm') ||
+            Object.prototype.hasOwnProperty.call(body || {}, 'maxRpm')
+          const next = Object.prototype.hasOwnProperty.call(body || {}, 'max_concurrency')
+            ? body.max_concurrency
+            : body.maxConcurrency
+          const nextRpm = Object.prototype.hasOwnProperty.call(body || {}, 'max_rpm') ? body.max_rpm : body.maxRpm
+          const hasMaxSessions = body && Object.prototype.hasOwnProperty.call(body, 'max_sessions')
+          // Explicit null = drop the slot's pin and follow its tier / global default again.
+          const inheritConc = body?.max_concurrency === null
+          const inheritRpm = body?.max_rpm === null
+          const hasSessionSlots = body && Object.prototype.hasOwnProperty.call(body, 'session_slots')
+          const hasQuotaOverride = body && Object.prototype.hasOwnProperty.call(body, 'quota_override')
+          const hasModels = body && Object.prototype.hasOwnProperty.call(body, 'allowed_models')
+          const hasAuthScheme = body && (body.auth_scheme != null || body.authScheme != null)
+          const hasScheduleLevel = body && Object.prototype.hasOwnProperty.call(body, 'schedule_level')
+          const hasActiveHours = body && Object.prototype.hasOwnProperty.call(body, 'active_hours')
+          const hasTimezone = body && Object.prototype.hasOwnProperty.call(body, 'timezone')
+          const hasWeight = body && Object.prototype.hasOwnProperty.call(body, 'weight')
+          const hasMemory =
+            body &&
+            (Object.prototype.hasOwnProperty.call(body, 'memory') ||
+              (body.machine &&
+                typeof body.machine === 'object' &&
+                !Array.isArray(body.machine) &&
+                Object.prototype.hasOwnProperty.call(body.machine, 'memory')))
+          // `timezone_follow_proxy: true` re-attaches the slot to its exit node's
+          // zone, undoing an earlier hand-pinned value.
+          const followProxyTz = body?.timezone_follow_proxy === true || body?.timezoneFollowProxy === true
+          const hasSlotPolicy =
+            body &&
+            (Object.prototype.hasOwnProperty.call(body, 'inference_engine') ||
+              Object.prototype.hasOwnProperty.call(body, 'persona_preset'))
+          if (
+            !hasConcurrency &&
+            !hasRpm &&
+            !inheritConc &&
+            !inheritRpm &&
+            !hasSessionSlots &&
+            !hasMaxSessions &&
+            !hasQuotaOverride &&
+            !hasModels &&
+            !hasAuthScheme &&
+            !hasSlotPolicy &&
+            !hasScheduleLevel &&
+            !hasActiveHours &&
+            !hasTimezone &&
+            !hasWeight &&
+            !hasMemory &&
+            !followProxyTz
+          ) {
             return json(res, 400, {
               ok: false,
               error: {
-                type: 'invalid_request_error',
-                code: 'invalid_timezone',
-                message: '时区必须是有效的 IANA 名称，如 Asia/Tokyo',
-                param: 'timezone',
+                message:
+                  'max_concurrency, max_rpm, max_sessions, session_slots, quota_override, allowed_models, auth_scheme, inference_engine, persona_preset, schedule_level, active_hours, timezone, weight, machine.memory or timezone_follow_proxy required',
               },
             })
           }
-          timezoneSync = { timezone: zone, source: 'manual' }
-        } else if (followProxyTz) {
-          const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, {
-            force: true,
-            persist: false,
-          })
-          if (!synced.ok) {
+          try {
+            if (hasConcurrency && next !== null) strictInteger(next, 1, 256, 'max_concurrency')
+            if (hasRpm && nextRpm !== null) strictInteger(nextRpm, 0, 1_000_000, 'max_rpm')
+            if (hasSessionSlots && body.session_slots !== null)
+              strictInteger(body.session_slots, SESSION_SLOT_MIN, SESSION_SLOT_MAX, 'session_slots')
+            if (hasMaxSessions && body.max_sessions !== null) strictInteger(body.max_sessions, 0, 256, 'max_sessions')
+            // null puts the slot back on the default weight of 1
+            if (hasWeight && body.weight !== null) strictInteger(body.weight, 1, 100, 'weight')
+          } catch (error) {
             return json(res, 400, {
               ok: false,
-              error: {
-                type: 'invalid_request_error',
-                code: synced.reason || 'proxy_timezone_unknown',
-                message: '未能从代理节点取到时区，请先检测代理地理位置',
-              },
+              error: { code: 'invalid_scheduling_value', message: error.message },
             })
           }
-          timezoneSync = { applied: false, timezone: synced.timezone, source: 'proxy_geo' }
-        }
-        if (hasConcurrency && next !== null) {
-          const vm = applyVmConcurrency(id, next, { override: true })
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        if (hasRpm && nextRpm !== null) {
-          const vm = applyVmRpm(id, nextRpm, { override: true })
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        if ((hasConcurrency && next === null) || (hasRpm && nextRpm === null)) {
-          const vm = inheritVmScheduling(id, {
-            concurrency: hasConcurrency && next === null,
-            rpm: hasRpm && nextRpm === null,
-          })
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        if (hasSessionSlots) {
-          if (body.session_slots === null) {
-            inheritVmScheduling(id, { sessionSlots: true })
-          } else {
-            const vm = applyVmSessionSlots(id, normalizeSessionSlots(body.session_slots), { override: true })
-            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const parsedScheduleLevel = hasScheduleLevel ? parseScheduleLevelInput(body.schedule_level) : null
+          if (parsedScheduleLevel && !parsedScheduleLevel.ok) {
+            return json(res, 400, { ok: false, error: { message: parsedScheduleLevel.error } })
           }
-        }
-        if (hasMaxSessions) {
-          if (body.max_sessions === null) {
-            const vm = inheritVmScheduling(id, { maxSessions: true })
-            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-          } else {
-            const vm = ctx.applyVmMaxSessions(id, body.max_sessions, { override: true })
-            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const parsedActiveHours = hasActiveHours ? parseActiveHoursInput(body.active_hours) : null
+          if (parsedActiveHours && !parsedActiveHours.ok) {
+            return json(res, 400, { ok: false, error: { message: parsedActiveHours.error } })
           }
-        }
-        if (parsedQuotaOverride) {
-          const vm = applyVmQuotaOverride(id, parsedQuotaOverride.value)
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        if (hasModels) {
-          const parsed = parseAllowedModelsPatch(body.allowed_models, { vm: currentVm })
-          const vm = persistAllowedModels(cfg.paths.project, id, parsed.value)
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        if (hasAuthScheme) {
-          const vm = persistSlotAuthScheme(cfg.paths.project, id, body.auth_scheme || body.authScheme)
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        let slotPolicyResult = null
-        if (hasSlotPolicy) {
-          const parsed = parseSlotEnginePolicyPatch(body)
-          slotPolicyResult = await applySlotPolicyWithRuntime(id, parsed.patch)
-          if (!slotPolicyResult.ok) {
-            const status =
-              slotPolicyResult.code === 'vm_not_found'
-                ? 404
-                : slotPolicyResult.code === 'gpt_engine_forbidden'
-                  ? 400
-                  : 503
-            return json(res, status, {
+          const parsedQuotaOverride = hasQuotaOverride ? parseVmQuotaOverride(body.quota_override) : null
+          if (parsedQuotaOverride && !parsedQuotaOverride.ok) {
+            return json(res, 400, { ok: false, error: { message: parsedQuotaOverride.error } })
+          }
+          if (parsedQuotaOverride) {
+            if (isCodexVm(currentVm)) {
+              return json(res, 400, {
+                ok: false,
+                error: { code: 'gpt_quota_override_forbidden', message: 'GPT slots do not use Claude quota tiers' },
+              })
+            }
+          }
+          if (hasSessionSlots && isCodexVm(currentVm)) {
+            return json(res, 400, {
               ok: false,
-              error: {
-                code: slotPolicyResult.code,
-                message: slotPolicyResult.error || 'inference engine switch failed',
-              },
+              error: { code: 'gpt_session_slots_forbidden', message: 'GPT slots do not use native session slots' },
             })
           }
-        }
-        if (parsedScheduleLevel) {
-          const vm = persistVmScheduleLevel(cfg.paths.project, id, parsedScheduleLevel.value)
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        if (parsedActiveHours) {
-          const vm = persistVmActiveHours(cfg.paths.project, id, parsedActiveHours.value)
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        if (hasTimezone) {
-          const vm = persistVmTimezone(cfg.paths.project, id, timezoneSync.timezone, { source: 'manual' })
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-          const kernel = projectSlotKernelConfig(vm)
-          timezoneSync.applied = true
-          timezoneSync.kernel_hot = kernel?.changed === true
-        } else if (followProxyTz) {
-          const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, { force: true })
-          timezoneSync = { applied: synced.applied, timezone: synced.timezone, source: 'proxy_geo' }
-          if (synced.applied) {
-            const kernel = projectSlotKernelConfig({ id })
+          if (hasMaxSessions && !isCodexVm(currentVm)) {
+            return json(res, 400, {
+              ok: false,
+              error: { code: 'claude_max_sessions_forbidden', message: 'Claude 槽不使用 OpenAI 会话容量上限' },
+            })
+          }
+          if (hasAuthScheme && hostUnsupported(res, currentVm, 'auth_scheme')) return
+          if (
+            hasSlotPolicy &&
+            Object.prototype.hasOwnProperty.call(body, 'inference_engine') &&
+            (isCodexVm(currentVm) || hostUnsupported(res, currentVm, 'engine_switch'))
+          ) {
+            if (isCodexVm(currentVm)) {
+              return json(res, 400, {
+                ok: false,
+                error: { code: 'gpt_engine_forbidden', message: 'GPT slots do not use go or rust inference engines' },
+              })
+            }
+            return
+          }
+          if (hasModels) {
+            const parsed = parseAllowedModelsPatch(body.allowed_models, { vm: currentVm })
+            if (!parsed.ok) return json(res, 400, { ok: false, error: { message: parsed.error } })
+          }
+          if (hasSlotPolicy) {
+            const parsed = parseSlotEnginePolicyPatch(body)
+            if (!parsed.ok) return json(res, 400, { ok: false, error: { message: parsed.error } })
+          }
+          let timezoneSync = null
+          if (hasTimezone) {
+            // Any IANA zone is allowed — the US presets are UI defaults, not a
+            // whitelist. Reject only what Intl (and therefore the container TZ)
+            // cannot resolve, so a typo never reaches `docker run -e TZ=`.
+            const zone = validTimezone(body.timezone)
+            if (!zone) {
+              return json(res, 400, {
+                ok: false,
+                error: {
+                  type: 'invalid_request_error',
+                  code: 'invalid_timezone',
+                  message: '时区必须是有效的 IANA 名称，如 Asia/Tokyo',
+                  param: 'timezone',
+                },
+              })
+            }
+            timezoneSync = { timezone: zone, source: 'manual' }
+          } else if (followProxyTz) {
+            const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, {
+              force: true,
+              persist: false,
+            })
+            if (!synced.ok) {
+              return json(res, 400, {
+                ok: false,
+                error: {
+                  type: 'invalid_request_error',
+                  code: synced.reason || 'proxy_timezone_unknown',
+                  message: '未能从代理节点取到时区，请先检测代理地理位置',
+                },
+              })
+            }
+            timezoneSync = { applied: false, timezone: synced.timezone, source: 'proxy_geo' }
+          }
+          if (hasConcurrency && next !== null) {
+            const vm = applyVmConcurrency(id, next, { override: true })
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          if (hasRpm && nextRpm !== null) {
+            const vm = applyVmRpm(id, nextRpm, { override: true })
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          if ((hasConcurrency && next === null) || (hasRpm && nextRpm === null)) {
+            const vm = inheritVmScheduling(id, {
+              concurrency: hasConcurrency && next === null,
+              rpm: hasRpm && nextRpm === null,
+            })
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          if (hasSessionSlots) {
+            if (body.session_slots === null) {
+              inheritVmScheduling(id, { sessionSlots: true })
+            } else {
+              const vm = applyVmSessionSlots(id, normalizeSessionSlots(body.session_slots), { override: true })
+              if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+            }
+          }
+          if (hasMaxSessions) {
+            if (body.max_sessions === null) {
+              const vm = inheritVmScheduling(id, { maxSessions: true })
+              if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+            } else {
+              const vm = ctx.applyVmMaxSessions(id, body.max_sessions, { override: true })
+              if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+            }
+          }
+          if (parsedQuotaOverride) {
+            const vm = applyVmQuotaOverride(id, parsedQuotaOverride.value)
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          if (hasModels) {
+            const parsed = parseAllowedModelsPatch(body.allowed_models, { vm: currentVm })
+            const vm = persistAllowedModels(cfg.paths.project, id, parsed.value)
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          if (hasAuthScheme) {
+            const vm = persistSlotAuthScheme(cfg.paths.project, id, body.auth_scheme || body.authScheme)
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          let slotPolicyResult = null
+          if (hasSlotPolicy) {
+            const parsed = parseSlotEnginePolicyPatch(body)
+            slotPolicyResult = await vmEffect(handles.get(id), () => applySlotPolicyWithRuntime(id, parsed.patch))
+            if (!slotPolicyResult.ok) {
+              const status =
+                slotPolicyResult.code === 'vm_not_found'
+                  ? 404
+                  : slotPolicyResult.code === 'gpt_engine_forbidden'
+                    ? 400
+                    : 503
+              return json(res, status, {
+                ok: false,
+                error: {
+                  code: slotPolicyResult.code,
+                  message: slotPolicyResult.error || 'inference engine switch failed',
+                },
+              })
+            }
+          }
+          if (parsedScheduleLevel) {
+            const vm = persistVmScheduleLevel(cfg.paths.project, id, parsedScheduleLevel.value)
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          if (parsedActiveHours) {
+            const vm = persistVmActiveHours(cfg.paths.project, id, parsedActiveHours.value)
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          if (hasTimezone) {
+            const vm = persistVmTimezone(cfg.paths.project, id, timezoneSync.timezone, { source: 'manual' })
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+            const kernel = projectSlotKernelConfig(vm)
+            timezoneSync.applied = true
             timezoneSync.kernel_hot = kernel?.changed === true
+          } else if (followProxyTz) {
+            const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, { force: true })
+            timezoneSync = { applied: synced.applied, timezone: synced.timezone, source: 'proxy_geo' }
+            if (synced.applied) {
+              const kernel = projectSlotKernelConfig({ id })
+              timezoneSync.kernel_hot = kernel?.changed === true
+            }
           }
-        }
-        if (hasWeight) {
-          const nextWeight = body.weight === null ? 1 : body.weight
-          const vm = patchVmRecord(cfg.paths.project, id, (record) => ({
-            policy: { ...(record.policy || {}), weight: nextWeight },
-          }))
-          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        let memoryRaiseResult = null
-        if (hasMemory) {
-          const requestedMemory =
-            body.machine && typeof body.machine === 'object' && !Array.isArray(body.machine)
-              ? body.machine.memory
-              : body.memory
-          const liveVm = getVm(cfg.paths.project, id) || currentVm
-          const raiseMemory = ctx.raiseDockerSlotMemory || raiseDockerSlotMemory
-          const raised = raiseMemory(cfg.paths.project, liveVm, requestedMemory, {
-            routing: ctx.routingConfig,
+          if (hasWeight) {
+            const nextWeight = body.weight === null ? 1 : body.weight
+            const vm = patchVmRecord(cfg.paths.project, id, (record) => ({
+              policy: { ...(record.policy || {}), weight: nextWeight },
+            }))
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          let memoryRaiseResult = null
+          if (hasMemory) {
+            const requestedMemory =
+              body.machine && typeof body.machine === 'object' && !Array.isArray(body.machine)
+                ? body.machine.memory
+                : body.memory
+            const liveVm = getVm(cfg.paths.project, id) || currentVm
+            const raiseMemory = ctx.raiseDockerSlotMemory || raiseDockerSlotMemory
+            const raised = await vmEffect(handles.get(id), () =>
+              raiseMemory(cfg.paths.project, liveVm, requestedMemory, {
+                routing: ctx.routingConfig,
+              }),
+            )
+            if (!raised.ok) {
+              const status =
+                raised.code === 'vm_not_found'
+                  ? 404
+                  : raised.code === 'invalid_memory' ||
+                      raised.code === 'memory_not_increased' ||
+                      raised.code === 'kvm_memory_raise_forbidden'
+                    ? 400
+                    : 502
+              return json(res, status, {
+                ok: false,
+                error: {
+                  code: raised.code,
+                  message: raised.message,
+                  requested: raised.requested ?? requestedMemory ?? null,
+                  container_memory: raised.container_memory ?? null,
+                  current: raised.current ?? null,
+                },
+              })
+            }
+            memoryRaiseResult = {
+              previous: raised.previous,
+              memory: raised.memory,
+              container_memory: raised.container_memory,
+            }
+          }
+          const detail = await panel.buildVmDetail({
+            cfg,
+            accountQuota,
+            id,
+            routingConfig: ctx.routingConfig,
+            poolScheduler: ctx.poolScheduler,
+            requestLog,
+            proxyPool,
+            kernelHealth: panelKernelHealth,
+            clusterNodes: clusterNodesOf(ctx),
+            role: panelIdentity(req).role,
           })
-          if (!raised.ok) {
-            const status =
-              raised.code === 'vm_not_found'
-                ? 404
-                : raised.code === 'invalid_memory' ||
-                    raised.code === 'memory_not_increased' ||
-                    raised.code === 'kvm_memory_raise_forbidden'
-                  ? 400
-                  : 502
-            return json(res, status, {
-              ok: false,
-              error: {
-                code: raised.code,
-                message: raised.message,
-                requested: raised.requested ?? requestedMemory ?? null,
-                container_memory: raised.container_memory ?? null,
-                current: raised.current ?? null,
-              },
-            })
+          if (slotPolicyResult && detail?.data) {
+            detail.data.engine_switch = {
+              configured_engine: slotPolicyResult.configured_engine,
+              resolved_engine: slotPolicyResult.resolved_engine,
+              active_engine: slotPolicyResult.active_engine,
+              runtime: slotPolicyResult.runtime,
+            }
           }
-          memoryRaiseResult = {
-            previous: raised.previous,
-            memory: raised.memory,
-            container_memory: raised.container_memory,
-          }
-        }
-        const detail = await panel.buildVmDetail({
-          cfg,
-          accountQuota,
-          id,
-          routingConfig: ctx.routingConfig,
-          poolScheduler: ctx.poolScheduler,
-          requestLog,
-          proxyPool,
-          kernelHealth: panelKernelHealth,
-          clusterNodes: clusterNodesOf(ctx),
-          role: panelIdentity(req).role,
+          if (timezoneSync && detail?.data) detail.data.timezone_sync = timezoneSync
+          if (memoryRaiseResult && detail?.data) detail.data.memory_raise = memoryRaiseResult
+          return json(res, 200, detail)
         })
-        if (slotPolicyResult && detail?.data) {
-          detail.data.engine_switch = {
-            configured_engine: slotPolicyResult.configured_engine,
-            resolved_engine: slotPolicyResult.resolved_engine,
-            active_engine: slotPolicyResult.active_engine,
-            runtime: slotPolicyResult.runtime,
-          }
-        }
-        if (timezoneSync && detail?.data) detail.data.timezone_sync = timezoneSync
-        if (memoryRaiseResult && detail?.data) detail.data.memory_raise = memoryRaiseResult
-        return json(res, 200, detail)
       }
       // POST /api/panel/vms/:id/probe
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/probe$/.test(p)) {
@@ -3218,71 +3271,89 @@ export function createPanelHandler(ctx) {
       if (req.method === 'POST' && p === '/api/panel/vms/schedule/hold') {
         const body = await readBody(req, 8192).catch(() => ({}))
         const reason = String(body?.reason || KERNEL_UPDATE_HOLD).slice(0, 64)
-        const ids = holdSchedulableSlots(cfg.paths.project, reason)
-        const drain = await waitForSlotDrain(ctx.poolScheduler, ids)
-        if (!drain.ok) {
-          const restored = resumeSchedulableSlots(cfg.paths.project, ids, reason)
-          return json(res, 409, {
-            ok: false,
-            error: { code: 'slots_busy', message: '在途请求未结束，已恢复调度' },
-            data: { paused: ids.length, restored: restored.length, inflight: drain.inflight, drained: false },
-          })
-        }
-        return json(res, 200, panel.ok({ paused: ids.length, inflight: 0, drained: true }))
+        const candidates = listVms(cfg.paths.project)
+          .filter((vm) => vm?.schedulable !== false)
+          .map((vm) => vm.id)
+        return mutateVms(candidates, async () => {
+          const ids = []
+          for (const id of candidates) {
+            if (getVm(cfg.paths.project, id)?.schedulable === false) continue
+            if (setVmSchedulable(cfg.paths.project, id, false, reason, { preserveStatus: true, source: 'force' }))
+              ids.push(id)
+          }
+          // Shared claims exclude every global execution; standalone retains its local drain behavior.
+          const drain =
+            isKubernetesMode() || ctx.vmOperations
+              ? { ok: true, inflight: 0 }
+              : await waitForSlotDrain(ctx.poolScheduler, ids)
+          if (!drain.ok) {
+            const restored = resumeSchedulableSlots(cfg.paths.project, ids, reason)
+            return json(res, 409, {
+              ok: false,
+              error: { code: 'slots_busy', message: '在途请求未结束，已恢复调度' },
+              data: { paused: ids.length, restored: restored.length, inflight: drain.inflight, drained: false },
+            })
+          }
+          return json(res, 200, panel.ok({ paused: ids.length, inflight: 0, drained: true }))
+        })
       }
       if (req.method === 'POST' && p === '/api/panel/vms/schedule/resume') {
         const body = await readBody(req, 8192).catch(() => ({}))
         const reason = String(body?.reason || KERNEL_UPDATE_HOLD).slice(0, 64)
-        const ids = (listVms(cfg.paths.project) || [])
+        const ids = listVms(cfg.paths.project)
           .filter((vm) => vm?.schedule_disabled_reason === reason)
           .map((vm) => vm.id)
-        const restored = resumeSchedulableSlots(cfg.paths.project, ids, reason)
-        return json(res, 200, panel.ok({ restored: restored.length }))
+        return mutateVms(ids, async () => {
+          const restored = resumeSchedulableSlots(cfg.paths.project, ids, reason)
+          return json(res, 200, panel.ok({ restored: restored.length }))
+        })
       }
 
       // POST /api/panel/vms/:id/schedulable — sub2api-style schedule toggle
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/schedulable$/.test(p)) {
         const id = p.split('/')[4]
-        if (!getVm(cfg.paths.project, id)) {
-          const e = makeError({
-            type: ErrorType.NOT_FOUND,
-            code: ErrorCode.VM_NOT_FOUND,
-            message: 'vm not found',
-            status: 404,
+        return mutateVms([id], async () => {
+          if (!getVm(cfg.paths.project, id)) {
+            const e = makeError({
+              type: ErrorType.NOT_FOUND,
+              code: ErrorCode.VM_NOT_FOUND,
+              message: 'vm not found',
+              status: 404,
+            })
+            return json(res, e.status, { ok: false, error: e.body.error })
+          }
+          const body = await readBody(req, 8192).catch(() => ({}))
+          if (typeof body?.schedulable !== 'boolean') {
+            return json(res, 400, { ok: false, error: { message: 'schedulable required' } })
+          }
+          const currentVm = getVm(cfg.paths.project, id)
+          const credentialFailure =
+            /oauth_revoked|oauth_invalid_grant|invalid_grant|refresh_token_missing|token has been revoked/i.test(
+              `${currentVm?.claude?.refresh_error || ''} ${currentVm?.schedule_disabled_reason || ''}`,
+            )
+          if (body.schedulable && credentialFailure) {
+            return json(res, 409, {
+              ok: false,
+              error: { code: 'credential_unavailable', message: '凭证已失效或吊销，请重新导入凭证后再开启调度' },
+            })
+          }
+          const reason = body.schedulable ? null : body.reason || 'disabled'
+          const summary = setVmSchedulable(cfg.paths.project, id, body.schedulable, reason, {
+            preserveStatus: true,
+            source: 'manual',
           })
-          return json(res, e.status, { ok: false, error: e.body.error })
-        }
-        const body = await readBody(req, 8192).catch(() => ({}))
-        if (typeof body?.schedulable !== 'boolean') {
-          return json(res, 400, { ok: false, error: { message: 'schedulable required' } })
-        }
-        const currentVm = getVm(cfg.paths.project, id)
-        const credentialFailure =
-          /oauth_revoked|oauth_invalid_grant|invalid_grant|refresh_token_missing|token has been revoked/i.test(
-            `${currentVm?.claude?.refresh_error || ''} ${currentVm?.schedule_disabled_reason || ''}`,
+          return json(
+            res,
+            200,
+            panel.ok({
+              id,
+              schedulable: summary?.schedulable !== false,
+              schedule_manual: summary?.schedule_manual === true,
+              schedule_disabled_reason: summary?.schedule_disabled_reason || null,
+              status: summary?.status || null,
+            }),
           )
-        if (body.schedulable && credentialFailure) {
-          return json(res, 409, {
-            ok: false,
-            error: { code: 'credential_unavailable', message: '凭证已失效或吊销，请重新导入凭证后再开启调度' },
-          })
-        }
-        const reason = body.schedulable ? null : body.reason || 'disabled'
-        const summary = setVmSchedulable(cfg.paths.project, id, body.schedulable, reason, {
-          preserveStatus: true,
-          source: 'manual',
         })
-        return json(
-          res,
-          200,
-          panel.ok({
-            id,
-            schedulable: summary?.schedulable !== false,
-            schedule_manual: summary?.schedule_manual === true,
-            schedule_disabled_reason: summary?.schedule_disabled_reason || null,
-            status: summary?.status || null,
-          }),
-        )
       }
       // POST /api/panel/vms/:id/cooldown/clear — drop 401/quota leftover so the slot re-enters
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/cooldown\/clear$/.test(p)) {
@@ -3333,61 +3404,81 @@ export function createPanelHandler(ctx) {
       // DELETE /api/panel/vms/:id — remove VM record, cli-home, unbind proxy
       if (req.method === 'DELETE' && /^\/api\/panel\/vms\/[^/]+$/.test(p)) {
         const id = p.split('/')[4]
-        if (!isValidVmId(id)) {
-          return json(res, 400, { ok: false, error: { message: 'invalid vm id' } })
-        }
-        const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
-        if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        const active = getActiveVmId(cfg.paths.project)
-        if (active === id && listVms(cfg.paths.project).some((vm) => vm.id !== id)) {
-          return json(res, 409, { ok: false, error: { message: 'cannot delete active VM, switch active first' } })
-        }
-        const vm = getVm(cfg.paths.project, id)
-        if (denyIfUserCannotDeleteVm(req, res, vm, json)) return true
-        try {
-          if (vm) {
-            const gone = await destroySlot(vm)
-            // A node slot that could not be removed keeps running there with the account's credential.
-            if (!gone.ok && slotHost(vm).kind === 'node') {
-              return json(res, 409, {
-                ok: false,
-                error: { code: gone.code || 'remote_destroy_failed', message: gone.error || 'remote destroy failed' },
-              })
+        return mutateVms([id], async (handles) => {
+          if (!isValidVmId(id)) {
+            return json(res, 400, { ok: false, error: { message: 'invalid vm id' } })
+          }
+          const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
+          if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const active = getActiveVmId(cfg.paths.project)
+          if (active === id && listVms(cfg.paths.project).some((vm) => vm.id !== id)) {
+            return json(res, 409, { ok: false, error: { message: 'cannot delete active VM, switch active first' } })
+          }
+          const vm = getVm(cfg.paths.project, id)
+          if (denyIfUserCannotDeleteVm(req, res, vm, json)) return true
+          try {
+            if (vm) {
+              const gone = await vmEffect(handles.get(id), () => (ctx.vmMutationOps?.destroySlot || destroySlot)(vm))
+              // A node slot that could not be removed keeps running there with the account's credential.
+              if (!gone.ok) {
+                return json(res, 409, {
+                  ok: false,
+                  error: { code: gone.code || 'remote_destroy_failed', message: gone.error || 'remote destroy failed' },
+                })
+              }
+            }
+          } catch (error) {
+            await handles.get(id)?.markUncertain?.()
+            return json(res, 502, {
+              ok: false,
+              error: { code: error.code || 'vm_destroy_unknown', message: String(error.message || error) },
+            })
+          }
+          // detach this VM only — do not unbind other slots sharing the SOCKS5
+          try {
+            await proxyPool.unbindVm(id)
+          } catch (error) {
+            if (isKubernetesMode() || ctx.vmOperations) throw error
+          }
+          // remove cli-home
+          try {
+            fs.rmSync(path.join(cfg.paths.project, 'vms', id), { recursive: true, force: true })
+          } catch (error) {
+            if (isKubernetesMode() || ctx.vmOperations) throw error
+          }
+          fs.unlinkSync(vmPath)
+          invalidateVmSlotReadCache(cfg.paths.project, id)
+          try {
+            await vmTestSchedule.remove(id)
+          } catch (error) {
+            if (isKubernetesMode() || ctx.vmOperations) throw error
+          }
+          if (active === id) {
+            clearActiveVm(cfg.paths.project)
+            try {
+              await clearActiveVmFromDb()
+            } catch (error) {
+              if (isKubernetesMode() || ctx.vmOperations) throw error
+            }
+            try {
+              reloadActiveVm(cfg)
+            } catch (error) {
+              if (isKubernetesMode() || ctx.vmOperations) throw error
             }
           }
-        } catch {}
-        // detach this VM only — do not unbind other slots sharing the SOCKS5
-        try {
-          await proxyPool.unbindVm(id)
-        } catch {}
-        // remove cli-home
-        try {
-          fs.rmSync(path.join(cfg.paths.project, 'vms', id), { recursive: true, force: true })
-        } catch {}
-        fs.unlinkSync(vmPath)
-        invalidateVmSlotReadCache(cfg.paths.project, id)
-        try {
-          await vmTestSchedule.remove(id)
-        } catch {}
-        if (active === id) {
-          clearActiveVm(cfg.paths.project)
+          // drop the DB credential mirror row too
           try {
-            await clearActiveVmFromDb()
-          } catch {}
+            await removeVmFromDb(id)
+          } catch (error) {
+            if (isKubernetesMode() || ctx.vmOperations) throw error
+          }
+          // optional chat side files
           try {
-            reloadActiveVm(cfg)
+            const chat = path.join(cfg.paths.project, 'vms', `${id}-chat.json`)
+            if (fs.existsSync(chat)) fs.unlinkSync(chat)
           } catch {}
-        }
-        // drop the DB credential mirror row too
-        try {
-          await removeVmFromDb(id)
-        } catch {}
-        // optional chat side files
-        try {
-          const chat = path.join(cfg.paths.project, 'vms', `${id}-chat.json`)
-          if (fs.existsSync(chat)) fs.unlinkSync(chat)
-        } catch {}
-        return json(res, 200, panel.ok({ deleted: id }))
+          return json(res, 200, panel.ok({ deleted: id }))
+        })
       }
       // POST /api/panel/vms/:id/reset — destroy container + home, recreate same slot
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/reset$/.test(p)) {
@@ -3988,375 +4079,407 @@ export function createPanelHandler(ctx) {
         const rawId = body.id || 'vm-' + padVm(idx)
         const id = String(rawId).replace(/[^a-zA-Z0-9_-]/g, '')
         if (!isValidVmId(id)) return json(res, 400, { ok: false, error: { message: 'invalid id' } })
-        const vmsDir = path.join(cfg.paths.project, 'vms')
-        fs.mkdirSync(vmsDir, { recursive: true })
-        const vmPath = path.join(vmsDir, id + '.json')
-        if (fs.existsSync(vmPath)) {
-          return json(res, 409, { ok: false, error: { message: 'vm id exists' } })
-        }
-        const ident = panelIdentity(req)
-        if (ident.role === 'user') {
-          const ownerId = normalizeOwnerId(req.panelUserId)
-          const quota = clampVmCreateQuota((await panelUsers.getById(ownerId))?.vm_create_quota, 0)
-          const used = countUserCreatedVms(existing, ownerId)
-          if (!ownerId || quota <= 0 || used >= quota) {
-            return json(res, 403, {
-              ok: false,
-              error: { code: 'vm_create_quota_exceeded', message: '自建虚拟机数量已达上限' },
-            })
+        return mutateVms([id], async (handles) => {
+          const existing = listVms(cfg.paths.project)
+          const aliases = physicalVmAliases(id)
+          const committed =
+            isKubernetesMode() || ctx.vmOperations
+              ? await getDb().prepare('SELECT id FROM vms WHERE id = ANY($1::text[]) LIMIT 1').get(aliases)
+              : null
+          if (committed || existing.some((vm) => aliases.includes(vm.id))) {
+            return json(res, 409, { ok: false, error: { code: 'vm_id_exists', message: 'vm identity exists' } })
           }
-        }
-        const startNow = body.start !== false && body.status !== 'stopped'
-        const wantKernel = body.kernel && OS_CATALOG[body.kernel] ? body.kernel : kernelForIndex(idx)
-        const nodeId = body.node_id ? String(body.node_id) : null
-        const vmDefaults = normalizeVmConfig(ctx.routingConfig?.vm)
-        const requestedRuntime = body.runtime_type
-        let runtime
-        if (requestedRuntime == null || requestedRuntime === '') {
-          runtime = vmDefaults.default_runtime
-        } else {
-          const kind = String(requestedRuntime).trim().toLowerCase()
-          if (kind !== 'docker' && kind !== 'kvm') {
-            return json(res, 400, {
-              ok: false,
-              error: {
-                type: 'invalid_request_error',
-                code: 'invalid_runtime_type',
-                message: 'runtime_type 必须是 docker 或 kvm',
-              },
-            })
+          const vmsDir = path.join(cfg.paths.project, 'vms')
+          fs.mkdirSync(vmsDir, { recursive: true })
+          const vmPath = path.join(vmsDir, id + '.json')
+          if (fs.existsSync(vmPath)) {
+            return json(res, 409, { ok: false, error: { message: 'vm id exists' } })
           }
-          runtime = kind
-        }
-        let machine
-        try {
-          machine = resolveMachineSpec({ config: vmDefaults, overrides: body.machine, runtime })
-        } catch (error) {
-          if (error?.status === 400 || error?.code === 'invalid_machine') {
-            return json(res, 400, {
-              ok: false,
-              error: { type: 'invalid_request_error', code: 'invalid_machine', message: error.message },
-            })
-          }
-          throw error
-        }
-        if (nodeId) {
-          if (ident.role !== 'admin') {
-            return json(res, 403, {
-              ok: false,
-              error: { code: 'placement_forbidden', message: '只有管理员可以把虚拟机放到集群节点' },
-            })
-          }
-          const kindProbe = { node_id: nodeId }
-          stampVmKind(kindProbe, body)
-          if (isCodexVm(kindProbe) && !slotHost(kindProbe).supports('codex')) {
-            return json(res, 400, {
-              ok: false,
-              error: { code: 'remote_unsupported', message: '集群节点上的虚拟机暂不支持此操作' },
-            })
-          }
-          let preflight
-          try {
-            preflight = await preflightNode(nodeId, { kernel: wantKernel, runtime })
-          } catch (e) {
-            return json(res, e?.status || 500, {
-              ok: false,
-              error: { code: e?.code || 'placement_failed', message: String(e?.message || e) },
-            })
-          }
-          if (!preflight.ok) {
-            return json(res, 409, {
-              ok: false,
-              error: {
-                code: 'placement_preflight_failed',
-                message: '目标节点预检未通过',
-                checks: preflight.checks,
-              },
-            })
-          }
-        }
-        // An explicit exit (e.g. local egress for a node: that VPS's own route) replaces auto-allocation.
-        let pickedProxyId = typeof body.proxy_id === 'string' ? body.proxy_id.trim() : ''
-        if (pickedProxyId && isLocalEgressId(pickedProxyId)) {
-          // Local egress is per VPS: a generic pick resolves to the target machine's own row.
-          const resolved = await proxyPool.resolveLocalTarget(pickedProxyId, nodeId || null)
-          if (!resolved.ok) {
-            return json(res, 409, {
-              ok: false,
-              error: { code: resolved.error, message: LOCAL_PROXY_MISMATCH_MESSAGE },
-            })
-          }
-          pickedProxyId = resolved.id
-        }
-        if (pickedProxyId) {
-          const row = proxyPool.snapshot().proxies.find((proxy) => proxy.id === pickedProxyId)
-          const owner = ident.role === 'user' ? normalizeOwnerId(req.panelUserId) : null
-          if (!row || !canBindProxyToVm(row, { owner_user_id: owner }, { role: ident.role })) {
-            return json(res, 404, {
-              ok: false,
-              error: { code: 'proxy_not_found', message: '所选出口不存在或不能绑到此槽位' },
-            })
-          }
-          const used = Array.isArray(row.bound_vm_ids) ? row.bound_vm_ids.length : 0
-          if (!row.enabled || row.status === 'dead' || row.blocked_reason || used >= (row.bind_limit || 5)) {
-            return json(res, 409, {
-              ok: false,
-              error: { code: 'proxy_unavailable', message: '所选出口已失效或已绑满' },
-            })
-          }
-        }
-        if (runtime === RUNTIME_KVM && !nodeId) {
-          const probe = typeof ctx.probeLocalKvm === 'function' ? ctx.probeLocalKvm : probeLocalKvm
-          const kvm = await probe({ routing: ctx.routingConfig })
-          if (!kvm?.ok) {
-            return json(res, 409, {
-              ok: false,
-              error: { code: 'kvm_unavailable', message: kvm?.error || '本机 KVM 不可用' },
-            })
-          }
-        }
-        const requestedTimezone = validTimezone(body.timezone)
-        const requestedLocale = body.locale == null || body.locale === '' ? STANDARD_LOCALE : String(body.locale)
-        if (!SLOT_LOCALES.includes(requestedLocale)) {
-          return json(res, 400, {
-            ok: false,
-            error: { code: 'invalid_locale', message: `语言必须是 ${SLOT_LOCALES.join('、')}` },
-          })
-        }
-        let generated
-        try {
-          generated = assignComputerFingerprint(
-            cfg.paths.project,
-            {
-              id,
-              kernel: wantKernel,
-              timezone: requestedTimezone,
-              locale: requestedLocale,
-              runtime: { type: runtime },
-            },
-            { taken: takenFingerprintKeys(existing) },
-          )
-        } catch (e) {
-          return json(res, 400, {
-            ok: false,
-            error: {
-              code: e.code || 'computer_create_failed',
-              message: String(e.message || e),
-            },
-          })
-        }
-        const vm = {
-          id,
-          name: body.name || padVm(idx),
-          status: startNow ? 'running' : body.status || 'stopped',
-          kernel: wantKernel,
-          timezone: requestedTimezone || null,
-          // Only an explicit zone is a pin. An empty zone stays unset so the
-          // next SOCKS5 bind can write the exit node's detected timezone.
-          timezone_source: requestedTimezone ? 'manual' : 'auto',
-          locale: generated.locale || STANDARD_LOCALE,
-          region: body.region || body.zone || null,
-          note: body.note || `${(OS_CATALOG[wantKernel] || {}).pretty || wantKernel} · Go slot worker`,
-          proxy: null,
-          policy: {
-            maxConcurrency: 0,
-            concurrencyOverride: false,
-            maxRpm: 0,
-            rpmOverride: false,
-            maxSessions: 0,
-            sessionsOverride: false,
-            weight: Math.max(1, Math.min(100, Number(body.weight ?? 1))),
-            inflight: 0,
-          },
-          claude: {},
-          fingerprint: applyGeneratedFingerprint({}, generated),
-          stats: {},
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-          schedulable: false,
-          schedule_disabled_reason: 'no_credential',
-          proxy_cli_enabled: body.proxy_cli_enabled === true,
-          proxy_required: false,
-          seed_policy: standardSeedPolicy(),
-          runtime: { type: runtime },
-          machine,
-        }
-        if (ident.role === 'user') {
-          vm.owner_user_id = normalizeOwnerId(req.panelUserId)
-          vm.origin = VM_ORIGIN.userCreated
-        } else {
-          vm.owner_user_id = null
-          vm.origin = VM_ORIGIN.platform
-        }
-        if (nodeId) vm.node_id = nodeId
-        stampVmKind(vm, body)
-        const openaiPolicy = normalizeOpenAIQuotaPolicy(ctx.routingConfig?.codex?.quota)
-        const explicitConcurrency =
-          Object.prototype.hasOwnProperty.call(body, 'max_concurrency') ||
-          Object.prototype.hasOwnProperty.call(body, 'maxConcurrency')
-        const explicitRpm =
-          Object.prototype.hasOwnProperty.call(body, 'max_rpm') || Object.prototype.hasOwnProperty.call(body, 'maxRpm')
-        const explicitSessions = Object.prototype.hasOwnProperty.call(body, 'max_sessions')
-        const readField = (snake, camel) =>
-          Object.prototype.hasOwnProperty.call(body, snake) ? body[snake] : body[camel]
-        const hasField = (snake, camel) =>
-          Object.prototype.hasOwnProperty.call(body, snake) || Object.prototype.hasOwnProperty.call(body, camel)
-        const rawConcurrency = readField('max_concurrency', 'maxConcurrency')
-        const rawRpm = readField('max_rpm', 'maxRpm')
-        const rawSessions = body.max_sessions
-        const validInteger = (value, min, max) =>
-          typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value) && value >= min && value <= max
-        const invalidCreate = (value, min, max) => value !== null && !validInteger(value, min, max)
-        if (isCodexVm(vm)) {
-          if (
-            (explicitConcurrency && invalidCreate(rawConcurrency, 1, 256)) ||
-            (explicitRpm && invalidCreate(rawRpm, 0, 1e6)) ||
-            (explicitSessions && invalidCreate(rawSessions, 0, 256))
-          ) {
-            return json(res, 400, {
-              ok: false,
-              error: {
-                code: 'invalid_create_schedule',
-                message: 'OpenAI scheduling values must be finite integers in range',
-              },
-            })
-          }
-          vm.policy.maxConcurrency =
-            explicitConcurrency && rawConcurrency !== null ? rawConcurrency : openaiPolicy.max_concurrency
-          vm.policy.concurrencyOverride = explicitConcurrency && rawConcurrency !== null
-          vm.policy.maxRpm = explicitRpm && rawRpm !== null ? rawRpm : openaiPolicy.max_rpm
-          vm.policy.rpmOverride = explicitRpm && rawRpm !== null
-          vm.policy.maxSessions = explicitSessions && rawSessions !== null ? rawSessions : openaiPolicy.max_sessions
-          vm.policy.sessionsOverride = explicitSessions && rawSessions !== null
-        } else {
-          if (
-            (explicitConcurrency && invalidCreate(rawConcurrency, 0, 256)) ||
-            (explicitRpm && invalidCreate(rawRpm, 0, 1e6)) ||
-            explicitSessions
-          ) {
-            return json(res, 400, {
-              ok: false,
-              error: {
-                code: 'invalid_create_schedule',
-                message: 'Claude scheduling values are invalid or unsupported',
-              },
-            })
-          }
-          vm.policy.maxConcurrency = explicitConcurrency
-            ? rawConcurrency
-            : Number(ctx.routingConfig?.concurrency?.default_max_per_account ?? 2)
-          vm.policy.concurrencyOverride = explicitConcurrency
-          vm.policy.maxRpm = explicitRpm ? rawRpm : Number(ctx.routingConfig?.concurrency?.default_max_rpm ?? 0)
-          vm.policy.rpmOverride = explicitRpm
-        }
-        atomicWriteJson(vmPath, vm, { mode: 0o600 })
-        writeGuestMachineIdFile(cfg.paths.project, id, generated.guest_machine_id)
-        try {
-          seedFreshCliHome(cfg.paths.project, vm)
-        } catch (e) {}
-        let allocated = null
-        let proxyError = null
-        const wantProxy = body.auto_allocate_proxy === true || startNow || !!pickedProxyId
-        // px-local 没有 SOCKS URL，但它是合法出口；不要把它当成"未绑定"。
-        const hasExit = (v) => !!(v?.proxy?.url || isLocalEgressProxy(v?.proxy))
-        if (wantProxy && !hasExit(vm)) {
-          if (pickedProxyId) {
-            const bound = await proxyPool.bind(pickedProxyId, id)
-            if (bound.ok) allocated = bound.proxy
-            else proxyError = bound.error || 'proxy_bind_failed'
-          } else {
-            try {
-              allocated = await proxyPool.allocateForVm(id, {
-                ownerUserId: vm.owner_user_id || null,
-                role: ident.role,
+          const ident = panelIdentity(req)
+          if (ident.role === 'user') {
+            const ownerId = normalizeOwnerId(req.panelUserId)
+            const quota = clampVmCreateQuota((await panelUsers.getById(ownerId))?.vm_create_quota, 0)
+            const used = countUserCreatedVms(existing, ownerId)
+            if (!ownerId || quota <= 0 || used >= quota) {
+              return json(res, 403, {
+                ok: false,
+                error: { code: 'vm_create_quota_exceeded', message: '自建虚拟机数量已达上限' },
               })
-            } catch (e) {}
+            }
           }
-          if (allocated) {
-            bindVmProxy(cfg.paths.project, id, proxyPool.getProxyForVm(id))
-            adoptVmProxyBinding(vm, getVm(cfg.paths.project, id))
-          }
-        }
-        // vm is written again below; carry the exit's zone so that write keeps it.
-        const zoned = await fillTimezoneFromExit(id)
-        if (zoned?.applied) {
-          vm.timezone = zoned.timezone
-          vm.timezone_source = 'proxy_geo'
-          if (vm.fingerprint && typeof vm.fingerprint === 'object') vm.fingerprint.timezone = zoned.timezone
-        }
-        if (body.activate === true) {
-          try {
-            activateVmSlot(id)
-          } catch (e) {}
-        }
-        let startError = null
-        if (startNow && hasExit(vm)) {
-          let boot
-          try {
-            boot = await startSlotReady(vm, cfg.paths.project, { routing: ctx.routingConfig })
-          } catch (e) {
-            boot = { ok: false, error: String(e?.message || e) }
-          }
-          if (!boot.ok) {
-            // Slot JSON is already on disk. 500 here makes the console treat
-            // create as a no-op, so the new row never refetches into the list.
-            patchVmRecord(cfg.paths.project, id, {
-              status: 'error',
-              schedulable: false,
-              schedule_disabled_reason: boot.error || 'runtime start failed',
-            })
-            startError = boot.error || 'runtime start failed'
+          const startNow = body.start !== false && body.status !== 'stopped'
+          const wantKernel = body.kernel && OS_CATALOG[body.kernel] ? body.kernel : kernelForIndex(idx)
+          const nodeId = body.node_id ? String(body.node_id) : null
+          const vmDefaults = normalizeVmConfig(ctx.routingConfig?.vm)
+          const requestedRuntime = body.runtime_type
+          let runtime
+          if (requestedRuntime == null || requestedRuntime === '') {
+            runtime = vmDefaults.default_runtime
           } else {
-            patchVmRecord(cfg.paths.project, id, { status: 'running' })
+            const kind = String(requestedRuntime).trim().toLowerCase()
+            if (kind !== 'docker' && kind !== 'kvm') {
+              return json(res, 400, {
+                ok: false,
+                error: {
+                  type: 'invalid_request_error',
+                  code: 'invalid_runtime_type',
+                  message: 'runtime_type 必须是 docker 或 kvm',
+                },
+              })
+            }
+            runtime = kind
           }
-        } else if (startNow) {
-          patchVmRecord(cfg.paths.project, id, { status: 'stopped' })
-        }
-        const saved = getVm(cfg.paths.project, id) || vm
-        return json(
-          res,
-          200,
-          panel.ok({
-            vm: panel.publicVmBootView(summarizeVm(saved, cfg.paths.project, ctx.routingConfig)),
-            allocated_proxy: panel.publicAllocatedProxy(proxyPool, allocated, {
-              nodeId: saved.node_id || nodeId || null,
-              role: ident.role,
-              nodes: clusterNodesOf(ctx),
+          let machine
+          try {
+            machine = resolveMachineSpec({ config: vmDefaults, overrides: body.machine, runtime })
+          } catch (error) {
+            if (error?.status === 400 || error?.code === 'invalid_machine') {
+              return json(res, 400, {
+                ok: false,
+                error: { type: 'invalid_request_error', code: 'invalid_machine', message: error.message },
+              })
+            }
+            throw error
+          }
+          if (nodeId) {
+            if (ident.role !== 'admin') {
+              return json(res, 403, {
+                ok: false,
+                error: { code: 'placement_forbidden', message: '只有管理员可以把虚拟机放到集群节点' },
+              })
+            }
+            const kindProbe = { node_id: nodeId }
+            stampVmKind(kindProbe, body)
+            if (isCodexVm(kindProbe) && !slotHost(kindProbe).supports('codex')) {
+              return json(res, 400, {
+                ok: false,
+                error: { code: 'remote_unsupported', message: '集群节点上的虚拟机暂不支持此操作' },
+              })
+            }
+            let preflight
+            try {
+              preflight = await preflightNode(nodeId, { kernel: wantKernel, runtime })
+            } catch (e) {
+              return json(res, e?.status || 500, {
+                ok: false,
+                error: { code: e?.code || 'placement_failed', message: String(e?.message || e) },
+              })
+            }
+            if (!preflight.ok) {
+              return json(res, 409, {
+                ok: false,
+                error: {
+                  code: 'placement_preflight_failed',
+                  message: '目标节点预检未通过',
+                  checks: preflight.checks,
+                },
+              })
+            }
+          }
+          // An explicit exit (e.g. local egress for a node: that VPS's own route) replaces auto-allocation.
+          let pickedProxyId = typeof body.proxy_id === 'string' ? body.proxy_id.trim() : ''
+          if (pickedProxyId && isLocalEgressId(pickedProxyId)) {
+            // Local egress is per VPS: a generic pick resolves to the target machine's own row.
+            const resolved = await proxyPool.resolveLocalTarget(pickedProxyId, nodeId || null)
+            if (!resolved.ok) {
+              return json(res, 409, {
+                ok: false,
+                error: { code: resolved.error, message: LOCAL_PROXY_MISMATCH_MESSAGE },
+              })
+            }
+            pickedProxyId = resolved.id
+          }
+          if (pickedProxyId) {
+            const row = proxyPool.snapshot().proxies.find((proxy) => proxy.id === pickedProxyId)
+            const owner = ident.role === 'user' ? normalizeOwnerId(req.panelUserId) : null
+            if (!row || !canBindProxyToVm(row, { owner_user_id: owner }, { role: ident.role })) {
+              return json(res, 404, {
+                ok: false,
+                error: { code: 'proxy_not_found', message: '所选出口不存在或不能绑到此槽位' },
+              })
+            }
+            const used = Array.isArray(row.bound_vm_ids) ? row.bound_vm_ids.length : 0
+            if (!row.enabled || row.status === 'dead' || row.blocked_reason || used >= (row.bind_limit || 5)) {
+              return json(res, 409, {
+                ok: false,
+                error: { code: 'proxy_unavailable', message: '所选出口已失效或已绑满' },
+              })
+            }
+          }
+          if (runtime === RUNTIME_KVM && !nodeId) {
+            const probe = typeof ctx.probeLocalKvm === 'function' ? ctx.probeLocalKvm : probeLocalKvm
+            const kvm = await probe({ routing: ctx.routingConfig })
+            if (!kvm?.ok) {
+              return json(res, 409, {
+                ok: false,
+                error: { code: 'kvm_unavailable', message: kvm?.error || '本机 KVM 不可用' },
+              })
+            }
+          }
+          const requestedTimezone = validTimezone(body.timezone)
+          const requestedLocale = body.locale == null || body.locale === '' ? STANDARD_LOCALE : String(body.locale)
+          if (!SLOT_LOCALES.includes(requestedLocale)) {
+            return json(res, 400, {
+              ok: false,
+              error: { code: 'invalid_locale', message: `语言必须是 ${SLOT_LOCALES.join('、')}` },
+            })
+          }
+          let generated
+          try {
+            generated = assignComputerFingerprint(
+              cfg.paths.project,
+              {
+                id,
+                kernel: wantKernel,
+                timezone: requestedTimezone,
+                locale: requestedLocale,
+                runtime: { type: runtime },
+              },
+              { taken: takenFingerprintKeys(existing) },
+            )
+          } catch (e) {
+            return json(res, 400, {
+              ok: false,
+              error: {
+                code: e.code || 'computer_create_failed',
+                message: String(e.message || e),
+              },
+            })
+          }
+          const vm = {
+            id,
+            name: body.name || padVm(idx),
+            status: startNow ? 'running' : body.status || 'stopped',
+            kernel: wantKernel,
+            timezone: requestedTimezone || null,
+            // Only an explicit zone is a pin. An empty zone stays unset so the
+            // next SOCKS5 bind can write the exit node's detected timezone.
+            timezone_source: requestedTimezone ? 'manual' : 'auto',
+            locale: generated.locale || STANDARD_LOCALE,
+            region: body.region || body.zone || null,
+            note: body.note || `${(OS_CATALOG[wantKernel] || {}).pretty || wantKernel} · Go slot worker`,
+            proxy: null,
+            policy: {
+              maxConcurrency: 0,
+              concurrencyOverride: false,
+              maxRpm: 0,
+              rpmOverride: false,
+              maxSessions: 0,
+              sessionsOverride: false,
+              weight: Math.max(1, Math.min(100, Number(body.weight ?? 1))),
+              inflight: 0,
+            },
+            claude: {},
+            fingerprint: applyGeneratedFingerprint({}, generated),
+            stats: {},
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            schedulable: false,
+            schedule_disabled_reason: 'no_credential',
+            proxy_cli_enabled: body.proxy_cli_enabled === true,
+            proxy_required: false,
+            seed_policy: standardSeedPolicy(),
+            runtime: { type: runtime },
+            machine,
+          }
+          if (ident.role === 'user') {
+            vm.owner_user_id = normalizeOwnerId(req.panelUserId)
+            vm.origin = VM_ORIGIN.userCreated
+          } else {
+            vm.owner_user_id = null
+            vm.origin = VM_ORIGIN.platform
+          }
+          if (nodeId) vm.node_id = nodeId
+          stampVmKind(vm, body)
+          const openaiPolicy = normalizeOpenAIQuotaPolicy(ctx.routingConfig?.codex?.quota)
+          const explicitConcurrency =
+            Object.prototype.hasOwnProperty.call(body, 'max_concurrency') ||
+            Object.prototype.hasOwnProperty.call(body, 'maxConcurrency')
+          const explicitRpm =
+            Object.prototype.hasOwnProperty.call(body, 'max_rpm') ||
+            Object.prototype.hasOwnProperty.call(body, 'maxRpm')
+          const explicitSessions = Object.prototype.hasOwnProperty.call(body, 'max_sessions')
+          const readField = (snake, camel) =>
+            Object.prototype.hasOwnProperty.call(body, snake) ? body[snake] : body[camel]
+          const hasField = (snake, camel) =>
+            Object.prototype.hasOwnProperty.call(body, snake) || Object.prototype.hasOwnProperty.call(body, camel)
+          const rawConcurrency = readField('max_concurrency', 'maxConcurrency')
+          const rawRpm = readField('max_rpm', 'maxRpm')
+          const rawSessions = body.max_sessions
+          const validInteger = (value, min, max) =>
+            typeof value === 'number' &&
+            Number.isFinite(value) &&
+            Number.isInteger(value) &&
+            value >= min &&
+            value <= max
+          const invalidCreate = (value, min, max) => value !== null && !validInteger(value, min, max)
+          if (isCodexVm(vm)) {
+            if (
+              (explicitConcurrency && invalidCreate(rawConcurrency, 1, 256)) ||
+              (explicitRpm && invalidCreate(rawRpm, 0, 1e6)) ||
+              (explicitSessions && invalidCreate(rawSessions, 0, 256))
+            ) {
+              return json(res, 400, {
+                ok: false,
+                error: {
+                  code: 'invalid_create_schedule',
+                  message: 'OpenAI scheduling values must be finite integers in range',
+                },
+              })
+            }
+            vm.policy.maxConcurrency =
+              explicitConcurrency && rawConcurrency !== null ? rawConcurrency : openaiPolicy.max_concurrency
+            vm.policy.concurrencyOverride = explicitConcurrency && rawConcurrency !== null
+            vm.policy.maxRpm = explicitRpm && rawRpm !== null ? rawRpm : openaiPolicy.max_rpm
+            vm.policy.rpmOverride = explicitRpm && rawRpm !== null
+            vm.policy.maxSessions = explicitSessions && rawSessions !== null ? rawSessions : openaiPolicy.max_sessions
+            vm.policy.sessionsOverride = explicitSessions && rawSessions !== null
+          } else {
+            if (
+              (explicitConcurrency && invalidCreate(rawConcurrency, 0, 256)) ||
+              (explicitRpm && invalidCreate(rawRpm, 0, 1e6)) ||
+              explicitSessions
+            ) {
+              return json(res, 400, {
+                ok: false,
+                error: {
+                  code: 'invalid_create_schedule',
+                  message: 'Claude scheduling values are invalid or unsupported',
+                },
+              })
+            }
+            vm.policy.maxConcurrency = explicitConcurrency
+              ? rawConcurrency
+              : Number(ctx.routingConfig?.concurrency?.default_max_per_account ?? 2)
+            vm.policy.concurrencyOverride = explicitConcurrency
+            vm.policy.maxRpm = explicitRpm ? rawRpm : Number(ctx.routingConfig?.concurrency?.default_max_rpm ?? 0)
+            vm.policy.rpmOverride = explicitRpm
+          }
+          atomicWriteJson(vmPath, vm, { mode: 0o600 })
+          writeGuestMachineIdFile(cfg.paths.project, id, generated.guest_machine_id)
+          try {
+            seedFreshCliHome(cfg.paths.project, vm)
+          } catch (e) {
+            if (isKubernetesMode() || ctx.vmOperations) throw e
+          }
+          let allocated = null
+          let proxyError = null
+          const wantProxy = body.auto_allocate_proxy === true || startNow || !!pickedProxyId
+          // px-local 没有 SOCKS URL，但它是合法出口；不要把它当成"未绑定"。
+          const hasExit = (v) => !!(v?.proxy?.url || isLocalEgressProxy(v?.proxy))
+          if (wantProxy && !hasExit(vm)) {
+            if (pickedProxyId) {
+              const bound = await proxyPool.bind(pickedProxyId, id)
+              if (bound.ok) allocated = bound.proxy
+              else proxyError = bound.error || 'proxy_bind_failed'
+            } else {
+              try {
+                allocated = await proxyPool.allocateForVm(id, {
+                  ownerUserId: vm.owner_user_id || null,
+                  role: ident.role,
+                })
+              } catch (e) {
+                if (isKubernetesMode() || ctx.vmOperations) throw e
+              }
+            }
+            if (allocated) {
+              bindVmProxy(cfg.paths.project, id, proxyPool.getProxyForVm(id))
+              adoptVmProxyBinding(vm, getVm(cfg.paths.project, id))
+            }
+          }
+          // vm is written again below; carry the exit's zone so that write keeps it.
+          const zoned = await fillTimezoneFromExit(id)
+          if (zoned?.applied) {
+            vm.timezone = zoned.timezone
+            vm.timezone_source = 'proxy_geo'
+            if (vm.fingerprint && typeof vm.fingerprint === 'object') vm.fingerprint.timezone = zoned.timezone
+          }
+          if (body.activate === true) {
+            try {
+              activateVmSlot(id)
+            } catch (e) {
+              if (isKubernetesMode() || ctx.vmOperations) throw e
+            }
+          }
+          let startError = null
+          if (startNow && hasExit(vm)) {
+            let boot
+            try {
+              boot = await vmEffect(handles.get(id), () =>
+                (ctx.vmMutationOps?.startSlotReady || startSlotReady)(vm, cfg.paths.project, {
+                  routing: ctx.routingConfig,
+                }),
+              )
+            } catch (e) {
+              boot = { ok: false, error: String(e?.message || e) }
+            }
+            if (!boot.ok) {
+              // Slot JSON is already on disk. 500 here makes the console treat
+              // create as a no-op, so the new row never refetches into the list.
+              patchVmRecord(cfg.paths.project, id, {
+                status: 'error',
+                schedulable: false,
+                schedule_disabled_reason: boot.error || 'runtime start failed',
+              })
+              startError = boot.error || 'runtime start failed'
+            } else {
+              patchVmRecord(cfg.paths.project, id, { status: 'running' })
+            }
+          } else if (startNow) {
+            patchVmRecord(cfg.paths.project, id, { status: 'stopped' })
+          }
+          const saved = getVm(cfg.paths.project, id) || vm
+          return json(
+            res,
+            200,
+            panel.ok({
+              vm: panel.publicVmBootView(summarizeVm(saved, cfg.paths.project, ctx.routingConfig)),
+              allocated_proxy: panel.publicAllocatedProxy(proxyPool, allocated, {
+                nodeId: saved.node_id || nodeId || null,
+                role: ident.role,
+                nodes: clusterNodesOf(ctx),
+              }),
+              ...(startError ? { start_error: startError } : {}),
+              ...(proxyError ? { proxy_error: proxyError } : {}),
             }),
-            ...(startError ? { start_error: startError } : {}),
-            ...(proxyError ? { proxy_error: proxyError } : {}),
-          }),
-        )
+          )
+        })
       }
       // POST /api/panel/vms/:id/start
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/start$/.test(p)) {
         const id = p.split('/')[4]
-        const started = await powerOnSlot({
-          projectRoot: cfg.paths.project,
-          id,
-          proxyPool,
-          routing: ctx.routingConfig,
-          fillTimezone: fillTimezoneFromExit,
-        })
-        if (!started.ok) {
-          return json(res, started.status, { ok: false, error: { code: started.code, message: started.error } })
-        }
-        const { vm, bound, boot } = started
-        return json(
-          res,
-          200,
-          panel.ok({
-            vm: panel.publicVmBootView(summarizeVm(vm, cfg.paths.project, ctx.routingConfig)),
-            allocated_proxy: panel.publicAllocatedProxy(proxyPool, bound, {
-              nodeId: vm.node_id || null,
-              role: panelIdentity(req).role,
-              nodes: clusterNodesOf(ctx),
+        return mutateVms([id], async (handles) => {
+          if (!getVm(cfg.paths.project, id))
+            return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
+          const started = await vmEffect(handles.get(id), () =>
+            (ctx.vmMutationOps?.powerOnSlot || powerOnSlot)({
+              projectRoot: cfg.paths.project,
+              id,
+              proxyPool,
+              routing: ctx.routingConfig,
+              fillTimezone: fillTimezoneFromExit,
             }),
-            runtime: panel.publicRuntimeView(vm.runtime) || GATEWAY_CAPABILITIES.runtime,
-            kernel: GATEWAY_CAPABILITIES.kernel,
-            boot: panel.publicSlotBoot(boot),
-          }),
-        )
+          )
+          if (!started.ok) {
+            return json(res, started.status, { ok: false, error: { code: started.code, message: started.error } })
+          }
+          const { vm, bound, boot } = started
+          return json(
+            res,
+            200,
+            panel.ok({
+              vm: panel.publicVmBootView(summarizeVm(vm, cfg.paths.project, ctx.routingConfig)),
+              allocated_proxy: panel.publicAllocatedProxy(proxyPool, bound, {
+                nodeId: vm.node_id || null,
+                role: panelIdentity(req).role,
+                nodes: clusterNodesOf(ctx),
+              }),
+              runtime: panel.publicRuntimeView(vm.runtime) || GATEWAY_CAPABILITIES.runtime,
+              kernel: GATEWAY_CAPABILITIES.kernel,
+              boot: panel.publicSlotBoot(boot),
+            }),
+          )
+        })
       }
       // GET /api/panel/vms/:id/diagnose — read-only check of every service the slot hop needs
       if (req.method === 'GET' && /^\/api\/panel\/vms\/[^/]+\/diagnose$/.test(p)) {
@@ -4372,43 +4495,52 @@ export function createPanelHandler(ctx) {
       }
       // POST /api/panel/vms/:id/recover — power cycle (stop → start) plus a fresh diagnosis
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/recover$/.test(p)) {
-        const recovered = await recoverSlot({
-          projectRoot: cfg.paths.project,
-          id: p.split('/')[4],
-          proxyPool,
-          routing: ctx.routingConfig,
-          fillTimezone: fillTimezoneFromExit,
-          watchdog: ctx.kernelWatchdog,
-          internal: panelIdentity(req).role === 'admin',
+        const id = p.split('/')[4]
+        return mutateVms([id], async (handles) => {
+          if (!getVm(cfg.paths.project, id))
+            return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
+          const recovered = await vmEffect(handles.get(id), () =>
+            (ctx.vmMutationOps?.recoverSlot || recoverSlot)({
+              projectRoot: cfg.paths.project,
+              id: p.split('/')[4],
+              proxyPool,
+              routing: ctx.routingConfig,
+              fillTimezone: fillTimezoneFromExit,
+              watchdog: ctx.kernelWatchdog,
+              internal: panelIdentity(req).role === 'admin',
+            }),
+          )
+          if (!recovered.ok) {
+            return json(res, recovered.status, { ok: false, error: { code: recovered.code, message: recovered.error } })
+          }
+          return json(res, 200, panel.ok(recovered.report))
         })
-        if (!recovered.ok) {
-          return json(res, recovered.status, { ok: false, error: { code: recovered.code, message: recovered.error } })
-        }
-        return json(res, 200, panel.ok(recovered.report))
       }
       // POST /api/panel/vms/:id/stop
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/stop$/.test(p)) {
         const id = p.split('/')[4]
-        const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
-        if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-        const halt = await stopSlot(vm)
-        if (!halt.ok) return json(res, 500, { ok: false, error: { message: halt.error || 'runtime stop failed' } })
-        vm.status = 'stopped'
-        vm.schedulable = false
-        vm.schedule_disabled_reason = 'stopped'
-        vm.updated_at = new Date().toISOString()
-        atomicWriteJson(vmPath, vm, { mode: 0o600 })
-        return json(
-          res,
-          200,
-          panel.ok({
-            vm: summarizeVm(vm, cfg.paths.project, ctx.routingConfig),
-            runtime: panel.publicRuntimeView(vm.runtime) || GATEWAY_CAPABILITIES.runtime,
-            kernel: GATEWAY_CAPABILITIES.kernel,
-            halt: panel.publicSlotBoot(halt),
-          }),
-        )
+        return mutateVms([id], async (handles) => {
+          const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
+          if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+          const halt = await vmEffect(handles.get(id), () => (ctx.vmMutationOps?.stopSlot || stopSlot)(vm))
+          if (!halt.ok) return json(res, 500, { ok: false, error: { message: halt.error || 'runtime stop failed' } })
+          vm.status = 'stopped'
+          vm.schedulable = false
+          vm.schedule_disabled_reason = 'stopped'
+          vm.updated_at = new Date().toISOString()
+          atomicWriteJson(vmPath, vm, { mode: 0o600 })
+          return json(
+            res,
+            200,
+            panel.ok({
+              vm: summarizeVm(vm, cfg.paths.project, ctx.routingConfig),
+              runtime: panel.publicRuntimeView(vm.runtime) || GATEWAY_CAPABILITIES.runtime,
+              kernel: GATEWAY_CAPABILITIES.kernel,
+              halt: panel.publicSlotBoot(halt),
+            }),
+          )
+        })
       }
 
       // POST /api/panel/vms/import
@@ -6005,6 +6137,17 @@ export function createPanelHandler(ctx) {
     res._panelResponseState = state
     try {
       result = await handlePanel(req, res, url)
+    } catch (error) {
+      if (
+        ['vm_operation_active', 'vm_execution_active', 'vm_physical_target_conflict', 'invalid_vm_operation'].includes(
+          error.code,
+        )
+      ) {
+        state.response = [res, error.status || 409, { ok: false, error: { code: error.code, message: error.message } }]
+        result = true
+      } else if (error.panelPersistenceFailure) {
+        return persistenceFailure(res, error)
+      } else throw error
     } finally {
       delete res._panelResponseState
     }
