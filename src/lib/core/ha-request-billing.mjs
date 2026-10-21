@@ -211,8 +211,11 @@ export class HaRequestBilling {
         job = null,
         observed = null
       if (reservation.settled_at) outcome = 'already_settled'
-      else if (!jobs.length && source === 'recovery') outcome = 'not_dispatched'
-      else {
+      else if (!jobs.length && !chosen) {
+        if (source === 'handler')
+          await this.db.prepare('UPDATE ha_request_contexts SET accepting_children=false WHERE id=$1').run(requestId)
+        outcome = 'not_dispatched'
+      } else {
         if (reservation.released_at) return { settled: false, reason: 'api_key_reservation_released' }
         if (!chosen && source === 'recovery' && jobs.length === 1) {
           chosen = jobs[0].request_id
@@ -309,7 +312,7 @@ export async function recordHaRequestUsage(db, { reservation, commandId, nodeSta
   if (reservation?.shared !== true) throw failure('invalid_api_key_reservation')
   const context = currentHaRequestContext(db)
   if (!context) throw failure('ha_request_context_required')
-  await selectHaBillableCommand(db, commandId)
+  if (commandId != null) await selectHaBillableCommand(db, commandId)
   const result = await new HaRequestBilling(db).settle(context.requestId, {
     source: 'handler',
     commandId,

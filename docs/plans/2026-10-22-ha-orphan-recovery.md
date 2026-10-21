@@ -29,7 +29,7 @@ readCompletion({requestId: originalCommandId, nodeBinding: originalPgBinding})
 
 `ApiKeyStore.recordHaUsage({reservation,commandId,nodeStatus})` 与恢复服务共用同一 parent/key/reservation 事务和唯一 `ha_request_settlements` 行。它更新原 key 的请求/token/USD 与 5h/1d/7d 窗口。现有推理链不扣 users.balance，本阶段保持该规则。key 已删除仍写 key_deleted 审计；原 reservation 已 settled 则写 already_settled，不重复增加计数。正常 handler 的 outer finally 负责 release；孤儿执行图已恢复后才原子结算并 release。
 
-恢复仅选择已有持久 billable command，或 sealed parent 的唯一原 job。多 command 缺最终选择、usage_complete=false、缺实际 model/四项主计数、原 snapshot 无价格或模型不匹配时，API key claim 继续保留。不会猜最高 attempt、累加多 attempt 或按 0 结算。无 job 的 sealed/execution_recovered parent 可以写 not_dispatched，释放未使用预留且不增加请求数或金额。
+恢复仅选择已有持久 billable command，或 sealed parent 的唯一原 job。多 command 缺最终选择、usage_complete=false、缺实际 model/四项主计数、原 snapshot 无价格或模型不匹配时，API key claim 继续保留。不会猜最高 attempt、累加多 attempt 或按 0 结算。无 job 的 sealed/execution_recovered parent 可以写 not_dispatched，释放未使用预留且不增加请求数或金额。原 handler 的 final 准备失败也可在同一 parent 锁下确认无 job，先关闭 child 准入再记 not_dispatched，保持既有 400；有任何 job 但缺最终 command 仍保留预留。
 
 receipt 仅允许 ID、实际 model、usage_complete、规范 decimal-string 的主计数、缓存时间拆分、web search 次数与明确 speed/service_tier/stop_reason。计数进入 PG bigint 时保持精确字符串；USD 仍沿用现有 double precision schema 与价格计算规则。账单独立保留原 receipt、binding 和 snapshot；不保存响应正文、headers 或凭据。
 
@@ -40,3 +40,5 @@ receipt 仅允许 ID、实际 model、usage_complete、规范 decimal-string 的
 历史清理保留仍有 active API key/执行资源、parent 尚未封闭、恢复未结束或原 activity 未确认 completed 的原始图。attempt cleanup 在精确 parent 锁下判断，与恢复读取互斥。正常已结束且无这些依赖的历史仍遵循旧清理策略。长期财务审计保留在 settlement 行，不依赖 admission/job 的短期历史。
 
 新 HTTP/异步请求可能继承已关闭的 HA context。新 context 仅在新真实 coordinator gate 的 scope 下允许建立；继承的 active context 仍拒绝嵌套，原 activity 无法借 closed context 重新建立 parent。attempt context 共用父 context 的关闭状态。
+
+服务接线示例：`new HaRequestRecovery(db,{coordinator,readNodeRecoveryStatus})`。reader 接收 `{requestId,nodeBinding}`，由调用方使用原绑定和固定可信 TLS 创建 SlotgateClient，再调用 `recoveryStatus(requestId,{timeoutMs,signal})`。正常 protocol 使用同名 `deps.readNodeRecoveryStatus`。`scan()` 和 `recover()` 必须位于当前 Pod 的真实 `gate.run()` 内；本服务不自行建立 activity 或启动后台任务。
