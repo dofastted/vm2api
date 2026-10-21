@@ -3,7 +3,13 @@
 日期：2026-10-21。分支：`codex/kubernetes-control-plane`。
 依赖：`codex/postgresql-migration@cf9462d5`（#647）。
 
-## 当前范围和完成条件
+## 目标和验收条件
+
+目标为 #648 的 Kubernetes 部署与多活动控制面水平扩容。至少两个副本须部署在不同节点，同时承载重叠请求；认证、配置、业务数据和全局限额保持一致；后台任务不重复，异常退出后能够安全接管；HTTP、SSE、WebSocket、扩缩容和滚动更新均需运行验证。全部推理转交给单个 leader 不能代替此验收。
+
+当前 Draft PR #651 和以下第一阶段结果尚未满足全部条件。后续增量继续在同一分支实现，不关闭 #648。
+
+## 第一阶段范围和完成条件（历史）
 
 本次先提交可运行、可评审的 Kubernetes 部署基础 Draft PR。默认只允许一个活动控制面。控制面多副本同时处理推理尚未具备安全条件，本 PR 不关闭 #648，也不将单副本部署称为水平扩容。
 
@@ -57,3 +63,11 @@
 4. 全部条件具备后再允许两个活动副本，补充 HPA、PodDisruptionBudget 和多节点部署，并验证并发、滚动更新、缩容与故障接管。
 
 本轮运行证据及未验证项将在增量验证报告中记录。第一阶段的镜像 digest 与 k3s 结果只覆盖当时源码，不能用于证明本轮新代码已部署。
+
+## 共享执行准入增量（进行中）
+
+`fb90450d` 已加入账号/VM/Fable/RPM 的共享准入、设备座位与 generation、发送前实际 kernel request ID 绑定，以及未知执行保留和停止重试。设备预算按账号跨 VM 计算。standalone 保留原同步调度路径。详细结果见 [共享执行验证](2026-10-21-kubernetes-execution-results.md)。全量 unit 为 3493 pass、7 fail、10 skip；全量 E2E 为 103 pass、17 fail、1 skip。失败差异和基线依据均在报告中列出。
+
+当前队列仍为进程内队列。同会话顺序和 Sticky 的跨副本条件更新未完成。HTTP/SSE EOF 终态还依赖正常 kernel 协议，尚无执行端 fencing；控制面死亡后的占位没有自动回收。独占锁和单副本限制继续保留。
+
+下一阶段需优先拆除整行快照覆盖：AccountQuota 的计数改为 PG 原子增量，响应头/probe 改为有数据库观测顺序的字段补丁，身份与并发/RPM 配置使用管理补丁。`panel-api` 的显示检查、Fable probe、手工清理以及 `panel-routes` 的身份修改也会调用整行 `save`，需要同时覆盖。保留已有 bigint 精度和 `countRequest:false` 行为。ProxyPool 的 probe 当前仍调用 `replaceAll` 删除重建代理表，需要拆成目标行配置、健康、绑定及删除操作，并校验 probe 对应的配置版本。

@@ -1,0 +1,80 @@
+{
+  "baselineCommit": "eee8f6ecb6ca04455e6edef0c8e498fb3be21f21",
+  "baselineTreeCheck": {
+    "checkedGitBlobs": 698,
+    "missing": 0,
+    "different": 0
+  },
+  "currentTestCommit": "fb90450d06fd3aaaee8a0a4b52aca13d2f675431",
+  "nodeVersion": "v22.23.2",
+  "originalRunnerContract": "node --test <file>; no pg-setup import",
+  "tests": 29,
+  "passed": 22,
+  "failed": 7,
+  "allDiagnosticsEqual": true,
+  "results": [
+    {
+      "name": "prepareCliHopBody drops metadata and CLI-owned system but keeps official agent leftover",
+      "assertion": "test/unit/cli-hop-body.test.mjs:34",
+      "diagnostic": "  error: |-\n    Expected values to be strictly equal:\n    \n    '1h' !== undefined\n    \n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  actual: '1h'\n  operator: 'strictEqual'",
+      "assertionSha256": "a43e28c8c8a102e389ec8f57d05595f4304e1cbe8f10e5afd7e4f06f218c0e00",
+      "sameDiagnostic": true,
+      "sameAssertion": true,
+      "currentAssertionSha256": "a43e28c8c8a102e389ec8f57d05595f4304e1cbe8f10e5afd7e4f06f218c0e00"
+    },
+    {
+      "name": "every cli-hop system becomes the identity plus the caller body",
+      "assertion": "test/unit/cli-hop-body.test.mjs:59",
+      "diagnostic": "  error: |-\n    Expected values to be strictly deep-equal:\n    + actual - expected\n    \n      {\n    +   ttl: '1h',\n        type: 'ephemeral'\n      }\n    \n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  expected:\n    type: 'ephemeral'\n  actual:\n    type: 'ephemeral'\n    ttl: '1h'\n  operator: 'deepStrictEqual'",
+      "assertionSha256": "53ea5bcdad72e73478dab67c05fd993567253e722ff47e6681bf5011bd12540f",
+      "sameDiagnostic": true,
+      "sameAssertion": true,
+      "currentAssertionSha256": "53ea5bcdad72e73478dab67c05fd993567253e722ff47e6681bf5011bd12540f"
+    },
+    {
+      "name": "cli-hop normalizes mixed caller markers to the official template",
+      "assertion": "test/unit/cli-hop-body.test.mjs:81",
+      "diagnostic": "  error: |-\n    Expected values to be strictly deep-equal:\n    + actual - expected\n    \n      {\n    +   ttl: '1h',\n        type: 'ephemeral'\n      }\n    \n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  expected:\n    type: 'ephemeral'\n  actual:\n    type: 'ephemeral'\n    ttl: '1h'\n  operator: 'deepStrictEqual'",
+      "assertionSha256": "53ea5bcdad72e73478dab67c05fd993567253e722ff47e6681bf5011bd12540f",
+      "sameDiagnostic": true,
+      "sameAssertion": true,
+      "currentAssertionSha256": "53ea5bcdad72e73478dab67c05fd993567253e722ff47e6681bf5011bd12540f"
+    },
+    {
+      "name": "cli-hop drops caller system/tools markers and restamps last plus penultimate user",
+      "assertion": "test/unit/cli-hop-body.test.mjs:377",
+      "diagnostic": "  error: |-\n    Expected values to be strictly deep-equal:\n    + actual - expected\n    \n      {\n    +   ttl: '5m',\n        type: 'ephemeral'\n      }\n    \n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  expected:\n    type: 'ephemeral'\n  actual:\n    type: 'ephemeral'\n    ttl: '5m'\n  operator: 'deepStrictEqual'",
+      "assertionSha256": "f7e05b9b943131bd7a5937a9eef9f7479132d9ab6b1615630be8f52f6e96c479",
+      "sameDiagnostic": true,
+      "sameAssertion": true,
+      "currentAssertionSha256": "f7e05b9b943131bd7a5937a9eef9f7479132d9ab6b1615630be8f52f6e96c479"
+    },
+    {
+      "name": "cli-hop short history only marks the last message",
+      "assertion": "test/unit/cli-hop-body.test.mjs:395",
+      "diagnostic": "  error: |-\n    Expected values to be strictly deep-equal:\n    + actual - expected\n    \n      [\n        {\n          blockIndex: 0,\n          index: 2,\n    +     ttl: '1h',\n    -     ttl: undefined,\n          type: 'text'\n        }\n      ]\n    \n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  expected:\n    0:\n      index: 2\n      blockIndex: 0\n      type: 'text'\n  actual:\n    0:\n      index: 2\n      blockIndex: 0\n      type: 'text'\n      ttl: '1h'\n  operator: 'deepStrictEqual'",
+      "assertionSha256": "90bd2262aa99eacd53591ddeb9b25f30e5aefcd3d591fd8eb768a3c290c140f4",
+      "sameDiagnostic": true,
+      "sameAssertion": true,
+      "currentAssertionSha256": "90bd2262aa99eacd53591ddeb9b25f30e5aefcd3d591fd8eb768a3c290c140f4"
+    },
+    {
+      "name": "cli-hop uses the inbound session TTL on both message anchors",
+      "assertion": "test/unit/cli-hop-body.test.mjs:435",
+      "diagnostic": "  error: |-\n    Expected values to be strictly deep-equal:\n    + actual - expected\n    \n      [\n    +   '1h'\n    -   undefined\n      ]\n    \n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  expected:\n  actual:\n    0: '1h'\n  operator: 'deepStrictEqual'",
+      "assertionSha256": "c34d08b21f1ac688087e5aa9bbd2c65e9c0439d14bae7db90f2ee9e42525bcd8",
+      "sameDiagnostic": true,
+      "sameAssertion": true,
+      "currentAssertionSha256": "c34d08b21f1ac688087e5aa9bbd2c65e9c0439d14bae7db90f2ee9e42525bcd8"
+    },
+    {
+      "name": "openai.chat multi-turn cli-hop marks last and penultimate user",
+      "assertion": "test/unit/convert-cache-shape.test.mjs:155",
+      "diagnostic": "  error: |-\n    Expected values to be strictly deep-equal:\n    + actual - expected\n    \n      {\n    +   ttl: '1h',\n        type: 'ephemeral'\n      }\n    \n  code: 'ERR_ASSERTION'\n  name: 'AssertionError'\n  expected:\n    type: 'ephemeral'\n  actual:\n    type: 'ephemeral'\n    ttl: '1h'\n  operator: 'deepStrictEqual'",
+      "assertionSha256": "53ea5bcdad72e73478dab67c05fd993567253e722ff47e6681bf5011bd12540f",
+      "sameDiagnostic": true,
+      "sameAssertion": true,
+      "currentAssertionSha256": "53ea5bcdad72e73478dab67c05fd993567253e722ff47e6681bf5011bd12540f"
+    }
+  ]
+}
