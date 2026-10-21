@@ -118,6 +118,19 @@ test('canAccept rejects disabled / expired / quota / concurrency', async () => {
   assert.equal((await store.canAccept(await store.getById(rec.id))).code, 'api_key_quota_exhausted')
 })
 
+test('request quotas compare imported bigint counters exactly', async () => {
+  const store = tmpStore()
+  const rec = await store.create({ name: 'large quota' })
+  await store.db
+    .prepare('UPDATE api_keys SET quota_requests = $1, quota_requests_used = $2 WHERE id = $3')
+    .run('10000000000000000', '9007199254740993', rec.id)
+  assert.equal((await store.canAccept(await store.getById(rec.id))).ok, true)
+  await store.db.prepare('UPDATE api_keys SET status = $1 WHERE id = $2').run('quota_exhausted', rec.id)
+  assert.equal((await store.update(rec.id, { name: 'renamed' })).status, 'active')
+  await store.db.prepare('UPDATE api_keys SET quota_requests_used = quota_requests WHERE id = $1').run(rec.id)
+  assert.equal((await store.canAccept(await store.getById(rec.id))).code, 'api_key_quota_exhausted')
+})
+
 test('rpm window blocks then recovers', async () => {
   const store = tmpStore()
   const rec = await store.create({ name: 'rpm', max_concurrency: 0, quota_requests: 0, rpm: 2 })
