@@ -19,6 +19,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { redactSecrets } from '../core/security.mjs'
 import { resolveStoreDb } from '../db/database.mjs'
+import { integerValue } from '../db/integers.mjs'
 import { UsageLogsRepo } from '../db/repos/usage-logs-repo.mjs'
 import { classifyRequestError, resolveMutedErrorClasses } from './error-class.mjs'
 import { costColumnsFromUsage, normalizeUsage } from './pricing.mjs'
@@ -114,9 +115,9 @@ function cacheCreationBreakdown(usage) {
     return { cache_creation_5m_tokens: null, cache_creation_1h_tokens: null }
   }
   const nested = usage.cache_creation
-  let five = Number(nested?.ephemeral_5m_input_tokens) || 0
-  let hour = Number(nested?.ephemeral_1h_input_tokens) || 0
-  const total = Number(usage.cache_creation_input_tokens ?? usage.cache_creation_tokens) || 0
+  let five = integerValue(nested?.ephemeral_5m_input_tokens)
+  let hour = integerValue(nested?.ephemeral_1h_input_tokens)
+  const total = integerValue(usage.cache_creation_input_tokens ?? usage.cache_creation_tokens)
   if (five === 0 && hour === 0 && total > 0) {
     if (usage.cache_ttl === '1h') hour = total
     else five = total
@@ -128,8 +129,8 @@ function cacheCreationBreakdown(usage) {
 }
 
 function webSearchRequestsOf(usage) {
-  const n = Number(usage?.server_tool_use?.web_search_requests ?? usage?.web_search_requests)
-  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0
+  const n = integerValue(usage?.server_tool_use?.web_search_requests ?? usage?.web_search_requests)
+  return n > 0 ? n : 0
 }
 
 const PRICED_COLUMN_KEYS = [
@@ -388,6 +389,7 @@ export class RequestLogStore {
     this._mem = [] // recent normal summaries for panel hot path
     this._memMax = 200
     this._cleanupTimer = null
+    this._cleanupPending = new Set()
   }
 
   async setConfig({ mode, retainDays, debugRetainDays, maxMb, mutedErrorClasses } = {}) {
@@ -502,9 +504,10 @@ export class RequestLogStore {
   async finish(ctx, extra = {}) {
     if (!ctx || ctx.mode === 'off') return null
     const duration_ms = Math.max(0, Date.now() - (ctx.t0 || Date.now()))
-    const usage = normalizeUsage(disjointOpenaiUsage(extra.usage || {}) || {})
+    const rawUsage = disjointOpenaiUsage(extra.usage || {}) || {}
+    const usage = normalizeUsage(rawUsage)
     const breakdown = cacheCreationBreakdown(usage)
-    const webSearch = extra.web_search_requests ?? webSearchRequestsOf(usage)
+    const webSearch = extra.web_search_requests ?? webSearchRequestsOf(rawUsage)
     const billedUsage = {
       ...usage,
       input_tokens: extra.input_tokens ?? usage.input_tokens,
@@ -764,10 +767,14 @@ export class RequestLogStore {
   startCleanupScheduler({ intervalMs = CLEANUP_INTERVAL_MS } = {}) {
     this.stopCleanupScheduler()
     const ms = Math.max(60_000, Number(intervalMs) || CLEANUP_INTERVAL_MS)
-    const run = async () => {
-      try {
-        await this.cleanup()
-      } catch {}
+    const run = () => {
+      const pending = (async () => {
+        try {
+          await this.cleanup()
+        } catch {}
+      })()
+      this._cleanupPending.add(pending)
+      pending.finally(() => this._cleanupPending.delete(pending))
     }
     this._cleanupTimer = setInterval(run, ms)
     if (typeof this._cleanupTimer.unref === 'function') this._cleanupTimer.unref()
@@ -776,6 +783,10 @@ export class RequestLogStore {
   stopCleanupScheduler() {
     clearInterval(this._cleanupTimer)
     this._cleanupTimer = null
+  }
+
+  async flush() {
+    while (this._cleanupPending.size) await Promise.all([...this._cleanupPending])
   }
 
   _cleanupLegacyFiles(days, dir) {

@@ -19,6 +19,7 @@ import { keyScopeFromRecord, normalizeKeyScope } from './key-scope.mjs'
 import { VmPoolsRepo } from '../db/repos/vm-pools-repo.mjs'
 import crypto from 'node:crypto'
 import { resolveStoreDb, withTransaction } from '../db/database.mjs'
+import { integerValue } from '../db/integers.mjs'
 import { ApiKeysRepo } from '../db/repos/api-keys-repo.mjs'
 import { maybeEncrypt, maybeDecrypt } from '../db/secure.mjs'
 import { calculateCost, normalizeUsage } from './pricing.mjs'
@@ -301,7 +302,7 @@ export class ApiKeyStore {
       if (
         rec.status === 'quota_exhausted' &&
         !((rec.quota ?? 0) > 0 && (rec.quota_used ?? 0) >= rec.quota) &&
-        !(rec.quota_requests > 0 && (rec.quota_requests_used ?? 0) >= rec.quota_requests)
+        !(rec.quota_requests > 0 && BigInt(rec.quota_requests_used ?? 0) >= BigInt(rec.quota_requests))
       ) {
         rec.status = 'active'
       }
@@ -386,7 +387,7 @@ export class ApiKeyStore {
     if (this._expired(rec, now)) {
       return { ok: false, code: 'api_key_expired', message: 'API key has expired', status: 403 }
     }
-    if (rec.quota_requests > 0 && (rec.quota_requests_used ?? 0) >= rec.quota_requests) {
+    if (rec.quota_requests > 0 && BigInt(rec.quota_requests_used ?? 0) >= BigInt(rec.quota_requests)) {
       return {
         ok: false,
         code: 'api_key_quota_exhausted',
@@ -504,10 +505,10 @@ export class ApiKeyStore {
     const rate = Number.isFinite(Number(rateMultiplier)) ? Number(rateMultiplier) : 1
     const cost = billed * rate
     const rec = await this.repo.recordUsage(id, {
-      tokens_in: Number(normalized.input_tokens) || Number(normalized.tokens_in) || 0,
-      tokens_out: Number(normalized.output_tokens) || Number(normalized.tokens_out) || 0,
-      cache_read_tokens: Number(normalized.cache_read_input_tokens ?? normalized.cache_read_tokens) || 0,
-      cache_creation_tokens: Number(normalized.cache_creation_input_tokens ?? normalized.cache_creation_tokens) || 0,
+      tokens_in: integerValue(normalized.input_tokens ?? normalized.tokens_in),
+      tokens_out: integerValue(normalized.output_tokens ?? normalized.tokens_out),
+      cache_read_tokens: integerValue(normalized.cache_read_input_tokens ?? normalized.cache_read_tokens),
+      cache_creation_tokens: integerValue(normalized.cache_creation_input_tokens ?? normalized.cache_creation_tokens),
       cost,
     })
     return rec

@@ -8,6 +8,7 @@
  */
 
 import { getDb, withTransaction } from '../database.mjs'
+import { integerValue } from '../integers.mjs'
 
 const COLUMNS = [
   'id',
@@ -75,6 +76,16 @@ const NUMERIC_DEFAULT_0 = new Set([
   'usage_7d',
 ])
 
+const INTEGER_COUNTERS = new Set([
+  'quota_requests',
+  'quota_requests_used',
+  'requests',
+  'tokens_in',
+  'tokens_out',
+  'cache_read_tokens',
+  'cache_creation_tokens',
+])
+
 function rowToRec(row) {
   if (!row) return null
   return { ...row }
@@ -88,6 +99,7 @@ function toValue(rec, c) {
     if (c === 'allowed_vms') return '[]'
     return NUMERIC_DEFAULT_0.has(c) ? 0 : null
   }
+  if (INTEGER_COUNTERS.has(c)) return integerValue(v)
   return v
 }
 
@@ -185,10 +197,10 @@ export class ApiKeysRepo {
       const usd = Number(cost) || 0
       const w = WINDOWS.map((win) => this._rollWindow(rec, win, usd, nowMs))
       await this._recordUsage.run(
-        Number(tokens_in) || 0,
-        Number(tokens_out) || 0,
-        Number(cache_read_tokens) || 0,
-        Number(cache_creation_tokens) || 0,
+        integerValue(tokens_in),
+        integerValue(tokens_out),
+        integerValue(cache_read_tokens),
+        integerValue(cache_creation_tokens),
         usd,
         w[0].usage,
         w[0].start,

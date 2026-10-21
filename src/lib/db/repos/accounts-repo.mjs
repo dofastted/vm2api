@@ -9,6 +9,7 @@
  */
 
 import { getDb, withTransaction } from '../database.mjs'
+import { integerValue } from '../integers.mjs'
 
 const MAX_ALLOCATIONS_PER_ACCOUNT = 50
 
@@ -136,11 +137,11 @@ export class AccountsRepo {
         acc.concurrency_override ? 1 : 0,
         acc.max_rpm ?? 0,
         acc.rpm_override ? 1 : 0,
-        acc.requests ?? 0,
-        acc.tokens_in ?? 0,
-        acc.tokens_out ?? 0,
-        acc.cache_read_tokens ?? 0,
-        acc.cache_creation_tokens ?? 0,
+        integerValue(acc.requests),
+        integerValue(acc.tokens_in),
+        integerValue(acc.tokens_out),
+        integerValue(acc.cache_read_tokens),
+        integerValue(acc.cache_creation_tokens),
         buildExtra(acc),
         acc.created_at ?? now,
         acc.updated_at ?? now,
@@ -161,11 +162,11 @@ export class AccountsRepo {
       acc.concurrency_override ? 1 : 0,
       acc.max_rpm ?? 0,
       acc.rpm_override ? 1 : 0,
-      acc.requests ?? 0,
-      acc.tokens_in ?? 0,
-      acc.tokens_out ?? 0,
-      acc.cache_read_tokens ?? 0,
-      acc.cache_creation_tokens ?? 0,
+      integerValue(acc.requests),
+      integerValue(acc.tokens_in),
+      integerValue(acc.tokens_out),
+      integerValue(acc.cache_read_tokens),
+      integerValue(acc.cache_creation_tokens),
       buildExtra(acc),
       new Date().toISOString(),
       acc.account_id,
@@ -193,8 +194,8 @@ export class AccountsRepo {
         alloc.status_5h ?? null,
         alloc.status_7d ?? null,
         alloc.claim ?? null,
-        alloc.tokens_in ?? null,
-        alloc.tokens_out ?? null,
+        alloc.tokens_in == null ? null : integerValue(alloc.tokens_in),
+        alloc.tokens_out == null ? null : integerValue(alloc.tokens_out),
       )
       await this._trimAlloc.run(accountId, accountId, max)
     })

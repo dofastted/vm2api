@@ -10,6 +10,7 @@
  */
 
 import { getDb } from '../database.mjs'
+import { addInteger, integerValue } from '../integers.mjs'
 import { DEFAULT_MUTED_ERROR_CLASSES, enrichLogRow, excludeErrorClassSql } from '../../admin/error-class.mjs'
 import { reportTimezone, zonedDayStartMs } from '../../core/timezone.mjs'
 import {
@@ -105,8 +106,8 @@ export async function lookupNames(db, { userIds = [], keyIds = [], vmIds = [], a
 }
 
 function cacheTtlApplied(row) {
-  const short = num(row.cache_creation_5m_tokens)
-  const long = num(row.cache_creation_1h_tokens)
+  const short = integerValue(row.cache_creation_5m_tokens)
+  const long = integerValue(row.cache_creation_1h_tokens)
   if (short > 0 && long > 0) return 'mixed'
   if (long > 0) return '1h'
   if (short > 0) return '5m'
@@ -155,10 +156,10 @@ function blockedBy(row) {
 /** Raw `usage_logs` row (already `enrichLogRow`-ed) + batched names → `UsageLogRow`. */
 export function toUsageLogRow(row, names, chain = []) {
   const accountId = row.final_account_id || row.account_id || null
-  const inputTokens = num(row.input_tokens)
-  const outputTokens = num(row.output_tokens)
-  const cacheCreation = num(row.cache_creation_tokens)
-  const cacheRead = num(row.cache_read_tokens)
+  const inputTokens = integerValue(row.input_tokens)
+  const outputTokens = integerValue(row.output_tokens)
+  const cacheCreation = integerValue(row.cache_creation_tokens)
+  const cacheRead = integerValue(row.cache_read_tokens)
   const blocked = blockedBy(row)
   return {
     id: row.id,
@@ -188,8 +189,8 @@ export function toUsageLogRow(row, names, chain = []) {
     outputTokens,
     cacheCreationInputTokens: cacheCreation,
     cacheReadInputTokens: cacheRead,
-    cacheCreation5mInputTokens: num(row.cache_creation_5m_tokens),
-    cacheCreation1hInputTokens: num(row.cache_creation_1h_tokens),
+    cacheCreation5mInputTokens: integerValue(row.cache_creation_5m_tokens),
+    cacheCreation1hInputTokens: integerValue(row.cache_creation_1h_tokens),
     cacheTtlApplied: cacheTtlApplied(row),
     totalTokens: rowTotalTokens(row),
     costUsd: nullableNum(row.total_cost),
@@ -199,7 +200,7 @@ export function toUsageLogRow(row, names, chain = []) {
     durationMs: nullableNum(row.duration_ms),
     ttftMs: nullableNum(row.first_token_ms),
     stopReason: row.stop_reason ?? null,
-    attemptCount: nullableNum(row.attempt_count),
+    attemptCount: row.attempt_count == null ? null : integerValue(row.attempt_count),
     finalState: row.final_state ?? null,
     via: row.via ?? null,
     stream: row.stream == null ? null : !!row.stream,
@@ -557,7 +558,7 @@ export class UsageLogsView {
         'cache_creation_1h_tokens',
         'prompt_tokens',
       ])
-        acc[k] += num(r[k])
+        acc[k] = addInteger(acc[k], r[k])
       if (r.duration_ms != null) {
         durSum += num(r.duration_ms)
         durN++
@@ -741,7 +742,7 @@ export class UsageLogsView {
     })
     return {
       minutes: mins,
-      total: num(total),
+      total: integerValue(total),
       sessions: rows.map((r) => ({
         sessionId: r.sid,
         clientSessionId: r.client_session_id ?? null,
@@ -753,10 +754,10 @@ export class UsageLogsView {
         model: r.model ?? null,
         firstAt: r.first_at,
         lastAt: r.last_at,
-        requests: num(r.requests),
+        requests: integerValue(r.requests),
         lastStatus: nullableNum(r.status),
         lastDurationMs: nullableNum(r.duration_ms),
-        totalTokens: num(r.tokens),
+        totalTokens: integerValue(r.tokens),
         totalCost: num(r.cost),
       })),
     }
@@ -798,14 +799,14 @@ export class UsageLogsView {
     const lastMinute = await agg(now - 60_000, now + 1)
     const avg = (v) => (v == null ? null : Math.round(Number(v)))
     return {
-      activeSessions: num(active.sessions),
-      rpm: num(lastMinute.requests),
-      todayRequests: num(today.requests),
+      activeSessions: integerValue(active.sessions),
+      rpm: integerValue(lastMinute.requests),
+      todayRequests: integerValue(today.requests),
       todayCost: num(today.cost),
       todayActualCost: num(today.actual_cost),
-      todayErrors: num(today.errors),
+      todayErrors: integerValue(today.errors),
       todayAvgDurationMs: avg(today.avg_duration_ms),
-      yesterdayRequests: num(yesterday.requests),
+      yesterdayRequests: integerValue(yesterday.requests),
       yesterdayCost: num(yesterday.cost),
       yesterdayAvgDurationMs: avg(yesterday.avg_duration_ms),
     }
@@ -813,15 +814,15 @@ export class UsageLogsView {
 }
 
 function toSummary(row) {
-  const input = num(row.input_tokens)
-  const output = num(row.output_tokens)
-  const cacheCreation = num(row.cache_creation_tokens)
-  const cacheRead = num(row.cache_read_tokens)
-  const prompt = num(row.prompt_tokens)
+  const input = integerValue(row.input_tokens)
+  const output = integerValue(row.output_tokens)
+  const cacheCreation = integerValue(row.cache_creation_tokens)
+  const cacheRead = integerValue(row.cache_read_tokens)
+  const prompt = integerValue(row.prompt_tokens)
   return {
-    totalRequests: num(row.requests),
-    successRequests: num(row.success),
-    errorRequests: num(row.errors),
+    totalRequests: integerValue(row.requests),
+    successRequests: integerValue(row.success),
+    errorRequests: integerValue(row.errors),
     totalCost: num(row.cost),
     totalActualCost: num(row.actual_cost),
     totalTokens: rowTotalTokens(row),
@@ -829,8 +830,8 @@ function toSummary(row) {
     totalOutputTokens: output,
     totalCacheCreationTokens: cacheCreation,
     totalCacheReadTokens: cacheRead,
-    totalCacheCreation5mTokens: num(row.cache_creation_5m_tokens),
-    totalCacheCreation1hTokens: num(row.cache_creation_1h_tokens),
+    totalCacheCreation5mTokens: integerValue(row.cache_creation_5m_tokens),
+    totalCacheCreation1hTokens: integerValue(row.cache_creation_1h_tokens),
     cacheHitRate: prompt > 0 ? Math.min(1, cacheRead / prompt) : 0,
     avgDurationMs: row.avg_duration_ms == null ? null : Math.round(Number(row.avg_duration_ms)),
     avgTtftMs: row.avg_ttft_ms == null ? null : Math.round(Number(row.avg_ttft_ms)),

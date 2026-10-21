@@ -9,6 +9,7 @@
  */
 
 import { getDb, withTransaction } from '../database.mjs'
+import { addInteger, integerValue } from '../integers.mjs'
 import { collectErrors, enrichLogRow, excludeErrorClassSql, ingressAuthSql } from '../../admin/error-class.mjs'
 import {
   costColumnsFromUsage,
@@ -56,10 +57,24 @@ function billingStatsCacheKey(accountWindows) {
 // Do not re-apply a single Anthropic formula on the mixed SUM (homepage/usage
 // billing). Database-page PromptCacheMetricsPanel still uses input+read+write.
 function sumCostBuckets(rows) {
-  return {
-    ...sumCostColumns(rows),
-    prompt_tokens: rows.reduce((sum, row) => sum + (Number(row.prompt_tokens) || 0), 0),
+  const out = sumCostColumns(rows)
+  for (const key of [
+    'requests',
+    'success',
+    'errors',
+    'input_tokens',
+    'output_tokens',
+    'cache_read_tokens',
+    'cache_creation_tokens',
+    'prompt_tokens',
+  ]) {
+    out[key] = rows.reduce((sum, row) => addInteger(sum, row[key]), 0)
   }
+  return out
+}
+
+function withCacheHitRate(bucket) {
+  return { ...bucket, cache_hit_rate: cacheHitStats(bucket).cache_hit_rate }
 }
 
 const SUMMARY_COLUMNS = [
@@ -140,7 +155,7 @@ function toRow(rec) {
       c === 'cache_creation_1h_tokens' ||
       c === 'web_search_requests'
     )
-      return Number(rec[c]) || 0
+      return integerValue(rec[c])
     return rec[c] ?? null
   })
 }
@@ -216,13 +231,13 @@ function bucketEventsSince(rows = [], sinceMs) {
     ...sumCostBuckets(
       picked.map((row) => ({
         requests: 1,
-        success: Number(row.success || 0),
-        errors: Number(row.errors || 0),
-        input_tokens: Number(row.input_tokens || 0),
-        output_tokens: Number(row.output_tokens || 0),
-        cache_read_tokens: Number(row.cache_read_tokens || 0),
-        cache_creation_tokens: Number(row.cache_creation_tokens || 0),
-        prompt_tokens: Number(row.prompt_tokens || 0),
+        success: integerValue(row.success),
+        errors: integerValue(row.errors),
+        input_tokens: integerValue(row.input_tokens),
+        output_tokens: integerValue(row.output_tokens),
+        cache_read_tokens: integerValue(row.cache_read_tokens),
+        cache_creation_tokens: integerValue(row.cache_creation_tokens),
+        prompt_tokens: integerValue(row.prompt_tokens),
         input_cost: Number(row.input_cost || 0),
         output_cost: Number(row.output_cost || 0),
         cache_read_cost: Number(row.cache_read_cost || 0),
@@ -574,7 +589,7 @@ export class UsageLogsRepo {
       FROM usage_logs
     `)
       .get()
-    return { ...row, ...cacheHitStats(row) }
+    return withCacheHitRate(row)
   }
 
   _usageForPrice(row) {
@@ -747,7 +762,7 @@ export class UsageLogsRepo {
         .all(...params)
     ).map((r) => ({
       model: r.model,
-      requests: Number(r.requests || 0),
+      requests: integerValue(r.requests),
       last_seen: r.last_seen || null,
     }))
   }
@@ -772,20 +787,20 @@ export class UsageLogsRepo {
     `)
       .get(...params)
     const out = {
-      requests: Number(row?.requests || 0),
-      input_tokens: Number(row?.input_tokens || 0),
-      output_tokens: Number(row?.output_tokens || 0),
-      cache_read_tokens: Number(row?.cache_read_tokens || 0),
-      cache_creation_tokens: Number(row?.cache_creation_tokens || 0),
-      prompt_tokens: Number(row?.prompt_tokens || 0),
+      requests: integerValue(row?.requests),
+      input_tokens: integerValue(row?.input_tokens),
+      output_tokens: integerValue(row?.output_tokens),
+      cache_read_tokens: integerValue(row?.cache_read_tokens),
+      cache_creation_tokens: integerValue(row?.cache_creation_tokens),
+      prompt_tokens: integerValue(row?.prompt_tokens),
       input_cost: Number(row?.input_cost || 0),
       output_cost: Number(row?.output_cost || 0),
       cache_read_cost: Number(row?.cache_read_cost || 0),
       cache_creation_cost: Number(row?.cache_creation_cost || 0),
       total_cost: Number(row?.total_cost || 0),
-      unpriced: Number(row?.unpriced || 0),
+      unpriced: integerValue(row?.unpriced),
     }
-    return { ...out, ...cacheHitStats(out) }
+    return withCacheHitRate(out)
   }
 
   async costByAccount({ since = null, until = null } = {}) {
@@ -817,20 +832,20 @@ export class UsageLogsRepo {
     return rows.map((r) => ({
       account_id: r.account_id,
       vm_id: r.vm_id || null,
-      requests: Number(r.requests || 0),
-      success: Number(r.success || 0),
-      errors: Number(r.errors || 0),
-      input_tokens: Number(r.input_tokens || 0),
-      output_tokens: Number(r.output_tokens || 0),
-      cache_read_tokens: Number(r.cache_read_tokens || 0),
-      cache_creation_tokens: Number(r.cache_creation_tokens || 0),
-      prompt_tokens: Number(r.prompt_tokens || 0),
+      requests: integerValue(r.requests),
+      success: integerValue(r.success),
+      errors: integerValue(r.errors),
+      input_tokens: integerValue(r.input_tokens),
+      output_tokens: integerValue(r.output_tokens),
+      cache_read_tokens: integerValue(r.cache_read_tokens),
+      cache_creation_tokens: integerValue(r.cache_creation_tokens),
+      prompt_tokens: integerValue(r.prompt_tokens),
       input_cost: Number(r.input_cost || 0),
       output_cost: Number(r.output_cost || 0),
       cache_read_cost: Number(r.cache_read_cost || 0),
       cache_creation_cost: Number(r.cache_creation_cost || 0),
       total_cost: Number(r.total_cost || 0),
-      unpriced: Number(r.unpriced || 0),
+      unpriced: integerValue(r.unpriced),
     }))
   }
 
@@ -874,13 +889,13 @@ export class UsageLogsRepo {
       service_tier: r.service_tier || null,
       speed: r.speed || null,
       long_context: Number(r.long_context || 0),
-      requests: Number(r.requests || 0),
-      unpriced_requests: Number(r.unpriced_requests || 0),
-      input_tokens: Number(r.input_tokens || 0),
-      output_tokens: Number(r.output_tokens || 0),
-      cache_read_tokens: Number(r.cache_read_tokens || 0),
-      cache_creation_tokens: Number(r.cache_creation_tokens || 0),
-      prompt_tokens: Number(r.prompt_tokens || 0),
+      requests: integerValue(r.requests),
+      unpriced_requests: integerValue(r.unpriced_requests),
+      input_tokens: integerValue(r.input_tokens),
+      output_tokens: integerValue(r.output_tokens),
+      cache_read_tokens: integerValue(r.cache_read_tokens),
+      cache_creation_tokens: integerValue(r.cache_creation_tokens),
+      prompt_tokens: integerValue(r.prompt_tokens),
       input_cost: Number(r.input_cost || 0),
       output_cost: Number(r.output_cost || 0),
       cache_read_cost: Number(r.cache_read_cost || 0),
@@ -942,16 +957,16 @@ export class UsageLogsRepo {
         .all(...params)
     ).map((r) => ({
       day: r.day,
-      requests: Number(r.requests || 0),
-      errors: Number(r.errors || 0),
-      input_tokens: Number(r.input_tokens || 0),
-      output_tokens: Number(r.output_tokens || 0),
-      cache_read_tokens: Number(r.cache_read_tokens || 0),
-      cache_creation_tokens: Number(r.cache_creation_tokens || 0),
-      prompt_tokens: Number(r.prompt_tokens || 0),
+      requests: integerValue(r.requests),
+      errors: integerValue(r.errors),
+      input_tokens: integerValue(r.input_tokens),
+      output_tokens: integerValue(r.output_tokens),
+      cache_read_tokens: integerValue(r.cache_read_tokens),
+      cache_creation_tokens: integerValue(r.cache_creation_tokens),
+      prompt_tokens: integerValue(r.prompt_tokens),
       total_cost: Number(r.total_cost || 0),
-      duration_ms_sum: Number(r.duration_ms_sum || 0),
-      duration_n: Number(r.duration_n || 0),
+      duration_ms_sum: integerValue(r.duration_ms_sum),
+      duration_n: integerValue(r.duration_n),
     }))
     const group = async (expr, limit) =>
       (
@@ -967,8 +982,8 @@ export class UsageLogsRepo {
           .all(...params)
       ).map((r) => ({
         name: r.name,
-        requests: Number(r.requests || 0),
-        tokens: Number(r.tokens || 0),
+        requests: integerValue(r.requests),
+        tokens: integerValue(r.tokens),
         total_cost: Number(r.total_cost || 0),
       }))
     return {
@@ -1039,9 +1054,9 @@ export class UsageLogsRepo {
     const folded = foldInterceptRows(grouped)
     return {
       since,
-      total: Number(row?.total || 0),
-      blocked: Number(row?.blocked || 0),
-      passed: Number(row?.passed || 0),
+      total: integerValue(row?.total),
+      blocked: integerValue(row?.blocked),
+      passed: integerValue(row?.passed),
       keywords: collapseBlockKeywords(keywords),
       blocks: folded.blocks,
       passes: folded.passes,
@@ -1093,8 +1108,8 @@ export class UsageLogsRepo {
     // blocks unrelated HTTP requests on the Node event loop.
     const totalBucket = sumCostBuckets(accountsTotal)
     const todayBucket = sumCostBuckets(accountsToday)
-    const total = { ...totalBucket, ...cacheHitStats(totalBucket) }
-    const today = { ...todayBucket, ...cacheHitStats(todayBucket) }
+    const total = withCacheHitRate(totalBucket)
+    const today = withCacheHitRate(todayBucket)
     const keyOf = (a) => a.account_id + '\0' + (a.vm_id || '')
     const todayById = new Map(accountsToday.map((a) => [keyOf(a), a]))
     const aligned = Array.isArray(accountWindows) && accountWindows.length > 0
@@ -1139,8 +1154,8 @@ export class UsageLogsRepo {
         window_fable = {
           cost: Number(fable.total_cost || 0),
           tokens: totalTokens(fable),
-          requests: Number(fable.requests || 0),
-          unpriced: Number(fable.unpriced || 0),
+          requests: integerValue(fable.requests),
+          unpriced: integerValue(fable.unpriced),
           start: new Date(sinceFable).toISOString(),
         }
       }
@@ -1150,47 +1165,41 @@ export class UsageLogsRepo {
         window_5h: { ...w },
         window_7d: { ...w7 },
         today_cost: Number(t.total_cost || 0),
-        today_requests: Number(t.requests || 0),
-        today_input_tokens: Number(t.input_tokens || 0),
-        today_output_tokens: Number(t.output_tokens || 0),
-        today_cache_read_tokens: Number(t.cache_read_tokens || 0),
-        today_cache_creation_tokens: Number(t.cache_creation_tokens || 0),
+        today_requests: integerValue(t.requests),
+        today_input_tokens: integerValue(t.input_tokens),
+        today_output_tokens: integerValue(t.output_tokens),
+        today_cache_read_tokens: integerValue(t.cache_read_tokens),
+        today_cache_creation_tokens: integerValue(t.cache_creation_tokens),
         today_input_cost: Number(t.input_cost || 0),
         today_output_cost: Number(t.output_cost || 0),
         today_cache_cost: Number(t.cache_read_cost || 0) + Number(t.cache_creation_cost || 0),
         window_5h_cost: Number(w.total_cost || 0),
-        window_5h_requests: Number(w.requests || 0),
+        window_5h_requests: integerValue(w.requests),
         window_5h_tokens: totalTokens(w),
-        window_5h_unpriced: Number(w.unpriced || 0),
-        window_5h_input_tokens: Number(w.input_tokens || 0),
-        window_5h_output_tokens: Number(w.output_tokens || 0),
-        window_5h_cache_read_tokens: Number(w.cache_read_tokens || 0),
-        window_5h_cache_creation_tokens: Number(w.cache_creation_tokens || 0),
+        window_5h_unpriced: integerValue(w.unpriced),
+        window_5h_input_tokens: integerValue(w.input_tokens),
+        window_5h_output_tokens: integerValue(w.output_tokens),
+        window_5h_cache_read_tokens: integerValue(w.cache_read_tokens),
+        window_5h_cache_creation_tokens: integerValue(w.cache_creation_tokens),
         window_5h_input_cost: Number(w.input_cost || 0),
         window_5h_output_cost: Number(w.output_cost || 0),
         window_5h_cache_cost: Number(w.cache_read_cost || 0) + Number(w.cache_creation_cost || 0),
         window_5h_start: aligned ? new Date(since5).toISOString() : fiveHStart,
         window_7d_cost: Number(w7.total_cost || 0),
-        window_7d_requests: Number(w7.requests || 0),
-        window_7d_success: Number(w7.success || 0),
-        window_7d_errors: Number(w7.errors || 0),
+        window_7d_requests: integerValue(w7.requests),
+        window_7d_success: integerValue(w7.success),
+        window_7d_errors: integerValue(w7.errors),
         window_7d_tokens: totalTokens(w7),
-        window_7d_unpriced: Number(w7.unpriced || 0),
+        window_7d_unpriced: integerValue(w7.unpriced),
         window_7d_start: aligned ? new Date(since7).toISOString() : sevenDStart,
         window_fable,
       }
     })
     const window5h = aligned
-      ? {
-          ...sumCostBuckets(accounts.map((a) => a.window_5h)),
-          ...cacheHitStats(sumCostBuckets(accounts.map((a) => a.window_5h))),
-        }
+      ? withCacheHitRate(sumCostBuckets(accounts.map((a) => a.window_5h)))
       : await this._costSelect('WHERE created_at >= $1', [fiveHStart])
     const window7d = aligned
-      ? {
-          ...sumCostBuckets(accounts.map((a) => a.window_7d)),
-          ...cacheHitStats(sumCostBuckets(accounts.map((a) => a.window_7d))),
-        }
+      ? withCacheHitRate(sumCostBuckets(accounts.map((a) => a.window_7d)))
       : await this._costSelect('WHERE created_at >= $1', [sevenDStart])
     const coverage = await this.logCoverageStart()
     return {
@@ -1319,22 +1328,22 @@ export class UsageLogsRepo {
       since: since ? new Date(since).toISOString() : null,
       until: until ? new Date(until).toISOString() : null,
       totals: {
-        requests: num(totals, 'requests'),
-        ok: num(totals, 'ok'),
-        fail: num(totals, 'fail'),
-        tokens_in: num(totals, 'tokens_in'),
-        tokens_out: num(totals, 'tokens_out'),
+        requests: integerValue(totals.requests),
+        ok: integerValue(totals.ok),
+        fail: integerValue(totals.fail),
+        tokens_in: integerValue(totals.tokens_in),
+        tokens_out: integerValue(totals.tokens_out),
         cost_usd: num(totals, 'cost_usd'),
         official_cost_usd: num(totals, 'official_cost_usd'),
       },
       items: items.map((row) => ({
         vm_id: grouped === 'vm' ? row.id || null : undefined,
         api_key_id: grouped === 'key' ? row.id || null : undefined,
-        requests: num(row, 'requests'),
-        ok: num(row, 'ok'),
-        fail: num(row, 'fail'),
-        tokens_in: num(row, 'tokens_in'),
-        tokens_out: num(row, 'tokens_out'),
+        requests: integerValue(row.requests),
+        ok: integerValue(row.ok),
+        fail: integerValue(row.fail),
+        tokens_in: integerValue(row.tokens_in),
+        tokens_out: integerValue(row.tokens_out),
         cost_usd: num(row, 'cost_usd'),
         official_cost_usd: num(row, 'official_cost_usd'),
       })),
@@ -1374,20 +1383,20 @@ export class UsageLogsRepo {
       FROM usage_logs ${where}
     `)
       .get(...allParams)
-    const requests = Number(counts?.requests || 0)
-    const success = Number(counts?.success || 0)
-    const errors = Number(counts?.errors || 0)
-    const inputTokens = Number(counts?.input_tokens || 0)
-    const outputTokens = Number(counts?.output_tokens || 0)
-    const cacheRead = Number(counts?.cache_read_tokens || 0)
-    const cacheWrite = Number(counts?.cache_creation_tokens || 0)
-    const cache = cacheHitStats({
+    const requests = integerValue(counts?.requests)
+    const success = integerValue(counts?.success)
+    const errors = integerValue(counts?.errors)
+    const inputTokens = integerValue(counts?.input_tokens)
+    const outputTokens = integerValue(counts?.output_tokens)
+    const cacheRead = integerValue(counts?.cache_read_tokens)
+    const cacheWrite = integerValue(counts?.cache_creation_tokens)
+    const cache = withCacheHitRate({
       input_tokens: inputTokens,
       cache_read_tokens: cacheRead,
       cache_creation_tokens: cacheWrite,
-      prompt_tokens: Number(counts?.prompt_tokens || 0),
+      prompt_tokens: integerValue(counts?.prompt_tokens),
     })
-    const tokens = inputTokens + outputTokens + cacheRead + cacheWrite
+    const tokens = totalTokens(counts)
 
     const startMs = since ? Date.parse(since) : null
     const endMs = until ? Date.parse(until) : Date.now()
@@ -1403,8 +1412,8 @@ export class UsageLogsRepo {
       GROUP BY minute
     `)
       .all(...allParams)
-    const peakReq = minuteRows.reduce((m, r) => Math.max(m, Number(r.requests || 0)), 0)
-    const peakTok = minuteRows.reduce((m, r) => Math.max(m, Number(r.tokens || 0)), 0)
+    const peakReq = minuteRows.reduce((m, r) => Math.max(m, integerValue(r.requests)), 0)
+    const peakTok = minuteRows.reduce((m, r) => Math.max(m, integerValue(r.tokens)), 0)
     const lastMinute = minuteRows.length ? minuteRows[minuteRows.length - 1] : null
 
     const ttftWhere = where ? `${where} AND first_token_ms IS NOT NULL` : 'WHERE first_token_ms IS NOT NULL'
@@ -1440,10 +1449,10 @@ export class UsageLogsRepo {
       errors,
       sla: requests ? success / requests : 1,
       error_rate: requests ? errors / requests : 0,
-      status_429: Number(counts?.status_429 || 0),
-      status_529: Number(counts?.status_529 || 0),
-      status_503: Number(counts?.status_503 || 0),
-      stream_requests: Number(counts?.stream_requests || 0),
+      status_429: integerValue(counts?.status_429),
+      status_529: integerValue(counts?.status_529),
+      status_503: integerValue(counts?.status_503),
+      stream_requests: integerValue(counts?.stream_requests),
       input_tokens: inputTokens,
       output_tokens: outputTokens,
       cache_read_tokens: cacheRead,
@@ -1466,9 +1475,9 @@ export class UsageLogsRepo {
       ttft: summarizeLatency(ttfts),
       by_model: byModel.map((r) => ({
         model: r.model,
-        requests: Number(r.requests || 0),
-        errors: Number(r.errors || 0),
-        ttft_samples: Number(r.ttft_samples || 0),
+        requests: integerValue(r.requests),
+        errors: integerValue(r.errors),
+        ttft_samples: integerValue(r.ttft_samples),
         avg_first_token_ms: r.avg_first_token_ms ?? null,
         avg_duration_ms: r.avg_duration_ms ?? null,
       })),
@@ -1505,9 +1514,9 @@ export class UsageLogsRepo {
       let selections = 0
       let hits = 0
       for (const row of rows) {
-        const n = Number(row.n || 0)
-        selections += n
-        if (String(row.selection_reason || '') === 'sticky') hits += n
+        const n = integerValue(row.n)
+        selections = addInteger(selections, n)
+        if (String(row.selection_reason || '') === 'sticky') hits = addInteger(hits, n)
       }
       return {
         selections,
@@ -1563,7 +1572,7 @@ export class UsageLogsRepo {
       ).map((row) => ({
         api_key_presented: row.api_key_presented || '',
         ip: row.ip || '',
-        count: Number(row.count || 0),
+        count: integerValue(row.count),
         last_ts: row.last_ts || null,
         error_code: row.error_code || null,
       }))
@@ -1616,11 +1625,11 @@ export class UsageLogsRepo {
   }
 
   async debugBytes() {
-    return Number((await this._debugBytes.get()).n || 0)
+    return integerValue((await this._debugBytes.get()).n)
   }
 
   async countDebug() {
-    return Number((await this._debugCount.get()).n || 0)
+    return integerValue((await this._debugCount.get()).n)
   }
 
   /** Delete oldest debug rows until the stored JSON bytes fit maxBytes. */

@@ -1132,9 +1132,13 @@ test('stopping retention scheduling still waits for its running cleanup during f
   })
   t.mock.method(globalThis, 'clearInterval', () => {})
   let releaseCleanup
-  const cleanupPending = new Promise((resolve) => { releaseCleanup = resolve })
+  const cleanupPending = new Promise((resolve) => {
+    releaseCleanup = resolve
+  })
   let signalCleanup
-  const cleanupStarted = new Promise((resolve) => { signalCleanup = resolve })
+  const cleanupStarted = new Promise((resolve) => {
+    signalCleanup = resolve
+  })
   store.cleanup = async () => {
     signalCleanup()
     await cleanupPending
@@ -1146,7 +1150,9 @@ test('stopping retention scheduling still waits for its running cleanup during f
   let settled = false
   let pending
   try {
-    pending = store.flush().then(() => { settled = true })
+    pending = store.flush().then(() => {
+      settled = true
+    })
     await Promise.resolve()
     assert.equal(settled, false)
   } finally {

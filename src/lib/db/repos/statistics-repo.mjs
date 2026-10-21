@@ -11,8 +11,16 @@
  */
 
 import { getDb } from '../database.mjs'
+import { addInteger, integerValue } from '../integers.mjs'
 import { reportTimezone, zonedDayStartMs, zonedParts, zonedWallToMs } from '../../core/timezone.mjs'
-import { ERROR_PRED, PROMPT_TOKENS_SQL, SUCCESS_PRED, TOTAL_TOKENS_SQL, ownerPred } from './usage-log-preds.mjs'
+import {
+  ERROR_PRED,
+  PROMPT_TOKENS_SQL,
+  SUCCESS_PRED,
+  TOTAL_TOKENS_SQL,
+  ownerPred,
+  totalTokens,
+} from './usage-log-preds.mjs'
 import { lookupNames } from './usage-logs-view.mjs'
 
 export const STATS_RANGES = ['today', '7days', '30days', 'thisMonth']
@@ -133,17 +141,17 @@ export class StatisticsRepo {
       FROM usage_logs ${cond}
     `)
       .get(...params)
-    const input = num(row.input_tokens)
-    const output = num(row.output_tokens)
-    const cacheRead = num(row.cache_read_tokens)
-    const cacheCreation = num(row.cache_creation_tokens)
-    const prompt = num(row.prompt_tokens)
+    const input = integerValue(row.input_tokens)
+    const output = integerValue(row.output_tokens)
+    const cacheRead = integerValue(row.cache_read_tokens)
+    const cacheCreation = integerValue(row.cache_creation_tokens)
+    const prompt = integerValue(row.prompt_tokens)
     return {
-      requests: num(row.requests),
-      errors: num(row.errors),
+      requests: integerValue(row.requests),
+      errors: integerValue(row.errors),
       cost: num(row.cost),
       actualCost: num(row.actual_cost),
-      tokens: input + output + cacheRead + cacheCreation,
+      tokens: totalTokens(row),
       inputTokens: input,
       outputTokens: output,
       cacheReadTokens: cacheRead,
@@ -194,13 +202,14 @@ export class StatisticsRepo {
       row.id = id
       const cur = volume.get(id) || { id, cost: 0, requests: 0, tokens: 0 }
       cur.cost += num(row.cost)
-      cur.requests += num(row.requests)
-      cur.tokens += num(row.tokens)
+      cur.requests = addInteger(cur.requests, row.requests)
+      cur.tokens = addInteger(cur.tokens, row.tokens)
       volume.set(id, cur)
     }
-    const ranked = [...volume.values()].sort(
-      (a, b) => b.cost - a.cost || b.requests - a.requests || a.id.localeCompare(b.id),
-    )
+    const ranked = [...volume.values()].sort((a, b) => {
+      const requests = BigInt(b.requests) - BigInt(a.requests)
+      return b.cost - a.cost || (requests > 0n ? 1 : requests < 0n ? -1 : 0) || a.id.localeCompare(b.id)
+    })
     const kept = ranked.slice(0, MAX_SERIES)
     const names = await this._names(
       dim,
@@ -227,9 +236,13 @@ export class StatisticsRepo {
       if (!dataKey) continue
       const idx = bucketIndex(buckets, Date.parse(`${row.slot}:00.000Z`))
       for (const m of metricNames) {
-        const v = num(row[m])
-        metrics[m][idx][dataKey] += v
-        seriesTotals[dataKey][m] += v
+        if (m === 'cost') {
+          metrics[m][idx][dataKey] += num(row[m])
+          seriesTotals[dataKey][m] += num(row[m])
+        } else {
+          metrics[m][idx][dataKey] = addInteger(metrics[m][idx][dataKey], row[m])
+          seriesTotals[dataKey][m] = addInteger(seriesTotals[dataKey][m], row[m])
+        }
       }
     }
 
@@ -298,20 +311,20 @@ export class StatisticsRepo {
       range: r,
       tz: zone,
       entries: rows.map((row, i) => {
-        const input = num(row.input_tokens)
-        const output = num(row.output_tokens)
-        const cacheRead = num(row.cache_read_tokens)
-        const cacheCreation = num(row.cache_creation_tokens)
-        const requests = num(row.requests)
-        const prompt = num(row.prompt_tokens)
+        const input = integerValue(row.input_tokens)
+        const output = integerValue(row.output_tokens)
+        const cacheRead = integerValue(row.cache_read_tokens)
+        const cacheCreation = integerValue(row.cache_creation_tokens)
+        const requests = integerValue(row.requests)
+        const prompt = integerValue(row.prompt_tokens)
         return {
           id: ids[i],
           name: this._nameOf(names, ids[i]),
           totalRequests: requests,
-          successRequests: num(row.success),
-          errorRequests: num(row.errors),
-          successRate: requests > 0 ? num(row.success) / requests : 0,
-          totalTokens: input + output + cacheRead + cacheCreation,
+          successRequests: integerValue(row.success),
+          errorRequests: integerValue(row.errors),
+          successRate: requests > 0 ? integerValue(row.success) / requests : 0,
+          totalTokens: totalTokens(row),
           inputTokens: input,
           outputTokens: output,
           cacheReadTokens: cacheRead,

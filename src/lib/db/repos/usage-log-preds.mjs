@@ -5,6 +5,7 @@
  */
 
 import { ignoredErrorSqlList, slaOkErrorSqlList } from '../../admin/error-class.mjs'
+import { addInteger } from '../integers.mjs'
 
 const IGNORED_CODES_SQL = ignoredErrorSqlList()
 const SLA_OK_CODES_SQL = slaOkErrorSqlList()
@@ -23,11 +24,9 @@ export const TOTAL_TOKENS_SQL =
   'COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) + COALESCE(cache_read_tokens, 0) + COALESCE(cache_creation_tokens, 0)'
 
 export function totalTokens(row = {}) {
-  return (
-    (Number(row.input_tokens) || 0) +
-    (Number(row.output_tokens) || 0) +
-    (Number(row.cache_read_tokens) || 0) +
-    (Number(row.cache_creation_tokens) || 0)
+  return [row.input_tokens, row.output_tokens, row.cache_read_tokens, row.cache_creation_tokens].reduce(
+    (sum, value) => addInteger(sum, value),
+    0,
   )
 }
 
