@@ -1,4 +1,5 @@
 import tls from 'node:tls'
+import { normalizeRefreshGrant, normalizeRefreshReceipt } from '../core/node-credential-refresh.mjs'
 import net from 'node:net'
 import { isDeepStrictEqual } from 'node:util'
 import crypto from 'node:crypto'
@@ -91,7 +92,9 @@ export function allocateNodeSlot({ link, grant }) {
     socket.once('secureConnect', () => {
       const pin = socket.getPeerCertificate()?.fingerprint256?.replaceAll(':', '').toLowerCase()
       if (pin !== link.certSha256) return finish(denied())
-      socket.write(`KSG2 ${link.token}\n${JSON.stringify(request)}\n`)
+      socket.write(
+        `KSG2 ${link.token}\n${JSON.stringify(request, (key, value) => (key === 'generation' ? JSON.rawJSON(String(value)) : value))}\n`,
+      )
     })
     socket.on('data', (chunk) => {
       buffer = Buffer.concat([buffer, chunk])
@@ -120,7 +123,12 @@ function managementInvalid() {
 
 function managementFailure(action, sent) {
   return Object.assign(new Error('node management acknowledgement unavailable'), {
-    code: action === 'publish-initial' ? 'node_publication_unconfirmed' : 'node_launch_unconfirmed',
+    code:
+      action === 'credential-refresh'
+        ? 'node_refresh_unconfirmed'
+        : action === 'publish-initial'
+          ? 'node_publication_unconfirmed'
+          : 'node_launch_unconfirmed',
     ...(sent ? { vmOperationUncertain: true } : { vmOperationNotStarted: true }),
   })
 }
@@ -152,7 +160,8 @@ async function commandNodeSlot({ link: linkInput, grant: grantInput, payload: pa
         throw managementInvalid()
       payload = Buffer.from(payloadInput)
     }
-    grant = normalizeNodeManagementGrant(grantInput)
+    grant =
+      action === 'credential-refresh' ? normalizeRefreshGrant(grantInput) : normalizeNodeManagementGrant(grantInput)
     if (
       grant.intent.action !== action ||
       (payload && crypto.createHash('sha256').update(payload).digest('hex') !== grant.intent.payload_digest)
@@ -165,7 +174,7 @@ async function commandNodeSlot({ link: linkInput, grant: grantInput, payload: pa
   const request = {
     op: action,
     vm_id: grant.intent.vm_id,
-    management: grant.intent,
+    [action === 'credential-refresh' ? 'refresh' : 'management']: grant.intent,
     ...(payload ? { content_length: payload.length } : {}),
   }
   return new Promise((resolve, reject) => {
@@ -187,14 +196,16 @@ async function commandNodeSlot({ link: linkInput, grant: grantInput, payload: pa
       else resolve(value)
     }
     const failed = () => finish(managementFailure(action, sent))
-    const timer = setTimeout(failed, 8000)
+    const timer = setTimeout(failed, action === 'credential-refresh' ? 45000 : 8000)
     socket.once('error', failed)
     socket.once('close', failed)
     socket.once('secureConnect', () => {
       const pin = socket.getPeerCertificate()?.fingerprint256?.replaceAll(':', '').toLowerCase()
       if (pin !== link.certSha256) return failed()
       sent = true
-      socket.write(`KSG2 ${link.token}\n${JSON.stringify(request)}\n`)
+      socket.write(
+        `KSG2 ${link.token}\n${JSON.stringify(request, (key, value) => (key === 'generation' ? JSON.rawJSON(String(value)) : value))}\n`,
+      )
       if (payload) socket.write(payload)
     })
     socket.on('data', (chunk) => {
@@ -206,10 +217,16 @@ async function commandNodeSlot({ link: linkInput, grant: grantInput, payload: pa
         const reply = JSON.parse(buffer.subarray(0, newline).toString(), (key, value, context) =>
           key === 'generation' && typeof value === 'number' ? context.source : value,
         )
-        const field = action === 'publish-initial' ? 'publication' : 'launch'
+        const field =
+          action === 'credential-refresh' ? 'refresh' : action === 'publish-initial' ? 'publication' : 'launch'
         exact(reply, ['ok', field])
         if (reply.ok !== true) return failed()
-        finish(null, normalizeNodeManagementReceipt(grant, reply[field]))
+        finish(
+          null,
+          action === 'credential-refresh'
+            ? normalizeRefreshReceipt(grant, reply[field])
+            : normalizeNodeManagementReceipt(grant, reply[field]),
+        )
       } catch {
         failed()
       }
@@ -222,4 +239,8 @@ export function publishNodeSlotInitial(input) {
 }
 export function launchNodeSlot(input) {
   return commandNodeSlot(input, 'launch')
+}
+
+export function refreshNodeSlotCredential(input) {
+  return commandNodeSlot(input, 'credential-refresh')
 }

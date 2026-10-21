@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import { quoteIdentifier, withTransaction } from './database.mjs'
 import { coordinationSchemaFor } from './global-maintenance.mjs'
+import { nodeRefreshAuthorityState } from './node-credential-refresh-authority.mjs'
 
 export function nodeAuthoritySchemaFor(applicationSchema) {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(applicationSchema)) throw new Error('invalid database schema')
@@ -275,11 +276,13 @@ export async function revokeNodeOperationGrants(db, { operationId, ownerId }) {
   const state = await nodeAuthorityState(db)
   if (!state.enabled) return
   const commands = await nodeCommandAuthorityState(db)
+  const refreshes = await nodeRefreshAuthorityState(db)
   const rows = (
     await db.query(
       `SELECT DISTINCT node_id,vm_id FROM (
         SELECT node_id,vm_id FROM ${state.q}.allocations WHERE operation_id=$1 AND owner_id=$2 AND revoked_at IS NULL
         ${commands.enabled ? `UNION ALL SELECT node_id,vm_id FROM ${state.q}.command_grants WHERE operation_id=$1 AND owner_id=$2 AND revoked_at IS NULL` : ''}
+        ${refreshes.enabled ? `UNION ALL SELECT node_id,vm_id FROM ${state.q}.refresh_grants WHERE operation_id=$1 AND owner_id=$2 AND revoked_at IS NULL` : ''}
       ) grants ORDER BY node_id,vm_id`,
       [operationId, ownerId],
     )
@@ -293,6 +296,12 @@ export async function revokeNodeOperationGrants(db, { operationId, ownerId }) {
   if (commands.enabled)
     await db.query(
       `UPDATE ${state.q}.command_grants SET revoked_at=clock_timestamp()
+      WHERE operation_id=$1 AND owner_id=$2 AND revoked_at IS NULL`,
+      [operationId, ownerId],
+    )
+  if (refreshes.enabled)
+    await db.query(
+      `UPDATE ${state.q}.refresh_grants SET revoked_at=clock_timestamp()
       WHERE operation_id=$1 AND owner_id=$2 AND revoked_at IS NULL`,
       [operationId, ownerId],
     )

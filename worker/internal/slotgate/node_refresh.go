@@ -75,6 +75,7 @@ type RefreshReceipt struct {
 }
 type RefreshAuthorizer func(context.Context, RefreshIntent, func() error) error
 type nodeCredentialRefresher struct {
+	boot         string
 	authority    *Authority
 	root         string
 	nodeID       string
@@ -97,7 +98,7 @@ func publicCredential(data []byte, identity credentialIdentity) (PublicCredentia
 	return result, nil
 }
 func (r *nodeCredentialRefresher) Refresh(ctx context.Context, i RefreshIntent) (RefreshReceipt, error) {
-	if r.authorize == nil || i.NodeID != r.nodeID || !validRefreshIntent(i) || i.PolicyDigest != r.policy.digest() {
+	if r.authorize == nil || i.NodeID != r.nodeID || i.Fence.Executor.NodeBootID != r.boot || !validRefreshIntent(i) || i.PolicyDigest != r.policy.digest() {
 		return RefreshReceipt{}, ErrManagementDenied
 	}
 	var state AuthorityState

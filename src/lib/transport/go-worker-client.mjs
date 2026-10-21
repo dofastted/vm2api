@@ -1141,14 +1141,41 @@ export async function workerHealth(exec, { timeoutMs = 3000, signal } = {}) {
 
 export async function ensureWorkerCredential(exec, { force = false, ...refreshOptions } = {}) {
   requireNodeCapability(exec)
-  if (exec?.slotgate != null)
+  if (exec?.slotgate != null) {
+    const health = await workerHealth(exec)
+    const credential = health?.credential
+    if (
+      health.ok !== true ||
+      !credential ||
+      typeof credential.generation !== 'string' ||
+      credential.account_uuid !== (exec.accountId || exec.nodeIdentity?.credential?.account_uuid)
+    )
+      return {
+        ok: false,
+        status: 503,
+        refreshed: false,
+        credentialRefreshNotStarted: true,
+        error: { code: 'slotgate_route_unavailable', message: 'Node credential refresh is unavailable' },
+      }
+    if (!force && credential.has_access === true && credential.needs_refresh === false)
+      return { ok: true, status: 200, refreshed: false, refresh_class: 'already_fresh', credential }
+    const value = await runSlotOauth(exec, 'refresh', {
+      ...refreshOptions,
+      force,
+      expectedGeneration:
+        refreshOptions.expectedGeneration === undefined ? credential.generation : refreshOptions.expectedGeneration,
+    })
     return {
-      ok: false,
-      status: 503,
-      refreshed: false,
-      credentialRefreshNotStarted: true,
-      error: { code: 'slotgate_route_unavailable', message: 'Node credential refresh is not available' },
+      ok: value.ok === true,
+      status: value.status,
+      refreshed: value.body?.refreshed === true,
+      credential: value.body?.credential,
+      ...(value.body?.error ? { error: value.body.error } : {}),
+      ...(value.credentialRefreshUnknown ? { credentialRefreshUnknown: true } : {}),
+      ...(value.credentialRefreshNotStarted ? { credentialRefreshNotStarted: true } : {}),
+      attemptFinished: value.attemptFinished,
     }
+  }
   if (isCrsMock()) {
     return {
       ok: true,

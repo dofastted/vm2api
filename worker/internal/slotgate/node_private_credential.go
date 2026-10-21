@@ -3,6 +3,7 @@ package slotgate
 import (
 	"bytes"
 	"encoding/json"
+	"strconv"
 )
 
 const nodePrivateCredentialAuthority = "node-private-v1"
@@ -18,7 +19,8 @@ func validNodeCredentialState(s *nodeCredentialState) bool {
 		return false
 	}
 	gen, err := credentialScalar(json.RawMessage(s.Generation))
-	return err == nil && gen == s.Generation && gen != "0"
+	n, parseErr := strconv.ParseInt(gen, 10, 64)
+	return err == nil && parseErr == nil && n > 0 && gen == s.Generation
 }
 
 // Only the private canonical document contains the rotating token. The guest

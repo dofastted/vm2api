@@ -28,6 +28,7 @@ var errGateTicketInvalid = errors.New("ticket_invalid")
 // commands continue with one parsed HTTP/1 request and an HTTP response after
 // OK\n. KSG1 raw splicing is never accepted when fenced mode is enabled.
 type gate2Request struct {
+	Refresh          *RefreshIntent    `json:"refresh,omitempty"`
 	Op               string            `json:"op"`
 	VMID             string            `json:"vm_id"`
 	Fence            Fence             `json:"fence"`
@@ -110,6 +111,10 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 		io.WriteString(conn, "ERR bad_request\n")
 		return
 	}
+	if request.Op != "credential-refresh" && request.Refresh != nil {
+		io.WriteString(conn, "ERR bad_request\n")
+		return
+	}
 	if request.Op != "publish-initial" && request.Op != "launch" && (request.Management != nil || request.ContentLength != 0) {
 		io.WriteString(conn, "ERR bad_request\n")
 		return
@@ -128,6 +133,16 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 	reply := map[string]any{"ok": false}
 	var state AuthorityState
 	switch request.Op {
+	case "credential-refresh":
+		if s.refresher == nil || request.Refresh == nil || request.Management != nil || request.Fence != (Fence{}) || request.CommandID != "" || request.Kind != "" || request.Ticket != "" || request.AllocationID != "" || request.OperationID != "" || request.OwnerID != "" || request.ContentLength != 0 || request.Refresh.VMID != request.VMID {
+			err = ErrManagementDenied
+			break
+		}
+		var receipt RefreshReceipt
+		receipt, err = s.refresher.Refresh(ctx, *request.Refresh)
+		if err == nil {
+			reply["refresh"] = receipt
+		}
 	case "health":
 		if err = s.currentBootFence(request.Fence); err != nil {
 			break
@@ -271,7 +286,7 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 		reply["error"] = gate2Code(err)
 	} else {
 		reply["ok"] = true
-		if request.Op != "prepare" && request.Op != "command" && request.Op != "allocate" && request.Op != "publish-initial" && request.Op != "launch" && request.Op != "health" && request.Op != "recovery-status" && request.Op != "seal-not-started" {
+		if request.Op != "prepare" && request.Op != "command" && request.Op != "allocate" && request.Op != "publish-initial" && request.Op != "launch" && request.Op != "health" && request.Op != "recovery-status" && request.Op != "seal-not-started" && request.Op != "credential-refresh" {
 			reply["state"] = publicGateState(state)
 		}
 	}

@@ -27,7 +27,7 @@ func refreshFixture(t *testing.T, handler http.Handler) (*publicationFixture, *n
 	calls := new(atomic.Int64)
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls.Add(1); handler.ServeHTTP(w, r) }))
 	t.Cleanup(provider.Close)
-	r := &nodeCredentialRefresher{authority: f.a, root: f.root, nodeID: f.intent.NodeID, policy: f.l.policy, authorize: func(_ context.Context, _ RefreshIntent, dispatch func() error) error { return dispatch() }, newRefresher: func(store *credential.Store) *kinoauth.Refresher {
+	r := &nodeCredentialRefresher{boot: f.l.boot, authority: f.a, root: f.root, nodeID: f.intent.NodeID, policy: f.l.policy, authorize: func(_ context.Context, _ RefreshIntent, dispatch func() error) error { return dispatch() }, newRefresher: func(store *credential.Store) *kinoauth.Refresher {
 		return &kinoauth.Refresher{Store: store, Client: provider.Client(), TokenURL: provider.URL, MaxTries: 1}
 	}}
 	i := RefreshIntent{Action: "credential-refresh", NodeID: f.intent.NodeID, VMID: "v", AllocationID: f.intent.AllocationID, OperationID: "refresh-operation", OwnerID: "refresh-owner", CommandID: "refresh-command", AccountID: "synthetic-account", BGTaskKey: "oauth-refresh:claude:synthetic-account", BGExecutionID: "refresh-execution", BGOwnerID: "refresh-bg-owner", Epoch: "1", Fence: state.Fence, ExpectedGeneration: "1", ManifestRevision: "1", ManifestDigest: state.InitialManifest.Receipt.ManifestDigest, PresetID: initialPresetID, PolicyDigest: f.l.policy.digest(), Force: true}
@@ -107,5 +107,64 @@ func TestNodeRefreshRequiresPrivateOwnershipAndOriginalActiveFence(t *testing.T)
 	}
 	if calls.Load() != 0 {
 		t.Fatal("denied refresh reached provider")
+	}
+}
+
+func TestNodeRefreshProjectionFailuresRemainUnknown(t *testing.T) {
+	for _, point := range []string{"before-projection", "after-projection"} {
+		t.Run(point, func(t *testing.T) {
+			f, r, i, calls := refreshFixture(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				fmt.Fprint(w, `{"access_token":"synthetic-next","expires_in":3600}`)
+			}))
+			r.fault = func(stage string) error {
+				if stage == point {
+					return errors.New("synthetic projection failure")
+				}
+				return nil
+			}
+			if _, err := r.Refresh(context.Background(), i); err == nil {
+				t.Fatal("partial publication completed")
+			}
+			i.CommandID = "after-partial-publication"
+			if _, err := r.Refresh(context.Background(), i); err == nil {
+				t.Fatal("partial publication allowed another refresh")
+			}
+			state, _ := f.a.State("v")
+			if calls.Load() != 1 || !hasPendingMutation(state) {
+				t.Fatal("partial publication lost its pending attempt")
+			}
+			if _, err := f.a.Revoke("v", i.Fence); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.a.Advance(context.Background(), "v", i.Fence); !errors.Is(err, ErrPendingMutation) {
+				t.Fatal("container termination was allowed to clear a node refresh")
+			}
+		})
+	}
+}
+func TestNodeRefreshCompleteRejectionAllowsLaterOperatorAttempt(t *testing.T) {
+	_, r, i, calls := refreshFixture(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(401)
+		fmt.Fprint(w, `{"error":"invalid_grant"}`)
+	}))
+	for _, id := range []string{"first-rejection", "later-operator-attempt"} {
+		i.CommandID = id
+		receipt, err := r.Refresh(context.Background(), i)
+		if err != nil || receipt.OK || !receipt.Finished || receipt.Credential.Generation != "1" {
+			t.Fatalf("complete rejection: %+v %v", receipt, err)
+		}
+	}
+	if calls.Load() != 2 {
+		t.Fatal("a previous complete rejection permanently suppressed an operator attempt")
+	}
+}
+func TestNodePrivateCredentialStateIsNotMutableThroughSnapshot(t *testing.T) {
+	f := publishingFixture(t)
+	f.publish(t)
+	state, _ := f.a.State("v")
+	state.Credential.Generation = "999"
+	persisted, _ := f.a.State("v")
+	if persisted.Credential.Generation != "1" {
+		t.Fatal("snapshot mutated private authority")
 	}
 }

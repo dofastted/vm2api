@@ -5,6 +5,18 @@ import { getSharedBackgroundTasks } from '../core/shared-background-tasks.mjs'
 import { SharedVmOperations, currentVmOperationIds } from '../vm/shared-vm-operations.mjs'
 
 const services = new WeakMap()
+const refreshAttempts = new AsyncLocalStorage()
+export function currentCredentialRefreshAttempt(db) {
+  const context = refreshAttempts.getStore()
+  if (
+    !context?.active ||
+    context.operation.uncertain ||
+    context.db.schema !== db.schema ||
+    context.db.connectionString !== db.connectionString
+  )
+    return null
+  return context
+}
 const admissionContext = new AsyncLocalStorage()
 
 export async function withRefreshAdmission(db, admission, callback) {
@@ -149,7 +161,12 @@ export class SharedCredentialRefresh {
             let outcome = { finished: true, value: { ok: true } }
             let next = fresh
             if (fresh.generation === expectedGeneration) {
-              outcome = await refresh(fresh)
+              const attempt = { db: this.db, operation, claim, accountId, vmId, active: true }
+              try {
+                outcome = await refreshAttempts.run(attempt, () => refresh(fresh, { operation, claim }))
+              } finally {
+                attempt.active = false
+              }
               if (outcome?.finished !== true) {
                 state.unknown = true
                 return {
@@ -190,7 +207,10 @@ export class SharedCredentialRefresh {
         throw failure('credential_refresh_completion_unconfirmed')
       return result
     } catch (error) {
-      if (acquired) {
+      if (acquired && error.vmOperationNotStarted === true && error.credentialRefreshNotStarted === true) {
+        if (!(await claim.complete({ sharedResult: { ok: false, code: 'refresh_not_started' } })).completed)
+          throw failure('credential_refresh_completion_unconfirmed')
+      } else if (acquired) {
         state.unknown = true
         await claim.markUnknown()
       } else {

@@ -1,9 +1,12 @@
+import { randomUUID } from 'node:crypto'
+import { SlotgateClient } from './slotgate-client.mjs'
+import { NodeCredentialRefreshGrants } from '../cluster/node-credential-refresh-grants.mjs'
 import { spawn } from 'node:child_process'
 import path from 'node:path'
 import { slotHost } from '../vm/slot-host.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
 import { getDb, getActivityCoordinator } from '../db/database.mjs'
-import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { isKubernetesMode, isKubernetesHaMode } from '../core/control-plane-mode.mjs'
 import { getSharedBackgroundTasks } from '../core/shared-background-tasks.mjs'
 import { SharedVmOperations } from '../vm/shared-vm-operations.mjs'
 import { flushVmDbSync } from '../vm/vm-db-sync.mjs'
@@ -101,9 +104,123 @@ function lastJsonLine(stdout) {
 }
 
 export function runSlotOauth(exec, op, options = {}) {
+  if (exec?.slotgate != null) {
+    const db = options.db || getDb()
+    return getSharedBackgroundTasks(db).track(runNodeSlotOauth(db, exec, op, options))
+  }
+  if (isKubernetesHaMode())
+    throw Object.assign(new Error('Node credential capability required'), {
+      code: 'slotgate_capability_required',
+      credentialRefreshNotStarted: true,
+      vmOperationNotStarted: true,
+    })
   if (!isKubernetesMode() || process.env.KIN_CRS_MOCK === '1') return runSlotOauthRaw(exec, op, options)
   const db = options.db || getDb()
   return getSharedBackgroundTasks(db).track(runSharedSlotOauth(db, exec, op, options))
+}
+
+async function runNodeSlotOauth(db, exec, op, options) {
+  if (op !== 'refresh')
+    return {
+      ok: false,
+      status: 503,
+      body: { error: { code: 'slotgate_route_unavailable' } },
+      headers: {},
+      attemptFinished: true,
+      credentialRefreshNotStarted: true,
+      via: 'slotgate',
+    }
+  const client = new SlotgateClient(exec.slotgate)
+  const vmId = client.nodeBinding.vmId
+  const accountId =
+    options.accountId || options.admission?.accountId || exec.accountId || exec.nodeIdentity?.credential?.account_uuid
+  const readCurrent = async () => {
+    const status = await client.health()
+    const credential = status.credential
+    if (
+      status.ok !== true ||
+      !credential ||
+      credential.account_uuid !== accountId ||
+      typeof credential.generation !== 'string'
+    )
+      throw Object.assign(new Error('Node credential identity unavailable'), {
+        code: 'slotgate_identity_unavailable',
+        credentialRefreshNotStarted: true,
+        vmOperationNotStarted: true,
+      })
+    return { credential, generation: credential.generation }
+  }
+  const current = await readCurrent()
+  const grants = new NodeCredentialRefreshGrants(db)
+  const outcome = await getSharedCredentialRefresh(db).run(
+    {
+      platform: 'claude',
+      vmId,
+      accountId,
+      expectedGeneration: options.expectedGeneration === undefined ? current.generation : options.expectedGeneration,
+      admission: options.admission || currentRefreshAdmission(db),
+    },
+    {
+      readCurrent,
+      refresh: async (_old, { operation }) => {
+        const receipt = await grants.refresh(
+          {
+            operation,
+            nodeId: client.nodeBinding.nodeId,
+            vmId,
+            accountId,
+            commandId: randomUUID(),
+            capturedFence: client.nodeBinding.fence,
+            expectedGeneration: _old.generation,
+            force: options.force === true,
+          },
+          client.link,
+        )
+        return {
+          finished: true,
+          value: {
+            ok: receipt.ok,
+            status: receipt.status,
+            body: {
+              refreshed: receipt.refreshed,
+              credential: receipt.credential,
+              ...(!receipt.ok ? { error: { code: receipt.error_code } } : {}),
+            },
+            headers: {},
+            attemptFinished: true,
+            via: 'slotgate',
+          },
+        }
+      },
+      publish: async (_old, value) => {
+        const next = await readCurrent()
+        if (next.generation !== value.body.credential.generation)
+          throw Object.assign(new Error('Node credential publication unconfirmed'), {
+            code: 'credential_projection_stale',
+          })
+        return next
+      },
+    },
+  )
+  if (outcome.unknown)
+    return {
+      ...(outcome.value || failure('credential_refresh_unknown')),
+      attemptFinished: false,
+      credentialRefreshUnknown: true,
+    }
+  if (!outcome.shared) return outcome.value
+  return {
+    ok: outcome.value?.ok === true,
+    status: outcome.value?.ok ? 200 : 400,
+    body: {
+      refreshed: false,
+      credential: outcome.current?.credential,
+      ...(!outcome.value?.ok ? { error: { code: outcome.value?.error || 'credential_refresh_rejected' } } : {}),
+    },
+    headers: {},
+    attemptFinished: true,
+    via: 'slotgate',
+  }
 }
 
 async function runSharedSlotOauth(db, exec, op, options) {

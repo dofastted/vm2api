@@ -54,6 +54,7 @@ var (
 )
 
 type Server struct {
+	refresher        *nodeCredentialRefresher
 	cfg              Config
 	token            [sha256.Size]byte
 	tls              *tls.Config
@@ -140,6 +141,9 @@ func New(cfg Config) (*Server, error) {
 			srv.allocator = &allocationManager{authority: srv.authority, nodeID: cfg.Management.NodeID, authorize: authorizer.Authorize}
 			srv.managementNodeID = cfg.Management.NodeID
 			srv.authorizeCommand = authorizer.AuthorizeCommand
+			if srv.launcher != nil {
+				srv.refresher = &nodeCredentialRefresher{boot: boot, authority: srv.authority, root: cfg.Root, nodeID: cfg.Management.NodeID, policy: *cfg.Launch, authorize: authorizer.AuthorizeRefresh}
+			}
 		}
 	}
 	return srv, nil
