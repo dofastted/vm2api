@@ -120,6 +120,44 @@ test('an outside dependency refuses older-snapshot cleanup without changing eith
   }
 })
 
+for (const included of [true, false]) {
+  test(`restore refuses a cross-schema partition of ${included ? 'an archived' : 'a later'} table before changing either schema`, async () => {
+    const db = getDb()
+    const neighbor = `"${db.schema}_neighbor"`
+    const createParent = 'CREATE TABLE restore_partitioned(id integer) PARTITION BY RANGE(id)'
+    if (included) await db.exec(createParent)
+    await new SettingsRepo(db).set('partition-marker', 'before')
+    const rec = await svc.createBackup()
+    const archive = await svc._extractArchive(rec)
+    try {
+      if (!included) await db.exec(createParent)
+      await new SettingsRepo(db).set('partition-marker', 'after')
+      await db.exec(`CREATE SCHEMA ${neighbor};
+        CREATE TABLE ${neighbor}.sentinel PARTITION OF restore_partitioned FOR VALUES FROM(0) TO(100);
+        INSERT INTO ${neighbor}.sentinel VALUES(17)`)
+      const tables = () =>
+        db
+          .prepare(`
+        SELECT c.relname, c.oid FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE n.nspname=$1 AND c.relkind IN ('r','p') ORDER BY c.relname
+      `)
+          .all(db.schema)
+      const before = await tables()
+      await assert.rejects(
+        db.withMaintenance(() => svc._applyArchive(archive)),
+        /psql failed/,
+      )
+      assert.deepEqual(await tables(), before)
+      assert.equal(await new SettingsRepo(db).get('partition-marker'), 'after')
+      assert.deepEqual(await db.prepare(`SELECT id FROM ${neighbor}.sentinel`).all(), [{ id: 17 }])
+      assert.deepEqual(await db.prepare('SELECT id FROM restore_partitioned').all(), [{ id: 17 }])
+    } finally {
+      await db.exec(`DROP SCHEMA IF EXISTS ${neighbor} CASCADE`)
+      fs.rmSync(archive.tmp, { recursive: true, force: true })
+    }
+  })
+}
+
 test('createBackup produces tar.gz with manifest + db + vms + config, records ok', async () => {
   seedVm()
   await initVmDbSync(root, { watch: false })
