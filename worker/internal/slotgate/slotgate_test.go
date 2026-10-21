@@ -21,7 +21,11 @@ const testToken = "0123456789abcdef0123456789abcdef"
 // Unix socket paths are capped near 104 bytes, so the tree lives in a short /tmp dir.
 func shortRoot(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("/tmp", "ksg")
+	base := os.Getenv("VM2API_SLOTGATE_TEST_ROOT")
+	if base == "" {
+		base = "/tmp"
+	}
+	dir, err := os.MkdirTemp(base, "ksg")
 	if err != nil {
 		t.Fatal(err)
 	}

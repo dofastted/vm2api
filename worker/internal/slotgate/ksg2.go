@@ -28,15 +28,17 @@ var errGateTicketInvalid = errors.New("ticket_invalid")
 // commands continue with one parsed HTTP/1 request and an HTTP response after
 // OK\n. KSG1 raw splicing is never accepted when fenced mode is enabled.
 type gate2Request struct {
-	Op           string `json:"op"`
-	VMID         string `json:"vm_id"`
-	Fence        Fence  `json:"fence"`
-	CommandID    string `json:"command_id,omitempty"`
-	Kind         string `json:"kind,omitempty"`
-	Ticket       string `json:"ticket,omitempty"`
-	AllocationID string `json:"allocation_id,omitempty"`
-	OperationID  string `json:"operation_id,omitempty"`
-	OwnerID      string `json:"owner_id,omitempty"`
+	Op            string            `json:"op"`
+	VMID          string            `json:"vm_id"`
+	Fence         Fence             `json:"fence"`
+	CommandID     string            `json:"command_id,omitempty"`
+	Kind          string            `json:"kind,omitempty"`
+	Ticket        string            `json:"ticket,omitempty"`
+	AllocationID  string            `json:"allocation_id,omitempty"`
+	OperationID   string            `json:"operation_id,omitempty"`
+	OwnerID       string            `json:"owner_id,omitempty"`
+	Management    *ManagementIntent `json:"management,omitempty"`
+	ContentLength int               `json:"content_length,omitempty"`
 }
 
 type gate2State struct {
@@ -98,17 +100,15 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 		return
 	}
 	var request gate2Request
-	decoder := json.NewDecoder(bytes.NewReader(lineBytes))
-	decoder.DisallowUnknownFields()
-	if err = decoder.Decode(&request); err != nil {
-		io.WriteString(conn, "ERR bad_request\n")
-		return
-	}
-	if err = decoder.Decode(new(any)); err != io.EOF {
+	if err = strictJSON(lineBytes, &request); err != nil {
 		io.WriteString(conn, "ERR bad_request\n")
 		return
 	}
 	if !vmIDRe.MatchString(request.VMID) {
+		io.WriteString(conn, "ERR bad_request\n")
+		return
+	}
+	if request.Op != "publish-initial" && request.Op != "launch" && (request.Management != nil || request.ContentLength != 0) {
 		io.WriteString(conn, "ERR bad_request\n")
 		return
 	}
@@ -135,6 +135,10 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 	case "state":
 		state, err = s.authority.State(request.VMID)
 	case "prepare":
+		if managed, e := s.authority.State(request.VMID); e == nil && managed.Allocation != nil && (managed.InitialManifest == nil || request.Kind != "kernel") {
+			err = ErrManagementDenied
+			break
+		}
 		if _, ok := kinds[request.Kind]; !ok {
 			err = ErrInvalidAuthority
 			break
@@ -157,19 +161,36 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 		}
 		err = s.authorizeManagement(ctx, request, func() error { var e error; state, e = s.authority.Advance(ctx, request.VMID, request.Fence); return e })
 	case "launch":
-		if s.authorizeManagement == nil {
+		if s.authorizeCommand == nil || s.managementNodeID == "" {
 			err = ErrManagementDenied
 			break
 		}
-		if s.launcher == nil || request.Kind != "" || request.Ticket != "" {
+		if s.launcher == nil || !s.validManagementRequest(request) || request.ContentLength != 0 {
 			err = ErrInvalidAuthority
 			break
 		}
-		err = s.authorizeManagement(ctx, request, func() error {
-			var e error
-			state, e = s.launcher.Launch(ctx, request.VMID, request.Fence, request.CommandID)
-			return e
-		})
+		var receipt LaunchReceipt
+		receipt, err = s.launcher.LaunchManifest(ctx, *request.Management, s.authorizeCommand)
+		if err == nil {
+			reply["launch"] = receipt
+		}
+	case "publish-initial":
+		if s.authorizeCommand == nil || s.managementNodeID == "" {
+			err = ErrManagementDenied
+			break
+		}
+		if s.publisher == nil || !s.validManagementRequest(request) {
+			err = ErrInvalidAuthority
+			break
+		}
+		publisher := *s.publisher
+		publisher.nodeID = s.managementNodeID
+		publisher.authorize = s.authorizeCommand
+		var receipt PublicationReceipt
+		receipt, err = publisher.Publish(ctx, *request.Management, request.ContentLength, reader)
+		if err == nil {
+			reply["publication"] = receipt
+		}
 	case "command":
 		var handle CommandHandle
 		handle, err = s.forwardHandle(request)
@@ -197,11 +218,16 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 		reply["error"] = gate2Code(err)
 	} else {
 		reply["ok"] = true
-		if request.Op != "prepare" && request.Op != "command" && request.Op != "allocate" {
+		if request.Op != "prepare" && request.Op != "command" && request.Op != "allocate" && request.Op != "publish-initial" && request.Op != "launch" {
 			reply["state"] = publicGateState(state)
 		}
 	}
 	json.NewEncoder(conn).Encode(reply)
+}
+
+func (s *Server) validManagementRequest(request gate2Request) bool {
+	return request.Management != nil && request.Management.Action == request.Op && request.Management.VMID == request.VMID && request.Management.NodeID == s.managementNodeID &&
+		request.Fence == (Fence{}) && request.CommandID == "" && request.Kind == "" && request.Ticket == "" && request.AllocationID == "" && request.OperationID == "" && request.OwnerID == "" && validManagementIntent(*request.Management)
 }
 
 func gate2Ticket(nonce string, request gate2Request) string {
@@ -267,6 +293,20 @@ func (s *Server) forwardFenced(ctx context.Context, conn net.Conn, reader *bufio
 		io.WriteString(conn, "ERR http_request\n")
 		return
 	}
+	state, err := s.authority.State(request.VMID)
+	if err != nil || state.Fence != request.Fence {
+		fmt.Fprint(conn, "ERR fence_mismatch\n")
+		return
+	}
+	if state.Allocation != nil {
+		var envelope map[string]json.RawMessage
+		var id string
+		if state.InitialManifest == nil || s.launcher == nil || request.Kind != "kernel" || req.Method != http.MethodPost || req.URL.Path != "/internal/v1/messages" || req.URL.RawQuery != "" ||
+			strictJSON(body, &envelope) != nil || json.Unmarshal(envelope["request_id"], &id) != nil || id != request.CommandID {
+			fmt.Fprint(conn, "ERR management_denied\n")
+			return
+		}
+	}
 	req.Body = io.NopCloser(bytes.NewReader(body))
 	req.ContentLength = int64(len(body))
 	req.TransferEncoding = nil
@@ -278,6 +318,14 @@ func (s *Server) forwardFenced(ctx context.Context, conn net.Conn, reader *bufio
 	conn.SetDeadline(time.Time{})
 	var target net.Conn
 	err = s.authority.DispatchCommand(handle, func(ExecutorIdentity) error {
+		if state.Allocation != nil {
+			token, e := readPublishedInitial(s.cfg.Root, request.VMID, request.Fence, s.launcher.policy, *state.InitialManifest, false)
+			if e != nil {
+				return e
+			}
+			req.Header.Set("x-kin-internal-token", token)
+			req.Header.Set("x-internal-token", token)
+		}
 		var dialErr error
 		// The incarnation has a private socket namespace. No fallback to run/.
 		socket := filepath.Join(s.cfg.Root, "vms", request.VMID, "incarnations", request.Fence.Incarnation, "run", kinds[request.Kind])

@@ -87,6 +87,8 @@ type CommandRecord struct {
 	Dispatched    bool                `json:"dispatched"`
 	TerminationID string              `json:"termination_id,omitempty"`
 	LaunchTarget  *DockerLaunchTarget `json:"launch_target,omitempty"`
+	Management    *ManagementIntent   `json:"management,omitempty"`
+	LaunchReceipt *LaunchReceipt      `json:"launch_receipt,omitempty"`
 }
 
 // DockerLaunchTarget is recorded after create returns and before start. A
@@ -101,6 +103,7 @@ type DockerLaunchTarget struct {
 
 type AuthorityState struct {
 	Allocation      *AllocationReceipt       `json:"allocation,omitempty"`
+	InitialManifest *initialManifest         `json:"initial_manifest,omitempty"`
 	Fence           Fence                    `json:"fence"`
 	Phase           AuthorityPhase           `json:"phase"`
 	Commands        map[string]CommandRecord `json:"commands"`
@@ -464,9 +467,15 @@ func (a *Authority) BindExecutor(handle CommandHandle, executor ExecutorIdentity
 		}
 	}
 	command.Status = CommandCompleted
-	state.Commands[handle.ID] = command
 	state.Fence.Executor = executor
 	state.Phase = PhaseActive
+	if intent := command.Management; intent != nil {
+		if state.InitialManifest == nil || intent.Action != "launch" || state.InitialManifest.Receipt.ManifestDigest != intent.ManifestDigest {
+			return AuthorityState{}, ErrInvalidAuthority
+		}
+		command.LaunchReceipt = &LaunchReceipt{Intent: *intent, IntentDigest: intent.digest(), ManifestRevision: "1", ManifestDigest: intent.ManifestDigest, Fence: state.Fence}
+	}
+	state.Commands[handle.ID] = command
 	return a.commit(handle.VMID, state)
 }
 
@@ -485,7 +494,7 @@ func (a *Authority) CompleteCommand(handle CommandHandle) error {
 	if command.Status != CommandPending {
 		return ErrCommandOwner
 	}
-	if command.Kind == commandLaunch && command.Dispatched {
+	if command.Kind == commandPublish || (command.Kind == commandLaunch && command.Dispatched) {
 		return ErrAuthorityPhase
 	}
 	command.Status = CommandCompleted
@@ -666,12 +675,24 @@ func (a *Authority) persist(next authorityJournal) error {
 }
 
 func cloneState(state AuthorityState) AuthorityState {
+	if state.InitialManifest != nil {
+		manifest := *state.InitialManifest
+		state.InitialManifest = &manifest
+	}
 	if state.Allocation != nil {
 		receipt := *state.Allocation
 		state.Allocation = &receipt
 	}
 	commands := make(map[string]CommandRecord, len(state.Commands))
 	for id, command := range state.Commands {
+		if command.Management != nil {
+			intent := *command.Management
+			command.Management = &intent
+		}
+		if command.LaunchReceipt != nil {
+			receipt := *command.LaunchReceipt
+			command.LaunchReceipt = &receipt
+		}
 		if command.LaunchTarget != nil {
 			target := *command.LaunchTarget
 			command.LaunchTarget = &target
@@ -759,6 +780,9 @@ func validateJournal(journal authorityJournal) error {
 		return ErrInvalidAuthority
 	}
 	for vm, state := range journal.Slots {
+		if err := validateInitialManifest(vm, state); err != nil {
+			return err
+		}
 		if receipt := state.Allocation; receipt != nil {
 			if journal.Management != nil && receipt.NodeID != journal.Management.NodeID {
 				return ErrInvalidAuthority
@@ -787,8 +811,29 @@ func validateJournal(journal authorityJournal) error {
 			if id != command.ID || !validAuthorityID(id) || !validAuthorityID(command.Runtime) || !validAuthorityID(command.Token) || command.Fence.Generation == 0 || command.Fence.Generation > state.Fence.Generation || !validAuthorityID(command.Fence.Incarnation) {
 				return ErrInvalidAuthority
 			}
-			if command.Kind != CommandForward && command.Kind != CommandMutation && command.Kind != commandLaunch {
+			if command.Kind != CommandForward && command.Kind != CommandMutation && command.Kind != commandLaunch && command.Kind != commandPublish {
 				return ErrInvalidAuthority
+			}
+			if command.Kind == commandPublish && command.Management == nil {
+				return ErrInvalidAuthority
+			}
+			if command.Kind == commandPublish && command.Status == CommandCompleted && state.InitialManifest == nil {
+				return ErrInvalidAuthority
+			}
+			if intent := command.Management; intent != nil {
+				if !validManagementIntent(*intent) || intent.VMID != vm || intent.CommandID != id || intent.Fence != command.Fence ||
+					(command.Kind == commandPublish && intent.Action != "publish-initial") ||
+					(command.Kind == commandLaunch && intent.Action != "launch") ||
+					(command.Kind != commandPublish && command.Kind != commandLaunch) {
+					return ErrInvalidAuthority
+				}
+			}
+			if receipt := command.LaunchReceipt; receipt != nil {
+				if command.Management == nil || receipt.Intent != *command.Management || receipt.IntentDigest != receipt.Intent.digest() ||
+					receipt.ManifestRevision != "1" || receipt.ManifestDigest != receipt.Intent.ManifestDigest || command.Kind != commandLaunch ||
+					command.Status != CommandCompleted || receipt.Fence.Generation != command.Fence.Generation || receipt.Fence.Incarnation != command.Fence.Incarnation || validateExecutor(receipt.Fence.Executor) != nil {
+					return ErrInvalidAuthority
+				}
 			}
 			if command.Status != CommandPending && command.Status != CommandUnknown && command.Status != CommandCompleted && command.Status != CommandTerminated {
 				return ErrInvalidAuthority

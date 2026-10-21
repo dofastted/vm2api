@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -95,45 +96,63 @@ func (f *fakeLaunchEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func launchFixture(t *testing.T) (*Authority, *dockerLauncher, *fakeLaunchEngine, AuthorityState, string) {
+	return launchFixtureConfigured(t, true, "none")
+}
+
+func launchFixtureConfigured(t *testing.T, published bool, network string) (*Authority, *dockerLauncher, *fakeLaunchEngine, AuthorityState, string) {
 	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skip("initial publication requires Linux descriptor-relative file operations")
+	}
 	root := shortRoot(t)
 	boot, err := nodeBootID()
 	if err != nil {
 		t.Fatal(err)
 	}
 	a := authorityForTest(t, filepath.Join(root, "authority"), terminatedExecutor)
-	state, err := a.CreateSlot("v")
+	allocation, err := a.Allocate(AllocationIntent{NodeID: "node-test", VMID: "v", AllocationID: "allocation-test", OperationID: "allocation-operation", OwnerID: "allocation-owner"}, "1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	policy := DockerLaunchPolicy{ImageID: "sha256:" + strings.Repeat("b", 64), NetworkID: "none", UID: os.Getuid(), GID: os.Getgid()}
+	state, _ := a.State("v")
+	policy := DockerLaunchPolicy{ImageID: "sha256:" + strings.Repeat("b", 64), NetworkID: network, UID: os.Getuid(), GID: os.Getgid()}
 	if policy.UID == 0 {
 		policy.UID = 10000
 		policy.GID = 10000
 	}
 	private := filepath.Join(root, "vms", "v", "incarnations", state.Fence.Incarnation)
-	for _, dir := range []string{"config", "run", "home", "claude"} {
-		if err = os.MkdirAll(filepath.Join(private, dir), 0o700); err != nil {
+	if !published {
+		for _, dir := range []string{"config", "run", "home", "claude"} {
+			if err = os.MkdirAll(filepath.Join(private, dir), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if dir != "config" && policy.UID != os.Geteuid() {
+				if err = os.Chown(filepath.Join(private, dir), policy.UID, policy.GID); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		for _, file := range []string{"kernel.json", "internal.token"} {
+			if err = os.WriteFile(filepath.Join(private, "config", file), []byte("synthetic-only"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if policy.UID != os.Geteuid() {
+				if err = os.Chown(filepath.Join(private, "config", file), os.Geteuid(), policy.GID); err != nil {
+					t.Fatal(err)
+				}
+				if err = os.Chmod(filepath.Join(private, "config", file), 0o640); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	} else {
+		payload := []byte(`{"credential":{"type":"oauth","access_token":"synthetic-access","refresh_token":"synthetic-refresh"}}`)
+		intent := publicationIntentForTest(allocation, policy, payload)
+		publisher := initialPublisher{authority: a, root: root, nodeID: allocation.NodeID, policy: policy, authorize: allowNodeCommandForTest}
+		if _, err = publisher.Publish(context.Background(), intent, len(payload), strings.NewReader(string(payload))); err != nil {
 			t.Fatal(err)
 		}
-		if dir != "config" && policy.UID != os.Geteuid() {
-			if err = os.Chown(filepath.Join(private, dir), policy.UID, policy.GID); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	for _, file := range []string{"kernel.json", "internal.token"} {
-		if err = os.WriteFile(filepath.Join(private, "config", file), []byte("synthetic-only"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		if policy.UID != os.Geteuid() {
-			if err = os.Chown(filepath.Join(private, "config", file), os.Geteuid(), policy.GID); err != nil {
-				t.Fatal(err)
-			}
-			if err = os.Chmod(filepath.Join(private, "config", file), 0o640); err != nil {
-				t.Fatal(err)
-			}
-		}
+		state, _ = a.State("v")
 	}
 	fake := &fakeLaunchEngine{image: policy.ImageID, container: strings.Repeat("c", 64), startedAt: "2026-10-21T01:00:00Z"}
 	socket := filepath.Join(shortRoot(t), "docker.sock")
@@ -393,7 +412,7 @@ func TestKSG2LaunchCreatesAndBindsWithNodePolicyAndRejectsRawSpec(t *testing.T) 
 	if err := a.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s, err := New(Config{Listen: "127.0.0.1:0", Root: root, Token: testToken, TLSDir: filepath.Join(root, "tls"), Fenced: true, AuthorityDir: filepath.Join(root, "authority"), DockerSocket: engine.socket, Launch: &launcher.policy})
+	s, err := New(Config{Listen: "127.0.0.1:0", Root: root, Token: testToken, TLSDir: filepath.Join(root, "tls"), Fenced: true, AuthorityDir: filepath.Join(root, "authority"), DockerSocket: engine.socket, Launch: &launcher.policy, Management: managementConfigForTest()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -428,18 +447,22 @@ func TestKSG2LaunchCreatesAndBindsWithNodePolicyAndRejectsRawSpec(t *testing.T) 
 	if count != 0 {
 		t.Fatal("raw spec reached Engine")
 	}
-	s.authorizeManagement = func(_ context.Context, _ gate2Request, dispatch func() error) error { return dispatch() }
-	reply := gate2Control(t, ln.Addr().String(), gate2Request{Op: "launch", VMID: "v", Fence: state.Fence, CommandID: "trusted-node-launch"})
-	if !reply.OK || reply.State == nil || reply.State.Phase != PhaseActive || reply.State.Fence.Executor.ContainerID != engine.container {
+	s.authorizeCommand = allowNodeCommandForTest
+	intent := launchIntentForTest(state, "trusted-node-launch")
+	reply := gate2Control(t, ln.Addr().String(), gate2Request{Op: "launch", VMID: "v", Management: &intent})
+	if !reply.OK {
 		t.Fatalf("KSG2 launch: %+v", reply)
+	}
+	active, _ := s.authority.State("v")
+	if active.Phase != PhaseActive || active.Fence.Executor.ContainerID != engine.container {
+		t.Fatalf("KSG2 active: %+v", active)
 	}
 }
 
 func TestDockerLaunchChecksFixedBridgeNetworkBeforeCreate(t *testing.T) {
 	for _, driver := range []string{"bridge", "host"} {
 		t.Run(driver, func(t *testing.T) {
-			_, launcher, engine, state, _ := launchFixture(t)
-			launcher.policy.NetworkID = strings.Repeat("e", 64)
+			_, launcher, engine, state, _ := launchFixtureConfigured(t, true, strings.Repeat("e", 64))
 			engine.networkDriver = driver
 			_, err := launcher.Launch(context.Background(), "v", state.Fence, "fixed-network")
 			if driver == "bridge" {

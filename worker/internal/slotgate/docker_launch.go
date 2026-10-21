@@ -61,6 +61,32 @@ func newDockerLauncher(socket, root, boot string, a *Authority, policy DockerLau
 }
 
 func (l *dockerLauncher) Launch(ctx context.Context, vm string, expected Fence, id string) (AuthorityState, error) {
+	return l.launch(ctx, vm, expected, id, nil)
+}
+
+func (l *dockerLauncher) LaunchManifest(ctx context.Context, intent ManagementIntent, authorize CommandAuthorizer) (LaunchReceipt, error) {
+	if authorize == nil {
+		return LaunchReceipt{}, ErrManagementDenied
+	}
+	if !validManagementIntent(intent) || intent.Action != "launch" || intent.PolicyDigest != l.policy.digest() {
+		return LaunchReceipt{}, ErrInvalidAuthority
+	}
+	state, err := l.launch(ctx, intent.VMID, intent.Fence, intent.CommandID, func() (CommandHandle, error) {
+		var handle CommandHandle
+		err := authorize(ctx, intent, func() error { var e error; handle, e = l.authority.beginManifestLaunch(intent); return e })
+		return handle, err
+	})
+	if err != nil {
+		return LaunchReceipt{}, err
+	}
+	command := state.Commands[intent.CommandID]
+	if command.LaunchReceipt == nil {
+		return LaunchReceipt{}, ErrAuthorityUnavailable
+	}
+	return *command.LaunchReceipt, nil
+}
+
+func (l *dockerLauncher) launch(ctx context.Context, vm string, expected Fence, id string, accept func() (CommandHandle, error)) (AuthorityState, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	state, err := l.authority.State(vm)
@@ -78,6 +104,12 @@ func (l *dockerLauncher) Launch(ctx context.Context, vm string, expected Fence, 
 	}
 	if !validAuthorityID(id) {
 		return AuthorityState{}, ErrInvalidAuthority
+	}
+	if err = checkInitialManifest(state, l.policy); err != nil {
+		return AuthorityState{}, err
+	}
+	if _, err = readPublishedInitial(l.root, vm, expected, l.policy, *state.InitialManifest, true); err != nil {
+		return AuthorityState{}, err
 	}
 	if err = l.privateFiles(vm, expected); err != nil {
 		return AuthorityState{}, err
@@ -116,7 +148,12 @@ func (l *dockerLauncher) Launch(ctx context.Context, vm string, expected Fence, 
 			return AuthorityState{}, ErrInvalidAuthority
 		}
 	}
-	handle, err := l.authority.BeginLaunch(vm, expected, id)
+	var handle CommandHandle
+	if accept != nil {
+		handle, err = accept()
+	} else {
+		handle, err = l.authority.BeginLaunch(vm, expected, id)
+	}
 	if err != nil {
 		return AuthorityState{}, err
 	}

@@ -54,14 +54,17 @@ var (
 )
 
 type Server struct {
-	cfg       Config
-	token     [sha256.Size]byte
-	tls       *tls.Config
-	slots     chan struct{}
-	wg        sync.WaitGroup
-	authority *Authority
-	launcher  *dockerLauncher
-	allocator *allocationManager
+	cfg              Config
+	token            [sha256.Size]byte
+	tls              *tls.Config
+	slots            chan struct{}
+	wg               sync.WaitGroup
+	authority        *Authority
+	launcher         *dockerLauncher
+	allocator        *allocationManager
+	publisher        *initialPublisher
+	authorizeCommand CommandAuthorizer
+	managementNodeID string
 	// Internal injection for trusted adapters/tests. Config alone never grants
 	// unimplemented network mutations to a holder of the forwarding token.
 	authorizeManagement func(context.Context, gate2Request, func() error) error
@@ -124,6 +127,7 @@ func New(cfg Config) (*Server, error) {
 				srv.authority.Close()
 				return nil, err
 			}
+			srv.publisher = &initialPublisher{authority: srv.authority, root: cfg.Root, policy: *cfg.Launch}
 		}
 		if cfg.Management != nil {
 			authorizer, authErr := newPGAllocationAuthorizer(*cfg.Management)
@@ -132,6 +136,8 @@ func New(cfg Config) (*Server, error) {
 				return nil, authErr
 			}
 			srv.allocator = &allocationManager{authority: srv.authority, nodeID: cfg.Management.NodeID, authorize: authorizer.Authorize}
+			srv.managementNodeID = cfg.Management.NodeID
+			srv.authorizeCommand = authorizer.AuthorizeCommand
 		}
 	}
 	return srv, nil
