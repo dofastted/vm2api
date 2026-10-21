@@ -71,6 +71,44 @@ test('runCodexKernelHop does not retry after SSE has started', async () => {
   assert.equal(result.transport_retried, undefined)
 })
 
+for (const execution of [
+  undefined,
+  { requestId: 'pending-codex-job', started: true, ended: false, reason: 'transport_error' },
+]) {
+  test(`shared Codex ${execution ? 'unfinished' : 'missing'} execution metadata prevents a transport retry`, async () => {
+    let jobs = 0
+    const result = await runCodexKernelHop({
+      sharedExecution: true,
+      hop: async () => {
+        jobs++
+        return { ok: false, status: 502, body: { error: { code: 'upstream_transport' } }, execution }
+      },
+    })
+    assert.equal(jobs, 1, 'an unconfirmed execution must not be submitted twice')
+    assert.equal(result.transport_retried, undefined)
+  })
+}
+
+test('shared Codex retries use distinct durable job IDs after confirmed EOF', async () => {
+  const ids = []
+  await runCodexKernelHop({
+    sharedExecution: true,
+    args: { requestId: 'fixed-first-codex-job' },
+    hop: async ({ requestId }) => {
+      ids.push(requestId)
+      return {
+        ok: ids.length > 1,
+        status: ids.length > 1 ? 200 : 502,
+        body: { error: { code: 'upstream_transport' } },
+        execution: { requestId, started: true, ended: true, reason: 'eof' },
+      }
+    },
+  })
+  assert.equal(ids.length, 2)
+  assert.equal(ids[0], 'fixed-first-codex-job')
+  assert.notEqual(ids[1], ids[0])
+})
+
 function writeGptVm(root, id) {
   const dir = path.join(root, 'vms')
   fs.mkdirSync(path.join(dir, id), { recursive: true })
