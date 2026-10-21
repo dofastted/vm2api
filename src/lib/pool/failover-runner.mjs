@@ -803,6 +803,9 @@ export class FailoverRunner {
         let policy
         let committed = false
         let hopNoted = false
+        let callEntered = false
+        let executionEnded = false
+        let unknownExecution = false
         const noteHop = (value) => {
           if (hopNoted) return
           hopNoted = true
@@ -844,6 +847,7 @@ export class FailoverRunner {
               },
             )
           }
+          callEntered = true
           result = await callAttempt({
             candidate: selected,
             body,
@@ -856,6 +860,12 @@ export class FailoverRunner {
               committed = true
             },
           })
+          executionEnded = result?.execution?.ended === true
+          if (selected.bindExecution && !executionEnded) {
+            await selected.markUncertain()
+            unknownExecution = true
+            if (result) result.executionUncertain = true
+          }
           noteHop(result)
           if (result) result.committed = result.committed || committed
           if (signal?.aborted || isClientCancelledResult(result)) {
@@ -923,6 +933,8 @@ export class FailoverRunner {
           if (typeof onAttempt === 'function') {
             await onAttempt({ attemptNo, selected, result, policy })
           }
+          if (unknownExecution)
+            return incompleteHopResult(result, policy, { ...attribution(), executionUncertain: true })
           if (policy.reason === 'content_filter_refusal' || policy.reason === 'usage_policy_refusal') {
             this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
             bindAll({ accountId: selected.accountId, vmId: selected.vmId })
@@ -986,6 +998,13 @@ export class FailoverRunner {
           }
           budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
         } catch (error) {
+          // A submitted job can outlive its transport. Never replay it or free
+          // its shared capacity without proof that the execution ended.
+          if (selected.bindExecution && callEntered) {
+            if (executionEnded) throw error
+            if (!unknownExecution) await selected.markUncertain()
+            unknownExecution = true
+          }
           const invalidCache = error?.status === 400 && error.body?.error?.code === 'invalid_cache_control'
           noteHop(invalidCache ? { upstreamExecutions: 0 } : null)
           if (error?.code === 'response_sent') {
@@ -1035,10 +1054,16 @@ export class FailoverRunner {
               terminalState: 'cancelled',
               latencyMs: Date.now() - attemptStarted,
             })
-            return { ...clientCancelledResult({ committed }), via: 'pool-failover', ...attribution() }
+            return {
+              ...clientCancelledResult({ committed }),
+              ...(unknownExecution ? { executionUncertain: true } : {}),
+              via: 'pool-failover',
+              ...attribution(),
+            }
           }
           result = {
             ok: false,
+            ...(unknownExecution ? { executionUncertain: true } : {}),
             status: 0,
             transportError: true,
             committed,
@@ -1076,7 +1101,7 @@ export class FailoverRunner {
             terminalState: result.terminalState,
             latencyMs: Date.now() - attemptStarted,
           })
-          if (committed || !shouldContinue(policy)) {
+          if (unknownExecution || committed || !shouldContinue(policy)) {
             return { ...result, ...attribution(), finalState: result.terminalState, policy }
           }
           applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })

@@ -52,6 +52,7 @@ for (const execution of [undefined, { requestId: 'job-1', started: true, ended: 
       }),
     )
     assert.equal(result.ok, false)
+    assert.equal(result.executionUncertain, true)
     assert.deepEqual(events, ['select', 'call', 'uncertain', 'release'])
   })
 }
@@ -65,6 +66,7 @@ test('an exception after entering a shared execution retains capacity and stops 
     }),
   )
   assert.equal(result.ok, false)
+  assert.equal(result.executionUncertain, true)
   assert.deepEqual(events, ['select', 'call', 'uncertain', 'release'])
 })
 

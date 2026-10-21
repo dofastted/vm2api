@@ -449,6 +449,8 @@ export function createHandleProtocol(deps) {
     const assembler = createClaudeMessageAssembler()
     const workerResult = await dispatchStreamInference({
       exec: candidate.exec,
+      onExecutionStart: candidate.bindExecution,
+      onExecutionEnd: candidate.completeExecution,
       body,
       reqHeaders,
       timeoutMs,
@@ -486,7 +488,7 @@ export function createHandleProtocol(deps) {
       }
       throw error
     } finally {
-      if (!admission.lease?.billingFailed) await admission.lease?.release?.()
+      if (!admission.lease?.billingFailed && !admission.lease?.executionUncertain) await admission.lease?.release?.()
     }
   }
 
@@ -1539,6 +1541,8 @@ export function createHandleProtocol(deps) {
           try {
             return await dispatchStreamInference({
               exec: candidate.exec,
+              onExecutionStart: candidate.bindExecution,
+              onExecutionEnd: candidate.completeExecution,
               cacheTtl,
               preserveCacheBreakpoints,
               cliHop: attemptMeta?.cliHop === true,
@@ -1597,6 +1601,7 @@ export function createHandleProtocol(deps) {
           }
         },
       })
+      if (result?.executionUncertain && admission.lease?.shared) admission.lease.executionUncertain = true
     } finally {
       anthropicKeepalive?.stop()
       clientAbort.settle()
