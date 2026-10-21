@@ -81,6 +81,7 @@ export async function fakeSlotgate(t, options = {}) {
       const held = commands.get(command.command_id)
       if (!held || held.ticket !== command.ticket) return socket.end('ERR ticket_invalid\n')
       held.envelope = envelope
+      held.headers = headers
       options.onForward?.(command, envelope)
       if (options.hold) return
       const payload = options.body || JSON.stringify(assistant)

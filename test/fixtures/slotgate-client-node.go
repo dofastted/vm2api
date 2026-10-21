@@ -47,6 +47,11 @@ func main() {
 	unix, err := net.Listen("unix", filepath.Join(run, "kernel.sock"))
 	check(err)
 	kernel := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Kin-Internal-Token") != "synthetic-kernel-internal-token" || r.Header.Get("X-Internal-Token") != "synthetic-kernel-internal-token" {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, `{"type":"error","error":{"code":"internal_unauthorized"}}`)
+			return
+		}
 		var envelope struct {
 			Body struct {
 				Mode string `json:"mode"`

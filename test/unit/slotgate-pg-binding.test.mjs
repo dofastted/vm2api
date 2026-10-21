@@ -111,7 +111,7 @@ test('the actual Go KSG2 node persists normal completion but retains an internal
     const lease = await first.tryReserve(candidate)
     assert.equal(lease.ok, true)
     const result = await callGoWorker({
-      exec: { vmId: config.vmId, slotgate: config },
+      exec: { vmId: config.vmId, slotgate: config, vm: { runtime: { worker_token_file: config.kernelTokenFile } } },
       envelope: { body: { mode } },
       onExecutionStart: lease.bindExecution,
     })

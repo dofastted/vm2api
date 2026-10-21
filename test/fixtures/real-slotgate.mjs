@@ -31,6 +31,8 @@ export async function realSlotgate(t) {
   })
   const runtime = path.join(root, 'runtime')
   fs.mkdirSync(runtime, { mode: 0o700 })
+  const kernelTokenFile = path.join(runtime, 'internal.token')
+  fs.writeFileSync(kernelTokenFile, 'synthetic-kernel-internal-token\n', { mode: 0o600 })
   process = spawn(binary, [runtime], { stdio: ['ignore', 'pipe', 'pipe'] })
   exited = once(process, 'exit')
   return new Promise((resolve, reject) => {
@@ -45,7 +47,7 @@ export async function realSlotgate(t) {
       const newline = buffer.indexOf('\n')
       if (newline < 0) return
       clearTimeout(timer)
-      try { resolve(JSON.parse(buffer.slice(0, newline))) } catch (error) { reject(error) }
+      try { resolve({ ...JSON.parse(buffer.slice(0, newline)), kernelTokenFile }) } catch (error) { reject(error) }
     })
   })
 }
