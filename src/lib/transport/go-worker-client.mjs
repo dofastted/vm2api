@@ -1142,6 +1142,14 @@ export async function workerHealth(exec, { timeoutMs = 3000, signal } = {}) {
 export async function ensureWorkerCredential(exec, { force = false, ...refreshOptions } = {}) {
   requireNodeCapability(exec)
   if (exec?.slotgate != null) {
+    if (!exec.accountId && !exec.nodeIdentity?.credential?.account_uuid)
+      return {
+        ok: false,
+        status: 503,
+        refreshed: false,
+        credentialRefreshNotStarted: true,
+        error: { code: 'slotgate_route_unavailable', message: 'Node credential identity is required' },
+      }
     const health = await workerHealth(exec)
     const credential = health?.credential
     if (
