@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { setTimeout as delay } from 'node:timers/promises'
+import pg from 'pg'
 import { createDatabase, getDb, quoteIdentifier } from '../../src/lib/db/database.mjs'
 
 async function fixture(t, { acknowledge = true } = {}) {
@@ -16,7 +17,13 @@ async function fixture(t, { acknowledge = true } = {}) {
   t.after(async () => {
     await Promise.allSettled(operations.map((operation) => operation.close()))
     await Promise.allSettled([first.stop(), second.stop()])
-    await db.pool.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`)
+    const cleanup = new pg.Client({ connectionString: db.connectionString })
+    await cleanup.connect()
+    try {
+      await cleanup.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(schema)} CASCADE`)
+    } finally {
+      await cleanup.end()
+    }
   })
   await first.start()
   await second.start()
