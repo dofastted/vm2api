@@ -89,9 +89,18 @@ export async function importSqlite({ source, db }) {
       await db.query('SELECT pg_advisory_xact_lock(hashtext(current_database()),hashtext($1))', [
         `vm2api:sqlite-import:${db.schema}`,
       ])
-      await db.exec(`LOCK TABLE ${expected.map(q).join(',')} IN ACCESS EXCLUSIVE MODE`)
-      for (const table of expected) {
-        const count = (await db.prepare(`SELECT count(*) AS n FROM ${q(table)}`).get()).n
+      const targetTables = (
+        await db
+          .prepare(`
+        SELECT tablename FROM pg_tables
+        WHERE schemaname = $1 AND tablename <> 'schema_migrations' ORDER BY tablename
+      `)
+          .all(db.schema)
+      ).map((row) => row.tablename)
+      const targetName = (table) => `${q(db.schema)}.${q(table)}`
+      await db.exec(`LOCK TABLE ${targetTables.map(targetName).join(',')} IN ACCESS EXCLUSIVE MODE`)
+      for (const table of targetTables) {
+        const count = (await db.prepare(`SELECT count(*) AS n FROM ${targetName(table)}`).get()).n
         if (table === 'groups') {
           const rows = await db.prepare('SELECT * FROM groups ORDER BY id').all()
           const seedCols = columns(template, 'groups')

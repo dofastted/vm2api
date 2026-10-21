@@ -34,7 +34,7 @@ after(async () => {
 test('PostgreSQL baseline includes business and historical tables and default groups', async () => {
   const db = await database()
   const rows = await db.prepare('SELECT table_name FROM information_schema.tables WHERE table_schema=$1').all(db.schema)
-  assert.equal(rows.length, 30)
+  assert.equal(rows.length, 31)
   for (const name of [
     'settings',
     'users',
@@ -44,6 +44,7 @@ test('PostgreSQL baseline includes business and historical tables and default gr
     'thinking_signature_owners',
     'accounts_legacy',
     'panel_users_legacy',
+    'panel_sessions',
   ]) {
     assert.ok(
       rows.some((r) => r.table_name === name),
@@ -104,23 +105,27 @@ test('concurrent initialization serializes migrations and checksums are enforced
   const opts = options()
   const [a, b] = await Promise.all([createDatabase(opts), createDatabase(opts)])
   dbs.push(a, b)
-  assert.equal((await a.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 1)
+  assert.equal((await a.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 2)
   await a.prepare("UPDATE schema_migrations SET checksum='invalid'").run()
   await assert.rejects(applyMigrations(b), /checksum mismatch/)
 })
 
 test('failed migrations rollback DDL and migration records', async () => {
   const dir = fs.mkdtempSync('/tmp/vm2api-pg-migrations-')
-  fs.writeFileSync(dir + '/002_bad.sql', 'CREATE TABLE partial_write(id text); INVALID SQL;')
+  fs.writeFileSync(dir + '/003_bad.sql', 'CREATE TABLE partial_write(id text); INVALID SQL;')
   const db = await database()
   await assert.rejects(applyMigrations(db, { migrationsDir: dir }), /unknown PostgreSQL migration/)
   fs.copyFileSync(
     new URL('../../src/lib/db/postgres-migrations/001_baseline.sql', import.meta.url),
     dir + '/001_baseline.sql',
   )
-  await assert.rejects(applyMigrations(db, { migrationsDir: dir }), /002_bad.sql failed/)
+  fs.copyFileSync(
+    new URL('../../src/lib/db/postgres-migrations/002_control_plane_sessions.sql', import.meta.url),
+    dir + '/002_control_plane_sessions.sql',
+  )
+  await assert.rejects(applyMigrations(db, { migrationsDir: dir }), /003_bad.sql failed/)
   assert.equal((await db.prepare('SELECT to_regclass($1) AS name').get(db.schema + '.partial_write')).name, null)
-  assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 1)
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 2)
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
