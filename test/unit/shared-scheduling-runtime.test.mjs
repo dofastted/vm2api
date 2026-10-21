@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createDatabase, getDb } from '../../src/lib/db/database.mjs'
 import { SchedulingRuntime } from '../../src/lib/pool/scheduling-runtime.mjs'
+import { AccountsRepo } from '../../src/lib/db/repos/accounts-repo.mjs'
 
 function deferred() {
   let resolve
@@ -21,6 +22,16 @@ async function pair(t, seed = {}) {
   const right = await new SchedulingRuntime(other).init()
   return { left, right, stored: () => left.persistence.get('runtime-account') }
 }
+
+test('an existing account without a VM can acquire its initial runtime binding from observation context', async () => {
+  const db = getDb()
+  await new AccountsRepo(db).insert({ account_id: 'unbound-runtime-account' })
+  const runtime = await new SchedulingRuntime(db).init()
+  runtime.updateWindow('unbound-runtime-account', { vmId: 'vm-initial', sessionWindowStatus: 'allowed' })
+  await runtime.flush()
+  assert.equal((await runtime.persistence.get('unbound-runtime-account')).vm_id, 'vm-initial')
+  assert.equal(runtime.get('unbound-runtime-account').session_window_status, 'allowed')
+})
 
 for (const producer of ['window', 'heartbeat']) {
   test(`a stale ${producer} update preserves another controller's VM, priority and cooldown`, async (t) => {
@@ -149,6 +160,29 @@ test('database observation tickets reject an older worker or allowed-window comp
   assert.equal(state.worker_heartbeat_at, 200)
   assert.equal(state.rate_limit_reset_at, until)
   assert.equal(state.session_window_status, 'rejected')
+})
+
+test('an observational VM context cannot rebind the authoritative account and quota clearing compares the cached cooldown', async (t) => {
+  const until = Date.now() + 90_000
+  const { left, right, stored } = await pair(t, {
+    status: 'cooldown',
+    cooldown_until: until,
+    cooldown_reason: 'quota_guard',
+  })
+  left.upsert({ account_id: 'runtime-account', vm_id: 'vm-new' })
+  left.markCooldown('runtime-account', { vmId: 'vm-new', until: until + 1000, reason: 'quota_guard' })
+  await left.flush()
+  right.clearQuotaCooldown('runtime-account')
+  await right.flush()
+  assert.equal((await stored()).cooldown_until, until + 1000)
+  const observation = await right.beginObservation()
+  right.upsert({ account_id: 'runtime-account', worker_status: { ok: true } }, { vmId: 'vm-old', observation })
+  await right.flush()
+  assert.equal((await stored()).vm_id, 'vm-new')
+  await right.refresh()
+  assert.equal(right.clearQuotaCooldown('runtime-account'), true)
+  await right.flush()
+  assert.equal((await stored()).cooldown_until, null)
 })
 
 test('runtime refresh publishes committed peer rows and preserves a later local mutation', async (t) => {
