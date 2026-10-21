@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { createDatabase, getDb } from '../../src/lib/db/database.mjs'
 import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
 import { SharedBackgroundTasks } from '../../src/lib/core/shared-background-tasks.mjs'
-import { createNotifyMonitor, summarizePoolAvailability } from '../../src/lib/admin/notify.mjs'
+import { createNotifyMonitor, dispatchNotify, summarizePoolAvailability } from '../../src/lib/admin/notify.mjs'
 
 const config = {
   enabled: true,
@@ -104,4 +104,26 @@ test('PostgreSQL state reservation failure prevents sending and is returned to t
   })
   await assert.rejects(monitor.runOnce(), { code: 'P6483' })
   assert.equal(sends, 0)
+})
+
+test('a truncated provider response cannot confirm the notification attempt ended', async () => {
+  for (const channel of ['telegram', 'wecom']) {
+    const cfg = {
+      [channel]:
+        channel === 'telegram'
+          ? { enabled: true, bot_token: 'synthetic-token', chat_id: 'synthetic-chat' }
+          : { enabled: true, webhook: 'synthetic-key-1234' },
+    }
+    const result = await dispatchNotify(cfg, { text: 'synthetic notification' }, {
+      fetch: async () => ({
+        ok: true,
+        status: 200,
+        text: async () => {
+          throw new Error('synthetic truncated provider body')
+        },
+      }),
+    })
+    assert.equal(result.ok, false, channel)
+    assert.equal(result.uncertain, true, channel)
+  }
 })
