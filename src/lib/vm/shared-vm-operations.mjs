@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { withTransaction } from '../db/database.mjs'
 import { ExecutionAdmissionsRepo } from '../db/repos/execution-admissions-repo.mjs'
 import { physicalVmAliases } from './vm-physical-target.mjs'
+import { revokeNodeOperationGrants } from '../db/node-management-authority.mjs'
 
 const callbacks = new AsyncLocalStorage()
 
@@ -108,7 +109,7 @@ export class SharedVmOperations {
     let uncertain = false
     let marking = null
     let releasing = null
-    return {
+    return Object.freeze({
       ok: true,
       ...identity,
       get uncertain() {
@@ -149,25 +150,37 @@ export class SharedVmOperations {
         }
         return releasing
       },
-    }
+    })
   }
 
   async markUncertain({ operationId, ownerId }) {
-    const result = await this.db
-      .prepare(`UPDATE vm_operations
-      SET uncertain_at = COALESCE(uncertain_at, clock_timestamp())
-      WHERE id = $1 AND owner_id = $2 AND released_at IS NULL`)
-      .run(operationId, ownerId)
-    return { uncertain: result.changes > 0 }
+    return withTransaction(this.db, async () => {
+      const row = await this.db
+        .prepare('SELECT id FROM vm_operations WHERE id=$1 AND owner_id=$2 AND released_at IS NULL FOR UPDATE')
+        .get(operationId, ownerId)
+      if (!row) return { uncertain: false }
+      await revokeNodeOperationGrants(this.db, { operationId, ownerId })
+      const result = await this.db
+        .prepare(`UPDATE vm_operations SET uncertain_at=COALESCE(uncertain_at,clock_timestamp())
+        WHERE id=$1 AND owner_id=$2 AND released_at IS NULL`)
+        .run(operationId, ownerId)
+      return { uncertain: result.changes > 0 }
+    })
   }
 
   async release({ operationId, ownerId }) {
-    const result = await this.db
-      .prepare(`UPDATE vm_operations
-      SET released_at = COALESCE(released_at, clock_timestamp())
-      WHERE id = $1 AND owner_id = $2 AND uncertain_at IS NULL`)
-      .run(operationId, ownerId)
-    return { released: result.changes > 0 }
+    return withTransaction(this.db, async () => {
+      const row = await this.db
+        .prepare('SELECT id FROM vm_operations WHERE id=$1 AND owner_id=$2 AND uncertain_at IS NULL FOR UPDATE')
+        .get(operationId, ownerId)
+      if (!row) return { released: false }
+      await revokeNodeOperationGrants(this.db, { operationId, ownerId })
+      const result = await this.db
+        .prepare(`UPDATE vm_operations SET released_at=COALESCE(released_at,clock_timestamp())
+        WHERE id=$1 AND owner_id=$2 AND uncertain_at IS NULL`)
+        .run(operationId, ownerId)
+      return { released: result.changes > 0 }
+    })
   }
 
   async run(vmId, callback, { kind = 'mutation', accountId = null, admission = null } = {}) {
@@ -207,7 +220,14 @@ export class SharedVmOperations {
         return { ok: true }
       })
       if (!valid.ok) throw operationError(valid.code)
-      return callback(nested.operation)
+      try {
+        const result = await callback(nested.operation)
+        if (result?.vmOperationUncertain === true) await nested.operation.markUncertain()
+        return result
+      } catch (error) {
+        if (error?.vmOperationNotStarted !== true || nested.operation.uncertain) await nested.operation.markUncertain()
+        throw error
+      }
     }
     const operation = await this.tryAcquire({ vmId, kind, accountId, admission })
     if (!operation.ok) throw operationError(operation.code)

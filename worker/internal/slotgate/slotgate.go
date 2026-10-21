@@ -36,6 +36,7 @@ type Config struct {
 	AuthorityDir string              `json:"authority_dir,omitempty"`
 	DockerSocket string              `json:"docker_socket,omitempty"`
 	Launch       *DockerLaunchPolicy `json:"launch,omitempty"`
+	Management   *PGManagementConfig `json:"management,omitempty"`
 }
 
 // Preface: "KSG1 <token> <vm> <kernel|worker|ping>\n"; reply "OK\n" or "ERR <code>\n".
@@ -60,9 +61,16 @@ type Server struct {
 	wg        sync.WaitGroup
 	authority *Authority
 	launcher  *dockerLauncher
+	allocator *allocationManager
+	// Internal injection for trusted adapters/tests. Config alone never grants
+	// unimplemented network mutations to a holder of the forwarding token.
+	authorizeManagement func(context.Context, gate2Request, func() error) error
 }
 
 func New(cfg Config) (*Server, error) {
+	if !cfg.Fenced && (cfg.Management != nil || cfg.AuthorityDir != "") {
+		return nil, ErrManagementDenied
+	}
 	if strings.TrimSpace(cfg.Listen) == "" {
 		return nil, errors.New("listen required")
 	}
@@ -106,12 +114,24 @@ func New(cfg Config) (*Server, error) {
 		if err != nil {
 			return nil, err
 		}
+		if err = srv.authority.bindManagement(cfg.Management); err != nil {
+			srv.authority.Close()
+			return nil, err
+		}
 		if cfg.Launch != nil {
 			srv.launcher, err = newDockerLauncher(socket, cfg.Root, boot, srv.authority, *cfg.Launch)
 			if err != nil {
 				srv.authority.Close()
 				return nil, err
 			}
+		}
+		if cfg.Management != nil {
+			authorizer, authErr := newPGAllocationAuthorizer(*cfg.Management)
+			if authErr != nil {
+				srv.authority.Close()
+				return nil, authErr
+			}
+			srv.allocator = &allocationManager{authority: srv.authority, nodeID: cfg.Management.NodeID, authorize: authorizer.Authorize}
 		}
 	}
 	return srv, nil

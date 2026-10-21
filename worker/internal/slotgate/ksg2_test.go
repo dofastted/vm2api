@@ -106,6 +106,9 @@ func fencedGate(t *testing.T) (string, string, *Server, AuthorityState, *fakeEng
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Explicit trusted adapter for these verifier-focused tests. Production
+	// Config.Fenced does not authorize management with a forwarding token.
+	s.authorizeManagement = func(_ context.Context, _ gate2Request, dispatch func() error) error { return dispatch() }
 	state := launchForTest(t, s.authority, "v", executor)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

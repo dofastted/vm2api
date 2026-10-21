@@ -100,6 +100,7 @@ type DockerLaunchTarget struct {
 }
 
 type AuthorityState struct {
+	Allocation      *AllocationReceipt       `json:"allocation,omitempty"`
 	Fence           Fence                    `json:"fence"`
 	Phase           AuthorityPhase           `json:"phase"`
 	Commands        map[string]CommandRecord `json:"commands"`
@@ -128,8 +129,9 @@ type TerminationProof struct {
 type TerminationVerifier func(context.Context, ExecutorIdentity) (TerminationProof, error)
 
 type authorityJournal struct {
-	Version int                       `json:"version"`
-	Slots   map[string]AuthorityState `json:"slots"`
+	Version    int                       `json:"version"`
+	Slots      map[string]AuthorityState `json:"slots"`
+	Management *managementBinding        `json:"management,omitempty"`
 }
 
 type Authority struct {
@@ -611,7 +613,7 @@ func (a *Authority) available() error {
 }
 
 func (a *Authority) commit(vm string, state AuthorityState) (AuthorityState, error) {
-	next := authorityJournal{Version: 1, Slots: make(map[string]AuthorityState, len(a.journal.Slots)+1)}
+	next := authorityJournal{Version: 1, Slots: make(map[string]AuthorityState, len(a.journal.Slots)+1), Management: a.journal.Management}
 	for key, value := range a.journal.Slots {
 		next.Slots[key] = value
 	}
@@ -664,6 +666,10 @@ func (a *Authority) persist(next authorityJournal) error {
 }
 
 func cloneState(state AuthorityState) AuthorityState {
+	if state.Allocation != nil {
+		receipt := *state.Allocation
+		state.Allocation = &receipt
+	}
 	commands := make(map[string]CommandRecord, len(state.Commands))
 	for id, command := range state.Commands {
 		if command.LaunchTarget != nil {
@@ -749,7 +755,18 @@ func validateJournal(journal authorityJournal) error {
 	if journal.Version != 1 || journal.Slots == nil {
 		return ErrInvalidAuthority
 	}
+	if binding := journal.Management; binding != nil && (binding.ProtocolVersion != 1 || !vmIDRe.MatchString(binding.NodeID) || !authoritySchemaRE.MatchString(binding.AuthoritySchema)) {
+		return ErrInvalidAuthority
+	}
 	for vm, state := range journal.Slots {
+		if receipt := state.Allocation; receipt != nil {
+			if journal.Management != nil && receipt.NodeID != journal.Management.NodeID {
+				return ErrInvalidAuthority
+			}
+			if !validAllocation(receipt.AllocationIntent, receipt.Epoch) || receipt.VMID != vm || receipt.IntentDigest != receipt.AllocationIntent.digest() || receipt.Fence.Generation != 1 || !validAuthorityID(receipt.Fence.Incarnation) || receipt.Fence.Executor != (ExecutorIdentity{}) || (state.Fence.Generation == 1 && state.Fence.Incarnation != receipt.Fence.Incarnation) {
+				return ErrInvalidAuthority
+			}
+		}
 		if !vmIDRe.MatchString(vm) || state.Fence.Generation == 0 || !validAuthorityID(state.Fence.Incarnation) || state.Commands == nil {
 			return ErrInvalidAuthority
 		}

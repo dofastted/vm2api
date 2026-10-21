@@ -1,0 +1,110 @@
+import tls from 'node:tls'
+import net from 'node:net'
+import { isDeepStrictEqual } from 'node:util'
+
+function denied() {
+  return Object.assign(new Error('node allocation acknowledgement unavailable'), {
+    code: 'node_allocation_unconfirmed',
+  })
+}
+function exact(value, keys) {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    Object.keys(value).length !== keys.length ||
+    keys.some((key) => !Object.hasOwn(value, key))
+  )
+    throw denied()
+}
+
+export function normalizeAllocationReceipt(receipt, grant) {
+  exact(receipt, ['node_id', 'vm_id', 'allocation_id', 'operation_id', 'owner_id', 'epoch', 'intent_digest', 'fence'])
+  if (
+    receipt.node_id !== grant.nodeId ||
+    receipt.vm_id !== grant.vmId ||
+    receipt.allocation_id !== grant.allocationId ||
+    receipt.operation_id !== grant.operationId ||
+    receipt.owner_id !== grant.ownerId ||
+    receipt.epoch !== grant.epoch ||
+    receipt.intent_digest !== grant.intentDigest
+  )
+    throw denied()
+  const fence = receipt.fence
+  exact(fence, ['generation', 'incarnation', 'executor'])
+  if (
+    String(fence.generation) !== '1' ||
+    !/^[a-f0-9]{32}$/.test(fence.incarnation) ||
+    !isDeepStrictEqual(fence.executor, { kind: '', node_boot_id: '' })
+  )
+    throw denied()
+  return {
+    ...receipt,
+    fence: { generation: '1', incarnation: fence.incarnation, executor: { kind: '', node_boot_id: '' } },
+  }
+}
+
+/** One typed management action; no retry, shell, launch or arbitrary path RPC. */
+export function allocateNodeSlot({ link, grant }) {
+  const values = [grant?.nodeId, grant?.vmId, grant?.allocationId, grant?.operationId, grant?.ownerId]
+  if (
+    grant?.action !== 'allocate' ||
+    values.some((value) => typeof value !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(value)) ||
+    !link ||
+    !net.isIP(link.address) ||
+    !Number.isInteger(link.port) ||
+    link.port < 1 ||
+    link.port > 65535 ||
+    typeof link.token !== 'string' ||
+    !/^[\x21-\x7e]{32,256}$/.test(link.token) ||
+    !/^[a-f0-9]{64}$/.test(link.certSha256)
+  )
+    return Promise.reject(denied())
+  const request = {
+    op: 'allocate',
+    vm_id: grant.vmId,
+    allocation_id: grant.allocationId,
+    operation_id: grant.operationId,
+    owner_id: grant.ownerId,
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false
+    let buffer = Buffer.alloc(0)
+    const socket = tls.connect({
+      host: link.address,
+      port: link.port,
+      rejectUnauthorized: false,
+      minVersion: 'TLSv1.3',
+    })
+    const finish = (error, value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      socket.destroy()
+      if (error) reject(error)
+      else resolve(value)
+    }
+    const timer = setTimeout(() => finish(denied()), 8000)
+    socket.once('error', () => finish(denied()))
+    socket.once('close', () => finish(denied()))
+    socket.once('secureConnect', () => {
+      const pin = socket.getPeerCertificate()?.fingerprint256?.replaceAll(':', '').toLowerCase()
+      if (pin !== link.certSha256) return finish(denied())
+      socket.write(`KSG2 ${link.token}\n${JSON.stringify(request)}\n`)
+    })
+    socket.on('data', (chunk) => {
+      buffer = Buffer.concat([buffer, chunk])
+      if (buffer.length > 8192) return finish(denied())
+      const newline = buffer.indexOf(10)
+      if (newline < 0) return
+      try {
+        const reply = JSON.parse(buffer.subarray(0, newline).toString(), (key, value, context) =>
+          key === 'generation' && typeof value === 'number' ? context.source : value,
+        )
+        if (reply.ok !== true) throw denied()
+        finish(null, normalizeAllocationReceipt(reply.allocation, grant))
+      } catch {
+        finish(denied())
+      }
+    })
+  })
+}

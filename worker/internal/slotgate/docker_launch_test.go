@@ -428,6 +428,7 @@ func TestKSG2LaunchCreatesAndBindsWithNodePolicyAndRejectsRawSpec(t *testing.T) 
 	if count != 0 {
 		t.Fatal("raw spec reached Engine")
 	}
+	s.authorizeManagement = func(_ context.Context, _ gate2Request, dispatch func() error) error { return dispatch() }
 	reply := gate2Control(t, ln.Addr().String(), gate2Request{Op: "launch", VMID: "v", Fence: state.Fence, CommandID: "trusted-node-launch"})
 	if !reply.OK || reply.State == nil || reply.State.Phase != PhaseActive || reply.State.Fence.Executor.ContainerID != engine.container {
 		t.Fatalf("KSG2 launch: %+v", reply)

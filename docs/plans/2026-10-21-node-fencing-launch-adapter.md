@@ -16,7 +16,7 @@ KSG2 增加 `launch` 操作。客户端只提供 `vm_id`、创建操作时捕获
 | `network_id` | `none`，或节点预先批准的完整 bridge network ID；不接受 host、container 或 service 网络命名空间 |
 | `uid`、`gid` | 非 root 的正整数；不能由 RPC 调用者覆盖 |
 
-`launch` policy 缺失时拒绝启动。当前接口要求目标 VM 已有 `VACANT` 状态，且可信节点组件已准备好该 captured incarnation 的私有文件树。本批没有提供初始 allocate、文件上传或文件发布 RPC，也不会自动接管 legacy executor。
+`launch` policy 缺失时拒绝启动。当前接口要求目标 VM 已有 `VACANT` 状态，且可信节点组件已准备好该 captured incarnation 的私有文件树。后续初始 allocate 已接入独立 PG 授权与 node receipt，见 [初始槽位分配与节点独立授权](2026-10-21-node-allocation-authority.md)。文件上传、文件发布与 launch action grant 仍未接入，也不会自动接管 legacy executor。KSG2 静态转发 token 不再授予 launch/revoke/advance 管理权限；这些动作默认拒绝。
 
 启动顺序为：
 

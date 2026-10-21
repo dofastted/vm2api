@@ -28,12 +28,15 @@ var errGateTicketInvalid = errors.New("ticket_invalid")
 // commands continue with one parsed HTTP/1 request and an HTTP response after
 // OK\n. KSG1 raw splicing is never accepted when fenced mode is enabled.
 type gate2Request struct {
-	Op        string `json:"op"`
-	VMID      string `json:"vm_id"`
-	Fence     Fence  `json:"fence"`
-	CommandID string `json:"command_id,omitempty"`
-	Kind      string `json:"kind,omitempty"`
-	Ticket    string `json:"ticket,omitempty"`
+	Op           string `json:"op"`
+	VMID         string `json:"vm_id"`
+	Fence        Fence  `json:"fence"`
+	CommandID    string `json:"command_id,omitempty"`
+	Kind         string `json:"kind,omitempty"`
+	Ticket       string `json:"ticket,omitempty"`
+	AllocationID string `json:"allocation_id,omitempty"`
+	OperationID  string `json:"operation_id,omitempty"`
+	OwnerID      string `json:"owner_id,omitempty"`
 }
 
 type gate2State struct {
@@ -70,7 +73,7 @@ func gate2Line(reader *bufio.Reader) ([]byte, error) {
 }
 
 func gate2Code(err error) string {
-	for _, known := range []error{ErrAuthorityUnavailable, ErrAuthorityPhase, ErrFenceMismatch, ErrCommandExists, ErrCommandOwner, ErrCommandDispatched, ErrPendingMutation, ErrInvalidAuthority, ErrTerminationProof, errGateTicketInvalid} {
+	for _, known := range []error{ErrAuthorityUnavailable, ErrAuthorityPhase, ErrFenceMismatch, ErrCommandExists, ErrCommandOwner, ErrCommandDispatched, ErrPendingMutation, ErrInvalidAuthority, ErrTerminationProof, ErrManagementDenied, ErrManagementUnavailable, ErrAllocationConflict, errGateTicketInvalid} {
 		if errors.Is(err, known) {
 			return known.Error()
 		}
@@ -119,6 +122,16 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 	reply := map[string]any{"ok": false}
 	var state AuthorityState
 	switch request.Op {
+	case "allocate":
+		if s.allocator == nil || request.Fence != (Fence{}) || request.CommandID != "" || request.Kind != "" || request.Ticket != "" {
+			err = ErrManagementDenied
+			break
+		}
+		var receipt AllocationReceipt
+		receipt, err = s.allocator.Allocate(ctx, AllocationIntent{NodeID: s.allocator.nodeID, VMID: request.VMID, AllocationID: request.AllocationID, OperationID: request.OperationID, OwnerID: request.OwnerID})
+		if err == nil {
+			reply["allocation"] = receipt
+		}
 	case "state":
 		state, err = s.authority.State(request.VMID)
 	case "prepare":
@@ -132,15 +145,31 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 			reply["ticket"] = gate2Ticket(handle.token, request)
 		}
 	case "revoke":
-		state, err = s.authority.Revoke(request.VMID, request.Fence)
+		if s.authorizeManagement == nil {
+			err = ErrManagementDenied
+			break
+		}
+		err = s.authorizeManagement(ctx, request, func() error { var e error; state, e = s.authority.Revoke(request.VMID, request.Fence); return e })
 	case "advance":
-		state, err = s.authority.Advance(ctx, request.VMID, request.Fence)
+		if s.authorizeManagement == nil {
+			err = ErrManagementDenied
+			break
+		}
+		err = s.authorizeManagement(ctx, request, func() error { var e error; state, e = s.authority.Advance(ctx, request.VMID, request.Fence); return e })
 	case "launch":
+		if s.authorizeManagement == nil {
+			err = ErrManagementDenied
+			break
+		}
 		if s.launcher == nil || request.Kind != "" || request.Ticket != "" {
 			err = ErrInvalidAuthority
 			break
 		}
-		state, err = s.launcher.Launch(ctx, request.VMID, request.Fence, request.CommandID)
+		err = s.authorizeManagement(ctx, request, func() error {
+			var e error
+			state, e = s.launcher.Launch(ctx, request.VMID, request.Fence, request.CommandID)
+			return e
+		})
 	case "command":
 		var handle CommandHandle
 		handle, err = s.forwardHandle(request)
@@ -168,7 +197,7 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 		reply["error"] = gate2Code(err)
 	} else {
 		reply["ok"] = true
-		if request.Op != "prepare" && request.Op != "command" {
+		if request.Op != "prepare" && request.Op != "command" && request.Op != "allocate" {
 			reply["state"] = publicGateState(state)
 		}
 	}

@@ -3,9 +3,10 @@ package slotgate
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
-	"sync"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -90,15 +91,39 @@ func TestKSG2ForwardTokenAloneCannotAuthorizeManagement(t *testing.T) {
 
 func TestInitializedManagementBindingCannotBeRemovedOrRelabeled(t *testing.T) {
 	root := shortRoot(t)
-	management := &PGManagementConfig{ConnectionString:"postgres://synthetic@127.0.0.1:1/synthetic_test?sslmode=disable",AuthoritySchema:"vm2api_node_"+strings.Repeat("a",32),NodeID:"synthetic-node"}
-	config := Config{Listen:"127.0.0.1:0",Root:root,Token:testToken,TLSDir:filepath.Join(root,"tls"),Fenced:true,AuthorityDir:filepath.Join(root,"authority"),Management:management}
-	server,err := New(config)
-	if err != nil { t.Fatal(err) }
+	management := &PGManagementConfig{ConnectionString: "postgres://synthetic@127.0.0.1:1/synthetic_test?sslmode=disable", AuthoritySchema: "vm2api_node_" + strings.Repeat("a", 32), NodeID: "synthetic-node"}
+	config := Config{Listen: "127.0.0.1:0", Root: root, Token: testToken, TLSDir: filepath.Join(root, "tls"), Fenced: true, AuthorityDir: filepath.Join(root, "authority"), Management: management}
+	server, err := New(config)
+	if err != nil {
+		t.Fatal(err)
+	}
 	server.authority.Close()
 	config.Management = nil
-	if reopened,err := New(config); err == nil { reopened.authority.Close();t.Fatal("initialized node accepted missing authorizer") }
+	if reopened, err := New(config); err == nil {
+		reopened.authority.Close()
+		t.Fatal("initialized node accepted missing authorizer")
+	}
 	copy := *management
 	copy.NodeID = "different-node"
 	config.Management = &copy
-	if reopened,err := New(config); err == nil { reopened.authority.Close();t.Fatal("initialized node accepted a different identity") }
+	if reopened, err := New(config); err == nil {
+		reopened.authority.Close()
+		t.Fatal("initialized node accepted a different identity")
+	}
+}
+
+func TestAllocationJournalFailureNeverAcknowledgesOrResetsGeneration(t *testing.T) {
+	a := authorityForTest(t, filepath.Join(shortRoot(t), "authority"), nil)
+	if err := os.Rename(filepath.Join(a.root, "authority.json"), filepath.Join(a.root, "saved.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(a.root, "authority.json"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Allocate(allocationIntent("write-failure"), "1"); err == nil {
+		t.Fatal("acknowledged failed journal")
+	}
+	if _, err := a.State("v"); !errors.Is(err, ErrAuthorityUnavailable) {
+		t.Fatalf("not poisoned: %v", err)
+	}
 }
