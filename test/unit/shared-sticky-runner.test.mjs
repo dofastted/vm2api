@@ -27,7 +27,7 @@ async function fixture(t) {
 }
 
 function success() {
-  return { ok: true, status: 200, terminalState: 'verified', body: { content: [{ type: 'text', text: 'ok' }] } }
+  return { ok: true, status: 200, terminalState: 'verified', body: { type: 'message', id: 'msg_synthetic', role: 'assistant', content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } } }
 }
 
 for (const initial of ['absent', 'tombstone']) {
@@ -97,4 +97,38 @@ test('runner late success preserves shared pin moved during execution', async (t
   const stored = await fx.peer.persistence.get(key)
   assert.equal(stored.vm_id, 'vm-b')
   assert.equal(stored.session_id, null)
+})
+
+test('scheduler shared alias release uses captured versions and preserves a newer alias', async (t) => {
+  const { PoolScheduler } = await import('../../src/lib/pool/pool-scheduler.mjs')
+  const fx = await fixture(t)
+  const keys = ['runner-alias-one', 'runner-alias-two']
+  for (const key of keys) await fx.router.bindShared(key, { accountId: 'account-a', vmId: 'vm-a' })
+  const versions = new Map(keys.map((key) => [key, fx.router.versionOf(key)]))
+  await fx.peer.refresh()
+  await fx.peer.rebindFamilyShared(keys[1], { accountId: 'account-b', vmId: 'vm-b' })
+  const pool = new PoolScheduler({ stickyRouter: fx.router })
+  await pool.releaseSticky({ accountId: 'account-a', vmId: 'vm-a' }, keys[0], keys, versions)
+  assert.equal(await fx.peer.persistence.get(keys[0]), null)
+  assert.equal((await fx.peer.persistence.get(keys[1])).vm_id, 'vm-b')
+})
+
+test('scheduler shared reconciliation preserves a pin moved while clearing the old account', async (t) => {
+  const { PoolScheduler } = await import('../../src/lib/pool/pool-scheduler.mjs')
+  const fx = await fixture(t)
+  const key = 'runner-reconcile-conflict'
+  await fx.router.bindShared(key, { accountId: 'account-a', vmId: 'vm-a' })
+  const clear = fx.router.unbindShared.bind(fx.router)
+  fx.router.unbindShared = async (...args) => {
+    await fx.peer.refresh()
+    await fx.peer.rebindFamilyShared(key, { accountId: 'account-b', vmId: 'vm-b' })
+    return clear(...args)
+  }
+  const pool = new PoolScheduler({ stickyRouter: fx.router })
+  const candidate = { accountId: 'account-b', vmId: 'vm-b' }
+  const result = await pool.reconcileStickyShared({ stickyKey: key, eligible: [candidate] })
+  assert.equal(result.cleared, false)
+  assert.equal(result.vmId, 'vm-b')
+  assert.deepEqual(result.match, candidate)
+  assert.equal((await fx.peer.persistence.get(key)).vm_id, 'vm-b')
 })
