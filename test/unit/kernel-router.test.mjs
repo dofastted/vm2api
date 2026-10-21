@@ -198,6 +198,153 @@ async function kernelFixture(handler) {
   }
 }
 
+for (const [mode, dispatch] of [
+  ['call', dispatchCallInference],
+  ['stream', dispatchStreamInference],
+]) {
+  unixTest(`shared ${mode} execution does not retry after a truncated Unix socket response`, async () => {
+    const previous = process.env.KIN_KERNEL_BIN
+    process.env.KIN_KERNEL_BIN = '/bin/true'
+    const requests = []
+    const started = []
+    const ended = []
+    const fx = await kernelFixture(async (req, res) => {
+      const chunks = []
+      for await (const chunk of req) chunks.push(chunk)
+      requests.push(JSON.parse(Buffer.concat(chunks).toString('utf8')).request_id)
+      res.destroy()
+    })
+    try {
+      const result = await dispatch({
+        exec: fx.exec,
+        body: { model: 'claude-test', messages: [{ role: 'user', content: 'synthetic request' }] },
+        ensureRust: async () => ({ ok: true }),
+        timeoutMs: 1000,
+        onExecutionStart: async (execution) => started.push(execution),
+        onExecutionEnd: async (execution) => ended.push(execution),
+      })
+      assert.equal(requests.length, 1, 'an unconfirmed execution must not create another kernel job')
+      assert.equal(started.length, 1)
+      assert.equal(ended.length, 1)
+      assert.equal(ended[0].requestId, requests[0])
+      assert.equal(ended[0].started, true)
+      assert.equal(ended[0].ended, false)
+      assert.equal(result.execution.ended, false)
+      assert.equal(result.rust_transport_retried, undefined)
+    } finally {
+      await fx.close()
+      if (previous == null) delete process.env.KIN_KERNEL_BIN
+      else process.env.KIN_KERNEL_BIN = previous
+    }
+  })
+}
+
+unixTest('shared credential retry awaits the first execution end and uses a new job ID', async () => {
+  const previous = process.env.KIN_KERNEL_BIN
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  const requests = []
+  const ended = []
+  let ensures = 0
+  const fx = await kernelFixture(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    requests.push(JSON.parse(Buffer.concat(chunks).toString('utf8')).request_id)
+    res.writeHead(requests.length === 1 ? 401 : 200, { 'content-type': 'application/json' })
+    res.end(
+      JSON.stringify(
+        requests.length === 1
+          ? { type: 'error', error: { code: 'needs_refresh', message: 'synthetic refresh' } }
+          : { type: 'message', role: 'assistant', content: [] },
+      ),
+    )
+  })
+  try {
+    const result = await dispatchCallInference({
+      exec: fx.exec,
+      body: { model: 'claude-test', messages: [{ role: 'user', content: 'synthetic request' }] },
+      requestId: 'fixed-first-job',
+      ensureRust: async () => ({ ok: true }),
+      onExecutionStart: async () => {},
+      onExecutionEnd: async (execution) => {
+        await new Promise((resolve) => setImmediate(resolve))
+        ended.push(execution)
+      },
+      ensureCredential: async () => {
+        assert.equal(ended.length, 1, 'credential refresh follows the awaited execution-end callback')
+        assert.equal(ended[0].ended, true)
+        ensures++
+        return { ok: true }
+      },
+      timeoutMs: 1000,
+    })
+    assert.equal(result.credential_retried, true)
+    assert.equal(ensures, 1)
+    assert.equal(requests.length, 2)
+    assert.equal(requests[0], 'fixed-first-job')
+    assert.notEqual(requests[1], requests[0], 'a retry cannot reuse a cancelled or completed job ID')
+    assert.deepEqual(
+      ended.map((execution) => execution.requestId),
+      requests,
+    )
+    assert.equal(ended[1].ended, true)
+  } finally {
+    await fx.close()
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+  }
+})
+
+for (const callback of ['onExecutionStart', 'onExecutionEnd']) {
+  unixTest(`a failing ${callback} prevents further jobs and preserves its original error`, async () => {
+    const previous = process.env.KIN_KERNEL_BIN
+    process.env.KIN_KERNEL_BIN = '/bin/true'
+    let requests = 0
+    let ensures = 0
+    const error = new Error(`synthetic ${callback} persistence failure`)
+    const fx = await kernelFixture((req, res) => {
+      req.resume()
+      requests++
+      res.writeHead(401, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ type: 'error', error: { code: 'needs_refresh' } }))
+    })
+    try {
+      await assert.rejects(
+        dispatchCallInference({
+          exec: fx.exec,
+          body: { model: 'claude-test', messages: [{ role: 'user', content: 'synthetic request' }] },
+          ensureRust: async () => ({ ok: true }),
+          onExecutionStart: async () => {},
+          onExecutionEnd: async () => {},
+          [callback]: async () => {
+            throw error
+          },
+          ensureCredential: async () => {
+            ensures++
+            return { ok: true }
+          },
+          timeoutMs: 1000,
+        }),
+        (actual) => actual === error,
+      )
+      assert.equal(requests, callback === 'onExecutionStart' ? 0 : 1)
+      assert.equal(ensures, 0)
+    } finally {
+      await fx.close()
+      if (previous == null) delete process.env.KIN_KERNEL_BIN
+      else process.env.KIN_KERNEL_BIN = previous
+    }
+  })
+}
+
+unixTest('preparation rejection identifies that no kernel execution started', async () => {
+  const result = await dispatchCallInference({
+    exec: { vmId: 'synthetic-unavailable', vm: { id: 'synthetic-unavailable' } },
+    ensureRust: async () => ({ ok: false, reason: 'kernel_unavailable' }),
+    onExecutionStart: async () => assert.fail('preparation cannot create a kernel job'),
+  })
+  assert.deepEqual(result.execution, { requestId: null, started: false, ended: true, reason: 'not_started' })
+})
+
 unixTest('dispatchStreamInference uses rust socket when ready', async () => {
   const prev = process.env.KIN_KERNEL_BIN
   process.env.KIN_KERNEL_BIN = '/bin/true'
