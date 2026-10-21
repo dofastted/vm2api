@@ -91,7 +91,13 @@ test('explicit terminal failures and known not-started errors permit later plans
     }),
     /synthetic validation failure/,
   )
-  const next = await second.tryClaim(plan('four'))
+  await assert.rejects(
+    first.run(plan('four'), () => {
+      throw Object.assign(new Error('synthetic terminal rejection'), { taskTerminal: true })
+    }),
+    /synthetic terminal rejection/,
+  )
+  const next = await second.tryClaim(plan('five'))
   assert.equal(next.ok, true)
   await next.complete()
 })
