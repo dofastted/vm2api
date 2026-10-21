@@ -56,6 +56,18 @@ export async function fakeSlotgate(t, options = {}) {
           key === 'generation' && typeof value === 'number' ? context.source : value)
         buffer = buffer.subarray(second + 1)
         requests.push(command)
+        if (command.op === 'health') {
+          const reply = typeof options.health === 'function' ? options.health(command) : options.health
+          if (options.holdHealth) return
+          return socket.end(wire(reply || {
+            ok: true, fence: command.fence,
+            manifest_revision: command.manifest_revision, manifest_digest: command.manifest_digest,
+            health: { ok: true, engine: 'rust', healthy: true, ready_slots: 1,
+              credential: { has_access: true, has_refresh: true, generation: 'credential-1',
+                expires_at: 1981929600000, account_uuid: 'synthetic-account',
+                org_uuid: 'synthetic-org', email: 'synthetic@example.invalid' } },
+          }) + '\n')
+        }
         if (command.op === 'prepare') {
           commands.set(command.command_id, { ticket: `ticket-${command.command_id}`, command })
           return socket.end(JSON.stringify({ ok: true, ticket: `ticket-${command.command_id}` }) + '\n')
