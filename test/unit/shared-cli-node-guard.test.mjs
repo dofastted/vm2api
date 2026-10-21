@@ -87,7 +87,7 @@ test('CLI guard keeps the VM unavailable until its actual command has ended', as
   await next.release()
 })
 
-async function engine(t, states) {
+async function engine(t, states, { createStatus = 201, startStatus = 200 } = {}) {
   const execId = 'a'.repeat(64)
   const calls = []
   const server = http.createServer(async (req, res) => {
@@ -97,10 +97,12 @@ async function engine(t, states) {
     calls.push(req.url)
     let body
     if (req.url.endsWith('/exec')) {
-      res.statusCode = 201
+      res.statusCode = createStatus
       body = { Id: execId }
-    } else if (req.url.endsWith('/start')) body = {}
-    else body = states.length > 1 ? states.shift() : states[0]
+    } else if (req.url.endsWith('/start')) {
+      res.statusCode = startStatus
+      body = {}
+    } else body = states.length > 1 ? states.shift() : states[0]
     res.setHeader('content-type', 'application/json')
     res.end(JSON.stringify(body))
   })
@@ -139,4 +141,24 @@ test('guard executor timeout leaves a running Docker exec unconfirmed', async (t
   const result = await runCliNodeGuardCommand(fx.connect, 'kin-synthetic', ['synthetic'], { timeoutMs: 0 })
   assert.equal(result.ended, false)
   assert.equal(result.ok, false)
+})
+
+for (const createStatus of [404, 409]) {
+  test(`a complete Docker create-exec ${createStatus} rejection is proven not started`, async (t) => {
+    const fx = await engine(t, [], { createStatus })
+    await guard(() => runCliNodeGuardCommand(fx.connect, 'kin-synthetic', ['synthetic'])).tick()
+    assert.deepEqual(fx.calls, ['/containers/kin-synthetic/exec'])
+    const next = await reserve()
+    assert.equal(next.ok, true)
+    await next.release()
+    const row = await getDb().prepare('SELECT unknown_at, finished_at FROM background_task_runs').get()
+    assert.equal(row.unknown_at, null)
+    assert.ok(row.finished_at)
+  })
+}
+
+test('a start-exec 404 remains unknown after an exec was created', async (t) => {
+  const fx = await engine(t, [], { startStatus: 404 })
+  await guard(() => runCliNodeGuardCommand(fx.connect, 'kin-synthetic', ['synthetic'])).tick()
+  assert.equal((await reserve()).code, 'vm_operation_active')
 })
