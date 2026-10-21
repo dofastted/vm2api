@@ -12,6 +12,8 @@ import { getDb, isDbOpen } from '../db/database.mjs'
 import { RuntimeSettings as SettingsRepo } from '../db/settings-state.mjs'
 import { socksProxyUrl } from './socks-address.mjs'
 import { assertProxyAllowed, proxyBlockedReason } from './proxy-policy.mjs'
+import { atomicWriteJson } from './vm-file.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 
 export const EGRESS_BIN = process.env.KIN_EGRESS_BIN || '/opt/kin-gateway/bin/kin-egress'
 export const LOCAL_EGRESS_ID = 'px-local'
@@ -317,14 +319,27 @@ export function readEgressListenTcp(projectRoot, proxyId) {
     return ''
   }
 }
-export function inspectEgressNetwork(proxyId, run = docker) {
-  const name = networkName(proxyId)
+export function inspectEgressNetwork(proxyId, run = docker, { strict = false, target = null } = {}) {
+  const name = target || networkName(proxyId)
   if (!name) return null
-  const r = run(['network', 'inspect', '-f', '{{range .IPAM.Config}}{{.Subnet}}|{{.Gateway}}{{end}}', name])
-  if (!r.ok) return null
-  const [subnet, gateway] = String(r.stdout || '').split('|')
+  const r = run(['network', 'inspect', '-f', '{{range .IPAM.Config}}{{.Subnet}}|{{.Gateway}}{{end}}|{{.Id}}', name])
+  if (!r.ok) {
+    if (
+      strict &&
+      !/^(?:Error(?: response from daemon)?: )?(?:No such network: [^\r\n]+|network [^\r\n]+ not found)$/i.test(
+        r.stderr || '',
+      )
+    ) {
+      throw Object.assign(new Error(r.stderr || 'Docker network inspection failed'), { code: 'egress_network_unknown' })
+    }
+    return null
+  }
+  const [subnet, gateway, id] = String(r.stdout || '').split('|')
+  if (strict && !id?.trim())
+    throw Object.assign(new Error('Docker network identity unavailable'), { code: 'egress_network_unknown' })
   return {
     name,
+    id: id?.trim() || null,
     network: name,
     subnet: String(subnet || '').trim(),
     gateway: String(gateway || '').trim() || gatewayFromSubnet(String(subnet || '').trim()),
@@ -387,9 +402,12 @@ function applyIptables(plan, runIptables = iptables) {
   return { ok: true }
 }
 
-function removeIptables(plan, runIptables = iptables) {
+function removeIptables(plan, runIptables = iptables, { strict = false } = {}) {
   for (const args of plan.del) {
-    runIptables(args)
+    const result = runIptables(args)
+    if (strict && !result.ok && !/Bad rule|No chain\/target\/match by that name/i.test(result.stderr || '')) {
+      return { ok: false, error: result.stderr || 'iptables removal unconfirmed' }
+    }
   }
   return { ok: true }
 }
@@ -477,6 +495,12 @@ export async function startEgressProcess({
   const listenTcp = `${listenHost}:${tcpPort}`
   const listenDns = `${listenHost}:${dnsPort}`
   const existing = readPid(pidFile)
+  let owner
+  try {
+    owner = isKubernetesMode() ? egressOwnerSnapshot(projectRoot, proxyId) : { legacy: true, pid: existing }
+  } catch (error) {
+    return egressOwnerUnknown(error, existing)
+  }
   const configMatches = ownsEgressProcess(existing, cfgPath)
   if (configMatches) {
     try {
@@ -492,9 +516,17 @@ export async function startEgressProcess({
       ) {
         return { ok: true, pid: existing, reused: true, configPath: cfgPath }
       }
-    } catch {}
+    } catch (error) {
+      if (isKubernetesMode()) return egressOwnerUnknown(error, existing)
+    }
   }
-  const superseded = [...new Set([...(configMatches ? [existing] : []), ...staleEgressPids(cfgPath)])]
+  if (!owner.legacy && (owner.receipt || isKubernetesMode())) {
+    const stopped = await stopEgressProcessConfirmed(projectRoot, proxyId)
+    if (!stopped.ok) return stopped
+  }
+  const superseded = owner.legacy
+    ? [...new Set([...(configMatches ? [existing] : []), ...staleEgressPids(cfgPath)])]
+    : []
   for (const pid of superseded) {
     const stopped = await stopOwnedEgress(pid)
     if (!stopped.ok) return { ok: false, error: stopped.error, pid }
@@ -522,7 +554,26 @@ export async function startEgressProcess({
   fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 })
   const spawned = await spawnDetachedEgress(bin, cfgPath)
   if (!spawned.ok) return spawned
-  fs.writeFileSync(pidFile, String(spawned.pid) + '\n', { mode: 0o600 })
+  try {
+    fs.writeFileSync(pidFile, String(spawned.pid) + '\n', { mode: 0o600 })
+    if (process.platform === 'linux') {
+      const identity = readEgressIdentity(spawned.pid, cfgPath)
+      if (!identity || identity.state === 'Z' || identity.other)
+        throw new Error('Egress execution identity was not recorded')
+      atomicWriteJson(
+        path.join(dir, 'egress.owner.json'),
+        {
+          ...egressExecutionDomain(),
+          proxy_id: proxyId,
+          pid: spawned.pid,
+          start_ticks: identity.start_ticks,
+        },
+        { mode: 0o600 },
+      )
+    } else if (isKubernetesMode()) throw new Error('Egress execution identity is unavailable on this platform')
+  } catch (error) {
+    return { ...egressOwnerUnknown(error, spawned.pid), code: 'egress_receipt_persist_failed' }
+  }
   return { ok: true, pid: spawned.pid, reused: false, configPath: cfgPath, listen_tcp: listenTcp }
 }
 
@@ -548,6 +599,161 @@ export function stopEgressProcess(projectRoot, proxyId) {
     return { ok: false, error: `egress_pid_cleanup_failed: ${error.code || error.message}` }
   }
   return { ok: true, pending }
+}
+
+function egressOwnerUnknown(error, pid = null) {
+  return {
+    ok: false,
+    code: 'egress_owner_unreachable',
+    error: String(error?.message || error),
+    pid,
+    vmOperationUncertain: true,
+  }
+}
+
+function egressExecutionDomain() {
+  if (process.platform !== 'linux') throw new Error('Egress execution domain is not observable')
+  return {
+    boot_id: fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(),
+    pid_namespace: fs.readlinkSync('/proc/self/ns/pid'),
+  }
+}
+
+function readEgressIdentity(pid, configPath) {
+  let stat
+  try {
+    stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8')
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ESRCH') return null
+    throw error
+  }
+  const fields = stat
+    .slice(stat.lastIndexOf(')') + 1)
+    .trim()
+    .split(/\s+/)
+  if (!/^\d+$/.test(fields[19] || '')) throw new Error('Egress process start identity is unavailable')
+  const identity = { pid, state: fields[0], start_ticks: fields[19] }
+  if (identity.state === 'Z') return identity
+  try {
+    const args = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0')
+    const index = args.indexOf('-config')
+    const argument = args[index + 1]
+    if (
+      index <= 0 ||
+      !argument ||
+      !args.some((arg) => path.basename(arg.replace(/ \(deleted\)$/, '')).startsWith('kin-egress'))
+    ) {
+      return { ...identity, other: true }
+    }
+    const actual = path.isAbsolute(argument)
+      ? path.resolve(argument)
+      : path.resolve(fs.readlinkSync(`/proc/${pid}/cwd`), argument)
+    if (actual !== path.resolve(configPath)) return { ...identity, other: true }
+    processExe(pid) // A permission error is unknown, never absence.
+    return identity
+  } catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ESRCH') {
+      try {
+        fs.statSync(`/proc/${pid}`)
+      } catch (absent) {
+        if (absent.code === 'ENOENT' || absent.code === 'ESRCH') return null
+      }
+    }
+    throw error
+  }
+}
+
+function egressOwnerSnapshot(projectRoot, proxyId) {
+  const dir = egressRunDir(projectRoot, proxyId)
+  const config = path.join(dir, 'egress.json')
+  let pid = null
+  try {
+    pid = Number(fs.readFileSync(path.join(dir, 'egress.pid'), 'utf8').trim())
+    if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error('Invalid egress PID record')
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error
+  }
+  let receipt = null
+  try {
+    receipt = JSON.parse(fs.readFileSync(path.join(dir, 'egress.owner.json'), 'utf8'))
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error
+  }
+  if (!receipt) {
+    if (!isKubernetesMode()) return { legacy: true, pid }
+    if (pid || egressPidsForProxyConfig(projectRoot, proxyId).length)
+      throw new Error('Egress PID has no execution identity receipt')
+    return { receipt: null, pid: null }
+  }
+  const domain = egressExecutionDomain()
+  if (
+    receipt.proxy_id !== proxyId ||
+    !Number.isSafeInteger(receipt.pid) ||
+    receipt.pid <= 0 ||
+    typeof receipt.start_ticks !== 'string' ||
+    !/^\d+$/.test(receipt.start_ticks) ||
+    receipt.boot_id !== domain.boot_id ||
+    receipt.pid_namespace !== domain.pid_namespace ||
+    (pid && pid !== receipt.pid)
+  )
+    throw new Error('Egress execution owner is not observable in this PID namespace')
+  const identity = readEgressIdentity(receipt.pid, config)
+  if (identity && identity.start_ticks !== receipt.start_ticks && !identity.other && identity.state !== 'Z') {
+    throw new Error('An unreceipted egress helper reused the recorded PID')
+  }
+  if (identity?.start_ticks === receipt.start_ticks && identity.other)
+    throw new Error('Egress process execution changed')
+  for (const other of egressPidsForProxyConfig(projectRoot, proxyId)) {
+    if (other !== receipt.pid) throw new Error('An additional egress process has no execution identity receipt')
+  }
+  return { receipt, identity, pid: receipt.pid }
+}
+
+/** Confirm the recorded execution ended; never signal a reused PID or another Pod's namespace. */
+export async function stopEgressProcessConfirmed(
+  projectRoot,
+  proxyId,
+  { termTimeoutMs = EGRESS_STOP_TIMEOUT_MS, killGraceMs = EGRESS_KILL_GRACE_MS } = {},
+) {
+  try {
+    const owner = egressOwnerSnapshot(projectRoot, proxyId)
+    if (owner.legacy) {
+      const drained = await drainEgressForProxyConfig(projectRoot, proxyId)
+      if (!drained.ok) return { ...drained, vmOperationUncertain: true }
+      return { ...stopEgressProcess(projectRoot, proxyId), ended: false, legacy: true }
+    }
+    const config = path.join(egressRunDir(projectRoot, proxyId), 'egress.json')
+    const ended = () => {
+      if (!owner.receipt) return true
+      const current = readEgressIdentity(owner.pid, config)
+      if (!current || current.state === 'Z') return true
+      if (current.start_ticks !== owner.receipt.start_ticks) {
+        if (!current.other) throw new Error('An unreceipted egress helper reused the recorded PID')
+        return true
+      }
+      if (current.other) throw new Error('Egress process execution changed')
+      return false
+    }
+    for (const [signal, timeout] of [
+      ['SIGTERM', termTimeoutMs],
+      ['SIGKILL', killGraceMs],
+    ]) {
+      if (ended()) break
+      try {
+        process.kill(owner.pid, signal)
+      } catch (error) {
+        if (error.code !== 'ESRCH') throw error
+      }
+      const deadline = Date.now() + timeout
+      while (!ended() && Date.now() < deadline) await delay(EGRESS_POLL_MS)
+    }
+    if (!ended()) throw new Error('Egress process termination was not confirmed')
+    for (const file of ['egress.pid', 'egress.owner.json'])
+      fs.rmSync(path.join(egressRunDir(projectRoot, proxyId), file), { force: true })
+    return { ok: true, ended: true }
+  } catch (error) {
+    return egressOwnerUnknown(error)
+  }
 }
 
 async function stopOwnedEgress(pid) {
@@ -856,18 +1062,34 @@ export async function startProxyEgress(
 export function stopProxyEgress(projectRoot, proxyId, { subnet, runDocker = docker, runIptables = iptables } = {}) {
   // A node's local row owns nothing here; its bridge name is the control plane's px-local one.
   if (localEgressNodeId(proxyId)) return { ok: true, skipped: 'node_local' }
-  const net = inspectEgressNetwork(proxyId, runDocker)
-  const plan = iptablesPlan({
-    chain: chainName(proxyId),
-    bridge: bridgeName(proxyId),
-    subnet: subnet || net?.subnet || '0.0.0.0/0',
-    tcpPort: portsForProxy(proxyId).tcp,
-    dnsPort: portsForProxy(proxyId).dns,
+  return runExclusiveProxyEgress(projectRoot, proxyId, async () => {
+    try {
+      const net = inspectEgressNetwork(proxyId, runDocker, { strict: true })
+      const stopped = await stopEgressProcessConfirmed(projectRoot, proxyId)
+      if (!stopped.ok) return stopped
+      const plan = iptablesPlan({
+        chain: chainName(proxyId),
+        bridge: bridgeName(proxyId),
+        subnet: subnet || net?.subnet || '0.0.0.0/0',
+        tcpPort: portsForProxy(proxyId).tcp,
+        dnsPort: portsForProxy(proxyId).dns,
+      })
+      const rules = removeIptables(plan, runIptables, { strict: true })
+      if (!rules.ok) return { ...rules, vmOperationUncertain: true }
+      if (net) {
+        runDocker(['network', 'rm', net.id])
+        if (
+          inspectEgressNetwork(proxyId, runDocker, { strict: true, target: net.id }) ||
+          inspectEgressNetwork(proxyId, runDocker, { strict: true })
+        ) {
+          throw new Error('Egress network removal was not confirmed')
+        }
+      }
+      return { ok: true, ended: stopped.ended, ...(stopped.legacy ? { legacy: true } : {}) }
+    } catch (error) {
+      return egressOwnerUnknown(error)
+    }
   })
-  removeIptables(plan, runIptables)
-  stopEgressProcess(projectRoot, proxyId)
-  if (net?.name) runDocker(['network', 'rm', net.name])
-  return { ok: true }
 }
 
 export function slotNetworkForVm(vm, _env = process.env) {

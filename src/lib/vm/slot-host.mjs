@@ -85,15 +85,15 @@ import { destroyVmRuntime, officialCcUidGid, reloadSlotWorker, startVmRuntime, s
 import {
   boundProxyUrl,
   ensureProxyEgress,
-  inspectEgressProcess,
   isLocalEgressProxy,
   localEgressProxyUrl,
-  stopEgressProcess,
+  stopEgressProcessConfirmed,
 } from './egress.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { nodeEgressProxyUrl } from '../cluster/node-egress-socks.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
-import { stopCodexKernel } from '../transport/codex-kernel-supervisor.mjs'
+import { stopCodexKernel, finishCodexRecycle } from '../transport/codex-kernel-supervisor.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 
 const noop = async () => ({ skipped: true })
 
@@ -118,28 +118,16 @@ const LOCAL_HOST = Object.freeze({
     if (isCodexVm(vm)) {
       if (enabled) return { ok: true }
       const child = stopCodexKernel(vm.id)
-      if (!child || child.exitCode !== null || child.signalCode !== null) return { ok: true }
-      return new Promise((resolve) => {
-        const exited = () => {
-          clearTimeout(timeout)
-          resolve({ ok: true })
-        }
-        const timeout = setTimeout(() => {
-          child.off('exit', exited)
-          resolve({ ok: false, error: 'codex_stop_timeout' })
-        }, 2000)
-        child.once('exit', exited)
-      })
+      if (!child)
+        return isKubernetesMode()
+          ? { ok: false, code: 'codex_kernel_owner_unknown', vmOperationUncertain: true }
+          : { ok: true, notStarted: true }
+      if (!(await finishCodexRecycle(child)).exited)
+        return { ok: false, code: 'codex_kernel_exit_unconfirmed', vmOperationUncertain: true }
+      return { ok: true, ended: true }
     }
     if (enabled) return await ensureProxyEgress(projectRoot, vm.proxy)
-    const stopped = stopEgressProcess(projectRoot, vm.proxy?.id)
-    if (!stopped.ok) return stopped
-    const deadline = Date.now() + 2000
-    while (inspectEgressProcess(projectRoot, vm.proxy?.id).ok) {
-      if (Date.now() >= deadline) return { ok: false, error: 'egress_stop_timeout' }
-      await new Promise((resolve) => setTimeout(resolve, 20))
-    }
-    return stopEgressProcess(projectRoot, vm.proxy?.id)
+    return await stopEgressProcessConfirmed(projectRoot, vm.proxy?.id)
   },
   localExitProxyUrl: (vm) => (isCodexVm(vm) ? localEgressProxyUrl() : ''),
   // The container bind-mounts vms/<id>/ directly: every local write is already published.

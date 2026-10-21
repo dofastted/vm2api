@@ -532,11 +532,25 @@ export async function setRemoteProxyEgressEnabled(vm, projectRoot, enabled) {
     }
     for (const name of new Set([current, legacy])) {
       const existing = await inspectContainerOrNull(session.docker, name)
-      if (existing?.State?.Running) await containerAction(session.docker, name, 'stop')
+      if (!existing) continue
+      if (!existing.Id) return { ok: false, code: 'egress_container_unknown', vmOperationUncertain: true }
+      if (!remoteContainerStopped(existing)) {
+        try {
+          await containerAction(session.docker, existing.Id, 'stop')
+        } catch {}
+      }
+      const remaining = await inspectContainerOrNull(session.docker, existing.Id)
+      const named = await inspectContainerOrNull(session.docker, name)
+      if (
+        (remaining && !remoteContainerStopped(remaining)) ||
+        (named && (named.Id !== existing.Id || !remoteContainerStopped(named)))
+      ) {
+        return { ok: false, code: 'egress_stop_unconfirmed', vmOperationUncertain: true }
+      }
     }
-    return { ok: true }
+    return { ok: true, ended: true }
   } catch (err) {
-    return failure(err)
+    return { ...failure(err), vmOperationUncertain: true }
   }
 }
 
