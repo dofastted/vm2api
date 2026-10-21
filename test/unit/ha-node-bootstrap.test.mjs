@@ -9,8 +9,14 @@ import tls from 'node:tls'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
 import { NodeManagementGrants } from '../../src/lib/cluster/node-management-grants.mjs'
-import { getDb, createDatabase, quoteIdentifier } from '../../src/lib/db/database.mjs'
-import { GlobalMaintenanceCoordinator } from '../../src/lib/db/global-maintenance.mjs'
+import {
+  getDb,
+  createDatabase,
+  quoteIdentifier,
+  PostgresDatabase,
+  applyMigrations,
+} from '../../src/lib/db/database.mjs'
+import { coordinationSchemaFor, GlobalMaintenanceCoordinator } from '../../src/lib/db/global-maintenance.mjs'
 import { realAllocationGate } from '../fixtures/real-allocation-gate.mjs'
 import { allocateNodeSlot } from '../../src/lib/transport/slotgate-management-client.mjs'
 
@@ -535,4 +541,101 @@ nodeCase('an unsent allocation terminal commit failure retains its grant and bot
   ).rows[0]
   assert.ok(bg.unknown_at)
   assert.equal(bg.finished_at, null)
+})
+
+nodeCase('reserved VM ids are rejected before grants or node actions', async (fx) => {
+  const init = await fx.cli('trusted-init')
+  assert.equal(init.status, 0, init.out + init.err)
+  await fx.db.pool.query(fs.readFileSync(fx.output, 'utf8'))
+  for (const reserved of ['active', 'create', 'create-options', 'import', 'package', 'account-chat', 'ACTIVE']) {
+    fx.config.vm.id = reserved
+    fs.writeFileSync(fx.file, JSON.stringify(fx.config))
+    const result = await fx.cli('slot-create')
+    assert.equal(fx.calls.length, 0, `reserved id ${reserved} must not cause node actions`)
+    assert.equal(result.status, 1)
+    assert.match(result.err, /bootstrap_config_invalid/)
+    assert.equal((await fx.peer.query(`SELECT count(*)::int AS n FROM ${fx.q}.allocations`)).rows[0].n, 0)
+  }
+})
+
+async function businessSnapshot(db) {
+  const migrations = (await db.query('SELECT * FROM schema_migrations ORDER BY version')).rows
+  const columns = (
+    await db.query(
+      `SELECT table_name,column_name,data_type,is_nullable,column_default FROM information_schema.columns WHERE table_schema=$1 ORDER BY table_name,ordinal_position`,
+      [db.schema],
+    )
+  ).rows
+  const relations = (
+    await db.query(
+      `SELECT c.relname,c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 ORDER BY c.relname`,
+      [db.schema],
+    )
+  ).rows
+  return crypto.createHash('sha256').update(JSON.stringify({ migrations, columns, relations })).digest('hex')
+}
+async function targetSchema(fx, suffix, callback) {
+  const schema = fx.db.schema + suffix
+  const db = new PostgresDatabase({ connectionString: fx.db.connectionString, schema })
+  try {
+    await callback(db)
+  } finally {
+    await db.close()
+    const { nodeAuthoritySchemaFor } = await import('../../src/lib/db/node-management-authority.mjs')
+    for (const name of [nodeAuthoritySchemaFor(schema), coordinationSchemaFor(schema), schema])
+      await fx.peer.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(name)} CASCADE`)
+  }
+}
+
+nodeCase('an outdated business schema remains at 020 when trusted-init has an invalid reader', async (fx) => {
+  await targetSchema(fx, '_old', async (db) => {
+    const dir = path.join(fx.root, '020-migrations')
+    fs.mkdirSync(dir)
+    const source = fileURLToPath(new URL('../../src/lib/db/postgres-migrations/', import.meta.url))
+    for (const file of fs.readdirSync(source))
+      if (/^\d+.*\.sql$/.test(file) && Number(file.split('_')[0]) <= 20)
+        fs.copyFileSync(path.join(source, file), path.join(dir, file))
+    await applyMigrations(db, { migrationsDir: dir })
+    const before = await businessSnapshot(db)
+    fx.config.database.schema = db.schema
+    fx.config.reader.role = 'missing_reader_' + crypto.randomBytes(8).toString('hex')
+    fs.writeFileSync(fx.file, JSON.stringify(fx.config))
+    const result = await fx.cli('trusted-init')
+    assert.equal(result.status, 1)
+    assert.equal(
+      (await db.query("SELECT count(*)::int AS n FROM schema_migrations WHERE version='021'")).rows[0].n,
+      0,
+      'failed CLI must not apply migration 021',
+    )
+    assert.equal(await businessSnapshot(db), before)
+    assert.match(result.err, /database_migrations_not_current/)
+    assert.equal(
+      (await fx.peer.query('SELECT to_regnamespace($1) AS present', [coordinationSchemaFor(db.schema)])).rows[0]
+        .present,
+      null,
+    )
+  })
+})
+
+nodeCase('neither CLI command creates a missing business schema', async (fx) => {
+  for (const command of ['trusted-init', 'slot-create']) {
+    await targetSchema(fx, '_absent_' + command.replace('-', '_'), async (db) => {
+      fx.config.database.schema = db.schema
+      fs.writeFileSync(fx.file, JSON.stringify(fx.config))
+      const result = await fx.cli(command)
+      assert.equal(
+        (await fx.peer.query('SELECT to_regnamespace($1) AS present', [db.schema])).rows[0].present,
+        null,
+        `${command} must not create business schema`,
+      )
+      assert.equal(result.status, 1)
+      assert.match(result.err, /database_migrations_not_current/)
+      assert.equal(
+        (await fx.peer.query('SELECT to_regnamespace($1) AS present', [coordinationSchemaFor(db.schema)])).rows[0]
+          .present,
+        null,
+      )
+      assert.equal(fx.calls.length, 0)
+    })
+  }
 })
