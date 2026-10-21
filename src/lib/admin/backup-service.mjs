@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { Worker } from 'node:worker_threads'
-import { getDb, applyMigrations } from '../db/database.mjs'
+import { getDb, applyMigrations, quoteIdentifier } from '../db/database.mjs'
 import { sha256FileAsync, runPgTool, runProcess, extractArchiveMember } from './backup-core.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { BackupRepo } from '../db/repos/backup-repo.mjs'
@@ -347,6 +347,7 @@ export class BackupService {
       const dump = path.join(tmp, 'db', 'postgres.dump')
       const listing = await runPgTool('pg_restore', ['--list', dump], getDb().connectionString)
       const schema = getDb().schema
+      const tables = new Set()
       const allowed =
         /^(TABLE DATA|SEQUENCE OWNED BY|SEQUENCE SET|FK CONSTRAINT|TABLE|SEQUENCE|DEFAULT|CONSTRAINT|INDEX|SCHEMA|COMMENT) (\S+) (.+)$/
       for (const line of listing.split('\n')) {
@@ -362,8 +363,9 @@ export class BackupService {
         ) {
           throw new Error('backup contains objects outside the application schema allowlist')
         }
+        if (item[1] === 'TABLE') tables.add(item[3].split(' ')[0])
       }
-      return { tmp, dump, manifest }
+      return { tmp, dump, manifest, tables }
     } catch (error) {
       fs.rmSync(tmp, { recursive: true, force: true })
       throw error
@@ -398,20 +400,44 @@ export class BackupService {
   }
 
   async _applyArchive(archive) {
+    const db = getDb()
+    // pg_restore --clean only removes objects present in the archive. Later
+    // migrations can add tables (including login sessions) that must disappear
+    // before restoring an older snapshot and reapplying those migrations.
+    const extraTables = (await db.prepare('SELECT tablename FROM pg_tables WHERE schemaname=$1').all(db.schema))
+      .map(({ tablename }) => tablename)
+      .filter((name) => !archive.tables.has(name))
+    const cleanup = path.join(archive.tmp, 'cleanup.sql')
+    const restore = path.join(archive.tmp, 'restore.sql')
+    fs.writeFileSync(
+      cleanup,
+      extraTables.length
+        ? `DROP TABLE ${extraTables.map((name) => `${quoteIdentifier(db.schema)}.${quoteIdentifier(name)}`).join(', ')};\n`
+        : '',
+      { mode: 0o600 },
+    )
+    fs.writeFileSync(restore, '', { mode: 0o600 })
     await runPgTool(
       'pg_restore',
       [
         '--clean',
         '--if-exists',
-        '--single-transaction',
         '--no-owner',
         '--no-privileges',
-        `--schema=${getDb().schema}`,
-        '--dbname',
-        decodeURIComponent(new URL(getDb().connectionString).pathname.slice(1)),
+        `--schema=${db.schema}`,
+        '--file',
+        restore,
         archive.dump,
       ],
-      getDb().connectionString,
+      db.connectionString,
+    )
+    // Both the removal and restore must commit together. RESTRICT (the default)
+    // also refuses dependencies outside the application schema without deleting
+    // neighboring objects. psql streams the potentially multi-GB SQL file.
+    await runPgTool(
+      'psql',
+      ['--no-psqlrc', '--quiet', '--single-transaction', '--set=ON_ERROR_STOP=1', '--file', cleanup, '--file', restore],
+      db.connectionString,
     )
     this._restoreFiles(archive.tmp)
     await applyMigrations(getDb())

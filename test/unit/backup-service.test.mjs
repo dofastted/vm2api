@@ -92,6 +92,34 @@ test('restoring a PG 001 snapshot removes later tables before reapplying migrati
   assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 2)
 })
 
+test('an outside dependency refuses older-snapshot cleanup without changing either schema', async () => {
+  const db = getDb()
+  await db.exec("DROP TABLE panel_sessions; DELETE FROM schema_migrations WHERE version='002'")
+  await new SettingsRepo(db).set('older-snapshot', 'before')
+  const rec = await svc.createBackup()
+  const archive = await svc._extractArchive(rec)
+  const neighbor = `"${db.schema}_neighbor"`
+  try {
+    await applyMigrations(db)
+    await new SettingsRepo(db).set('older-snapshot', 'after')
+    await db
+      .prepare('INSERT INTO panel_sessions VALUES($1,$2,$3,$4)')
+      .run('later', 'admin', 'admin', Date.now() + 60000)
+    await db.exec(`CREATE SCHEMA ${neighbor}; CREATE TABLE ${neighbor}.sentinel(token text REFERENCES panel_sessions(token_hash));
+      INSERT INTO ${neighbor}.sentinel VALUES('later')`)
+    await assert.rejects(
+      db.withMaintenance(() => svc._applyArchive(archive)),
+      /psql failed/,
+    )
+    assert.equal(await new SettingsRepo(db).get('older-snapshot'), 'after')
+    assert.equal((await db.prepare('SELECT token_hash FROM panel_sessions').get()).token_hash, 'later')
+    assert.equal((await db.prepare(`SELECT token FROM ${neighbor}.sentinel`).get()).token, 'later')
+  } finally {
+    await db.exec(`DROP SCHEMA IF EXISTS ${neighbor} CASCADE`)
+    fs.rmSync(archive.tmp, { recursive: true, force: true })
+  }
+})
+
 test('createBackup produces tar.gz with manifest + db + vms + config, records ok', async () => {
   seedVm()
   await initVmDbSync(root, { watch: false })
