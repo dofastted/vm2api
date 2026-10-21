@@ -1,6 +1,7 @@
 import crypto from 'node:crypto'
 import { withTransaction } from '../database.mjs'
 import { physicalContainerName, physicalVmAliases } from '../../vm/vm-physical-target.mjs'
+import { readWatchdogState } from '../../transport/kernel-watchdog-state.mjs'
 
 function invalid(field) {
   return Object.assign(new Error(`Invalid execution admission ${field}`), { code: 'invalid_execution_admission' })
@@ -88,7 +89,9 @@ export class ExecutionAdmissionsRepo {
     if (vmId != null) identifier(vmId, 'vmId')
     if (accountId == null && vmId == null) throw invalid('resource')
     const { now } = await this.db.prepare('SELECT clock_timestamp() AS now').get()
-    return this._counts(accountId ?? null, vmId ?? null, now)
+    const counts = await this._counts(accountId ?? null, vmId ?? null, now)
+    const fault = vmId == null ? null : (await readWatchdogState(this.db, vmId)).fault
+    return fault ? { ...counts, kernelFault: fault } : counts
   }
 
   async tryReserve(input = {}) {
@@ -114,6 +117,7 @@ export class ExecutionAdmissionsRepo {
         .prepare('SELECT id FROM vms WHERE id = ANY($1::text[]) AND schedulable IS DISTINCT FROM 1 LIMIT 1')
         .get(physicalVmAliases(vmId))
       if (held) return denied('vm_not_schedulable', 0, vmLimit)
+      if ((await readWatchdogState(this.db, vmId)).fault) return denied('kernel_faulted', 0, vmLimit)
       const alias = await this.db
         .prepare(`SELECT id FROM execution_admissions
           WHERE vm_id = ANY($1::text[]) AND vm_id <> $2 AND released_at IS NULL LIMIT 1`)

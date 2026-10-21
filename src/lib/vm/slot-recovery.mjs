@@ -527,7 +527,7 @@ export async function recoverSlot({
     // Only an attempted boot earns a fresh budget; a cycle that never reached start fixed nothing.
     if (watchdog?.reset && proceed) {
       await step('watchdog_reset', async () => {
-        const { faulted } = watchdog.reset(id)
+        const { faulted } = await watchdog.reset(id)
         return { ok: true, message: faulted ? '已清除内核故障标记与重启计数' : '重启计数已清零' }
       })
     }

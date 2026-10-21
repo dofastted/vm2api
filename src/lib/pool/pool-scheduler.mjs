@@ -1315,7 +1315,9 @@ export class PoolScheduler extends EventEmitter {
     }
     if (this.shared && gateZone === GATE_DRAINING && inflight > 0) markWait('quota_band_inflight')
     // A sticky preference must not bypass exhausted kernel recovery.
-    if (kernelFaults.has(vm.id)) return { ok: false, reason: 'kernel_faulted' }
+    if (this.shared ? sharedCounts.kernelFault : kernelFaults.has(vm.id)) {
+      return { ok: false, reason: 'kernel_faulted' }
+    }
     // Node offline or asleep: the relay has no link behind it, a pick would only fail. Back on reconnect.
     if (!vmNodeReady(vm)) return { ok: false, reason: 'node_offline' }
     if (rustKernelBusy(workerStatus)) {

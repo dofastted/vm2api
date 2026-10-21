@@ -76,3 +76,36 @@ test('operator watchdog reset persists before another controller admits a reques
   assert.equal(next.ok, true)
   await next.release()
 })
+
+test('a state persistence failure after watchdog recovery retains both durable claims', async () => {
+  const db = getDb()
+  const at = (await db.prepare('SELECT extract(epoch FROM clock_timestamp()) * 1000 AS now').get()).now
+  await new SettingsRepo(db).set(key, state({ nextAt: at - 1 }))
+  await db.exec(`CREATE FUNCTION reject_watchdog_state() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.key LIKE 'kernel_watchdog_state:%' THEN
+        RAISE EXCEPTION 'synthetic watchdog state failure' USING ERRCODE = 'P6498';
+      END IF;
+      RETURN NEW;
+    END $$;
+    CREATE TRIGGER reject_watchdog_state BEFORE INSERT OR UPDATE ON settings
+    FOR EACH ROW EXECUTE FUNCTION reject_watchdog_state()`)
+  let recovered = 0
+  const watchdog = createKernelWatchdog({
+    listTargets: () => [{ id: vmId, status: 'running' }],
+    health: async () => ({ ok: true, healthy: false }),
+    observeRuntime: async () => ({ state: 'running' }),
+    ensure: async () => {
+      recovered++
+      return { ok: true }
+    },
+    sharedTasks: new SharedBackgroundTasks(db),
+    operations: new SharedVmOperations(db),
+  })
+  await watchdog.tick()
+  assert.equal(recovered, 1)
+  assert.equal((await reserve()).code, 'vm_operation_active')
+  const row = await db.prepare('SELECT unknown_at, finished_at FROM background_task_runs').get()
+  assert.ok(row.unknown_at)
+  assert.equal(row.finished_at, null)
+})

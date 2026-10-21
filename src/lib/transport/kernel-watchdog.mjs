@@ -30,6 +30,7 @@ import { backgroundTasksFor } from '../core/shared-background-tasks.mjs'
 import { SharedVmOperations } from '../vm/shared-vm-operations.mjs'
 import { physicalContainerName } from '../vm/vm-physical-target.mjs'
 import { flushVmDbSync } from '../vm/vm-db-sync.mjs'
+import { readWatchdogState, writeWatchdogState } from './kernel-watchdog-state.mjs'
 
 /** A failed observation is not evidence of a dead container. Use the slot's own host, including KVM runners. */
 export async function observeWatchdogContainer(
@@ -185,6 +186,27 @@ export function createKernelWatchdog({
   const tasks = backgroundTasksFor(sharedTasks)
   const mutations = operations || (tasks ? new SharedVmOperations(tasks.db) : null)
   const sideEffects = new Set()
+  const databaseTimes = new Map()
+  const clock = (vm) => (tasks ? databaseTimes.get(vm.id) : now())
+
+  function adoptState(vmId, state) {
+    if (state.nextAt == null) restarts.delete(vmId)
+    else restarts.set(vmId, { attempts: [...state.attempts], nextAt: state.nextAt })
+    telemetryDue.set(vmId, state.telemetryDue)
+    if (state.fault) kernelFaults.set(vmId, state.fault)
+    else kernelFaults.delete(vmId)
+  }
+
+  function currentState(vmId) {
+    const budget = restarts.get(vmId)
+    return {
+      version: 1,
+      attempts: budget?.attempts || [],
+      nextAt: budget?.nextAt ?? null,
+      telemetryDue: telemetryDue.get(vmId) || 0,
+      fault: kernelFaults.get(vmId) || null,
+    }
+  }
 
   function trackSideEffect(operation) {
     sideEffects.add(operation)
@@ -258,7 +280,7 @@ export function createKernelWatchdog({
   /** One VM's check. `held` is re-read after every await: an operator cycle may start mid-check. */
   async function reviveDownContainer(vm, state, markUnknown = () => {}) {
     if (vm.status !== 'running' || typeof revive !== 'function') return
-    if (!(await admitRestart(vm, `container ${state}`, now()))) return
+    if (!(await admitRestart(vm, `container ${state}`, clock(vm)))) return
     const revived = await revive(vm)
     if (tasks && revived?.ok !== true) markUnknown()
     if (!revived?.ok) console.warn(`[kernel-watchdog] ${vm.id} boot failed: ${revived?.error || revived?.code}`)
@@ -301,7 +323,7 @@ export function createKernelWatchdog({
     // Permission/transport failures and deliberately paused containers never authorize recovery.
     if (!['running', 'missing', 'stopped', 'restarting'].includes(observed?.state)) return
     if (observed.state !== 'running') return reviveDownContainer(vm, observed.state, markUnknown)
-    if (!(await admitRestart(vm, reason, now()))) return
+    if (!(await admitRestart(vm, reason, clock(vm)))) return
     console.warn(`[kernel-watchdog] ${vm.id} restarting container: ${reason}`)
     const result = await ensure(exec, { timeoutMs: config.timeout_ms })
     if (tasks && result?.ok !== true) markUnknown()
@@ -344,13 +366,23 @@ export function createKernelWatchdog({
                   await mutations.run(
                     vm.id,
                     async () => {
+                      adoptState(vm.id, await readWatchdogState(tasks.db, vm.id))
+                      const at = (
+                        await tasks.db.prepare('SELECT extract(epoch FROM clock_timestamp()) * 1000 AS now').get()
+                      ).now
+                      databaseTimes.set(vm.id, at)
                       const markUnknown = () => {
                         unknown = true
                       }
-                      if (isTelemetryHealTarget(vm)) await healTelemetry(vm, now(), markUnknown)
-                      if (isKernelWatchdogTarget(vm, routing)) await checkVm(vm, routing, markUnknown)
-                      await flushVmDbSync()
-                      return { vmOperationUncertain: unknown }
+                      try {
+                        if (isTelemetryHealTarget(vm)) await healTelemetry(vm, at, markUnknown)
+                        if (isKernelWatchdogTarget(vm, routing)) await checkVm(vm, routing, markUnknown)
+                        await writeWatchdogState(tasks.db, vm.id, currentState(vm.id))
+                        await flushVmDbSync()
+                        return { vmOperationUncertain: unknown }
+                      } finally {
+                        databaseTimes.delete(vm.id)
+                      }
                     },
                     { kind: 'kernel_watchdog' },
                   )
@@ -415,6 +447,18 @@ export function createKernelWatchdog({
     },
     /** Operator recovery: drop the L5 fault and spent budget so the next failure starts fresh. */
     reset(vmId) {
+      if (tasks)
+        return mutations.run(
+          vmId,
+          async () => {
+            const previous = await readWatchdogState(tasks.db, vmId)
+            const state = { ...previous, attempts: [], nextAt: null, fault: null }
+            await writeWatchdogState(tasks.db, vmId, state)
+            adoptState(vmId, state)
+            return { faulted: !!previous.fault }
+          },
+          { kind: 'watchdog_reset' },
+        )
       const faulted = kernelFaults.delete(vmId)
       restarts.delete(vmId)
       return { faulted }
