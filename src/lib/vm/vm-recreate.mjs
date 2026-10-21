@@ -168,6 +168,7 @@ export function buildRecreatedVmRecord(prev, generated, { mode = 'traits' } = {}
     ...(prev.persona_preset ? { persona_preset: prev.persona_preset } : {}),
     ...(prev.node_id ? { node_id: prev.node_id } : {}),
     ...(prev.owner_user_id ? { owner_user_id: prev.owner_user_id } : {}),
+    ...(prev.origin ? { origin: prev.origin } : {}),
   }
   if (!keep || next.schedule_disabled_reason) next.schedulable = false
   if (keep && !next.schedule_disabled_reason) next.schedulable = prev.schedulable !== false
