@@ -27,7 +27,19 @@ async function fixture(t) {
 }
 
 function success() {
-  return { ok: true, status: 200, terminalState: 'verified', body: { type: 'message', id: 'msg_synthetic', role: 'assistant', content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 } } }
+  return {
+    ok: true,
+    status: 200,
+    terminalState: 'verified',
+    body: {
+      type: 'message',
+      id: 'msg_synthetic',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'ok' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 1, output_tokens: 1 },
+    },
+  }
 }
 
 for (const initial of ['absent', 'tombstone']) {
@@ -67,10 +79,17 @@ test('runner rejects shared native-session CAS conflict before submission', asyn
     canonicalBody: { model: 'claude-test' },
     applyAttempt: async () => {
       await fx.peer.refresh()
-      await fx.peer.rebindFamilyShared(key, { accountId: 'account-b', vmId: 'vm-b' }, { ifGeneration: fx.peer.versionOf(key) })
+      await fx.peer.rebindFamilyShared(
+        key,
+        { accountId: 'account-b', vmId: 'vm-b' },
+        { ifGeneration: fx.peer.versionOf(key) },
+      )
       return { body: {}, meta: { sessionId: 'native-a' } }
     },
-    callAttempt: async () => { calls++; return success() },
+    callAttempt: async () => {
+      calls++
+      return success()
+    },
   })
   assert.equal(calls, 0)
   assert.equal(result.status, 503)
@@ -88,7 +107,11 @@ test('runner late success preserves shared pin moved during execution', async (t
     applyAttempt: () => ({ body: {}, meta: { sessionId: 'native-a' } }),
     callAttempt: async () => {
       await fx.peer.refresh()
-      await fx.peer.rebindFamilyShared(key, { accountId: 'account-b', vmId: 'vm-b' }, { ifGeneration: fx.peer.versionOf(key) })
+      await fx.peer.rebindFamilyShared(
+        key,
+        { accountId: 'account-b', vmId: 'vm-b' },
+        { ifGeneration: fx.peer.versionOf(key) },
+      )
       await fx.router.refresh()
       return success()
     },
@@ -131,4 +154,35 @@ test('scheduler shared reconciliation preserves a pin moved while clearing the o
   assert.equal(result.vmId, 'vm-b')
   assert.deepEqual(result.match, candidate)
   assert.equal((await fx.peer.persistence.get(key)).vm_id, 'vm-b')
+})
+
+test('runner retains its own generation changes when retiring an empty native session', async (t) => {
+  const fx = await fixture(t)
+  fx.runner.reloadConfig({ same_account_retry_delay_ms: 0 })
+  let calls = 0
+  const result = await fx.runner.run({
+    requestId: 'runner-empty-retire',
+    stickyKey: 'runner-empty-retire',
+    canonicalBody: { model: 'claude-test' },
+    applyAttempt: (_body, _selected, { attemptNo }) => ({ body: {}, meta: { sessionId: `native-${attemptNo}` } }),
+    callAttempt: async () => {
+      calls++
+      if (calls === 1)
+        return {
+          ok: true,
+          status: 200,
+          terminalState: 'verified',
+          body: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'thinking', thinking: 'draft', signature: 'sig' }],
+            stop_reason: null,
+          },
+        }
+      return success()
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(calls, 2)
+  assert.equal((await fx.peer.persistence.get('runner-empty-retire')).session_id, 'native-2')
 })

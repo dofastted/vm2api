@@ -454,8 +454,18 @@ export class PoolScheduler extends EventEmitter {
       const preferred = avoid?.size
         ? available.filter((candidate) => !avoid.has(candidate.accountId) && !avoid.has(candidate.vmId))
         : available
+      const stickySnapshot = this.stickyRouter?.shared
+        ? await this.reconcileStickyShared({
+            stickyKey,
+            stickyKeys,
+            eligible: candidates,
+            spilled,
+            familyVmId: familyGated ? null : familyVm,
+          })
+        : null
       let selected = this.pick(preferred, {
         stickyKey,
+        stickySnapshot,
         eligible: candidates,
         spilled,
         stickyKeys,
@@ -621,13 +631,16 @@ export class PoolScheduler extends EventEmitter {
         // A grant can land while eligibility was being re-read.
         if (ticket?.granted) return finish(ticket.granted)
         if (familyVm && !candidates.some((candidate) => candidate.vmId === familyVm)) familyGated = true
-        const sticky = this.reconcileSticky({
-          stickyKey,
-          stickyKeys,
-          eligible: candidates,
-          spilled,
-          familyVmId: familyGated ? null : familyVm,
-        })
+        const sticky = await (this.stickyRouter?.shared ? this.reconcileStickyShared : this.reconcileSticky).call(
+          this,
+          {
+            stickyKey,
+            stickyKeys,
+            eligible: candidates,
+            spilled,
+            familyVmId: familyGated ? null : familyVm,
+          },
+        )
         if (sticky.cleared) stickyCleared = true
         const byVm = new Map(candidates.map((candidate) => [candidate.vmId, candidate]))
         if (ticket) ticket.candidates = byVm
@@ -954,6 +967,10 @@ export class PoolScheduler extends EventEmitter {
    * `spilled` homes keep their pin. Returns the VM the pin still points at.
    */
   reconcileSticky({ stickyKey = null, stickyKeys = null, eligible = [], spilled = null, familyVmId = null } = {}) {
+    if (stickyKey && this.stickyRouter?.shared)
+      throw Object.assign(new Error('Shared sticky reconciliation requires the asynchronous API'), {
+        code: 'shared_sticky_async_required',
+      })
     const bound = stickyKey ? this.stickyRouter?.resolve?.(stickyKey) : null
     if (!bound) return { cleared: false, vmId: null, match: null }
     const familyVm = familyVmId ? String(familyVmId).trim() : ''
@@ -973,6 +990,34 @@ export class PoolScheduler extends EventEmitter {
       return { cleared: true, vmId: null, match: null }
     }
     return { cleared: false, vmId: bound.vmId, match }
+  }
+
+  async reconcileStickyShared({
+    stickyKey = null,
+    stickyKeys = null,
+    eligible = [],
+    spilled = null,
+    familyVmId = null,
+  } = {}) {
+    if (!stickyKey || !this.stickyRouter) return { cleared: false, vmId: null, match: null }
+    await this.stickyRouter.refresh()
+    const bound = this.stickyRouter.resolve(stickyKey)
+    if (!bound) return { cleared: false, vmId: null, match: null }
+    const matchFor = (pin) =>
+      eligible.find((candidate) => candidate.vmId === pin?.vmId && candidate.accountId === pin?.accountId) || null
+    const match = matchFor(bound)
+    const familyMoved =
+      familyVmId && bound.vmId !== familyVmId && eligible.some((candidate) => candidate.vmId === familyVmId)
+    const clear =
+      familyMoved ||
+      (!match && !spilled?.has(bound.accountId)) ||
+      (match?.busy && !stickyShouldWait(match.waitReason, match.cooldownReason))
+    if (!clear) return { cleared: !match, vmId: match ? bound.vmId : null, match }
+    const results = await this.releaseSticky(bound, stickyKey, stickyKeys)
+    const primary = results.find((result) => result.key === stickyKey)
+    if (primary?.applied) return { cleared: true, vmId: null, match: null }
+    const current = this.stickyRouter.resolve(stickyKey)
+    return { cleared: false, vmId: current?.vmId || null, match: matchFor(current) }
   }
 
   async eligibleCandidates({
@@ -1107,7 +1152,7 @@ export class PoolScheduler extends EventEmitter {
       const modelGate = slotAllowsModel({ vm, account, model })
       if (!modelGate.ok) return modelGate
       if (account) {
-        this.syncQuotaSchedule(vm, account)
+        await this.syncQuotaSchedule(vm, account)
         if (this.projectRoot) {
           const live = getVm(this.projectRoot, vm.id)
           if (live) {
@@ -1305,6 +1350,7 @@ export class PoolScheduler extends EventEmitter {
     if (cached && now - cached.at < this.config.worker_health_ttl_ms) {
       return cached.value
     }
+    const observation = await this.runtimeRepo?.beginObservation?.()
     let value
     try {
       value = await this.workerHealth(exec, { signal })
@@ -1317,15 +1363,18 @@ export class PoolScheduler extends EventEmitter {
       const prevGen = Number(prev?.credential_generation) || 0
       const nextGen = Number(value?.credential?.generation) || 0
       const effectiveGen = Math.max(prevGen, nextGen)
-      this.runtimeRepo.upsert({
-        account_id: exec.accountId,
-        vm_id: exec.vmId,
-        status: runtimeHealthStatus(value),
-        worker_heartbeat_at: now,
-        worker_status: value,
-        credential_generation: effectiveGen,
-        refresh_status: value?.credential?.credential_state || (value?.credential?.needs_refresh ? 'needed' : 'fresh'),
-      })
+      this.runtimeRepo.upsert(
+        {
+          account_id: exec.accountId,
+          status: runtimeHealthStatus(value),
+          worker_heartbeat_at: now,
+          worker_status: value,
+          credential_generation: effectiveGen,
+          refresh_status:
+            value?.credential?.credential_state || (value?.credential?.needs_refresh ? 'needed' : 'fresh'),
+        },
+        { vmId: exec.vmId, observation },
+      )
       const liveMs = expiresAtToMs(value?.credential?.expires_at)
       const prevMs = expiresAtToMs(prev?.worker_status?.credential?.expires_at)
       if (
@@ -1399,8 +1448,22 @@ export class PoolScheduler extends EventEmitter {
   }
 
   /** Session leaves this VM: drop its alias keys. A device seat lives in the planner, not here. */
-  releaseSticky(bound, stickyKey, stickyKeys) {
-    const keys = Array.isArray(stickyKeys) && stickyKeys.length ? stickyKeys : stickyKey ? [stickyKey] : []
+  releaseSticky(bound, stickyKey, stickyKeys, versions = null) {
+    const keys = [...new Set([stickyKey, ...(Array.isArray(stickyKeys) ? stickyKeys : [])].filter(Boolean))]
+    if (this.stickyRouter?.shared) {
+      const snapshots = keys.map((key) => ({
+        key,
+        record: this.stickyRouter.resolve(key),
+        generation: versions?.get(key) ?? this.stickyRouter.versionOf(key),
+      }))
+      return Promise.all(
+        snapshots.map(async ({ key, record, generation }) => {
+          if (record && bound?.accountId && (record.accountId !== bound.accountId || record.vmId !== bound.vmId))
+            return { key, applied: false }
+          return { key, ...(await this.stickyRouter.unbindShared(key, { ifGeneration: generation })) }
+        }),
+      )
+    }
     for (const key of keys) this.stickyRouter?.unbind?.(key)
   }
 
@@ -1411,6 +1474,7 @@ export class PoolScheduler extends EventEmitter {
    */
   releaseAccountSessions({ accountId = null, vmId = null } = {}) {
     if (!accountId && !vmId) return 0
+    if (this.stickyRouter?.shared) return this.stickyRouter.unbindByAccountShared({ accountId, vmId })
     return this.stickyRouter?.unbindByAccount?.({ accountId, vmId }) || 0
   }
 
@@ -1423,17 +1487,27 @@ export class PoolScheduler extends EventEmitter {
    */
   pick(
     candidates,
-    { stickyKey, eligible = candidates, spilled = null, stickyKeys = null, deviceVmId = null, familyVmId = null } = {},
+    {
+      stickyKey,
+      stickySnapshot = null,
+      eligible = candidates,
+      spilled = null,
+      stickyKeys = null,
+      deviceVmId = null,
+      familyVmId = null,
+    } = {},
   ) {
     this.lastStickyCleared = false
     if (!candidates.length && !eligible?.length) return null
-    const sticky = this.reconcileSticky({
-      stickyKey,
-      stickyKeys,
-      eligible: eligible || candidates,
-      spilled,
-      familyVmId,
-    })
+    const sticky =
+      stickySnapshot ||
+      this.reconcileSticky({
+        stickyKey,
+        stickyKeys,
+        eligible: eligible || candidates,
+        spilled,
+        familyVmId,
+      })
     this.lastStickyCleared = sticky.cleared
     let borrowed = false
     if (sticky.match) {
@@ -1733,37 +1807,42 @@ export class PoolScheduler extends EventEmitter {
     this.emit('change')
   }
 
-  markSuccess(candidate, { workerStatus = null, countUsage = true } = {}) {
+  markSuccess(candidate, { workerStatus = null, countUsage = true, observation } = {}) {
     const now = Date.now()
     if (countUsage !== false) this.accountQuota?.noteBandSettled?.(candidate.accountId)
-    const prev = this.runtimeRepo?.get?.(candidate.accountId)
     if (countUsage !== false) this.lastUsed.set(candidate.accountId, now)
-    this.runtimeRepo?.upsert?.({
-      account_id: candidate.accountId,
-      vm_id: candidate.vmId,
-      status: 'ready',
-      priority: candidate.priority,
-      weight: candidate.weight,
-      cooldown_until: null,
-      cooldown_reason: null,
-      last_used_at: countUsage === false ? prev?.last_used_at || this.lastUsed.get(candidate.accountId) || null : now,
-      worker_heartbeat_at: workerStatus ? now : candidate.state?.worker_heartbeat_at,
-      worker_status: workerStatus || candidate.state?.worker_status || null,
-    })
-    if (this.projectRoot && candidate.vmId) {
+    this.runtimeRepo?.upsert?.(
+      {
+        account_id: candidate.accountId,
+        ...(!this.shared
+          ? {
+              status: 'ready',
+              priority: candidate.priority,
+              weight: candidate.weight,
+              cooldown_until: null,
+              cooldown_reason: null,
+            }
+          : {}),
+        ...(countUsage === false ? {} : { last_used_at: now }),
+        ...(workerStatus ? { worker_heartbeat_at: now, worker_status: workerStatus } : {}),
+      },
+      { vmId: candidate.vmId, observation },
+    )
+    if (!this.shared && this.projectRoot && candidate.vmId) {
       try {
         clearVmAuthCooldown(vmJsonPath(this.projectRoot, candidate.vmId))
       } catch {}
     }
   }
 
-  markCooldown(candidate, { until, reason, model = null, status = 'cooldown' } = {}) {
+  markCooldown(candidate, { until, reason, model = null, status = 'cooldown', observation } = {}) {
     this.runtimeRepo?.markCooldown?.(candidate.accountId, {
       vmId: candidate.vmId,
       until,
       reason,
       model: model ? normalizeModel(model) : null,
       status,
+      observation,
     })
     if (isAuthCooldownReason(reason) && this.projectRoot && candidate.vmId) {
       try {
@@ -2015,14 +2094,18 @@ export class PoolScheduler extends EventEmitter {
       return { action: 'restrict', reason: ev.reason, until }
     }
     if (ev.accept) {
-      this.clearQuotaRestriction(vm, accountId, file)
-      if (leftover) {
-        setVmSchedulable(this.projectRoot, vm.id, true, null, { preserveStatus: true, source: 'force' })
-        vm.schedulable = true
-        vm.schedule_disabled_reason = null
-        return { action: 'enable', reason: null }
+      const finish = (cleared) => {
+        if (cleared === false) return { action: 'keep', reason: 'quota_state_changed' }
+        if (leftover) {
+          setVmSchedulable(this.projectRoot, vm.id, true, null, { preserveStatus: true, source: 'force' })
+          vm.schedulable = true
+          vm.schedule_disabled_reason = null
+          return { action: 'enable', reason: null }
+        }
+        return { action: 'clear', reason: null }
       }
-      return { action: 'clear', reason: null }
+      const cleared = this.clearQuotaRestriction(vm, accountId, file)
+      return cleared?.then ? cleared.then(finish) : finish(cleared)
     }
     if (leftover) {
       setVmSchedulable(this.projectRoot, vm.id, true, null, { preserveStatus: true, source: 'force' })
@@ -2057,7 +2140,21 @@ export class PoolScheduler extends EventEmitter {
     const reason = state?.cooldown_reason || vm.claude?.temp_unschedulable_reason || vm.temp_unschedulable_reason
     if (reason && !isAccountRestrictionReason(reason) && !isQuotaWindowReason(reason)) return false
     if (isAuthCooldownReason(reason)) return false
-    if (state && isAccountRestrictionReason(state.cooldown_reason)) {
+    const apply = () => {
+      const next = clearVmQuotaRestriction(file)
+      if (next) {
+        vm.claude = next.claude || vm.claude
+        delete vm.temp_unschedulable_until
+        delete vm.temp_unschedulable_reason
+      }
+      return true
+    }
+    if (state && (isAccountRestrictionReason(state.cooldown_reason) || isQuotaWindowReason(state.cooldown_reason))) {
+      if (this.shared) {
+        return this.runtimeRepo
+          .clearQuotaCooldownCommitted(accountId, { vmId: vm.id })
+          .then((applied) => (applied ? apply() : false))
+      }
       this.runtimeRepo?.upsert?.({
         account_id: accountId,
         vm_id: vm.id,
@@ -2066,13 +2163,7 @@ export class PoolScheduler extends EventEmitter {
         status: 'ready',
       })
     }
-    const next = clearVmQuotaRestriction(file)
-    if (next) {
-      vm.claude = next.claude || vm.claude
-      delete vm.temp_unschedulable_until
-      delete vm.temp_unschedulable_reason
-    }
-    return true
+    return apply()
   }
 
   snapshot() {

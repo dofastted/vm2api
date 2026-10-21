@@ -819,6 +819,8 @@ async function requireAuth(req, res) {
     invalidatePriceCatalog()
     await accountQuota.refresh?.()
     await proxyPool.refresh?.()
+    await runtimeRepo?.refresh?.()
+    await stickyRouter?.refresh?.()
   }
   // Panel session
   const session = await verifyPanelSession(token)

@@ -413,19 +413,20 @@ function selectionFailure(selected, { excluded, lastPolicy, lastResult, hops }) 
   return failed
 }
 
-function applyCooldown(scheduler, selected, policy, model, { diagnosticPin = false } = {}) {
+async function applyCooldown(scheduler, selected, policy, model, { diagnosticPin = false, observation } = {}) {
   if (policy?.action !== 'continue-and-cooldown' && policy?.action !== 'disable' && policy?.action !== 'pause') return
   // VM / master pin is a diagnostic. A 401 from the wrong inbound class
   // must not forever-park a Setup Token that has no refresh by design.
   if (diagnosticPin && (policy.reason === 'oauth_no_refresh' || policy.reason === 'oauth_revoked')) {
     return
   }
-  scheduler.markCooldown(selected, {
+  await scheduler.markCooldown(selected, {
     until:
       policy.action === 'disable' || policy.reason === 'oauth_no_refresh' || policy.reason === 'oauth_revoked'
         ? Number.MAX_SAFE_INTEGER
         : policy.cooldownUntil,
     reason: policy.reason,
+    observation,
     model: policy.scope === 'model' ? policy.model || model : null,
     status:
       policy.action === 'disable' || policy.reason === 'oauth_no_refresh' || policy.reason === 'oauth_revoked'
@@ -436,7 +437,7 @@ function applyCooldown(scheduler, selected, policy, model, { diagnosticPin = fal
   // conversation pin: other seats absorb this turn. Quota and auth move
   // every conversation off the unit, windows included (#163).
   if (policy.scope === 'account' && policy.action !== 'pause' && !SOFT_COOLDOWN_REASONS.has(policy.reason)) {
-    scheduler.releaseAccountSessions?.({ accountId: selected?.accountId, vmId: selected?.vmId })
+    await scheduler.releaseAccountSessions?.({ accountId: selected?.accountId, vmId: selected?.vmId })
   }
 }
 
@@ -485,16 +486,23 @@ export class FailoverRunner {
    * Client cancellation only ends its job; kernel cancel_ack fences slot reuse.
    * Planner seat indexes are not kernel native slots.
    */
-  retireOutboundSession(selected, bindKeys) {
+  async retireOutboundSession(selected, bindKeys, versions = null) {
     if (!selected?.vmId) return
     for (const key of bindKeys || []) {
       const bound = this.stickyRouter?.resolve?.(key)
       if (bound?.accountId !== selected.accountId) continue
-      this.stickyRouter?.bind?.(
+      const changed = await (this.stickyRouter.shared ? this.stickyRouter.bindShared : this.stickyRouter.bind)?.call(
+        this.stickyRouter,
         key,
         { accountId: selected.accountId, vmId: selected.vmId },
-        { countHit: false, replaceSession: true, clearSlot: true },
+        {
+          countHit: false,
+          replaceSession: true,
+          clearSlot: true,
+          ...(this.stickyRouter.shared ? { ifGeneration: versions?.get(key) ?? this.stickyRouter.versionOf(key) } : {}),
+        },
       )
+      if (this.stickyRouter.shared && changed.applied) versions?.set(key, changed.generation)
     }
   }
 
@@ -527,15 +535,15 @@ export class FailoverRunner {
     }
   }
 
-  forgetCredential(selected, policy, { familyKey = null, sessionKeys = [] } = {}) {
+  async forgetCredential(selected, policy, { familyKey = null, sessionKeys = [], versions = null } = {}) {
     if (familyKey) {
-      this.scheduler.releaseSticky?.(selected, null, sessionKeys)
+      await this.scheduler.releaseSticky?.(selected, null, sessionKeys, versions)
     } else {
-      this.scheduler.releaseAccountSessions?.({ accountId: selected?.accountId, vmId: selected?.vmId })
+      await this.scheduler.releaseAccountSessions?.({ accountId: selected?.accountId, vmId: selected?.vmId })
     }
     if (typeof this.onCredentialFailure === 'function') {
       try {
-        this.onCredentialFailure({ selected, policy })
+        await this.onCredentialFailure({ selected, policy })
       } catch {}
     }
   }
@@ -638,6 +646,7 @@ export class FailoverRunner {
   } = {}) {
     if (!this.scheduler) throw new Error('FailoverRunner requires a scheduler')
     if (typeof callAttempt !== 'function') throw new Error('FailoverRunner requires callAttempt')
+    if (this.stickyRouter?.shared) await this.stickyRouter.refresh()
     const startedAt = Date.now()
     const budget = new AttemptCoordinator({
       maxSameUnitRetries: Number(this.config.max_same_account_retries ?? 1),
@@ -651,15 +660,21 @@ export class FailoverRunner {
     // Accounts left only because the kernel had no free slot; their pins stay.
     const spilled = budget.spilled
     const bindKeys = uniqueStickyKeys(stickyKey, stickyKeys)
-    const pinKeys = familyKey ? [...bindKeys, familyKey] : bindKeys
+    const pinKeys = [...bindKeys, familyKey, deviceKey].filter(Boolean)
     // Pins as this request last saw them. A pin moved by someone else since
     // (quota migration, credential death) is never written back by a late hop.
     const pinBaseline = new Map()
+    const pinVersions = new Map()
     const snapshotPins = () => {
-      for (const key of pinKeys) pinBaseline.set(key, this.stickyRouter?.resolve?.(key) || null)
+      for (const key of pinKeys) {
+        if (this.stickyRouter?.shared && pinVersions.has(key)) continue
+        pinBaseline.set(key, this.stickyRouter?.resolve?.(key) || null)
+        pinVersions.set(key, this.stickyRouter?.versionOf?.(key) || 0)
+      }
     }
     const pinMoved = (key) => {
       const base = pinBaseline.get(key)
+      if (this.stickyRouter?.shared) return this.stickyRouter.versionOf(key) !== pinVersions.get(key)
       if (!base) return false
       const now = this.stickyRouter?.resolve?.(key)
       return !now || now.accountId !== base.accountId || (now.generation || 0) !== (base.generation || 0)
@@ -677,8 +692,9 @@ export class FailoverRunner {
       vmId: lastSelected?.vmId,
       attemptCount: budget.hops,
     })
-    const bindAll = (account, opts) => {
-      if (!this.stickyRouter || !account) return
+    const bindAll = async (account, opts, { required = false } = {}) => {
+      if (!this.stickyRouter || !account) return true
+      let accepted = true
       const sessionId = account.sessionId || (account.accountId === outboundSessionAccountId ? outboundSessionId : '')
       const payload = { accountId: account.accountId, vmId: account.vmId }
       const slotIndex = account.slotIndex != null ? account.slotIndex : pinnedSlot
@@ -687,21 +703,49 @@ export class FailoverRunner {
       if (stickyDeviceId) payload.deviceId = stickyDeviceId
       if (this.stickyRouter.bind) {
         for (const key of bindKeys) {
-          if (pinMoved(key)) continue
+          if (pinMoved(key)) {
+            accepted = false
+            continue
+          }
           const prev = this.stickyRouter.resolve?.(key)
           // A live pin on another account means this request only borrowed
           // capacity. Rewriting it would move the whole session off its home.
           if (prev?.accountId && prev.accountId !== account.accountId) continue
           let guard = opts
-          if (prev) guard = { ...opts, ifGeneration: prev.generation || 0 }
+          if (this.stickyRouter.shared) guard = { ...opts, ifGeneration: pinVersions.get(key) }
+          else if (prev) guard = { ...opts, ifGeneration: prev.generation || 0 }
           if (freshSlot || opts?.replaceSession) guard = { ...guard, replaceSession: true }
-          this.stickyRouter.bind(key, payload, guard)
+          const bound = await (this.stickyRouter.shared ? this.stickyRouter.bindShared : this.stickyRouter.bind).call(
+            this.stickyRouter,
+            key,
+            payload,
+            guard,
+          )
+          if (
+            this.stickyRouter.shared &&
+            (!bound.applied || (required && sessionId && bound.nativeSessionId !== sessionId))
+          ) {
+            accepted = false
+            continue
+          }
           pinBaseline.set(key, this.stickyRouter.resolve?.(key) || null)
+          pinVersions.set(key, this.stickyRouter.versionOf?.(key) || 0)
         }
       }
       if (familyKey && account.vmId && !pinMoved(familyKey)) {
-        this.stickyRouter.bind?.(familyKey, { accountId: account.accountId, vmId: account.vmId }, { countHit: false })
-        pinBaseline.set(familyKey, this.stickyRouter.resolve?.(familyKey) || null)
+        const result = await (this.stickyRouter.shared
+          ? this.stickyRouter.rebindFamilyShared
+          : this.stickyRouter.bind
+        )?.call(
+          this.stickyRouter,
+          familyKey,
+          { accountId: account.accountId, vmId: account.vmId },
+          { countHit: false, ifGeneration: pinVersions.get(familyKey) },
+        )
+        if (!this.stickyRouter.shared || result.applied) {
+          pinBaseline.set(familyKey, this.stickyRouter.resolve?.(familyKey) || null)
+          pinVersions.set(familyKey, this.stickyRouter.versionOf?.(familyKey) || 0)
+        } else accepted = false
       }
       if (
         deviceKey &&
@@ -710,12 +754,22 @@ export class FailoverRunner {
       ) {
         const devicePayload = { accountId: account.accountId, vmId: account.vmId }
         if (this.stickyRouter.bindDeviceAffinity) {
-          this.stickyRouter.bindDeviceAffinity(deviceKey, devicePayload, { countHit: false })
+          if (!this.stickyRouter.shared)
+            this.stickyRouter.bindDeviceAffinity(deviceKey, devicePayload, { countHit: false })
+          else if (!pinMoved(deviceKey)) {
+            const bound = await this.stickyRouter.bindDeviceAffinityShared(deviceKey, devicePayload, {
+              countHit: false,
+              ifGeneration: pinVersions.get(deviceKey),
+            })
+            if (bound.applied) pinVersions.set(deviceKey, bound.generation)
+          }
         } else {
           this.stickyRouter.bind?.(deviceKey, devicePayload, { countHit: false })
         }
       }
+      return accepted
     }
+    const stickyConflict = () => poolError('sticky_binding_conflict', 'Conversation binding changed before execution')
     let lastResult = null
     let lastPolicy = null
     let repaired = false
@@ -806,7 +860,11 @@ export class FailoverRunner {
           const home = this.stickyRouter?.resolve?.(familyKey)
           const ownExclusion =
             !!home && (budget.tried.has(home.accountId) || budget.tried.has(home.vmId) || spilled.has(home.accountId))
-          if (!ownExclusion) this.stickyRouter?.unbind?.(familyKey)
+          if (!ownExclusion) {
+            if (this.stickyRouter?.shared)
+              await this.stickyRouter.unbindShared(familyKey, { ifGeneration: this.stickyRouter.versionOf(familyKey) })
+            else this.stickyRouter?.unbind?.(familyKey)
+          }
           familyVmId = null
         }
         if (!selected?.ok && selected?.reason === 'fable_requires_max') {
@@ -830,7 +888,14 @@ export class FailoverRunner {
         lastSelected = selected
         pinnedSlot = selected.slotIndex ?? null
         if (selected.seatMoved) seatMovedTo = selected.vmId
-        bindAll({ accountId: selected.accountId, vmId: selected.vmId, slotIndex: pinnedSlot }, { countHit: false })
+        if (
+          !(await bindAll(
+            { accountId: selected.accountId, vmId: selected.vmId, slotIndex: pinnedSlot },
+            { countHit: false },
+            { required: true },
+          ))
+        )
+          return stickyConflict()
         const attemptStarted = Date.now()
         await this.attemptsRepo?.begin?.({
           requestId,
@@ -880,14 +945,16 @@ export class FailoverRunner {
           if (attemptMeta?.sessionId) {
             outboundSessionId = String(attemptMeta.sessionId)
             outboundSessionAccountId = selected.accountId
-            bindAll(
+            const bound = await bindAll(
               { accountId: selected.accountId, vmId: selected.vmId, sessionId: outboundSessionId },
               {
                 countHit: false,
                 // Prebinding moved the VM already; replace the previous VM's session.
                 replaceSession: !!attemptStickyBound?.vmId && attemptStickyBound.vmId !== selected.vmId,
               },
+              { required: true },
             )
+            if (!bound) return stickyConflict()
           }
           callEntered = true
           result = await callAttempt({
@@ -940,12 +1007,12 @@ export class FailoverRunner {
           // One writer for rate_limit_reset_at / overload_until (sub2api HandleUpstreamError).
           const hardBlock =
             !result?.committed && !pinVmId
-              ? this.rateLimitService?.handleUpstreamError?.({
+              ? (await this.rateLimitService?.handleUpstreamError?.({
                   accountId: selected.accountId,
                   vmId: selected.vmId,
                   result,
                   policy,
-                }) || null
+                })) || null
               : null
           if (hardBlock?.until && policy.action === 'continue-and-cooldown' && policy.scope === 'account') {
             policy = { ...policy, cooldownUntil: hardBlock.until }
@@ -978,8 +1045,12 @@ export class FailoverRunner {
           if (unknownExecution)
             return incompleteHopResult(result, policy, { ...attribution(), executionUncertain: true })
           if (policy.reason === 'content_filter_refusal' || policy.reason === 'usage_policy_refusal') {
-            this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
-            bindAll({ accountId: selected.accountId, vmId: selected.vmId })
+            await this.scheduler.markSuccess(selected, {
+              workerStatus: result.workerStatus || null,
+              countUsage,
+              observation: result.accountObservation,
+            })
+            await bindAll({ accountId: selected.accountId, vmId: selected.vmId })
             return {
               ...result,
               ...attribution(),
@@ -998,13 +1069,17 @@ export class FailoverRunner {
                 expiresAt: Date.now() + SEARCH_REPAIR_IDLE_MS,
               })
             }
-            this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
+            await this.scheduler.markSuccess(selected, {
+              workerStatus: result.workerStatus || null,
+              countUsage,
+              observation: result.accountObservation,
+            })
             if (isFableModel(model) && typeof this.onFableSuccess === 'function') {
               try {
                 this.onFableSuccess({ selected, model })
               } catch {}
             }
-            bindAll({ accountId: selected.accountId, vmId: selected.vmId })
+            await bindAll({ accountId: selected.accountId, vmId: selected.vmId })
             return { ...result, ...attribution(), finalState: 'verified' }
           }
           if (policy.action === 'repair-and-retry' && !repaired && !result?.committed) {
@@ -1016,9 +1091,12 @@ export class FailoverRunner {
             requestBody = repairAnthropicRequest(requestBody, policy)
             continue
           }
-          applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
+          await applyCooldown(this.scheduler, selected, policy, model, {
+            diagnosticPin: !!pinVmId,
+            observation: result?.accountObservation,
+          })
           if (!pinVmId && isCredentialDeath(policy)) {
-            this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
+            await this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys, versions: pinVersions })
             if (familyKey) {
               return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
             }
@@ -1030,7 +1108,7 @@ export class FailoverRunner {
           const hopMs = Date.now() - attemptStarted
           if (isRetryableEmptyHop(policy)) {
             if (!emptyHopReleased(result) || pinVmId) return incompleteHopResult(result, policy, attribution())
-            this.retireOutboundSession(selected, bindKeys)
+            await this.retireOutboundSession(selected, bindKeys, pinVersions)
             freshSlot = true
           }
           if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
@@ -1148,9 +1226,12 @@ export class FailoverRunner {
           if (unknownExecution || committed || !shouldContinue(policy)) {
             return { ...result, ...attribution(), finalState: result.terminalState, policy }
           }
-          applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
+          await applyCooldown(this.scheduler, selected, policy, model, {
+            diagnosticPin: !!pinVmId,
+            observation: result?.accountObservation,
+          })
           if (!pinVmId && isCredentialDeath(policy)) {
-            this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
+            await this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys, versions: pinVersions })
             if (familyKey) {
               return { ...result, ...attribution(), finalState: result.terminalState, policy }
             }

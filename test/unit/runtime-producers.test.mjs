@@ -73,14 +73,17 @@ test('shared scheduler waits for committed quota cleanup and preserves VM restri
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-runtime-cleanup-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const file = path.join(root, 'vm-cleanup.json')
-  const vm = { id: 'vm-cleanup', claude: { temp_unschedulable_reason: 'quota_exhausted', temp_unschedulable_until: 1 } }
+  const vm = {
+    id: 'vm-cleanup',
+    claude: { temp_unschedulable_reason: 'account_quota_exhausted', temp_unschedulable_until: 1 },
+  }
   fs.writeFileSync(file, JSON.stringify(vm))
   const entered = deferred()
   const resume = deferred()
   const pool = new PoolScheduler({
     projectRoot: root,
     runtimeRepo: {
-      get: () => ({ cooldown_reason: 'quota_exhausted', cooldown_until: 1 }),
+      get: () => ({ cooldown_reason: 'account_quota_exhausted', cooldown_until: 1 }),
       upsert() {},
       async clearQuotaCooldownCommitted() {
         entered.resolve()
@@ -96,12 +99,15 @@ test('shared scheduler waits for committed quota cleanup and preserves VM restri
     return value
   })
   try {
-    await Promise.race([entered.promise, result.then(() => assert.fail('cleanup returned before PostgreSQL confirmation'))])
+    await Promise.race([
+      entered.promise,
+      result.then(() => assert.fail('cleanup returned before PostgreSQL confirmation')),
+    ])
     assert.equal(settled, false)
-    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).claude.temp_unschedulable_reason, 'quota_exhausted')
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).claude.temp_unschedulable_reason, 'account_quota_exhausted')
   } finally {
     resume.resolve()
   }
   assert.equal(await result, false)
-  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).claude.temp_unschedulable_reason, 'quota_exhausted')
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).claude.temp_unschedulable_reason, 'account_quota_exhausted')
 })

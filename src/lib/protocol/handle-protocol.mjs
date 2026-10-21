@@ -995,11 +995,16 @@ export function createHandleProtocol(deps) {
       ? null
       : resolveSeatIdentity({ inbound, body: ctx.body, headers: req.headers, clientIp: clientIp(req) }).key
     const sessionKeys = stickyRouter?.sessionPoolKeys
-      ? stickyRouter.sessionPoolKeys(req, inbound, {
-          sessionId: inboundIdentity.sessionId,
-          deviceId: stickyDeviceId,
-          migrate: !isProbe,
-        })
+      ? await (stickyRouter.shared ? stickyRouter.sessionPoolKeysShared : stickyRouter.sessionPoolKeys).call(
+          stickyRouter,
+          req,
+          inbound,
+          {
+            sessionId: inboundIdentity.sessionId,
+            deviceId: stickyDeviceId,
+            migrate: !isProbe,
+          },
+        )
       : {
           stickyKey: stickyRouter?.extractPoolKey?.(req, inbound, { platform: 'anthropic' }) || null,
           stickyKeys: stickyRouter?.collectPoolKeys?.(req, inbound, { platform: 'anthropic' }) || [],
@@ -1014,7 +1019,12 @@ export function createHandleProtocol(deps) {
     const familyKey = !familySession
       ? null
       : stickyRouter?.familyPoolKey
-        ? stickyRouter.familyPoolKey(req, familySession, { trusted: familyTrusted })
+        ? await (stickyRouter.shared ? stickyRouter.familyPoolKeyShared : stickyRouter.familyPoolKey).call(
+            stickyRouter,
+            req,
+            familySession,
+            { trusted: familyTrusted },
+          )
         : stickyRouter?.familyKey?.(req, familySession, 'anthropic') || null
     const familyVmId = familyKey ? stickyRouter?.resolve?.(familyKey)?.vmId || null : null
     const stickyBound =
@@ -1688,15 +1698,16 @@ export function createHandleProtocol(deps) {
         const pool = typeof deps.getPoolScheduler === 'function' ? deps.getPoolScheduler() : deps.poolScheduler
         // Live `5h-status` on every response; `allowed` is the only early unblock.
         if (!exhausted) {
-          pool?.rateLimitService?.updateSessionWindow?.({
+          await pool?.rateLimitService?.updateSessionWindow?.({
             accountId: result.accountId,
             vmId: result.vmId || null,
             headers: result.headers || {},
+            observation: result?.accountObservation,
           })
         }
         if (pool?.syncQuotaSchedule && result.vmId && cfg?.paths?.project) {
           const vm = getVm(cfg.paths.project, result.vmId)
-          if (vm) pool.syncQuotaSchedule(vm)
+          if (vm) await pool.syncQuotaSchedule(vm)
         }
       } catch {}
       await attachPricing(logBag, {
