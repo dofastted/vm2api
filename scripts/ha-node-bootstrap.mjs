@@ -210,7 +210,13 @@ async function trustedInit(db, c, output) {
   } catch {
     throw failure('bootstrap_output_unavailable', true)
   }
-  return { ok: true, command: 'trusted-init', node_id: c.node.id, reader_sql_file: c.reader.sqlOutput }
+  return {
+    ok: true,
+    command: 'trusted-init',
+    node_id: c.node.id,
+    authority_schema: grants.schema,
+    reader_sql_file: c.reader.sqlOutput,
+  }
 }
 async function slotCreate(db, c, input) {
   if (!c.vm) throw failure('bootstrap_config_invalid', true)
