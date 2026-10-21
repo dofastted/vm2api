@@ -391,9 +391,19 @@ export class VmTestScheduleRunner {
         if (error.code !== 'maintenance_activity_closed') throw error
       }
     }
-    return coordinator
-      ? coordinator.runActivity({ kind }, async () => ({ ended: true, value: await callback() }))
-      : callback()
+    if (!coordinator) return callback()
+    let started = false
+    try {
+      return await coordinator.runActivity({ kind }, async () => {
+        started = true
+        return { ended: true, value: await callback() }
+      })
+    } catch (error) {
+      // A timer can reach admission after DRAINING commits but before local stop.
+      // No discovery SQL started, so this refusal is not a failed persistence operation.
+      if (kind === 'vm_test_discovery' && !started && error.code === 'database_maintenance') return
+      throw error
+    }
   }
 
   _vm(vmId) {

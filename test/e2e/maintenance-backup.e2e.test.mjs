@@ -46,9 +46,13 @@ test('Kubernetes manual backup transfers its HTTP activity to private maintenanc
 test('Kubernetes scheduled backup uses private claims and leaves no active business task in its snapshot', async (t) => {
   const { gw, q } = await fixture(t, true)
   let records = []
+  let history = []
   for (let i = 0; i < 100; i++) {
     records = (await gw.db.pool.query("SELECT id FROM backup_records WHERE kind='scheduled' AND status='ok'")).rows
-    if (records.length) break
+    if (records.length) {
+      history = (await gw.db.pool.query(`SELECT ended_at FROM ${q}.operations WHERE task_key='scheduled-backup'`)).rows
+      if (history.some((operation) => operation.ended_at)) break
+    }
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
   assert.equal(records.length, 1, gw.stderr())
@@ -57,8 +61,6 @@ test('Kubernetes scheduled backup uses private claims and leaves no active busin
       .n,
     0,
   )
-  const history = (await gw.db.pool.query(`SELECT ended_at FROM ${q}.operations WHERE task_key='scheduled-backup'`))
-    .rows
   assert.equal(history.length, 1)
   assert.ok(history[0].ended_at)
 })

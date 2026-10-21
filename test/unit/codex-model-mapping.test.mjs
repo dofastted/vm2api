@@ -10,11 +10,12 @@ import {
 } from '../../src/lib/protocol/codex-model-mapping.mjs'
 import { normalizeCodexRouting } from '../../src/lib/protocol/codex-route.mjs'
 import { resetGptModelPolicy, saveGptModelPolicy } from '../../src/lib/protocol/gpt-model-policy.mjs'
+import { getDb } from '../../src/lib/db/database.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 
-test('default map rewrites codex-auto-review before platform detect', () => {
-  resetGptModelPolicy()
+test('default map rewrites codex-auto-review before platform detect', async () => {
+  await resetGptModelPolicy()
   const rewrite = applyCodexInboundModelRewrite({ model: 'codex-auto-review' }, {})
   assert.equal(rewrite.ok, true)
   assert.equal(rewrite.mapped, true)
@@ -30,16 +31,16 @@ test('literal detectInboundPlatform still fail-closes codex-auto-review', () => 
   assert.equal(detectInboundPlatform('codex-auto-review').ok, false)
 })
 
-test('custom routing.model_mappings overrides default target', () => {
-  resetGptModelPolicy()
+test('custom routing.model_mappings overrides default target', async () => {
+  await resetGptModelPolicy()
   const routing = { codex: { model_mappings: { 'codex-auto-review': 'gpt-6-sol' } } }
   const rewrite = applyCodexInboundModelRewrite({ model: 'codex-auto-review' }, routing)
   assert.equal(rewrite.upstreamModel, 'gpt-6-sol')
   assert.equal(detectInboundPlatform(rewrite.body.model).platform, 'openai')
 })
 
-test('empty configured target for codex-auto-review uses fallback sol model', () => {
-  resetGptModelPolicy()
+test('empty configured target for codex-auto-review uses fallback sol model', async () => {
+  await resetGptModelPolicy()
   const mappings = normalizeCodexModelMappings({ 'codex-auto-review': '' })
   assert.equal(mappings['codex-auto-review'], DEFAULT_CODEX_MODEL_MAPPING_FALLBACK)
   const rewrite = applyCodexInboundModelRewrite(
@@ -49,8 +50,8 @@ test('empty configured target for codex-auto-review uses fallback sol model', ()
   assert.equal(rewrite.upstreamModel, DEFAULT_CODEX_MODEL_MAPPING_FALLBACK)
 })
 
-test('invalid non-GPT mapping target returns codex_model_mapping_invalid', () => {
-  resetGptModelPolicy()
+test('invalid non-GPT mapping target returns codex_model_mapping_invalid', async () => {
+  await resetGptModelPolicy()
   const rewrite = applyCodexInboundModelRewrite(
     { model: 'codex-auto-review' },
     { codex: { model_mappings: { 'codex-auto-review': 'claude-sonnet-4-6' } } },
@@ -59,13 +60,15 @@ test('invalid non-GPT mapping target returns codex_model_mapping_invalid', () =>
   assert.equal(rewrite.code, 'codex_model_mapping_invalid')
 })
 
-test('disabled GPT mapping target returns model_disabled', () => {
-  resetGptModelPolicy()
-  saveGptModelPolicy({
+test('disabled GPT mapping target returns model_disabled', async () => {
+  await resetGptModelPolicy()
+  await saveGptModelPolicy({
     models: {
       'gpt-6-luna': { id: 'gpt-6-luna', enabled: false },
     },
   })
+  const stored = (await getDb().query("SELECT value FROM settings WHERE key='gpt_model_policy'")).rows[0]
+  assert.equal(JSON.parse(stored.value).models['gpt-6-luna'].enabled, false)
   const check = validateCodexModelMappingTarget('gpt-6-luna')
   assert.equal(check.ok, false)
   assert.equal(check.code, 'model_disabled')
