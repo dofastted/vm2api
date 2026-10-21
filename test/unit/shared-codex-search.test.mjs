@@ -193,6 +193,54 @@ test('a truncated Search body retains capacity and forbids retry on another VM',
   assert.equal(fx.calls.length, 1)
 })
 
+test('a complete Search HTTP error releases its admission before failover to another VM', async (t) => {
+  const fx = await fixture(
+    t,
+    async (_req, res, count) => {
+      if (count > 1) {
+        const previous = await fx.other
+          .prepare(`SELECT j.ended_at, a.released_at FROM execution_jobs j
+          JOIN execution_admissions a ON a.id=j.admission_id WHERE j.request_id=$1`)
+          .get(fx.calls[0].headers['x-client-request-id'])
+        assert.ok(previous.ended_at && previous.released_at >= previous.ended_at)
+      }
+      answer(res, count === 1 ? 500 : 200)
+    },
+    { vms: 2 },
+  )
+  const result = await fx.run()
+  assert.equal(result.res.statusCode, 200)
+  assert.equal(fx.calls.length, 2)
+  const jobs = await fx.other.prepare('SELECT * FROM execution_jobs').all()
+  assert.equal(jobs.length, 2)
+  assert.notEqual(jobs[0].admission_id, jobs[1].admission_id)
+  assert.ok(jobs.every((job) => job.ended_at))
+  assert.equal((await fx.counts()).accountInflight, 0)
+})
+
+test('released Search admissions still enforce the shared account RPM across controllers', async (t) => {
+  const fx = await fixture(t)
+  assert.equal((await fx.run({ quota: { max_rpm: 1 } })).res.statusCode, 200)
+  assert.equal((await fx.run({ controller: 1, quota: { max_rpm: 1 } })).res.statusCode, 429)
+  assert.equal(fx.calls.length, 1)
+  assert.equal((await fx.counts()).accountInflight, 0)
+  assert.equal((await fx.counts()).rpmCount, 1)
+})
+
+test('shared Search does not follow an HTTP redirect as an unregistered second job', async (t) => {
+  const fx = await fixture(t, (_req, res, count) => {
+    if (count === 1) {
+      res.writeHead(307, { 'content-type': 'application/json', location: '/redirected-search' })
+      res.end('{"redirected":true}')
+    } else answer(res)
+  })
+  const result = await fx.run()
+  assert.equal(result.res.statusCode, 307)
+  assert.equal(fx.calls.length, 1)
+  assert.equal((await fx.other.prepare('SELECT count(*) AS count FROM execution_jobs').get()).count, 1)
+  assert.equal((await fx.counts()).accountInflight, 0)
+})
+
 for (const status of [401, 403]) {
   test(`Search completes its ${status} job before refresh and retries with a new persisted ID`, async (t) => {
     const fx = await fixture(t, (_req, res, count) => answer(res, count === 1 ? status : 200))

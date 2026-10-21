@@ -3,6 +3,7 @@
  */
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
+import fetch from 'node-fetch'
 import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 import { SharedCodexRuntime } from '../pool/shared-codex-runtime.mjs'
 import { getVm, listVms, persistCodexUsage, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
@@ -37,6 +38,7 @@ import {
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
+import { createProxyAgent } from '../vm/proxy-agent.mjs'
 import { readCodexAccounts, upsertCodexAccount } from '../vm/codex-slot.mjs'
 import { scopeAccountFromVm } from './jev-intercept.mjs'
 import {
@@ -44,7 +46,6 @@ import {
   CODEX_CATALOG_ORIGINATOR,
   CODEX_SEARCH_URL,
   CODEX_USER_AGENT,
-  makeProxyFetch,
   refreshCodexAccessToken,
 } from './codex-models.mjs'
 import { orderCodexSessionSlots, codexSlotAllowsModel, isCodexFailoverError } from '../pool/codex-slot-pool.mjs'
@@ -1239,12 +1240,33 @@ function plainHeaders(headers) {
 }
 
 /** One search call on one slot. Resolves `{ status, text, headers }`, or `{ status: 0, error }`. */
-async function postCodexSearch({ projectRoot, vm, body, turnMetadata, fetchImpl, refresh = refreshCodexAccessToken }) {
+async function postCodexSearch({
+  projectRoot,
+  vm,
+  body,
+  turnMetadata,
+  fetchImpl,
+  refresh = refreshCodexAccessToken,
+  signal,
+  timeoutMs = CODEX_SEARCH_TIMEOUT_MS,
+  onExecutionStart,
+  onExecutionEnd,
+}) {
+  const notStarted = { requestId: null, started: false, ended: true, reason: 'not_started' }
   const proxyUrl = hostProxyUrlForVm(vm)
-  if (!fetchImpl && !proxyUrl && !isLocalEgressProxy(vm.proxy)) return { status: 0, error: 'proxy_required' }
-  const doFetch = fetchImpl || makeProxyFetch(proxyUrl, CODEX_SEARCH_TIMEOUT_MS, { maxMs: CODEX_SEARCH_TIMEOUT_MS })
+  if (!fetchImpl && !proxyUrl && !isLocalEgressProxy(vm.proxy))
+    return { status: 0, error: 'proxy_required', execution: notStarted }
+  let agent
+  try {
+    if (!fetchImpl && proxyUrl) agent = createProxyAgent(proxyUrl.replace(/^socks5:\/\//i, 'socks5h://'))
+  } catch {
+    return { status: 0, error: 'upstream_transport', execution: notStarted }
+  }
+  const doFetch = fetchImpl || fetch
   const creds = searchCredentials(projectRoot, vm)
   const send = async (access) => {
+    if (signal?.aborted) return { status: 0, error: 'client_cancelled', execution: notStarted }
+    const requestId = randomUUID()
     // Same identity as the slot's kernel; the backend wants originator, User-Agent and version to agree.
     const headers = {
       authorization: `Bearer ${access}`,
@@ -1253,19 +1275,48 @@ async function postCodexSearch({ projectRoot, vm, body, turnMetadata, fetchImpl,
       originator: CODEX_CATALOG_ORIGINATOR,
       'user-agent': CODEX_USER_AGENT,
       version: CODEX_APP_VERSION,
+      'x-client-request-id': requestId,
     }
     if (creds.accountId) headers['chatgpt-account-id'] = creds.accountId
     if (turnMetadata) headers['x-codex-turn-metadata'] = turnMetadata
+    const payload = JSON.stringify(body)
+    await onExecutionStart?.({ requestId, started: false, ended: false, reason: 'before_send' })
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    signal?.addEventListener('abort', abort, { once: true })
+    if (signal?.aborted) controller.abort()
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, timeoutMs)
+    let out
+    let execution
     try {
-      const res = await doFetch(CODEX_SEARCH_URL, { method: 'POST', headers, body: JSON.stringify(body) })
-      return { status: Number(res?.status) || 0, text: await res.text(), headers: plainHeaders(res?.headers) }
+      const res = await doFetch(CODEX_SEARCH_URL, {
+        method: 'POST',
+        headers,
+        body: payload,
+        agent,
+        signal: controller.signal,
+        ...(onExecutionStart ? { redirect: 'manual' } : {}),
+      })
+      out = { status: Number(res?.status) || 0, text: await res.text(), headers: plainHeaders(res?.headers) }
+      execution = { requestId, started: true, ended: true, reason: 'http_body_complete' }
     } catch (e) {
-      return { status: 0, error: /abort/i.test(`${e?.name} ${e?.message}`) ? 'upstream_timeout' : 'upstream_transport' }
+      const aborted = timedOut || signal?.aborted || /abort/i.test(`${e?.name} ${e?.message}`)
+      out = { status: 0, error: aborted ? 'upstream_timeout' : 'upstream_transport' }
+      execution = { requestId, started: true, ended: false, reason: timedOut ? 'http_timeout' : 'http_transport' }
+    } finally {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', abort)
     }
+    await onExecutionEnd?.(execution)
+    return { ...out, execution }
   }
-  if (!creds.access && !creds.refresh) return { status: 0, error: 'no_oauth_token' }
-  let out = creds.access ? await send(creds.access) : { status: 401 }
-  if (out.status === 401 || out.status === 403) {
+  if (!creds.access && !creds.refresh) return { status: 0, error: 'no_oauth_token', execution: notStarted }
+  let out = creds.access ? await send(creds.access) : { status: 401, execution: notStarted }
+  if ((out.status === 401 || out.status === 403) && !signal?.aborted) {
     const access = await refreshSearchAccess(projectRoot, vm, creds.access, { proxyUrl, fetchImpl, refresh })
     if (access) out = await send(access)
   }
@@ -1319,7 +1370,8 @@ export async function handleCodexSearch({
   for (const key of CODEX_SEARCH_DROP_FIELDS) delete outbound[key]
   const turnMetadata = headerString(req.headers, 'x-codex-turn-metadata')
   const post = ops.postCodexSearch || postCodexSearch
-  const pickOpts = { stickyRouter, sessions: null, body: outbound, excluded: new Set() }
+  const sharedRuntime = ops.sharedRuntime || (isKubernetesMode() ? new SharedCodexRuntime() : null)
+  const pickOpts = { stickyRouter, sessions: null, body: outbound, excluded: new Set(), routing, sharedRuntime }
   const deadline = Date.now() + codexWaitTimeoutMs(routing)
   const gone = clientGoneSignal(req, res)
   let last = null
@@ -1347,24 +1399,47 @@ export async function handleCodexSearch({
         logBag.vm_id = vm.id
         logBag.account_id = vm.id
         logBag.attempt_count = attempts
-        last = await post({
+        const args = {
           projectRoot,
           vm,
           body: outbound,
           turnMetadata,
           fetchImpl: ops.fetchImpl,
           refresh: ops.refresh,
-        })
+          signal: gone.signal,
+          timeoutMs: ops.searchTimeoutMs,
+        }
+        last = sharedRuntime ? await sharedRuntime.invoke(admitted.lease, post, args) : await post(args)
+        if (sharedRuntime && (last?.executionUncertain || last?.execution?.ended !== true)) {
+          logBag.final_state = gone.signal.aborted ? 'cancelled' : 'incomplete'
+          if (gone.signal.aborted) return
+          return reject(
+            502,
+            'api_error',
+            'codex_search_execution_uncertain',
+            'Codex search execution termination is unknown',
+          )
+        }
+        if (gone.signal.aborted) {
+          logBag.final_state = 'cancelled'
+          return
+        }
         logBag.upstream_status = last.status || null
-        ingestCodexHop(projectRoot, vm.id, {
-          ok: last.status >= 200 && last.status < 300,
-          status: last.status,
-          headers: last.headers || {},
-          body: parseJson(last.text),
-        })
+        ingestCodexHop(
+          projectRoot,
+          vm.id,
+          {
+            ok: last.status >= 200 && last.status < 300,
+            status: last.status,
+            headers: last.headers || {},
+            body: parseJson(last.text),
+          },
+          Date.now(),
+          admitted.picked.quotaPolicy || codex.quota,
+        )
         if (!isSearchFailover(last)) break
       } finally {
-        admitted.lease.release()
+        await admitted.lease.release()
       }
     }
   } finally {
