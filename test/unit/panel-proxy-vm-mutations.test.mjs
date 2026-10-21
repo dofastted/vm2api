@@ -9,6 +9,7 @@ import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 import { ProxyPool } from '../../src/lib/vm/proxy-pool.mjs'
 import { SharedVmOperations } from '../../src/lib/vm/shared-vm-operations.mjs'
 import { ExecutionAdmissionsRepo } from '../../src/lib/db/repos/execution-admissions-repo.mjs'
+import { SharedProxyOperations } from '../../src/lib/vm/shared-proxy-operations.mjs'
 
 async function fixture(t) {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'panel-proxy-claims-'))
@@ -153,6 +154,37 @@ test('a failed worker reload after proxy editing keeps the target claim unknown'
   assert.equal(h.response.status, 200)
   assert.equal(h.response.body.data.workers[0].ok, false)
   assert.equal((await f.otherOperations.tryAcquire({ vmId: 'vm-a' })).ok, false)
+  assert.equal((await new SharedProxyOperations(f.peer).tryAcquire()).ok, false)
+})
+
+test('an idle proxy binding owns the new target and releases both persistent claims after completion', async (t) => {
+  const f = await fixture(t)
+  f.seed('vm-b')
+  const h = f.handler({ vm_id: 'vm-b' }, { vmMutationOps: { ensureProxyEgress: async () => ({ ok: true }) } })
+  await h.request('POST', '/api/panel/proxies/' + f.proxyId + '/bind')
+  assert.equal(h.response.status, 200, JSON.stringify(h.response.body))
+  assert.deepEqual(f.pool.getProxyByIdWithAuth(f.proxyId).bound_vm_ids, ['vm-a', 'vm-b'])
+  const vmClaim = await f.otherOperations.tryAcquire({ vmId: 'vm-b' })
+  assert.equal(vmClaim.ok, true)
+  await vmClaim.release()
+  const proxyClaim = await new SharedProxyOperations(f.peer).tryAcquire()
+  assert.equal(proxyClaim.ok, true)
+  await proxyClaim.release()
+})
+
+test('unknown cleanup of an empty proxy keeps its pool claim without inventing a VM target', async (t) => {
+  const f = await fixture(t)
+  process.env.VM2API_CONTROL_PLANE_MODE = 'standalone'
+  await f.pool.unbind(f.proxyId)
+  process.env.VM2API_CONTROL_PLANE_MODE = 'kubernetes'
+  const h = f.handler(
+    {},
+    { vmMutationOps: { stopProxyEgress: async () => ({ ok: false, error: 'synthetic unknown' }) } },
+  )
+  await h.request('DELETE', '/api/panel/proxies/' + f.proxyId)
+  assert.equal(h.response.status, 502)
+  assert.equal((await new SharedProxyOperations(f.peer).tryAcquire()).ok, false)
+  assert.equal((await f.db.prepare('SELECT count(*) AS n FROM vm_operations').get()).n, 0)
 })
 
 test('proxy unbind awaits confirmed helper stop before releasing its VM claim', async (t) => {
