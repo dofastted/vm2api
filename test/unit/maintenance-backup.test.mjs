@@ -72,3 +72,30 @@ test('BackupService scheduled checks finish their read activity before claiming 
   )
   assert.equal(await coordinator.isReady(), true)
 })
+
+test('a pre-restore refusal cancels only its own drain and leaves ordinary requests available', async (t) => {
+  const { db, coordinator, service } = await fixture(t)
+  fs.mkdirSync(service.dataDir, { recursive: true })
+  const file = path.join(service.dataDir, 'synthetic.tar.gz')
+  fs.writeFileSync(file, 'synthetic validation fixture')
+  await db.pool.query(
+    "INSERT INTO backup_records(id,created_at,kind,status,file_path,file_name) VALUES ('restore-refused','now','manual','ok',$1,'synthetic.tar.gz')",
+    [file],
+  )
+  await db.pool.query(
+    "INSERT INTO background_task_runs(task_key,execution_id,owner_id,unknown_at) VALUES ('unknown-remote','one','old-pod',clock_timestamp())",
+  )
+  service._extractArchive = async () => ({
+    tmp: fs.mkdtempSync(path.join(service.dataDir, 'extract-')),
+    tables: new Set(),
+  })
+  const request = await coordinator.admit({ kind: 'http' })
+  await request.run(() =>
+    assert.rejects(service.restoreBackup('restore-refused'), { code: 'maintenance_claims_active' }),
+  )
+  assert.equal((await coordinator.getState()).phase, 'open')
+  assert.equal(service.isMaintaining, false)
+  assert.equal(service.isRestoring, false)
+  assert.equal(fs.existsSync(service.maintenanceFile), false)
+  await request.complete({ ended: true })
+})

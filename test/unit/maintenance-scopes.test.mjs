@@ -68,9 +68,14 @@ test('a transaction cannot reuse an activity that closed while its JavaScript ca
   )
   transaction.catch(() => {})
   await started
-  await gate.complete({ ended: true })
-  release()
-  await assert.rejects(transaction, { code: 'maintenance_activity_closed' })
+  try {
+    await assert.rejects(gate.complete({ ended: true }), { code: 'maintenance_persistence_pending' })
+    await coordinator.stop()
+  } finally {
+    release()
+    await transaction.catch(() => {})
+  }
+  await assert.rejects(transaction, { code: 'maintenance_connection_lost' })
   assert.equal((await db.pool.query("SELECT count(*) AS n FROM settings WHERE key='closed-scope-write'")).rows[0].n, 0)
 })
 
