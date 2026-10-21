@@ -17,6 +17,7 @@ function failure(code, message = undefined) {
     headers: {},
     via: 'slot-worker',
     transportError: true,
+    attemptFinished: false,
   }
 }
 
@@ -136,6 +137,12 @@ export async function runSlotOauth(
     body: payload.body && typeof payload.body === 'object' ? payload.body : {},
     headers: payload.headers && typeof payload.headers === 'object' ? payload.headers : {},
     via: 'slot-worker',
+    attemptFinished:
+      result?.code === 0 &&
+      payload.body?.error?.code !== 'upstream_transport_error' &&
+      ((payload.ok && status >= 200 && status < 300) ||
+        status >= 400 ||
+        ['config_failed', 'proxy_required', 'credential_required'].includes(payload.body?.error?.code)),
   }
   if (status === 0) response.transportError = true
   return response

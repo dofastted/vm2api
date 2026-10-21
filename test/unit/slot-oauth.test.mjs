@@ -68,6 +68,7 @@ test('runSlotOauth builds the worker argv and sends count-tokens stdin', async (
     body: { input_tokens: 12 },
     headers: { 'x-test': 'ok' },
     via: 'slot-worker',
+    attemptFinished: true,
   })
 })
 
@@ -138,6 +139,7 @@ test('runSlotOauth maps timeout to a transport error', async () => {
     headers: {},
     via: 'slot-worker',
     transportError: true,
+    attemptFinished: false,
   })
 })
 
@@ -157,6 +159,7 @@ test('runSlotOauth reports invalid worker output with stderr context', async () 
     headers: {},
     via: 'slot-worker',
     transportError: true,
+    attemptFinished: false,
   })
 })
 

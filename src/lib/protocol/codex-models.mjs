@@ -193,7 +193,7 @@ export function makeProxyFetch(proxyUrl, timeoutMs = 15000, { maxMs = 30000 } = 
  */
 export async function refreshCodexAccessToken(opts = {}) {
   const refreshToken = String(opts.refreshToken || '').trim()
-  if (!refreshToken) return { ok: false, error: 'missing_refresh_token' }
+  if (!refreshToken) return { ok: false, error: 'missing_refresh_token', attemptFinished: true }
   const fetchFn = opts.fetchImpl || makeProxyFetch(opts.proxyUrl, opts.timeoutMs)
   const body = new URLSearchParams({
     grant_type: 'refresh_token',
@@ -212,16 +212,29 @@ export async function refreshCodexAccessToken(opts = {}) {
       body: String(body),
     })
     const status = Number(res?.status) || 0
-    const payload = await readFetchBody(res)
+    // Consume the actual body before accepting even a rejection as terminal.
+    // readFetchBody intentionally tolerates malformed catalog responses; refresh cannot.
+    let payload
+    if (typeof res?.text === 'function') {
+      const text = await res.text()
+      try {
+        payload = text ? JSON.parse(text) : null
+      } catch {
+        payload = null
+      }
+    } else if (typeof res?.json === 'function') payload = await res.json()
+    else return { ok: false, error: 'refresh_empty', status, attemptFinished: false }
     if (status === 401 || status === 403) {
-      return { ok: false, error: 'refresh_rejected', status }
+      return { ok: false, error: 'refresh_rejected', status, attemptFinished: true }
     }
-    if (status >= 400) return { ok: false, error: 'refresh_failed', status }
+    if (status >= 400) return { ok: false, error: 'refresh_failed', status, attemptFinished: true }
     const access = String(payload?.access_token || '').trim()
-    if (!access) return { ok: false, error: 'refresh_empty', status }
+    if (!access || status < 200 || status >= 300)
+      return { ok: false, error: 'refresh_empty', status, attemptFinished: false }
     const expiresIn = Number(payload?.expires_in)
     return {
       ok: true,
+      attemptFinished: true,
       access_token: access,
       refresh_token: String(payload?.refresh_token || refreshToken).trim() || refreshToken,
       id_token: String(payload?.id_token || '').trim(),
@@ -229,7 +242,7 @@ export async function refreshCodexAccessToken(opts = {}) {
     }
   } catch (e) {
     const aborted = e?.name === 'AbortError' || /aborted/i.test(String(e?.message || e))
-    return { ok: false, error: aborted ? 'timeout' : 'fetch_failed' }
+    return { ok: false, error: aborted ? 'timeout' : 'fetch_failed', attemptFinished: false }
   }
 }
 
