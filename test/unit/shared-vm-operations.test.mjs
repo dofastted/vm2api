@@ -280,6 +280,63 @@ test('a failed release remains persistent and retries PostgreSQL rather than cac
   await next.release()
 })
 
+test('nested unknown outcomes retain their parent operation even when the outer result omits the flag', async (t) => {
+  const other = await otherDatabase(t)
+  const outer = await operations(getDb(), 'owner-a')
+  const nested = await operations(other, 'owner-b')
+  await outer.run('vm-a', async () => {
+    const result = await nested.run('vm-a', async () => ({ vmOperationUncertain: true, value: 'synthetic unknown' }))
+    assert.equal(result.value, 'synthetic unknown')
+    return { ok: true }
+  })
+  const row = await other.prepare('SELECT released_at,uncertain_at FROM vm_operations').get()
+  assert.equal(row.released_at, null)
+  assert.ok(row.uncertain_at)
+  assert.equal((await nested.tryAcquire({ vmId: 'vm-a' })).code, 'vm_operation_active')
+})
+
+test('a nested unknown exception remains persistent when the outer callback catches it', async (t) => {
+  const other = await otherDatabase(t)
+  const outer = await operations(getDb(), 'owner-a')
+  const nested = await operations(other, 'owner-b')
+  const failure = new Error('synthetic unknown after remote submission')
+  await outer.run('vm-a', async () => {
+    await assert.rejects(
+      nested.run('vm-a', async () => {
+        throw failure
+      }),
+      (error) => error === failure,
+    )
+    return { ok: true }
+  })
+  const row = await other.prepare('SELECT released_at,uncertain_at FROM vm_operations').get()
+  assert.equal(row.released_at, null)
+  assert.ok(row.uncertain_at)
+  assert.equal((await nested.tryAcquire({ vmId: 'vm-a' })).code, 'vm_operation_active')
+})
+
+test('a nested explicitly unstarted exception does not retain an otherwise finished parent operation', async (t) => {
+  const other = await otherDatabase(t)
+  const outer = await operations(getDb(), 'owner-a')
+  const nested = await operations(other, 'owner-b')
+  const failure = Object.assign(new Error('synthetic validation rejection'), { vmOperationNotStarted: true })
+  await outer.run('vm-a', async () => {
+    await assert.rejects(
+      nested.run('vm-a', async () => {
+        throw failure
+      }),
+      (error) => error === failure,
+    )
+    return { ok: true }
+  })
+  const row = await other.prepare('SELECT released_at,uncertain_at FROM vm_operations').get()
+  assert.ok(row.released_at)
+  assert.equal(row.uncertain_at, null)
+  const next = await nested.tryAcquire({ vmId: 'vm-a' })
+  assert.equal(next.ok, true)
+  await next.release()
+})
+
 test('different schemas cannot reuse one another nested operation context', async (t) => {
   const db = getDb()
   const other = await createDatabase({ connectionString: db.connectionString, schema: db.schema + '_other' })
