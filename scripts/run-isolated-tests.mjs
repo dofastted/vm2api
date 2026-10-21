@@ -29,7 +29,7 @@ for (const file of files) {
   const offline = /(?:sqlite-legacy|db-migration-sub2api)\.test\.mjs$/.test(file)
   const database =
     !offline &&
-    /db\/|database\.mjs|api-keys\.mjs|panel-users\.mjs|account-quota\.mjs|sticky-router\.mjs|proxy-pool\.mjs|request-log\.mjs|api-endpoints\.mjs|thinking-owner\.mjs|harness\.mjs/.test(
+    /db\/|database\.mjs|api-keys\.mjs|panel-users\.mjs|account-quota\.mjs|sticky-router\.mjs|proxy-pool\.mjs|request-log\.mjs|api-endpoints\.mjs|thinking-owner\.mjs|harness\.mjs|ha-billing\.mjs|node-management-fixture\.mjs/.test(
       source,
     )
   const args = database ? ['--import', './test/pg-setup.mjs', '--test', file] : ['--test', file]
