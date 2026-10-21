@@ -230,6 +230,8 @@ test('package update rejects global executions before its first metadata or cred
     accountId: 'synthetic',
     vmLimit: 1,
     accountLimit: 1,
+    fableLimit: 0,
+    rpmLimit: 0,
   })
   const body = buildVmPackage({ vm: { id: 'vm-a', name: 'must not be written', timezone: 'UTC' } })
   const h = f.handler(body, { packageImportBringUp: false })
