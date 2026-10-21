@@ -3,6 +3,24 @@ import assert from 'node:assert/strict'
 import { getDb, createDatabase } from '../../src/lib/db/database.mjs'
 import { ControlPlaneLock } from '../../src/lib/db/control-plane-lock.mjs'
 
+test('a one-connection pool rejects control-plane startup without consuming the business connection', async () => {
+  const db = getDb()
+  const single = await createDatabase({ connectionString: db.connectionString, schema: db.schema + '_single', max: 1 })
+  const lock = new ControlPlaneLock(single)
+  try {
+    await assert.rejects(lock.start(), {
+      code: 'control_plane_pool_too_small',
+      message: 'Control-plane mode requires a PostgreSQL connection pool with at least 2 connections',
+    })
+    assert.equal(lock.healthy, false)
+    assert.equal(single.pool.totalCount, single.pool.idleCount)
+    assert.equal((await single.prepare('SELECT 1 AS n').get()).n, 1)
+  } finally {
+    await lock.stop()
+    await single.close()
+  }
+})
+
 test('one controller owns each database and schema until explicit stop', async () => {
   const db = getDb()
   let lost = 0
