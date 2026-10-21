@@ -1,0 +1,297 @@
+{
+  "status": "in_progress_not_ha_acceptance",
+  "full_suite_source_sha": "0ffae4b04c2429f472bef5a42add4a00a1ed7fcc",
+  "full_suites": {
+    "unit": {
+      "files": 342,
+      "totals": {
+        "tests": 3932,
+        "pass": 3915,
+        "fail": 7,
+        "cancelled": 0,
+        "skipped": 10
+      },
+      "failures": [
+        {
+          "file": "test/unit/cli-hop-body.test.mjs",
+          "test": "prepareCliHopBody drops metadata and CLI-owned system but keeps official agent leftover",
+          "error_sha256": "1afab608e2476a88783807d547c9b239ad4ac831679731a3ed4d44812b0c31d2",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/unit/cli-hop-body.test.mjs",
+          "test": "every cli-hop system becomes the identity plus the caller body",
+          "error_sha256": "312320875ebe3fc483f8bb570b16a93bb368278d2b6a78f71a763436e2a81b3f",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/unit/cli-hop-body.test.mjs",
+          "test": "cli-hop normalizes mixed caller markers to the official template",
+          "error_sha256": "312320875ebe3fc483f8bb570b16a93bb368278d2b6a78f71a763436e2a81b3f",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/unit/cli-hop-body.test.mjs",
+          "test": "cli-hop drops caller system/tools markers and restamps last plus penultimate user",
+          "error_sha256": "7862d1144e6748d63aa6e98dabf5a9fa7d8d1582f7fbfe851d978eb15f6d5c92",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/unit/cli-hop-body.test.mjs",
+          "test": "cli-hop short history only marks the last message",
+          "error_sha256": "81b2ee3a4bb8b1ab4f351bede4398032dc9637c683b82b146630fd6857e94c2e",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/unit/cli-hop-body.test.mjs",
+          "test": "cli-hop uses the inbound session TTL on both message anchors",
+          "error_sha256": "01732f4307f58f479e9b3d8329d92a93d9c748c58028276022257d3645e77e87",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/unit/convert-cache-shape.test.mjs",
+          "test": "openai.chat multi-turn cli-hop marks last and penultimate user",
+          "error_sha256": "312320875ebe3fc483f8bb570b16a93bb368278d2b6a78f71a763436e2a81b3f",
+          "matches_6732a864_error": true
+        }
+      ],
+      "log_sha256": "c3a343df30076763d8e5405f1385b89a11bc9896a507275b4788333f204c0fcc"
+    },
+    "e2e": {
+      "files": 30,
+      "totals": {
+        "tests": 127,
+        "pass": 109,
+        "fail": 17,
+        "cancelled": 0,
+        "skipped": 1
+      },
+      "failures": [
+        {
+          "file": "test/e2e/account-pool-failover.e2e.test.mjs",
+          "test": "account1 quota exhaustion rotates to account2 and commits sticky final account",
+          "error_sha256": "a25cb59468e4decc45b1d8b3a66b0a4fbd2195af9f498da39aa83e92169825b5",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/e2e/auto-mode.e2e.test.mjs",
+          "test": "classifier terminal/error/cancel/concurrency boundaries through actual ELF",
+          "error_sha256": "84e06146cf59485c3b46e05070f6a9a184ecb010a57ef8ab1b62a3ebae90c36a",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/e2e/completions.e2e.test.mjs",
+          "test": "POST /v1/completions old OpenAI prompt format",
+          "error_sha256": "fdb99383e1e333346a42b82cbf8092357575350f6a03f1ec297c9cee064b1e6d",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/e2e/credentials.e2e.test.mjs",
+          "test": "reset destroys home and recreates the same slot without oauth",
+          "error_sha256": "dfd84d60931072a864eb94f48ce13d4223e963ae919898236f1859bedc8d917e",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/e2e/crs-default.e2e.test.mjs",
+          "test": "default POST /v1/messages uses Go worker pool, not CLI",
+          "error_sha256": "fdb99383e1e333346a42b82cbf8092357575350f6a03f1ec297c9cee064b1e6d",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/e2e/errors.e2e.test.mjs",
+          "test": "unknown model is rejected without hop",
+          "error_sha256": "6ea819807eaee98e6a4c38817c9f011fb426e6a5ff499fa441d8f7bb07371461",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/e2e/health.e2e.test.mjs",
+          "test": "harness /health 200 and honest capabilities",
+          "error_sha256": "c23279127cad70a092d0cc7bb6ac400e05aff03e4614d1eaaa40252878c221c2",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/e2e/hermes.e2e.test.mjs",
+          "test": "Hermes unofficial: Go relay keeps persona/tools and never launches CLI",
+          "error_sha256": "97ae4156650fa0de2f613aa7753666781545cb2fe7818350a6df904ab696cdbc",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/e2e/hermes.e2e.test.mjs",
+          "test": "Hermes system blob without UA still classifies as hermes",
+          "error_sha256": "a2c6319267f1b752b63d96a41e15b1a5133952e88f0c145bc96dda53fd31cbe5",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/e2e/hop-meta.e2e.test.mjs",
+          "test": "CRS default keeps thinking + max_tokens + temperature in official body",
+          "error_sha256": "ebe0dbf58f38b7e1df9e2c55463c11e712927dcbc047102419ad10a8d38f1420",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/e2e/hop-meta.e2e.test.mjs",
+          "test": "CRS keeps a long caller system in the structured official prompt",
+          "error_sha256": "ba0ac5e90ea008839723c328e8b172228820837ab895e425d2190c1aa5caa708",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/e2e/hop-meta.e2e.test.mjs",
+          "test": "legacy CLI selector cannot drop HTTP request parameters",
+          "error_sha256": "ebe0dbf58f38b7e1df9e2c55463c11e712927dcbc047102419ad10a8d38f1420",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/e2e/messages.e2e.test.mjs",
+          "test": "HTTP worker preserves thinking, sampling and max_tokens",
+          "error_sha256": "8353154a58e84007d91c2d217c516dc771e359ddb43d527c7db6734ab5cff6ca",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/e2e/messages.e2e.test.mjs",
+          "test": "HTTP path preserves long system without CLI argv truncation",
+          "error_sha256": "085c13ab1e54fb324bce5520b12006fbf7f84b4a69a1c5cf9e09727b5b33da99",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/e2e/openai-responses.e2e.test.mjs",
+          "test": "POST /v1/responses non-stream shape: object + output_text + usage",
+          "error_sha256": "a7c7c455e65d737b0a872d5d7b4cbe5a5c2372e3117e3f361d6dbe8f223c1392",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/e2e/openai-responses.e2e.test.mjs",
+          "test": "POST /v1/responses stream includes [DONE]",
+          "error_sha256": "0be25feaedaa697c09835d15c8cfdae694de2710330cadfadcbdfa146625a099",
+          "matches_6732a864_error": true
+        },
+        {
+          "file": "test/e2e/openai-responses.e2e.test.mjs",
+          "test": "POST /v1/responses tools → function_call in output",
+          "error_sha256": "a7c7c455e65d737b0a872d5d7b4cbe5a5c2372e3117e3f361d6dbe8f223c1392",
+          "matches_6732a864_error": true
+        }
+      ],
+      "log_sha256": "0b07581d3588fa0d7042cbc0926ef75c66e93e7a73182b0cd63fd94ba71f4843"
+    }
+  },
+  "independent_review": {
+    "source_sha": "0ffae4b04c2429f472bef5a42add4a00a1ed7fcc",
+    "base_sha": "fcd568c92f50103fb3f9694de7dbffc3f238c764",
+    "session_id": "01a15ee0-3324-7490-928c-8343beb13b5e",
+    "method": "separate Codex CLI session, read-only detached worktree, static source review only",
+    "findings": {
+      "P1": 4,
+      "P2": 1
+    },
+    "raw_report_sha256": "f1b0fed39c969477b546b658363e0b6b90e5bccaace03e48e890fae684bdfdbf",
+    "fixes": [
+      {
+        "finding": "NUL summary write",
+        "red_sha": "97e00cf3",
+        "fix_sha": "1c034cc6",
+        "verification": {
+          "files": 1,
+          "totals": {
+            "tests": 56,
+            "pass": 56,
+            "fail": 0,
+            "cancelled": 0,
+            "skipped": 0
+          },
+          "failures": [],
+          "log_sha256": "9530c4872e2c287c3e5798cf843958ad08f36cbeb54e00f18bbc2a2babf26f82"
+        },
+        "verification_scope": "workspace request-log unit/E2E; summary sanitization matches fix commit, not a frozen whole-source check"
+      },
+      {
+        "finding": "monitor preparation admission",
+        "red_sha": "04a016b2",
+        "fix_sha": "f666c923",
+        "reported_tests": 96
+      },
+      {
+        "finding": "official bootstrap original promise",
+        "red_sha": "3e5b3b1a",
+        "fix_sha": "3304c452",
+        "reported_tests": 85
+      },
+      {
+        "finding": "package writes before VM claim",
+        "red_sha": "2a58a9e9",
+        "fix_sha": "4fed2928",
+        "reported_tests": 83
+      },
+      {
+        "finding": "panel proxy claims",
+        "red_sha": "2ebc3f42",
+        "fix_sha": "b9fc7462",
+        "reported_tests": 107
+      }
+    ],
+    "delta_review": {
+      "source_sha": "66a580de17670a954638fbfb46fee25740adab78",
+      "status": "completed_4_P1_reproduction_and_fixes_in_progress",
+      "session_id": "01a15f03-648a-7d92-bf3d-f4d20d4cf03e",
+      "findings": {
+        "P1": 4
+      },
+      "raw_report_sha256": "771838ebe137f75df8d9456bfa7590672fe90fa9562dcdda33219f22d0ef99bc"
+    }
+  },
+  "additional_fixed_source_checks": [
+    {
+      "source_sha": "f4a685b98f31d467b6a2c8c5a8b7cf7749bf15c5",
+      "scope": "watchdog recovery state and global fault gate",
+      "result": {
+        "files": 1,
+        "totals": {
+          "tests": 99,
+          "pass": 99,
+          "fail": 0,
+          "cancelled": 0,
+          "skipped": 0
+        },
+        "failures": [],
+        "log_sha256": "235ee5b910bba7e813bf7fabfb46ee58e6068aa0d8ea1388a046694ba2dbd09a"
+      }
+    },
+    {
+      "source_sha": "bf7615f8be9adf4f569c2a7d802be514a4c58e64",
+      "scope": "shared circuits, execution admission, panel read/reset, failover, database and backup",
+      "result": {
+        "files": 1,
+        "totals": {
+          "tests": 142,
+          "pass": 142,
+          "fail": 0,
+          "cancelled": 0,
+          "skipped": 0
+        },
+        "failures": [],
+        "log_sha256": "eec09eea8dd6cd844d1b3ddf4b82d2dfd3efdc840e40a169d242625399a28fba"
+      }
+    },
+    {
+      "source_sha": "e1e5d2a9e6cea391fb96aacc6b0757fa3ad0360f",
+      "scope": "captured KSG2/PG binding, actual synthetic Go gate plus two PG connections, immutable proof and bind/refresh exclusion",
+      "result": {
+        "files": 1,
+        "totals": {
+          "tests": 156,
+          "pass": 156,
+          "fail": 0,
+          "cancelled": 0,
+          "skipped": 0
+        },
+        "failures": [],
+        "log_sha256": "675fc3b7320b857a06df520380f210a4b72a5ee7f9c487f0f97dcf03e40e0402"
+      }
+    }
+  ],
+  "environment_boundary": "Dedicated task PostgreSQL plus synthetic/mock workers only. No production changes. Node-side and later controller increments have not been deployed to the singleton image.",
+  "remaining": [
+    "shared refresh integration",
+    "captured node execution binding",
+    "trusted node-owned mutation and permissions",
+    "multi-node active/active and fault takeover acceptance"
+  ]
+}
