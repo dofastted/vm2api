@@ -212,6 +212,7 @@ nodeCase(
   async (fx) => {
     const initialized = await fx.cli('trusted-init')
     assert.equal(initialized.status, 0, initialized.out + initialized.err)
+    assert.equal(JSON.parse(initialized.out).authority_schema, fx.service.schema)
     const sql = fs.readFileSync(fx.output, 'utf8')
     assert.equal(fs.statSync(fx.output).mode & 0o777, 0o600)
     assert.equal(sql.includes('synthetic-command-refresh'), false)
