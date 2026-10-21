@@ -13,6 +13,7 @@ import { writeCodexAccounts } from '../../src/lib/vm/codex-slot.mjs'
 
 async function fixture(t, { codex = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'panel-refresh-claims-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   fs.mkdirSync(path.join(root, 'vms'))
   const vm = {
     id: 'vm-synthetic',
@@ -22,7 +23,8 @@ async function fixture(t, { codex = false } = {}) {
       : { claude: { mode: 'oauth', has_refresh: true } }),
   }
   fs.writeFileSync(path.join(root, 'vms', vm.id + '.json'), JSON.stringify(vm))
-  if (codex)
+  if (codex) {
+    fs.mkdirSync(path.join(root, 'vms', vm.id))
     writeCodexAccounts(root, vm.id, [
       {
         id: 'synthetic-account',
@@ -31,6 +33,7 @@ async function fixture(t, { codex = false } = {}) {
         refresh_token: 'synthetic-old-refresh',
       },
     ])
+  }
   const db = getDb()
   const peer = await createRepositoryTestDatabase({ connectionString: db.connectionString, schema: db.schema })
   const previous = process.env.VM2API_CONTROL_PLANE_MODE
@@ -45,7 +48,6 @@ async function fixture(t, { codex = false } = {}) {
     await peer.close()
     if (previous == null) delete process.env.VM2API_CONTROL_PLANE_MODE
     else process.env.VM2API_CONTROL_PLANE_MODE = previous
-    fs.rmSync(root, { recursive: true, force: true })
   })
   function handler(extra = {}) {
     const response = {}
