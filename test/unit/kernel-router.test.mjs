@@ -345,6 +345,46 @@ unixTest('preparation rejection identifies that no kernel execution started', as
   assert.deepEqual(result.execution, { requestId: null, started: false, ended: true, reason: 'not_started' })
 })
 
+for (const [mode, dispatch] of [
+  ['call', dispatchCallInference],
+  ['stream', dispatchStreamInference],
+]) {
+  for (const scenario of ['pre-aborted', 'mock']) {
+    for (const durableStart of [true, false]) {
+      test(`${mode} ${scenario} ${durableStart ? 'does not complete an unbound job' : 'keeps end-only observation'}`, async () => {
+        const env = ['KIN_KERNEL_BIN', 'KIN_CRS_MOCK', 'KIN_CRS_TRACE_FILE', 'KIN_MOCK_TRACE_FILE']
+        const previous = Object.fromEntries(env.map((key) => [key, process.env[key]]))
+        process.env.KIN_KERNEL_BIN = '/bin/true'
+        process.env.KIN_CRS_MOCK = scenario === 'mock' ? '1' : '0'
+        delete process.env.KIN_CRS_TRACE_FILE
+        delete process.env.KIN_MOCK_TRACE_FILE
+        let starts = 0
+        const ended = []
+        try {
+          const result = await dispatch({
+            exec: { vmId: 'synthetic-unbound', vm: { id: 'synthetic-unbound' } },
+            body: { model: 'claude-test', messages: [{ role: 'user', content: 'synthetic request' }] },
+            signal: scenario === 'pre-aborted' ? AbortSignal.abort() : undefined,
+            ensureRust: async () => ({ ok: true }),
+            ...(durableStart ? { onExecutionStart: async () => starts++ } : {}),
+            onExecutionEnd: async (execution) => ended.push(execution),
+          })
+          assert.equal(starts, 0)
+          assert.equal(result.execution.started, false)
+          assert.equal(result.execution.ended, true)
+          assert.equal(ended.length, durableStart ? 0 : 1)
+          if (!durableStart) assert.deepEqual(ended[0], result.execution)
+        } finally {
+          for (const key of env) {
+            if (previous[key] == null) delete process.env[key]
+            else process.env[key] = previous[key]
+          }
+        }
+      })
+    }
+  }
+}
+
 unixTest('dispatchStreamInference uses rust socket when ready', async () => {
   const prev = process.env.KIN_KERNEL_BIN
   process.env.KIN_KERNEL_BIN = '/bin/true'
