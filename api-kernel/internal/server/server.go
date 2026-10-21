@@ -4,6 +4,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"io"
+	"mime"
 	"net/http"
 	"strings"
 
@@ -94,7 +95,29 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
+	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if mediaType == "text/event-stream" {
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+			_, _ = io.Copy(flushingWriter{writer: w, flusher: flusher}, resp.Body)
+			return
+		}
+	}
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// Expose only Write so io.Copy cannot bypass flushing through ReaderFrom.
+type flushingWriter struct {
+	writer  io.Writer
+	flusher http.Flusher
+}
+
+func (w flushingWriter) Write(p []byte) (int, error) {
+	n, err := w.writer.Write(p)
+	if n > 0 {
+		w.flusher.Flush()
+	}
+	return n, err
 }
 
 func jsonQuote(s string) string {
