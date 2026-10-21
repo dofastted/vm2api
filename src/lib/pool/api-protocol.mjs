@@ -71,6 +71,7 @@ export async function runApiInference({
 } = {}) {
   const canonical = officialMessagesBody(convertedBody)
   const model = canonical.model
+  scheduler.reload(await store.listRaw())
   const picked = scheduler.pick(model)
   if (!picked.ok) {
     return {

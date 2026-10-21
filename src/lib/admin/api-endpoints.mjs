@@ -228,6 +228,7 @@ export class ApiEndpointStore {
   }
 
   async setKeyCooldown(id, untilIso) {
+    // Automatic upstream responses may extend cooldown; updateKey handles explicit administrator resets.
     await this.repo.setKeyCooldown(id, untilIso)
   }
 

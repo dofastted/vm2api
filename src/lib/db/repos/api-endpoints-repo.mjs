@@ -99,7 +99,12 @@ export class ApiEndpointsRepo {
       `INSERT INTO api_endpoint_models (${MODEL_COLS.join(',')}) VALUES (${MODEL_COLS.map((_, i) => '$' + (i + 1)).join(',')})`,
     )
     this._delModelsEp = db.prepare('DELETE FROM api_endpoint_models WHERE endpoint_id = $1')
-    this._cool = db.prepare('UPDATE api_endpoint_keys SET cooldown_until = $1 WHERE id = $2')
+    this._cool = db.prepare(`
+      UPDATE api_endpoint_keys SET cooldown_until = CASE
+        WHEN cooldown_until IS NULL OR cooldown_until::timestamptz < $1::text::timestamptz THEN $1::text
+        ELSE cooldown_until
+      END WHERE id = $2
+    `)
     this._updKey = db.prepare(
       'UPDATE api_endpoint_keys SET api_key = $1, proxy_url = $2, proxy_id = $3, disabled = $4, cooldown_until = $5 WHERE id = $6',
     )
