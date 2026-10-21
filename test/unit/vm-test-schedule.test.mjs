@@ -296,3 +296,56 @@ test('sync with an invalid test writes nothing', () => {
   }
   assert.deepEqual(settings.all(), before)
 })
+
+test('flush waits until a scheduled result finishes persisting', async () => {
+  const { settings, schedule } = runner()
+  await schedule.save('vm-01', claudeConfig)
+  schedule.started = true
+  let release
+  let entered
+  const gate = new Promise((resolve) => { release = resolve })
+  const writing = new Promise((resolve) => { entered = resolve })
+  const originalSet = settings.set.bind(settings)
+  settings.set = async (...args) => {
+    entered()
+    await gate
+    return originalSet(...args)
+  }
+  const run = schedule._run('vm-01')
+  await writing
+  let flushed = false
+  const flush = schedule.flush().then(() => { flushed = true })
+  try {
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(flushed, false, 'the scheduled result is still being written')
+  } finally {
+    release()
+    await run
+    await flush
+    schedule.stop()
+  }
+})
+
+test('flush reports a failed scheduled result write', async () => {
+  const { settings, schedule } = runner()
+  await schedule.save('vm-01', claudeConfig)
+  schedule.started = true
+  const failure = new Error('synthetic scheduled result write failure')
+  let release
+  let entered
+  const gate = new Promise((resolve) => { release = resolve })
+  const writing = new Promise((resolve) => { entered = resolve })
+  settings.set = async () => {
+    entered()
+    await gate
+    throw failure
+  }
+  const run = schedule._run('vm-01')
+  run.catch(() => {})
+  await writing
+  const flush = schedule.flush()
+  release()
+  await assert.rejects(run, (error) => error === failure)
+  await assert.rejects(flush, (error) => error === failure)
+  schedule.stop()
+})
