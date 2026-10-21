@@ -585,6 +585,11 @@ export class RequestLogStore {
     const classified = classifyRequestError(summary)
     if (classified?.error_class) summary.error_class = classified.error_class
 
+    // PostgreSQL text rejects NUL; JSON debug bodies can retain the original request.
+    for (const [key, value] of Object.entries(summary)) {
+      if (typeof value === 'string') summary[key] = value.replaceAll('\0', '\\u0000')
+    }
+
     await this.repo.insertSummaryIfAbsent(summary)
     if (this.jsonlMirror) this._appendJsonl(summary)
     this._mem.push(summary)
