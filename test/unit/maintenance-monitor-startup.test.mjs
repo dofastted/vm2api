@@ -210,6 +210,7 @@ test('a monitor can replace the closed initialization scope inherited by an asyn
 test('DRAINING rejects monitor configuration and VM discovery before any callback or claim', async (t) => {
   const { db, root, coordinator, tasks } = await fixture(t)
   let calls = 0
+  let discoveryReads = 0
   const callback = async () => {
     calls++
     return { ok: true }
@@ -224,8 +225,14 @@ test('DRAINING rejects monitor configuration and VM discovery before any callbac
   const runner = new VmTestScheduleRunner({
     projectRoot: root,
     sharedTasks: tasks,
-    settings: () => new RuntimeSettings(db),
-    list: () => [vm],
+    settings: () => {
+      discoveryReads++
+      return new RuntimeSettings(db)
+    },
+    list: () => {
+      discoveryReads++
+      return [vm]
+    },
     runTest: callback,
   })
   const operation = await coordinator.beginMaintenance({ kind: 'backup' })
@@ -233,7 +240,11 @@ test('DRAINING rejects monitor configuration and VM discovery before any callbac
     await assert.rejects(credential.runOnce(), { code: 'database_maintenance' })
     await assert.rejects(health.runRealProbe(), { code: 'database_maintenance' })
     await assert.rejects(usage.runOnce(), { code: 'database_maintenance' })
-    await assert.rejects(runner.start(), { code: 'database_maintenance' })
+    await runner.start()
+    await runner.flush()
+    assert.equal(discoveryReads, 0, 'a discovery admission refusal never reads settings or VMs')
+    assert.equal(runner.jobs.size, 0)
+    assert.equal(runner.writeFailure, null, 'maintenance refusal is not a persistence failure')
     assert.equal(calls, 0)
     assert.equal((await db.pool.query('SELECT count(*)::integer AS n FROM background_task_runs')).rows[0].n, 0)
   } finally {
