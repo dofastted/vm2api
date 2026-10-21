@@ -34,6 +34,13 @@ import { isKvmRuntime } from './runtime-kind.mjs'
 import { slotDockerCpus } from './machine-spec.mjs'
 import { bindVmProxy, getVm, patchVmRecord, vmHasSchedulableCredential } from './vm-registry.mjs'
 import { isCredentialRefreshFailed } from '../pool/availability.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { getDb } from '../db/database.mjs'
+import { SharedProxyOperations } from './shared-proxy-operations.mjs'
+import { SharedVmOperations } from './shared-vm-operations.mjs'
+import { withVmMutations } from './vm-mutations.mjs'
+import { parseBoundVmIds } from './proxy-pool.mjs'
+import { flushVmDbSync } from './vm-db-sync.mjs'
 
 const HEALTH_TIMEOUT_MS = 1500
 const BRIDGE_HEAL_MIN_MS = 60_000
@@ -611,7 +618,13 @@ export function createSlotBridgeHealer({
   now = () => Date.now(),
   ops = {},
   logger = console,
+  operations = null,
+  proxyOperations = null,
 }) {
+  const shared = !!operations || !!proxyOperations || isKubernetesMode()
+  const db = shared ? operations?.db || proxyOperations?.db || getDb() : null
+  const mutations = shared ? operations || new SharedVmOperations(db) : null
+  const proxies = shared ? proxyOperations || new SharedProxyOperations(db) : null
   const egressAlive = ops.egressAlive || ((proxyId) => inspectEgressProcess(projectRoot, proxyId).ok)
   const startEgress = ops.ensureProxyEgress || ((proxy) => ensureProxyEgress(projectRoot, proxy))
   const getCluster = ops.cluster || cluster
@@ -622,7 +635,7 @@ export function createSlotBridgeHealer({
     lastAttempt.set(key, at)
     return true
   }
-  return async function healBridges(vms) {
+  async function perform(vms) {
     const seenProxies = new Set()
     for (const vm of vms) {
       if (vm?.status !== 'running') continue
@@ -638,6 +651,7 @@ export function createSlotBridgeHealer({
           if (healed.length) logger.warn(`[bridge-heal] ${vm.id} rebuilt ${healed.join(', ')}`)
         } catch (error) {
           logger.warn(`[bridge-heal] ${vm.id} relay rebuild failed: ${error?.message || error}`)
+          if (shared) return { ok: false, vmOperationUncertain: true }
         }
         continue
       }
@@ -650,6 +664,81 @@ export function createSlotBridgeHealer({
       const result = await startEgress(proxy)
       if (result?.ok) logger.warn(`[bridge-heal] kin-egress ${proxy.id} was down; restarted`)
       else logger.warn(`[bridge-heal] kin-egress ${proxy.id} restart failed: ${result?.error || 'unknown'}`)
+      if (shared && (result?.ok !== true || result?.vmOperationUncertain === true))
+        return { ok: false, vmOperationUncertain: true }
+    }
+    return { ok: true, vmOperationUncertain: false }
+  }
+
+  return async function healBridges(vms) {
+    if (!shared) return perform(vms)
+    // Read-only planning avoids taking every VM out of scheduling on healthy ticks.
+    const plans = []
+    for (const vm of vms) {
+      if (vm?.status !== 'running') continue
+      const nodeId = vmNodeId(vm)
+      if (nodeId) {
+        const status = getCluster()?.slotBridgeStatus(nodeId, vm.id)
+        if (
+          status?.link?.state === 'ready' &&
+          !(status.bridge?.alive && status.relays?.kernel?.alive && status.relays?.worker?.alive)
+        )
+          plans.push({ vm, nodeId })
+      } else {
+        const proxy = (ops.getVm || getVm)(projectRoot, vm.id)?.proxy
+        if (
+          !isCodexVm(vm) &&
+          hasBoundExit(proxy) &&
+          !isLocalEgressProxy(proxy) &&
+          !proxyBlockedReason(proxy) &&
+          !egressAlive(proxy.id)
+        )
+          plans.push({ vm, proxyId: proxy.id })
+      }
+    }
+    if (!plans.length) return { ok: true, vmOperationUncertain: false }
+    let entered = false
+    try {
+      return await proxies.run(async () => {
+        const ids = new Set(plans.map((plan) => plan.vm.id))
+        const proxyIds = [...new Set(plans.map((plan) => plan.proxyId).filter(Boolean))]
+        if (proxyIds.length) {
+          const rows = await db.prepare('SELECT bound_vm_id FROM proxies WHERE id = ANY($1::text[])').all(proxyIds)
+          for (const row of rows) for (const id of parseBoundVmIds(row.bound_vm_id)) ids.add(id)
+        }
+        // A node Docker bridge is shared by its slots. Include stored VMs even
+        // when the watchdog target snapshot omitted them.
+        if (plans.some((plan) => plan.nodeId)) {
+          for (const row of await db.prepare('SELECT id FROM vms').all()) ids.add(row.id)
+        }
+        let result
+        try {
+          result = await withVmMutations(
+            projectRoot,
+            [...ids],
+            async () => {
+              entered = true
+              const targets = plans.flatMap((plan) => {
+                const current = (ops.getVm || getVm)(projectRoot, plan.vm.id) || plan.vm
+                const sameTarget = plan.nodeId ? vmNodeId(current) === plan.nodeId : current.proxy?.id === plan.proxyId
+                return sameTarget ? [current] : []
+              })
+              const outcome = await perform(targets)
+              await flushVmDbSync()
+              return outcome
+            },
+            { operations: mutations, kind: 'kernel_bridge_heal' },
+          )
+        } catch (error) {
+          if (!entered) error.proxyOperationNotStarted = true
+          throw error
+        }
+        return { terminal: result?.ok === true && result.vmOperationUncertain !== true, value: result }
+      })
+    } catch (error) {
+      if (!entered && ['vm_execution_active', 'vm_operation_active', 'proxy_operation_active'].includes(error.code))
+        error.taskNotStarted = true
+      throw error
     }
   }
 }

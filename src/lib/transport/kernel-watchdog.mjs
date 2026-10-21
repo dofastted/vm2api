@@ -222,10 +222,10 @@ export function createKernelWatchdog({
     healingBridges = true
     const work = () => healBridges(vms)
     const pending = tasks
-      ? tasks.run({ taskKey: 'kernel_bridge_heal', intervalMs: config.interval_sec * 1000 }, async () => ({
-          terminal: true,
-          value: await work(),
-        }))
+      ? tasks.run({ taskKey: 'kernel_bridge_heal', intervalMs: config.interval_sec * 1000 }, async () => {
+          const value = await work()
+          return { terminal: value?.ok === true && value.vmOperationUncertain !== true, value }
+        })
       : Promise.resolve().then(work)
     trackSideEffect(pending)
       .catch((error) => console.warn(`[kernel-watchdog] bridge heal failed: ${error?.message || error}`))
