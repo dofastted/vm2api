@@ -126,6 +126,19 @@ test('batch fingerprint reconciliation acquires every target before changing any
   await next.release()
 })
 
+test('fleet update claims every selected target before starting the first command', async (t) => {
+  const f = await fixture(t)
+  f.seed('vm-a')
+  f.seed('vm-b')
+  await f.otherOperations.tryAcquire({ vmId: 'vm-b' })
+  const h = f.handler({ action: 'collect', ids: ['vm-a', 'vm-b'] })
+  await h.request('POST', '/api/panel/vms/fleet-update')
+  assert.equal(h.response.status, 409)
+  const next = await f.otherOperations.tryAcquire({ vmId: 'vm-a' })
+  assert.equal(next.ok, true)
+  await next.release()
+})
+
 test('create claims the new physical identity before writing a VM or fingerprint', async (t) => {
   const f = await fixture(t)
   await f.otherOperations.tryAcquire({ vmId: 'vm-synthetic' })

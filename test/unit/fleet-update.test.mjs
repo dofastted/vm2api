@@ -83,6 +83,20 @@ test('degraded worker without OAuth still counts as up', () => {
   assert.equal(isWorkerProcessUp({ code: 'worker_unavailable' }), false)
 })
 
+test('fleet does not treat a partial Rust reload as completed successfully', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fleet-partial-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeSlot(root, 'vm-synthetic')
+  const report = await runFleetUpdate(root, {
+    action: 'roll',
+    reloadFn: async () => ({ ok: true, rust_ok: false, vmOperationUncertain: true }),
+    collectFn: async () => ({ ok: true }),
+    healthFn: async () => ({ ok: true }),
+  })
+  assert.equal(report.failed_count, 1)
+  assert.equal(report.items[0].vmOperationUncertain, true)
+})
+
 test('fleet telemetry uses injected telemetryFn with options object', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fleet-tel-'))
   writeSlot(root, 'vm-01', { node_id: 'node-a' })
