@@ -345,7 +345,10 @@ const routingRt = createRoutingRuntime({
   },
   // Lazy: the monitor is built after the runtime. An unknown 429 asks for one
   // /usage hop through the same single-flight, bounded queue as the timer.
-  probeUsageOne: (vmId) => usageProbeMonitor?.probeNow?.(vmId, 'rate_limited_unknown'),
+  probeUsageOne: (vmId) => {
+    if (haMode) throw haUnsupported()
+    return usageProbeMonitor?.probeNow?.(vmId, 'rate_limited_unknown')
+  },
 })
 
 const {
@@ -692,10 +695,12 @@ backupService.onRestored(async (db) => {
     maxMb: routingConfig.logging?.max_mb,
     mutedErrorClasses: routingConfig.logging?.muted_error_classes,
   })
-  healthMonitor?.setConfig(routingConfig.health_probe)
-  credentialRefreshMonitor?.setConfig(normalizeCredentialRefreshConfig(routingConfig.credential_refresh))
-  kernelWatchdog?.setConfig(normalizeKernelWatchdogConfig(routingConfig.kernel_watchdog))
-  usageProbeMonitor?.setConfig(routingConfig.usage_probe)
+  if (!haMode) {
+    healthMonitor?.setConfig(routingConfig.health_probe)
+    credentialRefreshMonitor?.setConfig(normalizeCredentialRefreshConfig(routingConfig.credential_refresh))
+    kernelWatchdog?.setConfig(normalizeKernelWatchdogConfig(routingConfig.kernel_watchdog))
+    usageProbeMonitor?.setConfig(routingConfig.usage_probe)
+  }
   notifyMonitor?.setConfig(routingConfig.notify)
 
   await initPoolRuntime()

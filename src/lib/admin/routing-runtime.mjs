@@ -166,8 +166,8 @@ export function createRoutingRuntime(ctx) {
     configureUnitCircuit(config)
     const pending = []
     for (const [name, callback] of [
-      ['health_monitor', () => getHealth()?.setConfig(config.health_probe)],
-      ['usage_monitor', () => getUsage()?.setConfig(config.usage_probe)],
+      ['health_monitor', () => getHealth()?.setConfig(config.health_probe, { restart: !isKubernetesHaMode() })],
+      ['usage_monitor', () => getUsage()?.setConfig(config.usage_probe, { restart: !isKubernetesHaMode() })],
       ['notify_monitor', () => getNotify()?.setConfig(config.notify)],
       [
         'logging',
@@ -864,7 +864,7 @@ export function createRoutingRuntime(ctx) {
       accountQuota: ctx.accountQuota,
       config: routingConfig.rate_limit || {},
       onUsageProbe: ({ vmId }) => {
-        if (!vmId || typeof ctx.probeUsageOne !== 'function') return
+        if (isKubernetesHaMode() || !vmId || typeof ctx.probeUsageOne !== 'function') return
         Promise.resolve(ctx.probeUsageOne(vmId)).catch(() => {})
       },
     })
