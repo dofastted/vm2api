@@ -36,8 +36,10 @@ const payload = Buffer.from(
   }),
 )
 
-async function fixture(t) {
-  const db = getDb()
+async function fixture(t, { mixedSchema = false } = {}) {
+  const db = mixedSchema
+    ? await createDatabase({ connectionString: getDb().connectionString, schema: getDb().schema + '_Mixed' })
+    : getDb()
   const peer = await createDatabase({ connectionString: db.connectionString, schema: db.schema })
   const coordinator = new GlobalMaintenanceCoordinator(db)
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nmc-'))
@@ -56,6 +58,7 @@ async function fixture(t) {
     }
     await coordinator.stop()
     await peer.close()
+    if (mixedSchema) await db.close()
     const cleanup = new pg.Client({ connectionString: db.connectionString })
     await cleanup.connect()
     try {
@@ -64,6 +67,7 @@ async function fixture(t) {
       await cleanup.query(
         `DROP SCHEMA IF EXISTS ${quoteIdentifier(service.schema)} CASCADE; DROP SCHEMA IF EXISTS ${quoteIdentifier(coordinator.schema)} CASCADE`,
       )
+      if (mixedSchema) await cleanup.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(db.schema)} CASCADE`)
     } finally {
       await cleanup.end()
       fs.rmSync(root, { recursive: true, force: true })
@@ -204,9 +208,9 @@ async function fixture(t) {
   }
 }
 
-function nodeCase(name, callback) {
+function nodeCase(name, callback, options) {
   test(name, async (t) => {
-    const fx = await fixture(t)
+    const fx = await fixture(t, options)
     try {
       await callback(fx, t)
     } finally {
@@ -214,6 +218,35 @@ function nodeCase(name, callback) {
     }
   })
 }
+
+nodeCase(
+  'both CLI commands accept an already migrated mixed-case schema without a lowercase alias',
+  async (fx) => {
+    assert.equal(
+      (
+        await fx.peer.query('SELECT count(*)::int AS n FROM pg_namespace WHERE nspname=$1', [
+          fx.db.schema.toLowerCase(),
+        ])
+      ).rows[0].n,
+      0,
+    )
+    const init = await fx.cli('trusted-init')
+    assert.equal(init.status, 0, init.out + init.err)
+    await fx.db.pool.query(fs.readFileSync(fx.output, 'utf8'))
+    const created = await fx.cli('slot-create')
+    assert.equal(created.status, 0, created.out + created.err)
+    assert.equal((await fx.peer.query('SELECT count(*)::int AS n FROM vms WHERE id=$1', [vmId])).rows[0].n, 1)
+    assert.equal(
+      (
+        await fx.peer.query('SELECT count(*)::int AS n FROM pg_namespace WHERE nspname=$1', [
+          fx.db.schema.toLowerCase(),
+        ])
+      ).rows[0].n,
+      0,
+    )
+  },
+  { mixedSchema: true },
+)
 
 nodeCase(
   'trusted-init writes nonsecret reader SQL and slot-create persists only confirmed public metadata',
