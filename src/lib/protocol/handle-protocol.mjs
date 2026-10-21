@@ -199,7 +199,10 @@ export function createHandleProtocol(deps) {
     return disjointOpenaiUsage(next)
   }
 
-  async function attachPricing(logBag, { managedKey = null, rateMultiplier = 1, bill = false } = {}) {
+  async function attachPricing(
+    logBag,
+    { managedKey = null, rateMultiplier = 1, bill = false, reservation = null } = {},
+  ) {
     const model = logBag.upstream_model || logBag.model
     const priced = costColumnsFromUsage(logBag.usage || {}, model)
     Object.assign(logBag, priced)
@@ -209,8 +212,16 @@ export function createHandleProtocol(deps) {
         model,
         rateMultiplier,
         officialCost: priced.total_cost,
+        reservation,
       })
-    } catch {}
+    } catch (error) {
+      if (reservation?.shared) {
+        // The request executed but its quota settlement is uncertain. Preserve the
+        // durable reservation until recovery can establish the result.
+        reservation.billingFailed = true
+        throw error
+      }
+    }
   }
 
   function finishClientCancel(res, result, logBag) {
@@ -466,6 +477,42 @@ export function createHandleProtocol(deps) {
   }
 
   async function handleProtocol(req, res, protocol, pathName) {
+    const admission = { lease: null }
+    try {
+      return await handleProtocolRequest(req, res, protocol, pathName, admission)
+    } catch (error) {
+      if (admission.executionStarted && admission.lease?.shared && !admission.lease.settled) {
+        admission.lease.billingFailed = true
+      }
+      throw error
+    } finally {
+      if (!admission.lease?.billingFailed) await admission.lease?.release?.()
+    }
+  }
+
+  async function reserveManagedKey(req, res) {
+    if (!req.apiKeyRecord) return { ok: true }
+    const gate = await apiKeyStore.reserve(req.apiKeyRecord)
+    if (!gate.ok) {
+      stats.errors++
+      json(
+        res,
+        gate.status,
+        makeError({
+          type: gate.status === 429 ? ErrorType.RATE_LIMIT : ErrorType.PERMISSION,
+          code: gate.code,
+          message: gate.message,
+          status: gate.status,
+          details: gate.detail || undefined,
+        }).body,
+      )
+    } else if (gate.record) {
+      req.apiKeyRecord = gate.record
+    }
+    return gate
+  }
+
+  async function handleProtocolRequest(req, res, protocol, pathName, admission) {
     const logCtx = requestLog.start(req, { protocol, pathName })
     res._kinRequestId = logCtx.request_id
     // Registers its own 'finish' listener first so status/headers are final when finish() runs.
@@ -738,6 +785,20 @@ export function createHandleProtocol(deps) {
       return
     }
     if (platform.platform === 'openai') {
+      const gate = await reserveManagedKey(req, res)
+      if (!gate.ok) return
+      admission.lease = gate
+      const runCodex = async (options) => {
+        admission.executionStarted = true
+        const output = await handleCodexProtocol(options)
+        await attachPricing(logBag, {
+          managedKey: req.apiKeyRecord,
+          reservation: gate,
+          rateMultiplier: await deps.groupsRepo.rateMultiplier(req.apiKeyRecord?.group_id ?? 1),
+          bill: !!req.apiKeyRecord && logBag.final_state === 'verified',
+        })
+        return output
+      }
       const routing = getRouting() || {}
       const codexSticky = {
         requestStartedAt: logCtx.t0,
@@ -760,7 +821,7 @@ export function createHandleProtocol(deps) {
         })
       if (protocol === 'anthropic.messages') {
         const codex = normalizeCodexRouting(routing.codex)
-        return await handleCodexProtocol({
+        return await runCodex({
           req,
           res,
           protocol,
@@ -788,7 +849,7 @@ export function createHandleProtocol(deps) {
           ...codexSticky,
         })
       }
-      return await handleCodexProtocol({
+      return await runCodex({
         req,
         res,
         protocol,
@@ -1028,24 +1089,10 @@ export function createHandleProtocol(deps) {
       })
     }
     if (inferenceBackend === 'api') {
+      const gate = await reserveManagedKey(req, res)
+      if (!gate.ok) return
+      admission.lease = gate
       const managedKey = req.apiKeyRecord || null
-      if (managedKey) {
-        const gate = await apiKeyStore.acquire(managedKey)
-        if (!gate.ok) {
-          stats.errors++
-          return json(
-            res,
-            gate.status,
-            makeError({
-              type: gate.status === 429 ? ErrorType.RATE_LIMIT : ErrorType.PERMISSION,
-              code: gate.code,
-              message: gate.message,
-              status: gate.status,
-              details: gate.detail || undefined,
-            }).body,
-          )
-        }
-      }
       const clientAbort = bindClientAbort(req, res)
       const clientStream = isClientStream(inbound, req.headers)
       const requestedDelivery = String(
@@ -1057,6 +1104,7 @@ export function createHandleProtocol(deps) {
       logBag.via = 'api-kernel'
       let result
       try {
+        admission.executionStarted = true
         result = await runApiInference({
           req,
           res,
@@ -1088,11 +1136,6 @@ export function createHandleProtocol(deps) {
         })
       } finally {
         clientAbort.settle()
-        if (managedKey) {
-          try {
-            apiKeyStore.release(managedKey)
-          } catch {}
-        }
       }
       // The api backend forwards the converted body untouched: its session is the outbound one.
       logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(ctx.body) || logBag.session_id)
@@ -1108,6 +1151,7 @@ export function createHandleProtocol(deps) {
       logBag.final_state = result?.terminalState || null
       await attachPricing(logBag, {
         managedKey,
+        reservation: admission.lease,
         rateMultiplier: await deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
         bill: !!(result?.ok && managedKey),
       })
@@ -1145,24 +1189,10 @@ export function createHandleProtocol(deps) {
     // anything still waiting past this writes SSE so Cloudflare does not 524.
     const queueKeepaliveDelay = queueKeepaliveDelayMs(getRouting(), cfg.limits?.queue_keepalive_delay_ms)
     const streamIdleTimeoutMs = resolveStreamIdleTimeoutMs(getRouting(), cfg)
+    const gate = await reserveManagedKey(req, res)
+    if (!gate.ok) return
+    admission.lease = gate
     const managedKey = req.apiKeyRecord || null
-    if (managedKey) {
-      const gate = await apiKeyStore.acquire(managedKey)
-      if (!gate.ok) {
-        stats.errors++
-        return json(
-          res,
-          gate.status,
-          makeError({
-            type: gate.status === 429 ? ErrorType.RATE_LIMIT : ErrorType.PERMISSION,
-            code: gate.code,
-            message: gate.message,
-            status: gate.status,
-            details: gate.detail || undefined,
-          }).body,
-        )
-      }
-    }
 
     const clientAbort = bindClientAbort(req, res)
 
@@ -1216,6 +1246,7 @@ export function createHandleProtocol(deps) {
     }
     let result
     try {
+      admission.executionStarted = true
       result = await getFailoverRunner().run({
         requestId: logCtx.request_id,
         canonicalBody,
@@ -1569,11 +1600,6 @@ export function createHandleProtocol(deps) {
     } finally {
       anthropicKeepalive?.stop()
       clientAbort.settle()
-      if (managedKey) {
-        try {
-          apiKeyStore.release(managedKey)
-        } catch {}
-      }
     }
 
     if (result?.responseSent) return
@@ -1649,6 +1675,7 @@ export function createHandleProtocol(deps) {
       } catch {}
       await attachPricing(logBag, {
         managedKey,
+        reservation: admission.lease,
         rateMultiplier: await deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
         bill: !!managedKey,
       })
@@ -1792,17 +1819,33 @@ export function createHandleProtocol(deps) {
     }
     logBag.model = typeof body?.model === 'string' ? body.model : null
     logBag.inbound_summary = summarizeBody(body)
-    return await handleCodexSearch({
-      req,
-      res,
-      body,
-      logBag,
-      stats,
-      json,
-      routing: getRouting() || {},
-      projectRoot: cfg.paths.project,
-      stickyRouter,
-    })
+    const gate = await reserveManagedKey(req, res)
+    if (!gate.ok) return
+    try {
+      const output = await handleCodexSearch({
+        req,
+        res,
+        body,
+        logBag,
+        stats,
+        json,
+        routing: getRouting() || {},
+        projectRoot: cfg.paths.project,
+        stickyRouter,
+      })
+      await attachPricing(logBag, {
+        managedKey: req.apiKeyRecord,
+        reservation: gate,
+        rateMultiplier: await deps.groupsRepo.rateMultiplier(req.apiKeyRecord?.group_id ?? 1),
+        bill: !!req.apiKeyRecord && logBag.final_state === 'verified',
+      })
+      return output
+    } catch (error) {
+      if (gate.shared && !gate.settled) gate.billingFailed = true
+      throw error
+    } finally {
+      if (!gate.billingFailed) await gate.release?.()
+    }
   }
 
   return {

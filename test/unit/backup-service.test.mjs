@@ -76,9 +76,11 @@ test('restoring the application schema preserves later writes in a neighboring s
   }
 })
 
-test('restoring a PG 001 snapshot removes later tables before reapplying migration 002', async () => {
+test('restoring a PG 001 snapshot removes later tables before reapplying current migrations', async () => {
   const db = getDb()
-  await db.exec("DROP TABLE panel_sessions; DELETE FROM schema_migrations WHERE version='002'")
+  await db.exec(
+    "DROP TABLE panel_sessions, api_key_admissions, gateway_rate_buckets; DELETE FROM schema_migrations WHERE version <> '001'",
+  )
   await new SettingsRepo(db).set('older-snapshot', 'before')
   const rec = await svc.createBackup()
   await applyMigrations(db)
@@ -88,13 +90,17 @@ test('restoring a PG 001 snapshot removes later tables before reapplying migrati
   await new SettingsRepo(db).set('older-snapshot', 'after')
   assert.equal((await svc.restoreBackup(rec.id)).ok, true)
   assert.equal(await new SettingsRepo(db).get('older-snapshot'), 'before')
-  assert.equal((await db.prepare('SELECT count(*) AS n FROM panel_sessions').get()).n, 0)
-  assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 2)
+  for (const name of ['panel_sessions', 'api_key_admissions', 'gateway_rate_buckets']) {
+    assert.equal((await db.prepare(`SELECT count(*) AS n FROM ${name}`).get()).n, 0)
+  }
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 4)
 })
 
 test('an outside dependency refuses older-snapshot cleanup without changing either schema', async () => {
   const db = getDb()
-  await db.exec("DROP TABLE panel_sessions; DELETE FROM schema_migrations WHERE version='002'")
+  await db.exec(
+    "DROP TABLE panel_sessions, api_key_admissions, gateway_rate_buckets; DELETE FROM schema_migrations WHERE version <> '001'",
+  )
   await new SettingsRepo(db).set('older-snapshot', 'before')
   const rec = await svc.createBackup()
   const archive = await svc._extractArchive(rec)

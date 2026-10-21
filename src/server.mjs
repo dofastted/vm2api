@@ -20,7 +20,7 @@ import {
   attachPanelAuth,
   getPanelAdmin,
 } from './lib/core/security.mjs'
-import { loadModelPolicy } from './lib/protocol/model-policy.mjs'
+import { loadModelPolicy, refreshModelPolicy } from './lib/protocol/model-policy.mjs'
 import { gatewayModelCatalog } from './lib/protocol/models.mjs'
 import {
   createCredentialRefreshMonitor,
@@ -34,7 +34,7 @@ import { ensureTelemetrySidecar } from './lib/vm/slot-process-status.mjs'
 import { createSlotBridgeHealer, powerOnSlot, reviveDownSlots } from './lib/vm/slot-recovery.mjs'
 import { createUsageProbeMonitor, normalizeUsageProbeConfig } from './lib/oauth/usage-probe-monitor.mjs'
 import { createCatalogMonitor } from './lib/admin/catalog-monitor.mjs'
-import { pausePriceCatalog, resumePriceCatalog } from './lib/admin/price-catalog.mjs'
+import { pausePriceCatalog, resumePriceCatalog, invalidatePriceCatalog } from './lib/admin/price-catalog.mjs'
 import { normalizeOfficialCcConfig } from './lib/oauth/official-cc-bootstrap.mjs'
 import { invalidateLiveCredentialCache } from './lib/admin/panel-live-credentials.mjs'
 import { normalizeHealthProbeConfig, createHealthProbeMonitor, HEALTH_REAL_HEADER } from './lib/admin/health-probe.mjs'
@@ -75,7 +75,7 @@ import { openDatabase, closeDatabase } from './lib/db/database.mjs'
 import { runLegacyImport } from './lib/db/legacy-import.mjs'
 import { initVmDbSync, stopVmWatch, flushVmDbSync, pauseVmDbSync, resumeVmDbSync } from './lib/vm/vm-db-sync.mjs'
 import { flushPendingWrites } from './lib/db/pending-writes.mjs'
-import { loadGptModelPolicy } from './lib/protocol/gpt-model-policy.mjs'
+import { loadGptModelPolicy, refreshGptModelPolicy } from './lib/protocol/gpt-model-policy.mjs'
 import { BackupService } from './lib/admin/backup-service.mjs'
 import { ClusterNodesRepo } from './lib/db/repos/cluster-nodes-repo.mjs'
 import { ClusterManager } from './lib/cluster/cluster-manager.mjs'
@@ -811,6 +811,12 @@ async function requireAuth(req, res) {
         status: 401,
       }),
     )
+  }
+  if (kubernetesMode) {
+    const snapshot = await new SettingsRepo().refresh()
+    refreshModelPolicy(snapshot.model_policy)
+    refreshGptModelPolicy(snapshot.gpt_model_policy)
+    invalidatePriceCatalog()
   }
   // Panel session
   const session = await verifyPanelSession(token)
