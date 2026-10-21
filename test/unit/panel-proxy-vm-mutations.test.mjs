@@ -163,7 +163,7 @@ test('an idle proxy binding owns the new target and releases both persistent cla
   const h = f.handler({ vm_id: 'vm-b' }, { vmMutationOps: { ensureProxyEgress: async () => ({ ok: true }) } })
   await h.request('POST', '/api/panel/proxies/' + f.proxyId + '/bind')
   assert.equal(h.response.status, 200, JSON.stringify(h.response.body))
-  assert.deepEqual(f.pool.getProxyByIdWithAuth(f.proxyId).bound_vm_ids, ['vm-a', 'vm-b'])
+  assert.deepEqual(f.pool.snapshot().proxies.find((proxy) => proxy.id === f.proxyId).bound_vm_ids, ['vm-a', 'vm-b'])
   const vmClaim = await f.otherOperations.tryAcquire({ vmId: 'vm-b' })
   assert.equal(vmClaim.ok, true)
   await vmClaim.release()

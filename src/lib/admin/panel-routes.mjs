@@ -174,6 +174,8 @@ import * as panel from './panel-api.mjs'
 import { GATEWAY_CAPABILITIES } from '../vm/execution-context.mjs'
 import { withVmLock, atomicWriteJson, isValidVmId, invalidateVmSlotReadCache } from '../vm/vm-file.mjs'
 import { withVmMutations } from '../vm/vm-mutations.mjs'
+import { getSharedProxyOperations, markCurrentProxyOperationUncertain } from '../vm/shared-proxy-operations.mjs'
+import { parseBoundVmIds } from '../vm/proxy-pool.mjs'
 import { physicalVmAliases } from '../vm/vm-physical-target.mjs'
 import { snapshotDatabaseMetrics } from '../db/database-metrics.mjs'
 import { getUsageCache } from '../oauth/usage-cache.mjs'
@@ -640,6 +642,7 @@ export function createPanelHandler(ctx) {
       result = await callback()
     } catch (error) {
       await operation?.markUncertain?.()
+      await markCurrentProxyOperationUncertain(getDb())
       throw error
     }
     if (
@@ -649,8 +652,38 @@ export function createPanelHandler(ctx) {
       (result?.ok !== true && result?.notStarted !== true && result?.vmOperationNotStarted !== true)
     ) {
       await operation?.markUncertain?.()
+      await markCurrentProxyOperationUncertain(getDb())
     }
     return result
+  }
+  async function mutateProxyVms(ids, callback) {
+    if (!isKubernetesMode() && !ctx.proxyOperations) return mutateVms(ids, callback)
+    return (ctx.proxyOperations || getSharedProxyOperations()).run(async () => {
+      await ctx.proxyPool.refresh?.()
+      const bindings = await getDb().prepare('SELECT bound_vm_id FROM proxies WHERE bound_vm_id IS NOT NULL').all()
+      const targets = [...new Set([...ids, ...bindings.flatMap((proxy) => parseBoundVmIds(proxy.bound_vm_id))])]
+      let entered = false
+      try {
+        const value = await mutateVms(targets, async (handles) => {
+          entered = true
+          return callback(handles)
+        })
+        return { terminal: true, value }
+      } catch (error) {
+        if (!entered) error.proxyOperationNotStarted = true
+        throw error
+      }
+    })
+  }
+  function proxyEffect(handles, callback) {
+    return vmEffect(
+      {
+        markUncertain: async () => {
+          for (const operation of handles.values()) await operation.markUncertain()
+        },
+      },
+      callback,
+    )
   }
   const hostUnsupported = (res, vm, cap) => {
     if (slotHost(vm).supports(cap)) return false
@@ -3404,7 +3437,7 @@ export function createPanelHandler(ctx) {
       // DELETE /api/panel/vms/:id — remove VM record, cli-home, unbind proxy
       if (req.method === 'DELETE' && /^\/api\/panel\/vms\/[^/]+$/.test(p)) {
         const id = p.split('/')[4]
-        return mutateVms([id], async (handles) => {
+        return mutateProxyVms([id], async (handles) => {
           if (!isValidVmId(id)) {
             return json(res, 400, { ok: false, error: { message: 'invalid vm id' } })
           }
@@ -4079,7 +4112,7 @@ export function createPanelHandler(ctx) {
         const rawId = body.id || 'vm-' + padVm(idx)
         const id = String(rawId).replace(/[^a-zA-Z0-9_-]/g, '')
         if (!isValidVmId(id)) return json(res, 400, { ok: false, error: { message: 'invalid id' } })
-        return mutateVms([id], async (handles) => {
+        return mutateProxyVms([id], async (handles) => {
           const existing = listVms(cfg.paths.project)
           const aliases = physicalVmAliases(id)
           const committed =
@@ -4448,7 +4481,7 @@ export function createPanelHandler(ctx) {
       // POST /api/panel/vms/:id/start
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/start$/.test(p)) {
         const id = p.split('/')[4]
-        return mutateVms([id], async (handles) => {
+        return mutateProxyVms([id], async (handles) => {
           if (!getVm(cfg.paths.project, id))
             return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
           const started = await vmEffect(handles.get(id), () =>
@@ -4496,7 +4529,7 @@ export function createPanelHandler(ctx) {
       // POST /api/panel/vms/:id/recover — power cycle (stop → start) plus a fresh diagnosis
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/recover$/.test(p)) {
         const id = p.split('/')[4]
-        return mutateVms([id], async (handles) => {
+        return mutateProxyVms([id], async (handles) => {
           if (!getVm(cfg.paths.project, id))
             return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
           const recovered = await vmEffect(handles.get(id), () =>
@@ -5684,51 +5717,73 @@ export function createPanelHandler(ctx) {
         return json(res, 200, panel.ok(snap))
       }
       if (req.method === 'POST' && p === '/api/panel/proxies/local') {
-        const result = await proxyPool.ensureLocal()
-        if (result.created) await ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(result.proxy.id))
-        // Enabling local egress on a cluster that already has nodes: each VPS gets its row now.
-        await proxyPool.syncLocalNodes(clusterNodesOf(ctx).map((node) => node.id))
-        return json(res, 200, panel.ok(result))
+        return mutateProxyVms([], async (handles) => {
+          const result = await proxyPool.ensureLocal()
+          if (result.created) {
+            const egress = await proxyEffect(handles, () =>
+              (ctx.vmMutationOps?.ensureProxyEgress || ensureProxyEgress)(
+                cfg.paths.project,
+                proxyPool.getProxyByIdWithAuth(result.proxy.id),
+              ),
+            )
+            if (!egress.ok)
+              return json(res, 502, {
+                ok: false,
+                error: { code: egress.code || 'egress_start_unknown', message: egress.error },
+              })
+          }
+          // Enabling local egress on a cluster that already has nodes: each VPS gets its row now.
+          await proxyPool.syncLocalNodes(clusterNodesOf(ctx).map((node) => node.id))
+          return json(res, 200, panel.ok(result))
+        })
       }
       if (req.method === 'POST' && p === '/api/panel/proxies/import') {
         const body = await readBody(req, 2 * 1024 * 1024)
-        const text = body.text || body.lines || (Array.isArray(body) ? body.join('\n') : '')
-        const ident = panelIdentity(req)
-        const bindVmId = String(body.bind_vm_id || body.vm_id || '').trim()
-        if (bindVmId && userMissesVmId(req, cfg.paths.project, bindVmId)) {
-          return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        }
-        const result = await proxyPool.importLines(text, {
-          fields: body.proxies || body.entries || null,
-          host: body.host,
-          port: body.port,
-          username: body.username ?? body.user,
-          password: body.password ?? body.pass,
-          ownerUserId: ident.role === 'user' ? req.panelUserId : null,
-        })
-        let bound = null
-        let worker = null
-        let timezone = null
-        if (bindVmId && result.items?.[0]?.id) {
-          const bind = await proxyPool.bind(result.items[0].id, bindVmId)
-          if (bind.ok) {
-            bindVmProxy(cfg.paths.project, bindVmId, proxyPool.getProxyForVm(bindVmId))
-            bound = bind.proxy
-            // Before the reload: the worker reads vm.timezone when it starts.
-            timezone = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, bindVmId, {
-              proxyId: result.items[0].id,
-            })
-            const vm = getVm(cfg.paths.project, bindVmId)
-            if (vm?.status === 'running' && process.env.KIN_CRS_MOCK !== '1') {
-              setVmSchedulable(cfg.paths.project, bindVmId, false, 'proxy_rebind_worker_reload')
-              worker = await reloadSlotReady(getVm(cfg.paths.project, bindVmId), cfg.paths.project, {
-                routing: ctx.routingConfig,
+        return mutateProxyVms([String(body.bind_vm_id || body.vm_id || '').trim()].filter(Boolean), async (handles) => {
+          const text = body.text || body.lines || (Array.isArray(body) ? body.join('\n') : '')
+          const ident = panelIdentity(req)
+          const bindVmId = String(body.bind_vm_id || body.vm_id || '').trim()
+          if (bindVmId && userMissesVmId(req, cfg.paths.project, bindVmId)) {
+            return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          }
+          const result = await proxyPool.importLines(text, {
+            fields: body.proxies || body.entries || null,
+            host: body.host,
+            port: body.port,
+            username: body.username ?? body.user,
+            password: body.password ?? body.pass,
+            ownerUserId: ident.role === 'user' ? req.panelUserId : null,
+          })
+          let bound = null
+          let worker = null
+          let timezone = null
+          if (bindVmId && result.items?.[0]?.id) {
+            const bind = await proxyPool.bind(result.items[0].id, bindVmId)
+            if (bind.ok) {
+              bindVmProxy(cfg.paths.project, bindVmId, proxyPool.getProxyForVm(bindVmId))
+              bound = bind.proxy
+              // Before the reload: the worker reads vm.timezone when it starts.
+              timezone = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, bindVmId, {
+                proxyId: result.items[0].id,
               })
-              if (worker.ok) restoreSchedulableIfReady(bindVmId)
+              const vm = getVm(cfg.paths.project, bindVmId)
+              if (vm?.status === 'running' && process.env.KIN_CRS_MOCK !== '1') {
+                setVmSchedulable(cfg.paths.project, bindVmId, false, 'proxy_rebind_worker_reload')
+                worker = await vmEffect(handles.get(bindVmId), () =>
+                  (ctx.vmMutationOps?.reloadSlotReady || reloadSlotReady)(
+                    getVm(cfg.paths.project, bindVmId),
+                    cfg.paths.project,
+                    {
+                      routing: ctx.routingConfig,
+                    },
+                  ),
+                )
+                if (worker.ok) restoreSchedulableIfReady(bindVmId)
+              }
             }
           }
-        }
-        return json(res, 200, panel.ok({ ...result, bound, worker, timezone }))
+          return json(res, 200, panel.ok({ ...result, bound, worker, timezone }))
+        })
       }
       if (req.method === 'POST' && p === '/api/panel/proxies/geo') {
         const body = await readBody(req, 8192).catch(() => ({}))
@@ -5749,95 +5804,121 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'PUT' && p === '/api/panel/proxies/config') {
         const body = await readBody(req, 64 * 1024)
-        const previousConfig = proxyPool.snapshot().config
-        const result = await proxyPool.updateConfig(body)
-        if (!result.ok)
-          return json(res, 400, {
-            ok: false,
-            error: { type: 'invalid_request_error', code: result.error, message: result.error, details: result },
-          })
-        // DNS changes must reach running egress helpers; slots stay intact.
-        const egress = []
-        if (
-          ((body.dns_primary != null && body.dns_primary !== previousConfig.dns_primary) ||
-            (body.dns_disable_svcb_https != null &&
-              body.dns_disable_svcb_https !== previousConfig.dns_disable_svcb_https)) &&
-          egressEnabled() &&
-          process.env.KIN_CRS_MOCK !== '1'
-        ) {
-          const dnsUpstream = dnsUpstreamChain(result.config.dns_primary)
-          const dnsEmptyTypes = result.config.dns_disable_svcb_https ? [64, 65] : []
-          for (const proxy of proxyPool.snapshot().proxies) {
-            if (isLocalEgressProxy(proxy) || !proxy.bound_vm_ids?.length) continue
-            const r = await ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(proxy.id), {
-              dnsUpstream,
-              dnsEmptyTypes,
-            })
-            egress.push({ proxy_id: proxy.id, ok: r.ok, error: r.ok ? null : r.error })
-          }
-        }
-        if (body.ipv6_enabled != null && process.env.KIN_CRS_MOCK !== '1') {
-          egress.push(...(await syncIpv6ProxyEgress(cfg.paths.project, proxyPool)))
-        }
-        return json(res, 200, panel.ok({ ...result.config, egress }))
+        return mutateProxyVms(
+          body.ipv6_enabled != null ? listVms(cfg.paths.project).map((vm) => vm.id) : [],
+          async (handles) => {
+            const previousConfig = proxyPool.snapshot().config
+            const result = await proxyPool.updateConfig(body)
+            if (!result.ok)
+              return json(res, 400, {
+                ok: false,
+                error: { type: 'invalid_request_error', code: result.error, message: result.error, details: result },
+              })
+            // DNS changes must reach running egress helpers; slots stay intact.
+            const egress = []
+            if (
+              ((body.dns_primary != null && body.dns_primary !== previousConfig.dns_primary) ||
+                (body.dns_disable_svcb_https != null &&
+                  body.dns_disable_svcb_https !== previousConfig.dns_disable_svcb_https)) &&
+              egressEnabled() &&
+              process.env.KIN_CRS_MOCK !== '1'
+            ) {
+              const dnsUpstream = dnsUpstreamChain(result.config.dns_primary)
+              const dnsEmptyTypes = result.config.dns_disable_svcb_https ? [64, 65] : []
+              for (const proxy of proxyPool.snapshot().proxies) {
+                if (isLocalEgressProxy(proxy) || !proxy.bound_vm_ids?.length) continue
+                const r = await proxyEffect(handles, () =>
+                  (ctx.vmMutationOps?.ensureProxyEgress || ensureProxyEgress)(
+                    cfg.paths.project,
+                    proxyPool.getProxyByIdWithAuth(proxy.id),
+                    {
+                      dnsUpstream,
+                      dnsEmptyTypes,
+                    },
+                  ),
+                )
+                egress.push({ proxy_id: proxy.id, ok: r.ok, error: r.ok ? null : r.error })
+              }
+            }
+            if (body.ipv6_enabled != null && process.env.KIN_CRS_MOCK !== '1') {
+              const results = await syncIpv6ProxyEgress(cfg.paths.project, proxyPool)
+              await proxyEffect(handles, async () => ({ ok: results.every((result) => result.ok) }))
+              egress.push(...results)
+            }
+            return json(res, 200, panel.ok({ ...result.config, egress }))
+          },
+        )
       }
       // Must stay BELOW /proxies/config: `[^/]+` matches "config" too, and this
       // route shares its method, so ordering alone decides the winner. The
       // negative lookahead makes that dependency explicit rather than positional.
       if (req.method === 'PUT' && /^\/api\/panel\/proxies\/(?!config$)[^/]+$/.test(p)) {
-        const id = p.split('/')[4]
-        const body = await readBody(req, 64 * 1024)
-        // Forward only the keys the caller actually sent — update() reads
-        // presence, not value, to tell "leave alone" from "clear".
-        const patch = {}
-        for (const key of ['host', 'port', 'username', 'password', 'label', 'domain_forward']) {
-          if (Object.prototype.hasOwnProperty.call(body, key)) patch[key] = body[key]
-        }
-        const result = await proxyPool.update(id, patch)
-        if (!result.ok) {
-          const status = result.error === 'proxy_not_found' ? 404 : 400
-          const type = status === 404 ? 'not_found_error' : 'invalid_request_error'
-          return json(res, status, { ok: false, error: { type, code: result.error, message: result.error } })
-        }
-        // Hostname mode and SOCKS upstream both live inside kin-egress.
-        // Domain-forward-only: restart the helper; slots keep the same bridge.
-        // Same-id connection change: network name is unchanged so reload would
-        // only docker restart — the helper must pick up the new proxy_url or
-        // transparent traffic keeps the old exit.
-        let egress = null
-        if (
-          (result.domain_forward_changed || result.connection_changed) &&
-          egressEnabled() &&
-          process.env.KIN_CRS_MOCK !== '1' &&
-          (result.proxy.bound_vm_ids || []).length
-        ) {
-          const restarted = await ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(id))
-          egress = { ok: !!restarted.ok, error: restarted.ok ? null : restarted.error || 'egress_restart_failed' }
-        }
-        // A label is display-only; reloading every bound worker for it would
-        // pull live slots out of scheduling for nothing.
-        if (!result.connection_changed) return json(res, 200, panel.ok({ proxy: result.proxy, workers: [], egress }))
-        // The pool store is only one of three places the credentials live
-        // (pool -> vms/<id>.json -> worker.json). Without this the edit looks
-        // like it worked while every bound slot keeps dialing the old proxy.
-        const workers = []
-        for (const vmId of result.proxy.bound_vm_ids || []) {
-          bindVmProxy(cfg.paths.project, vmId, proxyPool.getProxyByIdWithAuth(id))
-          const vm = getVm(cfg.paths.project, vmId)
-          if (vm?.status === 'running' && process.env.KIN_CRS_MOCK !== '1') {
-            setVmSchedulable(cfg.paths.project, vmId, false, 'proxy_edit_worker_reload')
-            const reloaded = await reloadSlotReady(getVm(cfg.paths.project, vmId), cfg.paths.project, {
-              routing: ctx.routingConfig,
-            })
-            if (reloaded.ok) restoreSchedulableIfReady(vmId)
-            // A slot that fails to reload does not fail the request: the store
-            // is already updated, so report per-slot and let ops retry.
-            workers.push({ vm_id: vmId, ok: !!reloaded.ok, error: reloaded.ok ? null : reloaded.error || null })
-          } else {
-            workers.push({ vm_id: vmId, ok: true, error: null })
+        return mutateProxyVms([], async (handles) => {
+          const id = p.split('/')[4]
+          const body = await readBody(req, 64 * 1024)
+          // Forward only the keys the caller actually sent — update() reads
+          // presence, not value, to tell "leave alone" from "clear".
+          const patch = {}
+          for (const key of ['host', 'port', 'username', 'password', 'label', 'domain_forward']) {
+            if (Object.prototype.hasOwnProperty.call(body, key)) patch[key] = body[key]
           }
-        }
-        return json(res, 200, panel.ok({ proxy: result.proxy, workers, egress }))
+          const result = await proxyPool.update(id, patch)
+          if (!result.ok) {
+            const status = result.error === 'proxy_not_found' ? 404 : 400
+            const type = status === 404 ? 'not_found_error' : 'invalid_request_error'
+            return json(res, status, { ok: false, error: { type, code: result.error, message: result.error } })
+          }
+          // Hostname mode and SOCKS upstream both live inside kin-egress.
+          // Domain-forward-only: restart the helper; slots keep the same bridge.
+          // Same-id connection change: network name is unchanged so reload would
+          // only docker restart — the helper must pick up the new proxy_url or
+          // transparent traffic keeps the old exit.
+          let egress = null
+          if (
+            (result.domain_forward_changed || result.connection_changed) &&
+            egressEnabled() &&
+            process.env.KIN_CRS_MOCK !== '1' &&
+            (result.proxy.bound_vm_ids || []).length
+          ) {
+            const restarted = await proxyEffect(handles, () =>
+              (ctx.vmMutationOps?.ensureProxyEgress || ensureProxyEgress)(
+                cfg.paths.project,
+                proxyPool.getProxyByIdWithAuth(id),
+              ),
+            )
+            egress = { ok: !!restarted.ok, error: restarted.ok ? null : restarted.error || 'egress_restart_failed' }
+          }
+          // A label is display-only; reloading every bound worker for it would
+          // pull live slots out of scheduling for nothing.
+          if (!result.connection_changed) return json(res, 200, panel.ok({ proxy: result.proxy, workers: [], egress }))
+          // The pool store is only one of three places the credentials live
+          // (pool -> vms/<id>.json -> worker.json). Without this the edit looks
+          // like it worked while every bound slot keeps dialing the old proxy.
+          const workers = []
+          for (const vmId of result.proxy.bound_vm_ids || []) {
+            bindVmProxy(cfg.paths.project, vmId, proxyPool.getProxyByIdWithAuth(id))
+            const vm = getVm(cfg.paths.project, vmId)
+            if (vm?.status === 'running' && process.env.KIN_CRS_MOCK !== '1') {
+              setVmSchedulable(cfg.paths.project, vmId, false, 'proxy_edit_worker_reload')
+              const reloaded = await vmEffect(handles.get(vmId), () =>
+                (ctx.vmMutationOps?.reloadSlotReady || reloadSlotReady)(
+                  getVm(cfg.paths.project, vmId),
+                  cfg.paths.project,
+                  {
+                    routing: ctx.routingConfig,
+                  },
+                ),
+              )
+              if (reloaded.ok) restoreSchedulableIfReady(vmId)
+              // A slot that fails to reload does not fail the request: the store
+              // is already updated, so report per-slot and let ops retry.
+              workers.push({ vm_id: vmId, ok: !!reloaded.ok, error: reloaded.ok ? null : reloaded.error || null })
+            } else {
+              workers.push({ vm_id: vmId, ok: true, error: null })
+            }
+          }
+          return json(res, 200, panel.ok({ proxy: result.proxy, workers, egress }))
+        })
       }
       // The one endpoint allowed to return proxy credentials. Mirrors
       // POST /api/panel/api-keys/:id/reveal: POST so it never lands in browser
@@ -5876,185 +5957,251 @@ export function createPanelHandler(ctx) {
         return json(res, 200, panel.ok(result))
       }
       if (req.method === 'POST' && /^\/api\/panel\/proxies\/[^/]+\/geo$/.test(p)) {
-        const id = p.split('/')[4]
-        const body = await readBody(req, 8192).catch(() => ({}))
-        const result = await proxyPool.detectGeo(id, { force: body?.force !== false })
-        if (result.error === 'ipv6_disabled') {
-          return json(res, 409, {
-            ok: false,
-            error: {
-              code: result.error,
-              message: 'IPv6 已关闭，请在设置 → SOCKS5 开启 IPv6 代理出口',
-            },
-          })
-        }
-        if (!result.ok && result.error === 'proxy_not_found') {
-          return json(res, 404, {
-            ok: false,
-            error: { type: 'not_found_error', code: result.error, message: result.error },
-          })
-        }
-        if (!result.ok) {
-          return json(res, 502, {
-            ok: false,
-            error: {
-              type: 'upstream_error',
-              code: 'geo_lookup_failed',
-              message: String(result.error || 'geo lookup failed').slice(0, 200),
-              details: { proxy: result.proxy || null },
-            },
-          })
-        }
-        // A slot already bound to this proxy adopts the freshly learned zone.
-        const timezones = []
-        for (const vmId of result.proxy?.bound_vm_ids || []) {
-          const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, vmId, {
-            proxyId: id,
-            detect: false,
-          })
-          timezones.push({ vm_id: vmId, applied: synced.applied, timezone: synced.timezone, reason: synced.reason })
-        }
-        return json(res, 200, panel.ok({ ...result, timezones }))
+        return mutateProxyVms([], async (handles) => {
+          const id = p.split('/')[4]
+          const body = await readBody(req, 8192).catch(() => ({}))
+          const result = await proxyPool.detectGeo(id, { force: body?.force !== false })
+          if (result.error === 'ipv6_disabled') {
+            return json(res, 409, {
+              ok: false,
+              error: {
+                code: result.error,
+                message: 'IPv6 已关闭，请在设置 → SOCKS5 开启 IPv6 代理出口',
+              },
+            })
+          }
+          if (!result.ok && result.error === 'proxy_not_found') {
+            return json(res, 404, {
+              ok: false,
+              error: { type: 'not_found_error', code: result.error, message: result.error },
+            })
+          }
+          if (!result.ok) {
+            return json(res, 502, {
+              ok: false,
+              error: {
+                type: 'upstream_error',
+                code: 'geo_lookup_failed',
+                message: String(result.error || 'geo lookup failed').slice(0, 200),
+                details: { proxy: result.proxy || null },
+              },
+            })
+          }
+          // A slot already bound to this proxy adopts the freshly learned zone.
+          const timezones = []
+          for (const vmId of result.proxy?.bound_vm_ids || []) {
+            const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, vmId, {
+              proxyId: id,
+              detect: false,
+            })
+            timezones.push({ vm_id: vmId, applied: synced.applied, timezone: synced.timezone, reason: synced.reason })
+          }
+          return json(res, 200, panel.ok({ ...result, timezones }))
+        })
       }
       if (req.method === 'POST' && /^\/api\/panel\/proxies\/[^/]+\/enable$/.test(p)) {
-        const id = p.split('/')[4]
-        const result = await proxyPool.setEnabled(id, true)
-        if (!result.ok)
-          return json(res, 404, {
-            ok: false,
-            error: { type: 'not_found_error', code: result.error, message: result.error },
-          })
-        // re-enable bound VM scheduling if any
-        for (const vmId of result.proxy?.bound_vm_ids ||
-          (result.proxy?.bound_vm_id ? [result.proxy.bound_vm_id] : [])) {
-          const bound = getVm(cfg.paths.project, vmId)
-          const reason = String(bound?.schedule_disabled_reason || '')
-          if (vmHasSchedulableCredential(bound, cfg.paths.project) && reason !== 'disabled' && reason !== 'stopped') {
-            setVmSchedulable(cfg.paths.project, vmId, true, null)
+        return mutateProxyVms([], async (handles) => {
+          const id = p.split('/')[4]
+          const result = await proxyPool.setEnabled(id, true)
+          if (!result.ok)
+            return json(res, 404, {
+              ok: false,
+              error: { type: 'not_found_error', code: result.error, message: result.error },
+            })
+          // re-enable bound VM scheduling if any
+          for (const vmId of result.proxy?.bound_vm_ids ||
+            (result.proxy?.bound_vm_id ? [result.proxy.bound_vm_id] : [])) {
+            const bound = getVm(cfg.paths.project, vmId)
+            const reason = String(bound?.schedule_disabled_reason || '')
+            if (vmHasSchedulableCredential(bound, cfg.paths.project) && reason !== 'disabled' && reason !== 'stopped') {
+              setVmSchedulable(cfg.paths.project, vmId, true, null)
+            }
           }
-        }
-        return json(res, 200, panel.ok(result.proxy))
+          return json(res, 200, panel.ok(result.proxy))
+        })
       }
       if (req.method === 'POST' && /^\/api\/panel\/proxies\/[^/]+\/disable$/.test(p)) {
-        const id = p.split('/')[4]
-        const result = await proxyPool.setEnabled(id, false)
-        if (!result.ok)
-          return json(res, 404, {
-            ok: false,
-            error: { type: 'not_found_error', code: result.error, message: result.error },
-          })
-        return json(res, 200, panel.ok(result.proxy))
+        return mutateProxyVms([], async (handles) => {
+          const id = p.split('/')[4]
+          const result = await proxyPool.setEnabled(id, false)
+          if (!result.ok)
+            return json(res, 404, {
+              ok: false,
+              error: { type: 'not_found_error', code: result.error, message: result.error },
+            })
+          return json(res, 200, panel.ok(result.proxy))
+        })
       }
       if (req.method === 'POST' && /^\/api\/panel\/proxies\/[^/]+\/bind$/.test(p)) {
         const id = p.split('/')[4]
         const body = await readBody(req, 64 * 1024)
-        const vmId = body.vm_id
-        if (!vmId)
-          return json(res, 400, {
-            ok: false,
-            error: { type: 'invalid_request_error', code: 'missing_field', message: 'vm_id required', param: 'vm_id' },
-          })
-        const result = await proxyPool.bind(id, vmId)
-        if (!result.ok) {
-          const message =
-            result.error === 'proxy_bind_limit'
-              ? `SOCKS5 最多绑定 ${result.max || 5} 台虚拟机`
-              : result.error === 'local_proxy_node_mismatch'
-                ? LOCAL_PROXY_MISMATCH_MESSAGE
-                : result.error
-          return json(res, 400, {
-            ok: false,
-            error: { type: 'invalid_request_error', code: result.error, message, details: result },
-          })
-        }
-        bindVmProxy(cfg.paths.project, vmId, proxyPool.getProxyForVm(vmId))
-        if (egressEnabled()) {
-          await ensureProxyEgress(
-            cfg.paths.project,
-            proxyPool.getProxyForVm(vmId) || proxyPool.getProxyByIdWithAuth(id),
-          )
-        }
-        let worker = null
-        // Runs before the reload so the worker starts with the exit node's zone.
-        const timezone = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, vmId, { proxyId: id })
-        const vm = getVm(cfg.paths.project, vmId)
-        if (vm?.status === 'running' && process.env.KIN_CRS_MOCK !== '1') {
-          setVmSchedulable(cfg.paths.project, vmId, false, 'proxy_rebind_worker_reload')
-          worker = await reloadSlotReady(getVm(cfg.paths.project, vmId), cfg.paths.project, {
-            routing: ctx.routingConfig,
-          })
-          if (worker.ok) restoreSchedulableIfReady(vmId)
-        }
-        return json(res, 200, panel.ok({ proxy: result.proxy, worker, timezone }))
+        return mutateProxyVms([String(body.vm_id || '').trim()].filter(Boolean), async (handles) => {
+          const vmId = body.vm_id
+          if (!vmId)
+            return json(res, 400, {
+              ok: false,
+              error: {
+                type: 'invalid_request_error',
+                code: 'missing_field',
+                message: 'vm_id required',
+                param: 'vm_id',
+              },
+            })
+          const result = await proxyPool.bind(id, vmId)
+          if (!result.ok) {
+            const message =
+              result.error === 'proxy_bind_limit'
+                ? `SOCKS5 最多绑定 ${result.max || 5} 台虚拟机`
+                : result.error === 'local_proxy_node_mismatch'
+                  ? LOCAL_PROXY_MISMATCH_MESSAGE
+                  : result.error
+            return json(res, 400, {
+              ok: false,
+              error: { type: 'invalid_request_error', code: result.error, message, details: result },
+            })
+          }
+          bindVmProxy(cfg.paths.project, vmId, proxyPool.getProxyForVm(vmId))
+          if (egressEnabled()) {
+            const egress = await proxyEffect(handles, () =>
+              (ctx.vmMutationOps?.ensureProxyEgress || ensureProxyEgress)(
+                cfg.paths.project,
+                proxyPool.getProxyForVm(vmId) || proxyPool.getProxyByIdWithAuth(id),
+              ),
+            )
+            if (!egress.ok)
+              return json(res, 502, {
+                ok: false,
+                error: { code: egress.code || 'egress_start_unknown', message: egress.error },
+              })
+          }
+          let worker = null
+          // Runs before the reload so the worker starts with the exit node's zone.
+          const timezone = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, vmId, { proxyId: id })
+          const vm = getVm(cfg.paths.project, vmId)
+          if (vm?.status === 'running' && process.env.KIN_CRS_MOCK !== '1') {
+            setVmSchedulable(cfg.paths.project, vmId, false, 'proxy_rebind_worker_reload')
+            worker = await vmEffect(handles.get(vmId), () =>
+              (ctx.vmMutationOps?.reloadSlotReady || reloadSlotReady)(
+                getVm(cfg.paths.project, vmId),
+                cfg.paths.project,
+                {
+                  routing: ctx.routingConfig,
+                },
+              ),
+            )
+            if (worker.ok) restoreSchedulableIfReady(vmId)
+          }
+          return json(res, 200, panel.ok({ proxy: result.proxy, worker, timezone }))
+        })
       }
       if (req.method === 'POST' && /^\/api\/panel\/proxies\/[^/]+\/unbind$/.test(p)) {
         const id = p.split('/')[4]
         const body = await readBody(req, 64 * 1024)
-        const vmId = String(body.vm_id || '').trim()
-        const snap = proxyPool.snapshot().proxies.find((proxy) => proxy.id === id)
-        const targets = vmId
-          ? [vmId]
-          : snap?.bound_vm_ids?.length
-            ? snap.bound_vm_ids
-            : snap?.bound_vm_id
-              ? [snap.bound_vm_id]
-              : []
-        const result = await proxyPool.unbind(id, vmId || null)
-        if (!result.ok)
-          return json(res, 404, {
-            ok: false,
-            error: { type: 'not_found_error', code: result.error, message: result.error },
-          })
-        for (const unboundId of result.unbound_vm_ids || targets) {
-          bindVmProxy(cfg.paths.project, unboundId, null)
-          setVmSchedulable(cfg.paths.project, unboundId, false, 'proxy_required')
-        }
-        if (egressEnabled() && !(result.proxy?.bound_vm_ids || []).length) {
-          stopProxyEgress(cfg.paths.project, id)
-        }
-        return json(res, 200, panel.ok(result.proxy))
+        return mutateProxyVms([String(body.vm_id || '').trim()].filter(Boolean), async (handles) => {
+          const vmId = String(body.vm_id || '').trim()
+          const snap = proxyPool.snapshot().proxies.find((proxy) => proxy.id === id)
+          const targets = vmId
+            ? [vmId]
+            : snap?.bound_vm_ids?.length
+              ? snap.bound_vm_ids
+              : snap?.bound_vm_id
+                ? [snap.bound_vm_id]
+                : []
+          const result = await proxyPool.unbind(id, vmId || null)
+          if (!result.ok)
+            return json(res, 404, {
+              ok: false,
+              error: { type: 'not_found_error', code: result.error, message: result.error },
+            })
+          for (const unboundId of result.unbound_vm_ids || targets) {
+            bindVmProxy(cfg.paths.project, unboundId, null)
+            setVmSchedulable(cfg.paths.project, unboundId, false, 'proxy_required')
+          }
+          if (egressEnabled() && !(result.proxy?.bound_vm_ids || []).length) {
+            const stopped = await proxyEffect(handles, () =>
+              (ctx.vmMutationOps?.stopProxyEgress || stopProxyEgress)(cfg.paths.project, id),
+            )
+            if (!stopped.ok)
+              return json(res, 502, {
+                ok: false,
+                error: { code: stopped.code || 'egress_stop_unknown', message: stopped.error },
+              })
+          }
+          return json(res, 200, panel.ok(result.proxy))
+        })
       }
       if (req.method === 'DELETE' && /^\/api\/panel\/proxies\/[^/]+$/.test(p)) {
-        const id = p.split('/').pop()
-        const snap = proxyPool.snapshot().proxies.find((proxy) => proxy.id === id)
-        const targets = snap?.bound_vm_ids?.length ? snap.bound_vm_ids : snap?.bound_vm_id ? [snap.bound_vm_id] : []
-        const result = await proxyPool.remove(id)
-        if (!result.ok)
-          return json(res, 404, {
-            ok: false,
-            error: { type: 'not_found_error', code: result.error, message: result.error },
-          })
-        for (const unboundId of targets) {
-          bindVmProxy(cfg.paths.project, unboundId, null)
-          setVmSchedulable(cfg.paths.project, unboundId, false, 'proxy_required')
-        }
-        if (egressEnabled()) stopProxyEgress(cfg.paths.project, id)
-        return json(res, 200, panel.ok(result.removed))
+        return mutateProxyVms([], async (handles) => {
+          const id = p.split('/').pop()
+          const snap = proxyPool.snapshot().proxies.find((proxy) => proxy.id === id)
+          const targets = snap?.bound_vm_ids?.length ? snap.bound_vm_ids : snap?.bound_vm_id ? [snap.bound_vm_id] : []
+          const result = await proxyPool.remove(id)
+          if (!result.ok)
+            return json(res, 404, {
+              ok: false,
+              error: { type: 'not_found_error', code: result.error, message: result.error },
+            })
+          for (const unboundId of targets) {
+            bindVmProxy(cfg.paths.project, unboundId, null)
+            setVmSchedulable(cfg.paths.project, unboundId, false, 'proxy_required')
+          }
+          if (egressEnabled()) {
+            const stopped = await proxyEffect(handles, () =>
+              (ctx.vmMutationOps?.stopProxyEgress || stopProxyEgress)(cfg.paths.project, id),
+            )
+            if (!stopped.ok)
+              return json(res, 502, {
+                ok: false,
+                error: { code: stopped.code || 'egress_stop_unknown', message: stopped.error },
+              })
+          }
+          return json(res, 200, panel.ok(result.removed))
+        })
       }
       // Auto-allocate proxy for a VM
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/allocate-proxy$/.test(p)) {
-        const vmId = p.split('/')[4]
-        const allocated = await proxyPool.allocateForVm(vmId)
-        if (!allocated)
-          return json(res, 409, {
-            ok: false,
-            error: { type: 'api_error', code: 'no_free_proxy', message: 'No free SOCKS5 in pool' },
+        return mutateProxyVms([p.split('/')[4]], async (handles) => {
+          const vmId = p.split('/')[4]
+          const allocated = await proxyPool.allocateForVm(vmId)
+          if (!allocated)
+            return json(res, 409, {
+              ok: false,
+              error: { type: 'api_error', code: 'no_free_proxy', message: 'No free SOCKS5 in pool' },
+            })
+          bindVmProxy(cfg.paths.project, vmId, proxyPool.getProxyForVm(vmId))
+          if (egressEnabled()) {
+            const egress = await proxyEffect(handles, () =>
+              (ctx.vmMutationOps?.ensureProxyEgress || ensureProxyEgress)(
+                cfg.paths.project,
+                proxyPool.getProxyForVm(vmId),
+              ),
+            )
+            if (!egress.ok)
+              return json(res, 502, {
+                ok: false,
+                error: { code: egress.code || 'egress_start_unknown', message: egress.error },
+              })
+          }
+          let worker = null
+          const timezone = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, vmId, {
+            proxyId: allocated?.id || null,
           })
-        bindVmProxy(cfg.paths.project, vmId, proxyPool.getProxyForVm(vmId))
-        if (egressEnabled()) await ensureProxyEgress(cfg.paths.project, proxyPool.getProxyForVm(vmId))
-        let worker = null
-        const timezone = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, vmId, {
-          proxyId: allocated?.id || null,
+          const vm = getVm(cfg.paths.project, vmId)
+          if (vm?.status === 'running' && process.env.KIN_CRS_MOCK !== '1') {
+            setVmSchedulable(cfg.paths.project, vmId, false, 'proxy_rebind_worker_reload')
+            worker = await vmEffect(handles.get(vmId), () =>
+              (ctx.vmMutationOps?.reloadSlotReady || reloadSlotReady)(
+                getVm(cfg.paths.project, vmId),
+                cfg.paths.project,
+                {
+                  routing: ctx.routingConfig,
+                },
+              ),
+            )
+            if (worker.ok) restoreSchedulableIfReady(vmId)
+          }
+          return json(res, 200, panel.ok({ proxy: allocated, worker, timezone }))
         })
-        const vm = getVm(cfg.paths.project, vmId)
-        if (vm?.status === 'running' && process.env.KIN_CRS_MOCK !== '1') {
-          setVmSchedulable(cfg.paths.project, vmId, false, 'proxy_rebind_worker_reload')
-          worker = await reloadSlotReady(getVm(cfg.paths.project, vmId), cfg.paths.project, {
-            routing: ctx.routingConfig,
-          })
-          if (worker.ok) restoreSchedulableIfReady(vmId)
-        }
-        return json(res, 200, panel.ok({ proxy: allocated, worker, timezone }))
       }
 
       return json(res, 404, {
@@ -6139,9 +6286,15 @@ export function createPanelHandler(ctx) {
       result = await handlePanel(req, res, url)
     } catch (error) {
       if (
-        ['vm_operation_active', 'vm_execution_active', 'vm_physical_target_conflict', 'invalid_vm_operation'].includes(
-          error.code,
-        )
+        [
+          'vm_operation_active',
+          'vm_execution_active',
+          'vm_physical_target_conflict',
+          'invalid_vm_operation',
+          'proxy_operation_active',
+          'proxy_operation_inactive',
+          'vm_mutation_claim_required',
+        ].includes(error.code)
       ) {
         state.response = [res, error.status || 409, { ok: false, error: { code: error.code, message: error.message } }]
         result = true
