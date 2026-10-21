@@ -13,7 +13,15 @@ async function replicas() {
 async function user(store, { role = 'user', concurrency = 1 } = {}) {
   const id = 'user-' + crypto.randomUUID()
   const now = new Date().toISOString()
-  return store.users.insert({ id, username: id, password_hash: 'test', role, concurrency, created_at: now, updated_at: now })
+  return store.users.insert({
+    id,
+    username: id,
+    password_hash: 'test',
+    role,
+    concurrency,
+    created_at: now,
+    updated_at: now,
+  })
 }
 
 test('independent replicas atomically enforce key concurrency and release once', async () => {
@@ -87,9 +95,13 @@ test('quota count and pending settlement commit together under the key lock', as
   const key = await first.create({ max_concurrency: 0, quota_requests: 2 })
   const gate = await first.reserve(key)
   let entered
-  const waiting = new Promise((resolve) => { entered = resolve })
+  const waiting = new Promise((resolve) => {
+    entered = resolve
+  })
   let resume
-  const proceed = new Promise((resolve) => { resume = resolve })
+  const proceed = new Promise((resolve) => {
+    resume = resolve
+  })
   const record = first.repo.recordUsage.bind(first.repo)
   first.repo.recordUsage = async (...args) => {
     const saved = await record(...args)
@@ -101,7 +113,9 @@ test('quota count and pending settlement commit together under the key lock', as
   await waiting
   const observed = await second.getById(key.id)
   assert.equal(observed.quota_requests_used, 0, 'an uncommitted completion is invisible')
-  const otherPending = await second.db.prepare('SELECT count(*) AS count FROM api_key_admissions WHERE settled_at IS NULL AND released_at IS NULL').get()
+  const otherPending = await second.db
+    .prepare('SELECT count(*) AS count FROM api_key_admissions WHERE settled_at IS NULL AND released_at IS NULL')
+    .get()
   assert.equal(otherPending.count, 1, 'the pending reservation remains visible until completion commits')
   const competing = second.reserve(key)
   resume()
@@ -197,7 +211,46 @@ test('old executing reservations do not expire or disappear when their connectio
   await first.db.prepare("UPDATE api_key_admissions SET created_at = clock_timestamp() - interval '2 hours'").run()
   await second.db.close()
   assert.equal((await first.reserve(key)).code, 'api_key_concurrency_limit')
-  const row = await first.db.prepare('SELECT owner_id, released_at FROM api_key_admissions WHERE id = $1').get(gate.reservationId)
+  const row = await first.db
+    .prepare('SELECT owner_id, released_at FROM api_key_admissions WHERE id = $1')
+    .get(gate.reservationId)
   assert.equal(row.owner_id, gate.ownerId)
   assert.equal(row.released_at, null)
+})
+
+test('deleting an executing key retains its owner concurrency until release', async () => {
+  const [first, second] = await replicas()
+  const owner = await user(first)
+  const key = await first.create({ user_id: owner.id, max_concurrency: 0 })
+  const otherKey = await first.create({ user_id: owner.id, max_concurrency: 0 })
+  const gate = await first.reserve(key)
+  assert.equal(await first.remove(key.id), true)
+  assert.equal((await second.reserve(otherKey)).code, 'user_concurrency_limit')
+  await gate.release()
+  const next = await second.reserve(otherKey)
+  assert.equal(next.ok, true)
+  await next.release()
+})
+
+test('pending quota arithmetic remains exact above the safe integer boundary', async () => {
+  const [first, second] = await replicas()
+  const key = await first.create({ max_concurrency: 0 })
+  await first.db.prepare('UPDATE api_keys SET quota_requests = $1, quota_requests_used = $2 WHERE id = $3')
+    .run('9007199254740994', '9007199254740993', key.id)
+  const gate = await first.reserve(key)
+  assert.equal(gate.ok, true)
+  assert.equal((await second.reserve(key)).code, 'api_key_quota_exhausted')
+  await first.recordUsage(key, {}, { reservation: gate })
+  await gate.release()
+  assert.equal((await first.getById(key.id)).quota_requests_used, '9007199254740994')
+  assert.equal((await second.reserve(key)).code, 'api_key_quota_exhausted')
+})
+
+test('an unavailable shared database cannot fall back to process-local admission', async () => {
+  const [first, second] = await replicas()
+  const key = await first.create({ max_concurrency: 0 })
+  await second.db.close()
+  await assert.rejects(second.reserve(key), /database is closed/)
+  assert.equal(second.inflight.size, 0)
+  assert.equal((await first.list())[0].inflight, 0)
 })
