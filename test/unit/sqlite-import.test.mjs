@@ -85,3 +85,19 @@ test('fractional weights in the preserved legacy runtime table survive import', 
     .get('legacy-fractional')
   assert.equal(row.weight, 1.25)
 })
+
+test('fractional API endpoint priorities survive import and store mutations', async () => {
+  const old = sqlite({ dbPath: source })
+  old
+    .prepare('INSERT INTO api_endpoints(id,name,base_url,priority) VALUES(?,?,?,?)')
+    .run('fractional-endpoint', 'fractional', 'https://example.invalid', 1.25)
+  old.close()
+  const db = getDb()
+  await importSqlite({ source, db })
+  const { ApiEndpointStore } = await import('../../src/lib/admin/api-endpoints.mjs')
+  const store = new ApiEndpointStore({ db })
+  assert.equal((await store.getRaw('fractional-endpoint')).priority, 1.25)
+  const created = await store.create({ base_url: 'https://example.invalid', priority: 2.75 })
+  assert.equal(created.priority, 2.75)
+  assert.equal((await store.update(created.id, { priority: 0.25 })).priority, 0.25)
+})
