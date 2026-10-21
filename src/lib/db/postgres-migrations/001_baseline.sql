@@ -95,7 +95,7 @@ CREATE TABLE "accounts" (
   "credentials" text COLLATE "C" NOT NULL DEFAULT '{}',
   "extra" text COLLATE "C" NOT NULL DEFAULT '{}',
   "proxy_id" text COLLATE "C",
-  "load_factor" bigint,
+  "load_factor" double precision,
   "priority" bigint NOT NULL DEFAULT 50,
   "rate_multiplier" double precision NOT NULL DEFAULT 1.0,
   "status" text COLLATE "C" NOT NULL DEFAULT 'active',

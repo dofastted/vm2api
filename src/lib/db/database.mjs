@@ -9,6 +9,7 @@ import pg from 'pg'
 const MIGRATIONS_DIR = fileURLToPath(new URL('./postgres-migrations/', import.meta.url))
 const transactions = new AsyncLocalStorage()
 const maintenance = new AsyncLocalStorage()
+const instances = new Set()
 let singleton = null
 let opening = null
 
@@ -57,6 +58,7 @@ export class PostgresDatabase {
         },
       },
     })
+    instances.add(this)
     this.closed = false
     this.active = 0
     this.maintaining = false
@@ -136,6 +138,7 @@ export class PostgresDatabase {
       } finally {
         this.closed = true
         await this.pool.end()
+        instances.delete(this)
       }
       if (failure) throw failure
     })()
@@ -232,6 +235,9 @@ export async function applyMigrations(db, { migrationsDir = MIGRATIONS_DIR } = {
 }
 
 export async function createDatabase(options = {}) {
+  if (options.dataDir && fs.existsSync(path.join(options.dataDir, 'restore-maintenance.json'))) {
+    throw new Error('restore maintenance marker exists; complete offline recovery before startup')
+  }
   const db = new PostgresDatabase({ ...options, schema: options.schema || process.env.KIN_DATABASE_SCHEMA || 'public' })
   try {
     const version = Number((await db.prepare('SHOW server_version_num').get()).server_version_num)
@@ -276,4 +282,12 @@ export async function closeDatabase() {
   const db = singleton
   singleton = null
   if (db) await db.close()
+}
+
+/** Drain only explicitly identified test connections before deleting their schema. */
+export async function closeDatabasesForSchema(schema, connectionString) {
+  const matches = [...instances].filter((db) => db.schema === schema && db.connectionString === connectionString)
+  const results = await Promise.allSettled(matches.map((db) => db.close()))
+  const failed = results.find((result) => result.status === 'rejected')
+  if (failed) throw failed.reason
 }

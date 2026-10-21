@@ -19,16 +19,18 @@
     "fetch:payload": "node scripts/fetch-payload.mjs",
     "test:web": "pnpm -C web test",
     "format": "biome format --write && gofmt -w worker && pnpm -C web format",
-    "format:check": "biome format && node scripts/check-gofmt.mjs && pnpm -C web format:check"
+    "format:check": "biome format && node scripts/check-gofmt.mjs && pnpm -C web format:check",
+    "db:import:sqlite": "node scripts/import-sqlite.mjs",
+    "db:convert:sqlite-backup": "node scripts/convert-sqlite-backup.mjs"
   },
   "dependencies": {
     "croner": "^10.0.1",
     "https-proxy-agent": "^9.1.0",
     "node-fetch": "^2.7.0",
+    "pg": "^8.23.1",
     "socks-proxy-agent": "^10.1.0",
     "ssh2": "^1.17.0",
-    "ws": "^8.22.0",
-    "pg": "^8.23.1"
+    "ws": "^8.22.0"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.11"
