@@ -4,9 +4,12 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import pg from 'pg'
+import { AsyncResource } from 'node:async_hooks'
 import { getDb, registerActivityCoordinator, quoteIdentifier } from '../../src/lib/db/database.mjs'
 import { GlobalMaintenanceCoordinator } from '../../src/lib/db/global-maintenance.mjs'
 import { BackupService } from '../../src/lib/admin/backup-service.mjs'
+import { VmTestScheduleRunner } from '../../src/lib/admin/vm-test-schedule.mjs'
+import { SharedBackgroundTasks } from '../../src/lib/core/shared-background-tasks.mjs'
 
 async function fixture(t) {
   const db = getDb()
@@ -71,6 +74,66 @@ test('BackupService scheduled checks finish their read activity before claiming 
     1,
   )
   assert.equal(await coordinator.isReady(), true)
+})
+
+async function discoveryTimer(t, db) {
+  const schedule = new VmTestScheduleRunner({
+    projectRoot: '/missing-maintenance-fixture',
+    list: () => [],
+    sharedTasks: new SharedBackgroundTasks(db),
+  })
+  let callback
+  const timer = t.mock.method(globalThis, 'setInterval', (fn) => {
+    callback = fn
+    return { unref() {} }
+  })
+  try {
+    await schedule.start()
+  } finally {
+    timer.mock.restore()
+  }
+  const context = new AsyncResource('maintenance-discovery-timer')
+  t.after(async () => {
+    await schedule.stop()
+    context.emitDestroy()
+  })
+  return { schedule, tick: () => context.runInAsyncScope(callback) }
+}
+
+test('a scheduled backup drains when periodic discovery is refused before starting in DRAINING', async (t) => {
+  const { db, coordinator, service } = await fixture(t)
+  const { schedule, tick } = await discoveryTimer(t, db)
+  let discoveries = 0
+  const listPlans = schedule.resultRepo.listPlans.bind(schedule.resultRepo)
+  schedule.resultRepo.listPlans = () => {
+    discoveries++
+    return listPlans()
+  }
+  service.onMaintenance(async (enabled) => {
+    if (!enabled) return
+    assert.equal((await coordinator.getState()).phase, 'draining')
+    await tick()
+    await schedule.stop()
+    await schedule.flush()
+  })
+  const record = await service.runScheduled()
+  assert.equal(record.status, 'ok')
+  assert.equal(discoveries, 0)
+  assert.equal(await coordinator.isReady(), true)
+})
+
+test('a discovery failure after admission remains a persistence failure even with the maintenance error code', async (t) => {
+  const { db } = await fixture(t)
+  const { schedule, tick } = await discoveryTimer(t, db)
+  const failure = Object.assign(new Error('synthetic admitted discovery failure'), { code: 'database_maintenance' })
+  let discoveries = 0
+  schedule.resultRepo.listPlans = async () => {
+    discoveries++
+    throw failure
+  }
+  await tick()
+  assert.equal(discoveries, 1)
+  await assert.rejects(schedule.flush(), (error) => error === failure)
 })
 
 test('a pre-restore refusal cancels only its own drain and leaves ordinary requests available', async (t) => {
