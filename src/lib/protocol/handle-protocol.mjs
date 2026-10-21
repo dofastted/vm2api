@@ -468,7 +468,7 @@ export function createHandleProtocol(deps) {
       requestContext,
       slotWaitMs: candidate.slotWaitMs,
       noGoFallback,
-      ensureCredential: async (exec) => await ensureWorkerCredential(exec),
+      ensureCredential: async (exec, opts) => await ensureWorkerCredential(exec, opts),
       onEvent: async (line) => {
         if (/response_headers/.test(String(line))) return
         applyClaudeSSELineToMessage(restoreToolNamesInSSELine(line, toolNames), assembler)
@@ -1621,7 +1621,7 @@ export function createHandleProtocol(deps) {
               routing: getRouting(),
               slotWaitMs: candidate.slotWaitMs,
               noGoFallback: !!pinVmId,
-              ensureCredential: async (exec) => await ensureWorkerCredential(exec),
+              ensureCredential: async (exec, opts) => await ensureWorkerCredential(exec, opts),
               onCommit: () => {
                 if (protocol === 'anthropic.messages' && !res.headersSent) writeSSEHeaders(res)
                 onCommit()
