@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { getDb, createDatabase } from '../../src/lib/db/database.mjs'
+import { withDatabaseActivities } from '../maintenance-fixture.mjs'
 import { RuntimeSettings, loadSettingsState } from '../../src/lib/db/settings-state.mjs'
 import { SharedBackgroundTasks } from '../../src/lib/core/shared-background-tasks.mjs'
 import { createHealthProbeMonitor, cachedClaudeMessage } from '../../src/lib/admin/health-probe.mjs'
@@ -133,21 +134,23 @@ test('Kubernetes health uses the default shared service and refreshes routing be
     merge: (current, patch) => ({ ...current, ...patch }),
     apply: (config) => monitor?.setConfig(config.health_probe, { restart: false }),
   })
-  await routing.init()
-  monitor = createHealthProbeMonitor({
-    config: { enabled: true, real: { prompt: 'old prompt' } },
-    listTargets: () => [live],
-    runChat: async (_vm, config) => {
-      assert.equal(config.prompt, 'new prompt')
-      return { ok: true, text: 'synthetic', body: { id: 'synthetic-message' } }
-    },
+  await withDatabaseActivities([f.db], async () => {
+    await routing.init()
+    monitor = createHealthProbeMonitor({
+      config: { enabled: true, real: { prompt: 'old prompt' } },
+      listTargets: () => [live],
+      runChat: async (_vm, config) => {
+        assert.equal(config.prompt, 'new prompt')
+        return { ok: true, text: 'synthetic', body: { id: 'synthetic-message' } }
+      },
+    })
+    await new RoutingConfigRepo(f.other).patch((current) => ({
+      ...current,
+      health_probe: { enabled: true, real: { prompt: 'new prompt' } },
+    }))
+    assert.equal((await monitor.runRealProbe()).ok, true)
+    assert.equal((await f.other.prepare('SELECT count(*) AS n FROM background_task_runs').get()).n, 1)
   })
-  await new RoutingConfigRepo(f.other).patch((current) => ({
-    ...current,
-    health_probe: { enabled: true, real: { prompt: 'new prompt' } },
-  }))
-  assert.equal((await monitor.runRealProbe()).ok, true)
-  assert.equal((await f.other.prepare('SELECT count(*) AS n FROM background_task_runs').get()).n, 1)
 })
 
 test('usage timer and event probes share one persisted VM task plan across monitors', async (t) => {

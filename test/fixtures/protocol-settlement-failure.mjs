@@ -8,11 +8,14 @@ import { getDb } from '../../src/lib/db/database.mjs'
 import { readBody } from '../../src/lib/http/respond.mjs'
 
 const [route, failure] = process.env.VM2API_SETTLEMENT_FAILURE_CASE.split(':')
-async function completedUpstream({ logBag, json, res }) {
+async function completedUpstream({ req, logBag, json, res, onExecutionState }) {
+  const execution = { requestId: 'synthetic-settlement-job', started: true, ended: false }
+  await onExecutionState?.(req, execution)
   logBag.final_state = 'verified'
   logBag.usage = { input_tokens: 1, output_tokens: 1 }
   const result = json(res, 200, { upstream_completed: true })
   if (failure === 'backend') throw new Error('simulated execution-stage backend failure')
+  await onExecutionState?.(req, { ...execution, ended: true, reason: 'http_body_complete' })
   return result
 }
 mock.module(new URL('../../src/lib/protocol/handle-codex.mjs', import.meta.url), {
