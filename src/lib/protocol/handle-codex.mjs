@@ -214,7 +214,20 @@ export async function pickCodexCandidates(
 ) {
   const pin = pinnedVmId(req)
   const model = body?.model || null
-  const routingPolicy = normalizeCodexRouting(routing.codex || routing).quota
+  const snapshot = sharedRuntime ? await sharedRuntime.routingSnapshot(routing) : null
+  const liveRouting = snapshot?.config || routing
+  const routingPolicy = normalizeCodexRouting(liveRouting.codex || liveRouting).quota
+  const withPolicy = (ordered) =>
+    sharedRuntime
+      ? {
+          ...ordered,
+          quotaPolicy: routingPolicy,
+          candidates: (ordered.candidates || []).map((candidate) => ({
+            ...candidate,
+            routingRevision: snapshot.revision,
+          })),
+        }
+      : ordered
   const scope = await keyScopeFromRequest(req)
   const poolDenial = vmPoolDenial(scope)
   if (poolDenial) return { error: 'vm_pool_unavailable', message: poolDenial.message, ids: [], candidates: [] }
@@ -233,7 +246,7 @@ export async function pickCodexCandidates(
       quotaPolicy: routingPolicy,
       runtimeSignals,
     })
-    return { ...ordered, pin, sticky: false, sessionKey: null, stickyKeys: [] }
+    return { ...withPolicy(ordered), pin, sticky: false, sessionKey: null, stickyKeys: [] }
   }
   for (const item of listVms(projectRoot, { codex: { quota: routingPolicy } })) {
     if (!isCodexVm(item)) continue
@@ -286,7 +299,7 @@ export async function pickCodexCandidates(
   if (continuesResponse && (boundLeft || ordered.error === 'candidates_exhausted')) {
     return { error: 'response_not_portable', ids: [], sessionKey, stickyKeys, boundVmId: bound.vmId }
   }
-  return { ...ordered, sessionKey, stickyKeys, ...(stickyRouter?.shared ? { stickyVersions } : {}) }
+  return { ...withPolicy(ordered), sessionKey, stickyKeys, ...(stickyRouter?.shared ? { stickyVersions } : {}) }
 }
 
 function ingestCodexHop(projectRoot, vmId, result, now = Date.now(), policy = null) {
@@ -426,18 +439,26 @@ function clientGoneSignal(req, res) {
  */
 async function admitCodexCandidate(projectRoot, req, opts, { deadline, signal }) {
   let woken = false
-  for (;;) {
+  selection: for (;;) {
     const picked = await pickCodexCandidates(projectRoot, req, opts)
-    const livePolicy = normalizeCodexRouting(opts.routing?.codex || opts.routing).quota
+    const livePolicy = picked.quotaPolicy || normalizeCodexRouting(opts.routing?.codex || opts.routing).quota
     if (picked.error && picked.error !== 'capacity_unavailable') return { picked }
     for (const candidate of picked.candidates || []) {
-      const lease = opts.sharedRuntime
-        ? await opts.sharedRuntime.tryReserve(projectRoot, getVm(projectRoot, candidate.id), candidate, livePolicy)
-        : tryAcquireOpenAISlot(candidate.id, {
-            concurrency: candidate.concurrency,
-            maxRpm: candidate.maxRpm,
-            quotaPolicy: livePolicy,
-          })
+      let lease
+      try {
+        lease = opts.sharedRuntime
+          ? await opts.sharedRuntime.tryReserve(projectRoot, getVm(projectRoot, candidate.id), candidate, livePolicy)
+          : tryAcquireOpenAISlot(candidate.id, {
+              concurrency: candidate.concurrency,
+              maxRpm: candidate.maxRpm,
+              quotaPolicy: livePolicy,
+            })
+      } catch (error) {
+        if (!opts.sharedRuntime || error?.code !== 'routing_config_stale') throw error
+        if (signal?.aborted) return { picked: { error: 'client_cancelled', ids: [] } }
+        if (Date.now() >= deadline) return { picked: { error: 'capacity_unavailable', ids: [] } }
+        continue selection
+      }
       if (lease) return { picked, vmId: candidate.id, lease }
     }
     // A woken waiter that still missed hands the wake to the next in line.
@@ -937,7 +958,13 @@ export async function handleCodexProtocol({
             },
           })
         }
-        ingestCodexHop(projectRoot, vm.id, result, Date.now(), normalizeCodexRouting(routing.codex).quota)
+        ingestCodexHop(
+          projectRoot,
+          vm.id,
+          result,
+          Date.now(),
+          picked.quotaPolicy || normalizeCodexRouting(routing.codex).quota,
+        )
         if (result?.transport_retried) logBag.transport_retried = true
         if (result?.reasoning_history_retried) {
           logBag.attempt_count += 1

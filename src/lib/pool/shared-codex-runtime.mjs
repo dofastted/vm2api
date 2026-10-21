@@ -3,6 +3,7 @@ import { SharedExecutionAdmissions } from './shared-execution-admissions.mjs'
 import { SharedSessionTurns } from './shared-session-turns.mjs'
 import { readCodexAccounts } from '../vm/codex-slot.mjs'
 import { normalizeOpenAIQuotaPolicy } from './openai-quota-policy.mjs'
+import { getSharedRoutingState } from '../admin/shared-routing-config.mjs'
 
 function identityError() {
   return Object.assign(new Error('Shared Codex execution requires exactly one account with chatgpt_account_id'), {
@@ -14,8 +15,18 @@ function identityError() {
 export class SharedCodexRuntime {
   constructor(db = getDb(), options = {}) {
     this.db = db
-    this.admissions = new SharedExecutionAdmissions(db, options)
+    this.routingState = options.routingState ?? getSharedRoutingState(db)
+    this.admissions = new SharedExecutionAdmissions(db, {
+      ...options,
+      assertRoutingRevision: this.routingState
+        ? (revision) => this.routingState.assertRevision(revision)
+        : options.assertRoutingRevision,
+    })
     this.turns = new SharedSessionTurns(db, options)
+  }
+
+  async routingSnapshot(routing) {
+    return this.routingState ? this.routingState.refresh() : { config: routing }
   }
 
   accountId(projectRoot, vm) {
@@ -57,6 +68,7 @@ export class SharedCodexRuntime {
       rpmLimit: limits.max_rpm,
       fableLimit: 0,
       family: 'codex',
+      routingRevision: candidate.routingRevision,
     })
     if (!gate.ok) return null
     let releasing = null
