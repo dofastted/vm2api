@@ -45,7 +45,7 @@ test('plan limit writes rate_limit_reset_at from the text and survives a passive
   const { service, runtimeRepo, accountQuota, probes, close } = await setup()
   try {
     const now = Date.now()
-    const block = service.handleUpstreamError({
+    const block = await service.handleUpstreamError({
       accountId: 'acc-1',
       vmId: 'vm-01',
       result: limitResult("provider error: You've hit your limit · resets 11am (America/New_York)"),
@@ -61,7 +61,7 @@ test('plan limit writes rate_limit_reset_at from the text and survives a passive
     assert.deepEqual(hardBlockOf(state, now), { reason: 'rate_limited', until: state.rate_limit_reset_at })
     assert.equal(probes.length, 0)
     // Passive Extra saying "under safety" must not lift the 429 block.
-    accountQuota.clearQuotaExhaustedCooldown('acc-1')
+    await accountQuota.clearQuotaExhaustedCooldown('acc-1')
     assert.equal(runtimeRepo.get('acc-1').rate_limit_reset_at, state.rate_limit_reset_at)
   } finally {
     await close()
@@ -72,7 +72,7 @@ test('plan limit without any reset falls back to the configured cooldown and ask
   const { service, runtimeRepo, probes, close } = await setup({ fallback_cooldown_min: 30 })
   try {
     const now = Date.now()
-    const block = service.handleUpstreamError({
+    const block = await service.handleUpstreamError({
       accountId: 'acc-1',
       vmId: 'vm-01',
       result: limitResult("You've hit your limit"),
@@ -91,7 +91,7 @@ test('plan limit without any reset falls back to the configured cooldown and ask
 test('model-scoped 429 does not write an account hard block', async () => {
   const { service, runtimeRepo, close } = await setup()
   try {
-    const block = service.handleUpstreamError({
+    const block = await service.handleUpstreamError({
       accountId: 'acc-1',
       vmId: 'vm-01',
       result: limitResult('rate limited'),
@@ -107,7 +107,7 @@ test('model-scoped 429 does not write an account hard block', async () => {
 test('#163: an unknown bare 429 asks for one usage probe and fabricates no 5h block', async () => {
   const { service, runtimeRepo, probes, close } = await setup()
   try {
-    const block = service.handleUpstreamError({
+    const block = await service.handleUpstreamError({
       accountId: 'acc-1',
       vmId: 'vm-01',
       result: limitResult('Rate limited'),
@@ -125,7 +125,7 @@ test('529 writes overload_until for the configured minutes', async () => {
   const { service, runtimeRepo, close } = await setup({ overload_cooldown_min: 10 })
   try {
     const now = Date.now()
-    const block = service.handleUpstreamError({
+    const block = await service.handleUpstreamError({
       accountId: 'acc-1',
       vmId: 'vm-01',
       result: { status: 529, body: { type: 'error', error: { type: 'overloaded_error' } } },
@@ -143,7 +143,7 @@ test('only a live allowed header lifts a rate limit early', async () => {
   const { service, runtimeRepo, close } = await setup()
   try {
     const now = Date.now()
-    service.handleUpstreamError({
+    await service.handleUpstreamError({
       accountId: 'acc-1',
       vmId: 'vm-01',
       result: limitResult("You've hit your limit · resets 11pm (UTC)"),
@@ -151,13 +151,13 @@ test('only a live allowed header lifts a rate limit early', async () => {
       now,
     })
     const reset = String(Math.floor((now + 4 * 3600_000) / 1000))
-    service.updateSessionWindow({
+    await service.updateSessionWindow({
       accountId: 'acc-1',
       headers: { 'anthropic-ratelimit-unified-5h-status': 'allowed_warning' },
       now,
     })
     assert.ok(hardBlockOf(runtimeRepo.get('acc-1'), now))
-    const lifted = service.updateSessionWindow({
+    const lifted = await service.updateSessionWindow({
       accountId: 'acc-1',
       headers: {
         'anthropic-ratelimit-unified-5h-status': 'allowed',
@@ -178,7 +178,7 @@ test('an out-of-range 5h reset header is ignored for the session window', async 
   const { service, runtimeRepo, close } = await setup()
   try {
     const now = Date.now()
-    service.updateSessionWindow({
+    await service.updateSessionWindow({
       accountId: 'acc-1',
       headers: {
         'anthropic-ratelimit-unified-5h-status': 'allowed',
@@ -209,7 +209,7 @@ test('clearExpired drops elapsed rate limit and overload columns', async () => {
 test('an incomplete hop does not write an empty_response cooldown', async () => {
   const { service, runtimeRepo, close } = await setup({ empty_response_cooldown_sec: 60 })
   try {
-    const block = service.handleUpstreamError({
+    const block = await service.handleUpstreamError({
       accountId: 'acc-1',
       vmId: 'vm-01',
       result: { status: 200, committed: false, terminalState: 'incomplete' },
@@ -246,7 +246,7 @@ test('429 headers retain the ticket captured before the attempt began', async ()
     options = value
   }
   try {
-    service.handleUpstreamError({
+    await service.handleUpstreamError({
       accountId: 'acc-1',
       vmId: 'vm-01',
       result: { ...limitResult('rate limited'), accountObservation: 41 },

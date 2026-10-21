@@ -1020,8 +1020,17 @@ test('persistEffectiveWindows clears leftover quota cooldown when official is un
   const runtime = new Map()
   q.attachRuntimeRepo({
     get: (id) => runtime.get(id) || null,
-    upsert: (row) => {
-      runtime.set(row.account_id, { ...runtime.get(row.account_id), ...row })
+    clearQuotaCooldownCommitted: async (id) => {
+      const row = runtime.get(id)
+      if (!row) return false
+      runtime.set(id, {
+        ...row,
+        status: 'ready',
+        cooldown_until: null,
+        cooldown_reason: null,
+        rate_limit_reset_at: null,
+      })
+      return true
     },
     updateWindow: () => {},
   })
@@ -1057,8 +1066,17 @@ test('official 0.44 allowed overwrites local 0.9 and clears quota cooldown', asy
   const runtime = new Map()
   q.attachRuntimeRepo({
     get: (id) => runtime.get(id) || null,
-    upsert: (row) => {
-      runtime.set(row.account_id, { ...runtime.get(row.account_id), ...row })
+    clearQuotaCooldownCommitted: async (id) => {
+      const row = runtime.get(id)
+      if (!row) return false
+      runtime.set(id, {
+        ...row,
+        status: 'ready',
+        cooldown_until: null,
+        cooldown_reason: null,
+        rate_limit_reset_at: null,
+      })
+      return true
     },
     updateWindow: () => {},
   })

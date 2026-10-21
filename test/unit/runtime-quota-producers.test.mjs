@@ -160,3 +160,40 @@ test('quota-cleared callbacks wait until the queued PG clearing has committed', 
   assert.equal(callbacks, 1)
   assert.equal((await left.persistence.get('producer-account')).cooldown_until, null)
 })
+
+test('an older clearing reports false when newer identical cooldown fields have claimed their observation versions', async () => {
+  const { left, right } = await fixture()
+  const until = Date.now() + 60_000
+  const fields = { account_id: 'producer-account', cooldown_until: until, cooldown_reason: 'quota_guard' }
+  left.upsert(fields)
+  await left.flush()
+  const older = await left.beginObservation()
+  const newer = await right.beginObservation()
+  right.upsert(fields, { observation: newer })
+  await right.flush()
+  assert.equal(await left.clearQuotaCooldownCommitted('producer-account', { observation: older }), false)
+  assert.equal((await left.persistence.get('producer-account')).cooldown_until, until)
+})
+
+test('a failed PG rate-limit write rejects without publishing cache or firing the usage callback', async () => {
+  const { left, service } = await fixture()
+  let callbacks = 0
+  service.onUsageProbe = () => {
+    callbacks++
+  }
+  await left.persistence.db.exec(`CREATE FUNCTION reject_limit_write() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN RAISE EXCEPTION 'synthetic runtime write failure' USING ERRCODE = 'P0001'; END $$;
+    CREATE TRIGGER reject_limit_write BEFORE UPDATE ON accounts FOR EACH ROW EXECUTE FUNCTION reject_limit_write()`)
+  try {
+    await assert.rejects(service.handle429({ accountId: 'producer-account', vmId: 'producer-vm', result: {} }), {
+      code: 'P0001',
+    })
+    assert.equal(callbacks, 0)
+    assert.equal(left.get('producer-account').rate_limit_reset_at, null)
+    assert.equal((await left.persistence.get('producer-account')).rate_limit_reset_at, null)
+  } finally {
+    await left.persistence.db.exec('DROP TRIGGER reject_limit_write ON accounts')
+    // This isolated test deliberately faulted the queue; allow its fixture to drain.
+    left.writes.failure = null
+  }
+})

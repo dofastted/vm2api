@@ -152,18 +152,42 @@ export class AccountRuntimeRepo {
     return account
   }
 
-  async patch(accountId, fields, { vmId, observation, modelPatch, clearModels = false, expected, condition } = {}) {
+  async patch(
+    accountId,
+    fields,
+    {
+      vmId,
+      observation,
+      modelPatch,
+      clearModels = false,
+      expected,
+      condition,
+      returnApplied = false,
+      atomic = false,
+    } = {},
+  ) {
     const sequence = BigInt(await (observation ?? this.beginObservation()))
     return withTransaction(this.db, async () => {
       const account = await this.lockAccount(accountId, vmId)
-      if (!account) return null
+      if (!account) return returnApplied ? { applied: false, state: null } : null
       const runtime = await this.db.prepare('SELECT * FROM account_runtime WHERE account_id = $1').get(accountId)
       const current = mergeState(runtime, account)
-      if (!current.vm_id && !vmId && !fields.vm_id) return null
-      if (condition && !condition(current)) return null
+      const rejected = () => (returnApplied ? { applied: false, state: current } : null)
+      if (!current.vm_id && !vmId && !fields.vm_id) return rejected()
+      if (condition && !condition(current)) return rejected()
       if (expected && Object.entries(expected).some(([key, value]) => !isDeepStrictEqual(current[key], value)))
-        return null
+        return rejected()
       const versions = account.observation_versions || {}
+      if (
+        atomic &&
+        Object.entries(fields).some(
+          ([field, value]) =>
+            value !== undefined &&
+            (Object.hasOwn(ACCOUNT_FIELDS, field) || Object.hasOwn(RUNTIME_FIELDS, field)) &&
+            !accepts(versions, ['runtime', field], sequence),
+        )
+      )
+        return rejected()
       const acc = {}
       const rt = {}
       let accepted = false
@@ -197,7 +221,7 @@ export class AccountRuntimeRepo {
         rt.model_states_json = JSON.stringify(models)
         accepted = true
       }
-      if (!accepted) return current
+      if (!accepted) return returnApplied ? { applied: false, state: current } : current
       const now = new Date().toISOString()
       await this.db
         .prepare(`INSERT INTO account_runtime (account_id, vm_id, updated_at)
@@ -216,7 +240,8 @@ export class AccountRuntimeRepo {
       const assignments = Object.keys(acc).map((key, i) => `${key} = $${i + 1}`)
       assignments.push(`observation_versions = $${values.length - 2}::jsonb`, `updated_at = $${values.length - 1}`)
       await this.db.prepare(`UPDATE accounts SET ${assignments.join(', ')} WHERE id = $${values.length}`).run(...values)
-      return this.get(accountId)
+      const stored = await this.get(accountId)
+      return returnApplied ? { applied: true, state: stored } : stored
     })
   }
 
@@ -243,6 +268,21 @@ export class AccountRuntimeRepo {
       if (input[key] !== undefined) fields[field] = input[key]
     }
     return this.patch(accountId, fields, { vmId, observation })
+  }
+
+  async updateWindowCommitted(accountId, { vmId = null, observation, ...input } = {}) {
+    const fields = {}
+    for (const [key, field] of Object.entries({
+      rateLimitedAt: 'rate_limited_at',
+      rateLimitResetAt: 'rate_limit_reset_at',
+      overloadUntil: 'overload_until',
+      sessionWindowStart: 'session_window_start',
+      sessionWindowEnd: 'session_window_end',
+      sessionWindowStatus: 'session_window_status',
+    })) {
+      if (input[key] !== undefined) fields[field] = input[key]
+    }
+    return this.patch(accountId, fields, { vmId, observation, returnApplied: true, atomic: true })
   }
 
   async markCooldown(accountId, { vmId, until, reason, model = null, status = 'cooldown', observation } = {}) {
@@ -316,11 +356,22 @@ export class AccountRuntimeRepo {
   }
 
   async clearQuotaCooldown(accountId, { vmId, observation, expected } = {}) {
-    return !!(await this.patch(
+    return (await this.clearQuotaCooldownCommitted(accountId, { vmId, observation, expected })).applied
+  }
+
+  async clearQuotaCooldownCommitted(accountId, { vmId, observation, expected } = {}) {
+    return this.patch(
       accountId,
       { status: 'ready', cooldown_until: null, cooldown_reason: null, rate_limit_reset_at: null },
-      { vmId, observation, expected, condition: (state) => this.isQuotaCooldown(state) },
-    ))
+      {
+        vmId,
+        observation,
+        expected,
+        condition: (state) => this.isQuotaCooldown(state),
+        returnApplied: true,
+        atomic: true,
+      },
+    )
   }
 
   async clearExpired(now = Date.now()) {

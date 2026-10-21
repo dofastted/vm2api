@@ -44,6 +44,7 @@ export class SchedulingRuntime {
     this.revisions = new Map()
     this.refreshStarted = 0
     this.refreshPublished = 0
+    this.observationTail = Promise.resolve()
     this.writes = this.persistence.db.schedulingWriteQueue ||= new WriteQueue(this.persistence.db)
   }
 
@@ -55,7 +56,9 @@ export class SchedulingRuntime {
     return this.writes.flush()
   }
   beginObservation() {
-    return this.persistence.beginObservation()
+    const observation = this.observationTail.then(() => this.persistence.beginObservation())
+    this.observationTail = observation.catch(() => {})
+    return observation
   }
   get(id) {
     return structuredClone(this.rows.get(id) || null)
@@ -149,6 +152,29 @@ export class SchedulingRuntime {
     )
   }
 
+  commit(accountId, write) {
+    const revision = (this.revisions.get(accountId) || 0) + 1
+    this.revisions.set(accountId, revision)
+    let result
+    const queued = this.writes.enqueue(async () => {
+      result = await write()
+      if (result.state && this.revisions.get(accountId) === revision) this.rows.set(accountId, result.state)
+    })
+    const committed = queued.then(() => {
+      if (this.writes.failure) throw this.writes.failure
+      return result
+    })
+    committed.catch(() => {})
+    return committed
+  }
+
+  updateWindowCommitted(accountId, { observation, ...input } = {}) {
+    const ticket = this.ticket(observation)
+    return this.commit(accountId, () =>
+      this.persistence.updateWindowCommitted(accountId, { ...input, observation: ticket }),
+    )
+  }
+
   markCooldown(accountId, { vmId, until, reason, model = null, status = 'cooldown', observation } = {}) {
     const current = this.get(accountId) || { account_id: accountId, vm_id: vmId }
     current.vm_id ||= vmId
@@ -199,6 +225,24 @@ export class SchedulingRuntime {
   }
   clearQuotaCooldown(accountId, options = {}) {
     return this.clearCooldown('clearQuotaCooldown', accountId, options)
+  }
+
+  clearQuotaCooldownCommitted(accountId, { vmId = null, observation, expected } = {}) {
+    const current = this.get(accountId)
+    if (!current || !this.persistence.isQuotaCooldown(current)) return Promise.resolve(false)
+    const ticket = this.ticket(observation)
+    return this.commit(accountId, () =>
+      this.persistence.clearQuotaCooldownCommitted(accountId, {
+        vmId,
+        observation: ticket,
+        expected: expected || {
+          cooldown_until: current.cooldown_until,
+          cooldown_reason: current.cooldown_reason,
+          rate_limit_reset_at: current.rate_limit_reset_at,
+          overload_until: current.overload_until,
+        },
+      }),
+    ).then((result) => result.applied)
   }
 
   clearCooldown(method, accountId, { vmId = null, observation } = {}) {

@@ -208,7 +208,7 @@ export class AccountQuota {
     this.runtimeRepo = runtimeRepo || null
   }
 
-  _writeSessionWindow(acc) {
+  _writeSessionWindow(acc, { observation } = {}) {
     if (!this.runtimeRepo?.updateWindow || !acc) return
     const extra = headerWindow(acc.unified, '5h')
     const w5 = extra.utilization != null || extra.status || extra.reset ? extra : officialWindow(acc.unified, '5h')
@@ -217,6 +217,7 @@ export class AccountQuota {
     try {
       this.runtimeRepo.updateWindow(acc.account_id, {
         vmId: acc.vm_id || null,
+        observation,
         sessionWindowEnd: Number.isFinite(endMs)
           ? endMs
           : Number.isFinite(parseResetMs(endIso))
@@ -275,6 +276,7 @@ export class AccountQuota {
    * headers: Headers | plain object (lower-cased keys preferred)
    */
   ingestHeaders(accountId, headers, usageBody = null, extra = {}) {
+    const observation = extra.observation ?? this.beginObservation()
     const acc = this.ensure({ account_id: accountId })
     const h = normalizeHeaders(headers)
     acc.unified.headers = acc.unified.headers || {}
@@ -382,8 +384,8 @@ export class AccountQuota {
       })
     }
 
-    const saved = this.repo.observe(acc, { observation: extra.observation, paths })
-    this._writeSessionWindow(saved)
+    const saved = this.repo.observe(acc, { observation, paths })
+    this._writeSessionWindow(saved, { observation })
     if (sampled) {
       const observed5 = headerWindowOrEmpty(saved.unified, '5h')
       const observed7 = headerWindowOrEmpty(saved.unified, '7d')
@@ -424,6 +426,7 @@ export class AccountQuota {
    * Fable weekly limit is stored separately and does not unschedulable the account.
    */
   ingestOAuthUsage(accountId, probe = {}, { observation } = {}) {
+    observation ??= this.beginObservation()
     const acc = this.ensure({ account_id: accountId })
     const nowIso = probe.probed_at || new Date().toISOString()
     if (isOfficialUsageRateLimited(probe)) {
@@ -568,7 +571,7 @@ export class AccountQuota {
       clearHeaderExhaustIfOfficialOpen(acc)
     }
     const saved = this.repo.observe(acc, { observation, paths })
-    this._writeSessionWindow(saved)
+    this._writeSessionWindow(saved, { observation })
     if (usageOk) {
       const observed5 = headerWindowOrEmpty(saved.unified, '5h')
       const observed7 = headerWindowOrEmpty(saved.unified, '7d')
@@ -579,7 +582,7 @@ export class AccountQuota {
       })
     }
     if (usageOk && this.headerUnderSafety(saved)) {
-      this.clearQuotaExhaustedCooldown(accountId)
+      this.clearQuotaExhaustedCooldown(accountId, { observation })
     }
     return saved
   }
@@ -995,7 +998,8 @@ export class AccountQuota {
    * Write effective 5h/7d windows back to SQLite when a reset has elapsed
    * or last_used proves a probe-source 100% is leftover from the previous window.
    */
-  persistEffectiveWindows(accountId, { now = Date.now() } = {}) {
+  persistEffectiveWindows(accountId, { now = Date.now(), observation } = {}) {
+    observation ??= this.beginObservation()
     if (!accountId) return null
     const acc = this.repo.get(accountId)
     if (!acc?.unified) return acc || null
@@ -1030,7 +1034,7 @@ export class AccountQuota {
       const healed = healOfficialOverwriteExtra(acc, accountId, this.repo)
       if (!healed) {
         if (backoffExpired) this.repo.save(acc)
-        if (this.headerUnderSafety(acc)) this.clearQuotaExhaustedCooldown(accountId)
+        if (this.headerUnderSafety(acc)) this.clearQuotaExhaustedCooldown(accountId, { observation })
         return acc
       }
     } else {
@@ -1047,8 +1051,8 @@ export class AccountQuota {
     }
     acc.unified.updated_at = new Date().toISOString()
     const saved = this.repo.save(acc)
-    this._writeSessionWindow(saved)
-    if (this.headerUnderSafety(saved)) this.clearQuotaExhaustedCooldown(accountId)
+    this._writeSessionWindow(saved, { observation })
+    if (this.headerUnderSafety(saved)) this.clearQuotaExhaustedCooldown(accountId, { observation })
     return saved
   }
 
@@ -1071,36 +1075,19 @@ export class AccountQuota {
     return true
   }
 
-  clearQuotaExhaustedCooldown(accountId) {
-    if (!accountId || !this.runtimeRepo) return false
-    let state = null
-    try {
-      state = this.runtimeRepo.get?.(accountId)
-    } catch {
-      return false
-    }
-    if (!state) return false
-    // Live 429 / overload columns belong to RateLimitService; passive Extra never lifts them.
-    if (Number(state.rate_limit_reset_at) > Date.now() || Number(state.overload_until) > Date.now()) return false
-    const reason = String(state.cooldown_reason || '')
-    const quotaCool = !reason || /quota|account_quota_exhausted|rate_limited/i.test(reason)
-    if (!quotaCool) return false
-    if (!state.cooldown_until && !reason) return false
-    try {
-      this.runtimeRepo.upsert?.({
-        ...state,
-        status: 'ready',
-        cooldown_until: null,
-        cooldown_reason: null,
-        rate_limit_reset_at: null,
-      })
-    } catch {
-      return false
-    }
-    try {
-      this.onQuotaCooldownCleared?.(accountId)
-    } catch {}
-    return true
+  clearQuotaExhaustedCooldown(accountId, { observation } = {}) {
+    const clearing = (async () => {
+      if (!accountId || !this.runtimeRepo?.clearQuotaCooldownCommitted) return false
+      const cleared = await this.runtimeRepo.clearQuotaCooldownCommitted(accountId, { observation })
+      if (!cleared) return false
+      try {
+        this.onQuotaCooldownCleared?.(accountId)
+      } catch {}
+      return true
+    })()
+    // Synchronous quota ingestion schedules this work; flush exposes queued DB failures.
+    clearing.catch(() => {})
+    return clearing
   }
 
   _lastUsedAt(accountId) {
