@@ -36,8 +36,10 @@ func main() {
 	launch, err := authority.BeginLaunch("vm-synthetic", state.Fence, "synthetic-bootstrap")
 	check(err)
 	check(authority.StartLaunch(launch))
+	boot, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	check(err)
 	state, err = authority.BindExecutor(launch, slotgate.ExecutorIdentity{
-		Kind: "container", NodeBootID: "synthetic-boot", ContainerID: strings.Repeat("a", 64),
+		Kind: "container", NodeBootID: strings.TrimSpace(string(boot)), ContainerID: strings.Repeat("a", 64),
 		DockerDaemonID: "synthetic-engine", StartedAt: "2026-10-21T00:00:00.000000001Z",
 	})
 	check(err)
