@@ -15,7 +15,7 @@
 
 ## 独立会话审查
 
-两轮审查均使用单独 Codex CLI 会话和固定 detached worktree。审查会话只读源码、测试、文档与 Git 对象，没有执行测试或访问部署环境。主会话另行动态复现并验证修复。
+五轮审查均使用单独 Codex CLI 会话和固定 detached worktree。审查会话只读源码、测试、文档与 Git 对象，没有执行测试或访问部署环境。主会话另行动态复现并验证修复。
 
 首轮源码为 `0ffae4b0`，独立会话为 `01a15ee0-3324-7490-928c-8343beb13b5e`。发现 4 项 P1、1 项 P2。对应失败规格和定向修复如下：
 
@@ -36,14 +36,27 @@ NUL 问题动态复现得到 PostgreSQL `22021`。修复恢复依赖分支已有
 - 已有容器端点的代理网络清理可能长期保留整个代理池声明。
 - watchdog bridge 修复没有取得共享代理/VM 互斥，且丢弃未知结果。
 
-这 4 项正在复现和修复。本报告不将第二轮审查写为通过。两轮原始发现及静态审查边界见 [首轮报告](evidence/kubernetes/review-progress/independent-review-0ffae4b0.md) 和 [第二轮报告](evidence/kubernetes/review-progress/independent-review-66a580de.md)。
+这 4 项已完成定向修复：初始化 `d2b62208` 为 118/118；代理清理 `d824fa2a` 为 58/58；watchdog 及协议观察 `befd24d1` 为 72/72。本报告不将定向结果称为最终审查通过。原始发现及静态审查边界见 [首轮报告](evidence/kubernetes/review-progress/independent-review-0ffae4b0.md) 和 [第二轮报告](evidence/kubernetes/review-progress/independent-review-66a580de.md)。
+
+第三轮源码为 `068919906653acf0e6dd0f749f83cb808f9f36f1`，独立会话为 `01a15f1a-0084-78a2-917f-2792725bceea`。审查发现 5 项 P1。嵌套 VM 操作未知结果、手动 Codex 刷新和明确未开始的繁忙拒绝，分别由审查开始后的 `34854048`、`12088dde` 和 `2065da50` 修正。已结束的包初始化普通失败在 `da7700bd` 修正，95/95 通过。worker 内部刷新重试覆盖先前未知结果在 `08a18287` 修正，Go race 与 Node 52/52 定向检查通过。见 [第三轮报告](evidence/kubernetes/review-progress/independent-review-06891990.md)。
+
+第四轮源码为 `08a182870b6334691a114c7b93a0f07032588ff7`，独立会话为 `01a15f31-9c1b-77e1-bbee-e2941606450d`。逐项复核第三轮 5 项指定触发路径已修正，新增 1 项 P1：首次远端目录准备已取得退出码及通道关闭，仍被发布队列和协议标为未知。远端证明传播在 `04dde1cd` 修正，固定源码 94 项通过、2 项平台跳过；协议两处分类和真实准入验证仍在进行。见 [第四轮报告](evidence/kubernetes/review-progress/independent-review-08a18287.md)。
+
+`08a18287` 的后续全量结果：unit 368 文件、4182 项，4159 通过、13 失败、10 跳过；E2E 31 文件、130 项，110 通过、19 失败、1 跳过。原 7 项 unit、17 项 E2E 的规范化断言与 `0ffae4b0` 一致。新增 6 项 unit、2 项 E2E 已分别复现，涉及测试数据库初始化、未启动的内存校验、备份调度拒绝和测试 Docker 隔离。修正提交为 `f011a227`、`68d2b54d`、`43076583`、`f9f396dd`，均有定向检查；仍需新的全量检查。该源码的 Go race 为 190 通过、1 辅助跳过，vet、gofmt、733 文件格式检查和 323 文件语法检查通过。
+
+第五轮源码为 `e9076922a4af1f43840e6f9db8381790c809ee21`。独立会话未发现新增 P0/P1/P2，复核了首次准备已结束和 unknown 优先的释放链。真实 runner、双 PG 连接、请求活动及远端发布相关 103 项中，101 通过、2 项平台跳过。fixture 的发布入口和后端仍受测试控制，不等于整条生产 SSH 调用链验收。见 [第五轮报告](evidence/kubernetes/review-progress/independent-review-e9076922.md)。
+
+该源码全量 unit 为 369 文件、4201 项，4183 通过、8 失败、10 跳过；E2E 为 32 文件、131 项，113 通过、17 失败、1 跳过。原 7 项 unit、17 项 E2E 的规范化断言仍一致。新增 1 项 unit 期待调度发现的维护准入拒绝抛出异常；`60d63596` 更正为验证零发现读取、零回调、零 job、零 claim 且无持久化失败，相关 8 项通过。该源码 Go race 为 190 通过、1 辅助跳过；vet、gofmt、735 文件格式检查、302 个 `src` MJS 语法检查通过。之后的节点发布、命令授权和 HA 接线未包含在该全量结果中。
 
 ## 后续固定源码检查
 
 - `f4a685b98f31d467b6a2c8c5a8b7cf7749bf15c5`：watchdog 共享恢复预算、故障准入及相关回归 99/99。
 - `bf7615f8be9adf4f569c2a7d802be514a4c58e64`：共享熔断及原准入、面板、备份和重试 142/142。失败次数在 PostgreSQL 累计；半开状态的探测绑定持久 admission；未知结果不随时间释放；旧结果不能覆盖重置后的代次。
 - `e1e5d2a9e6cea391fb96aacc6b0757fa3ad0360f`：KSG2 客户端、PG 绑定及相关回归 156/156。实际 Go gate、合成 Unix kernel 与两条 PG 连接验证：正常持久完成后可释放；内部错误仍保留。发送前绑定原 Fence；响应后另取原 ticket 的节点持久完成状态。绑定新 job 与凭据刷新 VM 操作使用同一资源锁。
+- `34854048`：私有 PG 节点管理授权及初始 allocate，Node 63/63；Go race 182 通过、1 辅助跳过；Darwin 编译通过。受限节点角色只读授权，操作结束或未知时撤销 grant；未授权管理 RPC 默认拒绝。尚未接真实 VM 创建及节点文件发布。
+- `06891990`：共享刷新接线 251/251；`2065da50` 的明确未开始修正 166/166。新增账号互斥持久记录，表数为 42，业务迁移为 18。私有节点授权不属于业务备份恢复范围。
+- `c05da6f2`：远端发布原始 Promise 等待，203 通过、2 平台跳过。协议两处补充接线见 `63e641b5`；新的合成测试在此前源码上分别复现继续选择 VM、调度提前开始和发布拒绝被吞。修正后持久准入及两处协议等待的 3 项检查通过。
 
-上述检查只使用专用测试 PostgreSQL、合成请求、模拟节点或测试自己的子进程。KSG2 集成使用合成 executor 身份，没有调用真实 Docker Engine；它不能证明可信启动或权限隔离。生产 capability 来源、节点文件发布和管理授权、凭据刷新接线、多节点运行及故障接管仍在实现。旧预编译 payload 继续复用。
+定向协议检查使用专用测试 PostgreSQL、合成请求、模拟节点或测试自己的子进程。KSG2 集成使用合成 executor 身份，没有调用真实 Docker Engine；它不能证明可信启动或权限隔离。旧 E2E harness 的 mock gateway 仍会创建真实本机 Docker 网络，已在 `f9f396dd` 隔离；此前资源按精确 fixture、network ID、无端点和无 helper 证据核对后，仅删除 10 个测试网络。6 个带业务端点的网络和 3 个固定名网络保留。生产 capability 来源、节点文件发布和管理授权、多节点运行及故障接管仍在实现。旧预编译 payload 继续复用。
 
-结构化统计、日志摘要与边界见 [验证证据](evidence/kubernetes/review-progress/verification.json)。任务测试资源按精确所有权清单清理；专用 PostgreSQL 与共享 Go 缓存在后续验证结束前保留。没有修改生产环境。
+结构化统计、日志摘要与边界见 [验证证据](evidence/kubernetes/review-progress/verification.json)。已精确删除 9 个完成检查的 root 工作树或源码副本；另有固定检查脚本自行清理的目录。专用 PostgreSQL 与共享 Go 缓存在后续验证结束前保留。没有修改生产环境。
