@@ -420,7 +420,7 @@ async function applyCooldown(scheduler, selected, policy, model, { diagnosticPin
   if (diagnosticPin && (policy.reason === 'oauth_no_refresh' || policy.reason === 'oauth_revoked')) {
     return
   }
-  await scheduler.markCooldown(selected, {
+  const applied = await scheduler.markCooldown(selected, {
     until:
       policy.action === 'disable' || policy.reason === 'oauth_no_refresh' || policy.reason === 'oauth_revoked'
         ? Number.MAX_SAFE_INTEGER
@@ -433,12 +433,14 @@ async function applyCooldown(scheduler, selected, policy, model, { diagnosticPin
         ? 'disabled'
         : 'cooldown',
   })
+  if (applied === false) return false
   // A 5xx pause, an RPM cooldown, or an unproven bare 429 keeps the
   // conversation pin: other seats absorb this turn. Quota and auth move
   // every conversation off the unit, windows included (#163).
   if (policy.scope === 'account' && policy.action !== 'pause' && !SOFT_COOLDOWN_REASONS.has(policy.reason)) {
     await scheduler.releaseAccountSessions?.({ accountId: selected?.accountId, vmId: selected?.vmId })
   }
+  return true
 }
 
 export class FailoverRunner {
@@ -1091,11 +1093,11 @@ export class FailoverRunner {
             requestBody = repairAnthropicRequest(requestBody, policy)
             continue
           }
-          await applyCooldown(this.scheduler, selected, policy, model, {
+          const cooldownApplied = await applyCooldown(this.scheduler, selected, policy, model, {
             diagnosticPin: !!pinVmId,
             observation: result?.accountObservation,
           })
-          if (!pinVmId && isCredentialDeath(policy)) {
+          if (cooldownApplied !== false && !pinVmId && isCredentialDeath(policy)) {
             await this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys, versions: pinVersions })
             if (familyKey) {
               return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
@@ -1226,11 +1228,11 @@ export class FailoverRunner {
           if (unknownExecution || committed || !shouldContinue(policy)) {
             return { ...result, ...attribution(), finalState: result.terminalState, policy }
           }
-          await applyCooldown(this.scheduler, selected, policy, model, {
+          const cooldownApplied = await applyCooldown(this.scheduler, selected, policy, model, {
             diagnosticPin: !!pinVmId,
             observation: result?.accountObservation,
           })
-          if (!pinVmId && isCredentialDeath(policy)) {
+          if (cooldownApplied !== false && !pinVmId && isCredentialDeath(policy)) {
             await this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys, versions: pinVersions })
             if (familyKey) {
               return { ...result, ...attribution(), finalState: result.terminalState, policy }

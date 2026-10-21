@@ -1836,14 +1836,27 @@ export class PoolScheduler extends EventEmitter {
   }
 
   markCooldown(candidate, { until, reason, model = null, status = 'cooldown', observation } = {}) {
-    this.runtimeRepo?.markCooldown?.(candidate.accountId, {
+    const options = {
       vmId: candidate.vmId,
       until,
       reason,
       model: model ? normalizeModel(model) : null,
       status,
       observation,
-    })
+    }
+    if (this.shared) {
+      return this.runtimeRepo.markCooldownCommitted(candidate.accountId, options).then(({ applied }) => {
+        if (!applied) return false
+        this.applyCooldownEffects(candidate, { until, reason, model })
+        return true
+      })
+    }
+    this.runtimeRepo?.markCooldown?.(candidate.accountId, options)
+    this.applyCooldownEffects(candidate, { until, reason, model })
+    return true
+  }
+
+  applyCooldownEffects(candidate, { until, reason, model }) {
     if (isAuthCooldownReason(reason) && this.projectRoot && candidate.vmId) {
       try {
         markVmAuthCooldown(vmJsonPath(this.projectRoot, candidate.vmId), {
