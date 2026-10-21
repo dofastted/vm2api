@@ -6,7 +6,7 @@ import path from 'node:path'
 import { EventEmitter } from 'node:events'
 import { bindPlacement, unbindPlacement } from '../../src/lib/cluster/placement.mjs'
 import { queueSlotPush } from '../../src/lib/cluster/remote-slot-files.mjs'
-import { writeKernelConfig } from '../../src/lib/transport/rust-kernel-supervisor.mjs'
+import { writeKernelConfig, syncClaudeKernelConfigs } from '../../src/lib/transport/rust-kernel-supervisor.mjs'
 import { SharedVmOperations } from '../../src/lib/vm/shared-vm-operations.mjs'
 import { getDb } from '../../src/lib/db/database.mjs'
 import { createRepositoryTestDatabase } from '../repository-database.mjs'
@@ -86,6 +86,7 @@ async function fixture(t) {
     peer,
     started,
     finish,
+    finishFirst: (error) => waiting.shift()(error),
     writes,
     operations: new SharedVmOperations(db),
     other: new SharedVmOperations(peer),
@@ -173,4 +174,36 @@ test('panel timezone publication completes before HTTP success and VM claim rele
     await request
   }
   assert.equal(response.status, 200)
+})
+
+test('a fleet config publication waits for every original push before reporting one failure', async (t) => {
+  const f = await fixture(t)
+  const second = { ...f.vm, id: 'vm-second' }
+  fs.mkdirSync(path.join(f.root, 'vms', second.id, 'run'), { recursive: true })
+  fs.writeFileSync(path.join(f.root, 'vms', second.id + '.json'), JSON.stringify(second))
+  const result = syncClaudeKernelConfigs(f.root, {})
+  let ended = false
+  const publication = result.publication.then(
+    () => {
+      ended = true
+    },
+    (error) => {
+      ended = true
+      throw error
+    },
+  )
+  publication.catch(() => {})
+  try {
+    await f.started
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(f.writes.length, 2)
+    f.finishFirst(new Error('synthetic first publication disconnect'))
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(ended, false)
+  } finally {
+    f.finish()
+  }
+  await assert.rejects(publication, { code: 'sftp_failed' })
+  assert.equal(ended, true)
+  assert.equal(JSON.stringify(result).includes('publication'), false)
 })

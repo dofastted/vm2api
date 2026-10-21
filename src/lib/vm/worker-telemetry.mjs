@@ -74,8 +74,8 @@ export function touchTelemetrySession(projectRoot, vmId, vm = null) {
   } catch {
     return { wrote: false }
   }
-  slotHost(vm).touch(vm, path.join(projectRoot, 'vms', vmId))
-  return { wrote: true }
+  const publication = slotHost(vm).touch(vm, path.join(projectRoot, 'vms', vmId))
+  return { wrote: true, publication }
 }
 function officialInstallTime(homeDir) {
   if (!homeDir) return ''

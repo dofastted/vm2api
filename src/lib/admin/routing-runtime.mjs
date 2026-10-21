@@ -521,8 +521,10 @@ export function createRoutingRuntime(ctx) {
     return Object.prototype.hasOwnProperty.call(inference, 'session_idle_ttl_seconds')
   }
 
-  function syncKernelPanelConfig(routingConfig) {
-    return syncClaudeKernelConfigs(ctx.cfg.paths.project, routingConfig)
+  async function syncKernelPanelConfig(routingConfig) {
+    const result = syncClaudeKernelConfigs(ctx.cfg.paths.project, routingConfig)
+    await result.publication
+    return result
   }
 
   // kernel.json hot-reloads, but the job watchdog reads its idle limit from env at start.
@@ -539,8 +541,8 @@ export function createRoutingRuntime(ctx) {
   }
 
   // The sidecar re-reads worker.json on mtime change, so a rewrite applies without a restart.
-  // Node slots read a pushed copy; that push is queued and only logged on failure.
-  function syncTelemetryUploadInterval(routingConfig) {
+  // Node slots read a pushed copy; the original push must finish before applying returns.
+  async function syncTelemetryUploadInterval(routingConfig) {
     const project = ctx.cfg.paths.project
     const applied = { updated: 0, queued: 0, skipped: 0, failed: [] }
     for (const { id } of listVms(project)) {
@@ -551,10 +553,14 @@ export function createRoutingRuntime(ctx) {
           applied.skipped += 1
           continue
         }
-        if (slotHost(vm).queueSyncRun(vm, path.join(project, 'vms', vm.id))) applied.queued += 1
-        else applied.updated += 1
-      } catch {
+        const publication = slotHost(vm).queueSyncRun(vm, path.join(project, 'vms', vm.id))
+        if (publication) {
+          await publication
+          applied.queued += 1
+        } else applied.updated += 1
+      } catch (error) {
         applied.failed.push(vm.id)
+        throw error
       }
     }
     return applied
@@ -661,12 +667,14 @@ export function createRoutingRuntime(ctx) {
       inferenceTouchesKernel(body.inference) ||
       idleChanged ||
       requestBytesChanged
-        ? syncKernelPanelConfig(routingConfig)
+        ? await syncKernelPanelConfig(routingConfig)
         : null
     // Stream idle / body-limit still need an idle restart; CCH and sticky-slot TTL hot-read kernel.json.
     const kernelReload = idleChanged || requestBytesChanged ? reloadClaudeKernelsWhenIdle(routingConfig) : 0
     const telemetrySync =
-      telemetryUploadInterval(routingConfig) !== prevUploadInterval ? syncTelemetryUploadInterval(routingConfig) : null
+      telemetryUploadInterval(routingConfig) !== prevUploadInterval
+        ? await syncTelemetryUploadInterval(routingConfig)
+        : null
     // Pool and failover settings hot-reload into the live scheduler and runner.
     // Rebuilding them would drop the seat book and queues while their requests
     // still run (the panel sends `failover` with every routing save).

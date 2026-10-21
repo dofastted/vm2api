@@ -989,7 +989,9 @@ export async function finalizeOfficialCcTelemetry(
   let touched = false
   if (tel.enabled) {
     try {
-      touched = !!touchTelemetrySession(projectRoot, vmId).wrote
+      const touch = touchTelemetrySession(projectRoot, vmId)
+      await touch.publication
+      touched = !!touch.wrote
     } catch {
       uncertain = true
     }

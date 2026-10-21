@@ -524,7 +524,7 @@ async function syncInstalledKernels({
         continue
       }
       if (resolveInferenceEngine(vm, routingConfig) !== 'rust') continue
-      writeKernelConfig(project, vm, { routing: routingConfig, timezone: vm.timezone })
+      await writeKernelConfig(project, vm, { routing: routingConfig, timezone: vm.timezone })?.publication
       const exec = slotExec(project, vm)
       item.kernel = await effect(item.id, () => restartRustKernel(exec)).catch((e) => ({
         ok: false,
@@ -1212,7 +1212,7 @@ export function createPanelHandler(ctx) {
             return { ok: false, id, code: laid.code || 'dataplane_materialize_failed', error: laid.error }
           }
         }
-        writeKernelConfig(cfg.paths.project, saved, { routing: ctx.routingConfig })
+        await writeKernelConfig(cfg.paths.project, saved, { routing: ctx.routingConfig })?.publication
         if (previousDataplane !== targetDataplane && saved.status === 'running') {
           const exec = slotExec(cfg.paths.project, saved)
           const restarted = await restartRustKernel(exec).catch((e) => ({
@@ -1253,13 +1253,15 @@ export function createPanelHandler(ctx) {
     }
   }
 
-  function projectSlotKernelConfig(vm) {
+  async function projectSlotKernelConfig(vm) {
     if (!vm?.id || isCodexVm(vm)) return null
     const full = getVm(cfg.paths.project, vm.id) || vm
-    return writeKernelConfig(cfg.paths.project, full, {
+    const written = writeKernelConfig(cfg.paths.project, full, {
       routing: ctx.routingConfig,
       timezone: full.timezone,
     })
+    await written?.publication
+    return written
   }
 
   async function restoreRoutingRuntime(previous) {
@@ -3145,14 +3147,14 @@ export function createPanelHandler(ctx) {
           if (hasTimezone) {
             const vm = persistVmTimezone(cfg.paths.project, id, timezoneSync.timezone, { source: 'manual' })
             if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-            const kernel = projectSlotKernelConfig(vm)
+            const kernel = await projectSlotKernelConfig(vm)
             timezoneSync.applied = true
             timezoneSync.kernel_hot = kernel?.changed === true
           } else if (followProxyTz) {
             const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, { force: true })
             timezoneSync = { applied: synced.applied, timezone: synced.timezone, source: 'proxy_geo' }
             if (synced.applied) {
-              const kernel = projectSlotKernelConfig({ id })
+              const kernel = await projectSlotKernelConfig({ id })
               timezoneSync.kernel_hot = kernel?.changed === true
             }
           }
@@ -4070,7 +4072,7 @@ export function createPanelHandler(ctx) {
           }
           const wrap = materializeWrapCli(cfg.paths.project, vm)
           if (!wrap.ok) return json(res, 400, { ok: false, error: { code: wrap.code, message: wrap.error } })
-          writeKernelConfig(cfg.paths.project, vm, { routing: ctx.routingConfig })
+          await writeKernelConfig(cfg.paths.project, vm, { routing: ctx.routingConfig })?.publication
 
           let kernel = { ok: false, skipped: true, reason: 'engine_not_rust' }
           if (resolveInferenceEngine(vm, ctx.routingConfig) === 'rust') {

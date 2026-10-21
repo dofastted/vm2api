@@ -49,7 +49,12 @@ export const LAUNCHD_GUI_REQUIRED =
 
 function failure(err, fallbackCode = 'native_slot_failed') {
   const code = err?.code && typeof err.code === 'string' ? err.code : fallbackCode
-  return { ok: false, code, error: String(err?.message || err).slice(0, 500) }
+  return {
+    ok: false,
+    code,
+    error: String(err?.message || err).slice(0, 500),
+    ...(err?.vmOperationUncertain ? { vmOperationUncertain: true } : {}),
+  }
 }
 
 export function nativeLabels(vmId) {
@@ -400,7 +405,8 @@ async function configureSlot(vm, projectRoot, routing) {
   const slotDir = path.join(projectRoot, 'vms', vm.id)
   await prepareSlotTree(session, p)
   const relays = await clusterManager().ensureSlotRelays(nodeId, vm.id)
-  writeWorkerFiles(vm, projectRoot, { transparent: true, routing })
+  const worker = writeWorkerFiles(vm, projectRoot, { transparent: true, routing })
+  await worker?.publication
   ensureGuestMachineIdFile(projectRoot, vm)
   await pushSlotFiles(vm, slotDir, ['run', 'seed'], session)
   await reconcileSlotCredentials(vm, slotDir, session)

@@ -87,7 +87,12 @@ const LIVE_BIN_GUEST = '/opt/kin-guest/opt/kin-live'
 const LIVE_SERVICE_MOUNT_DESTINATIONS = Object.freeze([LIVE_BIN, LIVE_BIN_GUEST])
 
 function failure(err, fallbackCode = 'remote_slot_failed') {
-  return { ok: false, code: err?.code || fallbackCode, error: String(err?.message || err) }
+  return {
+    ok: false,
+    code: err?.code || fallbackCode,
+    error: String(err?.message || err),
+    ...(err?.vmOperationUncertain ? { vmOperationUncertain: true } : {}),
+  }
 }
 
 const MIGRATION_CONFIG_KEYS = Object.freeze([
@@ -1065,7 +1070,8 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
       await removeContainer(session.docker, name)
       existing = null
     }
-    writeWorkerFiles(vm, projectRoot, { transparent: true, routing })
+    const worker = writeWorkerFiles(vm, projectRoot, { transparent: true, routing })
+    await worker?.publication
     ensureGuestMachineIdFile(projectRoot, vm)
     await pushSlotFiles(vm, slotDir, ['run', 'seed'], session)
     if (!existing) await migrateClaudeDir(session, vm, remoteDir)
@@ -1123,7 +1129,8 @@ export async function reloadRemoteSlot(vm, projectRoot, { routing } = {}) {
       return startRemoteSlot(vm, projectRoot, { recreate: !!existing, routing })
     }
     const relays = await clusterManager().ensureSlotRelays(nodeId, vm.id)
-    writeWorkerFiles(vm, projectRoot, { transparent: true, routing })
+    const worker = writeWorkerFiles(vm, projectRoot, { transparent: true, routing })
+    await worker?.publication
     await pushSlotFiles(vm, slotDir, ['run', 'seed'], session)
     await reconcileSlotCredentials(vm, slotDir, session)
     const running = !!existing.State?.Running

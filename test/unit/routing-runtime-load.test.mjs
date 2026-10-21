@@ -447,7 +447,7 @@ test('persistRoutingPatch merges a valid vm patch', async () => {
   }
 })
 
-test('persistRoutingPatch rewrites Claude worker.json when the upload interval changes', async (t) => {
+test('persistRoutingPatch reports a failed remote publication after rewriting the upload interval', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-telemetry-'))
   const vms = path.join(root, 'vms')
   const routingFile = path.join(root, 'routing.json')
@@ -471,14 +471,16 @@ test('persistRoutingPatch rewrites Claude worker.json when the upload interval c
   t.mock.method(console, 'warn', (line) => warned.push(String(line)))
   try {
     const runtime = persistHarness(root, routingFile, routingConfig)
-    const changed = await runtime.persistRoutingPatch({ telemetry: { upload_interval_seconds: 3600 } })
-    assert.deepEqual(changed.telemetry_sync, { updated: 1, queued: 1, skipped: 0, failed: [] })
+    await assert.rejects(runtime.persistRoutingPatch({ telemetry: { upload_interval_seconds: 3600 } }), {
+      code: 'cluster_unavailable',
+      vmOperationUncertain: true,
+      executionUncertain: true,
+    })
     assert.equal(JSON.parse(fs.readFileSync(routingFile, 'utf8')).telemetry.upload_interval_seconds, 3600)
     assert.equal(worker('vm-claude').upload_interval_seconds, 3600)
     assert.equal(worker('vm-node').upload_interval_seconds, 3600)
     assert.equal(worker('vm-codex'), undefined)
-    // No cluster in the test: the queued push for the node slot runs, fails, and is only logged.
-    for (let i = 0; i < 50 && !warned.length; i++) await new Promise((r) => setTimeout(r, 10))
+    // The synthetic node has no cluster; logging does not consume the caller's rejection.
     const push = JSON.parse(warned.find((line) => line.includes('remote_slot_push_failed')))
     assert.equal(push.vm_id, 'vm-node')
     assert.deepEqual(push.sets, ['run'])

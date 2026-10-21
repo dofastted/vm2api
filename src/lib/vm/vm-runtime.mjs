@@ -426,6 +426,7 @@ export async function reloadSlotWorker(vm, projectRoot, { routing } = {}) {
     }
     worker = paths
   }
+  await worker?.publication
   const existing = inspectContainer(name)
   if (!existing) return await startVmRuntime(vm, projectRoot, { recreate: false, routing })
   // Before the KVM branch so a runner on the wrong kin-eg-* is recreated too.
@@ -571,6 +572,7 @@ export function writeWorkerFiles(vm, projectRoot, { transparent, routing } = {})
   replaceSlotOwnedFile(paths.config, JSON.stringify(workerConfig, null, 2) + '\n', vm)
   const allowed = assertCliHopAllowed(vm, resolvedRouting)
   if (!allowed.ok) throw new Error(allowed.error)
+  ensureSlotClaudeOwnership(path.join(projectRoot, 'vms', vm.id, 'cli-home'), uid, gid)
   const kernel = writeKernelConfig(projectRoot, vm, {
     token,
     proxyUrl,
@@ -583,8 +585,7 @@ export function writeWorkerFiles(vm, projectRoot, { transparent, routing } = {})
   chownSlotRuntimeFile(paths.token, vm)
   chownSlotRuntimeFile(paths.config, vm)
   if (kernel?.configPath) chownSlotRuntimeFile(kernel.configPath, vm)
-  ensureSlotClaudeOwnership(path.join(projectRoot, 'vms', vm.id, 'cli-home'), uid, gid)
-  return { ...paths, kernelSocket: kernel?.socketPath || paths.kernelSocket }
+  return { ...paths, kernelSocket: kernel?.socketPath || paths.kernelSocket, publication: kernel?.publication }
 }
 
 /** Running slots survive Node deploy. Only an explicit recreate or a crash-looping container may docker rm -f. */
@@ -981,6 +982,7 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
   } catch (error) {
     return { ok: false, error: String(error.message || error) }
   }
+  await worker?.publication
   try {
     fs.chownSync(home, runtimeUidNum(vm), Number(GID))
   } catch {}

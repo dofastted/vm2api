@@ -20,7 +20,7 @@
  *                   host's default route (or the deployment proxy of a Codex slot); a node
  *                   slot gets a loopback SOCKS5 that dials from the node itself
  *   syncRun(vm, slotDir)        publish run/ (kernel.json, worker.json, token) where the slot reads it
- *   queueSyncRun(vm, slotDir)   fire-and-forget syncRun
+ *   queueSyncRun(vm, slotDir)   serialized syncRun; callers must await the returned Promise
  *   onImport(vm, slotDir)       an imported credential replaces the slot's copy
  *   afterRefresh(vm, slotDir)   the slot rotated its credential; mirror it back
  *   touch(vm, slotDir)          telemetry activity mark
@@ -64,7 +64,6 @@ import { ClusterError } from '../cluster/ssh-link.mjs'
 import {
   pullSlotCredentials,
   pushSlotCredentials,
-  pushSlotFiles,
   pushTelemetryTouch,
   queueSlotPush,
 } from '../cluster/remote-slot-files.mjs'
@@ -156,7 +155,7 @@ function nodeHost(nodeId) {
     destroy: (vm) => destroyRemoteSlot(vm),
     setProxyEgressEnabled: (vm, projectRoot, enabled) => setRemoteProxyEgressEnabled(vm, projectRoot, enabled),
     localExitProxyUrl: () => nodeEgressProxyUrl(nodeId),
-    syncRun: (vm, slotDir) => pushSlotFiles(vm, slotDir, ['run']),
+    syncRun: (vm, slotDir) => queueSlotPush(vm, slotDir, ['run']),
     queueSyncRun: (vm, slotDir) => queueSlotPush(vm, slotDir, ['run']),
     onImport: (vm, slotDir) => pushSlotCredentials(vm, slotDir),
     afterRefresh: (vm, slotDir) => pullSlotCredentials(vm, slotDir),
