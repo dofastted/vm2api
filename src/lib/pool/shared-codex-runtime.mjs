@@ -4,6 +4,7 @@ import { SharedSessionTurns } from './shared-session-turns.mjs'
 import { readCodexAccounts } from '../vm/codex-slot.mjs'
 import { normalizeOpenAIQuotaPolicy } from './openai-quota-policy.mjs'
 import { getSharedRoutingState } from '../admin/shared-routing-config.mjs'
+import { withRefreshAdmission } from '../oauth/shared-credential-refresh.mjs'
 
 function identityError() {
   return Object.assign(new Error('Shared Codex execution requires exactly one account with chatgpt_account_id'), {
@@ -108,6 +109,10 @@ export class SharedCodexRuntime {
   }
 
   async invoke(lease, hop, args) {
+    return withRefreshAdmission(this.db, lease, () => this._invoke(lease, hop, args))
+  }
+
+  async _invoke(lease, hop, args) {
     let bound = false
     let completed = false
     try {
@@ -126,7 +131,7 @@ export class SharedCodexRuntime {
         },
       })
       const notStarted = result?.execution?.started === false && result?.execution?.ended === true && !bound
-      if ((!bound || !completed || result?.execution?.ended !== true) && !notStarted) {
+      if (result?.executionUncertain || ((!bound || !completed || result?.execution?.ended !== true) && !notStarted)) {
         await lease.markUncertain()
         if (result) result.executionUncertain = true
       }

@@ -34,6 +34,7 @@ import {
 } from '../core/errors.mjs'
 import { extraHeadersFromLimitError } from '../pool/quota-window.mjs'
 import { SlotgateClient } from './slotgate-client.mjs'
+import { credentialGeneration } from '../oauth/shared-credential-refresh.mjs'
 
 const MAX_BODY = 64 * 1024 * 1024
 const credentialRefreshTail = new Map()
@@ -1119,7 +1120,7 @@ export async function workerHealth(exec, { timeoutMs = 3000, signal } = {}) {
   }
 }
 
-export async function ensureWorkerCredential(exec, { force = false } = {}) {
+export async function ensureWorkerCredential(exec, { force = false, ...refreshOptions } = {}) {
   if (isCrsMock()) {
     return {
       ok: true,
@@ -1201,7 +1202,14 @@ export async function ensureWorkerCredential(exec, { force = false } = {}) {
         credential: credentialSummary(live, liveNow),
       }
     }
-    const result = await runSlotOauth(exec, 'refresh', { force: !!force })
+    const result = await runSlotOauth(exec, 'refresh', {
+      ...refreshOptions,
+      expectedGeneration:
+        refreshOptions.expectedGeneration === undefined
+          ? credentialGeneration(credential)
+          : refreshOptions.expectedGeneration,
+      force: !!force,
+    })
     const body = result?.body || {}
     const refreshedCredential = readWorkerCredentialFile(exec.homeDir)
     const mapped = {
@@ -1211,6 +1219,9 @@ export async function ensureWorkerCredential(exec, { force = false } = {}) {
       refresh_class: result?.ok ? (body.refreshed ? 'rotated' : 'already_fresh') : undefined,
       credential: result?.ok ? credentialSummary({ ...(refreshedCredential || {}), ...body }, Date.now()) : undefined,
       error: result?.ok ? undefined : body.error,
+      attemptFinished: result?.attemptFinished === true,
+      ...(result?.credentialRefreshUnknown ? { credentialRefreshUnknown: true } : {}),
+      ...(result?.transportError ? { transportError: true } : {}),
     }
     if (!mapped.ok) mapped.refresh_class = classifyCredentialRefresh(mapped)
     return mapped

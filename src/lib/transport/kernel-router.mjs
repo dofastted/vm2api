@@ -176,6 +176,7 @@ function credentialEnsureFailure(result, ensured) {
       },
     },
     credential_ensure_failed: true,
+    ...(ensured?.credentialRefreshUnknown ? { executionUncertain: true } : {}),
   }
 }
 

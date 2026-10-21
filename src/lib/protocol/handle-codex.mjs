@@ -5,6 +5,8 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import fetch from 'node-fetch'
 import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { refreshSharedCodexCredential } from '../oauth/shared-codex-refresh.mjs'
+import { credentialGeneration, currentRefreshAdmission } from '../oauth/shared-credential-refresh.mjs'
 import { SharedCodexRuntime } from '../pool/shared-codex-runtime.mjs'
 import { getVm, listVms, persistCodexUsage, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { isValidVmId } from '../vm/vm-file.mjs'
@@ -1217,8 +1219,23 @@ function searchCredentials(projectRoot, vm) {
  * refresh token on its own, so first adopt a token it wrote meanwhile; otherwise refresh
  * once per slot, shared by concurrent callers.
  */
-async function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl, refresh }) {
+async function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl, refresh, expectedGeneration }) {
   const now = searchCredentials(projectRoot, vm)
+  if (isKubernetesMode()) {
+    const result = await refreshSharedCodexCredential({
+      projectRoot,
+      vm,
+      proxyUrl,
+      fetchImpl,
+      refresh,
+      expectedGeneration,
+      db: currentRefreshAdmission()?.db,
+    })
+    return {
+      access: result.finished && result.value?.ok ? result.current.credential.access_token : '',
+      unknown: result.unknown,
+    }
+  }
   if (now.access && now.access !== usedAccess) return now.access
   if (!now.refresh) return ''
   let pending = searchRefreshes.get(vm.id)
@@ -1322,7 +1339,14 @@ async function postCodexSearch({
   if (!creds.access && !creds.refresh) return { status: 0, error: 'no_oauth_token', execution: notStarted }
   let out = creds.access ? await send(creds.access) : { status: 401, execution: notStarted }
   if ((out.status === 401 || out.status === 403) && !signal?.aborted) {
-    const access = await refreshSearchAccess(projectRoot, vm, creds.access, { proxyUrl, fetchImpl, refresh })
+    const refreshed = await refreshSearchAccess(projectRoot, vm, creds.access, {
+      proxyUrl,
+      fetchImpl,
+      refresh,
+      expectedGeneration: credentialGeneration(creds.first),
+    })
+    if (refreshed?.unknown) return { ...out, executionUncertain: true, error: 'credential_refresh_unknown' }
+    const access = typeof refreshed === 'string' ? refreshed : refreshed?.access
     if (access) out = await send(access)
   }
   return out

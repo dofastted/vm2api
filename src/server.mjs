@@ -769,13 +769,29 @@ function publicCredentialRefreshResult(vmId, result, { force = false } = {}) {
 
 async function refreshWorkerCredentialForVm({ vmId, vmPath, homeDir, vm, force = false }) {
   // Host RefreshIfNeeded is the credential writer. Slot workers only read AT.
-  const result = await ensureWorkerCredential({ vmId, vm, homeDir }, { force: !!force })
+  const result = await ensureWorkerCredential(
+    { vmId, vm, homeDir },
+    {
+      force: !!force,
+      ...(kubernetesMode
+        ? {
+            publishCredential: async () => {
+              mirrorWorkerCredentialsToVm(vmPath, homeDir, { acceptLiveGrant: true })
+              await flushVmDbSync()
+              invalidateLiveCredentialCache()
+            },
+          }
+        : {}),
+    },
+  )
 
   const published = publicCredentialRefreshResult(vmId, result, { force })
   if (result.ok) {
-    try {
-      mirrorWorkerCredentialsToVm(vmPath, homeDir, { acceptLiveGrant: true })
-    } catch {}
+    if (!kubernetesMode) {
+      try {
+        mirrorWorkerCredentialsToVm(vmPath, homeDir, { acceptLiveGrant: true })
+      } catch {}
+    }
     try {
       invalidateLiveCredentialCache()
     } catch {}

@@ -127,7 +127,7 @@ async function runSharedSlotOauth(db, exec, op, options) {
         platform: 'claude',
         vmId,
         accountId,
-        expectedGeneration: options.expectedGeneration || current.generation,
+        expectedGeneration: options.expectedGeneration === undefined ? current.generation : options.expectedGeneration,
         admission,
       },
       {
@@ -168,12 +168,12 @@ async function runSharedSlotOauth(db, exec, op, options) {
       new SharedVmOperations(db).run(
         vmId,
         async () => {
-        entered = true
-        result = await runSlotOauthRaw(exec, op, options)
-        if (result?.attemptFinished === true && exec.homeDir)
-          await slotHost(exec.vm).afterRefresh(exec.vm, path.dirname(exec.homeDir))
-        await flushVmDbSync()
-        finished = result?.attemptFinished === true
+          entered = true
+          result = await runSlotOauthRaw(exec, op, options)
+          if (result?.attemptFinished === true && exec.homeDir)
+            await slotHost(exec.vm).afterRefresh(exec.vm, path.dirname(exec.homeDir))
+          await flushVmDbSync()
+          finished = result?.attemptFinished === true
           return { ...result, vmOperationUncertain: result?.attemptFinished !== true }
         },
         { kind: `oauth_${op}`, accountId, admission },

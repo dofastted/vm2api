@@ -317,6 +317,43 @@ test('an uncertain Search token refresh retains its original admission and both 
   })
 })
 
+test('Search adopts a generation published while its unauthorized HTTP job was in flight', async (t) => {
+  let fixtureRoot
+  const fx = await fixture(t, (_req, res, count) => {
+    if (count === 1) {
+      fs.writeFileSync(
+        path.join(fixtureRoot, 'vms', vmId, 'codex-credentials.json'),
+        JSON.stringify({
+          accounts: [
+            {
+              id: 'synthetic-account',
+              access_token: 'synthetic-adopted-access',
+              refresh_token: 'synthetic-adopted-refresh',
+              chatgpt_account_id: 'synthetic-search-account',
+            },
+          ],
+        }),
+      )
+      return answer(res, 401)
+    }
+    return answer(res)
+  })
+  fixtureRoot = fx.root
+  await withDatabaseActivities([fx.db, fx.other], async () => {
+    let refreshes = 0
+    const result = await fx.run({
+      refresh: async () => {
+        refreshes++
+        return { ok: false, attemptFinished: true }
+      },
+    })
+    assert.equal(result.res.statusCode, 200)
+    assert.equal(refreshes, 0)
+    assert.equal(fx.calls[1].headers.authorization, 'Bearer synthetic-adopted-access')
+    assert.equal((await fx.counts()).accountInflight, 0)
+  })
+})
+
 for (const phase of ['timeout', 'cancel']) {
   test(`Search ${phase} after response headers retains its job and capacity`, async (t) => {
     let timer

@@ -17,9 +17,12 @@ export async function withRefreshAdmission(db, admission, callback) {
   }
 }
 
-export function currentRefreshAdmission(db = getDb()) {
+export function currentRefreshAdmission(db = null) {
   const context = admissionContext.getStore()
-  if (!context?.active || context.db.schema !== db.schema || context.db.connectionString !== db.connectionString)
+  if (
+    !context?.active ||
+    (db && (context.db.schema !== db.schema || context.db.connectionString !== db.connectionString))
+  )
     return null
   return context.admission
 }

@@ -23,6 +23,8 @@ import { AttemptCoordinator } from './unit-decision.mjs'
 import { SOFT_COOLDOWN_REASONS } from './pool-scheduler.mjs'
 import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 import { SharedSessionTurns } from './shared-session-turns.mjs'
+import { getDb } from '../db/database.mjs'
+import { withRefreshAdmission } from '../oauth/shared-credential-refresh.mjs'
 
 // Seat wait for the one-shot repair hop when the rejected hop already spent the deadline.
 const REPAIR_HOP_WAIT_MS = 30_000
@@ -519,9 +521,21 @@ export class FailoverRunner {
     const beforeRefresh = String(before?.refresh_token || '')
     let refreshed
     try {
-      refreshed = await ensureWorkerCredential(exec, { force: true })
+      refreshed = await this.withCredentialAdmission(selected, () => ensureWorkerCredential(exec, { force: true }))
     } catch (error) {
+      if (selected.bindExecution) {
+        await selected.markUncertain()
+        error.executionUncertain = true
+        throw error
+      }
       refreshed = { ok: false, error: { message: String(error?.message || error) } }
+    }
+    if (selected.bindExecution && refreshed?.credentialRefreshUnknown) {
+      await selected.markUncertain()
+      throw Object.assign(new Error('credential refresh termination is unknown'), {
+        code: 'credential_refresh_unknown',
+        executionUncertain: true,
+      })
     }
     const after = readWorkerCredentialFile(exec.homeDir)
     const afterRefresh = String(after?.refresh_token || '')
@@ -538,6 +552,12 @@ export class FailoverRunner {
       reason: 'oauth_refresh_failed',
       cooldownUntil: null,
     }
+  }
+
+  withCredentialAdmission(selected, callback) {
+    if (!selected?.admissionId) return withRefreshAdmission(null, null, callback)
+    const db = this.scheduler?.executionAdmissions?.db || this.scheduler?.accountQuota?.db || getDb()
+    return withRefreshAdmission(db, selected, callback)
   }
 
   async forgetCredential(selected, policy, { familyKey = null, sessionKeys = [], versions = null } = {}) {
@@ -962,20 +982,22 @@ export class FailoverRunner {
             if (!bound) return stickyConflict()
           }
           callEntered = true
-          result = await callAttempt({
-            candidate: selected,
-            body,
-            attemptMeta,
-            attemptNo,
-            stream,
-            deliveryMode: deliveryMode || this.config.delivery_mode,
-            signal,
-            onCommit: () => {
-              committed = true
-            },
-          })
+          result = await this.withCredentialAdmission(selected, () =>
+            callAttempt({
+              candidate: selected,
+              body,
+              attemptMeta,
+              attemptNo,
+              stream,
+              deliveryMode: deliveryMode || this.config.delivery_mode,
+              signal,
+              onCommit: () => {
+                committed = true
+              },
+            }),
+          )
           executionEnded = result?.execution?.ended === true
-          if (selected.bindExecution && !executionEnded) {
+          if (selected.bindExecution && (!executionEnded || result?.executionUncertain)) {
             await selected.markUncertain()
             unknownExecution = true
             if (result) result.executionUncertain = true
