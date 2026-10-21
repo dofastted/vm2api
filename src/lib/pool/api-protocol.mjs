@@ -88,6 +88,7 @@ export async function runApiInference(options = {}) {
     result = await runApiInferenceBody(options, lifecycle)
   } catch (error) {
     if (lifecycle.startFailed) throw lifecycle.startError
+    if (!lifecycle.startedHook) throw error
     result = {
       ok: false,
       status: 502,
