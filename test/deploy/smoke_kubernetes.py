@@ -43,8 +43,10 @@ http.createServer(async(req,res)=>{
   const event=(type,data)=>res.write(`event: ${type}\ndata: ${JSON.stringify({type,...data})}\n\n`);
   event('message_start',{message});
   event('content_block_start',{index:0,content_block:{type:'text',text:''}});
+  const split=Math.floor(proof.length/2);
+  event('content_block_delta',{index:0,delta:{type:'text_delta',text:proof.slice(0,split)}});
   setTimeout(()=>{
-    event('content_block_delta',{index:0,delta:{type:'text_delta',text:proof}});
+    event('content_block_delta',{index:0,delta:{type:'text_delta',text:proof.slice(split)}});
     event('content_block_stop',{index:0});
     event('message_delta',{delta:{stop_reason:'end_turn',stop_sequence:null},usage:{output_tokens:3}});
     event('message_stop',{});res.end();
@@ -157,6 +159,9 @@ class Smoke:
         config['data']['KIN_BACKUP_DISABLED'] = '1'
         self.apply(*resources)
         self.kubectl('rollout', 'status', 'deployment/vm2api', '--timeout=240s', timeout=255)
+        pods = json.loads(self.kubectl('get', 'pods', '-l', 'app.kubernetes.io/name=vm2api', '-o', 'json').stdout)
+        image_id = pods['items'][0]['status']['containerStatuses'][0]['imageID']
+        print(json.dumps({'event': 'pod-ready', 'namespace': self.namespace, 'image_id': image_id}), flush=True)
         self.checks.append('pod-ready')
         self.kubectl('exec', 'deployment/vm2api', '-c', 'control-plane', '--', 'node', '--input-type=module', '-e',
                      "const r=await fetch('http://vm2api:8787/readyz');if(r.status!==200)process.exit(1)")
@@ -227,16 +232,34 @@ class Smoke:
                        'x-request-id': self.proof + ('-stream' if stream else '-plain')}
             request = Request(self.base_url + '/v1/messages', headers=headers,
                               data=json.dumps({**body, 'stream': stream}).encode())
+            started = time.monotonic()
             with urlopen(request, timeout=15) as response:
                 assert response.status == 200, 'inference did not succeed'
                 if stream:
                     assert 'text/event-stream' in response.headers.get('content-type', ''), 'SSE response required'
-                    first = response.readline()
-                    first_at = time.monotonic()
-                    content = first + response.read()
-                    assert time.monotonic() - first_at >= 0.5, 'SSE frames were buffered until completion'
-                    assert b'message_stop' in content, 'SSE stream did not finish'
-                    assert self.proof.encode() in content, 'SSE response did not come from the synthetic upstream'
+                    header_ms = round((time.monotonic() - started) * 1000, 1)
+                    frames, deltas = [], []
+                    for line in response:
+                        if not line.startswith(b'data:'):
+                            continue
+                        frame = json.loads(line[5:])
+                        arrived_ms = round((time.monotonic() - started) * 1000, 1)
+                        frames.append({'type': frame['type'], 'arrived_ms': arrived_ms})
+                        if frame.get('delta', {}).get('type') == 'text_delta':
+                            deltas.append({'text': frame['delta']['text'], 'arrived_ms': arrived_ms})
+                    ended_ms = round((time.monotonic() - started) * 1000, 1)
+                    print(json.dumps({'event': 'sse-timing', 'headers_ms': header_ms,
+                                      'headers': {key: response.headers[key] for key in (
+                                          'content-type', 'cache-control', 'transfer-encoding', 'x-accel-buffering')
+                                          if key in response.headers},
+                                      'frames': frames, 'deltas': deltas, 'ended_ms': ended_ms}), flush=True)
+                    assert len(deltas) >= 2, 'two upstream text deltas required'
+                    assert deltas[-1]['arrived_ms'] - deltas[0]['arrived_ms'] >= 500, \
+                        'SSE text deltas were buffered until completion'
+                    assert ended_ms - deltas[0]['arrived_ms'] >= 500, 'SSE frames were buffered until completion'
+                    assert any(frame['type'] == 'message_stop' for frame in frames), 'SSE stream did not finish'
+                    assert ''.join(delta['text'] for delta in deltas) == self.proof, \
+                        'SSE response did not come from the synthetic upstream'
                 else:
                     content = json.loads(response.read())
                     assert any(item.get('text') == self.proof for item in content['content']), 'upstream proof missing'
