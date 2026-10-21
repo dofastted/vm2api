@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import pg from 'pg'
 import { getDb, quoteIdentifier, registerActivityCoordinator, withTransaction } from '../../src/lib/db/database.mjs'
 import { GlobalMaintenanceCoordinator, coordinationSchemaFor } from '../../src/lib/db/global-maintenance.mjs'
 import { createRepositoryTestDatabase } from '../repository-database.mjs'
@@ -22,7 +23,13 @@ async function fixture(t) {
     if (previousMode == null) delete process.env.VM2API_CONTROL_PLANE_MODE
     else process.env.VM2API_CONTROL_PLANE_MODE = previousMode
     await Promise.allSettled([first.stop(), second.stop()])
-    await peer.pool.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(coordinationSchemaFor(db.schema))} CASCADE`)
+    const cleanup = new pg.Client({ connectionString: db.connectionString })
+    await cleanup.connect()
+    try {
+      await cleanup.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(coordinationSchemaFor(db.schema))} CASCADE`)
+    } finally {
+      await cleanup.end()
+    }
     await peer.close()
   })
   const gate = await second.admit({ kind: 'orphan_recovery' })
@@ -70,7 +77,7 @@ test('upgrading old private members leaves legacy owners unproven without a vers
   await first.stop()
   await peer.pool.query(`ALTER TABLE ${first.qualified}.members DROP COLUMN owner_lock_version`)
   const fresh = new GlobalMaintenanceCoordinator(peer, { ownerId: 'new-protocol-owner' })
-  t.after(() => fresh.stop())
+  t.after(() => fresh.stop().catch(() => {}))
   await fresh.start()
   const rows = (
     await peer.pool.query(`SELECT owner_id, owner_lock_version FROM ${first.qualified}.members ORDER BY owner_id`)

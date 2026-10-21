@@ -162,10 +162,12 @@ export class GlobalMaintenanceCoordinator {
         );
         CREATE TABLE IF NOT EXISTS ${q}.members (
           owner_id text PRIMARY KEY,
+          owner_lock_version integer,
           bound_epoch bigint,
           started_at timestamptz NOT NULL DEFAULT clock_timestamp(),
           stopped_at timestamptz
         );
+        ALTER TABLE ${q}.members ADD COLUMN IF NOT EXISTS owner_lock_version integer;
         CREATE TABLE IF NOT EXISTS ${q}.activities (
           id text PRIMARY KEY,
           owner_id text NOT NULL,
@@ -211,7 +213,11 @@ export class GlobalMaintenanceCoordinator {
       try {
         await client.connect()
         this._client = client
-        await this.db.pool.query(`INSERT INTO ${this.qualified}.members(owner_id) VALUES ($1)`, [this.ownerId])
+        const lock = await client.query(TRY_EXCLUSIVE, [this._ownerResource(this.ownerId)])
+        if (!lock.rows[0].acquired) throw failure('maintenance_owner_connected', 'Owner identity is already connected')
+        await client.query(`INSERT INTO ${this.qualified}.members(owner_id,owner_lock_version) VALUES ($1,1)`, [
+          this.ownerId,
+        ])
         if (this._lost) throw failure('maintenance_connection_lost', 'Activity connection ended during startup')
         this._healthy = true
         return this
@@ -236,6 +242,33 @@ export class GlobalMaintenanceCoordinator {
       throw failure('maintenance_schema_mismatch', 'Coordination ownership record is unavailable')
     }
     return stateOf(row)
+  }
+
+  _ownerResource(ownerId) {
+    if (typeof ownerId !== 'string' || !ownerId.trim() || ownerId.length > 256) {
+      throw failure('maintenance_owner_invalid', 'Owner identity is invalid')
+    }
+    return `vm2api:owner-lifetime:${this.db.schema}:${ownerId}`
+  }
+
+  /** Proof is valid only inside this short transaction. No timestamp establishes owner loss. */
+  async lockAbsentOwner(ownerId) {
+    const scope = this.assertActivity()
+    if (!this.db.isTransaction) throw failure('maintenance_transaction_required', 'Owner proof requires a transaction')
+    const control = (await this.db.query(`SELECT phase,epoch FROM ${this.qualified}.control WHERE id=1 FOR SHARE`))
+      .rows[0]
+    if (control?.phase !== 'open' || String(control.epoch) !== String(scope.epoch)) {
+      throw failure('database_maintenance', 'Owner proof requires the current open epoch')
+    }
+    const member = (
+      await this.db.query(`SELECT owner_lock_version FROM ${this.qualified}.members WHERE owner_id=$1`, [ownerId])
+    ).rows[0]
+    if (member?.owner_lock_version !== 1) return { absent: false, reason: 'owner_protocol_unproven' }
+    const lock = await this.db.query(
+      'SELECT pg_try_advisory_xact_lock(hashtext(current_database()),hashtext($1)) AS acquired',
+      [this._ownerResource(ownerId)],
+    )
+    return lock.rows[0].acquired ? { absent: true } : { absent: false, reason: 'owner_connected' }
   }
 
   async acknowledgeEpoch(epoch) {

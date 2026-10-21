@@ -36,7 +36,7 @@ export async function lockHaRequestContext(db) {
 }
 
 /** Correlation only: closing this context never releases a lease or unknown work. */
-export async function withHaRequestContext({ db = getDb(), requestId, activity }, callback) {
+export async function withHaRequestContext({ db = getDb(), requestId, activity, recoveryKind = null }, callback) {
   if (!isKubernetesHaMode()) return callback()
   if (requests.getStore()) throw failure('ha_request_context_nested')
   const coordinator = getActivityCoordinator(db)
@@ -50,10 +50,11 @@ export async function withHaRequestContext({ db = getDb(), requestId, activity }
     throw failure('ha_request_activity_mismatch')
   if (typeof requestId !== 'string' || !requestId.trim() || requestId.length > 128)
     throw failure('ha_request_id_invalid')
+  if (recoveryKind !== null && recoveryKind !== 'claude_messages') throw failure('ha_request_recovery_kind_invalid')
   const inserted = await db
-    .prepare(`INSERT INTO ha_request_contexts(id,activity_id,activity_owner_id,activity_epoch)
-    VALUES($1,$2,$3,$4) ON CONFLICT(id) DO NOTHING RETURNING id`)
-    .get(requestId, scope.id, coordinator.ownerId, scope.epoch)
+    .prepare(`INSERT INTO ha_request_contexts(id,activity_id,activity_owner_id,activity_epoch,recovery_kind)
+    VALUES($1,$2,$3,$4,$5) ON CONFLICT(id) DO NOTHING RETURNING id`)
+    .get(requestId, scope.id, coordinator.ownerId, scope.epoch, recoveryKind)
   if (!inserted) throw failure('ha_request_context_exists')
   let active = true
   const context = Object.freeze({
