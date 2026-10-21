@@ -236,6 +236,28 @@ test('request preparation rejection safely releases the shared session turn', as
   assert.equal((await fx.runner(fx.other).run(args('next', async () => success()))).ok, true)
 })
 
+for (const failure of [
+  Object.assign(new Error('synthetic response already sent'), { code: 'response_sent' }),
+  Object.assign(new Error('synthetic rejection after entering execution'), {
+    status: 400,
+    body: { error: { code: 'invalid_cache_control' } },
+  }),
+]) {
+  test(`a ${failure.code || failure.body.error.code} exception after entering execution keeps the shared turn`, async (t) => {
+    const fx = await fixture(t)
+    const result = await fx.runner(fx.db).run(
+      args('unknown-rejection', () => {
+        throw failure
+      }),
+    )
+    assert.equal(result.executionUncertain, true)
+    const rows = await fx.rows()
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0].state, 'active')
+    assert.ok(rows[0].uncertain_at)
+  })
+}
+
 test('an exception during selected reservation release conservatively retains the shared session turn', async (t) => {
   const fx = await fixture(t)
   const failure = new Error('synthetic reservation release failure')
