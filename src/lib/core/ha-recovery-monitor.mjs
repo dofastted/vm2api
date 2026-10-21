@@ -11,6 +11,7 @@ function reportFailure(error) {
 export function createHaRecoveryMonitor({ db, coordinator, readNodeRecoveryStatus }) {
   const recovery = new HaRequestRecovery(db, { coordinator, readNodeRecoveryStatus })
   let cursor = null
+  let scanCursor = null
   let inflight = null
   let timer = null
   let generation = 0
@@ -22,6 +23,8 @@ export function createHaRecoveryMonitor({ db, coordinator, readNodeRecoveryStatu
     inflight = coordinator
       .runActivity({ kind: 'ha_request_recovery' }, async () => {
         try {
+          const scans = await coordinator.recoverHaRecoveryScans({ limit: 20, afterActivityId: scanCursor })
+          scanCursor = scans.nextCursor
           const value = await recovery.scan({ limit: 20, afterRequestId: cursor })
           cursor = value.nextCursor
           for (const result of value.results) {

@@ -2,7 +2,7 @@
 import crypto from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import pg from 'pg'
-import { quoteIdentifier } from './database.mjs'
+import { quoteIdentifier, withTransaction } from './database.mjs'
 
 const activities = new AsyncLocalStorage()
 const TRY_SHARED = 'SELECT pg_try_advisory_lock_shared(hashtext(current_database()), hashtext($1)) AS acquired'
@@ -269,6 +269,68 @@ export class GlobalMaintenanceCoordinator {
       [this._ownerResource(ownerId)],
     )
     return lock.rows[0].acquired ? { absent: true } : { absent: false, reason: 'owner_connected' }
+  }
+
+  /**
+   * This internal kind only reads historical node status. Its DB settlements are atomic transactions;
+   * it never dispatches node work or creates its own HA parent/handoff. After proven owner loss,
+   * an interrupted scan has no external mutation to await. Other activity kinds keep their claims.
+   */
+  async recoverHaRecoveryScans({ limit = 20, afterActivityId = null } = {}) {
+    const scope = this.assertActivity()
+    if (scope.kind !== 'ha_request_recovery')
+      throw failure('maintenance_scan_scope_required', 'Scanner recovery requires its own scan activity')
+    if (this.db.isTransaction)
+      throw failure('maintenance_transaction_active', 'Scanner recovery requires separate short transactions')
+    if (
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > 100 ||
+      (afterActivityId !== null &&
+        (typeof afterActivityId !== 'string' || !afterActivityId || afterActivityId.length > 256))
+    )
+      throw failure('maintenance_scan_invalid', 'Invalid scanner recovery page')
+    const rows = await this.db
+      .prepare(`SELECT id,owner_id FROM ${this.qualified}.activities
+      WHERE kind='ha_request_recovery' AND epoch=$1 AND completed_at IS NULL AND id<>$2
+        AND ($3::text IS NULL OR id>$3) ORDER BY id LIMIT $4`)
+      .all(scope.epoch, scope.id, afterActivityId, limit + 1)
+    const page = rows.slice(0, limit)
+    const results = []
+    for (const candidate of page) {
+      const result = await withTransaction(this.db, async () => {
+        // Control/owner before activity matches the handoff and exact request-recovery lock order.
+        const absent = await this.lockAbsentOwner(candidate.owner_id)
+        if (!absent.absent) return { recovered: false, reason: absent.reason }
+        const row = await this.db
+          .prepare(`SELECT * FROM ${this.qualified}.activities WHERE id=$1 FOR UPDATE SKIP LOCKED`)
+          .get(candidate.id)
+        if (!row || row.completed_at) return { recovered: false, reason: 'scan_inactive' }
+        if (
+          row.kind !== 'ha_request_recovery' ||
+          row.owner_id !== candidate.owner_id ||
+          String(row.epoch) !== String(scope.epoch)
+        )
+          return { recovered: false, reason: 'scan_changed' }
+        if (await this.db.prepare('SELECT id FROM ha_request_contexts WHERE activity_id=$1 LIMIT 1').get(row.id))
+          return { recovered: false, reason: 'scan_parent_present' }
+        if (
+          await this.db
+            .prepare(
+              `SELECT id FROM ${this.qualified}.operations WHERE source_activity_id=$1 AND ended_at IS NULL LIMIT 1`,
+            )
+            .get(row.id)
+        )
+          return { recovered: false, reason: 'scan_handoff_pending' }
+        await this.db
+          .prepare(`UPDATE ${this.qualified}.activities SET completed_at=clock_timestamp(),reason='ha_recovery_scan_owner_lost'
+          WHERE id=$1 AND owner_id=$2 AND epoch=$3 AND kind='ha_request_recovery' AND completed_at IS NULL`)
+          .run(row.id, row.owner_id, scope.epoch)
+        return { recovered: true }
+      })
+      results.push({ activityId: candidate.id, ...result })
+    }
+    return { results, nextCursor: rows.length > limit ? page.at(-1).id : null }
   }
 
   async acknowledgeEpoch(epoch) {
