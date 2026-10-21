@@ -61,7 +61,7 @@ test(`protocol waits for ${kind} publication and preserves unknown activity`, as
       async run({ applyAttempt, canonicalBody }) {
         runnerCalls++
         noteRunner()
-        if (kind === 'touch') await applyAttempt(canonicalBody, {
+        if (kind.startsWith('touch')) await applyAttempt(canonicalBody, {
           vmId: 'publication-vm', accountId: 'publication-account', vm: {}, exec: {},
           markUncertain: async () => { marked++ },
         })
@@ -91,12 +91,23 @@ test(`protocol waits for ${kind} publication and preserves unknown activity`, as
     await request
     assert.equal(runnerCalls, 1)
   } else {
-    reject(Object.assign(new Error('synthetic publication failed'), { code: 'sftp_failed', executionUncertain: true }))
+    const finishedPublication = kind === 'touch-finished'
+    reject(Object.assign(new Error('synthetic publication failed'), {
+      code: 'sftp_failed',
+      ...(finishedPublication ? { publicationFinished: true } : { executionUncertain: true }),
+    }))
     await assert.rejects(request, /synthetic publication failed/)
-    assert.equal(marked, 1)
-    assert.ok(states.some((state) => state.started === true && state.ended === false && !state.requestId))
+    assert.equal(marked, finishedPublication ? 0 : 1)
+    assert.equal(states.some((state) => state.started === true && state.ended === false && !state.requestId), !finishedPublication)
     const row = await db.prepare('SELECT released_at FROM api_key_admissions WHERE key_id=$1').get(key.id)
-    assert.equal(row.released_at, null)
-    assert.equal((await store.reserve(key)).code, 'api_key_concurrency_limit')
+    if (finishedPublication) {
+      assert.ok(row.released_at)
+      const next = await store.reserve(key)
+      assert.equal(next.ok, true)
+      await next.release()
+    } else {
+      assert.equal(row.released_at, null)
+      assert.equal((await store.reserve(key)).code, 'api_key_concurrency_limit')
+    }
   }
 })
