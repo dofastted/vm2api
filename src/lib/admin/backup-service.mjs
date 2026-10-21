@@ -35,6 +35,8 @@ export class BackupService {
     this._restoreRunning = false
     this._maintenance = null
     this._running = false
+    this._schedulerGeneration = 0
+    this._scheduledChecks = new Set()
     this._timer = null
     this._bootTimer = null
     this._rebindStores = null // set via onRestored()
@@ -127,7 +129,7 @@ export class BackupService {
   // ---------- create ----------
 
   async flush() {
-    await Promise.all([this._pendingBackup, this._pendingRestore].filter(Boolean))
+    await Promise.all([...this._scheduledChecks, this._pendingBackup, this._pendingRestore].filter(Boolean))
   }
 
   async createBackup(options = {}) {
@@ -534,15 +536,22 @@ export class BackupService {
   /** Auto-backup checker: every checkIntervalMs + a catch-up run at boot. */
   startScheduler() {
     this.stopScheduler()
-    const check = async () => {
-      try {
-        if (await this.shouldRunScheduled()) {
-          const rec = await this.createBackup({ kind: 'scheduled' })
-          console.log(`[backup] scheduled backup completed (${Math.round((rec.size_bytes || 0) / 1048576)} MiB)`)
+    const generation = this._schedulerGeneration
+    const check = () => {
+      if (generation !== this._schedulerGeneration) return
+      const pending = (async () => {
+        try {
+          if ((await this.shouldRunScheduled()) && generation === this._schedulerGeneration) {
+            const rec = await this.createBackup({ kind: 'scheduled' })
+            console.log(`[backup] scheduled backup completed (${Math.round((rec.size_bytes || 0) / 1048576)} MiB)`)
+          }
+        } catch (e) {
+          console.warn('[backup] scheduled backup failed:', String(e.message || e))
         }
-      } catch (e) {
-        console.warn('[backup] scheduled backup failed:', String(e.message || e))
-      }
+      })()
+      this._scheduledChecks.add(pending)
+      pending.finally(() => this._scheduledChecks.delete(pending))
+      return pending
     }
     this._timer = setInterval(check, this.checkIntervalMs)
     if (typeof this._timer.unref === 'function') this._timer.unref()
@@ -560,6 +569,7 @@ export class BackupService {
   }
 
   stopScheduler() {
+    this._schedulerGeneration += 1
     if (this._timer) {
       clearInterval(this._timer)
       this._timer = null

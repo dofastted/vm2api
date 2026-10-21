@@ -276,6 +276,37 @@ test('stopping scheduling drains an in-flight check without starting a backup af
   assert.deepEqual({ flushedDuringCheck, backups }, { flushedDuringCheck: false, backups: 0 })
 })
 
+test('restarting scheduling does not reactivate a check from the previous schedule', async (t) => {
+  let check
+  t.mock.method(globalThis, 'setInterval', (callback) => {
+    check = callback
+    return { unref() {} }
+  })
+  t.mock.method(globalThis, 'clearInterval', () => {})
+  let releaseCheck
+  const gate = new Promise((resolve) => {
+    releaseCheck = resolve
+  })
+  svc.shouldRunScheduled = async () => {
+    await gate
+    return true
+  }
+  let backups = 0
+  svc.createBackup = async () => {
+    backups += 1
+    return { size_bytes: 0 }
+  }
+  svc.startScheduler()
+  const previous = check()
+  svc.startScheduler()
+  releaseCheck()
+  await previous
+  assert.equal(backups, 0)
+  await check()
+  await svc.flush()
+  assert.equal(backups, 1)
+})
+
 test('remove deletes record + file', async () => {
   seedVm()
   const rec = await svc.createBackup({ kind: 'manual' })
