@@ -273,6 +273,7 @@ async function runHop({ mode, opts }) {
   let hop = 0
   const sendHop = async () => {
     let startError
+    let bound = false
     const value = await send({
       ...opts,
       requestId: hop++ === 0 && opts.requestId != null ? opts.requestId : randomUUID(),
@@ -281,6 +282,7 @@ async function runHop({ mode, opts }) {
           ? async (execution) => {
               try {
                 await opts.onExecutionStart(execution)
+                bound = true
               } catch (error) {
                 startError = error
                 throw error
@@ -291,7 +293,9 @@ async function runHop({ mode, opts }) {
     // The worker returns transport results for errors, including callback errors.
     // A failed durable start must retain the original exception and cannot retry.
     if (startError) throw startError
-    if (typeof opts.onExecutionEnd === 'function') await opts.onExecutionEnd(value?.execution)
+    if (typeof opts.onExecutionEnd === 'function' && (typeof opts.onExecutionStart !== 'function' || bound)) {
+      await opts.onExecutionEnd(value?.execution)
+    }
     return value
   }
   beginWrapHop(opts.exec)
