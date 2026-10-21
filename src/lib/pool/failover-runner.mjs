@@ -757,344 +757,346 @@ export class FailoverRunner {
         }
         throw error
       }
-      if (selected?.familyGated && familyKey && familyVmId) {
-        // The family home left the pool (quota, credential): the family moves
-        // with the next bind. An exclusion this request made itself is not proof.
-        const home = this.stickyRouter?.resolve?.(familyKey)
-        const ownExclusion =
-          !!home && (budget.tried.has(home.accountId) || budget.tried.has(home.vmId) || spilled.has(home.accountId))
-        if (!ownExclusion) this.stickyRouter?.unbind?.(familyKey)
-        familyVmId = null
-      }
-      if (!selected?.ok && selected?.reason === 'fable_requires_max') {
-        return {
-          ...fableRequiresMaxError({
-            wait_ms: selected?.waitMs ?? selected?.wait_ms ?? 0,
-            eligible: selected?.eligible ?? 0,
-            available: selected?.available ?? 0,
-            attempt_count: budget.hops,
-          }),
-          ...attribution(),
-        }
-      }
-      if (!selected?.ok) {
-        const exhausted = selectionFailure(selected, { excluded, lastPolicy, lastResult, hops: budget.hops })
-        return preferLastResult(lastResult, lastPolicy, exhausted, attribution())
-      }
-      repairPending = false
-      snapshotPins()
-      const attemptStickyBound = pinBaseline.get(stickyKey) || null
-      lastSelected = selected
-      pinnedSlot = selected.slotIndex ?? null
-      if (selected.seatMoved) seatMovedTo = selected.vmId
-      bindAll({ accountId: selected.accountId, vmId: selected.vmId, slotIndex: pinnedSlot }, { countHit: false })
-      const attemptStarted = Date.now()
-      await this.attemptsRepo?.begin?.({
-        requestId,
-        attemptNo,
-        vmId: selected.vmId,
-        accountId: selected.accountId,
-        model,
-        selectionReason: selected.selectionReason,
-        waitMs: selected.waitMs,
-      })
-      let result
-      let policy
-      let committed = false
-      let hopNoted = false
-      const noteHop = (value) => {
-        if (hopNoted) return
-        hopNoted = true
-        const executions = executionsOf(value)
-        if (executions > 0) budget.noteHop(selected.accountId, selected.vmId, executions)
-      }
       try {
-        const repairKey = searchRepairKey(stickyKey, model, selected)
-        const hint = this.searchRepairs.get(repairKey)
-        if (hint && hint.expiresAt <= Date.now()) this.searchRepairs.delete(repairKey)
-        const knownSearchRepair = hint && hint.expiresAt > Date.now() && hint.fingerprint === fingerprint()
-        const attemptBody = knownSearchRepair ? flattenSearchResultHistory(requestBody) : requestBody
-        const prepared =
-          typeof applyAttempt === 'function'
-            ? await applyAttempt(clone(attemptBody), selected, {
-                attemptNo,
-                repaired,
-                attemptStartedAt: attemptStarted,
-                freshSlot,
-                stickyBound: attemptStickyBound,
-              })
-            : clone(attemptBody)
-        const wrappedAttempt =
-          prepared &&
-          typeof prepared === 'object' &&
-          Object.prototype.hasOwnProperty.call(prepared, 'body') &&
-          Object.prototype.hasOwnProperty.call(prepared, 'meta')
-        const body = wrappedAttempt ? prepared.body : prepared
-        const attemptMeta = wrappedAttempt ? prepared.meta : null
-        if (attemptMeta?.sessionId) {
-          outboundSessionId = String(attemptMeta.sessionId)
-          outboundSessionAccountId = selected.accountId
-          bindAll(
-            { accountId: selected.accountId, vmId: selected.vmId, sessionId: outboundSessionId },
-            {
-              countHit: false,
-              // Prebinding moved the VM already; replace the previous VM's session.
-              replaceSession: !!attemptStickyBound?.vmId && attemptStickyBound.vmId !== selected.vmId,
-            },
-          )
+        if (selected?.familyGated && familyKey && familyVmId) {
+          // The family home left the pool (quota, credential): the family moves
+          // with the next bind. An exclusion this request made itself is not proof.
+          const home = this.stickyRouter?.resolve?.(familyKey)
+          const ownExclusion =
+            !!home && (budget.tried.has(home.accountId) || budget.tried.has(home.vmId) || spilled.has(home.accountId))
+          if (!ownExclusion) this.stickyRouter?.unbind?.(familyKey)
+          familyVmId = null
         }
-        result = await callAttempt({
-          candidate: selected,
-          body,
-          attemptMeta,
-          attemptNo,
-          stream,
-          deliveryMode: deliveryMode || this.config.delivery_mode,
-          signal,
-          onCommit: () => {
-            committed = true
-          },
-        })
-        noteHop(result)
-        if (result) result.committed = result.committed || committed
-        if (signal?.aborted || isClientCancelledResult(result)) {
-          await this.attemptsRepo?.complete?.(requestId, attemptNo, {
-            upstreamStatus: result?.status ?? null,
-            errorScope: 'request',
-            action: 'stop',
-            downstreamCommitted: !!(result?.committed || committed),
-            terminalState: 'cancelled',
-            latencyMs: Date.now() - attemptStarted,
-          })
-          return { ...clientCancelledResult(result), via: result?.via || 'pool-failover', ...attribution() }
-        }
-        policy = classifyAttempt(
-          result,
-          selected,
-          {
-            model,
-            repaired,
-            oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
-            signatureRepair: signatureRepairEnabled(this.config),
-          },
-          this.scheduler?.accountQuota,
-        )
-        if (knownSearchRepair && policy.reason === 'search_repairable') {
-          // Repeating the identical flatten cannot fix a second rejection.
-          this.searchRepairs.delete(repairKey)
-          policy = { ...policy, action: 'stop' }
-        }
-        // One writer for rate_limit_reset_at / overload_until (sub2api HandleUpstreamError).
-        const hardBlock =
-          !result?.committed && !pinVmId
-            ? this.rateLimitService?.handleUpstreamError?.({
-                accountId: selected.accountId,
-                vmId: selected.vmId,
-                result,
-                policy,
-              }) || null
-            : null
-        if (hardBlock?.until && policy.action === 'continue-and-cooldown' && policy.scope === 'account') {
-          policy = { ...policy, cooldownUntil: hardBlock.until }
-        }
-
-        lastResult = result
-        lastPolicy = policy
-        this.noteUnitHealth(selected, policy, result)
-        notifyProxyFailure(this.onProxyFailure, selected, policy)
-        if (policy.reason === 'fable_plan_denied' && typeof this.onFablePlanDenied === 'function') {
-          try {
-            this.onFablePlanDenied({ selected, policy })
-          } catch {}
-        }
-        const terminalState = result?.terminalState || (result?.ok ? 'unknown' : 'error')
-        await this.attemptsRepo?.complete?.(requestId, attemptNo, {
-          upstreamStatus: result?.status ?? null,
-          errorScope: policy.scope,
-          action: policy.action,
-          cooldownUntil: policy.cooldownUntil,
-          downstreamCommitted: result?.committed || committed,
-          terminalState,
-          usage: usageOf(result),
-          ttftMs: result?.ttftMs ?? null,
-          latencyMs: Date.now() - attemptStarted,
-        })
-        if (typeof onAttempt === 'function') {
-          await onAttempt({ attemptNo, selected, result, policy })
-        }
-        if (policy.reason === 'content_filter_refusal' || policy.reason === 'usage_policy_refusal') {
-          this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
-          bindAll({ accountId: selected.accountId, vmId: selected.vmId })
+        if (!selected?.ok && selected?.reason === 'fable_requires_max') {
           return {
-            ...result,
+            ...fableRequiresMaxError({
+              wait_ms: selected?.waitMs ?? selected?.wait_ms ?? 0,
+              eligible: selected?.eligible ?? 0,
+              available: selected?.available ?? 0,
+              attempt_count: budget.hops,
+            }),
             ...attribution(),
-            finalState: policy.reason === 'usage_policy_refusal' ? 'rejected' : 'content_filter',
-            policy,
           }
         }
-        if (verifiedSuccess(result)) {
-          if (repairKey && (knownSearchRepair || searchRepair?.key === repairKey)) {
-            this.searchRepairs.delete(repairKey)
-            while (this.searchRepairs.size >= SEARCH_REPAIR_LIMIT) {
-              this.searchRepairs.delete(this.searchRepairs.keys().next().value)
-            }
-            this.searchRepairs.set(repairKey, {
-              fingerprint: fingerprint(),
-              expiresAt: Date.now() + SEARCH_REPAIR_IDLE_MS,
-            })
+        if (!selected?.ok) {
+          const exhausted = selectionFailure(selected, { excluded, lastPolicy, lastResult, hops: budget.hops })
+          return preferLastResult(lastResult, lastPolicy, exhausted, attribution())
+        }
+        repairPending = false
+        snapshotPins()
+        const attemptStickyBound = pinBaseline.get(stickyKey) || null
+        lastSelected = selected
+        pinnedSlot = selected.slotIndex ?? null
+        if (selected.seatMoved) seatMovedTo = selected.vmId
+        bindAll({ accountId: selected.accountId, vmId: selected.vmId, slotIndex: pinnedSlot }, { countHit: false })
+        const attemptStarted = Date.now()
+        await this.attemptsRepo?.begin?.({
+          requestId,
+          attemptNo,
+          vmId: selected.vmId,
+          accountId: selected.accountId,
+          model,
+          selectionReason: selected.selectionReason,
+          waitMs: selected.waitMs,
+        })
+        let result
+        let policy
+        let committed = false
+        let hopNoted = false
+        const noteHop = (value) => {
+          if (hopNoted) return
+          hopNoted = true
+          const executions = executionsOf(value)
+          if (executions > 0) budget.noteHop(selected.accountId, selected.vmId, executions)
+        }
+        try {
+          const repairKey = searchRepairKey(stickyKey, model, selected)
+          const hint = this.searchRepairs.get(repairKey)
+          if (hint && hint.expiresAt <= Date.now()) this.searchRepairs.delete(repairKey)
+          const knownSearchRepair = hint && hint.expiresAt > Date.now() && hint.fingerprint === fingerprint()
+          const attemptBody = knownSearchRepair ? flattenSearchResultHistory(requestBody) : requestBody
+          const prepared =
+            typeof applyAttempt === 'function'
+              ? await applyAttempt(clone(attemptBody), selected, {
+                  attemptNo,
+                  repaired,
+                  attemptStartedAt: attemptStarted,
+                  freshSlot,
+                  stickyBound: attemptStickyBound,
+                })
+              : clone(attemptBody)
+          const wrappedAttempt =
+            prepared &&
+            typeof prepared === 'object' &&
+            Object.prototype.hasOwnProperty.call(prepared, 'body') &&
+            Object.prototype.hasOwnProperty.call(prepared, 'meta')
+          const body = wrappedAttempt ? prepared.body : prepared
+          const attemptMeta = wrappedAttempt ? prepared.meta : null
+          if (attemptMeta?.sessionId) {
+            outboundSessionId = String(attemptMeta.sessionId)
+            outboundSessionAccountId = selected.accountId
+            bindAll(
+              { accountId: selected.accountId, vmId: selected.vmId, sessionId: outboundSessionId },
+              {
+                countHit: false,
+                // Prebinding moved the VM already; replace the previous VM's session.
+                replaceSession: !!attemptStickyBound?.vmId && attemptStickyBound.vmId !== selected.vmId,
+              },
+            )
           }
-          this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
-          if (isFableModel(model) && typeof this.onFableSuccess === 'function') {
+          result = await callAttempt({
+            candidate: selected,
+            body,
+            attemptMeta,
+            attemptNo,
+            stream,
+            deliveryMode: deliveryMode || this.config.delivery_mode,
+            signal,
+            onCommit: () => {
+              committed = true
+            },
+          })
+          noteHop(result)
+          if (result) result.committed = result.committed || committed
+          if (signal?.aborted || isClientCancelledResult(result)) {
+            await this.attemptsRepo?.complete?.(requestId, attemptNo, {
+              upstreamStatus: result?.status ?? null,
+              errorScope: 'request',
+              action: 'stop',
+              downstreamCommitted: !!(result?.committed || committed),
+              terminalState: 'cancelled',
+              latencyMs: Date.now() - attemptStarted,
+            })
+            return { ...clientCancelledResult(result), via: result?.via || 'pool-failover', ...attribution() }
+          }
+          policy = classifyAttempt(
+            result,
+            selected,
+            {
+              model,
+              repaired,
+              oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
+              signatureRepair: signatureRepairEnabled(this.config),
+            },
+            this.scheduler?.accountQuota,
+          )
+          if (knownSearchRepair && policy.reason === 'search_repairable') {
+            // Repeating the identical flatten cannot fix a second rejection.
+            this.searchRepairs.delete(repairKey)
+            policy = { ...policy, action: 'stop' }
+          }
+          // One writer for rate_limit_reset_at / overload_until (sub2api HandleUpstreamError).
+          const hardBlock =
+            !result?.committed && !pinVmId
+              ? this.rateLimitService?.handleUpstreamError?.({
+                  accountId: selected.accountId,
+                  vmId: selected.vmId,
+                  result,
+                  policy,
+                }) || null
+              : null
+          if (hardBlock?.until && policy.action === 'continue-and-cooldown' && policy.scope === 'account') {
+            policy = { ...policy, cooldownUntil: hardBlock.until }
+          }
+
+          lastResult = result
+          lastPolicy = policy
+          this.noteUnitHealth(selected, policy, result)
+          notifyProxyFailure(this.onProxyFailure, selected, policy)
+          if (policy.reason === 'fable_plan_denied' && typeof this.onFablePlanDenied === 'function') {
             try {
-              this.onFableSuccess({ selected, model })
+              this.onFablePlanDenied({ selected, policy })
             } catch {}
           }
-          bindAll({ accountId: selected.accountId, vmId: selected.vmId })
-          return { ...result, ...attribution(), finalState: 'verified' }
-        }
-        if (policy.action === 'repair-and-retry' && !repaired && !result?.committed) {
-          repaired = true
-          repairPending = true
-          if (policy.reason === 'search_repairable' && repairKey && fingerprint()) {
-            searchRepair = { key: repairKey }
+          const terminalState = result?.terminalState || (result?.ok ? 'unknown' : 'error')
+          await this.attemptsRepo?.complete?.(requestId, attemptNo, {
+            upstreamStatus: result?.status ?? null,
+            errorScope: policy.scope,
+            action: policy.action,
+            cooldownUntil: policy.cooldownUntil,
+            downstreamCommitted: result?.committed || committed,
+            terminalState,
+            usage: usageOf(result),
+            ttftMs: result?.ttftMs ?? null,
+            latencyMs: Date.now() - attemptStarted,
+          })
+          if (typeof onAttempt === 'function') {
+            await onAttempt({ attemptNo, selected, result, policy })
           }
-          requestBody = repairAnthropicRequest(requestBody, policy)
-          continue
-        }
-        applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
-        if (!pinVmId && isCredentialDeath(policy)) {
-          this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
-          if (familyKey) {
+          if (policy.reason === 'content_filter_refusal' || policy.reason === 'usage_policy_refusal') {
+            this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
+            bindAll({ accountId: selected.accountId, vmId: selected.vmId })
+            return {
+              ...result,
+              ...attribution(),
+              finalState: policy.reason === 'usage_policy_refusal' ? 'rejected' : 'content_filter',
+              policy,
+            }
+          }
+          if (verifiedSuccess(result)) {
+            if (repairKey && (knownSearchRepair || searchRepair?.key === repairKey)) {
+              this.searchRepairs.delete(repairKey)
+              while (this.searchRepairs.size >= SEARCH_REPAIR_LIMIT) {
+                this.searchRepairs.delete(this.searchRepairs.keys().next().value)
+              }
+              this.searchRepairs.set(repairKey, {
+                fingerprint: fingerprint(),
+                expiresAt: Date.now() + SEARCH_REPAIR_IDLE_MS,
+              })
+            }
+            this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
+            if (isFableModel(model) && typeof this.onFableSuccess === 'function') {
+              try {
+                this.onFableSuccess({ selected, model })
+              } catch {}
+            }
+            bindAll({ accountId: selected.accountId, vmId: selected.vmId })
+            return { ...result, ...attribution(), finalState: 'verified' }
+          }
+          if (policy.action === 'repair-and-retry' && !repaired && !result?.committed) {
+            repaired = true
+            repairPending = true
+            if (policy.reason === 'search_repairable' && repairKey && fingerprint()) {
+              searchRepair = { key: repairKey }
+            }
+            requestBody = repairAnthropicRequest(requestBody, policy)
+            continue
+          }
+          applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
+          if (!pinVmId && isCredentialDeath(policy)) {
+            this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
+            if (familyKey) {
+              return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
+            }
+          }
+          if (!shouldContinue(policy)) {
             return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
           }
-        }
-        if (!shouldContinue(policy)) {
-          return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
-        }
-        policy = await this.recoverCredential(selected, policy)
-        const hopMs = Date.now() - attemptStarted
-        if (isRetryableEmptyHop(policy)) {
-          if (!emptyHopReleased(result) || pinVmId) return incompleteHopResult(result, policy, attribution())
-          this.retireOutboundSession(selected, bindKeys)
-          freshSlot = true
-        }
-        if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
-          budget.noteSameUnit(selected.accountId)
-          avoid = new Set([selected.accountId, selected.vmId])
-          continue
-        }
-        budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
-      } catch (error) {
-        const invalidCache = error?.status === 400 && error.body?.error?.code === 'invalid_cache_control'
-        noteHop(invalidCache ? { upstreamExecutions: 0 } : null)
-        if (error?.code === 'response_sent') {
-          await this.attemptsRepo?.complete?.(requestId, attemptNo, {
-            upstreamStatus: 403,
-            errorScope: 'request',
-            action: 'stop',
-            downstreamCommitted: true,
-            terminalState: 'policy_block',
-            latencyMs: Date.now() - attemptStarted,
-          })
-          return {
-            ok: false,
-            responseSent: true,
-            status: 403,
-            via: 'account-scope',
-            vmId: selected.vmId,
-            accountId: selected.accountId,
-            attemptCount: attemptNo,
-            finalState: 'policy_block',
+          policy = await this.recoverCredential(selected, policy)
+          const hopMs = Date.now() - attemptStarted
+          if (isRetryableEmptyHop(policy)) {
+            if (!emptyHopReleased(result) || pinVmId) return incompleteHopResult(result, policy, attribution())
+            this.retireOutboundSession(selected, bindKeys)
+            freshSlot = true
           }
-        }
-        if (invalidCache) {
-          await this.attemptsRepo?.complete?.(requestId, attemptNo, {
-            upstreamStatus: 0,
-            errorScope: 'request',
-            action: 'stop',
-            downstreamCommitted: false,
-            terminalState: 'invalid_request',
-            latencyMs: Date.now() - attemptStarted,
-          })
-          return {
-            ok: false,
-            status: 400,
-            body: error.body,
-            terminalState: 'invalid_request',
-            finalState: 'invalid_request',
-            ...attribution(),
+          if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
+            budget.noteSameUnit(selected.accountId)
+            avoid = new Set([selected.accountId, selected.vmId])
+            continue
           }
-        }
-        if (signal?.aborted || error?.code === 'selection_cancelled' || error?.code === 'request_cancelled') {
-          await this.attemptsRepo?.complete?.(requestId, attemptNo, {
-            upstreamStatus: 0,
-            errorScope: 'request',
-            action: 'stop',
-            downstreamCommitted: !!committed,
-            terminalState: 'cancelled',
-            latencyMs: Date.now() - attemptStarted,
-          })
-          return { ...clientCancelledResult({ committed }), via: 'pool-failover', ...attribution() }
-        }
-        result = {
-          ok: false,
-          status: 0,
-          transportError: true,
-          committed,
-          terminalState: committed ? 'incomplete' : 'transport_error',
-          body: {
-            type: 'error',
-            error: {
-              type: 'worker_error',
-              code: error.code || 'attempt_failed',
-              message: String(error.message || error).slice(0, 300),
+          budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
+        } catch (error) {
+          const invalidCache = error?.status === 400 && error.body?.error?.code === 'invalid_cache_control'
+          noteHop(invalidCache ? { upstreamExecutions: 0 } : null)
+          if (error?.code === 'response_sent') {
+            await this.attemptsRepo?.complete?.(requestId, attemptNo, {
+              upstreamStatus: 403,
+              errorScope: 'request',
+              action: 'stop',
+              downstreamCommitted: true,
+              terminalState: 'policy_block',
+              latencyMs: Date.now() - attemptStarted,
+            })
+            return {
+              ok: false,
+              responseSent: true,
+              status: 403,
+              via: 'account-scope',
+              vmId: selected.vmId,
+              accountId: selected.accountId,
+              attemptCount: attemptNo,
+              finalState: 'policy_block',
+            }
+          }
+          if (invalidCache) {
+            await this.attemptsRepo?.complete?.(requestId, attemptNo, {
+              upstreamStatus: 0,
+              errorScope: 'request',
+              action: 'stop',
+              downstreamCommitted: false,
+              terminalState: 'invalid_request',
+              latencyMs: Date.now() - attemptStarted,
+            })
+            return {
+              ok: false,
+              status: 400,
+              body: error.body,
+              terminalState: 'invalid_request',
+              finalState: 'invalid_request',
+              ...attribution(),
+            }
+          }
+          if (signal?.aborted || error?.code === 'selection_cancelled' || error?.code === 'request_cancelled') {
+            await this.attemptsRepo?.complete?.(requestId, attemptNo, {
+              upstreamStatus: 0,
+              errorScope: 'request',
+              action: 'stop',
+              downstreamCommitted: !!committed,
+              terminalState: 'cancelled',
+              latencyMs: Date.now() - attemptStarted,
+            })
+            return { ...clientCancelledResult({ committed }), via: 'pool-failover', ...attribution() }
+          }
+          result = {
+            ok: false,
+            status: 0,
+            transportError: true,
+            committed,
+            terminalState: committed ? 'incomplete' : 'transport_error',
+            body: {
+              type: 'error',
+              error: {
+                type: 'worker_error',
+                code: error.code || 'attempt_failed',
+                message: String(error.message || error).slice(0, 300),
+              },
             },
-          },
-        }
-        policy = classifyAttempt(
-          result,
-          selected,
-          {
-            model,
-            repaired,
-            oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
-            signatureRepair: signatureRepairEnabled(this.config),
-          },
-          this.scheduler?.accountQuota,
-        )
-        lastResult = result
-        lastPolicy = policy
-        this.noteUnitHealth(selected, policy, result)
-        notifyProxyFailure(this.onProxyFailure, selected, policy)
-        await this.attemptsRepo?.complete?.(requestId, attemptNo, {
-          upstreamStatus: 0,
-          errorScope: policy.scope,
-          action: policy.action,
-          cooldownUntil: policy.cooldownUntil,
-          downstreamCommitted: committed,
-          terminalState: result.terminalState,
-          latencyMs: Date.now() - attemptStarted,
-        })
-        if (committed || !shouldContinue(policy)) {
-          return { ...result, ...attribution(), finalState: result.terminalState, policy }
-        }
-        applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
-        if (!pinVmId && isCredentialDeath(policy)) {
-          this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
-          if (familyKey) {
+          }
+          policy = classifyAttempt(
+            result,
+            selected,
+            {
+              model,
+              repaired,
+              oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
+              signatureRepair: signatureRepairEnabled(this.config),
+            },
+            this.scheduler?.accountQuota,
+          )
+          lastResult = result
+          lastPolicy = policy
+          this.noteUnitHealth(selected, policy, result)
+          notifyProxyFailure(this.onProxyFailure, selected, policy)
+          await this.attemptsRepo?.complete?.(requestId, attemptNo, {
+            upstreamStatus: 0,
+            errorScope: policy.scope,
+            action: policy.action,
+            cooldownUntil: policy.cooldownUntil,
+            downstreamCommitted: committed,
+            terminalState: result.terminalState,
+            latencyMs: Date.now() - attemptStarted,
+          })
+          if (committed || !shouldContinue(policy)) {
             return { ...result, ...attribution(), finalState: result.terminalState, policy }
           }
+          applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
+          if (!pinVmId && isCredentialDeath(policy)) {
+            this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
+            if (familyKey) {
+              return { ...result, ...attribution(), finalState: result.terminalState, policy }
+            }
+          }
+          policy = await this.recoverCredential(selected, policy)
+          const hopMs = Date.now() - attemptStarted
+          if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
+            budget.noteSameUnit(selected.accountId)
+            avoid = new Set([selected.accountId, selected.vmId])
+            continue
+          }
+          budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
         }
-        policy = await this.recoverCredential(selected, policy)
-        const hopMs = Date.now() - attemptStarted
-        if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
-          budget.noteSameUnit(selected.accountId)
-          avoid = new Set([selected.accountId, selected.vmId])
-          continue
-        }
-        budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
       } finally {
-        selected.release?.()
+        await selected?.release?.()
       }
     }
   }
