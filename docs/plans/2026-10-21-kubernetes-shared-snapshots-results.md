@@ -55,13 +55,25 @@ Pod imageID 对应 manifest 中的 config digest，不能与 OCI manifest digest
 | `08998f406eb7a2bf7ac3512d4b20895879cc2829` | API endpoint 执行 hook、终态与 PG job：72/72 通过 |
 | `bdda2026dca0ed5905c70514bc3fad94e727a53e` | 固定源码归档上的请求 activity hook 接线：75/75 通过 |
 
-前两项提交位于全量检查点之前。后两项在其后。Search 直接 HTTP 请求只有在响应体读取完成后才结束作业；401/403 重发前完成旧作业并使用新 ID。响应体截断、取消、超时及 PG 故障保留容量。Search 不增加原协议没有定义的同会话队列。
+前两项提交位于全量检查点之前，其余位于其后。Search 直接 HTTP 请求只有在响应体读取完成后才结束作业；401/403 重发前完成旧作业并使用新 ID。响应体截断、取消、超时及 PG 故障保留容量。Search 不增加原协议没有定义的同会话队列。
 
 面板路由更新显式返回已提交 revision 和 application 状态。VM/kernel 投影未执行时返回 pending。PG 提交失败不回退到可能过期的本地配置，也不在提交前切换执行端引擎。
 
 后续发现普通 EOF 假设的例外：现有 `kin-kernel`/`cli-node` 在合成上游保持 SSE 时，外部 cancel 返回 200 `cancelled:true`，原请求随后可返回完整 HTTP 502 `worker_error/provider_error: client disconnected`。`b32641b8` 对这类取消、内部 transport/timeout 和无法确认的 kernel 错误保留 `ended=false`，停止共享执行重试及容量释放。普通完整响应和明确供应商拒绝保留原有 EOF 语义。`ready_slots` 是汇总状态，不含 request ID 或 epoch，不能证明单个 job 已结束。
 
 `e854273a5d7016c160a24237ef9aeac3df0cf988` 修正 Go API proxy 在 `io.Copy` 失败时正常结束响应、隐瞒上游 body 截断的问题。`08998f40` 和 `bdda2026` 接入 API endpoint 及请求 activity 的发送前登记和读取结束确认。取消、超时、截断、`upstream_transport` 或 SSE 缺终态不释放未知执行。源码验证与现有 payload 反例见 [后续生命周期证据](evidence/kubernetes/singleton-6732a864/later-lifecycle.json)。这些修正及新的认证、后台任务/全局维护代码没有部署到 `6732a864` 候选镜像。
+
+## 全局维护和后台活动的后续回归
+
+`4e5cc46870b6b4bbb69583eb123e2db2ab823c64` 的独立源码归档完成第二次全量检查。unit 为 333 文件、3860 项：3835 通过、15 失败、10 跳过。E2E 为 29 文件、124 项：106 通过、17 失败、1 跳过。E2E 的 17 个失败及 unit 中原有 7 个失败的断言文本与 `6732a864` 记录一致。
+
+新增的 8 个 unit 失败没有被当作既有失败：4 个来自 API 准备阶段异常被转换为响应，1 个来自拦截顺序的静态断言，2 个计费失败 mock 缺少新的发送事件，1 个默认后台服务测试没有创建生产维护活动。修正后的固定源码 `2923a65ff170bb289356b2f5c5ae74afbcf84ac0` 在独立归档上的 230 项相关回归全部通过。该结果覆盖这 8 个失败及后台、集群调用链；没有替代修正后整套 unit 的重新执行。
+
+这些增量为每次 HTTP、终端和后台数据库工作登记独立活动。数据库查询和事务必须处于对应连接的有效活动范围。配置轮询、日志清理、代理探测、文件监听、SSH 重连及集群事件等待各自的异步持久化。终端连接关闭不证明执行结束；SSH exit 或 Docker exec 明确停止才可确认结束。
+
+`bffb8eca90b54d5b35422bdc7b6ee72aa8304543` 的 CLI 清理器增量在独立归档上 46/46 通过。Kubernetes 模式使用 PG 共享计划及 VM 物理目标互斥，活动推理期间不执行清理；启动 Docker exec 后检查不可变 exec ID 的 Running/ExitCode。未确认退出时保留后台与 VM 占用。其他控制面的面板进程无法仅靠本副本列表确认已结束，因此保守保留。该行为尚未提供孤立面板进程的自动回收。
+
+上述验证只使用专用 PostgreSQL、合成 HTTP/Unix 上游、模拟节点以及测试自己创建的子进程。检查统计、失败摘要和日志 SHA-256 见 [维护增量证据](evidence/kubernetes/maintenance-progress/verification.json)。后续备份恢复接线、其他 VM 管理入口及执行端 generation 权威仍在实现。
 
 ## 未完成和未验证
 
