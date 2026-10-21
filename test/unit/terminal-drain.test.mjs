@@ -5,9 +5,23 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { EventEmitter, once } from 'node:events'
+import { spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { WebSocket } from 'ws'
 import { createClusterRoutes } from '../../src/lib/cluster/cluster-routes.mjs'
 import { createSlotShell } from '../../src/lib/vm/slot-shell.mjs'
+
+test('slot terminal drain waits for a delayed SSH TTY close and final OAuth import', () => {
+  const child = spawnSync(
+    process.execPath,
+    [
+      '--experimental-test-module-mocks',
+      fileURLToPath(new URL('../fixtures/delayed-terminal-drain.mjs', import.meta.url)),
+    ],
+    { encoding: 'utf8', timeout: 5000 },
+  )
+  assert.equal(child.status, 0, child.stderr || child.error?.message)
+})
 
 test('cluster terminal drain waits for a pending SSH channel and closes it before returning', async () => {
   let release
