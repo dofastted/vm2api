@@ -21,6 +21,13 @@ test('a complete successful worker command proves its credential attempt finishe
   assert.equal(result.attemptFinished, true)
 })
 
+test('worker refresh uncertainty takes priority over a final complete rejection', async () => {
+  const result = await runSlotOauth(exec, 'refresh', {
+    runDocker: worker({ ok: false, status: 401, refresh_unknown: true, body: { error: { code: 'refresh_failed' } } }),
+  })
+  assert.equal(result.attemptFinished, false)
+})
+
 test('worker timeout, nonzero exit and reported upstream truncation cannot prove completion', async () => {
   for (const [payload, extra] of [
     [{ ok: true, status: 200 }, { timed_out: true }],

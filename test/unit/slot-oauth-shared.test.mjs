@@ -112,6 +112,28 @@ test('a slot refresh timeout retains its shared operation and task', async (t) =
   assert.ok(rows.rows[0].uncertain_at)
 })
 
+test('worker refresh uncertainty retains shared claims despite its final rejection status', async (t) => {
+  const f = await fixture(t)
+  const result = await runSlotOauth(f.exec, 'refresh', {
+    runDocker: async () => ({
+      code: 0,
+      stdout: JSON.stringify({
+        ok: false,
+        status: 400,
+        refresh_unknown: true,
+        body: { error: { code: 'refresh_failed' } },
+      }),
+    }),
+  })
+  assert.equal(result.attemptFinished, false)
+  const operation = await f.run(() => f.db.prepare('SELECT released_at,uncertain_at FROM vm_operations').get())
+  assert.equal(operation.released_at, null)
+  assert.ok(operation.uncertain_at)
+  const task = await f.run(() => f.db.prepare('SELECT finished_at,unknown_at FROM background_task_runs').get())
+  assert.equal(task.finished_at, null)
+  assert.ok(task.unknown_at)
+})
+
 test('ensure publishes its VM projection before the shared refresh and VM operation finish', async (t) => {
   const f = await fixture(t)
   let publications = 0
