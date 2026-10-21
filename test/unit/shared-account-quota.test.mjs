@@ -394,3 +394,33 @@ test('an older refresh finishing late cannot replace a newer committed remote sn
   await older
   assert.equal(left.repo.get('shared-account').max_concurrency, 29)
 })
+
+test('ticket allocation preserves local invocation order when an earlier PG allocation is delayed', async (t) => {
+  const { left } = await pair(t)
+  const allocate = left.persistence.beginObservation.bind(left.persistence)
+  let entered
+  let resume
+  const started = new Promise((resolve) => {
+    entered = resolve
+  })
+  const gate = new Promise((resolve) => {
+    resume = resolve
+  })
+  let calls = 0
+  left.persistence.beginObservation = async () => {
+    if (++calls === 1) {
+      entered()
+      await gate
+    }
+    return allocate()
+  }
+  const older = left.beginObservation()
+  await started
+  const newer = left.beginObservation()
+  await Promise.resolve()
+  const callsBeforeRelease = calls
+  resume()
+  const [oldTicket, newTicket] = await Promise.all([older, newer])
+  assert.equal(callsBeforeRelease, 1)
+  assert.ok(BigInt(oldTicket) < BigInt(newTicket))
+})
