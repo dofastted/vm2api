@@ -4,6 +4,47 @@ import { startGateway, api } from '../harness.mjs'
 
 const MODEL = 'claude-haiku-4-5-20251001'
 
+test('NUL-containing rejected requests preserve panel queries and backups', async () => {
+  const gw = await startGateway({ env: { KIN_REQUEST_LOG_MODE: 'normal', KIN_BACKUP_DISABLED: '1' } })
+  try {
+    for (const mode of ['normal', 'debug']) {
+      const model = 'invalid\0model'
+      const rejected = await api(gw, 'POST', '/v1/messages', {
+        headers: { 'x-kin-log': mode },
+        body: { model, max_tokens: 8, messages: [{ role: 'user', content: 'hi' }] },
+      })
+      assert.equal(rejected.status, 400, rejected.text)
+      const rid = rejected.headers.get('x-request-id')
+      const logs = await api(gw, 'GET', '/api/panel/request-logs?mode=normal&limit=10')
+      assert.equal(logs.status, 200, logs.text)
+      const row = logs.json.items.find((item) => item.request_id === rid)
+      assert.ok(row, `rejected ${mode} request must remain logged`)
+      assert.equal(row.status, 400)
+      assert.equal(row.model, 'invalid\\u0000model')
+      assert.equal(row.requested_model, 'invalid\\u0000model')
+      if (mode === 'debug') {
+        const debug = await api(gw, 'GET', `/api/panel/request-logs/${rid}`)
+        assert.equal(debug.status, 200, debug.text)
+        assert.equal(debug.json.item.inbound_body.model, model)
+      }
+      const keys = await api(gw, 'GET', '/api/panel/api-keys')
+      assert.equal(keys.status, 200, keys.text)
+    }
+    const backup = await api(gw, 'POST', '/api/panel/backups')
+    assert.equal(backup.status, 201, backup.text)
+    assert.equal(backup.json.item.status, 'ok')
+    const valid = await api(gw, 'POST', '/v1/messages', {
+      body: { model: MODEL, max_tokens: 8, messages: [{ role: 'user', content: 'after rejected requests' }] },
+    })
+    assert.equal(valid.status, 200, valid.text)
+    const logs = await api(gw, 'GET', '/api/panel/request-logs?mode=normal&limit=10')
+    assert.equal(logs.status, 200, logs.text)
+    assert.ok(logs.json.items.some((item) => item.request_id === valid.headers.get('x-request-id')))
+  } finally {
+    await gw.stop()
+  }
+})
+
 test('normal mode writes summary log with X-Request-ID', async () => {
   const gw = await startGateway({ mockText: 'logged', env: { KIN_REQUEST_LOG_MODE: 'normal' } })
   try {

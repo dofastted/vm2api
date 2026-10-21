@@ -14,6 +14,7 @@ import {
 } from '../../src/lib/admin/request-log.mjs'
 import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
 import { GroupsRepo } from '../../src/lib/db/repos/groups-repo.mjs'
+import { trackPendingWrite, flushPendingWrites } from '../../src/lib/db/pending-writes.mjs'
 import { gateVerdict } from '../../src/lib/protocol/intercept-stats.mjs'
 
 function tmpStore(mode = 'normal') {
@@ -72,6 +73,48 @@ test('normal mode writes jsonl without body', async () => {
   // no debug file
   assert.equal((await store.listDebug({ limit: 5 })).length, 0)
 })
+
+for (const mode of ['normal', 'debug']) {
+  test(`${mode} logs escape NUL fields and leave response writes drainable`, async () => {
+    const store = tmpStore(mode)
+    const ctx = store.start(
+      { method: 'POST', headers: {}, socket: {} },
+      { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+    )
+    const model = 'invalid\0model'
+    const inbound = { model, messages: [{ role: 'user', content: '文本\0content' }] }
+    const summary = await trackPendingWrite(
+      store.finish(ctx, {
+        status: 400,
+        model,
+        requested_model: model,
+        upstream_model: 'upstream\0model',
+        error_message: 'invalid model: ' + model,
+        session_id: 'session\0id',
+        inbound_body: inbound,
+      }),
+    )
+    await flushPendingWrites()
+    await flushPendingWrites()
+    const row = await store.repo.getByRequestId(ctx.request_id)
+    for (const [field, expected] of Object.entries({
+      model: 'invalid\\u0000model',
+      requested_model: 'invalid\\u0000model',
+      upstream_model: 'upstream\\u0000model',
+      error_message: 'invalid model: invalid\\u0000model',
+      session_id: 'session\\u0000id',
+    })) {
+      assert.equal(row[field], expected, field)
+      assert.equal(summary[field], expected, field)
+    }
+    if (mode === 'debug') {
+      const debug = await store.getDebug(ctx.request_id)
+      assert.equal(debug.model, summary.model)
+      assert.deepEqual(debug.inbound_body, inbound)
+    }
+    assert.equal(inbound.model, model, 'logging must not mutate the request')
+  })
+}
 
 test('summary persists protocol usage detail (cache/model/ttft/stop_reason)', async () => {
   const store = tmpStore('normal')
