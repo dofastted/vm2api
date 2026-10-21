@@ -1079,7 +1079,14 @@ export function createHandleProtocol(deps) {
     let preserveCacheBreakpoints = false
     const cacheBreakpoints = cacheBreakpointsFromRoutingFile(routingConfigPath)
     const openaiCompat = String(protocol || '').startsWith('openai.')
-    syncClaudeKernelConfigsFromFile(cfg.paths?.project, routingConfigPath)
+    try {
+      await syncClaudeKernelConfigsFromFile(cfg.paths?.project, routingConfigPath)?.publication
+    } catch (error) {
+      admission.executionStarted = true
+      if (admission.lease?.shared) admission.lease.executionUncertain = true
+      await observeExecution(req, admission, { started: true, ended: false, reason: 'remote_publication_unknown' })
+      throw error
+    }
     const personaMode = personaModeFromRoutingFile(routingConfigPath)
     if (!requestContext && !officialClient && !officialTraffic) {
       ctx.body = ensureClaudeWebSearch(ctx.body, {
@@ -1347,8 +1354,19 @@ export function createHandleProtocol(deps) {
             }
           }
           try {
-            touchTelemetrySession(cfg.paths.project, selected.vmId, selected.exec?.vm)
-          } catch {}
+            await touchTelemetrySession(cfg.paths.project, selected.vmId, selected.exec?.vm)?.publication
+          } catch (error) {
+            error.executionUncertain = true
+            admission.executionStarted = true
+            if (admission.lease?.shared) admission.lease.executionUncertain = true
+            await selected.markUncertain?.()
+            await observeExecution(req, admission, {
+              started: true,
+              ended: false,
+              reason: 'remote_publication_unknown',
+            })
+            throw error
+          }
           const identity = loadVmIdentity(selected.exec)
           const attemptStartedAt = extra.attemptStartedAt ?? Date.now()
           // The runner snapshots after this session's queue turn, before VM prebinding.

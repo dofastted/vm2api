@@ -1164,6 +1164,10 @@ export class FailoverRunner {
           }
           budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
         } catch (error) {
+          if (error?.executionUncertain === true && selected.bindExecution) {
+            if (!unknownExecution) await selected.markUncertain()
+            unknownExecution = true
+          }
           // A submitted job can outlive its transport. Never replay it or free
           // its shared capacity without proof that the execution ended.
           if (selected.bindExecution && callEntered) {
