@@ -4,8 +4,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { SlotgateClient } from '../../src/lib/transport/slotgate-client.mjs'
-import { workerHealth, ensureWorkerCredential, callGoWorker } from '../../src/lib/transport/go-worker-client.mjs'
-import { clearRustHealthCache, dispatchCallInference } from '../../src/lib/transport/kernel-router.mjs'
+import { workerHealth, ensureWorkerCredential, callGoWorker, streamGoWorker, callWorkerGet, countTokensViaWorker } from '../../src/lib/transport/go-worker-client.mjs'
+import { clearRustHealthCache, dispatchCallInference, rememberRustHealth, peekRustHealth } from '../../src/lib/transport/kernel-router.mjs'
 import { fakeSlotgate, syntheticFence } from '../fixtures/fake-slotgate.mjs'
 
 function manifest(config) {
@@ -78,6 +78,58 @@ test('capture refuses a different account without preparing inference', async (t
   manifest(fx.config)
   await assert.rejects(capture(fx.config, { accountId: 'other-account' }), { code: 'node_account_mismatch' })
   assert.deepEqual(fx.requests.map((value) => value.op), ['health'])
+})
+
+test('capture snapshots fixed TLS configuration before awaiting the PG receipt', async (t) => {
+  const fx = await fakeSlotgate(t)
+  manifest(fx.config)
+  const trustedNodes = new Map([[fx.config.nodeId, { ...fx.config.link, presetId: 'claude-docker-v1', policyDigest: 'c'.repeat(64) }]])
+  let resume
+  const blocked = new Promise((resolve) => { resume = resolve })
+  let reads = 0
+  const pending = capture(fx.config, { trustedNodes, readLaunchReceipt: async () => {
+    if (++reads === 1) await blocked
+    return receipt(fx.config)
+  } })
+  // Wait until capture has entered its original lookup, not until node IO.
+  await new Promise((resolve) => setImmediate(resolve))
+  trustedNodes.get(fx.config.nodeId).certSha256 = '0'.repeat(64)
+  resume()
+  const result = await pending
+  assert.equal(result.slotgate.link.certSha256, fx.config.link.certSha256)
+})
+
+for (const account of [undefined, null, '', 'other-account']) {
+  test(`capture does not authorize account by display email or conflicting identity (${account})`, async (t) => {
+    const fx = await fakeSlotgate(t, { health: (command) => ({
+      ok: true, fence: command.fence, manifest_revision: command.manifest_revision, manifest_digest: command.manifest_digest,
+      health: { ok: true, credential: { has_access: true, account_uuid: account, email: 'synthetic-account' },
+        identity: { account_uuid: 'synthetic-account' } },
+    }) })
+    manifest(fx.config)
+    await assert.rejects(capture(fx.config), { code: 'node_account_mismatch' })
+    assert.deepEqual(fx.requests.map((value) => value.op), ['health'])
+  })
+}
+
+test('a PG receipt failure has no TLS or legacy fallback', async (t) => {
+  const fx = await fakeSlotgate(t)
+  manifest(fx.config)
+  await assert.rejects(capture(fx.config, { readLaunchReceipt: async () => { throw Object.assign(new Error('synthetic PG failure'), { code: 'synthetic_pg_failure' }) } }), { code: 'synthetic_pg_failure' })
+  assert.equal(fx.requests.length, 0)
+})
+
+test('health cache separates captured fences and manifests and VM invalidation clears each', async () => {
+  clearRustHealthCache()
+  const first = { vmId: 'cache-vm', slotgate: { fence: syntheticFence(), manifest: { revision: '1', digest: 'a'.repeat(64) } } }
+  rememberRustHealth(first, { ok: true, health: { ok: true } })
+  assert.equal(peekRustHealth(first, 1000).health.ok, true)
+  const next = { ...first, slotgate: { ...first.slotgate, fence: syntheticFence('2') } }
+  assert.equal(peekRustHealth(next, 1000), null)
+  const changedManifest = { ...first, slotgate: { ...first.slotgate, manifest: { revision: '2', digest: 'b'.repeat(64) } } }
+  assert.equal(peekRustHealth(changedManifest, 1000), null)
+  clearRustHealthCache('cache-vm')
+  assert.equal(peekRustHealth(first, 1000), null)
 })
 
 test('typed health returns only public fields and never needs a Pod kernel token', async (t) => {
@@ -159,6 +211,9 @@ test('HA transport refuses a missing trusted capability before mock or legacy ex
   process.env.KIN_CRS_MOCK = '1'
   try {
     await assert.rejects(callGoWorker({ exec: { vmId: 'legacy-vm' }, envelope: { body: {} } }), { code: 'slotgate_capability_required' })
+    await assert.rejects(streamGoWorker({ exec: { vmId: 'legacy-vm' }, envelope: { body: {} } }), { code: 'slotgate_capability_required' })
+    await assert.rejects(callWorkerGet({ vmId: 'legacy-vm' }, '/internal/v1/models'), { code: 'slotgate_capability_required' })
+    await assert.rejects(countTokensViaWorker({ vmId: 'legacy-vm' }, { body: {} }), { code: 'slotgate_capability_required' })
   } finally {
     if (before == null) delete process.env.VM2API_CONTROL_PLANE_MODE
     else process.env.VM2API_CONTROL_PLANE_MODE = before
