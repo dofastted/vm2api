@@ -40,6 +40,8 @@ test(`protocol waits for ${kind} publication and preserves unknown activity`, as
   let runnerCalls = 0
   let marked = 0
   let finished = false
+  let noteRunner
+  const runnerStarted = new Promise((done) => { noteRunner = done })
   const states = []
   const handler = createHandleProtocol({
     cfg: {
@@ -58,6 +60,7 @@ test(`protocol waits for ${kind} publication and preserves unknown activity`, as
     failoverRunner: {
       async run({ applyAttempt, canonicalBody }) {
         runnerCalls++
+        noteRunner()
         if (kind === 'touch') await applyAttempt(canonicalBody, {
           vmId: 'publication-vm', accountId: 'publication-account', vm: {}, exec: {},
           markUncertain: async () => { marked++ },
@@ -78,6 +81,11 @@ test(`protocol waits for ${kind} publication and preserves unknown activity`, as
   await new Promise((done) => setImmediate(done))
   assert.equal(finished, false)
   if (kind === 'sync') {
+    const phase = await Promise.race([
+      runnerStarted.then(() => 'started'),
+      new Promise((done) => setTimeout(() => done('blocked'), 200)),
+    ])
+    assert.equal(phase, 'blocked', 'model scheduling waits for publication completion')
     assert.equal(runnerCalls, 0)
     resolve()
     await request
