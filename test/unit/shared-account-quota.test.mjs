@@ -424,3 +424,24 @@ test('ticket allocation preserves local invocation order when an earlier PG allo
   assert.equal(callsBeforeRelease, 1)
   assert.ok(BigInt(oldTicket) < BigInt(newTicket))
 })
+
+test('elapsed-window cleanup from a stale replica cannot clear a newer window with the same utilization', async (t) => {
+  const { left, right } = await pair(t)
+  left.ingestHeaders('shared-account', {
+    'anthropic-ratelimit-unified-5h-utilization': '0.9',
+    'anthropic-ratelimit-unified-5h-reset': new Date(Date.now() - 60_000).toISOString(),
+  })
+  await left.flush()
+  await right.refresh()
+  const newReset = new Date(Date.now() + 3600_000).toISOString()
+  left.ingestHeaders('shared-account', {
+    'anthropic-ratelimit-unified-5h-utilization': '0.9',
+    'anthropic-ratelimit-unified-5h-reset': newReset,
+  })
+  await left.flush()
+  right.persistEffectiveWindows('shared-account')
+  await right.flush()
+  const saved = await left.persistence.get('shared-account')
+  assert.equal(saved.unified.headers['5h'].utilization, 0.9)
+  assert.equal(saved.unified.headers['5h'].reset, newReset)
+})
