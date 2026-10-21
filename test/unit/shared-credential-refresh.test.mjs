@@ -139,6 +139,22 @@ test('a later caller may retry a definitively ended failure with the same creden
   )
 })
 
+test('a later caller may retry after a successful no-op that kept the same credential generation', async (t) => {
+  const f = await fixture(t)
+  let calls = 0
+  const callbacks = {
+    readCurrent: f.readCurrent,
+    publish: async () => f.readCurrent(),
+    refresh: async () => {
+      calls++
+      return { finished: true, value: { ok: true, refreshed: false } }
+    },
+  }
+  await f.first.run(input(), callbacks)
+  await f.second.run(input(), callbacks)
+  assert.equal(calls, 2)
+})
+
 test('missing expected generation or unreadable current credential never falls back to a raw refresh', async (t) => {
   const f = await fixture(t)
   let calls = 0
