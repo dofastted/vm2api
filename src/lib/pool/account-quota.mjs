@@ -68,6 +68,7 @@ export class AccountQuota {
     this.revisions = new Map()
     this.refreshStarted = 0
     this.refreshPublished = 0
+    this.observationTail = Promise.resolve()
     this.allocations = new Map()
     this.seedAccounts = accounts || []
     this.repo = this._workingSet()
@@ -186,7 +187,9 @@ export class AccountQuota {
 
   /** Reserve before remote I/O when the producer can identify when an observation starts. */
   beginObservation() {
-    return this.persistence.beginObservation()
+    const observation = this.observationTail.then(() => this.persistence.beginObservation())
+    this.observationTail = observation.catch(() => {})
+    return observation
   }
 
   /** Re-bind to a fresh DB connection (after backup restore). */
