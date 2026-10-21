@@ -234,8 +234,10 @@ export async function pickCodexCandidates(
       policy: routingPolicy,
     })
   }
+  if (stickyRouter?.shared) await stickyRouter.refresh()
   const stickyKeys = stickyRouter?.collectPoolKeys?.(req, body || {}, { platform: 'openai' }) || []
   const sessionKey = stickyRouter?.extractPoolKey?.(req, body || {}, { platform: 'openai' }) || stickyKeys[0] || null
+  const stickyVersions = new Map(stickyKeys.map((key) => [key, stickyRouter?.shared ? stickyRouter.versionOf(key) : 0]))
   const bound = sessionKey ? stickyRouter?.resolve?.(sessionKey) : null
   const vms = listVms(projectRoot, { codex: { quota: routingPolicy } }).filter((vm) => keyAllowsVm(scope, vm))
   const continuesResponse = !!body?.previous_response_id && !!bound?.vmId
@@ -253,7 +255,15 @@ export async function pickCodexCandidates(
   // A resting home migrates the conversation like a gone one: the next slot rebinds it.
   const boundLeft = ordered.boundState === 'gone' || ordered.boundState === 'resting'
   if (bound?.vmId && sessionKey && boundLeft) {
-    for (const key of stickyKeys.length ? stickyKeys : [sessionKey]) stickyRouter?.unbind?.(key)
+    for (const key of stickyKeys.length ? stickyKeys : [sessionKey]) {
+      if (stickyRouter?.shared) {
+        const result = await stickyRouter.unbindShared(key, {
+          ifGeneration: stickyVersions.get(key) ?? stickyRouter.versionOf(key),
+        })
+        if (!result.applied) return { error: 'sticky_binding_conflict', ids: [], candidates: [] }
+        stickyVersions.set(key, result.generation)
+      } else stickyRouter?.unbind?.(key)
+    }
     try {
       sessions?.drop?.(bound.vmId, sessionKey)
     } catch {}
@@ -261,7 +271,7 @@ export async function pickCodexCandidates(
   if (continuesResponse && (boundLeft || ordered.error === 'candidates_exhausted')) {
     return { error: 'response_not_portable', ids: [], sessionKey, stickyKeys, boundVmId: bound.vmId }
   }
-  return { ...ordered, sessionKey, stickyKeys }
+  return { ...ordered, sessionKey, stickyKeys, ...(stickyRouter?.shared ? { stickyVersions } : {}) }
 }
 
 function ingestCodexHop(projectRoot, vmId, result, now = Date.now(), policy = null) {
@@ -654,19 +664,31 @@ export async function handleCodexProtocol({
           windowGen = sessions?.touch?.(vm.id, picked.sessionKey) ?? null
         } catch {}
       }
-      const ownsPin = !!stickyBound?.vmId && stickyBound.vmId === vm.id
-      const bindSticky = (sessionId = null) => {
-        if (!picked.sessionKey || !stickyRouter?.bind) return
+      let ownsPin = !!stickyBound?.vmId && stickyBound.vmId === vm.id
+      const stickyVersions = picked.stickyVersions || new Map()
+      const bindSticky = async (sessionId = null) => {
+        if (!picked.sessionKey || !stickyRouter) return true
         const payload = { accountId: vm.id, vmId: vm.id }
         if (sessionId) payload.sessionId = sessionId
-        for (const key of stickyKeys) stickyRouter.bind(key, payload)
+        for (const key of stickyKeys) {
+          if (stickyRouter.shared) {
+            const result = await stickyRouter.bindShared(key, payload, { ifGeneration: stickyVersions.get(key) ?? 0 })
+            if (!result.applied || result.record?.vmId !== vm.id || result.nativeSessionId !== sessionId) return false
+            stickyVersions.set(key, result.generation)
+            ownsPin = true
+          } else stickyRouter.bind?.(key, payload)
+        }
+        return true
       }
-      const leaveSticky = () => {
+      const leaveSticky = async () => {
         if (!ownsPin || !picked.sessionKey) return
         try {
           sessions?.drop?.(vm.id, picked.sessionKey)
         } catch {}
-        for (const key of stickyKeys) stickyRouter?.unbind?.(key)
+        for (const key of stickyKeys) {
+          if (stickyRouter?.shared) await stickyRouter.unbindShared(key, { ifGeneration: stickyVersions.get(key) ?? 0 })
+          else stickyRouter?.unbind?.(key)
+        }
       }
       let attemptKind = 'failed'
       try {
@@ -741,7 +763,18 @@ export async function handleCodexProtocol({
         let hopEmitted = false
         const runHop = async () =>
           await runCodexKernelHop({
-            hop,
+            hop: stickyRouter?.shared
+              ? async (args) => {
+                  // Confirm each actual submission, including hidden retries. A CAS
+                  // conflict must never send a body carrying a different native session.
+                  if (!(await bindSticky(outboundSessionId))) {
+                    throw Object.assign(new Error('Shared session binding changed before Codex submission'), {
+                      code: 'sticky_binding_conflict',
+                    })
+                  }
+                  return hop(args)
+                }
+              : hop,
             args: {
               exec: execFor(projectRoot, vm),
               signal: gone.signal,
@@ -839,7 +872,7 @@ export async function handleCodexProtocol({
         const delivered = !conversionError && (result?.ok || (Number(result?.status) === 200 && usageTokens(usage) > 0))
         if (delivered) {
           attemptKind = 'succeeded'
-          bindSticky(outboundSessionId)
+          await bindSticky(outboundSessionId)
           const extracted = extractOpenaiUsage(usage)
           const serviceTier = responseServiceTier || converted.body?.service_tier || usage?.service_tier || null
           const disjoint = extracted ? openaiAnthropicUsageFromExtract(extracted) : null
@@ -896,12 +929,18 @@ export async function handleCodexProtocol({
         }
         if (isCodexFailoverError(result)) {
           pickOpts.excluded.add(vm.id)
-          leaveSticky()
+          await leaveSticky()
           switches += 1
           if (switches > failoverBudget.maxSwitches || attempts >= failoverBudget.maxAttempts) break
           continue
         }
         break
+      } catch (error) {
+        if (error?.code !== 'sticky_binding_conflict') throw error
+        stats.errors++
+        logBag.error_code = error.code
+        logBag.final_state = 'rejected'
+        return json(res, 503, { error: { type: 'api_error', code: error.code, message: '会话绑定已变更，请重试请求' } })
       } finally {
         lease.release()
         if (claimsWindow) {

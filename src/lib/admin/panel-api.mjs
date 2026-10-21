@@ -286,7 +286,7 @@ export function publicPhysicalFeatures(vm) {
 }
 
 /** Clear runtime cooldown, leftover /usage 429 flag, and sticky pins for a slot. */
-export function clearVmCooldown({ cfg, accountQuota, stickyRouter = null, poolScheduler = null, id } = {}) {
+export async function clearVmCooldown({ cfg, accountQuota, stickyRouter = null, poolScheduler = null, id } = {}) {
   const vm = getVm(cfg?.paths?.project, id)
   if (!vm) {
     return fail(
@@ -309,6 +309,10 @@ export function clearVmCooldown({ cfg, accountQuota, stickyRouter = null, poolSc
       if (repo?.clearAccountCooldown?.(key, { vmId: vm.id })) runtimeCleared += 1
     } catch {}
     try {
+      if (stickyRouter?.shared) await stickyRouter.unbindByAccountShared({ accountId: key, vmId: vm.id })
+      else stickyRouter?.unbindByAccount?.({ accountId: key, vmId: vm.id })
+    } catch {}
+    try {
       const row = accountQuota?.repo?.get?.(key)
       if (!row?.unified) continue
       let changed = false
@@ -325,9 +329,6 @@ export function clearVmCooldown({ cfg, accountQuota, stickyRouter = null, poolSc
         headersRefreshed += 1
       }
       if (changed) accountQuota.repo.save(row)
-    } catch {}
-    try {
-      stickyRouter?.unbindByAccount?.({ accountId: key, vmId: vm.id })
     } catch {}
   }
   const vmPath = path.join(cfg.paths.project, 'vms', `${vm.id}.json`)

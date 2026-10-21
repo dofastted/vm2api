@@ -104,14 +104,28 @@ export async function peekCurrentAccount({
   const detected = detectInboundPlatform(model)
   const platform = detected.ok ? detected.platform : undefined
   const identity = resolveInboundIdentity({ inbound, body: inbound, headers: req?.headers || {} })
-  const stickyKey =
-    (platform === 'anthropic' && identity.sessionId && stickyRouter?.sessionPoolKeys
-      ? stickyRouter.sessionPoolKeys(req, inbound, {
+  let stickyKey
+  if (
+    platform === 'anthropic' &&
+    (identity.sessionId || stickyRouter?.shared) &&
+    (stickyRouter?.shared || stickyRouter?.sessionPoolKeys)
+  ) {
+    const keys = stickyRouter.shared
+      ? await stickyRouter.sessionPoolKeysShared(req, inbound, {
           sessionId: identity.sessionId,
           deviceId: identity.deviceId,
           migrate: false,
-        }).stickyKey
-      : stickyRouter?.extractPoolKey?.(req, inbound, { platform })) || null
+        })
+      : stickyRouter.sessionPoolKeys(req, inbound, {
+          sessionId: identity.sessionId,
+          deviceId: identity.deviceId,
+          migrate: false,
+        })
+    stickyKey = keys.stickyKey || null
+  } else {
+    if (stickyRouter?.shared) await stickyRouter.refresh()
+    stickyKey = stickyRouter?.extractPoolKey?.(req, inbound, { platform }) || null
+  }
   if (!poolScheduler?.peekAccount) {
     return { ok: false, code: 'no_eligible_accounts' }
   }

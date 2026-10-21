@@ -72,7 +72,7 @@ async function fixture(t) {
     key,
     response,
     jobs,
-    run({ ensure, hop } = {}) {
+    run({ ensure, hop, routing = {} } = {}) {
       return handleCodexProtocol({
         req,
         res: response,
@@ -83,6 +83,7 @@ async function fixture(t) {
         stats: { errors: 0, requests: 0, by_route: {} },
         projectRoot: root,
         stickyRouter: router,
+        routing,
         json(_res, status, value) {
           response.status = status
           response.body = value
@@ -96,7 +97,10 @@ async function fixture(t) {
           ensureCodexKernel: ensure || (async () => ({ ok: true })),
           streamCodexKernel: async (args) => {
             jobs.push(args)
-            if (hop) await hop(args)
+            if (hop) {
+              const result = await hop(args)
+              if (result) return result
+            }
             return { ok: true, status: 200, terminalState: 'verified', body: { id: 'resp-synthetic' } }
           },
         },
@@ -157,6 +161,44 @@ test('a late Codex success cannot restore a pin moved by another controller', as
   assert.equal(stored.session_id, null)
 })
 
+test('a shared native-session conflict stops an implicit Codex transport retry', async (t) => {
+  const fx = await fixture(t)
+  await fx.run({
+    hop: async () => {
+      await fx.peer.refresh()
+      await fx.peer.rebindFamilyShared(
+        fx.key,
+        { accountId: 'vm-gpt-b', vmId: 'vm-gpt-b' },
+        { ifGeneration: fx.peer.versionOf(fx.key) },
+      )
+      return { ok: false, status: 502, body: { error: { code: 'upstream_transport' } } }
+    },
+  })
+  assert.equal(fx.jobs.length, 1, 'each actual retry must confirm the captured binding generation again')
+  assert.equal(fx.response.status, 503)
+  assert.equal(fx.response.body.error.code, 'sticky_binding_conflict')
+  assert.equal((await fx.peer.persistence.get(fx.key)).vm_id, 'vm-gpt-b')
+})
+
+test('a late Codex failure cannot unbind a pin moved by another controller', async (t) => {
+  const fx = await fixture(t)
+  await fx.run({
+    routing: { failover: { max_total_attempts: 1, max_account_switches: 0 } },
+    hop: async () => {
+      await fx.peer.refresh()
+      await fx.peer.rebindFamilyShared(
+        fx.key,
+        { accountId: 'vm-gpt-b', vmId: 'vm-gpt-b' },
+        { ifGeneration: fx.peer.versionOf(fx.key) },
+      )
+      return { ok: false, status: 401, body: { error: { code: 'oauth_revoked' } } }
+    },
+  })
+  assert.equal(fx.jobs.length, 1)
+  assert.equal(fx.response.status, 401)
+  assert.equal((await fx.peer.persistence.get(fx.key)).vm_id, 'vm-gpt-b')
+})
+
 test('count_tokens awaits the shared read-only session helper with migrate disabled', async () => {
   const entered = deferred()
   const resume = deferred()
@@ -214,7 +256,6 @@ test('panel cooldown clearing awaits shared sticky deletion before returning', a
       cfg: { paths: { project: fx.root } },
       id: 'vm-gpt-a',
       stickyRouter: fx.router,
-      accountQuota: { repo: { get: () => ({ unified: {} }) } },
     }),
   ).then((result) => {
     settled = true
