@@ -147,11 +147,47 @@ test('admin owner remains uncapped and current key configuration accompanies a r
   const [first, second] = await replicas()
   const owner = await user(first, { role: 'admin' })
   const key = await first.create({ user_id: owner.id, max_concurrency: 0 })
-  await first.update(key.id, { category: 'api' })
+  await first.update(key.id, { rpm: 20 })
   const gates = await Promise.all([first.reserve(key), second.reserve(key)])
   assert.ok(gates.every((g) => g.ok))
-  assert.ok(gates.every((g) => g.record.category === 'api'))
+  assert.ok(gates.every((g) => g.record.rpm === 20))
   await Promise.all(gates.map((g) => g.release()))
+})
+
+test('authorization policy changes after authentication require a fresh request', async () => {
+  const [first, second] = await replicas()
+  const key = await first.create({ max_concurrency: 0 })
+  for (const [column, value] of [
+    ['category', 'api'],
+    ['group_type', 'platform'],
+    ['allowed_vms', '["vm-other"]'],
+    ['vm_pool_id', 'pool-other'],
+    ['user_id', 'owner-other'],
+    ['group_id', 2],
+  ]) {
+    const stale = await first.getById(key.id)
+    await first.db.prepare(`UPDATE api_keys SET ${column} = $1 WHERE id = $2`).run(value, key.id)
+    assert.equal((await second.reserve(stale)).code, 'api_key_changed', column)
+  }
+})
+
+test('a failed usage transaction retains pending quota and can be safely retried', async () => {
+  const [first, second] = await replicas()
+  const key = await first.create({ max_concurrency: 0, quota_requests: 1 })
+  const gate = await first.reserve(key)
+  const record = first.repo.recordUsage.bind(first.repo)
+  first.repo.recordUsage = async (...args) => {
+    await record(...args)
+    throw new Error('settlement failed before commit')
+  }
+  await assert.rejects(first.recordUsage(key, {}, { reservation: gate }), /settlement failed before commit/)
+  assert.equal(gate.settled, false)
+  assert.equal((await first.getById(key.id)).quota_requests_used, 0)
+  assert.equal((await second.reserve(key)).code, 'api_key_quota_exhausted')
+  first.repo.recordUsage = record
+  await first.recordUsage(key, {}, { reservation: gate })
+  await gate.release()
+  assert.equal((await first.getById(key.id)).quota_requests_used, 1)
 })
 
 test('old executing reservations do not expire or disappear when their connection closes', async () => {
