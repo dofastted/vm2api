@@ -688,6 +688,33 @@ test('slot /usage stops once Fable limits arrive', async () => {
   fs.rmSync(home, { recursive: true, force: true })
 })
 
+test('slot /usage stops after an unconfirmed timeout instead of overwriting it with a retry', async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cc-usage-unknown-'))
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }))
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true })
+  let calls = 0
+  const run = await runOfficialCcUsage({
+    homeDir: home,
+    retryDelayMs: 0,
+    turn: async ({ outFile }) => {
+      calls++
+      fs.writeFileSync(
+        outFile,
+        calls === 1
+          ? ''
+          : usageLines([
+              { kind: 'session', percent: 10 },
+              { kind: 'weekly_all', percent: 30 },
+            ]),
+      )
+      return calls === 1 ? { ok: false, code: null, timed_out: true } : { ok: true, code: 0, timed_out: false }
+    },
+  })
+  assert.equal(calls, 1)
+  assert.equal(run.turn.timed_out, true)
+  assert.equal(run.attemptFinished, false)
+})
+
 test('collectOfficialCcAccount reads tier from profile and model ids via slot worker', async () => {
   const ops = []
   const slotOauth = async (_exec, op) => {

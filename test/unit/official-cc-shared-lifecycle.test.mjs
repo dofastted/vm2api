@@ -14,6 +14,7 @@ import {
   readOfficialCcStatus,
   scheduleOfficialCcBootstrap,
 } from '../../src/lib/oauth/official-cc-bootstrap.mjs'
+import { writeWorkerCredentialFile } from '../../src/lib/oauth/oauth-credentials.mjs'
 
 async function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'official-shared-lifecycle-'))
@@ -58,6 +59,78 @@ async function fixture(t) {
   })
   return { db, peer, tasks, other, options, finish, vm, root }
 }
+
+function prepareRawBootstrap(f, t) {
+  const home = officialCcHome(f.root, f.vm.id)
+  f.vm.claude.has_access = true
+  fs.writeFileSync(path.join(f.root, 'vms', f.vm.id + '.json'), JSON.stringify(f.vm))
+  writeWorkerCredentialFile(home, {
+    mode: 'oauth',
+    access_token: 'synthetic-access',
+    expires_at: '2099-01-01T00:00:00Z',
+  })
+  fs.mkdirSync(path.join(home, '.kin'), { recursive: true })
+  fs.writeFileSync(path.join(home, '.kin', 'cli-node'), '#!/bin/sh\nprintf synthetic-version\n', { mode: 0o700 })
+  const bin = path.join(f.root, 'bin')
+  fs.mkdirSync(bin)
+  // Every Docker call uses this synthetic executable; no daemon or VM is contacted.
+  fs.writeFileSync(path.join(bin, 'docker'), '#!/bin/sh\nprintf "{}"\n', { mode: 0o700 })
+  const previous = process.env.PATH
+  process.env.PATH = bin + path.delimiter + previous
+  t.after(() => {
+    process.env.PATH = previous
+  })
+  delete f.options.runBootstrap
+  Object.assign(f.options, {
+    wipe: false,
+    applySeed: false,
+    reconcileFingerprint: false,
+    syncTelemetry: false,
+    retryDelayMs: 0,
+    slotOauth: async (_exec, op) => ({
+      ok: true,
+      attemptFinished: true,
+      body: op === 'profile' ? { account: {}, organization: {} } : { data: [] },
+    }),
+  })
+}
+
+test('a raw bootstrap usage timeout keeps task and VM ownership and prevents a later retry', async (t) => {
+  const f = await fixture(t)
+  prepareRawBootstrap(f, t)
+  let calls = 0
+  f.options.runTurn = async ({ prompt, outFile }) => {
+    if (prompt !== '/usage') return { ok: true, code: 0, timed_out: false }
+    calls++
+    fs.writeFileSync(
+      outFile,
+      calls === 1
+        ? ''
+        : [
+            JSON.stringify({
+              type: 'assistant',
+              usage_report: {
+                rate_limits: {
+                  limits: [
+                    { kind: 'session', percent: 10 },
+                    { kind: 'weekly_all', percent: 30 },
+                  ],
+                },
+              },
+            }),
+            JSON.stringify({ type: 'result', result: 'ok' }),
+          ].join('\n'),
+    )
+    return calls === 1 ? { ok: false, code: null, timed_out: true } : { ok: true, code: 0, timed_out: false }
+  }
+  await scheduleOfficialCcBootstrap(f.options)
+  await f.tasks.flush()
+  assert.equal((await f.other.tryAcquire({ vmId: f.vm.id })).ok, false)
+  const claim = await f.peer.prepare('SELECT unknown_at, finished_at FROM background_task_runs').get()
+  assert.notEqual(claim.unknown_at, null)
+  assert.equal(claim.finished_at, null)
+  assert.equal(calls, 1)
+})
 
 test('manual bootstrap rejects a busy VM before queued status or background effects are written', async (t) => {
   const f = await fixture(t)
