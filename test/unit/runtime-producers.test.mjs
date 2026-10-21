@@ -65,3 +65,43 @@ test('runtime observation tickets retain local invocation order while allocation
   first.resolve(1)
   assert.deepEqual(await Promise.all([a, b]), [1, 2])
 })
+
+test('shared scheduler waits for committed quota cleanup and preserves VM restriction when CAS loses', async (t) => {
+  const fs = await import('node:fs')
+  const os = await import('node:os')
+  const path = await import('node:path')
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-runtime-cleanup-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const file = path.join(root, 'vm-cleanup.json')
+  const vm = { id: 'vm-cleanup', claude: { temp_unschedulable_reason: 'quota_exhausted', temp_unschedulable_until: 1 } }
+  fs.writeFileSync(file, JSON.stringify(vm))
+  const entered = deferred()
+  const resume = deferred()
+  const pool = new PoolScheduler({
+    projectRoot: root,
+    runtimeRepo: {
+      get: () => ({ cooldown_reason: 'quota_exhausted', cooldown_until: 1 }),
+      upsert() {},
+      async clearQuotaCooldownCommitted() {
+        entered.resolve()
+        await resume.promise
+        return false
+      },
+    },
+  })
+  pool.shared = true
+  let settled = false
+  const result = Promise.resolve(pool.clearQuotaRestriction(vm, 'account-cleanup', file)).then((value) => {
+    settled = true
+    return value
+  })
+  try {
+    await Promise.race([entered.promise, result.then(() => assert.fail('cleanup returned before PostgreSQL confirmation'))])
+    assert.equal(settled, false)
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).claude.temp_unschedulable_reason, 'quota_exhausted')
+  } finally {
+    resume.resolve()
+  }
+  assert.equal(await result, false)
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).claude.temp_unschedulable_reason, 'quota_exhausted')
+})
