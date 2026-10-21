@@ -71,7 +71,7 @@ import { ensureProxyEgress, proxyEgressReady } from './lib/vm/egress.mjs'
 import { syncIpv6ProxyEgress } from './lib/vm/proxy-policy-runtime.mjs'
 import { GATEWAY_CAPABILITIES } from './lib/vm/execution-context.mjs'
 import { isTelemetryPath, telemetryInterceptResponse } from './lib/identity/telemetry-rewrite.mjs'
-import { openDatabase, closeDatabase } from './lib/db/database.mjs'
+import { openDatabase, closeDatabase, getActivityCoordinator } from './lib/db/database.mjs'
 import { runLegacyImport } from './lib/db/legacy-import.mjs'
 import { initVmDbSync, stopVmWatch, flushVmDbSync, pauseVmDbSync, resumeVmDbSync } from './lib/vm/vm-db-sync.mjs'
 import { flushPendingWrites } from './lib/db/pending-writes.mjs'
@@ -151,13 +151,28 @@ const activeRequests = new Set()
 let _shuttingDown = false
 const dataDir = cfg.paths.data || path.join(cfg.paths.root, 'data')
 const db = await openDatabase({ dataDir })
+const activityCoordinator = getActivityCoordinator(db)
+db.bootstrapActivity?.enter()
 let controlPlaneLock = null
 let startupAborting = false
 const lifecycle = new ControlPlaneLifecycle({
-  probe: () => db.prepare('SELECT 1').get(),
-  lockHealthy: () => !kubernetesMode || controlPlaneLock?.healthy === true,
+  probe: async () => {
+    if (activityCoordinator) {
+      if (!(await activityCoordinator.isReady())) throw new Error('global maintenance is not ready')
+      return db.pool.query('SELECT 1')
+    }
+    return db.prepare('SELECT 1').get()
+  },
+  lockHealthy: () => !kubernetesMode || (controlPlaneLock?.healthy === true && activityCoordinator?.healthy === true),
   isMaintaining: () => backupService.isMaintaining,
 })
+if (activityCoordinator) {
+  activityCoordinator.onLost = (error) => {
+    lifecycle.beginDrain()
+    if (!lifecycle.initialized) void failStartup(error)
+    else void shutdown('activity_connection_lost', { failed: true })
+  }
+}
 async function failStartup(error) {
   if (startupAborting) return
   startupAborting = true
@@ -191,6 +206,7 @@ if (kubernetesMode) {
     await controlPlaneLock.start()
   } catch (error) {
     await controlPlaneLock.stop()
+    await db.bootstrapActivity?.complete({ ended: true, reason: 'startup_exclusive_guard_rejected' })
     await closeDatabase()
     throw Object.assign(new Error(`Control plane startup failed: ${error.code || 'lock_unavailable'}`), {
       code: error.code || 'lock_unavailable',
@@ -945,6 +961,7 @@ const importCommit = createImportCommit({
 const { commitImportedOauth, requireSlotProxy, officialCcStatsHandler } = importCommit
 
 const protocolHandlers = createHandleProtocol({
+  onExecutionState: noteRequestExecution,
   json,
   writeSSEHeaders,
   readBody,
@@ -990,12 +1007,20 @@ async function dispatchProtocol(name, req, res, ...args) {
       error: { type: 'overloaded_error', code: 'maintenance_in_progress', message: 'Database maintenance in progress' },
     })
   }
-  activeRequests.add(req)
-  try {
-    return await protocolHandlers[name](req, res, ...args)
-  } finally {
-    activeRequests.delete(req)
-  }
+  return withRequestActivity(
+    req,
+    res,
+    async () => {
+      const alreadyTracked = activeRequests.has(req)
+      activeRequests.add(req)
+      try {
+        return await protocolHandlers[name](req, res, ...args)
+      } finally {
+        if (!alreadyTracked) activeRequests.delete(req)
+      }
+    },
+    'websocket_request',
+  )
 }
 
 const handleProtocol = async (...args) => await dispatchProtocol('handleProtocol', ...args)
@@ -1160,7 +1185,60 @@ const handlePanel = createPanelHandler({
 })
 
 const sockets = new Set()
-const server = http.createServer(async (req, res) => {
+const requestActivities = new WeakMap()
+
+function noteRequestExecution(req, execution) {
+  const state = requestActivities.get(req)
+  if (!state) return
+  state.gate.noteExecution(execution)
+  const id = execution?.requestId
+  if (!id && execution?.started === true) {
+    state.unknown = true
+    return
+  }
+  if (id) {
+    const previous = state.executions.get(id)
+    state.executions.set(id, {
+      started: execution.started === true || previous?.started === true,
+      ended: execution.ended === true,
+    })
+  }
+}
+
+async function withRequestActivity(req, res, callback, kind = 'http') {
+  if (!activityCoordinator || requestActivities.has(req)) return callback()
+  const gate = await activityCoordinator.admit({ kind })
+  const state = { gate, executions: new Map(), unknown: false }
+  requestActivities.set(req, state)
+  let responseDone
+  if (res) {
+    responseDone = new Promise((resolve) => {
+      if (res.writableFinished || res.writableEnded || res.destroyed || res.closed) return resolve()
+      res.once('finish', resolve)
+      res.once('close', resolve)
+    })
+  }
+  try {
+    return await gate.run(async () => {
+      try {
+        const value = await callback()
+        await responseDone
+        await flushRuntimeWrites()
+        return value
+      } catch (error) {
+        state.unknown = true
+        throw error
+      }
+    })
+  } finally {
+    const ended =
+      !state.unknown && [...state.executions.values()].every((execution) => !execution.started || execution.ended)
+    await gate.complete({ ended, reason: ended ? 'handler_persisted' : 'handler_execution_unknown' })
+    requestActivities.delete(req)
+  }
+}
+
+async function handleHttp(req, res) {
   const handlerFinished = lifecycle.trackHttp(req, res)
   activeRequests.add(req)
   try {
@@ -1351,6 +1429,24 @@ const server = http.createServer(async (req, res) => {
     activeRequests.delete(req)
     handlerFinished()
   }
+}
+
+const server = http.createServer((req, res) => {
+  const url = parseRequestUrl(req)
+  const probe = (req.method === 'GET' || req.method === 'HEAD') && ['/healthz', '/readyz'].includes(url?.pathname)
+  const pending = probe ? handleHttp(req, res) : withRequestActivity(req, res, () => handleHttp(req, res))
+  pending.catch((error) => {
+    console.warn(`[http] activity failed: ${error.code || error.name}`)
+    if (!res.headersSent)
+      json(res, error.code?.startsWith('maintenance_') || error.code === 'database_maintenance' ? 503 : 500, {
+        error: {
+          type: 'overloaded_error',
+          code: error.code || 'request_activity_failed',
+          message: 'Request activity unavailable',
+        },
+      })
+    else res.end()
+  })
 })
 
 server.on('connection', (socket) => {
@@ -1515,6 +1611,7 @@ async function shutdown(signal, { failed = false } = {}) {
         await flushRuntimeWrites()
         stopAllRustKernels()
         await clusterManager.stop()
+        await activityCoordinator?.stop()
         await controlPlaneLock?.stop()
         await closeDatabase()
       })(),
@@ -1558,6 +1655,11 @@ async function flushRuntimeWrites() {
 }
 
 await bootApiKernel(cfg)
+if (activityCoordinator) {
+  await flushRuntimeWrites()
+  await activityCoordinator.acknowledgeEpoch(db.bootstrapActivity.epoch)
+  await db.bootstrapActivity.complete({ ended: true, reason: 'startup_initialized' })
+}
 
 server.listen(cfg.port, cfg.host, async () => {
   try {

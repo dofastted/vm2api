@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { getDb } from '../db/database.mjs'
+import { getDb, getActivityCoordinator } from '../db/database.mjs'
 import { BackgroundTaskRunsRepo } from '../db/repos/background-task-runs-repo.mjs'
 import { isKubernetesMode } from './control-plane-mode.mjs'
 
@@ -8,27 +8,60 @@ const services = new WeakMap()
 /** Unknown work remains occupied until an explicit recovery protocol proves it ended. */
 export class SharedBackgroundTasks {
   constructor(db, { ownerId = randomUUID() } = {}) {
+    this.db = db
     this.repo = new BackgroundTaskRunsRepo(db)
     this.ownerId = ownerId
     this.pending = new Set()
   }
 
-  now() {
-    return this.repo.now()
+  _coordinator() {
+    const coordinator = getActivityCoordinator(this.db)
+    if (!coordinator && isKubernetesMode()) {
+      throw Object.assign(new Error('background activity coordinator unavailable'), { code: 'maintenance_unavailable' })
+    }
+    return coordinator
+  }
+
+  async now() {
+    const activity = await this._coordinator()?.admit({ kind: 'background_clock' })
+    try {
+      return await (activity ? activity.run(() => this.repo.now()) : this.repo.now())
+    } finally {
+      await activity?.complete({ ended: true, reason: 'clock_read_completed' })
+    }
   }
 
   async tryClaim(plan) {
-    const identity = await this.repo.tryClaim({ ...plan, ownerId: this.ownerId })
-    if (!identity.ok) return identity
+    const activity = await this._coordinator()?.admit({
+      kind: 'background',
+      requestId: plan.executionId || plan.taskKey,
+    })
+    const run = (fn) => (activity ? activity.run(fn) : fn())
+    let identity
+    try {
+      identity = await run(() => this.repo.tryClaim({ ...plan, ownerId: this.ownerId }))
+    } catch (error) {
+      await activity?.complete({ ended: true, reason: 'background_claim_not_started' })
+      throw error
+    }
+    if (!identity.ok) {
+      await activity?.complete({ ended: true, reason: 'background_claim_rejected' })
+      return identity
+    }
     let unknown = false
     let marking = null
     let completing = null
     return {
       ...identity,
+      run,
       markUnknown: () => {
         unknown = true
         if (!marking) {
-          const pending = this.markUnknown(identity)
+          const pending = (async () => {
+            const result = await run(() => this.markUnknown(identity))
+            await activity?.markUncertain('background_task_unknown')
+            return result
+          })()
           marking = pending
           pending.catch(() => {
             if (marking === pending) marking = null
@@ -42,7 +75,12 @@ export class SharedBackgroundTasks {
           return { completed: false }
         }
         if (!completing) {
-          const pending = this.complete(identity, options)
+          const pending = (async () => {
+            const result = await run(() => this.complete(identity, options))
+            if (result.completed) await activity?.complete({ ended: true, reason: 'background_task_completed' })
+            else await activity?.markUncertain('background_task_completion_unconfirmed')
+            return result
+          })()
           completing = pending
           pending.then(
             (result) => {
@@ -86,7 +124,7 @@ export class SharedBackgroundTasks {
       }
     let outcome
     try {
-      outcome = await callback()
+      outcome = await claim.run(callback)
     } catch (error) {
       if (error?.taskNotStarted === true || error?.taskTerminal === true) await this._complete(claim)
       else await claim.markUnknown()

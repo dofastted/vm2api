@@ -66,6 +66,19 @@ export class GlobalMaintenanceCoordinator {
     return this._healthy
   }
 
+  async isReady() {
+    if (!this.healthy || this._closing) return false
+    const row = (
+      await this.db.pool.query(
+        `SELECT c.phase, c.epoch, m.bound_epoch
+      FROM ${this.qualified}.control c JOIN ${this.qualified}.members m ON m.owner_id = $1
+      WHERE c.id = 1 AND m.stopped_at IS NULL`,
+        [this.ownerId],
+      )
+    ).rows[0]
+    return this.healthy && row?.phase === 'open' && Number(row.bound_epoch) === Number(row.epoch)
+  }
+
   _exclusiveLocal(fn) {
     const pending = this._serial.then(fn)
     this._serial = pending.catch(() => {})
@@ -238,6 +251,20 @@ export class GlobalMaintenanceCoordinator {
     return this._admit(metadata, false)
   }
 
+  /** Producers must explicitly report whether their work ended; a missing result retains the claim. */
+  async runActivity(metadata, callback) {
+    const gate = await this.admit(metadata)
+    let outcome
+    try {
+      outcome = await gate.run(() => callback(gate))
+    } catch (error) {
+      await gate.complete({ ended: error.activityEnded === true, reason: error.code || 'activity_callback_failed' })
+      throw error
+    }
+    await gate.complete({ ended: outcome?.ended === true, reason: outcome?.reason })
+    return outcome?.value
+  }
+
   /** Hold across migrations and initial cache loading, before the first epoch acknowledgement. */
   admitBootstrap({ requestId = null } = {}) {
     return this._admit({ kind: 'bootstrap', requestId }, true)
@@ -295,7 +322,7 @@ export class GlobalMaintenanceCoordinator {
   }
 
   _gate(id, epoch, kind) {
-    const scope = { coordinator: this, id, epoch, kind, active: true }
+    const scope = { coordinator: this, id, epoch, kind, active: true, remoteStarted: false }
     const assertActive = () => {
       this._assertHealthy()
       if (!scope.active) throw failure('maintenance_activity_closed', 'The activity scope has completed')
@@ -307,7 +334,15 @@ export class GlobalMaintenanceCoordinator {
       assertActive,
       run: (fn) => {
         assertActive()
-        return activities.run(scope, fn)
+        return activities.run({ scope, parent: activities.getStore() }, fn)
+      },
+      enter: () => {
+        assertActive()
+        activities.enterWith({ scope, parent: activities.getStore() })
+      },
+      noteExecution: (execution) => {
+        assertActive()
+        if (execution?.started === true) scope.remoteStarted = true
       },
       complete: (execution) => this._complete(scope, execution),
       markUncertain: (reason) => this._complete(scope, { ended: false, reason }),
@@ -317,11 +352,12 @@ export class GlobalMaintenanceCoordinator {
 
   assertActivity() {
     this._assertHealthy()
-    const scope = activities.getStore()
-    if (scope?.coordinator !== this || !scope.active) {
-      throw failure('maintenance_activity_closed', 'SQL requires a live admitted activity scope')
+    for (let context = activities.getStore(); context; context = context.parent) {
+      const { scope } = context
+      if (!scope.active) throw failure('maintenance_activity_closed', 'An inherited activity scope has completed')
+      if (scope.coordinator === this) return scope
     }
-    return scope
+    throw failure('maintenance_activity_closed', 'SQL requires a live admitted activity scope')
   }
 
   async _complete(scope, execution) {

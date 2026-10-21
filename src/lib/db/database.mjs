@@ -5,13 +5,26 @@ import crypto from 'node:crypto'
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { fileURLToPath } from 'node:url'
 import pg from 'pg'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 
 const MIGRATIONS_DIR = fileURLToPath(new URL('./postgres-migrations/', import.meta.url))
 const transactions = new AsyncLocalStorage()
 const maintenance = new AsyncLocalStorage()
 const instances = new Set()
+const activityCoordinators = new WeakMap()
 let singleton = null
 let opening = null
+
+export function registerActivityCoordinator(db, coordinator) {
+  if (coordinator.db !== db || (activityCoordinators.has(db) && activityCoordinators.get(db) !== coordinator)) {
+    throw new Error('database activity coordinator mismatch')
+  }
+  activityCoordinators.set(db, coordinator)
+}
+
+export function getActivityCoordinator(db) {
+  return activityCoordinators.get(db) || null
+}
 
 export function quoteIdentifier(value) {
   return '"' + String(value).replaceAll('"', '""') + '"'
@@ -73,6 +86,7 @@ export class PostgresDatabase {
 
   async query(sql, params = []) {
     if (this.closed) throw new Error('database is closed')
+    getActivityCoordinator(this)?.assertActivity()
     const tx = transactions.getStore()
     if (this.maintaining && maintenance.getStore() !== this && tx?.db !== this) {
       throw Object.assign(new Error('database maintenance in progress'), { code: 'database_maintenance' })
@@ -136,6 +150,11 @@ export class PostgresDatabase {
           }
         }
       } finally {
+        try {
+          await getActivityCoordinator(this)?.stop()
+        } catch (error) {
+          failure ||= error
+        }
         this.closed = true
         await this.pool.end()
         instances.delete(this)
@@ -147,6 +166,7 @@ export class PostgresDatabase {
 }
 
 export async function withTransaction(db, fn) {
+  getActivityCoordinator(db)?.assertActivity()
   const outer = transactions.getStore()
   if (outer?.db === db) return fn(db)
   if (db.closed) throw new Error('database is closed')
@@ -240,16 +260,28 @@ export async function createDatabase(options = {}) {
   }
   const db = new PostgresDatabase({ ...options, schema: options.schema || process.env.KIN_DATABASE_SCHEMA || 'public' })
   try {
-    const version = Number((await db.prepare('SHOW server_version_num').get()).server_version_num)
-    if (version < 170000 || version >= 180000)
-      throw new Error('vm2api requires PostgreSQL 17 and PostgreSQL 17 backup clients')
-    await applyMigrations(db, options)
-    if (options.dataDir && fs.existsSync(path.join(options.dataDir, 'kin.db')) && !options.allowLegacySource) {
-      const imported = await db.prepare("SELECT value FROM settings WHERE key = 'sqlite_import_done'").get()
-      if (!imported) throw new Error('existing SQLite data requires db:import:sqlite before PostgreSQL startup')
+    if (isKubernetesMode()) {
+      const { GlobalMaintenanceCoordinator } = await import('./global-maintenance.mjs')
+      const coordinator = new GlobalMaintenanceCoordinator(db)
+      registerActivityCoordinator(db, coordinator)
+      await coordinator.start()
+      db.bootstrapActivity = await coordinator.admitBootstrap()
     }
+    const initialize = async () => {
+      const version = Number((await db.prepare('SHOW server_version_num').get()).server_version_num)
+      if (version < 170000 || version >= 180000)
+        throw new Error('vm2api requires PostgreSQL 17 and PostgreSQL 17 backup clients')
+      await applyMigrations(db, options)
+      if (options.dataDir && fs.existsSync(path.join(options.dataDir, 'kin.db')) && !options.allowLegacySource) {
+        const imported = await db.prepare("SELECT value FROM settings WHERE key = 'sqlite_import_done'").get()
+        if (!imported) throw new Error('existing SQLite data requires db:import:sqlite before PostgreSQL startup')
+      }
+    }
+    if (db.bootstrapActivity) await db.bootstrapActivity.run(initialize)
+    else await initialize()
     return db
   } catch (error) {
+    await db.bootstrapActivity?.complete({ ended: true, reason: 'database_initialization_failed' }).catch(() => {})
     await db.close()
     throw error
   }

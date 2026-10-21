@@ -4,6 +4,7 @@ import pg from 'pg'
 import * as database from '../../src/lib/db/database.mjs'
 import { GlobalMaintenanceCoordinator, coordinationSchemaFor } from '../../src/lib/db/global-maintenance.mjs'
 import { SharedBackgroundTasks } from '../../src/lib/core/shared-background-tasks.mjs'
+import { withDatabaseActivities } from '../maintenance-fixture.mjs'
 
 async function fixture(t) {
   const db = database.getDb()
@@ -123,4 +124,15 @@ test('shared background work enters an independent activity and retains unknown 
     WHERE completed_at IS NULL AND uncertain_at IS NOT NULL`)
   ).rows[0]
   assert.equal(row.n, 1)
+})
+
+test('the explicit activity fixture keeps independent PostgreSQL scopes live together', async (t) => {
+  const { db } = await fixture(t)
+  const peer = await database.createDatabase({ connectionString: db.connectionString, schema: db.schema })
+  await withDatabaseActivities([db, peer], async () => {
+    assert.equal((await db.query('SELECT 1 AS n')).rows[0].n, 1)
+    assert.equal((await peer.query('SELECT 2 AS n')).rows[0].n, 2)
+  })
+  await assert.rejects(peer.query('SELECT 1'), { code: 'maintenance_activity_closed' })
+  await peer.close()
 })
