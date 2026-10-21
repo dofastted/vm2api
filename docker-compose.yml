@@ -8,6 +8,10 @@ services:
     container_name: ${VM2API_CONTAINER_NAME:-vm2api}
     restart: unless-stopped
     init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
     network_mode: host
     cap_add:
       - NET_ADMIN
@@ -17,6 +21,7 @@ services:
     environment:
       KIN_PROJECT_ROOT: /opt/vm2api
       KIN_DATA_DIR: /opt/vm2api/data
+      VM2API_DATABASE_URL: ${VM2API_DATABASE_URL:-${KIN_DATABASE_URL:-postgresql://vm2api:${VM2API_POSTGRES_PASSWORD:-}@127.0.0.1:${VM2API_POSTGRES_PORT:-55432}/vm2api}}
       KIN_KERNEL_BIN: /opt/vm2api/bin/kin-kernel
       KIN_EGRESS_BIN: /opt/vm2api/bin/kin-egress
       KIN_WORKER_BIN: /opt/vm2api/bin/kin-worker
@@ -36,3 +41,27 @@ services:
       - ./bin:/opt/vm2api/bin
       - ./share:/opt/vm2api/share
       - ./src/config:/opt/vm2api/src/config
+
+  postgres:
+    image: postgres:17-bookworm
+    profiles: [postgres]
+    restart: unless-stopped
+    entrypoint: [/bin/bash, /usr/local/bin/vm2api-postgres-entrypoint]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+      VM2API_POSTGRES_PASSWORD: ${VM2API_POSTGRES_PASSWORD:-}
+    ports:
+      - "127.0.0.1:${VM2API_POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./deploy/postgres-entrypoint.sh:/usr/local/bin/vm2api-postgres-entrypoint:ro
+      - ./deploy/postgres-init.sh:/docker-entrypoint-initdb.d/10-vm2api.sh:ro
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U vm2api -d vm2api && psql -U vm2api -d vm2api -Atqc 'SELECT 1' >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+volumes:
+  postgres-data:

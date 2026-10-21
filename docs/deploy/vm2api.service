@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/vm2api
+# /etc/vm2api.env must contain VM2API_DATABASE_URL. See postgresql.md.
 EnvironmentFile=/etc/vm2api.env
 ExecStart=/usr/bin/node src/server.mjs
 Restart=on-failure

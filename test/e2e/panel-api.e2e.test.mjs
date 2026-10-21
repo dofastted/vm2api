@@ -33,18 +33,18 @@ test('panel login → cookie → /api/panel/me', async () => {
   }
 })
 
-test('admin database metrics endpoint returns a safe SQLite snapshot', async () => {
+test('admin database metrics endpoint returns a safe PostgreSQL snapshot', async () => {
   const gw = await startGateway()
   try {
     const response = await api(gw, 'GET', '/api/panel/database/metrics')
     assert.equal(response.status, 200, response.text)
     const data = response.json.data || response.json
-    assert.equal(data.database.engine, 'sqlite')
+    assert.equal(data.database.engine, 'postgresql')
     assert.equal(data.database.ok, true)
-    assert.equal(data.database.journal_mode, 'wal')
+    assert.equal('wal_size_bytes' in data.database, false)
     assert.equal(typeof data.database.probe_latency_ms, 'number')
-    assert.equal(typeof data.database.file_size_bytes, 'number')
-    assert.equal(typeof data.database.page_count, 'number')
+    assert.equal(typeof data.database.size_bytes, 'number')
+    assert.equal(typeof data.database.pool_total, 'number')
     assert.equal(typeof data.usage_cache.requests, 'number')
     assert.ok(data.sampled_at)
 

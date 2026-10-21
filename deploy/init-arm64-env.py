@@ -57,11 +57,16 @@ def main() -> int:
 
     root = Path(__file__).resolve().parents[1]
     env_path = root / ".env"
+    postgres_password = secrets.token_hex(32)
     values = {
         "VM2API_ADMIN_USER": "admin",
         "VM2API_ADMIN_PASSWORD": secrets.token_urlsafe(24),
         "VM2API_API_KEY": secrets.token_hex(32),
         "VM2API_DB_SECRET": secrets.token_hex(32),
+        "COMPOSE_PROFILES": "postgres",
+        "VM2API_POSTGRES_PORT": "55432",
+        "VM2API_POSTGRES_PASSWORD": postgres_password,
+        "VM2API_DATABASE_URL": f"postgresql://vm2api:{postgres_password}@127.0.0.1:55432/vm2api",
         "VM2API_CONTAINER_NAME": args.container_name,
         "VM2API_BIND_HOST": args.bind_host,
         "PORT": str(args.port),
@@ -72,7 +77,7 @@ def main() -> int:
         fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         print("Existing .env preserved. Review it locally before starting this deployment.")
-        missing = [key for key in ("COMPOSE_FILE", "VM2API_HOST_ROOT") if not env_has(env_path, key)]
+        missing = [key for key in ("COMPOSE_FILE", "VM2API_HOST_ROOT", "VM2API_DATABASE_URL") if not env_has(env_path, key)]
         if missing:
             print(f"Add to .env: COMPOSE_FILE={COMPOSE_FILE} and VM2API_HOST_ROOT={root} "
                   f"(missing: {', '.join(missing)}).")
