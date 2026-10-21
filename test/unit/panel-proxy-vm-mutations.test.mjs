@@ -13,6 +13,7 @@ import { ExecutionAdmissionsRepo } from '../../src/lib/db/repos/execution-admiss
 import { SharedProxyOperations } from '../../src/lib/vm/shared-proxy-operations.mjs'
 import { buildVmPackage } from '../../src/lib/vm/vm-package.mjs'
 import { VmsRepo } from '../../src/lib/db/repos/vms-repo.mjs'
+import { stopProxyEgress } from '../../src/lib/vm/egress.mjs'
 
 async function fixture(t) {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'panel-proxy-claims-'))
@@ -219,6 +220,44 @@ test('proxy unbind awaits confirmed helper stop before releasing its VM claim', 
   await request
   assert.equal(h.response.status, 200)
   const next = await f.otherOperations.tryAcquire({ vmId: 'vm-a' })
+  assert.equal(next.ok, true)
+  await next.release()
+})
+
+test('last unbind can retain a known attached network after its helper has ended', async (t) => {
+  const f = await fixture(t)
+  let attempted = false
+  const h = f.handler(
+    {},
+    {
+      vmMutationOps: {
+        stopProxyEgress: (root, id) =>
+          stopProxyEgress(root, id, {
+            runIptables: () => ({ ok: true }),
+            runDocker: (args) => {
+              if (args[1] === 'rm') {
+                attempted = true
+                return {
+                  ok: false,
+                  stderr:
+                    'Error response from daemon: error while removing network: network synthetic has active endpoints',
+                }
+              }
+              return {
+                ok: true,
+                stdout:
+                  '192.0.2.0/24|192.0.2.1|same-network-id|' +
+                  JSON.stringify(attempted ? { immutableContainer: { Name: 'kin-a' } } : {}),
+              }
+            },
+          }),
+      },
+    },
+  )
+  await h.request('POST', '/api/panel/proxies/' + f.proxyId + '/unbind')
+  assert.equal(h.response.status, 200, JSON.stringify(h.response.body))
+  assert.deepEqual(f.pool.snapshot().proxies[0].bound_vm_ids, [])
+  const next = await new SharedProxyOperations(f.peer).tryAcquire()
   assert.equal(next.ok, true)
   await next.release()
 })

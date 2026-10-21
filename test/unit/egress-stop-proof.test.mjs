@@ -189,6 +189,28 @@ test('Docker network inspection failure cannot be treated as absent during proxy
   assert.equal(result.vmOperationUncertain, true)
 })
 
+test('a confirmed helper stop may retain the same network with known container endpoints', async (t) => {
+  const f = fixture(t)
+  let attempted = false
+  const result = await stopProxyEgress(f.root, 'synthetic', {
+    ...noDocker,
+    runDocker: (args) => {
+      if (args[1] === 'rm') {
+        attempted = true
+        return {
+          ok: false,
+          stderr: 'Error response from daemon: error while removing network: network synthetic has active endpoints',
+        }
+      }
+      const containers = attempted ? { immutableContainer: { Name: 'kin-synthetic' } } : {}
+      return { ok: true, stdout: '192.0.2.0/24|192.0.2.1|same-network-id|' + JSON.stringify(containers) }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.network_retained, true)
+  assert.equal(result.ended, false) // standalone legacy compatibility is not a termination proof.
+})
+
 for (const mode of ['normal', 'noop', 'replacement']) {
   test(`proxy network teardown verifies immutable ID and observed absence (${mode})`, async (t) => {
     const f = fixture(t)
