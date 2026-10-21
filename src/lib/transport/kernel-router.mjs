@@ -177,6 +177,7 @@ function credentialEnsureFailure(result, ensured) {
     },
     credential_ensure_failed: true,
     ...(ensured?.credentialRefreshUnknown ? { executionUncertain: true } : {}),
+    ...(ensured?.credentialRefreshNotStarted === true ? { credentialRefreshNotStarted: true } : {}),
   }
 }
 
@@ -314,7 +315,19 @@ async function runHop({ mode, opts }) {
     }
     if (!isClientCancelledResult(result) && isNeedsRefreshResult(result) && canRetry(result)) {
       const ensure = opts.ensureCredential || ensureWorkerCredential
-      const ensured = await ensure(opts.exec, { force: true })
+      let ensured
+      try {
+        ensured = await ensure(opts.exec, { force: true })
+      } catch (error) {
+        if (error.credentialRefreshNotStarted !== true || result.execution?.ended !== true || result.executionUncertain)
+          throw error
+        ensured = {
+          ok: false,
+          status: 503,
+          credentialRefreshNotStarted: true,
+          error: { code: error.code, message: error.message },
+        }
+      }
       if (ensured?.ok !== true) result = credentialEnsureFailure(result, ensured)
       else {
         // The CLI invalidates its OAuth cache from the shared credential file

@@ -73,7 +73,13 @@ export class SharedCredentialRefresh {
       throw failure('credential_generation_required')
     if (!['claude', 'codex'].includes(input.platform) || !input.vmId || !input.accountId)
       throw failure('invalid_credential_refresh')
-    const activity = await getActivityCoordinator(this.db)?.admit({ kind: 'credential_refresh' })
+    let activity
+    try {
+      activity = await getActivityCoordinator(this.db)?.admit({ kind: 'credential_refresh' })
+    } catch (error) {
+      if (error.code === 'database_maintenance') error.credentialRefreshNotStarted = true
+      throw error
+    }
     const state = { unknown: false }
     try {
       const invoke = () => this._run(input, callbacks, state)
@@ -118,11 +124,17 @@ export class SharedCredentialRefresh {
       observed.sharedResult.generation !== expectedGeneration
     )
       throw failure('credential_projection_stale')
-    const claim = await this.tasks.tryClaim({
-      taskKey,
-      executionId: randomUUID(),
-      ifPreviousExecutionId: observed?.executionId ?? null,
-    })
+    let claim
+    try {
+      claim = await this.tasks.tryClaim({
+        taskKey,
+        executionId: randomUUID(),
+        ifPreviousExecutionId: observed?.executionId ?? null,
+      })
+    } catch (error) {
+      if (error.code === 'database_maintenance') error.credentialRefreshNotStarted = true
+      throw error
+    }
     if (!claim.ok) return this._joined(taskKey, await this.tasks.repo.latest(taskKey), callbacks)
     let acquired = false
     let metadata
@@ -183,7 +195,10 @@ export class SharedCredentialRefresh {
         await claim.markUnknown()
       } else {
         // No mutation callback ran; the claim has caused no remote or credential effect.
-        await claim.complete({ sharedResult: { ok: false, code: 'refresh_not_started' } })
+        if (!(await claim.complete({ sharedResult: { ok: false, code: 'refresh_not_started' } })).completed)
+          throw failure('credential_refresh_completion_unconfirmed')
+        if (['vm_operation_active', 'vm_execution_active'].includes(error.code))
+          error.credentialRefreshNotStarted = true
       }
       throw error
     }

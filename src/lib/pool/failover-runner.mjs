@@ -513,7 +513,7 @@ export class FailoverRunner {
     }
   }
 
-  async recoverCredential(selected, policy) {
+  async recoverCredential(selected, policy, { executionEnded = false } = {}) {
     if (policy?.reason !== 'oauth_refresh_required') return policy
     const exec = selected?.exec
     if (!exec?.homeDir) return permanentOAuthRevoke(policy)
@@ -523,6 +523,15 @@ export class FailoverRunner {
     try {
       refreshed = await this.withCredentialAdmission(selected, () => ensureWorkerCredential(exec, { force: true }))
     } catch (error) {
+      if (selected.bindExecution && executionEnded === true && error.credentialRefreshNotStarted === true)
+        return {
+          ...policy,
+          retrySameAccount: false,
+          action: 'stop',
+          cooldownUntil: null,
+          reason: 'oauth_refresh_not_started',
+          credentialRefreshNotStarted: true,
+        }
       if (selected.bindExecution) {
         await selected.markUncertain()
         error.executionUncertain = true
@@ -1071,6 +1080,8 @@ export class FailoverRunner {
           }
           if (unknownExecution)
             return incompleteHopResult(result, policy, { ...attribution(), executionUncertain: true })
+          if (executionEnded && result?.credentialRefreshNotStarted === true)
+            return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
           if (policy.reason === 'content_filter_refusal' || policy.reason === 'usage_policy_refusal') {
             await this.scheduler.markSuccess(selected, {
               workerStatus: result.workerStatus || null,
@@ -1131,7 +1142,15 @@ export class FailoverRunner {
           if (!shouldContinue(policy)) {
             return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
           }
-          policy = await this.recoverCredential(selected, policy)
+          policy = await this.recoverCredential(selected, policy, { executionEnded })
+          if (policy.credentialRefreshNotStarted === true)
+            return {
+              ...result,
+              ...attribution(),
+              finalState: result?.terminalState || 'rejected',
+              policy,
+              credentialRefreshNotStarted: true,
+            }
           const hopMs = Date.now() - attemptStarted
           if (isRetryableEmptyHop(policy)) {
             if (!emptyHopReleased(result) || pinVmId) return incompleteHopResult(result, policy, attribution())
@@ -1263,7 +1282,15 @@ export class FailoverRunner {
               return { ...result, ...attribution(), finalState: result.terminalState, policy }
             }
           }
-          policy = await this.recoverCredential(selected, policy)
+          policy = await this.recoverCredential(selected, policy, { executionEnded })
+          if (policy.credentialRefreshNotStarted === true)
+            return {
+              ...result,
+              ...attribution(),
+              finalState: result.terminalState,
+              policy,
+              credentialRefreshNotStarted: true,
+            }
           const hopMs = Date.now() - attemptStarted
           if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
             budget.noteSameUnit(selected.accountId)
