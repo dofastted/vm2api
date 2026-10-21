@@ -530,7 +530,10 @@ export async function callGoWorker({
   requestPath = '/internal/v1/messages',
   envelope = null,
   cliHop = false,
+  requestId = randomUUID(),
+  onExecutionStart,
 } = {}) {
+  const execution = { requestId, started: false, ended: true, reason: isCrsMock() ? 'mock' : 'not_started' }
   if (isCrsMock()) {
     const { body: outboundBody, headers } = finalizeWorkerPayload({
       body,
@@ -551,11 +554,12 @@ export async function callGoWorker({
       usage: mock.body?.usage || null,
       model: mock.body?.model || null,
       stopReason: mock.body?.stop_reason || null,
+      execution,
     }
   }
-  const requestId = randomUUID()
-  const stopCancel = cancelOnAbort(exec, signal, requestId)
+  let stopCancel = () => {}
   try {
+    if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
     const prepared = envelope
       ? { envelope, thread: null }
       : workerEnvelope({
@@ -571,6 +575,11 @@ export async function callGoWorker({
           cliHop,
           requestContext,
         })
+    // The caller can durably bind this ID before any bytes reach the kernel.
+    if (onExecutionStart) await onExecutionStart({ requestId })
+    if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
+    stopCancel = cancelOnAbort(exec, signal, requestId)
+    Object.assign(execution, { started: true, ended: false, reason: 'in_progress' })
     const response = await workerRequest(exec, {
       method: 'POST',
       requestPath,
@@ -579,6 +588,7 @@ export async function callGoWorker({
       timeoutMs,
     })
     const data = await readAll(response)
+    Object.assign(execution, { ended: true, reason: 'eof' })
     const parsed = parseJson(data)
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     const ok = response.statusCode >= 200 && response.statusCode < 300 && parsed?.type !== 'error'
@@ -595,8 +605,16 @@ export async function callGoWorker({
       terminalState: headers['x-terminal-state'] || null,
       transportError: false,
       threadBetas: prepared.thread,
+      execution,
     })
   } catch (error) {
+    if (!execution.ended) {
+      execution.reason = signal?.aborted
+        ? 'client_aborted'
+        : error.code === 'worker_timeout'
+          ? 'timeout'
+          : 'transport_error'
+    }
     return {
       ok: false,
       status: 0,
@@ -612,6 +630,7 @@ export async function callGoWorker({
       headers: {},
       terminalState: 'transport_error',
       transportError: true,
+      execution,
     }
   } finally {
     stopCancel()
@@ -637,7 +656,10 @@ export async function streamGoWorker({
   requestPath = '/internal/v1/messages',
   envelope = null,
   cliHop = false,
+  requestId = randomUUID(),
+  onExecutionStart,
 } = {}) {
+  const execution = { requestId, started: false, ended: true, reason: isCrsMock() ? 'mock' : 'not_started' }
   if (isCrsMock()) {
     const { body: outboundBody, headers } = finalizeWorkerPayload({
       body,
@@ -662,6 +684,7 @@ export async function streamGoWorker({
           headers: {},
           terminalState: 'incomplete',
           committed: false,
+          execution,
         }
       }
       if (typeof onCommit === 'function') onCommit()
@@ -684,6 +707,7 @@ export async function streamGoWorker({
         headers: {},
         terminalState: 'incomplete',
         committed: true,
+        execution,
       }
     }
     const payload = mockCrsPayload({ scenario })
@@ -693,6 +717,7 @@ export async function streamGoWorker({
         via: 'go-worker-mock-stream',
         terminalState: 'rejected',
         committed: false,
+        execution,
       }
     }
     let mockTtftMs = null
@@ -716,15 +741,16 @@ export async function streamGoWorker({
       stopReason: payload.body?.stop_reason || null,
       ttftMs: mockTtftMs,
       firstTokenAt: mockTtftMs == null ? null : mockStartedAt + mockTtftMs,
+      execution,
     }
   }
   let committed = false
   // Hop-relative TTFT. firstTokenAt is epoch ms so request logs subtract ingress t0.
   const startedAt = Date.now()
   let ttftMs = null
-  const requestId = randomUUID()
-  const stopCancel = cancelOnAbort(exec, signal, requestId)
+  let stopCancel = () => {}
   try {
+    if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
     const prepared = envelope
       ? { envelope, thread: null }
       : workerEnvelope({
@@ -741,6 +767,10 @@ export async function streamGoWorker({
           cliHop,
           requestContext,
         })
+    if (onExecutionStart) await onExecutionStart({ requestId })
+    if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
+    stopCancel = cancelOnAbort(exec, signal, requestId)
+    Object.assign(execution, { started: true, ended: false, reason: 'in_progress' })
     const response = await workerRequest(exec, {
       method: 'POST',
       requestPath,
@@ -753,6 +783,7 @@ export async function streamGoWorker({
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
       const data = await readAll(response, 1024 * 1024)
+      Object.assign(execution, { ended: true, reason: 'eof' })
       return restoreKernelErrorStatus({
         ok: false,
         status: response.statusCode || 0,
@@ -763,6 +794,7 @@ export async function streamGoWorker({
         terminalState: headers['x-terminal-state'] || 'error',
         transportError: false,
         threadBetas: prepared.thread,
+        execution,
       })
     }
     let buffer = ''
@@ -868,6 +900,7 @@ export async function streamGoWorker({
           await emitLine(line)
         }
       }
+      Object.assign(execution, { ended: true, reason: 'eof' })
       if (buffer) {
         applyClaudeSSELineToMessage(buffer, assembler)
         await emitLine(buffer)
@@ -903,17 +936,26 @@ export async function streamGoWorker({
         terminalState,
         transportError: false,
         threadBetas: prepared.thread,
+        execution,
       })
     } finally {
       if (idleTimer) clearInterval(idleTimer)
     }
   } catch (error) {
+    if (!execution.ended) {
+      execution.reason = signal?.aborted
+        ? 'client_aborted'
+        : error.code === 'worker_timeout'
+          ? 'timeout'
+          : 'transport_error'
+    }
     if (signal?.aborted) {
       return clientCancelledResult({
         via: 'go-worker-stream',
         ttftMs,
         firstTokenAt: ttftMs == null ? null : startedAt + ttftMs,
         committed,
+        execution,
       })
     }
     return {
@@ -934,6 +976,7 @@ export async function streamGoWorker({
       committed,
       terminalState: committed ? 'incomplete' : 'transport_error',
       transportError: true,
+      execution,
     }
   } finally {
     stopCancel()

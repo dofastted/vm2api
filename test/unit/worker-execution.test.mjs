@@ -132,6 +132,54 @@ for (const [name, invoke] of [
     assert.equal(result.ok, false)
   })
 
+  unixTest(`${name} generates a recoverable hop ID when none is provided`, async (t) => {
+    let wireId
+    let boundId
+    const exec = await fixture(t, async (req, res) => {
+      const chunks = []
+      for await (const chunk of req) chunks.push(chunk)
+      wireId = JSON.parse(Buffer.concat(chunks).toString()).request_id
+      res.end('{}')
+    })
+    const result = await invoke({
+      exec,
+      envelope,
+      onExecutionStart: ({ requestId }) => {
+        boundId = requestId
+      },
+    })
+    assert.match(boundId, /^[a-f0-9-]{36}$/)
+    assert.equal(result.execution.requestId, wireId)
+    assert.equal(wireId, boundId)
+    assert.equal(result.execution.ended, true)
+  })
+
+  unixTest(`${name} aborting during durable binding prevents submission`, async (t) => {
+    let calls = 0
+    const controller = new AbortController()
+    const exec = await fixture(t, (_req, res) => {
+      calls++
+      res.end('{}')
+    })
+    const result = await invoke({
+      exec,
+      envelope,
+      signal: controller.signal,
+      requestId: 'abort-during-bind',
+      onExecutionStart: async () => {
+        await Promise.resolve()
+        controller.abort()
+      },
+    })
+    assert.deepEqual(result.execution, {
+      requestId: 'abort-during-bind',
+      started: false,
+      ended: true,
+      reason: 'not_started',
+    })
+    assert.equal(calls, 0)
+  })
+
   unixTest(`${name} request timeouts do not prove the kernel task ended`, async (t) => {
     const exec = await fixture(t, async (req) => {
       for await (const _chunk of req) {
@@ -167,6 +215,7 @@ unixTest(
     const started = deferred()
     const sawCancel = deferred()
     const respondCancel = deferred()
+    const cancelCompleted = deferred()
     let cancelResponded = false
     let wireId
     const exec = await fixture(t, async (req, res) => {
@@ -178,6 +227,7 @@ unixTest(
         await respondCancel.promise
         cancelResponded = true
         res.end('{"ok":true,"cancelled":true}')
+        cancelCompleted.resolve()
         return
       }
       wireId = body.request_id
@@ -195,7 +245,8 @@ unixTest(
       assert.equal(cancelResponded, false)
       assert.deepEqual(result.execution, { requestId: wireId, started: true, ended: false, reason: 'client_aborted' })
       respondCancel.resolve()
-      await new Promise((resolve) => setImmediate(resolve))
+      await cancelCompleted.promise
+      assert.equal(cancelResponded, true)
       assert.equal(result.execution.ended, false)
     } finally {
       respondCancel.resolve()
@@ -242,9 +293,12 @@ test('synthetic mock results are ended even when their assistant response is inc
   process.env.KIN_CRS_MOCK = '1'
   process.env.KIN_MOCK_ACCOUNT_SCENARIOS = JSON.stringify({ 'vm-mock': 'incomplete_stream' })
   try {
-    for (const invoke of [callGoWorker, streamGoWorker]) {
-      const result = await invoke({ exec: { vmId: 'vm-mock' }, body: envelope.body, requestId: 'mock-hop' })
-      assert.deepEqual(result.execution, { requestId: 'mock-hop', started: false, ended: true, reason: 'mock' })
+    for (const scenario of ['text', 'error', 'rate_limit', 'incomplete_stream']) {
+      process.env.KIN_MOCK_ACCOUNT_SCENARIOS = JSON.stringify({ 'vm-mock': scenario })
+      for (const invoke of [callGoWorker, streamGoWorker]) {
+        const result = await invoke({ exec: { vmId: 'vm-mock' }, body: envelope.body, requestId: 'mock-hop' })
+        assert.deepEqual(result.execution, { requestId: 'mock-hop', started: false, ended: true, reason: 'mock' })
+      }
     }
   } finally {
     if (before.mock === undefined) delete process.env.KIN_CRS_MOCK
