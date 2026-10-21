@@ -25,9 +25,16 @@ function jobError(code) {
 
 /** Short PostgreSQL transactions for global account/VM execution limits. */
 export class ExecutionAdmissionsRepo {
-  constructor(db, { ownerId = 'controller_' + crypto.randomUUID() } = {}) {
+  constructor(db, { ownerId = 'controller_' + crypto.randomUUID(), assertRoutingRevision = null } = {}) {
     this.db = db
     this.ownerId = identifier(ownerId, 'ownerId')
+    this.routingRevisionCheck = assertRoutingRevision
+  }
+
+  async assertRoutingRevision(revision) {
+    if (!this.routingRevisionCheck) return
+    if (!this.db.isTransaction) throw jobError('execution_transaction_required')
+    await this.routingRevisionCheck(revision)
   }
 
   /** Shared order: device (caller), account, then every involved VM sorted. */
@@ -91,6 +98,7 @@ export class ExecutionAdmissionsRepo {
     const rpmLimit = limit(input.rpmLimit, 'rpmLimit')
     const family = input.family == null ? null : identifier(input.family, 'family')
     return withTransaction(this.db, async () => {
+      await this.assertRoutingRevision(input.routingRevision)
       await this.lockResources({ accountId, vmIds: [vmId] })
       const operation = await this.db
         .prepare('SELECT id FROM vm_operations WHERE vm_id = $1 AND released_at IS NULL')

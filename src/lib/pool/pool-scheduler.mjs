@@ -332,6 +332,7 @@ export class PoolScheduler extends EventEmitter {
     runtimeRepo = null,
     workerHealth = null,
     executionAdmissions = null,
+    routingState = null,
     config = {},
   } = {}) {
     super()
@@ -343,8 +344,12 @@ export class PoolScheduler extends EventEmitter {
     this.runtimeRepo = runtimeRepo
     this.workerHealth = workerHealth
     this.shared = isKubernetesMode()
+    this.routingState = routingState
     this.executionAdmissions = this.shared
-      ? executionAdmissions || new SharedExecutionAdmissions(accountQuota?.db || getDb())
+      ? executionAdmissions ||
+        new SharedExecutionAdmissions(accountQuota?.db || getDb(), {
+          assertRoutingRevision: routingState ? (revision) => routingState.assertRevision(revision) : null,
+        })
       : null
     this.tasks = new Set()
     this.failure = null
@@ -1029,6 +1034,7 @@ export class PoolScheduler extends EventEmitter {
     keyScope = null,
     quotaRequest = null,
   } = {}) {
+    const routingRevision = this.routingState?.currentRevision
     const now = Date.now()
     this.runtimeRepo?.clearExpired?.(now)
     const summaries = listVms(this.projectRoot)
@@ -1085,6 +1091,7 @@ export class PoolScheduler extends EventEmitter {
       const seatCap = seatCapOf(vm, this.config.default_session_slots)
       this.planner.noteCap(vm.id, seatCap)
       candidates.push({
+        routingRevision,
         ok: true,
         vmId: vm.id,
         accountId,
@@ -1672,7 +1679,10 @@ export class PoolScheduler extends EventEmitter {
     if (candidate.draining) accountLimit = Math.min(accountLimit, 1)
     return {
       accountLimit,
-      vmLimit: maxConcurrencyOf(candidate.vm, candidate.maxConcurrency),
+      vmLimit:
+        this.routingState && !candidate.vm?.policy?.concurrencyOverride
+          ? Math.max(0, Number(candidate.maxConcurrency))
+          : maxConcurrencyOf(candidate.vm, candidate.maxConcurrency),
       rpmLimit: Number(this.accountQuota?.rpmLimitFor?.(candidate.account, policy) ?? candidate.account?.max_rpm ?? 0),
       fableLimit: Number(this.config.fable_max_per_account) || 0,
       family: isFableModel(candidate.model) ? FABLE_FAMILY_KEY : null,
@@ -1697,10 +1707,15 @@ export class PoolScheduler extends EventEmitter {
         accountId: candidate.accountId,
         vmId: candidate.vmId,
         ...limits,
+        routingRevision: candidate.routingRevision,
         ...options,
       })
     } catch (error) {
       if (circuitHold?.probe) this.unitCircuit?.releaseProbe?.(candidate.accountId)
+      if (error?.code === 'routing_config_stale' && this.routingState) {
+        await this.routingState.refresh()
+        return null
+      }
       throw error
     }
     if (!lease.ok) {

@@ -60,6 +60,7 @@ export class SharedExecutionAdmissions {
       throw invalid('seatReservePct')
     if (input.seatHeadroom != null && !Number.isFinite(input.seatHeadroom)) throw invalid('seatHeadroom')
     const gate = await withTransaction(this.db, async () => {
+      await this.executions.assertRoutingRevision(input.routingRevision)
       await this.lockDevice(seatKey)
       const before = await this.readSeat(seatKey)
       // A move involves two VM books. Lock both in the same order as admissions.
