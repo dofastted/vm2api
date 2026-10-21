@@ -32,9 +32,10 @@ type Config struct {
 	TLSDir string `json:"tls_dir"`
 	// Experimental node fencing. Raw SSH/Docker/SFTP permissions and controller
 	// admission wiring must be migrated before this can be enabled for HA.
-	Fenced       bool   `json:"fenced,omitempty"`
-	AuthorityDir string `json:"authority_dir,omitempty"`
-	DockerSocket string `json:"docker_socket,omitempty"`
+	Fenced       bool                `json:"fenced,omitempty"`
+	AuthorityDir string              `json:"authority_dir,omitempty"`
+	DockerSocket string              `json:"docker_socket,omitempty"`
+	Launch       *DockerLaunchPolicy `json:"launch,omitempty"`
 }
 
 // Preface: "KSG1 <token> <vm> <kernel|worker|ping>\n"; reply "OK\n" or "ERR <code>\n".
@@ -58,6 +59,7 @@ type Server struct {
 	slots     chan struct{}
 	wg        sync.WaitGroup
 	authority *Authority
+	launcher  *dockerLauncher
 }
 
 func New(cfg Config) (*Server, error) {
@@ -103,6 +105,13 @@ func New(cfg Config) (*Server, error) {
 		srv.authority, err = OpenAuthority(cfg.AuthorityDir, verify)
 		if err != nil {
 			return nil, err
+		}
+		if cfg.Launch != nil {
+			srv.launcher, err = newDockerLauncher(socket, cfg.Root, boot, srv.authority, *cfg.Launch)
+			if err != nil {
+				srv.authority.Close()
+				return nil, err
+			}
 		}
 	}
 	return srv, nil

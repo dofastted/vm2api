@@ -1,9 +1,12 @@
 package slotgate
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -16,6 +19,7 @@ import (
 type fakeLaunchEngine struct {
 	mu            sync.Mutex
 	image         string
+	socket        string
 	container     string
 	startedAt     string
 	spec          map[string]any
@@ -25,6 +29,7 @@ type fakeLaunchEngine struct {
 	createEntered chan struct{}
 	createProceed chan struct{}
 	onInspect     func()
+	networkDriver string
 }
 
 func (f *fakeLaunchEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -39,6 +44,12 @@ func (f *fakeLaunchEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		image := f.image
 		f.mu.Unlock()
 		json.NewEncoder(w).Encode(map[string]any{"Id": image, "Config": map[string]any{"Labels": map[string]string{"kin.slot.full": "1"}}})
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/networks/") {
+		driver := f.networkDriver
+		f.mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]any{"Id": strings.TrimPrefix(r.URL.Path, "/networks/"), "Driver": driver, "Scope": "local"})
 		return
 	}
 	if r.URL.Path == "/containers/create" {
@@ -105,14 +116,28 @@ func launchFixture(t *testing.T) (*Authority, *dockerLauncher, *fakeLaunchEngine
 		if err = os.MkdirAll(filepath.Join(private, dir), 0o700); err != nil {
 			t.Fatal(err)
 		}
+		if dir != "config" && policy.UID != os.Geteuid() {
+			if err = os.Chown(filepath.Join(private, dir), policy.UID, policy.GID); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	for _, file := range []string{"kernel.json", "internal.token"} {
 		if err = os.WriteFile(filepath.Join(private, "config", file), []byte("synthetic-only"), 0o600); err != nil {
 			t.Fatal(err)
 		}
+		if policy.UID != os.Geteuid() {
+			if err = os.Chown(filepath.Join(private, "config", file), os.Geteuid(), policy.GID); err != nil {
+				t.Fatal(err)
+			}
+			if err = os.Chmod(filepath.Join(private, "config", file), 0o640); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 	fake := &fakeLaunchEngine{image: policy.ImageID, container: strings.Repeat("c", 64), startedAt: "2026-10-21T01:00:00Z"}
 	socket := filepath.Join(shortRoot(t), "docker.sock")
+	fake.socket = socket
 	unixHTTP(t, socket, fake)
 	launcher, err := newDockerLauncher(socket, root, boot, a, policy)
 	if err != nil {
@@ -161,12 +186,21 @@ func TestDockerLaunchNetworkIOLeavesOtherVMAdmissionAvailableAndPendingBlocksAdv
 	a, launcher, engine, state, _ := launchFixture(t)
 	other := launchForTest(t, a, "other", testExecutor("d"))
 	engine.createEntered, engine.createProceed = make(chan struct{}), make(chan struct{})
+	var released sync.Once
+	resume := func() { released.Do(func() { close(engine.createProceed) }) }
+	defer resume()
 	finished := make(chan error, 1)
 	go func() {
 		_, err := launcher.Launch(context.Background(), "v", state.Fence, "slow-create")
 		finished <- err
 	}()
-	<-engine.createEntered
+	select {
+	case <-engine.createEntered:
+	case err := <-finished:
+		t.Fatalf("launch ended before create: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("create was not reached")
+	}
 	admitted := make(chan error, 1)
 	go func() { _, err := a.BeginCommand("other", other.Fence, "parallel", CommandForward); admitted <- err }()
 	select {
@@ -175,7 +209,7 @@ func TestDockerLaunchNetworkIOLeavesOtherVMAdmissionAvailableAndPendingBlocksAdv
 			t.Fatal(err)
 		}
 	case <-time.After(time.Second):
-		close(engine.createProceed)
+		resume()
 		t.Fatal("Engine I/O held the Authority global lock")
 	}
 	if _, err := a.Revoke("v", state.Fence); err != nil {
@@ -183,7 +217,7 @@ func TestDockerLaunchNetworkIOLeavesOtherVMAdmissionAvailableAndPendingBlocksAdv
 	}
 	_, err := a.Advance(context.Background(), "v", state.Fence)
 	requireAuthorityError(t, err, ErrPendingMutation)
-	close(engine.createProceed)
+	resume()
 	if err = <-finished; err == nil {
 		t.Fatal("late launch bound after revocation")
 	}
@@ -311,5 +345,119 @@ func TestDockerLaunchRejectsRootCapabilitiesAndUnsafePrivateFilesBeforeCreate(t 
 	stored, _ := a.State("v")
 	if _, exists := stored.Commands["unsafe-file"]; exists {
 		t.Fatal("invalid preparation reserved a launch")
+	}
+}
+
+func TestDockerLaunchJournalFailureSendsNoCreateAndDispatchedLaunchCannotBeCompleted(t *testing.T) {
+	a, launcher, engine, state, root := launchFixture(t)
+	journal := filepath.Join(root, "authority", "authority.json")
+	if err := os.Rename(journal, journal+".saved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(journal, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := launcher.Launch(context.Background(), "v", state.Fence, "persist-before-create"); err == nil {
+		t.Fatal("journal failure authorized create")
+	}
+	engine.mu.Lock()
+	calls := append([]string(nil), engine.calls...)
+	engine.mu.Unlock()
+	for _, call := range calls {
+		if strings.HasPrefix(call, "POST ") {
+			t.Fatalf("mutation before durable launch: %v", calls)
+		}
+	}
+	if err := os.Remove(journal); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(journal+".saved", journal); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened := authorityForTest(t, filepath.Join(root, "authority"), terminatedExecutor)
+	handle, err := reopened.BeginLaunch("v", state.Fence, "node-launch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = reopened.StartLaunch(handle); err != nil {
+		t.Fatal(err)
+	}
+	requireAuthorityError(t, reopened.CompleteCommand(handle), ErrAuthorityPhase)
+}
+
+func TestKSG2LaunchCreatesAndBindsWithNodePolicyAndRejectsRawSpec(t *testing.T) {
+	a, launcher, engine, state, root := launchFixture(t)
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Config{Listen: "127.0.0.1:0", Root: root, Token: testToken, TLSDir: filepath.Join(root, "tls"), Fenced: true, AuthorityDir: filepath.Join(root, "authority"), DockerSocket: engine.socket, Launch: &launcher.policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.ServeListener(ctx, tls.NewListener(ln, s.TLSConfig())) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	})
+	c, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.SetDeadline(time.Now().Add(3 * time.Second))
+	raw, _ := json.Marshal(map[string]any{"op": "launch", "vm_id": "v", "fence": state.Fence, "command_id": "raw-spec-forbidden", "HostConfig": map[string]any{"Privileged": true, "Binds": []string{"/:/host"}}})
+	fmt.Fprintf(c, "KSG2 %s\n%s\n", testToken, raw)
+	line, _ := bufio.NewReader(c).ReadString('\n')
+	c.Close()
+	if line != "ERR bad_request\n" {
+		t.Fatalf("raw Docker spec accepted: %q", line)
+	}
+	engine.mu.Lock()
+	count := len(engine.calls)
+	engine.mu.Unlock()
+	if count != 0 {
+		t.Fatal("raw spec reached Engine")
+	}
+	reply := gate2Control(t, ln.Addr().String(), gate2Request{Op: "launch", VMID: "v", Fence: state.Fence, CommandID: "trusted-node-launch"})
+	if !reply.OK || reply.State == nil || reply.State.Phase != PhaseActive || reply.State.Fence.Executor.ContainerID != engine.container {
+		t.Fatalf("KSG2 launch: %+v", reply)
+	}
+}
+
+func TestDockerLaunchChecksFixedBridgeNetworkBeforeCreate(t *testing.T) {
+	for _, driver := range []string{"bridge", "host"} {
+		t.Run(driver, func(t *testing.T) {
+			_, launcher, engine, state, _ := launchFixture(t)
+			launcher.policy.NetworkID = strings.Repeat("e", 64)
+			engine.networkDriver = driver
+			_, err := launcher.Launch(context.Background(), "v", state.Fence, "fixed-network")
+			if driver == "bridge" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err == nil {
+					t.Fatal("non-bridge network was accepted")
+				}
+				engine.mu.Lock()
+				calls := append([]string(nil), engine.calls...)
+				engine.mu.Unlock()
+				for _, call := range calls {
+					if strings.HasPrefix(call, "POST ") {
+						t.Fatalf("unsafe network reached create: %v", calls)
+					}
+				}
+			}
+		})
 	}
 }

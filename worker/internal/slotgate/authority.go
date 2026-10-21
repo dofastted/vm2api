@@ -78,14 +78,25 @@ type Fence struct {
 }
 
 type CommandRecord struct {
-	ID            string        `json:"id"`
-	Kind          CommandKind   `json:"kind"`
-	Status        CommandStatus `json:"status"`
-	Fence         Fence         `json:"fence"`
-	Runtime       string        `json:"runtime"`
-	Token         string        `json:"token"`
-	Dispatched    bool          `json:"dispatched"`
-	TerminationID string        `json:"termination_id,omitempty"`
+	ID            string              `json:"id"`
+	Kind          CommandKind         `json:"kind"`
+	Status        CommandStatus       `json:"status"`
+	Fence         Fence               `json:"fence"`
+	Runtime       string              `json:"runtime"`
+	Token         string              `json:"token"`
+	Dispatched    bool                `json:"dispatched"`
+	TerminationID string              `json:"termination_id,omitempty"`
+	LaunchTarget  *DockerLaunchTarget `json:"launch_target,omitempty"`
+}
+
+// DockerLaunchTarget is recorded after create returns and before start. A
+// missing StartedAt here is intentional: the container has not started yet.
+type DockerLaunchTarget struct {
+	ContainerID    string `json:"container_id"`
+	DockerDaemonID string `json:"docker_daemon_id"`
+	NodeBootID     string `json:"node_boot_id"`
+	ImageID        string `json:"image_id"`
+	Name           string `json:"name"`
 }
 
 type AuthorityState struct {
@@ -295,6 +306,65 @@ func (a *Authority) BeginLaunch(vm string, expected Fence, commandID string) (Co
 	return a.begin(vm, expected, commandID, commandLaunch, PhaseVacant)
 }
 
+// StartLaunch records dispatch without holding the Authority lock over Docker
+// I/O. The pending launch blocks all generation advancement until a trusted
+// binding completes; a crash or lost create response is never retried here.
+func (a *Authority) StartLaunch(handle CommandHandle) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	state, command, err := a.command(handle)
+	if err != nil {
+		return err
+	}
+	if state.Phase != PhaseVacant || command.Kind != commandLaunch || command.Status != CommandPending {
+		return ErrAuthorityPhase
+	}
+	if command.Dispatched {
+		return ErrCommandDispatched
+	}
+	command.Dispatched = true
+	state.Commands[handle.ID] = command
+	_, err = a.commit(handle.VMID, state)
+	return err
+}
+
+func (a *Authority) RecordLaunchTarget(handle CommandHandle, target DockerLaunchTarget) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := validateLaunchTarget(target); err != nil {
+		return err
+	}
+	state, command, err := a.command(handle)
+	if err != nil {
+		return err
+	}
+	// Revocation can win while create is in progress. Still retain the exact
+	// returned target, but the launcher must not start or bind it afterward.
+	if command.Kind != commandLaunch || command.Status != CommandPending || !command.Dispatched {
+		return ErrAuthorityPhase
+	}
+	if command.LaunchTarget != nil && *command.LaunchTarget != target {
+		return ErrFenceMismatch
+	}
+	command.LaunchTarget = &target
+	state.Commands[handle.ID] = command
+	_, err = a.commit(handle.VMID, state)
+	return err
+}
+
+func (a *Authority) checkLaunch(handle CommandHandle) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	state, command, err := a.command(handle)
+	if err != nil {
+		return err
+	}
+	if state.Phase != PhaseVacant || command.Kind != commandLaunch || command.Status != CommandPending || !command.Dispatched {
+		return ErrAuthorityPhase
+	}
+	return nil
+}
+
 // BeginCommand must commit before any bytes or mutation are sent. Command IDs
 // remain tombstoned across generations, preventing retry by relabeling an ID.
 func (a *Authority) BeginCommand(vm string, expected Fence, commandID string, kind CommandKind) (CommandHandle, error) {
@@ -383,6 +453,9 @@ func (a *Authority) BindExecutor(handle CommandHandle, executor ExecutorIdentity
 	if state.Phase != PhaseVacant || command.Kind != commandLaunch || command.Status != CommandPending || !command.Dispatched {
 		return AuthorityState{}, ErrAuthorityPhase
 	}
+	if target := command.LaunchTarget; target != nil && (target.ContainerID != executor.ContainerID || target.DockerDaemonID != executor.DockerDaemonID || target.NodeBootID != executor.NodeBootID) {
+		return AuthorityState{}, ErrFenceMismatch
+	}
 	for _, retired := range state.Retired {
 		if executor == retired {
 			return AuthorityState{}, ErrFenceMismatch
@@ -409,6 +482,9 @@ func (a *Authority) CompleteCommand(handle CommandHandle) error {
 	}
 	if command.Status != CommandPending {
 		return ErrCommandOwner
+	}
+	if command.Kind == commandLaunch && command.Dispatched {
+		return ErrAuthorityPhase
 	}
 	command.Status = CommandCompleted
 	state.Commands[handle.ID] = command
@@ -590,6 +666,10 @@ func (a *Authority) persist(next authorityJournal) error {
 func cloneState(state AuthorityState) AuthorityState {
 	commands := make(map[string]CommandRecord, len(state.Commands))
 	for id, command := range state.Commands {
+		if command.LaunchTarget != nil {
+			target := *command.LaunchTarget
+			command.LaunchTarget = &target
+		}
 		commands[id] = command
 	}
 	state.Commands = commands
@@ -698,6 +778,14 @@ func validateJournal(journal authorityJournal) error {
 			}
 			if pendingCommand(command) && command.Fence != state.Fence {
 				return ErrInvalidAuthority
+			}
+			if command.LaunchTarget != nil {
+				if command.Kind != commandLaunch || !command.Dispatched {
+					return ErrInvalidAuthority
+				}
+				if err := validateLaunchTarget(*command.LaunchTarget); err != nil {
+					return err
+				}
 			}
 		}
 		if state.LastTermination != nil {

@@ -133,6 +133,12 @@ func (s *Server) handleFenced(ctx context.Context, conn net.Conn, reader *bufio.
 		state, err = s.authority.Revoke(request.VMID, request.Fence)
 	case "advance":
 		state, err = s.authority.Advance(ctx, request.VMID, request.Fence)
+	case "launch":
+		if s.launcher == nil || request.Kind != "" || request.Ticket != "" {
+			err = ErrInvalidAuthority
+			break
+		}
+		state, err = s.launcher.Launch(ctx, request.VMID, request.Fence, request.CommandID)
 	default:
 		err = ErrInvalidAuthority
 	}

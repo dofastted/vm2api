@@ -2,13 +2,7 @@ package slotgate
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
-	"io"
-	"net"
-	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -29,45 +23,15 @@ func nodeBootID() (string, error) {
 // The old identity must already have been recorded by a trusted node launcher.
 // A daemon ID mismatch, malformed response or denied request is not absence.
 func newDockerVerifier(socket, boot string) (TerminationVerifier, error) {
-	if !filepath.IsAbs(socket) || !validAuthorityID(boot) {
+	if !validAuthorityID(boot) {
 		return nil, ErrInvalidAuthority
 	}
-	transport := &http.Transport{DisableKeepAlives: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
-	}}
-	client := &http.Client{Transport: transport, Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	engine, err := newDockerEngine(socket)
+	if err != nil {
+		return nil, err
+	}
 	call := func(ctx context.Context, method, path string, out any, allowed ...int) (int, error) {
-		req, err := http.NewRequestWithContext(ctx, method, "http://docker"+path, nil)
-		if err != nil {
-			return 0, err
-		}
-		res, err := client.Do(req)
-		if err != nil {
-			return 0, err
-		}
-		defer res.Body.Close()
-		ok := false
-		for _, status := range allowed {
-			if res.StatusCode == status {
-				ok = true
-			}
-		}
-		if !ok {
-			return res.StatusCode, fmt.Errorf("docker_status_%d", res.StatusCode)
-		}
-		data, err := io.ReadAll(io.LimitReader(res.Body, (1<<20)+1))
-		if err != nil {
-			return res.StatusCode, err
-		}
-		if len(data) > 1<<20 {
-			return res.StatusCode, ErrInvalidAuthority
-		}
-		if out != nil && res.StatusCode == 200 {
-			if err = json.Unmarshal(data, out); err != nil {
-				return res.StatusCode, err
-			}
-		}
-		return res.StatusCode, nil
+		return engine.call(ctx, method, path, nil, out, allowed...)
 	}
 	type inspectState struct {
 		ID    string `json:"Id"`
