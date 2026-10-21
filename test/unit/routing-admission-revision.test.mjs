@@ -52,6 +52,8 @@ test('shared device admission checks routing before every resource lock', async 
   }
   const granted = await admissions.tryReserve({
     ...input,
+    accountId: 'routing-seat-account',
+    vmId: 'routing-seat-vm',
     routingRevision: 7,
     seatKey: 'routing-device',
     seatCap: 2,
@@ -97,4 +99,62 @@ test('scheduler rejects its old candidate after a routing change and refreshes c
   assert.equal(lease, null)
   assert.equal(refreshed, 1)
   assert.equal((await pool.executionAdmissions.getCounts(candidate.accountId, candidate.vmId)).vmInflight, 0)
+})
+
+test('configuration writes wait until admission commits its validated revision', async () => {
+  const db = getDb()
+  await db.prepare("INSERT INTO settings(key,value) VALUES('routing-admission-lock','7')").run()
+  let entered
+  let resume
+  const checked = new Promise((resolve) => {
+    entered = resolve
+  })
+  const hold = new Promise((resolve) => {
+    resume = resolve
+  })
+  const repo = new ExecutionAdmissionsRepo(db, {
+    assertRoutingRevision: async (revision) => {
+      const row = await db.prepare("SELECT value FROM settings WHERE key='routing-admission-lock' FOR SHARE").get()
+      assert.equal(Number(row.value), revision)
+      entered()
+      await hold
+    },
+  })
+  const pending = repo.tryReserve({
+    ...input,
+    accountId: 'routing-lock-account',
+    vmId: 'routing-lock-vm',
+    routingRevision: 7,
+  })
+  await checked
+  const client = await db.pool.connect()
+  const changed = client.query("UPDATE settings SET value='8' WHERE key='routing-admission-lock'")
+  try {
+    let blocked = false
+    for (let i = 0; i < 100; i++) {
+      const { rows } = await db.query('SELECT cardinality(pg_blocking_pids($1::integer)) AS blockers', [
+        client.processID,
+      ])
+      if (rows[0].blockers > 0) {
+        blocked = true
+        break
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.equal(blocked, true, 'the configuration update must wait for the admission transaction')
+  } finally {
+    resume()
+    const lease = await pending
+    await changed
+    client.release()
+    await lease.release()
+  }
+})
+
+test('current global limits replace stale inherited VM policy while explicit overrides remain', () => {
+  const pool = new PoolScheduler({ routingState: { currentRevision: 8 } })
+  const candidate = { maxConcurrency: 2, vm: { policy: { maxConcurrency: 9, concurrencyOverride: false } } }
+  assert.equal(pool.executionLimits(candidate).vmLimit, 2)
+  candidate.vm.policy.concurrencyOverride = true
+  assert.equal(pool.executionLimits(candidate).vmLimit, 9)
 })
