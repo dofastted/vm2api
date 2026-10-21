@@ -7,6 +7,7 @@ import vmContext from 'node:vm'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { egressRunDir, startEgressProcess, stopProxyEgress } from '../../src/lib/vm/egress.mjs'
+import * as egress from '../../src/lib/vm/egress.mjs'
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'egress-stop-proof-'))
@@ -23,7 +24,7 @@ function fixture(t) {
   t.after(() => {
     for (const pid of pids) {
       try {
-        process.kill(pid, 'SIGKILL')
+        if (fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').includes(root)) process.kill(pid, 'SIGKILL')
       } catch {}
     }
     fs.rmSync(root, { recursive: true, force: true })
@@ -114,7 +115,53 @@ test('Kubernetes legacy or foreign-namespace PID records cannot prove the old he
     assert.equal(result.ok, false)
     assert.equal(result.vmOperationUncertain, true)
     assert.equal(fs.existsSync(path.join(f.dir, 'egress.pid')), true)
+    await new Promise((resolve) => setTimeout(resolve, 150))
+    assert.equal(child.exitCode, null)
+    assert.equal(child.signalCode, null)
   }
+})
+
+test('confirmed egress stop waits for its recorded execution and clears its receipt', {
+  skip: process.platform !== 'linux',
+}, async (t) => {
+  const f = fixture(t)
+  assert.equal((await f.start()).ok, true)
+  const result = await egress.stopEgressProcessConfirmed(f.root, 'synthetic', { termTimeoutMs: 500, killGraceMs: 500 })
+  assert.equal(result.ok, true)
+  assert.equal(result.ended, true)
+  assert.equal(fs.existsSync(path.join(f.dir, 'egress.owner.json')), false)
+  assert.equal(fs.existsSync(path.join(f.dir, 'egress.pid')), false)
+})
+
+test('an unreceipted helper using a recycled PID cannot be declared absent or signalled', {
+  skip: process.platform !== 'linux',
+}, async (t) => {
+  const f = fixture(t)
+  const started = await f.start()
+  const receipt = JSON.parse(fs.readFileSync(path.join(f.dir, 'egress.owner.json'), 'utf8'))
+  receipt.start_ticks = String(BigInt(receipt.start_ticks) + 1n)
+  fs.writeFileSync(path.join(f.dir, 'egress.owner.json'), JSON.stringify(receipt))
+  const result = await egress.stopEgressProcessConfirmed(f.root, 'synthetic')
+  assert.equal(result.ok, false)
+  assert.equal(result.vmOperationUncertain, true)
+  assert.equal(fs.existsSync(path.join(f.dir, 'egress.pid')), true)
+  assert.equal(process.kill(started.pid, 0), true)
+})
+
+test('process inspection permission failure retains its receipt and ownership', {
+  skip: process.platform !== 'linux',
+}, async (t) => {
+  const f = fixture(t)
+  const started = await f.start()
+  const read = fs.readFileSync
+  t.mock.method(fs, 'readFileSync', (file, ...args) => {
+    if (file === `/proc/${started.pid}/stat`) throw Object.assign(new Error('inspection denied'), { code: 'EACCES' })
+    return read(file, ...args)
+  })
+  const result = await egress.stopEgressProcessConfirmed(f.root, 'synthetic')
+  assert.equal(result.ok, false)
+  assert.equal(result.vmOperationUncertain, true)
+  assert.equal(fs.existsSync(path.join(f.dir, 'egress.owner.json')), true)
 })
 
 test('Docker network inspection failure cannot be treated as absent during proxy teardown', async (t) => {
