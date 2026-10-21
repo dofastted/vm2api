@@ -608,6 +608,12 @@ export function createSlotShell({
     })
     adoptTimer = size.login ? setInterval(() => track(adoptLive()), 1000) : null
     adoptTimer?.unref?.()
+    let completeTerminal
+    track(
+      new Promise((resolve) => {
+        completeTerminal = resolve
+      }),
+    )
     let ended = false
     const onEnd = () => {
       if (ended) return
@@ -615,19 +621,23 @@ export function createSlotShell({
       clearInterval(adoptTimer)
       track(
         (async () => {
-          if (size.login) {
-            const adopted = await adoptLive(true)
-            if (
-              draining &&
-              adopted.error &&
-              !['auth_login_incomplete', 'auth_login_scope'].includes(adopted.error.code)
-            ) {
-              throw adopted.error
+          try {
+            if (size.login) {
+              const adopted = await adoptLive(true)
+              if (
+                draining &&
+                adopted.error &&
+                !['auth_login_incomplete', 'auth_login_scope'].includes(adopted.error.code)
+              ) {
+                throw adopted.error
+              }
             }
+            const info = await inspectExec(connect, session.execId).catch(() => null)
+            send(JSON.stringify({ t: 'exit', code: info?.ExitCode ?? null }))
+            ws.close(1000)
+          } finally {
+            completeTerminal()
           }
-          const info = await inspectExec(connect, session.execId).catch(() => null)
-          send(JSON.stringify({ t: 'exit', code: info?.ExitCode ?? null }))
-          ws.close(1000)
         })(),
       )
     }

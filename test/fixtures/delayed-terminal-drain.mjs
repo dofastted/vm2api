@@ -34,6 +34,8 @@ fs.writeFileSync(path.join(home, 'credentials.json'), JSON.stringify({ claudeAiO
 let databaseClosed = false
 let imports = 0
 let writesAfterClose = 0
+let releaseImport
+const importGate = new Promise((resolve) => { releaseImport = resolve })
 const shell = createSlotShell({
   projectRoot: root,
   authLoginReady: async () => {},
@@ -41,6 +43,7 @@ const shell = createSlotShell({
   importOauth: async () => {
     imports += 1
     if (databaseClosed) writesAfterClose += 1
+    await importGate
     return { ok: true }
   },
   logger: { warn() {} },
@@ -61,12 +64,17 @@ try {
   databaseClosed = drained
   assert.equal(tty.destroyRequested, true)
   tty.emit('close')
+  await new Promise((resolve) => setImmediate(resolve))
+  const drainedDuringImport = drained
+  releaseImport()
   await pending
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(drainedBeforeTtyClose, false, 'drain returned before the SSH TTY close/final adoption')
+  assert.equal(drainedDuringImport, false, 'drain returned while the final OAuth import was pending')
   assert.equal(imports, 1)
   assert.equal(writesAfterClose, 0, 'OAuth import began after the drain allowed database closure')
 } finally {
+  releaseImport()
   tty.emit('close')
   await pending?.catch(() => {})
   ws.terminate()
