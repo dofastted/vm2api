@@ -10,6 +10,7 @@
 import http from 'node:http'
 import fs from 'node:fs'
 import path from 'node:path'
+import crypto from 'node:crypto'
 import { loadConfig, reloadActiveVm, routingConfigFile } from './lib/core/config.mjs'
 import {
   extractApiKey,
@@ -104,7 +105,11 @@ import { createHandleProtocol } from './lib/protocol/handle-protocol.mjs'
 import { createResponsesWsHandler } from './lib/protocol/responses-ws.mjs'
 import { handleUserCountTokens, handleUserUsage } from './lib/protocol/user-count-tokens.mjs'
 import { createPanelHandler } from './lib/admin/panel-routes.mjs'
-import { isKubernetesMode, shutdownTimeoutMs } from './lib/core/control-plane-mode.mjs'
+import { isKubernetesMode, isKubernetesHaMode, shutdownTimeoutMs } from './lib/core/control-plane-mode.mjs'
+import { loadHaNodeTrust, haRouteAllowed, haUnsupported } from './lib/core/ha-control-plane-policy.mjs'
+import { HaVmCatalog, bindHaVmCatalog } from './lib/vm/ha-vm-catalog.mjs'
+import { captureNodeExecution } from './lib/cluster/node-execution-capabilities.mjs'
+import { withHaRequestContext } from './lib/core/ha-request-context.mjs'
 import { ControlPlaneLifecycle, withTimeout } from './lib/core/control-plane-lifecycle.mjs'
 import { getSharedBackgroundTasks } from './lib/core/shared-background-tasks.mjs'
 import { ControlPlaneLock } from './lib/db/control-plane-lock.mjs'
@@ -140,6 +145,8 @@ if (!getPanelAdmin().password) {
   throw new Error('VM2API_ADMIN_PASSWORD must be set; insecure default panel credentials are disabled')
 }
 const kubernetesMode = isKubernetesMode()
+const haMode = isKubernetesHaMode()
+const trustedNodes = haMode ? loadHaNodeTrust(process.env.VM2API_NODE_CONFIG_FILE) : null
 const shutdownGraceMs = shutdownTimeoutMs()
 
 const allowRate = createRateLimiter({
@@ -154,7 +161,14 @@ const dataDir = cfg.paths.data || path.join(cfg.paths.root, 'data')
 const db = await openDatabase({ dataDir })
 const activityCoordinator = getActivityCoordinator(db)
 db.bootstrapActivity?.enter()
+const haCatalog = haMode ? new HaVmCatalog(db) : null
+if (haCatalog) {
+  bindHaVmCatalog(haCatalog)
+  await haCatalog.refresh()
+}
 let controlPlaneLock = null
+const controlPlaneHealthy = () =>
+  !kubernetesMode || (activityCoordinator?.healthy === true && (haMode || controlPlaneLock?.healthy === true))
 let startupAborting = false
 const lifecycle = new ControlPlaneLifecycle({
   probe: async () => {
@@ -164,7 +178,7 @@ const lifecycle = new ControlPlaneLifecycle({
     }
     return db.prepare('SELECT 1').get()
   },
-  lockHealthy: () => !kubernetesMode || (controlPlaneLock?.healthy === true && activityCoordinator?.healthy === true),
+  lockHealthy: controlPlaneHealthy,
   isMaintaining: () => backupService.isMaintaining,
 })
 if (activityCoordinator) {
@@ -192,6 +206,8 @@ async function failStartup(error) {
 if (kubernetesMode) {
   process.once('uncaughtException', failStartup)
   process.once('unhandledRejection', failStartup)
+}
+if (kubernetesMode && !haMode) {
   controlPlaneLock = new ControlPlaneLock(db, {
     onLost(error) {
       lifecycle.beginDrain()
@@ -215,7 +231,7 @@ if (kubernetesMode) {
   }
 }
 fs.mkdirSync(cfg.paths.captures, { recursive: true })
-const legacyImport = await runLegacyImport({ dataDir, projectRoot: cfg.paths.project })
+const legacyImport = haMode ? null : await runLegacyImport({ dataDir, projectRoot: cfg.paths.project })
 if (legacyImport?.imported) {
   console.log('[db] legacy JSON import done:', JSON.stringify(legacyImport.counts || {}))
 }
@@ -223,7 +239,7 @@ await loadSettingsState()
 await loadModelPolicy()
 await loadGptModelPolicy()
 // VM/credential mirror: write-through hook + startup reconcile + fs.watch
-const vmSync = await initVmDbSync(cfg.paths.project)
+const vmSync = haMode ? { upserted: 0, rebuilt: 0, reclaimed_vm_ids: [] } : await initVmDbSync(cfg.paths.project)
 if (vmSync.upserted || vmSync.rebuilt) {
   console.log(`[db] vm mirror reconciled: upserted=${vmSync.upserted} rebuilt=${vmSync.rebuilt}`)
 }
@@ -258,6 +274,7 @@ let failoverRunner
 let groupsRepo
 
 const routingRt = createRoutingRuntime({
+  captureNodeExecution: haMode ? (input) => captureNodeExecution({ db, trustedNodes, ...input }) : null,
   get routingConfig() {
     return routingConfig
   },
@@ -444,25 +461,27 @@ proxyPool = new ProxyPool({
 })
 await proxyPool.init()
 // An upgrade replaces bin/ files; slots mounting data/run/slot-guest-bin must see the new ones.
-try {
-  refreshSlotGuestBinDir(cfg.paths.project)
-} catch (err) {
-  console.warn('[bootstrap] slot-guest-bin refresh failed:', err?.message || err)
-}
-proxyPool.startScheduler()
+if (!haMode)
+  try {
+    refreshSlotGuestBinDir(cfg.paths.project)
+  } catch (err) {
+    console.warn('[bootstrap] slot-guest-bin refresh failed:', err?.message || err)
+  }
+if (!haMode) proxyPool.startScheduler()
 
 // 首次安装的出口池是空的，槽没有可绑出口就起不来。本机出口永远成立，先补上。
-try {
-  if (!proxyPool.snapshot().proxies?.length) {
-    const seeded = await proxyPool.ensureLocal()
-    if (seeded.created) {
-      void (await ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(seeded.proxy.id)))
-      console.log('[bootstrap] seeded local egress px-local')
+if (!haMode)
+  try {
+    if (!proxyPool.snapshot().proxies?.length) {
+      const seeded = await proxyPool.ensureLocal()
+      if (seeded.created) {
+        void (await ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(seeded.proxy.id)))
+        console.log('[bootstrap] seeded local egress px-local')
+      }
     }
+  } catch (e) {
+    console.warn('[bootstrap] local egress seed failed', e?.message || e)
   }
-} catch (e) {
-  console.warn('[bootstrap] local egress seed failed', e?.message || e)
-}
 
 await initPoolRuntime()
 routingRt.routingState?.start()
@@ -679,7 +698,8 @@ backupService.onRestored(async (db) => {
   notifyMonitor?.setConfig(routingConfig.notify)
 
   await initPoolRuntime()
-  await clusterManager.rebind(db)
+  if (haCatalog) await haCatalog.refresh()
+  await clusterManager?.rebind(db)
   reloadActiveVm(cfg)
   await vmTestSchedule.reload()
 })
@@ -708,15 +728,15 @@ backupService.onMaintenance(async (enabled, _reason, context = {}) => {
   } else {
     if (_shuttingDown) return
     routingRt.routingState?.start()
-    resumeVmDbSync()
-    resumePriceCatalog()
+    if (!haMode) resumeVmDbSync()
+    if (!haMode) resumePriceCatalog()
     for (const monitor of maintenanceMonitors()) await monitor?.start?.({ immediate: false })
-    proxyPool.startScheduler()
+    if (!haMode) proxyPool.startScheduler()
     requestLog.startCleanupScheduler()
-    await vmTestSchedule.start()
+    if (!haMode) await vmTestSchedule.start()
   }
 })
-await backupService.startScheduler()
+if (!haMode) await backupService.startScheduler()
 
 const stats = {
   requests: 0,
@@ -1020,7 +1040,7 @@ const protocolHandlers = createHandleProtocol({
 })
 
 async function dispatchProtocol(name, req, res, ...args) {
-  if (lifecycle.draining || (kubernetesMode && controlPlaneLock?.healthy !== true)) {
+  if (lifecycle.draining || !controlPlaneHealthy()) {
     return json(res, 503, {
       error: { type: 'overloaded_error', code: 'control_plane_draining', message: 'Control plane is draining' },
     })
@@ -1074,58 +1094,73 @@ async function syncNodeLocalEgress() {
   }
 }
 
-const clusterManager = new ClusterManager({
-  repo: new ClusterNodesRepo(),
-  dataDir,
-  gateBin: process.env.KIN_CLUSTER_GATE_BIN || path.join(cfg.paths.project, 'bin', 'kin-slot-gate'),
-  listen: { host: cfg.host, port: cfg.port },
-  vmsOnNode: (nodeId) => listVms(cfg.paths.project).filter((vm) => vm.node_id === nodeId),
-  assertNodeEditable: (nodeId) => {
-    const busy = listVms(cfg.paths.project).some(
-      (vm) =>
-        vm.node_id === nodeId &&
-        (Number(poolScheduler?.vmInflight?.get(vm.id) || 0) > 0 ||
-          vmLockBusy(path.join(cfg.paths.project, 'vms', `${vm.id}.json`))),
-    )
-    if (busy || nodeImageBuildRunning(nodeId)) {
-      throw new ClusterError(409, 'node_in_use', '节点仍有进行中的请求、虚拟机操作或镜像构建，请完成后重试')
-    }
-  },
-  onNodesChanged: () => {
-    if (!backupService.isMaintaining) return syncNodeLocalEgress()
-  },
-  // A node's local row follows its link: re-probe as soon as the link settles.
-  onLinkState: (nodeId, state) => {
-    if (!backupService.isMaintaining && (state === 'ready' || state === 'error' || state === 'backoff')) {
-      return proxyPool.probeLocalNode(nodeId)
-    }
-  },
-})
+const clusterManager = haMode
+  ? null
+  : new ClusterManager({
+      repo: new ClusterNodesRepo(),
+      dataDir,
+      gateBin: process.env.KIN_CLUSTER_GATE_BIN || path.join(cfg.paths.project, 'bin', 'kin-slot-gate'),
+      listen: { host: cfg.host, port: cfg.port },
+      vmsOnNode: (nodeId) => listVms(cfg.paths.project).filter((vm) => vm.node_id === nodeId),
+      assertNodeEditable: (nodeId) => {
+        const busy = listVms(cfg.paths.project).some(
+          (vm) =>
+            vm.node_id === nodeId &&
+            (Number(poolScheduler?.vmInflight?.get(vm.id) || 0) > 0 ||
+              vmLockBusy(path.join(cfg.paths.project, 'vms', `${vm.id}.json`))),
+        )
+        if (busy || nodeImageBuildRunning(nodeId)) {
+          throw new ClusterError(409, 'node_in_use', '节点仍有进行中的请求、虚拟机操作或镜像构建，请完成后重试')
+        }
+      },
+      onNodesChanged: () => {
+        if (!backupService.isMaintaining) return syncNodeLocalEgress()
+      },
+      // A node's local row follows its link: re-probe as soon as the link settles.
+      onLinkState: (nodeId, state) => {
+        if (!backupService.isMaintaining && (state === 'ready' || state === 'error' || state === 'backoff')) {
+          return proxyPool.probeLocalNode(nodeId)
+        }
+      },
+    })
 localEgressCluster = clusterManager
-bindPlacement({ manager: clusterManager, projectRoot: cfg.paths.project })
-await startNodeEgressSocks({ clientFor: (nodeId) => clusterManager.client(nodeId) })
-await clusterManager.start()
-await clusterManager.restoreSlotRelays()
-await syncNodeLocalEgress()
-if (proxyPool.snapshot().config.ipv6_enabled !== true) {
-  const exits = await syncIpv6ProxyEgress(cfg.paths.project, proxyPool)
-  for (const exit of exits.filter((item) => !item.ok)) {
-    console.warn('[ipv6-policy] exit not blocked', exit.vm_id || exit.proxy_id, exit.error)
+if (!haMode) {
+  bindPlacement({ manager: clusterManager, projectRoot: cfg.paths.project })
+  await startNodeEgressSocks({ clientFor: (nodeId) => clusterManager.client(nodeId) })
+  await clusterManager.start()
+  await clusterManager.restoreSlotRelays()
+  await syncNodeLocalEgress()
+  if (proxyPool.snapshot().config.ipv6_enabled !== true) {
+    const exits = await syncIpv6ProxyEgress(cfg.paths.project, proxyPool)
+    for (const exit of exits.filter((item) => !item.ok)) {
+      console.warn('[ipv6-policy] exit not blocked', exit.vm_id || exit.proxy_id, exit.error)
+    }
   }
 }
-const clusterRoutes = createClusterRoutes({
-  manager: clusterManager,
-  json,
-  readBody,
-  ok: panel.ok,
-  onExecutionState: noteRequestExecution,
-})
-const slotShell = createSlotShell({
-  projectRoot: cfg.paths.project,
-  importOauth: commitImportedOauth,
-  onExecutionState: noteRequestExecution,
-})
-for (const vm of listVms(cfg.paths.project)) {
+const noHostRoutes = {
+  handle: () => false,
+  handleUpgrade: () => false,
+  beginDrain() {},
+  terminate() {},
+  async drain() {},
+}
+const clusterRoutes = haMode
+  ? noHostRoutes
+  : createClusterRoutes({
+      manager: clusterManager,
+      json,
+      readBody,
+      ok: panel.ok,
+      onExecutionState: noteRequestExecution,
+    })
+const slotShell = haMode
+  ? noHostRoutes
+  : createSlotShell({
+      projectRoot: cfg.paths.project,
+      importOauth: commitImportedOauth,
+      onExecutionState: noteRequestExecution,
+    })
+for (const vm of haMode ? [] : listVms(cfg.paths.project)) {
   if (isCodexVm(vm)) continue
   try {
     ensureSlotSubscriptionType(path.join(cfg.paths.project, 'vms', vm.id, 'cli-home'), vm.account_tier)
@@ -1133,10 +1168,12 @@ for (const vm of listVms(cfg.paths.project)) {
     console.warn('[credential-subscription]', vm.id, error?.message || error)
   }
 }
-cliNodeGuard = createCliNodeGuard({
-  listTargets: () => listVms(cfg.paths.project),
-  liveTokens: () => slotShell.liveShellTokens?.() || [],
-})
+cliNodeGuard = haMode
+  ? null
+  : createCliNodeGuard({
+      listTargets: () => listVms(cfg.paths.project),
+      liveTokens: () => slotShell.liveShellTokens?.() || [],
+    })
 
 const handlePanel = createPanelHandler({
   onPersistenceFailure: async () => {
@@ -1241,7 +1278,8 @@ function noteRequestExecution(req, execution) {
 
 async function withRequestActivity(req, res, callback, kind = 'http') {
   if (!activityCoordinator || requestActivities.has(req)) return callback()
-  const gate = await activityCoordinator.admit({ kind })
+  const requestId = haMode ? crypto.randomUUID() : null
+  const gate = await activityCoordinator.admit({ kind, requestId })
   const state = { gate, executions: new Map(), unknown: false }
   requestActivities.set(req, state)
   let responseDone
@@ -1255,9 +1293,13 @@ async function withRequestActivity(req, res, callback, kind = 'http') {
   try {
     return await gate.run(async () => {
       try {
-        const value = await callback(state)
-        await responseDone
-        await flushRuntimeWrites()
+        const value = await withHaRequestContext({ db, requestId, activity: gate }, async () => {
+          if (haCatalog) await haCatalog.refresh()
+          const result = await callback(state)
+          await responseDone
+          await flushRuntimeWrites()
+          return result
+        })
         return value
       } catch (error) {
         state.unknown = true
@@ -1287,6 +1329,10 @@ async function handleHttp(req, res) {
       return json(res, 400, { error: { message: 'Invalid URL', type: 'invalid_request' } })
     }
     const p = url.pathname
+    if (haMode && !haRouteAllowed(req.method, p)) {
+      const error = haUnsupported()
+      return json(res, error.status, { error: { code: error.code, message: error.message } })
+    }
 
     if ((req.method === 'GET' || req.method === 'HEAD') && p === '/readyz') {
       const ready = await lifecycle.isReady()
@@ -1297,7 +1343,7 @@ async function handleHttp(req, res) {
       return json(res, ready ? 200 : 503, { status: ready ? 'ready' : 'not_ready' })
     }
     if (
-      (lifecycle.draining || (kubernetesMode && (!lifecycle.initialized || controlPlaneLock?.healthy !== true))) &&
+      (lifecycle.draining || (kubernetesMode && (!lifecycle.initialized || !controlPlaneHealthy()))) &&
       p !== '/healthz' &&
       p !== '/health'
     ) {
@@ -1493,13 +1539,17 @@ server.on('connection', (socket) => {
 server.on('upgrade', async (req, socket, head) => {
   if (
     lifecycle.draining ||
-    (kubernetesMode && (!lifecycle.initialized || controlPlaneLock?.healthy !== true)) ||
+    (kubernetesMode && (!lifecycle.initialized || !controlPlaneHealthy())) ||
     backupService.isMaintaining
   ) {
     socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n')
     return
   }
   try {
+    if (haMode && !haRouteAllowed(req.method, parseRequestUrl(req)?.pathname || '', { upgrade: true })) {
+      socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n')
+      return
+    }
     await withRequestActivity(
       req,
       null,
@@ -1565,7 +1615,8 @@ const pub = {
   },
 }
 // Never persist the raw API key. Public snapshot only.
-fs.writeFileSync(path.join(cfg.paths.root, 'config', 'gateway-v2.public.json'), JSON.stringify(pub, null, 2))
+if (!haMode)
+  fs.writeFileSync(path.join(cfg.paths.root, 'config', 'gateway-v2.public.json'), JSON.stringify(pub, null, 2))
 
 process.on('uncaughtException', (e) => console.error('[uncaught]', e))
 process.on('unhandledRejection', (e) => console.error('[unhandled]', e))
@@ -1670,7 +1721,7 @@ async function shutdown(signal, { failed = false } = {}) {
         if (kubernetesMode) await getSharedBackgroundTasks(db).flush()
         await flushRuntimeWrites()
         stopAllRustKernels()
-        await clusterManager.stop()
+        await clusterManager?.stop()
         await shutdownActivity?.complete({ ended: true, reason: 'shutdown_persistence_completed' })
         await activityCoordinator?.stop()
         await controlPlaneLock?.stop()
@@ -1694,12 +1745,9 @@ process.on('SIGINT', async () => await shutdown('SIGINT'))
 
 function maintenanceMonitors() {
   return [
-    healthMonitor,
-    credentialRefreshMonitor,
-    kernelWatchdog,
-    cliNodeGuard,
-    usageProbeMonitor,
-    catalogMonitor,
+    ...(haMode
+      ? []
+      : [healthMonitor, credentialRefreshMonitor, kernelWatchdog, cliNodeGuard, usageProbeMonitor, catalogMonitor]),
     notifyMonitor,
   ]
 }
@@ -1715,7 +1763,7 @@ async function flushRuntimeWrites() {
   await flushVmDbSync()
 }
 
-await bootApiKernel(cfg)
+if (!haMode) await bootApiKernel(cfg)
 if (activityCoordinator) {
   await flushRuntimeWrites()
   await activityCoordinator.acknowledgeEpoch(db.bootstrapActivity.epoch)
@@ -1723,48 +1771,50 @@ if (activityCoordinator) {
 }
 
 server.listen(cfg.port, cfg.host, async () => {
-  try {
-    await vmTestSchedule.start()
-  } catch (e) {
-    console.warn('[vm-test-schedule] start failed', e?.message || e)
-  }
-  try {
-    healthMonitor?.start?.({ immediate: true })
-  } catch (e) {
-    console.warn('[health-probe] start failed', e?.message || e)
-  }
-  try {
-    credentialRefreshMonitor?.start?.({ immediate: true })
-  } catch (e) {
-    console.warn('[credential-refresh] start failed', e?.message || e)
-  }
-  try {
-    kernelWatchdog?.start?.({ immediate: true })
-  } catch (e) {
-    console.warn('[kernel-watchdog] start failed', e?.message || e)
-  }
-  // Boot fills what Docker's restart policy missed (removed or exited slot containers); off with the watchdog.
-  if (process.env.KIN_CRS_MOCK !== '1' && normalizeKernelWatchdogConfig(routingConfig.kernel_watchdog).enabled) {
-    reviveDownSlots({ vms: listVms(cfg.paths.project), powerOn: bootSlot, watchdog: kernelWatchdog }).catch((e) =>
-      console.warn('[slot-revive] boot pass failed', e?.message || e),
-    )
-  }
-  try {
-    cliNodeGuard?.start?.({ immediate: true })
-  } catch (e) {
-    console.warn('[cli-node-guard] start failed', e?.message || e)
-  }
-  try {
-    usageProbeMonitor?.start?.({ immediate: true })
-  } catch (e) {
-    console.warn('[usage-probe] start failed', e?.message || e)
-  }
-  // The KIN_CRS_MOCK harness promises no outbound network; catalogs stay on builtin data there.
-  if (process.env.KIN_CRS_MOCK !== '1') {
+  if (!haMode) {
     try {
-      catalogMonitor?.start?.()
+      await vmTestSchedule.start()
     } catch (e) {
-      console.warn('[catalog-sync] start failed', e?.message || e)
+      console.warn('[vm-test-schedule] start failed', e?.message || e)
+    }
+    try {
+      healthMonitor?.start?.({ immediate: true })
+    } catch (e) {
+      console.warn('[health-probe] start failed', e?.message || e)
+    }
+    try {
+      credentialRefreshMonitor?.start?.({ immediate: true })
+    } catch (e) {
+      console.warn('[credential-refresh] start failed', e?.message || e)
+    }
+    try {
+      kernelWatchdog?.start?.({ immediate: true })
+    } catch (e) {
+      console.warn('[kernel-watchdog] start failed', e?.message || e)
+    }
+    // Boot fills what Docker's restart policy missed (removed or exited slot containers); off with the watchdog.
+    if (process.env.KIN_CRS_MOCK !== '1' && normalizeKernelWatchdogConfig(routingConfig.kernel_watchdog).enabled) {
+      reviveDownSlots({ vms: listVms(cfg.paths.project), powerOn: bootSlot, watchdog: kernelWatchdog }).catch((e) =>
+        console.warn('[slot-revive] boot pass failed', e?.message || e),
+      )
+    }
+    try {
+      cliNodeGuard?.start?.({ immediate: true })
+    } catch (e) {
+      console.warn('[cli-node-guard] start failed', e?.message || e)
+    }
+    try {
+      usageProbeMonitor?.start?.({ immediate: true })
+    } catch (e) {
+      console.warn('[usage-probe] start failed', e?.message || e)
+    }
+    // The KIN_CRS_MOCK harness promises no outbound network; catalogs stay on builtin data there.
+    if (process.env.KIN_CRS_MOCK !== '1') {
+      try {
+        catalogMonitor?.start?.()
+      } catch (e) {
+        console.warn('[catalog-sync] start failed', e?.message || e)
+      }
     }
   }
   try {

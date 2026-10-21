@@ -183,6 +183,7 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
 }
 
 export function getActiveVmId(projectRoot) {
+  if (isKubernetesHaMode()) return null
   try {
     const a = readJsonCached(path.join(projectRoot, 'vms', 'active.json'))
     return a?.active_vm ?? null

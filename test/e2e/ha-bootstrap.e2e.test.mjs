@@ -13,13 +13,26 @@ test('two HA processes start with PG-only metadata and never enter legacy host b
     fs.rmSync(root, { recursive: true, force: true })
   })
   const trust = path.join(root, 'nodes.json')
-  fs.writeFileSync(trust, JSON.stringify({ nodes: { 'fixture-node': {
-    address: '127.0.0.1', port: 19999, token: 'synthetic-bootstrap-token',
-    certSha256: 'a'.repeat(64), policyDigest: 'b'.repeat(64), presetId: 'claude-docker-v1',
-  } } }), { mode: 0o600 })
+  fs.writeFileSync(
+    trust,
+    JSON.stringify({
+      nodes: {
+        'fixture-node': {
+          address: '127.0.0.1',
+          port: 19999,
+          token: 'synthetic-bootstrap-token',
+          certSha256: 'a'.repeat(64),
+          policyDigest: 'b'.repeat(64),
+          presetId: 'claude-docker-v1',
+        },
+      },
+    }),
+    { mode: 0o600 },
+  )
   const barrier = path.join(root, 'legacy-effects.log')
   const env = {
-    VM2API_CONTROL_PLANE_MODE: 'kubernetes-ha', VM2API_NODE_CONFIG_FILE: trust,
+    VM2API_CONTROL_PLANE_MODE: 'kubernetes-ha',
+    VM2API_NODE_CONFIG_FILE: trust,
     VM2API_TEST_HOST_BARRIER_FILE: barrier,
     NODE_OPTIONS: `--import=${new URL('../fixtures/ha-no-host-loader.mjs', import.meta.url).href}`,
     KIN_BACKUP_DISABLED: '1',
@@ -28,19 +41,25 @@ test('two HA processes start with PG-only metadata and never enter legacy host b
     const project = path.join(root, `pod-${index}`)
     fs.mkdirSync(path.join(project, 'vms'), { recursive: true })
     fs.writeFileSync(path.join(project, 'vms', 'active.json'), '{}')
-    const gateway = await startGateway({ project, env: { ...env, ...(gateways[0] ? { KIN_DATABASE_SCHEMA: gateways[0].schema } : {}) } })
+    const gateway = await startGateway({
+      project,
+      env: { ...env, ...(gateways[0] ? { KIN_DATABASE_SCHEMA: gateways[0].schema } : {}) },
+    })
     gateways.push(gateway)
     assert.equal((await fetch(`${gateway.baseUrl}/readyz`)).status, 200)
   }
   const login = await fetch(`${gateways[0].baseUrl}/api/panel/login`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ username: 'admin', password: 'testpass' }),
   })
   assert.equal(login.status, 200)
   const cookie = login.headers.get('set-cookie').split(';')[0]
   assert.equal((await fetch(`${gateways[1].baseUrl}/api/panel/me`, { headers: { cookie } })).status, 200)
   const blocked = await fetch(`${gateways[1].baseUrl}/api/panel/vms/create`, {
-    method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: '{}',
+    method: 'POST',
+    headers: { cookie, 'content-type': 'application/json' },
+    body: '{}',
   })
   assert.equal(blocked.status, 503)
   assert.equal((await blocked.json()).error.code, 'ha_operation_unsupported')

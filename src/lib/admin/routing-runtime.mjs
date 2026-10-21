@@ -54,7 +54,8 @@ import { normalizeVmConfig } from '../vm/machine-spec.mjs'
 import { syncWorkerTelemetry } from '../vm/vm-runtime.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { telemetryUploadInterval } from '../vm/worker-telemetry.mjs'
-import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { isKubernetesMode, isKubernetesHaMode } from '../core/control-plane-mode.mjs'
+import { assertHaRoutingPatch } from '../core/ha-control-plane-policy.mjs'
 import { SharedRoutingConfig } from './shared-routing-config.mjs'
 
 export function createRoutingRuntime(ctx) {
@@ -567,6 +568,7 @@ export function createRoutingRuntime(ctx) {
   }
 
   async function persistRoutingPatch(body = {}, options = {}) {
+    if (isKubernetesHaMode()) assertHaRoutingPatch(body)
     if (routingState) return routingState.patch(body, options)
     const hasCodexQuota = body?.codex && Object.prototype.hasOwnProperty.call(body.codex, 'quota')
     if (hasCodexQuota) validateOpenAIQuotaPatch(body.codex.quota)
@@ -847,6 +849,7 @@ export function createRoutingRuntime(ctx) {
       runtimeRepo,
       routingState,
       workerHealth: rustKernelHealth,
+      captureNodeExecution: ctx.captureNodeExecution,
       config: poolSchedulerConfig(),
     })
     setPool(poolScheduler)
