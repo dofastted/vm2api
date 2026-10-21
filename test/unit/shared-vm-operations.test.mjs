@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { createInterface } from 'node:readline'
-import { createDatabase, getDb, withTransaction } from '../../src/lib/db/database.mjs'
+import { getDb, withTransaction } from '../../src/lib/db/database.mjs'
+import { createRepositoryTestDatabase as createDatabase } from '../repository-database.mjs'
 import { ExecutionAdmissionsRepo } from '../../src/lib/db/repos/execution-admissions-repo.mjs'
 import { withVmLock, vmLockBusy } from '../../src/lib/vm/vm-file.mjs'
 
@@ -198,9 +199,9 @@ test('closing the owner PG connection leaves the committed operation unavailable
 
 test('SIGKILL of an operation owner does not make its VM available', async (t) => {
   const observer = await operations(getDb(), 'observer')
-  const databaseUrl = new URL('../../src/lib/db/database.mjs', import.meta.url).href
+  const databaseUrl = new URL('../repository-database.mjs', import.meta.url).href
   const serviceUrl = new URL('../../src/lib/vm/shared-vm-operations.mjs', import.meta.url).href
-  const script = `import { createDatabase } from ${JSON.stringify(databaseUrl)};
+  const script = `import { createRepositoryTestDatabase as createDatabase } from ${JSON.stringify(databaseUrl)};
     import { SharedVmOperations } from ${JSON.stringify(serviceUrl)};
     const db = await createDatabase({ connectionString: process.env.VM2API_TEST_DATABASE_URL, schema: process.env.KIN_DATABASE_SCHEMA });
     const claim = await new SharedVmOperations(db, { ownerId: 'killed-owner' }).tryAcquire({ vmId: 'vm-killed' });

@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import { setTimeout as delay } from 'node:timers/promises'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
-import { createDatabase, getDb } from '../../src/lib/db/database.mjs'
+import { getDb } from '../../src/lib/db/database.mjs'
+import { createRepositoryTestDatabase as createDatabase } from '../repository-database.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 
 function deferred() {
@@ -303,7 +304,7 @@ test('terminating the owner process leaves its persistent active turn blocking a
       '--input-type=module',
       '-e',
       `
-    import { createDatabase } from './src/lib/db/database.mjs';
+    import { createRepositoryTestDatabase as createDatabase } from './test/repository-database.mjs';
     import { FailoverRunner } from './src/lib/pool/failover-runner.mjs';
     const db = await createDatabase({ connectionString: process.env.VM2API_TEST_DATABASE_URL, schema: process.env.KIN_DATABASE_SCHEMA });
     const runner = new FailoverRunner({ scheduler: {

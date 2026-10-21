@@ -5,7 +5,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
 import { SeatPlanner } from '../../src/lib/pool/seat-planner.mjs'
-import { createDatabase, getDb } from '../../src/lib/db/database.mjs'
+import { getDb } from '../../src/lib/db/database.mjs'
+import { createRepositoryTestDatabase as createDatabase } from '../repository-database.mjs'
 import { SharedExecutionAdmissions } from '../../src/lib/pool/shared-execution-admissions.mjs'
 
 function gate() {
