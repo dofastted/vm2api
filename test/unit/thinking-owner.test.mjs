@@ -127,7 +127,7 @@ test('a handler records the served signature and the next account replays it as 
     requestLog: { start: () => ({ request_id: 'thinking-owner', mode: 'normal' }), finish() {} },
     stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
     accountQuota: { ingestHeaders() {} },
-    apiKeyStore: { acquire: () => ({ ok: true }), release() {} },
+    apiKeyStore: { reserve: async (record) => ({ ok: true, record, release: async () => {} }) },
     apiScheduler: {},
     apiEndpointStore: {},
     stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },

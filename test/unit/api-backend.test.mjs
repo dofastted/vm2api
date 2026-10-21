@@ -98,8 +98,9 @@ test('API backend applies the global official_full persona setting', async () =>
     requestLog: { start: () => ({ request_id: 'api-persona-test' }), finish() {} },
     stickyRouter: {},
     accountQuota: {},
-    apiKeyStore: { acquire: () => ({ ok: true }), release() {} },
+    apiKeyStore: { reserve: async (record) => ({ ok: true, record, release: async () => {} }) },
     apiScheduler: {
+      reload() {},
       pick: () => ({
         ok: true,
         endpoint: { id: 'ep-test', kind: 'claude', protocol: 'anthropic', base_url: 'https://upstream.invalid' },
@@ -107,7 +108,7 @@ test('API backend applies the global official_full persona setting', async () =>
         key: { id: 'key-test', api_key: 'secret' },
       }),
     },
-    apiEndpointStore: {},
+    apiEndpointStore: { listRaw: async () => [] },
     stats,
     routingConfigPath: routingFile,
     routingConfig: {
@@ -487,8 +488,7 @@ async function runManagedKeyHop(root, result) {
     stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
     accountQuota: { ingestHeaders() {} },
     apiKeyStore: {
-      acquire: () => ({ ok: true }),
-      release() {},
+      reserve: async (record) => ({ ok: true, record, release: async () => {} }),
       recordUsage: (key, usage, opts) => charges.push({ key, usage, opts }),
     },
     apiScheduler: {},
@@ -684,12 +684,15 @@ function protocolHarness({ body, stickyRouter, failoverRunner, apiKeyRecord = nu
     stickyRouter,
     accountQuota: {},
     apiKeyStore: {
-      acquire: () => {
+      reserve: async (record) => {
         apiKeyCalls.acquire += 1
-        return { ok: true }
-      },
-      release: () => {
-        apiKeyCalls.release += 1
+        return {
+          ok: true,
+          record,
+          release: async () => {
+            apiKeyCalls.release += 1
+          },
+        }
       },
     },
     apiScheduler: {},
@@ -1121,6 +1124,7 @@ test('Responses API backend keeps parallel done-only tools in one stream state',
   }
   try {
     const result = await runApiInference({
+      store: { listRaw: async () => [] },
       cfg: { paths: { data: root } },
       res,
       protocol: 'openai.chat',
@@ -1134,6 +1138,7 @@ test('Responses API backend keeps parallel done-only tools in one stream state',
         },
       },
       scheduler: {
+        reload() {},
         pick: () => ({
           ok: true,
           endpoint: { id: 'ep', kind: 'openai', protocol: 'openai', base_url: 'https://fixture.invalid' },
@@ -1178,6 +1183,7 @@ test('API Anthropic non-stream rejects message_start without message_stop', asyn
   await new Promise((resolve) => kernel.listen(socket, resolve))
   try {
     const result = await runApiInference({
+      store: { listRaw: async () => [] },
       cfg: { paths: { data: root } },
       res: { headersSent: false, write: () => {} },
       protocol: 'anthropic.messages',
@@ -1187,6 +1193,7 @@ test('API Anthropic non-stream rejects message_start without message_stop', asyn
       inbound: {},
       converters: { createClaudeMessageAssembler, applyClaudeSSELineToMessage },
       scheduler: {
+        reload() {},
         pick: () => ({
           ok: true,
           endpoint: { id: 'ep', kind: 'claude', protocol: 'anthropic', base_url: 'https://fixture.invalid' },
@@ -1234,6 +1241,7 @@ test('API Anthropic non-stream rejects stop_reason and text without message_stop
   await new Promise((resolve) => kernel.listen(socket, resolve))
   try {
     const result = await runApiInference({
+      store: { listRaw: async () => [] },
       cfg: { paths: { data: root } },
       res: { headersSent: false, write: () => {} },
       protocol: 'anthropic.messages',
@@ -1243,6 +1251,7 @@ test('API Anthropic non-stream rejects stop_reason and text without message_stop
       inbound: {},
       converters: { createClaudeMessageAssembler, applyClaudeSSELineToMessage },
       scheduler: {
+        reload() {},
         pick: () => ({
           ok: true,
           endpoint: { id: 'ep', kind: 'claude', protocol: 'anthropic', base_url: 'https://fixture.invalid' },
@@ -1276,6 +1285,7 @@ test('API Anthropic non-stream accepts message_stop as terminal', async () => {
   await new Promise((resolve) => kernel.listen(socket, resolve))
   try {
     const result = await runApiInference({
+      store: { listRaw: async () => [] },
       cfg: { paths: { data: root } },
       res: { headersSent: false, write: () => {} },
       protocol: 'anthropic.messages',
@@ -1285,6 +1295,7 @@ test('API Anthropic non-stream accepts message_stop as terminal', async () => {
       inbound: {},
       converters: { createClaudeMessageAssembler, applyClaudeSSELineToMessage },
       scheduler: {
+        reload() {},
         pick: () => ({
           ok: true,
           endpoint: { id: 'ep', kind: 'claude', protocol: 'anthropic', base_url: 'https://fixture.invalid' },
@@ -1343,8 +1354,9 @@ test('API backend non-stream maps incomplete assistant hops to incomplete_respon
     requestLog: { start: () => ({ request_id: 'api-incomplete-test' }), finish() {} },
     stickyRouter: {},
     accountQuota: {},
-    apiKeyStore: { acquire: () => ({ ok: true }), release() {} },
+    apiKeyStore: { reserve: async (record) => ({ ok: true, record, release: async () => {} }) },
     apiScheduler: {
+      reload() {},
       pick: () => ({
         ok: true,
         endpoint: { id: 'ep-test', kind: 'claude', protocol: 'anthropic', base_url: 'https://upstream.invalid' },
@@ -1352,7 +1364,7 @@ test('API backend non-stream maps incomplete assistant hops to incomplete_respon
         key: { id: 'key-test', api_key: 'secret' },
       }),
     },
-    apiEndpointStore: {},
+    apiEndpointStore: { listRaw: async () => [] },
     stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
     routingConfigPath: routingFile,
     routingConfig: { compatibility: { persona_preset: 'zero' }, failover: {} },
@@ -1401,6 +1413,7 @@ test('Responses API backend returns 502 for conflicting tool arguments when the 
   await new Promise((resolve) => kernel.listen(socket, resolve))
   try {
     const result = await runApiInference({
+      store: { listRaw: async () => [] },
       cfg: { paths: { data: root } },
       res: { headersSent: false, write: () => {} },
       protocol: 'anthropic.messages',
@@ -1410,6 +1423,7 @@ test('Responses API backend returns 502 for conflicting tool arguments when the 
       inbound: {},
       converters: { writeSSEHeaders: () => {} },
       scheduler: {
+        reload() {},
         pick: () => ({
           ok: true,
           endpoint: { id: 'ep', kind: 'openai', protocol: 'openai', base_url: 'https://fixture.invalid' },

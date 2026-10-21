@@ -190,8 +190,9 @@ function protocolHarness({ routing, body, healthMonitor }) {
     requestLog: { start: () => ({ request_id: 'cc-only-test' }), finish() {} },
     stickyRouter: {},
     accountQuota: {},
-    apiKeyStore: { acquire: () => ({ ok: true }), release() {} },
+    apiKeyStore: { reserve: async (record) => ({ ok: true, record, release: async () => {} }) },
     apiScheduler: {
+      reload() {},
       pick: () => {
         throw REACHED
       },
@@ -201,7 +202,7 @@ function protocolHarness({ routing, body, healthMonitor }) {
         throw REACHED
       },
     },
-    apiEndpointStore: {},
+    apiEndpointStore: { listRaw: async () => [] },
     stats,
     getRoutingConfig: () => routing,
     groupsRepo: { rateMultiplier: () => 1 },
