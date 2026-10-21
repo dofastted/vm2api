@@ -4,13 +4,14 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import https from 'node:https'
-import { getDb } from '../../src/lib/db/database.mjs'
+import { getDb, quoteIdentifier } from '../../src/lib/db/database.mjs'
 import { createRepositoryTestDatabase } from '../repository-database.mjs'
 import { withDatabaseActivities } from '../maintenance-fixture.mjs'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 import { ExecutionAdmissionsRepo } from '../../src/lib/db/repos/execution-admissions-repo.mjs'
 import { SharedVmOperations } from '../../src/lib/vm/shared-vm-operations.mjs'
 import { writeCodexAccounts, readCodexAccounts, codexCredentialPath } from '../../src/lib/vm/codex-slot.mjs'
+import { refreshSharedCodexCredential } from '../../src/lib/oauth/shared-codex-refresh.mjs'
 
 async function fixture(t, { codex = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'panel-refresh-claims-'))
@@ -210,4 +211,75 @@ test('Claude complete rejection can release its manual operation', async (t) => 
   const next = await new SharedVmOperations(f.peer).tryAcquire({ vmId: f.vm.id })
   assert.equal(next.ok, true)
   await next.release()
+})
+
+test('manual Codex refresh never resubmits an account with a pending or unknown refresh on another VM', async (t) => {
+  const f = await fixture(t, { codex: true })
+  const winnerVm = { ...f.vm, id: 'vm-winner' }
+  const thirdVm = { ...f.vm, id: 'vm-third' }
+  for (const vm of [winnerVm, thirdVm]) {
+    fs.mkdirSync(path.join(f.root, 'vms', vm.id))
+    fs.writeFileSync(path.join(f.root, 'vms', vm.id + '.json'), JSON.stringify(vm))
+    writeCodexAccounts(f.root, vm.id, readCodexAccounts(f.root, f.vm.id))
+  }
+  let entered
+  const started = new Promise((resolve) => {
+    entered = resolve
+  })
+  let finish
+  const pending = new Promise((resolve) => {
+    finish = resolve
+  })
+  let winnerCalls = 0
+  const winner = withDatabaseActivities([f.peer], () =>
+    refreshSharedCodexCredential({
+      projectRoot: f.root,
+      vm: winnerVm,
+      db: f.peer,
+      refresh: async () => {
+        winnerCalls++
+        entered()
+        await pending
+        return { ok: false, attemptFinished: false, error: 'synthetic_disconnect' }
+      },
+    }),
+  )
+  winner.catch(() => {})
+  await started
+  let manualCalls = 0
+  const extra = {
+    vmMutationOps: {
+      refreshCodexAccessToken: async () => {
+        manualCalls++
+        throw new Error('must not resubmit the same account refresh')
+      },
+    },
+  }
+  const h = f.handler(extra)
+  const request = h.request('/api/panel/vms/vm-synthetic/oauth/refresh')
+  request.catch(() => {})
+  try {
+    const deadline = Date.now() + 2000
+    while (true) {
+      const row = await f.peer.pool.query(
+        `SELECT count(*) AS n FROM ${quoteIdentifier(f.peer.schema)}.vm_operations WHERE vm_id=$1 AND released_at IS NULL`,
+        [f.vm.id],
+      )
+      if (Number(row.rows[0].n) === 1) break
+      assert.ok(Date.now() < deadline, 'manual route did not enter its VM operation')
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    assert.equal(manualCalls, 0)
+  } finally {
+    finish()
+    await winner
+    await request
+  }
+  assert.equal(h.response.status, 502)
+  const third = f.handler(extra)
+  await third.request('/api/panel/vms/vm-third/oauth/refresh')
+  assert.equal(third.response.status, 502)
+  assert.equal(winnerCalls, 1)
+  assert.equal(manualCalls, 0)
+  assert.equal(f.calls(), 0)
 })

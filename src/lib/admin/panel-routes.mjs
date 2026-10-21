@@ -886,10 +886,11 @@ export function createPanelHandler(ctx) {
         credentialMode: credentialModeOfVm(vm),
       }
       if (isKubernetesMode()) {
-        const completed = await vmEffect(operation, async () => {
+        const execution = await vmEffect(operation, async () => {
           const result = await (ctx.vmMutationOps?.runOfficialCcBootstrap || runOfficialCcBootstrap)(options)
-          return officialCcBootstrapFinished(result, options) ? result : { ...result, vmOperationUncertain: true }
+          return { ok: officialCcBootstrapFinished(result, options), value: result }
         })
+        const completed = execution.value
         bootstrap = { scheduled: true, vmId: id, completed: true, ok: completed?.ok === true }
       } else bootstrap = scheduleOfficialCcBootstrap(options)
     }
