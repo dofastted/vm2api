@@ -43,6 +43,24 @@ test('offline import preserves source, credentials, bigint, runtime and legacy d
   await assert.rejects(importSqlite({ source, db }), /target is not empty/)
 })
 
+test('PostgreSQL-only session rows make the import target nonempty', async () => {
+  const old = sqlite({ dbPath: source })
+  old.close()
+  const before = digest()
+  const db = getDb()
+  await db
+    .prepare(`
+    INSERT INTO panel_sessions(token_hash,username,role,expires_at)
+    VALUES($1,'alice','admin',floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint + 60000)
+  `)
+    .run('a'.repeat(64))
+  await assert.rejects(importSqlite({ source, db }), /target is not empty \(panel_sessions\)/)
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM panel_sessions').get()).n, 1)
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM settings').get()).n, 0)
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM groups').get()).n, 2)
+  assert.equal(digest(), before)
+})
+
 test('unmapped source schema is rejected without writing target', async () => {
   const old = sqlite({ dbPath: source })
   old.exec('CREATE TABLE unknown_business(id TEXT)')
