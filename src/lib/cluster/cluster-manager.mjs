@@ -5,7 +5,7 @@
  */
 
 import crypto from 'node:crypto'
-import { getDb, withTransaction } from '../db/database.mjs'
+import { getDb, withTransaction, getActivityCoordinator } from '../db/database.mjs'
 import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 import { OneTimeAuthRepo } from '../db/repos/one-time-auth-repo.mjs'
 import fs from 'node:fs'
@@ -159,6 +159,8 @@ export class ClusterManager {
     this.tickets = new Map()
     this.authState = isKubernetesMode() ? authState || new OneTimeAuthRepo(repo.db || getDb()) : null
     this._healthTimer = null
+    this._backgroundTasks = new Set()
+    this._stopping = false
   }
 
   async reload() {
@@ -180,20 +182,25 @@ export class ClusterManager {
   }
 
   async start() {
+    this._stopping = false
     await this.reload()
     for (const node of this.nodes.values()) this._attach(node)
     this._healthTimer = setInterval(() => {
-      for (const id of this.links.keys()) this._checkHealth(id)
+      for (const id of this.links.keys()) {
+        void this._background('cluster_health', () => this._checkHealth(id)).catch(() => {})
+      }
     }, HEALTH_INTERVAL_MS)
     this._healthTimer.unref?.()
   }
 
   async stop() {
+    this._stopping = true
     clearInterval(this._healthTimer)
     this._healthTimer = null
     for (const link of this.links.values()) link.stop()
     const relays = [...this.bridges.values(), ...[...this.slotRelays.values()].flatMap((r) => [r.kernel, r.worker])]
     await Promise.all(relays.map((r) => r.stop().catch(() => {})))
+    while (this._backgroundTasks.size) await Promise.allSettled([...this._backgroundTasks])
     this.links.clear()
     this.bridges.clear()
     this.slotRelays.clear()
@@ -203,21 +210,44 @@ export class ClusterManager {
     return path.join(this.socketDir, id, 'docker.sock')
   }
 
+  _background(kind, callback) {
+    if (this._stopping) return Promise.reject(new ClusterError(503, 'cluster_stopping', '集群正在停止'))
+    const coordinator = getActivityCoordinator(this.repo.db)
+    const pending = coordinator
+      ? coordinator.runActivity({ kind }, async () => ({ ended: true, value: await callback() }))
+      : Promise.resolve().then(callback)
+    this._backgroundTasks.add(pending)
+    pending.then(
+      () => this._backgroundTasks.delete(pending),
+      (error) => {
+        this._backgroundTasks.delete(pending)
+        this.logger.warn(`[cluster] ${kind} failed: ${error.code || error.name}`)
+      },
+    )
+    return pending
+  }
+
   _attach(node) {
-    const link = new SshLink({ id: node.id, resolveTarget: () => this._targetFor(node.id) })
+    const link = new SshLink({
+      id: node.id,
+      resolveTarget: () => this._background('cluster_ssh_target', () => this._targetFor(node.id)),
+    })
     link.on('state', (state) => {
       this.logger.log(JSON.stringify({ event: 'cluster-link', node: node.id, state, error: link.error?.code || null }))
       if (state === 'ready') {
         // Host facts first: they carry the platform the health check branches on.
-        Promise.resolve(this.remoteHost(node.id))
-          .catch(() => {})
-          .then(() => this._checkHealth(node.id))
-          .catch(() => {})
-          .finally(() => this._linkState(node.id, state))
-        this._ensureGate(node.id).catch(() => {})
+        void this._background('cluster_link_ready', async () => {
+          try {
+            await this.remoteHost(node.id)
+            await this._checkHealth(node.id)
+          } finally {
+            await this._linkState(node.id, state)
+          }
+        }).catch(() => {})
+        void this._background('cluster_gate', () => this._ensureGate(node.id)).catch(() => {})
       } else {
         this.health.delete(node.id)
-        this._linkState(node.id, state)
+        void this._background('cluster_link_state', () => this._linkState(node.id, state)).catch(() => {})
       }
     })
     this.links.set(node.id, link)
@@ -415,7 +445,7 @@ export class ClusterManager {
     } catch (err) {
       this._directPatch(id, { gate_error: err.message })
       this.logger.warn(`[cluster] slot gate on ${id}: ${err.message}`)
-      if (strict) throw err
+      if (strict || getActivityCoordinator(this.repo.db)) throw err
     }
   }
 
@@ -505,7 +535,7 @@ export class ClusterManager {
     this.nodes.set(node.id, node)
     this.platforms.set(node.id, 'linux')
     this._attach(node)
-    this._nodesChanged()
+    await this._nodesChanged()
     return this._view(node)
   }
 
@@ -710,20 +740,17 @@ export class ClusterManager {
     }
   }
 
-  _linkState(id, state) {
+  async _linkState(id, state) {
     try {
-      this.onLinkState?.(id, state)
+      await this.onLinkState?.(id, state)
     } catch (err) {
       this.logger.warn(`[cluster] link-state hook failed: ${err.message}`)
+      if (getActivityCoordinator(this.repo.db)) throw err
     }
   }
 
   _nodesChanged() {
-    try {
-      this.onNodesChanged?.()
-    } catch (err) {
-      this.logger.warn(`[cluster] nodes-changed hook failed: ${err.message}`)
-    }
+    return this._background('cluster_nodes_changed', () => this.onNodesChanged?.()).catch(() => {})
   }
 
   async remove(id) {
@@ -748,7 +775,7 @@ export class ClusterManager {
     this.nodes.delete(id)
     this.platforms.delete(id)
     this.directLinksState.delete(id)
-    this._nodesChanged()
+    await this._nodesChanged()
   }
 
   reconnect(id) {
@@ -811,6 +838,7 @@ export class ClusterManager {
       }
     } catch (err) {
       this.logger.warn(`[cluster] record platform of ${id}: ${err.message}`)
+      if (getActivityCoordinator(this.repo.db)) throw err
     }
   }
 
