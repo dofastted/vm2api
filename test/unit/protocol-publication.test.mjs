@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url'
 
 const fixture = fileURLToPath(new URL('../fixtures/protocol-publication.mjs', import.meta.url))
 const setup = fileURLToPath(new URL('../pg-setup.mjs', import.meta.url))
-for (const kind of ['sync', 'touch', 'touch-finished']) {
+for (const kind of ['sync', 'sync-finished', 'sync-finished-unknown', 'touch', 'touch-finished', 'touch-finished-unknown']) {
   test(`protocol awaits its own ${kind} publication`, () => {
     const env = { ...process.env, VM2API_PROTOCOL_PUBLICATION_CASE: kind }
     delete env.NODE_TEST_CONTEXT

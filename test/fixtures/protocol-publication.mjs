@@ -24,7 +24,7 @@ mock.module(new URL('../../src/lib/transport/rust-kernel-supervisor.mjs', import
   namedExports: {
     ...supervisor,
     syncClaudeKernelConfigsFromFile() {
-      if (kind === 'sync') { enter(); return { publication } }
+      if (kind.startsWith('sync')) { enter(); return { publication } }
       return { updated: 0 }
     },
   },
@@ -91,13 +91,15 @@ test(`protocol waits for ${kind} publication and preserves unknown activity`, as
     await request
     assert.equal(runnerCalls, 1)
   } else {
-    const finishedPublication = kind === 'touch-finished'
+    const finishedPublication = kind.endsWith('-finished')
     reject(Object.assign(new Error('synthetic publication failed'), {
       code: 'sftp_failed',
-      ...(finishedPublication ? { publicationFinished: true } : { executionUncertain: true }),
+      ...(kind.includes('-finished') ? { publicationFinished: true } : {}),
+      ...(!finishedPublication ? { executionUncertain: true } : {}),
     }))
     await assert.rejects(request, /synthetic publication failed/)
-    assert.equal(marked, finishedPublication ? 0 : 1)
+    assert.equal(marked, finishedPublication || kind.startsWith('sync') ? 0 : 1)
+    if (kind.startsWith('sync')) assert.equal(runnerCalls, 0)
     assert.equal(states.some((state) => state.started === true && state.ended === false && !state.requestId), !finishedPublication)
     const row = await db.prepare('SELECT released_at FROM api_key_admissions WHERE key_id=$1').get(key.id)
     if (finishedPublication) {
