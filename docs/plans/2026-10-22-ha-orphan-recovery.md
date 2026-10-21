@@ -28,3 +28,7 @@ readCompletion({requestId: originalCommandId, nodeBinding: originalPgBinding})
 本阶段不写 usage、model、请求成功状态或金额，也不释放 API key reservation。缺少节点用量、实际模型和 PG 定价快照时，不能按 0 结算。API key 的业务 claim 继续阻止破坏性维护。恢复不会释放任何 VM operation、background task 或其他 parent 的资源。
 
 后续用量回执应在节点 completed 的同一 journal 事务持久化，通过原 node binding + command ID 关联 `execution_jobs`。回执仅包含 receipt ID、实际 model、usage_complete 和明确计数白名单；缺字段不得补 0，不保存响应正文、headers 或凭据。控制面按原 pricing snapshot 结算；它不能重发原 command 或重新 mint grant。
+
+历史清理保留两类原始执行图：仍有未 release 的同 parent API key reservation；已封闭但 execution_recovered_at 仍为空的 parent。正常已结束且无这些待处理关联的历史仍遵循旧清理策略。节点 proof 的长期独立审计存储和完整计费恢复尚未实现。
+
+新 HTTP/异步请求可能继承已关闭的 HA context。新 context 仅在新真实 coordinator gate 的 scope 下允许建立；继承的 active context 仍拒绝嵌套，原 activity 无法借 closed context 重新建立 parent。attempt context 共用父 context 的关闭状态。

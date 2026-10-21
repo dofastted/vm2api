@@ -38,7 +38,8 @@ export async function lockHaRequestContext(db) {
 /** Correlation only: closing this context never releases a lease or unknown work. */
 export async function withHaRequestContext({ db = getDb(), requestId, activity, recoveryKind = null }, callback) {
   if (!isKubernetesHaMode()) return callback()
-  if (requests.getStore()) throw failure('ha_request_context_nested')
+  const inherited = requests.getStore()
+  if (inherited?.isActive()) throw failure('ha_request_context_nested')
   const coordinator = getActivityCoordinator(db)
   const scope = coordinator?.assertActivity()
   if (
@@ -48,6 +49,15 @@ export async function withHaRequestContext({ db = getDb(), requestId, activity, 
     String(activity?.epoch) !== String(scope.epoch)
   )
     throw failure('ha_request_activity_mismatch')
+  if (
+    inherited &&
+    inherited.db.schema === db.schema &&
+    inherited.db.connectionString === db.connectionString &&
+    inherited.activityId === scope.id &&
+    inherited.activityOwnerId === coordinator.ownerId &&
+    String(inherited.activityEpoch) === String(scope.epoch)
+  )
+    throw failure('ha_request_context_closed')
   if (typeof requestId !== 'string' || !requestId.trim() || requestId.length > 128)
     throw failure('ha_request_id_invalid')
   if (recoveryKind !== null && recoveryKind !== 'claude_messages') throw failure('ha_request_recovery_kind_invalid')
@@ -64,6 +74,7 @@ export async function withHaRequestContext({ db = getDb(), requestId, activity, 
     activityOwnerId: coordinator.ownerId,
     activityEpoch: scope.epoch,
     attemptNo: null,
+    isActive: () => active,
     assertActive: () => {
       if (!active) throw failure('ha_request_context_closed')
     },
