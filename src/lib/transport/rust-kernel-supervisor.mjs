@@ -823,7 +823,14 @@ export function syncClaudeKernelConfigs(projectRoot, routing) {
     }
   }
   const publication = Promise.allSettled(publications).then((results) => {
-    const failed = results.find((result) => result.status === 'rejected')
+    const failures = results.filter((result) => result.status === 'rejected')
+    const unknown = failures.find(
+      ({ reason }) =>
+        reason?.publicationFinished !== true ||
+        reason.vmOperationUncertain === true ||
+        reason.executionUncertain === true,
+    )
+    const failed = unknown || failures[0]
     if (failed) throw failed.reason
   })
   publication.catch(() => {})

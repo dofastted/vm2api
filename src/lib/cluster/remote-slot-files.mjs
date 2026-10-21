@@ -94,7 +94,15 @@ function ownerFor(session, vm) {
 /** Push the named sets (`run`, `seed`, `touch`). Missing local files are skipped. */
 export async function pushSlotFiles(vm, slotDir, sets = ['run', 'seed'], session = null) {
   const s = session || (await nodeSession(vmNodeId(vm)))
-  await prepareRemoteDir(s, vm)
+  try {
+    await prepareRemoteDir(s, vm)
+  } catch (error) {
+    // This is the first remote step. Its confirmed failure precedes every SFTP operation.
+    if (error.remoteCommandEnded === true && error.vmOperationUncertain !== true && error.executionUncertain !== true) {
+      error.publicationFinished = true
+    }
+    throw error
+  }
   const sftp = await openSftp(s.client)
   const remote = remoteSlotDir(s.host, vm.id)
   const owner = ownerFor(s, vm)
@@ -226,8 +234,14 @@ export function queueSlotPush(vm, slotDir, sets, { logger = console } = {}) {
     .catch(() => {})
     .then(() => pushSlotFiles(vm, slotDir, sets))
     .catch((error) => {
-      error.vmOperationUncertain = true
-      error.executionUncertain = true
+      if (
+        error.publicationFinished !== true ||
+        error.vmOperationUncertain === true ||
+        error.executionUncertain === true
+      ) {
+        error.vmOperationUncertain = true
+        error.executionUncertain = true
+      }
       throw error
     })
     .finally(() => {
