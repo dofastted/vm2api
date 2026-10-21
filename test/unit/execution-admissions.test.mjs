@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { createDatabase, getDb, withTransaction } from '../../src/lib/db/database.mjs'
+import { createDatabase, getDb, withSavepoint, withTransaction } from '../../src/lib/db/database.mjs'
 
 async function replicas() {
   const { ExecutionAdmissionsRepo } = await import('../../src/lib/db/repos/execution-admissions-repo.mjs')
@@ -195,4 +195,71 @@ test('a shared database failure never creates an in-memory fallback admission', 
   await second.db.close()
   await assert.rejects(second.tryReserve(candidate()), /database is closed/)
   assert.equal((await first.getCounts(candidate())).accountInflight, 0)
+})
+
+test('simultaneous admissions atomically reserve account RPM across replicas', async () => {
+  const repos = await replicas()
+  const input = candidate({ accountLimit: 20, vmLimit: 20, rpmLimit: 3 })
+  const gates = await Promise.all(
+    Array.from({ length: 12 }, (_, i) => repos[i % 2].tryReserve({ ...input, vmId: `vm-${i}` })),
+  )
+  assert.equal(gates.filter((gate) => gate.ok).length, 3)
+  assert.ok(gates.filter((gate) => !gate.ok).every((gate) => gate.code === 'rpm_limit'))
+  await Promise.all(gates.filter((gate) => gate.ok).map((gate) => gate.release()))
+  assert.equal((await repos[1].getCounts(input)).rpmCount, 3)
+})
+
+test('simultaneous Fable requests share their sublimit across VMs and replicas', async () => {
+  const repos = await replicas()
+  const input = candidate({ accountLimit: 20, vmLimit: 20, fableLimit: 2, family: 'fable' })
+  const gates = await Promise.all(
+    Array.from({ length: 12 }, (_, i) => repos[i % 2].tryReserve({ ...input, vmId: `vm-${i}` })),
+  )
+  assert.equal(gates.filter((gate) => gate.ok).length, 2)
+  assert.ok(gates.filter((gate) => !gate.ok).every((gate) => gate.code === 'fable_concurrency'))
+  assert.equal((await repos[1].getCounts(input)).fableInflight, 2)
+  await Promise.all(gates.filter((gate) => gate.ok).map((gate) => gate.release()))
+})
+
+test('a refused seat can roll back admission in a savepoint and try another VM', async () => {
+  const [first, second] = await replicas()
+  let accepted
+  await withTransaction(first.db, async () => {
+    await assert.rejects(
+      withSavepoint(first.db, async () => {
+        const deniedSeat = await first.tryReserve(candidate({ accountLimit: 1, rpmLimit: 1 }))
+        assert.equal(deniedSeat.ok, true)
+        throw new Error('first VM has no seat')
+      }),
+      /first VM has no seat/,
+    )
+    accepted = await first.tryReserve(candidate({ vmId: 'vm-other', accountLimit: 1, rpmLimit: 1 }))
+    assert.equal(accepted.ok, true)
+  })
+  const counts = await second.getCounts(candidate({ vmId: 'vm-other' }))
+  assert.equal(counts.accountInflight, 1)
+  assert.equal(counts.rpmCount, 1)
+  await accepted.release()
+})
+
+test('resource locks compose with seat transactions and leave unrelated resources available', async () => {
+  const [first, second] = await replicas()
+  await assert.rejects(first.lockVm('vm-1'), { code: 'execution_transaction_required' })
+  await withTransaction(first.db, async () => {
+    await first.lockResources({ accountId: 'account-1', vmIds: ['vm-2', 'vm-1'] })
+    await first.lockVm('vm-1')
+    await withTransaction(second.db, async () => {
+      for (const [resource, expected] of [
+        ['account:account-1', false],
+        ['vm:vm-1', false],
+        ['vm:vm-2', false],
+        ['vm:vm-unrelated', true],
+      ]) {
+        const result = await second.db
+          .prepare('SELECT pg_try_advisory_xact_lock(hashtext($1), hashtext($2)) AS locked')
+          .get(`vm2api:execution:${first.db.schema}`, resource)
+        assert.equal(result.locked, expected, resource)
+      }
+    })
+  })
 })
