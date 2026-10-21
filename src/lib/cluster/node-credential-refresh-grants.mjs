@@ -103,7 +103,7 @@ export class NodeCredentialRefreshGrants {
       })
       const latest = (
         await this.db.query(
-          `SELECT receipt FROM ${state.q}.refresh_grants WHERE node_id=$1 AND vm_id=$2 AND epoch=$3 AND receipt IS NOT NULL ORDER BY created_at DESC,command_id DESC LIMIT 1`,
+          `SELECT receipt FROM ${state.q}.refresh_grants WHERE node_id=$1 AND vm_id=$2 AND epoch=$3 AND receipt->'finished'='true'::jsonb ORDER BY created_at DESC,command_id DESC LIMIT 1`,
           [intent.node_id, intent.vm_id, intent.epoch],
         )
       ).rows[0]
@@ -156,7 +156,23 @@ export class NodeCredentialRefreshGrants {
     try {
       receipt = await refreshNodeSlotCredential({ link, grant })
     } catch (error) {
-      if (error.vmOperationNotStarted === true) error.credentialRefreshNotStarted = true
+      if (error.vmOperationNotStarted === true && !error.vmOperationUncertain && !error.credentialRefreshUnknown) {
+        try {
+          // The transport proved no application bytes were sent. Retire this exact
+          // authorization before releasing its claims or allowing another command.
+          await this._recordNotStarted(grant)
+        } catch (commitError) {
+          delete commitError.vmOperationNotStarted
+          delete commitError.credentialRefreshNotStarted
+          commitError.vmOperationUncertain = true
+          commitError.credentialRefreshUnknown = true
+          throw commitError
+        }
+        error.credentialRefreshNotStarted = true
+      } else {
+        delete error.vmOperationNotStarted
+        delete error.credentialRefreshNotStarted
+      }
       throw error
     }
     try {
@@ -166,6 +182,44 @@ export class NodeCredentialRefreshGrants {
       error.credentialRefreshUnknown = true
       throw error
     }
+  }
+  async _recordNotStarted(grantInput) {
+    const grant = normalizeRefreshGrant(grantInput),
+      i = grant.intent,
+      scope = currentCredentialRefreshAttempt(this.db)
+    return withTransaction(this.db, async () => {
+      const { state, epoch } = await this._state({
+        operation: scope?.operation,
+        nodeId: i.node_id,
+        vmId: i.vm_id,
+        accountId: i.account_id,
+        capturedFence: i.fence,
+      })
+      if (epoch !== i.epoch) throw refreshFailure('node_refresh_epoch_stale')
+      const row = (
+        await this.db.query(`SELECT * FROM ${state.q}.refresh_grants WHERE command_id=$1 FOR UPDATE`, [i.command_id])
+      ).rows[0]
+      if (
+        !row ||
+        row.revoked_at ||
+        row.receipt ||
+        row.intent_digest !== grant.intentDigest ||
+        !isDeepStrictEqual(normalizeRefreshIntent(row.intent), i)
+      )
+        throw refreshFailure('node_refresh_conflict')
+      // This is an owner-side transport terminal state, not a node refresh
+      // receipt. It supplies no credential generation or execution completion.
+      const terminal = {
+        not_started: true,
+        reason: 'application_data_not_sent',
+        command_id: i.command_id,
+        intent_digest: grant.intentDigest,
+      }
+      await this.db.query(
+        `UPDATE ${state.q}.refresh_grants SET receipt=$2::jsonb,revoked_at=clock_timestamp() WHERE command_id=$1`,
+        [i.command_id, JSON.stringify(terminal)],
+      )
+    })
   }
   async recordReceipt(grantInput, value) {
     const grant = normalizeRefreshGrant(grantInput),

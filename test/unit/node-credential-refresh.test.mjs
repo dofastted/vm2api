@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import pg from 'pg'
+import net from 'node:net'
 import { getDb, createDatabase, quoteIdentifier } from '../../src/lib/db/database.mjs'
 import { GlobalMaintenanceCoordinator } from '../../src/lib/db/global-maintenance.mjs'
 import { NodeManagementGrants } from '../../src/lib/cluster/node-management-grants.mjs'
@@ -292,4 +293,54 @@ refreshCase('a failed PG receipt commit retains the exact background and VM clai
   const g = (await f.peer.query(`SELECT receipt,revoked_at FROM ${f.q}.refresh_grants`)).rows[0]
   assert.equal(g.receipt, null)
   assert.ok(g.revoked_at)
+})
+
+refreshCase('an unsent terminal grant cannot authorize or replace the last confirmed generation', async (f) => {
+  await f.grants.initialize()
+  await f.attempt(async (_current, { operation }) => {
+    const grant = await f.grants.issue(f.input(operation))
+    await f.grants.recordReceipt(grant, f.receipt(grant, '2'))
+    return { finished: true, value: { ok: true, generation: '2' } }
+  })
+  const reader = await f.reader()
+  const server = net.createServer()
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+  await new Promise((resolve) => server.close(resolve))
+  let unsentGrant
+  await assert.rejects(
+    f.attempt(async (_current, { operation }) => {
+      const input = f.input(operation)
+      try {
+        await f.grants.refresh(input, { address: '127.0.0.1', port, token: 's'.repeat(32), certSha256: 'a'.repeat(64) })
+      } catch (error) {
+        assert.equal(error.vmOperationNotStarted, true)
+        const row = (
+          await f.peer.query(
+            `SELECT intent,intent_digest,receipt,revoked_at FROM ${f.q}.refresh_grants WHERE command_id=$1`,
+            [input.commandId],
+          )
+        ).rows[0]
+        assert.equal(row.receipt.not_started, true)
+        assert.ok(row.revoked_at)
+        unsentGrant = { intent: row.intent, intentDigest: row.intent_digest }
+        assert.equal(
+          (await reader.query(`SELECT ${f.q}.refresh_current($1) AS active`, [input.commandId])).rows[0].active,
+          false,
+        )
+        throw error
+      }
+    }),
+    { code: 'node_refresh_unconfirmed', credentialRefreshNotStarted: true },
+  )
+  const next = await f.attempt(async (_current, { operation }) => {
+    await assert.rejects(f.grants.recordReceipt(unsentGrant, f.receipt(unsentGrant, '3')), {
+      code: 'node_refresh_conflict',
+    })
+    const grant = await f.grants.issue(f.input(operation))
+    assert.equal(grant.intent.expected_credential_generation, '2')
+    await f.grants.recordReceipt(grant, f.receipt(grant, '3'))
+    return { finished: true, value: { ok: true, generation: '3' } }
+  })
+  assert.equal(next.current.generation, '3')
 })
