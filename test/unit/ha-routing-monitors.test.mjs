@@ -46,13 +46,19 @@ test('HA routing updates keep unsupported monitors stopped and reject on-demand 
     cfg: { paths: { project: root } },
     routingConfigPath: file,
     getRoutingConfig: () => config,
-    setRoutingConfig: (next) => { config = next },
+    setRoutingConfig: (next) => {
+      config = next
+    },
     accountQuota: { reloadConfig() {}, attachRuntimeRepo() {} },
     getPoolScheduler: () => pool,
-    setPoolScheduler: (next) => { pool = next },
+    setPoolScheduler: (next) => {
+      pool = next
+    },
     healthMonitor: health,
     usageProbeMonitor: usage,
-    probeUsageOne: () => { probes++ },
+    probeUsageOne: () => {
+      probes++
+    },
   })
   const bootstrap = await coordinator.admitBootstrap()
   await bootstrap.run(async () => {

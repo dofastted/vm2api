@@ -109,6 +109,7 @@ import { isKubernetesMode, isKubernetesHaMode, shutdownTimeoutMs } from './lib/c
 import { loadHaNodeTrust, haRouteAllowed, haUnsupported } from './lib/core/ha-control-plane-policy.mjs'
 import { HaVmCatalog, bindHaVmCatalog } from './lib/vm/ha-vm-catalog.mjs'
 import { captureNodeExecution } from './lib/cluster/node-execution-capabilities.mjs'
+import { createNodeRecoveryReader } from './lib/cluster/node-request-recovery.mjs'
 import { withHaRequestContext } from './lib/core/ha-request-context.mjs'
 import { ControlPlaneLifecycle, withTimeout } from './lib/core/control-plane-lifecycle.mjs'
 import { getSharedBackgroundTasks } from './lib/core/shared-background-tasks.mjs'
@@ -147,6 +148,7 @@ if (!getPanelAdmin().password) {
 const kubernetesMode = isKubernetesMode()
 const haMode = isKubernetesHaMode()
 const trustedNodes = haMode ? loadHaNodeTrust(process.env.VM2API_NODE_CONFIG_FILE) : null
+const readNodeRecoveryStatus = haMode ? createNodeRecoveryReader(trustedNodes) : null
 const shutdownGraceMs = shutdownTimeoutMs()
 
 const allowRate = createRateLimiter({
@@ -1053,6 +1055,7 @@ const importCommit = createImportCommit({
 const { commitImportedOauth, requireSlotProxy, officialCcStatsHandler } = importCommit
 
 const protocolHandlers = createHandleProtocol({
+  readNodeRecoveryStatus,
   onExecutionState: noteRequestExecution,
   json,
   writeSSEHeaders,
