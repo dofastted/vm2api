@@ -3,6 +3,29 @@ import assert from 'node:assert/strict'
 import { getDb, createDatabase } from '../../src/lib/db/database.mjs'
 import { ControlPlaneLock } from '../../src/lib/db/control-plane-lock.mjs'
 
+test('HA controllers share the mode guard and exclude a singleton controller in either startup order', async () => {
+  const db = getDb()
+  const first = new ControlPlaneLock(db, { shared: true })
+  const second = new ControlPlaneLock(db, { shared: true })
+  const singleton = new ControlPlaneLock(db)
+  try {
+    await first.start()
+    await second.start()
+    assert.equal(first.healthy && second.healthy, true)
+    await assert.rejects(singleton.start(), { code: 'control_plane_already_active' })
+    await first.stop()
+    await assert.rejects(singleton.start(), { code: 'control_plane_already_active' })
+    await second.stop()
+    await singleton.start()
+    await assert.rejects(first.start(), { code: 'control_plane_already_active' })
+    await singleton.stop()
+    await first.start()
+    assert.equal(first.healthy, true)
+  } finally {
+    await Promise.all([first.stop(), second.stop(), singleton.stop()])
+  }
+})
+
 test('a one-connection pool rejects control-plane startup without consuming the business connection', async () => {
   const db = getDb()
   const single = await createDatabase({ connectionString: db.connectionString, schema: db.schema + '_single', max: 1 })
