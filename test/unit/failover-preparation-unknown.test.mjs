@@ -17,8 +17,13 @@ test('an unknown remote publication during preparation stops failover and preser
         accountId: 'publication-account',
         vmId: 'publication-vm',
         bindExecution: async () => {},
-        markUncertain: async () => { marked++; uncertain = true },
-        release: async () => { if (!uncertain) released++ },
+        markUncertain: async () => {
+          marked++
+          uncertain = true
+        },
+        release: async () => {
+          if (!uncertain) released++
+        },
       }
     },
     markCooldown() {},
@@ -35,7 +40,10 @@ test('an unknown remote publication during preparation stops failover and preser
         executionUncertain: true,
       })
     },
-    callAttempt: async () => { calls++; return { ok: false } },
+    callAttempt: async () => {
+      calls++
+      return { ok: false }
+    },
   })
   assert.equal(selections, 1, 'unknown preparation must not select another VM')
   assert.equal(marked, 1)
