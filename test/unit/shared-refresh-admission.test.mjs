@@ -78,6 +78,45 @@ test('a refresh can hold its exact completed admission while blocking every new 
   }
 })
 
+test('an account refresh blocks inference and another mutation on a different VM', async (t) => {
+  const { db, peer } = await fixture(t)
+  const operations = new SharedVmOperations(db)
+  const operation = await operations.tryAcquire({ vmId: 'refresh-vm', accountId: 'refresh-account' })
+  let gate, other
+  try {
+    gate = await new ExecutionAdmissionsRepo(peer).tryReserve(execution({ vmId: 'other-refresh-vm' }))
+    assert.equal(gate.ok, false)
+    assert.equal(gate.code, 'vm_operation_active')
+    other = await new SharedVmOperations(peer).tryAcquire({ vmId: 'other-refresh-vm', accountId: 'refresh-account' })
+    assert.equal(other.ok, false)
+    assert.equal(other.code, 'vm_operation_active')
+  } finally {
+    await gate?.release?.()
+    await other?.release?.()
+    await operation.release()
+  }
+})
+
+test('an uncertain account refresh remains exclusive across VMs', async (t) => {
+  const { db, peer } = await fixture(t)
+  const operation = await new SharedVmOperations(db).tryAcquire({ vmId: 'refresh-vm', accountId: 'refresh-account' })
+  await operation.markUncertain()
+  const gate = await new ExecutionAdmissionsRepo(peer).tryReserve(execution({ vmId: 'other-refresh-vm' }))
+  try { assert.equal(gate.ok, false) }
+  finally { await gate.release?.() }
+})
+
+test('a nested refresh binds its account to the manual VM operation until that operation ends', async (t) => {
+  const { db, peer } = await fixture(t)
+  const operations = new SharedVmOperations(db)
+  await operations.run('refresh-vm', async () => {
+    await operations.run('refresh-vm', async () => {}, { accountId: 'refresh-account' })
+    const gate = await new ExecutionAdmissionsRepo(peer).tryReserve(execution({ vmId: 'other-refresh-vm' }))
+    try { assert.equal(gate.ok, false) }
+    finally { await gate.release?.() }
+  })
+})
+
 test('refresh never excludes a pending job or another active admission', async (t) => {
   const { db, peer } = await fixture(t)
   const gate = await new ExecutionAdmissionsRepo(db).tryReserve(execution())
