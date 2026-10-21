@@ -111,6 +111,7 @@ import { HaVmCatalog, bindHaVmCatalog } from './lib/vm/ha-vm-catalog.mjs'
 import { captureNodeExecution } from './lib/cluster/node-execution-capabilities.mjs'
 import { createNodeRecoveryReader } from './lib/cluster/node-request-recovery.mjs'
 import { withHaRequestContext } from './lib/core/ha-request-context.mjs'
+import { createHaRecoveryMonitor } from './lib/core/ha-recovery-monitor.mjs'
 import { ControlPlaneLifecycle, withTimeout } from './lib/core/control-plane-lifecycle.mjs'
 import { getSharedBackgroundTasks } from './lib/core/shared-background-tasks.mjs'
 import { ControlPlaneLock } from './lib/db/control-plane-lock.mjs'
@@ -162,6 +163,9 @@ let _shuttingDown = false
 const dataDir = cfg.paths.data || path.join(cfg.paths.root, 'data')
 const db = await openDatabase({ dataDir })
 const activityCoordinator = getActivityCoordinator(db)
+const haRecoveryMonitor = haMode
+  ? createHaRecoveryMonitor({ db, coordinator: activityCoordinator, readNodeRecoveryStatus })
+  : null
 db.bootstrapActivity?.enter()
 const haCatalog = haMode ? new HaVmCatalog(db) : null
 if (haCatalog) {
@@ -1709,6 +1713,7 @@ async function shutdown(signal, { failed = false } = {}) {
   clusterRoutes.beginDrain()
   slotShell.beginDrain()
   console.log(`[shutdown] ${signal} — closing`)
+  void haRecoveryMonitor?.stop()
   const deadline = Date.now() + shutdownGraceMs
   const forceClose = () => {
     lifecycle.forceClose()
@@ -1821,6 +1826,7 @@ function maintenanceMonitors() {
       ? []
       : [healthMonitor, credentialRefreshMonitor, kernelWatchdog, cliNodeGuard, usageProbeMonitor, catalogMonitor]),
     notifyMonitor,
+    haRecoveryMonitor,
   ]
 }
 
@@ -1889,6 +1895,7 @@ server.listen(cfg.port, cfg.host, async () => {
       }
     }
   }
+  await haRecoveryMonitor?.start()
   try {
     notifyMonitor?.start?.({ immediate: true })
   } catch (e) {

@@ -1,6 +1,7 @@
 # Control plane. Only source is in git: the console and Go helpers build here, and the
 # prebuilt slot payloads come from the release pinned in deploy/payload.json.
 
+ARG BUILDPLATFORM=linux/amd64
 FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS web
 RUN npm install -g pnpm@10
 WORKDIR /src/web

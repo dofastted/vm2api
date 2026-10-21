@@ -24,7 +24,7 @@
 1. PostgreSQL 17、相同业务 schema、相同业务加密密钥。所有副本使用相同管理员配置和初始 API key。
 2. 至少两个可调度的 Kubernetes 节点。必需的 Pod 反亲和保证副本分布在不同节点。默认滚动更新为 `maxUnavailable: 0, maxSurge: 1`，因此两个副本更新时需要第三个可调度节点。
 3. 已安装并校验固定镜像 ID、网络 ID 和 UID/GID 的远端 Go 节点服务。节点的原始 Docker/SSH 权限不能交给控制面 Pod。
-4. 通过可信初始化安装独立 allocation、command 私有 authority、节点专用只读 PostgreSQL role，以及授权的 allocation → 首次凭据发布 → launch 回执链。普通应用启动不会自行安装这些授权。相关接口见 [节点授权](../plans/2026-10-22-node-command-authority.md) 和 [首次发布](../plans/2026-10-22-node-initial-publication.md)。目前尚无面向操作者的完整安装命令。
+4. 通过可信初始化安装独立 allocation、command 私有 authority、节点专用只读 PostgreSQL role，以及授权的 allocation → 首次凭据发布 → launch 回执链。普通应用启动不会自行安装这些授权。相关接口见 [节点授权](../plans/2026-10-22-node-command-authority.md) 和 [首次发布](../plans/2026-10-22-node-initial-publication.md)。可信离线初始化与槽位创建命令见 [节点初始化 CLI](ha-node-bootstrap.md)。该命令不安装节点服务或配置宿主 Docker。
 
 从旧安装切换前停止旧控制面并核实在途任务。`kubernetes` 单实例模式与 `kubernetes-ha` 多副本模式使用互斥的 PostgreSQL 模式锁，不能并存。旧版独立进程不持有该锁，必须由操作者停止。
 
