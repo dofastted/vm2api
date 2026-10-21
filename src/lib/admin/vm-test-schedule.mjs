@@ -5,6 +5,8 @@ import { isValidVmId } from '../vm/vm-file.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { getVm, listVms } from '../vm/vm-registry.mjs'
 import { listTestableModels } from './vm-test-chat.mjs'
+import { backgroundTasksFor } from '../core/shared-background-tasks.mjs'
+import { VmTestScheduleResultsRepo } from '../db/repos/vm-test-schedule-results-repo.mjs'
 
 export const VM_TEST_SCHEDULE_PREFIX = 'vm_test_schedule:'
 export const VM_TEST_SCHEDULE_DEFAULT_KEY = 'vm_test_schedule_default'
@@ -345,13 +347,21 @@ export class VmTestScheduleRunner {
     runTest,
     list = () => listVms(projectRoot),
     now = () => Date.now(),
+    sharedTasks,
   } = {}) {
     this.projectRoot = projectRoot
     this.settingsFactory = typeof settings === 'function' ? settings : () => settings
     this.runTest = runTest
     this.listVms = list
     this.now = now
+    this.sharedTasks = backgroundTasksFor(sharedTasks)
+    this.resultRepo = this.sharedTasks ? new VmTestScheduleResultsRepo(this.sharedTasks.repo.db) : null
     this.jobs = new Map()
+    this.jobRevisions = new Map()
+    this.discoveryGeneration = 0
+    this.lifecycleGeneration = 0
+    this.discoveries = new Set()
+    this.discoveryTimer = null
     this.running = new Set()
     this.writeFailure = null
     this.started = false
@@ -369,8 +379,7 @@ export class VmTestScheduleRunner {
     return this.listVms().find((vm) => vm.id === vmId) || getVm(this.projectRoot, vmId)
   }
 
-  _stored(vmId) {
-    const raw = this._settings().get(keyFor(vmId))
+  _stored(vmId, raw = this._settings().get(keyFor(vmId))) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
     const vm = this._vm(vmId)
     if (!vm) return null
@@ -480,6 +489,7 @@ export class VmTestScheduleRunner {
     const previous = this._settings().get(keyFor(vmId)) || {}
     const config = normalizeVmTestSchedule(input, vm)
     await this._settings().set(keyFor(vmId), { ...config, ...savedResult(previous), revision: randomUUID() })
+    this.discoveryGeneration++
     if (this.started) this._syncJob(vmId, config)
     return this.get(vmId)
   }
@@ -518,6 +528,7 @@ export class VmTestScheduleRunner {
       ...savedResult(previous),
       revision: randomUUID(),
     })
+    this.discoveryGeneration++
     if (this.started) this._syncJob(vmId, config)
     return this.get(vmId)
   }
@@ -558,6 +569,7 @@ export class VmTestScheduleRunner {
         const stored = this._settings().get(keyFor(vmId))
         if (stored) {
           await this._settings().set(keyFor(vmId), { ...stored, enabled: false })
+          this.discoveryGeneration++
           this.jobs.get(vmId)?.stop()
           this.jobs.delete(vmId)
         }
@@ -582,103 +594,191 @@ export class VmTestScheduleRunner {
     } else dialog = await defaultDialogParams(vm)
     const config = normalizeVmTestSchedule({ enabled: full.enabled, ...structure, ...dialog }, vm)
     await this._settings().set(keyFor(vmId), { ...config, ...savedResult(previous), revision: randomUUID() })
+    this.discoveryGeneration++
     if (this.started) this._syncJob(vmId, config)
   }
 
   async remove(vmId) {
+    this.discoveryGeneration++
     this.jobs.get(vmId)?.stop()
     this.jobs.delete(vmId)
+    this.jobRevisions.delete(vmId)
     await this._settings().remove?.(keyFor(vmId))
     return null
   }
 
   async start() {
+    const generation = ++this.lifecycleGeneration
     this.started = true
-    await this.reload()
+    clearInterval(this.discoveryTimer)
+    const discovery = this.reload()
+    await discovery
+    if (this.sharedTasks && this.started && generation === this.lifecycleGeneration) {
+      this.discoveryTimer = setInterval(() => {
+        if (!this.started) return
+        if (this.discoveries.size) return Promise.allSettled([...this.discoveries])
+        return this.reload().catch((error) => {
+          this.writeFailure ||= error
+        })
+      }, 1000)
+      this.discoveryTimer.unref?.()
+    }
   }
 
   async flush() {
-    while (this.running.size) await new Promise((resolve) => setTimeout(resolve, 10))
+    while (this.running.size || this.discoveries.size) {
+      if (this.discoveries.size) await Promise.allSettled([...this.discoveries])
+      else await new Promise((resolve) => setTimeout(resolve, 10))
+    }
     if (this.writeFailure) throw this.writeFailure
   }
 
   stop() {
     this.started = false
+    this.lifecycleGeneration++
+    this.discoveryGeneration++
+    clearInterval(this.discoveryTimer)
+    this.discoveryTimer = null
     for (const job of this.jobs.values()) job.stop()
     this.jobs.clear()
+    this.jobRevisions.clear()
+    return this.flush().catch(() => {})
   }
 
-  async reload() {
-    for (const job of this.jobs.values()) job.stop()
-    this.jobs.clear()
-    const all = this._settings().all?.() || {}
+  reload() {
+    const generation = ++this.discoveryGeneration
+    const pending = this._reload(generation)
+    this.discoveries.add(pending)
+    pending.then(
+      () => this.discoveries.delete(pending),
+      () => this.discoveries.delete(pending),
+    )
+    return pending
+  }
+
+  async _reload(generation) {
+    const all = this.resultRepo ? await this.resultRepo.listPlans() : this._settings().all?.() || {}
+    if (generation !== this.discoveryGeneration || !this.started) return
+    if (!this.sharedTasks) {
+      for (const job of this.jobs.values()) job.stop()
+      this.jobs.clear()
+      this.jobRevisions.clear()
+    }
+    const desired = new Map()
     for (const key of Object.keys(all)) {
       if (!key.startsWith(VM_TEST_SCHEDULE_PREFIX)) continue
       const vmId = key.slice(VM_TEST_SCHEDULE_PREFIX.length)
       const vm = this._vm(vmId)
       if (!vm) {
         await this._settings().remove?.(key)
+        if (generation !== this.discoveryGeneration || !this.started) return
         continue
       }
-      const schedule = this._stored(vmId)
-      if (schedule?.enabled) this._syncJob(vmId, schedule)
+      const schedule = this._stored(vmId, all[key])
+      if (schedule?.enabled) desired.set(vmId, schedule)
+    }
+    for (const [id, job] of this.jobs) {
+      if (!desired.has(id)) {
+        job.stop()
+        this.jobs.delete(id)
+        this.jobRevisions.delete(id)
+      }
+    }
+    for (const [id, schedule] of desired) {
+      if (!this.jobs.has(id) || this.jobRevisions.get(id) !== schedule.revision) this._syncJob(id, schedule)
     }
   }
 
   _syncJob(vmId, schedule) {
     this.jobs.get(vmId)?.stop()
     this.jobs.delete(vmId)
+    this.jobRevisions.delete(vmId)
     if (!this.started || !schedule.enabled || !this._vm(vmId)) return
+    const revision = schedule.revision ?? this._settings().get(keyFor(vmId))?.revision
     const job = new Cron(
       schedule.cron,
       { timezone: schedule.timezone, mode: '5-part', catch: true, unref: true },
-      async () => await this._run(vmId),
+      async () => await this._run(vmId, revision),
     )
     this.jobs.set(vmId, job)
+    this.jobRevisions.set(vmId, revision)
   }
 
-  async _run(vmId) {
+  async _run(vmId, expectedRevision) {
     if (!this.started || this.running.has(vmId)) return
-    if (!this._vm(vmId)) {
-      await this.remove(vmId)
-      return
-    }
-    const schedule = this._stored(vmId)
-    if (!schedule?.enabled) return
     this.running.add(vmId)
-    const startedAt = this.now()
     try {
-      let result
-      try {
-        result = await this.runTest(vmId, {
-          model: schedule.model,
-          prompt: schedule.prompt,
-          max_tokens: schedule.max_tokens,
-          reasoning_effort: schedule.reasoning_effort,
-        })
-      } catch (error) {
-        result = { ok: false, error }
-      }
+      const settings = this._settings()
+      if (this.sharedTasks) await settings.refresh?.()
       if (!this.started) return
-
-      const current = this._settings().get(keyFor(vmId))
-      if (!current || String(current.revision || '') !== schedule.revision || !this._vm(vmId)) return
-      const duration = Number(result?.duration_ms)
-      const lastDuration =
-        Number.isSafeInteger(duration) && duration >= 0 ? duration : Math.max(0, this.now() - startedAt)
-      const lastOk = result?.ok === true
-      try {
-        await this._settings().set(keyFor(vmId), {
-          ...current,
+      if (!this._vm(vmId)) {
+        await this.remove(vmId)
+        return
+      }
+      const schedule = this._stored(vmId)
+      if (!schedule?.enabled) return
+      if (expectedRevision != null && expectedRevision !== schedule.revision) {
+        this.discoveryGeneration++
+        this._syncJob(vmId, schedule)
+        return
+      }
+      const startedAt = this.sharedTasks ? await this.sharedTasks.now() : this.now()
+      const execute = async () => {
+        if (!this.started || (this.resultRepo && !(await this.resultRepo.isCurrent(vmId, schedule.revision)))) {
+          return { notStarted: true }
+        }
+        let result
+        try {
+          result = await this.runTest(vmId, {
+            model: schedule.model,
+            prompt: schedule.prompt,
+            max_tokens: schedule.max_tokens,
+            reasoning_effort: schedule.reasoning_effort,
+          })
+        } catch (error) {
+          result = { ok: false, error, taskTerminal: error?.taskTerminal, taskNotStarted: error?.taskNotStarted }
+        }
+        const terminal = result?.ok === true || result?.taskTerminal === true || result?.taskNotStarted === true
+        if (!this.started) return { terminal }
+        if (this.sharedTasks) await settings.refresh?.()
+        const current = settings.get(keyFor(vmId))
+        if (!current || String(current.revision || '') !== schedule.revision || !this._vm(vmId)) return { terminal }
+        const duration = Number(result?.duration_ms)
+        const lastDuration =
+          Number.isSafeInteger(duration) && duration >= 0 ? duration : Math.max(0, this.now() - startedAt)
+        const lastOk = result?.ok === true
+        const saved = {
           last_run_at: new Date(startedAt).toISOString(),
           last_ok: lastOk,
           last_duration_ms: lastDuration,
           last_error: lastOk ? null : compactError(result?.error),
-        })
-      } catch (error) {
-        this.writeFailure ||= error
-        throw error
+        }
+        try {
+          if (this.resultRepo) {
+            await this.resultRepo.record(vmId, schedule.revision, saved)
+            await settings.refresh?.()
+          } else await settings.set(keyFor(vmId), { ...current, ...saved })
+        } catch (error) {
+          this.writeFailure ||= error
+          // The completed test is not retried merely because its local summary failed to persist.
+          if (terminal) error.taskTerminal = true
+          throw error
+        }
+        return { terminal }
       }
+      if (!this.sharedTasks) return await execute()
+      const cron = new Cron(schedule.cron, { timezone: schedule.timezone, mode: '5-part', paused: true })
+      let occurrence
+      try {
+        occurrence = cron.previousRuns(1, new Date(startedAt + 1))[0]
+      } finally {
+        cron.stop()
+      }
+      if (!occurrence) return
+      await this.sharedTasks.run(
+        { taskKey: `vm-test:${vmId}`, executionId: `${schedule.revision}:${occurrence.toISOString()}` },
+        execute,
+      )
     } finally {
       this.running.delete(vmId)
     }

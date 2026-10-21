@@ -88,7 +88,7 @@ export class SharedBackgroundTasks {
     try {
       outcome = await callback()
     } catch (error) {
-      if (error?.taskNotStarted === true) await this._complete(claim)
+      if (error?.taskNotStarted === true || error?.taskTerminal === true) await this._complete(claim)
       else await claim.markUnknown()
       throw error
     }

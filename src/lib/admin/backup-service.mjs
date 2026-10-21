@@ -8,6 +8,7 @@ import { sha256FileAsync, runPgTool, runProcess, extractArchiveMember } from './
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { BackupRepo } from '../db/repos/backup-repo.mjs'
 import { invalidateReadCache } from '../vm/vm-file.mjs'
+import { backgroundTasksFor } from '../core/shared-background-tasks.mjs'
 
 // tarAvailability / sha256File / the runnable pipeline live in backup-core.mjs;
 // keep the historical export surface for tests and callers.
@@ -22,13 +23,14 @@ export const DEFAULT_SCHEDULE = {
 }
 
 export class BackupService {
-  constructor({ dataDir, projectRoot, configDir, backupDir, tmpDir, checkIntervalMs = 10 * 60_000 } = {}) {
+  constructor({ dataDir, projectRoot, configDir, backupDir, tmpDir, checkIntervalMs = 10 * 60_000, sharedTasks } = {}) {
     this.dataDir = dataDir
     this.projectRoot = projectRoot
     this.configDir = configDir || null
     this.backupDir = backupDir || path.join(dataDir, 'backups')
     this.tmpDir = tmpDir || path.join(dataDir, 'tmp')
     this.checkIntervalMs = checkIntervalMs
+    this.sharedTasks = backgroundTasksFor(sharedTasks)
     this.maintenanceFile = path.join(dataDir, 'restore-maintenance.json')
     this.isRestoring = fs.existsSync(this.maintenanceFile)
     this.isMaintaining = this.isRestoring
@@ -576,24 +578,49 @@ export class BackupService {
   // ---------- scheduler ----------
 
   /** Auto-backup checker: every checkIntervalMs + a catch-up run at boot. */
+  runScheduled(generation = this._schedulerGeneration) {
+    const pending = (async () => {
+      const now = this.sharedTasks ? await this.sharedTasks.now() : Date.now()
+      if (!(await this.shouldRunScheduled(now)) || generation !== this._schedulerGeneration) return null
+      const config = await this.getSchedule()
+      const backup = async () => {
+        if (generation !== this._schedulerGeneration) return { notStarted: true, value: null }
+        if (this.sharedTasks && !(await this.shouldRunScheduled(await this.sharedTasks.now()))) {
+          return { notStarted: true, value: null }
+        }
+        const record = await this.createBackup({ kind: 'scheduled' })
+        return { terminal: record?.status === 'ok', value: record }
+      }
+      if (!this.sharedTasks) return (await backup()).value
+      const result = await this.sharedTasks.run(
+        { taskKey: 'scheduled-backup', intervalMs: Math.round(config.interval_hours * 3600_000) },
+        backup,
+      )
+      return result.ran ? result.value : null
+    })()
+    this._scheduledChecks.add(pending)
+    pending.then(
+      () => this._scheduledChecks.delete(pending),
+      () => this._scheduledChecks.delete(pending),
+    )
+    return pending
+  }
+
   startScheduler() {
     this.stopScheduler()
     const generation = this._schedulerGeneration
     const check = () => {
       if (generation !== this._schedulerGeneration) return
-      const pending = (async () => {
-        try {
-          if ((await this.shouldRunScheduled()) && generation === this._schedulerGeneration) {
-            const rec = await this.createBackup({ kind: 'scheduled' })
+      return this.runScheduled(generation).then(
+        (rec) => {
+          if (rec) {
             console.log(`[backup] scheduled backup completed (${Math.round((rec.size_bytes || 0) / 1048576)} MiB)`)
           }
-        } catch (e) {
+        },
+        (e) => {
           console.warn('[backup] scheduled backup failed:', String(e.message || e))
-        }
-      })()
-      this._scheduledChecks.add(pending)
-      pending.finally(() => this._scheduledChecks.delete(pending))
-      return pending
+        },
+      )
     }
     this._timer = setInterval(check, this.checkIntervalMs)
     if (typeof this._timer.unref === 'function') this._timer.unref()
@@ -602,7 +629,8 @@ export class BackupService {
     if (typeof this._bootTimer.unref === 'function') this._bootTimer.unref()
   }
 
-  async shouldRunScheduled(now = Date.now()) {
+  async shouldRunScheduled(now) {
+    now ??= this.sharedTasks ? await this.sharedTasks.now() : Date.now()
     const cfg = await this.getSchedule()
     if (!cfg.enabled || this._running || this._restoreRunning || this.isMaintaining) return false
     const last = await this._repo().lastSuccessful({})
@@ -620,5 +648,6 @@ export class BackupService {
       clearTimeout(this._bootTimer)
       this._bootTimer = null
     }
+    return this.flush().catch(() => {})
   }
 }

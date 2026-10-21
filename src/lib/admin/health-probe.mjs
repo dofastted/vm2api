@@ -11,6 +11,9 @@ import { isValidVmId } from '../vm/vm-file.mjs'
 import { activeHoursOf, evaluateActiveHours } from '../pool/active-hours.mjs'
 import { fromClaudeToOpenAIChat, fromClaudeToOpenAICompletions, fromClaudeToResponses } from '../protocol/convert.mjs'
 import { detectInboundPlatform } from '../protocol/platform-detect.mjs'
+import { backgroundTasksFor } from '../core/shared-background-tasks.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { getSharedRoutingState } from './shared-routing-config.mjs'
 
 export const HEALTH_REAL_HEADER = 'x-kin-health-real'
 export const HEALTH_VIA_CACHE = 'health-cache'
@@ -616,6 +619,9 @@ export function createHealthProbeMonitor(opts = {}) {
   let lastRunAt = 0
   let inflight = null
   let timer = null
+  let generation = 0
+  let unknown = false
+  const sharedTasks = backgroundTasksFor(opts.sharedTasks)
   const nowFn = opts.now || (() => Date.now())
 
   const getConfig = () => config
@@ -699,12 +705,14 @@ export function createHealthProbeMonitor(opts = {}) {
     const probeVm = async (vm) => {
       try {
         const result = await opts.runChat(vm, real)
+        if (!result?.ok && result?.taskTerminal !== true && result?.taskNotStarted !== true) unknown = true
         if (result?.ok) return { ok: true, result }
         return {
           ok: false,
           error: result?.error?.message || result?.error || 'probe_failed',
         }
       } catch (e) {
+        if (e?.taskTerminal !== true && e?.taskNotStarted !== true) unknown = true
         return { ok: false, error: String(e?.message || e).slice(0, 300) }
       }
     }
@@ -764,16 +772,92 @@ export function createHealthProbeMonitor(opts = {}) {
     }
   }
 
-  const runRealProbe = async () => {
+  const sharedSnapshot = (platform) => {
+    const snapshot = snapshots[platform]
+    if (!snapshot) return null
+    const usage = {}
+    for (const key of ['input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens']) {
+      const value = snapshot.body?.usage?.[key]
+      if (Number.isFinite(value) && value >= 0) usage[key] = value
+    }
+    const view = getSnapshot(platform)
+    return {
+      ok: snapshot.ok,
+      at: view.at,
+      vm_id: view.vm_id,
+      model: view.model,
+      message_id: view.message_id,
+      text: view.text,
+      status: view.status,
+      error: view.error,
+      duration_ms: view.duration_ms,
+      usage,
+      stop_reason: snapshot.body?.stop_reason || 'end_turn',
+      stop_sequence: snapshot.body?.stop_sequence ?? null,
+    }
+  }
+
+  const acceptSharedSnapshot = (platform, value) => {
+    if (!value?.at) return
+    snapshots[platform] = {
+      ok: value.ok,
+      at: value.at,
+      vm_id: value.vm_id,
+      model: value.model,
+      text: value.text,
+      status: value.status,
+      error: value.error,
+      duration_ms: value.duration_ms,
+      body: value.message_id
+        ? {
+            id: value.message_id,
+            type: 'message',
+            role: 'assistant',
+            model: value.model,
+            content: [{ type: 'text', text: value.text || '' }],
+            usage: value.usage,
+            stop_reason: value.stop_reason,
+            stop_sequence: value.stop_sequence,
+          }
+        : undefined,
+    }
+  }
+
+  const runRealProbe = async ({ scheduled = false } = {}) => {
     if (inflight) return inflight
+    const current = generation
     inflight = (async () => {
-      const started = nowFn()
-      lastRunAt = started
-      await probePlatform('anthropic', config.real, started)
-      if (config.real.openai_model) {
-        await probePlatform('openai', { ...config.real, model: config.real.openai_model }, started)
-      } else {
-        snapshots.openai = null
+      if (isKubernetesMode()) {
+        const routing = getSharedRoutingState(sharedTasks?.repo.db)
+        if (!routing)
+          throw Object.assign(new Error('shared routing unavailable'), { code: 'routing_config_unavailable' })
+        await routing.refresh()
+      }
+      if (scheduled && (current !== generation || !config.enabled)) return getSnapshot('anthropic')
+      const probe = async () => {
+        if (scheduled && (current !== generation || !config.enabled))
+          return { notStarted: true, value: getSnapshot('anthropic') }
+        const started = nowFn()
+        lastRunAt = started
+        unknown = false
+        await probePlatform('anthropic', config.real, started)
+        if (config.real.openai_model) {
+          await probePlatform('openai', { ...config.real, model: config.real.openai_model }, started)
+        } else {
+          snapshots.openai = null
+        }
+        return {
+          terminal: !unknown,
+          value: getSnapshot('anthropic'),
+          sharedResult: { anthropic: sharedSnapshot('anthropic'), openai: sharedSnapshot('openai') },
+        }
+      }
+      if (!sharedTasks) return (await probe()).value
+      const result = await sharedTasks.run({ taskKey: 'health-probe', intervalMs: config.interval_sec * 1000 }, probe)
+      if (result.ran) return result.value
+      if (result.sharedResult) {
+        acceptSharedSnapshot('anthropic', result.sharedResult.anthropic)
+        acceptSharedSnapshot('openai', result.sharedResult.openai)
       }
       return getSnapshot('anthropic')
     })().finally(() => {
@@ -783,22 +867,25 @@ export function createHealthProbeMonitor(opts = {}) {
   }
 
   const stop = () => {
+    generation++
     if (timer) {
       clearInterval(timer)
       timer = null
     }
+    return inflight ? Promise.allSettled([inflight]) : Promise.resolve()
   }
 
   const start = ({ immediate = false } = {}) => {
     stop()
     if (!config.enabled) return { started: false, reason: 'disabled' }
+    const current = generation
     timer = setInterval(() => {
-      runRealProbe().catch(() => {})
+      if (current === generation) runRealProbe({ scheduled: true }).catch(() => {})
     }, config.interval_sec * 1000)
     if (typeof timer.unref === 'function') timer.unref()
     if (immediate && config.run_on_start) {
       queueMicrotask(() => {
-        runRealProbe().catch(() => {})
+        if (current === generation) runRealProbe({ scheduled: true }).catch(() => {})
       })
     }
     return { started: true, interval_sec: config.interval_sec, run_on_start: config.run_on_start }
