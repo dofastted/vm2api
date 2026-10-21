@@ -106,6 +106,7 @@ import { handleUserCountTokens, handleUserUsage } from './lib/protocol/user-coun
 import { createPanelHandler } from './lib/admin/panel-routes.mjs'
 import { isKubernetesMode, shutdownTimeoutMs } from './lib/core/control-plane-mode.mjs'
 import { ControlPlaneLifecycle, withTimeout } from './lib/core/control-plane-lifecycle.mjs'
+import { getSharedBackgroundTasks } from './lib/core/shared-background-tasks.mjs'
 import { ControlPlaneLock } from './lib/db/control-plane-lock.mjs'
 
 const FEATURES = [
@@ -1650,6 +1651,7 @@ async function shutdown(signal, { failed = false } = {}) {
         await pausePriceCatalog()
         for (const monitor of maintenanceMonitors()) await monitor?.flush?.()
         await vmTestSchedule.flush()
+        if (kubernetesMode) await getSharedBackgroundTasks(db).flush()
         await flushRuntimeWrites()
         stopAllRustKernels()
         await clusterManager.stop()
