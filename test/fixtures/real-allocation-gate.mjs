@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-export async function realAllocationGate(t, management) {
+export async function realAllocationGate(t, management, { launch, dockerSocket } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(),'ag2-'))
   const worker = path.join(root,'worker')
   fs.cpSync(fileURLToPath(new URL('../../worker',import.meta.url)),worker,{recursive:true})
@@ -36,7 +36,8 @@ export async function realAllocationGate(t, management) {
     fs.mkdirSync(runtime,{mode:0o700})
     const configFile = path.join(root,'config.json')
     fs.writeFileSync(configFile,JSON.stringify({listen:'127.0.0.1:0',root:runtime,token:'synthetic-node-allocation-token-000000',tls_dir:path.join(root,'tls'),
-      fenced:true,authority_dir:path.join(root,'authority'),docker_socket:path.join(root,'never-opened.sock'),management}),{mode:0o600})
+      fenced:true,authority_dir:path.join(root,'authority'),docker_socket:dockerSocket || path.join(root,'never-opened.sock'),management,
+      ...(launch ? {launch} : {})}),{mode:0o600})
     child = spawn(binary,[configFile],{stdio:['ignore','pipe','pipe']})
     exited = once(child,'exit')
     const link = await new Promise((resolve,reject) => {
