@@ -422,16 +422,17 @@ test('a controller discovers remote schedule creation, updates and deletion usin
 
 test('a late discovery cannot replace a job accepted by a newer discovery', async (t) => {
   const f = await schedules(t)
-  const oldRefresh = f.settings.refresh.bind(f.settings)
+  const oldRead = f.first.resultRepo.listPlans.bind(f.first.resultRepo)
   const entered = deferred()
   const finish = deferred()
   let reads = 0
-  f.settings.refresh = async () => {
-    await oldRefresh()
+  f.first.resultRepo.listPlans = async () => {
+    const snapshot = await oldRead()
     if (++reads === 1) {
       entered.resolve()
       await finish.promise
     }
+    return snapshot
   }
   const older = f.first.reload()
   await entered.promise
@@ -444,15 +445,36 @@ test('a late discovery cannot replace a job accepted by a newer discovery', asyn
   assert.equal(f.first.jobs.get(live.id), accepted)
 })
 
-test('stop awaits its pending discovery and does not publish jobs after stopping', async (t) => {
+test('a late discovery cannot replace a locally saved schedule revision', async (t) => {
   const f = await schedules(t)
-  const refresh = f.settings.refresh.bind(f.settings)
+  const read = f.first.resultRepo.listPlans.bind(f.first.resultRepo)
   const entered = deferred()
   const finish = deferred()
-  f.settings.refresh = async () => {
-    await refresh()
+  f.first.resultRepo.listPlans = async () => {
+    const snapshot = await read()
     entered.resolve()
     await finish.promise
+    return snapshot
+  }
+  const older = f.first.reload()
+  await entered.promise
+  await f.first.save(live.id, { ...f.first.get(live.id), time: '12:30' })
+  const accepted = f.first.jobs.get(live.id)
+  finish.resolve()
+  await older
+  assert.equal(f.first.jobs.get(live.id), accepted)
+})
+
+test('stop awaits its pending discovery and does not publish jobs after stopping', async (t) => {
+  const f = await schedules(t)
+  const read = f.first.resultRepo.listPlans.bind(f.first.resultRepo)
+  const entered = deferred()
+  const finish = deferred()
+  f.first.resultRepo.listPlans = async () => {
+    const snapshot = await read()
+    entered.resolve()
+    await finish.promise
+    return snapshot
   }
   const discovering = f.first.reload()
   await entered.promise
