@@ -38,10 +38,16 @@ import { effectiveOpenAIPolicy, normalizeOpenAIQuotaPolicy } from '../pool/opena
 import { runtimeKind } from './runtime-kind.mjs'
 import { hasBoundExit } from './egress.mjs'
 import { ensureSlotSmbios } from './machine-spec.mjs'
+import { isKubernetesHaMode } from '../core/control-plane-mode.mjs'
+import { haVmCatalog } from './ha-vm-catalog.mjs'
 
 export { isCodexVm, normalizeVmKind } from './vm-kind.mjs'
 
 export function listVms(projectRoot, routing = null) {
+  if (isKubernetesHaMode())
+    return haVmCatalog()
+      .list()
+      .map((vm) => summarizeVm(vm, null, routing))
   const dir = path.join(projectRoot, 'vms')
   if (!fs.existsSync(dir)) return []
   const files = listVmRecordFiles(dir)
@@ -59,6 +65,7 @@ export function listVms(projectRoot, routing = null) {
 }
 
 export function getVm(projectRoot, id) {
+  if (isKubernetesHaMode()) return haVmCatalog().get(id)
   return readJsonCached(path.join(projectRoot, 'vms', `${id}.json`))
 }
 
