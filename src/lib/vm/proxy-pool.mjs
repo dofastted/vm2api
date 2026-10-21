@@ -14,6 +14,10 @@ import net from 'node:net'
 import crypto from 'node:crypto'
 import { resolveStoreDb, withTransaction, getActivityCoordinator } from '../db/database.mjs'
 import { ProxiesRepo, PROXY_COLUMNS, PROXY_HEALTH_COLUMNS } from '../db/repos/proxies-repo.mjs'
+import { ExecutionAdmissionsRepo } from '../db/repos/execution-admissions-repo.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { currentVmOperationIds } from './shared-vm-operations.mjs'
+import { physicalVmAliases } from './vm-physical-target.mjs'
 import { canBindProxyToVm, normalizeOwnerId, proxyOwnerId, vmOwnerId } from '../admin/resource-owner.mjs'
 import { validTimezone } from '../core/timezone.mjs'
 import { lookupProxyGeo, lookupProxyGeoV6 } from './proxy-geo.mjs'
@@ -425,7 +429,7 @@ export class ProxyPool extends EventEmitter {
   }
 
   /** Each control mutation starts from PG and writes only its changed rows/fields. */
-  _mutate(change) {
+  _mutate(change, { observation = false } = {}) {
     const operation = withTransaction(this.db, async () => {
       await this.repo.lockMutations()
       const snapshot = await this.repo.snapshot()
@@ -443,6 +447,7 @@ export class ProxyPool extends EventEmitter {
         this._mutation = null
       }
       if (result?.ok === false) return result
+      if (!observation && isKubernetesMode()) await this._assertVmMutationClaims(before, working)
       const previous = new Map(before.proxies.map((proxy) => [proxy.id, proxy]))
       for (const proxy of working.proxies) {
         const old = previous.get(proxy.id)
@@ -470,6 +475,56 @@ export class ProxyPool extends EventEmitter {
       return result
     })
     return this._track(operation)
+  }
+
+  async _assertVmMutationClaims(before, after) {
+    const configChanged =
+      Object.keys(this._changes(before.config, after.config, Object.keys(DEFAULT_CONFIG))).length > 0
+    const previous = new Map(before.proxies.map((proxy) => [proxy.id, proxy]))
+    const next = new Map(after.proxies.map((proxy) => [proxy.id, proxy]))
+    const involved = new Set()
+    const required = new Set()
+    for (const id of new Set([...previous.keys(), ...next.keys()])) {
+      const old = previous.get(id)
+      const updated = next.get(id)
+      const patch = old && updated ? this._changes(this._stored(old), this._stored(updated)) : null
+      if (!configChanged && old && updated && !Object.keys(patch).length) continue
+      const oldIds = boundVmIdsOf(old)
+      const newIds = boundVmIdsOf(updated)
+      for (const vmId of [...oldIds, ...newIds]) involved.add(vmId)
+      // A binding-only change owns its added/removed targets. Configuration and
+      // deletion affect every existing member of the shared proxy.
+      const bindingOnly =
+        !configChanged &&
+        old &&
+        updated &&
+        Object.keys(patch).every((key) => ['bound_vm_id', 'updated_at'].includes(key))
+      for (const vmId of [...oldIds, ...newIds]) {
+        if (!bindingOnly || oldIds.includes(vmId) !== newIds.includes(vmId)) required.add(vmId)
+      }
+    }
+    if (!involved.size) return
+    // Serialize these checks with acquisition of each logical/physical VM claim.
+    await new ExecutionAdmissionsRepo(this.db).lockResources({ vmIds: [...involved] })
+    const aliases = [...new Set([...involved].flatMap(physicalVmAliases))]
+    const rows = await this.db
+      .prepare(`SELECT id, vm_id, uncertain_at FROM vm_operations
+      WHERE vm_id = ANY($1::text[]) AND released_at IS NULL`)
+      .all(aliases)
+    const current = currentVmOperationIds(this.db)
+    if (rows.some((row) => !current.has(row.id) || row.uncertain_at)) {
+      throw Object.assign(new Error('A proxy VM operation is active'), { code: 'vm_operation_active', status: 409 })
+    }
+    if (
+      [...required].some(
+        (vmId) => !rows.some((row) => current.has(row.id) && physicalVmAliases(vmId).includes(row.vm_id)),
+      )
+    ) {
+      throw Object.assign(new Error('Current VM operation claims do not cover the proxy binding set'), {
+        code: 'vm_mutation_claim_required',
+        status: 409,
+      })
+    }
   }
 
   /** Compatibility for explicit state edits; production operations use the methods below. */
@@ -553,7 +608,7 @@ export class ProxyPool extends EventEmitter {
     return this._mutate(() => this._updateConfig(...args))
   }
   async reportRuntimeFailure(...args) {
-    return this._mutate(() => this._reportRuntimeFailure(...args))
+    return this._mutate(() => this._reportRuntimeFailure(...args), { observation: true })
   }
 
   /**

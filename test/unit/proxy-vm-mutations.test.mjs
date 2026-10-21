@@ -131,13 +131,13 @@ test('detached work cannot reuse a callback claim after it has returned', async 
 test('global proxy settings require the complete current binding set', async (t) => {
   const f = await fixture(t, { bound: ['vm-a', 'vm-b'] })
   await f.operations.run('vm-a', async () => {
-    await assert.rejects(f.first.updateConfig({ dns_primary: '1.1.1.1' }), { code: 'vm_mutation_claim_required' })
+    await assert.rejects(f.first.updateConfig({ dns_primary: '1.1.1.1:53' }), { code: 'vm_mutation_claim_required' })
   })
   await withVmMutations(
     '/synthetic',
     ['vm-b', 'vm-a'],
     async () => {
-      assert.equal((await f.first.updateConfig({ dns_primary: '1.1.1.1' })).ok, true)
+      assert.equal((await f.first.updateConfig({ dns_primary: '1.1.1.1:53' })).ok, true)
     },
     { operations: f.operations },
   )

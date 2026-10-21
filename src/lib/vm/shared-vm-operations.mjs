@@ -6,6 +6,21 @@ import { physicalVmAliases } from './vm-physical-target.mjs'
 
 const callbacks = new AsyncLocalStorage()
 
+/** Exact active claims inherited by this callback, never merely a controller owner ID. */
+export function currentVmOperationIds(db) {
+  return new Set(
+    (callbacks.getStore() || [])
+      .filter(
+        (context) =>
+          context.active &&
+          !context.operation.uncertain &&
+          context.db.schema === db.schema &&
+          context.db.connectionString === db.connectionString,
+      )
+      .map((context) => context.operation.operationId),
+  )
+}
+
 function operationError(code, status = 409) {
   return Object.assign(new Error(code.replaceAll('_', ' ')), { code, status })
 }
