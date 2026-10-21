@@ -4,9 +4,20 @@ import { coordinationSchemaFor } from '../db/global-maintenance.mjs'
 import { currentVmOperationIds } from '../vm/shared-vm-operations.mjs'
 import { physicalContainerName } from '../vm/vm-physical-target.mjs'
 import { ClusterNodesRepo } from '../db/repos/cluster-nodes-repo.mjs'
-import { allocateNodeSlot, normalizeAllocationReceipt } from '../transport/slotgate-management-client.mjs'
+import {
+  allocateNodeSlot,
+  normalizeAllocationReceipt,
+  publishNodeSlotInitial,
+  launchNodeSlot,
+} from '../transport/slotgate-management-client.mjs'
 import { isDeepStrictEqual } from 'node:util'
-import { normalizeNodeFence } from '../core/node-execution-proof.mjs'
+import {
+  normalizeVacantNodeFence as vacantFence,
+  normalizeNodeManagementIntent as commandIntent,
+  nodeManagementIntentDigest as commandDigest,
+  normalizeNodeManagementGrant as commandGrant,
+  normalizeNodeManagementReceipt as commandReceipt,
+} from '../core/node-management-command.mjs'
 import {
   initializeNodeAuthority,
   nodeAuthorityState,
@@ -30,108 +41,8 @@ function literal(value) {
   return "'" + value.replaceAll("'", "''") + "'"
 }
 
-const COMMAND_KEYS = [
-  'action',
-  'node_id',
-  'vm_id',
-  'allocation_id',
-  'operation_id',
-  'owner_id',
-  'command_id',
-  'epoch',
-  'fence',
-  'expected_manifest_revision',
-  'manifest_revision',
-  'payload_digest',
-  'preset_id',
-  'policy_digest',
-  'manifest_digest',
-]
-const digestPattern = /^[a-f0-9]{64}$/
-function isDigest(value) {
-  return typeof value === 'string' && digestPattern.test(value)
-}
 function commandFailure(code = 'node_command_invalid') {
   return nodeAuthorityError(code)
-}
-function exactShape(value, keys) {
-  if (
-    !value ||
-    typeof value !== 'object' ||
-    Array.isArray(value) ||
-    ![Object.prototype, null].includes(Object.getPrototypeOf(value)) ||
-    Object.keys(value).length !== keys.length ||
-    keys.some((key) => !Object.hasOwn(value, key))
-  )
-    throw commandFailure()
-}
-function vacantFence(value) {
-  exactShape(value, ['generation', 'incarnation', 'executor'])
-  exactShape(value.executor, ['kind', 'node_boot_id'])
-  if (
-    (value.generation !== '1' && value.generation !== 1) ||
-    typeof value.incarnation !== 'string' ||
-    !/^[a-f0-9]{32}$/.test(value.incarnation) ||
-    value.executor.kind !== '' ||
-    value.executor.node_boot_id !== ''
-  )
-    throw commandFailure()
-  // Initial allocation generation 1 is exactly representable in the existing Go JSON number wire format.
-  return { generation: 1, incarnation: value.incarnation, executor: { kind: '', node_boot_id: '' } }
-}
-function commandIntent(value) {
-  exactShape(value, COMMAND_KEYS)
-  for (const key of ['node_id', 'vm_id', 'allocation_id', 'operation_id', 'owner_id', 'command_id'])
-    identifier(value[key])
-  if (
-    typeof value.epoch !== 'string' ||
-    !/^[1-9][0-9]{0,18}$/.test(value.epoch) ||
-    BigInt(value.epoch) > 9223372036854775807n ||
-    value.manifest_revision !== '1' ||
-    value.preset_id !== 'claude-docker-v1' ||
-    !isDigest(value.policy_digest)
-  )
-    throw commandFailure()
-  if (value.action === 'publish-initial') {
-    if (value.expected_manifest_revision !== '0' || !isDigest(value.payload_digest) || value.manifest_digest !== '')
-      throw commandFailure()
-  } else if (value.action === 'launch') {
-    if (value.expected_manifest_revision !== '1' || value.payload_digest !== '' || !isDigest(value.manifest_digest))
-      throw commandFailure()
-  } else throw commandFailure()
-  return { ...value, fence: vacantFence(value.fence) }
-}
-function commandDigest(intent) {
-  return crypto
-    .createHash('sha256')
-    .update(
-      [
-        'slotgate-command-v1',
-        intent.action,
-        intent.node_id,
-        intent.vm_id,
-        intent.allocation_id,
-        intent.operation_id,
-        intent.owner_id,
-        intent.command_id,
-        intent.epoch,
-        String(intent.fence.generation),
-        intent.fence.incarnation,
-        intent.expected_manifest_revision,
-        intent.manifest_revision,
-        intent.payload_digest,
-        intent.preset_id,
-        intent.policy_digest,
-        intent.manifest_digest,
-      ].join('\0'),
-    )
-    .digest('hex')
-}
-function commandGrant(value) {
-  exactShape(value, ['intent', 'intentDigest'])
-  const intent = commandIntent(value.intent)
-  if (value.intentDigest !== commandDigest(intent)) throw commandFailure()
-  return { intent, intentDigest: value.intentDigest }
 }
 function storedGrant(row) {
   if (!row) throw commandFailure('node_command_conflict')
@@ -150,36 +61,6 @@ function storedGrant(row) {
     throw commandFailure('node_command_conflict')
   return grant
 }
-function commandReceipt(grant, value) {
-  try {
-    const launch = grant.intent.action === 'launch'
-    exactShape(value, ['intent', 'intent_digest', 'manifest_revision', 'manifest_digest', ...(launch ? ['fence'] : [])])
-    const intent = commandIntent(value.intent)
-    if (
-      !isDeepStrictEqual(intent, grant.intent) ||
-      value.intent_digest !== grant.intentDigest ||
-      value.manifest_revision !== '1' ||
-      !isDigest(value.manifest_digest) ||
-      (launch && value.manifest_digest !== intent.manifest_digest)
-    )
-      throw commandFailure()
-    const result = {
-      intent,
-      intent_digest: value.intent_digest,
-      manifest_revision: '1',
-      manifest_digest: value.manifest_digest,
-    }
-    if (launch) {
-      result.fence = normalizeNodeFence(value.fence)
-      if (result.fence.generation !== '1' || result.fence.incarnation !== intent.fence.incarnation)
-        throw commandFailure()
-    }
-    return result
-  } catch {
-    throw commandFailure('node_command_receipt_invalid')
-  }
-}
-
 export class NodeManagementGrants {
   constructor(db, { resolveNodeLink } = {}) {
     this.db = db
@@ -341,6 +222,53 @@ export class NodeManagementGrants {
   }
   issueLaunch(input) {
     return this._issueCommand('launch', input)
+  }
+
+  async _issueCommandBeforeSend(action, input) {
+    try {
+      return await this._issueCommand(action, input)
+    } catch (error) {
+      // These authority refusals precede grant insertion and node transmission.
+      // Receipt persistence errors occur later and must not inherit this proof.
+      if (
+        ['node_command_epoch_stale', 'node_command_authority_unavailable'].includes(error.code) &&
+        error.vmOperationUncertain !== true &&
+        error.executionUncertain !== true
+      )
+        error.vmOperationNotStarted = true
+      throw error
+    }
+  }
+
+  async publishInitial(input) {
+    if (!Buffer.isBuffer(input?.payload) || input.payload.length < 1 || input.payload.length > 65536) {
+      throw Object.assign(commandFailure(), { vmOperationNotStarted: true })
+    }
+    const payload = Buffer.from(input.payload)
+    const link = await this.resolveNodeLink(input.nodeId)
+    if (!link) throw Object.assign(nodeAuthorityError('node_link_unavailable'), { vmOperationNotStarted: true })
+    const grant = await this._issueCommandBeforeSend('publish-initial', {
+      ...input,
+      expectedManifestRevision: '0',
+      revision: '1',
+      payloadDigest: crypto.createHash('sha256').update(payload).digest('hex'),
+      manifestDigest: '',
+    })
+    const receipt = await publishNodeSlotInitial({ link, grant, payload })
+    return this.recordInitialPublishReceipt(grant, receipt)
+  }
+
+  async launch(input) {
+    const link = await this.resolveNodeLink(input?.nodeId)
+    if (!link) throw Object.assign(nodeAuthorityError('node_link_unavailable'), { vmOperationNotStarted: true })
+    const grant = await this._issueCommandBeforeSend('launch', {
+      ...input,
+      expectedManifestRevision: '1',
+      revision: '1',
+      payloadDigest: '',
+    })
+    const receipt = await launchNodeSlot({ link, grant })
+    return this.recordLaunchReceipt(grant, receipt)
   }
 
   async _recordCommand(grantValue, receiptValue, action) {

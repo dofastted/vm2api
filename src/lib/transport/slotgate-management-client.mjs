@@ -1,6 +1,8 @@
 import tls from 'node:tls'
 import net from 'node:net'
 import { isDeepStrictEqual } from 'node:util'
+import crypto from 'node:crypto'
+import { normalizeNodeManagementGrant, normalizeNodeManagementReceipt } from '../core/node-management-command.mjs'
 
 function denied() {
   return Object.assign(new Error('node allocation acknowledgement unavailable'), {
@@ -107,4 +109,117 @@ export function allocateNodeSlot({ link, grant }) {
       }
     })
   })
+}
+
+function managementInvalid() {
+  return Object.assign(new Error('invalid node management command'), {
+    code: 'node_command_invalid',
+    vmOperationNotStarted: true,
+  })
+}
+
+function managementFailure(action, sent) {
+  return Object.assign(new Error('node management acknowledgement unavailable'), {
+    code: action === 'publish-initial' ? 'node_publication_unconfirmed' : 'node_launch_unconfirmed',
+    ...(sent ? { vmOperationUncertain: true } : { vmOperationNotStarted: true }),
+  })
+}
+
+function managementLink(link) {
+  if (
+    !link ||
+    !net.isIP(link.address) ||
+    !Number.isInteger(link.port) ||
+    link.port < 1 ||
+    link.port > 65535 ||
+    typeof link.token !== 'string' ||
+    !/^[\x21-\x7e]{32,256}$/.test(link.token) ||
+    typeof link.certSha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(link.certSha256)
+  )
+    throw managementInvalid()
+  return { address: link.address, port: link.port, token: link.token, certSha256: link.certSha256 }
+}
+
+/** Exactly one typed action. No retry or shell/Docker/path parameter is accepted. */
+async function commandNodeSlot({ link: linkInput, grant: grantInput, payload: payloadInput }, action) {
+  let grant
+  let link
+  let payload
+  try {
+    if (action === 'publish-initial') {
+      if (!Buffer.isBuffer(payloadInput) || payloadInput.length < 1 || payloadInput.length > 65536)
+        throw managementInvalid()
+      payload = Buffer.from(payloadInput)
+    }
+    grant = normalizeNodeManagementGrant(grantInput)
+    if (
+      grant.intent.action !== action ||
+      (payload && crypto.createHash('sha256').update(payload).digest('hex') !== grant.intent.payload_digest)
+    )
+      throw managementInvalid()
+    link = managementLink(linkInput)
+  } catch {
+    throw managementInvalid()
+  }
+  const request = {
+    op: action,
+    vm_id: grant.intent.vm_id,
+    management: grant.intent,
+    ...(payload ? { content_length: payload.length } : {}),
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false
+    let sent = false
+    let buffer = Buffer.alloc(0)
+    const socket = tls.connect({
+      host: link.address,
+      port: link.port,
+      rejectUnauthorized: false,
+      minVersion: 'TLSv1.3',
+    })
+    const finish = (error, value) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      socket.destroy()
+      if (error) reject(error)
+      else resolve(value)
+    }
+    const failed = () => finish(managementFailure(action, sent))
+    const timer = setTimeout(failed, 8000)
+    socket.once('error', failed)
+    socket.once('close', failed)
+    socket.once('secureConnect', () => {
+      const pin = socket.getPeerCertificate()?.fingerprint256?.replaceAll(':', '').toLowerCase()
+      if (pin !== link.certSha256) return failed()
+      sent = true
+      socket.write(`KSG2 ${link.token}\n${JSON.stringify(request)}\n`)
+      if (payload) socket.write(payload)
+    })
+    socket.on('data', (chunk) => {
+      buffer = Buffer.concat([buffer, chunk])
+      if (buffer.length > 8192) return failed()
+      const newline = buffer.indexOf(10)
+      if (newline < 0) return
+      try {
+        const reply = JSON.parse(buffer.subarray(0, newline).toString(), (key, value, context) =>
+          key === 'generation' && typeof value === 'number' ? context.source : value,
+        )
+        const field = action === 'publish-initial' ? 'publication' : 'launch'
+        exact(reply, ['ok', field])
+        if (reply.ok !== true) return failed()
+        finish(null, normalizeNodeManagementReceipt(grant, reply[field]))
+      } catch {
+        failed()
+      }
+    })
+  })
+}
+
+export function publishNodeSlotInitial(input) {
+  return commandNodeSlot(input, 'publish-initial')
+}
+export function launchNodeSlot(input) {
+  return commandNodeSlot(input, 'launch')
 }

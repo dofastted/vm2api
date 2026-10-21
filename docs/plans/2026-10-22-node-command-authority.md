@@ -14,6 +14,10 @@
 - `recordInitialPublishReceipt(grant, receipt)` / `recordLaunchReceipt(grant, receipt)`：在原精确操作仍有效时重新检查授权、epoch 和完整来源链，原子保存固定字段回执。相同回执可重复确认；不同回执拒绝覆盖。
 - `readLaunchReceipt({vmId, nodeId?})`：从 PG 确定节点并验证完整链，返回原 launch 回执。正常撤销授权不会删除已确认回执。它证明历史启动已被确认，不证明容器当前仍在运行，也不获取新 fence 替换原值。
 
+`publishInitial(input)` 和 `launch(input)` 将上述接口组合为发行授权、事务外单次 TLS 请求、严格校验回执、原子保存。首次发布要求 Buffer，复制后绑定其完整 SHA-256，限制为 1..65536 字节。客户端只接受固定 IP、TLS 1.3 和证书指纹；节点 token 用于运输认证，不能代替 PG 动作授权。客户端不重试、不重新发行授权，不接受 shell、路径、Docker 参数或任意配置 RPC。
+
+仅在 TLS 应用数据尚未发送时，证书或连接拒绝可带明确的 `vmOperationNotStarted`。发行前的维护阶段/特性拒绝同样使用这一证明。发送后的断连、无效回执和 PG 回执提交失败继续保留原 VM 操作。回执上限为 8192 字节，错误不包含上传内容或节点返回的原始文本。
+
 每个 allocation 的每种新动作只允许一条命令。command ID、动作、操作、owner、epoch、fence、payload、preset 和 policy 不能通过重新发行修改。未知操作继续占用 VM；本增量不提供超时释放或自动恢复。
 
 ## 固定协议
