@@ -86,6 +86,12 @@ for (const [method, suffix, body] of [
   ['POST', '/stop', {}],
   ['DELETE', '', {}],
   ['POST', '/schedulable', { schedulable: false }],
+  ['PATCH', '/owner', { user_id: null }],
+  ['POST', '/reset-fingerprint', {}],
+  ['POST', '/reconcile-fingerprint', {}],
+  ['PUT', '/seed-settings', { theme: 'light' }],
+  ['POST', '/wrap-cli/repair', { mode: 'keep' }],
+  ['POST', '/collect-identity', {}],
 ]) {
   test(`panel ${method} VM${suffix} rejects a global execution admission before any mutation`, async (t) => {
     const f = await fixture(t)
@@ -106,6 +112,19 @@ for (const [method, suffix, body] of [
     assert.deepEqual(f.read('vm-synthetic'), before)
   })
 }
+
+test('batch fingerprint reconciliation acquires every target before changing any file', async (t) => {
+  const f = await fixture(t)
+  f.seed('vm-a')
+  f.seed('vm-b')
+  await f.otherOperations.tryAcquire({ vmId: 'vm-b' })
+  const h = f.handler()
+  await h.request('POST', '/api/panel/vms/reconcile-fingerprints')
+  assert.equal(h.response.status, 409)
+  const next = await f.otherOperations.tryAcquire({ vmId: 'vm-a' })
+  assert.equal(next.ok, true)
+  await next.release()
+})
 
 test('create claims the new physical identity before writing a VM or fingerprint', async (t) => {
   const f = await fixture(t)
