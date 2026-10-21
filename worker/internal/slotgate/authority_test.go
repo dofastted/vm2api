@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -36,6 +37,9 @@ func launchForTest(t *testing.T, a *Authority, vm string, executor ExecutorIdent
 	}
 	launch, err := a.BeginLaunch(vm, s.Fence, "launch-"+vm)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err = a.DispatchCommand(launch, func(ExecutorIdentity) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	s, err = a.BindExecutor(launch, executor)
@@ -102,6 +106,12 @@ func TestAuthorityRevocationRequiresProofAndRejectsCapturedOldCommands(t *testin
 	launch, err := a.BeginLaunch("vm-1", next.Fence, "launch-new")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err = a.DispatchCommand(launch, func(ExecutorIdentity) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = a.BindExecutor(launch, testExecutor("a")); !errors.Is(err, ErrFenceMismatch) {
+		t.Fatalf("retired executor was rebound: %v", err)
 	}
 	active, err := a.BindExecutor(launch, testExecutor("b"))
 	if err != nil {
@@ -275,10 +285,149 @@ func TestAuthoritySerializesSameNodeJournalAcrossProcesses(t *testing.T) {
 	a := authorityForTest(t, root, terminatedExecutor)
 	_, err := OpenAuthority(root, terminatedExecutor)
 	requireAuthorityError(t, err, ErrAuthorityLocked)
+	probe := exec.Command(os.Args[0], "-test.run=^TestAuthorityProcessProbe$")
+	probe.Env = append(os.Environ(), "SLOTGATE_AUTHORITY_PROBE_ROOT="+root)
+	if output, err := probe.CombinedOutput(); err != nil {
+		t.Fatalf("another process acquired authority: %v\n%s", err, output)
+	}
 	if err = a.Close(); err != nil {
 		t.Fatal(err)
 	}
 	authorityForTest(t, root, terminatedExecutor)
+}
+
+func TestAuthorityProcessProbe(t *testing.T) {
+	root := os.Getenv("SLOTGATE_AUTHORITY_PROBE_ROOT")
+	if root == "" {
+		t.Skip("subprocess-only lock probe")
+	}
+	if os.Getenv("SLOTGATE_AUTHORITY_PROBE_MODE") == "crash-mutation" {
+		a, err := OpenAuthority(root, terminatedExecutor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, err := a.State("vm-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		command, err := a.BeginCommand("vm-1", s.Fence, "crashed-mutation", CommandMutation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = a.DispatchCommand(command, func(ExecutorIdentity) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		os.Exit(0) // Intentionally bypass Close, modeling loss of the node daemon.
+	}
+	_, err := OpenAuthority(root, terminatedExecutor)
+	requireAuthorityError(t, err, ErrAuthorityLocked)
+}
+
+func TestAuthorityProcessCrashCannotForgetDispatchedMutation(t *testing.T) {
+	root := t.TempDir()
+	a := authorityForTest(t, root, terminatedExecutor)
+	s := launchForTest(t, a, "vm-1", testExecutor("a"))
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	probe := exec.Command(os.Args[0], "-test.run=^TestAuthorityProcessProbe$")
+	probe.Env = append(os.Environ(), "SLOTGATE_AUTHORITY_PROBE_ROOT="+root, "SLOTGATE_AUTHORITY_PROBE_MODE=crash-mutation")
+	if output, err := probe.CombinedOutput(); err != nil {
+		t.Fatalf("crash helper: %v\n%s", err, output)
+	}
+	reopened := authorityForTest(t, root, terminatedExecutor)
+	got, err := reopened.State("vm-1")
+	if err != nil || got.Phase != PhaseRevoking || !got.Commands["crashed-mutation"].Dispatched || got.Commands["crashed-mutation"].Status != CommandUnknown {
+		t.Fatalf("crashed mutation was forgotten: %+v %v", got, err)
+	}
+	_, err = reopened.Advance(context.Background(), "vm-1", s.Fence)
+	requireAuthorityError(t, err, ErrPendingMutation)
+}
+
+func TestAuthorityProcessIdentityRequiresBirthAndWholeScopeProof(t *testing.T) {
+	a := authorityForTest(t, t.TempDir(), func(_ context.Context, e ExecutorIdentity) (TerminationProof, error) {
+		return TerminationProof{ID: "process-proof", Executor: e, Scope: "process_scope_empty", ObservedAt: "2026-10-21T00:01:00Z"}, nil
+	})
+	executor := ExecutorIdentity{Kind: "process", NodeBootID: "test-node-boot", PID: 42, ProcessStart: 12345, ProcessScope: "/vm2api/incarnation-a"}
+	s := launchForTest(t, a, "vm-1", executor)
+	wrong := s.Fence
+	wrong.Executor.ProcessStart++
+	_, err := a.Revoke("vm-1", wrong)
+	requireAuthorityError(t, err, ErrFenceMismatch)
+	if _, err = a.Revoke("vm-1", s.Fence); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = a.Advance(context.Background(), "vm-1", s.Fence); err != nil {
+		t.Fatal(err)
+	}
+	for _, invalid := range []ExecutorIdentity{
+		{Kind: "process", NodeBootID: "test-node-boot", PID: 42},
+		{Kind: "process", NodeBootID: "test-node-boot", PID: 42, ProcessStart: 12345},
+	} {
+		if err = validateExecutor(invalid); err == nil {
+			t.Fatalf("PID alone was accepted: %+v", invalid)
+		}
+	}
+}
+
+func TestAuthorityMissingInitializedJournalCannotResetGeneration(t *testing.T) {
+	root := t.TempDir()
+	a := authorityForTest(t, root, terminatedExecutor)
+	launchForTest(t, a, "vm-1", testExecutor("a"))
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, "authority.json")); err != nil {
+		t.Fatal(err)
+	}
+	if reopened, err := OpenAuthority(root, terminatedExecutor); err == nil {
+		reopened.Close()
+		t.Fatal("lost initialized journal silently reset generations")
+	}
+}
+
+func TestAuthorityDispatchChecksEpochAtSendAndNeverRetriesUnknownSend(t *testing.T) {
+	a := authorityForTest(t, t.TempDir(), terminatedExecutor)
+	s := launchForTest(t, a, "vm-1", testExecutor("a"))
+	queued, err := a.BeginCommand("vm-1", s.Fence, "queued-before-revoke", CommandForward)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = a.Revoke("vm-1", s.Fence); err != nil {
+		t.Fatal(err)
+	}
+	sends := 0
+	send := func(ExecutorIdentity) error { sends++; return nil }
+	requireAuthorityError(t, a.DispatchCommand(queued, send), ErrAuthorityPhase)
+	if _, err = a.Advance(context.Background(), "vm-1", s.Fence); err != nil {
+		t.Fatal(err)
+	}
+	requireAuthorityError(t, a.DispatchCommand(queued, send), ErrFenceMismatch)
+	if sends != 0 {
+		t.Fatal("captured old ticket sent after revocation")
+	}
+
+	b := authorityForTest(t, t.TempDir(), terminatedExecutor)
+	active := launchForTest(t, b, "vm-2", testExecutor("b"))
+	command, err := b.BeginCommand("vm-2", active.Fence, "transport-unknown", CommandForward)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transportError := errors.New("lost response after send")
+	err = b.DispatchCommand(command, func(identity ExecutorIdentity) error {
+		if identity != active.Fence.Executor {
+			t.Fatal("send used a different executor")
+		}
+		return transportError
+	})
+	if err != transportError {
+		t.Fatalf("send error changed: %v", err)
+	}
+	requireAuthorityError(t, b.DispatchCommand(command, send), ErrCommandDispatched)
+	state, err := b.State("vm-2")
+	if err != nil || state.Commands[command.ID].Status != CommandPending {
+		t.Fatalf("unknown send was released: %+v %v", state, err)
+	}
 }
 
 func TestAuthorityInvalidJournalIsNotReinitialized(t *testing.T) {
