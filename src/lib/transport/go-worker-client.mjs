@@ -374,6 +374,17 @@ async function completeFencedExecution(client, handle, execution) {
   }
 }
 
+function forwardFencedWorker(exec, client, handle, request) {
+  const token = readInternalToken(exec)
+  return client.forward(handle, {
+    ...request,
+    headers: {
+      ...request.headers,
+      ...(token ? { 'x-kin-internal-token': token, 'x-internal-token': token } : {}),
+    },
+  })
+}
+
 function completeHttpExecution(execution, body, httpStatus) {
   const uncertain = kernelExecutionUnconfirmed(body, httpStatus)
   Object.assign(execution, {
@@ -651,7 +662,7 @@ export async function callGoWorker({
       signal,
       timeoutMs,
     }
-    const response = await (fenced ? fenced.forward(handle, request) : workerRequest(exec, request))
+    const response = await (fenced ? forwardFencedWorker(exec, fenced, handle, request) : workerRequest(exec, request))
     const data = await readAll(response)
     const parsed = parseJson(data)
     if (fenced) await completeFencedExecution(fenced, handle, execution)
@@ -862,7 +873,7 @@ export async function streamGoWorker({
       timeoutMode: 'first-byte',
       headers: { te: 'trailers' },
     }
-    const response = await (fenced ? fenced.forward(handle, request) : workerRequest(exec, request))
+    const response = await (fenced ? forwardFencedWorker(exec, fenced, handle, request) : workerRequest(exec, request))
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
       const data = await readAll(response, 1024 * 1024)
