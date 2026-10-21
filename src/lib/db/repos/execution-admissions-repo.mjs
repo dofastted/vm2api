@@ -19,6 +19,10 @@ function denied(code, inflight, max, extra = {}) {
   return { ok: false, code, reason: code, detail: { inflight, max }, ...extra }
 }
 
+function jobError(code) {
+  return Object.assign(new Error(code.replaceAll('_', ' ')), { code })
+}
+
 /** Short PostgreSQL transactions for global account/VM execution limits. */
 export class ExecutionAdmissionsRepo {
   constructor(db, { ownerId = 'controller_' + crypto.randomUUID() } = {}) {
@@ -122,6 +126,8 @@ export class ExecutionAdmissionsRepo {
         record,
         release: (options) => this.release(handle, options),
         markUncertain: () => this.markUncertain(handle),
+        bindExecution: (execution) => this.bindExecution(handle, execution),
+        completeExecution: (execution) => this.completeExecution(handle, execution),
       }
     })
   }
@@ -134,12 +140,87 @@ export class ExecutionAdmissionsRepo {
     return { uncertain: result.changes > 0 }
   }
 
+  async _lockAdmission({ admissionId, ownerId }) {
+    return this.db
+      .prepare('SELECT * FROM execution_admissions WHERE id = $1 AND owner_id = $2 FOR UPDATE')
+      .get(admissionId, ownerId)
+  }
+
+  async bindExecution(handle, execution) {
+    return withTransaction(this.db, async () => {
+      const admission = await this._lockAdmission(handle)
+      if (!admission || admission.released_at || admission.uncertain_at) {
+        throw jobError('execution_admission_inactive')
+      }
+      if (typeof execution?.requestId !== 'string' || !execution.requestId.trim()) {
+        throw jobError('invalid_execution_job')
+      }
+      const pending = await this.db
+        .prepare('SELECT request_id FROM execution_jobs WHERE admission_id = $1 AND ended_at IS NULL LIMIT 1')
+        .get(handle.admissionId)
+      if (pending) throw jobError('execution_job_pending')
+      const row = await this.db
+        .prepare(`INSERT INTO execution_jobs (request_id, admission_id) VALUES ($1, $2)
+        ON CONFLICT (request_id) DO NOTHING RETURNING request_id`)
+        .get(execution.requestId, handle.admissionId)
+      if (!row) throw jobError('execution_job_exists')
+      return { bound: true, admissionId: handle.admissionId, requestId: execution.requestId }
+    })
+  }
+
+  async completeExecution(handle, execution) {
+    const result = await withTransaction(this.db, async () => {
+      const admission = await this._lockAdmission(handle)
+      if (!admission) throw jobError('execution_admission_inactive')
+      const valid =
+        typeof execution?.requestId === 'string' &&
+        execution.requestId.trim() &&
+        typeof execution.started === 'boolean' &&
+        typeof execution.ended === 'boolean' &&
+        typeof execution.reason === 'string' &&
+        execution.reason.trim()
+      if (!valid) {
+        await this.markUncertain(handle)
+        // Commit the uncertainty before reporting the invalid metadata.
+        return { error: 'invalid_execution_job' }
+      }
+      const job = await this.db
+        .prepare('SELECT * FROM execution_jobs WHERE request_id = $1 AND admission_id = $2')
+        .get(execution.requestId, handle.admissionId)
+      if (!job) {
+        await this.markUncertain(handle)
+        return { error: 'execution_job_mismatch' }
+      }
+      if (job.ended_at) return { ended: true, uncertain: !!admission.uncertain_at, requestId: execution.requestId }
+      await this.db
+        .prepare(`UPDATE execution_jobs SET
+        ended_at = CASE WHEN $1 THEN clock_timestamp() ELSE ended_at END,
+        started = COALESCE(started, false) OR $2, reason = $3
+        WHERE request_id = $4 AND admission_id = $5 AND ended_at IS NULL`)
+        .run(execution.ended, execution.started, execution.reason, execution.requestId, handle.admissionId)
+      if (!execution.ended) await this.markUncertain(handle)
+      return {
+        ended: execution.ended,
+        uncertain: !execution.ended || !!admission.uncertain_at,
+        requestId: execution.requestId,
+      }
+    })
+    if (result.error) throw jobError(result.error)
+    return result
+  }
+
   async release(handle, { uncertain = false } = {}) {
     if (uncertain) return this.markUncertain(handle)
-    const result = await this.db
-      .prepare(`UPDATE execution_admissions SET released_at = clock_timestamp()
-        WHERE id = $1 AND owner_id = $2 AND released_at IS NULL AND uncertain_at IS NULL`)
-      .run(handle.admissionId, handle.ownerId)
-    return { released: result.changes > 0 }
+    return withTransaction(this.db, async () => {
+      // Lock before the pending-job query so a concurrent bind commits before
+      // this statement takes its snapshot. An UPDATE alone can use an older one.
+      if (!(await this._lockAdmission(handle))) return { released: false }
+      const result = await this.db
+        .prepare(`UPDATE execution_admissions SET released_at = clock_timestamp()
+          WHERE id = $1 AND owner_id = $2 AND released_at IS NULL AND uncertain_at IS NULL
+          AND NOT EXISTS (SELECT 1 FROM execution_jobs j WHERE j.admission_id = execution_admissions.id AND j.ended_at IS NULL)`)
+        .run(handle.admissionId, handle.ownerId)
+      return { released: result.changes > 0 }
+    })
   }
 }
