@@ -89,7 +89,7 @@ test('scheduled bootstrap keeps an independent activity and VM claim until the o
         `SELECT count(*) AS n FROM ${coordinator.qualified}.activities WHERE kind='background' AND completed_at IS NULL`,
       )
     ).rows[0].n,
-    '1',
+    1,
   )
   let drained = false
   const flush = f.tasks.flush().then(() => {
@@ -117,4 +117,48 @@ test('ordinary error and timeout results keep bootstrap task and VM ownership wi
   const claim = await f.peer.prepare('SELECT unknown_at, finished_at FROM background_task_runs').get()
   assert.notEqual(claim.unknown_at, null)
   assert.equal(claim.finished_at, null)
+})
+
+test('a normally returned bootstrap error remains unknown even without a timeout flag', async (t) => {
+  const f = await fixture(t)
+  await scheduleOfficialCcBootstrap(f.options)
+  f.finish({ ok: false, error: 'synthetic worker ACK missing' })
+  await f.tasks.flush()
+  assert.equal((await f.other.tryAcquire({ vmId: f.vm.id })).ok, false)
+})
+
+test('a successful response with an unknown auxiliary operation retains ownership', async (t) => {
+  const f = await fixture(t)
+  await scheduleOfficialCcBootstrap(f.options)
+  f.finish({ ok: true, vmOperationUncertain: true })
+  await f.tasks.flush()
+  assert.equal((await f.other.tryAcquire({ vmId: f.vm.id })).ok, false)
+})
+
+test('successful bootstrap keeps ownership until queued persistence has completed', async (t) => {
+  const f = await fixture(t)
+  let finishFlush
+  let enteredFlush
+  const flushing = new Promise((resolve) => {
+    finishFlush = resolve
+  })
+  const entered = new Promise((resolve) => {
+    enteredFlush = resolve
+  })
+  f.options.flush = async () => {
+    enteredFlush()
+    await flushing
+  }
+  await scheduleOfficialCcBootstrap(f.options)
+  f.finish({ ok: true })
+  await entered
+  try {
+    assert.equal((await f.other.tryAcquire({ vmId: f.vm.id })).ok, false)
+  } finally {
+    finishFlush()
+  }
+  await f.tasks.flush()
+  const next = await f.other.tryAcquire({ vmId: f.vm.id })
+  assert.equal(next.ok, true)
+  await next.release()
 })
