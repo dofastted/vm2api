@@ -66,6 +66,15 @@ export function accountChanges(before, after, { paths = [] } = {}) {
     observationChanges(before[field], after[field], [field], observations)
   }
   for (const path of paths) touchObservation(valueAt(before, path), valueAt(after, path), path, observations)
+  for (const change of observations) {
+    const path = change.path
+    // Reset/status/utilization describe one window. A stale cleanup must compare the whole window.
+    const window =
+      path[0] === 'unified' && ['headers', 'official'].includes(path[1]) ? path.slice(0, 3) : path.slice(0, 2)
+    change.guardPath =
+      path[0] === 'unified' && ['5h', '7d', '7d_oi', 'last_probe', 'fable'].includes(window.at(-1)) ? window : path
+    change.guardBefore = valueAt(before, change.guardPath)
+  }
   return { fields, deltas, observations }
 }
 
@@ -290,8 +299,13 @@ export class AccountsRepo {
       const extra = parse(row.extra, {}) || {}
       const versions = row.observation_versions || {}
       const probeChanged = probeBase !== undefined && !isDeepStrictEqual(extra.unified?.last_probe ?? null, probeBase)
+      const applicable = changes.map(
+        (change) =>
+          !conditional ||
+          isDeepStrictEqual(valueAt(extra, change.guardPath || change.path), change.guardBefore ?? change.before),
+      )
       let changed = false
-      for (const change of changes) {
+      for (const [index, change] of changes.entries()) {
         if (!['unified', 'last_blocked', 'last_cli_rate_limit'].includes(change.path[0])) {
           throw new Error('unsupported account observation')
         }
@@ -302,7 +316,7 @@ export class AccountsRepo {
         )
           continue
         if (probeChanged && change.path[0] === 'unified' && change.path[1] === 'last_probe') continue
-        if (conditional && !isDeepStrictEqual(valueAt(extra, change.path), change.before)) continue
+        if (!applicable[index]) continue
         setAt(extra, change.path, change.value)
         versions[JSON.stringify(change.path)] = sequence.toString()
         changed = true
