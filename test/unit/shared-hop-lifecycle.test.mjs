@@ -213,6 +213,31 @@ unixTest('a truncated shared kernel socket cannot retry or release capacity to a
   await fx.peerIsBlocked()
 })
 
+unixTest('a complete kernel client-disconnected error retains its job, VM and device seat', async (t) => {
+  const fx = await fixture(t, (_job, _req, res) => {
+    res.writeHead(502, { 'content-type': 'application/json' })
+    res.end(
+      JSON.stringify({
+        ok: false,
+        error: {
+          type: 'worker_error',
+          code: 'provider_error',
+          message: 'provider error: client disconnected',
+          status: 502,
+        },
+      }),
+    )
+  })
+  const result = await fx.run()
+  assert.equal(result.execution.ended, false)
+  assert.equal(result.executionUncertain, true)
+  assert.equal(fx.messages.length, 1)
+  assert.equal((await fx.counts()).vmInflight, 1)
+  assert.equal((await fx.pools[1].executionAdmissions.getSeat(scopedSeatKey)).inflight, 1)
+  assert.equal((await fx.db.prepare('SELECT ended_at FROM execution_jobs').get()).ended_at, null)
+  await fx.peerIsBlocked()
+})
+
 for (const [phase, trigger, code, expectedExecutions] of [
   ['binding', 'INSERT', 'P6481', 0],
   ['completion', 'UPDATE OF ended_at', 'P6482', 1],

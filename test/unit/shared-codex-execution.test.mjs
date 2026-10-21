@@ -302,6 +302,34 @@ unixTest('a truncated Codex socket retains its admission and session turn withou
   assert.equal(fx.messages.length, 1)
 })
 
+unixTest('a complete Codex kernel internal error cannot release capacity or start another job', async (t) => {
+  const fx = await fixture(t, (_job, _req, res) => {
+    res.writeHead(502, { 'content-type': 'application/json' })
+    res.end(
+      JSON.stringify({
+        ok: false,
+        error: {
+          type: 'worker_error',
+          code: 'provider_error',
+          message: 'provider error: client disconnected',
+          status: 502,
+        },
+      }),
+    )
+  })
+  const result = await fx.run({ runtimeIndex: 0, sessionId: 'kernel-cancelled-conversation' })
+  assert.equal(result.status, 502)
+  assert.equal(result.body.error.code, 'codex_execution_uncertain')
+  assert.equal(fx.messages.length, 1)
+  assert.equal((await fx.counts()).vmInflight, 1)
+  assert.equal((await fx.other.prepare('SELECT ended_at FROM execution_jobs').get()).ended_at, null)
+  const turn = await fx.other.prepare('SELECT * FROM session_turns').get()
+  assert.ok(turn.uncertain_at)
+  const blocked = await fx.run({ runtimeIndex: 1, sessionId: 'kernel-cancelled-conversation' })
+  assert.equal(blocked.status, 429)
+  assert.equal(fx.messages.length, 1)
+})
+
 unixTest('Codex EOF permits an implicit retry only with a new persisted job ID', async (t) => {
   let executions = 0
   const fx = await fixture(t, (_job, _req, res) => {

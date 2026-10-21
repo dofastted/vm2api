@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { callGoWorker, streamGoWorker } from '../../src/lib/transport/go-worker-client.mjs'
+import { callCodexKernel, streamCodexKernel } from '../../src/lib/transport/codex-kernel-client.mjs'
 
 const unixTest = process.platform === 'win32' ? test.skip : test
 function deferred() {
@@ -28,10 +29,76 @@ async function fixture(t, handler) {
     await new Promise((resolve) => server.close(resolve))
     fs.rmSync(root, { recursive: true, force: true })
   })
-  return { vmId: 'vm-execution', vm: { runtime: { worker_socket: socket } } }
+  return { vmId: 'vm-execution', vm: { runtime: { worker_socket: socket, codex_kernel_socket: socket } } }
 }
 
 const envelope = { body: { model: 'claude-test', messages: [{ role: 'user', content: 'hi' }] }, headers: {} }
+
+for (const [name, invoke] of [
+  ['HTTP', callGoWorker],
+  ['SSE', streamGoWorker],
+  ['Codex HTTP', callCodexKernel],
+  ['Codex SSE', streamCodexKernel],
+]) {
+  for (const message of [
+    'provider error: client disconnected',
+    "provider error: client disconnected; You've hit your limit (429)",
+    'provider error: internal transport timeout',
+    'provider error: failed to read CLI response',
+  ]) {
+    unixTest(`${name} complete kernel error '${message}' does not prove execution end`, async (t) => {
+      const exec = await fixture(t, (_req, res) => {
+        res.writeHead(502, { 'content-type': 'application/json' })
+        res.end(
+          JSON.stringify({ ok: false, error: { type: 'worker_error', code: 'provider_error', message, status: 502 } }),
+        )
+      })
+      const result = await invoke({ exec, envelope })
+      assert.equal(result.execution.started, true)
+      assert.equal(result.execution.ended, false)
+      assert.equal(result.execution.reason, 'kernel_execution_unconfirmed')
+      assert.equal(result.transportError, false, 'the HTTP response itself completed')
+    })
+  }
+  unixTest(`${name} recognized provider rejection still permits EOF completion`, async (t) => {
+    const exec = await fixture(t, (_req, res) => {
+      res.writeHead(502, { 'content-type': 'application/json' })
+      res.end(
+        JSON.stringify({
+          error: { type: 'worker_error', code: 'provider_error', message: "provider error: You've hit your limit" },
+        }),
+      )
+    })
+    const result = await invoke({ exec, envelope })
+    assert.equal(result.status, 429)
+    assert.equal(result.execution.ended, true)
+    assert.equal(result.execution.reason, 'eof')
+  })
+}
+
+for (const [name, invoke] of [
+  ['SSE', streamGoWorker],
+  ['Codex SSE', streamCodexKernel],
+]) {
+  unixTest(`${name} kernel error event followed by EOF keeps termination unknown`, async (t) => {
+    const exec = await fixture(t, (_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(
+        `event: error\ndata: ${JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'worker_error',
+            code: 'provider_error',
+            message: 'provider error: client disconnected',
+          },
+        })}\n\n`,
+      )
+    })
+    const result = await invoke({ exec, envelope })
+    assert.equal(result.execution.ended, false)
+    assert.equal(result.execution.reason, 'kernel_execution_unconfirmed')
+  })
+}
 
 for (const [name, invoke] of [
   ['HTTP', callGoWorker],
