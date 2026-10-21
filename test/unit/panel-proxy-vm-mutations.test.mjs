@@ -1,3 +1,4 @@
+import '../fixtures/kin-computer-test-env.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -248,5 +249,27 @@ test('package create rejects a busy physical alias before assigning an identity'
   await h.request('POST', '/api/panel/vms/package')
   assert.equal(h.response.status, 409)
   assert.equal(h.response.body.error.code, 'vm_operation_active')
+  assert.equal(fs.existsSync(path.join(f.project, 'vms', 'new.json')), false)
+})
+
+test('Kubernetes package creation never renames outside its claimed identity', async (t) => {
+  const f = await fixture(t)
+  const before = fs.readFileSync(path.join(f.project, 'vms', 'vm-a.json'), 'utf8')
+  const h = f.handler(buildVmPackage({ vm: { id: 'vm-a', name: 'must not rename', timezone: 'UTC' } }), {
+    packageImportBringUp: false,
+  })
+  await h.request('POST', '/api/panel/vms/package')
+  assert.equal(h.response.status, 409)
+  assert.equal(h.response.body.error.code, 'vm_id_exists')
+  assert.deepEqual(fs.readdirSync(path.join(f.project, 'vms')), ['vm-a.json'])
+  assert.equal(fs.readFileSync(path.join(f.project, 'vms', 'vm-a.json'), 'utf8'), before)
+})
+
+test('Kubernetes package creation refuses a committed alias missing from this Pod files', async (t) => {
+  const f = await fixture(t)
+  await f.peer.prepare("INSERT INTO vms (id, name) VALUES ('vm-new', 'synthetic')").run()
+  const h = f.handler(buildVmPackage({ vm: { id: 'new', timezone: 'UTC' } }), { packageImportBringUp: false })
+  await h.request('POST', '/api/panel/vms/package')
+  assert.equal(h.response.status, 409)
   assert.equal(fs.existsSync(path.join(f.project, 'vms', 'new.json')), false)
 })

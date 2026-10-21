@@ -64,7 +64,12 @@ import {
   oauthToSub2apiExport,
   parseCredentialEdit,
 } from '../oauth/sub2api-account.mjs'
-import { officialCcHome, readOfficialCcStatus, scheduleOfficialCcBootstrap } from '../oauth/official-cc-bootstrap.mjs'
+import {
+  officialCcHome,
+  readOfficialCcStatus,
+  runOfficialCcBootstrap,
+  scheduleOfficialCcBootstrap,
+} from '../oauth/official-cc-bootstrap.mjs'
 import { invalidateLiveCredentialCache } from './panel-live-credentials.mjs'
 import { ensureCodexKernel, stopCodexKernel, finishCodexRecycle } from '../transport/codex-kernel-supervisor.mjs'
 import { listOfficialModels, seedModelCatalog } from '../protocol/models.mjs'
@@ -785,14 +790,16 @@ export function createPanelHandler(ctx) {
     return { ok: true, via, node_id: host.nodeId || null, proxy_id: proxy.id || null, geo: r.geo }
   }
 
-  async function bringUpImportedVm(id) {
+  async function bringUpImportedVm(id, operation) {
     let vm = getVm(cfg.paths.project, id)
     let startError = null
     if (!vm) return { start_error: 'vm not found', official_cc_bootstrap: null, probe: null }
     if (!hasBoundExit(vm.proxy)) {
       startError = 'no_exit'
     } else {
-      const boot = await startSlotReady(vm, cfg.paths.project, { routing: ctx.routingConfig })
+      const boot = await vmEffect(operation, () =>
+        (ctx.vmMutationOps?.startSlotReady || startSlotReady)(vm, cfg.paths.project, { routing: ctx.routingConfig }),
+      )
       vm = getVm(cfg.paths.project, id) || vm
       if (!boot?.ok) {
         startError = boot?.error || boot?.reason || 'runtime start failed'
@@ -813,8 +820,10 @@ export function createPanelHandler(ctx) {
     else if (!vmHasClaudeCredential(vm)) bootstrap = { scheduled: false, reason: 'no_credential' }
     else if (!canOfficialCc(credentialModeOfVm(vm))) {
       bootstrap = { scheduled: false, reason: 'credential_mode_unsupported' }
+    } else if (!slotHost(vm).supports('official_cc')) {
+      bootstrap = { scheduled: false, reason: 'remote_unsupported' }
     } else {
-      bootstrap = scheduleOfficialCcBootstrap({
+      const options = {
         vmId: id,
         projectRoot: cfg.paths.project,
         vm,
@@ -825,7 +834,13 @@ export function createPanelHandler(ctx) {
         routingFile: routingConfigPath,
         config: ctx.routingConfig?.official_cc,
         credentialMode: credentialModeOfVm(vm),
-      })
+      }
+      if (isKubernetesMode()) {
+        const completed = await vmEffect(operation, () =>
+          (ctx.vmMutationOps?.runOfficialCcBootstrap || runOfficialCcBootstrap)(options),
+        )
+        bootstrap = { scheduled: true, vmId: id, completed: true, ok: completed?.ok === true }
+      } else bootstrap = scheduleOfficialCcBootstrap(options)
     }
     const probed = await panel.buildProbeOne({ cfg, accountQuota, id, routingConfig: ctx.routingConfig })
     const probe = probed?.status
@@ -3404,7 +3419,7 @@ export function createPanelHandler(ctx) {
       // POST /api/panel/vms/:id/circuit/reset — close a tripped Claude unit circuit
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/circuit\/reset$/.test(p)) {
         const id = decodeURIComponent(p.split('/')[4])
-        const result = panel.resetVmCircuit({ cfg, poolScheduler: ctx.poolScheduler, id })
+        const result = await panel.resetVmCircuit({ cfg, poolScheduler: ctx.poolScheduler, id })
         if (result.status) return json(res, result.status, result.body)
         return json(res, 200, result)
       }
@@ -4022,38 +4037,49 @@ export function createPanelHandler(ctx) {
       if (req.method === 'PUT' && /^\/api\/panel\/vms\/[^/]+\/package$/.test(p)) {
         const id = p.split('/')[4]
         const body = await readBody(req, 256 * 1024).catch(() => null)
-        const result = await commitVmPackage({
-          projectRoot: cfg.paths.project,
-          parsed: parseVmPackage(body),
-          mode: 'update',
-          targetId: id,
-          owner: { role: panelIdentity(req).role, userId: req.panelUserId },
-          proxyPool,
-        })
-        if (!result.ok) return json(res, result.status, { ok: false, error: result.error })
-        await fillTimezoneFromExit(id)
-        let worker = null
-        // The package may swap credentials or exit; a running worker keeps the old ones until reloaded.
-        if (ctx.packageImportBringUp !== false && result.vm.status === 'running' && process.env.KIN_CRS_MOCK !== '1') {
-          setVmSchedulable(cfg.paths.project, id, false, 'package_update_worker_reload')
-          worker = await reloadSlotReady(getVm(cfg.paths.project, id), cfg.paths.project, {
-            routing: ctx.routingConfig,
+        const parsed = parseVmPackage(body)
+        if (!parsed.ok) return json(res, 400, { ok: false, error: parsed.error })
+        return mutateProxyVms([id], async (handles) => {
+          const result = await commitVmPackage({
+            projectRoot: cfg.paths.project,
+            parsed,
+            mode: 'update',
+            targetId: id,
+            owner: { role: panelIdentity(req).role, userId: req.panelUserId },
+            proxyPool,
           })
-          if (worker.ok) restoreSchedulableIfReady(id)
-        }
-        const saved = getVm(cfg.paths.project, id) || result.vm
-        return json(
-          res,
-          200,
-          panel.ok({
-            vm: summarizeVm(saved, cfg.paths.project, ctx.routingConfig),
-            worker_reload: worker ? { ok: !!worker.ok, error: worker.ok ? null : worker.error || null } : null,
-          }),
-        )
+          if (!result.ok) return json(res, result.status, { ok: false, error: result.error })
+          await fillTimezoneFromExit(id)
+          let worker = null
+          // The package may swap credentials or exit; a running worker keeps the old ones until reloaded.
+          if (
+            ctx.packageImportBringUp !== false &&
+            result.vm.status === 'running' &&
+            process.env.KIN_CRS_MOCK !== '1'
+          ) {
+            setVmSchedulable(cfg.paths.project, id, false, 'package_update_worker_reload')
+            worker = await vmEffect(handles.get(id), () =>
+              (ctx.vmMutationOps?.reloadSlotReady || reloadSlotReady)(getVm(cfg.paths.project, id), cfg.paths.project, {
+                routing: ctx.routingConfig,
+              }),
+            )
+            if (worker.ok) restoreSchedulableIfReady(id)
+          }
+          const saved = getVm(cfg.paths.project, id) || result.vm
+          return json(
+            res,
+            200,
+            panel.ok({
+              vm: summarizeVm(saved, cfg.paths.project, ctx.routingConfig),
+              worker_reload: worker ? { ok: !!worker.ok, error: worker.ok ? null : worker.error || null } : null,
+            }),
+          )
+        })
       }
       if (req.method === 'POST' && p === '/api/panel/vms/package') {
         const body = await readBody(req, 256 * 1024).catch(() => null)
         const parsed = parseVmPackage(body)
+        if (!parsed.ok) return json(res, 400, { ok: false, error: parsed.error })
         const ident = panelIdentity(req)
         if (parsed.ok && ident.role === 'user') {
           const ownerId = normalizeOwnerId(req.panelUserId)
@@ -4070,32 +4096,45 @@ export function createPanelHandler(ctx) {
           { id: a.vm_id },
           { id: a.account_id },
         ])
-        const result = await commitVmPackage({
-          projectRoot: cfg.paths.project,
-          parsed,
-          mode: 'create',
-          owner: { role: ident.role, userId: req.panelUserId },
-          proxyPool,
-          occupied: historic,
-        })
-        if (!result.ok) return json(res, result.status, { ok: false, error: result.error })
-        await fillTimezoneFromExit(result.vm.id)
-        const brought =
-          ctx.packageImportBringUp === false
-            ? { start_error: null, official_cc_bootstrap: null, probe: null }
-            : await bringUpImportedVm(result.vm.id)
-        const saved = getVm(cfg.paths.project, result.vm.id) || result.vm
-        return json(
-          res,
-          result.status,
-          panel.ok({
-            vm: summarizeVm(saved, cfg.paths.project, ctx.routingConfig),
-            renamed_from: result.renamed_from,
-            start_error: brought.start_error,
-            official_cc_bootstrap: brought.official_cc_bootstrap,
-            probe: brought.probe,
-          }),
-        )
+        const fixedId = isKubernetesMode() || ctx.vmOperations ? parsed.value.id : null
+        const commit = async (handles) => {
+          if (fixedId) {
+            const aliases = physicalVmAliases(fixedId)
+            const committed = await getDb()
+              .prepare('SELECT id FROM vms WHERE id = ANY($1::text[]) LIMIT 1')
+              .get(aliases)
+            if (committed || listVms(cfg.paths.project).some((vm) => aliases.includes(vm.id)))
+              return json(res, 409, { ok: false, error: { code: 'vm_id_exists', message: 'VM identity exists' } })
+          }
+          const result = await commitVmPackage({
+            projectRoot: cfg.paths.project,
+            parsed,
+            mode: 'create',
+            targetId: fixedId,
+            owner: { role: ident.role, userId: req.panelUserId },
+            proxyPool,
+            occupied: historic,
+          })
+          if (!result.ok) return json(res, result.status, { ok: false, error: result.error })
+          await fillTimezoneFromExit(result.vm.id)
+          const brought =
+            ctx.packageImportBringUp === false
+              ? { start_error: null, official_cc_bootstrap: null, probe: null }
+              : await bringUpImportedVm(result.vm.id, handles.get(result.vm.id))
+          const saved = getVm(cfg.paths.project, result.vm.id) || result.vm
+          return json(
+            res,
+            result.status,
+            panel.ok({
+              vm: summarizeVm(saved, cfg.paths.project, ctx.routingConfig),
+              renamed_from: result.renamed_from,
+              start_error: brought.start_error,
+              official_cc_bootstrap: brought.official_cc_bootstrap,
+              probe: brought.probe,
+            }),
+          )
+        }
+        return fixedId ? mutateProxyVms([fixedId], commit) : commit(new Map())
       }
 
       // POST /api/panel/vms/create — configurable seed VM + pure Claude Code home

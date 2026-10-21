@@ -602,10 +602,11 @@ export async function commitVmPackage({
   // Tenants cannot read or write seed-settings; a package must not smuggle them in either.
   if (owner.role === 'user') spec.vm.seed_policy = null
   const create = mode === 'create'
-  let id = create ? spec.id : targetId
+  let id = create ? targetId || spec.id : targetId
   let renamedFrom = null
   if (!isValidVmId(id)) return { ok: false, status: 400, error: { code: 'invalid_id', message: 'vm.id 无效' } }
   if (create && fs.existsSync(path.join(projectRoot, 'vms', `${id}.json`))) {
+    if (targetId) return { ok: false, status: 409, error: { code: 'vm_id_exists', message: 'VM identity exists' } }
     renamedFrom = id
     id = nextFreePackageVmId(projectRoot, occupied)
     const oldLabel = slotLabel(renamedFrom)
