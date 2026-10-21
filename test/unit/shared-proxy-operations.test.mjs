@@ -105,13 +105,49 @@ test('a normal callback without explicit terminal proof retains its persistent p
   assert.equal((await f.second.tryAcquire()).ok, false)
 })
 
-test('an exception retains ownership while an explicitly not-started failure can release', async (t) => {
+test('an explicitly not-started failure can release its proxy operation', async (t) => {
   const f = await services(t)
   await assert.rejects(
     f.first.run(async () => {
       throw Object.assign(new Error('synthetic unsubmitted'), { proxyOperationNotStarted: true })
     }),
   )
+  assert.equal((await f.second.tryAcquire()).ok, true)
+})
+
+test('a caught nested exception still retains the outer proxy operation', async (t) => {
+  const f = await services(t)
+  await f.first.run(async () => {
+    await assert.rejects(
+      f.second.run(async () => {
+        throw new Error('synthetic unknown effect')
+      }),
+    )
+    return { terminal: true }
+  })
+  assert.equal((await f.second.tryAcquire()).ok, false)
+  assert.notEqual(
+    (await f.db.prepare('SELECT unknown_at FROM background_task_runs WHERE task_key = $1').get(TASK_KEY)).unknown_at,
+    null,
+  )
+})
+
+test('failed or unconfirmed release can retry without reselling an active claim', async (t) => {
+  const f = await services(t)
+  const claim = await f.first.tryAcquire()
+  const complete = f.first.runs.complete.bind(f.first.runs)
+  let calls = 0
+  f.first.runs.complete = async (...args) => {
+    calls += 1
+    if (calls === 1) throw new Error('synthetic DB failure')
+    if (calls === 2) return { completed: false }
+    return complete(...args)
+  }
+  await assert.rejects(claim.release(), /synthetic DB failure/)
+  assert.equal((await f.second.tryAcquire()).ok, false)
+  assert.deepEqual(await claim.release(), { released: false })
+  assert.equal((await f.second.tryAcquire()).ok, false)
+  assert.deepEqual(await claim.release(), { released: true })
   assert.equal((await f.second.tryAcquire()).ok, true)
 })
 
