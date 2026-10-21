@@ -269,3 +269,25 @@ test('a Kubernetes Codex exit-policy stop cannot infer another Pod kernel is abs
   assert.equal(result.ok, false)
   assert.equal(result.vmOperationUncertain, true)
 })
+
+test('Kubernetes fleet telemetry cannot bypass the persistent helper execution receipt', async () => {
+  const source = fs.readFileSync(new URL('../../src/lib/vm/fleet-update.mjs', import.meta.url), 'utf8')
+  const body = source.slice(source.indexOf('export async function restartLocalEgress('), source.indexOf('async function restartLocalServices(')).replace('export ', '')
+  let legacySignals = 0
+  let starts = 0
+  const restart = vmContext.runInNewContext(`${body}; restartLocalEgress`, {
+    isLocalEgressProxy: () => false, isKubernetesMode: () => true,
+    runExclusiveProxyEgress: (_root, _id, callback) => callback(),
+    stopEgressProcessConfirmed: async () => ({ ok: false, code: 'egress_owner_unreachable', vmOperationUncertain: true }),
+    inspectEgressProcess: () => ({ ok: false }),
+    stopEgressProcess: () => { legacySignals++; return { ok: true } },
+    egressPidsForProxyConfig: () => [], drainEgressForProxyConfig: async () => ({ ok: true }),
+    readEgressListenTcp: () => '',
+    startProxyEgress: async () => { starts++; return { ok: true } },
+  })
+  const result = await restart('/synthetic', { proxy: { id: 'synthetic' } })
+  assert.equal(result.ok, false)
+  assert.equal(result.vmOperationUncertain, true)
+  assert.equal(legacySignals, 0)
+  assert.equal(starts, 0)
+})
