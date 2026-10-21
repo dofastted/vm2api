@@ -92,7 +92,8 @@ import { isCodexVm } from './vm-kind.mjs'
 import { nodeEgressProxyUrl } from '../cluster/node-egress-socks.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { stopCodexKernel, finishCodexRecycle } from '../transport/codex-kernel-supervisor.mjs'
-import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { isKubernetesMode, isKubernetesHaMode } from '../core/control-plane-mode.mjs'
+import { haUnsupported } from '../core/ha-control-plane-policy.mjs'
 
 const noop = async () => ({ skipped: true })
 
@@ -217,6 +218,32 @@ function nativeHost(nodeId, record) {
 }
 
 export function slotHost(vm) {
+  if (isKubernetesHaMode()) {
+    const deny = () => {
+      throw haUnsupported()
+    }
+    return {
+      kind: 'managed',
+      nodeId: vmNodeId(vm),
+      bakedKernel: true,
+      ownsSocketFiles: false,
+      supports: () => false,
+      dockerEnv: deny,
+      dockerApi: deny,
+      execUser: deny,
+      start: deny,
+      reload: deny,
+      stop: deny,
+      destroy: deny,
+      setProxyEgressEnabled: deny,
+      localExitProxyUrl: deny,
+      syncRun: deny,
+      queueSyncRun: deny,
+      onImport: deny,
+      afterRefresh: deny,
+      touch: deny,
+    }
+  }
   const nodeId = vmNodeId(vm)
   if (nodeId && isNativeNodeVm(vm)) return nativeHost(nodeId, vm)
   const base = nodeId ? nodeHost(nodeId) : LOCAL_HOST

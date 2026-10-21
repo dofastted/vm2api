@@ -12,7 +12,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { getDb } from '../db/database.mjs'
-import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { isKubernetesMode, isKubernetesHaMode } from '../core/control-plane-mode.mjs'
+import { haUnsupported } from '../core/ha-control-plane-policy.mjs'
 import { SharedVmOperations } from './shared-vm-operations.mjs'
 
 /**
@@ -178,6 +179,7 @@ function notifyVmWrite(filePath) {
 }
 
 export function withVmLock(key, fn, { operations, vmId, kind = 'mutation' } = {}) {
+  if (isKubernetesHaMode()) throw haUnsupported()
   if (operations || isKubernetesMode()) {
     if (vmId == null) {
       const name = path.basename(String(key || ''))
@@ -231,6 +233,7 @@ export function withVmLock(key, fn, { operations, vmId, kind = 'mutation' } = {}
 }
 
 export function atomicWriteJson(filePath, obj, { mode } = {}) {
+  assertVmWriteAllowed(filePath)
   const dir = path.dirname(filePath)
   const tmp = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`)
   const data = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2)
@@ -255,6 +258,7 @@ export function atomicWriteJson(filePath, obj, { mode } = {}) {
 }
 
 export function writeJsonIfChanged(filePath, obj, { mode } = {}) {
+  assertVmWriteAllowed(filePath)
   const data = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2)
   try {
     if (fs.existsSync(filePath) && readFileCached(filePath) === data) {
@@ -263,4 +267,8 @@ export function writeJsonIfChanged(filePath, obj, { mode } = {}) {
   } catch {}
   atomicWriteJson(filePath, data, { mode })
   return true
+}
+
+function assertVmWriteAllowed(filePath) {
+  if (isKubernetesHaMode() && path.resolve(filePath).split(path.sep).includes('vms')) throw haUnsupported()
 }
