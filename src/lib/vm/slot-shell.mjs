@@ -379,6 +379,7 @@ export function createSlotShell({
   authLoginReady = null,
   upgradeLoginReady = null,
   db,
+  onExecutionState = null,
 } = {}) {
   const tickets = new Map()
   const authState = isKubernetesMode() ? new OneTimeAuthRepo(db) : null
@@ -457,8 +458,25 @@ export function createSlotShell({
     const url = new URL(req.url || '/', 'http://local')
     const sm = SHELL_RE.exec(url.pathname)
     if (!sm) return false
+    const requestId = crypto.randomUUID()
+    const reject = (status, text) => {
+      if (!onExecutionState) return rejectUpgrade(socket, status, text)
+      track(
+        Promise.resolve()
+          .then(() =>
+            onExecutionState(req, {
+              requestId,
+              started: false,
+              ended: true,
+              reason: 'not_started',
+              phase: 'complete',
+            }),
+          )
+          .then(() => rejectUpgrade(socket, status, text)),
+      )
+    }
     if (draining) {
-      rejectUpgrade(socket, 503, 'Service Unavailable')
+      reject(503, 'Service Unavailable')
       return true
     }
     const vmId = decodeURIComponent(sm[1])
@@ -469,8 +487,7 @@ export function createSlotShell({
         consumeTicket(ticket, vmId, requestedLogin)
           .then(acceptTicket)
           .catch((error) =>
-            rejectUpgrade(
-              socket,
+            reject(
               error.code === 'shell_ticket_scope_mismatch' ? 409 : 503,
               error.code === 'shell_ticket_scope_mismatch' ? 'Conflict' : 'Service Unavailable',
             ),
@@ -482,22 +499,22 @@ export function createSlotShell({
 
     function acceptTicket(entry) {
       if (!entry) {
-        rejectUpgrade(socket, 401, 'Unauthorized')
+        reject(401, 'Unauthorized')
         return true
       }
       const vm = getVm(projectRoot, vmId)
       if (!vm || isCodexVm(vm)) {
-        rejectUpgrade(socket, 404, 'Not Found')
+        reject(404, 'Not Found')
         return true
       }
       if (requestedLogin !== !!entry.login) {
-        rejectUpgrade(socket, 409, 'Conflict')
+        reject(409, 'Conflict')
         return true
       }
       const login = !!entry.login
       const accept = () => {
         if (draining || socket.destroyed) {
-          rejectUpgrade(socket, 503, 'Service Unavailable')
+          reject(503, 'Service Unavailable')
           return
         }
         if (sessions >= MAX_SESSIONS) {
@@ -512,7 +529,7 @@ export function createSlotShell({
         }
         wss.handleUpgrade(req, socket, head, (ws) => {
           track(new Promise((resolve) => ws.once('close', resolve)))
-          track(attach(ws, vm, size))
+          track(attach(ws, vm, size, req, requestId))
         })
       }
       if (!login) {
@@ -523,8 +540,7 @@ export function createSlotShell({
         Promise.resolve()
           .then(() => (upgradeLoginReady || authLoginReady || assertAuthLoginReady)(projectRoot, vm))
           .then(accept, (err) =>
-            rejectUpgrade(
-              socket,
+            reject(
               409,
               String(err?.message || 'Conflict')
                 .replace(/[\r\n]+/g, ' ')
@@ -536,7 +552,7 @@ export function createSlotShell({
     }
   }
 
-  async function attach(ws, vm, size) {
+  async function attach(ws, vm, size, req, requestId) {
     const token = crypto.randomBytes(12).toString('hex')
     liveTokens.add(token)
     const container = slotContainerName({ vm })
@@ -545,6 +561,13 @@ export function createSlotShell({
     let closed = false
     let released = false
     let adoptTimer = null
+    let started = false
+    let completed = false
+    const finish = async (ended, reason) => {
+      if (completed) return
+      completed = true
+      await onExecutionState?.(req, { requestId, started, ended, reason, phase: 'complete' })
+    }
     connections.set(ws, () => {
       clearInterval(adoptTimer)
       ws.close(1001, 'Control plane is draining')
@@ -599,6 +622,13 @@ export function createSlotShell({
     })
     try {
       connect = slotHost(vm).dockerApi()
+      await onExecutionState?.(req, { requestId, started: true, ended: false, reason: 'started', phase: 'start' })
+      if (closed || draining) {
+        await finish(true, 'not_started')
+        ws.close(1001)
+        return
+      }
+      started = true
       if (size.login) await preparePanelShellLogin(projectRoot, vm)
       const launch = panelShellLaunch(slotHost(vm).bins.cli)
       const env = ['TERM=xterm-256color', `${SESSION_ENV}=${token}`, `${RC_ENV}=${launch.rc}`]
@@ -616,6 +646,7 @@ export function createSlotShell({
         rows: size.rows,
       })
     } catch (err) {
+      await finish(!started, started ? 'docker_exec_open_failed' : 'not_started')
       send(JSON.stringify({ t: 'error', message: `打开终端失败：${err.message}` }))
       ws.close(1011)
       return
@@ -624,6 +655,8 @@ export function createSlotShell({
       // The close handler ran before the session existed: reap here instead.
       session.stream.destroy()
       await reap().catch(() => {})
+      const info = await inspectExec(connect, session.execId).catch(() => null)
+      await finish(info?.Running === false, info?.Running === false ? 'docker_exec_stopped' : 'docker_exec_unknown')
       return
     }
     // ConsoleSize on exec start is API >= 1.42; resize covers older daemons.
@@ -673,10 +706,18 @@ export function createSlotShell({
               }
             }
             const info = await inspectExec(connect, session.execId).catch(() => null)
+            await finish(
+              info?.Running === false,
+              info?.Running === false ? 'docker_exec_stopped' : 'docker_exec_unknown',
+            )
             send(JSON.stringify({ t: 'exit', code: info?.ExitCode ?? null }))
             ws.close(1000)
           } finally {
-            completeTerminal()
+            try {
+              if (!completed) await finish(false, 'terminal_cleanup_failed')
+            } finally {
+              completeTerminal()
+            }
           }
         })(),
       )

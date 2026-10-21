@@ -5,6 +5,7 @@
  */
 
 import { WebSocketServer } from 'ws'
+import { randomUUID } from 'node:crypto'
 import {
   containerAction,
   containerLogs,
@@ -34,7 +35,7 @@ function clampInt(v, lo, hi, dflt) {
   return Math.min(hi, Math.max(lo, n))
 }
 
-export function createClusterRoutes({ manager, json, readBody, ok }) {
+export function createClusterRoutes({ manager, json, readBody, ok, onExecutionState = null }) {
   function fail(res, err, respond = json) {
     const status = err instanceof ClusterError ? err.status : 500
     const code = err instanceof ClusterError ? err.code : 'cluster_error'
@@ -188,34 +189,58 @@ export function createClusterRoutes({ manager, json, readBody, ok }) {
     const url = new URL(req.url || '/', 'http://local')
     const sm = SHELL_RE.exec(url.pathname)
     if (!sm) return false
+    const requestId = randomUUID()
+    const reject = (status, text) => {
+      if (!onExecutionState) return rejectUpgrade(socket, status, text)
+      track(
+        Promise.resolve()
+          .then(() =>
+            onExecutionState(req, {
+              requestId,
+              started: false,
+              ended: true,
+              reason: 'not_started',
+              phase: 'complete',
+            }),
+          )
+          .then(() => rejectUpgrade(socket, status, text)),
+      )
+    }
     if (draining) {
-      rejectUpgrade(socket, 503, 'Service Unavailable')
+      reject(503, 'Service Unavailable')
       return true
     }
     const id = sm[1]
     const accept = (authorized) => {
-      if (!authorized) return rejectUpgrade(socket, 401, 'Unauthorized')
-      if (draining || socket.destroyed) return rejectUpgrade(socket, 503, 'Service Unavailable')
+      if (!authorized) return reject(401, 'Unauthorized')
+      if (draining || socket.destroyed) return reject(503, 'Service Unavailable')
       const cols = clampInt(url.searchParams.get('cols'), 10, 500, 80)
       const rows = clampInt(url.searchParams.get('rows'), 5, 200, 24)
       wss.handleUpgrade(req, socket, head, (ws) => {
         track(new Promise((resolve) => ws.once('close', resolve)))
-        track(attachShell(ws, id, { cols, rows }))
+        track(attachShell(ws, id, { cols, rows }, req, requestId))
       })
     }
     const consumed = manager.consumeShellTicket(url.searchParams.get('ticket') || '', id)
     if (typeof consumed?.then === 'function') {
-      track(consumed.then(accept, () => rejectUpgrade(socket, 503, 'Service Unavailable')))
+      track(consumed.then(accept, () => reject(503, 'Service Unavailable')))
     } else accept(consumed)
     return true
   }
 
-  async function attachShell(ws, id, size) {
+  async function attachShell(ws, id, size, req, requestId) {
     // Listen before the channel opens: input/resize sent during the SSH round
     // trip would otherwise be dropped (ws does not buffer unhandled messages).
     const pending = []
     let stream = null
     let closed = false
+    let started = false
+    let completed = false
+    const finish = async (ended, reason) => {
+      if (completed) return
+      completed = true
+      await onExecutionState?.(req, { requestId, started, ended, reason, phase: 'complete' })
+    }
     const apply = (msg) => {
       if (msg?.t === 'd' && typeof msg.d === 'string') stream.write(msg.d)
       else if (msg?.t === 'r') stream.setWindow(clampInt(msg.r, 5, 200, 24), clampInt(msg.c, 10, 500, 80), 0, 0)
@@ -234,22 +259,35 @@ export function createClusterRoutes({ manager, json, readBody, ok }) {
     ws.on('close', () => {
       closed = true
       stream?.close()
+      if (stream) track(finish(false, 'client_closed'))
     })
     try {
+      await onExecutionState?.(req, { requestId, started: true, ended: false, reason: 'started', phase: 'start' })
+      if (closed || draining) {
+        await finish(true, 'not_started')
+        return
+      }
+      started = true
       stream = await manager.openShell(id, size)
     } catch (err) {
+      await finish(!started, started ? 'ssh_open_failed' : 'not_started')
       if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ t: 'error', message: err.message }))
       ws.close(1011)
       return
     }
+    stream.on('exit', () => track(finish(true, 'ssh_exit')))
+    stream.on('close', () => {
+      track(finish(false, 'ssh_channel_closed'))
+      ws.close(1000)
+    })
     if (closed) {
       stream.close()
+      await finish(false, 'client_closed')
       return
     }
     stream.on('data', (chunk) => ws.readyState === ws.OPEN && ws.send(chunk))
     stream.stderr?.on('data', (chunk) => ws.readyState === ws.OPEN && ws.send(chunk))
     stream.on('exit', (code) => ws.readyState === ws.OPEN && ws.send(JSON.stringify({ t: 'exit', code })))
-    stream.on('close', () => ws.close(1000))
     for (const msg of pending.splice(0)) apply(msg)
   }
 

@@ -1090,8 +1090,18 @@ if (proxyPool.snapshot().config.ipv6_enabled !== true) {
     console.warn('[ipv6-policy] exit not blocked', exit.vm_id || exit.proxy_id, exit.error)
   }
 }
-const clusterRoutes = createClusterRoutes({ manager: clusterManager, json, readBody, ok: panel.ok })
-const slotShell = createSlotShell({ projectRoot: cfg.paths.project, importOauth: commitImportedOauth })
+const clusterRoutes = createClusterRoutes({
+  manager: clusterManager,
+  json,
+  readBody,
+  ok: panel.ok,
+  onExecutionState: noteRequestExecution,
+})
+const slotShell = createSlotShell({
+  projectRoot: cfg.paths.project,
+  importOauth: commitImportedOauth,
+  onExecutionState: noteRequestExecution,
+})
 for (const vm of listVms(cfg.paths.project)) {
   if (isCodexVm(vm)) continue
   try {
@@ -1203,6 +1213,7 @@ function noteRequestExecution(req, execution) {
       ended: execution.ended === true,
     })
   }
+  if (execution?.phase === 'complete') state.finishExecution?.()
 }
 
 async function withRequestActivity(req, res, callback, kind = 'http') {
@@ -1221,7 +1232,7 @@ async function withRequestActivity(req, res, callback, kind = 'http') {
   try {
     return await gate.run(async () => {
       try {
-        const value = await callback()
+        const value = await callback(state)
         await responseDone
         await flushRuntimeWrites()
         return value
@@ -1465,9 +1476,27 @@ server.on('upgrade', async (req, socket, head) => {
     socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n')
     return
   }
-  if (await responsesWs.handleUpgrade(req, socket, head)) return
-  if (clusterRoutes.handleUpgrade(req, socket, head)) return
-  if (!slotShell.handleUpgrade(req, socket, head)) socket.destroy()
+  try {
+    await withRequestActivity(
+      req,
+      null,
+      async (state) => {
+        const terminal = new Promise((resolve) => {
+          if (state) state.finishExecution = resolve
+        })
+        if (await responsesWs.handleUpgrade(req, socket, head)) return
+        if (clusterRoutes.handleUpgrade(req, socket, head) || slotShell.handleUpgrade(req, socket, head)) {
+          if (state) await terminal
+          return
+        }
+        socket.destroy()
+      },
+      'websocket_upgrade',
+    )
+  } catch (error) {
+    console.warn(`[websocket] activity failed: ${error.code || error.name}`)
+    socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n')
+  }
 })
 
 server.on('clientError', (err, socket) => {
@@ -1522,6 +1551,13 @@ process.on('unhandledRejection', (e) => console.error('[unhandled]', e))
 async function shutdown(signal, { failed = false } = {}) {
   if (_shuttingDown) return
   _shuttingDown = true
+  let shutdownActivity
+  if (activityCoordinator?.healthy) {
+    try {
+      shutdownActivity = await activityCoordinator.admit({ kind: 'shutdown' })
+      shutdownActivity.enter()
+    } catch {}
+  }
   lifecycle.beginDrain()
   responsesWs.beginDrain()
   clusterRoutes.beginDrain()
@@ -1611,6 +1647,7 @@ async function shutdown(signal, { failed = false } = {}) {
         await flushRuntimeWrites()
         stopAllRustKernels()
         await clusterManager.stop()
+        await shutdownActivity?.complete({ ended: true, reason: 'shutdown_persistence_completed' })
         await activityCoordinator?.stop()
         await controlPlaneLock?.stop()
         await closeDatabase()
