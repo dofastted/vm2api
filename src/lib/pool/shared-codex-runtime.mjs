@@ -114,6 +114,7 @@ export class SharedCodexRuntime {
       const result = await hop({
         ...args,
         onExecutionStart: async (execution) => {
+          await args.onExecutionStart?.(execution)
           await lease.bindExecution(execution)
           bound = true
         },
@@ -121,6 +122,7 @@ export class SharedCodexRuntime {
           await lease.completeExecution(execution)
           completed = execution?.ended === true
           if (!completed) await lease.markUncertain()
+          await args.onExecutionEnd?.(execution)
         },
       })
       const notStarted = result?.execution?.started === false && result?.execution?.ended === true && !bound

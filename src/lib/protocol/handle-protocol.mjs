@@ -446,12 +446,14 @@ export function createHandleProtocol(deps) {
     routing = {},
     noGoFallback = false,
     accountObservation = null,
+    onExecutionStart = candidate.bindExecution,
+    onExecutionEnd = candidate.completeExecution,
   }) {
     const assembler = createClaudeMessageAssembler()
     const workerResult = await dispatchStreamInference({
       exec: candidate.exec,
-      onExecutionStart: candidate.bindExecution,
-      onExecutionEnd: candidate.completeExecution,
+      onExecutionStart,
+      onExecutionEnd,
       body,
       reqHeaders,
       timeoutMs,
@@ -491,6 +493,32 @@ export function createHandleProtocol(deps) {
       throw error
     } finally {
       if (!admission.lease?.billingFailed && !admission.lease?.executionUncertain) await admission.lease?.release?.()
+    }
+  }
+
+  async function observeExecution(req, admission, execution) {
+    await deps.onExecutionState?.(req, execution)
+    if (!execution?.requestId) return
+    admission.pendingExecutions ||= new Set()
+    if (execution.ended === true) admission.pendingExecutions.delete(execution.requestId)
+    else if (execution.started === true) {
+      admission.executionStarted = true
+      admission.pendingExecutions.add(execution.requestId)
+    }
+    if (admission.lease?.shared) admission.lease.executionUncertain = admission.pendingExecutions.size > 0
+  }
+
+  function executionHooks(req, admission, candidate = {}) {
+    if (!deps.onExecutionState && !admission.lease?.shared && !candidate.bindExecution) return {}
+    return {
+      onExecutionStart: async (execution) => {
+        await observeExecution(req, admission, { ...execution, started: true, ended: false })
+        await candidate.bindExecution?.(execution)
+      },
+      onExecutionEnd: async (execution) => {
+        await candidate.completeExecution?.(execution)
+        await observeExecution(req, admission, execution)
+      },
     }
   }
 
@@ -793,8 +821,13 @@ export function createHandleProtocol(deps) {
       if (!gate.ok) return
       admission.lease = gate
       const runCodex = async (options) => {
-        admission.executionStarted = true
-        const output = await handleCodexProtocol(options)
+        const output = await handleCodexProtocol({
+          ...options,
+          onExecutionState:
+            deps.onExecutionState || gate.shared
+              ? (_req, execution) => observeExecution(req, admission, execution)
+              : undefined,
+        })
         await attachPricing(logBag, {
           managedKey: req.apiKeyRecord,
           reservation: gate,
@@ -1118,8 +1151,8 @@ export function createHandleProtocol(deps) {
       logBag.via = 'api-kernel'
       let result
       try {
-        admission.executionStarted = true
         result = await runApiInference({
+          ...executionHooks(req, admission),
           req,
           res,
           cfg,
@@ -1522,8 +1555,10 @@ export function createHandleProtocol(deps) {
           }
         },
         callAttempt: async ({ candidate, body, attemptMeta, deliveryMode: attemptDelivery, signal, onCommit }) => {
+          const hooks = executionHooks(req, admission, candidate)
           if (!clientStream) {
             return await streamAndAssembleClaudeMessage({
+              ...hooks,
               candidate,
               body,
               reqHeaders: req.headers,
@@ -1570,8 +1605,7 @@ export function createHandleProtocol(deps) {
           try {
             const workerResult = await dispatchStreamInference({
               exec: candidate.exec,
-              onExecutionStart: candidate.bindExecution,
-              onExecutionEnd: candidate.completeExecution,
+              ...hooks,
               cacheTtl,
               preserveCacheBreakpoints,
               cliHop: attemptMeta?.cliHop === true,
@@ -1858,6 +1892,7 @@ export function createHandleProtocol(deps) {
     logBag.inbound_summary = summarizeBody(body)
     const gate = await reserveManagedKey(req, res)
     if (!gate.ok) return
+    const admission = { lease: gate }
     try {
       const output = await handleCodexSearch({
         req,
@@ -1869,6 +1904,10 @@ export function createHandleProtocol(deps) {
         routing: getRouting() || {},
         projectRoot: cfg.paths.project,
         stickyRouter,
+        onExecutionState:
+          deps.onExecutionState || gate.shared
+            ? (_req, execution) => observeExecution(req, admission, execution)
+            : undefined,
       })
       await attachPricing(logBag, {
         managedKey: req.apiKeyRecord,
@@ -1881,7 +1920,7 @@ export function createHandleProtocol(deps) {
       if (gate.shared && !gate.settled) gate.billingFailed = true
       throw error
     } finally {
-      if (!gate.billingFailed) await gate.release?.()
+      if (!gate.billingFailed && !gate.executionUncertain) await gate.release?.()
     }
   }
 

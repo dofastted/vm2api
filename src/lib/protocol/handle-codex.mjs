@@ -588,6 +588,7 @@ export async function handleCodexProtocol({
   captureOutbound = false,
   requestStartedAt = Date.now(),
   accountGate = null,
+  onExecutionState = null,
 }) {
   const codex = normalizeCodexRouting(routing.codex)
   const allowed = isCodexProtocolAllowed(protocol, { codex })
@@ -862,6 +863,10 @@ export async function handleCodexProtocol({
                 : hop,
             args: {
               exec: execFor(projectRoot, vm),
+              onExecutionStart: onExecutionState
+                ? (execution) => onExecutionState(req, { ...execution, started: true, ended: false })
+                : undefined,
+              onExecutionEnd: onExecutionState ? (execution) => onExecutionState(req, execution) : undefined,
               signal: gone.signal,
               body: outboundBody,
               reqHeaders: req.headers,
@@ -1352,6 +1357,7 @@ export async function handleCodexSearch({
   projectRoot,
   stickyRouter = null,
   ops = {},
+  onExecutionState = null,
 }) {
   logBag.via = 'codex-search'
   const reject = (status, type, code, message) => {
@@ -1408,6 +1414,10 @@ export async function handleCodexSearch({
           refresh: ops.refresh,
           signal: gone.signal,
           timeoutMs: ops.searchTimeoutMs,
+          onExecutionStart: onExecutionState
+            ? (execution) => onExecutionState(req, { ...execution, started: true, ended: false })
+            : undefined,
+          onExecutionEnd: onExecutionState ? (execution) => onExecutionState(req, execution) : undefined,
         }
         last = sharedRuntime ? await sharedRuntime.invoke(admitted.lease, post, args) : await post(args)
         if (sharedRuntime && (last?.executionUncertain || last?.execution?.ended !== true)) {
