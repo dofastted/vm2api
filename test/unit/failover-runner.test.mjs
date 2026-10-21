@@ -139,6 +139,41 @@ test('a finished model job with uncertain credential refresh retains its admissi
   assert.equal(result.executionUncertain, true)
 })
 
+for (const ended of [true, false]) {
+  test(`an explicit refresh refusal stops retry only after first job ended=${ended}`, async () => {
+    let marked = 0
+    const first = {
+      ...candidate(1),
+      bindExecution: async () => {},
+      markUncertain: async () => {
+        marked++
+      },
+    }
+    const scheduler = new Scheduler([first, candidate(2)])
+    const runner = new FailoverRunner({ scheduler })
+    let calls = 0
+    const result = await runner.run({
+      requestId: 'refused-refresh',
+      model: 'claude-test',
+      canonicalBody: { model: 'claude-test' },
+      callAttempt: async () => {
+        calls++
+        if (calls > 1) return success()
+        return {
+          ok: false,
+          status: 503,
+          execution: { ended },
+          credentialRefreshNotStarted: true,
+          body: { error: { code: 'database_maintenance' } },
+        }
+      },
+    })
+    assert.equal(calls, 1)
+    assert.equal(marked, ended ? 0 : 1)
+    assert.equal(result.executionUncertain === true, !ended)
+  })
+}
+
 test('invalid panel cache layout stops before execution without rotating or cooling accounts', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const attempts = new Attempts()

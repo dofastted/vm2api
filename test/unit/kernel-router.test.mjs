@@ -522,6 +522,35 @@ unixTest('an uncertain credential refresh stays distinct from the first complete
   }
 })
 
+unixTest('a definitely unstarted refresh refusal preserves the completed kernel job result', async () => {
+  const previous = process.env.KIN_KERNEL_BIN
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  const fx = await kernelFixture((_req, res) => {
+    res.writeHead(401, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ type: 'error', error: { code: 'needs_refresh' } }))
+  })
+  try {
+    const result = await dispatchCallInference({
+      exec: fx.exec,
+      body: { model: 'claude-test', messages: [{ role: 'user', content: 'synthetic' }] },
+      ensureRust: async () => ({ ok: true }),
+      ensureCredential: async () => {
+        throw Object.assign(new Error('synthetic explicit drain refusal'), {
+          code: 'database_maintenance',
+          credentialRefreshNotStarted: true,
+        })
+      },
+    })
+    assert.equal(result.execution.ended, true)
+    assert.equal(result.credentialRefreshNotStarted, true)
+    assert.notEqual(result.executionUncertain, true)
+  } finally {
+    await fx.close()
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+  }
+})
+
 unixTest('failed Go credential ensure is not followed by a blind Rust retry', async () => {
   const previous = process.env.KIN_KERNEL_BIN
   process.env.KIN_KERNEL_BIN = '/bin/true'
