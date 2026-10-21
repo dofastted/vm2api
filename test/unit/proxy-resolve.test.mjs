@@ -14,9 +14,9 @@ function tmpDir() {
 
 test('prefers pool credentials over host-only vm.proxy', async () => {
   const pool = await new ProxyPool({ dataDir: tmpDir() }).init()
-  pool.importLines('socks5://user:s3cret@10.0.0.5:1080')
+  await pool.importLines('socks5://user:s3cret@10.0.0.5:1080')
   const id = pool.snapshot().proxies[0].id
-  pool.bind(id, 'vm-02')
+  await pool.bind(id, 'vm-02')
   pool.stopScheduler()
   const resolved = resolveImportProxy({
     vm: { id: 'vm-02', proxy: { id, host: '10.0.0.5', port: 1080 } },
@@ -28,10 +28,10 @@ test('prefers pool credentials over host-only vm.proxy', async () => {
 
 test('blocks import when bound proxy is fail or dead', async () => {
   const pool = await new ProxyPool({ dataDir: tmpDir() }).init()
-  pool.importLines('10.0.0.6:1080')
+  await pool.importLines('10.0.0.6:1080')
   const id = pool.snapshot().proxies[0].id
-  pool.bind(id, 'vm-03')
-  pool.setEnabled(id, false)
+  await pool.bind(id, 'vm-03')
+  await pool.setEnabled(id, false)
   pool.stopScheduler()
   const resolved = resolveImportProxy({
     vm: { id: 'vm-03', proxy: { id, host: '10.0.0.6', port: 1080, url: 'socks5h://10.0.0.6:1080' } },

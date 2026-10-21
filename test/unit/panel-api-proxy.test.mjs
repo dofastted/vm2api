@@ -41,8 +41,8 @@ test('summarizeProxyPool includes disconnect_on_error', async () => {
   })
   const dir = tmpDir()
   const pool = await new ProxyPool({ dataDir: dir }).init()
-  pool.importLines('10.0.0.9:1080')
-  pool.updateConfig({ disconnect_on_error: true })
+  await pool.importLines('10.0.0.9:1080')
+  await pool.updateConfig({ disconnect_on_error: true })
   pool.stopScheduler()
   const sum = summarizeProxyPool(pool)
   assert.equal(sum.total, 1)
@@ -64,9 +64,9 @@ test('dashboard and vm detail merge pool health onto bound VM', async () => {
     policy: { maxConcurrency: 4, weight: 1, priority: 8 },
   })
   const pool = await new ProxyPool({ dataDir }).init()
-  pool.importLines('10.8.8.8:1080')
+  await pool.importLines('10.8.8.8:1080')
   const px = pool.snapshot().proxies[0]
-  pool.bind(px.id, 'vm-02')
+  await pool.bind(px.id, 'vm-02')
   const bound = pool.state.proxies[0]
   bound.status = 'ok'
   bound.latency_ms = 12
@@ -78,7 +78,7 @@ test('dashboard and vm detail merge pool health onto bound VM', async () => {
   bound.geo_timezone = 'Asia/Tokyo'
   bound.geo_checked_at = '2026-01-01T00:00:00Z'
   bound.label = '东京-2'
-  pool.save()
+  await pool.save()
   pool.stopScheduler()
 
   const cfg = { paths: { project }, rewrite: { enabled: false }, base_url: 'http://127.0.0.1' }
@@ -158,10 +158,10 @@ test('dead bound proxy blocks credential import', async () => {
     policy: {},
   })
   const pool = await new ProxyPool({ dataDir }).init()
-  pool.importLines('10.7.7.7:1080')
+  await pool.importLines('10.7.7.7:1080')
   const id = pool.snapshot().proxies[0].id
-  pool.bind(id, 'vm-03')
-  pool.setEnabled(id, false)
+  await pool.bind(id, 'vm-03')
+  await pool.setEnabled(id, false)
   pool.stopScheduler()
   const cfg = { paths: { project }, rewrite: {}, base_url: '' }
   const detail = await buildVmDetail({ cfg, accountQuota: fakeQuota(), id: 'vm-03', proxyPool: pool })
@@ -363,11 +363,11 @@ test('local proxy node labels are present for admin and absent for tenant', asyn
     vmNodeOf: (vmId) => vms.find((vm) => vm.id === vmId)?.node_id || null,
   }).init()
   t.after(() => pool.stopScheduler())
-  pool.ensureLocal()
+  await pool.ensureLocal()
   // A generic px-local bind lands each slot on its own VPS's local row.
-  assert.equal(pool.bind('px-local', 'vm-ctrl').proxy.id, 'px-local')
-  assert.equal(pool.bind('px-local', 'vm-tokyo').proxy.id, 'px-local-node-a')
-  assert.equal(pool.bind('px-local', 'vm-tenant').proxy.id, 'px-local-node-a')
+  assert.equal((await pool.bind('px-local', 'vm-ctrl')).proxy.id, 'px-local')
+  assert.equal((await pool.bind('px-local', 'vm-tokyo')).proxy.id, 'px-local-node-a')
+  assert.equal((await pool.bind('px-local', 'vm-tenant')).proxy.id, 'px-local-node-a')
 
   const nodes = [{ id: 'node-a', label: '东京-01' }]
   const adminSnap = pool.panelSnapshot({ role: 'admin', vms, nodes })

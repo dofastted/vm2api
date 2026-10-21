@@ -15,7 +15,7 @@ async function makePool(t) {
 
 test('import: different passwords at the same endpoint are distinct within a batch and after reload', async (t) => {
   const pool = await makePool(t)
-  const first = pool.importLines('1.2.3.4:1080:alice:first\n1.2.3.4:1080:alice:second\n1.2.3.4:1080:alice:first')
+  const first = await pool.importLines('1.2.3.4:1080:alice:first\n1.2.3.4:1080:alice:second\n1.2.3.4:1080:alice:first')
   assert.equal(first.added, 2)
   assert.equal(first.skipped, 1)
   assert.equal(first.skip_details[0].reason, 'duplicate')
@@ -23,7 +23,7 @@ test('import: different passwords at the same endpoint are distinct within a bat
 
   await pool.reload()
   assert.deepEqual(pool.state.proxies.map((p) => p.password).sort(), ['first', 'second'])
-  const next = pool.importLines('1.2.3.4:1080:alice:second\n1.2.3.4:1080:alice:third')
+  const next = await pool.importLines('1.2.3.4:1080:alice:second\n1.2.3.4:1080:alice:third')
   assert.equal(next.added, 1)
   assert.equal(next.skipped, 1)
   assert.equal(pool.state.proxies.length, 3)
@@ -31,7 +31,7 @@ test('import: different passwords at the same endpoint are distinct within a bat
 
 test('import: structured credentials containing colons do not collide, equivalent URLs still deduplicate', async (t) => {
   const pool = await makePool(t)
-  const result = pool.importLines('', {
+  const result = await pool.importLines('', {
     fields: [
       { host: '1.2.3.4', port: 1080, username: 'alice:region', password: 'secret' },
       { host: '1.2.3.4', port: 1080, username: 'alice', password: 'region:secret' },
@@ -39,7 +39,7 @@ test('import: structured credentials containing colons do not collide, equivalen
   })
   assert.equal(result.added, 2)
   assert.equal(result.skipped, 0)
-  const duplicate = pool.importLines('socks5://alice:region%3Asecret@1.2.3.4:1080')
+  const duplicate = await pool.importLines('socks5://alice:region%3Asecret@1.2.3.4:1080')
   assert.equal(duplicate.added, 0)
   assert.equal(duplicate.skipped, 1)
 })
