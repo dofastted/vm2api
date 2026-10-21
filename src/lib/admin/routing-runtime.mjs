@@ -723,8 +723,8 @@ export function createRoutingRuntime(ctx) {
       attemptsRepo,
       rateLimitService,
       config: routingConfig.failover || {},
-      onProxyFailure: (vmId, reason) => {
-        ctx.proxyPool.reportRuntimeFailure(vmId, reason)
+      onProxyFailure: async (vmId, reason) => {
+        await ctx.proxyPool.reportRuntimeFailure(vmId, reason)
       },
       onFablePlanDenied: ({ selected }) => {
         const accountId = selected?.accountId

@@ -3357,7 +3357,7 @@ export function createPanelHandler(ctx) {
         } catch {}
         // detach this VM only — do not unbind other slots sharing the SOCKS5
         try {
-          proxyPool.unbindVm(id)
+          await proxyPool.unbindVm(id)
         } catch {}
         // remove cli-home
         try {
@@ -3408,7 +3408,7 @@ export function createPanelHandler(ctx) {
           } catch {}
           if (!hasBoundExit(vm.proxy)) {
             try {
-              const allocated = proxyPool.allocateForVm(id)
+              const allocated = await proxyPool.allocateForVm(id)
               if (allocated) {
                 bindVmProxy(cfg.paths.project, id, proxyPool.getProxyForVm(id))
                 adoptVmProxyBinding(vm, getVm(cfg.paths.project, id))
@@ -4046,7 +4046,7 @@ export function createPanelHandler(ctx) {
         let pickedProxyId = typeof body.proxy_id === 'string' ? body.proxy_id.trim() : ''
         if (pickedProxyId && isLocalEgressId(pickedProxyId)) {
           // Local egress is per VPS: a generic pick resolves to the target machine's own row.
-          const resolved = proxyPool.resolveLocalTarget(pickedProxyId, nodeId || null)
+          const resolved = await proxyPool.resolveLocalTarget(pickedProxyId, nodeId || null)
           if (!resolved.ok) {
             return json(res, 409, {
               ok: false,
@@ -4228,12 +4228,12 @@ export function createPanelHandler(ctx) {
         const hasExit = (v) => !!(v?.proxy?.url || isLocalEgressProxy(v?.proxy))
         if (wantProxy && !hasExit(vm)) {
           if (pickedProxyId) {
-            const bound = proxyPool.bind(pickedProxyId, id)
+            const bound = await proxyPool.bind(pickedProxyId, id)
             if (bound.ok) allocated = bound.proxy
             else proxyError = bound.error || 'proxy_bind_failed'
           } else {
             try {
-              allocated = proxyPool.allocateForVm(id, {
+              allocated = await proxyPool.allocateForVm(id, {
                 ownerUserId: vm.owner_user_id || null,
                 role: ident.role,
               })
@@ -5515,10 +5515,10 @@ export function createPanelHandler(ctx) {
         return json(res, 200, panel.ok(snap))
       }
       if (req.method === 'POST' && p === '/api/panel/proxies/local') {
-        const result = proxyPool.ensureLocal()
+        const result = await proxyPool.ensureLocal()
         if (result.created) await ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(result.proxy.id))
         // Enabling local egress on a cluster that already has nodes: each VPS gets its row now.
-        proxyPool.syncLocalNodes(clusterNodesOf(ctx).map((node) => node.id))
+        await proxyPool.syncLocalNodes(clusterNodesOf(ctx).map((node) => node.id))
         return json(res, 200, panel.ok(result))
       }
       if (req.method === 'POST' && p === '/api/panel/proxies/import') {
@@ -5529,7 +5529,7 @@ export function createPanelHandler(ctx) {
         if (bindVmId && userMissesVmId(req, cfg.paths.project, bindVmId)) {
           return json(res, 404, { ok: false, error: { message: 'vm not found' } })
         }
-        const result = proxyPool.importLines(text, {
+        const result = await proxyPool.importLines(text, {
           fields: body.proxies || body.entries || null,
           host: body.host,
           port: body.port,
@@ -5541,7 +5541,7 @@ export function createPanelHandler(ctx) {
         let worker = null
         let timezone = null
         if (bindVmId && result.items?.[0]?.id) {
-          const bind = proxyPool.bind(result.items[0].id, bindVmId)
+          const bind = await proxyPool.bind(result.items[0].id, bindVmId)
           if (bind.ok) {
             bindVmProxy(cfg.paths.project, bindVmId, proxyPool.getProxyForVm(bindVmId))
             bound = bind.proxy
@@ -5581,7 +5581,7 @@ export function createPanelHandler(ctx) {
       if (req.method === 'PUT' && p === '/api/panel/proxies/config') {
         const body = await readBody(req, 64 * 1024)
         const previousConfig = proxyPool.snapshot().config
-        const result = proxyPool.updateConfig(body)
+        const result = await proxyPool.updateConfig(body)
         if (!result.ok)
           return json(res, 400, {
             ok: false,
@@ -5624,7 +5624,7 @@ export function createPanelHandler(ctx) {
         for (const key of ['host', 'port', 'username', 'password', 'label', 'domain_forward']) {
           if (Object.prototype.hasOwnProperty.call(body, key)) patch[key] = body[key]
         }
-        const result = proxyPool.update(id, patch)
+        const result = await proxyPool.update(id, patch)
         if (!result.ok) {
           const status = result.error === 'proxy_not_found' ? 404 : 400
           const type = status === 404 ? 'not_found_error' : 'invalid_request_error'
@@ -5749,7 +5749,7 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'POST' && /^\/api\/panel\/proxies\/[^/]+\/enable$/.test(p)) {
         const id = p.split('/')[4]
-        const result = proxyPool.setEnabled(id, true)
+        const result = await proxyPool.setEnabled(id, true)
         if (!result.ok)
           return json(res, 404, {
             ok: false,
@@ -5768,7 +5768,7 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'POST' && /^\/api\/panel\/proxies\/[^/]+\/disable$/.test(p)) {
         const id = p.split('/')[4]
-        const result = proxyPool.setEnabled(id, false)
+        const result = await proxyPool.setEnabled(id, false)
         if (!result.ok)
           return json(res, 404, {
             ok: false,
@@ -5785,7 +5785,7 @@ export function createPanelHandler(ctx) {
             ok: false,
             error: { type: 'invalid_request_error', code: 'missing_field', message: 'vm_id required', param: 'vm_id' },
           })
-        const result = proxyPool.bind(id, vmId)
+        const result = await proxyPool.bind(id, vmId)
         if (!result.ok) {
           const message =
             result.error === 'proxy_bind_limit'
@@ -5830,7 +5830,7 @@ export function createPanelHandler(ctx) {
             : snap?.bound_vm_id
               ? [snap.bound_vm_id]
               : []
-        const result = proxyPool.unbind(id, vmId || null)
+        const result = await proxyPool.unbind(id, vmId || null)
         if (!result.ok)
           return json(res, 404, {
             ok: false,
@@ -5849,7 +5849,7 @@ export function createPanelHandler(ctx) {
         const id = p.split('/').pop()
         const snap = proxyPool.snapshot().proxies.find((proxy) => proxy.id === id)
         const targets = snap?.bound_vm_ids?.length ? snap.bound_vm_ids : snap?.bound_vm_id ? [snap.bound_vm_id] : []
-        const result = proxyPool.remove(id)
+        const result = await proxyPool.remove(id)
         if (!result.ok)
           return json(res, 404, {
             ok: false,
@@ -5865,7 +5865,7 @@ export function createPanelHandler(ctx) {
       // Auto-allocate proxy for a VM
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/allocate-proxy$/.test(p)) {
         const vmId = p.split('/')[4]
-        const allocated = proxyPool.allocateForVm(vmId)
+        const allocated = await proxyPool.allocateForVm(vmId)
         if (!allocated)
           return json(res, 409, {
             ok: false,

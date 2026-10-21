@@ -370,7 +370,7 @@ export async function powerOnSlot({ projectRoot, id, proxyPool, routing = {}, fi
   } catch (error) {
     return { ok: false, status: 400, code: error.code, error: error.message }
   }
-  const bound = proxyPool.ensureBoundToVm(id, vm.proxy?.id || null)
+  const bound = await proxyPool.ensureBoundToVm(id, vm.proxy?.id || null)
   if (!bound) {
     return { ok: false, status: 409, code: 'proxy_required', error: 'No SOCKS5 is bound or free for this VM' }
   }

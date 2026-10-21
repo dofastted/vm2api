@@ -52,7 +52,11 @@ for (const kind of ['update', 'disable']) {
     try {
       await entered.promise
       await setImmediate()
-      assert.equal(response, undefined, 'an unfinished database write cannot produce a success or false failure response')
+      assert.equal(
+        response,
+        undefined,
+        'an unfinished database write cannot produce a success or false failure response',
+      )
     } finally {
       persist.resolve()
       await operation

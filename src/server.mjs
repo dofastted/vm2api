@@ -437,7 +437,7 @@ proxyPool.startScheduler()
 // 首次安装的出口池是空的，槽没有可绑出口就起不来。本机出口永远成立，先补上。
 try {
   if (!proxyPool.snapshot().proxies?.length) {
-    const seeded = proxyPool.ensureLocal()
+    const seeded = await proxyPool.ensureLocal()
     if (seeded.created) {
       void (await ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(seeded.proxy.id)))
       console.log('[bootstrap] seeded local egress px-local')
@@ -817,6 +817,7 @@ async function requireAuth(req, res) {
     refreshModelPolicy(snapshot.model_policy)
     refreshGptModelPolicy(snapshot.gpt_model_policy)
     invalidatePriceCatalog()
+    await proxyPool.refresh?.()
   }
   // Panel session
   const session = await verifyPanelSession(token)
@@ -1006,10 +1007,10 @@ const responsesWs = createResponsesWsHandler({
  * another machine's row (the shared px-local before per-node rows) move onto
  * their own node's row, with the slot's recorded proxy rewritten to match.
  */
-function syncNodeLocalEgress() {
+async function syncNodeLocalEgress() {
   try {
-    proxyPool.syncLocalNodes(clusterManager.list().map((node) => node.id))
-    for (const move of proxyPool.adoptNodeLocalBindings()) {
+    await proxyPool.syncLocalNodes(clusterManager.list().map((node) => node.id))
+    for (const move of await proxyPool.adoptNodeLocalBindings()) {
       bindVmProxy(cfg.paths.project, move.vm_id, proxyPool.getProxyByIdWithAuth(move.to))
       console.log(`[local-egress] ${move.vm_id}: ${move.from} -> ${move.to}`)
     }
@@ -1050,7 +1051,7 @@ bindPlacement({ manager: clusterManager, projectRoot: cfg.paths.project })
 await startNodeEgressSocks({ clientFor: (nodeId) => clusterManager.client(nodeId) })
 await clusterManager.start()
 clusterManager.restoreSlotRelays()
-syncNodeLocalEgress()
+await syncNodeLocalEgress()
 if (proxyPool.snapshot().config.ipv6_enabled !== true) {
   const exits = await syncIpv6ProxyEgress(cfg.paths.project, proxyPool)
   for (const exit of exits.filter((item) => !item.ok)) {
