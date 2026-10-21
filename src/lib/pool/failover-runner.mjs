@@ -21,6 +21,8 @@ import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
 import { resolveOfficialCcInference } from '../vm/slot-engine.mjs'
 import { AttemptCoordinator } from './unit-decision.mjs'
 import { SOFT_COOLDOWN_REASONS } from './pool-scheduler.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { SharedSessionTurns } from './shared-session-turns.mjs'
 
 // Seat wait for the one-shot repair hop when the rejected hop already spent the deadline.
 const REPAIR_HOP_WAIT_MS = 30_000
@@ -235,11 +237,11 @@ function classifyAttempt(
   })
 }
 
-function notifyProxyFailure(onProxyFailure, selected, policy) {
+async function notifyProxyFailure(onProxyFailure, selected, policy) {
   if (policy?.reason !== 'proxy_transport_failure') return
   if (typeof onProxyFailure !== 'function') return
   try {
-    onProxyFailure(selected?.vmId, policy.reason)
+    await onProxyFailure(selected?.vmId, policy.reason)
   } catch {
     /* control-plane disconnect is best-effort */
   }
@@ -444,6 +446,7 @@ export class FailoverRunner {
     stickyRouter = null,
     attemptsRepo = null,
     rateLimitService = null,
+    sessionTurns = null,
     config = {},
     onProxyFailure = null,
     onCredentialFailure = null,
@@ -460,6 +463,8 @@ export class FailoverRunner {
     this.onFablePlanDenied = onFablePlanDenied
     this.onFableSuccess = onFableSuccess
     this.sessionTails = new Map()
+    this.sessionTurns = sessionTurns
+    this.sharedSessions = isKubernetesMode()
     this.searchRepairs = new Map()
   }
 
@@ -538,6 +543,7 @@ export class FailoverRunner {
   async run(args = {}) {
     const sessionKey = String(args.stickyKey || '')
     if (!sessionKey) return await this.runOnce(args)
+    if (this.sharedSessions || this.sessionTurns) return this.runSharedSession(sessionKey, args)
     const previous = this.sessionTails.get(sessionKey) || Promise.resolve()
     let releaseTurn
     const turn = new Promise((resolve) => {
@@ -567,6 +573,42 @@ export class FailoverRunner {
         if (this.sessionTails.get(sessionKey) === tail) this.sessionTails.delete(sessionKey)
       }
       tail.then(drop, drop)
+    }
+  }
+
+  async runSharedSession(sessionKey, args) {
+    this.sessionTurns ||= new SharedSessionTurns(
+      this.scheduler?.executionAdmissions?.db || this.scheduler?.accountQuota?.db,
+    )
+    let turn
+    try {
+      turn = await this.sessionTurns.acquire(sessionKey, {
+        requestId: args.requestId,
+        signal: args.signal,
+        timeoutMs: this.config.session_queue_timeout_ms,
+      })
+    } catch (error) {
+      if (error?.code === 'request_cancelled') return clientCancelledResult()
+      if (error?.code === 'session_queue_timeout') {
+        const retryMs = Number(this.config.session_queue_timeout_ms)
+        return poolOverloadedError({
+          reason: 'session_queue_timeout',
+          retry_after_ms: Number.isFinite(retryMs) && retryMs > 0 ? retryMs : 1000,
+        })
+      }
+      throw error
+    }
+    try {
+      const result = await this.runOnce(args)
+      // runOnce awaits selected.release in its finally before resolving.
+      if (result?.executionUncertain) await turn.markUncertain()
+      else await turn.release()
+      return result
+    } catch (error) {
+      // A thrown attempt or release can leave an execution active. Connection
+      // loss and HTTP cancellation do not provide proof that it ended.
+      await turn.markUncertain()
+      throw error
     }
   }
 
@@ -912,7 +954,7 @@ export class FailoverRunner {
           lastResult = result
           lastPolicy = policy
           this.noteUnitHealth(selected, policy, result)
-          notifyProxyFailure(this.onProxyFailure, selected, policy)
+          await notifyProxyFailure(this.onProxyFailure, selected, policy)
           if (policy.reason === 'fable_plan_denied' && typeof this.onFablePlanDenied === 'function') {
             try {
               this.onFablePlanDenied({ selected, policy })
@@ -1018,6 +1060,7 @@ export class FailoverRunner {
             })
             return {
               ok: false,
+              ...(unknownExecution ? { executionUncertain: true } : {}),
               responseSent: true,
               status: 403,
               via: 'account-scope',
@@ -1038,6 +1081,7 @@ export class FailoverRunner {
             })
             return {
               ok: false,
+              ...(unknownExecution ? { executionUncertain: true } : {}),
               status: 400,
               body: error.body,
               terminalState: 'invalid_request',
@@ -1091,7 +1135,7 @@ export class FailoverRunner {
           lastResult = result
           lastPolicy = policy
           this.noteUnitHealth(selected, policy, result)
-          notifyProxyFailure(this.onProxyFailure, selected, policy)
+          await notifyProxyFailure(this.onProxyFailure, selected, policy)
           await this.attemptsRepo?.complete?.(requestId, attemptNo, {
             upstreamStatus: 0,
             errorScope: policy.scope,

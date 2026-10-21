@@ -79,6 +79,23 @@ async function fixture(t) {
   }
 }
 
+test('a runner can use an explicitly injected shared turn service', async (t) => {
+  const fx = await fixture(t)
+  const { SharedSessionTurns } = await import('../../src/lib/pool/shared-session-turns.mjs')
+  const service = new SharedSessionTurns(fx.other, { ownerId: 'injected-controller' })
+  const runner = fx.runner(fx.db, { sessionTurns: service })
+  const result = await runner.run(
+    args('injected', async () => {
+      const rows = await fx.rows()
+      assert.equal(rows[0].owner_id, 'injected-controller')
+      assert.equal(rows[0].state, 'active')
+      return success()
+    }),
+  )
+  assert.equal(result.ok, true)
+  assert.deepEqual(await fx.rows(), [])
+})
+
 test('independent runners serialize one session in database FIFO order and await reservation release', async (t) => {
   const fx = await fixture(t)
   const entered = deferred()
@@ -163,7 +180,7 @@ test('waiting cancellation and timeout remove only their own records without ove
   const entered = deferred()
   const finish = deferred()
   const first = fx.runner(fx.db)
-  const second = fx.runner(fx.other, { timeout: 50 })
+  const second = fx.runner(fx.other)
   const holder = first.run(
     args('holder', async () => {
       entered.resolve()
@@ -181,7 +198,9 @@ test('waiting cancellation and timeout remove only their own records without ove
     await until(async () => (await fx.rows()).some((row) => row.request_id === 'cancelled'))
     controller.abort()
     assert.equal((await cancelled).clientCancelled, true)
-    const timedOut = await second.run(args('timed-out', () => assert.fail('a timed out waiter cannot execute')))
+    const timedOut = await fx
+      .runner(fx.other, { timeout: 100 })
+      .run(args('timed-out', () => assert.fail('a timed out waiter cannot execute')))
     assert.equal(timedOut.status, 529)
     assert.equal(timedOut.body.error.details.reason, 'session_queue_timeout')
     assert.deepEqual(
