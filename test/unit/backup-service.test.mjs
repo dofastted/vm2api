@@ -113,7 +113,7 @@ test('restoring a PG 001 snapshot removes later tables before reapplying current
   ]) {
     assert.equal((await db.prepare(`SELECT count(*) AS n FROM ${name}`).get()).n, 0)
   }
-  assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 15)
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 18)
 })
 
 test('an outside dependency refuses older-snapshot cleanup without changing either schema', async () => {
