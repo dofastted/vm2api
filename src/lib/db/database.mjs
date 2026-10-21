@@ -270,7 +270,7 @@ async function verifyCurrentMigrations(db, { migrationsDir = MIGRATIONS_DIR } = 
     ])
     const present = (
       await db.query('SELECT to_regnamespace($1) IS NOT NULL AND to_regclass($2) IS NOT NULL AS ready', [
-        db.schema,
+        quoteIdentifier(db.schema),
         `${quoteIdentifier(db.schema)}.schema_migrations`,
       ])
     ).rows[0]
