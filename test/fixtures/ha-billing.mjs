@@ -48,7 +48,9 @@ export async function billingRequest(f, callback = async () => {}, { snapshot = 
   const data = { nodeBinding, commandIds: [] }
   await f.originalGate.run(() => withHaRequestContext({ db: f.db, requestId: 'billing-parent', activity: f.originalGate, recoveryKind: 'claude_messages' }, async () => {
     data.keys = new ApiKeyStore({ db: f.db })
-    data.key = await data.keys.create({ name: 'synthetic-billing-key' })
+    const now = new Date().toISOString()
+    data.user = await data.keys.users.insert({ id: 'synthetic-billing-user', username: 'synthetic-billing-user', password_hash: 'synthetic-test-only', role: 'user', balance: 123, concurrency: 4, created_at: now, updated_at: now })
+    data.key = await data.keys.create({ name: 'synthetic-billing-key', user_id: data.user.id })
     data.reservation = await data.keys.reserve(data.key)
     data.admission = await new ExecutionAdmissionsRepo(f.db).tryReserve({ accountId: 'fixture-account', vmId: 'vm-fixture', accountLimit: 5, vmLimit: 5, fableLimit: 0, rpmLimit: 0 })
     for (let attempt = 1; attempt <= jobs; attempt++) {
