@@ -1,0 +1,126 @@
+{
+  "verified_commit": "bf9f508dc0f7bb7232a6ed0fd1a0bcdf6e85a5f1",
+  "baseline_commit": "eee8f6ecb6ca04455e6edef0c8e498fb3be21f21",
+  "assertions": [
+    {
+      "file": "test/e2e/account-pool-failover.e2e.test.mjs",
+      "test": "account1 quota exhaustion rotates to account2 and commits sticky final account",
+      "assertion_sha256": "b94b33d5b07ef7a98da1199dde49d3bb8be79daed51ca7d5c01ce3002d3e4811",
+      "baseline_assertion_sha256": "b94b33d5b07ef7a98da1199dde49d3bb8be79daed51ca7d5c01ce3002d3e4811",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/e2e/auto-mode.e2e.test.mjs",
+      "test": "classifier terminal/error/cancel/concurrency boundaries through actual ELF",
+      "assertion_sha256": "e736744c0afda8b9160312af46c31dfde85514afaf09a5d1a97575b09101da15",
+      "baseline_assertion_sha256": "e736744c0afda8b9160312af46c31dfde85514afaf09a5d1a97575b09101da15",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/e2e/completions.e2e.test.mjs",
+      "test": "POST /v1/completions old OpenAI prompt format",
+      "assertion_sha256": "5bff2f11fcb7ad2b0c71a78cf620dc3070ecddd3a78d954956a32c006ff887f4",
+      "baseline_assertion_sha256": "5bff2f11fcb7ad2b0c71a78cf620dc3070ecddd3a78d954956a32c006ff887f4",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/e2e/credentials.e2e.test.mjs",
+      "test": "reset destroys home and recreates the same slot without oauth",
+      "assertion_sha256": "5e6c5a7d2769e0e83c04a4a727c75808b0e1592375b77a815a02b9677de5c477",
+      "baseline_assertion_sha256": "5e6c5a7d2769e0e83c04a4a727c75808b0e1592375b77a815a02b9677de5c477",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/e2e/crs-default.e2e.test.mjs",
+      "test": "default POST /v1/messages uses Go worker pool, not CLI",
+      "assertion_sha256": "5bff2f11fcb7ad2b0c71a78cf620dc3070ecddd3a78d954956a32c006ff887f4",
+      "baseline_assertion_sha256": "5bff2f11fcb7ad2b0c71a78cf620dc3070ecddd3a78d954956a32c006ff887f4",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/e2e/errors.e2e.test.mjs",
+      "test": "unknown model is rejected without hop",
+      "assertion_sha256": "6a63caf64d29521ed813c597ef288b59270dd6cd3789d4c2a11fe430f2ef95f3",
+      "baseline_assertion_sha256": "6a63caf64d29521ed813c597ef288b59270dd6cd3789d4c2a11fe430f2ef95f3",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/e2e/health.e2e.test.mjs",
+      "test": "harness /health 200 and honest capabilities",
+      "assertion_sha256": "858fac7a2bd27316ba43e74a56d0ae6e0bcf45a553d8ecc3da006bfc0a768afb",
+      "baseline_assertion_sha256": "858fac7a2bd27316ba43e74a56d0ae6e0bcf45a553d8ecc3da006bfc0a768afb",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/e2e/hermes.e2e.test.mjs",
+      "test": "Hermes unofficial: Go relay keeps persona/tools and never launches CLI",
+      "assertion_sha256": "fc9f564f4db729f7ec444eca13379843ea4c861646e4d21c6c7fdac8b629e390",
+      "baseline_assertion_sha256": "fc9f564f4db729f7ec444eca13379843ea4c861646e4d21c6c7fdac8b629e390",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/e2e/hermes.e2e.test.mjs",
+      "test": "Hermes system blob without UA still classifies as hermes",
+      "assertion_sha256": "1c1ddb4f06cf94c9408f62e32d5a13a572bceccc1b0acdb5eb9f04acb2a8538b",
+      "baseline_assertion_sha256": "1c1ddb4f06cf94c9408f62e32d5a13a572bceccc1b0acdb5eb9f04acb2a8538b",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/e2e/hop-meta.e2e.test.mjs",
+      "test": "CRS default keeps thinking + max_tokens + temperature in official body",
+      "assertion_sha256": "9a16b07bbe941aca1d5d3d2cac804b9f432fea6f74a28b38cceaadabc1af53a4",
+      "baseline_assertion_sha256": "9a16b07bbe941aca1d5d3d2cac804b9f432fea6f74a28b38cceaadabc1af53a4",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/e2e/hop-meta.e2e.test.mjs",
+      "test": "CRS keeps a long caller system in the structured official prompt",
+      "assertion_sha256": "d435dea7913cfa24178f66420d521003431251d6b764517887968b26f123a027",
+      "baseline_assertion_sha256": "d435dea7913cfa24178f66420d521003431251d6b764517887968b26f123a027",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/e2e/hop-meta.e2e.test.mjs",
+      "test": "legacy CLI selector cannot drop HTTP request parameters",
+      "assertion_sha256": "9a16b07bbe941aca1d5d3d2cac804b9f432fea6f74a28b38cceaadabc1af53a4",
+      "baseline_assertion_sha256": "9a16b07bbe941aca1d5d3d2cac804b9f432fea6f74a28b38cceaadabc1af53a4",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/e2e/messages.e2e.test.mjs",
+      "test": "HTTP worker preserves thinking, sampling and max_tokens",
+      "assertion_sha256": "0af5a9fd20a0a5f8cdfa29b648678f9284a376f484b82d04a1a0230bdf6aa41b",
+      "baseline_assertion_sha256": "0af5a9fd20a0a5f8cdfa29b648678f9284a376f484b82d04a1a0230bdf6aa41b",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/e2e/messages.e2e.test.mjs",
+      "test": "HTTP path preserves long system without CLI argv truncation",
+      "assertion_sha256": "5af4ac27ac1e335b2217102a235b4901fbcf18d33188d54a12497261e6e87049",
+      "baseline_assertion_sha256": "5af4ac27ac1e335b2217102a235b4901fbcf18d33188d54a12497261e6e87049",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/e2e/openai-responses.e2e.test.mjs",
+      "test": "POST /v1/responses non-stream shape: object + output_text + usage",
+      "assertion_sha256": "152e5bc121c8a068b2003c5d9e4ce943560281dba6f96f1b238eb1b3e89a2eb7",
+      "baseline_assertion_sha256": "152e5bc121c8a068b2003c5d9e4ce943560281dba6f96f1b238eb1b3e89a2eb7",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/e2e/openai-responses.e2e.test.mjs",
+      "test": "POST /v1/responses stream includes [DONE]",
+      "assertion_sha256": "017b08bb23fcae3cb2a5bb334bf68a032eedf15572fce0c3f585154b3b940833",
+      "baseline_assertion_sha256": "017b08bb23fcae3cb2a5bb334bf68a032eedf15572fce0c3f585154b3b940833",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/e2e/openai-responses.e2e.test.mjs",
+      "test": "POST /v1/responses tools → function_call in output",
+      "assertion_sha256": "152e5bc121c8a068b2003c5d9e4ce943560281dba6f96f1b238eb1b3e89a2eb7",
+      "baseline_assertion_sha256": "152e5bc121c8a068b2003c5d9e4ce943560281dba6f96f1b238eb1b3e89a2eb7",
+      "matches_baseline": true
+    }
+  ],
+  "all_failures_match_baseline": true
+}

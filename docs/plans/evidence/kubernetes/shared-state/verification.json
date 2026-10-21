@@ -1,0 +1,55 @@
+{
+  "source_commit": "bf9f508dc0f7bb7232a6ed0fd1a0bcdf6e85a5f1",
+  "scope": "shared key/user admission, token buckets and selected configuration caches; active-active control plane remains unimplemented",
+  "node": "22.23.2",
+  "postgresql": "17.11",
+  "checks": {
+    "unit": {
+      "verified_commit": "f4ff7004530791b877cc7ac27971596628e42d13",
+      "files": 291,
+      "exit_code": 1,
+      "log_sha256": "088eae935b5c46a2c994b1345b4cbfebbba56132cf7522926c9644d6a30ae0b9",
+      "totals": {
+        "tests": 3408,
+        "pass": 3390,
+        "fail": 8,
+        "cancelled": 0,
+        "skipped": 10
+      },
+      "non_baseline_failure": {
+        "file": "test/unit/slot-shell-rc.test.mjs",
+        "test": "official login tickets check a cluster slot for its container cli-node",
+        "actual": "cli_node_missing",
+        "expected": "container_not_ready",
+        "classification": "test consulted running host container rather than synthetic stopped-container state",
+        "test_fix_commit": "5abd21d95da3eb18f0b9a2b06b179ff96983f744",
+        "directed_after_fix": {
+          "tests": 19,
+          "pass": 19,
+          "fail": 0
+        },
+        "full_unit_after_test_fix_rerun": false
+      }
+    },
+    "e2e": {
+      "verified_commit": "bf9f508dc0f7bb7232a6ed0fd1a0bcdf6e85a5f1",
+      "files": 28,
+      "exit_code": 1,
+      "log_sha256": "3d7dc174461c1b76667706bf054311ffc3b3fc69beb6d491a8b081570f0d97e6",
+      "totals": {
+        "tests": 121,
+        "pass": 103,
+        "fail": 17,
+        "cancelled": 0,
+        "skipped": 1
+      }
+    }
+  },
+  "runtime_deployment_performed": false,
+  "limitations": [
+    "account/VM/seat/session global admission remains unimplemented",
+    "executor fencing and safe orphan recovery remain unimplemented",
+    "background tasks, routing and full-snapshot write conflicts remain uncoordinated",
+    "no multi-node active replicas, HPA or rollout validation"
+  ]
+}

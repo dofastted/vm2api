@@ -1,0 +1,56 @@
+{
+  "verified_commit": "bf9f508dc0f7bb7232a6ed0fd1a0bcdf6e85a5f1",
+  "baseline_commit": "eee8f6ecb6ca04455e6edef0c8e498fb3be21f21",
+  "assertions": [
+    {
+      "file": "test/unit/cli-hop-body.test.mjs",
+      "test": "prepareCliHopBody drops metadata and CLI-owned system but keeps official agent leftover",
+      "assertion_sha256": "4e6c294bbe40bd85115a154e355bc81e5b21e3e781d2e0dcd1feafcd85a57181",
+      "baseline_assertion_sha256": "4e6c294bbe40bd85115a154e355bc81e5b21e3e781d2e0dcd1feafcd85a57181",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/unit/cli-hop-body.test.mjs",
+      "test": "every cli-hop system becomes the identity plus the caller body",
+      "assertion_sha256": "a81c34c8c33c94dae4bef4af01c4db186fa7431766e106dedb0c93fac4a3f55b",
+      "baseline_assertion_sha256": "a81c34c8c33c94dae4bef4af01c4db186fa7431766e106dedb0c93fac4a3f55b",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/unit/cli-hop-body.test.mjs",
+      "test": "cli-hop normalizes mixed caller markers to the official template",
+      "assertion_sha256": "a81c34c8c33c94dae4bef4af01c4db186fa7431766e106dedb0c93fac4a3f55b",
+      "baseline_assertion_sha256": "a81c34c8c33c94dae4bef4af01c4db186fa7431766e106dedb0c93fac4a3f55b",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/unit/cli-hop-body.test.mjs",
+      "test": "cli-hop drops caller system/tools markers and restamps last plus penultimate user",
+      "assertion_sha256": "e37b9c82cfabec8b2d18adaf338ef1368f30e11e38cd9e46c5f5d2d212ec2d11",
+      "baseline_assertion_sha256": "e37b9c82cfabec8b2d18adaf338ef1368f30e11e38cd9e46c5f5d2d212ec2d11",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/unit/cli-hop-body.test.mjs",
+      "test": "cli-hop short history only marks the last message",
+      "assertion_sha256": "f68c71379df4d2ba7748acb814268e5f1dcc6590c86098766cf66043bb9fdf9d",
+      "baseline_assertion_sha256": "f68c71379df4d2ba7748acb814268e5f1dcc6590c86098766cf66043bb9fdf9d",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/unit/cli-hop-body.test.mjs",
+      "test": "cli-hop uses the inbound session TTL on both message anchors",
+      "assertion_sha256": "5044751390e94cf06d620d10ac9c06e61d7a6a9d27b67bf37eb9711fa14b24ca",
+      "baseline_assertion_sha256": "5044751390e94cf06d620d10ac9c06e61d7a6a9d27b67bf37eb9711fa14b24ca",
+      "matches_baseline": true
+    },
+    {
+      "file": "test/unit/convert-cache-shape.test.mjs",
+      "test": "openai.chat multi-turn cli-hop marks last and penultimate user",
+      "assertion_sha256": "a81c34c8c33c94dae4bef4af01c4db186fa7431766e106dedb0c93fac4a3f55b",
+      "baseline_assertion_sha256": "a81c34c8c33c94dae4bef4af01c4db186fa7431766e106dedb0c93fac4a3f55b",
+      "matches_baseline": true
+    }
+  ],
+  "all_failures_match_baseline": true
+}
