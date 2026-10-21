@@ -593,7 +593,7 @@ function hasExactLayer(platform, id, catalog) {
   )
 }
 
-export function resolvePrice(rawModel) {
+export function resolvePrice(rawModel, { refresh = true } = {}) {
   const platform = platformOfModel(rawModel)
   const candidates = catalogIdCandidates(rawModel, platform)
   const catalog = loadCatalog()
@@ -610,7 +610,7 @@ export function resolvePrice(rawModel) {
     const got = candidates.length ? resolveLayers(p, candidates[0], catalog) : null
     if (got) return got
   }
-  maybeRefreshModelsDev()
+  if (refresh) maybeRefreshModelsDev()
   return null
 }
 

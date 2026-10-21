@@ -5,6 +5,7 @@ import { readWatchdogState } from '../../transport/kernel-watchdog-state.mjs'
 import { ExecutionCircuitsRepo } from './execution-circuits-repo.mjs'
 import { normalizeNodeBinding, normalizeNodeCompletion, sameNodeBinding } from '../../core/node-execution-proof.mjs'
 import { lockHaRequestContext } from '../../core/ha-request-context.mjs'
+import { normalizeHaBillingSnapshot } from '../../core/ha-request-billing.mjs'
 
 function invalid(field) {
   return Object.assign(new Error(`Invalid execution admission ${field}`), { code: 'invalid_execution_admission' })
@@ -212,6 +213,8 @@ export class ExecutionAdmissionsRepo {
 
   async bindExecution(handle, execution) {
     const nodeBinding = execution?.nodeBinding === undefined ? null : normalizeNodeBinding(execution.nodeBinding)
+    const billingSnapshot =
+      execution?.billingSnapshot == null ? null : normalizeHaBillingSnapshot(execution.billingSnapshot)
     return withTransaction(this.db, async () => {
       const context = await lockHaRequestContext(this.db)
       const before = await this.db
@@ -255,7 +258,7 @@ export class ExecutionAdmissionsRepo {
         .get(handle.admissionId)
       if (pending) throw jobError('execution_job_pending')
       const row = await this.db
-        .prepare(`INSERT INTO execution_jobs (request_id, admission_id, node_binding, ha_request_id, attempt_no) VALUES ($1, $2, $3::jsonb, $4, $5)
+        .prepare(`INSERT INTO execution_jobs (request_id, admission_id, node_binding, ha_request_id, attempt_no, billing_snapshot) VALUES ($1, $2, $3::jsonb, $4, $5, $6::jsonb)
         ON CONFLICT (request_id) DO NOTHING RETURNING request_id`)
         .get(
           execution.requestId,
@@ -263,6 +266,7 @@ export class ExecutionAdmissionsRepo {
           nodeBinding ? JSON.stringify(nodeBinding) : null,
           context?.requestId ?? null,
           context?.attemptNo ?? null,
+          context && billingSnapshot ? JSON.stringify(billingSnapshot) : null,
         )
       if (!row) throw jobError('execution_job_exists')
       return {

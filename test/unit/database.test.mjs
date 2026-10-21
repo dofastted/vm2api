@@ -35,7 +35,7 @@ after(async () => {
 test('PostgreSQL baseline includes business and historical tables and default groups', async () => {
   const db = await database()
   const rows = await db.prepare('SELECT table_name FROM information_schema.tables WHERE table_schema=$1').all(db.schema)
-  assert.equal(rows.length, 43)
+  assert.equal(rows.length, 44)
   for (const name of [
     'settings',
     'users',
@@ -53,6 +53,7 @@ test('PostgreSQL baseline includes business and historical tables and default gr
     'execution_seats',
     'execution_jobs',
     'ha_request_contexts',
+    'ha_request_settlements',
     'session_turns',
     'vm_operations',
     'background_task_runs',
@@ -118,7 +119,7 @@ test('concurrent initialization serializes migrations and checksums are enforced
   const opts = options()
   const [a, b] = await Promise.all([createDatabase(opts), createDatabase(opts)])
   dbs.push(a, b)
-  assert.equal((await a.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 20)
+  assert.equal((await a.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 21)
   await a.prepare("UPDATE schema_migrations SET checksum='invalid'").run()
   await assert.rejects(applyMigrations(b), /checksum mismatch/)
 })
@@ -134,7 +135,7 @@ test('failed migrations rollback DDL and migration records', async () => {
   }
   await assert.rejects(applyMigrations(db, { migrationsDir: dir }), /999_bad.sql failed/)
   assert.equal((await db.prepare('SELECT to_regclass($1) AS name').get(db.schema + '.partial_write')).name, null)
-  assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 20)
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 21)
   fs.rmSync(dir, { recursive: true, force: true })
 })
 

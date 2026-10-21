@@ -179,9 +179,14 @@ function selectBand(price, mode, prompt) {
  * After normalizeUsage, input_tokens is the uncached bucket for every vendor.
  */
 export function calculateCost(usage = {}, model = null) {
+  const mid = model || usage?.model || usage?.upstream_model || usage?.requested_model || ''
+  return calculateCostAtPrice(usage, model, resolvePrice(mid))
+}
+
+/** Same billing bands, using a previously captured price rather than the current catalog. */
+export function calculateCostAtPrice(usage = {}, model = null, resolved = null) {
   const u = normalizeUsage(usage)
   const mid = model || u.model || u.upstream_model || u.requested_model || ''
-  const resolved = resolvePrice(mid)
   const outputTokens = n(u.output_tokens)
   const cacheRead = n(u.cache_read_tokens)
   const { cache5m, cache1h } = cacheSplit(u)
