@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import { getDb } from '../../src/lib/db/database.mjs'
 import { withDatabaseActivities } from '../maintenance-fixture.mjs'
 import { ClusterManager } from '../../src/lib/cluster/cluster-manager.mjs'
@@ -27,7 +28,10 @@ async function fixture(t) {
     onLinkState: async () => sql('state'),
     onNodesChanged: async () => sql('nodes'),
   })
-  manager.remoteHost = async () => sql('host')
+  manager.remoteHost = async () => {
+    await sql('host')
+    return { root: '/synthetic' }
+  }
   manager._checkHealth = async () => sql('health')
   manager._ensureGate = async () => sql('gate')
   t.mock.method(SshLink.prototype, 'start', () => {})
@@ -73,4 +77,41 @@ test('node change hooks await asynchronous persistence in a fresh activity', asy
   const fx = await fixture(t)
   await fx.manager._nodesChanged()
   assert.deepEqual(fx.calls, ['nodes'])
+})
+
+test('slot relay callbacks do not reuse the closed startup activity', async (t) => {
+  const fx = await fixture(t)
+  fx.manager._dialDirect = async () => {
+    await getDb().query('SELECT 1')
+    fx.calls.push('dial')
+    return null
+  }
+  await fx.manager.ensureSlotRelays('node-synthetic', 'vm-synthetic')
+  const relay = fx.manager.slotRelays.get('vm-synthetic').kernel
+  assert.equal(await relay.dialDirect(), null)
+  assert.equal(await relay.remotePath(), '/synthetic/vms/vm-synthetic/run/kernel.sock')
+  assert.deepEqual(fx.calls, ['dial', 'host'])
+})
+
+test('a refused direct admission cannot fall back to raw SSH', async () => {
+  let ssh = 0
+  const relay = new SocketRelay({
+    socketPath: '/tmp/synthetic-relay-unused',
+    remotePath: '/synthetic',
+    getClient: () => {
+      ssh++
+      return {}
+    },
+    dialDirect: async () => {
+      throw Object.assign(new Error('maintenance'), { code: 'database_maintenance' })
+    },
+  })
+  const local = Object.assign(new EventEmitter(), {
+    destroy() {
+      this.destroyed = true
+    },
+  })
+  await relay._relay(local)
+  assert.equal(local.destroyed, true)
+  assert.equal(ssh, 0)
 })
