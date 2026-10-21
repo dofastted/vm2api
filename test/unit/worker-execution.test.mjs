@@ -74,6 +74,20 @@ for (const [name, invoke] of [
     assert.equal(result.execution.ended, true)
     assert.equal(result.execution.reason, 'eof')
   })
+  unixTest(`${name} ordinary explicit provider rejection retains EOF completion`, async (t) => {
+    for (const status of [400, 401, 403, 404, 409, 422, 429, 529]) {
+      const exec = await fixture(t, (_req, res) => {
+        res.writeHead(status, { 'content-type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            error: { type: 'worker_error', code: 'provider_error', message: 'provider rejected the request', status },
+          }),
+        )
+      })
+      const result = await invoke({ exec, envelope })
+      assert.equal(result.execution.ended, true, `ordinary ${status} rejection is complete`)
+    }
+  })
 }
 
 for (const [name, invoke] of [
