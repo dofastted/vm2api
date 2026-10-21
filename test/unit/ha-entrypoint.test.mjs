@@ -21,10 +21,13 @@ test('HA image startup stages only local config and requires shared secrets with
   // Relocate only the image's absolute fixture path; execute the actual shell logic.
   fs.writeFileSync(script, source.replaceAll('/opt/vm2api', image))
   const env = {
-    ...process.env, PATH: bin + path.delimiter + process.env.PATH,
-    VM2API_CONTROL_PLANE_MODE: 'kubernetes-ha', KIN_PROJECT_ROOT: project,
+    ...process.env,
+    PATH: bin + path.delimiter + process.env.PATH,
+    VM2API_CONTROL_PLANE_MODE: 'kubernetes-ha',
+    KIN_PROJECT_ROOT: project,
     VM2API_DATABASE_URL: 'postgresql://synthetic@127.0.0.1:1/unreachable_test',
-    VM2API_API_KEY: 'synthetic-ha-key', VM2API_ADMIN_PASSWORD: 'synthetic-ha-password',
+    VM2API_API_KEY: 'synthetic-ha-key',
+    VM2API_ADMIN_PASSWORD: 'synthetic-ha-password',
     VM2API_DB_SECRET: 'synthetic-ha-encryption-secret',
   }
   const result = spawnSync('sh', [script], { env, encoding: 'utf8', timeout: 10_000 })

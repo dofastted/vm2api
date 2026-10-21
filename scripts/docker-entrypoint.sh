@@ -7,6 +7,25 @@ if [ -z "${VM2API_DATABASE_URL:-${KIN_DATABASE_URL:-}}" ]; then
   echo "vm2api: PostgreSQL 17 connection is required. Configure VM2API_DATABASE_URL; see docs/deploy/postgresql.md for SQLite import." >&2
   exit 1
 fi
+
+# Runtime HA Pods only use PostgreSQL and the fixed TLS node interface. Assets
+# and execution privileges stay on trusted nodes; per-Pod random secrets would
+# split authentication and encrypted state between replicas.
+if [ "${VM2API_CONTROL_PLANE_MODE:-}" = kubernetes-ha ]; then
+  if [ -z "${VM2API_API_KEY:-${KIN_API_KEY:-}}" ] || [ -z "${VM2API_ADMIN_PASSWORD:-${KIN_ADMIN_PASSWORD:-}}" ] || [ -z "${VM2API_DB_SECRET:-${KIN_DB_SECRET:-}}" ]; then
+    echo "vm2api: kubernetes-ha requires shared VM2API_API_KEY, VM2API_ADMIN_PASSWORD and VM2API_DB_SECRET." >&2
+    exit 1
+  fi
+  KIN_DATA_DIR="${KIN_DATA_DIR:-$ROOT/data}"
+  KIN_CAPTURES_DIR="${KIN_CAPTURES_DIR:-$KIN_DATA_DIR/captures}"
+  export KIN_DATA_DIR KIN_CAPTURES_DIR
+  mkdir -p "$ROOT/src/config" "$KIN_DATA_DIR" "$KIN_CAPTURES_DIR"
+  if [ ! -f "$ROOT/src/config/routing.json" ]; then
+    cp /opt/vm2api/image-config/routing.json "$ROOT/src/config/routing.json"
+  fi
+  cd /opt/vm2api
+  exec node src/server.mjs
+fi
 mkdir -p "$ROOT/vms" "$ROOT/data" "$ROOT/bin"
 
 # 镜像安装没有仓库 checkout：把镜像内默认配置补进被 bind-mount 覆盖的 src/config。
