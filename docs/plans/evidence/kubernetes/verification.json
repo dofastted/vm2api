@@ -1,0 +1,59 @@
+{
+  "source_commit": "6589eab3ca1179250a24c6ee5a5fee5e738e7f47",
+  "dependency_commit": "cf9462d5501c323efa95c254feb3821f7cf656f0",
+  "scope": "single active control plane; horizontal multi-active execution remains unimplemented",
+  "checks": {
+    "directed": {
+      "verified_commit": "1366e203",
+      "tests": 119,
+      "passed": 119,
+      "failed": 0,
+      "skipped": 0,
+      "cancelled": 0,
+      "log_sha256": "36e32464a9cb25fa99b50e8342172be7673e402a58cf6308f72bcd421b27c416"
+    },
+    "database": {
+      "verified_commit": "6589eab3",
+      "tests": 44,
+      "passed": 44,
+      "failed": 0,
+      "skipped": 0,
+      "cancelled": 0,
+      "log_sha256": "f1b9c61f821a2b5c57f88863ae9f3b6a9691d3b23ff8d97eb2b173e5db9d0f3a"
+    },
+    "unit": {
+      "verified_commit": "1366e203",
+      "tests": 3367,
+      "passed": 3350,
+      "failed": 7,
+      "skipped": 10,
+      "cancelled": 0,
+      "log_sha256": "35b1fc56c1c5f0d1349306c7436d6f3b1811438ce286cbdaa0c5bbc495e40df3"
+    },
+    "e2e": {
+      "verified_commit": "6589eab3",
+      "tests": 119,
+      "passed": 101,
+      "failed": 17,
+      "skipped": 1,
+      "cancelled": 0,
+      "log_sha256": "8191fee5a620d736f7d084706823d8d118664ce787db6b75329457ccfc8a8a78"
+    },
+    "deployment": {
+      "verified_commit": "6589eab3",
+      "tests": 33,
+      "passed": 33,
+      "failed": 0,
+      "skipped": 0,
+      "cancelled": 0,
+      "log_sha256": "4d21d1d3d6646a3e364d36c31ad851e4d0490ab7b6237703edebda446ced9a68"
+    }
+  },
+  "go_api_kernel": {
+    "verified_commit": "11ee7dc1",
+    "command": "go test -race ./...",
+    "exit_code": 0,
+    "log_sha256": "570290cde41a737dd632b388f8ab6ab9b97344b1e0031d3d419016bbcfcfbd17"
+  },
+  "runtime_evidence": "runtime-after.json"
+}

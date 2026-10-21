@@ -10,7 +10,7 @@
 
 外部 PostgreSQL：在 `.env` 中填写 `VM2API_DATABASE_URL`，清空 `COMPOSE_PROFILES`。控制面使用 host 网络，数据库地址应为宿主可访问地址，不能使用 Compose 服务名 `postgres`。业务数据库应由本应用专用；应用登录角色需要管理应用 schema 的表、索引、函数和 sequence，无需超级用户或创建/删除数据库权限。应用默认 schema 为 `public`。
 
-使用 systemd 直接运行 Node.js 时，在 `/etc/vm2api.env` 中配置连接 URL，并安装 PostgreSQL 17 的 `pg_dump` 与 `pg_restore`。`docs/deploy/vm2api.service` 是启动示例。两种控制面镜像均已包含本机架构的 PG 17 客户端。
+使用 systemd 直接运行 Node.js 时，在 `/etc/vm2api.env` 中配置连接 URL，并安装 PostgreSQL 17 的 `pg_dump`、`pg_restore` 与 `psql`。`docs/deploy/vm2api.service` 是启动示例。两种控制面镜像均已包含本机架构的 PG 17 客户端。
 
 ## 已有 SQLite 安装
 
@@ -33,7 +33,7 @@
 
 普通备份先短时暂停写入并排空在途任务，在专用事务中导出 PostgreSQL 快照，同时复制 VM 和配置文件。文件复制完成后恢复写入。worker 使用同一个导出快照执行 `pg_dump`，导出事务一直保留到 dump 完成。
 
-恢复校验外层与内部文件摘要，再检查 `pg_restore --list` 对象目录。恢复只允许本应用 schema 中的已支持对象。数据库使用 `pg_restore --single-transaction --clean --if-exists --no-owner --no-privileges`，不创建或删除整个数据库，也不恢复其他角色的所有权或授权。
+恢复校验外层与内部文件摘要，再检查 `pg_restore --list` 对象目录。恢复只允许本应用 schema 中的已支持对象。`pg_restore --clean --if-exists --no-owner --no-privileges` 生成恢复 SQL，`psql --single-transaction --set=ON_ERROR_STOP=1` 在同一事务内删除快照之外的新增表并执行恢复。事务提交后重新执行后续迁移，新增会话表不会保留快照之后的登录状态。存在其他 schema 的依赖时拒绝删除，不使用 `CASCADE`。此过程不创建或删除整个数据库，也不恢复其他角色的所有权或授权。
 
 恢复期间拒绝新增业务写入，后台任务暂停，所有在途操作排空。恢复前自动创建 `pre_restore` 备份。数据库和文件都恢复后，等待内存 store、路由与调度状态重新加载，再退出维护状态。恢复失败会尝试恢复前快照；失败状态持续保持维护。`data/restore-maintenance.json` 在修改数据库/文件前写入，只有恢复和重新加载成功才删除。进程重启发现该文件时会在迁移或 VM 初始化前拒绝普通启动。进程仍运行时，管理员可以通过原恢复接口显式重试。进程退出后，应在停服状态下使用恢复前归档恢复对应 PostgreSQL、VM 与配置快照，验证一致性后才移除此文件并重新启动。不要在原因未查明时直接删除标记。
 
