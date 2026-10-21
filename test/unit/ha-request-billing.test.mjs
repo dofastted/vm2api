@@ -317,3 +317,26 @@ test('a sealed request with no bound jobs records not_dispatched and releases un
     )
   })
 })
+
+test('a PostgreSQL counter overflow rolls back settlement and keeps the exact reservation held', async (t) => {
+  const f = await haBillingFixture(t)
+  const data = await billingRequest(f, async (current) => {
+    await f.db.prepare('UPDATE api_keys SET tokens_in=$2 WHERE id=$1').run(current.key.id, '9223372036854775807')
+  })
+  await assert.rejects(reconcile(f, data), { code: '22003' })
+  await f.recoveryGate.run(async () => {
+    assert.equal((await f.peer.prepare('SELECT count(*) AS n FROM ha_request_settlements').get()).n, 0)
+    assert.equal(
+      (
+        await f.peer
+          .prepare('SELECT released_at,settled_at FROM api_key_admissions WHERE id=$1')
+          .get(data.reservation.reservationId)
+      ).released_at,
+      null,
+    )
+    assert.equal(
+      (await f.peer.prepare('SELECT tokens_in FROM api_keys WHERE id=$1').get(data.key.id)).tokens_in,
+      '9223372036854775807',
+    )
+  })
+})

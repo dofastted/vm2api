@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from 'node:util'
 import { normalizeNodeBinding, normalizeNodeCompletion } from './node-execution-proof.mjs'
 import { SharedExecutionAdmissions } from '../pool/shared-execution-admissions.mjs'
 import { SharedSessionTurns } from '../pool/shared-session-turns.mjs'
+import { HaRequestBilling } from './ha-request-billing.mjs'
 
 function unchangedGraph(graph) {
   return {
@@ -20,10 +21,11 @@ function unchangedGraph(graph) {
 
 /** Explicit recovery only. Closing a parent proves no late child can be admitted, not that a node ended. */
 export class HaRequestRecovery {
-  constructor(db = getDb(), { coordinator = getActivityCoordinator(db) } = {}) {
+  constructor(db = getDb(), { coordinator = getActivityCoordinator(db), readNodeRecoveryStatus = null } = {}) {
     if (!coordinator || coordinator.db !== db) throw new Error('HA recovery requires its activity coordinator')
     this.db = db
     this.coordinator = coordinator
+    this.readNodeRecoveryStatus = readNodeRecoveryStatus
   }
 
   async seal(requestId) {
@@ -117,7 +119,7 @@ export class HaRequestRecovery {
   }
 
   /** readCompletion authenticates the original node; it must never substitute current State or a new command. */
-  async recover(requestId, { readCompletion } = {}) {
+  async recover(requestId, { readCompletion, readRecoveryStatus = this.readNodeRecoveryStatus } = {}) {
     const snapshot = await withTransaction(this.db, async () => {
       const sealed = await this._seal(requestId)
       if (!sealed.sealed) return { reason: sealed.reason }
@@ -126,14 +128,21 @@ export class HaRequestRecovery {
       return this._validGraph(requestId, graph) ? { graph } : { reason: 'request_job_binding_unproven' }
     })
     if (snapshot.reason) return { recovered: false, reason: snapshot.reason }
-    if (snapshot.already) return { recovered: true, billingHeld: await this._billingHeld(requestId) }
+    if (snapshot.already) return this._bill(requestId, readRecoveryStatus)
     const proofs = new Map()
     for (const job of snapshot.graph.jobs) {
       try {
         const value =
           job.ended_at && job.node_completion
             ? job.node_completion
-            : await readCompletion?.({ requestId: job.request_id, nodeBinding: structuredClone(job.node_binding) })
+            : readRecoveryStatus
+              ? (
+                  await readRecoveryStatus({
+                    requestId: job.request_id,
+                    nodeBinding: structuredClone(job.node_binding),
+                  })
+                )?.command
+              : await readCompletion?.({ requestId: job.request_id, nodeBinding: structuredClone(job.node_binding) })
         proofs.set(
           job.request_id,
           normalizeNodeCompletion(value, { requestId: job.request_id, nodeBinding: job.node_binding }),
@@ -142,7 +151,7 @@ export class HaRequestRecovery {
         return { recovered: false, reason: 'node_completion_unproven' }
       }
     }
-    return withTransaction(this.db, async () => {
+    const result = await withTransaction(this.db, async () => {
       const sealed = await this._seal(requestId)
       if (!sealed.sealed) return { recovered: false, reason: sealed.reason }
       if (sealed.request.execution_recovered_at)
@@ -219,5 +228,11 @@ export class HaRequestRecovery {
         .run(requestId)
       return { recovered: true, billingHeld: await this._billingHeld(requestId) }
     })
+    return result.recovered ? this._bill(requestId, readRecoveryStatus) : result
+  }
+
+  async _bill(requestId, readRecoveryStatus) {
+    const billing = await new HaRequestBilling(this.db).reconcile(requestId, { readRecoveryStatus })
+    return { recovered: true, billingHeld: !billing.settled, billing }
   }
 }

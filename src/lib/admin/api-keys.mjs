@@ -26,6 +26,7 @@ import { calculateCost, normalizeUsage } from './pricing.mjs'
 import { UsersRepo } from '../db/repos/users-repo.mjs'
 import { ApiKeyAdmissionsRepo } from '../db/repos/api-key-admissions-repo.mjs'
 import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { recordHaRequestUsage } from '../core/ha-request-billing.mjs'
 
 const KEY_PREFIX = 'sk-vm-'
 const HASH_MARKER = 'hmac:'
@@ -586,6 +587,10 @@ export class ApiKeyStore {
       return rec
     }
     return write()
+  }
+
+  recordHaUsage(options) {
+    return recordHaRequestUsage(this.db, options)
   }
 
   async snapshot() {

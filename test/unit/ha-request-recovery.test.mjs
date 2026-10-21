@@ -341,7 +341,7 @@ test('sealed supported requests with no bound node jobs can release execution an
       readCompletion: async () => assert.fail('no original node job'),
     })
     assert.equal(outcome.recovered, true)
-    assert.equal(outcome.billingHeld, true)
+    assert.equal(outcome.billingHeld, false)
     assert.ok(
       (
         await f.peer
