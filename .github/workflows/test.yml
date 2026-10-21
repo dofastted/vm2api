@@ -50,9 +50,16 @@ jobs:
           . /etc/os-release
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $VERSION_CODENAME-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
           sudo apt-get update
-          sudo apt-get install -y postgresql-client-17
+          sudo apt-get install -y postgresql-client-17 python3-yaml
           echo /usr/lib/postgresql/17/bin >> "$GITHUB_PATH"
           /usr/lib/postgresql/17/bin/pg_dump --version
+      - name: pinned Kubernetes manifest tooling
+        run: |
+          curl --fail --silent --show-error --location -o "$RUNNER_TEMP/kubectl" https://dl.k8s.io/release/v1.36.4/bin/linux/amd64/kubectl
+          curl --fail --silent --show-error --location -o "$RUNNER_TEMP/kubectl.sha256" https://dl.k8s.io/release/v1.36.4/bin/linux/amd64/kubectl.sha256
+          python3 -c 'import hashlib,os,pathlib; root=pathlib.Path(os.environ["RUNNER_TEMP"]); assert hashlib.sha256((root/"kubectl").read_bytes()).hexdigest()==(root/"kubectl.sha256").read_text().strip()'
+          chmod 755 "$RUNNER_TEMP/kubectl"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - name: panel user and onboarding regression tests
         run: node --import ./test/pg-setup.mjs --test test/unit/panel-users.test.mjs test/unit/onboarding.test.mjs test/e2e/panel-users.e2e.test.mjs
       - name: format-check
@@ -67,7 +74,7 @@ jobs:
       - run: npm run test:unit
       - run: npm run test:e2e
       - name: ARM64 host preparation and rollback tests
-        run: python3 -m unittest discover -s test/deploy -v
+        run: /usr/bin/python3 -m unittest discover -s test/deploy -v
       - name: PostgreSQL application role permissions
         run: python3 test/deploy/smoke_postgres_role.py
 

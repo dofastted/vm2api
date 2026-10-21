@@ -90,11 +90,13 @@ if [ -f /opt/vm2api/image-crag/kin-kernel ]; then
   fi
 fi
 
-if [ ! -S /var/run/docker.sock ]; then
-  echo "vm2api: /var/run/docker.sock not mounted; slot create/start will fail." >&2
-elif [ -f /opt/vm2api/docker/kin-os/build.mjs ]; then
-  # 只拉预构建客体镜像；拉不到不阻塞启动，建槽时再兜底构建。
-  node /opt/vm2api/docker/kin-os/build.mjs --pull-only ubuntu || true
+if [ "${VM2API_CONTROL_PLANE_MODE:-}" != kubernetes ]; then
+  if [ ! -S /var/run/docker.sock ]; then
+    echo "vm2api: /var/run/docker.sock not mounted; slot create/start will fail." >&2
+  elif [ -f /opt/vm2api/docker/kin-os/build.mjs ]; then
+    # 只拉预构建客体镜像；拉不到不阻塞启动，建槽时再兜底构建。
+    node /opt/vm2api/docker/kin-os/build.mjs --pull-only ubuntu || true
+  fi
 fi
 
 env_get_file() {
@@ -154,7 +156,7 @@ if [ -z "${VM2API_DB_SECRET:-}" ] && [ -z "${KIN_DB_SECRET:-}" ]; then
   env_upsert_if_empty VM2API_DB_SECRET "$VM2API_DB_SECRET" "$ENVF"
 fi
 
-if [ "$WRAP_CHANGED" = 1 ] && [ "${KIN_AUTO_SYNC_WRAP:-0}" = 1 ]; then
+if [ "${VM2API_CONTROL_PLANE_MODE:-}" != kubernetes ] && [ "$WRAP_CHANGED" = 1 ] && [ "${KIN_AUTO_SYNC_WRAP:-0}" = 1 ]; then
   node /opt/vm2api/scripts/sync-wrap-cli.mjs &
 fi
 
