@@ -166,7 +166,7 @@ async function listenWithHandleProtocol(
   {
     codexOps,
     requestLog,
-    apiKeyStore,
+    apiKeyStore = { reserve: async (record) => ({ ok: true, record, release: async () => {} }) },
     routing = {
       websocket: { enabled: true },
       pool: { fallback_wait_timeout_ms: 3000 },
@@ -802,10 +802,10 @@ test('real handleProtocol: one in-flight interrupt yields a single cancelled fin
       },
     },
     apiKeyStore: {
+      reserve: async (record) => ({ ok: true, record, release: async () => {} }),
       recordUsage(_key, usage) {
         usageRecords.push(usage)
       },
-      release() {},
     },
     codexOps: {
       streamCodexKernel: async ({ onEvent, signal }) => {
@@ -827,8 +827,8 @@ test('real handleProtocol: one in-flight interrupt yields a single cancelled fin
       },
     },
   })
+  const opened = await openWs(live.url, { authorization: 'Bearer sk-test' })
   try {
-    const opened = await openWs(live.url, { authorization: 'Bearer sk-test' })
     opened.ws.send(JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: 'bill' }))
     await nextFrame(opened.ws, (frame) => frame.type === 'response.created')
     opened.ws.send(JSON.stringify({ type: 'response.interrupt', previous_response_id: 'resp_hp1' }))
@@ -837,8 +837,8 @@ test('real handleProtocol: one in-flight interrupt yields a single cancelled fin
     assert.equal(finishCalls.length, 1)
     assert.equal(finishCalls[0].error_code, 'client_cancelled')
     assert.equal(usageRecords.length, 0)
-    opened.ws.close()
   } finally {
+    opened.ws?.terminate()
     await live.close()
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -850,6 +850,8 @@ test('real handleProtocol: interrupt after hop finish bills once without duplica
   const finishCalls = []
   const usageRecords = []
   const usage = { input_tokens: 12, output_tokens: 4, total_tokens: 16 }
+  const leaseEvents = []
+  let reservation
   const live = await listenWithHandleProtocol(root, {
     requestLog: {
       start: () => ({ request_id: 'ws-complete-interrupt', t0: Date.now() }),
@@ -858,10 +860,15 @@ test('real handleProtocol: interrupt after hop finish bills once without duplica
       },
     },
     apiKeyStore: {
-      recordUsage(_key, usageRow) {
+      async reserve(record) {
+        reservation = { ok: true, record, release: async () => leaseEvents.push('release') }
+        return reservation
+      },
+      recordUsage(_key, usageRow, options) {
+        assert.equal(options.reservation, reservation)
+        leaseEvents.push('usage')
         usageRecords.push(usageRow)
       },
-      release() {},
     },
     codexOps: {
       streamCodexKernel: async ({ onEvent }) => {
@@ -875,8 +882,8 @@ test('real handleProtocol: interrupt after hop finish bills once without duplica
       },
     },
   })
+  const opened = await openWs(live.url, { authorization: 'Bearer sk-test' })
   try {
-    const opened = await openWs(live.url, { authorization: 'Bearer sk-test' })
     const frames = []
     opened.ws.on('message', (data) => frames.push(JSON.parse(String(data))))
     opened.ws.send(JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: 'first' }))
@@ -897,9 +904,116 @@ test('real handleProtocol: interrupt after hop finish bills once without duplica
     assert.equal(finishCalls[0].error_code, null)
     assert.equal(finishCalls[0].input_tokens, 12)
     assert.equal(finishCalls[0].output_tokens, 4)
-    assert.equal(usageRecords.length, 0)
-    opened.ws.close()
+    assert.equal(usageRecords.length, 1, 'a verified Codex stream consumes quota once despite a later interrupt')
+    assert.equal(usageRecords[0].input_tokens, 12)
+    assert.equal(usageRecords[0].output_tokens, 4)
+    assert.deepEqual(leaseEvents, ['usage', 'release'], 'quota is settled before releasing the request reservation')
   } finally {
+    opened.ws?.terminate()
+    await live.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('real handleProtocol: shared key admission spans WebSockets and cancellation releases each request lease', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-responses-ws-shared-key-'))
+  writeGptVm(root, 'vm-gpt-a')
+  let reserveCalls = 0
+  let inflight = 0
+  let releases = 0
+  let upstreamHops = 0
+  const usageRecords = []
+  const live = await listenWithHandleProtocol(root, {
+    requestLog: { start: () => ({ request_id: 'ws-shared-key', t0: Date.now() }), finish() {} },
+    apiKeyStore: {
+      async reserve(record) {
+        reserveCalls++
+        if (inflight) {
+          return {
+            ok: false,
+            status: 429,
+            code: 'api_key_concurrency_limit',
+            message: 'API key concurrency limit (1)',
+          }
+        }
+        inflight++
+        let released = false
+        return {
+          ok: true,
+          record,
+          async release() {
+            if (released) return
+            released = true
+            inflight--
+            releases++
+          },
+        }
+      },
+      recordUsage(_key, usage) {
+        usageRecords.push(usage)
+      },
+    },
+    codexOps: {
+      async streamCodexKernel({ onEvent, signal }) {
+        const id = `resp_shared_${++upstreamHops}`
+        await onEvent(`data: ${JSON.stringify({ type: 'response.created', response: { id, output: [] } })}\n\n`)
+        await new Promise((resolve) => {
+          if (signal.aborted) resolve()
+          else signal.addEventListener('abort', resolve, { once: true })
+        })
+        return { ok: false, status: 200, committed: false, body: { error: { code: 'client_cancelled' } } }
+      },
+    },
+  })
+  const sockets = []
+  const waitForRelease = async (count) => {
+    const deadline = Date.now() + 2000
+    while (releases < count) {
+      assert.ok(Date.now() < deadline, 'cancelled request lease release timeout')
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+  try {
+    const first = await openWs(live.url, { authorization: 'Bearer sk-test' })
+    sockets.push(first.ws)
+    const second = await openWs(live.url, { authorization: 'Bearer sk-test' })
+    sockets.push(second.ws)
+    assert.equal(first.ok, true)
+    assert.equal(second.ok, true)
+    assert.equal(reserveCalls, 0, 'WebSocket handshakes do not reserve inference capacity')
+
+    const created = nextFrame(first.ws, (frame) => frame.type === 'response.created')
+    first.ws.send(JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: 'pending' }))
+    assert.equal((await created).response.id, 'resp_shared_1')
+    assert.equal(inflight, 1)
+
+    // Each socket serializes its own queue. A second socket exercises overlapping requests with the same key.
+    const denied = nextFrame(second.ws, (frame) => frame.type === 'error')
+    second.ws.send(JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: 'overlap' }))
+    const error = await denied
+    assert.equal(error.status, 429)
+    assert.equal(error.error.code, 'api_key_concurrency_limit')
+    assert.equal(upstreamHops, 1)
+
+    const accepted = nextFrame(first.ws, (frame) => frame.type === 'response.interrupt.accepted')
+    first.ws.send(JSON.stringify({ type: 'response.interrupt', previous_response_id: 'resp_shared_1' }))
+    await accepted
+    await waitForRelease(1)
+    assert.equal(inflight, 0)
+
+    const retried = nextFrame(second.ws, (frame) => frame.type === 'response.created')
+    second.ws.send(JSON.stringify({ type: 'response.create', model: 'gpt-5.4', input: 'retry after cancellation' }))
+    assert.equal((await retried).response.id, 'resp_shared_2')
+    const cancelled = nextFrame(second.ws, (frame) => frame.type === 'response.interrupt.accepted')
+    second.ws.send(JSON.stringify({ type: 'response.interrupt', previous_response_id: 'resp_shared_2' }))
+    await cancelled
+    await waitForRelease(2)
+    assert.equal(inflight, 0)
+    assert.equal(reserveCalls, 3)
+    assert.equal(usageRecords.length, 0, 'cancelled requests do not consume completed-request quota')
+  } finally {
+    for (const ws of sockets) ws?.terminate()
+    await live.handler.drain()
     await live.close()
     fs.rmSync(root, { recursive: true, force: true })
   }
