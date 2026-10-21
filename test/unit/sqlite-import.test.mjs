@@ -71,3 +71,17 @@ test('fractional scheduling weights survive SQLite import and PostgreSQL updates
   const record = await new AccountRuntimeRepo(db).upsert({ account_id: 'fractional', vm_id: 'vm-01', weight: 2.75 })
   assert.equal(record.weight, 2.75)
 })
+
+test('fractional weights in the preserved legacy runtime table survive import', async () => {
+  const old = sqlite({ dbPath: source })
+  old
+    .prepare('INSERT INTO account_runtime_states_legacy(account_id,vm_id,weight,updated_at) VALUES(?,?,?,?)')
+    .run('legacy-fractional', 'vm-01', 1.25, '2026-10-21T00:00:00.000Z')
+  old.close()
+  const db = getDb()
+  await importSqlite({ source, db })
+  const row = await db
+    .prepare('SELECT weight FROM account_runtime_states_legacy WHERE account_id=$1')
+    .get('legacy-fractional')
+  assert.equal(row.weight, 1.25)
+})
