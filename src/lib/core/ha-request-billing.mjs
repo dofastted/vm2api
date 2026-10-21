@@ -312,12 +312,24 @@ export async function recordHaRequestUsage(db, { reservation, commandId, nodeSta
   if (reservation?.shared !== true) throw failure('invalid_api_key_reservation')
   const context = currentHaRequestContext(db)
   if (!context) throw failure('ha_request_context_required')
-  if (commandId != null) await selectHaBillableCommand(db, commandId)
-  const result = await new HaRequestBilling(db).settle(context.requestId, {
-    source: 'handler',
-    commandId,
-    nodeStatus,
-    reservation,
+  const result = await withTransaction(db, async () => {
+    await lockHaRequestContext(db)
+    // A client-side command ID can exist before dispatch permission. Only the persisted graph proves no dispatch.
+    const job = await db
+      .prepare(`SELECT j.request_id FROM execution_jobs j
+      LEFT JOIN execution_admissions a ON a.id=j.admission_id
+      WHERE j.ha_request_id=$1 OR a.ha_request_id=$1 LIMIT 1`)
+      .get(context.requestId)
+    if (job && commandId == null) return { settled: false, reason: 'ha_billable_command_unproven' }
+    const billableCommandId = job ? commandId : null
+    if (billableCommandId != null) await selectHaBillableCommand(db, billableCommandId)
+    // settle() closes children for no-job requests before this parent transaction commits.
+    return new HaRequestBilling(db).settle(context.requestId, {
+      source: 'handler',
+      commandId: billableCommandId,
+      nodeStatus,
+      reservation,
+    })
   })
   if (result.settled) reservation?._markSettled?.()
   else if (reservation) reservation.billingFailed = true
