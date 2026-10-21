@@ -909,9 +909,9 @@ test('aborted signal stops before another account is tried', async () => {
 for (const cancellation of ['result', 'throw']) {
   test(`client cancellation via ${cancellation} preserves outbound session beyond fifty turns`, async (t) => {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cancel-session-'))
-    const sticky = new StickyRouter({ dataDir, config: { sticky: { enabled: true } } })
-    t.after(() => {
-      sticky.db.close()
+    const sticky = await new StickyRouter({ dataDir, config: { sticky: { enabled: true } } }).init()
+    t.after(async () => {
+      await sticky.db.close()
       fs.rmSync(dataDir, { recursive: true, force: true })
     })
     const scheduler = new Scheduler([{ ...candidate(1), slotIndex: 3 }])

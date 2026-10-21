@@ -637,7 +637,7 @@ export function createResponsesWsHandler({
       }
     }
 
-    ws.on('message', (data, isBinary) => {
+    ws.on('message', async (data, isBinary) => {
       if (closed) return
       if (isBinary) {
         closed = true
@@ -724,7 +724,7 @@ export function createResponsesWsHandler({
     })
   }
 
-  function handleUpgrade(req, socket, head) {
+  async function handleUpgrade(req, socket, head) {
     let pathname = '/v1/responses'
     try {
       pathname = new URL(req.url || '/', 'http://local').pathname
@@ -735,7 +735,7 @@ export function createResponsesWsHandler({
     const routing = typeof getRouting === 'function' ? getRouting() || {} : {}
     if (rejectNewWs(socket, routing)) return true
     const res = handshakeRes(socket)
-    if (typeof requireAuth === 'function' && !requireAuth(req, res)) return true
+    if (typeof requireAuth === 'function' && !(await requireAuth(req, res))) return true
     wss.handleUpgrade(req, socket, head, (ws) => attach(ws, req))
     return true
   }

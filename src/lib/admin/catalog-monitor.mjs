@@ -6,7 +6,7 @@
  * Results land in settings `model_catalog_sync` so the models page can show them.
  */
 import path from 'node:path'
-import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { RuntimeSettings as SettingsRepo } from '../db/settings-state.mjs'
 import { runSlotOauth } from '../transport/slot-oauth.mjs'
 import { getVm, listVms, vmHasClaudeCredential } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
@@ -32,10 +32,10 @@ export function readCatalogSync() {
   }
 }
 
-function writeCatalogSync(platform, status) {
+async function writeCatalogSync(platform, status) {
   const repo = new SettingsRepo()
   const cur = repo.get(CATALOG_SYNC_KEY, null) || { claude: null, codex: null }
-  repo.set(CATALOG_SYNC_KEY, { ...cur, [platform]: status })
+  await repo.set(CATALOG_SYNC_KEY, { ...cur, [platform]: status })
   return status
 }
 
@@ -54,7 +54,7 @@ function claudeCatalogTargets(projectRoot) {
 /** Live Claude catalog → model_policy. */
 export async function syncClaudeCatalog({ projectRoot, runOauth = runSlotOauth } = {}) {
   const targets = claudeCatalogTargets(projectRoot)
-  if (!targets.length) return writeCatalogSync('claude', syncStatus('skipped', { error: 'no_claude_slot' }))
+  if (!targets.length) return await writeCatalogSync('claude', syncStatus('skipped', { error: 'no_claude_slot' }))
   const ids = new Set()
   let successes = 0
   let lastError = null
@@ -70,12 +70,12 @@ export async function syncClaudeCatalog({ projectRoot, runOauth = runSlotOauth }
     successes++
     for (const row of list) if (row?.id) ids.add(String(row.id))
   }
-  if (!successes) return writeCatalogSync('claude', syncStatus('error', { error: lastError || 'models_failed' }))
-  const { added } = syncWorkerModelsIntoPolicy([...ids], {
+  if (!successes) return await writeCatalogSync('claude', syncStatus('error', { error: lastError || 'models_failed' }))
+  const { added } = await syncWorkerModelsIntoPolicy([...ids], {
     displayNameOf: (id) => modelsDevMeta('anthropic', id)?.name,
   })
   seedModelCatalog()
-  return writeCatalogSync('claude', syncStatus('ok', { added }))
+  return await writeCatalogSync('claude', syncStatus('ok', { added }))
 }
 
 /** Live ChatGPT Codex catalog → gpt_model_policy. Timers never rotate OAuth; the panel button may. */
@@ -83,10 +83,10 @@ export async function syncGptCatalog({ projectRoot, vmId = '', catalogClientVers
   const result = await syncCodexCatalog({ projectRoot, vmId, rotate, catalogClientVersion })
   if (!result.ok) {
     const skipped = result.error === 'no_codex_slot' || result.error === 'proxy_required'
-    writeCatalogSync('codex', syncStatus(skipped ? 'skipped' : 'error', { error: result.error }))
+    await writeCatalogSync('codex', syncStatus(skipped ? 'skipped' : 'error', { error: result.error }))
     return result
   }
-  writeCatalogSync('codex', syncStatus('ok', { added: result.added || [] }))
+  await writeCatalogSync('codex', syncStatus('ok', { added: result.added || [] }))
   return result
 }
 
@@ -96,15 +96,21 @@ export async function syncGptCatalog({ projectRoot, vmId = '', catalogClientVers
 export function createCatalogMonitor({ projectRoot, codexCatalogVersion = () => 'auto', log = () => {} } = {}) {
   const timers = []
   let running = false
+  const pending = new Set()
   const guard = (name, fn) => async () => {
+    if (!running) return
+    const operation = Promise.resolve().then(fn)
+    pending.add(operation)
     try {
-      const out = await fn()
+      const out = await operation
       log({ event: 'catalog-sync', job: name, status: out?.status ?? (out?.ok === false ? 'error' : 'ok') })
     } catch (error) {
       log({ event: 'catalog-sync', job: name, status: 'error', error: String(error?.message || error) })
+    } finally {
+      pending.delete(operation)
     }
   }
-  const modelsDev = guard('models.dev', () => syncModelsDev())
+  const modelsDev = guard('models.dev', async () => await syncModelsDev())
   const upstream = guard('upstream', async () => {
     const claude = await syncClaudeCatalog({ projectRoot })
     await syncGptCatalog({ projectRoot, catalogClientVersion: codexCatalogVersion() })
@@ -128,6 +134,9 @@ export function createCatalogMonitor({ projectRoot, codexCatalogVersion = () => 
         t.unref?.()
         timers.push(t)
       }
+    },
+    async flush() {
+      while (pending.size) await Promise.allSettled([...pending])
     },
     stop() {
       running = false

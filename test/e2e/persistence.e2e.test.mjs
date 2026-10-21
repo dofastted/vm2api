@@ -1,18 +1,17 @@
 /**
- * E2E: SQLite persistence across gateway restarts + legacy JSON import.
+ * E2E: PostgreSQL persistence across gateway restarts + legacy JSON import.
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
 import { startGateway, api } from '../harness.mjs'
 
 const MODEL = 'claude-haiku-4-5-20251001'
 
 function openDb(gw) {
-  return new DatabaseSync(path.join(gw.project, 'data', 'kin.db'), { readOnly: true })
+  return gw.db
 }
 
 test('data survives a full gateway restart on the same data dir', async () => {
@@ -72,7 +71,7 @@ test('vm credentials are mirrored into the vms table (入库)', async () => {
     // seeded VM has oauth in vms/vm-sim-01.json — reconcile mirrors it at boot
     const db = openDb(gw)
     try {
-      const row = db.prepare('SELECT * FROM vms WHERE id = ?').get('vm-sim-01')
+      const row = await db.prepare('SELECT * FROM vms WHERE id = $1').get('vm-sim-01')
       assert.ok(row, 'vms row must exist')
       assert.equal(row.access_token, null)
       assert.equal(row.refresh_token, null)
@@ -81,10 +80,10 @@ test('vm credentials are mirrored into the vms table (入库)', async () => {
       assert.equal(vmJson.claude.access_token, undefined)
       assert.equal(vmJson.claude.has_access, true)
       assert.equal(vmJson.claude.has_refresh, true)
-      const active = db.prepare("SELECT value FROM settings WHERE key = 'active_vm'").get()
+      const active = await db.prepare("SELECT value FROM settings WHERE key = 'active_vm'").get()
       assert.equal(JSON.parse(active.value), 'vm-sim-01')
     } finally {
-      db.close()
+      // The gateway harness owns this connection.
     }
 
     // sessionKey import (fake) writes through persistOauthToVm → DB mirror updates
@@ -94,14 +93,14 @@ test('vm credentials are mirrored into the vms table (入库)', async () => {
     assert.equal(imp.status, 200, imp.text)
     const db2 = openDb(gw)
     try {
-      const row = db2.prepare('SELECT access_token, session_key, vm_json FROM vms WHERE id = ?').get('vm-sim-01')
+      const row = await db2.prepare('SELECT access_token, session_key, vm_json FROM vms WHERE id = $1').get('vm-sim-01')
       assert.equal(row.access_token, null)
       assert.equal(row.session_key, null)
       const vmJson = JSON.parse(row.vm_json)
       assert.equal(vmJson.claude.session_key, undefined)
       assert.equal(vmJson.claude.has_access, true)
     } finally {
-      db2.close()
+      // The gateway harness owns this connection.
     }
   } finally {
     await gw.stop()
@@ -172,11 +171,13 @@ test('legacy JSON files are imported once at first boot', async () => {
     // import flag recorded; original files untouched
     const db = openDb(gw)
     try {
-      const flag = JSON.parse(db.prepare("SELECT value FROM settings WHERE key = 'legacy_import_done'").get().value)
+      const flag = JSON.parse(
+        (await db.prepare("SELECT value FROM settings WHERE key = 'legacy_import_done'").get()).value,
+      )
       assert.equal(flag.counts.api_keys, 1)
       assert.equal(flag.counts.request_logs, 1)
     } finally {
-      db.close()
+      // The gateway harness owns this connection.
     }
     assert.ok(fs.existsSync(path.join(dataDir, 'api-keys.json')))
   } finally {

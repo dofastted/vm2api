@@ -38,11 +38,11 @@ test('haiku 5.5 is in the panel seed and keeps forced tool choice', () => {
   assert.deepEqual(blocked.thinking, { type: 'adaptive' })
 })
 
-test('loading old Haiku 5.5 seed migrates only the old 1M defaults to 100K', () => {
-  openDatabase({ dbPath: ':memory:' })
+test('loading old Haiku 5.5 seed migrates only the old 1M defaults to 100K', async () => {
+  await openDatabase({ dbPath: ':memory:' })
   try {
     const repo = new SettingsRepo()
-    repo.set('model_policy', {
+    await repo.set('model_policy', {
       source: 'panel',
       models: {
         'claude-haiku-5-5': {
@@ -56,14 +56,14 @@ test('loading old Haiku 5.5 seed migrates only the old 1M defaults to 100K', () 
         },
       },
     })
-    loadModelPolicy({ force: true })
-    const stored = repo.get('model_policy')
+    await loadModelPolicy({ force: true })
+    const stored = await repo.get('model_policy')
     const row = stored.models['claude-haiku-5-5']
     assert.equal(row.capabilities.context_window, 100000)
     assert.equal(row.params.max_tokens_default, 100000)
     assert.equal(row.params.max_tokens_cap, 100000)
     assert.equal(row.params.default_effort, 'medium')
   } finally {
-    closeDatabase()
+    await closeDatabase()
   }
 })

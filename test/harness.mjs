@@ -9,6 +9,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
+import crypto from 'node:crypto'
+import { createDatabase } from '../src/lib/db/database.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 export const GATEWAY_ROOT = path.resolve(__dirname, '../src')
@@ -81,9 +83,20 @@ export async function startGateway(opts = {}) {
   }
   const port = opts.port || (await pickFreePort())
   const traceFile = opts.traceFile || path.join(project, 'mock-trace.json')
+  const connectionString = process.env.VM2API_TEST_DATABASE_URL
+  if (!connectionString || !/_test$/.test(new URL(connectionString).pathname)) {
+    throw new Error('gateway tests require VM2API_TEST_DATABASE_URL for a dedicated *_test database')
+  }
+  const schema =
+    (process.env.KIN_DATABASE_SCHEMA || 'gateway_test') +
+    '_gw_' +
+    crypto.createHash('sha256').update(project).digest('hex').slice(0, 12)
   const env = {
     ...process.env,
     KIN_API_KEY: opts.apiKey || TEST_API_KEY,
+    VM2API_DATABASE_URL: connectionString,
+    KIN_DATABASE_URL: connectionString,
+    KIN_DATABASE_SCHEMA: schema,
     KIN_ADMIN_USER: 'admin',
     KIN_ADMIN_PASSWORD: 'testpass',
     PORT: String(port),
@@ -102,6 +115,7 @@ export async function startGateway(opts = {}) {
     KIN_MOCK_TRACE_FILE: traceFile,
     KIN_MOCK_TEXT: opts.mockText || 'pong',
     KIN_CRS_MOCK: '1',
+    KIN_KERNEL_BIN: path.join(REPO_ROOT, 'bin', 'kin-kernel'),
   }
   if (opts.env) Object.assign(env, opts.env)
 
@@ -140,7 +154,11 @@ export async function startGateway(opts = {}) {
     throw new Error(`gateway failed to start\nstdout:\n${stdout}\nstderr:\n${stderr}`)
   }
 
+  const db = await createDatabase({ connectionString, schema: env.KIN_DATABASE_SCHEMA })
   return {
+    db,
+    schema: env.KIN_DATABASE_SCHEMA,
+    connectionString,
     baseUrl,
     port,
     project,
@@ -150,10 +168,18 @@ export async function startGateway(opts = {}) {
     stdout: () => stdout,
     stderr: () => stderr,
     async stop() {
+      await db.close()
       if (child.exitCode == null) {
         child.kill('SIGTERM')
-        await new Promise((r) => setTimeout(r, 150))
-        if (child.exitCode == null) child.kill('SIGKILL')
+        await new Promise((resolve) => {
+          const timer = setTimeout(() => {
+            child.kill('SIGKILL')
+          }, 5000)
+          child.once('exit', () => {
+            clearTimeout(timer)
+            resolve()
+          })
+        })
       }
     },
   }

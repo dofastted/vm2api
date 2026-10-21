@@ -6,10 +6,10 @@ import path from 'node:path'
 import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
 import { createRoutingRuntime } from '../../src/lib/admin/routing-runtime.mjs'
 
-function fixture(t, cap, { override = true, tier = 'default' } = {}) {
+async function fixture(t, cap, { override = true, tier = 'default' } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'routing-concurrency-'))
   const accountId = 'test-account'
-  const quota = new AccountQuota({
+  const quota = await new AccountQuota({
     dataDir: path.join(root, 'data'),
     accounts: [
       {
@@ -19,7 +19,7 @@ function fixture(t, cap, { override = true, tier = 'default' } = {}) {
         concurrency_override: override,
       },
     ],
-  })
+  }).init()
   quota.setAccountTier(accountId, tier)
   const vmPath = path.join(root, 'vms/vm-02.json')
   fs.mkdirSync(path.dirname(vmPath), { recursive: true })
@@ -36,8 +36,8 @@ function fixture(t, cap, { override = true, tier = 'default' } = {}) {
     accountQuota: quota,
     routingConfig: { tiers: {}, quota: {}, concurrency: {} },
   })
-  t.after(() => {
-    quota.db.close()
+  t.after(async () => {
+    await quota.db.close()
     fs.rmSync(root, { recursive: true, force: true })
   })
   return {
@@ -49,8 +49,8 @@ function fixture(t, cap, { override = true, tier = 'default' } = {}) {
 }
 
 for (const cap of [0, 2, 16, 20]) {
-  test(`tier synchronization preserves a manual concurrency value of ${cap}`, (t) => {
-    const f = fixture(t, cap)
+  test(`tier synchronization preserves a manual concurrency value of ${cap}`, async (t) => {
+    const f = await fixture(t, cap)
     const applied = f.runtime.applyRoutingTierConcurrency({ default: { max_concurrency: 4 } })
     assert.equal(applied.skipped, 1)
     assert.equal(f.policy().maxConcurrency, cap)
@@ -59,8 +59,8 @@ for (const cap of [0, 2, 16, 20]) {
     assert.equal(Boolean(f.account().concurrency_override), true)
   })
 
-  test(`global default updates preserve a manual concurrency value of ${cap}`, (t) => {
-    const f = fixture(t, cap)
+  test(`global default updates preserve a manual concurrency value of ${cap}`, async (t) => {
+    const f = await fixture(t, cap)
     f.runtime.applyRoutingConcurrency(4)
     assert.equal(f.policy().maxConcurrency, cap)
     assert.equal(f.policy().concurrencyOverride, true)
@@ -70,8 +70,8 @@ for (const cap of [0, 2, 16, 20]) {
 }
 
 for (const tier of ['default', 'pro', 'max']) {
-  test(`inherited ${tier} concurrency receives the tier default`, (t) => {
-    const f = fixture(t, 2, { override: false, tier })
+  test(`inherited ${tier} concurrency receives the tier default`, async (t) => {
+    const f = await fixture(t, 2, { override: false, tier })
     const applied = f.runtime.applyRoutingTierConcurrency({ [tier]: { max_concurrency: 6 } })
     assert.equal(applied[tier], 1)
     assert.equal(f.policy().maxConcurrency, 6)
@@ -80,29 +80,29 @@ for (const tier of ['default', 'pro', 'max']) {
   })
 }
 
-test('global default updates still reach inherited concurrency', (t) => {
-  const f = fixture(t, 2, { override: false })
+test('global default updates still reach inherited concurrency', async (t) => {
+  const f = await fixture(t, 2, { override: false })
   f.runtime.applyRoutingConcurrency(4)
   assert.equal(f.policy().maxConcurrency, 4)
   assert.equal(f.policy().concurrencyOverride, false)
   assert.equal(f.account().max_concurrency, 4)
 })
 
-test('tier synchronization does not rewrite an unchanged inherited VM record', (t) => {
-  const f = fixture(t, 4, { override: false })
+test('tier synchronization does not rewrite an unchanged inherited VM record', async (t) => {
+  const f = await fixture(t, 4, { override: false })
   const before = fs.readFileSync(f.vmPath, 'utf8')
   const applied = f.runtime.applyRoutingTierConcurrency({ default: { max_concurrency: 4 } })
   assert.equal(applied.default, 0)
   assert.equal(fs.readFileSync(f.vmPath, 'utf8'), before)
 })
 
-function rpmFixture(t, rpm, { override = true } = {}) {
+async function rpmFixture(t, rpm, { override = true } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'routing-rpm-'))
   const accountId = 'test-account'
-  const quota = new AccountQuota({
+  const quota = await new AccountQuota({
     dataDir: path.join(root, 'data'),
     accounts: [{ account_id: accountId, vm_id: 'vm-02', max_rpm: rpm }],
-  })
+  }).init()
   const vmPath = path.join(root, 'vms/vm-02.json')
   fs.mkdirSync(path.dirname(vmPath), { recursive: true })
   fs.writeFileSync(
@@ -118,8 +118,8 @@ function rpmFixture(t, rpm, { override = true } = {}) {
     accountQuota: quota,
     routingConfig: { tiers: {}, quota: {}, concurrency: {} },
   })
-  t.after(() => {
-    quota.db.close()
+  t.after(async () => {
+    await quota.db.close()
     fs.rmSync(root, { recursive: true, force: true })
   })
   return {
@@ -130,8 +130,8 @@ function rpmFixture(t, rpm, { override = true } = {}) {
   }
 }
 
-test('tier RPM synchronization preserves a manual RPM value', (t) => {
-  const f = rpmFixture(t, 30)
+test('tier RPM synchronization preserves a manual RPM value', async (t) => {
+  const f = await rpmFixture(t, 30)
   const applied = f.runtime.applyRoutingTierRpm({ default: { max_rpm: 10 } })
   assert.equal(applied.skipped, 1)
   assert.equal(f.policy().maxRpm, 30)
@@ -139,8 +139,8 @@ test('tier RPM synchronization preserves a manual RPM value', (t) => {
   assert.equal(f.account().max_rpm, 30)
 })
 
-test('tier RPM synchronization updates inherited RPM and skips unchanged records', (t) => {
-  const f = rpmFixture(t, 10, { override: false })
+test('tier RPM synchronization updates inherited RPM and skips unchanged records', async (t) => {
+  const f = await rpmFixture(t, 10, { override: false })
   const before = fs.readFileSync(f.vmPath, 'utf8')
   assert.equal(f.runtime.applyRoutingTierRpm({ default: { max_rpm: 10 } }).default, 0)
   assert.equal(fs.readFileSync(f.vmPath, 'utf8'), before)

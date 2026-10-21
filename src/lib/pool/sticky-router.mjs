@@ -7,6 +7,7 @@ import crypto from 'node:crypto'
 import { ENVELOPE_NEEDLES, extractPrompt } from '../core/distill-detect.mjs'
 import { resolveStoreDb } from '../db/database.mjs'
 import { StickyRepo } from '../db/repos/sticky-repo.mjs'
+import { WriteQueue } from './write-queue.mjs'
 import {
   claudeCodeAgentRootSession,
   extractCallerSession,
@@ -204,18 +205,70 @@ export function childDeclaredWithoutParent(body = {}, headers = {}) {
 export class StickyRouter {
   constructor({ dataDir, db, config }) {
     this.db = resolveStoreDb({ db, dataDir })
-    this.repo = new StickyRepo(this.db)
+    this.persistence = new StickyRepo(this.db)
+    this.writes = new WriteQueue(this.db)
+    this.sessions = {}
     this.config = mergeStickyConfig(config)
-    this.repo.dropAliasKeys()
+    this.repo = {
+      get: (key) => structuredClone(this.sessions[key] || null),
+      all: () => structuredClone(this.sessions),
+      upsert: (key, entry) => {
+        const next = { ...entry, device_id: entry.device_id || this.sessions[key]?.device_id || null }
+        this.sessions[key] = structuredClone(next)
+        this.writes.enqueue(() => this.persistence.upsert(key, next))
+      },
+      remove: (key) => {
+        delete this.sessions[key]
+        this.writes.enqueue(() => this.persistence.remove(key))
+      },
+      removeByAccount: ({ accountId = null, vmId = null } = {}) => {
+        let removed = 0
+        for (const [key, entry] of Object.entries(this.sessions)) {
+          if ((accountId && entry.account_id === accountId) || (vmId && entry.vm_id === vmId)) {
+            delete this.sessions[key]
+            removed += 1
+          }
+        }
+        if (removed) this.writes.enqueue(() => this.persistence.removeByAccount({ accountId, vmId }))
+        return removed
+      },
+      purgeExpired: (now) => {
+        let removed = 0
+        for (const [key, entry] of Object.entries(this.sessions)) {
+          if (entry.expires_at != null && entry.expires_at < now) {
+            delete this.sessions[key]
+            removed += 1
+          }
+        }
+        if (removed) this.writes.enqueue(() => this.persistence.purgeExpired(now))
+        return removed
+      },
+    }
   }
 
   /** Kept for API compat + post-restore hook (state lives in DB). */
-  reload() {}
+  async init() {
+    for (const queue of this.db.pendingWriteQueues || []) await queue.flush()
+    await this.persistence.dropAliasKeys()
+    this.sessions = await this.persistence.all()
+    return this
+  }
+
+  async reload() {
+    await this.flush()
+    return await this.init()
+  }
+
+  flush() {
+    return this.writes.flush()
+  }
 
   /** Re-bind to a fresh DB connection (after backup restore). */
-  rebind(db) {
+  async rebind(db) {
+    await this.flush()
     this.db = db
-    this.repo = new StickyRepo(db)
+    this.persistence = new StickyRepo(db)
+    return await this.init()
   }
 
   isolateKey(raw, req = null) {

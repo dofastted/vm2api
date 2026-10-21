@@ -4,7 +4,7 @@
  */
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import path from 'node:path'
+import { createDatabase } from '../../src/lib/db/database.mjs'
 import { startGateway, api, takeTrace } from '../harness.mjs'
 
 const MODEL = 'claude-haiku-4-5-20251001'
@@ -60,7 +60,7 @@ test('same x-session-id keeps native full history without CLI resume', async () 
   }
 })
 
-test('one sticky session holds across three protocols and stream', async () => {
+test('one sticky session holds across allowed protocols and stream', async () => {
   const gw = await startGateway({ mockText: 'ack' })
   try {
     const h = { 'x-session-id': 'conv-multi-proto-1', 'x-kin-forward': 'cli' }
@@ -86,10 +86,9 @@ test('one sticky session holds across three protocols and stream', async () => {
       headers: h,
       body: { model: MODEL, input: 'p-openai-responses' },
     })
-    assert.equal(c.status, 200, c.text)
-    const trResp = takeTrace(gw)
-    assert.equal(trResp.argv, undefined)
-    assert.match(JSON.stringify(trResp.body.messages), /p-openai-responses/)
+    assert.equal(c.status, 400, c.text)
+    assert.equal(c.json.error.code, 'protocol_not_allowed')
+    assert.equal(takeTrace(gw), null)
 
     const res = await fetch(gw.baseUrl + '/v1/messages', {
       method: 'POST',
@@ -117,10 +116,10 @@ test('one sticky session holds across three protocols and stream', async () => {
     const snap = await api(gw, 'GET', '/admin/routing')
     assert.equal(snap.status, 200, snap.text)
     const sessions = snap.json?.sticky?.sessions || {}
-    const hit = sessions['conv-multi-proto-1']
+    const hit = sessions['p:anthropic:conv-multi-proto-1']
     assert.ok(hit, `missing sticky bind: ${JSON.stringify(snap.json?.sticky)}`)
-    assert.equal(hit.session_id, null)
-    assert.ok(hit.hits >= 4, `hits=${hit.hits}`)
+    assert.equal(typeof hit.session_id, 'string')
+    assert.ok(hit.hits >= 3, `hits=${hit.hits}`)
     assert.equal(hit.vm_id, 'vm-sim-01')
     assert.equal(hit.account_id, 'acct-seed')
   } finally {
@@ -145,14 +144,14 @@ test('different x-session-id creates independent sticky bindings', async () => {
     assert.equal(trB.argv, undefined)
     assert.ok(msgText(trB.body.messages[0]).endsWith('only-B'))
     const snap = await api(gw, 'GET', '/admin/routing')
-    assert.ok(snap.json.sticky.sessions['conv-A'])
-    assert.ok(snap.json.sticky.sessions['conv-B'])
+    assert.ok(snap.json.sticky.sessions['p:anthropic:conv-A'])
+    assert.ok(snap.json.sticky.sessions['p:anthropic:conv-B'])
   } finally {
     await gw.stop()
   }
 })
 
-test('sticky bindings persist in sqlite after a long sequential session', async () => {
+test('sticky bindings persist in PostgreSQL after a long sequential session', async () => {
   const gw = await startGateway({ mockText: 'n' })
   try {
     const h = { 'x-session-id': 'conv-long-n', 'x-kin-forward': 'cli' }
@@ -166,16 +165,16 @@ test('sticky bindings persist in sqlite after a long sequential session', async 
       assert.equal(tr.argv, undefined)
       assert.ok(msgText(tr.body.messages[0]).endsWith(`n-${i}`))
     }
-    // sticky bindings now live in the SQLite store (data/kin.db)
-    const { DatabaseSync } = await import('node:sqlite')
-    const db = new DatabaseSync(path.join(gw.project, 'data', 'kin.db'), { readOnly: true })
+    // Shutdown must drain queued writes before reporting the gateway stopped.
+    await gw.stop()
+    const db = await createDatabase({ connectionString: gw.connectionString, schema: gw.schema })
     try {
-      const row = db.prepare('SELECT * FROM sticky_sessions WHERE key = ?').get('conv-long-n')
+      const row = await db.prepare('SELECT * FROM sticky_sessions WHERE key = $1').get('p:anthropic:conv-long-n')
       assert.ok(row, 'sticky binding row should exist in DB')
-      assert.equal(row.session_id, null)
+      assert.equal(typeof row.session_id, 'string')
       assert.ok(row.hits >= 6)
     } finally {
-      db.close()
+      await db.close()
     }
   } finally {
     await gw.stop()

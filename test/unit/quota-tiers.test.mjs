@@ -109,8 +109,8 @@ test('buildRouting exposes effective Codex routing to the panel', () => {
   assert.equal(data.codex.protocols['openai.responses'].enabled, true)
 })
 
-test('canAccept uses per-tier 5h and weekly lines', () => {
-  const q = new AccountQuota({
+test('canAccept uses per-tier 5h and weekly lines', async () => {
+  const q = await new AccountQuota({
     dataDir: tmpDir(),
     config: {
       quota: { block_on_5h: true, block_on_7d: true, gate_overshoot: 0 },
@@ -120,7 +120,7 @@ test('canAccept uses per-tier 5h and weekly lines', () => {
         max: { max_concurrency: 4, safety_ratio: 0.95, weekly_safety_ratio: 0.95, warn_ratio: 0.85 },
       },
     },
-  })
+  }).init()
   q.ensure({ account_id: 'pro-1' })
   q.setAccountTier('pro-1', 'pro')
   q.ingestHeaders('pro-1', { 'anthropic-ratelimit-unified-5h-utilization': '0.86' })
@@ -138,8 +138,8 @@ test('canAccept uses per-tier 5h and weekly lines', () => {
   assert.equal(q.canAccept('max-1').reason, 'quota_7d_safety')
 })
 
-test('reloadConfig picks up saved weekly line without process restart shape', () => {
-  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+test('reloadConfig picks up saved weekly line without process restart shape', async () => {
+  const q = await new AccountQuota({ dataDir: tmpDir(), config: {} }).init()
   q.ensure({ account_id: 'p' })
   q.setAccountTier('p', 'pro')
   // Pro default 7d line 0.80 + default 0.05 overshoot.
@@ -152,15 +152,15 @@ test('reloadConfig picks up saved weekly line without process restart shape', ()
   assert.equal(q.canAccept('p').ok, true)
 })
 
-test('applyTierConcurrency writes only the matching tier', () => {
-  const q = new AccountQuota({
+test('applyTierConcurrency writes only the matching tier', async () => {
+  const q = await new AccountQuota({
     dataDir: tmpDir(),
     config: { concurrency: { default_max_per_account: 20 } },
     accounts: [
       { account_id: 'a-pro', vm_id: 'vm-1', max_concurrency: 20 },
       { account_id: 'a-max', vm_id: 'vm-2', max_concurrency: 20 },
     ],
-  })
+  }).init()
   q.setAccountTier('a-pro', 'pro')
   q.setAccountTier('a-max', 'max')
   q.applyTierConcurrency({
@@ -172,8 +172,8 @@ test('applyTierConcurrency writes only the matching tier', () => {
   assert.equal(q.repo.get('a-max').max_concurrency, 4)
 })
 
-test('applyTierRpm writes only the matching tier and skips override', () => {
-  const q = new AccountQuota({
+test('applyTierRpm writes only the matching tier and skips override', async () => {
+  const q = await new AccountQuota({
     dataDir: tmpDir(),
     config: {},
     accounts: [
@@ -181,7 +181,7 @@ test('applyTierRpm writes only the matching tier and skips override', () => {
       { account_id: 'r-max', vm_id: 'vm-2', max_rpm: 0 },
       { account_id: 'r-pin', vm_id: 'vm-3', max_rpm: 99 },
     ],
-  })
+  }).init()
   q.setAccountTier('r-pro', 'pro')
   q.setAccountTier('r-max', 'max')
   q.setMaxRpm('r-pin', 99, { override: true })
@@ -207,8 +207,8 @@ test('resolveTierPolicy reads live config', () => {
   assert.equal(p.weekly_safety_ratio, 0.7)
 })
 
-test('saving Pro 5h=80% lands on policyFor limit_5h', () => {
-  const q = new AccountQuota({
+test('saving Pro 5h=80% lands on policyFor limit_5h', async () => {
+  const q = await new AccountQuota({
     dataDir: tmpDir(),
     config: {
       quota: { block_on_5h: true, block_on_7d: true, gate_overshoot: 0 },
@@ -216,7 +216,7 @@ test('saving Pro 5h=80% lands on policyFor limit_5h', () => {
         pro: { limit_5h: 0.8, limit_7d: 0.8, max_concurrency: 2 },
       }),
     },
-  })
+  }).init()
   q.ensure({ account_id: 'pro-80' })
   q.setAccountTier('pro-80', 'pro')
   assert.equal(q.policyFor(q.repo.get('pro-80')).limit_5h, 0.8)
@@ -224,8 +224,8 @@ test('saving Pro 5h=80% lands on policyFor limit_5h', () => {
   assert.equal(q.canAccept('pro-80').reason, 'quota_5h_safety')
 })
 
-test('Pro 95% runs one call at a time from 90% and blocks at line + overshoot', () => {
-  const q = new AccountQuota({
+test('Pro 95% runs one call at a time from 90% and blocks at line + overshoot', async () => {
+  const q = await new AccountQuota({
     dataDir: tmpDir(),
     config: {
       quota: { block_on_5h: true, block_on_7d: true },
@@ -233,7 +233,7 @@ test('Pro 95% runs one call at a time from 90% and blocks at line + overshoot', 
         pro: { limit_5h: 0.95, limit_7d: 0.95, max_concurrency: 4 },
       }),
     },
-  })
+  }).init()
   q.ensure({ account_id: 'pro-95' })
   q.setAccountTier('pro-95', 'pro')
   q.ingestHeaders('pro-95', {
@@ -256,14 +256,14 @@ test('Pro 95% runs one call at a time from 90% and blocks at line + overshoot', 
   assert.equal(q.canAccept('pro-95').reason, 'quota_5h_safety')
 })
 
-test('reloadConfig applies conc and rpm without rewriting account rows', () => {
-  const q = new AccountQuota({
+test('reloadConfig applies conc and rpm without rewriting account rows', async () => {
+  const q = await new AccountQuota({
     dataDir: tmpDir(),
     config: {
       quota: { block_on_5h: true, block_on_7d: true },
       tiers: { default: { max_concurrency: 2, max_rpm: 0 } },
     },
-  })
+  }).init()
   q.ensure({ account_id: 'live' })
   const acc = q.repo.get('live')
   assert.equal(q.limitFor(acc), 2)
@@ -276,8 +276,8 @@ test('reloadConfig applies conc and rpm without rewriting account rows', () => {
   assert.equal(q.rpmLimitFor(q.repo.get('live')), 12)
 })
 
-test('manual conc and rpm pins ignore live tier', () => {
-  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+test('manual conc and rpm pins ignore live tier', async () => {
+  const q = await new AccountQuota({ dataDir: tmpDir(), config: {} }).init()
   q.ensure({ account_id: 'pin' })
   q.setMaxConcurrency('pin', 1, { override: true })
   q.setMaxRpm('pin', 2, { override: true })

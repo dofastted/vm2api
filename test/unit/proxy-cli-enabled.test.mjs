@@ -166,11 +166,11 @@ test('OAuth commit after bind does not reset proxy_cli_enabled', async () => {
 test('package import with a proxy keeps proxy_cli_enabled even if the spec says false', async (t) => {
   const root = tmpRoot()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const db = createDatabase({ dbPath: ':memory:' })
-  const pool = new ProxyPool({ db })
-  t.after(() => {
+  const db = await createDatabase({ dbPath: ':memory:' })
+  const pool = await new ProxyPool({ db }).init()
+  t.after(async () => {
     pool.stopScheduler()
-    db.close()
+    await db.close()
   })
   const doc = buildVmPackage({
     vm: {

@@ -6,7 +6,7 @@ import { makeError, mapUpstreamError, rewritePoolErrorForClient, ErrorType, Erro
 import { refusalGuardPolicy } from '../core/refusal-guard.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
-import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { RuntimeSettings as SettingsRepo } from '../db/settings-state.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
 import { readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
 import { runProtocolIntercept } from './intercept-gate.mjs'
@@ -115,7 +115,7 @@ export async function peekCurrentAccount({
   if (!poolScheduler?.peekAccount) {
     return { ok: false, code: 'no_eligible_accounts' }
   }
-  const keyScope = keyScopeFromRequest(req)
+  const keyScope = await keyScopeFromRequest(req)
   const poolDenial = vmPoolDenial(keyScope)
   if (poolDenial) return { ok: false, code: ErrorCode.VM_POOL_UNAVAILABLE, message: poolDenial.message }
   // Same gate as Messages: a platform-scoped key must not hop to the other platform's VMs.
@@ -126,7 +126,7 @@ export async function peekCurrentAccount({
     model,
     stickyKey,
     signal,
-    ownerScope: ownerScopeFromRequest(req, usersRepo),
+    ownerScope: await ownerScopeFromRequest(req, usersRepo),
     keyScope,
   })
 }
@@ -245,7 +245,7 @@ export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
 
 export async function handleUserCountTokens(req, res, deps) {
   const json = (...args) => deps.json(...args)
-  if (!deps.requireAuth(req, res)) return
+  if (!(await deps.requireAuth(req, res))) return
   let inbound
   try {
     inbound = await deps.readBody(req, inboundBodyLimit(deps.getRouting?.(), deps.cfg.limits.max_body_bytes))
@@ -372,7 +372,7 @@ export async function resolveUsageWindows({
 
 export async function handleUserUsage(req, res, deps) {
   const json = (...args) => deps.json(...args)
-  if (!deps.requireAuth(req, res)) return
+  if (!(await deps.requireAuth(req, res))) return
   const peeked = await peekCurrentAccount({
     poolScheduler: typeof deps.getPoolScheduler === 'function' ? deps.getPoolScheduler() : deps.poolScheduler,
     stickyRouter: deps.stickyRouter,

@@ -32,33 +32,33 @@ export class GroupsRepo {
   constructor(db = getDb()) {
     this.db = db
     this._list = db.prepare('SELECT * FROM groups WHERE deleted_at IS NULL ORDER BY sort_order, id')
-    this._get = db.prepare('SELECT * FROM groups WHERE id = ? AND deleted_at IS NULL')
-    this._getByName = db.prepare('SELECT * FROM groups WHERE name = ? AND deleted_at IS NULL')
+    this._get = db.prepare('SELECT * FROM groups WHERE id = $1 AND deleted_at IS NULL')
+    this._getByName = db.prepare('SELECT * FROM groups WHERE name = $1 AND deleted_at IS NULL')
   }
 
-  list() {
-    return this._list.all().map(rowToRec)
+  async list() {
+    return (await this._list.all()).map(rowToRec)
   }
 
-  getById(id) {
-    return rowToRec(this._get.get(id))
+  async getById(id) {
+    return rowToRec(await this._get.get(id))
   }
 
-  getByName(name) {
-    return rowToRec(this._getByName.get(String(name || '').trim()))
+  async getByName(name) {
+    return rowToRec(await this._getByName.get(String(name || '').trim()))
   }
 
   /** The coding group — where keys/accounts land unless told otherwise. */
-  getDefault() {
-    return this.getById(DEFAULT_GROUP_ID)
+  async getDefault() {
+    return await this.getById(DEFAULT_GROUP_ID)
   }
 
   /** Patch editable attributes only (name/platform/id are fixed). */
-  update(id, patch = {}) {
+  async update(id, patch = {}) {
     const cols = EDITABLE.filter((c) => patch[c] !== undefined)
-    if (!cols.length) return this.getById(id)
-    const sql = `UPDATE groups SET ${cols.map((c) => `${c} = ?`).join(', ')}, updated_at = ? WHERE id = ? AND deleted_at IS NULL`
-    this.db.prepare(sql).run(
+    if (!cols.length) return await this.getById(id)
+    const sql = `UPDATE groups SET ${cols.map((c, i) => `${c} = $${i + 1}`).join(', ')}, updated_at = $${cols.length + 1} WHERE id = $${cols.length + 2} AND deleted_at IS NULL`
+    await this.db.prepare(sql).run(
       ...cols.map((c) => {
         if (c === 'is_exclusive') return patch[c] ? 1 : 0
         return patch[c]
@@ -66,12 +66,12 @@ export class GroupsRepo {
       new Date().toISOString(),
       id,
     )
-    return this.getById(id)
+    return await this.getById(id)
   }
 
   /** Effective billing multiplier for a group id (missing group → 1). */
-  rateMultiplier(id) {
-    const g = this.getById(id ?? DEFAULT_GROUP_ID)
+  async rateMultiplier(id) {
+    const g = await this.getById(id ?? DEFAULT_GROUP_ID)
     return g ? g.rate_multiplier : 1
   }
 }

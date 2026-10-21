@@ -79,15 +79,15 @@ export function keyScopeFromRecord(rec) {
   }
 }
 
-function defaultPoolLookup(id) {
+async function defaultPoolLookup(id) {
   if (!isDbOpen()) return null
-  return new VmPoolsRepo(getDb()).get(id)
+  return await new VmPoolsRepo(getDb()).get(id)
 }
 
 /** Live membership. A missing, disabled, or empty pool never widens to the global set. */
-export function applyVmPool(scope, lookup = defaultPoolLookup) {
+export async function applyVmPool(scope, lookup = defaultPoolLookup) {
   if (!scope?.vm_pool_id) return scope
-  const pool = lookup?.(scope.vm_pool_id) || null
+  const pool = (await lookup?.(scope.vm_pool_id)) || null
   if (!pool) return { ...scope, allowed_vms: [], vm_pool_error: 'missing' }
   if (!pool.enabled) return { ...scope, allowed_vms: [], vm_pool_error: 'disabled' }
   const ids = Array.isArray(pool.vm_ids) ? pool.vm_ids.map((id) => String(id || '').trim()).filter(Boolean) : []
@@ -95,9 +95,9 @@ export function applyVmPool(scope, lookup = defaultPoolLookup) {
   return { ...scope, allowed_vms: ids, vm_pool_error: null }
 }
 
-export function keyScopeFromRequest(req, lookup = defaultPoolLookup) {
+export async function keyScopeFromRequest(req, lookup = defaultPoolLookup) {
   if (!req || req.apiKeyKind === 'master') return { group_type: 'all', allowed_vms: [], vm_pool_id: null }
-  return applyVmPool(keyScopeFromRecord(req.apiKeyRecord), lookup)
+  return await applyVmPool(keyScopeFromRecord(req.apiKeyRecord), lookup)
 }
 
 export function vmPoolDenial(scope) {

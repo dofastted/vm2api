@@ -3,7 +3,9 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
+import { EventEmitter } from 'node:events'
+import { getDb } from '../../src/lib/db/database.mjs'
+import { ClusterManager } from '../../src/lib/cluster/cluster-manager.mjs'
 import {
   describeNativePayload,
   isDarwinArm64MachO,
@@ -183,13 +185,10 @@ test('node platform comes from uname -s and the darwin host stats parse like /pr
   assert.equal(stats.containers_mem, 1048576)
 })
 
-test('platform is stored per node without touching the edit version', () => {
-  const db = new DatabaseSync(':memory:')
-  for (const name of ['026_cluster_nodes.sql', '040_cluster_node_platform.sql']) {
-    db.exec(fs.readFileSync(new URL(`../../src/lib/db/migrations/${name}`, import.meta.url), 'utf8'))
-  }
+test('platform is stored per node without touching the edit version', async () => {
+  const db = getDb()
   const repo = new ClusterNodesRepo(db)
-  const node = repo.insert({
+  const node = await repo.insert({
     id: 'node-m',
     label: 'mini',
     host: 'mini.example.test',
@@ -200,12 +199,64 @@ test('platform is stored per node without touching the edit version', () => {
     host_key_alg: 'ssh-ed25519',
     host_key_sha256: 'SHA256:x',
   })
-  assert.equal(repo.platform('node-m'), 'linux')
-  assert.equal(repo.setPlatform('node-m', 'darwin'), true)
-  assert.equal(repo.platform('node-m'), 'darwin')
-  assert.equal(repo.get('node-m').updated_at, node.updated_at)
-  assert.equal(repo.platform('node-gone'), null)
-  db.close()
+  assert.equal(await repo.platform('node-m'), 'linux')
+  assert.equal(await repo.setPlatform('node-m', 'darwin'), true)
+  assert.equal(await repo.platform('node-m'), 'darwin')
+  assert.equal((await repo.get('node-m')).updated_at, node.updated_at)
+  assert.equal(await repo.platform('node-gone'), null)
+  await db.close()
+})
+
+test('remote host discovery waits for the persisted platform and preserves one in-flight read', async () => {
+  let releaseSave
+  const savePending = new Promise((resolve) => {
+    releaseSave = resolve
+  })
+  let signalSave
+  const saveStarted = new Promise((resolve) => {
+    signalSave = resolve
+  })
+  const manager = new ClusterManager({
+    repo: {
+      setPlatform: async () => {
+        signalSave()
+        await savePending
+      },
+    },
+    dataDir: '/unused',
+    logger: { log() {}, warn() {} },
+  })
+  manager.nodes.set('node-mac', { id: 'node-mac' })
+  manager.platforms.set('node-mac', 'linux')
+  const client = {
+    exec(_command, callback) {
+      const stream = new EventEmitter()
+      stream.stderr = new EventEmitter()
+      stream.close = () => {}
+      callback(null, stream)
+      queueMicrotask(() => {
+        stream.emit('data', Buffer.from('501\n20\n/Users/kin\nsudo\nDarwin\n'))
+        stream.emit('exit', 0)
+        stream.emit('close')
+      })
+    },
+  }
+  manager.links.set('node-mac', { state: 'ready', client })
+  const pending = manager.remoteHost('node-mac')
+  assert.equal(manager.remoteHost('node-mac'), pending)
+  let settled = false
+  pending.then(() => {
+    settled = true
+  })
+  try {
+    await saveStarted
+    await Promise.resolve()
+    assert.equal(settled, false)
+  } finally {
+    releaseSave()
+  }
+  assert.equal((await pending).platform, 'darwin')
+  assert.equal(manager.nodePlatform('node-mac'), 'darwin')
 })
 
 function bindMac(t, { ready = true, root = '/Users/kin/.vm2api', projectRoot = '/unused' } = {}) {

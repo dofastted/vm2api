@@ -149,20 +149,20 @@ function seedLegacyFiles() {
   fs.writeFileSync(path.join(vmsDir, 'active.json'), JSON.stringify({ active_vm: 'vm-l1' }))
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-import-'))
   dataDir = path.join(root, 'data')
-  openDatabase({ dataDir })
+  await openDatabase({ dataDir })
 })
 
-afterEach(() => {
-  closeDatabase()
+afterEach(async () => {
+  await closeDatabase()
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('imports every legacy store and is idempotent', () => {
+test('imports every legacy store and is idempotent', async () => {
   seedLegacyFiles()
-  const res = runLegacyImport({ dataDir, projectRoot: root })
+  const res = await runLegacyImport({ dataDir, projectRoot: root })
   assert.equal(res.imported, true)
   assert.deepEqual(
     { ...res.counts },
@@ -179,33 +179,33 @@ test('imports every legacy store and is idempotent', () => {
     },
   )
   const db = getDb()
-  assert.equal(new ApiKeysRepo(db).getById('key_legacy1').tokens_in, 300)
-  assert.equal(new AccountsRepo(db).get('acct-legacy').requests, 7)
-  assert.equal(new AccountsRepo(db).allocationCount('acct-legacy'), 2)
-  assert.equal(new StickyRepo(db).get('conv-legacy').hits, 4)
-  assert.equal(new ProxiesRepo(db).loadAll()[0].bound_vm_id, 'vm-l1')
-  assert.equal(new ProxiesRepo(db).getConfig().probe_interval_min, 30)
-  assert.equal(new UsageLogsRepo(db).count(), 2)
-  assert.ok(new UsageLogsRepo(db).getDebug('rid-l1'))
-  const vmRow = new VmsRepo(db).get('vm-l1')
+  assert.equal((await new ApiKeysRepo(db).getById('key_legacy1')).tokens_in, 300)
+  assert.equal((await new AccountsRepo(db).get('acct-legacy')).requests, 7)
+  assert.equal(await new AccountsRepo(db).allocationCount('acct-legacy'), 2)
+  assert.equal((await new StickyRepo(db).get('conv-legacy')).hits, 4)
+  assert.equal((await new ProxiesRepo(db).loadAll())[0].bound_vm_id, 'vm-l1')
+  assert.equal((await new ProxiesRepo(db).getConfig()).probe_interval_min, 30)
+  assert.equal(await new UsageLogsRepo(db).count(), 2)
+  assert.ok(await new UsageLogsRepo(db).getDebug('rid-l1'))
+  const vmRow = await new VmsRepo(db).get('vm-l1')
   assert.equal(vmRow.access_token, null)
   assert.equal(vmRow.vm.claude.has_access, true)
   assert.equal(vmRow.vm.claude.access_token, undefined)
-  assert.equal(new VmsRepo(db).getActiveVmId(), 'vm-l1')
+  assert.equal(await new VmsRepo(db).getActiveVmId(), 'vm-l1')
 
   // second run skips
-  const res2 = runLegacyImport({ dataDir, projectRoot: root })
+  const res2 = await runLegacyImport({ dataDir, projectRoot: root })
   assert.equal(res2.imported, false)
   assert.ok(res2.already?.at)
-  assert.equal(new ApiKeysRepo(db).count(), 1)
+  assert.equal(await new ApiKeysRepo(db).count(), 1)
 
   // original files untouched
   assert.ok(fs.existsSync(path.join(dataDir, 'api-keys.json')))
   assert.ok(fs.existsSync(path.join(dataDir, 'proxy-pool.json')))
 })
 
-test('missing files import cleanly with zero counts', () => {
-  const res = runLegacyImport({ dataDir, projectRoot: root })
+test('missing files import cleanly with zero counts', async () => {
+  const res = await runLegacyImport({ dataDir, projectRoot: root })
   assert.equal(res.imported, true)
   assert.equal(
     Object.values(res.counts).reduce((a, b) => a + b, 0),
@@ -213,14 +213,14 @@ test('missing files import cleanly with zero counts', () => {
   )
 })
 
-test('corrupt file is skipped, counted as error, others still import', () => {
+test('corrupt file is skipped, counted as error, others still import', async () => {
   seedLegacyFiles()
   fs.writeFileSync(path.join(dataDir, 'api-keys.json'), '{ not json')
-  const res = runLegacyImport({ dataDir, projectRoot: root })
+  const res = await runLegacyImport({ dataDir, projectRoot: root })
   assert.equal(res.imported, true)
   assert.equal(res.counts.api_keys, 0)
   assert.ok(res.counts.errors >= 1)
   assert.equal(res.counts.accounts, 1)
   assert.equal(res.counts.vms, 1)
-  assert.ok(new SettingsRepo(getDb()).get('legacy_import_done'))
+  assert.ok(await new SettingsRepo(getDb()).get('legacy_import_done'))
 })

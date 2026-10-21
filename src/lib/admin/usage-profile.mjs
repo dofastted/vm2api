@@ -88,24 +88,24 @@ export function riskPatchForProfile(mode) {
 /**
  * @param {{ mode: string, persistRouting: (patch: object) => unknown, settings: { get: Function, set: Function }, distillFile: string, setDistill?: (rules: object) => void }} input
  */
-export function applyUsageProfile({ mode, persistRouting, settings, distillFile, setDistill } = {}) {
+export async function applyUsageProfile({ mode, persistRouting, settings, distillFile, setDistill } = {}) {
   const profile = normalizeUsageProfile(mode)
   if (!profile) {
     const err = new Error('mode 必须是 personal 或 relay')
     err.code = 'invalid_profile'
     throw err
   }
-  const routing = persistRouting(routingPatchForProfile(profile))
+  const routing = await persistRouting(routingPatchForProfile(profile))
   const risk = riskPatchForProfile(profile)
   const distill = saveDistillRules(distillFile, risk.distill)
   if (typeof setDistill === 'function') setDistill(distill)
-  const jev = applyJevPatch(settings, risk.jev)
+  const jev = await applyJevPatch(settings, risk.jev)
   if (!jev.ok) {
     const err = new Error(jev.problems.join('；'))
     err.code = 'invalid_profile'
     throw err
   }
-  const refusal = applyRefusalGuardPatch(settings, risk.refusal)
+  const refusal = await applyRefusalGuardPatch(settings, risk.refusal)
   if (!refusal.ok) {
     const err = new Error(refusal.problems.join('；'))
     err.code = 'invalid_profile'

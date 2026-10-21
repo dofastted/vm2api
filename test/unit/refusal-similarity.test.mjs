@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { createDatabase } from '../../src/lib/db/database.mjs'
+import { getDb } from '../../src/lib/db/database.mjs'
 import { RefusalGuardsRepo } from '../../src/lib/db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../../src/lib/db/repos/refusal-device-blocks-repo.mjs'
 import {
@@ -99,9 +99,9 @@ test('a Responses prompt with a small tail edit stays above the similarity line'
   assert.ok(nearScore >= REFUSAL_SIMILARITY, `near ${nearScore}`)
 })
 
-test('stored near-duplicate blocks and then the device blocks any later prompt', () => {
+test('stored near-duplicate blocks and then the device blocks any later prompt', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-near-'))
-  const db = createDatabase({ dataDir: dir })
+  const db = await getDb()
   try {
     const guards = new RefusalGuardsRepo(db)
     const devices = new RefusalDeviceBlocksRepo(db)
@@ -109,7 +109,7 @@ test('stored near-duplicate blocks and then the device blocks any later prompt',
       metadata: { user_id: { device_id: 'device-aaaabbbbcccc', session_id: 'sess-1' } },
     })
     const fp = refusalFingerprint(original)
-    guards.remember({
+    await guards.remember({
       fingerprint: fp,
       model: original.model,
       signature: refusalPromptSignature(original),
@@ -119,41 +119,41 @@ test('stored near-duplicate blocks and then the device blocks any later prompt',
       metadata: { user_id: { device_id: 'device-aaaabbbbcccc', session_id: 'sess-1' } },
     })
     assert.notEqual(refusalFingerprint(edited), fp)
-    const similar = matchStoredRefusal({ inbound: edited, body: edited, repo: guards, devices })
+    const similar = await matchStoredRefusal({ inbound: edited, body: edited, repo: guards, devices })
     assert.equal(similar.kind, 'similar')
     assert.ok(similar.score >= REFUSAL_SIMILARITY)
-    devices.block({ deviceId: similar.deviceId, fingerprint: similar.fingerprint, reason: 'refusal_similar' })
+    await devices.block({ deviceId: similar.deviceId, fingerprint: similar.fingerprint, reason: 'refusal_similar' })
     const other = body('completely different short ask', {
       metadata: { user_id: { device_id: 'device-aaaabbbbcccc', session_id: 'sess-2' } },
     })
-    const banned = matchStoredRefusal({ inbound: other, body: other, repo: guards, devices })
+    const banned = await matchStoredRefusal({ inbound: other, body: other, repo: guards, devices })
     assert.equal(banned.kind, 'device')
     assert.equal(inboundRefusalDeviceId({ inbound: { device_id: 'short' } }), '')
-    assert.equal(devices.block({ deviceId: '' }), null)
+    assert.equal(await devices.block({ deviceId: '' }), null)
   } finally {
-    db.close()
+    await db.close()
   }
 })
 
-test('different user text under the same system is not a near match', () => {
+test('different user text under the same system is not a near match', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-near-'))
-  const db = createDatabase({ dataDir: dir })
+  const db = await getDb()
   try {
     const guards = new RefusalGuardsRepo(db)
     const stored = body(longUser('payload-a'))
-    guards.remember({
+    await guards.remember({
       fingerprint: refusalFingerprint(stored),
       model: stored.model,
       signature: refusalPromptSignature(stored),
     })
     const other = body(longUser('unrelated-question-about-refactoring-the-scheduler'))
-    assert.equal(matchStoredRefusal({ inbound: other, body: other, repo: guards, devices: null }), null)
+    assert.equal(await matchStoredRefusal({ inbound: other, body: other, repo: guards, devices: null }), null)
   } finally {
-    db.close()
+    await db.close()
   }
 })
 
-test('panel policy defaults on at 90 and rejects an unknown threshold', () => {
+test('panel policy defaults on at 90 and rejects an unknown threshold', async () => {
   assert.deepEqual(refusalGuardPolicy(), {
     enabled: true,
     similarity_enabled: true,
@@ -165,8 +165,8 @@ test('panel policy defaults on at 90 and rejects an unknown threshold', () => {
     get: (key, fallback) => (settings.has(key) ? settings.get(key) : fallback),
     set: (key, value) => settings.set(key, value),
   }
-  assert.equal(applyRefusalGuardPatch(store, { similarity: 70 }).ok, false)
-  assert.equal(applyRefusalGuardPatch(store, { similarity: 85, similarity_enabled: false }).ok, true)
+  assert.equal((await applyRefusalGuardPatch(store, { similarity: 70 })).ok, false)
+  assert.equal((await applyRefusalGuardPatch(store, { similarity: 85, similarity_enabled: false })).ok, true)
   assert.equal(normalizeRefusalSimilarity(85), 85)
   assert.deepEqual(
     refusalGuardPolicy((key, fallback) => store.get(key, fallback)),
@@ -179,26 +179,26 @@ test('panel policy defaults on at 90 and rejects an unknown threshold', () => {
   )
 })
 
-test('turning similarity or device block off skips that check', () => {
+test('turning similarity or device block off skips that check', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-near-'))
-  const db = createDatabase({ dataDir: dir })
+  const db = await getDb()
   try {
     const guards = new RefusalGuardsRepo(db)
     const devices = new RefusalDeviceBlocksRepo(db)
     const stored = body(longUser('payload'), {
       metadata: { user_id: { device_id: 'device-aaaabbbbcccc', session_id: 'sess-1' } },
     })
-    guards.remember({
+    await guards.remember({
       fingerprint: refusalFingerprint(stored),
       model: stored.model,
       signature: refusalPromptSignature(stored),
     })
-    devices.block({ deviceId: 'device-aaaabbbbcccc', reason: 'refusal_guard' })
+    await devices.block({ deviceId: 'device-aaaabbbbcccc', reason: 'refusal_guard' })
     const edited = body(longUser('payload').slice(0, -20) + 'tail-edit-xx', {
       metadata: { user_id: { device_id: 'device-aaaabbbbcccc', session_id: 'sess-9' } },
     })
     assert.equal(
-      matchStoredRefusal({
+      await matchStoredRefusal({
         inbound: edited,
         body: edited,
         repo: guards,
@@ -209,6 +209,6 @@ test('turning similarity or device block off skips that check', () => {
       null,
     )
   } finally {
-    db.close()
+    await db.close()
   }
 })

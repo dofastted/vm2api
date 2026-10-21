@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 // Billing contract audit: web consumers vs backend producers, cost basis per aggregation,
 // and (optional) usage_logs data checks.
-//   node scripts/audit-billing-contract.mjs [path/to/kin.db] [--json]
+//   node scripts/audit-billing-contract.mjs [--database] [--json]
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs'
 import { join, relative } from 'node:path'
+import { openAuditDb } from './audit-db.mjs'
 
 const ROOT = new URL('..', import.meta.url).pathname
 const args = process.argv.slice(2)
 const asJson = args.includes('--json')
-const dbPath = args.find((a) => !a.startsWith('--'))
+const inspectDatabase = args.includes('--database')
 
 function walk(dir, exts, skip = /node_modules|dist|\.test\.|routeTree\.gen/) {
   const out = []
@@ -66,7 +67,7 @@ const unused = [...src.entries()]
 // 3) cost basis per aggregation SQL (total_cost = official list price, actual_cost = rate-multiplied)
 const repo = readFileSync(join(ROOT, 'src/lib/db/repos/usage-logs-repo.mjs'), 'utf8')
 const basis = []
-const methodRe = /^ {2}(_?[a-zA-Z]+)\([^)]*\)\s*\{/gm
+const methodRe = /^ {2}(?:async )?(_?[a-zA-Z]+)\([^)]*\)\s*\{/gm
 const starts = [...repo.matchAll(methodRe)].map((m) => ({ name: m[1], at: m.index }))
 starts.forEach((s, i) => {
   const body = repo.slice(s.at, starts[i + 1]?.at ?? repo.length)
@@ -95,44 +96,50 @@ const backfillRepricesUnpriced = !bf || !/pricing_model IS NULL/.test(bf[2])
 
 // 5) optional DB checks
 let db = null
-if (dbPath) {
-  if (!existsSync(dbPath)) {
-    console.error(`db not found: ${dbPath}`)
-    process.exit(2)
-  }
-  const { DatabaseSync } = await import('node:sqlite')
-  const d = new DatabaseSync(dbPath, { readOnly: true })
-  const colNames = d
-    .prepare("SELECT name FROM pragma_table_info('usage_logs')")
-    .all()
-    .map((r) => r.name)
-  const q = (sql) => d.prepare(sql).all()
-  db = {
-    has_service_tier_col: colNames.includes('service_tier'),
-    has_speed_col: colNames.includes('speed'),
-    unpriced_rows: q("SELECT COUNT(*) n FROM usage_logs WHERE pricing_model = 'unpriced'")[0],
-    band_distribution: colNames.includes('service_tier')
-      ? q(`SELECT service_tier, speed, long_context, COUNT(*) n, ROUND(SUM(COALESCE(total_cost,0)),4) cost
+if (inspectDatabase) {
+  const d = await openAuditDb()
+  try {
+    const colNames = (
+      await d
+        .prepare(
+          "SELECT column_name AS name FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'usage_logs'",
+        )
+        .all()
+    ).map((r) => r.name)
+    const q = (sql) => d.prepare(sql).all()
+    db = {
+      has_service_tier_col: colNames.includes('service_tier'),
+      has_speed_col: colNames.includes('speed'),
+      unpriced_rows: (await q("SELECT COUNT(*) n FROM usage_logs WHERE pricing_model = 'unpriced'"))[0],
+      band_distribution: colNames.includes('service_tier')
+        ? await q(`SELECT service_tier, speed, long_context, COUNT(*) n, ROUND((SUM(COALESCE(total_cost,0)))::numeric,4) cost
           FROM usage_logs GROUP BY 1, 2, 3 ORDER BY 4 DESC LIMIT 30`)
-      : null,
-    totals: q(`SELECT COUNT(*) n,
-        SUM(total_cost IS NULL) null_total,
-        SUM(actual_cost IS NULL AND total_cost IS NOT NULL) null_actual,
-        ROUND(SUM(COALESCE(total_cost,0)),4) sum_total,
-        ROUND(SUM(COALESCE(actual_cost,total_cost,0)),4) sum_actual,
-        SUM(COALESCE(rate_multiplier,1) <> 1) rated_rows
-      FROM usage_logs`)[0],
-    unpriced_with_tokens: q(`SELECT COALESCE(upstream_model,model,requested_model) m, COUNT(*) n
+        : null,
+      totals: (
+        await q(`SELECT COUNT(*) n,
+        COUNT(*) FILTER (WHERE total_cost IS NULL) null_total,
+        COUNT(*) FILTER (WHERE actual_cost IS NULL AND total_cost IS NOT NULL) null_actual,
+        ROUND((SUM(COALESCE(total_cost,0)))::numeric,4) sum_total,
+        ROUND((SUM(COALESCE(actual_cost,total_cost,0)))::numeric,4) sum_actual,
+        COUNT(*) FILTER (WHERE COALESCE(rate_multiplier,1) <> 1) rated_rows
+      FROM usage_logs`)
+      )[0],
+      unpriced_with_tokens: await q(`SELECT COALESCE(upstream_model,model,requested_model) m, COUNT(*) n
         FROM usage_logs WHERE (total_cost IS NULL OR total_cost = 0)
           AND COALESCE(input_tokens,0)+COALESCE(output_tokens,0) > 0
         GROUP BY 1 ORDER BY 2 DESC LIMIT 20`),
-    pricing_model: q(`SELECT pricing_model, COUNT(*) n, ROUND(SUM(total_cost),4) cost
+      pricing_model: await q(`SELECT pricing_model, COUNT(*) n, ROUND((SUM(total_cost))::numeric,4) cost
         FROM usage_logs GROUP BY 1 ORDER BY 2 DESC LIMIT 30`),
-    long_context_candidates: q(`SELECT pricing_model, COUNT(*) n FROM usage_logs
+      long_context_candidates: await q(`SELECT pricing_model, COUNT(*) n FROM usage_logs
         WHERE COALESCE(input_tokens,0)+COALESCE(cache_read_tokens,0)+COALESCE(cache_creation_tokens,0) > 200000
         GROUP BY 1 ORDER BY 2 DESC`),
-    total_vs_parts_mismatch: q(`SELECT COUNT(*) n FROM usage_logs WHERE total_cost IS NOT NULL
-        AND ABS(total_cost - (COALESCE(input_cost,0)+COALESCE(output_cost,0)+COALESCE(cache_read_cost,0)+COALESCE(cache_creation_cost,0))) > 1e-6`)[0],
+      total_vs_parts_mismatch: (
+        await q(`SELECT COUNT(*) n FROM usage_logs WHERE total_cost IS NOT NULL
+        AND ABS(total_cost - (COALESCE(input_cost,0)+COALESCE(output_cost,0)+COALESCE(cache_read_cost,0)+COALESCE(cache_creation_cost,0))) > 1e-6`)
+      )[0],
+    }
+  } finally {
+    await d.close()
   }
 }
 
@@ -170,5 +177,5 @@ if (asJson) {
   if (db) {
     console.log('\n== 5. DB ==')
     console.log(JSON.stringify(db, null, 2))
-  } else console.log('\n(未给 DB 路径，跳过数据检查)')
+  } else console.log('\n(未传 --database，跳过数据检查)')
 }

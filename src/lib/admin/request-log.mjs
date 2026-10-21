@@ -1,5 +1,5 @@
 /**
- * Request logging — sub2api UsageLog + access-log inspired (SQLite-backed).
+ * Request logging — sub2api UsageLog + access-log inspired (PostgreSQL-backed).
  *
  * Modes:
  *   off    — no writes
@@ -19,6 +19,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { redactSecrets } from '../core/security.mjs'
 import { resolveStoreDb } from '../db/database.mjs'
+import { integerValue } from '../db/integers.mjs'
 import { UsageLogsRepo } from '../db/repos/usage-logs-repo.mjs'
 import { classifyRequestError, resolveMutedErrorClasses } from './error-class.mjs'
 import { costColumnsFromUsage, normalizeUsage } from './pricing.mjs'
@@ -114,9 +115,9 @@ function cacheCreationBreakdown(usage) {
     return { cache_creation_5m_tokens: null, cache_creation_1h_tokens: null }
   }
   const nested = usage.cache_creation
-  let five = Number(nested?.ephemeral_5m_input_tokens) || 0
-  let hour = Number(nested?.ephemeral_1h_input_tokens) || 0
-  const total = Number(usage.cache_creation_input_tokens ?? usage.cache_creation_tokens) || 0
+  let five = integerValue(nested?.ephemeral_5m_input_tokens)
+  let hour = integerValue(nested?.ephemeral_1h_input_tokens)
+  const total = integerValue(usage.cache_creation_input_tokens ?? usage.cache_creation_tokens)
   if (five === 0 && hour === 0 && total > 0) {
     if (usage.cache_ttl === '1h') hour = total
     else five = total
@@ -128,8 +129,8 @@ function cacheCreationBreakdown(usage) {
 }
 
 function webSearchRequestsOf(usage) {
-  const n = Number(usage?.server_tool_use?.web_search_requests ?? usage?.web_search_requests)
-  return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0
+  const n = integerValue(usage?.server_tool_use?.web_search_requests ?? usage?.web_search_requests)
+  return n > 0 ? n : 0
 }
 
 const PRICED_COLUMN_KEYS = [
@@ -388,9 +389,10 @@ export class RequestLogStore {
     this._mem = [] // recent normal summaries for panel hot path
     this._memMax = 200
     this._cleanupTimer = null
+    this._cleanupPending = new Set()
   }
 
-  setConfig({ mode, retainDays, debugRetainDays, maxMb, mutedErrorClasses } = {}) {
+  async setConfig({ mode, retainDays, debugRetainDays, maxMb, mutedErrorClasses } = {}) {
     if (mode != null) {
       const m = String(mode).trim().toLowerCase()
       if (MODES.has(m)) this.mode = m
@@ -411,7 +413,7 @@ export class RequestLogStore {
     if (mutedErrorClasses !== undefined) {
       this.mutedErrorClasses = resolveMutedErrorClasses(mutedErrorClasses)
     }
-    return this.snapshot()
+    return await this.snapshot()
   }
 
   /** Kept for API compat + post-restore hook (state lives in DB). */
@@ -499,12 +501,13 @@ export class RequestLogStore {
    * Write normal summary always (unless off).
    * Write debug full record when mode===debug.
    */
-  finish(ctx, extra = {}) {
+  async finish(ctx, extra = {}) {
     if (!ctx || ctx.mode === 'off') return null
     const duration_ms = Math.max(0, Date.now() - (ctx.t0 || Date.now()))
-    const usage = normalizeUsage(disjointOpenaiUsage(extra.usage || {}) || {})
+    const rawUsage = disjointOpenaiUsage(extra.usage || {}) || {}
+    const usage = normalizeUsage(rawUsage)
     const breakdown = cacheCreationBreakdown(usage)
-    const webSearch = extra.web_search_requests ?? webSearchRequestsOf(usage)
+    const webSearch = extra.web_search_requests ?? webSearchRequestsOf(rawUsage)
     const billedUsage = {
       ...usage,
       input_tokens: extra.input_tokens ?? usage.input_tokens,
@@ -570,7 +573,7 @@ export class RequestLogStore {
       intercept: extra.intercept ? String(extra.intercept).slice(0, 400) : null,
       // sub2api ownership + billing columns
       user_id: extra.user_id ?? null,
-      vm_owner_user_id: this.repo.vmOwnerOf(extra.vm_id),
+      vm_owner_user_id: await this.repo.vmOwnerOf(extra.vm_id),
       group_id: extra.group_id ?? 1,
       rate_multiplier: Number.isFinite(Number(extra.rate_multiplier)) ? Number(extra.rate_multiplier) : 1,
       ...costColumnsForLog(billedUsage, extra.upstream_model || extra.model || extra.requested_model, extra),
@@ -582,9 +585,12 @@ export class RequestLogStore {
     const classified = classifyRequestError(summary)
     if (classified?.error_class) summary.error_class = classified.error_class
 
-    try {
-      this.repo.insertSummaryIfAbsent(summary)
-    } catch {}
+    // PostgreSQL text rejects NUL; JSON debug bodies can retain the original request.
+    for (const [key, value] of Object.entries(summary)) {
+      if (typeof value === 'string') summary[key] = value.replaceAll('\0', '\\u0000')
+    }
+
+    await this.repo.insertSummaryIfAbsent(summary)
     if (this.jsonlMirror) this._appendJsonl(summary)
     this._mem.push(summary)
     if (this._mem.length > this._memMax) this._mem = this._mem.slice(-this._memMax)
@@ -615,9 +621,7 @@ export class RequestLogStore {
             : null,
         response: ctx.response ? debugResponse(ctx.response) : null,
       }
-      try {
-        this.repo.insertDebug(summary.request_id || summary.id, summary.ts, debugRec)
-      } catch {}
+      await this.repo.insertDebug(summary.request_id || summary.id, summary.ts, debugRec)
     }
     return summary
   }
@@ -651,66 +655,66 @@ export class RequestLogStore {
     return (items || []).filter((row) => !row.error_class || !blocked.has(row.error_class))
   }
 
-  listNormal({ limit = 50, ...filters } = {}) {
-    return this.queryNormal({ limit, ...filters }).items
+  async listNormal({ limit = 50, ...filters } = {}) {
+    return (await this.queryNormal({ limit, ...filters })).items
   }
 
   /** Filtered + paginated query with total (panel). Default hides muted classes. */
-  queryNormal(opts = {}) {
+  async queryNormal(opts = {}) {
     const exclude = this._mutedExclude(opts)
-    const result = this.repo.query({ ...opts, exclude_error_class: exclude })
+    const result = await this.repo.query({ ...opts, exclude_error_class: exclude })
     result.items = this._dropMuted(result.items, exclude)
     return result
   }
 
-  exportRows(opts = {}) {
+  async exportRows(opts = {}) {
     const limit = Math.max(1, Math.min(5000, Number(opts.limit) || 2000))
-    return this.queryNormal({ ...opts, limit, offset: 0, maxLimit: 5000 })
+    return await this.queryNormal({ ...opts, limit, offset: 0, maxLimit: 5000 })
   }
 
   /** Aggregated stats for charts. */
-  aggregate(opts = {}) {
-    return this.repo.aggregate(opts)
+  async aggregate(opts = {}) {
+    return await this.repo.aggregate(opts)
   }
 
-  totals() {
-    return this.repo.totals()
+  async totals() {
+    return await this.repo.totals()
   }
 
-  hasSuccessfulRequest(opts = {}) {
-    return this.repo.hasSuccessfulRequest(opts)
+  async hasSuccessfulRequest(opts = {}) {
+    return await this.repo.hasSuccessfulRequest(opts)
   }
 
-  billingStats(opts = {}) {
-    return this.repo.billingStats(opts)
+  async billingStats(opts = {}) {
+    return await this.repo.billingStats(opts)
   }
 
-  ownerBilling(opts = {}) {
-    return this.repo.ownerBilling(opts)
+  async ownerBilling(opts = {}) {
+    return await this.repo.ownerBilling(opts)
   }
 
-  costByModel(opts = {}) {
-    return this.repo.costByModel(opts)
+  async costByModel(opts = {}) {
+    return await this.repo.costByModel(opts)
   }
 
-  vmUsageStats(opts = {}) {
-    return this.repo.vmUsageStats(opts)
+  async vmUsageStats(opts = {}) {
+    return await this.repo.vmUsageStats(opts)
   }
 
-  keyUsageStats(opts = {}) {
-    return this.repo.keyUsageStats(opts)
+  async keyUsageStats(opts = {}) {
+    return await this.repo.keyUsageStats(opts)
   }
 
   /** Windowed SLA / QPS / TTFT snapshot for overview + log analysis. */
-  windowStats(opts = {}) {
-    return this.repo.windowStats(opts)
+  async windowStats(opts = {}) {
+    return await this.repo.windowStats(opts)
   }
 
-  protocolEntryStats(opts = {}) {
-    return this.repo.protocolEntryStats(opts)
+  async protocolEntryStats(opts = {}) {
+    return await this.repo.protocolEntryStats(opts)
   }
 
-  listDebug({
+  async listDebug({
     limit = 20,
     exclude_error_class = null,
     include_muted = false,
@@ -719,20 +723,20 @@ export class RequestLogStore {
   } = {}) {
     const exclude = this._mutedExclude({ exclude_error_class, include_muted, error_class })
     const n = Math.max(1, Math.min(100, Number(limit) || 20))
-    const pool = this.repo.listDebug({ limit: exclude ? Math.min(200, n * 15) : n, owner_user_id })
+    const pool = await this.repo.listDebug({ limit: exclude ? Math.min(200, n * 15) : n, owner_user_id })
     const items = error_class ? pool.filter((row) => row.error_class === error_class) : this._dropMuted(pool, exclude)
     return items.slice(0, n)
   }
 
-  getDebug(requestId, { owner_user_id = null } = {}) {
+  async getDebug(requestId, { owner_user_id = null } = {}) {
     if (!requestId) return null
-    const rec = this.repo.getDebug(requestId) || this.repo.getByRequestId(requestId)
+    const rec = (await this.repo.getDebug(requestId)) || (await this.repo.getByRequestId(requestId))
     if (!rec) return null
-    if (owner_user_id && !this.repo.belongsToOwner(requestId, owner_user_id)) return null
+    if (owner_user_id && !(await this.repo.belongsToOwner(requestId, owner_user_id))) return null
     return rec
   }
 
-  snapshot() {
+  async snapshot() {
     return {
       mode: this.mode,
       retain_days: this.retainDays,
@@ -740,11 +744,11 @@ export class RequestLogStore {
       max_mb: this.maxMb,
       muted_error_classes: this.mutedErrorClasses.slice(),
       recent_normal: this._mem.length,
-      backend: 'sqlite',
+      backend: 'postgresql',
       jsonl_mirror: this.jsonlMirror,
-      total_rows: (() => {
+      total_rows: await (async () => {
         try {
-          return this.repo.count()
+          return await this.repo.count()
         } catch {
           return null
         }
@@ -753,9 +757,9 @@ export class RequestLogStore {
   }
 
   /** Retention: delete rows older than retain windows, then enforce max_mb. */
-  cleanup() {
+  async cleanup() {
     try {
-      this.repo.cleanup({
+      await this.repo.cleanup({
         retainDays: this.retainDays,
         debugRetainDays: this.debugRetainDays,
         maxBytes: this.maxMb > 0 ? this.maxMb * 1024 * 1024 : 0,
@@ -769,9 +773,13 @@ export class RequestLogStore {
     this.stopCleanupScheduler()
     const ms = Math.max(60_000, Number(intervalMs) || CLEANUP_INTERVAL_MS)
     const run = () => {
-      try {
-        this.cleanup()
-      } catch {}
+      const pending = (async () => {
+        try {
+          await this.cleanup()
+        } catch {}
+      })()
+      this._cleanupPending.add(pending)
+      pending.finally(() => this._cleanupPending.delete(pending))
     }
     this._cleanupTimer = setInterval(run, ms)
     if (typeof this._cleanupTimer.unref === 'function') this._cleanupTimer.unref()
@@ -780,6 +788,10 @@ export class RequestLogStore {
   stopCleanupScheduler() {
     clearInterval(this._cleanupTimer)
     this._cleanupTimer = null
+  }
+
+  async flush() {
+    while (this._cleanupPending.size) await Promise.all([...this._cleanupPending])
   }
 
   _cleanupLegacyFiles(days, dir) {

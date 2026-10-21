@@ -166,8 +166,8 @@ function assertCron(cron, timezone) {
   }
 }
 
-function defaultDialogParams(vm) {
-  const models = listTestableModels(isCodexVm(vm) ? 'openai' : 'anthropic')
+async function defaultDialogParams(vm) {
+  const models = await listTestableModels(isCodexVm(vm) ? 'openai' : 'anthropic')
   const model = models[0]?.id || ''
   if (!model) {
     throw new VmTestScheduleError('no test model available for this vm', 'test_model_missing', 400)
@@ -353,6 +353,7 @@ export class VmTestScheduleRunner {
     this.now = now
     this.jobs = new Map()
     this.running = new Set()
+    this.writeFailure = null
     this.started = false
   }
 
@@ -404,15 +405,15 @@ export class VmTestScheduleRunner {
     }
   }
 
-  saveDefaultTemplate(input) {
+  async saveDefaultTemplate(input) {
     const structure = normalizeScheduleStructure(input)
     compileStructuredSchedule(structure)
-    this._settings().set(VM_TEST_SCHEDULE_DEFAULT_KEY, structure)
+    await this._settings().set(VM_TEST_SCHEDULE_DEFAULT_KEY, structure)
     return structure
   }
 
-  clearDefaultTemplate() {
-    this._settings().remove?.(VM_TEST_SCHEDULE_DEFAULT_KEY)
+  async clearDefaultTemplate() {
+    await this._settings().remove?.(VM_TEST_SCHEDULE_DEFAULT_KEY)
     return null
   }
 
@@ -472,18 +473,18 @@ export class VmTestScheduleRunner {
     return null
   }
 
-  save(vmId, input) {
+  async save(vmId, input) {
     if (!isValidVmId(vmId)) throw new VmTestScheduleError('invalid vm id', 'invalid_vm_id')
     const vm = this._vm(vmId)
     if (!vm) throw new VmTestScheduleError('vm not found', 'vm_not_found', 404)
     const previous = this._settings().get(keyFor(vmId)) || {}
     const config = normalizeVmTestSchedule(input, vm)
-    this._settings().set(keyFor(vmId), { ...config, ...savedResult(previous), revision: randomUUID() })
+    await this._settings().set(keyFor(vmId), { ...config, ...savedResult(previous), revision: randomUUID() })
     if (this.started) this._syncJob(vmId, config)
     return this.get(vmId)
   }
 
-  applyScheduleStructure(vmId, structure, { preserveDialog = true } = {}) {
+  async applyScheduleStructure(vmId, structure, { preserveDialog = true } = {}) {
     if (!isValidVmId(vmId)) throw new VmTestScheduleError('invalid vm id', 'invalid_vm_id')
     const vm = this._vm(vmId)
     if (!vm) throw new VmTestScheduleError('vm not found', 'vm_not_found', 404)
@@ -500,7 +501,7 @@ export class VmTestScheduleRunner {
         reasoning_effort: previous.reasoning_effort ?? null,
       }
     } else {
-      dialog = defaultDialogParams(vm)
+      dialog = await defaultDialogParams(vm)
     }
     const enabled = previous.enabled === true
     const config = normalizeVmTestSchedule(
@@ -511,7 +512,7 @@ export class VmTestScheduleRunner {
       },
       vm,
     )
-    this._settings().set(keyFor(vmId), {
+    await this._settings().set(keyFor(vmId), {
       ...config,
       enabled,
       ...savedResult(previous),
@@ -526,7 +527,7 @@ export class VmTestScheduleRunner {
    * A slot of the other kind (Claude vs Codex) keeps its own dialog params, since
    * a model of one kind cannot run on the other; switch and timing still apply.
    */
-  syncSchedules({ scope, vmIds = [], schedule, test = null }) {
+  async syncSchedules({ scope, vmIds = [], schedule, test = null }) {
     const structure = normalizeScheduleStructure(schedule)
     const full = test == null ? null : normalizeSyncTest(test, structure)
     let targets = []
@@ -547,16 +548,16 @@ export class VmTestScheduleRunner {
         continue
       }
       if (full) {
-        this._applyFullTest(vmId, structure, full)
+        await this._applyFullTest(vmId, structure, full)
         updated.push(vmId)
         continue
       }
       const hadPlan = !!this._settings().get(keyFor(vmId))
-      this.applyScheduleStructure(vmId, structure, { preserveDialog: hadPlan })
+      await this.applyScheduleStructure(vmId, structure, { preserveDialog: hadPlan })
       if (!hadPlan) {
         const stored = this._settings().get(keyFor(vmId))
         if (stored) {
-          this._settings().set(keyFor(vmId), { ...stored, enabled: false })
+          await this._settings().set(keyFor(vmId), { ...stored, enabled: false })
           this.jobs.get(vmId)?.stop()
           this.jobs.delete(vmId)
         }
@@ -566,7 +567,7 @@ export class VmTestScheduleRunner {
     return { updated, missing, schedule: structure }
   }
 
-  _applyFullTest(vmId, structure, full) {
+  async _applyFullTest(vmId, structure, full) {
     const vm = this._vm(vmId)
     const previous = this._settings().get(keyFor(vmId)) || {}
     let dialog
@@ -578,22 +579,27 @@ export class VmTestScheduleRunner {
         max_tokens: previous.max_tokens ?? null,
         reasoning_effort: previous.reasoning_effort ?? null,
       }
-    } else dialog = defaultDialogParams(vm)
+    } else dialog = await defaultDialogParams(vm)
     const config = normalizeVmTestSchedule({ enabled: full.enabled, ...structure, ...dialog }, vm)
-    this._settings().set(keyFor(vmId), { ...config, ...savedResult(previous), revision: randomUUID() })
+    await this._settings().set(keyFor(vmId), { ...config, ...savedResult(previous), revision: randomUUID() })
     if (this.started) this._syncJob(vmId, config)
   }
 
-  remove(vmId) {
+  async remove(vmId) {
     this.jobs.get(vmId)?.stop()
     this.jobs.delete(vmId)
-    this._settings().remove?.(keyFor(vmId))
+    await this._settings().remove?.(keyFor(vmId))
     return null
   }
 
-  start() {
+  async start() {
     this.started = true
-    this.reload()
+    await this.reload()
+  }
+
+  async flush() {
+    while (this.running.size) await new Promise((resolve) => setTimeout(resolve, 10))
+    if (this.writeFailure) throw this.writeFailure
   }
 
   stop() {
@@ -602,7 +608,7 @@ export class VmTestScheduleRunner {
     this.jobs.clear()
   }
 
-  reload() {
+  async reload() {
     for (const job of this.jobs.values()) job.stop()
     this.jobs.clear()
     const all = this._settings().all?.() || {}
@@ -611,7 +617,7 @@ export class VmTestScheduleRunner {
       const vmId = key.slice(VM_TEST_SCHEDULE_PREFIX.length)
       const vm = this._vm(vmId)
       if (!vm) {
-        this._settings().remove?.(key)
+        await this._settings().remove?.(key)
         continue
       }
       const schedule = this._stored(vmId)
@@ -623,8 +629,10 @@ export class VmTestScheduleRunner {
     this.jobs.get(vmId)?.stop()
     this.jobs.delete(vmId)
     if (!this.started || !schedule.enabled || !this._vm(vmId)) return
-    const job = new Cron(schedule.cron, { timezone: schedule.timezone, mode: '5-part', catch: true, unref: true }, () =>
-      this._run(vmId),
+    const job = new Cron(
+      schedule.cron,
+      { timezone: schedule.timezone, mode: '5-part', catch: true, unref: true },
+      async () => await this._run(vmId),
     )
     this.jobs.set(vmId, job)
   }
@@ -632,40 +640,47 @@ export class VmTestScheduleRunner {
   async _run(vmId) {
     if (!this.started || this.running.has(vmId)) return
     if (!this._vm(vmId)) {
-      this.remove(vmId)
+      await this.remove(vmId)
       return
     }
     const schedule = this._stored(vmId)
     if (!schedule?.enabled) return
     this.running.add(vmId)
     const startedAt = this.now()
-    let result
     try {
-      result = await this.runTest(vmId, {
-        model: schedule.model,
-        prompt: schedule.prompt,
-        max_tokens: schedule.max_tokens,
-        reasoning_effort: schedule.reasoning_effort,
-      })
-    } catch (error) {
-      result = { ok: false, error }
+      let result
+      try {
+        result = await this.runTest(vmId, {
+          model: schedule.model,
+          prompt: schedule.prompt,
+          max_tokens: schedule.max_tokens,
+          reasoning_effort: schedule.reasoning_effort,
+        })
+      } catch (error) {
+        result = { ok: false, error }
+      }
+      if (!this.started) return
+
+      const current = this._settings().get(keyFor(vmId))
+      if (!current || String(current.revision || '') !== schedule.revision || !this._vm(vmId)) return
+      const duration = Number(result?.duration_ms)
+      const lastDuration =
+        Number.isSafeInteger(duration) && duration >= 0 ? duration : Math.max(0, this.now() - startedAt)
+      const lastOk = result?.ok === true
+      try {
+        await this._settings().set(keyFor(vmId), {
+          ...current,
+          last_run_at: new Date(startedAt).toISOString(),
+          last_ok: lastOk,
+          last_duration_ms: lastDuration,
+          last_error: lastOk ? null : compactError(result?.error),
+        })
+      } catch (error) {
+        this.writeFailure ||= error
+        throw error
+      }
     } finally {
       this.running.delete(vmId)
     }
-    if (!this.started) return
-
-    const current = this._settings().get(keyFor(vmId))
-    if (!current || String(current.revision || '') !== schedule.revision || !this._vm(vmId)) return
-    const duration = Number(result?.duration_ms)
-    const lastDuration =
-      Number.isSafeInteger(duration) && duration >= 0 ? duration : Math.max(0, this.now() - startedAt)
-    const lastOk = result?.ok === true
-    this._settings().set(keyFor(vmId), {
-      ...current,
-      last_run_at: new Date(startedAt).toISOString(),
-      last_ok: lastOk,
-      last_duration_ms: lastDuration,
-      last_error: lastOk ? null : compactError(result?.error),
-    })
   }
 }

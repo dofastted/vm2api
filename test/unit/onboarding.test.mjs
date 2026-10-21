@@ -102,14 +102,14 @@ test('guide pops until skip or finish, even when setup steps are already done', 
   assert.equal(legacy.guide_used, false)
 })
 
-test('PUT complete / dismiss / reset round-trip through settings; invalid action rejected', () => {
+test('PUT complete / dismiss / reset round-trip through settings; invalid action rejected', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-onboarding-'))
-  const db = createDatabase({ dataDir: dir })
+  const db = await createDatabase({ dataDir: dir })
   const settings = new SettingsRepo(db)
-  assert.equal(recordOf(loadOnboardingState(settings), 'admin').status, 'pending')
+  assert.equal(recordOf(await loadOnboardingState(settings), 'admin').status, 'pending')
 
-  saveOnboardingState(settings, applyOnboardingAction(loadOnboardingState(settings), 'admin', 'complete'))
-  const completed = recordOf(loadOnboardingState(settings), 'admin')
+  await saveOnboardingState(settings, applyOnboardingAction(await loadOnboardingState(settings), 'admin', 'complete'))
+  const completed = recordOf(await loadOnboardingState(settings), 'admin')
   assert.equal(completed.status, 'completed')
   assert.equal(completed.guide_used, true)
   assert.ok(completed.updated_at)
@@ -121,17 +121,17 @@ test('PUT complete / dismiss / reset round-trip through settings; invalid action
   })
   assert.equal(afterComplete.needs_welcome, false)
 
-  saveOnboardingState(settings, applyOnboardingAction(loadOnboardingState(settings), 'admin', 'dismiss'))
-  assert.equal(recordOf(loadOnboardingState(settings), 'admin').status, 'dismissed')
-  assert.equal(recordOf(loadOnboardingState(settings), 'admin').guide_used, true)
+  await saveOnboardingState(settings, applyOnboardingAction(await loadOnboardingState(settings), 'admin', 'dismiss'))
+  assert.equal(recordOf(await loadOnboardingState(settings), 'admin').status, 'dismissed')
+  assert.equal(recordOf(await loadOnboardingState(settings), 'admin').guide_used, true)
   const legacy = recordOf({ admin: { status: 'completed', updated_at: '2026-01-01T00:00:00.000Z' } }, 'admin')
   assert.equal(legacy.guide_used, false)
   assert.equal(buildOnboardingPayload({ user: 'admin', role: 'admin', ...legacy }).needs_welcome, true)
-  assert.equal(recordOf(loadOnboardingState(settings), 'bob').status, 'pending')
+  assert.equal(recordOf(await loadOnboardingState(settings), 'bob').status, 'pending')
 
-  saveOnboardingState(settings, applyOnboardingAction(loadOnboardingState(settings), 'admin', 'reset'))
-  assert.equal(recordOf(loadOnboardingState(settings), 'admin').status, 'pending')
-  assert.equal(loadOnboardingState(settings).admin, undefined)
+  await saveOnboardingState(settings, applyOnboardingAction(await loadOnboardingState(settings), 'admin', 'reset'))
+  assert.equal(recordOf(await loadOnboardingState(settings), 'admin').status, 'pending')
+  assert.equal((await loadOnboardingState(settings)).admin, undefined)
 
   assert.throws(
     () => applyOnboardingAction({}, 'admin', 'skip'),
@@ -159,48 +159,48 @@ test('only VMs visible to the user drive slot and schedulable steps', () => {
   assert.equal(steps('u2').find((s) => s.id === 'schedulable').done, true)
 })
 
-test('first_request EXISTS uses the same ownerPred as request-log stats', () => {
+test('first_request EXISTS uses the same ownerPred as request-log stats', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-onboarding-logs-'))
-  const db = createDatabase({ dbPath: path.join(dir, 'logs.db') })
-  db.exec(`
+  const db = await createDatabase({ dbPath: path.join(dir, 'logs.db') })
+  await db.exec(`
     INSERT INTO users (id, email, username, password_hash) VALUES ('u1', 'a@x', 'alice', 'x'), ('u2', 'b@x', 'bob', 'x');
     INSERT INTO api_keys (id, name, key, user_id) VALUES ('k1', 'alice-key', 'sk-1', 'u1'), ('k2', 'bob-key', 'sk-2', 'u2');
   `)
   const repo = new UsageLogsRepo(db)
-  repo.insertSummary({
+  await repo.insertSummary({
     id: 'log_fail',
     request_id: 'req-fail',
     created_at: '2026-01-01T00:00:00.000Z',
     status: 401,
     user_id: 'u1',
   })
-  assert.equal(repo.hasSuccessfulRequest({ owner_user_id: 'u1' }), false)
-  repo.insertSummary({
+  assert.equal(await repo.hasSuccessfulRequest({ owner_user_id: 'u1' }), false)
+  await repo.insertSummary({
     id: 'log_other',
     request_id: 'req-other',
     created_at: '2026-01-01T00:00:01.000Z',
     status: 200,
     user_id: 'u2',
   })
-  assert.equal(repo.hasSuccessfulRequest({ owner_user_id: 'u1' }), false)
-  assert.equal(repo.hasSuccessfulRequest({ owner_user_id: 'u2' }), true)
-  repo.insertSummary({
+  assert.equal(await repo.hasSuccessfulRequest({ owner_user_id: 'u1' }), false)
+  assert.equal(await repo.hasSuccessfulRequest({ owner_user_id: 'u2' }), true)
+  await repo.insertSummary({
     id: 'log_ok',
     request_id: 'req-ok',
     created_at: '2026-01-01T00:00:02.000Z',
     status: 200,
     user_id: 'u1',
   })
-  assert.equal(repo.hasSuccessfulRequest({ owner_user_id: 'u1' }), true)
-  assert.equal(repo.hasSuccessfulRequest({}), true)
-  repo.insertSummary({
+  assert.equal(await repo.hasSuccessfulRequest({ owner_user_id: 'u1' }), true)
+  assert.equal(await repo.hasSuccessfulRequest({}), true)
+  await repo.insertSummary({
     id: 'log_redirect',
     request_id: 'req-3xx',
     created_at: '2026-01-01T00:00:03.000Z',
     status: 301,
     user_id: 'u3',
   })
-  assert.equal(repo.hasSuccessfulRequest({ owner_user_id: 'u3' }), false)
+  assert.equal(await repo.hasSuccessfulRequest({ owner_user_id: 'u3' }), false)
 })
 
 test('master API key identity is __master__ / admin; base_url strips trailing slash', () => {

@@ -279,11 +279,19 @@ env_set() {
   local name="$1"
   local value="$2"
   local envf="${INSTALL_DIR}/.env"
-  if grep -qE "^${name}=" "$envf" 2>/dev/null; then
-    sed -i "s|^${name}=.*|${name}=${value}|" "$envf"
-  else
-    printf '%s=%s\n' "$name" "$value" >>"$envf"
-  fi
+  VM2API_ENV_KEY="$name" VM2API_ENV_VALUE="$value" VM2API_ENV_FILE="$envf" python3 - <<'PYENV'
+import os
+from pathlib import Path
+p = Path(os.environ["VM2API_ENV_FILE"])
+key = os.environ["VM2API_ENV_KEY"] + "="
+value = key + os.environ["VM2API_ENV_VALUE"] + "\n"
+lines = p.read_text().splitlines(keepends=True) if p.exists() else []
+if any(line.startswith(key) for line in lines):
+    p.write_text("".join(value if line.startswith(key) else line for line in lines))
+else:
+    text = "".join(lines)
+    p.write_text(text + ("\n" if text and not text.endswith("\n") else "") + value)
+PYENV
 }
 
 env_set_if_empty() {
@@ -380,6 +388,16 @@ ensure_env() {
     cp "$example" "$envf"
   fi
   chmod 600 "$envf" || true
+  if [ -z "$(env_get VM2API_DATABASE_URL)" ] && [ -z "$(env_get KIN_DATABASE_URL)" ]; then
+    if [ -f "${INSTALL_DIR}/data/kin.db" ]; then
+      err "SQLite 数据尚未迁移。保留运行容器，按 docs/deploy/postgresql.md 完成离线导入后再升级。"
+      return 1
+    fi
+    env_set_if_empty COMPOSE_PROFILES postgres || true
+    env_set_if_empty VM2API_POSTGRES_PORT 55432 || true
+    env_set_if_empty VM2API_POSTGRES_PASSWORD "$(gen_secret)" || true
+    env_set_if_empty VM2API_DATABASE_URL "postgresql://vm2api:$(env_get VM2API_POSTGRES_PASSWORD)@127.0.0.1:$(env_get VM2API_POSTGRES_PORT)/vm2api" || true
+  fi
   env_set_if_empty VM2API_ADMIN_USER "$DEFAULT_ADMIN_USER" || true
   if env_set_if_empty VM2API_ADMIN_PASSWORD "$DEFAULT_ADMIN_PASSWORD"; then
     WROTE_DEFAULT_PASSWORD=1
@@ -519,9 +537,14 @@ fetch_file() {
 # 镜像安装：只落部署文件，不 clone 仓库，不在本机构建。
 fetch_release_files() {
   local tag="$1"
-  mkdir -p "${INSTALL_DIR}/deploy"
+  mkdir -p "${INSTALL_DIR}/deploy" "${INSTALL_DIR}/docs/deploy"
   info "下载部署文件 ${tag} → ${INSTALL_DIR}"
   fetch_file "$tag" docker-compose.yml "${INSTALL_DIR}/docker-compose.yml"
+  if grep -q 'vm2api-postgres-entrypoint' "${INSTALL_DIR}/docker-compose.yml"; then
+    fetch_file "$tag" deploy/postgres-entrypoint.sh "${INSTALL_DIR}/deploy/postgres-entrypoint.sh"
+    fetch_file "$tag" deploy/postgres-init.sh "${INSTALL_DIR}/deploy/postgres-init.sh"
+    fetch_file "$tag" docs/deploy/postgresql.md "${INSTALL_DIR}/docs/deploy/postgresql.md"
+  fi
   fetch_file "$tag" .env.example "${INSTALL_DIR}/.env.example"
   fetch_file "$tag" VERSION "${INSTALL_DIR}/VERSION"
   fetch_file "$tag" CHANGELOG.md "${INSTALL_DIR}/CHANGELOG.md" 1
@@ -631,6 +654,11 @@ start_stack() {
   fi
   cd "${INSTALL_DIR}"
   auto_sync_wrap="${KIN_AUTO_SYNC_WRAP:-0}"
+  # An existing SQLite installation must pass the read-only import check before replacement.
+  if [ -f data/kin.db ] || [ -f .local/arm64/data/kin.db ]; then
+    if [ "$mode" = image ]; then compose pull vm2api; else compose build vm2api; fi
+    compose run --rm --no-deps -T --entrypoint node vm2api scripts/check-postgres-upgrade.mjs || return 1
+  fi
   if [ "$mode" = image ]; then
     info "docker compose pull && up -d（拉预构建镜像，本机不构建）"
     if ! compose pull; then

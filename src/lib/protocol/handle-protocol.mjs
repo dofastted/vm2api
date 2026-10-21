@@ -1,3 +1,4 @@
+import { trackPendingWrite } from '../db/pending-writes.mjs'
 /**
  * /v1 protocol handler. URLs, auth, and response envelopes stay with the
  * server wiring; this factory owns convert → pool → Go/Rust hop → client.
@@ -16,7 +17,7 @@ import {
 } from '../core/refusal-guard.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
-import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { RuntimeSettings as SettingsRepo } from '../db/settings-state.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
 import { jevScopeWaits, readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
 import { runProtocolIntercept } from './intercept-gate.mjs'
@@ -172,7 +173,7 @@ export function createHandleProtocol(deps) {
   const json = (...args) => deps.json(...args)
   const writeSSEHeaders = (...args) => deps.writeSSEHeaders(...args)
   const readBody = (...args) => deps.readBody(...args)
-  const requireAuth = (...args) => deps.requireAuth(...args)
+  const requireAuth = async (...args) => await deps.requireAuth(...args)
   const cfg = deps.cfg
   const requestLog = deps.requestLog
   const stickyRouter = deps.stickyRouter
@@ -199,13 +200,13 @@ export function createHandleProtocol(deps) {
     return disjointOpenaiUsage(next)
   }
 
-  function attachPricing(logBag, { managedKey = null, rateMultiplier = 1, bill = false } = {}) {
+  async function attachPricing(logBag, { managedKey = null, rateMultiplier = 1, bill = false } = {}) {
     const model = logBag.upstream_model || logBag.model
     const priced = costColumnsFromUsage(logBag.usage || {}, model)
     Object.assign(logBag, priced)
     if (!bill || !managedKey) return
     try {
-      apiKeyStore.recordUsage(managedKey, logBag.usage || {}, {
+      await apiKeyStore.recordUsage(managedKey, logBag.usage || {}, {
         model,
         rateMultiplier,
         officialCost: priced.total_cost,
@@ -371,10 +372,10 @@ export function createHandleProtocol(deps) {
     }
   }
 
-  function banRefusalDevice(deviceId, { requestId, fingerprint, reason }) {
+  async function banRefusalDevice(deviceId, { requestId, fingerprint, reason }) {
     if (!deviceId) return
     try {
-      deviceRepo()?.block?.({ deviceId, requestId, fingerprint, reason })
+      await deviceRepo()?.block?.({ deviceId, requestId, fingerprint, reason })
     } catch {
       /* the prompt block still stands */
     }
@@ -389,7 +390,7 @@ export function createHandleProtocol(deps) {
     }
   }
 
-  function rememberRefusal({ inbound, body, headers, result, logBag, requestId }) {
+  async function rememberRefusal({ inbound, body, headers, result, logBag, requestId }) {
     if (!refusalEnabled()) return
     const contentRefusal = isUpstreamRefusal(result, logBag)
     const timed = result?.policy?.rememberRefusal === true
@@ -399,7 +400,7 @@ export function createHandleProtocol(deps) {
     const fingerprint = refusalFingerprint(body, inbound)
     try {
       const ttl = Number(result?.policy?.refusalTtlMs) || 0
-      repo.remember({
+      await repo.remember({
         fingerprint,
         model: body?.model || inbound?.model || '',
         requestId,
@@ -412,7 +413,7 @@ export function createHandleProtocol(deps) {
       return
     }
     if (!contentRefusal || !refusalPolicy().device_block_enabled) return
-    banRefusalDevice(inboundRefusalDeviceId({ inbound, body, headers }), {
+    await banRefusalDevice(inboundRefusalDeviceId({ inbound, body, headers }), {
       requestId,
       fingerprint,
       reason: 'refusal_guard',
@@ -452,7 +453,7 @@ export function createHandleProtocol(deps) {
       requestContext,
       slotWaitMs: candidate.slotWaitMs,
       noGoFallback,
-      ensureCredential: (exec) => ensureWorkerCredential(exec),
+      ensureCredential: async (exec) => await ensureWorkerCredential(exec),
       onEvent: async (line) => {
         if (/response_headers/.test(String(line))) return
         applyClaudeSSELineToMessage(restoreToolNamesInSSELine(line, toolNames), assembler)
@@ -501,21 +502,27 @@ export function createHandleProtocol(deps) {
       reasoning_effort: null,
       outbound_session_id: null,
     }
-    res.on('finish', () => {
-      try {
-        const groupId = req.apiKeyRecord?.group_id ?? 1
-        requestLog.finish(logCtx, {
-          status: res.statusCode || 0,
-          api_key_kind: req.apiKeyKind || null,
-          api_key_id: req.apiKeyRecord?.id || null,
-          user_id: req.apiKeyRecord?.user_id ?? null,
-          group_id: groupId,
-          rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
-          ...logBag,
-        })
-      } catch {}
-    })
-    if (!requireAuth(req, res)) {
+    res.on('finish', () =>
+      trackPendingWrite(
+        (async () => {
+          try {
+            const groupId = req.apiKeyRecord?.group_id ?? 1
+            await requestLog.finish(logCtx, {
+              status: res.statusCode || 0,
+              api_key_kind: req.apiKeyKind || null,
+              api_key_id: req.apiKeyRecord?.id || null,
+              user_id: req.apiKeyRecord?.user_id ?? null,
+              group_id: groupId,
+              rate_multiplier: await deps.groupsRepo.rateMultiplier(groupId),
+              ...logBag,
+            })
+          } catch (error) {
+            throw error
+          }
+        })(),
+      ),
+    )
+    if (!(await requireAuth(req, res))) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
       logBag.error_message = req.authError?.message || 'Invalid credentials'
       logBag.api_key_presented = presentedApiKeyForLog(req.presentedApiKey)
@@ -677,7 +684,7 @@ export function createHandleProtocol(deps) {
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, errorResult.status, errorResult.body)
     }
-    const keyScope = keyScopeFromRequest(req)
+    const keyScope = await keyScopeFromRequest(req)
     const poolDenial = vmPoolDenial(keyScope)
     if (poolDenial) {
       stats.errors++
@@ -741,8 +748,8 @@ export function createHandleProtocol(deps) {
       }
       // Account scope needs the slot, so the Codex hop runs the same gate again
       // once a candidate is claimed. Without a scope the pre-hop verdict stands.
-      const accountGate = (account) =>
-        applyProtocolIntercept({
+      const accountGate = async (account) =>
+        await applyProtocolIntercept({
           req,
           inbound,
           body: ctx.body,
@@ -754,7 +761,7 @@ export function createHandleProtocol(deps) {
         })
       if (protocol === 'anthropic.messages') {
         const codex = normalizeCodexRouting(routing.codex)
-        return handleCodexProtocol({
+        return await handleCodexProtocol({
           req,
           res,
           protocol,
@@ -782,7 +789,7 @@ export function createHandleProtocol(deps) {
           ...codexSticky,
         })
       }
-      return handleCodexProtocol({
+      return await handleCodexProtocol({
         req,
         res,
         protocol,
@@ -1024,7 +1031,7 @@ export function createHandleProtocol(deps) {
     if (inferenceBackend === 'api') {
       const managedKey = req.apiKeyRecord || null
       if (managedKey) {
-        const gate = apiKeyStore.acquire(managedKey)
+        const gate = await apiKeyStore.acquire(managedKey)
         if (!gate.ok) {
           stats.errors++
           return json(
@@ -1100,9 +1107,9 @@ export function createHandleProtocol(deps) {
         ? Math.max(0, result.firstTokenAt - logCtx.t0)
         : (result?.ttftMs ?? null)
       logBag.final_state = result?.terminalState || null
-      attachPricing(logBag, {
+      await attachPricing(logBag, {
         managedKey,
-        rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
+        rateMultiplier: await deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
         bill: !!(result?.ok && managedKey),
       })
       if (clientStream) {
@@ -1141,7 +1148,7 @@ export function createHandleProtocol(deps) {
     const streamIdleTimeoutMs = resolveStreamIdleTimeoutMs(getRouting(), cfg)
     const managedKey = req.apiKeyRecord || null
     if (managedKey) {
-      const gate = apiKeyStore.acquire(managedKey)
+      const gate = await apiKeyStore.acquire(managedKey)
       if (!gate.ok) {
         stats.errors++
         return json(
@@ -1194,7 +1201,7 @@ export function createHandleProtocol(deps) {
     const pinVmRaw = String(req.headers['x-kin-vm'] || '').trim()
     const pinVmId = req.apiKeyKind === 'master' && isValidVmId(pinVmRaw) ? pinVmRaw : null
     // Pin is panel test-chat / diagnostics (manage). Unpinned /v1 is dispatch.
-    const ownerScope = pinVmId ? { type: 'any' } : ownerScopeFromRequest(req, apiKeyStore?.users)
+    const ownerScope = pinVmId ? { type: 'any' } : await ownerScopeFromRequest(req, apiKeyStore?.users)
     // Cache bypass is a client hint; only authenticated master-key probes may skip accounting.
     const healthReal = req.apiKeyKind === 'master' && isHealthRealBypass(req.headers)
     // Cache lives per account; a failover to another account starts cold by design.
@@ -1236,7 +1243,7 @@ export function createHandleProtocol(deps) {
         applyAttempt: async (body, selected, extra = {}) => {
           // Only this account's own thinking replays as thinking. Another
           // account's signature, or one with no record, goes out as text.
-          const owned = filterThinkingForAccount(body, selected.accountId, thinkingOwnerStore)
+          const owned = await filterThinkingForAccount(body, selected.accountId, thinkingOwnerStore)
           body = owned.body
           if (owned.kept || owned.converted || owned.dropped) {
             const { kept, converted, dropped, unknown } = owned
@@ -1463,7 +1470,7 @@ export function createHandleProtocol(deps) {
         },
         callAttempt: async ({ candidate, body, attemptMeta, deliveryMode: attemptDelivery, signal, onCommit }) => {
           if (!clientStream) {
-            return streamAndAssembleClaudeMessage({
+            return await streamAndAssembleClaudeMessage({
               candidate,
               body,
               reqHeaders: req.headers,
@@ -1524,7 +1531,7 @@ export function createHandleProtocol(deps) {
               routing: getRouting(),
               slotWaitMs: candidate.slotWaitMs,
               noGoFallback: !!pinVmId,
-              ensureCredential: (exec) => ensureWorkerCredential(exec),
+              ensureCredential: async (exec) => await ensureWorkerCredential(exec),
               onCommit: () => {
                 if (protocol === 'anthropic.messages' && !res.headersSent) writeSSEHeaders(res)
                 onCommit()
@@ -1588,7 +1595,7 @@ export function createHandleProtocol(deps) {
     logBag.final_account_id = result?.accountId || null
     if (result?.threadBetas) logBag.hop_meta = { ...logBag.hop_meta, thread_betas: result.threadBetas }
     if (result?.accountId && (result.ok || result.committed))
-      recordThinkingOwners(result.body, result.accountId, thinkingOwnerStore)
+      await recordThinkingOwners(result.body, result.accountId, thinkingOwnerStore)
     // Zero executions is a real 0, not unknown; the VM is the last one that ran.
     logBag.attempt_count = result?.attemptCount ?? 0
     logBag.final_state = result?.finalState || result?.terminalState || null
@@ -1608,7 +1615,14 @@ export function createHandleProtocol(deps) {
       logBag.error_code = logBag.error_code || 'content_filter_refusal'
       logBag.error_message = logBag.error_message || 'upstream stop_reason=refusal'
     }
-    rememberRefusal({ inbound, body: ctx.body, headers: req.headers, result, logBag, requestId: logCtx.request_id })
+    await rememberRefusal({
+      inbound,
+      body: ctx.body,
+      headers: req.headers,
+      result,
+      logBag,
+      requestId: logCtx.request_id,
+    })
 
     if (result?.accountId) {
       try {
@@ -1641,9 +1655,9 @@ export function createHandleProtocol(deps) {
           if (vm) pool.syncQuotaSchedule(vm)
         }
       } catch {}
-      attachPricing(logBag, {
+      await attachPricing(logBag, {
         managedKey,
-        rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
+        rateMultiplier: await deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
         bill: !!managedKey,
       })
     }
@@ -1676,7 +1690,14 @@ export function createHandleProtocol(deps) {
           res.write(buildAnthropicSseError(mapped.body?.error || {}))
         }
       }
-      rememberRefusal({ inbound, body: ctx.body, headers: req.headers, result, logBag, requestId: logCtx.request_id })
+      await rememberRefusal({
+        inbound,
+        body: ctx.body,
+        headers: req.headers,
+        result,
+        logBag,
+        requestId: logCtx.request_id,
+      })
       return res.end()
     }
 
@@ -1732,21 +1753,27 @@ export function createHandleProtocol(deps) {
       attempt_count: null,
       final_state: null,
     }
-    res.on('finish', () => {
-      try {
-        const groupId = req.apiKeyRecord?.group_id ?? 1
-        requestLog.finish(logCtx, {
-          status: res.statusCode || 0,
-          api_key_kind: req.apiKeyKind || null,
-          api_key_id: req.apiKeyRecord?.id || null,
-          user_id: req.apiKeyRecord?.user_id ?? null,
-          group_id: groupId,
-          rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
-          ...logBag,
-        })
-      } catch {}
-    })
-    if (!requireAuth(req, res)) {
+    res.on('finish', () =>
+      trackPendingWrite(
+        (async () => {
+          try {
+            const groupId = req.apiKeyRecord?.group_id ?? 1
+            await requestLog.finish(logCtx, {
+              status: res.statusCode || 0,
+              api_key_kind: req.apiKeyKind || null,
+              api_key_id: req.apiKeyRecord?.id || null,
+              user_id: req.apiKeyRecord?.user_id ?? null,
+              group_id: groupId,
+              rate_multiplier: await deps.groupsRepo.rateMultiplier(groupId),
+              ...logBag,
+            })
+          } catch (error) {
+            throw error
+          }
+        })(),
+      ),
+    )
+    if (!(await requireAuth(req, res))) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
       logBag.error_message = req.authError?.message || 'Invalid credentials'
       logBag.api_key_presented = presentedApiKeyForLog(req.presentedApiKey)
@@ -1773,7 +1800,7 @@ export function createHandleProtocol(deps) {
     }
     logBag.model = typeof body?.model === 'string' ? body.model : null
     logBag.inbound_summary = summarizeBody(body)
-    return handleCodexSearch({
+    return await handleCodexSearch({
       req,
       res,
       body,

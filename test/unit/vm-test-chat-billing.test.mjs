@@ -70,7 +70,7 @@ test('runVmTestChat without project/vm does not invent a panel request_log', asy
   const result = await runVmTestChat({ vmId: 'vm-01', requestLog: store })
   assert.equal(result.ok, false)
   assert.equal(result.error?.code, 'invalid_request')
-  assert.equal(store.listNormal({ limit: 5 }).length, 0)
+  assert.equal((await store.listNormal({ limit: 5 })).length, 0)
 })
 
 test('runVmTestChat loopbacks /v1/messages with x-kin-vm pin and never calls a worker', async (t) => {

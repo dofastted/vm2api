@@ -10,6 +10,7 @@
  */
 
 import { getDb } from '../database.mjs'
+import { addInteger, integerValue } from '../integers.mjs'
 import { DEFAULT_MUTED_ERROR_CLASSES, enrichLogRow, excludeErrorClassSql } from '../../admin/error-class.mjs'
 import { reportTimezone, zonedDayStartMs } from '../../core/timezone.mjs'
 import {
@@ -73,30 +74,30 @@ function uniq(values) {
 }
 
 function placeholders(list) {
-  return list.map(() => '?').join(', ')
+  return list.map((_, i) => '$' + (i + 1)).join(', ')
 }
 
 /**
  * Batched display names for one page / one aggregate. One IN query per entity
  * kind so a page of 100 rows costs at most four lookups.
  */
-export function lookupNames(db, { userIds = [], keyIds = [], vmIds = [], accountIds = [] } = {}) {
-  const pick = (sql, ids, nameOf) => {
+export async function lookupNames(db, { userIds = [], keyIds = [], vmIds = [], accountIds = [] } = {}) {
+  const pick = async (sql, ids, nameOf) => {
     const list = uniq(ids)
     const map = new Map()
     if (!list.length) return map
-    for (const r of db.prepare(sql.replace('$IN', placeholders(list))).all(...list)) map.set(r.id, nameOf(r))
+    for (const r of await db.prepare(sql.replace('$IN', placeholders(list))).all(...list)) map.set(r.id, nameOf(r))
     return map
   }
   return {
-    users: pick(
+    users: await pick(
       'SELECT id, username, email FROM users WHERE id IN ($IN)',
       userIds,
       (r) => r.username || r.email || r.id,
     ),
-    keys: pick('SELECT id, name FROM api_keys WHERE id IN ($IN)', keyIds, (r) => r.name || r.id),
-    vms: pick('SELECT id, name FROM vms WHERE id IN ($IN)', vmIds, (r) => r.name || r.id),
-    accounts: pick(
+    keys: await pick('SELECT id, name FROM api_keys WHERE id IN ($IN)', keyIds, (r) => r.name || r.id),
+    vms: await pick('SELECT id, name FROM vms WHERE id IN ($IN)', vmIds, (r) => r.name || r.id),
+    accounts: await pick(
       'SELECT id, email, name FROM accounts WHERE id IN ($IN)',
       accountIds,
       (r) => r.email || r.name || r.id,
@@ -105,8 +106,8 @@ export function lookupNames(db, { userIds = [], keyIds = [], vmIds = [], account
 }
 
 function cacheTtlApplied(row) {
-  const short = num(row.cache_creation_5m_tokens)
-  const long = num(row.cache_creation_1h_tokens)
+  const short = integerValue(row.cache_creation_5m_tokens)
+  const long = integerValue(row.cache_creation_1h_tokens)
   if (short > 0 && long > 0) return 'mixed'
   if (long > 0) return '1h'
   if (short > 0) return '5m'
@@ -155,10 +156,10 @@ function blockedBy(row) {
 /** Raw `usage_logs` row (already `enrichLogRow`-ed) + batched names → `UsageLogRow`. */
 export function toUsageLogRow(row, names, chain = []) {
   const accountId = row.final_account_id || row.account_id || null
-  const inputTokens = num(row.input_tokens)
-  const outputTokens = num(row.output_tokens)
-  const cacheCreation = num(row.cache_creation_tokens)
-  const cacheRead = num(row.cache_read_tokens)
+  const inputTokens = integerValue(row.input_tokens)
+  const outputTokens = integerValue(row.output_tokens)
+  const cacheCreation = integerValue(row.cache_creation_tokens)
+  const cacheRead = integerValue(row.cache_read_tokens)
   const blocked = blockedBy(row)
   return {
     id: row.id,
@@ -188,8 +189,8 @@ export function toUsageLogRow(row, names, chain = []) {
     outputTokens,
     cacheCreationInputTokens: cacheCreation,
     cacheReadInputTokens: cacheRead,
-    cacheCreation5mInputTokens: num(row.cache_creation_5m_tokens),
-    cacheCreation1hInputTokens: num(row.cache_creation_1h_tokens),
+    cacheCreation5mInputTokens: integerValue(row.cache_creation_5m_tokens),
+    cacheCreation1hInputTokens: integerValue(row.cache_creation_1h_tokens),
     cacheTtlApplied: cacheTtlApplied(row),
     totalTokens: rowTotalTokens(row),
     costUsd: nullableNum(row.total_cost),
@@ -199,7 +200,7 @@ export function toUsageLogRow(row, names, chain = []) {
     durationMs: nullableNum(row.duration_ms),
     ttftMs: nullableNum(row.first_token_ms),
     stopReason: row.stop_reason ?? null,
-    attemptCount: nullableNum(row.attempt_count),
+    attemptCount: row.attempt_count == null ? null : integerValue(row.attempt_count),
     finalState: row.final_state ?? null,
     via: row.via ?? null,
     stream: row.stream == null ? null : !!row.stream,
@@ -297,7 +298,7 @@ function buildFilter(filters, defaultMuted) {
   }
   const eq = (col, val) => {
     if (val == null || val === '') return
-    where.push(`${col} = ?`)
+    where.push(`${col} = $${params.length + 1}`)
     params.push(String(val))
   }
   eq('user_id', filters.user_id)
@@ -305,22 +306,22 @@ function buildFilter(filters, defaultMuted) {
   eq('vm_id', filters.vm_id)
   if (filters.session_id) {
     // Either side of the mapping finds the conversation.
-    where.push('(outbound_session_id = ? OR session_id = ?)')
+    where.push(`(outbound_session_id = $${params.length + 1} OR session_id = $${params.length + 2})`)
     params.push(String(filters.session_id), String(filters.session_id))
   }
   eq('path', filters.endpoint)
   eq('protocol', filters.protocol)
   if (filters.account_id) {
-    where.push('(account_id = ? OR final_account_id = ?)')
+    where.push(`(account_id = $${params.length + 1} OR final_account_id = $${params.length + 2})`)
     params.push(filters.account_id, filters.account_id)
   }
   if (filters.model) {
-    where.push('(model = ? OR requested_model = ?)')
+    where.push(`(model = $${params.length + 1} OR requested_model = $${params.length + 2})`)
     params.push(filters.model, filters.model)
   }
   const statusCode = clampInt(filters.status_code, 0, 999, null)
   if (statusCode != null) {
-    where.push('status = ?')
+    where.push(`status = $${params.length + 1}`)
     params.push(statusCode)
   } else if (filters.exclude_status_200) {
     where.push('(status IS NULL OR status < 200 OR status >= 300)')
@@ -328,7 +329,7 @@ function buildFilter(filters, defaultMuted) {
   if (filters.model_mismatch) where.push('model_mismatch = 1')
   const minAttempts = clampInt(filters.min_attempt_count, 0, 1000, null)
   if (minAttempts != null) {
-    where.push('IFNULL(attempt_count, 0) >= ?')
+    where.push(`COALESCE(attempt_count, 0) >= $${params.length + 1}`)
     params.push(minAttempts)
   }
   if (filters.debug_only) where.push("log_mode = 'debug'")
@@ -336,16 +337,18 @@ function buildFilter(filters, defaultMuted) {
   if (filters.errors_only) where.push(ERROR_PRED)
   const start = isoOrNull(filters.start_time)
   if (start) {
-    where.push('created_at >= ?')
+    where.push(`created_at >= $${params.length + 1}`)
     params.push(start)
   }
   const end = isoOrNull(filters.end_time)
   if (end) {
-    where.push('created_at < ?')
+    where.push(`created_at < $${params.length + 1}`)
     params.push(end)
   }
   if (filters.q) {
-    where.push('(path LIKE ? OR error_code LIKE ? OR error_message LIKE ? OR request_id LIKE ?)')
+    where.push(
+      `(ascii_fold(path) LIKE ascii_fold($${params.length + 1}) ESCAPE '' OR ascii_fold(error_code) LIKE ascii_fold($${params.length + 2}) ESCAPE '' OR ascii_fold(error_message) LIKE ascii_fold($${params.length + 3}) ESCAPE '' OR ascii_fold(request_id) LIKE ascii_fold($${params.length + 4}) ESCAPE '')`,
+    )
     const like = `%${String(filters.q).slice(0, 100)}%`
     params.push(like, like, like, like)
   }
@@ -378,7 +381,7 @@ function whereSql(where) {
 
 export class UsageLogsView {
   /**
-   * @param {import('node:sqlite').DatabaseSync} db
+   * @param {object} db
    * @param {{ mutedErrorClasses?: string[] }} [opts] settings default mute list
    */
   constructor(db = getDb(), { mutedErrorClasses = DEFAULT_MUTED_ERROR_CLASSES } = {}) {
@@ -392,7 +395,7 @@ export class UsageLogsView {
    * that cap is hit before `limit` matches, the cursor points at the last
    * scanned row and `hasMore` stays true so the client keeps paging.
    */
-  listBatch(filters = {}) {
+  async listBatch(filters = {}) {
     const limit = clampInt(filters.limit, 1, LIST_LIMIT_MAX, LIST_LIMIT_DEFAULT)
     const { where, params, keep } = buildFilter(filters, this.mutedErrorClasses)
     let cursor =
@@ -408,11 +411,11 @@ export class UsageLogsView {
       const w = where.slice()
       const p = params.slice()
       if (cursor) {
-        w.push('(created_at < ? OR (created_at = ? AND id < ?))')
+        w.push(`(created_at < $${p.length + 1} OR (created_at = $${p.length + 2} AND id < $${p.length + 3}))`)
         p.push(cursor.createdAt, cursor.createdAt, cursor.id)
       }
-      const rows = this.db
-        .prepare(`SELECT * FROM usage_logs ${whereSql(w)} ORDER BY created_at DESC, id DESC LIMIT ?`)
+      const rows = await this.db
+        .prepare(`SELECT * FROM usage_logs ${whereSql(w)} ORDER BY created_at DESC, id DESC LIMIT $${p.length + 1}`)
         .all(...p, want)
       for (const raw of rows) {
         scanned++
@@ -448,24 +451,24 @@ export class UsageLogsView {
       hasMore = true
     }
     return {
-      logs: this._hydrate(page),
+      logs: await this._hydrate(page),
       nextCursor: next ? { createdAt: next.created_at, id: next.id } : null,
       hasMore,
     }
   }
 
   /** Names + provider chains for a whole page: one attempts query, one lookup per entity kind. */
-  _hydrate(rows) {
+  async _hydrate(rows) {
     if (!rows.length) return []
     const requestIds = uniq(rows.map((r) => r.request_id))
     const attempts = requestIds.length
-      ? this.db
+      ? await this.db
           .prepare(
             `SELECT * FROM request_attempts WHERE request_id IN (${placeholders(requestIds)}) ORDER BY request_id, attempt_no`,
           )
           .all(...requestIds)
       : []
-    const names = lookupNames(this.db, {
+    const names = await lookupNames(this.db, {
       userIds: rows.map((r) => r.user_id),
       keyIds: rows.map((r) => r.api_key_id),
       vmIds: [...rows.map((r) => r.vm_id), ...attempts.map((a) => a.vm_id)],
@@ -489,11 +492,11 @@ export class UsageLogsView {
    * SQL-expressible `auth` class; otherwise aggregates the newest
    * SUMMARY_SCAN_CAP rows after JS classification.
    */
-  summary(filters = {}) {
+  async summary(filters = {}) {
     const { where, params, keep, sqlOnlySummary } = buildFilter(filters, this.mutedErrorClasses)
     const cond = whereSql(where)
     if (sqlOnlySummary) {
-      const row = this.db
+      const row = await this.db
         .prepare(`
         SELECT COUNT(*) AS requests,
                COALESCE(SUM(CASE WHEN ${SUCCESS_PRED} THEN 1 ELSE 0 END), 0) AS success,
@@ -514,11 +517,13 @@ export class UsageLogsView {
         .get(...params)
       return toSummary(row)
     }
-    const rows = this.db
-      .prepare(
-        `SELECT *, (${PROMPT_TOKENS_SQL}) AS prompt_tokens FROM usage_logs ${cond} ORDER BY created_at DESC, id DESC LIMIT ?`,
-      )
-      .all(...params, SUMMARY_SCAN_CAP)
+    const rows = (
+      await this.db
+        .prepare(
+          `SELECT *, (${PROMPT_TOKENS_SQL}) AS prompt_tokens FROM usage_logs ${cond} ORDER BY created_at DESC, id DESC LIMIT $${params.length + 1}`,
+        )
+        .all(...params, SUMMARY_SCAN_CAP)
+    )
       .map(enrichLogRow)
       .filter(keep)
     const acc = {
@@ -553,7 +558,7 @@ export class UsageLogsView {
         'cache_creation_1h_tokens',
         'prompt_tokens',
       ])
-        acc[k] += num(r[k])
+        acc[k] = addInteger(acc[k], r[k])
       if (r.duration_ms != null) {
         durSum += num(r.duration_ms)
         durN++
@@ -576,23 +581,20 @@ export class UsageLogsView {
    * most EXPORT_SCAN_CAP newest rows are read and `capped` says the scan ended
    * before the table did.
    */
-  exportRows(filters = {}) {
+  async exportRows(filters = {}) {
     const limit = clampInt(filters.limit, 1, EXPORT_LIMIT_MAX, EXPORT_LIMIT_DEFAULT)
     const { where, params, keep, sqlOnlySummary } = buildFilter(filters, this.mutedErrorClasses)
     const cond = whereSql(where)
-    const select = `SELECT * FROM usage_logs ${cond} ORDER BY created_at DESC, id DESC LIMIT ?`
+    const select = `SELECT * FROM usage_logs ${cond} ORDER BY created_at DESC, id DESC LIMIT $${params.length + 1}`
     if (!keep || sqlOnlySummary) {
-      const total = this.db.prepare(`SELECT COUNT(*) AS c FROM usage_logs ${cond}`).get(...params).c
+      const total = (await this.db.prepare(`SELECT COUNT(*) AS c FROM usage_logs ${cond}`).get(...params)).c
       return {
-        items: this.db
-          .prepare(select)
-          .all(...params, limit)
-          .map(exportRow),
+        items: (await this.db.prepare(select).all(...params, limit)).map(exportRow),
         total,
         capped: false,
       }
     }
-    const scanned = this.db.prepare(select).all(...params, EXPORT_SCAN_CAP)
+    const scanned = await this.db.prepare(select).all(...params, EXPORT_SCAN_CAP)
     const matched = scanned.map(exportRow).filter(keep)
     return {
       items: matched.slice(0, limit),
@@ -602,17 +604,18 @@ export class UsageLogsView {
   }
 
   /** Lazy dropdown values. Entity lists come from their tables; free-form columns from recent rows. */
-  filterOptions({ owner_user_id = null } = {}) {
+  async filterOptions({ owner_user_id = null } = {}) {
     const own = ownerPred(owner_user_id)
     const recentWhere = own.sql ? `WHERE ${own.sql}` : ''
     const recent = `(SELECT * FROM usage_logs ${recentWhere} ORDER BY created_at DESC LIMIT ${RECENT_SCAN})`
-    const distinct = (col) =>
-      this.db
-        .prepare(
-          `SELECT ${col} AS v FROM ${recent} WHERE ${col} IS NOT NULL AND ${col} != '' GROUP BY ${col} ORDER BY MAX(created_at) DESC LIMIT ${OPTION_LIMIT}`,
-        )
-        .all(...own.params)
-        .map((r) => r.v)
+    const distinct = async (col) =>
+      (
+        await this.db
+          .prepare(
+            `SELECT ${col} AS v FROM ${recent} AS recent_rows WHERE ${col} IS NOT NULL ${col === 'status' ? '' : `AND ${col} != ''`} GROUP BY ${col} ORDER BY MAX(created_at) DESC LIMIT ${OPTION_LIMIT}`,
+          )
+          .all(...own.params)
+      ).map((r) => r.v)
     const named = (ids, map) => ids.map((id) => ({ id: String(id), name: map.get(id) ?? String(id) }))
 
     let users
@@ -620,105 +623,105 @@ export class UsageLogsView {
     let vmIds
     let accountIds
     if (owner_user_id) {
-      users = this.db.prepare('SELECT id, username, email FROM users WHERE id = ?').all(String(owner_user_id))
-      keys = this.db
-        .prepare('SELECT id, name, user_id FROM api_keys WHERE user_id = ? AND deleted_at IS NULL ORDER BY name')
+      users = await this.db.prepare('SELECT id, username, email FROM users WHERE id = $1').all(String(owner_user_id))
+      keys = await this.db
+        .prepare('SELECT id, name, user_id FROM api_keys WHERE user_id = $1 AND deleted_at IS NULL ORDER BY name')
         .all(String(owner_user_id))
       // Pool slots that served this tenant appear in its rows even when not owned.
       vmIds = uniq([
-        ...this.db
-          .prepare('SELECT id FROM vms WHERE owner_user_id = ?')
-          .all(String(owner_user_id))
-          .map((r) => r.id),
-        ...distinct('vm_id'),
+        ...(await this.db.prepare('SELECT id FROM vms WHERE owner_user_id = $1').all(String(owner_user_id))).map(
+          (r) => r.id,
+        ),
+        ...(await distinct('vm_id')),
       ])
-      accountIds = uniq([...distinct('final_account_id'), ...distinct('account_id')])
+      accountIds = uniq([...(await distinct('final_account_id')), ...(await distinct('account_id'))])
     } else {
-      users = this.db.prepare('SELECT id, username, email FROM users WHERE deleted_at IS NULL ORDER BY username').all()
-      keys = this.db.prepare('SELECT id, name, user_id FROM api_keys WHERE deleted_at IS NULL ORDER BY name').all()
-      vmIds = this.db
-        .prepare('SELECT id FROM vms ORDER BY id')
+      users = await this.db
+        .prepare('SELECT id, username, email FROM users WHERE deleted_at IS NULL ORDER BY username')
         .all()
-        .map((r) => r.id)
-      accountIds = this.db
-        .prepare('SELECT id FROM accounts WHERE deleted_at IS NULL ORDER BY id')
+      keys = await this.db
+        .prepare('SELECT id, name, user_id FROM api_keys WHERE deleted_at IS NULL ORDER BY name')
         .all()
-        .map((r) => r.id)
+      vmIds = (await this.db.prepare('SELECT id FROM vms ORDER BY id').all()).map((r) => r.id)
+      accountIds = (await this.db.prepare('SELECT id FROM accounts WHERE deleted_at IS NULL ORDER BY id').all()).map(
+        (r) => r.id,
+      )
     }
-    const names = lookupNames(this.db, { vmIds, accountIds })
+    const names = await lookupNames(this.db, { vmIds, accountIds })
     return {
-      users: users.map((u) => ({ id: String(u.id), name: u.username || u.email || String(u.id) })),
+      users: await users.map((u) => ({ id: String(u.id), name: u.username || u.email || String(u.id) })),
       keys: keys.map((k) => ({ id: String(k.id), name: k.name || String(k.id), userId: k.user_id ?? null })),
       vms: named(vmIds, names.vms),
       accounts: named(accountIds, names.accounts),
-      models: uniq([...distinct('model'), ...distinct('requested_model')]).sort(),
-      protocols: distinct('protocol').sort(),
-      endpoints: distinct('path').sort(),
-      statusCodes: distinct('status')
-        .map(Number)
-        .sort((a, b) => a - b),
+      models: uniq([...(await distinct('model')), ...(await distinct('requested_model'))]).sort(),
+      protocols: (await distinct('protocol')).sort(),
+      endpoints: (await distinct('path')).sort(),
+      statusCodes: (await distinct('status')).map(Number).sort((a, b) => a - b),
     }
   }
 
   /** Outbound session ids starting with `q`, most recently used first (index range scan). */
-  sessionSuggestions({ q = '', limit = 20, owner_user_id = null } = {}) {
+  async sessionSuggestions({ q = '', limit = 20, owner_user_id = null } = {}) {
     const n = clampInt(limit, 1, 50, 20)
-    const own = ownerPred(owner_user_id)
+    let own = ownerPred(owner_user_id)
     const prefix = String(q || '').trim()
     if (prefix) {
-      const where = ['outbound_session_id >= ?', 'outbound_session_id < ?']
+      const where = ['outbound_session_id COLLATE "C" >= $1', 'outbound_session_id COLLATE "C" < $2']
       const params = [prefix, `${prefix}\uffff`]
+      own = ownerPred(owner_user_id, params.length)
       if (own.sql) {
         where.push(own.sql)
         params.push(...own.params)
       }
-      return this.db
-        .prepare(
-          `SELECT outbound_session_id AS sid FROM usage_logs WHERE ${where.join(' AND ')} GROUP BY outbound_session_id ORDER BY MAX(created_at) DESC LIMIT ?`,
-        )
-        .all(...params, n)
-        .map((r) => r.sid)
+      return (
+        await this.db
+          .prepare(
+            `SELECT outbound_session_id AS sid FROM usage_logs WHERE ${where.join(' AND ')} GROUP BY outbound_session_id ORDER BY MAX(created_at) DESC LIMIT $${params.length + 1}`,
+          )
+          .all(...params, n)
+      ).map((r) => r.sid)
     }
     const where = ['outbound_session_id IS NOT NULL']
     if (own.sql) where.push(own.sql)
-    return this.db
-      .prepare(
-        `SELECT sid FROM (SELECT outbound_session_id AS sid, created_at FROM usage_logs WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT ${RECENT_SCAN}) GROUP BY sid ORDER BY MAX(created_at) DESC LIMIT ?`,
-      )
-      .all(...own.params, n)
-      .map((r) => r.sid)
+    return (
+      await this.db
+        .prepare(
+          `SELECT sid FROM (SELECT outbound_session_id AS sid, created_at FROM usage_logs WHERE ${where.join(' AND ')} ORDER BY created_at DESC LIMIT ${RECENT_SCAN}) AS recent_sessions GROUP BY sid ORDER BY MAX(created_at) DESC LIMIT $${own.params.length + 1}`,
+        )
+        .all(...own.params, n)
+    ).map((r) => r.sid)
   }
 
   /** Outbound sessions with a completed request in the last `minutes`. */
-  activeSessions({ minutes = 5, limit = 50, owner_user_id = null, now = Date.now() } = {}) {
+  async activeSessions({ minutes = 5, limit = 50, owner_user_id = null, now = Date.now() } = {}) {
     const mins = clampInt(minutes, 1, 1440, 5)
     const n = clampInt(limit, 1, 200, 50)
-    const where = ['created_at >= ?', 'outbound_session_id IS NOT NULL']
+    const where = ['created_at >= $1', 'outbound_session_id IS NOT NULL']
     const params = [new Date(now - mins * 60_000).toISOString()]
-    const own = ownerPred(owner_user_id)
+    const own = ownerPred(owner_user_id, params.length)
     if (own.sql) {
       where.push(own.sql)
       params.push(...own.params)
     }
     const cond = `WHERE ${where.join(' AND ')}`
-    const total = this.db
-      .prepare(`SELECT COUNT(DISTINCT outbound_session_id) AS n FROM usage_logs ${cond}`)
-      .get(...params).n
+    const total = (
+      await this.db.prepare(`SELECT COUNT(DISTINCT outbound_session_id) AS n FROM usage_logs ${cond}`).get(...params)
+    ).n
     // Aggregate first, then pull the newest row per session by id; SQLite's
     // bare-column-with-MAX shortcut is undefined once MIN() is also present.
-    const rows = this.db
+    const rows = await this.db
       .prepare(`
       WITH s AS (
         SELECT outbound_session_id AS sid,
                MAX(created_at) AS last_at,
                MIN(created_at) AS first_at,
                COUNT(*) AS requests,
-               SUM(IFNULL(input_tokens, 0) + IFNULL(output_tokens, 0) + IFNULL(cache_read_tokens, 0) + IFNULL(cache_creation_tokens, 0)) AS tokens,
+               SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) + COALESCE(cache_read_tokens, 0) + COALESCE(cache_creation_tokens, 0)) AS tokens,
                COALESCE(SUM(total_cost), 0) AS cost
         FROM usage_logs ${cond}
         GROUP BY outbound_session_id
         ORDER BY last_at DESC
-        LIMIT ?
+        LIMIT $${params.length + 1}
       )
       SELECT s.*, l.session_id AS client_session_id, l.user_id, l.api_key_id, l.vm_id, l.model, l.status, l.duration_ms,
              COALESCE(l.final_account_id, l.account_id) AS account
@@ -730,8 +733,8 @@ export class UsageLogsView {
       )
       ORDER BY s.last_at DESC
     `)
-      .all(...params, n, ...own.params)
-    const names = lookupNames(this.db, {
+      .all(...params, n)
+    const names = await lookupNames(this.db, {
       userIds: rows.map((r) => r.user_id),
       keyIds: rows.map((r) => r.api_key_id),
       vmIds: rows.map((r) => r.vm_id),
@@ -739,7 +742,7 @@ export class UsageLogsView {
     })
     return {
       minutes: mins,
-      total: num(total),
+      total: integerValue(total),
       sessions: rows.map((r) => ({
         sessionId: r.sid,
         clientSessionId: r.client_session_id ?? null,
@@ -751,10 +754,10 @@ export class UsageLogsView {
         model: r.model ?? null,
         firstAt: r.first_at,
         lastAt: r.last_at,
-        requests: num(r.requests),
+        requests: integerValue(r.requests),
         lastStatus: nullableNum(r.status),
         lastDurationMs: nullableNum(r.duration_ms),
-        totalTokens: num(r.tokens),
+        totalTokens: integerValue(r.tokens),
         totalCost: num(r.cost),
       })),
     }
@@ -764,20 +767,20 @@ export class UsageLogsView {
    * Header cards. "Today" = local midnight in `tz` → now; "yesterday" = the
    * same elapsed span starting at yesterday's local midnight.
    */
-  overview({ tz = 'UTC', owner_user_id = null, now = Date.now() } = {}) {
+  async overview({ tz = 'UTC', owner_user_id = null, now = Date.now() } = {}) {
     const zone = reportTimezone(tz)
-    const own = ownerPred(owner_user_id)
+    const own = ownerPred(owner_user_id, 2)
     const todayStart = zonedDayStartMs(now, zone)
     const yesterdayStart = zonedDayStartMs(now, zone, -1)
     const yesterdayEnd = Math.min(todayStart, yesterdayStart + (now - todayStart))
-    const agg = (sinceMs, untilMs) => {
-      const where = ['created_at >= ?', 'created_at < ?']
+    const agg = async (sinceMs, untilMs) => {
+      const where = ['created_at >= $1', 'created_at < $2']
       const params = [new Date(sinceMs).toISOString(), new Date(untilMs).toISOString()]
       if (own.sql) {
         where.push(own.sql)
         params.push(...own.params)
       }
-      return this.db
+      return await this.db
         .prepare(`
         SELECT COUNT(*) AS requests,
                COALESCE(SUM(CASE WHEN ${ERROR_PRED} THEN 1 ELSE 0 END), 0) AS errors,
@@ -790,20 +793,20 @@ export class UsageLogsView {
         .get(...params)
     }
     // +1ms so a row stamped exactly `now` still counts.
-    const today = agg(todayStart, now + 1)
-    const yesterday = agg(yesterdayStart, yesterdayEnd)
-    const active = agg(now - 5 * 60_000, now + 1)
-    const lastMinute = agg(now - 60_000, now + 1)
+    const today = await agg(todayStart, now + 1)
+    const yesterday = await agg(yesterdayStart, yesterdayEnd)
+    const active = await agg(now - 5 * 60_000, now + 1)
+    const lastMinute = await agg(now - 60_000, now + 1)
     const avg = (v) => (v == null ? null : Math.round(Number(v)))
     return {
-      activeSessions: num(active.sessions),
-      rpm: num(lastMinute.requests),
-      todayRequests: num(today.requests),
+      activeSessions: integerValue(active.sessions),
+      rpm: integerValue(lastMinute.requests),
+      todayRequests: integerValue(today.requests),
       todayCost: num(today.cost),
       todayActualCost: num(today.actual_cost),
-      todayErrors: num(today.errors),
+      todayErrors: integerValue(today.errors),
       todayAvgDurationMs: avg(today.avg_duration_ms),
-      yesterdayRequests: num(yesterday.requests),
+      yesterdayRequests: integerValue(yesterday.requests),
       yesterdayCost: num(yesterday.cost),
       yesterdayAvgDurationMs: avg(yesterday.avg_duration_ms),
     }
@@ -811,15 +814,15 @@ export class UsageLogsView {
 }
 
 function toSummary(row) {
-  const input = num(row.input_tokens)
-  const output = num(row.output_tokens)
-  const cacheCreation = num(row.cache_creation_tokens)
-  const cacheRead = num(row.cache_read_tokens)
-  const prompt = num(row.prompt_tokens)
+  const input = integerValue(row.input_tokens)
+  const output = integerValue(row.output_tokens)
+  const cacheCreation = integerValue(row.cache_creation_tokens)
+  const cacheRead = integerValue(row.cache_read_tokens)
+  const prompt = integerValue(row.prompt_tokens)
   return {
-    totalRequests: num(row.requests),
-    successRequests: num(row.success),
-    errorRequests: num(row.errors),
+    totalRequests: integerValue(row.requests),
+    successRequests: integerValue(row.success),
+    errorRequests: integerValue(row.errors),
     totalCost: num(row.cost),
     totalActualCost: num(row.actual_cost),
     totalTokens: rowTotalTokens(row),
@@ -827,8 +830,8 @@ function toSummary(row) {
     totalOutputTokens: output,
     totalCacheCreationTokens: cacheCreation,
     totalCacheReadTokens: cacheRead,
-    totalCacheCreation5mTokens: num(row.cache_creation_5m_tokens),
-    totalCacheCreation1hTokens: num(row.cache_creation_1h_tokens),
+    totalCacheCreation5mTokens: integerValue(row.cache_creation_5m_tokens),
+    totalCacheCreation1hTokens: integerValue(row.cache_creation_1h_tokens),
     cacheHitRate: prompt > 0 ? Math.min(1, cacheRead / prompt) : 0,
     avgDurationMs: row.avg_duration_ms == null ? null : Math.round(Number(row.avg_duration_ms)),
     avgTtftMs: row.avg_ttft_ms == null ? null : Math.round(Number(row.avg_ttft_ms)),

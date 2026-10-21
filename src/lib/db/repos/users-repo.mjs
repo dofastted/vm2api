@@ -56,35 +56,44 @@ export class UsersRepo {
   constructor(db) {
     this.db = db
     this._list = db.prepare('SELECT * FROM users WHERE deleted_at IS NULL ORDER BY created_at, username')
-    this._get = db.prepare('SELECT * FROM users WHERE id = ? AND deleted_at IS NULL')
-    this._getByName = db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE AND deleted_at IS NULL')
+    this._get = db.prepare('SELECT * FROM users WHERE id = $1 AND deleted_at IS NULL')
+    this._getByName = db.prepare(
+      'SELECT * FROM users WHERE ascii_fold(username) = ascii_fold($1) AND deleted_at IS NULL',
+    )
     this._insert = db.prepare(`
       INSERT INTO users (${COLUMNS.join(', ')})
-      VALUES (${COLUMNS.map(() => '?').join(', ')})
+      VALUES (${COLUMNS.map((_, i) => '$' + (i + 1)).join(', ')})
     `)
-    this._softDelete = db.prepare('UPDATE users SET deleted_at = ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL')
+    this._softDelete = db.prepare(
+      'UPDATE users SET deleted_at = $1, updated_at = $2 WHERE id = $3 AND deleted_at IS NULL',
+    )
     this._countRole = db.prepare(
-      "SELECT COUNT(*) AS c FROM users WHERE role = ? AND status = 'active' AND deleted_at IS NULL",
+      "SELECT COUNT(*) AS c FROM users WHERE role = $1 AND status = 'active' AND deleted_at IS NULL",
     )
     this._addBalance = db.prepare(
-      'UPDATE users SET balance = balance + ?, updated_at = ? WHERE id = ? AND deleted_at IS NULL',
+      'UPDATE users SET balance = balance + $1, updated_at = $2 WHERE id = $3 AND deleted_at IS NULL',
     )
   }
 
-  list() {
-    return this._list.all().map(rowToRec)
+  async list() {
+    return (await this._list.all()).map(rowToRec)
   }
 
-  getById(id) {
-    return rowToRec(this._get.get(id))
+  async getById(id, { forUpdate = false } = {}) {
+    return rowToRec(
+      await (forUpdate
+        ? this.db.prepare('SELECT * FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE')
+        : this._get
+      ).get(id),
+    )
   }
 
-  getByUsername(username) {
-    return rowToRec(this._getByName.get(String(username || '').trim()))
+  async getByUsername(username) {
+    return rowToRec(await this._getByName.get(String(username || '').trim()))
   }
 
-  insert(rec) {
-    this._insert.run(
+  async insert(rec) {
+    await this._insert.run(
       ...COLUMNS.map((c) => {
         if (c === 'email') return rec.email ?? `${rec.username}@panel.local`
         if (c === 'status') return statusOf(rec)
@@ -96,13 +105,13 @@ export class UsersRepo {
         return rec[c] ?? null
       }),
     )
-    return this.getById(rec.id)
+    return await this.getById(rec.id)
   }
 
-  update(rec) {
+  async update(rec) {
     const cols = COLUMNS.filter((c) => c !== 'id' && c !== 'deleted_at')
-    const sql = `UPDATE users SET ${cols.map((c) => `${c} = ?`).join(', ')} WHERE id = ? AND deleted_at IS NULL`
-    this.db.prepare(sql).run(
+    const sql = `UPDATE users SET ${cols.map((c, i) => `${c} = $${i + 1}`).join(', ')} WHERE id = $${cols.length + 1} AND deleted_at IS NULL`
+    await this.db.prepare(sql).run(
       ...cols.map((c) => {
         if (c === 'email') return rec.email ?? `${rec.username}@panel.local`
         if (c === 'status') return statusOf(rec)
@@ -114,23 +123,27 @@ export class UsersRepo {
       }),
       rec.id,
     )
-    return this.getById(rec.id)
+    return await this.getById(rec.id)
   }
 
   /** Soft delete (sub2api SoftDeleteMixin semantics). */
-  remove(id) {
+  async remove(id) {
     const now = new Date().toISOString()
-    return this._softDelete.run(now, now, id).changes > 0
+    return (await this._softDelete.run(now, now, id)).changes > 0
   }
 
-  countEnabledRole(role) {
-    const row = this._countRole.get(role)
+  async countEnabledRole(role) {
+    const row = await this._countRole.get(role)
     return Number(row?.c || 0)
   }
 
+  async touchLogin(id, at) {
+    await this.db.prepare('UPDATE users SET last_login_at = $1 WHERE id = $2 AND deleted_at IS NULL').run(at, id)
+  }
+
   /** Atomic balance credit/debit (redeem, billing). Negative delta = charge. */
-  addBalance(id, delta) {
-    this._addBalance.run(Number(delta) || 0, new Date().toISOString(), id)
-    return this.getById(id)
+  async addBalance(id, delta) {
+    await this._addBalance.run(Number(delta) || 0, new Date().toISOString(), id)
+    return await this.getById(id)
   }
 }

@@ -66,9 +66,9 @@ async function startLoopbackServer(t, respond) {
   return { baseUrl: `http://127.0.0.1:${server.address().port}`, calls }
 }
 
-test('listTestableModels(openai) hides Claude ids', () => {
-  const gpt = listTestableModels('openai')
-  const claude = listTestableModels('anthropic')
+test('listTestableModels(openai) hides Claude ids', async () => {
+  const gpt = await listTestableModels('openai')
+  const claude = await listTestableModels('anthropic')
   assert.ok(gpt.length > 0)
   assert.ok(claude.length > 0)
   assert.ok(gpt.every((m) => /^(gpt-|codex-)/i.test(m.id) || m.family === 'codex'))
@@ -294,7 +294,7 @@ test('runVmTestChat Codex ENOENT is not rewritten as wrap cli-hop', async (t) =>
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   seedCodexVm(root)
   seedRouting(root)
-  const model = listTestableModels('openai')[0]?.id || 'gpt-5.5'
+  const model = (await listTestableModels('openai'))[0]?.id || 'gpt-5.5'
   const { baseUrl } = await startLoopbackServer(t, () => ({
     status: 503,
     body: {

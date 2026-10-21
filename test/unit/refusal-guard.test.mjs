@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { createDatabase } from '../../src/lib/db/database.mjs'
+import { getDb } from '../../src/lib/db/database.mjs'
 import { RefusalGuardsRepo } from '../../src/lib/db/repos/refusal-guards-repo.mjs'
 import {
   REFUSAL_GUARD_MESSAGE,
@@ -88,41 +88,41 @@ test('zero inject still allows distill skip while refusal fingerprint is indepen
   assert.ok(refusalFingerprint(inbound))
 })
 
-test('remember then lookup hits the same prompt', () => {
+test('remember then lookup hits the same prompt', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-refusal-'))
-  const db = createDatabase({ dataDir: dir })
+  const db = await getDb()
   try {
     const repo = new RefusalGuardsRepo(db)
     const req = body('Return exactly CACHE_30_5m_OK.')
     const fp = refusalFingerprint(req)
-    assert.equal(repo.get(fp), null)
-    repo.remember({
+    assert.equal(await repo.get(fp), null)
+    await repo.remember({
       fingerprint: fp,
       model: req.model,
       requestId: 'req-1',
       errorMessage: 'violate our Usage Policy',
       preview: 'Return exactly CACHE_30_5m_OK.',
     })
-    const hit = repo.get(fp)
+    const hit = await repo.get(fp)
     assert.ok(hit)
     assert.equal(hit.hit_count, 0)
-    const bumped = repo.hit(fp)
+    const bumped = await repo.hit(fp)
     assert.equal(bumped.hit_count, 1)
     const other = refusalFingerprint(body('Return exactly CACHE_30_5m_OK.', { model: 'claude-opus-4-8' }))
-    assert.equal(repo.get(other), null)
+    assert.equal(await repo.get(other), null)
   } finally {
-    db.close()
+    await db.close()
   }
 })
 
-test('timed refusal expires and no longer blocks', () => {
+test('timed refusal expires and no longer blocks', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-refusal-'))
-  const db = createDatabase({ dataDir: dir })
+  const db = await getDb()
   try {
     const repo = new RefusalGuardsRepo(db)
     const req = body('pause this 500')
     const fp = refusalFingerprint(req)
-    repo.remember({
+    await repo.remember({
       fingerprint: fp,
       model: req.model,
       requestId: 'req-500',
@@ -130,10 +130,10 @@ test('timed refusal expires and no longer blocks', () => {
       preview: 'pause this 500',
       expiresAt: new Date(Date.now() - 1000).toISOString(),
     })
-    assert.equal(repo.get(fp), null)
-    assert.equal(repo.list().length, 0)
+    assert.equal(await repo.get(fp), null)
+    assert.equal((await repo.list()).length, 0)
   } finally {
-    db.close()
+    await db.close()
   }
 })
 test('guard error is a non-retryable HTTP 400 request rejection, not a login error', () => {
@@ -170,27 +170,27 @@ test('guard error is a non-retryable HTTP 400 request rejection, not a login err
   })
 })
 
-test('list remove and clear', () => {
+test('list remove and clear', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-refusal-'))
-  const db = createDatabase({ dataDir: dir })
+  const db = await getDb()
   try {
     const repo = new RefusalGuardsRepo(db)
     const a = refusalFingerprint(body('A'))
     const b = refusalFingerprint(body('B'))
-    repo.remember({ fingerprint: a, model: 'claude-opus-5', preview: 'A' })
-    repo.remember({ fingerprint: b, model: 'claude-opus-5', preview: 'B' })
-    assert.equal(repo.count(), 2)
-    assert.equal(repo.list().length, 2)
-    assert.equal(repo.remove(a), true)
-    assert.equal(repo.count(), 1)
-    assert.equal(repo.clear(), 1)
-    assert.equal(repo.count(), 0)
+    await repo.remember({ fingerprint: a, model: 'claude-opus-5', preview: 'A' })
+    await repo.remember({ fingerprint: b, model: 'claude-opus-5', preview: 'B' })
+    assert.equal(await repo.count(), 2)
+    assert.equal((await repo.list()).length, 2)
+    assert.equal(await repo.remove(a), true)
+    assert.equal(await repo.count(), 1)
+    assert.equal(await repo.clear(), 1)
+    assert.equal(await repo.count(), 0)
   } finally {
-    db.close()
+    await db.close()
   }
 })
 
-test('panel setting and env can disable the guard', () => {
+test('panel setting and env can disable the guard', async () => {
   const settings = new Map([[REFUSAL_GUARD_SETTING, true]])
   const read = (key, fb) => (settings.has(key) ? settings.get(key) : fb)
   assert.equal(isRefusalGuardEnabled(read), true)

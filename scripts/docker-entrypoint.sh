@@ -3,6 +3,10 @@ set -eu
 
 ROOT="${KIN_PROJECT_ROOT:-/opt/vm2api}"
 IMAGE_BIN="/opt/vm2api/image-bin"
+if [ -z "${VM2API_DATABASE_URL:-${KIN_DATABASE_URL:-}}" ]; then
+  echo "vm2api: PostgreSQL 17 connection is required. Configure VM2API_DATABASE_URL; see docs/deploy/postgresql.md for SQLite import." >&2
+  exit 1
+fi
 mkdir -p "$ROOT/vms" "$ROOT/data" "$ROOT/bin"
 
 # 镜像安装没有仓库 checkout：把镜像内默认配置补进被 bind-mount 覆盖的 src/config。

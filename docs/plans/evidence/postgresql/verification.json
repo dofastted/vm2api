@@ -1,0 +1,100 @@
+{
+  "baseline_commit": "eee8f6ecb6ca04455e6edef0c8e498fb3be21f21",
+  "production_code_commit": "6aa877de792bbcaa0fd02134c821bf938c295c42",
+  "final_test_commit": "3054bfa08500c43f81eeb0a84804c4a63e4bd022",
+  "database": "PostgreSQL 17.11",
+  "unit": {
+    "verified_commit": "4ad444d71e32e938c589c647850a0a795a9b84d1",
+    "tests": 3342,
+    "pass": 3325,
+    "fail": 7,
+    "skipped": 10,
+    "cancelled": 0,
+    "failed_files": 2,
+    "files": 281,
+    "log": ".tmp/pg-evidence/unit-final.log"
+  },
+  "e2e": {
+    "verified_commit": "3054bfa08500c43f81eeb0a84804c4a63e4bd022",
+    "tests": 114,
+    "pass": 96,
+    "fail": 17,
+    "skipped": 1,
+    "cancelled": 0,
+    "failed_files": 11,
+    "files": 26,
+    "log": ".tmp/pg-evidence/e2e-complete.log"
+  },
+  "node22": {
+    "verified_commit": "4ad444d71e32e938c589c647850a0a795a9b84d1",
+    "tests": 93,
+    "pass": 93,
+    "fail": 0,
+    "skipped": 0,
+    "cancelled": 0,
+    "log": ".tmp/pg-evidence/node22-final.log"
+  },
+  "schema_isolation": {
+    "verified_commit": "3054bfa08500c43f81eeb0a84804c4a63e4bd022",
+    "tests": 40,
+    "pass": 40,
+    "fail": 0,
+    "skipped": 0,
+    "cancelled": 0,
+    "log": ".tmp/pg-evidence/schema-isolation-final.log"
+  },
+  "web": {
+    "verified_commit": "4ad444d71e32e938c589c647850a0a795a9b84d1",
+    "files": 60,
+    "tests": 473,
+    "pass": 473,
+    "fail": 0,
+    "build": "pass",
+    "format": "pass"
+  },
+  "go": {
+    "verified_commit": "4ad444d71e32e938c589c647850a0a795a9b84d1",
+    "worker_race": "pass",
+    "api_kernel_race": "pass"
+  },
+  "deployment": {
+    "verified_commit": "4ad444d71e32e938c589c647850a0a795a9b84d1",
+    "python_tests": 25,
+    "pass": 25,
+    "postgres_role_smoke": "pass"
+  },
+  "image": {
+    "verified_commit": "6aa877de792bbcaa0fd02134c821bf938c295c42",
+    "result": "PASS",
+    "image": "sha256:d93e36d953db42aa80acd562a2af63cf0a969789d154d063610c0e6e060dc33e",
+    "versions": [
+      "v22.23.2",
+      "pg_dump (PostgreSQL) 17.11 (Debian 17.11-1.pgdg12+2)",
+      "pg_restore (PostgreSQL) 17.11 (Debian 17.11-1.pgdg12+2)"
+    ],
+    "checks": [
+      "HTTP health",
+      "PostgreSQL metrics",
+      "API key mutations",
+      "snapshot backup",
+      "restore and memory rebind"
+    ]
+  },
+  "screenshots": {
+    "viewport": {
+      "width": 1440,
+      "height": 900
+    },
+    "baseline": "database-sqlite-1440.png",
+    "implementation": "database-postgresql-1440.png",
+    "data": "synthetic"
+  },
+  "limitations": [
+    "Existing baseline failures remain; see baseline-comparison.json",
+    "Native ARM64 build/runtime not performed locally",
+    "No existing deployment, live credentials, customer data, or external inference upstream was migrated or tested"
+  ],
+  "git": {
+    "pushed": false
+  }
+}

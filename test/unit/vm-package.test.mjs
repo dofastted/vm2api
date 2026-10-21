@@ -83,12 +83,12 @@ function makeHandler(project, body, { pool, role = 'admin', panelUsers = null } 
   return { handlePanel, response }
 }
 
-function makePool(t) {
-  const db = createDatabase({ dbPath: ':memory:' })
-  const pool = new ProxyPool({ db })
-  t.after(() => {
+async function makePool(t) {
+  const db = await createDatabase({ dbPath: ':memory:' })
+  const pool = await new ProxyPool({ db }).init()
+  t.after(async () => {
     pool.stopScheduler()
-    db.close()
+    await db.close()
   })
   return pool
 }
@@ -134,7 +134,7 @@ test('package export keeps a window whose stored fields are partly invalid', () 
 test('import creates the slot and rolls a colliding id forward', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-vm-pkg-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = makePool(t)
+  const pool = await makePool(t)
   const doc = claudePackage('vm-pkg')
   const first = makeHandler(root, doc, { pool })
   await first.handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/package'))
@@ -174,7 +174,7 @@ test('import creates the slot and rolls a colliding id forward', async (t) => {
 test('write-back updates the current slot and leaves runtime counters', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-vm-pkg-put-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = makePool(t)
+  const pool = await makePool(t)
   const created = makeHandler(root, claudePackage('vm-pkg'), { pool })
   await created.handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/package'))
   assert.equal(created.response.status, 201, created.response.body?.error?.message)
@@ -204,7 +204,7 @@ test('write-back updates the current slot and leaves runtime counters', async (t
 test('local egress imports as px-local and codex tokens stay out of vm.json', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-vm-pkg-kind-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = makePool(t)
+  const pool = await makePool(t)
   const local = claudePackage('vm-local')
   local.proxy = { kind: 'local' }
   const localRes = makeHandler(root, local, { pool })
@@ -249,7 +249,7 @@ test('local egress imports as px-local and codex tokens stay out of vm.json', as
 test('user cannot download a package and cannot import past the create quota', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-vm-pkg-user-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = makePool(t)
+  const pool = await makePool(t)
   const admin = makeHandler(root, claudePackage('vm-pkg'), { pool })
   await admin.handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/package'))
   assert.equal(admin.response.status, 201, admin.response.body?.error?.message)
@@ -275,7 +275,7 @@ test('user cannot download a package and cannot import past the create quota', a
 test('tenant import cannot bind px-local or another owner SOCKS and drops seed_policy', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-vm-pkg-tenant-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = makePool(t)
+  const pool = await makePool(t)
   const panelUsers = { getById: () => ({ vm_create_quota: 5 }) }
   const importAs = async (doc) => {
     const h = makeHandler(root, doc, { pool, role: 'user', panelUsers })
@@ -315,7 +315,7 @@ test('tenant import cannot bind px-local or another owner SOCKS and drops seed_p
 test('admin export returns the SOCKS password', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-vm-pkg-get-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const pool = makePool(t)
+  const pool = await makePool(t)
   const created = makeHandler(root, claudePackage('vm-pkg'), { pool })
   await created.handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/package'))
   const got = makeHandler(root, null, { pool })

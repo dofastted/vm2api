@@ -9,7 +9,7 @@ import { execFileSync, spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
 import { getDb, isDbOpen } from '../db/database.mjs'
-import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { RuntimeSettings as SettingsRepo } from '../db/settings-state.mjs'
 import { socksProxyUrl } from './socks-address.mjs'
 import { assertProxyAllowed, proxyBlockedReason } from './proxy-policy.mjs'
 
@@ -556,7 +556,7 @@ async function stopOwnedEgress(pid) {
   } catch (error) {
     if (error.code !== 'ESRCH') return { ok: false, error: `egress_stop_failed: ${error.code || error.message}` }
   }
-  return waitEgressExit(pid)
+  return await waitEgressExit(pid)
 }
 
 export function inspectEgressProcess(projectRoot, proxyId) {
@@ -653,7 +653,7 @@ export async function waitEgressExit(
   try {
     process.kill(pid, 'SIGKILL')
   } catch (error) {
-    if (error.code === 'ESRCH') return waitEgressReap(pid, killGraceMs)
+    if (error.code === 'ESRCH') return await waitEgressReap(pid, killGraceMs)
     return { ok: false, error: `egress_kill_failed: ${error.code || error.message}`, pid }
   }
   const reaped = await waitEgressReap(pid, killGraceMs)
@@ -783,7 +783,11 @@ export async function runExclusiveProxyEgress(projectRoot, proxyId, fn) {
 
 export async function ensureProxyEgress(projectRoot, proxy, opts = {}) {
   if (isLocalEgressProxy(proxy)) return ensureLocalProxyEgress(proxy, { runDocker: opts.runDocker })
-  return runExclusiveProxyEgress(projectRoot, proxy?.id, () => startProxyEgress(projectRoot, proxy, opts))
+  return await runExclusiveProxyEgress(
+    projectRoot,
+    proxy?.id,
+    async () => await startProxyEgress(projectRoot, proxy, opts),
+  )
 }
 
 export async function startProxyEgress(

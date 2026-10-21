@@ -248,7 +248,7 @@ test('auto-numbering skips ids a deleted VM left behind in account history', asy
 
 test('create binds an explicitly chosen exit instead of auto-allocating', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-exit-'))
-  const pool = new ProxyPool({ dataDir: root, geoLookup: async () => ({ ok: false, error: 'offline' }) })
+  const pool = await new ProxyPool({ dataDir: root, geoLookup: async () => ({ ok: false, error: 'offline' }) }).init()
   pool.stopScheduler()
   try {
     const socks = pool.importLines('1.2.3.4:1080').items[0].id
@@ -295,7 +295,7 @@ test('create stamps docker machine from routing defaults', async () => {
 
 test('create refuses an unknown or full exit before writing the slot', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-exit-bad-'))
-  const pool = new ProxyPool({ dataDir: root, geoLookup: async () => ({ ok: false, error: 'offline' }) })
+  const pool = await new ProxyPool({ dataDir: root, geoLookup: async () => ({ ok: false, error: 'offline' }) }).init()
   pool.stopScheduler()
   try {
     const missing = makeCreateHandler(root, { id: 'vm-x', start: false, proxy_id: 'px-nope' }, pool)

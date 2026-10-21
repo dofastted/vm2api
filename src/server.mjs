@@ -34,6 +34,7 @@ import { ensureTelemetrySidecar } from './lib/vm/slot-process-status.mjs'
 import { createSlotBridgeHealer, powerOnSlot, reviveDownSlots } from './lib/vm/slot-recovery.mjs'
 import { createUsageProbeMonitor, normalizeUsageProbeConfig } from './lib/oauth/usage-probe-monitor.mjs'
 import { createCatalogMonitor } from './lib/admin/catalog-monitor.mjs'
+import { pausePriceCatalog, resumePriceCatalog } from './lib/admin/price-catalog.mjs'
 import { normalizeOfficialCcConfig } from './lib/oauth/official-cc-bootstrap.mjs'
 import { invalidateLiveCredentialCache } from './lib/admin/panel-live-credentials.mjs'
 import { normalizeHealthProbeConfig, createHealthProbeMonitor, HEALTH_REAL_HEADER } from './lib/admin/health-probe.mjs'
@@ -47,7 +48,7 @@ import { normalizeTiers } from './lib/pool/quota-tiers.mjs'
 import { ApiKeyStore } from './lib/admin/api-keys.mjs'
 import { keyScopeFromRequest } from './lib/admin/key-scope.mjs'
 import { GroupsRepo } from './lib/db/repos/groups-repo.mjs'
-import { SettingsRepo } from './lib/db/repos/settings-repo.mjs'
+import { RuntimeSettings as SettingsRepo, loadSettingsState } from './lib/db/settings-state.mjs'
 import { ApiEndpointStore } from './lib/admin/api-endpoints.mjs'
 import { ApiScheduler } from './lib/pool/api-scheduler.mjs'
 import { resolveInferenceBackend } from './lib/pool/api-protocol.mjs'
@@ -72,7 +73,9 @@ import { GATEWAY_CAPABILITIES } from './lib/vm/execution-context.mjs'
 import { isTelemetryPath, telemetryInterceptResponse } from './lib/identity/telemetry-rewrite.mjs'
 import { openDatabase, closeDatabase } from './lib/db/database.mjs'
 import { runLegacyImport } from './lib/db/legacy-import.mjs'
-import { initVmDbSync, stopVmWatch } from './lib/vm/vm-db-sync.mjs'
+import { initVmDbSync, stopVmWatch, flushVmDbSync, pauseVmDbSync, resumeVmDbSync } from './lib/vm/vm-db-sync.mjs'
+import { flushPendingWrites } from './lib/db/pending-writes.mjs'
+import { loadGptModelPolicy } from './lib/protocol/gpt-model-policy.mjs'
 import { BackupService } from './lib/admin/backup-service.mjs'
 import { ClusterNodesRepo } from './lib/db/repos/cluster-nodes-repo.mjs'
 import { ClusterManager } from './lib/cluster/cluster-manager.mjs'
@@ -139,21 +142,20 @@ const allowRate = createRateLimiter({
   refillPerSec: cfg.limits.rate_refill,
 })
 
-// --- Persistent store (SQLite, sub2api-inspired) ---
+// --- Persistent PostgreSQL store ---
+const activeRequests = new Set()
+let _shuttingDown = false
 const dataDir = cfg.paths.data || path.join(cfg.paths.root, 'data')
-openDatabase({ dataDir })
-try {
-  loadModelPolicy()
-} catch (e) {
-  console.warn('[model-policy] boot load failed', e?.message || e)
-}
-// one-time migration of legacy JSON files (data/*.json + request-logs) into the DB
-const legacyImport = runLegacyImport({ dataDir, projectRoot: cfg.paths.project })
+await openDatabase({ dataDir })
+const legacyImport = await runLegacyImport({ dataDir, projectRoot: cfg.paths.project })
 if (legacyImport?.imported) {
   console.log('[db] legacy JSON import done:', JSON.stringify(legacyImport.counts || {}))
 }
+await loadSettingsState()
+await loadModelPolicy()
+await loadGptModelPolicy()
 // VM/credential mirror: write-through hook + startup reconcile + fs.watch
-const vmSync = initVmDbSync(cfg.paths.project)
+const vmSync = await initVmDbSync(cfg.paths.project)
 if (vmSync.upserted || vmSync.rebuilt) {
   console.log(`[db] vm mirror reconciled: upserted=${vmSync.upserted} rebuilt=${vmSync.rebuilt}`)
 }
@@ -287,7 +289,7 @@ routingConfig.usage_probe = normalizeUsageProbeConfig(routingConfig.usage_probe)
 routingConfig.notify = normalizeNotifyConfig(routingConfig.notify)
 routingConfig.tiers = normalizeTiers(routingConfig.tiers, routingConfig.quota, routingConfig.concurrency)
 syncTierDefaultsIntoRouting()
-stickyRouter = new StickyRouter({ dataDir, config: routingConfig })
+stickyRouter = await new StickyRouter({ dataDir, config: routingConfig }).init()
 accountQuota = new AccountQuota({
   dataDir,
   config: routingConfig,
@@ -300,29 +302,30 @@ accountQuota = new AccountQuota({
     max_rpm: v.policy?.maxRpm ?? routingConfig?.concurrency?.default_max_rpm ?? 0,
   })),
 })
+await accountQuota.init()
 accountQuota.loadVmQuotaOverrides(listVms(cfg.paths.project))
 
 const apiKeyStore = new ApiKeyStore({ dataDir: cfg.paths.data })
 groupsRepo = new GroupsRepo()
 const apiEndpointStore = new ApiEndpointStore({ dataDir: cfg.paths.data })
 const apiScheduler = new ApiScheduler()
-apiScheduler.reload(apiEndpointStore.listRaw())
+apiScheduler.reload(await apiEndpointStore.listRaw())
 const panelUsers = new PanelUserStore({ dataDir: cfg.paths.data, projectRoot: cfg.paths.project })
 try {
-  panelUsers.bootstrapFromEnv(getPanelAdmin())
+  await panelUsers.bootstrapFromEnv(getPanelAdmin())
 } catch (e) {
   console.warn('[panel-users] bootstrap failed', e?.message || e)
 }
 attachPanelAuth({
-  authenticate: (username, password) => panelUsers.authenticate(username, password),
-  lookupRole: (username) => panelUsers.getByUsername(username)?.role || null,
+  authenticate: async (username, password) => await panelUsers.authenticate(username, password),
+  lookupRole: async (username) => (await panelUsers.getByUsername(username))?.role || null,
 })
 requestLog = new RequestLogStore({
   dataDir: cfg.paths.data,
   mode: process.env.KIN_REQUEST_LOG_MODE || routingConfig?.logging?.mode || 'normal',
 })
 if (routingConfig?.logging) {
-  requestLog.setConfig({
+  await requestLog.setConfig({
     // Env wins at boot so e2e / ops can force off|debug. Panel PUT still hot-updates.
     mode: process.env.KIN_REQUEST_LOG_MODE || routingConfig.logging.mode,
     retainDays: routingConfig.logging.retain_days,
@@ -332,7 +335,7 @@ if (routingConfig?.logging) {
   })
 }
 try {
-  requestLog.cleanup()
+  await requestLog.cleanup()
 } catch {}
 requestLog.startCleanupScheduler()
 
@@ -369,8 +372,9 @@ proxyPool = new ProxyPool({
     setVmSchedulable(cfg.paths.project, vmId, true)
   },
   egressCheck: (proxy) => proxyEgressReady(proxy, cfg.paths.project),
-  repairEgress: (proxy) => ensureProxyEgress(cfg.paths.project, proxy),
+  repairEgress: async (proxy) => await ensureProxyEgress(cfg.paths.project, proxy),
 })
+await proxyPool.init()
 // An upgrade replaces bin/ files; slots mounting data/run/slot-guest-bin must see the new ones.
 try {
   refreshSlotGuestBinDir(cfg.paths.project)
@@ -384,7 +388,7 @@ try {
   if (!proxyPool.snapshot().proxies?.length) {
     const seeded = proxyPool.ensureLocal()
     if (seeded.created) {
-      void ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(seeded.proxy.id))
+      void (await ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(seeded.proxy.id)))
       console.log('[bootstrap] seeded local egress px-local')
     }
   }
@@ -392,7 +396,7 @@ try {
   console.warn('[bootstrap] local egress seed failed', e?.message || e)
 }
 
-initPoolRuntime()
+await initPoolRuntime()
 try {
   applyRoutingTierConcurrency(routingConfig.tiers)
 } catch (e) {
@@ -446,8 +450,8 @@ function attachSlotRuntime(vm) {
 healthMonitor = createHealthProbeMonitor({
   config: routingConfig.health_probe,
   listTargets: () => listVms(cfg.paths.project).map(attachSlotRuntime),
-  runChat: (vm, real) =>
-    runVmTestChat({
+  runChat: async (vm, real) =>
+    await runVmTestChat({
       projectRoot: cfg.paths.project,
       vmId: vm.id,
       model: real.model,
@@ -465,8 +469,8 @@ const vmTestSchedule = new VmTestScheduleRunner({
   projectRoot: cfg.paths.project,
   settings: () => new SettingsRepo(),
   list: () => listVms(cfg.paths.project),
-  runTest: (vmId, params) =>
-    runVmTestChat({
+  runTest: async (vmId, params) =>
+    await runVmTestChat({
       projectRoot: cfg.paths.project,
       vmId,
       ...params,
@@ -486,8 +490,8 @@ credentialRefreshMonitor = createCredentialRefreshMonitor({
       } catch {}
       return { ...vm, last_probe: lastProbe }
     }),
-  refreshOne: (vm) =>
-    refreshWorkerCredentialForVm({
+  refreshOne: async (vm) =>
+    await refreshWorkerCredentialForVm({
       vmId: vm.id,
       vmPath: path.join(cfg.paths.project, 'vms', `${vm.id}.json`),
       homeDir: path.join(cfg.paths.project, 'vms', vm.id, 'cli-home'),
@@ -495,20 +499,20 @@ credentialRefreshMonitor = createCredentialRefreshMonitor({
       force: false,
     }),
 })
-function bootSlot(id) {
-  return powerOnSlot({ projectRoot: cfg.paths.project, id, proxyPool, routing: routingConfig })
+async function bootSlot(id) {
+  return await powerOnSlot({ projectRoot: cfg.paths.project, id, proxyPool, routing: routingConfig })
 }
 kernelWatchdog = createKernelWatchdog({
   config: routingConfig.kernel_watchdog,
   listTargets: () => listVms(cfg.paths.project),
   getRouting: () => routingConfig,
   homeDirFor: (vm) => path.join(cfg.paths.project, 'vms', vm.id, 'cli-home'),
-  ensureTelemetry: (vm) => ensureTelemetrySidecar({ projectRoot: cfg.paths.project, vm }),
-  revive: (vm) => bootSlot(vm.id),
+  ensureTelemetry: async (vm) => await ensureTelemetrySidecar({ projectRoot: cfg.paths.project, vm }),
+  revive: async (vm) => await bootSlot(vm.id),
   healBridges: createSlotBridgeHealer({ projectRoot: cfg.paths.project }),
-  onFault: (vm, reason) => {
+  onFault: async (vm, reason) => {
     const title = `槽内核故障 ${vm.id}`
-    dispatchNotify(routingConfig.notify, {
+    await dispatchNotify(routingConfig.notify, {
       title,
       text: `【KIN】${title}\n\n${reason}\n已停止调度该槽；内核恢复健康后自动恢复调度。`,
       subject: `KIN · ${title}`,
@@ -538,7 +542,7 @@ usageProbeMonitor = createUsageProbeMonitor({
       poolScheduler.syncQuotaSchedule(vm, account)
     } catch {}
   },
-  probeOne: (vm) => panel.buildProbeOne({ cfg, accountQuota, id: vm.id, routingConfig }),
+  probeOne: async (vm) => await panel.buildProbeOne({ cfg, accountQuota, id: vm.id, routingConfig }),
 })
 catalogMonitor = createCatalogMonitor({
   projectRoot: cfg.paths.project,
@@ -548,8 +552,8 @@ catalogMonitor = createCatalogMonitor({
 notifyMonitor = createNotifyMonitor({
   config: routingConfig.notify,
   baseUrl: cfg.base_url,
-  snapshot: () =>
-    panel.snapshotAccountPool({
+  snapshot: async () =>
+    await panel.snapshotAccountPool({
       cfg,
       accountQuota,
       routingConfig,
@@ -565,15 +569,18 @@ const backupService = new BackupService({
   projectRoot: cfg.paths.project,
   configDir: path.dirname(routingConfigPath),
 })
-backupService.onRestored((db) => {
-  // A restore swaps the DatabaseSync instance and routing files. Rebuild every
+backupService.onRestored(async (db) => {
+  await loadSettingsState(db)
+  await loadModelPolicy({ force: true })
+  await loadGptModelPolicy({ force: true })
+  // A restore swaps the database pool and routing files. Rebuild every
   // holder before reporting success; otherwise requests keep stale snapshots
   // or silently write through statements owned by the closed connection.
   for (const store of [apiKeyStore, apiEndpointStore, panelUsers, accountQuota, stickyRouter, proxyPool, requestLog]) {
-    store.rebind(db)
+    await store.rebind(db)
   }
   groupsRepo = new GroupsRepo(db)
-  apiScheduler.reload(apiEndpointStore.listRaw())
+  apiScheduler.reload(await apiEndpointStore.listRaw())
 
   routingConfig = loadRoutingConfig()
   migrateLegacyOpenAIPolicies(routingConfig)
@@ -590,7 +597,7 @@ backupService.onRestored((db) => {
   stickyRouter.reloadConfig(routingConfig)
   accountQuota.reloadConfig(routingConfig)
   accountQuota.loadVmQuotaOverrides(listVms(cfg.paths.project))
-  requestLog.setConfig({
+  await requestLog.setConfig({
     mode: process.env.KIN_REQUEST_LOG_MODE || routingConfig.logging?.mode,
     retainDays: routingConfig.logging?.retain_days,
     debugRetainDays: routingConfig.logging?.debug_retain_days,
@@ -603,11 +610,36 @@ backupService.onRestored((db) => {
   usageProbeMonitor?.setConfig(routingConfig.usage_probe)
   notifyMonitor?.setConfig(routingConfig.notify)
 
-  initPoolRuntime()
+  await initPoolRuntime()
+  await clusterManager.rebind(db)
   reloadActiveVm(cfg)
-  vmTestSchedule.reload()
+  await vmTestSchedule.reload()
 })
-backupService.startScheduler()
+backupService.onMaintenance(async (enabled) => {
+  if (enabled) {
+    vmTestSchedule.stop()
+    proxyPool.stopScheduler()
+    requestLog.stopCleanupScheduler()
+    for (const monitor of maintenanceMonitors()) await monitor?.stop?.()
+    while ([...activeRequests].some((request) => !/\/(?:backups)(?:\/|$)/.test(String(request.url || '')))) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    for (const monitor of maintenanceMonitors()) await monitor?.flush?.()
+    await vmTestSchedule.flush()
+    await pausePriceCatalog()
+    await flushRuntimeWrites()
+    await pauseVmDbSync()
+  } else {
+    if (_shuttingDown) return
+    resumeVmDbSync()
+    resumePriceCatalog()
+    for (const monitor of maintenanceMonitors()) await monitor?.start?.({ immediate: false })
+    proxyPool.startScheduler()
+    requestLog.startCleanupScheduler()
+    await vmTestSchedule.start()
+  }
+})
+await backupService.startScheduler()
 
 const stats = {
   requests: 0,
@@ -687,9 +719,22 @@ async function refreshWorkerCredentialForVm({ vmId, vmPath, homeDir, vm, force =
   return published
 }
 
-const { json, writeSSEHeaders, readBody, readRawBody } = createRespond(cfg, {
+const {
+  json: sendJson,
+  writeSSEHeaders,
+  readBody,
+  readRawBody,
+} = createRespond(cfg, {
   tcpNodelay: () => routingConfig?.inference?.tcp_nodelay !== false,
 })
+
+function json(res, ...args) {
+  if (res._panelResponseState) {
+    res._panelResponseState.response = [res, ...args]
+    return
+  }
+  return sendJson(res, ...args)
+}
 
 function rejectAuth(req, res, error) {
   req.authError = {
@@ -701,7 +746,7 @@ function rejectAuth(req, res, error) {
   return false
 }
 
-function requireAuth(req, res) {
+async function requireAuth(req, res) {
   req.presentedApiKey = extractApiKey(req)
   const token = extractPanelToken(req) || req.presentedApiKey
   if (!token) {
@@ -717,7 +762,7 @@ function requireAuth(req, res) {
     )
   }
   // Panel session
-  const session = verifyPanelSession(token)
+  const session = await verifyPanelSession(token)
   if (session) {
     if (!allowRate('panel:' + session.user)) {
       return rejectAuth(
@@ -732,8 +777,8 @@ function requireAuth(req, res) {
       )
     }
     req.panelUser = session.user
-    req.panelRole = session.role || panelUsers.getByUsername(session.user)?.role || 'user'
-    const rec = panelUsers.getByUsername(session.user)
+    req.panelRole = session.role || (await panelUsers.getByUsername(session.user))?.role || 'user'
+    const rec = await panelUsers.getByUsername(session.user)
     req.panelUserId = rec?.id || null
     req.panelVmCreateQuota = rec?.vm_create_quota ?? 0
     return true
@@ -759,7 +804,7 @@ function requireAuth(req, res) {
   }
 
   // Managed multi-keys (sub2api-style)
-  const managed = apiKeyStore.authenticate(token)
+  const managed = await apiKeyStore.authenticate(token)
   if (!managed.ok) {
     return rejectAuth(
       req,
@@ -772,7 +817,7 @@ function requireAuth(req, res) {
       }),
     )
   }
-  const gate = apiKeyStore.canAccept(managed.record)
+  const gate = await apiKeyStore.canAccept(managed.record)
   if (!gate.ok) {
     const type =
       gate.status === 429
@@ -834,7 +879,7 @@ const importCommit = createImportCommit({
 
 const { commitImportedOauth, requireSlotProxy, officialCcStatsHandler } = importCommit
 
-const { handleProtocol, handleSearch } = createHandleProtocol({
+const protocolHandlers = createHandleProtocol({
   json,
   writeSSEHeaders,
   readBody,
@@ -868,6 +913,23 @@ const { handleProtocol, handleSearch } = createHandleProtocol({
     return groupsRepo
   },
 })
+
+async function dispatchProtocol(name, req, res, ...args) {
+  if (backupService.isMaintaining) {
+    return json(res, 503, {
+      error: { type: 'overloaded_error', code: 'maintenance_in_progress', message: 'Database maintenance in progress' },
+    })
+  }
+  activeRequests.add(req)
+  try {
+    return await protocolHandlers[name](req, res, ...args)
+  } finally {
+    activeRequests.delete(req)
+  }
+}
+
+const handleProtocol = async (...args) => await dispatchProtocol('handleProtocol', ...args)
+const handleSearch = async (...args) => await dispatchProtocol('handleSearch', ...args)
 
 const responsesWs = createResponsesWsHandler({
   handleProtocol,
@@ -911,10 +973,12 @@ const clusterManager = new ClusterManager({
       throw new ClusterError(409, 'node_in_use', '节点仍有进行中的请求、虚拟机操作或镜像构建，请完成后重试')
     }
   },
-  onNodesChanged: () => syncNodeLocalEgress(),
+  onNodesChanged: () => {
+    if (!backupService.isMaintaining) syncNodeLocalEgress()
+  },
   // A node's local row follows its link: re-probe as soon as the link settles.
   onLinkState: (nodeId, state) => {
-    if (state === 'ready' || state === 'error' || state === 'backoff') {
+    if (!backupService.isMaintaining && (state === 'ready' || state === 'error' || state === 'backoff')) {
       proxyPool.probeLocalNode(nodeId).catch(() => {})
     }
   },
@@ -922,7 +986,7 @@ const clusterManager = new ClusterManager({
 localEgressCluster = clusterManager
 bindPlacement({ manager: clusterManager, projectRoot: cfg.paths.project })
 await startNodeEgressSocks({ clientFor: (nodeId) => clusterManager.client(nodeId) })
-clusterManager.start()
+await clusterManager.start()
 clusterManager.restoreSlotRelays()
 syncNodeLocalEgress()
 if (proxyPool.snapshot().config.ipv6_enabled !== true) {
@@ -947,6 +1011,14 @@ cliNodeGuard = createCliNodeGuard({
 })
 
 const handlePanel = createPanelHandler({
+  onPersistenceFailure: async () => {
+    backupService.isMaintaining = true
+    vmTestSchedule.stop()
+    proxyPool.stopScheduler()
+    requestLog.stopCleanupScheduler()
+    stopVmWatch()
+    for (const monitor of maintenanceMonitors()) await monitor?.stop?.()
+  },
   json,
   writeSSEHeaders,
   readBody,
@@ -1018,6 +1090,7 @@ const handlePanel = createPanelHandler({
 })
 
 const server = http.createServer(async (req, res) => {
+  activeRequests.add(req)
   try {
     res.req = req
     if (req.method === 'OPTIONS') {
@@ -1036,16 +1109,18 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (
-      backupService.isRestoring &&
-      (p.startsWith('/v1/') || p === '/messages' || p === '/chat/completions' || p === '/responses')
+      backupService.isMaintaining &&
+      p !== '/healthz' &&
+      p !== '/health' &&
+      !(req.method === 'POST' && /^\/(?:api\/panel|admin)\/backups\/[^/]+\/restore$/.test(p))
     ) {
       return json(
         res,
         503,
         makeError({
           type: ErrorType.OVERLOADED,
-          code: 'restore_in_progress',
-          message: 'Gateway is restoring from backup; retry shortly',
+          code: backupService.isRestoring ? 'restore_in_progress' : 'maintenance_in_progress',
+          message: 'Database maintenance in progress; retry shortly',
           status: 503,
         }).body,
       )
@@ -1085,7 +1160,7 @@ const server = http.createServer(async (req, res) => {
         health_probe: healthMonitor?.getSnapshot?.() || null,
         api_kernel: {
           ...apiKernelSnapshot(cfg),
-          endpoints: apiEndpointStore.listRaw().filter((ep) => !ep.disabled).length,
+          endpoints: (await apiEndpointStore.listRaw()).filter((ep) => !ep.disabled).length,
         },
       })
     }
@@ -1111,15 +1186,15 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && p === '/v1/models') {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuth(req, res))) return
       if (resolveInferenceBackend(req) === 'api') {
         return json(res, 200, apiScheduler.catalog())
       }
-      const result = await fetchWorkerModels({ groupType: keyScopeFromRequest(req).group_type })
+      const result = await fetchWorkerModels({ groupType: (await keyScopeFromRequest(req)).group_type })
       return json(res, 200, result)
     }
     if (req.method === 'POST' && p === '/admin/models/refresh') {
-      if (!requireAuth(req, res)) return
+      if (!(await requireAuth(req, res))) return
       const result = await fetchWorkerModels()
       return json(res, 200, result)
     }
@@ -1181,11 +1256,17 @@ const server = http.createServer(async (req, res) => {
         res.end()
       } catch {}
     }
+  } finally {
+    activeRequests.delete(req)
   }
 })
 
-server.on('upgrade', (req, socket, head) => {
-  if (responsesWs.handleUpgrade(req, socket, head)) return
+server.on('upgrade', async (req, socket, head) => {
+  if (backupService.isMaintaining) {
+    socket.end('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n')
+    return
+  }
+  if (await responsesWs.handleUpgrade(req, socket, head)) return
   if (clusterRoutes.handleUpgrade(req, socket, head)) return
   if (!slotShell.handleUpgrade(req, socket, head)) socket.destroy()
 })
@@ -1238,9 +1319,8 @@ fs.writeFileSync(path.join(cfg.paths.root, 'config', 'gateway-v2.public.json'), 
 process.on('uncaughtException', (e) => console.error('[uncaught]', e))
 process.on('unhandledRejection', (e) => console.error('[unhandled]', e))
 
-// Graceful shutdown: stop schedulers/watchers, close the DB (WAL checkpoint).
-let _shuttingDown = false
-function shutdown(signal) {
+// Graceful shutdown: stop schedulers/watchers, drain persistence, close the pool.
+async function shutdown(signal) {
   if (_shuttingDown) return
   _shuttingDown = true
   console.log(`[shutdown] ${signal} — closing`)
@@ -1285,21 +1365,54 @@ function shutdown(signal) {
     clusterManager.stop()
   } catch {}
   try {
-    server.close(() => {})
+    await new Promise((resolve) => server.close(resolve))
   } catch {}
   try {
-    closeDatabase()
-  } catch {}
+    await backupService.flush()
+    await pausePriceCatalog()
+    for (const monitor of maintenanceMonitors()) await monitor?.flush?.()
+    await vmTestSchedule.flush()
+    await flushRuntimeWrites()
+    await closeDatabase()
+  } catch (error) {
+    console.error(`[shutdown] persistence failed: ${error.code || error.name}`)
+    try {
+      await closeDatabase()
+    } catch {}
+    process.exit(1)
+  }
   process.exit(0)
 }
-process.on('SIGTERM', () => shutdown('SIGTERM'))
-process.on('SIGINT', () => shutdown('SIGINT'))
+process.on('SIGTERM', async () => await shutdown('SIGTERM'))
+process.on('SIGINT', async () => await shutdown('SIGINT'))
+
+function maintenanceMonitors() {
+  return [
+    healthMonitor,
+    credentialRefreshMonitor,
+    kernelWatchdog,
+    cliNodeGuard,
+    usageProbeMonitor,
+    catalogMonitor,
+    notifyMonitor,
+  ]
+}
+
+async function flushRuntimeWrites() {
+  await requestLog.flush?.()
+  await flushPendingWrites()
+  await accountQuota.flush()
+  await stickyRouter.flush()
+  await proxyPool.flush()
+  await runtimeRepo?.flush?.()
+  await flushVmDbSync()
+}
 
 await bootApiKernel(cfg)
 
-server.listen(cfg.port, cfg.host, () => {
+server.listen(cfg.port, cfg.host, async () => {
   try {
-    vmTestSchedule.start()
+    await vmTestSchedule.start()
   } catch (e) {
     console.warn('[vm-test-schedule] start failed', e?.message || e)
   }

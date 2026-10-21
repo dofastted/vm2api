@@ -1,5 +1,5 @@
 /**
- * Per-account Claude usage quota tracker (SQLite-backed).
+ * Per-account Claude usage quota tracker backed by PostgreSQL.
  *
  * Scheduling and list Extra come from Messages response headers.
  * Official GET /api/oauth/usage is a manual calibration hop that writes
@@ -10,7 +10,9 @@
  */
 
 import { resolveStoreDb } from '../db/database.mjs'
+import { addInteger } from '../db/integers.mjs'
 import { AccountsRepo } from '../db/repos/accounts-repo.mjs'
+import { WriteQueue } from './write-queue.mjs'
 import { computeWeeklySplit, weeklySplitConfig } from './weekly-split.mjs'
 import {
   applyEffectiveWindows,
@@ -60,7 +62,12 @@ export { estimateRequestRisk }
 export class AccountQuota {
   constructor({ dataDir, db, config, accounts }) {
     this.db = resolveStoreDb({ db, dataDir })
-    this.repo = new AccountsRepo(this.db)
+    this.persistence = new AccountsRepo(this.db)
+    this.writes = this.db.schedulingWriteQueue ||= new WriteQueue(this.db)
+    this.rows = new Map()
+    this.allocations = new Map()
+    this.seedAccounts = accounts || []
+    this.repo = this._workingSet()
     this.config = config?.quota || {
       safety_ratio: 0.85,
       weekly_safety_ratio: 0.8,
@@ -78,17 +85,68 @@ export class AccountQuota {
     this.sessions = config?.sessions instanceof SessionLimitRegistry ? config.sessions : new SessionLimitRegistry()
     // vm_id → normalized `vm.policy.quota`; vm.json is the source of truth, this is the hot-path copy.
     this.vmQuota = new Map()
-    // seed accounts
-    for (const a of accounts || []) this.ensure(a)
   }
 
-  /** Kept for API compat + post-restore hook (no in-memory cache to refresh). */
-  reload() {}
+  /** Load persisted counters and allocations; restore reload omits startup seed accounts. */
+  async init({ seed = true } = {}) {
+    for (const queue of this.db.pendingWriteQueues || []) await queue.flush()
+    for (const row of await this.persistence.list()) {
+      this.rows.set(row.account_id, row)
+      this.allocations.set(row.account_id, await this.persistence.recentAllocations(row.account_id, 50))
+    }
+    if (seed) for (const account of this.seedAccounts) this.ensure(account)
+    await this.flush()
+    return this
+  }
+
+  async reload() {
+    await this.flush()
+    this.rows.clear()
+    this.allocations.clear()
+    return await this.init({ seed: false })
+  }
+
+  flush() {
+    return this.writes.flush()
+  }
+
+  _workingSet() {
+    const save = (account, insert = false) => {
+      const next = structuredClone(account)
+      this.rows.set(next.account_id, next)
+      this.writes.enqueue(async () => {
+        const existing = insert ? await this.persistence.get(next.account_id) : true
+        return this.persistence[existing ? 'save' : 'insert'](next)
+      })
+      return structuredClone(next)
+    }
+    return {
+      get: (id) => structuredClone(this.rows.get(id) || null),
+      list: () => [...this.rows.values()].map((row) => structuredClone(row)),
+      insert: (row) => save(row, true),
+      save: (row) => save(row),
+      remove: (id) => {
+        const removed = this.rows.delete(id)
+        this.allocations.delete(id)
+        this.writes.enqueue(() => this.persistence.remove(id))
+        return removed
+      },
+      addAllocation: (id, input, { max = 50 } = {}) => {
+        const allocation = { ...input, at: input.at || new Date().toISOString() }
+        this.allocations.set(id, [...(this.allocations.get(id) || []), structuredClone(allocation)].slice(-max))
+        this.writes.enqueue(() => this.persistence.addAllocation(id, allocation, { max }))
+      },
+      recentAllocations: (id, limit = 5) => structuredClone((this.allocations.get(id) || []).slice(-limit)),
+      allocationCount: (id) => (this.allocations.get(id) || []).length,
+    }
+  }
 
   /** Re-bind to a fresh DB connection (after backup restore). */
-  rebind(db) {
+  async rebind(db) {
+    await this.flush()
     this.db = db
-    this.repo = new AccountsRepo(db)
+    this.persistence = new AccountsRepo(db)
+    return await this.reload()
   }
 
   /**
@@ -237,12 +295,12 @@ export class AccountQuota {
         usage.cache_read_tokens != null ||
         usage.cache_creation_tokens != null)
     ) {
-      acc.tokens_in += Number(usage.input_tokens) || 0
-      acc.tokens_out += Number(usage.output_tokens) || 0
-      acc.cache_read_tokens = (acc.cache_read_tokens || 0) + (Number(usage.cache_read_tokens) || 0)
-      acc.cache_creation_tokens = (acc.cache_creation_tokens || 0) + (Number(usage.cache_creation_tokens) || 0)
+      acc.tokens_in = addInteger(acc.tokens_in, usage.input_tokens || 0)
+      acc.tokens_out = addInteger(acc.tokens_out, usage.output_tokens || 0)
+      acc.cache_read_tokens = addInteger(acc.cache_read_tokens, usage.cache_read_tokens || 0)
+      acc.cache_creation_tokens = addInteger(acc.cache_creation_tokens, usage.cache_creation_tokens || 0)
     }
-    if (countRequest) acc.requests += 1
+    if (countRequest) acc.requests = addInteger(acc.requests, 1)
 
     if (exhausted) applyHeaderExhausted(acc, h)
 
@@ -486,10 +544,10 @@ export class AccountQuota {
 
     const shouldCount = countRequest == null ? usageBody?.input_tokens != null : !!countRequest
     if (usageBody?.input_tokens != null) {
-      acc.tokens_in += Number(usageBody.input_tokens) || 0
-      acc.tokens_out += Number(usageBody.output_tokens) || 0
+      acc.tokens_in = addInteger(acc.tokens_in, usageBody.input_tokens || 0)
+      acc.tokens_out = addInteger(acc.tokens_out, usageBody.output_tokens || 0)
     }
-    if (shouldCount) acc.requests += 1
+    if (shouldCount) acc.requests = addInteger(acc.requests, 1)
 
     this.repo.addAllocation(accountId, {
       at: new Date().toISOString(),

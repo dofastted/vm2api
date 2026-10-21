@@ -17,7 +17,20 @@ permissions:
 jobs:
   unit:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-bookworm
+        env:
+          POSTGRES_USER: vm2api
+          POSTGRES_PASSWORD: vm2api-ci-test
+          POSTGRES_DB: vm2api_test
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U vm2api -d vm2api_test"
+          --health-interval 5s --health-timeout 3s --health-retries 12
+    env:
+      VM2API_TEST_DATABASE_URL: postgresql://vm2api:vm2api-ci-test@127.0.0.1:5432/vm2api_test
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -30,8 +43,18 @@ jobs:
           go-version: '1.25.x'
           cache-dependency-path: worker/go.sum
       - run: npm ci
+      - name: PostgreSQL 17 backup clients
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          curl --fail --silent --show-error https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo tee /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc >/dev/null
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $VERSION_CODENAME-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+          echo /usr/lib/postgresql/17/bin >> "$GITHUB_PATH"
+          /usr/lib/postgresql/17/bin/pg_dump --version
       - name: panel user and onboarding regression tests
-        run: node --test test/unit/panel-users.test.mjs test/unit/onboarding.test.mjs test/e2e/panel-users.e2e.test.mjs
+        run: node --import ./test/pg-setup.mjs --test test/unit/panel-users.test.mjs test/unit/onboarding.test.mjs test/e2e/panel-users.e2e.test.mjs
       - name: format-check
         run: npx biome format
       - name: syntax-check Node source and scripts
@@ -42,8 +65,11 @@ jobs:
           npm run fetch:payload
           npm run build:egress
       - run: npm run test:unit
+      - run: npm run test:e2e
       - name: ARM64 host preparation and rollback tests
         run: python3 -m unittest discover -s test/deploy -v
+      - name: PostgreSQL application role permissions
+        run: python3 test/deploy/smoke_postgres_role.py
 
   arm64:
     runs-on: ubuntu-24.04-arm

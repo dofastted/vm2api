@@ -1,3 +1,4 @@
+import { flushPendingWrites } from '../../src/lib/db/pending-writes.mjs'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -234,6 +235,7 @@ test('the alpha/search route authenticates, logs and reaches the Codex search ho
   }
   await handleSearch(req, res, '/v1/alpha/search')
   res.finish()
+  await flushPendingWrites()
   assert.equal(res.statusCode, 502)
   assert.equal(res.body.error.code, 'proxy_required')
   assert.equal(rows.length, 1)

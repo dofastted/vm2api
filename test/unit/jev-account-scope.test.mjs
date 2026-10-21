@@ -186,13 +186,13 @@ test('without a scope the GPT switch still decides and Claude still scans', asyn
   assert.equal(claude.action, 'block')
 })
 
-test('the panel PUT round-trips platform-plan pairs and rejects junk', () => {
+test('the panel PUT round-trips platform-plan pairs and rejects junk', async () => {
   const stored = new Map()
   const settings = {
     get: (key, fallback) => (stored.has(key) ? stored.get(key) : fallback),
     set: (key, value) => stored.set(key, value),
   }
-  const saved = applyJevPatch(settings, {
+  const saved = await applyJevPatch(settings, {
     account_platform_plans: ['Claude:Max', 'gpt:plus'],
     account_ids: ['vm-02', 'ops@example.com'],
     account_types: [],
@@ -202,7 +202,7 @@ test('the panel PUT round-trips platform-plan pairs and rejects junk', () => {
   assert.deepEqual(saved.config.account_platform_plans, ['claude:max', 'gpt:plus'])
   assert.equal(jevScopeConfigured(stored.get('jev_intercept')), true)
 
-  const cleared = applyJevPatch(settings, { account_platform_plans: [], account_ids: [] })
+  const cleared = await applyJevPatch(settings, { account_platform_plans: [], account_ids: [] })
   assert.equal(cleared.ok, true)
   assert.equal(jevScopeConfigured(stored.get('jev_intercept')), false)
   assert.deepEqual(publicJevConfig(null).account_platform_plans, [])

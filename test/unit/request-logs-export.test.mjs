@@ -9,23 +9,18 @@ import { UsageLogsView } from '../../src/lib/db/repos/usage-logs-view.mjs'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-log-export-'))
-const db = openDatabase({ dbPath: path.join(root, 'logs.db') })
-test.after(() => {
-  closeDatabase()
+let db
+test.after(async () => {
+  await closeDatabase()
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-db.exec(`
-  INSERT INTO users (id, email, username, password_hash) VALUES ('u1', 'a@x', 'alice', 'x'), ('u2', 'b@x', 'bob', 'x');
-  INSERT INTO api_keys (id, name, key, user_id) VALUES ('k1', 'alice-key', 'sk-1', 'u1'), ('k2', 'bob-key', 'sk-2', 'u2');
-`)
-
 let seq = 0
-function seed(rows) {
+async function seed(rows) {
   const repo = new UsageLogsRepo(db)
   for (const r of rows) {
     seq++
-    repo.insertSummary({
+    await repo.insertSummary({
       id: `log_${String(seq).padStart(8, '0')}`,
       request_id: `req-${seq}`,
       created_at: new Date(Date.UTC(2026, 0, 1) + seq * 1000).toISOString(),
@@ -43,15 +38,24 @@ function seed(rows) {
   }
 }
 
-seed([
-  { session_id: 's1', status: 200 },
-  { session_id: 's1', status: 500, error_code: 'upstream_error' },
-  { session_id: 's1', status: 500, error_code: 'upstream_error', path: '/v1/chat/completions' },
-  { session_id: 's2', status: 500, error_code: 'upstream_error' },
-  { session_id: 's1', status: 200, attempt_count: 3, log_mode: 'debug' },
-  { session_id: 's1', status: 401, error_code: 'invalid_api_key', vm_id: null },
-  { session_id: 's9', user_id: 'u2', api_key_id: 'k2', status: 500, error_code: 'upstream_error' },
-])
+test.beforeEach(async () => {
+  db = await openDatabase()
+  seq = 0
+  await db.exec(`
+  INSERT INTO users (id, email, username, password_hash) VALUES ('u1', 'a@x', 'alice', 'x'), ('u2', 'b@x', 'bob', 'x');
+  INSERT INTO api_keys (id, name, key, user_id) VALUES ('k1', 'alice-key', 'sk-1', 'u1'), ('k2', 'bob-key', 'sk-2', 'u2');
+`)
+
+  await seed([
+    { session_id: 's1', status: 200 },
+    { session_id: 's1', status: 500, error_code: 'upstream_error' },
+    { session_id: 's1', status: 500, error_code: 'upstream_error', path: '/v1/chat/completions' },
+    { session_id: 's2', status: 500, error_code: 'upstream_error' },
+    { session_id: 's1', status: 200, attempt_count: 3, log_mode: 'debug' },
+    { session_id: 's1', status: 401, error_code: 'invalid_api_key', vm_id: null },
+    { session_id: 's9', user_id: 'u2', api_key_id: 'k2', status: 500, error_code: 'upstream_error' },
+  ])
+})
 
 async function exportLogs(query, { role = 'admin', userId = null, headers = {} } = {}) {
   const out = {}
@@ -97,9 +101,9 @@ test('export honours the list filters the page sends (session, status code, endp
   const { rows, headers } = await exportLogs(query)
   assert.deepEqual(ids(rows), ['req-2'])
   assert.equal(headers['x-kin-export-total'], '1')
-  const listed = new UsageLogsView(db)
-    .listBatch({ session_id: 's1', status_code: '500', endpoint: '/v1/messages' })
-    .logs.map((r) => r.requestId)
+  const listed = (
+    await new UsageLogsView(db).listBatch({ session_id: 's1', status_code: '500', endpoint: '/v1/messages' })
+  ).logs.map((r) => r.requestId)
   assert.deepEqual(ids(rows), listed)
 })
 

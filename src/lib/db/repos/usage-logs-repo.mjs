@@ -8,7 +8,8 @@
  * may pass either name.
  */
 
-import { getDb } from '../database.mjs'
+import { getDb, withTransaction } from '../database.mjs'
+import { addInteger, integerValue } from '../integers.mjs'
 import { collectErrors, enrichLogRow, excludeErrorClassSql, ingressAuthSql } from '../../admin/error-class.mjs'
 import {
   costColumnsFromUsage,
@@ -56,10 +57,24 @@ function billingStatsCacheKey(accountWindows) {
 // Do not re-apply a single Anthropic formula on the mixed SUM (homepage/usage
 // billing). Database-page PromptCacheMetricsPanel still uses input+read+write.
 function sumCostBuckets(rows) {
-  return {
-    ...sumCostColumns(rows),
-    prompt_tokens: rows.reduce((sum, row) => sum + (Number(row.prompt_tokens) || 0), 0),
+  const out = sumCostColumns(rows)
+  for (const key of [
+    'requests',
+    'success',
+    'errors',
+    'input_tokens',
+    'output_tokens',
+    'cache_read_tokens',
+    'cache_creation_tokens',
+    'prompt_tokens',
+  ]) {
+    out[key] = rows.reduce((sum, row) => addInteger(sum, row[key]), 0)
   }
+  return out
+}
+
+function withCacheHitRate(bucket) {
+  return { ...bucket, cache_hit_rate: cacheHitStats(bucket).cache_hit_rate }
 }
 
 const SUMMARY_COLUMNS = [
@@ -140,7 +155,7 @@ function toRow(rec) {
       c === 'cache_creation_1h_tokens' ||
       c === 'web_search_requests'
     )
-      return Number(rec[c]) || 0
+      return integerValue(rec[c])
     return rec[c] ?? null
   })
 }
@@ -160,11 +175,11 @@ function timeCond(since, until) {
   const where = []
   const params = []
   if (since) {
-    where.push('created_at >= ?')
+    where.push(`created_at >= $${params.length + 1}`)
     params.push(new Date(since).toISOString())
   }
   if (until) {
-    where.push('created_at <= ?')
+    where.push(`created_at <= $${params.length + 1}`)
     params.push(new Date(until).toISOString())
   }
   return { cond: where.length ? `WHERE ${where.join(' AND ')}` : '', params }
@@ -216,13 +231,13 @@ function bucketEventsSince(rows = [], sinceMs) {
     ...sumCostBuckets(
       picked.map((row) => ({
         requests: 1,
-        success: Number(row.success || 0),
-        errors: Number(row.errors || 0),
-        input_tokens: Number(row.input_tokens || 0),
-        output_tokens: Number(row.output_tokens || 0),
-        cache_read_tokens: Number(row.cache_read_tokens || 0),
-        cache_creation_tokens: Number(row.cache_creation_tokens || 0),
-        prompt_tokens: Number(row.prompt_tokens || 0),
+        success: integerValue(row.success),
+        errors: integerValue(row.errors),
+        input_tokens: integerValue(row.input_tokens),
+        output_tokens: integerValue(row.output_tokens),
+        cache_read_tokens: integerValue(row.cache_read_tokens),
+        cache_creation_tokens: integerValue(row.cache_creation_tokens),
+        prompt_tokens: integerValue(row.prompt_tokens),
         input_cost: Number(row.input_cost || 0),
         output_cost: Number(row.output_cost || 0),
         cache_read_cost: Number(row.cache_read_cost || 0),
@@ -238,15 +253,15 @@ function filterCond({ since = null, until = null, vmId = null, accountId = null,
   const { cond, params } = timeCond(since, until)
   const parts = cond ? [cond.replace(/^WHERE /, '')] : []
   if (vmId) {
-    parts.push('vm_id = ?')
+    parts.push(`vm_id = $${params.length + 1}`)
     params.push(vmId)
   }
   if (apiKeyId) {
-    parts.push('api_key_id = ?')
+    parts.push(`api_key_id = $${params.length + 1}`)
     params.push(apiKeyId)
   }
   if (accountId) {
-    parts.push('(account_id = ? OR final_account_id = ?)')
+    parts.push(`(account_id = $${params.length + 1} OR final_account_id = $${params.length + 2})`)
     params.push(accountId, accountId)
   }
   return { cond: parts.length ? `WHERE ${parts.join(' AND ')}` : '', params }
@@ -288,86 +303,91 @@ export class UsageLogsRepo {
     this._billingBackfillAt = 0
     this._insert = db.prepare(`
       INSERT INTO usage_logs (${SUMMARY_COLUMNS.join(', ')})
-      VALUES (${SUMMARY_COLUMNS.map(() => '?').join(', ')})
+      VALUES (${SUMMARY_COLUMNS.map((_, i) => '$' + (i + 1)).join(', ')})
     `)
     this._insertIfAbsent = db.prepare(`
-      INSERT OR IGNORE INTO usage_logs (${SUMMARY_COLUMNS.join(', ')})
-      VALUES (${SUMMARY_COLUMNS.map(() => '?').join(', ')})
+      INSERT INTO usage_logs (${SUMMARY_COLUMNS.join(', ')})
+      VALUES (${SUMMARY_COLUMNS.map((_, i) => '$' + (i + 1)).join(', ')})
+      ON CONFLICT(request_id) DO NOTHING
     `)
     this._insertDebug = db.prepare(`
-      INSERT INTO request_log_debug (request_id, ts, record_json) VALUES (?, ?, ?)
+      INSERT INTO request_log_debug (request_id, ts, record_json) VALUES ($1, $2, $3)
       ON CONFLICT(request_id) DO UPDATE SET ts = excluded.ts, record_json = excluded.record_json
     `)
     this._insertDebugIfAbsent = db.prepare(`
-      INSERT OR IGNORE INTO request_log_debug (request_id, ts, record_json) VALUES (?, ?, ?)
+      INSERT INTO request_log_debug (request_id, ts, record_json) VALUES ($1, $2, $3)
+      ON CONFLICT(request_id) DO NOTHING
     `)
-    this._getDebug = db.prepare('SELECT record_json FROM request_log_debug WHERE request_id = ?')
-    this._vmOwner = db.prepare('SELECT owner_user_id FROM vms WHERE id = ?')
-    this._listDebug = db.prepare('SELECT record_json FROM request_log_debug ORDER BY ts DESC LIMIT ?')
-    this._getByRequestId = db.prepare('SELECT * FROM usage_logs WHERE request_id = ?')
-    // OCTET_LENGTH counts encoded bytes and lets SQLite read TEXT size from metadata without loading each body.
+    this._getDebug = db.prepare('SELECT record_json FROM request_log_debug WHERE request_id = $1')
+    this._vmOwner = db.prepare('SELECT owner_user_id FROM vms WHERE id = $1')
+    this._listDebug = db.prepare('SELECT record_json FROM request_log_debug ORDER BY ts DESC LIMIT $1')
+    this._getByRequestId = db.prepare('SELECT * FROM usage_logs WHERE request_id = $1')
+    // OCTET_LENGTH counts encoded bytes rather than characters.
     this._debugBytes = db.prepare('SELECT COALESCE(SUM(OCTET_LENGTH(record_json)), 0) AS n FROM request_log_debug')
     this._debugCount = db.prepare('SELECT COUNT(*) AS n FROM request_log_debug')
-    this._deleteOldUsage = db.prepare('DELETE FROM usage_logs WHERE created_at < ?')
-    this._deleteOldDebug = db.prepare('DELETE FROM request_log_debug WHERE ts < ?')
+    this._deleteOldUsage = db.prepare('DELETE FROM usage_logs WHERE created_at < $1')
+    this._deleteOldDebug = db.prepare('DELETE FROM request_log_debug WHERE ts < $1')
     this._deleteOldestDebug = db.prepare(`
       DELETE FROM request_log_debug WHERE request_id IN (
-        SELECT request_id FROM request_log_debug ORDER BY ts ASC LIMIT ?
+        SELECT request_id FROM request_log_debug ORDER BY ts ASC LIMIT $1
       )
     `)
   }
 
   /** Cheap EXISTS: ≥1 2xx row visible to the caller (same ownerPred as request-log stats). */
-  hasSuccessfulRequest({ owner_user_id = null } = {}) {
+  async hasSuccessfulRequest({ owner_user_id = null } = {}) {
     const own = ownerPred(owner_user_id)
     const where = own.sql ? `AND ${own.sql}` : ''
-    const row = this.db
+    const row = await this.db
       .prepare(`SELECT 1 AS ok FROM usage_logs WHERE status >= 200 AND status < 300 ${where} LIMIT 1`)
       .get(...own.params)
     return !!row
   }
 
-  belongsToOwner(requestId, ownerUserId) {
+  async belongsToOwner(requestId, ownerUserId) {
     if (!requestId) return false
     if (!ownerUserId) return true
-    const own = ownerPred(ownerUserId)
-    const row = this.db
-      .prepare(`SELECT 1 AS ok FROM usage_logs WHERE request_id = ? AND ${own.sql} LIMIT 1`)
+    const own = ownerPred(ownerUserId, 1)
+    const row = await this.db
+      .prepare(`SELECT 1 AS ok FROM usage_logs WHERE request_id = $1 AND ${own.sql} LIMIT 1`)
       .get(requestId, ...own.params)
     return !!row
   }
 
-  getByRequestId(requestId) {
+  async getByRequestId(requestId) {
     if (!requestId) return null
-    const row = this._getByRequestId.get(requestId)
+    const row = await this._getByRequestId.get(requestId)
     return row ? enrichLogRow(fromRow(row)) : null
   }
 
-  insertSummary(rec) {
-    this._insert.run(...toRow(rec))
+  async insertSummary(rec) {
+    await this._insert.run(...toRow(rec))
     return rec
   }
 
-  vmOwnerOf(vmId) {
+  async vmOwnerOf(vmId) {
     if (!vmId) return null
-    return this._vmOwner.get(String(vmId))?.owner_user_id || null
+    return (await this._vmOwner.get(String(vmId)))?.owner_user_id || null
   }
 
-  /** INSERT OR IGNORE (legacy import path). @returns true when inserted */
-  insertSummaryIfAbsent(rec) {
-    return this._insertIfAbsent.run(...toRow(rec)).changes > 0
+  /** Idempotent insert for legacy imports. @returns true when inserted */
+  async insertSummaryIfAbsent(rec) {
+    return (await this._insertIfAbsent.run(...toRow(rec))).changes > 0
   }
 
-  insertDebug(requestId, ts, record) {
-    this._insertDebug.run(requestId, ts || new Date().toISOString(), JSON.stringify(record))
+  async insertDebug(requestId, ts, record) {
+    await this._insertDebug.run(requestId, ts || new Date().toISOString(), JSON.stringify(record))
   }
 
-  insertDebugIfAbsent(requestId, ts, record) {
-    return this._insertDebugIfAbsent.run(requestId, ts || new Date().toISOString(), JSON.stringify(record)).changes > 0
+  async insertDebugIfAbsent(requestId, ts, record) {
+    return (
+      (await this._insertDebugIfAbsent.run(requestId, ts || new Date().toISOString(), JSON.stringify(record))).changes >
+      0
+    )
   }
 
-  getDebug(requestId) {
-    const row = this._getDebug.get(requestId)
+  async getDebug(requestId) {
+    const row = await this._getDebug.get(requestId)
     if (!row) return null
     try {
       return enrichLogRow(JSON.parse(row.record_json))
@@ -376,12 +396,11 @@ export class UsageLogsRepo {
     }
   }
 
-  listDebug({ limit = 20, owner_user_id = null } = {}) {
+  async listDebug({ limit = 20, owner_user_id = null } = {}) {
     const n = Math.max(1, Math.min(100, Number(limit) || 20))
     const own = ownerPred(owner_user_id)
     if (!own.sql) {
-      return this._listDebug
-        .all(n)
+      return (await this._listDebug.all(n))
         .map((r) => {
           try {
             return enrichLogRow(JSON.parse(r.record_json))
@@ -391,16 +410,18 @@ export class UsageLogsRepo {
         })
         .filter(Boolean)
     }
-    return this.db
-      .prepare(`
+    return (
+      await this.db
+        .prepare(`
       SELECT d.record_json
       FROM request_log_debug d
       JOIN usage_logs u ON u.request_id = d.request_id
       WHERE ${own.sql}
       ORDER BY d.ts DESC
-      LIMIT ?
+      LIMIT $${own.params.length + 1}
     `)
-      .all(...own.params, n)
+        .all(...own.params, n)
+    )
       .map((r) => {
         try {
           return enrichLogRow(JSON.parse(r.record_json))
@@ -415,7 +436,7 @@ export class UsageLogsRepo {
    * Filtered, paginated query over summaries (newest first).
    * @returns {{ items: object[], total: number }}
    */
-  query({
+  async query({
     limit = 50,
     offset = 0,
     api_key_id = null,
@@ -440,23 +461,23 @@ export class UsageLogsRepo {
       params.push(...own.params)
     }
     if (api_key_id) {
-      where.push('api_key_id = ?')
+      where.push(`api_key_id = $${params.length + 1}`)
       params.push(api_key_id)
     }
     if (vm_id) {
-      where.push('vm_id = ?')
+      where.push(`vm_id = $${params.length + 1}`)
       params.push(vm_id)
     }
     if (account_id) {
-      where.push('account_id = ?')
+      where.push(`account_id = $${params.length + 1}`)
       params.push(account_id)
     }
     if (model) {
-      where.push('model = ?')
+      where.push(`model = $${params.length + 1}`)
       params.push(model)
     }
     if (protocol) {
-      where.push('protocol = ?')
+      where.push(`protocol = $${params.length + 1}`)
       params.push(protocol)
     }
     if (error_class && (status == null || status === '')) status = 'error'
@@ -464,7 +485,7 @@ export class UsageLogsRepo {
       if (String(status) === 'error') where.push(ERROR_PRED)
       else if (String(status) === 'ok') where.push('(status < 400 AND status IS NOT NULL)')
       else {
-        where.push('status = ?')
+        where.push(`status = $${params.length + 1}`)
         params.push(Number(status))
       }
     }
@@ -473,15 +494,17 @@ export class UsageLogsRepo {
       if (excludeSql) where.push(excludeSql)
     }
     if (since) {
-      where.push('created_at >= ?')
+      where.push(`created_at >= $${params.length + 1}`)
       params.push(new Date(since).toISOString())
     }
     if (until) {
-      where.push('created_at <= ?')
+      where.push(`created_at <= $${params.length + 1}`)
       params.push(new Date(until).toISOString())
     }
     if (q) {
-      where.push('(path LIKE ? OR error_code LIKE ? OR error_message LIKE ? OR request_id LIKE ?)')
+      where.push(
+        `(ascii_fold(path) LIKE ascii_fold($${params.length + 1}) ESCAPE '' OR ascii_fold(error_code) LIKE ascii_fold($${params.length + 2}) ESCAPE '' OR ascii_fold(error_message) LIKE ascii_fold($${params.length + 3}) ESCAPE '' OR ascii_fold(request_id) LIKE ascii_fold($${params.length + 4}) ESCAPE '')`,
+      )
       const like = `%${String(q).slice(0, 100)}%`
       params.push(like, like, like, like)
     }
@@ -491,18 +514,24 @@ export class UsageLogsRepo {
     const off = Math.max(0, Number(offset) || 0)
     if (error_class) {
       const scan = Math.min(5000, Math.max(n + off, 2000))
-      const rows = this.db
-        .prepare(`SELECT * FROM usage_logs ${cond} ORDER BY created_at DESC, id DESC LIMIT ?`)
-        .all(...params, scan)
+      const rows = (
+        await this.db
+          .prepare(`SELECT * FROM usage_logs ${cond} ORDER BY created_at DESC, id DESC LIMIT $${params.length + 1}`)
+          .all(...params, scan)
+      )
         .map(fromRow)
         .map(enrichLogRow)
         .filter((row) => row.error_class === error_class)
       return { items: rows.slice(off, off + n), total: rows.length }
     }
-    const total = this.db.prepare(`SELECT COUNT(*) c FROM usage_logs ${cond}`).get(...params).c
-    const items = this.db
-      .prepare(`SELECT * FROM usage_logs ${cond} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`)
-      .all(...params, n, off)
+    const total = (await this.db.prepare(`SELECT COUNT(*) c FROM usage_logs ${cond}`).get(...params)).c
+    const items = (
+      await this.db
+        .prepare(
+          `SELECT * FROM usage_logs ${cond} ORDER BY created_at DESC, id DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        )
+        .all(...params, n, off)
+    )
       .map(fromRow)
       .map(enrichLogRow)
     return { items, total }
@@ -512,19 +541,19 @@ export class UsageLogsRepo {
    * Aggregate stats bucketed by day or hour (dashboard/usage charts).
    * @returns {Array<{bucket, requests, errors, input_tokens, output_tokens, avg_duration_ms}>}
    */
-  aggregate({ since = null, until = null, bucket = 'day', owner_user_id = null } = {}) {
-    const fmt = bucket === 'hour' ? '%Y-%m-%dT%H:00' : '%Y-%m-%d'
+  async aggregate({ since = null, until = null, bucket = 'day', owner_user_id = null } = {}) {
+    const fmt = bucket === 'hour' ? 'YYYY-MM-DD\"T\"HH24:00' : 'YYYY-MM-DD'
     const { cond, params } = timeCond(since, until)
-    const own = ownerPred(owner_user_id)
+    const own = ownerPred(owner_user_id, params.length)
     let where = cond
     const allParams = [...params]
     if (own.sql) {
       where = where ? `${where} AND ${own.sql}` : `WHERE ${own.sql}`
       allParams.push(...own.params)
     }
-    return this.db
+    return await this.db
       .prepare(`
-      SELECT strftime('${fmt}', created_at) AS bucket,
+      SELECT to_char(created_at::timestamptz AT TIME ZONE 'UTC', '${fmt}') AS bucket,
              COUNT(*) AS requests,
              SUM(CASE WHEN ${ERROR_PRED} THEN 1 ELSE 0 END) AS errors,
              COALESCE(SUM(input_tokens), 0) AS input_tokens,
@@ -533,8 +562,8 @@ export class UsageLogsRepo {
              COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
              COALESCE(SUM(${PROMPT_TOKENS_SQL}), 0) AS prompt_tokens,
              COALESCE(SUM(total_cost), 0) AS total_cost,
-             CAST(AVG(duration_ms) AS INTEGER) AS avg_duration_ms,
-             CAST(AVG(first_token_ms) AS INTEGER) AS avg_first_token_ms
+             TRUNC(AVG(duration_ms))::bigint AS avg_duration_ms,
+             TRUNC(AVG(first_token_ms))::bigint AS avg_first_token_ms
       FROM usage_logs ${where}
       GROUP BY bucket ORDER BY bucket
     `)
@@ -542,8 +571,8 @@ export class UsageLogsRepo {
   }
 
   /** Grand totals (dashboard db_totals). */
-  totals() {
-    const row = this.db
+  async totals() {
+    const row = await this.db
       .prepare(`
       SELECT COUNT(*) AS requests,
              SUM(CASE WHEN ${ERROR_PRED} THEN 1 ELSE 0 END) AS errors,
@@ -560,7 +589,7 @@ export class UsageLogsRepo {
       FROM usage_logs
     `)
       .get()
-    return { ...row, ...cacheHitStats(row) }
+    return withCacheHitRate(row)
   }
 
   _usageForPrice(row) {
@@ -577,29 +606,28 @@ export class UsageLogsRepo {
     }
   }
 
-  _repriceRows(rows, { writeActualCost = false } = {}) {
+  async _repriceRows(rows, { writeActualCost = false } = {}) {
     if (!rows.length) return { rows: 0, changed: 0, still_unpriced: 0, delta_usd: 0 }
     const upd = writeActualCost
       ? this.db.prepare(`
       UPDATE usage_logs
-         SET input_cost = ?, output_cost = ?, cache_read_cost = ?,
-             cache_creation_cost = ?, web_search_cost = ?, total_cost = ?,
-             actual_cost = ?, pricing_model = ?, price_source = ?, price_version = ?,
-             long_context = ?
-       WHERE id = ?
+         SET input_cost = $1, output_cost = $2, cache_read_cost = $3,
+             cache_creation_cost = $4, web_search_cost = $5, total_cost = $6,
+             actual_cost = $7, pricing_model = $8, price_source = $9, price_version = $10,
+             long_context = $11
+       WHERE id = $12
     `)
       : this.db.prepare(`
       UPDATE usage_logs
-         SET input_cost = ?, output_cost = ?, cache_read_cost = ?,
-             cache_creation_cost = ?, web_search_cost = ?, total_cost = ?,
-             pricing_model = ?, price_source = ?, price_version = ?, long_context = ?
-       WHERE id = ?
+         SET input_cost = $1, output_cost = $2, cache_read_cost = $3,
+             cache_creation_cost = $4, web_search_cost = $5, total_cost = $6,
+             pricing_model = $7, price_source = $8, price_version = $9, long_context = $10
+       WHERE id = $11
     `)
     let changed = 0
     let still_unpriced = 0
     let delta_usd = 0
-    this.db.exec('BEGIN')
-    try {
+    await withTransaction(this.db, async () => {
       for (const r of rows) {
         const model = r.upstream_model || r.model || r.requested_model
         const priced = costColumnsFromUsage(this._usageForPrice(r), model)
@@ -624,7 +652,7 @@ export class UsageLogsRepo {
           const parsedRate = r.rate_multiplier == null ? 1 : Number(r.rate_multiplier)
           const rate = Number.isFinite(parsedRate) ? parsedRate : 1
           const actual = priced.total_cost == null ? null : priced.total_cost * rate
-          upd.run(
+          await upd.run(
             priced.input_cost ?? null,
             priced.output_cost ?? null,
             priced.cache_read_cost ?? null,
@@ -639,7 +667,7 @@ export class UsageLogsRepo {
             r.id,
           )
         } else {
-          upd.run(
+          await upd.run(
             priced.input_cost ?? null,
             priced.output_cost ?? null,
             priced.cache_read_cost ?? null,
@@ -654,13 +682,7 @@ export class UsageLogsRepo {
           )
         }
       }
-      this.db.exec('COMMIT')
-    } catch (e) {
-      try {
-        this.db.exec('ROLLBACK')
-      } catch {}
-      throw e
-    }
+    })
     return { rows: rows.length, changed, still_unpriced, delta_usd }
   }
 
@@ -670,8 +692,8 @@ export class UsageLogsRepo {
    * (cost stays NULL) so they are never guessed at standard rates. Idempotent.
    * Only `pricing_model IS NULL` rows; those set actual_cost = total_cost × rate_multiplier.
    */
-  backfillMissingCosts({ limit = 4000 } = {}) {
-    const rows = this.db
+  async backfillMissingCosts({ limit = 4000 } = {}) {
+    const rows = await this.db
       .prepare(`
       SELECT id, model, upstream_model, requested_model,
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
@@ -681,53 +703,54 @@ export class UsageLogsRepo {
              total_cost, pricing_model, price_source, price_version, long_context
       FROM usage_logs
       WHERE pricing_model IS NULL
-      LIMIT ?
+      LIMIT $1
     `)
       .all(Math.max(1, Math.min(20000, Number(limit) || 4000)))
-    return this._repriceRows(rows, { writeActualCost: true }).rows
+    return (await this._repriceRows(rows, { writeActualCost: true })).rows
   }
 
   /** Rewrite cost columns in [since, until]; never actual_cost / rate_multiplier. */
-  repriceRange({ since, until } = {}) {
+  async repriceRange({ since, until } = {}) {
     const { cond, params } = timeCond(since, until)
-    const where = cond ? `${cond} AND rowid > ?` : 'WHERE rowid > ?'
+    const where = `${cond || 'WHERE 1 = 1'} AND id > $${params.length + 1}`
     // Keyset pages keep a month-long range from loading every row at once.
     const page = this.db.prepare(`
-      SELECT rowid AS _rowid, id, model, upstream_model, requested_model,
+      SELECT id, model, upstream_model, requested_model,
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests,
              rate_multiplier, service_tier, speed,
              input_cost, output_cost, cache_read_cost, cache_creation_cost, web_search_cost,
              total_cost, pricing_model, price_source, price_version, long_context
       FROM usage_logs ${where}
-      ORDER BY rowid
+      ORDER BY id
       LIMIT 2000
     `)
     const out = { rows: 0, changed: 0, still_unpriced: 0, delta_usd: 0 }
-    let after = 0
+    let after = ''
     for (;;) {
-      const rows = page.all(...params, after)
+      const rows = await page.all(...params, after)
       if (!rows.length) break
-      const part = this._repriceRows(rows, { writeActualCost: false })
+      const part = await this._repriceRows(rows, { writeActualCost: false })
       out.rows += part.rows
       out.changed += part.changed
       out.still_unpriced += part.still_unpriced
       out.delta_usd += part.delta_usd
-      after = rows.at(-1)._rowid
+      after = rows.at(-1).id
     }
     out.delta_usd = Math.round(out.delta_usd * 1e8) / 1e8
     return out
   }
 
-  unpricedModels({ since } = {}) {
+  async unpricedModels({ since } = {}) {
     const where = [`pricing_model = '${UNPRICED_MODEL}'`]
     const params = []
     if (since) {
-      where.push('created_at >= ?')
+      where.push(`created_at >= $${params.length + 1}`)
       params.push(new Date(since).toISOString())
     }
-    return this.db
-      .prepare(`
+    return (
+      await this.db
+        .prepare(`
       SELECT COALESCE(NULLIF(upstream_model, ''), NULLIF(model, ''), NULLIF(requested_model, ''), '') AS model,
              COUNT(*) AS requests,
              MAX(created_at) AS last_seen
@@ -736,16 +759,16 @@ export class UsageLogsRepo {
       GROUP BY 1
       ORDER BY requests DESC, last_seen DESC
     `)
-      .all(...params)
-      .map((r) => ({
-        model: r.model,
-        requests: Number(r.requests || 0),
-        last_seen: r.last_seen || null,
-      }))
+        .all(...params)
+    ).map((r) => ({
+      model: r.model,
+      requests: integerValue(r.requests),
+      last_seen: r.last_seen || null,
+    }))
   }
 
-  _costSelect(cond, params) {
-    const row = this.db
+  async _costSelect(cond, params) {
+    const row = await this.db
       .prepare(`
       SELECT
         COUNT(*) AS requests,
@@ -764,25 +787,25 @@ export class UsageLogsRepo {
     `)
       .get(...params)
     const out = {
-      requests: Number(row?.requests || 0),
-      input_tokens: Number(row?.input_tokens || 0),
-      output_tokens: Number(row?.output_tokens || 0),
-      cache_read_tokens: Number(row?.cache_read_tokens || 0),
-      cache_creation_tokens: Number(row?.cache_creation_tokens || 0),
-      prompt_tokens: Number(row?.prompt_tokens || 0),
+      requests: integerValue(row?.requests),
+      input_tokens: integerValue(row?.input_tokens),
+      output_tokens: integerValue(row?.output_tokens),
+      cache_read_tokens: integerValue(row?.cache_read_tokens),
+      cache_creation_tokens: integerValue(row?.cache_creation_tokens),
+      prompt_tokens: integerValue(row?.prompt_tokens),
       input_cost: Number(row?.input_cost || 0),
       output_cost: Number(row?.output_cost || 0),
       cache_read_cost: Number(row?.cache_read_cost || 0),
       cache_creation_cost: Number(row?.cache_creation_cost || 0),
       total_cost: Number(row?.total_cost || 0),
-      unpriced: Number(row?.unpriced || 0),
+      unpriced: integerValue(row?.unpriced),
     }
-    return { ...out, ...cacheHitStats(out) }
+    return withCacheHitRate(out)
   }
 
-  costByAccount({ since = null, until = null } = {}) {
+  async costByAccount({ since = null, until = null } = {}) {
     const { cond, params } = timeCond(since, until)
-    const rows = this.db
+    const rows = await this.db
       .prepare(`
       SELECT
         COALESCE(NULLIF(final_account_id, ''), NULLIF(account_id, ''), vm_id, '—') AS account_id,
@@ -809,20 +832,20 @@ export class UsageLogsRepo {
     return rows.map((r) => ({
       account_id: r.account_id,
       vm_id: r.vm_id || null,
-      requests: Number(r.requests || 0),
-      success: Number(r.success || 0),
-      errors: Number(r.errors || 0),
-      input_tokens: Number(r.input_tokens || 0),
-      output_tokens: Number(r.output_tokens || 0),
-      cache_read_tokens: Number(r.cache_read_tokens || 0),
-      cache_creation_tokens: Number(r.cache_creation_tokens || 0),
-      prompt_tokens: Number(r.prompt_tokens || 0),
+      requests: integerValue(r.requests),
+      success: integerValue(r.success),
+      errors: integerValue(r.errors),
+      input_tokens: integerValue(r.input_tokens),
+      output_tokens: integerValue(r.output_tokens),
+      cache_read_tokens: integerValue(r.cache_read_tokens),
+      cache_creation_tokens: integerValue(r.cache_creation_tokens),
+      prompt_tokens: integerValue(r.prompt_tokens),
       input_cost: Number(r.input_cost || 0),
       output_cost: Number(r.output_cost || 0),
       cache_read_cost: Number(r.cache_read_cost || 0),
       cache_creation_cost: Number(r.cache_creation_cost || 0),
       total_cost: Number(r.total_cost || 0),
-      unpriced: Number(r.unpriced || 0),
+      unpriced: integerValue(r.unpriced),
     }))
   }
 
@@ -831,9 +854,9 @@ export class UsageLogsRepo {
    * service_tier is folded to fast / flex / other-raw (standard aliases → NULL);
    * speed is 'fast' or NULL. unpriced_requests counts rows left without an estimate.
    */
-  costByModel({ vmId = null, accountId = null, since = null, until = null } = {}) {
+  async costByModel({ vmId = null, accountId = null, since = null, until = null } = {}) {
     const { cond, params } = filterCond({ since, until, vmId, accountId })
-    const rows = this.db
+    const rows = await this.db
       .prepare(`
       SELECT COALESCE(NULLIF(upstream_model, ''), NULLIF(model, ''), NULLIF(requested_model, ''), '—') AS model,
              CASE
@@ -866,13 +889,13 @@ export class UsageLogsRepo {
       service_tier: r.service_tier || null,
       speed: r.speed || null,
       long_context: Number(r.long_context || 0),
-      requests: Number(r.requests || 0),
-      unpriced_requests: Number(r.unpriced_requests || 0),
-      input_tokens: Number(r.input_tokens || 0),
-      output_tokens: Number(r.output_tokens || 0),
-      cache_read_tokens: Number(r.cache_read_tokens || 0),
-      cache_creation_tokens: Number(r.cache_creation_tokens || 0),
-      prompt_tokens: Number(r.prompt_tokens || 0),
+      requests: integerValue(r.requests),
+      unpriced_requests: integerValue(r.unpriced_requests),
+      input_tokens: integerValue(r.input_tokens),
+      output_tokens: integerValue(r.output_tokens),
+      cache_read_tokens: integerValue(r.cache_read_tokens),
+      cache_creation_tokens: integerValue(r.cache_creation_tokens),
+      prompt_tokens: integerValue(r.prompt_tokens),
       input_cost: Number(r.input_cost || 0),
       output_cost: Number(r.output_cost || 0),
       cache_read_cost: Number(r.cache_read_cost || 0),
@@ -887,8 +910,8 @@ export class UsageLogsRepo {
    * `models` / `endpoints` are ranked by request count and capped; `endpoints`
    * is the inbound request path (usage_logs keeps no separate upstream endpoint).
    */
-  vmUsageStats({ vmId, days = 30 } = {}) {
-    return this._usageWindow({
+  async vmUsageStats({ vmId, days = 30 } = {}) {
+    return await this._usageWindow({
       vmId,
       days,
       rankExpr: "COALESCE(NULLIF(path, ''), '—')",
@@ -898,8 +921,8 @@ export class UsageLogsRepo {
   }
 
   /** Same window as vmUsageStats, isolated to one managed key. Third rank is the VM. */
-  keyUsageStats({ apiKeyId, days = 30 } = {}) {
-    return this._usageWindow({
+  async keyUsageStats({ apiKeyId, days = 30 } = {}) {
+    return await this._usageWindow({
       apiKeyId,
       days,
       rankExpr: "COALESCE(NULLIF(vm_id, ''), '—')",
@@ -908,15 +931,16 @@ export class UsageLogsRepo {
     })
   }
 
-  _usageWindow({ vmId = null, apiKeyId = null, days = 30, rankExpr, rankKey, rankLimit = 8 } = {}) {
+  async _usageWindow({ vmId = null, apiKeyId = null, days = 30, rankExpr, rankKey, rankLimit = 8 } = {}) {
     const empty = { days: 0, since: null, history: [], models: [], [rankKey]: [] }
     if (!vmId && !apiKeyId) return empty
     const span = Math.max(1, Math.min(90, Math.floor(Number(days)) || 30))
     const since = new Date(Date.parse(shanghaiDayStartIso()) - (span - 1) * 86400_000).toISOString()
     const { cond, params } = filterCond({ since, vmId, apiKeyId })
-    const history = this.db
-      .prepare(`
-      SELECT strftime('%Y-%m-%d', created_at, '+8 hours') AS day,
+    const history = (
+      await this.db
+        .prepare(`
+      SELECT to_char(created_at::timestamptz AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD') AS day,
              COUNT(*) AS requests,
              SUM(CASE WHEN ${SLA_ERROR_PRED} THEN 1 ELSE 0 END) AS errors,
              COALESCE(SUM(input_tokens), 0) AS input_tokens,
@@ -930,23 +954,24 @@ export class UsageLogsRepo {
       FROM usage_logs ${cond}
       GROUP BY day ORDER BY day
     `)
-      .all(...params)
-      .map((r) => ({
-        day: r.day,
-        requests: Number(r.requests || 0),
-        errors: Number(r.errors || 0),
-        input_tokens: Number(r.input_tokens || 0),
-        output_tokens: Number(r.output_tokens || 0),
-        cache_read_tokens: Number(r.cache_read_tokens || 0),
-        cache_creation_tokens: Number(r.cache_creation_tokens || 0),
-        prompt_tokens: Number(r.prompt_tokens || 0),
-        total_cost: Number(r.total_cost || 0),
-        duration_ms_sum: Number(r.duration_ms_sum || 0),
-        duration_n: Number(r.duration_n || 0),
-      }))
-    const group = (expr, limit) =>
-      this.db
-        .prepare(`
+        .all(...params)
+    ).map((r) => ({
+      day: r.day,
+      requests: integerValue(r.requests),
+      errors: integerValue(r.errors),
+      input_tokens: integerValue(r.input_tokens),
+      output_tokens: integerValue(r.output_tokens),
+      cache_read_tokens: integerValue(r.cache_read_tokens),
+      cache_creation_tokens: integerValue(r.cache_creation_tokens),
+      prompt_tokens: integerValue(r.prompt_tokens),
+      total_cost: Number(r.total_cost || 0),
+      duration_ms_sum: integerValue(r.duration_ms_sum),
+      duration_n: integerValue(r.duration_n),
+    }))
+    const group = async (expr, limit) =>
+      (
+        await this.db
+          .prepare(`
       SELECT ${expr} AS name,
              COUNT(*) AS requests,
              COALESCE(SUM(${TOTAL_TOKENS_SQL}), 0) AS tokens,
@@ -954,19 +979,22 @@ export class UsageLogsRepo {
       FROM usage_logs ${cond}
       GROUP BY name ORDER BY requests DESC, total_cost DESC LIMIT ${limit}
     `)
-        .all(...params)
-        .map((r) => ({
-          name: r.name,
-          requests: Number(r.requests || 0),
-          tokens: Number(r.tokens || 0),
-          total_cost: Number(r.total_cost || 0),
-        }))
+          .all(...params)
+      ).map((r) => ({
+        name: r.name,
+        requests: integerValue(r.requests),
+        tokens: integerValue(r.tokens),
+        total_cost: Number(r.total_cost || 0),
+      }))
     return {
       days: span,
       since,
       history,
-      models: group("COALESCE(NULLIF(upstream_model, ''), NULLIF(model, ''), NULLIF(requested_model, ''), '—')", 12),
-      [rankKey]: group(rankExpr, rankLimit),
+      models: await group(
+        "COALESCE(NULLIF(upstream_model, ''), NULLIF(model, ''), NULLIF(requested_model, ''), '—')",
+        12,
+      ),
+      [rankKey]: await group(rankExpr, rankLimit),
     }
   }
 
@@ -975,7 +1003,7 @@ export class UsageLogsRepo {
    * `total` is every inbound inference request (warmup answers included) plus
    * gate blocks on other paths, so each stage's share uses one denominator.
    */
-  protocolEntryStats({ since = shanghaiDayStartIso() } = {}) {
+  async protocolEntryStats({ since = shanghaiDayStartIso() } = {}) {
     // COALESCE: a bare `col = x` on NULL yields NULL, and `NOT NULL` drops the row.
     const block = `(
       COALESCE(error_code, '') = 'policy_blocked'
@@ -983,7 +1011,7 @@ export class UsageLogsRepo {
       OR COALESCE(final_state, '') IN ('policy_blocked', 'distill_blocked', 'refusal_guard', 'refusal_similar', 'refusal_device')
     )`
     const inference = `path IN ('/v1/messages', '/v1/responses', '/v1/chat/completions')`
-    const row = this.db
+    const row = await this.db
       .prepare(
         `SELECT
            SUM(CASE WHEN ${inference} OR ${block} THEN 1 ELSE 0 END) AS total,
@@ -993,14 +1021,14 @@ export class UsageLogsRepo {
                      AND COALESCE(via, '') != 'warmup-intercept'
                 THEN 1 ELSE 0 END) AS passed
          FROM usage_logs
-         WHERE created_at >= ?`,
+         WHERE created_at >= $1`,
       )
       .get(since)
-    const keywords = this.db
+    const keywords = await this.db
       .prepare(
         `SELECT error_message AS message, COUNT(*) AS count
          FROM usage_logs
-         WHERE created_at >= ?
+         WHERE created_at >= $1
            AND ${block}
            AND error_message IS NOT NULL
            AND error_message != ''
@@ -1009,13 +1037,13 @@ export class UsageLogsRepo {
          LIMIT 50`,
       )
       .all(since)
-    const grouped = this.db
+    const grouped = await this.db
       .prepare(
         `SELECT intercept, via, error_message AS message,
                 CASE WHEN ${block} THEN 1 ELSE 0 END AS blocked,
                 COUNT(*) AS count
          FROM usage_logs
-         WHERE created_at >= ?
+         WHERE created_at >= $1
            AND (
              ${block}
              OR (${inference} AND COALESCE(via, '') != 'warmup-intercept')
@@ -1026,9 +1054,9 @@ export class UsageLogsRepo {
     const folded = foldInterceptRows(grouped)
     return {
       since,
-      total: Number(row?.total || 0),
-      blocked: Number(row?.blocked || 0),
-      passed: Number(row?.passed || 0),
+      total: integerValue(row?.total),
+      blocked: integerValue(row?.blocked),
+      passed: integerValue(row?.passed),
       keywords: collapseBlockKeywords(keywords),
       blocks: folded.blocks,
       passes: folded.passes,
@@ -1036,7 +1064,7 @@ export class UsageLogsRepo {
   }
 
   /** Official-standard totals: all-time + Shanghai calendar today + per account. */
-  billingStats(opts = {}) {
+  async billingStats(opts = {}) {
     const { accountWindows = null, now = Date.now() } = opts
     const cacheable = !Object.hasOwn(opts, 'now')
     const cacheNow = Date.now()
@@ -1050,11 +1078,11 @@ export class UsageLogsRepo {
     if (cacheNow - this._billingBackfillAt >= BILLING_BACKFILL_INTERVAL_MS) {
       this._billingBackfillAt = cacheNow
       try {
-        this.backfillMissingCosts()
+        await this.backfillMissingCosts()
       } catch {}
     }
 
-    const value = this._computeBillingStats({ accountWindows, now })
+    const value = await this._computeBillingStats({ accountWindows, now })
     if (this._billingStatsCache.size > 32) {
       for (const [cacheKey, entry] of this._billingStatsCache) {
         if (entry.expires_at <= cacheNow) this._billingStatsCache.delete(cacheKey)
@@ -1068,20 +1096,20 @@ export class UsageLogsRepo {
     return value
   }
 
-  _computeBillingStats({ accountWindows = null, now = Date.now() } = {}) {
+  async _computeBillingStats({ accountWindows = null, now = Date.now() } = {}) {
     const todayStart = shanghaiDayStartIso()
     const fiveHStart = new Date(now - WINDOW_5H_MS).toISOString()
     const sevenDStart = new Date(now - WINDOW_7D_MS).toISOString()
-    const accountsTotal = this.costByAccount()
-    const accountsToday = this.costByAccount({ since: todayStart })
+    const accountsTotal = await this.costByAccount()
+    const accountsToday = await this.costByAccount({ since: todayStart })
     // The per-account queries already cover every row. Re-sum them for the
     // global buckets instead of scanning the entire usage table two more times.
     // This matters on multi-GB databases where each synchronous full scan also
     // blocks unrelated HTTP requests on the Node event loop.
     const totalBucket = sumCostBuckets(accountsTotal)
     const todayBucket = sumCostBuckets(accountsToday)
-    const total = { ...totalBucket, ...cacheHitStats(totalBucket) }
-    const today = { ...todayBucket, ...cacheHitStats(todayBucket) }
+    const total = withCacheHitRate(totalBucket)
+    const today = withCacheHitRate(todayBucket)
     const keyOf = (a) => a.account_id + '\0' + (a.vm_id || '')
     const todayById = new Map(accountsToday.map((a) => [keyOf(a), a]))
     const aligned = Array.isArray(accountWindows) && accountWindows.length > 0
@@ -1100,9 +1128,13 @@ export class UsageLogsRepo {
       }
       eventsSince = new Date(earliest).toISOString()
     }
-    const events = aligned ? this._costEventsSince(eventsSince) : null
-    const fiveById = aligned ? null : new Map(this.costByAccount({ since: fiveHStart }).map((a) => [keyOf(a), a]))
-    const sevenById = aligned ? null : new Map(this.costByAccount({ since: sevenDStart }).map((a) => [keyOf(a), a]))
+    const events = aligned ? await this._costEventsSince(eventsSince) : null
+    const fiveById = aligned
+      ? null
+      : new Map((await this.costByAccount({ since: fiveHStart })).map((a) => [keyOf(a), a]))
+    const sevenById = aligned
+      ? null
+      : new Map((await this.costByAccount({ since: sevenDStart })).map((a) => [keyOf(a), a]))
     const eventsByKey = aligned ? groupCostEvents(events) : null
     const accounts = accountsTotal.map((a) => {
       const t = todayById.get(keyOf(a)) || emptyCostBucket()
@@ -1122,8 +1154,8 @@ export class UsageLogsRepo {
         window_fable = {
           cost: Number(fable.total_cost || 0),
           tokens: totalTokens(fable),
-          requests: Number(fable.requests || 0),
-          unpriced: Number(fable.unpriced || 0),
+          requests: integerValue(fable.requests),
+          unpriced: integerValue(fable.unpriced),
           start: new Date(sinceFable).toISOString(),
         }
       }
@@ -1133,49 +1165,43 @@ export class UsageLogsRepo {
         window_5h: { ...w },
         window_7d: { ...w7 },
         today_cost: Number(t.total_cost || 0),
-        today_requests: Number(t.requests || 0),
-        today_input_tokens: Number(t.input_tokens || 0),
-        today_output_tokens: Number(t.output_tokens || 0),
-        today_cache_read_tokens: Number(t.cache_read_tokens || 0),
-        today_cache_creation_tokens: Number(t.cache_creation_tokens || 0),
+        today_requests: integerValue(t.requests),
+        today_input_tokens: integerValue(t.input_tokens),
+        today_output_tokens: integerValue(t.output_tokens),
+        today_cache_read_tokens: integerValue(t.cache_read_tokens),
+        today_cache_creation_tokens: integerValue(t.cache_creation_tokens),
         today_input_cost: Number(t.input_cost || 0),
         today_output_cost: Number(t.output_cost || 0),
         today_cache_cost: Number(t.cache_read_cost || 0) + Number(t.cache_creation_cost || 0),
         window_5h_cost: Number(w.total_cost || 0),
-        window_5h_requests: Number(w.requests || 0),
+        window_5h_requests: integerValue(w.requests),
         window_5h_tokens: totalTokens(w),
-        window_5h_unpriced: Number(w.unpriced || 0),
-        window_5h_input_tokens: Number(w.input_tokens || 0),
-        window_5h_output_tokens: Number(w.output_tokens || 0),
-        window_5h_cache_read_tokens: Number(w.cache_read_tokens || 0),
-        window_5h_cache_creation_tokens: Number(w.cache_creation_tokens || 0),
+        window_5h_unpriced: integerValue(w.unpriced),
+        window_5h_input_tokens: integerValue(w.input_tokens),
+        window_5h_output_tokens: integerValue(w.output_tokens),
+        window_5h_cache_read_tokens: integerValue(w.cache_read_tokens),
+        window_5h_cache_creation_tokens: integerValue(w.cache_creation_tokens),
         window_5h_input_cost: Number(w.input_cost || 0),
         window_5h_output_cost: Number(w.output_cost || 0),
         window_5h_cache_cost: Number(w.cache_read_cost || 0) + Number(w.cache_creation_cost || 0),
         window_5h_start: aligned ? new Date(since5).toISOString() : fiveHStart,
         window_7d_cost: Number(w7.total_cost || 0),
-        window_7d_requests: Number(w7.requests || 0),
-        window_7d_success: Number(w7.success || 0),
-        window_7d_errors: Number(w7.errors || 0),
+        window_7d_requests: integerValue(w7.requests),
+        window_7d_success: integerValue(w7.success),
+        window_7d_errors: integerValue(w7.errors),
         window_7d_tokens: totalTokens(w7),
-        window_7d_unpriced: Number(w7.unpriced || 0),
+        window_7d_unpriced: integerValue(w7.unpriced),
         window_7d_start: aligned ? new Date(since7).toISOString() : sevenDStart,
         window_fable,
       }
     })
     const window5h = aligned
-      ? {
-          ...sumCostBuckets(accounts.map((a) => a.window_5h)),
-          ...cacheHitStats(sumCostBuckets(accounts.map((a) => a.window_5h))),
-        }
-      : this._costSelect('WHERE created_at >= ?', [fiveHStart])
+      ? withCacheHitRate(sumCostBuckets(accounts.map((a) => a.window_5h)))
+      : await this._costSelect('WHERE created_at >= $1', [fiveHStart])
     const window7d = aligned
-      ? {
-          ...sumCostBuckets(accounts.map((a) => a.window_7d)),
-          ...cacheHitStats(sumCostBuckets(accounts.map((a) => a.window_7d))),
-        }
-      : this._costSelect('WHERE created_at >= ?', [sevenDStart])
-    const coverage = this.logCoverageStart()
+      ? withCacheHitRate(sumCostBuckets(accounts.map((a) => a.window_7d)))
+      : await this._costSelect('WHERE created_at >= $1', [sevenDStart])
+    const coverage = await this.logCoverageStart()
     return {
       source: 'anthropic-official',
       currency: 'USD',
@@ -1201,17 +1227,18 @@ export class UsageLogsRepo {
    * surviving row (a quiet hour looks like a gap) nor the current retain_days (raising
    * it does not bring deleted rows back) can stand in for that boundary.
    */
-  logCoverageStart() {
+  async logCoverageStart() {
     const created = Date.parse(
-      this.db.prepare("SELECT MIN(applied_at) AS t FROM schema_migrations WHERE version = '001'").get()?.t || '',
+      (await this.db.prepare("SELECT MIN(applied_at) AS t FROM schema_migrations WHERE version = '001'").get())?.t ||
+        '',
     )
-    const pruned = Date.parse(this._prunedThrough() || '')
+    const pruned = Date.parse((await this._prunedThrough()) || '')
     const start = Math.max(Number.isFinite(created) ? created : -Infinity, Number.isFinite(pruned) ? pruned : -Infinity)
     return Number.isFinite(start) ? new Date(start).toISOString() : null
   }
 
-  _prunedThrough() {
-    const row = this.db.prepare(`SELECT value FROM settings WHERE key = '${PRUNED_THROUGH_KEY}'`).get()
+  async _prunedThrough() {
+    const row = await this.db.prepare(`SELECT value FROM settings WHERE key = '${PRUNED_THROUGH_KEY}'`).get()
     try {
       return row ? JSON.parse(row.value) : null
     } catch {
@@ -1219,8 +1246,8 @@ export class UsageLogsRepo {
     }
   }
 
-  _costEventsSince(since) {
-    return this.db
+  async _costEventsSince(since) {
+    return await this.db
       .prepare(
         `
       SELECT
@@ -1243,13 +1270,13 @@ export class UsageLogsRepo {
         COALESCE(cache_creation_cost, 0) AS cache_creation_cost,
         COALESCE(total_cost, 0) AS total_cost
       FROM usage_logs
-      WHERE created_at >= ?
+      WHERE created_at >= $1
     `,
       )
       .all(since)
   }
 
-  ownerBilling({ ownerUserId = null, since = null, until = null, groupBy = 'vm' } = {}) {
+  async ownerBilling({ ownerUserId = null, since = null, until = null, groupBy = 'vm' } = {}) {
     const where = []
     const params = []
     const own = ownerPred(ownerUserId)
@@ -1258,17 +1285,17 @@ export class UsageLogsRepo {
       params.push(...own.params)
     }
     if (since) {
-      where.push('created_at >= ?')
+      where.push(`created_at >= $${params.length + 1}`)
       params.push(new Date(since).toISOString())
     }
     if (until) {
-      where.push('created_at <= ?')
+      where.push(`created_at <= $${params.length + 1}`)
       params.push(new Date(until).toISOString())
     }
     const cond = where.length ? `WHERE ${where.join(' AND ')}` : ''
     const grouped = groupBy === 'key' ? 'key' : 'vm'
     const groupCol = grouped === 'key' ? 'api_key_id' : 'vm_id'
-    const totals = this.db
+    const totals = await this.db
       .prepare(`
       SELECT COUNT(*) AS requests,
              SUM(CASE WHEN ${SUCCESS_PRED} THEN 1 ELSE 0 END) AS ok,
@@ -1280,7 +1307,7 @@ export class UsageLogsRepo {
       FROM usage_logs ${cond}
     `)
       .get(...params)
-    const items = this.db
+    const items = await this.db
       .prepare(`
       SELECT ${groupCol} AS id,
              COUNT(*) AS requests,
@@ -1301,22 +1328,22 @@ export class UsageLogsRepo {
       since: since ? new Date(since).toISOString() : null,
       until: until ? new Date(until).toISOString() : null,
       totals: {
-        requests: num(totals, 'requests'),
-        ok: num(totals, 'ok'),
-        fail: num(totals, 'fail'),
-        tokens_in: num(totals, 'tokens_in'),
-        tokens_out: num(totals, 'tokens_out'),
+        requests: integerValue(totals.requests),
+        ok: integerValue(totals.ok),
+        fail: integerValue(totals.fail),
+        tokens_in: integerValue(totals.tokens_in),
+        tokens_out: integerValue(totals.tokens_out),
         cost_usd: num(totals, 'cost_usd'),
         official_cost_usd: num(totals, 'official_cost_usd'),
       },
       items: items.map((row) => ({
         vm_id: grouped === 'vm' ? row.id || null : undefined,
         api_key_id: grouped === 'key' ? row.id || null : undefined,
-        requests: num(row, 'requests'),
-        ok: num(row, 'ok'),
-        fail: num(row, 'fail'),
-        tokens_in: num(row, 'tokens_in'),
-        tokens_out: num(row, 'tokens_out'),
+        requests: integerValue(row.requests),
+        ok: integerValue(row.ok),
+        fail: integerValue(row.fail),
+        tokens_in: integerValue(row.tokens_in),
+        tokens_out: integerValue(row.tokens_out),
         cost_usd: num(row, 'cost_usd'),
         official_cost_usd: num(row, 'official_cost_usd'),
       })),
@@ -1327,16 +1354,16 @@ export class UsageLogsRepo {
    * Windowed ops snapshot aligned with sub2api overview cards:
    * SLA / error / 429 / 503, QPS·TPS, duration + first_token percentiles, per-model.
    */
-  windowStats({ since = null, until = null, owner_user_id = null } = {}) {
+  async windowStats({ since = null, until = null, owner_user_id = null } = {}) {
     const { cond, params } = timeCond(since, until)
-    const own = ownerPred(owner_user_id)
+    const own = ownerPred(owner_user_id, params.length)
     let where = cond
     const allParams = [...params]
     if (own.sql) {
       where = where ? `${where} AND ${own.sql}` : `WHERE ${own.sql}`
       allParams.push(...own.params)
     }
-    const counts = this.db
+    const counts = await this.db
       .prepare(`
       SELECT
         COUNT(*) AS requests,
@@ -1356,58 +1383,56 @@ export class UsageLogsRepo {
       FROM usage_logs ${where}
     `)
       .get(...allParams)
-    const requests = Number(counts?.requests || 0)
-    const success = Number(counts?.success || 0)
-    const errors = Number(counts?.errors || 0)
-    const inputTokens = Number(counts?.input_tokens || 0)
-    const outputTokens = Number(counts?.output_tokens || 0)
-    const cacheRead = Number(counts?.cache_read_tokens || 0)
-    const cacheWrite = Number(counts?.cache_creation_tokens || 0)
-    const cache = cacheHitStats({
+    const requests = integerValue(counts?.requests)
+    const success = integerValue(counts?.success)
+    const errors = integerValue(counts?.errors)
+    const inputTokens = integerValue(counts?.input_tokens)
+    const outputTokens = integerValue(counts?.output_tokens)
+    const cacheRead = integerValue(counts?.cache_read_tokens)
+    const cacheWrite = integerValue(counts?.cache_creation_tokens)
+    const cache = withCacheHitRate({
       input_tokens: inputTokens,
       cache_read_tokens: cacheRead,
       cache_creation_tokens: cacheWrite,
-      prompt_tokens: Number(counts?.prompt_tokens || 0),
+      prompt_tokens: integerValue(counts?.prompt_tokens),
     })
-    const tokens = inputTokens + outputTokens + cacheRead + cacheWrite
+    const tokens = totalTokens(counts)
 
     const startMs = since ? Date.parse(since) : null
     const endMs = until ? Date.parse(until) : Date.now()
     const windowSeconds =
       Number.isFinite(startMs) && Number.isFinite(endMs) ? Math.max(1, (endMs - startMs) / 1000) : Math.max(1, requests)
 
-    const minuteRows = this.db
+    const minuteRows = await this.db
       .prepare(`
-      SELECT strftime('%Y-%m-%dT%H:%M', created_at) AS minute,
+      SELECT to_char(created_at::timestamptz AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI') AS minute,
              COUNT(*) AS requests,
              COALESCE(SUM(${TOTAL_TOKENS_SQL}), 0) AS tokens
       FROM usage_logs ${where}
       GROUP BY minute
     `)
       .all(...allParams)
-    const peakReq = minuteRows.reduce((m, r) => Math.max(m, Number(r.requests || 0)), 0)
-    const peakTok = minuteRows.reduce((m, r) => Math.max(m, Number(r.tokens || 0)), 0)
+    const peakReq = minuteRows.reduce((m, r) => Math.max(m, integerValue(r.requests)), 0)
+    const peakTok = minuteRows.reduce((m, r) => Math.max(m, integerValue(r.tokens)), 0)
     const lastMinute = minuteRows.length ? minuteRows[minuteRows.length - 1] : null
 
     const ttftWhere = where ? `${where} AND first_token_ms IS NOT NULL` : 'WHERE first_token_ms IS NOT NULL'
     const durWhere = where ? `${where} AND duration_ms IS NOT NULL` : 'WHERE duration_ms IS NOT NULL'
-    const ttfts = this.db
-      .prepare(`SELECT first_token_ms AS v FROM usage_logs ${ttftWhere}`)
-      .all(...allParams)
-      .map((r) => r.v)
-    const durs = this.db
-      .prepare(`SELECT duration_ms AS v FROM usage_logs ${durWhere}`)
-      .all(...allParams)
-      .map((r) => r.v)
+    const ttfts = (
+      await this.db.prepare(`SELECT first_token_ms AS v FROM usage_logs ${ttftWhere}`).all(...allParams)
+    ).map((r) => r.v)
+    const durs = (await this.db.prepare(`SELECT duration_ms AS v FROM usage_logs ${durWhere}`).all(...allParams)).map(
+      (r) => r.v,
+    )
 
-    const byModel = this.db
+    const byModel = await this.db
       .prepare(`
       SELECT COALESCE(NULLIF(upstream_model, ''), NULLIF(model, ''), '—') AS model,
              COUNT(*) AS requests,
              SUM(CASE WHEN ${SLA_ERROR_PRED} THEN 1 ELSE 0 END) AS errors,
              SUM(CASE WHEN first_token_ms IS NOT NULL THEN 1 ELSE 0 END) AS ttft_samples,
-             CAST(AVG(first_token_ms) AS INTEGER) AS avg_first_token_ms,
-             CAST(AVG(duration_ms) AS INTEGER) AS avg_duration_ms
+             TRUNC(AVG(first_token_ms))::bigint AS avg_first_token_ms,
+             TRUNC(AVG(duration_ms))::bigint AS avg_duration_ms
       FROM usage_logs ${where}
       GROUP BY 1
       ORDER BY requests DESC
@@ -1424,17 +1449,17 @@ export class UsageLogsRepo {
       errors,
       sla: requests ? success / requests : 1,
       error_rate: requests ? errors / requests : 0,
-      status_429: Number(counts?.status_429 || 0),
-      status_529: Number(counts?.status_529 || 0),
-      status_503: Number(counts?.status_503 || 0),
-      stream_requests: Number(counts?.stream_requests || 0),
+      status_429: integerValue(counts?.status_429),
+      status_529: integerValue(counts?.status_529),
+      status_503: integerValue(counts?.status_503),
+      stream_requests: integerValue(counts?.stream_requests),
       input_tokens: inputTokens,
       output_tokens: outputTokens,
       cache_read_tokens: cacheRead,
       cache_creation_tokens: cacheWrite,
       prompt_tokens: cache.prompt_tokens,
       cache_hit_rate: cache.cache_hit_rate,
-      sticky: this._stickyWindow({ since, until, owner_user_id }),
+      sticky: await this._stickyWindow({ since, until, owner_user_id }),
       total_cost: Number(counts?.total_cost || 0),
       qps: {
         current: lastMinute ? Number(lastMinute.requests || 0) / 60 : 0,
@@ -1450,36 +1475,36 @@ export class UsageLogsRepo {
       ttft: summarizeLatency(ttfts),
       by_model: byModel.map((r) => ({
         model: r.model,
-        requests: Number(r.requests || 0),
-        errors: Number(r.errors || 0),
-        ttft_samples: Number(r.ttft_samples || 0),
+        requests: integerValue(r.requests),
+        errors: integerValue(r.errors),
+        ttft_samples: integerValue(r.ttft_samples),
         avg_first_token_ms: r.avg_first_token_ms ?? null,
         avg_duration_ms: r.avg_duration_ms ?? null,
       })),
-      error_collection: this.errorCollection({ since, until, owner_user_id }),
+      error_collection: await this.errorCollection({ since, until, owner_user_id }),
     }
   }
 
-  _stickyWindow({ since = null, until = null, owner_user_id = null } = {}) {
+  async _stickyWindow({ since = null, until = null, owner_user_id = null } = {}) {
     const empty = { selections: 0, hits: 0, rate: null }
     try {
       const parts = []
       const params = []
       if (since) {
-        parts.push('started_at >= ?')
+        parts.push(`started_at >= $${params.length + 1}`)
         params.push(since)
       }
       if (until) {
-        parts.push('started_at <= ?')
+        parts.push(`started_at <= $${params.length + 1}`)
         params.push(until)
       }
-      const own = ownerPred(owner_user_id)
+      const own = ownerPred(owner_user_id, params.length)
       if (own.sql) {
         parts.push(`request_id IN (SELECT request_id FROM usage_logs WHERE ${own.sql})`)
         params.push(...own.params)
       }
       const where = parts.length ? `WHERE ${parts.join(' AND ')}` : ''
-      const rows = this.db
+      const rows = await this.db
         .prepare(`
         SELECT selection_reason, COUNT(*) AS n
         FROM request_attempts ${where}
@@ -1489,9 +1514,9 @@ export class UsageLogsRepo {
       let selections = 0
       let hits = 0
       for (const row of rows) {
-        const n = Number(row.n || 0)
-        selections += n
-        if (String(row.selection_reason || '') === 'sticky') hits += n
+        const n = integerValue(row.n)
+        selections = addInteger(selections, n)
+        if (String(row.selection_reason || '') === 'sticky') hits = addInteger(hits, n)
       }
       return {
         selections,
@@ -1503,11 +1528,11 @@ export class UsageLogsRepo {
     }
   }
 
-  errorCollection({ since = null, until = null, owner_user_id = null } = {}) {
+  async errorCollection({ since = null, until = null, owner_user_id = null } = {}) {
     const { cond, params } = timeCond(since, until)
-    const own = ownerPred(owner_user_id)
+    const own = ownerPred(owner_user_id, params.length)
     const errCond = `${cond ? `${cond} AND ` : 'WHERE '}${ERROR_PRED}${own.sql ? ` AND ${own.sql}` : ''}`
-    const rows = this.db
+    const rows = await this.db
       .prepare(`
       SELECT created_at AS ts, request_id, status, error_code, error_message, model, upstream_model, vm_id, ip_address AS ip, api_key_presented
       FROM usage_logs ${errCond}
@@ -1517,19 +1542,20 @@ export class UsageLogsRepo {
       .all(...params, ...own.params)
     return {
       ...collectErrors(rows),
-      ingress_hits: this.ingressHits({ since, until, owner_user_id }),
+      ingress_hits: await this.ingressHits({ since, until, owner_user_id }),
     }
   }
 
   /** Invalid-key 401s grouped by presented token + IP (still counted when muted). */
-  ingressHits({ since = null, until = null, owner_user_id = null } = {}) {
+  async ingressHits({ since = null, until = null, owner_user_id = null } = {}) {
     const { cond, params } = timeCond(since, until)
-    const own = ownerPred(owner_user_id)
+    const own = ownerPred(owner_user_id, params.length)
     const authPred = own.sql ? `${ingressAuthSql()} AND ${own.sql}` : ingressAuthSql()
     const where = cond ? `${cond} AND ${authPred}` : `WHERE ${authPred}`
     try {
-      return this.db
-        .prepare(`
+      return (
+        await this.db
+          .prepare(`
         SELECT
           COALESCE(api_key_presented, '') AS api_key_presented,
           COALESCE(ip_address, '') AS ip,
@@ -1542,14 +1568,14 @@ export class UsageLogsRepo {
         ORDER BY count DESC
         LIMIT 40
       `)
-        .all(...params, ...own.params)
-        .map((row) => ({
-          api_key_presented: row.api_key_presented || '',
-          ip: row.ip || '',
-          count: Number(row.count || 0),
-          last_ts: row.last_ts || null,
-          error_code: row.error_code || null,
-        }))
+          .all(...params, ...own.params)
+      ).map((row) => ({
+        api_key_presented: row.api_key_presented || '',
+        ip: row.ip || '',
+        count: integerValue(row.count),
+        last_ts: row.last_ts || null,
+        error_code: row.error_code || null,
+      }))
     } catch {
       return []
     }
@@ -1559,19 +1585,11 @@ export class UsageLogsRepo {
    * Age out summaries/debug independently, then trim debug blobs to maxBytes.
    * Number form `cleanup(7)` keeps the old retainDays-only call.
    */
-  cleanup(opts = {}) {
+  async cleanup(opts = {}) {
     const cfg = this._cleanupOpts(opts)
-    const usage_logs = this._pruneUsage(cfg.usageCutoff)
-    const debug_by_age = this._deleteOldDebug.run(cfg.debugCutoff).changes
-    const debug_by_size = this.trimDebugToMaxBytes(cfg.maxBytes)
-    if (usage_logs + debug_by_age + debug_by_size > 0) {
-      try {
-        this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)')
-      } catch {}
-    }
-    try {
-      this.db.exec('PRAGMA optimize')
-    } catch {}
+    const usage_logs = await this._pruneUsage(cfg.usageCutoff)
+    const debug_by_age = (await this._deleteOldDebug.run(cfg.debugCutoff)).changes
+    const debug_by_size = await this.trimDebugToMaxBytes(cfg.maxBytes)
     return {
       usage_logs,
       request_log_debug: debug_by_age + debug_by_size,
@@ -1581,29 +1599,17 @@ export class UsageLogsRepo {
   }
 
   /** Delete summaries before `cutoff` and advance the prune boundary in one transaction. */
-  _pruneUsage(cutoff) {
-    this.db.exec('BEGIN')
-    try {
-      const deleted = this._deleteOldUsage.run(cutoff).changes
+  async _pruneUsage(cutoff) {
+    return withTransaction(this.db, async () => {
+      const deleted = (await this._deleteOldUsage.run(cutoff)).changes
       if (deleted > 0) {
-        const prev = this._prunedThrough()
-        if (!prev || prev < cutoff) {
-          this.db
-            .prepare(`
-              INSERT INTO settings (key, value, updated_at) VALUES ('${PRUNED_THROUGH_KEY}', ?, ?)
-              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-            `)
-            .run(JSON.stringify(cutoff), new Date().toISOString())
-        }
+        await this.db
+          .prepare(`INSERT INTO settings (key, value, updated_at) VALUES ('${PRUNED_THROUGH_KEY}', $1, $2)
+          ON CONFLICT(key) DO UPDATE SET value = GREATEST(settings.value, excluded.value), updated_at = excluded.updated_at`)
+          .run(JSON.stringify(cutoff), new Date().toISOString())
       }
-      this.db.exec('COMMIT')
       return deleted
-    } catch (e) {
-      try {
-        this.db.exec('ROLLBACK')
-      } catch {}
-      throw e
-    }
+    })
   }
 
   _cleanupOpts(opts) {
@@ -1618,35 +1624,35 @@ export class UsageLogsRepo {
     }
   }
 
-  debugBytes() {
-    return Number(this._debugBytes.get().n || 0)
+  async debugBytes() {
+    return integerValue((await this._debugBytes.get()).n)
   }
 
-  countDebug() {
-    return Number(this._debugCount.get().n || 0)
+  async countDebug() {
+    return integerValue((await this._debugCount.get()).n)
   }
 
   /** Delete oldest debug rows until the stored JSON bytes fit maxBytes. */
-  trimDebugToMaxBytes(maxBytes) {
+  async trimDebugToMaxBytes(maxBytes) {
     const cap = Math.max(0, Number(maxBytes) || 0)
     if (cap <= 0) return 0
     let deleted = 0
     for (let i = 0; i < 8; i++) {
-      const used = this.debugBytes()
+      const used = await this.debugBytes()
       if (used <= cap) return deleted
-      const count = this.countDebug()
+      const count = await this.countDebug()
       if (!count) return deleted
       const avg = Math.max(1, Math.floor(used / count))
       const need = Math.min(count, Math.max(1, Math.ceil((used - cap) / avg) + 1))
-      const n = this._deleteOldestDebug.run(need).changes
+      const n = (await this._deleteOldestDebug.run(need)).changes
       if (!n) return deleted
       deleted += n
     }
     return deleted
   }
 
-  count() {
-    return this.db.prepare('SELECT COUNT(*) c FROM usage_logs').get().c
+  async count() {
+    return (await this.db.prepare('SELECT COUNT(*) c FROM usage_logs').get()).c
   }
 }
 

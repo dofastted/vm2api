@@ -14,6 +14,7 @@ import net from 'node:net'
 import crypto from 'node:crypto'
 import { resolveStoreDb } from '../db/database.mjs'
 import { ProxiesRepo } from '../db/repos/proxies-repo.mjs'
+import { WriteQueue } from '../pool/write-queue.mjs'
 import { canBindProxyToVm, normalizeOwnerId, proxyOwnerId, vmOwnerId } from '../admin/resource-owner.mjs'
 import { validTimezone } from '../core/timezone.mjs'
 import { lookupProxyGeo, lookupProxyGeoV6 } from './proxy-geo.mjs'
@@ -341,43 +342,53 @@ export class ProxyPool extends EventEmitter {
     this._probeSockets = new Map()
     // Node exits are not pool rows: px-local's geo is the control plane's, a node slot leaves elsewhere.
     this._exitGeo = new Map()
-    this.load()
+    this.writes = new WriteQueue(this.db)
+    this.db.pendingWriteQueues.add(this)
   }
 
   /** Re-read working set from DB (startup + post-restore). */
-  load() {
-    try {
-      this.state.config = { ...DEFAULT_CONFIG, ...(this.repo.getConfig({}) || {}) }
-      this.state.proxies = this.repo.loadAll().map(hydrateProxy)
-    } catch {
-      this.state = { config: { ...DEFAULT_CONFIG }, proxies: [] }
-    }
+  async load() {
+    for (const queue of this.db.pendingWriteQueues || []) await queue.flush()
+    await this.flush()
+    this.state.config = { ...DEFAULT_CONFIG, ...((await this.repo.getConfig({})) || {}) }
+    this.state.proxies = (await this.repo.loadAll()).map(hydrateProxy)
+    return this
   }
 
-  reload() {
-    this.load()
+  async init() {
+    return await this.load()
   }
 
-  /** Re-bind to a fresh DB connection (after backup restore) and re-read. */
-  rebind(db) {
+  async reload() {
+    return await this.load()
+  }
+
+  async rebind(db) {
+    await this.flush()
     this.db = db
     this.repo = new ProxiesRepo(db)
-    this.load()
+    return await this.load()
+  }
+
+  async flush() {
+    while (this._probing) await new Promise((resolve) => setTimeout(resolve, 10))
+    await this.writes.flush()
   }
 
   save() {
-    // Batched rewrites (local-row migration) persist once at the end.
     if (this._saveDeferred) {
       this._savePending = true
       return
     }
-    this.repo.setConfig(this.state.config)
-    this.repo.replaceAll(
-      this.state.proxies.map((p) => ({
-        ...p,
-        bound_vm_id: encodeBoundVmIds(boundVmIdsOf(p)),
-      })),
-    )
+    const config = structuredClone(this.state.config)
+    const proxies = this.state.proxies.map((p) => ({
+      ...structuredClone(p),
+      bound_vm_id: encodeBoundVmIds(boundVmIdsOf(p)),
+    }))
+    this.writes.enqueue(async () => {
+      await this.repo.setConfig(config)
+      await this.repo.replaceAll(proxies)
+    })
     this.emit('change')
   }
 
@@ -1382,7 +1393,7 @@ export class ProxyPool extends EventEmitter {
     const min = this.state.config.probe_interval_min || 10
     const ms = min * 60 * 1000
     void this.probeAll({ onlyEnabled: true }).catch(() => {})
-    this._timer = setInterval(() => {
+    this._timer = setInterval(async () => {
       this.probeAll({ onlyEnabled: true }).catch(() => {})
     }, ms)
     this._timer.unref?.()

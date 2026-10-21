@@ -97,12 +97,12 @@ test('misaligned 7d vs 7d_oi uses the difference as regular usage', () => {
   assert.equal(s.mode, 'open')
 })
 
-test('AccountQuota.weeklySplitOf reads unified windows and config', () => {
+test('AccountQuota.weeklySplitOf reads unified windows and config', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wsplit-'))
-  const q = new AccountQuota({
+  const q = await new AccountQuota({
     dataDir: dir,
     config: { quota: { weekly_split: { enabled: true, fable_share: 0.5 } } },
-  })
+  }).init()
   q.ingestHeaders('acc-1', {
     'anthropic-ratelimit-unified-7d-utilization': '0.50',
     'anthropic-ratelimit-unified-7d_oi-utilization': '0',

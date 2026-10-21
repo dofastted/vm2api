@@ -64,10 +64,10 @@ export function denyIfUserCannotDeleteVm(req, res, vm, json) {
   return true
 }
 
-export function denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId }) {
+export async function denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId }) {
   const ident = panelIdentity(req)
   if (ident.role !== 'user') return false
-  const rec = apiKeyStore?.repo?.getById?.(keyId) || null
+  const rec = (await apiKeyStore?.repo?.getById?.(keyId)) || null
   const owner = normalizeOwnerId(rec?.user_id)
   if (!rec || owner !== normalizeOwnerId(req.panelUserId)) {
     json(res, 404, { ok: false, error: { message: 'api key not found' } })

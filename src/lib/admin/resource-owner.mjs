@@ -49,13 +49,13 @@ export function ownerScopeFromApiKey(record, { apiKeyKind = null, ownerRole = nu
   return { type: 'user', userId }
 }
 
-export function ownerScopeFromRequest(req, usersRepo = null) {
+export async function ownerScopeFromRequest(req, usersRepo = null) {
   const rec = req?.apiKeyRecord || null
   let ownerRole = null
   const userId = normalizeOwnerId(rec?.user_id)
   if (userId && usersRepo?.getById) {
     try {
-      ownerRole = usersRepo.getById(userId)?.role || null
+      ownerRole = (await usersRepo.getById(userId))?.role || null
     } catch {
       ownerRole = null
     }

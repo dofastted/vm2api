@@ -366,6 +366,9 @@ export function createUsageProbeMonitor(opts = {}) {
     runOnce,
     probeNow,
     start,
+    flush: async () => {
+      while (inflight || probing.size) await Promise.allSettled([...(inflight ? [inflight] : []), ...probing.values()])
+    },
     stop,
   }
 }

@@ -212,6 +212,9 @@ chmod 600 .env
 docker compose pull && docker compose up -d
 ```
 
+数据库使用 PostgreSQL 17。新安装由安装脚本生成内置数据库密码；手工 Compose 安装先配置 `.env` 中的 `VM2API_POSTGRES_PASSWORD`。已有 SQLite 安装须先离线导入，保留原 `VM2API_DB_SECRET`。外部数据库、备份恢复和验证步骤见 [PostgreSQL 部署说明](docs/deploy/postgresql.md)。
+
+
 ### 3. 访问与调用
 
 服务启动后，系统暴露统一服务端口（默认 `8787`）：

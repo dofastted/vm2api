@@ -29,7 +29,7 @@ function writeVm(project, rec) {
   fs.writeFileSync(path.join(dir, `${rec.id}.json`), JSON.stringify(rec, null, 2))
 }
 
-test('summarizeProxyPool includes disconnect_on_error', () => {
+test('summarizeProxyPool includes disconnect_on_error', async () => {
   assert.deepEqual(summarizeProxyPool(null), {
     total: 0,
     free: 0,
@@ -40,7 +40,7 @@ test('summarizeProxyPool includes disconnect_on_error', () => {
     disconnect_on_error: false,
   })
   const dir = tmpDir()
-  const pool = new ProxyPool({ dataDir: dir })
+  const pool = await new ProxyPool({ dataDir: dir }).init()
   pool.importLines('10.0.0.9:1080')
   pool.updateConfig({ disconnect_on_error: true })
   pool.stopScheduler()
@@ -63,7 +63,7 @@ test('dashboard and vm detail merge pool health onto bound VM', async () => {
     claude: {},
     policy: { maxConcurrency: 4, weight: 1, priority: 8 },
   })
-  const pool = new ProxyPool({ dataDir })
+  const pool = await new ProxyPool({ dataDir }).init()
   pool.importLines('10.8.8.8:1080')
   const px = pool.snapshot().proxies[0]
   pool.bind(px.id, 'vm-02')
@@ -157,7 +157,7 @@ test('dead bound proxy blocks credential import', async () => {
     claude: {},
     policy: {},
   })
-  const pool = new ProxyPool({ dataDir })
+  const pool = await new ProxyPool({ dataDir }).init()
   pool.importLines('10.7.7.7:1080')
   const id = pool.snapshot().proxies[0].id
   pool.bind(id, 'vm-03')
@@ -358,10 +358,10 @@ test('local proxy node labels are present for admin and absent for tenant', asyn
     { id: 'vm-tokyo', node_id: 'node-a' },
     { id: 'vm-tenant', node_id: 'node-a', owner_user_id: 'user-1' },
   ]
-  const pool = new ProxyPool({
+  const pool = await new ProxyPool({
     dataDir,
     vmNodeOf: (vmId) => vms.find((vm) => vm.id === vmId)?.node_id || null,
-  })
+  }).init()
   t.after(() => pool.stopScheduler())
   pool.ensureLocal()
   // A generic px-local bind lands each slot on its own VPS's local row.

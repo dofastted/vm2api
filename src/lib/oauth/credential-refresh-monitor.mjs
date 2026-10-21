@@ -179,6 +179,9 @@ export function createCredentialRefreshMonitor(opts = {}) {
     getSnapshot: () => lastRun,
     runOnce,
     start,
+    flush: async () => {
+      while (inflight) await inflight
+    },
     stop,
   }
 }
