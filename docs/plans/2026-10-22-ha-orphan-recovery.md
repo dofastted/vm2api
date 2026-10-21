@@ -23,12 +23,20 @@ readCompletion({requestId: originalCommandId, nodeBinding: originalPgBinding})
 
 原节点正常 completed 仅依赖现有 kernel 正常终态加 EOF 的协议假设。它不证明未知异常的 provider 行为已经结束。未 dispatch 的已绑定 command 仍需要节点持久 tombstone 或后续可靠停止证明，本阶段保留占位。
 
-## 计费与维护限制
+## API key 对账
 
-本阶段不写 usage、model、请求成功状态或金额，也不释放 API key reservation。缺少节点用量、实际模型和 PG 定价快照时，不能按 0 结算。API key 的业务 claim 继续阻止破坏性维护。恢复不会释放任何 VM operation、background task 或其他 parent 的资源。
+021 在实际 job bind 的短事务内保存 dispatch 前价格快照，包含 model 的 resolved rates/modes/tiers、group multiplier、实际 cache TTL 和请求 speed。后续改价不改变已提交快照。正常 handler 将最终 result.execution.requestId 持久选为 billable command；服务用原节点 recovery-status 的公开 receipt 结算。派发和结算都不读取 Pod 凭据文件。
 
-后续用量回执应在节点 completed 的同一 journal 事务持久化，通过原 node binding + command ID 关联 `execution_jobs`。回执仅包含 receipt ID、实际 model、usage_complete 和明确计数白名单；缺字段不得补 0，不保存响应正文、headers 或凭据。控制面按原 pricing snapshot 结算；它不能重发原 command 或重新 mint grant。
+`ApiKeyStore.recordHaUsage({reservation,commandId,nodeStatus})` 与恢复服务共用同一 parent/key/reservation 事务和唯一 `ha_request_settlements` 行。它更新原 key 的请求/token/USD 与 5h/1d/7d 窗口。现有推理链不扣 users.balance，本阶段保持该规则。key 已删除仍写 key_deleted 审计；原 reservation 已 settled 则写 already_settled，不重复增加计数。正常 handler 的 outer finally 负责 release；孤儿执行图已恢复后才原子结算并 release。
 
-历史清理保留两类原始执行图：仍有未 release 的同 parent API key reservation；已封闭但 execution_recovered_at 仍为空的 parent。正常已结束且无这些待处理关联的历史仍遵循旧清理策略。节点 proof 的长期独立审计存储和完整计费恢复尚未实现。
+恢复仅选择已有持久 billable command，或 sealed parent 的唯一原 job。多 command 缺最终选择、usage_complete=false、缺实际 model/四项主计数、原 snapshot 无价格或模型不匹配时，API key claim 继续保留。不会猜最高 attempt、累加多 attempt 或按 0 结算。无 job 的 sealed/execution_recovered parent 可以写 not_dispatched，释放未使用预留且不增加请求数或金额。
+
+receipt 仅允许 ID、实际 model、usage_complete、规范 decimal-string 的主计数、缓存时间拆分、web search 次数与明确 speed/service_tier/stop_reason。计数进入 PG bigint 时保持精确字符串；USD 仍沿用现有 double precision schema 与价格计算规则。账单独立保留原 receipt、binding 和 snapshot；不保存响应正文、headers 或凭据。
+
+## 分页发现与保留
+
+`scan({limit:20,afterRequestId:null})` 返回 `{results,nextCursor}`。它在当前真实 activity 内只读发现 recovery_kind=claude_messages、原 activity/owner/epoch 一致的候选，随后每条 recover 再证明 owner session lock 已空闲。单条错误不终止其余条目，cursor 防止未知旧条目占满同一页。settled 但未 release 的原预留仍需处理；全部资源和额度已结束才排除。服务本身没有 timer。
+
+历史清理保留仍有 active API key/执行资源、parent 尚未封闭、恢复未结束或原 activity 未确认 completed 的原始图。attempt cleanup 在精确 parent 锁下判断，与恢复读取互斥。正常已结束且无这些依赖的历史仍遵循旧清理策略。长期财务审计保留在 settlement 行，不依赖 admission/job 的短期历史。
 
 新 HTTP/异步请求可能继承已关闭的 HA context。新 context 仅在新真实 coordinator gate 的 scope 下允许建立；继承的 active context 仍拒绝嵌套，原 activity 无法借 closed context 重新建立 parent。attempt context 共用父 context 的关闭状态。

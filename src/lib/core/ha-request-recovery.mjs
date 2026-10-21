@@ -28,6 +28,44 @@ export class HaRequestRecovery {
     this.readNodeRecoveryStatus = readNodeRecoveryStatus
   }
 
+  /** Candidate discovery is read-only. recover() proves owner loss again for every exact parent. */
+  async scan({ limit = 20, afterRequestId = null } = {}) {
+    if (
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > 100 ||
+      (afterRequestId !== null &&
+        (typeof afterRequestId !== 'string' || !afterRequestId || afterRequestId.length > 128))
+    ) {
+      throw Object.assign(new Error('invalid HA recovery scan'), { code: 'ha_recovery_scan_invalid' })
+    }
+    const scope = this.coordinator.assertActivity()
+    const rows = await this.db
+      .prepare(`SELECT r.id FROM ha_request_contexts r
+      JOIN ${this.coordinator.qualified}.activities a ON a.id=r.activity_id
+        AND a.owner_id=r.activity_owner_id AND a.epoch=r.activity_epoch
+      JOIN ${this.coordinator.qualified}.control c ON c.id=1 AND c.phase='open'
+        AND c.epoch=r.activity_epoch AND c.epoch=$3
+      WHERE r.recovery_kind='claude_messages' AND ($1::text IS NULL OR r.id>$1)
+        AND ((r.execution_recovered_at IS NULL AND (a.completed_at IS NULL OR r.recovery_sealed_at IS NOT NULL
+          OR EXISTS (SELECT 1 FROM execution_admissions e WHERE e.ha_request_id=r.id AND e.released_at IS NULL)
+          OR EXISTS (SELECT 1 FROM execution_jobs j WHERE j.ha_request_id=r.id AND j.ended_at IS NULL)))
+          OR EXISTS (SELECT 1 FROM api_key_admissions k WHERE k.ha_request_id=r.id AND k.released_at IS NULL))
+      ORDER BY r.id LIMIT $2`)
+      .all(afterRequestId, limit + 1, scope.epoch)
+    const page = rows.slice(0, limit)
+    const results = []
+    for (const row of page) {
+      try {
+        results.push({ requestId: row.id, ...(await this.recover(row.id)) })
+      } catch (error) {
+        const code = /^[A-Za-z0-9_]{1,80}$/.test(error?.code) ? error.code : 'ha_recovery_failed'
+        results.push({ requestId: row.id, recovered: false, errorCode: code })
+      }
+    }
+    return { results, nextCursor: rows.length > limit ? page.at(-1).id : null }
+  }
+
   async seal(requestId) {
     return withTransaction(this.db, async () => {
       const { request, ...result } = await this._seal(requestId)
