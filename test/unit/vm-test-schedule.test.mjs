@@ -296,3 +296,241 @@ test('sync with an invalid test writes nothing', () => {
   }
   assert.deepEqual(settings.all(), before)
 })
+
+const intervalConfig = {
+  ...claudeConfig,
+  frequency: 'interval',
+  time: '09:00',
+  timezone: 'UTC',
+  interval_minutes: 300,
+  jitter_min_minutes: 0,
+  jitter_max_minutes: 60,
+}
+
+function clockRunner({ at = '2026-10-16T00:00:00.000Z', random = () => 0, runTest, settings, list } = {}) {
+  const clock = { now: Date.parse(at) }
+  const store = settings || new MemorySettings()
+  const calls = []
+  const schedule = new VmTestScheduleRunner({
+    projectRoot: '/missing-project',
+    settings: () => store,
+    list: list || (() => [claudeVm]),
+    runTest:
+      runTest ||
+      (async (_vmId, params) => {
+        calls.push(params)
+        return { ok: true, duration_ms: 5 }
+      }),
+    now: () => clock.now,
+    random,
+  })
+  return { clock, settings: store, schedule, calls }
+}
+
+const row = (settings, id = 'vm-01') => settings.get(`${VM_TEST_SCHEDULE_PREFIX}${id}`)
+
+test('interval structure validates its fields and compiles the first-run time', () => {
+  const structure = normalizeScheduleStructure({
+    frequency: 'interval',
+    time: '9:05',
+    interval_minutes: 300,
+    jitter_max_minutes: 60,
+    timezone: 'UTC',
+  })
+  assert.deepEqual(structure, {
+    frequency: 'interval',
+    time: '09:05',
+    interval_minutes: 300,
+    jitter_min_minutes: 0,
+    jitter_max_minutes: 60,
+    timezone: 'UTC',
+  })
+  assert.equal(compileStructuredSchedule(structure), '5 9 * * *')
+  const noJitter = normalizeScheduleStructure({ ...structure, jitter_max_minutes: undefined, jitter_min_minutes: 15 })
+  assert.equal(noJitter.jitter_max_minutes, 15, 'max defaults to min')
+  for (const bad of [
+    { interval_minutes: undefined },
+    { interval_minutes: 5 },
+    { interval_minutes: 7 * 24 * 60 + 1 },
+    { interval_minutes: 90.5 },
+    { jitter_min_minutes: 30, jitter_max_minutes: 10 },
+    { jitter_max_minutes: 24 * 60 + 1 },
+    { time: undefined },
+  ]) {
+    assert.throws(() => normalizeScheduleStructure({ ...structure, ...bad }), /interval_minutes|jitter|HH:MM/)
+  }
+})
+
+test('interval plan first runs at the next `time`, then at actual run + interval + random delay', async () => {
+  let draw = 0.5
+  const { clock, settings, schedule, calls } = clockRunner({ random: () => draw })
+  const saved = schedule.save('vm-01', intervalConfig)
+  assert.equal(saved.frequency, 'interval')
+  assert.equal(saved.next_run_at, '2026-10-16T09:00:00.000Z', 'shown before the runner starts')
+  schedule.start()
+  t_assertJob(schedule, '2026-10-16T09:00:00.000Z')
+
+  // The run fires late (09:07); the next one counts from the actual run.
+  clock.now = Date.parse('2026-10-16T09:07:00.000Z')
+  await schedule.jobs.get('vm-01').trigger()
+  assert.equal(calls.length, 1)
+  const next = Date.parse(row(settings).next_run_at)
+  assert.equal(next, Date.parse('2026-10-16T14:07:00.000Z') + Math.floor(0.5 * (3_600_000 + 1)))
+  assert.equal(schedule.get('vm-01').next_run_at, new Date(next).toISOString())
+  assert.equal(row(settings).last_run_at, '2026-10-16T09:07:00.000Z')
+  assert.equal(row(settings).last_ok, true)
+
+  for (const value of [0, 0.999999]) {
+    draw = value
+    clock.now += 6 * 3_600_000
+    await schedule.jobs.get('vm-01').trigger()
+    const at = Date.parse(row(settings).next_run_at) - clock.now
+    assert.ok(at >= 300 * 60_000 && at <= 360 * 60_000, `delay ${at} within interval + [0, 60] min`)
+  }
+  schedule.stop()
+})
+
+function t_assertJob(schedule, iso) {
+  const job = schedule.jobs.get('vm-01')
+  assert.ok(job, 'interval job armed')
+  assert.equal(job.nextRun().toISOString(), iso)
+}
+
+test('saving an interval plan keeps its pending run unless the timing changes', () => {
+  const { clock, settings, schedule } = clockRunner()
+  schedule.save('vm-01', intervalConfig)
+  const pending = '2026-10-16T12:34:00.000Z'
+  settings.set(`${VM_TEST_SCHEDULE_PREFIX}vm-01`, { ...row(settings), next_run_at: pending })
+  clock.now = Date.parse('2026-10-16T01:00:00.000Z')
+  assert.equal(schedule.save('vm-01', { ...intervalConfig, prompt: 'edited' }).next_run_at, pending)
+  assert.equal(
+    schedule.save('vm-01', { ...intervalConfig, interval_minutes: 120 }).next_run_at,
+    '2026-10-16T09:00:00.000Z',
+    'new timing restarts from the first-run time',
+  )
+  assert.equal(schedule.save('vm-01', { ...intervalConfig, enabled: false }).next_run_at, null)
+})
+
+test('interval plan restored after restart keeps or rolls forward its next run without catching up', () => {
+  for (const [stored, expected] of [
+    ['2026-10-16T03:00:00.000Z', '2026-10-16T03:00:00.000Z'],
+    // Missed at 2026-10-15T20:00 while down: moved by whole 5 h intervals, no immediate run.
+    ['2026-10-15T20:00:00.000Z', '2026-10-16T06:00:00.000Z'],
+    [null, '2026-10-16T09:00:00.000Z'],
+  ]) {
+    const { settings, schedule, calls } = clockRunner({ at: '2026-10-16T02:00:00.000Z' })
+    schedule.save('vm-01', intervalConfig)
+    const raw = row(settings)
+    if (stored) raw.next_run_at = stored
+    else delete raw.next_run_at
+    settings.set(`${VM_TEST_SCHEDULE_PREFIX}vm-01`, raw)
+    schedule.start()
+    assert.equal(row(settings).next_run_at, expected)
+    assert.equal(schedule.jobs.get('vm-01').nextRun().toISOString(), expected)
+    assert.equal(calls.length, 0)
+    schedule.stop()
+  }
+})
+
+test('interval timer splits delays longer than setTimeout allows', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const { clock, settings, schedule } = clockRunner({ runTest: () => new Promise(() => {}) })
+  schedule.save('vm-01', intervalConfig)
+  const far = clock.now + 30 * 24 * 3_600_000
+  settings.set(`${VM_TEST_SCHEDULE_PREFIX}vm-01`, { ...row(settings), next_run_at: new Date(far).toISOString() })
+  schedule.start()
+  const max = 2 ** 31 - 1
+  clock.now += max
+  t.mock.timers.tick(max)
+  assert.equal(schedule.running.has('vm-01'), false, 'not due yet after the first segment')
+  const rest = far - clock.now
+  clock.now = far
+  t.mock.timers.tick(rest)
+  assert.equal(schedule.running.has('vm-01'), true)
+  schedule.stop()
+})
+
+test('prompts are de-duplicated, validated, and one is picked at random per run', async () => {
+  const plan = normalizeVmTestSchedule({ ...claudeConfig, prompt: ' a ', prompts: ['a', 'b', '', ' c '] }, claudeVm)
+  assert.equal(plan.prompt, 'a')
+  assert.deepEqual(plan.prompts, ['a', 'b', 'c'])
+  assert.deepEqual(normalizeVmTestSchedule({ ...claudeConfig, prompt: '', prompts: ['x', 'y'] }, claudeVm).prompts, [
+    'x',
+    'y',
+  ])
+  assert.throws(() => normalizeVmTestSchedule({ ...claudeConfig, prompts: 'a' }, claudeVm), /array/)
+  assert.throws(() => normalizeVmTestSchedule({ ...claudeConfig, prompts: [1] }, claudeVm), /strings/)
+  assert.throws(
+    () =>
+      normalizeVmTestSchedule({ ...claudeConfig, prompts: Array.from({ length: 21 }, (_, i) => `p${i}`) }, claudeVm),
+    /at most 20/,
+  )
+  assert.throws(
+    () => normalizeVmTestSchedule({ ...claudeConfig, prompts: ['x'.repeat(16_000), 'y'.repeat(16_001)] }, claudeVm),
+    /16000/,
+  )
+  assert.throws(
+    () =>
+      normalizeVmTestSchedule({ ...claudeConfig, prompts: ['x'.repeat(16_000), 'y'.repeat(16_000), 'z'] }, claudeVm),
+    /total/,
+  )
+
+  const draws = [0, 0.4, 0.99]
+  const { schedule, calls } = clockRunner({ random: () => draws.shift() ?? 0 })
+  schedule.save('vm-01', { ...claudeConfig, prompts: ['hello', 'second', 'third'] })
+  assert.deepEqual(schedule.get('vm-01').prompts, ['hello', 'second', 'third'])
+  schedule.start()
+  const job = schedule.jobs.get('vm-01')
+  for (let i = 0; i < 3; i++) await job.trigger()
+  assert.deepEqual(
+    calls.map((c) => c.prompt),
+    ['hello', 'second', 'third'],
+  )
+  schedule.stop()
+})
+
+test('rows saved before interval/prompts load unchanged', () => {
+  const { settings, schedule } = clockRunner()
+  settings.set(`${VM_TEST_SCHEDULE_PREFIX}vm-01`, {
+    enabled: true,
+    frequency: 'daily',
+    time: '09:00',
+    timezone: 'UTC',
+    cron: '0 9 * * *',
+    model: 'claude-haiku-4-5',
+    prompt: 'legacy',
+    max_tokens: 64,
+    reasoning_effort: null,
+    revision: 'r1',
+  })
+  const view = schedule.get('vm-01')
+  assert.equal(view.parse_error, false)
+  assert.deepEqual(view.prompts, ['legacy'])
+  assert.match(view.next_run_at, /T09:00:00\.000Z$/, 'cron plans still probe croner')
+  schedule.start()
+  assert.equal(row(settings).next_run_at, undefined, 'cron plans never store next_run_at')
+  schedule.stop()
+})
+
+test('sync and default template carry interval timing and prompts', () => {
+  const otherClaude = { id: 'vm-03', platform: 'anthropic' }
+  const { settings, schedule } = clockRunner({ list: () => [claudeVm, otherClaude] })
+  const structure = normalizeScheduleStructure(intervalConfig)
+  assert.deepEqual(schedule.saveDefaultTemplate(intervalConfig), structure)
+  assert.deepEqual(schedule.getDefaultTemplate(), structure)
+  schedule.save('vm-01', { ...claudeConfig, prompts: ['keep', 'also'] })
+  schedule.syncSchedules({ scope: 'ids', vmIds: ['vm-01'], schedule: structure })
+  assert.deepEqual(row(settings).prompts, ['hello', 'keep', 'also'])
+  assert.equal(row(settings).frequency, 'interval')
+  assert.equal(row(settings).next_run_at, '2026-10-16T09:00:00.000Z')
+
+  schedule.syncSchedules({
+    scope: 'all',
+    schedule: structure,
+    test: { enabled: true, model: 'claude-haiku-5-5', prompt: 'p1', prompts: ['p1', 'p2'], max_tokens: 32 },
+  })
+  for (const id of ['vm-01', 'vm-03']) {
+    assert.deepEqual(row(settings, id).prompts, ['p1', 'p2'])
+    assert.equal(row(settings, id).interval_minutes, 300)
+  }
+})

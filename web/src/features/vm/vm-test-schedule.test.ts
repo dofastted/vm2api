@@ -72,4 +72,32 @@ describe('scheduled test form follows changes made elsewhere', () => {
     const next = stored({ enabled: true })
     expect(reconcileSchedule(formOf(next), base, next)).toBe('track')
   })
+
+  it('extra prompts and interval timing count as plan content', () => {
+    const base = stored({
+      frequency: 'interval',
+      time: '09:00',
+      interval_minutes: 300,
+      jitter_min_minutes: 0,
+      jitter_max_minutes: 60,
+      prompts: ['hello', 'second'],
+    })
+    const form = formOf(base, {
+      structure: {
+        frequency: 'interval',
+        time: '09:00',
+        interval_minutes: 300,
+        jitter_min_minutes: 0,
+        jitter_max_minutes: 60,
+        timezone: base.timezone,
+      },
+      extraPrompts: ['second'],
+    })
+    expect(reconcileSchedule(form, base, base)).toBe('keep')
+    const moved = stored({ ...base, interval_minutes: 120 })
+    expect(reconcileSchedule(form, base, moved)).toBe('adopt')
+    expect(
+      reconcileSchedule({ ...form, extraPrompts: ['other'] }, base, moved)
+    ).toBe('stale')
+  })
 })

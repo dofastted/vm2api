@@ -755,9 +755,10 @@ export function createPanelHandler(ctx) {
       vmTestSchedule.remove(id)
       return json(res, 200, panel.ok({ schedule: null }))
     }
+    // Up to 20 prompts, 32000 characters in total.
     let body
     try {
-      body = await readBody(req, 64 * 1024)
+      body = await readBody(req, 256 * 1024)
     } catch (error) {
       return json(res, 400, {
         ok: false,

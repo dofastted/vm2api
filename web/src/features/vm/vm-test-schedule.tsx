@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { Vm } from '@/types/panel-vm'
-import { Clock3, Save, Trash2 } from 'lucide-react'
+import { Clock3, Plus, Save, Trash2, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { validTimezone } from '@/lib/timezone'
@@ -28,10 +28,11 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
+import { Textarea } from '@/components/ui/textarea'
 import { meQueryOptions } from '@/features/auth/queries'
 import { TimezonePicker } from '@/features/vm/timezone-picker'
 
-type ScheduleFrequency = 'hourly' | 'daily' | 'weekly'
+type ScheduleFrequency = 'hourly' | 'daily' | 'weekly' | 'interval'
 
 export type TestSchedule = {
   enabled: boolean
@@ -39,10 +40,15 @@ export type TestSchedule = {
   minute?: number
   time?: string
   weekdays?: number[]
+  interval_minutes?: number
+  jitter_min_minutes?: number
+  jitter_max_minutes?: number
   timezone: string
   parse_error?: boolean
   model: string
   prompt: string
+  /** All candidate prompts, `prompts[0] === prompt`; one is picked per run. */
+  prompts?: string[]
   max_tokens: number | null
   reasoning_effort: string | null
   last_run_at: string | null
@@ -55,7 +61,14 @@ export type TestSchedule = {
 
 export type ScheduleStructure = Pick<
   TestSchedule,
-  'frequency' | 'minute' | 'time' | 'weekdays' | 'timezone'
+  | 'frequency'
+  | 'minute'
+  | 'time'
+  | 'weekdays'
+  | 'interval_minutes'
+  | 'jitter_min_minutes'
+  | 'jitter_max_minutes'
+  | 'timezone'
 >
 
 type SchedulePayload = { schedule: TestSchedule | null }
@@ -128,8 +141,24 @@ function structureFromSchedule(
     minute: schedule.minute ?? 0,
     time: schedule.time || '09:00',
     weekdays: schedule.weekdays?.length ? schedule.weekdays : [1],
+    interval_minutes: schedule.interval_minutes ?? 300,
+    jitter_min_minutes: schedule.jitter_min_minutes ?? 0,
+    jitter_max_minutes: schedule.jitter_max_minutes ?? 60,
     timezone: schedule.timezone || localTimezone(),
   }
+}
+
+/** Extra prompts beyond the main one, as stored. */
+function extrasOf(schedule: TestSchedule | null) {
+  return schedule?.prompts?.slice(1) ?? []
+}
+
+function cleanExtras(extras: string[]) {
+  return extras.map((item) => item.trim()).filter(Boolean)
+}
+
+function sameList(a: string[], b: string[]) {
+  return a.length === b.length && a.every((item, i) => item === b[i])
 }
 
 export type FormState = {
@@ -137,6 +166,8 @@ export type FormState = {
   structure: ScheduleStructure
   model: string
   prompt: string
+  /** Extra prompts picked at random together with `prompt`. */
+  extraPrompts?: string[]
   maxTokens: number
   reasoningEffort: string
   codex: boolean
@@ -163,6 +194,7 @@ function formFrom(schedule: TestSchedule): FormState {
     structure: structureFromSchedule(schedule),
     model: schedule.model,
     prompt: schedule.prompt,
+    extraPrompts: extrasOf(schedule),
     maxTokens: schedule.max_tokens ?? 0,
     reasoningEffort: schedule.reasoning_effort ?? '',
     codex: schedule.reasoning_effort != null,
@@ -176,6 +208,7 @@ function formShows(form: FormState, schedule: TestSchedule) {
     structureEqual(form.structure, structureFromSchedule(schedule)) &&
     form.model === schedule.model &&
     form.prompt.trim() === schedule.prompt &&
+    sameList(cleanExtras(form.extraPrompts ?? []), extrasOf(schedule)) &&
     (form.codex
       ? form.reasoningEffort === schedule.reasoning_effort
       : form.maxTokens === schedule.max_tokens)
@@ -183,6 +216,16 @@ function formShows(form: FormState, schedule: TestSchedule) {
 }
 
 function structureEqual(a: ScheduleStructure, b: ScheduleStructure) {
+  if (a.frequency === 'interval' || b.frequency === 'interval') {
+    return (
+      a.frequency === b.frequency &&
+      a.timezone === b.timezone &&
+      a.time === b.time &&
+      a.interval_minutes === b.interval_minutes &&
+      a.jitter_min_minutes === b.jitter_min_minutes &&
+      a.jitter_max_minutes === b.jitter_max_minutes
+    )
+  }
   return (
     a.frequency === b.frequency &&
     a.timezone === b.timezone &&
@@ -218,6 +261,7 @@ export function VmTestSchedule({
   const [enabled, setEnabled] = useState(false)
   const [structure, setStructure] =
     useState<ScheduleStructure>(defaultStructure)
+  const [extras, setExtras] = useState<string[]>([])
   const [syncOpen, setSyncOpen] = useState(false)
   const [syncAllOpen, setSyncAllOpen] = useState(false)
   const scheduleQuery = useQuery({
@@ -245,6 +289,7 @@ export function VmTestSchedule({
     structure,
     model: selectedModel,
     prompt,
+    extraPrompts: extras,
     maxTokens,
     reasoningEffort,
     codex,
@@ -254,6 +299,7 @@ export function VmTestSchedule({
     setStale(false)
     setEnabled(schedule.enabled)
     setStructure(structureFromSchedule(schedule))
+    setExtras(extrasOf(schedule))
     onLoadSchedule(schedule)
   }
 
@@ -291,10 +337,14 @@ export function VmTestSchedule({
       !structureEqual(structure, savedStructure) ||
       selectedModel !== saved.model ||
       prompt.trim() !== saved.prompt ||
+      !sameList(cleanExtras(extras), extrasOf(saved)) ||
       (codex
         ? reasoningEffort !== saved.reasoning_effort
         : maxTokens !== saved.max_tokens)
-    : enabled || !structureEqual(structure, defaultStructure())
+    : enabled ||
+      !structureEqual(structure, defaultStructure()) ||
+      cleanExtras(extras).length > 0
+  const prompts = [prompt.trim(), ...cleanExtras(extras)]
 
   const save = useMutation({
     onMutate: () => qc.cancelQueries({ queryKey }),
@@ -306,6 +356,7 @@ export function VmTestSchedule({
           ...structure,
           model: selectedModel,
           prompt,
+          prompts,
           ...(codex
             ? { reasoning_effort: reasoningEffort }
             : { max_tokens: maxTokens }),
@@ -318,6 +369,7 @@ export function VmTestSchedule({
         setStale(false)
         setEnabled(data.schedule.enabled)
         setStructure(structureFromSchedule(data.schedule))
+        setExtras(extrasOf(data.schedule))
         onPromptChange(data.schedule.prompt)
       }
       toast.success(
@@ -336,6 +388,7 @@ export function VmTestSchedule({
       setStale(false)
       setEnabled(false)
       setStructure(defaultStructure())
+      setExtras([])
       toast.success('测试计划已删除')
     },
     onError: (error: Error) => toast.error(error.message),
@@ -368,6 +421,7 @@ export function VmTestSchedule({
                   enabled,
                   model: selectedModel,
                   prompt: prompt.trim(),
+                  prompts,
                   ...(codex
                     ? { reasoning_effort: reasoningEffort }
                     : { max_tokens: maxTokens }),
@@ -480,6 +534,9 @@ export function VmTestSchedule({
                     minute: prev.minute ?? 0,
                     time: prev.time || '09:00',
                     weekdays: prev.weekdays?.length ? prev.weekdays : [1],
+                    interval_minutes: prev.interval_minutes ?? 300,
+                    jitter_min_minutes: prev.jitter_min_minutes ?? 0,
+                    jitter_max_minutes: prev.jitter_max_minutes ?? 60,
                   }))
                 }
               >
@@ -490,6 +547,7 @@ export function VmTestSchedule({
                   <SelectItem value='hourly'>每小时</SelectItem>
                   <SelectItem value='daily'>每天</SelectItem>
                   <SelectItem value='weekly'>每周</SelectItem>
+                  <SelectItem value='interval'>间隔</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -517,7 +575,9 @@ export function VmTestSchedule({
               </div>
             ) : (
               <div className='space-y-1.5'>
-                <Label htmlFor={`vm-test-time-${vm.id}`}>时刻</Label>
+                <Label htmlFor={`vm-test-time-${vm.id}`}>
+                  {structure.frequency === 'interval' ? '首次时刻' : '时刻'}
+                </Label>
                 <Input
                   id={`vm-test-time-${vm.id}`}
                   type='time'
@@ -546,6 +606,68 @@ export function VmTestSchedule({
               </p>
             </div>
 
+            {structure.frequency === 'interval' ? (
+              <>
+                <div className='space-y-1.5'>
+                  <Label htmlFor={`vm-test-interval-${vm.id}`}>
+                    间隔（分钟）
+                  </Label>
+                  <Input
+                    id={`vm-test-interval-${vm.id}`}
+                    type='number'
+                    min={10}
+                    max={10080}
+                    value={structure.interval_minutes ?? 300}
+                    onChange={(event) =>
+                      setStructure((prev) => ({
+                        ...prev,
+                        interval_minutes: Number(event.target.value),
+                      }))
+                    }
+                  />
+                </div>
+                <div className='space-y-1.5'>
+                  <Label htmlFor={`vm-test-jitter-${vm.id}`}>
+                    随机延迟（分钟）
+                  </Label>
+                  <div className='flex items-center gap-2'>
+                    <Input
+                      id={`vm-test-jitter-${vm.id}`}
+                      type='number'
+                      min={0}
+                      max={1440}
+                      aria-label='随机延迟下限（分钟）'
+                      value={structure.jitter_min_minutes ?? 0}
+                      onChange={(event) =>
+                        setStructure((prev) => ({
+                          ...prev,
+                          jitter_min_minutes: Number(event.target.value),
+                        }))
+                      }
+                    />
+                    <span className='text-muted-foreground'>～</span>
+                    <Input
+                      type='number'
+                      min={0}
+                      max={1440}
+                      aria-label='随机延迟上限（分钟）'
+                      value={structure.jitter_max_minutes ?? 0}
+                      onChange={(event) =>
+                        setStructure((prev) => ({
+                          ...prev,
+                          jitter_max_minutes: Number(event.target.value),
+                        }))
+                      }
+                    />
+                  </div>
+                </div>
+                <p className='text-xs text-muted-foreground sm:col-span-2'>
+                  首次在「首次时刻」运行；之后每次 = 上次实际运行 + 间隔 +
+                  本轮随机延迟。
+                </p>
+              </>
+            ) : null}
+
             {structure.frequency === 'weekly' ? (
               <div className='space-y-2 sm:col-span-2'>
                 <Label>星期</Label>
@@ -572,6 +694,51 @@ export function VmTestSchedule({
                 </div>
               </div>
             ) : null}
+          </div>
+
+          <div className='space-y-1.5'>
+            <Label>备选题目</Label>
+            {extras.map((item, index) => (
+              <div key={index} className='flex items-start gap-2'>
+                <Textarea
+                  aria-label={`备选题目 ${index + 1}`}
+                  className='min-h-9'
+                  rows={1}
+                  value={item}
+                  onChange={(event) =>
+                    setExtras((prev) =>
+                      prev.map((value, i) =>
+                        i === index ? event.target.value : value
+                      )
+                    )
+                  }
+                />
+                <Button
+                  size='icon'
+                  variant='ghost'
+                  className='size-8 shrink-0 text-muted-foreground'
+                  aria-label={`删除备选题目 ${index + 1}`}
+                  onClick={() =>
+                    setExtras((prev) => prev.filter((_, i) => i !== index))
+                  }
+                >
+                  <X />
+                </Button>
+              </div>
+            ))}
+            <div className='flex items-center gap-2'>
+              <Button
+                size='sm'
+                variant='ghost'
+                disabled={extras.length >= 19}
+                onClick={() => setExtras((prev) => [...prev, ''])}
+              >
+                <Plus /> 添加题目
+              </Button>
+              <span className='text-xs text-muted-foreground'>
+                每次从上方 Prompt 与备选题目里随机抽一道
+              </span>
+            </div>
           </div>
 
           <div className='flex flex-wrap items-center gap-2'>
@@ -664,7 +831,7 @@ export function VmTestSchedule({
           <AlertDialogHeader>
             <AlertDialogTitle>同步调度时间？</AlertDialogTitle>
             <AlertDialogDescription>
-              将把当前表单的调度时间（频率、时刻/分钟、星期、时区）覆盖写入本槽
+              将把当前表单的调度时间（频率、时刻/分钟、星期、间隔、时区）覆盖写入本槽
               {saved ? '' : '（若无计划将创建且保持关闭）'}
               。不会修改 Prompt、模型、token/effort 或启用开关。
             </AlertDialogDescription>
@@ -693,7 +860,7 @@ export function VmTestSchedule({
             <AlertDialogDescription>
               把本槽当前显示的定时测试整个覆盖到你有权限的全部槽（租户仅自己的槽）：
               开关（{enabled ? '启用' : '暂停'}
-              ）、频率、时刻/分钟、星期、时区、模型、Prompt、
+              ）、频率、时刻/分钟、星期、间隔、时区、模型、Prompt 与备选题目、
               {codex ? 'effort' : 'token 上限'}。不用先点保存。
               另一类槽（Claude/Codex 不同）只同步开关和时间，保留自己的模型与
               Prompt。

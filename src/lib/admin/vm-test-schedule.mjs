@@ -12,9 +12,16 @@ export const VM_TEST_SCHEDULE_DEFAULT_KEY = 'vm_test_schedule_default'
 const MAX_CRON_LENGTH = 120
 const MAX_MODEL_LENGTH = 200
 const MAX_PROMPT_LENGTH = 16_000
+const MAX_PROMPTS = 20
+const MAX_PROMPTS_TOTAL_LENGTH = 32_000
+const MIN_INTERVAL_MINUTES = 10
+const MAX_INTERVAL_MINUTES = 7 * 24 * 60
+const MAX_JITTER_MINUTES = 24 * 60
+// setTimeout clamps anything above 2^31-1 ms (~24.8 days) to 1 ms.
+const MAX_TIMER_MS = 2 ** 31 - 1
 const MAX_ERROR_LENGTH = 300
 const REASONING_EFFORTS = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max'])
-const FREQUENCIES = new Set(['hourly', 'daily', 'weekly'])
+const FREQUENCIES = new Set(['hourly', 'daily', 'weekly', 'interval'])
 const DEFAULT_PROMPT = 'hello'
 const DEFAULT_MAX_TOKENS = 64
 const DEFAULT_REASONING_EFFORT = 'medium'
@@ -64,10 +71,18 @@ function normalizeWeekdays(values) {
   return sorted
 }
 
+function intInRange(value, fallback, min, max, name) {
+  const n = value == null || value === '' ? fallback : Number(value)
+  if (!Number.isInteger(n) || n < min || n > max) {
+    throw new VmTestScheduleError(`${name} must be an integer from ${min} to ${max}`)
+  }
+  return n
+}
+
 export function normalizeScheduleStructure(input = {}) {
   const frequency = String(input.frequency || '').trim()
   if (!FREQUENCIES.has(frequency)) {
-    throw new VmTestScheduleError('frequency must be hourly, daily, or weekly')
+    throw new VmTestScheduleError('frequency must be hourly, daily, weekly, or interval')
   }
   const timezone = validTimezone(input.timezone)
   if (!timezone) throw new VmTestScheduleError('timezone must be a valid IANA timezone')
@@ -82,6 +97,29 @@ export function normalizeScheduleStructure(input = {}) {
 
   const time = parseTime(input.time)
   if (!time) throw new VmTestScheduleError('time must be HH:MM in 24-hour format')
+  if (frequency === 'interval') {
+    // `time` is the first run; each later run is the previous actual run + interval + a fresh delay.
+    const intervalMinutes = intInRange(
+      input.interval_minutes,
+      null,
+      MIN_INTERVAL_MINUTES,
+      MAX_INTERVAL_MINUTES,
+      'interval_minutes',
+    )
+    const jitterMin = intInRange(input.jitter_min_minutes, 0, 0, MAX_JITTER_MINUTES, 'jitter_min_minutes')
+    const jitterMax = intInRange(input.jitter_max_minutes, jitterMin, 0, MAX_JITTER_MINUTES, 'jitter_max_minutes')
+    if (jitterMax < jitterMin) {
+      throw new VmTestScheduleError('jitter_max_minutes must not be less than jitter_min_minutes')
+    }
+    return {
+      frequency,
+      time: formatTime(time.hour, time.minute),
+      interval_minutes: intervalMinutes,
+      jitter_min_minutes: jitterMin,
+      jitter_max_minutes: jitterMax,
+      timezone,
+    }
+  }
   if (frequency === 'daily') {
     return { frequency, time: formatTime(time.hour, time.minute), timezone }
   }
@@ -95,7 +133,8 @@ export function compileStructuredSchedule(structure) {
     return `${normalized.minute} * * * *`
   }
   const { hour, minute } = parseTime(normalized.time)
-  if (normalized.frequency === 'daily') {
+  // Interval plans only use cron to find the first run (next `time` in the timezone).
+  if (normalized.frequency === 'daily' || normalized.frequency === 'interval') {
     return `${minute} ${hour} * * *`
   }
   return `${minute} ${hour} * * ${normalized.weekdays.join(',')}`
@@ -210,10 +249,8 @@ export function normalizeVmTestSchedule(input, vm) {
   if (!model || model.length > MAX_MODEL_LENGTH) {
     throw new VmTestScheduleError('model is required and must be at most 200 characters')
   }
-  const prompt = String(input.prompt ?? '').trim()
-  if (!prompt || prompt.length > MAX_PROMPT_LENGTH) {
-    throw new VmTestScheduleError('prompt is required and must be at most 16000 characters')
-  }
+  const prompts = normalizePrompts(input.prompt, input.prompts)
+  const prompt = prompts[0]
 
   let maxTokens = input.max_tokens == null ? null : input.max_tokens
   if (maxTokens != null && (!Number.isSafeInteger(maxTokens) || maxTokens < 1 || maxTokens > 128_000)) {
@@ -239,8 +276,110 @@ export function normalizeVmTestSchedule(input, vm) {
     cron,
     model,
     prompt,
+    prompts,
     max_tokens: maxTokens,
     reasoning_effort: reasoningEffort,
+  }
+}
+
+/**
+ * `prompt` plus optional `prompts`, trimmed and de-duplicated in order; a run picks one at random.
+ * `prompts[0]` is `prompt`, so clients may send either the extras or the whole list.
+ */
+function normalizePrompts(prompt, prompts) {
+  if (prompts != null && !Array.isArray(prompts)) throw new VmTestScheduleError('prompts must be an array')
+  const out = []
+  for (const raw of [prompt, ...(prompts || [])]) {
+    if (raw != null && typeof raw !== 'string') throw new VmTestScheduleError('prompts must be strings')
+    const text = String(raw ?? '').trim()
+    if (!text) continue
+    if (text.length > MAX_PROMPT_LENGTH) {
+      throw new VmTestScheduleError('prompt is required and must be at most 16000 characters')
+    }
+    if (!out.includes(text)) out.push(text)
+  }
+  if (!out.length) throw new VmTestScheduleError('prompt is required and must be at most 16000 characters')
+  if (out.length > MAX_PROMPTS) throw new VmTestScheduleError(`at most ${MAX_PROMPTS} prompts`)
+  if (out.reduce((sum, text) => sum + text.length, 0) > MAX_PROMPTS_TOTAL_LENGTH) {
+    throw new VmTestScheduleError(`prompts must total at most ${MAX_PROMPTS_TOTAL_LENGTH} characters`)
+  }
+  return out
+}
+
+function storedPrompts(raw) {
+  const list = Array.isArray(raw.prompts) ? raw.prompts.filter((p) => typeof p === 'string' && p.trim()) : []
+  const prompt = String(raw.prompt || '')
+  if (!list.length) return prompt ? [prompt] : []
+  return list[0] === prompt ? list : [prompt, ...list.filter((p) => p !== prompt)].filter(Boolean)
+}
+
+function sameTiming(a, b) {
+  if (!a || !b || a.parse_error || b.parse_error) return false
+  return (
+    a.frequency === b.frequency &&
+    a.time === b.time &&
+    a.timezone === b.timezone &&
+    a.interval_minutes === b.interval_minutes &&
+    a.jitter_min_minutes === b.jitter_min_minutes &&
+    a.jitter_max_minutes === b.jitter_max_minutes
+  )
+}
+
+function futureIso(value, now) {
+  const at = typeof value === 'string' ? Date.parse(value) : Number.NaN
+  return Number.isFinite(at) && at > now ? new Date(at).toISOString() : null
+}
+
+/** First run of an interval plan: the next `time` in its timezone. */
+function firstIntervalRun(structure, now) {
+  const probe = new Cron(compileStructuredSchedule(structure), {
+    timezone: structure.timezone,
+    mode: '5-part',
+    paused: true,
+  })
+  try {
+    const next = probe.nextRun(new Date(now))
+    return next ? next.toISOString() : null
+  } finally {
+    probe.stop()
+  }
+}
+
+/** Timer-driven job for interval plans; same surface as the croner jobs the runner keeps. */
+class IntervalJob {
+  constructor(at, fire, now) {
+    this.at = at
+    this.fire = fire
+    this.now = now
+    this.timer = null
+    this._arm()
+  }
+
+  _arm() {
+    const delay = Math.max(0, this.at - this.now())
+    const step = Math.min(delay, MAX_TIMER_MS)
+    this.timer = setTimeout(() => {
+      this.timer = null
+      if (step < delay) return this._arm()
+      // Same as croner's `catch: true`: a failed run must not take the gateway down.
+      try {
+        Promise.resolve(this.fire()).catch(() => {})
+      } catch {}
+    }, step)
+    this.timer.unref?.()
+  }
+
+  nextRun() {
+    return new Date(this.at)
+  }
+
+  trigger() {
+    return this.fire()
+  }
+
+  stop() {
+    if (this.timer) clearTimeout(this.timer)
+    this.timer = null
   }
 }
 
@@ -257,6 +396,7 @@ function normalizeSyncTest(test, structure) {
       ...structure,
       model: test.model,
       prompt: test.prompt,
+      prompts: test.prompts,
       max_tokens: test.max_tokens ?? null,
       reasoning_effort: test.reasoning_effort ?? null,
     },
@@ -268,9 +408,20 @@ function normalizeSyncTest(test, structure) {
     dialog: {
       model: config.model,
       prompt: config.prompt,
+      prompts: config.prompts,
       max_tokens: config.max_tokens,
       reasoning_effort: config.reasoning_effort,
     },
+  }
+}
+
+function previousDialog(previous) {
+  return {
+    model: previous.model,
+    prompt: previous.prompt,
+    prompts: storedPrompts(previous),
+    max_tokens: previous.max_tokens ?? null,
+    reasoning_effort: previous.reasoning_effort ?? null,
   }
 }
 
@@ -313,6 +464,9 @@ function structureFromStored(raw, vm) {
         minute: raw.minute,
         time: raw.time,
         weekdays: raw.weekdays,
+        interval_minutes: raw.interval_minutes,
+        jitter_min_minutes: raw.jitter_min_minutes,
+        jitter_max_minutes: raw.jitter_max_minutes,
         timezone: raw.timezone,
       })
     } catch {
@@ -345,12 +499,14 @@ export class VmTestScheduleRunner {
     runTest,
     list = () => listVms(projectRoot),
     now = () => Date.now(),
+    random = Math.random,
   } = {}) {
     this.projectRoot = projectRoot
     this.settingsFactory = typeof settings === 'function' ? settings : () => settings
     this.runTest = runTest
     this.listVms = list
     this.now = now
+    this.random = random
     this.jobs = new Map()
     this.running = new Set()
     this.started = false
@@ -384,9 +540,11 @@ export class VmTestScheduleRunner {
         cron,
         model: String(raw.model || ''),
         prompt: String(raw.prompt || ''),
+        prompts: storedPrompts(raw),
         max_tokens: raw.max_tokens ?? null,
         reasoning_effort: raw.reasoning_effort ?? null,
         ...savedResult(raw),
+        ...(structure.frequency === 'interval' ? { next_run_at: nullableIso(raw.next_run_at) } : {}),
         revision: String(raw.revision || ''),
       }
     } catch {
@@ -418,6 +576,10 @@ export class VmTestScheduleRunner {
 
   _nextRun(schedule, job = this.jobs.get(schedule.vm_id)) {
     if (!schedule.enabled) return null
+    if (schedule.frequency === 'interval') {
+      const next = job?.nextRun?.()
+      return next instanceof Date && Number.isFinite(next.getTime()) ? next.toISOString() : schedule.next_run_at || null
+    }
     let next = null
     try {
       next = job?.nextRun?.() || null
@@ -443,6 +605,7 @@ export class VmTestScheduleRunner {
         enabled: raw.enabled === true,
         model: String(raw.model || ''),
         prompt: String(raw.prompt || ''),
+        prompts: storedPrompts(raw),
         max_tokens: raw.max_tokens ?? null,
         reasoning_effort: raw.reasoning_effort ?? null,
         last_run_at: nullableIso(raw.last_run_at),
@@ -478,9 +641,24 @@ export class VmTestScheduleRunner {
     if (!vm) throw new VmTestScheduleError('vm not found', 'vm_not_found', 404)
     const previous = this._settings().get(keyFor(vmId)) || {}
     const config = normalizeVmTestSchedule(input, vm)
-    this._settings().set(keyFor(vmId), { ...config, ...savedResult(previous), revision: randomUUID() })
-    if (this.started) this._syncJob(vmId, config)
+    this._write(vmId, config, previous)
     return this.get(vmId)
+  }
+
+  /**
+   * Store a normalized plan, keep the last result, and re-arm its job. An interval plan keeps
+   * its pending next run while the timing is unchanged; otherwise it restarts from `time`.
+   */
+  _write(vmId, config, previous = {}) {
+    const row = { ...config, ...savedResult(previous), revision: randomUUID() }
+    if (config.frequency === 'interval') {
+      const now = this.now()
+      const kept = sameTiming(structureFromStored(previous), config) ? futureIso(previous.next_run_at, now) : null
+      row.next_run_at = kept || firstIntervalRun(config, now)
+    }
+    this._settings().set(keyFor(vmId), row)
+    if (this.started) this._syncJob(vmId, row)
+    return row
   }
 
   applyScheduleStructure(vmId, structure, { preserveDialog = true } = {}) {
@@ -493,12 +671,7 @@ export class VmTestScheduleRunner {
     const previous = this._settings().get(keyFor(vmId)) || {}
     let dialog
     if (preserveDialog && previous.model && previous.prompt) {
-      dialog = {
-        model: previous.model,
-        prompt: previous.prompt,
-        max_tokens: previous.max_tokens ?? null,
-        reasoning_effort: previous.reasoning_effort ?? null,
-      }
+      dialog = previousDialog(previous)
     } else {
       dialog = defaultDialogParams(vm)
     }
@@ -511,13 +684,7 @@ export class VmTestScheduleRunner {
       },
       vm,
     )
-    this._settings().set(keyFor(vmId), {
-      ...config,
-      enabled,
-      ...savedResult(previous),
-      revision: randomUUID(),
-    })
-    if (this.started) this._syncJob(vmId, config)
+    this._write(vmId, config, previous)
     return this.get(vmId)
   }
 
@@ -571,17 +738,10 @@ export class VmTestScheduleRunner {
     const previous = this._settings().get(keyFor(vmId)) || {}
     let dialog
     if (isCodexVm(vm) === full.codex) dialog = full.dialog
-    else if (previous.model && previous.prompt) {
-      dialog = {
-        model: previous.model,
-        prompt: previous.prompt,
-        max_tokens: previous.max_tokens ?? null,
-        reasoning_effort: previous.reasoning_effort ?? null,
-      }
-    } else dialog = defaultDialogParams(vm)
+    else if (previous.model && previous.prompt) dialog = previousDialog(previous)
+    else dialog = defaultDialogParams(vm)
     const config = normalizeVmTestSchedule({ enabled: full.enabled, ...structure, ...dialog }, vm)
-    this._settings().set(keyFor(vmId), { ...config, ...savedResult(previous), revision: randomUUID() })
-    if (this.started) this._syncJob(vmId, config)
+    this._write(vmId, config, previous)
   }
 
   remove(vmId) {
@@ -615,18 +775,62 @@ export class VmTestScheduleRunner {
         continue
       }
       const schedule = this._stored(vmId)
-      if (schedule?.enabled) this._syncJob(vmId, schedule)
+      if (!schedule?.enabled) continue
+      if (schedule.frequency === 'interval') schedule.next_run_at = this._restoreIntervalNext(vmId, schedule)
+      this._syncJob(vmId, schedule)
     }
+  }
+
+  /**
+   * After a restart an interval plan keeps its stored next run. A run missed while the
+   * gateway was down is not caught up: it moves forward by whole intervals instead.
+   */
+  _restoreIntervalNext(vmId, schedule) {
+    const now = this.now()
+    const stored = Date.parse(schedule.next_run_at || '')
+    let next
+    if (!Number.isFinite(stored)) next = Date.parse(firstIntervalRun(schedule, now))
+    else if (stored > now) return new Date(stored).toISOString()
+    else {
+      const step = schedule.interval_minutes * 60_000
+      next = stored + Math.ceil((now - stored + 1) / step) * step
+    }
+    const iso = new Date(next).toISOString()
+    const raw = this._settings().get(keyFor(vmId))
+    if (raw) this._settings().set(keyFor(vmId), { ...raw, next_run_at: iso })
+    return iso
   }
 
   _syncJob(vmId, schedule) {
     this.jobs.get(vmId)?.stop()
     this.jobs.delete(vmId)
     if (!this.started || !schedule.enabled || !this._vm(vmId)) return
+    if (schedule.frequency === 'interval') {
+      const at = Date.parse(schedule.next_run_at || '')
+      if (!Number.isFinite(at)) return
+      this.jobs.set(vmId, new IntervalJob(at, () => this._fireInterval(vmId), this.now))
+      return
+    }
     const job = new Cron(schedule.cron, { timezone: schedule.timezone, mode: '5-part', catch: true, unref: true }, () =>
       this._run(vmId),
     )
     this.jobs.set(vmId, job)
+  }
+
+  /** Book the next run (this actual run + interval + fresh random delay) before running this one. */
+  _fireInterval(vmId) {
+    if (!this.started) return
+    const raw = this._settings().get(keyFor(vmId))
+    const schedule = this._stored(vmId)
+    if (!raw || !schedule?.enabled || schedule.frequency !== 'interval') return
+    const firedAt = this.now()
+    const lo = schedule.jitter_min_minutes * 60_000
+    const hi = schedule.jitter_max_minutes * 60_000
+    const delay = lo + Math.floor(this.random() * (hi - lo + 1))
+    const next = new Date(firedAt + schedule.interval_minutes * 60_000 + delay).toISOString()
+    this._settings().set(keyFor(vmId), { ...raw, next_run_at: next })
+    this._syncJob(vmId, { ...schedule, next_run_at: next })
+    return this._run(vmId)
   }
 
   async _run(vmId) {
@@ -641,9 +845,10 @@ export class VmTestScheduleRunner {
     const startedAt = this.now()
     let result
     try {
+      const prompts = schedule.prompts.length ? schedule.prompts : [schedule.prompt]
       result = await this.runTest(vmId, {
         model: schedule.model,
-        prompt: schedule.prompt,
+        prompt: prompts[Math.min(prompts.length - 1, Math.floor(this.random() * prompts.length))],
         max_tokens: schedule.max_tokens,
         reasoning_effort: schedule.reasoning_effort,
       })
