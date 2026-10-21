@@ -6,7 +6,12 @@
  * Results land in settings `model_catalog_sync` so the models page can show them.
  */
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 import { RuntimeSettings as SettingsRepo } from '../db/settings-state.mjs'
+import { SettingsRepo as PersistentSettingsRepo } from '../db/repos/settings-repo.mjs'
+import { RoutingConfigRepo } from '../db/repos/routing-config-repo.mjs'
+import { backgroundTasksFor } from '../core/shared-background-tasks.mjs'
+import { SharedVmOperations } from '../vm/shared-vm-operations.mjs'
 import { runSlotOauth } from '../transport/slot-oauth.mjs'
 import { getVm, listVms, vmHasClaudeCredential } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
@@ -33,10 +38,25 @@ export function readCatalogSync() {
 }
 
 async function writeCatalogSync(platform, status) {
-  const repo = new SettingsRepo()
-  const cur = repo.get(CATALOG_SYNC_KEY, null) || { claude: null, codex: null }
-  await repo.set(CATALOG_SYNC_KEY, { ...cur, [platform]: status })
+  await new PersistentSettingsRepo().update(CATALOG_SYNC_KEY, (current) => ({
+    ...(current || { claude: null, codex: null }),
+    [platform]: status,
+  }))
   return status
+}
+
+async function runCatalogTask(tasks, platform, scheduled, callback) {
+  if (!tasks) return callback()
+  const plan = scheduled
+    ? { taskKey: `catalog:${platform}`, intervalMs: UPSTREAM_EVERY_MS }
+    : { taskKey: `catalog:${platform}`, executionId: randomUUID() }
+  const result = await tasks.run(plan, async () => {
+    const value = await callback()
+    return { terminal: value?.executionUncertain !== true, value, sharedResult: value }
+  })
+  return result.ran
+    ? result.value
+    : result.sharedResult || { ok: false, status: 'skipped', error: result.code, added: [] }
 }
 
 function syncStatus(status, { added = [], error = null } = {}) {
@@ -52,7 +72,14 @@ function claudeCatalogTargets(projectRoot) {
 }
 
 /** Live Claude catalog → model_policy. */
-export async function syncClaudeCatalog({ projectRoot, runOauth = runSlotOauth } = {}) {
+export async function syncClaudeCatalog({ projectRoot, runOauth = runSlotOauth, sharedTasks, scheduled = false } = {}) {
+  const tasks = backgroundTasksFor(sharedTasks)
+  return runCatalogTask(tasks, 'claude', scheduled, () =>
+    syncClaudeCatalogOnce({ projectRoot, runOauth, mutations: tasks ? new SharedVmOperations(tasks.db) : null }),
+  )
+}
+
+async function syncClaudeCatalogOnce({ projectRoot, runOauth, mutations }) {
   const targets = claudeCatalogTargets(projectRoot)
   if (!targets.length) return await writeCatalogSync('claude', syncStatus('skipped', { error: 'no_claude_slot' }))
   const ids = new Set()
@@ -60,8 +87,36 @@ export async function syncClaudeCatalog({ projectRoot, runOauth = runSlotOauth }
   let lastError = null
   for (const vm of targets) {
     if (successes >= CLAUDE_ACCOUNTS_PER_SYNC) break
-    const exec = { vmId: vm.id, homeDir: path.join(projectRoot, 'vms', vm.id, 'cli-home'), oauth: vm.claude, vm }
-    const res = await runOauth(exec, 'models', { timeoutMs: 30_000 })
+    let res
+    const read = async () => {
+      const current = getVm(projectRoot, vm.id) || vm
+      const exec = {
+        vmId: current.id,
+        homeDir: path.join(projectRoot, 'vms', current.id, 'cli-home'),
+        oauth: current.claude,
+        vm: current,
+      }
+      const result = await runOauth(exec, 'models', { timeoutMs: 30_000 })
+      return result && { ...result, vmOperationUncertain: result.transportError === true }
+    }
+    try {
+      res = mutations ? await mutations.run(vm.id, read, { kind: 'claude_catalog' }) : await read()
+    } catch (error) {
+      if (!['vm_operation_active', 'vm_execution_active'].includes(error.code)) throw error
+      lastError = error.code
+      continue
+    }
+    if (res?.transportError || (!res && process.env.KIN_CRS_MOCK !== '1')) {
+      return {
+        ...(await writeCatalogSync(
+          'claude',
+          syncStatus('error', {
+            error: res?.body?.error?.code || 'models_execution_unknown',
+          }),
+        )),
+        executionUncertain: true,
+      }
+    }
     const list = Array.isArray(res?.body?.data) ? res.body.data : null
     if (!res?.ok || !list) {
       lastError = res?.body?.error?.code || `http_${res?.status || 0}`
@@ -79,8 +134,34 @@ export async function syncClaudeCatalog({ projectRoot, runOauth = runSlotOauth }
 }
 
 /** Live ChatGPT Codex catalog → gpt_model_policy. Timers never rotate OAuth; the panel button may. */
-export async function syncGptCatalog({ projectRoot, vmId = '', catalogClientVersion = 'auto', rotate = false } = {}) {
-  const result = await syncCodexCatalog({ projectRoot, vmId, rotate, catalogClientVersion })
+export async function syncGptCatalog({
+  projectRoot,
+  vmId = '',
+  catalogClientVersion = 'auto',
+  rotate = false,
+  sharedTasks,
+  scheduled = false,
+} = {}) {
+  const tasks = backgroundTasksFor(sharedTasks)
+  return runCatalogTask(tasks, 'codex', scheduled, async () => {
+    if (tasks && scheduled) {
+      const routing = await new RoutingConfigRepo(tasks.db).get()
+      if (!routing)
+        throw Object.assign(new Error('shared routing configuration missing'), { code: 'routing_config_unavailable' })
+      catalogClientVersion = routing.config.codex?.catalog_client_version || 'auto'
+    }
+    return syncGptCatalogOnce({
+      projectRoot,
+      vmId,
+      catalogClientVersion,
+      rotate,
+      mutations: tasks ? new SharedVmOperations(tasks.db) : undefined,
+    })
+  })
+}
+
+async function syncGptCatalogOnce({ projectRoot, vmId, catalogClientVersion, rotate, mutations }) {
+  const result = await syncCodexCatalog({ projectRoot, vmId, rotate, catalogClientVersion, operations: mutations })
   if (!result.ok) {
     const skipped = result.error === 'no_codex_slot' || result.error === 'proxy_required'
     await writeCatalogSync('codex', syncStatus(skipped ? 'skipped' : 'error', { error: result.error }))
@@ -93,7 +174,13 @@ export async function syncGptCatalog({ projectRoot, vmId = '', catalogClientVers
 /**
  * @param {{ projectRoot: string, codexCatalogVersion?: () => string, log?: (event: object) => void }} opts
  */
-export function createCatalogMonitor({ projectRoot, codexCatalogVersion = () => 'auto', log = () => {} } = {}) {
+export function createCatalogMonitor({
+  projectRoot,
+  codexCatalogVersion = () => 'auto',
+  log = () => {},
+  sharedTasks,
+} = {}) {
+  const tasks = backgroundTasksFor(sharedTasks)
   const timers = []
   let running = false
   const pending = new Set()
@@ -110,10 +197,15 @@ export function createCatalogMonitor({ projectRoot, codexCatalogVersion = () => 
       pending.delete(operation)
     }
   }
-  const modelsDev = guard('models.dev', async () => await syncModelsDev())
+  const modelsDev = guard('models.dev', async () => await syncModelsDev({ sharedTasks: tasks, scheduled: true }))
   const upstream = guard('upstream', async () => {
-    const claude = await syncClaudeCatalog({ projectRoot })
-    await syncGptCatalog({ projectRoot, catalogClientVersion: codexCatalogVersion() })
+    const claude = await syncClaudeCatalog({ projectRoot, sharedTasks: tasks, scheduled: true })
+    await syncGptCatalog({
+      projectRoot,
+      catalogClientVersion: codexCatalogVersion(),
+      sharedTasks: tasks,
+      scheduled: true,
+    })
     return claude
   })
 

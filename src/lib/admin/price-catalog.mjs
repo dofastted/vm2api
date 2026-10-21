@@ -3,6 +3,9 @@
  * ID matching is exact / alias / Claude date-strip — no fuzzy family regex.
  */
 import { RuntimeSettings as SettingsRepo } from '../db/settings-state.mjs'
+import { SettingsRepo as PersistentSettingsRepo } from '../db/repos/settings-repo.mjs'
+import { backgroundTasksFor } from '../core/shared-background-tasks.mjs'
+import { randomUUID } from 'node:crypto'
 import { BUILTIN_ALIASES, BUILTIN_RATES, BUILTIN_SOURCE } from './builtin-rates.mjs'
 
 export const PRICE_FIELDS = ['input', 'output', 'cache_read', 'cache_5m', 'cache_1h']
@@ -301,8 +304,13 @@ async function persistOverrides(next) {
   await settingsRepo().set(SETTINGS_OVERRIDES, next)
 }
 
-async function persistSnapshot(next) {
-  await settingsRepo().set(SETTINGS_SNAPSHOT, next)
+async function persistSnapshot(change) {
+  if (injectedSettings) {
+    const value = change(readSnapshot())
+    await settingsRepo().set(SETTINGS_SNAPSHOT, value)
+    return value
+  }
+  return new PersistentSettingsRepo().update(SETTINGS_SNAPSHOT, change)
 }
 
 function statusOf(snap) {
@@ -345,9 +353,29 @@ async function readCappedBody(res, maxBytes) {
   return text
 }
 
-export async function syncModelsDev({ fetchImpl } = {}) {
-  const prev = readSnapshot() || {}
+export async function syncModelsDev({ fetchImpl, sharedTasks, scheduled = false } = {}) {
+  const tasks = backgroundTasksFor(sharedTasks)
+  if (!tasks) return syncModelsDevOnce({ fetchImpl })
+  const plan = scheduled
+    ? { taskKey: 'catalog:models.dev', intervalMs: MODELS_DEV_STALE_MS }
+    : { taskKey: 'catalog:models.dev', executionId: randomUUID() }
+  const result = await tasks.run(plan, async () => {
+    if (scheduled) {
+      const current = await new PersistentSettingsRepo(tasks.db).get(SETTINGS_SNAPSHOT)
+      if (current?.fetched_at && (await tasks.now()) - Date.parse(current.fetched_at) < MODELS_DEV_STALE_MS) {
+        return { terminal: true, value: statusOf(current), sharedResult: statusOf(current) }
+      }
+    }
+    const value = await syncModelsDevOnce({ fetchImpl })
+    return { terminal: true, value, sharedResult: value }
+  })
+  return result.ran ? result.value : result.sharedResult || { status: 'skipped', error: result.code }
+}
+
+async function syncModelsDevOnce({ fetchImpl }) {
   const fetchFn = fetchImpl || injectedFetch || globalThis.fetch
+  let parsed
+  let error
   try {
     if (typeof fetchFn !== 'function') throw new Error('fetch is not available')
     const res = await fetchFn(MODELS_DEV_URL, { signal: AbortSignal.timeout(MODELS_DEV_TIMEOUT_MS) })
@@ -359,29 +387,29 @@ export async function syncModelsDev({ fetchImpl } = {}) {
     } catch {
       throw new Error('models.dev invalid JSON')
     }
-    const parsed = parseModelsDev(json)
-    const snap = {
-      fetched_at: new Date().toISOString(),
-      status: 'ok',
-      error: null,
-      anthropic: parsed.anthropic,
-      openai: parsed.openai,
-    }
-    await persistSnapshot(snap)
-    invalidatePriceCatalog()
-    return statusOf(snap)
+    parsed = parseModelsDev(json)
   } catch (e) {
-    const snap = {
-      fetched_at: prev.fetched_at || null,
-      status: 'error',
-      error: String(e?.message || e),
-      anthropic: prev.anthropic || {},
-      openai: prev.openai || {},
-    }
-    await persistSnapshot(snap)
-    invalidatePriceCatalog()
-    return statusOf(snap)
+    error = String(e?.message || e)
   }
+  const snap = await persistSnapshot((prev) =>
+    error
+      ? {
+          fetched_at: prev?.fetched_at || null,
+          status: 'error',
+          error,
+          anthropic: prev?.anthropic || {},
+          openai: prev?.openai || {},
+        }
+      : {
+          fetched_at: new Date().toISOString(),
+          status: 'ok',
+          error: null,
+          anthropic: parsed.anthropic,
+          openai: parsed.openai,
+        },
+  )
+  invalidatePriceCatalog()
+  return statusOf(snap)
 }
 
 function canPersist() {
@@ -403,8 +431,8 @@ export function maybeRefreshModelsDev({ now } = {}) {
   const t = now ?? Date.now()
   if (fetchedAt && Number.isFinite(fetchedAt) && t - fetchedAt < MODELS_DEV_STALE_MS) return
   refreshInflight = Promise.resolve()
-    .then(async () => await syncModelsDev())
-    .catch(() => {})
+    .then(async () => await syncModelsDev({ scheduled: true }))
+    .catch((error) => console.warn('[models.dev] background refresh failed:', error.code || error.message))
     .finally(() => {
       refreshInflight = null
     })

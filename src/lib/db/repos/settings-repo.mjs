@@ -3,7 +3,7 @@
  * Used for: legacy_import_done, backup_schedule, proxy_pool_config, active_vm …
  */
 
-import { getDb } from '../database.mjs'
+import { getDb, withTransaction } from '../database.mjs'
 
 const cacheRevisions = new WeakMap()
 
@@ -45,6 +45,20 @@ export class SettingsRepo {
       this.db.settingsState?.set(key, value)
     })
     return value
+  }
+
+  /** Merge one settings document against its committed value, including first creation. */
+  async update(key, change, fallback = null) {
+    return withTransaction(this.db, async () => {
+      await this.db
+        .prepare(`INSERT INTO settings(key,value,updated_at) VALUES ($1,$2,$3)
+        ON CONFLICT(key) DO NOTHING`)
+        .run(key, JSON.stringify(fallback), new Date().toISOString())
+      const row = await this.db.prepare('SELECT value FROM settings WHERE key=$1 FOR UPDATE').get(key)
+      const value = change(JSON.parse(row.value))
+      await this.set(key, value)
+      return value
+    })
   }
 
   async has(key) {

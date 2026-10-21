@@ -9,6 +9,8 @@
  */
 
 import { RuntimeSettings as SettingsRepo } from '../db/settings-state.mjs'
+import { getDb } from '../db/database.mjs'
+import { SettingsRepo as PersistentSettingsRepo } from '../db/repos/settings-repo.mjs'
 import {
   CONTEXT_1M_BETA,
   DEFAULT_CONTEXT_1M_WHITELIST,
@@ -636,27 +638,27 @@ export function getModelPolicy() {
 }
 
 export async function saveModelPolicy(next) {
-  policy = normalizePolicy(next)
-  policy.updated_at = new Date().toISOString()
-  policy.source = 'panel'
-  try {
-    const repo = new SettingsRepo()
-    await repo.set(SETTINGS_KEY, policy)
-  } catch (e) {
-    console.warn('[model-policy] persist failed', e?.message || e)
-  }
-  loaded = true
-  return policy
+  const saved = normalizePolicy(next)
+  saved.updated_at = new Date().toISOString()
+  saved.source = 'panel'
+  const db = getDb()
+  await new PersistentSettingsRepo(db).set(SETTINGS_KEY, saved)
+  db.afterCommit(() => {
+    policy = saved
+    loaded = true
+  })
+  return saved
 }
 
 export async function resetModelPolicy() {
-  policy = seedDefaultPolicy()
-  try {
-    const repo = new SettingsRepo()
-    await repo.set(SETTINGS_KEY, policy)
-  } catch {}
-  loaded = true
-  return policy
+  const saved = seedDefaultPolicy()
+  const db = getDb()
+  await new PersistentSettingsRepo(db).set(SETTINGS_KEY, saved)
+  db.afterCommit(() => {
+    policy = saved
+    loaded = true
+  })
+  return saved
 }
 
 export function resolvePolicyModelId(raw = '') {
@@ -981,46 +983,52 @@ export function listPolicyModels() {
  * `displayNameOf(id)` may supply a display name (models.dev) for new entries.
  */
 export async function syncWorkerModelsIntoPolicy(workerIds = [], { displayNameOf = null } = {}) {
+  const db = getDb()
   const added = []
-  const enabled = policy.catalog_mode === 'worker_only'
-  for (const workerId of workerIds || []) {
-    const id = workerId === FABLE_51_LEGACY_ID ? FABLE_51_ID : workerId === OPUS_55_LEGACY_ID ? OPUS_55_ID : workerId
-    if (!id || !isCatalogModelId(id)) continue
-    if (/^gpt/i.test(id)) continue
-    if (policy.models[id]) continue
-    const family = familyOfModelId(id)
-    const caps = heuristicCapabilities(id)
-    policy.models[id] = entry({
-      id,
-      display_name: displayNameOf?.(id) || id,
-      family,
-      capabilities: caps,
-      betas: family === 'codex' ? { required: [], drop: [CONTEXT_1M], pass_context_1m: false } : undefined,
-      params:
-        family === 'codex'
-          ? {
-              max_tokens_default: 16384,
-              max_tokens_cap: 128000,
-              on_adaptive: 'passthrough',
-              on_enabled: 'passthrough',
-            }
-          : {
-              on_adaptive: caps.supports_adaptive ? 'passthrough' : 'convert_to_enabled',
-              on_enabled: 'passthrough',
-            },
-    })
-    policy.models[id].enabled = enabled
-    // pass_context_1m left unset → inherit defaults.context_1m_whitelist
-    added.push(id)
-  }
-  if (added.length) {
-    policy.updated_at = new Date().toISOString()
-    policy.source = 'worker_merge'
-    try {
-      await new SettingsRepo().set(SETTINGS_KEY, policy)
-    } catch {}
-  }
-  return { policy, added }
+  const next = await new PersistentSettingsRepo(db).update(SETTINGS_KEY, (current) => {
+    const next = normalizePolicy(current || seedDefaultPolicy())
+    const enabled = next.catalog_mode === 'worker_only'
+    for (const workerId of workerIds || []) {
+      const id = workerId === FABLE_51_LEGACY_ID ? FABLE_51_ID : workerId === OPUS_55_LEGACY_ID ? OPUS_55_ID : workerId
+      if (!id || !isCatalogModelId(id)) continue
+      if (/^gpt/i.test(id)) continue
+      if (next.models[id]) continue
+      const family = familyOfModelId(id)
+      const caps = heuristicCapabilities(id)
+      next.models[id] = entry({
+        id,
+        display_name: displayNameOf?.(id) || id,
+        family,
+        capabilities: caps,
+        betas: family === 'codex' ? { required: [], drop: [CONTEXT_1M], pass_context_1m: false } : undefined,
+        params:
+          family === 'codex'
+            ? {
+                max_tokens_default: 16384,
+                max_tokens_cap: 128000,
+                on_adaptive: 'passthrough',
+                on_enabled: 'passthrough',
+              }
+            : {
+                on_adaptive: caps.supports_adaptive ? 'passthrough' : 'convert_to_enabled',
+                on_enabled: 'passthrough',
+              },
+      })
+      next.models[id].enabled = enabled
+      // pass_context_1m left unset → inherit defaults.context_1m_whitelist
+      added.push(id)
+    }
+    if (added.length) {
+      next.updated_at = new Date().toISOString()
+      next.source = 'worker_merge'
+    }
+    return next
+  })
+  db.afterCommit(() => {
+    policy = next
+    loaded = true
+  })
+  return { policy: next, added }
 }
 
 /** Last-resort fill when the model has no policy default. Probe / short tests use this. */

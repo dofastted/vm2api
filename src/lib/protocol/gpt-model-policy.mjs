@@ -3,6 +3,8 @@
  * Live ids from ChatGPT sync; seed is empty-catalog fallback.
  */
 import { RuntimeSettings as SettingsRepo } from '../db/settings-state.mjs'
+import { getDb } from '../db/database.mjs'
+import { SettingsRepo as PersistentSettingsRepo } from '../db/repos/settings-repo.mjs'
 import { isGptSeriesId, isSyncableGptCatalogId } from './gpt-ids.mjs'
 
 const SETTINGS_KEY = 'gpt_model_policy'
@@ -56,12 +58,13 @@ export function seedGptPolicy() {
 let policy = seedGptPolicy()
 let loaded = false
 
-async function persist() {
-  try {
-    await new SettingsRepo().set(SETTINGS_KEY, policy)
-  } catch (e) {
-    console.warn('[gpt-model-policy] persist failed', e?.message || e)
-  }
+async function persist(next = policy) {
+  const db = getDb()
+  await new PersistentSettingsRepo(db).set(SETTINGS_KEY, next)
+  db.afterCommit(() => {
+    policy = next
+    loaded = true
+  })
 }
 
 function normalizeGptPolicy(stored) {
@@ -111,7 +114,7 @@ export async function saveGptModelPolicy(next) {
       models[id] = { ...models[id], ...row, id, family: 'codex' }
     }
   }
-  policy = {
+  const saved = {
     ...seed,
     ...next,
     models,
@@ -119,8 +122,8 @@ export async function saveGptModelPolicy(next) {
     updated_at: new Date().toISOString(),
     source: 'panel',
   }
-  await persist()
-  return policy
+  await persist(saved)
+  return saved
 }
 export function listGptPolicyModels() {
   return Object.entries(policy.models || {})
@@ -144,10 +147,9 @@ export function isGptModelEnabled(id) {
 }
 
 export async function resetGptModelPolicy() {
-  policy = seedGptPolicy()
-  loaded = true
-  await persist()
-  return policy
+  const saved = seedGptPolicy()
+  await persist(saved)
+  return saved
 }
 
 /**
@@ -170,30 +172,33 @@ export async function syncGptIdsIntoPolicy(ids = [], { displayNameOf = null } = 
   if (!live.length) {
     return { ok: true, synced: 0, added: [], ids: listGptPolicyModels().map((m) => m.id) }
   }
-  const next = {}
+  const db = getDb()
   const added = []
-  for (const row of live) {
-    const prev = policy.models[row.id]
-    if (!prev) added.push(row.id)
-    next[row.id] = entry(row.id, {
-      ...prev,
-      display_name: row.display_name || prev?.display_name || displayNameOf?.(row.id) || row.id,
-      enabled: prev ? prev.enabled !== false : false,
-      source: 'codex',
-    })
-  }
-  policy = {
-    ...policy,
-    models: next,
-    platform: 'openai',
-    updated_at: new Date().toISOString(),
-    source: 'codex',
-  }
-  await persist()
+  const saved = await new PersistentSettingsRepo(db).update(SETTINGS_KEY, (current) => {
+    const previous = normalizeGptPolicy(current) || seedGptPolicy()
+    const models = {}
+    for (const row of live) {
+      const prev = previous.models[row.id]
+      if (!prev) added.push(row.id)
+      models[row.id] = entry(row.id, {
+        ...prev,
+        display_name: row.display_name || prev?.display_name || displayNameOf?.(row.id) || row.id,
+        enabled: prev ? prev.enabled !== false : false,
+        source: 'codex',
+      })
+    }
+    return { ...previous, models, platform: 'openai', updated_at: new Date().toISOString(), source: 'codex' }
+  })
+  db.afterCommit(() => {
+    policy = saved
+    loaded = true
+  })
   return {
     ok: true,
     synced: live.length,
     added,
-    ids: listGptPolicyModels().map((m) => m.id),
+    ids: Object.values(saved.models)
+      .filter((row) => row.enabled !== false)
+      .map((row) => row.id),
   }
 }
