@@ -1,0 +1,12 @@
+{
+  "nodes": {
+    "node-01": {
+      "address": "192.0.2.10",
+      "port": 18443,
+      "token": "REPLACE_WITH_EXISTING_NODE_RUNTIME_TOKEN",
+      "certSha256": "REPLACE_WITH_PINNED_NODE_CERTIFICATE_SHA256",
+      "presetId": "claude-docker-v1",
+      "policyDigest": "REPLACE_WITH_APPROVED_NODE_POLICY_SHA256"
+    }
+  }
+}
