@@ -7,7 +7,9 @@ import http from 'node:http'
 import { EventEmitter } from 'node:events'
 import { setTimeout as delay } from 'node:timers/promises'
 import fetch from 'node-fetch'
-import { getDb } from '../../src/lib/db/database.mjs'
+import pg from 'pg'
+import { getDb, getActivityCoordinator, quoteIdentifier } from '../../src/lib/db/database.mjs'
+import { withDatabaseActivities } from '../maintenance-fixture.mjs'
 import { createRepositoryTestDatabase as createDatabase } from '../repository-database.mjs'
 import { handleCodexSearch } from '../../src/lib/protocol/handle-codex.mjs'
 import { SharedCodexRuntime } from '../../src/lib/pool/shared-codex-runtime.mjs'
@@ -86,7 +88,18 @@ async function fixture(t, handle = (_req, res) => answer(res), { vms = 1 } = {})
   t.after(async () => {
     server.closeAllConnections()
     await new Promise((resolve) => server.close(resolve))
+    const coordinators = [db, other].map((connection) => getActivityCoordinator(connection)).filter(Boolean)
+    for (const coordinator of coordinators) await coordinator.stop()
     await other.close()
+    if (coordinators.length) {
+      const client = new pg.Client({ connectionString: db.connectionString })
+      await client.connect()
+      try {
+        await client.query(`DROP SCHEMA IF EXISTS ${quoteIdentifier(coordinators[0].schema)} CASCADE`)
+      } finally {
+        await client.end()
+      }
+    }
     fs.rmSync(root, { recursive: true, force: true })
     if (previous == null) delete process.env.VM2API_CONTROL_PLANE_MODE
     else process.env.VM2API_CONTROL_PLANE_MODE = previous
@@ -246,25 +259,55 @@ for (const status of [401, 403]) {
   test(`Search completes its ${status} job before refresh and retries with a new persisted ID`, async (t) => {
     const fx = await fixture(t, (_req, res, count) => answer(res, count === 1 ? status : 200))
     let refreshes = 0
-    const result = await fx.run({
-      refresh: async () => {
-        refreshes += 1
-        const previous = await fx.other.prepare('SELECT * FROM execution_jobs').get()
-        assert.ok(previous?.ended_at, 'the first HTTP job must be durably complete before refresh/retry')
-        return { ok: true, access_token: 'synthetic-new-access', refresh_token: 'synthetic-new-refresh' }
-      },
+    await withDatabaseActivities([fx.db, fx.other], async () => {
+      const result = await fx.run({
+        refresh: async () => {
+          refreshes += 1
+          const previous = await fx.other.prepare('SELECT * FROM execution_jobs').get()
+          assert.ok(previous?.ended_at, 'the first HTTP job must be durably complete before refresh/retry')
+          return {
+            ok: true,
+            attemptFinished: true,
+            access_token: 'synthetic-new-access',
+            refresh_token: 'synthetic-new-refresh',
+          }
+        },
+      })
+      assert.equal(result.res.statusCode, 200)
+      assert.equal(refreshes, 1)
+      assert.equal(fx.calls.length, 2)
+      assert.ok(fx.bindings.every(Boolean))
+      assert.notEqual(fx.calls[0].headers['x-client-request-id'], fx.calls[1].headers['x-client-request-id'])
+      const jobs = await fx.other.prepare('SELECT * FROM execution_jobs').all()
+      assert.equal(jobs.length, 2)
+      assert.ok(jobs.every((job) => job.ended_at))
+      assert.equal((await fx.counts()).accountInflight, 0)
     })
-    assert.equal(result.res.statusCode, 200)
-    assert.equal(refreshes, 1)
-    assert.equal(fx.calls.length, 2)
-    assert.ok(fx.bindings.every(Boolean))
-    assert.notEqual(fx.calls[0].headers['x-client-request-id'], fx.calls[1].headers['x-client-request-id'])
-    const jobs = await fx.other.prepare('SELECT * FROM execution_jobs').all()
-    assert.equal(jobs.length, 2)
-    assert.ok(jobs.every((job) => job.ended_at))
-    assert.equal((await fx.counts()).accountInflight, 0)
   })
 }
+
+test('an uncertain Search token refresh retains its original admission and both refresh claims', async (t) => {
+  const fx = await fixture(t, (_req, res) => answer(res, 401))
+  await withDatabaseActivities([fx.db, fx.other], async () => {
+    let refreshes = 0
+    const result = await fx.run({
+      refresh: async () => {
+        refreshes++
+        return { ok: false, attemptFinished: false, error: 'fetch_failed' }
+      },
+    })
+    assert.equal(result.res.statusCode, 502)
+    assert.equal(refreshes, 1)
+    assert.equal(fx.calls.length, 1)
+    assert.equal((await fx.counts()).accountInflight, 1)
+    const operation = await fx.other.prepare('SELECT released_at,uncertain_at FROM vm_operations').get()
+    assert.equal(operation.released_at, null)
+    assert.ok(operation.uncertain_at)
+    const task = await fx.other.prepare('SELECT finished_at,unknown_at FROM background_task_runs').get()
+    assert.equal(task.finished_at, null)
+    assert.ok(task.unknown_at)
+  })
+})
 
 for (const phase of ['timeout', 'cancel']) {
   test(`Search ${phase} after response headers retains its job and capacity`, async (t) => {
