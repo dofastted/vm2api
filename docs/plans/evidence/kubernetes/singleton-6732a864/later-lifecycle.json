@@ -1,0 +1,69 @@
+{
+  "scope": "later source validation; none of these changes was included in the deployed 6732a864 image",
+  "directed_checks": [
+    {
+      "commit": "b32641b84aebb3f4beac656e09c59beee8c78270",
+      "scope": "kernel internal errors, existing payload cancellation, Claude/Codex shared capacity",
+      "totals": {
+        "tests": 228,
+        "pass": 228,
+        "fail": 0,
+        "skipped": 0,
+        "cancelled": 0
+      },
+      "log_sha256": "5256f142d405fd7dca2f71db408077d7d201dbcd8fb36ad19592479687347317"
+    },
+    {
+      "commit": "08998f406eb7a2bf7ac3512d4b20895879cc2829",
+      "scope": "API endpoint start/end hooks and PostgreSQL execution ledger",
+      "totals": {
+        "tests": 72,
+        "pass": 72,
+        "fail": 0,
+        "skipped": 0,
+        "cancelled": 0
+      },
+      "log_sha256": "d7e9fe905a756c78478e189c465bbf791d742a7b0e647bdec1f14a0c1082d827"
+    },
+    {
+      "commit": "bdda2026dca0ed5905c70514bc3fad94e727a53e",
+      "scope": "request activities connected to actual inference execution; fixed source archive",
+      "totals": {
+        "tests": 75,
+        "pass": 75,
+        "fail": 0,
+        "skipped": 0,
+        "cancelled": 0
+      },
+      "log_sha256": "1dead2fb600b3fff9db28469c887cb43e65ab1e3cdc4b7521bd1bf45f2bca6e0"
+    }
+  ],
+  "go_api_body_copy_fix": {
+    "commit": "e854273a5d7016c160a24237ef9aeac3df0cf988",
+    "change": "Abort the downstream HTTP response when io.Copy of an upstream body fails; Go package checks reported passing by task owner.",
+    "runtime_deployment_verified": false
+  },
+  "kernel_counterexample": {
+    "artifact": "kernel-cancel-counterexample.json",
+    "sha256": "7dc1df4660af181540d2e317f297db87109c1608f7e38ba7bd85eb7f18ac17b1",
+    "payload_sha256": {
+      "bin/kin-kernel": "8f1347ccffa6ac66d2a6625fded59ea2b9d46c3499f4f192d77cc0510a636a68",
+      "share/wrap-cli/cli-node": "b5054cb8494670354e61f3e0a0f7b2c3b768832c841140a4e22407fec24ab009"
+    },
+    "observation": "cancel returned 200/cancelled:true and the original request returned full HTTP 502 worker_error/provider_error client disconnected; aggregate ready_slots was still 1.",
+    "limitation": "ready_slots has no request ID or epoch and cannot prove an individual job ended.",
+    "before": {
+      "source_head": "f081b9798d72a45e762ef880af65dc2298c73654",
+      "test_changes_committed_as": "09166c4f",
+      "tests": 62,
+      "pass": 41,
+      "fail": 21,
+      "log_sha256": "dfe8c2240556f0f6a6f00138d26e5067db9d90b19fa4c31b0df5c3485be189db"
+    }
+  },
+  "remaining_limitations": [
+    "No independent per-job fencing or unknown-job recovery proof.",
+    "No deployment validation of later auth/background/API lifecycle changes.",
+    "Issue 648 remains incomplete; singleton deployment is not HA."
+  ]
+}

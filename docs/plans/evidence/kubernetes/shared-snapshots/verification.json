@@ -238,7 +238,7 @@
     "Full suites are not all passing; all 7 unit and 17 E2E error texts match comparison records.",
     "Later targeted checks are not a full-suite verification of later commits.",
     "Kubernetes control plane remains single active replica with exclusive guard.",
-    "No current container deployment, multi-node inference, executor fencing, or automatic orphan recovery was verified.",
+    "The 6732a864 image passed 12 singleton Kubernetes checks; later lifecycle changes, multi-node inference, executor fencing, and automatic orphan recovery were not deployment-verified.",
     "Background task coordination and one-time OAuth/ticket state are separate ongoing increments.",
     "VM files/credentials and global backup restore maintenance are not yet coordinated across all entry points.",
     "Remote VM/kernel routing projection is pending; configuration commit does not prove it was applied."
@@ -251,5 +251,7 @@
     "diff_check_exit_code": 0,
     "diff_base": "fb90450d06fd3aaaee8a0a4b52aca13d2f675431",
     "log_sha256": "6f4fbd68da9299121172e18f8c28ee6f3bbcd5d47b8586e291fd8966d084ed48"
-  }
+  },
+  "runtime_evidence": "../singleton-6732a864/verification.json",
+  "later_lifecycle_evidence": "../singleton-6732a864/later-lifecycle.json"
 }

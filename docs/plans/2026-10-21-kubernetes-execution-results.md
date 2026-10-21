@@ -39,7 +39,7 @@
 
 17 项 E2E 失败的断言文本与上一轮已核实基线记录相同，本轮未重新运行原始提交的整套 E2E。例如 Responses 实际返回 400 `protocol_not_allowed`，预期 200；classifier 的 thinking 实际多出 `display: summarized`。未将这些失败改成通过或跳过。
 
-结构化结果与日志摘要见 [验证元数据](evidence/kubernetes/execution-state/verification.json) 和 [原始 unit 复核](evidence/kubernetes/execution-state/baseline-unit-recheck.json)。上一轮原始 E2E 对照见 [既有基线记录](evidence/kubernetes/shared-state/baseline-e2e.json)。本轮没有重新部署容器，验证 SHA 仅标识被测试的源码。
+结构化结果与日志摘要见 [验证元数据](evidence/kubernetes/execution-state/verification.json) 和 [原始 unit 复核](evidence/kubernetes/execution-state/baseline-unit-recheck.json)。上一轮原始 E2E 对照见 [既有基线记录](evidence/kubernetes/shared-state/baseline-e2e.json)。`fb90450d` 检查点当时没有重新部署；后续 `6732a864` 已完成单实例镜像部署，范围见 [后续部署记录](2026-10-21-kubernetes-shared-snapshots-results.md)。
 
 ## 尚未完成
 
@@ -50,4 +50,4 @@
 - routing、VM/凭据文件共享归属、后台任务唯一执行、全局维护及备份恢复。
 - 两个不同 Kubernetes 节点上的活动副本、HPA、PodDisruptionBudget、滚动更新、缩容和故障接管。
 
-第一阶段镜像与 k3s 证据不覆盖本轮新增源码。本轮没有重新部署，不能用旧镜像 digest 证明当前代码生效。Draft PR #651 的远端分支更新仍等待用户确认 push。
+第一阶段镜像与 k3s 证据只覆盖当时源码。后续 `6732a864` 镜像通过单实例部署检查，但不包含再后的认证、后台任务和生命周期修正；不能用其 digest 证明这些新代码生效。Draft PR #651 的远端分支更新仍等待用户确认 push。

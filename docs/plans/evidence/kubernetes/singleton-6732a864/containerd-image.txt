@@ -1,0 +1,2 @@
+REF                                          TYPE                                       DIGEST                                                                  SIZE      PLATFORMS   LABELS                          
+docker.io/library/vm2api:kubernetes-6732a864 application/vnd.oci.image.manifest.v1+json sha256:db695e30d1ae3165bc88003f134584761db40dba09f1166e364b7dd9af683d05 260.2 MiB linux/amd64 io.cri-containerd.image=managed 
