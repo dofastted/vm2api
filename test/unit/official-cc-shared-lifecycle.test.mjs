@@ -135,6 +135,14 @@ test('a successful response with an unknown auxiliary operation retains ownershi
   assert.equal((await f.other.tryAcquire({ vmId: f.vm.id })).ok, false)
 })
 
+test('successful hello with an auxiliary profile timeout still retains ownership', async (t) => {
+  const f = await fixture(t)
+  await scheduleOfficialCcBootstrap(f.options)
+  f.finish({ ok: true, status: { profile_error: 'synthetic timeout', models_error: null } })
+  await f.tasks.flush()
+  assert.equal((await f.other.tryAcquire({ vmId: f.vm.id })).ok, false)
+})
+
 test('successful bootstrap keeps ownership until queued persistence has completed', async (t) => {
   const f = await fixture(t)
   let finishFlush
