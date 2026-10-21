@@ -248,3 +248,184 @@ test('API transport-error EOF retains a durable job and blocks independent Postg
   assert.equal(job.request_id, fx.jobs[0].request_id)
   assert.equal(job.ended_at, null)
 })
+
+test('API error headers alone do not invoke end before the complete body', async (t) => {
+  const entered = deferred()
+  const finish = deferred()
+  const fx = await fixture(t, async (_job, _req, res) => {
+    res.writeHead(429, { 'content-type': 'application/json' })
+    res.write('{"error":')
+    entered.resolve()
+    await finish.promise
+    res.end('{"type":"rate_limit_error"}}')
+  })
+  const ended = []
+  const pending = fx.run({ onExecutionEnd: (execution) => ended.push(execution) })
+  try {
+    await entered.promise
+    assert.equal(ended.length, 0)
+    finish.resolve()
+    assert.equal((await pending).execution.ended, true)
+    assert.equal(ended.length, 1)
+  } finally {
+    finish.resolve()
+    await pending
+  }
+})
+
+for (const clientStream of [false, true]) {
+  for (const terminal of [false, true]) {
+    test(`OpenAI API terminal=${terminal}, clientStream=${clientStream} observes actual SSE completion`, async (t) => {
+      const fx = await fixture(t, (_job, _req, res) => success(res, { openai: true, stop: terminal }))
+      const result = await fx.run({
+        clientStream,
+        protocol: 'openai.responses',
+        scheduler: {
+          reload() {},
+          pick: () => ({
+            ok: true,
+            endpoint: { id: 'ep-openai', kind: 'openai', protocol: 'openai', base_url: 'https://synthetic.invalid' },
+            key: { id: 'key-openai', api_key: 'synthetic' },
+            upstream_model: 'gpt-synthetic',
+          }),
+        },
+      })
+      assert.equal(result.execution.ended, terminal)
+      assert.equal(!!result.executionUncertain, !terminal)
+    })
+  }
+}
+
+for (const phase of ['before headers', 'after headers']) {
+  test(`API timeout ${phase} retains unknown execution`, async (t) => {
+    let timer
+    const fx = await fixture(t, (_job, _req, res) => {
+      if (phase === 'after headers') {
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        res.write('data: {"type":"message_start"}\n\n')
+        timer = setTimeout(() => res.end('data: {"type":"message_stop"}\n\n'), 200)
+      } else timer = setTimeout(() => success(res), 200)
+    })
+    t.after(() => clearTimeout(timer))
+    const ended = []
+    const result = await fx.run({ timeoutMs: 25, onExecutionEnd: (execution) => ended.push(execution) })
+    assert.equal(result.execution.ended, false)
+    assert.equal(result.executionUncertain, true)
+    assert.equal(ended.length, 1)
+  })
+}
+
+test('API persists the UUID before forward and completes it before releasing global capacity', async (t) => {
+  const db = getDb()
+  const other = await createDatabase({ connectionString: db.connectionString, schema: db.schema })
+  t.after(() => other.close())
+  let boundAtWire
+  const fx = await fixture(t, async (job, _req, res) => {
+    boundAtWire = await other.prepare('SELECT * FROM execution_jobs WHERE request_id=$1').get(job.request_id)
+    success(res)
+  })
+  const a = new SharedExecutionAdmissions(db)
+  const b = new SharedExecutionAdmissions(other)
+  const input = {
+    accountId: 'api-key-normal',
+    vmId: 'api-endpoint-normal',
+    accountLimit: 1,
+    vmLimit: 1,
+    fableLimit: 0,
+    rpmLimit: 0,
+  }
+  const lease = await a.tryReserve(input)
+  const result = await fx.run({ onExecutionStart: lease.bindExecution, onExecutionEnd: lease.completeExecution })
+  assert.ok(boundAtWire)
+  assert.equal(result.execution.ended, true)
+  assert.ok((await other.prepare('SELECT ended_at FROM execution_jobs').get()).ended_at)
+  assert.equal((await lease.release()).released, true)
+  const next = await b.tryReserve(input)
+  assert.equal(next.ok, true)
+  await next.release()
+})
+
+for (const code of ['rate_limit_error', 'upstream_transport']) {
+  test(`API SSE error ${code} distinguishes provider rejection from transport uncertainty`, async (t) => {
+    const fx = await fixture(t, (_job, _req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(
+        `data: ${JSON.stringify({ type: 'error', error: { type: 'api_error', code, status: 429, message: 'synthetic' } })}\n\n`,
+      )
+    })
+    const result = await fx.run()
+    assert.equal(result.execution.ended, code === 'rate_limit_error')
+    assert.equal(!!result.executionUncertain, code === 'upstream_transport')
+  })
+}
+
+test('an API message_stop followed by an HTTP truncation remains unknown', async (t) => {
+  const fx = await fixture(t, (_job, _req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'content-length': '10000' })
+    res.write('data: {"type":"message_stop"}\n\n')
+    setImmediate(() => res.destroy())
+  })
+  const result = await fx.run()
+  assert.equal(result.execution.ended, false)
+  assert.equal(result.executionUncertain, true)
+})
+
+test('unconnected API kernel retries retain one logical request ID and invoke start once', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-api-connect-retry-'))
+  const socket = path.join(root, 'run', 'api-kernel.sock')
+  fs.mkdirSync(path.dirname(socket), { recursive: true })
+  const wireIds = []
+  const starts = []
+  const server = http.createServer(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    wireIds.push(JSON.parse(Buffer.concat(chunks).toString()).request_id)
+    res.end('{}')
+  })
+  const timer = setTimeout(() => server.listen(socket), 130)
+  t.after(async () => {
+    clearTimeout(timer)
+    server.closeAllConnections()
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  for (let i = 0; i < 2; i++) {
+    const upstream = await forwardApi({
+      cfg: { paths: { data: root } },
+      url: 'https://synthetic.invalid',
+      onExecutionStart: (execution) => starts.push(execution.requestId),
+    })
+    for await (const _ of upstream) {
+    }
+  }
+  assert.equal(starts.length, 2)
+  assert.equal(wireIds.length, 2)
+  assert.deepEqual(wireIds, starts)
+  assert.notEqual(starts[0], starts[1])
+})
+
+for (const [phase, event, code, calls] of [
+  ['start', 'INSERT', 'P6501', 0],
+  ['end', 'UPDATE OF ended_at', 'P6502', 1],
+]) {
+  test(`API PostgreSQL ${phase} hook failure is not swallowed`, async (t) => {
+    const fx = await fixture(t)
+    const db = getDb()
+    const lease = await new SharedExecutionAdmissions(db).tryReserve({
+      accountId: 'api-fault-key',
+      vmId: 'api-fault-endpoint',
+      accountLimit: 1,
+      vmLimit: 1,
+      fableLimit: 0,
+      rpmLimit: 0,
+    })
+    await db.exec(`CREATE FUNCTION reject_api_job() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN RAISE EXCEPTION 'synthetic api hook failure' USING ERRCODE='${code}'; END; $$;
+      CREATE TRIGGER reject_api_job BEFORE ${event} ON execution_jobs FOR EACH ROW EXECUTE FUNCTION reject_api_job();`)
+    await assert.rejects(fx.run({ onExecutionStart: lease.bindExecution, onExecutionEnd: lease.completeExecution }), {
+      code,
+    })
+    assert.equal(fx.jobs.length, calls)
+    if (phase === 'end') assert.equal((await lease.release()).released, false)
+  })
+}
