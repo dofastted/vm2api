@@ -95,6 +95,12 @@ const ANTHROPIC = {
   'claude-3-haiku': claude(0.25, 1.25, 0.03, 0.3, 0.5),
 }
 
+// GPT Image 2.5 (developers.openai.com/api/docs/pricing; codex-proxy-rs verified 2026-09-09):
+// text input 5 / cached 1.25, image tokens 8 / cached 2 / output 30. Both variants share one price.
+function gptImage() {
+  return { ...tokenPrice(5, 0, 1.25, 0, 0), image: { input: 8, output: 30, cache_read: 2 } }
+}
+
 const OPENAI = {
   'gpt-6-astra': openaiFrom(
     { input: 10, output: 50, cache_read: 1, cache_write: 12.5 },
@@ -271,6 +277,8 @@ const OPENAI = {
   'gpt-5.1-chat-latest': openaiFrom({ input: 1.25, output: 10, cache_read: 0.125, cache_write: 0 }),
   'gpt-5.2-codex': openaiFrom({ input: 1.75, output: 14, cache_read: 0.175, cache_write: 0 }),
   'gpt-5.2-chat-latest': openaiFrom({ input: 1.75, output: 14, cache_read: 0.175, cache_write: 0 }),
+  'gpt-image-2.5-flare': gptImage(),
+  'gpt-image-2.5-sunburst': gptImage(),
 }
 
 /** Dated / legacy / family ids → canonical priced id. OpenAI: verified snapshot aliases only. */
@@ -309,6 +317,8 @@ export const BUILTIN_ALIASES = {
   'gpt-5.4-pro-2026-03-05': 'gpt-5.4-pro',
   'gpt-5.5-2026-04-23': 'gpt-5.5',
   'gpt-5.5-pro-2026-04-23': 'gpt-5.5-pro',
+  'gpt-image-2.5-flare-2026-09-08': 'gpt-image-2.5-flare',
+  'gpt-image-2.5-sunburst-2026-09-08': 'gpt-image-2.5-sunburst',
   'gpt-daybreak-blue-latest': 'gpt-5.6-sol',
   'gpt-daybreak-red-latest': 'gpt-5.6-cyber',
   'o1-2024-12-17': 'o1',

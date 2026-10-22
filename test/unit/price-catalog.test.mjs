@@ -268,3 +268,32 @@ test('saving an override invalidates the memoized catalog', () => {
   assert.equal(after.override.input, 9)
   invalidatePriceCatalog()
 })
+
+test('validatePrice accepts an optional image band and rejects a partial one', () => {
+  const ok = validatePrice(
+    { input: 5, output: 0, cache_read: 1.25, image: { input: 8, output: 30, cache_read: 2 } },
+    { platform: 'openai' },
+  )
+  assert.equal(ok.ok, true)
+  assert.deepEqual(ok.price.image, { input: 8, output: 30, cache_read: 2 })
+  for (const image of [{ input: 8, output: 30 }, { input: -1, output: 30, cache_read: 2 }, 'x', []]) {
+    assert.equal(validatePrice({ input: 5, output: 0, cache_read: 1.25, image }, { platform: 'openai' }).ok, false)
+  }
+})
+
+test('image band override wins; a text-only override keeps the builtin image band', () => {
+  assert.equal(
+    setPriceOverride('openai/gpt-image-2.5-flare', {
+      input: 5,
+      output: 0,
+      cache_read: 1.25,
+      image: { input: 16, output: 60, cache_read: 4 },
+    }).ok,
+    true,
+  )
+  assert.deepEqual(resolvePrice('gpt-image-2.5-flare').price.image, { input: 16, output: 60, cache_read: 4 })
+  assert.equal(setPriceOverride('openai/gpt-image-2.5-sunburst', { input: 6, output: 0, cache_read: 1.5 }).ok, true)
+  const sun = resolvePrice('gpt-image-2.5-sunburst').price
+  assert.equal(sun.input, 6)
+  assert.deepEqual(sun.image, { input: 8, output: 30, cache_read: 2 })
+})

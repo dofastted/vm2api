@@ -37,6 +37,27 @@ export function fmtBaseRates(price: Price | null | undefined): string {
   ].join(' / ')
 }
 
+/** OpenAI order: input / cached input / output per 1M. */
+export function fmtOpenaiRates(price: Price | null | undefined): string {
+  if (!price) return '未定价'
+  return [
+    fmtPerM(price.input),
+    fmtPerM(price.cache_read),
+    fmtPerM(price.output),
+  ].join(' / ')
+}
+
+/** GPT Image token rates: input / cached input / output per 1M. */
+export function fmtImageRates(price: Price | null | undefined): string {
+  const image = price?.image
+  if (!image) return '—'
+  return [
+    fmtPerM(image.input),
+    fmtPerM(image.cache_read),
+    fmtPerM(image.output),
+  ].join(' / ')
+}
+
 export function cacheFillHint(
   platform: 'anthropic' | 'openai',
   field: 'cache_5m' | 'cache_1h',
@@ -67,6 +88,13 @@ export function tiersSummary(price: Price | null | undefined): string {
       return above
     })
     .join(' · ')
+}
+
+/** OpenAI service tiers with their own price (flex / priority); `fast` is the Anthropic mode. */
+export function openaiServiceModes(
+  price: Price | null | undefined
+): Array<'flex' | 'priority'> {
+  return (['flex', 'priority'] as const).filter((k) => price?.modes?.[k])
 }
 
 export function modeKeys(

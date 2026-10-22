@@ -1103,3 +1103,106 @@ test('tenant log scope follows the slot owner at write time, not the current own
   )
   assert.equal(store.queryNormal({}).total, 2)
 })
+
+const IMAGE_GEN_USAGE = {
+  input_tokens: 300,
+  input_tokens_details: { text_tokens: 100, image_tokens: 200 },
+  output_tokens: 1000,
+  total_tokens: 1300,
+}
+
+test('Responses image tool usage is stored and billed on top of the text model', () => {
+  const store = tmpStore('normal')
+  const ctx = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'openai.responses', pathName: '/v1/responses' },
+  )
+  const rec = store.finish(ctx, {
+    status: 200,
+    protocol: 'openai.responses',
+    model: 'gpt-6-luna',
+    upstream_model: 'gpt-6-luna',
+    usage: { input_tokens: 1000, output_tokens: 100 },
+    image_usage: IMAGE_GEN_USAGE,
+    image_model: 'gpt-image-2.5-sunburst',
+  })
+  const row = store.db
+    .prepare(
+      'SELECT image_model, image_usage, image_input_tokens, image_output_tokens, image_cost, total_cost, actual_cost, pricing_model FROM usage_logs WHERE id = ?',
+    )
+    .get(rec.id)
+  assert.equal(row.image_model, 'gpt-image-2.5-sunburst')
+  assert.deepEqual(JSON.parse(row.image_usage), IMAGE_GEN_USAGE)
+  assert.equal(row.image_input_tokens, 300)
+  assert.equal(row.image_output_tokens, 1000)
+  assert.ok(Math.abs(row.image_cost - 0.0321) < 1e-9)
+  assert.equal(row.pricing_model, 'gpt-6-luna')
+  assert.ok(row.total_cost > row.image_cost)
+  assert.equal(row.actual_cost, row.total_cost)
+})
+
+test('Images endpoint rows bill only the image usage', () => {
+  const store = tmpStore('normal')
+  const ctx = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'openai.images', pathName: '/v1/images/generations' },
+  )
+  const rec = store.finish(ctx, {
+    status: 200,
+    protocol: 'openai.images',
+    model: 'gpt-image-2.5-flare',
+    image_model: 'gpt-image-2.5-flare',
+    image_usage: IMAGE_GEN_USAGE,
+  })
+  const row = store.db
+    .prepare('SELECT image_cost, total_cost, pricing_model, input_tokens FROM usage_logs WHERE id = ?')
+    .get(rec.id)
+  assert.equal(row.pricing_model, 'gpt-image-2.5-flare')
+  assert.ok(Math.abs(row.total_cost - 0.0321) < 1e-9)
+  assert.equal(row.image_cost, row.total_cost)
+  assert.equal(row.input_tokens, 0)
+  const missing = store.finish(
+    store.start(
+      { method: 'POST', headers: {}, socket: {} },
+      { protocol: 'openai.images', pathName: '/v1/images/generations' },
+    ),
+    { status: 200, protocol: 'openai.images', model: 'gpt-image-2.5-flare', image_model: 'gpt-image-2.5-flare' },
+  )
+  assert.equal(missing.pricing_model, 'unpriced')
+  assert.equal(missing.total_cost, null)
+})
+
+test('repriceRange re-prices image usage from the stored JSON and keeps actual_cost', () => {
+  const store = tmpStore('normal')
+  const now = new Date().toISOString()
+  store.db
+    .prepare(`
+    INSERT INTO usage_logs (
+      id, request_id, created_at, protocol, model, upstream_model, status,
+      input_tokens, output_tokens, image_model, image_usage, image_input_tokens, image_output_tokens,
+      image_cost, total_cost, actual_cost, pricing_model, rate_multiplier
+    ) VALUES
+      ('log_img_tool', 'rid_img_tool', ?, 'openai.responses', 'gpt-6-luna', 'gpt-6-luna', 200, 0, 0,
+       'gpt-image-2.5-flare', ?, 300, 1000, 1, 1, 7, 'gpt-6-luna', 1),
+      ('log_img_only', 'rid_img_only', ?, 'openai.images', 'gpt-image-2.5-sunburst', NULL, 200, 0, 0,
+       'gpt-image-2.5-sunburst', ?, 300, 1000, NULL, NULL, 5, NULL, 1)
+  `)
+    .run(now, JSON.stringify(IMAGE_GEN_USAGE), now, JSON.stringify(IMAGE_GEN_USAGE))
+  const out = store.repo.repriceRange({ since: now, until: now })
+  assert.equal(out.rows, 2)
+  assert.equal(out.still_unpriced, 0)
+  const rows = Object.fromEntries(
+    store.db
+      .prepare(
+        "SELECT id, image_cost, total_cost, actual_cost, pricing_model FROM usage_logs WHERE id LIKE 'log_img_%'",
+      )
+      .all()
+      .map((r) => [r.id, r]),
+  )
+  assert.ok(Math.abs(rows.log_img_tool.image_cost - 0.0321) < 1e-9)
+  assert.ok(Math.abs(rows.log_img_tool.total_cost - 0.0321) < 1e-9)
+  assert.equal(rows.log_img_tool.actual_cost, 7)
+  assert.equal(rows.log_img_only.pricing_model, 'gpt-image-2.5-sunburst')
+  assert.ok(Math.abs(rows.log_img_only.total_cost - 0.0321) < 1e-9)
+  assert.equal(rows.log_img_only.actual_cost, 5)
+})

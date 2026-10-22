@@ -415,3 +415,44 @@ test('withTransaction only runs inline for a real outer transaction', () => {
   )
   assert.equal(called, false)
 })
+
+test('migration 042 adds image generation columns; old rows and prompt totals stay the same', () => {
+  const src = path.join(process.cwd(), 'src/lib/db/migrations')
+  const migSrc = path.join(tmp, 'mig042')
+  fs.mkdirSync(migSrc, { recursive: true })
+  for (const f of fs.readdirSync(src)) {
+    if (f.endsWith('.sql') && f < '042') fs.copyFileSync(path.join(src, f), path.join(migSrc, f))
+  }
+  const db = new DatabaseSync(path.join(tmp, 'mig042.db'))
+  applyMigrations(db, { migrationsDir: migSrc })
+  db.prepare(`
+    INSERT INTO usage_logs (id, request_id, created_at, model, input_tokens, cache_read_tokens, output_tokens, total_cost)
+    VALUES ('old', 'r-old', '2026-10-01T00:00:00.000Z', 'gpt-6-luna', 100, 20, 5, 0.5)
+  `).run()
+  const prompt =
+    'SELECT SUM(IFNULL(input_tokens, 0) + IFNULL(cache_read_tokens, 0) + IFNULL(cache_creation_tokens, 0)) AS n FROM usage_logs'
+  const before = db.prepare(prompt).get().n
+  fs.copyFileSync(
+    path.join(src, '042_usage_logs_image_generation.sql'),
+    path.join(migSrc, '042_usage_logs_image_generation.sql'),
+  )
+  applyMigrations(db, { migrationsDir: migSrc })
+  assert.equal(db.prepare(prompt).get().n, before)
+  const row = db
+    .prepare(
+      'SELECT image_model, image_usage, image_input_tokens, image_output_tokens, image_cost, total_cost FROM usage_logs WHERE id = ?',
+    )
+    .get('old')
+  assert.deepEqual(
+    { ...row },
+    {
+      image_model: null,
+      image_usage: null,
+      image_input_tokens: 0,
+      image_output_tokens: 0,
+      image_cost: null,
+      total_cost: 0.5,
+    },
+  )
+  db.close()
+})

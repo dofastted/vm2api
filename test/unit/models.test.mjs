@@ -169,3 +169,26 @@ test('gatewayModelCatalog filters by key group_type', () => {
   assert.ok(anthropic.length > 0 && !anthropic.some(isGpt))
   assert.equal(gatewayModelCatalog({ groupType: 'all' }).data.length, all.length)
 })
+
+test('enabled GPT image models are listed for openai and all keys, never for anthropic keys', async () => {
+  const { openDatabase, closeDatabase } = await import('../../src/lib/db/database.mjs')
+  const { loadGptModelPolicy, saveGptModelPolicy } = await import('../../src/lib/protocol/gpt-model-policy.mjs')
+  openDatabase({ dbPath: ':memory:' })
+  loadGptModelPolicy({ force: true })
+  try {
+    saveGptModelPolicy({ image_tools: { 'gpt-image-2.5-sunburst': { enabled: false } } })
+    clearModelsCache()
+    const ids = (groupType) => gatewayModelCatalog({ groupType }).data.map((m) => m.id)
+    assert.ok(ids('openai').includes('gpt-image-2.5-flare'))
+    assert.ok(ids('all').includes('gpt-image-2.5-flare'))
+    assert.ok(!ids('openai').includes('gpt-image-2.5-sunburst'))
+    assert.ok(!ids('anthropic').includes('gpt-image-2.5-flare'))
+    const row = gatewayModelCatalog({ groupType: 'openai' }).data.find((m) => m.id === 'gpt-image-2.5-flare')
+    assert.equal(row.owned_by, 'openai')
+    assert.equal(row.family, 'gpt-image')
+  } finally {
+    closeDatabase()
+    loadGptModelPolicy({ force: true })
+    clearModelsCache()
+  }
+})

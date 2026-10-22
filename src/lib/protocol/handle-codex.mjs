@@ -40,6 +40,8 @@ import { scopeAccountFromVm } from './jev-intercept.mjs'
 import {
   CODEX_APP_VERSION,
   CODEX_CATALOG_ORIGINATOR,
+  CODEX_IMAGE_EDITS_URL,
+  CODEX_IMAGE_GENERATIONS_URL,
   CODEX_SEARCH_URL,
   CODEX_USER_AGENT,
   makeProxyFetch,
@@ -55,6 +57,8 @@ import {
 } from '../pool/openai-account-runtime.mjs'
 import { CLIENT_POOL_BUSY_MESSAGE, CLIENT_POOL_UNAVAILABLE_MESSAGE, ErrorCode } from '../core/errors.mjs'
 import { applyOpenaiWashLog } from './openai-wash.mjs'
+import { canonicalImageToolModel, imageGenerationTools } from './image-tool-models.mjs'
+import { isImageToolModelEnabled } from './gpt-model-policy.mjs'
 import { sessionIdForLog } from './log-fields.mjs'
 import { redactHeaders } from '../admin/request-log.mjs'
 import {
@@ -356,6 +360,30 @@ export function usageFromSseLine(line) {
   }
 }
 
+/** `tool_usage.image_gen` from a terminal Responses frame (official `response.tool_usage`). */
+export function imageGenUsageFromSseLine(line) {
+  if (typeof line !== 'string' || !line.startsWith('data:') || !line.includes('tool_usage')) return null
+  try {
+    const ev = JSON.parse(line.slice(5).trim())
+    if (ev?.type !== 'response.completed' && ev?.type !== 'response.incomplete') return null
+    const usage = ev.response?.tool_usage?.image_gen
+    return usage && typeof usage === 'object' ? usage : null
+  } catch {
+    return null
+  }
+}
+
+/** A known image model the GPT policy disabled is refused before any slot is picked. */
+function disabledImageTool(body, logBag) {
+  for (const tool of imageGenerationTools(body)) {
+    const model = typeof tool.model === 'string' ? tool.model.trim() : ''
+    if (!model) continue
+    logBag.image_model = canonicalImageToolModel(model) || model
+    if (isImageToolModelEnabled(model) === false) return model
+  }
+  return null
+}
+
 function usageTokens(usage) {
   const extracted = extractOpenaiUsage(usage)
   if (!extracted) return 0
@@ -572,6 +600,19 @@ export async function handleCodexProtocol({
     converted: converted.converted,
     outboundBody: converted.body,
   })
+  const disabledImage = disabledImageTool(converted.body, logBag)
+  if (disabledImage) {
+    stats.errors++
+    logBag.via = 'codex-kernel'
+    logBag.error_code = 'model_disabled'
+    return json(res, 400, {
+      error: {
+        type: 'invalid_request_error',
+        code: 'model_disabled',
+        message: `image_generation model '${disabledImage}' is disabled by gateway GPT model policy`,
+      },
+    })
+  }
   const stream = inbound?.stream !== false && ctx.body?.stream !== false
   const inboundSession = sessionFrom(req, converted.body)
   const sessionMode = officialCodexPassthrough ? 'rebuild' : outboundSessionMode(routing)
@@ -719,6 +760,7 @@ export async function handleCodexProtocol({
         const nameSseEvent = createResponsesSseEventNamer()
         let responseServiceTier = null
         let streamedUsage = null
+        let streamedImageUsage = null
         let conversionError = null
         const attemptStartedAt = Date.now()
         const sessionOptions = {
@@ -774,6 +816,8 @@ export async function handleCodexProtocol({
               if (tier) responseServiceTier = tier
               const seen = usageFromSseLine(line)
               if (seen) streamedUsage = preferUsage(streamedUsage, seen)
+              const imageGen = imageGenUsageFromSseLine(line)
+              if (imageGen) streamedImageUsage = imageGen
               if (!stream) {
                 chunks.push(line)
                 return
@@ -854,6 +898,9 @@ export async function handleCodexProtocol({
           const disjoint = extracted ? openaiAnthropicUsageFromExtract(extracted) : null
           const logged = disjointOpenaiUsage(usage && serviceTier ? { ...usage, service_tier: serviceTier } : usage)
           logBag.usage = logged
+          const imageUsage =
+            result.body?.tool_usage?.image_gen || result.body?.response?.tool_usage?.image_gen || streamedImageUsage
+          if (imageUsage) logBag.image_usage = imageUsage
           logBag.input_tokens = disjoint?.input_tokens ?? usage?.input_tokens ?? usage?.prompt_tokens ?? null
           logBag.output_tokens = disjoint?.output_tokens ?? usage?.output_tokens ?? usage?.completion_tokens ?? null
           logBag.cache_read_tokens =
@@ -1070,11 +1117,24 @@ function plainHeaders(headers) {
   return { ...(headers || {}) }
 }
 
-/** One search call on one slot. Resolves `{ status, text, headers }`, or `{ status: 0, error }`. */
-async function postCodexSearch({ projectRoot, vm, body, turnMetadata, fetchImpl, refresh = refreshCodexAccessToken }) {
+/**
+ * One JSON POST to a Codex backend endpoint (search, images) on one slot.
+ * Resolves `{ status, text, headers }`, or `{ status: 0, error }`.
+ */
+async function postCodexJson({
+  url,
+  timeoutMs,
+  projectRoot,
+  vm,
+  body,
+  turnMetadata,
+  extraHeaders = {},
+  fetchImpl,
+  refresh = refreshCodexAccessToken,
+}) {
   const proxyUrl = hostProxyUrlForVm(vm)
   if (!fetchImpl && !proxyUrl && !isLocalEgressProxy(vm.proxy)) return { status: 0, error: 'proxy_required' }
-  const doFetch = fetchImpl || makeProxyFetch(proxyUrl, CODEX_SEARCH_TIMEOUT_MS, { maxMs: CODEX_SEARCH_TIMEOUT_MS })
+  const doFetch = fetchImpl || makeProxyFetch(proxyUrl, timeoutMs, { maxMs: timeoutMs })
   const creds = searchCredentials(projectRoot, vm)
   const send = async (access) => {
     // Same identity as the slot's kernel; the backend wants originator, User-Agent and version to agree.
@@ -1088,8 +1148,9 @@ async function postCodexSearch({ projectRoot, vm, body, turnMetadata, fetchImpl,
     }
     if (creds.accountId) headers['chatgpt-account-id'] = creds.accountId
     if (turnMetadata) headers['x-codex-turn-metadata'] = turnMetadata
+    Object.assign(headers, extraHeaders)
     try {
-      const res = await doFetch(CODEX_SEARCH_URL, { method: 'POST', headers, body: JSON.stringify(body) })
+      const res = await doFetch(url, { method: 'POST', headers, body: JSON.stringify(body) })
       return { status: Number(res?.status) || 0, text: await res.text(), headers: plainHeaders(res?.headers) }
     } catch (e) {
       return { status: 0, error: /abort/i.test(`${e?.name} ${e?.message}`) ? 'upstream_timeout' : 'upstream_transport' }
@@ -1102,6 +1163,10 @@ async function postCodexSearch({ projectRoot, vm, body, turnMetadata, fetchImpl,
     if (access) out = await send(access)
   }
   return out
+}
+
+function postCodexSearch(args) {
+  return postCodexJson({ ...args, url: CODEX_SEARCH_URL, timeoutMs: CODEX_SEARCH_TIMEOUT_MS })
 }
 
 function isSearchFailover(out) {
@@ -1221,6 +1286,166 @@ export async function handleCodexSearch({
   if (last.status >= 400) {
     stats.errors++
     logBag.error_code = payload?.error?.code || `upstream_${last.status}`
+  }
+  return json(res, last.status, payload)
+}
+
+// Image generation runs for minutes. codex-proxy-rs sets no total deadline on these JSON endpoints
+// (connect timeout only); the proxy fetch here needs one, so it is generous.
+const CODEX_IMAGES_TIMEOUT_MS = 600000
+const CODEX_IMAGES_URLS = Object.freeze({
+  generations: CODEX_IMAGE_GENERATIONS_URL,
+  edits: CODEX_IMAGE_EDITS_URL,
+})
+
+/** Official Codex `image_generation_available` excludes Free (codex-proxy-rs credential/selector.rs). */
+function isFreePlanSlot(projectRoot, vm) {
+  const plan = vm?.codex?.plan_type || readCodexAccounts(projectRoot, vm.id)[0]?.chatgpt_plan_type || ''
+  return String(plan).trim().toLowerCase() === 'free'
+}
+
+/**
+ * POST /v1/images/{generations,edits}: native Codex Images JSON, passed through on one slot
+ * (codex-proxy-rs `gateway-api/src/openai/images`). No inference session window; an
+ * `x-codex-image-turn-id` keeps one edit turn on the slot that served it.
+ */
+export async function handleCodexImages({
+  req,
+  res,
+  kind,
+  body,
+  logBag,
+  stats,
+  json,
+  routing = {},
+  projectRoot,
+  stickyRouter = null,
+  ops = {},
+  ownerScope = null,
+}) {
+  logBag.via = 'codex-images'
+  const reject = (status, type, code, message) => {
+    stats.errors++
+    logBag.error_code = code
+    return json(res, status, { error: { type, code, message } })
+  }
+  const codex = normalizeCodexRouting(routing.codex)
+  if (!codex.enabled) return reject(400, 'invalid_request_error', 'codex_disabled', 'Codex routing is disabled')
+  const restriction = restrictCodexClient(req.headers, body, { codex }, 'openai.images')
+  if (!restriction.ok) return reject(403, 'permission_error', restriction.code, restriction.message)
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return reject(400, 'invalid_request_error', 'invalid_request', 'Images request body must be a JSON object')
+  }
+  const model = typeof body.model === 'string' ? body.model.trim() : ''
+  if (model) {
+    logBag.image_model = canonicalImageToolModel(model) || model
+    if (isImageToolModelEnabled(model) === false) {
+      return reject(
+        400,
+        'invalid_request_error',
+        'model_disabled',
+        `image model '${model}' is disabled by gateway GPT model policy`,
+      )
+    }
+  }
+  const excluded = new Set()
+  let usable = 0
+  for (const item of listVms(projectRoot)) {
+    if (!isCodexVm(item)) continue
+    if (isFreePlanSlot(projectRoot, getVm(projectRoot, item.id) || item)) excluded.add(item.id)
+    else usable += 1
+  }
+  if (!usable && excluded.size) {
+    return reject(
+      403,
+      'permission_error',
+      'image_generation_unavailable',
+      'Image generation is not available on Free-plan GPT slots',
+    )
+  }
+  const turnMetadata = headerString(req.headers, 'x-codex-turn-metadata')
+  const imageTurnId = headerString(req.headers, 'x-codex-image-turn-id')
+  const extraHeaders = imageTurnId ? { 'x-codex-image-turn-id': imageTurnId } : {}
+  const post = ops.postCodexJson || postCodexJson
+  // Selection-only body: the turn id becomes the sticky session; the upstream body is untouched.
+  const pickBody = { model: model || null, ...(imageTurnId ? { session_id: `codex-image-turn:${imageTurnId}` } : {}) }
+  const pickOpts = { stickyRouter, sessions: null, body: pickBody, excluded, ownerScope }
+  const deadline = Date.now() + codexWaitTimeoutMs(routing)
+  const gone = clientGoneSignal(req, res)
+  let last = null
+  let attempts = 0
+  try {
+    for (;;) {
+      const admitted = await admitCodexCandidate(projectRoot, req, pickOpts, { deadline, signal: gone.signal })
+      if (!admitted.lease) {
+        if (admitted.picked.error === 'client_cancelled') {
+          logBag.final_state = 'cancelled'
+          return
+        }
+        if (last) break
+        return rejectCodexAdmission({ res, json, stats, logBag, picked: admitted.picked, model })
+      }
+      try {
+        const vm = getVm(projectRoot, admitted.vmId)
+        excluded.add(admitted.vmId)
+        if (!vm || !isCodexVm(vm)) continue
+        if (!attempts) {
+          stats.requests++
+          stats.by_route['openai.images'] = (stats.by_route['openai.images'] || 0) + 1
+        }
+        attempts += 1
+        logBag.vm_id = vm.id
+        logBag.account_id = vm.id
+        logBag.attempt_count = attempts
+        last = await post({
+          url: CODEX_IMAGES_URLS[kind] || CODEX_IMAGE_GENERATIONS_URL,
+          timeoutMs: CODEX_IMAGES_TIMEOUT_MS,
+          projectRoot,
+          vm,
+          body,
+          turnMetadata,
+          extraHeaders,
+          fetchImpl: ops.fetchImpl,
+          refresh: ops.refresh,
+        })
+        logBag.upstream_status = last.status || null
+        ingestCodexHop(projectRoot, vm.id, {
+          ok: last.status >= 200 && last.status < 300,
+          status: last.status,
+          headers: last.headers || {},
+          body: parseJson(last.text),
+        })
+        if (last.status >= 200 && last.status < 300 && stickyRouter?.bind) {
+          for (const key of admitted.picked.stickyKeys || []) stickyRouter.bind(key, { accountId: vm.id, vmId: vm.id })
+        }
+        if (!isSearchFailover(last)) break
+      } finally {
+        admitted.lease.release()
+      }
+    }
+  } finally {
+    gone.settle()
+  }
+  if (!last.status) {
+    logBag.final_state = 'upstream_error'
+    return reject(502, 'api_error', last.error || 'upstream_transport', 'Codex images upstream request failed')
+  }
+  const payload = parseJson(last.text)
+  if (payload === undefined) {
+    logBag.final_state = 'upstream_error'
+    return reject(
+      502,
+      'api_error',
+      'upstream_invalid_body',
+      `Codex images upstream answered ${last.status} without JSON`,
+    )
+  }
+  logBag.final_state = last.status < 300 ? 'verified' : 'upstream_error'
+  if (last.status >= 400) {
+    stats.errors++
+    logBag.error_code = payload?.error?.code || `upstream_${last.status}`
+  } else if (payload?.usage && typeof payload.usage === 'object') {
+    logBag.image_usage = payload.usage
   }
   return json(res, last.status, payload)
 }

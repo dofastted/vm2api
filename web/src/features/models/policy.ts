@@ -25,6 +25,23 @@ export type ModelBetas = {
   pass_context_1m?: boolean
 }
 
+/** Upstream Codex catalog facts saved by “同步 GPT”; absent until a sync carries them. */
+export type CatalogMeta = {
+  description?: string
+  priority?: number
+  visibility?: string
+  context_window?: number
+  max_context_window?: number
+  default_reasoning_level?: string
+  supported_reasoning_levels?: string[]
+  service_tiers?: { id: string; name: string; description?: string }[]
+  input_modalities?: string[]
+  supports_search_tool?: boolean
+  supports_parallel_tool_calls?: boolean
+  supported_in_api?: boolean
+  synced_at?: string
+}
+
 export type ModelEntry = {
   id: string
   enabled?: boolean
@@ -35,6 +52,16 @@ export type ModelEntry = {
   capabilities?: ModelCaps
   params?: ModelParams
   betas?: ModelBetas
+  catalog?: CatalogMeta
+}
+
+export type ImageToolModel = {
+  id: string
+  display_name: string
+  snapshots: string[]
+  upstream_default: boolean
+  sort: number
+  enabled: boolean
 }
 
 export type PolicyDefaults = {
@@ -53,12 +80,14 @@ export type ModelPolicy = {
   defaults?: PolicyDefaults
   models?: Record<string, Omit<ModelEntry, 'id'>>
   aliases?: Record<string, string>
+  image_tools?: Record<string, { enabled: boolean }>
 }
 
 export type PolicyPayload = {
   policy?: ModelPolicy
-  models?: { id: string }[]
+  models?: ModelEntry[]
   effective?: { id: string }[]
+  image_tools?: ImageToolModel[]
   synced?: number
 }
 
@@ -227,4 +256,88 @@ export function isCatalogMode(v: string | undefined): v is CatalogMode {
     v === 'worker_only' ||
     v === 'policy_only'
   )
+}
+
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${Number((n / 1_000_000).toFixed(2))}M`
+  if (n >= 1000) return `${Math.round(n / 1000)}K`
+  return String(n)
+}
+
+const MODALITY_LABEL: Record<string, string> = { text: '文本', image: '图像' }
+const VISIBILITY_LABEL: Record<string, string> = {
+  list: '列出',
+  hide: '隐藏',
+  none: '不列出',
+}
+
+function yesNo(v: boolean | undefined): string {
+  if (v === undefined) return '—'
+  return v ? '支持' : '不支持'
+}
+
+export type CatalogFacts = {
+  synced: boolean
+  context: string
+  maxContext: string
+  defaultEffort: string
+  efforts: string
+  tierNames: string
+  tiers: string
+  input: string
+  search: string
+  parallel: string
+  visibility: string
+  description: string
+  syncedAt: string
+}
+
+/** OpenAI page facts from the synced catalog only; never from seed constants. */
+export function catalogFacts(m: ModelEntry): CatalogFacts {
+  const c = m.catalog
+  if (!c) {
+    const none = '未同步'
+    return {
+      synced: false,
+      context: none,
+      maxContext: none,
+      defaultEffort: none,
+      efforts: none,
+      tierNames: none,
+      tiers: none,
+      input: none,
+      search: none,
+      parallel: none,
+      visibility: none,
+      description: '',
+      syncedAt: '',
+    }
+  }
+  const levels = c.supported_reasoning_levels || []
+  const noTiers = c.service_tiers ? '无' : '—'
+  return {
+    synced: true,
+    context: c.context_window ? fmtTokens(c.context_window) : '—',
+    maxContext: c.max_context_window ? fmtTokens(c.max_context_window) : '—',
+    defaultEffort: c.default_reasoning_level || '—',
+    efforts: levels.length ? levels.join(' / ') : '—',
+    tierNames: c.service_tiers?.length
+      ? c.service_tiers.map((t) => t.name).join(' / ')
+      : noTiers,
+    tiers: c.service_tiers?.length
+      ? c.service_tiers
+          .map((t) => (t.name === t.id ? t.name : `${t.name}（${t.id}）`))
+          .join(' / ')
+      : noTiers,
+    input: c.input_modalities?.length
+      ? c.input_modalities.map((x) => MODALITY_LABEL[x] || x).join(' / ')
+      : '—',
+    search: yesNo(c.supports_search_tool),
+    parallel: yesNo(c.supports_parallel_tool_calls),
+    visibility: c.visibility
+      ? VISIBILITY_LABEL[c.visibility] || c.visibility
+      : '—',
+    description: c.description || '',
+    syncedAt: c.synced_at || '',
+  }
 }

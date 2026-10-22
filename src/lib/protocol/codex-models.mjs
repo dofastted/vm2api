@@ -16,6 +16,9 @@ export const CODEX_MODELS_URL = 'https://chatgpt.com/backend-api/codex/models'
 // Codex web search (`web.run`): the CLI posts to `{base_url}/alpha/search`; under ChatGPT login
 // that base is https://chatgpt.com/backend-api/codex.
 export const CODEX_SEARCH_URL = 'https://chatgpt.com/backend-api/codex/alpha/search'
+// Codex Images (codex-proxy-rs `transport/endpoints.rs`): native non-streaming JSON under the same base.
+export const CODEX_IMAGE_GENERATIONS_URL = 'https://chatgpt.com/backend-api/codex/images/generations'
+export const CODEX_IMAGE_EDITS_URL = 'https://chatgpt.com/backend-api/codex/images/edits'
 export const CHATGPT_MODELS_URL = CODEX_MODELS_URL
 export const CHATGPT_MODELS_URLS = Object.freeze([CODEX_MODELS_URL])
 export const CODEX_OAUTH_TOKEN_URL = 'https://auth.openai.com/oauth/token'
@@ -117,8 +120,67 @@ function isCodexRequestSlug(id) {
   return isSyncableGptCatalogId(id)
 }
 
+const CATALOG_VISIBILITY = new Set(['list', 'hide', 'none'])
+
+function boundedText(value, maxBytes) {
+  if (typeof value !== 'string') return undefined
+  const text = value.trim()
+  return text && Buffer.byteLength(text) <= maxBytes ? text : undefined
+}
+
+function positiveInt(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : undefined
+}
+
 /**
- * Official Codex catalog: `{ models: [{ slug, display_name }] }`.
+ * Whitelisted upstream facts for one catalog row (codex-proxy-rs `transport/catalog.rs`).
+ * A malformed field is dropped on its own; nothing is inferred from the model name.
+ */
+export function sanitizeCodexCatalogMetadata(row = {}) {
+  const out = {}
+  const put = (key, value) => {
+    if (value !== undefined) out[key] = value
+  }
+  put('description', boundedText(row.description, 4 * 1024))
+  put('priority', Number.isSafeInteger(row.priority) ? row.priority : undefined)
+  put('visibility', CATALOG_VISIBILITY.has(row.visibility) ? row.visibility : undefined)
+  const context = positiveInt(row.context_window)
+  const maxContext = positiveInt(row.max_context_window)
+  if (!(context && maxContext && context > maxContext)) {
+    put('context_window', context)
+    put('max_context_window', maxContext)
+  }
+  put('default_reasoning_level', boundedText(row.default_reasoning_level, 64))
+  if (Array.isArray(row.supported_reasoning_levels)) {
+    const efforts = []
+    for (const level of row.supported_reasoning_levels) {
+      const effort = boundedText(level?.effort, 64)
+      if (effort && !efforts.includes(effort)) efforts.push(effort)
+    }
+    out.supported_reasoning_levels = efforts
+  }
+  if (Array.isArray(row.service_tiers)) {
+    const tiers = []
+    for (const tier of row.service_tiers) {
+      const id = boundedText(tier?.id, 64)
+      const name = boundedText(tier?.name, 256)
+      if (!id || !name) continue
+      const description = boundedText(tier?.description, 4 * 1024)
+      tiers.push(description ? { id, name, description } : { id, name })
+    }
+    out.service_tiers = tiers
+  }
+  if (Array.isArray(row.input_modalities)) {
+    out.input_modalities = row.input_modalities.filter((m) => typeof m === 'string' && /^[a-z_]+$/.test(m))
+  }
+  for (const key of ['supports_search_tool', 'supports_parallel_tool_calls', 'supported_in_api']) {
+    put(key, typeof row[key] === 'boolean' ? row[key] : undefined)
+  }
+  return out
+}
+
+/**
+ * Official Codex catalog: `{ models: [{ slug, display_name, ... }] }`.
  * Does not walk ChatGPT web `/backend-api/models` consumer trees.
  */
 export function parseCodexModelCatalog(payload) {
@@ -133,6 +195,7 @@ export function parseCodexModelCatalog(payload) {
     out.push({
       id,
       display_name: String(row.display_name || row.title || id).trim() || id,
+      catalog: sanitizeCodexCatalogMetadata(row),
     })
   }
   return out
