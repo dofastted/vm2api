@@ -22,7 +22,7 @@
  */
 import crypto from 'node:crypto'
 import { formatMetadataUserId } from './vm-identity.mjs'
-import { isShortProbeRequest } from '../pool/sticky-router.mjs'
+import { explicitParentSessionId, isShortProbeRequest } from '../pool/sticky-router.mjs'
 
 export const IDENTITY_REPLACE = Object.freeze([
   'device_id',
@@ -277,8 +277,23 @@ function ephemeralCacheText(body = {}) {
  * normalized UA + system + first user turn. The API key never takes part.
  * @returns {{ key: string|null, source: 'device'|'session'|'probe'|'cache'|'fingerprint' }}
  */
-export function resolveSeatIdentity({ inbound = {}, body = {}, headers = {}, clientIp = '' } = {}) {
+export function resolveSeatIdentity({
+  inbound = {},
+  body = {},
+  headers = {},
+  clientIp = '',
+  mode = 'device',
+  rootSessionId = '',
+} = {}) {
   const identity = resolveInboundIdentity({ inbound, body, headers })
+  if (mode === 'session') {
+    const root =
+      rootSessionId ||
+      explicitParentSessionId(inbound, headers) ||
+      explicitParentSessionId(body, headers) ||
+      identity.sessionId
+    if (root) return { key: `seat:sess:${root}`, source: 'session' }
+  }
   if (identity.deviceId) return { key: `seat:dev:${identity.deviceId}`, source: 'device' }
   if (identity.sessionId) return { key: `seat:sess:${identity.sessionId}`, source: 'session' }
   if (isShortProbeRequest(inbound)) return { key: null, source: 'probe' }

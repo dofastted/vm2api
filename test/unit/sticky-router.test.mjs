@@ -9,12 +9,146 @@ import {
   explicitParentSessionId,
   isShortProbeRequest,
   mergeStickyConfig,
+  scopeAssignmentKey,
 } from '../../src/lib/pool/sticky-router.mjs'
 import { ProxyPool } from '../../src/lib/vm/proxy-pool.mjs'
 
 function tmpDir(prefix = 'kin-sticky-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
 }
+
+test('assignment keys isolate owners and pools without separating keys in the same scope', () => {
+  const scope = {
+    ownerScope: { type: 'user', userId: 'tenant-a' },
+    keyScope: { group_type: 'anthropic', allowed_vms: ['vm-02', 'vm-01'] },
+  }
+  const key = scopeAssignmentKey('sess:one', scope)
+  assert.equal(
+    key,
+    scopeAssignmentKey('sess:one', {
+      ...scope,
+      keyScope: { group_type: 'anthropic', allowed_vms: ['vm-01', 'vm-02'] },
+    }),
+  )
+  assert.notEqual(key, scopeAssignmentKey('sess:one', { ...scope, ownerScope: { type: 'user', userId: 'tenant-b' } }))
+  assert.notEqual(
+    key,
+    scopeAssignmentKey('sess:one', { ...scope, keyScope: { group_type: 'anthropic', allowed_vms: ['vm-01'] } }),
+  )
+  assert.notEqual(
+    scopeAssignmentKey('sess:one', { keyScope: { vm_pool_id: 'pool_11111111' } }),
+    scopeAssignmentKey('sess:one', { keyScope: { vm_pool_id: 'pool_22222222' } }),
+  )
+})
+
+test('session assignment exposes exact legacy pins without copying device or session rows', () => {
+  const router = new StickyRouter({ dataDir: tmpDir(), config: { sticky: { enabled: true } } })
+  router.bind('sess:one', { accountId: 'old-account', vmId: 'old-vm' })
+  router.bind('dev2:device', { accountId: 'device-account', vmId: 'device-vm' })
+  const req = { apiKeyRecord: { id: 'key-a' } }
+  const keys = router.sessionPoolKeys(req, {}, { sessionId: 'one', deviceId: 'device', assignmentMode: 'session' })
+  assert.deepEqual(keys.stickyKeys, [keys.stickyKey])
+  assert.deepEqual(keys.legacyBindingKeys, ['sess:one', 'p:anthropic:kkey-a:one', 'kkey-a:one'])
+  assert.equal(router.resolve(keys.stickyKey), null)
+  assert.equal(router.resolve('sess:one').vmId, 'old-vm')
+  assert.equal(router.resolve('dev2:device').vmId, 'device-vm')
+  const otherKey = router.sessionPoolKeys(
+    { apiKeyRecord: { id: 'key-b' } },
+    {},
+    { sessionId: 'one', assignmentMode: 'session' },
+  )
+  assert.equal(keys.stickyKey, otherKey.stickyKey)
+})
+
+test('root-only assignment fingerprints stay scoped and never adopt legacy fingerprint bindings', () => {
+  const router = new StickyRouter({ dataDir: tmpDir(), config: { sticky: { enabled: true } } })
+  const req = { apiKeyRecord: { id: 'key-a' } }
+  const body = {
+    metadata: { root_session_id: 'root' },
+    messages: [{ role: 'user', content: 'Synthetic root-only context' }],
+  }
+  const legacy = router.extractPoolKey(req, body, { platform: 'anthropic' })
+  router.bind(legacy, { accountId: 'old-account', vmId: 'old-vm' })
+  const options = { assignmentMode: 'session', rootSessionId: 'root', ownerScope: { type: 'user', userId: 'tenant-a' } }
+  const first = router.sessionPoolKeys(req, body, options)
+  assert.deepEqual(first.stickyKeys, [first.stickyKey])
+  assert.deepEqual(first.legacyBindingKeys, [])
+  assert.equal(router.resolve(first.stickyKey), null)
+  assert.equal(router.resolve(legacy).vmId, 'old-vm')
+  const otherRoot = router.sessionPoolKeys(req, body, { ...options, rootSessionId: 'other-root' })
+  const otherTenant = router.sessionPoolKeys(req, body, {
+    ...options,
+    ownerScope: { type: 'user', userId: 'tenant-b' },
+  })
+  assert.notEqual(first.stickyKey, otherRoot.stickyKey)
+  assert.notEqual(first.stickyKey, otherTenant.stickyKey)
+  router.reloadConfig({ sticky: { enabled: false } })
+  const disabled = router.sessionPoolKeys(req, body, options)
+  assert.equal(disabled.stickyKey, first.stickyKey)
+  router.bind(disabled.stickyKey, { accountId: 'new-account', vmId: 'new-vm' })
+  assert.equal(router.resolve(disabled.stickyKey).vmId, 'new-vm')
+})
+
+test('assignment pins remain enabled when legacy sticky routing is disabled', () => {
+  const router = new StickyRouter({ dataDir: tmpDir(), config: { sticky: { enabled: false } } })
+  const keys = router.sessionPoolKeys({}, {}, { sessionId: 'one', assignmentMode: 'session' })
+  const family = router.familyPoolKey({}, 'one', { trusted: true, assignmentMode: 'session' })
+  assert.equal(router.bind(keys.stickyKey, { accountId: 'account-a', vmId: 'vm-a' }), true)
+  assert.equal(router.resolve(keys.stickyKey).vmId, 'vm-a')
+  router.bind(family, { accountId: 'account-a', vmId: 'vm-a' })
+  router.rebindFamily(family, { accountId: 'account-b', vmId: 'vm-b' })
+  assert.equal(router.resolve(family).vmId, 'vm-b')
+  assert.equal(router.bind('sess:legacy', { accountId: 'account-a', vmId: 'vm-a' }), false)
+})
+
+test('nested parent-only relations survive restart, account removal and preserve tenant boundaries', () => {
+  const dataDir = tmpDir()
+  const config = { sticky: { enabled: true } }
+  const router = new StickyRouter({ dataDir, config })
+  const body = (session, parent) => ({
+    metadata: { user_id: { session_id: session, ...(parent ? { parent_session_id: parent } : {}) } },
+  })
+  const scope = { ownerScope: { type: 'user', userId: 'tenant-a' } }
+  assert.equal(router.resolveAssignmentRoot({}, body('child', 'root'), scope), 'root')
+  router.bind(scopeAssignmentKey('sess:child', scope), { accountId: 'account-a', vmId: 'vm-a' })
+  router.unbindByAccount({ accountId: 'account-a' })
+  const restarted = new StickyRouter({ dataDir, config })
+  assert.equal(restarted.resolveAssignmentRoot({}, body('grandchild', 'child'), scope), 'root')
+  assert.equal(restarted.resolveAssignmentRoot({}, body('grandchild'), scope), 'root')
+  assert.equal(
+    restarted.resolveAssignmentRoot({}, body('other', 'child'), { ownerScope: { type: 'user', userId: 'tenant-b' } }),
+    'child',
+  )
+})
+
+test('assignment relations reject cycles and expire with the sticky TTL', () => {
+  const router = new StickyRouter({ dataDir: tmpDir(), config: { sticky: { enabled: true } } })
+  const body = (session, parent) => ({ metadata: { user_id: { session_id: session, parent_session_id: parent } } })
+  assert.equal(router.resolveAssignmentRoot({}, body('a', 'root')), 'root')
+  assert.equal(router.resolveAssignmentRoot({}, body('root', 'a')), 'root')
+  assert.equal(router.repo.get(scopeAssignmentKey('relation:root')), null)
+  const relation = scopeAssignmentKey('relation:a')
+  router.repo.upsert(relation, { ...router.repo.get(relation), expires_at: Date.now() - 1 })
+  assert.equal(router.resolveAssignmentRoot({}, body('b', 'a')), 'a')
+  assert.equal(router.resolveAssignmentRoot({}, body('self', 'self')), 'self')
+})
+
+test('assignment sessions containing legacy alias markers survive router restart', () => {
+  const dataDir = tmpDir()
+  const config = { sticky: { enabled: true } }
+  const router = new StickyRouter({ dataDir, config })
+  const sessionId = 'caller:ch:session:dev:identity:envelope'
+  const keys = router.sessionPoolKeys({}, {}, { sessionId, assignmentMode: 'session' })
+  router.bind(keys.stickyKey, { accountId: 'account-a', vmId: 'vm-a' })
+  const child = { metadata: { user_id: { session_id: 'child:ch:one', parent_session_id: sessionId } } }
+  assert.equal(router.resolveAssignmentRoot({}, child), sessionId)
+  const restarted = new StickyRouter({ dataDir, config })
+  assert.equal(restarted.resolve(keys.stickyKey).vmId, 'vm-a')
+  assert.equal(
+    restarted.resolveAssignmentRoot({}, { metadata: { user_id: { session_id: 'child:ch:one' } } }),
+    sessionId,
+  )
+})
 
 test('string and header parent ids stay on one family and do not cross API keys', () => {
   const r = new StickyRouter({ dataDir: tmpDir(), config: { sticky: { enabled: true } } })

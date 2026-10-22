@@ -206,6 +206,14 @@ Claude PATCH `max_sessions` 返回 400 `claude_max_sessions_forbidden`；OpenAI 
 
 `PUT` 热更新。`tiers` 必须回传：该块是整体替换而非 patch，缺字段即置空。Claude 分档保存只传播到未手动覆盖的 Claude 槽。OpenAI `codex.quota` 按字段合并，不覆盖其它 Codex 协议/客户端配置，只更新跟随的 OpenAI 限额。
 
+### Claude 账号分配模式
+
+`pool.assignment_mode` 默认 `device`，可设为 `session`；未配置或非法值归一化为 `device`。通过现有 `PUT /api/panel/routing` 保存，无新增设置开关或环境变量。保存时按上文要求保留 `tiers` 等现有字段。
+
+会话模式按可信根会话分配，新会话优先使用有执行并发余量的合格账号，再应用现有策略。已绑定会话忙时在原账号等待。明确关联的子代理跟随根会话，保留各自的上下文与执行队列。无可信会话 ID 时按设备/指纹回退。详细规则见 [推理 API](API.md)。
+
+配置切换仅影响随后进入的请求。已有请求和等待队列保留进入时的分配模式；scheduler 与 runner 原实例热更新，不清空并发计数或预约。不同模式的绑定互不批量删除。首次进入会话模式时，仅在当前租户、账号池及其它候选条件允许时，惰性继承该会话或父会话的精确旧绑定；不会继承设备亲和，不修改旧绑定行。再次使用某模式时仍有效的绑定可继续使用。切换回设备模式后新请求遵循设备席位规则。
+
 ### OpenAI 传输与隐私
 
 设置页的「调度 → OpenAI」和「槽位 → OpenAI」进入同一个 `#/settings/openai` 页面。GPT 协议、客户端准入、目录版本及全局配额集中在这里；Claude 配置仍在原页。保存使用现有 `PUT /api/panel/routing`。

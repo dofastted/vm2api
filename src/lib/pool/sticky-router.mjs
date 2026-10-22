@@ -12,6 +12,7 @@ import {
   extractCallerSession,
   firstUserIdentityText,
   parseUserId,
+  resolveInboundIdentity,
 } from '../identity/identity-rewrite.mjs'
 
 export const DEFAULT_STICKY_HEADER_KEYS = [
@@ -44,6 +45,28 @@ export function scopeStickyKey(key, platform) {
   if (!name) return raw
   const prefix = `p:${name}:`
   return raw.startsWith(prefix) ? raw : `${prefix}${raw}`
+}
+
+/** Assignment identities share only an owner and the same allowed account pool. */
+export function scopeAssignmentKey(key, { ownerScope = null, keyScope = null } = {}) {
+  if (!key) return null
+  const type = ownerScope?.type || 'platform'
+  const owner = type === 'user' ? String(ownerScope?.userId || '').trim() : ''
+  const group = keyScope?.group_type || 'all'
+  const pool = keyScope?.vm_pool_id
+    ? ['pool', String(keyScope.vm_pool_id)]
+    : ['vms', group === 'all' ? [] : [...new Set(keyScope?.allowed_vms || [])].map(String).sort()]
+  const scope = crypto
+    .createHash('sha256')
+    .update(JSON.stringify([type, owner, group, pool]))
+    .digest('hex')
+  // Keep caller-controlled separators out of legacy alias cleanup patterns.
+  const identity = crypto.createHash('sha256').update(String(key)).digest('hex')
+  return `assignment:${scope}:${identity}`
+}
+
+function assignmentKey(key) {
+  return /^assignment:[a-f0-9]{64}:/.test(String(key || ''))
 }
 
 export function mergeStickyConfig(config) {
@@ -378,13 +401,99 @@ export class StickyRouter {
     return id ? `family2:${id}` : null
   }
 
+  /** Explicit child relationships survive control-plane restarts independently of account pins. */
+  resolveAssignmentRoot(req, body = {}, { ownerScope, keyScope } = {}) {
+    const headers = req?.headers || {}
+    const parsed = parseUserId(body?.metadata?.user_id) || {}
+    const meta = body?.metadata && typeof body.metadata === 'object' ? body.metadata : {}
+    const identity = resolveInboundIdentity({ inbound: body, body, headers })
+    const own = identity.sessionId || extractCallerSession({ inbound: body, body, headers })
+    const explicitRoot = String(
+      parsed.root_session_id ||
+        meta.root_session_id ||
+        headers['x-kin-root-session'] ||
+        claudeCodeAgentRootSession({ inbound: body, body, headers }) ||
+        '',
+    ).trim()
+    const parent = String(
+      parsed.parent_session_id || meta.parent_session_id || headers['x-kin-parent-session'] || '',
+    ).trim()
+    const relationKey = (session) => scopeAssignmentKey(`relation:${session}`, { ownerScope, keyScope })
+    const now = Date.now()
+    const relation = (session) => {
+      const row = this.repo.get(relationKey(session))
+      return row && row.expires_at > now ? String(row.session_id || '') : ''
+    }
+    let root = explicitRoot || parent || (own && relation(own)) || identity.sessionId
+    if (!root) return ''
+    const seen = new Set(own ? [own] : [])
+    let cursor = root
+    for (let depth = 0; depth < 32; depth += 1) {
+      if (seen.has(cursor)) return identity.sessionId || ''
+      seen.add(cursor)
+      const next = relation(cursor)
+      if (!next) break
+      cursor = next
+      if (!explicitRoot) root = next
+      if (depth === 31) return identity.sessionId || ''
+    }
+    if (own && own !== root) {
+      this.repo.upsert(relationKey(own), {
+        account_id: null,
+        vm_id: null,
+        session_id: root,
+        bound_at: now,
+        expires_at: now + (this.config.ttl_seconds || 86400) * 1000,
+      })
+    }
+    return root
+  }
+
   /**
    * Anthropic session sticky keys. A trusted inbound session_id maps to one
    * canonical key across API keys; a still-live legacy API-key-scoped row is
    * copied onto it once. Without a trusted session_id the legacy aliases stay.
    * @returns {{ stickyKey: string|null, stickyKeys: string[] }}
    */
-  sessionPoolKeys(req, body = {}, { sessionId = '', deviceId = '', migrate = true } = {}) {
+  sessionPoolKeys(
+    req,
+    body = {},
+    {
+      sessionId = '',
+      deviceId = '',
+      migrate = true,
+      assignmentMode = 'device',
+      rootSessionId = '',
+      ownerScope,
+      keyScope,
+    } = {},
+  ) {
+    if (assignmentMode === 'session') {
+      const ownSessionId = sessionId || extractCallerSession({ inbound: body, body, headers: req?.headers || {} })
+      if (!ownSessionId) {
+        const fingerprint = firstUserFingerprint(body)
+        const root = rootSessionId || explicitParentSessionId(body, req?.headers || {})
+        const stickyKey = fingerprint
+          ? scopeAssignmentKey(`fingerprint:${JSON.stringify([root, fingerprint])}`, { ownerScope, keyScope })
+          : null
+        return { stickyKey, stickyKeys: stickyKey ? [stickyKey] : [], legacyBindingKeys: [] }
+      }
+      const canonical = this.canonicalSessionKey(ownSessionId)
+      const stickyKey = scopeAssignmentKey(canonical, { ownerScope, keyScope })
+      return {
+        stickyKey,
+        stickyKeys: [stickyKey],
+        // The scheduler checks these exact old session pins against current
+        // eligibility before copying one. Device and fingerprint aliases never migrate.
+        legacyBindingKeys: [
+          ...new Set([
+            canonical,
+            scopeStickyKey(this.isolateKey(ownSessionId, req), 'anthropic'),
+            this.isolateKey(ownSessionId, req),
+          ]),
+        ],
+      }
+    }
     if (!this.config.enabled) return { stickyKey: null, stickyKeys: [] }
     const canonical = this.canonicalSessionKey(sessionId)
     if (!canonical) {
@@ -409,7 +518,10 @@ export class StickyRouter {
    * Family lock key. Trusted parent/root ids use the canonical key; a live
    * legacy family row is copied onto it once so an in-flight family stays put.
    */
-  familyPoolKey(req, sessionId, { trusted = false } = {}) {
+  familyPoolKey(req, sessionId, { trusted = false, assignmentMode = 'device', ownerScope, keyScope } = {}) {
+    if (assignmentMode === 'session' && trusted) {
+      return scopeAssignmentKey(this.canonicalFamilyKey(sessionId), { ownerScope, keyScope })
+    }
     const legacy = this.familyKey(req, sessionId, 'anthropic')
     if (!trusted || !legacy) return legacy
     const canonical = this.canonicalFamilyKey(sessionId)
@@ -424,7 +536,7 @@ export class StickyRouter {
 
   /** @returns {{ accountId: string, vmId: string } | null } */
   resolve(key) {
-    if (!key || !this.config.enabled) return null
+    if (!key || (!this.config.enabled && !assignmentKey(key))) return null
     this._purge()
     const ent = this.repo.get(key)
     if (!ent) return null
@@ -447,7 +559,7 @@ export class StickyRouter {
     { accountId, vmId, sessionId = null, deviceId = null, slotIndex = null } = {},
     { countHit = true, ifGeneration = null, replaceSession = false, clearSlot = false } = {},
   ) {
-    if (!key || !this.config.enabled) return false
+    if (!key || (!this.config.enabled && !assignmentKey(key))) return false
     const ttl = (this.config.ttl_seconds || 86400) * 1000
     const prev = this.repo.get(key) || {}
     const prevGeneration = Number(prev.generation) || 0
@@ -494,7 +606,7 @@ export class StickyRouter {
 
   /** Move an entire family together. Session rows stay until their next turn. */
   rebindFamily(key, { accountId, vmId } = {}) {
-    if (!key || !this.config.enabled || !accountId || !vmId) return null
+    if (!key || (!this.config.enabled && !assignmentKey(key)) || !accountId || !vmId) return null
     const ttl = (this.config.ttl_seconds || 86400) * 1000
     const prev = this.repo.get(key) || {}
     const generation = (Number(prev.generation) || 0) + 1
