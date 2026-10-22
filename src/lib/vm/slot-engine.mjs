@@ -208,9 +208,13 @@ export function parseOfficialCcInferencePatch(value) {
 }
 
 export function resolveSlotPersonaPreset(vm, routing = {}) {
+  const compat = routing?.compatibility || {}
+  // Official-only deployments keep the caller's genuine Claude Code wire body.
+  // The kernel must not append the full official prompt on top of it; `zero`
+  // is the only kernel layout that still keeps the caller system block.
+  if (compat.official_cc_passthrough === true) return 'zero'
   const fromVm = normalizeSlotPersonaPreset(vm?.persona_preset, { inherit: true })
   if (fromVm) return fromVm
-  const compat = routing?.compatibility || {}
   if (compat.persona_preset != null && String(compat.persona_preset).trim() !== '') {
     return normalizePersonaPreset(compat.persona_preset)
   }

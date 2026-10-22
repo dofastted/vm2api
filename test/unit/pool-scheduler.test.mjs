@@ -334,6 +334,35 @@ test('cooldown is waitable and becomes selectable after it expires', async (t) =
   selected.release()
 })
 
+test('refreshes cooldown time after an async health check crosses the expiry', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const repo = new RuntimeRepo()
+  const pool = new PoolScheduler({
+    projectRoot: root,
+    runtimeRepo: repo,
+    accountQuota: { canAccept: () => ({ ok: true }) },
+    workerHealth: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      return { ok: true, credential: { generation: 1, has_access: true } }
+    },
+    config: { fallback_wait_timeout_ms: 200, sticky_wait_timeout_ms: 200 },
+  })
+  repo.markCooldown('account-1', {
+    vmId: 'vm-01',
+    until: Date.now() + 20,
+    reason: 'provider_transient_error',
+  })
+  const selected = await pool.selectAndReserve({
+    model: 'claude-test',
+    excluded: new Set(['account-2']),
+    allowWait: true,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.accountId, 'account-1')
+  selected.release()
+})
+
 test('busy slot waits for release instead of failing closed', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))

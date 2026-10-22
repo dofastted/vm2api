@@ -56,20 +56,6 @@ export const FULL_ENV_KEYS = Object.freeze([
   'linux_kernel',
 ])
 
-export const HARDWARE_ENV_KEYS = Object.freeze([
-  'cpu_model',
-  'cpu_cores',
-  'memory_bytes',
-  'root_disk',
-  'mac',
-  'dmi_manufacturer',
-  'dmi_product',
-  'dmi_version',
-  'dmi_family',
-  'dmi_serial',
-  'dmi_uuid',
-])
-
 function str(v) {
   return v == null ? '' : String(v)
 }
@@ -180,43 +166,6 @@ export function buildFullEnvJson(id = {}) {
   }
   const buildTime = str(id.build_time).trim()
   if (buildTime) env.build_time = buildTime
-  applyHardwareEnv(env, id)
-  return env
-}
-
-function hardwareNumber(value) {
-  const n = typeof value === 'number' ? value : Number.parseInt(String(value ?? ''), 10)
-  return Number.isFinite(n) && n >= 0 ? n : null
-}
-
-/** Copy observed guest hardware into telemetry env. Empty facts stay omitted. */
-export function applyHardwareEnv(env, id = {}) {
-  const hw = id.hardware && typeof id.hardware === 'object' ? id.hardware : {}
-  const dmi = hw.dmi && typeof hw.dmi === 'object' ? hw.dmi : {}
-  const src = {
-    cpu_model: id.cpu_model ?? hw.cpu_model,
-    cpu_cores: id.cpu_cores ?? hw.cpu_cores,
-    memory_bytes: id.memory_bytes ?? hw.memory_bytes,
-    root_disk: id.root_disk ?? hw.root_disk,
-    mac: id.mac ?? hw.mac,
-    dmi_manufacturer: id.dmi_manufacturer ?? dmi.manufacturer,
-    dmi_product: id.dmi_product ?? dmi.product,
-    dmi_version: id.dmi_version ?? dmi.version,
-    dmi_family: id.dmi_family ?? dmi.family,
-    dmi_serial: id.dmi_serial ?? dmi.serial,
-    dmi_uuid: id.dmi_uuid ?? dmi.uuid,
-  }
-  for (const key of HARDWARE_ENV_KEYS) {
-    const value = src[key]
-    if (value == null || value === '') continue
-    if (key === 'cpu_cores' || key === 'memory_bytes') {
-      const n = hardwareNumber(value)
-      if (n != null) env[key] = n
-      continue
-    }
-    const text = String(value).trim()
-    if (text) env[key] = text
-  }
   return env
 }
 

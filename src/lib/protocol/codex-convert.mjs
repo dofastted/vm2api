@@ -15,11 +15,11 @@ const IDENTITY_KEYS = [
   'client_metadata',
 ]
 
-export function stripCodexIdentity(body = {}) {
+export function stripCodexIdentity(body = {}, { preserveMetadata = false } = {}) {
   if (!body || typeof body !== 'object') return {}
   const next = { ...body }
   for (const key of IDENTITY_KEYS) delete next[key]
-  if (next.metadata && typeof next.metadata === 'object') {
+  if (!preserveMetadata && next.metadata && typeof next.metadata === 'object') {
     const metadata = { ...next.metadata }
     delete metadata.user_id
     delete metadata.device_id
@@ -27,6 +27,23 @@ export function stripCodexIdentity(body = {}) {
     next.metadata = metadata
   }
   return next
+}
+
+/**
+ * Official Codex Responses passthrough.
+ *
+ * The official CLI already sends the complete Responses body: instructions,
+ * input items, tools, reasoning, service_tier, prompt_cache_key and session
+ * fields. Normalizing it (system→developer, max_output/temperature strip,
+ * prompt_cache_key rebuild) changes the cached prefix and the session identity.
+ * Only strip credentials/client routing metadata; keep the wire body intact.
+ */
+export function toOfficialCodexPassthrough(body = {}) {
+  return {
+    ok: true,
+    body: stripCodexIdentity(body, { preserveMetadata: true }),
+    converted: false,
+  }
 }
 
 function textParts(content) {
@@ -307,7 +324,8 @@ export function anthropicToCodexResponses(body = {}) {
   })
 }
 
-export function toCodexResponses(protocol, body, convert = {}) {
+export function toCodexResponses(protocol, body, convert = {}, { officialPassthrough = false } = {}) {
+  if (officialPassthrough && protocol === 'openai.responses') return toOfficialCodexPassthrough(body)
   const stripped = stripCodexIdentity(body)
   if (protocol === 'openai.responses') {
     return {

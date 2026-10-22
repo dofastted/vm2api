@@ -223,3 +223,54 @@ test('READ_IDENTITY hardware probes survive missing optional commands', async ()
   assert.ok(result.body.identity.hardware.memory_bytes > 0)
   assert.ok(result.body.identity.hardware.cpu_cores > 0)
 })
+
+function slotComputerFixture(t, { cpuMax, memoryMax }) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'guest-slot-computer-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const hw = path.join(root, 'kin-hardware')
+  const dmi = path.join(root, 'kin-dmi')
+  const cg = path.join(root, 'cgroup')
+  for (const dir of [hw, dmi, cg]) fs.mkdirSync(dir)
+  const files = {
+    [path.join(hw, 'cpu_brand')]: 'Persona CPU i5-1135G7',
+    [path.join(hw, 'logical_cpus')]: '8',
+    [path.join(hw, 'ram_bytes')]: '8589934592',
+    [path.join(hw, 'mac')]: '02:aa:bb:cc:dd:ee',
+    [path.join(dmi, 'sys_vendor')]: 'Dell Inc.',
+    [path.join(dmi, 'product_name')]: 'Inspiron 5502',
+    [path.join(dmi, 'product_family')]: 'Inspiron',
+    [path.join(cg, 'cpu.max')]: cpuMax,
+    [path.join(cg, 'memory.max')]: memoryMax,
+  }
+  for (const [file, body] of Object.entries(files)) fs.writeFileSync(file, `${body}\n`)
+  return `KIN_HW_DIR='${hw}'\nKIN_DMI_DIR='${dmi}'\nKIN_CGROUP_DIR='${cg}'\n`
+}
+
+async function readWithPrefix(prefix) {
+  return readGuestIdentity({ vmId: 'vm-05', vm: { runtime: { type: 'docker' } } }, '', {
+    run: (_command, args, opts) => promisify(execFile)('sh', ['-c', `${prefix}${args.at(-1)}`], opts),
+  })
+}
+
+test('Docker slot hardware comes from the slot computer and cgroup limits, not the host', async (t) => {
+  const prefix = slotComputerFixture(t, { cpuMax: '150000 100000', memoryMax: '4294967296' })
+  const result = await readWithPrefix(prefix)
+  assert.equal(result.ok, true)
+  const hw = result.body.identity.hardware
+  assert.equal(hw.cpu_model, 'Persona CPU i5-1135G7')
+  assert.equal(hw.cpu_cores, 2)
+  assert.equal(hw.memory_bytes, 4294967296)
+  assert.equal(hw.mac, '02:aa:bb:cc:dd:ee')
+  assert.equal(hw.dmi.manufacturer, 'Dell Inc.')
+  assert.equal(hw.dmi.product, 'Inspiron 5502')
+  assert.equal(hw.dmi.family, 'Inspiron')
+})
+
+test('unlimited cgroup falls back to the slot computer cores and memory', async (t) => {
+  const prefix = slotComputerFixture(t, { cpuMax: 'max 100000', memoryMax: 'max' })
+  const result = await readWithPrefix(prefix)
+  assert.equal(result.ok, true)
+  const hw = result.body.identity.hardware
+  assert.equal(hw.cpu_cores, 8)
+  assert.equal(hw.memory_bytes, 8589934592)
+})

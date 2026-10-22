@@ -994,27 +994,58 @@ export function jevDocument(inbound, body = inbound) {
 }
 
 /** Jev also sees the client system. Roleplay tasks put the sexual text there and leave the user turn as a character card. */
+function jevModelContentText(content) {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) return content.map(jevModelContentText).filter(Boolean).join('\n')
+  if (!content || typeof content !== 'object') return ''
+  const type = String(content.type || '')
+  if (type === 'tool_result' || type === 'function_call_output' || type.endsWith('_tool_result')) return ''
+  if (typeof content.text === 'string') return content.text
+  if (typeof content.content === 'string') return content.content
+  if (Array.isArray(content.content)) return jevModelContentText(content.content)
+  return ''
+}
+
+/**
+ * Preserve provenance for semantic moderation. The old document flattened
+ * system and user turns, so quoted attacks in history looked like the current
+ * ask. Labels are context for the decision model, not an allowlist.
+ */
 export function jevModelDocument(inbound, body = inbound) {
   const seen = new Set()
   const parts = []
-  const push = (text) => {
+  const push = (source, text) => {
     const norm = normalizeText(text)
-    if (!norm || seen.has(norm)) return
-    seen.add(norm)
-    parts.push(norm)
+    // Deduplicate repeated copies from inbound/body, but keep each message/input
+    // position distinct so repeated user turns remain separate evidence.
+    const key = `${source}\u0000${norm}`
+    if (!norm || seen.has(key)) return
+    seen.add(key)
+    parts.push(`[${source}]\n${norm}`)
   }
   for (const src of [inbound, body]) {
-    // Responses carries the client system prompt as `instructions`.
     for (const field of ['system', 'instructions']) {
       const system = src?.[field]
       const blocks = typeof system === 'string' ? [system] : Array.isArray(system) ? system : []
-      for (const block of blocks) {
-        push(typeof block === 'string' ? block : block?.text)
-      }
+      for (const block of blocks) push('system', typeof block === 'string' ? block : block?.text)
     }
+    const messages = Array.isArray(src?.messages) ? src.messages : []
+    messages.forEach((message, index) => {
+      const role = String(message?.role || 'unknown').toLowerCase()
+      if (role === 'tool' || role === 'function' || role === 'assistant' || role === 'system') return
+      push(`${role} message ${index + 1}`, jevModelContentText(message?.content))
+    })
+    const input = typeof src?.input === 'string' ? [src.input] : Array.isArray(src?.input) ? src.input : []
+    input.forEach((item, index) => {
+      if (typeof item === 'string') {
+        push(`user input ${index + 1}`, item)
+        return
+      }
+      const role = String(item?.role || 'user').toLowerCase()
+      if (role === 'tool' || role === 'assistant' || role === 'system') return
+      push(`${role} input ${index + 1}`, jevModelContentText(item?.content ?? item))
+    })
   }
-  const user = jevDocument(inbound, body)
-  if (user) parts.push(user)
   return parts.join('\n')
 }
 

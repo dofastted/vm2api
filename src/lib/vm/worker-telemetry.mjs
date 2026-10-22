@@ -15,7 +15,6 @@ import {
   buildFullEnvJson,
   DEFAULT_PROCESS_RANGES,
   distroVersionFromPretty,
-  HARDWARE_ENV_KEYS,
   officialDeviceID,
   telemetryCodeUa,
   telemetryShell,
@@ -167,10 +166,7 @@ export function buildWorkerTelemetry(vm, projectRoot, routing = null) {
     process: { ...DEFAULT_PROCESS_RANGES },
     source: 'official-cc-init',
   }
-  payload.env = buildFullEnvJson({ ...payload, hardware: hw || undefined })
-  for (const key of HARDWARE_ENV_KEYS) {
-    if (payload.env[key] != null) payload[key] = payload.env[key]
-  }
+  payload.env = buildFullEnvJson(payload)
   return {
     enabled: true,
     upload_interval_seconds: telemetryUploadInterval(routingFor(projectRoot, routing)),

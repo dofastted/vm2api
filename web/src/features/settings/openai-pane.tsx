@@ -168,6 +168,21 @@ export function OpenaiPane({
                   aria-label='允许官方 Codex 客户端'
                 />
               </SettingRow>
+              <SettingRow
+                label='官方 Codex 客户端透传'
+                desc={
+                  codex.official_passthrough === true
+                    ? '开：保留官方 Responses body、instructions、prompt_cache_key 与 session，不再按 attempt 重建。'
+                    : '关：官方 Codex 也走 body 归一化和 prompt_cache_key 重建。'
+                }
+              >
+                <Switch
+                  checked={codex.official_passthrough === true}
+                  disabled={saving}
+                  onCheckedChange={(on) => update({ official_passthrough: on })}
+                  aria-label='官方 Codex 客户端透传'
+                />
+              </SettingRow>
               <SettingRow label='OpenAI 兼容客户端'>
                 <Switch
                   checked={codexClient(codex, 'openai_compatible')}

@@ -114,7 +114,7 @@ func TestLoadTelemetryKeepsEnvBetasAndSource(t *testing.T) {
 	}
 }
 
-func TestLoadTelemetryKeepsHardwareEnvAndIdentity(t *testing.T) {
+func TestLoadTelemetryAcceptsOldHardwareFields(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "worker.json")
 	raw := `{
@@ -148,11 +148,9 @@ func TestLoadTelemetryKeepsHardwareEnvAndIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tel.Identity.CPUModel != "Intel(R) Xeon(R) CPU" || tel.Identity.CPUCores != 4 {
-		t.Fatalf("identity hardware=%+v", tel.Identity)
-	}
-	if tel.Identity.Env["root_disk"] != "/dev/vda2" || tel.Identity.Env["dmi_product"] != "OptiPlex 7090" {
-		t.Fatalf("env=%v", tel.Identity.Env)
+	// Older worker.json still loads; the sender drops the hardware keys.
+	if !tel.Enabled || tel.Identity.DeviceID != "dev" || tel.Identity.Env["platform"] != "linux" {
+		t.Fatalf("telemetry=%+v", tel)
 	}
 }
 

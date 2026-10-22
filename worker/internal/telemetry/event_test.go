@@ -177,10 +177,11 @@ func TestEventUsesConfiguredEnvAndOmitsBetas(t *testing.T) {
 	}
 }
 
-func TestSanitizeEnvKeepsObservedHardwareAndDropsSecrets(t *testing.T) {
+func TestSanitizeEnvDropsGuestHardwareAndSecrets(t *testing.T) {
 	ev := InitEvent(Identity{
 		Env: map[string]any{
 			"platform":         "linux",
+			"shell":            "zsh",
 			"cpu_model":        "Intel(R) Xeon(R) CPU",
 			"cpu_cores":        float64(4),
 			"memory_bytes":     float64(4294967296),
@@ -199,16 +200,10 @@ func TestSanitizeEnvKeepsObservedHardwareAndDropsSecrets(t *testing.T) {
 		},
 	}, time.Date(2026, 8, 23, 1, 0, 0, 0, time.UTC))
 	env, _ := ev.EventData["env"].(map[string]any)
-	if env["cpu_model"] != "Intel(R) Xeon(R) CPU" {
-		t.Fatalf("cpu_model=%v", env["cpu_model"])
+	if env["platform"] != "linux" || env["shell"] != "zsh" {
+		t.Fatalf("official keys lost: %v", env)
 	}
-	if env["cpu_cores"] != float64(4) || env["memory_bytes"] != float64(4294967296) {
-		t.Fatalf("numeric hardware=%v", env)
-	}
-	if env["dmi_product"] != "OptiPlex 7090" || env["mac"] != "52:54:00:11:22:33" {
-		t.Fatalf("dmi/mac=%v", env)
-	}
-	for _, drop := range []string{"node_version", "authorization", "hostname", "machine_id"} {
+	for _, drop := range append([]string{"node_version", "authorization", "hostname", "machine_id"}, guestHardwareKeys...) {
 		if _, ok := env[drop]; ok {
 			t.Fatalf("leaked %s in %v", drop, env)
 		}
@@ -222,26 +217,18 @@ func TestSanitizeEnvKeepsObservedHardwareAndDropsSecrets(t *testing.T) {
 	}
 }
 
-func TestEnvBlockFallbackUsesIdentityHardware(t *testing.T) {
-	ev := InitEvent(Identity{
-		Platform:        "linux",
-		CPUModel:        "AMD EPYC",
-		CPUCores:        8,
-		MemoryBytes:     8589934592,
-		RootDisk:        "/dev/vda1",
-		MAC:             "52:54:00:aa:bb:cc",
-		DMIManufacturer: "QEMU",
-		DMIProduct:      "Standard PC",
-		DMIUUID:         "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-	}, time.Date(2026, 8, 23, 1, 0, 0, 0, time.UTC))
+func TestEnvBlockFallbackHasNoGuestHardware(t *testing.T) {
+	ev := InitEvent(Identity{Platform: "linux"}, time.Date(2026, 8, 23, 1, 0, 0, 0, time.UTC))
 	env, _ := ev.EventData["env"].(map[string]any)
-	if env["cpu_model"] != "AMD EPYC" {
-		t.Fatalf("cpu_model=%v", env["cpu_model"])
+	for _, key := range guestHardwareKeys {
+		if _, ok := env[key]; ok {
+			t.Fatalf("fallback env has %s: %v", key, env)
+		}
 	}
-	if env["cpu_cores"] != int64(8) || env["memory_bytes"] != int64(8589934592) {
-		t.Fatalf("numeric=%v", env)
-	}
-	if env["dmi_manufacturer"] != "QEMU" || env["mac"] != "52:54:00:aa:bb:cc" {
-		t.Fatalf("dmi/mac=%v", env)
-	}
+}
+
+var guestHardwareKeys = []string{
+	"cpu_model", "cpu_cores", "memory_bytes", "root_disk", "mac",
+	"dmi_manufacturer", "dmi_product", "dmi_version", "dmi_family",
+	"dmi_serial", "dmi_uuid",
 }

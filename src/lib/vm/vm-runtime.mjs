@@ -149,26 +149,15 @@ export function displayName(vmId) {
   return String(vmId || '').replace(/^vm-/, '')
 }
 
-export function inspectContainer(name) {
-  const r = sh([
-    'docker',
-    'inspect',
-    '--format',
-    '{{.State.Running}}|{{.State.Pid}}|{{.HostConfig.NetworkMode}}|{{.State.StartedAt}}|{{.Config.Image}}|{{.Config.Hostname}}|{{index .Config.Labels "kin.vm.runtime"}}|{{index .Config.Labels "kin.vm.role"}}|{{.State.Restarting}}|{{.Id}}',
-    name,
-  ])
-  if (!r.ok) {
-    if (/^(?:Error(?: response from daemon)?: )?No such (?:object|container): [^\r\n]+$/i.test(r.stderr)) return null
-    throw Object.assign(new Error(r.stderr || 'docker inspect failed'), { code: 'container_inspect_failed' })
-  }
-  const [running, pid, networkMode, startedAt, image, hostname, runtime, role, restarting, id] = r.stdout.split('|')
+function parseInspectStdout(name, stdout) {
+  const [running, pid, networkMode, startedAt, image, hostname, runtime, role, restarting, id] = stdout.split('|')
   if (
     !['true', 'false'].includes(running) ||
     !['true', 'false'].includes(restarting) ||
     !id?.trim() ||
     !/^\d+$/.test(pid)
   ) {
-    throw Object.assign(new Error('Invalid docker inspect state'), { code: 'container_inspect_failed' })
+    return null
   }
   // Docker reports Running=true during a restart-policy backoff; nothing can be exec'd there.
   const crashLooping = restarting === 'true'
@@ -187,6 +176,38 @@ export function inspectContainer(name) {
     runtime: String(runtime || '').trim() || null,
     role: String(role || '').trim() || null,
   }
+}
+
+const INSPECT_FORMAT =
+  '{{.State.Running}}|{{.State.Pid}}|{{.HostConfig.NetworkMode}}|{{.State.StartedAt}}|{{.Config.Image}}|{{.Config.Hostname}}|{{index .Config.Labels "kin.vm.runtime"}}|{{index .Config.Labels "kin.vm.role"}}|{{.State.Restarting}}|{{.Id}}'
+
+/**
+ * @returns {{ status: 'found', container: object } | { status: 'missing' } | { status: 'error', error: string, code?: number }}
+ */
+export function inspectContainerOutcome(name, { run = sh } = {}) {
+  const r = run(['docker', 'inspect', '--format', INSPECT_FORMAT, name])
+  if (r.ok) {
+    const container = parseInspectStdout(name, r.stdout)
+    return container ? { status: 'found', container } : { status: 'error', error: 'Invalid docker inspect state' }
+  }
+  if (
+    /^(?:Error(?: response from daemon)?: )?No such (?:object|container): [^\r\n]+$/i.test(r.stderr || r.stdout || '')
+  ) {
+    return { status: 'missing' }
+  }
+  return {
+    status: 'error',
+    error: (r.stderr || r.stdout || 'docker inspect failed').trim(),
+    code: r.code,
+  }
+}
+
+export function inspectContainer(name, opts) {
+  const outcome = inspectContainerOutcome(name, opts)
+  if (outcome.status === 'error') {
+    throw Object.assign(new Error(outcome.error), { code: 'container_inspect_failed' })
+  }
+  return outcome.status === 'found' ? outcome.container : null
 }
 
 /** Label on GPT slot containers: their PID 1 idles; the Codex kernel runs on the host. */

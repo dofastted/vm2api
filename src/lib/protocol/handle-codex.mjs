@@ -189,7 +189,7 @@ export function isRetryableSameCodexAccount(
   return false
 }
 
-function applyCodexRebuildBody(body, sessionId, mode) {
+export function applyCodexRebuildBody(body, sessionId, mode) {
   const out = { ...body }
   if (mode !== 'rebuild') return out
   out.prompt_cache_key = sessionId
@@ -615,7 +615,10 @@ export async function handleCodexProtocol({
       error: { type: 'permission_error', code: restriction.code, message: restriction.message },
     })
   }
-  const converted = toCodexResponses(protocol, ctx.body, codex.convert)
+  const officialCodexPassthrough = codex.official_passthrough === true && restriction.kind === 'official_codex'
+  const converted = toCodexResponses(protocol, ctx.body, codex.convert, {
+    officialPassthrough: officialCodexPassthrough,
+  })
   if (!converted.ok) {
     stats.errors++
     logBag.via = 'codex-kernel'
@@ -641,7 +644,7 @@ export async function handleCodexProtocol({
   })
   const stream = inbound?.stream !== false && ctx.body?.stream !== false
   const inboundSession = sessionFrom(req, converted.body)
-  const sessionMode = outboundSessionMode(routing)
+  const sessionMode = officialCodexPassthrough ? 'passthrough' : outboundSessionMode(routing)
   const callerSession = extractCallerSession({
     inbound: converted.body,
     body: converted.body,

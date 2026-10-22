@@ -13,6 +13,7 @@ import { isNativeNodeVm, vmNodeId } from '../cluster/placement.mjs'
 import { slotHost } from './slot-host.mjs'
 import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 import { restartRemoteServices } from '../cluster/remote-slot.mjs'
+import { isMissingContainerMessage, logTelemetryContainerSkip, telemetryContainerSkip } from './docker-container.mjs'
 import {
   drainEgressForProxyConfig,
   egressPidsForProxyConfig,
@@ -71,7 +72,17 @@ async function restartLocalServices({ projectRoot, vm, enabled, egressOpts = {} 
   if (!telemetry.ok) return telemetry
   const egress = await restartLocalEgress(projectRoot, vm, egressOpts)
   if (!egress.ok) return egress
-  return { ...telemetry, egress: egress.egress }
+  return { ...telemetry, egress: egress.egress ?? (telemetry.skipped ? 'unchanged' : undefined) }
+}
+
+function normalizeTelemetryRefresh(changed, vm) {
+  if (changed?.ok || changed?.skipped || changed?.vmOperationUncertain) return changed
+  const message = String(changed?.error || changed?.code || '')
+  if (!isMissingContainerMessage(message)) return changed
+  const container =
+    String(vm?.runtime?.container || '').trim() || (vm?.id ? `kin-${String(vm.id).replace(/^vm-/, '')}` : '')
+  logTelemetryContainerSkip('fleet', vm.id, container, message)
+  return telemetryContainerSkip(container, message)
 }
 
 function sleep(ms) {
@@ -160,15 +171,24 @@ export async function updateOneSlot(
       const enabled =
         telemetryEnabled === undefined ? vm.seed_policy?.telemetry_disabled === false : telemetryEnabled === true
       const vmRef = getVm(projectRoot, id) || vm
-      const changed = telemetryFn
-        ? await telemetryFn({ projectRoot, vm: vmRef, telemetryEnabled: enabled, enabled })
-        : isNativeNodeVm(vmRef)
-          ? await slotHost(vmRef).restartTelemetry(vmRef, { enabled })
-          : vmNodeId(vm)
-            ? await restartRemoteServices(vmRef, projectRoot, { telemetryEnabled: enabled })
-            : await restartLocalServices({ projectRoot, vm: vmRef, enabled })
+      const changed = normalizeTelemetryRefresh(
+        telemetryFn
+          ? await telemetryFn({ projectRoot, vm: vmRef, telemetryEnabled: enabled, enabled })
+          : isNativeNodeVm(vmRef)
+            ? await slotHost(vmRef).restartTelemetry(vmRef, { enabled })
+            : vmNodeId(vm)
+              ? await restartRemoteServices(vmRef, projectRoot, { telemetryEnabled: enabled })
+              : await restartLocalServices({ projectRoot, vm: vmRef, enabled }),
+        vmRef,
+      )
       result.telemetry = changed
       if (changed?.vmOperationUncertain) result.vmOperationUncertain = true
+      if (changed?.skipped) {
+        result.skipped = true
+        result.skip_reason = changed.reason || 'container_unavailable'
+        result.ok = true
+        return result
+      }
       if (!changed?.ok) {
         result.error = changed?.error || 'telemetry service update failed'
         result.code = changed?.code || 'telemetry_update_failed'
@@ -226,11 +246,13 @@ export async function runFleetUpdate(
     }),
   )
   const okCount = items.filter((row) => row.ok).length
+  const skippedCount = items.filter((row) => row.skipped).length
   return {
     action: nextAction,
     concurrency: conc,
     total: items.length,
     ok_count: okCount,
+    skipped_count: skippedCount,
     failed_count: items.length - okCount,
     items,
   }

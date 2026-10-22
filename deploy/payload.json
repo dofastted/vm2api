@@ -1,6 +1,6 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.10.19-kernel-cli",
+  "release": "payload-2026.10.22-computer-linux",
   "files": [
     {
       "path": "bin/kin-kernel",
@@ -23,8 +23,8 @@
     {
       "path": "bin/kin-computer",
       "asset": "kin-computer",
-      "size": 5527768,
-      "sha256": "fa431f10321e6043ee88a4012b6dd8c515acac3a63fc40645091d1edf6334c01"
+      "size": 5531864,
+      "sha256": "a64970838469da0e3b86831212e8f6b0806e3433a65dd062f6556252403c2bb9"
     },
     {
       "path": "share/wrap-cli/cli-node",

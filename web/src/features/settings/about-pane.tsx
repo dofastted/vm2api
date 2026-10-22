@@ -272,7 +272,7 @@ export function AboutPane() {
 
 function ChangelogBlock({ entry }: { entry: ChangelogEntry }) {
   return (
-    <article className='space-y-1.5'>
+    <article className='space-y-1.5 wrap-anywhere'>
       <div className='flex flex-wrap items-baseline gap-2'>
         <h3 className='font-medium'>
           {entry.tag || entry.version}

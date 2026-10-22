@@ -7,4 +7,11 @@ const report = await runFleetUpdate(root, {
   concurrency,
 })
 console.log(JSON.stringify(report))
+if (report.skipped_count) {
+  for (const item of report.items) {
+    if (!item.skipped) continue
+    const container = item.telemetry?.container || item.id
+    console.warn(`[fleet-services] skipped ${item.id}: container unavailable (${container})`)
+  }
+}
 if (report.failed_count) process.exit(1)

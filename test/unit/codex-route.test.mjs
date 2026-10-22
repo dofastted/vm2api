@@ -18,6 +18,15 @@ test('default routing allows responses and chat, rejects anthropic', () => {
   assert.equal(isCodexProtocolAllowed('anthropic.messages', routing).code, 'protocol_not_allowed')
 })
 
+test('official Codex passthrough defaults off and round-trips', () => {
+  assert.equal(normalizeCodexRouting().official_passthrough, false)
+  assert.equal(normalizeCodexRouting({ official_passthrough: true }).official_passthrough, true)
+  assert.throws(
+    () => validateInferenceWebsocketPatch({ codex: { official_passthrough: 'yes' } }),
+    (err) => err.code === 'invalid_codex_official_passthrough',
+  )
+})
+
 test('disabled hop rejects every protocol', () => {
   const routing = { codex: normalizeCodexRouting({ enabled: false }) }
   assert.equal(isCodexProtocolAllowed('openai.responses', routing).code, 'codex_disabled')

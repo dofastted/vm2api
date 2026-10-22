@@ -193,21 +193,6 @@ func envBlock(id Identity) map[string]any {
 	if bt := strings.TrimSpace(id.BuildTime); bt != "" {
 		out["build_time"] = bt
 	}
-	put(out, "cpu_model", id.CPUModel)
-	if id.CPUCores > 0 {
-		out["cpu_cores"] = id.CPUCores
-	}
-	if id.MemoryBytes > 0 {
-		out["memory_bytes"] = id.MemoryBytes
-	}
-	put(out, "root_disk", id.RootDisk)
-	put(out, "mac", id.MAC)
-	put(out, "dmi_manufacturer", id.DMIManufacturer)
-	put(out, "dmi_product", id.DMIProduct)
-	put(out, "dmi_version", id.DMIVersion)
-	put(out, "dmi_family", id.DMIFamily)
-	put(out, "dmi_serial", id.DMISerial)
-	put(out, "dmi_uuid", id.DMIUUID)
 	return out
 }
 func sanitizeEnv(in map[string]any) map[string]any {
@@ -240,7 +225,12 @@ func dropEnvKey(key string) bool {
 	case "node_version", "is_running_with_bun", "betas",
 		"authorization", "cookie", "x-api-key", "proxy-authorization",
 		"hostname", "machine_id", "machine-id", "kernel_release",
-		"os_pretty", "os_id", "runtime_kind":
+		"os_pretty", "os_id", "runtime_kind",
+		// Guest hardware: not in the official CLI env (2.1.296), so older
+		// worker.json files that still carry it must not upload it.
+		"cpu_model", "cpu_cores", "memory_bytes", "root_disk", "mac",
+		"dmi_manufacturer", "dmi_product", "dmi_version", "dmi_family",
+		"dmi_serial", "dmi_uuid":
 		return true
 	default:
 		return false

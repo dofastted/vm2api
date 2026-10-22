@@ -212,8 +212,8 @@ func TestRunReloadsTelemetryWithoutRestart(t *testing.T) {
 	if strings.Contains(got, "2.1.241") {
 		t.Fatalf("stale version in %s", got)
 	}
-	if !strings.Contains(got, `"cpu_model":"CPU-cd"`) || !strings.Contains(got, `"memory_bytes":8589934592`) {
-		t.Fatalf("reloaded body missing hardware: %s", got)
+	if strings.Contains(got, `"cpu_model"`) || strings.Contains(got, `"memory_bytes"`) {
+		t.Fatalf("guest hardware was uploaded: %s", got)
 	}
 }
 

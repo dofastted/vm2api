@@ -43,6 +43,7 @@ import { type LoginTerminalHandle, WsTerminal } from '@/components/ws-terminal'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { CodexCredentialPanel } from '@/features/vm/codex-credential-panel'
 import { ConvertOauthToSetupButton } from '@/features/vm/convert-oauth-button'
+import { prepareLoginTerminal } from '@/features/vm/login-terminal-start'
 import { vmQueryOptions } from '@/features/vm/queries'
 
 export type CommitResult = {
@@ -141,6 +142,7 @@ export function CredentialPanel({
   }
   return (
     <ClaudeCredentialPanel
+      key={vm.id}
       vm={vm}
       onCommitted={onCommitted}
       showConvert={showConvert}
@@ -298,7 +300,22 @@ function ClaudeCredentialPanel({
     onError: (e: Error) => toast.error(importErrorMessage(e)),
   })
 
-  const busy = gen.isPending || exchange.isPending || importCred.isPending
+  const openLogin = useMutation({
+    mutationFn: () => prepareLoginTerminal(vm),
+    onSuccess: () => {
+      setLoginUrl('')
+      setLoginCode('')
+      setLoginOpen(true)
+      void invalidate()
+    },
+    onError: (error: Error) => toast.error(importErrorMessage(error)),
+  })
+
+  const busy =
+    gen.isPending ||
+    exchange.isPending ||
+    importCred.isPending ||
+    openLogin.isPending
   const proxyHint =
     link.proxyHint || (vm.proxy?.host ? proxyNamedLabel(vm.proxy) : '')
 
@@ -418,10 +435,20 @@ function ClaudeCredentialPanel({
       ) : activeMethod === 'cc' ? (
         <div className='space-y-2'>
           <Hint>
-            打开终端启动 claude。授权链接提取后显示在这里，复制后把授权码回填。
+            未运行的槽位会先使用已绑定的出口开机，再打开终端启动 claude。
+            授权链接提取后显示在这里，复制后把授权码回填。
           </Hint>
-          <Button size='sm' onClick={() => setLoginOpen(true)}>
-            打开官方登录终端
+          <Button
+            size='sm'
+            disabled={busy}
+            loading={openLogin.isPending}
+            onClick={() => openLogin.mutate()}
+          >
+            {openLogin.isPending
+              ? '正在准备登录终端…'
+              : vm.status?.toLowerCase() === 'running'
+                ? '打开官方登录终端'
+                : '启动并打开官方登录终端'}
           </Button>
           <Dialog open={loginOpen} onOpenChange={setLoginOpen}>
             <DialogContent className='flex h-[min(760px,90vh)] max-w-4xl flex-col gap-3'>

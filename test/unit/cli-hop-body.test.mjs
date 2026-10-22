@@ -31,10 +31,12 @@ test('prepareCliHopBody drops metadata and CLI-owned system but keeps official a
   })
   assert.equal(body.metadata, undefined)
   assert.equal(body.system[0].text, CRS_OFFICIAL_CLI_SYSTEM)
-  assert.equal(body.system[0].cache_control.ttl, undefined)
+  assert.equal(body.system[0].cache_control.ttl, '1h')
   assert.match(body.system[1].text, /You are an interactive agent/)
   assert.equal(body.model, 'claude-sonnet-5')
-  assert.deepEqual(body.messages[0].content, [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral' } }])
+  assert.deepEqual(body.messages[0].content, [
+    { type: 'text', text: 'hi', cache_control: { type: 'ephemeral', ttl: '1h' } },
+  ])
   assert.equal(body.stream, true)
 })
 
@@ -56,8 +58,8 @@ test('every cli-hop system becomes the identity plus the caller body', () => {
   assert.equal(body.system.length, 2)
   assert.equal(body.system[0].text, "You are Claude Code, Anthropic's official CLI for Claude.")
   assert.equal(body.system[1].text, 'RFC 2119 keywords')
-  assert.deepEqual(body.system[0].cache_control, { type: 'ephemeral' })
-  assert.deepEqual(body.system[1].cache_control, { type: 'ephemeral' })
+  assert.deepEqual(body.system[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.deepEqual(body.system[1].cache_control, { type: 'ephemeral', ttl: '1h' })
 })
 
 test('cli-hop normalizes mixed caller markers to the official template', () => {
@@ -78,10 +80,10 @@ test('cli-hop normalizes mixed caller markers to the official template', () => {
   const body = prepareCliHopBody(input, { preserveSystem: true, cacheTtl: '1h' })
   assert.equal(body.system[0].text, CRS_OFFICIAL_CLI_SYSTEM)
   assert.equal(body.system[1].text, 'caller')
-  assert.deepEqual(body.system[1].cache_control, { type: 'ephemeral' })
+  assert.deepEqual(body.system[1].cache_control, { type: 'ephemeral', ttl: '1h' })
   assert.equal(body.messages[0].content[0].cache_control, undefined)
   assert.equal(body.messages[1].content[0].cache_control, undefined)
-  assert.deepEqual(body.messages[2].content[0].cache_control, { type: 'ephemeral' })
+  assert.deepEqual(body.messages[2].content[0].cache_control, { type: 'ephemeral', ttl: '1h' })
 })
 
 test('caller environment stays behind the official identity', () => {
@@ -374,8 +376,8 @@ test('cli-hop drops caller system/tools markers and restamps last plus penultima
   assert.equal(body.cache_control, undefined)
   assert.equal(body.tools[0].cache_control, undefined)
   assert.equal(body.system[0].text, CRS_OFFICIAL_CLI_SYSTEM)
-  assert.deepEqual(body.system[0].cache_control, { type: 'ephemeral' })
-  assert.deepEqual(messageMarkers(body), [{ index: 2, blockIndex: 0, type: 'text', ttl: undefined }])
+  assert.deepEqual(body.system[0].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.deepEqual(messageMarkers(body), [{ index: 2, blockIndex: 0, type: 'text', ttl: '5m' }])
 })
 
 test('cli-hop short history only marks the last message', () => {
@@ -392,7 +394,7 @@ test('cli-hop short history only marks the last message', () => {
     body.messages.map((message) => message.role),
     ['user', 'assistant', 'user'],
   )
-  assert.deepEqual(messageMarkers(body), [{ index: 2, blockIndex: 0, type: 'text', ttl: undefined }])
+  assert.deepEqual(messageMarkers(body), [{ index: 2, blockIndex: 0, type: 'text', ttl: '1h' }])
 })
 
 test('cli-hop does not mark thinking blocks', () => {
@@ -434,7 +436,7 @@ test('cli-hop uses the inbound session TTL on both message anchors', () => {
   )
   assert.deepEqual(
     messageMarkers(body).map((hit) => hit.ttl),
-    [undefined],
+    ['1h'],
   )
 })
 

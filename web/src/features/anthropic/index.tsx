@@ -207,12 +207,11 @@ export function AnthropicConsolePage() {
     <PageHeader title={VIEW_TITLES.anthropic}>
       <div className='mx-auto grid max-w-5xl gap-6'>
         <div>
-          <div className='mb-2 hidden grid-cols-[minmax(14rem,1.1fr)_8rem_minmax(0,1.4fr)_8rem_4.5rem_3rem] gap-2 px-1 text-xs text-muted-foreground sm:grid'>
+          <div className='mb-2 hidden grid-cols-[minmax(10rem,1.1fr)_8rem_minmax(0,1.4fr)_8rem_auto] gap-2 px-1 text-xs text-muted-foreground @2xl/content:grid'>
             <span>地址</span>
             <span>认证</span>
             <span>密钥</span>
             <span>代理</span>
-            <span />
             <span />
           </div>
           <div className='divide-y rounded-md border'>
@@ -221,7 +220,7 @@ export function AnthropicConsolePage() {
               const custom = item.baseUrl.trim() !== DEFAULT_URL
               return (
                 <div key={item.id} className='px-2 py-2'>
-                  <div className='grid items-center gap-2 sm:grid-cols-[minmax(14rem,1.1fr)_8rem_minmax(0,1.4fr)_8rem_4.5rem_3rem]'>
+                  <div className='grid items-center gap-2 @2xl/content:grid-cols-[minmax(10rem,1.1fr)_8rem_minmax(0,1.4fr)_8rem_auto]'>
                     <Input
                       value={item.baseUrl}
                       onChange={(event) =>
@@ -320,41 +319,45 @@ export function AnthropicConsolePage() {
                         ))}
                       </PopoverContent>
                     </Popover>
-                    <Button
-                      type='button'
-                      variant='outline'
-                      disabled={testing !== null}
-                      onClick={() => send.mutate(index)}
-                    >
-                      {testing === index ? '…' : '测试'}
-                    </Button>
-                    <Button
-                      type='button'
-                      variant='outline'
-                      disabled={
-                        save.isPending || (!item.apiKey.trim() && !item.keyId)
-                      }
-                      onClick={() => save.mutate(item)}
-                    >
-                      保存
-                    </Button>
-                    <Button
-                      type='button'
-                      variant='ghost'
-                      disabled={endpoints.length === 1}
-                      onClick={() => {
-                        setEndpoints((current) =>
-                          current.filter((endpoint) => endpoint.id !== item.id)
-                        )
-                        setResults((current) => {
-                          const next = { ...current }
-                          delete next[item.id]
-                          return next
-                        })
-                      }}
-                    >
-                      删除
-                    </Button>
+                    <div className='grid grid-cols-3 gap-1'>
+                      <Button
+                        type='button'
+                        variant='outline'
+                        disabled={testing !== null}
+                        onClick={() => send.mutate(index)}
+                      >
+                        {testing === index ? '…' : '测试'}
+                      </Button>
+                      <Button
+                        type='button'
+                        variant='outline'
+                        disabled={
+                          save.isPending || (!item.apiKey.trim() && !item.keyId)
+                        }
+                        onClick={() => save.mutate(item)}
+                      >
+                        保存
+                      </Button>
+                      <Button
+                        type='button'
+                        variant='ghost'
+                        disabled={endpoints.length === 1}
+                        onClick={() => {
+                          setEndpoints((current) =>
+                            current.filter(
+                              (endpoint) => endpoint.id !== item.id
+                            )
+                          )
+                          setResults((current) => {
+                            const next = { ...current }
+                            delete next[item.id]
+                            return next
+                          })
+                        }}
+                      >
+                        删除
+                      </Button>
+                    </div>
                   </div>
                   {result ? (
                     <p

@@ -408,3 +408,38 @@ test('completed snapshots recover unregistered function and custom calls in ever
   }
   assert.equal(frames.find((frame) => frame.type === 'message_delta').delta.stop_reason, 'tool_use')
 })
+
+test('official Codex passthrough keeps instructions/input/cache/session fields intact', () => {
+  const input = {
+    model: 'gpt-5.5',
+    instructions: 'You are Codex, a coding agent.',
+    input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'hi' }] }],
+    tools: [{ type: 'function', name: 'shell', parameters: { type: 'object' } }],
+    reasoning: { effort: 'high' },
+    service_tier: 'priority',
+    max_output_tokens: 8192,
+    temperature: 0.2,
+    prompt_cache_key: 'caller-session-key',
+    previous_response_id: 'resp_123',
+    conversation_id: 'conv_123',
+    session_id: 'sess_123',
+    metadata: { user_id: 'caller-user', topic: 'keep' },
+    store: false,
+  }
+  const out = toCodexResponses('openai.responses', input, {}, { officialPassthrough: true })
+  assert.equal(out.ok, true)
+  assert.equal(out.converted, false)
+  assert.deepEqual(out.body, input, 'official body must be preserved field-for-field')
+})
+
+test('official Codex passthrough still strips credentials', () => {
+  const out = toCodexResponses(
+    'openai.responses',
+    { model: 'gpt-5.5', input: [], api_key: 'sk-live', authorization: 'Bearer x', client_metadata: { x: 1 } },
+    {},
+    { officialPassthrough: true },
+  )
+  assert.equal(out.body.api_key, undefined)
+  assert.equal(out.body.authorization, undefined)
+  assert.equal(out.body.client_metadata, undefined)
+})

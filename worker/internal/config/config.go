@@ -85,17 +85,6 @@ type TelemetryIdentity struct {
 	LinuxDistroID      string           `json:"linux_distro_id"`
 	LinuxDistroVersion string           `json:"linux_distro_version"`
 	LinuxKernel        string           `json:"linux_kernel"`
-	CPUModel           string           `json:"cpu_model"`
-	CPUCores           int64            `json:"cpu_cores"`
-	MemoryBytes        int64            `json:"memory_bytes"`
-	RootDisk           string           `json:"root_disk"`
-	MAC                string           `json:"mac"`
-	DMIManufacturer    string           `json:"dmi_manufacturer"`
-	DMIProduct         string           `json:"dmi_product"`
-	DMIVersion         string           `json:"dmi_version"`
-	DMIFamily          string           `json:"dmi_family"`
-	DMISerial          string           `json:"dmi_serial"`
-	DMIUUID            string           `json:"dmi_uuid"`
 	Process            TelemetryProcess `json:"process"`
 	Source             string           `json:"source"`
 	Env                map[string]any   `json:"env"`

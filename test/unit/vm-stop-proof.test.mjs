@@ -52,7 +52,7 @@ function localRuntime({
     return { ok: true, stdout: '' }
   }
   const source =
-    section('../../src/lib/vm/vm-runtime.mjs', 'export function inspectContainer(', '/** Label on GPT') +
+    section('../../src/lib/vm/vm-runtime.mjs', 'function parseInspectStdout(', '/** Label on GPT') +
     section('../../src/lib/vm/vm-runtime.mjs', 'export function destroyVmRuntime(', 'export function listRuntimeVms(')
   const api = vmContext.runInNewContext(`${source}; ({inspectContainer, stopVmRuntime, destroyVmRuntime})`, {
     sh,

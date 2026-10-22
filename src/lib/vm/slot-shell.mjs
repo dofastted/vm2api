@@ -186,6 +186,16 @@ const SYSTEM_FACTS_RC = [
   '  IFS= read -r x < "$1" || x=',
   '  nvl "$x"',
   '}',
+  'num() {',
+  '  x=',
+  '  [ -r "$1" ] && { IFS= read -r x < "$1" || :; }',
+  '  case "$x" in 0|*[!0-9]*) x= ;; esac',
+  '  printf %s "$x"',
+  '}',
+  // Docker slots see the host in /proc and /sys/class/dmi; the slot computer and cgroup limits win.
+  'khw=${KIN_HW_DIR:-/etc/kin-hardware}',
+  'kdmi=${KIN_DMI_DIR:-/etc/kin-dmi}',
+  'kcg=${KIN_CGROUP_DIR:-/sys/fs/cgroup}',
   'host=$(hostname 2>/dev/null || uname -n 2>/dev/null || printf %s unknown)',
   '[ -n "$host" ] || host=unknown',
   'os_pretty=unknown',
@@ -226,6 +236,13 @@ const SYSTEM_FACTS_RC = [
   'done',
   '[ "$n" -gt 0 ] && cpu_n=$n',
   '[ "$cpu_n" -gt 0 ] 2>/dev/null || cpu_n=unknown',
+  'if [ -r "$khw/cpu_brand" ]; then IFS= read -r x < "$khw/cpu_brand" || x=; [ -z "$x" ] || cpu_model=$x; fi',
+  'q=; p=; lim=',
+  'if [ -r "$kcg/cpu.max" ]; then read -r q p < "$kcg/cpu.max" || :',
+  'else q=$(num "$kcg/cpu/cpu.cfs_quota_us"); p=$(num "$kcg/cpu/cpu.cfs_period_us"); fi',
+  'case "$q" in \'\'|*[!0-9]*) ;; *) case "$p" in \'\'|0|*[!0-9]*) ;; *) lim=$(( (q + p - 1) / p )) ;; esac ;; esac',
+  '[ -n "$lim" ] || lim=$(num "$khw/logical_cpus")',
+  '[ -z "$lim" ] || cpu_n=$lim',
   'mem=unknown',
   'if [ -r /proc/meminfo ]; then',
   '  while IFS= read -r line; do',
@@ -234,6 +251,11 @@ const SYSTEM_FACTS_RC = [
   '    esac',
   '  done < /proc/meminfo',
   'fi',
+  'b=$(num "$kcg/memory.max")',
+  '[ -n "$b" ] || b=$(num "$kcg/memory/memory.limit_in_bytes")',
+  '[ ${#b} -lt 19 ] || b=',
+  '[ -n "$b" ] || b=$(num "$khw/ram_bytes")',
+  '[ -z "$b" ] || mem=$(hsize $((b / 1024)))',
   'disk=未采集',
   'df_out=$(df -kP / 2>/dev/null || df -k / 2>/dev/null)',
   'if [ -n "$df_out" ]; then',
@@ -245,6 +267,7 @@ const SYSTEM_FACTS_RC = [
   '  case "$2" in *[!0-9]*|\'\') ;; *) disk=$(hsize "$2") ;; esac',
   'fi',
   'mac=未采集',
+  'if [ -r "$khw/mac" ]; then IFS= read -r x < "$khw/mac" || x=; case "$x" in \'\'|00:00:00:00:00:00) ;; *) mac=$x ;; esac; fi',
   'for pass in up any; do',
   '  [ "$mac" = 未采集 ] || break',
   '  for n in /sys/class/net/*; do',
@@ -265,6 +288,7 @@ const SYSTEM_FACTS_RC = [
   'done',
   'dmi=/sys/class/dmi/id',
   '[ -d "$dmi" ] || dmi=/sys/devices/virtual/dmi/id',
+  '[ -d "$kdmi" ] && dmi=$kdmi',
   'vendor=$(rd "$dmi/sys_vendor")',
   'product=$(rd "$dmi/product_name")',
   'serial=$(rd "$dmi/product_serial")',
@@ -321,7 +345,8 @@ const SYSTEM_FACTS_RC = [
  * Interactive shell for one panel session. `claude` is this slot's cli-node,
  * not whatever `claude` is on PATH. The rcfile is session-only; the slot's
  * own ~/.bashrc is sourced, not rewritten. Startup prints a live 系统特征
- * block from guest /proc and sysfs; missing optional probes become
+ * block: slot computer files and cgroup limits first, then guest /proc and
+ * sysfs; missing optional probes become
  * unknown/未采集 and must not prevent the prompt.
  * @returns {{ cmd: string[], rc: string }}
  */
@@ -632,9 +657,12 @@ export function createSlotShell({
       if (size.login) await preparePanelShellLogin(projectRoot, vm)
       const launch = panelShellLaunch(slotHost(vm).bins.cli)
       const env = ['TERM=xterm-256color', `${SESSION_ENV}=${token}`, `${RC_ENV}=${launch.rc}`]
+      // guest-exec 经 root SSH 降权后仍继承 /root，终端须显式切换到槽用户目录。
+      if (isKvmRuntime(vm)) env.push('HOME=/home/kincli', 'CLAUDE_CONFIG_DIR=/home/kincli/.claude')
       if (size.login) env.push('KIN_PANEL_LOGIN=1')
       const { Cmd } = slotExecCmd(vm, launch.cmd, {
         env: isKvmRuntime(vm) ? env : undefined,
+        workdir: isKvmRuntime(vm) ? '/home/kincli' : undefined,
         interactive: true,
         tty: true,
         user: isKvmRuntime(vm) ? slotHost(vm).execUser(vm) : undefined,

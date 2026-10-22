@@ -60,6 +60,9 @@ export function parseGuestHardware(raw) {
 // NUL separators preserve whitespace and quotes without requiring jq or Node.
 // Minimal images (kin-os-arch) ship without `hostname`; `uname -n` is the same nodename.
 // Optional hardware is a final JSON field; missing files/commands must not abort.
+// In a Docker slot /proc and /sys/class/dmi are the host's: the slot computer
+// (kin-computer → /etc/kin-hardware, /etc/kin-dmi) and the container's cgroup
+// limits come first. KVM guests have neither and read their own /proc and DMI.
 export const READ_IDENTITY = `
 set -eu
 if [ -r /etc/os-release ]; then . /etc/os-release; fi
@@ -76,16 +79,48 @@ read_sys() {
 }
 trim() { printf '%s' "$1" | tr -d '\\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
 set +e
-hw_cpu_model=$(trim "$(awk -F': ' '/^model name[ \\t]*:/{print $2; exit} /^Hardware[ \\t]*:/{print $2; exit}' /proc/cpuinfo 2>/dev/null)")
-hw_cpu_cores=$(nproc 2>/dev/null)
+: "\${KIN_HW_DIR:=/etc/kin-hardware}" "\${KIN_DMI_DIR:=/etc/kin-dmi}" "\${KIN_CGROUP_DIR:=/sys/fs/cgroup}"
+read_num() {
+  _x=$(trim "$(read_sys "$1")")
+  case $_x in ''|0|*[!0-9]*) _x= ;; esac
+  printf '%s' "$_x"
+}
+cg_cpus() {
+  _q=; _p=
+  if [ -r "$KIN_CGROUP_DIR/cpu.max" ]; then
+    read -r _q _p < "$KIN_CGROUP_DIR/cpu.max"
+  else
+    _q=$(read_num "$KIN_CGROUP_DIR/cpu/cpu.cfs_quota_us")
+    _p=$(read_num "$KIN_CGROUP_DIR/cpu/cpu.cfs_period_us")
+  fi
+  case $_q in ''|*[!0-9]*) return 0 ;; esac
+  case $_p in ''|0|*[!0-9]*) return 0 ;; esac
+  printf '%s' $(( (_q + _p - 1) / _p ))
+}
+cg_mem() {
+  _m=$(read_num "$KIN_CGROUP_DIR/memory.max")
+  [ -n "$_m" ] || _m=$(read_num "$KIN_CGROUP_DIR/memory/memory.limit_in_bytes")
+  # cgroup v1 reports no limit as a page-rounded LONG_MAX.
+  [ \${#_m} -lt 19 ] && printf '%s' "$_m"
+}
+hw_cpu_model=$(trim "$(read_sys "$KIN_HW_DIR/cpu_brand")")
+[ -n "$hw_cpu_model" ] || hw_cpu_model=$(trim "$(awk -F': ' '/^model name[ \\t]*:/{print $2; exit} /^Hardware[ \\t]*:/{print $2; exit}' /proc/cpuinfo 2>/dev/null)")
+hw_cpu_cores=$(cg_cpus)
+[ -n "$hw_cpu_cores" ] || hw_cpu_cores=$(read_num "$KIN_HW_DIR/logical_cpus")
+[ -n "$hw_cpu_cores" ] || hw_cpu_cores=$(nproc 2>/dev/null)
 if [ -z "$hw_cpu_cores" ]; then hw_cpu_cores=$(awk 'BEGIN{n=0} /^processor[ \\t]*:/{n++} END{print n}' /proc/cpuinfo 2>/dev/null); fi
-hw_mem_kb=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null)
-hw_memory_bytes=""
-if [ -n "$hw_mem_kb" ]; then hw_memory_bytes=$((hw_mem_kb * 1024)); fi
+hw_memory_bytes=$(cg_mem)
+[ -n "$hw_memory_bytes" ] || hw_memory_bytes=$(read_num "$KIN_HW_DIR/ram_bytes")
+if [ -z "$hw_memory_bytes" ]; then
+  hw_mem_kb=$(awk '/^MemTotal:/{print $2; exit}' /proc/meminfo 2>/dev/null)
+  if [ -n "$hw_mem_kb" ]; then hw_memory_bytes=$((hw_mem_kb * 1024)); fi
+fi
 hw_root_disk=$(trim "$(awk '$2=="/"{print $1; exit}' /proc/mounts 2>/dev/null)")
 case $hw_root_disk in *docker*|*containerd*|*podman*) hw_root_disk=overlay ;; esac
-hw_mac=""
+hw_mac=$(trim "$(read_sys "$KIN_HW_DIR/mac")")
+[ "$hw_mac" = "00:00:00:00:00:00" ] && hw_mac=""
 for _n in /sys/class/net/*; do
+  [ -z "$hw_mac" ] || break
   [ -e "\$_n" ] || continue
   _base=\${_n##*/}
   [ "\$_base" = lo ] && continue
@@ -96,6 +131,7 @@ for _n in /sys/class/net/*; do
   break
 done
 _dmi=/sys/class/dmi/id
+[ -d "$KIN_DMI_DIR" ] && _dmi=$KIN_DMI_DIR
 hw_dmi_manufacturer=$(trim "$(read_sys "\$_dmi/sys_vendor")")
 hw_dmi_product=$(trim "$(read_sys "\$_dmi/product_name")")
 hw_dmi_version=$(trim "$(read_sys "\$_dmi/product_version")")

@@ -46,7 +46,7 @@ export function SettingsNav({ active }: { active: SettingsTabId }) {
       {/* 桌面：分组竖排 */}
       <nav
         aria-label='设置分区'
-        className='hidden md:sticky md:top-20 md:block md:self-start'
+        className='hidden @2xl/content:sticky @2xl/content:top-20 @2xl/content:block @2xl/content:self-start'
       >
         <div ref={listRef} className='relative space-y-4'>
           {indicator ? (
@@ -95,7 +95,7 @@ export function SettingsNav({ active }: { active: SettingsTabId }) {
       {/* 窄屏：横向滚动 pill 列 */}
       <nav
         aria-label='设置分区'
-        className='-mx-4 no-scrollbar flex gap-1 overflow-x-auto px-4 md:hidden'
+        className='-mx-4 no-scrollbar flex gap-1 overflow-x-auto px-4 @2xl/content:hidden'
       >
         {SETTINGS_NAV_ITEMS.map(({ id, icon: Icon }) => {
           const isActive = id === active

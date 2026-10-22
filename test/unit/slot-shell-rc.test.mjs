@@ -624,3 +624,51 @@ test('panel shell 系统特征 still prints under sh -i fallback', () => {
   assert.match(ran.stdout, /机器ID\s+(已采集|未采集)/)
   fs.rmSync(dir, { recursive: true, force: true })
 })
+
+test('panel shell 系统特征 reads the slot computer and cgroup limits before the host', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-facts-computer-'))
+  const home = path.join(dir, 'home')
+  const hw = path.join(dir, 'kin-hardware')
+  const dmi = path.join(dir, 'kin-dmi')
+  const cg = path.join(dir, 'cgroup')
+  for (const d of [home, hw, dmi, cg]) fs.mkdirSync(d)
+  fs.writeFileSync(path.join(hw, 'cpu_brand'), 'Persona CPU i5-1135G7\n')
+  fs.writeFileSync(path.join(hw, 'logical_cpus'), '8\n')
+  fs.writeFileSync(path.join(hw, 'ram_bytes'), '8589934592\n')
+  fs.writeFileSync(path.join(hw, 'mac'), '02:aa:bb:cc:dd:ee\n')
+  fs.writeFileSync(path.join(dmi, 'sys_vendor'), 'Dell Inc.\n')
+  fs.writeFileSync(path.join(dmi, 'product_name'), 'Inspiron 5502\n')
+  fs.writeFileSync(path.join(cg, 'cpu.max'), '150000 100000\n')
+  fs.writeFileSync(path.join(cg, 'memory.max'), '4294967296\n')
+  // The rc deletes itself after one session, so each run gets a fresh one.
+  const run = () => {
+    const rcPath = writeLaunchRc(dir)
+    return spawnSync('bash', ['--rcfile', rcPath, '-ic', 'true'], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        HOME: home,
+        KIN_PANEL_RCFILE: rcPath,
+        KIN_HW_DIR: hw,
+        KIN_DMI_DIR: dmi,
+        KIN_CGROUP_DIR: cg,
+        TERM: 'xterm',
+      },
+    })
+  }
+  let ran = run()
+  assert.equal(ran.status, 0, ran.stderr)
+  assert.match(ran.stdout, /CPU\s+Persona CPU i5-1135G7$/m)
+  assert.match(ran.stdout, /核数\s+2$/m)
+  assert.match(ran.stdout, /内存\s+4G$/m)
+  assert.match(ran.stdout, /MAC\s+02:aa:bb:cc:dd:ee$/m)
+  assert.match(ran.stdout, /厂商\s+Dell Inc\.$/m)
+  assert.match(ran.stdout, /产品\s+Inspiron 5502$/m)
+  fs.writeFileSync(path.join(cg, 'cpu.max'), 'max 100000\n')
+  fs.writeFileSync(path.join(cg, 'memory.max'), 'max\n')
+  ran = run()
+  assert.equal(ran.status, 0, ran.stderr)
+  assert.match(ran.stdout, /核数\s+8$/m)
+  assert.match(ran.stdout, /内存\s+8G$/m)
+  fs.rmSync(dir, { recursive: true, force: true })
+})

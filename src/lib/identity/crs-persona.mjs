@@ -376,6 +376,27 @@ export function buildBillingAttributionText(
   return `x-anthropic-billing-header: cc_version=${ver}.${fp}; cc_entrypoint=sdk-cli; cch=${CCH_PLACEHOLDER}; cc_prompt_id=${promptId};${tail}`
 }
 
+/** Add the billing block exactly once before the cli-node hop. */
+export function ensureBillingAttribution(
+  body,
+  { firstUserText = '', cliVersion = DEFAULT_CLI_VERSION, sessionId = '', indexes = null } = {},
+) {
+  if (!body || typeof body !== 'object') return body
+  const hasBilling = (system) => {
+    if (typeof system === 'string') return /x-anthropic-billing-header:/i.test(system)
+    if (!Array.isArray(system)) return false
+    return system.some((block) => /x-anthropic-billing-header:/i.test(String(block?.text || block || '')))
+  }
+  if (hasBilling(body.system)) return body
+  const block = {
+    type: 'text',
+    text: buildBillingAttributionText(firstUserText, cliVersion, sessionId, indexes),
+  }
+  if (Array.isArray(body.system)) return { ...body, system: [block, ...body.system] }
+  if (body.system == null || body.system === '') return { ...body, system: [block] }
+  return { ...body, system: [block, { type: 'text', text: String(body.system) }] }
+}
+
 function extractSystemTexts(system) {
   if (!system) return []
   if (typeof system === 'string') return [system]
