@@ -2,7 +2,7 @@
 
 ## 未发布
 
-- 官方透传（`compatibility.official_cc_passthrough`、`codex.official_passthrough`）：内容仍完全透传，但 outbound session 恢复与非透传一致的 attempt/VM rebuild/mint，不再沿用入站 session；`metadata.user_id` 继续重绑槽位 device/account。
+- 官方透传（`compatibility.official_cc_passthrough`、`codex.official_passthrough`）：system/instructions、messages/input、tools、cache_control、采样字段等 body 仍完全透传；outbound session 与 Codex `prompt_cache_key` 恢复 attempt/VM rebuild/mint（不再沿用入站 session 或调用方 cache key）；`metadata.user_id` 继续重绑槽位 device/account。默认开关仍关。
 
 ## 1.3.212 — 2026-10-22
 

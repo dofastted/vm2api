@@ -1284,11 +1284,13 @@ export function createHandleProtocol(deps) {
           const routingNow = getRouting()
           const cliHop = resolveOfficialCcInference(selected.vm, routingNow) === 'cli-hop'
           // Official Claude Code already carries the real system, cache markers
-          // and sampling fields. In this mode the gateway only rebinds the slot
-          // identity; it must not rebuild the body or re-mint the session.
+          // and sampling fields. Content stays on the wire; slot identity and
+          // outbound session still follow attempt/VM rebuild semantics.
           const officialPassthrough = officialTraffic && cliHop && officialCcPassthroughFromRouting(routingNow)
+          const attemptSessionMode = officialPassthrough ? 'rebuild' : sessionContext.mode
           const attemptSessionId = resolveOutboundSessionId(callerSession, {
             ...sessionContext,
+            mode: attemptSessionMode,
             accountId: selected.accountId,
             boundSessionId: keptSession,
             boundAccountId: keptAccount,
@@ -1447,7 +1449,7 @@ export function createHandleProtocol(deps) {
             boundVmId: keptVm,
             vmId: selected.vmId,
             epoch: attemptStartedAt,
-            mode: sessionMode,
+            mode: officialPassthrough ? 'rebuild' : sessionMode,
             routing: routingNow,
             clientDiscriminator,
             firstUserText,
