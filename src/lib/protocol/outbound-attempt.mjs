@@ -356,7 +356,7 @@ export function prepareOfficialPassthroughBody(
     inbound = {},
     reqHeaders = {},
     sessionId = '',
-    mode = 'passthrough',
+    mode = 'rebuild',
     sessionContext = {},
   } = {},
 ) {

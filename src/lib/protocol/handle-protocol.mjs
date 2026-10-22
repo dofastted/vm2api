@@ -1289,7 +1289,6 @@ export function createHandleProtocol(deps) {
           const officialPassthrough = officialTraffic && cliHop && officialCcPassthroughFromRouting(routingNow)
           const attemptSessionId = resolveOutboundSessionId(callerSession, {
             ...sessionContext,
-            mode: officialPassthrough ? 'passthrough' : sessionContext.mode,
             accountId: selected.accountId,
             boundSessionId: keptSession,
             boundAccountId: keptAccount,
@@ -1448,7 +1447,7 @@ export function createHandleProtocol(deps) {
             boundVmId: keptVm,
             vmId: selected.vmId,
             epoch: attemptStartedAt,
-            mode: officialPassthrough ? 'passthrough' : sessionMode,
+            mode: sessionMode,
             routing: routingNow,
             clientDiscriminator,
             firstUserText,

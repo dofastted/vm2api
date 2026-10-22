@@ -569,7 +569,8 @@ export async function handleCodexProtocol({
   })
   const stream = inbound?.stream !== false && ctx.body?.stream !== false
   const inboundSession = sessionFrom(req, converted.body)
-  const sessionMode = officialCodexPassthrough ? 'passthrough' : outboundSessionMode(routing)
+  const sessionMode = outboundSessionMode(routing)
+  const codexBodySessionMode = officialCodexPassthrough ? 'passthrough' : sessionMode
   const callerSession = extractCallerSession({
     inbound: converted.body,
     body: converted.body,
@@ -737,7 +738,11 @@ export async function handleCodexProtocol({
           previous_response_id: inboundSession.previous_response_id,
         }
         logBag.outbound_session_id = sessionIdForLog(outboundSessionId)
-        const outboundBody = applyCodexRebuildBody({ ...converted.body, stream: true }, outboundSessionId, sessionMode)
+        const outboundBody = applyCodexRebuildBody(
+          { ...converted.body, stream: true },
+          outboundSessionId,
+          codexBodySessionMode,
+        )
         const outboundHeaders = codexKernelHeaders(req.headers, outboundBody, session)
         if (captureOutbound) logBag.outbound_body = outboundBody
         logBag.outbound_headers = redactHeaders(outboundHeaders)

@@ -1,5 +1,9 @@
 # Changelog
 
+## 未发布
+
+- 官方透传（`compatibility.official_cc_passthrough`、`codex.official_passthrough`）：内容仍完全透传，但 outbound session 恢复与非透传一致的 attempt/VM rebuild/mint，不再沿用入站 session；`metadata.user_id` 继续重绑槽位 device/account。
+
 ## 1.3.212 — 2026-10-22
 
 - 新增官方 Codex 透传：开启 `codex.official_passthrough` 后，官方 Codex 家族 `/v1/responses` 保留 `instructions`、`input`、tools、reasoning、`prompt_cache_key`、`previous_response_id`、`conversation_id`/`session_id` 和官方 metadata，不再按 attempt 重建 `prompt_cache_key`；只清掉 API key/authorization/client_metadata。会话使用 `mode=passthrough`。OpenAI 兼容客户端的 body 归一化不变。

@@ -105,7 +105,7 @@ export function ProtocolPane({
             label='官方 Claude Code 家族透传'
             desc={
               compat.official_cc_passthrough === true
-                ? '开：直连和被识别为中转的官方家族保留入站 system，不套用当前提示词档。'
+                ? '开：保留入站 system/tools/messages 与 cache 标记；出站 session 仍按槽位重建，device 绑槽位。'
                 : '关：官方家族也套用协议里的 system 档。打开后才透传。'
             }
           >
