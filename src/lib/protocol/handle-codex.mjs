@@ -644,7 +644,7 @@ export async function handleCodexProtocol({
   })
   const stream = inbound?.stream !== false && ctx.body?.stream !== false
   const inboundSession = sessionFrom(req, converted.body)
-  const sessionMode = officialCodexPassthrough ? 'passthrough' : outboundSessionMode(routing)
+  const sessionMode = officialCodexPassthrough ? 'rebuild' : outboundSessionMode(routing)
   const callerSession = extractCallerSession({
     inbound: converted.body,
     body: converted.body,
