@@ -536,7 +536,7 @@ export class FailoverRunner {
   }
 
   async run(args = {}) {
-    const sessionKey = String(args.stickyKey || '')
+    const sessionKey = String(args.sessionLockKey || args.stickyKey || '')
     if (!sessionKey) return this.runOnce(args)
     const previous = this.sessionTails.get(sessionKey) || Promise.resolve()
     let releaseTurn
@@ -588,6 +588,8 @@ export class FailoverRunner {
     familyKey = null,
     familyVmId = null,
     deviceKey = null,
+    assignmentMode = 'device',
+    legacyBindingKeys = null,
     skipSessionSeat = false,
     ownerScope = null,
     keyScope = null,
@@ -596,6 +598,7 @@ export class FailoverRunner {
   } = {}) {
     if (!this.scheduler) throw new Error('FailoverRunner requires a scheduler')
     if (typeof callAttempt !== 'function') throw new Error('FailoverRunner requires callAttempt')
+    if (assignmentMode === 'session') deviceKey = null
     const startedAt = Date.now()
     const budget = new AttemptCoordinator({
       maxSameUnitRetries: Number(this.config.max_same_account_retries ?? 1),
@@ -690,9 +693,21 @@ export class FailoverRunner {
     }
     // A unit that just failed replayably waits behind every other free seat.
     let avoid = null
+    let attemptSequence = 0
+    const waitForSessionCapacity = async (selected) => {
+      selected.release?.()
+      const delay = Math.max(50, Number(this.config.same_account_retry_delay_ms) || 0)
+      try {
+        await sleepWithSignal(Math.min(delay, Math.max(0, deadline - Date.now())), signal)
+        return true
+      } catch (error) {
+        if (error?.code === 'selection_cancelled') return false
+        throw error
+      }
+    }
 
     for (;;) {
-      const attemptNo = budget.hops + 1
+      const attemptNo = attemptSequence + 1
       if (signal?.aborted || isClientCancelledResult(lastResult)) {
         return { ...clientCancelledResult(lastResult || {}), via: 'pool-failover', ...attribution() }
       }
@@ -711,6 +726,9 @@ export class FailoverRunner {
       }
       let selected = null
       try {
+        if (assignmentMode === 'session' && familyKey) {
+          familyVmId = this.stickyRouter?.resolve?.(familyKey)?.vmId || null
+        }
         currentDeviceVmId = deviceKey ? this.stickyRouter?.resolve?.(deviceKey)?.vmId || null : null
         const selectArgs = {
           model,
@@ -722,8 +740,11 @@ export class FailoverRunner {
           signal,
           deadline: repairPending ? Math.max(deadline, Date.now() + REPAIR_HOP_WAIT_MS) : deadline,
           pinVmId,
+          familyKey,
           familyVmId,
           deviceVmId: currentDeviceVmId,
+          assignmentMode,
+          legacyBindingKeys,
           skipSessionSlot: skipSessionSeat,
           ownerScope,
           keyScope,
@@ -782,6 +803,7 @@ export class FailoverRunner {
         return preferLastResult(lastResult, lastPolicy, exhausted, attribution())
       }
       repairPending = false
+      attemptSequence = attemptNo
       snapshotPins()
       const attemptStickyBound = pinBaseline.get(stickyKey) || null
       lastSelected = selected
@@ -972,6 +994,15 @@ export class FailoverRunner {
           return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
         }
         policy = await this.recoverCredential(selected, policy)
+        if (assignmentMode === 'session' && !pinVmId && policy.reason === 'slot_busy') {
+          if (budget.untriedOnly || budget.executionsLeft(selected.accountId) <= 0) {
+            return { ...result, ...attribution(), finalState: result.terminalState || 'rejected', policy }
+          }
+          if (!(await waitForSessionCapacity(selected))) {
+            return { ...clientCancelledResult(), via: 'pool-failover', ...attribution() }
+          }
+          continue
+        }
         const hopMs = Date.now() - attemptStarted
         if (isRetryableEmptyHop(policy)) {
           if (!emptyHopReleased(result) || pinVmId) return incompleteHopResult(result, policy, attribution())
@@ -1003,7 +1034,7 @@ export class FailoverRunner {
             via: 'account-scope',
             vmId: selected.vmId,
             accountId: selected.accountId,
-            attemptCount: attemptNo,
+            attemptCount: budget.hops,
             finalState: 'policy_block',
           }
         }
@@ -1086,6 +1117,15 @@ export class FailoverRunner {
           }
         }
         policy = await this.recoverCredential(selected, policy)
+        if (assignmentMode === 'session' && !pinVmId && policy.reason === 'slot_busy') {
+          if (budget.untriedOnly || budget.executionsLeft(selected.accountId) <= 0) {
+            return { ...result, ...attribution(), finalState: result.terminalState, policy }
+          }
+          if (!(await waitForSessionCapacity(selected))) {
+            return { ...clientCancelledResult(), via: 'pool-failover', ...attribution() }
+          }
+          continue
+        }
         const hopMs = Date.now() - attemptStarted
         if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
           budget.noteSameUnit(selected.accountId)

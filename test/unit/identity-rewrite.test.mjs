@@ -391,6 +391,37 @@ test('resolveSeatIdentity: device id first, then metadata session, never the API
   })
 })
 
+test('session assignment uses independent root sessions while keeping agent contexts separate', () => {
+  const body = (session) => ({ metadata: { user_id: { device_id: 'device-shared', session_id: session } } })
+  assert.equal(resolveSeatIdentity({ inbound: body('one'), mode: 'session' }).key, 'seat:sess:one')
+  assert.equal(resolveSeatIdentity({ inbound: body('two'), mode: 'session' }).key, 'seat:sess:two')
+  const headers = { 'x-claude-code-agent-id': 'agent-a' }
+  assert.equal(resolveSeatIdentity({ inbound: body('one'), headers, mode: 'session' }).key, 'seat:sess:one')
+  assert.notEqual(extractCallerSession({ inbound: body('one'), headers }), 'one')
+  assert.equal(
+    resolveSeatIdentity({ inbound: body('child'), mode: 'session', rootSessionId: 'root' }).key,
+    'seat:sess:root',
+  )
+})
+
+test('session assignment without trusted metadata or a parent retains device and fingerprint fallback', () => {
+  const inbound = { device_id: 'fallback-device', session_id: 'untrusted-body-session' }
+  const headers = { 'x-session-id': 'untrusted-header-session' }
+  assert.deepEqual(resolveSeatIdentity({ inbound, headers, mode: 'session' }), {
+    key: 'seat:dev:fallback-device',
+    source: 'device',
+  })
+  const fingerprint = {
+    messages: [
+      { role: 'user', content: 'A sufficiently long synthetic request to exercise the original fingerprint fallback.' },
+    ],
+  }
+  assert.deepEqual(
+    resolveSeatIdentity({ inbound: fingerprint, mode: 'session', clientIp: '127.0.0.1' }),
+    resolveSeatIdentity({ inbound: fingerprint, clientIp: '127.0.0.1' }),
+  )
+})
+
 test('resolveSeatIdentity: same IP + UA + first turn hashes to one identity whatever the API key', () => {
   const turn = (extra = []) => ({
     system: [{ type: 'text', text: 'You are a helpful assistant.' }],

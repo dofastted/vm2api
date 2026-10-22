@@ -102,6 +102,7 @@ import {
   explicitParentSessionId,
   isParentSessionCompanion,
   isShortProbeRequest,
+  scopeAssignmentKey,
 } from '../pool/sticky-router.mjs'
 import {
   applyCrsUnofficialPersona,
@@ -901,6 +902,20 @@ export function createHandleProtocol(deps) {
     // read before outbound cleaning. API key never scopes it.
     const inboundIdentity = resolveInboundIdentity({ inbound, body: ctx.body, headers: req.headers })
     const stickyDeviceId = inboundIdentity.deviceId
+    const pinVmRaw = String(req.headers['x-kin-vm'] || '').trim()
+    const pinVmId = req.apiKeyKind === 'master' && isValidVmId(pinVmRaw) ? pinVmRaw : null
+    // Pin is panel test-chat / diagnostics (manage). Unpinned /v1 is dispatch.
+    const ownerScope = pinVmId ? { type: 'any' } : ownerScopeFromRequest(req, apiKeyStore?.users)
+    const requestedAssignmentMode = getRouting()?.pool?.assignment_mode === 'session' ? 'session' : 'device'
+    const parentSession = explicitParentSessionId(inbound, req.headers)
+    const rootSessionId =
+      requestedAssignmentMode === 'session'
+        ? stickyRouter?.resolveAssignmentRoot?.(req, inbound, { ownerScope, keyScope }) ||
+          parentSession ||
+          inboundIdentity.sessionId
+        : ''
+    const assignmentMode = requestedAssignmentMode === 'session' && rootSessionId ? 'session' : 'device'
+    const sessionAssignment = assignmentMode === 'session'
     logBag.inbound_device_id = sessionIdForLog(stickyDeviceId)
     if (childDeclaredWithoutParent(inbound, req.headers)) {
       stats.errors++
@@ -917,19 +932,30 @@ export function createHandleProtocol(deps) {
         }).body,
       )
     }
-    const isProbe = isParentSessionCompanion(inbound) || isParentSessionCompanion(ctx.body)
+    const isProbe = !sessionAssignment && (isParentSessionCompanion(inbound) || isParentSessionCompanion(ctx.body))
     // One-shot test calls (sub2api account test, new-api channel test) keep their
     // sticky identity but never hold a session seat the main conversation needs.
-    const seatless = isProbe || isShortProbeRequest(inbound)
-    // Seat = inbound device (R1/R2); the API key never scopes it.
-    const seatKey = seatless
+    const seatless = !sessionAssignment && (isProbe || isShortProbeRequest(inbound))
+    const rawSeatKey = seatless
       ? null
-      : resolveSeatIdentity({ inbound, body: ctx.body, headers: req.headers, clientIp: clientIp(req) }).key
+      : resolveSeatIdentity({
+          inbound,
+          body: ctx.body,
+          headers: req.headers,
+          clientIp: clientIp(req),
+          mode: assignmentMode,
+          rootSessionId,
+        }).key
+    const seatKey = sessionAssignment ? scopeAssignmentKey(rawSeatKey, { ownerScope, keyScope }) : rawSeatKey
     const sessionKeys = stickyRouter?.sessionPoolKeys
       ? stickyRouter.sessionPoolKeys(req, inbound, {
-          sessionId: inboundIdentity.sessionId,
+          sessionId: inboundIdentity.sessionId || (sessionAssignment && parentSession ? callerSession : ''),
           deviceId: stickyDeviceId,
           migrate: !isProbe,
+          assignmentMode,
+          rootSessionId,
+          ownerScope,
+          keyScope,
         })
       : {
           stickyKey: stickyRouter?.extractPoolKey?.(req, inbound, { platform: 'anthropic' }) || null,
@@ -937,16 +963,38 @@ export function createHandleProtocol(deps) {
         }
     const stickyKey = sessionKeys.stickyKey || null
     const stickyKeys = sessionKeys.stickyKeys || []
-    const deviceKey = stickyDeviceId ? stickyRouter?.canonicalDeviceKey?.(stickyDeviceId) || null : null
-    const parentSession = explicitParentSessionId(inbound, req.headers)
-    const familySession = parentSession || callerSession
+    // A mode change must keep queued and active turns on the same session lock.
+    const sessionLockKey =
+      stickyKey && callerSession
+        ? scopeAssignmentKey(stickyRouter?.canonicalSessionKey?.(callerSession) || `sess:${callerSession}`, {
+            ownerScope,
+            keyScope,
+          })
+        : stickyKey
+    const deviceKey =
+      !sessionAssignment && stickyDeviceId ? stickyRouter?.canonicalDeviceKey?.(stickyDeviceId) || null : null
+    const familySession = rootSessionId || parentSession || callerSession
     const familyTrusted =
       !!parentSession || (!!inboundIdentity.sessionId && familySession === inboundIdentity.sessionId)
     const familyKey = !familySession
       ? null
       : stickyRouter?.familyPoolKey
-        ? stickyRouter.familyPoolKey(req, familySession, { trusted: familyTrusted })
+        ? stickyRouter.familyPoolKey(req, familySession, {
+            trusted: familyTrusted || sessionAssignment,
+            assignmentMode,
+            ownerScope,
+            keyScope,
+          })
         : stickyRouter?.familyKey?.(req, familySession, 'anthropic') || null
+    const legacyBindingKeys = sessionAssignment
+      ? {
+          session: sessionKeys.legacyBindingKeys || [],
+          family: [
+            stickyRouter?.canonicalFamilyKey?.(familySession),
+            stickyRouter?.familyKey?.(req, familySession, 'anthropic'),
+          ].filter(Boolean),
+        }
+      : null
     const familyVmId = familyKey ? stickyRouter?.resolve?.(familyKey)?.vmId || null : null
     const stickyBound =
       stickyKey && typeof stickyRouter?.resolve === 'function' ? stickyRouter.resolve(stickyKey) : null
@@ -1193,10 +1241,6 @@ export function createHandleProtocol(deps) {
     // Worker hop stays realtime unless the caller asked for verified.
     // stream:false only changes the client response shape (assembled JSON).
     const deliveryMode = requestedDelivery === 'verified' ? 'verified' : 'realtime'
-    const pinVmRaw = String(req.headers['x-kin-vm'] || '').trim()
-    const pinVmId = req.apiKeyKind === 'master' && isValidVmId(pinVmRaw) ? pinVmRaw : null
-    // Pin is panel test-chat / diagnostics (manage). Unpinned /v1 is dispatch.
-    const ownerScope = pinVmId ? { type: 'any' } : ownerScopeFromRequest(req, apiKeyStore?.users)
     // Cache bypass is a client hint; only authenticated master-key probes may skip accounting.
     const healthReal = req.apiKeyKind === 'master' && isHealthRealBypass(req.headers)
     // Cache lives per account; a failover to another account starts cold by design.
@@ -1225,11 +1269,14 @@ export function createHandleProtocol(deps) {
         model: canonicalBody.model,
         stickyKey: isProbe ? null : stickyKey,
         stickyKeys: isProbe ? [] : stickyKeys,
+        sessionLockKey: isProbe ? null : sessionLockKey,
         stickyDeviceId,
         deviceKey,
         skipSessionSeat: seatless,
         familyKey,
         seatKey,
+        assignmentMode,
+        legacyBindingKeys,
         familyVmId,
         pinVmId,
         ownerScope,

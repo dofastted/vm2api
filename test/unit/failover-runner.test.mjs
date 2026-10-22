@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
+import { RequestAttemptsRepo } from '../../src/lib/db/repos/request-attempts-repo.mjs'
 import { resolveOutboundSessionId } from '../../src/lib/identity/identity-rewrite.mjs'
 
 class Scheduler {
@@ -71,6 +72,16 @@ function success(text = 'ok') {
       stop_reason: 'end_turn',
       usage: { input_tokens: 1, output_tokens: 1 },
     },
+  }
+}
+
+function slotBusy() {
+  return {
+    ok: false,
+    status: 503,
+    upstreamExecutions: 0,
+    terminalState: 'rejected',
+    body: { error: { type: 'worker_error', code: 'slot_busy', message: 'rust kernel has no free slot' } },
   }
 }
 
@@ -1637,6 +1648,37 @@ test('same sticky session requests execute serially', async () => {
   assert.equal(peak, 1)
 })
 
+test('the same execution session stays serial while assignment mode changes its sticky key', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({ scheduler })
+  let active = 0
+  let peak = 0
+  const callAttempt = async () => {
+    active++
+    peak = Math.max(peak, active)
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    active--
+    return success()
+  }
+  const results = await Promise.all(
+    ['device', 'session', 'device'].map((assignmentMode, index) =>
+      runner.run({
+        requestId: `mode-change-${index}`,
+        canonicalBody: { model: 'claude-sonnet-test' },
+        model: 'claude-sonnet-test',
+        assignmentMode,
+        sessionLockKey: 'same-scoped-execution-session',
+        stickyKey: assignmentMode === 'session' ? 'scoped-session' : 'legacy-session',
+        callAttempt,
+      }),
+    ),
+  )
+  assert.ok(results.every((result) => result.ok))
+  assert.equal(peak, 1)
+  assert.equal(scheduler.selectCalls, 3)
+  assert.equal(runner.sessionTails.size, 0)
+})
+
 test('different sticky sessions still execute concurrently', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const runner = new FailoverRunner({ scheduler })
@@ -1744,6 +1786,222 @@ test('explicit VM pin is not redirected by a family locked elsewhere', async () 
     assert.equal(result.vmId, 'vm-01')
   }
   assert.equal(scheduler.state.selects.length, 3)
+  assert.equal(scheduler.state.inflight, 0)
+})
+
+test('session assignment forwards the root binding and ignores device affinity', async () => {
+  const scheduler = leasingScheduler([candidate(1), candidate(2)])
+  const deviceBindings = []
+  const runner = new FailoverRunner({
+    scheduler,
+    stickyRouter: {
+      resolve: (key) => (key === 'device-home' ? { accountId: 'account-2', vmId: 'vm-02' } : null),
+      bind: () => true,
+      bindDeviceAffinity: (...args) => deviceBindings.push(args),
+    },
+  })
+  const legacyBindingKeys = { session: ['legacy-session'], family: ['legacy-family'] }
+  const result = await runner.run({
+    requestId: 'session-assignment',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    assignmentMode: 'session',
+    stickyKey: 'scoped-session',
+    familyKey: 'scoped-root',
+    seatKey: 'scoped-root-seat',
+    deviceKey: 'device-home',
+    legacyBindingKeys,
+    callAttempt: () => success(),
+  })
+  assert.equal(result.ok, true)
+  const selection = scheduler.state.selects[0]
+  assert.equal(selection.assignmentMode, 'session')
+  assert.equal(selection.familyKey, 'scoped-root')
+  assert.equal(selection.seatKey, 'scoped-root-seat')
+  assert.deepEqual(selection.legacyBindingKeys, legacyBindingKeys)
+  assert.equal(selection.deviceVmId, null)
+  assert.deepEqual(deviceBindings, [])
+  assert.equal(scheduler.state.inflight, 0)
+})
+
+test('session assignment re-reads a family moved before selection and between retries', async () => {
+  const scheduler = leasingScheduler([candidate(1), candidate(2)])
+  let family = { accountId: 'account-1', vmId: 'vm-01' }
+  const runner = new FailoverRunner({
+    scheduler,
+    stickyRouter: {
+      resolve: (key) => (key === 'root-home' ? family : null),
+      bind: () => true,
+    },
+    config: { signature_repair: true },
+  })
+  let attempts = 0
+  const result = await runner.run({
+    requestId: 'session-moved-root',
+    canonicalBody: { model: 'claude-sonnet-test', messages: [] },
+    model: 'claude-sonnet-test',
+    assignmentMode: 'session',
+    stickyKey: 'child-session',
+    familyKey: 'root-home',
+    familyVmId: 'stale-vm',
+    callAttempt: () => {
+      attempts++
+      if (attempts === 1) {
+        family = { accountId: 'account-2', vmId: 'vm-02' }
+        return {
+          ok: false,
+          status: 400,
+          terminalState: 'rejected',
+          body: { error: { message: 'thinking.signature: Field required' } },
+        }
+      }
+      return success()
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.deepEqual(
+    scheduler.state.selects.map((selection) => selection.familyVmId),
+    ['vm-01', 'vm-02'],
+  )
+  assert.equal(result.vmId, 'vm-02')
+  assert.equal(scheduler.state.inflight, 0)
+})
+
+test('session assignment keeps parent and child execution locks separate', async () => {
+  const scheduler = leasingScheduler([candidate(1)])
+  const runner = new FailoverRunner({ scheduler })
+  let started = 0
+  let release
+  const both = new Promise((resolve) => {
+    release = resolve
+  })
+  const callAttempt = async () => {
+    started++
+    if (started === 2) release()
+    await both
+    return success()
+  }
+  const result = await Promise.all(
+    ['parent-session', 'child-session'].map((stickyKey) =>
+      runner.run({
+        requestId: stickyKey,
+        canonicalBody: { model: 'claude-sonnet-test' },
+        model: 'claude-sonnet-test',
+        assignmentMode: 'session',
+        stickyKey,
+        familyKey: 'shared-root',
+        seatKey: 'shared-root-seat',
+        callAttempt,
+      }),
+    ),
+  )
+  assert.ok(result.every((item) => item.ok))
+  assert.equal(started, 2)
+  assert.equal(scheduler.state.inflight, 0)
+})
+
+test('session slot_busy releases capacity while waiting and retries without spending execution or switch budgets', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-session-capacity-'))
+  const sticky = new StickyRouter({ dataDir, config: { sticky: { enabled: true } } })
+  t.after(() => {
+    sticky.db.close()
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  })
+  const attempts = new RequestAttemptsRepo(sticky.db)
+  const scheduler = leasingScheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({
+    scheduler,
+    stickyRouter: sticky,
+    attemptsRepo: attempts,
+    config: {
+      max_total_attempts: 1,
+      max_account_switches: 0,
+      max_same_account_retries: 0,
+      same_account_retry_delay_ms: 0,
+      total_retry_deadline_ms: 1000,
+    },
+  })
+  const seen = []
+  const exclusions = []
+  let idleDuringWait = null
+  const result = await runner.run({
+    requestId: 'capacity-admission-retries',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    assignmentMode: 'session',
+    stickyKey: 'capacity-session',
+    familyKey: 'capacity-root',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.vmId)
+      exclusions.push([...scheduler.state.selects.at(-1).excluded])
+      if (seen.length === 1)
+        setTimeout(() => {
+          idleDuringWait = scheduler.state.inflight
+        }, 10)
+      return seen.length < 3 ? slotBusy() : success()
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.attemptCount, 1)
+  assert.equal(idleDuringWait, 0)
+  assert.deepEqual(seen, ['vm-01', 'vm-01', 'vm-01'])
+  assert.deepEqual(exclusions, [[], [], []])
+  assert.ok(scheduler.state.selects.every((selection) => !selection.avoid))
+  assert.deepEqual(
+    attempts.list('capacity-admission-retries').map((attempt) => attempt.attempt_no),
+    [1, 2, 3],
+  )
+  assert.equal(sticky.resolve('capacity-root').vmId, 'vm-01')
+  assert.equal(scheduler.state.inflight, 0)
+})
+
+test('session slot_busy with zero configured delay remains bounded by the request deadline', async () => {
+  const scheduler = leasingScheduler([candidate(1)])
+  const runner = new FailoverRunner({
+    scheduler,
+    config: { same_account_retry_delay_ms: 0, total_retry_deadline_ms: 80 },
+  })
+  const started = Date.now()
+  const result = await runner.run({
+    requestId: 'capacity-deadline',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    assignmentMode: 'session',
+    stickyKey: 'capacity-session',
+    callAttempt: slotBusy,
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.body.error.code, 'slot_busy')
+  assert.equal(result.attemptCount, 0)
+  assert.ok(scheduler.state.selects.length <= 2)
+  assert.ok(Date.now() - started < 1000)
+  assert.equal(scheduler.state.inflight, 0)
+})
+
+test('cancelling a session slot_busy wait releases its reservation immediately', async () => {
+  const scheduler = leasingScheduler([candidate(1)])
+  const runner = new FailoverRunner({ scheduler, config: { same_account_retry_delay_ms: 500 } })
+  const controller = new AbortController()
+  let idleDuringWait = null
+  const result = await runner.run({
+    requestId: 'capacity-cancel',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    assignmentMode: 'session',
+    stickyKey: 'capacity-session',
+    signal: controller.signal,
+    callAttempt: () => {
+      setTimeout(() => {
+        idleDuringWait = scheduler.state.inflight
+        controller.abort()
+      }, 10)
+      return slotBusy()
+    },
+  })
+  assert.equal(result.body.error.code, 'client_cancelled')
+  assert.equal(result.status, 499)
+  assert.equal(idleDuringWait, 0)
+  assert.equal(scheduler.state.selects.length, 1)
   assert.equal(scheduler.state.inflight, 0)
 })
 

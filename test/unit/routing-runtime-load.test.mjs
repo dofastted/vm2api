@@ -31,6 +31,43 @@ test('loadRoutingConfig fails when routing.json is invalid', () => {
   }
 })
 
+test('persistRoutingPatch saves assignment mode and reloads the existing scheduler', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-assignment-'))
+  const file = path.join(root, 'routing.json')
+  const reloaded = []
+  const routingConfig = { pool: { strategy: 'fill' }, concurrency: {}, tiers: {} }
+  const poolScheduler = { reloadConfig: (config) => reloaded.push(config) }
+  try {
+    const runtime = createRoutingRuntime({
+      cfg: { paths: { project: root } },
+      routingConfigPath: file,
+      routingConfig,
+      poolScheduler,
+      setPoolScheduler: () => assert.fail('routing patches must reuse the active scheduler'),
+      stickyRouter: { reloadConfig() {} },
+      accountQuota: {
+        setMaxConcurrency() {},
+        setMaxRpm() {},
+        reloadConfig() {},
+        applyTierConcurrency() {},
+        applyTierRpm() {},
+        repo: { get: () => null },
+      },
+      requestLog: { setConfig() {} },
+    })
+    runtime.persistRoutingPatch({ pool: { assignment_mode: 'session' } })
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).pool.assignment_mode, 'session')
+    assert.equal(reloaded.at(-1).assignment_mode, 'session')
+    assert.equal(reloaded.at(-1).strategy, 'fill')
+    runtime.persistRoutingPatch({ pool: { assignment_mode: 'unknown' } })
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).pool.assignment_mode, 'device')
+    assert.equal(reloaded.at(-1).assignment_mode, 'device')
+    assert.equal(reloaded.length, 2)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('applyVmSessionSlots updates only native admission policy', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-session-slots-'))
   const vms = path.join(root, 'vms')

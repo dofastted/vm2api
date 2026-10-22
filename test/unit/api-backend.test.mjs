@@ -5,7 +5,7 @@ import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
-import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
+import { StickyRouter, scopeAssignmentKey } from '../../src/lib/pool/sticky-router.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { CRS_OFFICIAL_AGENT_PROMPT } from '../../src/lib/identity/crs-persona.mjs'
 import { sessionIdFromOutboundBody } from '../../src/lib/identity/identity-rewrite.mjs'
@@ -655,7 +655,14 @@ function companionHaikuBody(sessionId, deviceId = 'device-probe') {
   }
 }
 
-function protocolHarness({ body, stickyRouter, failoverRunner, apiKeyRecord = null, headers = {} }) {
+function protocolHarness({
+  body,
+  stickyRouter,
+  failoverRunner,
+  apiKeyRecord = null,
+  headers = {},
+  routingConfig = {},
+}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-protocol-seat-'))
   const routingFile = path.join(root, 'routing.json')
   fs.writeFileSync(routingFile, JSON.stringify({ compatibility: { persona_preset: 'zero' } }))
@@ -698,7 +705,7 @@ function protocolHarness({ body, stickyRouter, failoverRunner, apiKeyRecord = nu
     apiEndpointStore: {},
     stats,
     routingConfigPath: routingFile,
-    routingConfig: { compatibility: { persona_preset: 'zero' }, failover: {} },
+    routingConfig: { compatibility: { persona_preset: 'zero' }, failover: {}, ...routingConfig },
     failoverRunner,
     groupsRepo: { rateMultiplier: () => 1 },
   })
@@ -802,13 +809,14 @@ test('ordinary Haiku with tools keeps session sticky and session seat', async ()
   }
 })
 
-async function captureRunOpts({ body, stickyRouter, apiKeyRecord, headers }) {
+async function captureRunOpts({ body, stickyRouter, apiKeyRecord, headers, routingConfig }) {
   let runOpts = null
   const harness = protocolHarness({
     body,
     stickyRouter,
     apiKeyRecord,
     headers,
+    routingConfig,
     failoverRunner: {
       async run(opts) {
         runOpts = opts
@@ -844,6 +852,207 @@ function realStickyRouter() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-identity-sticky-'))
   return { dir, router: new StickyRouter({ dataDir: dir, config: { sticky: { enabled: true, ttl_seconds: 600 } } }) }
 }
+
+test('session assignment keeps short independent conversations separate from device affinity', async () => {
+  const { dir, router } = realStickyRouter()
+  try {
+    const routingConfig = { pool: { assignment_mode: 'session' } }
+    const first = await captureRunOpts({
+      body: sessionBody({ device_id: 'shared', session_id: 'first' }),
+      stickyRouter: router,
+      routingConfig,
+    })
+    const second = await captureRunOpts({
+      body: sessionBody({ device_id: 'shared', session_id: 'second' }),
+      stickyRouter: router,
+      routingConfig,
+    })
+    assert.equal(first.assignmentMode, 'session')
+    assert.equal(first.seatKey, scopeAssignmentKey('seat:sess:first'))
+    assert.equal(second.seatKey, scopeAssignmentKey('seat:sess:second'))
+    assert.equal(first.skipSessionSeat, false)
+    assert.equal(first.deviceKey, null)
+    assert.equal(second.deviceKey, null)
+    assert.equal(first.stickyKey, scopeAssignmentKey('sess:first'))
+    assert.deepEqual(first.legacyBindingKeys.session, ['sess:first', 'p:anthropic:first', 'first'])
+    assert.deepEqual(first.legacyBindingKeys.family, ['family2:first', 'p:anthropic:family:first'])
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('session assignment gives Claude agents one root seat and distinct sticky contexts', async () => {
+  const { dir, router } = realStickyRouter()
+  try {
+    const routingConfig = { pool: { assignment_mode: 'session' } }
+    const body = sessionBody({ device_id: 'shared', session_id: 'root' })
+    const main = await captureRunOpts({ body, stickyRouter: router, routingConfig })
+    const child = await captureRunOpts({
+      body,
+      stickyRouter: router,
+      routingConfig,
+      headers: { 'x-claude-code-agent-id': 'child' },
+    })
+    const grandchild = await captureRunOpts({
+      body,
+      stickyRouter: router,
+      routingConfig,
+      headers: { 'x-claude-code-agent-id': 'grandchild', 'x-claude-code-parent-agent-id': 'child' },
+    })
+    for (const agent of [child, grandchild]) {
+      assert.equal(agent.seatKey, main.seatKey)
+      assert.equal(agent.familyKey, main.familyKey)
+      assert.equal(agent.deviceKey, null)
+      assert.equal(agent.skipSessionSeat, false)
+    }
+    assert.equal(new Set([main.stickyKey, child.stickyKey, grandchild.stickyKey]).size, 3)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('session locks stay stable across assignment modes and separate agent contexts', async () => {
+  const { dir, router } = realStickyRouter()
+  try {
+    const body = sessionBody({ device_id: 'shared', session_id: 'root' })
+    const call = (mode, agentId) =>
+      captureRunOpts({
+        body,
+        stickyRouter: router,
+        routingConfig: { pool: { assignment_mode: mode } },
+        headers: agentId ? { 'x-claude-code-agent-id': agentId } : {},
+      })
+    const device = await call('device')
+    const session = await call('session')
+    const deviceChild = await call('device', 'child')
+    const sessionChild = await call('session', 'child')
+    assert.notEqual(device.stickyKey, session.stickyKey)
+    assert.equal(device.sessionLockKey, session.sessionLockKey)
+    assert.equal(device.sessionLockKey, scopeAssignmentKey('sess:root'))
+    assert.equal(deviceChild.sessionLockKey, sessionChild.sessionLockKey)
+    assert.notEqual(device.sessionLockKey, deviceChild.sessionLockKey)
+    router.reloadConfig({ sticky: { enabled: false } })
+    const disabled = await call('device')
+    assert.equal(disabled.stickyKey, null)
+    assert.equal(disabled.sessionLockKey, null)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('explicit header sessions keep their lock across assignment changes without upgrading fallback seats', async () => {
+  const { dir, router } = realStickyRouter()
+  try {
+    const body = sessionBody({ device_id: 'shared', parent_session_id: 'root' })
+    const headers = { 'x-session-id': 'child-header' }
+    const device = await captureRunOpts({ body, headers, stickyRouter: router })
+    const session = await captureRunOpts({
+      body,
+      headers,
+      stickyRouter: router,
+      routingConfig: { pool: { assignment_mode: 'session' } },
+    })
+    assert.equal(device.sessionLockKey, scopeAssignmentKey('sess:child-header'))
+    assert.equal(session.sessionLockKey, device.sessionLockKey)
+    assert.notEqual(session.stickyKey, device.stickyKey)
+    assert.equal(session.seatKey, scopeAssignmentKey('seat:sess:root'))
+    assert.equal(session.familyKey, scopeAssignmentKey('family2:root'))
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('root-only assignment scopes fingerprint context across tenants and allowed VM pools', async () => {
+  const { dir, router } = realStickyRouter()
+  try {
+    router.reloadConfig({ sticky: { enabled: false } })
+    const body = sessionBody({ root_session_id: 'root-only' })
+    const routingConfig = { pool: { assignment_mode: 'session' } }
+    const record = { id: 'key-a', user_id: 'tenant-a', group_type: 'anthropic', allowed_vms: ['vm-01'] }
+    const call = (apiKeyRecord) => captureRunOpts({ body, stickyRouter: router, routingConfig, apiKeyRecord })
+    const first = await call(record)
+    const repeat = await call({ ...record, id: 'key-b' })
+    const otherTenant = await call({ ...record, user_id: 'tenant-b' })
+    const otherPool = await call({ ...record, allowed_vms: ['vm-02'] })
+    assert.equal(first.assignmentMode, 'session')
+    assert.match(first.stickyKey, /^assignment:/)
+    assert.equal(first.stickyKey, repeat.stickyKey)
+    assert.equal(first.sessionLockKey, first.stickyKey)
+    assert.deepEqual(first.stickyKeys, [first.stickyKey])
+    assert.deepEqual(first.legacyBindingKeys.session, [])
+    assert.notEqual(first.stickyKey, otherTenant.stickyKey)
+    assert.notEqual(first.stickyKey, otherPool.stickyKey)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('session assignment resolves parent-only grandchildren and isolates tenant scopes at ingress', async () => {
+  const { dir, router } = realStickyRouter()
+  try {
+    const routingConfig = { pool: { assignment_mode: 'session' } }
+    const apiKeyRecord = { id: 'key-a', user_id: 'tenant-a', group_id: 1 }
+    const call = (session, parent, record = apiKeyRecord) =>
+      captureRunOpts({
+        body: sessionBody({
+          device_id: 'shared',
+          session_id: session,
+          ...(parent ? { parent_session_id: parent } : {}),
+        }),
+        stickyRouter: router,
+        routingConfig,
+        apiKeyRecord: record,
+      })
+    const root = await call('root')
+    const child = await call('child', 'root')
+    const grandchild = await call('grandchild', 'child')
+    assert.equal(child.seatKey, root.seatKey)
+    assert.equal(grandchild.seatKey, root.seatKey)
+    assert.equal(grandchild.familyKey, root.familyKey)
+    const otherTenant = await call('root', null, { ...apiKeyRecord, user_id: 'tenant-b' })
+    assert.notEqual(otherTenant.seatKey, root.seatKey)
+    assert.notEqual(otherTenant.stickyKey, root.stickyKey)
+    const sameTenantKey = await call('root', null, { ...apiKeyRecord, id: 'key-b' })
+    assert.equal(sameTenantKey.stickyKey, root.stickyKey)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('session assignment without trusted session metadata preserves the device fallback', async () => {
+  const { dir, router } = realStickyRouter()
+  try {
+    const body = sessionBody(
+      { device_id: 'fallback' },
+      {
+        messages: [
+          { role: 'user', content: 'Synthetic request long enough to exercise normal device-seat admission.' },
+        ],
+      },
+    )
+    const opts = await captureRunOpts({
+      body,
+      stickyRouter: router,
+      routingConfig: { pool: { assignment_mode: 'session' } },
+      headers: { 'x-session-id': 'header-only' },
+    })
+    assert.equal(opts.assignmentMode, 'device')
+    assert.equal(opts.seatKey, 'seat:dev:fallback')
+    assert.equal(opts.deviceKey, 'dev2:fallback')
+    assert.equal(opts.legacyBindingKeys, null)
+    assert.equal(opts.sessionLockKey, scopeAssignmentKey('sess:header-only'))
+    const fingerprint = await captureRunOpts({
+      body,
+      stickyRouter: router,
+      routingConfig: { pool: { assignment_mode: 'session' } },
+    })
+    assert.equal(fingerprint.assignmentMode, 'device')
+    assert.equal(fingerprint.seatKey, 'seat:dev:fallback')
+    assert.equal(fingerprint.sessionLockKey, fingerprint.stickyKey)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
 
 test('inbound session and device keys match across API keys at the protocol entry', async () => {
   const { dir, router } = realStickyRouter()

@@ -292,6 +292,11 @@ test('queue_max=2: the 3rd waiter is refused at once; a freed place admits the n
 })
 
 test('pool routing normalization: queue_max clamps, legacy strategy, dropped per-account cap', () => {
+  assert.equal(normalizePoolRouting({}).assignment_mode, 'device')
+  assert.equal(normalizePoolRouting({ assignment_mode: 'session' }).assignment_mode, 'session')
+  for (const invalid of ['SESSION', 'random', '', null, true]) {
+    assert.equal(normalizePoolRouting({ assignment_mode: invalid }).assignment_mode, 'device')
+  }
   assert.equal(normalizePoolRouting({}).queue_max, 50)
   assert.equal(normalizePoolRouting({ queue_max: 0 }).queue_max, 1)
   assert.equal(normalizePoolRouting({ queue_max: 1000 }).queue_max, 999)
@@ -308,6 +313,35 @@ test('pool routing normalization: queue_max clamps, legacy strategy, dropped per
   assert.equal(next.seat_grace_ms, 120000)
   assert.equal(next.seat_budget_reserve_pct, 0.5)
   assert.equal(normalizePoolRouting({}).seat_budget_reserve_pct, 0.02)
+})
+
+test('assignment mode hot reload preserves active seats, reservations and waiters', async (t) => {
+  const pool = setup(t, [{ id: 'vm-01', policy: { maxConcurrency: 1 } }], { seat_grace_ms: 0 })
+  const held = await seat(pool, 'existing-device')
+  const originalPlanner = pool.planner
+  const originalSeat = pool.planner.seatOf(planned('existing-device'))
+  const waiting = seat(pool, 'existing-device')
+  await waitFor(() => pool.queuedTotal() === 1)
+
+  for (const assignment_mode of ['session', 'device']) {
+    pool.reloadConfig({ ...pool.config, assignment_mode })
+    assert.equal(pool.config.assignment_mode, assignment_mode)
+    assert.equal(pool.planner, originalPlanner)
+    assert.equal(pool.planner.seatOf(planned('existing-device')), originalSeat)
+    assert.equal(pool.inflight.get(held.accountId), 1)
+    assert.equal(pool.vmInflight.get(held.vmId), 1)
+    assert.equal(pool.queuedTotal(), 1)
+  }
+
+  held.release()
+  const resumed = await waiting
+  assert.equal(resumed.ok, true)
+  assert.equal(resumed.vmId, held.vmId)
+  assert.equal(pool.inflight.get(held.accountId), 1)
+  resumed.release()
+  assert.equal(pool.inflight.get(held.accountId) || 0, 0)
+  assert.equal(pool.vmInflight.get(held.vmId) || 0, 0)
+  assert.equal(pool.queuedTotal(), 0)
 })
 
 test('seatless and pinned requests bypass the planner', async (t) => {
