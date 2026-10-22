@@ -1,5 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import {
   parseCountTokensBody,
   buildUsageView,
@@ -408,4 +411,132 @@ test('missing count_tokens body is 400', async () => {
   )
   assert.equal(cap.calls[0].status, 400)
   assert.equal(cap.calls[0].body.error.code, 'missing_field')
+})
+
+function usageProject(t, vms) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-usage-pick-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  for (const vm of vms) fs.writeFileSync(path.join(root, 'vms', `${vm.id}.json`), JSON.stringify(vm))
+  return root
+}
+
+const CLAUDE_UNIFIED = {
+  headers: {
+    '5h': { utilization: 0.2, status: 'active', reset: 'r5' },
+    '7d': { utilization: 0.3, status: 'ok', reset: 'r7' },
+  },
+}
+
+const CODEX_USAGE = {
+  primary_used_percent: 40,
+  primary_window_minutes: 300,
+  secondary_used_percent: 10,
+  secondary_window_minutes: 10080,
+}
+
+function usageDeps(root, overrides = {}) {
+  const cap = jsonCapture()
+  let peeks = 0
+  return {
+    cap,
+    peeks: () => peeks,
+    deps: {
+      json: cap.json,
+      requireAuth: () => true,
+      projectRoot: root,
+      accountQuota: { repo: { get: () => ({ unified: CLAUDE_UNIFIED }) } },
+      getPoolScheduler: () => ({
+        peekAccount: async () => {
+          peeks += 1
+          return { ok: false, code: 'no_eligible_accounts' }
+        },
+      }),
+      probeAccount: async () => ({ ok: true }),
+      ...overrides,
+    },
+  }
+}
+
+const tenantReq = (extra = {}) => ({
+  url: '/v1/usage',
+  headers: {},
+  apiKeyKind: 'managed',
+  apiKeyRecord: { id: 'k1', user_id: 'u1' },
+  ...extra,
+})
+const tenantUsers = { users: { getById: () => ({ role: 'user' }) } }
+const CODEX_VM = {
+  owner_user_id: 'u1',
+  platform: 'openai',
+  family: 'codex',
+  codex: { has_access: true, usage: CODEX_USAGE },
+}
+
+test('usage keeps the next Claude account and tags its platform', async (t) => {
+  const root = usageProject(t, [{ id: 'vm-x', ...CODEX_VM }])
+  const { cap, deps, peeks } = usageDeps(root, {
+    apiKeyStore: tenantUsers,
+    getPoolScheduler: () => ({
+      peekAccount: async () => ({
+        ok: true,
+        accountId: 'acc-1',
+        vmId: 'vm-c',
+        vm: { claude: { mode: 'oauth' } },
+        exec: {},
+      }),
+    }),
+  })
+  await handleUserUsage(tenantReq(), {}, deps)
+  assert.equal(cap.calls[0].status, 200, JSON.stringify(cap.calls[0].body))
+  assert.equal(cap.calls[0].body.platform, 'anthropic')
+  assert.equal(cap.calls[0].body.five_hour.utilization, 20)
+  assert.equal(peeks(), 0)
+})
+
+test('usage reads Codex windows when the caller has no Claude account', async (t) => {
+  const root = usageProject(t, [
+    { id: 'vm-x', ...CODEX_VM },
+    { id: 'vm-x-other', ...CODEX_VM, owner_user_id: 'u2' },
+  ])
+  const { cap, deps, peeks } = usageDeps(root, { apiKeyStore: tenantUsers })
+  await handleUserUsage(tenantReq(), {}, deps)
+  const body = cap.calls[0].body
+  assert.equal(cap.calls[0].status, 200, JSON.stringify(body))
+  assert.equal(peeks(), 1)
+  assert.equal(body.platform, 'openai')
+  assert.equal(body.source, 'codex')
+  assert.equal(body.five_hour.utilization, 40)
+  assert.equal(body.seven_day.utilization, 10)
+})
+
+test('usage never reads another owner Codex slot', async (t) => {
+  const root = usageProject(t, [{ id: 'vm-x-other', ...CODEX_VM, owner_user_id: 'u2' }])
+  const { cap, deps } = usageDeps(root, { apiKeyStore: tenantUsers })
+  await handleUserUsage(tenantReq(), {}, deps)
+  assert.equal(cap.calls[0].status, 503)
+})
+
+test('usage platform filter picks one side and rejects unknown values', async (t) => {
+  const root = usageProject(t, [{ id: 'vm-x', ...CODEX_VM }])
+  const { cap, deps, peeks } = usageDeps(root, {
+    apiKeyStore: tenantUsers,
+    getPoolScheduler: () => ({
+      peekAccount: async () => ({
+        ok: true,
+        accountId: 'acc-1',
+        vmId: 'vm-c',
+        vm: { claude: { mode: 'oauth' } },
+        exec: {},
+      }),
+    }),
+  })
+  await handleUserUsage(tenantReq({ url: '/v1/usage?platform=openai' }), {}, deps)
+  assert.equal(cap.calls[0].body.platform, 'openai')
+  await handleUserUsage(tenantReq({ url: '/v1/usage?platform=claude' }), {}, deps)
+  assert.equal(cap.calls[1].body.platform, 'anthropic')
+  await handleUserUsage(tenantReq({ url: '/v1/usage?platform=gemini' }), {}, deps)
+  assert.equal(cap.calls[2].status, 400)
+  assert.equal(cap.calls[2].body.error.code, 'invalid_platform')
+  assert.equal(peeks(), 0)
 })

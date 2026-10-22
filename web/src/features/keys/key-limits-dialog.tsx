@@ -168,25 +168,27 @@ export function KeyLimitsDialog({
               />
             </Field>
           ) : null}
-          <Field label='分类'>
-            <Select
-              value={draft.category}
-              onValueChange={(v) =>
-                setDraft((d) => ({
-                  ...d,
-                  category: v === 'api' ? 'api' : 'oauth',
-                }))
-              }
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value='oauth'>OAuth 槽位</SelectItem>
-                <SelectItem value='api'>API 直连</SelectItem>
-              </SelectContent>
-            </Select>
-          </Field>
+          {pools ? (
+            <Field label='分类'>
+              <Select
+                value={draft.category}
+                onValueChange={(v) =>
+                  setDraft((d) => ({
+                    ...d,
+                    category: v === 'api' ? 'api' : 'oauth',
+                  }))
+                }
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value='oauth'>OAuth 槽位</SelectItem>
+                  <SelectItem value='api'>API 直连</SelectItem>
+                </SelectContent>
+              </Select>
+            </Field>
+          ) : null}
           <Field label='并发'>
             <NumSelect
               kind='conc'

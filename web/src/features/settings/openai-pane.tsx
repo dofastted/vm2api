@@ -172,7 +172,7 @@ export function OpenaiPane({
                 label='官方 Codex 客户端透传'
                 desc={
                   codex.official_passthrough === true
-                    ? '开：保留官方 Responses body、instructions、prompt_cache_key 与 session，不再按 attempt 重建。'
+                    ? '开：保留 instructions/input/tools 等官方 body；session 与 prompt_cache_key 仍按槽位重建。'
                     : '关：官方 Codex 也走 body 归一化和 prompt_cache_key 重建。'
                 }
               >

@@ -202,7 +202,7 @@ function userVmPathAllowed(method, path) {
     )
   }
   if (method === 'PUT') return rest === 'test-schedule' || rest === 'oauth/credential'
-  if (method === 'DELETE') return !rest || rest === 'test-schedule'
+  if (method === 'DELETE') return rest === 'test-schedule'
   return false
 }
 

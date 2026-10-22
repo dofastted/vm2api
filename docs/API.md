@@ -35,7 +35,7 @@ x-api-key: sk-vm-…
 |------|------|------|--------------|
 | `POST` | `/v1/messages` 或 `/messages` | Anthropic Messages | Anthropic Messages / SSE |
 | `POST` | `/v1/messages/count_tokens` 或 `/messages/count_tokens` | Anthropic count_tokens | Setup/API Key → `{ input_tokens }`；OAuth → 5H/7D（同 `/v1/usage`） |
-| `GET` | `/v1/usage` | — | 当前 OAuth 账户 5H/7D（`unit=percent_used`） |
+| `GET` | `/v1/usage` | — | 当前账户 5H/7D，Claude 与 GPT 均可（`unit=percent_used`） |
 | `POST` | `/v1/chat/completions` 或 `/chat/completions` | OpenAI Chat | OpenAI Chat / SSE |
 | `POST` | `/v1/completions` 或 `/completions` | OpenAI Completions | OpenAI Completions |
 | `POST` | `/v1/responses` 或 `/responses` | OpenAI Responses | OpenAI Responses |
@@ -191,18 +191,21 @@ curl -sS http://127.0.0.1:8787/v1/messages/count_tokens \
 curl -sS http://127.0.0.1:8787/v1/usage -H "Authorization: Bearer $KEY"
 ```
 
-`GET /v1/usage` 仅完整 OAuth。成功：
+`GET /v1/usage` 返回调度器下一次会选到的账户的用量，只在调用方自己的属主范围和密钥范围内选：先选 Claude 账户；没有可用的 Claude 账户时，再选 GPT（Codex）槽位。可用 `?platform=claude` 或 `?platform=openai` 只看一类，其他值返回 `400 invalid_platform`。成功：
 
 ```json
 {
   "unit": "percent_used",
   "five_hour": { "utilization": 12, "status": "active", "resets_at": "…" },
   "seven_day": { "utilization": 34, "status": "ok", "resets_at": "…" },
-  "source": "extra"
+  "source": "extra",
+  "platform": "anthropic"
 }
 ```
 
-`utilization` 0–100。有 Messages Extra 用 Extra；两窗都空才走一次带缓存的官方 `/api/oauth/usage`（`source=oauth-usage`）。Setup Token 只有 `user:inference` 时官方 usage 会返回 scope 错误；服务端保留失败原因，不把它当吊销/封禁，也不改历史套餐。Console API Key 调 `/v1/usage` → `400 usage_unsupported`。窗缺失为 `null`，不伪装 0%。
+`platform` 为 `anthropic` 或 `openai`。GPT 槽位读本地记录的 Codex 5h/7d 窗口（`source=codex`），不发起上游请求。
+
+`utilization` 0–100。Claude 槽位：有 Messages Extra 用 Extra；两窗都空才走一次带缓存的官方 `/api/oauth/usage`（`source=oauth-usage`）。Setup Token 只有 `user:inference` 时官方 usage 会返回 scope 错误；服务端保留失败原因，不把它当吊销/封禁，也不改历史套餐。Console API Key 调 `/v1/usage` → `400 usage_unsupported`。窗缺失为 `null`，不伪装 0%。
 
 ## 面板额度探测
 

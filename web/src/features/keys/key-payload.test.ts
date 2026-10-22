@@ -28,6 +28,18 @@ describe('API key limit payload', () => {
     })
   })
 
+  it('sends category only for admins', () => {
+    expect(keyLimitsPayload(draft, 'create', { isAdmin: true }).category).toBe(
+      'api'
+    )
+    expect(
+      keyLimitsPayload(draft, 'create', { isAdmin: false })
+    ).not.toHaveProperty('category')
+    expect(
+      keyLimitsPayload(draft, 'edit', { isAdmin: false })
+    ).not.toHaveProperty('category')
+  })
+
   it('omits create-only fields from edits and rejects invalid quotas', () => {
     expect(keyLimitsPayload(draft, 'edit')).not.toHaveProperty('name')
     expect(keyLimitsPayload(draft, 'edit')).not.toHaveProperty(

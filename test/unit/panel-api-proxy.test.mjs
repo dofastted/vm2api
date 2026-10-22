@@ -29,6 +29,25 @@ function writeVm(project, rec) {
   fs.writeFileSync(path.join(dir, `${rec.id}.json`), JSON.stringify(rec, null, 2))
 }
 
+test('admin vm list and detail carry tenant owner and origin', async () => {
+  const project = tmpDir()
+  fs.mkdirSync(path.join(project, 'data'), { recursive: true })
+  writeVm(project, { id: 'vm-t1', status: 'stopped', claude: {}, owner_user_id: 'u1', origin: 'user_created' })
+  writeVm(project, { id: 'vm-p1', status: 'stopped', claude: {} })
+  const cfg = { paths: { project }, rewrite: { enabled: false }, base_url: 'http://127.0.0.1' }
+  const quota = fakeQuota()
+  const listed = await buildVmList({ cfg, accountQuota: quota, routingConfig: {} })
+  const tenant = listed.data.items.find((item) => item.id === 'vm-t1')
+  assert.equal(tenant.owner_user_id, 'u1')
+  assert.equal(tenant.origin, 'user_created')
+  const platform = listed.data.items.find((item) => item.id === 'vm-p1')
+  assert.equal(platform.owner_user_id, null)
+  assert.equal(platform.origin, 'platform')
+  const detail = await buildVmDetail({ cfg, accountQuota: quota, id: 'vm-t1' })
+  assert.equal(detail.data.vm.owner_user_id, 'u1')
+  assert.equal(detail.data.vm.origin, 'user_created')
+})
+
 test('summarizeProxyPool includes disconnect_on_error', () => {
   assert.deepEqual(summarizeProxyPool(null), {
     total: 0,

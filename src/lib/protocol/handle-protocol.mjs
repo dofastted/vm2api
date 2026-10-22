@@ -742,6 +742,7 @@ export function createHandleProtocol(deps) {
         stickyRouter,
         sessions: accountQuota?.sessions || null,
         body: ctx.body,
+        ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
       }
       // Account scope needs the slot, so the Codex hop runs the same gate again
       // once a candidate is claimed. Without a scope the pre-hop verdict stands.
@@ -1026,6 +1027,19 @@ export function createHandleProtocol(deps) {
       })
     }
     if (inferenceBackend === 'api') {
+      // API 直连走平台端点，不经过槽位；门禁与 api-kernel hop 同位，勿提前于 credential/intercept 链
+      if (ownerScopeFromRequest(req, apiKeyStore?.users).type !== 'platform') {
+        stats.errors++
+        const errorResult = makeError({
+          type: ErrorType.PERMISSION,
+          code: ErrorCode.API_BACKEND_FORBIDDEN,
+          message: '租户密钥只能调用自己名下的槽位',
+          status: 403,
+        })
+        logBag.error_code = ErrorCode.API_BACKEND_FORBIDDEN
+        logBag.error_message = errorResult.body?.error?.message || null
+        return json(res, 403, errorResult.body)
+      }
       const managedKey = req.apiKeyRecord || null
       if (managedKey) {
         const gate = apiKeyStore.acquire(managedKey)
@@ -1286,12 +1300,13 @@ export function createHandleProtocol(deps) {
           const routingNow = getRouting()
           const cliHop = resolveOfficialCcInference(selected.vm, routingNow) === 'cli-hop'
           // Official Claude Code already carries the real system, cache markers
-          // and sampling fields. In this mode the gateway only rebinds the slot
-          // identity; it must not rebuild the body or re-mint the session.
+          // and sampling fields. Content stays on the wire; slot identity and
+          // outbound session still follow attempt/VM rebuild semantics.
           const officialPassthrough = officialTraffic && cliHop && officialCcPassthroughFromRouting(routingNow)
+          const attemptSessionMode = officialPassthrough ? 'rebuild' : sessionContext.mode
           const attemptSessionId = resolveOutboundSessionId(callerSession, {
             ...sessionContext,
-            mode: officialPassthrough ? 'passthrough' : sessionContext.mode,
+            mode: attemptSessionMode,
             accountId: selected.accountId,
             boundSessionId: keptSession,
             boundAccountId: keptAccount,
@@ -1450,7 +1465,7 @@ export function createHandleProtocol(deps) {
             boundVmId: keptVm,
             vmId: selected.vmId,
             epoch: attemptStartedAt,
-            mode: officialPassthrough ? 'passthrough' : sessionMode,
+            mode: officialPassthrough ? 'rebuild' : sessionMode,
             routing: routingNow,
             clientDiscriminator,
             firstUserText,
@@ -1813,6 +1828,7 @@ export function createHandleProtocol(deps) {
       routing: getRouting() || {},
       projectRoot: cfg.paths.project,
       stickyRouter,
+      ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
     })
   }
 

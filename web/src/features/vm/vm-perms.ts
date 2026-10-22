@@ -17,7 +17,7 @@ export type VmPerms = {
   testModels: boolean
   /** oauth/*、导入凭证、额度刷新、重置券、诊断与恢复服务。 */
   credential: boolean
-  /** DELETE /vms/:id（租户只能删自己的，由后端判）。 */
+  /** DELETE /vms/:id（仅管理员）。 */
   remove: boolean
 }
 
@@ -55,7 +55,7 @@ export function vmPermsFor(
       power: true,
       test: true,
       credential: true,
-      remove: true,
+      remove: false,
     }
   }
   if (role === 'super') return { ...NONE, known: true, dashboard: true }

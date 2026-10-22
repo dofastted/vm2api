@@ -5,6 +5,7 @@ import {
   prepareOfficialPassthroughBody,
   prepareOutboundEnvelope,
 } from '../../src/lib/protocol/outbound-attempt.mjs'
+import { rebuildOutboundSession } from '../../src/lib/identity/identity-rewrite.mjs'
 import { resolveSlotPersonaPreset } from '../../src/lib/vm/slot-engine.mjs'
 
 const identity = {
@@ -66,12 +67,13 @@ function officialBody() {
 
 test('official passthrough keeps system/tools/messages/cache markers and sampling fields', () => {
   const input = officialBody()
+  const outboundSessionId = rebuildOutboundSession({ identity: 'caller-session', epoch: 'attempt:1' })
   const body = prepareOfficialPassthroughBody(input, {
     stream: true,
     identity,
     inbound: input,
     reqHeaders: { 'user-agent': 'claude-cli/2.1.306 (external, claude-vscode)' },
-    sessionId: 'caller-session',
+    sessionId: outboundSessionId,
   })
 
   assert.deepEqual(body.system, input.system, 'system and cache_control must not be rewritten')
@@ -90,7 +92,8 @@ test('official passthrough keeps system/tools/messages/cache markers and samplin
   const metadata = JSON.parse(body.metadata.user_id)
   assert.equal(metadata.device_id, 'dev-slot-01')
   assert.equal(metadata.account_uuid, 'acct-slot-01')
-  assert.equal(metadata.session_id, 'caller-session')
+  assert.equal(metadata.session_id, outboundSessionId)
+  assert.notEqual(metadata.session_id, 'caller-session')
 })
 
 test('official passthrough envelope returns the prepared body untouched', () => {

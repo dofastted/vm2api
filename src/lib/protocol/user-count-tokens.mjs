@@ -28,8 +28,12 @@ import { isOfficialUsageRateLimited, shouldHopOfficialUsage } from '../oauth/crs
 import { countTokensViaWorker } from '../transport/go-worker-client.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
 import { listQuotaFromHeaders, publicUsageWindow, usageWindowsEmpty } from '../pool/quota-window.mjs'
-import { ownerScopeFromRequest } from '../admin/resource-owner.mjs'
-import { keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
+import { ownerScopeFromRequest, vmMatchesOwnerScope } from '../admin/resource-owner.mjs'
+import { keyAllowsVm, keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
+import { getVm, listVms } from '../vm/vm-registry.mjs'
+import { isCodexVm } from '../vm/vm-kind.mjs'
+import { summarizeCodexSlot } from '../vm/codex-slot.mjs'
+import { pickCodexSlots } from '../pool/codex-slot-pool.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
 import { resolveInboundIdentity } from '../identity/identity-rewrite.mjs'
 export function countTokensUnsupportedError() {
@@ -370,30 +374,100 @@ export async function resolveUsageWindows({
   return { listed, source }
 }
 
+const USAGE_PLATFORMS = {
+  claude: 'anthropic',
+  anthropic: 'anthropic',
+  cc: 'anthropic',
+  openai: 'openai',
+  codex: 'openai',
+  gpt: 'openai',
+  cx: 'openai',
+}
+
+export function usagePlatformOf(req) {
+  let raw = ''
+  try {
+    raw = new URL(req?.url || '/', 'http://localhost').searchParams.get('platform') || ''
+  } catch {
+    raw = ''
+  }
+  const key = raw.trim().toLowerCase()
+  if (!key) return { ok: true, platform: null }
+  const platform = USAGE_PLATFORMS[key]
+  return platform ? { ok: true, platform } : { ok: false }
+}
+
+function usableUsageVm(vm, { ownerScope, keyScope }) {
+  return !!vm?.id && vmMatchesOwnerScope(vm, ownerScope) && keyAllowsVm(keyScope, vm)
+}
+
+function codexUsageVm(projectRoot, scope) {
+  if (!projectRoot) return null
+  // Readiness reads summary fields (has_token, expires_at), same as the Codex hop.
+  const summaries = listVms(projectRoot).filter((vm) => isCodexVm(vm) && usableUsageVm(vm, scope))
+  const id = pickCodexSlots(summaries).ids?.[0]
+  return id ? getVm(projectRoot, id) : null
+}
+
+/** The account the scheduler would pick next. Claude first, then Codex; `platform` narrows to one. */
 export async function handleUserUsage(req, res, deps) {
   const json = (...args) => deps.json(...args)
   if (!deps.requireAuth(req, res)) return
-  const peeked = await peekCurrentAccount({
-    poolScheduler: typeof deps.getPoolScheduler === 'function' ? deps.getPoolScheduler() : deps.poolScheduler,
-    stickyRouter: deps.stickyRouter,
-    req,
-    inbound: {},
-    usersRepo: deps.apiKeyStore?.users || null,
-  })
-  if (!peeked.ok) return sendPoolFail(res, json, peeked)
-  const mode = credentialModeOfVm(peeked.vm)
-  if (!canOfficialUsage(mode)) {
-    const err = usageUnsupportedError()
+  const wanted = usagePlatformOf(req)
+  if (!wanted.ok) {
+    const err = makeError({
+      type: ErrorType.INVALID_REQUEST,
+      code: 'invalid_platform',
+      message: 'platform 只能是 claude 或 openai',
+      param: 'platform',
+      status: 400,
+    })
     return json(res, err.status, err.body)
   }
-  const { listed, source } = await resolveUsageWindows({
-    accountQuota: deps.accountQuota,
-    accountId: peeked.accountId,
-    vmId: peeked.vmId,
-    exec: peeked.exec,
-    vm: peeked.vm,
-    usageCache: deps.usageCache,
-    probe: deps.probeAccount,
-  })
-  return json(res, 200, buildUsageView(listed, source))
+  const keyScope = keyScopeFromRequest(req)
+  const poolDenial = vmPoolDenial(keyScope)
+  if (poolDenial) return sendPoolFail(res, json, { code: ErrorCode.VM_POOL_UNAVAILABLE, message: poolDenial.message })
+  if (wanted.platform && keyScope.group_type !== 'all' && keyScope.group_type !== wanted.platform) {
+    return sendPoolFail(res, json, { code: ErrorCode.KEY_GROUP_MISMATCH, group_type: keyScope.group_type })
+  }
+  const poolScheduler = typeof deps.getPoolScheduler === 'function' ? deps.getPoolScheduler() : deps.poolScheduler
+  const projectRoot = deps.projectRoot || poolScheduler?.projectRoot || null
+
+  let peeked = null
+  if (wanted.platform !== 'openai') {
+    peeked = await peekCurrentAccount({
+      poolScheduler,
+      stickyRouter: deps.stickyRouter,
+      req,
+      inbound: {},
+      usersRepo: deps.apiKeyStore?.users || null,
+    })
+    if (peeked.ok && !isCodexVm(peeked.vm)) {
+      if (!canOfficialUsage(credentialModeOfVm(peeked.vm))) {
+        const err = usageUnsupportedError()
+        return json(res, err.status, err.body)
+      }
+      const { listed, source } = await resolveUsageWindows({
+        accountQuota: deps.accountQuota,
+        accountId: peeked.accountId,
+        vmId: peeked.vmId,
+        exec: peeked.exec,
+        vm: peeked.vm,
+        usageCache: deps.usageCache,
+        probe: deps.probeAccount,
+      })
+      return json(res, 200, { ...buildUsageView(listed, source), platform: 'anthropic' })
+    }
+  }
+  if (wanted.platform !== 'anthropic') {
+    const vm = codexUsageVm(projectRoot, {
+      ownerScope: ownerScopeFromRequest(req, deps.apiKeyStore?.users || null),
+      keyScope,
+    })
+    if (vm) {
+      const quota = summarizeCodexSlot(projectRoot, vm).usage?.quota || {}
+      return json(res, 200, { ...buildUsageView(quota, 'codex'), platform: 'openai' })
+    }
+  }
+  return sendPoolFail(res, json, peeked && !peeked.ok ? peeked : { code: 'no_eligible_accounts' })
 }

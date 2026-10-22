@@ -1,7 +1,7 @@
 import { getVm } from '../vm/vm-registry.mjs'
 import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import { panelIdentity } from './panel-acl.mjs'
-import { canUserDeleteVm, normalizeOwnerId, proxyOwnerId, vmOwnerId } from './resource-owner.mjs'
+import { normalizeOwnerId, proxyOwnerId, vmOwnerId } from './resource-owner.mjs'
 
 const VM_COLLECTION = new Set([
   'create',
@@ -50,7 +50,7 @@ export function denyIfUserMissesVm(req, res, { projectRoot, json, path }) {
 export function denyIfUserCannotDeleteVm(req, res, vm, json) {
   const ident = panelIdentity(req)
   if (ident.role === 'admin') return false
-  if (ident.role === 'user' && canUserDeleteVm(vm, req.panelUserId)) return false
+  void vm
   json(
     res,
     403,

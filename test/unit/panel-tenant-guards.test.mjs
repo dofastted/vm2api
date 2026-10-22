@@ -219,6 +219,51 @@ test('tenant key scope only accepts its own slots, on PATCH and create', async (
   assert.equal(rec.group_id, 1)
 })
 
+test('tenant cannot delete a self-created slot; admin still can', async (t) => {
+  const root = makeProject(t)
+  writeVm(root, {
+    id: 'vm-mine',
+    platform: 'anthropic',
+    family: 'claude',
+    owner_user_id: 'u-1',
+    origin: 'user_created',
+  })
+  const tenantDel = await makeHandler(root, TENANT, {}, {}).call('DELETE', '/api/panel/vms/vm-mine')
+  assert.equal(tenantDel.status, 403)
+  assert.equal(tenantDel.body?.error?.code, 'forbidden')
+  assert.ok(fs.existsSync(path.join(root, 'vms', 'vm-mine.json')))
+
+  const adminDel = await makeHandler(root, ADMIN, {}, {}).call('DELETE', '/api/panel/vms/vm-mine')
+  assert.equal(adminDel.status, 200, JSON.stringify(adminDel.body))
+  assert.equal(adminDel.body?.data?.deleted, 'vm-mine')
+})
+
+test('only admins can create or switch keys to the API category', async (t) => {
+  const { root, store, key } = keyFixture(t)
+  const before = store.list().length
+  const create = await makeHandler(root, TENANT, { name: 'direct', category: 'api' }, { apiKeyStore: store }).call(
+    'POST',
+    '/api/panel/api-keys',
+  )
+  assert.equal(create.status, 403)
+  assert.equal(create.body.error.code, 'key_category_forbidden')
+  assert.equal(store.list().length, before)
+
+  const patch = await makeHandler(root, TENANT, { category: ' API ' }, { apiKeyStore: store }).call(
+    'PATCH',
+    `/api/panel/api-keys/${key.id}`,
+  )
+  assert.equal(patch.status, 403)
+  assert.equal(store.getById(key.id).category, 'oauth')
+
+  const admin = await makeHandler(root, ADMIN, { category: 'api' }, { apiKeyStore: store }).call(
+    'PATCH',
+    `/api/panel/api-keys/${key.id}`,
+  )
+  assert.equal(admin.status, 200, JSON.stringify(admin.body))
+  assert.equal(store.getById(key.id).category, 'api')
+})
+
 test('admin key edits keep user_id, group_id and any slot', async (t) => {
   const { root, store, key } = keyFixture(t)
   const out = await makeHandler(
