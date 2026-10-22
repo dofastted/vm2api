@@ -1939,6 +1939,7 @@ export function createHandleProtocol(deps) {
       routing: getRouting() || {},
       projectRoot: cfg.paths.project,
       stickyRouter,
+      ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
     })
   }
 

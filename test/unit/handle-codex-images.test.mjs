@@ -234,8 +234,9 @@ test('a non-JSON upstream answer is a 502, and upstream errors pass through', as
   assert.equal(rejected.logBag.final_state, 'upstream_error')
 })
 
-function protocolHarness(rows) {
+function protocolHarness(rows, { apiKeyStore = null } = {}) {
   return createHandleProtocol({
+    apiKeyStore,
     cfg: { limits: { max_body_bytes: 1 << 20 }, rewrite: { enabled: false }, paths: { project: root } },
     json(res, status, body) {
       res.statusCode = status
@@ -299,6 +300,28 @@ test('the images route rejects a broken multipart edit as a 400', async () => {
   assert.equal(res.statusCode, 400)
   assert.equal(res.body.error.code, 'invalid_image_edit')
   assert.equal(rows[0].error_code, 'invalid_image_edit')
+})
+
+test('the images route picks slots by the key owner role, like search', async () => {
+  writeGptVm('vm-platform')
+  writeGptVm('vm-tenant')
+  const file = path.join(root, 'vms', 'vm-tenant.json')
+  fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), owner_user_id: 'u1' }))
+  const roles = { a1: 'admin', u1: 'user' }
+  const apiKeyStore = { users: { getById: (id) => ({ id, role: roles[id] }) } }
+  const run = async (userId) => {
+    const rows = []
+    const { handleImages } = protocolHarness(rows, { apiKeyStore })
+    const req = Readable.from([Buffer.from('{"model":"gpt-image-2.5-flare","prompt":"x"}')])
+    req.headers = { 'content-type': 'application/json' }
+    req.apiKeyRecord = { id: `key-${userId}`, user_id: userId }
+    const res = fakeRes()
+    await handleImages(req, res, '/v1/images/generations', 'generations')
+    res.finish()
+    return rows[0]
+  }
+  assert.equal((await run('a1')).vm_id, 'vm-platform')
+  assert.equal((await run('u1')).vm_id, 'vm-tenant')
 })
 
 test('the images route reads JSON generations', async () => {
