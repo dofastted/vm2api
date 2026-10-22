@@ -152,6 +152,6 @@ test('openai.chat multi-turn cli-hop marks last and penultimate user', () => {
   }).claude
   const body = prepareCliHopBody(chat, { unofficial: true, cacheTtl: '1h' })
   assert.equal(body.messages[2].content[0].cache_control, undefined)
-  assert.deepEqual(body.messages[4].content[0].cache_control, { type: 'ephemeral' })
+  assert.deepEqual(body.messages[4].content[0].cache_control, { type: 'ephemeral', ttl: '1h' })
   assert.equal(body.messages[0].content[0].cache_control, undefined)
 })
