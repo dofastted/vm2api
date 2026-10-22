@@ -127,6 +127,10 @@ function cacheCreationBreakdown(usage) {
   return { cache_creation_5m_tokens: five, cache_creation_1h_tokens: hour }
 }
 
+function imageTokenCount(v) {
+  return Number.isSafeInteger(v) && v > 0 ? v : 0
+}
+
 function webSearchRequestsOf(usage) {
   const n = Number(usage?.server_tool_use?.web_search_requests ?? usage?.web_search_requests)
   return Number.isFinite(n) && n > 0 ? Math.trunc(n) : 0
@@ -138,6 +142,7 @@ const PRICED_COLUMN_KEYS = [
   'cache_read_cost',
   'cache_creation_cost',
   'web_search_cost',
+  'image_cost',
   'total_cost',
   'pricing_model',
   'price_source',
@@ -147,19 +152,27 @@ const PRICED_COLUMN_KEYS = [
   'long_context',
 ]
 
+/** Image generation usage on this row; an Images endpoint row (`openai.images`) bills it alone. */
+function imageForLog(extra) {
+  const only = extra.protocol === 'openai.images'
+  if (!extra.image_usage && !only) return null
+  return { usage: extra.image_usage || null, model: extra.image_model || null, only }
+}
+
 function costColumnsForLog(usage, model, extra = {}) {
   if (extra.pricing_model != null) {
     const out = {}
     for (const key of PRICED_COLUMN_KEYS) out[key] = extra[key] ?? null
     return out
   }
-  const priced = costColumnsFromUsage(usage, model)
+  const priced = costColumnsFromUsage(usage, model, imageForLog(extra))
   return {
     input_cost: priced.input_cost ?? null,
     output_cost: priced.output_cost ?? null,
     cache_read_cost: priced.cache_read_cost ?? null,
     cache_creation_cost: priced.cache_creation_cost ?? null,
     web_search_cost: priced.web_search_cost ?? null,
+    image_cost: priced.image_cost ?? null,
     total_cost: priced.total_cost ?? null,
     pricing_model: priced.pricing_model ?? null,
     price_source: priced.price_source ?? null,
@@ -568,6 +581,10 @@ export class RequestLogStore {
       inbound_device_id: sessionIdForLog(extra.inbound_device_id),
       // Gate verdict JSON from intercept-gate; the risk audit groups on it.
       intercept: extra.intercept ? String(extra.intercept).slice(0, 400) : null,
+      image_model: extra.image_model || null,
+      image_usage: extra.image_usage ? JSON.stringify(extra.image_usage) : null,
+      image_input_tokens: imageTokenCount(extra.image_usage?.input_tokens),
+      image_output_tokens: imageTokenCount(extra.image_usage?.output_tokens),
       // sub2api ownership + billing columns
       user_id: extra.user_id ?? null,
       vm_owner_user_id: this.repo.vmOwnerOf(extra.vm_id),

@@ -5,6 +5,7 @@ import {
   shanghaiDay,
   shanghaiDayStartIso,
   costColumnsFromUsage,
+  imageCostFromUsage,
   normalizeUsage,
 } from '../../src/lib/admin/pricing.mjs'
 import { resolvePrice } from '../../src/lib/admin/price-catalog.mjs'
@@ -528,4 +529,118 @@ test('normalizeUsage is idempotent and Codex 100k/80k cached becomes 20k', () =>
   const billed = calculateCost(raw, 'gpt-5.5')
   assert.equal(billed.input_tokens, 20_000)
   assert.equal(billed.cache_read_tokens, 80_000)
+})
+
+const close = (a, b) => assert.ok(Math.abs(a - b) < 1e-9, `${a} != ${b}`)
+
+function imageUsage(over = {}) {
+  return {
+    input_tokens: 300,
+    input_tokens_details: { text_tokens: 100, image_tokens: 200 },
+    output_tokens: 1000,
+    output_tokens_details: { image_tokens: 1000, text_tokens: 0 },
+    total_tokens: 1300,
+    ...over,
+  }
+}
+
+test('gpt-image-2.5 builtin prices text and image tokens separately', () => {
+  for (const id of ['gpt-image-2.5-flare', 'gpt-image-2.5-sunburst-2026-09-08']) {
+    const got = resolvePrice(id)
+    assert.equal(got.platform, 'openai')
+    assert.equal(got.price.input, 5)
+    assert.equal(got.price.cache_read, 1.25)
+    assert.equal(got.price.output, 0)
+    assert.deepEqual(got.price.image, { input: 8, output: 30, cache_read: 2 })
+  }
+  assert.equal(resolvePrice('gpt-image-2.5-sunburst-2026-09-08').id, 'gpt-image-2.5-sunburst')
+})
+
+test('imageCostFromUsage matches the codex-proxy-rs image token formula', () => {
+  const c = imageCostFromUsage(imageUsage(), 'gpt-image-2.5-sunburst')
+  assert.equal(c.known, true)
+  assert.equal(c.pricing_key, 'gpt-image-2.5-sunburst')
+  // 100 text × $5 + 200 image × $8 + 1000 output × $30, per 1M
+  close(c.image_cost, 0.0005 + 0.0016 + 0.03)
+  assert.equal(c.image_input_tokens, 300)
+  assert.equal(c.image_output_tokens, 1000)
+})
+
+test('imageCostFromUsage splits cached input only when the split is unambiguous', () => {
+  const textOnly = {
+    input_tokens: 100,
+    input_tokens_details: { text_tokens: 100, image_tokens: 0, cached_tokens: 40 },
+    output_tokens: 0,
+  }
+  close(imageCostFromUsage(textOnly, 'gpt-image-2.5-flare').image_cost, (60 * 5 + 40 * 1.25) / 1e6)
+  const imageOnly = {
+    input_tokens: 200,
+    input_tokens_details: { text_tokens: 0, image_tokens: 200, cached_tokens: 100 },
+    output_tokens: 0,
+  }
+  close(imageCostFromUsage(imageOnly, 'gpt-image-2.5-flare').image_cost, (100 * 8 + 100 * 2) / 1e6)
+  const allCached = imageUsage({ input_tokens_details: { text_tokens: 100, image_tokens: 200, cached_tokens: 300 } })
+  close(imageCostFromUsage(allCached, 'gpt-image-2.5-flare').image_cost, (100 * 1.25 + 200 * 2 + 1000 * 30) / 1e6)
+  const partial = imageUsage({ input_tokens_details: { text_tokens: 100, image_tokens: 200, cached_tokens: 50 } })
+  assert.equal(imageCostFromUsage(partial, 'gpt-image-2.5-flare').known, false)
+})
+
+test('imageCostFromUsage refuses inconsistent or incomplete usage', () => {
+  const bad = [
+    imageUsage({ input_tokens: 301 }),
+    imageUsage({ total_tokens: 1299 }),
+    imageUsage({ output_tokens_details: { image_tokens: 900, text_tokens: 100 } }),
+    imageUsage({ input_tokens_details: { text_tokens: 100, image_tokens: 200, cached_tokens: 301 } }),
+    { input_tokens: 300, output_tokens: 1000 },
+    imageUsage({ output_tokens: -1 }),
+    null,
+  ]
+  for (const usage of bad)
+    assert.equal(imageCostFromUsage(usage, 'gpt-image-2.5-flare').known, false, JSON.stringify(usage))
+  assert.equal(imageCostFromUsage(imageUsage(), 'gpt-image-9').known, false)
+})
+
+test('imageCostFromUsage prices an omitted model at the shared 2.5 price', () => {
+  const c = imageCostFromUsage(imageUsage(), null)
+  assert.equal(c.known, true)
+  close(c.image_cost, 0.0321)
+})
+
+test('Responses image tool: main model cost plus image cost', () => {
+  const main = { input_tokens: 1000, output_tokens: 100 }
+  const plain = costColumnsFromUsage(main, 'gpt-6-luna')
+  const both = costColumnsFromUsage(main, 'gpt-6-luna', { usage: imageUsage(), model: 'gpt-image-2.5-flare' })
+  assert.equal(plain.image_cost, null)
+  close(both.image_cost, 0.0321)
+  close(both.total_cost, plain.total_cost + 0.0321)
+  assert.equal(both.pricing_model, 'gpt-6-luna')
+})
+
+test('Responses image tool with unpriceable image usage leaves the whole row unpriced', () => {
+  const row = costColumnsFromUsage({ input_tokens: 1000, output_tokens: 100 }, 'gpt-6-luna', {
+    usage: { input_tokens: 300, output_tokens: 1000 },
+    model: null,
+  })
+  assert.equal(row.pricing_model, 'unpriced')
+  assert.equal(row.total_cost, null)
+  assert.equal(row.image_cost, null)
+})
+
+test('Images endpoint rows bill only the image usage', () => {
+  const row = costColumnsFromUsage({}, 'gpt-image-2.5-sunburst', {
+    usage: imageUsage(),
+    model: 'gpt-image-2.5-sunburst',
+    only: true,
+  })
+  assert.equal(row.pricing_model, 'gpt-image-2.5-sunburst')
+  close(row.image_cost, 0.0321)
+  close(row.total_cost, 0.0321)
+  assert.equal(row.input_cost, 0)
+  const unpriced = costColumnsFromUsage({}, 'gpt-image-2.5-sunburst', {
+    usage: null,
+    model: 'gpt-image-2.5-sunburst',
+    only: true,
+  })
+  assert.equal(unpriced.pricing_model, 'unpriced')
+  assert.equal(unpriced.total_cost, null)
 })

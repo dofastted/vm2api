@@ -287,20 +287,111 @@ export function billingBandFromUsage(usage = {}) {
   return { service_tier: tier || null, speed: speed || null }
 }
 
-export function costColumnsFromUsage(usage, model) {
-  const c = calculateCost(usage, model)
+// Both GPT Image 2.5 variants share one price; an omitted model is priced with it.
+const IMAGE_DEFAULT_PRICE_ID = 'gpt-image-2.5-flare'
+
+function tokenCount(v) {
+  return Number.isSafeInteger(v) && v >= 0 ? v : null
+}
+
+/**
+ * Image generation usage (`tool_usage.image_gen`, or an Images response `usage`), priced like
+ * codex-proxy-rs `image_calculated_cost`: text input at the base rates, image input and output
+ * at `price.image`. A split that does not add up stays unpriced; nothing is guessed.
+ */
+export function imageCostFromUsage(usage, imageModel = null) {
+  const unknown = {
+    known: false,
+    image_cost: null,
+    image_input_tokens: tokenCount(usage?.input_tokens) ?? 0,
+    image_output_tokens: tokenCount(usage?.output_tokens) ?? 0,
+    pricing_key: null,
+    price_source: null,
+    price_version: null,
+  }
+  if (!usage || typeof usage !== 'object') return unknown
+  const resolved = resolvePrice(imageModel || IMAGE_DEFAULT_PRICE_ID)
+  const rates = resolved?.price
+  if (!rates?.image) return unknown
+  const input = tokenCount(usage.input_tokens)
+  const output = tokenCount(usage.output_tokens)
+  const text = tokenCount(usage.input_tokens_details?.text_tokens)
+  const image = tokenCount(usage.input_tokens_details?.image_tokens)
+  const cached =
+    usage.input_tokens_details?.cached_tokens == null ? 0 : tokenCount(usage.input_tokens_details.cached_tokens)
+  if (input == null || output == null || text == null || image == null || cached == null) return unknown
+  if (text + image !== input || cached > input) return unknown
+  if (usage.total_tokens != null && usage.total_tokens !== input + output) return unknown
+  // The model only outputs images; any other output modality cannot use the image rate.
+  const outDetails = usage.output_tokens_details
+  if (outDetails != null && (outDetails.image_tokens !== output || outDetails.text_tokens !== 0)) return unknown
+  // A cached total alone cannot be split across mixed text and image input.
+  let cachedText = 0
+  let cachedImage = 0
+  if (cached) {
+    if (image === 0) cachedText = cached
+    else if (text === 0) cachedImage = cached
+    else if (cached === input) {
+      cachedText = text
+      cachedImage = image
+    } else return unknown
+  }
+  const cost =
+    usd(text - cachedText, rates.input) +
+    usd(cachedText, rates.cache_read) +
+    usd(image - cachedImage, rates.image.input) +
+    usd(cachedImage, rates.image.cache_read) +
+    usd(output, rates.image.output)
   return {
-    input_cost: c.known ? c.input_cost : null,
-    output_cost: c.known ? c.output_cost : null,
-    cache_read_cost: c.known ? c.cache_read_cost : null,
-    cache_creation_cost: c.known ? c.cache_creation_cost : null,
-    web_search_cost: c.known ? c.web_search_cost : null,
-    total_cost: c.known ? c.total_cost : null,
-    pricing_model: c.known ? c.pricing_key : UNPRICED_MODEL,
-    price_source: c.known ? c.price_source : null,
-    price_version: c.known ? c.price_version : null,
-    ...billingBandFromUsage(normalizeUsage(usage)),
-    long_context: c.known ? (c.long_context ? 1 : 0) : null,
+    known: true,
+    image_cost: round8(cost),
+    image_input_tokens: input,
+    image_output_tokens: output,
+    pricing_key: resolved.id,
+    price_source: resolved.source,
+    price_version: resolved.version,
+  }
+}
+
+/**
+ * `image` = `{ usage, model, only }`: image generation usage on the same row. `only` marks an
+ * Images endpoint row, which has no text-model usage. Either part unpriced → the whole row is.
+ */
+export function costColumnsFromUsage(usage, model, image = null) {
+  const img = image ? imageCostFromUsage(image.usage, image.model) : null
+  const band = billingBandFromUsage(normalizeUsage(usage))
+  if (image?.only) {
+    const known = img.known
+    return {
+      input_cost: known ? 0 : null,
+      output_cost: known ? 0 : null,
+      cache_read_cost: known ? 0 : null,
+      cache_creation_cost: known ? 0 : null,
+      web_search_cost: known ? 0 : null,
+      image_cost: known ? img.image_cost : null,
+      total_cost: known ? img.image_cost : null,
+      pricing_model: known ? img.pricing_key : UNPRICED_MODEL,
+      price_source: known ? img.price_source : null,
+      price_version: known ? img.price_version : null,
+      ...band,
+      long_context: known ? 0 : null,
+    }
+  }
+  const c = calculateCost(usage, model)
+  const known = c.known && (!img || img.known)
+  return {
+    input_cost: known ? c.input_cost : null,
+    output_cost: known ? c.output_cost : null,
+    cache_read_cost: known ? c.cache_read_cost : null,
+    cache_creation_cost: known ? c.cache_creation_cost : null,
+    web_search_cost: known ? c.web_search_cost : null,
+    image_cost: known && img ? img.image_cost : null,
+    total_cost: known ? round8(c.total_cost + (img?.image_cost || 0)) : null,
+    pricing_model: known ? c.pricing_key : UNPRICED_MODEL,
+    price_source: known ? c.price_source : null,
+    price_version: known ? c.price_version : null,
+    ...band,
+    long_context: known ? (c.long_context ? 1 : 0) : null,
   }
 }
 

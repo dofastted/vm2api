@@ -550,3 +550,32 @@ test('persistRoutingPatch round-trips websocket gates and analytics', () => {
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('persistRoutingPatch replaces codex.model_mappings with the full table the panel sends', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-mappings-'))
+  const routingFile = path.join(root, 'routing.json')
+  const routingConfig = {
+    concurrency: {},
+    tiers: {},
+    codex: { model_mappings: { 'codex-auto-review': 'gpt-6-sol', 'my-fast': 'gpt-6-luna' } },
+  }
+  fs.writeFileSync(routingFile, JSON.stringify(routingConfig))
+  try {
+    const runtime = persistHarness(root, routingFile, routingConfig)
+    runtime.persistRoutingPatch({
+      codex: { model_mappings: { 'codex-auto-review': 'gpt-5.5', 'my-fast': 'gpt-6-luna', other: 'gpt-6-sol' } },
+    })
+    let saved = JSON.parse(fs.readFileSync(routingFile, 'utf8'))
+    assert.deepEqual(saved.codex.model_mappings, {
+      'codex-auto-review': 'gpt-5.5',
+      'my-fast': 'gpt-6-luna',
+      other: 'gpt-6-sol',
+    })
+    // Restoring the default removes the key; the default target comes back on normalize.
+    runtime.persistRoutingPatch({ codex: { model_mappings: { 'my-fast': 'gpt-6-luna' } } })
+    saved = JSON.parse(fs.readFileSync(routingFile, 'utf8'))
+    assert.deepEqual(saved.codex.model_mappings, { 'codex-auto-review': 'gpt-6-luna', 'my-fast': 'gpt-6-luna' })
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})

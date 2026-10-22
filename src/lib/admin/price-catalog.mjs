@@ -167,6 +167,9 @@ function fillPrice(price, platform) {
   if (price.per_call && typeof price.per_call === 'object' && isRate(price.per_call.web_search)) {
     base.per_call = { web_search: price.per_call.web_search }
   }
+  if (price.image && ['input', 'output', 'cache_read'].every((f) => isRate(price.image[f]))) {
+    base.image = { input: price.image.input, output: price.image.output, cache_read: price.image.cache_read }
+  }
   return base
 }
 
@@ -199,6 +202,14 @@ export function validatePrice(price, { platform } = {}) {
       if (price.modes[m] == null) continue
       const inner = validatePrice(price.modes[m], { platform })
       if (!inner.ok) return { ok: false, error: `modes.${m}: ${inner.error}` }
+    }
+  }
+  if (price.image != null) {
+    if (typeof price.image !== 'object' || Array.isArray(price.image)) {
+      return { ok: false, error: 'image must be an object' }
+    }
+    for (const f of ['input', 'output', 'cache_read']) {
+      if (!isRate(price.image[f])) return { ok: false, error: `missing or invalid image.${f}` }
     }
   }
   if (price.per_call != null) {
@@ -420,6 +431,7 @@ function fillGaps(base, builtin, source) {
   const price = clone(base)
   const mode_sources = {}
   if (price.per_call == null && builtin?.per_call) price.per_call = clone(builtin.per_call)
+  if (price.image == null && builtin?.image) price.image = clone(builtin.image)
   if (price.tiers == null && builtin?.tiers) price.tiers = clone(builtin.tiers)
   for (const m of MODE_NAMES) {
     if (price.modes?.[m]) mode_sources[m] = source
