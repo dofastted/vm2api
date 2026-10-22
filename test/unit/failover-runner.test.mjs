@@ -1747,6 +1747,115 @@ test('explicit VM pin is not redirected by a family locked elsewhere', async () 
   assert.equal(scheduler.state.inflight, 0)
 })
 
+test('session assignment forwards the root binding and ignores device affinity', async () => {
+  const scheduler = leasingScheduler([candidate(1), candidate(2)])
+  const deviceBindings = []
+  const runner = new FailoverRunner({
+    scheduler,
+    stickyRouter: {
+      resolve: (key) =>
+        key === 'device-home' ? { accountId: 'account-2', vmId: 'vm-02' } : null,
+      bind: () => true,
+      bindDeviceAffinity: (...args) => deviceBindings.push(args),
+    },
+  })
+  const legacyBindingKeys = { session: ['legacy-session'], family: ['legacy-family'] }
+  const result = await runner.run({
+    requestId: 'session-assignment',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    assignmentMode: 'session',
+    stickyKey: 'scoped-session',
+    familyKey: 'scoped-root',
+    seatKey: 'scoped-root-seat',
+    deviceKey: 'device-home',
+    legacyBindingKeys,
+    callAttempt: () => success(),
+  })
+  assert.equal(result.ok, true)
+  const selection = scheduler.state.selects[0]
+  assert.equal(selection.assignmentMode, 'session')
+  assert.equal(selection.familyKey, 'scoped-root')
+  assert.equal(selection.seatKey, 'scoped-root-seat')
+  assert.deepEqual(selection.legacyBindingKeys, legacyBindingKeys)
+  assert.equal(selection.deviceVmId, null)
+  assert.deepEqual(deviceBindings, [])
+  assert.equal(scheduler.state.inflight, 0)
+})
+
+test('session assignment re-reads a family moved before selection and between retries', async () => {
+  const scheduler = leasingScheduler([candidate(1), candidate(2)])
+  let family = { accountId: 'account-1', vmId: 'vm-01' }
+  const runner = new FailoverRunner({
+    scheduler,
+    stickyRouter: {
+      resolve: (key) => (key === 'root-home' ? family : null),
+      bind: () => true,
+    },
+    config: { signature_repair: true },
+  })
+  let attempts = 0
+  const result = await runner.run({
+    requestId: 'session-moved-root',
+    canonicalBody: { model: 'claude-sonnet-test', messages: [] },
+    model: 'claude-sonnet-test',
+    assignmentMode: 'session',
+    stickyKey: 'child-session',
+    familyKey: 'root-home',
+    familyVmId: 'stale-vm',
+    callAttempt: () => {
+      attempts++
+      if (attempts === 1) {
+        family = { accountId: 'account-2', vmId: 'vm-02' }
+        return {
+          ok: false,
+          status: 400,
+          terminalState: 'rejected',
+          body: { error: { message: 'thinking.signature: Field required' } },
+        }
+      }
+      return success()
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.deepEqual(scheduler.state.selects.map((selection) => selection.familyVmId), ['vm-01', 'vm-02'])
+  assert.equal(result.vmId, 'vm-02')
+  assert.equal(scheduler.state.inflight, 0)
+})
+
+test('session assignment keeps parent and child execution locks separate', async () => {
+  const scheduler = leasingScheduler([candidate(1)])
+  const runner = new FailoverRunner({ scheduler })
+  let started = 0
+  let release
+  const both = new Promise((resolve) => {
+    release = resolve
+  })
+  const callAttempt = async () => {
+    started++
+    if (started === 2) release()
+    await both
+    return success()
+  }
+  const result = await Promise.all(
+    ['parent-session', 'child-session'].map((stickyKey) =>
+      runner.run({
+        requestId: stickyKey,
+        canonicalBody: { model: 'claude-sonnet-test' },
+        model: 'claude-sonnet-test',
+        assignmentMode: 'session',
+        stickyKey,
+        familyKey: 'shared-root',
+        seatKey: 'shared-root-seat',
+        callAttempt,
+      }),
+    ),
+  )
+  assert.ok(result.every((item) => item.ok))
+  assert.equal(started, 2)
+  assert.equal(scheduler.state.inflight, 0)
+})
+
 test('an all-rest pool 503 carries Retry-After for the next window open', async () => {
   const scheduler = {
     async selectAndReserve() {
