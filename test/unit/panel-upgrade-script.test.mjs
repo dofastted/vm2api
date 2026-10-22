@@ -17,6 +17,7 @@ const args = process.argv.slice(2)
 args.push('--compose-file-env', process.env.COMPOSE_FILE || '')
 fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(args) + '\n')
 if (args[0] === 'compose') {
+  if (args.includes('run') && args.includes('scripts/check-postgres-upgrade.mjs') && process.env.FAIL_CUTOVER === '1') process.exit(1)
   if (args.includes('build') && process.env.FAIL_BUILD === '1') process.exit(1)
   if (args.includes('up') && process.env.STALE_BACKEND !== '1') {
     fs.writeFileSync(process.env.BOOT_VERSION, 'v1.2.7')
@@ -226,4 +227,11 @@ test('ARM64 source upgrade keeps the native override and rejects a missing one b
   assert.equal(missing.code, 1)
   assert.match(missing.stderr, /lacks docker-compose.arm64.yml/)
   assert.ok(!missing.calls.some((args) => args[0] === 'compose'))
+})
+
+test('failed PostgreSQL cutover preflight leaves the running control plane intact', async () => {
+  const result = await runUpgrade({ source: false, env: { FAIL_CUTOVER: '1' } })
+  assert.equal(result.code, 1)
+  assert.ok(result.calls.some((args) => args.includes('scripts/check-postgres-upgrade.mjs')))
+  assert.ok(!result.calls.some((args) => args[0] === 'compose' && args.includes('up')))
 })

@@ -11,6 +11,7 @@ import { rustKernelHealth } from '../transport/rust-kernel-client.mjs'
 import { restartTelemetrySidecar } from './slot-process-status.mjs'
 import { isNativeNodeVm, vmNodeId } from '../cluster/placement.mjs'
 import { slotHost } from './slot-host.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 import { restartRemoteServices } from '../cluster/remote-slot.mjs'
 import {
   drainEgressForProxyConfig,
@@ -21,6 +22,7 @@ import {
   runExclusiveProxyEgress,
   startProxyEgress,
   stopEgressProcess,
+  stopEgressProcessConfirmed,
   waitEgressExit,
   waitPortReleased,
 } from './egress.mjs'
@@ -31,6 +33,13 @@ export async function restartLocalEgress(projectRoot, vm, opts = {}) {
   if (isLocalEgressProxy(vm.proxy)) return { ok: true, egress: 'local' }
   const proxyId = vm.proxy?.id
   return runExclusiveProxyEgress(projectRoot, proxyId, async () => {
+    if (isKubernetesMode()) {
+      const stopped = await stopEgressProcessConfirmed(projectRoot, proxyId)
+      if (!stopped.ok) return { ...stopped, action: 'egress_stop_failed' }
+      const started = await startProxyEgress(projectRoot, vm.proxy, opts)
+      if (!started?.ok) return { ...started, ok: false, action: 'egress_start_failed', vmOperationUncertain: true }
+      return { ok: true, egress: 'restarted', pid: started.pid }
+    }
     const running = inspectEgressProcess(projectRoot, proxyId)
     const stopped = stopEgressProcess(projectRoot, proxyId)
     if (!stopped.ok) return { ok: false, action: 'egress_stop_failed', error: stopped.error }
@@ -130,7 +139,8 @@ export async function updateOneSlot(
     if (action === 'reload' || action === 'roll') {
       const reloaded = await reloadFn(vm, projectRoot, { routing })
       result.reload = reloaded
-      if (!reloaded?.ok) {
+      if (!reloaded?.ok || reloaded.rust_ok === false || reloaded.vmOperationUncertain) {
+        result.vmOperationUncertain = reloaded?.vmOperationUncertain === true || reloaded?.rust_ok === false
         result.error = reloaded?.error || 'reload failed'
         result.code = reloaded?.code || 'reload_failed'
         return result
@@ -140,6 +150,7 @@ export async function updateOneSlot(
         healthFn,
       })
       result.ready = !!ready.ok
+      if (!ready.ok) result.vmOperationUncertain = true
       if (!ready.ok && action === 'reload') {
         result.error = ready.error || 'worker_not_ready'
         return result
@@ -157,6 +168,7 @@ export async function updateOneSlot(
             ? await restartRemoteServices(vmRef, projectRoot, { telemetryEnabled: enabled })
             : await restartLocalServices({ projectRoot, vm: vmRef, enabled })
       result.telemetry = changed
+      if (changed?.vmOperationUncertain) result.vmOperationUncertain = true
       if (!changed?.ok) {
         result.error = changed?.error || 'telemetry service update failed'
         result.code = changed?.code || 'telemetry_update_failed'
@@ -166,6 +178,7 @@ export async function updateOneSlot(
     if (action === 'collect' || action === 'roll') {
       const collected = await collectFn(projectRoot, getVm(projectRoot, id) || vm)
       result.collect = collected
+      if (collected?.vmOperationUncertain) result.vmOperationUncertain = true
       if (!collected?.ok) {
         result.error = collected?.error || 'collect failed'
         result.code = collected?.code || 'collect_failed'
@@ -185,6 +198,7 @@ export async function runFleetUpdate(
   {
     action = 'roll',
     ids = null,
+    targetIds,
     concurrency = 4,
     routing = {},
     reloadFn,
@@ -197,7 +211,8 @@ export async function runFleetUpdate(
 ) {
   const nextAction = ACTIONS.has(action) ? action : 'roll'
   const conc = Math.max(1, Math.min(8, Number(concurrency) || 4))
-  const targets = selectFleetTargets(projectRoot, ids)
+  const wanted = targetIds ? new Set(targetIds) : null
+  const targets = selectFleetTargets(projectRoot, ids).filter((vm) => !wanted || wanted.has(vm.id))
   const items = await mapPool(targets, conc, (vm) =>
     updateOneSlot(projectRoot, vm, {
       action: nextAction,

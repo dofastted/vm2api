@@ -1,5 +1,5 @@
 /**
- * Configurable sticky / conversation-continuity routing (SQLite-backed).
+ * Configurable sticky / conversation-continuity routing (PostgreSQL-backed).
  * Binds conversation key → account/VM for the TTL window.
  */
 
@@ -7,6 +7,8 @@ import crypto from 'node:crypto'
 import { ENVELOPE_NEEDLES, extractPrompt } from '../core/distill-detect.mjs'
 import { resolveStoreDb } from '../db/database.mjs'
 import { StickyRepo } from '../db/repos/sticky-repo.mjs'
+import { WriteQueue } from './write-queue.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 import {
   claudeCodeAgentRootSession,
   extractCallerSession,
@@ -202,20 +204,328 @@ export function childDeclaredWithoutParent(body = {}, headers = {}) {
 }
 
 export class StickyRouter {
-  constructor({ dataDir, db, config }) {
+  constructor({ dataDir, db, config, shared = isKubernetesMode() }) {
     this.db = resolveStoreDb({ db, dataDir })
-    this.repo = new StickyRepo(this.db)
+    this.persistence = new StickyRepo(this.db)
+    this.writes = new WriteQueue(this.db)
+    this.sharedOperations = new Set()
+    this.db.pendingWriteQueues.add(this)
+    this.sessions = {}
+    this.shared = shared
+    this.versions = {}
+    this.cacheWrites = 0
+    this.refreshIssued = 0
+    this.refreshPublished = 0
     this.config = mergeStickyConfig(config)
-    this.repo.dropAliasKeys()
+    this.repo = {
+      get: (key) => structuredClone(this.sessions[key] || null),
+      all: () => structuredClone(this.sessions),
+      upsert: (key, entry) => {
+        this._assertSyncWrite()
+        const next = { ...entry, device_id: entry.device_id || this.sessions[key]?.device_id || null }
+        this.sessions[key] = structuredClone(next)
+        this.writes.enqueue(() => this.persistence.upsert(key, next))
+      },
+      remove: (key) => {
+        this._assertSyncWrite()
+        delete this.sessions[key]
+        this.writes.enqueue(() => this.persistence.remove(key))
+      },
+      removeByAccount: ({ accountId = null, vmId = null } = {}) => {
+        this._assertSyncWrite()
+        let removed = 0
+        for (const [key, entry] of Object.entries(this.sessions)) {
+          if ((accountId && entry.account_id === accountId) || (vmId && entry.vm_id === vmId)) {
+            delete this.sessions[key]
+            removed += 1
+          }
+        }
+        if (removed) this.writes.enqueue(() => this.persistence.removeByAccount({ accountId, vmId }))
+        return removed
+      },
+      purgeExpired: (now) => {
+        this._assertSyncWrite()
+        let removed = 0
+        for (const [key, entry] of Object.entries(this.sessions)) {
+          if (entry.expires_at != null && entry.expires_at < now) {
+            delete this.sessions[key]
+            removed += 1
+          }
+        }
+        if (removed) this.writes.enqueue(() => this.persistence.purgeExpired(now))
+        return removed
+      },
+    }
   }
 
   /** Kept for API compat + post-restore hook (state lives in DB). */
-  reload() {}
+  async init() {
+    for (const queue of this.db.pendingWriteQueues || []) await queue.flush()
+    if (this.shared) {
+      await this.persistence.dropAliasKeysShared()
+      return this.refresh()
+    }
+    await this.persistence.dropAliasKeys()
+    this.sessions = await this.persistence.all()
+    return this
+  }
+
+  async reload() {
+    await this.flush()
+    if (this.shared) return this.refresh()
+    return await this.init()
+  }
+
+  async flush() {
+    await this.writes.flush()
+    while (this.sharedOperations.size) await Promise.all([...this.sharedOperations])
+  }
 
   /** Re-bind to a fresh DB connection (after backup restore). */
-  rebind(db) {
+  async rebind(db) {
+    await this.flush()
+    this.db.pendingWriteQueues?.delete(this.writes)
+    this.db.pendingWriteQueues?.delete(this)
     this.db = db
-    this.repo = new StickyRepo(db)
+    this.persistence = new StickyRepo(db)
+    this.writes = new WriteQueue(db)
+    db.pendingWriteQueues.add(this)
+    this.cacheWrites++
+    return await this.init()
+  }
+
+  _assertSyncWrite() {
+    if (this.shared)
+      throw Object.assign(new Error('shared sticky mutations require the asynchronous API'), {
+        code: 'shared_sticky_async_required',
+      })
+  }
+
+  _trackShared(operation) {
+    this.sharedOperations.add(operation)
+    operation.finally(() => this.sharedOperations.delete(operation)).catch(() => {})
+    return operation
+  }
+
+  /** Pure committed-state refresh: no alias cleanup and no write-queue drain. */
+  async refresh() {
+    const issued = ++this.refreshIssued
+    const writes = this.cacheWrites
+    const snapshot = await this.persistence.snapshot()
+    if (issued > this.refreshPublished && writes === this.cacheWrites) {
+      this.refreshPublished = issued
+      this.sessions = snapshot.sessions
+      this.versions = snapshot.versions
+      if (this.shared) this._purge()
+    }
+    return this
+  }
+
+  versionOf(key) {
+    return this.versions[key] ?? (Number(this.sessions[key]?.generation) || 0)
+  }
+
+  _record(key, entry) {
+    if (!entry) return null
+    return {
+      key,
+      accountId: entry.account_id,
+      vmId: entry.vm_id,
+      sessionId: entry.session_id || null,
+      generation: entry.generation,
+      slotIndex: entry.slot_index == null ? null : Number(entry.slot_index),
+    }
+  }
+
+  _acceptShared(key, result) {
+    this.db.afterCommit(() => {
+      this.cacheWrites++
+      if (result.generation < this.versionOf(key)) return
+      this.versions[key] = result.generation
+      if (result.entry) this.sessions[key] = structuredClone(result.entry)
+      else delete this.sessions[key]
+    })
+    const record = this._record(key, result.entry)
+    return {
+      applied: result.applied,
+      record,
+      generation: result.generation,
+      nativeSessionId: record?.sessionId || null,
+      ...(result.reason ? { reason: result.reason } : {}),
+    }
+  }
+
+  async _changeShared(key, options, change) {
+    if (!key || !this.config.enabled)
+      return { applied: false, record: null, generation: 0, nativeSessionId: null, reason: 'sticky_disabled' }
+    const expected = options?.ifGeneration ?? this.versionOf(key)
+    return this._trackShared(
+      this.persistence.compareAndSet(key, expected, change).then((result) => this._acceptShared(key, result)),
+    )
+  }
+
+  async bindShared(key, { accountId, vmId, sessionId = null, deviceId = null, slotIndex = null } = {}, options = {}) {
+    if (!accountId || !vmId) throw new Error('sticky account and VM are required')
+    return this._changeShared(key, options, (previous) => {
+      const prev = previous || {}
+      const locked = !!(
+        prev.vm_id &&
+        vmId &&
+        prev.vm_id !== vmId &&
+        prev.account_id &&
+        accountId &&
+        prev.account_id !== accountId
+      )
+      const nextVm = locked ? prev.vm_id : vmId
+      const sameVm = !!(prev.vm_id && nextVm === prev.vm_id)
+      const nextSession = locked
+        ? prev.session_id || sessionId || null
+        : options.replaceSession
+          ? sessionId || null
+          : sameVm
+            ? prev.session_id || sessionId || null
+            : sessionId || prev.session_id || null
+      const now = Date.now()
+      return {
+        account_id: locked ? prev.account_id : accountId,
+        vm_id: nextVm,
+        session_id: nextSession,
+        device_id: String(deviceId || '').trim() || prev.device_id || null,
+        slot_index: locked
+          ? (prev.slot_index ?? null)
+          : options.clearSlot
+            ? null
+            : slotIndex == null
+              ? (prev.slot_index ?? null)
+              : Number(slotIndex),
+        bound_at: now,
+        expires_at: now + (this.config.ttl_seconds || 86400) * 1000,
+        hits: (prev.hits || 0) + (options.countHit === false ? 0 : 1),
+      }
+    })
+  }
+
+  async rebindFamilyShared(key, { accountId, vmId } = {}, options = {}) {
+    if (!accountId || !vmId) throw new Error('sticky account and VM are required')
+    return this._changeShared(key, options, (prev) => ({
+      account_id: accountId,
+      vm_id: vmId,
+      session_id: null,
+      slot_index: null,
+      device_id: prev?.device_id || null,
+      bound_at: Date.now(),
+      expires_at: Date.now() + (this.config.ttl_seconds || 86400) * 1000,
+      hits: (prev?.hits || 0) + (options.countHit === true ? 1 : 0),
+    }))
+  }
+
+  async bindDeviceAffinityShared(key, value = {}, options = {}) {
+    return this.rebindFamilyShared(key, value, options)
+  }
+
+  async unbindShared(key, options = {}) {
+    return this._changeShared(key, options, () => null)
+  }
+
+  async unbindByAccountShared(options = {}) {
+    return this._trackShared(
+      this.persistence.removeByAccountShared(options).then((results) => {
+        for (const result of results) this._acceptShared(result.key, result)
+        return results.length
+      }),
+    )
+  }
+
+  async purgeExpiredShared(now = Date.now()) {
+    return this._trackShared(
+      this.persistence.purgeExpiredShared(now).then((results) => {
+        for (const result of results) this._acceptShared(result.key, result)
+        return results.length
+      }),
+    )
+  }
+
+  /** A legacy source and every destination are checked under the same ordered key locks. */
+  async migrateLegacyIdentityShared(legacyKey, { sessionId = '', deviceId = '' } = {}) {
+    const sessionKey = this.canonicalSessionKey(sessionId)
+    const deviceKey = this.canonicalDeviceKey(deviceId)
+    const result = { sessionKey: null, deviceKey: null }
+    if (!legacyKey || !this.config.enabled) return result
+    const sourceVersion = this.versionOf(legacyKey)
+    const sessionVersion = sessionKey ? this.versionOf(sessionKey) : null
+    const deviceVersion = deviceKey ? this.versionOf(deviceKey) : null
+    return this._trackShared(
+      this.persistence.withKeys([legacyKey, sessionKey, deviceKey], async () => {
+        const source = await this.persistence.current(legacyKey)
+        if (!source.entry || source.generation !== sourceVersion || Date.now() > source.entry.expires_at) return result
+        const sourceRecord = source.entry
+        if (sessionKey && sessionKey !== legacyKey && sessionVersion === 0) {
+          const applied = await this.bindShared(
+            sessionKey,
+            {
+              accountId: sourceRecord.account_id,
+              vmId: sourceRecord.vm_id,
+              sessionId: sourceRecord.session_id || sessionId,
+              deviceId,
+            },
+            { ifGeneration: 0, countHit: false },
+          )
+          if (applied.applied) result.sessionKey = sessionKey
+        }
+        if (deviceKey && deviceVersion === 0) {
+          const applied = await this.bindDeviceAffinityShared(
+            deviceKey,
+            { accountId: sourceRecord.account_id, vmId: sourceRecord.vm_id },
+            { ifGeneration: 0 },
+          )
+          if (applied.applied) result.deviceKey = deviceKey
+        }
+        return result
+      }),
+    )
+  }
+
+  async sessionPoolKeysShared(req, body = {}, options = {}) {
+    await this.refresh()
+    const { sessionId = '', deviceId = '', migrate = true } = options
+    if (!this.config.enabled) return { stickyKey: null, stickyKeys: [] }
+    const canonical = this.canonicalSessionKey(sessionId)
+    if (!canonical)
+      return {
+        stickyKey: this.extractPoolKey(req, body, { platform: 'anthropic' }),
+        stickyKeys: this.collectPoolKeys(req, body, { platform: 'anthropic' }),
+      }
+    const legacy = [
+      ...new Set([...this.collectPoolKeys(req, body, { platform: 'anthropic' }), ...this.collectPoolKeys(req, body)]),
+    ].filter((key) => key !== canonical && this.resolve(key))
+    if (!this.resolve(canonical) && legacy.length) {
+      if (!migrate) return { stickyKey: legacy[0], stickyKeys: legacy }
+      await this.migrateLegacyIdentityShared(legacy[0], { sessionId, deviceId })
+    }
+    return { stickyKey: canonical, stickyKeys: [canonical, ...legacy] }
+  }
+
+  async familyPoolKeyShared(req, sessionId, { trusted = false } = {}) {
+    await this.refresh()
+    const legacy = this.familyKey(req, sessionId, 'anthropic')
+    if (!trusted || !legacy) return legacy
+    const canonical = this.canonicalFamilyKey(sessionId)
+    const sourceVersion = this.versionOf(legacy)
+    if (this.versionOf(canonical) === 0) {
+      await this._trackShared(
+        this.persistence.withKeys([legacy, canonical], async () => {
+          const source = await this.persistence.current(legacy)
+          if (source.entry && source.generation === sourceVersion && Date.now() <= source.entry.expires_at) {
+            await this.rebindFamilyShared(
+              canonical,
+              { accountId: source.entry.account_id, vmId: source.entry.vm_id },
+              { ifGeneration: 0 },
+            )
+          }
+        }),
+      )
+    }
+    return canonical
   }
 
   isolateKey(raw, req = null) {
@@ -600,6 +910,12 @@ export class StickyRouter {
   }
 
   _purge() {
+    if (this.shared) {
+      for (const [key, entry] of Object.entries(this.sessions)) {
+        if (entry.expires_at != null && entry.expires_at < Date.now()) delete this.sessions[key]
+      }
+      return
+    }
     this.repo.purgeExpired(Date.now())
   }
 

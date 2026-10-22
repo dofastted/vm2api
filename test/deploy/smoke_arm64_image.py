@@ -3,6 +3,9 @@
 
 import argparse
 import json
+import os
+import secrets
+import time
 from pathlib import Path
 import subprocess
 import uuid
@@ -41,6 +44,11 @@ for name in ('kin-worker', 'kin-egress'):
 elf(root / 'image-bin' / 'kin-api-kernel', 183, static=True)
 elf(Path('/usr/local/bin/docker'), 183, static=True)
 subprocess.run(['docker', '--version'], check=True, timeout=10)
+for name in ('pg_dump', 'pg_restore'):
+    binary = Path('/usr/lib/postgresql/17/bin') / name
+    elf(binary, 183)
+    assert ' 17.' in subprocess.check_output([str(binary), '--version'], text=True)
+
 for name in ('kin-kernel', 'kin-codex-kernel', 'kin-oauth-auth', 'kin-computer'):
     elf(root / 'image-bin' / name, 62)
 for name in ('kin-kernel', 'kin-codex-kernel'):
@@ -113,18 +121,30 @@ def main():
     args = parser.parse_args()
     expected = {"version": (ROOT / "VERSION").read_text().strip()}
     name = "vm2api-arm64-smoke-" + uuid.uuid4().hex[:12]
+    network = name + '-net'
+    postgres = name + '-pg'
+    password = secrets.token_hex(32)
+    db_env = {**os.environ, 'POSTGRES_PASSWORD': password, 'POSTGRES_USER': 'vm2api', 'POSTGRES_DB': 'vm2api_smoke_test',
+              'VM2API_DATABASE_URL': f'postgresql://vm2api:{password}@{postgres}:5432/vm2api_smoke_test'}
     try:
+        subprocess.run(['docker', 'network', 'create', '--internal', network], check=True, capture_output=True)
+        subprocess.run(['docker', 'run', '-d', '--name', postgres, '--network', network,
+                        '-e', 'POSTGRES_PASSWORD', '-e', 'POSTGRES_USER', '-e', 'POSTGRES_DB',
+                        'postgres:17-bookworm'], env=db_env, check=True, capture_output=True)
+        deadline = time.monotonic() + 60
+        while subprocess.run(['docker', 'exec', postgres, 'psql', '-U', 'vm2api', '-d', 'vm2api_smoke_test', '-Atqc', 'SELECT 1'],
+                             capture_output=True).returncode:
+            if time.monotonic() > deadline:
+                raise RuntimeError('isolated PostgreSQL did not become ready')
+            time.sleep(0.5)
         subprocess.run(["docker", "run", "--name", name, "--platform", "linux/arm64",
-                        "--network", "none", "-i", "--entrypoint", "python3", args.image,
-                        "-", json.dumps(expected)], input=PROGRAM, text=True, check=True, timeout=210)
+                        "--network", network, '-e', 'VM2API_DATABASE_URL', "-i", "--entrypoint", "python3", args.image,
+                        "-", json.dumps(expected)], env=db_env, input=PROGRAM, text=True, check=True, timeout=210)
     finally:
-        result = subprocess.run(["docker", "inspect", "--format", "{{.Id}} {{.State.Running}}", name],
-                                capture_output=True, text=True)
-        if result.returncode == 0:
-            container_id, running = result.stdout.strip().split()
-            if running == "true":
-                subprocess.run(["docker", "stop", "--time", "5", container_id], check=True)
-            subprocess.run(["docker", "container", "rm", container_id], check=True)
+        for container in (name, postgres):
+            subprocess.run(['docker', 'rm', '-fv', container], capture_output=True)
+        subprocess.run(['docker', 'network', 'rm', network], capture_output=True)
+
 
 
 if __name__ == "__main__":

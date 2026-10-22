@@ -16,13 +16,13 @@
 | `super` | 总览 / 集群 / 用量 / 日志 + 虚拟机 | 读 VM + 拨调度 / 清冷却；集群只读节点列表 |
 | `admin` | 全部 | `*`。可管理用户 VM，但 admin/master **未 pin** 的 `/v1` 只打未分配平台池 |
 
-环境变量 `VM2API_ADMIN_USER` / `VM2API_ADMIN_PASSWORD` 只在库里还没有同名用户时灌进第一个 admin；之后以 SQLite `users` 为准，面板「用户」页可增删改、改密码。密码 scrypt。不能删/停用最后一个 admin。
+环境变量 `VM2API_ADMIN_USER` / `VM2API_ADMIN_PASSWORD` 只在库里还没有同名用户时灌进第一个 admin；之后以 PostgreSQL `users` 为准，面板「用户」页可增删改、改密码。密码 scrypt。不能删/停用最后一个 admin。
 
 `vms/*.json` 的 `owner_user_id` / `origin`（`platform` \| `admin_assigned` \| `user_created`）是属主 SSOT。`PATCH /vms/:id/owner` 仅 admin。自建 VM 不能收回进平台池。
 
 ## 引导
 
-所有已登录角色与 master API key 可调，不是公开接口。状态按用户名存在 SQLite `settings` 键 `onboarding_state`；master key（`apiKeyKind=master`）键为 `__master__`。
+所有已登录角色与 master API key 可调，不是公开接口。状态按用户名存在 PostgreSQL `settings` 键 `onboarding_state`；master key（`apiKeyKind=master`）键为 `__master__`。
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -52,7 +52,7 @@
 | PATCH | `/vms/:id/owner` | admin：`{ user_id }` 分配，`{ user_id: null }` 收回（仅 `admin_assigned`） |
 | GET | `/billing` | 用户计费汇总。`from`/`until`/`group_by=vm|key`。user 隐式只看自己；admin 可 `user_id=` |
 
-启动时会修复旧版本遗留的已删除用户 VM 归属：仅收回 `admin_assigned`（旧记录未写 `origin` 时按已有归属规则推断），不收回租户自建 VM、停用用户或无用户记录的 VM。修改经 `vms/*.json` 写入并同步到 SQLite，不重启槽位。
+启动时会修复旧版本遗留的已删除用户 VM 归属：仅收回 `admin_assigned`（旧记录未写 `origin` 时按已有归属规则推断），不收回租户自建 VM、停用用户或无用户记录的 VM。修改经 `vms/*.json` 写入并同步到 PostgreSQL，不重启槽位。
 
 
 用户名 `^[a-zA-Z][a-zA-Z0-9._-]{1,31}$`，密码 8–128。`vm_create_quota` 整数 0–100，默认 0。
@@ -155,9 +155,9 @@ Claude PATCH `max_sessions` 返回 400 `claude_max_sessions_forbidden`；OpenAI 
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/database/metrics` | `{ sampled_at, database, usage_cache }`；SQLite/WAL 只读快照与官方用量缓存实例统计 |
+| GET | `/database/metrics` | `{ sampled_at, database, usage_cache }`；PostgreSQL 与应用连接池只读快照与官方用量缓存实例统计 |
 
-`database` 只执行 `SELECT 1`、只读 PRAGMA、migration 摘要和文件 stat；不返回数据库路径。单项失败为 `null`，文件明确不存在时大小为 `0`，探针失败只令 `database.ok = false`。当前 `node:sqlite` 不提供 SQLite 页缓存 hit/miss，不得从这些字段推算。
+`database` 只执行 `SELECT 1`、数据库大小及 migration 摘要查询；连接池展示当前进程的 total/idle/waiting。失败字段为 `null`，探针失败令 `database.ok = false`。不返回连接地址、用户名或密码。
 
 `usage_cache.hit_rate = (success_hits + error_hits) / requests`；`reuse_rate` 再加 `singleflight_joins`。零请求时均为 `null`。`error_hits` 是负缓存命中，不代表业务成功；累计计数随进程或缓存实例重建归零。
 
@@ -307,7 +307,7 @@ Claude `routing.quota` 的 5h/7d 闸分三段（`critical_band` 默认 0.05，`g
 | DELETE | `/refusal-guards` | 须 `{ "confirm": true }` 清空 |
 | DELETE | `/refusal-device-blocks` | `{ "device_id" }` 解封一条；`{ "confirm": true }` 清空。空 device、短于 8 字符的值不会入库 |
 
-`PUT { enabled }` 写入 SQLite `settings.refusal_guard_enabled`。环境变量 `REFUSAL_GUARD=0` 仍强制关闭。与蒸馏拦截独立：0 注入跳过普通蒸馏针，本缓存仍生效。`count_tokens` 同样在 peek / worker hop 之前拦截。device 取入站 `metadata.user_id.device_id`，否则显式 `device_id` / `x-kin-device-id`，不用 IP、UA 或 API key。仅 admin。
+`PUT { enabled }` 写入 PostgreSQL `settings.refusal_guard_enabled`。环境变量 `REFUSAL_GUARD=0` 仍强制关闭。与蒸馏拦截独立：0 注入跳过普通蒸馏针，本缓存仍生效。`count_tokens` 同样在 peek / worker hop 之前拦截。device 取入站 `metadata.user_id.device_id`，否则显式 `device_id` / `x-kin-device-id`，不用 IP、UA 或 API key。仅 admin。
 
 ## 决策模型与硬正则
 
@@ -315,7 +315,7 @@ Claude `routing.quota` 的 5h/7d 闸分三段（`critical_band` 默认 0.05，`g
 |------|------|------|
 | GET/PUT | `/jev-intercept` | 协议入口。顺序：蒸馏硬规则 → 去掉 reminder、按需展开 base64 后的硬正则 → 拒答缓存 → 决策模型。没配地址则跳过模型；模型失败默认放行。`fail_open: false` 时模型不可用则 403，不封设备 |
 
-`PUT` 写入 SQLite `settings.jev_intercept`。字段：`enabled`（默认关）、`hard_regex_enabled`（默认开）、`openai_platform_enabled`（默认关）、`provider`（`jev` 默认、`laya`、`modernbert`）、`base_url`、`model`、`timeout_ms`（200–8000，默认 2000）、`patterns[]`、`rules`（`null` 与 `[]` 都用内置规则；关掉这一层用 `hard_regex_enabled: false`）、`api_key` 或 `api_keys`（最多 999 把）、`question_ids`（题库 id，缺省为全部）。省略密钥保持原值；`api_key: ""` 或 `api_keys: []` 清除。一行可以是裸 key（用 `base_url`），或 `https://host/v1/systemone <key>` 打到另一个 systemone。`401` / `429` / `529` 退役该 key，之后不再调度，再次保存密钥列表会重新启用。网络错误和其它 HTTP 状态只跳过这一跳的同一主机，不退役 key；失败放行的原因写在放行 keyword（`网络异常` 或 `上游 <status>`）。另有 `safety_instruction`（空则不加自定义题）、`safety_threshold`（0–1，默认 0.5）、`block_if_below`（默认开）、`fail_open`（默认开）、`dedup_sec`（0–3600，默认 60）、`max_state_chars`（256–64000，默认 16000）、`expand_base64`、`strip_reminders`（后两个默认开）。GET 不回密钥，回 `api_key_set`、`api_key_count`、`question_bank`、`providers`、`builtin_patterns`、`rules`、`rules_customized`、`openai_platform_enabled`。
+`PUT` 写入 PostgreSQL `settings.jev_intercept`。字段：`enabled`（默认关）、`hard_regex_enabled`（默认开）、`openai_platform_enabled`（默认关）、`provider`（`jev` 默认、`laya`、`modernbert`）、`base_url`、`model`、`timeout_ms`（200–8000，默认 2000）、`patterns[]`、`rules`（`null` 与 `[]` 都用内置规则；关掉这一层用 `hard_regex_enabled: false`）、`api_key` 或 `api_keys`（最多 999 把）、`question_ids`（题库 id，缺省为全部）。省略密钥保持原值；`api_key: ""` 或 `api_keys: []` 清除。一行可以是裸 key（用 `base_url`），或 `https://host/v1/systemone <key>` 打到另一个 systemone。`401` / `429` / `529` 退役该 key，之后不再调度，再次保存密钥列表会重新启用。网络错误和其它 HTTP 状态只跳过这一跳的同一主机，不退役 key；失败放行的原因写在放行 keyword（`网络异常` 或 `上游 <status>`）。另有 `safety_instruction`（空则不加自定义题）、`safety_threshold`（0–1，默认 0.5）、`block_if_below`（默认开）、`fail_open`（默认开）、`dedup_sec`（0–3600，默认 60）、`max_state_chars`（256–64000，默认 16000）、`expand_base64`、`strip_reminders`（后两个默认开）。GET 不回密钥，回 `api_key_set`、`api_key_count`、`question_bank`、`providers`、`builtin_patterns`、`rules`、`rules_customized`、`openai_platform_enabled`。
 
 三个后端走同一套 `/v1/systemone`。题库存在 `questions`：可增删改，缺省是内置六题（综合、色情、破限、逆向、渗透、网络攻击）。每题都是「是否安全」，高分表示安全，启用的题目一起问，任一题低于阈值就拦。`safety_instruction` 非空时再多问一题自定义要求。`POST /jev-intercept/models` 用地址和 Key（留空则用已存的第一把）请求 `{base}/v1/models`，失败回 502，不会把上游 401 当成面板登出。
 

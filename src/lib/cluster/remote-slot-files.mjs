@@ -94,7 +94,15 @@ function ownerFor(session, vm) {
 /** Push the named sets (`run`, `seed`, `touch`). Missing local files are skipped. */
 export async function pushSlotFiles(vm, slotDir, sets = ['run', 'seed'], session = null) {
   const s = session || (await nodeSession(vmNodeId(vm)))
-  await prepareRemoteDir(s, vm)
+  try {
+    await prepareRemoteDir(s, vm)
+  } catch (error) {
+    // This is the first remote step. Its confirmed failure precedes every SFTP operation.
+    if (error.remoteCommandEnded === true && error.vmOperationUncertain !== true && error.executionUncertain !== true) {
+      error.publicationFinished = true
+    }
+    throw error
+  }
   const sftp = await openSftp(s.client)
   const remote = remoteSlotDir(s.host, vm.id)
   const owner = ownerFor(s, vm)
@@ -219,21 +227,34 @@ export async function ensureRemoteOfficialCredentialLink(vm, slotDir, session = 
 
 const queues = new Map()
 
-/** Fire-and-forget push, serialized per VM so a slow push never races the next one. */
+/** Serialized per VM. The returned original Promise is required for completion proof. */
 export function queueSlotPush(vm, slotDir, sets, { logger = console } = {}) {
   const prev = queues.get(vm.id) || Promise.resolve()
   const next = prev
     .catch(() => {})
     .then(() => pushSlotFiles(vm, slotDir, sets))
-    .catch((err) => {
-      logger.warn(
-        JSON.stringify({ event: 'remote_slot_push_failed', vm_id: vm.id, sets, error: String(err?.message || err) }),
-      )
+    .catch((error) => {
+      if (
+        error.publicationFinished !== true ||
+        error.vmOperationUncertain === true ||
+        error.executionUncertain === true
+      ) {
+        error.vmOperationUncertain = true
+        error.executionUncertain = true
+      }
+      throw error
     })
     .finally(() => {
       if (queues.get(vm.id) === next) queues.delete(vm.id)
     })
   queues.set(vm.id, next)
+  // Logging observes the rejection; it does not replace the caller's Promise
+  // with a fulfilled one or turn a transport failure into completion proof.
+  next.catch((error) => {
+    logger.warn(
+      JSON.stringify({ event: 'remote_slot_push_failed', vm_id: vm.id, sets, error: String(error?.message || error) }),
+    )
+  })
   return next
 }
 

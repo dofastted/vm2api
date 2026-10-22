@@ -12,11 +12,11 @@ function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'kin-resolve-'))
 }
 
-test('prefers pool credentials over host-only vm.proxy', () => {
-  const pool = new ProxyPool({ dataDir: tmpDir() })
-  pool.importLines('socks5://user:s3cret@10.0.0.5:1080')
+test('prefers pool credentials over host-only vm.proxy', async () => {
+  const pool = await new ProxyPool({ dataDir: tmpDir() }).init()
+  await pool.importLines('socks5://user:s3cret@10.0.0.5:1080')
   const id = pool.snapshot().proxies[0].id
-  pool.bind(id, 'vm-02')
+  await pool.bind(id, 'vm-02')
   pool.stopScheduler()
   const resolved = resolveImportProxy({
     vm: { id: 'vm-02', proxy: { id, host: '10.0.0.5', port: 1080 } },
@@ -26,12 +26,12 @@ test('prefers pool credentials over host-only vm.proxy', () => {
   assert.equal(resolved.proxyUrl, 'socks5h://user:s3cret@10.0.0.5:1080')
 })
 
-test('blocks import when bound proxy is fail or dead', () => {
-  const pool = new ProxyPool({ dataDir: tmpDir() })
-  pool.importLines('10.0.0.6:1080')
+test('blocks import when bound proxy is fail or dead', async () => {
+  const pool = await new ProxyPool({ dataDir: tmpDir() }).init()
+  await pool.importLines('10.0.0.6:1080')
   const id = pool.snapshot().proxies[0].id
-  pool.bind(id, 'vm-03')
-  pool.setEnabled(id, false)
+  await pool.bind(id, 'vm-03')
+  await pool.setEnabled(id, false)
   pool.stopScheduler()
   const resolved = resolveImportProxy({
     vm: { id: 'vm-03', proxy: { id, host: '10.0.0.6', port: 1080, url: 'socks5h://10.0.0.6:1080' } },

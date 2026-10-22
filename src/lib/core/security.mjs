@@ -2,6 +2,9 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { atomicWriteJson } from '../vm/vm-file.mjs'
+import { isKubernetesMode } from './control-plane-mode.mjs'
+import { PanelSessionsRepo } from '../db/repos/panel-sessions-repo.mjs'
+import { GatewayRateBucketsRepo } from '../db/repos/gateway-rate-buckets-repo.mjs'
 
 export function hashKey(key) {
   return crypto.createHash('sha256').update(String(key)).digest('hex')
@@ -35,7 +38,15 @@ export function extractApiKey(req) {
 }
 
 /** Simple token bucket per key */
-export function createRateLimiter({ capacity = 60, refillPerSec = 1 } = {}) {
+export function createRateLimiter({ capacity = 60, refillPerSec = 1, db = null } = {}) {
+  if (db || isKubernetesMode()) {
+    if (!Number.isFinite(capacity) || capacity < 0 || !Number.isFinite(refillPerSec) || refillPerSec < 0) {
+      throw new Error('Shared rate limits require finite non-negative capacity and refillPerSec')
+    }
+    return async function allow(key) {
+      return new GatewayRateBucketsRepo(db || undefined).allow(hashKey(key), { capacity, refillPerSec })
+    }
+  }
   const buckets = new Map()
   return function allow(key) {
     const now = Date.now()
@@ -140,15 +151,19 @@ function saveSessions() {
   }
 }
 
-loadSessions()
+if (!isKubernetesMode()) loadSessions()
 
-export function createPanelSession(username, ttlMs = SESSION_TTL_MS, extra = {}) {
+export async function createPanelSession(username, ttlMs = SESSION_TTL_MS, extra = {}) {
   if (ttlMs && typeof ttlMs === 'object') {
     extra = ttlMs
     ttlMs = extra.ttlMs || SESSION_TTL_MS
   }
   const token = 'kin-panel-' + crypto.randomBytes(24).toString('hex')
-  const role = extra.role || (_lookupRole && _lookupRole(username)) || 'admin'
+  const role = extra.role || (_lookupRole && (await _lookupRole(username))) || 'admin'
+  if (isKubernetesMode()) {
+    await new PanelSessionsRepo().create({ tokenHash: panelSessionKey(token), username, role, ttlMs })
+    return token
+  }
   panelSessions.set(panelSessionKey(token), {
     user: username,
     role,
@@ -158,9 +173,18 @@ export function createPanelSession(username, ttlMs = SESSION_TTL_MS, extra = {})
   return token
 }
 
-export function verifyPanelSession(token) {
+export async function verifyPanelSession(token) {
   if (!token || !token.startsWith('kin-panel-')) return null
   const key = panelSessionKey(token)
+  if (isKubernetesMode()) {
+    const repo = new PanelSessionsRepo()
+    const session = await repo.get(key)
+    if (!session) return null
+    if (session.exp - Date.now() < SESSION_TTL_MS / 2) {
+      return (await repo.renew(key, { expectedExp: session.exp, ttlMs: SESSION_TTL_MS })) || (await repo.get(key))
+    }
+    return session
+  }
   let s = panelSessions.get(key)
   if (!s) {
     // reload from disk once (multi-process / restart)
@@ -174,7 +198,7 @@ export function verifyPanelSession(token) {
     return null
   }
   if (!s.role && _lookupRole) {
-    s.role = _lookupRole(s.user) || null
+    s.role = (await _lookupRole(s.user)) || null
   }
   if (!s.role) {
     const admin = getPanelAdmin()
@@ -189,16 +213,18 @@ export function verifyPanelSession(token) {
   return s
 }
 
-export function revokePanelSession(token) {
+export async function revokePanelSession(token) {
   if (!token) return
+  if (isKubernetesMode()) return new PanelSessionsRepo().remove(panelSessionKey(token))
   panelSessions.delete(panelSessionKey(token))
   saveSessions()
 }
 
-export function revokePanelSessionsForUser(username, { exceptToken } = {}) {
+export async function revokePanelSessionsForUser(username, { exceptToken } = {}) {
   const name = String(username || '')
   if (!name) return 0
   const exceptKey = exceptToken ? panelSessionKey(exceptToken) : null
+  if (isKubernetesMode()) return new PanelSessionsRepo().removeForUser(name, { exceptHash: exceptKey })
   let n = 0
   for (const [key, s] of panelSessions.entries()) {
     if (s.user !== name) continue
@@ -213,12 +239,12 @@ export function revokePanelSessionsForUser(username, { exceptToken } = {}) {
 /**
  * @returns {{ username: string, role: string, id?: string } | null}
  */
-export function verifyPanelLogin(username, password) {
+export async function verifyPanelLogin(username, password) {
   if (_authenticateUser) {
-    const rec = _authenticateUser(username, password)
+    const rec = await _authenticateUser(username, password)
     if (rec) return { username: rec.username, role: rec.role || 'user', id: rec.id }
     // Existing DB user (including disabled) must not fall through to env password.
-    if (_lookupRole && _lookupRole(username)) return null
+    if (_lookupRole && (await _lookupRole(username))) return null
   }
   const admin = getPanelAdmin()
   if (!admin.password) return null

@@ -1,0 +1,257 @@
+{
+  "commit": "6732a8648a4a57c6483abc7f685fce4d8cb28946",
+  "node_version": "v22.23.2",
+  "postgresql_version": "17.11",
+  "execution": "detached worktree; per-test random PostgreSQL schema; synthetic HTTP/Unix-socket upstreams; copied payload binaries",
+  "comparison_commit": "fb90450d06fd3aaaee8a0a4b52aca13d2f675431",
+  "suites": {
+    "unit": {
+      "files": 318,
+      "totals": {
+        "tests": 3675,
+        "pass": 3658,
+        "fail": 7,
+        "cancelled": 0,
+        "skipped": 10
+      },
+      "failures": [
+        {
+          "file": "test/unit/cli-hop-body.test.mjs",
+          "test": "prepareCliHopBody drops metadata and CLI-owned system but keeps official agent leftover",
+          "error_sha256": "1afab608e2476a88783807d547c9b239ad4ac831679731a3ed4d44812b0c31d2",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/unit/cli-hop-body.test.mjs",
+          "test": "every cli-hop system becomes the identity plus the caller body",
+          "error_sha256": "312320875ebe3fc483f8bb570b16a93bb368278d2b6a78f71a763436e2a81b3f",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/unit/cli-hop-body.test.mjs",
+          "test": "cli-hop normalizes mixed caller markers to the official template",
+          "error_sha256": "312320875ebe3fc483f8bb570b16a93bb368278d2b6a78f71a763436e2a81b3f",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/unit/cli-hop-body.test.mjs",
+          "test": "cli-hop drops caller system/tools markers and restamps last plus penultimate user",
+          "error_sha256": "7862d1144e6748d63aa6e98dabf5a9fa7d8d1582f7fbfe851d978eb15f6d5c92",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/unit/cli-hop-body.test.mjs",
+          "test": "cli-hop short history only marks the last message",
+          "error_sha256": "81b2ee3a4bb8b1ab4f351bede4398032dc9637c683b82b146630fd6857e94c2e",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/unit/cli-hop-body.test.mjs",
+          "test": "cli-hop uses the inbound session TTL on both message anchors",
+          "error_sha256": "01732f4307f58f479e9b3d8329d92a93d9c748c58028276022257d3645e77e87",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/unit/convert-cache-shape.test.mjs",
+          "test": "openai.chat multi-turn cli-hop marks last and penultimate user",
+          "error_sha256": "312320875ebe3fc483f8bb570b16a93bb368278d2b6a78f71a763436e2a81b3f",
+          "same_error_as_comparison": true
+        }
+      ],
+      "log_sha256": "c7d6f161487d48fa11292ae4b9c7fd8e127b3107528f394879ec85198dbeb454"
+    },
+    "e2e": {
+      "files": 28,
+      "totals": {
+        "tests": 122,
+        "pass": 104,
+        "fail": 17,
+        "cancelled": 0,
+        "skipped": 1
+      },
+      "failures": [
+        {
+          "file": "test/e2e/account-pool-failover.e2e.test.mjs",
+          "test": "account1 quota exhaustion rotates to account2 and commits sticky final account",
+          "error_sha256": "a25cb59468e4decc45b1d8b3a66b0a4fbd2195af9f498da39aa83e92169825b5",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/e2e/auto-mode.e2e.test.mjs",
+          "test": "classifier terminal/error/cancel/concurrency boundaries through actual ELF",
+          "error_sha256": "84e06146cf59485c3b46e05070f6a9a184ecb010a57ef8ab1b62a3ebae90c36a",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/e2e/completions.e2e.test.mjs",
+          "test": "POST /v1/completions old OpenAI prompt format",
+          "error_sha256": "fdb99383e1e333346a42b82cbf8092357575350f6a03f1ec297c9cee064b1e6d",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/e2e/credentials.e2e.test.mjs",
+          "test": "reset destroys home and recreates the same slot without oauth",
+          "error_sha256": "dfd84d60931072a864eb94f48ce13d4223e963ae919898236f1859bedc8d917e",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/e2e/crs-default.e2e.test.mjs",
+          "test": "default POST /v1/messages uses Go worker pool, not CLI",
+          "error_sha256": "fdb99383e1e333346a42b82cbf8092357575350f6a03f1ec297c9cee064b1e6d",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/e2e/errors.e2e.test.mjs",
+          "test": "unknown model is rejected without hop",
+          "error_sha256": "6ea819807eaee98e6a4c38817c9f011fb426e6a5ff499fa441d8f7bb07371461",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/e2e/health.e2e.test.mjs",
+          "test": "harness /health 200 and honest capabilities",
+          "error_sha256": "c23279127cad70a092d0cc7bb6ac400e05aff03e4614d1eaaa40252878c221c2",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/e2e/hermes.e2e.test.mjs",
+          "test": "Hermes unofficial: Go relay keeps persona/tools and never launches CLI",
+          "error_sha256": "97ae4156650fa0de2f613aa7753666781545cb2fe7818350a6df904ab696cdbc",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/e2e/hermes.e2e.test.mjs",
+          "test": "Hermes system blob without UA still classifies as hermes",
+          "error_sha256": "a2c6319267f1b752b63d96a41e15b1a5133952e88f0c145bc96dda53fd31cbe5",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/e2e/hop-meta.e2e.test.mjs",
+          "test": "CRS default keeps thinking + max_tokens + temperature in official body",
+          "error_sha256": "ebe0dbf58f38b7e1df9e2c55463c11e712927dcbc047102419ad10a8d38f1420",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/e2e/hop-meta.e2e.test.mjs",
+          "test": "CRS keeps a long caller system in the structured official prompt",
+          "error_sha256": "ba0ac5e90ea008839723c328e8b172228820837ab895e425d2190c1aa5caa708",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/e2e/hop-meta.e2e.test.mjs",
+          "test": "legacy CLI selector cannot drop HTTP request parameters",
+          "error_sha256": "ebe0dbf58f38b7e1df9e2c55463c11e712927dcbc047102419ad10a8d38f1420",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/e2e/messages.e2e.test.mjs",
+          "test": "HTTP worker preserves thinking, sampling and max_tokens",
+          "error_sha256": "8353154a58e84007d91c2d217c516dc771e359ddb43d527c7db6734ab5cff6ca",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/e2e/messages.e2e.test.mjs",
+          "test": "HTTP path preserves long system without CLI argv truncation",
+          "error_sha256": "085c13ab1e54fb324bce5520b12006fbf7f84b4a69a1c5cf9e09727b5b33da99",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/e2e/openai-responses.e2e.test.mjs",
+          "test": "POST /v1/responses non-stream shape: object + output_text + usage",
+          "error_sha256": "a7c7c455e65d737b0a872d5d7b4cbe5a5c2372e3117e3f361d6dbe8f223c1392",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/e2e/openai-responses.e2e.test.mjs",
+          "test": "POST /v1/responses stream includes [DONE]",
+          "error_sha256": "0be25feaedaa697c09835d15c8cfdae694de2710330cadfadcbdfa146625a099",
+          "same_error_as_comparison": true
+        },
+        {
+          "file": "test/e2e/openai-responses.e2e.test.mjs",
+          "test": "POST /v1/responses tools → function_call in output",
+          "error_sha256": "a7c7c455e65d737b0a872d5d7b4cbe5a5c2372e3117e3f361d6dbe8f223c1392",
+          "same_error_as_comparison": true
+        }
+      ],
+      "log_sha256": "8da214bdde5f89e9750d06acb552d126301daa48886510dddb7abe7090956213"
+    }
+  },
+  "additional_targeted_checks": [
+    {
+      "commit": "12f19167ae5b2544add8e2a719993b5c972c644e",
+      "scope": "cooldown side effects and shared scheduling",
+      "files": 1,
+      "totals": {
+        "tests": 170,
+        "pass": 170,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failures": [],
+      "log_sha256": "8e72bff0b2339e31ee3a2b345fe513d2f589efade745ad9e2b550ac2393e2ac9"
+    },
+    {
+      "commit": "06d841cd5fb5d81366cf0a7684b408fcd7368ac3",
+      "scope": "routing revision and admission lock order",
+      "files": 1,
+      "totals": {
+        "tests": 44,
+        "pass": 44,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failures": [],
+      "log_sha256": "25cfb96af1d8b5050fb4a583490af5fa21bf1da741f6b2b3b22a30328fadb652"
+    },
+    {
+      "commit": "c5f6ff3d1e3728c74ceb630929bc876298322a2a",
+      "scope": "Codex and Search execution lifecycles",
+      "files": 1,
+      "totals": {
+        "tests": 145,
+        "pass": 145,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failures": [],
+      "log_sha256": "eeea710eede7aa9be04ad7d110a0fb6b8680a81360e4849ac5bedcdebf6234a0"
+    },
+    {
+      "commit": "97b4a087ae486814ffdc912f7b662fdeb2e387ff",
+      "scope": "shared routing panel and mutation integration",
+      "files": 1,
+      "totals": {
+        "tests": 34,
+        "pass": 34,
+        "fail": 0,
+        "cancelled": 0,
+        "skipped": 0
+      },
+      "failures": [],
+      "log_sha256": "166030a23622ee8b5ad65d71beec6c14dcef9c1065c8339d566d03771882f41f"
+    }
+  ],
+  "limitations": [
+    "Full suites are not all passing; all 7 unit and 17 E2E error texts match comparison records.",
+    "Later targeted checks are not a full-suite verification of later commits.",
+    "Kubernetes control plane remains single active replica with exclusive guard.",
+    "The 6732a864 image passed 12 singleton Kubernetes checks; later lifecycle changes, multi-node inference, executor fencing, and automatic orphan recovery were not deployment-verified.",
+    "Background task coordination and one-time OAuth/ticket state are separate ongoing increments.",
+    "VM files/credentials and global backup restore maintenance are not yet coordinated across all entry points.",
+    "Remote VM/kernel routing projection is pending; configuration commit does not prove it was applied."
+  ],
+  "static_checks": {
+    "commit": "6732a8648a4a57c6483abc7f685fce4d8cb28946",
+    "mjs_files": 78,
+    "node_syntax_errors": 0,
+    "biome_exit_code": 0,
+    "diff_check_exit_code": 0,
+    "diff_base": "fb90450d06fd3aaaee8a0a4b52aca13d2f675431",
+    "log_sha256": "6f4fbd68da9299121172e18f8c28ee6f3bbcd5d47b8586e291fd8966d084ed48"
+  },
+  "runtime_evidence": "../singleton-6732a864/verification.json",
+  "later_lifecycle_evidence": "../singleton-6732a864/later-lifecycle.json"
+}

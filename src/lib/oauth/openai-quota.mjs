@@ -17,6 +17,9 @@ import {
 } from '../protocol/codex-usage.mjs'
 import { CODEX_OAUTH_ORIGINATOR, makeProxyFetch, refreshCodexAccessToken } from '../protocol/codex-models.mjs'
 import { openaiIdentityFromJwt } from './openai-jwt.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { refreshSharedCodexCredential } from './shared-codex-refresh.mjs'
+import { credentialGeneration } from './shared-credential-refresh.mjs'
 
 export const CHATGPT_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
 export const CHATGPT_RESET_CREDITS_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits'
@@ -290,6 +293,24 @@ async function quotaFetch(url, { method = 'GET', headers, body, proxyUrl, fetchI
 
 async function rotateIfNeeded(slot, projectRoot, vmId, fetchImpl) {
   if (!slot.refresh) return slot
+  if (isKubernetesMode()) {
+    const result = await refreshSharedCodexCredential({
+      projectRoot,
+      vm: slot.vm,
+      fetchImpl,
+      proxyUrl: slot.proxyUrl,
+      timeoutMs: OPENAI_QUOTA_TIMEOUT_MS,
+      expectedGeneration: credentialGeneration(slot.first),
+    })
+    if (result.unknown || !result.value?.ok)
+      return { ...slot, rotateError: result.value?.error || 'credential_refresh_unknown' }
+    return {
+      ...slot,
+      first: result.current.credential,
+      access: result.current.credential.access_token,
+      refresh: result.current.credential.refresh_token,
+    }
+  }
   const tok = await refreshCodexAccessToken({
     refreshToken: slot.refresh,
     proxyUrl: slot.proxyUrl,

@@ -14,6 +14,7 @@ import {
 } from '../../src/lib/admin/request-log.mjs'
 import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
 import { GroupsRepo } from '../../src/lib/db/repos/groups-repo.mjs'
+import { trackPendingWrite, flushPendingWrites } from '../../src/lib/db/pending-writes.mjs'
 import { gateVerdict } from '../../src/lib/protocol/intercept-stats.mjs'
 
 function tmpStore(mode = 'normal') {
@@ -48,14 +49,14 @@ test('summarizeBody counts messages and tools', () => {
   assert.equal(s.system_len, 10)
 })
 
-test('normal mode writes jsonl without body', () => {
+test('normal mode writes jsonl without body', async () => {
   const store = tmpStore('normal')
   const ctx = store.start(
     { method: 'POST', headers: { 'user-agent': 't' }, socket: {} },
     { protocol: 'anthropic.messages', pathName: '/v1/messages' },
   )
   assert.equal(ctx.mode, 'normal')
-  const sum = store.finish(ctx, {
+  const sum = await store.finish(ctx, {
     status: 200,
     model: 'claude-haiku-4-5-20251001',
     stream: false,
@@ -66,20 +67,62 @@ test('normal mode writes jsonl without body', () => {
   assert.equal(sum.status, 200)
   assert.equal(sum.api_key_id, 'key_1')
   assert.equal(sum.inbound_body, undefined)
-  const listed = store.listNormal({ limit: 5 })
+  const listed = await store.listNormal({ limit: 5 })
   assert.equal(listed.length, 1)
   assert.equal(listed[0].request_id, ctx.request_id)
   // no debug file
-  assert.equal(store.listDebug({ limit: 5 }).length, 0)
+  assert.equal((await store.listDebug({ limit: 5 })).length, 0)
 })
 
-test('summary persists protocol usage detail (cache/model/ttft/stop_reason)', () => {
+for (const mode of ['normal', 'debug']) {
+  test(`${mode} logs escape NUL fields and leave response writes drainable`, async () => {
+    const store = tmpStore(mode)
+    const ctx = store.start(
+      { method: 'POST', headers: {}, socket: {} },
+      { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+    )
+    const model = 'invalid\0model'
+    const inbound = { model, messages: [{ role: 'user', content: '文本\0content' }] }
+    const summary = await trackPendingWrite(
+      store.finish(ctx, {
+        status: 400,
+        model,
+        requested_model: model,
+        upstream_model: 'upstream\0model',
+        error_message: 'invalid model: ' + model,
+        session_id: 'session\0id',
+        inbound_body: inbound,
+      }),
+    )
+    await flushPendingWrites()
+    await flushPendingWrites()
+    const row = await store.repo.getByRequestId(ctx.request_id)
+    for (const [field, expected] of Object.entries({
+      model: 'invalid\\u0000model',
+      requested_model: 'invalid\\u0000model',
+      upstream_model: 'upstream\\u0000model',
+      error_message: 'invalid model: invalid\\u0000model',
+      session_id: 'session\\u0000id',
+    })) {
+      assert.equal(row[field], expected, field)
+      assert.equal(summary[field], expected, field)
+    }
+    if (mode === 'debug') {
+      const debug = await store.getDebug(ctx.request_id)
+      assert.equal(debug.model, summary.model)
+      assert.deepEqual(debug.inbound_body, inbound)
+    }
+    assert.equal(inbound.model, model, 'logging must not mutate the request')
+  })
+}
+
+test('summary persists protocol usage detail (cache/model/ttft/stop_reason)', async () => {
   const store = tmpStore('normal')
   const ctx = store.start(
     { method: 'POST', headers: {}, socket: {} },
     { protocol: 'anthropic.messages', pathName: '/v1/messages' },
   )
-  const sum = store.finish(ctx, {
+  const sum = await store.finish(ctx, {
     status: 200,
     model: 'sonnet',
     requested_model: 'sonnet',
@@ -106,28 +149,28 @@ test('summary persists protocol usage detail (cache/model/ttft/stop_reason)', ()
   // Sonnet 5 official: $2/$10/cache 5m $2.50/1h $4/read $0.20 per MTok
   assert.equal(sum.pricing_model, 'claude-sonnet-5')
   assert.ok(Math.abs(sum.total_cost - 0.0000926) < 1e-12)
-  const row = store.queryNormal({ limit: 1 }).items[0]
+  const row = (await store.queryNormal({ limit: 1 })).items[0]
   assert.equal(row.cache_creation_5m_tokens, 4)
   assert.equal(row.upstream_model, 'claude-sonnet-5')
   assert.equal(row.stop_reason, 'end_turn')
   assert.equal(row.total_cost, 0.0000926)
 })
 
-test('backfillMissingCosts restores actual cost with the stored group multiplier', () => {
+test('backfillMissingCosts restores actual cost with the stored group multiplier', async () => {
   const store = tmpStore('normal')
   const insert = store.db.prepare(`
     INSERT INTO usage_logs (
       id, request_id, created_at, model, upstream_model, status,
       input_tokens, output_tokens, rate_multiplier
-    ) VALUES (?, ?, ?, 'claude-opus-5', 'claude-opus-5', 200, 1000000, 0, ?)
+    ) VALUES ($1, $2, $3, 'claude-opus-5', 'claude-opus-5', 200, 1000000, 0, $4)
   `)
   const now = new Date().toISOString()
-  insert.run('log_old_bill_default', 'rid_old_bill_default', now, null)
-  insert.run('log_old_bill_free', 'rid_old_bill_free', now, 0)
-  insert.run('log_old_bill_double', 'rid_old_bill_double', now, 2)
+  await insert.run('log_old_bill_default', 'rid_old_bill_default', now, null)
+  await insert.run('log_old_bill_free', 'rid_old_bill_free', now, 0)
+  await insert.run('log_old_bill_double', 'rid_old_bill_double', now, 2)
 
-  assert.equal(store.repo.backfillMissingCosts(), 3)
-  const rows = store.db
+  assert.equal(await store.repo.backfillMissingCosts(), 3)
+  const rows = await store.db
     .prepare(
       "SELECT id, total_cost, actual_cost, pricing_model FROM usage_logs WHERE id LIKE 'log_old_bill_%' ORDER BY id",
     )
@@ -140,25 +183,32 @@ test('backfillMissingCosts restores actual cost with the stored group multiplier
       { id: 'log_old_bill_free', total_cost: 5, actual_cost: 0, pricing_model: 'claude-opus-5' },
     ],
   )
-  assert.equal(store.repo.backfillMissingCosts(), 0)
+  assert.equal(await store.repo.backfillMissingCosts(), 0)
 })
 
-function finishWith(store, model, usage) {
+async function finishWith(store, model, usage) {
   const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { protocol: 'x', pathName: '/v1' })
-  return store.finish(ctx, { status: 200, model, upstream_model: model, vm_id: 'vm-t', account_id: 'acc-t', usage })
+  return await store.finish(ctx, {
+    status: 200,
+    model,
+    upstream_model: model,
+    vm_id: 'vm-t',
+    account_id: 'acc-t',
+    usage,
+  })
 }
 
-test('tier-unpriced rows stay unpriced after backfill', () => {
+test('tier-unpriced rows stay unpriced after backfill', async () => {
   const store = tmpStore('normal')
   // gpt-5.5 publishes no >272K fast column; gpt-5.3-codex has no flex band.
-  const a = finishWith(store, 'gpt-5.5', { input_tokens: 1_000_000, output_tokens: 0, service_tier: 'priority' })
-  const b = finishWith(store, 'gpt-5.3-codex', { input_tokens: 1000, output_tokens: 0, service_tier: 'flex' })
+  const a = await finishWith(store, 'gpt-5.5', { input_tokens: 1_000_000, output_tokens: 0, service_tier: 'priority' })
+  const b = await finishWith(store, 'gpt-5.3-codex', { input_tokens: 1000, output_tokens: 0, service_tier: 'flex' })
   assert.equal(a.total_cost, null)
   assert.equal(a.pricing_model, 'unpriced')
   assert.equal(a.service_tier, 'priority')
   assert.equal(b.pricing_model, 'unpriced')
-  store.repo.billingStats()
-  const rows = store.db.prepare('SELECT total_cost, actual_cost, pricing_model FROM usage_logs ORDER BY id').all()
+  await store.repo.billingStats()
+  const rows = await store.db.prepare('SELECT total_cost, actual_cost, pricing_model FROM usage_logs ORDER BY id').all()
   for (const r of rows) {
     assert.equal(r.total_cost, null)
     assert.equal(r.actual_cost, null)
@@ -166,36 +216,35 @@ test('tier-unpriced rows stay unpriced after backfill', () => {
   }
 })
 
-test('backfill reprices with the stored service tier and speed', () => {
+test('backfill reprices with the stored service tier and speed', async () => {
   const store = tmpStore('normal')
   const insert = store.db.prepare(`
     INSERT INTO usage_logs (id, request_id, created_at, model, upstream_model, status,
       input_tokens, output_tokens, service_tier, speed)
-    VALUES (?, ?, ?, ?, ?, 200, ?, 0, ?, ?)
+    VALUES ($1, $2, $3, $4, $5, 200, $6, 0, $7, $8)
   `)
   const now = new Date().toISOString()
   // 100K stays under the 272K long-context threshold → plain flex band ($2.5/MTok input).
-  insert.run('log_bf_flex', 'rid_bf_flex', now, 'gpt-5.5', 'gpt-5.5', 100_000, 'flex', null)
-  insert.run('log_bf_fast', 'rid_bf_fast', now, 'claude-opus-4-8', 'claude-opus-4-8', 1_000_000, null, 'fast')
-  insert.run('log_bf_weird', 'rid_bf_weird', now, 'gpt-5.5', 'gpt-5.5', 1000, 'weird', null)
-  store.repo.backfillMissingCosts()
+  await insert.run('log_bf_flex', 'rid_bf_flex', now, 'gpt-5.5', 'gpt-5.5', 100_000, 'flex', null)
+  await insert.run('log_bf_fast', 'rid_bf_fast', now, 'claude-opus-4-8', 'claude-opus-4-8', 1_000_000, null, 'fast')
+  await insert.run('log_bf_weird', 'rid_bf_weird', now, 'gpt-5.5', 'gpt-5.5', 1000, 'weird', null)
+  await store.repo.backfillMissingCosts()
   const got = Object.fromEntries(
-    store.db
-      .prepare("SELECT id, total_cost, pricing_model FROM usage_logs WHERE id LIKE 'log_bf_%'")
-      .all()
-      .map((r) => [r.id, [r.total_cost, r.pricing_model]]),
+    (await store.db.prepare("SELECT id, total_cost, pricing_model FROM usage_logs WHERE id LIKE 'log_bf_%'").all()).map(
+      (r) => [r.id, [r.total_cost, r.pricing_model]],
+    ),
   )
   assert.deepEqual(got.log_bf_flex, [0.25, 'gpt-5.5'])
   assert.deepEqual(got.log_bf_fast, [10, 'claude-opus-4-8'])
   assert.deepEqual(got.log_bf_weird, [null, 'unpriced'])
-  assert.equal(store.repo.backfillMissingCosts(), 0)
+  assert.equal(await store.repo.backfillMissingCosts(), 0)
 })
 
-test('costByModel splits rows by billing band', () => {
+test('costByModel splits rows by billing band', async () => {
   const store = tmpStore('normal')
-  finishWith(store, 'claude-opus-4-8', { input_tokens: 1_000_000, output_tokens: 0, speed: 'fast' })
-  finishWith(store, 'claude-opus-4-8', { input_tokens: 1_000_000, output_tokens: 0 })
-  const rows = store.repo.costByModel({ vmId: 'vm-t' })
+  await finishWith(store, 'claude-opus-4-8', { input_tokens: 1_000_000, output_tokens: 0, speed: 'fast' })
+  await finishWith(store, 'claude-opus-4-8', { input_tokens: 1_000_000, output_tokens: 0 })
+  const rows = await store.repo.costByModel({ vmId: 'vm-t' })
   assert.equal(rows.length, 2)
   const fast = rows.find((r) => r.speed === 'fast')
   const std = rows.find((r) => r.speed !== 'fast')
@@ -205,23 +254,23 @@ test('costByModel splits rows by billing band', () => {
   assert.equal(std.long_context, 0)
 })
 
-test('vmUsageStats buckets by Shanghai day, isolates the slot and ranks models and paths', () => {
+test('vmUsageStats buckets by Shanghai day, isolates the slot and ranks models and paths', async () => {
   const store = tmpStore('normal')
   const insert = store.db.prepare(`
     INSERT INTO usage_logs (id, request_id, created_at, path, model, upstream_model, status,
       vm_id, input_tokens, output_tokens, total_cost, duration_ms)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 100, 50, ?, ?)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 100, 50, $9, $10)
   `)
   const shanghaiDay = (offsetDays) =>
     new Date(Date.now() + 8 * 3600_000 - offsetDays * 86400_000).toISOString().slice(0, 10)
   // 16:30Z is 00:30 the next Shanghai day: a UTC bucket would file it under the wrong date.
   const at = (offsetDays) => `${shanghaiDay(offsetDays + 1)}T16:30:00.000Z`
-  insert.run('u1', 'r1', at(0), '/v1/messages', 'm-a', 'm-a', 200, 'vm-x', 1, 1000)
-  insert.run('u2', 'r2', at(0), '/v1/messages', 'm-a', 'm-a', 200, 'vm-x', 1, 3000)
-  insert.run('u3', 'r3', at(2), '/v1/chat/completions', 'm-b', 'm-b', 200, 'vm-x', 4, null)
-  insert.run('u4', 'r4', at(0), '/v1/messages', 'm-a', 'm-a', 200, 'vm-other', 99, 1)
-  insert.run('u5', 'r5', at(40), '/v1/messages', 'm-a', 'm-a', 200, 'vm-x', 99, 1)
-  const out = store.repo.vmUsageStats({ vmId: 'vm-x', days: 30 })
+  await insert.run('u1', 'r1', at(0), '/v1/messages', 'm-a', 'm-a', 200, 'vm-x', 1, 1000)
+  await insert.run('u2', 'r2', at(0), '/v1/messages', 'm-a', 'm-a', 200, 'vm-x', 1, 3000)
+  await insert.run('u3', 'r3', at(2), '/v1/chat/completions', 'm-b', 'm-b', 200, 'vm-x', 4, null)
+  await insert.run('u4', 'r4', at(0), '/v1/messages', 'm-a', 'm-a', 200, 'vm-other', 99, 1)
+  await insert.run('u5', 'r5', at(40), '/v1/messages', 'm-a', 'm-a', 200, 'vm-x', 99, 1)
+  const out = await store.repo.vmUsageStats({ vmId: 'vm-x', days: 30 })
   assert.deepEqual(
     out.history.map((h) => [h.day, h.requests, h.total_cost]),
     [
@@ -245,21 +294,21 @@ test('vmUsageStats buckets by Shanghai day, isolates the slot and ranks models a
     ['/v1/messages', '/v1/chat/completions'],
   )
   assert.equal(out.endpoints[0].tokens, 300)
-  assert.deepEqual(store.repo.vmUsageStats({ vmId: null }).history, [])
+  assert.deepEqual((await store.repo.vmUsageStats({ vmId: null })).history, [])
 })
 
-test('keyUsageStats counts only that key and ranks VMs', () => {
+test('keyUsageStats counts only that key and ranks VMs', async () => {
   const store = tmpStore('normal')
   const insert = store.db.prepare(`
     INSERT INTO usage_logs (id, request_id, created_at, path, model, upstream_model, status,
       vm_id, api_key_id, input_tokens, output_tokens, total_cost, duration_ms)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 100, 50, ?, ?)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 100, 50, $10, $11)
   `)
   const now = new Date().toISOString()
-  insert.run('k1', 'rk1', now, '/v1/messages', 'm-a', 'm-a', 200, 'vm-a', 'key_a', 1, 10)
-  insert.run('k2', 'rk2', now, '/v1/messages', 'm-b', 'm-b', 200, 'vm-b', 'key_a', 3, 20)
-  insert.run('k3', 'rk3', now, '/v1/messages', 'm-a', 'm-a', 200, 'vm-a', 'key_b', 99, 1)
-  const out = store.repo.keyUsageStats({ apiKeyId: 'key_a', days: 30 })
+  await insert.run('k1', 'rk1', now, '/v1/messages', 'm-a', 'm-a', 200, 'vm-a', 'key_a', 1, 10)
+  await insert.run('k2', 'rk2', now, '/v1/messages', 'm-b', 'm-b', 200, 'vm-b', 'key_a', 3, 20)
+  await insert.run('k3', 'rk3', now, '/v1/messages', 'm-a', 'm-a', 200, 'vm-a', 'key_b', 99, 1)
+  const out = await store.repo.keyUsageStats({ apiKeyId: 'key_a', days: 30 })
   assert.equal(
     out.history.reduce((n, row) => n + row.requests, 0),
     2,
@@ -276,22 +325,22 @@ test('keyUsageStats counts only that key and ranks VMs', () => {
     ],
   )
   assert.equal(out.endpoints, undefined)
-  assert.deepEqual(store.repo.keyUsageStats({ apiKeyId: null }).history, [])
+  assert.deepEqual((await store.repo.keyUsageStats({ apiKeyId: null })).history, [])
 })
 
-test('zero group multiplier keeps usage and key counters but charges no USD', () => {
+test('zero group multiplier keeps usage and key counters but charges no USD', async () => {
   const store = tmpStore('normal')
   const groups = new GroupsRepo(store.db)
-  groups.update(1, { rate_multiplier: 0 })
-  const rateMultiplier = groups.rateMultiplier(1)
-  assert.equal(groups.getById(1).rate_multiplier, 0)
+  await groups.update(1, { rate_multiplier: 0 })
+  const rateMultiplier = await groups.rateMultiplier(1)
+  assert.equal((await groups.getById(1)).rate_multiplier, 0)
   assert.equal(rateMultiplier, 0)
 
   const ctx = store.start(
     { method: 'POST', headers: {}, socket: {} },
     { protocol: 'anthropic.messages', pathName: '/v1/messages' },
   )
-  const summary = store.finish(ctx, {
+  const summary = await store.finish(ctx, {
     status: 200,
     model: 'claude-opus-5',
     upstream_model: 'claude-opus-5',
@@ -302,8 +351,8 @@ test('zero group multiplier keeps usage and key counters but charges no USD', ()
   assert.equal(summary.actual_cost, 0)
 
   const keys = new ApiKeyStore({ db: store.db, hashSecret: 'group-zero-test' })
-  const key = keys.create({ name: 'free-group', quota: 100 })
-  keys.recordUsage(
+  const key = await keys.create({ name: 'free-group', quota: 100 })
+  await keys.recordUsage(
     key.id,
     { input_tokens: 1_000_000 },
     {
@@ -311,21 +360,21 @@ test('zero group multiplier keeps usage and key counters but charges no USD', ()
       rateMultiplier,
     },
   )
-  const stored = keys.getById(key.id)
+  const stored = await keys.getById(key.id)
   assert.equal(stored.requests, 1)
   assert.equal(stored.tokens_in, 1_000_000)
   assert.equal(stored.quota_used, 0)
   assert.equal(stored.usage_5h, 0)
 })
 
-test('billingStats Extra window excludes older logs outside reset-5h', () => {
+test('billingStats Extra window excludes older logs outside reset-5h', async () => {
   const store = tmpStore('normal')
   const now = Date.parse('2026-09-26T12:00:00.000Z')
   const ctxOld = store.start(
     { method: 'POST', headers: {}, socket: {} },
     { protocol: 'anthropic.messages', pathName: '/v1/messages' },
   )
-  store.finish(ctxOld, {
+  await store.finish(ctxOld, {
     status: 200,
     model: 'claude-opus-5',
     upstream_model: 'claude-opus-5',
@@ -333,12 +382,14 @@ test('billingStats Extra window excludes older logs outside reset-5h', () => {
     account_id: 'acc-1',
     usage: { input_tokens: 1_000_000, output_tokens: 0 },
   })
-  store.repo.db.prepare('UPDATE usage_logs SET created_at = ? WHERE vm_id = ?').run('2026-09-26T08:00:00.000Z', 'vm-01')
+  await store.repo.db
+    .prepare('UPDATE usage_logs SET created_at = $1 WHERE vm_id = $2')
+    .run('2026-09-26T08:00:00.000Z', 'vm-01')
   const ctxNew = store.start(
     { method: 'POST', headers: {}, socket: {} },
     { protocol: 'anthropic.messages', pathName: '/v1/messages' },
   )
-  store.finish(ctxNew, {
+  await store.finish(ctxNew, {
     status: 200,
     model: 'claude-opus-5',
     upstream_model: 'claude-opus-5',
@@ -346,30 +397,30 @@ test('billingStats Extra window excludes older logs outside reset-5h', () => {
     account_id: 'acc-1',
     usage: { input_tokens: 200_000, output_tokens: 0 },
   })
-  store.repo.db
+  await store.repo.db
     .prepare(
       "UPDATE usage_logs SET created_at = '2026-09-26T11:30:00.000Z' WHERE created_at > '2026-09-26T10:00:00.000Z'",
     )
     .run()
   const reset5h = '2026-09-26T16:00:00.000Z'
-  const bill = store.billingStats({
+  const bill = await store.billingStats({
     now,
     accountWindows: [{ account_id: 'acc-1', vm_id: 'vm-01', reset_5h: reset5h }],
   })
   assert.equal(bill.accounts[0].window_5h_requests, 1)
   assert.ok(bill.accounts[0].window_5h_cost < 2)
   assert.equal(bill.accounts[0].window_5h_cost, bill.window_5h.total_cost)
-  const rolling = store.billingStats({ now })
+  const rolling = await store.billingStats({ now })
   assert.equal(rolling.accounts[0].window_5h_requests, 2)
 })
 
-test('billingStats aggregates official cost per account and today', () => {
+test('billingStats aggregates official cost per account and today', async () => {
   const store = tmpStore('normal')
   const ctx = store.start(
     { method: 'POST', headers: {}, socket: {} },
     { protocol: 'anthropic.messages', pathName: '/v1/messages' },
   )
-  store.finish(ctx, {
+  await store.finish(ctx, {
     status: 200,
     model: 'claude-opus-5',
     upstream_model: 'claude-opus-5',
@@ -377,7 +428,7 @@ test('billingStats aggregates official cost per account and today', () => {
     account_id: 'acc-1',
     usage: { input_tokens: 1_000_000, output_tokens: 0 },
   })
-  const bill = store.billingStats()
+  const bill = await store.billingStats()
   assert.equal(bill.currency, 'USD')
   assert.equal(bill.total.total_cost, 5)
   assert.equal(bill.today.total_cost, 5)
@@ -393,20 +444,20 @@ test('billingStats aggregates official cost per account and today', () => {
   assert.equal(bill.accounts[0].window_7d_success, 1)
   assert.equal(bill.accounts[0].window_7d_errors, 0)
   assert.ok(bill.window_7d)
-  const models = store.costByModel({ vmId: 'vm-01' })
+  const models = await store.costByModel({ vmId: 'vm-01' })
   assert.equal(models.length, 1)
   assert.equal(models[0].model, 'claude-opus-5')
   assert.equal(models[0].total_cost, 5)
   assert.equal(models[0].input_tokens, 1_000_000)
 })
 
-test('finish writes OpenAI Responses cache read and cache write', () => {
+test('finish writes OpenAI Responses cache read and cache write', async () => {
   const store = tmpStore('normal')
   const ctx = store.start(
     { method: 'POST', headers: {}, socket: {} },
     { protocol: 'openai.responses', pathName: '/v1/responses' },
   )
-  const sum = store.finish(ctx, {
+  const sum = await store.finish(ctx, {
     status: 200,
     protocol: 'openai.responses',
     model: 'gpt-5.6-sol',
@@ -422,13 +473,13 @@ test('finish writes OpenAI Responses cache read and cache write', () => {
   assert.equal(sum.cache_creation_tokens, 10)
 })
 
-test('finish prices OpenAI usage with top-level cached_tokens', () => {
+test('finish prices OpenAI usage with top-level cached_tokens', async () => {
   const store = tmpStore('normal')
   const ctx = store.start(
     { method: 'POST', headers: {}, socket: {} },
     { protocol: 'openai.chat', pathName: '/v1/chat/completions' },
   )
-  const sum = store.finish(ctx, {
+  const sum = await store.finish(ctx, {
     status: 200,
     protocol: 'openai.chat',
     model: 'gpt-5.5',
@@ -439,13 +490,13 @@ test('finish prices OpenAI usage with top-level cached_tokens', () => {
   assert.equal(sum.cache_read_tokens, 200_000)
 })
 
-test('finish prices OpenAI-shaped usage from third-party clients', () => {
+test('finish prices OpenAI-shaped usage from third-party clients', async () => {
   const store = tmpStore('normal')
   const ctx = store.start(
     { method: 'POST', headers: { 'user-agent': 'OpenAI/Python 1.70.0' }, socket: {} },
     { protocol: 'openai.chat', pathName: '/v1/chat/completions' },
   )
-  const sum = store.finish(ctx, {
+  const sum = await store.finish(ctx, {
     status: 200,
     protocol: 'openai.chat',
     model: 'claude-sonnet-5',
@@ -460,9 +511,9 @@ test('finish prices OpenAI-shaped usage from third-party clients', () => {
   assert.equal(sum.cache_read_tokens, 1_000_000)
 })
 
-test('cache breakdown without a split bills 5m unless cache_ttl is explicitly 1h', () => {
+test('cache breakdown without a split bills 5m unless cache_ttl is explicitly 1h', async () => {
   const store = tmpStore('normal')
-  const five = store.finish(
+  const five = await store.finish(
     store.start(
       { method: 'POST', headers: {}, socket: {} },
       { protocol: 'anthropic.messages', pathName: '/v1/messages' },
@@ -477,7 +528,7 @@ test('cache breakdown without a split bills 5m unless cache_ttl is explicitly 1h
   assert.equal(five.cache_creation_5m_tokens, 9)
   assert.equal(five.cache_creation_1h_tokens, 0)
   assert.equal(five.model_mismatch, 0)
-  const hour = store.finish(
+  const hour = await store.finish(
     store.start(
       { method: 'POST', headers: {}, socket: {} },
       { protocol: 'anthropic.messages', pathName: '/v1/messages' },
@@ -493,9 +544,9 @@ test('cache breakdown without a split bills 5m unless cache_ttl is explicitly 1h
   assert.equal(hour.cache_creation_1h_tokens, 9)
 })
 
-test('finish persists web_search_requests from server_tool_use', () => {
+test('finish persists web_search_requests from server_tool_use', async () => {
   const store = tmpStore('normal')
-  const sum = store.finish(
+  const sum = await store.finish(
     store.start(
       { method: 'POST', headers: {}, socket: {} },
       { protocol: 'anthropic.messages', pathName: '/v1/messages' },
@@ -512,31 +563,32 @@ test('finish persists web_search_requests from server_tool_use', () => {
     },
   )
   assert.equal(sum.web_search_requests, 3)
-  const row = store.db.prepare('SELECT web_search_requests FROM usage_logs WHERE id = ?').get(sum.id)
+  const row = await store.db.prepare('SELECT web_search_requests FROM usage_logs WHERE id = $1').get(sum.id)
   assert.equal(row.web_search_requests, 3)
 })
 
-test('repriceRange rewrites total_cost and fills unpriced rows while actual_cost stays put', () => {
+test('repriceRange rewrites total_cost and fills unpriced rows while actual_cost stays put', async () => {
   const store = tmpStore('normal')
   const now = new Date().toISOString()
-  store.db
+  await store.db
     .prepare(`
     INSERT INTO usage_logs (
       id, request_id, created_at, model, upstream_model, status,
       input_tokens, output_tokens, total_cost, actual_cost, pricing_model, rate_multiplier
     ) VALUES
-      ('log_rp_old', 'rid_rp_old', ?, 'claude-opus-5', 'claude-opus-5', 200, 1000000, 0, 1, 9, 'opus-5', 1),
-      ('log_rp_null', 'rid_rp_null', ?, 'claude-opus-5', 'claude-opus-5', 200, 1000000, 0, NULL, 4, NULL, 2)
+      ('log_rp_old', 'rid_rp_old', $1, 'claude-opus-5', 'claude-opus-5', 200, 1000000, 0, 1, 9, 'opus-5', 1),
+      ('log_rp_null', 'rid_rp_null', $2, 'claude-opus-5', 'claude-opus-5', 200, 1000000, 0, NULL, 4, NULL, 2)
   `)
     .run(now, now)
-  const out = store.repo.repriceRange({ since: now, until: now })
+  const out = await store.repo.repriceRange({ since: now, until: now })
   assert.equal(out.rows, 2)
   assert.ok(out.changed >= 1)
   const rows = Object.fromEntries(
-    store.db
-      .prepare("SELECT id, total_cost, actual_cost, pricing_model FROM usage_logs WHERE id LIKE 'log_rp_%'")
-      .all()
-      .map((r) => [r.id, r]),
+    (
+      await store.db
+        .prepare("SELECT id, total_cost, actual_cost, pricing_model FROM usage_logs WHERE id LIKE 'log_rp_%'")
+        .all()
+    ).map((r) => [r.id, r]),
   )
   assert.equal(rows.log_rp_old.actual_cost, 9)
   assert.notEqual(rows.log_rp_old.total_cost, 1)
@@ -545,13 +597,13 @@ test('repriceRange rewrites total_cost and fills unpriced rows while actual_cost
   assert.equal(rows.log_rp_null.total_cost, 5)
 })
 
-test('finish records washed Responses path over inbound chat path', () => {
+test('finish records washed Responses path over inbound chat path', async () => {
   const store = tmpStore('normal')
   const ctx = store.start(
     { method: 'POST', headers: {}, socket: {} },
     { protocol: 'openai.chat', pathName: '/v1/chat/completions' },
   )
-  const sum = store.finish(ctx, {
+  const sum = await store.finish(ctx, {
     status: 200,
     protocol: 'openai.responses',
     path: '/v1/responses',
@@ -561,18 +613,18 @@ test('finish records washed Responses path over inbound chat path', () => {
   assert.equal(sum.protocol, 'openai.responses')
 })
 
-test('debug mode stores full redacted body', () => {
+test('debug mode stores full redacted body', async () => {
   const store = tmpStore('normal')
   const req = { method: 'POST', headers: { 'x-kin-debug': '1', authorization: 'Bearer sk-kin-abc' }, socket: {} }
   const ctx = store.start(req, { protocol: 'openai.chat', pathName: '/v1/chat/completions' })
   assert.equal(ctx.mode, 'debug')
-  store.finish(ctx, {
+  await store.finish(ctx, {
     status: 200,
     model: 'm',
     inbound_body: { model: 'm', messages: [{ role: 'user', content: 'hi sk-ant-oat01-ABCDEFGH12345678' }] },
     hop_meta: { params: { dropped: ['max_tokens'] } },
   })
-  const dbg = store.listDebug({ limit: 5 })
+  const dbg = await store.listDebug({ limit: 5 })
   assert.equal(dbg.length, 1)
   assert.equal(dbg[0].request_id, ctx.request_id)
   assert.ok(dbg[0].headers.authorization === '***REDACTED***')
@@ -582,38 +634,38 @@ test('debug mode stores full redacted body', () => {
   assert.deepEqual(dbg[0].hop_meta.params.dropped, ['max_tokens'])
 })
 
-test('outbound bodies are stored only when the operator configured debug, not via caller headers', () => {
+test('outbound bodies are stored only when the operator configured debug, not via caller headers', async () => {
   const outbound = { body: { system: 'gateway persona overlay' }, headers: { 'x-app': 'cli' } }
-  const record = (store, headers) => {
+  const record = async (store, headers) => {
     const ctx = store.start({ method: 'POST', headers, socket: {} }, { pathName: '/v1/messages' })
-    store.finish(ctx, {
+    await store.finish(ctx, {
       status: 200,
       inbound_body: { model: 'm' },
       outbound_body: outbound.body,
       outbound_headers: outbound.headers,
     })
-    return store.getDebug(ctx.request_id)
+    return await store.getDebug(ctx.request_id)
   }
   for (const headers of [{ 'x-kin-debug': '1' }, { 'x-kin-log': 'debug' }]) {
-    const forced = record(tmpStore('normal'), headers)
+    const forced = await record(tmpStore('normal'), headers)
     assert.deepEqual(forced.inbound_body, { model: 'm' })
     assert.equal(forced.outbound_body, null)
     assert.equal(forced.outbound_headers, null)
   }
-  const operator = record(tmpStore('debug'), {})
+  const operator = await record(tmpStore('debug'), {})
   assert.deepEqual(operator.outbound_body, outbound.body)
   assert.deepEqual(operator.outbound_headers, outbound.headers)
 })
 
-test('off mode writes nothing', () => {
+test('off mode writes nothing', async () => {
   const store = tmpStore('off')
   const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { pathName: '/v1/messages' })
   assert.equal(ctx.mode, 'off')
-  assert.equal(store.finish(ctx, { status: 200 }), null)
-  assert.equal(store.listNormal({ limit: 5 }).length, 0)
+  assert.equal(await store.finish(ctx, { status: 200 }), null)
+  assert.equal((await store.listNormal({ limit: 5 })).length, 0)
 })
 
-test('classifier debug diagnostics omit system and transcript bodies', () => {
+test('classifier debug diagnostics omit system and transcript bodies', async () => {
   const store = tmpStore('debug')
   const ctx = store.start(
     { method: 'POST', headers: {}, socket: {} },
@@ -631,8 +683,8 @@ test('classifier debug diagnostics omit system and transcript bodies', () => {
     wire_observed: false,
     before: { max_tokens: 64 },
   }
-  store.finish(ctx, { status: 200, classifier, inbound_body: body, outbound_body: body })
-  const [debug] = store.listDebug({ limit: 1 })
+  await store.finish(ctx, { status: 200, classifier, inbound_body: body, outbound_body: body })
+  const [debug] = await store.listDebug({ limit: 1 })
   assert.deepEqual(debug.classifier, classifier)
   assert.equal(debug.request_body_snapshot, null)
   assert.equal(debug.inbound_body, null)
@@ -640,38 +692,38 @@ test('classifier debug diagnostics omit system and transcript bodies', () => {
   assert.equal(JSON.stringify(debug).includes('sensitive transcript'), false)
 })
 
-function logOne(store, extra = {}) {
+async function logOne(store, extra = {}) {
   const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { pathName: extra.path || '/v1/messages' })
-  return store.finish(ctx, { status: 200, ...extra })
+  return await store.finish(ctx, { status: 200, ...extra })
 }
 
-test('summaries persist in sqlite across store re-open', () => {
+test('summaries persist in PostgreSQL across store recreation', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-rlog-'))
   const s1 = new RequestLogStore({ dataDir: dir, mode: 'normal' })
-  logOne(s1, { model: 'claude-haiku-4-5', api_key_id: 'key_p' })
+  await logOne(s1, { model: 'claude-haiku-4-5', api_key_id: 'key_p' })
 
   const s2 = new RequestLogStore({ dataDir: dir, mode: 'normal' })
-  const listed = s2.listNormal({ limit: 10 })
+  const listed = await s2.listNormal({ limit: 10 })
   assert.equal(listed.length, 1)
   assert.equal(listed[0].api_key_id, 'key_p')
-  assert.equal(s2.snapshot().total_rows, 1)
+  assert.equal((await s2.snapshot()).total_rows, 1)
 })
 
-test('gate stats count every inbound request and keep the stored verdict', () => {
+test('gate stats count every inbound request and keep the stored verdict', async () => {
   const store = tmpStore()
   // Plain successes: error_code and final_state stay NULL.
-  logOne(store, { intercept: gateVerdict({ kind: 'pass', by: 'jev' }) })
-  logOne(store, { intercept: gateVerdict({ kind: 'pass', by: 'regex' }) })
-  logOne(store, { path: '/v1/responses', intercept: gateVerdict({ kind: 'pass', by: 'regex' }) })
-  logOne(store, { status: 401, error_code: 'invalid_api_key' })
-  logOne(store, {
+  await logOne(store, { intercept: gateVerdict({ kind: 'pass', by: 'jev' }) })
+  await logOne(store, { intercept: gateVerdict({ kind: 'pass', by: 'regex' }) })
+  await logOne(store, { path: '/v1/responses', intercept: gateVerdict({ kind: 'pass', by: 'regex' }) })
+  await logOne(store, { status: 401, error_code: 'invalid_api_key' })
+  await logOne(store, {
     status: 403,
     via: 'distill-detect',
     final_state: 'distill_blocked',
     error_code: 'distill_blocked',
     intercept: gateVerdict({ kind: 'block', by: 'distill', keyword: 'Memory-stage-one extractor' }),
   })
-  logOne(store, {
+  await logOne(store, {
     status: 503,
     via: 'refusal-guard',
     final_state: 'refusal_device',
@@ -679,7 +731,7 @@ test('gate stats count every inbound request and keep the stored verdict', () =>
     intercept: gateVerdict({ kind: 'block', by: 'refusal', keyword: 'device' }),
   })
 
-  const stats = store.protocolEntryStats({ since: '1970-01-01T00:00:00.000Z' })
+  const stats = await store.protocolEntryStats({ since: '1970-01-01T00:00:00.000Z' })
   assert.equal(stats.total, 6)
   assert.equal(stats.blocked, 2)
   assert.equal(stats.passed, 4)
@@ -689,27 +741,27 @@ test('gate stats count every inbound request and keep the stored verdict', () =>
   assert.deepEqual(blockBy, { 'distill:Memory-stage-one extractor': 1, 'refusal:device': 1 })
 })
 
-test('queryNormal filters + pagination + total', () => {
+test('queryNormal filters + pagination + total', async () => {
   const store = tmpStore('normal')
-  logOne(store, { api_key_id: 'key_a', model: 'm1', input_tokens: 10, output_tokens: 5 })
-  logOne(store, { api_key_id: 'key_a', model: 'm2', status: 500, error_code: 'upstream_error' })
-  logOne(store, { api_key_id: 'key_b', model: 'm1', vm_id: 'vm-9' })
+  await logOne(store, { api_key_id: 'key_a', model: 'm1', input_tokens: 10, output_tokens: 5 })
+  await logOne(store, { api_key_id: 'key_a', model: 'm2', status: 500, error_code: 'upstream_error' })
+  await logOne(store, { api_key_id: 'key_b', model: 'm1', vm_id: 'vm-9' })
 
-  assert.equal(store.queryNormal({ api_key_id: 'key_a' }).total, 2)
-  assert.equal(store.queryNormal({ vm_id: 'vm-9' }).total, 1)
-  assert.equal(store.queryNormal({ model: 'm1' }).total, 2)
-  assert.equal(store.queryNormal({ status: 'error' }).total, 1)
-  assert.equal(store.queryNormal({ status: 'ok' }).total, 2)
-  assert.equal(store.queryNormal({ status: 'error', include_muted: true }).total, 1)
-  assert.equal(store.queryNormal({ q: 'upstream' }).total, 1)
-  const page = store.queryNormal({ limit: 2, offset: 2 })
+  assert.equal((await store.queryNormal({ api_key_id: 'key_a' })).total, 2)
+  assert.equal((await store.queryNormal({ vm_id: 'vm-9' })).total, 1)
+  assert.equal((await store.queryNormal({ model: 'm1' })).total, 2)
+  assert.equal((await store.queryNormal({ status: 'error' })).total, 1)
+  assert.equal((await store.queryNormal({ status: 'ok' })).total, 2)
+  assert.equal((await store.queryNormal({ status: 'error', include_muted: true })).total, 1)
+  assert.equal((await store.queryNormal({ q: 'upstream' })).total, 1)
+  const page = await store.queryNormal({ limit: 2, offset: 2 })
   assert.equal(page.total, 3)
   assert.equal(page.items.length, 1)
 })
 
-test('windowStats computes ttft percentiles, sla and qps', () => {
+test('windowStats computes ttft percentiles, sla and qps', async () => {
   const store = tmpStore('normal')
-  logOne(store, {
+  await logOne(store, {
     status: 200,
     first_token_ms: 100,
     duration_ms: 200,
@@ -719,7 +771,7 @@ test('windowStats computes ttft percentiles, sla and qps', () => {
     cache_creation_tokens: 10,
     model: 'claude-sonnet-5',
   })
-  logOne(store, {
+  await logOne(store, {
     status: 200,
     first_token_ms: 300,
     duration_ms: 400,
@@ -729,8 +781,8 @@ test('windowStats computes ttft percentiles, sla and qps', () => {
     cache_creation_tokens: 0,
     model: 'claude-sonnet-5',
   })
-  logOne(store, { status: 503, error_code: 'overloaded', duration_ms: 50, model: 'claude-fable-5' })
-  const w = store.windowStats({ since: new Date(Date.now() - 60_000).toISOString() })
+  await logOne(store, { status: 503, error_code: 'overloaded', duration_ms: 50, model: 'claude-fable-5' })
+  const w = await store.windowStats({ since: new Date(Date.now() - 60_000).toISOString() })
   assert.equal(w.cache_read_tokens, 80)
   assert.equal(w.prompt_tokens, 110)
   assert.ok(Math.abs(w.cache_hit_rate - 80 / 110) < 1e-9)
@@ -747,21 +799,21 @@ test('windowStats computes ttft percentiles, sla and qps', () => {
   assert.equal(w.by_model.length, 2)
   assert.equal(w.error_collection.total, 1)
   assert.equal(w.error_collection.by_class[0].id, 'overloaded')
-  const filtered = store.queryNormal({ error_class: 'overloaded' })
+  const filtered = await store.queryNormal({ error_class: 'overloaded' })
   assert.equal(filtered.total, 1)
   assert.equal(filtered.items[0].error_label, '过载排队')
 })
 
-test('windowStats treats 429 quota/rate-limit as SLA success', () => {
+test('windowStats treats 429 quota/rate-limit as SLA success', async () => {
   const store = tmpStore('normal')
-  logOne(store, { status: 200, first_token_ms: 80, duration_ms: 100, model: 'claude-sonnet-5' })
-  logOne(store, {
+  await logOne(store, { status: 200, first_token_ms: 80, duration_ms: 100, model: 'claude-sonnet-5' })
+  await logOne(store, {
     status: 429,
     error_code: 'upstream_rate_limit',
     error_message: '5h extra usage',
     model: 'claude-opus-5',
   })
-  const w = store.windowStats({ since: new Date(Date.now() - 60_000).toISOString() })
+  const w = await store.windowStats({ since: new Date(Date.now() - 60_000).toISOString() })
   assert.equal(w.requests, 2)
   assert.equal(w.success, 2)
   assert.equal(w.errors, 0)
@@ -771,22 +823,22 @@ test('windowStats treats 429 quota/rate-limit as SLA success', () => {
   assert.equal(w.error_collection.by_class[0].id, 'rate_limit')
 })
 
-test('windowStats treats ingress auth failures as SLA success like sub2api', () => {
+test('windowStats treats ingress auth failures as SLA success like sub2api', async () => {
   const store = tmpStore('normal')
-  logOne(store, { status: 200, first_token_ms: 80, duration_ms: 100, model: 'claude-sonnet-5' })
-  logOne(store, {
+  await logOne(store, { status: 200, first_token_ms: 80, duration_ms: 100, model: 'claude-sonnet-5' })
+  await logOne(store, {
     status: 401,
     error_code: 'auth_failed',
     error_message: 'missing or invalid credentials',
     model: 'claude-sonnet-5',
   })
-  logOne(store, {
+  await logOne(store, {
     status: 401,
     error_code: 'invalid_api_key',
     error_message: 'Invalid credentials',
     model: 'claude-opus-5',
   })
-  const w = store.windowStats({ since: new Date(Date.now() - 60_000).toISOString() })
+  const w = await store.windowStats({ since: new Date(Date.now() - 60_000).toISOString() })
   assert.equal(w.requests, 3)
   assert.equal(w.success, 3)
   assert.equal(w.errors, 0)
@@ -796,54 +848,59 @@ test('windowStats treats ingress auth failures as SLA success like sub2api', () 
   assert.equal(w.error_collection.by_class[0].owner, 'client')
 })
 
-test('windowStats ignores client abort like sub2api ignore_context_canceled', () => {
+test('windowStats ignores client abort like sub2api ignore_context_canceled', async () => {
   const store = tmpStore('normal')
-  logOne(store, { status: 200, first_token_ms: 80, duration_ms: 100, model: 'claude-sonnet-5' })
-  logOne(store, { status: 200, error_code: 'client_cancelled', error_message: 'ECONNRESET', model: 'claude-sonnet-5' })
-  const w = store.windowStats({ since: new Date(Date.now() - 60_000).toISOString() })
+  await logOne(store, { status: 200, first_token_ms: 80, duration_ms: 100, model: 'claude-sonnet-5' })
+  await logOne(store, {
+    status: 200,
+    error_code: 'client_cancelled',
+    error_message: 'ECONNRESET',
+    model: 'claude-sonnet-5',
+  })
+  const w = await store.windowStats({ since: new Date(Date.now() - 60_000).toISOString() })
   assert.equal(w.requests, 2)
   assert.equal(w.success, 2)
   assert.equal(w.errors, 0)
   assert.equal(w.error_collection.total, 0)
-  assert.equal(store.queryNormal({ status: 'error' }).total, 0)
+  assert.equal((await store.queryNormal({ status: 'error' })).total, 0)
 })
 
-test('aggregate buckets by day with token sums', () => {
+test('aggregate buckets by day with token sums', async () => {
   const store = tmpStore('normal')
-  logOne(store, { input_tokens: 10, output_tokens: 5 })
-  logOne(store, { input_tokens: 20, output_tokens: 15, status: 500, error_code: 'x' })
-  const rows = store.aggregate({ bucket: 'day' })
+  await logOne(store, { input_tokens: 10, output_tokens: 5 })
+  await logOne(store, { input_tokens: 20, output_tokens: 15, status: 500, error_code: 'x' })
+  const rows = await store.aggregate({ bucket: 'day' })
   assert.equal(rows.length, 1)
   assert.equal(rows[0].requests, 2)
   assert.equal(rows[0].errors, 1)
   assert.equal(rows[0].input_tokens, 30)
   assert.equal(rows[0].output_tokens, 20)
-  const totals = store.totals()
+  const totals = await store.totals()
   assert.equal(totals.requests, 2)
   assert.equal(totals.input_tokens, 30)
 })
 
-test('cleanup removes rows older than retainDays', () => {
+test('cleanup removes rows older than retainDays', async () => {
   const store = tmpStore('normal')
   // one fresh row
-  logOne(store, {})
+  await logOne(store, {})
   // one stale row injected directly
-  store.repo.insertSummary({
+  await store.repo.insertSummary({
     id: 'log_old',
     request_id: 'rid-old',
     ts: new Date(Date.now() - 30 * 86400_000).toISOString(),
   })
-  store.repo.insertDebug('rid-old', new Date(Date.now() - 30 * 86400_000).toISOString(), { old: true })
-  assert.equal(store.repo.count(), 2)
-  store.cleanup()
-  assert.equal(store.repo.count(), 1)
-  assert.equal(store.getDebug('rid-old'), null)
+  await store.repo.insertDebug('rid-old', new Date(Date.now() - 30 * 86400_000).toISOString(), { old: true })
+  assert.equal(await store.repo.count(), 2)
+  await store.cleanup()
+  assert.equal(await store.repo.count(), 1)
+  assert.equal(await store.getDebug('rid-old'), null)
 })
 
-test('jsonl mirror writes legacy format when enabled', () => {
+test('jsonl mirror writes legacy format when enabled', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-rlog-'))
   const store = new RequestLogStore({ dataDir: dir, mode: 'normal', jsonlMirror: true })
-  logOne(store, { model: 'mm' })
+  await logOne(store, { model: 'mm' })
   const day = new Date().toISOString().slice(0, 10)
   const file = path.join(dir, 'request-logs', `${day}.jsonl`)
   assert.ok(fs.existsSync(file))
@@ -880,46 +937,46 @@ test('sanitizeRequestBodySnapshot omits image bytes', async () => {
   assert.equal(JSON.stringify(snap).includes(payload), false)
 })
 
-test('setConfig hot-updates mode', () => {
+test('setConfig hot-updates mode', async () => {
   const s = tmpStore('normal')
-  s.setConfig({ mode: 'debug', retainDays: 3 })
-  const snap = s.snapshot()
+  await s.setConfig({ mode: 'debug', retainDays: 3 })
+  const snap = await s.snapshot()
   assert.equal(snap.mode, 'debug')
   assert.equal(snap.retain_days, 3)
   assert.equal(snap.debug_retain_days, 3)
   assert.equal(snap.max_mb, 2048)
   assert.deepEqual(snap.muted_error_classes, ['auth'])
-  s.setConfig({ mutedErrorClasses: [] })
-  assert.deepEqual(s.snapshot().muted_error_classes, [])
+  await s.setConfig({ mutedErrorClasses: [] })
+  assert.deepEqual((await s.snapshot()).muted_error_classes, [])
 })
 
-test('cleanup keeps 7-day summaries and drops 3-day-old debug', () => {
+test('cleanup keeps 7-day summaries and drops 3-day-old debug', async () => {
   const store = tmpStore('normal')
-  store.setConfig({ retainDays: 7, debugRetainDays: 3, maxMb: 0 })
+  await store.setConfig({ retainDays: 7, debugRetainDays: 3, maxMb: 0 })
   const fiveDaysAgo = new Date(Date.now() - 5 * 86400_000).toISOString()
-  store.repo.insertSummary({
+  await store.repo.insertSummary({
     id: 'log_mid',
     request_id: 'rid-mid',
     ts: fiveDaysAgo,
   })
-  store.repo.insertDebug('rid-mid', fiveDaysAgo, { old: true })
-  store.cleanup()
-  assert.equal(store.repo.count(), 1)
-  assert.equal(store.repo.getDebug('rid-mid'), null)
+  await store.repo.insertDebug('rid-mid', fiveDaysAgo, { old: true })
+  await store.cleanup()
+  assert.equal(await store.repo.count(), 1)
+  assert.equal(await store.repo.getDebug('rid-mid'), null)
 })
 
-test('cleanup trims oldest debug rows when over max_mb', () => {
+test('cleanup trims oldest debug rows when over max_mb', async () => {
   const store = tmpStore('debug')
-  store.setConfig({ retainDays: 7, debugRetainDays: 7, maxMb: 1 })
+  await store.setConfig({ retainDays: 7, debugRetainDays: 7, maxMb: 1 })
   const blob = 'x'.repeat(400_000)
   for (let i = 0; i < 4; i++) {
-    store.repo.insertDebug(`rid-${i}`, new Date(Date.now() - (4 - i) * 1000).toISOString(), { blob })
+    await store.repo.insertDebug(`rid-${i}`, new Date(Date.now() - (4 - i) * 1000).toISOString(), { blob })
   }
-  assert.ok(store.repo.debugBytes() > 1024 * 1024)
-  store.cleanup()
-  assert.ok(store.repo.debugBytes() <= 1024 * 1024)
-  assert.equal(store.getDebug('rid-0'), null)
-  assert.ok(store.getDebug('rid-3'))
+  assert.ok((await store.repo.debugBytes()) > 1024 * 1024)
+  await store.cleanup()
+  assert.ok((await store.repo.debugBytes()) <= 1024 * 1024)
+  assert.equal(await store.getDebug('rid-0'), null)
+  assert.ok(await store.getDebug('rid-3'))
 })
 
 test('normalizeLoggingConfig defaults debug retain to 3 and caps at retain_days', () => {
@@ -933,7 +990,7 @@ test('normalizeLoggingConfig defaults debug retain to 3 and caps at retain_days'
   assert.equal(b.max_mb, 512)
 })
 
-test('ingress 401 stores presented key + ip and can be excluded from the list', () => {
+test('ingress 401 stores presented key + ip and can be excluded from the list', async () => {
   const store = tmpStore('normal')
   const ctx = store.start(
     {
@@ -943,28 +1000,28 @@ test('ingress 401 stores presented key + ip and can be excluded from the list', 
     },
     { protocol: 'anthropic.messages', pathName: '/v1/messages' },
   )
-  store.finish(ctx, {
+  await store.finish(ctx, {
     status: 401,
     error_code: 'invalid_api_key',
     error_message: 'Invalid credentials',
     api_key_presented: 'sk-bad-key-plain',
   })
-  assert.equal(store.queryNormal({ status: 'error' }).total, 0)
-  const listed = store.queryNormal({ status: 'error', include_muted: true })
+  assert.equal((await store.queryNormal({ status: 'error' })).total, 0)
+  const listed = await store.queryNormal({ status: 'error', include_muted: true })
   assert.equal(listed.total, 1)
   assert.equal(listed.items[0].api_key_presented, 'sk-bad-key-plain')
   assert.equal(listed.items[0].ip, '203.0.113.9')
   assert.equal(listed.items[0].error_class, 'auth')
-  assert.equal(store.queryNormal({ status: 'error', error_class: 'auth' }).total, 1)
-  assert.equal(store.queryNormal({ status: 'error', exclude_error_class: 'auth' }).total, 0)
-  const hits = store.windowStats().error_collection.ingress_hits
+  assert.equal((await store.queryNormal({ status: 'error', error_class: 'auth' })).total, 1)
+  assert.equal((await store.queryNormal({ status: 'error', exclude_error_class: 'auth' })).total, 0)
+  const hits = (await store.windowStats()).error_collection.ingress_hits
   assert.equal(hits.length, 1)
   assert.equal(hits[0].api_key_presented, 'sk-bad-key-plain')
   assert.equal(hits[0].ip, '203.0.113.9')
   assert.equal(hits[0].count, 1)
 })
 
-test('exportRows + csv/jsonl keep presented key and ip', () => {
+test('exportRows + csv/jsonl keep presented key and ip', async () => {
   const store = tmpStore('normal')
   const ctx = store.start(
     {
@@ -974,13 +1031,13 @@ test('exportRows + csv/jsonl keep presented key and ip', () => {
     },
     { pathName: '/v1/messages' },
   )
-  store.finish(ctx, {
+  await store.finish(ctx, {
     status: 401,
     error_code: 'invalid_api_key',
     error_message: 'Invalid credentials',
     api_key_presented: 'sk-export-plain',
   })
-  const { items, total } = store.exportRows({ status: 'error', include_muted: true, limit: 100 })
+  const { items, total } = await store.exportRows({ status: 'error', include_muted: true, limit: 100 })
   assert.equal(total, 1)
   assert.equal(items[0].ip, '198.51.100.4')
   const csv = logsToCsv(items)
@@ -991,14 +1048,14 @@ test('exportRows + csv/jsonl keep presented key and ip', () => {
   assert.match(jsonl, /sk-export-plain/)
 })
 
-test('finish persists caller and outbound sessions (capped) and only known reasoning efforts', () => {
+test('finish persists caller and outbound sessions (capped) and only known reasoning efforts', async () => {
   const store = tmpStore('normal')
-  const write = (extra) => {
+  const write = async (extra) => {
     const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { pathName: '/v1/messages' })
-    store.finish(ctx, { status: 200, ...extra })
-    return store.repo.getByRequestId(ctx.request_id)
+    await store.finish(ctx, { status: 200, ...extra })
+    return await store.repo.getByRequestId(ctx.request_id)
   }
-  const kept = write({
+  const kept = await write({
     session_id: `  ${'s'.repeat(250)}  `,
     outbound_session_id: '11111111-2222-4333-8444-555555555555',
     reasoning_effort: 'xhigh',
@@ -1006,7 +1063,7 @@ test('finish persists caller and outbound sessions (capped) and only known reaso
   assert.equal(kept.session_id, 's'.repeat(200))
   assert.equal(kept.outbound_session_id, '11111111-2222-4333-8444-555555555555')
   assert.equal(kept.reasoning_effort, 'xhigh')
-  const dropped = write({ session_id: '   ', outbound_session_id: '', reasoning_effort: 'turbo' })
+  const dropped = await write({ session_id: '   ', outbound_session_id: '', reasoning_effort: 'turbo' })
   assert.equal(dropped.session_id, null)
   assert.equal(dropped.outbound_session_id, null)
   assert.equal(dropped.reasoning_effort, null)
@@ -1037,7 +1094,7 @@ function fakeRes() {
   return res
 }
 
-test('debug mode records the exact client response; normal mode leaves res untouched', () => {
+test('debug mode records the exact client response; normal mode leaves res untouched', async () => {
   const store = new RequestLogStore({
     dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'kin-rlog-')),
     mode: 'debug',
@@ -1051,8 +1108,8 @@ test('debug mode records the exact client response; normal mode leaves res untou
   res.write('event: message_start\ndata: {"a":1}\n\n')
   res.write(Buffer.from('data: {"type":"content_block_delta","delta":{"text":"hello"}}\n\n'))
   res.end('data: [DONE]\n\n')
-  store.finish(ctx, { status: 200 })
-  const rec = store.getDebug(ctx.request_id)
+  await store.finish(ctx, { status: 200 })
+  const rec = await store.getDebug(ctx.request_id)
   assert.equal(rec.response.status, 200)
   assert.equal(rec.response.headers['content-type'], 'text/event-stream')
   assert.equal(rec.response.headers['set-cookie'], '***REDACTED***')
@@ -1070,36 +1127,103 @@ test('debug mode records the exact client response; normal mode leaves res untou
   assert.equal(nctx.response, undefined)
 })
 
-test('debug response body masks credentials that fit inside the capture window', () => {
+test('debug response body masks credentials that fit inside the capture window', async () => {
   const store = tmpStore('debug')
   const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { pathName: '/v1/messages' })
   const res = fakeRes()
   store.tapResponse(ctx, res)
   res.end('{"echo":"sk-ant-oat01-ABCDEFGH12345678"}')
-  store.finish(ctx, { status: 200 })
-  const body = store.getDebug(ctx.request_id).response.body
+  await store.finish(ctx, { status: 200 })
+  const body = (await store.getDebug(ctx.request_id)).response.body
   assert.doesNotMatch(body, /ABCDEFGH12345678/)
   assert.match(body, /REDACTED/)
 })
 
-test('tenant log scope follows the slot owner at write time, not the current owner', () => {
+test('tenant log scope follows the slot owner at write time, not the current owner', async () => {
   const store = tmpStore()
-  store.db.exec(`
+  await store.db.exec(`
     INSERT INTO users (id, email, username, password_hash) VALUES ('alice', 'a@x', 'alice', 'x'), ('bob', 'b@x', 'bob', 'x');
     INSERT INTO vms (id, name, vm_json) VALUES ('vm-a', 'Slot A', '{}');
   `)
-  logOne(store, { user_id: 'bob', vm_id: 'vm-a', error_code: 'upstream_error', status: 500 })
-  store.db.exec(`UPDATE vms SET owner_user_id = 'alice', origin = 'admin_assigned' WHERE id = 'vm-a'`)
-  const testChat = logOne(store, { api_key_kind: 'master', vm_id: 'vm-a', error_code: 'upstream_error', status: 500 })
+  await logOne(store, { user_id: 'bob', vm_id: 'vm-a', error_code: 'upstream_error', status: 500 })
+  await store.db.exec(`UPDATE vms SET owner_user_id = 'alice', origin = 'admin_assigned' WHERE id = 'vm-a'`)
+  const testChat = await logOne(store, {
+    api_key_kind: 'master',
+    vm_id: 'vm-a',
+    error_code: 'upstream_error',
+    status: 500,
+  })
 
-  const mine = store.queryNormal({ owner_user_id: 'alice' })
+  const mine = await store.queryNormal({ owner_user_id: 'alice' })
   assert.deepEqual(
     mine.items.map((r) => r.request_id),
     [testChat.request_id],
   )
   assert.deepEqual(
-    store.windowStats({ owner_user_id: 'alice' }).error_collection.recent.map((r) => r.request_id),
+    (await store.windowStats({ owner_user_id: 'alice' })).error_collection.recent.map((r) => r.request_id),
     [testChat.request_id],
   )
-  assert.equal(store.queryNormal({}).total, 2)
+  assert.equal((await store.queryNormal({})).total, 2)
+})
+
+test('stopping retention scheduling still waits for its running cleanup during flush', async (t) => {
+  const store = tmpStore()
+  let run
+  t.mock.method(globalThis, 'setInterval', (callback) => {
+    run = callback
+    return { unref() {} }
+  })
+  t.mock.method(globalThis, 'clearInterval', () => {})
+  let releaseCleanup
+  const cleanupPending = new Promise((resolve) => {
+    releaseCleanup = resolve
+  })
+  let signalCleanup
+  const cleanupStarted = new Promise((resolve) => {
+    signalCleanup = resolve
+  })
+  store.cleanup = async () => {
+    signalCleanup()
+    await cleanupPending
+  }
+  store.startCleanupScheduler()
+  run()
+  await cleanupStarted
+  store.stopCleanupScheduler()
+  let settled = false
+  let pending
+  try {
+    pending = store.flush().then(() => {
+      settled = true
+    })
+    await Promise.resolve()
+    assert.equal(settled, false)
+  } finally {
+    releaseCleanup()
+  }
+  await pending
+  assert.equal(settled, true)
+})
+
+test('summary and debug write failures reject finish and response flush', async () => {
+  const store = tmpStore('debug')
+  const query = store.db.query.bind(store.db)
+  const failure = Object.assign(new Error('simulated persistence failure'), { code: 'TEST_PERSISTENCE_FAILED' })
+  try {
+    store.db.query = (sql, params) =>
+      sql.includes('INSERT INTO request_log_debug') ? Promise.reject(failure) : query(sql, params)
+    const debug = store.start({ method: 'POST', url: '/v1/messages', headers: {} })
+    await assert.rejects(store.finish(debug, { status: 200 }), { code: 'TEST_PERSISTENCE_FAILED' })
+    assert.ok(await store.repo.getByRequestId(debug.request_id), 'summary persists even when debug persistence fails')
+
+    store.db.query = (sql, params) =>
+      sql.includes('INSERT INTO usage_logs') ? Promise.reject(failure) : query(sql, params)
+    const { trackPendingWrite, flushPendingWrites } = await import('../../src/lib/db/pending-writes.mjs')
+    const normal = store.start({ method: 'POST', url: '/v1/messages', headers: {} })
+    const pending = trackPendingWrite(store.finish(normal, { status: 200 }))
+    await assert.rejects(pending, { code: 'TEST_PERSISTENCE_FAILED' })
+    await assert.rejects(flushPendingWrites(), { code: 'TEST_PERSISTENCE_FAILED' })
+  } finally {
+    store.db.query = query
+  }
 })

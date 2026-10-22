@@ -33,6 +33,14 @@ import {
   isWrapConnectionError,
 } from '../core/errors.mjs'
 import { extraHeadersFromLimitError } from '../pool/quota-window.mjs'
+import { SlotgateClient } from './slotgate-client.mjs'
+import { credentialGeneration } from '../oauth/shared-credential-refresh.mjs'
+import { isKubernetesHaMode } from '../core/control-plane-mode.mjs'
+
+function requireNodeCapability(exec) {
+  if (isKubernetesHaMode() && exec?.slotgate == null)
+    throw Object.assign(new Error('trusted node capability required'), { code: 'slotgate_capability_required' })
+}
 
 const MAX_BODY = 64 * 1024 * 1024
 const credentialRefreshTail = new Map()
@@ -81,6 +89,13 @@ function workerRequest(
   exec,
   { method = 'GET', requestPath, body = null, signal, timeoutMs = 180000, timeoutMode = 'overall', headers = {} } = {},
 ) {
+  // Ancillary legacy health/credential/cancel routes have no fenced adapter.
+  // An explicitly fenced executor must never reach the old UDS/SSH relay.
+  if (exec?.slotgate != null)
+    return Promise.reject(
+      Object.assign(new Error('fenced worker route unavailable'), { code: 'slotgate_route_unavailable' }),
+    )
+  requireNodeCapability(exec)
   return new Promise((resolve, reject) => {
     const { socketPath } = workerPaths(exec)
     if (!socketPath) {
@@ -333,6 +348,61 @@ import { semanticStatusForStreamError } from '../protocol/stream-error-status.mj
 
 export { semanticStatusForStreamError } from '../protocol/stream-error-status.mjs'
 
+function kernelExecutionUnconfirmed(body, httpStatus = 0) {
+  const error = body?.error || body?.response?.error
+  if (!error || (error.type !== 'worker_error' && error.code !== 'provider_error')) return false
+  const detail = `${error.code || ''} ${error.message || ''}`
+  // The existing payload can close its HTTP response while the CLI still owns
+  // the job. Cancellation/transport failures take precedence over status text.
+  if (
+    /client.*disconnect|cancel|abort|transport|timeout|timed out|internal|failed to (?:read|write)|broken pipe|unexpected eof|connection.*(?:reset|closed)/i.test(
+      detail,
+    )
+  )
+    return true
+  if (/^(?:needs_refresh|invalid_grant|oauth_revoked|authentication_error)$/.test(String(error.code || '')))
+    return false
+  // A kernel's generic 502 is not an upstream status. Recognized provider
+  // rejections retain their ordinary EOF semantics.
+  const status = semanticStatusForStreamError({
+    ...body,
+    status: Number(body?.status) === 502 ? undefined : body?.status,
+    error: { ...error, status: Number(error.status) === 502 ? undefined : error.status },
+  })
+  const rejected = (value) => (value >= 400 && value < 500 && value !== 408 && value !== 499) || value === 529
+  return !rejected(status) && !rejected(httpStatus)
+}
+
+async function completeFencedExecution(client, handle, execution) {
+  try {
+    execution.nodeCompletion = await client.completion(handle)
+    Object.assign(execution, { ended: true, reason: 'node_completed' })
+  } catch {
+    Object.assign(execution, { ended: false, reason: 'node_completion_unconfirmed' })
+  }
+}
+
+function forwardFencedWorker(exec, client, handle, request) {
+  // Published manifests keep kernel authentication on the trusted node. Older
+  // explicitly injected test capabilities retain their legacy token contract.
+  const token = client.manifest ? '' : readInternalToken(exec)
+  return client.forward(handle, {
+    ...request,
+    headers: {
+      ...request.headers,
+      ...(token ? { 'x-kin-internal-token': token, 'x-internal-token': token } : {}),
+    },
+  })
+}
+
+function completeHttpExecution(execution, body, httpStatus) {
+  const uncertain = kernelExecutionUnconfirmed(body, httpStatus)
+  Object.assign(execution, {
+    ended: !uncertain,
+    reason: uncertain ? 'kernel_execution_unconfirmed' : 'eof',
+  })
+}
+
 /**
  * Kernel `map_kernel` folds every provider failure into 502 `provider_error`.
  * Restore recognized permission denials and plan-limit / overload statuses.
@@ -530,8 +600,12 @@ export async function callGoWorker({
   requestPath = '/internal/v1/messages',
   envelope = null,
   cliHop = false,
+  requestId = randomUUID(),
+  onExecutionStart,
 } = {}) {
-  if (isCrsMock()) {
+  requireNodeCapability(exec)
+  const execution = { requestId, started: false, ended: true, reason: isCrsMock() ? 'mock' : 'not_started' }
+  if (isCrsMock() && exec?.slotgate == null) {
     const { body: outboundBody, headers } = finalizeWorkerPayload({
       body,
       reqHeaders,
@@ -551,11 +625,14 @@ export async function callGoWorker({
       usage: mock.body?.usage || null,
       model: mock.body?.model || null,
       stopReason: mock.body?.stop_reason || null,
+      execution,
     }
   }
-  const requestId = randomUUID()
-  const stopCancel = cancelOnAbort(exec, signal, requestId)
+  const fenced = exec?.slotgate == null ? null : new SlotgateClient(exec.slotgate)
+  let startError
+  let stopCancel = () => {}
   try {
+    if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
     const prepared = envelope
       ? { envelope, thread: null }
       : workerEnvelope({
@@ -571,15 +648,36 @@ export async function callGoWorker({
           cliHop,
           requestContext,
         })
-    const response = await workerRequest(exec, {
+    // The caller can durably bind this ID before any bytes reach the kernel.
+    if (fenced) {
+      execution.nodeBinding = fenced.nodeBinding
+      try {
+        if (typeof onExecutionStart !== 'function')
+          throw Object.assign(new Error('durable node binding required'), { code: 'slotgate_binding_unconfirmed' })
+        const acknowledgement = await onExecutionStart({ requestId, nodeBinding: fenced.nodeBinding })
+        fenced.assertBinding(acknowledgement, requestId)
+      } catch (error) {
+        startError = error
+        throw error
+      }
+      Object.assign(execution, { ended: false, reason: 'node_prepared_unknown' })
+    } else if (onExecutionStart) await onExecutionStart({ requestId })
+    if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
+    if (!fenced) stopCancel = cancelOnAbort(exec, signal, requestId)
+    const handle = fenced ? await fenced.prepare(requestId) : null
+    Object.assign(execution, { started: true, ended: false, reason: 'in_progress' })
+    const request = {
       method: 'POST',
       requestPath,
       body: { ...prepared.envelope, request_id: requestId },
       signal,
       timeoutMs,
-    })
+    }
+    const response = await (fenced ? forwardFencedWorker(exec, fenced, handle, request) : workerRequest(exec, request))
     const data = await readAll(response)
     const parsed = parseJson(data)
+    if (fenced) await completeFencedExecution(fenced, handle, execution)
+    else completeHttpExecution(execution, parsed, response.statusCode)
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     const ok = response.statusCode >= 200 && response.statusCode < 300 && parsed?.type !== 'error'
     if (ok) rememberThreadTurn(parsed?.id, prepared.thread)
@@ -595,8 +693,17 @@ export async function callGoWorker({
       terminalState: headers['x-terminal-state'] || null,
       transportError: false,
       threadBetas: prepared.thread,
+      execution,
     })
   } catch (error) {
+    if (startError) throw startError
+    if (!execution.ended) {
+      execution.reason = signal?.aborted
+        ? 'client_aborted'
+        : error.code === 'worker_timeout'
+          ? 'timeout'
+          : 'transport_error'
+    }
     return {
       ok: false,
       status: 0,
@@ -612,6 +719,7 @@ export async function callGoWorker({
       headers: {},
       terminalState: 'transport_error',
       transportError: true,
+      execution,
     }
   } finally {
     stopCancel()
@@ -637,8 +745,12 @@ export async function streamGoWorker({
   requestPath = '/internal/v1/messages',
   envelope = null,
   cliHop = false,
+  requestId = randomUUID(),
+  onExecutionStart,
 } = {}) {
-  if (isCrsMock()) {
+  requireNodeCapability(exec)
+  const execution = { requestId, started: false, ended: true, reason: isCrsMock() ? 'mock' : 'not_started' }
+  if (isCrsMock() && exec?.slotgate == null) {
     const { body: outboundBody, headers } = finalizeWorkerPayload({
       body,
       reqHeaders,
@@ -662,6 +774,7 @@ export async function streamGoWorker({
           headers: {},
           terminalState: 'incomplete',
           committed: false,
+          execution,
         }
       }
       if (typeof onCommit === 'function') onCommit()
@@ -684,6 +797,7 @@ export async function streamGoWorker({
         headers: {},
         terminalState: 'incomplete',
         committed: true,
+        execution,
       }
     }
     const payload = mockCrsPayload({ scenario })
@@ -693,6 +807,7 @@ export async function streamGoWorker({
         via: 'go-worker-mock-stream',
         terminalState: 'rejected',
         committed: false,
+        execution,
       }
     }
     let mockTtftMs = null
@@ -716,15 +831,18 @@ export async function streamGoWorker({
       stopReason: payload.body?.stop_reason || null,
       ttftMs: mockTtftMs,
       firstTokenAt: mockTtftMs == null ? null : mockStartedAt + mockTtftMs,
+      execution,
     }
   }
+  const fenced = exec?.slotgate == null ? null : new SlotgateClient(exec.slotgate)
+  let startError
   let committed = false
   // Hop-relative TTFT. firstTokenAt is epoch ms so request logs subtract ingress t0.
   const startedAt = Date.now()
   let ttftMs = null
-  const requestId = randomUUID()
-  const stopCancel = cancelOnAbort(exec, signal, requestId)
+  let stopCancel = () => {}
   try {
+    if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
     const prepared = envelope
       ? { envelope, thread: null }
       : workerEnvelope({
@@ -741,7 +859,24 @@ export async function streamGoWorker({
           cliHop,
           requestContext,
         })
-    const response = await workerRequest(exec, {
+    if (fenced) {
+      execution.nodeBinding = fenced.nodeBinding
+      try {
+        if (typeof onExecutionStart !== 'function')
+          throw Object.assign(new Error('durable node binding required'), { code: 'slotgate_binding_unconfirmed' })
+        const acknowledgement = await onExecutionStart({ requestId, nodeBinding: fenced.nodeBinding })
+        fenced.assertBinding(acknowledgement, requestId)
+      } catch (error) {
+        startError = error
+        throw error
+      }
+      Object.assign(execution, { ended: false, reason: 'node_prepared_unknown' })
+    } else if (onExecutionStart) await onExecutionStart({ requestId })
+    if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
+    if (!fenced) stopCancel = cancelOnAbort(exec, signal, requestId)
+    const handle = fenced ? await fenced.prepare(requestId) : null
+    Object.assign(execution, { started: true, ended: false, reason: 'in_progress' })
+    const request = {
       method: 'POST',
       requestPath,
       body: { ...prepared.envelope, request_id: requestId },
@@ -749,24 +884,30 @@ export async function streamGoWorker({
       timeoutMs,
       timeoutMode: 'first-byte',
       headers: { te: 'trailers' },
-    })
+    }
+    const response = await (fenced ? forwardFencedWorker(exec, fenced, handle, request) : workerRequest(exec, request))
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
       const data = await readAll(response, 1024 * 1024)
+      const parsed = parseJson(data)
+      if (fenced) await completeFencedExecution(fenced, handle, execution)
+      else completeHttpExecution(execution, parsed, response.statusCode)
       return restoreKernelErrorStatus({
         ok: false,
         status: response.statusCode || 0,
         via: 'go-worker-stream',
-        body: parseJson(data),
+        body: parsed,
         headers,
         committed: false,
         terminalState: headers['x-terminal-state'] || 'error',
         transportError: false,
         threadBetas: prepared.thread,
+        execution,
       })
     }
     let buffer = ''
     let lastError = null
+    let unconfirmedKernelError = null
     let dataBuf = ''
     let sseUsage = null
     let sseModel = null
@@ -801,6 +942,7 @@ export async function streamGoWorker({
     }
     const observeSseEvent = (event) => {
       if (!event) return event
+      if (kernelExecutionUnconfirmed(event)) unconfirmedKernelError = event
       if (ttftMs == null && isFirstTokenEvent(event)) ttftMs = Date.now() - startedAt
       if (event.type === 'response_headers' && event.headers && typeof event.headers === 'object') {
         sseRateHeaders = { ...sseRateHeaders, ...event.headers }
@@ -876,6 +1018,8 @@ export async function streamGoWorker({
         const event = observeSseEvent(takeSseEvent())
         if (isDownstreamCommitEvent(event)) await flushCommit()
       }
+      if (fenced) await completeFencedExecution(fenced, handle, execution)
+      else completeHttpExecution(execution, unconfirmedKernelError || lastError, response.statusCode)
       const trailers = mergeRateLimitHeaders(publicHeaders(response.trailers))
       const meta = streamMetaFromHeaders({ ...headers, ...trailers })
       const assembled = assembler.message
@@ -903,17 +1047,27 @@ export async function streamGoWorker({
         terminalState,
         transportError: false,
         threadBetas: prepared.thread,
+        execution,
       })
     } finally {
       if (idleTimer) clearInterval(idleTimer)
     }
   } catch (error) {
+    if (startError) throw startError
+    if (!execution.ended) {
+      execution.reason = signal?.aborted
+        ? 'client_aborted'
+        : error.code === 'worker_timeout'
+          ? 'timeout'
+          : 'transport_error'
+    }
     if (signal?.aborted) {
       return clientCancelledResult({
         via: 'go-worker-stream',
         ttftMs,
         firstTokenAt: ttftMs == null ? null : startedAt + ttftMs,
         committed,
+        execution,
       })
     }
     return {
@@ -934,6 +1088,7 @@ export async function streamGoWorker({
       committed,
       terminalState: committed ? 'incomplete' : 'transport_error',
       transportError: true,
+      execution,
     }
   } finally {
     stopCancel()
@@ -941,6 +1096,14 @@ export async function streamGoWorker({
 }
 
 export async function workerHealth(exec, { timeoutMs = 3000, signal } = {}) {
+  requireNodeCapability(exec)
+  if (exec?.slotgate != null) {
+    try {
+      return await new SlotgateClient(exec.slotgate).health({ timeoutMs, signal })
+    } catch (error) {
+      return { ok: false, status: 0, code: error.code || 'slotgate_health_unconfirmed' }
+    }
+  }
   if (isCrsMock()) {
     const claude = exec?.vm?.claude || {}
     const hasCredential = hasCredentialPresence(claude)
@@ -976,7 +1139,51 @@ export async function workerHealth(exec, { timeoutMs = 3000, signal } = {}) {
   }
 }
 
-export async function ensureWorkerCredential(exec, { force = false } = {}) {
+export async function ensureWorkerCredential(exec, { force = false, ...refreshOptions } = {}) {
+  requireNodeCapability(exec)
+  if (exec?.slotgate != null) {
+    if (!exec.accountId && !exec.nodeIdentity?.credential?.account_uuid)
+      return {
+        ok: false,
+        status: 503,
+        refreshed: false,
+        credentialRefreshNotStarted: true,
+        error: { code: 'slotgate_route_unavailable', message: 'Node credential identity is required' },
+      }
+    const health = await workerHealth(exec)
+    const credential = health?.credential
+    if (
+      health.ok !== true ||
+      !credential ||
+      typeof credential.generation !== 'string' ||
+      credential.account_uuid !== (exec.accountId || exec.nodeIdentity?.credential?.account_uuid)
+    )
+      return {
+        ok: false,
+        status: 503,
+        refreshed: false,
+        credentialRefreshNotStarted: true,
+        error: { code: 'slotgate_route_unavailable', message: 'Node credential refresh is unavailable' },
+      }
+    if (!force && credential.has_access === true && credential.needs_refresh === false)
+      return { ok: true, status: 200, refreshed: false, refresh_class: 'already_fresh', credential }
+    const value = await runSlotOauth(exec, 'refresh', {
+      ...refreshOptions,
+      force,
+      expectedGeneration:
+        refreshOptions.expectedGeneration === undefined ? credential.generation : refreshOptions.expectedGeneration,
+    })
+    return {
+      ok: value.ok === true,
+      status: value.status,
+      refreshed: value.body?.refreshed === true,
+      credential: value.body?.credential,
+      ...(value.body?.error ? { error: value.body.error } : {}),
+      ...(value.credentialRefreshUnknown ? { credentialRefreshUnknown: true } : {}),
+      ...(value.credentialRefreshNotStarted ? { credentialRefreshNotStarted: true } : {}),
+      attemptFinished: value.attemptFinished,
+    }
+  }
   if (isCrsMock()) {
     return {
       ok: true,
@@ -1058,7 +1265,14 @@ export async function ensureWorkerCredential(exec, { force = false } = {}) {
         credential: credentialSummary(live, liveNow),
       }
     }
-    const result = await runSlotOauth(exec, 'refresh', { force: !!force })
+    const result = await runSlotOauth(exec, 'refresh', {
+      ...refreshOptions,
+      expectedGeneration:
+        refreshOptions.expectedGeneration === undefined
+          ? credentialGeneration(credential)
+          : refreshOptions.expectedGeneration,
+      force: !!force,
+    })
     const body = result?.body || {}
     const refreshedCredential = readWorkerCredentialFile(exec.homeDir)
     const mapped = {
@@ -1068,6 +1282,9 @@ export async function ensureWorkerCredential(exec, { force = false } = {}) {
       refresh_class: result?.ok ? (body.refreshed ? 'rotated' : 'already_fresh') : undefined,
       credential: result?.ok ? credentialSummary({ ...(refreshedCredential || {}), ...body }, Date.now()) : undefined,
       error: result?.ok ? undefined : body.error,
+      attemptFinished: result?.attemptFinished === true,
+      ...(result?.credentialRefreshUnknown ? { credentialRefreshUnknown: true } : {}),
+      ...(result?.transportError ? { transportError: true } : {}),
     }
     if (!mapped.ok) mapped.refresh_class = classifyCredentialRefresh(mapped)
     return mapped
@@ -1100,6 +1317,13 @@ function credentialSummary(credential, now = Date.now()) {
 }
 
 export async function importWorkerCredential(exec, credential, { timeoutMs = 60000, signal } = {}) {
+  requireNodeCapability(exec)
+  if (exec?.slotgate != null)
+    return {
+      ok: false,
+      status: 503,
+      error: { code: 'slotgate_route_unavailable', message: 'Node credential import is not available' },
+    }
   try {
     writeWorkerCredentialFile(exec.homeDir, credential)
     // Import is the one case where the control plane's credential replaces the slot's copy.
@@ -1124,6 +1348,17 @@ export async function importWorkerCredential(exec, credential, { timeoutMs = 600
 }
 
 export async function callWorkerGet(exec, requestPath, { timeoutMs = 30000, signal } = {}) {
+  requireNodeCapability(exec)
+  if (exec?.slotgate != null)
+    return {
+      ok: false,
+      status: 503,
+      body: { error: { code: 'slotgate_route_unavailable', message: 'Node auxiliary route is not available' } },
+      headers: {},
+      via: 'slotgate',
+      attemptFinished: true,
+      taskNotStarted: true,
+    }
   if (isCrsMock()) {
     if (requestPath === '/internal/v1/models') {
       return {
@@ -1216,6 +1451,17 @@ export async function callWorkerGet(exec, requestPath, { timeoutMs = 30000, sign
 }
 
 export async function countTokensViaWorker(exec, { body, headers = {}, timeoutMs = 45000 } = {}) {
+  requireNodeCapability(exec)
+  if (exec?.slotgate != null)
+    return {
+      ok: false,
+      status: 503,
+      body: { error: { code: 'slotgate_route_unavailable', message: 'Node count tokens is not available' } },
+      headers: {},
+      via: 'slotgate',
+      attemptFinished: true,
+      taskNotStarted: true,
+    }
   if (isCrsMock()) {
     return { ok: true, status: 200, body: { input_tokens: 8 }, headers: {}, via: 'go-worker-mock' }
   }

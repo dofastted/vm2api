@@ -179,7 +179,7 @@ export function validateDockerMemoryRaise(vm, requestedMemory, routing) {
 
 export function raiseDockerSlotMemory(projectRoot, vm, requestedMemory, { routing, execImpl = defaultExec } = {}) {
   const validated = validateDockerMemoryRaise(vm, requestedMemory, routing)
-  if (!validated.ok) return validated
+  if (!validated.ok) return { ...validated, vmOperationNotStarted: true }
 
   const mem = validated.memory
   const name = containerName(vm.id)

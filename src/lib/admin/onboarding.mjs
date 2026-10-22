@@ -113,14 +113,14 @@ export function buildOnboardingPayload({
   }
 }
 
-export function loadOnboardingState(settings) {
-  const raw = settings?.get?.(ONBOARDING_STATE_KEY, {})
+export async function loadOnboardingState(settings) {
+  const raw = await settings?.get?.(ONBOARDING_STATE_KEY, {})
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
   return raw
 }
 
-export function saveOnboardingState(settings, map) {
-  settings.set(ONBOARDING_STATE_KEY, map && typeof map === 'object' ? map : {})
+export async function saveOnboardingState(settings, map) {
+  await settings.set(ONBOARDING_STATE_KEY, map && typeof map === 'object' ? map : {})
   return map
 }
 

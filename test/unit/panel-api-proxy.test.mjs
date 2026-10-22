@@ -29,7 +29,7 @@ function writeVm(project, rec) {
   fs.writeFileSync(path.join(dir, `${rec.id}.json`), JSON.stringify(rec, null, 2))
 }
 
-test('summarizeProxyPool includes disconnect_on_error', () => {
+test('summarizeProxyPool includes disconnect_on_error', async () => {
   assert.deepEqual(summarizeProxyPool(null), {
     total: 0,
     free: 0,
@@ -40,9 +40,9 @@ test('summarizeProxyPool includes disconnect_on_error', () => {
     disconnect_on_error: false,
   })
   const dir = tmpDir()
-  const pool = new ProxyPool({ dataDir: dir })
-  pool.importLines('10.0.0.9:1080')
-  pool.updateConfig({ disconnect_on_error: true })
+  const pool = await new ProxyPool({ dataDir: dir }).init()
+  await pool.importLines('10.0.0.9:1080')
+  await pool.updateConfig({ disconnect_on_error: true })
   pool.stopScheduler()
   const sum = summarizeProxyPool(pool)
   assert.equal(sum.total, 1)
@@ -63,10 +63,10 @@ test('dashboard and vm detail merge pool health onto bound VM', async () => {
     claude: {},
     policy: { maxConcurrency: 4, weight: 1, priority: 8 },
   })
-  const pool = new ProxyPool({ dataDir })
-  pool.importLines('10.8.8.8:1080')
+  const pool = await new ProxyPool({ dataDir }).init()
+  await pool.importLines('10.8.8.8:1080')
   const px = pool.snapshot().proxies[0]
-  pool.bind(px.id, 'vm-02')
+  await pool.bind(px.id, 'vm-02')
   const bound = pool.state.proxies[0]
   bound.status = 'ok'
   bound.latency_ms = 12
@@ -78,7 +78,7 @@ test('dashboard and vm detail merge pool health onto bound VM', async () => {
   bound.geo_timezone = 'Asia/Tokyo'
   bound.geo_checked_at = '2026-01-01T00:00:00Z'
   bound.label = '东京-2'
-  pool.save()
+  await pool.save()
   pool.stopScheduler()
 
   const cfg = { paths: { project }, rewrite: { enabled: false }, base_url: 'http://127.0.0.1' }
@@ -157,11 +157,11 @@ test('dead bound proxy blocks credential import', async () => {
     claude: {},
     policy: {},
   })
-  const pool = new ProxyPool({ dataDir })
-  pool.importLines('10.7.7.7:1080')
+  const pool = await new ProxyPool({ dataDir }).init()
+  await pool.importLines('10.7.7.7:1080')
   const id = pool.snapshot().proxies[0].id
-  pool.bind(id, 'vm-03')
-  pool.setEnabled(id, false)
+  await pool.bind(id, 'vm-03')
+  await pool.setEnabled(id, false)
   pool.stopScheduler()
   const cfg = { paths: { project }, rewrite: {}, base_url: '' }
   const detail = await buildVmDetail({ cfg, accountQuota: fakeQuota(), id: 'vm-03', proxyPool: pool })
@@ -322,6 +322,41 @@ test('VM list exposes the Claude unit circuit and reset closes it', async (t) =>
   assert.equal(resetVmCircuit({ cfg, id: 'nope' }).status, 404)
 })
 
+test('Kubernetes VM list and reset use the shared circuit authority', async (t) => {
+  const { resetVmCircuit } = await import('../../src/lib/admin/panel-api.mjs')
+  const { getDb } = await import('../../src/lib/db/database.mjs')
+  const { SharedExecutionAdmissions } = await import('../../src/lib/pool/shared-execution-admissions.mjs')
+  const project = tmpDir()
+  const previous = process.env.VM2API_CONTROL_PLANE_MODE
+  process.env.VM2API_CONTROL_PLANE_MODE = 'kubernetes'
+  t.after(() => {
+    if (previous == null) delete process.env.VM2API_CONTROL_PLANE_MODE
+    else process.env.VM2API_CONTROL_PLANE_MODE = previous
+    fs.rmSync(project, { recursive: true, force: true })
+  })
+  writeVm(project, { id: 'vm-shared-circuit', claude: { account_uuid: 'shared-circuit-account' } })
+  const admissions = new SharedExecutionAdmissions(getDb())
+  const circuit = { failureThreshold: 1, openMs: 1000 }
+  const lease = await admissions.tryReserve({
+    accountId: 'shared-circuit-account',
+    vmId: 'vm-shared-circuit',
+    accountLimit: 4,
+    vmLimit: 4,
+    fableLimit: 0,
+    rpmLimit: 0,
+    circuit,
+  })
+  await lease.noteCircuitResult('failure')
+  await lease.release()
+  const cfg = { paths: { project } }
+  const listed = await buildVmList({ cfg, accountQuota: fakeQuota() })
+  assert.equal(listed.data.items[0].circuit.state, 'open')
+  assert.equal(listed.data.items[0].circuit.account_id, 'shared-circuit-account')
+  const reset = await resetVmCircuit({ cfg, id: 'vm-shared-circuit' })
+  assert.equal(reset.data.circuit.state, 'closed')
+  assert.equal((await admissions.inspectCircuit('shared-circuit-account', circuit)).failures, 0)
+})
+
 test('local proxy node labels are present for admin and absent for tenant', async (t) => {
   const project = tmpDir()
   const dataDir = path.join(project, 'data')
@@ -358,16 +393,16 @@ test('local proxy node labels are present for admin and absent for tenant', asyn
     { id: 'vm-tokyo', node_id: 'node-a' },
     { id: 'vm-tenant', node_id: 'node-a', owner_user_id: 'user-1' },
   ]
-  const pool = new ProxyPool({
+  const pool = await new ProxyPool({
     dataDir,
     vmNodeOf: (vmId) => vms.find((vm) => vm.id === vmId)?.node_id || null,
-  })
+  }).init()
   t.after(() => pool.stopScheduler())
-  pool.ensureLocal()
+  await pool.ensureLocal()
   // A generic px-local bind lands each slot on its own VPS's local row.
-  assert.equal(pool.bind('px-local', 'vm-ctrl').proxy.id, 'px-local')
-  assert.equal(pool.bind('px-local', 'vm-tokyo').proxy.id, 'px-local-node-a')
-  assert.equal(pool.bind('px-local', 'vm-tenant').proxy.id, 'px-local-node-a')
+  assert.equal((await pool.bind('px-local', 'vm-ctrl')).proxy.id, 'px-local')
+  assert.equal((await pool.bind('px-local', 'vm-tokyo')).proxy.id, 'px-local-node-a')
+  assert.equal((await pool.bind('px-local', 'vm-tenant')).proxy.id, 'px-local-node-a')
 
   const nodes = [{ id: 'node-a', label: '东京-01' }]
   const adminSnap = pool.panelSnapshot({ role: 'admin', vms, nodes })

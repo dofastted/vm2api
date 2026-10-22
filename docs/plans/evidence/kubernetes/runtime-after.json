@@ -1,0 +1,98 @@
+{
+  "source_commit": "6589eab3ca1179250a24c6ee5a5fee5e738e7f47",
+  "image": "vm2api:kubernetes-6589eab3",
+  "docker_reported_id": "sha256:a2d4d0ffa17e833eac84c466bc13ccc0985872a277d092cf63cf5d95c29a2340",
+  "containerd_manifest_digest": "sha256:a2d4d0ffa17e833eac84c466bc13ccc0985872a277d092cf63cf5d95c29a2340",
+  "manifest_media_type": "application/vnd.oci.image.manifest.v1+json",
+  "manifest_config_digest": "sha256:2bf42f9e9d5fd7c652dca757e62e69c79364dfc5f548338eddcbcd87ef688dce",
+  "validated_at": "2026-10-21T08:37:05.897950+00:00",
+  "context": "cube-local",
+  "storage_class": "local-path",
+  "smoke_test_commit": "e8e418b9a532959095a6c8aa5ccd70dc1f63a09a",
+  "exit_code": 0,
+  "observed_pod_image_id": "sha256:2bf42f9e9d5fd7c652dca757e62e69c79364dfc5f548338eddcbcd87ef688dce",
+  "namespace": "vm2api-k8s-649-67b4ba49e2",
+  "namespace_deleted": true,
+  "checks": [
+    "pod-ready",
+    "service-dns-and-clusterip",
+    "health-ready-console",
+    "panel-cookie-login-and-postgres-metrics",
+    "api-key-create",
+    "managed-api-key-inference",
+    "go-api-kernel-json-and-sse",
+    "two-request-logs",
+    "second-control-plane-rejected",
+    "recreate-restart",
+    "postgres-session-and-api-key-persist",
+    "pvc-persists"
+  ],
+  "sse_timing": {
+    "event": "sse-timing",
+    "headers_ms": 12.2,
+    "headers": {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      "transfer-encoding": "chunked",
+      "x-accel-buffering": "no"
+    },
+    "frames": [
+      {
+        "type": "message_start",
+        "arrived_ms": 12.2
+      },
+      {
+        "type": "content_block_start",
+        "arrived_ms": 12.2
+      },
+      {
+        "type": "content_block_delta",
+        "arrived_ms": 12.2
+      },
+      {
+        "type": "content_block_delta",
+        "arrived_ms": 1012.1
+      },
+      {
+        "type": "content_block_stop",
+        "arrived_ms": 1012.2
+      },
+      {
+        "type": "message_delta",
+        "arrived_ms": 1012.2
+      },
+      {
+        "type": "message_stop",
+        "arrived_ms": 1012.2
+      }
+    ],
+    "deltas": [
+      {
+        "text": "kubernetes-pro",
+        "arrived_ms": 12.2
+      },
+      {
+        "text": "of-67b4ba49e296",
+        "arrived_ms": 1012.1
+      }
+    ],
+    "ended_ms": 1019.7
+  },
+  "before_fix": {
+    "source_commit": "1366e203b4b771542702517bc4e1bf0279e6ee8f",
+    "exit_code": 1,
+    "failure": "SSE text deltas were buffered until completion",
+    "first_text_delta_ms": 1012.9,
+    "second_text_delta_ms": 1013.0,
+    "delta_gap_ms": 0.1
+  },
+  "after_fix_delta_gap_ms": 999.9,
+  "runtime_log": "smoke-runtime-6589eab3.log",
+  "limitations": [
+    "single active control plane only",
+    "Recreate restart is not a zero-downtime rollout",
+    "HTTP and SSE verified through Service port-forward; external Ingress not deployed",
+    "synthetic internal upstream only; no external model service traffic",
+    "no RWX or multi-node storage validation"
+  ]
+}

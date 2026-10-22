@@ -1,0 +1,89 @@
+{
+  "source_sha": "f53e005f4794782b0a8e0b4bb152f68d4a3a7aa0",
+  "namespace": "vm2api-648-ha-01a15dc9",
+  "boundary": "real two-node Kubernetes gateways, real PG/TLS Go node, synthetic kernel/provider",
+  "checks": [
+    {
+      "name": "two_ready_pods_on_distinct_nodes",
+      "passed": true,
+      "nodes": [
+        "k3d-vm2api-648-01a15dc9-server-0",
+        "k3d-vm2api-648-01a15dc9-agent-1"
+      ]
+    },
+    {
+      "name": "cross_pod_panel_session",
+      "passed": true
+    },
+    {
+      "name": "both_pods_dispatch_concurrently",
+      "passed": true,
+      "held": {
+        "keys": 2,
+        "executions": 2,
+        "turns": 2
+      }
+    },
+    {
+      "name": "global_account_vm_cap_and_cancelled_waiter_release",
+      "passed": true,
+      "kernelActive": 2,
+      "held": {
+        "keys": 2,
+        "executions": 2,
+        "turns": 2
+      }
+    },
+    {
+      "name": "http_sse_original_node_completion_and_billing",
+      "passed": true,
+      "ledger": [
+        {
+          "outcome": "charged",
+          "n": 2
+        }
+      ],
+      "held": {
+        "keys": 0,
+        "executions": 0,
+        "turns": 0
+      },
+      "kernelPeak": 2
+    },
+    {
+      "name": "global_key_concurrency_across_pods",
+      "passed": true,
+      "deniedStatus": 429
+    },
+    {
+      "name": "cross_pod_routing_refresh",
+      "passed": true
+    },
+    {
+      "name": "unsupported_management_refuses_before_host_io",
+      "passed": true
+    },
+    {
+      "name": "websocket_claude_responses_rejection",
+      "passed": true,
+      "inference_success": false
+    }
+  ],
+  "pods": [
+    {
+      "name": "vm2api-5ccbfd86f-68772",
+      "uid": "2ffcdd02-5520-4332-8934-0d4529e0e0f2",
+      "node": "k3d-vm2api-648-01a15dc9-server-0",
+      "image": "docker.io/library/vm2api:kubernetes-ha-f53e005f",
+      "imageID": "sha256:f2ce099f07273f1a187c01cfbbaffaee24f2cad57239b7627da917d17d5dcb3e"
+    },
+    {
+      "name": "vm2api-5ccbfd86f-9wjjb",
+      "uid": "b1be4ded-b032-467d-b803-4c374a140b2f",
+      "node": "k3d-vm2api-648-01a15dc9-agent-1",
+      "image": "docker.io/library/vm2api:kubernetes-ha-f53e005f",
+      "imageID": "sha256:f2ce099f07273f1a187c01cfbbaffaee24f2cad57239b7627da917d17d5dcb3e"
+    }
+  ],
+  "passed": true
+}

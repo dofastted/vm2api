@@ -29,6 +29,7 @@ import {
   slotNetworkForVm,
   startEgressProcess,
   stopEgressProcess,
+  stopEgressProcessConfirmed,
   waitEgressExit,
   egressPidActive,
   ensureProxyEgress,
@@ -539,25 +540,39 @@ test('DNS upstream validation rejects unsafe or malformed URL boundaries', () =>
   }
 })
 
-test('egress config carries dns_upstream only when configured', async () => {
+test('egress config carries dns_upstream only when configured', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'egress-dns-'))
+  const bin = path.join(root, 'kin-egress-config-fixture')
+  fs.writeFileSync(bin, `#!${process.execPath}\nsetInterval(() => {}, 1000)\n`, { mode: 0o700 })
+  const proxies = []
+  t.after(async () => {
+    for (const proxyId of proxies) {
+      const stopped = await stopEgressProcessConfirmed(root, proxyId, { termTimeoutMs: 500, killGraceMs: 500 })
+      assert.equal(stopped.ok, true, JSON.stringify(stopped))
+    }
+    fs.rmSync(root, { recursive: true, force: true })
+  })
   const base = {
     projectRoot: root,
     proxyUrl: 'socks5h://127.0.0.1:1',
-    tcpPort: 20000,
-    dnsPort: 20001,
+    tcpPort: 0,
+    dnsPort: 0,
     listenHost: '127.0.0.1',
-    bin: '/bin/true',
+    bin,
   }
   const a = await startEgressProcess({ ...base, proxyId: 'px-a', dnsUpstream: '' })
-  assert.equal(a.ok, true)
+  if (a.pid) proxies.push('px-a')
+  assert.equal(a.ok, true, JSON.stringify(a))
   assert.equal(JSON.parse(fs.readFileSync(a.configPath, 'utf8')).dns_upstream, undefined)
   const b = await startEgressProcess({ ...base, proxyId: 'px-b', dnsUpstream: '8.8.8.8:53,1.1.1.1:53' })
+  if (b.pid) proxies.push('px-b')
+  assert.equal(b.ok, true, JSON.stringify(b))
   assert.equal(JSON.parse(fs.readFileSync(b.configPath, 'utf8')).dns_upstream, '8.8.8.8:53,1.1.1.1:53')
   const c = await startEgressProcess({ ...base, proxyId: 'px-c', domainForward: true })
+  if (c.pid) proxies.push('px-c')
+  assert.equal(c.ok, true, JSON.stringify(c))
   assert.equal(JSON.parse(fs.readFileSync(c.configPath, 'utf8')).domain_forward, true)
   assert.equal(JSON.parse(fs.readFileSync(a.configPath, 'utf8')).domain_forward, undefined)
-  fs.rmSync(root, { recursive: true, force: true })
 })
 
 test('egress readiness checks the exact listener without opening a connection', async (t) => {

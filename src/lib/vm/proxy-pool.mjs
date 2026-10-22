@@ -1,5 +1,5 @@
 /**
- * SOCKS5 Proxy Pool (SQLite-backed)
+ * SOCKS5 Proxy Pool (PostgreSQL-backed)
  * - Bulk import
  * - 1 proxy ↔ up to N VMs (`config.bind_limit`, default 5)
  * - Auto-assign a proxy with remaining capacity on VM create
@@ -7,13 +7,18 @@
  * - On failure: disable proxy + disable bound VM scheduling
  *
  * Persistence: `proxies` table + `settings.proxy_pool_config`.
- * Working set stays in memory (probe loop mutates it); save() writes through.
+ * PostgreSQL is authoritative; synchronous accessors expose an explicit runtime cache.
  */
 import { EventEmitter } from 'node:events'
 import net from 'node:net'
 import crypto from 'node:crypto'
-import { resolveStoreDb } from '../db/database.mjs'
-import { ProxiesRepo } from '../db/repos/proxies-repo.mjs'
+import { resolveStoreDb, withTransaction, getActivityCoordinator } from '../db/database.mjs'
+import { ProxiesRepo, PROXY_COLUMNS, PROXY_HEALTH_COLUMNS } from '../db/repos/proxies-repo.mjs'
+import { ExecutionAdmissionsRepo } from '../db/repos/execution-admissions-repo.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { currentVmOperationIds } from './shared-vm-operations.mjs'
+import { physicalVmAliases } from './vm-physical-target.mjs'
+import { assertCurrentProxyOperation } from './shared-proxy-operations.mjs'
 import { canBindProxyToVm, normalizeOwnerId, proxyOwnerId, vmOwnerId } from '../admin/resource-owner.mjs'
 import { validTimezone } from '../core/timezone.mjs'
 import { lookupProxyGeo, lookupProxyGeoV6 } from './proxy-geo.mjs'
@@ -341,44 +346,271 @@ export class ProxyPool extends EventEmitter {
     this._probeSockets = new Map()
     // Node exits are not pool rows: px-local's geo is the control plane's, a node slot leaves elsewhere.
     this._exitGeo = new Map()
-    this.load()
+    this._operations = new Set()
+    this._cacheVersion = 0
+    this._refreshIssued = 0
+    this._refreshPublished = 0
+    this.db.pendingWriteQueues ||= new Set()
+    this.db.pendingWriteQueues.add(this)
   }
 
-  /** Re-read working set from DB (startup + post-restore). */
-  load() {
-    try {
-      this.state.config = { ...DEFAULT_CONFIG, ...(this.repo.getConfig({}) || {}) }
-      this.state.proxies = this.repo.loadAll().map(hydrateProxy)
-    } catch {
-      this.state = { config: { ...DEFAULT_CONFIG }, proxies: [] }
+  _emitChange() {
+    if (!this._mutation) this.emit('change')
+  }
+
+  _publish(snapshot) {
+    const previous = new Map(this.state.proxies.map((proxy) => [proxy.id, proxy]))
+    const proxies = snapshot.proxies.map((record) => {
+      const proxy = hydrateProxy(record)
+      const existing = previous.get(proxy.id)
+      return existing ? Object.assign(existing, proxy) : proxy
+    })
+    this.state = { config: { ...DEFAULT_CONFIG, ...snapshot.config }, proxies }
+    this._savedState = structuredClone(this.state)
+  }
+
+  /** Refresh committed PostgreSQL state without waiting for network probes. */
+  async refresh() {
+    const issued = ++this._refreshIssued
+    const version = this._cacheVersion
+    const snapshot = await this.repo.snapshot()
+    if (issued > this._refreshPublished && version === this._cacheVersion) {
+      this._refreshPublished = issued
+      this._publish(snapshot)
     }
+    return this
   }
 
-  reload() {
-    this.load()
+  async load() {
+    await this.flush()
+    return this.refresh()
   }
 
-  /** Re-bind to a fresh DB connection (after backup restore) and re-read. */
-  rebind(db) {
+  async init() {
+    return this.load()
+  }
+  async reload() {
+    return this.load()
+  }
+
+  async rebind(db) {
+    await this.flush()
+    this.db.pendingWriteQueues?.delete(this)
     this.db = db
     this.repo = new ProxiesRepo(db)
-    this.load()
+    db.pendingWriteQueues ||= new Set()
+    db.pendingWriteQueues.add(this)
+    return this.load()
   }
 
-  save() {
-    // Batched rewrites (local-row migration) persist once at the end.
-    if (this._saveDeferred) {
-      this._savePending = true
-      return
-    }
-    this.repo.setConfig(this.state.config)
-    this.repo.replaceAll(
-      this.state.proxies.map((p) => ({
-        ...p,
-        bound_vm_id: encodeBoundVmIds(boundVmIdsOf(p)),
-      })),
+  async flush() {
+    while (this._probing) await new Promise((resolve) => setTimeout(resolve, 10))
+    while (this._operations.size) await Promise.all([...this._operations])
+  }
+
+  _track(operation) {
+    this._operations.add(operation)
+    operation.finally(() => this._operations.delete(operation)).catch(() => {})
+    return operation
+  }
+
+  _stored(proxy) {
+    return { ...proxy, protocol: proxy.protocol ?? proxy.scheme, bound_vm_id: encodeBoundVmIds(boundVmIdsOf(proxy)) }
+  }
+
+  _changes(before, after, columns = PROXY_COLUMNS) {
+    return Object.fromEntries(
+      columns
+        .filter(
+          (column) =>
+            column !== 'id' && JSON.stringify(before[column] ?? null) !== JSON.stringify(after[column] ?? null),
+        )
+        .map((column) => [column, after[column] ?? null]),
     )
-    this.emit('change')
+  }
+
+  /** Each control mutation starts from PG and writes only its changed rows/fields. */
+  _mutate(change, { observation = false } = {}) {
+    const operation = withTransaction(this.db, async () => {
+      await this.repo.lockMutations()
+      if (!observation && isKubernetesMode()) await assertCurrentProxyOperation(this.db)
+      const snapshot = await this.repo.snapshot()
+      const working = { config: { ...DEFAULT_CONFIG, ...snapshot.config }, proxies: snapshot.proxies.map(hydrateProxy) }
+      const before = structuredClone(working)
+      const cached = this.state
+      const context = { callbacks: [], restartScheduler: false }
+      let result
+      this.state = working
+      this._mutation = context
+      try {
+        result = change()
+      } finally {
+        this.state = cached
+        this._mutation = null
+      }
+      if (result?.ok === false) return result
+      if (!observation && isKubernetesMode()) await this._assertVmMutationClaims(before, working)
+      const previous = new Map(before.proxies.map((proxy) => [proxy.id, proxy]))
+      for (const proxy of working.proxies) {
+        const old = previous.get(proxy.id)
+        let row
+        if (!old) row = await this.repo.insert(this._stored(proxy))
+        else {
+          const patch = this._changes(this._stored(old), this._stored(proxy))
+          if (Object.keys(patch).length) row = await this.repo.patchConfig(proxy.id, patch)
+        }
+        if (row) Object.assign(proxy, hydrateProxy(row))
+        previous.delete(proxy.id)
+      }
+      for (const id of previous.keys()) await this.repo.remove(id)
+      const configPatch = this._changes(before.config, working.config, Object.keys(DEFAULT_CONFIG))
+      if (Object.keys(configPatch).length) {
+        working.config = { ...DEFAULT_CONFIG, ...(await this.repo.patchPoolConfig(configPatch)) }
+      }
+      this.db.afterCommit(() => {
+        this._cacheVersion++
+        this._publish(working)
+        for (const callback of context.callbacks) callback()
+        this._emitChange()
+        if (context.restartScheduler) this.restartScheduler()
+      })
+      return result
+    })
+    return this._track(operation)
+  }
+
+  async _assertVmMutationClaims(before, after) {
+    const configChanged =
+      Object.keys(this._changes(before.config, after.config, Object.keys(DEFAULT_CONFIG))).length > 0
+    const previous = new Map(before.proxies.map((proxy) => [proxy.id, proxy]))
+    const next = new Map(after.proxies.map((proxy) => [proxy.id, proxy]))
+    const involved = new Set()
+    const required = new Set()
+    for (const id of new Set([...previous.keys(), ...next.keys()])) {
+      const old = previous.get(id)
+      const updated = next.get(id)
+      const patch = old && updated ? this._changes(this._stored(old), this._stored(updated)) : null
+      if (!configChanged && old && updated && !Object.keys(patch).length) continue
+      const oldIds = boundVmIdsOf(old)
+      const newIds = boundVmIdsOf(updated)
+      for (const vmId of [...oldIds, ...newIds]) involved.add(vmId)
+      // A binding-only change owns its added/removed targets. Configuration and
+      // deletion affect every existing member of the shared proxy.
+      const bindingOnly =
+        !configChanged &&
+        old &&
+        updated &&
+        Object.keys(patch).every((key) => ['bound_vm_id', 'updated_at'].includes(key))
+      for (const vmId of [...oldIds, ...newIds]) {
+        if (!bindingOnly || oldIds.includes(vmId) !== newIds.includes(vmId)) required.add(vmId)
+      }
+    }
+    if (!involved.size) return
+    // Serialize these checks with acquisition of each logical/physical VM claim.
+    await new ExecutionAdmissionsRepo(this.db).lockResources({ vmIds: [...involved] })
+    const aliases = [...new Set([...involved].flatMap(physicalVmAliases))]
+    const rows = await this.db
+      .prepare(`SELECT id, vm_id, uncertain_at FROM vm_operations
+      WHERE vm_id = ANY($1::text[]) AND released_at IS NULL`)
+      .all(aliases)
+    const current = currentVmOperationIds(this.db)
+    if (rows.some((row) => !current.has(row.id) || row.uncertain_at)) {
+      throw Object.assign(new Error('A proxy VM operation is active'), { code: 'vm_operation_active', status: 409 })
+    }
+    if (
+      [...required].some(
+        (vmId) => !rows.some((row) => current.has(row.id) && physicalVmAliases(vmId).includes(row.vm_id)),
+      )
+    ) {
+      throw Object.assign(new Error('Current VM operation claims do not cover the proxy binding set'), {
+        code: 'vm_mutation_claim_required',
+        status: 409,
+      })
+    }
+  }
+
+  /** Compatibility for explicit state edits; production operations use the methods below. */
+  save() {
+    if (this._mutation) return
+    const desired = structuredClone(this.state)
+    const baseline = structuredClone(this._savedState || { config: DEFAULT_CONFIG, proxies: [] })
+    return this._mutate(() => {
+      Object.assign(this.state.config, this._changes(baseline.config, desired.config, Object.keys(DEFAULT_CONFIG)))
+      const old = new Map(baseline.proxies.map((proxy) => [proxy.id, proxy]))
+      const desiredIds = new Set(desired.proxies.map((proxy) => proxy.id))
+      for (const proxy of desired.proxies) {
+        const previous = old.get(proxy.id)
+        const current = this.state.proxies.find((row) => row.id === proxy.id)
+        if (!previous) {
+          if (!current) this.state.proxies.push(proxy)
+          continue
+        }
+        if (!current) continue
+        const patch = this._changes(this._stored(previous), this._stored(proxy))
+        if (Object.keys(patch).length && previous.config_revision !== current.config_revision) {
+          throw Object.assign(new Error('proxy changed'), { code: 'proxy_changed' })
+        }
+        Object.assign(current, patch)
+        if (Object.hasOwn(patch, 'bound_vm_id')) setBoundVmIds(current, patch.bound_vm_id)
+      }
+      this.state.proxies = this.state.proxies.filter((proxy) => !old.has(proxy.id) || desiredIds.has(proxy.id))
+      return { ok: true }
+    })
+  }
+
+  async ensureLocal(...args) {
+    return this._mutate(() => this._ensureLocal(...args))
+  }
+  async ensureLocalForNode(...args) {
+    return this._mutate(() => this._ensureLocalForNode(...args))
+  }
+  async syncLocalNodes(...args) {
+    return this._mutate(() => this._syncLocalNodes(...args))
+  }
+  async resolveLocalTarget(...args) {
+    return this._mutate(() => this._resolveLocalTarget(...args))
+  }
+  async adoptNodeLocalBindings(...args) {
+    return this._mutate(() => this._collectNodeLocalBindings(...args))
+  }
+  async ensureSocks(...args) {
+    return this._mutate(() => this._ensureSocks(...args))
+  }
+  async importLines(...args) {
+    return this._mutate(() => this._importLines(...args))
+  }
+  async importParsed(...args) {
+    return this._mutate(() => this._importParsed(...args))
+  }
+  async ensureBoundToVm(...args) {
+    return this._mutate(() => this._ensureBoundToVm(...args))
+  }
+  async allocateForVm(...args) {
+    return this._mutate(() => this._allocateForVm(...args))
+  }
+  async bind(...args) {
+    return this._mutate(() => this._bind(...args))
+  }
+  async unbind(...args) {
+    return this._mutate(() => this._unbind(...args))
+  }
+  async unbindVm(...args) {
+    return this._mutate(() => this._unbindVm(...args))
+  }
+  async setEnabled(...args) {
+    return this._mutate(() => this._setEnabled(...args))
+  }
+  async remove(...args) {
+    return this._mutate(() => this._remove(...args))
+  }
+  async update(...args) {
+    return this._mutate(() => this._update(...args))
+  }
+  async updateConfig(...args) {
+    return this._mutate(() => this._updateConfig(...args))
+  }
+  async reportRuntimeFailure(...args) {
+    return this._mutate(() => this._reportRuntimeFailure(...args), { observation: true })
   }
 
   /**
@@ -496,12 +728,12 @@ export class ProxyPool extends EventEmitter {
   }
 
   /** The control plane's local row (`px-local`). */
-  ensureLocal() {
-    return this.ensureLocalForNode(null)
+  _ensureLocal() {
+    return this._ensureLocalForNode(null)
   }
 
   /** One local row per VPS: `px-local` for the control plane, `px-local-<nodeId>` per node. */
-  ensureLocalForNode(nodeId = null) {
+  _ensureLocalForNode(nodeId = null) {
     const id = localEgressIdForNode(nodeId)
     const existing = this.state.proxies.find((p) => p.id === id)
     if (existing) return { ok: true, created: false, proxy: this.publicProxy(existing) }
@@ -516,13 +748,13 @@ export class ProxyPool extends EventEmitter {
    * Keep node local rows in step with the cluster: a row per node once local
    * egress is in use, and drop rows of removed nodes that hold no slot.
    */
-  syncLocalNodes(nodeIds = []) {
+  _syncLocalNodes(nodeIds = []) {
     if (!this.state.proxies.some((p) => p.id === LOCAL_EGRESS_ID)) return { created: [], removed: [] }
     const wanted = new Set(nodeIds.map((id) => localEgressIdForNode(id)).filter((id) => id !== LOCAL_EGRESS_ID))
     const created = []
     for (const id of wanted) {
       if (this.state.proxies.some((p) => p.id === id)) continue
-      this.ensureLocalForNode(localEgressNodeId(id))
+      this._ensureLocalForNode(localEgressNodeId(id))
       created.push(id)
     }
     const removed = this.state.proxies
@@ -532,7 +764,7 @@ export class ProxyPool extends EventEmitter {
       this.state.proxies = this.state.proxies.filter((p) => !removed.includes(p.id))
       this.save()
     }
-    if (created.length || removed.length) this.emit('change')
+    if (created.length || removed.length) this._emitChange()
     return { created, removed }
   }
 
@@ -546,12 +778,13 @@ export class ProxyPool extends EventEmitter {
 
   /** Re-probe one node's local row (its SSH link just changed state). */
   async probeLocalNode(nodeId) {
+    await this.refresh()
     const p = this.state.proxies.find((x) => x.id === localEgressIdForNode(nodeId) && localEgressNodeId(x.id))
     // An operator-disabled row stays out of automatic probes, as in probeAll.
     if (!p || !p.enabled) return null
-    const result = await this.probeOne(p)
-    this._applyProbeResult(p, result)
-    this.save()
+    const observed = structuredClone(p)
+    const result = await this.probeOne(observed)
+    await this._persistObservation(observed, (current) => this._applyProbeResultInner(current, result))
     return result
   }
 
@@ -565,13 +798,13 @@ export class ProxyPool extends EventEmitter {
    * `nodeId` (null = control plane). The generic px-local resolves to the
    * slot's own VPS; another machine's local row is refused.
    */
-  resolveLocalTarget(proxyId, nodeId) {
+  _resolveLocalTarget(proxyId, nodeId) {
     const target = localEgressIdForNode(nodeId || null)
     if (proxyId !== target && proxyId !== LOCAL_EGRESS_ID) {
       return { ok: false, error: 'local_proxy_node_mismatch', expected: target }
     }
     const targetNode = localEgressNodeId(target)
-    if (targetNode) this.ensureLocalForNode(targetNode)
+    if (targetNode) this._ensureLocalForNode(targetNode)
     return { ok: true, id: target }
   }
 
@@ -580,18 +813,9 @@ export class ProxyPool extends EventEmitter {
    * px-local before per-node rows). Returns the moves so the caller can
    * rewrite each slot's recorded proxy.
    */
-  adoptNodeLocalBindings() {
+  _collectNodeLocalBindings() {
     const moves = []
-    this._saveDeferred = true
-    try {
-      this._adoptNodeLocalBindings(moves)
-    } finally {
-      this._saveDeferred = false
-      if (this._savePending) {
-        this._savePending = false
-        this.save()
-      }
-    }
+    this._adoptNodeLocalBindings(moves)
     return moves
   }
 
@@ -602,7 +826,7 @@ export class ProxyPool extends EventEmitter {
         if (this.vmNodeOf && this._vmNodeOrUndefined(vmId) === undefined) continue
         const target = this.localTargetForVm(vmId)
         if (target === p.id) continue
-        const bound = this.bind(target, vmId, { force: true })
+        const bound = this._bind(target, vmId, { force: true })
         if (bound.ok) moves.push({ vm_id: vmId, from: p.id, to: target })
       }
     }
@@ -625,12 +849,12 @@ export class ProxyPool extends EventEmitter {
    * Return the SOCKS row with this host/port/username/password, creating it
    * when absent. Same credentials must not allocate a second id.
    */
-  ensureSocks(fields = {}, { ownerUserId = null, label = null } = {}) {
+  _ensureSocks(fields = {}, { ownerUserId = null, label = null } = {}) {
     const parsed = parseSocks5Fields(fields)
     if (!parsed) return { ok: false, error: 'invalid_proxy' }
     const found = this._findSocksRow(parsed)
     if (found) return { ok: true, created: false, proxy: this._withAuth(found) }
-    const imported = this.importParsed([parsed], { ownerUserId })
+    const imported = this._importParsed([parsed], { ownerUserId })
     const id = imported.items[0]?.id
     const row = this.state.proxies.find((p) => p.id === id)
     if (!row) return { ok: false, error: 'proxy_import_failed' }
@@ -642,7 +866,7 @@ export class ProxyPool extends EventEmitter {
     return { ok: true, created: true, proxy: this._withAuth(row) }
   }
 
-  importLines(text, extra = {}) {
+  _importLines(text, extra = {}) {
     const parsed = []
     for (const line of String(text || '').split(/\r?\n/)) {
       if (!String(line || '').trim()) continue
@@ -656,10 +880,10 @@ export class ProxyPool extends EventEmitter {
     if (extra.host || extra.port) {
       parsed.push(parseSocks5Fields(extra) || { __invalid: `${extra.host || ''}:${extra.port || ''}` })
     }
-    return this.importParsed(parsed, extra)
+    return this._importParsed(parsed, extra)
   }
 
-  importParsed(records = [], extra = {}) {
+  _importParsed(records = [], extra = {}) {
     const added = []
     const skipped = []
     // Credentials can select distinct proxies at the same endpoint. Encode a
@@ -713,7 +937,7 @@ export class ProxyPool extends EventEmitter {
    * Restore pool↔VM binding after start/restart.
    * Prefer an existing bind, then the VM's last proxy id, then a free allocate.
    */
-  ensureBoundToVm(vmId, preferredId = null) {
+  _ensureBoundToVm(vmId, preferredId = null) {
     if (!vmId) return null
     if (this.state.proxies.some((p) => proxyHasVm(p, vmId) && proxyBlockedReason(p, this.state.config.ipv6_enabled)))
       return null
@@ -722,14 +946,14 @@ export class ProxyPool extends EventEmitter {
     if (preferredId) {
       const preferred = this.state.proxies.find((p) => p.id === preferredId)
       if (proxyBlockedReason(preferred, this.state.config.ipv6_enabled)) return null
-      const bound = this.bind(preferredId, vmId)
+      const bound = this._bind(preferredId, vmId)
       if (bound.ok) return this.getProxyForVm(vmId)
     }
-    return this.allocateForVm(vmId)
+    return this._allocateForVm(vmId)
   }
 
   /** Allocate one healthy proxy with remaining capacity and bind to vmId */
-  allocateForVm(vmId, { ownerUserId = null, role = 'admin' } = {}) {
+  _allocateForVm(vmId, { ownerUserId = null, role = 'admin' } = {}) {
     if (!vmId) return null
     if (this.state.proxies.some((p) => proxyHasVm(p, vmId) && proxyBlockedReason(p, this.state.config.ipv6_enabled)))
       return null
@@ -742,7 +966,7 @@ export class ProxyPool extends EventEmitter {
     const owner = normalizeOwnerId(ownerUserId)
     const localTarget = this.localTargetForVm(vmId)
     if (localTarget !== LOCAL_EGRESS_ID && this.state.proxies.some((p) => p.id === LOCAL_EGRESS_ID)) {
-      this.ensureLocalForNode(localEgressNodeId(localTarget))
+      this._ensureLocalForNode(localEgressNodeId(localTarget))
     }
     const candidates = this.state.proxies.filter((p) => {
       if (isLocalEgressProxy(p) && p.id !== localTarget) return false
@@ -758,16 +982,16 @@ export class ProxyPool extends EventEmitter {
     })
     const pick = candidates[0]
     if (!pick) return null
-    const bound = this.bind(pick.id, vmId, { role })
+    const bound = this._bind(pick.id, vmId, { role })
     return bound.ok ? bound.proxy : null
   }
 
-  bind(proxyId, vmId, { force = false } = {}) {
+  _bind(proxyId, vmId, { force = false } = {}) {
     const vm = String(vmId || '').trim()
     if (isLocalEgressId(proxyId) && vm) {
       // Local egress is the slot's own VPS route: a generic px-local request lands
       // on the slot's node row; another machine's local row is refused.
-      const resolved = this.resolveLocalTarget(proxyId, this._vmNodeOrUndefined(vm) || null)
+      const resolved = this._resolveLocalTarget(proxyId, this._vmNodeOrUndefined(vm) || null)
       if (!resolved.ok) return resolved
       proxyId = resolved.id
     }
@@ -801,7 +1025,7 @@ export class ProxyPool extends EventEmitter {
     return { ok: true, proxy: this.publicProxy(p) }
   }
 
-  unbind(proxyId, vmId = null) {
+  _unbind(proxyId, vmId = null) {
     const p = this.state.proxies.find((x) => x.id === proxyId)
     if (!p) return { ok: false, error: 'proxy_not_found' }
     const ids = boundVmIdsOf(p)
@@ -812,7 +1036,7 @@ export class ProxyPool extends EventEmitter {
     return { ok: true, proxy: this.publicProxy(p), unbound_vm_ids: removed }
   }
 
-  unbindVm(vmId) {
+  _unbindVm(vmId) {
     const vm = String(vmId || '').trim()
     if (!vm) return
     for (const p of this.state.proxies) {
@@ -826,7 +1050,7 @@ export class ProxyPool extends EventEmitter {
     this.save()
   }
 
-  setEnabled(proxyId, enabled) {
+  _setEnabled(proxyId, enabled) {
     const p = this.state.proxies.find((x) => x.id === proxyId)
     if (!p) return { ok: false, error: 'proxy_not_found' }
     p.enabled = !!enabled
@@ -842,7 +1066,7 @@ export class ProxyPool extends EventEmitter {
     return { ok: true, proxy: this.publicProxy(p) }
   }
 
-  remove(proxyId) {
+  _remove(proxyId) {
     const idx = this.state.proxies.findIndex((x) => x.id === proxyId)
     if (idx < 0) return { ok: false, error: 'proxy_not_found' }
     const [p] = this.state.proxies.splice(idx, 1)
@@ -860,7 +1084,7 @@ export class ProxyPool extends EventEmitter {
    * The merged record goes through socks5Record() so this shares the exact
    * validation and normalization the import path uses.
    */
-  update(proxyId, patch = {}) {
+  _update(proxyId, patch = {}) {
     const p = this.state.proxies.find((x) => x.id === proxyId)
     if (!p) return { ok: false, error: 'proxy_not_found' }
     const has = (k) => Object.prototype.hasOwnProperty.call(patch, k)
@@ -918,7 +1142,7 @@ export class ProxyPool extends EventEmitter {
     return { ok: true, proxy: this.publicProxy(p), connection_changed: true, domain_forward_changed: domainChanged }
   }
 
-  updateConfig(patch = {}) {
+  _updateConfig(patch = {}) {
     const allowed = [5, 10, 30, 60]
     if (Object.hasOwn(patch, 'dns_disable_svcb_https') && typeof patch.dns_disable_svcb_https !== 'boolean') {
       return { ok: false, error: 'invalid_dns_disable_svcb_https' }
@@ -968,9 +1192,11 @@ export class ProxyPool extends EventEmitter {
     if (patch.ipv6_enabled != null) this.state.config.ipv6_enabled = patch.ipv6_enabled
     this.save()
     if (patch.ipv6_enabled === false) {
-      for (const [socket, proxy] of this._probeSockets) {
-        if (socksProxyFamily(proxy) === 6) socket.destroy()
-      }
+      this._mutation.callbacks.push(() => {
+        for (const [socket, proxy] of this._probeSockets) {
+          if (socksProxyFamily(proxy) === 6) socket.destroy()
+        }
+      })
     }
     this.restartScheduler()
     return { ok: true, config: this.state.config }
@@ -984,7 +1210,7 @@ export class ProxyPool extends EventEmitter {
    * Runtime SOCKS5 failure from a live request.
    * When disconnect_on_error is off this is a no-op (existing cooldown/failover stays).
    */
-  reportRuntimeFailure(vmId, error = 'runtime_socks_failure') {
+  _reportRuntimeFailure(vmId, error = 'runtime_socks_failure') {
     if (!this.disconnectOnErrorEnabled()) {
       return { ok: true, skipped: true, reason: 'disconnect_on_error_disabled' }
     }
@@ -1008,6 +1234,11 @@ export class ProxyPool extends EventEmitter {
   }
 
   _cascadeDisconnectVm(proxy, reason) {
+    if (this._mutation) {
+      const committed = structuredClone(proxy)
+      this._mutation.callbacks.push(() => this._cascadeDisconnectVm(committed, reason))
+      return
+    }
     const cb = this.onDisconnectVm || this.onDisableVm
     if (typeof cb !== 'function') return
     for (const vmId of boundVmIdsOf(proxy)) {
@@ -1020,6 +1251,11 @@ export class ProxyPool extends EventEmitter {
   }
 
   _cascadeDisableVm(proxy, reason) {
+    if (this._mutation) {
+      const committed = structuredClone(proxy)
+      this._mutation.callbacks.push(() => this._cascadeDisableVm(committed, reason))
+      return
+    }
     if (typeof this.onDisableVm !== 'function') return
     for (const vmId of boundVmIdsOf(proxy)) {
       try {
@@ -1031,6 +1267,11 @@ export class ProxyPool extends EventEmitter {
   }
 
   _cascadeEnableVm(proxy, reason) {
+    if (this._mutation) {
+      const committed = structuredClone(proxy)
+      this._mutation.callbacks.push(() => this._cascadeEnableVm(committed, reason))
+      return
+    }
     if (typeof this.onEnableVm !== 'function') return
     for (const vmId of boundVmIdsOf(proxy)) {
       try {
@@ -1072,6 +1313,10 @@ export class ProxyPool extends EventEmitter {
     if (typeof this.egressCheck !== 'function') return { ...socks, scope: 'socks' }
     let eg = this.egressCheck(proxy)
     if (!eg?.ok && typeof this.repairEgress === 'function') {
+      const current = await this.repo.getById(proxy.id)
+      if (!current || current.config_revision !== proxy.config_revision) {
+        return { ok: false, scope: 'pending', error: 'proxy_changed', latency_ms: socks.latency_ms }
+      }
       try {
         await this.repairEgress(proxy)
       } catch {
@@ -1152,12 +1397,13 @@ export class ProxyPool extends EventEmitter {
   }
 
   async probeById(proxyId) {
+    await this.refresh()
     const p = this.state.proxies.find((x) => x.id === proxyId)
     if (!p) return { ok: false, error: 'proxy_not_found' }
-    const result = await this.probeOne(p)
-    this._applyProbeResult(p, result)
-    this.save()
-    return { ok: true, proxy: this.publicProxy(p), probe: result }
+    const observed = structuredClone(p)
+    const result = await this.probeOne(observed)
+    const current = await this._persistObservation(observed, (row) => this._applyProbeResultInner(row, result))
+    return { ok: true, proxy: this.publicProxy(current || p), probe: result, ...(current ? {} : { stale: true }) }
   }
 
   async probeAll({ onlyEnabled = true } = {}) {
@@ -1165,6 +1411,7 @@ export class ProxyPool extends EventEmitter {
     this._probing = true
     const results = []
     try {
+      await this.refresh()
       const list = this.state.proxies.filter((p) => {
         if (proxyBlockedReason(p, this.state.config.ipv6_enabled)) return false
         if (!onlyEnabled) return true
@@ -1172,11 +1419,17 @@ export class ProxyPool extends EventEmitter {
         return p.status === 'fail' || (p.status === 'dead' && p.last_error)
       })
       for (const p of list) {
-        const result = await this.probeOne(p)
-        this._applyProbeResult(p, result)
-        results.push({ id: p.id, ...result, status: p.status, enabled: p.enabled })
+        const observed = structuredClone(p)
+        const result = await this.probeOne(observed)
+        const current = await this._persistObservation(observed, (row) => this._applyProbeResultInner(row, result))
+        results.push({
+          id: p.id,
+          ...result,
+          status: current?.status ?? p.status,
+          enabled: current?.enabled ?? p.enabled,
+          ...(current ? {} : { stale: true }),
+        })
       }
-      this.save()
       return { ok: true, total: results.length, results }
     } finally {
       this._probing = false
@@ -1194,8 +1447,10 @@ export class ProxyPool extends EventEmitter {
    * hit is returned untouched so bind-time detection stays cheap.
    */
   async detectGeo(proxyId, { force = false } = {}) {
+    await this.refresh()
     const p = this.state.proxies.find((x) => x.id === proxyId)
     if (!p) return { ok: false, error: 'proxy_not_found' }
+    const observed = structuredClone(p)
     const blocked = proxyBlockedReason(p, this.state.config.ipv6_enabled)
     if (blocked) return { ok: false, error: blocked, proxy: this.publicProxy(p) }
     const v4Cached = !force && p.geo_checked_at && p.geo_ip
@@ -1224,30 +1479,33 @@ export class ProxyPool extends EventEmitter {
     }
     const timeoutMs = this.state.config?.geo_timeout_ms
     let v4Result = v4Cached ? { ok: true } : await this.geoLookup(url, { timeoutMs })
-    if (!v4Cached) this._applyGeoResult(p, v4Result)
     let v6Result = v6Cached ? { ok: true } : await this.geoV6Lookup(url, { timeoutMs })
-    if (!v6Cached) this._applyGeoV6Result(p, v6Result)
-    this.save()
-    const pub = this.publicProxy(p)
+    const current = await this._persistObservation(observed, (row) => {
+      if (!v4Cached) this._applyGeoResult(row, v4Result)
+      if (!v6Cached) this._applyGeoV6Result(row, v6Result)
+    })
+    if (!current) return { ok: false, error: 'proxy_changed', stale: true }
+    const pub = this.publicProxy(current)
     if (!v4Result?.ok) {
       return {
         ok: false,
         error: v4Result?.error || 'geo_lookup_failed',
         proxy: pub,
-        geo: proxyGeoOf(p),
-        geo_v6: proxyGeoV6Of(p),
+        geo: proxyGeoOf(current),
+        geo_v6: proxyGeoV6Of(current),
       }
     }
     return {
       ok: true,
       cached: v4Cached && v6Cached,
       proxy: pub,
-      geo: proxyGeoOf(p),
-      geo_v6: proxyGeoV6Of(p),
+      geo: proxyGeoOf(current),
+      geo_v6: proxyGeoV6Of(current),
     }
   }
 
   async detectGeoAll({ onlyEnabled = true, force = false } = {}) {
+    await this.refresh()
     const list = this.state.proxies.filter((p) => (onlyEnabled ? p.enabled : true))
     const results = []
     for (const p of list) {
@@ -1373,7 +1631,42 @@ export class ProxyPool extends EventEmitter {
 
   _applyProbeResult(p, result, opts = {}) {
     this._applyProbeResultInner(p, result, opts)
-    this.emit('change')
+    this._emitChange()
+  }
+
+  async _persistObservation(observed, apply) {
+    const operation = withTransaction(this.db, async () => {
+      await this.repo.lockMutations()
+      const row = await this.repo.getById(observed.id, { forUpdate: true })
+      if (!row || row.config_revision !== observed.config_revision) return null
+      const current = hydrateProxy(row)
+      const before = this._stored(current)
+      const cached = this.state
+      const context = { callbacks: [] }
+      this.state = { config: { ...DEFAULT_CONFIG, ...(await this.repo.getConfig({})) }, proxies: [current] }
+      this._mutation = context
+      try {
+        apply(current)
+      } finally {
+        this.state = cached
+        this._mutation = null
+      }
+      const patch = this._changes(before, this._stored(current), PROXY_HEALTH_COLUMNS)
+      const stored = await this.repo.patchHealth(current.id, patch, observed.config_revision)
+      if (!stored) return null
+      const fresh = hydrateProxy(stored)
+      this.db.afterCommit(() => {
+        this._cacheVersion++
+        const previous = this.state.proxies.find((proxy) => proxy.id === fresh.id)
+        if (previous) Object.assign(previous, fresh)
+        else this.state.proxies.push(fresh)
+        this._savedState = structuredClone(this.state)
+        for (const callback of context.callbacks) callback()
+        this._emitChange()
+      })
+      return fresh
+    })
+    return this._track(operation)
   }
 
   startScheduler() {
@@ -1381,10 +1674,18 @@ export class ProxyPool extends EventEmitter {
     if (!this.state.config.enabled) return
     const min = this.state.config.probe_interval_min || 10
     const ms = min * 60 * 1000
-    void this.probeAll({ onlyEnabled: true }).catch(() => {})
-    this._timer = setInterval(() => {
-      this.probeAll({ onlyEnabled: true }).catch(() => {})
-    }, ms)
+    const run = () => {
+      const coordinator = getActivityCoordinator(this.db)
+      const pending = coordinator
+        ? coordinator.runActivity({ kind: 'proxy_probe' }, async () => ({
+            ended: true,
+            value: await this.probeAll({ onlyEnabled: true }),
+          }))
+        : this.probeAll({ onlyEnabled: true })
+      return this._track(pending).catch(() => {})
+    }
+    void run()
+    this._timer = setInterval(run, ms)
     this._timer.unref?.()
   }
 
@@ -1396,6 +1697,10 @@ export class ProxyPool extends EventEmitter {
   }
 
   restartScheduler() {
+    if (this._mutation) {
+      this._mutation.restartScheduler = true
+      return
+    }
     this.startScheduler()
   }
 

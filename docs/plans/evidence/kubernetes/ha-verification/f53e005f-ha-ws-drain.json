@@ -1,0 +1,45 @@
+{
+  "source_sha": "f53e005f4794782b0a8e0b4bb152f68d4a3a7aa0",
+  "scope": "WebSocket upgrade, unsupported Claude Responses error, graceful idle close and reconnect; no successful model WS inference",
+  "oldPods": [
+    {
+      "uid": "3cc88f75-d577-44e2-ab29-cf000efc682e",
+      "name": "vm2api-6b86c684f-h4lbn",
+      "imageID": "sha256:f2ce099f07273f1a187c01cfbbaffaee24f2cad57239b7627da917d17d5dcb3e"
+    },
+    {
+      "uid": "0efe76ee-49c8-4f02-a7f3-85954a0cd6a9",
+      "name": "vm2api-6b86c684f-khv2s",
+      "imageID": "sha256:f2ce099f07273f1a187c01cfbbaffaee24f2cad57239b7627da917d17d5dcb3e"
+    }
+  ],
+  "closed": {
+    "code": 1001,
+    "reason": "Control plane is draining"
+  },
+  "reconnectAttempts": [
+    {
+      "ok": false,
+      "code": "Error"
+    },
+    {
+      "ok": true
+    }
+  ],
+  "newPods": [
+    {
+      "uid": "2a9ae89d-8d7d-49b5-9699-44c9effbbb03",
+      "name": "vm2api-7cd4b59c76-9wvbx",
+      "node": "k3d-vm2api-648-01a15dc9-agent-0",
+      "imageID": "sha256:f2ce099f07273f1a187c01cfbbaffaee24f2cad57239b7627da917d17d5dcb3e"
+    },
+    {
+      "uid": "0a967cf7-0f2e-4a03-bad8-e79607f98dec",
+      "name": "vm2api-7cd4b59c76-trfn2",
+      "node": "k3d-vm2api-648-01a15dc9-agent-1",
+      "imageID": "sha256:f2ce099f07273f1a187c01cfbbaffaee24f2cad57239b7627da917d17d5dcb3e"
+    }
+  ],
+  "reconnected": true,
+  "passed": true
+}

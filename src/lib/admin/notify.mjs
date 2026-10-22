@@ -6,9 +6,14 @@
  */
 import net from 'node:net'
 import tls from 'node:tls'
+import { randomUUID } from 'node:crypto'
 import { CREDENTIAL_REFRESH_FAIL } from '../pool/availability.mjs'
+import { backgroundTasksFor } from '../core/shared-background-tasks.mjs'
+import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { RoutingConfigRepo } from '../db/repos/routing-config-repo.mjs'
 
 export const SECRET_KEEP = '__KEEP__'
+const NOTIFY_STATE_KEY = 'pool_notify_state'
 export const DEFAULT_NOTIFY = Object.freeze({
   enabled: false,
   interval_sec: 60,
@@ -533,7 +538,7 @@ function smtpExpectOk(reply, allowed) {
         .split(/\r?\n/)
         .filter(Boolean)
         .pop() || `smtp_${reply.code}`
-    throw new Error(hint.slice(0, 180))
+    throw Object.assign(new Error(hint.slice(0, 180)), { notificationAttemptEnded: true })
   }
 }
 
@@ -705,7 +710,7 @@ export async function sendTelegramNotify(cfg, message, opts = {}) {
     }),
     signal: opts.signal,
   })
-  const raw = await res.text().catch(() => '')
+  const raw = await res.text()
   let data = {}
   try {
     data = raw ? JSON.parse(raw) : {}
@@ -713,7 +718,12 @@ export async function sendTelegramNotify(cfg, message, opts = {}) {
     data = { description: raw }
   }
   if (!res.ok || data.ok === false) {
-    throw new Error(redactTelegramError(data.description || `telegram_http_${res.status}`, tg.bot_token))
+    throw Object.assign(
+      new Error(redactTelegramError(data.description || `telegram_http_${res.status}`, tg.bot_token)),
+      {
+        notificationAttemptEnded: true,
+      },
+    )
   }
   return { ok: true, channel: 'telegram', chat_id: tg.chat_id }
 }
@@ -771,7 +781,7 @@ export async function sendWecomNotify(cfg, message, opts = {}) {
   } catch (err) {
     throw new Error(redactWecomError(err?.message || err, cfg))
   }
-  const raw = await res.text().catch(() => '')
+  const raw = await res.text()
   let data = {}
   try {
     data = raw ? JSON.parse(raw) : {}
@@ -781,7 +791,7 @@ export async function sendWecomNotify(cfg, message, opts = {}) {
   if (!res.ok || (data.errcode != null && Number(data.errcode) !== 0)) {
     const reason =
       data.errcode != null ? `wecom_${data.errcode} ${data.errmsg || ''}`.trim() : `wecom_http_${res.status}`
-    throw new Error(redactWecomError(reason, cfg))
+    throw Object.assign(new Error(redactWecomError(reason, cfg)), { notificationAttemptEnded: true })
   }
   return { ok: true, channel: 'wecom' }
 }
@@ -794,25 +804,41 @@ export async function dispatchNotify(cfg, message, opts = {}) {
     try {
       results.push(await sendEmailNotify(cfg, message, opts))
     } catch (err) {
-      results.push({ ok: false, channel: 'email', error: String(err?.message || err).slice(0, 180) })
+      results.push({
+        ok: false,
+        uncertain: err?.notificationAttemptEnded !== true,
+        channel: 'email',
+        error: String(err?.message || err).slice(0, 180),
+      })
     }
   }
   if (ready.telegram) {
     try {
       results.push(await sendTelegramNotify(cfg, message, opts))
     } catch (err) {
-      results.push({ ok: false, channel: 'telegram', error: String(err?.message || err).slice(0, 180) })
+      results.push({
+        ok: false,
+        uncertain: err?.notificationAttemptEnded !== true,
+        channel: 'telegram',
+        error: String(err?.message || err).slice(0, 180),
+      })
     }
   }
   if (ready.wecom) {
     try {
       results.push(await sendWecomNotify(cfg, message, opts))
     } catch (err) {
-      results.push({ ok: false, channel: 'wecom', error: String(err?.message || err).slice(0, 180) })
+      results.push({
+        ok: false,
+        uncertain: err?.notificationAttemptEnded !== true,
+        channel: 'wecom',
+        error: String(err?.message || err).slice(0, 180),
+      })
     }
   }
   return {
     ok: results.some((row) => row.ok),
+    uncertain: results.some((row) => row.uncertain),
     results,
   }
 }
@@ -841,6 +867,9 @@ export async function sendNotifyTest(cfg, channel, extra = {}) {
 }
 
 export function createNotifyMonitor(opts = {}) {
+  const tasks = backgroundTasksFor(opts.sharedTasks)
+  const settings = tasks ? new SettingsRepo(tasks.db) : null
+  const routing = tasks ? new RoutingConfigRepo(tasks.db) : null
   let config = normalizeNotifyConfig(opts.config)
   let snapshot = null
   let lastEvents = []
@@ -850,6 +879,22 @@ export function createNotifyMonitor(opts = {}) {
   let timer = null
   const lastSent = new Map()
   const nowFn = opts.now || (() => Date.now())
+
+  const restoreState = (state = {}) => {
+    snapshot = state.snapshot || null
+    lastEvents = state.last_events || []
+    lastError = state.last_error || null
+    lastRunAt = state.last_run_at || 0
+    lastSent.clear()
+    for (const [key, value] of Object.entries(state.last_sent || {})) lastSent.set(key, value)
+  }
+  const persistedState = () => ({
+    snapshot,
+    last_events: lastEvents,
+    last_error: lastError,
+    last_run_at: lastRunAt,
+    last_sent: Object.fromEntries(lastSent),
+  })
 
   const getConfig = () => config
   const getSnapshot = () => snapshot
@@ -868,55 +913,91 @@ export function createNotifyMonitor(opts = {}) {
     return now - prev >= wait * 1000
   }
 
-  const runOnce = async ({ send = true, force = false, digest = false } = {}) => {
+  const check = async ({ send = true, force = false, digest = false } = {}, { started = nowFn(), persist } = {}) => {
+    const checkConfig = config
+    lastRunAt = started
+    let deliveryError = null
+    let delivered = false
+    let uncertain = false
+    const next = typeof opts.snapshot === 'function' ? await opts.snapshot() : null
+    const prev = snapshot
+    snapshot = next
+    const events = detectPoolNotifyEvents(prev, next, checkConfig)
+    if (digest || (checkConfig.events.digest && (!prev || allowed('digest', started)))) {
+      events.push({ type: 'digest', title: EVENT_TITLES.digest })
+    }
+    lastEvents = events
+    // Commit the observation before contacting a provider. The durable task
+    // claim keeps a crash or unknown send from being replayed by another Pod.
+    if (persist) await persist()
+    const dispatched = []
+    const canSend =
+      send && checkConfig.enabled && (typeof opts.send === 'function' || notifyChannelsReady(checkConfig).any)
+    if (canSend) {
+      for (const event of events) {
+        if (!force && !digest && !allowed(event.type, started)) continue
+        const message = formatNotifyMessage(event, next, checkConfig, opts.baseUrl)
+        const sendFn = opts.send || ((msg) => dispatchNotify(checkConfig, msg))
+        try {
+          const result = await sendFn(message, event)
+          uncertain ||= result?.uncertain === true
+          lastSent.set(event.type, started)
+          const failedChannels = Array.isArray(result?.results) ? result.results.filter((row) => row?.ok === false) : []
+          if (result?.ok === false || failedChannels.length) {
+            deliveryError = String(
+              failedChannels.map((row) => row.error || 'notify_delivery_failed').join('; ') ||
+                result?.error ||
+                'notify_delivery_failed',
+            ).slice(0, 180)
+          } else {
+            delivered = true
+          }
+          dispatched.push({ type: event.type, ok: result?.ok !== false, result })
+        } catch (err) {
+          uncertain = true
+          deliveryError = String(err?.message || err).slice(0, 180)
+          dispatched.push({ type: event.type, ok: false, error: deliveryError })
+        }
+        if (tasks && uncertain) break
+      }
+    }
+    // A quiet/cooldown-suppressed check is not proof of delivery recovery.
+    // Any failure in this batch takes precedence over successful events.
+    if (deliveryError !== null) lastError = deliveryError
+    else if (delivered) lastError = null
+    if (persist) await persist()
+    return { snapshot: next, events, dispatched, prev, ...(tasks ? { uncertain } : {}) }
+  }
+
+  const sharedCheck = async (options, scheduled) => {
+    const plan = scheduled
+      ? { taskKey: 'notify-monitor', intervalMs: config.interval_sec * 1000 }
+      : { taskKey: 'notify-monitor', executionId: randomUUID() }
+    const result = await tasks.run(plan, async () => {
+      const current = await routing.get()
+      if (!current)
+        throw Object.assign(new Error('shared routing configuration missing'), { code: 'routing_config_unavailable' })
+      config = normalizeNotifyConfig(current.config.notify)
+      const previous = await settings.get(NOTIFY_STATE_KEY, {})
+      restoreState(previous)
+      try {
+        const value = await check(options, {
+          started: await tasks.now(),
+          persist: () => settings.set(NOTIFY_STATE_KEY, persistedState()),
+        })
+        return { terminal: !value.uncertain, value }
+      } catch (error) {
+        restoreState(previous)
+        throw error
+      }
+    })
+    return result.ran ? result.value : { snapshot, events: [], dispatched: [], prev: snapshot, code: result.code }
+  }
+
+  const runOnce = async (options = {}, scheduled = false) => {
     if (inflight) return inflight
     inflight = (async () => {
-      const started = nowFn()
-      lastRunAt = started
-      let deliveryError = null
-      let delivered = false
-      const next = typeof opts.snapshot === 'function' ? await opts.snapshot() : null
-      const prev = snapshot
-      snapshot = next
-      const events = detectPoolNotifyEvents(prev, next, config)
-      if (digest || (config.events.digest && (!prev || allowed('digest', started)))) {
-        events.push({ type: 'digest', title: EVENT_TITLES.digest })
-      }
-      lastEvents = events
-      const dispatched = []
-      const canSend = send && config.enabled && (typeof opts.send === 'function' || notifyChannelsReady(config).any)
-      if (canSend) {
-        for (const event of events) {
-          if (!force && !digest && !allowed(event.type, started)) continue
-          const message = formatNotifyMessage(event, next, config, opts.baseUrl)
-          const sendFn = opts.send || ((msg) => dispatchNotify(config, msg))
-          try {
-            const result = await sendFn(message, event)
-            lastSent.set(event.type, started)
-            const failedChannels = Array.isArray(result?.results)
-              ? result.results.filter((row) => row?.ok === false)
-              : []
-            if (result?.ok === false || failedChannels.length) {
-              deliveryError = String(
-                failedChannels.map((row) => row.error || 'notify_delivery_failed').join('; ') ||
-                  result?.error ||
-                  'notify_delivery_failed',
-              ).slice(0, 180)
-            } else {
-              delivered = true
-            }
-            dispatched.push({ type: event.type, ok: result?.ok !== false, result })
-          } catch (err) {
-            deliveryError = String(err?.message || err).slice(0, 180)
-            dispatched.push({ type: event.type, ok: false, error: deliveryError })
-          }
-        }
-      }
-      // A quiet/cooldown-suppressed check is not proof of delivery recovery.
-      // Any failure in this batch takes precedence over successful events.
-      if (deliveryError !== null) lastError = deliveryError
-      else if (delivered) lastError = null
-      return { snapshot: next, events, dispatched, prev }
+      return tasks ? await sharedCheck(options, scheduled) : await check(options)
     })().finally(() => {
       inflight = null
     })
@@ -934,12 +1015,12 @@ export function createNotifyMonitor(opts = {}) {
     stop()
     if (!config.enabled) return { started: false, reason: 'disabled' }
     timer = setInterval(() => {
-      runOnce().catch(() => {})
+      runOnce({}, true).catch(() => {})
     }, config.interval_sec * 1000)
     if (typeof timer.unref === 'function') timer.unref()
     if (immediate && config.run_on_start) {
       queueMicrotask(() => {
-        runOnce().catch(() => {})
+        runOnce({}, true).catch(() => {})
       })
     }
     return { started: true, interval_sec: config.interval_sec, run_on_start: config.run_on_start }
@@ -958,6 +1039,9 @@ export function createNotifyMonitor(opts = {}) {
     getStatus,
     runOnce,
     start,
+    flush: async () => {
+      while (inflight) await inflight
+    },
     stop,
   }
 }

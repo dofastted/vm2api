@@ -515,8 +515,9 @@ function mirrorCodex(vm, account) {
  * SOCKS rows, never px-local or a platform/other-tenant row with equal credentials.
  * Runs before any file is written so a refused package leaves nothing behind.
  */
-function proxyBindAllowed(spec, vm, role, proxyPool) {
+async function proxyBindAllowed(spec, vm, role, proxyPool) {
   if (!spec.proxy) return true
+  await proxyPool.refresh?.()
   let owner = null
   if (spec.proxy.kind === 'local') {
     if (role === 'user') return false
@@ -529,23 +530,23 @@ function proxyBindAllowed(spec, vm, role, proxyPool) {
 
 async function attachProxy(projectRoot, id, spec, proxyPool, ownerUserId) {
   if (!spec.proxy) {
-    proxyPool.unbindVm?.(id)
+    await proxyPool.unbindVm?.(id)
     bindVmProxy(projectRoot, id, null)
     return { ok: true }
   }
   if (spec.proxy.kind === 'local') {
-    const ensured = proxyPool.ensureLocal()
+    const ensured = await proxyPool.ensureLocal()
     const proxyId = ensured?.proxy?.id
     if (!proxyId) return fail('proxy_import_failed', '本机直连出口不可用')
-    const bound = proxyPool.bind(proxyId, id)
+    const bound = await proxyPool.bind(proxyId, id)
     if (!bound.ok) return fail(bound.error || 'proxy_bind_failed', '绑定直连出口失败')
     // bind() lands a node slot on its own VPS's local row, not the control plane's.
     bindVmProxy(projectRoot, id, proxyPool.getProxyByIdWithAuth(bound.proxy?.id || proxyId))
     return { ok: true }
   }
-  const ensured = proxyPool.ensureSocks(spec.proxy, { ownerUserId, label: spec.proxy.label })
+  const ensured = await proxyPool.ensureSocks(spec.proxy, { ownerUserId, label: spec.proxy.label })
   if (!ensured.ok) return fail(ensured.error || 'invalid_proxy', 'SOCKS5 无法写入')
-  const bound = proxyPool.bind(ensured.proxy.id, id)
+  const bound = await proxyPool.bind(ensured.proxy.id, id)
   if (!bound.ok) {
     const message = bound.error === 'proxy_bind_limit' ? 'SOCKS5 绑定数量已满' : '绑定 SOCKS5 失败'
     return fail(bound.error || 'proxy_bind_failed', message)
@@ -601,10 +602,11 @@ export async function commitVmPackage({
   // Tenants cannot read or write seed-settings; a package must not smuggle them in either.
   if (owner.role === 'user') spec.vm.seed_policy = null
   const create = mode === 'create'
-  let id = create ? spec.id : targetId
+  let id = create ? targetId || spec.id : targetId
   let renamedFrom = null
   if (!isValidVmId(id)) return { ok: false, status: 400, error: { code: 'invalid_id', message: 'vm.id 无效' } }
   if (create && fs.existsSync(path.join(projectRoot, 'vms', `${id}.json`))) {
+    if (targetId) return { ok: false, status: 409, error: { code: 'vm_id_exists', message: 'VM identity exists' } }
     renamedFrom = id
     id = nextFreePackageVmId(projectRoot, occupied)
     const oldLabel = slotLabel(renamedFrom)
@@ -669,7 +671,7 @@ export async function commitVmPackage({
     }
     status = vm.status || 'stopped'
   }
-  if (!proxyBindAllowed(spec, vm, owner.role, proxyPool)) {
+  if (!(await proxyBindAllowed(spec, vm, owner.role, proxyPool))) {
     return { ok: false, status: 403, error: { code: 'proxy_forbidden', message: '无权绑定这个出口' } }
   }
   applyTraits(vm, spec)

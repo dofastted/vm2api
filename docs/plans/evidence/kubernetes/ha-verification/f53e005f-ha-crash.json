@@ -1,0 +1,71 @@
+{
+  "source_sha": "f53e005f4794782b0a8e0b4bb152f68d4a3a7aa0",
+  "boundary": "one task control-plane container killed via CRI timeout0; original synthetic node kept alive",
+  "checks": [
+    {
+      "name": "owner_killed_but_unfinished_original_node_keeps_capacity",
+      "passed": true,
+      "held": {
+        "keys": 1,
+        "executions": 1
+      }
+    },
+    {
+      "name": "original_completed_receipt_recovers_capacity_and_bills_once",
+      "passed": true,
+      "ledger": [
+        {
+          "outcome": "charged",
+          "command_id": "0f991d2e-2013-4f05-bda1-54087f4ed1e9",
+          "tokens_in": "5",
+          "tokens_out": "7"
+        }
+      ],
+      "held": {
+        "keys": 0,
+        "executions": 0
+      }
+    },
+    {
+      "name": "other_replicas_continue_and_new_request_succeeds",
+      "passed": true
+    }
+  ],
+  "target": {
+    "name": "vm2api-5ccbfd86f-68772",
+    "uid": "2ffcdd02-5520-4332-8934-0d4529e0e0f2",
+    "node": "k3d-vm2api-648-01a15dc9-server-0",
+    "containerId": "61b909fc65a6a8a73f331685d2b728279a4dd8cbdedcec016cc9b79b40acb2d2",
+    "imageID": "sha256:f2ce099f07273f1a187c01cfbbaffaee24f2cad57239b7627da917d17d5dcb3e",
+    "restartsBefore": 1
+  },
+  "commandId": "0f991d2e-2013-4f05-bda1-54087f4ed1e9",
+  "originalNodeBinding": {
+    "kind": "kernel",
+    "vmId": "command-vm",
+    "fence": {
+      "executor": {
+        "kind": "container",
+        "started_at": "2026-10-22T00:00:00.000000001Z",
+        "container_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "node_boot_id": "6d7ddbe3-d683-427d-bc46-cde2fc1e2e5a",
+        "docker_daemon_id": "synthetic-daemon"
+      },
+      "generation": "1",
+      "incarnation": "78b28d80f6a2ec29ad81ee8869a5799c"
+    },
+    "nodeId": "command-node",
+    "protocol": "KSG2"
+  },
+  "termination": {
+    "containerID": "containerd://61b909fc65a6a8a73f331685d2b728279a4dd8cbdedcec016cc9b79b40acb2d2",
+    "exitCode": 137,
+    "finishedAt": "2026-10-21T18:26:30Z",
+    "reason": "Error",
+    "startedAt": "2026-10-21T18:25:46Z"
+  },
+  "clientResult": {
+    "error": "TypeError"
+  },
+  "passed": true
+}

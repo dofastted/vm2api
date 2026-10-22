@@ -6,7 +6,7 @@
  */
 
 import crypto from 'node:crypto'
-import { resolveStoreDb } from '../db/database.mjs'
+import { resolveStoreDb, withTransaction } from '../db/database.mjs'
 import { UsersRepo } from '../db/repos/users-repo.mjs'
 import { clampVmCreateQuota } from './resource-owner.mjs'
 import { reclaimAssignedVms } from '../vm/vm-registry.mjs'
@@ -129,30 +129,30 @@ export class PanelUserStore {
     this.repo = new UsersRepo(db)
   }
 
-  list() {
-    return this.repo.list().map(publicUserView)
+  async list() {
+    return (await this.repo.list()).map(publicUserView)
   }
 
-  getById(id) {
-    return this.repo.getById(id)
+  async getById(id) {
+    return await this.repo.getById(id)
   }
 
-  getByUsername(username) {
-    return this.repo.getByUsername(username)
+  async getByUsername(username) {
+    return await this.repo.getByUsername(username)
   }
 
-  countEnabledAdmins() {
-    return this.repo.countEnabledRole('admin')
+  async countEnabledAdmins() {
+    return await this.repo.countEnabledRole('admin')
   }
 
-  bootstrapFromEnv({ username, password } = {}) {
+  async bootstrapFromEnv({ username, password } = {}) {
     const name = normalizeUsername(username)
     if (!name || !password) return null
-    const existing = this.repo.getByUsername(name)
+    const existing = await this.repo.getByUsername(name)
     if (existing) return publicUserView(existing)
     // Import the already accepted env credential; new passwords still go through assertPassword.
     return publicUserView(
-      this.repo.insert({
+      await this.repo.insert({
         id: crypto.randomUUID(),
         username: assertUsername(name),
         password_hash: hashPassword(password),
@@ -166,18 +166,18 @@ export class PanelUserStore {
     )
   }
 
-  authenticate(username, password) {
-    const rec = this.repo.getByUsername(username)
+  async authenticate(username, password) {
+    const rec = await this.repo.getByUsername(username)
     if (!rec || rec.enabled === false) return null
     if (!verifyPassword(password, rec.password_hash)) return null
     const next = { ...rec, last_login_at: nowIso(), updated_at: rec.updated_at }
-    this.repo.update(next)
+    await this.repo.touchLogin(rec.id, next.last_login_at)
     return publicUserView(next)
   }
 
-  create({ username, password, role = 'user', enabled = true, vm_create_quota = 0 } = {}) {
+  async create({ username, password, role = 'user', enabled = true, vm_create_quota = 0 } = {}) {
     const name = assertUsername(username)
-    if (this.repo.getByUsername(name)) {
+    if (await this.repo.getByUsername(name)) {
       const err = new Error('用户名已存在')
       err.code = 'username_exists'
       throw err
@@ -193,66 +193,78 @@ export class PanelUserStore {
       updated_at: nowIso(),
       last_login_at: null,
     }
-    return this.repo.insert(rec)
+    return await this.repo.insert(rec)
   }
 
-  update(id, patch = {}, { actorId = null } = {}) {
-    const rec = this.repo.getById(id)
-    if (!rec) return null
-    const next = { ...rec }
+  async update(id, patch = {}, { actorId = null } = {}) {
+    return withTransaction(this.db, async () => {
+      await this.db
+        .prepare("SELECT id FROM users WHERE role = 'admin' AND deleted_at IS NULL ORDER BY id FOR UPDATE")
+        .all()
 
-    if (patch.role != null) {
-      const role = assertRole(patch.role)
-      if (rec.role === 'admin' && role !== 'admin' && this.countEnabledAdmins() <= 1) {
-        const err = new Error('不能取消最后一个管理员')
+      const rec = await this.repo.getById(id, { forUpdate: true })
+      if (!rec) return null
+      const next = { ...rec }
+
+      if (patch.role != null) {
+        const role = assertRole(patch.role)
+        if (rec.role === 'admin' && role !== 'admin' && (await this.countEnabledAdmins()) <= 1) {
+          const err = new Error('不能取消最后一个管理员')
+          err.code = 'last_admin'
+          throw err
+        }
+        next.role = role
+      }
+
+      if (patch.enabled != null) {
+        const enabled = !!patch.enabled
+        if (rec.role === 'admin' && rec.enabled && !enabled && (await this.countEnabledAdmins()) <= 1) {
+          const err = new Error('不能停用最后一个管理员')
+          err.code = 'last_admin'
+          throw err
+        }
+        if (actorId && actorId === rec.id && !enabled) {
+          const err = new Error('不能停用当前登录账号')
+          err.code = 'self_disable'
+          throw err
+        }
+        next.enabled = enabled
+      }
+
+      if (patch.password != null && String(patch.password) !== '') {
+        next.password_hash = hashPassword(assertPassword(patch.password))
+      }
+
+      if (patch.vm_create_quota != null) {
+        next.vm_create_quota = clampVmCreateQuota(patch.vm_create_quota, rec.vm_create_quota || 0)
+      }
+
+      next.updated_at = nowIso()
+      return await this.repo.update(next)
+    })
+  }
+
+  async remove(id, { actorId = null } = {}) {
+    return withTransaction(this.db, async () => {
+      await this.db
+        .prepare("SELECT id FROM users WHERE role = 'admin' AND deleted_at IS NULL ORDER BY id FOR UPDATE")
+        .all()
+
+      const rec = await this.repo.getById(id)
+      if (!rec) return false
+      if (actorId && actorId === rec.id) {
+        const err = new Error('不能删除当前登录账号')
+        err.code = 'self_delete'
+        throw err
+      }
+      if (rec.role === 'admin' && rec.enabled && (await this.countEnabledAdmins()) <= 1) {
+        const err = new Error('不能删除最后一个管理员')
         err.code = 'last_admin'
         throw err
       }
-      next.role = role
-    }
-
-    if (patch.enabled != null) {
-      const enabled = !!patch.enabled
-      if (rec.role === 'admin' && rec.enabled && !enabled && this.countEnabledAdmins() <= 1) {
-        const err = new Error('不能停用最后一个管理员')
-        err.code = 'last_admin'
-        throw err
-      }
-      if (actorId && actorId === rec.id && !enabled) {
-        const err = new Error('不能停用当前登录账号')
-        err.code = 'self_disable'
-        throw err
-      }
-      next.enabled = enabled
-    }
-
-    if (patch.password != null && String(patch.password) !== '') {
-      next.password_hash = hashPassword(assertPassword(patch.password))
-    }
-
-    if (patch.vm_create_quota != null) {
-      next.vm_create_quota = clampVmCreateQuota(patch.vm_create_quota, rec.vm_create_quota || 0)
-    }
-
-    next.updated_at = nowIso()
-    return this.repo.update(next)
-  }
-
-  remove(id, { actorId = null } = {}) {
-    const rec = this.repo.getById(id)
-    if (!rec) return false
-    if (actorId && actorId === rec.id) {
-      const err = new Error('不能删除当前登录账号')
-      err.code = 'self_delete'
-      throw err
-    }
-    if (rec.role === 'admin' && rec.enabled && this.countEnabledAdmins() <= 1) {
-      const err = new Error('不能删除最后一个管理员')
-      err.code = 'last_admin'
-      throw err
-    }
-    // Validate deletion first; a failed slot write must leave the user available for retry.
-    if (this.projectRoot) reclaimAssignedVms(this.projectRoot, new Set([rec.id]))
-    return this.repo.remove(id)
+      // Validate deletion first; a failed slot write must leave the user available for retry.
+      if (this.projectRoot) reclaimAssignedVms(this.projectRoot, new Set([rec.id]))
+      return await this.repo.remove(id)
+    })
   }
 }

@@ -7,7 +7,8 @@
  * is quota_requests / quota_requests_used. Soft delete via deleted_at.
  */
 
-import { getDb } from '../database.mjs'
+import { getDb, withTransaction } from '../database.mjs'
+import { integerValue } from '../integers.mjs'
 
 const COLUMNS = [
   'id',
@@ -75,6 +76,16 @@ const NUMERIC_DEFAULT_0 = new Set([
   'usage_7d',
 ])
 
+const INTEGER_COUNTERS = new Set([
+  'quota_requests',
+  'quota_requests_used',
+  'requests',
+  'tokens_in',
+  'tokens_out',
+  'cache_read_tokens',
+  'cache_creation_tokens',
+])
+
 function rowToRec(row) {
   if (!row) return null
   return { ...row }
@@ -88,6 +99,7 @@ function toValue(rec, c) {
     if (c === 'allowed_vms') return '[]'
     return NUMERIC_DEFAULT_0.has(c) ? 0 : null
   }
+  if (INTEGER_COUNTERS.has(c)) return integerValue(v)
   return v
 }
 
@@ -95,63 +107,69 @@ export class ApiKeysRepo {
   constructor(db = getDb()) {
     this.db = db
     this._list = db.prepare('SELECT * FROM api_keys WHERE deleted_at IS NULL ORDER BY created_at')
-    this._get = db.prepare('SELECT * FROM api_keys WHERE id = ? AND deleted_at IS NULL')
-    this._getByKey = db.prepare('SELECT * FROM api_keys WHERE key = ? AND deleted_at IS NULL')
-    this._getByHash = db.prepare('SELECT * FROM api_keys WHERE key_hash = ? AND deleted_at IS NULL')
+    this._get = db.prepare('SELECT * FROM api_keys WHERE id = $1 AND deleted_at IS NULL')
+    this._getByKey = db.prepare('SELECT * FROM api_keys WHERE key = $1 AND deleted_at IS NULL')
+    this._getByHash = db.prepare('SELECT * FROM api_keys WHERE key_hash = $1 AND deleted_at IS NULL')
     this._insert = db.prepare(`
       INSERT INTO api_keys (${COLUMNS.join(', ')})
-      VALUES (${COLUMNS.map(() => '?').join(', ')})
+      VALUES (${COLUMNS.map((_, i) => '$' + (i + 1)).join(', ')})
     `)
-    this._delete = db.prepare('DELETE FROM api_keys WHERE id = ?')
+    this._delete = db.prepare('DELETE FROM api_keys WHERE id = $1')
     this._recordUsage = db.prepare(`
       UPDATE api_keys SET
         requests = requests + 1,
         quota_requests_used = quota_requests_used + 1,
-        tokens_in = tokens_in + ?,
-        tokens_out = tokens_out + ?,
-        cache_read_tokens = COALESCE(cache_read_tokens, 0) + ?,
-        cache_creation_tokens = COALESCE(cache_creation_tokens, 0) + ?,
-        quota_used = quota_used + ?,
-        usage_5h = ?, window_5h_start = ?,
-        usage_1d = ?, window_1d_start = ?,
-        usage_7d = ?, window_7d_start = ?,
-        last_used_at = ?,
-        updated_at = ?
-      WHERE id = ?
+        tokens_in = tokens_in + $1,
+        tokens_out = tokens_out + $2,
+        cache_read_tokens = COALESCE(cache_read_tokens, 0) + $3,
+        cache_creation_tokens = COALESCE(cache_creation_tokens, 0) + $4,
+        quota_used = quota_used + $5,
+        status = CASE WHEN status = 'active' AND quota > 0 AND quota_used + $5 >= quota THEN 'quota_exhausted' ELSE status END,
+        usage_5h = $6, window_5h_start = $7,
+        usage_1d = $8, window_1d_start = $9,
+        usage_7d = $10, window_7d_start = $11,
+        last_used_at = $12,
+        updated_at = $13
+      WHERE id = $14
     `)
   }
 
-  list() {
-    return this._list.all().map(rowToRec)
+  async list() {
+    return (await this._list.all()).map(rowToRec)
   }
 
-  getById(id) {
-    return rowToRec(this._get.get(id))
+  async getById(id, { forUpdate = false } = {}) {
+    return rowToRec(
+      await (forUpdate
+        ? this.db.prepare('SELECT * FROM api_keys WHERE id = $1 AND deleted_at IS NULL FOR UPDATE')
+        : this._get
+      ).get(id),
+    )
   }
 
-  getByKey(key) {
-    return rowToRec(this._getByKey.get(key))
+  async getByKey(key) {
+    return rowToRec(await this._getByKey.get(key))
   }
 
-  getByHash(hash) {
-    return rowToRec(this._getByHash.get(hash))
+  async getByHash(hash) {
+    return rowToRec(await this._getByHash.get(hash))
   }
 
-  insert(rec) {
-    this._insert.run(...COLUMNS.map((c) => toValue(rec, c)))
-    return this.getById(rec.id)
+  async insert(rec) {
+    await this._insert.run(...COLUMNS.map((c) => toValue(rec, c)))
+    return await this.getById(rec.id)
   }
 
   /** Full-row update from a record object (id immutable). */
-  update(rec) {
+  async update(rec) {
     const cols = COLUMNS.filter((c) => c !== 'id')
-    const sql = `UPDATE api_keys SET ${cols.map((c) => `${c} = ?`).join(', ')} WHERE id = ?`
-    this.db.prepare(sql).run(...cols.map((c) => toValue(rec, c)), rec.id)
-    return this.getById(rec.id)
+    const sql = `UPDATE api_keys SET ${cols.map((c, i) => `${c} = $${i + 1}`).join(', ')} WHERE id = $${cols.length + 1}`
+    await this.db.prepare(sql).run(...cols.map((c) => toValue(rec, c)), rec.id)
+    return await this.getById(rec.id)
   }
 
-  remove(id) {
-    const info = this._delete.run(id)
+  async remove(id) {
+    const info = await this._delete.run(id)
     return info.changes > 0
   }
 
@@ -167,33 +185,38 @@ export class ApiKeysRepo {
     return { usage: (Number(rec[key.usage]) || 0) + cost, start: rec[key.start] }
   }
 
-  recordUsage(id, { tokens_in = 0, tokens_out = 0, cache_read_tokens = 0, cache_creation_tokens = 0, cost = 0 } = {}) {
-    const rec = this.getById(id)
-    if (!rec) return null
-    const nowMs = Date.now()
-    const now = new Date(nowMs).toISOString()
-    const usd = Number(cost) || 0
-    const w = WINDOWS.map((win) => this._rollWindow(rec, win, usd, nowMs))
-    this._recordUsage.run(
-      Number(tokens_in) || 0,
-      Number(tokens_out) || 0,
-      Number(cache_read_tokens) || 0,
-      Number(cache_creation_tokens) || 0,
-      usd,
-      w[0].usage,
-      w[0].start,
-      w[1].usage,
-      w[1].start,
-      w[2].usage,
-      w[2].start,
-      now,
-      now,
-      id,
-    )
-    return this.getById(id)
+  async recordUsage(
+    id,
+    { tokens_in = 0, tokens_out = 0, cache_read_tokens = 0, cache_creation_tokens = 0, cost = 0 } = {},
+  ) {
+    return withTransaction(this.db, async () => {
+      const rec = await this.getById(id, { forUpdate: true })
+      if (!rec) return null
+      const nowMs = Date.now()
+      const now = new Date(nowMs).toISOString()
+      const usd = Number(cost) || 0
+      const w = WINDOWS.map((win) => this._rollWindow(rec, win, usd, nowMs))
+      await this._recordUsage.run(
+        integerValue(tokens_in),
+        integerValue(tokens_out),
+        integerValue(cache_read_tokens),
+        integerValue(cache_creation_tokens),
+        usd,
+        w[0].usage,
+        w[0].start,
+        w[1].usage,
+        w[1].start,
+        w[2].usage,
+        w[2].start,
+        now,
+        now,
+        id,
+      )
+      return await this.getById(id)
+    })
   }
 
-  count() {
-    return this.db.prepare('SELECT COUNT(*) c FROM api_keys WHERE deleted_at IS NULL').get().c
+  async count() {
+    return (await this.db.prepare('SELECT COUNT(*) c FROM api_keys WHERE deleted_at IS NULL').get()).c
   }
 }

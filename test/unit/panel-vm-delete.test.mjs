@@ -35,6 +35,7 @@ function handler(project) {
       return true
     },
     readBody: async () => ({}),
+    vmMutationOps: { destroySlot: async () => ({ ok: true, action: 'absent' }) },
     proxyPool: { unbindVm() {} },
   })
   return { handlePanel, response, cfg }
@@ -95,13 +96,13 @@ test('startup reconcile does not resurrect a deleted sole active VM', async () =
   const { setVmWriteHook } = await import('../../src/lib/vm/vm-file.mjs')
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-del-db-'))
   try {
-    openDatabase({ dataDir: path.join(root, 'data') })
+    await openDatabase({ dataDir: path.join(root, 'data') })
     seed(root, 'vm-01', { active: true })
-    initVmDbSync(root, { watch: false })
+    await initVmDbSync(root, { watch: false })
     const { handlePanel, response } = handler(root)
     await handlePanel({ method: 'DELETE' }, {}, new URL('http://localhost/api/panel/vms/vm-01'))
     assert.equal(response.status, 200, JSON.stringify(response.body))
-    const again = reconcileVms(root)
+    const again = await reconcileVms(root)
     assert.equal(again.rebuilt, 0)
     assert.equal(again.active, null)
     assert.equal(fs.existsSync(path.join(root, 'vms', 'vm-01.json')), false)
@@ -109,7 +110,7 @@ test('startup reconcile does not resurrect a deleted sole active VM', async () =
   } finally {
     stopVmWatch()
     setVmWriteHook(null)
-    closeDatabase()
+    await closeDatabase()
     fs.rmSync(root, { recursive: true, force: true })
   }
 })

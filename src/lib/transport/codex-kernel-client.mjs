@@ -41,24 +41,41 @@ function remapVia(result) {
   }
 }
 
+async function dispatchCodex(opts, send) {
+  let bound = false
+  let startFailed = false
+  let startError
+  const result = await send({
+    ...opts,
+    exec: withCodexKernelExec(opts.exec),
+    requestPath: '/internal/v1/codex/responses',
+    onExecutionStart:
+      typeof opts.onExecutionStart === 'function'
+        ? async (execution) => {
+            try {
+              await opts.onExecutionStart(execution)
+              bound = true
+            } catch (error) {
+              startFailed = true
+              startError = error
+              throw error
+            }
+          }
+        : opts.onExecutionStart,
+  })
+  if (startFailed) throw startError
+  if (typeof opts.onExecutionEnd === 'function' && (bound || typeof opts.onExecutionStart !== 'function')) {
+    await opts.onExecutionEnd(result?.execution)
+  }
+  return remapVia(result)
+}
+
 export async function callCodexKernel(opts = {}) {
-  return remapVia(
-    await callGoWorker({
-      ...opts,
-      exec: withCodexKernelExec(opts.exec),
-      requestPath: '/internal/v1/codex/responses',
-    }),
-  )
+  return dispatchCodex(opts, callGoWorker)
 }
 
 export async function streamCodexKernel(opts = {}) {
-  return remapVia(
-    await streamGoWorker({
-      ...opts,
-      exec: withCodexKernelExec(opts.exec),
-      requestPath: '/internal/v1/codex/responses',
-    }),
-  )
+  return dispatchCodex(opts, streamGoWorker)
 }
 
 export async function codexKernelHealth(exec, opts = {}) {

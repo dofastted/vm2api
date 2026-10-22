@@ -8,7 +8,9 @@
  *   worker_only             — ignore policy enabled flags for listing
  */
 
-import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { RuntimeSettings as SettingsRepo } from '../db/settings-state.mjs'
+import { getDb } from '../db/database.mjs'
+import { SettingsRepo as PersistentSettingsRepo } from '../db/repos/settings-repo.mjs'
 import {
   CONTEXT_1M_BETA,
   DEFAULT_CONTEXT_1M_WHITELIST,
@@ -537,18 +539,18 @@ function heuristicCapabilities(modelId = '') {
   return { ...CAP_46 }
 }
 
-export function loadModelPolicy({ force = false } = {}) {
+export async function loadModelPolicy({ force = false } = {}) {
   if (loaded && !force) return policy
   try {
     const repo = new SettingsRepo()
     const stored = repo.get(SETTINGS_KEY, null)
     if (stored) {
-      const persisted = persistHaiku55Model(repo, persistOpus55Model(repo, stored))
+      const persisted = await persistHaiku55Model(repo, await persistOpus55Model(repo, stored))
       policy = normalizePolicy(persisted)
       policy.source = policy.source || 'settings'
     } else {
       policy = seedDefaultPolicy()
-      repo.set(SETTINGS_KEY, policy)
+      await repo.set(SETTINGS_KEY, policy)
     }
   } catch {
     policy = seedDefaultPolicy()
@@ -558,7 +560,7 @@ export function loadModelPolicy({ force = false } = {}) {
 }
 
 /** Append Opus 5.5 onto an existing settings row. Does not reset other models. */
-function persistOpus55Model(repo, stored) {
+async function persistOpus55Model(repo, stored) {
   if (!stored || typeof stored !== 'object') return stored
   const seed = seedDefaultPolicy()
   const models = stored.models && typeof stored.models === 'object' ? { ...stored.models } : {}
@@ -580,7 +582,7 @@ function persistOpus55Model(repo, stored) {
   if (!dirty) return stored
   const next = { ...stored, models, aliases }
   try {
-    repo.set(SETTINGS_KEY, next)
+    await repo.set(SETTINGS_KEY, next)
   } catch {
     return next
   }
@@ -588,7 +590,7 @@ function persistOpus55Model(repo, stored) {
 }
 
 /** Append or migrate Haiku 5.5 onto an existing settings row. Does not reset other models. */
-function persistHaiku55Model(repo, stored) {
+async function persistHaiku55Model(repo, stored) {
   if (!stored || typeof stored !== 'object') return stored
   const seed = seedDefaultPolicy()
   const desired = seed.models[HAIKU_55_ID]
@@ -617,44 +619,49 @@ function persistHaiku55Model(repo, stored) {
   if (!dirty) return stored
   const next = { ...stored, models }
   try {
-    repo.set(SETTINGS_KEY, next)
+    await repo.set(SETTINGS_KEY, next)
   } catch {
     return next
   }
   return next
 }
 
+/** Apply a refreshed settings value without running startup migrations or writes. */
+export function refreshModelPolicy(stored) {
+  policy = normalizePolicy(stored)
+  loaded = true
+  return policy
+}
+
 export function getModelPolicy() {
-  if (!loaded) loadModelPolicy()
   return policy
 }
 
-export function saveModelPolicy(next) {
-  policy = normalizePolicy(next)
-  policy.updated_at = new Date().toISOString()
-  policy.source = 'panel'
-  try {
-    const repo = new SettingsRepo()
-    repo.set(SETTINGS_KEY, policy)
-  } catch (e) {
-    console.warn('[model-policy] persist failed', e?.message || e)
-  }
-  loaded = true
-  return policy
+export async function saveModelPolicy(next) {
+  const saved = normalizePolicy(next)
+  saved.updated_at = new Date().toISOString()
+  saved.source = 'panel'
+  const db = getDb()
+  await new PersistentSettingsRepo(db).set(SETTINGS_KEY, saved)
+  db.afterCommit(() => {
+    policy = saved
+    loaded = true
+  })
+  return saved
 }
 
-export function resetModelPolicy() {
-  policy = seedDefaultPolicy()
-  try {
-    const repo = new SettingsRepo()
-    repo.set(SETTINGS_KEY, policy)
-  } catch {}
-  loaded = true
-  return policy
+export async function resetModelPolicy() {
+  const saved = seedDefaultPolicy()
+  const db = getDb()
+  await new PersistentSettingsRepo(db).set(SETTINGS_KEY, saved)
+  db.afterCommit(() => {
+    policy = saved
+    loaded = true
+  })
+  return saved
 }
 
 export function resolvePolicyModelId(raw = '') {
-  if (!loaded) loadModelPolicy()
   const m = String(raw || '').trim()
   if (!m) return null
   const bare = m.split('/').filter(Boolean).pop() || m
@@ -678,7 +685,6 @@ export function resolvePolicyModelId(raw = '') {
 }
 
 export function getModelEntry(modelId = '') {
-  if (!loaded) loadModelPolicy()
   const key = resolvePolicyModelId(modelId)
   if (key && policy.models[key]) return { id: key, ...policy.models[key] }
   const id = key || String(modelId || '')
@@ -720,7 +726,6 @@ export function getBetaPolicy(modelId = '') {
 }
 
 export function getContext1mWhitelist() {
-  if (!loaded) loadModelPolicy()
   return normalizeContext1mWhitelist(policy.defaults?.context_1m_whitelist, DEFAULT_CONTEXT_1M_WHITELIST)
 }
 
@@ -738,7 +743,6 @@ export function resolveContext1mPass(
 }
 
 export function shouldPassContext1mByPolicy(modelId = '') {
-  if (!loaded) loadModelPolicy()
   return resolveContext1mPass(modelId, {
     entry: getModelEntry(modelId),
     whitelist: getContext1mWhitelist(),
@@ -775,7 +779,6 @@ function adaptiveOnlyThinking(thinking) {
 }
 
 export function normalizeThinkingByPolicy(body = {}) {
-  if (!loaded) loadModelPolicy()
   if (!body || typeof body !== 'object') return body
   if (policy.defaults.normalize_thinking === false) return body
   const thinking = body.thinking
@@ -912,7 +915,6 @@ export function applyBetaPolicyToHeader(
   modelId = '',
   { isOfficial = false, whitelist, want1m = false } = {},
 ) {
-  if (!loaded) loadModelPolicy()
   const pass =
     whitelist !== undefined
       ? resolveContext1mPass(modelId, {
@@ -946,14 +948,12 @@ export function unofficialMimicryBetaHeader(modelId = '') {
 
 /** All policy model ids that look like Claude catalog ids (disabled included). */
 export function getPolicyCatalogIds({ enabledOnly = false } = {}) {
-  if (!loaded) loadModelPolicy()
   return Object.entries(policy.models || {})
     .filter(([id, cfg]) => isCatalogModelId(id) && (!enabledOnly || cfg.enabled !== false))
     .map(([id]) => id)
 }
 
 export function filterPublicModelIds(workerIds = []) {
-  if (!loaded) loadModelPolicy()
   const mode = policy.catalog_mode || 'policy_only'
   const ids = [
     ...new Set(
@@ -972,7 +972,6 @@ export function filterPublicModelIds(workerIds = []) {
 }
 
 export function listPolicyModels() {
-  if (!loaded) loadModelPolicy()
   return Object.entries(policy.models)
     .map(([id, cfg]) => ({ id, ...cfg }))
     .sort((a, b) => (a.sort ?? 100) - (b.sort ?? 100) || a.id.localeCompare(b.id))
@@ -983,48 +982,53 @@ export function listPolicyModels() {
  * public only under worker_only; other modes add it disabled for the admin to enable.
  * `displayNameOf(id)` may supply a display name (models.dev) for new entries.
  */
-export function syncWorkerModelsIntoPolicy(workerIds = [], { displayNameOf = null } = {}) {
-  if (!loaded) loadModelPolicy()
+export async function syncWorkerModelsIntoPolicy(workerIds = [], { displayNameOf = null } = {}) {
+  const db = getDb()
   const added = []
-  const enabled = policy.catalog_mode === 'worker_only'
-  for (const workerId of workerIds || []) {
-    const id = workerId === FABLE_51_LEGACY_ID ? FABLE_51_ID : workerId === OPUS_55_LEGACY_ID ? OPUS_55_ID : workerId
-    if (!id || !isCatalogModelId(id)) continue
-    if (/^gpt/i.test(id)) continue
-    if (policy.models[id]) continue
-    const family = familyOfModelId(id)
-    const caps = heuristicCapabilities(id)
-    policy.models[id] = entry({
-      id,
-      display_name: displayNameOf?.(id) || id,
-      family,
-      capabilities: caps,
-      betas: family === 'codex' ? { required: [], drop: [CONTEXT_1M], pass_context_1m: false } : undefined,
-      params:
-        family === 'codex'
-          ? {
-              max_tokens_default: 16384,
-              max_tokens_cap: 128000,
-              on_adaptive: 'passthrough',
-              on_enabled: 'passthrough',
-            }
-          : {
-              on_adaptive: caps.supports_adaptive ? 'passthrough' : 'convert_to_enabled',
-              on_enabled: 'passthrough',
-            },
-    })
-    policy.models[id].enabled = enabled
-    // pass_context_1m left unset → inherit defaults.context_1m_whitelist
-    added.push(id)
-  }
-  if (added.length) {
-    policy.updated_at = new Date().toISOString()
-    policy.source = 'worker_merge'
-    try {
-      new SettingsRepo().set(SETTINGS_KEY, policy)
-    } catch {}
-  }
-  return { policy, added }
+  const next = await new PersistentSettingsRepo(db).update(SETTINGS_KEY, (current) => {
+    const next = normalizePolicy(current || seedDefaultPolicy())
+    const enabled = next.catalog_mode === 'worker_only'
+    for (const workerId of workerIds || []) {
+      const id = workerId === FABLE_51_LEGACY_ID ? FABLE_51_ID : workerId === OPUS_55_LEGACY_ID ? OPUS_55_ID : workerId
+      if (!id || !isCatalogModelId(id)) continue
+      if (/^gpt/i.test(id)) continue
+      if (next.models[id]) continue
+      const family = familyOfModelId(id)
+      const caps = heuristicCapabilities(id)
+      next.models[id] = entry({
+        id,
+        display_name: displayNameOf?.(id) || id,
+        family,
+        capabilities: caps,
+        betas: family === 'codex' ? { required: [], drop: [CONTEXT_1M], pass_context_1m: false } : undefined,
+        params:
+          family === 'codex'
+            ? {
+                max_tokens_default: 16384,
+                max_tokens_cap: 128000,
+                on_adaptive: 'passthrough',
+                on_enabled: 'passthrough',
+              }
+            : {
+                on_adaptive: caps.supports_adaptive ? 'passthrough' : 'convert_to_enabled',
+                on_enabled: 'passthrough',
+              },
+      })
+      next.models[id].enabled = enabled
+      // pass_context_1m left unset → inherit defaults.context_1m_whitelist
+      added.push(id)
+    }
+    if (added.length) {
+      next.updated_at = new Date().toISOString()
+      next.source = 'worker_merge'
+    }
+    return next
+  })
+  db.afterCommit(() => {
+    policy = next
+    loaded = true
+  })
+  return { policy: next, added }
 }
 
 /** Last-resort fill when the model has no policy default. Probe / short tests use this. */
@@ -1032,7 +1036,6 @@ export const FALLBACK_MAX_TOKENS = 4096
 
 /** Official per-model default for a missing caller max_tokens. Never overwrites inbound. */
 export function defaultMaxTokensForModel(modelId = '') {
-  if (!loaded) loadModelPolicy()
   const params = getModelParams(modelId)
   const n = Number(params.max_tokens_default)
   const cap = Number(params.max_tokens_cap)

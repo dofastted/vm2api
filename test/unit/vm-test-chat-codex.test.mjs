@@ -4,6 +4,7 @@ import http from 'node:http'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { getDb } from '../../src/lib/db/database.mjs'
 import {
   listTestableModels,
   resolveTestModels,
@@ -66,9 +67,9 @@ async function startLoopbackServer(t, respond) {
   return { baseUrl: `http://127.0.0.1:${server.address().port}`, calls }
 }
 
-test('listTestableModels(openai) hides Claude ids', () => {
-  const gpt = listTestableModels('openai')
-  const claude = listTestableModels('anthropic')
+test('listTestableModels(openai) hides Claude ids', async () => {
+  const gpt = await listTestableModels('openai')
+  const claude = await listTestableModels('anthropic')
   assert.ok(gpt.length > 0)
   assert.ok(claude.length > 0)
   assert.ok(gpt.every((m) => /^(gpt-|codex-)/i.test(m.id) || m.family === 'codex'))
@@ -230,6 +231,7 @@ test('resolveTestModels refresh merges ChatGPT ids and ignores 401', async (t) =
     projectRoot: root,
     vmId: 'vm-codex-01',
     refresh: true,
+    catalogClientVersion: '0.158.0',
     fetchImpl: async () => ({
       ok: true,
       status: 200,
@@ -239,6 +241,8 @@ test('resolveTestModels refresh merges ChatGPT ids and ignores 401', async (t) =
   assert.equal(merged.source, 'chatgpt')
   assert.ok(merged.items.some((m) => m.id === 'gpt-5.6'))
   assert.equal(merged.protocol, 'openai.responses')
+  const stored = (await getDb().query("SELECT value FROM settings WHERE key='gpt_model_policy'")).rows[0]
+  assert.equal(JSON.parse(stored.value).models['gpt-5.6'].id, 'gpt-5.6')
 
   const denied = await resolveTestModels({
     projectRoot: root,
@@ -284,6 +288,10 @@ test('syncCodexCatalog refreshes OAuth on 401 then merges GPT ids', async (t) =>
   assert.equal(result.ok, true)
   assert.ok(result.ids.includes('gpt-5.6'))
   assert.ok(result.ids.includes('gpt-5.5'))
+  const stored = (await getDb().query("SELECT value FROM settings WHERE key='gpt_model_policy'")).rows[0]
+  const models = JSON.parse(stored.value).models
+  assert.equal(models['gpt-5.6'].id, 'gpt-5.6')
+  assert.equal(models['gpt-5.5'].id, 'gpt-5.5')
   const saved = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-codex-01', 'codex-credentials.json'), 'utf8'))
   assert.equal(saved.accounts[0].access_token, 'at-rotated')
   assert.equal(saved.accounts[0].refresh_token, 'rt-rotated')
@@ -294,7 +302,7 @@ test('runVmTestChat Codex ENOENT is not rewritten as wrap cli-hop', async (t) =>
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   seedCodexVm(root)
   seedRouting(root)
-  const model = listTestableModels('openai')[0]?.id || 'gpt-5.5'
+  const model = (await listTestableModels('openai'))[0]?.id || 'gpt-5.5'
   const { baseUrl } = await startLoopbackServer(t, () => ({
     status: 503,
     body: {

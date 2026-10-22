@@ -1,0 +1,19 @@
+{
+  "source_sha": "48aa2a284ab057c2b525d5426c6e7dd1c74a744d",
+  "docker_image_config_id": "sha256:a362a7f9cf98a6de4399adad4b70c5f8e25fb6943b1e9a7b00b20e7ed452e002",
+  "containerd_image_id": "sha256:a4927a617e980e4ca20636810281b201f9d469f76107587fb8f9feaead95586e",
+  "rootfs_diff_ids_match": true,
+  "rootfs_layer_count": 24,
+  "rootfs_diff_ids_sha256": "4fef9951b1368c31922a79344fc7dc6b04b3ddce27b8c9b74951ec1de426ec64",
+  "runtime_pod": "vm2api-b6b455568-668kl",
+  "runtime_files_sha256": {
+    "src/server.mjs": "3c87b8534a0486030ed2cca85885c0f1dd058551bbfb7d14bf3914bcc5a60897",
+    "src/lib/core/ha-recovery-monitor.mjs": "a787e1b98be6af95d85d8bd265e578fecd9ff68c43ae4eb315dcd4e3cba0d440",
+    "src/lib/core/ha-request-billing.mjs": "4411f6e37bfad824c5de49d9b0cf0c2f507848ef104c7f45e8ceb492ab0ce37e",
+    "src/lib/db/global-maintenance.mjs": "d2e928ef142faf0cb1666dac1275c957af0c0576739314911bce38e650798051",
+    "src/lib/db/database.mjs": "a4cb51f852cdbb349fe25d52d23a33cd9010316ab0ce1d4c4ed93ca5b023b070",
+    "src/lib/cluster/node-credential-refresh-grants.mjs": "3f25249f9d293c38c1c9b7e9f2bd8dcdd8aae501636ec1b9bc21082b2c6db0bc",
+    "src/lib/db/node-management-authority.mjs": "eb810d961e028ba4e18836024c960319aa7101367e02e6c630fab6c3e77d869a",
+    "scripts/ha-node-bootstrap.mjs": "0abf715c0680a2355e7930c9ec4adaeda54993a143a8687a9b784d42e89e0ddf"
+  }
+}

@@ -9,6 +9,8 @@ import crypto from 'node:crypto'
 import { exchangeTokenViaCookieAuth } from './cookie-auth.mjs'
 import { enrichOauthIdentity, flattenOauthIdentity } from './oauth-identity.mjs'
 import { FULL_OAUTH_SCOPE } from './oauth-contract.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { OneTimeAuthRepo } from '../db/repos/one-time-auth-repo.mjs'
 
 export const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 export const SESSION_TTL_MS = 30 * 60 * 1000
@@ -107,7 +109,8 @@ export function resetAuthUrlSessions() {
   sessions.clear()
 }
 
-export function peekAuthUrlSession(sessionId) {
+export function peekAuthUrlSession(sessionId, { db } = {}) {
+  if (isKubernetesMode()) return new OneTimeAuthRepo(db).peekPkce('anthropic', sessionId)
   sweepExpired()
   return sessions.get(sessionId) || null
 }
@@ -119,7 +122,7 @@ export function buildAuthorizationURL(state, codeChallenge, scope = SCOPE_OAUTH,
   return `${spec.authorizeUrl}?code=true&client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodedRedirectURI}&scope=${encodedScope}&code_challenge=${codeChallenge}&code_challenge_method=S256&state=${state}`
 }
 
-export function generateAuthUrl({ vmId, proxyUrl, flavor } = {}) {
+export function generateAuthUrl({ vmId, proxyUrl, flavor, db } = {}) {
   sweepExpired()
   if (normalizeOauthFlavor(flavor) === 'claude_code') {
     throw fail('claude_code_in_slot', '官方 Claude Code 登录必须由槽内 cli-node 执行，不能由宿主机生成授权链接')
@@ -134,7 +137,7 @@ export function generateAuthUrl({ vmId, proxyUrl, flavor } = {}) {
   const codeChallenge = generateCodeChallenge(codeVerifier)
   const sessionId = generateSessionId()
   const createdAt = Date.now()
-  sessions.set(sessionId, {
+  const session = {
     state,
     codeVerifier,
     flavor: spec.flavor,
@@ -145,14 +148,21 @@ export function generateAuthUrl({ vmId, proxyUrl, flavor } = {}) {
     proxyUrl: proxyUrl === '' ? '' : String(proxyUrl),
     vmId: String(vmId),
     createdAt,
-  })
-  return {
+  }
+  const generated = {
     auth_url: buildAuthorizationURL(state, codeChallenge, spec.scope, spec.flavor),
     session_id: sessionId,
     expires_at: createdAt + SESSION_TTL_MS,
     vm_id: String(vmId),
     flavor: spec.flavor,
   }
+  if (isKubernetesMode()) {
+    return new OneTimeAuthRepo(db)
+      .issuePkce('anthropic', sessionId, session, SESSION_TTL_MS)
+      .then(({ expiresAt }) => ({ ...generated, expires_at: expiresAt }))
+  }
+  sessions.set(sessionId, session)
+  return generated
 }
 
 function parseAuthCode(fullCode) {
@@ -175,25 +185,31 @@ async function exchangeCodeForToken(authCode, codeVerifier, state, proxyUrl, ses
   })
 }
 
-export async function exchangeAuthCode({ sessionId, code, proxyUrl, vmId, fetchImpl = null } = {}) {
+export async function exchangeAuthCode({ sessionId, code, proxyUrl, vmId, fetchImpl = null, db } = {}) {
   sweepExpired()
-  const session = sessions.get(sessionId)
-  if (!session || Date.now() - session.createdAt > SESSION_TTL_MS) {
+  const parsed = parseAuthCode(code)
+  const store = isKubernetesMode() ? new OneTimeAuthRepo(db) : null
+  const validate = (session) => {
+    if (vmId && session.vmId && session.vmId !== String(vmId))
+      throw fail('session_vm_mismatch', '授权会话与当前虚拟机不匹配')
+    if (!parsed.code) throw fail('code_required', '请粘贴授权码')
+    if (session.flavor === 'setup_token' && parsed.state && parsed.state !== session.state)
+      throw fail('state_mismatch', '授权 state 不匹配，请重新生成授权链接')
+    if ((proxyUrl ?? session.proxyUrl) == null) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
+  }
+  const claim = store ? await store.claimPkce('anthropic', sessionId, validate) : null
+  const session = store ? claim.session : sessions.get(sessionId)
+  if (!session || (!store && Date.now() - session.createdAt > SESSION_TTL_MS)) {
     if (session) sessions.delete(sessionId)
     throw fail('session_expired', '授权会话不存在或已过期，请重新生成授权链接')
   }
-  if (vmId && session.vmId && session.vmId !== String(vmId)) {
-    throw fail('session_vm_mismatch', '授权会话与当前虚拟机不匹配')
-  }
-  const parsed = parseAuthCode(code)
-  if (!parsed.code) throw fail('code_required', '请粘贴授权码')
-  if (session.flavor === 'setup_token' && parsed.state && parsed.state !== session.state)
-    throw fail('state_mismatch', '授权 state 不匹配，请重新生成授权链接')
+  if (!store) validate(session)
   const px = proxyUrl ?? session.proxyUrl
-  if (px == null) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
+  const consume = () =>
+    store ? store.finishPkce('anthropic', sessionId, claim.claimId, true) : sessions.delete(sessionId)
 
   if (process.env.KIN_FAKE_SESSION_OAUTH === '1' || process.env.KIN_FAKE_SESSION_OAUTH === 'true') {
-    sessions.delete(sessionId)
+    await consume()
     const now = Math.floor(Date.now() / 1000)
     return {
       access_token: 'sk-ant-oat01-FAKE-AUTH-URL',
@@ -213,8 +229,14 @@ export async function exchangeAuthCode({ sessionId, code, proxyUrl, vmId, fetchI
   // Full OAuth paste codes carry the provider's exchange state, not necessarily
   // the authorize nonce. PKCE still binds the code to this VM's live session.
   const exchangeState = session.flavor === 'setup_token' ? parsed.state || session.state : parsed.state
-  const token = await exchangeCodeForToken(parsed.code, session.codeVerifier, exchangeState, px, session)
-  sessions.delete(sessionId)
+  let token
+  try {
+    token = await exchangeCodeForToken(parsed.code, session.codeVerifier, exchangeState, px, session)
+  } catch (error) {
+    if (store) await store.finishPkce('anthropic', sessionId, claim.claimId, false)
+    throw error
+  }
+  await consume()
   const expiresIn = Number(token.expires_in || 0)
   const now = Math.floor(Date.now() / 1000)
   const identity = flattenOauthIdentity(token)

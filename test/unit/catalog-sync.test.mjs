@@ -27,17 +27,17 @@ function seedClaudeVm(root, id) {
   )
 }
 
-function withDb(t, catalogMode) {
+async function withDb(t, catalogMode) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-catalog-sync-'))
-  openDatabase({ dbPath: ':memory:' })
-  if (catalogMode) new SettingsRepo().set('model_policy', { catalog_mode: catalogMode, models: {} })
-  loadModelPolicy({ force: true })
-  loadGptModelPolicy({ force: true })
+  await openDatabase({ dbPath: ':memory:' })
+  if (catalogMode) await new SettingsRepo().set('model_policy', { catalog_mode: catalogMode, models: {} })
+  await loadModelPolicy({ force: true })
+  await loadGptModelPolicy({ force: true })
   clearModelsCache()
-  t.after(() => {
-    closeDatabase()
-    loadModelPolicy({ force: true })
-    loadGptModelPolicy({ force: true })
+  t.after(async () => {
+    await closeDatabase()
+    await loadModelPolicy({ force: true })
+    await loadGptModelPolicy({ force: true })
     clearModelsCache()
     fs.rmSync(root, { recursive: true, force: true })
   })
@@ -47,7 +47,7 @@ function withDb(t, catalogMode) {
 const upstream = (ids) => async () => ({ ok: true, status: 200, body: { data: ids.map((id) => ({ id })) } })
 
 test('a Claude id new to the policy is added disabled outside worker_only', async (t) => {
-  const root = withDb(t, 'policy_only')
+  const root = await withDb(t, 'policy_only')
   seedClaudeVm(root, 'vm-1')
   const before = getModelPolicy().models['claude-opus-5']
   const status = await syncClaudeCatalog({
@@ -63,14 +63,14 @@ test('a Claude id new to the policy is added disabled outside worker_only', asyn
 })
 
 test('worker_only publishes a new Claude id immediately', async (t) => {
-  const root = withDb(t, 'worker_only')
+  const root = await withDb(t, 'worker_only')
   seedClaudeVm(root, 'vm-1')
   await syncClaudeCatalog({ projectRoot: root, runOauth: upstream(['claude-opus-6-preview']) })
   assert.equal(getModelPolicy().models['claude-opus-6-preview'].enabled, true)
 })
 
 test('Claude sync without a reachable slot records the failure and changes nothing', async (t) => {
-  const root = withDb(t, 'policy_only')
+  const root = await withDb(t, 'policy_only')
   seedClaudeVm(root, 'vm-1')
   const before = structuredClone(getModelPolicy().models)
   const status = await syncClaudeCatalog({
@@ -82,9 +82,9 @@ test('Claude sync without a reachable slot records the failure and changes nothi
   assert.deepEqual(getModelPolicy().models, before)
 })
 
-test('a GPT id new to the policy starts disabled; known ids keep their switch', (t) => {
-  withDb(t)
-  const result = syncGptIdsIntoPolicy([{ id: 'gpt-5.6' }, { id: 'gpt-7-preview' }])
+test('a GPT id new to the policy starts disabled; known ids keep their switch', async (t) => {
+  await withDb(t)
+  const result = await syncGptIdsIntoPolicy([{ id: 'gpt-5.6' }, { id: 'gpt-7-preview' }])
   assert.deepEqual(result.added, ['gpt-7-preview'])
   const models = getGptModelPolicy().models
   assert.equal(models['gpt-5.6'].enabled, true)

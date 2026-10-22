@@ -1,5 +1,5 @@
 /**
- * Per-account Claude usage quota tracker (SQLite-backed).
+ * Per-account Claude usage quota tracker backed by PostgreSQL.
  *
  * Scheduling and list Extra come from Messages response headers.
  * Official GET /api/oauth/usage is a manual calibration hop that writes
@@ -10,7 +10,9 @@
  */
 
 import { resolveStoreDb } from '../db/database.mjs'
-import { AccountsRepo } from '../db/repos/accounts-repo.mjs'
+import { addInteger } from '../db/integers.mjs'
+import { accountChanges, AccountsRepo } from '../db/repos/accounts-repo.mjs'
+import { WriteQueue } from './write-queue.mjs'
 import { computeWeeklySplit, weeklySplitConfig } from './weekly-split.mjs'
 import {
   applyEffectiveWindows,
@@ -60,7 +62,16 @@ export { estimateRequestRisk }
 export class AccountQuota {
   constructor({ dataDir, db, config, accounts }) {
     this.db = resolveStoreDb({ db, dataDir })
-    this.repo = new AccountsRepo(this.db)
+    this.persistence = new AccountsRepo(this.db)
+    this.writes = this.db.schedulingWriteQueue ||= new WriteQueue(this.db)
+    this.rows = new Map()
+    this.revisions = new Map()
+    this.refreshStarted = 0
+    this.refreshPublished = 0
+    this.observationTail = Promise.resolve()
+    this.allocations = new Map()
+    this.seedAccounts = accounts || []
+    this.repo = this._workingSet()
     this.config = config?.quota || {
       safety_ratio: 0.85,
       weekly_safety_ratio: 0.8,
@@ -78,17 +89,115 @@ export class AccountQuota {
     this.sessions = config?.sessions instanceof SessionLimitRegistry ? config.sessions : new SessionLimitRegistry()
     // vm_id → normalized `vm.policy.quota`; vm.json is the source of truth, this is the hot-path copy.
     this.vmQuota = new Map()
-    // seed accounts
-    for (const a of accounts || []) this.ensure(a)
   }
 
-  /** Kept for API compat + post-restore hook (no in-memory cache to refresh). */
-  reload() {}
+  /** Load persisted counters and allocations; restore reload omits startup seed accounts. */
+  async init({ seed = true } = {}) {
+    for (const queue of this.db.pendingWriteQueues || []) await queue.flush()
+    for (const row of await this.persistence.list()) {
+      this.rows.set(row.account_id, row)
+      this.allocations.set(row.account_id, await this.persistence.recentAllocations(row.account_id, 50))
+    }
+    if (seed) for (const account of this.seedAccounts) this.ensure(account)
+    await this.flush()
+    return this
+  }
+
+  async reload() {
+    await this.flush()
+    this.rows.clear()
+    this.allocations.clear()
+    return await this.init({ seed: false })
+  }
+
+  /** Refresh committed account rows without replacing transient state or allocation history. */
+  async refresh() {
+    await this.flush()
+    const refresh = ++this.refreshStarted
+    const revisions = new Map(this.revisions)
+    const rows = await this.persistence.list()
+    if (refresh < this.refreshPublished) return
+    this.refreshPublished = refresh
+    const present = new Set(rows.map((row) => row.account_id))
+    for (const row of rows) {
+      if (this.revisions.get(row.account_id) === revisions.get(row.account_id)) this.rows.set(row.account_id, row)
+    }
+    for (const id of this.rows.keys()) {
+      if (!present.has(id) && this.revisions.get(id) === revisions.get(id)) this.rows.delete(id)
+    }
+  }
+
+  flush() {
+    return this.writes.flush()
+  }
+
+  _workingSet() {
+    const publish = (account, write) => {
+      const next = structuredClone(account)
+      const revision = (this.revisions.get(next.account_id) || 0) + 1
+      this.revisions.set(next.account_id, revision)
+      this.rows.set(next.account_id, next)
+      this.writes.enqueue(async () => {
+        const stored = await write()
+        // A completed write may carry remote changes, but must not erase a newer local mutation.
+        if (stored && this.revisions.get(next.account_id) === revision) this.rows.set(next.account_id, stored)
+        return stored
+      })
+      return structuredClone(next)
+    }
+    const save = (account, { observation, conditional = true, paths, probeBase } = {}) => {
+      const changes = accountChanges(this.rows.get(account.account_id) || {}, account, { paths })
+      const ticket = changes.observations.length ? (observation ?? this.beginObservation()) : null
+      // The ordered queue awaits the ticket; attach its rejection handler immediately.
+      if (ticket?.catch) ticket.catch(() => {})
+      return publish(account, () =>
+        this.persistence.applyChanges(account.account_id, changes, {
+          observation: ticket,
+          conditional,
+          probeBase,
+        }),
+      )
+    }
+    return {
+      get: (id) => structuredClone(this.rows.get(id) || null),
+      list: () => [...this.rows.values()].map((row) => structuredClone(row)),
+      insert: (row) => publish(row, () => this.persistence.insert(row)),
+      save: (row) => save(row),
+      observe: (row, options) => save(row, { ...options, conditional: false }),
+      patch: (id, fields) =>
+        publish({ ...this.rows.get(id), ...fields, account_id: id }, () =>
+          this.persistence.applyChanges(id, { fields }),
+        ),
+      remove: (id) => {
+        this.revisions.set(id, (this.revisions.get(id) || 0) + 1)
+        const removed = this.rows.delete(id)
+        this.allocations.delete(id)
+        this.writes.enqueue(() => this.persistence.remove(id))
+        return removed
+      },
+      addAllocation: (id, input, { max = 50 } = {}) => {
+        const allocation = { ...input, at: input.at || new Date().toISOString() }
+        this.allocations.set(id, [...(this.allocations.get(id) || []), structuredClone(allocation)].slice(-max))
+        this.writes.enqueue(() => this.persistence.addAllocation(id, allocation, { max }))
+      },
+      recentAllocations: (id, limit = 5) => structuredClone((this.allocations.get(id) || []).slice(-limit)),
+      allocationCount: (id) => (this.allocations.get(id) || []).length,
+    }
+  }
+
+  /** Reserve before remote I/O when the producer can identify when an observation starts. */
+  beginObservation() {
+    const observation = this.observationTail.then(() => this.persistence.beginObservation())
+    this.observationTail = observation.catch(() => {})
+    return observation
+  }
 
   /** Re-bind to a fresh DB connection (after backup restore). */
-  rebind(db) {
+  async rebind(db) {
+    await this.flush()
     this.db = db
-    this.repo = new AccountsRepo(db)
+    this.persistence = new AccountsRepo(db)
+    return await this.reload()
   }
 
   /**
@@ -99,7 +208,7 @@ export class AccountQuota {
     this.runtimeRepo = runtimeRepo || null
   }
 
-  _writeSessionWindow(acc) {
+  _writeSessionWindow(acc, { observation } = {}) {
     if (!this.runtimeRepo?.updateWindow || !acc) return
     const extra = headerWindow(acc.unified, '5h')
     const w5 = extra.utilization != null || extra.status || extra.reset ? extra : officialWindow(acc.unified, '5h')
@@ -108,6 +217,7 @@ export class AccountQuota {
     try {
       this.runtimeRepo.updateWindow(acc.account_id, {
         vmId: acc.vm_id || null,
+        observation,
         sessionWindowEnd: Number.isFinite(endMs)
           ? endMs
           : Number.isFinite(parseResetMs(endIso))
@@ -153,9 +263,10 @@ export class AccountQuota {
         last_error: null,
       })
     } else if ((account.vm_id && acc.vm_id !== account.vm_id) || (account.type && acc.type !== account.type)) {
-      if (account.vm_id) acc.vm_id = account.vm_id
-      if (account.type) acc.type = account.type
-      acc = this.repo.save(acc)
+      acc = this.repo.patch(id, {
+        ...(account.vm_id ? { vm_id: account.vm_id } : {}),
+        ...(account.type ? { type: account.type } : {}),
+      })
     }
     return acc
   }
@@ -165,6 +276,7 @@ export class AccountQuota {
    * headers: Headers | plain object (lower-cased keys preferred)
    */
   ingestHeaders(accountId, headers, usageBody = null, extra = {}) {
+    const observation = extra.observation ?? this.beginObservation()
     const acc = this.ensure({ account_id: accountId })
     const h = normalizeHeaders(headers)
     acc.unified.headers = acc.unified.headers || {}
@@ -175,6 +287,16 @@ export class AccountQuota {
     const writeExtra = countRequest || exhausted
     const u5 = num(h['anthropic-ratelimit-unified-5h-utilization'])
     const u7 = num(h['anthropic-ratelimit-unified-7d-utilization'])
+    const paths = []
+    for (const key of ['5h', '7d']) {
+      if (!writeExtra) continue
+      const prefix = `anthropic-ratelimit-unified-${key}-`
+      if (h[`${prefix}utilization`] != null) {
+        paths.push(['unified', 'headers', key, 'utilization'], ['unified', 'headers', key, 'status'])
+      }
+      if (h[`${prefix}status`]) paths.push(['unified', 'headers', key, 'status'])
+      if (h[`${prefix}reset`]) paths.push(['unified', 'headers', key, 'reset'])
+    }
     let sampled = false
     if (exhausted) {
       dropElapsedReset(acc, '5h', h['anthropic-ratelimit-unified-5h-reset'])
@@ -237,12 +359,12 @@ export class AccountQuota {
         usage.cache_read_tokens != null ||
         usage.cache_creation_tokens != null)
     ) {
-      acc.tokens_in += Number(usage.input_tokens) || 0
-      acc.tokens_out += Number(usage.output_tokens) || 0
-      acc.cache_read_tokens = (acc.cache_read_tokens || 0) + (Number(usage.cache_read_tokens) || 0)
-      acc.cache_creation_tokens = (acc.cache_creation_tokens || 0) + (Number(usage.cache_creation_tokens) || 0)
+      acc.tokens_in = addInteger(acc.tokens_in, usage.input_tokens || 0)
+      acc.tokens_out = addInteger(acc.tokens_out, usage.output_tokens || 0)
+      acc.cache_read_tokens = addInteger(acc.cache_read_tokens, usage.cache_read_tokens || 0)
+      acc.cache_creation_tokens = addInteger(acc.cache_creation_tokens, usage.cache_creation_tokens || 0)
     }
-    if (countRequest) acc.requests += 1
+    if (countRequest) acc.requests = addInteger(acc.requests, 1)
 
     if (exhausted) applyHeaderExhausted(acc, h)
 
@@ -262,8 +384,8 @@ export class AccountQuota {
       })
     }
 
-    const saved = this.repo.save(acc)
-    this._writeSessionWindow(saved)
+    const saved = this.repo.observe(acc, { observation, paths })
+    this._writeSessionWindow(saved, { observation })
     if (sampled) {
       const observed5 = headerWindowOrEmpty(saved.unified, '5h')
       const observed7 = headerWindowOrEmpty(saved.unified, '7d')
@@ -276,7 +398,7 @@ export class AccountQuota {
     return saved
   }
 
-  recordLastProbe(accountId, probe = {}) {
+  recordLastProbe(accountId, probe = {}, { observation } = {}) {
     if (!accountId) return null
     const acc = this.ensure({ account_id: accountId })
     const prev = acc.last_probe || acc.unified?.last_probe || null
@@ -292,14 +414,19 @@ export class AccountQuota {
       status: probe.status || null,
     }
     acc.unified.last_probe = acc.last_probe
-    return this.repo.save(acc)
+    return this.repo.observe(acc, {
+      observation,
+      paths: [['unified', 'last_probe']],
+      ...(isTestProbeSource(probe) ? { probeBase: prev } : {}),
+    })
   }
 
   /**
    * CRS oauth/usage snapshot from the VM UID probe.
    * Fable weekly limit is stored separately and does not unschedulable the account.
    */
-  ingestOAuthUsage(accountId, probe = {}) {
+  ingestOAuthUsage(accountId, probe = {}, { observation } = {}) {
+    observation ??= this.beginObservation()
     const acc = this.ensure({ account_id: accountId })
     const nowIso = probe.probed_at || new Date().toISOString()
     if (isOfficialUsageRateLimited(probe)) {
@@ -320,12 +447,19 @@ export class AccountQuota {
         attempted_at: nowIso,
       }
       acc.unified.last_probe = acc.last_probe
-      return this.repo.save(acc)
+      return this.repo.observe(acc, { observation, probeBase: prev.at ? prev : null })
     }
     if (acc.unified) delete acc.unified.usage_rate_limited_until
     const official = probe.interpretations?.official || {}
     const w5 = official.five_hour || probe.five_hour || {}
     const w7 = official.seven_day || probe.seven_day || {}
+    const paths = [['unified', 'last_probe']]
+    for (const [key, window] of [
+      ['5h', w5],
+      ['7d', w7],
+    ]) {
+      if (applyOfficialWindow(window)) paths.push(['unified', key], ['unified', 'official', key])
+    }
     writeOfficialWindow(acc, '5h', w5)
     writeOfficialWindow(acc, '7d', w7)
     if (probe.seven_day_sonnet) {
@@ -382,6 +516,8 @@ export class AccountQuota {
       else if (probe.usage_has_fable === false) acc.unified.account_tier = 'pro'
       if (acc.unified.account_tier === 'pro' || acc.unified.account_tier === 'max')
         acc.unified.account_tier_source = 'usage'
+      paths.push(['unified', 'account_tier'], ['unified', 'account_tier_source'])
+      if (probe.usage_has_fable != null) paths.push(['unified', 'usage_has_fable'])
     }
     if (probe.fable && !fableTransport) {
       const planDenied = completeOfficialUsage && !hasFableUsage && isFablePlanDenied(probe.fable)
@@ -434,8 +570,8 @@ export class AccountQuota {
       healOfficialOverwriteExtra(acc, accountId, this.repo)
       clearHeaderExhaustIfOfficialOpen(acc)
     }
-    const saved = this.repo.save(acc)
-    this._writeSessionWindow(saved)
+    const saved = this.repo.observe(acc, { observation, paths })
+    this._writeSessionWindow(saved, { observation })
     if (usageOk) {
       const observed5 = headerWindowOrEmpty(saved.unified, '5h')
       const observed7 = headerWindowOrEmpty(saved.unified, '7d')
@@ -446,7 +582,7 @@ export class AccountQuota {
       })
     }
     if (usageOk && this.headerUnderSafety(saved)) {
-      this.clearQuotaExhaustedCooldown(accountId)
+      this.clearQuotaExhaustedCooldown(accountId, { observation })
     }
     return saved
   }
@@ -455,9 +591,10 @@ export class AccountQuota {
    * Official Claude Code stream-json `rate_limit_event`.
    * Live CLI includes `unifiedWindows.*.utilization`; keep status + reset too.
    */
-  ingestCliRateLimit(accountId, rateLimitInfo, usageBody = null, { countRequest = null } = {}) {
+  ingestCliRateLimit(accountId, rateLimitInfo, usageBody = null, { countRequest = null, observation } = {}) {
     const acc = this.ensure({ account_id: accountId })
     const infos = Array.isArray(rateLimitInfo) ? rateLimitInfo : rateLimitInfo ? [rateLimitInfo] : []
+    const paths = []
     for (const info of infos) {
       if (!info || typeof info !== 'object') continue
       const typ = String(info.rateLimitType || info.rate_limit_type || '')
@@ -466,6 +603,9 @@ export class AccountQuota {
       if (window) {
         const slot = window === '7d' ? windows.seven_day || windows['7d'] : windows.five_hour || windows['5h']
         const utilization = officialUtilToExtra(slot?.utilization)
+        if (utilization != null) paths.push(['unified', 'headers', window, 'utilization'])
+        if (info.status || utilization != null) paths.push(['unified', 'headers', window, 'status'])
+        if (info.resetsAt != null || info.resets_at != null) paths.push(['unified', 'headers', window, 'reset'])
         writeHeaderWindow(acc, window, {
           status: info.status || (utilization != null ? statusFromUtil(utilization) : null),
           reset: info.resetsAt != null || info.resets_at != null ? epochToIso(info.resetsAt ?? info.resets_at) : null,
@@ -486,10 +626,10 @@ export class AccountQuota {
 
     const shouldCount = countRequest == null ? usageBody?.input_tokens != null : !!countRequest
     if (usageBody?.input_tokens != null) {
-      acc.tokens_in += Number(usageBody.input_tokens) || 0
-      acc.tokens_out += Number(usageBody.output_tokens) || 0
+      acc.tokens_in = addInteger(acc.tokens_in, usageBody.input_tokens || 0)
+      acc.tokens_out = addInteger(acc.tokens_out, usageBody.output_tokens || 0)
     }
-    if (shouldCount) acc.requests += 1
+    if (shouldCount) acc.requests = addInteger(acc.requests, 1)
 
     this.repo.addAllocation(accountId, {
       at: new Date().toISOString(),
@@ -503,7 +643,7 @@ export class AccountQuota {
       tokens_out: usageBody?.output_tokens ?? null,
     })
 
-    return this.repo.save(acc)
+    return this.repo.observe(acc, { observation, paths })
   }
 
   /**
@@ -858,7 +998,8 @@ export class AccountQuota {
    * Write effective 5h/7d windows back to SQLite when a reset has elapsed
    * or last_used proves a probe-source 100% is leftover from the previous window.
    */
-  persistEffectiveWindows(accountId, { now = Date.now() } = {}) {
+  persistEffectiveWindows(accountId, { now = Date.now(), observation } = {}) {
+    observation ??= this.beginObservation()
     if (!accountId) return null
     const acc = this.repo.get(accountId)
     if (!acc?.unified) return acc || null
@@ -893,7 +1034,7 @@ export class AccountQuota {
       const healed = healOfficialOverwriteExtra(acc, accountId, this.repo)
       if (!healed) {
         if (backoffExpired) this.repo.save(acc)
-        if (this.headerUnderSafety(acc)) this.clearQuotaExhaustedCooldown(accountId)
+        if (this.headerUnderSafety(acc)) this.clearQuotaExhaustedCooldown(accountId, { observation })
         return acc
       }
     } else {
@@ -910,8 +1051,8 @@ export class AccountQuota {
     }
     acc.unified.updated_at = new Date().toISOString()
     const saved = this.repo.save(acc)
-    this._writeSessionWindow(saved)
-    if (this.headerUnderSafety(saved)) this.clearQuotaExhaustedCooldown(accountId)
+    this._writeSessionWindow(saved, { observation })
+    if (this.headerUnderSafety(saved)) this.clearQuotaExhaustedCooldown(accountId, { observation })
     return saved
   }
 
@@ -934,36 +1075,19 @@ export class AccountQuota {
     return true
   }
 
-  clearQuotaExhaustedCooldown(accountId) {
-    if (!accountId || !this.runtimeRepo) return false
-    let state = null
-    try {
-      state = this.runtimeRepo.get?.(accountId)
-    } catch {
-      return false
-    }
-    if (!state) return false
-    // Live 429 / overload columns belong to RateLimitService; passive Extra never lifts them.
-    if (Number(state.rate_limit_reset_at) > Date.now() || Number(state.overload_until) > Date.now()) return false
-    const reason = String(state.cooldown_reason || '')
-    const quotaCool = !reason || /quota|account_quota_exhausted|rate_limited/i.test(reason)
-    if (!quotaCool) return false
-    if (!state.cooldown_until && !reason) return false
-    try {
-      this.runtimeRepo.upsert?.({
-        ...state,
-        status: 'ready',
-        cooldown_until: null,
-        cooldown_reason: null,
-        rate_limit_reset_at: null,
-      })
-    } catch {
-      return false
-    }
-    try {
-      this.onQuotaCooldownCleared?.(accountId)
-    } catch {}
-    return true
+  clearQuotaExhaustedCooldown(accountId, { observation } = {}) {
+    const clearing = (async () => {
+      if (!accountId || !this.runtimeRepo?.clearQuotaCooldownCommitted) return false
+      const cleared = await this.runtimeRepo.clearQuotaCooldownCommitted(accountId, { observation })
+      if (!cleared) return false
+      try {
+        this.onQuotaCooldownCleared?.(accountId)
+      } catch {}
+      return true
+    })()
+    // Synchronous quota ingestion schedules this work; flush exposes queued DB failures.
+    clearing.catch(() => {})
+    return clearing
   }
 
   _lastUsedAt(accountId) {
@@ -1084,9 +1208,7 @@ export class AccountQuota {
     const acc = this.ensure({ account_id: accountUuid, vm_id: vmId, email })
     if (!acc) return null
     if (acc.vm_id !== vmId || (email && acc.email !== email)) {
-      acc.vm_id = vmId
-      if (email) acc.email = email
-      return this.repo.save(acc)
+      return this.repo.patch(accountUuid, { vm_id: vmId, ...(email ? { email } : {}) })
     }
     return acc
   }
@@ -1124,18 +1246,31 @@ export class AccountQuota {
     return this.repo.save(acc)
   }
 
-  setAccountTier(accountId, tier, { source = null } = {}) {
+  setAccountTier(accountId, tier, { source = null, observation } = {}) {
     const key = String(tier || '').toLowerCase()
     if (!accountId || (key !== 'pro' && key !== 'max')) return null
     const acc = this.repo.get(accountId)
     if (!acc) return null
     if (acc.unified?.account_tier_source === 'profile' && source !== 'profile' && source !== 'usage') return acc
-    if (acc.unified?.account_tier === key && (acc.unified?.account_tier_source || null) === source) return acc
+    if (
+      observation == null &&
+      acc.unified?.account_tier === key &&
+      (acc.unified?.account_tier_source || null) === source
+    )
+      return acc
     acc.unified = acc.unified || {}
     acc.unified.account_tier = key
     acc.unified.account_tier_source = source
     acc.unified.updated_at = new Date().toISOString()
-    return this.repo.save(acc)
+    return observation == null
+      ? this.repo.save(acc)
+      : this.repo.observe(acc, {
+          observation,
+          paths: [
+            ['unified', 'account_tier'],
+            ['unified', 'account_tier_source'],
+          ],
+        })
   }
 
   markModelUnsupported(accountId, model, durationMs = 60 * 60_000) {
@@ -1167,9 +1302,10 @@ export class AccountQuota {
   setMaxConcurrency(accountId, n, { override = false } = {}) {
     const acc = this.ensure({ account_id: accountId })
     if (!acc) return null
-    acc.max_concurrency = Math.max(0, Math.min(256, Number(n) || 0))
-    acc.concurrency_override = override ? 1 : 0
-    return this.repo.save(acc)
+    return this.repo.patch(accountId, {
+      max_concurrency: Math.max(0, Math.min(256, Number(n) || 0)),
+      concurrency_override: override ? 1 : 0,
+    })
   }
 
   setMaxConcurrencyForVm(vmId, n) {
@@ -1177,8 +1313,7 @@ export class AccountQuota {
     const out = []
     for (const a of this.repo.list()) {
       if (a.vm_id === vmId || a.account_id === vmId) {
-        a.max_concurrency = v
-        out.push(this.repo.save(a))
+        out.push(this.repo.patch(a.account_id, { max_concurrency: v }))
       }
     }
     if (!out.length) out.push(this.setMaxConcurrency(vmId, v))
@@ -1191,8 +1326,7 @@ export class AccountQuota {
     const out = []
     for (const a of this.repo.list()) {
       if (skip.has(a.account_id) || skip.has(a.vm_id)) continue
-      a.max_concurrency = v
-      out.push(this.repo.save(a))
+      out.push(this.repo.patch(a.account_id, { max_concurrency: v }))
     }
     return out
   }
@@ -1200,9 +1334,10 @@ export class AccountQuota {
   setMaxRpm(accountId, n, { override = false } = {}) {
     const acc = this.ensure({ account_id: accountId })
     if (!acc) return null
-    acc.max_rpm = Math.max(0, Math.min(1e6, Number(n) || 0))
-    acc.rpm_override = override ? 1 : 0
-    return this.repo.save(acc)
+    return this.repo.patch(accountId, {
+      max_rpm: Math.max(0, Math.min(1e6, Number(n) || 0)),
+      rpm_override: override ? 1 : 0,
+    })
   }
 
   setMaxRpmForVm(vmId, n, { override = false } = {}) {
@@ -1210,9 +1345,7 @@ export class AccountQuota {
     const out = []
     for (const a of this.repo.list()) {
       if (a.vm_id === vmId || a.account_id === vmId) {
-        a.max_rpm = v
-        if (override) a.rpm_override = 1
-        out.push(this.repo.save(a))
+        out.push(this.repo.patch(a.account_id, { max_rpm: v, ...(override ? { rpm_override: 1 } : {}) }))
       }
     }
     if (!out.length) out.push(this.setMaxRpm(vmId, v, { override }))
@@ -1228,8 +1361,7 @@ export class AccountQuota {
       const key = accountTierKey(a)
       const v = Math.max(0, Math.min(1e6, Number(policies[key]?.max_rpm) || 0))
       if (Number(a.max_rpm) === v) continue
-      a.max_rpm = v
-      out.push(this.repo.save(a))
+      out.push(this.repo.patch(a.account_id, { max_rpm: v }))
     }
     return out
   }
@@ -1243,9 +1375,7 @@ export class AccountQuota {
       const key = accountTierKey(a)
       const v = Math.max(0, Math.min(256, Number(policies[key]?.max_concurrency) || 2))
       if (Number(a.max_concurrency) === v) continue
-      a.max_concurrency = v
-      a.concurrency_override = 0
-      out.push(this.repo.save(a))
+      out.push(this.repo.patch(a.account_id, { max_concurrency: v, concurrency_override: 0 }))
     }
     return out
   }

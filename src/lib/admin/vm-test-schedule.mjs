@@ -5,6 +5,10 @@ import { isValidVmId } from '../vm/vm-file.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { getVm, listVms } from '../vm/vm-registry.mjs'
 import { listTestableModels } from './vm-test-chat.mjs'
+import { backgroundTasksFor } from '../core/shared-background-tasks.mjs'
+import { VmTestScheduleResultsRepo } from '../db/repos/vm-test-schedule-results-repo.mjs'
+import { getActivityCoordinator } from '../db/database.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 
 export const VM_TEST_SCHEDULE_PREFIX = 'vm_test_schedule:'
 export const VM_TEST_SCHEDULE_DEFAULT_KEY = 'vm_test_schedule_default'
@@ -166,8 +170,8 @@ function assertCron(cron, timezone) {
   }
 }
 
-function defaultDialogParams(vm) {
-  const models = listTestableModels(isCodexVm(vm) ? 'openai' : 'anthropic')
+async function defaultDialogParams(vm) {
+  const models = await listTestableModels(isCodexVm(vm) ? 'openai' : 'anthropic')
   const model = models[0]?.id || ''
   if (!model) {
     throw new VmTestScheduleError('no test model available for this vm', 'test_model_missing', 400)
@@ -345,14 +349,23 @@ export class VmTestScheduleRunner {
     runTest,
     list = () => listVms(projectRoot),
     now = () => Date.now(),
+    sharedTasks,
   } = {}) {
     this.projectRoot = projectRoot
     this.settingsFactory = typeof settings === 'function' ? settings : () => settings
     this.runTest = runTest
     this.listVms = list
     this.now = now
+    this.sharedTasks = backgroundTasksFor(sharedTasks)
+    this.resultRepo = this.sharedTasks ? new VmTestScheduleResultsRepo(this.sharedTasks.repo.db) : null
     this.jobs = new Map()
+    this.jobRevisions = new Map()
+    this.discoveryGeneration = 0
+    this.lifecycleGeneration = 0
+    this.discoveries = new Set()
+    this.discoveryTimer = null
     this.running = new Set()
+    this.writeFailure = null
     this.started = false
   }
 
@@ -364,12 +377,40 @@ export class VmTestScheduleRunner {
     return settings
   }
 
+  async _activity(kind, callback) {
+    const coordinator = this.sharedTasks && getActivityCoordinator(this.sharedTasks.db)
+    if (!coordinator && isKubernetesMode())
+      throw Object.assign(new Error('activity coordinator unavailable'), { code: 'maintenance_unavailable' })
+    if (coordinator) {
+      try {
+        // Restore rebind is already owned by the exact maintenance operation;
+        // admitting an ordinary activity would correctly be refused in REBINDING.
+        const scope = coordinator.assertActivity()
+        if (scope.operation || scope.transferredTo) return callback()
+      } catch (error) {
+        if (error.code !== 'maintenance_activity_closed') throw error
+      }
+    }
+    if (!coordinator) return callback()
+    let started = false
+    try {
+      return await coordinator.runActivity({ kind }, async () => {
+        started = true
+        return { ended: true, value: await callback() }
+      })
+    } catch (error) {
+      // A timer can reach admission after DRAINING commits but before local stop.
+      // No discovery SQL started, so this refusal is not a failed persistence operation.
+      if (kind === 'vm_test_discovery' && !started && error.code === 'database_maintenance') return
+      throw error
+    }
+  }
+
   _vm(vmId) {
     return this.listVms().find((vm) => vm.id === vmId) || getVm(this.projectRoot, vmId)
   }
 
-  _stored(vmId) {
-    const raw = this._settings().get(keyFor(vmId))
+  _stored(vmId, raw = this._settings().get(keyFor(vmId))) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
     const vm = this._vm(vmId)
     if (!vm) return null
@@ -404,15 +445,15 @@ export class VmTestScheduleRunner {
     }
   }
 
-  saveDefaultTemplate(input) {
+  async saveDefaultTemplate(input) {
     const structure = normalizeScheduleStructure(input)
     compileStructuredSchedule(structure)
-    this._settings().set(VM_TEST_SCHEDULE_DEFAULT_KEY, structure)
+    await this._settings().set(VM_TEST_SCHEDULE_DEFAULT_KEY, structure)
     return structure
   }
 
-  clearDefaultTemplate() {
-    this._settings().remove?.(VM_TEST_SCHEDULE_DEFAULT_KEY)
+  async clearDefaultTemplate() {
+    await this._settings().remove?.(VM_TEST_SCHEDULE_DEFAULT_KEY)
     return null
   }
 
@@ -472,18 +513,19 @@ export class VmTestScheduleRunner {
     return null
   }
 
-  save(vmId, input) {
+  async save(vmId, input) {
     if (!isValidVmId(vmId)) throw new VmTestScheduleError('invalid vm id', 'invalid_vm_id')
     const vm = this._vm(vmId)
     if (!vm) throw new VmTestScheduleError('vm not found', 'vm_not_found', 404)
     const previous = this._settings().get(keyFor(vmId)) || {}
     const config = normalizeVmTestSchedule(input, vm)
-    this._settings().set(keyFor(vmId), { ...config, ...savedResult(previous), revision: randomUUID() })
+    await this._settings().set(keyFor(vmId), { ...config, ...savedResult(previous), revision: randomUUID() })
+    this.discoveryGeneration++
     if (this.started) this._syncJob(vmId, config)
     return this.get(vmId)
   }
 
-  applyScheduleStructure(vmId, structure, { preserveDialog = true } = {}) {
+  async applyScheduleStructure(vmId, structure, { preserveDialog = true } = {}) {
     if (!isValidVmId(vmId)) throw new VmTestScheduleError('invalid vm id', 'invalid_vm_id')
     const vm = this._vm(vmId)
     if (!vm) throw new VmTestScheduleError('vm not found', 'vm_not_found', 404)
@@ -500,7 +542,7 @@ export class VmTestScheduleRunner {
         reasoning_effort: previous.reasoning_effort ?? null,
       }
     } else {
-      dialog = defaultDialogParams(vm)
+      dialog = await defaultDialogParams(vm)
     }
     const enabled = previous.enabled === true
     const config = normalizeVmTestSchedule(
@@ -511,12 +553,13 @@ export class VmTestScheduleRunner {
       },
       vm,
     )
-    this._settings().set(keyFor(vmId), {
+    await this._settings().set(keyFor(vmId), {
       ...config,
       enabled,
       ...savedResult(previous),
       revision: randomUUID(),
     })
+    this.discoveryGeneration++
     if (this.started) this._syncJob(vmId, config)
     return this.get(vmId)
   }
@@ -526,7 +569,7 @@ export class VmTestScheduleRunner {
    * A slot of the other kind (Claude vs Codex) keeps its own dialog params, since
    * a model of one kind cannot run on the other; switch and timing still apply.
    */
-  syncSchedules({ scope, vmIds = [], schedule, test = null }) {
+  async syncSchedules({ scope, vmIds = [], schedule, test = null }) {
     const structure = normalizeScheduleStructure(schedule)
     const full = test == null ? null : normalizeSyncTest(test, structure)
     let targets = []
@@ -547,16 +590,17 @@ export class VmTestScheduleRunner {
         continue
       }
       if (full) {
-        this._applyFullTest(vmId, structure, full)
+        await this._applyFullTest(vmId, structure, full)
         updated.push(vmId)
         continue
       }
       const hadPlan = !!this._settings().get(keyFor(vmId))
-      this.applyScheduleStructure(vmId, structure, { preserveDialog: hadPlan })
+      await this.applyScheduleStructure(vmId, structure, { preserveDialog: hadPlan })
       if (!hadPlan) {
         const stored = this._settings().get(keyFor(vmId))
         if (stored) {
-          this._settings().set(keyFor(vmId), { ...stored, enabled: false })
+          await this._settings().set(keyFor(vmId), { ...stored, enabled: false })
+          this.discoveryGeneration++
           this.jobs.get(vmId)?.stop()
           this.jobs.delete(vmId)
         }
@@ -566,7 +610,7 @@ export class VmTestScheduleRunner {
     return { updated, missing, schedule: structure }
   }
 
-  _applyFullTest(vmId, structure, full) {
+  async _applyFullTest(vmId, structure, full) {
     const vm = this._vm(vmId)
     const previous = this._settings().get(keyFor(vmId)) || {}
     let dialog
@@ -578,94 +622,201 @@ export class VmTestScheduleRunner {
         max_tokens: previous.max_tokens ?? null,
         reasoning_effort: previous.reasoning_effort ?? null,
       }
-    } else dialog = defaultDialogParams(vm)
+    } else dialog = await defaultDialogParams(vm)
     const config = normalizeVmTestSchedule({ enabled: full.enabled, ...structure, ...dialog }, vm)
-    this._settings().set(keyFor(vmId), { ...config, ...savedResult(previous), revision: randomUUID() })
+    await this._settings().set(keyFor(vmId), { ...config, ...savedResult(previous), revision: randomUUID() })
+    this.discoveryGeneration++
     if (this.started) this._syncJob(vmId, config)
   }
 
-  remove(vmId) {
+  async remove(vmId) {
+    this.discoveryGeneration++
     this.jobs.get(vmId)?.stop()
     this.jobs.delete(vmId)
-    this._settings().remove?.(keyFor(vmId))
+    this.jobRevisions.delete(vmId)
+    await this._settings().remove?.(keyFor(vmId))
     return null
   }
 
-  start() {
+  async start() {
+    const generation = ++this.lifecycleGeneration
     this.started = true
-    this.reload()
+    clearInterval(this.discoveryTimer)
+    const discovery = this.reload()
+    await discovery
+    if (this.sharedTasks && this.started && generation === this.lifecycleGeneration) {
+      this.discoveryTimer = setInterval(() => {
+        if (!this.started) return
+        if (this.discoveries.size) return Promise.allSettled([...this.discoveries])
+        return this.reload().catch((error) => {
+          this.writeFailure ||= error
+        })
+      }, 1000)
+      this.discoveryTimer.unref?.()
+    }
+  }
+
+  async flush() {
+    while (this.running.size || this.discoveries.size) {
+      if (this.discoveries.size) await Promise.allSettled([...this.discoveries])
+      else await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    if (this.writeFailure) throw this.writeFailure
   }
 
   stop() {
     this.started = false
+    this.lifecycleGeneration++
+    this.discoveryGeneration++
+    clearInterval(this.discoveryTimer)
+    this.discoveryTimer = null
     for (const job of this.jobs.values()) job.stop()
     this.jobs.clear()
+    this.jobRevisions.clear()
+    return this.flush().catch(() => {})
   }
 
   reload() {
-    for (const job of this.jobs.values()) job.stop()
-    this.jobs.clear()
-    const all = this._settings().all?.() || {}
+    const generation = ++this.discoveryGeneration
+    const pending = this._activity('vm_test_discovery', () => this._reload(generation))
+    this.discoveries.add(pending)
+    pending.then(
+      () => this.discoveries.delete(pending),
+      () => this.discoveries.delete(pending),
+    )
+    return pending
+  }
+
+  async _reload(generation) {
+    const all = this.resultRepo ? await this.resultRepo.listPlans() : this._settings().all?.() || {}
+    if (generation !== this.discoveryGeneration || !this.started) return
+    if (!this.sharedTasks) {
+      for (const job of this.jobs.values()) job.stop()
+      this.jobs.clear()
+      this.jobRevisions.clear()
+    }
+    const desired = new Map()
     for (const key of Object.keys(all)) {
       if (!key.startsWith(VM_TEST_SCHEDULE_PREFIX)) continue
       const vmId = key.slice(VM_TEST_SCHEDULE_PREFIX.length)
       const vm = this._vm(vmId)
       if (!vm) {
-        this._settings().remove?.(key)
+        await this._settings().remove?.(key)
+        if (generation !== this.discoveryGeneration || !this.started) return
         continue
       }
-      const schedule = this._stored(vmId)
-      if (schedule?.enabled) this._syncJob(vmId, schedule)
+      const schedule = this._stored(vmId, all[key])
+      if (schedule?.enabled) desired.set(vmId, schedule)
+    }
+    for (const [id, job] of this.jobs) {
+      if (!desired.has(id)) {
+        job.stop()
+        this.jobs.delete(id)
+        this.jobRevisions.delete(id)
+      }
+    }
+    for (const [id, schedule] of desired) {
+      if (!this.jobs.has(id) || this.jobRevisions.get(id) !== schedule.revision) this._syncJob(id, schedule)
     }
   }
 
   _syncJob(vmId, schedule) {
     this.jobs.get(vmId)?.stop()
     this.jobs.delete(vmId)
+    this.jobRevisions.delete(vmId)
     if (!this.started || !schedule.enabled || !this._vm(vmId)) return
-    const job = new Cron(schedule.cron, { timezone: schedule.timezone, mode: '5-part', catch: true, unref: true }, () =>
-      this._run(vmId),
+    const revision = schedule.revision ?? this._settings().get(keyFor(vmId))?.revision
+    const job = new Cron(
+      schedule.cron,
+      { timezone: schedule.timezone, mode: '5-part', catch: true, unref: true },
+      async () => await this._run(vmId, revision),
     )
     this.jobs.set(vmId, job)
+    this.jobRevisions.set(vmId, revision)
   }
 
-  async _run(vmId) {
+  async _run(vmId, expectedRevision) {
     if (!this.started || this.running.has(vmId)) return
-    if (!this._vm(vmId)) {
-      this.remove(vmId)
-      return
-    }
-    const schedule = this._stored(vmId)
-    if (!schedule?.enabled) return
     this.running.add(vmId)
-    const startedAt = this.now()
-    let result
     try {
-      result = await this.runTest(vmId, {
-        model: schedule.model,
-        prompt: schedule.prompt,
-        max_tokens: schedule.max_tokens,
-        reasoning_effort: schedule.reasoning_effort,
+      const prepared = await this._activity('vm_test_prepare', async () => {
+        const settings = this._settings()
+        if (this.sharedTasks) await settings.refresh?.()
+        if (!this.started) return
+        if (!this._vm(vmId)) {
+          await this.remove(vmId)
+          return
+        }
+        const schedule = this._stored(vmId)
+        if (!schedule?.enabled) return
+        if (expectedRevision != null && expectedRevision !== schedule.revision) {
+          this.discoveryGeneration++
+          this._syncJob(vmId, schedule)
+          return
+        }
+        const startedAt = this.sharedTasks ? await this.sharedTasks.now() : this.now()
+        return { settings, schedule, startedAt }
       })
-    } catch (error) {
-      result = { ok: false, error }
+      if (!prepared) return
+      const { settings, schedule, startedAt } = prepared
+      const execute = async () => {
+        if (!this.started || (this.resultRepo && !(await this.resultRepo.isCurrent(vmId, schedule.revision)))) {
+          return { notStarted: true }
+        }
+        let result
+        try {
+          result = await this.runTest(vmId, {
+            model: schedule.model,
+            prompt: schedule.prompt,
+            max_tokens: schedule.max_tokens,
+            reasoning_effort: schedule.reasoning_effort,
+          })
+        } catch (error) {
+          result = { ok: false, error, taskTerminal: error?.taskTerminal, taskNotStarted: error?.taskNotStarted }
+        }
+        const terminal = result?.ok === true || result?.taskTerminal === true || result?.taskNotStarted === true
+        if (!this.started) return { terminal }
+        if (this.sharedTasks) await settings.refresh?.()
+        const current = settings.get(keyFor(vmId))
+        if (!current || String(current.revision || '') !== schedule.revision || !this._vm(vmId)) return { terminal }
+        const duration = Number(result?.duration_ms)
+        const lastDuration =
+          Number.isSafeInteger(duration) && duration >= 0 ? duration : Math.max(0, this.now() - startedAt)
+        const lastOk = result?.ok === true
+        const saved = {
+          last_run_at: new Date(startedAt).toISOString(),
+          last_ok: lastOk,
+          last_duration_ms: lastDuration,
+          last_error: lastOk ? null : compactError(result?.error),
+        }
+        try {
+          if (this.resultRepo) {
+            await this.resultRepo.record(vmId, schedule.revision, saved)
+            await settings.refresh?.()
+          } else await settings.set(keyFor(vmId), { ...current, ...saved })
+        } catch (error) {
+          this.writeFailure ||= error
+          // The completed test is not retried merely because its local summary failed to persist.
+          if (terminal) error.taskTerminal = true
+          throw error
+        }
+        return { terminal }
+      }
+      if (!this.sharedTasks) return await execute()
+      const cron = new Cron(schedule.cron, { timezone: schedule.timezone, mode: '5-part', paused: true })
+      let occurrence
+      try {
+        occurrence = cron.previousRuns(1, new Date(startedAt + 1))[0]
+      } finally {
+        cron.stop()
+      }
+      if (!occurrence) return
+      await this.sharedTasks.run(
+        { taskKey: `vm-test:${vmId}`, executionId: `${schedule.revision}:${occurrence.toISOString()}` },
+        execute,
+      )
     } finally {
       this.running.delete(vmId)
     }
-    if (!this.started) return
-
-    const current = this._settings().get(keyFor(vmId))
-    if (!current || String(current.revision || '') !== schedule.revision || !this._vm(vmId)) return
-    const duration = Number(result?.duration_ms)
-    const lastDuration =
-      Number.isSafeInteger(duration) && duration >= 0 ? duration : Math.max(0, this.now() - startedAt)
-    const lastOk = result?.ok === true
-    this._settings().set(keyFor(vmId), {
-      ...current,
-      last_run_at: new Date(startedAt).toISOString(),
-      last_ok: lastOk,
-      last_duration_ms: lastDuration,
-      last_error: lastOk ? null : compactError(result?.error),
-    })
   }
 }

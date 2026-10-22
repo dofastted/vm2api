@@ -2,7 +2,10 @@
  * Three-layer price catalog: override > models.dev > builtin.
  * ID matching is exact / alias / Claude date-strip — no fuzzy family regex.
  */
-import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { RuntimeSettings as SettingsRepo } from '../db/settings-state.mjs'
+import { SettingsRepo as PersistentSettingsRepo } from '../db/repos/settings-repo.mjs'
+import { backgroundTasksFor } from '../core/shared-background-tasks.mjs'
+import { randomUUID } from 'node:crypto'
 import { BUILTIN_ALIASES, BUILTIN_RATES, BUILTIN_SOURCE } from './builtin-rates.mjs'
 
 export const PRICE_FIELDS = ['input', 'output', 'cache_read', 'cache_5m', 'cache_1h']
@@ -27,6 +30,7 @@ let injectedFetch = null
 let backgroundRefresh = true
 let catalogMemo = null
 let refreshInflight = null
+let refreshPaused = false
 
 export function setPriceCatalogTestHooks(hooks = null) {
   if (!hooks) {
@@ -296,12 +300,17 @@ function readOverrides() {
   return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
 }
 
-function persistOverrides(next) {
-  settingsRepo().set(SETTINGS_OVERRIDES, next)
+async function persistOverrides(next) {
+  await settingsRepo().set(SETTINGS_OVERRIDES, next)
 }
 
-function persistSnapshot(next) {
-  settingsRepo().set(SETTINGS_SNAPSHOT, next)
+async function persistSnapshot(change) {
+  if (injectedSettings) {
+    const value = change(readSnapshot())
+    await settingsRepo().set(SETTINGS_SNAPSHOT, value)
+    return value
+  }
+  return new PersistentSettingsRepo().update(SETTINGS_SNAPSHOT, change)
 }
 
 function statusOf(snap) {
@@ -344,9 +353,29 @@ async function readCappedBody(res, maxBytes) {
   return text
 }
 
-export async function syncModelsDev({ fetchImpl } = {}) {
-  const prev = readSnapshot() || {}
+export async function syncModelsDev({ fetchImpl, sharedTasks, scheduled = false } = {}) {
+  const tasks = backgroundTasksFor(sharedTasks)
+  if (!tasks) return syncModelsDevOnce({ fetchImpl })
+  const plan = scheduled
+    ? { taskKey: 'catalog:models.dev', intervalMs: MODELS_DEV_STALE_MS }
+    : { taskKey: 'catalog:models.dev', executionId: randomUUID() }
+  const result = await tasks.run(plan, async () => {
+    if (scheduled) {
+      const current = await new PersistentSettingsRepo(tasks.db).get(SETTINGS_SNAPSHOT)
+      if (current?.fetched_at && (await tasks.now()) - Date.parse(current.fetched_at) < MODELS_DEV_STALE_MS) {
+        return { terminal: true, value: statusOf(current), sharedResult: statusOf(current) }
+      }
+    }
+    const value = await syncModelsDevOnce({ fetchImpl })
+    return { terminal: true, value, sharedResult: value }
+  })
+  return result.ran ? result.value : result.sharedResult || { status: 'skipped', error: result.code }
+}
+
+async function syncModelsDevOnce({ fetchImpl }) {
   const fetchFn = fetchImpl || injectedFetch || globalThis.fetch
+  let parsed
+  let error
   try {
     if (typeof fetchFn !== 'function') throw new Error('fetch is not available')
     const res = await fetchFn(MODELS_DEV_URL, { signal: AbortSignal.timeout(MODELS_DEV_TIMEOUT_MS) })
@@ -358,29 +387,29 @@ export async function syncModelsDev({ fetchImpl } = {}) {
     } catch {
       throw new Error('models.dev invalid JSON')
     }
-    const parsed = parseModelsDev(json)
-    const snap = {
-      fetched_at: new Date().toISOString(),
-      status: 'ok',
-      error: null,
-      anthropic: parsed.anthropic,
-      openai: parsed.openai,
-    }
-    persistSnapshot(snap)
-    invalidatePriceCatalog()
-    return statusOf(snap)
+    parsed = parseModelsDev(json)
   } catch (e) {
-    const snap = {
-      fetched_at: prev.fetched_at || null,
-      status: 'error',
-      error: String(e?.message || e),
-      anthropic: prev.anthropic || {},
-      openai: prev.openai || {},
-    }
-    persistSnapshot(snap)
-    invalidatePriceCatalog()
-    return statusOf(snap)
+    error = String(e?.message || e)
   }
+  const snap = await persistSnapshot((prev) =>
+    error
+      ? {
+          fetched_at: prev?.fetched_at || null,
+          status: 'error',
+          error,
+          anthropic: prev?.anthropic || {},
+          openai: prev?.openai || {},
+        }
+      : {
+          fetched_at: new Date().toISOString(),
+          status: 'ok',
+          error: null,
+          anthropic: parsed.anthropic,
+          openai: parsed.openai,
+        },
+  )
+  invalidatePriceCatalog()
+  return statusOf(snap)
 }
 
 function canPersist() {
@@ -394,7 +423,7 @@ function canPersist() {
 }
 
 export function maybeRefreshModelsDev({ now } = {}) {
-  if (!backgroundRefresh) return
+  if (!backgroundRefresh || refreshPaused) return
   if (!canPersist()) return
   if (refreshInflight) return
   const snap = readSnapshot()
@@ -402,11 +431,20 @@ export function maybeRefreshModelsDev({ now } = {}) {
   const t = now ?? Date.now()
   if (fetchedAt && Number.isFinite(fetchedAt) && t - fetchedAt < MODELS_DEV_STALE_MS) return
   refreshInflight = Promise.resolve()
-    .then(() => syncModelsDev())
-    .catch(() => {})
+    .then(async () => await syncModelsDev({ scheduled: true }))
+    .catch((error) => console.warn('[models.dev] background refresh failed:', error.code || error.message))
     .finally(() => {
       refreshInflight = null
     })
+}
+
+export async function pausePriceCatalog() {
+  refreshPaused = true
+  while (refreshInflight) await refreshInflight
+}
+
+export function resumePriceCatalog() {
+  refreshPaused = false
 }
 
 function storedPrice(entry, platform) {
@@ -555,7 +593,7 @@ function hasExactLayer(platform, id, catalog) {
   )
 }
 
-export function resolvePrice(rawModel) {
+export function resolvePrice(rawModel, { refresh = true } = {}) {
   const platform = platformOfModel(rawModel)
   const candidates = catalogIdCandidates(rawModel, platform)
   const catalog = loadCatalog()
@@ -572,7 +610,7 @@ export function resolvePrice(rawModel) {
     const got = candidates.length ? resolveLayers(p, candidates[0], catalog) : null
     if (got) return got
   }
-  maybeRefreshModelsDev()
+  if (refresh) maybeRefreshModelsDev()
   return null
 }
 
@@ -584,7 +622,7 @@ export function listPriceOverrides() {
   return clone(readOverrides())
 }
 
-export function setPriceOverride(key, price) {
+export async function setPriceOverride(key, price) {
   const k = String(key || '').trim()
   if (!OVERRIDE_KEY_RE.test(k) || k === '*/*') {
     return { ok: false, error: 'invalid override key' }
@@ -592,7 +630,7 @@ export function setPriceOverride(key, price) {
   const overrides = { ...readOverrides() }
   if (price == null) {
     delete overrides[k]
-    persistOverrides(overrides)
+    await persistOverrides(overrides)
     invalidatePriceCatalog()
     return { ok: true }
   }
@@ -600,7 +638,7 @@ export function setPriceOverride(key, price) {
   const v = validatePrice(price, { platform: plat })
   if (!v.ok) return { ok: false, error: v.error }
   overrides[k] = { ...v.price, updated_at: new Date().toISOString() }
-  persistOverrides(overrides)
+  await persistOverrides(overrides)
   invalidatePriceCatalog()
   return { ok: true }
 }

@@ -1,0 +1,109 @@
+[
+  {
+    "phase": "before",
+    "endpoint": "/internal/health",
+    "status": 200,
+    "body": {
+      "classifier_request_context": true,
+      "cli_pid": 2436739,
+      "cli_restarts": 0,
+      "cli_version": "",
+      "closed_slots": 0,
+      "credential_state": "fresh",
+      "delivery_mode": "realtime",
+      "engine": "rust",
+      "healthy": true,
+      "ok": true,
+      "provider": "local_cli",
+      "proxy_configured": false,
+      "proxy_required": false,
+      "ready_slots": 2,
+      "recovering": false,
+      "runtime_kind": "docker",
+      "unhealthy_reason": null,
+      "uptime_seconds": 0,
+      "version": "0.1.0",
+      "vm_id": "vm-capability",
+      "worker_version": "0.1.0"
+    }
+  },
+  {
+    "phase": "during",
+    "endpoint": "/internal/health",
+    "status": 200,
+    "body": {
+      "classifier_request_context": true,
+      "cli_pid": 2436739,
+      "cli_restarts": 0,
+      "cli_version": "",
+      "closed_slots": 0,
+      "credential_state": "fresh",
+      "delivery_mode": "realtime",
+      "engine": "rust",
+      "healthy": true,
+      "ok": true,
+      "provider": "local_cli",
+      "proxy_configured": false,
+      "proxy_required": false,
+      "ready_slots": 1,
+      "recovering": false,
+      "runtime_kind": "docker",
+      "unhealthy_reason": null,
+      "uptime_seconds": 1,
+      "version": "0.1.0",
+      "vm_id": "vm-capability",
+      "worker_version": "0.1.0"
+    }
+  },
+  {
+    "phase": "cancel",
+    "endpoint": "/internal/v1/cancel",
+    "status": 200,
+    "body": {
+      "cancelled": true,
+      "ok": true
+    }
+  },
+  {
+    "phase": "immediately-after-cancel",
+    "endpoint": "/internal/health",
+    "status": 200,
+    "body": {
+      "classifier_request_context": true,
+      "cli_pid": 2436739,
+      "cli_restarts": 0,
+      "cli_version": "",
+      "closed_slots": 0,
+      "credential_state": "fresh",
+      "delivery_mode": "realtime",
+      "engine": "rust",
+      "healthy": true,
+      "ok": true,
+      "provider": "local_cli",
+      "proxy_configured": false,
+      "proxy_required": false,
+      "ready_slots": 1,
+      "recovering": false,
+      "runtime_kind": "docker",
+      "unhealthy_reason": null,
+      "uptime_seconds": 1,
+      "version": "0.1.0",
+      "vm_id": "vm-capability",
+      "worker_version": "0.1.0"
+    }
+  },
+  {
+    "phase": "job-result",
+    "endpoint": "/internal/v1/messages",
+    "status": 502,
+    "body": {
+      "ok": false,
+      "error": {
+        "type": "worker_error",
+        "code": "provider_error",
+        "message": "provider error: client disconnected",
+        "status": 502
+      }
+    }
+  }
+]

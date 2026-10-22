@@ -78,6 +78,14 @@ test('kills leaked CLIs from closed panel shells and unmarked -p runs', async (t
   assert.equal(alive(stray), false)
 })
 
+test('shared guard retains a panel CLI whose remote owner cannot be disproved', async (t) => {
+  const slot = slotFixture(t)
+  const panel = slot.add(['-p', 'hello'], ['KIN_PANEL_SHELL=other-controller'])
+  slot.run(['--preserve-panel'])
+  await settle()
+  assert.equal(alive(panel), true)
+})
+
 test('keeps a not-yet-synced kernel CLI that still has the prefixed slots env', async (t) => {
   const slot = slotFixture(t)
   const kernel = slot.add(['-p'], ['CLAUDE_CODE_KIN_NATIVE_SLOTS=20'])

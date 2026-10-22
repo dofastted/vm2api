@@ -1,6 +1,7 @@
 # Control plane. Only source is in git: the console and Go helpers build here, and the
 # prebuilt slot payloads come from the release pinned in deploy/payload.json.
 
+ARG BUILDPLATFORM=linux/amd64
 FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS web
 RUN npm install -g pnpm@10
 WORKDIR /src/web
@@ -33,6 +34,17 @@ FROM node:22-bookworm-slim
 RUN apt-get update \
   && apt-get install -y --no-install-recommends ca-certificates iptables iproute2 python3 \
   && rm -rf /var/lib/apt/lists/*
+# Debian Bookworm defaults to PG15; backups require the PG17 client.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && curl --fail --silent --show-error -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client-17 \
+    && pg_dump --version | grep -E ' 17\.' \
+    && pg_restore --version | grep -E ' 17\.' \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=docker:27-cli /usr/local/bin/docker /usr/local/bin/docker
 WORKDIR /opt/vm2api
 COPY package.json package-lock.json ./

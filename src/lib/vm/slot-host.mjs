@@ -20,7 +20,7 @@
  *                   host's default route (or the deployment proxy of a Codex slot); a node
  *                   slot gets a loopback SOCKS5 that dials from the node itself
  *   syncRun(vm, slotDir)        publish run/ (kernel.json, worker.json, token) where the slot reads it
- *   queueSyncRun(vm, slotDir)   fire-and-forget syncRun
+ *   queueSyncRun(vm, slotDir)   serialized syncRun; callers must await the returned Promise
  *   onImport(vm, slotDir)       an imported credential replaces the slot's copy
  *   afterRefresh(vm, slotDir)   the slot rotated its credential; mirror it back
  *   touch(vm, slotDir)          telemetry activity mark
@@ -64,7 +64,6 @@ import { ClusterError } from '../cluster/ssh-link.mjs'
 import {
   pullSlotCredentials,
   pushSlotCredentials,
-  pushSlotFiles,
   pushTelemetryTouch,
   queueSlotPush,
 } from '../cluster/remote-slot-files.mjs'
@@ -85,15 +84,16 @@ import { destroyVmRuntime, officialCcUidGid, reloadSlotWorker, startVmRuntime, s
 import {
   boundProxyUrl,
   ensureProxyEgress,
-  inspectEgressProcess,
   isLocalEgressProxy,
   localEgressProxyUrl,
-  stopEgressProcess,
+  stopEgressProcessConfirmed,
 } from './egress.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { nodeEgressProxyUrl } from '../cluster/node-egress-socks.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
-import { stopCodexKernel } from '../transport/codex-kernel-supervisor.mjs'
+import { stopCodexKernel, finishCodexRecycle } from '../transport/codex-kernel-supervisor.mjs'
+import { isKubernetesMode, isKubernetesHaMode } from '../core/control-plane-mode.mjs'
+import { haUnsupported } from '../core/ha-control-plane-policy.mjs'
 
 const noop = async () => ({ skipped: true })
 
@@ -118,28 +118,16 @@ const LOCAL_HOST = Object.freeze({
     if (isCodexVm(vm)) {
       if (enabled) return { ok: true }
       const child = stopCodexKernel(vm.id)
-      if (!child || child.exitCode !== null || child.signalCode !== null) return { ok: true }
-      return new Promise((resolve) => {
-        const exited = () => {
-          clearTimeout(timeout)
-          resolve({ ok: true })
-        }
-        const timeout = setTimeout(() => {
-          child.off('exit', exited)
-          resolve({ ok: false, error: 'codex_stop_timeout' })
-        }, 2000)
-        child.once('exit', exited)
-      })
+      if (!child)
+        return isKubernetesMode()
+          ? { ok: false, code: 'codex_kernel_owner_unknown', vmOperationUncertain: true }
+          : { ok: true, notStarted: true }
+      if (!(await finishCodexRecycle(child)).exited)
+        return { ok: false, code: 'codex_kernel_exit_unconfirmed', vmOperationUncertain: true }
+      return { ok: true, ended: true }
     }
     if (enabled) return await ensureProxyEgress(projectRoot, vm.proxy)
-    const stopped = stopEgressProcess(projectRoot, vm.proxy?.id)
-    if (!stopped.ok) return stopped
-    const deadline = Date.now() + 2000
-    while (inspectEgressProcess(projectRoot, vm.proxy?.id).ok) {
-      if (Date.now() >= deadline) return { ok: false, error: 'egress_stop_timeout' }
-      await new Promise((resolve) => setTimeout(resolve, 20))
-    }
-    return stopEgressProcess(projectRoot, vm.proxy?.id)
+    return await stopEgressProcessConfirmed(projectRoot, vm.proxy?.id)
   },
   localExitProxyUrl: (vm) => (isCodexVm(vm) ? localEgressProxyUrl() : ''),
   // The container bind-mounts vms/<id>/ directly: every local write is already published.
@@ -168,7 +156,7 @@ function nodeHost(nodeId) {
     destroy: (vm) => destroyRemoteSlot(vm),
     setProxyEgressEnabled: (vm, projectRoot, enabled) => setRemoteProxyEgressEnabled(vm, projectRoot, enabled),
     localExitProxyUrl: () => nodeEgressProxyUrl(nodeId),
-    syncRun: (vm, slotDir) => pushSlotFiles(vm, slotDir, ['run']),
+    syncRun: (vm, slotDir) => queueSlotPush(vm, slotDir, ['run']),
     queueSyncRun: (vm, slotDir) => queueSlotPush(vm, slotDir, ['run']),
     onImport: (vm, slotDir) => pushSlotCredentials(vm, slotDir),
     afterRefresh: (vm, slotDir) => pullSlotCredentials(vm, slotDir),
@@ -230,6 +218,32 @@ function nativeHost(nodeId, record) {
 }
 
 export function slotHost(vm) {
+  if (isKubernetesHaMode()) {
+    const deny = () => {
+      throw haUnsupported()
+    }
+    return {
+      kind: 'managed',
+      nodeId: vmNodeId(vm),
+      bakedKernel: true,
+      ownsSocketFiles: false,
+      supports: () => false,
+      dockerEnv: deny,
+      dockerApi: deny,
+      execUser: deny,
+      start: deny,
+      reload: deny,
+      stop: deny,
+      destroy: deny,
+      setProxyEgressEnabled: deny,
+      localExitProxyUrl: deny,
+      syncRun: deny,
+      queueSyncRun: deny,
+      onImport: deny,
+      afterRefresh: deny,
+      touch: deny,
+    }
+  }
   const nodeId = vmNodeId(vm)
   if (nodeId && isNativeNodeVm(vm)) return nativeHost(nodeId, vm)
   const base = nodeId ? nodeHost(nodeId) : LOCAL_HOST

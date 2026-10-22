@@ -3,22 +3,33 @@
  * Used for: legacy_import_done, backup_schedule, proxy_pool_config, active_vm …
  */
 
-import { getDb } from '../database.mjs'
+import { getDb, withTransaction } from '../database.mjs'
+
+const cacheRevisions = new WeakMap()
+
+function cacheRevision(db) {
+  let revision = cacheRevisions.get(db)
+  if (!revision) {
+    revision = { refresh: 0, published: 0, write: 0 }
+    cacheRevisions.set(db, revision)
+  }
+  return revision
+}
 
 export class SettingsRepo {
   constructor(db = getDb()) {
     this.db = db
-    this._get = db.prepare('SELECT value FROM settings WHERE key = ?')
+    this._get = db.prepare('SELECT value FROM settings WHERE key = $1')
     this._set = db.prepare(`
-      INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+      INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, $3)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
     `)
-    this._del = db.prepare('DELETE FROM settings WHERE key = ?')
+    this._del = db.prepare('DELETE FROM settings WHERE key = $1')
     this._all = db.prepare('SELECT key, value, updated_at FROM settings ORDER BY key')
   }
 
-  get(key, fallback = null) {
-    const row = this._get.get(key)
+  async get(key, fallback = null) {
+    const row = await this._get.get(key)
     if (!row) return fallback
     try {
       return JSON.parse(row.value)
@@ -27,28 +38,60 @@ export class SettingsRepo {
     }
   }
 
-  set(key, value) {
-    this._set.run(key, JSON.stringify(value), new Date().toISOString())
+  async set(key, value) {
+    await this._set.run(key, JSON.stringify(value), new Date().toISOString())
+    this.db.afterCommit(() => {
+      cacheRevision(this.db).write += 1
+      this.db.settingsState?.set(key, value)
+    })
     return value
   }
 
-  has(key) {
-    return !!this._get.get(key)
+  /** Merge one settings document against its committed value, including first creation. */
+  async update(key, change, fallback = null) {
+    return withTransaction(this.db, async () => {
+      await this.db
+        .prepare(`INSERT INTO settings(key,value,updated_at) VALUES ($1,$2,$3)
+        ON CONFLICT(key) DO NOTHING`)
+        .run(key, JSON.stringify(fallback), new Date().toISOString())
+      const row = await this.db.prepare('SELECT value FROM settings WHERE key=$1 FOR UPDATE').get(key)
+      const value = change(JSON.parse(row.value))
+      await this.set(key, value)
+      return value
+    })
   }
 
-  remove(key) {
-    this._del.run(key)
+  async has(key) {
+    return !!(await this._get.get(key))
   }
 
-  all() {
+  async remove(key) {
+    await this._del.run(key)
+    this.db.afterCommit(() => {
+      cacheRevision(this.db).write += 1
+      this.db.settingsState?.delete(key)
+    })
+  }
+
+  async all() {
+    const revision = cacheRevision(this.db)
+    const refresh = ++revision.refresh
+    const write = revision.write
     const out = {}
-    for (const row of this._all.all()) {
+    for (const row of await this._all.all()) {
       try {
         out[row.key] = JSON.parse(row.value)
       } catch {
         out[row.key] = null
       }
     }
+    this.db.afterCommit(() => {
+      // A delayed read must not replace a newer refresh or local commit.
+      if (revision.published < refresh && revision.write === write) {
+        revision.published = refresh
+        this.db.settingsState = new Map(Object.entries(out))
+      }
+    })
     return out
   }
 }

@@ -13,6 +13,7 @@ import {
   syncShellLoginCredentials,
 } from '../../src/lib/vm/slot-shell.mjs'
 import { FULL_OAUTH_SCOPE } from '../../src/lib/oauth/oauth-contract.mjs'
+import { assertAuthLoginReady } from '../../src/lib/oauth/claude-auth-login.mjs'
 import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
 import {
   ensureOfficialCredentialLink,
@@ -449,7 +450,18 @@ test('official login tickets check a cluster slot for its container cli-node', a
   fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
   fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify({ id: 'vm-01', node_id: 'node-a' }))
   fs.writeFileSync(path.join(root, 'vms', 'vm-02.json'), JSON.stringify({ id: 'vm-02' }))
-  const shell = createSlotShell({ projectRoot: root, logger: { warn() {} } })
+  const inspected = []
+  const shell = createSlotShell({
+    projectRoot: root,
+    logger: { warn() {} },
+    authLoginReady: (projectRoot, vm) =>
+      assertAuthLoginReady(projectRoot, vm, {
+        inspect: (name) => {
+          inspected.push(name)
+          return null
+        },
+      }),
+  })
   try {
     const remote = await shell.issueTicket('vm-01', { login: true })
     assert.equal(remote.ok, false)
@@ -457,6 +469,7 @@ test('official login tickets check a cluster slot for its container cli-node', a
     const missing = await shell.issueTicket('vm-02', { login: true })
     assert.equal(missing.ok, false)
     assert.equal(missing.error.code, 'container_not_ready')
+    assert.ok(inspected.includes('kin-02'))
     const ops = await shell.issueTicket('vm-02')
     assert.equal(ops.ok, true)
   } finally {

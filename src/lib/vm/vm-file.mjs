@@ -3,14 +3,18 @@
  *
  * - atomicWriteJson: write to a temp file in the same dir then rename, so a
  *   concurrent reader (or a crash mid-write) never sees a torn/partial file.
- * - withVmLock: per-path async mutex to serialize read-modify-write sequences
- *   that span `await` boundaries (e.g. the admin sessionKey import path).
+ * - withVmLock: standalone per-path async mutex; Kubernetes uses a durable
+ *   per-VM claim shared with execution admission.
  * - writeJsonIfChanged: skip the write entirely when the on-disk content is
  *   byte-identical, cutting per-request write amplification.
  */
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
+import { getDb } from '../db/database.mjs'
+import { isKubernetesMode, isKubernetesHaMode } from '../core/control-plane-mode.mjs'
+import { haUnsupported } from '../core/ha-control-plane-policy.mjs'
+import { SharedVmOperations } from './shared-vm-operations.mjs'
 
 /**
  * Names inside `vms/` that are not slot records: `active.json` is the active
@@ -149,6 +153,7 @@ export function invalidateVmSlotReadCache(projectRoot, id) {
 
 const locks = new Map()
 const pendingLocks = new Map()
+const sharedOperations = new WeakMap()
 
 /** Includes queued operations: connection changes must not interrupt an awaiting VM mutation. */
 export function vmLockBusy(key) {
@@ -173,7 +178,42 @@ function notifyVmWrite(filePath) {
   } catch {}
 }
 
-export function withVmLock(key, fn) {
+export function withVmLock(key, fn, { operations, vmId, kind = 'mutation' } = {}) {
+  if (isKubernetesHaMode()) throw haUnsupported()
+  if (operations || isKubernetesMode()) {
+    if (vmId == null) {
+      const name = path.basename(String(key || ''))
+      if (
+        path.basename(path.dirname(String(key || ''))) !== 'vms' ||
+        !name.endsWith('.json') ||
+        !isValidVmId(name.slice(0, -5))
+      ) {
+        return Promise.reject(
+          Object.assign(new Error('invalid VM operation key'), { code: 'invalid_vm_operation', status: 400 }),
+        )
+      }
+      vmId = name.slice(0, -5)
+    }
+    try {
+      if (!isValidVmId(vmId)) {
+        throw Object.assign(new Error('invalid VM operation ID'), { code: 'invalid_vm_operation', status: 400 })
+      }
+      if (!operations) {
+        const db = getDb()
+        if (!sharedOperations.has(db)) sharedOperations.set(db, new SharedVmOperations(db))
+        operations = sharedOperations.get(db)
+      }
+      const run = operations.run(vmId, fn, { kind })
+      pendingLocks.set(key, (pendingLocks.get(key) || 0) + 1)
+      return run.finally(() => {
+        const pending = pendingLocks.get(key) - 1
+        if (pending) pendingLocks.set(key, pending)
+        else pendingLocks.delete(key)
+      })
+    } catch (error) {
+      return Promise.reject(error)
+    }
+  }
   const prev = locks.get(key) || Promise.resolve()
   pendingLocks.set(key, (pendingLocks.get(key) || 0) + 1)
   const run = prev.then(fn, fn).finally(() => {
@@ -193,6 +233,7 @@ export function withVmLock(key, fn) {
 }
 
 export function atomicWriteJson(filePath, obj, { mode } = {}) {
+  assertVmWriteAllowed(filePath)
   const dir = path.dirname(filePath)
   const tmp = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`)
   const data = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2)
@@ -217,6 +258,7 @@ export function atomicWriteJson(filePath, obj, { mode } = {}) {
 }
 
 export function writeJsonIfChanged(filePath, obj, { mode } = {}) {
+  assertVmWriteAllowed(filePath)
   const data = typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2)
   try {
     if (fs.existsSync(filePath) && readFileCached(filePath) === data) {
@@ -225,4 +267,8 @@ export function writeJsonIfChanged(filePath, obj, { mode } = {}) {
   } catch {}
   atomicWriteJson(filePath, data, { mode })
   return true
+}
+
+function assertVmWriteAllowed(filePath) {
+  if (isKubernetesHaMode() && path.resolve(filePath).split(path.sep).includes('vms')) throw haUnsupported()
 }

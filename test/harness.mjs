@@ -9,6 +9,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
+import crypto from 'node:crypto'
+import { createDatabase } from '../src/lib/db/database.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 export const GATEWAY_ROOT = path.resolve(__dirname, '../src')
@@ -81,9 +83,20 @@ export async function startGateway(opts = {}) {
   }
   const port = opts.port || (await pickFreePort())
   const traceFile = opts.traceFile || path.join(project, 'mock-trace.json')
+  const connectionString = process.env.VM2API_TEST_DATABASE_URL
+  if (!connectionString || !/_test$/.test(new URL(connectionString).pathname)) {
+    throw new Error('gateway tests require VM2API_TEST_DATABASE_URL for a dedicated *_test database')
+  }
+  const schema =
+    (process.env.KIN_DATABASE_SCHEMA || 'gateway_test') +
+    '_gw_' +
+    crypto.createHash('sha256').update(project).digest('hex').slice(0, 12)
   const env = {
     ...process.env,
     KIN_API_KEY: opts.apiKey || TEST_API_KEY,
+    VM2API_DATABASE_URL: connectionString,
+    KIN_DATABASE_URL: connectionString,
+    KIN_DATABASE_SCHEMA: schema,
     KIN_ADMIN_USER: 'admin',
     KIN_ADMIN_PASSWORD: 'testpass',
     PORT: String(port),
@@ -102,14 +115,38 @@ export async function startGateway(opts = {}) {
     KIN_MOCK_TRACE_FILE: traceFile,
     KIN_MOCK_TEXT: opts.mockText || 'pong',
     KIN_CRS_MOCK: '1',
+    KIN_KERNEL_BIN: path.join(REPO_ROOT, 'bin', 'kin-kernel'),
   }
   if (opts.env) Object.assign(env, opts.env)
 
-  const child = spawn(process.execPath, [path.join(GATEWAY_ROOT, 'server.mjs')], {
-    env,
-    cwd: GATEWAY_ROOT,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  })
+  // Mock HTTP gateways must never create host bridges, change iptables, or exec
+  // a real slot. The loader supplies virtual egress; other Docker calls fail closed.
+  const boundaryDir = path.join(project, 'mock-runtime')
+  fs.mkdirSync(boundaryDir, { recursive: true })
+  const runtimeCallsFile = path.join(boundaryDir, 'commands.log')
+  for (const command of ['docker', 'iptables']) {
+    fs.writeFileSync(
+      path.join(boundaryDir, command),
+      `#!${process.execPath}\nconst fs = require('node:fs');\nfs.appendFileSync(${JSON.stringify(runtimeCallsFile)}, ${JSON.stringify(command + ' ')} + process.argv.slice(2, 4).join(' ') + '\\n');\nprocess.stderr.write('Error: No such object: mock gateway runtime\\n');\nprocess.exit(1);\n`,
+      { mode: 0o700 },
+    )
+  }
+  env.PATH = boundaryDir + path.delimiter + env.PATH
+  env.KIN_DOCKER_BIN = path.join(boundaryDir, 'docker')
+
+  const child = spawn(
+    process.execPath,
+    [
+      '--import',
+      path.join(REPO_ROOT, 'test/fixtures/mock-gateway-runtime-loader.mjs'),
+      path.join(GATEWAY_ROOT, 'server.mjs'),
+    ],
+    {
+      env,
+      cwd: GATEWAY_ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  )
   let stdout = ''
   let stderr = ''
   child.stdout.on('data', (d) => {
@@ -140,20 +177,33 @@ export async function startGateway(opts = {}) {
     throw new Error(`gateway failed to start\nstdout:\n${stdout}\nstderr:\n${stderr}`)
   }
 
+  const db = await createDatabase({ connectionString, schema: env.KIN_DATABASE_SCHEMA })
   return {
+    db,
+    schema: env.KIN_DATABASE_SCHEMA,
+    connectionString,
     baseUrl,
     port,
     project,
     traceFile,
+    runtimeCallsFile,
     apiKey: env.KIN_API_KEY,
     child,
     stdout: () => stdout,
     stderr: () => stderr,
     async stop() {
+      await db.close()
       if (child.exitCode == null) {
         child.kill('SIGTERM')
-        await new Promise((r) => setTimeout(r, 150))
-        if (child.exitCode == null) child.kill('SIGKILL')
+        await new Promise((resolve) => {
+          const timer = setTimeout(() => {
+            child.kill('SIGKILL')
+          }, 5000)
+          child.once('exit', () => {
+            clearTimeout(timer)
+            resolve()
+          })
+        })
       }
     },
   }

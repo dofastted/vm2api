@@ -3,16 +3,62 @@ package oauthcmd
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/dofastted/kin-gateway/worker/internal/credential"
 )
+
+func TestUnknownRefreshMetadataSurvivesExplicitAndImplicitEnsure(t *testing.T) {
+	for _, op := range []string{"refresh", "models"} {
+		t.Run(op, func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				_, _ = io.Copy(io.Discard, request.Body)
+				if calls.Add(1) > 1 {
+					writer.WriteHeader(http.StatusUnauthorized)
+					_, _ = writer.Write([]byte(`{"error":"invalid_grant"}`))
+					return
+				}
+				conn, buffered, err := writer.(http.Hijacker).Hijack()
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				_, _ = buffered.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\n\r\n{\"access_token\":\"synthetic-lost")
+				_ = buffered.Flush()
+				_ = conn.Close()
+			}))
+			defer server.Close()
+			configPath, credPath := testConfig(t, server.URL, server.URL, nil)
+			saveCredential(t, credPath, credential.Credential{AccessToken: "synthetic-old-at", RefreshToken: "synthetic-old-rt", ExpiresAt: 1})
+			var output bytes.Buffer
+			if code := Run([]string{op, "--config", configPath}, nil, &output); code != 0 {
+				t.Fatalf("exit code = %d", code)
+			}
+			var envelope map[string]any
+			if err := json.Unmarshal(output.Bytes(), &envelope); err != nil {
+				t.Fatal(err)
+			}
+			if envelope["refresh_unknown"] != true {
+				t.Fatalf("refresh_unknown = %v, want true", envelope["refresh_unknown"])
+			}
+			if calls.Load() != 1 {
+				t.Fatalf("refresh calls = %d, want 1", calls.Load())
+			}
+			if strings.Contains(output.String(), "synthetic-old") || strings.Contains(output.String(), "synthetic-lost") {
+				t.Fatal("output leaked a synthetic token")
+			}
+		})
+	}
+}
 
 func TestUsageSuccessForwardsUserAgentAndBeta(t *testing.T) {
 	var gotUA, gotBeta string

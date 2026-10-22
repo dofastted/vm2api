@@ -675,11 +675,11 @@ test('unpinned slot follows live tier concurrency after reloadConfig', async (t)
   vm.policy.maxConcurrency = 2
   vm.policy.concurrencyOverride = false
   fs.writeFileSync(file, JSON.stringify(vm))
-  const accountQuota = new AccountQuota({
+  const accountQuota = await new AccountQuota({
     dataDir: path.join(root, 'data'),
     config: { tiers: { max: { max_concurrency: 2, max_rpm: 0 } } },
     accounts: [{ account_id: 'account-1', vm_id: 'vm-01', max_concurrency: 2 }],
-  })
+  }).init()
   accountQuota.setAccountTier('account-1', 'max')
   const pool = scheduler(root, { accountQuota })
   accountQuota.reloadConfig({
@@ -1333,7 +1333,7 @@ test('syncQuotaSchedule keeps Extra 5h exhausted schedulable and skips the slot'
   const root = project()
   let pool
   t.after(() => cleanupProject(root, pool))
-  const q = new AccountQuota({ dataDir: path.join(root, 'data'), config: {} })
+  const q = await new AccountQuota({ dataDir: path.join(root, 'data'), config: {} }).init()
   q.ensure({ account_id: 'account-1', vm_id: 'vm-01' })
   q.ensure({ account_id: 'account-2', vm_id: 'vm-02' })
   const reset = new Date(Date.now() + 4 * 3600_000).toISOString()
@@ -1369,7 +1369,7 @@ test('syncQuotaSchedule auto-picks Extra 5h again after the window opens', async
   const root = project()
   let pool
   t.after(() => cleanupProject(root, pool))
-  const q = new AccountQuota({ dataDir: path.join(root, 'data'), config: {} })
+  const q = await new AccountQuota({ dataDir: path.join(root, 'data'), config: {} }).init()
   q.ensure({ account_id: 'account-1', vm_id: 'vm-01' })
   const reset = new Date(Date.now() + 4 * 3600_000).toISOString()
   q.ingestHeaders('account-1', {
@@ -1411,7 +1411,7 @@ test('syncQuotaSchedule does not turn a manual-off slot back on', async (t) => {
   const root = project()
   let pool
   t.after(() => cleanupProject(root, pool))
-  const q = new AccountQuota({ dataDir: path.join(root, 'data'), config: {} })
+  const q = await new AccountQuota({ dataDir: path.join(root, 'data'), config: {} }).init()
   q.ensure({ account_id: 'account-1', vm_id: 'vm-01' })
   q.ensure({ account_id: 'account-2', vm_id: 'vm-02' })
   q.ingestHeaders('account-1', {
@@ -1443,11 +1443,11 @@ test('syncQuotaSchedule does not turn a manual-off slot back on', async (t) => {
   picked.release()
 })
 
-test('leftover quota 调度关 is restored to restricted without flipping the operator off', (t) => {
+test('leftover quota 调度关 is restored to restricted without flipping the operator off', async (t) => {
   const root = project()
   let pool
   t.after(() => cleanupProject(root, pool))
-  const q = new AccountQuota({ dataDir: path.join(root, 'data'), config: {} })
+  const q = await new AccountQuota({ dataDir: path.join(root, 'data'), config: {} }).init()
   q.ensure({ account_id: 'account-1', vm_id: 'vm-01' })
   q.ingestHeaders('account-1', {
     'anthropic-ratelimit-unified-5h-utilization': '1',
@@ -1539,14 +1539,14 @@ test('platform scope skips tenant-owned VMs', async (t) => {
 
 test('deleting a tenant makes its assigned spare selectable while the primary quota is exhausted', async (t) => {
   const root = project()
-  const quota = new AccountQuota({ dataDir: path.join(root, 'data'), config: {} })
+  const quota = await new AccountQuota({ dataDir: path.join(root, 'data'), config: {} }).init()
   let pool
-  t.after(() => {
-    quota.db.close()
+  t.after(async () => {
+    await quota.db.close()
     cleanupProject(root, pool)
   })
   const users = new PanelUserStore({ db: quota.db, projectRoot: root })
-  const user = users.create({ username: 'tenant', password: 'tenant-pass' })
+  const user = await users.create({ username: 'tenant', password: 'tenant-pass' })
   persistVmOwner(root, 'vm-02', { ownerUserId: user.id, origin: 'admin_assigned' })
   quota.ensure({ account_id: 'account-1', vm_id: 'vm-01' })
   quota.ensure({ account_id: 'account-2', vm_id: 'vm-02' })
@@ -1559,7 +1559,7 @@ test('deleting a tenant makes its assigned spare selectable while the primary qu
   const exhausted = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
   assert.equal(exhausted.ok, false)
 
-  assert.equal(users.remove(user.id), true)
+  assert.equal(await users.remove(user.id), true)
   const recovered = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
   assert.equal(recovered.ok, true)
   assert.equal(recovered.vmId, 'vm-02')
@@ -2067,10 +2067,13 @@ test('#A08: a refused reservation hands back exactly what it took; release is id
 
 test('#A15: a hard account exit moves every pinned conversation but not live leases', async (t) => {
   const root = project()
-  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
-  t.after(() => {
+  const sticky = await new StickyRouter({
+    dataDir: path.join(root, 'data'),
+    config: { sticky: { enabled: true } },
+  }).init()
+  t.after(async () => {
     try {
-      sticky.db?.close?.()
+      await sticky.db?.close?.()
     } catch {}
     fs.rmSync(root, { recursive: true, force: true })
   })
@@ -2206,10 +2209,13 @@ function verifiedHop(text) {
 
 test('family without pin schedules parent and child on one VM', async (t) => {
   const root = project()
-  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
-  t.after(() => {
+  const sticky = await new StickyRouter({
+    dataDir: path.join(root, 'data'),
+    config: { sticky: { enabled: true } },
+  }).init()
+  t.after(async () => {
     try {
-      sticky.db?.close?.()
+      await sticky.db?.close?.()
     } catch {}
     fs.rmSync(root, { recursive: true, force: true })
   })
@@ -2305,10 +2311,13 @@ test('family without pin schedules parent and child on one VM', async (t) => {
 
 test('family whose VM is gated moves as a whole and releases its sticky pins', async (t) => {
   const root = project()
-  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
-  t.after(() => {
+  const sticky = await new StickyRouter({
+    dataDir: path.join(root, 'data'),
+    config: { sticky: { enabled: true } },
+  }).init()
+  t.after(async () => {
     try {
-      sticky.db?.close?.()
+      await sticky.db?.close?.()
     } catch {}
     fs.rmSync(root, { recursive: true, force: true })
   })
@@ -2363,10 +2372,13 @@ test('family whose VM is gated moves as a whole and releases its sticky pins', a
 
 test('family VM left only for kernel slot_busy keeps the family pin', async (t) => {
   const root = project()
-  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
-  t.after(() => {
+  const sticky = await new StickyRouter({
+    dataDir: path.join(root, 'data'),
+    config: { sticky: { enabled: true } },
+  }).init()
+  t.after(async () => {
     try {
-      sticky.db?.close?.()
+      await sticky.db?.close?.()
     } catch {}
     fs.rmSync(root, { recursive: true, force: true })
   })
@@ -2438,10 +2450,13 @@ function applyRebuildAttempt(callerSession, extra = {}) {
 
 test('rebuild outbound session stays on one VM and changes after failover', async (t) => {
   const root = project()
-  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
-  t.after(() => {
+  const sticky = await new StickyRouter({
+    dataDir: path.join(root, 'data'),
+    config: { sticky: { enabled: true } },
+  }).init()
+  t.after(async () => {
     try {
-      sticky.db?.close?.()
+      await sticky.db?.close?.()
     } catch {}
     fs.rmSync(root, { recursive: true, force: true })
   })
@@ -2488,10 +2503,13 @@ test('rebuild outbound session stays on one VM and changes after failover', asyn
 
 test('consecutive turns without an inbound session keep one outbound session', async (t) => {
   const root = project()
-  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
-  t.after(() => {
+  const sticky = await new StickyRouter({
+    dataDir: path.join(root, 'data'),
+    config: { sticky: { enabled: true } },
+  }).init()
+  t.after(async () => {
     try {
-      sticky.db?.close?.()
+      await sticky.db?.close?.()
     } catch {}
     fs.rmSync(root, { recursive: true, force: true })
   })
@@ -2521,10 +2539,13 @@ test('consecutive turns without an inbound session keep one outbound session', a
 
 test('family migration remints parent and child outbound sessions', async (t) => {
   const root = project()
-  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
-  t.after(() => {
+  const sticky = await new StickyRouter({
+    dataDir: path.join(root, 'data'),
+    config: { sticky: { enabled: true } },
+  }).init()
+  t.after(async () => {
     try {
-      sticky.db?.close?.()
+      await sticky.db?.close?.()
     } catch {}
     fs.rmSync(root, { recursive: true, force: true })
   })
@@ -2604,10 +2625,13 @@ test('family migration remints parent and child outbound sessions', async (t) =>
 
 test('intra-request failover remints and persists the second outbound session', async (t) => {
   const root = project()
-  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
-  t.after(() => {
+  const sticky = await new StickyRouter({
+    dataDir: path.join(root, 'data'),
+    config: { sticky: { enabled: true } },
+  }).init()
+  t.after(async () => {
     try {
-      sticky.db?.close?.()
+      await sticky.db?.close?.()
     } catch {}
     fs.rmSync(root, { recursive: true, force: true })
   })
@@ -2652,10 +2676,13 @@ test('intra-request failover remints and persists the second outbound session', 
 
 test('returning to a previously used VM mints a new outbound session', async (t) => {
   const root = project()
-  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
-  t.after(() => {
+  const sticky = await new StickyRouter({
+    dataDir: path.join(root, 'data'),
+    config: { sticky: { enabled: true } },
+  }).init()
+  t.after(async () => {
     try {
-      sticky.db?.close?.()
+      await sticky.db?.close?.()
     } catch {}
     fs.rmSync(root, { recursive: true, force: true })
   })

@@ -46,6 +46,9 @@ import { inferClaudeTier } from '../pool/claude-tier.mjs'
 import { listQuotaFromHeaders, isOfficialWindowLimited } from '../pool/quota-window.mjs'
 import { hardBlockOf } from '../pool/rate-limit-service.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { getDb } from '../db/database.mjs'
+import { ExecutionAdmissionsRepo } from '../db/repos/execution-admissions-repo.mjs'
 import { accountIdOf, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
 import { codexMaxSessions } from '../pool/codex-slot-pool.mjs'
 import { resolveCredentialScheduleLevel } from '../pool/credential-weight.mjs'
@@ -286,7 +289,7 @@ export function publicPhysicalFeatures(vm) {
 }
 
 /** Clear runtime cooldown, leftover /usage 429 flag, and sticky pins for a slot. */
-export function clearVmCooldown({ cfg, accountQuota, stickyRouter = null, poolScheduler = null, id } = {}) {
+export async function clearVmCooldown({ cfg, accountQuota, stickyRouter = null, poolScheduler = null, id } = {}) {
   const vm = getVm(cfg?.paths?.project, id)
   if (!vm) {
     return fail(
@@ -309,6 +312,10 @@ export function clearVmCooldown({ cfg, accountQuota, stickyRouter = null, poolSc
       if (repo?.clearAccountCooldown?.(key, { vmId: vm.id })) runtimeCleared += 1
     } catch {}
     try {
+      if (stickyRouter?.shared) await stickyRouter.unbindByAccountShared({ accountId: key, vmId: vm.id })
+      else stickyRouter?.unbindByAccount?.({ accountId: key, vmId: vm.id })
+    } catch {}
+    try {
       const row = accountQuota?.repo?.get?.(key)
       if (!row?.unified) continue
       let changed = false
@@ -325,9 +332,6 @@ export function clearVmCooldown({ cfg, accountQuota, stickyRouter = null, poolSc
         headersRefreshed += 1
       }
       if (changed) accountQuota.repo.save(row)
-    } catch {}
-    try {
-      stickyRouter?.unbindByAccount?.({ accountId: key, vmId: vm.id })
     } catch {}
   }
   const vmPath = path.join(cfg.paths.project, 'vms', `${vm.id}.json`)
@@ -359,12 +363,35 @@ export function clearVmCooldown({ cfg, accountQuota, stickyRouter = null, poolSc
 
 /** Same key as PoolScheduler: full vm record (listVms summaries drop `claude`), slot identity first. */
 function circuitViewFor(vm, projectRoot) {
+  if (isKubernetesMode()) return null
   try {
     const full = (projectRoot && vm?.id && getVm(projectRoot, vm.id)) || vm
     const accountId = accountIdOf(full, projectRoot || null)
     return accountId ? { account_id: accountId, ...unitCircuit.view(accountId) } : null
   } catch {
     return null
+  }
+}
+
+function sharedCircuitConfig(routingConfig = {}) {
+  const pool = normalizePoolRouting(routingConfig.pool)
+  return { failureThreshold: pool.circuit_failure_threshold, openMs: pool.circuit_open_ms }
+}
+
+async function stampSharedCircuitViews(vms, projectRoot, routingConfig) {
+  if (!isKubernetesMode()) return
+  const circuits = new ExecutionAdmissionsRepo(getDb()).circuits
+  const config = sharedCircuitConfig(routingConfig)
+  const views = new Map()
+  for (const vm of vms) {
+    if (isCodexVm(vm)) continue
+    const accountId = accountIdOf(getVm(projectRoot, vm.id) || vm, projectRoot)
+    if (!accountId) continue
+    if (!views.has(accountId)) {
+      const { state, failures, threshold, open_until, open_ms } = await circuits.inspect(accountId, config)
+      views.set(accountId, { account_id: accountId, state, failures, threshold, open_until, open_ms })
+    }
+    vm.circuit = views.get(accountId)
   }
 }
 
@@ -382,6 +409,20 @@ export function resetVmCircuit({ cfg, poolScheduler = null, id } = {}) {
     )
   }
   const accountId = accountIdOf(vm, cfg.paths.project)
+  if (isKubernetesMode()) {
+    return (async () => {
+      if (accountId) {
+        const circuits = new ExecutionAdmissionsRepo(getDb()).circuits
+        await circuits.reset(accountId, poolScheduler?.circuitConfig?.() || sharedCircuitConfig())
+      }
+      const item = { ...vm }
+      await stampSharedCircuitViews([item], cfg.paths.project, {
+        pool: poolScheduler?.config || {},
+      })
+      poolScheduler?.notifyCapacity?.(accountId)
+      return ok({ id: vm.id, circuit: item.circuit || null })
+    })()
+  }
   if (accountId) unitCircuit.reset(accountId)
   try {
     poolScheduler?.notifyCapacity?.(accountId)
@@ -606,6 +647,7 @@ export async function buildDashboard({
     }),
   )
   const snap = accountQuota.snapshot()
+  await stampSharedCircuitViews(vms, cfg.paths.project, routingConfig)
   const accounts = liveAccounts(snap.accounts, listed)
   const peak5 = Math.max(0, ...accounts.map((a) => Number(a.unified?.['5h']?.utilization || 0)), 0)
   const peak7 = Math.max(0, ...accounts.map((a) => Number(a.unified?.['7d']?.utilization || 0)), 0)
@@ -628,9 +670,9 @@ export async function buildDashboard({
 
   const billing = stampVmBilling(
     vms,
-    (() => {
+    await (async () => {
       try {
-        return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), snap.accounts || [])
+        return attachBillingMeta(await panelBillingStats(requestLog, accountQuota, vms), snap.accounts || [])
       } catch {
         return null
       }
@@ -686,18 +728,18 @@ export async function buildDashboard({
     },
     gateway_stats: stats,
     // historic totals straight from the request_logs table (survives restarts)
-    db_totals: (() => {
+    db_totals: await (async () => {
       try {
-        return requestLog?.totals() || null
+        return (await requestLog?.totals()) || null
       } catch {
         return null
       }
     })(),
     billing,
     // last-hour ops cards (SLA / QPS / TTFT) — console can refetch other windows via /request-logs/stats
-    ops: (() => {
+    ops: await (async () => {
       try {
-        return requestLog?.windowStats?.({ since: new Date(Date.now() - 3600_000).toISOString() }) || null
+        return (await requestLog?.windowStats?.({ since: new Date(Date.now() - 3600_000).toISOString() })) || null
       } catch {
         return null
       }
@@ -735,6 +777,7 @@ export async function buildVmList({
       role,
     }),
   )
+  await stampSharedCircuitViews(vms, cfg.paths.project, routingConfig)
   const accounts = (() => {
     try {
       return accountQuota?.snapshot?.().accounts || []
@@ -744,9 +787,9 @@ export async function buildVmList({
   })()
   stampVmBilling(
     vms,
-    (() => {
+    await (async () => {
       try {
-        return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), accounts)
+        return attachBillingMeta(await panelBillingStats(requestLog, accountQuota, vms), accounts)
       } catch {
         return null
       }
@@ -802,10 +845,11 @@ export async function buildVmDetail({
     clusterNodes,
     role,
   })
+  await stampSharedCircuitViews([summary], cfg.paths.project, routingConfig)
   const acc = findAccount(accountQuota, summary)
-  const billing = (() => {
+  const billing = await (async () => {
     try {
-      return panelBillingStats(requestLog, accountQuota, [summary])
+      return await panelBillingStats(requestLog, accountQuota, [summary])
     } catch {
       return null
     }
@@ -813,7 +857,7 @@ export async function buildVmDetail({
   const cost = lookupBilling(indexBillingAccounts(billing), acc || summary)
   const gpt = isCodexVm(vm)
   applyCostFields(summary, cost, { coveredSince: billing?.log_coverage_start })
-  const detail = buildAccountBilling(cost, billing, {
+  const detail = await buildAccountBilling(cost, billing, {
     vmId: summary.id,
     accountId: acc?.account_id || summary.account_uuid,
     requestLog,
@@ -1009,7 +1053,7 @@ export async function buildClaudeResetRedeem({ cfg, id, idempotencyKey, transpor
   })
 }
 
-function applyFableProbeResult(accountQuota, accountId, found) {
+function applyFableProbeResult(accountQuota, accountId, found, observation) {
   if (found?.tier !== 'pro' && found?.tier !== 'max') return null
   const saved = accountQuota.repo.get(accountId)
   if (!saved || !found.fable) return found.tier
@@ -1028,7 +1072,7 @@ function applyFableProbeResult(accountQuota, accountId, found) {
     reset: found.fable.reset_at || prev.reset || null,
     probed_at: new Date().toISOString(),
   }
-  accountQuota.repo.save(saved)
+  accountQuota.repo.observe(saved, { observation, paths: [['unified', 'fable']] })
   return found.tier
 }
 function fatalUsageCredentialFailure(result = {}) {
@@ -1137,6 +1181,7 @@ export async function buildProbeOne({
   if (force) cache.clear(accountId)
   const skipHop = !shouldHopOfficialUsage(acc?.unified, { hop, force })
   const headerProbe = skipHop ? probeFromPassiveHeaders(acc?.unified || {}) : null
+  const observation = await accountQuota.beginObservation()
   const result = skipHop
     ? {
         ok: false,
@@ -1146,7 +1191,7 @@ export async function buildProbeOne({
         probed_at: new Date().toISOString(),
         ...(headerProbe ? { ...headerProbe, error: null } : {}),
       }
-    : await cache.load(accountId, () => probeAccount({ exec, vm, includeFable }), { force: !!force })
+    : await cache.load(accountId, async () => await probeAccount({ exec, vm, includeFable }), { force: !!force })
   if (fatalUsageCredentialFailure(result)) {
     try {
       markVmRefreshError(path.join(cfg.paths.project, 'vms', `${id}.json`), {
@@ -1157,12 +1202,19 @@ export async function buildProbeOne({
       })
     } catch {}
   }
-  if (!skipHop) accountQuota.ingestOAuthUsage(accountId, result)
+  if (!skipHop) accountQuota.ingestOAuthUsage(accountId, result, { observation })
   if (isSetupTokenMode(credentialModeOfVm(vm)) && (force || includeFable) && !result.usage_scope_missing) {
     try {
-      await applyFableProbeResult(accountQuota, accountId, await fableProbe({ exec, timeoutMs: 20000 }))
+      const fableObservation = await accountQuota.beginObservation()
+      await applyFableProbeResult(
+        accountQuota,
+        accountId,
+        await fableProbe({ exec, timeoutMs: 20000 }),
+        fableObservation,
+      )
     } catch {}
   }
+  await accountQuota.flush()
   const after = accountQuota.repo.get(accountId)
   const qAfter = quotaFromAccount(after)
   const rateLimited = isOfficialUsageRateLimited(result)
@@ -1186,11 +1238,17 @@ export async function buildProbeOne({
   ).key
   const completeUsage = result.ok === true && result.limits_present === true
   if (completeUsage && (result.account_tier === 'pro' || result.account_tier === 'max')) {
-    accountQuota.setAccountTier(accountId, result.account_tier, { source: 'usage' })
-    persistAccountTier(cfg.paths.project, id, result.account_tier, { source: 'usage' })
+    accountQuota.setAccountTier(accountId, result.account_tier, { source: 'usage', observation })
+    await accountQuota.flush()
+    if (accountQuota.repo.get(accountId)?.unified?.account_tier === result.account_tier) {
+      persistAccountTier(cfg.paths.project, id, result.account_tier, { source: 'usage' })
+    }
   } else if (completeUsage && (tier === 'pro' || tier === 'max')) {
-    accountQuota.setAccountTier(accountId, tier, { source: 'usage' })
-    persistAccountTier(cfg.paths.project, id, tier, { source: 'usage' })
+    accountQuota.setAccountTier(accountId, tier, { source: 'usage', observation })
+    await accountQuota.flush()
+    if (accountQuota.repo.get(accountId)?.unified?.account_tier === tier) {
+      persistAccountTier(cfg.paths.project, id, tier, { source: 'usage' })
+    }
   }
   const availability = evaluateAccount({
     vm,
@@ -1287,7 +1345,7 @@ export async function buildProbeOne({
     error: data.error,
     data_at: data.via === 'passive-headers' ? checked.unified.headers?.sampled_at || null : data.probed_at,
   }
-  accountQuota.repo.save(checked)
+  accountQuota.repo.observe(checked, { observation, paths: [['unified', 'last_probe_check']] })
   return ok(data)
 }
 
@@ -1306,12 +1364,12 @@ export async function buildProbeAll({ cfg, accountQuota, hop = true, force = tru
   return ok({ items, total: items.length })
 }
 
-export function buildUsage({ accountQuota, cfg, requestLog = null }) {
+export async function buildUsage({ accountQuota, cfg, requestLog = null }) {
   const snap = accountQuota.snapshot()
   const listed = listVms(cfg?.paths?.project)
-  const billing = (() => {
+  const billing = await (async () => {
     try {
-      return panelBillingStats(requestLog, accountQuota, listed)
+      return await panelBillingStats(requestLog, accountQuota, listed)
     } catch {
       return null
     }
@@ -1479,6 +1537,7 @@ export async function snapshotAccountPool({
       projectRoot: cfg.paths.project,
     }),
   )
+  await stampSharedCircuitViews(vms, cfg.paths.project, routingConfig)
   const accounts = (() => {
     try {
       return accountQuota?.snapshot?.().accounts || []
@@ -1488,9 +1547,9 @@ export async function snapshotAccountPool({
   })()
   const billing = stampVmBilling(
     vms,
-    (() => {
+    await (async () => {
       try {
-        return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), accounts)
+        return attachBillingMeta(await panelBillingStats(requestLog, accountQuota, vms), accounts)
       } catch {
         return null
       }
@@ -1498,7 +1557,7 @@ export async function snapshotAccountPool({
   )
   let today = null
   try {
-    today = requestLog?.windowStats?.({ since: shanghaiDayStartIso() }) || null
+    today = (await requestLog?.windowStats?.({ since: shanghaiDayStartIso() })) || null
   } catch {
     today = null
   }
@@ -2318,9 +2377,9 @@ function billingWindowOf(accountId, vmId, vm, q) {
   }
 }
 
-function panelBillingStats(requestLog, accountQuota, vms) {
+async function panelBillingStats(requestLog, accountQuota, vms) {
   if (!requestLog?.billingStats) return null
-  return requestLog.billingStats({ accountWindows: accountWindowsForBilling(accountQuota, vms) })
+  return await requestLog.billingStats({ accountWindows: accountWindowsForBilling(accountQuota, vms) })
 }
 
 function stampVmBilling(vms, billing) {
@@ -2431,7 +2490,7 @@ function windowEstimates(quota, cost, coveredSince, codex) {
   }
 }
 
-function buildAccountBilling(cost, billing, { vmId, accountId, requestLog } = {}) {
+async function buildAccountBilling(cost, billing, { vmId, accountId, requestLog } = {}) {
   if (!cost && !vmId && !accountId) return null
   const today = periodView(cost?.today) || {
     requests: Number(cost?.today_requests || 0),
@@ -2475,14 +2534,14 @@ function buildAccountBilling(cost, billing, { vmId, accountId, requestLog } = {}
   const total = periodView(cost)
   let byModel = []
   try {
-    byModel = requestLog?.costByModel?.({ vmId, accountId }) || []
+    byModel = (await requestLog?.costByModel?.({ vmId, accountId })) || []
   } catch {
     byModel = []
   }
   if (!cost && !byModel.length) return null
   let usageStats = null
   try {
-    usageStats = vmId ? requestLog?.vmUsageStats?.({ vmId, days: 30 }) || null : null
+    usageStats = vmId ? (await requestLog?.vmUsageStats?.({ vmId, days: 30 })) || null : null
   } catch {
     usageStats = null
   }

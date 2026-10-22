@@ -37,7 +37,24 @@ function joinHeaderMap(headers = {}) {
   return out
 }
 
-async function readLines(stream, onLine) {
+function apiTransportError(payload) {
+  const error = payload?.error || payload?.response?.error
+  return /transport|stream_interrupted|timeout|cancel|abort/i.test(String(error?.code || ''))
+}
+
+function observeApiTerminal(line, lifecycle) {
+  if (!lifecycle) return
+  if (lifecycle.protocol === 'openai' && String(line).trim() === 'data: [DONE]') lifecycle.terminal = true
+  const event = consumeClaudeSSEData(line, lifecycle.sse)
+  if (!event) return
+  if (apiTransportError(event)) lifecycle.unknown = true
+  if (lifecycle.protocol === 'openai') {
+    if (['response.completed', 'response.done', 'response.failed'].includes(event.type)) lifecycle.terminal = true
+  } else if (event.type === 'message_stop') lifecycle.terminal = true
+  if (event.type === 'error' && event.error && !apiTransportError(event)) lifecycle.terminal = true
+}
+
+async function readLines(stream, onLine, lifecycle) {
   let buf = ''
   for await (const chunk of stream) {
     buf += chunk.toString('utf8')
@@ -45,32 +62,98 @@ async function readLines(stream, onLine) {
     while ((idx = buf.indexOf('\n')) >= 0) {
       const line = buf.slice(0, idx)
       buf = buf.slice(idx + 1)
+      observeApiTerminal(line, lifecycle)
       await onLine(line)
     }
   }
-  if (buf) await onLine(buf)
+  if (buf) {
+    observeApiTerminal(buf, lifecycle)
+    await onLine(buf)
+  }
 }
 
-export async function runApiInference({
-  req,
-  res,
-  cfg,
-  scheduler,
-  store,
-  protocol,
-  inbound,
-  convertedBody,
-  clientStream,
-  deliveryMode,
-  signal,
-  timeoutMs,
-  personaHideTokens,
-  cacheTtl,
-  converters,
-  requestContext = null,
-} = {}) {
+export async function runApiInference(options = {}) {
+  const lifecycle = {
+    execution: { requestId: null, started: false, ended: true, reason: 'not_started' },
+    upstream: null,
+    startedHook: false,
+    registered: false,
+    startFailed: false,
+    terminal: false,
+    unknown: false,
+    sse: { dataBuf: '' },
+  }
+  let result
+  try {
+    result = await runApiInferenceBody(options, lifecycle)
+  } catch (error) {
+    if (lifecycle.startFailed) throw lifecycle.startError
+    if (!lifecycle.startedHook) throw error
+    result = {
+      ok: false,
+      status: 502,
+      via: 'api-kernel',
+      terminalState: 'transport_error',
+      transportError: true,
+      body: {
+        type: 'error',
+        error: {
+          type: 'api_error',
+          code: error.code || 'api_kernel_transport',
+          message: String(error.message || error).slice(0, 300),
+        },
+      },
+    }
+  }
+  const execution = lifecycle.upstream?.execution || lifecycle.execution
+  if (lifecycle.upstream) {
+    const complete = lifecycle.upstream.complete === true && lifecycle.upstream.readableEnded === true
+    const ended = complete && lifecycle.terminal && !lifecycle.unknown && !options.signal?.aborted
+    Object.assign(execution, {
+      ended,
+      reason: ended
+        ? 'eof'
+        : options.signal?.aborted
+          ? 'client_aborted'
+          : lifecycle.unknown
+            ? 'upstream_transport'
+            : !complete
+              ? execution.reason === 'in_progress'
+                ? 'transport_error'
+                : execution.reason
+              : 'missing_terminal',
+    })
+  }
+  if (lifecycle.startedHook && (!options.onExecutionStart || lifecycle.registered))
+    await options.onExecutionEnd?.({ ...execution })
+  return { ...result, execution, ...(!execution.ended ? { executionUncertain: true } : {}) }
+}
+
+async function runApiInferenceBody(
+  {
+    req,
+    res,
+    cfg,
+    scheduler,
+    store,
+    protocol,
+    inbound,
+    convertedBody,
+    clientStream,
+    deliveryMode,
+    signal,
+    timeoutMs,
+    personaHideTokens,
+    cacheTtl,
+    converters,
+    requestContext = null,
+    onExecutionStart,
+  } = {},
+  lifecycle,
+) {
   const canonical = officialMessagesBody(convertedBody)
   const model = canonical.model
+  scheduler.reload(await store.listRaw())
   const picked = scheduler.pick(model)
   if (!picked.ok) {
     return {
@@ -86,6 +169,7 @@ export async function runApiInference({
   const protocolKind = normalizeProtocol(picked.endpoint.protocol || preset.protocol, preset.kind)
   const extraHeaders = joinHeaderMap(picked.endpoint.headers)
   const isOpenAI = protocolKind === 'openai'
+  lifecycle.protocol = protocolKind
   if (requestContext && (isOpenAI || picked.upstream_model !== canonical.model)) {
     return {
       ok: false,
@@ -124,8 +208,23 @@ export async function runApiInference({
       proxyUrl: picked.key.proxy_url,
       signal,
       timeoutMs,
+      onExecutionStart: async (execution) => {
+        lifecycle.startedHook = true
+        lifecycle.execution = { ...execution, started: false, ended: true, reason: 'not_started' }
+        try {
+          await onExecutionStart?.(execution)
+          lifecycle.registered = true
+        } catch (error) {
+          lifecycle.startFailed = true
+          lifecycle.startError = error
+          throw error
+        }
+      },
     })
+    lifecycle.upstream = upstream
   } catch (error) {
+    if (lifecycle.startFailed) throw lifecycle.startError
+    if (error.execution) lifecycle.execution = error.execution
     return {
       ok: false,
       status: 502,
@@ -148,9 +247,9 @@ export async function runApiInference({
     const retry = Number(upstream.headers['retry-after'] || 30)
     const until = new Date(Date.now() + Math.max(1, retry) * 1000).toISOString()
     try {
-      store.setKeyCooldown(picked.key.id, until)
+      await store.setKeyCooldown(picked.key.id, until)
     } catch {}
-    scheduler.reload(store.listRaw())
+    scheduler.reload(await store.listRaw())
   }
 
   const resultBase = {
@@ -165,7 +264,9 @@ export async function runApiInference({
   }
 
   if (status >= 400) {
-    const payload = await readApiJson(upstream).catch(() => ({}))
+    const payload = await readApiJson(upstream)
+    lifecycle.terminal = true
+    lifecycle.unknown = apiTransportError(payload)
     const message = payload?.error?.message || payload?.message || `upstream ${status}`
     const upstreamCode = String(payload?.error?.code || payload?.code || '').trim()
     const contentCode = isContentPolicyErrorCode(upstreamCode) ? upstreamCode.toLowerCase() : ''
@@ -197,6 +298,7 @@ export async function runApiInference({
       res,
       converters,
       body,
+      lifecycle,
     })
   }
 
@@ -205,18 +307,22 @@ export async function runApiInference({
   let classifierStopped = false
   const readUpstreamLines = async (onLine) => {
     try {
-      await readLines(upstream, async (line) => {
-        if (requestContext) {
-          const event = consumeClaudeSSEData(line, classifierSseState)
-          if (event?.type === 'error')
-            classifierError = {
-              ...event,
-              error: { ...event.error, ...(event.error?.code ? { upstream_code: event.error.code } : {}) },
-            }
-          if (event?.type === 'message_stop') classifierStopped = true
-        }
-        await onLine(line)
-      })
+      await readLines(
+        upstream,
+        async (line) => {
+          if (requestContext) {
+            const event = consumeClaudeSSEData(line, classifierSseState)
+            if (event?.type === 'error')
+              classifierError = {
+                ...event,
+                error: { ...event.error, ...(event.error?.code ? { upstream_code: event.error.code } : {}) },
+              }
+            if (event?.type === 'message_stop') classifierStopped = true
+          }
+          await onLine(line)
+        },
+        lifecycle,
+      )
     } catch (error) {
       if (!requestContext) throw error
       classifierError = {
@@ -376,6 +482,7 @@ async function runOpenAIResponsesUpstream({
   res,
   converters,
   body,
+  lifecycle,
 }) {
   const chunks = []
   const anthropicSse = protocol === 'anthropic.messages' ? createAnthropicSseState() : null
@@ -388,43 +495,47 @@ async function runOpenAIResponsesUpstream({
   let streamedUsage = null
   const started = Date.now()
 
-  await readLines(upstream, async (line) => {
-    if (conversionError) return
-    const raw = String(line || '')
-    const seen = usageFromSseLine(raw)
-    if (seen) streamedUsage = seen
-    if (raw.startsWith('data:') && ttftMs == null) ttftMs = Date.now() - started
-    if (!committed && raw.startsWith('data:')) committed = true
-    if (!clientStream) {
-      chunks.push(raw)
-      if (/response\.(completed|done)/.test(raw) || raw.trim() === 'data: [DONE]') sawTerminal = true
-      return
-    }
-    if (!res.headersSent) converters.writeSSEHeaders(res)
-    if (protocol === 'openai.responses') {
-      res.write(raw.endsWith('\n') ? raw : `${raw}\n`)
-      if (/response\.(completed|done)/.test(raw)) completed = true
-      return
-    }
-    try {
-      const mapped =
-        protocol === 'anthropic.messages'
-          ? responsesSseToAnthropicEvents(raw, anthropicSse)
-          : responsesSseToChatChunk(raw, 'codex', chatSse)
-      if (mapped) {
-        res.write(mapped)
-        if (mapped.includes('[DONE]') || mapped.includes('event: message_stop\n')) completed = true
+  await readLines(
+    upstream,
+    async (line) => {
+      if (conversionError) return
+      const raw = String(line || '')
+      const seen = usageFromSseLine(raw)
+      if (seen) streamedUsage = seen
+      if (raw.startsWith('data:') && ttftMs == null) ttftMs = Date.now() - started
+      if (!committed && raw.startsWith('data:')) committed = true
+      if (!clientStream) {
+        chunks.push(raw)
+        if (/response\.(completed|done)/.test(raw) || raw.trim() === 'data: [DONE]') sawTerminal = true
+        return
       }
-    } catch (error) {
-      if (error.code !== 'tool_arguments_mismatch') throw error
-      conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
-      res.write(
-        protocol === 'anthropic.messages'
-          ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
-          : `data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`,
-      )
-    }
-  })
+      if (!res.headersSent) converters.writeSSEHeaders(res)
+      if (protocol === 'openai.responses') {
+        res.write(raw.endsWith('\n') ? raw : `${raw}\n`)
+        if (/response\.(completed|done)/.test(raw)) completed = true
+        return
+      }
+      try {
+        const mapped =
+          protocol === 'anthropic.messages'
+            ? responsesSseToAnthropicEvents(raw, anthropicSse)
+            : responsesSseToChatChunk(raw, 'codex', chatSse)
+        if (mapped) {
+          res.write(mapped)
+          if (mapped.includes('[DONE]') || mapped.includes('event: message_stop\n')) completed = true
+        }
+      } catch (error) {
+        if (error.code !== 'tool_arguments_mismatch') throw error
+        conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
+        res.write(
+          protocol === 'anthropic.messages'
+            ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
+            : `data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`,
+        )
+      }
+    },
+    lifecycle,
+  )
 
   if (!clientStream) {
     let assembled

@@ -1,3 +1,4 @@
+import { readRoutingDocument } from '../core/routing-document.mjs'
 /**
  * VM placement on cluster nodes. A VM with `node_id` runs its slot container on
  * that node; everything else about it (vm json, scheduler, kernel transport)
@@ -13,7 +14,6 @@
  * the bridge is served by this same event loop. Remote lifecycle uses the Engine API.
  */
 
-import fs from 'node:fs'
 import { Transform } from 'node:stream'
 import { slotRuntimeOwner } from '../oauth/oauth-credentials.mjs'
 import { routingConfigFile } from '../core/config.mjs'
@@ -144,7 +144,7 @@ function placementRouting() {
   const root = bound?.projectRoot
   if (!root) return null
   try {
-    return JSON.parse(fs.readFileSync(routingConfigFile(root), 'utf8'))
+    return readRoutingDocument(routingConfigFile(root))
   } catch {
     return null
   }

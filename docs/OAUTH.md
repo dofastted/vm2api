@@ -1,6 +1,6 @@
 # OAuth 凭证生命周期
 
-活票只写在槽位 `credentials.json`。换票由控制面 host `RefreshIfNeeded` 经槽 SOCKS5 完成；`vm.json`、SQLite 只存脱敏元数据。Go `kin-worker` 不再做 hop / refresh。
+活票只写在槽位 `credentials.json`。换票由控制面 host `RefreshIfNeeded` 经槽 SOCKS5 完成；`vm.json`、PostgreSQL 只存脱敏元数据。Go `kin-worker` 不再做 hop / refresh。
 
 ```text
 sessionKey（默认 Setup Token）或授权码

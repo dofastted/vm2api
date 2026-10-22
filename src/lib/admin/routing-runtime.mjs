@@ -26,7 +26,7 @@ import { PoolScheduler, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
 import { FailoverRunner } from '../pool/failover-runner.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { RateLimitService } from '../pool/rate-limit-service.mjs'
-import { AccountRuntimeRepo } from '../db/repos/account-runtime-repo.mjs'
+import { SchedulingRuntime } from '../pool/scheduling-runtime.mjs'
 import { RequestAttemptsRepo } from '../db/repos/request-attempts-repo.mjs'
 import { normalizeOfficialCcConfig } from '../oauth/official-cc-bootstrap.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
@@ -54,8 +54,12 @@ import { normalizeVmConfig } from '../vm/machine-spec.mjs'
 import { syncWorkerTelemetry } from '../vm/vm-runtime.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { telemetryUploadInterval } from '../vm/worker-telemetry.mjs'
+import { isKubernetesMode, isKubernetesHaMode } from '../core/control-plane-mode.mjs'
+import { assertHaRoutingPatch } from '../core/ha-control-plane-policy.mjs'
+import { SharedRoutingConfig } from './shared-routing-config.mjs'
 
 export function createRoutingRuntime(ctx) {
+  const shared = ctx.shared ?? isKubernetesMode()
   const getRouting = () => (typeof ctx.getRoutingConfig === 'function' ? ctx.getRoutingConfig() : ctx.routingConfig)
   const setRouting = (next) => {
     if (typeof ctx.setRoutingConfig === 'function') ctx.setRoutingConfig(next)
@@ -80,6 +84,134 @@ export function createRoutingRuntime(ctx) {
   const setFailover = (next) => {
     if (typeof ctx.setFailoverRunner === 'function') ctx.setFailoverRunner(next)
     else ctx.failoverRunner = next
+  }
+
+  function mergeSharedRouting(current, body = {}) {
+    if (body?.codex && Object.hasOwn(body.codex, 'quota')) validateOpenAIQuotaPatch(body.codex.quota)
+    validateInferenceWebsocketPatch(body)
+    const next = structuredClone(current)
+    for (const key of [
+      'sticky',
+      'quota',
+      'concurrency',
+      'pool',
+      'failover',
+      'inference',
+      'compatibility',
+      'websocket',
+      'codex',
+      'vm',
+      'telemetry',
+      'official_cc',
+      'usage_probe',
+      'logging',
+    ]) {
+      if (body[key]) next[key] = { ...(next[key] || {}), ...body[key] }
+    }
+    if (body.codex?.quota) next.codex.quota = mergeOpenAIQuotaPolicy(current.codex?.quota, body.codex.quota)
+    if (body.vm?.smbios) next.vm.smbios = { ...(current.vm?.smbios || {}), ...body.vm.smbios }
+    if (body.health_probe)
+      next.health_probe = {
+        ...(current.health_probe || {}),
+        ...body.health_probe,
+        real: { ...(current.health_probe?.real || {}), ...(body.health_probe.real || {}) },
+        match: { ...(current.health_probe?.match || {}), ...(body.health_probe.match || {}) },
+      }
+    if (body.notify) next.notify = mergeNotifyConfig(current.notify, body.notify)
+    if (next.compatibility) {
+      delete next.compatibility.persona_rules
+      delete next.compatibility.persona_leak_append
+      next.compatibility.cch_enabled = next.compatibility.cch_enabled !== false
+    }
+    next.websocket = normalizeInferenceWebsocket(next.websocket)
+    next.codex = normalizeCodexRouting(next.codex)
+    next.pool = normalizePoolRouting(next.pool)
+    next.vm = normalizeVmConfig(next.vm)
+    next.inference = normalizeInferenceConfig(next.inference)
+    next.official_cc = normalizeOfficialCcConfig(next.official_cc)
+    next.health_probe = normalizeHealthProbeConfig(next.health_probe)
+    next.usage_probe = normalizeUsageProbeConfig(next.usage_probe)
+    next.notify = mergeNotifyConfig(next.notify)
+    next.logging = normalizeLoggingConfig(next.logging)
+    next.telemetry = { ...(next.telemetry || {}), upload_interval_seconds: telemetryUploadInterval(next) }
+    next.tiers = normalizeTiers(
+      body.tiers ? mergeTierMaps(current.tiers, body.tiers) : next.tiers,
+      next.quota,
+      next.concurrency,
+    )
+    const defaults = next.tiers.default || {}
+    next.concurrency = {
+      ...(next.concurrency || {}),
+      default_max_per_account: Number(defaults.max_concurrency ?? 2),
+      default_key_concurrency: Number(defaults.max_concurrency ?? next.concurrency?.default_key_concurrency ?? 2),
+      default_max_rpm: Number(defaults.max_rpm ?? 0),
+    }
+    next.quota = {
+      ...(next.quota || {}),
+      safety_ratio: Number(defaults.limit_5h ?? defaults.safety_ratio ?? 0.85),
+      weekly_safety_ratio: Number(defaults.limit_7d ?? defaults.weekly_safety_ratio ?? 0.8),
+      warn_ratio: Number(defaults.warn_ratio ?? 0.75),
+    }
+    return next
+  }
+
+  async function applySharedRouting(config, revision) {
+    setRouting(config)
+    setManualScheduleWins(config.pool?.manual_schedule_wins)
+    ctx.stickyRouter?.reloadConfig(config)
+    ctx.accountQuota?.reloadConfig(config)
+    getPool()?.reloadConfig?.(poolSchedulerConfig())
+    ctx.failoverRunner?.reloadConfig?.(config.failover || {})
+    getPool()?.rateLimitService?.setConfig?.(config.rate_limit || {})
+    configureUnitCircuit(config)
+    const pending = []
+    for (const [name, callback] of [
+      ['health_monitor', () => getHealth()?.setConfig(config.health_probe, { restart: !isKubernetesHaMode() })],
+      ['usage_monitor', () => getUsage()?.setConfig(config.usage_probe, { restart: !isKubernetesHaMode() })],
+      ['notify_monitor', () => getNotify()?.setConfig(config.notify)],
+      [
+        'logging',
+        () =>
+          ctx.requestLog?.setConfig({
+            mode: config.logging.mode,
+            retainDays: config.logging.retain_days,
+            debugRetainDays: config.logging.debug_retain_days,
+            maxMb: config.logging.max_mb,
+            mutedErrorClasses: config.logging.muted_error_classes,
+          }),
+      ],
+    ]) {
+      try {
+        await callback()
+      } catch (error) {
+        pending.push({ component: name, error: error.code || error.message })
+      }
+    }
+    // Desired state is committed. Remote/kernel and VM-file effects require
+    // their own durable VM operation and must not run in the PG transaction.
+    for (const vm of listVms(ctx.cfg.paths.project)) {
+      pending.push({ component: 'vm_projection', vm_id: vm.id, revision })
+    }
+    return { status: pending.length ? 'pending' : 'applied', pending }
+  }
+
+  const routingState = shared
+    ? new SharedRoutingConfig({
+        db: ctx.db,
+        file: ctx.routingConfigPath,
+        normalize: (config) => mergeSharedRouting(config),
+        merge: mergeSharedRouting,
+        apply: applySharedRouting,
+      })
+    : null
+
+  async function initRoutingConfig() {
+    if (routingState) return routingState.init()
+    return loadRoutingConfig()
+  }
+
+  async function refreshRouting() {
+    return routingState ? routingState.refresh() : null
   }
 
   function applyVmConcurrency(id, n, { override = true } = {}) {
@@ -390,8 +522,10 @@ export function createRoutingRuntime(ctx) {
     return Object.prototype.hasOwnProperty.call(inference, 'session_idle_ttl_seconds')
   }
 
-  function syncKernelPanelConfig(routingConfig) {
-    return syncClaudeKernelConfigs(ctx.cfg.paths.project, routingConfig)
+  async function syncKernelPanelConfig(routingConfig) {
+    const result = syncClaudeKernelConfigs(ctx.cfg.paths.project, routingConfig)
+    await result.publication
+    return result
   }
 
   // kernel.json hot-reloads, but the job watchdog reads its idle limit from env at start.
@@ -408,8 +542,8 @@ export function createRoutingRuntime(ctx) {
   }
 
   // The sidecar re-reads worker.json on mtime change, so a rewrite applies without a restart.
-  // Node slots read a pushed copy; that push is queued and only logged on failure.
-  function syncTelemetryUploadInterval(routingConfig) {
+  // Node slots read a pushed copy; the original push must finish before applying returns.
+  async function syncTelemetryUploadInterval(routingConfig) {
     const project = ctx.cfg.paths.project
     const applied = { updated: 0, queued: 0, skipped: 0, failed: [] }
     for (const { id } of listVms(project)) {
@@ -420,16 +554,22 @@ export function createRoutingRuntime(ctx) {
           applied.skipped += 1
           continue
         }
-        if (slotHost(vm).queueSyncRun(vm, path.join(project, 'vms', vm.id))) applied.queued += 1
-        else applied.updated += 1
-      } catch {
+        const publication = slotHost(vm).queueSyncRun(vm, path.join(project, 'vms', vm.id))
+        if (publication) {
+          await publication
+          applied.queued += 1
+        } else applied.updated += 1
+      } catch (error) {
         applied.failed.push(vm.id)
+        throw error
       }
     }
     return applied
   }
 
-  function persistRoutingPatch(body = {}) {
+  async function persistRoutingPatch(body = {}, options = {}) {
+    if (isKubernetesHaMode()) assertHaRoutingPatch(body)
+    if (routingState) return routingState.patch(body, options)
     const hasCodexQuota = body?.codex && Object.prototype.hasOwnProperty.call(body.codex, 'quota')
     if (hasCodexQuota) validateOpenAIQuotaPatch(body.codex.quota)
     validateInferenceWebsocketPatch(body)
@@ -508,7 +648,7 @@ export function createRoutingRuntime(ctx) {
     syncTierDefaultsIntoRouting()
     if (body.logging) {
       routingConfig.logging = normalizeLoggingConfig({ ...(routingConfig.logging || {}), ...body.logging })
-      ctx.requestLog.setConfig({
+      await ctx.requestLog.setConfig({
         mode: routingConfig.logging.mode,
         retainDays: routingConfig.logging.retain_days,
         debugRetainDays: routingConfig.logging.debug_retain_days,
@@ -529,12 +669,14 @@ export function createRoutingRuntime(ctx) {
       inferenceTouchesKernel(body.inference) ||
       idleChanged ||
       requestBytesChanged
-        ? syncKernelPanelConfig(routingConfig)
+        ? await syncKernelPanelConfig(routingConfig)
         : null
     // Stream idle / body-limit still need an idle restart; CCH and sticky-slot TTL hot-read kernel.json.
     const kernelReload = idleChanged || requestBytesChanged ? reloadClaudeKernelsWhenIdle(routingConfig) : 0
     const telemetrySync =
-      telemetryUploadInterval(routingConfig) !== prevUploadInterval ? syncTelemetryUploadInterval(routingConfig) : null
+      telemetryUploadInterval(routingConfig) !== prevUploadInterval
+        ? await syncTelemetryUploadInterval(routingConfig)
+        : null
     // Pool and failover settings hot-reload into the live scheduler and runner.
     // Rebuilding them would drop the seat book and queues while their requests
     // still run (the panel sends `failover` with every routing save).
@@ -573,6 +715,13 @@ export function createRoutingRuntime(ctx) {
   }
 
   function loadRoutingConfig() {
+    if (routingState) {
+      if (!routingState.currentRevision)
+        throw Object.assign(new Error('shared routing config needs async initialization'), {
+          code: 'routing_config_unavailable',
+        })
+      return structuredClone(routingState.config)
+    }
     let raw
     try {
       raw = fs.readFileSync(ctx.routingConfigPath, 'utf8')
@@ -600,6 +749,7 @@ export function createRoutingRuntime(ctx) {
   }
 
   function migrateLegacyOpenAIPolicies(doc) {
+    if (routingState) return { status: 'pending', revision: routingState.currentRevision }
     const quota = normalizeOpenAIQuotaPolicy(doc.codex?.quota)
     for (const summary of listVms(ctx.cfg.paths.project)) {
       if (!isCodexVm(summary)) continue
@@ -682,22 +832,24 @@ export function createRoutingRuntime(ctx) {
     })
   }
 
-  function initPoolRuntime() {
+  async function initPoolRuntime() {
     const routingConfig = getRouting()
-    const runtimeRepo = new AccountRuntimeRepo()
+    const runtimeRepo = await new SchedulingRuntime().init()
     const attemptsRepo = new RequestAttemptsRepo()
     setRuntimeRepo(runtimeRepo)
     setAttemptsRepo(attemptsRepo)
     ctx.accountQuota.attachRuntimeRepo(runtimeRepo)
     try {
-      attemptsRepo.cleanup(routingConfig?.logging?.retain_days || 7)
+      await attemptsRepo.cleanup(routingConfig?.logging?.retain_days || 7)
     } catch {}
     const poolScheduler = new PoolScheduler({
       projectRoot: ctx.cfg.paths.project,
       stickyRouter: ctx.stickyRouter,
       accountQuota: ctx.accountQuota,
       runtimeRepo,
+      routingState,
       workerHealth: rustKernelHealth,
+      captureNodeExecution: ctx.captureNodeExecution,
       config: poolSchedulerConfig(),
     })
     setPool(poolScheduler)
@@ -712,7 +864,7 @@ export function createRoutingRuntime(ctx) {
       accountQuota: ctx.accountQuota,
       config: routingConfig.rate_limit || {},
       onUsageProbe: ({ vmId }) => {
-        if (!vmId || typeof ctx.probeUsageOne !== 'function') return
+        if (isKubernetesHaMode() || !vmId || typeof ctx.probeUsageOne !== 'function') return
         Promise.resolve(ctx.probeUsageOne(vmId)).catch(() => {})
       },
     })
@@ -723,8 +875,8 @@ export function createRoutingRuntime(ctx) {
       attemptsRepo,
       rateLimitService,
       config: routingConfig.failover || {},
-      onProxyFailure: (vmId, reason) => {
-        ctx.proxyPool.reportRuntimeFailure(vmId, reason)
+      onProxyFailure: async (vmId, reason) => {
+        await ctx.proxyPool.reportRuntimeFailure(vmId, reason)
       },
       onFablePlanDenied: ({ selected }) => {
         const accountId = selected?.accountId
@@ -774,6 +926,9 @@ export function createRoutingRuntime(ctx) {
   }
 
   return {
+    routingState,
+    initRoutingConfig,
+    refreshRouting,
     persistRoutingPatch,
     applyOfficialCcRoutingBody,
     applyHealthProbeRoutingBody,

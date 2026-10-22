@@ -14,6 +14,9 @@ import fs from 'node:fs'
 import { Readable } from 'node:stream'
 import path from 'node:path'
 import { readRoutingConfigFile } from '../core/config.mjs'
+import { getDb } from '../db/database.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { SharedVmOperations } from '../vm/shared-vm-operations.mjs'
 import { getVm, vmHasClaudeCredential } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { summarizeCodexSlot, readCodexAccounts, writeCodexAccounts } from '../vm/codex-slot.mjs'
@@ -76,7 +79,7 @@ function gptRank(id) {
   return mini * 1000 - major * 10 - minor
 }
 
-export function listTestableModels(platform) {
+export async function listTestableModels(platform) {
   const kind = normalizeTestPlatform(platform)
   const rank = (id) => {
     if (kind === 'openai' || isGptSeriesId(id)) return gptRank(id)
@@ -100,17 +103,15 @@ export function listTestableModels(platform) {
   const effective = listOfficialModels().map((m) => map(m, 'effective'))
   const list = effective.length
     ? effective
-    : listPolicyModels()
-        .filter((m) => m.enabled !== false)
-        .map((m) => map(m, 'policy'))
+    : (await listPolicyModels()).filter((m) => m.enabled !== false).map((m) => map(m, 'policy'))
   const filtered = list.filter((m) => !isGptTestModel(m))
   return filtered.sort((a, b) => rank(a.id) - rank(b.id) || String(a.id).localeCompare(String(b.id)))
 }
 
-export function testModelsView(platform) {
+export async function testModelsView(platform) {
   const kind = normalizeTestPlatform(platform)
   return {
-    items: listTestableModels(kind),
+    items: await listTestableModels(kind),
     platform: kind,
     protocol: kind === 'openai' ? 'openai.responses' : kind === 'anthropic' ? 'anthropic.messages' : null,
     inbound_path: kind === 'openai' ? '/v1/responses' : kind === 'anthropic' ? '/v1/messages' : null,
@@ -159,6 +160,7 @@ export async function syncCodexCatalog({
   fetchImpl,
   rotate = true,
   catalogClientVersion = 'auto',
+  operations,
 } = {}) {
   if (!projectRoot) {
     return { ok: false, error: 'invalid_request', message: 'projectRoot required', ids: [], synced: 0 }
@@ -189,81 +191,99 @@ export async function syncCodexCatalog({
   const merged = new Map()
   let usedVm = null
   let lastError = null
-  for (const target of targets) {
-    const direct = isLocalEgressProxy(target.proxy)
-    const proxyUrl = hostProxyUrlForVm(target)
-    if (!proxyUrl && !fetchImpl && !direct) {
-      lastError = {
-        ok: false,
-        error: 'proxy_required',
-        message: 'GPT 槽未绑定 SOCKS5',
-        vm_id: target.id,
+  const mutations = operations === undefined && isKubernetesMode() ? new SharedVmOperations(getDb()) : operations
+  let executionUncertain = false
+  for (const listed of targets) {
+    const readTarget = async () => {
+      const target = getVm(projectRoot, listed.id) || listed
+      const direct = isLocalEgressProxy(target.proxy)
+      const proxyUrl = hostProxyUrlForVm(target)
+      if (!proxyUrl && !fetchImpl && !direct) {
+        lastError = {
+          ok: false,
+          error: 'proxy_required',
+          message: 'GPT 槽未绑定 SOCKS5',
+          vm_id: target.id,
+        }
+        return
       }
-      continue
-    }
-    const accounts = readCodexAccounts(projectRoot, target.id)
-    const rows = accounts.length ? accounts : [target.codex || {}]
-    for (const account of rows) {
-      let access = account.access_token || target.codex?.access_token
-      const accountId = account.chatgpt_account_id || target.codex?.chatgpt_account_id
-      const refreshToken = account.refresh_token || target.codex?.refresh_token
-      const fetchOnce = () =>
-        fetchChatgptModelCatalog({
-          accessToken: access,
-          accountId,
-          proxyUrl,
-          fetchImpl,
-          direct,
-          catalogVersion: catalogVersion.version,
-        })
-      let live = await fetchOnce()
-      if (live.error === 'upstream_auth' && rotate && refreshToken) {
-        const tok = await refreshCodexAccessToken({ refreshToken, proxyUrl, fetchImpl })
-        if (!tok.ok) {
+      const accounts = readCodexAccounts(projectRoot, target.id)
+      const rows = accounts.length ? accounts : [target.codex || {}]
+      for (const account of rows) {
+        let access = account.access_token || target.codex?.access_token
+        const accountId = account.chatgpt_account_id || target.codex?.chatgpt_account_id
+        const refreshToken = account.refresh_token || target.codex?.refresh_token
+        const fetchOnce = async () =>
+          await fetchChatgptModelCatalog({
+            accessToken: access,
+            accountId,
+            proxyUrl,
+            fetchImpl,
+            direct,
+            catalogVersion: catalogVersion.version,
+          })
+        let live = await fetchOnce()
+        if (live.error === 'upstream_auth' && rotate && refreshToken) {
+          const tok = await refreshCodexAccessToken({ refreshToken, proxyUrl, fetchImpl })
+          if (!tok.ok) {
+            lastError = {
+              ok: false,
+              error: tok.error || 'refresh_failed',
+              message: 'GPT OAuth 刷新失败，请重新登录',
+              vm_id: target.id,
+            }
+            if (['timeout', 'fetch_failed', 'refresh_empty'].includes(tok.error)) {
+              executionUncertain = true
+              return { vmOperationUncertain: true }
+            }
+            continue
+          }
+          persistRefreshedCodexAccount(
+            projectRoot,
+            target.id,
+            {
+              access_token: tok.access_token,
+              refresh_token: tok.refresh_token,
+              id_token: tok.id_token || account.id_token,
+              expires_at: tok.expires_at || account.expires_at,
+            },
+            account,
+          )
+          access = tok.access_token
+          live = await fetchOnce()
+        }
+        if (!live.ok || !live.ids?.length) {
+          const auth = live.error === 'upstream_auth'
           lastError = {
             ok: false,
-            error: tok.error || 'refresh_failed',
-            message: 'GPT OAuth 刷新失败，请重新登录',
+            error: live.error || 'empty_catalog',
+            message: auth ? 'GPT OAuth 已过期，请重新登录' : '同步 GPT 目录失败',
             vm_id: target.id,
           }
           continue
         }
-        persistRefreshedCodexAccount(
-          projectRoot,
-          target.id,
-          {
-            access_token: tok.access_token,
-            refresh_token: tok.refresh_token,
-            id_token: tok.id_token || account.id_token,
-            expires_at: tok.expires_at || account.expires_at,
-          },
-          account,
-        )
-        access = tok.access_token
-        live = await fetchOnce()
-      }
-      if (!live.ok || !live.ids?.length) {
-        const auth = live.error === 'upstream_auth'
-        lastError = {
-          ok: false,
-          error: live.error || 'empty_catalog',
-          message: auth ? 'GPT OAuth 已过期，请重新登录' : '同步 GPT 目录失败',
-          vm_id: target.id,
+        usedVm = target.id
+        const rowsLive = live.models?.length ? live.models : live.ids.map((id) => ({ id }))
+        for (const row of rowsLive) {
+          const id = String(row?.id || row || '').trim()
+          if (!id) continue
+          merged.set(id.toLowerCase(), typeof row === 'object' ? row : { id })
         }
-        continue
-      }
-      usedVm = target.id
-      const rowsLive = live.models?.length ? live.models : live.ids.map((id) => ({ id }))
-      for (const row of rowsLive) {
-        const id = String(row?.id || row || '').trim()
-        if (!id) continue
-        merged.set(id.toLowerCase(), typeof row === 'object' ? row : { id })
       }
     }
+    try {
+      if (rotate && mutations) await mutations.run(listed.id, readTarget, { kind: 'codex_catalog_refresh' })
+      else await readTarget()
+    } catch (error) {
+      if (!['vm_operation_active', 'vm_execution_active'].includes(error.code)) throw error
+      lastError = { ok: false, error: error.code, vm_id: listed.id }
+    }
+    if (executionUncertain) break
   }
-  if (!merged.size) {
+  if (executionUncertain || !merged.size) {
     return {
       ok: false,
+      ...(executionUncertain ? { executionUncertain: true } : {}),
       error: lastError?.error || 'empty_catalog',
       message: lastError?.message || '同步 GPT 目录失败',
       vm_id: lastError?.vm_id || targets[0].id,
@@ -273,7 +293,7 @@ export async function syncCodexCatalog({
     }
   }
   const models = [...merged.values()]
-  const { added } = syncGptIdsIntoPolicy(models, { displayNameOf: (id) => modelsDevMeta('openai', id)?.name })
+  const { added } = await syncGptIdsIntoPolicy(models, { displayNameOf: (id) => modelsDevMeta('openai', id)?.name })
   return {
     ok: true,
     vm_id: usedVm,
@@ -321,7 +341,7 @@ export async function resolveTestModels({
     })
     if (live.ok) source = 'chatgpt'
   }
-  return { ...testModelsView(kind), source }
+  return { ...(await testModelsView(kind)), source }
 }
 
 function extractText(body) {
@@ -851,11 +871,11 @@ async function postV1Loopback({ path, baseUrl, apiKey, inbound, headers, vmId, t
 }
 
 async function postV1Messages(opts) {
-  return postV1Loopback({ ...opts, path: '/v1/messages' })
+  return await postV1Loopback({ ...opts, path: '/v1/messages' })
 }
 
 async function postV1Responses(opts) {
-  return postV1Loopback({ ...opts, path: '/v1/responses' })
+  return await postV1Loopback({ ...opts, path: '/v1/responses' })
 }
 
 /**
@@ -968,7 +988,7 @@ export async function runVmTestChat(opts = {}) {
 
   let model = String(opts.model || '').trim()
   if (!model) {
-    const models = listTestableModels(codex ? 'openai' : 'anthropic')
+    const models = await listTestableModels(codex ? 'openai' : 'anthropic')
     model = models[0]?.id || (codex ? 'gpt-5.4' : 'claude-haiku-4-5-20251001')
   }
   push('info', `模型 ${model}`)
@@ -1101,7 +1121,9 @@ export async function runVmTestChat(opts = {}) {
 
   const timeoutMs = Math.min(Math.max(Number(opts.timeoutMs) || 90000, 10000), 180000)
   let result
+  let observation
   try {
+    if (!codex) observation = await opts.accountQuota?.beginObservation?.()
     result = await (codex ? postV1Responses : postV1Messages)({
       baseUrl,
       apiKey,
@@ -1199,12 +1221,16 @@ export async function runVmTestChat(opts = {}) {
     if (errObj.request_id) push('info', `request_id=${errObj.request_id}`)
     if (result?.status === 401 && /revoked/i.test(String(errObj.message || errObj.upstream_message || ''))) {
       try {
-        opts.accountQuota?.recordLastProbe?.(vm.claude?.account_uuid || vm.account_uuid || vmId, {
-          ok: false,
-          source: 'test-chat',
-          error: errObj.message,
-          status: 401,
-        })
+        opts.accountQuota?.recordLastProbe?.(
+          vm.claude?.account_uuid || vm.account_uuid || vmId,
+          {
+            ok: false,
+            source: 'test-chat',
+            error: errObj.message,
+            status: 401,
+          },
+          { observation },
+        )
       } catch {}
     }
   }

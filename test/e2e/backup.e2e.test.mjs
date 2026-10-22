@@ -9,7 +9,6 @@ import os from 'node:os'
 import path from 'node:path'
 import zlib from 'node:zlib'
 import { spawnSync } from 'node:child_process'
-import { DatabaseSync } from 'node:sqlite'
 import { startGateway, api } from '../harness.mjs'
 
 test('manual backup → download → mutate → restore rolls back', async () => {
@@ -51,10 +50,10 @@ test('manual backup → download → mutate → restore rolls back', async () =>
     fs.writeFileSync(path.join(tmp, 'a.tar.gz'), buf)
     const tar = spawnSync('tar', ['-xzf', path.join(tmp, 'a.tar.gz'), '-C', tmp])
     assert.equal(tar.status, 0)
-    assert.ok(fs.existsSync(path.join(tmp, 'db', 'kin.db')))
+    assert.ok(fs.existsSync(path.join(tmp, 'db', 'postgres.dump')))
     assert.ok(fs.existsSync(path.join(tmp, 'manifest.json')))
     const manifest = JSON.parse(fs.readFileSync(path.join(tmp, 'manifest.json'), 'utf8'))
-    assert.equal(manifest.version, 1)
+    assert.equal(manifest.version, 2)
     fs.rmSync(tmp, { recursive: true, force: true })
 
     // 4. mutate state after the backup
@@ -86,9 +85,6 @@ test('manual backup → download → mutate → restore rolls back', async () =>
       },
     })
     assert.equal(m.status, 200, m.text)
-
-    // old db kept on disk as a safety net
-    assert.ok(fs.existsSync(path.join(gw.project, 'data', 'kin.db.pre-restore')))
 
     // ledger after restore still shows the pre_restore snapshot (undo path)
     const after = await api(gw, 'GET', '/api/panel/backups')
@@ -129,18 +125,13 @@ test('restore rebinds billing, API scheduler, and routing config without restart
     assert.equal(keyResponse.status, 201, keyResponse.text)
     const apiKey = keyResponse.json.item.key
 
-    const dbPath = path.join(gw.project, 'data', 'kin.db')
-    const beforeDb = new DatabaseSync(dbPath)
-    beforeDb.prepare('UPDATE groups SET rate_multiplier = 0 WHERE id = 1').run()
-    beforeDb.close()
+    await gw.db.exec('UPDATE groups SET rate_multiplier = 0 WHERE id = 1')
 
     const backup = await api(gw, 'POST', '/api/panel/backups')
     assert.equal(backup.status, 201, backup.text)
     const backupId = backup.json.item.id
 
-    const afterDb = new DatabaseSync(dbPath)
-    afterDb.prepare('UPDATE groups SET rate_multiplier = 2 WHERE id = 1').run()
-    afterDb.close()
+    await gw.db.exec('UPDATE groups SET rate_multiplier = 2 WHERE id = 1')
     assert.equal((await api(gw, 'DELETE', `/api/panel/api-endpoints/${endpointBeforeId}`)).status, 200)
     const endpointAfter = await api(gw, 'POST', '/api/panel/api-endpoints', {
       body: {

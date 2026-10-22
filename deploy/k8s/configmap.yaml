@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vm2api-config
+data:
+  VM2API_CONTROL_PLANE_MODE: kubernetes
+  VM2API_SHUTDOWN_TIMEOUT_MS: "60000"
+  VM2API_CLUSTER_SOCKET_DIR: /opt/vm2api/data/run/cluster
+  KIN_PROJECT_ROOT: /opt/vm2api
+  KIN_DATA_DIR: /opt/vm2api/data
+  KIN_CAPTURES_DIR: /opt/vm2api/data/captures
+  KIN_AUTO_SYNC_WRAP: "0"
+  HOST: 0.0.0.0
+  PORT: "8787"
+  NODE_ENV: production

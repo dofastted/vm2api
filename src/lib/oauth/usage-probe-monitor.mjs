@@ -14,6 +14,10 @@ import { shouldProbeFable, usageProbeBackoffRemainingMs } from './crs-usage-prob
 import { hasRefreshPresence } from './oauth-credentials.mjs'
 import { vmHasProxyPath } from './credential-refresh-monitor.mjs'
 import { hasLiveExtraSample, hasOfficialUsageSample, parseResetMs } from '../pool/quota-window.mjs'
+import { backgroundTasksFor } from '../core/shared-background-tasks.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { getSharedRoutingState } from '../admin/shared-routing-config.mjs'
+import { getActivityCoordinator } from '../db/database.mjs'
 export const DEFAULT_USAGE_PROBE = Object.freeze({
   enabled: false,
   interval_sec: 60,
@@ -195,12 +199,28 @@ export function createUsageProbeMonitor(opts = {}) {
   let timer = null
   let inflight = null
   let lastRun = null
+  let generation = 0
+  const sharedTasks = backgroundTasksFor(opts.sharedTasks)
+  const operations = new Set()
   const nowFn = opts.now || (() => Date.now())
   // One /usage hop per VM at a time, shared by the timer and 429 events.
   const probing = new Map()
   const backoff = new Map()
   const queue = []
   let running = 0
+
+  const refreshRouting = async () => {
+    if (!isKubernetesMode()) return
+    const routing = getSharedRoutingState(sharedTasks?.repo.db)
+    if (!routing) throw Object.assign(new Error('shared routing unavailable'), { code: 'routing_config_unavailable' })
+    const coordinator = getActivityCoordinator(routing.db)
+    if (!coordinator)
+      throw Object.assign(new Error('activity coordinator unavailable'), { code: 'maintenance_unavailable' })
+    await coordinator.runActivity({ kind: 'usage_probe_configuration' }, async () => ({
+      ended: true,
+      value: await routing.refresh(),
+    }))
+  }
 
   const listTargets = () => {
     const vms = typeof opts.listTargets === 'function' ? opts.listTargets() || [] : []
@@ -226,29 +246,51 @@ export function createUsageProbeMonitor(opts = {}) {
    * Failures keep the old sample (never a 0%), back off exponentially, and
    * surface in the run snapshot. A success clears the backoff.
    */
-  const probeVm = (vm, reason) => {
+  const probeVm = (vm, reason, prepare) => {
     const id = vm.id
     if (probing.has(id)) return probing.get(id)
-    const parked = backoff.get(id)
-    if (parked && parked.until > nowFn()) {
-      return Promise.resolve({ vm_id: id, ok: false, reason: 'probe_backoff', source: null })
-    }
     const worker = takeWorker()
     if (!worker) return Promise.resolve({ vm_id: id, ok: false, reason: 'probe_queue_full', source: null })
     const run = worker
       .then(async () => {
         try {
-          const result = await withTimeout(Promise.resolve(opts.probeOne(vm)), config.timeout_ms)
-          const ok = result?.ok !== false
-          if (ok) backoff.delete(id)
-          else {
-            const failures = (backoff.get(id)?.failures || 0) + 1
-            backoff.set(id, {
-              failures,
-              until: nowFn() + Math.min(STALE_USAGE_PROBE_GAP_MS, PROBE_BACKOFF_BASE_MS * 2 ** (failures - 1)),
-            })
+          const probe = async () => {
+            const prepared = await prepare?.()
+            if (prepared?.item) return { notStarted: true, value: prepared.item }
+            const probeReason = prepared?.reason || reason
+            const parked = backoff.get(id)
+            if (parked && parked.until > nowFn()) {
+              return { notStarted: true, value: { vm_id: id, ok: false, reason: 'probe_backoff', source: null } }
+            }
+            // The timeout only stops this caller waiting. Shutdown still observes the original work.
+            const operation = Promise.resolve().then(() => opts.probeOne(vm))
+            operations.add(operation)
+            operation.then(
+              () => operations.delete(operation),
+              () => operations.delete(operation),
+            )
+            const result = await withTimeout(operation, config.timeout_ms)
+            const payload = result?.data || result?.body?.data || result
+            const ok = result?.ok !== false && payload?.ok !== false
+            if (ok) backoff.delete(id)
+            else {
+              const failures = (backoff.get(id)?.failures || 0) + 1
+              backoff.set(id, {
+                failures,
+                until: nowFn() + Math.min(STALE_USAGE_PROBE_GAP_MS, PROBE_BACKOFF_BASE_MS * 2 ** (failures - 1)),
+              })
+            }
+            return {
+              terminal: (result != null && ok) || result?.taskTerminal === true || result?.taskNotStarted === true,
+              value: { vm_id: id, ok, reason: probeReason, source: payload?.source || (ok ? 'oauth-usage' : null) },
+            }
           }
-          return { vm_id: id, ok, reason, source: result?.source || (ok ? 'oauth-usage' : null) }
+          if (!sharedTasks) return (await probe()).value
+          const result = await sharedTasks.run(
+            { taskKey: `usage-probe:${id}`, intervalMs: config.interval_sec * 1000 },
+            probe,
+          )
+          return result.ran ? result.value : { vm_id: id, ok: false, reason: result.code, source: null }
         } catch (error) {
           const failures = (backoff.get(id)?.failures || 0) + 1
           backoff.set(id, {
@@ -266,62 +308,76 @@ export function createUsageProbeMonitor(opts = {}) {
   }
 
   /** Event-driven hop (unknown 429, reset recheck). Same single-flight and bounds as the timer. */
-  const probeNow = (vmId, reason = 'event') => {
+  const probeNow = async (vmId, reason = 'event') => {
+    await refreshRouting()
     if (typeof opts.probeOne !== 'function') return Promise.resolve({ vm_id: vmId, ok: false, reason: 'no_prober' })
     const vm = listTargets().find((item) => item.id === vmId)
     if (!vm) return Promise.resolve({ vm_id: vmId, ok: false, reason: 'not_target', source: null })
     return probeVm(vm, reason)
   }
 
-  const runOnce = async () => {
+  const runOnce = async ({ scheduled = false } = {}) => {
     if (inflight) return inflight
+    const current = generation
     inflight = (async () => {
+      await refreshRouting()
+      if (scheduled && (current !== generation || !config.enabled)) return lastRun
       const started = nowFn()
       const targets = listTargets()
-      const items = []
-      const due = []
+      let due = 0
       const staleMs = config.stale_sec * 1000
-      for (const vm of targets) {
+      const prepare = async (vm) => {
+        if (scheduled && (current !== generation || !config.enabled)) {
+          return { item: { vm_id: vm.id, ok: false, reason: 'stopped', source: null } }
+        }
         const account = typeof opts.accountForVm === 'function' ? opts.accountForVm(vm) : null
-        if (typeof opts.reconcile === 'function') {
-          try {
-            opts.reconcile(vm, account)
-          } catch {}
-        }
+        if (typeof opts.reconcile === 'function') await opts.reconcile(vm, account)
         let active = false
-        if (typeof opts.isActive === 'function') {
-          try {
-            active = !!opts.isActive(vm, account)
-          } catch {}
-        }
+        if (typeof opts.isActive === 'function') active = !!opts.isActive(vm, account)
         const decision = isUsageProbeDue(account || {}, { now: nowFn(), staleMs, active })
         if (!decision.due || typeof opts.probeOne !== 'function') {
-          items.push({
-            vm_id: vm.id,
-            ok: true,
-            reason: 'reconcile_extra',
-            source: null,
-          })
-          continue
+          return { item: { vm_id: vm.id, ok: true, reason: 'reconcile_extra', source: null } }
         }
         const nextProbeAt = resetProbeAt(account, vm, config, nowFn())
         if (nextProbeAt != null && nextProbeAt > nowFn()) {
-          items.push({
-            vm_id: vm.id,
-            ok: true,
-            reason: 'reset_probe_delay',
-            source: null,
-            next_probe_at: new Date(nextProbeAt).toISOString(),
-          })
-          continue
+          return {
+            item: {
+              vm_id: vm.id,
+              ok: true,
+              reason: 'reset_probe_delay',
+              source: null,
+              next_probe_at: new Date(nextProbeAt).toISOString(),
+            },
+          }
         }
-        due.push({ vm, reason: decision.reason })
+        due++
+        return { reason: decision.reason }
       }
-      items.push(...(await Promise.all(due.map(({ vm, reason }) => probeVm(vm, reason)))))
+      const items = []
+      if (sharedTasks) {
+        let cursor = 0
+        await Promise.all(
+          Array.from({ length: Math.min(config.concurrency, targets.length) }, async () => {
+            while (cursor < targets.length) {
+              const index = cursor++
+              const vm = targets[index]
+              items[index] = await probeVm(vm, 'scheduled', () => prepare(vm))
+            }
+          }),
+        )
+      } else {
+        const probes = []
+        for (const vm of targets) {
+          const prepared = await prepare(vm)
+          if (prepared.item) items.push(prepared.item)
+          else probes.push({ vm, reason: prepared.reason })
+        }
+        items.push(...(await Promise.all(probes.map(({ vm, reason }) => probeVm(vm, reason)))))
+      }
       lastRun = {
         at: new Date(nowFn()).toISOString(),
         duration_ms: nowFn() - started,
-        due: due.length,
+        due,
         items,
       }
       return lastRun
@@ -332,22 +388,25 @@ export function createUsageProbeMonitor(opts = {}) {
   }
 
   const stop = () => {
+    generation++
     if (timer) {
       clearInterval(timer)
       timer = null
     }
+    return flush()
   }
 
   const start = ({ immediate = false } = {}) => {
     stop()
     if (!config.enabled) return { started: false, reason: 'disabled' }
+    const current = generation
     timer = setInterval(() => {
-      runOnce().catch(() => {})
+      if (current === generation) runOnce({ scheduled: true }).catch(() => {})
     }, config.interval_sec * 1000)
     if (typeof timer.unref === 'function') timer.unref()
     if (immediate && config.run_on_start) {
       queueMicrotask(() => {
-        runOnce().catch(() => {})
+        if (current === generation) runOnce({ scheduled: true }).catch(() => {})
       })
     }
     return { started: true, interval_sec: config.interval_sec, run_on_start: config.run_on_start }
@@ -359,6 +418,12 @@ export function createUsageProbeMonitor(opts = {}) {
     return config
   }
 
+  const flush = async () => {
+    while (inflight || probing.size || operations.size) {
+      await Promise.allSettled([...(inflight ? [inflight] : []), ...probing.values(), ...operations])
+    }
+  }
+
   return {
     getConfig: () => config,
     setConfig,
@@ -366,6 +431,7 @@ export function createUsageProbeMonitor(opts = {}) {
     runOnce,
     probeNow,
     start,
+    flush,
     stop,
   }
 }

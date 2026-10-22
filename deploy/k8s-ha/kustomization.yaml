@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../k8s
+  - poddisruptionbudget.yaml
+patches:
+  - path: deployment.yaml
+  - target:
+      kind: ConfigMap
+      name: vm2api-config
+    patch: |-
+      - op: replace
+        path: /data/VM2API_CONTROL_PLANE_MODE
+        value: kubernetes-ha
+      - op: add
+        path: /data/VM2API_NODE_CONFIG_FILE
+        value: /etc/vm2api/nodes.json
+  - patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: vm2api-state

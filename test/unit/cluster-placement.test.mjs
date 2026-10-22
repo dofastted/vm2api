@@ -595,10 +595,11 @@ test('socket relay resolves the remote path lazily and reaches a unix socket ove
 
 test('a node with placed VMs cannot be removed', async () => {
   const manager = new ClusterManager({
-    repo: { get: () => ({ id: 'n1' }), dependentsOf: () => [] },
+    repo: { list: () => [{ id: 'n1' }], get: () => ({ id: 'n1' }), dependentsOf: () => [] },
     dataDir: '/tmp',
     vmsOnNode: () => [{ id: 'vm-02' }],
   })
+  await manager.reload()
   await assert.rejects(manager.remove('n1'), { code: 'node_has_vms' })
 })
 

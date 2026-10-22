@@ -1,0 +1,111 @@
+{
+  "source_commit": "6732a8648a4a57c6483abc7f685fce4d8cb28946",
+  "scope": "single active control plane on single-node amd64 k3s; not HA or issue 648 acceptance",
+  "image_reference": "docker.io/library/vm2api:kubernetes-6732a864",
+  "oci_manifest_digest": "sha256:db695e30d1ae3165bc88003f134584761db40dba09f1166e364b7dd9af683d05",
+  "config_digest": "sha256:e1b150ae36e2a80e785eb62b899aa144e4ad05692da05290e757489727451118",
+  "pod_image_id": "sha256:e1b150ae36e2a80e785eb62b899aa144e4ad05692da05290e757489727451118",
+  "namespace": "vm2api-k8s-649-77d914a4a9",
+  "namespace_cleanup": {
+    "state": "deleted",
+    "source": "task owner confirmation"
+  },
+  "build_adjustment": "Temporary Dockerfile only prepended ARG BUILDPLATFORM=linux/amd64 for the legacy builder; no feature patch.",
+  "checks": [
+    "pod-ready",
+    "service-dns-and-clusterip",
+    "health-ready-console",
+    "panel-cookie-login-and-postgres-metrics",
+    "api-key-create",
+    "managed-api-key-inference",
+    "go-api-kernel-json-and-sse",
+    "two-request-logs",
+    "second-control-plane-rejected",
+    "recreate-restart",
+    "postgres-session-and-api-key-persist",
+    "pvc-persists"
+  ],
+  "checks_passed": 12,
+  "smoke_exit_code": 0,
+  "sse_timing": {
+    "event": "sse-timing",
+    "headers_ms": 29.0,
+    "headers": {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      "transfer-encoding": "chunked",
+      "x-accel-buffering": "no"
+    },
+    "frames": [
+      {
+        "type": "message_start",
+        "arrived_ms": 29.1
+      },
+      {
+        "type": "content_block_start",
+        "arrived_ms": 29.1
+      },
+      {
+        "type": "content_block_delta",
+        "arrived_ms": 29.1
+      },
+      {
+        "type": "content_block_delta",
+        "arrived_ms": 1030.0
+      },
+      {
+        "type": "content_block_stop",
+        "arrived_ms": 1030.0
+      },
+      {
+        "type": "message_delta",
+        "arrived_ms": 1030.1
+      },
+      {
+        "type": "message_stop",
+        "arrived_ms": 1030.1
+      }
+    ],
+    "deltas": [
+      {
+        "text": "kubernetes-pro",
+        "arrived_ms": 29.1
+      },
+      {
+        "text": "of-77d914a4a9f4",
+        "arrived_ms": 1030.0
+      }
+    ],
+    "ended_ms": 1216.5
+  },
+  "artifacts": {
+    "smoke.jsonl": {
+      "sha256": "d29c550db3419dae39bf902d743f975b8590d5f6e23b1b748543e465b6425b5d"
+    },
+    "image-manifest.json": {
+      "sha256": "db695e30d1ae3165bc88003f134584761db40dba09f1166e364b7dd9af683d05"
+    },
+    "containerd-image.txt": {
+      "sha256": "e5a5d2392522e2b7ba523eb8db249eceae2a39ae54f57882a55cc3b92acf8551"
+    },
+    "image-id.txt": {
+      "sha256": "63a179914da1d2b7e7d97c9bb03570b29a0fad3d1a9a0af680e8a9918894a517"
+    }
+  },
+  "build_log_sha256": "31d12b596e274c70bf0a7775b7130b3ee98eef53ca480a1beaac91e67847033a",
+  "not_deployed": [
+    "later PKCE and shell-ticket persistence",
+    "later background-task and global-maintenance integration",
+    "b32641b8 kernel execution EOF correction",
+    "e854273a Go API body-copy interruption correction",
+    "08998f40 API lifecycle hooks",
+    "bdda2026 request activity hooks"
+  ],
+  "not_verified": [
+    "two active controllers on different Kubernetes nodes",
+    "HPA, rolling updates, scale-down and failover",
+    "node-side fencing and immutable remote execution termination proof",
+    "real remote VM/provider inference",
+    "production load and cross-node storage"
+  ]
+}

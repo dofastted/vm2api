@@ -19,14 +19,14 @@ function seedVm(project, id = 'vm-11') {
   return rec
 }
 
-test('clearVmCooldown 404s unknown slots', () => {
+test('clearVmCooldown 404s unknown slots', async () => {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cool-'))
-  const out = clearVmCooldown({ cfg: { paths: { project } }, id: 'vm-missing' })
+  const out = await clearVmCooldown({ cfg: { paths: { project } }, id: 'vm-missing' })
   assert.equal(out.status, 404)
   assert.equal(out.body.ok, false)
 })
 
-test('clearVmCooldown drops runtime leftover and usage 429 flag', () => {
+test('clearVmCooldown drops runtime leftover and usage 429 flag', async () => {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cool-'))
   seedVm(project)
   const runtime = new Map()
@@ -49,7 +49,7 @@ test('clearVmCooldown drops runtime leftover and usage 429 flag', () => {
   })
   const unbound = []
   let woken = 0
-  const out = clearVmCooldown({
+  const out = await clearVmCooldown({
     cfg: { paths: { project } },
     id: 'vm-11',
     accountQuota: {
@@ -98,7 +98,7 @@ test('clearVmCooldown drops runtime leftover and usage 429 flag', () => {
   assert.equal(woken, 1)
 })
 
-test('clearVmCooldown drops the on-disk park and refreshes a rejected 5h window', () => {
+test('clearVmCooldown drops the on-disk park and refreshes a rejected 5h window', async () => {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cool-'))
   const rec = seedVm(project)
   rec.claude.temp_unschedulable_until = Date.now() + 60_000
@@ -116,7 +116,7 @@ test('clearVmCooldown drops the on-disk park and refreshes a rejected 5h window'
       },
     },
   })
-  const out = clearVmCooldown({
+  const out = await clearVmCooldown({
     cfg: { paths: { project } },
     id: 'vm-11',
     accountQuota: {

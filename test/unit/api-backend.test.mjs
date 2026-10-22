@@ -1,3 +1,4 @@
+import { flushPendingWrites } from '../../src/lib/db/pending-writes.mjs'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -97,8 +98,9 @@ test('API backend applies the global official_full persona setting', async () =>
     requestLog: { start: () => ({ request_id: 'api-persona-test' }), finish() {} },
     stickyRouter: {},
     accountQuota: {},
-    apiKeyStore: { acquire: () => ({ ok: true }), release() {} },
+    apiKeyStore: { reserve: async (record) => ({ ok: true, record, release: async () => {} }) },
     apiScheduler: {
+      reload() {},
       pick: () => ({
         ok: true,
         endpoint: { id: 'ep-test', kind: 'claude', protocol: 'anthropic', base_url: 'https://upstream.invalid' },
@@ -106,7 +108,7 @@ test('API backend applies the global official_full persona setting', async () =>
         key: { id: 'key-test', api_key: 'secret' },
       }),
     },
-    apiEndpointStore: {},
+    apiEndpointStore: { listRaw: async () => [] },
     stats,
     routingConfigPath: routingFile,
     routingConfig: {
@@ -295,6 +297,7 @@ test('logs the session id actually sent upstream, not the caller one', async () 
   try {
     await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages')
     response.finish?.()
+    await flushPendingWrites()
     const sent = sessionIdFromOutboundBody(prepared.body) || prepared.meta.sessionId
     assert.ok(sent)
     assert.equal(logged.session_id, 'caller-sess')
@@ -310,7 +313,10 @@ for (const previousVm of [null, 'vm-01']) {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-queued-session-'))
     const routingFile = path.join(root, 'routing.json')
     fs.writeFileSync(routingFile, JSON.stringify({ compatibility: {} }))
-    const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+    const sticky = await new StickyRouter({
+      dataDir: path.join(root, 'data'),
+      config: { sticky: { enabled: true } },
+    }).init()
     const key = sticky.canonicalSessionKey('queued-caller')
     if (previousVm) {
       sticky.bind(key, { accountId: 'account-1', vmId: previousVm, sessionId: 'previous-outbound' })
@@ -339,9 +345,9 @@ for (const previousVm of [null, 'vm-01']) {
     const secondReady = new Promise((resolve) => {
       enteredSecond = resolve
     })
-    t.after(() => {
+    t.after(async () => {
       releaseFirst()
-      sticky.db.close()
+      await sticky.db.close()
       fs.rmSync(root, { recursive: true, force: true })
     })
     const sent = []
@@ -482,8 +488,7 @@ async function runManagedKeyHop(root, result) {
     stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
     accountQuota: { ingestHeaders() {} },
     apiKeyStore: {
-      acquire: () => ({ ok: true }),
-      release() {},
+      reserve: async (record) => ({ ok: true, record, release: async () => {} }),
       recordUsage: (key, usage, opts) => charges.push({ key, usage, opts }),
     },
     apiScheduler: {},
@@ -679,12 +684,15 @@ function protocolHarness({ body, stickyRouter, failoverRunner, apiKeyRecord = nu
     stickyRouter,
     accountQuota: {},
     apiKeyStore: {
-      acquire: () => {
+      reserve: async (record) => {
         apiKeyCalls.acquire += 1
-        return { ok: true }
-      },
-      release: () => {
-        apiKeyCalls.release += 1
+        return {
+          ok: true,
+          record,
+          release: async () => {
+            apiKeyCalls.release += 1
+          },
+        }
       },
     },
     apiScheduler: {},
@@ -833,13 +841,16 @@ function sessionBody(userId, extra = {}) {
   }
 }
 
-function realStickyRouter() {
+async function realStickyRouter() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-identity-sticky-'))
-  return { dir, router: new StickyRouter({ dataDir: dir, config: { sticky: { enabled: true, ttl_seconds: 600 } } }) }
+  return {
+    dir,
+    router: await new StickyRouter({ dataDir: dir, config: { sticky: { enabled: true, ttl_seconds: 600 } } }).init(),
+  }
 }
 
 test('inbound session and device keys match across API keys at the protocol entry', async () => {
-  const { dir, router } = realStickyRouter()
+  const { dir, router } = await realStickyRouter()
   try {
     const body = sessionBody({ device_id: 'dev-cross', account_uuid: 'acct-a', session_id: 'sess-cross' })
     const a = await captureRunOpts({ body, stickyRouter: router, apiKeyRecord: { id: 'key-a', group_id: 1 } })
@@ -864,7 +875,7 @@ test('inbound session and device keys match across API keys at the protocol entr
 })
 
 test('the protocol entry hands the device seat key to the pool, independent of the API key', async () => {
-  const { dir, router } = realStickyRouter()
+  const { dir, router } = await realStickyRouter()
   try {
     const turn = {
       messages: [{ role: 'user', content: 'please refactor the scheduler module and explain every single change' }],
@@ -888,7 +899,7 @@ test('the protocol entry hands the device seat key to the pool, independent of t
 })
 
 test('shared API key keeps different devices apart at the protocol entry', async () => {
-  const { dir, router } = realStickyRouter()
+  const { dir, router } = await realStickyRouter()
   try {
     const apiKeyRecord = { id: 'shared-key', group_id: 1 }
     const a = await captureRunOpts({
@@ -909,7 +920,7 @@ test('shared API key keeps different devices apart at the protocol entry', async
 })
 
 test('explicit body device_id is the fallback when metadata has no device', async () => {
-  const { dir, router } = realStickyRouter()
+  const { dir, router } = await realStickyRouter()
   try {
     const opts = await captureRunOpts({
       body: sessionBody({ session_id: 'sess-fallback' }, { device_id: 'dev-explicit' }),
@@ -925,7 +936,7 @@ test('explicit body device_id is the fallback when metadata has no device', asyn
 })
 
 test('legacy API-key-scoped session row migrates lazily at the protocol entry', async () => {
-  const { dir, router } = realStickyRouter()
+  const { dir, router } = await realStickyRouter()
   try {
     const apiKeyRecord = { id: 'key-old', group_id: 1 }
     const legacyKey = 'p:anthropic:kkey-old:sess-legacy'
@@ -959,7 +970,7 @@ test('legacy API-key-scoped session row migrates lazily at the protocol entry', 
 })
 
 test('parent and child family key is shared across API keys and inherits a live legacy family', async () => {
-  const { dir, router } = realStickyRouter()
+  const { dir, router } = await realStickyRouter()
   try {
     router.bind('p:anthropic:kkey-p:family:parent-sess', { accountId: 'acc-fam', vmId: 'vm-fam' })
     const parent = await captureRunOpts({
@@ -983,15 +994,15 @@ test('parent and child family key is shared across API keys and inherits a live 
 })
 
 test('Claude Code sub-agent hops run as child sessions of the main session', async () => {
-  const { dir, router } = realStickyRouter()
+  const { dir, router } = await realStickyRouter()
   try {
     const apiKeyRecord = { id: 'key-cc', group_id: 1 }
     const body = sessionBody({ device_id: 'dev-cc', session_id: 'main-sess' })
     const main = await captureRunOpts({ body, stickyRouter: router, apiKeyRecord })
     router.bind(main.stickyKey, { accountId: 'acc-cc', vmId: 'vm-cc', slotIndex: 0 })
     router.bind(main.familyKey, { accountId: 'acc-cc', vmId: 'vm-cc' })
-    const agentHop = (agentId, parentAgentId) =>
-      captureRunOpts({
+    const agentHop = async (agentId, parentAgentId) =>
+      await captureRunOpts({
         body,
         stickyRouter: router,
         apiKeyRecord,
@@ -1027,7 +1038,7 @@ test('Claude Code sub-agent hops run as child sessions of the main session', asy
 })
 
 test('request without trusted session id keeps the legacy scoped sticky key', async () => {
-  const { dir, router } = realStickyRouter()
+  const { dir, router } = await realStickyRouter()
   try {
     const body = {
       model: 'claude-sonnet-4-5',
@@ -1044,7 +1055,7 @@ test('request without trusted session id keeps the legacy scoped sticky key', as
 })
 
 test('one-shot test call skips the session seat but keeps its sticky key', async () => {
-  const { dir, router } = realStickyRouter()
+  const { dir, router } = await realStickyRouter()
   try {
     const probe = await captureRunOpts({
       body: sessionBody({ device_id: 'dev-probe', session_id: 'sess-probe' }, { max_tokens: 1024 }),
@@ -1113,6 +1124,7 @@ test('Responses API backend keeps parallel done-only tools in one stream state',
   }
   try {
     const result = await runApiInference({
+      store: { listRaw: async () => [] },
       cfg: { paths: { data: root } },
       res,
       protocol: 'openai.chat',
@@ -1126,6 +1138,7 @@ test('Responses API backend keeps parallel done-only tools in one stream state',
         },
       },
       scheduler: {
+        reload() {},
         pick: () => ({
           ok: true,
           endpoint: { id: 'ep', kind: 'openai', protocol: 'openai', base_url: 'https://fixture.invalid' },
@@ -1170,6 +1183,7 @@ test('API Anthropic non-stream rejects message_start without message_stop', asyn
   await new Promise((resolve) => kernel.listen(socket, resolve))
   try {
     const result = await runApiInference({
+      store: { listRaw: async () => [] },
       cfg: { paths: { data: root } },
       res: { headersSent: false, write: () => {} },
       protocol: 'anthropic.messages',
@@ -1179,6 +1193,7 @@ test('API Anthropic non-stream rejects message_start without message_stop', asyn
       inbound: {},
       converters: { createClaudeMessageAssembler, applyClaudeSSELineToMessage },
       scheduler: {
+        reload() {},
         pick: () => ({
           ok: true,
           endpoint: { id: 'ep', kind: 'claude', protocol: 'anthropic', base_url: 'https://fixture.invalid' },
@@ -1226,6 +1241,7 @@ test('API Anthropic non-stream rejects stop_reason and text without message_stop
   await new Promise((resolve) => kernel.listen(socket, resolve))
   try {
     const result = await runApiInference({
+      store: { listRaw: async () => [] },
       cfg: { paths: { data: root } },
       res: { headersSent: false, write: () => {} },
       protocol: 'anthropic.messages',
@@ -1235,6 +1251,7 @@ test('API Anthropic non-stream rejects stop_reason and text without message_stop
       inbound: {},
       converters: { createClaudeMessageAssembler, applyClaudeSSELineToMessage },
       scheduler: {
+        reload() {},
         pick: () => ({
           ok: true,
           endpoint: { id: 'ep', kind: 'claude', protocol: 'anthropic', base_url: 'https://fixture.invalid' },
@@ -1268,6 +1285,7 @@ test('API Anthropic non-stream accepts message_stop as terminal', async () => {
   await new Promise((resolve) => kernel.listen(socket, resolve))
   try {
     const result = await runApiInference({
+      store: { listRaw: async () => [] },
       cfg: { paths: { data: root } },
       res: { headersSent: false, write: () => {} },
       protocol: 'anthropic.messages',
@@ -1277,6 +1295,7 @@ test('API Anthropic non-stream accepts message_stop as terminal', async () => {
       inbound: {},
       converters: { createClaudeMessageAssembler, applyClaudeSSELineToMessage },
       scheduler: {
+        reload() {},
         pick: () => ({
           ok: true,
           endpoint: { id: 'ep', kind: 'claude', protocol: 'anthropic', base_url: 'https://fixture.invalid' },
@@ -1335,8 +1354,9 @@ test('API backend non-stream maps incomplete assistant hops to incomplete_respon
     requestLog: { start: () => ({ request_id: 'api-incomplete-test' }), finish() {} },
     stickyRouter: {},
     accountQuota: {},
-    apiKeyStore: { acquire: () => ({ ok: true }), release() {} },
+    apiKeyStore: { reserve: async (record) => ({ ok: true, record, release: async () => {} }) },
     apiScheduler: {
+      reload() {},
       pick: () => ({
         ok: true,
         endpoint: { id: 'ep-test', kind: 'claude', protocol: 'anthropic', base_url: 'https://upstream.invalid' },
@@ -1344,7 +1364,7 @@ test('API backend non-stream maps incomplete assistant hops to incomplete_respon
         key: { id: 'key-test', api_key: 'secret' },
       }),
     },
-    apiEndpointStore: {},
+    apiEndpointStore: { listRaw: async () => [] },
     stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
     routingConfigPath: routingFile,
     routingConfig: { compatibility: { persona_preset: 'zero' }, failover: {} },
@@ -1393,6 +1413,7 @@ test('Responses API backend returns 502 for conflicting tool arguments when the 
   await new Promise((resolve) => kernel.listen(socket, resolve))
   try {
     const result = await runApiInference({
+      store: { listRaw: async () => [] },
       cfg: { paths: { data: root } },
       res: { headersSent: false, write: () => {} },
       protocol: 'anthropic.messages',
@@ -1402,6 +1423,7 @@ test('Responses API backend returns 502 for conflicting tool arguments when the 
       inbound: {},
       converters: { writeSSEHeaders: () => {} },
       scheduler: {
+        reload() {},
         pick: () => ({
           ok: true,
           endpoint: { id: 'ep', kind: 'openai', protocol: 'openai', base_url: 'https://fixture.invalid' },

@@ -3,6 +3,7 @@
 package slotgate
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"syscall"
@@ -15,6 +16,10 @@ const oPath = 0x200000
 // in run/, so the final component is opened O_PATH|O_NOFOLLOW, checked to be a
 // socket, and connected through its /proc fd with no second path lookup.
 func dialSlotSocket(path string) (net.Conn, error) {
+	return dialSlotSocketContext(context.Background(), path)
+}
+
+func dialSlotSocketContext(ctx context.Context, path string) (net.Conn, error) {
 	fd, err := syscall.Open(path, oPath|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, err
@@ -27,5 +32,5 @@ func dialSlotSocket(path string) (net.Conn, error) {
 	if st.Mode&syscall.S_IFMT != syscall.S_IFSOCK {
 		return nil, fmt.Errorf("%s is not a socket", path)
 	}
-	return net.Dial("unix", fmt.Sprintf("/proc/self/fd/%d", fd))
+	return (&net.Dialer{}).DialContext(ctx, "unix", fmt.Sprintf("/proc/self/fd/%d", fd))
 }

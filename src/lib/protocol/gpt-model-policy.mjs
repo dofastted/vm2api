@@ -2,7 +2,9 @@
  * GPT catalog. Separate settings key from Claude model_policy.
  * Live ids from ChatGPT sync; seed is empty-catalog fallback.
  */
-import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { RuntimeSettings as SettingsRepo } from '../db/settings-state.mjs'
+import { getDb } from '../db/database.mjs'
+import { SettingsRepo as PersistentSettingsRepo } from '../db/repos/settings-repo.mjs'
 import { isGptSeriesId, isSyncableGptCatalogId } from './gpt-ids.mjs'
 
 const SETTINGS_KEY = 'gpt_model_policy'
@@ -56,28 +58,34 @@ export function seedGptPolicy() {
 let policy = seedGptPolicy()
 let loaded = false
 
-function persist() {
-  try {
-    new SettingsRepo().set(SETTINGS_KEY, policy)
-  } catch (e) {
-    console.warn('[gpt-model-policy] persist failed', e?.message || e)
-  }
+async function persist(next = policy) {
+  const db = getDb()
+  await new PersistentSettingsRepo(db).set(SETTINGS_KEY, next)
+  db.afterCommit(() => {
+    policy = next
+    loaded = true
+  })
 }
 
-export function loadGptModelPolicy({ force = false } = {}) {
+function normalizeGptPolicy(stored) {
+  if (!stored || typeof stored !== 'object' || !stored.models || typeof stored.models !== 'object') return null
+  const live = stored.source === 'codex' && Object.keys(stored.models).length
+  const seed = seedGptPolicy()
+  const normalized = {
+    ...(live ? stored : { ...seed, ...stored, models: { ...seed.models, ...stored.models } }),
+    platform: 'openai',
+  }
+  normalized.source = normalized.source || 'settings'
+  return normalized
+}
+
+export async function loadGptModelPolicy({ force = false } = {}) {
   if (loaded && !force) return policy
   try {
-    const stored = new SettingsRepo().get(SETTINGS_KEY, null)
-    if (stored && typeof stored === 'object' && stored.models && typeof stored.models === 'object') {
-      const live = stored.source === 'codex' && Object.keys(stored.models).length
-      policy = {
-        ...(live ? stored : { ...seedGptPolicy(), ...stored, models: { ...seedGptPolicy().models, ...stored.models } }),
-        platform: 'openai',
-      }
-      policy.source = policy.source || 'settings'
-    } else {
+    policy = normalizeGptPolicy(new SettingsRepo().get(SETTINGS_KEY, null))
+    if (!policy) {
       policy = seedGptPolicy()
-      persist()
+      await persist()
     }
   } catch {
     policy = seedGptPolicy()
@@ -86,12 +94,18 @@ export function loadGptModelPolicy({ force = false } = {}) {
   return policy
 }
 
-export function getGptModelPolicy() {
-  if (!loaded) loadGptModelPolicy()
+/** Apply a refreshed settings value without persisting missing-policy defaults. */
+export function refreshGptModelPolicy(stored) {
+  policy = normalizeGptPolicy(stored) || seedGptPolicy()
+  loaded = true
   return policy
 }
 
-export function saveGptModelPolicy(next) {
+export function getGptModelPolicy() {
+  return policy
+}
+
+export async function saveGptModelPolicy(next) {
   const seed = seedGptPolicy()
   const models = { ...(seed.models || {}) }
   if (next?.models && typeof next.models === 'object') {
@@ -100,7 +114,7 @@ export function saveGptModelPolicy(next) {
       models[id] = { ...models[id], ...row, id, family: 'codex' }
     }
   }
-  policy = {
+  const saved = {
     ...seed,
     ...next,
     models,
@@ -108,11 +122,10 @@ export function saveGptModelPolicy(next) {
     updated_at: new Date().toISOString(),
     source: 'panel',
   }
-  persist()
-  return policy
+  await persist(saved)
+  return saved
 }
 export function listGptPolicyModels() {
-  if (!loaded) loadGptModelPolicy()
   return Object.entries(policy.models || {})
     .filter(([id, cfg]) => isGptSeriesId(id) && cfg?.enabled !== false)
     .map(([id, cfg]) => ({ id, ...cfg, family: 'codex' }))
@@ -120,7 +133,6 @@ export function listGptPolicyModels() {
 }
 
 export function getGptPolicyCatalogIds({ enabledOnly = false } = {}) {
-  if (!loaded) loadGptModelPolicy()
   return Object.entries(policy.models || {})
     .filter(([id, cfg]) => isGptSeriesId(id) && (!enabledOnly || cfg?.enabled !== false))
     .map(([id]) => id)
@@ -128,18 +140,16 @@ export function getGptPolicyCatalogIds({ enabledOnly = false } = {}) {
 
 export function isGptModelEnabled(id) {
   if (!isGptSeriesId(id)) return false
-  if (!loaded) loadGptModelPolicy()
   const row = policy.models?.[id]
   if (row) return row.enabled !== false
   if (policy.source === 'codex' && Object.keys(policy.models || {}).length) return false
   return true
 }
 
-export function resetGptModelPolicy() {
-  policy = seedGptPolicy()
-  loaded = true
-  persist()
-  return policy
+export async function resetGptModelPolicy() {
+  const saved = seedGptPolicy()
+  await persist(saved)
+  return saved
 }
 
 /**
@@ -147,8 +157,7 @@ export function resetGptModelPolicy() {
  * a GPT id the policy has never seen starts disabled until the admin enables it
  * (GPT has no worker_only mode).
  */
-export function syncGptIdsIntoPolicy(ids = [], { displayNameOf = null } = {}) {
-  if (!loaded) loadGptModelPolicy()
+export async function syncGptIdsIntoPolicy(ids = [], { displayNameOf = null } = {}) {
   const live = []
   const seen = new Set()
   for (const item of ids || []) {
@@ -163,30 +172,33 @@ export function syncGptIdsIntoPolicy(ids = [], { displayNameOf = null } = {}) {
   if (!live.length) {
     return { ok: true, synced: 0, added: [], ids: listGptPolicyModels().map((m) => m.id) }
   }
-  const next = {}
+  const db = getDb()
   const added = []
-  for (const row of live) {
-    const prev = policy.models[row.id]
-    if (!prev) added.push(row.id)
-    next[row.id] = entry(row.id, {
-      ...prev,
-      display_name: row.display_name || prev?.display_name || displayNameOf?.(row.id) || row.id,
-      enabled: prev ? prev.enabled !== false : false,
-      source: 'codex',
-    })
-  }
-  policy = {
-    ...policy,
-    models: next,
-    platform: 'openai',
-    updated_at: new Date().toISOString(),
-    source: 'codex',
-  }
-  persist()
+  const saved = await new PersistentSettingsRepo(db).update(SETTINGS_KEY, (current) => {
+    const previous = normalizeGptPolicy(current) || seedGptPolicy()
+    const models = {}
+    for (const row of live) {
+      const prev = previous.models[row.id]
+      if (!prev) added.push(row.id)
+      models[row.id] = entry(row.id, {
+        ...prev,
+        display_name: row.display_name || prev?.display_name || displayNameOf?.(row.id) || row.id,
+        enabled: prev ? prev.enabled !== false : false,
+        source: 'codex',
+      })
+    }
+    return { ...previous, models, platform: 'openai', updated_at: new Date().toISOString(), source: 'codex' }
+  })
+  db.afterCommit(() => {
+    policy = saved
+    loaded = true
+  })
   return {
     ok: true,
     synced: live.length,
     added,
-    ids: listGptPolicyModels().map((m) => m.id),
+    ids: Object.values(saved.models)
+      .filter((row) => row.enabled !== false)
+      .map((row) => row.id),
   }
 }

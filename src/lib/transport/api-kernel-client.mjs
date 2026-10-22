@@ -109,7 +109,7 @@ export function apiKernelSnapshot(cfg) {
   }
 }
 
-export function forwardApi({
+export async function forwardApi({
   cfg,
   method = 'POST',
   url,
@@ -118,7 +118,14 @@ export function forwardApi({
   proxyUrl = '',
   signal,
   timeoutMs = 300_000,
+  requestId = crypto.randomUUID(),
+  onExecutionStart,
 } = {}) {
+  const execution = { requestId, started: false, ended: true, reason: 'not_started' }
+  if (signal?.aborted) {
+    throw Object.assign(new Error('API request aborted before forwarding'), { code: 'ABORT_ERR', execution })
+  }
+  await onExecutionStart?.({ requestId })
   return new Promise((resolve, reject) => {
     const { socketPath, tokenPath } = apiKernelPaths(cfg)
     const token = readToken(tokenPath)
@@ -128,6 +135,7 @@ export function forwardApi({
       headers,
       body: typeof body === 'string' ? body : JSON.stringify(body ?? {}),
       proxy_url: proxyUrl || '',
+      request_id: requestId,
     })
     const payload = Buffer.from(envelope)
     const reqHeaders = {
@@ -140,6 +148,8 @@ export function forwardApi({
     }
     const started = Date.now()
     const attempt = (left) => {
+      let connected = false
+      Object.assign(execution, { ended: false, reason: 'connecting' })
       const req = http.request(
         {
           socketPath,
@@ -148,8 +158,23 @@ export function forwardApi({
           headers: reqHeaders,
           signal,
         },
-        (res) => resolve(res),
+        (res) => {
+          res.execution = execution
+          res.once('aborted', () => {
+            if (execution.reason !== 'timeout')
+              execution.reason = signal?.aborted ? 'client_aborted' : 'transport_error'
+          })
+          resolve(res)
+        },
       )
+      req.once('socket', (socket) => {
+        const onConnect = () => {
+          connected = true
+          Object.assign(execution, { started: true, ended: false, reason: 'in_progress' })
+        }
+        if (socket.connecting) socket.once('connect', onConnect)
+        else if (!socket.destroyed) onConnect()
+      })
       const timer = setTimeout(
         () => {
           req.destroy(
@@ -162,11 +187,25 @@ export function forwardApi({
       req.once('close', () => clearTimeout(timer))
       req.once('error', (err) => {
         clearTimeout(timer)
-        const retryable = err?.code === 'ENOENT' || err?.code === 'ECONNREFUSED'
+        const retryable = !connected && (err?.code === 'ENOENT' || err?.code === 'ECONNREFUSED')
         if (retryable && left > 0 && !signal?.aborted) {
           setTimeout(() => attempt(left - 1), 80)
           return
         }
+        Object.assign(
+          execution,
+          retryable
+            ? { started: false, ended: true, reason: 'not_started' }
+            : {
+                ended: false,
+                reason: signal?.aborted
+                  ? 'client_aborted'
+                  : err?.code === 'api_kernel_timeout'
+                    ? 'timeout'
+                    : 'transport_error',
+              },
+        )
+        err.execution = execution
         reject(err)
       })
       req.write(payload)

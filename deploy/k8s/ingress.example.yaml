@@ -1,0 +1,21 @@
+# Optional; set the ingress class, host and TLS secret for your installation.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vm2api
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts: [vm2api.example.com]
+      secretName: vm2api-tls
+  rules:
+    - host: vm2api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: vm2api
+                port:
+                  name: http

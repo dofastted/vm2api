@@ -7,6 +7,10 @@
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { hasRefreshPresence, needsRefresh } from './oauth-credentials.mjs'
+import { backgroundTasksFor } from '../core/shared-background-tasks.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { getSharedRoutingState } from '../admin/shared-routing-config.mjs'
+import { getActivityCoordinator } from '../db/database.mjs'
 
 export const DEFAULT_CREDENTIAL_REFRESH = Object.freeze({
   enabled: true,
@@ -98,6 +102,8 @@ export function createCredentialRefreshMonitor(opts = {}) {
   let timer = null
   let inflight = null
   let lastRun = null
+  let generation = 0
+  const sharedTasks = backgroundTasksFor(opts.sharedTasks)
   const nowFn = opts.now || (() => Date.now())
 
   const listDue = () => {
@@ -105,22 +111,56 @@ export function createCredentialRefreshMonitor(opts = {}) {
     return vms.filter((vm) => isCredentialRefreshTarget(vm) && needsScheduledRefresh(vm, nowFn()))
   }
 
-  const runOnce = async () => {
+  const runOnce = async ({ scheduled = false } = {}) => {
     if (inflight) return inflight
+    const current = generation
     inflight = (async () => {
+      if (isKubernetesMode()) {
+        const routing = getSharedRoutingState(sharedTasks?.repo.db)
+        if (!routing)
+          throw Object.assign(new Error('shared routing unavailable'), { code: 'routing_config_unavailable' })
+        const coordinator = getActivityCoordinator(routing.db)
+        if (!coordinator)
+          throw Object.assign(new Error('activity coordinator unavailable'), { code: 'maintenance_unavailable' })
+        await coordinator.runActivity({ kind: 'credential_refresh_configuration' }, async () => ({
+          ended: true,
+          value: await routing.refresh(),
+        }))
+      }
+      if (scheduled && (current !== generation || !config.enabled)) return lastRun
       const started = nowFn()
       const due = listDue()
       const items = []
       if (due.length && typeof opts.refreshOne === 'function') {
         await mapPool(due, config.concurrency, async (vm) => {
           try {
-            const result = await opts.refreshOne(vm, config)
-            items.push({
-              vm_id: vm.id,
-              schedulable: vm.schedulable !== false,
-              ok: !!result?.ok,
-              refresh_class: result?.refresh_class || (result?.ok ? 'already_fresh' : 'failed'),
-            })
+            const refresh = async () => {
+              if (scheduled && (current !== generation || !config.enabled)) {
+                return {
+                  notStarted: true,
+                  value: { vm_id: vm.id, ok: false, refresh_class: 'skipped', reason: 'stopped' },
+                }
+              }
+              const result = await opts.refreshOne(vm, config)
+              return {
+                terminal: result?.ok === true || result?.taskTerminal === true || result?.taskNotStarted === true,
+                value: {
+                  vm_id: vm.id,
+                  schedulable: vm.schedulable !== false,
+                  ok: !!result?.ok,
+                  refresh_class: result?.refresh_class || (result?.ok ? 'already_fresh' : 'failed'),
+                },
+              }
+            }
+            if (sharedTasks) {
+              const result = await sharedTasks.run(
+                { taskKey: `credential-refresh:${vm.id}`, intervalMs: config.interval_sec * 1000 },
+                refresh,
+              )
+              items.push(
+                result.ran ? result.value : { vm_id: vm.id, ok: false, refresh_class: 'skipped', reason: result.code },
+              )
+            } else items.push((await refresh()).value)
           } catch (error) {
             items.push({
               vm_id: vm.id,
@@ -146,22 +186,25 @@ export function createCredentialRefreshMonitor(opts = {}) {
   }
 
   const stop = () => {
+    generation++
     if (timer) {
       clearInterval(timer)
       timer = null
     }
+    return inflight ? Promise.allSettled([inflight]) : Promise.resolve()
   }
 
   const start = ({ immediate = false } = {}) => {
     stop()
     if (!config.enabled) return { started: false, reason: 'disabled' }
+    const current = generation
     timer = setInterval(() => {
-      runOnce().catch(() => {})
+      if (current === generation) runOnce({ scheduled: true }).catch(() => {})
     }, config.interval_sec * 1000)
     if (typeof timer.unref === 'function') timer.unref()
     if (immediate && config.run_on_start) {
       queueMicrotask(() => {
-        runOnce().catch(() => {})
+        if (current === generation) runOnce({ scheduled: true }).catch(() => {})
       })
     }
     return { started: true, interval_sec: config.interval_sec, run_on_start: config.run_on_start }
@@ -179,6 +222,9 @@ export function createCredentialRefreshMonitor(opts = {}) {
     getSnapshot: () => lastRun,
     runOnce,
     start,
+    flush: async () => {
+      while (inflight) await inflight
+    },
     stop,
   }
 }

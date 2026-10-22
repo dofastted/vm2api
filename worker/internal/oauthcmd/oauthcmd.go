@@ -38,10 +38,11 @@ type resetRedeemInput struct {
 	RequestID        string `json:"request_id"`
 }
 type responseEnvelope struct {
-	OK      bool              `json:"ok"`
-	Status  int               `json:"status"`
-	Body    any               `json:"body"`
-	Headers map[string]string `json:"headers"`
+	OK             bool              `json:"ok"`
+	Status         int               `json:"status"`
+	Body           any               `json:"body"`
+	Headers        map[string]string `json:"headers"`
+	RefreshUnknown bool              `json:"refresh_unknown,omitempty"`
 }
 
 type countTokensInput struct {
@@ -86,7 +87,7 @@ func Run(args []string, stdin io.Reader, stdout io.Writer) int {
 	if op == "refresh" {
 		result, err := refresher.Ensure(ctx, force)
 		if err != nil {
-			return writeAndReturn(stdout, errorEnvelope(refreshErrorStatus(err), classifyError(err), errorMessage(classifyError(err))), 0)
+			return writeAndReturn(stdout, refreshErrorEnvelope(refreshErrorStatus(err), err), 0)
 		}
 		return writeAndReturn(stdout, responseEnvelope{
 			OK:     true,
@@ -157,8 +158,7 @@ func Run(args []string, stdin io.Reader, stdout io.Writer) int {
 		response, err = client.Post(ctx, target, payload, headers)
 	}
 	if err != nil {
-		code := classifyError(err)
-		return writeAndReturn(stdout, errorEnvelope(0, code, errorMessage(code)), 0)
+		return writeAndReturn(stdout, refreshErrorEnvelope(0, err), 0)
 	}
 	return writeUpstreamResponse(stdout, response)
 }
@@ -343,6 +343,13 @@ func errorEnvelope(status int, code, message string) responseEnvelope {
 		},
 		Headers: map[string]string{},
 	}
+}
+
+func refreshErrorEnvelope(status int, err error) responseEnvelope {
+	code := classifyError(err)
+	envelope := errorEnvelope(status, code, errorMessage(code))
+	envelope.RefreshUnknown = kinoauth.IsRefreshUnknown(err)
+	return envelope
 }
 
 func classifyError(err error) string {

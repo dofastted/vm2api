@@ -11,8 +11,16 @@
  */
 
 import { getDb } from '../database.mjs'
+import { addInteger, integerValue } from '../integers.mjs'
 import { reportTimezone, zonedDayStartMs, zonedParts, zonedWallToMs } from '../../core/timezone.mjs'
-import { ERROR_PRED, PROMPT_TOKENS_SQL, SUCCESS_PRED, TOTAL_TOKENS_SQL, ownerPred } from './usage-log-preds.mjs'
+import {
+  ERROR_PRED,
+  PROMPT_TOKENS_SQL,
+  SUCCESS_PRED,
+  TOTAL_TOKENS_SQL,
+  ownerPred,
+  totalTokens,
+} from './usage-log-preds.mjs'
 import { lookupNames } from './usage-logs-view.mjs'
 
 export const STATS_RANGES = ['today', '7days', '30days', 'thisMonth']
@@ -34,7 +42,8 @@ const DIMENSION_COLUMN = { user: 'user_id', key: 'api_key_id', model: 'model', v
 const TOKENS_SQL = TOTAL_TOKENS_SQL
 
 /** created_at (`YYYY-MM-DDTHH:MM:SS.sssZ`) floored to its 15-minute UTC slot. */
-const SLOT_SQL = "substr(created_at, 1, 14) || printf('%02d', (CAST(substr(created_at, 15, 2) AS INTEGER) / 15) * 15)"
+const SLOT_SQL =
+  "to_char(date_bin(interval '15 minutes', created_at::timestamptz, timestamptz '2000-01-01 00:00:00+00') AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI')"
 
 function num(v) {
   const n = Number(v)
@@ -104,9 +113,9 @@ export class StatisticsRepo {
   }
 
   _scope(sinceMs, untilMs, ownerUserId) {
-    const where = ['created_at >= ?', 'created_at < ?']
+    const where = ['created_at >= $1', 'created_at < $2']
     const params = [new Date(sinceMs).toISOString(), new Date(untilMs).toISOString()]
-    const own = ownerPred(ownerUserId)
+    const own = ownerPred(ownerUserId, params.length)
     if (own.sql) {
       where.push(own.sql)
       params.push(...own.params)
@@ -114,9 +123,9 @@ export class StatisticsRepo {
     return { cond: `WHERE ${where.join(' AND ')}`, params }
   }
 
-  _totals(sinceMs, untilMs, ownerUserId) {
+  async _totals(sinceMs, untilMs, ownerUserId) {
     const { cond, params } = this._scope(sinceMs, untilMs, ownerUserId)
-    const row = this.db
+    const row = await this.db
       .prepare(`
       SELECT COUNT(*) AS requests,
              COALESCE(SUM(CASE WHEN ${ERROR_PRED} THEN 1 ELSE 0 END), 0) AS errors,
@@ -132,17 +141,17 @@ export class StatisticsRepo {
       FROM usage_logs ${cond}
     `)
       .get(...params)
-    const input = num(row.input_tokens)
-    const output = num(row.output_tokens)
-    const cacheRead = num(row.cache_read_tokens)
-    const cacheCreation = num(row.cache_creation_tokens)
-    const prompt = num(row.prompt_tokens)
+    const input = integerValue(row.input_tokens)
+    const output = integerValue(row.output_tokens)
+    const cacheRead = integerValue(row.cache_read_tokens)
+    const cacheCreation = integerValue(row.cache_creation_tokens)
+    const prompt = integerValue(row.prompt_tokens)
     return {
-      requests: num(row.requests),
-      errors: num(row.errors),
+      requests: integerValue(row.requests),
+      errors: integerValue(row.errors),
       cost: num(row.cost),
       actualCost: num(row.actual_cost),
-      tokens: input + output + cacheRead + cacheCreation,
+      tokens: totalTokens(row),
       inputTokens: input,
       outputTokens: output,
       cacheReadTokens: cacheRead,
@@ -153,10 +162,10 @@ export class StatisticsRepo {
     }
   }
 
-  _names(dimension, ids) {
+  async _names(dimension, ids) {
     const real = ids.filter((id) => id !== NONE_ID)
     if (dimension === 'model') return new Map(real.map((id) => [id, id]))
-    const names = lookupNames(this.db, {
+    const names = await lookupNames(this.db, {
       userIds: dimension === 'user' ? real : [],
       keyIds: dimension === 'key' ? real : [],
       vmIds: dimension === 'vm' ? real : [],
@@ -169,14 +178,14 @@ export class StatisticsRepo {
   }
 
   /** Stacked-area series (top 8 by cost + others), window totals, and deltas vs the previous equal window. */
-  statistics({ range = 'today', dimension = 'model', tz = 'UTC', owner_user_id = null, now = Date.now() } = {}) {
+  async statistics({ range = 'today', dimension = 'model', tz = 'UTC', owner_user_id = null, now = Date.now() } = {}) {
     const r = normalizeRange(range) || 'today'
     const dim = normalizeDimension(dimension) || 'model'
     const zone = reportTimezone(tz)
     const { since, until, resolution, buckets } = resolveWindow(r, zone, now)
     const col = DIMENSION_COLUMN[dim]
     const { cond, params } = this._scope(since, until, owner_user_id)
-    const rows = this.db
+    const rows = await this.db
       .prepare(`
       SELECT ${col} AS sid, ${SLOT_SQL} AS slot,
              COUNT(*) AS requests,
@@ -193,15 +202,16 @@ export class StatisticsRepo {
       row.id = id
       const cur = volume.get(id) || { id, cost: 0, requests: 0, tokens: 0 }
       cur.cost += num(row.cost)
-      cur.requests += num(row.requests)
-      cur.tokens += num(row.tokens)
+      cur.requests = addInteger(cur.requests, row.requests)
+      cur.tokens = addInteger(cur.tokens, row.tokens)
       volume.set(id, cur)
     }
-    const ranked = [...volume.values()].sort(
-      (a, b) => b.cost - a.cost || b.requests - a.requests || a.id.localeCompare(b.id),
-    )
+    const ranked = [...volume.values()].sort((a, b) => {
+      const requests = BigInt(b.requests) - BigInt(a.requests)
+      return b.cost - a.cost || (requests > 0n ? 1 : requests < 0n ? -1 : 0) || a.id.localeCompare(b.id)
+    })
     const kept = ranked.slice(0, MAX_SERIES)
-    const names = this._names(
+    const names = await this._names(
       dim,
       kept.map((s) => s.id),
     )
@@ -226,14 +236,18 @@ export class StatisticsRepo {
       if (!dataKey) continue
       const idx = bucketIndex(buckets, Date.parse(`${row.slot}:00.000Z`))
       for (const m of metricNames) {
-        const v = num(row[m])
-        metrics[m][idx][dataKey] += v
-        seriesTotals[dataKey][m] += v
+        if (m === 'cost') {
+          metrics[m][idx][dataKey] += num(row[m])
+          seriesTotals[dataKey][m] += num(row[m])
+        } else {
+          metrics[m][idx][dataKey] = addInteger(metrics[m][idx][dataKey], row[m])
+          seriesTotals[dataKey][m] = addInteger(seriesTotals[dataKey][m], row[m])
+        }
       }
     }
 
-    const totals = this._totals(since, until, owner_user_id)
-    const prev = this._totals(since - (until - since), since, owner_user_id)
+    const totals = await this._totals(since, until, owner_user_id)
+    const prev = await this._totals(since - (until - since), since, owner_user_id)
     return {
       range: r,
       resolution,
@@ -254,7 +268,7 @@ export class StatisticsRepo {
   }
 
   /** Per-entity totals over the same window, by official cost. */
-  leaderboard({
+  async leaderboard({
     range = 'today',
     scope = 'model',
     limit = LEADERBOARD_DEFAULT,
@@ -269,9 +283,9 @@ export class StatisticsRepo {
     const { since, until } = resolveWindow(r, zone, now)
     const col = DIMENSION_COLUMN[s]
     const { cond, params } = this._scope(since, until, owner_user_id)
-    const rows = this.db
+    const rows = await this.db
       .prepare(`
-      SELECT ${col} AS sid,
+      SELECT COALESCE(${col}, '') AS sid,
              COUNT(*) AS requests,
              COALESCE(SUM(CASE WHEN ${SUCCESS_PRED} THEN 1 ELSE 0 END), 0) AS success,
              COALESCE(SUM(CASE WHEN ${ERROR_PRED} THEN 1 ELSE 0 END), 0) AS errors,
@@ -285,32 +299,32 @@ export class StatisticsRepo {
              AVG(duration_ms) AS avg_duration_ms,
              AVG(first_token_ms) AS avg_ttft_ms
       FROM usage_logs ${cond}
-      GROUP BY IFNULL(${col}, '')
+      GROUP BY COALESCE(${col}, '')
       ORDER BY cost DESC, requests DESC
-      LIMIT ?
+      LIMIT $${params.length + 1}
     `)
       .all(...params, n)
     const ids = rows.map((row) => (row.sid == null || row.sid === '' ? NONE_ID : String(row.sid)))
-    const names = this._names(s, ids)
+    const names = await this._names(s, ids)
     return {
       scope: s,
       range: r,
       tz: zone,
       entries: rows.map((row, i) => {
-        const input = num(row.input_tokens)
-        const output = num(row.output_tokens)
-        const cacheRead = num(row.cache_read_tokens)
-        const cacheCreation = num(row.cache_creation_tokens)
-        const requests = num(row.requests)
-        const prompt = num(row.prompt_tokens)
+        const input = integerValue(row.input_tokens)
+        const output = integerValue(row.output_tokens)
+        const cacheRead = integerValue(row.cache_read_tokens)
+        const cacheCreation = integerValue(row.cache_creation_tokens)
+        const requests = integerValue(row.requests)
+        const prompt = integerValue(row.prompt_tokens)
         return {
           id: ids[i],
           name: this._nameOf(names, ids[i]),
           totalRequests: requests,
-          successRequests: num(row.success),
-          errorRequests: num(row.errors),
-          successRate: requests > 0 ? num(row.success) / requests : 0,
-          totalTokens: input + output + cacheRead + cacheCreation,
+          successRequests: integerValue(row.success),
+          errorRequests: integerValue(row.errors),
+          successRate: requests > 0 ? integerValue(row.success) / requests : 0,
+          totalTokens: totalTokens(row),
           inputTokens: input,
           outputTokens: output,
           cacheReadTokens: cacheRead,

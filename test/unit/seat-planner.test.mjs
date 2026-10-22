@@ -473,21 +473,21 @@ test('seat stream frames carry per-VM seats, global queue and queue_max', async 
   req.emit('close')
 })
 
-function gatedQuota(root) {
+async function gatedQuota(root) {
   const tier = { limit_5h: 0.8, limit_7d: 0.8, max_concurrency: 4 }
-  return new AccountQuota({
+  return await new AccountQuota({
     dataDir: fs.mkdtempSync(path.join(root, 'quota-')),
     config: {
       quota: { block_on_5h: true, block_on_7d: true, critical_band: 0.05, gate_overshoot: 0.05 },
       tiers: { default: tier, pro: tier, max: tier },
     },
-  })
+  }).init()
 }
 
-function gatedSetup(t, specs) {
+async function gatedSetup(t, specs) {
   const root = project(specs)
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const quota = gatedQuota(root)
+  const quota = await gatedQuota(root)
   const pool = new PoolScheduler({
     projectRoot: root,
     runtimeRepo: new RuntimeRepo(),
@@ -508,7 +508,7 @@ function setUtil5h(quota, accountId, value) {
 }
 
 test('near the gate a seated device waits on its home, one call at a time, and never moves', async (t) => {
-  const { pool, quota } = gatedSetup(t, [
+  const { pool, quota } = await gatedSetup(t, [
     { id: 'vm-01', policy: { sessionSlots: 4 } },
     { id: 'vm-02', policy: { sessionSlots: 4 } },
   ])
@@ -534,7 +534,7 @@ test('near the gate a seated device waits on its home, one call at a time, and n
 })
 
 test('at line plus overshoot a seated device leaves and its old seat frees at once', async (t) => {
-  const { pool, quota } = gatedSetup(t, [
+  const { pool, quota } = await gatedSetup(t, [
     { id: 'vm-01', policy: { sessionSlots: 4 } },
     { id: 'vm-02', policy: { sessionSlots: 4 } },
   ])
@@ -550,7 +550,7 @@ test('at line plus overshoot a seated device leaves and its old seat frees at on
 })
 
 test('a new device takes an open VM before a draining one, and a draining one when nothing else is open', async (t) => {
-  const { pool, quota } = gatedSetup(t, [
+  const { pool, quota } = await gatedSetup(t, [
     { id: 'vm-01', policy: { sessionSlots: 1 } },
     { id: 'vm-02', policy: { sessionSlots: 1 } },
   ])

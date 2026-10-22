@@ -3,17 +3,17 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { createDatabase } from '../../src/lib/db/database.mjs'
+import { getDb } from '../../src/lib/db/database.mjs'
 import { UsageLogsRepo } from '../../src/lib/db/repos/usage-logs-repo.mjs'
 import { codexBodyToAnthropicMessage } from '../../src/lib/protocol/codex-convert.mjs'
 import { estimateWindow } from '../../src/lib/admin/window-estimate.mjs'
 
 let seq = 0
 
-function freshDb() {
+async function freshDb() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-ulrepo-'))
-  const db = createDatabase({ dbPath: path.join(dir, 'logs.db') })
-  db.exec(`
+  const db = await getDb()
+  await db.exec(`
     INSERT INTO users (id, email, username, password_hash) VALUES ('u1', 'a@x', 'alice', 'x'), ('u2', 'b@x', 'bob', 'x');
     INSERT INTO api_keys (id, name, key, user_id) VALUES ('k1', 'alice-key', 'sk-1', 'u1'), ('k2', 'bob-key', 'sk-2', 'u2');
     INSERT INTO vms (id, name, vm_json) VALUES ('vm-a', 'Slot A', '{}');
@@ -21,17 +21,17 @@ function freshDb() {
   return { dir, db, repo: new UsageLogsRepo(db) }
 }
 
-function storedDebugBytes(db) {
-  return db
-    .prepare('SELECT record_json FROM request_log_debug')
-    .all()
-    .reduce((sum, row) => sum + Buffer.byteLength(row.record_json, 'utf8'), 0)
+async function storedDebugBytes(db) {
+  return (await db.prepare('SELECT record_json FROM request_log_debug').all()).reduce(
+    (sum, row) => sum + Buffer.byteLength(row.record_json, 'utf8'),
+    0,
+  )
 }
 
-function seed(repo, rows) {
+async function seed(repo, rows) {
   for (const r of rows) {
     seq++
-    repo.insertSummary({
+    await repo.insertSummary({
       id: `log_${seq}`,
       request_id: `req-${seq}`,
       created_at: new Date().toISOString(),
@@ -51,65 +51,66 @@ function assertHit(stats, prompt, read, label) {
   assert.equal(stats.cache_hit_rate, prompt > 0 ? read / prompt : null, `${label} cache_hit_rate`)
 }
 
-test('debugBytes counts stored JSON bytes for empty, ASCII, and UTF-8 records', () => {
-  const { dir, db, repo } = freshDb()
+test('debugBytes counts stored JSON bytes for empty, ASCII, and UTF-8 records', async () => {
+  const { dir, db, repo } = await freshDb()
   try {
-    assert.equal(storedDebugBytes(db), 0)
-    assert.equal(repo.debugBytes(), 0)
+    assert.equal(await storedDebugBytes(db), 0)
+    assert.equal(await repo.debugBytes(), 0)
 
     const records = [{ body: 'ascii' }, { body: '中🙂' }, { body: 'line\nquote"' }]
-    records.forEach((record, i) => {
-      repo.insertDebug(`debug-${i}`, `2026-10-15T21:00:0${i}.000Z`, record)
-    })
+    await Promise.all(
+      records.map(async (record, i) => {
+        await repo.insertDebug(`debug-${i}`, `2026-10-15T21:00:0${i}.000Z`, record)
+      }),
+    )
 
     const expected = records.reduce((sum, record) => sum + Buffer.byteLength(JSON.stringify(record), 'utf8'), 0)
-    assert.equal(storedDebugBytes(db), expected)
-    assert.equal(repo.debugBytes(), expected)
+    assert.equal(await storedDebugBytes(db), expected)
+    assert.equal(await repo.debugBytes(), expected)
   } finally {
-    db.close()
+    await db.close()
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('trimDebugToMaxBytes removes oldest UTF-8 records until actual bytes fit', () => {
-  const { dir, db, repo } = freshDb()
+test('trimDebugToMaxBytes removes oldest UTF-8 records until actual bytes fit', async () => {
+  const { dir, db, repo } = await freshDb()
   try {
     const record = { body: '中'.repeat(10) }
     const serialized = JSON.stringify(record)
     const maxBytes = 164
     for (let i = 0; i < 5; i++) {
-      repo.insertDebug(`debug-${i}`, `2026-10-15T21:00:0${i}.000Z`, record)
+      await repo.insertDebug(`debug-${i}`, `2026-10-15T21:00:0${i}.000Z`, record)
     }
 
-    const before = db.prepare('SELECT record_json FROM request_log_debug').all()
+    const before = await db.prepare('SELECT record_json FROM request_log_debug').all()
     const characterCount = before.reduce((sum, row) => sum + row.record_json.length, 0)
     assert.equal(characterCount, serialized.length * 5)
     assert.ok(characterCount < maxBytes)
-    assert.ok(storedDebugBytes(db) > maxBytes)
+    assert.ok((await storedDebugBytes(db)) > maxBytes)
 
-    const originalIds = db
-      .prepare('SELECT request_id FROM request_log_debug ORDER BY ts ASC')
-      .all()
-      .map((row) => row.request_id)
-    const deleted = repo.trimDebugToMaxBytes(maxBytes)
+    const originalIds = (await db.prepare('SELECT request_id FROM request_log_debug ORDER BY ts ASC').all()).map(
+      (row) => row.request_id,
+    )
+    const deleted = await repo.trimDebugToMaxBytes(maxBytes)
     assert.ok(deleted > 0 && deleted < originalIds.length)
-    const remaining = db.prepare('SELECT request_id FROM request_log_debug ORDER BY ts ASC').all()
+    const remaining = await db.prepare('SELECT request_id FROM request_log_debug ORDER BY ts ASC').all()
     const remainingIds = remaining.map((row) => row.request_id)
     assert.equal(remainingIds.length, originalIds.length - deleted)
     assert.deepEqual(remainingIds, originalIds.slice(deleted))
     assert.equal(remainingIds.at(-1), originalIds.at(-1))
-    assert.ok(storedDebugBytes(db) <= maxBytes)
-    assert.equal(repo.debugBytes(), storedDebugBytes(db))
+    assert.ok((await storedDebugBytes(db)) <= maxBytes)
+    assert.equal(await repo.debugBytes(), await storedDebugBytes(db))
   } finally {
-    db.close()
+    await db.close()
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('mixed Claude/Codex usage keeps a row-wise prompt denominator on totals and windows', () => {
-  const { db, repo } = freshDb()
+test('mixed Claude/Codex usage keeps a row-wise prompt denominator on totals and windows', async () => {
+  const { db, repo } = await freshDb()
   try {
-    seed(repo, [
+    await seed(repo, [
       {
         user_id: 'u1',
         api_key_id: 'k1',
@@ -135,32 +136,32 @@ test('mixed Claude/Codex usage keeps a row-wise prompt denominator on totals and
         cache_read_tokens: 50,
       },
     ])
-    assertHit(repo.totals(), 300, 240, 'totals')
-    assertHit(repo.billingStats().total, 300, 240, 'billing.total')
+    assertHit(await repo.totals(), 300, 240, 'totals')
+    assertHit((await repo.billingStats()).total, 300, 240, 'billing.total')
     const since = new Date(Date.now() - 60_000).toISOString()
-    assertHit(repo.windowStats({ since }), 300, 240, 'window')
-    assertHit(repo.windowStats({ since, owner_user_id: 'u1' }), 200, 190, 'owner window')
-    assertHit(repo.windowStats({ since, owner_user_id: 'u2' }), 100, 50, 'other owner')
+    assertHit(await repo.windowStats({ since }), 300, 240, 'window')
+    assertHit(await repo.windowStats({ since, owner_user_id: 'u1' }), 200, 190, 'owner window')
+    assertHit(await repo.windowStats({ since, owner_user_id: 'u2' }), 100, 50, 'other owner')
   } finally {
-    db.close()
+    await db.close()
   }
 })
 
-test('empty usage windows keep a null cache hit rate', () => {
-  const { db, repo } = freshDb()
+test('empty usage windows keep a null cache hit rate', async () => {
+  const { db, repo } = await freshDb()
   try {
-    assertHit(repo.totals(), 0, 0, 'empty totals')
-    assertHit(repo.billingStats().total, 0, 0, 'empty billing')
-    const empty = repo.windowStats({ since: '2099-01-01T00:00:00.000Z' })
+    assertHit(await repo.totals(), 0, 0, 'empty totals')
+    assertHit((await repo.billingStats()).total, 0, 0, 'empty billing')
+    const empty = await repo.windowStats({ since: '2099-01-01T00:00:00.000Z' })
     assert.equal(empty.requests, 0)
     assertHit(empty, 0, 0, 'empty window')
   } finally {
-    db.close()
+    await db.close()
   }
 })
 
-test('billingStats reuses identical panel snapshots but separates account windows', () => {
-  const { db, repo } = freshDb()
+test('billingStats reuses identical panel snapshots but separates account windows', async () => {
+  const { db, repo } = await freshDb()
   try {
     let computes = 0
     const compute = repo._computeBillingStats.bind(repo)
@@ -173,23 +174,26 @@ test('billingStats reuses identical panel snapshots but separates account window
     const winAReordered = [{ vm_id: 'vm-a', reset_5h: '2026-10-19T05:00:00.000Z', account_id: 'acc-1' }]
     const winB = [{ account_id: 'acc-1', vm_id: 'vm-a', reset_5h: '2026-10-19T06:00:00.000Z' }]
 
-    assert.equal(repo.billingStats({ accountWindows: winA }), repo.billingStats({ accountWindows: winAReordered }))
+    assert.equal(
+      await repo.billingStats({ accountWindows: winA }),
+      await repo.billingStats({ accountWindows: winAReordered }),
+    )
     assert.equal(computes, 1)
-    repo.billingStats({ accountWindows: winB })
+    await repo.billingStats({ accountWindows: winB })
     assert.equal(computes, 2)
 
     // Explicit historical snapshots are deterministic test/report calls and must
     // not be served from the live panel cache.
-    repo.billingStats({ accountWindows: winA, now: Date.parse('2026-10-19T00:00:00.000Z') })
-    repo.billingStats({ accountWindows: winA, now: Date.parse('2026-10-19T00:00:00.000Z') })
+    await repo.billingStats({ accountWindows: winA, now: Date.parse('2026-10-19T00:00:00.000Z') })
+    await repo.billingStats({ accountWindows: winA, now: Date.parse('2026-10-19T00:00:00.000Z') })
     assert.equal(computes, 4)
   } finally {
-    db.close()
+    await db.close()
   }
 })
 
-test('billingStats TTL starts after a slow aggregation finishes', () => {
-  const { db, repo } = freshDb()
+test('billingStats TTL starts after a slow aggregation finishes', async () => {
+  const { db, repo } = await freshDb()
   const realNow = Date.now
   try {
     let clock = 1_000_000
@@ -201,39 +205,39 @@ test('billingStats TTL starts after a slow aggregation finishes', () => {
       clock += 20_000 // Simulate a scan slower than the 10-second cache TTL.
       return compute(opts)
     }
-    const first = repo.billingStats()
-    assert.equal(repo.billingStats(), first)
+    const first = await repo.billingStats()
+    assert.equal(await repo.billingStats(), first)
     assert.equal(computes, 1)
     clock += 10_001
-    repo.billingStats()
+    await repo.billingStats()
     assert.equal(computes, 2)
   } finally {
     Date.now = realNow
-    db.close()
+    await db.close()
   }
 })
 
-test('billingStats rate-limits maintenance backfill independently of cache keys', () => {
-  const { db, repo } = freshDb()
+test('billingStats rate-limits maintenance backfill independently of cache keys', async () => {
+  const { db, repo } = await freshDb()
   try {
     let backfills = 0
     repo.backfillMissingCosts = () => {
       backfills++
       return 0
     }
-    repo.billingStats()
-    repo.billingStats({ accountWindows: [{ account_id: 'acc-1', vm_id: 'vm-a' }] })
-    repo.billingStats({ accountWindows: [{ account_id: 'acc-2', vm_id: 'vm-a' }] })
+    await repo.billingStats()
+    await repo.billingStats({ accountWindows: [{ account_id: 'acc-1', vm_id: 'vm-a' }] })
+    await repo.billingStats({ accountWindows: [{ account_id: 'acc-2', vm_id: 'vm-a' }] })
     assert.equal(backfills, 1)
   } finally {
-    db.close()
+    await db.close()
   }
 })
 
-test('billingStats derives global totals from account aggregates without duplicate full scans', () => {
-  const { db, repo } = freshDb()
+test('billingStats derives global totals from account aggregates without duplicate full scans', async () => {
+  const { db, repo } = await freshDb()
   try {
-    seed(repo, [
+    await seed(repo, [
       { account_id: 'acc-1', vm_id: 'vm-a', input_tokens: 20, cache_read_tokens: 80, total_cost: 1 },
       { account_id: 'acc-2', vm_id: null, input_tokens: 40, output_tokens: 5, total_cost: 2 },
     ])
@@ -243,7 +247,7 @@ test('billingStats derives global totals from account aggregates without duplica
       if (!cond) fullScans++
       return costSelect(cond, params)
     }
-    const bill = repo.billingStats({ now: Date.now() })
+    const bill = await repo.billingStats({ now: Date.now() })
     assert.equal(fullScans, 0)
     assert.equal(bill.total.requests, 2)
     assert.equal(bill.total.input_tokens, 60)
@@ -255,15 +259,15 @@ test('billingStats derives global totals from account aggregates without duplica
       bill.accounts.reduce((sum, row) => sum + row.total_cost, 0),
     )
   } finally {
-    db.close()
+    await db.close()
   }
 })
 
-test('aligned account windows re-sum per-row prompt tokens instead of mixed Anthropic formula', () => {
-  const { db, repo } = freshDb()
+test('aligned account windows re-sum per-row prompt tokens instead of mixed Anthropic formula', async () => {
+  const { db, repo } = await freshDb()
   try {
     const now = Date.parse('2026-09-26T12:00:00.000Z')
-    seed(repo, [
+    await seed(repo, [
       {
         created_at: '2026-09-26T10:00:00.000Z',
         vm_id: 'vm-a',
@@ -289,22 +293,22 @@ test('aligned account windows re-sum per-row prompt tokens instead of mixed Anth
         cache_read_tokens: 95,
       },
     ])
-    const aligned = repo.billingStats({
+    const aligned = await repo.billingStats({
       now,
       accountWindows: [{ account_id: 'acc-1', vm_id: 'vm-a', reset_5h: '2026-09-26T16:00:00.000Z' }],
     })
     assertHit(aligned.window_5h, 200, 190, 'aligned 5h')
     assert.equal(Number(aligned.accounts[0].window_5h.prompt_tokens), 200)
     assert.equal(Number(aligned.accounts[0].window_5h.cache_read_tokens), 190)
-    const rolling = repo.billingStats({ now })
+    const rolling = await repo.billingStats({ now })
     assertHit(rolling.window_5h, 10_205, 190, 'rolling 5h')
   } finally {
-    db.close()
+    await db.close()
   }
 })
 
-test('converted non-streaming Anthropic API usage stays disjoint in UsageLogsRepo totals', () => {
-  const { db, repo } = freshDb()
+test('converted non-streaming Anthropic API usage stays disjoint in UsageLogsRepo totals', async () => {
+  const { db, repo } = await freshDb()
   try {
     const upstream = {
       model: 'gpt-5.4',
@@ -316,7 +320,7 @@ test('converted non-streaming Anthropic API usage stays disjoint in UsageLogsRep
       },
     }
     const message = codexBodyToAnthropicMessage(upstream)
-    seed(repo, [
+    await seed(repo, [
       {
         user_id: 'u1',
         via: 'api-kernel',
@@ -340,17 +344,17 @@ test('converted non-streaming Anthropic API usage stays disjoint in UsageLogsRep
     ])
     assert.equal(message.usage.input_tokens, 20)
     assert.equal(message.usage.cache_read_input_tokens, 80)
-    assertHit(repo.totals(), 200, 160, 'converted+codex totals')
+    assertHit(await repo.totals(), 200, 160, 'converted+codex totals')
   } finally {
-    db.close()
+    await db.close()
   }
 })
 
-test('billingStats window tokens are total including cache', () => {
-  const { db, repo } = freshDb()
+test('billingStats window tokens are total including cache', async () => {
+  const { db, repo } = await freshDb()
   try {
     const now = Date.parse('2026-09-26T12:00:00.000Z')
-    seed(repo, [
+    await seed(repo, [
       {
         created_at: '2026-09-26T11:00:00.000Z',
         vm_id: 'vm-a',
@@ -360,53 +364,53 @@ test('billingStats window tokens are total including cache', () => {
         cache_read_tokens: 80,
       },
     ])
-    const bill = repo.billingStats({ now })
+    const bill = await repo.billingStats({ now })
     assert.equal(bill.accounts[0].window_5h_tokens, 102)
-    const window = repo.windowStats({ since: '2026-09-26T00:00:00.000Z', until: '2026-09-26T12:00:00.000Z' })
+    const window = await repo.windowStats({ since: '2026-09-26T00:00:00.000Z', until: '2026-09-26T12:00:00.000Z' })
     assert.equal(window.input_tokens + window.output_tokens + window.cache_read_tokens, 102)
   } finally {
-    db.close()
+    await db.close()
   }
 })
 
-test('log coverage follows recorded prunes, not the oldest row or the current retention', () => {
-  const { db, repo } = freshDb()
+test('log coverage follows recorded prunes, not the oldest row or the current retention', async () => {
+  const { db, repo } = await freshDb()
   try {
     const now = Date.now()
     const iso = (msAgo) => new Date(now - msAgo).toISOString()
-    db.prepare("UPDATE schema_migrations SET applied_at = ? WHERE version = '001'").run(iso(30 * 86400_000))
-    seed(repo, [
+    await db.prepare("UPDATE schema_migrations SET applied_at = $1 WHERE version = '001'").run(iso(30 * 86400_000))
+    await seed(repo, [
       { created_at: iso(3 * 86400_000), vm_id: 'vm-a', account_id: 'acc-1', input_tokens: 1 },
       { created_at: iso(3600_000), vm_id: 'vm-a', account_id: 'acc-1', input_tokens: 1 },
     ])
     // Never pruned: a quiet stretch before the oldest row is still complete history.
-    assert.equal(repo.billingStats().log_coverage_start, iso(30 * 86400_000))
+    assert.equal((await repo.billingStats()).log_coverage_start, iso(30 * 86400_000))
 
-    assert.equal(repo.cleanup({ retainDays: 1 }).usage_logs, 1)
-    const afterPrune = Date.parse(repo.logCoverageStart())
+    assert.equal((await repo.cleanup({ retainDays: 1 })).usage_logs, 1)
+    const afterPrune = Date.parse(await repo.logCoverageStart())
     assert.ok(afterPrune >= now - 86400_000 && afterPrune <= Date.now() - 86400_000 + 1000)
 
     // Raising retention later does not bring the deleted day back.
-    assert.equal(repo.cleanup({ retainDays: 7 }).usage_logs, 0)
-    assert.equal(Date.parse(repo.logCoverageStart()), afterPrune)
+    assert.equal((await repo.cleanup({ retainDays: 7 })).usage_logs, 0)
+    assert.equal(Date.parse(await repo.logCoverageStart()), afterPrune)
     const week = estimateWindow({
       spentUsd: 5,
       usedRatio: 0.5,
       reset: iso(-86400_000),
       windowStart: iso(6 * 86400_000),
-      coveredSince: repo.logCoverageStart(),
+      coveredSince: await repo.logCoverageStart(),
     })
     assert.equal(week.status, 'log_gap')
   } finally {
-    db.close()
+    await db.close()
   }
 })
 
-test('window_fable only counts fable rows since reset_7d_oi', () => {
-  const { db, repo } = freshDb()
+test('window_fable only counts fable rows since reset_7d_oi', async () => {
+  const { db, repo } = await freshDb()
   try {
     const now = Date.parse('2026-09-26T12:00:00.000Z')
-    seed(repo, [
+    await seed(repo, [
       {
         created_at: '2026-09-20T11:00:00.000Z',
         vm_id: 'vm-a',
@@ -439,7 +443,7 @@ test('window_fable only counts fable rows since reset_7d_oi', () => {
         total_cost: 8,
       },
     ])
-    const bill = repo.billingStats({
+    const bill = await repo.billingStats({
       now,
       accountWindows: [
         {
@@ -455,29 +459,29 @@ test('window_fable only counts fable rows since reset_7d_oi', () => {
     assert.equal(fable.cost, 3)
     assert.equal(fable.tokens, 22)
     assert.equal(bill.accounts[0].window_fable, fable)
-    const none = repo.billingStats({
+    const none = await repo.billingStats({
       now,
       accountWindows: [{ account_id: 'acc-1', vm_id: 'vm-a' }],
     })
     assert.equal(none.accounts[0].window_fable, null)
   } finally {
-    db.close()
+    await db.close()
   }
 })
 
-test('unpricedModels lists unpriced rows', () => {
-  const { db, repo } = freshDb()
+test('unpricedModels lists unpriced rows', async () => {
+  const { db, repo } = await freshDb()
   try {
-    seed(repo, [
+    await seed(repo, [
       { model: 'mystery', pricing_model: 'unpriced', input_tokens: 10 },
       { model: 'mystery', pricing_model: 'unpriced', input_tokens: 4 },
       { model: 'claude-sonnet-5', pricing_model: 'sonnet-5', input_tokens: 8 },
     ])
-    const rows = repo.unpricedModels()
+    const rows = await repo.unpricedModels()
     assert.equal(rows.length, 1)
     assert.equal(rows[0].model, 'mystery')
     assert.equal(rows[0].requests, 2)
   } finally {
-    db.close()
+    await db.close()
   }
 })

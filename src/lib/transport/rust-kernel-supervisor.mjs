@@ -1,3 +1,4 @@
+import { readRoutingDocument, routingDocumentRevision } from '../core/routing-document.mjs'
 /**
  * Rust gateway-worker lifecycle. kin-kernel is container PID 1.
  * Host writes credentials; slot kernel only reads AT for inference.
@@ -778,7 +779,7 @@ export function writeKernelConfig(
   }
   const changed = writeKernelJsonAtomically(configPath, config, vm)
   // kin-kernel hot-reloads kernel.json: the change must reach wherever the slot reads it.
-  if (changed) host.queueSyncRun(record, path.join(projectRoot, 'vms', vm.id))
+  const publication = changed ? host.queueSyncRun(record, path.join(projectRoot, 'vms', vm.id)) : null
   return {
     runDir,
     socketPath,
@@ -787,6 +788,7 @@ export function writeKernelConfig(
     tokenPath,
     provider: config.provider,
     changed,
+    publication,
     persona_preset: config.persona_preset,
   }
 }
@@ -798,6 +800,7 @@ export function syncClaudeKernelConfigs(projectRoot, routing) {
   if (!projectRoot) return { updated: 0, skipped: 0 }
   let updated = 0
   let skipped = 0
+  const publications = []
   for (const { id } of listVms(projectRoot)) {
     const vm = getVm(projectRoot, id)
     if (!vm || isCodexVm(vm)) {
@@ -806,6 +809,7 @@ export function syncClaudeKernelConfigs(projectRoot, routing) {
     }
     try {
       const written = writeKernelConfig(projectRoot, vm, { routing })
+      if (written?.publication) publications.push(written.publication)
       if (written?.changed) updated += 1
     } catch (error) {
       skipped += 1
@@ -818,7 +822,19 @@ export function syncClaudeKernelConfigs(projectRoot, routing) {
       )
     }
   }
-  return { updated, skipped }
+  const publication = Promise.allSettled(publications).then((results) => {
+    const failures = results.filter((result) => result.status === 'rejected')
+    const unknown = failures.find(
+      ({ reason }) =>
+        reason?.publicationFinished !== true ||
+        reason.vmOperationUncertain === true ||
+        reason.executionUncertain === true,
+    )
+    const failed = unknown || failures[0]
+    if (failed) throw failed.reason
+  })
+  publication.catch(() => {})
+  return Object.defineProperty({ updated, skipped }, 'publication', { value: publication })
 }
 
 /**
@@ -828,20 +844,28 @@ export function syncClaudeKernelConfigs(projectRoot, routing) {
  */
 export function syncClaudeKernelConfigsFromFile(projectRoot, routingFile) {
   if (!projectRoot || !routingFile) return { updated: 0, skipped: true }
+  const revision = routingDocumentRevision(routingFile)
+  if (revision !== null) return { updated: 0, skipped: true, pending: true, revision }
   let mtimeMs
   try {
     mtimeMs = fs.statSync(routingFile).mtimeMs
   } catch {
     return { updated: 0, skipped: true }
   }
-  if (routingPersonaMtime.get(routingFile) === mtimeMs) return { updated: 0, skipped: true }
+  const previous = routingPersonaMtime.get(routingFile)
+  if (previous?.mtimeMs === mtimeMs)
+    return Object.defineProperty({ updated: 0, skipped: true }, 'publication', { value: previous.publication })
   let routing
   try {
-    routing = JSON.parse(fs.readFileSync(routingFile, 'utf8'))
+    routing = readRoutingDocument(routingFile)
   } catch {
     return { updated: 0, skipped: true }
   }
   const result = syncClaudeKernelConfigs(projectRoot, routing)
-  routingPersonaMtime.set(routingFile, mtimeMs)
+  const current = { mtimeMs, publication: result.publication }
+  routingPersonaMtime.set(routingFile, current)
+  result.publication.catch(() => {
+    if (routingPersonaMtime.get(routingFile) === current) routingPersonaMtime.delete(routingFile)
+  })
   return result
 }

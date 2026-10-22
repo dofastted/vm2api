@@ -2,6 +2,12 @@
  * Codex hop from handle-protocol. Claude convert/pool/CRS never runs here.
  */
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
+import fetch from 'node-fetch'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { refreshSharedCodexCredential } from '../oauth/shared-codex-refresh.mjs'
+import { credentialGeneration, currentRefreshAdmission } from '../oauth/shared-credential-refresh.mjs'
+import { SharedCodexRuntime } from '../pool/shared-codex-runtime.mjs'
 import { getVm, listVms, persistCodexUsage, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { isValidVmId } from '../vm/vm-file.mjs'
 import { isCodexProtocolAllowed, isCodexVm, normalizeCodexRouting } from './codex-route.mjs'
@@ -34,6 +40,7 @@ import {
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
+import { createProxyAgent } from '../vm/proxy-agent.mjs'
 import { readCodexAccounts, upsertCodexAccount } from '../vm/codex-slot.mjs'
 import { scopeAccountFromVm } from './jev-intercept.mjs'
 import {
@@ -41,7 +48,6 @@ import {
   CODEX_CATALOG_ORIGINATOR,
   CODEX_SEARCH_URL,
   CODEX_USER_AGENT,
-  makeProxyFetch,
   refreshCodexAccessToken,
 } from './codex-models.mjs'
 import { orderCodexSessionSlots, codexSlotAllowsModel, isCodexFailoverError } from '../pool/codex-slot-pool.mjs'
@@ -204,15 +210,28 @@ function pinnedVmId(req) {
  * A request that continues a stored response (`previous_response_id`) can
  * only run where that response lives.
  */
-export function pickCodexCandidates(
+export async function pickCodexCandidates(
   projectRoot,
   req,
-  { stickyRouter = null, sessions = null, body = null, excluded = null, routing = {} } = {},
+  { stickyRouter = null, sessions = null, body = null, excluded = null, routing = {}, sharedRuntime = null } = {},
 ) {
   const pin = pinnedVmId(req)
   const model = body?.model || null
-  const routingPolicy = normalizeCodexRouting(routing.codex || routing).quota
-  const scope = keyScopeFromRequest(req)
+  const snapshot = sharedRuntime ? await sharedRuntime.routingSnapshot(routing) : null
+  const liveRouting = snapshot?.config || routing
+  const routingPolicy = normalizeCodexRouting(liveRouting.codex || liveRouting).quota
+  const withPolicy = (ordered) =>
+    sharedRuntime
+      ? {
+          ...ordered,
+          quotaPolicy: routingPolicy,
+          candidates: (ordered.candidates || []).map((candidate) => ({
+            ...candidate,
+            routingRevision: snapshot.revision,
+          })),
+        }
+      : ordered
+  const scope = await keyScopeFromRequest(req)
   const poolDenial = vmPoolDenial(scope)
   if (poolDenial) return { error: 'vm_pool_unavailable', message: poolDenial.message, ids: [], candidates: [] }
   if (scope.group_type === 'anthropic') return { error: 'key_group_mismatch', ids: [], candidates: [] }
@@ -221,12 +240,16 @@ export function pickCodexCandidates(
     if (!vm || !isCodexVm(vm)) return { error: 'platform_mismatch', pin, ids: [] }
     if (!keyAllowsVm(scope, vm)) return { error: 'key_group_mismatch', pin, ids: [] }
     if (!codexSlotAllowsModel(vm, model)) return { error: 'model_not_allowed', pin, ids: [] }
+    const runtimeSignals = sharedRuntime ? await sharedRuntime.signals(projectRoot, [vm], routingPolicy) : null
+    if (runtimeSignals && !runtimeSignals.has(vm.id))
+      return { error: 'codex_account_identity_unavailable', ids: [], candidates: [] }
     const ordered = orderCodexSessionSlots([vm], {
       pin,
       excluded,
       quotaPolicy: routingPolicy,
+      runtimeSignals,
     })
-    return { ...ordered, pin, sticky: false, sessionKey: null, stickyKeys: [] }
+    return { ...withPolicy(ordered), pin, sticky: false, sessionKey: null, stickyKeys: [] }
   }
   for (const item of listVms(projectRoot, { codex: { quota: routingPolicy } })) {
     if (!isCodexVm(item)) continue
@@ -234,10 +257,19 @@ export function pickCodexCandidates(
       policy: routingPolicy,
     })
   }
+  if (stickyRouter?.shared) await stickyRouter.refresh()
   const stickyKeys = stickyRouter?.collectPoolKeys?.(req, body || {}, { platform: 'openai' }) || []
   const sessionKey = stickyRouter?.extractPoolKey?.(req, body || {}, { platform: 'openai' }) || stickyKeys[0] || null
+  const stickyVersions = new Map(stickyKeys.map((key) => [key, stickyRouter?.shared ? stickyRouter.versionOf(key) : 0]))
   const bound = sessionKey ? stickyRouter?.resolve?.(sessionKey) : null
-  const vms = listVms(projectRoot, { codex: { quota: routingPolicy } }).filter((vm) => keyAllowsVm(scope, vm))
+  let vms = listVms(projectRoot, { codex: { quota: routingPolicy } }).filter((vm) => keyAllowsVm(scope, vm))
+  if (sharedRuntime) vms = vms.filter(isCodexVm)
+  const runtimeSignals = sharedRuntime ? await sharedRuntime.signals(projectRoot, vms, routingPolicy) : null
+  if (runtimeSignals) {
+    const hadCandidates = vms.length > 0
+    vms = vms.filter((vm) => runtimeSignals.has(vm.id))
+    if (hadCandidates && !vms.length) return { error: 'codex_account_identity_unavailable', ids: [], candidates: [] }
+  }
   const continuesResponse = !!body?.previous_response_id && !!bound?.vmId
   if (scope.vm_pool_id && vms.length === 0 && !continuesResponse) {
     return { error: 'vm_pool_unavailable', message: '账号池没有可调度的 GPT 槽位', ids: [], candidates: [] }
@@ -249,11 +281,20 @@ export function pickCodexCandidates(
     model,
     excluded,
     quotaPolicy: routingPolicy,
+    runtimeSignals,
   })
   // A resting home migrates the conversation like a gone one: the next slot rebinds it.
   const boundLeft = ordered.boundState === 'gone' || ordered.boundState === 'resting'
   if (bound?.vmId && sessionKey && boundLeft) {
-    for (const key of stickyKeys.length ? stickyKeys : [sessionKey]) stickyRouter?.unbind?.(key)
+    for (const key of stickyKeys.length ? stickyKeys : [sessionKey]) {
+      if (stickyRouter?.shared) {
+        const result = await stickyRouter.unbindShared(key, {
+          ifGeneration: stickyVersions.get(key) ?? stickyRouter.versionOf(key),
+        })
+        if (!result.applied) return { error: 'sticky_binding_conflict', ids: [], candidates: [] }
+        stickyVersions.set(key, result.generation)
+      } else stickyRouter?.unbind?.(key)
+    }
     try {
       sessions?.drop?.(bound.vmId, sessionKey)
     } catch {}
@@ -261,7 +302,7 @@ export function pickCodexCandidates(
   if (continuesResponse && (boundLeft || ordered.error === 'candidates_exhausted')) {
     return { error: 'response_not_portable', ids: [], sessionKey, stickyKeys, boundVmId: bound.vmId }
   }
-  return { ...ordered, sessionKey, stickyKeys }
+  return { ...withPolicy(ordered), sessionKey, stickyKeys, ...(stickyRouter?.shared ? { stickyVersions } : {}) }
 }
 
 function ingestCodexHop(projectRoot, vmId, result, now = Date.now(), policy = null) {
@@ -401,16 +442,26 @@ function clientGoneSignal(req, res) {
  */
 async function admitCodexCandidate(projectRoot, req, opts, { deadline, signal }) {
   let woken = false
-  for (;;) {
-    const picked = pickCodexCandidates(projectRoot, req, opts)
-    const livePolicy = normalizeCodexRouting(opts.routing?.codex || opts.routing).quota
+  selection: for (;;) {
+    const picked = await pickCodexCandidates(projectRoot, req, opts)
+    const livePolicy = picked.quotaPolicy || normalizeCodexRouting(opts.routing?.codex || opts.routing).quota
     if (picked.error && picked.error !== 'capacity_unavailable') return { picked }
     for (const candidate of picked.candidates || []) {
-      const lease = tryAcquireOpenAISlot(candidate.id, {
-        concurrency: candidate.concurrency,
-        maxRpm: candidate.maxRpm,
-        quotaPolicy: livePolicy,
-      })
+      let lease
+      try {
+        lease = opts.sharedRuntime
+          ? await opts.sharedRuntime.tryReserve(projectRoot, getVm(projectRoot, candidate.id), candidate, livePolicy)
+          : tryAcquireOpenAISlot(candidate.id, {
+              concurrency: candidate.concurrency,
+              maxRpm: candidate.maxRpm,
+              quotaPolicy: livePolicy,
+            })
+      } catch (error) {
+        if (!opts.sharedRuntime || error?.code !== 'routing_config_stale') throw error
+        if (signal?.aborted) return { picked: { error: 'client_cancelled', ids: [] } }
+        if (Date.now() >= deadline) return { picked: { error: 'capacity_unavailable', ids: [] } }
+        continue selection
+      }
       if (lease) return { picked, vmId: candidate.id, lease }
     }
     // A woken waiter that still missed hands the wake to the next in line.
@@ -418,7 +469,11 @@ async function admitCodexCandidate(projectRoot, req, opts, { deadline, signal })
     const now = Date.now()
     if (now >= deadline) return { picked: { ...picked, error: 'capacity_unavailable', ids: [] } }
     const retryAt = Number(picked.retryAt)
-    const sliceDeadline = Number.isFinite(retryAt) && retryAt > now ? Math.min(deadline, retryAt) : deadline
+    const sliceDeadline = opts.sharedRuntime
+      ? Math.min(deadline, now + 250)
+      : Number.isFinite(retryAt) && retryAt > now
+        ? Math.min(deadline, retryAt)
+        : deadline
     let waited
     try {
       waited = await waitForOpenAICapacity({ deadline: sliceDeadline, signal })
@@ -473,23 +528,42 @@ export function reasoningHistoryFallback(args, result) {
   }
 }
 
-export async function runCodexKernelHop({ hop, args = {}, onEvent, onReasoningFallback } = {}) {
+export async function runCodexKernelHop({
+  hop,
+  args = {},
+  onEvent,
+  onReasoningFallback,
+  sharedExecution = false,
+} = {}) {
   let emitted = false
   const wrapped = async (line) => {
     emitted = true
     if (onEvent) await onEvent(line)
   }
-  let result = await hop({ ...args, onEvent: wrapped })
-  if (!result?.ok && !emitted && isRetryableCodexTransport(result)) {
-    result = { ...(await hop({ ...args, onEvent: wrapped })), transport_retried: true }
+  let sends = 0
+  const send = (input) =>
+    hop({
+      ...input,
+      ...(sharedExecution
+        ? {
+            requestId: sends++ === 0 && args.requestId != null ? args.requestId : randomUUID(),
+          }
+        : {}),
+      onEvent: wrapped,
+    })
+  const canRetry = (value) => !sharedExecution || (value?.execution?.ended === true && !value?.executionUncertain)
+  let result = await send(args)
+  if (!result?.ok && !emitted && canRetry(result) && isRetryableCodexTransport(result)) {
+    result = { ...(await send(args)), transport_retried: true }
   }
-  const fallback = !emitted && !result?.transport_retried ? reasoningHistoryFallback(args, result) : null
+  const fallback =
+    !emitted && !result?.transport_retried && canRetry(result) ? reasoningHistoryFallback(args, result) : null
   if (fallback) {
     if (onReasoningFallback)
       await onReasoningFallback({ originalResult: result, body: fallback.args.body, ...fallback.info })
     if (args.signal?.aborted) return result
     result = {
-      ...(await hop({ ...fallback.args, onEvent: wrapped })),
+      ...(await send(fallback.args)),
       reasoning_history_retried: true,
       reasoning_history_fallback: fallback.info,
     }
@@ -516,6 +590,7 @@ export async function handleCodexProtocol({
   captureOutbound = false,
   requestStartedAt = Date.now(),
   accountGate = null,
+  onExecutionState = null,
 }) {
   const codex = normalizeCodexRouting(routing.codex)
   const allowed = isCodexProtocolAllowed(protocol, { codex })
@@ -575,6 +650,7 @@ export async function handleCodexProtocol({
   // Chat→Responses conversion can surface a session key the raw inbound lacked.
   if (!logBag.session_id) logBag.session_id = sessionIdForLog(callerSession)
   const firstUserIdentity = firstUserIdentityFromCodex(converted.body)
+  const sharedRuntime = ops.sharedRuntime || (isKubernetesMode() ? new SharedCodexRuntime() : null)
   const hop = ops.streamCodexKernel || streamCodexKernel
   const writeCfg = ops.writeCodexKernelConfig || writeCodexKernelConfig
   const ensure = ops.ensureCodexKernel || ensureCodexKernel
@@ -589,8 +665,9 @@ export async function handleCodexProtocol({
     body: body || converted.body || inbound,
     excluded: new Set(),
     routing,
+    sharedRuntime,
   }
-  const deadline = Date.now() + codexWaitTimeoutMs(routing)
+  let deadline = Date.now() + codexWaitTimeoutMs(routing)
   const gone = clientGoneSignal(req, res)
   const failoverBudget = codexFailoverBudget(routing)
   const sameRetryDelay = Number(routing?.failover?.same_account_retry_delay_ms)
@@ -603,8 +680,26 @@ export async function handleCodexProtocol({
   let attempts = 0
   let switches = 0
   let counted = false
+  let turn = null
+  let activeLease = null
+  let executionUncertain = false
   try {
+    if (sharedRuntime) {
+      if (stickyRouter?.shared) await stickyRouter.refresh()
+      const turnKey =
+        stickyRouter?.extractPoolKey?.(req, pickOpts.body, { platform: 'openai' }) ||
+        (callerSession ? `codex:${req.apiKeyRecord?.id || ''}:${callerSession}` : null)
+      if (turnKey)
+        turn = await sharedRuntime.turns.acquire(turnKey, {
+          signal: gone.signal,
+          requestId: logBag.request_id,
+          timeoutMs: routing?.failover?.session_queue_timeout_ms ?? 900_000,
+        })
+      deadline = Date.now() + codexWaitTimeoutMs(routing)
+    }
     for (;;) {
+      if (executionUncertain)
+        throw Object.assign(new Error('Codex execution termination is unknown'), { code: 'codex_execution_uncertain' })
       const admitted = await admitCodexCandidate(projectRoot, req, pickOpts, { deadline, signal: gone.signal })
       const picked = admitted.picked
       if (!admitted.lease) {
@@ -618,14 +713,15 @@ export async function handleCodexProtocol({
       }
       const vm = getVm(projectRoot, admitted.vmId)
       const lease = admitted.lease
+      activeLease = lease
       if (!vm || !isCodexVm(vm)) {
-        lease.release()
+        await lease.release()
         pickOpts.excluded.add(admitted.vmId)
         continue
       }
       attempts += 1
       if (attempts > failoverBudget.maxAttempts) {
-        lease.release()
+        await lease.release()
         break
       }
       if (!counted) {
@@ -639,7 +735,7 @@ export async function handleCodexProtocol({
         logBag.vm_id = vm.id
         const blocked = await accountGate(scopeAccountFromVm(vm))
         if (blocked) {
-          lease.release()
+          await lease.release()
           return
         }
       }
@@ -654,19 +750,31 @@ export async function handleCodexProtocol({
           windowGen = sessions?.touch?.(vm.id, picked.sessionKey) ?? null
         } catch {}
       }
-      const ownsPin = !!stickyBound?.vmId && stickyBound.vmId === vm.id
-      const bindSticky = (sessionId = null) => {
-        if (!picked.sessionKey || !stickyRouter?.bind) return
+      let ownsPin = !!stickyBound?.vmId && stickyBound.vmId === vm.id
+      const stickyVersions = picked.stickyVersions || new Map()
+      const bindSticky = async (sessionId = null) => {
+        if (!picked.sessionKey || !stickyRouter) return true
         const payload = { accountId: vm.id, vmId: vm.id }
         if (sessionId) payload.sessionId = sessionId
-        for (const key of stickyKeys) stickyRouter.bind(key, payload)
+        for (const key of stickyKeys) {
+          if (stickyRouter.shared) {
+            const result = await stickyRouter.bindShared(key, payload, { ifGeneration: stickyVersions.get(key) ?? 0 })
+            if (!result.applied || result.record?.vmId !== vm.id || result.nativeSessionId !== sessionId) return false
+            stickyVersions.set(key, result.generation)
+            ownsPin = true
+          } else stickyRouter.bind?.(key, payload)
+        }
+        return true
       }
-      const leaveSticky = () => {
+      const leaveSticky = async () => {
         if (!ownsPin || !picked.sessionKey) return
         try {
           sessions?.drop?.(vm.id, picked.sessionKey)
         } catch {}
-        for (const key of stickyKeys) stickyRouter?.unbind?.(key)
+        for (const key of stickyKeys) {
+          if (stickyRouter?.shared) await stickyRouter.unbindShared(key, { ifGeneration: stickyVersions.get(key) ?? 0 })
+          else stickyRouter?.unbind?.(key)
+        }
       }
       let attemptKind = 'failed'
       try {
@@ -739,11 +847,28 @@ export async function handleCodexProtocol({
         if (captureOutbound) logBag.outbound_body = outboundBody
         logBag.outbound_headers = redactHeaders(outboundHeaders)
         let hopEmitted = false
-        const runHop = () =>
-          runCodexKernelHop({
-            hop,
+        const runHop = async () =>
+          await runCodexKernelHop({
+            sharedExecution: !!sharedRuntime,
+            hop:
+              sharedRuntime || stickyRouter?.shared
+                ? async (args) => {
+                    // Confirm each actual submission, including hidden retries. A CAS
+                    // conflict must never send a body carrying a different native session.
+                    if (stickyRouter?.shared && !(await bindSticky(outboundSessionId))) {
+                      throw Object.assign(new Error('Shared session binding changed before Codex submission'), {
+                        code: 'sticky_binding_conflict',
+                      })
+                    }
+                    return sharedRuntime ? sharedRuntime.invoke(lease, hop, args) : hop(args)
+                  }
+                : hop,
             args: {
               exec: execFor(projectRoot, vm),
+              onExecutionStart: onExecutionState
+                ? (execution) => onExecutionState(req, { ...execution, started: true, ended: false })
+                : undefined,
+              onExecutionEnd: onExecutionState ? (execution) => onExecutionState(req, execution) : undefined,
               signal: gone.signal,
               body: outboundBody,
               reqHeaders: req.headers,
@@ -804,7 +929,8 @@ export async function handleCodexProtocol({
             headersSent: res.headersSent || hopEmitted,
             conversionError,
             signal: gone.signal,
-          })
+          }) &&
+          (!sharedRuntime || (result?.execution?.ended === true && !result?.executionUncertain))
         ) {
           sameAccountRetries += 1
           attempts += 1
@@ -825,7 +951,28 @@ export async function handleCodexProtocol({
           result.terminalState = 'incomplete'
           result.body = { error: conversionError }
         }
-        ingestCodexHop(projectRoot, vm.id, result, Date.now(), normalizeCodexRouting(routing.codex).quota)
+        if (sharedRuntime && (result?.executionUncertain || result?.execution?.ended !== true)) {
+          executionUncertain = true
+          logBag.final_state = gone.signal.aborted ? 'cancelled' : 'incomplete'
+          logBag.error_code = 'codex_execution_uncertain'
+          if (gone.signal.aborted) return
+          stats.errors++
+          if (res.headersSent || hopEmitted) return res.end()
+          return json(res, 502, {
+            error: {
+              type: 'api_error',
+              code: 'codex_execution_uncertain',
+              message: 'Codex execution termination is unknown',
+            },
+          })
+        }
+        ingestCodexHop(
+          projectRoot,
+          vm.id,
+          result,
+          Date.now(),
+          picked.quotaPolicy || normalizeCodexRouting(routing.codex).quota,
+        )
         if (result?.transport_retried) logBag.transport_retried = true
         if (result?.reasoning_history_retried) {
           logBag.attempt_count += 1
@@ -839,7 +986,7 @@ export async function handleCodexProtocol({
         const delivered = !conversionError && (result?.ok || (Number(result?.status) === 200 && usageTokens(usage) > 0))
         if (delivered) {
           attemptKind = 'succeeded'
-          bindSticky(outboundSessionId)
+          await bindSticky(outboundSessionId)
           const extracted = extractOpenaiUsage(usage)
           const serviceTier = responseServiceTier || converted.body?.service_tier || usage?.service_tier || null
           const disjoint = extracted ? openaiAnthropicUsageFromExtract(extracted) : null
@@ -896,14 +1043,24 @@ export async function handleCodexProtocol({
         }
         if (isCodexFailoverError(result)) {
           pickOpts.excluded.add(vm.id)
-          leaveSticky()
+          await leaveSticky()
           switches += 1
           if (switches > failoverBudget.maxSwitches || attempts >= failoverBudget.maxAttempts) break
           continue
         }
         break
+      } catch (error) {
+        if (error?.code !== 'sticky_binding_conflict') throw error
+        stats.errors++
+        logBag.error_code = error.code
+        logBag.final_state = 'rejected'
+        return json(res, 503, { error: { type: 'api_error', code: error.code, message: '会话绑定已变更，请重试请求' } })
       } finally {
-        lease.release()
+        try {
+          await lease.release()
+        } finally {
+          if (sharedRuntime && (lease.uncertain || !lease.released)) executionUncertain = true
+        }
         if (claimsWindow) {
           try {
             sessions?.release?.(vm.id, picked.sessionKey, { gen: windowGen })
@@ -911,8 +1068,36 @@ export async function handleCodexProtocol({
         }
       }
     }
+  } catch (error) {
+    if (error?.code === 'request_cancelled') {
+      logBag.final_state = 'cancelled'
+      return
+    }
+    if (error?.code === 'session_queue_timeout') {
+      return rejectCodexAdmission({
+        res,
+        json,
+        stats,
+        logBag,
+        picked: { error: 'capacity_unavailable' },
+        model: converted.body.model,
+      })
+    }
+    throw error
   } finally {
-    gone.settle()
+    try {
+      try {
+        if (sharedRuntime && activeLease && !activeLease.released) await activeLease.release()
+      } finally {
+        if (turn) {
+          if (executionUncertain || activeLease?.uncertain || (activeLease && !activeLease.released))
+            await turn.markUncertain()
+          else await turn.release()
+        }
+      }
+    } finally {
+      gone.settle()
+    }
   }
   stats.errors++
   logBag.error_code = last?.body?.error?.code || 'codex_upstream'
@@ -1034,8 +1219,23 @@ function searchCredentials(projectRoot, vm) {
  * refresh token on its own, so first adopt a token it wrote meanwhile; otherwise refresh
  * once per slot, shared by concurrent callers.
  */
-function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl, refresh }) {
+async function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl, refresh, expectedGeneration }) {
   const now = searchCredentials(projectRoot, vm)
+  if (isKubernetesMode()) {
+    const result = await refreshSharedCodexCredential({
+      projectRoot,
+      vm,
+      proxyUrl,
+      fetchImpl,
+      refresh,
+      expectedGeneration,
+      db: currentRefreshAdmission()?.db,
+    })
+    return {
+      access: result.finished && result.value?.ok ? result.current.credential.access_token : '',
+      unknown: result.unknown,
+    }
+  }
   if (now.access && now.access !== usedAccess) return now.access
   if (!now.refresh) return ''
   let pending = searchRefreshes.get(vm.id)
@@ -1062,12 +1262,33 @@ function plainHeaders(headers) {
 }
 
 /** One search call on one slot. Resolves `{ status, text, headers }`, or `{ status: 0, error }`. */
-async function postCodexSearch({ projectRoot, vm, body, turnMetadata, fetchImpl, refresh = refreshCodexAccessToken }) {
+async function postCodexSearch({
+  projectRoot,
+  vm,
+  body,
+  turnMetadata,
+  fetchImpl,
+  refresh = refreshCodexAccessToken,
+  signal,
+  timeoutMs = CODEX_SEARCH_TIMEOUT_MS,
+  onExecutionStart,
+  onExecutionEnd,
+}) {
+  const notStarted = { requestId: null, started: false, ended: true, reason: 'not_started' }
   const proxyUrl = hostProxyUrlForVm(vm)
-  if (!fetchImpl && !proxyUrl && !isLocalEgressProxy(vm.proxy)) return { status: 0, error: 'proxy_required' }
-  const doFetch = fetchImpl || makeProxyFetch(proxyUrl, CODEX_SEARCH_TIMEOUT_MS, { maxMs: CODEX_SEARCH_TIMEOUT_MS })
+  if (!fetchImpl && !proxyUrl && !isLocalEgressProxy(vm.proxy))
+    return { status: 0, error: 'proxy_required', execution: notStarted }
+  let agent
+  try {
+    if (!fetchImpl && proxyUrl) agent = createProxyAgent(proxyUrl.replace(/^socks5:\/\//i, 'socks5h://'))
+  } catch {
+    return { status: 0, error: 'upstream_transport', execution: notStarted }
+  }
+  const doFetch = fetchImpl || fetch
   const creds = searchCredentials(projectRoot, vm)
   const send = async (access) => {
+    if (signal?.aborted) return { status: 0, error: 'client_cancelled', execution: notStarted }
+    const requestId = randomUUID()
     // Same identity as the slot's kernel; the backend wants originator, User-Agent and version to agree.
     const headers = {
       authorization: `Bearer ${access}`,
@@ -1076,20 +1297,56 @@ async function postCodexSearch({ projectRoot, vm, body, turnMetadata, fetchImpl,
       originator: CODEX_CATALOG_ORIGINATOR,
       'user-agent': CODEX_USER_AGENT,
       version: CODEX_APP_VERSION,
+      'x-client-request-id': requestId,
     }
     if (creds.accountId) headers['chatgpt-account-id'] = creds.accountId
     if (turnMetadata) headers['x-codex-turn-metadata'] = turnMetadata
+    const payload = JSON.stringify(body)
+    await onExecutionStart?.({ requestId, started: false, ended: false, reason: 'before_send' })
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    signal?.addEventListener('abort', abort, { once: true })
+    if (signal?.aborted) controller.abort()
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, timeoutMs)
+    let out
+    let execution
     try {
-      const res = await doFetch(CODEX_SEARCH_URL, { method: 'POST', headers, body: JSON.stringify(body) })
-      return { status: Number(res?.status) || 0, text: await res.text(), headers: plainHeaders(res?.headers) }
+      const res = await doFetch(CODEX_SEARCH_URL, {
+        method: 'POST',
+        headers,
+        body: payload,
+        agent,
+        signal: controller.signal,
+        ...(onExecutionStart ? { redirect: 'manual' } : {}),
+      })
+      out = { status: Number(res?.status) || 0, text: await res.text(), headers: plainHeaders(res?.headers) }
+      execution = { requestId, started: true, ended: true, reason: 'http_body_complete' }
     } catch (e) {
-      return { status: 0, error: /abort/i.test(`${e?.name} ${e?.message}`) ? 'upstream_timeout' : 'upstream_transport' }
+      const aborted = timedOut || signal?.aborted || /abort/i.test(`${e?.name} ${e?.message}`)
+      out = { status: 0, error: aborted ? 'upstream_timeout' : 'upstream_transport' }
+      execution = { requestId, started: true, ended: false, reason: timedOut ? 'http_timeout' : 'http_transport' }
+    } finally {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', abort)
     }
+    await onExecutionEnd?.(execution)
+    return { ...out, execution }
   }
-  if (!creds.access && !creds.refresh) return { status: 0, error: 'no_oauth_token' }
-  let out = creds.access ? await send(creds.access) : { status: 401 }
-  if (out.status === 401 || out.status === 403) {
-    const access = await refreshSearchAccess(projectRoot, vm, creds.access, { proxyUrl, fetchImpl, refresh })
+  if (!creds.access && !creds.refresh) return { status: 0, error: 'no_oauth_token', execution: notStarted }
+  let out = creds.access ? await send(creds.access) : { status: 401, execution: notStarted }
+  if ((out.status === 401 || out.status === 403) && !signal?.aborted) {
+    const refreshed = await refreshSearchAccess(projectRoot, vm, creds.access, {
+      proxyUrl,
+      fetchImpl,
+      refresh,
+      expectedGeneration: credentialGeneration(creds.first),
+    })
+    if (refreshed?.unknown) return { ...out, executionUncertain: true, error: 'credential_refresh_unknown' }
+    const access = typeof refreshed === 'string' ? refreshed : refreshed?.access
     if (access) out = await send(access)
   }
   return out
@@ -1124,6 +1381,7 @@ export async function handleCodexSearch({
   projectRoot,
   stickyRouter = null,
   ops = {},
+  onExecutionState = null,
 }) {
   logBag.via = 'codex-search'
   const reject = (status, type, code, message) => {
@@ -1142,7 +1400,8 @@ export async function handleCodexSearch({
   for (const key of CODEX_SEARCH_DROP_FIELDS) delete outbound[key]
   const turnMetadata = headerString(req.headers, 'x-codex-turn-metadata')
   const post = ops.postCodexSearch || postCodexSearch
-  const pickOpts = { stickyRouter, sessions: null, body: outbound, excluded: new Set() }
+  const sharedRuntime = ops.sharedRuntime || (isKubernetesMode() ? new SharedCodexRuntime() : null)
+  const pickOpts = { stickyRouter, sessions: null, body: outbound, excluded: new Set(), routing, sharedRuntime }
   const deadline = Date.now() + codexWaitTimeoutMs(routing)
   const gone = clientGoneSignal(req, res)
   let last = null
@@ -1170,24 +1429,51 @@ export async function handleCodexSearch({
         logBag.vm_id = vm.id
         logBag.account_id = vm.id
         logBag.attempt_count = attempts
-        last = await post({
+        const args = {
           projectRoot,
           vm,
           body: outbound,
           turnMetadata,
           fetchImpl: ops.fetchImpl,
           refresh: ops.refresh,
-        })
+          signal: gone.signal,
+          timeoutMs: ops.searchTimeoutMs,
+          onExecutionStart: onExecutionState
+            ? (execution) => onExecutionState(req, { ...execution, started: true, ended: false })
+            : undefined,
+          onExecutionEnd: onExecutionState ? (execution) => onExecutionState(req, execution) : undefined,
+        }
+        last = sharedRuntime ? await sharedRuntime.invoke(admitted.lease, post, args) : await post(args)
+        if (sharedRuntime && (last?.executionUncertain || last?.execution?.ended !== true)) {
+          logBag.final_state = gone.signal.aborted ? 'cancelled' : 'incomplete'
+          if (gone.signal.aborted) return
+          return reject(
+            502,
+            'api_error',
+            'codex_search_execution_uncertain',
+            'Codex search execution termination is unknown',
+          )
+        }
+        if (gone.signal.aborted) {
+          logBag.final_state = 'cancelled'
+          return
+        }
         logBag.upstream_status = last.status || null
-        ingestCodexHop(projectRoot, vm.id, {
-          ok: last.status >= 200 && last.status < 300,
-          status: last.status,
-          headers: last.headers || {},
-          body: parseJson(last.text),
-        })
+        ingestCodexHop(
+          projectRoot,
+          vm.id,
+          {
+            ok: last.status >= 200 && last.status < 300,
+            status: last.status,
+            headers: last.headers || {},
+            body: parseJson(last.text),
+          },
+          Date.now(),
+          admitted.picked.quotaPolicy || codex.quota,
+        )
         if (!isSearchFailover(last)) break
       } finally {
-        admitted.lease.release()
+        await admitted.lease.release()
       }
     }
   } finally {

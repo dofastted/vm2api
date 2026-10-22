@@ -25,6 +25,7 @@ export async function syncVmTimezoneFromProxy(
 ) {
   const id = String(vmId || '').trim()
   if (!id || !proxyPool) return skip('vm_id_required')
+  await proxyPool.refresh?.()
   if (!force && !proxyPool.followProxyTimezoneEnabled()) return skip('follow_proxy_timezone_disabled')
   const vm = getVm(projectRoot, id)
   if (!vm) return skip('vm_not_found')

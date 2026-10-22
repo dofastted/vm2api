@@ -33,18 +33,18 @@ test('panel login → cookie → /api/panel/me', async () => {
   }
 })
 
-test('admin database metrics endpoint returns a safe SQLite snapshot', async () => {
+test('admin database metrics endpoint returns a safe PostgreSQL snapshot', async () => {
   const gw = await startGateway()
   try {
     const response = await api(gw, 'GET', '/api/panel/database/metrics')
     assert.equal(response.status, 200, response.text)
     const data = response.json.data || response.json
-    assert.equal(data.database.engine, 'sqlite')
+    assert.equal(data.database.engine, 'postgresql')
     assert.equal(data.database.ok, true)
-    assert.equal(data.database.journal_mode, 'wal')
+    assert.equal('wal_size_bytes' in data.database, false)
     assert.equal(typeof data.database.probe_latency_ms, 'number')
-    assert.equal(typeof data.database.file_size_bytes, 'number')
-    assert.equal(typeof data.database.page_count, 'number')
+    assert.equal(typeof data.database.size_bytes, 'number')
+    assert.equal(typeof data.database.pool_total, 'number')
     assert.equal(typeof data.usage_cache.requests, 'number')
     assert.ok(data.sampled_at)
 
@@ -202,7 +202,8 @@ test('sessionKey import without SOCKS5 is rejected', async () => {
 })
 
 test('sessionKey import rejected when bound proxy is dead', async () => {
-  const gw = await startGateway()
+  // Slow proxy probing must not overlap the independent boot backup timer.
+  const gw = await startGateway({ env: { KIN_BACKUP_DISABLED: '1' } })
   try {
     const added = await api(gw, 'POST', '/api/panel/proxies/import', {
       body: { text: '10.9.9.9:1080' },
@@ -304,7 +305,7 @@ test('generate-auth-url then exchange-code writes fake oauth', async () => {
 })
 
 test('local egress slot generates auth url and exchanges code', async () => {
-  const gw = await startGateway({ oauth: false })
+  const gw = await startGateway({ oauth: false, env: { KIN_BACKUP_DISABLED: '1' } })
   try {
     const bind = await api(gw, 'POST', '/api/panel/proxies/px-local/bind', { body: { vm_id: 'vm-sim-01' } })
     assert.equal(bind.status, 200, bind.text)

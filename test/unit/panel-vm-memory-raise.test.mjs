@@ -108,3 +108,22 @@ test('PATCH vm memory rejects invalid values without persisting', async () => {
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('standalone memory errors preserve the original failure without a database fixture', async () => {
+  const root = tmpProject('memory-error')
+  const failure = new Error('synthetic memory failure')
+  try {
+    const { handlePanel } = handler(
+      root,
+      { memory: '1g' },
+      {
+        raiseDockerSlotMemory: () => {
+          throw failure
+        },
+      },
+    )
+    await assert.rejects(patchVm(handlePanel, 'memory-error'), (error) => error === failure)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})

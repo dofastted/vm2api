@@ -13,6 +13,7 @@ import { credentialModeOfVm, isApiKeyMode } from './credential-mode.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
 import { atomicWriteJson, withVmLock } from '../vm/vm-file.mjs'
+import { flushVmDbSync } from '../vm/vm-db-sync.mjs'
 
 export const CLAUDE_RESET_USAGE_PATH = '/api/oauth/usage?cedar_ember=1&skip_spend=1'
 export const CLAUDE_RESET_REDEEM_PATH = '/api/organizations/%s/reset_rate_limits'
@@ -321,16 +322,27 @@ function workerProblem(res) {
   return null
 }
 
-async function callWorker(transport, exec, op, opts) {
+async function callWorker(transport, exec, op, opts, vmOperation) {
+  let result
   try {
-    return await transport(exec, op, { timeoutMs: CALL_TIMEOUT_MS, ...opts })
-  } catch {
-    return { ok: false, status: 0, transportError: true, body: null }
+    result = await transport(exec, op, { timeoutMs: CALL_TIMEOUT_MS, ...opts })
+  } catch (error) {
+    result = {
+      ok: false,
+      status: 0,
+      transportError: true,
+      body: null,
+      vmOperationNotStarted: error?.vmOperationNotStarted === true,
+    }
   }
+  if (vmOperation && (result?.transportError || !result?.status) && result?.vmOperationNotStarted !== true) {
+    await vmOperation.markUncertain()
+  }
+  return result
 }
 
-async function fetchBlock(transport, exec) {
-  const res = await callWorker(transport, exec, 'reset-status')
+async function fetchBlock(transport, exec, vmOperation) {
+  const res = await callWorker(transport, exec, 'reset-status', undefined, vmOperation)
   const mapped = workerProblem(res)
   if (mapped) return mapped
   if (res?.transportError || !res?.status) return fail('CLAUDE_RESET_QUERY_FAILED', '限额重置状态查询失败', 502)
@@ -348,8 +360,8 @@ function canonicalUuid(value) {
   return text
 }
 
-async function fetchOrg(transport, exec) {
-  const res = await callWorker(transport, exec, 'profile')
+async function fetchOrg(transport, exec, vmOperation) {
+  const res = await callWorker(transport, exec, 'profile', undefined, vmOperation)
   const mapped = workerProblem(res)
   if (mapped) return mapped
   if (res?.transportError || res?.status !== 200)
@@ -376,11 +388,18 @@ function storedOutcome(record) {
   return publicOutcome({ ...record, replayed: true })
 }
 
-async function claim(transport, exec, org, grantId, operation) {
+async function claim(transport, exec, org, grantId, operation, vmOperation) {
   const unknown = { outcome: 'unknown', reason: 'claim_unconfirmed' }
-  const res = await callWorker(transport, exec, 'reset-redeem', {
-    body: { organization_uuid: org, grant_id: grantId, request_id: operation },
-  })
+  const res = await callWorker(
+    transport,
+    exec,
+    'reset-redeem',
+    {
+      body: { organization_uuid: org, grant_id: grantId, request_id: operation },
+    },
+    vmOperation,
+  )
+  if (res?.vmOperationNotStarted === true) return { ...unknown, vmOperationNotStarted: true }
   if (workerProblem(res) || res?.transportError || !res?.status) return unknown
   if (res.status === 401 || res.status === 403) return { outcome: 'ineligible', reason: 'authorization_rejected' }
   if (res.status !== 200 || !res.body || typeof res.body !== 'object' || Array.isArray(res.body)) return unknown
@@ -432,17 +451,17 @@ function fenceBlocks(fence, now) {
 async function persistCredits(projectRoot, vmId, credits) {
   if (!credits) return
   const file = path.join(projectRoot, 'vms', `${vmId}.json`)
-  await withVmLock(file, async () => {
-    let vm
-    try {
-      vm = JSON.parse(fs.readFileSync(file, 'utf8'))
-    } catch {
-      return
-    }
-    vm.claude_reset_credits = persistedCredits(credits)
-    vm.updated_at = new Date().toISOString()
-    atomicWriteJson(file, vm, { mode: 0o600 })
-  })
+  // Both callers hold the VM operation from before the remote call through this write.
+  let vm
+  try {
+    vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  } catch {
+    return
+  }
+  vm.claude_reset_credits = persistedCredits(credits)
+  vm.updated_at = new Date().toISOString()
+  atomicWriteJson(file, vm, { mode: 0o600 })
+  await flushVmDbSync()
 }
 
 function persistedCredits(view) {
@@ -474,11 +493,19 @@ export async function queryClaudeResetCredits({
 } = {}) {
   const account = loadAccount(projectRoot, vmId)
   if (!account.ok) return account
-  const fetched = await fetchBlock(transport, account.exec)
-  if (!fetched.ok) return fetched
-  const credits = projectClaudeResetCredits(fetched.block, now())
-  await persistCredits(projectRoot, vmId, credits)
-  return { ok: true, claude_reset_credits: credits }
+  return withVmLock(
+    path.join(projectRoot, 'vms', `${vmId}.json`),
+    async (vmOperation) => {
+      const current = loadAccount(projectRoot, vmId)
+      if (!current.ok) return current
+      const fetched = await fetchBlock(transport, current.exec, vmOperation)
+      if (!fetched.ok) return fetched
+      const credits = projectClaudeResetCredits(fetched.block, now())
+      await persistCredits(projectRoot, vmId, credits)
+      return { ok: true, claude_reset_credits: credits }
+    },
+    { vmId, kind: 'credit-query' },
+  )
 }
 
 export async function redeemClaudeResetCredit({
@@ -493,38 +520,51 @@ export async function redeemClaudeResetCredit({
   const account = loadAccount(projectRoot, vmId)
   if (!account.ok) return account
   const operation = claudeResetOperationId(vmId, normalized.key)
-  return withAccountLease(vmId, now(), async () => {
-    const existing = await mutateState(projectRoot, async (state) => ({
-      value: storedOutcome(state.operations[operation]),
-    }))
-    if (existing?.ok === false) return existing
-    if (existing) return { ok: true, ...existing }
-    const outcome = await redeemOnce({
-      projectRoot,
-      vmId,
-      operation,
-      exec: account.exec,
-      transport,
-      now,
-    })
-    if (!outcome.ok) return outcome
-    const saved = await mutateState(projectRoot, async (state) => {
-      state.operations[operation] = {
-        outcome: outcome.outcome,
-        ...(outcome.reason ? { reason: outcome.reason } : {}),
-        ...(outcome.cleared ? { cleared: outcome.cleared } : {}),
-        ...(outcome.cooldown_until ? { cooldown_until: outcome.cooldown_until } : {}),
-        ...(outcome.claude_reset_credits ? { credits: outcome.claude_reset_credits } : {}),
-        at: iso(now()),
-      }
-      return { write: true, value: outcome }
-    })
-    return saved?.ok === false ? saved : outcome
-  })
+  return withAccountLease(vmId, now(), () =>
+    withVmLock(
+      path.join(projectRoot, 'vms', `${vmId}.json`),
+      async (vmOperation) => {
+        const current = loadAccount(projectRoot, vmId)
+        if (!current.ok) return current
+        const existing = await mutateState(projectRoot, async (state) => ({
+          value: storedOutcome(state.operations[operation]),
+        }))
+        if (existing?.ok === false) return existing
+        if (existing) {
+          if (existing.outcome === 'unknown') await vmOperation?.markUncertain()
+          return { ok: true, ...existing }
+        }
+        const outcome = await redeemOnce({
+          projectRoot,
+          vmId,
+          operation,
+          exec: current.exec,
+          transport,
+          now,
+          vmOperation,
+        })
+        if (!outcome.ok) return outcome
+        const saved = await mutateState(projectRoot, async (state) => {
+          state.operations[operation] = {
+            outcome: outcome.outcome,
+            ...(outcome.reason ? { reason: outcome.reason } : {}),
+            ...(outcome.cleared ? { cleared: outcome.cleared } : {}),
+            ...(outcome.cooldown_until ? { cooldown_until: outcome.cooldown_until } : {}),
+            ...(outcome.claude_reset_credits ? { credits: outcome.claude_reset_credits } : {}),
+            at: iso(now()),
+          }
+          return { write: true, value: outcome }
+        })
+        if (saved?.ok === false) await vmOperation?.markUncertain()
+        return saved?.ok === false ? saved : outcome
+      },
+      { vmId, kind: 'credit-redeem' },
+    ),
+  )
 }
 
-async function redeemOnce({ projectRoot, vmId, operation, exec, transport, now }) {
-  const orgResult = await fetchOrg(transport, exec)
+async function redeemOnce({ projectRoot, vmId, operation, exec, transport, now, vmOperation }) {
+  const orgResult = await fetchOrg(transport, exec, vmOperation)
   if (!orgResult.ok) return orgResult
   const orgKey = claudeResetOrgId(orgResult.org)
   const owner = crypto.randomUUID()
@@ -539,6 +579,7 @@ async function redeemOnce({ projectRoot, vmId, operation, exec, transport, now }
       return fail('CLAUDE_RESET_UNRESOLVED', '上一次重置结果未确认，暂时不能再兑换', 409)
     }
     if (fence?.operation === operation) {
+      if (!fence.outcome || fence.outcome === 'unknown') await vmOperation?.markUncertain()
       return {
         ok: true,
         ...publicOutcome({
@@ -550,7 +591,7 @@ async function redeemOnce({ projectRoot, vmId, operation, exec, transport, now }
     }
     const blocked = fenceBlocks(fence, now())
     if (blocked) return blocked
-    const status = await fetchBlock(transport, exec)
+    const status = await fetchBlock(transport, exec, vmOperation)
     if (!status.ok) return status
     const grant = pickGrant(status.block, now())
     if (!grant) return fail('CLAUDE_RESET_NOT_AVAILABLE', '当前没有可兑换的限额重置', 409)
@@ -561,17 +602,20 @@ async function redeemOnce({ projectRoot, vmId, operation, exec, transport, now }
       at: iso(now()),
     })
     if (marked?.ok === false) return marked
-    const claimed = await claim(transport, exec, orgResult.org, grant.id, operation)
+    const claimed = await claim(transport, exec, orgResult.org, grant.id, operation, vmOperation)
+    if (claimed.outcome === 'unknown' && claimed.vmOperationNotStarted !== true) await vmOperation?.markUncertain()
     const settled = await writeFence(projectRoot, orgKey, {
       operation,
       outcome: claimed.outcome,
       ...(claimed.reason ? { reason: claimed.reason } : {}),
       at: iso(now()),
     })
-    if (settled?.ok === false)
+    if (settled?.ok === false) {
+      await vmOperation?.markUncertain()
       return { ok: true, outcome: 'unknown', reason: 'result_persistence_failed', replayed: false }
+    }
     if (claimed.outcome !== 'unknown') {
-      const fresh = await fetchBlock(transport, exec)
+      const fresh = await fetchBlock(transport, exec, vmOperation)
       if (fresh.ok) {
         claimed.credits = projectClaudeResetCredits(fresh.block, now())
         await persistCredits(projectRoot, vmId, claimed.credits)

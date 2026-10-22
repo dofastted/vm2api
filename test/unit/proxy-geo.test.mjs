@@ -18,8 +18,12 @@ function tmpDir(prefix = 'kin-geo-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix))
 }
 
-function makePool(geoLookup) {
-  const pool = new ProxyPool({ dataDir: tmpDir(), geoLookup })
+async function makePool(geoLookup) {
+  const pool = await new ProxyPool({
+    dataDir: tmpDir(),
+    geoLookup,
+    geoV6Lookup: async () => ({ ok: false, error: 'mock_no_ipv6' }),
+  }).init()
   pool.stopScheduler()
   return pool
 }
@@ -138,7 +142,7 @@ test('geo lookup surfaces transport and HTTP failures instead of throwing', asyn
 
 test('detectGeo caches per proxy and publishes location on the snapshot', async () => {
   let calls = 0
-  const pool = makePool(async () => {
+  const pool = await makePool(async () => {
     calls += 1
     return { ok: true, geo: { ip: '203.0.113.9', country: 'Japan', country_code: 'JP', timezone: 'Asia/Tokyo' } }
   })
@@ -146,7 +150,7 @@ test('detectGeo caches per proxy and publishes location on the snapshot', async 
     ok: true,
     geo: { ip: '2001:db8::9', country: 'Japan', country_code: 'JP', timezone: 'Asia/Tokyo' },
   })
-  const imported = pool.importLines('1.2.3.4:1080')
+  const imported = await pool.importLines('1.2.3.4:1080')
   const id = imported.items[0].id
 
   const first = await pool.detectGeo(id)
@@ -170,12 +174,12 @@ test('detectGeo caches per proxy and publishes location on the snapshot', async 
 })
 
 test('detectGeo keeps IPv4 and IPv6 results separate and records IPv6 unavailability', async () => {
-  const pool = makePool(async () => ({
+  const pool = await makePool(async () => ({
     ok: true,
     geo: { ip: '203.0.113.9', country: 'Japan', timezone: 'Asia/Tokyo' },
   }))
   pool.geoV6Lookup = async () => ({ ok: false, error: 'geo_transport_error:timeout' })
-  const id = pool.importLines('1.2.3.4:1080').items[0].id
+  const id = (await pool.importLines('1.2.3.4:1080')).items[0].id
   const result = await pool.detectGeo(id)
   assert.equal(result.ok, true)
   assert.equal(result.geo.ip, '203.0.113.9')
@@ -184,12 +188,12 @@ test('detectGeo keeps IPv4 and IPv6 results separate and records IPv6 unavailabi
 })
 
 test('detectGeo rejects IPv4 masquerading as IPv6 on the v6 path', async () => {
-  const pool = makePool(async () => ({
+  const pool = await makePool(async () => ({
     ok: true,
     geo: { ip: '203.0.113.9', country: 'Japan', timezone: 'Asia/Tokyo' },
   }))
   pool.geoV6Lookup = async () => ({ ok: false, error: 'geo_ipv6_got_ipv4' })
-  const id = pool.importLines('1.2.3.4:1080').items[0].id
+  const id = (await pool.importLines('1.2.3.4:1080')).items[0].id
   await pool.detectGeo(id)
   const snap = pool.snapshot().proxies.find((p) => p.id === id)
   assert.equal(snap.geo.ip, '203.0.113.9')
@@ -199,12 +203,12 @@ test('detectGeo rejects IPv4 masquerading as IPv6 on the v6 path', async () => {
 
 test('a failed lookup keeps the last known location and records the error', async () => {
   let ok = true
-  const pool = makePool(async () =>
+  const pool = await makePool(async () =>
     ok
       ? { ok: true, geo: { ip: '203.0.113.9', country: 'Japan', timezone: 'Asia/Tokyo' } }
       : { ok: false, error: 'geo_http_500' },
   )
-  const id = pool.importLines('1.2.3.4:1080').items[0].id
+  const id = (await pool.importLines('1.2.3.4:1080')).items[0].id
   await pool.detectGeo(id)
   ok = false
   const failed = await pool.detectGeo(id, { force: true })
@@ -216,12 +220,12 @@ test('a failed lookup keeps the last known location and records the error', asyn
 })
 
 test('binding a proxy moves the slot onto the exit node timezone', async () => {
-  const pool = makePool(async () => ({
+  const pool = await makePool(async () => ({
     ok: true,
     geo: { ip: '203.0.113.9', country: 'Japan', timezone: 'Asia/Tokyo' },
   }))
-  const id = pool.importLines('1.2.3.4:1080').items[0].id
-  pool.bind(id, 'vm-01')
+  const id = (await pool.importLines('1.2.3.4:1080')).items[0].id
+  await pool.bind(id, 'vm-01')
   const root = seedProject({
     id: 'vm-01',
     timezone: 'America/Los_Angeles',
@@ -238,9 +242,9 @@ test('binding a proxy moves the slot onto the exit node timezone', async () => {
 })
 
 test('a hand-pinned slot timezone survives a proxy bind unless forced', async () => {
-  const pool = makePool(async () => ({ ok: true, geo: { timezone: 'Asia/Tokyo' } }))
-  const id = pool.importLines('1.2.3.4:1080').items[0].id
-  pool.bind(id, 'vm-02')
+  const pool = await makePool(async () => ({ ok: true, geo: { timezone: 'Asia/Tokyo' } }))
+  const id = (await pool.importLines('1.2.3.4:1080')).items[0].id
+  await pool.bind(id, 'vm-02')
   const root = seedProject({
     id: 'vm-02',
     timezone: 'America/New_York',
@@ -259,14 +263,14 @@ test('a hand-pinned slot timezone survives a proxy bind unless forced', async ()
 })
 
 test('follow_proxy_timezone=false stops the bind-time default', async () => {
-  const pool = makePool(async () => ({ ok: true, geo: { timezone: 'Asia/Tokyo' } }))
-  pool.updateConfig({ follow_proxy_timezone: false })
+  const pool = await makePool(async () => ({ ok: true, geo: { timezone: 'Asia/Tokyo' } }))
+  await pool.updateConfig({ follow_proxy_timezone: false })
   // updateConfig restarts the probe loop; left running it keeps the test
   // process alive forever.
   pool.stopScheduler()
   assert.equal(pool.followProxyTimezoneEnabled(), false)
-  const id = pool.importLines('1.2.3.4:1080').items[0].id
-  pool.bind(id, 'vm-03')
+  const id = (await pool.importLines('1.2.3.4:1080')).items[0].id
+  await pool.bind(id, 'vm-03')
   const root = seedProject({ id: 'vm-03', timezone: 'America/New_York', proxy: { id } })
 
   const skipped = await syncVmTimezoneFromProxy(root, pool, 'vm-03')
@@ -275,9 +279,9 @@ test('follow_proxy_timezone=false stops the bind-time default', async () => {
 })
 
 test('an unresolvable exit zone leaves the slot timezone alone', async () => {
-  const pool = makePool(async () => ({ ok: true, geo: { ip: '203.0.113.9', country: 'Japan', timezone: null } }))
-  const id = pool.importLines('1.2.3.4:1080').items[0].id
-  pool.bind(id, 'vm-04')
+  const pool = await makePool(async () => ({ ok: true, geo: { ip: '203.0.113.9', country: 'Japan', timezone: null } }))
+  const id = (await pool.importLines('1.2.3.4:1080')).items[0].id
+  await pool.bind(id, 'vm-04')
   const root = seedProject({ id: 'vm-04', timezone: 'America/Denver', proxy: { id } })
 
   const skipped = await syncVmTimezoneFromProxy(root, pool, 'vm-04')
@@ -287,14 +291,14 @@ test('an unresolvable exit zone leaves the slot timezone alone', async () => {
 
 test('a node slot on local egress follows its node exit, not the control plane row', async (t) => {
   const lookups = []
-  const pool = makePool(async (url) => {
+  const pool = await makePool(async (url) => {
     lookups.push(url)
     // '' = the control plane's own route (px-local row); a SOCKS URL = the node forwarder.
     return { ok: true, geo: { timezone: url ? 'Europe/Berlin' : 'Asia/Tokyo' } }
   })
-  const local = pool.ensureLocal().proxy
-  pool.bind(local.id, 'vm-05')
-  pool.bind(local.id, 'vm-06')
+  const local = (await pool.ensureLocal()).proxy
+  await pool.bind(local.id, 'vm-05')
+  await pool.bind(local.id, 'vm-06')
   await startNodeEgressSocks({ clientFor: () => assert.fail('geo lookup is injected') })
   t.after(stopNodeEgressSocks)
   const proxy = { id: local.id, scheme: 'local', host: 'local', port: 0 }

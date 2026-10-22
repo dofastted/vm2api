@@ -23,12 +23,12 @@ function rowToRec(row) {
 export class RefusalGuardsRepo {
   constructor(db = getDb()) {
     this.db = db
-    this._get = db.prepare('SELECT * FROM refusal_guards WHERE fingerprint = ?')
+    this._get = db.prepare('SELECT * FROM refusal_guards WHERE fingerprint = $1')
     this._insert = db.prepare(`
       INSERT INTO refusal_guards (
         fingerprint, model, first_seen_at, last_seen_at, hit_count,
         source_request_id, error_message, preview, expires_at, signature
-      ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+      ) VALUES ($1, $2, $3, $4, 0, $5, $6, $7, $8, $9)
       ON CONFLICT(fingerprint) DO UPDATE SET
         last_seen_at = excluded.last_seen_at,
         error_message = COALESCE(excluded.error_message, refusal_guards.error_message),
@@ -41,32 +41,34 @@ export class RefusalGuardsRepo {
         END
     `)
     this._hit = db.prepare(`
-      UPDATE refusal_guards SET hit_count = hit_count + 1, last_seen_at = ?
-      WHERE fingerprint = ?
+      UPDATE refusal_guards SET hit_count = hit_count + 1, last_seen_at = $1
+      WHERE fingerprint = $2
     `)
     this._list = db.prepare(
       `SELECT fingerprint, model, first_seen_at, last_seen_at, hit_count,
               source_request_id, error_message, preview, expires_at
-       FROM refusal_guards ORDER BY last_seen_at DESC, fingerprint LIMIT ?`,
+       FROM refusal_guards ORDER BY last_seen_at DESC, fingerprint LIMIT $1`,
     )
     this._signatures = db.prepare(
       `SELECT fingerprint, signature FROM refusal_guards
-       WHERE signature IS NOT NULL AND (expires_at IS NULL OR expires_at > ?)`,
+       WHERE signature IS NOT NULL AND (expires_at IS NULL OR expires_at > $1)`,
     )
     this._count = db.prepare('SELECT COUNT(*) AS n FROM refusal_guards')
-    this._remove = db.prepare('DELETE FROM refusal_guards WHERE fingerprint = ?')
+    this._remove = db.prepare('DELETE FROM refusal_guards WHERE fingerprint = $1')
     this._clear = db.prepare('DELETE FROM refusal_guards')
   }
 
-  get(fingerprint) {
-    const rec = rowToRec(this._get.get(String(fingerprint || '')))
+  async get(fingerprint) {
+    const rec = rowToRec(await this._get.get(String(fingerprint || '')))
     if (!rec?.expires_at) return rec
     if (Date.parse(rec.expires_at) > Date.now()) return rec
-    this.remove(rec.fingerprint)
+    await this.db
+      .prepare('DELETE FROM refusal_guards WHERE fingerprint = $1 AND expires_at = $2')
+      .run(rec.fingerprint, rec.expires_at)
     return null
   }
 
-  remember({
+  async remember({
     fingerprint,
     model = '',
     requestId = null,
@@ -78,7 +80,7 @@ export class RefusalGuardsRepo {
     const fp = String(fingerprint || '').trim()
     if (!fp) return null
     const now = new Date().toISOString()
-    this._insert.run(
+    await this._insert.run(
       fp,
       String(model || ''),
       now,
@@ -89,51 +91,48 @@ export class RefusalGuardsRepo {
       expiresAt || null,
       signature || null,
     )
-    return this.get(fp)
+    return await this.get(fp)
   }
 
-  hit(fingerprint) {
+  async hit(fingerprint) {
     const fp = String(fingerprint || '').trim()
     if (!fp) return null
-    this._hit.run(new Date().toISOString(), fp)
-    return this.get(fp)
+    await this._hit.run(new Date().toISOString(), fp)
+    return await this.get(fp)
   }
   /** Highest stored user-text signature at or above the threshold. */
-  nearest(signature, threshold = REFUSAL_SIMILARITY) {
+  async nearest(signature, threshold = REFUSAL_SIMILARITY) {
     const query = Array.isArray(signature) ? signature : decodeSignature(signature)
     if (!query) return null
     let best = null
-    for (const row of this._signatures.all(new Date().toISOString())) {
+    for (const row of await this._signatures.all(new Date().toISOString())) {
       const score = signatureSimilarity(query, decodeSignature(row.signature))
       if (score < threshold) continue
       if (!best || score > best.score) best = { fingerprint: row.fingerprint, score }
     }
     if (!best) return null
-    const rec = this.get(best.fingerprint)
+    const rec = await this.get(best.fingerprint)
     if (!rec) return null
     return { ...rec, score: best.score }
   }
 
-  list(limit = 200) {
+  async list(limit = 200) {
     const n = Math.min(500, Math.max(1, Number(limit) || 200))
     const now = Date.now()
-    return this._list
-      .all(n)
-      .map(rowToRec)
-      .filter((rec) => !rec.expires_at || Date.parse(rec.expires_at) > now)
+    return (await this._list.all(n)).map(rowToRec).filter((rec) => !rec.expires_at || Date.parse(rec.expires_at) > now)
   }
 
-  count() {
-    return Number(this._count.get()?.n) || 0
+  async count() {
+    return Number((await this._count.get())?.n) || 0
   }
 
-  remove(fingerprint) {
+  async remove(fingerprint) {
     const fp = String(fingerprint || '').trim()
     if (!fp) return false
-    return this._remove.run(fp).changes > 0
+    return (await this._remove.run(fp)).changes > 0
   }
 
-  clear() {
-    return this._clear.run().changes
+  async clear() {
+    return (await this._clear.run()).changes
   }
 }

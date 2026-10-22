@@ -462,7 +462,7 @@ test('saved Anthropic row reloads its proxy and can test or fetch models without
   const savedKey = response.body.item.api_key_entries[0]
   assert.equal(savedKey.proxy_id, 'px-1')
 
-  const reloaded = new ApiEndpointStore({ dataDir: dir }).list()
+  const reloaded = await new ApiEndpointStore({ dataDir: dir }).list()
   assert.equal(reloaded[0].api_key_entries[0].proxy_id, 'px-1')
   assert.equal(reloaded[0].api_key_entries[0].api_key.includes('sk-ant-saved'), false)
 

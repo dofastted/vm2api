@@ -3,6 +3,29 @@ set -eu
 
 ROOT="${KIN_PROJECT_ROOT:-/opt/vm2api}"
 IMAGE_BIN="/opt/vm2api/image-bin"
+if [ -z "${VM2API_DATABASE_URL:-${KIN_DATABASE_URL:-}}" ]; then
+  echo "vm2api: PostgreSQL 17 connection is required. Configure VM2API_DATABASE_URL; see docs/deploy/postgresql.md for SQLite import." >&2
+  exit 1
+fi
+
+# Runtime HA Pods only use PostgreSQL and the fixed TLS node interface. Assets
+# and execution privileges stay on trusted nodes; per-Pod random secrets would
+# split authentication and encrypted state between replicas.
+if [ "${VM2API_CONTROL_PLANE_MODE:-}" = kubernetes-ha ]; then
+  if [ -z "${VM2API_API_KEY:-${KIN_API_KEY:-}}" ] || [ -z "${VM2API_ADMIN_PASSWORD:-${KIN_ADMIN_PASSWORD:-}}" ] || [ -z "${VM2API_DB_SECRET:-${KIN_DB_SECRET:-}}" ]; then
+    echo "vm2api: kubernetes-ha requires shared VM2API_API_KEY, VM2API_ADMIN_PASSWORD and VM2API_DB_SECRET." >&2
+    exit 1
+  fi
+  KIN_DATA_DIR="${KIN_DATA_DIR:-$ROOT/data}"
+  KIN_CAPTURES_DIR="${KIN_CAPTURES_DIR:-$KIN_DATA_DIR/captures}"
+  export KIN_DATA_DIR KIN_CAPTURES_DIR
+  mkdir -p "$ROOT/src/config" "$KIN_DATA_DIR" "$KIN_CAPTURES_DIR"
+  if [ ! -f "$ROOT/src/config/routing.json" ]; then
+    cp /opt/vm2api/image-config/routing.json "$ROOT/src/config/routing.json"
+  fi
+  cd /opt/vm2api
+  exec node src/server.mjs
+fi
 mkdir -p "$ROOT/vms" "$ROOT/data" "$ROOT/bin"
 
 # 镜像安装没有仓库 checkout：把镜像内默认配置补进被 bind-mount 覆盖的 src/config。
@@ -86,11 +109,13 @@ if [ -f /opt/vm2api/image-crag/kin-kernel ]; then
   fi
 fi
 
-if [ ! -S /var/run/docker.sock ]; then
-  echo "vm2api: /var/run/docker.sock not mounted; slot create/start will fail." >&2
-elif [ -f /opt/vm2api/docker/kin-os/build.mjs ]; then
-  # 只拉预构建客体镜像；拉不到不阻塞启动，建槽时再兜底构建。
-  node /opt/vm2api/docker/kin-os/build.mjs --pull-only ubuntu || true
+if [ "${VM2API_CONTROL_PLANE_MODE:-}" != kubernetes ]; then
+  if [ ! -S /var/run/docker.sock ]; then
+    echo "vm2api: /var/run/docker.sock not mounted; slot create/start will fail." >&2
+  elif [ -f /opt/vm2api/docker/kin-os/build.mjs ]; then
+    # 只拉预构建客体镜像；拉不到不阻塞启动，建槽时再兜底构建。
+    node /opt/vm2api/docker/kin-os/build.mjs --pull-only ubuntu || true
+  fi
 fi
 
 env_get_file() {
@@ -150,7 +175,7 @@ if [ -z "${VM2API_DB_SECRET:-}" ] && [ -z "${KIN_DB_SECRET:-}" ]; then
   env_upsert_if_empty VM2API_DB_SECRET "$VM2API_DB_SECRET" "$ENVF"
 fi
 
-if [ "$WRAP_CHANGED" = 1 ] && [ "${KIN_AUTO_SYNC_WRAP:-0}" = 1 ]; then
+if [ "${VM2API_CONTROL_PLANE_MODE:-}" != kubernetes ] && [ "$WRAP_CHANGED" = 1 ] && [ "${KIN_AUTO_SYNC_WRAP:-0}" = 1 ]; then
   node /opt/vm2api/scripts/sync-wrap-cli.mjs &
 fi
 

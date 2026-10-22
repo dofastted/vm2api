@@ -1,0 +1,35 @@
+{
+  "source_commit": "1366e203b4b771542702517bc4e1bf0279e6ee8f",
+  "smoke_test_commit": "e8e418b9",
+  "image": "vm2api:kubernetes-check",
+  "docker_reported_id": "sha256:db547ceaccc6803bbd1d14ec3dcd1fa5d3ca5dbe7779b65c0b67f93c01ea0db7",
+  "containerd_manifest_digest": "sha256:db547ceaccc6803bbd1d14ec3dcd1fa5d3ca5dbe7779b65c0b67f93c01ea0db7",
+  "manifest_config_digest": "sha256:9669bbe537df06ba2b76efdadbd085a5e6d37ece17cdec900e58da7dfbfb01de",
+  "observed_pod_image_id": "sha256:9669bbe537df06ba2b76efdadbd085a5e6d37ece17cdec900e58da7dfbfb01de",
+  "namespace": "vm2api-k8s-649-ef1854c411",
+  "namespace_deleted": true,
+  "exit_code": 1,
+  "failure": "SSE text deltas were buffered until completion",
+  "first_text_delta_ms": 1012.9,
+  "second_text_delta_ms": 1013.0,
+  "headers_ms": 1012.8,
+  "eof_ms": 1017.8,
+  "logs": [
+    "smoke-runtime.log",
+    "smoke-runtime-second.log"
+  ],
+  "passed_before_failure": [
+    "pod readiness",
+    "Service DNS and ClusterIP",
+    "healthz/readyz/console",
+    "panel cookie login",
+    "PostgreSQL metrics",
+    "managed API key create",
+    "nonstream managed API inference proof"
+  ],
+  "not_reached": [
+    "duplicate controller rejection",
+    "Pod recreate restart",
+    "session/API key/PVC persistence"
+  ]
+}

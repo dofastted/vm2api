@@ -4,6 +4,8 @@ import { fileURLToPath } from 'node:url'
 import { hashKey } from './security.mjs'
 import { atomicWriteJson } from '../vm/vm-file.mjs'
 import { loadDistillRules } from './distill-detect.mjs'
+import { readRoutingDocument, routingDocumentRevision } from './routing-document.mjs'
+import { isKubernetesHaMode } from './control-plane-mode.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 // this file lives at src/lib/core/ — the gateway root is src/
@@ -93,6 +95,7 @@ export function routingConfigFile(projectRoot = PROJECT) {
 
 export function readRoutingConfigFile(projectRoot = PROJECT) {
   const file = routingConfigFile(projectRoot)
+  if (routingDocumentRevision(file) !== null) return readRoutingDocument(file)
   let raw
   try {
     raw = fs.readFileSync(file, 'utf8')
@@ -147,6 +150,7 @@ export function resolvePublicBaseUrl(env = process.env, port = Number(env.PORT |
 }
 
 function readActiveVmRecord(projectRoot) {
+  if (isKubernetesHaMode()) return null
   try {
     const active = JSON.parse(fs.readFileSync(path.join(projectRoot, 'vms', 'active.json'), 'utf8'))
     const id = active?.active_vm

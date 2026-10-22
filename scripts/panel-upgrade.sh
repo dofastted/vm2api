@@ -9,7 +9,6 @@ TAG=$5
 ARCH=$6
 shift 6
 cd "$ROOT"
-
 COMPOSE_FILE_LIST=''
 for file do
   if [ -n "$COMPOSE_FILE_LIST" ]; then COMPOSE_FILE_LIST="$COMPOSE_FILE_LIST:"; fi
@@ -126,6 +125,8 @@ else
   compose pull vm2api
 fi
 
+# The new image checks the import marker without starting HTTP or applying migrations.
+compose run --rm --no-deps -T --entrypoint node vm2api scripts/check-postgres-upgrade.mjs
 compose up -d --no-deps --force-recreate vm2api
 CURRENT_ID=$(docker inspect --format '{{.Id}}' "$CONTAINER")
 if [ "$CURRENT_ID" = "$PREVIOUS_ID" ]; then

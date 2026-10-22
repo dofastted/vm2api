@@ -79,6 +79,7 @@ test('API classifier backend preserves contract, rejects model substitution and 
     runApiInference({
       cfg: { paths: { data: temp } },
       scheduler: {
+        reload() {},
         pick: () => ({
           ok: true,
           endpoint: { id: 'fixture', kind: 'claude', protocol: 'anthropic', base_url: 'https://fixture.invalid' },
@@ -86,7 +87,7 @@ test('API classifier backend preserves contract, rejects model substitution and 
           key: { id: 'fixture', api_key: 'fixture-key' },
         }),
       },
-      store: {},
+      store: { listRaw: async () => [] },
       inbound: input,
       convertedBody: input,
       clientStream: false,

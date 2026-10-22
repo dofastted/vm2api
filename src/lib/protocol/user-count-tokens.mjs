@@ -6,7 +6,7 @@ import { makeError, mapUpstreamError, rewritePoolErrorForClient, ErrorType, Erro
 import { refusalGuardPolicy } from '../core/refusal-guard.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
-import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { RuntimeSettings as SettingsRepo } from '../db/settings-state.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
 import { readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
 import { runProtocolIntercept } from './intercept-gate.mjs'
@@ -104,18 +104,32 @@ export async function peekCurrentAccount({
   const detected = detectInboundPlatform(model)
   const platform = detected.ok ? detected.platform : undefined
   const identity = resolveInboundIdentity({ inbound, body: inbound, headers: req?.headers || {} })
-  const stickyKey =
-    (platform === 'anthropic' && identity.sessionId && stickyRouter?.sessionPoolKeys
-      ? stickyRouter.sessionPoolKeys(req, inbound, {
+  let stickyKey
+  if (
+    platform === 'anthropic' &&
+    (identity.sessionId || stickyRouter?.shared) &&
+    (stickyRouter?.shared || stickyRouter?.sessionPoolKeys)
+  ) {
+    const keys = stickyRouter.shared
+      ? await stickyRouter.sessionPoolKeysShared(req, inbound, {
           sessionId: identity.sessionId,
           deviceId: identity.deviceId,
           migrate: false,
-        }).stickyKey
-      : stickyRouter?.extractPoolKey?.(req, inbound, { platform })) || null
+        })
+      : stickyRouter.sessionPoolKeys(req, inbound, {
+          sessionId: identity.sessionId,
+          deviceId: identity.deviceId,
+          migrate: false,
+        })
+    stickyKey = keys.stickyKey || null
+  } else {
+    if (stickyRouter?.shared) await stickyRouter.refresh()
+    stickyKey = stickyRouter?.extractPoolKey?.(req, inbound, { platform }) || null
+  }
   if (!poolScheduler?.peekAccount) {
     return { ok: false, code: 'no_eligible_accounts' }
   }
-  const keyScope = keyScopeFromRequest(req)
+  const keyScope = await keyScopeFromRequest(req)
   const poolDenial = vmPoolDenial(keyScope)
   if (poolDenial) return { ok: false, code: ErrorCode.VM_POOL_UNAVAILABLE, message: poolDenial.message }
   // Same gate as Messages: a platform-scoped key must not hop to the other platform's VMs.
@@ -126,7 +140,7 @@ export async function peekCurrentAccount({
     model,
     stickyKey,
     signal,
-    ownerScope: ownerScopeFromRequest(req, usersRepo),
+    ownerScope: await ownerScopeFromRequest(req, usersRepo),
     keyScope,
   })
 }
@@ -245,7 +259,7 @@ export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
 
 export async function handleUserCountTokens(req, res, deps) {
   const json = (...args) => deps.json(...args)
-  if (!deps.requireAuth(req, res)) return
+  if (!(await deps.requireAuth(req, res))) return
   let inbound
   try {
     inbound = await deps.readBody(req, inboundBodyLimit(deps.getRouting?.(), deps.cfg.limits.max_body_bytes))
@@ -355,14 +369,17 @@ export async function resolveUsageWindows({
   if (!shouldHopOfficialUsage(acc?.unified, { hop: true })) return { listed, source }
   const cache = usageCache || getUsageCache()
   let result
+  let observation
   try {
+    observation = await accountQuota?.beginObservation?.()
     result = await cache.load(accountId, () => probe({ exec, vm, includeFable: false }))
   } catch {
     return { listed, source }
   }
   if (!result || isOfficialUsageRateLimited(result)) return { listed, source }
   try {
-    accountQuota?.ingestOAuthUsage?.(accountId, result)
+    accountQuota?.ingestOAuthUsage?.(accountId, result, { observation })
+    await accountQuota?.flush?.()
   } catch {}
   const next = accountQuota?.repo?.get?.(accountId) || acc
   listed = listQuotaFromHeaders(next?.unified || {})
@@ -372,7 +389,7 @@ export async function resolveUsageWindows({
 
 export async function handleUserUsage(req, res, deps) {
   const json = (...args) => deps.json(...args)
-  if (!deps.requireAuth(req, res)) return
+  if (!(await deps.requireAuth(req, res))) return
   const peeked = await peekCurrentAccount({
     poolScheduler: typeof deps.getPoolScheduler === 'function' ? deps.getPoolScheduler() : deps.poolScheduler,
     stickyRouter: deps.stickyRouter,

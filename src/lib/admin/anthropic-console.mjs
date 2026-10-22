@@ -62,12 +62,12 @@ function headerMap(raw) {
   return out
 }
 
-function directKeys(input = {}, store = null) {
+async function directKeys(input = {}, store = null) {
   const listed = Array.isArray(input.keys) ? input.keys : [input]
   const keys = []
   for (const [row, item] of listed.entries()) {
     const source = item && typeof item === 'object' ? item : { api_key: item }
-    const saved = source.key_id || source.keyId ? savedEndpointKey(store, source.key_id || source.keyId) : null
+    const saved = source.key_id || source.keyId ? await savedEndpointKey(store, source.key_id || source.keyId) : null
     const apiKey = String(source.api_key || source.apiKey || saved?.api_key || '').trim()
     if (!apiKey) continue
     const label = String(source.label || '')
@@ -97,10 +97,10 @@ function chosen(source, snake, camel, fallback) {
   return String(fallback || '').trim()
 }
 
-export function savedEndpointKey(store, keyId) {
+export async function savedEndpointKey(store, keyId) {
   const id = String(keyId || '').trim()
   if (!id || !store?.listRaw) return null
-  for (const endpoint of store.listRaw()) {
+  for (const endpoint of await store.listRaw()) {
     const key = (endpoint.api_key_entries || []).find((item) => item.id === id)
     if (!key) continue
     return {
@@ -254,7 +254,7 @@ export async function runAnthropicConsole({
     return forwardConsoleRequest(request, { cfg, forward })
   }
 
-  const keys = directKeys(input, store)
+  const keys = await directKeys(input, store)
   const index = Number.isInteger(Number(input?.key_index)) ? Number(input.key_index) : null
   const selected = index == null ? keys : keys.filter((key) => key.row === index)
   if (!selected.length) {

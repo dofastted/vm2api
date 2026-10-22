@@ -1,9 +1,9 @@
+import { readRoutingDocument } from '../core/routing-document.mjs'
 /**
  * Anthropic cache_control ttl for unofficial OAuth.
  * Default 1h (2× input). Customers may request 5m (1.25× input);
  * billing must use the TTL we actually sent.
  */
-import fs from 'node:fs'
 import { isAnthropicServerTool } from './web-search.mjs'
 
 export const DEFAULT_CACHE_TTL = '1h'
@@ -35,7 +35,7 @@ export function cacheTtlFromRouting(routing = {}) {
 export function cacheTtlFromRoutingFile(filePath) {
   if (!filePath) return DEFAULT_CACHE_TTL
   try {
-    return cacheTtlFromRouting(JSON.parse(fs.readFileSync(filePath, 'utf8')))
+    return cacheTtlFromRouting(readRoutingDocument(filePath))
   } catch {
     return DEFAULT_CACHE_TTL
   }
@@ -399,7 +399,7 @@ export function cacheBreakpointsFromRouting(routing = {}) {
 export function cacheBreakpointsFromRoutingFile(filePath) {
   if (!filePath) return normalizeCacheBreakpoints(null)
   try {
-    return cacheBreakpointsFromRouting(JSON.parse(fs.readFileSync(filePath, 'utf8')))
+    return cacheBreakpointsFromRouting(readRoutingDocument(filePath))
   } catch {
     return normalizeCacheBreakpoints(null)
   }

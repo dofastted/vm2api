@@ -1,3 +1,7 @@
+import { trackPendingWrite } from '../db/pending-writes.mjs'
+import { currentHaRequestContext } from '../core/ha-request-context.mjs'
+import { captureHaBillingSnapshot } from '../core/ha-request-billing.mjs'
+import { isKubernetesHaMode } from '../core/control-plane-mode.mjs'
 /**
  * /v1 protocol handler. URLs, auth, and response envelopes stay with the
  * server wiring; this factory owns convert → pool → Go/Rust hop → client.
@@ -16,7 +20,7 @@ import {
 } from '../core/refusal-guard.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
-import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { RuntimeSettings as SettingsRepo } from '../db/settings-state.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
 import { jevScopeWaits, readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
 import { runProtocolIntercept } from './intercept-gate.mjs'
@@ -172,13 +176,24 @@ export function createHandleProtocol(deps) {
   const json = (...args) => deps.json(...args)
   const writeSSEHeaders = (...args) => deps.writeSSEHeaders(...args)
   const readBody = (...args) => deps.readBody(...args)
-  const requireAuth = (...args) => deps.requireAuth(...args)
+  const requireAuth = async (...args) => await deps.requireAuth(...args)
   const cfg = deps.cfg
   const requestLog = deps.requestLog
   const stickyRouter = deps.stickyRouter
   const accountQuota = deps.accountQuota
   const apiKeyStore = deps.apiKeyStore
   const apiScheduler = deps.apiScheduler
+  const rejectHaOperation = (res) =>
+    json(
+      res,
+      503,
+      makeError({
+        type: ErrorType.INVALID_REQUEST,
+        code: 'ha_operation_unsupported',
+        message: '该操作暂不支持多副本部署',
+        status: 503,
+      }).body,
+    )
   const apiEndpointStore = deps.apiEndpointStore
   const stats = deps.stats
   const routingConfigPath = deps.routingConfigPath
@@ -199,18 +214,63 @@ export function createHandleProtocol(deps) {
     return disjointOpenaiUsage(next)
   }
 
-  function attachPricing(logBag, { managedKey = null, rateMultiplier = 1, bill = false } = {}) {
+  async function attachPricing(
+    logBag,
+    { managedKey = null, rateMultiplier = 1, bill = false, reservation = null, execution = null } = {},
+  ) {
+    if (isKubernetesHaMode() && bill && managedKey && reservation?.shared) {
+      try {
+        let nodeStatus
+        if (execution?.requestId && execution?.nodeBinding) {
+          try {
+            nodeStatus = await deps.readNodeRecoveryStatus?.({
+              requestId: execution.requestId,
+              nodeBinding: execution.nodeBinding,
+            })
+          } catch {}
+        }
+        const settled = await apiKeyStore.recordHaUsage({ reservation, commandId: execution?.requestId, nodeStatus })
+        const price = settled.pricing
+        Object.assign(logBag, {
+          input_cost: price?.input_cost ?? null,
+          output_cost: price?.output_cost ?? null,
+          cache_read_cost: price?.cache_read_cost ?? null,
+          cache_creation_cost: price?.cache_creation_cost ?? null,
+          web_search_cost: price?.web_search_cost ?? null,
+          total_cost: price?.total_cost ?? null,
+          pricing_model: price?.pricing_key ?? 'unpriced',
+          price_source: price?.price_source ?? null,
+          price_version: price?.price_version ?? null,
+          service_tier: price?.service_tier ?? null,
+          speed: price?.speed ?? null,
+          long_context: price ? (price.long_context ? 1 : 0) : null,
+        })
+        if (!settled.settled) reservation.billingFailed = true
+      } catch (error) {
+        reservation.billingFailed = true
+        throw error
+      }
+      return
+    }
     const model = logBag.upstream_model || logBag.model
     const priced = costColumnsFromUsage(logBag.usage || {}, model)
     Object.assign(logBag, priced)
     if (!bill || !managedKey) return
     try {
-      apiKeyStore.recordUsage(managedKey, logBag.usage || {}, {
+      await apiKeyStore.recordUsage(managedKey, logBag.usage || {}, {
         model,
         rateMultiplier,
         officialCost: priced.total_cost,
+        reservation,
       })
-    } catch {}
+    } catch (error) {
+      if (reservation?.shared) {
+        // The request executed but its quota settlement is uncertain. Preserve the
+        // durable reservation until recovery can establish the result.
+        reservation.billingFailed = true
+        throw error
+      }
+    }
   }
 
   function finishClientCancel(res, result, logBag) {
@@ -371,10 +431,10 @@ export function createHandleProtocol(deps) {
     }
   }
 
-  function banRefusalDevice(deviceId, { requestId, fingerprint, reason }) {
+  async function banRefusalDevice(deviceId, { requestId, fingerprint, reason }) {
     if (!deviceId) return
     try {
-      deviceRepo()?.block?.({ deviceId, requestId, fingerprint, reason })
+      await deviceRepo()?.block?.({ deviceId, requestId, fingerprint, reason })
     } catch {
       /* the prompt block still stands */
     }
@@ -389,7 +449,7 @@ export function createHandleProtocol(deps) {
     }
   }
 
-  function rememberRefusal({ inbound, body, headers, result, logBag, requestId }) {
+  async function rememberRefusal({ inbound, body, headers, result, logBag, requestId }) {
     if (!refusalEnabled()) return
     const contentRefusal = isUpstreamRefusal(result, logBag)
     const timed = result?.policy?.rememberRefusal === true
@@ -399,7 +459,7 @@ export function createHandleProtocol(deps) {
     const fingerprint = refusalFingerprint(body, inbound)
     try {
       const ttl = Number(result?.policy?.refusalTtlMs) || 0
-      repo.remember({
+      await repo.remember({
         fingerprint,
         model: body?.model || inbound?.model || '',
         requestId,
@@ -412,7 +472,7 @@ export function createHandleProtocol(deps) {
       return
     }
     if (!contentRefusal || !refusalPolicy().device_block_enabled) return
-    banRefusalDevice(inboundRefusalDeviceId({ inbound, body, headers }), {
+    await banRefusalDevice(inboundRefusalDeviceId({ inbound, body, headers }), {
       requestId,
       fingerprint,
       reason: 'refusal_guard',
@@ -434,10 +494,15 @@ export function createHandleProtocol(deps) {
     requestContext = null,
     routing = {},
     noGoFallback = false,
+    accountObservation = null,
+    onExecutionStart = candidate.bindExecution,
+    onExecutionEnd = candidate.completeExecution,
   }) {
     const assembler = createClaudeMessageAssembler()
     const workerResult = await dispatchStreamInference({
       exec: candidate.exec,
+      onExecutionStart,
+      onExecutionEnd,
       body,
       reqHeaders,
       timeoutMs,
@@ -452,13 +517,14 @@ export function createHandleProtocol(deps) {
       requestContext,
       slotWaitMs: candidate.slotWaitMs,
       noGoFallback,
-      ensureCredential: (exec) => ensureWorkerCredential(exec),
+      ensureCredential: async (exec, opts) => await ensureWorkerCredential(exec, opts),
       onEvent: async (line) => {
         if (/response_headers/.test(String(line))) return
         applyClaudeSSELineToMessage(restoreToolNamesInSSELine(line, toolNames), assembler)
       },
     })
     Object.assign(workerResult, mergeAssembledAssistantHop(workerResult, assembler.message))
+    workerResult.accountObservation = accountObservation
     if (workerResult?.body) {
       workerResult.body = restoreToolNames(workerResult.body, toolNames)
     }
@@ -466,7 +532,70 @@ export function createHandleProtocol(deps) {
   }
 
   async function handleProtocol(req, res, protocol, pathName) {
+    const admission = { lease: null }
+    try {
+      return await handleProtocolRequest(req, res, protocol, pathName, admission)
+    } catch (error) {
+      if (admission.executionStarted && admission.lease?.shared && !admission.lease.settled) {
+        admission.lease.billingFailed = true
+      }
+      throw error
+    } finally {
+      if (!admission.lease?.billingFailed && !admission.lease?.executionUncertain) await admission.lease?.release?.()
+    }
+  }
+
+  async function observeExecution(req, admission, execution) {
+    await deps.onExecutionState?.(req, execution)
+    if (!execution?.requestId) return
+    admission.pendingExecutions ||= new Set()
+    if (execution.ended === true) admission.pendingExecutions.delete(execution.requestId)
+    else if (execution.started === true) {
+      admission.executionStarted = true
+      admission.pendingExecutions.add(execution.requestId)
+    }
+    if (admission.lease?.shared) admission.lease.executionUncertain = admission.pendingExecutions.size > 0
+  }
+
+  function executionHooks(req, admission, candidate = {}, billingSnapshot = null) {
+    if (!deps.onExecutionState && !admission.lease?.shared && !candidate.bindExecution) return {}
+    return {
+      onExecutionStart: async (execution) => {
+        await observeExecution(req, admission, { ...execution, started: true, ended: false })
+        return await candidate.bindExecution?.(billingSnapshot ? { ...execution, billingSnapshot } : execution)
+      },
+      onExecutionEnd: async (execution) => {
+        await candidate.completeExecution?.(execution)
+        await observeExecution(req, admission, execution)
+      },
+    }
+  }
+
+  async function reserveManagedKey(req, res) {
+    if (!req.apiKeyRecord) return { ok: true }
+    const gate = await apiKeyStore.reserve(req.apiKeyRecord)
+    if (!gate.ok) {
+      stats.errors++
+      json(
+        res,
+        gate.status,
+        makeError({
+          type: gate.status === 429 ? ErrorType.RATE_LIMIT : ErrorType.PERMISSION,
+          code: gate.code,
+          message: gate.message,
+          status: gate.status,
+          details: gate.detail || undefined,
+        }).body,
+      )
+    } else if (gate.record) {
+      req.apiKeyRecord = gate.record
+    }
+    return gate
+  }
+
+  async function handleProtocolRequest(req, res, protocol, pathName, admission) {
     const logCtx = requestLog.start(req, { protocol, pathName })
+    if (isKubernetesHaMode()) logCtx.request_id = currentHaRequestContext().requestId
     res._kinRequestId = logCtx.request_id
     // Registers its own 'finish' listener first so status/headers are final when finish() runs.
     requestLog.tapResponse?.(logCtx, res)
@@ -501,21 +630,27 @@ export function createHandleProtocol(deps) {
       reasoning_effort: null,
       outbound_session_id: null,
     }
-    res.on('finish', () => {
-      try {
-        const groupId = req.apiKeyRecord?.group_id ?? 1
-        requestLog.finish(logCtx, {
-          status: res.statusCode || 0,
-          api_key_kind: req.apiKeyKind || null,
-          api_key_id: req.apiKeyRecord?.id || null,
-          user_id: req.apiKeyRecord?.user_id ?? null,
-          group_id: groupId,
-          rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
-          ...logBag,
-        })
-      } catch {}
-    })
-    if (!requireAuth(req, res)) {
+    res.on('finish', () =>
+      trackPendingWrite(
+        (async () => {
+          try {
+            const groupId = req.apiKeyRecord?.group_id ?? 1
+            await requestLog.finish(logCtx, {
+              status: res.statusCode || 0,
+              api_key_kind: req.apiKeyKind || null,
+              api_key_id: req.apiKeyRecord?.id || null,
+              user_id: req.apiKeyRecord?.user_id ?? null,
+              group_id: groupId,
+              rate_multiplier: await deps.groupsRepo.rateMultiplier(groupId),
+              ...logBag,
+            })
+          } catch (error) {
+            throw error
+          }
+        })(),
+      ),
+    )
+    if (!(await requireAuth(req, res))) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
       logBag.error_message = req.authError?.message || 'Invalid credentials'
       logBag.api_key_presented = presentedApiKeyForLog(req.presentedApiKey)
@@ -549,6 +684,14 @@ export function createHandleProtocol(deps) {
     logBag.has_tools = Array.isArray(inbound?.tools) && inbound.tools.length > 0
     logBag.session_id = sessionIdForLog(extractCallerSession({ inbound, headers: req.headers }))
     logBag.reasoning_effort = reasoningEffortOf(inbound)
+
+    if (
+      isKubernetesHaMode() &&
+      (!['anthropic.messages', 'openai.chat', 'openai.completions', 'openai.responses'].includes(protocol) ||
+        resolveInferenceBackend(req) === 'api' ||
+        detectInboundPlatform(inbound?.model).platform === 'openai')
+    )
+      return rejectHaOperation(res)
 
     const fp = fingerprintRequest(req, inbound)
     // Before the health probe: its synthesized or fail-closed replies would otherwise answer
@@ -664,6 +807,9 @@ export function createHandleProtocol(deps) {
       logBag.upstream_model = modelRewrite.upstreamModel || null
     }
     const platform = detectInboundPlatform(ctx.body?.model)
+    // A model mapping must not redirect an otherwise supported Claude request
+    // into the unfenced Codex backend after the initial capability check.
+    if (isKubernetesHaMode() && platform.ok && platform.platform !== 'anthropic') return rejectHaOperation(res)
     if (!platform.ok) {
       stats.errors++
       const errorResult = makeError({
@@ -677,7 +823,7 @@ export function createHandleProtocol(deps) {
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, errorResult.status, errorResult.body)
     }
-    const keyScope = keyScopeFromRequest(req)
+    const keyScope = await keyScopeFromRequest(req)
     const poolDenial = vmPoolDenial(keyScope)
     if (poolDenial) {
       stats.errors++
@@ -732,6 +878,25 @@ export function createHandleProtocol(deps) {
       return
     }
     if (platform.platform === 'openai') {
+      const gate = await reserveManagedKey(req, res)
+      if (!gate.ok) return
+      admission.lease = gate
+      const runCodex = async (options) => {
+        const output = await handleCodexProtocol({
+          ...options,
+          onExecutionState:
+            deps.onExecutionState || gate.shared
+              ? (_req, execution) => observeExecution(req, admission, execution)
+              : undefined,
+        })
+        await attachPricing(logBag, {
+          managedKey: req.apiKeyRecord,
+          reservation: gate,
+          rateMultiplier: await deps.groupsRepo.rateMultiplier(req.apiKeyRecord?.group_id ?? 1),
+          bill: !!req.apiKeyRecord && logBag.final_state === 'verified',
+        })
+        return output
+      }
       const routing = getRouting() || {}
       const codexSticky = {
         requestStartedAt: logCtx.t0,
@@ -741,8 +906,8 @@ export function createHandleProtocol(deps) {
       }
       // Account scope needs the slot, so the Codex hop runs the same gate again
       // once a candidate is claimed. Without a scope the pre-hop verdict stands.
-      const accountGate = (account) =>
-        applyProtocolIntercept({
+      const accountGate = async (account) =>
+        await applyProtocolIntercept({
           req,
           inbound,
           body: ctx.body,
@@ -754,7 +919,7 @@ export function createHandleProtocol(deps) {
         })
       if (protocol === 'anthropic.messages') {
         const codex = normalizeCodexRouting(routing.codex)
-        return handleCodexProtocol({
+        return await runCodex({
           req,
           res,
           protocol,
@@ -782,7 +947,7 @@ export function createHandleProtocol(deps) {
           ...codexSticky,
         })
       }
-      return handleCodexProtocol({
+      return await runCodex({
         req,
         res,
         protocol,
@@ -924,11 +1089,16 @@ export function createHandleProtocol(deps) {
       ? null
       : resolveSeatIdentity({ inbound, body: ctx.body, headers: req.headers, clientIp: clientIp(req) }).key
     const sessionKeys = stickyRouter?.sessionPoolKeys
-      ? stickyRouter.sessionPoolKeys(req, inbound, {
-          sessionId: inboundIdentity.sessionId,
-          deviceId: stickyDeviceId,
-          migrate: !isProbe,
-        })
+      ? await (stickyRouter.shared ? stickyRouter.sessionPoolKeysShared : stickyRouter.sessionPoolKeys).call(
+          stickyRouter,
+          req,
+          inbound,
+          {
+            sessionId: inboundIdentity.sessionId,
+            deviceId: stickyDeviceId,
+            migrate: !isProbe,
+          },
+        )
       : {
           stickyKey: stickyRouter?.extractPoolKey?.(req, inbound, { platform: 'anthropic' }) || null,
           stickyKeys: stickyRouter?.collectPoolKeys?.(req, inbound, { platform: 'anthropic' }) || [],
@@ -943,7 +1113,12 @@ export function createHandleProtocol(deps) {
     const familyKey = !familySession
       ? null
       : stickyRouter?.familyPoolKey
-        ? stickyRouter.familyPoolKey(req, familySession, { trusted: familyTrusted })
+        ? await (stickyRouter.shared ? stickyRouter.familyPoolKeyShared : stickyRouter.familyPoolKey).call(
+            stickyRouter,
+            req,
+            familySession,
+            { trusted: familyTrusted },
+          )
         : stickyRouter?.familyKey?.(req, familySession, 'anthropic') || null
     const familyVmId = familyKey ? stickyRouter?.resolve?.(familyKey)?.vmId || null : null
     const stickyBound =
@@ -965,7 +1140,21 @@ export function createHandleProtocol(deps) {
     let preserveCacheBreakpoints = false
     const cacheBreakpoints = cacheBreakpointsFromRoutingFile(routingConfigPath)
     const openaiCompat = String(protocol || '').startsWith('openai.')
-    syncClaudeKernelConfigsFromFile(cfg.paths?.project, routingConfigPath)
+    try {
+      if (!isKubernetesHaMode())
+        await syncClaudeKernelConfigsFromFile(cfg.paths?.project, routingConfigPath)?.publication
+    } catch (error) {
+      if (
+        error?.publicationFinished === true &&
+        error?.executionUncertain !== true &&
+        error?.vmOperationUncertain !== true
+      )
+        throw error
+      admission.executionStarted = true
+      if (admission.lease?.shared) admission.lease.executionUncertain = true
+      await observeExecution(req, admission, { started: true, ended: false, reason: 'remote_publication_unknown' })
+      throw error
+    }
     const personaMode = personaModeFromRoutingFile(routingConfigPath)
     if (!requestContext && !officialClient && !officialTraffic) {
       ctx.body = ensureClaudeWebSearch(ctx.body, {
@@ -1022,24 +1211,10 @@ export function createHandleProtocol(deps) {
       })
     }
     if (inferenceBackend === 'api') {
+      const gate = await reserveManagedKey(req, res)
+      if (!gate.ok) return
+      admission.lease = gate
       const managedKey = req.apiKeyRecord || null
-      if (managedKey) {
-        const gate = apiKeyStore.acquire(managedKey)
-        if (!gate.ok) {
-          stats.errors++
-          return json(
-            res,
-            gate.status,
-            makeError({
-              type: gate.status === 429 ? ErrorType.RATE_LIMIT : ErrorType.PERMISSION,
-              code: gate.code,
-              message: gate.message,
-              status: gate.status,
-              details: gate.detail || undefined,
-            }).body,
-          )
-        }
-      }
       const clientAbort = bindClientAbort(req, res)
       const clientStream = isClientStream(inbound, req.headers)
       const requestedDelivery = String(
@@ -1052,6 +1227,7 @@ export function createHandleProtocol(deps) {
       let result
       try {
         result = await runApiInference({
+          ...executionHooks(req, admission),
           req,
           res,
           cfg,
@@ -1082,11 +1258,6 @@ export function createHandleProtocol(deps) {
         })
       } finally {
         clientAbort.settle()
-        if (managedKey) {
-          try {
-            apiKeyStore.release(managedKey)
-          } catch {}
-        }
       }
       // The api backend forwards the converted body untouched: its session is the outbound one.
       logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(ctx.body) || logBag.session_id)
@@ -1100,9 +1271,10 @@ export function createHandleProtocol(deps) {
         ? Math.max(0, result.firstTokenAt - logCtx.t0)
         : (result?.ttftMs ?? null)
       logBag.final_state = result?.terminalState || null
-      attachPricing(logBag, {
+      await attachPricing(logBag, {
         managedKey,
-        rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
+        reservation: admission.lease,
+        rateMultiplier: await deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
         bill: !!(result?.ok && managedKey),
       })
       if (clientStream) {
@@ -1139,24 +1311,10 @@ export function createHandleProtocol(deps) {
     // anything still waiting past this writes SSE so Cloudflare does not 524.
     const queueKeepaliveDelay = queueKeepaliveDelayMs(getRouting(), cfg.limits?.queue_keepalive_delay_ms)
     const streamIdleTimeoutMs = resolveStreamIdleTimeoutMs(getRouting(), cfg)
+    const gate = await reserveManagedKey(req, res)
+    if (!gate.ok) return
+    admission.lease = gate
     const managedKey = req.apiKeyRecord || null
-    if (managedKey) {
-      const gate = apiKeyStore.acquire(managedKey)
-      if (!gate.ok) {
-        stats.errors++
-        return json(
-          res,
-          gate.status,
-          makeError({
-            type: gate.status === 429 ? ErrorType.RATE_LIMIT : ErrorType.PERMISSION,
-            code: gate.code,
-            message: gate.message,
-            status: gate.status,
-            details: gate.detail || undefined,
-          }).body,
-        )
-      }
-    }
 
     const clientAbort = bindClientAbort(req, res)
 
@@ -1194,7 +1352,7 @@ export function createHandleProtocol(deps) {
     const pinVmRaw = String(req.headers['x-kin-vm'] || '').trim()
     const pinVmId = req.apiKeyKind === 'master' && isValidVmId(pinVmRaw) ? pinVmRaw : null
     // Pin is panel test-chat / diagnostics (manage). Unpinned /v1 is dispatch.
-    const ownerScope = pinVmId ? { type: 'any' } : ownerScopeFromRequest(req, apiKeyStore?.users)
+    const ownerScope = pinVmId ? { type: 'any' } : await ownerScopeFromRequest(req, apiKeyStore?.users)
     // Cache bypass is a client hint; only authenticated master-key probes may skip accounting.
     const healthReal = req.apiKeyKind === 'master' && isHealthRealBypass(req.headers)
     // Cache lives per account; a failover to another account starts cold by design.
@@ -1210,6 +1368,7 @@ export function createHandleProtocol(deps) {
     }
     let result
     try {
+      admission.executionStarted = true
       result = await getFailoverRunner().run({
         requestId: logCtx.request_id,
         canonicalBody,
@@ -1236,7 +1395,7 @@ export function createHandleProtocol(deps) {
         applyAttempt: async (body, selected, extra = {}) => {
           // Only this account's own thinking replays as thinking. Another
           // account's signature, or one with no record, goes out as text.
-          const owned = filterThinkingForAccount(body, selected.accountId, thinkingOwnerStore)
+          const owned = await filterThinkingForAccount(body, selected.accountId, thinkingOwnerStore)
           body = owned.body
           if (owned.kept || owned.converted || owned.dropped) {
             const { kept, converted, dropped, unknown } = owned
@@ -1263,8 +1422,26 @@ export function createHandleProtocol(deps) {
             }
           }
           try {
-            touchTelemetrySession(cfg.paths.project, selected.vmId, selected.exec?.vm)
-          } catch {}
+            if (!isKubernetesHaMode())
+              await touchTelemetrySession(cfg.paths.project, selected.vmId, selected.exec?.vm)?.publication
+          } catch (error) {
+            if (
+              error?.publicationFinished === true &&
+              error?.executionUncertain !== true &&
+              error?.vmOperationUncertain !== true
+            )
+              throw error
+            error.executionUncertain = true
+            admission.executionStarted = true
+            if (admission.lease?.shared) admission.lease.executionUncertain = true
+            await selected.markUncertain?.()
+            await observeExecution(req, admission, {
+              started: true,
+              ended: false,
+              reason: 'remote_publication_unknown',
+            })
+            throw error
+          }
           const identity = loadVmIdentity(selected.exec)
           const attemptStartedAt = extra.attemptStartedAt ?? Date.now()
           // The runner snapshots after this session's queue turn, before VM prebinding.
@@ -1383,7 +1560,16 @@ export function createHandleProtocol(deps) {
             })
             noteCachePrefix(selected, attemptSessionId, hopBody)
             logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(hopBody) || attemptSessionId)
-            return { body: hopBody, meta: { toolNames: {}, sessionId: attemptSessionId, cliHop: true, requestContext } }
+            return {
+              body: hopBody,
+              meta: {
+                toolNames: {},
+                sessionId: attemptSessionId,
+                cliHop: true,
+                requestContext,
+                accountObservation: await accountQuota?.beginObservation?.(),
+              },
+            }
           }
 
           cacheTtl = requestedCacheTtl
@@ -1459,11 +1645,29 @@ export function createHandleProtocol(deps) {
           })
           noteCachePrefix(selected, attemptSessionId, prepared.body)
           logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(prepared.body) || attemptSessionId)
-          return { body: prepared.body, meta: { toolNames: prepared.toolNames, sessionId: attemptSessionId } }
+          return {
+            body: prepared.body,
+            meta: {
+              toolNames: prepared.toolNames,
+              sessionId: attemptSessionId,
+              accountObservation: await accountQuota?.beginObservation?.(),
+            },
+          }
         },
         callAttempt: async ({ candidate, body, attemptMeta, deliveryMode: attemptDelivery, signal, onCommit }) => {
+          const billingSnapshot =
+            isKubernetesHaMode() && managedKey
+              ? captureHaBillingSnapshot({
+                  model: body.model,
+                  rateMultiplier: await deps.groupsRepo.rateMultiplier(managedKey.group_id ?? 1),
+                  cacheTtl,
+                  requestedSpeed: wantsFastMode(ctx.body) ? 'fast' : null,
+                })
+              : null
+          const hooks = executionHooks(req, admission, candidate, billingSnapshot)
           if (!clientStream) {
-            return streamAndAssembleClaudeMessage({
+            return await streamAndAssembleClaudeMessage({
+              ...hooks,
               candidate,
               body,
               reqHeaders: req.headers,
@@ -1479,6 +1683,7 @@ export function createHandleProtocol(deps) {
               want1m,
               routing: getRouting(),
               noGoFallback: !!pinVmId,
+              accountObservation: attemptMeta?.accountObservation,
             })
           }
           let state
@@ -1507,8 +1712,9 @@ export function createHandleProtocol(deps) {
           if (anthropicKeepalive) activeAttemptCommit = onCommit
           keepalive.arm()
           try {
-            return await dispatchStreamInference({
+            const workerResult = await dispatchStreamInference({
               exec: candidate.exec,
+              ...hooks,
               cacheTtl,
               preserveCacheBreakpoints,
               cliHop: attemptMeta?.cliHop === true,
@@ -1524,7 +1730,7 @@ export function createHandleProtocol(deps) {
               routing: getRouting(),
               slotWaitMs: candidate.slotWaitMs,
               noGoFallback: !!pinVmId,
-              ensureCredential: (exec) => ensureWorkerCredential(exec),
+              ensureCredential: async (exec, opts) => await ensureWorkerCredential(exec, opts),
               onCommit: () => {
                 if (protocol === 'anthropic.messages' && !res.headersSent) writeSSEHeaders(res)
                 onCommit()
@@ -1559,6 +1765,7 @@ export function createHandleProtocol(deps) {
                 writeChunks(claudeSSELineToResponsesEvents(line, state))
               },
             })
+            return { ...workerResult, accountObservation: attemptMeta?.accountObservation }
           } finally {
             if (anthropicKeepalive) {
               activeAttemptCommit = null
@@ -1567,14 +1774,10 @@ export function createHandleProtocol(deps) {
           }
         },
       })
+      if (result?.executionUncertain && admission.lease?.shared) admission.lease.executionUncertain = true
     } finally {
       anthropicKeepalive?.stop()
       clientAbort.settle()
-      if (managedKey) {
-        try {
-          apiKeyStore.release(managedKey)
-        } catch {}
-      }
     }
 
     if (result?.responseSent) return
@@ -1588,7 +1791,7 @@ export function createHandleProtocol(deps) {
     logBag.final_account_id = result?.accountId || null
     if (result?.threadBetas) logBag.hop_meta = { ...logBag.hop_meta, thread_betas: result.threadBetas }
     if (result?.accountId && (result.ok || result.committed))
-      recordThinkingOwners(result.body, result.accountId, thinkingOwnerStore)
+      await recordThinkingOwners(result.body, result.accountId, thinkingOwnerStore)
     // Zero executions is a real 0, not unknown; the VM is the last one that ran.
     logBag.attempt_count = result?.attemptCount ?? 0
     logBag.final_state = result?.finalState || result?.terminalState || null
@@ -1608,7 +1811,14 @@ export function createHandleProtocol(deps) {
       logBag.error_code = logBag.error_code || 'content_filter_refusal'
       logBag.error_message = logBag.error_message || 'upstream stop_reason=refusal'
     }
-    rememberRefusal({ inbound, body: ctx.body, headers: req.headers, result, logBag, requestId: logCtx.request_id })
+    await rememberRefusal({
+      inbound,
+      body: ctx.body,
+      headers: req.headers,
+      result,
+      logBag,
+      requestId: logCtx.request_id,
+    })
 
     if (result?.accountId) {
       try {
@@ -1626,25 +1836,29 @@ export function createHandleProtocol(deps) {
           exhausted,
           status: result.status,
           countRequest: !healthReal,
+          observation: result?.accountObservation,
         })
         const pool = typeof deps.getPoolScheduler === 'function' ? deps.getPoolScheduler() : deps.poolScheduler
         // Live `5h-status` on every response; `allowed` is the only early unblock.
         if (!exhausted) {
-          pool?.rateLimitService?.updateSessionWindow?.({
+          await pool?.rateLimitService?.updateSessionWindow?.({
             accountId: result.accountId,
             vmId: result.vmId || null,
             headers: result.headers || {},
+            observation: result?.accountObservation,
           })
         }
         if (pool?.syncQuotaSchedule && result.vmId && cfg?.paths?.project) {
           const vm = getVm(cfg.paths.project, result.vmId)
-          if (vm) pool.syncQuotaSchedule(vm)
+          if (vm) await pool.syncQuotaSchedule(vm)
         }
       } catch {}
-      attachPricing(logBag, {
+      await attachPricing(logBag, {
         managedKey,
-        rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
+        reservation: admission.lease,
+        rateMultiplier: isKubernetesHaMode() ? 1 : await deps.groupsRepo.rateMultiplier(managedKey?.group_id ?? 1),
         bill: !!managedKey,
+        execution: result?.execution,
       })
     }
 
@@ -1676,7 +1890,14 @@ export function createHandleProtocol(deps) {
           res.write(buildAnthropicSseError(mapped.body?.error || {}))
         }
       }
-      rememberRefusal({ inbound, body: ctx.body, headers: req.headers, result, logBag, requestId: logCtx.request_id })
+      await rememberRefusal({
+        inbound,
+        body: ctx.body,
+        headers: req.headers,
+        result,
+        logBag,
+        requestId: logCtx.request_id,
+      })
       return res.end()
     }
 
@@ -1713,6 +1934,10 @@ export function createHandleProtocol(deps) {
 
   /** POST /v1/alpha/search (Codex web search): same logging, auth and body handling as handleProtocol. */
   async function handleSearch(req, res, pathName) {
+    if (isKubernetesHaMode()) {
+      if (!(await requireAuth(req, res))) return
+      return rejectHaOperation(res)
+    }
     const protocol = 'openai.search'
     const logCtx = requestLog.start(req, { protocol, pathName })
     res._kinRequestId = logCtx.request_id
@@ -1732,21 +1957,27 @@ export function createHandleProtocol(deps) {
       attempt_count: null,
       final_state: null,
     }
-    res.on('finish', () => {
-      try {
-        const groupId = req.apiKeyRecord?.group_id ?? 1
-        requestLog.finish(logCtx, {
-          status: res.statusCode || 0,
-          api_key_kind: req.apiKeyKind || null,
-          api_key_id: req.apiKeyRecord?.id || null,
-          user_id: req.apiKeyRecord?.user_id ?? null,
-          group_id: groupId,
-          rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
-          ...logBag,
-        })
-      } catch {}
-    })
-    if (!requireAuth(req, res)) {
+    res.on('finish', () =>
+      trackPendingWrite(
+        (async () => {
+          try {
+            const groupId = req.apiKeyRecord?.group_id ?? 1
+            await requestLog.finish(logCtx, {
+              status: res.statusCode || 0,
+              api_key_kind: req.apiKeyKind || null,
+              api_key_id: req.apiKeyRecord?.id || null,
+              user_id: req.apiKeyRecord?.user_id ?? null,
+              group_id: groupId,
+              rate_multiplier: await deps.groupsRepo.rateMultiplier(groupId),
+              ...logBag,
+            })
+          } catch (error) {
+            throw error
+          }
+        })(),
+      ),
+    )
+    if (!(await requireAuth(req, res))) {
       logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
       logBag.error_message = req.authError?.message || 'Invalid credentials'
       logBag.api_key_presented = presentedApiKeyForLog(req.presentedApiKey)
@@ -1773,17 +2004,38 @@ export function createHandleProtocol(deps) {
     }
     logBag.model = typeof body?.model === 'string' ? body.model : null
     logBag.inbound_summary = summarizeBody(body)
-    return handleCodexSearch({
-      req,
-      res,
-      body,
-      logBag,
-      stats,
-      json,
-      routing: getRouting() || {},
-      projectRoot: cfg.paths.project,
-      stickyRouter,
-    })
+    const gate = await reserveManagedKey(req, res)
+    if (!gate.ok) return
+    const admission = { lease: gate }
+    try {
+      const output = await handleCodexSearch({
+        req,
+        res,
+        body,
+        logBag,
+        stats,
+        json,
+        routing: getRouting() || {},
+        projectRoot: cfg.paths.project,
+        stickyRouter,
+        onExecutionState:
+          deps.onExecutionState || gate.shared
+            ? (_req, execution) => observeExecution(req, admission, execution)
+            : undefined,
+      })
+      await attachPricing(logBag, {
+        managedKey: req.apiKeyRecord,
+        reservation: gate,
+        rateMultiplier: await deps.groupsRepo.rateMultiplier(req.apiKeyRecord?.group_id ?? 1),
+        bill: !!req.apiKeyRecord && logBag.final_state === 'verified',
+      })
+      return output
+    } catch (error) {
+      if (gate.shared && !gate.settled) gate.billingFailed = true
+      throw error
+    } finally {
+      if (!gate.billingFailed && !gate.executionUncertain) await gate.release?.()
+    }
   }
 
   return {

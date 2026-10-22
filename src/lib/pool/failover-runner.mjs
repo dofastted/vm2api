@@ -21,6 +21,11 @@ import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
 import { resolveOfficialCcInference } from '../vm/slot-engine.mjs'
 import { AttemptCoordinator } from './unit-decision.mjs'
 import { SOFT_COOLDOWN_REASONS } from './pool-scheduler.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
+import { SharedSessionTurns } from './shared-session-turns.mjs'
+import { getDb } from '../db/database.mjs'
+import { withRefreshAdmission } from '../oauth/shared-credential-refresh.mjs'
+import { withHaRequestAttempt } from '../core/ha-request-context.mjs'
 
 // Seat wait for the one-shot repair hop when the rejected hop already spent the deadline.
 const REPAIR_HOP_WAIT_MS = 30_000
@@ -235,11 +240,11 @@ function classifyAttempt(
   })
 }
 
-function notifyProxyFailure(onProxyFailure, selected, policy) {
+async function notifyProxyFailure(onProxyFailure, selected, policy) {
   if (policy?.reason !== 'proxy_transport_failure') return
   if (typeof onProxyFailure !== 'function') return
   try {
-    onProxyFailure(selected?.vmId, policy.reason)
+    await onProxyFailure(selected?.vmId, policy.reason)
   } catch {
     /* control-plane disconnect is best-effort */
   }
@@ -411,31 +416,34 @@ function selectionFailure(selected, { excluded, lastPolicy, lastResult, hops }) 
   return failed
 }
 
-function applyCooldown(scheduler, selected, policy, model, { diagnosticPin = false } = {}) {
+async function applyCooldown(scheduler, selected, policy, model, { diagnosticPin = false, observation } = {}) {
   if (policy?.action !== 'continue-and-cooldown' && policy?.action !== 'disable' && policy?.action !== 'pause') return
   // VM / master pin is a diagnostic. A 401 from the wrong inbound class
   // must not forever-park a Setup Token that has no refresh by design.
   if (diagnosticPin && (policy.reason === 'oauth_no_refresh' || policy.reason === 'oauth_revoked')) {
     return
   }
-  scheduler.markCooldown(selected, {
+  const applied = await scheduler.markCooldown(selected, {
     until:
       policy.action === 'disable' || policy.reason === 'oauth_no_refresh' || policy.reason === 'oauth_revoked'
         ? Number.MAX_SAFE_INTEGER
         : policy.cooldownUntil,
     reason: policy.reason,
+    observation,
     model: policy.scope === 'model' ? policy.model || model : null,
     status:
       policy.action === 'disable' || policy.reason === 'oauth_no_refresh' || policy.reason === 'oauth_revoked'
         ? 'disabled'
         : 'cooldown',
   })
+  if (applied === false) return false
   // A 5xx pause, an RPM cooldown, or an unproven bare 429 keeps the
   // conversation pin: other seats absorb this turn. Quota and auth move
   // every conversation off the unit, windows included (#163).
   if (policy.scope === 'account' && policy.action !== 'pause' && !SOFT_COOLDOWN_REASONS.has(policy.reason)) {
-    scheduler.releaseAccountSessions?.({ accountId: selected?.accountId, vmId: selected?.vmId })
+    await scheduler.releaseAccountSessions?.({ accountId: selected?.accountId, vmId: selected?.vmId })
   }
+  return true
 }
 
 export class FailoverRunner {
@@ -444,6 +452,7 @@ export class FailoverRunner {
     stickyRouter = null,
     attemptsRepo = null,
     rateLimitService = null,
+    sessionTurns = null,
     config = {},
     onProxyFailure = null,
     onCredentialFailure = null,
@@ -460,6 +469,8 @@ export class FailoverRunner {
     this.onFablePlanDenied = onFablePlanDenied
     this.onFableSuccess = onFableSuccess
     this.sessionTails = new Map()
+    this.sessionTurns = sessionTurns
+    this.sharedSessions = isKubernetesMode()
     this.searchRepairs = new Map()
   }
 
@@ -468,6 +479,9 @@ export class FailoverRunner {
   }
 
   noteUnitHealth(selected, policy, result) {
+    if (this.scheduler?.shared) {
+      return selected.noteCircuitResult?.(policy?.circuit ? 'failure' : verifiedSuccess(result) ? 'success' : 'neutral')
+    }
     const circuit = this.scheduler?.unitCircuit
     if (!circuit || !selected?.accountId) return
     if (policy?.circuit) circuit.recordFailure(selected.accountId)
@@ -480,32 +494,78 @@ export class FailoverRunner {
    * Client cancellation only ends its job; kernel cancel_ack fences slot reuse.
    * Planner seat indexes are not kernel native slots.
    */
-  retireOutboundSession(selected, bindKeys) {
+  async retireOutboundSession(selected, bindKeys, versions = null) {
     if (!selected?.vmId) return
     for (const key of bindKeys || []) {
       const bound = this.stickyRouter?.resolve?.(key)
       if (bound?.accountId !== selected.accountId) continue
-      this.stickyRouter?.bind?.(
+      const changed = await (this.stickyRouter.shared ? this.stickyRouter.bindShared : this.stickyRouter.bind)?.call(
+        this.stickyRouter,
         key,
         { accountId: selected.accountId, vmId: selected.vmId },
-        { countHit: false, replaceSession: true, clearSlot: true },
+        {
+          countHit: false,
+          replaceSession: true,
+          clearSlot: true,
+          ...(this.stickyRouter.shared ? { ifGeneration: versions?.get(key) ?? this.stickyRouter.versionOf(key) } : {}),
+        },
       )
+      if (this.stickyRouter.shared && changed.applied) versions?.set(key, changed.generation)
     }
   }
 
-  async recoverCredential(selected, policy) {
+  async recoverCredential(selected, policy, { executionEnded = false } = {}) {
     if (policy?.reason !== 'oauth_refresh_required') return policy
     const exec = selected?.exec
-    if (!exec?.homeDir) return permanentOAuthRevoke(policy)
-    const before = readWorkerCredentialFile(exec.homeDir)
+    const nodeOwned = exec?.slotgate != null
+    if (!nodeOwned && !exec?.homeDir) return permanentOAuthRevoke(policy)
+    const before = nodeOwned ? null : readWorkerCredentialFile(exec.homeDir)
     const beforeRefresh = String(before?.refresh_token || '')
     let refreshed
     try {
-      refreshed = await ensureWorkerCredential(exec, { force: true })
+      refreshed = await this.withCredentialAdmission(selected, () => ensureWorkerCredential(exec, { force: true }))
     } catch (error) {
+      if (selected.bindExecution && executionEnded === true && error.credentialRefreshNotStarted === true)
+        return {
+          ...policy,
+          retrySameAccount: false,
+          action: 'stop',
+          cooldownUntil: null,
+          reason: 'oauth_refresh_not_started',
+          credentialRefreshNotStarted: true,
+        }
+      if (selected.bindExecution) {
+        await selected.markUncertain()
+        error.executionUncertain = true
+        throw error
+      }
       refreshed = { ok: false, error: { message: String(error?.message || error) } }
     }
-    const after = readWorkerCredentialFile(exec.homeDir)
+    if (
+      nodeOwned &&
+      selected.bindExecution &&
+      executionEnded === true &&
+      refreshed?.credentialRefreshNotStarted === true
+    )
+      return {
+        ...policy,
+        retrySameAccount: false,
+        action: 'stop',
+        cooldownUntil: null,
+        reason: 'oauth_refresh_not_started',
+        credentialRefreshNotStarted: true,
+      }
+    if (
+      selected.bindExecution &&
+      (refreshed?.credentialRefreshUnknown || (nodeOwned && refreshed?.attemptFinished !== true))
+    ) {
+      await selected.markUncertain()
+      throw Object.assign(new Error('credential refresh termination is unknown'), {
+        code: 'credential_refresh_unknown',
+        executionUncertain: true,
+      })
+    }
+    const after = nodeOwned ? null : readWorkerCredentialFile(exec.homeDir)
     const afterRefresh = String(after?.refresh_token || '')
     const blob = `${refreshed?.error?.code || ''} ${refreshed?.error?.message || ''} ${refreshed?.refresh_class || ''}`
     const grantDead = /invalid_grant|token has been revoked|oauth_revoked/i.test(blob)
@@ -522,22 +582,29 @@ export class FailoverRunner {
     }
   }
 
-  forgetCredential(selected, policy, { familyKey = null, sessionKeys = [] } = {}) {
+  withCredentialAdmission(selected, callback) {
+    if (!selected?.admissionId) return withRefreshAdmission(null, null, callback)
+    const db = this.scheduler?.executionAdmissions?.db || this.scheduler?.accountQuota?.db || getDb()
+    return withRefreshAdmission(db, selected, callback)
+  }
+
+  async forgetCredential(selected, policy, { familyKey = null, sessionKeys = [], versions = null } = {}) {
     if (familyKey) {
-      this.scheduler.releaseSticky?.(selected, null, sessionKeys)
+      await this.scheduler.releaseSticky?.(selected, null, sessionKeys, versions)
     } else {
-      this.scheduler.releaseAccountSessions?.({ accountId: selected?.accountId, vmId: selected?.vmId })
+      await this.scheduler.releaseAccountSessions?.({ accountId: selected?.accountId, vmId: selected?.vmId })
     }
     if (typeof this.onCredentialFailure === 'function') {
       try {
-        this.onCredentialFailure({ selected, policy })
+        await this.onCredentialFailure({ selected, policy })
       } catch {}
     }
   }
 
   async run(args = {}) {
     const sessionKey = String(args.stickyKey || '')
-    if (!sessionKey) return this.runOnce(args)
+    if (!sessionKey) return await this.runOnce(args)
+    if (this.sharedSessions || this.sessionTurns) return this.runSharedSession(sessionKey, args)
     const previous = this.sessionTails.get(sessionKey) || Promise.resolve()
     let releaseTurn
     const turn = new Promise((resolve) => {
@@ -570,6 +637,42 @@ export class FailoverRunner {
     }
   }
 
+  async runSharedSession(sessionKey, args) {
+    this.sessionTurns ||= new SharedSessionTurns(
+      this.scheduler?.executionAdmissions?.db || this.scheduler?.accountQuota?.db,
+    )
+    let turn
+    try {
+      turn = await this.sessionTurns.acquire(sessionKey, {
+        requestId: args.requestId,
+        signal: args.signal,
+        timeoutMs: this.config.session_queue_timeout_ms,
+      })
+    } catch (error) {
+      if (error?.code === 'request_cancelled') return clientCancelledResult()
+      if (error?.code === 'session_queue_timeout') {
+        const retryMs = Number(this.config.session_queue_timeout_ms)
+        return poolOverloadedError({
+          reason: 'session_queue_timeout',
+          retry_after_ms: Number.isFinite(retryMs) && retryMs > 0 ? retryMs : 1000,
+        })
+      }
+      throw error
+    }
+    try {
+      const result = await this.runOnce(args)
+      // runOnce awaits selected.release in its finally before resolving.
+      if (result?.executionUncertain) await turn.markUncertain()
+      else await turn.release()
+      return result
+    } catch (error) {
+      // A thrown attempt or release can leave an execution active. Connection
+      // loss and HTTP cancellation do not provide proof that it ended.
+      await turn.markUncertain()
+      throw error
+    }
+  }
+
   async runOnce({
     requestId,
     canonicalBody,
@@ -596,6 +699,7 @@ export class FailoverRunner {
   } = {}) {
     if (!this.scheduler) throw new Error('FailoverRunner requires a scheduler')
     if (typeof callAttempt !== 'function') throw new Error('FailoverRunner requires callAttempt')
+    if (this.stickyRouter?.shared) await this.stickyRouter.refresh()
     const startedAt = Date.now()
     const budget = new AttemptCoordinator({
       maxSameUnitRetries: Number(this.config.max_same_account_retries ?? 1),
@@ -609,15 +713,21 @@ export class FailoverRunner {
     // Accounts left only because the kernel had no free slot; their pins stay.
     const spilled = budget.spilled
     const bindKeys = uniqueStickyKeys(stickyKey, stickyKeys)
-    const pinKeys = familyKey ? [...bindKeys, familyKey] : bindKeys
+    const pinKeys = [...bindKeys, familyKey, deviceKey].filter(Boolean)
     // Pins as this request last saw them. A pin moved by someone else since
     // (quota migration, credential death) is never written back by a late hop.
     const pinBaseline = new Map()
+    const pinVersions = new Map()
     const snapshotPins = () => {
-      for (const key of pinKeys) pinBaseline.set(key, this.stickyRouter?.resolve?.(key) || null)
+      for (const key of pinKeys) {
+        if (this.stickyRouter?.shared && pinVersions.has(key)) continue
+        pinBaseline.set(key, this.stickyRouter?.resolve?.(key) || null)
+        pinVersions.set(key, this.stickyRouter?.versionOf?.(key) || 0)
+      }
     }
     const pinMoved = (key) => {
       const base = pinBaseline.get(key)
+      if (this.stickyRouter?.shared) return this.stickyRouter.versionOf(key) !== pinVersions.get(key)
       if (!base) return false
       const now = this.stickyRouter?.resolve?.(key)
       return !now || now.accountId !== base.accountId || (now.generation || 0) !== (base.generation || 0)
@@ -635,8 +745,9 @@ export class FailoverRunner {
       vmId: lastSelected?.vmId,
       attemptCount: budget.hops,
     })
-    const bindAll = (account, opts) => {
-      if (!this.stickyRouter || !account) return
+    const bindAll = async (account, opts, { required = false } = {}) => {
+      if (!this.stickyRouter || !account) return true
+      let accepted = true
       const sessionId = account.sessionId || (account.accountId === outboundSessionAccountId ? outboundSessionId : '')
       const payload = { accountId: account.accountId, vmId: account.vmId }
       const slotIndex = account.slotIndex != null ? account.slotIndex : pinnedSlot
@@ -645,21 +756,49 @@ export class FailoverRunner {
       if (stickyDeviceId) payload.deviceId = stickyDeviceId
       if (this.stickyRouter.bind) {
         for (const key of bindKeys) {
-          if (pinMoved(key)) continue
+          if (pinMoved(key)) {
+            accepted = false
+            continue
+          }
           const prev = this.stickyRouter.resolve?.(key)
           // A live pin on another account means this request only borrowed
           // capacity. Rewriting it would move the whole session off its home.
           if (prev?.accountId && prev.accountId !== account.accountId) continue
           let guard = opts
-          if (prev) guard = { ...opts, ifGeneration: prev.generation || 0 }
+          if (this.stickyRouter.shared) guard = { ...opts, ifGeneration: pinVersions.get(key) }
+          else if (prev) guard = { ...opts, ifGeneration: prev.generation || 0 }
           if (freshSlot || opts?.replaceSession) guard = { ...guard, replaceSession: true }
-          this.stickyRouter.bind(key, payload, guard)
+          const bound = await (this.stickyRouter.shared ? this.stickyRouter.bindShared : this.stickyRouter.bind).call(
+            this.stickyRouter,
+            key,
+            payload,
+            guard,
+          )
+          if (
+            this.stickyRouter.shared &&
+            (!bound.applied || (required && sessionId && bound.nativeSessionId !== sessionId))
+          ) {
+            accepted = false
+            continue
+          }
           pinBaseline.set(key, this.stickyRouter.resolve?.(key) || null)
+          pinVersions.set(key, this.stickyRouter.versionOf?.(key) || 0)
         }
       }
       if (familyKey && account.vmId && !pinMoved(familyKey)) {
-        this.stickyRouter.bind?.(familyKey, { accountId: account.accountId, vmId: account.vmId }, { countHit: false })
-        pinBaseline.set(familyKey, this.stickyRouter.resolve?.(familyKey) || null)
+        const result = await (this.stickyRouter.shared
+          ? this.stickyRouter.rebindFamilyShared
+          : this.stickyRouter.bind
+        )?.call(
+          this.stickyRouter,
+          familyKey,
+          { accountId: account.accountId, vmId: account.vmId },
+          { countHit: false, ifGeneration: pinVersions.get(familyKey) },
+        )
+        if (!this.stickyRouter.shared || result.applied) {
+          pinBaseline.set(familyKey, this.stickyRouter.resolve?.(familyKey) || null)
+          pinVersions.set(familyKey, this.stickyRouter.versionOf?.(familyKey) || 0)
+        } else accepted = false
       }
       if (
         deviceKey &&
@@ -668,12 +807,22 @@ export class FailoverRunner {
       ) {
         const devicePayload = { accountId: account.accountId, vmId: account.vmId }
         if (this.stickyRouter.bindDeviceAffinity) {
-          this.stickyRouter.bindDeviceAffinity(deviceKey, devicePayload, { countHit: false })
+          if (!this.stickyRouter.shared)
+            this.stickyRouter.bindDeviceAffinity(deviceKey, devicePayload, { countHit: false })
+          else if (!pinMoved(deviceKey)) {
+            const bound = await this.stickyRouter.bindDeviceAffinityShared(deviceKey, devicePayload, {
+              countHit: false,
+              ifGeneration: pinVersions.get(deviceKey),
+            })
+            if (bound.applied) pinVersions.set(deviceKey, bound.generation)
+          }
         } else {
           this.stickyRouter.bind?.(deviceKey, devicePayload, { countHit: false })
         }
       }
+      return accepted
     }
+    const stickyConflict = () => poolError('sticky_binding_conflict', 'Conversation binding changed before execution')
     let lastResult = null
     let lastPolicy = null
     let repaired = false
@@ -757,344 +906,426 @@ export class FailoverRunner {
         }
         throw error
       }
-      if (selected?.familyGated && familyKey && familyVmId) {
-        // The family home left the pool (quota, credential): the family moves
-        // with the next bind. An exclusion this request made itself is not proof.
-        const home = this.stickyRouter?.resolve?.(familyKey)
-        const ownExclusion =
-          !!home && (budget.tried.has(home.accountId) || budget.tried.has(home.vmId) || spilled.has(home.accountId))
-        if (!ownExclusion) this.stickyRouter?.unbind?.(familyKey)
-        familyVmId = null
-      }
-      if (!selected?.ok && selected?.reason === 'fable_requires_max') {
-        return {
-          ...fableRequiresMaxError({
-            wait_ms: selected?.waitMs ?? selected?.wait_ms ?? 0,
-            eligible: selected?.eligible ?? 0,
-            available: selected?.available ?? 0,
-            attempt_count: budget.hops,
-          }),
-          ...attribution(),
-        }
-      }
-      if (!selected?.ok) {
-        const exhausted = selectionFailure(selected, { excluded, lastPolicy, lastResult, hops: budget.hops })
-        return preferLastResult(lastResult, lastPolicy, exhausted, attribution())
-      }
-      repairPending = false
-      snapshotPins()
-      const attemptStickyBound = pinBaseline.get(stickyKey) || null
-      lastSelected = selected
-      pinnedSlot = selected.slotIndex ?? null
-      if (selected.seatMoved) seatMovedTo = selected.vmId
-      bindAll({ accountId: selected.accountId, vmId: selected.vmId, slotIndex: pinnedSlot }, { countHit: false })
-      const attemptStarted = Date.now()
-      this.attemptsRepo?.begin?.({
-        requestId,
-        attemptNo,
-        vmId: selected.vmId,
-        accountId: selected.accountId,
-        model,
-        selectionReason: selected.selectionReason,
-        waitMs: selected.waitMs,
-      })
-      let result
-      let policy
-      let committed = false
-      let hopNoted = false
-      const noteHop = (value) => {
-        if (hopNoted) return
-        hopNoted = true
-        const executions = executionsOf(value)
-        if (executions > 0) budget.noteHop(selected.accountId, selected.vmId, executions)
-      }
       try {
-        const repairKey = searchRepairKey(stickyKey, model, selected)
-        const hint = this.searchRepairs.get(repairKey)
-        if (hint && hint.expiresAt <= Date.now()) this.searchRepairs.delete(repairKey)
-        const knownSearchRepair = hint && hint.expiresAt > Date.now() && hint.fingerprint === fingerprint()
-        const attemptBody = knownSearchRepair ? flattenSearchResultHistory(requestBody) : requestBody
-        const prepared =
-          typeof applyAttempt === 'function'
-            ? await applyAttempt(clone(attemptBody), selected, {
-                attemptNo,
-                repaired,
-                attemptStartedAt: attemptStarted,
-                freshSlot,
-                stickyBound: attemptStickyBound,
-              })
-            : clone(attemptBody)
-        const wrappedAttempt =
-          prepared &&
-          typeof prepared === 'object' &&
-          Object.prototype.hasOwnProperty.call(prepared, 'body') &&
-          Object.prototype.hasOwnProperty.call(prepared, 'meta')
-        const body = wrappedAttempt ? prepared.body : prepared
-        const attemptMeta = wrappedAttempt ? prepared.meta : null
-        if (attemptMeta?.sessionId) {
-          outboundSessionId = String(attemptMeta.sessionId)
-          outboundSessionAccountId = selected.accountId
-          bindAll(
-            { accountId: selected.accountId, vmId: selected.vmId, sessionId: outboundSessionId },
-            {
-              countHit: false,
-              // Prebinding moved the VM already; replace the previous VM's session.
-              replaceSession: !!attemptStickyBound?.vmId && attemptStickyBound.vmId !== selected.vmId,
-            },
-          )
+        if (selected?.familyGated && familyKey && familyVmId) {
+          // The family home left the pool (quota, credential): the family moves
+          // with the next bind. An exclusion this request made itself is not proof.
+          const home = this.stickyRouter?.resolve?.(familyKey)
+          const ownExclusion =
+            !!home && (budget.tried.has(home.accountId) || budget.tried.has(home.vmId) || spilled.has(home.accountId))
+          if (!ownExclusion) {
+            if (this.stickyRouter?.shared)
+              await this.stickyRouter.unbindShared(familyKey, { ifGeneration: this.stickyRouter.versionOf(familyKey) })
+            else this.stickyRouter?.unbind?.(familyKey)
+          }
+          familyVmId = null
         }
-        result = await callAttempt({
-          candidate: selected,
-          body,
-          attemptMeta,
-          attemptNo,
-          stream,
-          deliveryMode: deliveryMode || this.config.delivery_mode,
-          signal,
-          onCommit: () => {
-            committed = true
-          },
-        })
-        noteHop(result)
-        if (result) result.committed = result.committed || committed
-        if (signal?.aborted || isClientCancelledResult(result)) {
-          this.attemptsRepo?.complete?.(requestId, attemptNo, {
-            upstreamStatus: result?.status ?? null,
-            errorScope: 'request',
-            action: 'stop',
-            downstreamCommitted: !!(result?.committed || committed),
-            terminalState: 'cancelled',
-            latencyMs: Date.now() - attemptStarted,
-          })
-          return { ...clientCancelledResult(result), via: result?.via || 'pool-failover', ...attribution() }
-        }
-        policy = classifyAttempt(
-          result,
-          selected,
-          {
-            model,
-            repaired,
-            oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
-            signatureRepair: signatureRepairEnabled(this.config),
-          },
-          this.scheduler?.accountQuota,
-        )
-        if (knownSearchRepair && policy.reason === 'search_repairable') {
-          // Repeating the identical flatten cannot fix a second rejection.
-          this.searchRepairs.delete(repairKey)
-          policy = { ...policy, action: 'stop' }
-        }
-        // One writer for rate_limit_reset_at / overload_until (sub2api HandleUpstreamError).
-        const hardBlock =
-          !result?.committed && !pinVmId
-            ? this.rateLimitService?.handleUpstreamError?.({
-                accountId: selected.accountId,
-                vmId: selected.vmId,
-                result,
-                policy,
-              }) || null
-            : null
-        if (hardBlock?.until && policy.action === 'continue-and-cooldown' && policy.scope === 'account') {
-          policy = { ...policy, cooldownUntil: hardBlock.until }
-        }
-
-        lastResult = result
-        lastPolicy = policy
-        this.noteUnitHealth(selected, policy, result)
-        notifyProxyFailure(this.onProxyFailure, selected, policy)
-        if (policy.reason === 'fable_plan_denied' && typeof this.onFablePlanDenied === 'function') {
-          try {
-            this.onFablePlanDenied({ selected, policy })
-          } catch {}
-        }
-        const terminalState = result?.terminalState || (result?.ok ? 'unknown' : 'error')
-        this.attemptsRepo?.complete?.(requestId, attemptNo, {
-          upstreamStatus: result?.status ?? null,
-          errorScope: policy.scope,
-          action: policy.action,
-          cooldownUntil: policy.cooldownUntil,
-          downstreamCommitted: result?.committed || committed,
-          terminalState,
-          usage: usageOf(result),
-          ttftMs: result?.ttftMs ?? null,
-          latencyMs: Date.now() - attemptStarted,
-        })
-        if (typeof onAttempt === 'function') {
-          await onAttempt({ attemptNo, selected, result, policy })
-        }
-        if (policy.reason === 'content_filter_refusal' || policy.reason === 'usage_policy_refusal') {
-          this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
-          bindAll({ accountId: selected.accountId, vmId: selected.vmId })
+        if (!selected?.ok && selected?.reason === 'fable_requires_max') {
           return {
-            ...result,
+            ...fableRequiresMaxError({
+              wait_ms: selected?.waitMs ?? selected?.wait_ms ?? 0,
+              eligible: selected?.eligible ?? 0,
+              available: selected?.available ?? 0,
+              attempt_count: budget.hops,
+            }),
             ...attribution(),
-            finalState: policy.reason === 'usage_policy_refusal' ? 'rejected' : 'content_filter',
-            policy,
           }
         }
-        if (verifiedSuccess(result)) {
-          if (repairKey && (knownSearchRepair || searchRepair?.key === repairKey)) {
-            this.searchRepairs.delete(repairKey)
-            while (this.searchRepairs.size >= SEARCH_REPAIR_LIMIT) {
-              this.searchRepairs.delete(this.searchRepairs.keys().next().value)
-            }
-            this.searchRepairs.set(repairKey, {
-              fingerprint: fingerprint(),
-              expiresAt: Date.now() + SEARCH_REPAIR_IDLE_MS,
-            })
+        if (!selected?.ok) {
+          const exhausted = selectionFailure(selected, { excluded, lastPolicy, lastResult, hops: budget.hops })
+          return preferLastResult(lastResult, lastPolicy, exhausted, attribution())
+        }
+        repairPending = false
+        snapshotPins()
+        const attemptStickyBound = pinBaseline.get(stickyKey) || null
+        lastSelected = selected
+        pinnedSlot = selected.slotIndex ?? null
+        if (selected.seatMoved) seatMovedTo = selected.vmId
+        if (
+          !(await bindAll(
+            { accountId: selected.accountId, vmId: selected.vmId, slotIndex: pinnedSlot },
+            { countHit: false },
+            { required: true },
+          ))
+        )
+          return stickyConflict()
+        const attemptStarted = Date.now()
+        await this.attemptsRepo?.begin?.({
+          requestId,
+          attemptNo,
+          vmId: selected.vmId,
+          accountId: selected.accountId,
+          model,
+          selectionReason: selected.selectionReason,
+          waitMs: selected.waitMs,
+        })
+        let result
+        let policy
+        let committed = false
+        let hopNoted = false
+        let callEntered = false
+        let executionEnded = false
+        let unknownExecution = false
+        const noteHop = (value) => {
+          if (hopNoted) return
+          hopNoted = true
+          const executions = executionsOf(value)
+          if (executions > 0) budget.noteHop(selected.accountId, selected.vmId, executions)
+        }
+        try {
+          const repairKey = searchRepairKey(stickyKey, model, selected)
+          const hint = this.searchRepairs.get(repairKey)
+          if (hint && hint.expiresAt <= Date.now()) this.searchRepairs.delete(repairKey)
+          const knownSearchRepair = hint && hint.expiresAt > Date.now() && hint.fingerprint === fingerprint()
+          const attemptBody = knownSearchRepair ? flattenSearchResultHistory(requestBody) : requestBody
+          const prepared =
+            typeof applyAttempt === 'function'
+              ? await applyAttempt(clone(attemptBody), selected, {
+                  attemptNo,
+                  repaired,
+                  attemptStartedAt: attemptStarted,
+                  freshSlot,
+                  stickyBound: attemptStickyBound,
+                })
+              : clone(attemptBody)
+          const wrappedAttempt =
+            prepared &&
+            typeof prepared === 'object' &&
+            Object.prototype.hasOwnProperty.call(prepared, 'body') &&
+            Object.prototype.hasOwnProperty.call(prepared, 'meta')
+          const body = wrappedAttempt ? prepared.body : prepared
+          const attemptMeta = wrappedAttempt ? prepared.meta : null
+          if (attemptMeta?.sessionId) {
+            outboundSessionId = String(attemptMeta.sessionId)
+            outboundSessionAccountId = selected.accountId
+            const bound = await bindAll(
+              { accountId: selected.accountId, vmId: selected.vmId, sessionId: outboundSessionId },
+              {
+                countHit: false,
+                // Prebinding moved the VM already; replace the previous VM's session.
+                replaceSession: !!attemptStickyBound?.vmId && attemptStickyBound.vmId !== selected.vmId,
+              },
+              { required: true },
+            )
+            if (!bound) return stickyConflict()
           }
-          this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
-          if (isFableModel(model) && typeof this.onFableSuccess === 'function') {
+          callEntered = true
+          result = await withHaRequestAttempt(attemptNo, () =>
+            this.withCredentialAdmission(selected, () =>
+              callAttempt({
+                candidate: selected,
+                body,
+                attemptMeta,
+                attemptNo,
+                stream,
+                deliveryMode: deliveryMode || this.config.delivery_mode,
+                signal,
+                onCommit: () => {
+                  committed = true
+                },
+              }),
+            ),
+          )
+          executionEnded = result?.execution?.ended === true
+          if (selected.bindExecution && (!executionEnded || result?.executionUncertain)) {
+            await selected.markUncertain()
+            unknownExecution = true
+            if (result) result.executionUncertain = true
+          }
+          noteHop(result)
+          if (result) result.committed = result.committed || committed
+          if (signal?.aborted || isClientCancelledResult(result)) {
+            await this.attemptsRepo?.complete?.(requestId, attemptNo, {
+              upstreamStatus: result?.status ?? null,
+              errorScope: 'request',
+              action: 'stop',
+              downstreamCommitted: !!(result?.committed || committed),
+              terminalState: 'cancelled',
+              latencyMs: Date.now() - attemptStarted,
+            })
+            return { ...clientCancelledResult(result), via: result?.via || 'pool-failover', ...attribution() }
+          }
+          policy = classifyAttempt(
+            result,
+            selected,
+            {
+              model,
+              repaired,
+              oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
+              signatureRepair: signatureRepairEnabled(this.config),
+            },
+            this.scheduler?.accountQuota,
+          )
+          if (knownSearchRepair && policy.reason === 'search_repairable') {
+            // Repeating the identical flatten cannot fix a second rejection.
+            this.searchRepairs.delete(repairKey)
+            policy = { ...policy, action: 'stop' }
+          }
+          // One writer for rate_limit_reset_at / overload_until (sub2api HandleUpstreamError).
+          const hardBlock =
+            !result?.committed && !pinVmId
+              ? (await this.rateLimitService?.handleUpstreamError?.({
+                  accountId: selected.accountId,
+                  vmId: selected.vmId,
+                  result,
+                  policy,
+                })) || null
+              : null
+          if (hardBlock?.until && policy.action === 'continue-and-cooldown' && policy.scope === 'account') {
+            policy = { ...policy, cooldownUntil: hardBlock.until }
+          }
+
+          lastResult = result
+          lastPolicy = policy
+          await this.noteUnitHealth(selected, policy, result)
+          await notifyProxyFailure(this.onProxyFailure, selected, policy)
+          if (policy.reason === 'fable_plan_denied' && typeof this.onFablePlanDenied === 'function') {
             try {
-              this.onFableSuccess({ selected, model })
+              this.onFablePlanDenied({ selected, policy })
             } catch {}
           }
-          bindAll({ accountId: selected.accountId, vmId: selected.vmId })
-          return { ...result, ...attribution(), finalState: 'verified' }
-        }
-        if (policy.action === 'repair-and-retry' && !repaired && !result?.committed) {
-          repaired = true
-          repairPending = true
-          if (policy.reason === 'search_repairable' && repairKey && fingerprint()) {
-            searchRepair = { key: repairKey }
+          const terminalState = result?.terminalState || (result?.ok ? 'unknown' : 'error')
+          await this.attemptsRepo?.complete?.(requestId, attemptNo, {
+            upstreamStatus: result?.status ?? null,
+            errorScope: policy.scope,
+            action: policy.action,
+            cooldownUntil: policy.cooldownUntil,
+            downstreamCommitted: result?.committed || committed,
+            terminalState,
+            usage: usageOf(result),
+            ttftMs: result?.ttftMs ?? null,
+            latencyMs: Date.now() - attemptStarted,
+          })
+          if (typeof onAttempt === 'function') {
+            await onAttempt({ attemptNo, selected, result, policy })
           }
-          requestBody = repairAnthropicRequest(requestBody, policy)
-          continue
-        }
-        applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
-        if (!pinVmId && isCredentialDeath(policy)) {
-          this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
-          if (familyKey) {
+          if (unknownExecution)
+            return incompleteHopResult(result, policy, { ...attribution(), executionUncertain: true })
+          if (executionEnded && result?.credentialRefreshNotStarted === true)
+            return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
+          if (policy.reason === 'content_filter_refusal' || policy.reason === 'usage_policy_refusal') {
+            await this.scheduler.markSuccess(selected, {
+              workerStatus: result.workerStatus || null,
+              countUsage,
+              observation: result.accountObservation,
+            })
+            await bindAll({ accountId: selected.accountId, vmId: selected.vmId })
+            return {
+              ...result,
+              ...attribution(),
+              finalState: policy.reason === 'usage_policy_refusal' ? 'rejected' : 'content_filter',
+              policy,
+            }
+          }
+          if (verifiedSuccess(result)) {
+            if (repairKey && (knownSearchRepair || searchRepair?.key === repairKey)) {
+              this.searchRepairs.delete(repairKey)
+              while (this.searchRepairs.size >= SEARCH_REPAIR_LIMIT) {
+                this.searchRepairs.delete(this.searchRepairs.keys().next().value)
+              }
+              this.searchRepairs.set(repairKey, {
+                fingerprint: fingerprint(),
+                expiresAt: Date.now() + SEARCH_REPAIR_IDLE_MS,
+              })
+            }
+            await this.scheduler.markSuccess(selected, {
+              workerStatus: result.workerStatus || null,
+              countUsage,
+              observation: result.accountObservation,
+            })
+            if (isFableModel(model) && typeof this.onFableSuccess === 'function') {
+              try {
+                this.onFableSuccess({ selected, model })
+              } catch {}
+            }
+            await bindAll({ accountId: selected.accountId, vmId: selected.vmId })
+            return { ...result, ...attribution(), finalState: 'verified' }
+          }
+          if (policy.action === 'repair-and-retry' && !repaired && !result?.committed) {
+            repaired = true
+            repairPending = true
+            if (policy.reason === 'search_repairable' && repairKey && fingerprint()) {
+              searchRepair = { key: repairKey }
+            }
+            requestBody = repairAnthropicRequest(requestBody, policy)
+            continue
+          }
+          const cooldownApplied = await applyCooldown(this.scheduler, selected, policy, model, {
+            diagnosticPin: !!pinVmId,
+            observation: result?.accountObservation,
+          })
+          if (cooldownApplied !== false && !pinVmId && isCredentialDeath(policy)) {
+            await this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys, versions: pinVersions })
+            if (familyKey) {
+              return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
+            }
+          }
+          if (!shouldContinue(policy)) {
             return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
           }
-        }
-        if (!shouldContinue(policy)) {
-          return { ...result, ...attribution(), finalState: result?.terminalState || 'rejected', policy }
-        }
-        policy = await this.recoverCredential(selected, policy)
-        const hopMs = Date.now() - attemptStarted
-        if (isRetryableEmptyHop(policy)) {
-          if (!emptyHopReleased(result) || pinVmId) return incompleteHopResult(result, policy, attribution())
-          this.retireOutboundSession(selected, bindKeys)
-          freshSlot = true
-        }
-        if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
-          budget.noteSameUnit(selected.accountId)
-          avoid = new Set([selected.accountId, selected.vmId])
-          continue
-        }
-        budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
-      } catch (error) {
-        const invalidCache = error?.status === 400 && error.body?.error?.code === 'invalid_cache_control'
-        noteHop(invalidCache ? { upstreamExecutions: 0 } : null)
-        if (error?.code === 'response_sent') {
-          this.attemptsRepo?.complete?.(requestId, attemptNo, {
-            upstreamStatus: 403,
-            errorScope: 'request',
-            action: 'stop',
-            downstreamCommitted: true,
-            terminalState: 'policy_block',
-            latencyMs: Date.now() - attemptStarted,
-          })
-          return {
-            ok: false,
-            responseSent: true,
-            status: 403,
-            via: 'account-scope',
-            vmId: selected.vmId,
-            accountId: selected.accountId,
-            attemptCount: attemptNo,
-            finalState: 'policy_block',
+          policy = await this.recoverCredential(selected, policy, { executionEnded })
+          if (policy.credentialRefreshNotStarted === true)
+            return {
+              ...result,
+              ...attribution(),
+              finalState: result?.terminalState || 'rejected',
+              policy,
+              credentialRefreshNotStarted: true,
+            }
+          const hopMs = Date.now() - attemptStarted
+          if (isRetryableEmptyHop(policy)) {
+            if (!emptyHopReleased(result) || pinVmId) return incompleteHopResult(result, policy, attribution())
+            await this.retireOutboundSession(selected, bindKeys, pinVersions)
+            freshSlot = true
           }
-        }
-        if (invalidCache) {
-          this.attemptsRepo?.complete?.(requestId, attemptNo, {
-            upstreamStatus: 0,
-            errorScope: 'request',
-            action: 'stop',
-            downstreamCommitted: false,
-            terminalState: 'invalid_request',
-            latencyMs: Date.now() - attemptStarted,
-          })
-          return {
-            ok: false,
-            status: 400,
-            body: error.body,
-            terminalState: 'invalid_request',
-            finalState: 'invalid_request',
-            ...attribution(),
+          if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
+            budget.noteSameUnit(selected.accountId)
+            avoid = new Set([selected.accountId, selected.vmId])
+            continue
           }
-        }
-        if (signal?.aborted || error?.code === 'selection_cancelled' || error?.code === 'request_cancelled') {
-          this.attemptsRepo?.complete?.(requestId, attemptNo, {
-            upstreamStatus: 0,
-            errorScope: 'request',
-            action: 'stop',
-            downstreamCommitted: !!committed,
-            terminalState: 'cancelled',
-            latencyMs: Date.now() - attemptStarted,
-          })
-          return { ...clientCancelledResult({ committed }), via: 'pool-failover', ...attribution() }
-        }
-        result = {
-          ok: false,
-          status: 0,
-          transportError: true,
-          committed,
-          terminalState: committed ? 'incomplete' : 'transport_error',
-          body: {
-            type: 'error',
-            error: {
-              type: 'worker_error',
-              code: error.code || 'attempt_failed',
-              message: String(error.message || error).slice(0, 300),
+          budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
+        } catch (error) {
+          if (error?.executionUncertain === true && selected.bindExecution) {
+            if (!unknownExecution) await selected.markUncertain()
+            unknownExecution = true
+          }
+          // A submitted job can outlive its transport. Never replay it or free
+          // its shared capacity without proof that the execution ended.
+          if (selected.bindExecution && callEntered) {
+            if (executionEnded) throw error
+            if (!unknownExecution) await selected.markUncertain()
+            unknownExecution = true
+          }
+          const invalidCache = error?.status === 400 && error.body?.error?.code === 'invalid_cache_control'
+          noteHop(invalidCache ? { upstreamExecutions: 0 } : null)
+          if (error?.code === 'response_sent') {
+            await this.attemptsRepo?.complete?.(requestId, attemptNo, {
+              upstreamStatus: 403,
+              errorScope: 'request',
+              action: 'stop',
+              downstreamCommitted: true,
+              terminalState: 'policy_block',
+              latencyMs: Date.now() - attemptStarted,
+            })
+            return {
+              ok: false,
+              ...(unknownExecution ? { executionUncertain: true } : {}),
+              responseSent: true,
+              status: 403,
+              via: 'account-scope',
+              vmId: selected.vmId,
+              accountId: selected.accountId,
+              attemptCount: attemptNo,
+              finalState: 'policy_block',
+            }
+          }
+          if (invalidCache) {
+            await this.attemptsRepo?.complete?.(requestId, attemptNo, {
+              upstreamStatus: 0,
+              errorScope: 'request',
+              action: 'stop',
+              downstreamCommitted: false,
+              terminalState: 'invalid_request',
+              latencyMs: Date.now() - attemptStarted,
+            })
+            return {
+              ok: false,
+              ...(unknownExecution ? { executionUncertain: true } : {}),
+              status: 400,
+              body: error.body,
+              terminalState: 'invalid_request',
+              finalState: 'invalid_request',
+              ...attribution(),
+            }
+          }
+          if (signal?.aborted || error?.code === 'selection_cancelled' || error?.code === 'request_cancelled') {
+            await this.attemptsRepo?.complete?.(requestId, attemptNo, {
+              upstreamStatus: 0,
+              errorScope: 'request',
+              action: 'stop',
+              downstreamCommitted: !!committed,
+              terminalState: 'cancelled',
+              latencyMs: Date.now() - attemptStarted,
+            })
+            return {
+              ...clientCancelledResult({ committed }),
+              ...(unknownExecution ? { executionUncertain: true } : {}),
+              via: 'pool-failover',
+              ...attribution(),
+            }
+          }
+          result = {
+            ok: false,
+            ...(unknownExecution ? { executionUncertain: true } : {}),
+            status: 0,
+            transportError: true,
+            committed,
+            terminalState: committed ? 'incomplete' : 'transport_error',
+            body: {
+              type: 'error',
+              error: {
+                type: 'worker_error',
+                code: error.code || 'attempt_failed',
+                message: String(error.message || error).slice(0, 300),
+              },
             },
-          },
-        }
-        policy = classifyAttempt(
-          result,
-          selected,
-          {
-            model,
-            repaired,
-            oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
-            signatureRepair: signatureRepairEnabled(this.config),
-          },
-          this.scheduler?.accountQuota,
-        )
-        lastResult = result
-        lastPolicy = policy
-        this.noteUnitHealth(selected, policy, result)
-        notifyProxyFailure(this.onProxyFailure, selected, policy)
-        this.attemptsRepo?.complete?.(requestId, attemptNo, {
-          upstreamStatus: 0,
-          errorScope: policy.scope,
-          action: policy.action,
-          cooldownUntil: policy.cooldownUntil,
-          downstreamCommitted: committed,
-          terminalState: result.terminalState,
-          latencyMs: Date.now() - attemptStarted,
-        })
-        if (committed || !shouldContinue(policy)) {
-          return { ...result, ...attribution(), finalState: result.terminalState, policy }
-        }
-        applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
-        if (!pinVmId && isCredentialDeath(policy)) {
-          this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
-          if (familyKey) {
+          }
+          policy = classifyAttempt(
+            result,
+            selected,
+            {
+              model,
+              repaired,
+              oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
+              signatureRepair: signatureRepairEnabled(this.config),
+            },
+            this.scheduler?.accountQuota,
+          )
+          lastResult = result
+          lastPolicy = policy
+          await this.noteUnitHealth(selected, policy, result)
+          await notifyProxyFailure(this.onProxyFailure, selected, policy)
+          await this.attemptsRepo?.complete?.(requestId, attemptNo, {
+            upstreamStatus: 0,
+            errorScope: policy.scope,
+            action: policy.action,
+            cooldownUntil: policy.cooldownUntil,
+            downstreamCommitted: committed,
+            terminalState: result.terminalState,
+            latencyMs: Date.now() - attemptStarted,
+          })
+          if (unknownExecution || committed || !shouldContinue(policy)) {
             return { ...result, ...attribution(), finalState: result.terminalState, policy }
           }
+          const cooldownApplied = await applyCooldown(this.scheduler, selected, policy, model, {
+            diagnosticPin: !!pinVmId,
+            observation: result?.accountObservation,
+          })
+          if (cooldownApplied !== false && !pinVmId && isCredentialDeath(policy)) {
+            await this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys, versions: pinVersions })
+            if (familyKey) {
+              return { ...result, ...attribution(), finalState: result.terminalState, policy }
+            }
+          }
+          policy = await this.recoverCredential(selected, policy, { executionEnded })
+          if (policy.credentialRefreshNotStarted === true)
+            return {
+              ...result,
+              ...attribution(),
+              finalState: result.terminalState,
+              policy,
+              credentialRefreshNotStarted: true,
+            }
+          const hopMs = Date.now() - attemptStarted
+          if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
+            budget.noteSameUnit(selected.accountId)
+            avoid = new Set([selected.accountId, selected.vmId])
+            continue
+          }
+          budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
         }
-        policy = await this.recoverCredential(selected, policy)
-        const hopMs = Date.now() - attemptStarted
-        if (budget.allowSameUnit(selected.accountId, policy, hopMs, this.config.same_account_retry_max_hop_ms)) {
-          budget.noteSameUnit(selected.accountId)
-          avoid = new Set([selected.accountId, selected.vmId])
-          continue
-        }
-        budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
       } finally {
-        selected.release?.()
+        await selected?.release?.()
       }
     }
   }

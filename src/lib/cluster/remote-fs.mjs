@@ -116,7 +116,9 @@ export async function runRemote(client, script, { timeoutMs = 60_000, code = 're
   const r = await execCollect(client, `sh -c ${shellQuote(script)}`, { timeoutMs })
   if (r.code !== 0) {
     const detail = (r.stderr || r.stdout || `exit ${r.code}`).trim().slice(-500)
-    throw new ClusterError(502, code, detail)
+    const error = new ClusterError(502, code, detail)
+    if (Number.isSafeInteger(r.code)) error.remoteCommandEnded = true
+    throw error
   }
   return r.stdout
 }

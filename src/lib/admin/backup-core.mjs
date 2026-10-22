@@ -1,27 +1,9 @@
-/**
- * Backup pipeline primitives.
- *
- * Why this module exists: the whole pipeline (VACUUM INTO of a multi-GB
- * database, sha256 of the snapshot, `tar -czf`, sha256 of the archive, staging
- * cleanup) is synchronous. Running it on the gateway's main thread stops the
- * HTTP server from answering any request for the entire backup — a 3-5 minute
- * hole that turns into Cloudflare 524s for /v1 traffic, the panel and /healthz.
- *
- * So the pipeline lives here and is executed by backup-worker.mjs on its own
- * thread with its own database connection, while BackupService stays a thin
- * orchestrator on the main thread.
- *
- * Fallback: when `tar` is unavailable the snapshot is gzipped in memory
- * (only sane below ~2 GiB) — unchanged from the original implementation.
- */
-
+/** PostgreSQL backup primitives. Child processes keep dump/compression off the HTTP thread. */
 import fs from 'node:fs'
 import path from 'node:path'
 import crypto from 'node:crypto'
-import zlib from 'node:zlib'
-import { spawnSync } from 'node:child_process'
-import { getDb, vacuumInto } from '../db/database.mjs'
-import { BackupRepo } from '../db/repos/backup-repo.mjs'
+import { spawn, spawnSync } from 'node:child_process'
+import { pipeline } from 'node:stream/promises'
 
 export function stamp(d = new Date()) {
   return d.toISOString().replace(/[:.]/g, '-')
@@ -63,31 +45,8 @@ function mkdtempOnDataVolume({ tmpDir }) {
   return fs.mkdtempSync(path.join(base, 'kin-backup-'))
 }
 
-/** Drop backups past the retention window (pre_restore keeps the newest 3). */
-function applyRetention(repo, retention) {
-  const drop = [...repo.beyondRetention(retention), ...repo.preRestoreBeyond(3)]
-  for (const rec of drop) {
-    try {
-      if (rec.file_path && fs.existsSync(rec.file_path)) fs.rmSync(rec.file_path, { force: true })
-    } catch {}
-    try {
-      repo.remove(rec.id)
-    } catch {}
-  }
-  return drop.length
-}
-
-/**
- * Run one backup job end to end. Blocking by design — call it from a worker
- * thread (or the test process), never from the gateway's main thread.
- *
- * The caller owns the database connection: open it (openDatabase/openDatabase
- * singleton) before calling and close it afterwards.
- *
- * @returns backup record (status 'ok')
- */
-export function runBackupJob(ctx, { id, createdAt, kind = 'manual', note = null, retention = 7 }) {
-  const repo = new BackupRepo(getDb())
+/** The parent holds the exported snapshot until this asynchronous worker job completes. */
+export async function runBackupJob(ctx, { id, createdAt, kind = 'manual', note = null }, onFilesCopied = () => {}) {
   let tmp = null
   try {
     fs.mkdirSync(ctx.backupDir, { recursive: true, mode: 0o700 })
@@ -96,14 +55,14 @@ export function runBackupJob(ctx, { id, createdAt, kind = 'manual', note = null,
     } catch {}
     tmp = mkdtempOnDataVolume(ctx)
 
-    // 1. online-consistent DB snapshot (WAL-safe)
-    const dbSnap = path.join(tmp, 'db', 'kin.db')
-    vacuumInto(getDb(), dbSnap)
-    const dbBytes = fs.statSync(dbSnap).size
+    const dbSnap = path.join(tmp, 'db', 'postgres.dump')
+    fs.mkdirSync(path.dirname(dbSnap), { recursive: true, mode: 0o700 })
 
     // 2. vm files + config files
     const includes = { db: true, vms: 0, config: 0 }
-    const sha256s = { 'db/kin.db': sha256File(dbSnap) }
+    const sha256s = {}
+    if (ctx.projectRoot) fs.mkdirSync(path.join(tmp, 'vms'), { recursive: true })
+    if (ctx.configDir) fs.mkdirSync(path.join(tmp, 'config'), { recursive: true })
     const vmsDir = ctx.projectRoot ? path.join(ctx.projectRoot, 'vms') : null
     if (vmsDir && fs.existsSync(vmsDir)) {
       const outVms = path.join(tmp, 'vms')
@@ -111,13 +70,11 @@ export function runBackupJob(ctx, { id, createdAt, kind = 'manual', note = null,
       for (const f of fs.readdirSync(vmsDir)) {
         if (!/\.json$/.test(f)) continue
         const src = path.join(vmsDir, f)
-        try {
-          if (!fs.statSync(src).isFile()) continue
-          fs.copyFileSync(src, path.join(outVms, f))
-          fs.chmodSync(path.join(outVms, f), 0o600)
-          sha256s[`vms/${f}`] = sha256File(src)
-          includes.vms += 1
-        } catch {}
+        if (!fs.statSync(src).isFile()) continue
+        fs.copyFileSync(src, path.join(outVms, f))
+        fs.chmodSync(path.join(outVms, f), 0o600)
+        sha256s[`vms/${f}`] = sha256File(path.join(outVms, f))
+        includes.vms += 1
       }
     }
     if (ctx.configDir && fs.existsSync(ctx.configDir)) {
@@ -126,18 +83,37 @@ export function runBackupJob(ctx, { id, createdAt, kind = 'manual', note = null,
       for (const f of fs.readdirSync(ctx.configDir)) {
         if (!/\.json$/.test(f)) continue
         const src = path.join(ctx.configDir, f)
-        try {
-          if (!fs.statSync(src).isFile()) continue
-          fs.copyFileSync(src, path.join(outCfg, f))
-          sha256s[`config/${f}`] = sha256File(src)
-          includes.config += 1
-        } catch {}
+        if (!fs.statSync(src).isFile()) continue
+        fs.copyFileSync(src, path.join(outCfg, f))
+        sha256s[`config/${f}`] = sha256File(path.join(outCfg, f))
+        includes.config += 1
       }
     }
 
-    // 3. manifest
+    // Files and exported DB snapshot refer to the same write-free window.
+    await onFilesCopied()
+    await runPgTool(
+      'pg_dump',
+      [
+        '--format=custom',
+        '--no-owner',
+        '--no-privileges',
+        `--schema=${ctx.schema}`,
+        `--snapshot=${ctx.snapshot}`,
+        '--file',
+        dbSnap,
+      ],
+      ctx.connectionString,
+    )
+    fs.chmodSync(dbSnap, 0o600)
+    const dbBytes = fs.statSync(dbSnap).size
+    sha256s['db/postgres.dump'] = sha256File(dbSnap)
+
     const manifest = {
-      version: 1,
+      version: 2,
+      engine: 'postgresql',
+      schema: ctx.schema,
+      schema_version: ctx.schemaVersion,
       tool: 'kin-gateway',
       created_at: createdAt,
       kind,
@@ -146,30 +122,12 @@ export function runBackupJob(ctx, { id, createdAt, kind = 'manual', note = null,
     }
     fs.writeFileSync(path.join(tmp, 'manifest.json'), JSON.stringify(manifest, null, 2))
 
-    // 4. archive (tar.gz preferred; gzipped db fallback)
-    let filePath,
-      fileName,
-      noteOut = note
-    if (tarAvailable()) {
-      fileName = `kin-backup-${stamp(new Date(createdAt))}.tar.gz`
-      filePath = path.join(ctx.backupDir, fileName)
-      const r = spawnSync('tar', ['-czf', filePath, '-C', tmp, '.'], { stdio: 'pipe' })
-      if (r.status !== 0) {
-        throw new Error(`tar failed: ${String(r.stderr || '').slice(0, 300)}`)
-      }
-    } else {
-      fileName = `kin-backup-${stamp(new Date(createdAt))}.db.gz`
-      filePath = path.join(ctx.backupDir, fileName)
-      fs.writeFileSync(filePath, zlib.gzipSync(fs.readFileSync(dbSnap)))
-      noteOut = [note, 'tar unavailable — db-only gzip snapshot (vm files rebuilt from DB on restore)']
-        .filter(Boolean)
-        .join(' | ')
-    }
-    try {
-      fs.chmodSync(filePath, 0o600)
-    } catch {}
+    const fileName = `kin-backup-${stamp(new Date(createdAt))}.tar.gz`
+    const filePath = path.join(ctx.backupDir, fileName)
+    await runProcess('tar', ['-czf', filePath, '-C', tmp, '.'])
+    fs.chmodSync(filePath, 0o600)
 
-    const rec = repo.insert({
+    return {
       id,
       created_at: createdAt,
       kind,
@@ -181,28 +139,8 @@ export function runBackupJob(ctx, { id, createdAt, kind = 'manual', note = null,
       db_bytes: dbBytes,
       includes,
       error: null,
-      note: noteOut,
-    })
-    applyRetention(repo, retention)
-    return rec
-  } catch (e) {
-    try {
-      repo.insert({
-        id,
-        created_at: createdAt,
-        kind,
-        status: 'failed',
-        file_path: null,
-        file_name: null,
-        size_bytes: null,
-        sha256: null,
-        db_bytes: null,
-        includes: null,
-        error: String(e.message || e).slice(0, 500),
-        note,
-      })
-    } catch {}
-    throw e
+      note,
+    }
   } finally {
     if (tmp) {
       try {
@@ -210,4 +148,76 @@ export function runBackupJob(ctx, { id, createdAt, kind = 'manual', note = null,
       } catch {}
     }
   }
+}
+
+/** Secrets are passed only through the child environment; stderr may contain data and is never returned. */
+export function pgEnvironment(connectionString) {
+  let url
+  try {
+    url = new URL(connectionString)
+  } catch {
+    throw new Error('invalid PostgreSQL connection configuration')
+  }
+  if (!['postgres:', 'postgresql:'].includes(url.protocol)) throw new Error('PostgreSQL connection required')
+  const env = {
+    ...process.env,
+    PGHOST: url.searchParams.get('host') || url.hostname.replace(/^\[(.+)\]$/, '$1'),
+    PGPORT: url.searchParams.get('port') || url.port || '5432',
+    PGUSER: url.searchParams.get('user') || decodeURIComponent(url.username),
+    PGPASSWORD: url.searchParams.get('password') || decodeURIComponent(url.password),
+    PGDATABASE: decodeURIComponent(url.pathname.slice(1)),
+    PGCONNECT_TIMEOUT: '10',
+  }
+  for (const [key, name] of Object.entries({
+    sslmode: 'PGSSLMODE',
+    sslcert: 'PGSSLCERT',
+    sslkey: 'PGSSLKEY',
+    sslrootcert: 'PGSSLROOTCERT',
+    connect_timeout: 'PGCONNECT_TIMEOUT',
+    application_name: 'PGAPPNAME',
+    options: 'PGOPTIONS',
+  })) {
+    if (url.searchParams.has(key)) env[name] = url.searchParams.get(key)
+  }
+  return env
+}
+
+export function runProcess(command, args, env = process.env) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { env, stdio: ['ignore', 'pipe', 'ignore'] })
+    let stdout = ''
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString()
+      if (stdout.length > 1024 * 1024) {
+        child.kill()
+        reject(new Error(`${command} output exceeds the archive metadata limit`))
+      }
+    })
+    child.once('error', () => reject(new Error(`${command} could not start`)))
+    child.once('close', (code) =>
+      code === 0 ? resolve(stdout) : reject(new Error(`${command} failed (exit ${code})`)),
+    )
+  })
+}
+
+export function runPgTool(command, args, connectionString) {
+  return runProcess(command, args, pgEnvironment(connectionString))
+}
+
+/** Hash large archives without blocking health checks on the main thread. */
+export async function sha256FileAsync(file) {
+  const hash = crypto.createHash('sha256')
+  for await (const chunk of fs.createReadStream(file)) hash.update(chunk)
+  return hash.digest('hex')
+}
+
+/** Extract only a selected member's bytes; archive symlinks are never installed on disk. */
+export async function extractArchiveMember(archive, member, destination) {
+  fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o700 })
+  const child = spawn('tar', ['-xOzf', archive, '--', member], { stdio: ['ignore', 'pipe', 'ignore'] })
+  const done = new Promise((resolve, reject) => {
+    child.once('error', () => reject(new Error('tar could not start')))
+    child.once('close', (code) => (code === 0 ? resolve() : reject(new Error('backup archive extraction failed'))))
+  })
+  await Promise.all([pipeline(child.stdout, fs.createWriteStream(destination, { mode: 0o600, flags: 'wx' })), done])
 }

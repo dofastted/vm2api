@@ -48,17 +48,17 @@ test('a saved dotted Opus 5.5 row keeps administrator overrides on the hyphen id
   assert.equal(migrated.aliases[legacy], canonical)
 })
 
-test('loading settings that predate Opus 5.5 appends the model without resetting Opus 5', () => {
-  openDatabase({ dbPath: ':memory:' })
+test('loading settings that predate Opus 5.5 appends the model without resetting Opus 5', async () => {
+  await openDatabase({ dbPath: ':memory:' })
   try {
     const repo = new SettingsRepo()
-    repo.set('model_policy', {
+    await repo.set('model_policy', {
       source: 'panel',
       models: { 'claude-opus-5': { enabled: false, display_name: 'kept' } },
       aliases: { opus: 'claude-opus-5' },
     })
-    loadModelPolicy({ force: true })
-    const stored = repo.get('model_policy')
+    await loadModelPolicy({ force: true })
+    const stored = await repo.get('model_policy')
     assert.equal(stored.models['claude-opus-5'].enabled, false)
     assert.equal(stored.models['claude-opus-5'].display_name, 'kept')
     assert.equal(stored.models[canonical].display_name, 'Opus 5.5')
@@ -72,7 +72,7 @@ test('loading settings that predate Opus 5.5 appends the model without resetting
     assert.deepEqual(thinking.thinking, { type: 'adaptive' })
     assert.equal(thinking.thinking.budget_tokens, undefined)
   } finally {
-    closeDatabase()
+    await closeDatabase()
     clearModelsCache()
   }
 })

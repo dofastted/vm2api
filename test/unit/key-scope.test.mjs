@@ -13,12 +13,12 @@ import {
 const claude = { id: 'vm-01', platform: 'anthropic' }
 const codex = { id: 'vm-02', platform: 'openai', family: 'codex' }
 
-test('all is global and ignores a stored VM list', () => {
+test('all is global and ignores a stored VM list', async () => {
   const scope = keyScopeFromRecord({ group_type: 'all', allowed_vms: '["vm-01"]' })
   assert.deepEqual(scope, { group_type: 'all', allowed_vms: [], vm_pool_id: null })
   assert.equal(keyAllowsVm(scope, claude), true)
   assert.equal(keyAllowsVm(scope, codex), true)
-  assert.deepEqual(keyScopeFromRequest({ apiKeyKind: 'master', apiKeyRecord: { group_type: 'openai' } }), {
+  assert.deepEqual(await keyScopeFromRequest({ apiKeyKind: 'master', apiKeyRecord: { group_type: 'openai' } }), {
     group_type: 'all',
     allowed_vms: [],
     vm_pool_id: null,
@@ -52,17 +52,17 @@ test('a status-only patch does not widen or clear an existing scope', () => {
   })
 })
 
-test('a named pool is the only schedule set and a dead pool does not widen', () => {
+test('a named pool is the only schedule set and a dead pool does not widen', async () => {
   const bound = normalizeKeyScope({ vm_pool_id: 'pool_abcd1234', group_type: 'all' })
   assert.deepEqual(bound, { group_type: 'all', allowed_vms: [], vm_pool_id: 'pool_abcd1234' })
-  const live = applyVmPool(bound, () => ({ id: 'pool_abcd1234', enabled: true, vm_ids: ['vm-02'] }))
+  const live = await applyVmPool(bound, () => ({ id: 'pool_abcd1234', enabled: true, vm_ids: ['vm-02'] }))
   assert.equal(keyAllowsVm(live, codex), true)
   assert.equal(keyAllowsVm(live, claude), false)
-  const moved = applyVmPool(bound, () => ({ id: 'pool_abcd1234', enabled: true, vm_ids: ['vm-01'] }))
+  const moved = await applyVmPool(bound, () => ({ id: 'pool_abcd1234', enabled: true, vm_ids: ['vm-01'] }))
   assert.equal(keyAllowsVm(moved, codex), false)
   assert.equal(keyAllowsVm(moved, claude), true)
   for (const vm_pool_error of ['missing', 'disabled', 'empty']) {
-    const dead = applyVmPool(bound, () =>
+    const dead = await applyVmPool(bound, () =>
       vm_pool_error === 'missing' ? null : { enabled: vm_pool_error !== 'disabled', vm_ids: [] },
     )
     assert.equal(dead.vm_pool_error, vm_pool_error)

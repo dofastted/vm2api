@@ -248,11 +248,11 @@ test('auto-numbering skips ids a deleted VM left behind in account history', asy
 
 test('create binds an explicitly chosen exit instead of auto-allocating', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-exit-'))
-  const pool = new ProxyPool({ dataDir: root, geoLookup: async () => ({ ok: false, error: 'offline' }) })
+  const pool = await new ProxyPool({ dataDir: root, geoLookup: async () => ({ ok: false, error: 'offline' }) }).init()
   pool.stopScheduler()
   try {
-    const socks = pool.importLines('1.2.3.4:1080').items[0].id
-    const local = pool.ensureLocal().proxy.id
+    const socks = (await pool.importLines('1.2.3.4:1080')).items[0].id
+    const local = (await pool.ensureLocal()).proxy.id
     const { handlePanel, response } = makeCreateHandler(root, { start: false, proxy_id: local }, pool)
     await handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/create'))
     assert.equal(response.status, 200, response.body?.error?.message || JSON.stringify(response.body))
@@ -295,17 +295,17 @@ test('create stamps docker machine from routing defaults', async () => {
 
 test('create refuses an unknown or full exit before writing the slot', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-exit-bad-'))
-  const pool = new ProxyPool({ dataDir: root, geoLookup: async () => ({ ok: false, error: 'offline' }) })
+  const pool = await new ProxyPool({ dataDir: root, geoLookup: async () => ({ ok: false, error: 'offline' }) }).init()
   pool.stopScheduler()
   try {
     const missing = makeCreateHandler(root, { id: 'vm-x', start: false, proxy_id: 'px-nope' }, pool)
     await missing.handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/create'))
     assert.equal(missing.response.status, 404)
 
-    const local = pool.ensureLocal().proxy.id
-    pool.updateConfig({ bind_limit: 1 })
+    const local = (await pool.ensureLocal()).proxy.id
+    await pool.updateConfig({ bind_limit: 1 })
     pool.stopScheduler()
-    pool.bind(local, 'vm-other')
+    await pool.bind(local, 'vm-other')
     const full = makeCreateHandler(root, { id: 'vm-x', start: false, proxy_id: local }, pool)
     await full.handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/create'))
     assert.equal(full.response.status, 409)

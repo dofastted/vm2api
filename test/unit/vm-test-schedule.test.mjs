@@ -3,8 +3,8 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
-import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
+import { createDatabase } from '../../src/lib/db/database.mjs'
+import { loadSettingsState, RuntimeSettings as SettingsRepo } from '../../src/lib/db/settings-state.mjs'
 import {
   compileStructuredSchedule,
   normalizeScheduleStructure,
@@ -94,36 +94,36 @@ test('legacy cron input must match structured patterns', () => {
   )
 })
 
-test('SettingsRepo schedules reload after restart without an immediate catch-up run', (t) => {
+test('SettingsRepo schedules reload after restart without an immediate catch-up run', async (t) => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-test-schedule-'))
-  const dbPath = path.join(dataDir, 'settings.db')
-  let db = new DatabaseSync(dbPath)
-  db.exec('CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)')
+  let db = await createDatabase()
+  await loadSettingsState(db)
   let settings = new SettingsRepo(db)
   let first
   let restored
-  t.after(() => {
+  t.after(async () => {
     first?.stop()
     restored?.stop()
-    db.close()
+    await db.close()
     fs.rmSync(dataDir, { recursive: true, force: true })
   })
 
   first = runner({ settings }).schedule
-  first.save('vm-01', claudeConfig)
+  await first.save('vm-01', claudeConfig)
   assert.deepEqual(
     Object.keys(settings.all()).filter((key) => key.startsWith(VM_TEST_SCHEDULE_PREFIX)),
     [`${VM_TEST_SCHEDULE_PREFIX}vm-01`],
   )
-  first.start()
+  await first.start()
   assert.equal(first.jobs.has('vm-01'), true)
   assert.equal(first.get('vm-01').running, false)
   assert.ok(first.get('vm-01').next_run_at)
   assert.equal(first.get('vm-01').cron, undefined)
   first.stop()
 
-  db.close()
-  db = new DatabaseSync(dbPath)
+  await db.close()
+  db = await createDatabase()
+  await loadSettingsState(db)
   settings = new SettingsRepo(db)
   restored = new VmTestScheduleRunner({
     projectRoot: '/missing-project',
@@ -131,7 +131,7 @@ test('SettingsRepo schedules reload after restart without an immediate catch-up 
     list: () => [claudeVm],
     runTest: async () => ({ ok: true }),
   })
-  restored.start()
+  await restored.start()
   assert.equal(restored.jobs.has('vm-01'), true)
   assert.equal(restored.get('vm-01').enabled, true)
   restored.stop()
@@ -148,8 +148,8 @@ test('runs do not overlap per VM and failures persist only compact result fields
       })
     },
   })
-  schedule.save('vm-01', claudeConfig)
-  schedule.start()
+  await schedule.save('vm-01', claudeConfig)
+  await schedule.start()
 
   const job = schedule.jobs.get('vm-01')
   const first = job.trigger()
@@ -175,11 +175,11 @@ test('runs do not overlap per VM and failures persist only compact result fields
   schedule.stop()
 })
 
-test('sync overwrites schedule only and creates disabled plans with default dialog params', () => {
+test('sync overwrites schedule only and creates disabled plans with default dialog params', async () => {
   const codexVm = { id: 'vm-02', platform: 'openai' }
   const { settings, schedule } = runner({ list: () => [claudeVm, codexVm] })
-  schedule.save('vm-01', { ...claudeConfig, prompt: 'keep-me', enabled: true })
-  const result = schedule.syncSchedules({
+  await schedule.save('vm-01', { ...claudeConfig, prompt: 'keep-me', enabled: true })
+  const result = await schedule.syncSchedules({
     scope: 'all',
     schedule: normalizeScheduleStructure({
       frequency: 'hourly',
@@ -202,9 +202,9 @@ test('sync overwrites schedule only and creates disabled plans with default dial
   assert.equal(created.reasoning_effort, 'medium')
 })
 
-test('default template persists schedule structure only', () => {
+test('default template persists schedule structure only', async () => {
   const { schedule } = runner()
-  const saved = schedule.saveDefaultTemplate({
+  const saved = await schedule.saveDefaultTemplate({
     frequency: 'weekly',
     time: '10:15',
     weekdays: [5],
@@ -212,7 +212,7 @@ test('default template persists schedule structure only', () => {
   })
   assert.equal(saved.frequency, 'weekly')
   assert.deepEqual(schedule.getDefaultTemplate(), saved)
-  schedule.clearDefaultTemplate()
+  await schedule.clearDefaultTemplate()
   assert.equal(schedule.getDefaultTemplate(), null)
 })
 
@@ -231,12 +231,12 @@ test('unparseable stored cron surfaces parse_error without exposing cron string'
   assert.equal(view.cron, undefined)
 })
 
-test('sync with test copies switch and dialog to every slot of the same kind', () => {
+test('sync with test copies switch and dialog to every slot of the same kind', async () => {
   const codexVm = { id: 'vm-02', platform: 'openai' }
   const otherClaude = { id: 'vm-03', platform: 'anthropic' }
   const { settings, schedule } = runner({ list: () => [claudeVm, codexVm, otherClaude] })
-  schedule.save('vm-01', { ...claudeConfig, enabled: false })
-  schedule.save('vm-02', {
+  await schedule.save('vm-01', { ...claudeConfig, enabled: false })
+  await schedule.save('vm-02', {
     enabled: false,
     frequency: 'daily',
     time: '08:00',
@@ -246,7 +246,7 @@ test('sync with test copies switch and dialog to every slot of the same kind', (
     max_tokens: null,
     reasoning_effort: 'low',
   })
-  const result = schedule.syncSchedules({
+  const result = await schedule.syncSchedules({
     scope: 'all',
     schedule: normalizeScheduleStructure({ frequency: 'hourly', minute: 0, timezone: 'Asia/Shanghai' }),
     test: { enabled: true, model: 'claude-haiku-5-5', prompt: 'ping', max_tokens: 32 },
@@ -267,7 +267,7 @@ test('sync with test copies switch and dialog to every slot of the same kind', (
   assert.equal(codex.reasoning_effort, 'low')
   assert.equal(codex.max_tokens, null)
 
-  schedule.syncSchedules({
+  await schedule.syncSchedules({
     scope: 'all',
     schedule: normalizeScheduleStructure({ frequency: 'hourly', minute: 0, timezone: 'Asia/Shanghai' }),
     test: { enabled: false, model: 'claude-haiku-5-5', prompt: 'ping', max_tokens: 32 },
@@ -277,22 +277,86 @@ test('sync with test copies switch and dialog to every slot of the same kind', (
   }
 })
 
-test('sync with an invalid test writes nothing', () => {
+test('sync with an invalid test writes nothing', async () => {
   const { settings, schedule } = runner({ list: () => [claudeVm, { id: 'vm-03', platform: 'anthropic' }] })
-  schedule.save('vm-01', { ...claudeConfig, enabled: false })
+  await schedule.save('vm-01', { ...claudeConfig, enabled: false })
   const before = settings.all()
   for (const test of [
     { enabled: 'yes', model: 'm', prompt: 'p', max_tokens: 1 },
     { enabled: true, model: '', prompt: 'p', max_tokens: 1 },
     { enabled: true, model: 'm', prompt: 'p' },
   ]) {
-    assert.throws(() =>
-      schedule.syncSchedules({
-        scope: 'all',
-        schedule: normalizeScheduleStructure({ frequency: 'hourly', minute: 0, timezone: 'Asia/Shanghai' }),
-        test,
-      }),
+    await assert.rejects(
+      async () =>
+        await schedule.syncSchedules({
+          scope: 'all',
+          schedule: normalizeScheduleStructure({ frequency: 'hourly', minute: 0, timezone: 'Asia/Shanghai' }),
+          test,
+        }),
     )
   }
   assert.deepEqual(settings.all(), before)
+})
+
+test('flush waits until a scheduled result finishes persisting', async () => {
+  const { settings, schedule } = runner()
+  await schedule.save('vm-01', claudeConfig)
+  schedule.started = true
+  let release
+  let entered
+  const gate = new Promise((resolve) => {
+    release = resolve
+  })
+  const writing = new Promise((resolve) => {
+    entered = resolve
+  })
+  const originalSet = settings.set.bind(settings)
+  settings.set = async (...args) => {
+    entered()
+    await gate
+    return originalSet(...args)
+  }
+  const run = schedule._run('vm-01')
+  await writing
+  let flushed = false
+  const flush = schedule.flush().then(() => {
+    flushed = true
+  })
+  try {
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(flushed, false, 'the scheduled result is still being written')
+  } finally {
+    release()
+    await run
+    await flush
+    schedule.stop()
+  }
+})
+
+test('flush reports a failed scheduled result write', async () => {
+  const { settings, schedule } = runner()
+  await schedule.save('vm-01', claudeConfig)
+  schedule.started = true
+  const failure = new Error('synthetic scheduled result write failure')
+  let release
+  let entered
+  const gate = new Promise((resolve) => {
+    release = resolve
+  })
+  const writing = new Promise((resolve) => {
+    entered = resolve
+  })
+  settings.set = async () => {
+    entered()
+    await gate
+    throw failure
+  }
+  const run = schedule._run('vm-01')
+  run.catch(() => {})
+  await writing
+  const flush = schedule.flush()
+  release()
+  await assert.rejects(run, (error) => error === failure)
+  await assert.rejects(flush, (error) => error === failure)
+  schedule.stop()
 })

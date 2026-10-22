@@ -77,12 +77,16 @@ export class SeatPlanner {
     /** Read at use time: the scheduler owns `sticky_wait_timeout_ms` and hot-reloads it. */
     stickyWaitMs = () => 45_000,
     onChange = null,
+    asyncGrants = false,
   } = {}) {
     this.graceMs = graceMs
     this.reservePct = reservePct
     this.strategy = normalizeSeatStrategy(strategy)
     this.stickyWaitMs = stickyWaitMs
     this.onChange = onChange
+    this.asyncGrants = asyncGrants
+    this.tasks = new Set()
+    this.failure = null
     /** @type {Map<string, object>} seatKey → live seat */
     this.seats = new Map()
     /** @type {Map<string, Map<number, object>>} vmId → index → seat */
@@ -147,7 +151,7 @@ export class SeatPlanner {
     return (this.vmQueues.get(String(vmId)) || []).some((ticket) => ticket.kind === 'conc')
   }
 
-  open(seatKey, { vmId, accountId = null, cap = 0 }) {
+  open(seatKey, { vmId, accountId = null, cap = 0, index = null }) {
     const key = String(seatKey)
     const id = String(vmId)
     let book = this.byVm.get(id)
@@ -155,10 +159,19 @@ export class SeatPlanner {
       book = new Map()
       this.byVm.set(id, book)
     }
-    let index = 0
-    while (book.has(index)) index += 1
-    const seat = { seatKey: key, vmId: id, accountId, index, inflight: 0, graceUntil: null, timer: null, live: true }
-    book.set(index, seat)
+    let slotIndex = index ?? 0
+    if (index == null) while (book.has(slotIndex)) slotIndex += 1
+    const seat = {
+      seatKey: key,
+      vmId: id,
+      accountId,
+      index: slotIndex,
+      inflight: 0,
+      graceUntil: null,
+      timer: null,
+      live: true,
+    }
+    book.set(slotIndex, seat)
     this.seats.set(key, seat)
     if (cap) this.noteCap(id, cap)
     this.rehome(key, id)
@@ -331,6 +344,7 @@ export class SeatPlanner {
    * waiting for a seat here, then the first global tickets that accept it.
    */
   pump(vmId) {
+    if (this.asyncGrants) return this.pumpAsync(vmId)
     const id = String(vmId || '')
     if (!id) return
     this.dirty.add(id)
@@ -351,6 +365,82 @@ export class SeatPlanner {
     const ids = new Set([...this.vmQueues.keys(), ...this.byVm.keys()])
     for (const ticket of this.globalQueue) for (const vmId of ticket.vmIds?.() || []) ids.add(vmId)
     for (const id of ids) this.pump(id)
+  }
+
+  track(operation) {
+    const task = Promise.resolve(operation)
+    this.tasks.add(task)
+    task.then(
+      () => this.tasks.delete(task),
+      (error) => {
+        this.failure ||= error
+        this.tasks.delete(task)
+      },
+    )
+    return task
+  }
+
+  async flush() {
+    while (this.tasks.size) await Promise.allSettled([...this.tasks])
+    if (this.failure) throw this.failure
+  }
+
+  pumpAsync(vmId) {
+    const id = String(vmId || '')
+    if (!id) return Promise.resolve()
+    this.dirty.add(id)
+    if (this.pumping) return this.pumpingTask
+    this.pumping = true
+    this.pumpingTask = this.track(
+      (async () => {
+        try {
+          while (this.dirty.size) {
+            const next = this.dirty.values().next().value
+            this.dirty.delete(next)
+            await this.pumpOneAsync(next)
+          }
+        } finally {
+          this.pumping = false
+        }
+      })(),
+    )
+    return this.pumpingTask
+  }
+
+  async pumpOneAsync(vmId) {
+    for (const kind of ['conc', 'seat']) {
+      for (const ticket of [...(this.vmQueues.get(vmId) || [])]) {
+        if (!ticket.queued || ticket.kind !== kind) continue
+        if (!(await this.grantAsync(ticket, vmId))) break
+      }
+    }
+    for (const ticket of [...this.globalQueue]) {
+      if (!ticket.queued || !ticket.accepts(vmId)) continue
+      await this.grantAsync(ticket, vmId)
+    }
+  }
+
+  async grantAsync(ticket, vmId) {
+    let result
+    try {
+      result = await ticket.tryGrant(vmId)
+    } catch (error) {
+      ticket.error = error
+      ticket.wake?.()
+      throw error
+    }
+    if (!result) return false
+    const granted = typeof result === 'object' ? result : ticket.granted
+    if (!ticket.queued || (Number.isFinite(ticket.deadline) && Date.now() >= ticket.deadline)) {
+      ticket.granted = null
+      await granted?.reservation?.release?.()
+      return false
+    }
+    ticket.granted = granted
+    this.unlink(ticket)
+    this.changed()
+    ticket.wake?.()
+    return true
   }
 
   pumpOne(vmId) {

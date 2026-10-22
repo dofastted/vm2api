@@ -10,6 +10,7 @@ import {
   countUserCreatedVms,
   filterVmsForPanel,
   ownerScopeFromApiKey,
+  ownerScopeFromRequest,
   vmMatchesOwnerScope,
 } from '../../src/lib/admin/resource-owner.mjs'
 
@@ -62,4 +63,13 @@ test('unassign origin and proxy bind rules', () => {
   assert.equal(canBindProxyToVm({ owner_user_id: 'u1' }, { owner_user_id: 'u1' }, { role: 'user' }), true)
   assert.equal(canBindProxyToVm({ owner_user_id: 'u1' }, {}, { role: 'admin' }), false)
   assert.equal(canBindProxyToVm({}, { owner_user_id: 'u1' }, { role: 'admin' }), true)
+})
+
+test('request ownership waits for the asynchronous owner role lookup', async () => {
+  const request = { apiKeyKind: 'managed', apiKeyRecord: { user_id: 'owner' } }
+  assert.deepEqual(await ownerScopeFromRequest(request, { getById: async () => ({ role: 'admin' }) }), PLATFORM_SCOPE)
+  assert.deepEqual(await ownerScopeFromRequest(request, { getById: async () => ({ role: 'user' }) }), {
+    type: 'user',
+    userId: 'owner',
+  })
 })

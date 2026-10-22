@@ -128,9 +128,9 @@ test('hard regex blocks jailbreak and crack, not ordinary debugging', () => {
   assert.equal(matchHardPolicy('explain the difference between phishing and spam for a security class'), null)
 })
 
-test('saved rules replace the builtins and a bad regex is rejected', () => {
+test('saved rules replace the builtins and a bad regex is rejected', async () => {
   let saved = null
-  const patched = applyJevPatch(
+  const patched = await applyJevPatch(
     {
       get: () => null,
       set: (_key, value) => {
@@ -143,11 +143,11 @@ test('saved rules replace the builtins and a bad regex is rejected', () => {
   assert.equal(patched.config.rules_customized, true)
   assert.equal(matchHardPolicy('feat vmpanel-keygen', [], saved.rules).keyword, 'vmpanel')
   assert.equal(matchHardPolicy('write a keygen', [], saved.rules), null)
-  const bad = applyJevPatch({ get: () => null, set() {} }, { rules: [{ category: 'custom', source: '(' }] })
+  const bad = await applyJevPatch({ get: () => null, set() {} }, { rules: [{ category: 'custom', source: '(' }] })
   assert.equal(bad.ok, false)
 })
 
-test('an empty rule list falls back to the builtins instead of clearing the layer', () => {
+test('an empty rule list falls back to the builtins instead of clearing the layer', async () => {
   let saved = null
   const settings = {
     get: () => null,
@@ -156,7 +156,7 @@ test('an empty rule list falls back to the builtins instead of clearing the laye
     },
   }
   assert.equal(normalizeJevConfig({ rules: [] }).rules, null)
-  const patched = applyJevPatch(settings, { rules: [] })
+  const patched = await applyJevPatch(settings, { rules: [] })
   assert.equal(patched.ok, true)
   assert.equal(patched.config.rules_customized, false)
   assert.equal(patched.config.rules.length, builtinHardRules().length)
@@ -165,7 +165,7 @@ test('an empty rule list falls back to the builtins instead of clearing the laye
     'jailbreak',
   )
   // The panel can still turn the layer off with its own switch.
-  const off = applyJevPatch(settings, { hard_regex_enabled: false })
+  const off = await applyJevPatch(settings, { hard_regex_enabled: false })
   assert.equal(off.config.hard_regex_enabled, false)
   assert.equal(saved.rules, null)
 })
@@ -339,23 +339,30 @@ test('content-policy error codes are refusals; generic api errors are not', () =
   assert.equal(isUpstreamRefusal({ body: { error: { code: 'distill_blocked', message: '不允许蒸馏' } } }), false)
 })
 
-test('panel patch keeps a stored key unless cleared', () => {
+test('panel patch keeps a stored key unless cleared', async () => {
   const saved = new Map()
   const settings = {
     get: (key, fallback) => (saved.has(key) ? saved.get(key) : fallback),
     set: (key, value) => saved.set(key, value),
   }
   assert.equal(
-    applyJevPatch(settings, { enabled: true, base_url: 'http://127.0.0.1:9/v1', model: 'jev', api_key: 'secret' }).ok,
+    (
+      await applyJevPatch(settings, {
+        enabled: true,
+        base_url: 'http://127.0.0.1:9/v1',
+        model: 'jev',
+        api_key: 'secret',
+      })
+    ).ok,
     true,
   )
-  const kept = applyJevPatch(settings, { timeout_ms: 1500 })
+  const kept = await applyJevPatch(settings, { timeout_ms: 1500 })
   assert.equal(kept.ok, true)
   assert.equal(kept.config.api_key_set, true)
   const stored = saved.get('jev_intercept')
   assert.equal(publicJevConfig(stored).api_key_set, true)
   assert.equal(stored.api_key, 'secret')
-  assert.equal(applyJevPatch(settings, { api_key: '' }).config.api_key_set, false)
+  assert.equal((await applyJevPatch(settings, { api_key: '' })).config.api_key_set, false)
   assert.equal(validateJevPatch({ timeout_ms: 10 }).length, 1)
 })
 
@@ -763,7 +770,10 @@ test('401 retires that key until the key list is saved again', async () => {
       settings.value = value
     },
   }
-  assert.equal(applyJevPatch(settings, { api_keys: ['k-auth-retire'], base_url: cfg.base_url, enabled: true }).ok, true)
+  assert.equal(
+    (await applyJevPatch(settings, { api_keys: ['k-auth-retire'], base_url: cfg.base_url, enabled: true })).ok,
+    true,
+  )
   let retried = 0
   await classifyJev('retire-auth-3', { ...cfg, api_keys: ['k-auth-retire'] }, async () => {
     retried += 1

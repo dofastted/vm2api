@@ -1,0 +1,656 @@
+{
+  "verified_commit": "3054bfa0",
+  "production_code_commit": "6aa877de",
+  "verification_started_commit": "4ad444d7",
+  "baseline_commit": "eee8f6e",
+  "normalization": "Exact error/assertion body comparison after removing blank lines and stack frames; timing is outside the compared body.",
+  "suites": {
+    "unit": {
+      "verified_commit": "4ad444d7",
+      "log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/unit-final.log",
+      "log_complete": true,
+      "assertion_failed_file_count": 2,
+      "runner_summary": [
+        "2",
+        "281"
+      ],
+      "infrastructure_failures": [],
+      "failed_file_count": 2,
+      "failed_test_count": 7,
+      "assertion_failed_test_count": 7,
+      "runner_failed_record_count": 7,
+      "same_assertion_count": 7,
+      "all_assertion_failures_match_baseline": true,
+      "all_failures_match_baseline": true,
+      "files": [
+        {
+          "file": "test/unit/cli-hop-body.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-cli-hop-body.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "prepareCliHopBody drops metadata and CLI-owned system but keeps official agent leftover",
+              "test_line": 16,
+              "current_log_line": 767,
+              "baseline_log_line": 38,
+              "same_assertion": true,
+              "assertion_sha256": "4e6c294bbe40bd85115a154e355bc81e5b21e3e781d2e0dcd1feafcd85a57181",
+              "baseline_assertion_sha256": "4e6c294bbe40bd85115a154e355bc81e5b21e3e781d2e0dcd1feafcd85a57181"
+            },
+            {
+              "name": "every cli-hop system becomes the identity plus the caller body",
+              "test_line": 41,
+              "current_log_line": 786,
+              "baseline_log_line": 57,
+              "same_assertion": true,
+              "assertion_sha256": "a81c34c8c33c94dae4bef4af01c4db186fa7431766e106dedb0c93fac4a3f55b",
+              "baseline_assertion_sha256": "a81c34c8c33c94dae4bef4af01c4db186fa7431766e106dedb0c93fac4a3f55b"
+            },
+            {
+              "name": "cli-hop normalizes mixed caller markers to the official template",
+              "test_line": 63,
+              "current_log_line": 811,
+              "baseline_log_line": 82,
+              "same_assertion": true,
+              "assertion_sha256": "a81c34c8c33c94dae4bef4af01c4db186fa7431766e106dedb0c93fac4a3f55b",
+              "baseline_assertion_sha256": "a81c34c8c33c94dae4bef4af01c4db186fa7431766e106dedb0c93fac4a3f55b"
+            },
+            {
+              "name": "cli-hop drops caller system/tools markers and restamps last plus penultimate user",
+              "test_line": 357,
+              "current_log_line": 836,
+              "baseline_log_line": 107,
+              "same_assertion": true,
+              "assertion_sha256": "e37b9c82cfabec8b2d18adaf338ef1368f30e11e38cd9e46c5f5d2d212ec2d11",
+              "baseline_assertion_sha256": "e37b9c82cfabec8b2d18adaf338ef1368f30e11e38cd9e46c5f5d2d212ec2d11"
+            },
+            {
+              "name": "cli-hop short history only marks the last message",
+              "test_line": 381,
+              "current_log_line": 861,
+              "baseline_log_line": 132,
+              "same_assertion": true,
+              "assertion_sha256": "f68c71379df4d2ba7748acb814268e5f1dcc6590c86098766cf66043bb9fdf9d",
+              "baseline_assertion_sha256": "f68c71379df4d2ba7748acb814268e5f1dcc6590c86098766cf66043bb9fdf9d"
+            },
+            {
+              "name": "cli-hop uses the inbound session TTL on both message anchors",
+              "test_line": 421,
+              "current_log_line": 891,
+              "baseline_log_line": 162,
+              "same_assertion": true,
+              "assertion_sha256": "5044751390e94cf06d620d10ac9c06e61d7a6a9d27b67bf37eb9711fa14b24ca",
+              "baseline_assertion_sha256": "5044751390e94cf06d620d10ac9c06e61d7a6a9d27b67bf37eb9711fa14b24ca"
+            }
+          ]
+        },
+        {
+          "file": "test/unit/convert-cache-shape.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-convert-cache-shape.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "openai.chat multi-turn cli-hop marks last and penultimate user",
+              "test_line": 141,
+              "current_log_line": 1416,
+              "baseline_log_line": 15,
+              "same_assertion": true,
+              "assertion_sha256": "a81c34c8c33c94dae4bef4af01c4db186fa7431766e106dedb0c93fac4a3f55b",
+              "baseline_assertion_sha256": "a81c34c8c33c94dae4bef4af01c4db186fa7431766e106dedb0c93fac4a3f55b"
+            }
+          ]
+        }
+      ]
+    },
+    "e2e": {
+      "verified_commit": "3054bfa0",
+      "log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/e2e-complete.log",
+      "log_complete": true,
+      "assertion_failed_file_count": 11,
+      "runner_summary": [
+        "11",
+        "26"
+      ],
+      "infrastructure_failures": [],
+      "failed_file_count": 11,
+      "failed_test_count": 17,
+      "assertion_failed_test_count": 17,
+      "runner_failed_record_count": 17,
+      "same_assertion_count": 17,
+      "all_assertion_failures_match_baseline": true,
+      "all_failures_match_baseline": true,
+      "files": [
+        {
+          "file": "test/e2e/account-pool-failover.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-account-pool-failover.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "account1 quota exhaustion rotates to account2 and commits sticky final account",
+              "test_line": 10,
+              "current_log_line": 15,
+              "baseline_log_line": 15,
+              "same_assertion": true,
+              "assertion_sha256": "b94b33d5b07ef7a98da1199dde49d3bb8be79daed51ca7d5c01ce3002d3e4811",
+              "baseline_assertion_sha256": "b94b33d5b07ef7a98da1199dde49d3bb8be79daed51ca7d5c01ce3002d3e4811"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/auto-mode.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-auto-mode.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "classifier terminal/error/cancel/concurrency boundaries through actual ELF",
+              "test_line": 497,
+              "current_log_line": 54,
+              "baseline_log_line": 18,
+              "same_assertion": true,
+              "assertion_sha256": "e736744c0afda8b9160312af46c31dfde85514afaf09a5d1a97575b09101da15",
+              "baseline_assertion_sha256": "e736744c0afda8b9160312af46c31dfde85514afaf09a5d1a97575b09101da15"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/completions.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-completions.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "POST /v1/completions old OpenAI prompt format",
+              "test_line": 8,
+              "current_log_line": 116,
+              "baseline_log_line": 14,
+              "same_assertion": true,
+              "assertion_sha256": "5bff2f11fcb7ad2b0c71a78cf620dc3070ecddd3a78d954956a32c006ff887f4",
+              "baseline_assertion_sha256": "5bff2f11fcb7ad2b0c71a78cf620dc3070ecddd3a78d954956a32c006ff887f4"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/credentials.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-credentials.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "reset destroys home and recreates the same slot without oauth",
+              "test_line": 70,
+              "current_log_line": 167,
+              "baseline_log_line": 16,
+              "same_assertion": true,
+              "assertion_sha256": "5e6c5a7d2769e0e83c04a4a727c75808b0e1592375b77a815a02b9677de5c477",
+              "baseline_assertion_sha256": "5e6c5a7d2769e0e83c04a4a727c75808b0e1592375b77a815a02b9677de5c477"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/crs-default.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-crs-default.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "default POST /v1/messages uses Go worker pool, not CLI",
+              "test_line": 8,
+              "current_log_line": 198,
+              "baseline_log_line": 15,
+              "same_assertion": true,
+              "assertion_sha256": "5bff2f11fcb7ad2b0c71a78cf620dc3070ecddd3a78d954956a32c006ff887f4",
+              "baseline_assertion_sha256": "5bff2f11fcb7ad2b0c71a78cf620dc3070ecddd3a78d954956a32c006ff887f4"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/errors.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-errors.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "unknown model is rejected without hop",
+              "test_line": 32,
+              "current_log_line": 231,
+              "baseline_log_line": 17,
+              "same_assertion": true,
+              "assertion_sha256": "6a63caf64d29521ed813c597ef288b59270dd6cd3789d4c2a11fe430f2ef95f3",
+              "baseline_assertion_sha256": "6a63caf64d29521ed813c597ef288b59270dd6cd3789d4c2a11fe430f2ef95f3"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/health.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-health.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "harness /health 200 and honest capabilities",
+              "test_line": 5,
+              "current_log_line": 262,
+              "baseline_log_line": 15,
+              "same_assertion": true,
+              "assertion_sha256": "858fac7a2bd27316ba43e74a56d0ae6e0bcf45a553d8ecc3da006bfc0a768afb",
+              "baseline_assertion_sha256": "858fac7a2bd27316ba43e74a56d0ae6e0bcf45a553d8ecc3da006bfc0a768afb"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/hermes.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-hermes.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "Hermes unofficial: Go relay keeps persona/tools and never launches CLI",
+              "test_line": 15,
+              "current_log_line": 292,
+              "baseline_log_line": 14,
+              "same_assertion": true,
+              "assertion_sha256": "fc9f564f4db729f7ec444eca13379843ea4c861646e4d21c6c7fdac8b629e390",
+              "baseline_assertion_sha256": "fc9f564f4db729f7ec444eca13379843ea4c861646e4d21c6c7fdac8b629e390"
+            },
+            {
+              "name": "Hermes system blob without UA still classifies as hermes",
+              "test_line": 53,
+              "current_log_line": 355,
+              "baseline_log_line": 77,
+              "same_assertion": true,
+              "assertion_sha256": "1c1ddb4f06cf94c9408f62e32d5a13a572bceccc1b0acdb5eb9f04acb2a8538b",
+              "baseline_assertion_sha256": "1c1ddb4f06cf94c9408f62e32d5a13a572bceccc1b0acdb5eb9f04acb2a8538b"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/hop-meta.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-hop-meta.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "CRS default keeps thinking + max_tokens + temperature in official body",
+              "test_line": 8,
+              "current_log_line": 431,
+              "baseline_log_line": 15,
+              "same_assertion": true,
+              "assertion_sha256": "9a16b07bbe941aca1d5d3d2cac804b9f432fea6f74a28b38cceaadabc1af53a4",
+              "baseline_assertion_sha256": "9a16b07bbe941aca1d5d3d2cac804b9f432fea6f74a28b38cceaadabc1af53a4"
+            },
+            {
+              "name": "CRS keeps a long caller system in the structured official prompt",
+              "test_line": 31,
+              "current_log_line": 449,
+              "baseline_log_line": 33,
+              "same_assertion": true,
+              "assertion_sha256": "d435dea7913cfa24178f66420d521003431251d6b764517887968b26f123a027",
+              "baseline_assertion_sha256": "d435dea7913cfa24178f66420d521003431251d6b764517887968b26f123a027"
+            },
+            {
+              "name": "legacy CLI selector cannot drop HTTP request parameters",
+              "test_line": 61,
+              "current_log_line": 467,
+              "baseline_log_line": 51,
+              "same_assertion": true,
+              "assertion_sha256": "9a16b07bbe941aca1d5d3d2cac804b9f432fea6f74a28b38cceaadabc1af53a4",
+              "baseline_assertion_sha256": "9a16b07bbe941aca1d5d3d2cac804b9f432fea6f74a28b38cceaadabc1af53a4"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/messages.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-messages.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "HTTP worker preserves thinking, sampling and max_tokens",
+              "test_line": 114,
+              "current_log_line": 524,
+              "baseline_log_line": 20,
+              "same_assertion": true,
+              "assertion_sha256": "0af5a9fd20a0a5f8cdfa29b648678f9284a376f484b82d04a1a0230bdf6aa41b",
+              "baseline_assertion_sha256": "0af5a9fd20a0a5f8cdfa29b648678f9284a376f484b82d04a1a0230bdf6aa41b"
+            },
+            {
+              "name": "HTTP path preserves long system without CLI argv truncation",
+              "test_line": 189,
+              "current_log_line": 548,
+              "baseline_log_line": 44,
+              "same_assertion": true,
+              "assertion_sha256": "5af4ac27ac1e335b2217102a235b4901fbcf18d33188d54a12497261e6e87049",
+              "baseline_assertion_sha256": "5af4ac27ac1e335b2217102a235b4901fbcf18d33188d54a12497261e6e87049"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/openai-responses.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-openai-responses.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "POST /v1/responses non-stream shape: object + output_text + usage",
+              "test_line": 7,
+              "current_log_line": 593,
+              "baseline_log_line": 15,
+              "same_assertion": true,
+              "assertion_sha256": "152e5bc121c8a068b2003c5d9e4ce943560281dba6f96f1b238eb1b3e89a2eb7",
+              "baseline_assertion_sha256": "152e5bc121c8a068b2003c5d9e4ce943560281dba6f96f1b238eb1b3e89a2eb7"
+            },
+            {
+              "name": "POST /v1/responses stream includes [DONE]",
+              "test_line": 32,
+              "current_log_line": 611,
+              "baseline_log_line": 33,
+              "same_assertion": true,
+              "assertion_sha256": "017b08bb23fcae3cb2a5bb334bf68a032eedf15572fce0c3f585154b3b940833",
+              "baseline_assertion_sha256": "017b08bb23fcae3cb2a5bb334bf68a032eedf15572fce0c3f585154b3b940833"
+            },
+            {
+              "name": "POST /v1/responses tools → function_call in output",
+              "test_line": 52,
+              "current_log_line": 629,
+              "baseline_log_line": 51,
+              "same_assertion": true,
+              "assertion_sha256": "152e5bc121c8a068b2003c5d9e4ce943560281dba6f96f1b238eb1b3e89a2eb7",
+              "baseline_assertion_sha256": "152e5bc121c8a068b2003c5d9e4ce943560281dba6f96f1b238eb1b3e89a2eb7"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "all_assertion_failures_match_baseline": true,
+  "all_failures_match_baseline": true,
+  "previous_attempts": [
+    {
+      "verified_commit": "4ad444d7",
+      "log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/e2e-final.log",
+      "failed_file_count": 12,
+      "failed_test_count": 19,
+      "baseline_matched_file_count": 11,
+      "baseline_matched_test_count": 17,
+      "additional_failures": [
+        {
+          "file": "test/e2e/panel-api.e2e.test.mjs",
+          "name": "sessionKey import rejected when bound proxy is dead",
+          "actual_status": 503,
+          "expected_status": 200,
+          "classification": "scheduled_backup_maintenance_interference"
+        },
+        {
+          "file": "test/e2e/panel-api.e2e.test.mjs",
+          "name": "local egress slot generates auth url and exchanges code",
+          "actual_status": 503,
+          "expected_status": 200,
+          "classification": "scheduled_backup_maintenance_interference"
+        }
+      ],
+      "diagnostic_logs": [
+        "/tmp/vm2api-pg-implementation/panel-maintenance-diagnostic.log",
+        "/tmp/vm2api-pg-implementation/panel-local-maintenance-diagnostic.log"
+      ]
+    },
+    {
+      "verified_commit": "6aa877de",
+      "log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/e2e-final-isolated.log",
+      "log_complete": true,
+      "assertion_failed_file_count": 11,
+      "runner_summary": [
+        "12",
+        "26"
+      ],
+      "infrastructure_failures": [
+        {
+          "file": "test/e2e/backup.e2e.test.mjs",
+          "name": "test/e2e/backup.e2e.test.mjs",
+          "current_log_line": 96,
+          "classification": "file_level_timeout_after_business_cases_passed",
+          "cause": "under_investigation",
+          "error": "  'Promise resolution is still pending but the event loop has already resolved'"
+        }
+      ],
+      "failed_file_count": 11,
+      "failed_test_count": 17,
+      "assertion_failed_test_count": 17,
+      "runner_failed_record_count": 18,
+      "same_assertion_count": 17,
+      "all_assertion_failures_match_baseline": true,
+      "all_failures_match_baseline": false,
+      "files": [
+        {
+          "file": "test/e2e/account-pool-failover.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-account-pool-failover.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "account1 quota exhaustion rotates to account2 and commits sticky final account",
+              "test_line": 10,
+              "current_log_line": 15,
+              "baseline_log_line": 15,
+              "same_assertion": true,
+              "assertion_sha256": "b94b33d5b07ef7a98da1199dde49d3bb8be79daed51ca7d5c01ce3002d3e4811",
+              "baseline_assertion_sha256": "b94b33d5b07ef7a98da1199dde49d3bb8be79daed51ca7d5c01ce3002d3e4811"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/auto-mode.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-auto-mode.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "classifier terminal/error/cancel/concurrency boundaries through actual ELF",
+              "test_line": 497,
+              "current_log_line": 54,
+              "baseline_log_line": 18,
+              "same_assertion": true,
+              "assertion_sha256": "e736744c0afda8b9160312af46c31dfde85514afaf09a5d1a97575b09101da15",
+              "baseline_assertion_sha256": "e736744c0afda8b9160312af46c31dfde85514afaf09a5d1a97575b09101da15"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/completions.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-completions.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "POST /v1/completions old OpenAI prompt format",
+              "test_line": 8,
+              "current_log_line": 128,
+              "baseline_log_line": 14,
+              "same_assertion": true,
+              "assertion_sha256": "5bff2f11fcb7ad2b0c71a78cf620dc3070ecddd3a78d954956a32c006ff887f4",
+              "baseline_assertion_sha256": "5bff2f11fcb7ad2b0c71a78cf620dc3070ecddd3a78d954956a32c006ff887f4"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/credentials.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-credentials.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "reset destroys home and recreates the same slot without oauth",
+              "test_line": 70,
+              "current_log_line": 179,
+              "baseline_log_line": 16,
+              "same_assertion": true,
+              "assertion_sha256": "5e6c5a7d2769e0e83c04a4a727c75808b0e1592375b77a815a02b9677de5c477",
+              "baseline_assertion_sha256": "5e6c5a7d2769e0e83c04a4a727c75808b0e1592375b77a815a02b9677de5c477"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/crs-default.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-crs-default.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "default POST /v1/messages uses Go worker pool, not CLI",
+              "test_line": 8,
+              "current_log_line": 210,
+              "baseline_log_line": 15,
+              "same_assertion": true,
+              "assertion_sha256": "5bff2f11fcb7ad2b0c71a78cf620dc3070ecddd3a78d954956a32c006ff887f4",
+              "baseline_assertion_sha256": "5bff2f11fcb7ad2b0c71a78cf620dc3070ecddd3a78d954956a32c006ff887f4"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/errors.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-errors.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "unknown model is rejected without hop",
+              "test_line": 32,
+              "current_log_line": 243,
+              "baseline_log_line": 17,
+              "same_assertion": true,
+              "assertion_sha256": "6a63caf64d29521ed813c597ef288b59270dd6cd3789d4c2a11fe430f2ef95f3",
+              "baseline_assertion_sha256": "6a63caf64d29521ed813c597ef288b59270dd6cd3789d4c2a11fe430f2ef95f3"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/health.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-health.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "harness /health 200 and honest capabilities",
+              "test_line": 5,
+              "current_log_line": 274,
+              "baseline_log_line": 15,
+              "same_assertion": true,
+              "assertion_sha256": "858fac7a2bd27316ba43e74a56d0ae6e0bcf45a553d8ecc3da006bfc0a768afb",
+              "baseline_assertion_sha256": "858fac7a2bd27316ba43e74a56d0ae6e0bcf45a553d8ecc3da006bfc0a768afb"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/hermes.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-hermes.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "Hermes unofficial: Go relay keeps persona/tools and never launches CLI",
+              "test_line": 15,
+              "current_log_line": 304,
+              "baseline_log_line": 14,
+              "same_assertion": true,
+              "assertion_sha256": "fc9f564f4db729f7ec444eca13379843ea4c861646e4d21c6c7fdac8b629e390",
+              "baseline_assertion_sha256": "fc9f564f4db729f7ec444eca13379843ea4c861646e4d21c6c7fdac8b629e390"
+            },
+            {
+              "name": "Hermes system blob without UA still classifies as hermes",
+              "test_line": 53,
+              "current_log_line": 367,
+              "baseline_log_line": 77,
+              "same_assertion": true,
+              "assertion_sha256": "1c1ddb4f06cf94c9408f62e32d5a13a572bceccc1b0acdb5eb9f04acb2a8538b",
+              "baseline_assertion_sha256": "1c1ddb4f06cf94c9408f62e32d5a13a572bceccc1b0acdb5eb9f04acb2a8538b"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/hop-meta.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-hop-meta.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "CRS default keeps thinking + max_tokens + temperature in official body",
+              "test_line": 8,
+              "current_log_line": 443,
+              "baseline_log_line": 15,
+              "same_assertion": true,
+              "assertion_sha256": "9a16b07bbe941aca1d5d3d2cac804b9f432fea6f74a28b38cceaadabc1af53a4",
+              "baseline_assertion_sha256": "9a16b07bbe941aca1d5d3d2cac804b9f432fea6f74a28b38cceaadabc1af53a4"
+            },
+            {
+              "name": "CRS keeps a long caller system in the structured official prompt",
+              "test_line": 31,
+              "current_log_line": 461,
+              "baseline_log_line": 33,
+              "same_assertion": true,
+              "assertion_sha256": "d435dea7913cfa24178f66420d521003431251d6b764517887968b26f123a027",
+              "baseline_assertion_sha256": "d435dea7913cfa24178f66420d521003431251d6b764517887968b26f123a027"
+            },
+            {
+              "name": "legacy CLI selector cannot drop HTTP request parameters",
+              "test_line": 61,
+              "current_log_line": 479,
+              "baseline_log_line": 51,
+              "same_assertion": true,
+              "assertion_sha256": "9a16b07bbe941aca1d5d3d2cac804b9f432fea6f74a28b38cceaadabc1af53a4",
+              "baseline_assertion_sha256": "9a16b07bbe941aca1d5d3d2cac804b9f432fea6f74a28b38cceaadabc1af53a4"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/messages.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-messages.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "HTTP worker preserves thinking, sampling and max_tokens",
+              "test_line": 114,
+              "current_log_line": 536,
+              "baseline_log_line": 20,
+              "same_assertion": true,
+              "assertion_sha256": "0af5a9fd20a0a5f8cdfa29b648678f9284a376f484b82d04a1a0230bdf6aa41b",
+              "baseline_assertion_sha256": "0af5a9fd20a0a5f8cdfa29b648678f9284a376f484b82d04a1a0230bdf6aa41b"
+            },
+            {
+              "name": "HTTP path preserves long system without CLI argv truncation",
+              "test_line": 189,
+              "current_log_line": 560,
+              "baseline_log_line": 44,
+              "same_assertion": true,
+              "assertion_sha256": "5af4ac27ac1e335b2217102a235b4901fbcf18d33188d54a12497261e6e87049",
+              "baseline_assertion_sha256": "5af4ac27ac1e335b2217102a235b4901fbcf18d33188d54a12497261e6e87049"
+            }
+          ]
+        },
+        {
+          "file": "test/e2e/openai-responses.e2e.test.mjs",
+          "baseline_log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/baseline-openai-responses.e2e.test.mjs.log",
+          "same_assertion": true,
+          "tests": [
+            {
+              "name": "POST /v1/responses non-stream shape: object + output_text + usage",
+              "test_line": 7,
+              "current_log_line": 605,
+              "baseline_log_line": 15,
+              "same_assertion": true,
+              "assertion_sha256": "152e5bc121c8a068b2003c5d9e4ce943560281dba6f96f1b238eb1b3e89a2eb7",
+              "baseline_assertion_sha256": "152e5bc121c8a068b2003c5d9e4ce943560281dba6f96f1b238eb1b3e89a2eb7"
+            },
+            {
+              "name": "POST /v1/responses stream includes [DONE]",
+              "test_line": 32,
+              "current_log_line": 623,
+              "baseline_log_line": 33,
+              "same_assertion": true,
+              "assertion_sha256": "017b08bb23fcae3cb2a5bb334bf68a032eedf15572fce0c3f585154b3b940833",
+              "baseline_assertion_sha256": "017b08bb23fcae3cb2a5bb334bf68a032eedf15572fce0c3f585154b3b940833"
+            },
+            {
+              "name": "POST /v1/responses tools → function_call in output",
+              "test_line": 52,
+              "current_log_line": 641,
+              "baseline_log_line": 51,
+              "same_assertion": true,
+              "assertion_sha256": "152e5bc121c8a068b2003c5d9e4ce943560281dba6f96f1b238eb1b3e89a2eb7",
+              "baseline_assertion_sha256": "152e5bc121c8a068b2003c5d9e4ce943560281dba6f96f1b238eb1b3e89a2eb7"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "test_isolation_fix": {
+    "commit": "3054bfa0",
+    "log": "/home/lb/IdeaProjects/vm2api/.tmp/pg-evidence/schema-isolation-final.log",
+    "log_sha256": "95aa62bbd19cb45c9692e7085220cfafb460b7249bfaf7d969f02282b356e3d3",
+    "tests": 40,
+    "passed": 40,
+    "failed": 0,
+    "scope": "Dedicated *_test database with per-test schemas; adjacent schema sentinel retained and writable after restore."
+  }
+}

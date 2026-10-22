@@ -87,7 +87,12 @@ const LIVE_BIN_GUEST = '/opt/kin-guest/opt/kin-live'
 const LIVE_SERVICE_MOUNT_DESTINATIONS = Object.freeze([LIVE_BIN, LIVE_BIN_GUEST])
 
 function failure(err, fallbackCode = 'remote_slot_failed') {
-  return { ok: false, code: err?.code || fallbackCode, error: String(err?.message || err) }
+  return {
+    ok: false,
+    code: err?.code || fallbackCode,
+    error: String(err?.message || err),
+    ...(err?.vmOperationUncertain ? { vmOperationUncertain: true } : {}),
+  }
 }
 
 const MIGRATION_CONFIG_KEYS = Object.freeze([
@@ -532,11 +537,25 @@ export async function setRemoteProxyEgressEnabled(vm, projectRoot, enabled) {
     }
     for (const name of new Set([current, legacy])) {
       const existing = await inspectContainerOrNull(session.docker, name)
-      if (existing?.State?.Running) await containerAction(session.docker, name, 'stop')
+      if (!existing) continue
+      if (!existing.Id) return { ok: false, code: 'egress_container_unknown', vmOperationUncertain: true }
+      if (!remoteContainerStopped(existing)) {
+        try {
+          await containerAction(session.docker, existing.Id, 'stop')
+        } catch {}
+      }
+      const remaining = await inspectContainerOrNull(session.docker, existing.Id)
+      const named = await inspectContainerOrNull(session.docker, name)
+      if (
+        (remaining && !remoteContainerStopped(remaining)) ||
+        (named && (named.Id !== existing.Id || !remoteContainerStopped(named)))
+      ) {
+        return { ok: false, code: 'egress_stop_unconfirmed', vmOperationUncertain: true }
+      }
     }
-    return { ok: true }
+    return { ok: true, ended: true }
   } catch (err) {
-    return failure(err)
+    return { ...failure(err), vmOperationUncertain: true }
   }
 }
 
@@ -1051,7 +1070,8 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
       await removeContainer(session.docker, name)
       existing = null
     }
-    writeWorkerFiles(vm, projectRoot, { transparent: true, routing })
+    const worker = writeWorkerFiles(vm, projectRoot, { transparent: true, routing })
+    await worker?.publication
     ensureGuestMachineIdFile(projectRoot, vm)
     await pushSlotFiles(vm, slotDir, ['run', 'seed'], session)
     if (!existing) await migrateClaudeDir(session, vm, remoteDir)
@@ -1109,7 +1129,8 @@ export async function reloadRemoteSlot(vm, projectRoot, { routing } = {}) {
       return startRemoteSlot(vm, projectRoot, { recreate: !!existing, routing })
     }
     const relays = await clusterManager().ensureSlotRelays(nodeId, vm.id)
-    writeWorkerFiles(vm, projectRoot, { transparent: true, routing })
+    const worker = writeWorkerFiles(vm, projectRoot, { transparent: true, routing })
+    await worker?.publication
     await pushSlotFiles(vm, slotDir, ['run', 'seed'], session)
     await reconcileSlotCredentials(vm, slotDir, session)
     const running = !!existing.State?.Running
@@ -1202,21 +1223,37 @@ export async function restartRemoteServices(vm, projectRoot, { telemetryEnabled 
     const slotDir = path.join(projectRoot, 'vms', vm.id)
     const name = vm.runtime?.container || containerName(vm.id)
     const migration = await migrateRemoteServiceContainers(vm, projectRoot)
-    if (!migration.ok) return migration
+    if (!migration.ok) return { ...migration, vmOperationUncertain: true }
     await pushSlotFiles(vm, slotDir, ['run', 'seed'], session)
-    const target = { ...vm, runtime: { ...(vm.runtime || {}), container: name, type: runtimeKind(vm) } }
-    const stop = 'pkill -TERM -x kin-worker 2>/dev/null || true'
-    await execDetached(session.docker, name, slotExecCmd(target, ['sh', '-c', stop]).Cmd, {
-      user: slotExecCmd(target, ['sh', '-c', stop]).User,
-    })
-    await new Promise((resolve) => setTimeout(resolve, 150))
+    const info = await inspectContainerOrNull(session.docker, name)
+    if (!info?.Id || info.State?.Running !== true || info.State?.Restarting) {
+      return { ok: false, code: 'worker_container_unknown', vmOperationUncertain: true }
+    }
+    const target = { ...vm, runtime: { ...(vm.runtime || {}), container: info.Id, type: runtimeKind(vm) } }
+    const stop = [
+      'pids=$(pgrep -x kin-worker 2>&1); rc=$?',
+      '[ "$rc" -eq 1 ] && [ -z "$pids" ] && exit 0',
+      '[ "$rc" -eq 0 ] || exit 2',
+      'kill -TERM $pids || exit 2',
+      'i=0; while :; do',
+      '  live=$(ps -p "$(echo "$pids" | tr "\\n" "," | sed "s/,$//")" -o pid= 2>&1); rc=$?',
+      '  [ "$rc" -eq 1 ] && [ -z "$live" ] && exit 0',
+      '  [ "$rc" -eq 0 ] || exit 2',
+      '  i=$((i+1)); [ "$i" -ge 25 ] && exit 3; sleep 0.2',
+      'done',
+    ].join('\n')
+    const argv = slotExecArgv(target, ['sh', '-c', stop], { user: slotExecCmd(target, ['true']).User })
+    await runRemote(session.client, ['docker', ...argv].map(shellQuote).join(' '), { timeoutMs: 30_000 })
+    const current = await inspectContainerOrNull(session.docker, name)
+    if (current?.Id !== info.Id) return { ok: false, code: 'worker_container_changed', vmOperationUncertain: true }
     if (telemetryEnabled === true) await startRemoteTelemetry(session.docker, vm, name)
     const image = slotImageSpec(projectRoot, vm.kernel || 'ubuntu-24.04')
     const egress = await ensureRemoteEgress(session, vm, {
       imageRef: image.ref,
       binaryDigest: migration.binary_digest,
     })
-    if (!egress.ok) return { ok: false, error: egress.error, code: egress.code || 'egress_update_failed' }
+    if (!egress.ok)
+      return { ok: false, error: egress.error, code: egress.code || 'egress_update_failed', vmOperationUncertain: true }
     return {
       ok: true,
       action: telemetryEnabled === true ? 'restarted' : 'stopped',
@@ -1225,7 +1262,7 @@ export async function restartRemoteServices(vm, projectRoot, { telemetryEnabled 
       migration: migration.migrated,
     }
   } catch (err) {
-    return failure(err, 'service_update_failed')
+    return { ...failure(err, 'service_update_failed'), vmOperationUncertain: true }
   }
 }
 
@@ -1233,17 +1270,37 @@ export async function stopRemoteSlot(vm) {
   try {
     const session = await nodeSession(vmNodeId(vm))
     const name = containerName(vm.id)
-    const info = await inspectContainerOrNull(session.docker, name)
+    const info = await inspectRemoteStopTarget(session, vm, name)
     if (!info) {
       if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true }
       return { ok: true, action: 'absent', runtime: vm.runtime || null }
     }
+    if (remoteContainerStopped(info)) {
+      vm.runtime = { ...(vm.runtime || {}), pid: null, stopped: true }
+      return { ok: true, action: 'already-stopped', runtime: vm.runtime }
+    }
     const t = isKvmRuntime(vm) || runtimeLabelOf(info) === 'kvm' ? 30 : undefined
-    await containerAction(session.docker, name, 'stop', { t })
+    let commandError
+    try {
+      await containerAction(session.docker, info.Id, 'stop', { t })
+    } catch (error) {
+      commandError = error
+    }
+    const remaining = await inspectContainerOrNull(session.docker, info.Id)
+    const named = await inspectContainerOrNull(session.docker, name)
+    if (
+      (remaining && !remoteContainerStopped(remaining)) ||
+      (named && (named.Id !== info.Id || !remoteContainerStopped(named)))
+    ) {
+      return {
+        ...failure(commandError || new Error('Container termination was not confirmed')),
+        vmOperationUncertain: true,
+      }
+    }
     vm.runtime = { ...(vm.runtime || {}), pid: null, stopped: true }
     return { ok: true, action: 'stopped', runtime: vm.runtime }
   } catch (err) {
-    return failure(err)
+    return { ...failure(err), vmOperationUncertain: true }
   }
 }
 
@@ -1252,9 +1309,22 @@ export async function destroyRemoteSlot(vm) {
   try {
     const session = await nodeSession(vmNodeId(vm))
     const name = containerName(vm.id)
-    const info = await inspectContainerOrNull(session.docker, name)
+    const info = await inspectRemoteStopTarget(session, vm, name)
     if (info) {
-      await removeContainer(session.docker, name)
+      let commandError
+      try {
+        await removeContainer(session.docker, info.Id)
+      } catch (error) {
+        commandError = error
+      }
+      const remaining = await inspectContainerOrNull(session.docker, info.Id)
+      const named = await inspectContainerOrNull(session.docker, name)
+      if (remaining || named) {
+        return {
+          ...failure(commandError || new Error('Container removal was not confirmed')),
+          vmOperationUncertain: true,
+        }
+      }
       await releaseRemoteEgress(session, info.HostConfig?.NetworkMode)
     }
     await removeRemoteSlotDir(vm, session)
@@ -1262,6 +1332,20 @@ export async function destroyRemoteSlot(vm) {
     if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true, removed: true }
     return { ok: true, action: info ? 'removed' : 'absent', runtime: vm.runtime || null }
   } catch (err) {
-    return failure(err)
+    return { ...failure(err), vmOperationUncertain: true }
   }
+}
+
+async function inspectRemoteStopTarget(session, vm, name) {
+  const info =
+    (await inspectContainerOrNull(session.docker, name)) ||
+    (vm.runtime?.container_id ? await inspectContainerOrNull(session.docker, vm.runtime.container_id) : null)
+  if (info && (!info.Id || (vm.runtime?.container_id && vm.runtime.container_id !== info.Id))) {
+    throw new Error('Container identity changed')
+  }
+  return info
+}
+
+function remoteContainerStopped(info) {
+  return info.State?.Running === false && info.State?.Restarting === false && info.State?.Pid === 0
 }

@@ -10,7 +10,13 @@ import {
   restartRustKernel,
   writeKernelConfig,
 } from '../transport/rust-kernel-supervisor.mjs'
-import { ensureCodexKernel, stopCodexKernel, writeCodexKernelConfig } from '../transport/codex-kernel-supervisor.mjs'
+import {
+  ensureCodexKernel,
+  finishCodexRecycle,
+  stopCodexKernel,
+  writeCodexKernelConfig,
+} from '../transport/codex-kernel-supervisor.mjs'
+import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 import { runtimeKind, isKvmRuntime } from './runtime-kind.mjs'
 import { getVm, listVms, isCodexVm, persistVmRuntime } from './vm-registry.mjs'
 import { resolveInferenceEngine } from './slot-engine.mjs'
@@ -62,7 +68,15 @@ export async function startSlotReady(vm, projectRoot, opts = {}) {
 }
 
 export async function stopSlot(vm) {
-  if (isCodexVm(vm)) stopCodexKernel(vm.id)
+  if (isCodexVm(vm)) {
+    const child = stopCodexKernel(vm.id)
+    if (!child && isKubernetesMode()) {
+      return { ok: false, code: 'codex_kernel_owner_unknown', vmOperationUncertain: true }
+    }
+    if (child && !(await finishCodexRecycle(child)).exited) {
+      return { ok: false, code: 'codex_kernel_exit_unconfirmed', vmOperationUncertain: true }
+    }
+  }
   return slotHost(vm).stop(vm)
 }
 

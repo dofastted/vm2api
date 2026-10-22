@@ -608,10 +608,10 @@ test('normalize keeps default fingerprints when omitted', () => {
 test('handleProtocol intercepts before credential hop', () => {
   const src = fs.readFileSync(path.join(root, 'src/lib/protocol/handle-protocol.mjs'), 'utf8')
   const early = src.indexOf('await applyProtocolIntercept(')
-  const codex = src.indexOf('return handleCodexProtocol(')
+  const codex = src.indexOf('await handleCodexProtocol(')
   assert.ok(early > 0 && early < codex)
   const before = src.indexOf("applyIntercept(cfg.intercept.rules, 'before_upstream'")
-  const late = src.indexOf('await applyProtocolIntercept(', early + 1)
+  const late = src.indexOf('await applyProtocolIntercept(', before)
   const api = src.indexOf("inferenceBackend === 'api'")
   assert.ok(before > 0)
   assert.ok(late > before)
