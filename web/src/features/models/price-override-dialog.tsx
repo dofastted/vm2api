@@ -3,6 +3,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import type { Price, PricingEntry } from '@/types/panel-pricing'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
+import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
@@ -30,9 +31,19 @@ type FieldDraft = {
 
 type TierDraft = FieldDraft & { above: string; unpriced: boolean }
 
+type ImageDraft = { input: string; output: string; cache_read: string }
+
 type Draft = FieldDraft & {
   tiers: TierDraft[]
   modes: Partial<Record<ModeKey, FieldDraft | null>>
+  /** GPT Image token band; null when the model has none. */
+  image: ImageDraft | null
+}
+
+/** Anthropic prices `fast`; OpenAI service tiers are flex / priority. */
+const PLATFORM_MODES: Record<'anthropic' | 'openai', ModeKey[]> = {
+  anthropic: ['fast'],
+  openai: ['flex', 'priority'],
 }
 
 const MODE_LABEL: Record<ModeKey, string> = {
@@ -53,6 +64,15 @@ function fromPrice(price: Price | null | undefined): FieldDraft {
     cache_read: String(price.cache_read),
     cache_5m: price.cache_5m == null ? '' : String(price.cache_5m),
     cache_1h: price.cache_1h == null ? '' : String(price.cache_1h),
+  }
+}
+
+function fromImage(price: Price | null | undefined): ImageDraft | null {
+  if (!price?.image) return null
+  return {
+    input: String(price.image.input),
+    output: String(price.image.output),
+    cache_read: String(price.image.cache_read),
   }
 }
 
@@ -84,6 +104,7 @@ function fromEntry(entry: PricingEntry): Draft {
       }
     }),
     modes,
+    image: fromImage(src) || fromImage(entry.effective),
   }
 }
 
@@ -123,6 +144,7 @@ type OverridePrice = {
     flex?: OverridePrice
     priority?: OverridePrice
   }
+  image?: { input: number; output: number; cache_read: number }
 }
 
 function assembleFields(
@@ -172,6 +194,21 @@ function assemblePrice(d: Draft): OverridePrice | { error: string } {
     modes[key] = body
   }
   if (Object.keys(modes).length) base.modes = modes
+  if (d.image) {
+    const filled = [d.image.input, d.image.output, d.image.cache_read].some(
+      (v) => v.trim() !== ''
+    )
+    // All blank: the server keeps the builtin image band for this model.
+    if (filled) {
+      const input = parseReq(d.image.input, '图像 input')
+      if (typeof input === 'object') return input
+      const cache_read = parseReq(d.image.cache_read, '图像 cached input')
+      if (typeof cache_read === 'object') return cache_read
+      const output = parseReq(d.image.output, '图像 output')
+      if (typeof output === 'object') return output
+      base.image = { input, output, cache_read }
+    }
+  }
   return base
 }
 
@@ -186,20 +223,34 @@ function FieldGrid({
   platform: 'anthropic' | 'openai'
   idPrefix: string
 }) {
+  const openai = platform === 'openai'
   function set(key: keyof FieldDraft, raw: string) {
+    // OpenAI has one cache-write rate; keep both stored fields equal.
+    if (openai && key === 'cache_5m') {
+      onChange({ ...value, cache_5m: raw, cache_1h: raw })
+      return
+    }
     onChange({ ...value, [key]: raw })
   }
+  const fields = openai
+    ? ([
+        ['input', 'input', true],
+        ['cache_read', 'cached input', true],
+        ['output', 'output', true],
+        ['cache_5m', 'cache write', false],
+      ] as const)
+    : ([
+        ['input', 'input', true],
+        ['output', 'output', true],
+        ['cache_read', 'cache read', true],
+        ['cache_5m', '5m write', false],
+        ['cache_1h', '1h write', false],
+      ] as const)
   return (
-    <div className='grid gap-2 sm:grid-cols-5'>
-      {(
-        [
-          ['input', 'input', true],
-          ['output', 'output', true],
-          ['cache_read', 'cache read', true],
-          ['cache_5m', '5m write', false],
-          ['cache_1h', '1h write', false],
-        ] as const
-      ).map(([key, label, required]) => (
+    <div
+      className={cn('grid gap-2', openai ? 'sm:grid-cols-4' : 'sm:grid-cols-5')}
+    >
+      {fields.map(([key, label, required]) => (
         <div key={key} className='space-y-1'>
           <Label htmlFor={`${idPrefix}-${key}`} className='text-xs'>
             {label}
@@ -210,9 +261,11 @@ function FieldGrid({
             inputMode='decimal'
             value={value[key]}
             placeholder={
-              key === 'cache_5m' || key === 'cache_1h'
-                ? cacheFillHint(platform, key, value.input)
-                : undefined
+              openai && key === 'cache_5m'
+                ? '缺省 0'
+                : key === 'cache_5m' || key === 'cache_1h'
+                  ? cacheFillHint(platform, key, value.input)
+                  : undefined
             }
             onChange={(e) => set(key, e.target.value)}
           />
@@ -233,7 +286,9 @@ export function PriceOverrideDialog({
 }) {
   const qc = useQueryClient()
   const [draft, setDraft] = useState<Draft>(() =>
-    entry ? fromEntry(entry) : { ...emptyFields(), tiers: [], modes: {} }
+    entry
+      ? fromEntry(entry)
+      : { ...emptyFields(), tiers: [], modes: {}, image: null }
   )
 
   useEffect(() => {
@@ -289,8 +344,10 @@ export function PriceOverrideDialog({
         <DialogHeader>
           <DialogTitle>覆盖价格 · {entry.id}</DialogTitle>
           <DialogDescription>
-            input / output / cache_read 必填（USD / 1M）。cache_5m / cache_1h
-            可空，按平台补全。key {key}
+            {platform === 'openai'
+              ? 'input / cached input / output 必填（USD / 1M），cache write 可空。'
+              : 'input / output / cache_read 必填（USD / 1M），cache_5m / cache_1h 可空，按平台补全。'}{' '}
+            key {key}
           </DialogDescription>
         </DialogHeader>
 
@@ -398,44 +455,91 @@ export function PriceOverrideDialog({
 
           <section className='space-y-3'>
             <h4 className='text-sm font-medium'>
-              档位价（fast / flex / priority）
+              {platform === 'openai'
+                ? '服务档位价（flex / priority）'
+                : '档位价（fast）'}
             </h4>
-            {(['fast', 'flex', 'priority'] as const).map((mode) => {
-              const modeDraft = draft.modes[mode]
-              return (
-                <div key={mode} className='space-y-2'>
-                  <label className='flex items-center gap-2 text-sm'>
-                    <Checkbox
-                      checked={Boolean(modeDraft)}
-                      onCheckedChange={(v) =>
+            {(['fast', 'flex', 'priority'] as const)
+              // An existing price for the other platform's mode stays visible so it is not lost.
+              .filter(
+                (mode) =>
+                  PLATFORM_MODES[platform].includes(mode) || draft.modes[mode]
+              )
+              .map((mode) => {
+                const modeDraft = draft.modes[mode]
+                return (
+                  <div key={mode} className='space-y-2'>
+                    <label className='flex items-center gap-2 text-sm'>
+                      <Checkbox
+                        checked={Boolean(modeDraft)}
+                        onCheckedChange={(v) =>
+                          setDraft({
+                            ...draft,
+                            modes: {
+                              ...draft.modes,
+                              [mode]: v === true ? emptyFields() : null,
+                            },
+                          })
+                        }
+                      />
+                      {MODE_LABEL[mode]}
+                    </label>
+                    {modeDraft ? (
+                      <FieldGrid
+                        idPrefix={mode}
+                        platform={platform}
+                        value={modeDraft}
+                        onChange={(next) =>
+                          setDraft({
+                            ...draft,
+                            modes: { ...draft.modes, [mode]: next },
+                          })
+                        }
+                      />
+                    ) : null}
+                  </div>
+                )
+              })}
+          </section>
+
+          {draft.image ? (
+            <section className='space-y-2'>
+              <h4 className='text-sm font-medium'>图像 token</h4>
+              <p className='text-xs text-muted-foreground'>
+                图像输入 / 输出 token 单价（USD / 1M）；上方基础价只计文本
+                token。全部留空则用内置价。
+              </p>
+              <div className='grid gap-2 sm:grid-cols-3'>
+                {(
+                  [
+                    ['input', 'input'],
+                    ['cache_read', 'cached input'],
+                    ['output', 'output'],
+                  ] as const
+                ).map(([field, label]) => (
+                  <div key={field} className='space-y-1'>
+                    <Label htmlFor={`image-${field}`} className='text-xs'>
+                      {label}
+                    </Label>
+                    <Input
+                      id={`image-${field}`}
+                      inputMode='decimal'
+                      value={draft.image?.[field] ?? ''}
+                      onChange={(e) =>
                         setDraft({
                           ...draft,
-                          modes: {
-                            ...draft.modes,
-                            [mode]: v === true ? emptyFields() : null,
+                          image: {
+                            ...(draft.image as ImageDraft),
+                            [field]: e.target.value,
                           },
                         })
                       }
                     />
-                    {MODE_LABEL[mode]}
-                  </label>
-                  {modeDraft ? (
-                    <FieldGrid
-                      idPrefix={mode}
-                      platform={platform}
-                      value={modeDraft}
-                      onChange={(next) =>
-                        setDraft({
-                          ...draft,
-                          modes: { ...draft.modes, [mode]: next },
-                        })
-                      }
-                    />
-                  ) : null}
-                </div>
-              )
-            })}
-          </section>
+                  </div>
+                ))}
+              </div>
+            </section>
+          ) : null}
         </div>
 
         <DialogFooter className='gap-2 sm:justify-between'>

@@ -26,17 +26,11 @@ import {
 
 type Props = {
   pol: ModelPolicy
-  claudePool?: boolean
   onCatalogMode: (mode: CatalogMode) => void
   onDefaults: (patch: Partial<PolicyDefaults>) => void
 }
 
-export function ModelAdvanced({
-  pol,
-  claudePool = true,
-  onCatalogMode,
-  onDefaults,
-}: Props) {
+export function ModelAdvanced({ pol, onCatalogMode, onDefaults }: Props) {
   const defs = pol.defaults || {}
   const mode = isCatalogMode(pol.catalog_mode)
     ? pol.catalog_mode
@@ -69,20 +63,18 @@ export function ModelAdvanced({
             </SelectContent>
           </Select>
         </Row>
-        {claudePool ? (
-          <Row label='过滤 1M beta'>
-            <div className='flex items-center gap-2'>
-              <Switch
-                checked={defs.strip_context_1m !== false}
-                onCheckedChange={(on) => onDefaults({ strip_context_1m: on })}
-                aria-label='过滤 1M beta'
-              />
-              <span className='text-xs text-muted-foreground'>
-                {defs.strip_context_1m !== false ? '已开启' : '已关闭'}
-              </span>
-            </div>
-          </Row>
-        ) : null}
+        <Row label='过滤 1M beta'>
+          <div className='flex items-center gap-2'>
+            <Switch
+              checked={defs.strip_context_1m !== false}
+              onCheckedChange={(on) => onDefaults({ strip_context_1m: on })}
+              aria-label='过滤 1M beta'
+            />
+            <span className='text-xs text-muted-foreground'>
+              {defs.strip_context_1m !== false ? '已开启' : '已关闭'}
+            </span>
+          </div>
+        </Row>
         <div className='space-y-1'>
           <Label>未入库通配</Label>
           <Textarea
