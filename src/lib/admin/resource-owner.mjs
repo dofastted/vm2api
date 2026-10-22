@@ -51,6 +51,15 @@ export function ownerScopeFromApiKey(record, { apiKeyKind = null, ownerRole = nu
 
 export function ownerScopeFromRequest(req, usersRepo = null) {
   const rec = req?.apiKeyRecord || null
+  // 面板会话没有 apiKeyRecord，必须按会话角色收窄，否则租户会落到平台池
+  if (!rec && req?.panelUser && req?.apiKeyKind !== 'master') {
+    const role = String(req.panelRole || '')
+      .trim()
+      .toLowerCase()
+    if (role === 'admin' || role === 'super') return PLATFORM_SCOPE
+    const userId = normalizeOwnerId(req.panelUserId)
+    return userId ? { type: 'user', userId } : { type: 'none' }
+  }
   let ownerRole = null
   const userId = normalizeOwnerId(rec?.user_id)
   if (userId && usersRepo?.getById) {

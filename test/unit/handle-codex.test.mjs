@@ -1287,7 +1287,7 @@ test('codex passthrough without an inbound session derives a stable fallback ses
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('official Codex passthrough keeps native body, cache key and session', async () => {
+test('official Codex passthrough keeps native content and rebuilds session plus cache key', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-official-pass-'))
   const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
   writeGptVm(root, 'vm-gpt-a')
@@ -1318,12 +1318,14 @@ test('official Codex passthrough keeps native body, cache key and session', asyn
   const sent = envelopes[0]
   assert.deepEqual(sent.body.instructions, body.instructions)
   assert.deepEqual(sent.body.input, body.input)
-  assert.equal(sent.body.prompt_cache_key, 'cache-official-pass')
-  assert.equal(sent.body.conversation_id, inbound)
-  assert.equal(sent.body.session_id, inbound)
+  assert.equal(sent.body.prompt_cache_key, sent.session.session_id)
+  assert.notEqual(sent.body.prompt_cache_key, 'cache-official-pass')
+  assert.equal(sent.body.conversation_id, undefined)
+  assert.equal(sent.body.session_id, undefined)
   assert.equal(sent.body.max_output_tokens, 8192)
   assert.equal(sent.body.temperature, 0.2)
-  assert.equal(sent.session.session_id, inbound)
+  assert.notEqual(sent.session.session_id, inbound)
+  assert.match(sent.session.session_id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
   sticky.db?.close?.()
   fs.rmSync(root, { recursive: true, force: true })
 })

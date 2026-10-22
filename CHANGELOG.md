@@ -1,5 +1,26 @@
 # Changelog
 
+## 未发布
+
+## 1.3.215 — 2026-10-22
+
+- `/v1/usage` 与 `/v1/messages/count_tokens` 传入 `apiKeyStore`，与 Messages 一致解析密钥属主角色；面板会话无 `apiKeyRecord` 时按会话角色收窄作用域（admin/super → 平台池，user → 仅本人 VM），避免租户 peek 平台账号用量或 admin 托管密钥误报 503。（#658，#677）
+- 管理端 `enrichVm` 输出 `owner_user_id`、`origin`，租户自建槽位不再显示「平台池（未分配）」；槽位重建 `buildRecreatedVmRecord` 保留 `origin`，避免租户自建槽被误判为 `admin_assigned` 并影响配额与删租户回收。（#677）
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启一次。无迁移、无新依赖，不必 `wrap-cli/sync`、不必 `fetch:payload`、不必重建槽。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.214 — 2026-10-22
+
+- OpenAI Responses 上游：生命周期元数据（`response.created` / `queued` / `in_progress` / `metadata` / `keepalive`）在首条真实模型输出前不 commit attempt；仅 metadata 或 `overload` / `slow_down` 等早退失败时保持 `committed: false`，failover 仍可重试。（#645）
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启一次。无迁移、无新依赖，不必 `wrap-cli/sync`、不必 `fetch:payload`、不必重建槽。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.3.213 — 2026-10-22
+
+- 官方透传（`compatibility.official_cc_passthrough`、`codex.official_passthrough`）：system/instructions、messages/input、tools、cache_control、采样字段等 body 仍完全透传；outbound session 与 Codex `prompt_cache_key` 恢复 attempt/VM rebuild/mint（不再沿用入站 session 或调用方 cache key）；`metadata.user_id` 继续重绑槽位 device/account。默认开关仍关。（#676）
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启一次。启用时在面板打开对应开关并保存投影；不必 `wrap-cli/sync`、不必 `fetch:payload`、不必重建槽。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
 ## 1.3.212 — 2026-10-22
 
 - 新增官方 Codex 透传：开启 `codex.official_passthrough` 后，官方 Codex 家族 `/v1/responses` 保留 `instructions`、`input`、tools、reasoning、`prompt_cache_key`、`previous_response_id`、`conversation_id`/`session_id` 和官方 metadata，不再按 attempt 重建 `prompt_cache_key`；只清掉 API key/authorization/client_metadata。会话使用 `mode=passthrough`。OpenAI 兼容客户端的 body 归一化不变。

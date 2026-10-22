@@ -33,10 +33,10 @@ export function stripCodexIdentity(body = {}, { preserveMetadata = false } = {})
  * Official Codex Responses passthrough.
  *
  * The official CLI already sends the complete Responses body: instructions,
- * input items, tools, reasoning, service_tier, prompt_cache_key and session
- * fields. Normalizing it (system→developer, max_output/temperature strip,
- * prompt_cache_key rebuild) changes the cached prefix and the session identity.
- * Only strip credentials/client routing metadata; keep the wire body intact.
+ * input items, tools, reasoning, service_tier and sampling fields. Normalizing
+ * it (system→developer, max_output/temperature strip) changes the cached prefix.
+ * Only strip credentials/client routing metadata; keep content fields intact.
+ * Outbound session and prompt_cache_key rebuild happen later on the Codex hop.
  */
 export function toOfficialCodexPassthrough(body = {}) {
   return {

@@ -10,8 +10,15 @@ import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { CRS_OFFICIAL_AGENT_PROMPT } from '../../src/lib/identity/crs-persona.mjs'
 import { sessionIdFromOutboundBody } from '../../src/lib/identity/identity-rewrite.mjs'
 import { DEFAULT_AGENT_STANDING } from '../../src/lib/identity/persona-template.mjs'
-import { resolveInferenceBackend, messagesUrl, runApiInference } from '../../src/lib/pool/api-protocol.mjs'
+import {
+  isOpenAIResponsesCommitEvent,
+  resolveInferenceBackend,
+  messagesUrl,
+  runApiInference,
+} from '../../src/lib/pool/api-protocol.mjs'
 import { createClaudeMessageAssembler, applyClaudeSSELineToMessage } from '../../src/lib/protocol/convert.mjs'
+
+const unixTest = process.platform === 'win32' ? test.skip : test
 
 function fakeResponse() {
   return { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
@@ -1627,4 +1634,106 @@ test('Responses API backend returns 502 for conflicting tool arguments when the 
     await new Promise((resolve) => kernel.close(resolve))
     fs.rmSync(root, { recursive: true, force: true })
   }
+})
+test('OpenAI Responses lifecycle metadata does not commit downstream output', () => {
+  for (const type of [
+    'response.created',
+    'response.queued',
+    'response.in_progress',
+    'response.metadata',
+    'keepalive',
+  ]) {
+    assert.equal(isOpenAIResponsesCommitEvent({ type }), false, type)
+  }
+  assert.equal(isOpenAIResponsesCommitEvent({ type: 'error', error: { code: 'server_is_overloaded' } }), false)
+  assert.equal(isOpenAIResponsesCommitEvent({ type: 'response.failed' }), false)
+  assert.equal(
+    isOpenAIResponsesCommitEvent({ type: 'response.output_item.added', item: { type: 'reasoning', summary: [] } }),
+    false,
+  )
+  assert.equal(isOpenAIResponsesCommitEvent({ type: 'response.output_text.delta', delta: 'hello' }), true)
+})
+
+async function runOpenAIResponsesFixture(events) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-openai-metadata-'))
+  const socket = path.join(root, 'run', 'api-kernel.sock')
+  fs.mkdirSync(path.dirname(socket), { recursive: true })
+  const kernel = http.createServer((req, response) => {
+    req.resume()
+    req.on('end', () => {
+      response.writeHead(200, { 'content-type': 'text/event-stream' })
+      response.end(events.map((event) => 'data: ' + JSON.stringify(event) + '\n\n').join('') + 'data: [DONE]\n\n')
+    })
+  })
+  await new Promise((resolve) => kernel.listen(socket, resolve))
+  let wire = ''
+  const res = {
+    headersSent: false,
+    write(chunk) {
+      wire += chunk
+    },
+  }
+  try {
+    const result = await runApiInference({
+      cfg: { paths: { data: root } },
+      res,
+      protocol: 'openai.responses',
+      clientStream: true,
+      deliveryMode: 'verified',
+      convertedBody: { model: 'gpt-5.4', messages: [{ role: 'user', content: 'hello' }] },
+      inbound: {},
+      converters: {
+        writeSSEHeaders: () => {
+          res.headersSent = true
+        },
+      },
+      scheduler: {
+        pick: () => ({
+          ok: true,
+          endpoint: { id: 'ep', kind: 'openai', protocol: 'openai', base_url: 'https://fixture.invalid' },
+          key: { id: 'key', api_key: 'fixture' },
+          upstream_model: 'gpt-5.4',
+        }),
+      },
+    })
+    return { result, wire, headersSent: res.headersSent }
+  } finally {
+    kernel.closeAllConnections()
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+}
+
+unixTest('API OpenAI metadata followed by overload remains uncommitted for failover', async () => {
+  const run = await runOpenAIResponsesFixture([
+    { type: 'response.created', response: { id: 'resp_meta' } },
+    { type: 'response.queued', response: { id: 'resp_meta' } },
+    { type: 'response.metadata', response: { id: 'resp_meta' } },
+    { type: 'error', error: { type: 'server_error', code: 'server_is_overloaded', status: 503, message: 'busy' } },
+    {
+      type: 'response.failed',
+      response: { error: { type: 'server_error', code: 'server_is_overloaded', status: 503, message: 'busy' } },
+    },
+  ])
+  assert.equal(run.result.ok, false)
+  assert.equal(run.result.status, 503)
+  assert.equal(run.result.committed, false)
+  assert.equal(run.headersSent, false)
+  assert.equal(run.wire, '')
+})
+
+unixTest('API OpenAI flushes buffered metadata with the first real output', async () => {
+  const run = await runOpenAIResponsesFixture([
+    { type: 'response.created', response: { id: 'resp_ok' } },
+    { type: 'response.queued', response: { id: 'resp_ok' } },
+    { type: 'response.output_text.delta', delta: 'hello' },
+    { type: 'response.completed', response: { id: 'resp_ok', output: [] } },
+  ])
+  assert.equal(run.result.ok, true)
+  assert.equal(run.result.committed, true)
+  assert.equal(run.result.terminalState, 'verified')
+  assert.match(run.wire, /response\.created/)
+  assert.match(run.wire, /response\.queued/)
+  assert.match(run.wire, /response\.output_text\.delta/)
+  assert.match(run.wire, /response\.completed/)
 })

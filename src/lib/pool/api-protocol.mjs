@@ -51,6 +51,89 @@ async function readLines(stream, onLine) {
   if (buf) await onLine(buf)
 }
 
+function openAIResponsesSseEvent(line) {
+  const raw = String(line || '').trim()
+  if (!raw.startsWith('data:')) return null
+  const payload = raw.slice(5).trim()
+  if (!payload || payload === '[DONE]') return null
+  try {
+    return JSON.parse(payload)
+  } catch {
+    return null
+  }
+}
+
+function openAIResponsesItemHasOutput(item) {
+  if (!item || typeof item !== 'object') return false
+  if (item.arguments || item.input || item.result || item.encrypted_content) return true
+  for (const value of [item.content, item.summary]) {
+    if (!Array.isArray(value)) continue
+    if (
+      value.some(
+        (part) =>
+          part &&
+          typeof part === 'object' &&
+          (part.text || part.transcript || part.arguments || part.input || part.result || part.encrypted_content),
+      )
+    )
+      return true
+  }
+  return false
+}
+
+/** Lifecycle events are transport metadata, not downstream model output. */
+export function isOpenAIResponsesCommitEvent(event) {
+  if (!event || typeof event !== 'object') return false
+  const type = String(event.type || '').trim()
+  if (
+    !type ||
+    type === 'error' ||
+    type === 'response.failed' ||
+    type === 'response.created' ||
+    type === 'response.queued' ||
+    type === 'response.in_progress' ||
+    type === 'response.metadata' ||
+    type === 'keepalive'
+  )
+    return false
+  if (type === 'response.output_item.added' || type === 'response.output_item.done')
+    return openAIResponsesItemHasOutput(event.item)
+  if (
+    type === 'response.content_part.added' ||
+    type === 'response.content_part.done' ||
+    type === 'response.reasoning_summary_part.added' ||
+    type === 'response.reasoning_summary_part.done'
+  )
+    return !!(event.part?.text || event.part?.transcript)
+  if (type === 'response.function_call_arguments.done') return !!event.arguments
+  if (type === 'response.custom_tool_call_input.done') return !!event.input
+  if (type === 'response.image_generation_call.partial_image') return !!event.partial_image_b64
+  return type.startsWith('response.output_') || (type.startsWith('response.') && /\.(delta|done)$/.test(type))
+}
+
+function openAIResponsesFailure(event) {
+  if (!event || typeof event !== 'object') return null
+  if (event.type === 'error') return event
+  if (event.type !== 'response.failed') return null
+  return {
+    type: 'error',
+    error: event.response?.error || event.error || { type: 'server_error', message: 'Response failed' },
+  }
+}
+
+function mappedOpenAIResponsesFailure(resultBase, event, committed, extras = {}) {
+  const declared = Number(event?.error?.status || event?.status)
+  const mapped = mapUpstreamError(declared >= 400 && declared < 600 ? declared : 500, event)
+  return {
+    ...resultBase,
+    ...mapped,
+    ok: false,
+    terminalState: committed ? 'incomplete' : 'rejected',
+    committed,
+    ...extras,
+  }
+}
+
 export async function runApiInference({
   req,
   res,
@@ -386,23 +469,14 @@ async function runOpenAIResponsesUpstream({
   let sawTerminal = false
   let ttftMs = null
   let streamedUsage = null
+  let terminalFailure = null
+  const pendingLines = []
   const started = Date.now()
 
-  await readLines(upstream, async (line) => {
-    if (conversionError) return
-    const raw = String(line || '')
-    const seen = usageFromSseLine(raw)
-    if (seen) streamedUsage = seen
-    if (raw.startsWith('data:') && ttftMs == null) ttftMs = Date.now() - started
-    if (!committed && raw.startsWith('data:')) committed = true
-    if (!clientStream) {
-      chunks.push(raw)
-      if (/response\.(completed|done)/.test(raw) || raw.trim() === 'data: [DONE]') sawTerminal = true
-      return
-    }
+  const writeStreamLine = (raw) => {
     if (!res.headersSent) converters.writeSSEHeaders(res)
     if (protocol === 'openai.responses') {
-      res.write(raw.endsWith('\n') ? raw : `${raw}\n`)
+      res.write(raw.endsWith('\n') ? raw : raw + '\n')
       if (/response\.(completed|done)/.test(raw)) completed = true
       return
     }
@@ -418,15 +492,45 @@ async function runOpenAIResponsesUpstream({
     } catch (error) {
       if (error.code !== 'tool_arguments_mismatch') throw error
       conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
+      const payload = JSON.stringify({ error: conversionError })
       res.write(
         protocol === 'anthropic.messages'
-          ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
-          : `data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`,
+          ? 'event: error\ndata: ' + JSON.stringify({ type: 'error', error: conversionError }) + '\n\n'
+          : 'data: ' + payload + '\n\ndata: [DONE]\n\n',
       )
     }
+  }
+
+  await readLines(upstream, async (line) => {
+    if (conversionError) return
+    const raw = String(line || '')
+    const event = openAIResponsesSseEvent(raw)
+    const failure = openAIResponsesFailure(event)
+    if (failure) terminalFailure = failure
+    const seen = usageFromSseLine(raw)
+    if (seen) streamedUsage = seen
+    const startsOutput = isOpenAIResponsesCommitEvent(event)
+    const completes = event?.type === 'response.completed' || event?.type === 'response.done'
+    const wasCommitted = committed
+    if ((startsOutput || completes) && ttftMs == null) ttftMs = Date.now() - started
+    if (!committed && (startsOutput || completes)) committed = true
+    if (!clientStream) {
+      chunks.push(raw)
+      if (/response\.(completed|done)/.test(raw) || raw.trim() === 'data: [DONE]') sawTerminal = true
+      return
+    }
+    if (!wasCommitted) {
+      pendingLines.push(raw)
+      if (!committed) return
+      for (const pending of pendingLines.splice(0)) writeStreamLine(pending)
+      return
+    }
+    writeStreamLine(raw)
   })
 
   if (!clientStream) {
+    if (terminalFailure)
+      return mappedOpenAIResponsesFailure(resultBase, terminalFailure, committed, { usage: streamedUsage, ttftMs })
     let assembled
     let outBody
     try {
@@ -443,7 +547,7 @@ async function runOpenAIResponsesUpstream({
         status: 502,
         body: { error: { type: 'upstream_protocol_error', code: error.code, message: error.message } },
         terminalState: 'incomplete',
-        committed: true,
+        committed,
         usage: streamedUsage,
       }
     }
@@ -455,9 +559,11 @@ async function runOpenAIResponsesUpstream({
       body: outBody,
       usage: assembled?.usage || streamedUsage || outBody?.usage || null,
       terminalState: complete ? 'verified' : hasBody ? 'incomplete' : 'rejected',
-      committed: true,
+      committed,
     }
   }
+  if (terminalFailure)
+    return mappedOpenAIResponsesFailure(resultBase, terminalFailure, committed, { usage: streamedUsage, ttftMs })
   if (conversionError)
     return {
       ...resultBase,
