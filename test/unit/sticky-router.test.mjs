@@ -991,3 +991,27 @@ test('replaceSession remints the outbound session on the same VM', () => {
   assert.equal(r.resolve('sess:a').slotIndex, null)
   r.db?.close?.()
 })
+
+test('root accounting marks only confirmed roots and leaves old binding fields untouched', (t) => {
+  const dir = tmpDir('kin-sticky-roots-')
+  const router = new StickyRouter({ dataDir: dir, config: { sticky: { enabled: true } } })
+  t.after(() => {
+    router.db.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  const root = scopeAssignmentKey('family2:root')
+  const child = scopeAssignmentKey('sess:child')
+  router.bind(root, { accountId: 'old-account', vmId: 'old-vm' })
+  router.bind(child, { accountId: 'old-account', vmId: 'old-vm', sessionId: 'child-outbound' })
+  const before = router.repo.get(root)
+  assert.equal(router.rootAssignmentCounts().size, 0)
+  router.markRootAssignment(root)
+  router.markRootAssignment(root)
+  assert.deepEqual(router.repo.get(root), before)
+  assert.deepEqual([...router.rootAssignmentCounts()], [['old-account', 1]])
+  // Ordinary TTL refreshes cannot erase the root marker.
+  router.bind(root, { accountId: 'old-account', vmId: 'old-vm' }, { countHit: false })
+  assert.deepEqual([...router.rootAssignmentCounts()], [['old-account', 1]])
+  router.repo.upsert(root, { ...router.repo.get(root), expires_at: Date.now() - 1 })
+  assert.equal(router.rootAssignmentCounts().size, 0)
+})

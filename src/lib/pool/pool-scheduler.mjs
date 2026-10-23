@@ -561,6 +561,8 @@ export class PoolScheduler extends EventEmitter {
     const sessionAssignment = assignmentMode === 'session'
     const assignmentKey = sessionAssignment ? familyKey || stickyKey : null
     const claimOptions = { assignmentKey, sessionAssignment, ownerScope, keyScope }
+    // A pre-upgrade root contributes load without changing its destination or TTL.
+    if (assignmentKey) this.stickyRouter?.markRootAssignment?.(assignmentKey)
     let familyVm = familyVmId ? String(familyVmId).trim() : ''
     const deviceVm = !sessionAssignment && deviceVmId ? String(deviceVmId).trim() : ''
     const avoided = (candidate) => !!avoid?.size && (avoid.has(candidate.accountId) || avoid.has(candidate.vmId))
@@ -780,7 +782,7 @@ export class PoolScheduler extends EventEmitter {
             vmId: bound.vmId,
             ...(key === stickyKey ? { sessionId: bound.sessionId, slotIndex: bound.slotIndex } : {}),
           },
-          { countHit: false },
+          { countHit: false, rootAssignment: key === familyKey },
         )
       }
     }
@@ -812,11 +814,26 @@ export class PoolScheduler extends EventEmitter {
       const granted = home ? this.claimSeat(seatKey, home, 'sticky', claimOptions) : null
       if (granted) return granted
     }
-    for (const candidate of this.planner.rank(openable)) {
+    const ranked = claimOptions.sessionAssignment ? this.rankSessionCandidates(openable) : this.planner.rank(openable)
+    for (const candidate of ranked) {
       const granted = this.claimSeat(seatKey, candidate, this.planner.strategy, claimOptions)
       if (granted) return granted
     }
     return null
+  }
+
+  /** Only an unbound balanced root uses durable load; sticky homes are tried first. */
+  rankSessionCandidates(candidates) {
+    const ranked = this.planner.rank(candidates)
+    if (this.planner.strategy !== 'balanced') return ranked
+    const roots = this.stickyRouter?.rootAssignmentCounts?.() || new Map()
+    return ranked.sort((left, right) => {
+      const leftCap = Math.max(1, Number(left.maxConcurrency) || 1)
+      const rightCap = Math.max(1, Number(right.maxConcurrency) || 1)
+      const load = (roots.get(left.accountId) || 0) / leftCap - (roots.get(right.accountId) || 0) / rightCap
+      if (load) return load
+      return (this.inflight.get(left.accountId) || 0) / leftCap - (this.inflight.get(right.accountId) || 0) / rightCap
+    })
   }
 
   /** Synchronous policy recheck for session claims, including queued grants.
@@ -893,7 +910,7 @@ export class PoolScheduler extends EventEmitter {
         this.stickyRouter?.bind?.(
           assignmentKey,
           { accountId: candidate.accountId, vmId: candidate.vmId },
-          { countHit: false },
+          { countHit: false, rootAssignment: sessionAssignment },
         )
       }
     } catch (error) {

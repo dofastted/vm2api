@@ -6,6 +6,7 @@ import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { openDatabase, closeDatabase, getDb } from '../../src/lib/db/database.mjs'
 import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
+import { StickyRepo } from '../../src/lib/db/repos/sticky-repo.mjs'
 import { VmsRepo } from '../../src/lib/db/repos/vms-repo.mjs'
 import { BackupService, tarAvailable } from '../../src/lib/admin/backup-service.mjs'
 import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
@@ -234,4 +235,28 @@ test('remove deletes record + file', async () => {
   assert.equal(svc.remove(rec.id), true)
   assert.equal(fs.existsSync(rec.file_path), false)
   assert.equal(svc.get(rec.id), null)
+})
+
+test('backup restore preserves root load and exact pre-existing account bindings', async () => {
+  const roots = new StickyRepo(getDb())
+  roots.upsert('assignment:root', {
+    account_id: 'old-account',
+    vm_id: 'vm-b1',
+    expires_at: Date.now() + 60_000,
+    assignment_root: 1,
+  })
+  roots.upsert('assignment:child', {
+    account_id: 'old-account',
+    vm_id: 'vm-b1',
+    session_id: 'child-outbound',
+    expires_at: Date.now() + 60_000,
+  })
+  const before = roots.get('assignment:root')
+  const backup = await svc.createBackup({ kind: 'manual' })
+  roots.remove('assignment:root')
+  assert.equal(roots.rootAssignmentCounts().size, 0)
+  await svc.restoreBackup(backup.id)
+  const restored = new StickyRepo(getDb())
+  assert.deepEqual(restored.get('assignment:root'), before)
+  assert.deepEqual([...restored.rootAssignmentCounts()], [['old-account', 1]])
 })

@@ -557,7 +557,7 @@ export class StickyRouter {
   bind(
     key,
     { accountId, vmId, sessionId = null, deviceId = null, slotIndex = null } = {},
-    { countHit = true, ifGeneration = null, replaceSession = false, clearSlot = false } = {},
+    { countHit = true, ifGeneration = null, replaceSession = false, clearSlot = false, rootAssignment = false } = {},
   ) {
     if (!key || (!this.config.enabled && !assignmentKey(key))) return false
     const ttl = (this.config.ttl_seconds || 86400) * 1000
@@ -600,8 +600,19 @@ export class StickyRouter {
       hits: (prev.hits || 0) + (countHit ? 1 : 0),
       generation,
       slot_index: nextSlot,
+      assignment_root: rootAssignment && assignmentKey(key),
     })
     return true
+  }
+
+  /** Tag only the exact root identified by a request; never infer roots from aliases. */
+  markRootAssignment(key) {
+    if (!assignmentKey(key)) return 0
+    return this.repo.markRootAssignment(key)
+  }
+
+  rootAssignmentCounts() {
+    return this.repo.rootAssignmentCounts()
   }
 
   /** Move an entire family together. Session rows stay until their next turn. */

@@ -415,3 +415,27 @@ test('withTransaction only runs inline for a real outer transaction', () => {
   )
   assert.equal(called, false)
 })
+
+test('automatic upgrade adds root assignment accounting without changing any existing binding fields', () => {
+  const migSrc = path.resolve('src/lib/db/migrations')
+  const oldDir = path.join(tmp, 'pre-root-migs')
+  fs.mkdirSync(oldDir)
+  for (const file of fs.readdirSync(migSrc)) {
+    if (file < '042') fs.copyFileSync(path.join(migSrc, file), path.join(oldDir, file))
+  }
+  const dbPath = path.join(tmp, 'upgrade-root.db')
+  const old = new DatabaseSync(dbPath)
+  applyMigrations(old, { migrationsDir: oldDir })
+  old
+    .prepare(`INSERT INTO sticky_sessions
+    (key, account_id, vm_id, session_id, device_id, bound_at, expires_at, hits, generation, slot_index)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run('assignment:existing-root', 'old-account', 'old-vm', 'old-outbound', 'old-device', 123, 456, 7, 2, 3)
+  const before = { ...old.prepare('SELECT * FROM sticky_sessions').get() }
+  old.close()
+  const upgraded = openDatabase({ dbPath })
+  const { assignment_root, ...after } = upgraded.prepare('SELECT * FROM sticky_sessions').get()
+  assert.equal(assignment_root, 0)
+  assert.deepEqual(after, before)
+  assert.equal(upgraded.prepare('SELECT COUNT(*) AS n FROM schema_migrations WHERE version = ?').get('042').n, 1)
+})

@@ -24,8 +24,8 @@ export class StickyRepo {
     this.db = db
     this._get = db.prepare('SELECT * FROM sticky_sessions WHERE key = ?')
     this._upsert = db.prepare(`
-      INSERT INTO sticky_sessions (key, account_id, vm_id, session_id, device_id, bound_at, expires_at, hits, generation, slot_index)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO sticky_sessions (key, account_id, vm_id, session_id, device_id, bound_at, expires_at, hits, generation, slot_index, assignment_root)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(key) DO UPDATE SET
         account_id = excluded.account_id,
         vm_id = excluded.vm_id,
@@ -35,7 +35,14 @@ export class StickyRepo {
         expires_at = excluded.expires_at,
         hits = excluded.hits,
         generation = excluded.generation,
-        slot_index = excluded.slot_index
+        slot_index = excluded.slot_index,
+        assignment_root = MAX(sticky_sessions.assignment_root, excluded.assignment_root)
+    `)
+    this._markRoot = db.prepare('UPDATE sticky_sessions SET assignment_root = 1 WHERE key = ? AND assignment_root = 0')
+    this._rootCounts = db.prepare(`
+      SELECT account_id, COUNT(*) AS roots FROM sticky_sessions
+      WHERE assignment_root = 1 AND expires_at >= ? AND account_id IS NOT NULL AND vm_id IS NOT NULL
+      GROUP BY account_id
     `)
     this._delete = db.prepare('DELETE FROM sticky_sessions WHERE key = ?')
     this._deleteByAccount = db.prepare('DELETE FROM sticky_sessions WHERE account_id = ? OR vm_id = ?')
@@ -69,7 +76,16 @@ export class StickyRepo {
       ent.hits ?? 0,
       Number(ent.generation) || 0,
       ent.slot_index == null ? null : Number(ent.slot_index),
+      ent.assignment_root ? 1 : 0,
     )
+  }
+
+  markRootAssignment(key) {
+    return this._markRoot.run(key).changes
+  }
+
+  rootAssignmentCounts(now = Date.now()) {
+    return new Map(this._rootCounts.all(now).map((row) => [row.account_id, row.roots]))
   }
 
   remove(key) {

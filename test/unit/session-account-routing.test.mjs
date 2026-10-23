@@ -944,3 +944,46 @@ test('fill session assignment retains its priority-first placement', async (t) =
   assert.equal((await h.run('root-a')).vmId, 'vm-01')
   assert.equal((await h.run('root-b')).vmId, 'vm-01')
 })
+
+test('simultaneous independent first requests observe each prior root reservation', async (t) => {
+  const h = setup(t, { policies: { 'vm-01': { priority: 6 }, 'vm-02': { priority: 3 } } })
+  const first = await Promise.all(['root-a', 'root-b'].map((root) => h.select(root)))
+  assert.deepEqual(
+    first.map((result) => result.vmId),
+    ['vm-01', 'vm-02'],
+  )
+  assert.deepEqual(h.pool.snapshot().inflight, { 'account-1': 1, 'account-2': 1 })
+})
+
+test('root load expiry affects only new assignments and priority changes preserve old homes', async (t) => {
+  const h = setup(t, { policies: { 'vm-01': { priority: 6 }, 'vm-02': { priority: 3 } } })
+  assert.equal((await h.run('root-a')).vmId, 'vm-01')
+  assert.equal((await h.run('root-b')).vmId, 'vm-02')
+  const vmFile = path.join(h.root, 'vms', 'vm-02.json')
+  const vm = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+  vm.policy.priority = 10
+  fs.writeFileSync(vmFile, JSON.stringify(vm))
+  assert.equal((await h.run('root-a')).vmId, 'vm-01')
+  assert.equal((await h.run('root-b')).vmId, 'vm-02')
+  const rootKey = h.route('root-a').familyKey
+  h.sticky.repo.upsert(rootKey, { ...h.sticky.repo.get(rootKey), expires_at: Date.now() - 1 })
+  assert.equal((await h.run('root-c')).vmId, 'vm-01')
+  assert.equal(h.sticky.resolve(h.route('root-b').familyKey).vmId, 'vm-02')
+})
+
+test('old roots concentrated on one account are never redistributed by balancing new roots', async (t) => {
+  const h = setup(t, { policies: { 'vm-01': { priority: 6 }, 'vm-02': { priority: 3 } } })
+  for (const root of ['old-a', 'old-b']) {
+    const route = h.route(root)
+    h.sticky.bind(route.familyKey, { accountId: 'account-1', vmId: 'vm-01' }, { countHit: false })
+    h.sticky.bind(route.stickyKey, { accountId: 'account-1', vmId: 'vm-01', sessionId: `existing-${root}` })
+  }
+  h.restart()
+  for (const root of ['old-a', 'old-b']) assert.equal((await h.run(root)).vmId, 'vm-01')
+  assert.equal((await h.run('new-a')).vmId, 'vm-02')
+  for (const root of ['old-a', 'old-b']) {
+    assert.equal((await h.run(root)).vmId, 'vm-01')
+    assert.equal(h.sticky.resolve(h.route(root).stickyKey).sessionId, `existing-${root}`)
+  }
+  assert.equal((await h.run('new-b')).vmId, 'vm-02')
+})
