@@ -13,6 +13,13 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { proxiesQueryOptions } from '@/features/proxies/queries'
 import { type ProxyEditResult, editOutcome } from './proxy-results'
@@ -36,6 +43,7 @@ export function ProxyEditDialog({
   onOpenChange: (open: boolean) => void
 }) {
   const qc = useQueryClient()
+  const [scheme, setScheme] = useState('socks5')
   const [host, setHost] = useState('')
   const [port, setPort] = useState('')
   const [username, setUsername] = useState('')
@@ -54,6 +62,9 @@ export function ProxyEditDialog({
   const proxyId = proxy?.id || ''
   useEffect(() => {
     if (!proxyId) return
+    setScheme(
+      proxy?.scheme === 'socks5h' ? 'socks5' : proxy?.scheme || 'socks5'
+    )
     setHost(String(proxy?.host || ''))
     setPort(String(proxy?.port || ''))
     setUsername('')
@@ -70,6 +81,12 @@ export function ProxyEditDialog({
       // 只发真正改动的键：网关按「键是否存在」区分「不动」与「清空」，
       // 无脑全量提交会把留空的账密框当成清除指令。
       const patch: Record<string, unknown> = {}
+      if (
+        !localProxy &&
+        scheme !==
+          (proxy?.scheme === 'socks5h' ? 'socks5' : proxy?.scheme || 'socks5')
+      )
+        patch.scheme = scheme
       if (host.trim() && host.trim() !== proxy?.host) patch.host = host.trim()
       if (port.trim() && port.trim() !== String(proxy?.port ?? '')) {
         patch.port = Number(port.trim())
@@ -113,13 +130,17 @@ export function ProxyEditDialog({
   // password_without_username 拒掉 —— 在这里先拦住，别让用户白填一遍。
   const passwordWithoutUser =
     !clearAuth && !!password && !username.trim() && !proxy?.has_auth
-  const connectionChanged = !(
-    host.trim() === String(proxy?.host || '') &&
-    port.trim() === String(proxy?.port ?? '') &&
-    !username.trim() &&
-    !password &&
-    !clearAuth
-  )
+  const connectionChanged =
+    !localProxy &&
+    !(
+      scheme ===
+        (proxy?.scheme === 'socks5h' ? 'socks5' : proxy?.scheme || 'socks5') &&
+      host.trim() === String(proxy?.host || '') &&
+      port.trim() === String(proxy?.port ?? '') &&
+      !username.trim() &&
+      !password &&
+      !clearAuth
+    )
   const domainChanged =
     !localProxy && domainForward !== (proxy?.domain_forward === true)
   const nothingChanged = !connectionChanged && !labelChanged && !domainChanged
@@ -140,6 +161,27 @@ export function ProxyEditDialog({
               placeholder='如：东京-2 号机、xx 机房'
             />
           </div>
+          {!localProxy && (
+            <div className='space-y-1'>
+              <Label htmlFor='proxy-scheme'>代理类型</Label>
+              <Select value={scheme} onValueChange={setScheme}>
+                <SelectTrigger id='proxy-scheme'>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value='socks5'>SOCKS5</SelectItem>
+                  <SelectItem value='http'>HTTP</SelectItem>
+                  <SelectItem value='https'>HTTPS</SelectItem>
+                </SelectContent>
+              </Select>
+              {scheme !== 'socks5' && (
+                <p className='text-xs text-muted-foreground'>
+                  需要支持 CONNECT 隧道。HTTPS
+                  类型会加密到代理服务器的连接并验证证书。
+                </p>
+              )}
+            </div>
+          )}
           <div className='grid gap-3 sm:grid-cols-[2fr_1fr]'>
             <div className='space-y-1'>
               <Label>主机</Label>
@@ -223,12 +265,13 @@ export function ProxyEditDialog({
           )}
           {passwordWithoutUser ? (
             <p className='text-xs text-[color:var(--status-bad)]'>
-              只填密码不生效，SOCKS5 需要同时有用户名。
+              只填密码不生效，请同时填写用户名。
             </p>
           ) : null}
           {boundCount && connectionChanged ? (
             <p className='text-xs text-[color:var(--status-caution)]'>
-              该代理已绑 {boundCount} 台槽位，保存后会重载它们的 worker。
+              保存后将自动更新已绑定的 {boundCount}{' '}
+              台槽位，现有连接可能短暂中断。
             </p>
           ) : null}
         </div>

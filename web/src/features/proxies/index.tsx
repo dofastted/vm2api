@@ -291,7 +291,7 @@ export function ProxiesPage() {
       }
       try {
         await navigator.clipboard.writeText(uri)
-        toast.success('已复制 SOCKS5 地址（含账密）')
+        toast.success('已复制代理地址（含账密）')
       } catch {
         // 剪贴板 API 需要安全上下文（HTTPS 或 localhost），失败要说明白，
         // 而不是静默什么都没发生。这里也不把 uri 兜底渲染出来。
@@ -504,7 +504,7 @@ export function ProxiesPage() {
             <SheetDescription className='text-xs'>
               {drawer.kind === 'settings'
                 ? '绑定上限、自动探测、出口 DNS 与时区跟随，对整个代理池生效。'
-                : '粘贴 SOCKS5 行批量导入，或添加走所在 VPS 出口的本地代理。'}
+                : '粘贴 SOCKS5、HTTP 或 HTTPS 地址批量导入，或添加走所在 VPS 出口的本地代理。'}
             </SheetDescription>
           </SheetHeader>
           <div className='p-4'>

@@ -325,3 +325,24 @@ test('admin export returns the SOCKS password', async (t) => {
   assert.equal(got.response.body.data.credential.export.accounts[0].credentials.access_token, 'sk-ant-oat01-PACKAGE')
   assert.equal(got.response.body.data.vm.id, 'vm-pkg')
 })
+
+test('HTTP and HTTPS proxy types survive slot package export and import', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-vm-pkg-http-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pool = makePool(t)
+  for (const scheme of ['http', 'https']) {
+    const doc = claudePackage(`vm-pkg-${scheme}`)
+    doc.proxy.kind = scheme
+    const parsed = parseVmPackage(doc)
+    assert.equal(parsed.ok, true)
+    assert.equal(parsed.value.proxy.kind, scheme)
+    const handler = makeHandler(root, doc, { pool })
+    await handler.handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/package'))
+    assert.equal(handler.response.status, 201, handler.response.body?.error?.message)
+    const vm = JSON.parse(fs.readFileSync(path.join(root, 'vms', `vm-pkg-${scheme}.json`), 'utf8'))
+    assert.equal(vm.proxy.scheme, scheme)
+    assert.match(vm.proxy.url, new RegExp(`^${scheme}://`))
+    const exported = buildVmPackage({ vm, proxy: pool.getProxyByIdWithAuth(vm.proxy.id) })
+    assert.equal(exported.proxy.kind, scheme)
+  }
+})

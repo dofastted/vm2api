@@ -183,3 +183,23 @@ func TestLoadTelemetryMissingUploadIntervalIsZero(t *testing.T) {
 		t.Fatalf("UploadIntervalSecs=%d", tel.UploadIntervalSecs)
 	}
 }
+
+func TestLoadHTTPProxySchemes(t *testing.T) {
+	for _, scheme := range []string{"http", "https"} {
+		t.Run(scheme, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "worker.json")
+			raw := fmt.Sprintf(`{"vm_id":"vm-01","socket_path":%q,"credential_path":%q,"proxy_url":%q,"proxy_required":true}`, filepath.Join(dir, "worker.sock"), filepath.Join(dir, "credentials.json"), scheme+"://user:pass@127.0.0.1:8080")
+			if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.ProxyURL != scheme+"://user:pass@127.0.0.1:8080" {
+				t.Fatalf("proxy URL %q", cfg.ProxyURL)
+			}
+		})
+	}
+}

@@ -30,11 +30,15 @@ export function socksProxyUrl(proxy, scheme = 'socks5h') {
   if (!proxy) return ''
   if (proxy.url) {
     const u = new URL(proxy.url)
-    const endpoint = socksEndpoint(u.hostname, u.port || 1080)
-    if (!/^socks5h?:$/.test(u.protocol) || !endpoint) throw new Error('invalid SOCKS5 URL')
+    const endpoint = socksEndpoint(u.hostname, u.port || proxyDefaultPort(u.protocol))
+    if (!/^(socks5h?|https?):$/.test(u.protocol) || !endpoint) throw new Error('invalid proxy URL')
+    if (u.protocol === 'http:' || u.protocol === 'https:') scheme = u.protocol.slice(0, -1)
     const auth = u.username || u.password ? `${u.username}:${u.password}@` : ''
     return `${scheme}://${auth}${endpoint}`
   }
+  if (proxy.scheme === 'http' || proxy.scheme === 'https') scheme = proxy.scheme
+  if (proxy.scheme && !['socks5', 'socks5h', 'http', 'https'].includes(proxy.scheme))
+    throw new Error('invalid proxy scheme')
   const endpoint = socksEndpoint(proxy.host, proxy.port)
   if (!endpoint) return ''
   const auth = proxy.username
@@ -60,8 +64,12 @@ export function socksProxyEndpoint(proxy) {
   if (!proxy?.url) return null
   try {
     const u = new URL(proxy.url)
-    return socksEndpoint(u.hostname, u.port || 1080) || null
+    return socksEndpoint(u.hostname, u.port || proxyDefaultPort(u.protocol)) || null
   } catch {
     return null
   }
+}
+
+function proxyDefaultPort(protocol) {
+  return protocol === 'http:' ? 80 : protocol === 'https:' ? 443 : 1080
 }

@@ -110,6 +110,9 @@
 - 导入页以 start:false 建空槽后，打开官方登录终端前会先启动已绑定出口的槽位；已运行直接开终端，无出口拒绝，失败可重试。（#650，#657）
 - 池调度：异步 worker 健康探测返回后重新读取 `Date.now()` 再判 cooldown 与凭证门禁，避免探测期间已过期的 cooldown 被重新入队且错过唤醒通知。（#671）
 - JEV 语义审核：`jevModelDocument` 保留 system / user 消息与 input 的来源标签（如 `user message N`），同来源+正文才去重，assistant / tool 不参与，避免历史引用被当成当前提问。（#671）
+- 槽位出口代理新增 HTTP / HTTPS 类型（SOCKS5 与本地出口不变）：面板编辑与导入可指定协议，存储、健康检查与 VM 包导入/export 保留类型；不带协议前缀的导入行与旧记录仍按 SOCKS5。kin-egress 经 CONNECT 隧道转发，支持 Basic 认证；HTTPS 类型到代理服务器走 TLS 并校验证书。保存类型或上游后自动重载绑定槽位的出口与运行中 worker，失败项在页面报告便于重试。不改默认出口与推理路径。（#670）
+
+已部署机升级：更新 Node 控制面、`web/dist` 与 `bin/kin-egress`，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`。切换类型或改绑会重载本机出口；集群槽在下次启动、重载或出口重建时推送新 `kin-egress`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
 已部署机升级：更新 Node 控制面与 `web/dist`，执行 `npm run fetch:payload`（或更新控制面镜像）换上新 `bin/kin-computer`，重启一次 Node。无迁移、无新依赖，不必 `wrap-cli/sync`，不必重建槽位容器；已有槽位计算机身份不变。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 

@@ -46,7 +46,13 @@ export function editOutcome(data: ProxyEditResult): Outcome {
     const reason = reasonOf(data.egress.error)
     problems.push(`出口转发重启失败${reason ? `（${reason}）` : ''}`)
   }
-  if (!problems.length) return { level: 'success', text: '已保存' }
+  if (!problems.length) {
+    const count = data.workers?.length || 0
+    return {
+      level: 'success',
+      text: count ? `已保存，已自动更新 ${count} 台槽位配置` : '已保存',
+    }
+  }
   return { level: 'warning', text: `已保存，但${problems.join('；')}` }
 }
 
@@ -81,5 +87,5 @@ export function disableConfirmText(bound: number): string {
 export function deleteConfirmText(bound: number): string {
   return bound
     ? `删除后，绑在这条代理上的 ${bound} 台槽位会解绑并停止调度，要重新绑定代理才能恢复。确认删除？`
-    : '删除这条 SOCKS5？'
+    : '删除这条代理？'
 }

@@ -204,8 +204,8 @@ func (c Config) Validate() error {
 		if err != nil {
 			return fmt.Errorf("invalid proxy_url: %w", err)
 		}
-		if u.Scheme != "socks5" && u.Scheme != "socks5h" {
-			return fmt.Errorf("proxy_url scheme must be socks5 or socks5h, got %q", u.Scheme)
+		if u.Scheme != "socks5" && u.Scheme != "socks5h" && u.Scheme != "http" && u.Scheme != "https" {
+			return fmt.Errorf("proxy_url scheme must be socks5, socks5h, http or https, got %q", u.Scheme)
 		}
 		if u.Hostname() == "" || u.Port() == "" {
 			return errors.New("proxy_url requires host and port")

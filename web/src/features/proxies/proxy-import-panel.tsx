@@ -95,7 +95,7 @@ export function ProxyImportPanel({ hasLocal }: { hasLocal: boolean }) {
       }
     >
       <label htmlFor='proxy-import' className='sr-only'>
-        SOCKS5 列表，每行一条
+        代理列表，每行一条
       </label>
       <Textarea
         id='proxy-import'
@@ -114,12 +114,13 @@ export function ProxyImportPanel({ hasLocal }: { hasLocal: boolean }) {
         spellCheck={false}
         autoComplete='off'
         placeholder={
-          'host:port\nuser:pass@host:port\nsocks5://user:pass@host:port'
+          'host:port\nsocks5://user:pass@host:port\nhttp://user:pass@host:port\nhttps://user:pass@host:port'
         }
         className='field-host min-h-40 resize-y text-xs leading-relaxed'
       />
       <p className='mt-1.5 text-[11px] text-muted-foreground'>
-        也支持 host:port:user:pass。账密入库后不再回显，重复的自动跳过。
+        无协议前缀默认 SOCKS5，也支持 host:port:user:pass。HTTP / HTTPS
+        请带协议前缀，且需要支持 CONNECT。重复的自动跳过。
       </p>
       <div className='mt-3 flex flex-wrap items-center gap-2'>
         <Button

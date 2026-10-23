@@ -11,6 +11,7 @@
  */
 import { EventEmitter } from 'node:events'
 import net from 'node:net'
+import tls from 'node:tls'
 import crypto from 'node:crypto'
 import { resolveStoreDb } from '../db/database.mjs'
 import { ProxiesRepo } from '../db/repos/proxies-repo.mjs'
@@ -197,13 +198,15 @@ function localEgressRecord(nodeId = null) {
   }
 }
 
-function socks5Record({ host, port, username = null, password = null, raw = '' }) {
+function socks5Record({ scheme = 'socks5', host, port, username = null, password = null, raw = '' }) {
+  if (scheme === 'socks5h') scheme = 'socks5'
+  if (!['socks5', 'http', 'https'].includes(scheme)) return null
   host = normalizeSocksHost(host)
   if (!looksLikeHost(host) || !isSocksPort(port)) return null
   const user = username == null || username === '' ? null : String(username)
   const pass = user == null ? null : password == null ? '' : String(password)
   return {
-    scheme: 'socks5',
+    scheme,
     host: String(host).trim(),
     port: Number(port),
     username: user,
@@ -215,6 +218,7 @@ function socks5Record({ host, port, username = null, password = null, raw = '' }
 /** Structured host / port / username / password import. */
 export function parseSocks5Fields(fields = {}) {
   return socks5Record({
+    scheme: fields.scheme ?? fields.protocol ?? fields.kind ?? 'socks5',
     host: fields.host,
     port: fields.port,
     username: fields.username ?? fields.user,
@@ -236,16 +240,18 @@ export function parseSocks5Line(line) {
   if (!raw || raw.startsWith('#')) return null
   raw = raw.replace(/^['"]|['"]$/g, '').trim()
   try {
-    if (/^socks5h?:\/\//i.test(raw)) {
+    if (/^(socks5h?|https?):\/\//i.test(raw)) {
       const u = new URL(raw.replace(/^socks5h:\/\//i, 'socks5://'))
       return socks5Record({
+        scheme: u.protocol.slice(0, -1),
         host: u.hostname,
-        port: u.port || 1080,
+        port: u.port || (u.protocol === 'http:' ? 80 : u.protocol === 'https:' ? 443 : 1080),
         username: u.username ? decodeURIComponent(u.username) : null,
         password: u.password ? decodeURIComponent(u.password) : null,
         raw,
       })
     }
+    if (raw.includes('://')) return null
     const at = raw.lastIndexOf('@')
     if (at > 0) {
       const cred = raw.slice(0, at)
@@ -486,7 +492,7 @@ export class ProxyPool extends EventEmitter {
       last_probe_at: p.last_probe_at || null,
       last_error: p.last_error || null,
       created_at: p.created_at,
-      kind: isLocalEgressProxy(p) ? 'local' : 'socks5',
+      kind: isLocalEgressProxy(p) ? 'local' : p.scheme || 'socks5',
       node_id: isLocalEgressProxy(p) ? localEgressNodeId(p.id) : undefined,
       scheme: isLocalEgressProxy(p) ? 'local' : p.scheme || 'socks5',
       domain_forward: !!p.domain_forward,
@@ -609,7 +615,7 @@ export class ProxyPool extends EventEmitter {
   }
 
   _findSocksRow(parsed) {
-    const key = (p) => JSON.stringify([p.host, p.port, p.username || '', p.password || ''])
+    const key = (p) => JSON.stringify([p.scheme || 'socks5', p.host, p.port, p.username || '', p.password || ''])
     const wanted = key(parsed)
     return this.state.proxies.find((p) => key(p) === wanted) || null
   }
@@ -664,7 +670,7 @@ export class ProxyPool extends EventEmitter {
     const skipped = []
     // Credentials can select distinct proxies at the same endpoint. Encode a
     // tuple so colons inside credentials cannot collide with field separators.
-    const proxyKey = (p) => JSON.stringify([p.host, p.port, p.username || '', p.password || ''])
+    const proxyKey = (p) => JSON.stringify([p.scheme || 'socks5', p.host, p.port, p.username || '', p.password || ''])
     const existing = new Set(this.state.proxies.map(proxyKey))
     for (const parsed of records) {
       if (!parsed || parsed.__invalid || !parsed.host || !parsed.port) {
@@ -673,7 +679,7 @@ export class ProxyPool extends EventEmitter {
           skipped.push({
             line: label,
             reason: 'parse_failed',
-            message: 'Invalid SOCKS5 endpoint; IPv6 requires [host]:port or socks5h://[host]:port',
+            message: 'Invalid proxy endpoint; use socks5://, http:// or https://; IPv6 requires [host]:port',
           })
         continue
       }
@@ -685,7 +691,7 @@ export class ProxyPool extends EventEmitter {
       existing.add(key)
       const proxy = {
         id: uid('px'),
-        scheme: 'socks5',
+        scheme: parsed.scheme || 'socks5',
         host: parsed.host,
         port: parsed.port,
         username: parsed.username,
@@ -864,7 +870,8 @@ export class ProxyPool extends EventEmitter {
     const p = this.state.proxies.find((x) => x.id === proxyId)
     if (!p) return { ok: false, error: 'proxy_not_found' }
     const has = (k) => Object.prototype.hasOwnProperty.call(patch, k)
-    const connection = ['host', 'port', 'username', 'password'].some(has)
+    const connection = ['scheme', 'host', 'port', 'username', 'password'].some(has)
+    if (connection && isLocalEgressProxy(p)) return { ok: false, error: 'local_proxy_not_editable' }
     if (!connection && !has('label') && !has('domain_forward')) {
       return { ok: false, error: 'no_editable_fields' }
     }
@@ -895,6 +902,7 @@ export class ProxyPool extends EventEmitter {
       return { ok: false, error: 'password_without_username' }
     }
     const next = socks5Record({
+      scheme: has('scheme') ? patch.scheme : p.scheme || 'socks5',
       host: has('host') ? patch.host : p.host,
       port: has('port') ? patch.port : p.port,
       username,
@@ -904,6 +912,8 @@ export class ProxyPool extends EventEmitter {
       password: has('password') ? patch.password : username ? p.password : null,
     })
     if (!next) return { ok: false, error: 'invalid_proxy' }
+    p.scheme = next.scheme
+    p.protocol = next.scheme
     p.host = next.host
     p.port = next.port
     p.username = next.username
@@ -1095,6 +1105,7 @@ export class ProxyPool extends EventEmitter {
     const host = normalizeSocksHost(proxy.host)
     if (!host) return { ok: false, error: 'invalid_proxy_host', latency_ms: null }
     const timeout = this.state.config.probe_timeout_ms || 8000
+    if (proxy.scheme === 'http' || proxy.scheme === 'https') return this._probeHttp(proxy, timeout)
     const started = Date.now()
     return new Promise((resolve) => {
       const socket = net.connect({ host, port: proxy.port })
@@ -1148,6 +1159,56 @@ export class ProxyPool extends EventEmitter {
       socket.on('close', () => {
         if (!done) finish(connected, connected ? null : 'connection_closed')
       })
+    })
+  }
+
+  // CONNECT checks the configured credentials and tunnel support, not just an open port.
+  async _probeHttp(proxy, timeout) {
+    const started = Date.now()
+    return new Promise((resolve) => {
+      const host = normalizeSocksHost(proxy.host)
+      const secure = proxy.scheme === 'https'
+      const socket = secure
+        ? tls.connect({
+            host,
+            port: proxy.port,
+            servername: net.isIP(host) ? undefined : host,
+            ALPNProtocols: ['http/1.1'],
+          })
+        : net.connect({ host, port: proxy.port })
+      this._probeSockets.set(socket, proxy)
+      let done = false
+      let response = ''
+      const finish = (ok, error = null) => {
+        if (done) return
+        done = true
+        clearTimeout(timer)
+        this._probeSockets.delete(socket)
+        socket.destroy()
+        const blocked = proxyBlockedReason(proxy, this.state.config.ipv6_enabled)
+        resolve(
+          blocked
+            ? { ok: false, scope: 'policy', error: blocked, latency_ms: null }
+            : { ok, error, latency_ms: Date.now() - started },
+        )
+      }
+      const timer = setTimeout(() => finish(false, 'timeout'), timeout)
+      socket.once(secure ? 'secureConnect' : 'connect', () => {
+        const auth = proxy.username
+          ? `Proxy-Authorization: Basic ${Buffer.from(`${proxy.username}:${proxy.password || ''}`).toString('base64')}\r\n`
+          : ''
+        socket.write(`CONNECT api.anthropic.com:443 HTTP/1.1\r\nHost: api.anthropic.com:443\r\n${auth}\r\n`)
+      })
+      socket.on('data', (data) => {
+        response += data.toString('latin1')
+        if (response.length > 32768) return finish(false, 'proxy_response_too_large')
+        if (!response.includes('\r\n\r\n')) return
+        const status = /^HTTP\/1\.[01] (\d{3})(?: |\r\n)/.exec(response)?.[1]
+        if (status && Number(status) >= 200 && Number(status) < 300) finish(true)
+        else finish(false, status === '407' ? 'proxy_auth_rejected' : `proxy_connect_${status || 'invalid_response'}`)
+      })
+      socket.once('error', (e) => finish(false, e.code || 'proxy_connect_failed'))
+      socket.once('close', () => finish(false, 'connection_closed'))
     })
   }
 
@@ -1449,6 +1510,8 @@ export class ProxyPool extends EventEmitter {
     return {
       id: p.id,
       url: socksProxyUrl(p, 'socks5'),
+      scheme: p.scheme || 'socks5',
+      domain_forward: !!p.domain_forward,
       host: p.host,
       port: p.port,
       username: p.username || null,

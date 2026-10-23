@@ -27,6 +27,13 @@ describe('proxy action outcomes', () => {
     expect(editOutcome({ workers: [], egress: null }).level).toBe('success')
   })
 
+  it('reports automatic updates to bound slots', () => {
+    expect(editOutcome({ workers: [{ vm_id: 'vm-1', ok: true }] })).toEqual({
+      level: 'success',
+      text: '已保存，已自动更新 1 台槽位配置',
+    })
+  })
+
   it('lists failed slot reloads after editing a proxy', () => {
     const out = editOutcome({
       workers: [

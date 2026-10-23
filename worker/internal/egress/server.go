@@ -255,8 +255,8 @@ func spliceIdle(a, b net.Conn, dest string, idle time.Duration) error {
 				break
 			}
 		}
-		if tcp, ok := dst.(*net.TCPConn); ok {
-			_ = tcp.CloseWrite()
+		if half, ok := dst.(interface{ CloseWrite() error }); ok {
+			_ = half.CloseWrite()
 		} else {
 			_ = dst.Close()
 		}

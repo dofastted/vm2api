@@ -688,3 +688,20 @@ test('egress wait loops do not shell out to python3', () => {
   const src = fs.readFileSync(path.join(import.meta.dirname, '../../src/lib/vm/egress.mjs'), 'utf8')
   assert.equal(src.includes('python3'), false)
 })
+
+test('changing only proxy protocol replaces the running egress helper', async (t) => {
+  const fixture = egressFixture(t, 'px-protocol-change')
+  let previousPid
+  for (const scheme of ['socks5h', 'http', 'https']) {
+    const proxyUrl = `${scheme}://192.0.2.1:1080`
+    const result = await fixture.start({ proxyUrl })
+    assert.equal(result.ok, true, result.error)
+    assert.equal(JSON.parse(fs.readFileSync(fixture.configPath, 'utf8')).proxy_url, proxyUrl)
+    await waitForProcess(() => egressPidActive(result.pid, fixture.configPath))
+    if (previousPid) {
+      assert.notEqual(result.pid, previousPid)
+      assert.equal(egressPidActive(previousPid, fixture.configPath), false)
+    }
+    previousPid = result.pid
+  }
+})

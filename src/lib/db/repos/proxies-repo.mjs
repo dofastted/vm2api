@@ -80,7 +80,7 @@ export class ProxiesRepo {
           ...COLUMNS.map((c) => {
             if (c === 'enabled') return p.enabled === false ? 0 : 1
             if (c === 'domain_forward') return p.domain_forward ? 1 : 0
-            if (c === 'protocol') return p.protocol ?? p.scheme ?? 'socks5'
+            if (c === 'protocol') return p.scheme ?? p.protocol ?? 'socks5'
             if (c === 'name') return p.name ?? (p.host && p.port != null ? `${p.host}:${p.port}` : p.id)
             return p[c] ?? null
           }),

@@ -5554,6 +5554,7 @@ export function createPanelHandler(ctx) {
         }
         const result = proxyPool.importLines(text, {
           fields: body.proxies || body.entries || null,
+          scheme: body.scheme ?? body.protocol,
           host: body.host,
           port: body.port,
           username: body.username ?? body.user,
@@ -5644,7 +5645,7 @@ export function createPanelHandler(ctx) {
         // Forward only the keys the caller actually sent — update() reads
         // presence, not value, to tell "leave alone" from "clear".
         const patch = {}
-        for (const key of ['host', 'port', 'username', 'password', 'label', 'domain_forward']) {
+        for (const key of ['scheme', 'host', 'port', 'username', 'password', 'label', 'domain_forward']) {
           if (Object.prototype.hasOwnProperty.call(body, key)) patch[key] = body[key]
         }
         const result = proxyPool.update(id, patch)

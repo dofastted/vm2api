@@ -483,3 +483,56 @@ test('OpenAI scheduling HTTP panel status uses live OpenAI gates, not Claude thr
     fs.rmSync(gw.project, { recursive: true, force: true })
   }
 })
+
+test('proxy type edit automatically updates bound slot configuration', async () => {
+  const gw = await startGateway()
+  try {
+    const added = await api(gw, 'POST', '/api/panel/proxies/import', {
+      body: { text: 'socks5://alice:secret@127.0.0.1:18080' },
+    })
+    assert.equal(added.status, 200, added.text)
+    const id = (added.json.data || added.json).items[0].id
+    const bound = await api(gw, 'POST', `/api/panel/proxies/${id}/bind`, {
+      body: { vm_id: 'vm-sim-01' },
+    })
+    assert.equal(bound.status, 200, bound.text)
+    for (const scheme of ['http', 'https', 'socks5']) {
+      const edited = await api(gw, 'PUT', `/api/panel/proxies/${id}`, { body: { scheme } })
+      assert.equal(edited.status, 200, edited.text)
+      const result = edited.json.data || edited.json
+      assert.equal(result.proxy.scheme, scheme)
+      assert.ok(result.workers.some((w) => w.vm_id === 'vm-sim-01' && w.ok))
+      assert.doesNotMatch(edited.text, /alice|secret/)
+      const vm = JSON.parse(fs.readFileSync(path.join(gw.project, 'vms', 'vm-sim-01.json'), 'utf8'))
+      assert.equal(vm.proxy.scheme, scheme)
+      assert.equal(vm.proxy.url, `${scheme}://alice:secret@127.0.0.1:18080`)
+    }
+  } finally {
+    await gw.stop()
+  }
+})
+
+test('structured proxy import preserves scheme and protocol fields', async () => {
+  const gw = await startGateway()
+  try {
+    for (const type of [{ scheme: 'http' }, { protocol: 'https' }, {}]) {
+      const expected = type.scheme || type.protocol || 'socks5'
+      const added = await api(gw, 'POST', '/api/panel/proxies/import', {
+        body: { ...type, host: '127.0.0.1', port: 18080, username: 'alice', password: 'secret' },
+      })
+      assert.equal(added.status, 200, added.text)
+      const data = added.json.data || added.json
+      assert.equal(data.added, 1)
+      assert.equal(data.items[0].scheme, expected)
+      const revealed = await api(gw, 'POST', `/api/panel/proxies/${data.items[0].id}/reveal`)
+      assert.equal(revealed.status, 200, revealed.text)
+      assert.equal((revealed.json.data || revealed.json).uri, `${expected}://alice:secret@127.0.0.1:18080`)
+    }
+    const invalid = await api(gw, 'POST', '/api/panel/proxies/import', {
+      body: { scheme: 'ftp', host: '127.0.0.1', port: 18080 },
+    })
+    assert.equal((invalid.json.data || invalid.json).added, 0)
+  } finally {
+    await gw.stop()
+  }
+})

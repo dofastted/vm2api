@@ -120,7 +120,7 @@ function proxyDocument(proxy, label) {
   const username = proxy.username == null || proxy.username === '' ? null : String(proxy.username)
   const password = username == null || proxy.password == null ? null : String(proxy.password)
   return {
-    kind: 'socks5',
+    kind: proxy.scheme || proxy.kind || 'socks5',
     host,
     port,
     username,
@@ -269,6 +269,7 @@ function parseProxy(raw) {
     return fail('invalid_proxy', 'SOCKS5 不能只有密码没有用户名')
   }
   const parsed = parseSocks5Fields({
+    scheme: kind || 'socks5',
     host: raw.host,
     port: raw.port,
     username: raw.username ?? raw.user,
@@ -278,7 +279,7 @@ function parseProxy(raw) {
   return {
     ok: true,
     value: {
-      kind: 'socks5',
+      kind: parsed.scheme,
       host: parsed.host,
       port: parsed.port,
       username: parsed.username,

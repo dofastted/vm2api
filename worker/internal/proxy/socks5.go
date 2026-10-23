@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -14,24 +15,26 @@ import (
 )
 
 type Dialer struct {
-	Address  string
-	Username string
-	Password string
-	Timeout  time.Duration
+	Scheme    string
+	tlsConfig *tls.Config
+	Address   string
+	Username  string
+	Password  string
+	Timeout   time.Duration
 }
 
 func New(rawURL string, timeout time.Duration) (*Dialer, error) {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
-		return nil, fmt.Errorf("parse SOCKS5 URL: %w", err)
+		return nil, fmt.Errorf("parse proxy URL: %w", err)
 	}
-	if u.Scheme != "socks5" && u.Scheme != "socks5h" {
-		return nil, fmt.Errorf("unsupported SOCKS5 scheme %q", u.Scheme)
+	if u.Scheme != "socks5" && u.Scheme != "socks5h" && u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported proxy scheme %q", u.Scheme)
 	}
 	host := u.Hostname()
 	port := u.Port()
 	if host == "" || port == "" {
-		return nil, errors.New("SOCKS5 URL requires host and port")
+		return nil, errors.New("proxy URL requires host and port")
 	}
 	username := ""
 	password := ""
@@ -39,7 +42,7 @@ func New(rawURL string, timeout time.Duration) (*Dialer, error) {
 		username = u.User.Username()
 		password, _ = u.User.Password()
 	}
-	if len(username) > 255 || len(password) > 255 {
+	if (u.Scheme == "socks5" || u.Scheme == "socks5h") && (len(username) > 255 || len(password) > 255) {
 		return nil, errors.New("SOCKS5 username/password exceeds 255 bytes")
 	}
 	if timeout <= 0 {
@@ -47,6 +50,7 @@ func New(rawURL string, timeout time.Duration) (*Dialer, error) {
 	}
 	return &Dialer{
 		Address:  net.JoinHostPort(host, port),
+		Scheme:   u.Scheme,
 		Username: username,
 		Password: password,
 		Timeout:  timeout,
@@ -62,6 +66,9 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 	}
 	if sameHostPort(address, d.Address) {
 		return nil, fmt.Errorf("refusing SOCKS CONNECT to the proxy address %s; DialContext must receive the upstream host", d.Address)
+	}
+	if d.Scheme == "http" || d.Scheme == "https" {
+		return d.dialHTTP(ctx, address)
 	}
 	base := &net.Dialer{Timeout: d.Timeout}
 	conn, err := base.DialContext(ctx, "tcp", d.Address)

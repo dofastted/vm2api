@@ -5,6 +5,7 @@
 - [FORMAT.md](FORMAT.md) — 本地与 CI 同一套格式（Biome / gofmt / Prettier，LF）
 - [API.md](API.md) — `/v1`
 - [RISK.md](RISK.md) — 封控拦截（蒸馏 → 硬正则 → 拒答缓存 → 决策模型 → 放行出站）
+- [proxy-protocols.md](proxy-protocols.md) — 槽位 SOCKS5 / HTTP / HTTPS 出口与自动切换
 - [PANEL_API.md](PANEL_API.md) — 管理台 API
 - 抄本：[deploy/env.example](deploy/env.example) · [deploy/vm2api.service](deploy/vm2api.service)
 
