@@ -15,7 +15,10 @@ import { UnitCircuit } from '../../src/lib/pool/unit-circuit.mjs'
 
 const MODEL = 'claude-test'
 
-function setup(t, { mode = 'session', graceMs = 0, owners = {}, config = {}, workerHealth = null } = {}) {
+function setup(
+  t,
+  { mode = 'session', graceMs = 0, owners = {}, policies = {}, config = {}, workerHealth = null } = {},
+) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-session-routing-'))
   const vms = path.join(root, 'vms')
   fs.mkdirSync(vms, { recursive: true })
@@ -32,7 +35,7 @@ function setup(t, { mode = 'session', graceMs = 0, owners = {}, config = {}, wor
         proxy: { id: `proxy-${id}`, url: `socks5h://127.0.0.1:${11000 + index}` },
         runtime: { worker_socket: path.join(vms, id, 'run', 'worker.sock') },
         ...(owners[id] ? { owner_user_id: owners[id] } : {}),
-        policy: { maxConcurrency: 2, concurrencyOverride: true, sessionSlots: 4, weight: 1 },
+        policy: { maxConcurrency: 2, concurrencyOverride: true, sessionSlots: 4, weight: 1, ...policies[id] },
         claude: {
           account_uuid: `account-${index}`,
           account_tier: 'max',
@@ -870,4 +873,74 @@ test('kernel slot_busy retries the bound account within its deadline and preserv
   assert.deepEqual(h.pool.snapshot().inflight, {})
   assert.equal(h.pool.queuedTotal(), 0)
   assert.equal((await h.run('busy-root')).vmId, 'vm-01')
+})
+
+test('balanced session assignment spreads sequential roots across different priorities after every request ends', async (t) => {
+  const h = setup(t, { policies: { 'vm-01': { priority: 6 }, 'vm-02': { priority: 3 } } })
+  const homes = []
+  for (const root of ['root-a', 'root-b', 'root-c', 'root-d']) {
+    const result = await h.run(root)
+    assert.equal(result.ok, true)
+    homes.push(result.vmId)
+    assert.equal(h.pool.planner.seats.size, 0)
+  }
+  assert.deepEqual(homes, ['vm-01', 'vm-02', 'vm-01', 'vm-02'])
+  const resumed = await Promise.all(['root-a', 'root-b', 'root-c', 'root-d'].map((root) => h.select(root)))
+  assert.deepEqual(
+    resumed.map((result) => result.vmId),
+    homes,
+  )
+  assert.deepEqual(h.pool.snapshot().inflight, { 'account-1': 2, 'account-2': 2 })
+})
+
+test('released seats and a control-plane restart retain root load and the original account', async (t) => {
+  const h = setup(t, { graceMs: 10, policies: { 'vm-01': { priority: 6 }, 'vm-02': { priority: 3 } } })
+  const first = await h.select('root-a')
+  first.release()
+  await waitFor(() => h.pool.planner.seats.size === 0)
+  h.restart()
+  const second = await h.run('root-b')
+  assert.equal(second.vmId, 'vm-02')
+  const resumed = await h.run('root-a')
+  assert.equal(resumed.vmId, first.vmId)
+})
+
+test('child contexts count as one root when distributing subsequent independent sessions', async (t) => {
+  const h = setup(t, { policies: { 'vm-01': { priority: 6 }, 'vm-02': { priority: 3 } } })
+  assert.equal((await h.run('root-a')).vmId, 'vm-01')
+  for (const child of ['child-a', 'child-b', 'child-c']) {
+    assert.equal((await h.run(child, { parent: 'root-a' })).vmId, 'vm-01')
+  }
+  assert.equal((await h.run('root-b')).vmId, 'vm-02')
+  assert.equal((await h.run('root-c')).vmId, 'vm-01')
+})
+
+test('new session load accounts for each account concurrency capacity', async (t) => {
+  const h = setup(t, {
+    policies: { 'vm-01': { priority: 6, maxConcurrency: 4 }, 'vm-02': { priority: 3, maxConcurrency: 2 } },
+  })
+  const homes = []
+  for (const root of ['root-a', 'root-b', 'root-c', 'root-d', 'root-e', 'root-f']) homes.push((await h.run(root)).vmId)
+  assert.deepEqual(homes, ['vm-01', 'vm-02', 'vm-01', 'vm-01', 'vm-02', 'vm-01'])
+})
+
+test('a resumed unmarked root keeps its account and contributes load for new sessions', async (t) => {
+  const h = setup(t, { policies: { 'vm-01': { priority: 6 }, 'vm-02': { priority: 3 } } })
+  const old = h.route('old-root')
+  h.sticky.bind(old.familyKey, { accountId: 'account-1', vmId: 'vm-01' }, { countHit: false })
+  h.sticky.bind(old.stickyKey, { accountId: 'account-1', vmId: 'vm-01', sessionId: 'existing-outbound' })
+  h.restart()
+  assert.equal((await h.run('old-root')).vmId, 'vm-01')
+  assert.equal(h.sticky.resolve(old.stickyKey).sessionId, 'existing-outbound')
+  assert.equal((await h.run('new-root')).vmId, 'vm-02')
+  assert.equal(h.sticky.resolve(old.familyKey).vmId, 'vm-01')
+})
+
+test('fill session assignment retains its priority-first placement', async (t) => {
+  const h = setup(t, {
+    policies: { 'vm-01': { priority: 6 }, 'vm-02': { priority: 3 } },
+    config: { strategy: 'fill' },
+  })
+  assert.equal((await h.run('root-a')).vmId, 'vm-01')
+  assert.equal((await h.run('root-b')).vmId, 'vm-01')
 })
