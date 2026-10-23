@@ -82,7 +82,7 @@ import { ClusterError } from './lib/cluster/ssh-link.mjs'
 import { nodeEgressProxyUrl, startNodeEgressSocks } from './lib/cluster/node-egress-socks.mjs'
 import { createSlotShell } from './lib/vm/slot-shell.mjs'
 import { vmLockBusy } from './lib/vm/vm-file.mjs'
-import { refreshSlotGuestBinDir } from './lib/vm/vm-runtime.mjs'
+import { refreshSlotGuestBinDir, syncLocalSlotRestartPolicies } from './lib/vm/vm-runtime.mjs'
 
 import {
   classifyCredentialRefresh,
@@ -1304,6 +1304,9 @@ function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'))
 process.on('SIGINT', () => shutdown('SIGINT'))
 
+if (process.env.KIN_CRS_MOCK !== '1') {
+  syncLocalSlotRestartPolicies(listVms(cfg.paths.project))
+}
 await bootApiKernel(cfg)
 
 server.listen(cfg.port, cfg.host, () => {
@@ -1327,7 +1330,7 @@ server.listen(cfg.port, cfg.host, () => {
   } catch (e) {
     console.warn('[kernel-watchdog] start failed', e?.message || e)
   }
-  // Boot fills what Docker's restart policy missed (removed or exited slot containers); off with the watchdog.
+  // Proxy slots do not auto-start with Docker: boot restores egress before starting recorded-running slots.
   if (process.env.KIN_CRS_MOCK !== '1' && normalizeKernelWatchdogConfig(routingConfig.kernel_watchdog).enabled) {
     reviveDownSlots({ vms: listVms(cfg.paths.project), powerOn: bootSlot, watchdog: kernelWatchdog }).catch((e) =>
       console.warn('[slot-revive] boot pass failed', e?.message || e),

@@ -156,6 +156,9 @@ export function iptablesPlan({ chain, bridge, subnet, tcpPort, dnsPort }) {
   ]
   return {
     add: [
+      // Fail closed even while the helper starts or the NAT chain is rebuilt.
+      ['-t', 'filter', '-C', 'FORWARD', '-i', bridge, '!', '-d', subnet, '-j', 'DROP'],
+      ['-t', 'filter', '-I', 'FORWARD', '1', '-i', bridge, '!', '-d', subnet, '-j', 'DROP'],
       ['-t', 'nat', '-N', chain],
       ['-t', 'nat', '-C', 'PREROUTING', '-i', bridge, '-j', chain],
       ['-t', 'nat', '-A', 'PREROUTING', '-i', bridge, '-j', chain],
@@ -168,8 +171,6 @@ export function iptablesPlan({ chain, bridge, subnet, tcpPort, dnsPort }) {
         ['-t', 'filter', '-C', 'INPUT', ...rule],
         ['-t', 'filter', '-I', 'INPUT', '1', ...rule],
       ]),
-      ['-t', 'filter', '-C', 'FORWARD', '-i', bridge, '!', '-d', subnet, '-j', 'DROP'],
-      ['-t', 'filter', '-I', 'FORWARD', '1', '-i', bridge, '!', '-d', subnet, '-j', 'DROP'],
     ],
     del: [
       ['-t', 'nat', '-D', 'PREROUTING', '-i', bridge, '-j', chain],
@@ -817,6 +818,8 @@ export async function startProxyEgress(
     tcpPort: selectedPorts.tcp,
     dnsPort: selectedPorts.dns,
   })
+  const rules = applyIptables(plan, runIptables)
+  if (!rules.ok) return rules
   const started = await startEgressProcess({
     projectRoot,
     proxyId,
@@ -832,11 +835,6 @@ export async function startProxyEgress(
   if (!started.ok) return started
   if (!waitListen(listenHost, selectedPorts.tcp, 8000, selectedPorts.tcp > 0 ? started.pid : 0))
     return { ok: false, error: `kin-egress ${listenHost}:${selectedPorts.tcp} did not listen`, pid: started.pid }
-  const rules = applyIptables(plan, runIptables)
-  if (!rules.ok) {
-    stopEgressProcess(projectRoot, proxyId)
-    return rules
-  }
   return {
     ok: true,
     network: net.name,
