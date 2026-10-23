@@ -156,11 +156,77 @@ const SYSTEM_BILLING_CCH = new RegExp(
   'gim',
 )
 
+/**
+ * Billing literals echoed inside conversation history.
+ *
+ * The final CLI serialization stamps the digest by rewriting the first
+ * `x-anthropic-billing-header: … cch=xxxxx;` literal it finds in the request
+ * JSON, and `messages` is serialized ahead of `system`. When a prompt carries a
+ * captured request body (debug dumps, redacted transcripts, logs an agent read
+ * back into the conversation) that literal shadows the real system billing
+ * line: the digest lands in the history instead, and the history entry changes
+ * on every turn. The rotating literal breaks the cached prefix, so cache reads
+ * pin to the static system+tools head and each turn re-writes the tail.
+ *
+ * Break the literal in message content only, so the stamp always lands on the
+ * system block. WORD JOINER is invisible, does not split words, and makes the
+ * rewrite idempotent: the joined digest no longer matches the pattern.
+ */
+const MESSAGE_BILLING_CCH_LITERAL = /(x-anthropic-billing-header:[^"\r\n]*?\bcch=)([0-9a-f]{5})(?=;)/gi
+export const BILLING_LITERAL_JOINER = '\u2060'
+
+function joinBillingLiterals(text) {
+  if (!text.includes('x-anthropic-billing-header')) return text
+  return text.replace(
+    MESSAGE_BILLING_CCH_LITERAL,
+    (_match, prefix, digest) => `${prefix}${BILLING_LITERAL_JOINER}${digest}`,
+  )
+}
+
+function joinBillingLiteralsDeep(value) {
+  if (typeof value === 'string') return joinBillingLiterals(value)
+  if (Array.isArray(value)) {
+    let changed = false
+    const next = value.map((item) => {
+      const out = joinBillingLiteralsDeep(item)
+      changed ||= out !== item
+      return out
+    })
+    return changed ? next : value
+  }
+  if (value && typeof value === 'object') {
+    let changed = false
+    const next = {}
+    for (const [key, item] of Object.entries(value)) {
+      const out = joinBillingLiteralsDeep(item)
+      changed ||= out !== item
+      next[key] = out
+    }
+    return changed ? next : value
+  }
+  return value
+}
+
+/**
+ * Neutralize billing literals in `messages` so the later CLI seal step cannot
+ * mistake conversation history for the request's own billing line.
+ */
+export function neutralizeMessageBillingLiterals(body) {
+  if (!body || typeof body !== 'object' || !Array.isArray(body.messages)) return body
+  const messages = joinBillingLiteralsDeep(body.messages)
+  return messages === body.messages ? body : { ...body, messages }
+}
+
 /** Native hops leave the placeholder for the CLI's final SDK serialization. */
 export function sealClaudeCodeCch(body, { enabled = true, seal = true } = {}) {
   if (body == null || (typeof body !== 'string' && typeof body !== 'object')) return body
   const stringBody = typeof body === 'string'
-  const normalized = normalizeSystemCch(stringBody ? JSON.parse(body) : body)
+  const parsed = stringBody ? JSON.parse(body) : body
+  // Native hop (seal=false): the CLI stamps the digest itself and picks the
+  // first billing literal in the serialized JSON, which is a message when the
+  // request carries `messages` ahead of `system`. Join history literals there
+  // so the stamp lands on the system block; every other hop leaves them intact.
+  const normalized = seal ? normalizeSystemCch(parsed) : neutralizeMessageBillingLiterals(normalizeSystemCch(parsed))
   if (!enabled || !seal) return stringBody ? JSON.stringify(normalized) : normalized
   const raw = JSON.stringify(normalized)
   let billing = false

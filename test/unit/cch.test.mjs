@@ -4,7 +4,9 @@ import { xxh64 } from '../../src/lib/identity/xxh64.mjs'
 import {
   CCH_PLACEHOLDER,
   CCH_XXH64_SEED,
+  BILLING_LITERAL_JOINER,
   computeClaudeCodeCch,
+  neutralizeMessageBillingLiterals,
   projectClaudeCodeCchText,
   sealClaudeCodeCch,
 } from '../../src/lib/identity/cch.mjs'
@@ -208,4 +210,93 @@ test('no inbound system still emits billing, identity, official prompt, and env'
   assert.equal(out.system[2].text, CRS_OFFICIAL_AGENT_PROMPT)
   assert.deepEqual(out.system[2].cache_control, { type: 'ephemeral', ttl: '1h' })
   assert.match(out.system[3].text, /^# Environment\n/)
+})
+
+const ECHOED_BILLING = `x-anthropic-billing-header: cc_version=2.1.296.9ee; cc_entrypoint=sdk-cli; cch=${CCH_PLACEHOLDER}; cc_prompt_id=29b4a976-cd69-4dc5-a2b6-9e0cd730125d;`
+
+function echoedBody(content) {
+  return {
+    model: 'claude-sonnet-5-5',
+    max_tokens: 32,
+    system: [
+      {
+        type: 'text',
+        text: 'x-anthropic-billing-header: cc_version=2.1.296.9ee; cc_entrypoint=sdk-cli; cch=00000; cc_prompt_id=11111111-2222-4333-8444-555555555555;',
+      },
+      { type: 'text', text: "You are a Claude agent, built on Anthropic's Claude Agent SDK." },
+    ],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'here is the captured request' }] },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'cat debug.log' } }],
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content }] },
+      { role: 'user', content: [{ type: 'text', text: 'continue' }] },
+    ],
+  }
+}
+
+test('native hop joins echoed billing literals so the CLI stamp cannot land on history', () => {
+  const body = echoedBody(`DEBUG-BEGIN ${ECHOED_BILLING} DEBUG-END`)
+  const native = finalizeWorkerPayload({
+    body,
+    reqHeaders: {},
+    exec: { vm: { claude: { mode: 'oauth' } } },
+    routing: { compatibility: { cch_enabled: true } },
+    cliHop: true,
+  }).body
+
+  const history = native.messages[2].content[0].content
+  assert.ok(history.includes(BILLING_LITERAL_JOINER), 'echoed literal must be joined')
+  assert.doesNotMatch(history, /cc_entrypoint=sdk-cli; cch=[0-9a-f]{5};/)
+
+  // The real system line still holds the placeholder for the CLI to stamp.
+  assert.match(native.system[0].text, /cch=00000;/)
+  assert.equal((native.system[0].text.match(/cch=/g) || []).length, 1)
+
+  // Visible text is unchanged once the invisible joiner is stripped.
+  assert.equal(history.split(BILLING_LITERAL_JOINER).join(''), `DEBUG-BEGIN ${ECHOED_BILLING} DEBUG-END`)
+})
+
+test('non-native hops leave echoed history literals untouched', () => {
+  const body = echoedBody(`DEBUG-BEGIN ${ECHOED_BILLING} DEBUG-END`)
+  for (const cliHop of [false, undefined]) {
+    const out = finalizeWorkerPayload({
+      body,
+      reqHeaders: {},
+      exec: { vm: { claude: { mode: 'oauth' } } },
+      routing: { compatibility: { cch_enabled: true } },
+      cliHop,
+    }).body
+    assert.equal(out.messages[2].content[0].content, `DEBUG-BEGIN ${ECHOED_BILLING} DEBUG-END`)
+  }
+})
+
+test('billing literal joining is idempotent and only touches billing-shaped text', () => {
+  const once = neutralizeMessageBillingLiterals(echoedBody(`A ${ECHOED_BILLING} B`))
+  const twice = neutralizeMessageBillingLiterals(once)
+  assert.deepEqual(twice, once)
+
+  const plain = {
+    model: 'm',
+    messages: [
+      { role: 'user', content: 'cch=abcde; without a billing prefix' },
+      { role: 'user', content: `x-anthropic-billing-header: no digest here;` },
+      { role: 'user', content: `x-anthropic-billing-header: xxx; cch=zzzzz;` },
+    ],
+  }
+  assert.equal(neutralizeMessageBillingLiterals(plain), plain)
+})
+
+test('joined history literals keep the cached prefix stable across turns', () => {
+  const turn1 = neutralizeMessageBillingLiterals(echoedBody(`DEBUG-BEGIN ${ECHOED_BILLING} DEBUG-END`))
+  const turn2Body = JSON.parse(JSON.stringify(turn1))
+  turn2Body.messages.push({ role: 'assistant', content: [{ type: 'text', text: 'ok' }] })
+  turn2Body.messages.push({ role: 'user', content: [{ type: 'text', text: 'next' }] })
+  const turn2 = neutralizeMessageBillingLiterals(turn2Body)
+
+  // Every message the next turn replays must be byte-identical to turn 1.
+  const serialized = (body) => JSON.stringify(body.messages.slice(0, turn1.messages.length))
+  assert.equal(serialized(turn2), serialized(turn1))
 })
