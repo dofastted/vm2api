@@ -2,6 +2,8 @@
 
 ## 未发布
 
+- 本机 SOCKS5 槽位不再随 Docker 守护进程抢先启动：使用 `restart=no`，由控制面的自动恢复流程先恢复代理规则再启动槽位；升级时原地迁移已有容器的重启策略。出口初始化先安装阻断规则，代理进程失败时保持断网。升级后须确认控制面启动成功，再重启 Docker；详见 `docs/DEPLOY.md`。
+
 - cli-node 补齐 `Accept: application/json, text/event-stream` 与 `Accept-Encoding: gzip, br`，在 CCH 密封后按最终 UTF-8 请求体写 `Content-Length`；修复旧 SDK 把毫秒 timeout 写入 `x-stainless-timeout` 的问题（缺省 `600000` → `600` 秒）。对应构建尚未进 payload。
 - 以 v1.3.221 生产验证产物为基线：`deploy/payload.json` 改指 `payload-2026.10.23-v1.3.221`，并钉住 `kin-worker` / `kin-egress` / `kin-slot-gate`（与线上逐字节一致）。release.yml 与 amd64 镜像不再从源码编译这三个 helper；改 `worker/` 后须重新钉 payload 才会发出。ARM64 镜像与附件不变。
 - CI 合并为单个 job：格式与语法、payload 校验、Node unit、Go vet/test、web；去掉 ARM64 冒烟、真链路 CCH e2e 与 ARM64 主机脚本测试。

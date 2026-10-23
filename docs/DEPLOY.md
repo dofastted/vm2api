@@ -112,6 +112,10 @@ docker exec vm2api python3 -c 'import urllib.request; print(urllib.request.urlop
 kin-<槽> 容器 → keg* 网桥 → 宿主机 kin-egress（网关 IP:端口）→ SOCKS5 → 上游
 ```
 
+本机 SOCKS5 槽位（Docker / KVM）的重启策略为 `no`：由控制面的内核自动恢复流程负责进程崩溃和开机恢复，Docker 不再独立启动槽位。控制面启动时通过现有自动恢复流程，先安装阻断与代理规则，再启动记录为运行中的槽位；如果控制面启动失败、代理不可用或关闭了内核自动恢复，槽位保持停止，需恢复控制面或在面板手动启动。暂停的槽位不会被开机恢复。本地直连出口和远端节点的启动策略不变。
+
+升级时控制面会用 `docker update --restart no` 原地迁移已有本机代理槽位（包括暂停槽位的容器），不重建槽位、不改凭据。请先升级并确认控制面成功启动，再重启 Docker。迁移失败会阻止控制面启动并打印错误；不能仅凭版本号认定已启用保护。该保护针对 Docker 守护进程重启；不要手工 `docker start` 代理槽位或清除其防火墙规则，`live-restore` 场景也不在此启动顺序保证范围内。
+
 控制面用 iptables 把容器的 TCP 和 DNS 重定向到宿主机上的 `kin-egress`。这一跳的目的地是宿主机本身，要经过宿主机 **INPUT** 链。UFW 默认入站 `DROP`，而 vm2api 不改你的 INPUT 规则，所以需要手动放行：
 
 | 项 | 值 |
