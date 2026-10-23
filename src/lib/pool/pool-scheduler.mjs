@@ -836,6 +836,23 @@ export class PoolScheduler extends EventEmitter {
     })
   }
 
+  /** A global root may use another free VM, without passing its local or earlier global waiters. */
+  queuedRootCandidates(ticket, triggeredVmId, claimOptions) {
+    const candidates = [...ticket.candidates.values()].filter((candidate) => {
+      if (!this.refreshSeatCandidate(candidate, claimOptions) || !this.isReservable(candidate)) return false
+      if (!this.planner.canOpen(candidate.vmId, candidate.seatCap, candidate.headroom)) return false
+      // The triggering VM already served its own queue in pumpOne(). Other
+      // VMs must retain their local queues and earlier compatible global turns.
+      return (
+        candidate.vmId === triggeredVmId ||
+        (!this.planner.hasConcWaiters(candidate.vmId) &&
+          !this.planner.hasSeatWaiters(candidate.vmId, { beforeTicket: ticket }))
+      )
+    })
+    const open = candidates.filter((candidate) => !candidate.draining)
+    return this.rankSessionCandidates(open.length ? open : candidates)
+  }
+
   /** Synchronous policy recheck for session claims, including queued grants.
    * Reuse the same gates as discovery; only the already-read worker health is cached.
    * Reservation and root binding follow in this same turn of the event loop.
@@ -966,16 +983,24 @@ export class PoolScheduler extends EventEmitter {
       accepts: (id) => ticket.kind === 'global' && ticket.candidates.has(id),
       vmIds: () => [...ticket.candidates.keys()],
       tryGrant: (id) => {
-        const candidate = ticket.candidates.get(id)
-        const granted = this.claimSeat(ticket.seatKey, candidate, 'queued', claimOptions)
-        if (!granted) {
+        const unboundRoot =
+          ticket.kind === 'global' &&
+          claimOptions.sessionAssignment &&
+          claimOptions.assignmentKey &&
+          this.planner.strategy === 'balanced' &&
+          !this.stickyRouter?.resolve?.(claimOptions.assignmentKey)
+        const choices = unboundRoot ? this.queuedRootCandidates(ticket, id, claimOptions) : [ticket.candidates.get(id)]
+        for (const candidate of choices) {
+          const granted = this.claimSeat(ticket.seatKey, candidate, 'queued', claimOptions)
+          if (granted) {
+            ticket.granted = granted
+            return true
+          }
           // A live policy change invalidated the queued snapshot. Re-read the
           // whole pool before moving this family; never revive the old pin.
           if (candidate?.stale) ticket.wake?.()
-          return false
         }
-        ticket.granted = granted
-        return true
+        return false
       },
     }
     this.planner.enqueue(ticket)

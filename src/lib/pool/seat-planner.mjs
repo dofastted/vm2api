@@ -136,10 +136,14 @@ export class SeatPlanner {
    * A queued ticket that can take a new seat on this VM. A newcomer must not
    * open one while any of these wait: that would jump the queue.
    */
-  hasSeatWaiters(vmId) {
+  hasSeatWaiters(vmId, { beforeTicket = null } = {}) {
     const id = String(vmId)
     if ((this.vmQueues.get(id) || []).some((ticket) => ticket.kind === 'seat')) return true
-    return this.globalQueue.some((ticket) => ticket.accepts(id))
+    for (const ticket of this.globalQueue) {
+      if (ticket === beforeTicket) break
+      if (ticket.accepts(id)) return true
+    }
+    return false
   }
 
   /** Seated requests of this VM already waiting for concurrency: newcomers line up behind them. */
