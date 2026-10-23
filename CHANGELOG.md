@@ -2,6 +2,8 @@
 
 ## 未发布
 
+- 阻止回显 billing 字面量旋转缓存前缀（cli hop `seal=false`：messages 内完整 `cch=` 字面量前插入 U+2060，避免回填落在历史消息上）。（#690）
+
 ## 1.3.219 — 2026-10-23
 
 - `kin-guest-exec`：修正 `if ! run_ssh` 在 POSIX 下吞掉真实退出码的问题；来宾非零退出、ssh 255、timeout 124 不再误报为 0，控制面不再把来宾崩溃误判为 `worker_output_invalid`。（#680）
