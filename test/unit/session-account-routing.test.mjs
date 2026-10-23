@@ -987,3 +987,77 @@ test('old roots concentrated on one account are never redistributed by balancing
   }
   assert.equal((await h.run('new-b')).vmId, 'vm-02')
 })
+
+test('a queued new root uses durable load when multiple accounts become available together', async (t) => {
+  const h = setup(t)
+  assert.equal((await h.run('old-root')).vmId, 'vm-01')
+  let blocked = true
+  h.pool.accountQuota.canAccept = () =>
+    blocked ? { ok: false, reason: 'rpm_limit', detail: { reset_at: Date.now() + 100 } } : { ok: true }
+  h.pool.accountQuota.tryAcquire = h.pool.accountQuota.canAccept
+  const pending = h.select('new-root', { allowWait: true })
+  await waitFor(() => h.pool.planner.globalQueue.length === 1)
+  blocked = false
+  h.pool.planner.pump('vm-01')
+  const selected = await pending
+  assert.equal(selected.vmId, 'vm-02')
+  assert.deepEqual([...h.sticky.rootAssignmentCounts()].sort(), [
+    ['account-1', 1],
+    ['account-2', 1],
+  ])
+  assert.equal(h.sticky.resolve(h.route('old-root').familyKey).vmId, 'vm-01')
+})
+
+test('a later global root cannot take another account ahead of an earlier compatible waiter', async (t) => {
+  const h = setup(t)
+  for (const root of ['old-a', 'old-b']) {
+    const seeded = await h.select(root, { excluded: new Set(['account-2']) })
+    assert.equal(seeded.vmId, 'vm-01')
+    seeded.release()
+  }
+  let blocked = true
+  h.pool.accountQuota.canAccept = () =>
+    blocked ? { ok: false, reason: 'rpm_limit', detail: { reset_at: Date.now() + 100 } } : { ok: true }
+  h.pool.accountQuota.tryAcquire = h.pool.accountQuota.canAccept
+  const first = h.select('first-root', {
+    allowWait: true,
+    keyScope: { group_type: 'anthropic', allowed_vms: ['vm-02'] },
+  })
+  await waitFor(() => h.pool.planner.globalQueue.length === 1)
+  const second = h.select('second-root', { allowWait: true })
+  await waitFor(() => h.pool.planner.globalQueue.length === 2)
+  blocked = false
+  h.pool.planner.pump('vm-01')
+  assert.equal((await second).vmId, 'vm-01')
+  assert.equal(h.pool.planner.globalQueue.length, 1)
+  h.pool.planner.pump('vm-02')
+  assert.equal((await first).vmId, 'vm-02')
+  assert.equal(h.pool.queuedTotal(), 0)
+})
+
+test('a queued new root does not take capacity ahead of an old session waiting on its home', async (t) => {
+  const h = setup(t)
+  for (const root of ['old-a', 'old-b']) {
+    const seeded = await h.select(root, { excluded: new Set(['account-2']) })
+    assert.equal(seeded.vmId, 'vm-01')
+    seeded.release()
+  }
+  const home = await h.select('old-home', { excluded: new Set(['account-1']) })
+  assert.equal(home.vmId, 'vm-02')
+  home.release()
+  let blocked = true
+  h.pool.accountQuota.canAccept = () =>
+    blocked ? { ok: false, reason: 'rpm_limit', detail: { reset_at: Date.now() + 100 } } : { ok: true }
+  h.pool.accountQuota.tryAcquire = h.pool.accountQuota.canAccept
+  const old = h.select('old-home', { allowWait: true })
+  await waitFor(() => h.pool.queuedTotal() === 1)
+  const fresh = h.select('new-root', { allowWait: true })
+  await waitFor(() => h.pool.planner.globalQueue.length === 1)
+  blocked = false
+  h.pool.planner.pump('vm-01')
+  assert.equal((await fresh).vmId, 'vm-01')
+  h.pool.planner.pump('vm-02')
+  assert.equal((await old).vmId, 'vm-02')
+  assert.equal(h.sticky.resolve(h.route('old-home').familyKey).vmId, 'vm-02')
+  assert.equal(h.pool.queuedTotal(), 0)
+})
