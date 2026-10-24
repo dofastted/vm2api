@@ -111,7 +111,7 @@ SSH 扩展槽同样由控制面经绑定出口换票。拿到授权后，提交�
 
 ## 调度资格
 
-网页「可用」= 调度会选。死凭证出池并拆粘性。缺 refresh 的过期票不入池。`POST /api/panel/vms/:id/schedulable` 只改是否入池，不改容器状态。
+网页「可用」= 调度会选。死凭证出池并拆粘性，记为不可调度（`unschedulable`），只有重新导入凭证或操作员调度开才回池；后台刷新成功不会自动开回。缺 refresh 的过期票不入池。`POST /api/panel/vms/:id/schedulable` 只改是否入池，不改容器状态。四态定义见 `PANEL_API.md`「调度状态（四态）」。
 
 ## 管理 API
 

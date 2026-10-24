@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import type { Vm } from '@/types/panel-vm'
+import type { ScheduleState, Vm } from '@/types/panel-vm'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { expiresAtToMs } from '@/lib/fable-status'
@@ -21,14 +21,22 @@ function formatRestrictionUntil(until: number | null | undefined): string {
 }
 
 export function vmSchedulableProps(vm: Vm) {
+  const scheduleState: ScheduleState | undefined = isRestrictedSchedule(vm)
+    ? 'restricted'
+    : vm.schedule_state
   return {
     vmId: vm.id,
-    schedulable: vm.schedulable !== false,
-    scheduleState: isRestrictedSchedule(vm)
-      ? ('restricted' as const)
-      : vm.schedule_state,
+    // 受限（含维护 / 代理暂停）仍是「开」：开关只表达操作员意图和不可调度。
+    schedulable:
+      scheduleState === 'restricted'
+        ? true
+        : scheduleState
+          ? scheduleState === 'on'
+          : vm.schedulable !== false,
+    scheduleState,
     restrictionUntil: restrictionUntilOf(vm),
     restrictionReason: vm.restriction_reason,
+    unschedulableText: vm.unschedulable_text || vm.unschedulable_reason || null,
   }
 }
 
@@ -37,13 +45,15 @@ export function SchedulableSwitch({
   schedulable,
   scheduleState,
   restrictionUntil,
+  unschedulableText,
   className,
 }: {
   vmId: string
   schedulable: boolean
-  scheduleState?: 'on' | 'restricted' | 'off'
+  scheduleState?: ScheduleState
   restrictionUntil?: number | null
   restrictionReason?: string | null
+  unschedulableText?: string | null
   className?: string
 }) {
   const qc = useQueryClient()
@@ -74,13 +84,15 @@ export function SchedulableSwitch({
 
   const untilText = formatRestrictionUntil(restrictionUntil)
   const tooltip =
-    restricted && checked
-      ? untilText
-        ? `调度开，当前受限至 ${untilText}`
-        : '调度开，当前受限'
-      : checked
-        ? '点击关闭调度'
-        : '点击开启调度'
+    scheduleState === 'unschedulable' && !checked
+      ? `不可调度：${unschedulableText || '错误'}。处理后点击重新开启调度`
+      : restricted && checked
+        ? untilText
+          ? `调度开，当前受限至 ${untilText}`
+          : '调度开，当前受限'
+        : checked
+          ? '点击关闭调度'
+          : '点击开启调度'
 
   return (
     <Tooltip>

@@ -151,10 +151,22 @@ test('fatal refresh takes a non-manual slot out of the pool', () => {
   assert.equal(failed.claude.refresh_error, 'invalid_grant')
   assert.equal(failed.schedulable, false)
   assert.equal(failed.schedule_disabled_reason, 'oauth_invalid_grant')
+  assert.equal(failed.unschedulable.reason, 'oauth_invalid_grant')
+  // A background refresh / mirror does not reopen 不可调度 (operator action only).
   persistOauthToVm(vmPath, { has_access: true, has_refresh: true, expires_at: Date.now() + 3600_000 })
+  const mirrored = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+  assert.equal(mirrored.claude.refresh_error, null)
+  assert.equal(mirrored.schedulable, false)
+  assert.equal(mirrored.unschedulable.reason, 'oauth_invalid_grant')
+  // An operator import does.
+  persistOauthToVm(
+    vmPath,
+    { has_access: true, has_refresh: true, expires_at: Date.now() + 3600_000 },
+    { operatorImport: true },
+  )
   const restored = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-  assert.equal(restored.claude.refresh_error, null)
   assert.equal(restored.schedulable, true)
+  assert.equal(restored.unschedulable, undefined)
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
@@ -180,7 +192,9 @@ test('fatal refresh parks a schedule_manual slot that was still in the pool', ()
   assert.equal(failed.schedulable, false)
   assert.equal(failed.schedule_disabled_reason, 'oauth_invalid_grant')
   assert.equal(failed.status, 'paused')
-  assert.equal(failed.schedule_manual, true)
+  // The operator's "on" does not shield the slot from a dead grant.
+  assert.equal(failed.unschedulable.reason, 'oauth_invalid_grant')
+  assert.equal(failed.schedule_off, undefined)
   fs.rmSync(dir, { recursive: true, force: true })
 })
 

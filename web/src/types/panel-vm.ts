@@ -188,6 +188,8 @@ export type VmPhysicalFeatures = {
   runtimes?: string | null
 }
 
+export type ScheduleState = 'on' | 'off' | 'unschedulable' | 'restricted'
+
 export type Vm = {
   id: string
   name?: string
@@ -231,10 +233,27 @@ export type Vm = {
   proxy_id?: string
   schedulable?: boolean
   schedule_manual?: boolean
-  /** Operator switch vs quota/cooldown park. */
-  schedule_state?: 'on' | 'restricted' | 'off'
+  /**
+   * 四态：调度开 / 调度关（仅操作员）/ 不可调度（确定性错误，人工开回）/
+   * 受限（自动恢复）。由后端 `resolveSlotState` 给出，前端不再自行推断。
+   */
+  schedule_state?: ScheduleState
   restriction_reason?: string | null
+  /** 受限原因文案（后端归因表）。 */
+  restriction_text?: string | null
   restriction_until?: number | null
+  /** `new_session`：只拦新会话，已入座会话照常（席位满、临近闸线）。 */
+  restriction_scope?: 'slot' | 'new_session' | null
+  /** 软受限：全池没有「开」的槽时新会话仍可落上来。 */
+  restriction_soft?: boolean
+  unschedulable_reason?: string | null
+  unschedulable_text?: string | null
+  unschedulable_detail?: Record<string, unknown> | null
+  schedule_off?: boolean
+  schedule_hold?: {
+    reason: string
+    detail?: Record<string, unknown> | null
+  } | null
   /** Claude 单元熔断（Codex 为 null）。连续 5xx 达阈值后打开，到期只放 1 个探测。 */
   circuit?: VmCircuit | null
   cooldown_until?: number

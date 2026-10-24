@@ -46,7 +46,7 @@ import { sha256File } from './backup-core.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { BackupRepo } from '../db/repos/backup-repo.mjs'
 import { reconcileVms } from '../vm/vm-db-sync.mjs'
-import { repairSlotSmbios, repairVmProxyCliEnabled } from '../vm/vm-registry.mjs'
+import { migrateScheduleFields, repairSlotSmbios, repairVmProxyCliEnabled } from '../vm/vm-registry.mjs'
 import { invalidateReadCache, isVmRecordFile } from '../vm/vm-file.mjs'
 
 // tarAvailability / sha256File / the runnable pipeline live in backup-core.mjs;
@@ -365,6 +365,9 @@ export class BackupService {
           } catch {}
           try {
             repairSlotSmbios(this.projectRoot)
+          } catch {}
+          try {
+            migrateScheduleFields(this.projectRoot)
           } catch {}
         } catch {}
       }

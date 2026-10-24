@@ -449,6 +449,7 @@ export class FailoverRunner {
     onCredentialFailure = null,
     onFablePlanDenied = null,
     onFableSuccess = null,
+    onSchedulePause = null,
   } = {}) {
     this.scheduler = scheduler
     this.stickyRouter = stickyRouter
@@ -459,6 +460,7 @@ export class FailoverRunner {
     this.onCredentialFailure = onCredentialFailure
     this.onFablePlanDenied = onFablePlanDenied
     this.onFableSuccess = onFableSuccess
+    this.onSchedulePause = onSchedulePause
     this.sessionTails = new Map()
     this.searchRepairs = new Map()
   }
@@ -531,6 +533,16 @@ export class FailoverRunner {
     if (typeof this.onCredentialFailure === 'function') {
       try {
         this.onCredentialFailure({ selected, policy })
+      } catch {}
+    }
+  }
+
+  /** Upstream refused this seat outright: move its conversations off and park it for the operator. */
+  pauseUnit(selected, policy, result) {
+    this.scheduler.releaseAccountSessions?.({ accountId: selected?.accountId, vmId: selected?.vmId })
+    if (typeof this.onSchedulePause === 'function') {
+      try {
+        this.onSchedulePause({ selected, policy, result })
       } catch {}
     }
   }
@@ -962,6 +974,7 @@ export class FailoverRunner {
           continue
         }
         applyCooldown(this.scheduler, selected, policy, model, { diagnosticPin: !!pinVmId })
+        if (policy.pauseSchedule) this.pauseUnit(selected, policy, result)
         if (!pinVmId && isCredentialDeath(policy)) {
           this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys })
           if (familyKey) {

@@ -33,6 +33,12 @@ import { isCodexVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { slotDockerCpus } from './machine-spec.mjs'
 import { bindVmProxy, getVm, patchVmRecord, vmHasSchedulableCredential } from './vm-registry.mjs'
+import {
+  applyClearUnschedulable,
+  applyUnschedulable,
+  deriveScheduleFields,
+  migrateScheduleRecord,
+} from '../pool/schedule-state.mjs'
 import { isCredentialRefreshFailed } from '../pool/availability.mjs'
 
 const HEALTH_TIMEOUT_MS = 1500
@@ -361,8 +367,19 @@ export async function diagnoseSlotServices(
 /**
  * The POST /start boot: bind (or allocate) the exit, adopt its timezone, start
  * the container and its inference runtime, then record the running intent.
+ * `by` is the action behind the boot: 'start' (operator /start) reopens 关机 and
+ * a failed boot; 'recover_ok' (operator 恢复服务) reopens any 不可调度; null
+ * (watchdog revive) only records whether a ticket is on disk.
  */
-export async function powerOnSlot({ projectRoot, id, proxyPool, routing = {}, fillTimezone = null, ops = {} }) {
+export async function powerOnSlot({
+  projectRoot,
+  id,
+  proxyPool,
+  routing = {},
+  fillTimezone = null,
+  ops = {},
+  by = null,
+}) {
   let vm = getVm(projectRoot, id)
   if (!vm) return { ok: false, status: 404, code: 'vm_not_found', error: 'vm not found' }
   try {
@@ -392,11 +409,18 @@ export async function powerOnSlot({ projectRoot, id, proxyPool, routing = {}, fi
   const runtime = boot.runtime || boot.docker?.runtime
   vm =
     patchVmRecord(projectRoot, id, (record) => {
-      const next = {
-        status: 'running',
-        schedulable: hasCred,
-        schedule_disabled_reason: hasCred ? null : 'no_credential',
+      migrateScheduleRecord(record)
+      if (by === 'start' && record.schedule_off_reason === 'stopped') {
+        delete record.schedule_off
+        delete record.schedule_off_reason
       }
+      if (!hasCred) applyUnschedulable(record, 'no_credential')
+      else if (by === 'recover_ok') applyClearUnschedulable(record, { by })
+      else if (by === 'start' && record.unschedulable?.reason === 'runtime_start_failed') {
+        applyClearUnschedulable(record, { by: 'operator' })
+      } else applyClearUnschedulable(record, { by: 'credential_present' })
+      deriveScheduleFields(record)
+      const next = { status: 'running' }
       if (runtime) {
         const currentRuntime = record.runtime || {}
         next.runtime = { ...runtime }
@@ -521,7 +545,7 @@ export async function recoverSlot({
     }
     if (proceed) {
       await step('start', async () =>
-        startStepResult(await powerOn({ projectRoot, id, proxyPool, routing, fillTimezone })),
+        startStepResult(await powerOn({ projectRoot, id, proxyPool, routing, fillTimezone, by: 'recover_ok' })),
       )
     }
     // Only an attempted boot earns a fresh budget; a cycle that never reached start fixed nothing.

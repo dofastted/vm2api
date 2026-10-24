@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events'
-import { getVm, listVms, setVmSchedulable } from '../vm/vm-registry.mjs'
+import { getVm, listVms, markUnschedulable, migrateVmSchedule } from '../vm/vm-registry.mjs'
 import { vmCliHomePath, vmJsonPath } from '../vm/execution-context.mjs'
 import {
   expiresAtToMs,
@@ -973,9 +973,9 @@ export class PoolScheduler extends EventEmitter {
       if (
         this.projectRoot &&
         isSlotProxyDesynced(vm, this.projectRoot) &&
-        vm.schedule_disabled_reason !== 'proxy_desynced'
+        vm.unschedulable?.reason !== 'proxy_desynced'
       ) {
-        setVmSchedulable(this.projectRoot, vm.id, false, 'proxy_desynced')
+        markUnschedulable(this.projectRoot, vm.id, 'proxy_desynced')
       }
       return proxySync
     }
@@ -995,6 +995,9 @@ export class PoolScheduler extends EventEmitter {
             vm.schedulable = live.schedulable
             vm.schedule_disabled_reason = live.schedule_disabled_reason
             vm.schedule_manual = live.schedule_manual
+            vm.schedule_off = live.schedule_off
+            vm.unschedulable = live.unschedulable
+            vm.schedule_hold = live.schedule_hold
             vm.claude = live.claude || vm.claude
             vm.temp_unschedulable_until = live.temp_unschedulable_until
             vm.temp_unschedulable_reason = live.temp_unschedulable_reason
@@ -1033,14 +1036,6 @@ export class PoolScheduler extends EventEmitter {
           now,
         })
         if (!ev.accept) {
-          if (
-            this.projectRoot &&
-            vm.schedulable !== false &&
-            ev.reason === 'quota_refresh_failed' &&
-            vm.schedule_disabled_reason !== 'disabled'
-          ) {
-            setVmSchedulable(this.projectRoot, vm.id, false, 'quota_refresh_failed', { preserveStatus: true })
-          }
           if (ev.key === 'cool') {
             // cooldown is a wait, not a hard skip — handled below
           } else {
@@ -1221,14 +1216,7 @@ export class PoolScheduler extends EventEmitter {
         } catch {}
       }
       if (value?.ok && (value?.credential?.has_access || value?.credential?.has_refresh) && exec.vmId) {
-        try {
-          const live = getVm(this.projectRoot, exec.vmId)
-          const leftoverOff =
-            live?.schedule_disabled_reason === 'oauth_cleared' || live?.schedule_disabled_reason === 'oauth_no_refresh'
-          if (leftoverOff && value.credential?.has_access && !live.claude?.refresh_error) {
-            setVmSchedulable(this.projectRoot, exec.vmId, true)
-          }
-        } catch {}
+        // A live worker ticket does not reopen 不可调度: only an operator action does.
         // Leftover TTL must not wipe a 401 park. Only a newer generation is a rotation.
         if (prevGen > 0 && nextGen > prevGen) {
           this.clearAuthCooldownFor(exec.vmId, exec.accountId)
@@ -1749,7 +1737,7 @@ export class PoolScheduler extends EventEmitter {
       const until = Number(ev.until) || now + 5 * 60_000
       this.applyQuotaRestriction(vm, accountId, { until, reason: ev.reason, file })
       if (leftover) {
-        setVmSchedulable(this.projectRoot, vm.id, true, null, { preserveStatus: true, source: 'force' })
+        migrateVmSchedule(this.projectRoot, vm.id)
         vm.schedulable = true
         vm.schedule_disabled_reason = null
         return { action: 'restore', reason: ev.reason, until }
@@ -1759,7 +1747,7 @@ export class PoolScheduler extends EventEmitter {
     if (ev.accept) {
       this.clearQuotaRestriction(vm, accountId, file)
       if (leftover) {
-        setVmSchedulable(this.projectRoot, vm.id, true, null, { preserveStatus: true, source: 'force' })
+        migrateVmSchedule(this.projectRoot, vm.id)
         vm.schedulable = true
         vm.schedule_disabled_reason = null
         return { action: 'enable', reason: null }
@@ -1767,7 +1755,7 @@ export class PoolScheduler extends EventEmitter {
       return { action: 'clear', reason: null }
     }
     if (leftover) {
-      setVmSchedulable(this.projectRoot, vm.id, true, null, { preserveStatus: true, source: 'force' })
+      migrateVmSchedule(this.projectRoot, vm.id)
       vm.schedulable = true
       vm.schedule_disabled_reason = null
       return { action: 'restore', reason: ev.reason || null }

@@ -8,7 +8,7 @@ import { fableRow } from '@/features/vm/usage-meter'
 
 /**
  * 状态分区。机架内按它分段，顶部构成条用它筛选。
- * `bad` 与 `revoke` 在这里合成一区：两者处理方式相同（重新授权），
+ * `bad`、`revoke` 与其余「不可调度」合成一区：都要人工处理后再调度开，
  * 分开只会让运维多扫一段。
  */
 export type VmZone = 'pool' | 'restricted' | 'off' | 'none' | 'dead'
@@ -54,15 +54,17 @@ export const ZONES: readonly ZoneDef[] = [
   },
   {
     key: 'dead',
-    label: '无效凭证',
-    hint: '最近坏的在前',
+    label: '不可调度',
+    hint: '凭证失效、组织禁用或配置错误，需人工处理；最近坏的在前',
     tone: 'bad',
     color: 'var(--status-bad-solid)',
   },
 ]
 
 export function zoneOfGroup(group: FleetGroup): VmZone {
-  return group === 'bad' || group === 'revoke' ? 'dead' : group
+  return group === 'bad' || group === 'revoke' || group === 'unschedulable'
+    ? 'dead'
+    : group
 }
 
 export function zoneOf(vm: Vm): VmZone {
@@ -204,7 +206,15 @@ export function rackTotals(
   accounts?: UsageAccountRow[]
 ): RackTotals {
   const t: RackTotals = {
-    groups: { pool: 0, restricted: 0, off: 0, none: 0, bad: 0, revoke: 0 },
+    groups: {
+      pool: 0,
+      restricted: 0,
+      off: 0,
+      none: 0,
+      bad: 0,
+      revoke: 0,
+      unschedulable: 0,
+    },
     seatsUsed: 0,
     seatsMax: 0,
     ledger: [],

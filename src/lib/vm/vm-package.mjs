@@ -11,6 +11,7 @@ import { normalizeAuthScheme } from '../oauth/auth-scheme.mjs'
 import { persistOauthToVm, readWorkerCredentialFile, writeWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
 import { oauthToSub2apiExport, sub2apiAccountToOauth } from '../oauth/sub2api-account.mjs'
 import { parseScheduleLevelInput } from '../pool/credential-weight.mjs'
+import { applyScheduleOff, applyUnschedulable, migrateScheduleRecord } from '../pool/schedule-state.mjs'
 import { parseAllowedModelsPatch } from '../pool/slot-model-gate.mjs'
 import { activeHoursOf, parseActiveHoursInput } from '../pool/active-hours.mjs'
 import { parseVmQuotaOverride } from '../pool/vm-quota-override.mjs'
@@ -455,26 +456,18 @@ function applyTraits(vm, spec) {
 }
 
 function applySchedule(vm, spec, hasCredential) {
+  migrateScheduleRecord(vm)
   const operatorOff = spec.vm.schedule_manual === true && spec.vm.schedulable === false
   if (operatorOff) {
-    vm.schedule_manual = true
-    vm.schedulable = false
-    vm.schedule_disabled_reason = 'disabled'
+    applyScheduleOff(vm, true)
     return
   }
-  vm.schedule_manual = spec.vm.schedule_manual === true
   if (!hasCredential) {
-    vm.schedulable = false
-    vm.schedule_disabled_reason = 'no_credential'
+    applyUnschedulable(vm, 'no_credential')
     return
   }
-  vm.schedulable = spec.vm.schedulable !== false
-  if (vm.schedulable) {
-    const reason = String(vm.schedule_disabled_reason || '')
-    if (!reason || reason === 'disabled' || reason === 'no_credential') vm.schedule_disabled_reason = null
-  } else if (!vm.schedule_disabled_reason) {
-    vm.schedule_disabled_reason = 'disabled'
-  }
+  // Importing a package is an operator action: its switch decides, and it reopens 不可调度.
+  applyScheduleOff(vm, spec.vm.schedulable === false)
 }
 
 function credentialPresent(spec, vm) {
@@ -494,7 +487,7 @@ function writeCredential(projectRoot, id, spec) {
   const oauth = spec.credential.oauth
   const file = writeWorkerCredentialFile(home, oauth)
   if (!file) return fail('credential_required', 'Claude 包需要 access_token、refresh_token 或 api_key')
-  persistOauthToVm(path.join(projectRoot, 'vms', `${id}.json`), oauth, { acceptLiveGrant: true })
+  persistOauthToVm(path.join(projectRoot, 'vms', `${id}.json`), oauth, { acceptLiveGrant: true, operatorImport: true })
   return { ok: true }
 }
 
@@ -642,6 +635,7 @@ export async function commitVmPackage({
       updated_at: new Date().toISOString(),
       schedulable: false,
       schedule_disabled_reason: 'no_credential',
+      unschedulable: { reason: 'no_credential', detail: null, at: new Date().toISOString() },
       proxy_cli_enabled: false,
       proxy_required: false,
       seed_policy: standardSeedPolicy(),

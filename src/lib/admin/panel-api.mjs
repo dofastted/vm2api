@@ -18,7 +18,7 @@ import {
   vmHasClaudeCredential,
   persistAccountTier,
   isCodexVm,
-  setVmSchedulable,
+  migrateVmSchedule,
 } from '../vm/vm-registry.mjs'
 import { clearRecoverableVmCooldown, markVmRefreshError } from '../oauth/oauth-credentials.mjs'
 import {
@@ -38,6 +38,7 @@ import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import { filterVmsForPanel } from './resource-owner.mjs'
 import { computeWeeklySplit, publicWeeklySplit, weeklySplitConfig } from '../pool/weekly-split.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
+import { pickScheduleFields } from '../pool/schedule-state.mjs'
 import { socksProxyFamily, normalizeSocksHost } from '../vm/socks-address.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from '../pool/quota-tiers.mjs'
 import { applyVmQuotaConfig, applyVmQuotaPolicy, vmQuotaOverrideOf, vmQuotaView } from '../pool/vm-quota-override.mjs'
@@ -1723,8 +1724,17 @@ function mergeVmProxy(v, poolSnap, { role = 'admin', nodes = [] } = {}) {
 
 function enrichVm(v, accountQuota, active, extras = {}) {
   if (extras.projectRoot && isLeftoverQuotaScheduleOff(v)) {
-    setVmSchedulable(extras.projectRoot, v.id, true, null, { preserveStatus: true, source: 'force' })
-    v = { ...v, schedulable: true, schedule_disabled_reason: null }
+    migrateVmSchedule(extras.projectRoot, v.id)
+    const fresh = getVm(extras.projectRoot, v.id)
+    if (fresh) {
+      v = {
+        ...v,
+        schedulable: fresh.schedulable,
+        schedule_manual: fresh.schedule_manual,
+        schedule_disabled_reason: fresh.schedule_disabled_reason,
+        ...pickScheduleFields(fresh),
+      }
+    }
   }
   const acc = findAccount(accountQuota, v)
   const runtime = findRuntime(accountQuota, v)
@@ -1877,13 +1887,16 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     v.cooldown_reason ||
     availability.reason ||
     null
+  const circuit = isCodex ? null : circuitViewFor(v, extras.projectRoot)
+  const seatsMax = isCodex ? null : resolveSessionSlots(v, extras.routingConfig || {})
   const triad = resolveScheduleState({
-    schedulable: v.schedulable !== false,
-    scheduleManual: v.schedule_manual === true,
-    scheduleDisabledReason: v.schedule_disabled_reason || null,
+    vm: v,
     availability,
     restrictionUntil,
     restrictionReason,
+    circuit,
+    seats: isCodex ? null : { used: Number(seatRow?.seats_used) || 0, max: seatsMax },
+    sessions: isCodex ? { active: codexSessions?.active, max: codexSessions?.max } : null,
   })
   return {
     id: v.id,
@@ -2015,8 +2028,14 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     schedule_state: triad.schedule_state,
     restriction_reason: triad.restriction_reason,
     restriction_until: triad.restriction_until,
+    restriction_text: triad.restriction_text,
+    restriction_scope: triad.restriction_scope,
+    restriction_soft: triad.restriction_soft,
+    unschedulable_reason: triad.unschedulable_reason,
+    unschedulable_text: triad.unschedulable_text,
+    unschedulable_detail: triad.unschedulable_detail,
     // Claude unit circuit (Codex has its own failover set and never trips it).
-    circuit: isCodex ? null : circuitViewFor(v, extras.projectRoot),
+    circuit,
     refresh_error: v.refresh_error || v.claude?.refresh_error || runtime?.refresh_error || null,
     ...(isCodex
       ? {
@@ -2027,7 +2046,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
       : {}),
     // Live seat book from the seat planner (Claude only).
     seats_used: isCodex ? null : Number(seatRow?.seats_used) || 0,
-    seats_max: isCodex ? null : resolveSessionSlots(v, extras.routingConfig || {}),
+    seats_max: seatsMax,
     seats_grace: isCodex ? null : Number(seatRow?.seats_grace) || 0,
     queue_depth: isCodex ? null : Number(seatRow?.queue_depth) || 0,
     conc_waiting: isCodex ? null : Number(seatRow?.conc_waiting) || 0,
@@ -2050,6 +2069,8 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     schedulable: v.schedulable !== false,
     schedule_manual: v.schedule_manual === true,
     schedule_disabled_reason: v.schedule_disabled_reason || null,
+    schedule_off: v.schedule_off === true,
+    schedule_hold: v.schedule_hold || null,
     created_at: v.created_at || null,
   }
 }

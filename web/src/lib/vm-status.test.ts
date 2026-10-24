@@ -696,3 +696,85 @@ describe('rest period (working window) is scheduling, not cooldown or credential
     expect(credentialStatus(resting).key).not.toBe('rest')
   })
 })
+
+describe('four-state schedule model (backend resolveSlotState)', () => {
+  it('不可调度 shows the backend reason and groups with the dead zone', () => {
+    const vm = liveVm({
+      schedule_state: 'unschedulable',
+      schedulable: false,
+      unschedulable_reason: 'organization_disabled',
+      unschedulable_text: '组织禁用',
+    })
+    expect(scheduleStateLabel(vm)).toBe('不可调度')
+    expect(poolStatus(vm)).toMatchObject({
+      key: 'unschedulable',
+      text: '不可调度 · 组织禁用',
+      cls: 'bad',
+    })
+    expect(accountStatus(vm).text).toBe('不可调度 · 组织禁用')
+    expect(fleetGroup(vm)).toBe('unschedulable')
+    expect(fleetCounts([vm]).unschedulable).toBe(1)
+    expect(
+      restrictionCopy({
+        ...vm,
+        unschedulable_detail: { status: 403, message: 'OAuth not allowed' },
+      })
+    ).toBe('不可调度 · 组织禁用：OAuth not allowed')
+  })
+
+  it('a slot that never had a ticket stays 未使用, not an error', () => {
+    const vm = liveVm({
+      has_token: false,
+      has_refresh: false,
+      schedule_state: 'unschedulable',
+      unschedulable_reason: 'no_credential',
+      unschedulable_text: '无凭证',
+      availability: { key: 'none', usable: false, text: '无凭证' },
+    })
+    expect(fleetGroup(vm)).toBe('none')
+  })
+
+  it('restriction text comes from the backend table', () => {
+    const vm = liveVm({
+      schedule_state: 'restricted',
+      restriction_reason: 'maintenance',
+      restriction_text: '维护中',
+      restriction_scope: 'slot',
+    })
+    expect(poolStatus(vm).text).toBe('维护中')
+    expect(restrictionCopy(vm)).toBe('维护中')
+    expect(fleetGroup(vm)).toBe('restricted')
+  })
+
+  it('seats full is 受限 for new sessions only', () => {
+    const vm = liveVm({
+      schedule_state: 'restricted',
+      restriction_reason: 'seats_full',
+      restriction_text: '席位满',
+      restriction_scope: 'new_session',
+      seats_used: 4,
+      seats_max: 4,
+    })
+    expect(poolStatus(vm)).toMatchObject({
+      key: 'seats',
+      text: '席位满',
+      cls: 'caution',
+    })
+    expect(fleetGroup(vm)).toBe('restricted')
+    expect(scheduleStateLabel(vm)).toBe('受限')
+  })
+
+  it('a circuit restriction keeps the circuit tone', () => {
+    const vm = liveVm({
+      schedule_state: 'restricted',
+      restriction_reason: 'circuit_open',
+      restriction_text: '熔断中',
+      restriction_scope: 'slot',
+    })
+    expect(poolStatus(vm)).toMatchObject({
+      key: 'circuit',
+      text: '熔断中',
+      cls: 'bad',
+    })
+  })
+})

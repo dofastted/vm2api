@@ -22,7 +22,7 @@ import path from 'node:path'
 import { isDbOpen, getDb } from '../db/database.mjs'
 import { VmsRepo } from '../db/repos/vms-repo.mjs'
 import { setVmWriteHook, atomicWriteJson, isVmRecordFile } from './vm-file.mjs'
-import { reclaimAssignedVms, repairSlotSmbios, repairVmProxyCliEnabled } from './vm-registry.mjs'
+import { migrateScheduleFields, reclaimAssignedVms, repairSlotSmbios, repairVmProxyCliEnabled } from './vm-registry.mjs'
 
 let _repo = null
 let _watcher = null
@@ -176,6 +176,18 @@ export function initVmDbSync(projectRoot, { watch = true } = {}) {
     result.smbios_repaired = repairSlotSmbios(projectRoot).length
   } catch {
     result.smbios_repaired = 0
+  }
+  try {
+    const migrated = migrateScheduleFields(projectRoot)
+    result.schedule_migrated = migrated.length
+    for (const row of migrated) {
+      console.warn(
+        `[vm] schedule state ${row.id}: ${row.from || '-'} -> ${row.state}${row.reason ? `:${row.reason}` : ''}`,
+      )
+    }
+  } catch (error) {
+    console.warn(`[vm] schedule state migration failed: ${error?.message || error}`)
+    result.schedule_migrated = 0
   }
   if (watch) startVmWatch(projectRoot)
   return result

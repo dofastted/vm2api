@@ -13,6 +13,7 @@ import {
 } from './quota-window.mjs'
 import { GATE_DRAINING, GATE_GATED, gateZone, quotaGateOf } from './quota-gate.mjs'
 import { DEFAULT_TIER_POLICIES } from './quota-tiers.mjs'
+import { resolveSlotState } from './schedule-state.mjs'
 import { isOfficialUsageRateLimited } from '../oauth/crs-usage-probe.mjs'
 import { expiresAtToMs } from '../oauth/oauth-credentials.mjs'
 import {
@@ -512,49 +513,38 @@ export function isLeftoverQuotaScheduleOff(vm = {}, scheduleDisabledReason = nul
 }
 
 /**
- * Operator switch stays a boolean. Quota / cooldown / leftover Extra-off
- * collapse to restricted so the panel never paints them as 调度关.
+ * Panel verdict for one slot: on / off / unschedulable / restricted
+ * (see schedule-state.mjs). Legacy callers pass the three schedule fields;
+ * newer ones pass the whole record plus circuit / seat / session views.
  */
 export function resolveScheduleState({
+  vm = null,
   schedulable,
   scheduleManual,
   scheduleDisabledReason,
   availability = {},
   restrictionUntil = null,
   restrictionReason = null,
+  circuit = null,
+  seats = null,
+  sessions = null,
   now = Date.now(),
 } = {}) {
-  const leftover = isLeftoverQuotaScheduleOff(
-    {
-      schedulable,
-      schedule_manual: scheduleManual,
-      schedule_disabled_reason: scheduleDisabledReason,
-    },
-    scheduleDisabledReason,
-  )
-  if (schedulable === false && !leftover) {
-    return { schedule_state: 'off', restriction_reason: null, restriction_until: null }
+  const record = vm || {
+    schedulable,
+    schedule_manual: scheduleManual,
+    schedule_disabled_reason: scheduleDisabledReason,
   }
-  const until = Number(restrictionUntil) || Number(availability.until) || 0
-  const liveRestriction = until > now
-  // Rest is a scheduled shift, not a cooldown: stale cooldown fields must not mask it.
-  if (!liveRestriction && availability.key === 'rest') {
-    return {
-      schedule_state: 'restricted',
-      restriction_reason: availability.reason || 'rest_period',
-      restriction_until: Number(availability.until) || null,
-    }
-  }
-  const restricted = liveRestriction || availability.key === 'quota' || availability.key === 'cool'
-  if (restricted) {
-    return {
-      schedule_state: 'restricted',
-      restriction_reason:
-        restrictionReason || availability.reason || (leftover ? scheduleDisabledReason : null) || null,
-      restriction_until: liveRestriction ? until : availability.until || null,
-    }
-  }
-  return { schedule_state: 'on', restriction_reason: null, restriction_until: null }
+  return resolveSlotState({
+    vm: record,
+    availability,
+    restrictionReason,
+    restrictionUntil,
+    circuit,
+    seats,
+    sessions,
+    now,
+  })
 }
 
 /** True when 5h/7d is in 限制 and the account must not be scheduled or probed. */

@@ -14,7 +14,18 @@ import {
   markVmRestriction,
   expiresAtToMs,
 } from '../oauth/oauth-credentials.mjs'
-import { isManualScheduleLocked } from '../pool/schedule-policy.mjs'
+import {
+  HOLD_MAINTENANCE,
+  HOLD_PROXY,
+  applyClearHold,
+  applyClearUnschedulable,
+  applyHold,
+  applyScheduleOff,
+  applyUnschedulable,
+  deriveScheduleFields,
+  isUnschedulableReason,
+  migrateScheduleRecord,
+} from '../pool/schedule-state.mjs'
 import { isCredentialRefreshFailed, isLeftoverQuotaScheduleOff } from '../pool/availability.mjs'
 import { manualScheduleLevelOf, parseScheduleLevelInput } from '../pool/credential-weight.mjs'
 import { vmQuotaOverrideOf } from '../pool/vm-quota-override.mjs'
@@ -139,6 +150,9 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     schedulable: vm.schedulable !== false,
     schedule_manual: vm.schedule_manual === true,
     schedule_disabled_reason: vm.schedule_disabled_reason || null,
+    schedule_off: vm.schedule_off === true,
+    unschedulable: vm.unschedulable || null,
+    schedule_hold: vm.schedule_hold || null,
     temp_unschedulable_until: vm.claude?.temp_unschedulable_until || vm.temp_unschedulable_until || null,
     temp_unschedulable_reason: vm.claude?.temp_unschedulable_reason || vm.temp_unschedulable_reason || null,
     owner_user_id: normalizeOwnerId(vm.owner_user_id),
@@ -268,7 +282,7 @@ export function syncCodexQuotaSchedule(projectRoot, vm, { now = Date.now(), poli
       vm.temp_unschedulable_reason = next.temp_unschedulable_reason
     }
     if (leftover) {
-      setVmSchedulable(projectRoot, vm.id, true, null, { preserveStatus: true, source: 'force' })
+      migrateVmSchedule(projectRoot, vm.id)
       vm.schedulable = true
       vm.schedule_disabled_reason = null
     }
@@ -282,7 +296,7 @@ export function syncCodexQuotaSchedule(projectRoot, vm, { now = Date.now(), poli
       delete vm.temp_unschedulable_reason
     }
     if (leftover || ev.action === 'enable') {
-      setVmSchedulable(projectRoot, vm.id, true, null, { preserveStatus: true, source: 'force' })
+      migrateVmSchedule(projectRoot, vm.id)
       vm.schedulable = true
       vm.schedule_disabled_reason = null
       return { ...ev, action: 'enable' }
@@ -290,7 +304,7 @@ export function syncCodexQuotaSchedule(projectRoot, vm, { now = Date.now(), poli
     return { ...ev, action: 'clear' }
   }
   if (leftover) {
-    setVmSchedulable(projectRoot, vm.id, true, null, { preserveStatus: true, source: 'force' })
+    migrateVmSchedule(projectRoot, vm.id)
     vm.schedulable = true
     vm.schedule_disabled_reason = null
     return { action: 'enable', reason: null }
@@ -492,31 +506,92 @@ export function isVmScheduleReady(vm, { allowMissingCredential = false } = {}) {
   return true
 }
 
+/** Re-read vm.json, apply a schedule mutation, write. Returns the summary, or null when absent. */
+function writeSchedule(projectRoot, id, mutate) {
+  const file = path.join(projectRoot, 'vms', `${id}.json`)
+  if (!fs.existsSync(file)) return null
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  migrateScheduleRecord(vm)
+  if (mutate(vm) === false) return summarizeVm(vm)
+  atomicWriteJson(file, vm, { mode: 0o600 })
+  return summarizeVm(vm)
+}
+
+/** 调度关 / 调度开 by the operator. Turning on also clears 不可调度. */
+export function setScheduleOff(projectRoot, id, off, { reason = null, preserveStatus = true } = {}) {
+  return writeSchedule(projectRoot, id, (vm) => applyScheduleOff(vm, off, { reason, preserveStatus }))
+}
+
+/** A deterministic failure: the slot stays out until an operator action clears it. */
+export function markUnschedulable(projectRoot, id, reason, detail = null) {
+  return writeSchedule(projectRoot, id, (vm) => {
+    if (vm.unschedulable?.reason === reason && !detail) return false
+    applyUnschedulable(vm, reason, detail)
+  })
+}
+
+/** Rewrite one record onto the four-state fields (drops a leftover quota-off). */
+export function migrateVmSchedule(projectRoot, id) {
+  return writeSchedule(projectRoot, id, () => {})
+}
+
+/** `by` must be an operator action (see CLEAR_BY); background paths may not call this. */
+export function clearUnschedulable(projectRoot, id, { by, only = null } = {}) {
+  return writeSchedule(projectRoot, id, (vm) => {
+    if (!vm.unschedulable) return false
+    if (only && !only.includes(vm.unschedulable.reason)) return false
+    applyClearUnschedulable(vm, { by })
+  })
+}
+
+export function setScheduleHold(projectRoot, id, reason, detail = null) {
+  return writeSchedule(projectRoot, id, (vm) => applyHold(vm, reason, detail))
+}
+
+export function clearScheduleHold(projectRoot, id, reason, { tag = null } = {}) {
+  return writeSchedule(projectRoot, id, (vm) => {
+    if (vm.schedule_hold?.reason !== reason) return false
+    applyClearHold(vm, reason, { tag })
+  })
+}
+
+const LEGACY_WORKER_RELOAD = /^[a-z_]*_worker_reload$/
+
+/**
+ * Legacy entry point, kept as a router onto the four-state fields.
+ * - manual: the operator switch (on also clears 不可调度).
+ * - false + a deterministic reason → 不可调度; maintenance / proxy reasons → hold;
+ *   'disabled' / 'stopped' → 调度关.
+ * - true from automatic callers only fixes the soft paused mark: it never
+ *   reopens 调度关 or 不可调度 (decision 6). Holds are cleared by their owners.
+ */
 export function setVmSchedulable(
   projectRoot,
   id,
   schedulable,
   reason = null,
-  { preserveStatus = false, source = 'auto' } = {},
+  { preserveStatus = false, source = 'auto', detail = null } = {},
 ) {
-  const file = path.join(projectRoot, 'vms', `${id}.json`)
-  if (!fs.existsSync(file)) return null
-  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
-  const src = source === 'manual' || source === 'force' ? source : 'auto'
-  if (src === 'auto' && isManualScheduleLocked(vm)) return summarizeVm(vm)
-  if (src === 'manual') vm.schedule_manual = true
-  vm.schedulable = !!schedulable
-  vm.schedule_updated_at = new Date().toISOString()
-  vm.updated_at = vm.schedule_updated_at
-  if (schedulable) {
-    vm.schedule_disabled_reason = null
-    if (!preserveStatus && String(vm.status || '').toLowerCase() === 'paused') vm.status = 'running'
-  } else {
-    vm.schedule_disabled_reason = reason || 'disabled'
-    if (!preserveStatus && String(vm.status || '').toLowerCase() === 'running') vm.status = 'paused'
+  if (source === 'manual') {
+    return setScheduleOff(projectRoot, id, !schedulable, { reason, preserveStatus })
   }
-  atomicWriteJson(file, vm)
-  return summarizeVm(vm)
+  return writeSchedule(projectRoot, id, (vm) => {
+    if (schedulable) {
+      if (preserveStatus || vm.schedulable === false) return false
+      deriveScheduleFields(vm, { preserveStatus: false })
+      return
+    }
+    const code = String(reason || 'disabled')
+    if (code === 'disabled' || code === 'stopped') applyScheduleOff(vm, true, { reason: code, preserveStatus })
+    else if (code === KERNEL_UPDATE_HOLD || LEGACY_WORKER_RELOAD.test(code)) {
+      applyHold(vm, HOLD_MAINTENANCE, { tag: code })
+    } else if (/\|proxy=/.test(code)) {
+      applyHold(vm, HOLD_PROXY, { tag: /\|proxy=([^|\s]+)/.exec(code)?.[1] || null, message: code })
+    } else if (code === 'slot SOCKS5 proxy is required') applyUnschedulable(vm, 'proxy_required', detail)
+    else if (isUnschedulableReason(code)) applyUnschedulable(vm, code, detail)
+    else applyUnschedulable(vm, 'runtime_start_failed', { message: code.slice(0, 240), ...(detail || {}) })
+    if (!preserveStatus) deriveScheduleFields(vm, { preserveStatus: false })
+  })
 }
 export const KERNEL_UPDATE_HOLD = 'kernel_update'
 
@@ -524,7 +599,7 @@ export function holdSchedulableSlots(project, reason = KERNEL_UPDATE_HOLD) {
   const held = []
   for (const vm of listVms(project)) {
     if (vm?.schedulable === false) continue
-    const summary = setVmSchedulable(project, vm.id, false, reason, { preserveStatus: true, source: 'force' })
+    const summary = setScheduleHold(project, vm.id, HOLD_MAINTENANCE, { tag: reason })
     if (summary) held.push(vm.id)
   }
   return held
@@ -534,11 +609,50 @@ export function resumeSchedulableSlots(project, ids, reason = KERNEL_UPDATE_HOLD
   const restored = []
   for (const id of ids || []) {
     const vm = getVm(project, id)
-    if (!vm || vm.schedule_disabled_reason !== reason) continue
-    const summary = setVmSchedulable(project, id, true, null, { preserveStatus: true, source: 'force' })
+    if (!vm || !isMaintenanceHold(vm, reason)) continue
+    const summary = clearScheduleHold(project, id, HOLD_MAINTENANCE, { tag: reason })
     if (summary?.schedulable !== false) restored.push(id)
   }
   return restored
+}
+
+/** True when the slot sits in a system maintenance hold with this tag (or a legacy record of it). */
+export function isMaintenanceHold(vm, tag) {
+  if (vm?.schedule_hold?.reason === HOLD_MAINTENANCE) return vm.schedule_hold.detail?.tag === tag
+  return vm?.schedulable === false && vm?.schedule_disabled_reason === tag
+}
+
+/** One-shot boot migration onto the four-state fields. Legacy fields are kept for rollback. */
+export function migrateScheduleFields(projectRoot) {
+  const migrated = []
+  const dir = path.join(projectRoot, 'vms')
+  if (!fs.existsSync(dir)) return migrated
+  let backupDir = null
+  for (const name of listVmRecordFiles(dir)) {
+    const file = path.join(dir, name)
+    let vm
+    try {
+      vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+    } catch {
+      continue
+    }
+    if (!vm?.id) continue
+    const before = vm.schedule_disabled_reason || null
+    const raw = fs.readFileSync(file)
+    if (!migrateScheduleRecord(vm)) continue
+    // Copy the untouched record aside once per run before the first rewrite.
+    backupDir ||= path.join(projectRoot, 'backups', `schedule-migration-${Date.now()}`)
+    fs.mkdirSync(backupDir, { recursive: true })
+    fs.writeFileSync(path.join(backupDir, name), raw, { mode: 0o600 })
+    atomicWriteJson(file, vm, { mode: 0o600 })
+    migrated.push({
+      id: vm.id,
+      from: before,
+      state: vm.schedule_off ? 'off' : vm.unschedulable ? 'unschedulable' : vm.schedule_hold ? 'hold' : 'on',
+      reason: vm.unschedulable?.reason || vm.schedule_hold?.reason || null,
+    })
+  }
+  return migrated
 }
 
 export async function waitForSlotDrain(poolScheduler, ids, { timeoutMs = 120000 } = {}) {

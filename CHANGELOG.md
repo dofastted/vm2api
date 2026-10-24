@@ -2,6 +2,12 @@
 
 ## 未发布
 
+- 调度状态统一为四态：调度开 / 调度关（仅操作员）/ 不可调度（确定性错误，只能人工开回）/ 受限（自动恢复）。调度、面板、日志共用一张归因表（`src/lib/pool/schedule-state.mjs`）。面板新增「不可调度」分组与原因，席位满、GPT 对话窗口满、临近闸线显示为「受限 · 仅新会话」。
+- 不可调度只由操作员开回：调度开、导入凭证、改绑代理、「恢复服务」成功。后台凭证刷新、worker 有票、代理探活不再自动开回（`no_credential` 在凭证落盘后仍自动解除）。操作员调度开之后再出现的凭证失效照常出池。
+- 组织禁用 OAuth（400/401/403 `organization disabled` / `OAuth authentication is currently not allowed`）：当前请求换号，该槽记为不可调度并保存上游原文，只能人工开回（并入 #664）。
+- kernel 升级排空、worker 重载、代理探活失败改为系统暂停（受限），不再写成调度关；移除设置「手动开关优先」（`manual_schedule_wins`）。
+- 升级首次启动迁移 `vms/*.json` 到新字段，原文件备份到 `backups/schedule-migration-<ts>/`；旧字段保留可回滚。迁移前可用 `node scripts/replay-schedule-state.mjs --project <dir>` 预览。
+
 ## 1.3.226 — 2026-10-24
 
 - 协议 / billing（#698）：调用方自带的 billing 不再改写 `cc_entrypoint`；网关生成或 cli-node 缺失 billing 时的补头仍为 `cc_entrypoint=sdk-cli`，并带上 `cc_turn_origin` 与轮次索引。文档明确 CCH 密封块属于 billing body、非 User-Agent；补充 crs-persona 与面板协议页回归测试。

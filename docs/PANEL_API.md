@@ -69,9 +69,9 @@
 | POST | `/vms/pool-policy` | 批量槽策略。`{ ids: [...] }` 或 `{ all: true }`，可带 `weight`(1–100) / `schedule_level`(1–10 或 `"auto"`) / `max_concurrency`(1–256) / `max_rpm`(0–1000000) / `max_sessions`(0–256)；`null`（或 `""`）取消钉住：weight 回默认 1、schedule_level 回 auto、上限回 tier / 全局默认，语义与逐槽 PATCH 一致。只写 `vms/*.json`、不重建槽详情，100+ 槽一次调用即可（逐个 `PATCH /vms/:id` 每槽约 4s，并发下发会压住控制面）。返回 `{ updated, missing, failed, items: [{ id, weight, schedule_level, max_concurrency, concurrency_override, max_rpm, max_sessions }] }` |
 | POST | `/vms/:id/probe` | 槽 SOCKS5 探官方 `/usage` + Fable（Pro 跳过 Fable） |
 | POST | `/vms/:id/exit-probe` | 测这个槽真实出口的 IP 与地理（仅 admin）：SOCKS5 槽经代理查；本地代理槽查它所在 VPS 那条本地代理并刷新该行地理。未绑定 502 `proxy_required` |
-| POST | `/vms/schedule/hold` | kernel 升级排空：`{ reason? }` 默认 `kernel_update`。将当前 **可调度** 槽标为不可调度（`schedule_disabled_reason=reason`，不改容器状态）；等待这些槽在途请求归零（最长约 120s）。成功 `{ paused, inflight: 0, drained: true }`。超时 409 `slots_busy`，**自动恢复** 本次 hold 的槽调度。手动关调度或凭证失效的槽不受影响 |
+| POST | `/vms/schedule/hold` | kernel 升级排空：`{ reason? }` 默认 `kernel_update`。给当前 **可调度** 槽加维护暂停（`schedule_hold={reason:'maintenance', detail:{tag:reason}}`，受限，不改容器状态）；等待这些槽在途请求归零（最长约 120s）。成功 `{ paused, inflight: 0, drained: true }`。超时 409 `slots_busy`，**自动恢复** 本次 hold 的槽。调度关与不可调度的槽不受影响 |
 | POST | `/vms/schedule/resume` | 与 hold 配对：`{ reason? }` 默认 `kernel_update`。恢复 `schedule_disabled_reason` 等于该 reason 的槽为可调度；返回 `{ restored }`。`deploy/install.sh upgrade` 在 kernel 同步后调用 |
-| POST | `/vms/:id/schedulable` | `{ schedulable }` 是否入池；不改容器 |
+| POST | `/vms/:id/schedulable` | 操作员开关 `{ schedulable }`，不改容器。`false` = 调度关；`true` = 调度开，同时清除不可调度。凭证已失效或吊销时开启返回 409 `credential_unavailable`（先重新导入凭证） |
 | POST | `/vms/:id/cooldown/clear` | 清账号/模型冷却、粘性钉和 `/usage` 429 旗标，重新入池 |
 | POST | `/vms/:id/test-chat` | loopback `POST /v1/messages`，master 可钉槽；官方 CC 入站 + 4 块 system。默认 prompt `hello` |
 | GET/PUT/DELETE | `/vms/:id/test-schedule` | 每 VM 一条真实对话定时计划，回 `{ schedule }`。PUT 保存结构化调度 `{ enabled?, frequency, minute?, time?, weekdays?, timezone, model, prompt, max_tokens?, reasoning_effort? }`（`frequency`=`hourly`/`daily`/`weekly`；服务端内部编译五字段 cron，响应不回 `cron` 字符串）。`enabled` 缺省 `false`；Claude 用 `max_tokens`，Codex 用 `reasoning_effort`。GET/PUT 含最近结果、下次运行时间与运行状态；到点 `runVmTestChat` 并计用量；重启恢复计划但不补跑停机错过；删 VM 时清计划。租户可读写自己槽的计划 |
@@ -118,6 +118,30 @@
 `account.runtime_window`：`rate_limited_at` / `rate_limit_reset_at` / `overload_until` / `session_window_start|end|status`。
 
 `schedule_level` 是当前有效调度等级，范围 1–10；`schedule_level_mode` 为 `manual` 或 `auto`。`PATCH {"schedule_level": 1..10}` 写入手动等级，`null` 或 `"auto"` 清除手动值。自动模式按 Claude 7D 重置剩余时间滚动分档：不足 24h 为 7，之后每 24h 降一级，144h 及以上或无有效重置时间为 1。Claude 同等级内按 `routing.pool.strategy`（`balanced` / `fill`）开新席位；`weight` 只用于 Codex 选槽，与调度等级无关。整池改这两项用 `POST /vms/pool-policy`（只写记录，不重建槽详情）。
+
+### 调度状态（四态）
+
+列表与详情的 `schedule_state` 只有四个值，调度与面板读同一个判定（`src/lib/pool/schedule-state.mjs`）：
+
+| `schedule_state` | 含义 | 怎么恢复 |
+|------------------|------|----------|
+| `on` | 调度开 | — |
+| `off` | 调度关，只由操作员写（`schedule_off`；关机为 `schedule_off_reason: "stopped"`） | 操作员调度开（关机的槽开机即恢复） |
+| `unschedulable` | 不可调度：确定性错误，`unschedulable_reason` / `unschedulable_text` / `unschedulable_detail` | 只能人工：调度开、导入凭证、改绑代理、「恢复服务」成功 |
+| `restricted` | 受限：额度、429、闸线、鉴权冷却、熔断、过载、代理异常、节点 / 内核故障、维护、休息时段、席位满 | 条件消失自动恢复 |
+
+不可调度原因：`no_credential`、`oauth_revoked`、`oauth_invalid_grant`、`oauth_no_refresh`、`oauth_cleared`、`oauth_expired`、`credential_refresh_failed`、`credential_blocked`、`organization_disabled`、`proxy_required`、`proxy_desynced`、`runtime_start_failed`、`legacy_unknown`（迁移时认不出的旧原因，需人工确认）。后台刷新、探活、worker 有票都不会开回不可调度；唯一例外是 `no_credential` / `oauth_cleared` 在磁盘上出现凭证后自动解除。
+
+受限另带 `restriction_text`（文案）、`restriction_scope` 与 `restriction_soft`：
+
+- `restriction_scope: "new_session"`：只拦新会话，已入座会话照常（`seats_full` 席位满、`sessions_full` GPT 对话窗口满、`gate_5h_draining` / `gate_7d_draining` 临近闸线）。
+- `restriction_soft: true`：全池没有 `on` 的槽时新会话仍可落上来（只有临近闸线）。
+
+优先级：`off` > `unschedulable` > `restricted`（额度 → 熔断 → 冷却 → 临近闸线 → 席位满）> `on`。调度关的槽若同时有不可调度原因，仍显示调度关，原因保留在 `unschedulable_*`。
+
+风险审计拦截（`distill_blocked`、`policy_blocked` / `refusal_guard`、硬正则与决策模型 403）发生在选槽之前，上游请求级错误（内容拒答、`invalid_request`、`*_repairable` 等）只影响本次请求：都不改变槽位状态。
+
+记录字段：`schedule_off`、`unschedulable{reason,detail,at}`、`schedule_hold{reason,detail,at}`（系统暂停：`maintenance` / `proxy_cooldown`，由写入方自己解除）。`schedulable` / `schedule_disabled_reason` / `schedule_manual` 每次写入时派生，保留给旧读者与回滚。升级后首次启动把旧记录迁到新字段，原文件备份到 `backups/schedule-migration-<ts>/`；上线前可用 `node scripts/replay-schedule-state.mjs --project <dir>` 预览迁移结果。设置 `routing.pool.manual_schedule_wins` 已移除（调度关不会被任何自动路径打开）。
 
 ### 平台独立的槽位限额
 

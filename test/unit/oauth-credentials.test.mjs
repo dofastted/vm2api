@@ -198,20 +198,24 @@ test('healLeftoverAuthState does not clear oauth_revoked', () => {
   assert.equal(vm.schedule_disabled_reason, 'oauth_revoked')
 })
 
-test('restoreScheduleAfterLiveCredential heals oauth_revoked after a live credential', () => {
+test('restoreScheduleAfterLiveCredential heals oauth_revoked only on an operator import', () => {
   const vm = {
     status: 'paused',
     schedulable: false,
     schedule_disabled_reason: 'oauth_revoked',
     claude: { has_access: true, has_refresh: true },
   }
+  // Background refresh / mirror: 不可调度 stays until an operator acts.
   restoreScheduleAfterLiveCredential(vm)
+  assert.equal(vm.schedulable, false)
+  assert.equal(vm.unschedulable.reason, 'oauth_revoked')
+  restoreScheduleAfterLiveCredential(vm, { operatorImport: true })
   assert.equal(vm.schedulable, true)
   assert.equal(vm.schedule_disabled_reason, null)
   assert.equal(vm.status, 'running')
 })
 
-test('persistOauthToVm heals revoke when acceptLiveGrant even if expiry did not bump', () => {
+test('persistOauthToVm heals revoke on an operator import even if expiry did not bump', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-import-'))
   const vmPath = path.join(dir, 'vm-50.json')
   fs.writeFileSync(
@@ -235,7 +239,7 @@ test('persistOauthToVm heals revoke when acceptLiveGrant even if expiry did not 
       refresh_token: 'new-rt',
       expires_at: 1_800_000_000_000,
     },
-    { acceptLiveGrant: true },
+    { acceptLiveGrant: true, operatorImport: true },
   )
   const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
   assert.equal(vm.claude.refresh_error, null)

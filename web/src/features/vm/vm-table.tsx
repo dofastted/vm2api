@@ -20,9 +20,15 @@ export type VmSortKey =
  */
 function statusRank(vm: Vm): number {
   return (
-    { pool: 0, restricted: 1, off: 2, none: 3, bad: 4, revoke: 5 }[
-      fleetGroup(vm)
-    ] ?? 6
+    {
+      pool: 0,
+      restricted: 1,
+      off: 2,
+      none: 3,
+      unschedulable: 4,
+      bad: 4,
+      revoke: 5,
+    }[fleetGroup(vm)] ?? 6
   )
 }
 

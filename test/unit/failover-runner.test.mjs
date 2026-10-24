@@ -1764,3 +1764,45 @@ test('an all-rest pool 503 carries Retry-After for the next window open', async 
   assert.equal(result.body.error.code, 'account_pool_exhausted')
   assert.equal(result.retryAfterSec, 91)
 })
+
+test('org OAuth refusal pauses that slot and the family request hops to another', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const pauses = []
+  const runner = new FailoverRunner({
+    scheduler,
+    stickyRouter: { resolve: () => null, bind: () => true, unbind: () => true },
+    onSchedulePause: (value) => pauses.push(value),
+  })
+  const result = await runner.run({
+    requestId: 'req-org-refusal',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    familyKey: 'family2:root',
+    callAttempt: ({ candidate: selected }) => {
+      if (selected.accountId === 'account-1') {
+        return {
+          ok: false,
+          status: 403,
+          terminalState: 'rejected',
+          body: {
+            type: 'error',
+            error: {
+              type: 'permission_error',
+              message: 'OAuth authentication is currently not allowed for this organization.',
+            },
+          },
+        }
+      }
+      return success()
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.accountId, 'account-2')
+  // A pause, not a timed or permanent runtime cooldown.
+  assert.deepEqual(scheduler.cooldowns, [])
+  assert.equal(scheduler.releasedAccounts[0].accountId, 'account-1')
+  assert.equal(pauses.length, 1)
+  assert.equal(pauses[0].selected.vmId, 'vm-01')
+  assert.equal(pauses[0].policy.reason, 'organization_disabled')
+  assert.equal(pauses[0].policy.detail.status, 403)
+})

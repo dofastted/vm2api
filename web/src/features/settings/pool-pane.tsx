@@ -501,7 +501,6 @@ export function PoolPane({
     if (open === 'strategy') {
       onPoolChange({
         strategy: poolDraft.strategy,
-        manual_schedule_wins: poolDraft.manual_schedule_wins,
       })
     } else if (open === 'seats') {
       onInferenceChange({ session_slots: inferenceDraft.session_slots })
@@ -666,21 +665,6 @@ export function PoolPane({
                   value={poolDraft.strategy === 'fill' ? 'fill' : 'balanced'}
                   onChange={(next) => updateDraft('pool', { strategy: next })}
                 />
-                <div className='flex items-center justify-between gap-4 rounded-md border px-3 py-2.5'>
-                  <div>
-                    <Label htmlFor='pool-manual-wins'>手动开关优先</Label>
-                    <p className='text-xs leading-5 text-muted-foreground'>
-                      保留运维手动调度状态。
-                    </p>
-                  </div>
-                  <Switch
-                    id='pool-manual-wins'
-                    checked={poolDraft.manual_schedule_wins !== false}
-                    onCheckedChange={(value) =>
-                      updateDraft('pool', { manual_schedule_wins: value })
-                    }
-                  />
-                </div>
               </>
             ) : null}
             {open === 'seats' ? (

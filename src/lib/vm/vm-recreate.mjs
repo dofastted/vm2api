@@ -11,6 +11,7 @@ import { atomicWriteJson, invalidateVmSlotReadCache } from './vm-file.mjs'
 import { defaultSeedPolicy } from '../protocol/seed-policy.mjs'
 import { writeSlotSeedFiles } from './slot-seed.mjs'
 import { manualScheduleLevelOf } from '../pool/credential-weight.mjs'
+import { applyUnschedulable, deriveScheduleFields, pickScheduleFields } from '../pool/schedule-state.mjs'
 import { activeHoursOf } from '../pool/active-hours.mjs'
 import { stampVmKind } from './vm-kind.mjs'
 import { materializeWrapCli } from './wrap-cli-runtime.mjs'
@@ -158,8 +159,6 @@ export function buildRecreatedVmRecord(prev, generated, { mode = 'traits' } = {}
     stats: keep && prev.stats && typeof prev.stats === 'object' ? prev.stats : {},
     created_at: prev.created_at || now,
     updated_at: now,
-    schedulable: false,
-    schedule_disabled_reason: keep && prev?.claude?.has_access ? null : 'no_credential',
     proxy_cli_enabled: hasBoundExit(prev.proxy),
     seed_policy: defaultSeedPolicy(prev.seed_policy || {}),
     runtime: { type: prev.runtime?.type === 'kvm' ? 'kvm' : 'docker' },
@@ -170,8 +169,10 @@ export function buildRecreatedVmRecord(prev, generated, { mode = 'traits' } = {}
     ...(prev.owner_user_id ? { owner_user_id: prev.owner_user_id } : {}),
     ...(prev.origin ? { origin: prev.origin } : {}),
   }
-  if (!keep || next.schedule_disabled_reason) next.schedulable = false
-  if (keep && !next.schedule_disabled_reason) next.schedulable = prev.schedulable !== false
+  // Keep mode carries the operator switch and any 不可调度 over; a fresh slot has no ticket.
+  if (keep && prev?.claude?.has_access) Object.assign(next, pickScheduleFields(prev))
+  else applyUnschedulable(next, 'no_credential')
+  deriveScheduleFields(next)
   stampVmKind(next, prev)
   if (keep && account.codex) next.codex = account.codex
   else if (keep) next.claude = account.claude

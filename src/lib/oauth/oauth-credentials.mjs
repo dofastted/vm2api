@@ -11,7 +11,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { atomicWriteJson } from '../vm/vm-file.mjs'
-import { isManualScheduleLocked } from '../pool/schedule-policy.mjs'
+import { applyClearUnschedulable, applyUnschedulable, migrateScheduleRecord } from '../pool/schedule-state.mjs'
 import {
   credentialModeFromOauth,
   isApiKeyMode,
@@ -565,25 +565,23 @@ export function mirrorWorkerCredentialsToVm(vmPath, homeDir, opts = {}) {
 }
 
 /**
- * Reset leftover oauth_cleared / oauth_* / no_credential after a live
- * credential is written. Operator `disabled` and explicit `stopped` stay.
+ * An operator credential import clears 不可调度. A background refresh or
+ * worker mirror only lifts a bare no-ticket park: any other verdict
+ * waits for an operator action, so a misread grant death cannot silently
+ * come back.
  */
-export function restoreScheduleAfterLiveCredential(vm) {
+export function restoreScheduleAfterLiveCredential(vm, { operatorImport = false } = {}) {
   if (!vm || !hasCredentialPresence(vm.claude)) return vm
-  if (isManualScheduleLocked(vm)) return vm
-  const reason = String(vm.schedule_disabled_reason || '')
-  // A live ticket after import/refresh heals leftover oauth_* including revoke.
-  if (reason && !/^oauth_/.test(reason) && reason !== 'no_credential') return vm
-  vm.schedule_disabled_reason = null
-  vm.schedulable = true
+  migrateScheduleRecord(vm)
+  if (!vm.unschedulable) return vm
+  applyClearUnschedulable(vm, { by: operatorImport ? 'credential_import' : 'credential_present' })
+  if (vm.unschedulable) return vm
   const status = String(vm.status || '').toLowerCase()
-  if (status === 'stopped' || status === 'paused' || status === 'disabled') {
-    vm.status = 'running'
-  }
+  if (status === 'stopped' || status === 'paused' || status === 'disabled') vm.status = 'running'
   return vm
 }
 
-export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false } = {}) {
+export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false, operatorImport = false } = {}) {
   if (!vmPath || !fs.existsSync(vmPath)) return null
   const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
   const prev = vm.claude || {}
@@ -642,7 +640,7 @@ export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false } = {})
   vm.claude.refreshed_at = new Date().toISOString()
   vm.claude._token_version = n._token_version || Date.now()
   clearClaudeAuthCooldown(vm.claude)
-  restoreScheduleAfterLiveCredential(vm)
+  restoreScheduleAfterLiveCredential(vm, { operatorImport })
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(vmPath, vm, { mode: 0o600 })
   return vm
@@ -812,9 +810,9 @@ export function markVmRefreshError(vmPath, result) {
   vm.claude = stripCredentialSecrets({ ...(vm.claude || {}) })
   vm.claude.refresh_error = refreshErrorCodeOf(result)
   if (classifyCredentialRefresh(result) === 'fatal') {
-    vm.schedulable = false
+    migrateScheduleRecord(vm)
     const code = vm.claude.refresh_error
-    vm.schedule_disabled_reason = code === 'oauth_revoked' ? 'oauth_revoked' : 'oauth_invalid_grant'
+    applyUnschedulable(vm, code === 'oauth_revoked' ? 'oauth_revoked' : 'oauth_invalid_grant', { refresh_error: code })
     if (String(vm.status || '').toLowerCase() === 'running') vm.status = 'paused'
   }
 
