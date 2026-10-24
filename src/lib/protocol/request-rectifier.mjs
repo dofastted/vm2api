@@ -6,7 +6,12 @@
  */
 import { createHash } from 'node:crypto'
 import { stripIllegalCacheControlFields } from './cache-ttl.mjs'
-import { blockHasEncryptedContent, isWebSearchArtifactBlock } from './web-search.mjs'
+import {
+  blockHasEncryptedContent,
+  hasClaudeWebSearch,
+  historyHasWebSearchArtifacts,
+  isWebSearchArtifactBlock,
+} from './web-search.mjs'
 
 export const CONTINUE_USER_TEXT = 'continue'
 export const MISSING_TOOL_RESULT_TEXT = 'Tool result unavailable.'
@@ -264,6 +269,16 @@ export function flattenSearchResultHistory(body = {}) {
   return { ...body, messages }
 }
 
+/**
+ * Replayed server search with no native web_search left in tools (the caller ships its
+ * own client web_search, or search is switched off): Anthropic rejects the replayed
+ * server_tool_use as "not defined in `tools` as a server tool", so it becomes text.
+ */
+export function flattenUndeclaredSearchHistory(body = {}) {
+  if (hasClaudeWebSearch(body.tools) || !historyHasWebSearchArtifacts(body)) return body
+  return flattenSearchResultHistory(body)
+}
+
 function placeholderContent(role) {
   return [
     {
@@ -273,9 +288,9 @@ function placeholderContent(role) {
   ]
 }
 
-/** First-pass unofficial fix: schema only. Do not invent tool_result / continue. */
+/** First-pass unofficial fix: schema, plus replayed server search the caller no longer declares. */
 export function rectifyUnofficialRequest(body = {}) {
-  return ensureOutputConfigSchema(stripIllegalCacheControlFields(clone(body)))
+  return flattenUndeclaredSearchHistory(ensureOutputConfigSchema(stripIllegalCacheControlFields(clone(body))))
 }
 
 /** Retry-only (upstream 400 prefill / unpaired tool_use). sub2api does not do this on first hop. */
