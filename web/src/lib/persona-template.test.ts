@@ -263,6 +263,20 @@ describe('agent standing + system preview', () => {
     })
     expect(fullOff.some((block) => block.id === 'env_official')).toBe(false)
 
+    const selected = previewSystemBlocks(
+      [
+        ...DEFAULT_PERSONA_TEMPLATES.official_full.filter(
+          (block) => block.id !== 'env_official'
+        ),
+        {
+          id: 'env_timezone_only',
+          type: 'text',
+          text: '{{env_timezone_only}}',
+        },
+      ],
+      { ...vars, env_timezone_only: tokyo }
+    )
+    expect(selected[selected.length - 1]?.text).toBe(tokyo)
     expect(
       previewSystemBlocks(
         DEFAULT_PERSONA_TEMPLATES.official,

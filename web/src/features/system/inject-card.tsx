@@ -6,8 +6,11 @@ import {
   personaHideEnabled,
   presetFlagEnabled,
   resetAgentStanding,
+  selectedPreviewBlocks,
   setPersonaHide,
   setPresetFlag,
+  setTemplateBlock,
+  templateBlockEnabled,
   type PresetFlagField,
   type RawBlock,
 } from '@/lib/persona-template'
@@ -17,7 +20,6 @@ import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
-
 type Compat = Record<string, unknown>
 
 /** 模板对某个注入位的引用状态：引用了就可开关，自带就锁开，都没有就锁关。 */
@@ -219,6 +221,28 @@ export function InjectCard({
           </span>
         </div>
       </div>
+      {preset === 'official_full' ? (
+        <div className='space-y-1 border-t border-border/60 px-4 py-3'>
+          <div className='text-sm font-medium'>块选择</div>
+          {selectedPreviewBlocks(blocks, undefined, preset).map((block) => {
+            const id = String(block.id ?? '')
+            return (
+              <label
+                key={id}
+                className='flex items-center justify-between gap-3 text-xs'
+              >
+                <span className='font-mono'>{id}</span>
+                <Switch
+                  checked={templateBlockEnabled(compat, preset, id)}
+                  onCheckedChange={(on) =>
+                    onChange(setTemplateBlock(compat, preset, id, on))
+                  }
+                />
+              </label>
+            )
+          })}
+        </div>
+      ) : null}
     </Card>
   )
 }

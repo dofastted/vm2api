@@ -464,6 +464,27 @@ export function validatePersonaRoutingPatch(body = {}) {
       }
     }
   }
+  const blockMap = compat.persona_block_presets
+  if (blockMap != null) {
+    if (typeof blockMap !== 'object' || Array.isArray(blockMap)) {
+      problems.push('persona_block_presets 必须是对象')
+    } else {
+      for (const [preset, selected] of Object.entries(blockMap)) {
+        if (!PERSONA_PRESETS.includes(preset)) {
+          problems.push(`persona_block_presets.${preset} 不是已知方案`)
+          continue
+        }
+        if (!selected || typeof selected !== 'object' || Array.isArray(selected)) {
+          problems.push(`persona_block_presets.${preset} 必须是对象`)
+          continue
+        }
+        for (const [id, on] of Object.entries(selected)) {
+          if (!id.trim() || id.length > 64) problems.push(`persona_block_presets.${preset}.${id} id 非法`)
+          else if (typeof on !== 'boolean') problems.push(`persona_block_presets.${preset}.${id} 必须是布尔`)
+        }
+      }
+    }
+  }
   if (compat.cache_ttl != null && !['5m', '1h'].includes(String(compat.cache_ttl).trim())) {
     problems.push(`cache_ttl 必须是 5m / 1h，收到 ${compat.cache_ttl}`)
   }

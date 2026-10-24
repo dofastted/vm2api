@@ -845,3 +845,48 @@ test('per-preset switch maps are validated on PUT', () => {
   })
   assert.equal(problems.length, 4)
 })
+
+test('official full can drop env_official while the timezone switch still writes timezone', () => {
+  withRoutingFile(
+    {
+      persona_preset: 'official_full',
+      overlay_preset: 'off',
+      persona_block_presets: { official_full: { env_official: false } },
+    },
+    (file) => {
+      const out = applyCrsUnofficialPersona(
+        { messages: [{ role: 'user', content: 'hi' }] },
+        { routingFile: file, identity: { timezone: 'Asia/Tokyo' } },
+      )
+      assert.equal(
+        out.system.some((block) => block.text.includes('You are an interactive agent')),
+        true,
+      )
+      assert.equal(out.system.at(-1).text, '# Environment\n - Timezone: Asia/Tokyo')
+    },
+  )
+  withRoutingFile(
+    {
+      persona_preset: 'official_full',
+      overlay_preset: 'off',
+      persona_env_presets: { official_full: false },
+      persona_block_presets: { official_full: { env_official: false } },
+    },
+    (file) => {
+      const out = applyCrsUnofficialPersona(
+        { messages: [{ role: 'user', content: 'hi' }] },
+        { routingFile: file, identity: { timezone: 'Asia/Tokyo' } },
+      )
+      assert.equal(
+        out.system.some((block) => /# Environment|Asia\/Tokyo/.test(block.text)),
+        false,
+      )
+    },
+  )
+  assert.deepEqual(
+    validatePersonaRoutingPatch({
+      compatibility: { persona_block_presets: { official_full: { env_official: false } } },
+    }),
+    [],
+  )
+})

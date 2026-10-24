@@ -765,6 +765,68 @@ export function applyPersonaEnvVars(
   return next
 }
 
+/** 官方完整档按块 id 选择。缺省全开；关 env_official 时预览改走时区段。 */
+export function templateBlockEnabled(
+  compat: Record<string, unknown> | undefined,
+  preset: PersonaPreset,
+  id: string
+): boolean {
+  if (preset !== 'official_full') return true
+  const selected = (
+    compat?.persona_block_presets as Record<string, unknown> | undefined
+  )?.[preset]
+  if (!selected || typeof selected !== 'object' || Array.isArray(selected))
+    return true
+  return (selected as Record<string, unknown>)[id] !== false
+}
+
+export function setTemplateBlock(
+  compat: Record<string, unknown>,
+  preset: PersonaPreset,
+  id: string,
+  on: boolean
+): Record<string, unknown> {
+  const raw = compat.persona_block_presets
+  const presets =
+    raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? { ...(raw as Record<string, unknown>) }
+      : {}
+  const current = presets[preset]
+  const selected =
+    current && typeof current === 'object' && !Array.isArray(current)
+      ? { ...(current as Record<string, unknown>) }
+      : {}
+  if (on) delete selected[id]
+  else selected[id] = false
+  if (Object.keys(selected).length) presets[preset] = selected
+  else delete presets[preset]
+  const next = { ...compat }
+  if (Object.keys(presets).length) next.persona_block_presets = presets
+  else delete next.persona_block_presets
+  return next
+}
+
+export function selectedPreviewBlocks(
+  blocks: readonly RawBlock[],
+  compat: Record<string, unknown> | undefined,
+  preset: PersonaPreset
+): RawBlock[] {
+  const selected = blocks.filter((block) =>
+    templateBlockEnabled(compat, preset, String(block.id ?? ''))
+  )
+  if (
+    preset !== 'official_full' ||
+    !presetFlagEnabled(compat, 'persona_env_presets', preset) ||
+    templateBlockEnabled(compat, preset, 'env_official')
+  ) {
+    return selected
+  }
+  return [
+    ...selected,
+    { id: 'env_timezone_only', type: 'text', text: '{{env_timezone_only}}' },
+  ]
+}
+
 const BILLING_VARS = ['billing', 'billing_semi']
 /** 后端 PERSONA_TOKEN_CHAR_DIVISOR：usage 遮罩也按这个估算。 */
 const TOKEN_CHAR_DIVISOR = 3

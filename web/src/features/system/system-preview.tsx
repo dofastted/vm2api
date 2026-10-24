@@ -16,6 +16,8 @@ import {
   personaPresetLabel,
   presetFlagEnabled,
   previewSystemBlocks,
+  selectedPreviewBlocks,
+  templateBlockEnabled,
   type RawBlock,
 } from '@/lib/persona-template'
 import { isCodexVm } from '@/lib/vm-kind'
@@ -99,16 +101,22 @@ export function SystemPreview({
     !!standing &&
     presetFlagEnabled(compat, 'agent_standing_hide_presets', preset)
   const blocksMasked = personaHideEnabled(compat, preset, blocks)
+  const selected = selectedPreviewBlocks(blocks, compat, preset)
+  const timezoneOnly =
+    preset === 'official_full' &&
+    presetFlagEnabled(compat, 'persona_env_presets', preset) &&
+    !templateBlockEnabled(compat, preset, 'env_official')
   const env = envTimezoneText(timezone)
   const rendered = vars.data
     ? previewSystemBlocks(
-        dropLegacyAutoScope(preset, blocks),
+        dropLegacyAutoScope(preset, selected),
         applyPersonaEnvVars(
           {
             ...vars.data.vars,
             ...PREVIEW_REQUEST_VARS,
             timezone,
             env_timezone_only: env,
+            env_official: timezoneOnly ? env : vars.data.vars.env_official,
             env,
             agent_standing: agentStandingVar(compat, preset),
             caller_agent: withCaller ? PREVIEW_CALLER_AGENT : '',

@@ -328,6 +328,14 @@ export const PRESET_FLAG_FIELDS = Object.freeze([
   'persona_hide_presets',
 ])
 
+/** 官方完整档可按块 id 关掉。缺省或非对象 = 全部保留。 */
+export function selectedTemplateBlocks(blocks, compat = {}, preset) {
+  if (normalizePersonaPreset(preset) !== 'official_full') return blocks
+  const selected = compat?.persona_block_presets?.[normalizePersonaPreset(preset)]
+  if (!selected || typeof selected !== 'object' || Array.isArray(selected)) return blocks
+  return blocks.filter((block) => selected[String(block?.id || '')] !== false)
+}
+
 /** {{agent_standing}} 的值：非空时以换行结尾，紧跟下一段不粘连。 */
 export function agentStandingVar(compat = {}, preset) {
   if (!presetFlagEnabled(compat, 'agent_standing_presets', preset)) return ''

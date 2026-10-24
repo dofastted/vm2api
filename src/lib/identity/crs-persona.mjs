@@ -68,6 +68,7 @@ import {
   renderPersonaTemplate,
   resolveOverlayTemplate,
   resolvePersonaTemplate,
+  selectedTemplateBlocks,
   templateHidesAnything,
   templatePresetFor,
   OFFICIAL_303_PRESET,
@@ -1333,6 +1334,7 @@ export function personaTemplateSettingsFromRouting(routing = {}) {
       agent_standing_hide_presets: compat.agent_standing_hide_presets,
       persona_env_presets: compat.persona_env_presets,
       persona_hide_presets: compat.persona_hide_presets,
+      persona_block_presets: compat.persona_block_presets,
     },
   }
 }
@@ -1703,8 +1705,9 @@ function applyTemplatePersona(
 ) {
   const messages = Array.isArray(body.messages) ? body.messages : []
   const zero = preset === 'zero'
-  const blocks = resolvePersonaTemplate(preset, templates)
+  const blocks = selectedTemplateBlocks(resolvePersonaTemplate(preset, templates), switches, preset)
   const withEnv = presetFlagEnabled(switches, 'persona_env_presets', preset)
+  const timezoneOnlyEnv = preset === 'official_full' && withEnv && !blocks.some((block) => block?.id === 'env_official')
   const callerOptions = { preserveEnvironment: !withEnv }
   const usesEnv = blocks.some((block) => extractTemplateVars(block?.text).includes('env'))
   const { env, sourceTexts, facts } = personaEnvForBody(body, {
@@ -1743,12 +1746,18 @@ function applyTemplatePersona(
       withEnv,
       callerAgent,
       agentOfficial: harness,
-      timezoneOnlyEnv: Boolean(harness),
+      timezoneOnlyEnv: Boolean(harness) || timezoneOnlyEnv,
       leftover: midSystem ? '' : leftover,
       model: modelId,
       messages,
     }),
   )
+  if (timezoneOnlyEnv) {
+    system.push({
+      type: 'text',
+      text: buildOfficialEnvironmentSection({ timezone: env.timezone }, { sourceTexts: [], contextManagement: false }),
+    })
+  }
   if (preset === 'official') system = insertOfficialCallerAgent(system, callerAgent)
   let outMessages = messages
   if (midSystem) {
