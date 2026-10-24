@@ -105,8 +105,8 @@ function summarizeBody(body) {
 
 /**
  * Cache-creation TTL breakdown.
- * Prefer usage.cache_creation.ephemeral_5m/1h; when the split is absent but
- * cache_creation_input_tokens > 0, bill 1h only on an explicit cache_ttl === '1h',
+ * Prefer usage.cache_creation.ephemeral_5m/1h; cache_creation_input_tokens beyond
+ * that split (absent, or stale after message_delta) bills 1h only on an explicit cache_ttl === '1h',
  * else 5m. DEFAULT_CACHE_TTL is not a billing fallback.
  */
 function cacheCreationBreakdown(usage) {
@@ -117,9 +117,10 @@ function cacheCreationBreakdown(usage) {
   let five = Number(nested?.ephemeral_5m_input_tokens) || 0
   let hour = Number(nested?.ephemeral_1h_input_tokens) || 0
   const total = Number(usage.cache_creation_input_tokens ?? usage.cache_creation_tokens) || 0
-  if (five === 0 && hour === 0 && total > 0) {
-    if (usage.cache_ttl === '1h') hour = total
-    else five = total
+  const unsplit = total - five - hour
+  if (unsplit > 0) {
+    if (usage.cache_ttl === '1h') hour += unsplit
+    else five += unsplit
   }
   if (five === 0 && hour === 0) {
     return { cache_creation_5m_tokens: null, cache_creation_1h_tokens: null }

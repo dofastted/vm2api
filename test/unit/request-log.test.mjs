@@ -493,6 +493,29 @@ test('cache breakdown without a split bills 5m unless cache_ttl is explicitly 1h
   assert.equal(hour.cache_creation_1h_tokens, 9)
 })
 
+test('cache breakdown puts the total beyond a partial split into the fallback TTL (#678)', () => {
+  const store = tmpStore('normal')
+  const sum = store.finish(
+    store.start(
+      { method: 'POST', headers: {}, socket: {} },
+      { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+    ),
+    {
+      status: 200,
+      model: 'claude-opus-5-5',
+      upstream_model: 'claude-opus-5-5',
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_creation_input_tokens: 14890,
+        cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 119 },
+      },
+    },
+  )
+  assert.equal(sum.cache_creation_5m_tokens, 14771)
+  assert.equal(sum.cache_creation_1h_tokens, 119)
+})
+
 test('finish persists web_search_requests from server_tool_use', () => {
   const store = tmpStore('normal')
   const sum = store.finish(

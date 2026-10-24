@@ -644,3 +644,19 @@ test('Images endpoint rows bill only the image usage', () => {
   assert.equal(unpriced.pricing_model, 'unpriced')
   assert.equal(unpriced.total_cost, null)
 })
+
+test('cache creation above the TTL split bills the remainder (#678)', () => {
+  const usage = {
+    input_tokens: 6,
+    output_tokens: 1593,
+    cache_creation_tokens: 14890,
+    cache_creation_5m_tokens: 0,
+    cache_creation_1h_tokens: 119,
+  }
+  const priced = calculateCost(usage, 'claude-opus-5-5')
+  const as5m = calculateCost({ ...usage, cache_creation_5m_tokens: 14771 }, 'claude-opus-5-5')
+  assert.equal(priced.cache_creation_cost, as5m.cache_creation_cost)
+  const pinned = calculateCost({ ...usage, cache_ttl: '1h' }, 'claude-opus-5-5')
+  const as1h = calculateCost({ ...usage, cache_creation_1h_tokens: 14890 }, 'claude-opus-5-5')
+  assert.equal(pinned.cache_creation_cost, as1h.cache_creation_cost)
+})

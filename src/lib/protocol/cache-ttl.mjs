@@ -756,8 +756,8 @@ export function applyCacheTtlToUsage(usage, ttl = DEFAULT_CACHE_TTL) {
   const five = n(out.cache_creation_5m_tokens ?? out.cache_creation?.ephemeral_5m_input_tokens)
   const hour = n(out.cache_creation_1h_tokens ?? out.cache_creation?.ephemeral_1h_input_tokens)
   const create = n(out.cache_creation_input_tokens ?? out.cache_creation_tokens)
-  let total = five + hour
-  if (!total && create) total = create
+  // message_delta can raise the total without resending the message_start split.
+  const total = Math.max(five + hour, create)
   if (!total) return out
   if (target === '1h') {
     out.cache_creation_1h_tokens = total

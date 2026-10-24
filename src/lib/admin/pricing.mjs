@@ -114,10 +114,12 @@ function cacheSplit(u) {
   let cache5m = n(u.cache_creation_5m_tokens ?? u.cache_creation?.ephemeral_5m_input_tokens)
   let cache1h = n(u.cache_creation_1h_tokens ?? u.cache_creation?.ephemeral_1h_input_tokens)
   const cacheCreate = n(u.cache_creation_tokens ?? u.cache_creation_input_tokens)
-  if (!cache5m && !cache1h && cacheCreate) {
-    // Explicit TTL only — never DEFAULT_CACHE_TTL (which is 1h for upstream).
-    if (u.cache_ttl === '1h') cache1h = cacheCreate
-    else cache5m = cacheCreate
+  // Unsplit total (none, or beyond a stale message_start split) — explicit TTL only,
+  // never DEFAULT_CACHE_TTL (which is 1h for upstream).
+  const unsplit = cacheCreate - cache5m - cache1h
+  if (unsplit > 0) {
+    if (u.cache_ttl === '1h') cache1h += unsplit
+    else cache5m += unsplit
   }
   return { cache5m, cache1h, cacheCreate }
 }
