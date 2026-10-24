@@ -316,6 +316,49 @@ test('GPT wait queue wakes FIFO on release and caps at 100 waiters', async () =>
   assert.equal(rt.openAIWaiterCount(), 0)
 })
 
+test('GPT wait queue wakes the oldest waiter for the freed account', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const deadline = Date.now() + 5000
+  const order = []
+  const onlyB = rt.waitForOpenAICapacity({ deadline, accounts: ['vm-b'] }).then((r) => order.push(['b', r.accountId]))
+  const onlyA = rt.waitForOpenAICapacity({ deadline, accounts: ['vm-a'] }).then((r) => order.push(['a', r.accountId]))
+  rt.tryAcquireOpenAISlot('vm-a').release()
+  await onlyA
+  assert.deepEqual(order, [['a', 'vm-a']])
+  assert.equal(rt.openAIWaiterCount(), 1)
+  // No waiter takes vm-c: the release wakes nobody.
+  rt.tryAcquireOpenAISlot('vm-c').release()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(rt.openAIWaiterCount(), 1)
+  // An unscoped wake (routing change) still reaches the oldest waiter.
+  rt.wakeOpenAIWaiter()
+  await onlyB
+  assert.deepEqual(order, [
+    ['a', 'vm-a'],
+    ['b', null],
+  ])
+  rt.resetOpenAIAccountRuntime()
+})
+
+test('GPT wait queue re-parks a woken waiter at the head past the cap', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const deadline = Date.now() + 5000
+  const parked = Array.from({ length: rt.OPENAI_MAX_WAITERS }, (_, i) =>
+    rt.waitForOpenAICapacity({ deadline }).then((r) => ({ i, ...r })),
+  )
+  await assert.rejects(rt.waitForOpenAICapacity({ deadline }), { code: 'pool_wait_queue_full' })
+  const again = rt
+    .waitForOpenAICapacity({ deadline, accounts: ['vm-a'], front: true })
+    .then((r) => ({ i: 'again', ...r }))
+  assert.equal(rt.openAIWaiterCount(), rt.OPENAI_MAX_WAITERS + 1)
+  rt.tryAcquireOpenAISlot('vm-a').release()
+  assert.deepEqual(await again, { i: 'again', woken: true, accountId: 'vm-a' })
+  rt.resetOpenAIAccountRuntime()
+  await Promise.all(parked)
+})
+
 test('RPM-only capacity miss reports when the window reopens', async () => {
   const { tryAcquireOpenAISlot, resetOpenAIAccountRuntime } = await import(
     '../../src/lib/pool/openai-account-runtime.mjs'

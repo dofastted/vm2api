@@ -3,7 +3,7 @@
  */
 import path from 'node:path'
 import { getVm, listVms, persistCodexUsage, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
-import { isValidVmId } from '../vm/vm-file.mjs'
+import { isValidVmId, listVmRecordFiles, readJsonCached } from '../vm/vm-file.mjs'
 import { isCodexProtocolAllowed, isCodexVm, normalizeCodexRouting } from './codex-route.mjs'
 import { keyAllowsVm, keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
 import { ownerScopeFromRequest, vmMatchesOwnerScope } from '../admin/resource-owner.mjs'
@@ -234,11 +234,17 @@ export function pickCodexCandidates(
     })
     return { ...ordered, pin, sticky: false, sessionKey: null, stickyKeys: [] }
   }
-  for (const item of listVms(projectRoot, { codex: { quota: routingPolicy } })) {
-    if (!isCodexVm(item)) continue
-    syncCodexQuotaSchedule(projectRoot, getVm(projectRoot, item.id) || item, {
-      policy: routingPolicy,
-    })
+  // Quota sync only needs the raw records; the summarized list is built once, after it.
+  const vmDir = path.join(projectRoot, 'vms')
+  for (const file of listVmRecordFiles(vmDir)) {
+    let vm
+    try {
+      vm = readJsonCached(path.join(vmDir, file))
+    } catch {
+      continue
+    }
+    if (!vm?.id || !isCodexVm(vm)) continue
+    syncCodexQuotaSchedule(projectRoot, vm, { policy: routingPolicy })
   }
   const stickyKeys = stickyRouter?.collectPoolKeys?.(req, body || {}, { platform: 'openai' }) || []
   const sessionKey = stickyRouter?.extractPoolKey?.(req, body || {}, { platform: 'openai' }) || stickyKeys[0] || null
@@ -428,11 +434,11 @@ function clientGoneSignal(req, res) {
 /**
  * Admission = fresh candidates + one synchronous seat claim. Candidates are
  * re-read every round, so a seat taken while another request awaited kernel
- * init is never double-sold. All full: FIFO wait for a release or the RPM
- * window, up to the pool wait deadline.
+ * init is never double-sold. All full: FIFO wait for a release on one of
+ * this request's accounts or the RPM window, up to the pool wait deadline.
  */
 async function admitCodexCandidate(projectRoot, req, opts, { deadline, signal }) {
-  let woken = false
+  let woken = null
   for (;;) {
     const picked = pickCodexCandidates(projectRoot, req, opts)
     const livePolicy = normalizeCodexRouting(opts.routing?.codex || opts.routing).quota
@@ -445,21 +451,31 @@ async function admitCodexCandidate(projectRoot, req, opts, { deadline, signal })
       })
       if (lease) return { picked, vmId: candidate.id, lease }
     }
-    // A woken waiter that still missed hands the wake to the next in line.
-    if (woken) wakeOpenAIWaiter()
+    const waitIds = picked.candidates?.length ? picked.candidates.map((candidate) => candidate.id) : picked.waitIds
+    // A woken waiter that missed a seat it can use lost it to a newer request;
+    // passing the wake on would only re-run selection for every waiter behind
+    // it. Hand it on only when the freed account is not one this request takes.
+    if (woken && (woken.accountId == null || !waitIds?.includes(woken.accountId))) {
+      wakeOpenAIWaiter(woken.accountId)
+    }
     const now = Date.now()
     if (now >= deadline) return { picked: { ...picked, error: 'capacity_unavailable', ids: [] } }
     const retryAt = Number(picked.retryAt)
     const sliceDeadline = Number.isFinite(retryAt) && retryAt > now ? Math.min(deadline, retryAt) : deadline
     let waited
     try {
-      waited = await waitForOpenAICapacity({ deadline: sliceDeadline, signal })
+      waited = await waitForOpenAICapacity({
+        deadline: sliceDeadline,
+        signal,
+        accounts: Array.isArray(waitIds) ? waitIds : null,
+        front: !!woken,
+      })
     } catch (error) {
       if (error?.code === 'pool_wait_queue_full') return { picked: { error: 'pool_wait_queue_full', ids: [] } }
       throw error
     }
     if (waited.aborted) return { picked: { error: 'client_cancelled', ids: [] } }
-    woken = !!waited.woken
+    woken = waited.woken ? { accountId: waited.accountId ?? null } : null
   }
 }
 

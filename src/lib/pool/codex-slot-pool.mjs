@@ -302,6 +302,8 @@ export function orderCodexSessionSlots(
     return {
       error: quotaExhausted ? 'quota_exhausted' : 'capacity_unavailable',
       retryAt,
+      // Accounts a waiter may use once a seat frees; scopes its wake-up.
+      waitIds: ids,
       ids: [],
       ready: [],
       parked: picked.parked || [],

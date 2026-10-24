@@ -128,7 +128,7 @@ export function tryAcquireOpenAISlot(id, { concurrency = 1, maxRpm = 0, now = Da
       if (released) return
       released = true
       slot.inFlight = Math.max(0, slot.inFlight - 1)
-      wakeOpenAIWaiter()
+      wakeOpenAIWaiter(id)
     },
   }
 }
@@ -137,22 +137,32 @@ export function openAIWaiterCount() {
   return waiters.length
 }
 
-/** FIFO: one released seat wakes the oldest waiter. A woken waiter that still misses passes it on. */
-export function wakeOpenAIWaiter() {
-  const next = waiters.shift()
-  next?.wake()
+/**
+ * FIFO per account: a seat freed on `accountId` wakes the oldest waiter that
+ * can use that account (or that parked without an account set). Without an id
+ * the oldest waiter wakes, for changes that may open any account.
+ */
+export function wakeOpenAIWaiter(accountId = null) {
+  const key = accountId == null ? null : String(accountId)
+  const at = key == null ? 0 : waiters.findIndex((entry) => !entry.accounts || entry.accounts.has(key))
+  if (at < 0 || at >= waiters.length) return
+  const [next] = waiters.splice(at, 1)
+  next.wake(key)
 }
 
 /**
  * Park until a seat frees, `deadline` passes, or `signal` aborts.
- * Resolves `{ woken }`; throws `pool_wait_queue_full` past OPENAI_MAX_WAITERS.
+ * `accounts` limits which releases wake this waiter; omit it to wake on any.
+ * `front` re-parks a woken waiter at the head of the queue; it was already
+ * counted, so it is not refused by the queue cap.
+ * Resolves `{ woken, accountId }`; throws `pool_wait_queue_full` past OPENAI_MAX_WAITERS.
  */
-export function waitForOpenAICapacity({ deadline, signal = null } = {}) {
-  if (waiters.length >= OPENAI_MAX_WAITERS) {
+export function waitForOpenAICapacity({ deadline, signal = null, accounts = null, front = false } = {}) {
+  if (!front && waiters.length >= OPENAI_MAX_WAITERS) {
     return Promise.reject(Object.assign(new Error('OpenAI pool wait queue is full'), { code: 'pool_wait_queue_full' }))
   }
   return new Promise((resolve) => {
-    const entry = {}
+    const entry = { accounts: accounts ? new Set(Array.from(accounts, String)) : null }
     const cleanup = () => {
       clearTimeout(timer)
       signal?.removeEventListener?.('abort', onAbort)
@@ -163,9 +173,9 @@ export function waitForOpenAICapacity({ deadline, signal = null } = {}) {
       cleanup()
       resolve({ woken: false, aborted: true })
     }
-    entry.wake = () => {
+    entry.wake = (accountId = null) => {
       cleanup()
-      resolve({ woken: true })
+      resolve({ woken: true, accountId })
     }
     const timer = setTimeout(
       () => {
@@ -175,7 +185,8 @@ export function waitForOpenAICapacity({ deadline, signal = null } = {}) {
       Math.max(1, Number(deadline) - Date.now()),
     )
     timer.unref?.()
-    waiters.push(entry)
+    if (front) waiters.unshift(entry)
+    else waiters.push(entry)
     if (signal?.aborted) onAbort()
     else signal?.addEventListener?.('abort', onAbort, { once: true })
   })

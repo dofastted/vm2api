@@ -1434,3 +1434,124 @@ test('tool argument disagreement terminates the client stream instead of recordi
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('a freed GPT seat wakes only a waiter that can use that account', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-targeted-wake-'))
+  const vmDir = path.join(root, 'vms')
+  for (const [id, model] of [
+    ['vm-gpt-a', 'gpt-a'],
+    ['vm-gpt-b', 'gpt-b'],
+  ]) {
+    writeGptVm(root, id)
+    const file = path.join(vmDir, `${id}.json`)
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
+    fs.writeFileSync(file, JSON.stringify({ ...raw, policy: { maxConcurrency: 1, allowed_models: [model] } }))
+  }
+  const gates = []
+  const opened = []
+  for (let i = 0; i < 2; i++) gates.push(new Promise((resolve) => opened.push(resolve)))
+  let hops = 0
+  const ops = {
+    ensureCodexKernel: async () => ({ ok: true }),
+    streamCodexKernel: async ({ onEvent }) => {
+      const gate = gates[hops++]
+      if (gate) await gate
+      await onEvent('data: {"type":"response.completed"}')
+      return { ok: true, status: 200, terminalState: 'verified' }
+    },
+  }
+  const run = (model) => handleCodexProtocol(codexArgs(root, ops, { body: { model, input: 'hi', stream: false } }))
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 20))
+  const busyA = run('gpt-a')
+  await tick()
+  const busyB = run('gpt-b')
+  await tick()
+  assert.equal(hops, 2)
+  const waitersB = Array.from({ length: 10 }, () => run('gpt-b'))
+  await tick()
+  const waiterA = run('gpt-a')
+  await tick()
+  assert.equal(rt.openAIWaiterCount(), 11)
+  // Each selection round lists vms/ twice: quota sync, then the summarized pool.
+  const realReaddir = fs.readdirSync
+  let vmDirReads = 0
+  fs.readdirSync = function (dir, ...rest) {
+    if (dir === vmDir) vmDirReads++
+    return realReaddir.call(this, dir, ...rest)
+  }
+  try {
+    opened[0]()
+    assert.equal((await busyA).status, 200)
+    assert.equal((await waiterA).status, 200)
+  } finally {
+    fs.readdirSync = realReaddir
+  }
+  // One round for the gpt-a waiter; the ten gpt-b waiters ahead of it are not woken.
+  assert.equal(vmDirReads, 2)
+  assert.equal(rt.openAIWaiterCount(), 10)
+  opened[1]()
+  const results = await Promise.all([busyB, ...waitersB])
+  assert.deepEqual(
+    results.map((r) => r.status),
+    Array(11).fill(200),
+  )
+  assert.equal(hops, 13)
+  rt.resetOpenAIAccountRuntime()
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('a woken GPT waiter whose seat was taken re-parks first instead of waking the queue', async () => {
+  const rt = await import('../../src/lib/pool/openai-account-runtime.mjs')
+  rt.resetOpenAIAccountRuntime()
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-stolen-seat-'))
+  const vmDir = path.join(root, 'vms')
+  writeGptVm(root, 'vm-gpt-a')
+  const file = path.join(vmDir, 'vm-gpt-a.json')
+  const raw = JSON.parse(fs.readFileSync(file, 'utf8'))
+  fs.writeFileSync(file, JSON.stringify({ ...raw, policy: { maxConcurrency: 1 } }))
+  const order = []
+  const ops = {
+    ensureCodexKernel: async () => ({ ok: true }),
+    streamCodexKernel: async ({ onEvent }) => {
+      await onEvent('data: {"type":"response.completed"}')
+      return { ok: true, status: 200, terminalState: 'verified' }
+    },
+  }
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 20))
+  const held = rt.tryAcquireOpenAISlot('vm-gpt-a', { concurrency: 1 })
+  const waiters = []
+  for (let i = 0; i < 5; i++) {
+    waiters.push(handleCodexProtocol(codexArgs(root, ops)).then((r) => order.push(i) && r))
+    await tick()
+  }
+  assert.equal(rt.openAIWaiterCount(), 5)
+  const realReaddir = fs.readdirSync
+  let vmDirReads = 0
+  fs.readdirSync = function (dir, ...rest) {
+    if (dir === vmDir) vmDirReads++
+    return realReaddir.call(this, dir, ...rest)
+  }
+  let thief
+  try {
+    held.release()
+    thief = rt.tryAcquireOpenAISlot('vm-gpt-a', { concurrency: 1 })
+    assert.ok(thief)
+    await tick()
+  } finally {
+    fs.readdirSync = realReaddir
+  }
+  // Only the oldest waiter re-checks; the other four stay parked.
+  assert.equal(vmDirReads, 2)
+  assert.equal(rt.openAIWaiterCount(), 5)
+  thief.release()
+  const results = await Promise.all(waiters)
+  assert.deepEqual(
+    results.map((r) => r.status),
+    Array(5).fill(200),
+  )
+  assert.deepEqual(order, [0, 1, 2, 3, 4])
+  rt.resetOpenAIAccountRuntime()
+  fs.rmSync(root, { recursive: true, force: true })
+})
