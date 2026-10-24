@@ -18,11 +18,16 @@ import {
   clearCachePrefixSessions,
   confirmCachePrefix,
   peekCachePrefix,
-  trackCachePrefix,
+  prepareCachePrefix,
 } from '../../src/lib/protocol/cache-prefix.mjs'
 import { rewritePoolErrorForClient, mapUpstreamError } from '../../src/lib/core/errors.mjs'
 import { evaluateAccount } from '../../src/lib/pool/availability.mjs'
 import { listQuotaFromHeaders } from '../../src/lib/pool/quota-window.mjs'
+
+function track(key, body, now) {
+  const { body: _sent, ...prefix } = prepareCachePrefix(key, body, now)
+  return prefix
+}
 
 function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'kin-quota-band-'))
@@ -285,7 +290,7 @@ test('peek does not record; unconfirmed attempts stay cold', () => {
   }
   assert.equal(peekCachePrefix('acc:s', body1, 0).turn, 1)
   assert.equal(peekCachePrefix('acc:s', body1, 0).confirmed, false)
-  assert.deepEqual(trackCachePrefix('acc:s', body1, 0), { turn: 1, break: null })
+  assert.deepEqual(track('acc:s', body1, 0), { turn: 1, break: null })
   const peeked = peekCachePrefix('acc:s', body2, 1)
   assert.equal(peeked.turn, 2)
   assert.equal(peeked.confirmed, false)
@@ -330,9 +335,9 @@ test('output ceiling does not make a short prompt large in the critical band', (
     messages: [...history.slice(0, n), { role: 'user', content: `follow-up ${n}` }],
   })
   const key = `${account}:${session}`
-  trackCachePrefix(key, turn(0))
+  track(key, turn(0))
   assert.equal(confirmCachePrefix(key), true)
-  trackCachePrefix(key, turn(2))
+  track(key, turn(2))
   assert.equal(confirmCachePrefix(key), true)
 
   const warm = estimateRequestRisk(turn(2), { accountId: account, sessionId: session })
@@ -388,7 +393,7 @@ test('stale band still blocks a warm turn whose new user text is itself large', 
     max_tokens: 128000,
     messages: [{ role: 'user', content: 'short' }],
   }
-  trackCachePrefix('band:sess', base)
+  track('band:sess', base)
   assert.equal(confirmCachePrefix('band:sess'), true)
   const extended = {
     ...base,
