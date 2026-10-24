@@ -96,7 +96,7 @@ test('unofficial outbound envelope matches official 2.1.281 capture keys', () =>
   assert.equal(body.system[0].text, CRS_OFFICIAL_SYSTEM)
   assert.equal(body.system[1].text, CRS_AGENT_EXPANSION)
   assert.deepEqual(body.system[1].cache_control, AGENT_EXPANSION_CACHE_CONTROL)
-  assert.match(body.system[2].text, /cc_entrypoint=cli;/)
+  assert.match(body.system[2].text, /cc_entrypoint=sdk-cli;/)
   assert.match(body.system[2].text, /cch=/)
   assert.match(body.system[2].text, /cc_prompt_id=/)
   assert.match(body.system[3].text, /# Environment/)

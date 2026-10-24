@@ -110,6 +110,7 @@ import {
 import {
   applyCrsUnofficialPersona,
   detectProxiedOfficialCcFromRoutingFile,
+  billingIndexesFromMessages,
   ensureBillingAttribution,
   extractFirstUserText,
   isOfficialClaudeCodeTraffic,
@@ -1380,6 +1381,7 @@ export function createHandleProtocol(deps) {
                 firstUserText,
                 sessionId: attemptSessionId,
                 cliVersion: outboundProfile.cliVersion,
+                indexes: billingIndexesFromMessages(hopBody.messages),
               })
             }
             hopBody = await materializeRemoteImageSources(hopBody)

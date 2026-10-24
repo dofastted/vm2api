@@ -105,7 +105,7 @@ test('official caller: system is billing + identity + 2.1.303 main; caller syste
   assert.equal(out.system.length, 3)
   assert.match(
     out.system[0].text,
-    /^x-anthropic-billing-header: cc_version=2\.1\.303\.[0-9a-f]{3}; cc_entrypoint=cli; cch=00000;/,
+    /^x-anthropic-billing-header: cc_version=2\.1\.303\.[0-9a-f]{3}; cc_entrypoint=sdk-cli; cch=00000;/,
   )
   assert.equal(out.system[0].cache_control, undefined)
   assert.equal(out.system[1].text, OFFICIAL_303_IDENTITY)

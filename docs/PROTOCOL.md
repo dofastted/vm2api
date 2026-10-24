@@ -30,7 +30,7 @@
 | `persona_park` | `false` | 与 `overlay_preset=off` 对齐 |
 | `cache_ttl` | `1h` | Node 重写时新增点的缺省 TTL；`x-kin-cache-ttl` 参与首次会话选择，不覆盖 native 透传 caller / 模板显式 TTL |
 
-**official 模板**保留 billing + 交互 CLI identity（`You are Claude Code, Anthropic's official CLI for Claude.`）+ 可选 caller_agent / caller_system，并在 agent 块之后写槽位 `# Environment`（`{{env}}`，只含 `Timezone: <槽位时区>`，不挂 cache，不破 agent 块的 1h global 缓存）；不会自动追加完整 agent prompt。网关生成的 billing 一律 `cc_entrypoint=cli`；0注入的 `prompt_version=<…>` 也是同一句交互 CLI identity。
+**official 模板**保留 billing + 交互 CLI identity（`You are Claude Code, Anthropic's official CLI for Claude.`）+ 可选 caller_agent / caller_system，并在 agent 块之后写槽位 `# Environment`（`{{env}}`，只含 `Timezone: <槽位时区>`，不挂 cache，不破 agent 块的 1h global 缓存）；不会自动追加完整 agent prompt。网关生成的 billing 一律 `cc_entrypoint=sdk-cli`；0注入的 `prompt_version=<…>` 也是同一句交互 CLI identity。
 
 **official_full 模板**在相同前缀后固定追加完整 `agent_official`，带 ephemeral 1h cache；调用方 system 作为末块追加。
 

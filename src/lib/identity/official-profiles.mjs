@@ -2,9 +2,7 @@
  * Official Claude Code outbound profiles: the reference every outbound shape is
  * compared against. Data plus small lookups only; no request mutation here.
  *
- * 2.1.303 is the assembled profile (`official_303` preset, lean models).
- * 2.1.296 only describes what the existing presets already send, for the
- * panel reference card and the shape diff tool. It never drives rendering.
+ * Named official presets use 2.1.303. Empty and legacy presets retain 2.1.296.
  */
 import { createRequire } from 'node:module'
 import { OFFICIAL_SLOT_CWD, officialProjectSlug, sanitizeInboundCwd } from './official-cc-system-2.1.241.mjs'
@@ -61,15 +59,28 @@ export const OFFICIAL_PROFILES = Object.freeze({
       Object.freeze({ slot: 'identity', cache: true }),
       Object.freeze({ slot: 'caller', cache: true }),
     ]),
-    messages: Object.freeze({ reminder: 'caller', marker: 'last_user', environment: 'caller' }),
+    messages: Object.freeze({
+      reminder: 'caller',
+      marker: 'last_user',
+      environment: 'caller',
+    }),
     ttlSource: 'request',
   }),
 })
 
 export function profileForPreset(preset) {
-  return normalizePersonaPreset(preset) === OFFICIAL_303_PRESET
-    ? OFFICIAL_PROFILES['2.1.303']
-    : OFFICIAL_PROFILES['2.1.296']
+  const raw = String(preset ?? '')
+    .trim()
+    .toLowerCase()
+  if (
+    raw === 'official' ||
+    raw === 'official_full' ||
+    raw === 'official_303' ||
+    raw === '303' ||
+    raw === 'official-303'
+  )
+    return OFFICIAL_PROFILES['2.1.303']
+  return OFFICIAL_PROFILES['2.1.296']
 }
 
 /** Proxy prefixes (`test-pro/`), `[1m]` and date suffixes do not change the official model id. */

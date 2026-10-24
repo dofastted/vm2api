@@ -180,7 +180,7 @@ test('official empty beta uses sub2api DefaultBetaHeader; unofficial uses full m
   assert.equal(unofficial['x-stainless-runtime-version'], 'v26.3.0')
   assert.equal(unofficial['x-stainless-retry-count'], '0')
   assert.equal(unofficial['x-stainless-timeout'], '600')
-  assert.match(unofficial['user-agent'], /\(external, cli\)$/)
+  assert.match(unofficial['user-agent'], /\(external, sdk-cli\)$/)
   fs.rmSync(dir, { recursive: true, force: true })
 })
 

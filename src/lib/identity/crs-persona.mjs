@@ -53,6 +53,7 @@ import {
   parseInboundEnvFacts,
   sanitizeInboundCwd,
 } from './official-cc-system-2.1.241.mjs'
+import { CRS_OFFICIAL_AGENT_PROMPT_303 } from './official-cc-system-2.1.303-full.mjs'
 import {
   DEFAULT_OVERLAY_PRESET,
   DEFAULT_PERSONA_PRESET,
@@ -78,6 +79,7 @@ export {
   CRS_AGENT_EXPANSION,
   CRS_OFFICIAL_AGENT_IDENTITY,
   CRS_OFFICIAL_AGENT_PROMPT,
+  CRS_OFFICIAL_AGENT_PROMPT_303,
   CRS_OFFICIAL_CONTINUATION,
   CRS_REPORTING_OUTCOMES,
 }
@@ -376,7 +378,7 @@ export function buildBillingAttributionText(
   const fp = computeClaudeCodeFingerprint(firstUserText ?? '', ver)
   const promptId = billingPromptId(sessionId, firstUserText, ver)
   const tail = billingTurnSuffix(indexes?.promptIndex, indexes?.turnIndex)
-  return `x-anthropic-billing-header: cc_version=${ver}.${fp}; cc_entrypoint=cli; cch=${CCH_PLACEHOLDER}; cc_prompt_id=${promptId};${tail}`
+  return `x-anthropic-billing-header: cc_version=${ver}.${fp}; cc_entrypoint=sdk-cli; cch=${CCH_PLACEHOLDER}; cc_prompt_id=${promptId};${tail}`
 }
 
 /** Add the billing block exactly once before the cli-node hop. */
@@ -781,7 +783,7 @@ export function personaTemplateVars({
     reporting: CRS_REPORTING_OUTCOMES,
     dynamic_boundary: '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__',
     agent_expansion: CRS_AGENT_EXPANSION,
-    agent_official: agentOfficial || CRS_OFFICIAL_AGENT_PROMPT,
+    agent_official: agentOfficial || CRS_OFFICIAL_AGENT_PROMPT_303,
     agent_standing: String(agentStanding || ''),
     env: () => (withEnv ? envTimezoneOnly() : ''),
     caller_agent: String(callerAgent || '').trim(),

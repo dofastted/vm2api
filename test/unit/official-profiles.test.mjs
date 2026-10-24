@@ -59,10 +59,11 @@ test('model shape follows official 2.1.303 he(model)', () => {
   assert.equal(canonicalPromptModel('Test-Pro/Claude-Opus-5-5[1m]'), 'claude-opus-5-5')
 })
 
-test('profile per preset: only official_303 binds 2.1.303', () => {
-  assert.equal(profileForPreset('official_303').cliVersion, '2.1.303')
-  assert.equal(profileForPreset('303').cliVersion, '2.1.303')
-  for (const preset of ['official', 'official_full', 'zero', 'custom', '', undefined]) {
+test('official presets bind 2.1.303 while legacy presets retain 2.1.296', () => {
+  for (const preset of ['official', 'official_full', 'official_303', '303', 'official-303']) {
+    assert.equal(profileForPreset(preset).cliVersion, '2.1.303', String(preset))
+  }
+  for (const preset of ['zero', 'custom', '', undefined]) {
     assert.equal(profileForPreset(preset).cliVersion, '2.1.296', String(preset))
   }
   const profile = OFFICIAL_PROFILES['2.1.303']
@@ -87,7 +88,10 @@ test('official_303 is a selectable preset; the default stays official_full', () 
   for (const raw of ['official_303', 'OFFICIAL_303', '303', 'official-303']) {
     assert.equal(normalizePersonaPreset(raw), 'official_303')
     assert.equal(normalizeSlotPersonaPreset(raw), 'official_303')
-    assert.deepEqual(parseSlotPersonaPresetPatch(raw), { ok: true, value: 'official_303' })
+    assert.deepEqual(parseSlotPersonaPresetPatch(raw), {
+      ok: true,
+      value: 'official_303',
+    })
   }
   assert.equal(templatePresetFor('official_303'), 'official_full')
   assert.equal(templatePresetFor('zero'), 'zero')

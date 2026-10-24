@@ -228,18 +228,16 @@ describe('agent standing + system preview', () => {
     )
     expect(fullOn.map((block) => block.id)).toEqual([
       'identity',
-      'reporting',
       'agent_official',
-      'dynamic_boundary',
       'env_official',
     ])
-    expect(fullOn[2]).toMatchObject({
+    expect(fullOn[1]).toMatchObject({
       text: 'AGENT',
       placeholder: false,
       ttl: '1h',
       scope: '',
     })
-    expect(fullOn[4]).toMatchObject({
+    expect(fullOn[2]).toMatchObject({
       text: 'ENV',
       placeholder: false,
       ttl: '1h',
@@ -256,9 +254,7 @@ describe('agent standing + system preview', () => {
     )
     expect(fullOff.map((block) => block.id)).toEqual([
       'identity',
-      'reporting',
       'agent_official',
-      'dynamic_boundary',
     ])
     expect(
       fullOff.find((block) => block.id === 'agent_official')

@@ -1,6 +1,6 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.10.23-v1.3.221",
+  "release": "payload-2026.10.24-cli-303-sdk",
   "files": [
     {
       "path": "bin/kin-kernel",
@@ -47,8 +47,8 @@
     {
       "path": "share/wrap-cli/cli-node",
       "asset": "cli-node",
-      "size": 27175272,
-      "sha256": "944f645772f02ed5ca032d4b80151d00184a7c91a3ca3cb4e9e3746cf40025d8"
+      "size": 27784880,
+      "sha256": "cb2f8fb99bf2c191e5a32bd39e6489c2d02e72f3591ba7c3ba7a4e07229ba9fc"
     },
     {
       "path": "share/wrap-cli/cc-node",
