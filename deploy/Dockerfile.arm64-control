@@ -1,6 +1,6 @@
 # ARM64 control plane with the linux amd64 slot payloads pinned in deploy/payload.json.
 # Runtime dependencies are pinned independently of the checkout VERSION.
-ARG NODE_IMAGE=node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c
+ARG NODE_IMAGE=node:22-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d
 # The prebuilt Rust payloads require GLIBC_2.39 (Ubuntu 24.04).
 ARG AMD64_RUNTIME_IMAGE=ubuntu:24.04@sha256:f610ab94648195aa356059f5b41d6085c9d4d903c072430cdd1af7bdb646106b
 FROM --platform=linux/amd64 ${AMD64_RUNTIME_IMAGE} AS amd64-runtime
