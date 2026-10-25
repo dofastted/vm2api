@@ -3,6 +3,7 @@
  * go-worker-client, socket is run/codex-kernel.sock.
  */
 import path from 'node:path'
+import { maxRequestBytes } from '../core/config.mjs'
 import { callGoWorker, streamGoWorker, workerHealth, workerPaths } from './go-worker-client.mjs'
 
 export function codexKernelPaths(exec = {}) {
@@ -45,6 +46,7 @@ export async function callCodexKernel(opts = {}) {
   return remapVia(
     await callGoWorker({
       ...opts,
+      maxRequestBytes: maxRequestBytes(opts.routing),
       exec: withCodexKernelExec(opts.exec),
       requestPath: '/internal/v1/codex/responses',
     }),
@@ -55,6 +57,7 @@ export async function streamCodexKernel(opts = {}) {
   return remapVia(
     await streamGoWorker({
       ...opts,
+      maxRequestBytes: maxRequestBytes(opts.routing),
       exec: withCodexKernelExec(opts.exec),
       requestPath: '/internal/v1/codex/responses',
     }),

@@ -381,7 +381,8 @@ export function isCodexFailoverError(result) {
   // Uncommitted upstream 503 server_error is transient. The caller already
   // refused committed hops and anything that has written to the client.
   if (status === 408) return true
-  if (status === 503 && /server_error|provider_error/i.test(code)) return true
+  // The kernel may be busy/cooling down even while the gateway has a seat.
+  if (status === 503 && (code === 'no_capacity' || /server_error|provider_error/i.test(code))) return true
   if (status === 502 && /upstream_transport|worker_transport|transport/i.test(code)) return true
   // 500/502/504 before any downstream byte are replayable on another seat.
   // A request-shaped error is not: its code names the bad body, not the seat.

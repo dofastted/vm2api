@@ -82,7 +82,16 @@ function readInternalToken(exec) {
 
 function workerRequest(
   exec,
-  { method = 'GET', requestPath, body = null, signal, timeoutMs = 180000, timeoutMode = 'overall', headers = {} } = {},
+  {
+    method = 'GET',
+    requestPath,
+    body = null,
+    signal,
+    timeoutMs = 180000,
+    timeoutMode = 'overall',
+    headers = {},
+    maxRequestBytes = 0,
+  } = {},
 ) {
   return new Promise((resolve, reject) => {
     const { socketPath } = workerPaths(exec)
@@ -91,6 +100,16 @@ function workerRequest(
       return
     }
     const payload = body == null ? null : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))
+    // Include the headers, session metadata and request_id added around the caller's body.
+    if (maxRequestBytes > 0 && payload?.length > maxRequestBytes) {
+      reject(
+        Object.assign(new Error(`Request envelope exceeds ${maxRequestBytes} bytes`), {
+          status: 413,
+          code: 'body_too_large',
+        }),
+      )
+      return
+    }
     const internalToken = readInternalToken(exec)
     const requestHeaders = { ...headers }
     if (payload) {
@@ -177,10 +196,21 @@ async function readAll(stream, limit = MAX_BODY) {
   return Buffer.concat(chunks)
 }
 
-function parseJson(buffer) {
+function parseJson(buffer, status = 0) {
   try {
     return JSON.parse(String(buffer || ''))
   } catch {
+    if (status === 413) {
+      return {
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          code: 'body_too_large',
+          message: 'Request body exceeds the slot kernel limit',
+          details: { retryable: false },
+        },
+      }
+    }
     return {
       type: 'error',
       error: { type: 'worker_error', code: 'worker_invalid_json', message: String(buffer || '').slice(0, 400) },
@@ -478,6 +508,7 @@ export async function callGoWorker({
   body,
   reqHeaders = {},
   timeoutMs,
+  maxRequestBytes = 0,
   identity = null,
   routing,
   signal,
@@ -538,11 +569,12 @@ export async function callGoWorker({
       method: 'POST',
       requestPath,
       body: { ...prepared.envelope, request_id: requestId },
+      maxRequestBytes,
       signal,
       timeoutMs,
     })
     const data = await readAll(response)
-    const parsed = parseJson(data)
+    const parsed = parseJson(data, response.statusCode)
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     const ok = response.statusCode >= 200 && response.statusCode < 300 && parsed?.type !== 'error'
     if (ok) rememberThreadTurn(parsed?.id, prepared.thread)
@@ -562,19 +594,20 @@ export async function callGoWorker({
   } catch (error) {
     return {
       ok: false,
-      status: 0,
+      status: error.status === 413 ? 413 : 0,
       via: 'go-worker',
       body: {
         type: 'error',
         error: {
-          type: 'worker_error',
+          type: error.status === 413 ? 'invalid_request_error' : 'worker_error',
+          ...(error.status === 413 ? { details: { retryable: false } } : {}),
           code: error.code || 'worker_transport_error',
           message: String(error.message || error).slice(0, 300),
         },
       },
       headers: {},
-      terminalState: 'transport_error',
-      transportError: true,
+      terminalState: error.status === 413 ? 'rejected' : 'transport_error',
+      transportError: error.status !== 413,
     }
   } finally {
     stopCancel()
@@ -588,6 +621,7 @@ export async function streamGoWorker({
   reqHeaders = {},
   timeoutMs,
   idleTimeoutMs = 0,
+  maxRequestBytes = 0,
   identity = null,
   routing,
   signal,
@@ -711,6 +745,7 @@ export async function streamGoWorker({
       method: 'POST',
       requestPath,
       body: { ...prepared.envelope, request_id: requestId },
+      maxRequestBytes,
       signal,
       timeoutMs,
       timeoutMode: 'first-byte',
@@ -723,7 +758,7 @@ export async function streamGoWorker({
         ok: false,
         status: response.statusCode || 0,
         via: 'go-worker-stream',
-        body: parseJson(data),
+        body: parseJson(data, response.statusCode),
         headers,
         committed: false,
         terminalState: headers['x-terminal-state'] || 'error',
@@ -918,12 +953,13 @@ export async function streamGoWorker({
     }
     return {
       ok: false,
-      status: 0,
+      status: error.status === 413 ? 413 : 0,
       via: 'go-worker-stream',
       body: {
         type: 'error',
         error: {
-          type: 'worker_error',
+          type: error.status === 413 ? 'invalid_request_error' : 'worker_error',
+          ...(error.status === 413 ? { details: { retryable: false } } : {}),
           code: error.code || 'worker_transport_error',
           message: String(error.message || error).slice(0, 300),
         },
@@ -931,8 +967,8 @@ export async function streamGoWorker({
       headers: {},
       ...timing.snapshot(),
       committed,
-      terminalState: committed ? 'incomplete' : 'transport_error',
-      transportError: true,
+      terminalState: committed ? 'incomplete' : error.status === 413 ? 'rejected' : 'transport_error',
+      transportError: error.status !== 413,
     }
   } finally {
     stopCancel()

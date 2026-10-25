@@ -74,7 +74,7 @@ x-api-key: sk-vm-…
 | 钉槽（仅 master） | 虚拟机测试 loopback |
 | `X-Request-ID` | 原样回写响应头 |
 
-体大小上限由设置里的「请求体上限」决定（`failover.max_request_mib`，未设置时槽内 kernel 为 32 MiB）。网关进程天花板是 `KIN_MAX_BODY`（默认 128MB），面板值不能超过它。超限在选号之前返回 `413 body_too_large`；已经进槽、仍大于 kernel 缓冲的请求由 kernel 返回 413。改完保存后，各槽 kernel 在没有请求时重启一次才生效。
+体大小上限由设置里的「请求体上限」决定（`failover.max_request_mib`，未设置时入口与槽内 kernel 均为 32 MiB）。网关进程天花板是 `KIN_MAX_BODY`（默认 128MB），面板值不能超过它。超限在选号之前返回 `413 body_too_large`；Codex 转发还会按包含 headers/session/request_id 的实际序列化 envelope 检查槽内限额；封装后超限或内核返回的纯文本 413 均报告 `413 body_too_large`。改完保存后，各槽 kernel 在没有请求时重启一次才生效。
 
 ## Messages
 
@@ -163,6 +163,10 @@ curl -sS http://127.0.0.1:8787/v1/chat/completions \
 `POST /v1/completions`：`prompt`（字符串或非空数组）必填，转成单条 user Messages。
 
 `POST /v1/responses`：`input` 或 `messages` 必填。回包 `usage.input_tokens_details` 带缓存明细。`stop_reason=refusal` 同样映射 content_filter。
+
+Codex HTTP 入口省略 `stream` 且没有 `Accept: text/event-stream` 时返回 JSON；显式 `stream: false` 优先于 Accept。内部 kernel 仍使用 SSE，网关聚合后按入口返回 Responses 或 Chat/Completions JSON。入站 WebSocket 的事件格式不变。
+
+Codex 首事件等待使用 `KIN_UPSTREAM_TIMEOUT`（默认 600 秒），收到事件后按 `failover.stream_idle_timeout_ms` / `KIN_STREAM_IDLE_TIMEOUT` 检查空闲时间；持续传输的长流不按总时长截断。内核返回 `503 no_capacity` 且尚未输出时可在现有候选范围与尝试次数限制内换槽；请求体超限不换槽。
 
 ## 模型目录
 

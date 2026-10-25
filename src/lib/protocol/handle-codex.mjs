@@ -2,6 +2,8 @@
  * Codex hop from handle-protocol. Claude convert/pool/CRS never runs here.
  */
 import path from 'node:path'
+import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
+import { isClientStream, fromClaudeToOpenAIChat, fromClaudeToOpenAICompletions } from './convert.mjs'
 import { getVm, listVms, persistCodexUsage, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { isValidVmId } from '../vm/vm-file.mjs'
 import { isCodexProtocolAllowed, isCodexVm, normalizeCodexRouting } from './codex-route.mjs'
@@ -544,6 +546,7 @@ export async function handleCodexProtocol({
   requestStartedAt = Date.now(),
   accountGate = null,
   ownerScope = null,
+  cfg = null,
 }) {
   const codex = normalizeCodexRouting(routing.codex)
   const allowed = isCodexProtocolAllowed(protocol, { codex })
@@ -605,7 +608,8 @@ export async function handleCodexProtocol({
       },
     })
   }
-  const stream = inbound?.stream !== false && ctx.body?.stream !== false
+  // Upstream Codex always streams; the caller still chooses JSON versus SSE.
+  const stream = isClientStream(inbound || ctx.body, req.headers) && ctx.body?.stream !== false
   const inboundSession = sessionFrom(req, converted.body)
   const sessionMode = outboundSessionMode(routing)
   const callerSession = extractCallerSession({
@@ -788,6 +792,9 @@ export async function handleCodexProtocol({
             args: {
               exec: execFor(projectRoot, vm),
               signal: gone.signal,
+              timeoutMs: cfg?.limits?.upstream_timeout_ms ?? 600_000,
+              idleTimeoutMs: resolveStreamIdleTimeoutMs(routing, cfg),
+              routing,
               body: outboundBody,
               reqHeaders: req.headers,
               envelope: {
@@ -908,10 +915,16 @@ export async function handleCodexProtocol({
             let body
             try {
               const assembled = assembleCodexBodyFromSse(chunks, result.body || {})
-              body =
-                protocol === 'anthropic.messages'
-                  ? codexBodyToAnthropicMessage(assembled, converted.body.model)
-                  : assembled
+              body = assembled
+              if (protocol !== 'openai.responses') {
+                const message = codexBodyToAnthropicMessage(assembled, converted.body.model)
+                body =
+                  protocol === 'openai.chat'
+                    ? fromClaudeToOpenAIChat(message, converted.body.model)
+                    : protocol === 'openai.completions'
+                      ? fromClaudeToOpenAICompletions(message, converted.body.model)
+                      : message
+              }
             } catch (error) {
               if (!isToolArgumentsError(error)) throw error
               stats.errors++

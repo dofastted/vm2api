@@ -66,7 +66,7 @@ const MAX_REQUEST_MIB_MAX = 128
  * Bytes the slot kernel will buffer. The panel value
  * (failover.max_request_mib) is the receive size; axum rejects anything
  * larger with 413 before the CLI runs. Absent or invalid keeps fallbackBytes
- * (32 MiB on the kernel, the process ceiling on the gateway).
+ * (32 MiB, shared by ingress and the kernel).
  */
 export function maxRequestBytes(routing, fallbackBytes = DEFAULT_MAX_REQUEST_BYTES) {
   const mib = Number(routing?.failover?.max_request_mib)
@@ -79,8 +79,6 @@ export function maxRequestBytes(routing, fallbackBytes = DEFAULT_MAX_REQUEST_BYT
 export function inboundBodyLimit(routing, ceilingBytes) {
   const ceiling = Number(ceilingBytes)
   const cap = Number.isFinite(ceiling) && ceiling > 0 ? ceiling : DEFAULT_MAX_REQUEST_BYTES
-  const mib = Number(routing?.failover?.max_request_mib)
-  if (!Number.isFinite(mib) || mib <= 0) return cap
   return Math.min(cap, maxRequestBytes(routing))
 }
 

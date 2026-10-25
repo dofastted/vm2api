@@ -18,6 +18,7 @@ import { prepareCliHopBody } from '../../src/lib/protocol/outbound-attempt.mjs'
 import { callerAutoCompactWindow, defaultSeedPolicy, sanitizeInboundBody } from '../../src/lib/protocol/seed-policy.mjs'
 import { extractOpenaiUsage } from '../../src/lib/protocol/openai-usage.mjs'
 import { callRustKernel, rustKernelHealth } from '../../src/lib/transport/rust-kernel-client.mjs'
+import { callCodexKernel, streamCodexKernel } from '../../src/lib/transport/codex-kernel-client.mjs'
 import { forwardApi, readApiJson } from '../../src/lib/transport/api-kernel-client.mjs'
 
 test('restoreUncommittedHop keeps a structured upstream code', () => {
@@ -1264,4 +1265,112 @@ test('workerHealth fails closed when socket is absent', async () => {
     { timeoutMs: 20 },
   )
   assert.equal(result.ok, false)
+})
+
+for (const call of [callGoWorker, streamGoWorker]) {
+  unixTest(`${call.name} maps plain-text kernel 413 without losing structured errors`, async () => {
+    for (const structured of [false, true]) {
+      const upstream = {
+        error: { type: 'invalid_request_error', code: 'context_length_exceeded', message: 'specific limit' },
+      }
+      const fx = await fixture((req, res) => {
+        req.resume()
+        res.writeHead(413, { 'content-type': structured ? 'application/json' : 'text/plain' })
+        res.end(structured ? JSON.stringify(upstream) : 'Failed to buffer the request body: length limit exceeded')
+      })
+      try {
+        const result = await call({ exec: fx.exec, envelope: { body: { input: 'hi' } } })
+        assert.equal(result.status, 413)
+        assert.equal(result.ok, false)
+        assert.equal(result.transportError, false)
+        if (structured) assert.deepEqual(result.body, upstream)
+        else {
+          assert.equal(result.body.error.code, 'body_too_large')
+          assert.equal(result.body.error.type, 'invalid_request_error')
+          assert.equal(result.body.error.details.retryable, false)
+        }
+      } finally {
+        await fx.close()
+      }
+    }
+  })
+
+  unixTest(`${call.name} limits the exact UTF-8 envelope including request_id`, async () => {
+    let requests = 0
+    const envelope = { body: { input: '你好' }, headers: { 'session-id': 'example' } }
+    const bytes = Buffer.byteLength(JSON.stringify({ ...envelope, request_id: 'x'.repeat(36) }))
+    const fx = await fixture(async (req, res) => {
+      requests++
+      const chunks = []
+      for await (const chunk of req) chunks.push(chunk)
+      assert.equal(Buffer.concat(chunks).length, bytes)
+      res.writeHead(400, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ error: { code: 'fixture_reached' } }))
+    })
+    try {
+      const oversized = await call({ exec: fx.exec, envelope, maxRequestBytes: bytes - 1 })
+      assert.equal(oversized.status, 413)
+      assert.equal(oversized.body.error.code, 'body_too_large')
+      assert.equal(oversized.body.error.details.retryable, false)
+      assert.equal(oversized.transportError, false)
+      assert.equal(requests, 0)
+      const exact = await call({ exec: fx.exec, envelope, maxRequestBytes: bytes })
+      assert.equal(exact.status, 400)
+      assert.equal(exact.body.error.code, 'fixture_reached')
+      assert.equal(requests, 1)
+    } finally {
+      await fx.close()
+    }
+  })
+}
+
+for (const mode of ['first-byte', 'idle']) {
+  unixTest(`streamGoWorker enforces ${mode} timeout after kernel headers`, async () => {
+    const fx = await fixture((req, res) => {
+      req.resume()
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.flushHeaders()
+      if (mode === 'idle') writeData(res, { type: 'response.output_text.delta', delta: 'hello' })
+    })
+    const controller = new AbortController()
+    const safety = setTimeout(() => controller.abort(), 5000)
+    try {
+      const result = await streamGoWorker({
+        exec: fx.exec,
+        envelope: { body: { input: 'hi' } },
+        timeoutMs: mode === 'first-byte' ? 20 : 4000,
+        idleTimeoutMs: 20,
+        signal: controller.signal,
+      })
+      assert.equal(result.body.error.code, 'worker_timeout')
+      assert.match(result.body.error.message, new RegExp(mode))
+      assert.equal(result.committed, mode === 'idle')
+    } finally {
+      clearTimeout(safety)
+      controller.abort()
+      await fx.close()
+    }
+  })
+}
+
+unixTest('Codex clients enforce the panel limit on their serialized envelope', async () => {
+  let requests = 0
+  const fx = await fixture((req, res) => {
+    requests++
+    req.resume()
+    res.writeHead(400).end('{}')
+  })
+  try {
+    fx.exec.vm.runtime.codex_kernel_socket = fx.exec.vm.runtime.worker_socket
+    const envelope = { body: { input: 'x'.repeat(8 * 1024 * 1024) } }
+    for (const call of [callCodexKernel, streamCodexKernel]) {
+      const result = await call({ exec: fx.exec, envelope, routing: { failover: { max_request_mib: 8 } } })
+      assert.equal(result.status, 413)
+      assert.equal(result.body.error.code, 'body_too_large')
+      assert.equal(result.transportError, false)
+    }
+    assert.equal(requests, 0)
+  } finally {
+    await fx.close()
+  }
 })
