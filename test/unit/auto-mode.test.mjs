@@ -24,7 +24,7 @@ test('classifier assembly retains caller fields across both outbound paths', () 
     prepareOutboundAttempt({ canonicalBody: input, identity: {}, requestContext: context }).body,
   ]) {
     assert.deepEqual(body.thinking, input.thinking)
-    assert.equal(body.temperature, 0)
+    assert.equal(body.temperature, 1)
     assert.equal(body.max_tokens, 64)
     assert.deepEqual(body.system, input.system)
     assert.deepEqual(body.messages, input.messages)
@@ -79,10 +79,10 @@ for (const verdict of ['block', 'severity'])
         format: 'xml',
         stage,
       })
-      for (const max_tokens of [64, 256, 4096, 345]) {
+      for (const max_tokens of [64, 256, 8192, 345]) {
         const body = prepareClassifierBody({ ...input, max_tokens })
         assert.equal(body.max_tokens, max_tokens)
-        assert.equal(body.temperature, 0)
+        assert.equal(body.temperature, 1)
         assert.deepEqual(body.stop_sequences, input.stop_sequences)
       }
     })
@@ -174,7 +174,7 @@ test('phrase, same-name tool, short budget or public context cannot set purpose'
     {
       model: 'claude-sonnet-4-6',
       max_tokens: 64,
-      temperature: 0,
+      temperature: 1,
       request_context: context,
       messages: [{ role: 'user', content: 'search' }],
     },

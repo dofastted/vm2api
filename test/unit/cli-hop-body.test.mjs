@@ -164,30 +164,31 @@ test('stripCliOwnedSystem leaves empty inbound system absent', () => {
   assert.equal(stripCliOwnedSystem([{ type: 'text', text: '' }]), undefined)
 })
 
-test('prepareCliHopBody follows summarized display and omits sampling and context_management', () => {
+test('prepareCliHopBody applies display but leaves model policy and sampling to cli-node', () => {
   const body = prepareCliHopBody({
     model: 'claude-sonnet-5',
     thinking: { type: 'adaptive' },
+    temperature: 0.2,
+    context_management: { edits: [] },
     messages: [{ role: 'user', content: 'hello' }],
   })
   assert.deepEqual(body.thinking, { type: 'adaptive', display: 'summarized' })
-  assert.equal(body.output_config.effort, 'high')
-  assert.equal(body.context_management, undefined)
-  assert.equal(body.temperature, undefined)
+  assert.equal(body.output_config, undefined)
+  assert.deepEqual(body.context_management, { edits: [] })
+  assert.equal(body.temperature, 0.2)
   assert.equal(body.metadata, undefined)
-  assert.equal(body.system.length, 1)
-  assert.equal(body.system[0].text, CRS_OFFICIAL_CLI_SYSTEM)
 })
 
-test('prepareCliHopBody does not overwrite caller thinking disabled', () => {
+test('prepareCliHopBody keeps caller thinking disabled', () => {
   const body = prepareCliHopBody({
     model: 'claude-sonnet-5',
     max_tokens: 256,
     thinking: { type: 'disabled' },
+    context_management: { edits: [] },
     messages: [{ role: 'user', content: 'hi' }],
   })
   assert.equal(body.thinking.type, 'disabled')
-  assert.equal(body.context_management, undefined)
+  assert.deepEqual(body.context_management, { edits: [] })
 })
 
 test('prepareCliHopBody strips unsigned dummy and short thinking history', () => {
@@ -258,7 +259,7 @@ test('prepareCliHopBody keeps a short non-dummy signature on Opus 5.5', () => {
       { role: 'user', content: 'continue' },
     ],
   })
-  assert.equal(body.model, 'claude-opus-5-5')
+  assert.equal(body.model, 'claude-opus-5.5')
   assert.deepEqual(
     body.messages.map((message) => message.role),
     ['user', 'assistant', 'user'],
@@ -293,38 +294,17 @@ test('prepareCliHopBody repaired does not refill thinking after signature downgr
   ])
 })
 
-test('prepareCliHopBody disables thinking on Haiku so wrap CLI cannot inherit adaptive', () => {
-  const body = prepareCliHopBody({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 256,
-    messages: [{ role: 'user', content: 'hello' }],
-  })
-  assert.equal(body.thinking?.type, 'disabled')
-  assert.equal(body.output_config, undefined)
-  assert.equal(body.context_management, undefined)
-})
-
-test('prepareCliHopBody drops caller context_management on Haiku (thinking pinned off)', () => {
-  // Claude Code 的 Haiku 旁路请求会带 clear_thinking。cli-hop 把 Haiku thinking 固定为 disabled
-  // 且跳过 beta 清洗，所以必须在这里删掉该字段，否则上游会杀掉 CLI。
+test('prepareCliHopBody leaves Haiku thinking and context management untouched', () => {
   const body = prepareCliHopBody({
     model: 'claude-haiku-4-5-20251001',
     max_tokens: 512,
+    thinking: { type: 'adaptive', display: 'omitted' },
     context_management: { edits: [{ type: 'clear_thinking_20251015' }] },
     messages: [{ role: 'user', content: 'hi' }],
   })
-  assert.equal(body.thinking?.type, 'disabled')
-  assert.equal(body.context_management, undefined)
-})
-
-test('prepareCliHopBody disables Haiku adaptive thinking', () => {
-  const body = prepareCliHopBody({
-    model: 'claude-haiku-4-5',
-    max_tokens: 256,
-    thinking: { type: 'adaptive', display: 'omitted' },
-    messages: [{ role: 'user', content: 'hello' }],
-  })
-  assert.equal(body.thinking.type, 'disabled')
+  assert.equal(body.thinking.type, 'adaptive')
+  assert.deepEqual(body.context_management, { edits: [{ type: 'clear_thinking_20251015' }] })
+  assert.equal(body.output_config, undefined)
 })
 
 function withoutMessageCache(body) {
@@ -377,7 +357,10 @@ test('cli-hop drops caller system/tools markers and restamps last plus penultima
   assert.equal(body.tools[0].cache_control, undefined)
   assert.equal(body.system[0].text, CRS_OFFICIAL_CLI_SYSTEM)
   assert.deepEqual(body.system[0].cache_control, { type: 'ephemeral', ttl: '5m' })
-  assert.deepEqual(messageMarkers(body), [{ index: 2, blockIndex: 0, type: 'text', ttl: '5m' }])
+  assert.deepEqual(messageMarkers(body), [
+    { index: 0, blockIndex: 0, type: 'text', ttl: '5m' },
+    { index: 2, blockIndex: 0, type: 'text', ttl: '5m' },
+  ])
 })
 
 test('cli-hop short history only marks the last message', () => {
@@ -436,7 +419,7 @@ test('cli-hop uses the inbound session TTL on both message anchors', () => {
   )
   assert.deepEqual(
     messageMarkers(body).map((hit) => hit.ttl),
-    ['1h'],
+    ['1h', '1h'],
   )
 })
 
@@ -532,7 +515,7 @@ test('sonnet-5 lift keeps one context-budget reminder so the system tail stays s
   const renderedFirst = persona(first)
   const renderedSecond = persona(second)
   assert.deepEqual(renderedSecond.system, renderedFirst.system)
-  assert.equal(JSON.stringify(renderedSecond.system).match(/<total_tokens>/g)?.length, 2)
+  assert.equal(JSON.stringify(renderedSecond.system).includes('14928642'), false)
 })
 
 test('a later budget drop leaves a mixed system-reminder wrapper intact', () => {
@@ -549,7 +532,7 @@ test('a later budget drop leaves a mixed system-reminder wrapper intact', () => 
   assert.doesNotMatch(joined, /<total_tokens>1 tokens left<\/total_tokens>/)
 })
 
-test('cli-hop makes Opus 5.5 acceptable to Claude Code 2.1.280', () => {
+test('cli-hop leaves Opus model policy for cli-node', () => {
   const body = prepareCliHopBody({
     model: 'claude-opus-5.5',
     thinking: { type: 'enabled', budget_tokens: 8000, display: 'summarized' },
@@ -561,28 +544,10 @@ test('cli-hop makes Opus 5.5 acceptable to Claude Code 2.1.280', () => {
     ],
     messages: [{ role: 'user', content: 'hi' }],
   })
-  assert.equal(body.model, 'claude-opus-5-5')
-  assert.deepEqual(body.thinking, { type: 'adaptive', display: 'summarized' })
-  assert.equal(body.thinking.budget_tokens, undefined)
+  assert.equal(body.model, 'claude-opus-5.5')
+  assert.deepEqual(body.thinking, { type: 'enabled', budget_tokens: 8000, display: 'summarized' })
   assert.equal(body.output_config.effort, 'high')
-  assert.deepEqual(body.tool_choice, { type: 'auto' })
-  assert.equal(body.tools.find((tool) => tool.name === 'get_weather').strict, true)
-  assert.equal(body.tools.find((tool) => tool.name === 'computer').type, 'computer_toolset_20260801')
-
-  const filled = prepareCliHopBody({
-    model: 'claude-opus-5-5',
-    thinking: { type: 'disabled' },
-    messages: [{ role: 'user', content: 'hi' }],
-  })
-  assert.equal(filled.thinking.type, 'adaptive')
-  assert.equal(filled.thinking.budget_tokens, undefined)
-  assert.equal(filled.output_config.effort, 'medium')
-
-  const opus5 = prepareCliHopBody({
-    model: 'claude-opus-5',
-    thinking: { type: 'disabled' },
-    messages: [{ role: 'user', content: 'hi' }],
-  })
-  assert.equal(opus5.thinking.type, 'disabled')
-  assert.equal(opus5.output_config.effort, 'high')
+  assert.deepEqual(body.tool_choice, { type: 'tool', name: 'get_weather' })
+  assert.equal(body.tools.find((tool) => tool.name === 'get_weather').strict, undefined)
+  assert.equal(body.tools.find((tool) => tool.name === 'computer').type, 'computer_20251124')
 })

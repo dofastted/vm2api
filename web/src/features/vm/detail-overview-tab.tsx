@@ -2,6 +2,7 @@ import type { Dashboard } from '@/types/panel-overview'
 import type {
   Vm,
   VmBillingModelRow,
+  VmDetailPayload,
   VmKernelSnapshot,
   VmProxySnap,
 } from '@/types/panel-vm'
@@ -37,7 +38,7 @@ type VmOverviewTabProps = {
   rpm: RpmInfo | null
   today: VmTodayCounts
   costByModel?: VmBillingModelRow[]
-  billing?: Record<string, unknown> | null
+  billing?: VmDetailPayload['billing']
 }
 
 export function periodOf(
@@ -102,7 +103,7 @@ export function VmOverviewTab(props: VmOverviewTabProps) {
   const { vm, kernel, costByModel, billing, ...board } = props
   return (
     <TabsContent value='overview' className='space-y-3 pt-3'>
-      <VmStatusBoard vm={vm} kernel={kernel} {...board} />
+      <VmStatusBoard vm={vm} kernel={kernel} billing={billing} {...board} />
       {isCodexVm(vm) ? <OpenaiWindowStats billing={billing} /> : null}
       <VmCostByModel rows={costByModel} />
       {isCodexVm(vm) ? null : (

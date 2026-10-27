@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 const fixture = fileURLToPath(new URL('../fixtures/protocol-settlement-failure.mjs', import.meta.url))
 const setup = fileURLToPath(new URL('../pg-setup.mjs', import.meta.url))
 
-for (const route of ['responses', 'search']) {
+for (const route of ['responses', 'search', 'images']) {
   for (const failure of ['multiplier', 'backend']) {
     test(`${route} preserves pending request quota after an execution-stage ${failure} failure`, () => {
       const env = { ...process.env, VM2API_SETTLEMENT_FAILURE_CASE: `${route}:${failure}` }

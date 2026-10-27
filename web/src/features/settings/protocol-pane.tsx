@@ -19,8 +19,10 @@ import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
 import { SettingRow } from '@/components/setting-row'
+import { OutboundReference } from './outbound-reference'
 import {
   cchEnabledFromCompat,
+  ccEntrypointFromCompat,
   sessionIdleTtlFromInference,
   thinkingDisplayFromCompat,
 } from './protocol-authority'
@@ -177,6 +179,28 @@ export function ProtocolPane({
         </p>
       </PaneSection>
       <PaneSection
+        icon={Database}
+        title='出站入口'
+        desc='billing 的 cc_entrypoint 和出站 UA 用同一个值。调用方自带的 billing 不改。'
+      >
+        <SettingRow
+          label='cc_entrypoint'
+          desc='保存后写入各 Claude 槽 kernel.json，cli-node 下次请求读取。'
+        >
+          <ChipGroup
+            label='cc_entrypoint'
+            value={ccEntrypointFromCompat(compat)}
+            options={[
+              ['sdk-cli', 'sdk-cli'],
+              ['cli', 'cli'],
+            ]}
+            onChange={(cc_entrypoint) =>
+              onCompatChange({ ...compat, cc_entrypoint })
+            }
+          />
+        </SettingRow>
+      </PaneSection>
+      <PaneSection
         icon={Brain}
         title='thinking 显示'
         desc='调用方打开 thinking 却要求隐藏时，出站改成返回摘要。计费不变。'
@@ -269,6 +293,7 @@ export function ProtocolPane({
           }
         />
       </PaneSection>
+      <OutboundReference />
     </div>
   )
 }

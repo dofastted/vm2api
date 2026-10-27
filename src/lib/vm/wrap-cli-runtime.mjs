@@ -461,17 +461,19 @@ export function materializeWrapCli(projectRoot, vm, { uid = null, gid = null } =
   if (!status.ok) return status
   const dest = wrapCliHomeDir(projectRoot, vm.id)
   fs.mkdirSync(dest, { recursive: true })
+  let payloadChanged = false
   for (const name of WRAP_CLI_FILES) {
-    copyFile(path.join(src, name), path.join(dest, name))
+    payloadChanged = replaceFile(path.join(src, name), path.join(dest, name)) || payloadChanged
   }
   const kernelChanged = installKernelPayload(src, dest, projectRoot)
+  const changed = payloadChanged || kernelChanged
   chownTree(dest, uid, gid)
   return {
     ok: true,
     dest,
     src,
-    changed: kernelChanged,
-    kernel_changed: kernelChanged,
+    changed,
+    kernel_changed: changed,
     glibc_shim: isDir(path.join(dest, WRAP_GLIBC_DIR)),
     wrapper: isFile(path.join(dest, WRAP_KERNEL_WRAPPER)),
     kernel_bin: isFile(path.join(dest, WRAP_KERNEL_BIN)),
@@ -721,6 +723,13 @@ function kernelWouldChange(src, dest) {
   return !filesEqual(src, dest)
 }
 
+function payloadWouldChange(srcDir, destDir, projectRoot) {
+  const pairs = [
+    ...WRAP_CLI_FILES.map((name) => [path.join(srcDir, name), path.join(destDir, name)]),
+    [kernelPayloadPath(srcDir, projectRoot), path.join(destDir, WRAP_KERNEL_BIN)],
+  ]
+  return pairs.some(([src, dest]) => kernelWouldChange(src, dest))
+}
 export function inspectKernelChanges(projectRoot, vms, { routing } = {}) {
   const sample = describeWrapSample(projectRoot)
   const crag = describeCragPayload(projectRoot)
@@ -728,7 +737,7 @@ export function inspectKernelChanges(projectRoot, vms, { routing } = {}) {
   for (const vm of vms || []) {
     if (isCodexVm(vm)) continue
     const dataplane = resolveKernelDataplane(vm, routing) || 'wrap'
-    const dest = path.join(wrapCliHomeDir(projectRoot, vm.id), WRAP_KERNEL_BIN)
+    const destDir = wrapCliHomeDir(projectRoot, vm.id)
     const src = dataplane === 'crag' ? crag.path : kernelPayloadPath(sample.dir, projectRoot)
     if (dataplane === 'crag' && !crag.ok) {
       items.push({ id: vm.id, dataplane, ok: false, code: 'crag_kernel_missing', kernel_changed: false })
@@ -738,7 +747,10 @@ export function inspectKernelChanges(projectRoot, vms, { routing } = {}) {
       items.push({ id: vm.id, dataplane, ok: false, code: sample.code, kernel_changed: false })
       continue
     }
-    const kernelChanged = kernelWouldChange(src, dest) || Boolean(vm?.kernel_restart_pending)
+    const kernelChanged =
+      (dataplane === 'crag'
+        ? kernelWouldChange(src, path.join(destDir, WRAP_KERNEL_BIN))
+        : payloadWouldChange(sample.dir, destDir, projectRoot)) || Boolean(vm?.kernel_restart_pending)
     items.push({ id: vm.id, dataplane, ok: true, kernel_changed: kernelChanged })
   }
   const failed = items.filter((item) => !item.ok)

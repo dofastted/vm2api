@@ -14,7 +14,7 @@ const unixTest = process.platform === 'win32' ? test.skip : test
 
 /**
  * 假槽位 kernel：/internal/health 报告就绪，推理路由记下收到的 envelope 并回一段完整 SSE。
- * 请求日志该记的正是这里收到的 body / headers。
+ * Body remains the worker envelope; headers must come from the CLI send boundary.
  */
 async function fakeKernel() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-outbound-log-'))
@@ -26,6 +26,7 @@ async function fakeKernel() {
   fs.writeFileSync(tokenFile, 'internal-test\n', { mode: 0o600 })
   const socket = path.join(runDir, 'kernel.sock')
   const posted = []
+  let reportFinalHeaders = true
   const server = http.createServer(async (req, res) => {
     if (req.url === '/internal/health') {
       res.setHeader('content-type', 'application/json')
@@ -37,6 +38,18 @@ async function fakeKernel() {
     posted.push(JSON.parse(Buffer.concat(chunks).toString('utf8')))
     res.setHeader('content-type', 'text/event-stream')
     const send = (event) => res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
+    if (reportFinalHeaders) {
+      send({ type: 'kin_outbound_headers', headers: { accept: 'superseded-attempt' } })
+      send({
+        type: 'kin_outbound_headers',
+        headers: {
+          accept: 'application/json, text/event-stream',
+          'accept-encoding': 'gzip, br',
+          'content-length': String(1000 + posted.length),
+          authorization: 'Bearer must-not-be-logged',
+        },
+      })
+    }
     send({
       type: 'message_start',
       message: {
@@ -66,6 +79,9 @@ async function fakeKernel() {
   return {
     root,
     posted,
+    setReportFinalHeaders(value) {
+      reportFinalHeaders = value
+    },
     selected: { vmId: 'vm-01', accountId: 'account-a', vm, exec: { vmId: 'vm-01', homeDir, vm } },
     async close() {
       await new Promise((resolve) => server.close(resolve))
@@ -76,7 +92,9 @@ async function fakeKernel() {
 
 function fakeResponse() {
   const listeners = {}
+  const writes = []
   return {
+    writes,
     headersSent: false,
     statusCode: 200,
     on(event, fn) {
@@ -89,7 +107,8 @@ function fakeResponse() {
       this.statusCode = status
       this.headersSent = true
     },
-    write() {
+    write(chunk) {
+      writes.push(String(chunk))
       return true
     },
     end() {},
@@ -99,7 +118,7 @@ function fakeResponse() {
   }
 }
 
-unixTest('debug log records the envelope the slot kernel received, not the pre-transport body', async () => {
+unixTest('debug log uses final CLI headers, hides internal events and never substitutes envelope headers', async () => {
   const kernel = await fakeKernel()
   const finished = []
   const handler = createHandleProtocol({
@@ -163,7 +182,8 @@ unixTest('debug log records the envelope the slot kernel received, not the pre-t
   process.env.KIN_KERNEL_BIN = path.join(kernel.root, 'kin-kernel')
   try {
     // 非流式走 streamAndAssembleClaudeMessage，流式走 dispatchStreamInference，两条路都要记 envelope。
-    for (const stream of [false, true]) {
+    for (const stream of [false, true, false, true]) {
+      kernel.setReportFinalHeaders(finished.length < 2)
       const res = fakeResponse()
       await handler.handleProtocol(
         request({ model: 'claude-haiku-4-5', stream, max_tokens: 64, messages: [{ role: 'user', content: 'hi' }] }),
@@ -173,20 +193,34 @@ unixTest('debug log records the envelope the slot kernel received, not the pre-t
       )
       res.finish()
       await flushPendingWrites()
+      assert.equal(res.writes.join('').includes('kin_outbound_headers'), false)
+      assert.equal(res.writes.join('').includes('must-not-be-logged'), false)
     }
     assert.equal(
       kernel.posted.length,
-      2,
+      4,
       JSON.stringify(finished.map((f) => [f.status, f.error_code, f.error_message])),
     )
-    assert.equal(finished.length, 2)
+    assert.equal(finished.length, 4)
     for (const [i, extra] of finished.entries()) {
       const sent = kernel.posted[i]
       assert.deepEqual(JSON.parse(JSON.stringify(extra.outbound_body)), sent.body)
       // cli-hop 在传输层才补的字段：betas 与 cch 占位；billing 由 cli-hop 末段补上。
       assert.ok(Array.isArray(extra.outbound_body.betas))
       assert.match(extra.outbound_body.system[0].text, /^x-anthropic-billing-header: .*\bcch=00000;/)
-      assert.equal(extra.outbound_headers['anthropic-beta'], sent.headers['anthropic-beta'])
+      assert.deepEqual(extra.worker_envelope_headers, sent.headers)
+      if (i < 2) {
+        assert.deepEqual(extra.outbound_headers, {
+          accept: 'application/json, text/event-stream',
+          'accept-encoding': 'gzip, br',
+          'content-length': String(1001 + i),
+          authorization: '***REDACTED***',
+        })
+        assert.equal(extra.outbound_headers_source, 'cli_final')
+      } else {
+        assert.equal(extra.outbound_headers, null)
+        assert.equal(extra.outbound_headers_source, 'unavailable')
+      }
     }
   } finally {
     if (prevKernelBin === undefined) delete process.env.KIN_KERNEL_BIN

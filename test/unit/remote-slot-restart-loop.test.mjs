@@ -4,6 +4,7 @@ import vmContext from 'node:vm'
 import test from 'node:test'
 import { createKernelWatchdog } from '../../src/lib/transport/kernel-watchdog.mjs'
 import { kernelFaults } from '../../src/lib/transport/rust-kernel-client.mjs'
+import { dockerEnvMap, ensureKvmMachineRecord, kvmEnvMapIncomplete } from '../../src/lib/vm/kvm-machine.mjs'
 
 // Execute the exact production lifecycle body with synthetic I/O boundaries.
 // No SSH, Docker daemon, credentials or production filesystem is accessed.
@@ -29,10 +30,15 @@ function fixture({
     status: 'running',
     runtime: { type: kind, accel: 'kvm' },
   }
+  const kvmEnv = kind === 'kvm' ? ['KIN_KVM_MAC=52:54:00:11:22:33', 'KIN_KVM_DISK_SERIAL=KINfixture01'] : undefined
   let info = missing
     ? null
     : {
-        Config: { Image: mismatch ? 'old-image' : 'image', Labels: { 'kin.vm.layout': '2' } },
+        Config: {
+          Image: mismatch ? 'old-image' : 'image',
+          Labels: { 'kin.vm.layout': '2' },
+          ...(kvmEnv ? { Env: kvmEnv } : {}),
+        },
         HostConfig: { NetworkMode: 'network' },
         State: { Running: running, Restarting: restarting },
       }
@@ -85,6 +91,10 @@ function fixture({
     chownRemoteKvmBinds: async () => {},
     startRemoteTelemetry: async () => {},
     failure: (err) => ({ ok: false, error: err.message }),
+    dockerEnvMap,
+    ensureKvmMachineRecord,
+    kvmEnvMapIncomplete,
+    patchVmRecord: () => null,
   }
   const boot = vmContext.runInNewContext(`${start.replace('export ', '')}; startRemoteSlot`, io)
   return { calls, target, boot: () => boot(target, '/fixture'), state: () => info?.State }

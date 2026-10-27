@@ -408,3 +408,104 @@ test('caller-declared web_search is not given injected defaults', () => {
   const [capped] = sanitizeAnthropicTools([{ type: 'web_search_20250305', name: 'web_search', max_uses: 3 }])
   assert.equal(capped.max_uses, 3)
 })
+
+test('caller-defined web_search function stays a client tool through convert', () => {
+  const fn = {
+    type: 'function',
+    function: {
+      name: 'web_search',
+      description: 'Search the web using Tavily.',
+      parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+    },
+  }
+  assert.equal(isWebSearchTool(fn), false)
+  const [out] = openaiToolsToClaude([fn])
+  assert.equal(out.name, 'web_search')
+  assert.equal(out.type, undefined)
+  assert.deepEqual(out.input_schema.required, ['query'])
+  assert.equal(out.description, 'Search the web using Tavily.')
+})
+
+test('caller-defined web_search function blocks native search injection', () => {
+  const body = {
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: [
+      {
+        type: 'function',
+        function: {
+          name: 'web_search',
+          description: 'Tavily',
+          parameters: { type: 'object', properties: { query: { type: 'string' } } },
+        },
+      },
+    ],
+  }
+  assert.equal(ensureClaudeWebSearch(body), body)
+})
+
+test('non-search tool with description+schema is not caller-defined search and does not block inject', () => {
+  const readFileFn = {
+    type: 'function',
+    function: {
+      name: 'read_file',
+      description: 'Read a file from disk',
+      parameters: { type: 'object', properties: { path: { type: 'string' } } },
+    },
+  }
+  assert.equal(isWebSearchTool(readFileFn), false)
+  const body = {
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: [readFileFn],
+  }
+  const out = ensureClaudeWebSearch(body)
+  assert.equal(out.tools.length, 2)
+  assert.equal(out.tools[0].function.name, 'read_file')
+  assert.deepEqual(out.tools[1], CLAUDE_WEB_SEARCH_TOOL)
+})
+
+test('Anthropic custom tool with description+schema but non-search name does not block inject', () => {
+  const body = {
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: [
+      {
+        name: 'lookup',
+        description: 'Look up a record',
+        input_schema: { type: 'object', properties: { id: { type: 'string' } } },
+      },
+    ],
+  }
+  const out = ensureClaudeWebSearch(body)
+  assert.equal(out.tools.length, 2)
+  assert.equal(out.tools[0].name, 'lookup')
+  assert.deepEqual(out.tools[1], CLAUDE_WEB_SEARCH_TOOL)
+})
+
+test('bare OpenAI web_search and native types still map to the server tool', () => {
+  assert.equal(isWebSearchTool({ type: 'web_search' }), true)
+  assert.equal(isWebSearchTool({ type: 'function', function: { name: 'web_search' } }), true)
+  assert.equal(isWebSearchTool({ name: 'web_search' }), true)
+  assert.equal(isWebSearchTool({ name: 'web_search', input_schema: { type: 'object' } }), true)
+})
+
+test('caller-defined web_search survives convert then sanitize as a client tool', () => {
+  const fn = {
+    type: 'function',
+    function: {
+      name: 'web_search',
+      description: 'Search the web using Tavily.',
+      parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+    },
+  }
+  const [out] = sanitizeAnthropicTools(openaiToolsToClaude([fn]))
+  assert.equal(out.type, undefined)
+  assert.equal(out.name, 'web_search')
+  assert.deepEqual(out.input_schema.required, ['query'])
+  assert.equal(out.description, 'Search the web using Tavily.')
+})
+
+test('native web_search with a stray description is still rebuilt as the server tool', () => {
+  const [out] = sanitizeAnthropicTools([
+    { type: 'web_search_20250305', name: 'web_search', description: 'x', input_schema: {} },
+  ])
+  assert.deepEqual(out, { type: 'web_search_20250305', name: 'web_search' })
+})

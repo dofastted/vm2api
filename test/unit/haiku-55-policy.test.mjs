@@ -2,7 +2,15 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
 import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
-import { applyModelRequestRules, loadModelPolicy, seedDefaultPolicy } from '../../src/lib/protocol/model-policy.mjs'
+import {
+  applyModelRequestRules,
+  getModelEntry,
+  getModelParams,
+  loadModelPolicy,
+  saveModelPolicy,
+  seedDefaultPolicy,
+} from '../../src/lib/protocol/model-policy.mjs'
+import { ensureUnofficialEffortHigh } from '../../src/lib/protocol/thinking.mjs'
 
 test('haiku 5.5 is in the panel seed and keeps forced tool choice', () => {
   const seed = seedDefaultPolicy()
@@ -63,6 +71,31 @@ test('loading old Haiku 5.5 seed migrates only the old 1M defaults to 100K', asy
     assert.equal(row.params.max_tokens_default, 100000)
     assert.equal(row.params.max_tokens_cap, 100000)
     assert.equal(row.params.default_effort, 'medium')
+  } finally {
+    await closeDatabase()
+  }
+})
+
+test('a panel effort edit is what Node reads back', async () => {
+  await openDatabase({ dbPath: ':memory:' })
+  try {
+    const seed = seedDefaultPolicy()
+    seed.models['claude-haiku-5-5'].params.default_effort = 'high'
+    seed.models['claude-haiku-4-5'].params.default_effort = 'medium'
+    await saveModelPolicy(seed)
+    await loadModelPolicy({ force: true })
+    assert.equal(getModelParams('claude-haiku-5-5').default_effort, 'high')
+    assert.equal(getModelParams('claude-haiku-4-5').default_effort, undefined)
+    assert.equal(getModelEntry('claude-haiku-4-5').capabilities.supports_effort, false)
+    seed.models['claude-haiku-5-5'].params.default_effort = 'off'
+    await saveModelPolicy(seed)
+    await loadModelPolicy({ force: true })
+    const body = ensureUnofficialEffortHigh({
+      model: 'claude-haiku-5-5',
+      max_tokens: 16,
+      messages: [{ role: 'user', content: 'pong' }],
+    })
+    assert.equal(body.output_config, undefined)
   } finally {
     await closeDatabase()
   }

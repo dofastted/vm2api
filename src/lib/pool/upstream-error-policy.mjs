@@ -361,6 +361,23 @@ function classifyUpstreamResultRaw(
       retrySameAccount: false,
     }
   }
+  // The org refuses this seat. Not a token death and not a timed cooldown:
+  // pause the slot until an operator resumes it, and give the request to
+  // another unit instead of returning the 403.
+  if (
+    (status === 400 || status === 401 || status === 403) &&
+    ORGANIZATION_DISABLED_PATTERNS.some((pattern) => pattern.test(message))
+  ) {
+    return {
+      scope: 'account',
+      action: result.committed ? 'stop' : 'continue',
+      reason: 'organization_disabled',
+      cooldownUntil: null,
+      retrySameAccount: false,
+      pauseSchedule: true,
+      detail: { status, message: message.slice(0, 500) },
+    }
+  }
   if (/token has been revoked|oauth_revoked|invalid_grant|authentication_error/i.test(hay) || status === 401) {
     if (isUnconfirmedAuthFailure(result)) {
       return {
@@ -502,14 +519,6 @@ function classifyUpstreamResultRaw(
   }
   if (status === 401) return classifyOAuth401(hasRefresh, hay)
   if (status === 403) {
-    if (ORGANIZATION_DISABLED_PATTERNS.some((pattern) => pattern.test(message))) {
-      return {
-        scope: 'account',
-        action: 'disable',
-        reason: 'organization_disabled',
-        cooldownUntil: null,
-      }
-    }
     if (/<html|cloudflare|proxy/i.test(message)) {
       return {
         scope: 'proxy',

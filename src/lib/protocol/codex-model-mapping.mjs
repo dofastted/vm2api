@@ -4,6 +4,8 @@
  */
 import { isGptSeriesId } from './gpt-ids.mjs'
 import { isGptModelEnabled } from './gpt-model-policy.mjs'
+import { canonicalImageToolModel } from './image-tool-models.mjs'
+import { detectInboundPlatform } from './platform-detect.mjs'
 
 /** Recommended secondary default when an operator clears the primary auto-review target. */
 export const DEFAULT_CODEX_MODEL_MAPPING_FALLBACK = 'gpt-6.1-sol'
@@ -82,6 +84,19 @@ export function validateCodexModelMappingsPatch(raw, path = 'codex.model_mapping
   for (const [key, value] of Object.entries(raw)) {
     const alias = String(key || '').trim()
     if (!alias) throw typedError(`${path} 的键必须是非空字符串`, 'invalid_codex_model_mappings')
+    // The rewrite runs before platform detection, so an alias must not capture Claude or image traffic.
+    if (/[\s\p{Cc}]/u.test(key)) {
+      throw typedError(`${path} 的别名 '${alias}' 不能包含空白或控制字符`, 'invalid_codex_model_mappings')
+    }
+    if (detectInboundPlatform(alias).platform === 'anthropic') {
+      throw typedError(
+        `${path} 的别名 '${alias}' 是 Anthropic 模型名，会劫持 Claude 请求`,
+        'invalid_codex_model_mappings',
+      )
+    }
+    if (canonicalImageToolModel(alias)) {
+      throw typedError(`${path} 的别名 '${alias}' 是图像模型，不能映射`, 'invalid_codex_model_mappings')
+    }
     if (value === null || value === '') continue
     if (typeof value !== 'string' || !value.trim()) {
       throw typedError(`${path}.${alias} 必须是字符串、null 或空字符串`, 'invalid_codex_model_mappings')

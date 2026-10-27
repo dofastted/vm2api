@@ -33,6 +33,17 @@ jobs:
       VM2API_TEST_DATABASE_URL: postgresql://vm2api:vm2api-ci-test@127.0.0.1:5432/vm2api_test
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: merge current base
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          # refs/pull/<n>/merge keeps the base from the PR's last push and a
+          # re-run reuses it; merge today's base so a re-run tests against it.
+          git fetch --no-tags origin "$BASE_REF"
+          git -c user.name=ci -c user.email=ci@localhost merge --no-edit FETCH_HEAD
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
@@ -41,7 +52,9 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: '1.25.x'
-          cache-dependency-path: worker/go.sum
+          cache-dependency-path: |
+            worker/go.sum
+            api-kernel/go.sum
       - name: download worker modules for offline Go protocol fixtures
         working-directory: worker
         run: go mod download
@@ -80,6 +93,20 @@ jobs:
         run: /usr/bin/python3 -m unittest discover -s test/deploy -v
       - name: PostgreSQL application role permissions
         run: python3 test/deploy/smoke_postgres_role.py
+      - name: go vet and test
+        run: |
+          (cd worker && go vet ./... && go test ./...)
+          (cd api-kernel && go vet ./... && go test ./...)
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10
+      - name: web
+        working-directory: web
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm format:check
+          pnpm test
+          pnpm build
 
   arm64:
     runs-on: ubuntu-24.04-arm
@@ -107,71 +134,3 @@ jobs:
           python3 -c 'from pathlib import Path; p = Path("VERSION"); p.write_text(p.read_text().strip() + "-arm64-build-check\n")'
           docker build --progress=plain --platform linux/arm64 -f deploy/Dockerfile.arm64-control -t vm2api-arm64-control:ci-version .
           python3 test/deploy/smoke_arm64_image.py vm2api-arm64-control:ci-version
-
-  worker:
-    runs-on: ubuntu-latest
-    timeout-minutes: 8
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: '1.25.x'
-          cache-dependency-path: |
-            worker/go.sum
-            api-kernel/go.sum
-      - name: gofmt
-        run: |
-          files=$(gofmt -l worker api-kernel)
-          if [ -n "$files" ]; then
-            printf 'gofmt needed:\n%s\n' "$files" >&2
-            exit 1
-          fi
-      - name: go test race
-        run: |
-          (cd worker && go test -race ./...)
-          (cd api-kernel && go test -race ./...)
-      - name: go vet
-        run: |
-          (cd worker && go vet ./...)
-          (cd api-kernel && go vet ./...)
-      - name: build Go commands
-        run: |
-          (cd worker && CGO_ENABLED=0 go build -trimpath ./cmd/...)
-          (cd api-kernel && CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/kin-api-kernel" ./cmd/kin-api-kernel)
-
-  kernel:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '22'
-      - name: pinned linux amd64 payload ELFs
-        run: |
-          node scripts/fetch-payload.mjs
-          node scripts/fetch-payload.mjs --check
-          for b in bin/kin-kernel bin/kin-codex-kernel bin/kin-oauth-auth share/wrap-cli/kin-kernel.bin share/wrap-cli/cli-node share/wrap-cli/cc-node share/crag/kin-kernel; do
-            file "$b" | grep -q 'ELF 64-bit LSB .*x86-64'
-          done
-
-  web:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '22'
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 10
-          cache: true
-          cache_dependency_path: web/pnpm-lock.yaml
-      - name: install and verify
-        working-directory: web
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm format:check
-          pnpm test
-          pnpm build

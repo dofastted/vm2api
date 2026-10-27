@@ -34,8 +34,8 @@ export function classifierFixture({ model = 'claude-sonnet-4-6', format = 'xml',
   const action = { type: 'text', text: 'WebSearch fixture documentation\n', cache_control: { type: 'ephemeral', ttl: '1h' } }
   const suffix = stage === 'xml_s2' ? SUFFIX[verdict].s2 : SUFFIX[verdict].s1
   return {
-    model, max_tokens: stage === 'xml_s1' ? 64 : stage === 'fast' ? 256 : 4096,
-    thinking: { type: 'disabled' }, temperature: 0,
+    model, max_tokens: stage === 'xml_s1' ? 64 : stage === 'fast' ? 256 : 8192,
+    thinking: { type: 'disabled' }, temperature: 1,
     system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral', ttl: '1h' } }],
     messages: [{ role: 'user', content: [
       ...(format === 'xml' ? [{ type: 'text', text: '<transcript>\n' }] : []),

@@ -5,7 +5,6 @@ import {
   VM_ORIGIN,
   assignOriginForOwner,
   canBindProxyToVm,
-  canUserDeleteVm,
   clampVmCreateQuota,
   countUserCreatedVms,
   filterVmsForPanel,
@@ -13,6 +12,34 @@ import {
   ownerScopeFromRequest,
   vmMatchesOwnerScope,
 } from '../../src/lib/admin/resource-owner.mjs'
+
+test('panel sessions without a key record follow the session role', async () => {
+  const tenant = await ownerScopeFromRequest({ panelUser: 'alice', panelRole: 'user', panelUserId: 'u1' })
+  assert.deepEqual(tenant, { type: 'user', userId: 'u1' })
+  assert.equal(vmMatchesOwnerScope({}, tenant), false)
+  const orphan = await ownerScopeFromRequest({ panelUser: 'ghost', panelRole: 'user', panelUserId: null })
+  assert.equal(vmMatchesOwnerScope({}, orphan), false)
+  assert.equal(vmMatchesOwnerScope({ owner_user_id: 'u1' }, orphan), false)
+  assert.deepEqual(
+    await ownerScopeFromRequest({ panelUser: 'root', panelRole: 'admin', panelUserId: 'a1' }),
+    PLATFORM_SCOPE,
+  )
+  assert.deepEqual(
+    await ownerScopeFromRequest({ panelUser: 'ops', panelRole: 'super', panelUserId: 's1' }),
+    PLATFORM_SCOPE,
+  )
+  assert.deepEqual(
+    await ownerScopeFromRequest({ panelUser: 'master', panelRole: 'admin', apiKeyKind: 'master' }),
+    PLATFORM_SCOPE,
+  )
+})
+
+test('managed keys resolve the owner role through the users repo', async () => {
+  const users = { getById: (id) => ({ a1: { role: 'admin' }, u1: { role: 'user' } })[id] || null }
+  const req = (userId) => ({ apiKeyKind: 'managed', apiKeyRecord: { user_id: userId } })
+  assert.deepEqual(await ownerScopeFromRequest(req('a1'), users), PLATFORM_SCOPE)
+  assert.deepEqual(await ownerScopeFromRequest(req('u1'), users), { type: 'user', userId: 'u1' })
+})
 
 test('admin and master keys stay on the platform pool', () => {
   assert.deepEqual(ownerScopeFromApiKey({ user_id: 'admin-1' }, { apiKeyKind: 'master' }), PLATFORM_SCOPE)
@@ -52,8 +79,6 @@ test('quota clamp and self-created count', () => {
     { owner_user_id: 'u1' },
   ]
   assert.equal(countUserCreatedVms(vms, 'u1'), 1)
-  assert.equal(canUserDeleteVm(vms[0], 'u1'), true)
-  assert.equal(canUserDeleteVm(vms[1], 'u1'), false)
 })
 
 test('unassign origin and proxy bind rules', () => {

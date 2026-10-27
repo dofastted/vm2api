@@ -1,15 +1,23 @@
 import type { ReactNode } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import type { UsageAccountRow } from '@/types/panel-usage'
-import type { Vm, VmUsageStatsRank } from '@/types/panel-vm'
+import type {
+  Vm,
+  VmBillingPeriod,
+  VmClosedWindow,
+  VmDetailPayload,
+  VmUsageStatsRank,
+} from '@/types/panel-vm'
 import {
   BarChart3,
   Calculator,
   ClipboardList,
   Clock,
   Coins,
-  Flame,
   Gauge,
+  History,
+  Hourglass,
+  Timer,
   TrendingUp,
   Zap,
 } from 'lucide-react'
@@ -25,10 +33,18 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
+import { fmtResetClock, resetCountdown } from '@/lib/fable-status'
 import { fmtMs, fmtNum, fmtUsd } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { accountStatus, vmRunning } from '@/lib/vm-status'
-import { fmtHitPct, vmTodayStats, vmWeekOutcome } from '@/lib/vm-usage'
+import {
+  fmtHitPct,
+  fmtWindowSpan,
+  vmTodayStats,
+  vmWeekOutcome,
+  vmWindowCosts,
+} from '@/lib/vm-usage'
+import { useNow } from '@/hooks/use-now'
 import {
   Dialog,
   DialogContent,
@@ -41,8 +57,11 @@ import { SlotIdentity } from '@/components/platform-chip'
 import { StatusMark } from '@/components/status-mark'
 import { VmCostByModel } from '@/features/vm/detail-cost-by-model'
 import { vmQueryOptions } from '@/features/vm/queries'
-import { VmUsagePanel } from '@/features/vm/usage-windows'
+import { riskFg, UsageMeter } from '@/features/vm/usage-meter'
+import { VmQuotaActions } from '@/features/vm/usage-windows'
+import { vmWindows } from '@/features/vm/vm-rack-model'
 import {
+  projectionView,
   summarizeUsageStats,
   type StatsDayPoint,
 } from '@/features/vm/vm-stats-model'
@@ -449,6 +468,248 @@ export function EndpointBars({ rows }: { rows: VmUsageStatsRank[] }) {
   )
 }
 
+type WindowCell = {
+  key: string
+  label: string
+  /** 已用百分比 0–100；未探测为 null。 */
+  pct: number | null
+  /** 起止或重置时刻。 */
+  when: string
+  cost: number
+  requests: number | null
+  tokens: number | null
+}
+
+const periodTokens = (p: VmBillingPeriod) =>
+  p.input_tokens +
+  p.output_tokens +
+  p.cache_read_tokens +
+  p.cache_creation_tokens
+
+/** 窗口一格：标签 · 已用% / 占用条 / 起止或重置 / 花费 · 请求 · tokens。 */
+function WindowLine({ cell }: { cell: WindowCell }) {
+  const { pct } = cell
+  const nums = [
+    fmtUsd(cell.cost, 2),
+    cell.requests == null ? null : `${fmtNum(cell.requests)} req`,
+    cell.tokens == null ? null : `${fmtTokens(cell.tokens)} tok`,
+  ].filter(Boolean)
+  return (
+    <div className='min-w-0 space-y-1'>
+      <div className='flex items-baseline justify-between gap-2'>
+        <span className='text-xs font-medium text-muted-foreground'>
+          {cell.label}
+        </span>
+        <span
+          className={cn(
+            'font-mono text-sm font-semibold tabular-nums',
+            pct == null ? 'text-[color:var(--text-tertiary)]' : riskFg(pct)
+          )}
+        >
+          {pct == null ? '—' : `${pct.toFixed(0)}%`}
+        </span>
+      </div>
+      {pct == null ? (
+        <div
+          className='h-[5px] w-full rounded-full track-recessed'
+          aria-hidden='true'
+        />
+      ) : (
+        <UsageMeter value={pct} size='sm' ticks={false} />
+      )}
+      <div className='truncate text-[11px] text-muted-foreground tabular-nums'>
+        {cell.when}
+      </div>
+      <div className='truncate font-mono text-[11px] tabular-nums'>
+        {nums.join(' · ')}
+      </div>
+    </div>
+  )
+}
+
+function WindowCard({
+  tone,
+  icon,
+  title,
+  meta,
+  children,
+}: {
+  tone: string
+  icon: ReactNode
+  title: string
+  meta?: string
+  children: ReactNode
+}) {
+  return (
+    <section className='flex min-w-0 flex-col rounded-xl border bg-card p-3.5'>
+      <div className='mb-3 flex items-center gap-2'>
+        <span className={cn('rounded-lg p-1.5 [&_svg]:size-4', tone)}>
+          {icon}
+        </span>
+        <h3 className='text-sm font-semibold'>{title}</h3>
+        {meta ? (
+          <span className='ms-auto text-[11px] text-muted-foreground'>
+            {meta}
+          </span>
+        ) : null}
+      </div>
+      <div className='flex flex-1 flex-col gap-3'>{children}</div>
+    </section>
+  )
+}
+
+function closedCell(label: string, w: VmClosedWindow | null | undefined) {
+  if (!w) return null
+  return {
+    key: label,
+    label,
+    pct: w.used_ratio * 100,
+    when: fmtWindowSpan(w.start, w.end),
+    cost: w.total_cost,
+    requests: w.requests,
+    tokens: w.tokens,
+  } satisfies WindowCell
+}
+
+/**
+ * 额度窗口：上个窗口 / 当前窗口各含 5H 与 7D，第三张是本窗口预计剩余 5H。
+ * 上个窗口靠后端在窗口翻转时归档，翻转前没有记录。
+ */
+function QuotaWindows({
+  vm,
+  accounts,
+  billing,
+  loading,
+}: {
+  vm: Vm
+  accounts?: UsageAccountRow[]
+  billing: VmDetailPayload['billing']
+  loading: boolean
+}) {
+  const now = useNow()
+  const hasToken = Boolean(vm.has_token)
+  const fallback = vmWindowCosts(vm, accounts)
+  const live: Record<string, VmBillingPeriod | null | undefined> = {
+    '5h': billing?.window_5h,
+    '7d': billing?.window_7d,
+  }
+  const current: WindowCell[] = vmWindows(vm).map((w) => {
+    const period = live[w.key]
+    const clock = hasToken ? fmtResetClock(w.reset) : null
+    const left = hasToken ? resetCountdown(w.reset, now) : null
+    return {
+      key: w.key,
+      label: w.label,
+      pct: w.pct,
+      when:
+        w.note ??
+        (clock ? `重置 ${clock}${left ? ` · ${left}` : ''}` : '无重置时间'),
+      cost:
+        w.key === 'fable'
+          ? Number(vm.window_fable_cost) || 0
+          : (period?.total_cost ??
+            (w.key === '5h' ? fallback.h5 : fallback.d7)),
+      requests: period ? period.requests : null,
+      tokens: period ? periodTokens(period) : null,
+    }
+  })
+  const prev = [
+    closedCell('5H', billing?.prev_window_5h),
+    closedCell('7D', billing?.prev_window_7d),
+  ]
+  const proj = projectionView(
+    billing?.window_5h_projection,
+    vm.estimate_5h,
+    Boolean(billing?.prev_window_5h)
+  )
+  const spent5 = live['5h']?.total_cost ?? fallback.h5
+
+  return (
+    <div className='grid gap-3 lg:grid-cols-3'>
+      <WindowCard
+        tone='bg-slate-500/15 text-slate-600 dark:text-slate-300'
+        icon={<History />}
+        title='上个窗口'
+        meta='结束时已用'
+      >
+        {loading ? (
+          <Skeleton className='h-32 rounded-lg' />
+        ) : (
+          prev.map((cell, i) =>
+            cell ? (
+              <WindowLine key={cell.key} cell={cell} />
+            ) : (
+              <div key={i} className='min-w-0 space-y-1'>
+                <span className='text-xs font-medium text-muted-foreground'>
+                  {i === 0 ? '5H' : '7D'}
+                </span>
+                <p className='text-[11px] text-muted-foreground'>
+                  暂无记录 · 窗口翻转后开始记录
+                </p>
+              </div>
+            )
+          )
+        )}
+      </WindowCard>
+
+      <WindowCard
+        tone='bg-sky-500/15 text-sky-600 dark:text-sky-400'
+        icon={<Timer />}
+        title='当前窗口'
+        meta='官方价'
+      >
+        {current.map((cell) => (
+          <WindowLine key={cell.key} cell={cell} />
+        ))}
+        <div className='mt-auto'>
+          <VmQuotaActions vm={vm} now={now} />
+        </div>
+      </WindowCard>
+
+      <WindowCard
+        tone='bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+        icon={<Hourglass />}
+        title='预计剩余 5H 额度'
+      >
+        {loading ? (
+          <Skeleton className='h-32 rounded-lg' />
+        ) : (
+          <>
+            <div>
+              <p
+                className={cn(
+                  'text-2xl leading-tight font-bold tabular-nums',
+                  proj.remaining == null && 'text-[color:var(--text-tertiary)]'
+                )}
+              >
+                {proj.remaining == null ? '—' : fmtUsd(proj.remaining, 2)}
+              </p>
+              <p className='mt-1 text-[11px] text-muted-foreground'>
+                {proj.basis}
+              </p>
+            </div>
+            <dl className='space-y-1.5 text-xs'>
+              <div className='flex justify-between gap-3'>
+                <dt className='text-muted-foreground'>本窗口已花</dt>
+                <dd className='font-mono tabular-nums'>{fmtUsd(spent5, 2)}</dd>
+              </div>
+              <div className='flex justify-between gap-3'>
+                <dt className='text-muted-foreground'>窗口总额度</dt>
+                <dd className='font-mono tabular-nums'>
+                  {proj.total == null ? '—' : `≈ ${fmtUsd(proj.total, 2)}`}
+                </dd>
+              </div>
+            </dl>
+            <p className='mt-auto text-[11px] text-[color:var(--text-tertiary)]'>
+              按官方价估算；账号在网关外使用会偏低
+            </p>
+          </>
+        )}
+      </WindowCard>
+    </div>
+  )
+}
+
 function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
   const detail = useQuery(vmQueryOptions(vm.id))
   const billing = detail.data?.billing
@@ -481,9 +742,12 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
         </div>
       </div>
 
-      <section className='rounded-xl border bg-card px-3.5 py-3'>
-        <VmUsagePanel vm={vm} accounts={accounts} />
-      </section>
+      <QuotaWindows
+        vm={vm}
+        accounts={accounts}
+        billing={billing}
+        loading={detail.isLoading}
+      />
 
       {detail.isLoading ? (
         <div className='space-y-3'>
@@ -550,52 +814,6 @@ function StatsBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
                 },
               ]}
             />
-            <InfoCard
-              tone='bg-orange-500/15 text-orange-600 dark:text-orange-400'
-              icon={<Flame />}
-              title='花费最高的一天'
-              rows={[
-                {
-                  label: '日期',
-                  value: view.summary.highestCost?.day ?? '-',
-                },
-                {
-                  label: '费用',
-                  value: fmtUsd(view.summary.highestCost?.total_cost ?? 0, 2),
-                  strong: 'text-orange-600 dark:text-orange-400',
-                },
-                {
-                  label: '请求',
-                  value: fmtNum(view.summary.highestCost?.requests ?? 0),
-                },
-              ]}
-            />
-            <InfoCard
-              tone='bg-indigo-500/15 text-indigo-600 dark:text-indigo-400'
-              icon={<TrendingUp />}
-              title='请求最多的一天'
-              rows={[
-                {
-                  label: '日期',
-                  value: view.summary.highestRequests?.day ?? '-',
-                },
-                {
-                  label: '请求',
-                  value: fmtNum(view.summary.highestRequests?.requests ?? 0),
-                  strong: 'text-indigo-600 dark:text-indigo-400',
-                },
-                {
-                  label: '费用',
-                  value: fmtUsd(
-                    view.summary.highestRequests?.total_cost ?? 0,
-                    2
-                  ),
-                },
-              ]}
-            />
-          </div>
-
-          <div className='grid gap-3 lg:grid-cols-2'>
             <InfoCard
               tone='bg-rose-500/15 text-rose-600 dark:text-rose-400'
               icon={<Gauge />}

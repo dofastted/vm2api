@@ -33,6 +33,7 @@ import {
   waitEgressExit,
   egressPidActive,
   ensureProxyEgress,
+  startProxyEgress,
   runExclusiveProxyEgress,
   waitPortReleased,
 } from '../../src/lib/vm/egress.mjs'
@@ -345,6 +346,66 @@ test('iptables plan redirects tcp and dns, returns subnet, drops the rest', () =
   assert.ok(joined.some((s) => s.includes('-d 172.31.0.0/24 -j RETURN')))
   assert.ok(joined.some((s) => s.includes('FORWARD') && s.includes('DROP')))
   assert.ok(plan.del.some((row) => row.includes('-X')))
+  assert.ok(joined.findIndex((s) => s.includes('-I FORWARD')) < joined.findIndex((s) => s.includes('-t nat')))
+})
+
+test('helper startup failure leaves a forwarding block in place before any slot can go direct', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-eg-fail-closed-'))
+  const calls = []
+  try {
+    const result = await startProxyEgress(
+      root,
+      { id: 'px-audit', url: 'socks5h://192.0.2.1:1080' },
+      {
+        bin: path.join(root, 'missing-egress'),
+        runDocker: () => ({ ok: true, stdout: '172.31.0.0/24|172.31.0.1' }),
+        runIptables: (args) => {
+          calls.push(args)
+          return { ok: !args.includes('-C') }
+        },
+      },
+    )
+    assert.equal(result.ok, false)
+    assert.deepEqual(calls[1], [
+      '-t',
+      'filter',
+      '-I',
+      'FORWARD',
+      '1',
+      '-i',
+      'kegaudit',
+      '!',
+      '-d',
+      '172.31.0.0/24',
+      '-j',
+      'DROP',
+    ])
+    assert.equal(
+      calls.some((args) => args.includes('-D')),
+      false,
+    )
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('refusing the forwarding block aborts before installing redirects or launching a helper', async () => {
+  const calls = []
+  const result = await startProxyEgress(
+    '/unused',
+    { id: 'px-audit', url: 'socks5h://192.0.2.1:1080' },
+    {
+      runDocker: () => ({ ok: true, stdout: '172.31.0.0/24|172.31.0.1' }),
+      runIptables: (args) => {
+        calls.push(args)
+        return { ok: false, stderr: 'permission denied' }
+      },
+    },
+  )
+  assert.equal(result.ok, false)
+  assert.match(result.error, /permission denied/)
+  assert.equal(calls.length, 2)
+  assert.ok(calls.every((args) => args.includes('FORWARD')))
 })
 
 test('host INPUT allows only bridge subnet helper ports and removes the same rules', () => {

@@ -5,6 +5,7 @@ import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
 import {
   normalizePolicy,
   loadModelPolicy,
+  getModelPolicy,
   getPolicyCatalogIds,
   filterPublicModelIds,
   syncWorkerModelsIntoPolicy,
@@ -100,7 +101,9 @@ test('loading a persisted disabled legacy model keeps both request spellings dis
       assert.equal(result.ok, false, model)
       assert.equal(result.error.code, 'model_disabled', model)
     }
-    assert.deepEqual(filterPublicModelIds([legacy, canonical]), [canonical])
+    assert.deepEqual(filterPublicModelIds([legacy, canonical]), [canonical, 'auto'])
+    getModelPolicy().models.auto.enabled = false
+    assert.deepEqual(filterPublicModelIds([canonical]), [canonical])
     await syncWorkerModelsIntoPolicy([legacy])
     assert.ok(!getPolicyCatalogIds().includes(legacy))
   } finally {

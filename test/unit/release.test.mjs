@@ -130,6 +130,16 @@ test('readLocalVersion prefers VERSION file over package.json', () => {
   }
 })
 
+test('readLocalVersion keeps a dev VERSION string intact', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2api-release-'))
+  try {
+    fs.writeFileSync(path.join(tmp, 'VERSION'), '1.3.228-dev.703-cache\n')
+    assert.equal(readLocalVersion(tmp), '1.3.228-dev.703-cache')
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 test('loadChangelog reads the warehouse CHANGELOG.md', () => {
   const entries = loadChangelog(path.resolve(import.meta.dirname, '../..'))
   assert.ok(entries.length >= 3)

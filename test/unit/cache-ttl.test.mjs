@@ -261,6 +261,19 @@ test('applyCacheTtlToUsage reclassifies a 5m report after we sent 1h', () => {
   assert.equal(out.cache_ttl, '1h')
 })
 
+test('applyCacheTtlToUsage keeps a message_delta total above the stale start split (#678)', () => {
+  const out = applyCacheTtlToUsage(
+    {
+      cache_creation_input_tokens: 14890,
+      cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 119 },
+    },
+    '1h',
+  )
+  assert.equal(out.cache_creation_1h_tokens, 14890)
+  assert.equal(out.cache_creation_5m_tokens, 0)
+  assert.equal(out.cache_creation.ephemeral_1h_input_tokens, 14890)
+})
+
 test('default 5m usage stays in the 1.25x bucket', () => {
   const out = applyCacheTtlToUsage(
     {

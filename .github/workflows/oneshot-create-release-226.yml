@@ -1,0 +1,57 @@
+name: oneshot-create-release-226
+on:
+  push:
+    paths:
+      - ".github/workflows/oneshot-create-release-226.yml"
+  workflow_dispatch: {}
+jobs:
+  create:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 7cd52501c03c03e36493c38e39edc349de7d0c99
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: ensure notes on workspace
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git checkout origin/main -- docs/releases/v1.3.226-notes.md
+          test -f docs/releases/v1.3.226-notes.md
+      - name: stage pinned payload
+        run: |
+          node scripts/fetch-payload.mjs
+          node scripts/fetch-payload.mjs --stage dist
+      - name: create or edit release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NOTES=docs/releases/v1.3.226-notes.md
+          if gh release view v1.3.226 --repo dofastted/vm2api >/dev/null 2>&1; then
+            echo release-exists
+            gh release edit v1.3.226 --repo dofastted/vm2api --title "vm2api 1.3.226" --notes-file "$NOTES"
+          else
+            gh release create v1.3.226 \
+              --repo dofastted/vm2api \
+              --target 7cd52501c03c03e36493c38e39edc349de7d0c99 \
+              --title "vm2api 1.3.226" \
+              --notes-file "$NOTES" \
+              dist/kin-kernel \
+              dist/kin-kernel-crag \
+              dist/kin-codex-kernel \
+              dist/kin-worker \
+              dist/kin-egress \
+              dist/kin-slot-gate \
+              dist/kin-oauth-auth \
+              dist/kin-computer \
+              dist/cli-node \
+              dist/cc-node
+          fi
+          gh release view v1.3.226 --repo dofastted/vm2api

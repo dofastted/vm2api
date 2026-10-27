@@ -1,28 +1,23 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { PersonaPreset } from '@/types/panel-routing'
-import { Check, ChevronDown, RotateCcw } from 'lucide-react'
+import { Check, RotateCcw } from 'lucide-react'
 import {
   DEFAULT_PERSONA_TEMPLATES,
   PERSONA_PRESET_OPTIONS,
   PERSONA_PRESETS,
+  PERSONA_TEMPLATE_VARS,
   formatLineError,
   parsePersonaTemplateLines,
   personaPresetFromCompat,
   personaPresetLabel,
   presetSeed,
   stringifyPersonaTemplate,
-  templateSlotState,
   validatePersonaTemplate,
   type RawBlock,
 } from '@/lib/persona-template'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from '@/components/ui/collapsible'
 import {
   type PersonaDrafts,
   personaDraftStoresEmpty,
@@ -35,7 +30,13 @@ import {
   PersonaTemplateEditor,
   Problems,
 } from '@/features/settings/persona-editors'
-import { InjectCard } from './inject-card'
+import { PromptFields } from './prompt-fields'
+import {
+  promptDisplayText,
+  promptEditorBlocks,
+  promptSourceBlocks,
+  promptSourceText,
+} from './prompt-presentation'
 import { SystemPreview } from './system-preview'
 
 type Compat = Record<string, unknown>
@@ -62,7 +63,7 @@ function PresetBar({
     <div
       role='tablist'
       aria-label='system 提示词档位'
-      className='grid grid-cols-2 gap-2 lg:grid-cols-4'
+      className='grid grid-cols-2 gap-2 md:grid-cols-3 xl:grid-cols-5'
     >
       {PERSONA_PRESET_OPTIONS.map(([key, label]) => {
         const selected = key === viewing
@@ -80,17 +81,17 @@ function PresetBar({
                 : 'border-border/60 bg-card hover:border-border hover:bg-muted/40'
             )}
           >
-            <span className='flex w-full items-center gap-2'>
-              <span className='text-sm font-medium'>{label}</span>
+            <span className='w-full text-sm font-medium whitespace-nowrap'>
+              {label}
+            </span>
+            <span className='flex w-full items-center gap-2 text-[11px] text-muted-foreground'>
+              <span>{summaries[key]}</span>
               {key === active ? (
-                <span className='ml-auto flex items-center gap-1 text-[10px] font-medium text-emerald-600 dark:text-emerald-400'>
+                <span className='ml-auto flex shrink-0 items-center gap-1 text-[10px] font-medium whitespace-nowrap text-emerald-600 dark:text-emerald-400'>
                   <Check className='size-3' aria-hidden />
                   生效
                 </span>
               ) : null}
-            </span>
-            <span className='text-[11px] text-muted-foreground'>
-              {summaries[key]}
             </span>
           </button>
         )
@@ -98,7 +99,6 @@ function PresetBar({
     </div>
   )
 }
-
 export function SystemPromptWorkspace({
   compat,
   server,
@@ -113,7 +113,6 @@ export function SystemPromptWorkspace({
   const [drafts, setDrafts] = useState<PersonaDrafts | null>(null)
   const active = personaPresetFromCompat(compat)
   const [viewing, setViewing] = useState<PersonaPreset>(active)
-  const [templateOpen, setTemplateOpen] = useState(false)
 
   useEffect(() => {
     if (drafts || !Object.keys(compat).length) return
@@ -166,8 +165,11 @@ export function SystemPromptWorkspace({
         onView={setViewing}
       />
 
-      <div className='grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.15fr)]'>
-        <div className='min-w-0 space-y-4'>
+      <div className='grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_22rem]'>
+        <section aria-label='出站预览' className='min-w-0 xl:sticky xl:top-20'>
+          <SystemPreview preset={viewing} blocks={blocks} compat={compat} />
+        </section>
+        <aside aria-label='注入控制' className='min-w-0 space-y-4'>
           {viewing !== active ? (
             <div className='flex items-center justify-between gap-3 rounded-xl border border-dashed px-4 py-2.5'>
               <span className='text-sm text-muted-foreground'>
@@ -191,82 +193,89 @@ export function SystemPromptWorkspace({
             </div>
           ) : null}
 
-          <InjectCard
-            compat={compat}
-            server={server}
-            preset={viewing}
-            blocks={blocks}
-            standing='switch'
-            env={templateSlotState(blocks, 'env')}
-            onChange={onChange}
-          />
-
-          <Collapsible open={templateOpen} onOpenChange={setTemplateOpen}>
-            <Card className='gap-0 py-0'>
-              <div className='flex items-center gap-2 px-4 py-2.5'>
-                <CollapsibleTrigger asChild>
-                  <button
-                    type='button'
-                    className='flex min-w-0 flex-1 cursor-pointer items-center gap-2 text-left'
-                  >
-                    <ChevronDown
-                      className={cn(
-                        'size-4 text-muted-foreground transition-transform duration-200',
-                        templateOpen ? 'rotate-0' : '-rotate-90'
-                      )}
-                      aria-hidden
-                    />
-                    <span className='text-sm font-medium'>模板</span>
-                    <span className='truncate text-xs text-muted-foreground'>
-                      {summaries[viewing]} · {blocks.length} 块
-                    </span>
-                  </button>
-                </CollapsibleTrigger>
-                <Button
-                  type='button'
-                  size='sm'
-                  variant='ghost'
-                  className='h-7 cursor-pointer text-xs'
-                  onClick={() =>
-                    setDraft(
-                      stringifyPersonaTemplate(
-                        presetSeed(DEFAULT_PERSONA_TEMPLATES, viewing)
-                      )
+          <Card className='gap-0 py-0'>
+            <div className='flex items-center justify-between gap-2 px-5 py-4 sm:px-6'>
+              <span className='text-base font-semibold'>注入控制</span>
+              <Button
+                type='button'
+                size='sm'
+                variant='ghost'
+                className='h-7 cursor-pointer text-xs'
+                onClick={() =>
+                  setDraft(
+                    stringifyPersonaTemplate(
+                      presetSeed(DEFAULT_PERSONA_TEMPLATES, viewing)
                     )
-                  }
-                >
-                  <RotateCcw />
-                  恢复预设
-                </Button>
-              </div>
-              <CollapsibleContent className='space-y-3 border-t border-border/60 px-4 py-3'>
-                {viewing === 'custom' &&
-                personaDraftStoresEmpty(text, 'custom') ? (
-                  <Notice tone='caution'>空模板会回落官方提示词。</Notice>
-                ) : null}
-                <PersonaTemplateEditor
-                  key={viewing}
-                  text={text}
-                  blocks={
-                    parsed.blocks.length
-                      ? parsed.blocks
-                      : presetSeed(DEFAULT_PERSONA_TEMPLATES, viewing)
-                  }
-                  hasErrors={hasErrors}
-                  onTextChange={setDraft}
+                  )
+                }
+              >
+                <RotateCcw />
+                恢复预设
+              </Button>
+            </div>
+            <div className='space-y-3 border-t border-border/60 px-5 py-4 sm:px-6'>
+              {viewing === 'custom' &&
+              personaDraftStoresEmpty(text, 'custom') ? (
+                <Notice tone='caution'>空模板会回落官方提示词。</Notice>
+              ) : null}
+              {viewing === 'custom' || hasErrors ? (
+                <details className='group'>
+                  <summary className='cursor-pointer py-2 text-sm font-medium focus-visible:rounded-md'>
+                    详情编辑
+                  </summary>
+                  <div className='pt-3'>
+                    <PersonaTemplateEditor
+                      key={viewing}
+                      text={
+                        hasErrors
+                          ? promptDisplayText(text)
+                          : stringifyPersonaTemplate(
+                              promptEditorBlocks(parsed.blocks)
+                            )
+                      }
+                      blocks={promptEditorBlocks(blocks)}
+                      hasErrors={hasErrors}
+                      vars={PERSONA_TEMPLATE_VARS.map(([name, description]) => [
+                        promptDisplayText(`{{${name}}}`).slice(2, -2),
+                        description.replace(/2\.1\.303/g, '').trim(),
+                      ])}
+                      onTextChange={(next) => {
+                        const source = promptSourceText(next)
+                        const parsed = parsePersonaTemplateLines(source)
+                        setDraft(
+                          parsed.errors.length
+                            ? source
+                            : stringifyPersonaTemplate(
+                                promptSourceBlocks(parsed.blocks, blocks)
+                              )
+                        )
+                      }}
+                      onBlocksChange={(next) =>
+                        setDraft(
+                          stringifyPersonaTemplate(
+                            promptSourceBlocks(next, blocks)
+                          )
+                        )
+                      }
+                    />
+                  </div>
+                </details>
+              ) : (
+                <PromptFields
+                  preset={viewing}
+                  blocks={blocks}
+                  compat={compat}
+                  server={server}
                   onBlocksChange={(next) =>
                     setDraft(stringifyPersonaTemplate(next))
                   }
+                  onCompatChange={onChange}
                 />
-              </CollapsibleContent>
-            </Card>
-          </Collapsible>
+              )}
+            </div>
+          </Card>
 
           <Problems items={problems} />
-        </div>
-
-        <aside className='min-w-0 xl:sticky xl:top-20'>
-          <SystemPreview preset={viewing} blocks={blocks} compat={compat} />
         </aside>
       </div>
     </div>

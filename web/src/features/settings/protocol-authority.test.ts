@@ -1,9 +1,17 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { VmPatch } from '@/lib/api'
 import {
+  cchEnabledFromCompat,
   inheritProtocolOnSlots,
   protocolInheritPatch,
 } from './protocol-authority'
+
+describe('cchEnabledFromCompat', () => {
+  it('disables CCH assignment for explicit false', () => {
+    expect(cchEnabledFromCompat({ cch_enabled: false })).toBe(false)
+    expect(cchEnabledFromCompat(undefined)).toBe(true)
+  })
+})
 
 describe('protocolInheritPatch', () => {
   it('returns null when the slot already inherits', () => {

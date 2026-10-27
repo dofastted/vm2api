@@ -6,6 +6,7 @@ import {
   ensureConversationEndsWithUser,
   ensureOutputConfigSchema,
   flattenSearchResultHistory,
+  flattenUndeclaredSearchHistory,
   pairMissingToolResults,
   rectifyUnofficialRequest,
   rectifyUnofficialRequestForRetry,
@@ -164,6 +165,56 @@ test('search_result block with encrypted_content flattens inside a tool_result',
   assert.match(toolResult.content[0].text, /body text/)
 })
 
+function serverSearchHistory(tools) {
+  return {
+    tools,
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: '查一下' }] },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'server_tool_use', id: 'srvtoolu_1', name: 'web_search', input: { query: 'example' } },
+          {
+            type: 'web_search_tool_result',
+            tool_use_id: 'srvtoolu_1',
+            content: [{ type: 'web_search_result', title: 'Ex', url: 'https://ex.co', encrypted_content: 'AAAA' }],
+          },
+          { type: 'text', text: '结论' },
+        ],
+      },
+      { role: 'user', content: [{ type: 'text', text: '继续' }] },
+    ],
+  }
+}
+
+test('server search history flattens when tools carry no native web_search (#702)', () => {
+  const clientSearch = {
+    name: 'web_search',
+    description: 'Search the web using a client-side tool',
+    input_schema: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+  }
+  for (const tools of [[clientSearch], [], undefined]) {
+    const body = flattenUndeclaredSearchHistory(serverSearchHistory(tools))
+    const types = body.messages[1].content.map((block) => block.type)
+    assert.deepEqual(types, ['text', 'text', 'text'])
+    assert.match(body.messages[1].content[0].text, /\[web search\] example/)
+    assert.equal(body.tools, tools)
+  }
+})
+
+test('first-pass rectifier flattens undeclared server search history', () => {
+  const body = rectifyUnofficialRequest(serverSearchHistory([]))
+  assert.deepEqual(
+    body.messages[1].content.map((block) => block.type),
+    ['text', 'text', 'text'],
+  )
+})
+
+test('server search history stays when native web_search is declared', () => {
+  const body = serverSearchHistory([{ type: 'web_search_20250305', name: 'web_search' }])
+  assert.equal(flattenUndeclaredSearchHistory(body), body)
+  assert.deepEqual(rectifyUnofficialRequest(body), body)
+})
 test('clean bodies and citation-only search_result are left untouched', () => {
   const clean = {
     messages: [

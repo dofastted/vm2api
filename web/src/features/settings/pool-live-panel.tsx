@@ -167,7 +167,7 @@ export function PoolLivePanel({
     <PaneSection
       icon={Activity}
       title='实时态势'
-      desc='Claude 预调度：一台设备在一台 VM 上占一个席位，同设备的并发请求共用席位；席位满了按到达顺序排队。'
+      desc='Claude 预调度：一个 client session 在请求进行中占一个席位，对话结束即释放；粘性 TTL 只记住用过的 VM，不占席位。同 session 的并发请求共用席位。席位满了按到达顺序排队。'
       aside={
         <span className='inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] text-muted-foreground'>
           <Radio
@@ -220,7 +220,7 @@ export function PoolLivePanel({
                       </span>
                     </>
                   }
-                  hint={`宽限保留 ${totals.grace} · 在池 ${rows.length - outOfPool.length}/${rows.length} 台`}
+                  hint={`交接 ${totals.grace} · 在池 ${rows.length - outOfPool.length}/${rows.length} 台`}
                 >
                   <div className='mt-1.5 h-1.5 overflow-hidden rounded-full bg-muted'>
                     <div

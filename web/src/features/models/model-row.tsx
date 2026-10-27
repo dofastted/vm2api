@@ -1,4 +1,3 @@
-import type { ReactNode } from 'react'
 import type { PolicyPrice } from '@/types/panel-pricing'
 import { BadgeDollarSign, Gauge, SlidersHorizontal } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -24,11 +23,18 @@ import {
 } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { ModelVendorIcon } from '@/components/model-vendor-icon'
+import { EditorRow, Fact, Metric, Panel } from './model-parts'
+import {
+  OpenaiCapabilityFacts,
+  OpenaiCardMetrics,
+  OpenaiPriceFacts,
+} from './openai-model-parts'
 import {
   type ModelEntry,
   type ModelParams,
   type ModelPolicy,
   type Pass1mMode,
+  catalogFacts,
   contextWindowLabel,
   passContext1mEffective,
   passContext1mMode,
@@ -36,6 +42,7 @@ import {
 } from './policy'
 import {
   fmtBaseRates,
+  fmtOpenaiRates,
   fmtPerM,
   priceSourceLabel,
   priceSourceVariant,
@@ -47,7 +54,7 @@ type Props = {
   pol: ModelPolicy
   pricing?: PolicyPrice | null
   open: boolean
-  showBeta?: boolean
+  platform: 'anthropic' | 'openai'
   onToggleOpen: () => void
   onToggleEnabled: (on: boolean) => void
   onModel: (fn: (rec: Omit<ModelEntry, 'id'>) => void) => void
@@ -61,7 +68,7 @@ export function ModelRow({
   pol,
   pricing,
   open,
-  showBeta = true,
+  platform,
   onToggleOpen,
   onToggleEnabled,
   onModel,
@@ -88,6 +95,9 @@ export function ModelRow({
   const displayName = model.display_name || model.id
   const price = pricing?.effective ?? null
   const priceSource = pricing?.source ?? null
+  // GPT rows show upstream catalog facts; Claude thinking / max_tokens / 1M knobs do not apply.
+  const claude = platform === 'anthropic'
+  const facts = claude ? null : catalogFacts(model)
 
   return (
     <Dialog
@@ -133,7 +143,7 @@ export function ModelRow({
                 </p>
                 <div className='mt-1.5 flex flex-wrap items-center gap-1.5'>
                   <span className='font-mono text-xs tabular-nums'>
-                    {fmtBaseRates(price)}
+                    {claude ? fmtBaseRates(price) : fmtOpenaiRates(price)}
                   </span>
                   <span className='text-[10px] text-muted-foreground'>
                     每 1M
@@ -145,32 +155,48 @@ export function ModelRow({
               </div>
             </div>
 
-            <div className='grid gap-2 text-xs sm:grid-cols-3'>
-              <Metric label='上下文' value={win.text} strong />
-              <Metric
-                label='输出上限'
-                value={`${formatK(params.max_tokens_cap ?? 64000)}`}
-              />
-              <Metric label='Thinking' value={thinkingPolicyLabel(model)} />
-            </div>
+            {facts ? (
+              <OpenaiCardMetrics facts={facts} />
+            ) : (
+              <div className='grid gap-2 text-xs sm:grid-cols-3'>
+                <Metric label='上下文' value={win.text} strong />
+                <Metric
+                  label='输出上限'
+                  value={`${formatK(params.max_tokens_cap ?? 64000)}`}
+                />
+                <Metric label='Thinking' value={thinkingPolicyLabel(model)} />
+                <Metric
+                  label='缺省 effort'
+                  value={
+                    caps.supports_effort
+                      ? params.default_effort === 'off'
+                        ? '不补'
+                        : params.default_effort || 'high'
+                      : '上游不接受'
+                  }
+                />
+              </div>
+            )}
 
-            <div className='flex flex-wrap gap-1.5'>
-              {(model.aliases || []).slice(0, 4).map((alias) => (
-                <Badge key={alias} variant='outline' className='font-mono'>
-                  {alias}
-                </Badge>
-              ))}
-              {(model.aliases || []).length > 4 ? (
-                <Badge variant='secondary'>
-                  +{(model.aliases || []).length - 4}
-                </Badge>
-              ) : null}
-              {!(model.aliases || []).length ? (
-                <span className='text-xs text-muted-foreground'>
-                  未设置别名
-                </span>
-              ) : null}
-            </div>
+            {claude ? (
+              <div className='flex flex-wrap gap-1.5'>
+                {(model.aliases || []).slice(0, 4).map((alias) => (
+                  <Badge key={alias} variant='outline' className='font-mono'>
+                    {alias}
+                  </Badge>
+                ))}
+                {(model.aliases || []).length > 4 ? (
+                  <Badge variant='secondary'>
+                    +{(model.aliases || []).length - 4}
+                  </Badge>
+                ) : null}
+                {!(model.aliases || []).length ? (
+                  <span className='text-xs text-muted-foreground'>
+                    未设置别名
+                  </span>
+                ) : null}
+              </div>
+            ) : null}
           </div>
 
           <div className='flex items-center justify-between gap-3 sm:w-32 sm:flex-col sm:items-end'>
@@ -206,6 +232,11 @@ export function ModelRow({
               <DialogDescription className='font-mono text-xs break-all'>
                 {model.id}
               </DialogDescription>
+              {facts?.description ? (
+                <p className='mt-1 text-xs leading-5 text-muted-foreground'>
+                  {facts.description}
+                </p>
+              ) : null}
             </div>
           </div>
         </DialogHeader>
@@ -213,7 +244,7 @@ export function ModelRow({
         <div className='grid gap-4 lg:grid-cols-[minmax(0,1fr)_18rem]'>
           <section className='space-y-4'>
             <Panel
-              title='模型覆写'
+              title={claude ? '模型覆写' : '目录'}
               icon={<SlidersHorizontal className='size-4' />}
             >
               <EditorRow label='对外启用'>
@@ -228,94 +259,131 @@ export function ModelRow({
                   </span>
                 </div>
               </EditorRow>
-              <EditorRow label='上下文窗口'>
-                <NumberInput
-                  value={Number(caps.context_window || 0)}
-                  onChange={(value) =>
-                    onModel((rec) => {
-                      rec.capabilities = {
-                        ...(rec.capabilities || {}),
-                        context_window: value,
+              {claude ? (
+                <>
+                  <EditorRow label='上下文窗口'>
+                    <NumberInput
+                      value={Number(caps.context_window || 0)}
+                      onChange={(value) =>
+                        onModel((rec) => {
+                          rec.capabilities = {
+                            ...(rec.capabilities || {}),
+                            context_window: value,
+                          }
+                        })
                       }
-                    })
-                  }
-                />
-                <span className='text-xs text-muted-foreground'>token</span>
-              </EditorRow>
-              <div className='space-y-2'>
-                <span className='text-xs font-medium text-muted-foreground'>
-                  别名
-                </span>
-                <Textarea
-                  className='min-h-24 font-mono text-xs'
-                  value={(model.aliases || []).join('\n')}
-                  placeholder='每行一个别名，例如 claude-haiku-5-5-private'
-                  onChange={(event) =>
-                    onModel((rec) => {
-                      rec.aliases = splitList(event.target.value)
-                    })
-                  }
-                />
-              </div>
+                    />
+                    <span className='text-xs text-muted-foreground'>token</span>
+                  </EditorRow>
+                  <div className='space-y-2'>
+                    <span className='text-xs font-medium text-muted-foreground'>
+                      别名
+                    </span>
+                    <Textarea
+                      className='min-h-24 font-mono text-xs'
+                      value={(model.aliases || []).join('\n')}
+                      placeholder='每行一个别名，例如 claude-haiku-5-5-private'
+                      onChange={(event) =>
+                        onModel((rec) => {
+                          rec.aliases = splitList(event.target.value)
+                        })
+                      }
+                    />
+                  </div>
+                </>
+              ) : (
+                <p className='text-xs leading-5 text-muted-foreground'>
+                  上下文、推理强度等能力来自上游 Codex 目录，点「同步
+                  GPT」刷新；GPT 请求不经过 Claude 的 thinking / max_tokens
+                  整流，因此这里没有参数可调。别名请用上方的「模型映射」。
+                </p>
+              )}
             </Panel>
 
-            <Panel title='模型参数' icon={<Gauge className='size-4' />}>
-              <EditorRow label='默认 max_tokens'>
-                <NumberInput
-                  value={params.max_tokens_default ?? 8192}
-                  onChange={(value) => onParam('max_tokens_default', value)}
-                />
-              </EditorRow>
-              <EditorRow label='max_tokens 上限'>
-                <NumberInput
-                  value={params.max_tokens_cap ?? 64000}
-                  onChange={(value) => onParam('max_tokens_cap', value)}
-                />
-              </EditorRow>
-              <EditorRow label='fallback budget'>
-                <NumberInput
-                  value={fallback}
-                  onChange={(value) =>
-                    onParam('thinking_fallback_budget', value)
-                  }
-                />
-              </EditorRow>
-              <EditorRow label='adaptive'>
-                <Select
-                  value={params.on_adaptive || 'passthrough'}
-                  onValueChange={(value) => onParam('on_adaptive', value)}
-                >
-                  <SelectTrigger className='h-8 w-full sm:w-[220px]'>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value='passthrough'>透传</SelectItem>
-                    <SelectItem value='convert_to_enabled'>
-                      转为 enabled + budget
-                    </SelectItem>
-                    <SelectItem value='strip'>剥离 thinking</SelectItem>
-                  </SelectContent>
-                </Select>
-              </EditorRow>
-              <EditorRow label='enabled'>
-                <Select
-                  value={onEnabled}
-                  onValueChange={(value) => onParam('on_enabled', value)}
-                >
-                  <SelectTrigger className='h-8 w-full sm:w-[220px]'>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value='passthrough'>透传</SelectItem>
-                    <SelectItem value='strip'>剥离 thinking</SelectItem>
-                  </SelectContent>
-                </Select>
-              </EditorRow>
-            </Panel>
+            {claude ? (
+              <Panel title='模型参数' icon={<Gauge className='size-4' />}>
+                <EditorRow label='默认 max_tokens'>
+                  <NumberInput
+                    value={params.max_tokens_default ?? 8192}
+                    onChange={(value) => onParam('max_tokens_default', value)}
+                  />
+                </EditorRow>
+                <EditorRow label='max_tokens 上限'>
+                  <NumberInput
+                    value={params.max_tokens_cap ?? 64000}
+                    onChange={(value) => onParam('max_tokens_cap', value)}
+                  />
+                </EditorRow>
+                <EditorRow label='fallback budget'>
+                  <NumberInput
+                    value={fallback}
+                    onChange={(value) =>
+                      onParam('thinking_fallback_budget', value)
+                    }
+                  />
+                </EditorRow>
+                <EditorRow label='adaptive'>
+                  <Select
+                    value={params.on_adaptive || 'passthrough'}
+                    onValueChange={(value) => onParam('on_adaptive', value)}
+                  >
+                    <SelectTrigger className='h-8 w-full sm:w-[220px]'>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value='passthrough'>透传</SelectItem>
+                      <SelectItem value='convert_to_enabled'>
+                        转为 enabled + budget
+                      </SelectItem>
+                      <SelectItem value='strip'>剥离 thinking</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </EditorRow>
+                <EditorRow label='enabled'>
+                  <Select
+                    value={onEnabled}
+                    onValueChange={(value) => onParam('on_enabled', value)}
+                  >
+                    <SelectTrigger className='h-8 w-full sm:w-[220px]'>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value='passthrough'>透传</SelectItem>
+                      <SelectItem value='strip'>剥离 thinking</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </EditorRow>
+                <EditorRow label='缺省 effort'>
+                  <Select
+                    value={params.default_effort || 'high'}
+                    onValueChange={(value) => onParam('default_effort', value)}
+                    disabled={!caps.supports_effort}
+                  >
+                    <SelectTrigger className='h-8 w-full sm:w-[220px]'>
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value='off'>不补</SelectItem>
+                      <SelectItem value='low'>low</SelectItem>
+                      <SelectItem value='medium'>medium</SelectItem>
+                      <SelectItem value='high'>high</SelectItem>
+                      <SelectItem value='xhigh'>xhigh</SelectItem>
+                      <SelectItem value='max'>max</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </EditorRow>
+                {caps.supports_effort ? null : (
+                  <p className='text-xs leading-5 text-muted-foreground'>
+                    cli-node 目录可能写了缺省值，但该模型上游拒绝
+                    effort，所以这里不补。
+                  </p>
+                )}
+              </Panel>
+            ) : null}
           </section>
 
           <aside className='space-y-4'>
-            {showBeta ? (
+            {claude ? (
               <Panel
                 title='官方 beta'
                 icon={<Gauge className='size-4' />}
@@ -366,25 +434,40 @@ export function ModelRow({
               icon={<BadgeDollarSign className='size-4' />}
               compact
             >
-              <Fact label='来源' value={priceSourceLabel(priceSource)} />
-              <Fact
-                label='input / output / cache read'
-                value={`${fmtBaseRates(price)} / 1M`}
-                mono
-              />
-              {price ? (
-                <Fact
-                  label='cache 5m / 1h'
-                  value={`${fmtPerM(price.cache_5m)} / ${fmtPerM(price.cache_1h)}`}
-                  mono
-                />
-              ) : null}
+              {claude ? (
+                <>
+                  <Fact label='来源' value={priceSourceLabel(priceSource)} />
+                  <Fact
+                    label='input / output / cache read'
+                    value={`${fmtBaseRates(price)} / 1M`}
+                    mono
+                  />
+                  {price ? (
+                    <Fact
+                      label='cache 5m / 1h'
+                      value={`${fmtPerM(price.cache_5m)} / ${fmtPerM(price.cache_1h)}`}
+                      mono
+                    />
+                  ) : null}
+                </>
+              ) : (
+                <OpenaiPriceFacts price={price} source={priceSource} />
+              )}
             </Panel>
 
             <Panel title='能力' icon={<Gauge className='size-4' />} compact>
-              <Fact label='上下文' value={win.text} />
-              <Fact label='Thinking' value={thinkingPolicyLabel(model)} />
-              <Fact label='目录状态' value={live ? '对外可见' : '未进入目录'} />
+              {facts ? (
+                <OpenaiCapabilityFacts facts={facts} live={live} />
+              ) : (
+                <>
+                  <Fact label='上下文' value={win.text} />
+                  <Fact label='Thinking' value={thinkingPolicyLabel(model)} />
+                  <Fact
+                    label='目录状态'
+                    value={live ? '对外可见' : '未进入目录'}
+                  />
+                </>
+              )}
             </Panel>
           </aside>
         </div>
@@ -401,83 +484,6 @@ export function ModelRow({
         </DialogFooter>
       </DialogContent>
     </Dialog>
-  )
-}
-
-function Panel({
-  title,
-  icon,
-  compact,
-  children,
-}: {
-  title: string
-  icon: ReactNode
-  compact?: boolean
-  children: ReactNode
-}) {
-  return (
-    <div className='rounded-xl border border-border/70 bg-background/70 p-3'>
-      <div className='mb-3 flex items-center gap-2 text-sm font-semibold'>
-        <span className='text-muted-foreground'>{icon}</span>
-        {title}
-      </div>
-      <div className={cn('space-y-3', compact && 'space-y-2')}>{children}</div>
-    </div>
-  )
-}
-
-function EditorRow({
-  label,
-  children,
-}: {
-  label: string
-  children: ReactNode
-}) {
-  return (
-    <div className='grid gap-1.5 sm:grid-cols-[8rem_minmax(0,1fr)] sm:items-center'>
-      <span className='text-xs font-medium text-muted-foreground'>{label}</span>
-      <div className='flex min-w-0 flex-wrap items-center gap-2'>
-        {children}
-      </div>
-    </div>
-  )
-}
-
-function Metric({
-  label,
-  value,
-  strong,
-}: {
-  label: string
-  value: string
-  strong?: boolean
-}) {
-  return (
-    <div className='rounded-lg bg-muted/45 px-2.5 py-2'>
-      <div className='text-[11px] text-muted-foreground'>{label}</div>
-      <div
-        className={cn('field-count mt-0.5 truncate', strong && 'font-semibold')}
-      >
-        {value}
-      </div>
-    </div>
-  )
-}
-
-function Fact({
-  label,
-  value,
-  mono,
-}: {
-  label: string
-  value: string
-  mono?: boolean
-}) {
-  return (
-    <div className='flex items-start justify-between gap-3 text-xs'>
-      <span className='text-muted-foreground'>{label}</span>
-      <span className={cn('text-right', mono && 'font-mono')}>{value}</span>
-    </div>
   )
 }
 

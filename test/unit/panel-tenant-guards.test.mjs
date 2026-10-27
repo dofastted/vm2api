@@ -198,14 +198,14 @@ test('tenant key scope only accepts its own slots, on PATCH and create', async (
   assert.equal(patchOwn.status, 200, JSON.stringify(patchOwn.body))
   assert.deepEqual(parseAllowedVms((await store.getById(key.id)).allowed_vms), ['vm-mine'])
 
-  const before = store.list().length
+  const before = (await store.list()).length
   const createForeign = await makeHandler(root, TENANT, { name: 'x', ...foreign }, { apiKeyStore: store }).call(
     'POST',
     '/api/panel/api-keys',
   )
   assert.equal(createForeign.status, 400)
   assert.equal(createForeign.body.error.code, 'key_vm_unknown')
-  assert.equal(store.list().length, before)
+  assert.equal((await store.list()).length, before)
 
   const created = await makeHandler(
     root,
@@ -217,6 +217,51 @@ test('tenant key scope only accepts its own slots, on PATCH and create', async (
   const rec = await store.getById(created.body.item.id)
   assert.equal(rec.user_id, 'u-1')
   assert.equal(rec.group_id, 1)
+})
+
+test('tenant cannot delete a self-created slot; admin still can', async (t) => {
+  const root = makeProject(t)
+  writeVm(root, {
+    id: 'vm-mine',
+    platform: 'anthropic',
+    family: 'claude',
+    owner_user_id: 'u-1',
+    origin: 'user_created',
+  })
+  const tenantDel = await makeHandler(root, TENANT, {}, {}).call('DELETE', '/api/panel/vms/vm-mine')
+  assert.equal(tenantDel.status, 403)
+  assert.equal(tenantDel.body?.error?.code, 'forbidden')
+  assert.ok(fs.existsSync(path.join(root, 'vms', 'vm-mine.json')))
+
+  const adminDel = await makeHandler(root, ADMIN, {}, {}).call('DELETE', '/api/panel/vms/vm-mine')
+  assert.equal(adminDel.status, 200, JSON.stringify(adminDel.body))
+  assert.equal(adminDel.body?.data?.deleted, 'vm-mine')
+})
+
+test('only admins can create or switch keys to the API category', async (t) => {
+  const { root, store, key } = await keyFixture(t)
+  const before = (await store.list()).length
+  const create = await makeHandler(root, TENANT, { name: 'direct', category: 'api' }, { apiKeyStore: store }).call(
+    'POST',
+    '/api/panel/api-keys',
+  )
+  assert.equal(create.status, 403)
+  assert.equal(create.body.error.code, 'key_category_forbidden')
+  assert.equal((await store.list()).length, before)
+
+  const patch = await makeHandler(root, TENANT, { category: ' API ' }, { apiKeyStore: store }).call(
+    'PATCH',
+    `/api/panel/api-keys/${key.id}`,
+  )
+  assert.equal(patch.status, 403)
+  assert.equal((await store.getById(key.id)).category, 'oauth')
+
+  const admin = await makeHandler(root, ADMIN, { category: 'api' }, { apiKeyStore: store }).call(
+    'PATCH',
+    `/api/panel/api-keys/${key.id}`,
+  )
+  assert.equal(admin.status, 200, JSON.stringify(admin.body))
+  assert.equal((await store.getById(key.id)).category, 'api')
 })
 
 test('admin key edits keep user_id, group_id and any slot', async (t) => {

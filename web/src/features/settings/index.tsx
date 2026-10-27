@@ -42,6 +42,7 @@ import {
 } from '@/features/settings/protocol-authority'
 import {
   notifyQueryOptions,
+  outboundProfileQueryOptions,
   routingQueryOptions,
 } from '@/features/settings/queries'
 import { QuotaTierPane } from '@/features/settings/quota-tier-pane'
@@ -171,6 +172,9 @@ export function SettingsPage() {
       await Promise.all([
         qc.invalidateQueries({ queryKey: routingQueryOptions().queryKey }),
         qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
+        qc.invalidateQueries({
+          queryKey: outboundProfileQueryOptions().queryKey,
+        }),
         ...(tab === 'notify'
           ? [qc.invalidateQueries({ queryKey: notifyQueryOptions().queryKey })]
           : []),

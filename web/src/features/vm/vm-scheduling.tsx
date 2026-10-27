@@ -31,6 +31,40 @@ import {
 } from '@/features/vm/scheduling-steps'
 import { useVmPerms } from '@/features/vm/vm-perms'
 
+function shortSession(id: string) {
+  if (id.length <= 18) return id
+  return `${id.slice(0, 8)}…${id.slice(-4)}`
+}
+
+/** Sessions actually holding a slot on this VM, including sticky holds with no live request. */
+function SeatSessionList({ sessions }: { sessions: Vm['seat_sessions'] }) {
+  const rows = Array.isArray(sessions) ? [...sessions] : []
+  if (!rows.length) return null
+  rows.sort((a, b) => Number(a.index) - Number(b.index))
+  return (
+    <ul className='space-y-0.5 font-mono text-[10px] leading-4 text-muted-foreground'>
+      {rows.map((seat) => (
+        <li
+          key={`${seat.index}:${seat.session_id}`}
+          className='truncate'
+          title={seat.session_id}
+        >
+          #{Number(seat.index)}{' '}
+          {shortSession(String(seat.session_id || '')) || '—'}
+          <span className='ms-1 font-sans'>
+            {seat.state === 'active'
+              ? '进行中'
+              : seat.state === 'held'
+                ? '粘性'
+                : '占用'}
+            {Number(seat.inflight) > 1 ? ` ×${seat.inflight}` : ''}
+          </span>
+        </li>
+      ))}
+    </ul>
+  )
+}
+
 type Knob<T> = { own: boolean; value: T }
 type QuotaKey = keyof VmQuotaView
 type Draft = {
@@ -310,7 +344,7 @@ export function VmSchedulingBlock({
             <span className='text-muted-foreground'>席位</span>
             <span className='tabular-nums'>
               {seatsUsed}/{seatsMax}
-              {vm.seats_grace ? ` · 宽限 ${vm.seats_grace}` : ''}
+              {vm.seats_grace ? ` · 交接 ${vm.seats_grace}` : ''}
               {queued ? (
                 <span className='text-[color:var(--status-warn)]'>
                   {' '}
@@ -326,6 +360,7 @@ export function VmSchedulingBlock({
             max={seatsMax}
             size='sm'
           />
+          <SeatSessionList sessions={vm.seat_sessions} />
         </div>
       )}
 
@@ -584,7 +619,7 @@ export function VmSchedulingEditor({ vm }: { vm: Vm }) {
               {codex ? null : (
                 <KnobRow
                   label='席位上限'
-                  desc='本 VM 同时能绑定的设备数；同设备的并发请求共用一个席位。'
+                  desc='本 VM 同时能占住的 client session 数。请求进行中占槽，对话结束即释放；粘性 TTL 只记住 VM，不占席位。同 session 的并发请求共用一个席位。'
                   inheritedText={String(inherited?.session_slots ?? '—')}
                   own={draft.seats.own}
                   onOwnChange={(own) =>

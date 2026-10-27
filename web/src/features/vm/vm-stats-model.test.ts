@@ -1,6 +1,10 @@
 import type { VmUsageStats, VmUsageStatsDay } from '@/types/panel-vm'
 import { describe, expect, it } from 'vitest'
-import { shanghaiDay, summarizeUsageStats } from './vm-stats-model'
+import {
+  projectionView,
+  shanghaiDay,
+  summarizeUsageStats,
+} from './vm-stats-model'
 
 // 2026-09-29 20:00 UTC 已是上海 09-30 04:00：日界必须按 +8h 算。
 const NOW = Date.parse('2026-09-29T20:00:00Z')
@@ -79,5 +83,44 @@ describe('summarizeUsageStats', () => {
     expect(out?.summary.highestCost).toBeNull()
     expect(out?.summary.avgDailyRequests).toBe(0)
     expect(summarizeUsageStats(null, NOW)).toBeNull()
+  })
+})
+
+describe('projectionView', () => {
+  it('names the window the capacity came from', () => {
+    expect(
+      projectionView(
+        { source: 'current', total_usd: 30, remaining_usd: 18 },
+        null,
+        false
+      )
+    ).toEqual({ remaining: 18, total: 30, basis: '按本窗口用量推算' })
+    expect(
+      projectionView(
+        { source: 'previous', total_usd: 50, remaining_usd: 49 },
+        null,
+        true
+      ).basis
+    ).toBe('本窗口用量太少，按上个窗口容量推算')
+  })
+
+  it('explains both paths when there is no number', () => {
+    const live = {
+      status: 'low_usage' as const,
+      spent_usd: 1,
+      total_usd: null,
+      remaining_usd: null,
+      total_tokens: null,
+      used_ratio: 0.02,
+    }
+    const none = { source: null, total_usd: null, remaining_usd: null }
+    expect(projectionView(none, live, false)).toEqual({
+      remaining: null,
+      total: null,
+      basis: '用量<5%；上个窗口暂无记录',
+    })
+    expect(projectionView(null, null, true).basis).toBe(
+      '本窗口暂无估算；上个窗口数据不足以推算'
+    )
   })
 })

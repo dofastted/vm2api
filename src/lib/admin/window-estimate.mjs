@@ -65,3 +65,29 @@ export function estimateWindow({
     total_tokens: Math.round((Number(tokens) || 0) / ratio),
   }
 }
+
+/**
+ * Remaining spend in the live window. The live estimate wins; while it has no
+ * number (fresh window, used% under the floor) the last closed window's
+ * spend ÷ final used% stands in for capacity. `closed` carries `start`,
+ * `used_ratio`, `total_cost`, `unpriced`.
+ */
+export function projectWindowRemaining({ live = null, closed = null, spentUsd = 0, coveredSince = null } = {}) {
+  if (live?.status === 'ok' && live.total_usd != null) {
+    return { source: 'current', total_usd: live.total_usd, remaining_usd: live.remaining_usd }
+  }
+  const none = { source: null, total_usd: null, remaining_usd: null }
+  const ratio = Number(closed?.used_ratio)
+  const cost = Number(closed?.total_cost)
+  if (!Number.isFinite(ratio) || ratio < ESTIMATE_MIN_USED_RATIO || !(cost > 0)) return none
+  if (Number(closed.unpriced) > 0) return none
+  const startMs = Date.parse(closed.start || '')
+  const coveredMs = Date.parse(coveredSince || '')
+  if (!Number.isFinite(startMs) || !Number.isFinite(coveredMs) || coveredMs > startMs) return none
+  const total = cost / Math.min(1, ratio)
+  return {
+    source: 'previous',
+    total_usd: round(total, 6),
+    remaining_usd: round(Math.max(total - (Number(spentUsd) || 0), 0), 6),
+  }
+}

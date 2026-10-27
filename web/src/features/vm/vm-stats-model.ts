@@ -1,4 +1,6 @@
-import type { VmUsageStatsDay } from '@/types/panel-vm'
+import type { WindowEstimate } from '@/types/panel-pricing'
+import type { VmUsageStatsDay, VmWindowProjection } from '@/types/panel-vm'
+import { ESTIMATE_STATUS_ZH } from '@/lib/vm-usage'
 
 const DAY_MS = 86_400_000
 
@@ -92,5 +94,36 @@ export function summarizeUsageStats(
       highestCost: best((p) => p.total_cost),
       highestRequests: best((p) => p.requests),
     },
+  }
+}
+
+export type ProjectionView = {
+  remaining: number | null
+  total: number | null
+  /** 总额度按哪个窗口推算；算不出时说明原因。 */
+  basis: string
+}
+
+/** 预计剩余 5H：后端给数时说清推算依据，给不出时把两条路各自为何不通讲明白。 */
+export function projectionView(
+  p: VmWindowProjection | null | undefined,
+  live: WindowEstimate | null | undefined,
+  hasPrev: boolean
+): ProjectionView {
+  if (p?.source && p.remaining_usd != null) {
+    return {
+      remaining: p.remaining_usd,
+      total: p.total_usd,
+      basis:
+        p.source === 'current'
+          ? '按本窗口用量推算'
+          : '本窗口用量太少，按上个窗口容量推算',
+    }
+  }
+  const why = live ? ESTIMATE_STATUS_ZH[live.status] : '本窗口暂无估算'
+  return {
+    remaining: null,
+    total: null,
+    basis: `${why}；${hasPrev ? '上个窗口数据不足以推算' : '上个窗口暂无记录'}`,
   }
 }

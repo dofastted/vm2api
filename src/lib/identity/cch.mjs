@@ -96,11 +96,14 @@ function stripMaxTokens(text) {
 }
 
 export function projectClaudeCodeCchText(raw) {
-  const source = String(raw ?? '')
-  const billingCch = /(x-anthropic-billing-header:[^"]*?\bcch=)[0-9a-f]{5}(?=;)/i
-  if (!billingCch.test(source)) throw new Error('billing cch not found')
-  const replaced = source.replace(billingCch, (_match, prefix) => `${prefix}00000`)
-  return projectBillingFields(replaced)
+  const body = JSON.parse(String(raw ?? ''))
+  let billing = false
+  const normalized = mapSystemText(body, (text) => {
+    billing = true
+    return normalizeBillingCch(text)
+  })
+  if (!billing) throw new Error('billing cch not found')
+  return projectBillingFields(JSON.stringify(normalized))
 }
 
 function projectBillingFields(text) {
@@ -113,7 +116,7 @@ export function computeClaudeCodeCch(bodyBytes) {
 }
 
 function normalizeBillingCch(text) {
-  return text.replace(/(^\s*x-anthropic-billing-header:)([^\r\n]*)/gim, (line) => {
+  return text.replace(/(^\s*x-anthropic-billing-header:)([^\r\n]*)/i, (line) => {
     let found = false
     const normalized = line.replace(/\s*cch=[^;\s]*;?/gi, () => {
       if (found) return ''
@@ -130,20 +133,27 @@ function normalizeSystemCch(body) {
 }
 
 function mapSystemText(body, fn) {
+  let found = false
+  const firstBilling = (text) => {
+    // History and later documentation blocks are caller content, not billing.
+    if (found || !/^\s*x-anthropic-billing-header:/i.test(text)) return text
+    found = true
+    return fn(text)
+  }
   if (typeof body.system === 'string') {
-    const system = fn(body.system)
+    const system = firstBilling(body.system)
     return system === body.system ? body : { ...body, system }
   }
   if (!Array.isArray(body.system)) return body
   let changed = false
   const system = body.system.map((block) => {
     if (typeof block === 'string') {
-      const text = fn(block)
+      const text = firstBilling(block)
       changed ||= text !== block
       return text
     }
     if (!block || typeof block.text !== 'string') return block
-    const text = fn(block.text)
+    const text = firstBilling(block.text)
     if (text === block.text) return block
     changed = true
     return { ...block, text }
@@ -153,7 +163,7 @@ function mapSystemText(body, fn) {
 
 const SYSTEM_BILLING_CCH = new RegExp(
   `(^\\s*x-anthropic-billing-header:[^\\r\\n]*?\\bcch=)${CCH_PLACEHOLDER}(?=;)`,
-  'gim',
+  'i',
 )
 
 /** Native hops leave the placeholder for the CLI's final SDK serialization. */

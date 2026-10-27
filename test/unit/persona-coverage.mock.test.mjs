@@ -5,7 +5,7 @@ import path from 'node:path'
 import test from 'node:test'
 import {
   CRS_OFFICIAL_AGENT_PROMPT,
-  CRS_OFFICIAL_SYSTEM,
+  CRS_OFFICIAL_CLI_SYSTEM,
   applyCrsUnofficialPersona,
 } from '../../src/lib/identity/crs-persona.mjs'
 import { toClaudeMessages } from '../../src/lib/protocol/convert.mjs'
@@ -35,7 +35,7 @@ function userText(body) {
 function assertOfficial(body, { caller = '' } = {}) {
   const blocks = texts(body)
   assert.match(blocks[0], /^x-anthropic-billing-header: /)
-  assert.equal(blocks[1], CRS_OFFICIAL_SYSTEM)
+  assert.equal(blocks[1], CRS_OFFICIAL_CLI_SYSTEM)
   assert.ok(blocks[2].includes(CRS_OFFICIAL_AGENT_PROMPT.slice(0, 48)))
   assert.match(blocks[3], /^# Environment\n/)
   if (caller) assert.equal(blocks.at(-1), caller)
@@ -46,7 +46,7 @@ function assertOfficial(body, { caller = '' } = {}) {
 function assertZero(body, { caller = '' } = {}) {
   const blocks = texts(body)
   assert.match(blocks[0], /x-anthropic-billing-header:/)
-  assert.match(blocks[0], /prompt_version=<You are Anthropic Claude Agent SDK\.>/)
+  assert.match(blocks[0], /prompt_version=<You are Claude Code, Anthropic's official CLI for Claude\.>/)
   assert.equal(blocks[1], '\u200b')
   assert.equal(blocks[2], '\u200b')
   assert.match(blocks[3], /^# Environment\n/)

@@ -15,6 +15,7 @@ import { codexKernelHealth, codexKernelPaths } from './codex-kernel-client.mjs'
 import { computedUpstreamTransport, normalizeCodexRouting } from '../protocol/codex-route.mjs'
 
 const starts = new Map()
+const stops = new Map()
 
 // The kernel exits only through config.proxy_url; inherited proxy variables would give it a second, unseen exit.
 function kernelEnv(env = process.env) {
@@ -179,7 +180,38 @@ export async function finishCodexRecycle(child, socketPath, { termMs = 2000, kil
   return { exited: true }
 }
 
+/** Explicit reload must stop the host process, not just its slot container. */
+export function stopCodexKernelAndWait(exec, opts = {}) {
+  const vmId = exec?.vmId
+  if (stops.has(vmId)) return stops.get(vmId)
+  const pending = (async () => {
+    const child = starts.get(vmId)
+    const paths = codexKernelPaths(exec)
+    if (!child) {
+      const health = await codexKernelHealth(exec, { timeoutMs: 500 })
+      if (health.code === 'ENOENT' || health.code === 'ECONNREFUSED') return { ok: true, stopped: false }
+      // A prior Node process may have left a detached kernel. Do not unlink a
+      // listening socket or claim success when we cannot verify its owner's exit.
+      return { ok: false, reason: 'untracked_kernel' }
+    }
+    const gone = await finishCodexRecycle(child, paths.socketPath, opts)
+    if (!gone.exited) return { ok: false, reason: 'recycle_timeout' }
+    if (starts.get(vmId) === child) starts.delete(vmId)
+    return { ok: true, stopped: true }
+  })()
+  const settled = pending.finally(() => {
+    if (stops.get(vmId) === settled) stops.delete(vmId)
+  })
+  stops.set(vmId, settled)
+  return settled
+}
+
 export async function ensureCodexKernel(exec, { timeoutMs = 8000 } = {}) {
+  const stopping = stops.get(exec?.vmId)
+  if (stopping) {
+    const stopped = await stopping
+    if (!stopped.ok) return stopped
+  }
   const bin = codexKernelBinPath()
   if (!bin) return { ok: false, reason: 'bin_missing' }
   const paths = codexKernelPaths(exec)
@@ -202,7 +234,7 @@ export async function ensureCodexKernel(exec, { timeoutMs = 8000 } = {}) {
   const live = await waitForHealth(exec, Math.min(800, Math.max(200, Number(timeoutMs) || 800)))
   if (live.ok) return { ok: true, reused: true, health: live.health }
   const current = starts.get(exec.vmId)
-  if (current && !current.killed) return waitForHealth(exec, timeoutMs)
+  if (!childHasExited(current)) return waitForHealth(exec, timeoutMs)
   try {
     if (paths.socketPath) fs.unlinkSync(paths.socketPath)
   } catch {}

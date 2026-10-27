@@ -80,13 +80,14 @@ test('restoring a PG 001 snapshot removes later tables before reapplying current
   const db = getDb()
   await db.exec(
     `ALTER TABLE request_attempts DROP COLUMN ha_request_id;
-    DROP TABLE ha_request_settlements, ha_request_contexts, panel_sessions, api_key_admissions, gateway_rate_buckets, execution_jobs, execution_admissions, execution_seats, session_turns, vm_operations, background_task_runs, oauth_pkce_sessions, shell_tickets, execution_circuits;
+    DROP TABLE claude_subscriptions, ha_request_settlements, ha_request_contexts, panel_sessions, api_key_admissions, gateway_rate_buckets, execution_jobs, execution_admissions, execution_seats, session_turns, vm_operations, background_task_runs, oauth_pkce_sessions, shell_tickets, execution_circuits;
     ALTER TABLE accounts DROP COLUMN observation_versions;
     ALTER TABLE proxies DROP COLUMN config_revision;
     ALTER TABLE sticky_sessions DROP COLUMN deleted_at;
     ALTER TABLE sticky_sessions ALTER COLUMN generation DROP DEFAULT;
     DROP SEQUENCE sticky_generation_seq;
     DROP SEQUENCE IF EXISTS account_observation_seq;
+    ALTER TABLE usage_logs DROP COLUMN image_model, DROP COLUMN image_usage, DROP COLUMN image_input_tokens, DROP COLUMN image_output_tokens, DROP COLUMN image_cost;
     DELETE FROM schema_migrations WHERE version <> '001'`,
   )
   await new SettingsRepo(db).set('older-snapshot', 'before')
@@ -116,20 +117,21 @@ test('restoring a PG 001 snapshot removes later tables before reapplying current
   ]) {
     assert.equal((await db.prepare(`SELECT count(*) AS n FROM ${name}`).get()).n, 0)
   }
-  assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 21)
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 23)
 })
 
 test('an outside dependency refuses older-snapshot cleanup without changing either schema', async () => {
   const db = getDb()
   await db.exec(
     `ALTER TABLE request_attempts DROP COLUMN ha_request_id;
-    DROP TABLE ha_request_settlements, ha_request_contexts, panel_sessions, api_key_admissions, gateway_rate_buckets, execution_jobs, execution_admissions, execution_seats, session_turns, vm_operations, background_task_runs, oauth_pkce_sessions, shell_tickets, execution_circuits;
+    DROP TABLE claude_subscriptions, ha_request_settlements, ha_request_contexts, panel_sessions, api_key_admissions, gateway_rate_buckets, execution_jobs, execution_admissions, execution_seats, session_turns, vm_operations, background_task_runs, oauth_pkce_sessions, shell_tickets, execution_circuits;
     ALTER TABLE accounts DROP COLUMN observation_versions;
     ALTER TABLE proxies DROP COLUMN config_revision;
     ALTER TABLE sticky_sessions DROP COLUMN deleted_at;
     ALTER TABLE sticky_sessions ALTER COLUMN generation DROP DEFAULT;
     DROP SEQUENCE sticky_generation_seq;
     DROP SEQUENCE IF EXISTS account_observation_seq;
+    ALTER TABLE usage_logs DROP COLUMN image_model, DROP COLUMN image_usage, DROP COLUMN image_input_tokens, DROP COLUMN image_output_tokens, DROP COLUMN image_cost;
     DELETE FROM schema_migrations WHERE version <> '001'`,
   )
   await new SettingsRepo(db).set('older-snapshot', 'before')

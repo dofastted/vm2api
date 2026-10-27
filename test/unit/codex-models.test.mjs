@@ -180,3 +180,74 @@ test('refreshCodexAccessToken posts form grant and keeps fallback refresh token'
   assert.match(calls[0].body, /grant_type=refresh_token/)
   assert.match(calls[0].body, /refresh_token=rt-old/)
 })
+
+test('parseCodexModelCatalog keeps whitelisted catalog metadata', () => {
+  const [row] = parseCodexModelCatalog({
+    models: [
+      {
+        slug: 'gpt-6-luna',
+        display_name: 'GPT-6 Luna',
+        description: '  Fast everyday model  ',
+        priority: 3,
+        visibility: 'list',
+        context_window: 272000,
+        max_context_window: 1000000,
+        default_reasoning_level: 'medium',
+        supported_reasoning_levels: [{ effort: 'low', description: 'x' }, { effort: 'high' }, { effort: 'low' }],
+        service_tiers: [{ id: 'priority', name: 'fast', description: 'Faster' }],
+        input_modalities: ['text', 'image'],
+        supports_search_tool: true,
+        supports_parallel_tool_calls: false,
+        supported_in_api: true,
+        base_instructions: 'secret prompt',
+        shell_type: 'local',
+      },
+    ],
+  })
+  assert.deepEqual(row.catalog, {
+    description: 'Fast everyday model',
+    priority: 3,
+    visibility: 'list',
+    context_window: 272000,
+    max_context_window: 1000000,
+    default_reasoning_level: 'medium',
+    supported_reasoning_levels: ['low', 'high'],
+    service_tiers: [{ id: 'priority', name: 'fast', description: 'Faster' }],
+    input_modalities: ['text', 'image'],
+    supports_search_tool: true,
+    supports_parallel_tool_calls: false,
+    supported_in_api: true,
+  })
+})
+
+test('parseCodexModelCatalog drops bad metadata fields but keeps the model', () => {
+  const [row] = parseCodexModelCatalog({
+    models: [
+      {
+        slug: 'gpt-6-sol',
+        display_name: 'GPT-6 Sol',
+        description: 'x'.repeat(5000),
+        priority: 1.5,
+        visibility: 'everywhere',
+        context_window: 2000000,
+        max_context_window: 1000000,
+        supported_reasoning_levels: 'high',
+        service_tiers: [{ id: 'priority' }, { id: 'flex', name: 'flex' }],
+        input_modalities: ['text', 42],
+        supports_search_tool: 'yes',
+      },
+    ],
+  })
+  assert.equal(row.id, 'gpt-6-sol')
+  assert.deepEqual(row.catalog, {
+    service_tiers: [{ id: 'flex', name: 'flex' }],
+    input_modalities: ['text'],
+  })
+})
+
+test('parseCodexModelCatalog rejects non-positive context windows', () => {
+  const [row] = parseCodexModelCatalog({
+    models: [{ slug: 'gpt-6-sol', display_name: 'GPT-6 Sol', context_window: 0, max_context_window: -5 }],
+  })
+  assert.deepEqual(row.catalog, {})
+})

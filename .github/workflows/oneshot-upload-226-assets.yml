@@ -1,0 +1,42 @@
+name: oneshot-upload-226-assets
+on:
+  push:
+    paths:
+      - ".github/workflows/oneshot-upload-226-assets.yml"
+  workflow_dispatch: {}
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 7cd52501c03c03e36493c38e39edc349de7d0c99
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: stage pinned payload
+        run: |
+          node scripts/fetch-payload.mjs
+          node scripts/fetch-payload.mjs --stage dist
+          ls -la dist
+      - name: upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release upload v1.3.226 --repo dofastted/vm2api --clobber \
+            dist/kin-kernel \
+            dist/kin-kernel-crag \
+            dist/kin-codex-kernel \
+            dist/kin-worker \
+            dist/kin-egress \
+            dist/kin-slot-gate \
+            dist/kin-oauth-auth \
+            dist/kin-computer \
+            dist/cli-node \
+            dist/cc-node
+          gh release view v1.3.226 --repo dofastted/vm2api

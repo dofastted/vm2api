@@ -480,6 +480,7 @@ test('boot revival starts only running-intent slots whose container is down', as
       { id: 'vm-gone', status: 'running' },
       { id: 'vm-up', status: 'running' },
       { id: 'vm-off', status: 'stopped' },
+      { id: 'vm-paused', status: 'paused' },
       { id: 'vm-node', status: 'running', node_id: 'node-a' },
     ],
     inspect: async (vm) => containers[vm.id],

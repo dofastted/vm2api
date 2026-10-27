@@ -25,10 +25,6 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: '1.25.x'
-          cache-dependency-path: worker/go.sum
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
@@ -42,12 +38,9 @@ jobs:
             echo "tag ${GITHUB_REF_NAME} does not match VERSION ${version}" >&2
             exit 1
           }
-      - name: build
+      - name: stage pinned payload
         run: |
-          mkdir -p dist
-          (cd worker && CGO_ENABLED=0 go build -trimpath -o ../dist/kin-worker ./cmd/kin-worker)
-          (cd worker && CGO_ENABLED=0 go build -trimpath -o ../dist/kin-egress ./cmd/kin-egress)
-          (cd worker && CGO_ENABLED=0 go build -trimpath -o ../dist/kin-slot-gate ./cmd/kin-slot-gate)
+          # Every amd64 asset, Go helpers included, is the pinned production build.
           node scripts/fetch-payload.mjs
           node scripts/fetch-payload.mjs --stage dist
       - uses: actions/upload-artifact@v7

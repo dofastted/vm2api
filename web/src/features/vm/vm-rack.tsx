@@ -26,6 +26,12 @@ const GROUP_SWATCH: { key: FleetGroup; label: string; color: string }[] = [
     label: '未使用',
     color: 'color-mix(in oklch, var(--status-none) 55%, transparent)',
   },
+  {
+    key: 'unschedulable',
+    label: '不可调度',
+    color:
+      'color-mix(in oklch, var(--status-bad-solid) 70%, var(--status-warn-solid))',
+  },
   { key: 'bad', label: '无效凭证', color: 'var(--status-bad-solid)' },
   { key: 'revoke', label: '已吊销', color: 'var(--red-4)' },
 ]

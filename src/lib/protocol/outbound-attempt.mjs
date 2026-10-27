@@ -14,13 +14,7 @@ import {
   modelSupportsMidConversationSystem,
 } from './anthropic-policy.mjs'
 import { liftMidConversationSystemMessages, promoteContentToBlocks } from './sanitize.mjs'
-import {
-  applyThinkingDisplay,
-  ensureUnofficialAdaptiveThinking,
-  ensureUnofficialEffortHigh,
-  normalizeThinkingForModel,
-  thinkingDisplayMode,
-} from './thinking.mjs'
+import { applyThinkingDisplay, thinkingDisplayMode } from './thinking.mjs'
 import { ensureOutputConfigSchema } from './request-rectifier.mjs'
 import {
   applyCrsIdentityReplace,
@@ -35,6 +29,7 @@ import {
   refreshOfficialSystemEnvironment,
   hasEnvironmentSection,
   stampBillingPromptId,
+  stripSubagentBilling,
   collapseSystemBudgetReminders,
   CRS_OFFICIAL_SYSTEM,
   CRS_OFFICIAL_CLI_SYSTEM,
@@ -57,7 +52,7 @@ import {
   validateCacheBreakpoints,
 } from './cache-ttl.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
-import { applyModelRequestRules } from './model-policy.mjs'
+
 import { isApiKeyMode, isAnySetupTokenMode } from '../oauth/credential-mode.mjs'
 import { prepareClassifierBody } from './request-purpose.mjs'
 
@@ -73,7 +68,7 @@ function systemBlockText(block) {
 export function isCliOwnedSystemText(text) {
   const t = String(text || '').trim()
   if (!t) return true
-  if (/^x-anthropic-billing-header/i.test(t)) return true
+  if (/^x-anthropic-billing-header/i.test(t)) return !/prompt_version=</.test(t)
   if (t.startsWith('# Environment')) return true
   if (t === CLI_IDENTITY || t === CRS_OFFICIAL_SYSTEM || t === CRS_OFFICIAL_AGENT_IDENTITY) return true
   if (t === CRS_COMPACT_IDENTITY || t === CRS_OFFICIAL_CLI_SYSTEM) return true
@@ -95,7 +90,7 @@ export function stripCliOwnedSystem(system, { preserveCallerEnvironment = false 
 const OFFICIAL_CONTEXT_BUDGET = '<total_tokens>15000000 tokens left</total_tokens>'
 const VOLATILE_CONTEXT_BUDGET = /<total_tokens>\d+ tokens left<\/total_tokens>/g
 
-function stabilizeOfficialContextBudget(text) {
+export function stabilizeOfficialContextBudget(text) {
   const raw = String(text ?? '')
   if (!raw.includes('<total_tokens>')) return raw
   return raw.replace(VOLATILE_CONTEXT_BUDGET, OFFICIAL_CONTEXT_BUDGET)
@@ -191,7 +186,12 @@ export function officialSystemTemplate(system, ttl = DEFAULT_CACHE_TTL) {
   return out
 }
 
-/** One marker, on the last text of the current tail, stamped with the session TTL. */
+/**
+ * Two markers, stamped with the session TTL: the last text of the current tail
+ * and of the user turn before it (4+ messages). The second one sits on the
+ * previous request's write, so a turn that grows past the 20-block lookback
+ * still reads it instead of falling back to the system prefix.
+ */
 function officialMessageMarker(messages, ttl = DEFAULT_CACHE_TTL) {
   if (!Array.isArray(messages) || messages.length === 0) return messages
   const next = messages.map((message) => {
@@ -213,34 +213,36 @@ function officialMessageMarker(messages, ttl = DEFAULT_CACHE_TTL) {
     })
     return changed ? { ...message, content } : message
   })
-  let tail = -1
-  for (let i = next.length - 1; i >= 0; i--) {
+  const users = []
+  for (let i = next.length - 1; i >= 0 && users.length < 2; i--) {
     if (next[i]?.role !== 'user') continue
     const content = next[i].content
-    if (typeof content === 'string' ? content : Array.isArray(content) && content.length) {
-      tail = i
-      break
-    }
+    if (typeof content === 'string' ? content : Array.isArray(content) && content.length) users.push(i)
   }
-  if (tail < 0) return next
-  const message = next[tail]
+  if (users.length === 0) return next
+  stampMessageTail(next, users[0], ttl)
+  if (users.length > 1 && next.length >= 4) stampMessageTail(next, users[1], ttl)
+  return next
+}
+
+function stampMessageTail(messages, index, ttl) {
+  const message = messages[index]
   if (typeof message.content === 'string') {
-    next[tail] = {
+    messages[index] = {
       ...message,
       content: [
         { type: 'text', text: message.content, cache_control: { type: 'ephemeral', ttl: normalizeCacheTtl(ttl) } },
       ],
     }
-    return next
+    return
   }
   const content = message.content.slice()
   for (let i = content.length - 1; i >= 0; i--) {
     if (content[i]?.type === 'thinking' || content[i]?.type === 'redacted_thinking') continue
     content[i] = { ...content[i], cache_control: { type: 'ephemeral', ttl: normalizeCacheTtl(ttl) } }
-    next[tail] = { ...message, content }
-    return next
+    messages[index] = { ...message, content }
+    return
   }
-  return next
 }
 /** Official Claude Code omits eager streaming and tool cache markers. A caller TTL here makes CLI fill the omitted system and message markers. */
 function stripEagerInputStreaming(tools) {
@@ -290,9 +292,12 @@ export function prepareCliHopBody(
     preserveCallerEnvironment = false,
     autoCompactWindow = null,
     routing = null,
+    outboundShape = null,
   } = {},
 ) {
   if (requestContext?.purpose === 'auto_mode_classifier') return prepareClassifierBody(canonicalBody, { stream })
+  // official_303 lean: renderOfficial303Body owns system, role=system placement and markers.
+  const lean = outboundShape === 'lean' && !requestContext
   if (preserveSystem) validateCacheBreakpoints(canonicalBody)
   let body = officialMessagesBody(canonicalBody, { stream, preserveContentShape: true })
   const windowTokens = Number(autoCompactWindow)
@@ -303,34 +308,48 @@ export function prepareCliHopBody(
   // Official family keeps the inbound system and its markers. Rewriting them
   // into the persona template (billing / reporting / 1h) is what diverges from
   // the captured Claude Code body: two ephemeral blocks, TTL omitted.
+  const assembledTemplate = (system) => {
+    const blocks = Array.isArray(system) ? system : []
+    const texts = blocks.map(textOf)
+    return (
+      texts.some((text) => text.trim() === '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__') ||
+      texts.some((text) => /^x-anthropic-billing-header/i.test(text) && /prompt_version=</.test(text))
+    )
+  }
   if (!preserveSystem) {
-    const leftover = stripCliOwnedSystem(body.system, { preserveCallerEnvironment })
-    if (leftover == null) delete body.system
-    else body.system = leftover
-    body = stabilizeSystemBudget(body)
+    if (!lean && !assembledTemplate(body.system)) {
+      const leftover = stripCliOwnedSystem(body.system, { preserveCallerEnvironment })
+      if (leftover == null) delete body.system
+      else body.system = leftover
+      body = stabilizeSystemBudget(body)
+    }
     body = stabilizeMessageBudgets(body)
   }
   // cli-node sends mid-conversation-system. Only models that reject the role need the lift.
-  if (!modelSupportsMidConversationSystem(body.model)) body = liftMidConversationSystemMessages(body)
-  if (!preserveSystem) body = collapseSystemBudgetReminders(body)
+  if (!lean && !modelSupportsMidConversationSystem(body.model)) body = liftMidConversationSystemMessages(body)
+  if (!preserveSystem && !lean) body = collapseSystemBudgetReminders(body)
 
-  if (!repaired) {
-    normalizeThinkingForModel(body)
-    body = pinHaikuCliThinking(body)
-    body = ensureUnofficialEffortHigh(body)
-  }
+  // Native cli-node applies model policy and the medium effort default.
+  // Explicit sampling fields stay omitted or present exactly as the caller sent them.
   body = applyThinkingDisplay(body, thinkingDisplayMode(routing))
+  body = stripSubagentBilling(body)
   body = stripInvalidThinkingBlocks(body, { preserveThinkingBlocks })
-  body = applyModelRequestRules(body)
   body = ensureOutputConfigSchema(body)
-  if (Object.prototype.hasOwnProperty.call(body, 'temperature')) delete body.temperature
-  if (Object.prototype.hasOwnProperty.call(body, 'top_p')) delete body.top_p
-  if (Object.prototype.hasOwnProperty.call(body, 'top_k')) delete body.top_k
-  if (Object.prototype.hasOwnProperty.call(body, 'context_management')) delete body.context_management
+
   if (Object.prototype.hasOwnProperty.call(body, 'cache_control')) delete body.cache_control
   if (!requestContext) {
-    body = { ...body, system: officialSystemTemplate(body.system, cacheTtl) }
-    body.messages = officialMessageMarker(body.messages, cacheTtl)
+    const preparedZero =
+      Array.isArray(body.system) &&
+      body.system.some(
+        (block) => /^x-anthropic-billing-header/i.test(textOf(block)) && /prompt_version=</.test(textOf(block)),
+      )
+    const shaped =
+      Array.isArray(body.system) &&
+      body.system.some((block) => textOf(block).trim() === '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__')
+    if (!lean && !shaped && !preparedZero) {
+      body = { ...body, system: officialSystemTemplate(body.system, cacheTtl) }
+      body.messages = officialMessageMarker(body.messages, cacheTtl)
+    }
     if (Array.isArray(body.tools)) body = { ...body, tools: stripEagerInputStreaming(body.tools) }
   }
   return body

@@ -118,3 +118,21 @@ export function healthProbeQueryOptions() {
     refetchInterval: 30_000,
   })
 }
+
+/** `GET /api/panel/outbound-profile` → `src/lib/admin/outbound-profile.mjs`. */
+export type OutboundProfile = {
+  preset: string
+  cli_version: string
+  user_agent: string
+  cc_entrypoint: string
+  anthropic_beta: string
+  beta_sample_model: string
+}
+
+export function outboundProfileQueryOptions() {
+  return queryOptions({
+    queryKey: ['panel', 'outbound-profile'] as const,
+    queryFn: () =>
+      api<{ profile: OutboundProfile }>('/api/panel/outbound-profile'),
+  })
+}

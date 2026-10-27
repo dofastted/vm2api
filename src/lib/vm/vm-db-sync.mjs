@@ -22,8 +22,9 @@ import path from 'node:path'
 import { isDbOpen, getDb, getActivityCoordinator } from '../db/database.mjs'
 import { VmsRepo } from '../db/repos/vms-repo.mjs'
 import { WriteQueue } from '../pool/write-queue.mjs'
+import { VmPoolsRepo } from '../db/repos/vm-pools-repo.mjs'
 import { setVmWriteHook, atomicWriteJson, isVmRecordFile } from './vm-file.mjs'
-import { reclaimAssignedVms, repairSlotSmbios, repairVmProxyCliEnabled } from './vm-registry.mjs'
+import { migrateScheduleFields, reclaimAssignedVms, repairSlotSmbios, repairVmProxyCliEnabled } from './vm-registry.mjs'
 
 let _repo = null
 let _watcher = null
@@ -78,9 +79,15 @@ export async function removeVmFromDb(id) {
   let removed = false
   _writes.enqueue(async () => {
     removed = await r.remove(id)
+    await new VmPoolsRepo(getDb()).removeVm(id)
   })
   await _writes.flush()
   return removed
+}
+
+async function pruneVmPools(knownIds) {
+  if (!isDbOpen()) return []
+  return await new VmPoolsRepo(getDb()).pruneUnknown(knownIds)
 }
 
 export async function clearActiveVmFromDb() {
@@ -166,6 +173,10 @@ export async function reconcileVms(projectRoot) {
   }
   await flushVmDbSync()
 
+  const known = new Set(seen)
+  for (const row of await r.list()) if (row?.id && row.vm) known.add(row.id)
+  out.pruned_pool_members = await pruneVmPools(known)
+
   _writes.enqueue(async () => {
     const activeFile = path.join(dir, 'active.json')
     if (fs.existsSync(activeFile)) {
@@ -226,6 +237,18 @@ export async function initVmDbSync(projectRoot, { watch = true } = {}) {
     result.smbios_repaired = repairSlotSmbios(projectRoot).length
   } catch {
     result.smbios_repaired = 0
+  }
+  try {
+    const migrated = migrateScheduleFields(projectRoot)
+    result.schedule_migrated = migrated.length
+    for (const row of migrated) {
+      console.warn(
+        `[vm] schedule state ${row.id}: ${row.from || '-'} -> ${row.state}${row.reason ? `:${row.reason}` : ''}`,
+      )
+    }
+  } catch (error) {
+    console.warn(`[vm] schedule state migration failed: ${error?.message || error}`)
+    result.schedule_migrated = 0
   }
   await flushVmDbSync()
   if (watch) startVmWatch(projectRoot)

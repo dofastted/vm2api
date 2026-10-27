@@ -58,14 +58,13 @@
     }
   },
   "logging": {
-    "mode": "debug",
+    "mode": "normal",
     "retain_days": 7,
     "debug_retain_days": 3,
     "max_mb": 2048
   },
   "pool": {
     "strategy": "balanced",
-    "manual_schedule_wins": true,
     "queue_max": 50,
     "seat_grace_ms": 30000,
     "seat_budget_reserve_pct": 0.02,

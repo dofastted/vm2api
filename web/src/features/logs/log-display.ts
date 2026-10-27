@@ -238,7 +238,7 @@ const SELECTION_REASON_LABELS: Record<string, string> = {
   sticky: '粘性会话',
   'sticky-spill': '粘性溢出',
   'family-affinity': '家族亲和',
-  'device-affinity': '设备亲和',
+  'device-affinity': '设备 / machine 所在 VM',
   'priority-load': '优先级负载',
   'seat-held': '已占席位',
   balanced: '平衡',

@@ -104,6 +104,23 @@ test('getProxyByIdWithAuth: 禁用/失效的代理仍可读回（getProxyForVm �
   assert.equal(pool.getProxyByIdWithAuth(p.id).url, 'socks5://alice:s3cret@1.2.3.4:1080', '新方法不受影响')
 })
 
+test('domain_forward: 开关要带到 kin-egress 用的代理对象上（两条取法都要）', async () => {
+  const pool = await makePool()
+  const p = await seed(pool)
+  await pool.bind(p.id, 'vm-01')
+  assert.equal(pool.getProxyByIdWithAuth(p.id).domain_forward, false, '默认关闭')
+  assert.equal(pool.getProxyForVm('vm-01').domain_forward, false)
+
+  const r = await pool.update(p.id, { domain_forward: true })
+  assert.equal(r.ok, true)
+  assert.equal(r.domain_forward_changed, true)
+  assert.equal(pool.getProxyByIdWithAuth(p.id).domain_forward, true, '面板改开关后重启出口用的就是它')
+  assert.equal(pool.getProxyForVm('vm-01').domain_forward, true, '槽位启动/修复出口用的是它')
+
+  await pool.update(p.id, { domain_forward: false })
+  assert.equal(pool.getProxyByIdWithAuth(p.id).domain_forward, false)
+})
+
 test('snapshot 回归：列表接口永不返回账密', async () => {
   const pool = await makePool()
   await seed(pool)

@@ -48,6 +48,7 @@ describe('seat snapshot merge', () => {
       seats_used: 0,
       seats_max: 2,
       seats_grace: 0,
+      seat_sessions: [],
       queue_depth: 0,
       conc_waiting: 0,
       inflight: 0,
@@ -55,20 +56,42 @@ describe('seat snapshot merge', () => {
     expect(nextCodex).toBe(codex)
   })
 
-  it('applies live seat, grace and queue counts', () => {
+  it('applies live seat, grace, queue counts and the sessions holding those slots', () => {
     const live = {
-      seats_used: 3,
+      seats_used: 1,
       seats_max: 4,
       seats_grace: 1,
       queue_depth: 2,
       conc_waiting: 1,
-      inflight: 2,
+      inflight: 0,
+      sessions: [
+        {
+          index: 0,
+          session_id: '01a17519-60b0-7218-9d67-d31c47ceedbc',
+          state: 'held',
+          inflight: 0,
+          held_until: 9,
+        },
+      ],
     }
     const [next] = mergeSeatSnapshot([claude], snap({ 'vm-1': live }))
-    expect(next).toMatchObject(live)
+    const { sessions, ...counts } = live
+    expect(next).toMatchObject({ ...counts, seat_sessions: sessions })
   })
 
   it('keeps the row identity when nothing changed', () => {
+    const seated = {
+      ...claude,
+      seat_sessions: [
+        {
+          index: 0,
+          session_id: 'sess-a',
+          state: 'active',
+          inflight: 1,
+          held_until: null,
+        },
+      ],
+    } as Vm
     const live = {
       seats_used: 2,
       seats_max: 2,
@@ -76,9 +99,10 @@ describe('seat snapshot merge', () => {
       queue_depth: 3,
       conc_waiting: 2,
       inflight: 1,
+      sessions: seated.seat_sessions ?? undefined,
     }
-    const [next] = mergeSeatSnapshot([claude], snap({ 'vm-1': live }))
-    expect(next).toBe(claude)
+    const [next] = mergeSeatSnapshot([seated], snap({ 'vm-1': live }))
+    expect(next).toBe(seated)
   })
 })
 

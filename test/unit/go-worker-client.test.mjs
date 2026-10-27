@@ -484,6 +484,58 @@ unixTest('streamGoWorker accepts message_stop before delayed EOF', async () => {
   }
 })
 
+unixTest('fragmented final-header diagnostics do not start idle timing, commit, or reach downstream', async () => {
+  const fx = await fixture((req, res) => {
+    req.resume()
+    res.setHeader('content-type', 'text/event-stream')
+    res.write('event: kin_outbound_head')
+    setImmediate(() => res.write('ers\ndata: {"type":"kin_outbound_headers","headers":{"content-length":"123"}}\n\n'))
+    setTimeout(() => res.end('event: message_stop\ndata: {"type":"message_stop"}\n\n'), 1200)
+  })
+  try {
+    const lines = []
+    const snapshots = []
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: { model: 'claude-test', messages: [{ role: 'user', content: 'hi' }] },
+      timeoutMs: 5000,
+      idleTimeoutMs: 10,
+      onOutboundHeaders: (headers) => snapshots.push(headers),
+      onEvent: (line) => lines.push(line),
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.ttftMs, null)
+    assert.deepEqual(snapshots, [{ 'content-length': '123' }])
+    assert.doesNotMatch(lines.join('\n'), /kin_outbound_headers|content-length/)
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('final headers survive an upstream error without becoming a downstream commit', async () => {
+  const fx = await fixture((req, res) => {
+    req.resume()
+    res.setHeader('content-type', 'text/event-stream')
+    res.write(
+      'event: kin_outbound_headers\ndata: {"type":"kin_outbound_headers","headers":{"x-stainless-retry-count":"1"}}\n\n',
+    )
+    res.end('event: error\ndata: {"type":"error","error":{"type":"overloaded_error","message":"busy"}}\n\n')
+  })
+  try {
+    const snapshots = []
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: { model: 'claude-test', messages: [{ role: 'user', content: 'hi' }] },
+      onOutboundHeaders: (headers) => snapshots.push(headers),
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.committed, false)
+    assert.deepEqual(snapshots, [{ 'x-stainless-retry-count': '1' }])
+  } finally {
+    await fx.close()
+  }
+})
+
 unixTest('streamGoWorker names the aborted hop to the kernel cancel route', async () => {
   let hopId = null
   let cancelled = null

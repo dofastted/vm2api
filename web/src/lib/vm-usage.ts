@@ -1,7 +1,7 @@
 import type { BillingAccountRow } from '@/types/panel-overview'
 import type { WindowEstimate } from '@/types/panel-pricing'
 import type { UsageAccountRow } from '@/types/panel-usage'
-import type { Vm } from '@/types/panel-vm'
+import type { Vm, VmClosedWindow } from '@/types/panel-vm'
 import { fmtNum, fmtUsd } from '@/lib/format'
 
 function num(v: unknown): number {
@@ -348,4 +348,25 @@ export function formatWindowSpend(
     remainText: remain,
     tooltip,
   }
+}
+
+/** 窗口起止 `MM-DD HH:mm – HH:mm`；跨天时结束端也带日期。本地时区，与重置时刻同口径。 */
+export function fmtWindowSpan(start: string, end: string): string {
+  const a = new Date(start)
+  const b = new Date(end)
+  if (!Number.isFinite(a.getTime()) || !Number.isFinite(b.getTime())) return '—'
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const day = (d: Date) => `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+  const clock = (d: Date) => `${pad(d.getHours())}:${pad(d.getMinutes())}`
+  const tail = day(a) === day(b) ? clock(b) : `${day(b)} ${clock(b)}`
+  return `${day(a)} ${clock(a)} – ${tail}`
+}
+
+/** 上个窗口一行说明：起止 · 官方价花费 · 请求数。 */
+export function closedWindowHint(w: VmClosedWindow): string {
+  return [
+    fmtWindowSpan(w.start, w.end),
+    fmtUsd(w.total_cost, 2),
+    `${fmtNum(w.requests)} req`,
+  ].join(' · ')
 }

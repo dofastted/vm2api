@@ -48,6 +48,22 @@ const SEAT_FIELDS = [
   'inflight',
 ] as const
 
+function sameSessions(a: Vm['seat_sessions'], b: Vm['seat_sessions']) {
+  const left = a ?? []
+  const right = b ?? []
+  if (left.length !== right.length) return false
+  return left.every((seat, i) => {
+    const other = right[i]
+    return (
+      seat.index === other?.index &&
+      seat.session_id === other?.session_id &&
+      seat.state === other?.state &&
+      seat.inflight === other?.inflight &&
+      (seat.held_until ?? null) === (other?.held_until ?? null)
+    )
+  })
+}
+
 /** 席位快照只覆盖 Claude 行（`seats_max` 非空）的实时字段；缺席即空闲。 */
 export function mergeSeatVm(vm: Vm, snap: PoolSeatSnapshot): Vm {
   if (vm.seats_max == null) return vm
@@ -57,11 +73,17 @@ export function mergeSeatVm(vm: Vm, snap: PoolSeatSnapshot): Vm {
     seats_used: live?.seats_used ?? 0,
     seats_max: live?.seats_max ?? vm.seats_max,
     seats_grace: live?.seats_grace ?? 0,
+    seat_sessions: live?.sessions ?? [],
     queue_depth: live?.queue_depth ?? 0,
     conc_waiting: live?.conc_waiting ?? 0,
     inflight: live?.inflight ?? 0,
   }
-  if (SEAT_FIELDS.every((key) => vm[key] === next[key])) return vm
+  if (
+    SEAT_FIELDS.every((key) => vm[key] === next[key]) &&
+    sameSessions(vm.seat_sessions, next.seat_sessions)
+  ) {
+    return vm
+  }
   return { ...vm, ...next }
 }
 

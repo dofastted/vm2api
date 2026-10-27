@@ -32,7 +32,8 @@ import { REMOTE_KERNEL_ENTRY, resolveKernelDataplane } from '../vm/slot-engine.m
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
-import { slotMemory, slotDockerCpus, memoryMiB, normalizeVmConfig, VM_CONFIG_DEFAULTS } from '../vm/machine-spec.mjs'
+import { slotMemory, slotDockerCpus, memoryMiB, normalizeVmConfig } from '../vm/machine-spec.mjs'
+import { dockerEnvMap, ensureKvmMachineRecord, kvmEnvMapIncomplete, kvmMachineFields } from '../vm/kvm-machine.mjs'
 import { logTelemetryContainerSkip, telemetryContainerSkip } from '../vm/docker-container.mjs'
 import { slotExecArgv, slotExecCmd } from '../vm/slot-exec.mjs'
 import {
@@ -59,7 +60,7 @@ import {
   removeNetwork,
   renameContainer,
 } from './docker-remote.mjs'
-import { refreshNativeSlotPayload } from './native-slot.mjs'
+import { refreshNativeSlotPayload, currentNativePayloadDigest } from './native-slot.mjs'
 import {
   awaitSlotImageBuild,
   clusterManager,
@@ -72,6 +73,7 @@ import {
   vmNodeId,
 } from './placement.mjs'
 import { openSftp, readRemoteFileNoFollow, runRemote, shellQuote, writeRemoteFile } from './remote-fs.mjs'
+
 import {
   pushSlotBinaries,
   pushSlotFiles,
@@ -633,27 +635,6 @@ async function probeRemoteAccel(session, routing) {
   }
 }
 
-function kvmMachineFields(vm) {
-  const m = vm.machine && typeof vm.machine === 'object' ? vm.machine : {}
-  const smbios = m.smbios && typeof m.smbios === 'object' ? m.smbios : {}
-  const d = VM_CONFIG_DEFAULTS
-  return {
-    vcpus: Number.isInteger(m.vcpus) ? m.vcpus : d.vcpus,
-    disk_gb: Number.isInteger(m.disk_gb) ? m.disk_gb : d.disk_gb,
-    cpu_model: m.cpu_model || d.cpu_model,
-    mac: m.mac || '',
-    smbios: {
-      manufacturer: smbios.manufacturer || d.smbios.manufacturer,
-      product: smbios.product || d.smbios.product,
-      version: smbios.version || d.smbios.version,
-      family: smbios.family || d.smbios.family,
-      serial: smbios.serial || '',
-      uuid: smbios.uuid || '',
-    },
-    disk_serial: m.disk_serial || '',
-  }
-}
-
 function kvmSlotContainerBody(vm, { image, network, remoteDir, routing, accel, slotUser }) {
   const slotName = displayName(vm.id)
   const memStr = slotMemory(vm, routing)
@@ -847,7 +828,13 @@ async function ensureNodeSlotImage(session, nodeId, projectRoot, kernel, runtime
 export async function refreshNodeSlotPayload(
   vm,
   projectRoot,
-  { routing, recreate = true, startFn = startRemoteSlot } = {},
+  {
+    routing,
+    recreate = true,
+    startFn = startRemoteSlot,
+    sessionFor = nodeSession,
+    inspect = inspectContainerOrNull,
+  } = {},
 ) {
   const id = vm?.id
   const nodeId = vmNodeId(vm)
@@ -856,14 +843,30 @@ export async function refreshNodeSlotPayload(
   const kernel = vm.kernel && OS_CATALOG[vm.kernel] ? vm.kernel : 'ubuntu-24.04'
   const kind = runtimeKind(vm)
   try {
-    const session = await nodeSession(nodeId)
+    const session = await sessionFor(nodeId)
+    const running = recreate !== false && vm.status === 'running'
+    // Upgrade and the entrypoint auto-sync both land here: a slot already up on this payload stays up.
+    if (running) {
+      const ref = slotImageSpec(projectRoot, kernel, { runtime: kind }).ref
+      const info = await inspect(session.docker, vm.runtime?.container || containerName(id))
+      if (info?.State?.Running && info.Config?.Image === ref) {
+        return {
+          id,
+          node_id: nodeId,
+          ok: true,
+          image: ref,
+          kernel_changed: false,
+          restarted: false,
+          kernel: { ok: true, skipped: true, reason: 'unchanged' },
+        }
+      }
+    }
     const spec = await ensureNodeSlotImage(session, nodeId, projectRoot, kernel, kind)
     if (spec.fail) return { id, node_id: nodeId, ...spec.fail }
     if (kind === 'kvm') {
       const dockerSpec = await ensureNodeSlotImage(session, nodeId, projectRoot, kernel, 'docker')
       if (dockerSpec.fail) return { id, node_id: nodeId, ...dockerSpec.fail }
     }
-    const running = recreate !== false && vm.status === 'running'
     if (!running) {
       return {
         id,
@@ -903,6 +906,59 @@ export async function refreshNodeSlotPayload(
       code: err?.code || 'slot_payload_refresh_failed',
       error: String(err?.message || err).slice(0, 300),
     }
+  }
+}
+export async function inspectClusterPayloadChanges(
+  projectRoot,
+  vms,
+  {
+    routing,
+    sessionFor = nodeSession,
+    inspect = inspectContainerOrNull,
+    nativeVm = isNativeNodeVm,
+    nativeDigestFor = currentNativePayloadDigest,
+  } = {},
+) {
+  const items = []
+  const nativeDigest = nativeDigestFor(projectRoot)
+  for (const vm of vms || []) {
+    if (isCodexVm(vm)) continue
+    const nodeId = vmNodeId(vm)
+    if (nativeVm(vm)) {
+      items.push({
+        id: vm.id,
+        node_id: nodeId,
+        ok: nativeDigest != null,
+        baked: true,
+        native: true,
+        code: nativeDigest ? undefined : 'native_payload_missing',
+        kernel_changed: nativeDigest != null && vm.runtime?.payload_digest !== nativeDigest,
+      })
+      continue
+    }
+    const kernel = vm.kernel && OS_CATALOG[vm.kernel] ? vm.kernel : 'ubuntu-24.04'
+    const spec = slotImageSpec(projectRoot, kernel, { runtime: runtimeKind(vm) })
+    const session = await sessionFor(nodeId)
+    const info = await inspect(session.docker, containerName(vm.id))
+    const current = String(info?.Config?.Image || '')
+    items.push({
+      id: vm.id,
+      node_id: nodeId,
+      ok: true,
+      baked: true,
+      image: spec.ref,
+      kernel_changed: current !== spec.ref,
+    })
+  }
+  const changed = items.filter((item) => item.kernel_changed)
+  return {
+    ok: true,
+    changed: changed.length > 0,
+    total: items.length,
+    ok_count: items.length,
+    failed_count: 0,
+    changed_count: changed.length,
+    items,
   }
 }
 
@@ -1036,6 +1092,13 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
     const name = containerName(vm.id)
     const relays = await clusterManager().ensureSlotRelays(nodeId, vm.id)
     let existing = await inspectContainerOrNull(session.docker, name)
+    if (kvm && existing) {
+      ensureKvmMachineRecord(vm, {
+        projectRoot,
+        containerEnv: dockerEnvMap(existing.Config?.Env),
+        persist: true,
+      })
+    }
     const matches =
       existing &&
       existing.Config?.Image === image &&
@@ -1066,7 +1129,8 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
       return { ok: true, action: 'already-running', runtime: vm.runtime }
     }
     let previousNetwork = null
-    if (existing && !matches) {
+    const envBroken = kvm && existing && kvmEnvMapIncomplete(dockerEnvMap(existing.Config?.Env), existing.Config?.Env)
+    if (existing && (!matches || envBroken)) {
       previousNetwork = existing.HostConfig?.NetworkMode
       await removeContainer(session.docker, name)
       existing = null

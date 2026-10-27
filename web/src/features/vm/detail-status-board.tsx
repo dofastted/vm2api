@@ -1,5 +1,11 @@
 import type { Dashboard } from '@/types/panel-overview'
-import type { Vm, VmKernelSnapshot, VmProxySnap } from '@/types/panel-vm'
+import type {
+  Vm,
+  VmClosedWindow,
+  VmDetailPayload,
+  VmKernelSnapshot,
+  VmProxySnap,
+} from '@/types/panel-vm'
 import type { StatusTone } from '@/types/status'
 import {
   fableCap,
@@ -21,7 +27,7 @@ import {
   scheduleStateLabel,
   vmRunning,
 } from '@/lib/vm-status'
-import { formatWindowSpend } from '@/lib/vm-usage'
+import { closedWindowHint, formatWindowSpend } from '@/lib/vm-usage'
 import {
   kernelHopReady,
   kernelProcessUp,
@@ -65,6 +71,28 @@ type Props = {
   conc: ConcurrencyInfo
   rpm: RpmInfo | null
   today: VmTodayCounts
+  billing?: VmDetailPayload['billing']
+}
+
+/** 上一个 5H 窗口结束时的已用比例与花费；窗口翻转前没有记录。 */
+function PrevWindowMeter({ w }: { w: VmClosedWindow | null | undefined }) {
+  if (!w) {
+    return (
+      <div className='flex items-baseline justify-between gap-2'>
+        <span className='text-xs text-muted-foreground'>上个 5H 已用</span>
+        <span className='text-[11px] text-muted-foreground'>
+          暂无记录 · 窗口翻转后开始记录
+        </span>
+      </div>
+    )
+  }
+  return (
+    <Meter
+      label='上个 5H 已用'
+      value={w.used_ratio * 100}
+      hint={closedWindowHint(w)}
+    />
+  )
 }
 
 type Verdict = {
@@ -173,6 +201,7 @@ export function VmStatusBoard(props: Props) {
     conc,
     rpm,
     today,
+    billing,
   } = props
   const verdict = slotVerdict(vm, kernel, proxy)
   const proxyH = proxyHealthOf(vm, proxy)
@@ -182,7 +211,18 @@ export function VmStatusBoard(props: Props) {
   const cost5 = money(acc.window_5h_cost ?? vm.window_5h_cost ?? cost.w)
   const cost7 = money(acc.window_7d_cost ?? vm.window_7d_cost)
   const fableCost = money(acc.window_fable_cost ?? vm.window_fable_cost)
-  const spend5 = formatWindowSpend(cost5, vm.estimate_5h)
+  const live5 = formatWindowSpend(cost5, vm.estimate_5h)
+  const proj5 = billing?.window_5h_projection
+  // 本窗口用量太低算不出时，总额度借上个窗口的「花费 ÷ 结束时已用」。
+  const spend5 =
+    proj5?.source === 'previous' &&
+    proj5.total_usd != null &&
+    proj5.remaining_usd != null
+      ? {
+          costText: `${fmtUsd(cost5, 2)} / ≈${fmtUsd(proj5.total_usd, 2)}`,
+          remainText: `余 ${fmtUsd(proj5.remaining_usd, 2)}（按上个窗口）`,
+        }
+      : live5
   const spend7 = formatWindowSpend(cost7, vm.estimate_7d)
   const spendFable = formatWindowSpend(fableCost, vm.estimate_fable)
   const telemetry = telemetryView(vm.seed_policy, kernel?.telemetry)
@@ -271,18 +311,21 @@ export function VmStatusBoard(props: Props) {
           <h3 className='text-sm font-medium'>额度</h3>
           <div className='mt-3 grid gap-3'>
             {isCodexVm(vm) ? (
-              <OpenaiQuotaPanel
-                vm={vm}
-                u5={u5}
-                u7={u7}
-                now={now}
-                cost5={cost5}
-                cost7={cost7}
-              />
+              <>
+                <OpenaiQuotaPanel
+                  vm={vm}
+                  u5={u5}
+                  u7={u7}
+                  now={now}
+                  cost5={cost5}
+                  cost7={cost7}
+                />
+                <PrevWindowMeter w={billing?.prev_window_5h} />
+              </>
             ) : (
               <>
                 <Meter
-                  label='5 小时已用'
+                  label='本窗口 5H 已用'
                   value={u5}
                   gate={
                     vm.quota_policy ? vm.quota_policy.limit_5h * 100 : undefined
@@ -295,6 +338,7 @@ export function VmStatusBoard(props: Props) {
                     .filter(Boolean)
                     .join(' · ')}
                 />
+                <PrevWindowMeter w={billing?.prev_window_5h} />
                 <Meter
                   label='7 天已用'
                   value={u7}

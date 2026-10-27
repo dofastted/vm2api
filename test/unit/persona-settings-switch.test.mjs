@@ -20,6 +20,7 @@ import {
   CRS_AGENT_PROMPT_REQUIRED,
   CRS_EMPTY_IDENTITY_TEXT,
   CRS_OFFICIAL_AGENT_PROMPT,
+  CRS_OFFICIAL_CLI_SYSTEM,
   CRS_OFFICIAL_SYSTEM,
   DEFAULT_CACHE_CONTROL_TTL,
   DEFAULT_PERSONA_MODE,
@@ -124,7 +125,7 @@ test('settings save rewrite/official_prompt/overwrite/zero/none hot-reads withou
     persistSettings(file, { persona_inject: 'official_prompt', persona_park: true })
     const official = applyFromSettings(file)
     assert.equal(official.system.length, 4)
-    assert.equal(official.system[1].text, CRS_OFFICIAL_SYSTEM)
+    assert.equal(official.system[1].text, CRS_OFFICIAL_CLI_SYSTEM)
     assert.equal(official.system[2].text, CRS_OFFICIAL_AGENT_PROMPT)
     assert.match(official.system[3].text, /^# Environment\n - Timezone: /)
     assert.ok(!official.system.some((b) => String(b?.text || '').includes(DEFAULT_AGENT_STANDING)))
@@ -146,7 +147,7 @@ test('settings save rewrite/official_prompt/overwrite/zero/none hot-reads withou
     const zero = applyFromSettings(file)
     assert.equal(zero.system.length, 4)
     assert.match(zero.system[0].text, /x-anthropic-billing-header:/)
-    assert.match(zero.system[0].text, /prompt_version=<You are Anthropic Claude Agent SDK\.>/)
+    assert.match(zero.system[0].text, /prompt_version=<You are Claude Code, Anthropic's official CLI for Claude\.>/)
     assert.equal(zero.system[1].text, CRS_EMPTY_IDENTITY_TEXT)
     assert.equal(zero.system[2].text, CRS_EMPTY_IDENTITY_TEXT)
     assert.equal(envTextAt(zero), '# Environment\n - Timezone: America/Los_Angeles')

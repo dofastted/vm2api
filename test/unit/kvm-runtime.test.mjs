@@ -66,6 +66,7 @@ test('kvm docker run mounts slot paths, stop-timeout 30, memory overhead', () =>
   const args = argsFor('tcg')
   assert.equal(args[0], 'docker')
   assert.equal(args[1], 'run')
+  assert.equal(args[args.indexOf('--restart') + 1], 'no')
   assert.equal(args[args.indexOf('--stop-timeout') + 1], '30')
   assert.equal(args[args.indexOf('--memory') + 1], '1536m')
   assert.equal(args.includes('--device'), false)

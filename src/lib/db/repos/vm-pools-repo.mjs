@@ -39,6 +39,8 @@ export class VmPoolsRepo {
     this._addMember = db.prepare('INSERT INTO vm_pool_members (pool_id, vm_id, created_at) VALUES ($1, $2, $3)')
     this._other = db.prepare('SELECT pool_id FROM vm_pool_members WHERE vm_id = $1 AND pool_id != $2')
     this._keyCount = db.prepare('SELECT COUNT(*) AS n FROM api_keys WHERE vm_pool_id = $1 AND deleted_at IS NULL')
+    this._deleteVm = db.prepare('DELETE FROM vm_pool_members WHERE vm_id = $1')
+    this._memberVmIds = db.prepare('SELECT DISTINCT vm_id FROM vm_pool_members')
   }
 
   async _ids(poolId) {
@@ -128,6 +130,24 @@ export class VmPoolsRepo {
   async remove(id) {
     const info = await this._delete.run(id)
     return info.changes > 0
+  }
+
+  /**
+   * Drop a slot from every pool. A deleted slot used to keep its membership
+   * row, which the panel could neither show nor remove: every save of that
+   * pool then failed with "槽位 X 不存在" even though X no longer existed.
+   */
+  async removeVm(vmId) {
+    const info = await this._deleteVm.run(String(vmId))
+    return Number(info.changes) || 0
+  }
+
+  /** Drop memberships for slots outside `knownIds`; returns the ids removed. */
+  async pruneUnknown(knownIds) {
+    const known = new Set([...knownIds].map(String))
+    const stale = (await this._memberVmIds.all()).map((row) => row.vm_id).filter((vmId) => !known.has(vmId))
+    for (const vmId of stale) await this._deleteVm.run(vmId)
+    return stale
   }
 }
 

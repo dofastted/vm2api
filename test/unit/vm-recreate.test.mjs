@@ -68,6 +68,16 @@ test('recreated record keeps slot identity and drops credentials', () => {
   assert.equal(next.proxy_cli_enabled, true)
 })
 
+test('recreated record keeps tenant owner and origin', () => {
+  const prev = { id: 'vm-09', kernel: 'debian-12', owner_user_id: 'u1', origin: 'user_created', claude: {} }
+  const next = buildRecreatedVmRecord(prev)
+  assert.equal(next.owner_user_id, 'u1')
+  assert.equal(next.origin, 'user_created')
+  const platform = buildRecreatedVmRecord({ id: 'vm-10', kernel: 'debian-12', claude: {} })
+  assert.equal(platform.owner_user_id, undefined)
+  assert.equal(platform.origin, undefined)
+})
+
 test('recreated record enables proxy_cli when an exit is still bound', () => {
   const next = buildRecreatedVmRecord({
     id: 'vm-08',

@@ -370,10 +370,15 @@ test('resolveInboundIdentity reads explicit device_id from the raw inbound body'
 
 const LONG_TURN = 'please refactor the scheduler module and explain every single change you make'
 
-test('resolveSeatIdentity: device id first, then metadata session, never the API key', () => {
+test('resolveSeatIdentity: session id owns the seat; device id only when there is no session', () => {
   const both = { metadata: { user_id: JSON.stringify({ device_id: 'dev-1', session_id: 'sess-1' }) } }
   const inbound = { ...both, messages: [{ role: 'user', content: LONG_TURN }] }
-  assert.deepEqual(resolveSeatIdentity({ inbound, body: inbound }), { key: 'seat:dev:dev-1', source: 'device' })
+  assert.deepEqual(resolveSeatIdentity({ inbound, body: inbound }), { key: 'seat:sess:sess-1', source: 'session' })
+  const otherSession = {
+    metadata: { user_id: JSON.stringify({ device_id: 'dev-1', session_id: 'sess-2' }) },
+    messages: [{ role: 'user', content: LONG_TURN }],
+  }
+  assert.equal(resolveSeatIdentity({ inbound: otherSession, body: otherSession }).key, 'seat:sess:sess-2')
   const explicit = { device_id: 'dev-2', messages: [{ role: 'user', content: LONG_TURN }] }
   assert.equal(resolveSeatIdentity({ inbound: explicit, body: explicit }).key, 'seat:dev:dev-2')
   const header = resolveSeatIdentity({
@@ -389,6 +394,17 @@ test('resolveSeatIdentity: device id first, then metadata session, never the API
     key: 'seat:sess:sess-9',
     source: 'session',
   })
+})
+
+test('resolveSeatIdentity: two x-session-id values on one device are two seats', () => {
+  const inbound = { device_id: 'dev-1', messages: [{ role: 'user', content: LONG_TURN }] }
+  const a = resolveSeatIdentity({ inbound, headers: { 'x-session-id': '01a17519-60b0-7218-9d67-d31c47ceedbc' } })
+  const b = resolveSeatIdentity({ inbound, headers: { 'x-session-id': '01b28620-71c1-8329-ae78-e42d58dffecd' } })
+  assert.equal(a.source, 'session')
+  assert.equal(a.key, 'seat:sess:01a17519-60b0-7218-9d67-d31c47ceedbc')
+  assert.equal(b.key, 'seat:sess:01b28620-71c1-8329-ae78-e42d58dffecd')
+  assert.notEqual(a.key, b.key)
+  assert.notEqual(a.key, 'seat:dev:dev-1')
 })
 
 test('resolveSeatIdentity: same IP + UA + first turn hashes to one identity whatever the API key', () => {

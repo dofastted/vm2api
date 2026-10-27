@@ -26,7 +26,7 @@ mock.module(new URL('../../src/lib/identity/vm-identity.mjs', import.meta.url), 
   namedExports: { ...identity, loadVmIdentity: () => ({ accountUuid: 'ha-account', fingerprint: { device_id: 'synthetic-ha-device' } }) },
 })
 mock.module(new URL('../../src/lib/protocol/handle-codex.mjs', import.meta.url), {
-  namedExports: { handleCodexProtocol: () => { events.push('codex'); return {} }, handleCodexSearch: () => { events.push('search'); return {} }, usageFromSseLine: () => null },
+  namedExports: { handleCodexProtocol: () => { events.push('codex'); return {} }, handleCodexSearch: () => { events.push('search'); return {} }, handleCodexImages: () => { events.push('images'); return {} }, usageFromSseLine: () => null },
 })
 if (kind === 'rewrite-gpt') mock.module(new URL('../../src/lib/protocol/codex-model-mapping.mjs', import.meta.url), {
   namedExports: { applyCodexInboundModelRewrite: (body) => ({ ok: true, mapped: true, body: { ...body, model: 'gpt-5.4' } }) },
@@ -70,13 +70,14 @@ test(`HA protocol boundary ${kind}`, async (t) => {
   req.headers = { 'user-agent': 'synthetic-ha-client', 'x-request-id': 'untrusted-client-id' }
   const res = new EventEmitter()
   res.setHeader = () => {}
-  if (kind === 'search') await handler.handleSearch(req, res, '/v1/alpha/search')
+  if (kind === 'images') await handler.handleImages(req, res, '/v1/images/generations', 'generations')
+  else if (kind === 'search') await handler.handleSearch(req, res, '/v1/alpha/search')
   else await handler.handleProtocol(req, res, protocol, '/synthetic-messages')
   if (kind === 'responses') {
     assert.equal(res.statusCode, 400)
     assert.equal(res.body.error.code, 'protocol_not_allowed')
     assert.deepEqual(events, [])
-  } else if (['gpt', 'api', 'search', 'rewrite-gpt'].includes(kind)) {
+  } else if (['gpt', 'api', 'search', 'images', 'rewrite-gpt'].includes(kind)) {
     assert.equal(res.statusCode, 503)
     assert.equal(res.body.error.code, 'ha_operation_unsupported')
     assert.deepEqual(events, [])

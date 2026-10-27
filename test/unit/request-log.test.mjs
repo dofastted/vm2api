@@ -544,6 +544,29 @@ test('cache breakdown without a split bills 5m unless cache_ttl is explicitly 1h
   assert.equal(hour.cache_creation_1h_tokens, 9)
 })
 
+test('cache breakdown puts the total beyond a partial split into the fallback TTL (#678)', async () => {
+  const store = tmpStore('normal')
+  const sum = await store.finish(
+    store.start(
+      { method: 'POST', headers: {}, socket: {} },
+      { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+    ),
+    {
+      status: 200,
+      model: 'claude-opus-5-5',
+      upstream_model: 'claude-opus-5-5',
+      usage: {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_creation_input_tokens: 14890,
+        cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 119 },
+      },
+    },
+  )
+  assert.equal(sum.cache_creation_5m_tokens, 14771)
+  assert.equal(sum.cache_creation_1h_tokens, 119)
+})
+
 test('finish persists web_search_requests from server_tool_use', async () => {
   const store = tmpStore('normal')
   const sum = await store.finish(
@@ -634,6 +657,22 @@ test('debug mode stores full redacted body', async () => {
   assert.deepEqual(dbg[0].hop_meta.params.dropped, ['max_tokens'])
 })
 
+test('debug records retain final header provenance and a separate redacted worker envelope', async () => {
+  const store = tmpStore('debug')
+  const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { protocol: 'anthropic.messages' })
+  await store.finish(ctx, {
+    status: 200,
+    outbound_headers_source: 'cli_final',
+    outbound_headers: { accept: 'application/json, text/event-stream', authorization: 'Bearer final-secret' },
+    worker_envelope_headers: { 'x-app': 'cli', authorization: 'Bearer envelope-secret' },
+  })
+  const [record] = await store.listDebug({ limit: 1 })
+  assert.equal(record.outbound_headers_source, 'cli_final')
+  assert.equal(record.outbound_headers.accept, 'application/json, text/event-stream')
+  assert.equal(record.outbound_headers.authorization, '***REDACTED***')
+  assert.deepEqual(record.worker_envelope_headers, { 'x-app': 'cli', authorization: '***REDACTED***' })
+})
+
 test('outbound bodies are stored only when the operator configured debug, not via caller headers', async () => {
   const outbound = { body: { system: 'gateway persona overlay' }, headers: { 'x-app': 'cli' } }
   const record = async (store, headers) => {
@@ -643,6 +682,8 @@ test('outbound bodies are stored only when the operator configured debug, not vi
       inbound_body: { model: 'm' },
       outbound_body: outbound.body,
       outbound_headers: outbound.headers,
+      outbound_headers_source: 'cli_final',
+      worker_envelope_headers: outbound.headers,
     })
     return await store.getDebug(ctx.request_id)
   }
@@ -651,6 +692,8 @@ test('outbound bodies are stored only when the operator configured debug, not vi
     assert.deepEqual(forced.inbound_body, { model: 'm' })
     assert.equal(forced.outbound_body, null)
     assert.equal(forced.outbound_headers, null)
+    assert.equal(forced.outbound_headers_source, null)
+    assert.equal(forced.worker_envelope_headers, null)
   }
   const operator = await record(tmpStore('debug'), {})
   assert.deepEqual(operator.outbound_body, outbound.body)
@@ -1226,4 +1269,108 @@ test('summary and debug write failures reject finish and response flush', async 
   } finally {
     store.db.query = query
   }
+})
+
+const IMAGE_GEN_USAGE = {
+  input_tokens: 300,
+  input_tokens_details: { text_tokens: 100, image_tokens: 200 },
+  output_tokens: 1000,
+  total_tokens: 1300,
+}
+
+test('Responses image tool usage is stored and billed on top of the text model', async () => {
+  const store = tmpStore('normal')
+  const ctx = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'openai.responses', pathName: '/v1/responses' },
+  )
+  const rec = await store.finish(ctx, {
+    status: 200,
+    protocol: 'openai.responses',
+    model: 'gpt-6-luna',
+    upstream_model: 'gpt-6-luna',
+    usage: { input_tokens: 1000, output_tokens: 100 },
+    image_usage: IMAGE_GEN_USAGE,
+    image_model: 'gpt-image-2.5-sunburst',
+  })
+  const row = await store.db
+    .prepare(
+      'SELECT image_model, image_usage, image_input_tokens, image_output_tokens, image_cost, total_cost, actual_cost, pricing_model FROM usage_logs WHERE id = $1',
+    )
+    .get(rec.id)
+  assert.equal(row.image_model, 'gpt-image-2.5-sunburst')
+  assert.deepEqual(JSON.parse(row.image_usage), IMAGE_GEN_USAGE)
+  assert.equal(row.image_input_tokens, 300)
+  assert.equal(row.image_output_tokens, 1000)
+  assert.ok(Math.abs(row.image_cost - 0.0321) < 1e-9)
+  assert.equal(row.pricing_model, 'gpt-6-luna')
+  assert.ok(row.total_cost > row.image_cost)
+  assert.equal(row.actual_cost, row.total_cost)
+})
+
+test('Images endpoint rows bill only the image usage', async () => {
+  const store = tmpStore('normal')
+  const ctx = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'openai.images', pathName: '/v1/images/generations' },
+  )
+  const rec = await store.finish(ctx, {
+    status: 200,
+    protocol: 'openai.images',
+    model: 'gpt-image-2.5-flare',
+    image_model: 'gpt-image-2.5-flare',
+    image_usage: IMAGE_GEN_USAGE,
+  })
+  const row = await store.db
+    .prepare('SELECT image_cost, total_cost, pricing_model, input_tokens FROM usage_logs WHERE id = $1')
+    .get(rec.id)
+  assert.equal(row.pricing_model, 'gpt-image-2.5-flare')
+  assert.ok(Math.abs(row.total_cost - 0.0321) < 1e-9)
+  assert.equal(row.image_cost, row.total_cost)
+  assert.equal(row.input_tokens, 0)
+  const missing = await store.finish(
+    store.start(
+      { method: 'POST', headers: {}, socket: {} },
+      { protocol: 'openai.images', pathName: '/v1/images/generations' },
+    ),
+    { status: 200, protocol: 'openai.images', model: 'gpt-image-2.5-flare', image_model: 'gpt-image-2.5-flare' },
+  )
+  assert.equal(missing.pricing_model, 'unpriced')
+  assert.equal(missing.total_cost, null)
+})
+
+test('repriceRange re-prices image usage from the stored JSON and keeps actual_cost', async () => {
+  const store = tmpStore('normal')
+  const now = new Date().toISOString()
+  await store.db
+    .prepare(`
+    INSERT INTO usage_logs (
+      id, request_id, created_at, protocol, model, upstream_model, status,
+      input_tokens, output_tokens, image_model, image_usage, image_input_tokens, image_output_tokens,
+      image_cost, total_cost, actual_cost, pricing_model, rate_multiplier
+    ) VALUES
+      ('log_img_tool', 'rid_img_tool', $1, 'openai.responses', 'gpt-6-luna', 'gpt-6-luna', 200, 0, 0,
+       'gpt-image-2.5-flare', $2, 300, 1000, 1, 1, 7, 'gpt-6-luna', 1),
+      ('log_img_only', 'rid_img_only', $3, 'openai.images', 'gpt-image-2.5-sunburst', NULL, 200, 0, 0,
+       'gpt-image-2.5-sunburst', $4, 300, 1000, NULL, NULL, 5, NULL, 1)
+  `)
+    .run(now, JSON.stringify(IMAGE_GEN_USAGE), now, JSON.stringify(IMAGE_GEN_USAGE))
+  const out = await store.repo.repriceRange({ since: now, until: now })
+  assert.equal(out.rows, 2)
+  assert.equal(out.still_unpriced, 0)
+  const rows = Object.fromEntries(
+    (
+      await store.db
+        .prepare(
+          "SELECT id, image_cost, total_cost, actual_cost, pricing_model FROM usage_logs WHERE id LIKE 'log_img_%'",
+        )
+        .all()
+    ).map((r) => [r.id, r]),
+  )
+  assert.ok(Math.abs(rows.log_img_tool.image_cost - 0.0321) < 1e-9)
+  assert.ok(Math.abs(rows.log_img_tool.total_cost - 0.0321) < 1e-9)
+  assert.equal(rows.log_img_tool.actual_cost, 7)
+  assert.equal(rows.log_img_only.pricing_model, 'gpt-image-2.5-sunburst')
+  assert.ok(Math.abs(rows.log_img_only.total_cost - 0.0321) < 1e-9)
+  assert.equal(rows.log_img_only.actual_cost, 5)
 })

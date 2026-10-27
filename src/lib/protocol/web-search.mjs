@@ -47,10 +47,31 @@ function isClaudeCodeClientWebSearch(tool, type) {
   return tool.name === 'WebSearch' && tool.input_schema != null && !type.startsWith('web_search')
 }
 
+/**
+ * A web_search tool that carries its own description and schema (OpenAI
+ * `function` wrapper or Anthropic `input_schema`) is the caller's own search,
+ * run by the caller. Rewriting it to the native server tool drops that schema
+ * and makes Anthropic run a different search than the one the caller asked for.
+ * Native tools have a `web_search*` type or no schema at all.
+ */
+function isWebSearchFamilyName(tool, type) {
+  const name = searchToolName(tool)
+  return type.startsWith('web_search') || type === 'google_search' || WEB_SEARCH_NAMES.has(name)
+}
+
+function isCallerDefinedSearchFunction(tool, type) {
+  if (type.startsWith('web_search') || type === 'google_search') return false
+  if (!isWebSearchFamilyName(tool, type)) return false
+  const def = type === 'function' && tool.function ? tool.function : tool
+  const schema = def.parameters ?? def.input_schema
+  return schema != null && Boolean(def.description)
+}
+
 export function isWebSearchTool(tool) {
   if (!tool || typeof tool !== 'object') return false
   const type = String(tool.type || '').toLowerCase()
   if (isClaudeCodeClientWebSearch(tool, type)) return false
+  if (isCallerDefinedSearchFunction(tool, type)) return false
   const name = searchToolName(tool)
   return type.startsWith('web_search') || type === 'google_search' || WEB_SEARCH_NAMES.has(name)
 }
@@ -58,9 +79,11 @@ export function isWebSearchTool(tool) {
 /** Client search tools (Rikka search_web, Claude Code WebSearch). Not Anthropic's built-in web_search. */
 export function isCallerClientSearchTool(tool) {
   if (!tool || typeof tool !== 'object') return false
-  if (isClaudeCodeClientWebSearch(tool, String(tool.type || '').toLowerCase())) return true
+  const type = String(tool.type || '').toLowerCase()
+  if (isClaudeCodeClientWebSearch(tool, type)) return true
   const name = searchToolName(tool)
-  return name === 'search_web' || name === 'scrape_web'
+  if (name === 'search_web' || name === 'scrape_web') return true
+  return isCallerDefinedSearchFunction(tool, type)
 }
 
 export function isAnthropicServerTool(tool) {

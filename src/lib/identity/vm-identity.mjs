@@ -20,8 +20,8 @@ export function readJsonSafe(p, fallback = null) {
   }
 }
 
-/** Official Claude Code version. 2.1.295 and older are below the 2.1.296 minimum. */
-export const OFFICIAL_CLI_VERSION = '2.1.296'
+/** Official Claude Code version shared by Node identity and the slot CLI wire. */
+export const OFFICIAL_CLI_VERSION = '2.1.303'
 export const OFFICIAL_CLAUDE_CLI_UA = `claude-cli/${OFFICIAL_CLI_VERSION} (external, sdk-cli)`
 export const OFFICIAL_STAINLESS = Object.freeze({
   stainless_lang: 'js',
@@ -32,9 +32,9 @@ export const OFFICIAL_STAINLESS = Object.freeze({
   stainless_package_version: '0.128.0',
 })
 
-export function officialClaudeCliUa(version = OFFICIAL_CLI_VERSION) {
+export function officialClaudeCliUa(version = OFFICIAL_CLI_VERSION, entrypoint = 'sdk-cli') {
   const m = String(version || '').match(/(\d+\.\d+\.\d+)/)
-  return `claude-cli/${m ? m[1] : OFFICIAL_CLI_VERSION} (external, sdk-cli)`
+  return `claude-cli/${m ? m[1] : OFFICIAL_CLI_VERSION} (external, ${entrypoint === 'cli' ? 'cli' : 'sdk-cli'})`
 }
 
 export function formatMetadataUserId({ deviceId, accountUuid, sessionId }) {

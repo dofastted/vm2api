@@ -1,0 +1,49 @@
+# When main's ci goes from red back to green, re-run open PRs whose latest ci
+# failed: they may have failed only because main itself was broken. test.yml
+# merges the current base first, so the re-run tests against the fixed main.
+name: pr-rerun
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  rerun:
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: main recovered
+        if: github.event_name == 'workflow_run'
+        id: recovered
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          prev=$(gh run list --workflow test.yml --branch main --event push --limit 30 \
+            --json databaseId,conclusion \
+            --jq "[.[] | select(.databaseId < $RUN_ID and (.conclusion == \"success\" or .conclusion == \"failure\"))][0].conclusion")
+          echo "previous main verdict: ${prev:-none}"
+          echo "red=$([ "$prev" = failure ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - name: re-run failed PR checks
+        if: github.event_name == 'workflow_dispatch' || steps.recovered.outputs.red == 'true'
+        run: |
+          gh pr list --state open --limit 200 --json number,headRefOid,isDraft,mergeable \
+            --jq '.[] | select(.isDraft | not) | select(.mergeable != "CONFLICTING") | "\(.number) \(.headRefOid)"' |
+          while read -r number sha; do
+            run=$(gh run list --workflow test.yml --commit "$sha" --event pull_request --limit 1 \
+              --json databaseId,conclusion --jq '.[] | select(.conclusion == "failure") | .databaseId')
+            [ -n "$run" ] || continue
+            echo "PR #$number: re-run $run"
+            gh run rerun "$run" || echo "PR #$number: re-run $run refused"
+          done

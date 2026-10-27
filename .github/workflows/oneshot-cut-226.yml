@@ -1,0 +1,42 @@
+name: oneshot-cut-226
+on:
+  push:
+    paths:
+      - ".github/workflows/oneshot-cut-226.yml"
+  workflow_dispatch: {}
+jobs:
+  cut:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: tag tip-cut
+        run: |
+          set -euo pipefail
+          TIP=7cd52501c03c03e36493c38e39edc349de7d0c99
+          git config user.name dofastted
+          git config user.email kuhlmangarry24@gmail.com
+          if git rev-parse -q --verify refs/tags/v1.3.226 >/dev/null; then
+            echo tag-exists
+          else
+            git tag -a v1.3.226 "$TIP" -m "vm2api 1.3.226"
+            git push origin "refs/tags/v1.3.226"
+          fi
+      - name: patch release title and notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 90); do
+            if gh release view v1.3.226 --repo dofastted/vm2api >/dev/null 2>&1; then break; fi
+            sleep 10
+          done
+          NOTES=docs/releases/v1.3.226-notes.md
+          test -f "$NOTES"
+          for j in 1 2 3 4 5 6; do
+            gh release edit v1.3.226 --repo dofastted/vm2api --title "vm2api 1.3.226" --notes-file "$NOTES" || true
+            sleep 20
+          done

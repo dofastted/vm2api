@@ -19,7 +19,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { redactSecrets } from '../core/security.mjs'
 import { resolveStoreDb, getActivityCoordinator } from '../db/database.mjs'
-import { integerValue } from '../db/integers.mjs'
+import { addInteger, integerValue } from '../db/integers.mjs'
 import { UsageLogsRepo } from '../db/repos/usage-logs-repo.mjs'
 import { classifyRequestError, resolveMutedErrorClasses } from './error-class.mjs'
 import { costColumnsFromUsage, normalizeUsage } from './pricing.mjs'
@@ -106,8 +106,8 @@ function summarizeBody(body) {
 
 /**
  * Cache-creation TTL breakdown.
- * Prefer usage.cache_creation.ephemeral_5m/1h; when the split is absent but
- * cache_creation_input_tokens > 0, bill 1h only on an explicit cache_ttl === '1h',
+ * Prefer usage.cache_creation.ephemeral_5m/1h; cache_creation_input_tokens beyond
+ * that split (absent, or stale after message_delta) bills 1h only on an explicit cache_ttl === '1h',
  * else 5m. DEFAULT_CACHE_TTL is not a billing fallback.
  */
 function cacheCreationBreakdown(usage) {
@@ -118,14 +118,19 @@ function cacheCreationBreakdown(usage) {
   let five = integerValue(nested?.ephemeral_5m_input_tokens)
   let hour = integerValue(nested?.ephemeral_1h_input_tokens)
   const total = integerValue(usage.cache_creation_input_tokens ?? usage.cache_creation_tokens)
-  if (five === 0 && hour === 0 && total > 0) {
-    if (usage.cache_ttl === '1h') hour = total
-    else five = total
+  const unsplit = addInteger(addInteger(total, -BigInt(five)), -BigInt(hour))
+  if (BigInt(unsplit) > 0n) {
+    if (usage.cache_ttl === '1h') hour = addInteger(hour, unsplit)
+    else five = addInteger(five, unsplit)
   }
   if (five === 0 && hour === 0) {
     return { cache_creation_5m_tokens: null, cache_creation_1h_tokens: null }
   }
   return { cache_creation_5m_tokens: five, cache_creation_1h_tokens: hour }
+}
+
+function imageTokenCount(v) {
+  return Number.isSafeInteger(v) && v > 0 ? v : 0
 }
 
 function webSearchRequestsOf(usage) {
@@ -139,6 +144,7 @@ const PRICED_COLUMN_KEYS = [
   'cache_read_cost',
   'cache_creation_cost',
   'web_search_cost',
+  'image_cost',
   'total_cost',
   'pricing_model',
   'price_source',
@@ -148,19 +154,27 @@ const PRICED_COLUMN_KEYS = [
   'long_context',
 ]
 
+/** Image generation usage on this row; an Images endpoint row (`openai.images`) bills it alone. */
+function imageForLog(extra) {
+  const only = extra.protocol === 'openai.images'
+  if (!extra.image_usage && !only) return null
+  return { usage: extra.image_usage || null, model: extra.image_model || null, only }
+}
+
 function costColumnsForLog(usage, model, extra = {}) {
   if (extra.pricing_model != null) {
     const out = {}
     for (const key of PRICED_COLUMN_KEYS) out[key] = extra[key] ?? null
     return out
   }
-  const priced = costColumnsFromUsage(usage, model)
+  const priced = costColumnsFromUsage(usage, model, imageForLog(extra))
   return {
     input_cost: priced.input_cost ?? null,
     output_cost: priced.output_cost ?? null,
     cache_read_cost: priced.cache_read_cost ?? null,
     cache_creation_cost: priced.cache_creation_cost ?? null,
     web_search_cost: priced.web_search_cost ?? null,
+    image_cost: priced.image_cost ?? null,
     total_cost: priced.total_cost ?? null,
     pricing_model: priced.pricing_model ?? null,
     price_source: priced.price_source ?? null,
@@ -571,6 +585,10 @@ export class RequestLogStore {
       inbound_device_id: sessionIdForLog(extra.inbound_device_id),
       // Gate verdict JSON from intercept-gate; the risk audit groups on it.
       intercept: extra.intercept ? String(extra.intercept).slice(0, 400) : null,
+      image_model: extra.image_model || null,
+      image_usage: extra.image_usage ? JSON.stringify(extra.image_usage) : null,
+      image_input_tokens: imageTokenCount(extra.image_usage?.input_tokens),
+      image_output_tokens: imageTokenCount(extra.image_usage?.output_tokens),
       // sub2api ownership + billing columns
       user_id: extra.user_id ?? null,
       vm_owner_user_id: await this.repo.vmOwnerOf(extra.vm_id),
@@ -615,6 +633,11 @@ export class RequestLogStore {
         classifier: extra.classifier || null,
         outbound_headers:
           ctx.capture_outbound && extra.outbound_headers != null ? redactHeaders(extra.outbound_headers) : null,
+        outbound_headers_source: ctx.capture_outbound ? extra.outbound_headers_source || null : null,
+        worker_envelope_headers:
+          ctx.capture_outbound && extra.worker_envelope_headers != null
+            ? redactHeaders(extra.worker_envelope_headers)
+            : null,
         outbound_body:
           ctx.capture_outbound && !extra.classifier && extra.outbound_body != null
             ? clampBody(extra.outbound_body, this.maxDebugBodyChars)
@@ -699,6 +722,10 @@ export class RequestLogStore {
 
   async vmUsageStats(opts = {}) {
     return await this.repo.vmUsageStats(opts)
+  }
+
+  async costBetween(opts = {}) {
+    return await this.repo.costBetween(opts)
   }
 
   async keyUsageStats(opts = {}) {

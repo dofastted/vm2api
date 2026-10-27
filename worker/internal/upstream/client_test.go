@@ -20,6 +20,30 @@ import (
 	kinproxy "github.com/dofastted/kin-gateway/worker/internal/proxy"
 )
 
+func TestAllowedHeaderKeepsCapturedIdentityAndDropsSecrets(t *testing.T) {
+	for _, key := range []string{
+		"Accept",
+		"User-Agent",
+		"anthropic-beta",
+		"anthropic-dangerous-direct-browser-access",
+		"x-claude-code-prompt-id",
+		"x-claude-code-request-class",
+		"x-claude-code-session-id",
+		"x-client-request-id",
+		"X-Stainless-Package-Version",
+		"X-Stainless-Timeout",
+	} {
+		if !allowedHeader(key) {
+			t.Errorf("allowedHeader(%q) = false", key)
+		}
+	}
+	for _, key := range []string{"Authorization", "Cookie", "X-Api-Key", "Set-Cookie"} {
+		if allowedHeader(key) {
+			t.Errorf("allowedHeader(%q) = true", key)
+		}
+	}
+}
+
 func TestRefreshAndMessagesUseSameSOCKSProxy(t *testing.T) {
 	var pathsMu sync.Mutex
 	var paths []string

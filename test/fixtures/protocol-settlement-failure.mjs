@@ -22,6 +22,7 @@ mock.module(new URL('../../src/lib/protocol/handle-codex.mjs', import.meta.url),
   namedExports: {
     handleCodexProtocol: completedUpstream,
     handleCodexSearch: completedUpstream,
+    handleCodexImages: completedUpstream,
     usageFromSseLine: () => null,
   },
 })
@@ -70,7 +71,9 @@ test(`${route}:${failure}`, async () => {
   req.headers = { 'user-agent': 'openai-node/1.0' }
   const res = new EventEmitter()
   res.setHeader = () => {}
-  const request = route === 'search'
+  const request = route === 'images'
+    ? handler.handleImages(req, res, '/v1/images/generations', 'generations')
+    : route === 'search'
     ? handler.handleSearch(req, res, '/v1/alpha/search')
     : handler.handleProtocol(req, res, 'openai.responses', '/v1/responses')
   await assert.rejects(request, new RegExp(`simulated execution-stage ${failure} failure`))

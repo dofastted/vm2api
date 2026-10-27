@@ -144,7 +144,7 @@ export function StickyPane({
             icon={Link2}
             title='会话绑定'
             value={enabled ? '已启用' : '已停用'}
-            desc='优先回到绑定账号，不改变 Claude 独立席位语义'
+            desc='优先回到绑定 VM；session 占着的槽位跟这个绑定一起留'
             pending={pending}
             disabled={saving}
             buttonRef={(node) => {
@@ -158,7 +158,7 @@ export function StickyPane({
             icon={Clock3}
             title='绑定保持时间'
             value={fmtDuration(ttl * 1000)}
-            desc='绑定记录 TTL，不是请求超时或席位宽限'
+            desc='绑定 TTL，也是请求结束后 session 继续占槽的时间'
             pending={pending}
             disabled={saving}
             buttonRef={(node) => {

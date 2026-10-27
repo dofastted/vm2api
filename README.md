@@ -83,6 +83,7 @@
 - **模型**页改为卡片矩阵。`claude-haiku-5-5` 的默认上下文、`max_tokens` 和输出上限是 100K；已经改过的管理员值不会被重置。
 - **托管密钥**可以限定平台（全部 / Anthropic / OpenAI）和勾选的槽。打到范围外返回 403。
 - **流空闲**默认 180 秒，在「重试与切号」里改。长工具参数可打开流式下发，避免静默超时。
+- **cli-node** 本机交付文件已换成 2.1.303：`share/wrap-cli/cli-node`，UPX 后 27,788,488 字节，SHA256 `efa72baab605c4ecee19a9e130b52ca2e1d6ef317880f5eaa5d90e867cc96aa4`。构建基线 `e30047ed` 加当前工作区。payload 尚未更新，线上槽位未部署。
 
 ---
 
@@ -298,6 +299,7 @@ Since 1.3.122, the caller-visible changes are:
 - **Models** are a card matrix. Haiku 5.5 defaults to a 100K context and output cap; an admin override is kept.
 - **Keys** can be limited to Anthropic or OpenAI and to selected slots. A call outside that scope returns 403.
 - **Stream idle** defaults to 180 seconds under retry settings. Long tool arguments can be streamed.
+- **cli-node** local delivery is now 2.1.303: `share/wrap-cli/cli-node`, 27,788,488 bytes after UPX, SHA256 `efa72baab605c4ecee19a9e130b52ca2e1d6ef317880f5eaa5d90e867cc96aa4`. Built from `e30047ed` plus the current working tree. The payload and live slots are unchanged.
 
 Details: [CHANGELOG.md](CHANGELOG.md). Guide: [vm2api.fkcodex.com/zh](https://vm2api.fkcodex.com/zh/).
 

@@ -14,6 +14,7 @@ import {
   healLeftoverAuthState,
   markVmAuthCooldown,
   clearVmAuthCooldown,
+  clearRecoverableVmCooldown,
   restoreScheduleAfterLiveCredential,
   readWorkerCredentialFile,
   readSlotCredentialIdentity,
@@ -198,20 +199,24 @@ test('healLeftoverAuthState does not clear oauth_revoked', () => {
   assert.equal(vm.schedule_disabled_reason, 'oauth_revoked')
 })
 
-test('restoreScheduleAfterLiveCredential heals oauth_revoked after a live credential', () => {
+test('restoreScheduleAfterLiveCredential heals oauth_revoked only on an operator import', () => {
   const vm = {
     status: 'paused',
     schedulable: false,
     schedule_disabled_reason: 'oauth_revoked',
     claude: { has_access: true, has_refresh: true },
   }
+  // Background refresh / mirror: 不可调度 stays until an operator acts.
   restoreScheduleAfterLiveCredential(vm)
+  assert.equal(vm.schedulable, false)
+  assert.equal(vm.unschedulable.reason, 'oauth_revoked')
+  restoreScheduleAfterLiveCredential(vm, { operatorImport: true })
   assert.equal(vm.schedulable, true)
   assert.equal(vm.schedule_disabled_reason, null)
   assert.equal(vm.status, 'running')
 })
 
-test('persistOauthToVm heals revoke when acceptLiveGrant even if expiry did not bump', () => {
+test('persistOauthToVm heals revoke on an operator import even if expiry did not bump', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-import-'))
   const vmPath = path.join(dir, 'vm-50.json')
   fs.writeFileSync(
@@ -235,7 +240,7 @@ test('persistOauthToVm heals revoke when acceptLiveGrant even if expiry did not 
       refresh_token: 'new-rt',
       expires_at: 1_800_000_000_000,
     },
-    { acceptLiveGrant: true },
+    { acceptLiveGrant: true, operatorImport: true },
   )
   const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
   assert.equal(vm.claude.refresh_error, null)
@@ -586,4 +591,41 @@ test('official setup-token persist omits refresh and marks mode', () => {
   const cred = readWorkerCredentialFile(home)
   assert.equal(cred.type, 'official-setup-token')
   assert.equal(cred.refresh_token, '')
+})
+
+test('clearRecoverableVmCooldown drops stale Codex codex_limited_until', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-codex-'))
+  const until = new Date(Date.now() + 86_400_000).toISOString()
+  const vmPath = path.join(dir, 'vm-codex.json')
+  fs.writeFileSync(
+    vmPath,
+    JSON.stringify({
+      id: 'vm-codex',
+      platform: 'openai',
+      temp_unschedulable_reason: 'quota_5h_header',
+      codex: { extra: { codex_limited_until: until, codex_5h_used_percent: 0 } },
+    }),
+  )
+  clearRecoverableVmCooldown(vmPath)
+  const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+  assert.equal(vm.temp_unschedulable_reason, undefined)
+  assert.equal(vm.codex.extra.codex_limited_until, undefined)
+})
+
+test('clearRecoverableVmCooldown keeps Codex park when grant is dead', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-codex-dead-'))
+  const until = new Date(Date.now() + 86_400_000).toISOString()
+  const vmPath = path.join(dir, 'vm-codex.json')
+  fs.writeFileSync(
+    vmPath,
+    JSON.stringify({
+      id: 'vm-codex',
+      temp_unschedulable_reason: 'oauth_revoked',
+      codex: { extra: { codex_limited_until: until } },
+    }),
+  )
+  clearRecoverableVmCooldown(vmPath)
+  const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+  assert.equal(vm.temp_unschedulable_reason, 'oauth_revoked')
+  assert.equal(vm.codex.extra.codex_limited_until, until)
 })

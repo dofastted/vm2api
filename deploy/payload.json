@@ -1,6 +1,6 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.10.22-computer-linux",
+  "release": "payload-2026.10.26-cli-effort",
   "files": [
     {
       "path": "bin/kin-kernel",
@@ -27,10 +27,28 @@
       "sha256": "a64970838469da0e3b86831212e8f6b0806e3433a65dd062f6556252403c2bb9"
     },
     {
+      "path": "bin/kin-worker",
+      "asset": "kin-worker",
+      "size": 16455001,
+      "sha256": "d6b29f1144cd389696fe11edd6b5a024499bfc598da6a9ac96a4c7a9f9d6071b"
+    },
+    {
+      "path": "bin/kin-egress",
+      "asset": "kin-egress",
+      "size": 9047621,
+      "sha256": "0bf1eeb0424fb341ad371fed1e40c39e68e940770222a0ac940d3340f3b4e277"
+    },
+    {
+      "path": "bin/kin-slot-gate",
+      "asset": "kin-slot-gate",
+      "size": 8120583,
+      "sha256": "78f78d59e4f61917aca202a384eb687488a8f511acfc41662d3877223431c859"
+    },
+    {
       "path": "share/wrap-cli/cli-node",
       "asset": "cli-node",
-      "size": 27174928,
-      "sha256": "b5054cb8494670354e61f3e0a0f7b2c3b768832c841140a4e22407fec24ab009"
+      "size": 27789508,
+      "sha256": "f29bbfa45b68308367f4091699cbeb3a0baba860d327d349d6d55cc11408fb68"
     },
     {
       "path": "share/wrap-cli/cc-node",

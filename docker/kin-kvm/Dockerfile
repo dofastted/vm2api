@@ -35,6 +35,7 @@ RUN test -n "$CLOUD_IMAGE_URL" || { echo "CLOUD_IMAGE_URL is required" >&2; exit
       -o /tmp/cloud.img "$CLOUD_IMAGE_URL" \
  && python3 /usr/local/lib/kin-kvm-fetch-cloud.py "$CLOUD_IMAGE_URL"
 
+# kin-guest-exec changes require rebuilding/redeploying this image for live KVM slots.
 COPY kin-kvm-entry kin-guest-exec /usr/local/bin/
 COPY guest/ /opt/kin-kvm/guest/
 RUN chmod 755 /usr/local/bin/kin-kvm-entry /usr/local/bin/kin-guest-exec \

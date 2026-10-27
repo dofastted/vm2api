@@ -381,3 +381,42 @@ test('kernel update keeps slot data unless traits mode is explicit', async () =>
     fs.rmSync(project, { recursive: true, force: true })
   }
 })
+
+test('concurrent wrap syncs run one after another', async () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-panel-sync-serial-'))
+  const events = []
+  try {
+    seedWrapTemplate(project)
+    fs.mkdirSync(path.join(project, 'vms'), { recursive: true })
+    fs.writeFileSync(
+      path.join(project, 'vms', 'node-slot.json'),
+      JSON.stringify({ id: 'node-slot', name: 'node', status: 'running', node_id: 'node-a', kernel: 'ubuntu-24.04' }),
+    )
+    let calls = 0
+    const refreshClusterSlotPayloads = async (_root, vms) => {
+      const n = ++calls
+      events.push(`start ${n}`)
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      events.push(`end ${n}`)
+      return {
+        ok: true,
+        total: vms.length,
+        ok_count: vms.length,
+        failed_count: 0,
+        items: vms.map((vm) => ({ id: vm.id, ok: true, kernel_changed: false })),
+      }
+    }
+    // The entrypoint auto-sync and the upgrade helper are separate requests to one server.
+    const first = panelFor(project, { refreshClusterSlotPayloads })
+    const second = panelFor(project, { refreshClusterSlotPayloads })
+    await Promise.all([
+      first.handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/wrap-cli/sync')),
+      second.handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/wrap-cli/sync')),
+    ])
+    assert.deepEqual(events, ['start 1', 'end 1', 'start 2', 'end 2'])
+    assert.equal(first.response.status, 200)
+    assert.equal(second.response.status, 200)
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})

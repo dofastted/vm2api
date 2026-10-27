@@ -21,6 +21,7 @@ import { rustKernelBusy, rustKernelReachable } from '../../src/lib/transport/rus
 import {
   ensureRustKernel,
   writeKernelConfig,
+  syncClaudeKernelConfigs,
   syncClaudeKernelConfigsFromFile,
   reconcileCliHopRuntime,
   wrapSlotCount,
@@ -36,7 +37,9 @@ import {
 } from '../../src/lib/transport/rust-kernel-supervisor.mjs'
 import { rustKernelPaths, isNeedsRefreshResult } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
+import { resetModelPolicy, saveModelPolicy } from '../../src/lib/protocol/model-policy.mjs'
 import { slotRuntimeOwner } from '../../src/lib/oauth/oauth-credentials.mjs'
+import { closeDatabase, openDatabase } from '../../src/lib/db/database.mjs'
 import { socksUidFor } from '../../src/lib/vm/vm-runtime.mjs'
 
 const unix = process.platform !== 'win32'
@@ -886,6 +889,36 @@ test('writeKernelConfig separates container paths from host socket paths', () =>
   fs.rmSync(root, { recursive: true, force: true })
 })
 
+test('model effort changes rewrite kernel.json without a routing save or restart', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-effort-'))
+  const routing = { compatibility: { persona_preset: 'official' } }
+  const vm = { id: 'vm-09' }
+  const configPath = path.join(root, 'vms', 'vm-09', 'run', 'kernel.json')
+  const read = () => JSON.parse(fs.readFileSync(configPath, 'utf8'))
+  await openDatabase({ dbPath: ':memory:' })
+  fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+  fs.writeFileSync(path.join(root, 'vms', 'vm-09.json'), JSON.stringify({ id: 'vm-09', status: 'running' }))
+  try {
+    await saveModelPolicy({
+      models: { 'claude-haiku-5-5': { params: { default_effort: 'high' } } },
+    })
+    writeKernelConfig(root, vm, { token: 'tok', routing })
+    assert.equal(read().model_effort['claude-haiku-5-5'], 'high')
+    const before = fs.statSync(configPath).mtimeMs
+    await saveModelPolicy({
+      models: { 'claude-haiku-5-5': { params: { default_effort: 'off' } } },
+    })
+    const synced = syncClaudeKernelConfigs(root, routing)
+    assert.equal(synced.updated, 1)
+    assert.equal(read().model_effort['claude-haiku-5-5'], 'off')
+    assert.ok(fs.statSync(configPath).mtimeMs >= before)
+  } finally {
+    await resetModelPolicy()
+    await closeDatabase()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('writeKernelConfig idle timeout follows the panel stream idle timeout', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-idle-cfg-'))
   const prev = process.env.KIN_STREAM_IDLE_TIMEOUT
@@ -1017,9 +1050,9 @@ test('writeKernelConfig uses identity when official_full has no persona_inject',
   assert.equal(overridden.system_layout, 'zero')
 })
 
-test('kernel.json rename chowns the new inode to the slot uid before publish', () => {
+test('kernel.json rename keeps the control-plane gid while adopting the slot uid', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-owner-'))
-  const vm = { id: 'vm-01', inference_engine: 'rust' }
+  const vm = { id: 'vm-10', inference_engine: 'rust' }
   const owner = slotRuntimeOwner(vm)
   const calls = []
   const chown = mock.method(fs, 'chownSync', (file, uid, gid) => {
@@ -1027,7 +1060,7 @@ test('kernel.json rename chowns the new inode to the slot uid before publish', (
   })
   const kernelOwned = () => calls.filter((call) => String(call.file).includes(`${path.sep}kernel.json`))
   try {
-    assert.equal(owner.uid, Number(process.env.KIN_VM_UID_BASE || 10000) + 1)
+    assert.equal(owner.uid, Number(process.env.KIN_VM_UID_BASE || 10000) + 10)
     assert.equal(owner.gid, Number(process.env.KIN_VM_GID || 987))
     assert.equal(String(owner.uid), socksUidFor(vm))
     const zero = { compatibility: { persona_preset: 'zero', cache_ttl: '5m' } }
@@ -1040,9 +1073,10 @@ test('kernel.json rename chowns the new inode to the slot uid before publish', (
     const changed = writeKernelConfig(root, vm, { token: 'tok', routing: full })
     assert.equal(changed.changed, true)
     const published = kernelOwned()
+    const controlGid = process.getgid()
     assert.ok(published.length >= 1)
     assert.ok(
-      published.every((call) => call.uid === owner.uid && call.gid === owner.gid),
+      published.every((call) => call.uid === owner.uid && call.gid === controlGid),
       JSON.stringify(published),
     )
     assert.ok(
@@ -1055,9 +1089,35 @@ test('kernel.json rename chowns the new inode to the slot uid before publish', (
     assert.equal(again.changed, false)
     assert.equal(fs.readFileSync(again.configPath, 'utf8').includes('"persona_preset": "official_full'), true)
     assert.ok(
-      kernelOwned().some((call) => call.file === again.configPath && call.uid === owner.uid && call.gid === owner.gid),
+      kernelOwned().some((call) => call.file === again.configPath && call.uid === owner.uid && call.gid === controlGid),
     )
   } finally {
+    chown.mock.restore()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('named slot ids keep the shared runtime owner when kernel config is rewritten', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-named-owner-'))
+  const vm = { id: 'loutish-arches-3gicloudcom' }
+  const runDir = path.join(root, 'vms', vm.id, 'run')
+  const owner = slotRuntimeOwner(vm)
+  fs.mkdirSync(runDir, { recursive: true })
+  fs.writeFileSync(path.join(runDir, 'worker.json'), '{"ok":true}\n', { mode: 0o644 })
+  const calls = []
+  const chown = mock.method(fs, 'chownSync', (file, uid, gid) => {
+    calls.push({ file, uid, gid })
+  })
+  const getuid = mock.method(process, 'getuid', () => 0)
+  try {
+    writeKernelConfig(root, vm, { token: 'tok', routing: {} })
+    const runOwned = calls.filter((call) => call.file === runDir)
+    assert.equal(runOwned.length, 1)
+    assert.equal(runOwned[0].uid, 10001)
+    assert.equal(owner.uid, 10001)
+    assert.notEqual(runOwned[0].uid, Number(process.env.KIN_VM_UID_BASE || 10000) + 3)
+  } finally {
+    getuid.mock.restore()
     chown.mock.restore()
     fs.rmSync(root, { recursive: true, force: true })
   }

@@ -62,7 +62,7 @@ export function accountChanges(before, after, { paths = [] } = {}) {
     const delta = addInteger(after[field], (-BigInt(integerValue(before[field]))).toString())
     if (delta !== 0) deltas[field] = delta
   }
-  for (const field of ['unified', 'last_blocked', 'last_cli_rate_limit']) {
+  for (const field of ['unified', 'last_blocked', 'last_cli_rate_limit', 'window_history']) {
     observationChanges(before[field], after[field], [field], observations)
   }
   for (const path of paths) touchObservation(valueAt(before, path), valueAt(after, path), path, observations)
@@ -147,6 +147,7 @@ function rowToAccount(row) {
     unified: extra.unified ?? DEFAULT_UNIFIED(),
     last_blocked: extra.last_blocked ?? null,
     last_cli_rate_limit: extra.last_cli_rate_limit ?? null,
+    window_history: extra.window_history ?? null,
     updated_at: row.updated_at,
   }
 }
@@ -156,6 +157,7 @@ function buildExtra(acc) {
     unified: acc.unified ?? null,
     last_blocked: acc.last_blocked ?? null,
     last_cli_rate_limit: acc.last_cli_rate_limit ?? null,
+    window_history: acc.window_history ?? null,
   })
 }
 
@@ -306,7 +308,7 @@ export class AccountsRepo {
       )
       let changed = false
       for (const [index, change] of changes.entries()) {
-        if (!['unified', 'last_blocked', 'last_cli_rate_limit'].includes(change.path[0])) {
+        if (!['unified', 'last_blocked', 'last_cli_rate_limit', 'window_history'].includes(change.path[0])) {
           throw new Error('unsupported account observation')
         }
         if (

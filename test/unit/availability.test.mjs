@@ -608,5 +608,8 @@ test('rest stays restricted even with a stale cooldown left on the slot', () => 
     restrictionReason: 'rate_limited',
     now,
   })
-  assert.deepEqual(triad, { schedule_state: 'restricted', restriction_reason: 'rest_period', restriction_until: until })
+  assert.equal(triad.schedule_state, 'restricted')
+  assert.equal(triad.restriction_reason, 'rest_period')
+  assert.equal(triad.restriction_until, until)
+  assert.equal(triad.restriction_text, '休息时段')
 })

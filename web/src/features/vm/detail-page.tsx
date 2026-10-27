@@ -64,6 +64,12 @@ import { VmProxyTab } from '@/features/vm/detail-proxy-tab'
 import { VmDetailSkeleton } from '@/features/vm/detail-skeleton'
 import { VmTestTab } from '@/features/vm/detail-test-tab'
 import { bootOutcome, vmTodayCounts } from '@/features/vm/detail-today'
+import { ActiveVmBadge } from '@/features/vm/active-vm-badge'
+import {
+  planDeleteActiveVm,
+  type DeleteActiveVmPlan,
+} from '@/features/vm/active-vm'
+import { DeleteActiveVmHint } from '@/features/vm/delete-active-hint'
 import { NodeChip } from '@/features/vm/node-chip'
 import { probeOutcome, type ProbeCheck } from '@/features/vm/probe-status'
 import {
@@ -222,6 +228,8 @@ function VmDetailBody({
           else toast.warning(boot.message)
         } else if (path === '/stop') {
           toast.success('已关机，调度已关闭')
+        } else if (path === '/activate') {
+          toast.success('已设为活跃槽')
         } else {
           toast.success('已执行 ' + path)
         }
@@ -264,11 +272,25 @@ function VmDetailBody({
     },
     onError: (error: Error) => toast.error(error.message),
   })
+  const deletePlan: DeleteActiveVmPlan = planDeleteActiveVm(vm, slotList)
   const remove = useMutation({
-    mutationFn: () =>
-      api(`/api/panel/vms/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    mutationFn: async () => {
+      if (deletePlan.kind === 'switch') {
+        await api(
+          `/api/panel/vms/${encodeURIComponent(deletePlan.replacement.id)}/activate`,
+          { method: 'POST' }
+        )
+      }
+      return api(`/api/panel/vms/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      })
+    },
     onSuccess: async () => {
-      toast.success('已删除')
+      toast.success(
+        deletePlan.kind === 'switch'
+          ? `已切换活跃到 ${deletePlan.replacement.id} 并删除 ${id}`
+          : '已删除'
+      )
       await qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey })
       navigate({ to: '/vm' })
     },
@@ -370,6 +392,7 @@ function VmDetailBody({
             </Select>
           ) : null}
           <PlatformChip vm={vm} />
+          <ActiveVmBadge vm={vm} className='text-[11px]' />
           <RuntimeChip vm={vm} className='text-[11px]' />
           <NodeChip nodeId={vm.node_id} className='text-[11px]' />
           <StatusMark tone={accountStatus(vm)} variant='pill' />
@@ -620,13 +643,23 @@ function VmDetailBody({
           open={confirmDel}
           onOpenChange={setConfirmDel}
           title={`删除 ${id}`}
-          desc='删除槽位不可恢复。'
-          confirmText='删除'
+          desc={
+            <>
+              <p>删除槽位不可恢复。</p>
+              <DeleteActiveVmHint target={vm} vms={slotList} />
+            </>
+          }
+          confirmText={
+            deletePlan.kind === 'switch' ? '切换活跃并删除' : '删除'
+          }
           cancelBtnText='取消'
           destructive
+          disabled={deletePlan.kind === 'blocked'}
           isLoading={remove.isPending}
           handleConfirm={() => {
-            if (!remove.isPending) remove.mutate()
+            if (!remove.isPending && deletePlan.kind !== 'blocked') {
+              remove.mutate()
+            }
           }}
         />
         <ConfirmDialog

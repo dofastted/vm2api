@@ -18,6 +18,8 @@ export type Price = {
   >
   modes?: { fast?: Price; flex?: Price; priority?: Price }
   per_call?: { web_search?: number }
+  /** GPT Image: image-token rates; the base fields price the text tokens. */
+  image?: { input: number; output: number; cache_read: number }
 }
 
 export type PriceSource = 'override' | 'models.dev' | 'builtin'

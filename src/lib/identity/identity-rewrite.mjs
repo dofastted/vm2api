@@ -270,17 +270,21 @@ function ephemeralCacheText(body = {}) {
 }
 
 /**
- * Pool seat identity: one key per inbound device; every request of it shares
- * one seat. Precedence (sub2api GenerateSessionHash without the API key):
- * device id → metadata session_id → short one-shot probe (no seat) →
- * hash of `cache_control: ephemeral` content → hash of client IP +
- * normalized UA + system + first user turn. The API key never takes part.
- * @returns {{ key: string|null, source: 'device'|'session'|'probe'|'cache'|'fingerprint' }}
+ * Pool seat identity: one key per client session. A session that lands on a
+ * VM keeps that slot until sticky TTL, or until the home is unschedulable /
+ * an error moves it. Precedence: caller session (metadata.user_id, then
+ * `x-session-id` and the other caller session headers/body keys) → device id
+ * (no session) → short one-shot probe (no seat) → hash of
+ * `cache_control: ephemeral` content → hash of client IP + normalized UA +
+ * system + first user turn. The API key never takes part. Two sessions on
+ * the same device are two seats.
+ * @returns {{ key: string|null, source: 'session'|'device'|'probe'|'cache'|'fingerprint' }}
  */
 export function resolveSeatIdentity({ inbound = {}, body = {}, headers = {}, clientIp = '' } = {}) {
+  const sessionId = cleanIdentityValue(extractCallerSession({ inbound, body, headers }))
+  if (sessionId) return { key: `seat:sess:${sessionId}`, source: 'session' }
   const identity = resolveInboundIdentity({ inbound, body, headers })
   if (identity.deviceId) return { key: `seat:dev:${identity.deviceId}`, source: 'device' }
-  if (identity.sessionId) return { key: `seat:sess:${identity.sessionId}`, source: 'session' }
   if (isShortProbeRequest(inbound)) return { key: null, source: 'probe' }
   const cached = ephemeralCacheText(inbound)
   if (cached) return { key: `seat:h:${seatHash(['cache', cached])}`, source: 'cache' }

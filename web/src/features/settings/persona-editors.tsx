@@ -208,12 +208,14 @@ export function PersonaTemplateEditor({
   hasErrors,
   onTextChange,
   onBlocksChange,
+  vars = PERSONA_TEMPLATE_VARS,
 }: {
   text: string
   blocks: RawBlock[]
   hasErrors: boolean
   onTextChange: (text: string) => void
   onBlocksChange: (blocks: RawBlock[]) => void
+  vars?: [string, string][]
 }) {
   const jsonl = (
     <Textarea
@@ -241,7 +243,7 @@ export function PersonaTemplateEditor({
         </CollapsibleTrigger>
         <CollapsibleContent className='space-y-2 pt-2'>
           {jsonl}
-          <VarsHint vars={PERSONA_TEMPLATE_VARS} />
+          <VarsHint vars={vars} />
         </CollapsibleContent>
       </Collapsible>
     </div>

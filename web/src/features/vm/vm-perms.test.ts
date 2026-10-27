@@ -20,7 +20,7 @@ describe('vmPermsFor follows panel-acl roles', () => {
     })
   })
 
-  it('tenant cannot read dashboard or manage the slot, but can power, test, import and delete', () => {
+  it('tenant cannot read dashboard, delete slots, or manage the slot, but can power, test and import', () => {
     const p = vmPermsFor('user')
     expect(p.known).toBe(true)
     expect(p.admin).toBe(false)
@@ -30,7 +30,7 @@ describe('vmPermsFor follows panel-acl roles', () => {
     // The backend only serves GET /api/panel/test-models to admins.
     expect(p.testModels).toBe(false)
     expect(p.credential).toBe(true)
-    expect(p.remove).toBe(true)
+    expect(p.remove).toBe(false)
   })
 
   it('super only reads dashboard and toggles scheduling', () => {

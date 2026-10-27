@@ -17,10 +17,12 @@
 
 export const PERSONA_PRESETS = Object.freeze(['official', 'official_full', 'zero', 'custom'])
 export const DEFAULT_PERSONA_PRESET = 'official_full'
+/** Read-only compatibility alias; no longer a selectable preset. */
+export const OFFICIAL_303_PRESET = 'official_303'
 export const OVERLAY_PRESETS = Object.freeze(['off', 'official', 'minimal', 'custom'])
 export const DEFAULT_OVERLAY_PRESET = 'off'
 
-export const PERSONA_TEMPLATE_META_KEYS = Object.freeze(['id', 'note', 'drop_if_empty', 'hide'])
+export const PERSONA_TEMPLATE_META_KEYS = Object.freeze(['id', 'note', 'drop_if_empty', 'hide', 'role'])
 export const PERSONA_TEMPLATE_BLOCK_MAX = 40_000
 export const PERSONA_TEMPLATE_TOTAL_MAX = 200_000
 export const PERSONA_TEMPLATE_BLOCKS_MAX = 24
@@ -29,7 +31,7 @@ export const PERSONA_TEMPLATE_BLOCKS_MAX = 24
 export const PERSONA_TEMPLATE_VARS = Object.freeze([
   Object.freeze(['billing', '官方计费归因头整行：cc_version / cc_entrypoint / cch / cc_prompt_id']),
   Object.freeze(['billing_semi', '同 billing，但保证以分号结尾，供同一行继续拼接']),
-  Object.freeze(['identity', "官方身份句 You are a Claude agent, built on Anthropic's Claude Agent SDK."]),
+  Object.freeze(['identity', "官方身份句 You are Claude Code, Anthropic's official CLI for Claude."]),
   Object.freeze(['identity_cli', "交互 CLI 身份句 You are Claude Code, Anthropic's official CLI for Claude."]),
   Object.freeze(['identity_compact', '0注入短身份句 You are Anthropic Claude Agent SDK.']),
   Object.freeze(['reporting', '官方 # Reporting outcomes 整段。cli-node 只在计费和身份都在时把它切成独立段']),
@@ -51,6 +53,14 @@ export const PERSONA_TEMPLATE_VARS = Object.freeze([
   Object.freeze(['cwd', '调用方 cwd（已清洗）']),
   Object.freeze(['cli_version', '官方 CLI 版本号']),
   Object.freeze(['session_id', '出站会话 id']),
+  Object.freeze(['main_prompt_303', '官方 2.1.303 harness + guidance（记忆目录跟随调用方 cwd，无 cwd 时删除记忆段）']),
+  Object.freeze(['harness_303', '官方 2.1.303 harness。1h 时带 scope global']),
+  Object.freeze(['guidance_303', '官方 2.1.303 guidance（记忆目录跟随调用方 cwd，无 cwd 时删除记忆段）']),
+  Object.freeze(['env_303', '官方 2.1.303 Environment 段（槽位身份 + 调用方 cwd / git / shell）']),
+  Object.freeze(['env_instructions_303', '抓包中的工具 / agent / MCP / skills 长环境说明，默认不加载']),
+  Object.freeze(['env_timezone', '可选槽位时区行，默认不加载']),
+  Object.freeze(['env_locale', '可选槽位语言行，默认不加载']),
+  Object.freeze(['model_sentence', '当前模型的官方模型句，追加在 Environment 之后，可在本页改写']),
 ])
 
 export const OVERLAY_TEMPLATE_VARS = Object.freeze([
@@ -85,113 +95,143 @@ export const DEFAULT_PERSONA_TEMPLATES = Object.freeze({
     }),
     Object.freeze({
       id: 'identity',
-      note: '官方身份句（Claude Agent SDK）',
+      note: '官方 CLI 身份句，不打缓存点',
       type: 'text',
-      text: '{{identity}}',
+      text: '{{identity_cli}}',
     }),
     Object.freeze({
-      id: 'agent',
-      note: '常驻约束 + 调用方官方提示词。空则丢弃。1h 断点在本块，排在会变的第5段之前。',
+      id: 'harness',
+      note: '2.1.303 harness。常驻约束放在段首，空则丢弃',
       drop_if_empty: true,
       type: 'text',
-      text: '{{agent_standing}}{{caller_agent}}',
-      cache_control: Object.freeze({ type: 'ephemeral', ttl: '1h' }),
+      text: '{{agent_standing}}{{harness_303}}',
+      cache_control: Object.freeze({ type: 'ephemeral', scope: 'global' }),
+    }),
+    Object.freeze({
+      id: 'dynamic_boundary',
+      note: 'cli-node 拆分点。标记本身不出站',
+      type: 'text',
+      text: '{{dynamic_boundary}}',
+    }),
+    Object.freeze({
+      id: 'guidance',
+      note: '2.1.303 guidance。断点 TTL 取面板缓存 TTL，不带 scope',
+      type: 'text',
+      text: '{{guidance_303}}',
+      cache_control: Object.freeze({ type: 'ephemeral' }),
     }),
     Object.freeze({
       id: 'env',
-      note: '槽位 Environment（时区），按档开关，排在 agent 之后不破 1h 前缀缓存',
+      note: '写入 messages 的 role=system，不混入顶层 system',
+      role: 'system',
       drop_if_empty: true,
       type: 'text',
-      text: '{{env}}',
+      text: '{{env_303}}',
     }),
     Object.freeze({
-      id: 'caller_system',
-      note: '第5段可选。只放顶层 system。role=system 留在消息列表。空则丢弃',
+      id: 'env_timezone',
+      note: '可选时区，默认不加载',
+      role: 'system',
       drop_if_empty: true,
       type: 'text',
-      text: '{{caller_system}}',
+      text: '{{env_timezone}}',
+    }),
+    Object.freeze({
+      id: 'env_locale',
+      note: '可选语言，默认不加载',
+      role: 'system',
+      drop_if_empty: true,
+      type: 'text',
+      text: '{{env_locale}}',
     }),
   ]),
   official_full: Object.freeze([
     Object.freeze({
       id: 'billing',
-      note: '计费归因头：cc_version / cc_entrypoint / cch / cc_prompt_id，官方必带',
+      note: '2.1.303 计费归因头，不打缓存点',
       type: 'text',
       text: '{{billing}}',
     }),
     Object.freeze({
       id: 'identity',
-      note: '交互 CLI 身份句。cli-node 按这句切第 2 段，不能换成 Agent SDK 句',
+      note: '官方 CLI 身份句，不打缓存点',
       type: 'text',
       text: '{{identity_cli}}',
     }),
     Object.freeze({
-      id: 'reporting',
-      note: '官方 reporting 整段。必须是独立块，cli-node 才把它从静态段里抬出来',
+      id: 'harness',
+      note: '2.1.303 harness。常驻约束放在段首',
       type: 'text',
-      text: '{{reporting}}',
-    }),
-    Object.freeze({
-      id: 'agent_official',
-      note: '静态段。常驻约束在前，官方提示词在后。1h 断点打在这里，排在会变的动态段之前',
-      type: 'text',
-      text: '{{agent_standing}}{{agent_official}}',
-      cache_control: Object.freeze({ type: 'ephemeral', ttl: '1h' }),
+      text: '{{agent_standing}}{{harness_303}}',
+      cache_control: Object.freeze({ type: 'ephemeral', scope: 'global' }),
     }),
     Object.freeze({
       id: 'dynamic_boundary',
-      note: '静态段和动态段的分界。cli-node 丢掉这个标记，只拿它决定 cache scope',
+      note: 'cli-node 拆分点。标记本身不出站',
       type: 'text',
       text: '{{dynamic_boundary}}',
     }),
     Object.freeze({
-      id: 'env_official',
-      note: '官方 continuation + Environment。2.1.263 起 1h 缓存，无 scope',
+      id: 'guidance',
+      note: '2.1.303 guidance。断点 TTL 取面板缓存 TTL，不带 scope',
       type: 'text',
-      text: '{{env_official}}',
-      cache_control: Object.freeze({ type: 'ephemeral', ttl: '1h' }),
+      text: '{{guidance_303}}',
+      cache_control: Object.freeze({ type: 'ephemeral' }),
+    }),
+    Object.freeze({
+      id: 'env',
+      note: '写入 messages 的 role=system，不混入顶层 system',
+      role: 'system',
+      drop_if_empty: true,
+      type: 'text',
+      text: '{{env_303}}',
+    }),
+    Object.freeze({
+      id: 'env_extra',
+      note: 'Environment 之后的附加段。默认是当前模型句，可在 system提示词页改写或清空',
+      drop_if_empty: true,
+      role: 'system',
+      type: 'text',
+      text: '{{model_sentence}}',
+    }),
+    Object.freeze({
+      id: 'env_instructions',
+      note: '2.1.303 抓包长环境说明。仅显式开启时加载，可修改或整块移除',
+      role: 'system',
+      drop_if_empty: true,
+      type: 'text',
+      text: '{{env_instructions_303}}',
+    }),
+    Object.freeze({
+      id: 'env_timezone',
+      note: '可选时区，默认不加载',
+      role: 'system',
+      drop_if_empty: true,
+      type: 'text',
+      text: '{{env_timezone}}',
+    }),
+    Object.freeze({
+      id: 'env_locale',
+      note: '可选语言，默认不加载',
+      role: 'system',
+      drop_if_empty: true,
+      type: 'text',
+      text: '{{env_locale}}',
     }),
     Object.freeze({
       id: 'caller_system',
-      note: '调用方 --append-system-prompt 剩余 system，原文追加不清洗',
+      note: '第三方 system。不进顶层 system，包成 <system-reminder> 放在第一条 user 最前面',
       drop_if_empty: true,
       type: 'text',
-      text: '{{caller_system}}',
+      text: '<system-reminder>\n{{caller_system}}\n</system-reminder>\n',
     }),
   ]),
   zero: Object.freeze([
     Object.freeze({
-      id: 'billing_zero',
-      hide: true,
+      id: 'billing',
+      note: '0注入只留计费头，官方身份句放在 prompt_version',
       type: 'text',
-      text: '{{billing_semi}} prompt_version=<{{identity_compact}}>',
-    }),
-    Object.freeze({
-      id: 'identity_slot',
-      hide: true,
-      type: 'text',
-      text: '\u200b',
-    }),
-    Object.freeze({
-      id: 'agent_slot',
-      hide: true,
-      type: 'text',
-      text: '{{agent_standing}}',
-      cache_control: Object.freeze({ type: 'ephemeral', ttl: '1h' }),
-    }),
-    Object.freeze({
-      id: 'env',
-      hide: true,
-      drop_if_empty: true,
-      type: 'text',
-      text: '{{env}}',
-    }),
-    Object.freeze({
-      id: 'caller_system',
-      note: '第5段可选。调用方 system 都写这里，空则丢弃',
-      drop_if_empty: true,
-      type: 'text',
-      text: '{{caller_system}}',
+      text: '{{billing_semi}} prompt_version=<{{identity_cli}}>',
     }),
   ]),
   custom: Object.freeze([]),
@@ -246,7 +286,31 @@ export function normalizePersonaPreset(value) {
     return 'official'
   if (raw === 'zero' || raw === 'zero_inject' || raw === '0inject' || raw === '0-inject') return 'zero'
   if (raw === 'custom' || raw === 'diy' || raw === 'manual') return 'custom'
+  if (raw === OFFICIAL_303_PRESET || raw === '303' || raw === 'official-303') return 'official_full'
   return DEFAULT_PERSONA_PRESET
+}
+
+/**
+ * Retired preset names resolve to the same template as official_full.
+ */
+export function templatePresetFor(preset) {
+  return normalizePersonaPreset(preset)
+}
+
+/** Retired 303 selections and their saved switches/templates follow official_full without losing edits. */
+export function canonicalPersonaCompat(compat = {}) {
+  if (!compat || typeof compat !== 'object' || Array.isArray(compat)) return compat
+  const next = { ...compat }
+  if ([OFFICIAL_303_PRESET, '303', 'official-303'].includes(compat.persona_preset))
+    next.persona_preset = 'official_full'
+  for (const field of ['persona_templates', 'persona_block_presets', ...PRESET_FLAG_FIELDS]) {
+    const map = compat[field]
+    if (!map || typeof map !== 'object' || Array.isArray(map) || !Object.hasOwn(map, OFFICIAL_303_PRESET)) continue
+    next[field] = { ...map }
+    if (!Object.hasOwn(map, 'official_full')) next[field].official_full = map[OFFICIAL_303_PRESET]
+    delete next[field][OFFICIAL_303_PRESET]
+  }
+  return next
 }
 
 export function normalizeOverlayPreset(value) {
@@ -285,11 +349,19 @@ export function agentStandingText(compat = {}) {
  * remain opt-out for backwards-compatible masking/env behavior.
  */
 export function presetFlagEnabled(compat, field, preset) {
-  const defaultValue = field === 'agent_standing_presets' ? false : true
+  const optIn = [
+    'agent_standing_presets',
+    'model_env_extra_presets',
+    'persona_env_instructions_presets',
+    'persona_timezone_presets',
+    'persona_locale_presets',
+    'persona_guidance_presets',
+  ].includes(field)
+  const defaultValue = !optIn
   const map = compat?.[field]
   if (!map || typeof map !== 'object' || Array.isArray(map)) return defaultValue
   const value = map[normalizePersonaPreset(preset)]
-  if (field === 'agent_standing_presets') return value === true
+  if (optIn) return value === true
   return value !== false
 }
 
@@ -302,7 +374,25 @@ export const PRESET_FLAG_FIELDS = Object.freeze([
   'agent_standing_hide_presets',
   'persona_env_presets',
   'persona_hide_presets',
+  'model_env_extra_presets',
+  'persona_env_instructions_presets',
+  'persona_timezone_presets',
+  'persona_locale_presets',
+  'persona_guidance_presets',
 ])
+
+/** zero、官方、官方完整都可按块 id 关掉。guidance 默认关，显式 true 才注入。 */
+export function selectedTemplateBlocks(blocks, compat = {}, preset) {
+  const key = normalizePersonaPreset(preset)
+  if (!['zero', 'official', 'official_full'].includes(key)) return blocks
+  const selected = compat?.persona_block_presets?.[key]
+  return blocks.filter((block) => {
+    const id = String(block?.id || '')
+    if (id === 'guidance') return selected?.[id] === true || presetFlagEnabled(compat, 'persona_guidance_presets', key)
+    if (!selected || typeof selected !== 'object' || Array.isArray(selected)) return true
+    return selected[id] !== false
+  })
+}
 
 /** {{agent_standing}} 的值：非空时以换行结尾，紧跟下一段不粘连。 */
 export function agentStandingVar(compat = {}, preset) {
@@ -322,7 +412,10 @@ export function parsePersonaTemplateLines(text) {
     try {
       parsed = JSON.parse(line)
     } catch (err) {
-      errors.push({ line: index + 1, message: `不是合法 JSON：${err.message}` })
+      errors.push({
+        line: index + 1,
+        message: `不是合法 JSON：${err.message}`,
+      })
       return
     }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -369,13 +462,12 @@ function withStandingSlot(blocks, standingText) {
   const idx = blocks.findIndex((block) => {
     const id = String(block?.id || '')
     const text = String(block?.text || '')
-    return /agent/i.test(id) || text.includes('{{caller_agent}}') || text.includes('{{agent_official}}')
+    return (
+      id === 'harness' || id === 'guidance' || text.includes('{{harness_303}}') || text.includes('{{agent_official}}')
+    )
   })
   const copy = blocks.map((block) => ({ ...block }))
-  if (idx < 0) {
-    copy.splice(Math.min(copy.length, 2), 0, { id: 'agent_standing', type: 'text', text: '{{agent_standing}}' })
-    return copy
-  }
+  if (idx < 0) return blocks
   const existing = String(copy[idx].text || '')
   copy[idx].text = existing.replace(/\u200b/g, '').trim() ? `{{agent_standing}}${existing}` : '{{agent_standing}}'
   return copy
@@ -386,21 +478,31 @@ function withStandingSlot(blocks, standingText) {
  * other blank blocks keep their slot as a zero-width space because upstream
  * rejects empty text (0注入 agent slot with standing off and no caller agent).
  */
-export function renderPersonaTemplate(blocks, vars = {}) {
+export function renderPersonaTemplate(blocks, vars = {}, { role = null } = {}) {
   const source = withStandingSlot(blocks, vars?.agent_standing)
   if (!Array.isArray(source)) return []
   const out = []
   for (const block of source) {
     if (!block || typeof block !== 'object') continue
+    if ((block.role || null) !== role) continue
     const text = renderText(block.text, vars)
-    // The marker only tells cli-node where the global prefix ends. HTTP has no
-    // splitter, so a rendered block would ship the literal upstream.
-    if (text === '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__') continue
+    // cli-hop needs the literal so splitSysPromptPrefix can separate harness
+    // from guidance. HTTP has no splitter and must not send it upstream.
+    if (text === '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__' && vars?.keep_dynamic_boundary !== true) continue
     const blank = !text.trim()
     const emptyEnvironment =
       blank &&
       extractTemplateVars(block.text).some((name) =>
-        ['env', 'env_official', 'env_timezone_only', 'timezone'].includes(name),
+        [
+          'env',
+          'env_official',
+          'env_timezone_only',
+          'env_303',
+          'env_instructions_303',
+          'env_timezone',
+          'env_locale',
+          'timezone',
+        ].includes(name),
       )
     if (blank && (block.drop_if_empty || emptyEnvironment)) continue
     const next = { type: 'text', text: blank ? EMPTY_BLOCK_TEXT : text }
@@ -459,7 +561,13 @@ function templateFrom(templates, key, defaults) {
 /** Empty array means "use the built-in preset"; empty custom falls back to official. */
 export function resolvePersonaTemplate(preset, templates) {
   const key = normalizePersonaPreset(preset)
-  return dropLegacyAutoScope(key, templateFrom(templates, key, DEFAULT_PERSONA_TEMPLATES))
+  const blocks = dropLegacyAutoScope(key, templateFrom(templates, key, DEFAULT_PERSONA_TEMPLATES))
+  if (!['official', 'official_full'].includes(key)) return blocks
+  return blocks.map((block) =>
+    ['env', 'env_official', 'env_timezone_only', 'env_extra'].includes(block?.id)
+      ? { ...block, role: 'system' }
+      : block,
+  )
 }
 
 const LEGACY_AUTO_SCOPE_BLOCKS = new Set(['agent', 'agent_official'])
@@ -538,6 +646,9 @@ export function validatePersonaTemplate(blocks, { overlay = false } = {}) {
       }
     } else if (block.type != null && block.type !== 'text') {
       errors.push(`${at} type 只能是 text`)
+    }
+    if (block.role != null && (overlay || block.role !== 'system')) {
+      errors.push(`${at} role 只能是 system（环境注入）`)
     }
     for (const name of extractTemplateVars(block.text)) {
       if (!allowed.includes(name)) errors.push(`${at} 使用了未登记的占位符 {{${name}}}`)

@@ -185,15 +185,11 @@ export function createImportCommit(ctx) {
             const written = patchVmRecord(ctx.cfg.paths.project, vmId, {
               runtime: boot.runtime,
               status: 'running',
-              schedulable: true,
-              schedule_disabled_reason: null,
             })
             if (written) Object.assign(existing, written)
             else {
               existing.runtime = boot.runtime
               existing.status = 'running'
-              existing.schedulable = true
-              existing.schedule_disabled_reason = null
             }
             workerExec.vm = existing
           }
@@ -228,7 +224,7 @@ export function createImportCommit(ctx) {
             mode: importedCredential.mode || credentialModeFromOauth(oauth),
             type: importedCredential.type || importedCredential.mode,
           },
-          { acceptLiveGrant: true },
+          { acceptLiveGrant: true, operatorImport: true },
         )
         try {
           const accountId = importedCredential.account_uuid || existing.claude?.account_uuid || vmId

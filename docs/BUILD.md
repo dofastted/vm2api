@@ -2,8 +2,8 @@
 
 git 里只有源码。`bin/`、`web/dist`、`share/crag` 与 `share/wrap-cli` 里的 ELF / glibc 都不进 git：
 
-- `web/dist`、`kin-worker`、`kin-egress` 由源码编译（镜像构建内、CI 内或本机 `npm run build:*`）。
-- 闭源或预编译的槽位产物（`kin-kernel`、`kin-codex-kernel`、`kin-oauth-auth`、`cli-node`、`cc-node`、crag kernel、glibc 2.39 shim）放在独立的 payload Release，由 [`deploy/payload.json`](../deploy/payload.json) 按 sha256 / 大小钉住。`npm run fetch:payload` 下载并校验到 `bin/` / `share/`；镜像构建同样按清单下载，校验不过即失败。
+- `web/dist` 与 `kin-api-kernel` 由源码编译（镜像构建内或本机）。
+- 生产验证过的 linux amd64 产物（`kin-kernel`、`kin-codex-kernel`、`kin-oauth-auth`、`kin-computer`、`kin-worker`、`kin-egress`、`kin-slot-gate`、`cli-node`、`cc-node`、crag kernel、glibc 2.39 shim）放在独立的 payload Release，由 [`deploy/payload.json`](../deploy/payload.json) 按 sha256 / 大小钉住。`npm run fetch:payload` 下载并校验到 `bin/` / `share/`；镜像构建同样按清单下载，校验不过即失败。
 
 换 payload：把新文件放到本机对应路径，然后
 
@@ -35,7 +35,7 @@ git tag -a v1.2.22 -m "vm2api v1.2.22"
 git push origin v1.2.22
 ```
 
-`v*` tag 推上去之后，Actions 在 `ubuntu-latest` 编 Go linux amd64，按 `deploy/payload.json` 拉 payload，并把这些 ELF 一并挂到该 tag 的 Release（面板按版本 Release 的同名附件下载 kernel / CLI）：
+`v*` tag 推上去之后，Actions 按 `deploy/payload.json` 拉 payload（含 Go helper，不再从源码编译），并把这些 ELF 挂到该 tag 的 Release（面板按版本 Release 的同名附件下载 kernel / CLI）：
 
 | 文件 | 角色 |
 |---|---|
@@ -49,7 +49,7 @@ git push origin v1.2.22
 
 没有 tag、只点 workflow_dispatch 时，产物进 artifact，不会建 Release。
 
-控制面镜像（amd64 `Dockerfile` 与 `deploy/Dockerfile.arm64-control`）是多阶段构建：在镜像里编 `web/dist` 和 Go helper，按清单下载 payload。artifact 保留 7 天，正式 Release assets 不受此期限影响。
+控制面镜像（amd64 `Dockerfile` 与 `deploy/Dockerfile.arm64-control`）是多阶段构建：在镜像里编 `web/dist` 和 `kin-api-kernel`，amd64 的 Go helper 与 payload 按清单下载；ARM64 镜像的 Go helper 仍在镜像内从源码编译。artifact 保留 7 天，正式 Release assets 不受此期限影响。
 
 槽位 OS 镜像由 `.github/workflows/guest-images.yml` 独立发布：main 上 `docker/kin-os/`、`docker/kin-kvm/` 或该 workflow 有变化时触发，也可手动运行。四种系统并行构建，各用独立缓存；普通应用发版不再重复构建槽位 OS / KVM runner 镜像。
 
@@ -77,11 +77,8 @@ install -m 755 kin-kernel kin-egress kin-worker kin-codex-kernel kin-oauth-auth 
 npm ci
 pnpm -C web install --frozen-lockfile
 
-npm run fetch:payload     # bin/kin-{kernel,codex-kernel,oauth-auth}、share/wrap-cli、share/crag
-npm run build:egress      # bin/kin-egress
-npm run build:gate        # bin/kin-slot-gate（扩展节点直连通道）
+npm run fetch:payload     # bin/kin-{kernel,codex-kernel,oauth-auth,computer,worker,egress,slot-gate}、share/wrap-cli、share/crag
 npm run build:web         # web/dist
-npm run build:worker      # bin/kin-worker（telemetry）
 ```
 
 格式：和 CI 同一套，全文 LF。说明见 [FORMAT.md](FORMAT.md)。
@@ -91,7 +88,7 @@ npm run format
 npm run format:check
 ```
 
-对应命令：
+改 Go helper 时本机编译（会覆盖钉住的文件，`fetch:payload --check` 随之失败；要随版本发出，须按上文换 payload 重新钉）：
 
 ```bash
 CGO_ENABLED=0 go build -trimpath -o bin/kin-egress ./worker/cmd/kin-egress
@@ -114,7 +111,7 @@ npm run test:web          # 要先 pnpm -C web install
 node --check src/server.mjs
 ```
 
-CI（`.github/workflows/test.yml`）在 main push / PR 上运行，也可手动触发：Node 格式、源码及脚本语法与 unit（先拉 payload、编 `kin-egress`）；`worker/` 和 `api-kernel/` 的 gofmt、race test、vet 和命令编译；payload 清单校验与 linux amd64 ELF 检查；web 格式、测试、类型检查和构建。Node 22、Go 1.25、pnpm 10 与部署要求一致，依赖缓存分别以对应 lockfile / `go.sum` 为键。
+CI（`.github/workflows/test.yml`）在 main push / PR 上运行，也可手动触发，只有一个 job：Node 格式与语法、`worker/` / `api-kernel/` 的 gofmt；拉取并校验钉住的 payload；Node unit；Go vet 与 test；web 格式、测试与构建。基线是生产验证过的产物，CI 不做 ARM64、真链路 e2e 或历史升级回归。PR 的 run 会先合入 base 分支的最新提交（GitHub 的 `refs/pull/<n>/merge` 停在 PR 最后一次 push 时的 base，重跑也沿用），所以重跑即对着当前 main；main 的 ci 由红转绿时，`.github/workflows/pr-rerun.yml` 自动重跑最近一次 ci 失败的 open PR（非草稿、无冲突），也可手动触发。
 
 ## 升级一台已部署的机
 

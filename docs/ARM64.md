@@ -69,6 +69,20 @@ sudo bash /opt/vm2api/deploy/install.sh status
 （见下一节），然后拉取 `-arm64` 镜像。没有 ARM64 发布的旧版本会明确报错，
 不会回退到 amd64 镜像。`status` 显示宿主架构和当前镜像 tag。
 
+预构建镜像安装应使用 `docker-compose.yml`（及可选的 `docker-compose.override.yml` /
+自定义 overlay，**不要**含 `docker-compose.arm64.yml`）与
+`VM2API_IMAGE_TAG=vX.Y.Z-arm64`。若 `.env` 的 `COMPOSE_FILE` 仍含
+`docker-compose.arm64.yml`（例如先跑过 `deploy/init-arm64-env.py`），会叠加
+源码构建 override（默认镜像是 `vm2api-arm64-control:local`），而不是拉 ghcr
+的 `-arm64` 控制面。
+
+自 #746 起，**仅当执行新版** `deploy/install.sh`（`install` / `upgrade`）时，
+脚本会从 `COMPOSE_FILE` **去掉** `docker-compose.arm64.yml` 这一项，其它 overlay
+保留；若去掉后为空则写回 `docker-compose.yml`。**不会**为空的 `COMPOSE_FILE`
+写入默认值（避免 Compose 不再自动加载 `docker-compose.override.yml`）。
+**面板一键更新不会改 `.env`**；若仍用旧版 `install.sh` 升级，当次仍是旧逻辑，
+需再拉新版脚本执行一次 `upgrade`/`install`，或手动编辑 `COMPOSE_FILE`。
+
 ## 准备主机
 
 一键脚本会自动执行；源码构建时在仓库根目录手动执行：

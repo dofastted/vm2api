@@ -33,7 +33,8 @@ function isCatalogModelId(id) {
   if (s.endsWith('-') || s.endsWith('.')) return false
   if (/\.md$/i.test(s)) return false
   if (/^(gpt-[a-z0-9.-]+|codex-[a-z0-9.-]+)$/i.test(s)) return s.split(/[-.]/).length >= 2
-  if (!/^claude-(opus|sonnet|haiku|fable|3)[a-z0-9.-]*$/i.test(s)) return false
+  if (!/^claude-(opus|sonnet|haiku|fable|3)[a-z0-9.-]*$/i.test(s) && s !== 'auto') return false
+  if (s === 'auto') return true
   return s.split('-').length >= 3
 }
 
@@ -377,6 +378,21 @@ export function seedDefaultPolicy() {
       on_enabled: 'passthrough',
     },
     aliases: [FABLE_51_LEGACY_ID],
+  })
+
+  add('auto', {
+    display_name: 'Auto',
+    family: 'auto',
+    sort: 1,
+    capabilities: CAP_ADAPTIVE_ONLY,
+    betas: { pass_context_1m: false },
+    params: {
+      max_tokens_default: 128000,
+      max_tokens_cap: 128000,
+      on_adaptive: 'passthrough',
+      on_enabled: 'passthrough',
+    },
+    aliases: [],
   })
 
   return {
@@ -965,7 +981,9 @@ export function filterPublicModelIds(workerIds = []) {
     ),
   ]
 
-  if (mode === 'worker_only') return ids
+  if (mode === 'worker_only') {
+    return policy.models.auto?.enabled === false || ids.includes('auto') ? ids : [...ids, 'auto']
+  }
 
   // policy_only and legacy worker_intersect_policy: #/models is the catalog.
   return getPolicyCatalogIds({ enabledOnly: true })

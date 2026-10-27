@@ -120,7 +120,7 @@ test('concurrent initialization serializes migrations and checksums are enforced
   const opts = options()
   const [a, b] = await Promise.all([createDatabase(opts), createDatabase(opts)])
   dbs.push(a, b)
-  assert.equal((await a.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 22)
+  assert.equal((await a.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 23)
   await a.prepare("UPDATE schema_migrations SET checksum='invalid'").run()
   await assert.rejects(applyMigrations(b), /checksum mismatch/)
 })
@@ -136,7 +136,7 @@ test('failed migrations rollback DDL and migration records', async () => {
   }
   await assert.rejects(applyMigrations(db, { migrationsDir: dir }), /999_bad.sql failed/)
   assert.equal((await db.prepare('SELECT to_regclass($1) AS name').get(db.schema + '.partial_write')).name, null)
-  assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 22)
+  assert.equal((await db.prepare('SELECT count(*) AS n FROM schema_migrations').get()).n, 23)
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
@@ -189,4 +189,51 @@ test('maintenance drains transactions and rejects unrelated writes', async () =>
   await transaction
   await maintaining
   assert.equal((await db.prepare('SELECT count(*) AS n FROM settings').get()).n, 2)
+})
+
+test('migration 023 adds upstream image columns without changing old rows or migration checksums', async () => {
+  const src = new URL('../../src/lib/db/postgres-migrations/', import.meta.url)
+  const dir = fs.mkdtempSync('/tmp/vm2api-image-migration-')
+  let db
+  try {
+    for (const file of fs.readdirSync(src).filter((name) => name.endsWith('.sql') && name < '023')) {
+      fs.copyFileSync(new URL(file, src), path.join(dir, file))
+    }
+    db = await createDatabase({ ...options(), migrationsDir: dir })
+    dbs.push(db)
+    await db
+      .prepare(`
+      INSERT INTO usage_logs (id,request_id,created_at,model,input_tokens,cache_read_tokens,output_tokens,total_cost)
+      VALUES ('old','r-old','2026-10-01T00:00:00.000Z','gpt-6-luna',100,20,5,0.5)
+    `)
+      .run()
+    const checksums = await db.prepare('SELECT version, checksum FROM schema_migrations ORDER BY version').all()
+    const prompt =
+      'SELECT SUM(COALESCE(input_tokens,0) + COALESCE(cache_read_tokens,0) + COALESCE(cache_creation_tokens,0)) AS n FROM usage_logs'
+    const before = (await db.prepare(prompt).get()).n
+    assert.deepEqual(await applyMigrations(db), ['023_usage_logs_image_generation.sql'])
+    assert.deepEqual(
+      await db.prepare("SELECT version, checksum FROM schema_migrations WHERE version < '023' ORDER BY version").all(),
+      checksums,
+    )
+    assert.equal((await db.prepare(prompt).get()).n, before)
+    assert.deepEqual(
+      await db
+        .prepare(
+          "SELECT image_model,image_usage,image_input_tokens,image_output_tokens,image_cost,total_cost FROM usage_logs WHERE id = 'old'",
+        )
+        .get(),
+      {
+        image_model: null,
+        image_usage: null,
+        image_input_tokens: 0,
+        image_output_tokens: 0,
+        image_cost: null,
+        total_cost: 0.5,
+      },
+    )
+    assert.deepEqual(await applyMigrations(db), [])
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })

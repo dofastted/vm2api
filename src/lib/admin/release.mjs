@@ -44,7 +44,7 @@ export function readLocalVersion(root = projectRoot()) {
         if (ver) return normalizeVersion(ver) || '0.0.0'
         continue
       }
-      const ver = normalizeVersion(raw.trim())
+      const ver = raw.trim()
       if (ver) return ver
     } catch {
       // try next

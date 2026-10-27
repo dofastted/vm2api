@@ -22,7 +22,7 @@ async function seedUsers(db) {
 async function freshDb() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-stats-'))
   const db = await getDb()
-  await db.exec('TRUNCATE users, api_keys, vms, usage_logs, request_attempts')
+  await db.exec('TRUNCATE users, api_keys, claude_subscriptions, vms, usage_logs, request_attempts')
   await seedUsers(db)
   return db
 }
@@ -353,7 +353,7 @@ test('panel routes owner-scope statistics for users and reject user/vm groupings
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-stats-route-'))
   const db = await openDatabase({ dbPath: path.join(dir, 'panel.db') })
   try {
-    await db.exec('TRUNCATE users, api_keys, vms, usage_logs, request_attempts')
+    await db.exec('TRUNCATE users, api_keys, claude_subscriptions, vms, usage_logs, request_attempts')
     await seedUsers(db)
     const at = new Date(Date.now() - 1000).toISOString()
     await seed(db, [

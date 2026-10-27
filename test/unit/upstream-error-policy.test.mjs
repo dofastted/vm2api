@@ -808,3 +808,46 @@ test('signatureRepair=false leaves the other 400 repairs alone', () => {
   assert.equal(policy.reason, 'search_repairable')
   assert.equal(policy.action, 'repair-and-retry')
 })
+
+test('org OAuth refusal pauses the seat and hops instead of returning the 403', () => {
+  const message = 'OAuth authentication is currently not allowed for this organization.'
+  const policy = classifyUpstreamResult(
+    { status: 403, terminalState: 'rejected', body: { error: { type: 'permission_error', message } } },
+    { model: 'claude-opus-test' },
+  )
+  assert.equal(policy.reason, 'organization_disabled')
+  assert.equal(policy.scope, 'account')
+  assert.equal(policy.action, 'continue')
+  assert.equal(policy.cooldownUntil, null)
+  assert.equal(policy.retrySameAccount, false)
+  assert.equal(policy.pauseSchedule, true)
+  assert.deepEqual(policy.detail, { status: 403, message })
+  assert.equal(policy.decision.action, 'next_unit')
+  assert.equal(shouldContinue(policy), true)
+})
+
+test('org refusal after downstream commit still pauses but stops the request', () => {
+  const policy = classifyUpstreamResult({
+    status: 403,
+    committed: true,
+    body: {
+      error: {
+        type: 'permission_error',
+        message: 'OAuth authentication is currently not allowed for this organization.',
+      },
+    },
+  })
+  assert.equal(policy.reason, 'organization_disabled')
+  assert.equal(policy.pauseSchedule, true)
+  assert.equal(shouldContinue(policy), false)
+})
+
+test('disabled organization 400 is an org pause, not an invalid request', () => {
+  const policy = classifyUpstreamResult({
+    status: 400,
+    body: { error: { type: 'invalid_request_error', message: 'This organization has been disabled.' } },
+  })
+  assert.equal(policy.reason, 'organization_disabled')
+  assert.equal(policy.pauseSchedule, true)
+  assert.equal(shouldContinue(policy), true)
+})

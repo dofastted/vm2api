@@ -115,7 +115,10 @@ run_ssh() {
   fi
 }
 
-if ! run_ssh "$@"; then
+# Capture $? in the else branch: `if ! cmd` makes $? always 0 in then (inverted test status).
+if run_ssh "$@"; then
+  exit 0
+else
   st=$?
   if [ "$st" -eq 255 ] || [ "$st" -eq 124 ]; then
     echo "guest ssh unavailable" >&2

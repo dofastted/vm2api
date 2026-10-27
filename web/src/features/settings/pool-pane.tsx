@@ -434,7 +434,6 @@ export function PoolPane({
     Math.max(1, numOf(inference, 'session_slots', SEAT_CAP_MAX))
   )
   const queueMax = numOf(pool, 'queue_max', POOL_DEFAULTS.queue_max)
-  const grace = numOf(pool, 'seat_grace_ms', POOL_DEFAULTS.seat_grace_ms)
   const reservePct =
     Math.round(
       numOf(
@@ -501,7 +500,6 @@ export function PoolPane({
     if (open === 'strategy') {
       onPoolChange({
         strategy: poolDraft.strategy,
-        manual_schedule_wins: poolDraft.manual_schedule_wins,
       })
     } else if (open === 'seats') {
       onInferenceChange({ session_slots: inferenceDraft.session_slots })
@@ -570,7 +568,7 @@ export function PoolPane({
           icon={Layers}
           title='分配策略'
           value={strategy === 'fill' ? '填充' : '平衡'}
-          desc='Claude 新设备开席的优先顺序'
+          desc='Claude 新 session 开席的优先顺序'
           pending={pending}
           disabled={saving}
           buttonRef={(node) => {
@@ -582,7 +580,7 @@ export function PoolPane({
           icon={Armchair}
           title='席位容量'
           value={`${seatCap} 席 / VM`}
-          desc={`宽限 ${fmtDuration(grace)} · 预算预留 ${reservePct}%`}
+          desc={`对话结束即释放 · 预算预留 ${reservePct}%`}
           pending={pending}
           disabled={saving}
           buttonRef={(node) => {
@@ -666,21 +664,6 @@ export function PoolPane({
                   value={poolDraft.strategy === 'fill' ? 'fill' : 'balanced'}
                   onChange={(next) => updateDraft('pool', { strategy: next })}
                 />
-                <div className='flex items-center justify-between gap-4 rounded-md border px-3 py-2.5'>
-                  <div>
-                    <Label htmlFor='pool-manual-wins'>手动开关优先</Label>
-                    <p className='text-xs leading-5 text-muted-foreground'>
-                      保留运维手动调度状态。
-                    </p>
-                  </div>
-                  <Switch
-                    id='pool-manual-wins'
-                    checked={poolDraft.manual_schedule_wins !== false}
-                    onCheckedChange={(value) =>
-                      updateDraft('pool', { manual_schedule_wins: value })
-                    }
-                  />
-                </div>
               </>
             ) : null}
             {open === 'seats' ? (
@@ -720,7 +703,7 @@ export function PoolPane({
                 </div>
                 <SliderSetting
                   id='pool-seat-grace'
-                  label='席位宽限'
+                  label='旧席位宽限（不再释放槽位）'
                   value={numOf(
                     poolDraft,
                     'seat_grace_ms',

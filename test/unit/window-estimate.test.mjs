@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { estimateWindow, usedRatioOf } from '../../src/lib/admin/window-estimate.mjs'
+import { estimateWindow, projectWindowRemaining, usedRatioOf } from '../../src/lib/admin/window-estimate.mjs'
 
 const now = Date.parse('2026-10-14T12:00:00Z')
 const base = {
@@ -60,4 +60,28 @@ test('unpriced calls in the window understate spend, so no estimate', () => {
 
 test('used% moved with no gateway spend means usage happened outside the logs', () => {
   assert.equal(estimateWindow({ ...base, spentUsd: 0 }).status, 'log_gap')
+})
+
+test('projection: live estimate wins when it has a number', () => {
+  const live = estimateWindow(base)
+  const out = projectWindowRemaining({ live, closed: { used_ratio: 0.5, total_cost: 100 }, spentUsd: 12 })
+  assert.deepEqual(out, { source: 'current', total_usd: 30, remaining_usd: 18 })
+})
+
+test('projection: a fresh window falls back to last window spend ÷ final used%', () => {
+  const live = estimateWindow({ ...base, usedRatio: 0.02 })
+  assert.equal(live.status, 'low_usage')
+  const closed = { start: '2026-10-14T05:00:00Z', used_ratio: 0.8, total_cost: 40, unpriced: 0 }
+  const out = projectWindowRemaining({ live, closed, spentUsd: 1, coveredSince: base.coveredSince })
+  assert.deepEqual(out, { source: 'previous', total_usd: 50, remaining_usd: 49 })
+})
+
+test('projection: no number when the last window is thin, unpriced or not fully logged', () => {
+  const closed = { start: '2026-10-14T05:00:00Z', used_ratio: 0.8, total_cost: 40, unpriced: 0 }
+  const coveredSince = base.coveredSince
+  const none = { source: null, total_usd: null, remaining_usd: null }
+  assert.deepEqual(projectWindowRemaining({ closed: { ...closed, used_ratio: 0.03 }, coveredSince }), none)
+  assert.deepEqual(projectWindowRemaining({ closed: { ...closed, unpriced: 2 }, coveredSince }), none)
+  assert.deepEqual(projectWindowRemaining({ closed, coveredSince: '2026-10-14T06:00:00Z' }), none)
+  assert.deepEqual(projectWindowRemaining({ closed: null, coveredSince }), none)
 })

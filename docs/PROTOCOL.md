@@ -30,11 +30,11 @@
 | `persona_park` | `false` | 与 `overlay_preset=off` 对齐 |
 | `cache_ttl` | `1h` | Node 重写时新增点的缺省 TTL；`x-kin-cache-ttl` 参与首次会话选择，不覆盖 native 透传 caller / 模板显式 TTL |
 
-**official 模板**保留 billing + Agent SDK identity + 可选 caller_agent / caller_system，并在 agent 块之后写槽位 `# Environment`（`{{env}}`，只含 `Timezone: <槽位时区>`，不挂 cache，不破 agent 块的 1h global 缓存）；不会自动追加完整 agent prompt。
+**official / official_full 模板**统一采用 2.1.303 OAuth 抓包中的 harness + guidance；顶层 `system` 只装提示词与调用方 `caller_system`。Environment 放入 `messages[].role=system`，不打缓存点，不混入顶层提示词。身份和 billing 入口跟随 `cc_entrypoint`。所有档位均使用 2.1.303，不再提供单独的 `official_303` 选项；旧值读写时归一为 `official_full`，旧开关和模板迁移到完整版，已有明确的完整版配置优先。
 
-**official_full 模板**在相同前缀后固定追加完整 `agent_official`，带 ephemeral 1h cache；调用方 system 作为末块追加。
+**official_full 环境扩展**额外提供抓包中的工具 / agent / MCP / skills 长说明（`{{env_instructions_303}}`），默认不加载，可开启、改写或整块移除。抓包样本仅为文字，不会创建对应工具能力，启用前须按实际客户端修改。个人目录、实时日期与剩余 token 不固化到该长说明。模型附加句也写入环境区域。时区和语言通过 `{{env_timezone}}` / `{{env_locale}}` 独立按需加载，默认关闭。
 
-**zero 模板**在 agent 槽之后写 `{{env}}` 块（`hide`、`drop_if_empty`、不挂 cache），只含槽位时区。自定义档空模板回落 official，同样带 `{{env}}`。live 已自定义的 zero 模板不会自动多出这一块，需在 system提示词页「恢复预设」。
+**zero 模板**仅保留 billing，不自动追加环境。自定义档空模板回落 official；已保存的自定义模板不被默认模板覆盖。模板块可用元数据 `role: "system"` 指定环境区域，未指定时进入顶层 `system`；该元数据不会出站。
 
 **agent prompt 常驻约束**：默认不启用。`compatibility.agent_standing` 仍保留内置 distillation / 思维链 / NSFW 四行文本（显式空串 = 不加，上限 2000 字符），只有当前档的 `agent_standing_presets` 显式为 `true` 才经 `{{agent_standing}}` 写成 agent 块第一段：official / 0注入 在 `caller_agent` 之前，official_full 在 `agent_official` 之前（同一块）。关掉后 0注入 无调用方 agent 时回到零宽占位；已有显式开启的配置不被覆盖。
 
@@ -42,6 +42,8 @@
 - `agent_standing_presets`：是否写常驻约束，缺 map 或缺 key 视为关。控制台开关、预览与 Node 出站使用同一缺省语义。
 - `agent_standing_hide_presets`：常驻约束是否从客户端 usage 中扣除，缺 map/key 视为开，独立于整档遮罩；未启用约束时不扣约束 token。cli-hop 0注入 同样生效。
 - `persona_env_presets`：是否写生成的 `{{env}}` / `{{env_timezone_only}}` / `{{env_official}}` 及槽位 `{{timezone}}`，缺 map/key 视为开。关闭时删除生成的整个环境块（含官方完整档 continuation 环境块），不留下带 cache 的零宽环境占位；调用方或自定义模板字面写入的 Environment / 时区保留，不用槽位时区覆盖。控制台预览与最终出站一致，各档独立。
+- `persona_env_instructions_presets`：完整版长环境说明，缺 map/key 视为关。
+- `persona_timezone_presets` / `persona_locale_presets`：独立加载槽位时区 / locale，缺 map/key 视为关。`persona_env_presets=false` 同时停用所有生成的环境消息，包括模型附加句；调用方已有 `role=system` 原文保留。
 - `persona_hide_presets`：整档 usage 遮罩（billing / identity / agent / Environment 等 `hide:true` 块）。缺 key 时依次回落旧全局 `persona_hides`、该档模板的 `hide` 标记（默认 zero 开、其余关）。槽位单独指定人设时读该槽位档的开关；cli-hop 0注入 关掉后 CLI billing + Environment 计入 usage。
 
 native cli-hop 优先完整保留 Node 已组装、带 billing 的 wire system，不在后面重加槽内 Environment。Node 关闭当前档 Environment 时，CLI 预处理保留调用方环境原文，HTTP 出站也跳过槽位时区刷新；没有调用方环境就不发送 Environment 块。启用时沿用原有槽位环境规则。调用方真正的 `You are an agent for Claude Code...` 和 `Notes:` 不会被当作自产内容删除。无 Node billed wire system 的独立 CLI fallback 仍沿用自己的布局，不在本次修改范围；槽位必须使用支持 wire-system 保留的 CLI 产物，旧 ELF 不会因修改控制面配置而自动更新。
@@ -79,14 +81,17 @@ Go worker JSON 透传，不必因人设重建 worker。
 ## beta 与 1M
 
 - 存盘的 `kin-cc-headers.json` **只**留 `anthropic-version` / `anthropic-beta`。UA、stainless、session、accept-language 只出槽位指纹 + 代码 pin。
-- 出站 UA 锁 `claude-cli/2.1.293 (external, sdk-cli)`。Stainless 仍是 `js` / `Linux` / `x64` / `node` / `v26.3.0` / `0.112.1`，`retry-count=0`，`timeout=600`。
+- 出站 UA 使用 `claude-cli/<当前档版本> (external, <CLAUDE_CODE_ENTRYPOINT>)`，缺省 `cli`；kernel 启动的 Agent SDK CLI 槽设置为 `sdk-cli`。Stainless 是 `js` / `Linux` / `x64` / `node` / `v26.3.0` / `0.128.0`，`retry-count=0`；CLI 把配置的毫秒 timeout 转为秒写入头（缺省 `600`）。CCH 是 billing body 参数，不属于 UA。
+- cli-node SDK 请求显式带 `Accept: application/json, text/event-stream`、`Accept-Encoding: gzip, br`。`Content-Length` 在 CCH 密封和最终序列化之后按 UTF-8 字节数设置；不是响应长度，不能拿它填写 SSE 响应。该补齐构建尚未进 payload，不能据代码或 envelope 推断运行中的 CLI 已发送这些头。
+- 新 CLI 在最终 `fetch` 调用前，经任务隔离的内部事件回传请求头。debug 日志的 `outbound_headers_source=cli_final` 时，`outbound_headers` 才是此处采集的实际值；凭证及未列入公开清单的自定义头值在离开 CLI 前脱敏。此值不含底层 HTTP 实现后加的 Host / HTTP/2 伪头，不是 TLS 抓包。内部事件不下发调用方、不计作首 token 或启动上游 idle 计时；重试记录最后一次采集结果。
+- Node → worker 的头另存 `worker_envelope_headers`。旧 CLI 无回传或该次尝试尚未发送时，最终头为 null、source 为 `unavailable`，不回退成 envelope。旧日志缺少 source，保留原值但不标为最终值。`outbound_body` 仍是 worker envelope 的请求体，未改为 CLI 最终序列化字节；需同时升级 Node / web / cli-node，kernel 已有的通道无需修改。
 - 非官方裸模型 **不注入、不重放** `context-1m-2025-08-07`。入站末尾 `[1m]`（如 `claude-sonnet-5[1m]`）在矩阵允许时注入该 beta（官方/非官方都算）。
 - 官方 CC：矩阵 `betas.pass_context_1m` 决定透传/剥离；未入库时回退 `defaults.context_1m_whitelist`（seed：`sonnet-5*`）。同一 `[1m]` 后缀在允许时也会注入。
 - 出站 `model` 去掉 `[1m]` 后缀。
 - 缺 `context-management` beta 时剥掉 body 同名字段。
 - 缺 beta 时不带对应高级字段；短 beta 按 mimicry 集合补齐（官方路径）。
 
-模型目录权威是面板 `model_policy`（`GET/PUT /api/panel/model-policy`）。`GET /v1/models` 与 `validateOfficialModel` 读这份集合，**禁止** hop 槽位 `/internal/v1/models`。`GET /v1/models` 只列出该 key 的 `group_type` 能调度的模型：`openai` 只列 GPT，`anthropic` 只列 Claude，`all` 与 master 两者都列。
+模型目录权威是面板 `model_policy`（`GET/PUT /api/panel/model-policy`）。`GET /v1/models` 与 `validateOfficialModel` 读这份集合，**禁止** hop 槽位 `/internal/v1/models`。`GET /v1/models` 只列出该 key 的 `group_type` 能调度的模型：`openai` 只列 GPT，`anthropic` 只列 Claude，`all` 与 master 两者都列。固定策略模型 `auto` 不属于 worker 抓到的 Claude 目录：`policy_only` 与 `worker_intersect_policy` 在它启用时列出；`worker_only` 即使 worker 列表没有它，也会追加已启用的 `auto`。策略里停用后，三种模式都不列出。请求里的 `model: "auto"` 原样通过校验和出站，不改写成具体 Claude 模型。
 
 ## web_search
 

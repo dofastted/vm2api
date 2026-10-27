@@ -23,6 +23,12 @@ export function cchEnabledFromCompat(
 ): boolean {
   return compat?.cch_enabled !== false
 }
+/** `routing.compatibility.cc_entrypoint`：只有显式 cli 离开 sdk-cli。 */
+export function ccEntrypointFromCompat(
+  compat: Record<string, unknown> | undefined
+): 'sdk-cli' | 'cli' {
+  return compat?.cc_entrypoint === 'cli' ? 'cli' : 'sdk-cli'
+}
 
 /** `routing.compatibility.thinking_display`：缺省 summarized，显式 passthrough 才关。 */
 export function thinkingDisplayFromCompat(

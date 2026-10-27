@@ -458,6 +458,7 @@ export class FailoverRunner {
     onCredentialFailure = null,
     onFablePlanDenied = null,
     onFableSuccess = null,
+    onSchedulePause = null,
   } = {}) {
     this.scheduler = scheduler
     this.stickyRouter = stickyRouter
@@ -468,6 +469,7 @@ export class FailoverRunner {
     this.onCredentialFailure = onCredentialFailure
     this.onFablePlanDenied = onFablePlanDenied
     this.onFableSuccess = onFableSuccess
+    this.onSchedulePause = onSchedulePause
     this.sessionTails = new Map()
     this.sessionTurns = sessionTurns
     this.sharedSessions = isKubernetesMode()
@@ -597,6 +599,16 @@ export class FailoverRunner {
     if (typeof this.onCredentialFailure === 'function') {
       try {
         await this.onCredentialFailure({ selected, policy })
+      } catch {}
+    }
+  }
+
+  /** Upstream refused this seat outright: move its conversations off and park it for the operator. */
+  pauseUnit(selected, policy, result) {
+    this.scheduler.releaseAccountSessions?.({ accountId: selected?.accountId, vmId: selected?.vmId })
+    if (typeof this.onSchedulePause === 'function') {
+      try {
+        this.onSchedulePause({ selected, policy, result })
       } catch {}
     }
   }
@@ -761,13 +773,17 @@ export class FailoverRunner {
             continue
           }
           const prev = this.stickyRouter.resolve?.(key)
-          // A live pin on another account means this request only borrowed
-          // capacity. Rewriting it would move the whole session off its home.
-          if (prev?.accountId && prev.accountId !== account.accountId) continue
+          const ownMove =
+            !!outboundSessionAccountId &&
+            prev?.accountId === outboundSessionAccountId &&
+            prev.accountId !== account.accountId &&
+            opts?.borrowed !== true
+          if (prev?.accountId && prev.accountId !== account.accountId && !ownMove) continue
           let guard = opts
           if (this.stickyRouter.shared) guard = { ...opts, ifGeneration: pinVersions.get(key) }
           else if (prev) guard = { ...opts, ifGeneration: prev.generation || 0 }
           if (freshSlot || opts?.replaceSession) guard = { ...guard, replaceSession: true }
+          if (ownMove) guard = { ...guard, allowMove: true }
           const bound = await (this.stickyRouter.shared ? this.stickyRouter.bindShared : this.stickyRouter.bind).call(
             this.stickyRouter,
             key,
@@ -823,6 +839,28 @@ export class FailoverRunner {
       return accepted
     }
     const stickyConflict = () => poolError('sticky_binding_conflict', 'Conversation binding changed before execution')
+    // The dialog ended. Drop the persisted slot index so a restart does not
+    // put this session back into session_slots. VM / account memory and its
+    // original sticky expiry stay.
+    const releaseStickySlots = async () => {
+      if (!this.stickyRouter?.bind) return
+      for (const key of bindKeys) {
+        if (pinMoved(key)) continue
+        const prev = this.stickyRouter.resolve?.(key)
+        if (!prev?.vmId || prev.slotIndex == null) continue
+        await (this.stickyRouter.shared ? this.stickyRouter.bindShared : this.stickyRouter.bind).call(
+          this.stickyRouter,
+          key,
+          {
+            accountId: prev.accountId,
+            vmId: prev.vmId,
+            sessionId: prev.sessionId || outboundSessionId || '',
+          },
+          { countHit: false, ifGeneration: prev.generation || 0, clearSlot: true, keepExpiry: true },
+        )
+        pinBaseline.set(key, this.stickyRouter.resolve?.(key) || null)
+      }
+    }
     let lastResult = null
     let lastPolicy = null
     let repaired = false
@@ -873,6 +911,7 @@ export class FailoverRunner {
           pinVmId,
           familyVmId,
           deviceVmId: currentDeviceVmId,
+          deviceKey,
           skipSessionSlot: skipSessionSeat,
           ownerScope,
           keyScope,
@@ -906,6 +945,7 @@ export class FailoverRunner {
         }
         throw error
       }
+      let keepStickySlot = false
       try {
         if (selected?.familyGated && familyKey && familyVmId) {
           // The family home left the pool (quota, credential): the family moves
@@ -944,7 +984,7 @@ export class FailoverRunner {
         if (
           !(await bindAll(
             { accountId: selected.accountId, vmId: selected.vmId, slotIndex: pinnedSlot },
-            { countHit: false },
+            { countHit: false, borrowed: lastPolicy?.reason === 'slot_busy' },
             { required: true },
           ))
         )
@@ -1030,6 +1070,7 @@ export class FailoverRunner {
           if (selected.bindExecution && (!executionEnded || result?.executionUncertain)) {
             await selected.markUncertain()
             unknownExecution = true
+            keepStickySlot = true
             if (result) result.executionUncertain = true
           }
           noteHop(result)
@@ -1078,6 +1119,16 @@ export class FailoverRunner {
           lastResult = result
           lastPolicy = policy
           await this.noteUnitHealth(selected, policy, result)
+          if (!unknownExecution && attemptMeta?.sessionId) {
+            await bindAll(
+              { accountId: selected.accountId, vmId: selected.vmId, sessionId: outboundSessionId },
+              {
+                countHit: false,
+                borrowed: policy?.reason === 'slot_busy',
+                replaceSession: !!attemptStickyBound?.vmId && attemptStickyBound.vmId !== selected.vmId,
+              },
+            )
+          }
           await notifyProxyFailure(this.onProxyFailure, selected, policy)
           if (policy.reason === 'fable_plan_denied' && typeof this.onFablePlanDenied === 'function') {
             try {
@@ -1154,6 +1205,7 @@ export class FailoverRunner {
             diagnosticPin: !!pinVmId,
             observation: result?.accountObservation,
           })
+          if (policy.pauseSchedule) await this.pauseUnit(selected, policy, result)
           if (cooldownApplied !== false && !pinVmId && isCredentialDeath(policy)) {
             await this.forgetCredential(selected, policy, { familyKey, sessionKeys: bindKeys, versions: pinVersions })
             if (familyKey) {
@@ -1188,6 +1240,7 @@ export class FailoverRunner {
           if (error?.executionUncertain === true && selected.bindExecution) {
             if (!unknownExecution) await selected.markUncertain()
             unknownExecution = true
+            keepStickySlot = true
           }
           // A submitted job can outlive its transport. Never replay it or free
           // its shared capacity without proof that the execution ended.
@@ -1195,6 +1248,7 @@ export class FailoverRunner {
             if (executionEnded) throw error
             if (!unknownExecution) await selected.markUncertain()
             unknownExecution = true
+            keepStickySlot = true
           }
           const invalidCache = error?.status === 400 && error.body?.error?.code === 'invalid_cache_control'
           noteHop(invalidCache ? { upstreamExecutions: 0 } : null)
@@ -1325,7 +1379,8 @@ export class FailoverRunner {
           budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
         }
       } finally {
-        await selected?.release?.()
+        const released = await selected?.release?.()
+        if (!keepStickySlot && released?.released !== false && released?.uncertain !== true) await releaseStickySlots()
       }
     }
   }

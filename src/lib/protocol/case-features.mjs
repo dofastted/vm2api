@@ -102,6 +102,7 @@ export function officialSystemKinds(system) {
     if (/x-anthropic-billing-header:/i.test(text)) return 'billing'
     if (index === 1 && /^[\u200b\u200c\u200d\ufeff\s]*$/.test(text)) return 'identity'
     if (/You are a Claude agent, built on Anthropic's Claude Agent SDK/.test(text)) return 'identity'
+    if (text.trim() === "You are Claude Code, Anthropic's official CLI for Claude.") return 'identity'
     if (
       /# Doing tasks|# Tone and style/.test(text) ||
       /You are an interactive agent that helps users with software engineering tasks/.test(text) ||

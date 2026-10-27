@@ -16,6 +16,9 @@ export type VmActions = {
   /** 未提供时菜单不渲染对应项。 */
   reset?: (vm: Vm) => void
   remove?: (vm: Vm) => void
+  /** 设为全局活跃槽（`POST …/activate`）。 */
+  activate?: (vm: Vm) => void
+  activatingId?: string | null
   /** admin：打开分配租户对话框 / 收回确认。 */
   openAssignOwner?: (vm: Vm) => void
   reclaimOwner?: (vm: Vm) => void

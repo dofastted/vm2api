@@ -160,7 +160,7 @@ test('zero inject hides billing and env, not leftover', () => {
   const hide = personaHideInputTokens(before, after)
   const billing = String(after.system[0].text || '')
   assert.ok(billing.startsWith('x-anthropic-billing-header:'))
-  assert.match(billing, /prompt_version=<You are Anthropic Claude Agent SDK\.>/)
+  assert.match(billing, /prompt_version=<You are Claude Code, Anthropic's official CLI for Claude\.>/)
   assert.equal(after.system.length, 5)
   assert.equal(after.system[1].text, '\u200b')
   assert.equal(after.system[2].text, '\u200b')

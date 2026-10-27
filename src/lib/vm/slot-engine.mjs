@@ -6,14 +6,18 @@
  * rust 下 official_cc inference 强制 cli-hop。
  * Setup Token 换票走 sessionKey/PKCE 脚本，不启 claude setup-token PTY；
  * 推理仍跟槽位 engine：配 rust 就 cli-hop。
- * persona_preset official|official_full|zero on a VM overrides the global protocol;
+ * persona_preset official|official_full|zero|official_303 on a VM overrides the global protocol;
  * empty inherits routing.compatibility.persona_preset.
  */
-import { normalizePersonaPreset, personaPresetFromLegacyMode } from '../identity/persona-template.mjs'
+import {
+  normalizePersonaPreset,
+  OFFICIAL_303_PRESET,
+  personaPresetFromLegacyMode,
+} from '../identity/persona-template.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 
 export const INFERENCE_ENGINES = Object.freeze(['rust'])
-export const SLOT_PERSONA_PRESETS = Object.freeze(['official', 'official_full', 'zero'])
+export const SLOT_PERSONA_PRESETS = Object.freeze(['official', 'official_full', 'zero', OFFICIAL_303_PRESET])
 export const OFFICIAL_CC_INFERENCES = Object.freeze(['http', 'cli-hop'])
 export const KERNEL_DATAPLANES = Object.freeze(['wrap', 'cc', 'crag'])
 export const CONTAINER_CLI_NODE_BIN = '/home/kincli/.kin/cli-node'
@@ -97,6 +101,7 @@ export function normalizeSlotPersonaPreset(value, { inherit = false } = {}) {
   )
     return 'official'
   if (raw === 'zero' || raw === 'zero_inject' || raw === '0inject' || raw === '0-inject') return 'zero'
+  if (raw === OFFICIAL_303_PRESET || raw === '303' || raw === 'official-303') return OFFICIAL_303_PRESET
   return inherit ? '' : null
 }
 
@@ -225,10 +230,11 @@ export function personaModeFromPreset(preset) {
   if (preset === 'zero') return 'zero'
   if (preset === 'official') return 'official_prompt'
   if (preset === 'official_full') return 'official_full'
+  if (preset === OFFICIAL_303_PRESET) return OFFICIAL_303_PRESET
   return null
 }
 
-/** Wrap CLI layout follows the resolved persona preset. zero stays zero; official / custom → identity. */
+/** zero stays zero. Other presets stay identity; the CLI preserves a 303-shaped system there. */
 export function resolveCliSystemLayout(vm, routing = {}) {
   const preset = resolveSlotPersonaPreset(vm, routing)
   if (preset === 'zero') return 'zero'
@@ -265,22 +271,9 @@ export function parseSlotPersonaPresetPatch(value) {
   if (!raw || raw === 'inherit' || raw === 'global' || raw === 'default') {
     return { ok: true, value: '' }
   }
-  if (raw === 'official_full' || raw === 'full' || raw === 'agent_official') {
-    return { ok: true, value: 'official_full' }
-  }
-  if (
-    raw === 'official' ||
-    raw === 'official_prompt' ||
-    raw === 'prompt' ||
-    raw === 'agent_prompt' ||
-    raw === 'cc_prompt'
-  ) {
-    return { ok: true, value: 'official' }
-  }
-  if (raw === 'zero' || raw === 'zero_inject' || raw === '0inject' || raw === '0-inject') {
-    return { ok: true, value: 'zero' }
-  }
-  return { ok: false, error: 'persona_preset must be official, official_full, zero, or empty' }
+  const preset = normalizeSlotPersonaPreset(raw)
+  if (preset) return { ok: true, value: preset }
+  return { ok: false, error: 'persona_preset must be official, official_full, zero, official_303, or empty' }
 }
 
 export function parseSlotEnginePolicyPatch(body = {}) {

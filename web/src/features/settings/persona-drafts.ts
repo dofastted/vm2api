@@ -40,6 +40,7 @@ export function seedPersonaDrafts(compat: Compat): PersonaDrafts {
     official_full: seedText(stored, DEFAULT_PERSONA_TEMPLATES, 'official_full'),
     zero: seedText(stored, DEFAULT_PERSONA_TEMPLATES, 'zero'),
     custom: seedText(stored, DEFAULT_PERSONA_TEMPLATES, 'custom'),
+    official_303: seedText(stored, DEFAULT_PERSONA_TEMPLATES, 'official_303'),
   }
 }
 

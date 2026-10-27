@@ -14,7 +14,6 @@ const PROTOCOLS = [
   { path: '/v1/chat/completions', spec: 'OpenAI Chat' },
   { path: '/v1/responses', spec: 'OpenAI Responses' },
   { path: '/v1/models', spec: '模型目录' },
-  { path: '/v1/messages/count_tokens', spec: '计 token' },
   { path: 'SSE 流式', spec: '逐字转发' },
 ] as const
 

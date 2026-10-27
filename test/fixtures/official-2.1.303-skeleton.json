@@ -1,0 +1,91 @@
+{
+  "top_level": [
+    "model",
+    "messages",
+    "system",
+    "tools",
+    "metadata",
+    "max_tokens",
+    "thinking",
+    "output_config",
+    "stream"
+  ],
+  "model": "claude-opus-5-5",
+  "system": [
+    {
+      "type": "text",
+      "kind": "identity",
+      "len": 57,
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    },
+    {
+      "type": "text",
+      "kind": "main",
+      "len": 5885,
+      "cache_control": {
+        "type": "ephemeral"
+      }
+    }
+  ],
+  "billing_fields": null,
+  "messages": [
+    {
+      "role": "user",
+      "content": "array",
+      "blocks": [
+        {
+          "type": "text",
+          "kind": "reminder",
+          "len": 6107
+        },
+        {
+          "type": "text",
+          "kind": "text",
+          "len": 5,
+          "cache_control": {
+            "type": "ephemeral"
+          }
+        }
+      ]
+    },
+    {
+      "role": "system",
+      "content": "string",
+      "kind": "env",
+      "len": 17023
+    }
+  ],
+  "tools": {
+    "count": 28,
+    "markers": 0
+  },
+  "metadata_keys": [
+    "user_id"
+  ],
+  "thinking": {
+    "type": "adaptive"
+  },
+  "output_config_keys": [
+    "effort"
+  ],
+  "stream": true,
+  "markers": {
+    "total": 3,
+    "at": [
+      {
+        "where": "system[0]",
+        "ttl": "5m"
+      },
+      {
+        "where": "system[1]",
+        "ttl": "5m"
+      },
+      {
+        "where": "messages[0].content[1]",
+        "ttl": "5m"
+      }
+    ]
+  }
+}

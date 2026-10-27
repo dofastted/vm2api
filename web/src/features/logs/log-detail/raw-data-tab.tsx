@@ -44,8 +44,26 @@ function sections(item: RequestLogItem): Section[] {
     { id: 'outbound_body', label: '出站请求体', value: item.outbound_body },
     {
       id: 'outbound_headers',
-      label: '出站请求头',
-      value: item.outbound_headers,
+      label:
+        item.outbound_headers_source === 'cli_final'
+          ? '最终出站请求头'
+          : '出站请求头',
+      value:
+        item.outbound_headers_source === 'unavailable'
+          ? '未获取到最终出站请求头（运行中的 CLI 尚不支持回传，或请求尚未发送）。'
+          : item.outbound_headers,
+      note:
+        item.outbound_headers_source === 'cli_final'
+          ? 'CLI 完成请求头组装及 CCH 密封后、调用 fetch 前采集；凭证已脱敏。'
+          : item.outbound_headers_source == null &&
+              present(item.outbound_headers)
+            ? '历史记录未标注采集位置，不能确认是最终出站值。'
+            : undefined,
+    },
+    {
+      id: 'worker_envelope_headers',
+      label: '槽位入站请求头（中间值）',
+      value: item.worker_envelope_headers,
     },
     {
       id: 'response_body',

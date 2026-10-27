@@ -1283,8 +1283,8 @@ export class ProxyPool extends EventEmitter {
   }
 
   /**
-   * TCP connect probe to host:port (SOCKS5 handshake optional lightweight).
-   * Full SOCKS5 auth handshake is best-effort.
+   * SOCKS5 method-selection probe. TCP connect alone is not healthy:
+   * an HTTP port that accepts the socket and never answers 0x05 is a failure.
    */
   async probeOne(proxy) {
     const blocked = proxyBlockedReason(proxy, this.state.config.ipv6_enabled)
@@ -1346,6 +1346,8 @@ export class ProxyPool extends EventEmitter {
       this._probeSockets.set(socket, proxy)
       let done = false
       let connected = false
+      let greeted = false
+      let buf = Buffer.alloc(0)
       const finish = (ok, error) => {
         if (done) return
         done = true
@@ -1373,25 +1375,26 @@ export class ProxyPool extends EventEmitter {
         socket.write(Buffer.from([0x05, 0x02, 0x00, 0x02]))
       })
       socket.on('data', (data) => {
-        if (data.length >= 2 && data[0] === 0x05) {
-          if (data[1] === 0x00 || data[1] === 0x02) {
-            finish(true, null)
-            return
-          }
-          if (data[1] === 0xff) {
-            finish(true, null)
-            return
-          }
+        buf = Buffer.concat([buf, data])
+        if (buf.length < 2) return
+        greeted = true
+        if (buf[0] !== 0x05) {
+          finish(false, 'not_socks5：请填写 SOCKS5 端口')
+          return
         }
-        finish(true, null)
+        if (buf[1] === 0x00 || buf[1] === 0x02 || buf[1] === 0xff) {
+          finish(true, null)
+          return
+        }
+        finish(false, 'not_socks5：请填写 SOCKS5 端口')
       })
-      socket.on('timeout', () => finish(connected, connected ? null : 'timeout'))
+      socket.on('timeout', () => finish(false, connected && !greeted ? 'not_socks5：请填写 SOCKS5 端口' : 'timeout'))
       socket.on('error', (e) => {
-        if (connected) finish(true, null)
-        else finish(false, String(e.message || e))
+        const message = String(e.message || e)
+        finish(false, connected && !greeted ? 'not_socks5：请填写 SOCKS5 端口' : message)
       })
       socket.on('close', () => {
-        if (!done) finish(connected, connected ? null : 'connection_closed')
+        if (!done) finish(false, connected && !greeted ? 'not_socks5：请填写 SOCKS5 端口' : 'connection_closed')
       })
     })
   }
@@ -1758,6 +1761,9 @@ export class ProxyPool extends EventEmitter {
       port: p.port,
       username: p.username || null,
       password: p.password == null ? null : p.password,
+      // startProxyEgress reads this to write kin-egress domain_forward; without
+      // it the toggle is stored but every helper keeps forwarding IP literals.
+      domain_forward: p.domain_forward === true,
     }
   }
 }

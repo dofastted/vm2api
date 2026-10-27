@@ -1,15 +1,21 @@
 /**
  * Pre-scheduler seat book for the Claude pool.
  *
- * A seat is one inbound device (seat key) bound to one VM. Every concurrent
- * request of that device rides the same seat and shares the VM's concurrency;
- * a device is never split across VMs. Seat capacity is the VM's
- * `session_slots`; concurrency and RPM stay with PoolScheduler.reserve().
+ * A seat is one client session (seat key) bound to one VM slot. Every
+ * concurrent request of that session rides the same seat and shares the VM's
+ * concurrency; a session is never split across VMs. Two sessions on the same
+ * device are two seats. Seat capacity is the VM's `session_slots`;
+ * concurrency and RPM stay with PoolScheduler.reserve().
+ *
+ * A seat stays taken after its last request ends. It frees only when sticky
+ * TTL expires, or when the scheduler drops it because the home left the pool
+ * (unschedulable, quota, credential, failover). `graceMs` is unused; the
+ * field remains so older routing config still loads.
  *
  * Queues:
- *   vmQueue[vm]  `conc` tickets: a seated device waiting for VM concurrency.
- *                `seat` tickets: a device bound to this VM waiting for a seat.
- *   globalQueue  new devices (and sticky waits past their timeout); the first
+ *   vmQueue[vm]  `conc` tickets: a seated session waiting for VM concurrency.
+ *                `seat` tickets: a session bound to this VM waiting for a seat.
+ *   globalQueue  new sessions (and sticky waits past their timeout); the first
  *                ticket that accepts a VM gets its free seat.
  *
  * Grants are synchronous: a ticket's tryGrant() writes the seat and the
@@ -71,11 +77,13 @@ export function rankSeatCandidates(candidates, { strategy = 'balanced', openOf }
 
 export class SeatPlanner {
   constructor({
-    graceMs = 30_000,
+    graceMs = 0,
     reservePct = 0.02,
     strategy = 'balanced',
     /** Read at use time: the scheduler owns `sticky_wait_timeout_ms` and hot-reloads it. */
     stickyWaitMs = () => 45_000,
+    /** Sticky VM-memory TTL. It does not keep an idle dialog's session slot. */
+    stickyTtlMs = () => 86_400_000,
     onChange = null,
     asyncGrants = false,
   } = {}) {
@@ -83,6 +91,7 @@ export class SeatPlanner {
     this.reservePct = reservePct
     this.strategy = normalizeSeatStrategy(strategy)
     this.stickyWaitMs = stickyWaitMs
+    this.stickyTtlMs = stickyTtlMs
     this.onChange = onChange
     this.asyncGrants = asyncGrants
     this.tasks = new Set()
@@ -167,6 +176,7 @@ export class SeatPlanner {
       accountId,
       index: slotIndex,
       inflight: 0,
+      heldUntil: null,
       graceUntil: null,
       timer: null,
       live: true,
@@ -178,65 +188,132 @@ export class SeatPlanner {
     this.changed()
     return seat
   }
+  /**
+   * Put a persisted in-flight session back on its slot without treating it
+   * as a new open. `index` is kept when that cell is free. `heldUntil` is
+   * only a restart race: the dialog already ended, so the slot frees unless
+   * that session queues again before the timer. It is not sticky TTL.
+   */
+  restore(seatKey, { vmId, accountId = null, index = null, heldUntil = null, cap = 0 } = {}) {
+    const key = String(seatKey || '')
+    const id = String(vmId || '')
+    if (!key || !id || this.seats.has(key)) return null
+    let book = this.byVm.get(id)
+    if (!book) {
+      book = new Map()
+      this.byVm.set(id, book)
+    }
+    let slot = Number.isInteger(index) && index >= 0 && !book.has(index) ? index : 0
+    while (book.has(slot)) slot += 1
+    const until = Number(heldUntil) > Date.now() ? Number(heldUntil) : null
+    const seat = {
+      seatKey: key,
+      vmId: id,
+      accountId,
+      index: slot,
+      inflight: 0,
+      heldUntil: until,
+      graceUntil: until,
+      timer: null,
+      live: true,
+    }
+    book.set(slot, seat)
+    this.seats.set(key, seat)
+    if (cap) this.noteCap(id, cap)
+    if (until) this.armHold(seat)
+    this.changed()
+    return seat
+  }
 
   hold(seat) {
     seat.inflight += 1
     clearTimeout(seat.timer)
     seat.timer = null
-    if (seat.graceUntil != null) {
+    if (seat.heldUntil != null || seat.graceUntil != null) {
+      seat.heldUntil = null
       seat.graceUntil = null
       this.changed()
     }
   }
 
   /**
-   * One request of this seat finished. The last one starts the grace window:
-   * the seat stays with its device for `graceMs`, then frees. A device that
-   * still has a ticket queued on this VM keeps the seat; grace starts again
-   * once that queue has drained.
+   * One request of this seat finished. The last one frees the slot unless
+   * another request of this session is already waiting. Sticky VM memory
+   * stays in the router until its own TTL.
    */
   release(seat) {
     if (!seat) return
+    const followUp = this.followUpWaiting(seat)
     seat.inflight = Math.max(0, seat.inflight - 1)
     if (!seat.live) {
       this.pump(seat.vmId)
       return
     }
-    if (seat.inflight === 0) this.armGrace(seat)
+    if (seat.inflight === 0 && !followUp) this.finishDialog(seat)
     this.pump(seat.vmId)
   }
 
-  /** Tickets queued on this seat's VM. Global waiters do not keep the seat. */
-  queuedOn(seat) {
-    return (this.vmQueues.get(seat.vmId) || []).some((ticket) => ticket.seatKey === seat.seatKey)
+  /** A later request is queued, or already granted and not yet taken by its caller. */
+  followUpWaiting(seat) {
+    const mine = (ticket) => ticket.seatKey === seat.seatKey
+    for (const queue of this.vmQueues.values()) {
+      if (queue.some(mine)) return true
+    }
+    if (this.globalQueue.some(mine)) return true
+    for (const ticket of this.granted || []) {
+      if (mine(ticket)) return true
+    }
+    return false
+  }
+
+  noteGranted(ticket) {
+    if (!this.granted) this.granted = new Set()
+    this.granted.add(ticket)
+  }
+
+  forgetGranted(ticket) {
+    this.granted?.delete(ticket)
   }
 
   /**
-   * Own the seat for `graceMs` after the last in-flight request. `graceMs`
-   * of 0 still frees immediately. Failover calls `free` and never comes here.
+   * Dialog ended. A follow-up already waiting keeps the slot; otherwise the
+   * slot is free now. `heldUntil` is a restart handoff only.
    */
-  armGrace(seat) {
+  finishDialog(seat) {
     if (!seat?.live || seat.inflight !== 0 || seat.timer) return
-    if (!(this.graceMs > 0)) {
+    if (this.followUpWaiting(seat)) return
+    const stored = Number(seat.heldUntil)
+    const until = stored > Date.now() ? stored : 0
+    const wait = until - Date.now()
+    if (!(wait > 0)) {
       this.free(seat)
       return
     }
-    if (this.queuedOn(seat)) return
-    seat.graceUntil = Date.now() + this.graceMs
+    seat.heldUntil = until
+    seat.graceUntil = until
     seat.timer = setTimeout(() => {
       seat.timer = null
       if (!seat.live || seat.inflight !== 0) return
-      // Queued work of this device would otherwise reopen the seat ahead of
-      // devices already waiting for one.
-      if (this.queuedOn(seat)) {
+      if (this.followUpWaiting(seat)) {
+        seat.heldUntil = null
         seat.graceUntil = null
         this.changed()
         return
       }
       this.free(seat)
-    }, this.graceMs)
+    }, wait)
     seat.timer.unref?.()
     this.changed()
+  }
+
+  /** @deprecated restart handoff only; a finished dialog does not keep its slot. */
+  armHold(seat) {
+    this.finishDialog(seat)
+  }
+
+  /** @deprecated alias of finishDialog. */
+  armGrace(seat) {
+    this.finishDialog(seat)
   }
 
   /** Drop the seat now. Requests still running on it finish; their release only counts down. */
@@ -251,6 +328,7 @@ export class SeatPlanner {
     seat.live = false
     clearTimeout(seat.timer)
     seat.timer = null
+    seat.heldUntil = null
     seat.graceUntil = null
     if (this.seats.get(seat.seatKey) === seat) this.seats.delete(seat.seatKey)
     const book = this.byVm.get(seat.vmId)
@@ -277,9 +355,9 @@ export class SeatPlanner {
     const vmId = ticket.vmId
     this.unlink(ticket)
     const seat = vmId ? this.seatOf(seatKey) : null
-    // A timeout never calls release. Rearm grace once this VM's queue is empty
-    // so the seat does not stay taken after the device gave up.
-    if (seat?.vmId === vmId) this.armGrace(seat)
+    // A timeout never calls release. Rearm the sticky hold once this VM's
+    // queue is empty so the seat does not stay taken after the session gave up.
+    if (seat?.vmId === vmId) this.armHold(seat)
     this.changed()
   }
 
@@ -466,6 +544,7 @@ export class SeatPlanner {
     }
     if (!granted) return false
     if (ticket.queued) this.unlink(ticket)
+    this.noteGranted(ticket)
     this.changed()
     ticket.wake?.()
     return true
@@ -477,15 +556,16 @@ export class SeatPlanner {
     return total
   }
 
-  /** Earliest grace expiry among these VMs (ms from now), the best wake estimate for a 529. */
+  /** Earliest sticky-hold expiry among these VMs (ms from now), the best wake estimate for a 529. */
   retryAfterMs(vmIds = null) {
     const now = Date.now()
     const wanted = vmIds ? new Set([...vmIds].map(String)) : null
     let soonest = null
     for (const seat of this.seats.values()) {
-      if (seat.graceUntil == null || seat.graceUntil <= now) continue
+      const until = seat.heldUntil ?? seat.graceUntil
+      if (until == null || until <= now) continue
       if (wanted && !wanted.has(seat.vmId)) continue
-      const left = seat.graceUntil - now
+      const left = until - now
       if (soonest == null || left < soonest) soonest = left
     }
     return soonest
@@ -501,11 +581,18 @@ export class SeatPlanner {
         seats_grace: 0,
         queue_depth: 0,
         conc_waiting: 0,
+        sessions: [],
       })
     for (const [vmId, book] of this.byVm) {
       const entry = row(vmId)
       entry.seats_used = book.size
-      for (const seat of book.values()) if (seat.graceUntil != null) entry.seats_grace += 1
+      const sessions = []
+      for (const seat of book.values()) {
+        if (seat.heldUntil != null || seat.graceUntil != null) entry.seats_grace += 1
+        sessions.push(sessionView(seat))
+      }
+      sessions.sort((a, b) => a.index - b.index)
+      entry.sessions = sessions
     }
     for (const [vmId, queue] of this.vmQueues) {
       const entry = row(vmId)
@@ -513,6 +600,20 @@ export class SeatPlanner {
       entry.conc_waiting += queue.filter((ticket) => ticket.kind === 'conc').length
     }
     return { seats, global_queue_depth: this.globalQueue.length }
+  }
+}
+
+/** Panel label for one occupied slot. Planner keys are `scope|seat:…`. */
+function sessionView(seat) {
+  const raw = String(seat.seatKey || '')
+  const id = raw.includes('|') ? raw.slice(raw.indexOf('|') + 1) : raw
+  const held = seat.heldUntil != null || seat.graceUntil != null
+  return {
+    index: seat.index,
+    session_id: id.startsWith('seat:sess:') ? id.slice('seat:sess:'.length) : id,
+    state: seat.inflight > 0 ? 'active' : held ? 'held' : 'idle',
+    inflight: seat.inflight,
+    held_until: seat.heldUntil ?? seat.graceUntil ?? null,
   }
 }
 

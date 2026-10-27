@@ -256,22 +256,46 @@ test('account1 quota exhausted rotates to account2 and commits final sticky', as
   assert.equal(attempts.items[1].terminalState, 'verified')
 })
 
-test('slot_busy spill serves the turn elsewhere but keeps the session pinned', async () => {
-  const scheduler = new Scheduler([candidate(1), candidate(2)])
-  scheduler.releaseAccountSessions = () => assert.fail('capacity spill must not unbind')
-  const pins = new Map([['conversation-1', { accountId: 'account-1', vmId: 'vm-01' }]])
-  const runner = new FailoverRunner({
-    scheduler,
-    stickyRouter: {
-      resolve: (key) => pins.get(key) || null,
-      bind: (key, value) => pins.set(key, value),
-    },
+test('slot_busy spill serves the turn elsewhere but keeps the session pinned', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-slot-busy-'))
+  const sticky = new StickyRouter({ dataDir, config: { sticky: { enabled: true } } })
+  t.after(() => {
+    sticky.db.close()
+    fs.rmSync(dataDir, { recursive: true, force: true })
   })
+  const callerSession = 'slot-busy-caller'
+  const stickyKey = sticky.canonicalSessionKey(callerSession)
+  sticky.bind(stickyKey, { accountId: 'account-1', vmId: 'vm-01', sessionId: 'stored-home' }, { countHit: false })
+  const selections = [1, 2].map((n) => ({ ok: true, accountId: `account-${n}`, vmId: `vm-0${n}`, release() {} }))
+  let index = 0
+  const scheduler = {
+    async selectAndReserve() {
+      return selections[Math.min(index++, selections.length - 1)]
+    },
+    markSuccess() {},
+    markCooldown() {},
+    releaseAccountSessions() {
+      assert.fail('capacity spill must not unbind')
+    },
+  }
+  const runner = new FailoverRunner({ scheduler, stickyRouter: sticky, config: { same_account_retry_delay_ms: 0 } })
+  let clock = 1_000
   const result = await runner.run({
     requestId: 'req-spill',
     canonicalBody: { model: 'claude-opus-test' },
     model: 'claude-opus-test',
-    stickyKey: 'conversation-1',
+    stickyKey,
+    applyAttempt: (body, selected, extra) => ({
+      body,
+      meta: {
+        sessionId: resolveOutboundSessionId(callerSession, {
+          boundSessionId: extra.stickyBound?.sessionId,
+          boundVmId: extra.stickyBound?.vmId,
+          vmId: selected.vmId,
+          epoch: `${clock++}:${selected.vmId}`,
+        }),
+      },
+    }),
     callAttempt: ({ candidate: selected }) =>
       selected.accountId === 'account-1'
         ? {
@@ -284,7 +308,11 @@ test('slot_busy spill serves the turn elsewhere but keeps the session pinned', a
   })
   assert.equal(result.ok, true)
   assert.equal(result.accountId, 'account-2')
-  assert.deepEqual(pins.get('conversation-1'), { accountId: 'account-1', vmId: 'vm-01' })
+  assert.deepEqual((({ accountId, vmId, sessionId }) => ({ accountId, vmId, sessionId }))(sticky.resolve(stickyKey)), {
+    accountId: 'account-1',
+    vmId: 'vm-01',
+    sessionId: 'stored-home',
+  })
 })
 
 test('#A20: a late completion never writes back a pin another request released', async () => {
@@ -399,7 +427,10 @@ test('verified hop stores the outbound session on every sticky alias', async () 
   })
   assert.equal(result.ok, true)
   const stored = bindings.filter((b) => b.value.sessionId)
-  assert.deepEqual(stored.map((b) => b.key).sort(), ['ch:first', 'dev:aabbcc', 'ch:first', 'dev:aabbcc'].sort())
+  assert.deepEqual(
+    stored.map((b) => b.key).sort(),
+    ['ch:first', 'dev:aabbcc', 'ch:first', 'dev:aabbcc', 'ch:first', 'dev:aabbcc'].sort(),
+  )
   assert.ok(stored.every((b) => b.value.sessionId === '11111111-1111-4111-8111-111111111111'))
   assert.ok(stored.every((b) => b.value.accountId === 'account-1'))
 })
@@ -1020,11 +1051,150 @@ for (const cancellation of ['result', 'throw']) {
       if (turn === 50) assert.equal(result.body.error.code, 'client_cancelled')
       const bound = sticky.resolve(stickyKey)
       assert.equal(bound.sessionId, originalSession, `persisted session changed at turn ${turn}`)
-      assert.equal(bound.slotIndex, 3, `cancellation dropped the seat at turn ${turn}`)
+      assert.equal(bound.vmId, 'vm-01', `dialog forgot the VM at turn ${turn}`)
+      assert.equal(bound.slotIndex, null, `ended dialog kept the slot at turn ${turn}`)
     }
     assert.notEqual(originalSession, callerSession)
     assert.deepEqual(scheduler.releasedAccounts, [])
     assert.deepEqual(scheduler.cooldowns, [])
+  })
+}
+
+test('failed hops before a cross-account VM move persist that VM outbound session', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-failed-move-'))
+  const sticky = new StickyRouter({ dataDir, config: { sticky: { enabled: true } } })
+  t.after(() => {
+    sticky.db.close()
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  })
+  const callerSession = 'failed-hop-caller'
+  const stickyKey = sticky.canonicalSessionKey(callerSession)
+  sticky.bind(stickyKey, { accountId: 'account-old', vmId: 'vm-old', sessionId: 'stored-old' }, { countHit: false })
+  const selections = [
+    { ok: true, vmId: 'vm-old', accountId: 'account-old', release() {} },
+    { ok: true, vmId: 'vm-mid', accountId: 'account-mid', release() {} },
+    { ok: true, vmId: 'vm-home', accountId: 'account-home', release() {} },
+  ]
+  let index = 0
+  const scheduler = {
+    async selectAndReserve() {
+      return selections[Math.min(index++, selections.length - 1)]
+    },
+    markSuccess() {},
+    markCooldown() {},
+    releaseAccountSessions() {},
+  }
+  const runner = new FailoverRunner({ scheduler, stickyRouter: sticky, config: { same_account_retry_delay_ms: 0 } })
+  const seen = []
+  let clock = 1_000
+  const applyAttempt = (body, selected, extra) => {
+    const bound = extra.stickyBound
+    const sessionId = resolveOutboundSessionId(callerSession, {
+      boundSessionId: bound?.sessionId,
+      boundVmId: bound?.vmId,
+      vmId: selected.vmId,
+      epoch: `${clock}:${selected.vmId}`,
+    })
+    clock += 10
+    seen.push({ vm: selected.vmId, sessionId })
+    return { body, meta: { sessionId } }
+  }
+  const responses = [
+    {
+      ok: false,
+      status: 503,
+      terminalState: 'rejected',
+      body: { type: 'error', error: { type: 'api_error', message: 'worker unavailable' } },
+    },
+    {
+      ok: false,
+      status: 401,
+      terminalState: 'error',
+      body: { type: 'error', error: { type: 'authentication_error', message: 'authentication_error' } },
+    },
+    success(),
+  ]
+  let responseIndex = 0
+  await runner.run({
+    requestId: 'req-move',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey,
+    applyAttempt,
+    callAttempt: () => responses[responseIndex++],
+  })
+  await runner.run({
+    requestId: 'req-home',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey,
+    applyAttempt,
+    callAttempt: () => success(),
+  })
+  const stored = sticky.resolve(stickyKey)
+  assert.equal(stored.vmId, 'vm-home')
+  assert.equal(stored.accountId, 'account-home')
+  assert.equal(stored.sessionId, seen[2].sessionId)
+  assert.equal(seen[3].sessionId, seen[2].sessionId)
+  assert.notEqual(seen[2].sessionId, seen[1].sessionId)
+})
+
+for (const cancellation of ['result', 'throw']) {
+  test(`first cancelled turn via ${cancellation} keeps the sent outbound session`, async (t) => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-first-cancel-'))
+    const sticky = new StickyRouter({ dataDir, config: { sticky: { enabled: true } } })
+    t.after(() => {
+      sticky.db.close()
+      fs.rmSync(dataDir, { recursive: true, force: true })
+    })
+    const callerSession = `first-cancel-${cancellation}`
+    const stickyKey = sticky.canonicalSessionKey(callerSession)
+    const runner = new FailoverRunner({
+      scheduler: {
+        async selectAndReserve() {
+          return { ok: true, vmId: 'vm-home', accountId: 'home', release() {} }
+        },
+        markSuccess() {},
+      },
+      stickyRouter: sticky,
+    })
+    const seen = []
+    let clock = 1_000
+    const applyAttempt = (body, selected, extra) => {
+      const sessionId = resolveOutboundSessionId(callerSession, {
+        boundSessionId: extra.stickyBound?.sessionId,
+        boundVmId: extra.stickyBound?.vmId,
+        vmId: selected.vmId,
+        epoch: `${clock}:${selected.vmId}`,
+      })
+      clock += 10
+      seen.push(sessionId)
+      return { body, meta: { sessionId } }
+    }
+    const first = runner.run({
+      requestId: `req-first-${cancellation}`,
+      canonicalBody: { model: 'claude-opus-test' },
+      model: 'claude-opus-test',
+      stickyKey,
+      applyAttempt,
+      callAttempt: () => {
+        if (cancellation === 'throw') throw Object.assign(new Error('cancelled'), { code: 'request_cancelled' })
+        return { ok: false, status: 499, clientCancelled: true, terminalState: 'cancelled' }
+      },
+    })
+    assert.equal((await first).status, 499)
+    const second = await runner.run({
+      requestId: `req-second-${cancellation}`,
+      canonicalBody: { model: 'claude-opus-test' },
+      model: 'claude-opus-test',
+      stickyKey,
+      applyAttempt,
+      callAttempt: () => success(),
+    })
+    assert.equal(second.status, 200)
+    assert.equal(second.finalState, 'verified')
+    assert.equal(seen.length, 2)
+    assert.equal(seen[1], seen[0])
   })
 }
 
@@ -1831,4 +2001,46 @@ test('an all-rest pool 503 carries Retry-After for the next window open', async 
   assert.equal(result.status, 503)
   assert.equal(result.body.error.code, 'account_pool_exhausted')
   assert.equal(result.retryAfterSec, 91)
+})
+
+test('org OAuth refusal pauses that slot and the family request hops to another', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const pauses = []
+  const runner = new FailoverRunner({
+    scheduler,
+    stickyRouter: { resolve: () => null, bind: () => true, unbind: () => true },
+    onSchedulePause: (value) => pauses.push(value),
+  })
+  const result = await runner.run({
+    requestId: 'req-org-refusal',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    familyKey: 'family2:root',
+    callAttempt: ({ candidate: selected }) => {
+      if (selected.accountId === 'account-1') {
+        return {
+          ok: false,
+          status: 403,
+          terminalState: 'rejected',
+          body: {
+            type: 'error',
+            error: {
+              type: 'permission_error',
+              message: 'OAuth authentication is currently not allowed for this organization.',
+            },
+          },
+        }
+      }
+      return success()
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.accountId, 'account-2')
+  // A pause, not a timed or permanent runtime cooldown.
+  assert.deepEqual(scheduler.cooldowns, [])
+  assert.equal(scheduler.releasedAccounts[0].accountId, 'account-1')
+  assert.equal(pauses.length, 1)
+  assert.equal(pauses[0].selected.vmId, 'vm-01')
+  assert.equal(pauses[0].policy.reason, 'organization_disabled')
+  assert.equal(pauses[0].policy.detail.status, 403)
 })

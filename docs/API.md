@@ -34,8 +34,7 @@ x-api-key: sk-vm-…
 | 方法 | 路径 | 入站 | 出站给客户端 |
 |------|------|------|--------------|
 | `POST` | `/v1/messages` 或 `/messages` | Anthropic Messages | Anthropic Messages / SSE |
-| `POST` | `/v1/messages/count_tokens` 或 `/messages/count_tokens` | Anthropic count_tokens | Setup/API Key → `{ input_tokens }`；OAuth → 5H/7D（同 `/v1/usage`） |
-| `GET` | `/v1/usage` | — | 当前 OAuth 账户 5H/7D（`unit=percent_used`） |
+| `GET` | `/v1/usage` | — | 当前账户 5H/7D，Claude 与 GPT 均可（`unit=percent_used`） |
 | `POST` | `/v1/chat/completions` 或 `/chat/completions` | OpenAI Chat | OpenAI Chat / SSE |
 | `POST` | `/v1/completions` 或 `/completions` | OpenAI Completions | OpenAI Completions |
 | `POST` | `/v1/responses` 或 `/responses` | OpenAI Responses | OpenAI Responses |
@@ -173,36 +172,26 @@ curl -sS http://127.0.0.1:8787/v1/models -H "Authorization: Bearer $KEY"
 
 读面板持久化的 `model_policy`，**不** hop 槽位 `/v1/models`。列表按密钥 `group_type` 过滤：`openai` 只列 GPT，`anthropic` 只列 Claude，`all` 与 master 两者都列。`POST /admin/models/refresh` 仍回完整目录。未入库的 id → `400`，请求被拒，不上游。别名如 `claude-haiku-4-5` 可解析到带日期的目录项。出站 `model` 去掉 `[1m]` 后缀。
 
-## count_tokens / usage
-
-选当前会用的账户（sticky 仍可调度则用 sticky，否则下一张）。**不写、不拆 sticky。** 按该 VM 凭证分叉：
-
-- Setup Token / Console API Key：hop 官方 Token Counting，`{ input_tokens }`
-- 完整 OAuth：不 hop count_tokens，返回与 `GET /v1/usage` 相同的 5H/7D
-
-```bash
-curl -sS http://127.0.0.1:8787/v1/messages/count_tokens \
-  -H "Authorization: Bearer $KEY" \
-  -H "content-type: application/json" \
-  -d '{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hi"}]}'
-```
-
+## usage
 ```bash
 curl -sS http://127.0.0.1:8787/v1/usage -H "Authorization: Bearer $KEY"
 ```
 
-`GET /v1/usage` 仅完整 OAuth。成功：
+`GET /v1/usage` 返回调度器下一次会选到的账户的用量，只在调用方自己的属主范围和密钥范围内选：先选 Claude 账户；没有可用的 Claude 账户时，再选 GPT（Codex）槽位。可用 `?platform=claude` 或 `?platform=openai` 只看一类，其他值返回 `400 invalid_platform`。成功：
 
 ```json
 {
   "unit": "percent_used",
   "five_hour": { "utilization": 12, "status": "active", "resets_at": "…" },
   "seven_day": { "utilization": 34, "status": "ok", "resets_at": "…" },
-  "source": "extra"
+  "source": "extra",
+  "platform": "anthropic"
 }
 ```
 
-`utilization` 0–100。有 Messages Extra 用 Extra；两窗都空才走一次带缓存的官方 `/api/oauth/usage`（`source=oauth-usage`）。Setup Token 只有 `user:inference` 时官方 usage 会返回 scope 错误；服务端保留失败原因，不把它当吊销/封禁，也不改历史套餐。Console API Key 调 `/v1/usage` → `400 usage_unsupported`。窗缺失为 `null`，不伪装 0%。
+`platform` 为 `anthropic` 或 `openai`。GPT 槽位读本地记录的 Codex 5h/7d 窗口（`source=codex`），不发起上游请求。
+
+`utilization` 0–100。Claude 槽位：有 Messages Extra 用 Extra；两窗都空才走一次带缓存的官方 `/api/oauth/usage`（`source=oauth-usage`）。Setup Token 只有 `user:inference` 时官方 usage 会返回 scope 错误；服务端保留失败原因，不把它当吊销/封禁，也不改历史套餐。Console API Key 调 `/v1/usage` → `400 usage_unsupported`。窗缺失为 `null`，不伪装 0%。
 
 ## 面板额度探测
 
@@ -244,7 +233,7 @@ curl -sS http://127.0.0.1:8787/v1/usage -H "Authorization: Bearer $KEY"
 curl -sS http://127.0.0.1:8787/health
 ```
 
-无鉴权。含 `features`、`limitations`、`stats`。能力字面量：`passthrough`、`stream`、`verified-stream`、`protocol-convert`、`go-slot-worker`、`account-pool-failover`、`tools`、`client-workspace`、`count_tokens`、`account_usage`。
+无鉴权。含 `features`、`limitations`、`stats`。能力字面量：`passthrough`、`stream`、`verified-stream`、`protocol-convert`、`go-slot-worker`、`account-pool-failover`、`tools`、`client-workspace`、`account_usage`。
 
 ## 错误
 
@@ -360,14 +349,14 @@ stateDiagram-v2
 
 - **realtime（默认）**：第一段业务 SSE 写出后不再换账号。
 - **verified**：收齐 `message_stop` 再给客户端；不完整则继续换号。
-- 席位（预调度）：Claude 请求按入站 device 占席位（`metadata.user_id.device_id` / `device_id` / `x-kin-device-id` → `metadata` 的 `session_id` → `cache_control: ephemeral` 内容哈希 → 客户端 IP + 归一化 UA + system + 首轮 user 内容哈希；API key 从不参与）。同一 device 的并发请求共用 1 个席位，共享该 VM 并发，在 VM 内按到达顺序等待，不拆到两台 VM。每台 VM 的席位数是 `session_slots`（VM 覆盖 → `inference.session_slots`，上限 20）。最后一个请求结束后席位保留 `routing.pool.seat_grace_ms`（默认 30 秒）给同一 device。开新席位要求余量 `min(limit_5h − u5, limit_7d − u7) ≥ (已占 + 1) × seat_budget_reserve_pct`。新 device 先回粘性 VM，否则按 `strategy`（`balanced` 选占用率最低、`fill` 选已占最多未满，同级再比余量）；都满时进全局 FIFO，新到请求不插队；有粘性 VM 的先在该 VM 等 `sticky_wait_timeout_ms`，再转全局等 `fallback_wait_timeout_ms`。超时返回 529。一次性短探测（单条短 user 文本、无工具）和诊断 pin 不占席位。
-- sticky：同一会话（`x-session-id` 等键）在终态成功后绑槽，粘性 VM 是新席位的首选；已占席位的 device 一直留在席位所在 VM。额度 / 凭证 / 暂停等确定失效或换 VM 重试时席位立即释放（不进宽限），在新 VM 开席位并更新设备绑定。
+- 席位（预调度）：出站占位的首要身份是 device id / machine id，其次才是 session id。一个 machine（`metadata.user_id.device_id`、`device_id`、`x-kin-device-id`）先占一台 VM。同一 machine 再来的 session 优先使用这台 VM 里还空着的槽；槽满了才等这台 VM，等不到才去别的 VM。每个 session 在请求进行中独占一个槽；这一轮结束且该 session 没有排在这台 VM 上的后续请求时，槽立刻释放。粘性 TTL 只记住用过的 VM，不占 `session_slots`。没有 device / machine 时，按 session id 占槽；再没有才用 `cache_control: ephemeral` 内容哈希，然后是客户端 IP + 归一化 UA + system + 首轮 user 内容哈希。API key 从不参与。同一 session 的并发请求共用这一个席位。每台 VM 的席位数是 `session_slots`（VM 覆盖 → `inference.session_slots`，上限 20）。额度 / 凭证 / 暂停等确定失效，或换 VM 重试，才立刻释放，到新 VM 再占一个槽。开新席位要求余量 `min(limit_5h − u5, limit_7d − u7) ≥ (已占 + 1) × seat_budget_reserve_pct`。都满时进全局 FIFO。有粘性 VM 的先在该 VM 等 `sticky_wait_timeout_ms`，再转全局等 `fallback_wait_timeout_ms`。超时返回 529。一次性短探测和诊断 pin 不占席位。分配原因：`device-affinity` 是这台 machine 已有的 VM，`sticky` 是这个 session 自己的绑定，`family-affinity` 是父会话所在 VM。
+- sticky：同一会话在终态成功后记住 VM；粘性 TTL 内这台 VM 是该 session 新开席位的首选。对话结束后不占席位。不可调度 / 错误会清掉这份记忆。
 - 5h/7d 闸（`routing.quota`）：用量进入闸线下 `critical_band`（默认 5 个百分点）起为「临近闸线」，一直到闸线上 `gate_overshoot`（默认 5 个百分点）。这一段里已入座的 device 留在原 VM：同账号一次只跑一个请求（额度读数滞后于在飞请求），第二个并发在原 VM 排队，不换 VM；新 device 优先开到其他正常 VM，用量已过闸线时不再开新席位。用量达到闸线 + `gate_overshoot` 才让出席位换 VM；上游 rejected / 100% / 429 冷却始终立即换。
 - 重试预算：每个 VM 每请求最多 3 次实际执行；准入竞争失败不算一次执行。`failover.max_total_attempts` / `max_account_switches` 用完后只再尝试本请求还没试过的 VM，直到 `total_retry_deadline_ms`。
 - 流空闲上限：上游流连续无事件超过 `failover.stream_idle_timeout_ms`（默认 180 秒，面板「重试与切号」可调，30 秒–60 分钟）即判超时。网关、槽内 kernel 的流空闲上限和 job 看门狗（kernel 读的是不带前缀的环境变量 `JOB_IDLE_SECS`，由 kernel 启动脚本从 `kernel.json` 读取并导出；`KIN_JOB_IDLE_SECS` 不生效）共用这个值。保存后立即热写入各槽 `kernel.json`；job 看门狗只在 kernel 启动时读取，所以值变化后各运行中的 Claude 槽会在没有任务时自动重启 kernel（有任务则等它结束，另每 15 秒复查一次）。不带 `eager_input_streaming` 时，上游会把大工具入参（如长 `Write` 内容）整段缓冲，期间可能静默数分钟。未配置时用环境变量 `KIN_STREAM_IDLE_TIMEOUT`。
 - 排队保活（仅 Claude `stream: true`）：选席、同会话串行、失败重试都发生在上游尝试开始之前，这段时间原先不下发任何字节。Cloudflare 约 100 秒收不到响应会回 524。`failover.queue_keepalive_delay_ms`（默认 60 秒，上限 90 秒，也可用 `KIN_QUEUE_KEEPALIVE_DELAY`）过后开始写 SSE `event: ping`，间隔与 `stream_keepalive_ms` 相同，并一直持续到首个内容事件。延迟之内失败仍是 HTTP 429/529/503。一旦写出 ping，状态码不能再改，后续失败改为 SSE `event: error`（例如 `overloaded_error`）。同会话排队另有 `failover.session_queue_timeout_ms`（默认 15 分钟；`0` 表示不限制），超时按 529 `overloaded_error` 返回，不会和仍在跑的上一轮并发。Codex / OpenAI 路径不变。
 - 工具参数流式下发：`failover.eager_tool_streaming`（默认开，面板「重试与切号」开关；显式 `false` 关闭）。开启后给所有自定义工具加 `eager_input_streaming: true`（服务端工具不动），上游边生成边下发大参数，不再长时间静默。这与官方 Claude Code 开启细粒度工具流式时的形态一致：官方只在直连官方 base URL 且服务端开关 `tengu_fgts` 打开，或设置 `CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1` 时给全部工具加这个字段，所以经中转的客户端默认不带。客户端自己带了这个布尔值时以客户端为准。参数在 `max_tokens` 截断时可能是不完整的 JSON。OpenAI chat/responses 入口的 function 工具在转成 Anthropic 后同样加这个字段。
-- 子请求：带显式 `parent_session_id` / `root_session_id` 且父会话在本地已有绑定时，子请求跟随父会话所在 VM（family 粘性）；同一 device 的父子请求共用该 device 的席位。没有显式父子字段时，同设备的新会话不会被当作子请求。
+- 子请求：带显式 `parent_session_id` / `root_session_id` 且父会话在本地已有绑定时，子请求跟随父会话所在 VM（family 粘性）。子会话有自己的 session id，单独占一个席位，不和父会话或同 device 的其它会话共用。没有显式父子字段时，同设备的新会话不会被当作子请求。
 - Claude Code 子 agent：请求头带 `x-claude-code-agent-id` 时，按上一条的子请求处理，父会话是 `metadata.user_id.session_id`，子会话 ID 由它和 agent ID 派生。每个 agent 单独串行，不等父会话当前这一轮。
 - 裸 429（没有 5h/7d 头、没有套餐文案）不按模型名定范围：当前执行单元短暂让位并触发一次 `/usage` 探测，由真实用量决定是否是账号额度。上游文本点名模型的才按模型冷却，每分钟限流按 RPM 短冷却。
 

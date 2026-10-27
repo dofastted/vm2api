@@ -7,7 +7,7 @@ import assert from 'node:assert/strict'
 
 const SOURCE = path.resolve(import.meta.dirname, '../../docker/kin-kvm/kin-guest-exec')
 
-function prepareHarness() {
+function prepareHarness({ sshExit = 0, timeoutExit = null } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-guest-exec-'))
   const bin = path.join(root, 'bin')
   const key = path.join(root, 'id_ed25519')
@@ -16,12 +16,16 @@ function prepareHarness() {
   const remoteLog = path.join(root, 'remote.log')
   fs.mkdirSync(bin)
   fs.writeFileSync(key, 'fake-key\n', { mode: 0o600 })
+  const timeoutFail =
+    timeoutExit != null
+      ? `exit ${timeoutExit}`
+      : `shift
+exec "$@"`
   fs.writeFileSync(
     path.join(bin, 'timeout'),
     `#!/bin/sh
 echo "timeout $*" >> ${timeoutLog.replace(/'/g, `'\\''`)}
-shift
-exec "$@"
+${timeoutFail}
 `,
     { mode: 0o755 },
   )
@@ -38,7 +42,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 printf '%s' "$remote" > ${remoteLog.replace(/'/g, `'\\''`)}
-exit 0
+exit ${sshExit}
 `,
     { mode: 0o755 },
   )
@@ -120,4 +124,33 @@ test('kin-guest-exec applies wall-clock timeout only for detach and non-interact
   assert.doesNotMatch(src, /if ! timeout 8 ssh "\$@" root@127\.0\.0\.1 "\$remote"/)
   assert.match(src, /if \[ "\$detach" -eq 1 \] \|\| \[ "\$interactive" -eq 0 \]; then/)
   assert.match(src, /else\s*\n\s*ssh "\$@" root@127\.0\.0\.1 "\$remote"/)
+})
+
+test('non-zero guest command exit is propagated (not masked as 0)', () => {
+  const h = prepareHarness({ sshExit: 37 })
+  const ran = runHarness(h, ['-u', '1000:1000', '--', '/bin/false'])
+  assert.equal(ran.status, 37, ran.stderr)
+  fs.rmSync(h.root, { recursive: true, force: true })
+})
+
+test('ssh failure 255 maps to exit 1 with guest ssh unavailable', () => {
+  const h = prepareHarness({ sshExit: 255 })
+  const ran = runHarness(h, ['-u', '1000:1000', '--', '/bin/true'])
+  assert.equal(ran.status, 1, ran.stderr)
+  assert.match(ran.stderr, /guest ssh unavailable/)
+  fs.rmSync(h.root, { recursive: true, force: true })
+})
+
+test('timeout 124 maps to exit 1 with guest ssh unavailable', () => {
+  const h = prepareHarness({ timeoutExit: 124 })
+  const ran = runHarness(h, ['-u', '1000:1000', '--', '/bin/true'])
+  assert.equal(ran.status, 1, ran.stderr)
+  assert.match(ran.stderr, /guest ssh unavailable/)
+  fs.rmSync(h.root, { recursive: true, force: true })
+})
+
+test('source does not use if ! run_ssh for exit capture', () => {
+  const src = fs.readFileSync(SOURCE, 'utf8')
+  assert.doesNotMatch(src, /if ! run_ssh/)
+  assert.match(src, /if run_ssh "\$@"; then/)
 })

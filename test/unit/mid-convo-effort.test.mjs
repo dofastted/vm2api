@@ -54,7 +54,7 @@ test('issue 383: control after new user stays message-level and top-level effort
   assert.equal(reasoningEffortOf(inbound), 'max')
   const betas = withRequestProtocolBetas([], outbound)
   assert.ok(betas.includes(BETA_MID_CONVERSATION_OUTPUT_CONFIG))
-  assert.ok(betas.includes(BETA_MID_CONVERSATION_SYSTEM))
+  assert.ok(!betas.includes(BETA_MID_CONVERSATION_SYSTEM))
   assert.ok(betas.includes(BETA_EFFORT))
 })
 
@@ -267,7 +267,7 @@ test('withRequestProtocolBetas derives mid-conversation-output-config from messa
   assert.ok(derived.includes('caller-beta'))
   assert.ok(derived.includes(BETA_MID_CONVERSATION_OUTPUT_CONFIG))
   assert.ok(derived.includes(BETA_EFFORT))
-  assert.ok(derived.includes(BETA_MID_CONVERSATION_SYSTEM))
+  assert.ok(!derived.includes(BETA_MID_CONVERSATION_SYSTEM))
   assert.deepEqual(withRequestProtocolBetas(['caller-beta'], { model: 'claude-sonnet-4-6' }), ['caller-beta'])
 })
 
@@ -292,7 +292,7 @@ test('thread create and continue derive the same output-config beta without repl
   const continued = withRequestProtocolBetas(['caller-beta'], resume)
   assert.ok(continued.includes(BETA_MID_CONVERSATION_OUTPUT_CONFIG))
   assert.ok(!continued.includes(BETA_MID_CONVERSATION_SYSTEM))
-  assert.ok(created.includes(BETA_MID_CONVERSATION_SYSTEM))
+  assert.ok(!created.includes(BETA_MID_CONVERSATION_SYSTEM))
   const { thread: _thread, ...plain } = resume
   assert.ok(!withRequestProtocolBetas(['caller-beta'], plain).includes(BETA_MID_CONVERSATION_OUTPUT_CONFIG))
   assert.ok(

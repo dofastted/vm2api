@@ -64,10 +64,19 @@ function hasHourCache(node) {
   return node.cache_control?.ttl === '1h' || hasHourCache(node.content)
 }
 
+function hasCacheScope(node) {
+  if (Array.isArray(node)) return node.some(hasCacheScope)
+  if (!node || typeof node !== 'object') return false
+  return node.cache_control?.scope != null || hasCacheScope(node.content)
+}
+
 export function withRequestProtocolBetas(tokens = [], body = {}) {
   const betas = [...new Set(tokens.filter(Boolean))]
-  const add = (token) => {
-    if (!betas.includes(token)) betas.push(token)
+  const add = (token, before) => {
+    if (betas.includes(token)) return
+    const at = before ? betas.indexOf(before) : -1
+    if (at === -1) betas.push(token)
+    else betas.splice(at, 0, token)
   }
   // Catalog capabilities do not imply opt-in timing/thread/diagnostic fields.
   const model = String(body.model || '')
@@ -75,8 +84,8 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
     .pop()
     .replace(/\[1m\]/gi, '')
     .replace(/-\d{8}$/, '')
-  if (Object.hasOwn(PER_TURN_MODELS, model)) add('per-turn-control-2026-07-01')
-  if (Object.hasOwn(MID_TOOL_CHANGE_MODELS, model)) add(BETA_MID_CONVERSATION_TOOL_CHANGES)
+  if (Object.hasOwn(PER_TURN_MODELS, model)) add('per-turn-control-2026-07-01', BETA_MID_CONVERSATION_TOOL_CHANGES)
+  if (Object.hasOwn(MID_TOOL_CHANGE_MODELS, model) || model === 'auto') add(BETA_MID_CONVERSATION_TOOL_CHANGES)
   if (body.thread != null && Object.hasOwn(MID_OUTPUT_CONFIG_MODELS, model)) add(BETA_MID_CONVERSATION_OUTPUT_CONFIG)
   if (body.output_config?.effort != null) add(BETA_EFFORT)
   if (body.thinking?.display === 'updates') add(BETA_THINKING_DISPLAY_UPDATES)
@@ -106,8 +115,9 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
   if (body.cache_control?.evict_on_complete) add('prompt-caching-evict-2026-05-12')
   if (hasHourCache(body) || hasHourCache(body.system) || hasHourCache(body.tools) || hasHourCache(body.messages))
     add(BETA_EXTENDED_CACHE_TTL)
+  if (hasCacheScope(body) || hasCacheScope(body.system) || hasCacheScope(body.tools) || hasCacheScope(body.messages))
+    add(BETA_PROMPT_CACHING_SCOPE)
   if (Array.isArray(body.messages)) {
-    let hasSystem = false
     let hasClearAt = false
     let hasMessageOutputConfig = false
     let hasMessageEffort = false
@@ -115,7 +125,6 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
     let hasMessageTaskBudget = false
     for (const message of body.messages) {
       if (!message || typeof message !== 'object') continue
-      if (message.role === 'system') hasSystem = true
       if (message.clear_at != null) hasClearAt = true
       const config = message.output_config
       if (!config || typeof config !== 'object') continue
@@ -124,7 +133,6 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
       if (config.format) hasMessageFormat = true
       if (config.task_budget) hasMessageTaskBudget = true
     }
-    if (hasSystem) add(BETA_MID_CONVERSATION_SYSTEM)
     if (hasClearAt) add(BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT)
     if (hasMessageOutputConfig) add(BETA_MID_CONVERSATION_OUTPUT_CONFIG)
     if (hasMessageEffort) add(BETA_EFFORT)
@@ -136,7 +144,7 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
 
 export const HAIKU_BETA_HEADER = `${BETA_OAUTH},${BETA_INTERLEAVED}`
 
-/** Common 2.1.293 Messages betas; model capabilities and fields are separate gates. */
+/** Official 2.1.303 `--print` prefix. Field-gated tokens stay after it. */
 export function fullClaudeCodeMimicryBetas() {
   return [
     BETA_CLAUDE_CODE,
@@ -145,7 +153,14 @@ export function fullClaudeCodeMimicryBetas() {
     BETA_THINKING_TOKEN_COUNT,
     BETA_CONTEXT_MANAGEMENT,
     BETA_PROMPT_CACHING_SCOPE,
-    BETA_MID_CONVERSATION_SYSTEM,
+    'per-turn-control-2026-07-01',
+    BETA_MID_CONVERSATION_TOOL_CHANGES,
+    BETA_ADVANCED_TOOL_USE,
+    BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT,
+    BETA_EFFORT,
+    BETA_THINKING_BINDING_CONTROLS,
+    BETA_EXTENDED_CACHE_TTL,
+    BETA_CACHE_DIAGNOSIS,
   ]
 }
 

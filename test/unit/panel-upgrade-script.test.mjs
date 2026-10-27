@@ -15,6 +15,9 @@ const fs = require('node:fs')
 const { spawnSync } = require('node:child_process')
 const args = process.argv.slice(2)
 args.push('--compose-file-env', process.env.COMPOSE_FILE || '')
+if (process.env.DOCKER_DEFAULT_PLATFORM) {
+  args.push('--docker-default-platform', process.env.DOCKER_DEFAULT_PLATFORM)
+}
 fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(args) + '\n')
 if (args[0] === 'compose') {
   if (args.includes('run') && args.includes('scripts/check-postgres-upgrade.mjs') && process.env.FAIL_CUTOVER === '1') process.exit(1)
@@ -215,6 +218,18 @@ test('image upgrade pulls the pinned ARM64 release and records VERSION only afte
   assert.ok(result.calls.some((args) => args.includes('pull')))
   assert.ok(!result.calls.some((args) => args.includes('build')))
   assert.equal(result.version, '1.2.7\n')
+})
+
+test('compose upgrades ignore host DOCKER_DEFAULT_PLATFORM so ARM64 control images still pull', async () => {
+  const result = await runUpgrade({
+    source: false,
+    arch: 'arm64',
+    env: { DOCKER_DEFAULT_PLATFORM: 'linux/amd64' },
+  })
+  assert.equal(result.code, 0, result.stderr)
+  for (const args of result.calls.filter((row) => row[0] === 'compose')) {
+    assert.ok(!args.includes('--docker-default-platform'), args.join(' '))
+  }
 })
 
 test('ARM64 source upgrade keeps the native override and rejects a missing one before building', async () => {

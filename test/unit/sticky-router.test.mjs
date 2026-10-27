@@ -874,3 +874,24 @@ test('replaceSession remints the outbound session on the same VM', async () => {
   assert.equal(r.resolve('sess:a').slotIndex, null)
   await r.db?.close?.()
 })
+
+test('clearing a finished dialog slot keeps the VM and the original sticky expiry', () => {
+  const r = new StickyRouter({ dataDir: tmpDir(), config: { sticky: { enabled: true, ttl_seconds: 60 } } })
+  r.bind('sess:a', { accountId: 'acc', vmId: 'vm-05', sessionId: 'live', deviceId: 'dev-1', slotIndex: 2 })
+  const before = r.repo.get('sess:a')
+  r.bind(
+    'sess:a',
+    { accountId: before.account_id, vmId: before.vm_id, sessionId: before.session_id },
+    { countHit: false, ifGeneration: before.generation, clearSlot: true, keepExpiry: true },
+  )
+  const after = r.repo.get('sess:a')
+  assert.equal(after.vm_id, 'vm-05')
+  assert.equal(after.account_id, 'acc')
+  assert.equal(after.session_id, 'live')
+  assert.equal(after.device_id, 'dev-1')
+  assert.equal(after.slot_index, null)
+  assert.equal(after.expires_at, before.expires_at)
+  assert.equal(after.bound_at, before.bound_at)
+  assert.equal(r.resolve('sess:a').slotIndex, null)
+  r.db?.close?.()
+})

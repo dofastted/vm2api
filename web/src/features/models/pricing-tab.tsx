@@ -24,8 +24,10 @@ import { EmptyState } from '@/components/empty-state'
 import { QueryGate } from '@/components/query-gate'
 import {
   fmtBaseRates,
+  fmtImageRates,
   fmtPerM,
   modeKeys,
+  openaiServiceModes,
   priceSourceLabel,
   priceSourceVariant,
   tiersSummary,
@@ -79,13 +81,24 @@ function DiffMark({ entry }: { entry: PricingEntry }) {
   )
 }
 
+function RateCell({ value }: { value: number | null | undefined }) {
+  return (
+    <TableCell className='text-end font-mono text-xs tabular-nums'>
+      {fmtPerM(value)}
+    </TableCell>
+  )
+}
+
 function CatalogTable({
   title,
   rows,
+  openai = false,
   onEdit,
 }: {
   title: string
   rows: PricingEntry[]
+  /** OpenAI terms: cached input, one cache-write rate, service tiers, image tokens. */
+  openai?: boolean
   onEdit: (entry: PricingEntry) => void
 }) {
   const [inPolicyOnly, setInPolicyOnly] = useState(true)
@@ -114,13 +127,27 @@ function CatalogTable({
             <TableRow>
               <TableHead>id</TableHead>
               <TableHead>名称</TableHead>
-              <TableHead className='text-end'>input</TableHead>
-              <TableHead className='text-end'>output</TableHead>
-              <TableHead className='text-end'>cache read</TableHead>
-              <TableHead className='text-end'>5m write</TableHead>
-              <TableHead className='text-end'>1h write</TableHead>
-              <TableHead>档位</TableHead>
-              <TableHead>modes</TableHead>
+              {openai ? (
+                <>
+                  <TableHead className='text-end'>input</TableHead>
+                  <TableHead className='text-end'>cached input</TableHead>
+                  <TableHead className='text-end'>output</TableHead>
+                  <TableHead className='text-end'>cache write</TableHead>
+                  <TableHead>长上下文</TableHead>
+                  <TableHead>服务档位</TableHead>
+                  <TableHead>图像 token</TableHead>
+                </>
+              ) : (
+                <>
+                  <TableHead className='text-end'>input</TableHead>
+                  <TableHead className='text-end'>output</TableHead>
+                  <TableHead className='text-end'>cache read</TableHead>
+                  <TableHead className='text-end'>5m write</TableHead>
+                  <TableHead className='text-end'>1h write</TableHead>
+                  <TableHead>档位</TableHead>
+                  <TableHead>modes</TableHead>
+                </>
+              )}
               <TableHead>来源</TableHead>
               <TableHead />
             </TableRow>
@@ -138,45 +165,57 @@ function CatalogTable({
                   <TableCell className='max-w-[10rem] truncate'>
                     {row.name || '—'}
                   </TableCell>
-                  <TableCell className='text-end font-mono text-xs tabular-nums'>
-                    {fmtPerM(price?.input)}
-                  </TableCell>
-                  <TableCell className='text-end font-mono text-xs tabular-nums'>
-                    {fmtPerM(price?.output)}
-                  </TableCell>
-                  <TableCell className='text-end font-mono text-xs tabular-nums'>
-                    {fmtPerM(price?.cache_read)}
-                  </TableCell>
-                  <TableCell className='text-end font-mono text-xs tabular-nums'>
-                    {fmtPerM(price?.cache_5m)}
-                  </TableCell>
-                  <TableCell className='text-end font-mono text-xs tabular-nums'>
-                    {fmtPerM(price?.cache_1h)}
-                  </TableCell>
-                  <TableCell className='text-xs'>
-                    {tiersSummary(price)}
-                  </TableCell>
-                  <TableCell>
-                    <div className='flex flex-wrap gap-1'>
-                      {modeKeys(price).map((mode) => (
-                        <Badge
-                          key={mode}
-                          variant='outline'
-                          className='font-mono'
-                          title={
-                            row.mode_sources[mode]
-                              ? `${mode} · ${priceSourceLabel(row.mode_sources[mode])}`
-                              : mode
-                          }
-                        >
-                          {mode}
-                        </Badge>
-                      ))}
-                      {modeKeys(price).length === 0 ? (
-                        <span className='text-xs text-muted-foreground'>—</span>
-                      ) : null}
-                    </div>
-                  </TableCell>
+                  {openai ? (
+                    <>
+                      <RateCell value={price?.input} />
+                      <RateCell value={price?.cache_read} />
+                      <RateCell value={price?.output} />
+                      <RateCell value={price?.cache_5m} />
+                      <TableCell className='text-xs'>
+                        {tiersSummary(price)}
+                      </TableCell>
+                      <TableCell className='font-mono text-xs'>
+                        {openaiServiceModes(price).join(' / ') || '—'}
+                      </TableCell>
+                      <TableCell className='font-mono text-xs tabular-nums'>
+                        {fmtImageRates(price)}
+                      </TableCell>
+                    </>
+                  ) : (
+                    <>
+                      <RateCell value={price?.input} />
+                      <RateCell value={price?.output} />
+                      <RateCell value={price?.cache_read} />
+                      <RateCell value={price?.cache_5m} />
+                      <RateCell value={price?.cache_1h} />
+                      <TableCell className='text-xs'>
+                        {tiersSummary(price)}
+                      </TableCell>
+                      <TableCell>
+                        <div className='flex flex-wrap gap-1'>
+                          {modeKeys(price).map((mode) => (
+                            <Badge
+                              key={mode}
+                              variant='outline'
+                              className='font-mono'
+                              title={
+                                row.mode_sources[mode]
+                                  ? `${mode} · ${priceSourceLabel(row.mode_sources[mode])}`
+                                  : mode
+                              }
+                            >
+                              {mode}
+                            </Badge>
+                          ))}
+                          {modeKeys(price).length === 0 ? (
+                            <span className='text-xs text-muted-foreground'>
+                              —
+                            </span>
+                          ) : null}
+                        </div>
+                      </TableCell>
+                    </>
+                  )}
                   <TableCell>
                     <div className='flex flex-wrap items-center gap-1'>
                       <Badge variant={priceSourceVariant(row.source)}>
@@ -308,7 +347,12 @@ export function PricingTab() {
           rows={grouped.anthropic}
           onEdit={setEdit}
         />
-        <CatalogTable title='OpenAI' rows={grouped.openai} onEdit={setEdit} />
+        <CatalogTable
+          title='OpenAI'
+          rows={grouped.openai}
+          openai
+          onEdit={setEdit}
+        />
       </div>
 
       <PriceOverrideDialog

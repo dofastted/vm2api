@@ -9,8 +9,8 @@ import {
 export const SEAT_CAP_MAX = 20
 
 /**
- * 席位格：实心 = 请求进行中，描边浅色 = 宽限（请求已结束、为原设备保留），
- * 空格 = 可开新席位。`used` 含宽限。
+ * 席位格：实心 = 请求进行中，描边浅色 = 重启交接（请求已结束、槽位尚未交还），
+ * 空格 = 可开新席位。对话结束后不占格。
  */
 export function SeatCells({
   used,
@@ -36,7 +36,7 @@ export function SeatCells({
   return (
     <div
       role='img'
-      aria-label={`席位 ${u}/${cap}，其中宽限 ${g}`}
+      aria-label={`席位 ${u}/${cap}，其中交接 ${g}`}
       className={cn('flex flex-wrap gap-[3px]', className)}
     >
       {Array.from({ length: cap }, (_, i) => {
@@ -82,7 +82,7 @@ export function SeatLegend({ className }: { className?: string }) {
       )}
     >
       {item('border-primary bg-primary', '进行中')}
-      {item('border-primary/70 bg-primary/25', '宽限保留')}
+      {item('border-primary/70 bg-primary/25', '交接')}
       {item('border-border bg-muted/60', '空闲')}
     </div>
   )

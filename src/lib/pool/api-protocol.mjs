@@ -16,6 +16,8 @@ import {
   responsesSseToChatChunk,
 } from '../protocol/codex-convert.mjs'
 import { usageFromSseLine } from '../protocol/handle-codex.mjs'
+import { BETA_CONTEXT_1M } from '../protocol/claude-code-betas.mjs'
+import { shouldPassContext1mByPolicy } from '../protocol/model-policy.mjs'
 
 export function resolveInferenceBackend(req) {
   if (req?.apiKeyKind !== 'managed') return 'oauth'
@@ -33,6 +35,66 @@ function joinHeaderMap(headers = {}) {
   for (const [k, v] of Object.entries(headers)) {
     if (v == null || v === '') continue
     out[k] = String(v)
+  }
+  return out
+}
+
+/**
+ * Native Anthropic Messages is a compatibility boundary.  Keep protocol
+ * headers supplied by the caller, including beta names this gateway does not
+ * know yet.  Headers the operator configured on the endpoint win; anthropic-beta
+ * is the union of endpoint and caller tokens so neither opt-in is dropped.
+ */
+function forwardAnthropicProtocolHeaders(headers = {}, protocol = '', protocolKind = '') {
+  if (protocol !== 'anthropic.messages' || protocolKind !== 'anthropic') return {}
+  const out = {}
+  for (const [rawName, rawValue] of Object.entries(headers || {})) {
+    const name = String(rawName || '').toLowerCase()
+    if (
+      !name.startsWith('anthropic-') &&
+      !name.startsWith('x-claude-code-') &&
+      !name.startsWith('x-stainless-') &&
+      name !== 'x-app' &&
+      name !== 'x-client-request-id' &&
+      name !== 'user-agent' &&
+      name !== 'accept-language' &&
+      name !== 'sec-fetch-mode'
+    )
+      continue
+    if (rawValue == null || rawValue === '') continue
+    out[name] = Array.isArray(rawValue) ? rawValue.join(',') : String(rawValue)
+  }
+  return out
+}
+
+function splitBetas(value) {
+  return String(value || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+}
+
+/** Caller context-1m follows the model-page 1M policy, same as the slot path. */
+function callerBetaTokens(value, model) {
+  const tokens = splitBetas(value)
+  if (!tokens.includes(BETA_CONTEXT_1M) || shouldPassContext1mByPolicy(model)) return tokens
+  return tokens.filter((t) => t !== BETA_CONTEXT_1M)
+}
+
+function mergeCallerProtocolHeaders(base = {}, caller = {}, configured = {}, model = '') {
+  const out = { ...base }
+  const configuredNames = new Set(Object.keys(configured).map((k) => k.toLowerCase()))
+  for (const [name, value] of Object.entries(caller)) {
+    const existing = Object.keys(out).filter((k) => k.toLowerCase() === name)
+    if (name === 'anthropic-beta') {
+      const merged = new Set([...existing.flatMap((k) => splitBetas(out[k])), ...callerBetaTokens(value, model)])
+      for (const k of existing) delete out[k]
+      if (merged.size) out[name] = [...merged].join(',')
+      continue
+    }
+    if (configuredNames.has(name)) continue
+    for (const k of existing) delete out[k]
+    out[name] = value
   }
   return out
 }
@@ -69,6 +131,89 @@ async function readLines(stream, onLine, lifecycle) {
   if (buf) {
     observeApiTerminal(buf, lifecycle)
     await onLine(buf)
+  }
+}
+
+function openAIResponsesSseEvent(line) {
+  const raw = String(line || '').trim()
+  if (!raw.startsWith('data:')) return null
+  const payload = raw.slice(5).trim()
+  if (!payload || payload === '[DONE]') return null
+  try {
+    return JSON.parse(payload)
+  } catch {
+    return null
+  }
+}
+
+function openAIResponsesItemHasOutput(item) {
+  if (!item || typeof item !== 'object') return false
+  if (item.arguments || item.input || item.result || item.encrypted_content) return true
+  for (const value of [item.content, item.summary]) {
+    if (!Array.isArray(value)) continue
+    if (
+      value.some(
+        (part) =>
+          part &&
+          typeof part === 'object' &&
+          (part.text || part.transcript || part.arguments || part.input || part.result || part.encrypted_content),
+      )
+    )
+      return true
+  }
+  return false
+}
+
+/** Lifecycle events are transport metadata, not downstream model output. */
+export function isOpenAIResponsesCommitEvent(event) {
+  if (!event || typeof event !== 'object') return false
+  const type = String(event.type || '').trim()
+  if (
+    !type ||
+    type === 'error' ||
+    type === 'response.failed' ||
+    type === 'response.created' ||
+    type === 'response.queued' ||
+    type === 'response.in_progress' ||
+    type === 'response.metadata' ||
+    type === 'keepalive'
+  )
+    return false
+  if (type === 'response.output_item.added' || type === 'response.output_item.done')
+    return openAIResponsesItemHasOutput(event.item)
+  if (
+    type === 'response.content_part.added' ||
+    type === 'response.content_part.done' ||
+    type === 'response.reasoning_summary_part.added' ||
+    type === 'response.reasoning_summary_part.done'
+  )
+    return !!(event.part?.text || event.part?.transcript)
+  if (type === 'response.function_call_arguments.done') return !!event.arguments
+  if (type === 'response.custom_tool_call_input.done') return !!event.input
+  if (type === 'response.image_generation_call.partial_image') return !!event.partial_image_b64
+  return type.startsWith('response.output_') || (type.startsWith('response.') && /\.(delta|done)$/.test(type))
+}
+
+function openAIResponsesFailure(event) {
+  if (!event || typeof event !== 'object') return null
+  if (event.type === 'error') return event
+  if (event.type !== 'response.failed') return null
+  return {
+    type: 'error',
+    error: event.response?.error || event.error || { type: 'server_error', message: 'Response failed' },
+  }
+}
+
+function mappedOpenAIResponsesFailure(resultBase, event, committed, extras = {}) {
+  const declared = Number(event?.error?.status || event?.status)
+  const mapped = mapUpstreamError(declared >= 400 && declared < 600 ? declared : 500, event)
+  return {
+    ...resultBase,
+    ...mapped,
+    ok: false,
+    terminalState: committed ? 'incomplete' : 'rejected',
+    committed,
+    ...extras,
   }
 }
 
@@ -189,14 +334,21 @@ async function runApiInferenceBody(
     ? { ...claudeToOpenAIResponsesRequest({ ...canonical, model: picked.upstream_model }), stream: true }
     : { ...canonical, model: picked.upstream_model, stream: true }
   if (requestContext) Object.assign(body, prepareClassifierBody(body))
-  const headers = {
-    'content-type': 'application/json',
-    accept: 'text/event-stream',
-    ...upstreamAuthHeaders(protocolKind, picked.key.api_key, {
-      ...extraHeaders,
-      auth_scheme: picked.endpoint.auth_scheme || extraHeaders.auth_scheme || extraHeaders.anthropic_apikey_auth_scheme,
-    }),
-  }
+  const callerProtocolHeaders = forwardAnthropicProtocolHeaders(req?.headers, protocol, protocolKind)
+  const headers = mergeCallerProtocolHeaders(
+    {
+      'content-type': 'application/json',
+      accept: 'text/event-stream',
+      ...upstreamAuthHeaders(protocolKind, picked.key.api_key, {
+        ...extraHeaders,
+        auth_scheme:
+          picked.endpoint.auth_scheme || extraHeaders.auth_scheme || extraHeaders.anthropic_apikey_auth_scheme,
+      }),
+    },
+    callerProtocolHeaders,
+    extraHeaders,
+    canonical.model,
+  )
 
   let upstream
   try {
@@ -493,51 +645,72 @@ async function runOpenAIResponsesUpstream({
   let sawTerminal = false
   let ttftMs = null
   let streamedUsage = null
+  let terminalFailure = null
+  const pendingLines = []
   const started = Date.now()
+
+  const writeStreamLine = (raw) => {
+    if (!res.headersSent) converters.writeSSEHeaders(res)
+    if (protocol === 'openai.responses') {
+      res.write(raw.endsWith('\n') ? raw : raw + '\n')
+      if (/response\.(completed|done)/.test(raw)) completed = true
+      return
+    }
+    try {
+      const mapped =
+        protocol === 'anthropic.messages'
+          ? responsesSseToAnthropicEvents(raw, anthropicSse)
+          : responsesSseToChatChunk(raw, 'codex', chatSse)
+      if (mapped) {
+        res.write(mapped)
+        if (mapped.includes('[DONE]') || mapped.includes('event: message_stop\n')) completed = true
+      }
+    } catch (error) {
+      if (error.code !== 'tool_arguments_mismatch') throw error
+      conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
+      const payload = JSON.stringify({ error: conversionError })
+      res.write(
+        protocol === 'anthropic.messages'
+          ? 'event: error\ndata: ' + JSON.stringify({ type: 'error', error: conversionError }) + '\n\n'
+          : 'data: ' + payload + '\n\ndata: [DONE]\n\n',
+      )
+    }
+  }
 
   await readLines(
     upstream,
     async (line) => {
       if (conversionError) return
       const raw = String(line || '')
+      const event = openAIResponsesSseEvent(raw)
+      const failure = openAIResponsesFailure(event)
+      if (failure) terminalFailure = failure
       const seen = usageFromSseLine(raw)
       if (seen) streamedUsage = seen
-      if (raw.startsWith('data:') && ttftMs == null) ttftMs = Date.now() - started
-      if (!committed && raw.startsWith('data:')) committed = true
+      const startsOutput = isOpenAIResponsesCommitEvent(event)
+      const completes = event?.type === 'response.completed' || event?.type === 'response.done'
+      const wasCommitted = committed
+      if ((startsOutput || completes) && ttftMs == null) ttftMs = Date.now() - started
+      if (!committed && (startsOutput || completes)) committed = true
       if (!clientStream) {
         chunks.push(raw)
         if (/response\.(completed|done)/.test(raw) || raw.trim() === 'data: [DONE]') sawTerminal = true
         return
       }
-      if (!res.headersSent) converters.writeSSEHeaders(res)
-      if (protocol === 'openai.responses') {
-        res.write(raw.endsWith('\n') ? raw : `${raw}\n`)
-        if (/response\.(completed|done)/.test(raw)) completed = true
+      if (!wasCommitted) {
+        pendingLines.push(raw)
+        if (!committed) return
+        for (const pending of pendingLines.splice(0)) writeStreamLine(pending)
         return
       }
-      try {
-        const mapped =
-          protocol === 'anthropic.messages'
-            ? responsesSseToAnthropicEvents(raw, anthropicSse)
-            : responsesSseToChatChunk(raw, 'codex', chatSse)
-        if (mapped) {
-          res.write(mapped)
-          if (mapped.includes('[DONE]') || mapped.includes('event: message_stop\n')) completed = true
-        }
-      } catch (error) {
-        if (error.code !== 'tool_arguments_mismatch') throw error
-        conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
-        res.write(
-          protocol === 'anthropic.messages'
-            ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
-            : `data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`,
-        )
-      }
+      writeStreamLine(raw)
     },
     lifecycle,
   )
 
   if (!clientStream) {
+    if (terminalFailure)
+      return mappedOpenAIResponsesFailure(resultBase, terminalFailure, committed, { usage: streamedUsage, ttftMs })
     let assembled
     let outBody
     try {
@@ -554,7 +727,7 @@ async function runOpenAIResponsesUpstream({
         status: 502,
         body: { error: { type: 'upstream_protocol_error', code: error.code, message: error.message } },
         terminalState: 'incomplete',
-        committed: true,
+        committed,
         usage: streamedUsage,
       }
     }
@@ -566,9 +739,11 @@ async function runOpenAIResponsesUpstream({
       body: outBody,
       usage: assembled?.usage || streamedUsage || outBody?.usage || null,
       terminalState: complete ? 'verified' : hasBody ? 'incomplete' : 'rejected',
-      committed: true,
+      committed,
     }
   }
+  if (terminalFailure)
+    return mappedOpenAIResponsesFailure(resultBase, terminalFailure, committed, { usage: streamedUsage, ttftMs })
   if (conversionError)
     return {
       ...resultBase,

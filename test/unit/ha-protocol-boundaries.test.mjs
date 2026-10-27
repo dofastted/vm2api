@@ -4,7 +4,18 @@ import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const fixture = fileURLToPath(new URL('../fixtures/ha-protocol-boundaries.mjs', import.meta.url))
-for (const kind of ['claude', 'touch', 'chat', 'responses', 'completions', 'gpt', 'api', 'search', 'rewrite-gpt']) {
+for (const kind of [
+  'claude',
+  'touch',
+  'chat',
+  'responses',
+  'completions',
+  'gpt',
+  'api',
+  'search',
+  'images',
+  'rewrite-gpt',
+]) {
   test(`HA refuses legacy effects and unsupported backend: ${kind}`, () => {
     const env = { ...process.env, VM2API_CONTROL_PLANE_MODE: 'kubernetes-ha', VM2API_HA_PROTOCOL_CASE: kind }
     delete env.NODE_TEST_CONTEXT

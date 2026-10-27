@@ -42,6 +42,10 @@ export type RequestLogItem = {
   ip?: string
   /** debug 模式下网关实际回给客户端的响应；body 为原始文本（SSE）或已解析 JSON。 */
   response?: DebugResponseCapture | null
+  /** CLI fetch-boundary headers; absent for unsupported runtimes or old records. */
+  outbound_headers?: Record<string, unknown> | null
+  outbound_headers_source?: 'cli_final' | 'unavailable' | null
+  worker_envelope_headers?: Record<string, unknown> | null
   [key: string]: unknown
 }
 

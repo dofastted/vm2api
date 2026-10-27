@@ -138,6 +138,11 @@ const SUMMARY_COLUMNS = [
   'inbound_device_id',
   'intercept',
   'vm_owner_user_id',
+  'image_model',
+  'image_usage',
+  'image_input_tokens',
+  'image_output_tokens',
+  'image_cost',
 ]
 
 function toRow(rec) {
@@ -153,7 +158,9 @@ function toRow(rec) {
       c === 'cache_creation_tokens' ||
       c === 'cache_creation_5m_tokens' ||
       c === 'cache_creation_1h_tokens' ||
-      c === 'web_search_requests'
+      c === 'web_search_requests' ||
+      c === 'image_input_tokens' ||
+      c === 'image_output_tokens'
     )
       return integerValue(rec[c])
     return rec[c] ?? null
@@ -606,23 +613,34 @@ export class UsageLogsRepo {
     }
   }
 
+  /** Stored image generation usage for re-pricing; Images endpoint rows bill it alone. */
+  _imageForPrice(row) {
+    const only = row.protocol === 'openai.images'
+    if (!row.image_usage && !only) return null
+    let usage = null
+    try {
+      usage = row.image_usage ? JSON.parse(row.image_usage) : null
+    } catch {}
+    return { usage, model: row.image_model, only }
+  }
+
   async _repriceRows(rows, { writeActualCost = false } = {}) {
     if (!rows.length) return { rows: 0, changed: 0, still_unpriced: 0, delta_usd: 0 }
     const upd = writeActualCost
       ? this.db.prepare(`
       UPDATE usage_logs
          SET input_cost = $1, output_cost = $2, cache_read_cost = $3,
-             cache_creation_cost = $4, web_search_cost = $5, total_cost = $6,
-             actual_cost = $7, pricing_model = $8, price_source = $9, price_version = $10,
-             long_context = $11
-       WHERE id = $12
+             cache_creation_cost = $4, web_search_cost = $5, image_cost = $6, total_cost = $7,
+             actual_cost = $8, pricing_model = $9, price_source = $10, price_version = $11,
+             long_context = $12
+       WHERE id = $13
     `)
       : this.db.prepare(`
       UPDATE usage_logs
          SET input_cost = $1, output_cost = $2, cache_read_cost = $3,
-             cache_creation_cost = $4, web_search_cost = $5, total_cost = $6,
-             pricing_model = $7, price_source = $8, price_version = $9, long_context = $10
-       WHERE id = $11
+             cache_creation_cost = $4, web_search_cost = $5, image_cost = $6, total_cost = $7,
+             pricing_model = $8, price_source = $9, price_version = $10, long_context = $11
+       WHERE id = $12
     `)
     let changed = 0
     let still_unpriced = 0
@@ -630,13 +648,14 @@ export class UsageLogsRepo {
     await withTransaction(this.db, async () => {
       for (const r of rows) {
         const model = r.upstream_model || r.model || r.requested_model
-        const priced = costColumnsFromUsage(this._usageForPrice(r), model)
+        const priced = costColumnsFromUsage(this._usageForPrice(r), model, this._imageForPrice(r))
         const same =
           (r.input_cost ?? null) === (priced.input_cost ?? null) &&
           (r.output_cost ?? null) === (priced.output_cost ?? null) &&
           (r.cache_read_cost ?? null) === (priced.cache_read_cost ?? null) &&
           (r.cache_creation_cost ?? null) === (priced.cache_creation_cost ?? null) &&
           (r.web_search_cost ?? null) === (priced.web_search_cost ?? null) &&
+          (r.image_cost ?? null) === (priced.image_cost ?? null) &&
           (r.total_cost ?? null) === (priced.total_cost ?? null) &&
           (r.pricing_model ?? null) === (priced.pricing_model ?? null) &&
           (r.price_source ?? null) === (priced.price_source ?? null) &&
@@ -658,6 +677,7 @@ export class UsageLogsRepo {
             priced.cache_read_cost ?? null,
             priced.cache_creation_cost ?? null,
             priced.web_search_cost ?? null,
+            priced.image_cost ?? null,
             priced.total_cost ?? null,
             actual,
             priced.pricing_model ?? UNPRICED_MODEL,
@@ -673,6 +693,7 @@ export class UsageLogsRepo {
             priced.cache_read_cost ?? null,
             priced.cache_creation_cost ?? null,
             priced.web_search_cost ?? null,
+            priced.image_cost ?? null,
             priced.total_cost ?? null,
             priced.pricing_model ?? UNPRICED_MODEL,
             priced.price_source ?? null,
@@ -698,9 +719,9 @@ export class UsageLogsRepo {
       SELECT id, model, upstream_model, requested_model,
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests,
-             rate_multiplier, service_tier, speed,
+             rate_multiplier, service_tier, speed, protocol, image_model, image_usage,
              input_cost, output_cost, cache_read_cost, cache_creation_cost, web_search_cost,
-             total_cost, pricing_model, price_source, price_version, long_context
+             image_cost, total_cost, pricing_model, price_source, price_version, long_context
       FROM usage_logs
       WHERE pricing_model IS NULL
       LIMIT $1
@@ -718,9 +739,9 @@ export class UsageLogsRepo {
       SELECT id, model, upstream_model, requested_model,
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
              cache_creation_5m_tokens, cache_creation_1h_tokens, web_search_requests,
-             rate_multiplier, service_tier, speed,
+             rate_multiplier, service_tier, speed, protocol, image_model, image_usage,
              input_cost, output_cost, cache_read_cost, cache_creation_cost, web_search_cost,
-             total_cost, pricing_model, price_source, price_version, long_context
+             image_cost, total_cost, pricing_model, price_source, price_version, long_context
       FROM usage_logs ${where}
       ORDER BY id
       LIMIT 2000
@@ -801,6 +822,12 @@ export class UsageLogsRepo {
       unpriced: integerValue(row?.unpriced),
     }
     return withCacheHitRate(out)
+  }
+
+  /** Official cost of one slot / credential over a fixed span (a closed quota window). */
+  async costBetween({ since, until, vmId = null, accountId = null } = {}) {
+    const { cond, params } = filterCond({ since, until, vmId, accountId })
+    return await this._costSelect(cond, params)
   }
 
   async costByAccount({ since = null, until = null } = {}) {

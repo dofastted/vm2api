@@ -230,3 +230,20 @@ test('fresh zero percent is a measurement, not a missing reading', async (t) => 
   })
   assert.deepEqual(values(root).windows, [0, null])
 })
+
+test('manual quota refresh drops a stale codex_limited_until when windows are below cap', (t) => {
+  const parkedUntil = new Date(Date.now() + 5 * 86_400_000).toISOString()
+  const root = fixture(t, { codex_limited_until: parkedUntil })
+  persistCodexQuotaSnapshot(root, 'vm-a', {
+    extra: {
+      codex_primary_used_percent: 0,
+      codex_primary_window_minutes: 10080,
+      codex_secondary_used_percent: 0,
+      codex_secondary_window_minutes: 0,
+      codex_5h_used_percent: 0,
+      codex_7d_used_percent: 0,
+    },
+    credits: { has_credits: false, unlimited: false, balance: '0' },
+  })
+  assert.equal(getVm(root, 'vm-a').codex.extra.codex_limited_until, undefined)
+})

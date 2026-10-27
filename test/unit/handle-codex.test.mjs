@@ -7,6 +7,7 @@ import {
   isRetryableCodexTransport,
   runCodexKernelHop,
   handleCodexProtocol,
+  pickCodexCandidates,
   codexFailureHold,
   codexFailoverBudget,
   applyCodexRebuildBody,
@@ -132,6 +133,40 @@ function writeGptVm(root, id) {
     }),
   )
 }
+
+test('GPT candidates follow the caller owner scope', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-owner-'))
+  try {
+    writeGptVm(root, 'vm-gpt-platform')
+    writeGptVm(root, 'vm-gpt-mine')
+    writeGptVm(root, 'vm-gpt-other')
+    const setOwner = (id, owner) => {
+      const file = path.join(root, 'vms', `${id}.json`)
+      fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), owner_user_id: owner }))
+    }
+    setOwner('vm-gpt-mine', 'u1')
+    setOwner('vm-gpt-other', 'u2')
+    const tenant = await pickCodexCandidates(
+      root,
+      { headers: {}, apiKeyKind: 'managed', apiKeyRecord: { user_id: 'u1' } },
+      {
+        ownerScope: { type: 'user', userId: 'u1' },
+      },
+    )
+    assert.deepEqual(tenant.ids, ['vm-gpt-mine'])
+    const session = await pickCodexCandidates(root, {
+      headers: {},
+      panelUser: 'alice',
+      panelRole: 'user',
+      panelUserId: 'u1',
+    })
+    assert.deepEqual(session.ids, ['vm-gpt-mine'])
+    const platform = await pickCodexCandidates(root, { headers: {}, apiKeyKind: 'master' })
+    assert.deepEqual(platform.ids, ['vm-gpt-platform'])
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
 
 test('quota 429 hops the next GPT slot and records 5h/7d extra', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-hop-'))

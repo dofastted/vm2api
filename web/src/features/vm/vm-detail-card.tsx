@@ -44,6 +44,7 @@ import { StatusMark } from '@/components/status-mark'
 import { meQueryOptions } from '@/features/auth/queries'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
 import { usersQueryOptions } from '@/features/users/queries'
+import { ActiveVmBadge } from '@/features/vm/active-vm-badge'
 import { ClaudeSubscriptionButton } from '@/features/vm/claude-subscription-button'
 import { restrictionTitle } from '@/features/vm/clear-restriction'
 import { Field } from '@/features/vm/detail-section-primitives'
@@ -106,6 +107,7 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
     <>
       <div className='flex flex-wrap items-center gap-1.5'>
         <PlatformChip vm={vm} />
+        <ActiveVmBadge vm={vm} />
         <StatusMark tone={accountStatus(vm)} variant='pill' />
         {tier.key !== 'none' ? <StatusMark tone={tier} variant='pill' /> : null}
         {poolStatus(vm).key !== accountStatus(vm).key ? (

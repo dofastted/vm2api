@@ -18,7 +18,10 @@ import {
   pricingQueryOptions,
 } from '@/features/models/queries'
 import { EntryStrip } from './entry-strip'
+import { ImageToolSection } from './image-tool-section'
 import { ModelAdvanced } from './model-advanced'
+import { mappingTargets } from './model-mapping'
+import { ModelMappingCard } from './model-mapping-card'
 import { ModelRow } from './model-row'
 import { resetConfirmText, syncConfirmText } from './page-messages'
 import {
@@ -189,6 +192,19 @@ export function ModelsPage() {
         rec.params.on_adaptive = String(value)
         return
       }
+      if (key === 'default_effort') {
+        const effort = String(value)
+        rec.params.default_effort =
+          effort === 'off' ||
+          effort === 'low' ||
+          effort === 'medium' ||
+          effort === 'high' ||
+          effort === 'xhigh' ||
+          effort === 'max'
+            ? effort
+            : ''
+        return
+      }
       rec.params[key] = Number(value) || 0
     })
   }
@@ -213,6 +229,14 @@ export function ModelsPage() {
       if (!ok) return
     }
     setExpanded((cur) => (cur === id ? null : id))
+  }
+
+  function setImageTool(id: string, on: boolean) {
+    setDraft((prev) => {
+      const next = cloneJson(prev)
+      next.image_tools = { ...(next.image_tools || {}), [id]: { enabled: on } }
+      return next
+    })
   }
 
   function setPass1m(id: string, mode: Pass1mMode) {
@@ -251,6 +275,10 @@ export function ModelsPage() {
   }
 
   const claudePool = catalogPlatform === 'anthropic'
+  const imageTools = q.data?.image_tools || []
+  // Mapping targets follow the saved policy: the server validates against it.
+  const gptTargets = claudePool ? [] : mappingTargets(q.data?.models || [])
+  const imageIds = imageTools.flatMap((m) => [m.id, ...m.snapshots])
   const poolHint = claudePool
     ? 'Claude 号池。同一会话只占一个 VM session 窗口，不和 GPT 混调度。'
     : 'GPT 号池。粘性独立，不占用 Claude 原生 session 槽。'
@@ -402,6 +430,10 @@ export function ModelsPage() {
                 </div>
               </section>
 
+              {claudePool ? null : (
+                <ModelMappingCard targets={gptTargets} imageIds={imageIds} />
+              )}
+
               {dirty ? (
                 <p
                   role='status'
@@ -522,7 +554,7 @@ export function ModelsPage() {
                       pol={draft}
                       pricing={pricingQ.data?.policy?.[m.id]}
                       open={expanded === m.id}
-                      showBeta={claudePool}
+                      platform={catalogPlatform}
                       onToggleOpen={() => requestExpand(m.id)}
                       onToggleEnabled={(on) =>
                         patchModel(m.id, (rec) => {
@@ -537,12 +569,20 @@ export function ModelsPage() {
                 </div>
               )}
 
-              <ModelAdvanced
-                pol={draft}
-                claudePool={claudePool}
-                onCatalogMode={setCatalog}
-                onDefaults={patchDefaults}
-              />
+              {claudePool ? (
+                <ModelAdvanced
+                  pol={draft}
+                  onCatalogMode={setCatalog}
+                  onDefaults={patchDefaults}
+                />
+              ) : (
+                <ImageToolSection
+                  models={imageTools}
+                  enabled={draft.image_tools}
+                  pricing={pricingQ.data?.policy}
+                  onToggle={setImageTool}
+                />
+              )}
             </div>
           </QueryGate>
         </TabsContent>

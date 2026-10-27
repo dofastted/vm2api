@@ -173,6 +173,26 @@ test('kernel inspection reports a change without writing the slot', () => {
     fs.rmSync(project, { recursive: true, force: true })
   }
 })
+test('cli-node inspection reports a change without writing the slot', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wrap-cli-node-'))
+  try {
+    const template = seedTemplate(project)
+    const vm = { id: 'vm-13' }
+    assert.equal(materializeWrapCli(project, vm).ok, true)
+    const dest = path.join(wrapCliHomeDir(project, 'vm-13'), 'cli-node')
+    const before = fs.readFileSync(dest)
+    fs.writeFileSync(path.join(template, 'cli-node'), 'replacement-cli')
+    const checked = inspectKernelChanges(project, [vm])
+    assert.equal(checked.changed_count, 1)
+    assert.deepEqual(fs.readFileSync(dest), before)
+    const synced = syncWrapSample(project, [vm])
+    assert.equal(synced.items[0].kernel_changed, true)
+    assert.equal(fs.readFileSync(dest, 'utf8'), 'replacement-cli')
+    assert.equal(inspectKernelChanges(project, [vm]).changed_count, 0)
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
 test('a failed kernel restart stays pending until the next sync', () => {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wrap-cli-pending-'))
   try {

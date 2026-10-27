@@ -202,6 +202,17 @@ export type ClaudeSubscription = {
   last_error?: string | null
 }
 
+/** 单台 VM 上一个被 client session 占住的槽位。 */
+export type SeatOccupant = {
+  index: number
+  session_id: string
+  state: 'active' | 'held' | 'idle' | string
+  inflight: number
+  held_until?: number | null
+}
+
+export type ScheduleState = 'on' | 'off' | 'unschedulable' | 'restricted'
+
 export type Vm = {
   claude_subscription?: ClaudeSubscription
   id: string
@@ -246,10 +257,27 @@ export type Vm = {
   proxy_id?: string
   schedulable?: boolean
   schedule_manual?: boolean
-  /** Operator switch vs quota/cooldown park. */
-  schedule_state?: 'on' | 'restricted' | 'off'
+  /**
+   * 四态：调度开 / 调度关（仅操作员）/ 不可调度（确定性错误，人工开回）/
+   * 受限（自动恢复）。由后端 `resolveSlotState` 给出，前端不再自行推断。
+   */
+  schedule_state?: ScheduleState
   restriction_reason?: string | null
+  /** 受限原因文案（后端归因表）。 */
+  restriction_text?: string | null
   restriction_until?: number | null
+  /** `new_session`：只拦新会话，已入座会话照常（席位满、临近闸线）。 */
+  restriction_scope?: 'slot' | 'new_session' | null
+  /** 软受限：全池没有「开」的槽时新会话仍可落上来。 */
+  restriction_soft?: boolean
+  unschedulable_reason?: string | null
+  unschedulable_text?: string | null
+  unschedulable_detail?: Record<string, unknown> | null
+  schedule_off?: boolean
+  schedule_hold?: {
+    reason: string
+    detail?: Record<string, unknown> | null
+  } | null
   /** Claude 单元熔断（Codex 为 null）。连续 5xx 达阈值后打开，到期只放 1 个探测。 */
   circuit?: VmCircuit | null
   cooldown_until?: number
@@ -442,12 +470,14 @@ export type Vm = {
   sessions?: { active?: number; max?: number }
   session_active?: number
   session_max?: number
-  /** 预调度席位簿：已占用的不同席位数，含宽限中的（Codex 为 null）。 */
+  /** 预调度席位簿：正在占用槽位的 client session 数。对话结束即释放，粘性 TTL 不占槽（Codex 为 null）。 */
   seats_used?: number | null
   /** 席位上限（VM 覆盖 → 全局 `inference.session_slots`）。 */
   seats_max?: number | null
-  /** `seats_used` 中请求已结束、为原设备保留的宽限席位数。 */
+  /** 重启交接短窗口里、请求已结束但槽位尚未交还的数量。正常结束后为 0。 */
   seats_grace?: number | null
+  /** 这台 VM 上实际占着槽位的 session。缺省表示旧快照没有逐席明细。 */
+  seat_sessions?: SeatOccupant[] | null
   /** 在该 VM 上排队的请求数（等席位、并发、冷却 / RPM）。 */
   queue_depth?: number | null
   /** `queue_depth` 中已有席位、只在等并发的请求数。 */
@@ -492,6 +522,8 @@ export type PoolSeatLive = {
   conc_waiting: number
   /** 正在这台 VM 上执行的请求数（含无席位探测与 pin）。 */
   inflight?: number
+  /** 占着槽位的 session；旧帧可能没有。 */
+  sessions?: SeatOccupant[]
 }
 
 /** `GET /api/panel/pool/stream` 的 `event: seats` 负载。 */
@@ -565,6 +597,34 @@ export type VmUsageStats = {
   endpoints: VmUsageStatsRank[]
 }
 
+/** `billing.window_5h` / `window_7d`：本窗口官方价汇总。 */
+export type VmBillingPeriod = {
+  requests: number
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_creation_tokens: number
+  total_cost: number
+}
+
+/** `billing.prev_window_5h` / `prev_window_7d`：上一个已结束的额度窗口，花费按窗口起止从日志汇总。 */
+export type VmClosedWindow = VmBillingPeriod & {
+  start: string
+  end: string
+  /** 窗口结束前最后一次读到的已用比例（0–1）。 */
+  used_ratio: number
+  /** 含缓存的 token 合计。 */
+  tokens: number
+  unpriced: number
+}
+
+/** `billing.window_5h_projection`：本窗口预计剩余。`source` 是总额度按哪个窗口推算，null 为算不出。 */
+export type VmWindowProjection = {
+  source: 'current' | 'previous' | null
+  total_usd: number | null
+  remaining_usd: number | null
+}
+
 export type VmDetailPayload = {
   vm?: Vm
   kernel?: VmKernelSnapshot | null
@@ -574,6 +634,11 @@ export type VmDetailPayload = {
     | (Record<string, unknown> & {
         by_model?: VmBillingModelRow[]
         usage_stats?: VmUsageStats | null
+        window_5h?: VmBillingPeriod | null
+        window_7d?: VmBillingPeriod | null
+        prev_window_5h?: VmClosedWindow | null
+        prev_window_7d?: VmClosedWindow | null
+        window_5h_projection?: VmWindowProjection | null
       })
     | null
   [key: string]: unknown
