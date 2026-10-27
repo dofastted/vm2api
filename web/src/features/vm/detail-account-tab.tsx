@@ -23,6 +23,7 @@ import {
 import { StatusMark } from '@/components/status-mark'
 import { AllowedModelsCard } from '@/features/vm/allowed-models-card'
 import { AuthSchemeEditor } from '@/features/vm/auth-scheme-editor'
+import { ClaudeSubscriptionButton } from '@/features/vm/claude-subscription-button'
 import { CodexCredentialPanel } from '@/features/vm/codex-credential-panel'
 import { ConvertOauthToSetupButton } from '@/features/vm/convert-oauth-button'
 import { CredentialEditorButton } from '@/features/vm/credential-editor'
@@ -216,6 +217,7 @@ export function VmAccountTab(props: VmAccountTabProps) {
                 </Field>
               )}
               <div className='flex flex-wrap items-center gap-2 pt-2'>
+                <ClaudeSubscriptionButton vm={vm} />
                 {gpt ? null : (
                   <ConvertOauthToSetupButton
                     vm={vm}

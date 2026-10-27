@@ -147,7 +147,7 @@ const LOG_STATS_GET = new Set([
 
 function isSuperVmRead(path) {
   if (path === '/api/panel/vms/fleet-status' || path === '/api/panel/vms/create-options') return false
-  return /^\/api\/panel\/vms\/[^/]+$/.test(path)
+  return /^\/api\/panel\/vms\/[^/]+(?:\/claude-subscription)?$/.test(path)
 }
 
 function isSuperSchedule(method, path) {
@@ -171,6 +171,7 @@ function userVmPathAllowed(method, path) {
     if (rest === 'oauth/credential' || rest === 'package') return false
     return (
       rest === 'test-schedule' ||
+      rest === 'claude-subscription' ||
       rest.startsWith('oauth/') ||
       rest === 'probe' ||
       rest === 'count-tokens' ||
@@ -198,11 +199,12 @@ function userVmPathAllowed(method, path) {
       rest === 'openai-quota/reset' ||
       rest === 'claude-reset/query' ||
       rest === 'claude-reset/redeem' ||
+      rest === 'claude-subscription' ||
       rest.startsWith('oauth/')
     )
   }
-  if (method === 'PUT') return rest === 'test-schedule' || rest === 'oauth/credential'
-  if (method === 'DELETE') return !rest || rest === 'test-schedule'
+  if (method === 'PUT') return rest === 'test-schedule' || rest === 'oauth/credential' || rest === 'claude-subscription'
+  if (method === 'DELETE') return !rest || rest === 'test-schedule' || rest === 'claude-subscription'
   return false
 }
 

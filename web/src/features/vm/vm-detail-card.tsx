@@ -44,6 +44,7 @@ import { StatusMark } from '@/components/status-mark'
 import { meQueryOptions } from '@/features/auth/queries'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
 import { usersQueryOptions } from '@/features/users/queries'
+import { ClaudeSubscriptionButton } from '@/features/vm/claude-subscription-button'
 import { restrictionTitle } from '@/features/vm/clear-restriction'
 import { Field } from '@/features/vm/detail-section-primitives'
 import { NodeChip } from '@/features/vm/node-chip'
@@ -273,6 +274,7 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
             >
               <RefreshCw /> 刷新令牌
             </Button>
+            <ClaudeSubscriptionButton vm={vm} />
           </>
         ) : null}
         <Button

@@ -28,6 +28,7 @@ import {
 import { CredLaneChip, SlotIdentity } from '@/components/platform-chip'
 import { StatusMark } from '@/components/status-mark'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
+import { subscriptionDateText } from '@/features/vm/claude-subscription'
 import { NodeChip } from '@/features/vm/node-chip'
 import { OpenaiPlanBadge } from '@/features/vm/openai-plan-badge'
 import { RuntimeChip } from '@/features/vm/runtime-chip'
@@ -331,7 +332,12 @@ function WeekPills({ week }: { week: VmWeekOutcome }) {
 function TierBadge({ vm }: { vm: Vm }) {
   if (isCodexVm(vm)) return <OpenaiPlanBadge vm={vm} />
   const skin = tierVisual(vm)
-  if (skin.key !== 'pro' && skin.key !== 'max' && skin.key !== 'unknown') {
+  if (
+    !vm.claude_subscription?.plan &&
+    skin.key !== 'pro' &&
+    skin.key !== 'max' &&
+    skin.key !== 'unknown'
+  ) {
     return null
   }
   return (
@@ -341,7 +347,7 @@ function TierBadge({ vm }: { vm: Vm }) {
         skin.badge
       )}
     >
-      {skin.label}
+      {vm.claude_subscription?.plan || skin.label}
     </span>
   )
 }
@@ -367,6 +373,19 @@ function SlotCell({ vm }: { vm: Vm }) {
         vm={vm}
         className='truncate text-[10.5px] text-muted-foreground'
       />
+      {!isCodexVm(vm) ? (
+        <div
+          className='truncate text-[10.5px] text-muted-foreground'
+          title={
+            vm.claude_subscription?.last_error
+              ? '最近查询失败，显示上次成功查询结果'
+              : undefined
+          }
+        >
+          {subscriptionDateText(vm.claude_subscription)}
+          {vm.claude_subscription?.last_error ? ' · 待更新' : ''}
+        </div>
+      ) : null}
     </div>
   )
 }

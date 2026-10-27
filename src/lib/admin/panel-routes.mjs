@@ -35,6 +35,13 @@ import { RuntimeSettings as SettingsRepo } from '../db/settings-state.mjs'
 import { parseCodexImportPayload, upsertCodexAccount, readCodexAccounts } from '../vm/codex-slot.mjs'
 import { generateAuthUrl, exchangeAuthCode, normalizeOauthFlavor } from '../oauth/oauth-auth-url.mjs'
 import { sessionKeyToOAuth, panelImportErrorPayload } from '../oauth/cookie-auth.mjs'
+import {
+  normalizeSubscriptionSessionKey,
+  queryClaudeSubscription,
+  subscriptionError,
+  subscriptionIdentity,
+} from '../oauth/claude-subscription.mjs'
+import { ClaudeSubscriptionsRepo } from '../db/repos/claude-subscriptions-repo.mjs'
 import { enrichOauthIdentity } from '../oauth/oauth-identity.mjs'
 import { generateCodexAuthUrl, exchangeCodexAuthCode } from '../oauth/codex-oauth.mjs'
 import {
@@ -2874,6 +2881,93 @@ export function createPanelHandler(ctx) {
           const saved = persistVmOwner(cfg.paths.project, id, { ownerUserId: nextOwner, origin })
           return json(res, 200, panel.ok({ vm: summarizeVm(saved, cfg.paths.project, ctx.routingConfig) }))
         })
+      }
+
+      // The billing cookie is separate from worker/OAuth credentials. GET never calls Claude.
+      if (
+        ['GET', 'PUT', 'POST', 'DELETE'].includes(req.method) &&
+        /^\/api\/panel\/vms\/[^/]+\/claude-subscription$/.test(p)
+      ) {
+        const id = p.split('/')[4]
+        const vm = getVm(cfg.paths.project, id)
+        if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+        if (isCodexVm(vm)) return json(res, 400, { ok: false, error: { message: '该功能仅适用于 Claude 订阅账号' } })
+        const repo = new ClaudeSubscriptionsRepo()
+        const identity = subscriptionIdentity(vm)
+        if (!identity)
+          return json(res, 400, {
+            ok: false,
+            error: {
+              code: 'subscription_identity_required',
+              message: subscriptionError('subscription_identity_required').message,
+            },
+          })
+        const assertCurrent = () => {
+          const current = getVm(cfg.paths.project, id)
+          const live = subscriptionIdentity(current)
+          if (
+            !live ||
+            live.account_uuid !== identity.account_uuid ||
+            live.org_uuid !== identity.org_uuid ||
+            current.owner_user_id !== vm.owner_user_id
+          ) {
+            throw subscriptionError('subscription_changed', 409)
+          }
+        }
+        let version
+        try {
+          if (req.method === 'GET') return json(res, 200, panel.ok(await repo.view(identity)))
+          if (req.method === 'DELETE') return json(res, 200, panel.ok(await repo.remove(identity)))
+          repo.requireEncryption()
+          const slotProxy = requireSlotProxy(vm)
+          if (!slotProxy.ok) return json(res, slotProxy.status, { ok: false, error: { message: slotProxy.message } })
+          let sessionKey
+          if (req.method === 'PUT') {
+            const body = await readBody(req, 8192).catch(() => {
+              throw subscriptionError('subscription_session_invalid', 400)
+            })
+            sessionKey = normalizeSubscriptionSessionKey(body?.session_key)
+          } else {
+            const saved = await repo.credential(identity)
+            sessionKey = saved.sessionKey
+            version = saved.version
+          }
+          const snapshot = await queryClaudeSubscription({
+            vm,
+            sessionKey,
+            cfg,
+            proxyUrl: slotProxy.proxyUrl,
+            request: ctx.claudeSubscriptionRequest,
+          })
+          assertCurrent()
+          const result = version
+            ? await repo.update(identity, version, { snapshot })
+            : await repo.save(identity, sessionKey, snapshot)
+          return json(res, 200, panel.ok(result))
+        } catch (error) {
+          if (!String(error.code || '').startsWith('subscription_')) throw error
+          try {
+            assertCurrent()
+          } catch (changed) {
+            error = changed
+          }
+          let data
+          try {
+            data =
+              version && error.code !== 'subscription_changed'
+                ? await repo.update(identity, version, { error: error.code })
+                : await repo.view(identity)
+          } catch (changed) {
+            if (changed.code !== 'subscription_changed') throw changed
+            error = changed
+            data = await repo.view(identity)
+          }
+          return json(res, error.status || 502, {
+            ok: false,
+            error: { code: error.code, message: error.message },
+            data,
+          })
+        }
       }
 
       // GET /api/panel/vms/:id

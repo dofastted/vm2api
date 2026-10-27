@@ -48,6 +48,7 @@ import { hardBlockOf } from '../pool/rate-limit-service.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { isKubernetesMode } from '../core/control-plane-mode.mjs'
 import { getDb } from '../db/database.mjs'
+import { stampClaudeSubscriptions } from '../db/repos/claude-subscriptions-repo.mjs'
 import { ExecutionAdmissionsRepo } from '../db/repos/execution-admissions-repo.mjs'
 import { accountIdOf, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
 import { codexMaxSessions } from '../pool/codex-slot-pool.mjs'
@@ -648,6 +649,7 @@ export async function buildDashboard({
   )
   const snap = accountQuota.snapshot()
   await stampSharedCircuitViews(vms, cfg.paths.project, routingConfig)
+  await stampClaudeSubscriptions(vms)
   const accounts = liveAccounts(snap.accounts, listed)
   const peak5 = Math.max(0, ...accounts.map((a) => Number(a.unified?.['5h']?.utilization || 0)), 0)
   const peak7 = Math.max(0, ...accounts.map((a) => Number(a.unified?.['7d']?.utilization || 0)), 0)
@@ -778,6 +780,7 @@ export async function buildVmList({
     }),
   )
   await stampSharedCircuitViews(vms, cfg.paths.project, routingConfig)
+  await stampClaudeSubscriptions(vms)
   const accounts = (() => {
     try {
       return accountQuota?.snapshot?.().accounts || []
@@ -846,6 +849,7 @@ export async function buildVmDetail({
     role,
   })
   await stampSharedCircuitViews([summary], cfg.paths.project, routingConfig)
+  await stampClaudeSubscriptions([summary])
   const acc = findAccount(accountQuota, summary)
   const billing = await (async () => {
     try {

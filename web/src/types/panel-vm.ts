@@ -188,7 +188,22 @@ export type VmPhysicalFeatures = {
   runtimes?: string | null
 }
 
+export type ClaudeSubscription = {
+  configured: boolean
+  encryption_available?: boolean
+  plan?: string | null
+  status?: string
+  expires_at?: string | null
+  expires_date_only?: boolean
+  renews_at?: string | null
+  renews_date_only?: boolean
+  fetched_at?: string | null
+  checked_at?: string | null
+  last_error?: string | null
+}
+
 export type Vm = {
+  claude_subscription?: ClaudeSubscription
   id: string
   name?: string
   owner_user_id?: string | null

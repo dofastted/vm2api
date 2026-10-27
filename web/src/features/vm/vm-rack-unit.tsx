@@ -4,8 +4,9 @@ import type { Vm } from '@/types/panel-vm'
 import { resetCountdown } from '@/lib/fable-status'
 import { fmtNum, fmtUsd } from '@/lib/format'
 import { cn } from '@/lib/utils'
-import { slotCredentialLabel } from '@/lib/vm-kind'
+import { isCodexVm, slotCredentialLabel } from '@/lib/vm-kind'
 import { vmCostLedger } from '@/lib/vm-usage'
+import { subscriptionDateText } from '@/features/vm/claude-subscription'
 import { RISK_SOLID, riskFg, riskLevel } from '@/features/vm/usage-meter'
 import {
   BLADE_STATE_CLASS,
@@ -101,15 +102,23 @@ export const VmUnit = memo(function VmUnit({
         </span>
         <TierBadge vm={vm} className='ms-auto h-4 px-1 text-[9.5px]' />
       </div>
-      <span
-        title={email || undefined}
-        className={cn(
-          'col-span-2 truncate text-[12.5px] font-semibold',
-          !email && 'font-medium text-muted-foreground'
-        )}
-      >
-        {slotCredentialLabel(vm, true)}
-      </span>
+      <div className='col-span-2 min-w-0'>
+        <div
+          title={email || undefined}
+          className={cn(
+            'truncate text-[12.5px] font-semibold',
+            !email && 'font-medium text-muted-foreground'
+          )}
+        >
+          {slotCredentialLabel(vm, true)}
+        </div>
+        {!isCodexVm(vm) ? (
+          <div className='truncate text-[10.5px] text-muted-foreground'>
+            {subscriptionDateText(vm.claude_subscription)}
+            {vm.claude_subscription?.last_error ? ' · 待更新' : ''}
+          </div>
+        ) : null}
+      </div>
       {state === 'live' ? (
         <span className='flex items-end gap-1.5'>
           {vmWindows(vm).map((w) => (

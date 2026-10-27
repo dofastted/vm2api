@@ -11,7 +11,7 @@ import { credEndpointLabel, credEndpointOf } from '@/lib/cred-type'
 import { fmtAgo, fmtNum, fmtUsd } from '@/lib/format'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
-import { slotCredentialLabel } from '@/lib/vm-kind'
+import { isCodexVm, slotCredentialLabel } from '@/lib/vm-kind'
 import {
   claudeTier,
   credentialStatus,
@@ -23,6 +23,7 @@ import {
 import { vmTotalCost, vmTotalTokens } from '@/lib/vm-usage'
 import { StatusMark } from '@/components/status-mark'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
+import { subscriptionDateText } from '@/features/vm/claude-subscription'
 import { runtimeTypeLabel, runtimeTypeOf } from '@/features/vm/machine-spec'
 import {
   SchedulableSwitch,
@@ -66,7 +67,7 @@ export function tierStyle(vm: Vm): CSSProperties | undefined {
 
 export function TierBadge({ vm, className }: { vm: Vm; className?: string }) {
   const skin = tierVisual(vm)
-  if (skin.key === 'none') return null
+  if (skin.key === 'none' && !vm.claude_subscription?.plan) return null
   return (
     <span
       className={cn(
@@ -75,7 +76,7 @@ export function TierBadge({ vm, className }: { vm: Vm; className?: string }) {
         className
       )}
     >
-      {claudeTier(vm).label}
+      {vm.claude_subscription?.plan || claudeTier(vm).label}
     </span>
   )
 }
@@ -452,6 +453,12 @@ export const VmBlade = memo(function VmBlade({
         >
           {slotCredentialLabel(vm)}
         </span>
+        {!isCodexVm(vm) ? (
+          <span className='col-span-2 truncate text-[10.5px] text-muted-foreground'>
+            {subscriptionDateText(vm.claude_subscription)}
+            {vm.claude_subscription?.last_error ? ' · 待更新' : ''}
+          </span>
+        ) : null}
         {restricted && state !== 'dead' ? (
           <StatusMark
             variant='pill'
