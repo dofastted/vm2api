@@ -207,7 +207,12 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
             startReady: async () => ({
               ok: true,
               rust_ok: true,
-              rust: { ok: true, health: { vm_telemetry: true, telemetry_ready: true } },
+              // startSlotReady nests it: { ok, engine, rust: { ok, reason, health } }
+              rust: {
+                ok: true,
+                engine: 'rust',
+                rust: { ok: true, health: { vm_telemetry: true, telemetry_ready: true } },
+              },
             }),
           }),
         postTelemetry: async () => ({ ok: true }),

@@ -37,13 +37,17 @@ export async function prepareSlotOAuth({
     throw fail(blocked || 'proxy_required', 'OAuth requires the target VM bound egress')
   }
   const boot = await startReady(vm, projectRoot, { routing, allowMissingCredential: true, timeoutMs })
+  // startSlotReady nests the kernel result: boot.rust = { ok, engine, rust: { ok, reason, health } }.
+  // startReady is injectable, so accept a flat boot.rust.health as well.
+  const kernel = boot?.rust?.rust || boot?.rust
+  const health = kernel?.health || boot?.rust?.health
   if (
     !boot?.ok ||
     boot.rust_ok === false ||
     !boot.rust?.ok ||
     boot.rust.skipped ||
-    boot.rust.health?.vm_telemetry !== true ||
-    boot.rust.health?.telemetry_ready !== true
+    health?.vm_telemetry !== true ||
+    health?.telemetry_ready !== true
   ) {
     throw fail(boot?.rust?.code || boot?.code || 'oauth_runtime_not_ready', 'Target VM native CLI is not ready')
   }
