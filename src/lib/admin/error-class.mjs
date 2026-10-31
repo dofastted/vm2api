@@ -3,7 +3,7 @@
  * Derived from status / error_code / message so historical rows classify without a migration.
  */
 
-import { isUsagePolicyErrorMessage } from '../core/errors.mjs'
+import { isUnanswerablePromptMessage } from '../core/errors.mjs'
 
 export const ERROR_CLASSES = {
   auth: { id: 'auth', owner: 'client', label: '认证' },
@@ -244,7 +244,7 @@ export function classifyRequestError(row = {}) {
   if (
     id !== 'auth' &&
     id !== 'credential' &&
-    isUsagePolicyErrorMessage(row?.error_message) &&
+    isUnanswerablePromptMessage(row?.error_message) &&
     !isOauthCredentialFailure(row, text, code)
   ) {
     id = 'refusal'

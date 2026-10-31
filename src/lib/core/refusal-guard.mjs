@@ -114,11 +114,13 @@ export function isUpstreamRefusal(result = {}, extra = {}) {
   if (isUsagePolicyErrorMessage(message)) return true
   const codes = [
     result?.body?.error?.code,
+    result?.body?.error?.upstream_code,
     result?.body?.code,
     result?.code,
     result?.error_code,
     extra?.error_code,
     extra?.code,
+    extra?.upstream_code,
   ]
   return codes.some(isContentPolicyErrorCode)
 }

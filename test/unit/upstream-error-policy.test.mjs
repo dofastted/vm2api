@@ -537,6 +537,9 @@ test('200 refusal with empty visible output is content_filter, not success', () 
   assert.equal(policy.scope, 'request')
   assert.equal(policy.action, 'stop')
   assert.equal(policy.reason, 'content_filter_refusal')
+  assert.equal(policy.rememberRefusal, true)
+  assert.equal(policy.refusalTtlMs, 0)
+  assert.equal(policy.decision.origin, 'client')
 })
 
 test('Usage Policy API Error stops the request and is cached with no expiry', () => {
@@ -564,6 +567,60 @@ test('Usage Policy API Error stops the request and is cached with no expiry', ()
     assert.notEqual(policy.reason, 'invalid_request')
     assert.notEqual(policy.reason, 'provider_pause')
   }
+})
+
+test('third-party extra-usage 400 and 503 are cached refusals, not invalid requests', () => {
+  const messages = [
+    "HTTP 400: Third-party apps now draw from your extra usage, not your plan limits. We've added a $20 credit to get you started.",
+    'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Third-party apps now draw from your extra usage, not your plan limits."}}',
+    '400 no third-party apps allowed on subscription',
+  ]
+  for (const status of [400, 503]) {
+    for (const message of messages) {
+      const policy = classifyUpstreamResult({
+        ok: false,
+        status,
+        terminalState: 'rejected',
+        body: {
+          type: 'error',
+          error: { type: 'invalid_request_error', code: 'upstream_invalid_request', message },
+        },
+      })
+      assert.equal(policy.action, 'stop', `${status} ${message}`)
+      assert.equal(policy.reason, 'usage_policy_refusal')
+      assert.equal(policy.rememberRefusal, true)
+      assert.equal(policy.refusalTtlMs, 0)
+      assert.equal(policy.cooldownUntil, null)
+      assert.equal(policy.circuit, undefined)
+      assert.equal(policy.decision.origin, 'client')
+      assert.equal(shouldContinue(policy), false)
+      assert.notEqual(policy.reason, 'invalid_request')
+      assert.notEqual(policy.reason, 'provider_overloaded')
+      assert.notEqual(policy.reason, 'entitlement_required')
+    }
+  }
+})
+
+test('content policy codes cache the prompt even when the kernel renames the code', () => {
+  const policy = classifyUpstreamResult({
+    ok: false,
+    status: 400,
+    body: {
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        code: 'upstream_invalid_request',
+        upstream_code: 'cyber_policy',
+        message: 'blocked',
+      },
+    },
+  })
+  assert.equal(policy.reason, 'content_policy_refusal')
+  assert.equal(policy.action, 'stop')
+  assert.equal(policy.rememberRefusal, true)
+  assert.equal(policy.refusalTtlMs, 0)
+  assert.equal(policy.decision.origin, 'client')
+  assert.equal(shouldContinue(policy), false)
 })
 
 test('assistant prefill 400 is repairable', () => {
