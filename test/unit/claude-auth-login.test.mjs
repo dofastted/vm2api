@@ -122,7 +122,12 @@ test('a live login session is not reused after the container stops or cli-node d
       startReady: async () => ({
         ok: true,
         rust_ok: true,
-        rust: { ok: true, health: { vm_telemetry: true, telemetry_ready: true } },
+        // startSlotReady nests it: { ok, engine, rust: { ok, reason, health } }
+        rust: {
+          ok: true,
+          engine: 'rust',
+          rust: { ok: true, health: { vm_telemetry: true, telemetry_ready: true } },
+        },
       }),
     })
   try {
@@ -221,6 +226,69 @@ test('stopClaudeAuthLoginSession pkills auth login, not setup-token', async () =
       },
     })
     assert.equal(kvm[0][0], KVM_GUEST_EXEC)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('prepareSlotOAuth reads the nested kernel health that startSlotReady actually returns', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-auth-login-runtime-'))
+  const seed = (id) => {
+    fs.mkdirSync(path.join(root, 'vms', id, 'run'), { recursive: true })
+    fs.writeFileSync(
+      path.join(root, 'vms', `${id}.json`),
+      JSON.stringify({ id, runtime: { type: 'docker' }, proxy: { id: 'px-local' } }),
+    )
+    fs.writeFileSync(
+      path.join(root, 'vms', id, 'run', 'kernel.json'),
+      JSON.stringify({ credential_path: '/home/kincli/.claude/credentials.json' }),
+    )
+    return { vmId: id, projectRoot: root }
+  }
+  // Real startSlotReady → { ok, rust_ok, rust: { ok, engine, rust: { ok, reason, health } } }
+  const nested = (health) => async () => ({
+    ok: true,
+    rust_ok: true,
+    rust: { ok: true, engine: 'rust', rust: { ok: true, health } },
+  })
+  const notReady = (err) => err.code === 'oauth_runtime_not_ready'
+  try {
+    const ready = await prepareSlotOAuth({
+      exec: seed('vm-11'),
+      startReady: nested({ vm_telemetry: true, telemetry_ready: true }),
+    })
+    assert.equal(ready.configDir, '/home/kincli/.claude')
+
+    await assert.rejects(
+      () => prepareSlotOAuth({ exec: seed('vm-12'), startReady: nested(undefined) }),
+      notReady,
+    )
+    await assert.rejects(
+      () =>
+        prepareSlotOAuth({
+          exec: seed('vm-13'),
+          startReady: nested({ vm_telemetry: false, telemetry_ready: true }),
+        }),
+      notReady,
+    )
+    await assert.rejects(
+      () =>
+        prepareSlotOAuth({
+          exec: seed('vm-14'),
+          startReady: nested({ vm_telemetry: true, telemetry_ready: false }),
+        }),
+      notReady,
+    )
+    // startReady is injectable: a flat boot.rust.health must still pass.
+    const flat = await prepareSlotOAuth({
+      exec: seed('vm-15'),
+      startReady: async () => ({
+        ok: true,
+        rust_ok: true,
+        rust: { ok: true, health: { vm_telemetry: true, telemetry_ready: true } },
+      }),
+    })
+    assert.equal(flat.configDir, '/home/kincli/.claude')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
