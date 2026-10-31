@@ -259,10 +259,7 @@ test('prepareSlotOAuth reads the nested kernel health that startSlotReady actual
     })
     assert.equal(ready.configDir, '/home/kincli/.claude')
 
-    await assert.rejects(
-      () => prepareSlotOAuth({ exec: seed('vm-12'), startReady: nested(undefined) }),
-      notReady,
-    )
+    await assert.rejects(() => prepareSlotOAuth({ exec: seed('vm-12'), startReady: nested(undefined) }), notReady)
     await assert.rejects(
       () =>
         prepareSlotOAuth({
