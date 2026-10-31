@@ -1727,6 +1727,11 @@ export function officialCcPassthroughFromRouting(routing = {}) {
   return routing?.compatibility?.official_cc_passthrough === true
 }
 
+/** Recognition is not passthrough. The body is kept only when that switch is on. */
+export function officialFamilyBodyPassthrough(officialTraffic, routing = {}) {
+  return officialTraffic === true && officialCcPassthroughFromRouting(routing)
+}
+
 function stripSystemCacheControl(body) {
   if (!Array.isArray(body.system)) return body
   let changed = false
@@ -2189,7 +2194,9 @@ export function applyCrsUnofficialPersona(
   } = {},
 ) {
   if (!body || typeof body !== 'object') return body
-  if (!forceConfigured && (officialClient || isOfficialClaudeCodeTraffic(headers || {}, body))) return body
+  // Looking like Claude Code is not enough. The handler sets officialClient
+  // only when routing.compatibility.official_cc_passthrough is on.
+  if (!forceConfigured && officialClient) return body
   const fromFile = routingFile ? personaOptionsFromRoutingFile(routingFile) : null
   const resolved = normalizePersonaMode(mode ?? fromFile?.mode)
   // Read the caller's agent prompt before stripLeakySystem drops it as known official text.
