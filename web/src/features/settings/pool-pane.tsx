@@ -62,7 +62,6 @@ const FAILOVER_DEFAULTS = {
   same_account_retry_max_hop_ms: 10000,
   signature_repair: false,
   stream_idle_timeout_ms: 180000,
-  max_request_mib: 32,
   eager_tool_streaming: true,
 }
 
@@ -526,15 +525,6 @@ export function PoolPane({
         signature_repair: failoverDraft.signature_repair,
         delivery_mode: failoverDraft.delivery_mode,
         stream_idle_timeout_ms: failoverDraft.stream_idle_timeout_ms,
-        ...(Number.isFinite(Number(failoverDraft.max_request_mib))
-          ? {
-              max_request_mib: numOf(
-                failoverDraft,
-                'max_request_mib',
-                FAILOVER_DEFAULTS.max_request_mib
-              ),
-            }
-          : {}),
         eager_tool_streaming: failoverDraft.eager_tool_streaming !== false,
       })
     } else {
@@ -868,25 +858,6 @@ export function PoolPane({
                     updateDraft('failover', {
                       stream_idle_timeout_ms: value,
                     })
-                  }
-                />
-                <SliderSetting
-                  id='failover-max-request'
-                  label='请求体上限'
-                  desc='入站请求超过此大小返回 413。未设置时槽内 kernel 仍是 32 MiB；保存后各槽 kernel 会在没有请求时自动重启以应用新值。网关不会放行超过 KIN_MAX_BODY 的请求。'
-                  value={numOf(
-                    failoverDraft,
-                    'max_request_mib',
-                    FAILOVER_DEFAULTS.max_request_mib
-                  )}
-                  min={8}
-                  max={128}
-                  step={8}
-                  format={(value) => `${value} MiB`}
-                  fallback={FAILOVER_DEFAULTS.max_request_mib}
-                  presets={[32, 64, 128]}
-                  onChange={(value) =>
-                    updateDraft('failover', { max_request_mib: value })
                   }
                 />
                 <div className='flex items-center justify-between gap-4 rounded-md border px-3 py-2.5'>

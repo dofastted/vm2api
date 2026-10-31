@@ -74,7 +74,7 @@ x-api-key: sk-vm-…
 | 钉槽（仅 master） | 虚拟机测试 loopback |
 | `X-Request-ID` | 原样回写响应头 |
 
-体大小上限由设置里的「请求体上限」决定（`failover.max_request_mib`，未设置时入口与槽内 kernel 均为 32 MiB）。网关进程天花板是 `KIN_MAX_BODY`（默认 128MB），面板值不能超过它。超限在选号之前返回 `413 body_too_large`；Codex 转发还会按包含 headers/session/request_id 的实际序列化 envelope 检查槽内限额；封装后超限或内核返回的纯文本 413 均报告 `413 body_too_large`。改完保存后，各槽 kernel 在没有请求时重启一次才生效。
+体大小上限由设置 → 配额的「请求体上限」决定（`failover.max_request_mib`，未设置时入口与槽内 kernel 均为 32 MiB）。网关进程天花板是 `KIN_MAX_BODY`（默认 128MB），面板值不能超过它。超限在选号之前返回 `413 body_too_large`；Codex 转发还会按包含 headers/session/request_id 的实际序列化 envelope 检查槽内限额；封装后超限或内核返回的纯文本 413 均报告 `413 body_too_large`。改完保存后，各槽 kernel 在没有请求时重启一次才生效。
 
 ## Messages
 

@@ -137,7 +137,7 @@ const GROUPS: { title: string; items: GuideItem[] }[] = [
         view: 'settings',
         to: '/settings/$tab',
         summary:
-          '粘性、账号池、配额、探测、通知这些全局开关。配额在「配额」页：5h/7d 闸线和并发。',
+          '粘性、账号池、配额、探测、通知这些全局开关。配额在「配额」页：5h/7d 闸线、并发和请求体上限。',
         detail: '个人自用把闸关掉并把闸线和并发拉满；中转站用出厂闸线。',
       },
       {
