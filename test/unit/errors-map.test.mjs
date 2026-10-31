@@ -7,6 +7,7 @@ import {
   retryAfterSeconds,
   isWrapConnectionError,
   isUsagePolicyErrorMessage,
+  isUnanswerablePromptMessage,
   makeRefusalGuardError,
   isAssistantMessageBody,
   isCompleteAssistantMessage,
@@ -289,6 +290,25 @@ test('Claude Code AUP API Error is a non-retryable 400 policy rejection, not a l
     assert.equal(mapped.body.error.code, 'refusal_guard')
     assert.equal(mapped.body.error.type, 'policy_blocked')
     assert.notEqual(mapped.body.error.code, 'content_filter_refusal')
+    assert.notEqual(mapped.body.error.code, 'upstream_invalid_request')
+  }
+})
+
+test('third-party extra-usage 400 and 503 are non-retryable refusals, not invalid requests', () => {
+  const msg =
+    'HTTP 400: Third-party apps now draw from your extra usage, not your plan limits. Claim it at claude.ai/settings/usage.'
+  assert.equal(isUsagePolicyErrorMessage(msg), false)
+  assert.equal(isUnanswerablePromptMessage(msg), true)
+  assert.equal(isUnanswerablePromptMessage('Extra usage required for this model'), false)
+  for (const status of [400, 503]) {
+    const mapped = mapUpstreamError(status, {
+      type: 'error',
+      error: { type: 'invalid_request_error', code: 'upstream_invalid_request', message: msg },
+    })
+    assert.equal(mapped.status, 400)
+    assert.equal(mapped.body.error.code, 'refusal_guard')
+    assert.equal(mapped.body.error.type, 'policy_blocked')
+    assert.equal(mapped.body.error.details.retryable, false)
     assert.notEqual(mapped.body.error.code, 'upstream_invalid_request')
   }
 })

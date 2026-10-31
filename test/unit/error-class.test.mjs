@@ -79,6 +79,22 @@ test('classifyRequestError maps known codes and statuses', () => {
     classifyRequestError({
       status: 400,
       error_code: 'upstream_invalid_request',
+      error_message: 'HTTP 400: Third-party apps now draw from your extra usage, not your plan limits.',
+    }).error_class,
+    'refusal',
+  )
+  assert.equal(
+    classifyRequestError({
+      status: 503,
+      error_code: 'upstream_error',
+      error_message: 'no third-party apps allowed on this subscription',
+    }).error_class,
+    'refusal',
+  )
+  assert.equal(
+    classifyRequestError({
+      status: 400,
+      error_code: 'upstream_invalid_request',
       error_message: 'max_tokens: 1 is too small',
     }).error_class,
     'request',
