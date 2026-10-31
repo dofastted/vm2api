@@ -1,6 +1,9 @@
 # Changelog
 
 ## Unreleased
+- 设置 → 配额直接显示并管理「请求体上限」（`failover.max_request_mib`，8–128 MiB）。账号池「重试与切号」不再包含这项。保存后的生效方式不变：各槽 kernel 在没有请求时重启。
+
+已部署机升级：更新 `web/dist` 后刷新控制台。不必重启 Node，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
 - 官方 Claude Code 家族不再仅凭识别放行。协议页「官方 Claude Code 家族透传」（`official_cc_passthrough`）关闭时，直连、中转、子跳以及任何看起来像官方的 Messages 都走 persona 清洗；只有该开关打开才保留入站 system。cli-hop 与 HTTP 同一条门。
 

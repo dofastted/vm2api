@@ -6,6 +6,7 @@ import {
   ChevronRight,
   Clock3,
   Gauge,
+  HardDrive,
   Info,
   ServerCog,
 } from 'lucide-react'
@@ -67,6 +68,8 @@ const TIER_DEFAULTS: Record<
   pro: { max_concurrency: 2, max_rpm: 0, limit_5h: 0.85, limit_7d: 0.8 },
   max: { max_concurrency: 4, max_rpm: 0, limit_5h: 0.95, limit_7d: 0.95 },
 }
+
+const REQUEST_BODY_DEFAULT_MIB = 32
 
 function cloneTiers(
   source: Record<string, QuotaTierPolicy>
@@ -392,15 +395,19 @@ function ClaudeRpm({
 export function QuotaTierPane({
   tiers,
   quota,
+  failover,
   onChange,
   onQuotaChange,
+  onFailoverChange,
   saving = false,
   pending = false,
 }: {
   tiers: Record<string, QuotaTierPolicy>
   quota: Obj
+  failover: Obj
   onChange: (tier: QuotaTierKey, patch: QuotaTierPolicy) => void
   onQuotaChange: (patch: Obj) => void
+  onFailoverChange: (patch: Obj) => void
   saving?: boolean
   pending?: boolean
 }) {
@@ -580,6 +587,31 @@ export function QuotaTierPane({
             </span>
           </span>
         </Button>
+      </PaneSection>
+
+      <PaneSection
+        icon={HardDrive}
+        title='请求体上限'
+        desc='入站请求正文的最大大小，图片和工具写入的大文件都算在内。Claude 与 GPT 共用。超过返回 413。保存后各槽 kernel 在没有请求时重启。不能超过 KIN_MAX_BODY。'
+      >
+        <fieldset disabled={saving} className='min-w-0 border-0 p-0'>
+          <SliderSetting
+            id='quota-max-request'
+            label='允许的最大请求体'
+            value={numberOf(failover.max_request_mib, REQUEST_BODY_DEFAULT_MIB)}
+            min={8}
+            max={128}
+            step={8}
+            format={(value) => `${value} MiB`}
+            fallback={REQUEST_BODY_DEFAULT_MIB}
+            presets={[32, 64, 128]}
+            onChange={(value) =>
+              onFailoverChange({
+                max_request_mib: Math.min(128, Math.max(8, Math.round(value))),
+              })
+            }
+          />
+        </fieldset>
       </PaneSection>
 
       <Dialog

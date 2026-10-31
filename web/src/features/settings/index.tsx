@@ -225,7 +225,7 @@ export function SettingsPage() {
       title={VIEW_TITLES.settings}
       description={
         tab === 'quota'
-          ? 'Claude 配额闸线、并发和 RPM。GPT 配额在 OpenAI 页。个人自用引导会把闸关掉并拉到上限；这里仍可再改。'
+          ? 'Claude 配额闸线、并发、RPM，以及请求体上限。GPT 配额在 OpenAI 页。个人自用引导会把闸关掉并拉到上限；这里仍可再改。'
           : tab === 'openai'
             ? 'GPT 传输、准入、配额与客户端画像。全局 WebSocket 只作用于推理，不影响终端或集群。'
             : undefined
@@ -311,6 +311,7 @@ export function SettingsPage() {
                       Record<string, QuotaTierPolicy> | undefined) || {}
                   }
                   quota={quota}
+                  failover={failover}
                   onChange={(tier, next) =>
                     setDraft((current) => {
                       const currentTiers =
@@ -354,6 +355,16 @@ export function SettingsPage() {
                         },
                       }
                     })
+                  }
+                  onFailoverChange={(patch) =>
+                    setDraft((current) => ({
+                      ...current,
+                      failover: {
+                        ...((current.failover as Record<string, unknown>) ||
+                          {}),
+                        ...patch,
+                      },
+                    }))
                   }
                   saving={save.isPending}
                   pending={dirty}
