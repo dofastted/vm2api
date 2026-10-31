@@ -1291,6 +1291,9 @@ if (process.env.KIN_CRS_MOCK !== '1') {
   syncLocalSlotRestartPolicies(listVms(cfg.paths.project))
 }
 await bootApiKernel(cfg)
+server.keepAliveTimeout = 120_000
+server.headersTimeout = 125_000
+server.timeout = 0
 
 server.listen(cfg.port, cfg.host, () => {
   try {
