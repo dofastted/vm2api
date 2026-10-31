@@ -64,7 +64,11 @@ test('local-agent with desktop markers passes the existing Claude Code checks', 
   assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, DESKTOP_BODY, NO_RELAY), true)
   assert.equal(isClaudeCodeFamilyRequest(DESKTOP_HEADERS, DESKTOP_BODY), true)
   assert.equal(isOfficialClaudeCodeTraffic(DESKTOP_HEADERS, DESKTOP_BODY), true)
-  assert.equal(applyCrsUnofficialPersona(DESKTOP_BODY, { headers: DESKTOP_HEADERS, mode: 'rewrite' }), DESKTOP_BODY)
+  assert.equal(
+    applyCrsUnofficialPersona(DESKTOP_BODY, { headers: DESKTOP_HEADERS, mode: 'rewrite', officialClient: true }),
+    DESKTOP_BODY,
+  )
+  assert.notEqual(applyCrsUnofficialPersona(DESKTOP_BODY, { headers: DESKTOP_HEADERS, mode: 'rewrite' }), DESKTOP_BODY)
   assert.equal(isProxiedOfficialClaudeCode(DESKTOP_BODY, DESKTOP_HEADERS), false)
 })
 

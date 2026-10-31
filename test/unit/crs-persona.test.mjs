@@ -30,6 +30,7 @@ import {
   FINGERPRINT_SALT,
   isOfficialClaudeCodeTraffic,
   officialCcPassthroughFromRouting,
+  officialFamilyBodyPassthrough,
   isLeakyClientFingerprint,
   looksLikeOhMyPiSystem,
   looksLikeOfficialClaudeSystem,
@@ -147,11 +148,12 @@ test('forceConfigured rewrites official and proxied-official system onto the pre
   }
   const headers = { 'user-agent': 'claude-cli/2.1.293 (external, cli)' }
   assert.equal(isOfficialClaudeCodeTraffic(headers, body), true)
-  const skipped = applyCrsUnofficialPersona(body, {
+  const kept = applyCrsUnofficialPersona(body, {
     headers,
     mode: 'official_full',
+    officialClient: true,
   })
-  assert.equal(skipped.system.length, 3)
+  assert.equal(kept.system.length, 3)
   const out = applyCrsUnofficialPersona(body, {
     headers,
     mode: 'official_full',
@@ -192,6 +194,8 @@ test('forceConfigured custom preset still writes billing and keeps caller system
 
 test('official family passthrough is off unless the protocol switch is on', () => {
   assert.equal(officialCcPassthroughFromRouting({}), false)
+  assert.equal(officialFamilyBodyPassthrough(true, {}), false)
+  assert.equal(officialFamilyBodyPassthrough(false, { compatibility: { official_cc_passthrough: true } }), false)
   assert.equal(
     officialCcPassthroughFromRouting({
       compatibility: { official_cc_passthrough: false },
@@ -199,7 +203,7 @@ test('official family passthrough is off unless the protocol switch is on', () =
     false,
   )
   assert.equal(
-    officialCcPassthroughFromRouting({
+    officialFamilyBodyPassthrough(true, {
       compatibility: { official_cc_passthrough: true },
     }),
     true,
@@ -630,7 +634,7 @@ test('spoofed claude-cli UA without valid user_id still gets default mimic', () 
   assertParkedStanding(out, 'hi')
 })
 
-test('official claude-cli UA plus valid user_id skips mimic', () => {
+test('official claude-cli UA plus valid user_id is cleaned unless passthrough is on', () => {
   const body = {
     system: CRS_OFFICIAL_SYSTEM,
     messages: [{ role: 'user', content: 'hi' }],
@@ -643,9 +647,11 @@ test('official claude-cli UA plus valid user_id skips mimic', () => {
     },
   }
   const headers = { 'user-agent': 'claude-cli/2.1.234 (external, cli)' }
-  const out = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite' })
-  assert.equal(out.system, CRS_OFFICIAL_SYSTEM)
   assert.equal(isOfficialClaudeCodeTraffic(headers, body), true)
+  const kept = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite', officialClient: true })
+  assert.equal(kept.system, CRS_OFFICIAL_SYSTEM)
+  const out = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite' })
+  assert.notEqual(out.system, CRS_OFFICIAL_SYSTEM)
 })
 
 const OMP_ROLE = `<system-conventions>
@@ -1164,7 +1170,7 @@ test('inbound mid-conversation role:system is kept', () => {
   assertParkedStanding(out, 'one')
 })
 
-test('vscode / cowork / desktop official family UA plus official system skips mimic', () => {
+test('vscode / cowork / desktop official family is cleaned unless passthrough is on', () => {
   const body = {
     system: CRS_OFFICIAL_SYSTEM,
     messages: [{ role: 'user', content: 'hi' }],
@@ -1184,12 +1190,19 @@ test('vscode / cowork / desktop official family UA plus official system skips mi
   for (const ua of uas) {
     const headers = { 'user-agent': ua }
     assert.equal(isOfficialClaudeCodeTraffic(headers, body), true, ua)
+    const kept = applyCrsUnofficialPersona(body, {
+      headers,
+      mode: 'rewrite',
+      park: true,
+      officialClient: true,
+    })
+    assert.equal(kept.system, CRS_OFFICIAL_SYSTEM, ua)
     const out = applyCrsUnofficialPersona(body, {
       headers,
       mode: 'rewrite',
       park: true,
     })
-    assert.equal(out.system, CRS_OFFICIAL_SYSTEM)
+    assert.notEqual(out.system, CRS_OFFICIAL_SYSTEM, ua)
   }
 })
 
@@ -1617,7 +1630,7 @@ test('zero env off keeps caller system without generating Environment', () => {
   })
 })
 
-test('new official identity variant plus UA and user_id skips rewrite', () => {
+test('new official identity variant is cleaned unless passthrough is on', () => {
   const body = {
     system: "You are Claude Code, Anthropic's newest coding agent.",
     messages: [{ role: 'user', content: 'hi' }],
@@ -1631,16 +1644,23 @@ test('new official identity variant plus UA and user_id skips rewrite', () => {
   }
   const headers = { 'user-agent': 'claude-cli/2.1.300 (external, cli)' }
   assert.equal(isOfficialClaudeCodeTraffic(headers, body), true)
+  const kept = applyCrsUnofficialPersona(body, {
+    headers,
+    mode: 'rewrite',
+    park: true,
+    officialClient: true,
+  })
+  assert.equal(kept.system, body.system)
+  assert.equal(kept.messages[0].content, 'hi')
   const out = applyCrsUnofficialPersona(body, {
     headers,
     mode: 'rewrite',
     park: true,
   })
-  assert.equal(out.system, body.system)
-  assert.equal(out.messages[0].content, 'hi')
+  assert.notEqual(out.system, body.system)
 })
 
-test('official entrypoint without exact identity line still skips rewrite', () => {
+test('official entrypoint without exact identity line is cleaned unless passthrough is on', () => {
   const body = {
     system: 'cc_entrypoint=vscode\nFollow the workspace instructions.',
     messages: [{ role: 'user', content: 'hi' }],
@@ -1651,8 +1671,10 @@ test('official entrypoint without exact identity line still skips rewrite', () =
   }
   assert.equal(looksLikeOfficialClaudeSystem(body.system), true)
   assert.equal(isOfficialClaudeCodeTraffic(headers, body), true)
+  const kept = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite', officialClient: true })
+  assert.equal(kept.system, body.system)
   const out = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite' })
-  assert.equal(out.system, body.system)
+  assert.notEqual(out.system, body.system)
 })
 
 test('local-agent entrypoint still does not count as official even with identity variant', () => {
@@ -1759,7 +1781,7 @@ function officialChildMeta() {
   }
 }
 
-test('Explore / Compact / web-search child hops count as official and skip rewrite', () => {
+test('Explore / Compact / web-search child hops are cleaned unless passthrough is on', () => {
   const cases = [
     "You are a file search specialist for Claude Code, Anthropic's official CLI for Claude.",
     'You are a helpful AI assistant tasked with summarizing conversations.',
@@ -1780,15 +1802,21 @@ test('Explore / Compact / web-search child hops count as official and skip rewri
     assert.equal(hasOfficialClaudeChildPrompt(body.system), true, text)
     assert.equal(looksLikeOfficialClaudeSystem(body.system), true, text)
     assert.equal(isOfficialClaudeCodeTraffic(officialChildHeaders(), body), true, text)
+    const kept = applyCrsUnofficialPersona(body, {
+      headers: officialChildHeaders(),
+      mode: 'rewrite',
+      officialClient: true,
+    })
+    assert.equal(kept.system, body.system, text)
     const out = applyCrsUnofficialPersona(body, {
       headers: officialChildHeaders(),
       mode: 'rewrite',
     })
-    assert.equal(out.system, body.system)
+    assert.notEqual(out.system, body.system, text)
   }
 })
 
-test('Explore child hop without billing still skips rewrite', () => {
+test('Explore child hop without billing is cleaned unless passthrough is on', () => {
   const body = {
     system: [
       {
@@ -1800,12 +1828,19 @@ test('Explore child hop without billing still skips rewrite', () => {
     metadata: officialChildMeta(),
   }
   assert.equal(isOfficialClaudeCodeTraffic(officialChildHeaders(), body), true)
+  const kept = applyCrsUnofficialPersona(body, {
+    headers: officialChildHeaders(),
+    mode: 'rewrite',
+    park: true,
+    officialClient: true,
+  })
+  assert.equal(kept.system, body.system)
   const out = applyCrsUnofficialPersona(body, {
     headers: officialChildHeaders(),
     mode: 'rewrite',
     park: true,
   })
-  assert.equal(out.system, body.system)
+  assert.notEqual(out.system, body.system)
 })
 
 test('security monitor child hop is official', () => {

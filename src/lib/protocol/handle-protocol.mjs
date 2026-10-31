@@ -119,6 +119,7 @@ import {
   isOfficialClaudeCodeTraffic,
   isProxiedOfficialClaudeCode,
   officialCcPassthroughFromRouting,
+  officialFamilyBodyPassthrough,
   personaHidesUsageFromRoutingFile,
   standingUsageFromRoutingFile,
   personaModeFromRoutingFile,
@@ -915,11 +916,12 @@ export function createHandleProtocol(deps) {
     const officialInbound =
       isOfficialClaudeCodeTraffic(req.headers, inbound) ||
       (detectProxiedOfficialCcFromRoutingFile(routingConfigPath) && isProxiedOfficialClaudeCode(inbound, req.headers))
+    const officialPassthrough = officialFamilyBodyPassthrough(officialInbound, getRouting())
     const converted = toClaudeMessages(protocol, ctx.body, {
       rewrite: rewriteEnabled,
       model_map: false,
       strict_passthrough: String(req.headers['x-kin-strict-passthrough'] || '') === '1',
-      preserve_content_shape: officialInbound,
+      preserve_content_shape: officialPassthrough,
     })
     stats.requests++
     stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
@@ -1093,7 +1095,8 @@ export function createHandleProtocol(deps) {
         ))
     if (!requestContext)
       ctx.body = applyCrsUnofficialPersona(ctx.body, {
-        officialClient: officialTraffic,
+        officialClient: officialPassthrough,
+        forceConfigured: !officialPassthrough,
         routingFile: routingConfigPath,
         cacheTtl: requestedCacheTtl,
         headers: req.headers,
@@ -1104,35 +1107,12 @@ export function createHandleProtocol(deps) {
     let personaHideTokens = requestContext
       ? 0
       : personaHideForUnofficial(personaIn, ctx.body, {
-          officialClient: officialTraffic,
+          officialClient: officialPassthrough,
           mode: personaMode,
           hides: personaHidesUsageFromRoutingFile(routingConfigPath),
           standing: standingUsageFromRoutingFile(routingConfigPath),
         })
 
-    if (
-      inferenceBackend === 'api' &&
-      !requestContext &&
-      officialTraffic &&
-      !officialCcPassthroughFromRouting(getRouting() || {})
-    ) {
-      ctx.body = applyCrsUnofficialPersona(ctx.body, {
-        officialClient: false,
-        forceConfigured: true,
-        routingFile: routingConfigPath,
-        cacheTtl: requestedCacheTtl,
-        headers: req.headers,
-        sessionId: outboundSessionId,
-        model: ctx.body?.model,
-        cliVersion: OFFICIAL_CLI_VERSION,
-      })
-      personaHideTokens = personaHideForUnofficial(personaIn, ctx.body, {
-        officialClient: false,
-        mode: personaMode,
-        hides: personaHidesUsageFromRoutingFile(routingConfigPath),
-        standing: standingUsageFromRoutingFile(routingConfigPath),
-      })
-    }
     if (inferenceBackend === 'api') {
       // API 直连走平台端点，不经过槽位；门禁与 api-kernel hop 同位，勿提前于 credential/intercept 链
       if (ownerScopeFromRequest(req, apiKeyStore?.users).type !== 'platform') {
@@ -1454,7 +1434,7 @@ export function createHandleProtocol(deps) {
             // The front rewrite already produces the official two-block shape.
             const outboundProfile = profileForPreset(resolvedPersona)
             // Render once from caller input with the selected slot's identity, not the pre-selection environment.
-            if (!requestContext && !officialTraffic) {
+            if (!requestContext && !officialPassthrough) {
               hopBody = applyCrsUnofficialPersona(prepareCliPersonaInput(structuredClone(personaIn), resolvedPersona), {
                 forceConfigured: true,
                 routingFile: routingConfigPath,
@@ -1480,7 +1460,7 @@ export function createHandleProtocol(deps) {
               preserveCallerEnvironment,
               autoCompactWindow: ctx.autoCompactWindow,
               routing: routingNow,
-              personaPreset: !requestContext && !officialTraffic ? resolvedPersona : null,
+              personaPreset: !requestContext && !officialPassthrough ? resolvedPersona : null,
             })
             if (!requestContext) {
               hopBody = ensureBillingAttribution(hopBody, {
@@ -1566,7 +1546,7 @@ export function createHandleProtocol(deps) {
             canonicalBody: hopBody,
             inbound,
             identity,
-            unofficial: !officialTraffic,
+            unofficial: !officialPassthrough,
             officialClient: officialTraffic,
             sessionId: attemptSessionId,
             accountId: selected.accountId,
