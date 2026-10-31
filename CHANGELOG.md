@@ -1,11 +1,15 @@
 # Changelog
 
 ## Unreleased
-- 设置 → 配额直接显示并管理「请求体上限」（`failover.max_request_mib`，8–128 MiB）。账号池「重试与切号」不再包含这项。保存后的生效方式不变：各槽 kernel 在没有请求时重启。
+- #841：设置 → 配额直接显示并管理「请求体上限」（`failover.max_request_mib`，8–128 MiB）。账号池「重试与切号」不再包含这项。保存后的生效方式不变：各槽 kernel 在没有请求时重启。
 
 已部署机升级：更新 `web/dist` 后刷新控制台。不必重启 Node，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
-- 官方 Claude Code 家族不再仅凭识别放行。协议页「官方 Claude Code 家族透传」（`official_cc_passthrough`）关闭时，直连、中转、子跳以及任何看起来像官方的 Messages 都走 persona 清洗；只有该开关打开才保留入站 system。cli-hop 与 HTTP 同一条门。
+- #843：官方 Claude Code 家族不再仅凭识别放行。协议页「官方 Claude Code 家族透传」（`official_cc_passthrough`）关闭时，直连、中转、子跳以及任何看起来像官方的 Messages 都走 persona 清洗；只有该开关打开才保留入站 system。cli-hop 与 HTTP 同一条门。
+
+- #842：上游 HTTP 400/503「Third-party apps now draw from your extra usage…」和「no third-party apps allowed」不再当无效请求、过载或额度错误。不换号、不修复重试，客户端收到 400 `refusal_guard`，该 prompt 永久写入拒答缓存，近似正文按已有阈值拦截。这是计费限制，不封 device。内容策略错误码（含只写在 `upstream_code` 的）同样永久入库并带相似度签名。
+
+已部署机升级：更新 Node 控制面后重启一次 Node。不必更新 `web/dist`，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
 ## 1.4.030 — 2026-10-31
 

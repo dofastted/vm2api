@@ -6,7 +6,7 @@ import {
   isCompleteAssistantMessage,
   isClientCancelledResult,
   isIncompleteAssistantMessage,
-  isUsagePolicyErrorMessage,
+  isUnanswerablePromptMessage,
   isWrapConnectionError,
   ErrorCode,
 } from '../core/errors.mjs'
@@ -175,6 +175,22 @@ function resultErrorCode(result) {
   return String(result?.body?.error?.code || result?.body?.error?.type || '')
 }
 
+function cacheRefusal(reason) {
+  return {
+    scope: 'request',
+    action: 'stop',
+    reason,
+    cooldownUntil: null,
+    retrySameAccount: false,
+    rememberRefusal: true,
+    refusalTtlMs: 0,
+  }
+}
+
+function refusalCodes(result, code, workerCode) {
+  return [code, workerCode, result?.body?.error?.upstream_code, result?.code, result?.error_code]
+}
+
 /**
  * First wrap hop after idle often streams a local/stale 401
  * (`request_id:null` or `upstream_stream_incomplete`) because the CLI
@@ -313,7 +329,7 @@ function classifyUpstreamResultRaw(
     }
   }
   if (isContentFilterRefusal(result) && !result.committed) {
-    return { scope: 'request', action: 'stop', reason: 'content_filter_refusal', cooldownUntil: null }
+    return cacheRefusal('content_filter_refusal')
   }
   const completeAssistant = isCompleteAssistantMessage(result)
   const malformedSuccess =
@@ -341,25 +357,11 @@ function classifyUpstreamResultRaw(
   // Claude Code wraps an AUP refusal as "API Error" and the kernel often
   // surfaces it as HTTP 400. That is the prompt, not a repairable request
   // and not an account failure: stop, do not hop again, cache forever.
-  if (isUsagePolicyErrorMessage(message) || isUsagePolicyErrorMessage(hay)) {
-    return {
-      scope: 'request',
-      action: 'stop',
-      reason: 'usage_policy_refusal',
-      cooldownUntil: null,
-      retrySameAccount: false,
-      rememberRefusal: true,
-      refusalTtlMs: 0,
-    }
+  if (isUnanswerablePromptMessage(message) || isUnanswerablePromptMessage(hay)) {
+    return cacheRefusal('usage_policy_refusal')
   }
-  if (isContentPolicyErrorCode(code) || isContentPolicyErrorCode(workerCode)) {
-    return {
-      scope: 'request',
-      action: 'stop',
-      reason: 'content_policy_refusal',
-      cooldownUntil: null,
-      retrySameAccount: false,
-    }
+  if (refusalCodes(result, code, workerCode).some(isContentPolicyErrorCode)) {
+    return cacheRefusal('content_policy_refusal')
   }
   // The org refuses this seat. Not a token death and not a timed cooldown:
   // pause the slot until an operator resumes it, and give the request to
