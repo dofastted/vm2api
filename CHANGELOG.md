@@ -1,7 +1,15 @@
 # Changelog
 
 ## Unreleased
-- 修复 OAuth 换票的嵌套代理：token 与 bootstrap 都在对应 VM 内沿用其绑定出口，控制面返回后不再再次经代理 bootstrap。
+
+## 1.4.032 — 2026-11-01
+
+- OpenAI GPT 模型页支持按上游 `priority` 档位公开 `<model>-fast` 别名；调度前还原基模型并发送 `service_tier: "priority"`。
+- Codex Image 增加 `gpt-image-2` 及 `gpt-image-2-2026-04-21` 快照，覆盖模型目录、Images 端点、Responses 图像工具、计费和槽位白名单。
+- Codex kernel 对齐 `codex-proxy-rs`：支持大图像 WebSocket 帧，并用增量字节 SSE 解码器处理拆分 UTF-8、LF/CRLF 和大流。
+- OAuth 换票与 bootstrap 全程沿用目标 VM 绑定出口。
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启；本版包含 Codex kernel payload 更新，不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
 ## 1.4.031 — 2026-11-01
 

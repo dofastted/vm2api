@@ -1,6 +1,6 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.10.29-telemetry-kernel",
+  "release": "payload-2026.11.01-codex-image-kernel",
   "files": [
     {
       "path": "bin/kin-kernel",
@@ -11,8 +11,8 @@
     {
       "path": "bin/kin-codex-kernel",
       "asset": "kin-codex-kernel",
-      "size": 7892048,
-      "sha256": "0ffec538a57afbe66f13832513ee4c2a27ecc970faa9367c7cb8a13551196dd3"
+      "size": 7899968,
+      "sha256": "afdb433ebf3c719eb8596e09ca6493e8f769af1aab136426e82cbcd54c9bdc4a"
     },
     {
       "path": "bin/kin-oauth-auth",
