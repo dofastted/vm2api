@@ -7,7 +7,7 @@
  */
 import crypto from 'node:crypto'
 import { exchangeTokenViaCookieAuth } from './cookie-auth.mjs'
-import { enrichOauthIdentity, flattenOauthIdentity } from './oauth-identity.mjs'
+import { flattenOauthIdentity } from './oauth-identity.mjs'
 import { FULL_OAUTH_SCOPE } from './oauth-contract.mjs'
 import { carryOAuthAttempt } from './guest-oauth-helper.mjs'
 
@@ -163,9 +163,11 @@ function parseAuthCode(fullCode) {
   return { code: raw.slice(0, hash), state: raw.slice(hash + 1) }
 }
 
-async function exchangeCodeForToken(authCode, codeVerifier, state, proxyUrl, session, options) {
-  const px = normalizeSocks(proxyUrl)
-  if (px == null) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
+async function exchangeCodeForToken(authCode, codeVerifier, state, proxyUrl, session, options = {}) {
+  // With an execution context the helper runs inside the target VM and
+  // selects that VM's bound egress. The host proxy is only a test/direct path.
+  const px = options.exec ? null : normalizeSocks(proxyUrl)
+  if (px == null && !options.exec) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
   return exchangeTokenViaCookieAuth({
     code: authCode,
     codeVerifier,
@@ -204,7 +206,7 @@ export async function exchangeAuthCode({
   if (session.flavor === 'setup_token' && parsed.state && parsed.state !== session.state)
     throw fail('state_mismatch', '授权 state 不匹配，请重新生成授权链接')
   const px = proxyUrl ?? session.proxyUrl
-  if (px == null) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
+  if (px == null && !exec) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
 
   if (process.env.KIN_FAKE_SESSION_OAUTH === '1' || process.env.KIN_FAKE_SESSION_OAUTH === 'true') {
     sessions.delete(sessionId)
@@ -237,25 +239,21 @@ export async function exchangeAuthCode({
   const expiresIn = Number(token.expires_in || 0)
   const now = Math.floor(Date.now() / 1000)
   const identity = flattenOauthIdentity(token)
-  return carryOAuthAttempt(
-    token,
-    await enrichOauthIdentity(
-      {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token || '',
-        token_type: token.token_type || 'Bearer',
-        expires_in: expiresIn,
-        expires_at: token.expires_at || now + expiresIn,
-        scope: token.scope || session.scope,
-        email: identity.email,
-        email_address: identity.email,
-        account_uuid: identity.account_uuid,
-        org_uuid: identity.org_uuid,
-        subscription_type: identity.subscription_type,
-        source: session.source || 'oauth-auth-url',
-        flavor: session.flavor || 'cai',
-      },
-      { proxyUrl: px, fetchImpl },
-    ),
-  )
+  // kin-oauth-auth completes bootstrap inside the VM, through the same bound
+  // egress as token exchange. Do not bootstrap again from the control plane.
+  return carryOAuthAttempt(token, {
+    access_token: token.access_token,
+    refresh_token: token.refresh_token || '',
+    token_type: token.token_type || 'Bearer',
+    expires_in: expiresIn,
+    expires_at: token.expires_at || now + expiresIn,
+    scope: token.scope || session.scope,
+    email: identity.email,
+    email_address: identity.email,
+    account_uuid: identity.account_uuid,
+    org_uuid: identity.org_uuid,
+    subscription_type: identity.subscription_type,
+    source: session.source || 'oauth-auth-url',
+    flavor: session.flavor || 'cai',
+  })
 }
