@@ -279,6 +279,7 @@ const OPENAI = {
   'gpt-5.2-chat-latest': openaiFrom({ input: 1.75, output: 14, cache_read: 0.175, cache_write: 0 }),
   'gpt-image-2.5-flare': gptImage(),
   'gpt-image-2.5-sunburst': gptImage(),
+  'gpt-image-2': gptImage(),
 }
 
 /** Dated / legacy / family ids → canonical priced id. OpenAI: verified snapshot aliases only. */
@@ -319,6 +320,7 @@ export const BUILTIN_ALIASES = {
   'gpt-5.5-pro-2026-04-23': 'gpt-5.5-pro',
   'gpt-image-2.5-flare-2026-09-08': 'gpt-image-2.5-flare',
   'gpt-image-2.5-sunburst-2026-09-08': 'gpt-image-2.5-sunburst',
+  'gpt-image-2-2026-04-21': 'gpt-image-2',
   'gpt-daybreak-blue-latest': 'gpt-5.6-sol',
   'gpt-daybreak-red-latest': 'gpt-5.6-cyber',
   'o1-2024-12-17': 'o1',

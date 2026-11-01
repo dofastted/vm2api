@@ -18,6 +18,13 @@ export const IMAGE_TOOL_MODELS = Object.freeze([
     upstream_default: false,
     sort: 20,
   }),
+  Object.freeze({
+    id: 'gpt-image-2',
+    display_name: 'GPT Image 2',
+    snapshots: Object.freeze(['gpt-image-2-2026-04-21']),
+    upstream_default: false,
+    sort: 30,
+  }),
 ])
 
 const CANONICAL = new Map()

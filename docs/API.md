@@ -39,10 +39,13 @@ x-api-key: sk-vm-…
 | `POST` | `/v1/completions` 或 `/completions` | OpenAI Completions | OpenAI Completions |
 | `POST` | `/v1/responses` 或 `/responses` | OpenAI Responses | OpenAI Responses |
 | `GET` + Upgrade | `/v1/responses` 或 `/responses` | Responses WebSocket | JSON `response.*` 帧，不包 SSE |
-| `GET` | `/v1/models` | — | 本地模型策略目录 |
+| `GET` | `/v1/models` | — | 本地模型策略目录；启用且上游声明 `priority` 的 GPT 可公开 `<model>-fast` 别名 |
+| `POST` | `/v1/images/generations` 或 `/images/generations` | OpenAI Images JSON | Codex Images JSON |
+| `POST` | `/v1/images/edits` 或 `/images/edits` | OpenAI Images JSON / multipart | Codex Images JSON |
 | `GET` | `/health` · `/` · `/v1/meta` | 无鉴权 | 能力 / 限制 / 计数 |
 
 上游 hop **永远** `stream: true`。客户端 `stream: true` 收 SSE；`stream: false` 或 `x-kin-delivery: verified` 由网关聚合成 JSON。
+OpenAI 模型页的 Fast 开关只对已同步、已启用且目录明确声明 `service_tiers[].id = "priority"` 的模型生效。客户端使用 `<model>-fast` 时，网关在调度前还原基模型并发送 `service_tier: "priority"`；普通模型 ID 和普通档位不改写。图像目录包含启用的 `gpt-image-2`（及 `gpt-image-2-2026-04-21` 快照）、`gpt-image-2.5-flare` 和 `gpt-image-2.5-sunburst`；Images 请求直连 Codex Images 槽位，Free 套餐槽位不参与。
 
 别名路径（无 `/v1` 前缀）与上表相同处理函数。
 

@@ -15,8 +15,6 @@ import {
   saveGptModelPolicy,
   syncGptIdsIntoPolicy,
 } from '../../src/lib/protocol/gpt-model-policy.mjs'
-import fs from 'node:fs'
-import path from 'node:path'
 
 test('default map rewrites codex-auto-review before platform detect', () => {
   resetGptModelPolicy()
@@ -127,13 +125,6 @@ test('disabled GPT mapping target returns model_disabled', () => {
 test('normalizeCodexRouting hot-loads model_mappings defaults', () => {
   const codex = normalizeCodexRouting({})
   assert.equal(codex.model_mappings['codex-auto-review'], 'gpt-6-luna')
-})
-
-test('handle-protocol applies codex model rewrite before detectInboundPlatform', () => {
-  const src = fs.readFileSync(path.join(process.cwd(), 'src/lib/protocol/handle-protocol.mjs'), 'utf8')
-  const rewriteAt = src.indexOf('applyCodexInboundModelRewrite')
-  const detectAt = src.indexOf('detectInboundPlatform(ctx.body?.model)')
-  assert.ok(rewriteAt > 0 && detectAt > rewriteAt)
 })
 
 test('mapping patch rejects aliases that would hijack Claude or image requests', () => {

@@ -102,6 +102,14 @@ test('a disabled image model is rejected locally with no upstream hop', async ()
   }
 })
 
+test('disabling GPT Image 2 also rejects a Responses image tool snapshot', async () => {
+  saveGptModelPolicy({ image_tools: { 'gpt-image-2': { enabled: false } } })
+  const { res, hops } = await run(request('gpt-image-2-2026-04-21'))
+  assert.equal(res.statusCode, 400)
+  assert.equal(res.body.error.code, 'model_disabled')
+  assert.equal(hops.length, 0)
+})
+
 test('an enabled, omitted or unknown image model reaches the upstream unchanged', async () => {
   saveGptModelPolicy({ image_tools: { 'gpt-image-2.5-sunburst': { enabled: false } } })
   for (const model of ['gpt-image-2.5-flare', null, 'gpt-image-9']) {

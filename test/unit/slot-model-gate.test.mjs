@@ -105,6 +105,11 @@ test('parseAllowedModelsPatch accepts GPT ids for Codex VMs', () => {
   assert.equal(mixed.ok, false)
 })
 
+test('parseAllowedModelsPatch accepts canonical and snapshot GPT image ids', () => {
+  const parsed = parseAllowedModelsPatch(['gpt-image-2', 'gpt-image-2-2026-04-21'], { platform: 'openai' })
+  assert.deepEqual(parsed, { ok: true, value: ['gpt-image-2', 'gpt-image-2-2026-04-21'] })
+})
+
 test('slot allowlist evaluates a Fast alias against its base model', () => {
   assert.deepEqual(
     slotAllowsModel({

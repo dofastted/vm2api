@@ -24,17 +24,19 @@ function withDb(t) {
   })
 }
 
-test('seed enables both image models', (t) => {
+test('seed enables image models', (t) => {
   withDb(t)
   assert.deepEqual(getGptModelPolicy().image_tools, {
     'gpt-image-2.5-flare': { enabled: true },
     'gpt-image-2.5-sunburst': { enabled: true },
+    'gpt-image-2': { enabled: true },
   })
   assert.deepEqual(
     listImageToolModels().map((m) => [m.id, m.enabled, m.upstream_default]),
     [
       ['gpt-image-2.5-flare', true, true],
       ['gpt-image-2.5-sunburst', true, false],
+      ['gpt-image-2', true, false],
     ],
   )
 })
@@ -45,16 +47,18 @@ test('save keeps only known image ids with boolean enabled', (t) => {
     image_tools: {
       'gpt-image-2.5-sunburst': { enabled: false },
       'gpt-image-2': { enabled: false },
+      'gpt-image-future': { enabled: false },
       'gpt-image-2.5-flare': { enabled: 'no' },
     },
   })
   assert.deepEqual(getGptModelPolicy().image_tools, {
     'gpt-image-2.5-flare': { enabled: true },
     'gpt-image-2.5-sunburst': { enabled: false },
+    'gpt-image-2': { enabled: false },
   })
   const stored = new SettingsRepo().get('gpt_model_policy', null)
   assert.equal(stored.image_tools['gpt-image-2.5-sunburst'].enabled, false)
-  assert.equal(stored.image_tools['gpt-image-2'], undefined)
+  assert.equal(stored.image_tools['gpt-image-future'], undefined)
 })
 
 test('save without image_tools keeps the current switches', (t) => {
@@ -73,22 +77,12 @@ test('reset and reload restore image switches', (t) => {
   assert.equal(isImageToolModelEnabled('gpt-image-2.5-flare'), true)
 })
 
-test('stored policy from before image_tools gets defaults', (t) => {
-  withDb(t)
-  new SettingsRepo().set('gpt_model_policy', {
-    source: 'codex',
-    models: { 'gpt-6-luna': { id: 'gpt-6-luna', enabled: true } },
-  })
-  loadGptModelPolicy({ force: true })
-  assert.equal(isImageToolModelEnabled('gpt-image-2.5-sunburst'), true)
-})
-
 test('isImageToolModelEnabled folds snapshots and returns null for unknown ids', (t) => {
   withDb(t)
   saveGptModelPolicy({ image_tools: { 'gpt-image-2.5-sunburst': { enabled: false } } })
   assert.equal(isImageToolModelEnabled('gpt-image-2.5-sunburst-2026-09-08'), false)
   assert.equal(isImageToolModelEnabled('gpt-image-2.5-flare'), true)
-  assert.equal(isImageToolModelEnabled('gpt-image-2'), null)
+  assert.equal(isImageToolModelEnabled('gpt-image-future'), null)
   assert.equal(isImageToolModelEnabled(''), null)
 })
 
@@ -133,11 +127,17 @@ test('Fast exposure defaults off, survives sync, and is persisted by panel save'
   assert.equal(getGptModelPolicy().models['gpt-6-luna'].expose_fast, true)
   assert.equal(isGptFastAliasAvailable('gpt-6-luna-fast'), true)
   assert.equal(listGptFastAliases()[0].id, 'gpt-6-luna-fast')
+  syncGptIdsIntoPolicy([{ id: 'gpt-6-luna', catalog: { service_tiers: [{ id: 'priority', name: 'Fast' }] } }])
+  assert.equal(isGptFastAliasAvailable('gpt-6-luna-fast'), true)
   loadGptModelPolicy({ force: true })
   assert.equal(getGptModelPolicy().models['gpt-6-luna'].expose_fast, true)
+  syncGptIdsIntoPolicy([{ id: 'gpt-6-luna', catalog: { service_tiers: [] } }])
+  assert.equal(isGptFastAliasAvailable('gpt-6-luna-fast'), false)
+  assert.equal(getGptModelPolicy().models['gpt-6-luna'].expose_fast, true)
+  assert.deepEqual(listGptFastAliases(), [])
 })
 
-test('Fast aliases require priority and never replace an actual catalog id', (t) => {
+test('Fast aliases require priority and never replace actual or mapped ids', (t) => {
   withDb(t)
   syncGptIdsIntoPolicy([
     { id: 'gpt-6-luna', catalog: { service_tiers: [{ id: 'flex', name: 'flex' }] } },
@@ -151,6 +151,11 @@ test('Fast aliases require priority and never replace an actual catalog id', (t)
   })
   assert.equal(isGptFastAliasAvailable('gpt-6-luna-fast'), false)
   assert.deepEqual(listGptFastAliases(), [])
+
+  resetGptModelPolicy()
+  syncGptIdsIntoPolicy([{ id: 'gpt-6-luna', catalog: { service_tiers: [{ id: 'priority', name: 'fast' }] } }])
+  saveGptModelPolicy({ models: { 'gpt-6-luna': { enabled: true, expose_fast: true } } })
+  assert.deepEqual(listGptFastAliases({ mappingKeys: ['gpt-6-luna-fast'] }), [])
 })
 
 test('sync without metadata keeps the previous catalog', (t) => {

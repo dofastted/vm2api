@@ -1,7 +1,7 @@
 import { inferClaudeTier } from './claude-tier.mjs'
 import { isFableModel } from './upstream-error-policy.mjs'
 import { getModelEntry, getPolicyCatalogIds, resolvePolicyModelId } from '../protocol/model-policy.mjs'
-import { getGptPolicyCatalogIds, resolveGptFastAlias } from '../protocol/gpt-model-policy.mjs'
+import { getGptPolicyCatalogIds, listImageToolModels, resolveGptFastAlias } from '../protocol/gpt-model-policy.mjs'
 import { isCodexCatalogModel } from '../protocol/models.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 
@@ -61,9 +61,13 @@ export function parseAllowedModelsPatch(raw, opts = {}) {
   if (!Array.isArray(raw)) return { ok: false, error: 'allowed_models must be an array' }
   const gpt = opts.platform === 'openai' || opts.platform === 'gpt' || opts.platform === 'codex' || isCodexVm(opts.vm)
   const catalog = new Set(
-    (gpt ? getGptPolicyCatalogIds({ enabledOnly: false }) : getPolicyCatalogIds({ enabledOnly: false })).map((id) =>
-      id.toLowerCase(),
-    ),
+    (gpt
+      ? [
+          ...getGptPolicyCatalogIds({ enabledOnly: false }),
+          ...listImageToolModels().flatMap((model) => [model.id, ...(model.snapshots || [])]),
+        ]
+      : getPolicyCatalogIds({ enabledOnly: false })
+    ).map((id) => id.toLowerCase()),
   )
   const ids = []
   for (const item of raw) {
