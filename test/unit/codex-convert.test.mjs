@@ -147,6 +147,21 @@ test('legacy fast service tier is sent as priority to Codex', () => {
   assert.equal(converted.body.service_tier, 'priority')
 })
 
+test('chat and completions conversion preserve service_tier', () => {
+  const chat = toCodexResponses('openai.chat', {
+    model: 'gpt-6-luna',
+    messages: [{ role: 'user', content: 'hello' }],
+    service_tier: 'priority',
+  })
+  const completions = toCodexResponses('openai.completions', {
+    model: 'gpt-6-luna',
+    prompt: 'hello',
+    service_tier: 'flex',
+  })
+  assert.equal(chat.body.service_tier, 'priority')
+  assert.equal(completions.body.service_tier, 'flex')
+})
+
 test('Codex hop drops max_output_tokens and keeps reasoning effort', () => {
   const converted = toCodexResponses('openai.responses', {
     model: 'gpt-5.5',

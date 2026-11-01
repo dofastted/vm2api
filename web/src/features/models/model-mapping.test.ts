@@ -65,6 +65,19 @@ describe('targets and problems', () => {
     expect(mappingProblem('gpt-6-luna', ['gpt-6-luna'])).toBeNull()
   })
 
+  it('adds available Fast aliases without hijacking actual ids', () => {
+    expect(
+      mappingTargets([
+        {
+          id: 'gpt-6-luna',
+          expose_fast: true,
+          catalog: { service_tiers: [{ id: 'priority' }] },
+        },
+        { id: 'gpt-6-luna-fast', enabled: true },
+      ])
+    ).toEqual(['gpt-6-luna', 'gpt-6-luna-fast'])
+  })
+
   it('aliasProblem mirrors the server rules', () => {
     const rows = mappingRows({ 'my-fast': 'gpt-6-luna' })
     const check = (alias: string, index = 5) =>

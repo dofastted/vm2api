@@ -10,7 +10,11 @@ import {
   validateCodexModelMappingsPatch,
 } from '../../src/lib/protocol/codex-model-mapping.mjs'
 import { normalizeCodexRouting } from '../../src/lib/protocol/codex-route.mjs'
-import { resetGptModelPolicy, saveGptModelPolicy } from '../../src/lib/protocol/gpt-model-policy.mjs'
+import {
+  resetGptModelPolicy,
+  saveGptModelPolicy,
+  syncGptIdsIntoPolicy,
+} from '../../src/lib/protocol/gpt-model-policy.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 
@@ -37,6 +41,51 @@ test('custom routing.model_mappings overrides default target', () => {
   const rewrite = applyCodexInboundModelRewrite({ model: 'codex-auto-review' }, routing)
   assert.equal(rewrite.upstreamModel, 'gpt-6-sol')
   assert.equal(detectInboundPlatform(rewrite.body.model).platform, 'openai')
+})
+
+test('Fast aliases rewrite to the base model and force priority', () => {
+  resetGptModelPolicy()
+  syncGptIdsIntoPolicy([{ id: 'gpt-6-luna', catalog: { service_tiers: [{ id: 'priority', name: 'fast' }] } }])
+  saveGptModelPolicy({
+    models: {
+      'gpt-6-luna': {
+        enabled: true,
+        expose_fast: true,
+      },
+    },
+  })
+  const rewrite = applyCodexInboundModelRewrite({ model: 'gpt-6-luna-fast', service_tier: 'flex' }, {})
+  assert.equal(rewrite.ok, true)
+  assert.equal(rewrite.body.model, 'gpt-6-luna')
+  assert.equal(rewrite.body.service_tier, 'priority')
+  assert.equal(rewrite.requestedModel, 'gpt-6-luna-fast')
+  assert.deepEqual(validateCodexModelMappingTarget('gpt-6-luna-fast'), {
+    ok: true,
+    target: 'gpt-6-luna',
+    service_tier: 'priority',
+    alias: 'gpt-6-luna-fast',
+  })
+})
+
+test('unavailable Fast aliases fail locally and mapping keys take precedence', () => {
+  resetGptModelPolicy()
+  const unavailable = applyCodexInboundModelRewrite({ model: 'gpt-6-luna-fast' }, {})
+  assert.equal(unavailable.ok, false)
+  assert.equal(unavailable.code, 'model_fast_unavailable')
+  const mapped = applyCodexInboundModelRewrite(
+    { model: 'gpt-6-luna-fast' },
+    { codex: { model_mappings: { 'gpt-6-luna-fast': 'gpt-6-sol' } } },
+  )
+  assert.equal(mapped.ok, true)
+  assert.equal(mapped.body.model, 'gpt-6-sol')
+})
+
+test('actual GPT catalog ids cannot be mapping aliases', () => {
+  resetGptModelPolicy()
+  assert.throws(
+    () => validateCodexModelMappingsPatch({ 'gpt-6-luna': 'gpt-6-sol' }),
+    (error) => error.code === 'invalid_codex_model_mappings',
+  )
 })
 
 test('empty configured target for codex-auto-review uses fallback sol model', () => {

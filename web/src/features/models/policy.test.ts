@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { catalogFacts } from './policy'
+import { catalogFacts, fastAliasState } from './policy'
 
 describe('catalogFacts', () => {
   it('reports 未同步 instead of seed constants', () => {
@@ -54,5 +54,33 @@ describe('catalogFacts', () => {
     expect(
       catalogFacts({ id: 'a', catalog: { service_tiers: [] } }).tierNames
     ).toBe('无')
+  })
+})
+
+describe('fastAliasState', () => {
+  it('requires an explicitly declared priority tier', () => {
+    const model = { id: 'gpt-6-luna', enabled: true, expose_fast: true }
+    expect(fastAliasState(model)).toMatchObject({
+      alias: 'gpt-6-luna-fast',
+      enabled: true,
+      available: false,
+    })
+    expect(fastAliasState(model).reason).toContain('priority')
+  })
+
+  it('shows the enabled Fast alias when the catalog has priority', () => {
+    expect(
+      fastAliasState({
+        id: 'gpt-6-luna',
+        enabled: true,
+        expose_fast: true,
+        catalog: { service_tiers: [{ id: 'priority', name: 'fast' }] },
+      })
+    ).toEqual({
+      alias: 'gpt-6-luna-fast',
+      enabled: true,
+      available: true,
+      reason: '',
+    })
   })
 })

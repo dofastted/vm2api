@@ -105,6 +105,16 @@ test('parseAllowedModelsPatch accepts GPT ids for Codex VMs', () => {
   assert.equal(mixed.ok, false)
 })
 
+test('slot allowlist evaluates a Fast alias against its base model', () => {
+  assert.deepEqual(
+    slotAllowsModel({
+      vm: { platform: 'openai', family: 'codex', policy: { allowed_models: ['gpt-5.4'] } },
+      model: 'gpt-5.4-fast',
+    }),
+    { ok: false, reason: 'model_fast_unavailable' },
+  )
+})
+
 test('persistAllowedModels writes and summarizeVm echoes the list', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-allowed-models-'))
   const dir = path.join(root, 'vms')

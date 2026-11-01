@@ -1,7 +1,7 @@
 import { inferClaudeTier } from './claude-tier.mjs'
 import { isFableModel } from './upstream-error-policy.mjs'
 import { getModelEntry, getPolicyCatalogIds, resolvePolicyModelId } from '../protocol/model-policy.mjs'
-import { getGptPolicyCatalogIds } from '../protocol/gpt-model-policy.mjs'
+import { getGptPolicyCatalogIds, resolveGptFastAlias } from '../protocol/gpt-model-policy.mjs'
 import { isCodexCatalogModel } from '../protocol/models.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 
@@ -127,7 +127,10 @@ export function resolveSlotTier(vm, account = null) {
 }
 
 export function slotAllowsModel({ vm, account = null, model } = {}) {
-  const modelKey = String(model || '').trim()
+  const requestedModel = String(model || '').trim()
+  const fast = resolveGptFastAlias(requestedModel)
+  if (fast.kind === 'unavailable') return { ok: false, reason: 'model_fast_unavailable' }
+  const modelKey = fast.kind === 'fast' ? fast.base : requestedModel
   if (!modelKey) return { ok: true }
   if (isCodexVm(vm)) {
     if (!isCodexCatalogModel(modelKey)) return { ok: false, reason: 'codex_model_required' }

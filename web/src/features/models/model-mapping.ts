@@ -51,8 +51,30 @@ export function rowsToMap(rows: MappingRow[]): Record<string, string> {
   return out
 }
 
-export function mappingTargets(models: { id: string; enabled?: boolean }[]) {
-  return models.filter((m) => m.enabled !== false).map((m) => m.id)
+export function mappingTargets(
+  models: {
+    id: string
+    enabled?: boolean
+    expose_fast?: boolean
+    catalog?: { service_tiers?: { id: string }[] }
+  }[]
+) {
+  const actualIds = new Set(models.map((m) => m.id.toLowerCase()))
+  const targets: string[] = []
+  for (const model of models) {
+    if (model.enabled === false) continue
+    targets.push(model.id)
+    const alias = `${model.id}-fast`
+    if (
+      model.expose_fast === true &&
+      !/-fast$/i.test(model.id) &&
+      model.catalog?.service_tiers?.some((tier) => tier.id === 'priority') &&
+      !actualIds.has(alias.toLowerCase())
+    ) {
+      targets.push(alias)
+    }
+  }
+  return targets
 }
 
 export function mappingProblem(target: string, enabled: string[]) {

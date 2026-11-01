@@ -55,6 +55,7 @@ export type ModelEntry = {
   params?: ModelParams
   betas?: ModelBetas
   catalog?: CatalogMeta
+  expose_fast?: boolean
 }
 
 export type ImageToolModel = {
@@ -162,6 +163,48 @@ export function passContext1mMode(m: ModelEntry): Pass1mMode {
   if (v === true) return 'true'
   if (v === false) return 'false'
   return 'inherit'
+}
+
+export function fastAliasId(m: ModelEntry): string {
+  return `${m.id}-fast`
+}
+
+export function hasPriorityTier(m: ModelEntry): boolean {
+  return !!m.catalog?.service_tiers?.some((tier) => tier?.id === 'priority')
+}
+
+export function fastAliasState(m: ModelEntry): {
+  alias: string
+  enabled: boolean
+  available: boolean
+  reason: string
+} {
+  const alias = fastAliasId(m)
+  if (/-fast$/i.test(m.id)) {
+    return {
+      alias,
+      enabled: false,
+      available: false,
+      reason: '实际目录模型使用此 ID',
+    }
+  }
+  if (!hasPriorityTier(m)) {
+    return {
+      alias,
+      enabled: m.expose_fast === true,
+      available: false,
+      reason: '上游目录未声明 priority 档位',
+    }
+  }
+  if (m.enabled === false) {
+    return {
+      alias,
+      enabled: m.expose_fast === true,
+      available: false,
+      reason: '先启用基模型',
+    }
+  }
+  return { alias, enabled: m.expose_fast === true, available: true, reason: '' }
 }
 
 export function passContext1mEffective(

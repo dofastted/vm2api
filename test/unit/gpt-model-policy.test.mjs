@@ -4,8 +4,10 @@ import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
 import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
 import {
   getGptModelPolicy,
+  isGptFastAliasAvailable,
   isImageToolModelEnabled,
   listGptPolicyModels,
+  listGptFastAliases,
   listImageToolModels,
   loadGptModelPolicy,
   resetGptModelPolicy,
@@ -116,6 +118,39 @@ test('sync stores catalog metadata and replaces it on the next sync', (t) => {
   assert.equal(second.context_window, undefined)
   assert.equal(second.max_context_window, 1000000)
   assert.equal(listGptPolicyModels().find((m) => m.id === 'gpt-6-luna').catalog.max_context_window, 1000000)
+})
+
+test('Fast exposure defaults off, survives sync, and is persisted by panel save', (t) => {
+  withDb(t)
+  assert.equal(getGptModelPolicy().models['gpt-6-luna'].expose_fast, false)
+  syncGptIdsIntoPolicy([
+    {
+      id: 'gpt-6-luna',
+      catalog: { service_tiers: [{ id: 'priority', name: 'fast' }] },
+    },
+  ])
+  saveGptModelPolicy({ models: { 'gpt-6-luna': { enabled: true, expose_fast: true } } })
+  assert.equal(getGptModelPolicy().models['gpt-6-luna'].expose_fast, true)
+  assert.equal(isGptFastAliasAvailable('gpt-6-luna-fast'), true)
+  assert.equal(listGptFastAliases()[0].id, 'gpt-6-luna-fast')
+  loadGptModelPolicy({ force: true })
+  assert.equal(getGptModelPolicy().models['gpt-6-luna'].expose_fast, true)
+})
+
+test('Fast aliases require priority and never replace an actual catalog id', (t) => {
+  withDb(t)
+  syncGptIdsIntoPolicy([
+    { id: 'gpt-6-luna', catalog: { service_tiers: [{ id: 'flex', name: 'flex' }] } },
+    { id: 'gpt-6-luna-fast', catalog: { service_tiers: [{ id: 'priority', name: 'fast' }] } },
+  ])
+  saveGptModelPolicy({
+    models: {
+      'gpt-6-luna': { enabled: true, expose_fast: true },
+      'gpt-6-luna-fast': { enabled: true },
+    },
+  })
+  assert.equal(isGptFastAliasAvailable('gpt-6-luna-fast'), false)
+  assert.deepEqual(listGptFastAliases(), [])
 })
 
 test('sync without metadata keeps the previous catalog', (t) => {
