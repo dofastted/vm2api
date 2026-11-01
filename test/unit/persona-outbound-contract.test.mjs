@@ -705,6 +705,29 @@ for (const preset of ['official', 'official_full']) {
     assert.ok(listCacheMarkers(out).every((marker) => marker.ttl === '1h'))
   })
 
+  for (const [callerTtl, expected] of [
+    [undefined, '1h'],
+    ['5m', '5m'],
+    ['1h', '1h'],
+  ]) {
+    test(`CLI ${preset} rewrite fills only missing official caller marker TTL (${callerTtl ?? 'missing'})`, async (t) => {
+      const out = await outbound(t, {
+        preset,
+        headers: { 'user-agent': 'claude-cli/2.1.303 (external, cli)' },
+        input: {
+          system: [text("You are Claude Code, Anthropic's official CLI for Claude."), text('Official caller prompt')],
+          messages: [
+            { role: 'user', content: [text('Hello')] },
+            { role: 'system', content: [text('Trailing reminder', callerTtl)] },
+          ],
+          metadata: { user_id: { device_id: 'fixture-device', session_id: 'fixture-session' } },
+        },
+      })
+      const marker = listCacheMarkers(out).find((item) => item.section === 'messages' && item.role === 'system')
+      assert.equal(marker?.ttl, expected)
+    })
+  }
+
   for (const backend of ['cli', 'api']) {
     const run = backend === 'api' ? unixTest : test
     run(`${backend} ${preset} reserves all four caller message breakpoints`, async (t) => {

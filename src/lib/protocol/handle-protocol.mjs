@@ -1484,6 +1484,13 @@ export function createHandleProtocol(deps) {
                 epoch: attemptStartedAt,
               })
             }
+            // Rewritten official traffic can still carry an inbound caller
+            // marker without ttl. Fill only those omissions so Anthropic does
+            // not silently bill a 1h configuration as an implicit 5m write.
+            if (!requestContext && officialTraffic && !officialPassthrough) {
+              hopBody = fillMissingCacheTtl(hopBody, requestedCacheTtl)
+              validateCacheBreakpoints(hopBody)
+            }
             preserveCacheBreakpoints = true
             // Native wire may mix TTLs or leave caller TTL absent. The menu is
             // not an accounting authority; retain the upstream 5m/1h split.
