@@ -4439,6 +4439,7 @@ export function createPanelHandler(ctx) {
           }
           const proxyUrl = slotProxy.proxyUrl
           let oauth = null
+          let oauthFromVm = false
           if (wantsApiKey) {
             const apiKey = String(apiKeyRaw || sessionKey || accessToken).trim()
             if (!looksLikeConsoleApiKey(apiKey)) {
@@ -4466,6 +4467,7 @@ export function createPanelHandler(ctx) {
               projectRoot: cfg.paths.project,
               routing: ctx.routingConfig,
             })
+            oauthFromVm = true
             if (inference) {
               oauth.type = 'setup-token'
               oauth.mode = 'setup-token'
@@ -4503,7 +4505,7 @@ export function createPanelHandler(ctx) {
             return json(res, 400, { ok: false, error: { message: 'sessionKey or access_token required' } })
           }
           if (body.auth_scheme || body.authScheme) oauth.auth_scheme = body.auth_scheme || body.authScheme
-          if (oauth.access_token && !wantsApiKey) {
+          if (oauth.access_token && !wantsApiKey && !oauthFromVm) {
             oauth = await enrichOauthIdentity(oauth, { proxyUrl })
           }
           const committed = await commitImportedOauth({
@@ -4681,29 +4683,33 @@ export function createPanelHandler(ctx) {
               !loginSession.expired &&
               loginSession.session_id &&
               loginSession.session_id === sessionKey)
-          let oauth = looksLikeOfficialSetupToken(code)
-            ? await completeClaudeSetupToken({
-                projectRoot: cfg.paths.project,
-                vmId: id,
-                sessionId: sessionKey,
-                code,
-              })
-            : officialLogin
-              ? await completeClaudeAuthLogin({
-                  projectRoot: cfg.paths.project,
-                  vmId: id,
-                  sessionId: sessionKey,
-                  code,
-                })
-              : await exchangeAuthCode({
-                  sessionId: sessionKey,
-                  code,
-                  proxyUrl: slotProxy.proxyUrl,
-                  vmId: id,
-                  exec: slotExec(cfg.paths.project, existing),
-                  projectRoot: cfg.paths.project,
-                  routing: ctx.routingConfig,
-                })
+          let oauth
+          let oauthFromVm = false
+          if (looksLikeOfficialSetupToken(code)) {
+            oauth = await completeClaudeSetupToken({
+              projectRoot: cfg.paths.project,
+              vmId: id,
+              sessionId: sessionKey,
+              code,
+            })
+          } else if (officialLogin) {
+            oauth = await completeClaudeAuthLogin({
+              projectRoot: cfg.paths.project,
+              vmId: id,
+              sessionId: sessionKey,
+              code,
+            })
+          } else {
+            oauthFromVm = true
+            oauth = await exchangeAuthCode({
+              sessionId: sessionKey,
+              code,
+              vmId: id,
+              exec: slotExec(cfg.paths.project, existing),
+              projectRoot: cfg.paths.project,
+              routing: ctx.routingConfig,
+            })
+          }
           if (looksLikeOfficialSetupToken(code) || oauth.flavor === SETUP_TOKEN_FLAVOR) {
             oauth.type = 'official-setup-token'
             oauth.mode = 'official-setup-token'
@@ -4719,7 +4725,7 @@ export function createPanelHandler(ctx) {
             oauth.mode = 'setup-token'
           }
           if (body.auth_scheme || body.authScheme) oauth.auth_scheme = body.auth_scheme || body.authScheme
-          if (oauth.access_token) {
+          if (oauth.access_token && !oauthFromVm) {
             oauth = await enrichOauthIdentity(oauth, { proxyUrl: slotProxy.proxyUrl })
           }
           const committed = await commitImportedOauth({

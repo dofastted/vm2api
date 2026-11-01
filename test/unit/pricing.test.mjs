@@ -566,6 +566,21 @@ test('imageCostFromUsage matches the codex-proxy-rs image token formula', () => 
   assert.equal(c.image_output_tokens, 1000)
 })
 
+test('GPT Image 2 snapshot usage is billed without double-counting image tokens', () => {
+  const cost = imageCostFromUsage(
+    {
+      input_tokens: 18,
+      input_tokens_details: { text_tokens: 18, image_tokens: 0 },
+      output_tokens: 229,
+      total_tokens: 247,
+    },
+    'gpt-image-2-2026-04-21',
+  )
+  assert.equal(cost.known, true)
+  assert.equal(cost.pricing_key, 'gpt-image-2')
+  close(cost.image_cost, 0.00696)
+})
+
 test('imageCostFromUsage splits cached input only when the split is unambiguous', () => {
   const textOnly = {
     input_tokens: 100,

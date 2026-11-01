@@ -15,7 +15,7 @@ import {
 } from './model-policy.mjs'
 import { hasClaudeCode1mSuffix, stripClaudeCode1mSuffix } from './context-1m.mjs'
 import { isGptSeriesId } from './gpt-ids.mjs'
-import { listGptPolicyModels, listImageToolModels } from './gpt-model-policy.mjs'
+import { listGptFastAliases, listGptPolicyModels, listImageToolModels } from './gpt-model-policy.mjs'
 
 const FAMILY_ALIASES = new Map([
   ['sonnet', 'sonnet'],
@@ -42,9 +42,9 @@ export function seedModelCatalog() {
   return setModelCatalog(ids, { source: 'model-policy' })
 }
 
-function listGptPublicModels() {
+function listGptPublicModels(mappingKeys = []) {
   try {
-    return listGptPolicyModels().map((m) => ({
+    const models = listGptPolicyModels().map((m) => ({
       id: m.id,
       object: 'model',
       type: 'model',
@@ -54,6 +54,15 @@ function listGptPublicModels() {
       enabled: m.enabled !== false,
       source: 'gpt-model-policy',
     }))
+    return [
+      ...models,
+      ...listGptFastAliases({ mappingKeys }).map((m) => ({
+        ...m,
+        object: 'model',
+        type: 'model',
+        owned_by: 'openai',
+      })),
+    ]
   } catch {
     return []
   }
@@ -83,12 +92,12 @@ function listImagePublicModels() {
  * Local catalog for GET /v1/models and boot. Does not touch workers.
  * groupType is the key's group_type: openai lists GPT only, anthropic lists Claude only, all lists both.
  */
-export function gatewayModelCatalog({ groupType = 'all' } = {}) {
+export function gatewayModelCatalog({ groupType = 'all', mappingKeys = [] } = {}) {
   seedModelCatalog()
   try {
     loadModelPolicy()
   } catch {}
-  const gpt = groupType === 'anthropic' ? [] : [...listGptPublicModels(), ...listImagePublicModels()]
+  const gpt = groupType === 'anthropic' ? [] : [...listGptPublicModels(mappingKeys), ...listImagePublicModels()]
   const claude = groupType === 'openai' ? [] : listOfficialModels()
   return {
     object: 'list',

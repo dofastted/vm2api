@@ -29,6 +29,7 @@ type PolicyPayload = {
     >
   }
   models?: { id: string; label?: string; display_name?: string }[]
+  image_tools?: { id: string; display_name: string; enabled: boolean }[]
 }
 
 function isFableId(id: string) {
@@ -81,7 +82,18 @@ export function AllowedModelsCard({ vm }: { vm: Vm }) {
     ...modelPolicyQueryOptions(gpt ? 'openai' : 'anthropic'),
     enabled: canEdit,
   })
-  const items = catalogForVm(catalogFrom(policy.data), vm)
+  const items = [
+    ...catalogForVm(catalogFrom(policy.data), vm),
+    ...(gpt
+      ? (policy.data?.image_tools || [])
+          .filter((model) => model.enabled)
+          .map((model) => ({
+            id: model.id,
+            label: model.display_name,
+            family: 'gpt-image',
+          }))
+      : []),
+  ]
   const save = useMutation({
     mutationFn: (next: string[] | null) =>
       api(`/api/panel/vms/${encodeURIComponent(vm.id)}`, {

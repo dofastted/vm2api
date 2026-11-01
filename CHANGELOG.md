@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- 修复 OAuth 换票的嵌套代理：token 与 bootstrap 都在对应 VM 内沿用其绑定出口，控制面返回后不再再次经代理 bootstrap。
 
 ## 1.4.031 — 2026-11-01
 

@@ -277,7 +277,7 @@ export function ModelsPage() {
   const claudePool = catalogPlatform === 'anthropic'
   const imageTools = q.data?.image_tools || []
   // Mapping targets follow the saved policy: the server validates against it.
-  const gptTargets = claudePool ? [] : mappingTargets(q.data?.models || [])
+  const gptTargets = claudePool ? [] : mappingTargets(all)
   const imageIds = imageTools.flatMap((m) => [m.id, ...m.snapshots])
   const poolHint = claudePool
     ? 'Claude 号池。同一会话只占一个 VM session 窗口，不和 GPT 混调度。'

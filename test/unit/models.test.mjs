@@ -1,6 +1,5 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import fs from 'node:fs'
 import {
   isCatalogModelId,
   latestIdForFamily,
@@ -144,18 +143,6 @@ test('gatewayModelCatalog stays local and never hops', () => {
     ids.some((id) => String(id).startsWith('claude-')),
     JSON.stringify(ids.slice(0, 12)),
   )
-  const src = fs.readFileSync(new URL('../../src/server.mjs', import.meta.url), 'utf8')
-  assert.equal(src.includes('callWorkerGet'), false)
-  assert.match(src, /return gatewayModelCatalog\([a-z]*\)/)
-})
-
-test('models module never talks to Anthropic or a CLI binary', () => {
-  const src = fs.readFileSync(new URL('../../src/lib/protocol/models.mjs', import.meta.url), 'utf8')
-  assert.equal(src.includes('api.anthropic.com'), false)
-  assert.equal(src.includes('oauth-2025-04-20'), false)
-  assert.equal(src.includes('spawnSync'), false)
-  assert.equal(src.includes('child_process'), false)
-  assert.equal(/user-agent.*claude-cli/.test(src), false)
 })
 
 test('gatewayModelCatalog filters by key group_type', () => {

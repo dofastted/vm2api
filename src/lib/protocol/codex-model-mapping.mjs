@@ -3,7 +3,7 @@
  * Applied before detectInboundPlatform; literal detect on raw ids is unchanged.
  */
 import { isGptSeriesId } from './gpt-ids.mjs'
-import { isGptModelEnabled } from './gpt-model-policy.mjs'
+import { getGptPolicyCatalogIds, isGptModelEnabled, resolveGptFastAlias } from './gpt-model-policy.mjs'
 import { canonicalImageToolModel } from './image-tool-models.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
 
@@ -24,6 +24,7 @@ function mappingLookup(map, model) {
   const bare = bareModelId(model)
   if (!bare) return null
   const lower = bare.toLowerCase()
+  if (getGptPolicyCatalogIds({ enabledOnly: false }).some((id) => id.toLowerCase() === lower)) return null
   if (Object.prototype.hasOwnProperty.call(map, bare)) return map[bare]
   if (Object.prototype.hasOwnProperty.call(map, lower)) return map[lower]
   for (const [key, target] of Object.entries(map)) {
@@ -66,14 +67,24 @@ export function validateCodexModelMappingTarget(target) {
       message: `model mapping target '${id || ''}' must be an enabled GPT chat model id`,
     }
   }
-  if (!isGptModelEnabled(id)) {
+  const fast = resolveGptFastAlias(id)
+  if (fast.kind === 'unavailable') {
+    return {
+      ok: false,
+      code: fast.reason === 'base_disabled' ? 'model_disabled' : 'model_fast_unavailable',
+      message: `model mapping target '${id}' is not an available Fast alias`,
+    }
+  }
+  if (fast.kind === 'fast') return { ok: true, target: fast.base, service_tier: fast.service_tier, alias: fast.alias }
+  const actual = fast.kind === 'actual' ? fast.model : id
+  if (!isGptModelEnabled(actual)) {
     return {
       ok: false,
       code: 'model_disabled',
       message: `model mapping target '${id}' is disabled by gateway GPT model policy`,
     }
   }
-  return { ok: true, target: id }
+  return { ok: true, target: actual }
 }
 
 export function validateCodexModelMappingsPatch(raw, path = 'codex.model_mappings') {
@@ -87,6 +98,9 @@ export function validateCodexModelMappingsPatch(raw, path = 'codex.model_mapping
     // The rewrite runs before platform detection, so an alias must not capture Claude or image traffic.
     if (/[\s\p{Cc}]/u.test(key)) {
       throw typedError(`${path} 的别名 '${alias}' 不能包含空白或控制字符`, 'invalid_codex_model_mappings')
+    }
+    if (getGptPolicyCatalogIds({ enabledOnly: false }).some((id) => id.toLowerCase() === alias.toLowerCase())) {
+      throw typedError(`${path} 的别名 '${alias}' 不能覆盖实际 GPT 目录模型`, 'invalid_codex_model_mappings')
     }
     if (detectInboundPlatform(alias).platform === 'anthropic') {
       throw typedError(
@@ -130,15 +144,29 @@ export function applyCodexInboundModelRewrite(body, routing = {}) {
   const codex = routing.codex && typeof routing.codex === 'object' ? routing.codex : routing
   const mappings = normalizeCodexModelMappings(codex?.model_mappings)
   const target = mappingLookup(mappings, model)
-  if (target == null) return { ok: true, body, requestedModel: model.trim(), upstreamModel: null, mapped: false }
-  const validated = validateCodexModelMappingTarget(target)
+  const requestedModel = model.trim()
+  const fast = target == null ? resolveGptFastAlias(requestedModel) : null
+  if (target == null && fast?.kind === 'unavailable') {
+    return {
+      ok: false,
+      code: fast.reason === 'base_disabled' ? 'model_disabled' : 'model_fast_unavailable',
+      message: `model '${requestedModel}' is not an available Fast alias`,
+    }
+  }
+  if (target == null && fast?.kind !== 'fast') {
+    return { ok: true, body, requestedModel, upstreamModel: null, mapped: false }
+  }
+  const validated = validateCodexModelMappingTarget(target == null ? requestedModel : target)
   if (!validated.ok) return validated
   const upstreamModel = validated.target
+  const nextBody = { ...body, model: rewriteModelField(model, upstreamModel) }
+  if (validated.service_tier) nextBody.service_tier = validated.service_tier
   return {
     ok: true,
-    body: { ...body, model: rewriteModelField(model, upstreamModel) },
+    body: nextBody,
     mapped: true,
-    requestedModel: model.trim(),
+    requestedModel,
     upstreamModel,
+    serviceTier: validated.service_tier || null,
   }
 }

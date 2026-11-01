@@ -12,6 +12,7 @@ import { resetOpenAIAccountRuntime } from '../../src/lib/pool/openai-account-run
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { readBody } from '../../src/lib/http/respond.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
+import { gatewayModelCatalog } from '../../src/lib/protocol/models.mjs'
 
 const USAGE = {
   input_tokens: 300,
@@ -159,6 +160,33 @@ test('a disabled image model is refused before any slot is used', async () => {
   assert.equal(res.statusCode, 400)
   assert.equal(res.body.error.code, 'model_disabled')
   assert.equal(calls, 0)
+})
+
+test('GPT Image 2 exposure and snapshot invocation follow its saved policy', async () => {
+  writeGptVm('vm-a')
+  const listed = () => gatewayModelCatalog({ groupType: 'openai' }).data.some((m) => m.id === 'gpt-image-2')
+  let calls = 0
+  const invoke = () =>
+    images({
+      body: { model: 'gpt-image-2-2026-04-21', prompt: 'a lighthouse' },
+      ops: {
+        fetchImpl: async () => {
+          calls++
+          return upstream(200, { data: [{ b64_json: 'AAEC' }], usage: USAGE })
+        },
+      },
+    })
+  saveGptModelPolicy({ image_tools: { 'gpt-image-2': { enabled: false } } })
+  assert.equal(listed(), false)
+  assert.equal((await invoke()).res.body.error.code, 'model_disabled')
+  assert.equal(calls, 0)
+  saveGptModelPolicy({ image_tools: { 'gpt-image-2': { enabled: true } } })
+  assert.equal(listed(), true)
+  const result = await invoke()
+  assert.equal(result.res.statusCode, 200)
+  assert.equal(result.res.body.data[0].b64_json, 'AAEC')
+  assert.equal(result.logBag.image_model, 'gpt-image-2')
+  assert.deepEqual(result.logBag.image_usage, USAGE)
 })
 
 test('a missing or unknown model reaches the upstream unchanged', async () => {

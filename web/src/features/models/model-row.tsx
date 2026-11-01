@@ -36,6 +36,7 @@ import {
   type Pass1mMode,
   catalogFacts,
   contextWindowLabel,
+  fastAliasState,
   passContext1mEffective,
   passContext1mMode,
   thinkingPolicyLabel,
@@ -98,6 +99,7 @@ export function ModelRow({
   // GPT rows show upstream catalog facts; Claude thinking / max_tokens / 1M knobs do not apply.
   const claude = platform === 'anthropic'
   const facts = claude ? null : catalogFacts(model)
+  const fast = claude || /-fast$/i.test(model.id) ? null : fastAliasState(model)
 
   return (
     <Dialog
@@ -292,11 +294,38 @@ export function ModelRow({
                   </div>
                 </>
               ) : (
-                <p className='text-xs leading-5 text-muted-foreground'>
-                  上下文、推理强度等能力来自上游 Codex 目录，点「同步
-                  GPT」刷新；GPT 请求不经过 Claude 的 thinking / max_tokens
-                  整流，因此这里没有参数可调。别名请用上方的「模型映射」。
-                </p>
+                <div className='space-y-3'>
+                  <p className='text-xs leading-5 text-muted-foreground'>
+                    上下文、推理强度等能力来自上游 Codex 目录，点「同步
+                    GPT」刷新；GPT 请求不经过 Claude 的 thinking / max_tokens
+                    整流，因此这里没有参数可调。别名请用上方的「模型映射」。
+                  </p>
+                  {fast ? (
+                    <EditorRow label='Fast 别名'>
+                      <div className='flex min-w-0 flex-wrap items-center gap-2'>
+                        <Checkbox
+                          checked={fast.enabled}
+                          disabled={!fast.available}
+                          onCheckedChange={(value) =>
+                            onModel((rec) => {
+                              rec.expose_fast = value === true
+                            })
+                          }
+                          aria-label={`公开 ${fast.alias}`}
+                        />
+                        <span className='font-mono text-xs'>{fast.alias}</span>
+                        <span className='text-xs text-muted-foreground'>
+                          使用 priority
+                        </span>
+                      </div>
+                    </EditorRow>
+                  ) : null}
+                  {fast && !fast.available ? (
+                    <p className='text-xs leading-5 text-muted-foreground'>
+                      {fast.reason}，因此不会公开或接受此 Fast 别名。
+                    </p>
+                  ) : null}
+                </div>
               )}
             </Panel>
 

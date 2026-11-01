@@ -4,6 +4,7 @@
  * Request/usage shapes follow codex-proxy-rs (system→developer, extract_usage).
  */
 import { extractOpenaiUsage, openaiAnthropicUsageFromExtract, openaiChatUsageFromExtract } from './openai-usage.mjs'
+import { resolveGptFastAlias } from './gpt-model-policy.mjs'
 
 const IDENTITY_KEYS = [
   'base_url',
@@ -27,6 +28,19 @@ export function stripCodexIdentity(body = {}) {
     next.metadata = metadata
   }
   return next
+}
+
+function normalizeFastAliasBody(body = {}) {
+  if (!body || typeof body !== 'object') return { ok: true, body }
+  const fast = resolveGptFastAlias(body.model)
+  if (fast.kind === 'unavailable') {
+    return { ok: false, code: fast.reason === 'base_disabled' ? 'model_disabled' : 'model_fast_unavailable' }
+  }
+  if (fast.kind !== 'fast') return { ok: true, body }
+  const model = String(body.model || '').trim()
+  const parts = model.split('/').filter(Boolean)
+  if (parts.length) parts[parts.length - 1] = fast.base
+  return { ok: true, body: { ...body, model: parts.join('/'), service_tier: fast.service_tier } }
 }
 
 function textParts(content) {
@@ -211,6 +225,7 @@ export function chatToCodexResponses(body = {}) {
     out.max_output_tokens = body.max_tokens || body.max_completion_tokens
   }
   if (body.prompt_cache_key) out.prompt_cache_key = body.prompt_cache_key
+  if (body.service_tier != null) out.service_tier = body.service_tier
   return out
 }
 
@@ -223,6 +238,7 @@ export function completionsToCodexResponses(body = {}) {
     store: false,
   }
   if (body.prompt_cache_key) out.prompt_cache_key = body.prompt_cache_key
+  if (body.service_tier != null) out.service_tier = body.service_tier
   return out
 }
 
@@ -309,21 +325,24 @@ export function anthropicToCodexResponses(body = {}) {
 
 export function toCodexResponses(protocol, body, convert = {}) {
   const stripped = stripCodexIdentity(body)
+  const fast = normalizeFastAliasBody(stripped)
+  if (!fast.ok) return fast
+  const normalized = fast.body
   if (protocol === 'openai.responses') {
     return {
       ok: true,
-      body: normalizeCodexResponsesInput(stripped),
-      converted: typeof stripped.input === 'string',
+      body: normalizeCodexResponsesInput(normalized),
+      converted: typeof normalized.input === 'string',
     }
   }
   if (protocol === 'openai.chat' && convert.chat_to_codex !== false) {
-    return { ok: true, body: stripUnsupportedCodexFields(chatToCodexResponses(stripped)), converted: true }
+    return { ok: true, body: stripUnsupportedCodexFields(chatToCodexResponses(normalized)), converted: true }
   }
   if (protocol === 'openai.completions' && convert.completions_to_codex !== false) {
-    return { ok: true, body: stripUnsupportedCodexFields(completionsToCodexResponses(stripped)), converted: true }
+    return { ok: true, body: stripUnsupportedCodexFields(completionsToCodexResponses(normalized)), converted: true }
   }
   if (protocol === 'anthropic.messages' && convert.anthropic_to_codex === true) {
-    return { ok: true, body: stripUnsupportedCodexFields(anthropicToCodexResponses(stripped)), converted: true }
+    return { ok: true, body: stripUnsupportedCodexFields(anthropicToCodexResponses(normalized)), converted: true }
   }
   return { ok: false, code: 'protocol_not_allowed' }
 }
