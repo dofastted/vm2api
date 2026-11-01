@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- #848：修复 Docker/KVM guest OAuth 换票把控制面的宿主 loopback SOCKS 地址传给 `kin-oauth-auth`，导致容器内连接 `127.0.0.1` 被拒；Linux guest 改由槽位 `kin-eg-*` 透明出口选路，macOS native 路径不变。
+
 ## 1.4.034 — 2026-11-02
 
 - 透传关闭时，任何入站都先收成标准 Anthropic 结构再进人设：调用方 billing 删掉并由项目重写；调用方 User-Agent 不出站。只有协议页打开官方家族透传才保留这两者。第三方工具名改为 `mcp__`，回包按原名还原。
