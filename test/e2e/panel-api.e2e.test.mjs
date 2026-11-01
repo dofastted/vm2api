@@ -2,7 +2,9 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import path from 'node:path'
-import { REPO_ROOT, startGateway, api } from '../harness.mjs'
+import net from 'node:net'
+import os from 'node:os'
+import { REPO_ROOT, startGateway, api, seedVm } from '../harness.mjs'
 
 test('panel login → cookie → /api/panel/me', async () => {
   const gw = await startGateway()
@@ -300,6 +302,51 @@ test('generate-auth-url then exchange-code writes fake oauth', async () => {
     assert.equal(out.vm?.has_token || out.has_refresh != null, true)
   } finally {
     await gw.stop()
+  }
+})
+
+test('OAuth exchange reuses VM egress without a host-side proxy hop', async () => {
+  let connections = 0
+  const proxy = net.createServer((socket) => {
+    connections += 1
+    socket.on('error', () => {})
+    socket.destroy()
+  })
+  await new Promise((resolve) => proxy.listen(0, '127.0.0.1', resolve))
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-proxy-'))
+  const vmPath = path.join(project, 'vms', 'vm-sim-01.json')
+  try {
+    seedVm({ project, oauth: false })
+    const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+    vm.proxy = {
+      ...vm.proxy,
+      url: `socks5h://127.0.0.1:${proxy.address().port}`,
+      host: '127.0.0.1',
+      port: proxy.address().port,
+    }
+    fs.writeFileSync(vmPath, JSON.stringify(vm, null, 2))
+    const gw = await startGateway({ project, oauth: false })
+    try {
+      // Gateway startup is not part of the exchange request under test.
+      connections = 0
+      const generated = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/generate-auth-url', { body: {} })
+      assert.equal(generated.status, 200, generated.text)
+      const link = generated.json.data || generated.json
+      const exchanged = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/exchange-code', {
+        body: { session_id: link.session_id, code: 'pasted-auth-code' },
+      })
+      assert.equal(exchanged.status, 200, exchanged.text)
+      const imported = await api(gw, 'POST', '/api/panel/vms/import', {
+        body: { vm_id: 'vm-sim-01', sessionKey: 'sk-ant-sid-proxy-reuse' },
+      })
+      assert.equal(imported.status, 200, imported.text)
+      assert.equal(connections, 0)
+    } finally {
+      await gw.stop()
+    }
+  } finally {
+    await new Promise((resolve) => proxy.close(resolve))
+    fs.rmSync(project, { recursive: true, force: true })
   }
 })
 

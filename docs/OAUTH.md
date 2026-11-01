@@ -6,9 +6,10 @@
 sessionKey（默认 Setup Token）或授权码
    │ 必须先有 VM + 槽位出口：SOCKS5，或本地出口 px-local（宿主机默认路由直连）；未绑定一律拒绝
    ▼
-bin/kin-oauth-auth（控制面 spawn；OAuth 源码只在本地构建）
-   │ sessionKey → /api/organizations → 完整 scope authorize → token
-   │ bootstrap（entrypoint=claude-code&model=claude-opus-5-5）读取 oauth_account；不再 PATCH Grove
+目标 VM 内的 `bin/kin-oauth-auth`（控制面只负责 `docker exec`，OAuth 源码只在本地构建）
+   │ sessionKey / 授权码 → authorize → token
+   │ bootstrap（entrypoint=claude-code&model=claude-opus-5-5）仍经同一 VM 出口读取 oauth_account
+   │ 控制面接收完整凭证，不在 helper 返回后再次 bootstrap 或套一层代理
    ▼
 槽 ~/.claude/credentials.json   ← 活票只在这里（含 email / account_uuid / org_uuid）
    │ host RefreshIfNeeded（推理临期 或 面板显式 refresh）
