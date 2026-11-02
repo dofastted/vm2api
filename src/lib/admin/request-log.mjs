@@ -19,6 +19,7 @@ import path from 'node:path'
 import crypto from 'node:crypto'
 import { redactSecrets } from '../core/security.mjs'
 import { resolveStoreDb } from '../db/database.mjs'
+import { enqueueWrite, writeBehindArmed } from '../db/write-behind.mjs'
 import { UsageLogsRepo } from '../db/repos/usage-logs-repo.mjs'
 import { classifyRequestError, resolveMutedErrorClasses } from './error-class.mjs'
 import { costColumnsFromUsage, normalizeUsage } from './pricing.mjs'
@@ -592,7 +593,7 @@ export class RequestLogStore {
       image_output_tokens: imageTokenCount(extra.image_usage?.output_tokens),
       // sub2api ownership + billing columns
       user_id: extra.user_id ?? null,
-      vm_owner_user_id: this.repo.vmOwnerOf(extra.vm_id),
+      vm_owner_user_id: null,
       group_id: extra.group_id ?? 1,
       rate_multiplier: Number.isFinite(Number(extra.rate_multiplier)) ? Number(extra.rate_multiplier) : 1,
       ...costColumnsForLog(billedUsage, extra.upstream_model || extra.model || extra.requested_model, extra),
@@ -605,14 +606,13 @@ export class RequestLogStore {
     const classified = classifyRequestError(summary)
     if (classified?.error_class) summary.error_class = classified.error_class
 
-    try {
-      this.repo.insertSummaryIfAbsent(summary)
-    } catch {}
-    if (this.jsonlMirror) this._appendJsonl(summary)
-    this._mem.push(summary)
-    if (this._mem.length > this._memMax) this._mem = this._mem.slice(-this._memMax)
-
-    if (ctx.mode === 'debug') {
+    const persist = () => {
+      summary.vm_owner_user_id = this.repo.vmOwnerOf(extra.vm_id)
+      try {
+        this.repo.insertSummaryIfAbsent(summary)
+      } catch {}
+      if (this.jsonlMirror) this._appendJsonl(summary)
+      if (ctx.mode !== 'debug') return
       const debugRec = {
         ...summary,
         headers: ctx.headers,
@@ -647,6 +647,10 @@ export class RequestLogStore {
         this.repo.insertDebug(summary.request_id || summary.id, summary.ts, debugRec)
       } catch {}
     }
+    this._mem.push(summary)
+    if (this._mem.length > this._memMax) this._mem = this._mem.slice(-this._memMax)
+    if (writeBehindArmed()) enqueueWrite(persist)
+    else persist()
     return summary
   }
 

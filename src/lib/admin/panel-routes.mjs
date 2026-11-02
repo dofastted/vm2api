@@ -189,6 +189,7 @@ import { withVmLock, atomicWriteJson, isValidVmId, invalidateVmSlotReadCache } f
 import { snapshotDatabaseMetrics } from '../db/database-metrics.mjs'
 import { getUsageCache } from '../oauth/usage-cache.mjs'
 import { getDb, getDbPath } from '../db/database.mjs'
+import { usagePoolEnabled, usageRead } from '../db/sqlite-pool.mjs'
 import {
   readLocalVersion,
   loadChangelog,
@@ -1182,6 +1183,21 @@ export function createPanelHandler(ctx) {
     }
   }
 
+  async function readUsage(kind, method, args) {
+    if (!usagePoolEnabled()) return null
+    try {
+      return await usageRead({
+        kind,
+        method,
+        args,
+        mutedErrorClasses: requestLog?.mutedErrorClasses || [],
+      })
+    } catch (err) {
+      console.warn(`[sqlite-pool] ${kind}.${method}: ${err?.message || err}`)
+      return null
+    }
+  }
+
   return async function handlePanel(req, res, url) {
     const p = url.pathname
     if (!p.startsWith('/admin') && !p.startsWith('/api/panel')) return false
@@ -1997,9 +2013,10 @@ export function createPanelHandler(ctx) {
           status_code: listed.status_code || (/^\d+$/.test(legacyStatus || '') ? legacyStatus : null),
           errors_only: legacyStatus === 'error',
         }
-        const { items, total, capped } = new UsageLogsView(getDb(), {
-          mutedErrorClasses: requestLog?.mutedErrorClasses,
-        }).exportRows(filters)
+        const exported =
+          (await readUsage('view', 'exportRows', [filters])) ||
+          new UsageLogsView(getDb(), { mutedErrorClasses: requestLog?.mutedErrorClasses }).exportRows(filters)
+        const { items, total, capped } = exported
         const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')
         const body = format === 'csv' ? logsToCsv(items) : logsToJsonl(items)
         const filename = `vm2api-logs-${stamp}.${format}`
@@ -2026,14 +2043,36 @@ export function createPanelHandler(ctx) {
         const until = u.searchParams.get('until') || null
         const tenant = panelIdentity(req).role === 'user'
         const owner_user_id = tenant ? req.panelUserId : u.searchParams.get('user_id') || null
+        let totals
+        let buckets
+        let window
+        if (usagePoolEnabled()) {
+          try {
+            const jobs = [
+              usageRead({ kind: 'repo', method: 'aggregate', args: [{ since, until, bucket, owner_user_id }] }),
+              usageRead({ kind: 'repo', method: 'windowStats', args: [{ since, until, owner_user_id }] }),
+            ]
+            if (!tenant) jobs.unshift(usageRead({ kind: 'repo', method: 'totals' }))
+            const out = await Promise.all(jobs)
+            if (tenant) [buckets, window] = out
+            else [totals, buckets, window] = out
+          } catch (err) {
+            console.warn(`[sqlite-pool] repo.stats: ${err?.message || err}`)
+          }
+        }
+        if (buckets === undefined) {
+          totals = tenant ? null : requestLog.totals()
+          buckets = requestLog.aggregate({ since, until, bucket, owner_user_id })
+          window = requestLog.windowStats({ since, until, owner_user_id })
+        }
         return json(res, 200, {
           ok: true,
           bucket,
           since,
           until,
-          totals: tenant ? null : requestLog.totals(),
-          buckets: requestLog.aggregate({ since, until, bucket, owner_user_id }),
-          window: requestLog.windowStats({ since, until, owner_user_id }),
+          totals: totals ?? null,
+          buckets,
+          window,
           muted_error_classes: requestLog.snapshot().muted_error_classes,
           config: tenant ? null : requestLog.snapshot(),
         })
@@ -2068,34 +2107,36 @@ export function createPanelHandler(ctx) {
       // Lives beside /request-logs (offset + snake_case, still used by error
       // collection and export); this surface never COUNTs the table.
       const usageLogsView = () => new UsageLogsView(getDb(), { mutedErrorClasses: requestLog?.mutedErrorClasses })
+      const readView = async (method, ...args) =>
+        (await readUsage('view', method, args)) ?? usageLogsView()[method](...args)
       const tenantId = () => (panelIdentity(req).role === 'user' ? req.panelUserId : null)
       if (req.method === 'GET' && p === '/api/panel/usage-logs') {
         const u = new URL(req.url, 'http://x')
-        return json(res, 200, panel.ok(usageLogsView().listBatch(usageLogFilters(req, u))))
+        return json(res, 200, panel.ok(await readView('listBatch', usageLogFilters(req, u))))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/summary') {
         const u = new URL(req.url, 'http://x')
-        return json(res, 200, panel.ok(usageLogsView().summary(usageLogFilters(req, u))))
+        return json(res, 200, panel.ok(await readView('summary', usageLogFilters(req, u))))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/filter-options') {
-        return json(res, 200, panel.ok(usageLogsView().filterOptions({ owner_user_id: tenantId() })))
+        return json(res, 200, panel.ok(await readView('filterOptions', { owner_user_id: tenantId() })))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/session-suggestions') {
         const u = new URL(req.url, 'http://x')
         const q = u.searchParams.get('q') || ''
         const limit = u.searchParams.get('limit')
-        return json(res, 200, panel.ok(usageLogsView().sessionSuggestions({ q, limit, owner_user_id: tenantId() })))
+        return json(res, 200, panel.ok(await readView('sessionSuggestions', { q, limit, owner_user_id: tenantId() })))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/active-sessions') {
         const u = new URL(req.url, 'http://x')
         const minutes = u.searchParams.get('minutes')
         const limit = u.searchParams.get('limit')
-        return json(res, 200, panel.ok(usageLogsView().activeSessions({ minutes, limit, owner_user_id: tenantId() })))
+        return json(res, 200, panel.ok(await readView('activeSessions', { minutes, limit, owner_user_id: tenantId() })))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/overview') {
         const u = new URL(req.url, 'http://x')
         const tz = u.searchParams.get('tz') || 'UTC'
-        return json(res, 200, panel.ok(usageLogsView().overview({ tz, owner_user_id: tenantId() })))
+        return json(res, 200, panel.ok(await readView('overview', { tz, owner_user_id: tenantId() })))
       }
 
       // ---- Statistics page ----

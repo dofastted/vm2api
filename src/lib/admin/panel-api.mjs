@@ -9,6 +9,7 @@
 import { THINKING_DISPLAY_MODES } from '../protocol/thinking.mjs'
 import { readSlotProcessStatus } from '../vm/slot-process-status.mjs'
 import os from 'node:os'
+import { usagePoolEnabled, usageRead } from '../db/sqlite-pool.mjs'
 import path from 'node:path'
 import {
   listVms,
@@ -682,6 +683,34 @@ export async function buildDashboard({
     })(),
   )
 
+  let dbTotals = null
+  let opsWindow = null
+  const opsSince = new Date(Date.now() - 3600_000).toISOString()
+  if (usagePoolEnabled()) {
+    try {
+      ;[dbTotals, opsWindow] = await Promise.all([
+        usageRead({ kind: 'repo', method: 'totals' }),
+        usageRead({ kind: 'repo', method: 'windowStats', args: [{ since: opsSince }] }),
+      ])
+    } catch (err) {
+      console.warn(`[sqlite-pool] dashboard: ${err?.message || err}`)
+    }
+  }
+  if (!dbTotals) {
+    try {
+      dbTotals = requestLog?.totals() || null
+    } catch {
+      dbTotals = null
+    }
+  }
+  if (!opsWindow) {
+    try {
+      opsWindow = requestLog?.windowStats?.({ since: opsSince }) || null
+    } catch {
+      opsWindow = null
+    }
+  }
+
   return ok({
     health: {
       status: 'ok',
@@ -731,22 +760,9 @@ export async function buildDashboard({
     },
     gateway_stats: stats,
     // historic totals straight from the request_logs table (survives restarts)
-    db_totals: (() => {
-      try {
-        return requestLog?.totals() || null
-      } catch {
-        return null
-      }
-    })(),
+    db_totals: dbTotals,
     billing,
-    // last-hour ops cards (SLA / QPS / TTFT) — console can refetch other windows via /request-logs/stats
-    ops: (() => {
-      try {
-        return requestLog?.windowStats?.({ since: new Date(Date.now() - 3600_000).toISOString() }) || null
-      } catch {
-        return null
-      }
-    })(),
+    ops: opsWindow,
   })
 }
 
