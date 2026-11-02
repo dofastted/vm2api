@@ -773,14 +773,20 @@ export function ensureSlotGuestBinDir(
     const tmp = `${dest}.${process.pid}.tmp`
     fs.rmSync(tmp, { force: true })
     try {
-      fs.linkSync(target, tmp)
-    } catch {
-      // EXDEV across mounts, or EPERM under fs.protected_hardlinks: a copy works for both.
-      fs.copyFileSync(target, tmp)
-      fs.chmodSync(tmp, src.mode & 0o777)
+      try {
+        fs.linkSync(target, tmp)
+      } catch {
+        // EXDEV across mounts, or EPERM under fs.protected_hardlinks: a copy works for both.
+        fs.copyFileSync(target, tmp)
+        fs.chmodSync(tmp, src.mode & 0o777)
+      }
+      // rename swaps the entry inside the mounted dir, so running slots see the new file.
+      fs.renameSync(tmp, dest)
+    } finally {
+      try {
+        fs.unlinkSync(tmp)
+      } catch {}
     }
-    // rename swaps the entry inside the mounted dir, so running slots see the new file.
-    fs.renameSync(tmp, dest)
   }
   link('kin-worker', workerBin)
   link('kin-kernel', kernelBin)
