@@ -1,0 +1,56 @@
+{
+  "id": "01-tools-list",
+  "title": "工具列表",
+  "requested_model": "claude-opus-5-5",
+  "model": "claude-opus-5-5",
+  "http": {
+    "status": 200,
+    "ms": 7296
+  },
+  "verdict": {
+    "clean": true,
+    "verdict": "干净",
+    "failed": [],
+    "checks": {
+      "http_ok": {
+        "pass": true,
+        "detail": "HTTP 200"
+      },
+      "has_visible_text": {
+        "pass": true,
+        "detail": "text_len=205"
+      },
+      "no_cc_identity": {
+        "pass": true,
+        "detail": "no Claude Code identity"
+      },
+      "no_cc_tools": {
+        "pass": true,
+        "detail": "no Claude Code tools"
+      },
+      "no_system_leak": {
+        "pass": true,
+        "detail": "no system prompt leak"
+      }
+    },
+    "stop_reason": "end_turn",
+    "tool_names": []
+  },
+  "usage": {
+    "input_tokens": 27,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 330,
+    "service_tier": "standard",
+    "inference_geo": "global",
+    "speed": "standard",
+    "output_tokens_details": {
+      "thinking_tokens": 120
+    }
+  },
+  "preview": "在当前对话中，我**没有可以调用的工具**。这次会话没有为我配置任何外部工具（如联网搜索、代码执行、文件读取、图像生成等），所以我只能直接用文字回复。\n\n我仍然可以用文字帮你做这些事：\n\n- 回答问题、解释概念\n- 写作、翻译、润色文本\n- 编写和讲解代码（但无法实际运行）\n- 分析你粘贴进来的文本或数据\n- 头脑风暴、做规划\n\n如果你使用的平台支持启用工具（比如搜索或代码解释器），开启后我就能调用它们了。"
+}

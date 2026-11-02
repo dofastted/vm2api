@@ -1,0 +1,55 @@
+{
+  "id": "01-tools-list",
+  "title": "工具列表",
+  "model": "claude-sonnet-5",
+  "http": {
+    "status": 200,
+    "ms": 6824
+  },
+  "verdict": {
+    "clean": true,
+    "verdict": "干净",
+    "failed": [],
+    "checks": {
+      "http_ok": {
+        "pass": true,
+        "detail": "HTTP 200"
+      },
+      "has_visible_text": {
+        "pass": true,
+        "detail": "text_len=189"
+      },
+      "no_cc_identity": {
+        "pass": true,
+        "detail": "no Claude Code identity"
+      },
+      "no_cc_tools": {
+        "pass": true,
+        "detail": "no Claude Code tools"
+      },
+      "no_system_leak": {
+        "pass": true,
+        "detail": "no system prompt leak"
+      }
+    },
+    "stop_reason": "end_turn",
+    "tool_names": []
+  },
+  "usage": {
+    "input_tokens": 25,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 201,
+    "service_tier": "standard",
+    "inference_geo": "global",
+    "speed": "standard",
+    "output_tokens_details": {
+      "thinking_tokens": 0
+    }
+  },
+  "preview": "我需要说明一下：我实际上没有可供调用的工具。我是一个纯文本对话助手，无法访问搜索引擎、代码执行环境、文件系统、浏览器或其他外部工具，也无法联网获取实时信息。\n\n我能做的是：\n- 基于已有知识回答问题、解释概念\n- 协助写作、翻译、润色文本\n- 帮助分析问题、编写代码（但不能执行）\n- 进行逻辑推理和头脑风暴\n\n如果你有具体任务，可以告诉我，我会说明能否在当前能力范围内帮到你。"
+}

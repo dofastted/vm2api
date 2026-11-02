@@ -1,0 +1,51 @@
+{
+  "id": "04-identity",
+  "title": "模型自我认知",
+  "model": "claude-opus-5",
+  "http": {
+    "status": 200,
+    "ms": 17930
+  },
+  "verdict": {
+    "clean": true,
+    "verdict": "干净",
+    "failed": [],
+    "checks": {
+      "http_ok": {
+        "pass": true,
+        "detail": "HTTP 200"
+      },
+      "has_visible_text": {
+        "pass": true,
+        "detail": "text_len=667"
+      },
+      "no_cc_identity": {
+        "pass": true,
+        "detail": "no Claude Code identity"
+      },
+      "no_system_leak": {
+        "pass": true,
+        "detail": "no system prompt leak"
+      }
+    },
+    "stop_reason": "end_turn",
+    "tool_names": []
+  },
+  "usage": {
+    "input_tokens": 31,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 943,
+    "service_tier": "standard",
+    "inference_geo": "global",
+    "speed": "standard",
+    "output_tokens_details": {
+      "thinking_tokens": 338
+    }
+  },
+  "preview": "你好！很高兴认识你 👋\n\n**关于我的身份：**\n\n我是 Claude，由 Anthropic（一家美国的 AI 安全研究公司）开发的大型语言模型助手。\n\n**具体模型：**\n\n据我所知，我是 **Claude Opus 4.5**，属于 Claude 4.5 代模型系列。不过这里需要坦白一点：模型对自己确切版本的自我认知并不总是百分之百可靠——我没有办法\"内省\"自己的权重或读取自己的版本号，这部分信息来自训练过程中被告知的内容。如果你需要精确确认，最可靠的方式是查看你所使用的平台/API 返回的 model 字段（例如类似 `claude-opus-4-5-...` 这样的标识符）。\n\n**关于运行环境：**\n\n这部分我确实无法得知具体细节。我看不到自己运行在什么硬件上、什么推理框架、什么部署配置，也不知道你是通过官方 Claude 网页版/App、Anthropic API、还是某个第三方平台（如云服务商的模型市场、各类聚合工具）在和我对话。对我来说，我只能看到传入的对话内容本身。\n\n**其他可能对你有用的信息：**\n\n- **知识截止**：我的训练数据大致到 2025 年初，之后发生的事情我不了解，也可能对最新情况有误判。\n- **当前日期**：我不会自动知道\"今天\"是哪天，除非系统提示中包含了日期信息或你告诉我。\n- **能力边界**：默认情况下我没有联网搜索能力，除非所在平台为我配置了相关工具。\n\n如果你是想确认模型版本以便做技术选型或 API 调用，告诉我你的使用场景，我可以给更有针对性的建议 😊"
+}

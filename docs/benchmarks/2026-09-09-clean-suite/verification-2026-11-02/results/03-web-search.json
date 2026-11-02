@@ -1,0 +1,62 @@
+{
+  "id": "03-web-search",
+  "title": "web_search",
+  "model": "claude-opus-4-8",
+  "http": {
+    "status": 200,
+    "ms": 22025
+  },
+  "verdict": {
+    "clean": true,
+    "verdict": "干净",
+    "failed": [],
+    "checks": {
+      "http_ok": {
+        "pass": true,
+        "detail": "HTTP 200"
+      },
+      "no_cc_identity": {
+        "pass": true,
+        "detail": "no Claude Code identity"
+      },
+      "no_system_leak": {
+        "pass": true,
+        "detail": "no system prompt leak"
+      },
+      "used_web_search_or_answered": {
+        "pass": true,
+        "detail": "tools=web_search,web_search"
+      }
+    },
+    "stop_reason": "max_tokens",
+    "tool_names": [
+      "web_search",
+      "web_search"
+    ]
+  },
+  "usage": {
+    "input_tokens": 4,
+    "cache_creation_input_tokens": 17950,
+    "cache_read_input_tokens": 2738,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 2738
+    },
+    "output_tokens": 1100,
+    "service_tier": "standard",
+    "inference_geo": "global",
+    "speed": "standard",
+    "output_tokens_details": {
+      "thinking_tokens": 0
+    },
+    "server_tool_use": {
+      "web_search_requests": 1,
+      "web_fetch_requests": 0
+    }
+  },
+  "preview": "I'll search for information about the iPhone features released in 2026.\n根据搜索结果，2026年苹果发布了多款iPhone，包括iPhone 18 Pro系列和首款可折叠的iPhone Duo。以下是这些机型的主要新功能：\n\n## iPhone 18 Pro 和 iPhone 18 Pro Max（2026年9月9日发布）\n\n**相机系统**\n- \n全新的4800万像素融合主摄，首次搭载可变光圈，带来前所未有的创作控制能力，相机应用中的新专业控制功能让用户自定义拍摄体验。\n\n- \n可变光圈还让专业用户能够在相机应用中手动调节四档光圈设置中的任意一档，开发者也可通过API获得更多控制权限。\n\n- \n在较暗环境下，iPhone 18 Pro会自动调整光圈以进光更多，带来出色的夜间模式拍摄效果。\n\n- \n用户现在可以通过Apple Reference Image证明照片的真实性，该功能由主摄的新传感器驱动，能够为所拍摄的每个像素签名。\n\n\n**芯片与性能**\n- \nA20 Pro采用最新的2纳米制程工艺打造，为移动计算设立了新标杆。\n\n- \nA20 Pro引入了灵感源自M系列芯片的定制封装，将硅芯片与内存并排放置，让内存脱离芯片的散热路径，并直接连接到新一代均热板。配合新材料和比上一代大三倍的表面积，重新设计的均热板大幅提升了持续性能，比上一代提升高达40%。\n\n\n**连接性**\n- \n两款机型都搭载N1——苹果自研的无线网络芯片，支持Wi-Fi 7、蓝牙6和Thread。\n\n- \niPhone 18 Pro引入了C2，苹果的下一代蜂窝调制解调器系统，带来AI驱动的蜂窝质量和可靠性提升。C2相比C1X带来更快的上传速度，同时能耗降低15%，并在美国支持毫米波。\n\n\n**续航**\n- \n仅支持eSIM的机型，iPhone 18 Pro视频播放续航最长可达36小时，iPhone 18 Pro Max最长可达45小时。\n\n\n**Dynamic Island**\n- \n升级后的灵动岛现在可以同时显示三个实时活动，同时继续支持Face ID安全解锁、验证购买、登录应用等功能。\n\n\n## iPhone Duo（苹果首款可折叠iPhone，2026年9月9日",
+  "tool_names": [
+    "web_search",
+    "web_search"
+  ]
+}

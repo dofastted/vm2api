@@ -1,0 +1,59 @@
+{
+	"name": "@crag/claude-code",
+	"version": "2.1.303",
+	"private": true,
+	"type": "module",
+	"description": "Claude Code 2.1.88 native runtime with CRAG slots and a 2.1.303 protocol backport",
+	"engines": {
+		"node": ">=24"
+	},
+	"optionalDependencies": {
+		"@img/sharp-darwin-arm64": "^0.34.2",
+		"@img/sharp-darwin-x64": "^0.34.2",
+		"@img/sharp-linux-arm": "^0.34.2",
+		"@img/sharp-linux-arm64": "^0.34.2",
+		"@img/sharp-linux-x64": "^0.34.2",
+		"@img/sharp-linuxmusl-arm64": "^0.34.2",
+		"@img/sharp-linuxmusl-x64": "^0.34.2",
+		"@img/sharp-win32-arm64": "^0.34.2",
+		"@img/sharp-win32-x64": "^0.34.2"
+	},
+	"bin": {
+		"claude": "bin/claude.mjs",
+		"crag": "bin/crag.mjs"
+	},
+	"scripts": {
+		"build": "node scripts/build.mjs",
+		"build:kernel": "cargo build --release",
+		"start": "node bin/crag.mjs",
+		"replay:suite": "node scripts/replay-suite.mjs",
+		"test": "node --test tests/*.test.mjs",
+		"test:mock-auth": "node scripts/mock-auth-regression.mjs",
+		"replay:generate": "node scripts/generate-replay-fixture.mjs",
+		"generate:kernel-config": "node scripts/generate-kernel-config.mjs",
+    "pack:kernel": "node scripts/package-kernel.mjs",
+    "pack:vm2api": "node scripts/package-vm2api.mjs",
+		"pack:release": "node scripts/package.mjs"
+	},
+	"files": [
+		"bin/",
+		"gateway/",
+		"runtime/",
+		"config/",
+		"dist/claude/",
+		"README.md",
+		"DESIGN.md",
+		"CRAG_KERNEL.md",
+		"VERIFY.md",
+		"Dockerfile",
+		"REPLAY.md",
+		"scripts/replay-suite.mjs",
+		"scripts/mock-upstream.mjs",
+		"scripts/mock-auth-regression.mjs",
+		"scripts/generate-replay-fixture.mjs",
+		"scripts/package-kernel.mjs",
+    "scripts/package-vm2api.mjs",
+		"scripts/generate-kernel-config.mjs"
+	],
+	"license": "SEE LICENSE IN dist/claude/LICENSE.md"
+}

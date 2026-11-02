@@ -1,0 +1,12 @@
+{
+  "name": "@crag/claude-code-native",
+  "version": "2.1.303",
+  "type": "module",
+  "bin": {
+    "claude": "cli.js"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "license": "SEE LICENSE IN LICENSE.md"
+}

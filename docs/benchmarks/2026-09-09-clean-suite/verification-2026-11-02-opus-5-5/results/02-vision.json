@@ -1,0 +1,56 @@
+{
+  "id": "02-vision",
+  "title": "识图",
+  "requested_model": "claude-opus-5-5",
+  "model": "claude-opus-5-5",
+  "http": {
+    "status": 200,
+    "ms": 7113
+  },
+  "verdict": {
+    "clean": true,
+    "verdict": "干净",
+    "failed": [],
+    "checks": {
+      "http_ok": {
+        "pass": true,
+        "detail": "HTTP 200"
+      },
+      "has_visible_text": {
+        "pass": true,
+        "detail": "text_len=131"
+      },
+      "no_cc_identity": {
+        "pass": true,
+        "detail": "no Claude Code identity"
+      },
+      "no_system_leak": {
+        "pass": true,
+        "detail": "no system prompt leak"
+      },
+      "vision_mentions_image": {
+        "pass": true,
+        "detail": "mentions image content"
+      }
+    },
+    "stop_reason": "max_tokens",
+    "tool_names": []
+  },
+  "usage": {
+    "input_tokens": 26,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 0,
+      "ephemeral_1h_input_tokens": 0
+    },
+    "output_tokens": 300,
+    "service_tier": "standard",
+    "inference_geo": "global",
+    "speed": "standard",
+    "output_tokens_details": {
+      "thinking_tokens": 190
+    }
+  },
+  "preview": "这是一个 **Google 的涂鸦（Google Doodle）**，也就是 Google 在特殊日子或重大活动期间对标志所做的创意改动。\n\n在这张图中：\n- 文字依然是 **“Google”**，但整体采用了紫色调；\n- 中间的字母 **“o”被换成了足球**"
+}

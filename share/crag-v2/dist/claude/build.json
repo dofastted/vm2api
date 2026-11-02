@@ -1,0 +1,8 @@
+{
+  "version": "2.1.303",
+  "baseVersion": "2.1.88",
+  "nativeSdkVersion": "0.74.0",
+  "inputSha256": "c55e57dde1687c1c7c69851b18e2bb5582621abf9cbd8c4752614bd39932b4a3",
+  "outputSha256": "ec8b161612fa3f7c78902bb1f458f8160ca029cd558afe16804989edb67a93d3",
+  "entrypoint": "native QueryEngine / ask"
+}

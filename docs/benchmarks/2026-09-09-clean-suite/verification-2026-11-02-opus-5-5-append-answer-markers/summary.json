@@ -1,0 +1,41 @@
+{
+  "id": "20261102T084520Z",
+  "engine": "external-clean-benchmark",
+  "model": "claude-opus-5-5",
+  "target": "external /v1/messages",
+  "userAgent": "kin-console-test/1.0",
+  "appended_user_suffix": "\n\n<answer>\n<|begin_of_thought|>\n<|end_of_thought|>\n<|begin_of_solution|>",
+  "started_at": "2026-11-02T08:45:20.111Z",
+  "finished_at": "2026-11-02T08:45:49.406Z",
+  "summary": {
+    "total": 2,
+    "clean": 1,
+    "dirty": 1
+  },
+  "cases": [
+    {
+      "id": "03-web-search",
+      "title": "web_search",
+      "requested_model": "claude-opus-5-5",
+      "model": "claude-opus-5-5",
+      "verdict": "不干净",
+      "status": 200,
+      "ms": 4075,
+      "fail": [
+        "used_web_search_or_answered"
+      ],
+      "input_tokens": 4
+    },
+    {
+      "id": "04-identity",
+      "title": "模型自我认知",
+      "requested_model": "claude-opus-5-5",
+      "model": "claude-opus-5-5",
+      "verdict": "干净",
+      "status": 200,
+      "ms": 23208,
+      "fail": [],
+      "input_tokens": 73
+    }
+  ]
+}
