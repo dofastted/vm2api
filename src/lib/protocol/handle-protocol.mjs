@@ -8,6 +8,7 @@ import { applyEagerToolStreaming } from './eager-tool-streaming.mjs'
 import { validateToolChoice } from './model-policy.mjs'
 import {
   inboundRefusalDeviceId,
+  inboundRefusalSessionId,
   isRefusalGuardEnabled,
   isUpstreamRefusal,
   refusalFingerprint,
@@ -17,7 +18,7 @@ import {
 } from '../core/refusal-guard.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
-import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-repo.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
 import { jevScopeWaits, readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
 import { runProtocolIntercept } from './intercept-gate.mjs'
@@ -385,6 +386,7 @@ export function createHandleProtocol(deps) {
       jev,
       repo: refusalRepo(),
       devices: deviceRepo(),
+      sessions: sessionRepo(),
       requestId,
       account,
     })
@@ -441,11 +443,27 @@ export function createHandleProtocol(deps) {
       return null
     }
   }
+  function sessionRepo() {
+    if (deps.refusalSessions) return deps.refusalSessions
+    try {
+      return new RefusalSessionBlocksRepo()
+    } catch {
+      return null
+    }
+  }
 
   function banRefusalDevice(deviceId, { requestId, fingerprint, reason }) {
     if (!deviceId) return
     try {
       deviceRepo()?.block?.({ deviceId, requestId, fingerprint, reason })
+    } catch {
+      /* the prompt block still stands */
+    }
+  }
+  function banRefusalSession(sessionId, { requestId, fingerprint, reason }) {
+    if (!sessionId) return
+    try {
+      sessionRepo()?.block?.({ sessionId, requestId, fingerprint, reason })
     } catch {
       /* the prompt block still stands */
     }
@@ -468,12 +486,22 @@ export function createHandleProtocol(deps) {
     const repo = refusalRepo()
     if (!repo) return
     const fingerprint = refusalFingerprint(body, inbound)
+    const upstreamErrorCode =
+      result?.body?.error?.upstream_code ||
+      result?.body?.error?.code ||
+      result?.body?.code ||
+      result?.error_code ||
+      null
+    const upstreamStatus = Number(result?.status || result?.body?.error?.status) || null
     try {
       const ttl = Number(result?.policy?.refusalTtlMs) || 0
       repo.remember({
         fingerprint,
         model: body?.model || inbound?.model || '',
         requestId,
+        source: 'upstream',
+        errorCode: upstreamErrorCode,
+        errorStatus: upstreamStatus,
         errorMessage: logBag.error_message || result?.body?.error?.message || null,
         preview: refusalPreview(body, inbound),
         expiresAt: contentRefusal || ttl <= 0 ? null : new Date(Date.now() + ttl).toISOString(),
@@ -483,11 +511,10 @@ export function createHandleProtocol(deps) {
       return
     }
     if (!contentRefusal || !refusalPolicy().device_block_enabled) return
-    banRefusalDevice(inboundRefusalDeviceId({ inbound, body, headers }), {
-      requestId,
-      fingerprint,
-      reason: 'refusal_guard',
-    })
+    const identity = { inbound, body, headers }
+    const ban = { requestId, fingerprint, reason: 'refusal_guard' }
+    banRefusalDevice(inboundRefusalDeviceId(identity), ban)
+    banRefusalSession(inboundRefusalSessionId(identity), ban)
   }
 
   async function streamAndAssembleClaudeMessage({

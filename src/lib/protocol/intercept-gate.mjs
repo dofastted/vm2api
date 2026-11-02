@@ -8,13 +8,13 @@
 import { detectDistill, distillBlockError, isOpenaiPlatformModel } from '../core/distill-detect.mjs'
 import {
   inboundRefusalDeviceId,
+  inboundRefusalSessionId,
   matchStoredRefusal,
   refusalFingerprint,
   refusalGuardError,
   refusalPreview,
   refusalPromptSignature,
 } from '../core/refusal-guard.mjs'
-import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
 import {
   HARD_POLICY_RULES,
   classifyJev,
@@ -27,6 +27,8 @@ import {
   matchHardPolicy,
   policyBlockError,
 } from './jev-intercept.mjs'
+import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
+import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-repo.mjs'
 import { gateVerdict } from './intercept-stats.mjs'
 import { prepareInterceptText } from './jev-prepare.mjs'
 
@@ -34,6 +36,15 @@ function deviceStore(devices) {
   if (devices) return devices
   try {
     return new RefusalDeviceBlocksRepo()
+  } catch {
+    return null
+  }
+}
+
+function sessionStore(sessions) {
+  if (sessions) return sessions
+  try {
+    return new RefusalSessionBlocksRepo()
   } catch {
     return null
   }
@@ -62,11 +73,12 @@ function similarityRatio(value) {
   return n > 1 ? n / 100 : n
 }
 
-export function commitProtocolBlock(decision, { repo, devices, policy, requestId } = {}) {
+export function commitProtocolBlock(decision, { repo, devices, sessions, policy, requestId } = {}) {
   if (!decision || decision.action !== 'block') return
-  if (decision.kind === 'device') {
+  if (decision.kind === 'device' || decision.kind === 'session') {
     try {
-      devices?.hit?.(decision.deviceId)
+      if (decision.kind === 'device') devices?.hit?.(decision.deviceId)
+      else sessions?.hit?.(decision.sessionId)
     } catch {
       /* counter is best-effort */
     }
@@ -85,6 +97,9 @@ export function commitProtocolBlock(decision, { repo, devices, policy, requestId
         fingerprint: decision.fingerprint,
         model: decision.model || '',
         requestId: requestId || null,
+        source: decision.cacheSource || 'upstream',
+        errorCode: decision.errorCode || null,
+        errorStatus: decision.errorStatus || null,
         errorMessage: decision.errorMessage || null,
         preview: decision.preview || null,
         expiresAt: null,
@@ -94,17 +109,31 @@ export function commitProtocolBlock(decision, { repo, devices, policy, requestId
       /* the response still must not hop */
     }
   }
-  if (!decision.banDevice || !decision.deviceId || !policy?.enabled) return
+  if (!decision.banDevice || !policy?.enabled) return
   if (!policy.device_block_enabled && !decision.forceDeviceBan) return
-  try {
-    deviceStore(devices)?.block?.({
-      deviceId: decision.deviceId,
-      requestId: requestId || null,
-      fingerprint: decision.fingerprint || null,
-      reason: decision.reason || decision.kind,
-    })
-  } catch {
-    /* the prompt block still stands */
+  if (decision.deviceId) {
+    try {
+      deviceStore(devices)?.block?.({
+        deviceId: decision.deviceId,
+        requestId: requestId || null,
+        fingerprint: decision.fingerprint || null,
+        reason: decision.reason || decision.kind,
+      })
+    } catch {
+      /* the prompt block still stands */
+    }
+  }
+  if (decision.sessionId) {
+    try {
+      sessionStore(sessions)?.block?.({
+        sessionId: decision.sessionId,
+        requestId: requestId || null,
+        fingerprint: decision.fingerprint || null,
+        reason: decision.reason || decision.kind,
+      })
+    } catch {
+      /* the prompt block still stands */
+    }
   }
 }
 
@@ -130,6 +159,7 @@ export async function evaluateProtocolIntercept({
   jev,
   repo,
   devices,
+  sessions,
   requestId,
   account = null,
   fetchImpl,
@@ -166,6 +196,7 @@ export async function evaluateProtocolIntercept({
       errorMessage: distillEvidenceMessage(distill.error?.message, evidence),
       intercept: gateVerdict({ kind: 'block', by: 'distill', keyword: evidence.slice(0, 40) }),
       deviceId: inboundRefusalDeviceId({ inbound, body, headers }),
+      sessionId: inboundRefusalSessionId({ inbound, body, headers }),
       fingerprint: refusalFingerprint(body, inbound),
       banDevice: true,
       remember: false,
@@ -199,6 +230,7 @@ export async function evaluateProtocolIntercept({
         errorMessage: distillEvidenceMessage(error.body?.error?.message, keyword),
         intercept: gateVerdict({ kind: 'block', by: 'distill', keyword: keyword.slice(0, 40) }),
         deviceId: inboundRefusalDeviceId({ inbound, body, headers }),
+        sessionId: inboundRefusalSessionId({ inbound, body, headers }),
         fingerprint: refusalFingerprint(body, inbound),
         banDevice: true,
         remember: false,
@@ -222,6 +254,7 @@ export async function evaluateProtocolIntercept({
         }),
         category: hard.category,
         deviceId: inboundRefusalDeviceId({ inbound, body, headers }),
+        sessionId: inboundRefusalSessionId({ inbound, body, headers }),
         fingerprint: refusalFingerprint(body, inbound),
         signature: refusalPromptSignature(inbound, body),
         model: body?.model || inbound?.model || '',
@@ -234,35 +267,56 @@ export async function evaluateProtocolIntercept({
     }
   }
 
-  if (policy?.enabled && repo && typeof repo.get === 'function') {
+  if (policy?.enabled && (repo || devices || sessions)) {
     let match = matchStoredRefusal({
       inbound,
       body,
       headers,
       repo,
       devices,
+      sessions,
       similarityEnabled: policy.similarity_enabled,
       similarity: similarityRatio(policy.similarity),
       deviceBlockEnabled: policy.device_block_enabled,
     })
-    // Our own Jev/regex block used to be stored here and then blocked every retry.
-    if (match && match.kind !== 'device' && isPolicyBlockMemory(match.row?.error_message)) match = null
+    // Legacy policy-block rows were created by the old Jev/regex path; Jev rows now carry source=jev.
+    if (
+      match &&
+      match.kind !== 'device' &&
+      match.kind !== 'session' &&
+      match.row?.source !== 'jev' &&
+      isPolicyBlockMemory(match.row?.error_message)
+    )
+      match = null
     if (match) {
       const error = refusalGuardError(requestId, match)
       return block({
         kind: match.kind,
         via: 'refusal-guard',
         final_state:
-          match.kind === 'device' ? 'refusal_device' : match.kind === 'similar' ? 'refusal_similar' : 'refusal_guard',
+          match.kind === 'device'
+            ? 'refusal_device'
+            : match.kind === 'session'
+              ? 'refusal_session'
+              : match.kind === 'similar'
+                ? 'refusal_similar'
+                : 'refusal_guard',
         error,
         errorMessage: error.body?.error?.message,
         intercept: gateVerdict({ kind: 'block', by: 'refusal', keyword: match.kind }),
         deviceId: match.deviceId,
+        sessionId: match.sessionId,
         fingerprint: match.fingerprint,
-        banDevice: match.kind !== 'device',
+        banDevice: match.kind !== 'device' && match.kind !== 'session',
         remember: false,
         reason:
-          match.kind === 'device' ? 'refusal_device' : match.kind === 'similar' ? 'refusal_similar' : 'refusal_guard',
+          match.kind === 'device'
+            ? 'refusal_device'
+            : match.kind === 'session'
+              ? 'refusal_session'
+              : match.kind === 'similar'
+                ? 'refusal_similar'
+                : 'refusal_guard',
       })
     }
   }
@@ -298,13 +352,17 @@ export async function evaluateProtocolIntercept({
         jevState: unavailable ? '' : verdict.state || '',
         category: unavailable ? 'unavailable' : category,
         deviceId: inboundRefusalDeviceId({ inbound, body, headers }),
+        sessionId: inboundRefusalSessionId({ inbound, body, headers }),
         fingerprint: refusalFingerprint(body, inbound),
         signature: refusalPromptSignature(inbound, body),
         model: body?.model || inbound?.model || '',
         preview: refusalPreview(body, inbound),
         banDevice: !unavailable,
         forceDeviceBan: !unavailable && (category === 'nsfw' || (verdict.categories || []).includes('nsfw')),
-        remember: false,
+        remember: !unavailable,
+        cacheSource: unavailable ? null : 'jev',
+        errorCode: unavailable ? null : error.body?.error?.code || null,
+        errorStatus: unavailable ? null : error.status || null,
         reason: unavailable ? 'jev:unavailable' : `jev:${category}`,
       })
     }

@@ -6,7 +6,7 @@ import { makeError, mapUpstreamError, rewritePoolErrorForClient, ErrorType, Erro
 import { refusalGuardPolicy } from '../core/refusal-guard.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
-import { SettingsRepo } from '../db/repos/settings-repo.mjs'
+import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-repo.mjs'
 import { findAccount } from '../admin/panel-api.mjs'
 import { readJevConfig, scopeAccountFromVm } from './jev-intercept.mjs'
 import { runProtocolIntercept } from './intercept-gate.mjs'
@@ -214,6 +214,14 @@ function deviceRepo(deps) {
     return null
   }
 }
+function sessionRepo(deps) {
+  if (deps.refusalSessions) return deps.refusalSessions
+  try {
+    return new RefusalSessionBlocksRepo()
+  } catch {
+    return null
+  }
+}
 
 /** Distill, hard regex, refusal cache, and jev. `wait` means the slot is required before a verdict. */
 export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
@@ -234,6 +242,7 @@ export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
     jev,
     repo: refusalRepo(deps),
     devices: deviceRepo(deps),
+    sessions: sessionRepo(deps),
     account: deps.account || null,
   })
   let wait = false

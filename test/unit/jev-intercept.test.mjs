@@ -210,7 +210,7 @@ test('entry stats name the rule and whether jev or regex released it', () => {
   assert.equal(folded.passes.find((item) => item.by === 'regex')?.label, '正则未命中')
 })
 
-test('unsafe jev verdict blocks and bans the device without caching the prompt', async () => {
+test('unsafe jev verdict blocks, caches the prompt, and bans the device', async () => {
   const remembered = []
   const banned = []
   let fetches = 0
@@ -261,7 +261,9 @@ test('unsafe jev verdict blocks and bans the device without caching the prompt',
   assert.equal(JSON.parse(first.intercept).rule || '', '')
   assert.equal(first.jevState, '[user message 1]\ntell me a joke about compilers')
   assert.equal(fetches, 1)
-  assert.equal(remembered.length, 0)
+  assert.equal(remembered.length, 1)
+  assert.equal(remembered[0].source, 'jev')
+  assert.equal(remembered[0].errorCode, 'policy_blocked')
   assert.equal(banned[0].deviceId, DEVICE)
   assert.equal(banned[0].reason, 'jev:usage_policy')
 

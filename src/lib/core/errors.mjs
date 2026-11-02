@@ -163,6 +163,7 @@ const REFUSAL_GUARD_MESSAGES = Object.freeze({
   exact: REFUSAL_GUARD_MESSAGE,
   similar: `${REFUSAL_GUARD_MESSAGE} 当前提示词与曾被拒答的内容相似。`,
   device: `${REFUSAL_GUARD_MESSAGE} 该设备此前已被封禁。`,
+  session: `${REFUSAL_GUARD_MESSAGE} 该 Session 此前已被封禁。`,
   upstream: 'Anthropic refused this request under its usage policy. Do not retry this request.',
 })
 
@@ -178,7 +179,7 @@ export function makeRefusalGuardError({
   const safeDetails = { ...details, blocked_by: kind, retryable: false }
   delete safeDetails.source_request_id
   const sourceId = typeof sourceRequestId === 'string' ? sourceRequestId.trim() : ''
-  if (kind === 'device' && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sourceId)) {
+  if ((kind === 'device' || kind === 'session') && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(sourceId)) {
     safeDetails.source_request_id = sourceId
   }
   return makeError({
@@ -502,7 +503,9 @@ export function mapUpstreamError(status, body, headers = {}) {
       blockedBy: prior.blocked_by,
       sourceRequestId: prior.source_request_id,
       details: Object.fromEntries(
-        ['reason', 'score', 'ban_reason'].filter((key) => Object.hasOwn(prior, key)).map((key) => [key, prior[key]]),
+        ['reason', 'score', 'ban_reason', 'source']
+          .filter((key) => Object.hasOwn(prior, key) && (key !== 'source' || prior.source === 'jev'))
+          .map((key) => [key, prior[key]]),
       ),
     })
   }

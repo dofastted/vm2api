@@ -9,7 +9,7 @@
 import { createHash } from 'node:crypto'
 import { isUsagePolicyErrorMessage, makeRefusalGuardError, REFUSAL_GUARD_MESSAGE } from './errors.mjs'
 import { extractPrompt, normalizeText } from './distill-detect.mjs'
-import { resolveInboundIdentity } from '../identity/identity-rewrite.mjs'
+import { extractCallerSession, resolveInboundIdentity } from '../identity/identity-rewrite.mjs'
 import { encodeSignature, refusalAskTurns, refusalSignature, refusalUserDocument } from './refusal-similarity.mjs'
 import { stripEnvironmentSection, stripReminders } from '../protocol/jev-prepare.mjs'
 
@@ -125,16 +125,22 @@ export function isUpstreamRefusal(result = {}, extra = {}) {
   return codes.some(isContentPolicyErrorCode)
 }
 
+function sourceDetails(match, details) {
+  return match?.row?.source === 'jev' ? { ...details, source: 'jev' } : details
+}
+
 function refusalBlockSuffix(match) {
   if (!match || typeof match !== 'object') return null
-  if (match.kind === 'device') {
+  if (match.kind === 'device' || match.kind === 'session') {
     const ban = String(match.row?.reason || '')
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, 80)
+    const subject = match.kind === 'session' ? 'Session' : '设备'
+    const reason = match.kind === 'session' ? 'session' : 'device'
     return {
-      message: ban ? ` 该设备此前已被封禁（${ban}）。` : ' 该设备此前已被封禁。',
-      details: ban ? { reason: 'device', ban_reason: ban } : { reason: 'device' },
+      message: ban ? ` 该${subject}此前已被封禁（${ban}）。` : ` 该${subject}此前已被封禁。`,
+      details: sourceDetails(match, ban ? { reason, ban_reason: ban } : { reason }),
     }
   }
   if (match.kind === 'similar') {
@@ -144,13 +150,13 @@ function refusalBlockSuffix(match) {
     return {
       message:
         pct == null ? ' 当前提示词与曾被拒答的内容相似。' : ` 当前提示词与曾被拒答的内容相似（相似度 ${pct}%）。`,
-      details: finite ? { reason: 'similar', score } : { reason: 'similar' },
+      details: sourceDetails(match, finite ? { reason: 'similar', score } : { reason: 'similar' }),
     }
   }
   if (match.kind === 'exact') {
     return {
       message: ' 当前提示词与曾被拒答的内容完全一致。',
-      details: { reason: 'exact' },
+      details: sourceDetails(match, { reason: 'exact' }),
     }
   }
   return null
@@ -170,11 +176,21 @@ export function refusalGuardError(requestId, match) {
 
 const DEVICE_ID_MIN = 8
 const DEVICE_ID_MAX = 200
+const SESSION_ID_MIN = 8
+const SESSION_ID_MAX = 200
 
 /** Inbound client device. Never the slot's rewritten outbound id, and never IP/UA/API key. */
 export function inboundRefusalDeviceId({ inbound, body, headers } = {}) {
   const id = resolveInboundIdentity({ inbound, body, headers }).deviceId
   if (id.length < DEVICE_ID_MIN || id.length > DEVICE_ID_MAX) return ''
+  return id
+}
+
+/** Inbound caller session. This is the caller identity, not the rebuilt outbound session. */
+export function inboundRefusalSessionId({ inbound, body, headers } = {}) {
+  const identity = resolveInboundIdentity({ inbound, body, headers })
+  const id = identity.sessionId || extractCallerSession({ inbound, body, headers })
+  if (id.length < SESSION_ID_MIN || id.length > SESSION_ID_MAX) return ''
   return id
 }
 
@@ -239,23 +255,32 @@ export function matchStoredRefusal({
   headers,
   repo,
   devices,
+  sessions,
   similarityEnabled = true,
   similarity = 0.9,
   deviceBlockEnabled = true,
 } = {}) {
-  const deviceId = inboundRefusalDeviceId({ inbound, body, headers })
+  const identity = resolveInboundIdentity({ inbound, body, headers })
+  const deviceId =
+    identity.deviceId.length >= DEVICE_ID_MIN && identity.deviceId.length <= DEVICE_ID_MAX ? identity.deviceId : ''
+  const sessionId =
+    identity.sessionId.length >= SESSION_ID_MIN && identity.sessionId.length <= SESSION_ID_MAX ? identity.sessionId : ''
   if (deviceBlockEnabled && deviceId && typeof devices?.get === 'function') {
     const banned = devices.get(deviceId)
-    if (banned) return { kind: 'device', deviceId, row: banned }
+    if (banned) return { kind: 'device', deviceId, sessionId, row: banned }
+  }
+  if (deviceBlockEnabled && sessionId && typeof sessions?.get === 'function') {
+    const banned = sessions.get(sessionId)
+    if (banned) return { kind: 'session', deviceId, sessionId, row: banned }
   }
   if (!repo || typeof repo.get !== 'function') return null
   const fingerprint = refusalFingerprint(body, inbound)
   const exact = repo.get(fingerprint)
-  if (exact) return { kind: 'exact', deviceId, fingerprint, row: exact }
+  if (exact) return { kind: 'exact', deviceId, sessionId, fingerprint, row: exact }
   if (!similarityEnabled || typeof repo.nearest !== 'function') return null
   const signature = refusalSignature(refusalStrictDocument(inbound, body))
   if (!signature) return null
   const near = repo.nearest(signature, similarity)
   if (!near) return null
-  return { kind: 'similar', deviceId, fingerprint: near.fingerprint, score: near.score, row: near }
+  return { kind: 'similar', deviceId, sessionId, fingerprint: near.fingerprint, score: near.score, row: near }
 }

@@ -42,6 +42,7 @@ const BLOCKED_STATES = {
   refusal_guard: 'refusal_guard',
   refusal_similar: 'refusal_guard',
   refusal_device: 'refusal_guard',
+  refusal_session: 'refusal_guard',
   policy_blocked: 'policy',
 }
 
@@ -501,6 +502,15 @@ export class UsageLogsView {
       const chain = own.filter((a) => attemptWithinRow(a, row)).map((a) => toProviderChainItem(a, names))
       return toUsageLogRow(row, names, chain)
     })
+  }
+  /** Hydrate the newest usage row for a refusal cache source request. */
+  getByRequestId(requestId) {
+    const id = String(requestId || '').trim()
+    if (!id) return null
+    const raw = this.db
+      .prepare('SELECT * FROM usage_logs WHERE request_id = ? ORDER BY created_at DESC, id DESC LIMIT 1')
+      .get(id)
+    return raw ? this._hydrate([raw])[0] || null : null
   }
 
   /**

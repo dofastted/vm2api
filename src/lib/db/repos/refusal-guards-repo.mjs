@@ -14,6 +14,9 @@ function rowToRec(row) {
     last_seen_at: row.last_seen_at,
     hit_count: Number(row.hit_count) || 0,
     source_request_id: row.source_request_id,
+    source: row.source === 'jev' ? 'jev' : 'upstream',
+    error_code: row.error_code || null,
+    error_status: row.error_status == null ? null : Number(row.error_status),
     error_message: row.error_message,
     preview: row.preview,
     expires_at: row.expires_at || null,
@@ -27,10 +30,17 @@ export class RefusalGuardsRepo {
     this._insert = db.prepare(`
       INSERT INTO refusal_guards (
         fingerprint, model, first_seen_at, last_seen_at, hit_count,
-        source_request_id, error_message, preview, expires_at, signature
-      ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+        source_request_id, source, error_code, error_status,
+        error_message, preview, expires_at, signature
+      ) VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(fingerprint) DO UPDATE SET
         last_seen_at = excluded.last_seen_at,
+        source = CASE
+          WHEN excluded.source = 'upstream' THEN 'upstream'
+          ELSE refusal_guards.source
+        END,
+        error_code = COALESCE(excluded.error_code, refusal_guards.error_code),
+        error_status = COALESCE(excluded.error_status, refusal_guards.error_status),
         error_message = COALESCE(excluded.error_message, refusal_guards.error_message),
         preview = COALESCE(excluded.preview, refusal_guards.preview),
         signature = COALESCE(excluded.signature, refusal_guards.signature),
@@ -46,7 +56,8 @@ export class RefusalGuardsRepo {
     `)
     this._list = db.prepare(
       `SELECT fingerprint, model, first_seen_at, last_seen_at, hit_count,
-              source_request_id, error_message, preview, expires_at
+              source_request_id, source, error_code, error_status,
+              error_message, preview, expires_at
        FROM refusal_guards ORDER BY last_seen_at DESC, fingerprint LIMIT ?`,
     )
     this._signatures = db.prepare(
@@ -70,6 +81,9 @@ export class RefusalGuardsRepo {
     fingerprint,
     model = '',
     requestId = null,
+    source = 'upstream',
+    errorCode = null,
+    errorStatus = null,
     errorMessage = null,
     preview = null,
     expiresAt = null,
@@ -78,12 +92,16 @@ export class RefusalGuardsRepo {
     const fp = String(fingerprint || '').trim()
     if (!fp) return null
     const now = new Date().toISOString()
+    const kind = source === 'jev' ? 'jev' : 'upstream'
     this._insert.run(
       fp,
       String(model || ''),
       now,
       now,
       requestId,
+      kind,
+      errorCode ? String(errorCode).slice(0, 120) : null,
+      errorStatus == null ? null : Number(errorStatus) || null,
       errorMessage ? String(errorMessage).slice(0, 500) : null,
       preview ? String(preview).slice(0, 240) : null,
       expiresAt || null,

@@ -27,6 +27,7 @@ import {
 import { JevUsageRepo } from '../db/repos/jev-usage-repo.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
+import { RefusalSessionBlocksRepo } from '../db/repos/refusal-session-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
 import { parseCodexImportPayload, upsertCodexAccount, readCodexAccounts } from '../vm/codex-slot.mjs'
 import { generateAuthUrl, exchangeAuthCode, normalizeOauthFlavor } from '../oauth/oauth-auth-url.mjs'
@@ -932,13 +933,20 @@ export function createPanelHandler(ctx) {
     const settings = new SettingsRepo()
     const repo = new RefusalGuardsRepo()
     const devices = new RefusalDeviceBlocksRepo()
+    const sessions = new RefusalSessionBlocksRepo()
+    const logs = new UsageLogsView(getDb())
     const read = (key, fallback) => settings.get(key, fallback)
     return {
       ...refusalGuardPolicy(read),
       count: repo.count(),
-      items: repo.list(),
+      items: repo.list().map((item) => ({
+        ...item,
+        source_log: item.source_request_id ? logs.getByRequestId(item.source_request_id) : null,
+      })),
       device_count: devices.count(),
       devices: devices.list(),
+      session_count: sessions.count(),
+      sessions: sessions.list(),
     }
   }
 
@@ -5464,6 +5472,32 @@ export function createPanelHandler(ctx) {
               type: 'invalid_request_error',
               code: 'confirm_required',
               message: '清空 device 封禁须 confirm: true，或传 device_id',
+            },
+          })
+        }
+        repo.clear()
+        return json(res, 200, panel.ok(refusalGuardSnapshot()))
+      }
+      if (req.method === 'DELETE' && p === '/api/panel/refusal-session-blocks') {
+        const body = await readBody(req, 8 * 1024).catch(() => ({}))
+        const repo = new RefusalSessionBlocksRepo()
+        const sessionId = String(body?.session_id || '').trim()
+        if (sessionId) {
+          if (!repo.remove(sessionId)) {
+            return json(res, 404, {
+              ok: false,
+              error: { type: 'not_found_error', code: 'refusal_session_not_found', message: 'Session 不存在' },
+            })
+          }
+          return json(res, 200, panel.ok(refusalGuardSnapshot()))
+        }
+        if (body?.confirm !== true) {
+          return json(res, 400, {
+            ok: false,
+            error: {
+              type: 'invalid_request_error',
+              code: 'confirm_required',
+              message: '清空 Session 封禁须 confirm: true，或传 session_id',
             },
           })
         }

@@ -6,9 +6,11 @@ import path from 'node:path'
 import { createDatabase } from '../../src/lib/db/database.mjs'
 import { RefusalGuardsRepo } from '../../src/lib/db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../../src/lib/db/repos/refusal-device-blocks-repo.mjs'
+import { RefusalSessionBlocksRepo } from '../../src/lib/db/repos/refusal-session-blocks-repo.mjs'
 import {
   applyRefusalGuardPatch,
   inboundRefusalDeviceId,
+  inboundRefusalSessionId,
   matchStoredRefusal,
   normalizeRefusalSimilarity,
   refusalFingerprint,
@@ -130,6 +132,30 @@ test('stored near-duplicate blocks and then the device blocks any later prompt',
     assert.equal(banned.kind, 'device')
     assert.equal(inboundRefusalDeviceId({ inbound: { device_id: 'short' } }), '')
     assert.equal(devices.block({ deviceId: '' }), null)
+  } finally {
+    db.close()
+  }
+})
+
+test('a refusal session block stops a different device in the same session', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-session-block-'))
+  const db = createDatabase({ dataDir: dir })
+  try {
+    const sessions = new RefusalSessionBlocksRepo(db)
+    const inbound = body('ordinary follow-up', {
+      metadata: { user_id: { device_id: 'device-session-01', session_id: 'session-shared-01' } },
+    })
+    assert.equal(inboundRefusalSessionId({ inbound }), 'session-shared-01')
+    sessions.block({ sessionId: 'session-shared-01', reason: 'jev:usage_policy' })
+    const match = matchStoredRefusal({
+      inbound,
+      body: inbound,
+      repo: null,
+      devices: null,
+      sessions,
+    })
+    assert.equal(match.kind, 'session')
+    assert.equal(match.sessionId, 'session-shared-01')
   } finally {
     db.close()
   }

@@ -283,7 +283,7 @@ function questionIdsOf(raw) {
   return ids
 }
 
-const QUESTION_MAX = 24
+const QUESTION_MAX = 5
 const BUILTIN_QUESTION_IDS = new Set(POLICY_QUESTION_BANK.map((item) => item.id))
 
 export function cleanQuestions(list) {
