@@ -18,7 +18,7 @@ import {
 } from '../transport/codex-kernel-supervisor.mjs'
 import { runtimeKind, isKvmRuntime } from './runtime-kind.mjs'
 import { getVm, listVms, isCodexVm, persistVmRuntime } from './vm-registry.mjs'
-import { resolveInferenceEngine } from './slot-engine.mjs'
+import { resolveInferenceEngine, resolveKernelDataplane } from './slot-engine.mjs'
 import {
   containerHasKernelMount,
   containerName,
@@ -26,7 +26,13 @@ import {
   startVmRuntime,
   reloadSlotWorker,
 } from './vm-runtime.mjs'
-import { inspectWrapCliDir, materializeWrapCli, wrapCliHomeDir } from './wrap-cli-runtime.mjs'
+import {
+  cragV2TemplateDir,
+  inspectWrapCliDir,
+  materializeSlotDataplane,
+  materializeWrapCli,
+  wrapCliHomeDir,
+} from './wrap-cli-runtime.mjs'
 import { isLocalEgressProxy } from './egress.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm, slotHost } from './slot-host.mjs'
@@ -161,32 +167,42 @@ export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
   if (opts.allowMissingCredential !== true && !slotHasCredential(vm, projectRoot)) {
     return { ok: true, skipped: true, reason: 'no_credential', engine: 'rust' }
   }
+  const dataplane = resolveKernelDataplane(vm, routing)
+  const cragV2 =
+    dataplane === 'crag' && fs.existsSync(path.join(cragV2TemplateDir(projectRoot), 'bin', 'crag-kernel-worker.mjs'))
   // A baked slot image ships kernel and CLIs; there is no .kin to materialize or kernel to mount.
   // KVM bind-mounts payload at /opt/kin-guest, not /usr/local/bin/kin-kernel.
   if (!slotHost(vm).bakedKernel) {
     const dest = wrapCliHomeDir(projectRoot, vm.id)
-    let wrap = inspectWrapCliDir(dest)
-    if (!wrap?.ok) {
-      wrap = (opts.ops?.materializeWrapCli || materializeWrapCli)(projectRoot, vm)
-    }
-    if (!wrap?.ok) {
-      return {
-        ok: false,
-        code: wrap?.code || 'wrap_cli_missing',
-        error: wrap?.error || 'wrap CLI is not installed in the slot home',
+    if (cragV2) {
+      if (!fs.existsSync(path.join(dest, 'kin-kernel'))) {
+        const staged = (opts.ops?.materializeSlotDataplane || materializeSlotDataplane)(projectRoot, vm, 'crag')
+        if (!staged?.ok) return staged
       }
-    }
-    if (!wrapUsesSlotKernel(wrap) && !isKvmRuntime(vm)) {
-      const kernelBin = (opts.ops?.kernelBinPath || kernelBinPath)()
-      const binaryError = kernelBinaryError(kernelBin)
-      if (binaryError) return binaryError
-      const name = containerName(vm.id)
-      const hasMount = (opts.ops?.containerHasKernelMount || containerHasKernelMount)(name)
-      if (!hasMount) {
+    } else {
+      let wrap = inspectWrapCliDir(dest)
+      if (!wrap?.ok) {
+        wrap = (opts.ops?.materializeWrapCli || materializeWrapCli)(projectRoot, vm)
+      }
+      if (!wrap?.ok) {
         return {
           ok: false,
-          code: 'kernel_mount_missing',
-          error: 'Rust kernel binary is not mounted in the slot container',
+          code: wrap?.code || 'wrap_cli_missing',
+          error: wrap?.error || 'wrap CLI is not installed in the slot home',
+        }
+      }
+      if (!wrapUsesSlotKernel(wrap) && !isKvmRuntime(vm)) {
+        const kernelBin = (opts.ops?.kernelBinPath || kernelBinPath)()
+        const binaryError = kernelBinaryError(kernelBin)
+        if (binaryError) return binaryError
+        const name = containerName(vm.id)
+        const hasMount = (opts.ops?.containerHasKernelMount || containerHasKernelMount)(name)
+        if (!hasMount) {
+          return {
+            ok: false,
+            code: 'kernel_mount_missing',
+            error: 'Rust kernel binary is not mounted in the slot container',
+          }
         }
       }
     }

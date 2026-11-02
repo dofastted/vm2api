@@ -79,6 +79,17 @@ export function cragTemplateDir(projectRoot) {
   return path.join(projectRoot, 'share', 'crag')
 }
 
+export function cragV2TemplateDir(projectRoot) {
+  const env = String(process.env.KIN_CRAG_V2_ROOT || '').trim()
+  const dir = env || (projectRoot ? path.join(projectRoot, 'share', 'crag-v2') : '')
+  return isDir(dir) && isFile(path.join(dir, 'bin', 'crag-kernel-worker.mjs')) ? dir : ''
+}
+
+function cragV2NodePath() {
+  const configured = String(process.env.KIN_CRAG_V2_NODE_BIN || '').trim()
+  return configured && isFile(configured) ? configured : process.execPath
+}
+
 export function cragKernelPath(projectRoot) {
   const env = String(process.env.KIN_CRAG_KERNEL_BIN || '').trim()
   if (env && isFile(env)) return env
@@ -353,7 +364,87 @@ function writeCragWrapper(destDir) {
   fs.renameSync(tmp, wrapper)
 }
 
+function cragV2PackageReady(root) {
+  return isDir(root) && isFile(path.join(root, 'bin', 'crag-kernel-worker.mjs'))
+}
+
+function writeCragV2Wrapper(destDir) {
+  const wrapper = path.join(destDir, WRAP_KERNEL_WRAPPER)
+  const body = `#!/bin/sh
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+NODE="$DIR/crag-v2/node"
+APP="$DIR/crag-v2/bin/crag-kernel-worker.mjs"
+if [ ! -x "$NODE" ]; then
+  echo "CRAG v2 node runtime missing: $NODE" >&2
+  exit 127
+fi
+exec "$NODE" "$APP" "$@"
+`
+  try {
+    if (fs.readFileSync(wrapper, 'utf8') === body) return
+  } catch {}
+  fs.mkdirSync(destDir, { recursive: true })
+  const tmp = path.join(destDir, `.${WRAP_KERNEL_WRAPPER}.${process.pid}.new`)
+  fs.writeFileSync(tmp, body, { mode: 0o755 })
+  fs.renameSync(tmp, wrapper)
+}
+
+export function materializeCragV2(projectRoot, vm, { uid = null, gid = null } = {}) {
+  if (!projectRoot || !vm?.id) return { ok: false, code: 'vm_required', error: 'projectRoot and vm id required' }
+  const src = cragV2TemplateDir(projectRoot)
+  if (!cragV2PackageReady(src)) {
+    return {
+      ok: false,
+      code: 'crag_v2_package_missing',
+      error: `CRAG v2 package missing (expected ${src}/bin/crag-kernel-worker.mjs)`,
+    }
+  }
+  const sourceCli = isFile(path.join(src, 'claude-code-2.1.88', 'cli.js'))
+    ? path.join(src, 'claude-code-2.1.88')
+    : path.join(src, 'dist', 'claude')
+  if (!isFile(path.join(sourceCli, 'cli.js'))) {
+    return { ok: false, code: 'crag_v2_cli_missing', error: 'CRAG v2 Claude bundle is missing' }
+  }
+  const cliRelative = sourceCli.endsWith(path.join('dist', 'claude'))
+    ? path.join('dist', 'claude')
+    : 'claude-code-2.1.88'
+  const dest = wrapCliHomeDir(projectRoot, vm.id)
+  const appDest = path.join(dest, 'crag-v2')
+  const workerSrc = path.join(src, 'bin', 'crag-kernel-worker.mjs')
+  const workerDest = path.join(appDest, 'bin', 'crag-kernel-worker.mjs')
+  const nodeDest = path.join(appDest, 'node')
+  fs.mkdirSync(appDest, { recursive: true })
+  const changed =
+    !isFile(workerDest) ||
+    !filesEqual(workerSrc, workerDest) ||
+    !isFile(nodeDest) ||
+    !filesEqual(cragV2NodePath(), nodeDest)
+  for (const name of ['bin', 'gateway', 'runtime']) copyDir(path.join(src, name), path.join(appDest, name))
+  copyDir(sourceCli, path.join(appDest, cliRelative))
+  if (isFile(path.join(src, 'package.json')))
+    copyFile(path.join(src, 'package.json'), path.join(appDest, 'package.json'))
+  copyFile(cragV2NodePath(), nodeDest)
+  writeCragV2Wrapper(dest)
+  chownTree(dest, uid, gid)
+  return {
+    ok: true,
+    dest,
+    src,
+    dataplane: 'crag',
+    changed,
+    kernel_changed: changed,
+    wrapper: isFile(path.join(dest, WRAP_KERNEL_WRAPPER)),
+    kernel_bin: false,
+    v2: true,
+  }
+}
+
 export function describeCragPayload(projectRoot) {
+  const v2 = cragV2TemplateDir(projectRoot)
+  if (cragV2PackageReady(v2)) {
+    const info = fileInfo(path.join(v2, 'bin', 'crag-kernel-worker.mjs'))
+    return { source: 'v2', path: v2, size: info?.size || 0, mtime: info?.mtime || '', ok: true, v2: true }
+  }
   const chosen = cragKernelPath(projectRoot)
   const info = fileInfo(chosen)
   return {
@@ -362,6 +453,7 @@ export function describeCragPayload(projectRoot) {
     size: info?.size || 0,
     mtime: info?.mtime || '',
     ok: Boolean(info),
+    v2: false,
   }
 }
 
@@ -369,6 +461,7 @@ export function materializeCragKernel(projectRoot, vm, { uid = null, gid = null 
   if (!projectRoot || !vm?.id) {
     return { ok: false, code: 'vm_required', error: 'projectRoot and vm id required' }
   }
+  if (cragV2PackageReady(cragV2TemplateDir(projectRoot))) return materializeCragV2(projectRoot, vm, { uid, gid })
   const src = cragKernelPath(projectRoot)
   if (!src) {
     return {
@@ -740,6 +833,13 @@ function kernelWouldChange(src, dest) {
   return !filesEqual(src, dest)
 }
 
+function cragV2WouldChange(src, destDir) {
+  const workerSrc = path.join(src, 'bin', 'crag-kernel-worker.mjs')
+  const workerDest = path.join(destDir, 'crag-v2', 'bin', 'crag-kernel-worker.mjs')
+  const nodeDest = path.join(destDir, 'crag-v2', 'node')
+  return kernelWouldChange(workerSrc, workerDest) || kernelWouldChange(cragV2NodePath(), nodeDest)
+}
+
 function payloadWouldChange(srcDir, destDir, projectRoot, native) {
   const pairs = [
     ...WRAP_CLI_FILES.map((name) => [
@@ -780,7 +880,9 @@ export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptio
     }
     const kernelChanged =
       (dataplane === 'crag'
-        ? kernelWouldChange(src, path.join(destDir, WRAP_KERNEL_BIN))
+        ? crag.v2
+          ? cragV2WouldChange(crag.path, destDir)
+          : kernelWouldChange(src, path.join(destDir, WRAP_KERNEL_BIN))
         : payloadWouldChange(sample.dir, destDir, projectRoot, native)) || Boolean(vm?.kernel_restart_pending)
     items.push({ id: vm.id, dataplane, ok: true, kernel_changed: kernelChanged })
   }

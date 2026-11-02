@@ -91,6 +91,30 @@ test('crag materialize copies the crag kernel and cc-node', () => {
     fs.rmSync(project, { recursive: true, force: true })
   }
 })
+test('crag materialize uses the CRAG v2 package when configured', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-v2-'))
+  const previous = process.env.KIN_CRAG_V2_ROOT
+  try {
+    const pkg = path.join(project, 'crag-v2-package')
+    fs.mkdirSync(path.join(pkg, 'bin'), { recursive: true })
+    fs.mkdirSync(path.join(pkg, 'claude-code-2.1.88'), { recursive: true })
+    fs.writeFileSync(path.join(pkg, 'bin', 'crag-kernel-worker.mjs'), 'worker')
+    fs.writeFileSync(path.join(pkg, 'claude-code-2.1.88', 'cli.js'), 'cli')
+    process.env.KIN_CRAG_V2_ROOT = pkg
+    const result = materializeSlotDataplane(project, { id: 'vm-13' }, 'crag')
+    assert.equal(result.ok, true)
+    assert.equal(result.v2, true)
+    const dest = wrapCliHomeDir(project, 'vm-13')
+    assert.equal(fs.existsSync(path.join(dest, 'kin-kernel')), true)
+    assert.equal(fs.existsSync(path.join(dest, 'crag-v2', 'node')), true)
+    assert.equal(fs.existsSync(path.join(dest, 'crag-v2', 'bin', 'crag-kernel-worker.mjs')), true)
+    assert.equal(fs.existsSync(path.join(dest, CC_NODE_BIN)), false)
+  } finally {
+    if (previous == null) delete process.env.KIN_CRAG_V2_ROOT
+    else process.env.KIN_CRAG_V2_ROOT = previous
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
 test('crag inspection reports a change and sync marks the kernel for restart', () => {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-change-'))
   try {

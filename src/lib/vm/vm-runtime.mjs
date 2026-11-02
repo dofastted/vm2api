@@ -15,10 +15,15 @@ import { runtimeKind, isKvmRuntime, RUNTIME_KVM } from './runtime-kind.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { kernelBinPath, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
-import { assertCliHopAllowed, resolveOfficialCcInference, resolveSlotPersonaPreset } from './slot-engine.mjs'
+import {
+  assertCliHopAllowed,
+  resolveKernelDataplane,
+  resolveOfficialCcInference,
+  resolveSlotPersonaPreset,
+} from './slot-engine.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
 import { ensureSlotClaudeOwnership, chownSlotRuntimeFile, replaceSlotOwnedFile } from '../oauth/oauth-credentials.mjs'
-import { materializeWrapCli } from './wrap-cli-runtime.mjs'
+import { materializeSlotDataplane, materializeWrapCli } from './wrap-cli-runtime.mjs'
 import { ensureGuestMachineIdFile } from '../identity/workstation-fingerprint.mjs'
 import { ensureSlotComputer, rememberComputer } from '../identity/slot-computer.mjs'
 import { coerceRfc4122Uuid } from '../identity/rfc4122-uuid.mjs'
@@ -1001,10 +1006,17 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
     return { ok: true, action: 'already-running', runtime: vm.runtime }
   }
   const codex = isCodexVm(vm)
+  const dataplane = resolveKernelDataplane(vm, resolvedRouting) || 'wrap'
   if (!codex) {
     try {
-      materializeWrapCli(projectRoot, vm, { uid: runtimeUidNum(vm), gid: Number(GID) })
-    } catch {}
+      const materialized = materializeSlotDataplane(projectRoot, vm, dataplane, {
+        uid: runtimeUidNum(vm),
+        gid: Number(GID),
+      })
+      if (!materialized?.ok) return materialized
+    } catch (error) {
+      return { ok: false, error: String(error?.message || error) }
+    }
   }
   const wrapKernel = path.join(home, '.kin', 'kin-kernel')
   const kernelBin = kernelBinPath()
