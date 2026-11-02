@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- #854：persona 注入的 Environment role=system 固定锚定首个 user，避免客户端下一轮不回传该临时块导致 cache prefix 从历史中段断开、每轮重写整段缓存。
 
 ## 1.4.034 — 2026-11-02
 
