@@ -1855,3 +1855,33 @@ test('security monitor child hop is official', () => {
   assert.equal(isOfficialClaudeSecurityMonitorPrompt(body.system), true)
   assert.equal(isOfficialClaudeCodeTraffic(officialChildHeaders(), body), true)
 })
+
+test('official prompt env message stays at a stable position across turns so the cache prefix survives', () => {
+  const opts = { mode: 'official_prompt', park: false }
+  const history = [
+    { role: 'user', content: 'first question' },
+    { role: 'assistant', content: 'first answer' },
+  ]
+  const turn1 = applyCrsUnofficialPersona(
+    { model: 'claude-opus-5-5', system: 'caller rules', messages: [...history, { role: 'user', content: 'second' }] },
+    opts,
+  )
+  const turn2 = applyCrsUnofficialPersona(
+    {
+      model: 'claude-opus-5-5',
+      system: 'caller rules',
+      messages: [
+        ...history,
+        { role: 'user', content: 'second' },
+        { role: 'assistant', content: 'second answer' },
+        { role: 'user', content: 'third' },
+      ],
+    },
+    opts,
+  )
+  const systems = (out) => out.messages.map((m, i) => (m.role === 'system' ? i : -1)).filter((i) => i >= 0)
+  assert.deepEqual(systems(turn1), systems(turn2))
+  // Everything sent on turn 1 is an unchanged prefix of turn 2.
+  assert.deepEqual(turn2.messages.slice(0, turn1.messages.length), turn1.messages)
+  assert.ok(systems(turn1).length > 0)
+})
