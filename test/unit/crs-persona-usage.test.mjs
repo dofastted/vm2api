@@ -121,7 +121,7 @@ test('official client same-object skip hides nothing', () => {
   assert.equal(personaHideInputTokens(body, after), 0)
 })
 
-test('official Claude Code traffic keeps inbound system only when passthrough is on', () => {
+test('official Claude Code traffic keeps inbound system and hides nothing', () => {
   const body = {
     system: CRS_OFFICIAL_SYSTEM,
     messages: [{ role: 'user', content: 'hello' }],
@@ -133,7 +133,8 @@ test('official Claude Code traffic keeps inbound system only when passthrough is
   assert.equal(kept.system, body.system)
   assert.equal(personaHideForUnofficial(body, kept, { officialClient: true }), 0)
   const after = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite', park: true })
-  assert.notEqual(after.system, body.system)
+  assert.equal(after.system, body.system)
+  assert.equal(personaHideForUnofficial(body, after), 0)
 })
 
 test('none mode hides nothing', () => {

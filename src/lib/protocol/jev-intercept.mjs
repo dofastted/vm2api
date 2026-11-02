@@ -16,6 +16,19 @@ import { hasAccessPresence } from '../oauth/oauth-credentials.mjs'
 import { prepareInterceptText, stripEnvironmentSection, stripReminders } from './jev-prepare.mjs'
 import { isOfficialTypeSafeUrl, jevKeyFingerprint, recordJevUsage } from './jev-usage.mjs'
 import { inferClaudeTier } from '../pool/claude-tier.mjs'
+import {
+  CRS_AGENT_EXPANSION,
+  CRS_OFFICIAL_AGENT_IDENTITY,
+  CRS_OFFICIAL_AGENT_PROMPT,
+  CRS_OFFICIAL_CONTINUATION,
+} from '../identity/official-cc-system-2.1.241.mjs'
+import { CRS_OFFICIAL_AGENT_PROMPT_303 } from '../identity/official-cc-system-2.1.303-full.mjs'
+import {
+  OFFICIAL_303_ENV_INSTRUCTIONS,
+  OFFICIAL_303_GUIDANCE,
+  OFFICIAL_303_HARNESS,
+  OFFICIAL_303_MAIN_PROMPT,
+} from '../identity/official-profiles.mjs'
 
 export const JEV_SETTING = 'jev_intercept'
 export const JEV_CATEGORIES = Object.freeze(['nsfw', 'distill', 'crack', 'jailbreak'])
@@ -101,10 +114,9 @@ const RULE_MAX = 60
 const SCOPE_LIST_MAX = 200
 
 /**
- * User-authored text only. Official system prompts and tool results quote
- * safety rules and exploit writeups; scanning them blocks omp itself.
- * System-side attacks are the distill detector's job (harvest / CoT) or the
- * decision model, when on.
+ * User-authored text, including the caller's own system / instructions prompt.
+ * 官方提示词 and 官方完整提示词 are whitelisted and never sent. Tool results
+ * still quote rules and exploit writeups, so they stay out.
  */
 export const HARD_POLICY_RULES = Object.freeze([
   { category: 'jailbreak', source: String.raw`\b(?:jailbreak|dan)\s+mode\b` },
@@ -1024,9 +1036,93 @@ function cleanUserAsk(text) {
   return stripEnvironmentSection(stripReminders(text))
 }
 
-/** Hard regex sees user-authored turns only. Tool results, system, and env are not scanned. */
+const OFFICIAL_PROMPT_EXACT = new Set(
+  [
+    CRS_OFFICIAL_AGENT_IDENTITY,
+    "You are Claude Code, Anthropic's official CLI for Claude.",
+    '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__',
+  ].map((text) => String(text || '').trim()),
+)
+
+/** Stable slices of 官方提示词 / 官方完整提示词. Placeholders are slot-specific. */
+const OFFICIAL_PROMPT_CHUNKS = [
+  OFFICIAL_303_HARNESS,
+  OFFICIAL_303_GUIDANCE,
+  OFFICIAL_303_MAIN_PROMPT,
+  OFFICIAL_303_ENV_INSTRUCTIONS,
+  CRS_OFFICIAL_AGENT_PROMPT,
+  CRS_OFFICIAL_AGENT_PROMPT_303,
+  CRS_AGENT_EXPANSION,
+  CRS_OFFICIAL_CONTINUATION,
+]
+  .flatMap((body) => String(body || '').split(/\{\{[a-z0-9_]+\}\}/i))
+  .map((piece) => piece.trim())
+  .filter((piece) => piece.length >= 120)
+  .sort((a, b) => b.length - a.length)
+
+/** Drop whitelisted official prompt text. Caller text around it stays auditable. */
+export function stripOfficialPromptWhitelist(text) {
+  let rest = cleanUserAsk(text)
+  if (OFFICIAL_PROMPT_EXACT.has(rest.trim())) return ''
+  rest = rest.replace(/^[ \t]*x-anthropic-billing-header:[^\n]*$/gim, '')
+  for (const chunk of OFFICIAL_PROMPT_CHUNKS) {
+    if (rest.includes(chunk)) rest = rest.split(chunk).join('')
+  }
+  if (OFFICIAL_PROMPT_EXACT.has(rest.trim())) return ''
+  return rest
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+function pushPromptContent(raw, content) {
+  if (typeof content === 'string') {
+    raw.push(content)
+    return
+  }
+  if (!Array.isArray(content)) return
+  for (const block of content) {
+    if (typeof block === 'string') raw.push(block)
+    else if (typeof block?.text === 'string') raw.push(block.text)
+    else if (typeof block?.content === 'string') raw.push(block.content)
+  }
+}
+
+/** Caller prompt fields. Official template bodies are removed before return. */
+function promptPieces(src) {
+  if (!src || typeof src !== 'object') return []
+  const raw = []
+  pushPromptContent(raw, src.system)
+  if (typeof src.instructions === 'string') raw.push(src.instructions)
+  if (typeof src.developer === 'string') raw.push(src.developer)
+  const messages = Array.isArray(src.messages) ? src.messages : []
+  for (const message of messages) {
+    if (String(message?.role || '').toLowerCase() !== 'system') continue
+    pushPromptContent(raw, message.content)
+  }
+  const input = Array.isArray(src.input) ? src.input : []
+  for (const item of input) {
+    const role = String(item?.role || '').toLowerCase()
+    if (role !== 'system' && role !== 'developer') continue
+    pushPromptContent(raw, item.content ?? item.text)
+  }
+  return raw.map(stripOfficialPromptWhitelist).filter(Boolean)
+}
+
+/** Hard regex sees user turns and caller prompts. Official prompts and tool results are not scanned. */
 export function jevDocument(inbound, body = inbound) {
-  return refusalUserDocument(inbound, body, { includeToolResults: false, clean: cleanUserAsk })
+  const users = refusalUserDocument(inbound, body, { includeToolResults: false, clean: cleanUserAsk })
+  const seen = new Set()
+  const prompts = []
+  for (const src of [inbound, body]) {
+    for (const piece of promptPieces(src)) {
+      const norm = normalizeText(piece)
+      if (!norm || seen.has(norm)) continue
+      seen.add(norm)
+      prompts.push(norm)
+    }
+  }
+  return [users, prompts.join('\n')].filter(Boolean).join('\n')
 }
 
 /** User text only. System prompts, env blocks, and tool payloads are not the ask. */
@@ -1052,9 +1148,9 @@ export function jevCurrentAsk(document) {
 }
 
 /**
- * User turns only, labeled by position. System, instructions, developer, and
- * env blocks are harness text; scoring them blocks ordinary coding sessions.
- * The current ask is the last user turn. Assistant and tool turns stay out.
+ * Caller prompts plus user turns. 官方提示词 and 官方完整提示词 are omitted.
+ * The current ask stays the last user turn when one exists. Assistant and tool
+ * turns stay out.
  */
 export function jevModelDocument(inbound, body = inbound) {
   const seen = new Set()
@@ -1069,6 +1165,9 @@ export function jevModelDocument(inbound, body = inbound) {
     parts.push(`[${source}]\n${norm}`)
   }
   for (const src of [inbound, body]) {
+    promptPieces(src).forEach((piece, index) => {
+      push(`system prompt ${index + 1}`, piece)
+    })
     const messages = Array.isArray(src?.messages) ? src.messages : []
     messages.forEach((message, index) => {
       const role = String(message?.role || 'unknown').toLowerCase()

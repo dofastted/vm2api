@@ -634,7 +634,7 @@ test('spoofed claude-cli UA without valid user_id still gets default mimic', () 
   assertParkedStanding(out, 'hi')
 })
 
-test('official claude-cli UA plus valid user_id is cleaned unless passthrough is on', () => {
+test('official claude-cli UA plus valid user_id keeps inbound system', () => {
   const body = {
     system: CRS_OFFICIAL_SYSTEM,
     messages: [{ role: 'user', content: 'hi' }],
@@ -651,7 +651,7 @@ test('official claude-cli UA plus valid user_id is cleaned unless passthrough is
   const kept = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite', officialClient: true })
   assert.equal(kept.system, CRS_OFFICIAL_SYSTEM)
   const out = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite' })
-  assert.notEqual(out.system, CRS_OFFICIAL_SYSTEM)
+  assert.equal(out.system, CRS_OFFICIAL_SYSTEM)
 })
 
 const OMP_ROLE = `<system-conventions>
@@ -1170,7 +1170,7 @@ test('inbound mid-conversation role:system is kept', () => {
   assertParkedStanding(out, 'one')
 })
 
-test('vscode / cowork / desktop official family is cleaned unless passthrough is on', () => {
+test('vscode / cowork / desktop official family keeps inbound system', () => {
   const body = {
     system: CRS_OFFICIAL_SYSTEM,
     messages: [{ role: 'user', content: 'hi' }],
@@ -1202,7 +1202,7 @@ test('vscode / cowork / desktop official family is cleaned unless passthrough is
       mode: 'rewrite',
       park: true,
     })
-    assert.notEqual(out.system, CRS_OFFICIAL_SYSTEM, ua)
+    assert.equal(out.system, CRS_OFFICIAL_SYSTEM, ua)
   }
 })
 
@@ -1630,7 +1630,7 @@ test('zero env off keeps caller system without generating Environment', () => {
   })
 })
 
-test('new official identity variant is cleaned unless passthrough is on', () => {
+test('new official identity variant keeps inbound system', () => {
   const body = {
     system: "You are Claude Code, Anthropic's newest coding agent.",
     messages: [{ role: 'user', content: 'hi' }],
@@ -1657,10 +1657,10 @@ test('new official identity variant is cleaned unless passthrough is on', () => 
     mode: 'rewrite',
     park: true,
   })
-  assert.notEqual(out.system, body.system)
+  assert.equal(out.system, body.system)
 })
 
-test('official entrypoint without exact identity line is cleaned unless passthrough is on', () => {
+test('official entrypoint without exact identity line keeps inbound system', () => {
   const body = {
     system: 'cc_entrypoint=vscode\nFollow the workspace instructions.',
     messages: [{ role: 'user', content: 'hi' }],
@@ -1674,7 +1674,7 @@ test('official entrypoint without exact identity line is cleaned unless passthro
   const kept = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite', officialClient: true })
   assert.equal(kept.system, body.system)
   const out = applyCrsUnofficialPersona(body, { headers, mode: 'rewrite' })
-  assert.notEqual(out.system, body.system)
+  assert.equal(out.system, body.system)
 })
 
 test('local-agent entrypoint still does not count as official even with identity variant', () => {
@@ -1781,7 +1781,7 @@ function officialChildMeta() {
   }
 }
 
-test('Explore / Compact / web-search child hops are cleaned unless passthrough is on', () => {
+test('Explore / Compact / web-search child hops keep inbound system', () => {
   const cases = [
     "You are a file search specialist for Claude Code, Anthropic's official CLI for Claude.",
     'You are a helpful AI assistant tasked with summarizing conversations.',
@@ -1812,11 +1812,11 @@ test('Explore / Compact / web-search child hops are cleaned unless passthrough i
       headers: officialChildHeaders(),
       mode: 'rewrite',
     })
-    assert.notEqual(out.system, body.system, text)
+    assert.equal(out.system, body.system, text)
   }
 })
 
-test('Explore child hop without billing is cleaned unless passthrough is on', () => {
+test('Explore child hop without billing keeps inbound system', () => {
   const body = {
     system: [
       {
@@ -1840,7 +1840,7 @@ test('Explore child hop without billing is cleaned unless passthrough is on', ()
     mode: 'rewrite',
     park: true,
   })
-  assert.notEqual(out.system, body.system)
+  assert.equal(out.system, body.system)
 })
 
 test('security monitor child hop is official', () => {
