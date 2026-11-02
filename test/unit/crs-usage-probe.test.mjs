@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   parseOAuthUsage,
+  isCompleteOAuthUsage,
   parseFableProbe,
   isFablePlanDenied,
   isFableUnavailablePro,
@@ -15,6 +16,25 @@ import {
   probeFromPassiveHeaders,
   probeVmUsage,
 } from '../../src/lib/oauth/crs-usage-probe.mjs'
+
+test('official weekly-only usage is complete without inventing a session window', () => {
+  const data = {
+    five_hour: null,
+    seven_day: { utilization: 4, resets_at: '2026-11-05T12:00:00Z' },
+    limits: [{ kind: 'weekly_all', percent: 4, resets_at: '2026-11-05T12:00:00Z' }],
+  }
+  const parsed = parseOAuthUsage(data)
+  assert.equal(isCompleteOAuthUsage(data, parsed), true)
+  assert.equal(parsed.five_hour, null)
+  assert.equal(parsed.seven_day.utilization, 0.04)
+  const { five_hour, ...omitted } = data
+  assert.equal(isCompleteOAuthUsage(omitted), true)
+  assert.equal(isCompleteOAuthUsage({ ...data, five_hour: { utilization: 12 } }), true)
+  assert.equal(isCompleteOAuthUsage({ ...data, five_hour: {} }), false)
+  assert.equal(isCompleteOAuthUsage({ ...data, seven_day: null }), false)
+  assert.equal(isCompleteOAuthUsage({ five_hour: null, seven_day: null, limits: [] }), false)
+  assert.equal(isCompleteOAuthUsage({}), false)
+})
 
 test('oauth usage parse: official percent scale 1 = 1%', () => {
   const p = parseOAuthUsage({
