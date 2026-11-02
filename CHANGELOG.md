@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- 修复 native cli-hop 最终请求未读取 `kernel.json.default_cache_ttl` 的回归：Web 设置的 `5m` / `1h` 现在传到 CLI 自有 system/tools 缓存断点；调用方保留的 message 断点不被覆盖。
 - #854：persona 注入的 Environment role=system 固定锚定首个 user，避免客户端下一轮不回传该临时块导致 cache prefix 从历史中段断开、每轮重写整段缓存。
 
 ## 1.4.034 — 2026-11-02
