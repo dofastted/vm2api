@@ -113,14 +113,39 @@ export function validateCacheBreakpoints(body) {
   check(body)
 }
 
-/** Only call for a rewritten native body: every surviving marker is Node-owned. */
+/**
+ * Only call for a rewritten native body: every surviving marker is Node-owned.
+ * Explicit TTLs stay. A missing TTL takes `ttl`, or 5m once a short marker
+ * precedes it, so filling never puts a 1h after a 5m. Anthropic reads tools,
+ * system, messages, then the root automatic marker at the message tail.
+ */
 export function fillMissingCacheTtl(body, ttl = DEFAULT_CACHE_TTL) {
+  if (!body || typeof body !== 'object') return body
   const target = normalizeCacheTtl(ttl)
-  return walkCacheNodes(body, (node) => {
+  let short = false
+  const fill = (node) => {
     const control = node?.cache_control
-    if (!control || control.type !== 'ephemeral' || control.ttl != null) return node
-    return { ...node, cache_control: { ...control, ttl: target } }
-  })
+    if (!control || control.type !== 'ephemeral') return node
+    if (control.ttl != null) {
+      if (control.ttl !== '1h') short = true
+      return node
+    }
+    const next = short ? '5m' : target
+    if (next !== '1h') short = true
+    return { ...node, cache_control: { ...control, ttl: next } }
+  }
+  const out = { ...body }
+  if (Array.isArray(out.tools)) out.tools = out.tools.map(fill)
+  if (Array.isArray(out.system)) out.system = out.system.map(fill)
+  if (Array.isArray(out.messages)) {
+    out.messages = out.messages.map((message) => {
+      if (!Array.isArray(message?.content)) return message
+      const content = message.content.map(fill)
+      return content.some((block, i) => block !== message.content[i]) ? { ...message, content } : message
+    })
+  }
+  if (out.cache_control) out.cache_control = fill({ cache_control: out.cache_control }).cache_control
+  return out
 }
 
 const CACHE_TTL_MS = Object.freeze({ '5m': 5 * 60_000, '1h': 60 * 60_000 })
