@@ -22,6 +22,7 @@ import {
   buildScopeInventory,
   listPolicyModels as listDecisionModels,
   publicJevConfig,
+  publicJevKeys,
   readJevConfig,
 } from '../protocol/jev-intercept.mjs'
 import { JevUsageRepo } from '../db/repos/jev-usage-repo.mjs'
@@ -5479,10 +5480,12 @@ export function createPanelHandler(ctx) {
         try {
           const repo = new JevUsageRepo()
           const page = repo.list(Object.fromEntries(url.searchParams))
+          const settings = new SettingsRepo()
+          const keys = repo.configuredKeys(publicJevKeys(readJevConfig((key, fallback) => settings.get(key, fallback))))
           return json(
             res,
             200,
-            panel.ok({ ...repo.overview(), ...page, storage_errors_since_start: jevUsageStorageErrors() }),
+            panel.ok({ ...repo.overview(), ...page, keys, storage_errors_since_start: jevUsageStorageErrors() }),
           )
         } catch (error) {
           if (error instanceof TypeError)

@@ -1396,6 +1396,18 @@ function jevTargets(config) {
   return out
 }
 
+/** Current configuration only; expose masked labels, never full credentials or URLs. */
+export function publicJevKeys(config) {
+  return jevTargets(normalizeJevConfig(config))
+    .filter((target) => target.apiKey)
+    .map((target, index) => ({
+      number: index + 1,
+      masked_key: target.apiKey.length >= 12 ? `${target.apiKey.slice(0, 4)}********${target.apiKey.slice(-4)}` : '********',
+      key_fingerprint: jevKeyFingerprint(target.apiKey),
+      retired: retiredJevKeys.has(target.id),
+    }))
+}
+
 function rearmJevKeys(config) {
   const live = new Set(jevTargets(config).map((target) => target.id))
   for (const id of [...retiredJevKeys]) {
