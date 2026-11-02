@@ -89,7 +89,6 @@ export class RequestAttemptsRepo {
         null,
         null,
         null,
-        null,
         0,
         'started',
         null,
