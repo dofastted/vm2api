@@ -2,13 +2,10 @@
 
 ## Unreleased
 
+## 1.4.034 — 2026-11-02
+
 - 透传关闭时，任何入站都先收成标准 Anthropic 结构再进人设：调用方 billing 删掉并由项目重写；调用方 User-Agent 不出站。只有协议页打开官方家族透传才保留这两者。第三方工具名改为 `mcp__`，回包按原名还原。
 - #836：`ensureSlotGuestBinDir` 原子替换失败时清理 `${dest}.${pid}.tmp` 暂存文件，避免 `data/run/slot-guest-bin` 下残留堆积。
-
-## 1.4.033 — 2026-11-02
-
-- #850：回滚 #843 对已识别官方 Claude Code 的 cli-hop 强制 persona。识别命中且未开「官方 Claude Code 家族透传」时，cli-hop 保留入站 system 和缓存断点，不再把无 TTL 的调用方断点留给上游当成隐式 5m。`forceConfigured` 仍可改写。API 直连在开关关闭时仍按原分支清洗。
-- 风险审计送审调用方提示词（system / instructions / developer）。「官方提示词」和「官方完整提示词」正文在白名单内，不送审；夹在官方正文后的调用方文字仍送审。工具结果和 Environment 不送审。
 
 已部署机升级：只更新 Node 控制面后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
