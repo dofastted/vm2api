@@ -28,6 +28,7 @@ import {
 } from '@/features/cluster/model'
 
 const G = GiB
+const M = 1024 ** 2
 
 function api(
   partial: Partial<ClusterApiNode> & {
@@ -144,13 +145,13 @@ describe('remoteLink', () => {
 })
 
 describe('capacity', () => {
-  it('parses slot memory and adds the KVM container overhead', () => {
+  it('parses slot memory and adds the measured qemu overhead, not the 512M ceiling', () => {
     expect(memoryBytes('2g')).toBe(2 * G)
     expect(memoryBytes('512m')).toBe(0.5 * G)
     expect(memoryBytes('')).toBeNull()
-    expect(slotQuotaBytes(vm({ id: 'a' }))).toBe(2.5 * G)
+    expect(slotQuotaBytes(vm({ id: 'a' }))).toBe(2 * G + 150 * M)
     expect(slotQuotaBytes(vm({ id: 'b', machine: { memory: '4g' } }))).toBe(
-      4.5 * G
+      4 * G + 150 * M
     )
     expect(
       slotQuotaBytes(
@@ -160,23 +161,25 @@ describe('capacity', () => {
   })
 
   it('counts room by quota, with the system share taken from measured use', () => {
-    // 德国集群1 on 11-02: 12 Pro × 2.5G quota on 31.35G, 0.93G outside containers.
+    // 德国集群1 on 11-02: 12 Pro × (2G + 150M) on 31.35G, 0.93G outside containers, 22.59G in use.
+    // The 512M container ceiling used to make this read 「满 · 剩 0.4G」 while about 8G sat free.
     const full = machineCapacity({
       total: 31.35 * G,
       used: 22.59 * G,
       slotsActual: 21.66 * G,
-      quota: 30 * G,
+      quota: 12 * (2 * G + 150 * M),
     })
-    expect(full.fit).toBe(0)
-    expect(gibFloor(full.free)).toBe('0.4')
+    expect(full.fit).toBe(2)
+    expect(gibFloor(full.free)).toBe('4.6')
+    expect(full.used).toBe(22.59 * G)
     const empty = machineCapacity({
       total: 31.35 * G,
       used: 0.88 * G,
       slotsActual: 0.04 * G,
       quota: 0,
     })
-    expect(empty.fit).toBe(12)
-    expect(Math.floor((empty.free || 0) / NEW_SLOT_QUOTA_BYTES)).toBe(12)
+    expect(empty.fit).toBe(14)
+    expect(Math.floor((empty.free || 0) / NEW_SLOT_QUOTA_BYTES)).toBe(14)
   })
 
   it('cannot tell the room without the slots reading', () => {
@@ -294,9 +297,9 @@ describe('machines', () => {
     expect(local.slots.map((v) => v.id)).toEqual(['niutopia2001', 'oliva'])
     expect(local.todayUsd).toBeCloseTo(114.96)
     expect(local.disk?.pct).toBe(33.7)
-    // 23.5 − (14 − 6) − (4.5 + 2.5) = 8.5G → 3 台
+    // 23.5 − (14 − 6) − (4G + 150M + 2G + 150M) ≈ 9.2G → 4 台（每台约 2.15G）
     expect(local.capacity?.reserve).toBe(8 * G)
-    expect(local.capacity?.fit).toBe(3)
+    expect(local.capacity?.fit).toBe(4)
   })
 
   it('shows dashes, not zeros, for a node it cannot reach', () => {

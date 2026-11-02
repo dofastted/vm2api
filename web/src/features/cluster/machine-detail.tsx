@@ -88,7 +88,7 @@ function CapacityBar({ m }: { m: ClusterMachine }) {
       <div className='mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-[11.5px] text-muted-foreground'>
         <span className='inline-flex items-center gap-1.5'>
           <i className='inline-block size-2 rounded-[2px] bg-[color:var(--tier-pro-solid)]' />
-          槽配额 <b className='field-metric text-foreground'>{gib(c.quota)}G</b>
+          槽用满 <b className='field-metric text-foreground'>{gib(c.quota)}G</b>
         </span>
         <span className='inline-flex items-center gap-1.5'>
           <i className='inline-block size-2 rounded-[2px] bg-[color:var(--status-none)] opacity-55' />
@@ -103,6 +103,10 @@ function CapacityBar({ m }: { m: ClusterMachine }) {
           <b className='field-metric text-foreground'>
             {c.free == null ? '—' : `${gibFloor(c.free)}G`}
           </b>
+        </span>
+        <span>
+          此刻实际已用{' '}
+          <b className='field-metric text-foreground'>{gib(c.used)}G</b>
         </span>
         <span>
           共 <b className='field-metric text-foreground'>{gib(c.total)}G</b>

@@ -16,8 +16,12 @@ export const LINK_SLOW_MS = 800
 
 const MiB = 1024 ** 2
 export const GiB = 1024 ** 3
-/** KVM 槽的容器配额 = 虚拟机内存 + 512M（`vm-runtime.mjs` 的 KVM_MEMORY_OVERHEAD_MIB）。 */
-export const KVM_OVERHEAD_BYTES = 512 * MiB
+/**
+ * KVM 槽在虚拟机内存之外实际多用的（qemu 进程本身）。容器上限给了 512M（`vm-runtime.mjs` 的
+ * KVM_MEMORY_OVERHEAD_MIB），但那只是上限：11-01 实测 1G 的槽 qemu 约 1.12G。按上限算会把每台多扣
+ * 约 0.35G，12 台的节点就少算 4G 多（11-02 用户指出），所以按实测取 150M。
+ */
+export const KVM_OVERHEAD_BYTES = 150 * MiB
 /** 「还能放」按一台 2G 的 KVM 槽算。 */
 export const NEW_SLOT_MEMORY_BYTES = 2 * GiB
 export const NEW_SLOT_QUOTA_BYTES = NEW_SLOT_MEMORY_BYTES + KVM_OVERHEAD_BYTES
@@ -131,7 +135,7 @@ export function memoryBytes(raw: unknown): number | null {
   return m[2] === 'g' ? n * GiB : n * MiB
 }
 
-/** 槽在这台机器上占的内存配额：KVM 是虚拟机内存 + 512M，Docker 槽就是它的内存上限。 */
+/** 槽用满时在这台机器上占的内存：KVM 是虚拟机内存 + 实测 qemu 开销，Docker 槽就是它的内存上限。 */
 export function slotQuotaBytes(vm: Vm): number {
   const mem = memoryBytes(vm.machine?.memory) ?? 512 * MiB
   return mem + (vm.runtime_type === 'kvm' ? KVM_OVERHEAD_BYTES : 0)
@@ -139,19 +143,22 @@ export function slotQuotaBytes(vm: Vm): number {
 
 export type MachineCapacity = {
   total: number
-  /** 槽配额合计。 */
+  /** 此刻实际已用（不含可回收缓存）。 */
+  used: number
+  /** 槽都用满时占的内存合计。 */
   quota: number
   /** 槽以外的占用（系统、控制面、数据库…）= 实际已用 − 槽此刻实际用的；读不到为 null。 */
   reserve: number | null
-  /** 按配额算还空着的内存；reserve 读不到为 null。 */
+  /** 槽都用满后还空着的内存；reserve 读不到为 null。 */
   free: number | null
   /** 还能放几台 2G KVM 槽。 */
   fit: number | null
 }
 
 /**
- * 按配额算余量，不按此刻用量：虚拟机会慢慢把分到的内存用满（11-01 挪槽就是这么算的）。
- * `slotsActual` 是槽此刻实际占的内存，只用来把「系统占用」从总用量里剥出来。
+ * 按槽用满时算余量，不按此刻用量：虚拟机会慢慢把分到的内存用满（11-01 挪槽就是这么算的）。
+ * 每台按虚拟机内存 + 实测 qemu 开销，不按容器上限。`slotsActual` 是槽此刻实际占的内存，
+ * 只用来把「系统占用」从总用量里剥出来。
  */
 export function machineCapacity(input: {
   total: number
@@ -165,6 +172,7 @@ export function machineCapacity(input: {
   const free = reserve == null ? null : Math.max(0, total - reserve - quota)
   return {
     total,
+    used,
     quota,
     reserve,
     free,
@@ -432,9 +440,9 @@ export const HOT_PCT = 85
 export function capacityTitle(m: ClusterMachine): string | undefined {
   const c = m.capacity
   if (!c) return undefined
-  const slot = `一台 2G 槽占 ${gib(NEW_SLOT_QUOTA_BYTES)}G（虚拟机 2G + 512M）`
+  const slot = `一台 2G 槽按 ${gib(NEW_SLOT_QUOTA_BYTES, 2)}G 算（虚拟机 2G + qemu 实测约 0.15G）`
   if (c.reserve == null) {
-    return `槽配额 ${gib(c.quota)}G / 共 ${gib(c.total)}G；槽此刻实际用了多少没读到，算不出余量`
+    return `槽用满 ${gib(c.quota)}G / 共 ${gib(c.total)}G；槽此刻实际用了多少没读到，算不出余量`
   }
-  return `共 ${gib(c.total)}G − 系统 ${gib(c.reserve)}G − 槽配额 ${gib(c.quota)}G = 剩 ${gibFloor(c.free)}G；${slot}`
+  return `共 ${gib(c.total)}G − 系统 ${gib(c.reserve)}G − 槽用满 ${gib(c.quota)}G = 剩 ${gibFloor(c.free)}G；${slot}。此刻实际已用 ${gib(c.used)}G`
 }
