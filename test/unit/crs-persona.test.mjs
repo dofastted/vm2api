@@ -490,15 +490,18 @@ test('fingerprint uses first user text, not discarded caller system', () => {
   assert.ok(!out.system[0].text.includes(expectedFp('[System Instructions]\nkeep this persona')))
 })
 
-test('billing attribution leaves caller-supplied billing unchanged', () => {
+test('billing attribution replaces caller billing unless passthrough is on', () => {
   const caller = 'x-anthropic-billing-header: cc_version=2.1.296; cc_entrypoint=local-agent; cch=00000;'
   const body = { system: [{ type: 'text', text: caller }] }
-  const out = ensureBillingAttribution(body)
-  assert.equal(out, body)
-  assert.equal(out.system[0].text, caller)
+  const replaced = ensureBillingAttribution(body)
+  assert.notEqual(replaced.system[0].text, caller)
+  assert.match(replaced.system[0].text, /^x-anthropic-billing-header: /)
+  assert.doesNotMatch(replaced.system[0].text, /local-agent/)
+  const kept = ensureBillingAttribution(body, { passthrough: true })
+  assert.equal(kept.system[0].text, caller)
 })
 
-test('missing billing receives cli and turn indexes; caller billing keeps entrypoint', () => {
+test('missing billing receives cli and turn indexes; caller billing is replaced', () => {
   const messages = [
     { role: 'user', content: 'ping' },
     { role: 'assistant', content: 'pong' },
@@ -516,19 +519,22 @@ test('missing billing receives cli and turn indexes; caller billing keeps entryp
     ),
   )
   const caller = 'x-anthropic-billing-header: cc_version=2.1.296.abc; cc_entrypoint=cli; cch=00000;'
-  const kept = ensureBillingAttribution(
+  const replaced = ensureBillingAttribution(
     { system: [{ type: 'text', text: caller }], messages },
     { firstUserText: 'ping', cliVersion: '2.1.296', sessionId, indexes: billingIndexesFromMessages(messages) },
   )
-  assert.equal(kept.system[0].text, caller)
+  assert.notEqual(replaced.system[0].text, caller)
+  assert.match(replaced.system[0].text, /cc_entrypoint=cli;/)
+  assert.match(replaced.system[0].text, new RegExp(`cc_prompt_id=${sessionId}`))
 })
-test('generated billing follows the panel entrypoint and still leaves caller billing unchanged', () => {
+test('generated billing follows the panel entrypoint and replaces caller billing', () => {
   const messages = [{ role: 'user', content: 'ping' }]
   const added = ensureBillingAttribution({ messages }, { firstUserText: 'ping', entrypoint: 'cli' })
   assert.match(added.system[0].text, /cc_entrypoint=cli;/)
   const caller = 'x-anthropic-billing-header: cc_version=2.1.296.abc; cc_entrypoint=sdk-cli; cch=00000;'
-  const kept = ensureBillingAttribution({ system: [{ type: 'text', text: caller }] }, { entrypoint: 'cli' })
-  assert.equal(kept.system[0].text, caller)
+  const replaced = ensureBillingAttribution({ system: [{ type: 'text', text: caller }] }, { entrypoint: 'cli' })
+  assert.match(replaced.system[0].text, /cc_entrypoint=cli;/)
+  assert.doesNotMatch(replaced.system[0].text, /sdk-cli/)
 })
 test('routing.json cc_entrypoint reaches the rendered template billing without a direct argument', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-entrypoint-'))

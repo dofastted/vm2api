@@ -715,10 +715,32 @@ export function composeToolNames(front = {}, hop = {}) {
 
 /**
  * Front gate: every non-classifier Messages body becomes standard Anthropic
- * blocks before persona or either hop. Hermes leaves string content and its
- * own tool names; those must not reach the template.
+ * blocks before persona or either hop. Caller billing is removed here unless
+ * official passthrough is on; the project template writes its own.
  */
 export function toStandardAnthropicBody(body, { official = false, rewriteTools = true } = {}) {
-  const shaped = sanitizeAnthropicBody(body, { strictPassthrough: false, preserveContentShape: false })
+  const shaped = sanitizeAnthropicBody(stripCallerBilling(body), {
+    strictPassthrough: false,
+    preserveContentShape: false,
+  })
   return scrubUpstreamClientBody(shaped, { official, rewriteTools })
+}
+
+function stripCallerBilling(body) {
+  if (!body || typeof body !== 'object' || body.system == null) return body
+  const billing = (text) => /^\s*x-anthropic-billing-header:/i.test(String(text || ''))
+  if (typeof body.system === 'string') {
+    if (!/x-anthropic-billing-header:/i.test(body.system)) return body
+    const text = body.system.replace(/^[ \t]*x-anthropic-billing-header:[^\n]*(?:\n|$)/gim, '').trim()
+    const next = { ...body }
+    if (text) next.system = text
+    else delete next.system
+    return next
+  }
+  if (!Array.isArray(body.system)) return body
+  const system = body.system.filter((block) => !billing(typeof block === 'string' ? block : block?.text))
+  if (system.length === body.system.length) return body
+  const next = { ...body, system }
+  if (!system.length) delete next.system
+  return next
 }

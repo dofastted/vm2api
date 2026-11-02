@@ -439,25 +439,53 @@ export function ccEntrypointFromRouting(routing) {
   return routing?.compatibility?.cc_entrypoint === 'sdk-cli' ? 'sdk-cli' : 'cli'
 }
 
-/** Add the billing block exactly once before the cli-node hop. */
+/** Add the project billing block once. Caller billing is kept only when passthrough is on. */
 export function ensureBillingAttribution(
   body,
-  { firstUserText = '', cliVersion = DEFAULT_CLI_VERSION, sessionId = '', indexes = null, entrypoint = 'cli' } = {},
+  {
+    firstUserText = '',
+    cliVersion = DEFAULT_CLI_VERSION,
+    sessionId = '',
+    indexes = null,
+    entrypoint = 'cli',
+    passthrough = false,
+  } = {},
 ) {
   if (!body || typeof body !== 'object') return body
+  const source = passthrough ? body : stripCallerBillingBody(body)
   const hasBilling = (system) => {
     if (typeof system === 'string') return /x-anthropic-billing-header:/i.test(system)
     if (!Array.isArray(system)) return false
     return system.some((block) => /x-anthropic-billing-header:/i.test(String(block?.text || block || '')))
   }
-  if (hasBilling(body.system)) return body
+  if (hasBilling(source.system)) return source
   const block = {
     type: 'text',
     text: buildBillingAttributionText(firstUserText, cliVersion, sessionId, indexes, entrypoint),
   }
-  if (Array.isArray(body.system)) return { ...body, system: [block, ...body.system] }
-  if (body.system == null || body.system === '') return { ...body, system: [block] }
-  return { ...body, system: [block, { type: 'text', text: String(body.system) }] }
+  if (Array.isArray(source.system)) return { ...source, system: [block, ...source.system] }
+  if (source.system == null || source.system === '') return { ...source, system: [block] }
+  return { ...source, system: [block, { type: 'text', text: String(source.system) }] }
+}
+
+function stripCallerBillingBody(body) {
+  if (!body || body.system == null) return body
+  const billing = (text) => /^\s*x-anthropic-billing-header:/i.test(String(text || ''))
+  if (typeof body.system === 'string') {
+    if (!/x-anthropic-billing-header:/i.test(body.system)) return body
+    const text = body.system.replace(/^[ \t]*x-anthropic-billing-header:[^\n]*(?:\n|$)/gim, '').trim()
+    const next = { ...body }
+    if (text) next.system = text
+    else delete next.system
+    return next
+  }
+  if (!Array.isArray(body.system)) return body
+  const system = body.system.filter((block) => !billing(typeof block === 'string' ? block : block?.text))
+  if (system.length === body.system.length) return body
+  const next = { ...body }
+  if (system.length) next.system = system
+  else delete next.system
+  return next
 }
 
 function extractSystemTexts(system) {

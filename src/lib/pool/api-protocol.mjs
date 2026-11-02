@@ -1,3 +1,4 @@
+import { OFFICIAL_CLAUDE_CLI_UA } from '../identity/vm-identity.mjs'
 import { officialMessagesBody } from '../protocol/anthropic-messages.mjs'
 import { prepareClassifierBody } from '../protocol/request-purpose.mjs'
 import { consumeClaudeSSEData } from '../protocol/convert.mjs'
@@ -47,11 +48,12 @@ function joinHeaderMap(headers = {}) {
  * know yet.  Headers the operator configured on the endpoint win; anthropic-beta
  * is the union of endpoint and caller tokens so neither opt-in is dropped.
  */
-function forwardAnthropicProtocolHeaders(headers = {}, protocol = '', protocolKind = '') {
+function forwardAnthropicProtocolHeaders(headers = {}, protocol = '', protocolKind = '', { passthrough = false } = {}) {
   if (protocol !== 'anthropic.messages' || protocolKind !== 'anthropic') return {}
   const out = {}
   for (const [rawName, rawValue] of Object.entries(headers || {})) {
     const name = String(rawName || '').toLowerCase()
+    if (name === 'user-agent' && !passthrough) continue
     if (
       !name.startsWith('anthropic-') &&
       !name.startsWith('x-claude-code-') &&
@@ -217,6 +219,7 @@ export async function runApiInference({
   cacheTtl,
   converters,
   requestContext = null,
+  passthrough = false,
 } = {}) {
   const canonical = officialMessagesBody(convertedBody)
   const model = canonical.model
@@ -254,16 +257,25 @@ export async function runApiInference({
     ? { ...claudeToOpenAIResponsesRequest({ ...canonical, model: picked.upstream_model }), stream: true }
     : { ...canonical, model: picked.upstream_model, stream: true }
   if (requestContext) Object.assign(body, prepareClassifierBody(body))
-  const callerProtocolHeaders = forwardAnthropicProtocolHeaders(req?.headers, protocol, protocolKind)
+  const callerProtocolHeaders = forwardAnthropicProtocolHeaders(req?.headers, protocol, protocolKind, {
+    passthrough,
+  })
+  const authHeaders = upstreamAuthHeaders(protocolKind, picked.key.api_key, {
+    ...extraHeaders,
+    auth_scheme: picked.endpoint.auth_scheme || extraHeaders.auth_scheme || extraHeaders.anthropic_apikey_auth_scheme,
+  })
+  if (
+    protocolKind === 'anthropic' &&
+    !passthrough &&
+    !Object.keys(authHeaders).some((key) => key.toLowerCase() === 'user-agent')
+  ) {
+    authHeaders['user-agent'] = OFFICIAL_CLAUDE_CLI_UA
+  }
   const headers = mergeCallerProtocolHeaders(
     {
       'content-type': 'application/json',
       accept: 'text/event-stream',
-      ...upstreamAuthHeaders(protocolKind, picked.key.api_key, {
-        ...extraHeaders,
-        auth_scheme:
-          picked.endpoint.auth_scheme || extraHeaders.auth_scheme || extraHeaders.anthropic_apikey_auth_scheme,
-      }),
+      ...authHeaders,
     },
     callerProtocolHeaders,
     extraHeaders,

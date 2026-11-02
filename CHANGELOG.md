@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- 本站 API 入站后、进人设之前，第三方（含 Hermes）和官方请求都先收成标准 Anthropic 结构：system / messages 变成 text block，丢掉 OpenAI 残留字段，Hermes 产品名换成官方口径，第三方工具名改为 `mcp__`。官方 Claude Code 工具名保留。回包按原名还原。避免上游把未转写的 Hermes 请求当成第三方应用并返回 extra usage 400。
+- 透传关闭时，任何入站都先收成标准 Anthropic 结构再进人设：调用方 billing 删掉并由项目重写；调用方 User-Agent 不出站。只有协议页打开官方家族透传才保留这两者。第三方工具名改为 `mcp__`，回包按原名还原。
 - #836：`ensureSlotGuestBinDir` 原子替换失败时清理 `${dest}.${pid}.tmp` 暂存文件，避免 `data/run/slot-guest-bin` 下残留堆积。
 
 ## 1.4.033 — 2026-11-02
