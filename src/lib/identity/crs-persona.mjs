@@ -2156,7 +2156,11 @@ function applyTemplatePersona(
       // expansions as blocks so the assembled cache merger can budget them.
       system = [...system, ...(Array.isArray(content) ? content : [{ type: 'text', text: content }])]
     } else if (content.length) {
-      const at = outMessages.findLastIndex((message) => message?.role === 'user')
+      // Official presets anchor to the first user turn: callers resend history
+      // without this injected block, so a tail position shifts every turn and
+      // breaks the cache prefix from that point on. Zero templates keep the
+      // caller-visible tail placement.
+      const at = zero ? outMessages.findLastIndex((message) => message?.role === 'user') : firstUserIndex(outMessages)
       if (at >= 0)
         outMessages = [...outMessages.slice(0, at + 1), { role: 'system', content }, ...outMessages.slice(at + 1)]
     }

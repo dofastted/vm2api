@@ -599,3 +599,28 @@ test('an anchor reads the newest entry an earlier turn wrote, not an unwritten u
   const { anchor } = prepareCachePrefix('w', marked(history(12, { 2: 'x', 7: 'y' })), 2)
   assert.equal(anchor, 0)
 })
+
+test('persona Environment injection does not break the prefix when each turn ends with a caller reminder', async () => {
+  const { applyCrsUnofficialPersona } = await import('../../src/lib/identity/crs-persona.mjs')
+  const { prepareCliHopBody } = await import('../../src/lib/protocol/outbound-attempt.mjs')
+  clearCachePrefixSessions()
+  const model = 'claude-opus-5-5'
+  const history = []
+  for (let turn = 0; turn < 3; turn++) {
+    // Claude Code resends its own trailing role=system reminder, never the gateway's Environment.
+    history.push({ role: 'user', content: [{ type: 'text', text: `question ${turn}` }] })
+    history.push({
+      role: 'system',
+      content: [{ type: 'text', text: `<total_tokens>${1000 - turn} tokens left</total_tokens>` }],
+    })
+    const rendered = applyCrsUnofficialPersona(
+      { model, system: 'caller rules', messages: structuredClone(history) },
+      { forceConfigured: true, mode: 'official_full', model },
+    )
+    const wire = prepareCliHopBody(rendered, { stream: true, personaPreset: 'official_full' })
+    const { break: br } = prepareCachePrefix('acct:persona-env', wire, turn)
+    assert.equal(br, null, `turn ${turn} broke at messages[${br?.index}] ${br?.diff?.reason}`)
+    confirmCachePrefix('acct:persona-env', turn)
+    history.push({ role: 'assistant', content: [{ type: 'text', text: `answer ${turn}` }] })
+  }
+})
