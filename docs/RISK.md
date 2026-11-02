@@ -8,10 +8,10 @@
 
 | 顺序 | 关 | 扫什么 | 拦住 |
 |------|----|--------|------|
-| 1 | 蒸馏 | 收割模板、题目指纹、结构特征 | 默认 403，并封 device |
-| 2 | 硬正则 | 用户正文（不含工具回传、system、`# Environment`、已闭合的 `<system-reminder>`） | 403，不进槽；device 封禁开着时并封 device，不进拒答缓存 |
-| 3 | 拒答缓存 | 上游拒过的正文、近似正文、已封 device | 400 `policy_blocked`，不可重试且不是登录失效。原文后追加命中原因：设备封禁、完全一致或相似 |
-| 4 | 决策模型 | 整理后的用户正文，不含 system / env / 已闭合提醒 | 低于阈值则 403，并封 device，不进拒答缓存。模型不可用且关闭失败放行时只拦本次，不封 device |
+| 1 | 蒸馏 | 收割模板、题目指纹、结构特征 | 默认 403，并封 device + Session |
+| 2 | 硬正则 | 用户正文（不含工具回传、system、`# Environment`、已闭合的 `<system-reminder>`） | 403，不进槽；身份封禁开着时同时封 device + Session，不进拒答缓存 |
+| 3 | 拒答缓存 | 上游拒过的正文、Jev 模型拦截的正文、近似正文、已封 device / Session | 400 `policy_blocked`，不可重试且不是登录失效。原文后追加命中原因：设备、Session、完全一致或相似 |
+| 4 | 决策模型 | 整理后的用户正文，不含 system / env / 已闭合提醒 | 低于阈值则 403，写入拒答缓存并封 device + Session。模型不可用且关闭失败放行时只拦本次，不封身份 | 
 | 5 | 放行出站 | 前面都没拦的请求 | 进入槽位 |
 
 「放行出站」不是第六道闸。它同时列出两类没被闸拦住、但结果仍异常的请求：决策模型打分失败后的放行，以及上游自己的拒答。用来看漏拦。
@@ -55,19 +55,22 @@
 
 ## 拒答缓存
 
-只记上游真正拒过的正文。硬正则和决策模型自己打回的拦截不进这张缓存，下次仍重新过闸。
+缓存按 `source` 区分 `upstream` 与 `jev`。上游真正拒答保存实际错误码、HTTP 状态、用户预览和相似度签名；Jev 模型拦截保存同一请求指纹和 `jev_state` 对应的日志，不再重复调用模型。硬正则和蒸馏仍不进入拒答缓存。
 
-内核把 Usage Policy 拒答报成 HTTP 400 `upstream_invalid_request` 时，日志仍按拒答归类，风险审计的「上游拒答」能看到这条 400。`Third-party apps now draw from your extra usage` 和 `no third-party apps allowed` 也是。它们常以 HTTP 400 或 503 出现，内核码仍是 `upstream_invalid_request` / `upstream_error`。不换号、不修复重试，永久写入拒答缓存；近似正文按同一阈值拦截。这是计费限制，不封 device。`content_policy`、`cyber_policy` 等错误码，包括只写在 `upstream_code` 里的，同样永久入库并带相似度签名；device 封禁开着时仍封 device。指纹列表显示当时的用户原文，不显示 `<system-reminder>`。近似比较去掉提醒、`# Environment` 和工具回传后的用户正文；短于 512 字没有近似签名，只拦完全一致的提示词。
+内核把 Usage Policy 拒答报成 HTTP 400 `upstream_invalid_request` 时，日志仍按拒答归类，风险审计的「上游拒答」能看到这条 400。`Third-party apps now draw from your extra usage` 和 `no third-party apps allowed` 也是。它们常以 HTTP 400 或 503 出现，内核码仍是 `upstream_invalid_request` / `upstream_error`。不换号、不修复重试，永久写入拒答缓存；近似正文按同一阈值拦截。这是计费限制，不封 device。`content_policy`、`cyber_policy` 等错误码，包括只写在 `upstream_code` 里的，同样永久入库并带相似度签名。身份封禁开启时，拒答同时封入站 device id 和客户端 Session id。指纹列表显示当时的用户原文，并可打开对应请求日志；Jev 行还显示送审 `state`。近似比较去掉提醒、`# Environment` 和工具回传后的用户正文；短于 512 字没有近似签名，只拦完全一致的提示词。
 
-三种命中都是不可自动重试的 400 `policy_blocked`，`code` 仍是 `refusal_guard`，避免 Claude Code 误提示 `/login`。原文后面追加原因，`details.reason` 为：
+缓存命中都是不可自动重试的 400 `policy_blocked`，`code` 仍是 `refusal_guard`，避免 Claude Code 误提示 `/login`。原文后面追加原因，`details.reason` 为：
 
 - `exact`：当前提示词与曾被拒答的内容完全一致
 - `similar`：相似，`details.score` 是 0–1 的估计 Jaccard，文案里写成百分比
-- `device`：该设备此前已被封禁，`details.ban_reason` 是当时写入的原因（如 `jev:safety`、`hard_regex:jailbreak`）
+- `device`：该设备此前已被封禁
+- `session`：该客户端 Session 此前已被封禁
+
+`details.source: "jev"` 表示命中的是 Jev 拦截缓存；上游缓存行在面板中显示 `source=upstream` 和实际错误码。
 
 ## 决策模型
 
-最后一道。题库是三题：使用政策、色情、破限与攻击。破限、逆向、破解、渗透和网络攻击合成一题。三题各自打分，高分表示安全，任一题低于阈值就拦。色情没有 0.08 的近失放行；色情命中会写入 device 封禁，即使总开关关掉也写。不读 `system`、`instructions`、`# Environment` 和已闭合的 `<system-reminder>`。未闭合的提醒标签不当成提醒，后面的用户句子留下。多轮时最后一条用户正文再标成 `[current ask]`，避免长历史把当前意图挤出送审窗口。低于阈值才拦，返回 403。`keyword` 只是命中的题。模型不返回命中片段；请求详情里的「决策模型送审正文」是当时 POST 的 `state`（最多 64000 字，含历史用户句），不是模型指出的那一句。用户文本同样不含工具回传。
+最后一道。题库最多五题，当前内置三题：使用政策、色情、破限与攻击。破限、逆向、破解、渗透和网络攻击合成一题。三题各自打分，高分表示安全，任一题低于阈值就拦。色情没有 0.08 的近失放行；色情命中会写入拒答缓存并封 device + Session，即使总开关关掉也写。不读 `system`、`instructions`、`# Environment` 和已闭合的 `<system-reminder>`。未闭合的提醒标签不当成提醒，后面的用户句子留下。多轮时最后一条用户正文再标成 `[current ask]`，避免长历史把当前意图挤出送审窗口。低于阈值才拦，返回 403。`keyword` 只是命中的题。模型不返回命中片段；请求详情里的「Jev 拦截提问内容」是当时 POST 的 `state`（最多 64000 字，含历史用户句），不是模型指出的那一句。用户文本同样不含工具回传。
 
 使用政策题按近期上游拒答改过：轴承、编码器、测量臂这类机械句，以及普通编程，不拦。违法协助、武器、诈骗、儿童性剥削仍拦。
 
@@ -90,5 +93,5 @@
 | 哪些账号进关卡 | 风险审计 → 账号范围 |
 | 蒸馏开关、收割包装、针、附加正则、结构下限、赛题正则、返回文案 | 风险审计 → 蒸馏 |
 | 类别正则、硬正则总开关 | 风险审计 → 硬正则 |
-| 拒答缓存、相似度、device 封禁 | 风险审计 → 拒答缓存 |
+| 拒答缓存、相似度、device + Session 封禁 | 风险审计 → 拒答缓存 |
 | 决策模型地址、阈值、失败放行 | 风险审计 → 决策模型 |

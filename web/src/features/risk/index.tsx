@@ -306,7 +306,7 @@ export function RiskAuditPage() {
                   onDirtyChange={onDirtyChange}
                 />
               ) : stage.id === 'refusal' ? (
-                <RefusalSettings />
+                <RefusalSettings onOpenLog={open} />
               ) : (
                 <ModelSettings onDirtyChange={onDirtyChange} />
               )}

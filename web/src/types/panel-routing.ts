@@ -1,3 +1,4 @@
+import type { UsageLogRow } from '@/types/panel-usage-logs'
 import type { RuntimeType } from '@/types/panel-vm'
 
 /** `routing.compatibility.persona_preset`。PUT 严格匹配，不做别名归一化。 */
@@ -66,7 +67,7 @@ export type DistillRules = {
   fingerprints: string[]
 }
 
-/** `GET/PUT /api/panel/refusal-guards`。上游 AUP 指纹缓存，独立于蒸馏拦截。 */
+/** `GET/PUT /api/panel/refusal-guards`。拒答缓存按上游/Jev来源区分。 */
 export type RefusalGuardItem = {
   fingerprint: string
   model: string
@@ -74,12 +75,26 @@ export type RefusalGuardItem = {
   last_seen_at: string
   hit_count: number
   source_request_id: string | null
+  source: 'upstream' | 'jev'
+  error_code: string | null
+  error_status: number | null
   error_message: string | null
   preview: string | null
+  source_log?: UsageLogRow | null
 }
 
 export type RefusalDeviceBlock = {
   device_id: string
+  first_seen_at: string
+  last_seen_at: string
+  hit_count: number
+  source_request_id: string | null
+  fingerprint: string | null
+  reason: string | null
+}
+
+export type RefusalSessionBlock = {
+  session_id: string
   first_seen_at: string
   last_seen_at: string
   hit_count: number
@@ -98,6 +113,8 @@ export type RefusalGuardConfig = {
   items: RefusalGuardItem[]
   device_count: number
   devices: RefusalDeviceBlock[]
+  session_count: number
+  sessions: RefusalSessionBlock[]
 }
 
 export type PolicyQuestion = {

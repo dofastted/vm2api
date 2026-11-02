@@ -24,7 +24,7 @@ export const STAGES: { id: StageId; name: string; does: string }[] = [
   {
     id: 'jev',
     name: '决策模型',
-    does: '三题各自打分，任一题低于阈值就拦。色情命中会封设备。',
+    does: '最多五题各自打分，任一题低于阈值就拦。命中会写拒答缓存并封 device + Session。',
   },
 ]
 

@@ -1,9 +1,12 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type { RefusalGuardConfig } from '@/types/panel-routing'
+import type { UsageLogRow } from '@/types/panel-usage-logs'
+import { ExternalLink } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { fmtExpiresAt } from '@/lib/format'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { ConfirmDialog } from '@/components/confirm-dialog'
@@ -19,13 +22,21 @@ function shortFp(fp: string) {
 }
 
 /** Changes here save immediately: each switch and list action is one PUT/DELETE. */
-export function RefusalSettings() {
+export function RefusalSettings({
+  onOpenLog,
+}: {
+  onOpenLog: (row: UsageLogRow) => void
+}) {
   const qc = useQueryClient()
   const q = useQuery(refusalGuardsQueryOptions())
   const [clearOpen, setClearOpen] = useState(false)
   const [clearDevicesOpen, setClearDevicesOpen] = useState(false)
+  const [clearSessionsOpen, setClearSessionsOpen] = useState(false)
   const [deleteFp, setDeleteFp] = useState<string | null>(null)
-  const [unblockId, setUnblockId] = useState<string | null>(null)
+  const [unblock, setUnblock] = useState<{
+    kind: 'device' | 'session'
+    id: string
+  } | null>(null)
 
   const save = useMutation({
     mutationFn: (patch: Partial<RefusalGuardConfig>) =>
@@ -71,15 +82,20 @@ export function RefusalSettings() {
     onError: (error: Error) => toast.error(error.message),
   })
 
-  const unblock = useMutation({
-    mutationFn: (deviceId: string) =>
-      api<RefusalGuardConfig>('/api/panel/refusal-device-blocks', {
-        method: 'DELETE',
-        body: JSON.stringify({ device_id: deviceId }),
-      }),
+  const removeBlock = useMutation({
+    mutationFn: ({ kind, id }: { kind: 'device' | 'session'; id: string }) =>
+      api<RefusalGuardConfig>(
+        `/api/panel/refusal-${kind === 'device' ? 'device-blocks' : 'session-blocks'}`,
+        {
+          method: 'DELETE',
+          body: JSON.stringify({
+            [kind === 'device' ? 'device_id' : 'session_id']: id,
+          }),
+        }
+      ),
     onSuccess: async () => {
-      toast.success('已解除 device 封禁')
-      setUnblockId(null)
+      toast.success('已解除身份封禁')
+      setUnblock(null)
       await qc.invalidateQueries({
         queryKey: refusalGuardsQueryOptions().queryKey,
       })
@@ -103,6 +119,22 @@ export function RefusalSettings() {
     onError: (error: Error) => toast.error(error.message),
   })
 
+  const clearSessions = useMutation({
+    mutationFn: () =>
+      api<RefusalGuardConfig>('/api/panel/refusal-session-blocks', {
+        method: 'DELETE',
+        body: JSON.stringify({ confirm: true }),
+      }),
+    onSuccess: async () => {
+      toast.success('已清空 Session 封禁')
+      setClearSessionsOpen(false)
+      await qc.invalidateQueries({
+        queryKey: refusalGuardsQueryOptions().queryKey,
+      })
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
+
   if (q.error) {
     return (
       <p className='p-4 text-sm text-destructive' role='alert'>
@@ -113,7 +145,9 @@ export function RefusalSettings() {
   if (!q.data) return <div className='h-40 animate-pulse bg-muted/40' />
   const data = q.data
   const devices = data.devices ?? []
+  const sessions = data.sessions ?? []
   const deviceCount = data.device_count ?? devices.length
+  const sessionCount = data.session_count ?? sessions.length
   const similarity = data.similarity ?? 90
   const deleting = data.items.find((item) => item.fingerprint === deleteFp)
 
@@ -121,7 +155,7 @@ export function RefusalSettings() {
     <div className='space-y-8 p-4'>
       <Group
         title='何时拦截'
-        hint='上游拒答过的正文记成指纹。精确命中直接 503；近似只比较用户正文，短于 512 字不做。改动立即生效。'
+        hint='上游拒答和 Jev 拦截的正文记成带来源的指纹。命中精确或近似内容、设备或 Session 封禁时直接 400；改动立即生效。'
       >
         <ToggleList>
           <ToggleItem label='拦截重复拒答' desc='REFUSAL_GUARD=0 会关掉整关'>
@@ -139,8 +173,8 @@ export function RefusalSettings() {
             />
           </ToggleItem>
           <ToggleItem
-            label='封禁 device'
-            desc='命中任一关后，这个 device 的任意 prompt 都不再 hop'
+            label='封禁 device + Session'
+            desc='命中拒答后同时封禁入站 device 和客户端 Session，任一身份的新 prompt 都不再 hop'
           >
             <Switch
               checked={data.device_block_enabled !== false}
@@ -176,7 +210,7 @@ export function RefusalSettings() {
         </ToggleList>
       </Group>
 
-      <div className='grid gap-8 xl:grid-cols-2'>
+      <div className='grid gap-8 xl:grid-cols-3'>
         <Group
           title='已封禁 device'
           hint={
@@ -218,7 +252,9 @@ export function RefusalSettings() {
                     size='sm'
                     variant='ghost'
                     className='cursor-pointer'
-                    onClick={() => setUnblockId(item.device_id)}
+                    onClick={() =>
+                      setUnblock({ kind: 'device', id: item.device_id })
+                    }
                   >
                     解除
                   </Button>
@@ -228,13 +264,65 @@ export function RefusalSettings() {
           ) : null}
         </Group>
         <Group
-          title='拒答指纹'
+          title='已封禁 Session'
+          hint={
+            sessionCount
+              ? sessions.length < sessionCount
+                ? `显示最近 ${sessions.length} / ${sessionCount}`
+                : `${sessionCount} 个`
+              : '还没有'
+          }
+          action={
+            <Button
+              size='sm'
+              variant='outline'
+              className='cursor-pointer'
+              disabled={!sessionCount || clearSessions.isPending}
+              onClick={() => setClearSessionsOpen(true)}
+            >
+              全部解除
+            </Button>
+          }
+        >
+          {sessions.length ? (
+            <ul className='max-h-80 divide-y overflow-y-auto rounded-xl border'>
+              {sessions.map((item) => (
+                <li
+                  key={item.session_id}
+                  className='flex items-center justify-between gap-2 px-3 py-2'
+                >
+                  <div className='min-w-0 flex-1'>
+                    <p className='truncate font-mono text-xs'>
+                      {item.session_id}
+                    </p>
+                    <p className='text-xs text-muted-foreground tabular-nums'>
+                      {item.reason || 'refusal_guard'} · 命中 {item.hit_count} ·{' '}
+                      {fmtExpiresAt(item.last_seen_at)}
+                    </p>
+                  </div>
+                  <Button
+                    size='sm'
+                    variant='ghost'
+                    className='cursor-pointer'
+                    onClick={() =>
+                      setUnblock({ kind: 'session', id: item.session_id })
+                    }
+                  >
+                    解除
+                  </Button>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </Group>
+        <Group
+          title='拒答缓存'
           hint={
             data.count
               ? data.items.length < data.count
                 ? `显示最近 ${data.items.length} / ${data.count}`
                 : `${data.count} 条`
-              : '还没有上游拒答'
+              : '还没有拒答'
           }
           action={
             <Button
@@ -244,7 +332,7 @@ export function RefusalSettings() {
               disabled={!data.count || clear.isPending}
               onClick={() => setClearOpen(true)}
             >
-              清空指纹
+              清空缓存
             </Button>
           }
         >
@@ -256,6 +344,16 @@ export function RefusalSettings() {
                   className='flex items-center justify-between gap-2 px-3 py-2'
                 >
                   <div className='min-w-0 flex-1'>
+                    <div className='mb-1 flex items-center gap-2'>
+                      <Badge variant='outline' className='text-[10px]'>
+                        {item.source === 'jev' ? 'Jev 拦截' : '上游 API error'}
+                      </Badge>
+                      {item.error_code ? (
+                        <span className='truncate font-mono text-[10px] text-muted-foreground'>
+                          {item.error_code}
+                        </span>
+                      ) : null}
+                    </div>
                     <p
                       className='line-clamp-3 text-sm break-words'
                       title={item.preview || undefined}
@@ -275,14 +373,29 @@ export function RefusalSettings() {
                       {item.hit_count} · {fmtExpiresAt(item.last_seen_at)}
                     </p>
                   </div>
-                  <Button
-                    size='sm'
-                    variant='ghost'
-                    className='cursor-pointer'
-                    onClick={() => setDeleteFp(item.fingerprint)}
-                  >
-                    删除
-                  </Button>
+                  <div className='flex shrink-0 flex-col gap-1'>
+                    {item.source_log ? (
+                      <Button
+                        size='sm'
+                        variant='ghost'
+                        className='cursor-pointer gap-1 px-2 text-xs'
+                        onClick={() =>
+                          item.source_log && onOpenLog(item.source_log)
+                        }
+                      >
+                        <ExternalLink className='size-3' aria-hidden='true' />
+                        查看日志
+                      </Button>
+                    ) : null}
+                    <Button
+                      size='sm'
+                      variant='ghost'
+                      className='cursor-pointer'
+                      onClick={() => setDeleteFp(item.fingerprint)}
+                    >
+                      删除
+                    </Button>
+                  </div>
                 </li>
               ))}
             </ul>
@@ -304,12 +417,23 @@ export function RefusalSettings() {
         open={clearDevicesOpen}
         onOpenChange={setClearDevicesOpen}
         title='解除全部 device 封禁'
-        desc='解除后这些 device 可以再次请求。拒答指纹还在，相同或足够近似的正文仍会被拦。'
+        desc='解除后这些 device 可以再次请求。拒答缓存还在，相同或足够近似的正文仍会被拦。'
         confirmText='全部解除'
         cancelBtnText='取消'
         destructive
         isLoading={clearDevices.isPending}
         handleConfirm={() => clearDevices.mutate()}
+      />
+      <ConfirmDialog
+        open={clearSessionsOpen}
+        onOpenChange={setClearSessionsOpen}
+        title='解除全部 Session 封禁'
+        desc='解除后这些客户端 Session 可以再次请求。拒答缓存还在，相同或足够近似的正文仍会被拦。'
+        confirmText='全部解除'
+        cancelBtnText='取消'
+        destructive
+        isLoading={clearSessions.isPending}
+        handleConfirm={() => clearSessions.mutate()}
       />
       <ConfirmDialog
         open={!!deleteFp}
@@ -327,18 +451,18 @@ export function RefusalSettings() {
         }}
       />
       <ConfirmDialog
-        open={!!unblockId}
+        open={!!unblock}
         onOpenChange={(open) => {
-          if (!open) setUnblockId(null)
+          if (!open) setUnblock(null)
         }}
-        title='解除这个 device'
-        desc={`解除后 ${unblockId || ''} 的新请求不再因为 device 封禁被拦。`}
+        title={`解除这个${unblock?.kind === 'session' ? ' Session' : ' device'}`}
+        desc={`解除后 ${unblock?.id || ''} 的新请求不再因为身份封禁被拦。`}
         confirmText='解除'
         cancelBtnText='取消'
         destructive
-        isLoading={unblock.isPending}
+        isLoading={removeBlock.isPending}
         handleConfirm={() => {
-          if (unblockId) unblock.mutate(unblockId)
+          if (unblock) removeBlock.mutate(unblock)
         }}
       />
     </div>

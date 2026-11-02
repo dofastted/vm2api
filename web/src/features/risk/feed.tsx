@@ -83,9 +83,14 @@ export function RiskFeed({
               )}
               <span
                 className='col-start-2 min-w-0 truncate font-mono text-xs md:col-start-auto'
-                title={evidence}
+                title={kind === 'jev' && row.jevState ? row.jevState : evidence}
               >
-                {evidence || '—'}
+                <span className='block truncate'>{evidence || '—'}</span>
+                {kind === 'jev' && row.jevState ? (
+                  <span className='block truncate font-sans text-[11px] text-muted-foreground'>
+                    审查内容：{row.jevState}
+                  </span>
+                ) : null}
               </span>
               <span className='col-start-2 min-w-0 truncate text-xs text-muted-foreground md:col-start-auto md:text-right'>
                 {who(row)}

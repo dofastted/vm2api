@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- 风险审计增强：Jev 模型拦截写入独立的拒答缓存来源并保留 `jev_state`；上游拒答保存实际错误码/状态。拒答同时封禁入站 device 与客户端 Session，拒答指纹可直接打开对应日志，题库上限收紧为 5 题。
 - 修复 native cli-hop 最终请求未读取 `kernel.json.default_cache_ttl` 的回归：Web 设置的 `5m` / `1h` 现在传到 CLI 自有 system/tools 缓存断点；调用方保留的 message 断点不被覆盖。
 - #854：persona 注入的 Environment role=system 固定锚定首个 user，避免客户端下一轮不回传该临时块导致 cache prefix 从历史中段断开、每轮重写整段缓存。
 - 协议改写按请求体补 `inline-tools-2026-09-15`：`messages` 里出现 `tool_addition.tool.type=tool_definition` 时写入 cli-hop 的 `betas` 和直连 `anthropic-beta`。没有该块不加。修复上游 400 `a tool_definition requires anthropic-beta: inline-tools-2026-09-15`。
