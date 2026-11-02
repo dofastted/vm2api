@@ -27,7 +27,30 @@ type UsageRow = {
   output_tokens: number | null
   estimated_cost_nano_usd: number | null
 }
+type KeyUsage = {
+  masked_key: string
+  number: number
+  key_fingerprint: string
+  retired: boolean
+  requests: number
+  successful: number
+  estimated_cost_nano_usd: number
+  unknown_cost_requests: number
+  status: string
+  last_request_at: string | null
+  last_http_status: number | null
+}
+const keyStatus: Record<string, string> = {
+  normal: '正常请求',
+  insufficient_balance: '余额不足',
+  auth_error: '鉴权失败',
+  rate_limited: '请求限流',
+  request_error: '请求异常',
+  unrequested: '未请求',
+  paused: '已暂停',
+}
 type UsagePage = {
+  keys: KeyUsage[]
   started_at: string | null
   day: string
   total: Counts
@@ -68,6 +91,9 @@ export function JevUsagePanel({
     staleTime: 30_000,
   })
   const summary = query.data?.pages[0]
+  const keyLabels = new Map(
+    summary?.keys.map((key) => [key.key_fingerprint, key.masked_key])
+  )
   const rows = [
     ...new Map(
       (query.data?.pages.flatMap((page) => page.rows) ?? []).map((row) => [
@@ -113,6 +139,73 @@ export function JevUsagePanel({
         )}
         {summary && (
           <>
+            <section
+              className='space-y-3 rounded-md border p-4'
+              aria-label='当前 Key 用量'
+            >
+              <h3 className='text-sm font-medium'>当前 Key · 已消耗估算费用</h3>
+              <p className='text-xs text-muted-foreground'>
+                按当前已保存明细统计（30 天保留策略），金额为
+                USD，不是剩余余额。余额暂不可查询；未返回费用的请求不计入估算。状态依据最近请求，不能代表实时余额。
+              </p>
+              <div className='overflow-x-auto'>
+                <table className='w-full min-w-[680px] text-left text-xs'>
+                  <thead>
+                    <tr className='border-b'>
+                      <th className='p-2'>Key / 脱敏标识</th>
+                      <th className='p-2'>已消耗估算 · USD</th>
+                      <th className='p-2'>请求状态</th>
+                      <th className='p-2'>调用 / 成功</th>
+                      <th className='p-2'>费用未知</th>
+                      <th className='p-2'>最近请求 · 北京</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {summary.keys.map((key) => (
+                      <tr key={key.number} className='border-b'>
+                        <td className='p-2'>
+                          Key {key.number}
+                          <br />
+                          <span className='font-mono'>{key.masked_key}</span>
+                        </td>
+                        <td className='p-2'>
+                          {key.requests === 0
+                            ? '暂无记录'
+                            : usageMoney(
+                                key.unknown_cost_requests === key.requests
+                                  ? null
+                                  : key.estimated_cost_nano_usd
+                              )}
+                        </td>
+                        <td className='p-2'>
+                          {keyStatus[key.status] ?? '未知状态'}
+                          {key.last_http_status
+                            ? ` · ${key.last_http_status}`
+                            : ''}
+                          {key.retired ? '（已暂停轮询）' : ''}
+                        </td>
+                        <td className='p-2'>
+                          {tokens(key.requests)} / {tokens(key.successful)}
+                        </td>
+                        <td className='p-2'>
+                          {tokens(key.unknown_cost_requests)} 次
+                        </td>
+                        <td className='p-2'>
+                          {key.last_request_at
+                            ? time(key.last_request_at)
+                            : '暂无记录'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              {summary.keys.length === 0 && (
+                <p className='text-xs text-muted-foreground'>
+                  当前未配置 Key。
+                </p>
+              )}
+            </section>
             <div className='grid grid-cols-2 gap-3 text-sm lg:grid-cols-4'>
               <div>
                 <div className='text-muted-foreground'>今日调用 · 北京时间</div>
@@ -160,7 +253,7 @@ export function JevUsagePanel({
                 <thead>
                   <tr className='border-b'>
                     <th className='p-2'>时间 · 北京</th>
-                    <th className='p-2'>Key 指纹</th>
+                    <th className='p-2'>Key 脱敏标识</th>
                     <th className='p-2'>模型</th>
                     <th className='p-2'>结果</th>
                     <th className='p-2'>输入 / 输出</th>
@@ -180,7 +273,11 @@ export function JevUsagePanel({
                         {time(row.created_at)}
                       </td>
                       <td className='p-2 font-mono'>
-                        {row.key_fingerprint || '无密钥'}
+                        {row.key_fingerprint
+                          ? keyLabels.has(row.key_fingerprint)
+                            ? keyLabels.get(row.key_fingerprint)
+                            : '已移除的 Key'
+                          : '无密钥'}
                       </td>
                       <td className='p-2'>{row.model || '未返回'}</td>
                       <td className='p-2'>

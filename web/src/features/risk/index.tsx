@@ -156,7 +156,7 @@ export function RiskAuditPage() {
 
       {view === 'all' || view === 'jev' ? (
         <div className='mt-6'>
-          <JevUsagePanel />
+          <JevUsagePanel defaultOpen />
         </div>
       ) : null}
 

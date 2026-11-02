@@ -22,6 +22,21 @@ function markup(errors = 0, open = true) {
       {
         started_at: '2026-10-25T00:00:00.000Z',
         day: '2026-10-25',
+        keys: [
+          {
+            number: 1,
+            masked_key: 'demo********1234',
+            key_fingerprint: 'abcdef123456',
+            retired: false,
+            requests: 1,
+            successful: 0,
+            estimated_cost_nano_usd: 0,
+            unknown_cost_requests: 1,
+            status: 'insufficient_balance',
+            last_request_at: '2026-10-25T01:00:00.000Z',
+            last_http_status: 402,
+          },
+        ],
         total: counts,
         today: counts,
         storage_errors_since_start: errors,
@@ -67,10 +82,15 @@ describe('JEV usage display', () => {
     expect(html).toContain('此前未保存的历史用量无法补回')
     expect(html).toContain('未知不等于免费')
   })
-  it('shows a fingerprint and unknown usage for unsuccessful calls', () => {
+  it('uses the same masked key in both tables and shows unknown usage for unsuccessful calls', () => {
     const html = markup()
-    expect(html).toContain('abcdef123456')
+    expect(html).not.toContain('abcdef123456')
+    expect(html.match(/demo\*{8}1234/g)).toHaveLength(2)
     expect(html).toContain('402')
+    expect(html).toContain('demo********1234')
+    expect(html).toContain('余额不足')
+    expect(html).toContain('余额暂不可查询')
+    expect(html).toContain('30 天保留策略')
     expect(html).toContain('未返回')
     expect(html).toContain('未知')
   })
