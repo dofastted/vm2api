@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.4.036 — 2026-11-03
+
+- #850：官方 Claude Code 在「官方 Claude Code 家族透传」关闭时被重写后，入站不带 `ttl` 的缓存断点不再以隐式 5m 出站。渲染前按会话已解析的 TTL（协议页全局值或入站显式值）补齐，调用方显式 `5m` / `1h` 保留，补齐结果仍满足 1h 在 5m 前、最多四点。cli-hop、HTTP hop 与 API 直连一致；透传打开时不经过这一步。
+- 入站统一收成标准 Anthropic 结构再按槽位档重写，回到 1.4.00 的官方档标准（billing、身份、harness、guidance，调用方 system 接在后面）。官方家族识别本身不再跳过重写，只有协议页透传开关打开才保留官方家族入站 system、billing 与 UA；API 直连与 cli-hop / HTTP 走同一道门。修复 #843 → 1.4.033 → 1.4.034 来回改动后各路径判断不一致（cli-hop 已重写、前置层仍按“已识别即保留”处理，Claude Code 的无 TTL 断点被当成 5m 写入，会话超过 5 分钟即整段重写缓存）。
+- 移除未文档化的 `x-kin-strict-passthrough` 请求头：调用方不能再用它跳过入站剥离与客户端指纹清洗。
+- 修复 native cli-hop 最终请求未读取 `kernel.json.default_cache_ttl` 的回归：Web 设置的 `5m` / `1h` 现在传到 CLI 自有 system/tools 缓存断点；调用方保留的 message 断点不被覆盖。
+- #863 / #864：风险审计的决策模型用量按当前配置的每把 JEV key 列出请求数、成功数、估算消耗和最近状态（正常、余额不足、鉴权失败、限流、请求错误、已暂停、未请求）。key 只显示前 4 位和后 4 位，不回传完整 key 或地址。
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
 ## 1.4.035 — 2026-11-03
 
 - 清理：删除零引用导出 `rewriteTelemetryBody`、`persistVmFingerprint`（REQ-CLEANUP-01 D-08），无行为变化。

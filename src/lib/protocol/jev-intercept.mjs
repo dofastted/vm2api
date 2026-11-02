@@ -1402,7 +1402,8 @@ export function publicJevKeys(config) {
     .filter((target) => target.apiKey)
     .map((target, index) => ({
       number: index + 1,
-      masked_key: target.apiKey.length >= 12 ? `${target.apiKey.slice(0, 4)}********${target.apiKey.slice(-4)}` : '********',
+      masked_key:
+        target.apiKey.length >= 12 ? `${target.apiKey.slice(0, 4)}********${target.apiKey.slice(-4)}` : '********',
       key_fingerprint: jevKeyFingerprint(target.apiKey),
       retired: retiredJevKeys.has(target.id),
     }))

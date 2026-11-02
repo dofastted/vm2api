@@ -12,6 +12,7 @@ import {
   validateCacheBreakpoints,
 } from '../../src/lib/protocol/cache-ttl.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
+import { OFFICIAL_CLAUDE_CLI_UA } from '../../src/lib/identity/vm-identity.mjs'
 import { clearCachePrefixSessions } from '../../src/lib/protocol/cache-prefix.mjs'
 
 const unixTest = process.platform === 'win32' ? test.skip : test
@@ -849,3 +850,91 @@ for (const backend of ['cli', 'api']) {
     assert.ok(out.system.some((block) => block.text === `Custom: ${rule}`))
   })
 }
+
+// Recognized Claude Code with official_cc_passthrough off is rewritten. Its
+// ttl-less markers mean "not chosen" and must not reach the wire as implicit 5m.
+const officialHeaders = { 'user-agent': OFFICIAL_CLAUDE_CLI_UA, 'anthropic-beta': 'claude-code-20250219' }
+const officialInput = (messages, tools) => ({
+  system: [
+    text('x-anthropic-billing-header: cc_version=2.1.303.abc; cc_entrypoint=cli; cch=0f0f0;', null),
+    text("You are Claude Code, Anthropic's official CLI for Claude.", undefined),
+  ],
+  metadata: {
+    user_id: JSON.stringify({ device_id: 'd'.repeat(64), session_id: '11111111-2222-4333-8444-555555555555' }),
+  },
+  messages,
+  ...(tools ? { tools } : {}),
+})
+// Claude Code marks the current turn and, on longer sessions, the previous user turn.
+const officialHistory = (tailTtl, { markPrevious = false } = {}) =>
+  history().map((message, i, all) => {
+    const tail = i === all.length - 1
+    if (!tail && !(markPrevious && i === all.length - 3)) return message
+    return { ...message, content: [text(message.content[0].text, tail ? tailTtl : undefined)] }
+  })
+
+for (const backend of ['cli', 'api']) {
+  const run = backend === 'api' ? unixTest : test
+  for (const [tailTtl, menu, expected] of [
+    [undefined, '1h', '1h'],
+    [undefined, '5m', '5m'],
+    ['5m', '1h', '5m'],
+    ['1h', '5m', '1h'],
+  ]) {
+    run(
+      `${backend} rewritten official tail ${tailTtl ?? 'without TTL'} under menu ${menu} goes out as ${expected}`,
+      async (t) => {
+        const out = await outbound(t, {
+          preset: 'official_full',
+          backend,
+          headers: officialHeaders,
+          compatibility: { cache_ttl: menu },
+          input: officialInput(officialHistory(tailTtl)),
+        })
+        assert.ok(!JSON.stringify(out).includes('cch=0f0f0'))
+        assert.deepEqual(out.messages.at(-1).content.at(-1).cache_control, control(expected))
+        assert.ok(listCacheMarkers(out).every((marker) => marker.ttl != null))
+      },
+    )
+  }
+  run(`${backend} rewritten official keeps four ordered breakpoints after filling TTLs`, async (t) => {
+    const tools = [{ name: 'Read', input_schema: { type: 'object' }, cache_control: control() }]
+    const out = await outbound(t, {
+      preset: 'official_full',
+      backend,
+      headers: officialHeaders,
+      input: officialInput(officialHistory(undefined, { markPrevious: true }), tools),
+    })
+    assert.ok(listCacheMarkers(out).length <= 4)
+    assert.ok(listCacheMarkers(out).every((marker) => marker.ttl === '1h'))
+    assert.deepEqual(out.messages.at(-1).content.at(-1).cache_control, control('1h'))
+  })
+}
+
+unixTest('API official passthrough keeps the caller marker without a TTL', async (t) => {
+  const out = await outbound(t, {
+    preset: 'official_full',
+    backend: 'api',
+    headers: officialHeaders,
+    compatibility: { official_cc_passthrough: true },
+    input: officialInput(officialHistory(undefined)),
+  })
+  assert.ok(JSON.stringify(out).includes('cch=0f0f0'))
+  assert.deepEqual(out.messages.at(-1).content.at(-1).cache_control, control())
+})
+
+test('a caller header cannot skip the inbound rewrite', async (t) => {
+  const out = await outbound(t, {
+    preset: 'official',
+    headers: { 'user-agent': 'hermes-agent/1.0', 'x-kin-strict-passthrough': '1' },
+    input: {
+      system: 'You are Hermes Agent by Nous Research.',
+      tools: [{ name: 'terminal', input_schema: { type: 'object' } }],
+    },
+  })
+  assert.ok(!JSON.stringify(out).includes('Hermes Agent'))
+  assert.deepEqual(
+    out.tools.map((tool) => tool.name),
+    ['mcp__terminal'],
+  )
+})

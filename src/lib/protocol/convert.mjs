@@ -317,10 +317,7 @@ export function normalizeOpenAIToolsOnMessages(body) {
 export function toClaudeMessages(protocol, body, opts = { rewrite: false, model_map: true }) {
   if (protocol === 'anthropic.messages' && !opts.rewrite) {
     const normalized = normalizeOpenAIToolsOnMessages(body)
-    const out = sanitizeAnthropicBody(normalized, {
-      strictPassthrough: opts.strict_passthrough,
-      preserveContentShape: opts.preserve_content_shape === true,
-    })
+    const out = sanitizeAnthropicBody(normalized, { preserveContentShape: opts.preserve_content_shape === true })
     if (!out.max_tokens) out.max_tokens = defaultMaxTokensForModel(out.model)
     return { claude: withUpstreamStream(out), mode: inboundHasOpenAIToolShape(body) ? 'convert' : 'passthrough' }
   }

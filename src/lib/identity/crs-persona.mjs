@@ -2205,10 +2205,9 @@ export function applyCrsUnofficialPersona(
   } = {},
 ) {
   if (!body || typeof body !== 'object') return body
-  // Recognized official Claude Code keeps its inbound system and cache markers.
-  // #843 forced this through persona and left ttl-less caller markers, which
-  // Anthropic bills as implicit 5m. forceConfigured still rewrites on purpose.
-  if (!forceConfigured && (officialClient || isOfficialClaudeCodeTraffic(headers || {}, body))) return body
+  // Looking like Claude Code is not passthrough. The handler sets officialClient
+  // only when routing.compatibility.official_cc_passthrough is on.
+  if (!forceConfigured && officialClient) return body
   const fromFile = routingFile ? personaOptionsFromRoutingFile(routingFile) : null
   const resolved = normalizePersonaMode(mode ?? fromFile?.mode)
   // Read the caller's agent prompt before stripLeakySystem drops it as known official text.
