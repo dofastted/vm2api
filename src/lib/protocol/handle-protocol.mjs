@@ -118,7 +118,7 @@ import {
   extractFirstUserText,
   isOfficialClaudeCodeTraffic,
   isProxiedOfficialClaudeCode,
-  officialCcPassthroughFromRouting,
+  officialBodyPolicy,
   personaHidesUsageFromRoutingFile,
   standingUsageFromRoutingFile,
   personaModeFromRoutingFile,
@@ -952,7 +952,13 @@ export function createHandleProtocol(deps) {
       logBag.error_message = error.body.error.message
       return json(res, error.status, error.body)
     }
-    if (!requestContext && officialTraffic && officialCcPassthroughFromRouting(getRouting())) {
+    const preOutboundPolicy = officialBodyPolicy({
+      backend: inferenceBackend === 'api' ? 'api' : 'slot-http',
+      requestContext,
+      officialTraffic,
+      routing: getRouting() || {},
+    })
+    if (preOutboundPolicy.validateCacheBreakpoints) {
       try {
         validateCacheBreakpoints(ctx.body)
       } catch (error) {
@@ -1091,9 +1097,10 @@ export function createHandleProtocol(deps) {
         personaIn.messages.some(
           (message) => Array.isArray(message?.content) && message.content.some((block) => block?.cache_control != null),
         ))
-    if (!requestContext)
+    if (!preOutboundPolicy.skipPrePersona) {
       ctx.body = applyCrsUnofficialPersona(ctx.body, {
-        officialClient: officialTraffic,
+        officialClient: preOutboundPolicy.prePersonaOfficialClient,
+        forceConfigured: preOutboundPolicy.prePersonaForceConfigured,
         routingFile: routingConfigPath,
         cacheTtl: requestedCacheTtl,
         headers: req.headers,
@@ -1101,39 +1108,15 @@ export function createHandleProtocol(deps) {
         model: ctx.body?.model,
         cliVersion: OFFICIAL_CLI_VERSION,
       })
+    }
     let personaHideTokens = requestContext
       ? 0
       : personaHideForUnofficial(personaIn, ctx.body, {
-          officialClient: officialTraffic,
+          officialClient: preOutboundPolicy.prePersonaOfficialClient,
           mode: personaMode,
           hides: personaHidesUsageFromRoutingFile(routingConfigPath),
           standing: standingUsageFromRoutingFile(routingConfigPath),
         })
-    // API direct still cleans recognized official traffic when the passthrough
-    // switch is off. cli-hop does not: rewriting it dropped message TTLs to 5m.
-    if (
-      inferenceBackend === 'api' &&
-      !requestContext &&
-      officialTraffic &&
-      !officialCcPassthroughFromRouting(getRouting() || {})
-    ) {
-      ctx.body = applyCrsUnofficialPersona(ctx.body, {
-        officialClient: false,
-        forceConfigured: true,
-        routingFile: routingConfigPath,
-        cacheTtl: requestedCacheTtl,
-        headers: req.headers,
-        sessionId: outboundSessionId,
-        model: ctx.body?.model,
-        cliVersion: OFFICIAL_CLI_VERSION,
-      })
-      personaHideTokens = personaHideForUnofficial(personaIn, ctx.body, {
-        officialClient: false,
-        mode: personaMode,
-        hides: personaHidesUsageFromRoutingFile(routingConfigPath),
-        standing: standingUsageFromRoutingFile(routingConfigPath),
-      })
-    }
 
     if (inferenceBackend === 'api') {
       // API 直连走平台端点，不经过槽位；门禁与 api-kernel hop 同位，勿提前于 credential/intercept 链
@@ -1443,8 +1426,14 @@ export function createHandleProtocol(deps) {
           // cli-node receives the cleaned body after this boundary. Keep every
           // thinking block on the first hop and only let a repaired retry strip it.
           const preserveCliHopThinkingBlocks = !repaired
-          const officialPassthrough = officialTraffic && officialCcPassthroughFromRouting(routingNow)
           const cliHop = resolveOfficialCcInference(selected.vm, routingNow) === 'cli-hop'
+          const slotOutboundPolicy = officialBodyPolicy({
+            backend: cliHop ? 'cli-hop' : 'slot-http',
+            requestContext,
+            officialTraffic,
+            routing: routingNow,
+            modeOverride: Boolean(modeOverride),
+          })
           const resolvedPersona = resolveSlotPersonaPreset(selected.vm, routingNow)
           const preserveCallerEnvironment = !presetFlagEnabled(
             routingNow?.compatibility,
@@ -1456,7 +1445,7 @@ export function createHandleProtocol(deps) {
             // The front rewrite already produces the official two-block shape.
             const outboundProfile = profileForPreset(resolvedPersona)
             // Render once from caller input with the selected slot's identity, not the pre-selection environment.
-            if (!requestContext && !officialTraffic) {
+            if (slotOutboundPolicy.cliHopApplyPersona) {
               hopBody = applyCrsUnofficialPersona(prepareCliPersonaInput(structuredClone(personaIn), resolvedPersona), {
                 forceConfigured: true,
                 routingFile: routingConfigPath,
@@ -1482,7 +1471,7 @@ export function createHandleProtocol(deps) {
               preserveCallerEnvironment,
               autoCompactWindow: ctx.autoCompactWindow,
               routing: routingNow,
-              personaPreset: !requestContext && !officialTraffic ? resolvedPersona : null,
+              personaPreset: slotOutboundPolicy.cliHopApplyPersona ? resolvedPersona : null,
             })
             if (!requestContext) {
               hopBody = ensureBillingAttribution(hopBody, {
@@ -1537,7 +1526,7 @@ export function createHandleProtocol(deps) {
           }
 
           cacheTtl = requestedCacheTtl
-          if (!requestContext && !officialPassthrough && (modeOverride || officialTraffic)) {
+          if (slotOutboundPolicy.slotHttpApplyPersona) {
             const configuredMode = modeOverride || resolveSlotPersonaPreset(selected.vm, routingNow)
             const rewritten = applyCrsUnofficialPersona(structuredClone(personaIn), {
               officialClient: false,

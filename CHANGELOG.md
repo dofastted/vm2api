@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 清理：官方×透传判定收口为单一决策函数（REQ-CLEANUP-01 C-02/C-03），行为等价，补矩阵测试。
 - #836：`ensureSlotGuestBinDir` 原子替换失败时清理 `${dest}.${pid}.tmp` 暂存文件，避免 `data/run/slot-guest-bin` 下残留堆积。
 
 ## 1.4.033 — 2026-11-02

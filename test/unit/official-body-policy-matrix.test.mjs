@@ -10,7 +10,7 @@ import test from 'node:test'
 import {
   applyCrsUnofficialPersona,
   CRS_OFFICIAL_SYSTEM,
-  officialCcPassthroughFromRouting,
+  officialBodyPolicy,
 } from '../../src/lib/identity/crs-persona.mjs'
 import { personaHideForUnofficial } from '../../src/lib/identity/crs-persona-usage.mjs'
 import { OFFICIAL_303_HARNESS } from '../../src/lib/identity/official-profiles.mjs'
@@ -73,7 +73,7 @@ function personaTemplateApplied(body) {
   return texts.some((t) => t === OFFICIAL_303_HARNESS || t.includes('prompt_version='))
 }
 
-/** Mirrors handle-protocol.mjs L955 + L1094–1136 + slot branches (pre-refactor). */
+/** Mirrors handle-protocol persona/cache policy via officialBodyPolicy. */
 function legacyOfficialBodyPipeline({
   backend,
   officialTraffic,
@@ -87,16 +87,27 @@ function legacyOfficialBodyPipeline({
 }) {
   const routing = JSON.parse(fs.readFileSync(routingFile, 'utf8'))
   const personaMode = personaModeFromRoutingFile(routingFile)
-  const officialPassthrough = officialTraffic && officialCcPassthroughFromRouting(routing)
-  const shouldValidateCacheBreakpoints =
-    !requestContext && officialTraffic && officialCcPassthroughFromRouting(routing)
+  const prePolicy = officialBodyPolicy({
+    backend: backend === 'api' ? 'api' : 'slot-http',
+    requestContext,
+    officialTraffic,
+    routing,
+  })
+  const slotPolicy = officialBodyPolicy({
+    backend: backend === 'cli-hop' ? 'cli-hop' : 'slot-http',
+    requestContext,
+    officialTraffic,
+    routing,
+    modeOverride,
+  })
 
   let body = structuredClone(personaIn)
   const inboundSnapshot = structuredClone(personaIn)
 
-  if (!requestContext) {
+  if (!prePolicy.skipPrePersona) {
     body = applyCrsUnofficialPersona(body, {
-      officialClient: officialTraffic,
+      officialClient: prePolicy.prePersonaOfficialClient,
+      forceConfigured: prePolicy.prePersonaForceConfigured,
       routingFile,
       cacheTtl,
       headers,
@@ -108,39 +119,14 @@ function legacyOfficialBodyPipeline({
   let personaHideTokens = requestContext
     ? 0
     : personaHideForUnofficial(inboundSnapshot, body, {
-        officialClient: officialTraffic,
+        officialClient: prePolicy.prePersonaOfficialClient,
         mode: personaMode,
         hides: personaHidesUsageFromRoutingFile(routingFile),
         standing: standingUsageFromRoutingFile(routingFile),
       })
 
   const prePersonaBody = structuredClone(body)
-  let apiSecondPass = false
-
-  if (
-    backend === 'api' &&
-    !requestContext &&
-    officialTraffic &&
-    !officialCcPassthroughFromRouting(routing)
-  ) {
-    apiSecondPass = true
-    body = applyCrsUnofficialPersona(body, {
-      officialClient: false,
-      forceConfigured: true,
-      routingFile,
-      cacheTtl,
-      headers,
-      sessionId: 'matrix-session',
-      model: body?.model,
-      cliVersion: OFFICIAL_CLI_VERSION,
-    })
-    personaHideTokens = personaHideForUnofficial(inboundSnapshot, body, {
-      officialClient: false,
-      mode: personaMode,
-      hides: personaHidesUsageFromRoutingFile(routingFile),
-      standing: standingUsageFromRoutingFile(routingFile),
-    })
-  }
+  const apiSecondPass = prePolicy.prePersonaForceConfigured
 
   let slotPersonaPass = false
   let cliHopPersonaPass = false
@@ -148,7 +134,7 @@ function legacyOfficialBodyPipeline({
 
   if (backend === 'cli-hop') {
     hopBody = body
-    if (!requestContext && !officialTraffic) {
+    if (slotPolicy.cliHopApplyPersona) {
       cliHopPersonaPass = true
       hopBody = applyCrsUnofficialPersona(structuredClone(personaIn), {
         forceConfigured: true,
@@ -164,12 +150,12 @@ function legacyOfficialBodyPipeline({
       cacheTtl,
       stream: true,
       requestContext,
-      personaPreset: !requestContext && !officialTraffic ? 'official' : null,
+      personaPreset: slotPolicy.cliHopApplyPersona ? 'official' : null,
     })
     if (officialTraffic) personaHideTokens = 0
   } else if (backend === 'slot-http') {
     hopBody = body
-    if (!requestContext && !officialPassthrough && (modeOverride || officialTraffic)) {
+    if (slotPolicy.slotHttpApplyPersona) {
       slotPersonaPass = true
       const configuredMode = modeOverride || 'official'
       const rewritten = applyCrsUnofficialPersona(structuredClone(personaIn), {
@@ -195,8 +181,8 @@ function legacyOfficialBodyPipeline({
   const outbound = backend === 'api' ? body : hopBody
 
   return {
-    shouldValidateCacheBreakpoints,
-    officialPassthrough,
+    shouldValidateCacheBreakpoints: prePolicy.validateCacheBreakpoints,
+    officialPassthrough: slotPolicy.officialPassthrough,
     prePersonaChanged: systemSignature(prePersonaBody) !== systemSignature(personaIn),
     apiSecondPass,
     slotPersonaPass,
@@ -258,11 +244,13 @@ for (const row of MATRIX) {
         }
 
         if (row.officialTraffic && !row.passthrough) {
-          assert.equal(result.prePersonaChanged, false, 'first pass still short-circuits on officialClient')
           if (row.backend === 'api') {
-            assert.equal(result.apiSecondPass, true)
+            assert.equal(result.apiSecondPass, true, 'api uses single forceConfigured pre-persona (C-03)')
+            assert.equal(result.prePersonaChanged, true)
             assert.equal(result.personaTemplateApplied, true)
             assert.equal(result.personaHideTokens, 0, 'current api force rewrite leaves personaHideTokens at 0')
+          } else {
+            assert.equal(result.prePersonaChanged, false, 'non-api pre-persona still short-circuits on officialClient')
           }
           if (row.backend === 'cli-hop') {
             assert.equal(result.cliHopPersonaPass, false, 'cli-hop ignores passthrough switch')
@@ -297,6 +285,43 @@ for (const row of MATRIX) {
   })
 }
 
+for (const row of MATRIX) {
+  const label = `flags ${row.backend} official=${row.officialTraffic} passthrough=${row.passthrough}${
+    row.modeOverride ? ' modeOverride' : ''
+  }`
+  test(`officialBodyPolicy decision: ${label}`, () => {
+    const routing = {
+      compatibility: {
+        official_cc_passthrough: row.passthrough,
+      },
+    }
+    const pre = officialBodyPolicy({
+      backend: row.backend === 'api' ? 'api' : 'slot-http',
+      officialTraffic: row.officialTraffic,
+      routing,
+    })
+    assert.equal(pre.validateCacheBreakpoints, row.officialTraffic && row.passthrough)
+    assert.equal(pre.prePersonaForceConfigured, row.backend === 'api' && row.officialTraffic && !row.passthrough)
+    if (row.backend === 'api') return
+    const slot = officialBodyPolicy({
+      backend: row.backend,
+      officialTraffic: row.officialTraffic,
+      routing,
+      modeOverride: row.modeOverride,
+    })
+    if (row.backend === 'cli-hop') {
+      assert.equal(slot.cliHopApplyPersona, !row.officialTraffic)
+      assert.equal(slot.slotHttpApplyPersona, false)
+    } else {
+      assert.equal(slot.cliHopApplyPersona, false)
+      assert.equal(
+        slot.slotHttpApplyPersona,
+        !(row.officialTraffic && row.passthrough) && (row.modeOverride || row.officialTraffic),
+      )
+    }
+  })
+}
+
 test('legacy pipeline: api official passthrough off applies persona once at backend (C-03)', () => {
   withRouting(
     { persona_preset: 'official', overlay_preset: 'off', cache_ttl: '1h', official_cc_passthrough: false },
@@ -311,7 +336,7 @@ test('legacy pipeline: api official passthrough off applies persona once at back
         headers: OFFICIAL_HEADERS,
       })
       assert.equal(result.apiSecondPass, true)
-      assert.equal(result.prePersonaChanged, false)
+      assert.equal(result.prePersonaChanged, true)
       assert.notEqual(systemSignature(inbound), systemSignature(result.outbound))
     },
   )

@@ -1732,6 +1732,38 @@ export function officialFamilyBodyPassthrough(officialTraffic, routing = {}) {
   return officialTraffic === true && officialCcPassthroughFromRouting(routing)
 }
 
+/**
+ * Single decision surface for official Claude Code traffic × passthrough switch
+ * across api / slot-http / cli-hop outbound paths (REQ-CLEANUP-01 C-02/C-03).
+ */
+export function officialBodyPolicy({
+  backend = 'slot-http',
+  requestContext = null,
+  officialTraffic = false,
+  routing = {},
+  modeOverride = false,
+} = {}) {
+  const passthroughOn = officialCcPassthroughFromRouting(routing)
+  const officialPassthrough = officialTraffic === true && passthroughOn
+  const hasRequestContext = requestContext != null && requestContext !== false
+
+  const apiForcePersona = backend === 'api' && !hasRequestContext && officialTraffic === true && !passthroughOn
+
+  return {
+    validateCacheBreakpoints: !hasRequestContext && officialTraffic === true && passthroughOn,
+    skipPrePersona: hasRequestContext,
+    prePersonaOfficialClient: apiForcePersona ? false : officialTraffic === true,
+    prePersonaForceConfigured: apiForcePersona,
+    cliHopApplyPersona: backend === 'cli-hop' && !hasRequestContext && officialTraffic !== true,
+    slotHttpApplyPersona:
+      backend === 'slot-http' &&
+      !hasRequestContext &&
+      !officialPassthrough &&
+      (modeOverride === true || officialTraffic === true),
+    officialPassthrough,
+  }
+}
+
 function stripSystemCacheControl(body) {
   if (!Array.isArray(body.system)) return body
   let changed = false
