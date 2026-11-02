@@ -5,8 +5,10 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
+import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
 import { JevUsageRepo } from '../../src/lib/db/repos/jev-usage-repo.mjs'
 import { normalizeJevUsage } from '../../src/lib/protocol/jev-usage.mjs'
+import { publicJevKeys } from '../../src/lib/protocol/jev-intercept.mjs'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 
 test('JEV actual panel route enforces roles, sanitization and pagination', async (t) => {
@@ -19,6 +21,11 @@ test('JEV actual panel route enforces roles, sanitization and pagination', async
   fs.mkdirSync(dataDir)
   const passed = []
   openDatabase({ dataDir })
+  new SettingsRepo().set('jev_intercept', {
+    provider: 'jev',
+    base_url: 'https://api.typesafe.ai',
+    api_keys: ['DO_NOT_EXPOSE_FIRST', 'DO_NOT_EXPOSE_SECOND'],
+  })
   const repo = new JevUsageRepo()
   for (const extra of [{}, { http_status: 402, outcome: 'http_error', usage: null }]) {
     repo.record(
@@ -74,6 +81,12 @@ test('JEV actual panel route enforces roles, sanitization and pagination', async
   assert.equal(result.body.data.total.successful, 1)
   assert.equal(result.body.data.total.unknown_usage_requests, 1)
   assert.equal(result.body.data.rows.length, 2)
+  assert.equal(result.body.data.keys.length, 2)
+  assert.equal(result.body.data.keys[0].masked_key, 'DO_N********IRST')
+  assert.equal(result.body.data.keys[1].masked_key, 'DO_N********COND')
+  assert.equal(result.body.data.keys[0].status, 'unrequested')
+  assert.match(result.body.data.keys[0].key_fingerprint, /^[a-f0-9]{12}$/)
+  assert.notEqual(result.body.data.keys[0].key_fingerprint, result.body.data.keys[1].key_fingerprint)
   assert.equal(result.body.data.rows.find((row) => row.http_status === 402).estimated_cost_nano_usd, null)
   assert.ok(!JSON.stringify(result.body).includes('DO_NOT_EXPOSE_'))
   passed.push('admin sees exact totals, unknowns and sanitized rows')
@@ -85,7 +98,12 @@ test('JEV actual panel route enforces roles, sanitization and pagination', async
   const cursor = first.body.data.next_cursor
   const next = await request(
     admin,
-    '?' + new URLSearchParams({ limit: '1', cursor_created_at: cursor.created_at, cursor_id: cursor.id }),
+    '?' +
+      new URLSearchParams({
+        limit: '1',
+        cursor_created_at: cursor.created_at,
+        cursor_id: cursor.id,
+      }),
   )
   assert.equal(next.body.data.rows.length, 1)
   assert.notEqual(next.body.data.rows[0].id, first.body.data.rows[0].id)
@@ -98,4 +116,18 @@ test('JEV actual panel route enforces roles, sanitization and pagination', async
   assert.equal(missing.body.data.total.requests, 2)
   passed.push('filter does not alter global totals')
   assert.equal(passed.length, 9)
+})
+
+test('masked key labels never expose short credentials or endpoint URLs', () => {
+  const rows = publicJevKeys({
+    provider: 'jev',
+    base_url: 'https://api.typesafe.ai',
+    api_keys: ['tiny', 'https://example.test token-abcdefghijk'],
+  })
+  assert.equal(rows[0].masked_key, '********')
+  assert.equal(rows[1].masked_key, 'toke********hijk')
+  const serialized = JSON.stringify(rows)
+  assert.ok(!serialized.includes('tiny'))
+  assert.ok(!serialized.includes('token-abcdefghijk'))
+  assert.ok(!serialized.includes('example.test'))
 })
