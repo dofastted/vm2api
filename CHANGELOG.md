@@ -6,6 +6,7 @@
 
 - 透传关闭时，任何入站都先收成标准 Anthropic 结构再进人设：调用方 billing 删掉并由项目重写；调用方 User-Agent 不出站。只有协议页打开官方家族透传才保留这两者。第三方工具名改为 `mcp__`，回包按原名还原。
 - #836：`ensureSlotGuestBinDir` 原子替换失败时清理 `${dest}.${pid}.tmp` 暂存文件，避免 `data/run/slot-guest-bin` 下残留堆积。
+- #854：persona 重渲染注入的 `# Environment` role=system 消息改为锚定在首个 user 之后（原为最后一个 user 之后）。客户端下一轮不会回传该临时块，旧位置的 content block 数量变化会让 cache prefix 在历史中段断开、整段重写 cache；位置固定后前缀稳定。zero 模板保持原有尾部位置。
 
 已部署机升级：只更新 Node 控制面后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
