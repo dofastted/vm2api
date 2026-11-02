@@ -68,17 +68,6 @@ function contentToText(content) {
   return content?.text || ''
 }
 
-export function isClaudeMessagesShape(body) {
-  return !!(
-    body &&
-    typeof body === 'object' &&
-    Array.isArray(body.messages) &&
-    typeof body.max_tokens === 'number' &&
-    !('input' in body) &&
-    !('choices' in body)
-  )
-}
-
 /** OpenAI tools → Claude tools. Server search maps to web_search_20250305; function tools stay client tools. */
 export function openaiToolsToClaude(tools) {
   if (!Array.isArray(tools) || !tools.length) return undefined

@@ -20,7 +20,6 @@ export const CODEX_SEARCH_URL = 'https://chatgpt.com/backend-api/codex/alpha/sea
 export const CODEX_IMAGE_GENERATIONS_URL = 'https://chatgpt.com/backend-api/codex/images/generations'
 export const CODEX_IMAGE_EDITS_URL = 'https://chatgpt.com/backend-api/codex/images/edits'
 export const CHATGPT_MODELS_URL = CODEX_MODELS_URL
-export const CHATGPT_MODELS_URLS = Object.freeze([CODEX_MODELS_URL])
 export const CODEX_OAUTH_TOKEN_URL = 'https://auth.openai.com/oauth/token'
 export const CODEX_OAUTH_AUTHORIZE_URL = 'https://auth.openai.com/oauth/authorize'
 export const CODEX_OAUTH_DESKTOP_AUTH_URL = 'https://chatgpt.com/codex/desktop-auth'
