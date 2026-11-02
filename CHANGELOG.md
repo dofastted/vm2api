@@ -2,9 +2,15 @@
 
 ## Unreleased
 
+## 1.4.035 — 2026-11-03
+
 - 清理：删除零引用导出 `rewriteTelemetryBody`、`persistVmFingerprint`（REQ-CLEANUP-01 D-08），无行为变化。
+- #847：官方用量只返回 weekly 窗口时不再当成残缺结果丢掉。缺 5 小时窗口保持未知；窗口给了但读不出来仍算无效。
 - #848：修复 Docker/KVM guest OAuth 换票把控制面的宿主 loopback SOCKS 地址传给 `kin-oauth-auth`，导致容器内连接 `127.0.0.1` 被拒；Linux guest 改由槽位 `kin-eg-*` 透明出口选路，macOS native 路径不变。
 - #854：persona 重渲染注入的 `# Environment` role=system 消息改为锚定在首个 user 之后（原为最后一个 user 之后）。客户端下一轮不会回传该临时块，旧位置的 content block 数量变化会让 cache prefix 在历史中段断开、整段重写 cache；位置固定后前缀稳定。zero 模板保持原有尾部位置。
+- #861：面板 `usage_logs` 大查询改到只读 worker，失败时回退同步读。请求 finish 和 hop 尝试先入队，再在同一条写连接上分批提交，避免另开写连接撞上 `SQLITE_BUSY`。
+
+已部署机升级：只更新 Node 控制面后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
 ## 1.4.034 — 2026-11-02
 
