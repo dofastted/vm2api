@@ -360,6 +360,9 @@ for (const preset of ['zero', 'official', 'official_full', 'custom']) {
 }
 
 for (const preset of ['zero', 'official', 'official_full', 'custom']) {
+  // zero keeps Environment at the tail, so caller indexes stay put. Other presets
+  // insert it after the first user and shift every later message by one.
+  const shift = preset === 'zero' ? 0 : 1
   for (const ttl of [undefined, '5m']) {
     test(`CLI ${preset} retains caller 1h and ${ttl ?? 'implicit 5m'} through session history edits`, async (t) => {
       clearCachePrefixSessions()
@@ -370,9 +373,12 @@ for (const preset of ['zero', 'official', 'official_full', 'custom']) {
       for (const edited of [false, true, true]) {
         if (edited) messages[6].content[0].text = 'edited m6'
         const out = await outbound(t, { preset, headers, input: { messages, system: rule } })
-        assert.deepEqual(messageMarkers(out), messageMarkers({ messages }))
-        assert.deepEqual(out.messages[2], messages[2])
-        assert.deepEqual(out.messages[8], messages[8])
+        assert.deepEqual(
+          messageMarkers(out),
+          messageMarkers({ messages }).map((marker) => ({ ...marker, index: marker.index + shift })),
+        )
+        assert.deepEqual(out.messages[2 + shift], messages[2])
+        assert.deepEqual(out.messages[8 + shift], messages[8])
         assert.equal(JSON.stringify(out).split(rule).length - 1, 1)
       }
     })
@@ -384,13 +390,13 @@ for (const preset of ['zero', 'official', 'official_full', 'custom']) {
     const first = await outbound(t, { preset, headers, input: { messages } })
     assert.deepEqual(
       messageMarkers(first).map((marker) => marker.index),
-      [6, 8],
+      [6 + shift, 8 + shift],
     )
     messages[3].content[0].text = 'edited m3'
     const next = await outbound(t, { preset, headers, input: { messages } })
     assert.deepEqual(
       messageMarkers(next).map((marker) => marker.index),
-      [2, 8],
+      [2 + shift, 8 + shift],
     )
     assert.ok(messageMarkers(next).every((marker) => marker.ttl === '1h'))
   })

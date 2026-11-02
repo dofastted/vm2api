@@ -1111,10 +1111,10 @@ test('Environment is a role=system message only for models that accept mid-conve
       )
       assert.deepEqual(
         out.messages.map((message) => message.role),
-        ['user', 'assistant', 'user', 'system'],
+        ['user', 'system', 'assistant', 'user'],
         model,
       )
-      assert.match(out.messages.at(-1).content, /^# Environment/, model)
+      assert.match(out.messages[1].content, /^# Environment/, model)
       assert.equal(
         out.system.some((block) => String(block.text).includes('# Environment')),
         false,
