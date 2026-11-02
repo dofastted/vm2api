@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- 协议改写按请求体补 `inline-tools-2026-09-15`：`messages` 里出现 `tool_addition.tool.type=tool_definition` 时写入 cli-hop 的 `betas` 和直连 `anthropic-beta`。没有该块不加。修复上游 400 `a tool_definition requires anthropic-beta: inline-tools-2026-09-15`。
 
 ## 1.4.036 — 2026-11-03
 
