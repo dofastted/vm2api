@@ -312,7 +312,95 @@ test('native Anthropic API backend keeps endpoint headers and applies the 1M pol
   assert.equal(envelope.headers['anthropic-beta'], 'context-1m-2025-08-07,oauth-2025-04-20,future-beta')
 
   // claude-sonnet-5 passes context-1m under the default model policy.
+  // Caller UA is not forwarded. Missing billing is stamped at the pinned CLI version.
   assert.equal((await run('claude-sonnet-5', {})).ok, true)
   assert.equal(envelope.headers['anthropic-beta'], 'oauth-2025-04-20,context-1m-2025-08-07,future-beta')
+  assert.equal(envelope.headers['user-agent'], 'claude-cli/2.1.303 (external, cli)')
+  assert.match(JSON.parse(envelope.body).system[0].text, /^x-anthropic-billing-header:/)
+  assert.match(JSON.parse(envelope.body).system[0].text, /cc_version=2\.1\.303\./)
+
+  const hermesBody = {
+    model: 'claude-sonnet-5',
+    max_tokens: 32,
+    system: 'You are Hermes, a Nous Research agent.',
+    messages: [{ role: 'user', content: 'hi' }],
+  }
+  assert.equal(
+    (
+      await runApiInference({
+        req: { headers: { 'user-agent': 'hermes-agent/0.13.0' } },
+        cfg: { paths: { data: temp } },
+        scheduler: {
+          pick: () => ({
+            ok: true,
+            endpoint: {
+              id: 'fixture',
+              kind: 'claude',
+              protocol: 'anthropic',
+              base_url: 'https://fixture.invalid',
+              headers: {},
+            },
+            upstream_model: hermesBody.model,
+            key: { id: 'fixture', api_key: 'fixture-key' },
+          }),
+        },
+        store: {},
+        protocol: 'anthropic.messages',
+        inbound: hermesBody,
+        convertedBody: toClaudeMessages('anthropic.messages', hermesBody, { rewrite: false }).claude,
+        converters: { createClaudeMessageAssembler, applyClaudeSSELineToMessage },
+        clientStream: false,
+        timeoutMs: 3000,
+      })
+    ).ok,
+    true,
+  )
+  assert.equal(envelope.headers['user-agent'], 'claude-cli/2.1.303 (external, cli)')
+  assert.doesNotMatch(JSON.stringify(envelope.headers), /hermes-agent/i)
+  const hermesOut = JSON.parse(envelope.body)
+  assert.match(hermesOut.system[0].text, /^x-anthropic-billing-header:/)
+  assert.match(JSON.stringify(hermesOut.system), /You are Hermes/)
+
+  const officialBody = {
+    model: 'claude-sonnet-5',
+    max_tokens: 32,
+    system: [{ type: 'text', text: 'x-anthropic-billing-header: cc_version=2.1.278.abc; cc_entrypoint=sdk-cli;' }],
+    messages: [{ role: 'user', content: 'hi' }],
+  }
+  assert.equal(
+    (
+      await runApiInference({
+        req: { headers: { 'user-agent': 'hermes-agent/0.13.0' } },
+        cfg: { paths: { data: temp } },
+        scheduler: {
+          pick: () => ({
+            ok: true,
+            endpoint: {
+              id: 'fixture',
+              kind: 'claude',
+              protocol: 'anthropic',
+              base_url: 'https://fixture.invalid',
+              headers: {},
+            },
+            upstream_model: officialBody.model,
+            key: { id: 'fixture', api_key: 'fixture-key' },
+          }),
+        },
+        store: {},
+        protocol: 'anthropic.messages',
+        inbound: officialBody,
+        convertedBody: toClaudeMessages('anthropic.messages', officialBody, { rewrite: false }).claude,
+        converters: { createClaudeMessageAssembler, applyClaudeSSELineToMessage },
+        clientStream: false,
+        timeoutMs: 3000,
+      })
+    ).ok,
+    true,
+  )
   assert.equal(envelope.headers['user-agent'], 'claude-cli/2.1.278 (external, sdk-cli)')
+  assert.match(JSON.parse(envelope.body).system[0].text, /cc_version=2\.1\.278\./)
+  assert.equal(
+    JSON.parse(envelope.body).system.filter((block) => /x-anthropic-billing-header:/i.test(block.text)).length,
+    1,
+  )
 })

@@ -1187,6 +1187,9 @@ export function createHandleProtocol(deps) {
           personaHideTokens,
           cacheTtl,
           requestContext,
+          sessionId: outboundSessionId,
+          firstUserText,
+          entrypoint: ccEntrypointFromRouting(getRouting()),
           converters: {
             createClaudeMessageAssembler,
             applyClaudeSSELineToMessage,
