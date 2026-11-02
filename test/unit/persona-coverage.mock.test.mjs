@@ -81,7 +81,7 @@ test('official preset appends the configured prompt on every empty-system shape'
   })
 })
 
-test('official-looking traffic gets the configured prompt unless passthrough is on', () => {
+test('official-looking traffic keeps its system unless force-configured', () => {
   withRouting({ persona_preset: 'official', overlay_preset: 'off' }, (file) => {
     const headers = { 'user-agent': 'claude-cli/2.1.293 (external, cli)' }
     const body = {
@@ -98,9 +98,15 @@ test('official-looking traffic gets the configured prompt unless passthrough is 
       officialClient: true,
     })
     assert.match(kept.system[0].text, /cch=bdff0/)
-    const out = applyCrsUnofficialPersona(structuredClone(body), { routingFile: file, headers })
-    assertOfficial(out)
-    assert.ok(!JSON.stringify(out).includes('cch=bdff0'))
+    const recognized = applyCrsUnofficialPersona(structuredClone(body), { routingFile: file, headers })
+    assert.match(recognized.system[0].text, /cch=bdff0/)
+    const forced = applyCrsUnofficialPersona(structuredClone(body), {
+      routingFile: file,
+      headers,
+      forceConfigured: true,
+    })
+    assertOfficial(forced)
+    assert.ok(!JSON.stringify(forced).includes('cch=bdff0'))
   })
 })
 

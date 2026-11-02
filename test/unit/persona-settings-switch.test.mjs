@@ -237,7 +237,7 @@ test('persona_park checkbox writes and is hot-read', () => {
   })
 })
 
-test('official Claude Code inbound follows the settings radio unless passthrough is on', () => {
+test('official Claude Code inbound is unchanged for every settings radio', () => {
   const official = {
     system: [
       {
@@ -256,7 +256,8 @@ test('official Claude Code inbound follows the settings radio unless passthrough
       assert.equal(kept.system[0].text, official.system[0].text)
       assert.equal(kept.system.length, 1)
       const out = applyCrsUnofficialPersona(official, { routingFile: file, headers })
-      assert.notEqual(JSON.stringify(out.system ?? null), JSON.stringify(official.system))
+      assert.equal(out.system[0].text, official.system[0].text)
+      assert.equal(out.system.length, 1)
     }
   })
 })

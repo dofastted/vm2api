@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- #850：回滚 #843 对已识别官方 Claude Code 的 cli-hop 强制 persona。识别命中且未开「官方 Claude Code 家族透传」时，cli-hop 保留入站 system 和缓存断点，不再把无 TTL 的调用方断点留给上游当成隐式 5m。`forceConfigured` 仍可改写。API 直连在开关关闭时仍按原分支清洗。
+
 ## 1.4.032 — 2026-11-01
 
 - OpenAI GPT 模型页支持按上游 `priority` 档位公开 `<model>-fast` 别名；调度前还原基模型并发送 `service_tier: "priority"`。
