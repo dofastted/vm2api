@@ -1072,7 +1072,7 @@ export function createHandleProtocol(deps) {
     })
     const requestedCacheTtl = pinConversationCacheTtl(
       stickyKey || callerSession || outboundSessionId,
-      resolveCacheTtl({ headers: req.headers, body: inbound, routingFile: routingConfigPath }),
+      resolveCacheTtl({ headers: req.headers, body: inbound, routing: getRouting(), routingFile: routingConfigPath }),
     )
     let cacheTtl = requestedCacheTtl
     let preserveCacheBreakpoints = false
