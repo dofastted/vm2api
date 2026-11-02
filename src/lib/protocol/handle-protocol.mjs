@@ -118,7 +118,7 @@ import {
   extractFirstUserText,
   isOfficialClaudeCodeTraffic,
   isProxiedOfficialClaudeCode,
-  officialCcPassthroughFromRouting,
+  officialFamilyBodyPassthrough,
   personaHidesUsageFromRoutingFile,
   standingUsageFromRoutingFile,
   personaModeFromRoutingFile,
@@ -918,10 +918,13 @@ export function createHandleProtocol(deps) {
     const officialInbound =
       isOfficialClaudeCodeTraffic(req.headers, inbound) ||
       (detectProxiedOfficialCcFromRoutingFile(routingConfigPath) && isProxiedOfficialClaudeCode(inbound, req.headers))
+    // Recognition alone is not passthrough. Only the protocol-tab switch keeps
+    // the Claude Code family body; every other inbound is rewritten below.
+    const officialPassthrough = officialFamilyBodyPassthrough(officialInbound, getRouting())
     const converted = toClaudeMessages(protocol, ctx.body, {
       rewrite: rewriteEnabled,
       model_map: false,
-      preserve_content_shape: officialInbound,
+      preserve_content_shape: officialPassthrough,
     })
     stats.requests++
     stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
@@ -945,7 +948,6 @@ export function createHandleProtocol(deps) {
         return json(res, error.status, error.body)
       }
     } else ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
-    const officialPassthrough = officialTraffic && officialCcPassthroughFromRouting(getRouting())
     let inboundToolReverse = {}
     if (!requestContext && !officialPassthrough) {
       const standard = toStandardAnthropicBody(ctx.body, {
@@ -964,7 +966,7 @@ export function createHandleProtocol(deps) {
       logBag.error_message = error.body.error.message
       return json(res, error.status, error.body)
     }
-    if (!requestContext && officialTraffic && officialCcPassthroughFromRouting(getRouting())) {
+    if (!requestContext && officialPassthrough) {
       try {
         validateCacheBreakpoints(ctx.body)
       } catch (error) {
@@ -1105,7 +1107,8 @@ export function createHandleProtocol(deps) {
         ))
     if (!requestContext)
       ctx.body = applyCrsUnofficialPersona(ctx.body, {
-        officialClient: officialTraffic,
+        officialClient: officialPassthrough,
+        forceConfigured: !officialPassthrough,
         routingFile: routingConfigPath,
         cacheTtl: requestedCacheTtl,
         headers: req.headers,
@@ -1116,36 +1119,11 @@ export function createHandleProtocol(deps) {
     let personaHideTokens = requestContext
       ? 0
       : personaHideForUnofficial(personaIn, ctx.body, {
-          officialClient: officialTraffic,
+          officialClient: officialPassthrough,
           mode: personaMode,
           hides: personaHidesUsageFromRoutingFile(routingConfigPath),
           standing: standingUsageFromRoutingFile(routingConfigPath),
         })
-    // API direct still cleans recognized official traffic when the passthrough
-    // switch is off. cli-hop does not: rewriting it dropped message TTLs to 5m.
-    if (
-      inferenceBackend === 'api' &&
-      !requestContext &&
-      officialTraffic &&
-      !officialCcPassthroughFromRouting(getRouting() || {})
-    ) {
-      ctx.body = applyCrsUnofficialPersona(ctx.body, {
-        officialClient: false,
-        forceConfigured: true,
-        routingFile: routingConfigPath,
-        cacheTtl: requestedCacheTtl,
-        headers: req.headers,
-        sessionId: outboundSessionId,
-        model: ctx.body?.model,
-        cliVersion: OFFICIAL_CLI_VERSION,
-      })
-      personaHideTokens = personaHideForUnofficial(personaIn, ctx.body, {
-        officialClient: false,
-        mode: personaMode,
-        hides: personaHidesUsageFromRoutingFile(routingConfigPath),
-        standing: standingUsageFromRoutingFile(routingConfigPath),
-      })
-    }
 
     if (inferenceBackend === 'api') {
       // API 直连走平台端点，不经过槽位；门禁与 api-kernel hop 同位，勿提前于 credential/intercept 链
@@ -1456,7 +1434,6 @@ export function createHandleProtocol(deps) {
           // cli-node receives the cleaned body after this boundary. Keep every
           // thinking block on the first hop and only let a repaired retry strip it.
           const preserveCliHopThinkingBlocks = !repaired
-          const officialPassthrough = officialTraffic && officialCcPassthroughFromRouting(routingNow)
           const cliHop = resolveOfficialCcInference(selected.vm, routingNow) === 'cli-hop'
           const resolvedPersona = resolveSlotPersonaPreset(selected.vm, routingNow)
           const preserveCallerEnvironment = !presetFlagEnabled(
