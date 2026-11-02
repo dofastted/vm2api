@@ -311,8 +311,9 @@ test('native Anthropic API backend keeps endpoint headers and applies the 1M pol
   assert.equal((await run('claude-opus-4-7', { 'anthropic-beta': 'context-1m-2025-08-07' })).ok, true)
   assert.equal(envelope.headers['anthropic-beta'], 'context-1m-2025-08-07,oauth-2025-04-20,future-beta')
 
-  // claude-sonnet-5 passes context-1m under the default model policy.
+  // Caller UA stays off the wire unless passthrough is on.
   assert.equal((await run('claude-sonnet-5', {})).ok, true)
   assert.equal(envelope.headers['anthropic-beta'], 'oauth-2025-04-20,context-1m-2025-08-07,future-beta')
-  assert.equal(envelope.headers['user-agent'], 'claude-cli/2.1.278 (external, sdk-cli)')
+  assert.equal(envelope.headers['user-agent'], 'claude-cli/2.1.303 (external, sdk-cli)')
+  assert.doesNotMatch(String(envelope.headers['user-agent']), /2\.1\.278/)
 })

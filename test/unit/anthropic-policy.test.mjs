@@ -4,6 +4,8 @@ import {
   prepareAnthropicRequest,
   stripInvalidThinkingBlocks,
   rewriteToolNames,
+  scrubUpstreamClientBody,
+  toStandardAnthropicBody,
   restoreToolNames,
   restoreToolNamesInSSELine,
   sanitizeAnthropicBodyForBetaTokens,
@@ -710,6 +712,75 @@ test('valid unique tool names are not changed', () => {
     result.body.tools.map((tool) => tool.name),
     ['read_file', 'write_file'],
   )
+})
+
+test('third-party Hermes body is rewritten before the upstream hop', () => {
+  const result = scrubUpstreamClientBody({
+    system: [{ type: 'text', text: 'You are Hermes Agent from Nous Research. Use hermes-agent.' }],
+    tools: [
+      { name: 'read_file', description: 'Hermes Agent read' },
+      { name: 'mcp_filesystem_read', description: 'read' },
+      { type: 'web_search_20250305', name: 'web_search' },
+    ],
+    tool_choice: { type: 'tool', name: 'read_file' },
+    messages: [
+      { role: 'user', content: 'keep Hermes Agent in the user text' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 't1', name: 'mcp_filesystem_read', input: {} }],
+      },
+    ],
+  })
+  assert.equal(result.body.tools[0].name, 'mcp__read_file')
+  assert.equal(result.body.tools[1].name, 'mcp__filesystem_read')
+  assert.equal(result.body.tools[2].name, 'web_search')
+  assert.equal(result.body.tool_choice.name, 'mcp__read_file')
+  assert.equal(result.body.messages[1].content[0].name, 'mcp__filesystem_read')
+  assert.equal(result.reverse.mcp__read_file, 'read_file')
+  assert.equal(result.reverse.mcp__filesystem_read, 'mcp_filesystem_read')
+  assert.match(result.body.system[0].text, /Claude Code/)
+  assert.match(result.body.system[0].text, /Anthropic/)
+  assert.match(result.body.system[0].text, /claude-code/)
+  assert.doesNotMatch(result.body.system[0].text, /Hermes|Nous Research|hermes-agent/)
+  assert.equal(result.body.tools[0].description, 'Claude Code read')
+  assert.match(result.body.messages[0].content, /Hermes Agent/)
+})
+
+test('official Claude Code tool names stay, stray mcp_ names do not', () => {
+  const result = scrubUpstreamClientBody(
+    {
+      tools: [{ name: 'Bash' }, { name: 'mcp_filesystem_read' }],
+      messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: {} }] }],
+    },
+    { official: true },
+  )
+  assert.equal(result.body.tools[0].name, 'Bash')
+  assert.equal(result.body.tools[1].name, 'mcp__filesystem_read')
+  assert.equal(result.body.messages[0].content[0].name, 'Bash')
+  assert.equal(result.reverse.mcp__filesystem_read, 'mcp_filesystem_read')
+  assert.equal(result.reverse.Bash, undefined)
+})
+
+test('front clean rewrites Hermes into standard Anthropic blocks before persona', () => {
+  const result = toStandardAnthropicBody({
+    model: 'claude-sonnet-5',
+    max_tokens: 32,
+    system:
+      'x-anthropic-billing-header: cc_version=9.9.9; cc_entrypoint=local-agent;\nYou are Hermes Agent from Nous Research.',
+    extra_body: { drop: true },
+    tools: [{ name: 'read_file', description: 'Hermes Agent read', input_schema: { type: 'object' } }],
+    messages: [{ role: 'user', content: 'hi' }],
+  })
+  assert.equal(result.body.extra_body, undefined)
+  assert.equal(
+    result.body.system.some((block) => /x-anthropic-billing-header/i.test(block.text)),
+    false,
+  )
+  assert.match(result.body.system.map((block) => block.text).join('\n'), /Claude Code from Anthropic/)
+  assert.deepEqual(result.body.messages[0].content, [{ type: 'text', text: 'hi' }])
+  assert.equal(result.body.tools[0].name, 'mcp__read_file')
+  assert.equal(result.body.tools[0].description, 'Claude Code read')
+  assert.equal(result.reverse.mcp__read_file, 'read_file')
 })
 
 test('duplicate names keep one canonical reference as history grows', () => {

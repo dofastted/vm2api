@@ -168,6 +168,9 @@ import {
   prepareAnthropicRequest,
   enforceCacheLimit,
   rewriteToolNames,
+  scrubUpstreamClientBody,
+  toStandardAnthropicBody,
+  composeToolNames,
   restoreToolNames,
   restoreToolNamesInSSELine,
   wantsFastMode,
@@ -943,6 +946,16 @@ export function createHandleProtocol(deps) {
         return json(res, error.status, error.body)
       }
     } else ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
+    const officialPassthrough = officialTraffic && officialCcPassthroughFromRouting(getRouting())
+    let inboundToolReverse = {}
+    if (!requestContext && String(req.headers['x-kin-strict-passthrough'] || '') !== '1' && !officialPassthrough) {
+      const standard = toStandardAnthropicBody(ctx.body, {
+        official: officialTraffic === true,
+        rewriteTools: getRouting()?.compatibility?.tool_name_rewrite !== false,
+      })
+      ctx.body = standard.body
+      inboundToolReverse = standard.reverse
+    }
     try {
       validateToolChoice(ctx.body)
     } catch (error) {
@@ -1187,6 +1200,7 @@ export function createHandleProtocol(deps) {
           personaHideTokens,
           cacheTtl,
           requestContext,
+          passthrough: officialPassthrough,
           converters: {
             createClaudeMessageAssembler,
             applyClaudeSSELineToMessage,
@@ -1456,7 +1470,7 @@ export function createHandleProtocol(deps) {
             // The front rewrite already produces the official two-block shape.
             const outboundProfile = profileForPreset(resolvedPersona)
             // Render once from caller input with the selected slot's identity, not the pre-selection environment.
-            if (!requestContext && !officialTraffic) {
+            if (!requestContext && !officialPassthrough) {
               hopBody = applyCrsUnofficialPersona(prepareCliPersonaInput(structuredClone(personaIn), resolvedPersona), {
                 forceConfigured: true,
                 routingFile: routingConfigPath,
@@ -1482,7 +1496,7 @@ export function createHandleProtocol(deps) {
               preserveCallerEnvironment,
               autoCompactWindow: ctx.autoCompactWindow,
               routing: routingNow,
-              personaPreset: !requestContext && !officialTraffic ? resolvedPersona : null,
+              personaPreset: !requestContext && !officialPassthrough ? resolvedPersona : null,
             })
             if (!requestContext) {
               hopBody = ensureBillingAttribution(hopBody, {
@@ -1491,6 +1505,7 @@ export function createHandleProtocol(deps) {
                 cliVersion: outboundProfile.cliVersion,
                 indexes: billingIndexesFromMessages(hopBody.messages),
                 entrypoint: entrypointNow,
+                passthrough: officialPassthrough,
               })
             }
             hopBody = await materializeRemoteImageSources(hopBody)
@@ -1505,6 +1520,15 @@ export function createHandleProtocol(deps) {
                 vmId: selected.vmId,
                 epoch: attemptStartedAt,
               })
+            }
+            let clientToolNames = {}
+            if (!requestContext) {
+              const scrubbed = scrubUpstreamClientBody(hopBody, {
+                official: officialTraffic === true,
+                rewriteTools: routingNow?.compatibility?.tool_name_rewrite !== false,
+              })
+              hopBody = scrubbed.body
+              clientToolNames = scrubbed.reverse
             }
             preserveCacheBreakpoints = true
             // Native wire may mix TTLs or leave caller TTL absent. The menu is
@@ -1532,7 +1556,13 @@ export function createHandleProtocol(deps) {
             logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(hopBody) || attemptSessionId)
             return {
               body: hopBody,
-              meta: { toolNames: {}, sessionId: attemptSessionId, cliHop: true, requestContext, repaired },
+              meta: {
+                toolNames: composeToolNames(inboundToolReverse, clientToolNames),
+                sessionId: attemptSessionId,
+                cliHop: true,
+                requestContext,
+                repaired,
+              },
             }
           }
 
@@ -1609,7 +1639,14 @@ export function createHandleProtocol(deps) {
             requestId: logCtx.request_id,
           })
           logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(outbound) || attemptSessionId)
-          return { body: outbound, meta: { toolNames: prepared.toolNames, sessionId: attemptSessionId, repaired } }
+          return {
+            body: outbound,
+            meta: {
+              toolNames: composeToolNames(inboundToolReverse, prepared.toolNames),
+              sessionId: attemptSessionId,
+              repaired,
+            },
+          }
         },
         callAttempt: async ({ candidate, body, attemptMeta, deliveryMode: attemptDelivery, signal, onCommit }) => {
           if (!clientStream) {
