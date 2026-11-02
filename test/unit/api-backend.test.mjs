@@ -196,8 +196,6 @@ test('API backend applies the global official_full persona setting', async () =>
       roles: outbound.messages.map((m) => m.role),
     })
     assert.match(texts[0], /^x-anthropic-billing-header: /, shape)
-    assert.match(received.headers['user-agent'], /^claude-cli\/2\.1\.303 /)
-    assert.doesNotMatch(received.headers['user-agent'], /test-client/)
     assert.equal(texts[1], CRS_OFFICIAL_CLI_SYSTEM, shape)
     assert.ok(texts[2].startsWith(`${DEFAULT_AGENT_STANDING}\n${OFFICIAL_303_HARNESS}`), shape)
     assert.equal(

@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- API 直连不再透传调用方 User-Agent。第三方（含 Hermes）和官方 Messages 在缺 `x-anthropic-billing-header` 时补上，出站 UA 与 billing 的 `cc_version` / `cc_entrypoint` 对齐。端点自己配置的 User-Agent 仍优先。避免 Anthropic 把请求当成第三方应用并返回 extra usage 400。
+- 本站 API 入站的第三方请求（含 Hermes）和官方请求在出站前转写客户端指纹：system / 工具描述里的 Hermes Agent、Nous Research、hermes-agent 换成官方口径；第三方工具名改为 `mcp__`，官方 Claude Code 工具名保留，单独的 `mcp_` 仍改成 `mcp__`。回包按原名还原。避免上游把请求当成第三方应用并返回 extra usage 400。
 - #836：`ensureSlotGuestBinDir` 原子替换失败时清理 `${dest}.${pid}.tmp` 暂存文件，避免 `data/run/slot-guest-bin` 下残留堆积。
 
 ## 1.4.033 — 2026-11-02

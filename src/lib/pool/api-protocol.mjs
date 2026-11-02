@@ -1,5 +1,3 @@
-import { ensureBillingAttribution } from '../identity/crs-persona.mjs'
-import { OFFICIAL_CLI_VERSION, officialClaudeCliUa } from '../identity/vm-identity.mjs'
 import { officialMessagesBody } from '../protocol/anthropic-messages.mjs'
 import { prepareClassifierBody } from '../protocol/request-purpose.mjs'
 import { consumeClaudeSSEData } from '../protocol/convert.mjs'
@@ -44,11 +42,10 @@ function joinHeaderMap(headers = {}) {
 }
 
 /**
- * Native Anthropic Messages keeps caller protocol headers this gateway does not
- * own (betas, stainless, x-app). User-Agent is not one of them. Hermes and
- * other third-party clients would otherwise reach Anthropic as themselves and
- * draw extra usage instead of the Claude Code plan. The hop stamps a Claude
- * Code UA that matches the billing block, unless the endpoint configured one.
+ * Native Anthropic Messages is a compatibility boundary.  Keep protocol
+ * headers supplied by the caller, including beta names this gateway does not
+ * know yet.  Headers the operator configured on the endpoint win; anthropic-beta
+ * is the union of endpoint and caller tokens so neither opt-in is dropped.
  */
 function forwardAnthropicProtocolHeaders(headers = {}, protocol = '', protocolKind = '') {
   if (protocol !== 'anthropic.messages' || protocolKind !== 'anthropic') return {}
@@ -61,6 +58,7 @@ function forwardAnthropicProtocolHeaders(headers = {}, protocol = '', protocolKi
       !name.startsWith('x-stainless-') &&
       name !== 'x-app' &&
       name !== 'x-client-request-id' &&
+      name !== 'user-agent' &&
       name !== 'accept-language' &&
       name !== 'sec-fetch-mode'
     )
@@ -101,27 +99,6 @@ function mergeCallerProtocolHeaders(base = {}, caller = {}, configured = {}, mod
     out[name] = value
   }
   return out
-}
-
-function headerKey(headers, name) {
-  const want = String(name || '').toLowerCase()
-  return Object.keys(headers || {}).find((key) => key.toLowerCase() === want) || ''
-}
-
-/** UA version and entrypoint follow the billing block so Anthropic does not split them. */
-function claudeCodeUaForBody(body, entrypoint = 'cli') {
-  const system = body?.system
-  const texts =
-    typeof system === 'string'
-      ? [system]
-      : Array.isArray(system)
-        ? system.map((block) => (typeof block === 'string' ? block : String(block?.text || '')))
-        : []
-  const billing = texts.find((text) => /x-anthropic-billing-header:/i.test(text)) || ''
-  const version = /\bcc_version=(\d+\.\d+\.\d+)/.exec(billing)?.[1] || OFFICIAL_CLI_VERSION
-  const billedEntry = /\bcc_entrypoint=(sdk-cli|cli)\b/i.exec(billing)?.[1]
-  const resolved = (billedEntry || (entrypoint === 'sdk-cli' ? 'sdk-cli' : 'cli')).toLowerCase()
-  return officialClaudeCliUa(version, resolved === 'sdk-cli' ? 'sdk-cli' : 'cli')
 }
 
 async function readLines(stream, onLine) {
@@ -240,9 +217,6 @@ export async function runApiInference({
   cacheTtl,
   converters,
   requestContext = null,
-  sessionId = '',
-  firstUserText = '',
-  entrypoint = 'cli',
 } = {}) {
   const canonical = officialMessagesBody(convertedBody)
   const model = canonical.model
@@ -276,31 +250,20 @@ export async function runApiInference({
       },
     }
   }
-  let body = isOpenAI
+  const body = isOpenAI
     ? { ...claudeToOpenAIResponsesRequest({ ...canonical, model: picked.upstream_model }), stream: true }
     : { ...canonical, model: picked.upstream_model, stream: true }
   if (requestContext) Object.assign(body, prepareClassifierBody(body))
-  else if (!isOpenAI) {
-    body = ensureBillingAttribution(body, {
-      firstUserText,
-      cliVersion: OFFICIAL_CLI_VERSION,
-      sessionId,
-      entrypoint: entrypoint === 'sdk-cli' ? 'sdk-cli' : 'cli',
-    })
-  }
   const callerProtocolHeaders = forwardAnthropicProtocolHeaders(req?.headers, protocol, protocolKind)
-  const authHeaders = upstreamAuthHeaders(protocolKind, picked.key.api_key, {
-    ...extraHeaders,
-    auth_scheme: picked.endpoint.auth_scheme || extraHeaders.auth_scheme || extraHeaders.anthropic_apikey_auth_scheme,
-  })
-  if (protocolKind === 'anthropic' && !headerKey(authHeaders, 'user-agent')) {
-    authHeaders['user-agent'] = claudeCodeUaForBody(body, entrypoint)
-  }
   const headers = mergeCallerProtocolHeaders(
     {
       'content-type': 'application/json',
       accept: 'text/event-stream',
-      ...authHeaders,
+      ...upstreamAuthHeaders(protocolKind, picked.key.api_key, {
+        ...extraHeaders,
+        auth_scheme:
+          picked.endpoint.auth_scheme || extraHeaders.auth_scheme || extraHeaders.anthropic_apikey_auth_scheme,
+      }),
     },
     callerProtocolHeaders,
     extraHeaders,

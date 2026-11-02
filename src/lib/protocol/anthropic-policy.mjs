@@ -586,3 +586,113 @@ export function restoreToolNamesInSSELine(line, reverse = {}) {
   if (payload?.message) payload.message = restoreToolNames(payload.message, reverse)
   return `${prefix} ${JSON.stringify(payload)}`
 }
+
+const CLIENT_PROSE = [
+  ['Hermes Agent', 'Claude Code'],
+  ['Hermes agent', 'Claude Code'],
+  ['Nous Research', 'Anthropic'],
+]
+const CLIENT_SLUG = /(?<![\w./:@'"`-])hermes-agent(?![\w/@-]|\.\w)/g
+
+function scrubClientProse(text) {
+  let out = String(text ?? '')
+  for (const [from, to] of CLIENT_PROSE) {
+    if (out.includes(from)) out = out.split(from).join(to)
+  }
+  return out.replace(CLIENT_SLUG, 'claude-code')
+}
+
+/** Third-party tool names Anthropic bills as extra usage. Official CC names stay. */
+export function wireToolName(name, { official = false, rewriteTools = true } = {}) {
+  const raw = String(name || '')
+  if (!raw || raw.startsWith('mcp__')) return raw
+  if (raw.startsWith('mcp_')) return `mcp__${raw.slice(4)}`
+  if (official || rewriteTools === false) return raw
+  return `mcp__${raw}`
+}
+
+/**
+ * Hermes calls this gateway as a third-party Messages client and does not apply
+ * its own OAuth identity transform. Rewrite the outbound body before either hop:
+ * product strings leave system and tool text, and tool names land on mcp__.
+ * Official Claude Code keeps its own tool names; a stray mcp_ name is still fixed.
+ */
+export function scrubUpstreamClientBody(body, { official = false, rewriteTools = true } = {}) {
+  if (!body || typeof body !== 'object') return { body, reverse: {} }
+  const out = clone(body)
+  const reverse = {}
+  const used = new Set()
+  const assigned = new Map()
+  const rename = (name) => {
+    if (assigned.has(name)) return assigned.get(name)
+    let wire = wireToolName(name, { official, rewriteTools })
+    if (!wire) return name
+    if (wire !== name) {
+      const base = wireToolName(name, { official, rewriteTools })
+      let suffix = 2
+      while (used.has(wire)) wire = `${base}_${suffix++}`
+      reverse[wire] = name
+    }
+    used.add(wire)
+    assigned.set(name, wire)
+    return wire
+  }
+  if (typeof out.system === 'string') out.system = scrubClientProse(out.system)
+  else if (Array.isArray(out.system)) out.system = out.system.map((block) => scrubTextBlock(block))
+  if (Array.isArray(out.tools)) {
+    out.tools = out.tools.map((tool) => {
+      if (!tool || typeof tool !== 'object' || isAnthropicServerTool(tool)) return tool
+      const next = { ...tool }
+      if (typeof next.name === 'string') next.name = rename(next.name)
+      if (typeof next.description === 'string') next.description = scrubClientProse(next.description)
+      return next
+    })
+  }
+  if (out.tool_choice && typeof out.tool_choice === 'object' && typeof out.tool_choice.name === 'string') {
+    const name = rename(out.tool_choice.name)
+    if (name !== out.tool_choice.name) out.tool_choice = { ...out.tool_choice, name }
+  }
+  if (Array.isArray(out.messages)) {
+    out.messages = out.messages.map((message) => scrubMessage(message, rename))
+  }
+  return { body: out, reverse }
+}
+
+function scrubTextBlock(block) {
+  if (typeof block === 'string') {
+    const text = scrubClientProse(block)
+    return text === block ? block : text
+  }
+  if (!block || typeof block !== 'object' || typeof block.text !== 'string') return block
+  const text = scrubClientProse(block.text)
+  return text === block.text ? block : { ...block, text }
+}
+
+function scrubMessage(message, rename) {
+  if (!message || typeof message !== 'object') return message
+  const systemTurn = message.role === 'system'
+  if (typeof message.content === 'string') {
+    if (!systemTurn) return message
+    const content = scrubClientProse(message.content)
+    return content === message.content ? message : { ...message, content }
+  }
+  if (!Array.isArray(message.content)) return message
+  let changed = false
+  const content = message.content.map((block) => {
+    if (!block || typeof block !== 'object') return block
+    if (block.type === 'tool_use' && typeof block.name === 'string') {
+      const name = rename(block.name)
+      if (name !== block.name) {
+        changed = true
+        return { ...block, name }
+      }
+    }
+    if (systemTurn) {
+      const next = scrubTextBlock(block)
+      if (next !== block) changed = true
+      return next
+    }
+    return block
+  })
+  return changed ? { ...message, content } : message
+}

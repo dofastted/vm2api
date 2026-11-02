@@ -6,9 +6,9 @@ import { officialMessagesBody } from './anthropic-messages.mjs'
 import {
   prepareAnthropicRequest,
   rewriteToolNames,
+  scrubUpstreamClientBody,
   sanitizeAnthropicBodyForBetaTokens,
   ensureFastModeBeta,
-  ensureClearThinkingContextManagement,
   stripInvalidThinkingBlocks,
   alignSamplingWithThinking,
   modelSupportsMidConversationSystem,
@@ -505,8 +505,17 @@ export function prepareOutboundAttempt({
   cleaned = stripIllegalCacheControlFields(cleaned)
   if (cacheTtl) cleaned = applyCacheTtlToBody(cleaned, cacheTtl)
   cleaned = enforceCacheTtlOrder(cleaned)
-  const tools = rewriteToolNames(cleaned, { enabled: toolNameRewrite !== false })
-  return { body: tools.body, toolNames: tools.reverse }
+  const scrubbed = scrubUpstreamClientBody(cleaned, {
+    official: !unofficial,
+    rewriteTools: toolNameRewrite !== false,
+  })
+  const tools = rewriteToolNames(scrubbed.body, { enabled: toolNameRewrite !== false })
+  const toolNames = {}
+  for (const [wire, mid] of Object.entries(tools.reverse)) {
+    const client = scrubbed.reverse[mid] || mid
+    if (client !== wire) toolNames[wire] = client
+  }
+  return { body: tools.body, toolNames }
 }
 
 export function prepareOutboundHeaders(reqHeaders, homeDir, identity, model, { credentialMode, want1m } = {}) {

@@ -168,6 +168,7 @@ import {
   prepareAnthropicRequest,
   enforceCacheLimit,
   rewriteToolNames,
+  scrubUpstreamClientBody,
   restoreToolNames,
   restoreToolNamesInSSELine,
   wantsFastMode,
@@ -1187,9 +1188,6 @@ export function createHandleProtocol(deps) {
           personaHideTokens,
           cacheTtl,
           requestContext,
-          sessionId: outboundSessionId,
-          firstUserText,
-          entrypoint: ccEntrypointFromRouting(getRouting()),
           converters: {
             createClaudeMessageAssembler,
             applyClaudeSSELineToMessage,
@@ -1509,6 +1507,15 @@ export function createHandleProtocol(deps) {
                 epoch: attemptStartedAt,
               })
             }
+            let clientToolNames = {}
+            if (!requestContext) {
+              const scrubbed = scrubUpstreamClientBody(hopBody, {
+                official: officialTraffic === true,
+                rewriteTools: routingNow?.compatibility?.tool_name_rewrite !== false,
+              })
+              hopBody = scrubbed.body
+              clientToolNames = scrubbed.reverse
+            }
             preserveCacheBreakpoints = true
             // Native wire may mix TTLs or leave caller TTL absent. The menu is
             // not an accounting authority; retain the upstream 5m/1h split.
@@ -1535,7 +1542,7 @@ export function createHandleProtocol(deps) {
             logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(hopBody) || attemptSessionId)
             return {
               body: hopBody,
-              meta: { toolNames: {}, sessionId: attemptSessionId, cliHop: true, requestContext, repaired },
+              meta: { toolNames: clientToolNames, sessionId: attemptSessionId, cliHop: true, requestContext, repaired },
             }
           }
 
