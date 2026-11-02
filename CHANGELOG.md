@@ -3,6 +3,7 @@
 ## Unreleased
 
 - #836：`ensureSlotGuestBinDir` 原子替换失败时清理 `${dest}.${pid}.tmp` 暂存文件，避免 `data/run/slot-guest-bin` 下残留堆积。
+- #848：修复 Docker/KVM guest OAuth 换票把控制面的宿主 loopback SOCKS 地址传给 `kin-oauth-auth`，导致容器内连接 `127.0.0.1` 被拒；Linux guest 改由槽位 `kin-eg-*` 透明出口选路，macOS native 路径不变。
 
 ## 1.4.033 — 2026-11-02
 
