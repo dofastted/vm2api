@@ -192,13 +192,8 @@ export function canonicalizeClaudeMessagesShape(body, { preserveContentShape = f
   return out
 }
 
-export function sanitizeAnthropicBody(body, { strictPassthrough = false, preserveContentShape = false } = {}) {
+export function sanitizeAnthropicBody(body, { preserveContentShape = false } = {}) {
   if (!body || typeof body !== 'object') return body
-  if (strictPassthrough) {
-    const out = { ...body }
-    normalizeStop(out)
-    return out
-  }
 
   const out = copyOfficialAnthropicFields(body)
   applyStructuredOutput(out, body)

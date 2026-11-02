@@ -921,7 +921,6 @@ export function createHandleProtocol(deps) {
     const converted = toClaudeMessages(protocol, ctx.body, {
       rewrite: rewriteEnabled,
       model_map: false,
-      strict_passthrough: String(req.headers['x-kin-strict-passthrough'] || '') === '1',
       preserve_content_shape: officialInbound,
     })
     stats.requests++
@@ -948,7 +947,7 @@ export function createHandleProtocol(deps) {
     } else ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
     const officialPassthrough = officialTraffic && officialCcPassthroughFromRouting(getRouting())
     let inboundToolReverse = {}
-    if (!requestContext && String(req.headers['x-kin-strict-passthrough'] || '') !== '1' && !officialPassthrough) {
+    if (!requestContext && !officialPassthrough) {
       const standard = toStandardAnthropicBody(ctx.body, {
         official: officialTraffic === true,
         rewriteTools: getRouting()?.compatibility?.tool_name_rewrite !== false,

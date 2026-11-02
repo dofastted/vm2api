@@ -849,3 +849,19 @@ for (const backend of ['cli', 'api']) {
     assert.ok(out.system.some((block) => block.text === `Custom: ${rule}`))
   })
 }
+
+test('a caller header cannot skip the inbound rewrite', async (t) => {
+  const out = await outbound(t, {
+    preset: 'official',
+    headers: { 'user-agent': 'hermes-agent/1.0', 'x-kin-strict-passthrough': '1' },
+    input: {
+      system: 'You are Hermes Agent by Nous Research.',
+      tools: [{ name: 'terminal', input_schema: { type: 'object' } }],
+    },
+  })
+  assert.ok(!JSON.stringify(out).includes('Hermes Agent'))
+  assert.deepEqual(
+    out.tools.map((tool) => tool.name),
+    ['mcp__terminal'],
+  )
+})

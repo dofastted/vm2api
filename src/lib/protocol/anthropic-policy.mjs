@@ -719,10 +719,7 @@ export function composeToolNames(front = {}, hop = {}) {
  * official passthrough is on; the project template writes its own.
  */
 export function toStandardAnthropicBody(body, { official = false, rewriteTools = true } = {}) {
-  const shaped = sanitizeAnthropicBody(stripCallerBilling(body), {
-    strictPassthrough: false,
-    preserveContentShape: false,
-  })
+  const shaped = sanitizeAnthropicBody(stripCallerBilling(body), { preserveContentShape: false })
   return scrubUpstreamClientBody(shaped, { official, rewriteTools })
 }
 

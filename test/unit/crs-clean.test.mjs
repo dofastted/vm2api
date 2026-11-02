@@ -177,18 +177,6 @@ test('sanitize drops empty content and prefixes assistant-first history', () => 
   assert.deepEqual(out.messages[1].content, [{ type: 'text', text: 'hello' }])
 })
 
-test('strict passthrough keeps invalid roles for official wire', () => {
-  const out = sanitizeAnthropicBody(
-    {
-      model: 'claude-sonnet-5',
-      max_tokens: 8,
-      messages: [{ role: 'admin', content: 'x' }],
-    },
-    { strictPassthrough: true },
-  )
-  assert.equal(out.messages[0].role, 'admin')
-})
-
 test('toClaudeMessages anthropic passthrough remaps admin role', () => {
   const { claude, mode } = toClaudeMessages('anthropic.messages', {
     model: 'claude-sonnet-5',
