@@ -224,6 +224,39 @@ test('setup-token cli-hop summarizes hidden thinking by default and keeps update
   assert.ok(passed.body.betas.includes('thinking-display-updates-2026-08-18'))
 })
 
+test('cli-hop appends inline-tools when a message carries a tool_definition', () => {
+  const block = {
+    type: 'tool_addition',
+    tool: {
+      type: 'tool_definition',
+      definition: { name: 'lookup', description: 'lookup', input_schema: { type: 'object' } },
+    },
+  }
+  const out = finalizeWorkerPayload({
+    body: {
+      model: 'claude-opus-5-5',
+      messages: [
+        { role: 'user', content: 'hi' },
+        { role: 'system', content: [{ type: 'text', text: 'note' }, block] },
+      ],
+    },
+    reqHeaders: { 'anthropic-beta': 'inline-tools-2026-09-15' },
+    exec: { homeDir: '', vm: { claude: { mode: 'setup-token', scope: 'user:inference' } } },
+    identity: null,
+    cliHop: true,
+  })
+  assert.ok(out.body.betas.includes('inline-tools-2026-09-15'))
+  assert.equal(out.body.messages[1].content[1].tool.type, 'tool_definition')
+  const plain = finalizeWorkerPayload({
+    body: { model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'hi' }] },
+    reqHeaders: { 'anthropic-beta': 'inline-tools-2026-09-15' },
+    exec: { homeDir: '', vm: { claude: { mode: 'setup-token', scope: 'user:inference' } } },
+    identity: null,
+    cliHop: true,
+  })
+  assert.ok(!plain.body.betas.includes('inline-tools-2026-09-15'))
+})
+
 const unix = process.platform !== 'win32'
 const unixTest = unix ? test : test.skip
 
