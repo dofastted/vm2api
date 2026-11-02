@@ -324,7 +324,7 @@ export function MachineDetail({
   onSelect,
   poolNameOf,
   canManage,
-  details,
+  localDetails,
   localRefresh,
   onOpenNode,
   onRemove,
@@ -335,7 +335,8 @@ export function MachineDetail({
   onSelect: (id: string) => void
   poolNameOf: (vmId: string) => string | null
   canManage: boolean
-  details: {
+  /** 主控的连接详情；节点的同类信息在「连接设置」面板里，不在这里重复。 */
+  localDetails: {
     rows: DetailRow[] | null
     summary: string
     checkedAt: string | null
@@ -424,7 +425,7 @@ export function MachineDetail({
         canManage={canManage}
         onCreate={() => onCreate(m)}
       />
-      <ConnectionDetails {...details} />
+      {m.role === 'local' ? <ConnectionDetails {...localDetails} /> : null}
     </>
   )
 }

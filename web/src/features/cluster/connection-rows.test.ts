@@ -1,12 +1,9 @@
 import type { ClusterApiNode, ClusterLocalStatus } from '@/types/panel-cluster'
 import { describe, expect, it } from 'vitest'
 import {
-  connectedText,
   internalAddresses,
   localDetailRows,
   localDetailSummary,
-  remoteDetailRows,
-  remoteDetailSummary,
 } from '@/features/cluster/connection-rows'
 
 const node = (over: Partial<ClusterApiNode> = {}): ClusterApiNode => ({
@@ -107,51 +104,5 @@ describe('local connection details', () => {
     expect(
       internalAddresses(['10.0.69.10'], [node({ host: '154.36.171.158' })])
     ).toEqual([])
-  })
-})
-
-describe('remote connection details', () => {
-  it('lists SSH, direct link, Docker and the pinned key', () => {
-    const now = Date.parse('2026-11-02T11:19:00.000Z')
-    const rows = remoteDetailRows(node(), now)
-    expect(rows.map((r) => r.label)).toEqual([
-      'SSH',
-      '直连通道',
-      'Docker',
-      '主机指纹',
-    ])
-    expect(rows[0].value).toMatch(
-      /^root@10\.0\.69\.11:22 · \d\d:\d\d 连上，已 10 小时$/
-    )
-    expect(rows[1].value).toBe('10.0.69.11:7790 · 正常 21ms')
-    expect(remoteDetailSummary(node())).toBe(
-      'SSH 正常 · 直连正常 · 26 个容器全在跑'
-    )
-    expect(connectedText(null)).toBe('')
-  })
-
-  it('explains a fallback and a broken link', () => {
-    const down = node({
-      direct_link: {
-        ...node().direct_link!,
-        state: 'down',
-        error: 'gate_unreachable',
-      },
-    })
-    expect(remoteDetailRows(down)[1]).toMatchObject({
-      tone: 'caution',
-      value: '10.0.69.11:7790 · 断了，槽的流量暂时走 SSH',
-    })
-    const off = node({
-      link: {
-        state: 'backoff',
-        error: { code: 'ECONNREFUSED', message: 'refused' },
-      },
-    })
-    expect(remoteDetailRows(off)[0]).toMatchObject({
-      tone: 'bad',
-      hint: 'ECONNREFUSED · refused',
-    })
-    expect(remoteDetailSummary(off)).toBe('SSH 重连等待')
   })
 })

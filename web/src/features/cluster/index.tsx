@@ -18,8 +18,6 @@ import { ClusterSkeleton } from '@/features/cluster/cluster-skeleton'
 import {
   localDetailRows,
   localDetailSummary,
-  remoteDetailRows,
-  remoteDetailSummary,
 } from '@/features/cluster/connection-rows'
 import { JoinVpsDialog } from '@/features/cluster/join-dialog'
 import { MachineDetail } from '@/features/cluster/machine-detail'
@@ -161,25 +159,19 @@ export function ClusterPage() {
     onError: (err) => toast.error(err.message),
   })
 
-  const details =
-    current?.role === 'remote' && current.remote
-      ? {
-          rows: remoteDetailRows(current.remote),
-          summary: remoteDetailSummary(current.remote),
-          checkedAt: checkedTime(current.remote.health?.checked_at),
-        }
-      : {
-          rows: localLink.data
-            ? localDetailRows({
-                status: localLink.data,
-                host: dashReady ? dash.data?.host : undefined,
-                nodes: apiNodes,
-              })
-            : null,
-          summary: localLink.data ? localDetailSummary(localLink.data) : '',
-          checkedAt: checkedTime(localLink.data?.checked_at),
-          error: localLink.error ? localLink.error.message : null,
-        }
+  // 只有主控有：节点的 SSH / 直连 / Docker / 指纹都在「连接设置」里，底下不再重复一份。
+  const localDetails = {
+    rows: localLink.data
+      ? localDetailRows({
+          status: localLink.data,
+          host: dashReady ? dash.data?.host : undefined,
+          nodes: apiNodes,
+        })
+      : null,
+    summary: localLink.data ? localDetailSummary(localLink.data) : '',
+    checkedAt: checkedTime(localLink.data?.checked_at),
+    error: localLink.error ? localLink.error.message : null,
+  }
 
   const today = Number(
     dash.data?.billing?.today?.total_cost ??
@@ -300,7 +292,7 @@ ANTI-PATTERN: Local board vs remote table, lifetime spend per host, one-sample l
               onSelect={select}
               poolNameOf={(id) => poolOf.get(id) || null}
               canManage={canManage}
-              details={details}
+              localDetails={localDetails}
               localRefresh={{
                 pending: refreshLocal.isPending,
                 run: () => refreshLocal.mutate(),

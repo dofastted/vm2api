@@ -1,7 +1,6 @@
 import type { ClusterApiNode, ClusterLocalStatus } from '@/types/panel-cluster'
 import type { HostStats } from '@/types/panel-overview'
 import { fmtBytes } from '@/lib/format'
-import { LINK_STATE_TEXT } from '@/features/cluster/model'
 
 /** 连接详情一行：`tone` 有值时前面画状态点，`hint` 是灰色小字。 */
 export type DetailRow = {
@@ -17,21 +16,6 @@ function ago(ms: number): string {
   const hr = Math.floor(min / 60)
   if (hr < 48) return `${hr} 小时`
   return `${Math.floor(hr / 24)} 天`
-}
-
-/** `09:19 连上，已 10 小时`（浏览器本地时间）。 */
-export function connectedText(
-  iso: string | null | undefined,
-  now = Date.now()
-): string {
-  const t = iso ? Date.parse(iso) : NaN
-  if (!Number.isFinite(t)) return ''
-  const hm = new Date(t).toLocaleTimeString('zh-CN', {
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-  })
-  return `${hm} 连上，已 ${ago(now - t)}`
 }
 
 function ipv4Prefix24(ip: string): string | null {
@@ -178,118 +162,5 @@ export function localDetailSummary(status: ClusterLocalStatus): string {
     parts.push(
       status.kvm.ok && status.kvm.accel === 'kvm' ? 'KVM 可用' : 'KVM 不可用'
     )
-  return parts.join(' · ')
-}
-
-export function remoteDetailRows(
-  node: ClusterApiNode,
-  now = Date.now()
-): DetailRow[] {
-  const ready = node.link.state === 'ready'
-  const rows: DetailRow[] = [
-    ready
-      ? {
-          label: 'SSH',
-          value: `${node.username}@${node.host}:${node.port} · ${connectedText(node.link.connected_at, now) || '已连接'}`,
-          tone: 'ok',
-        }
-      : {
-          label: 'SSH',
-          value: `${node.username}@${node.host}:${node.port} · ${LINK_STATE_TEXT[node.link.state]}`,
-          tone:
-            node.link.state === 'backoff' || node.link.state === 'error'
-              ? 'bad'
-              : undefined,
-          hint: node.link.error
-            ? `${node.link.error.code} · ${node.link.error.message}`
-            : undefined,
-        },
-  ]
-  const dl = node.direct_link
-  if (!dl) {
-    rows.push({ label: '直连通道', value: '未启用（槽的流量走 SSH）' })
-  } else {
-    const where = `${dl.address}:${dl.port}`
-    rows.push(
-      dl.state === 'ok'
-        ? {
-            label: '直连通道',
-            value: `${where} · 正常${dl.latency_ms != null ? ` ${dl.latency_ms}ms` : ''}`,
-            tone: 'ok',
-            hint: '槽的流量走这条；断了自动退回 SSH',
-          }
-        : dl.state === 'down'
-          ? {
-              label: '直连通道',
-              value: `${where} · 断了，槽的流量暂时走 SSH`,
-              tone: 'caution',
-              hint:
-                [dl.error, dl.gate_error].filter(Boolean).join('；') ||
-                undefined,
-            }
-          : { label: '直连通道', value: `${where} · 等待检查` }
-    )
-  }
-  const health = node.health
-  if (node.platform === 'darwin') {
-    rows.push({
-      label: '运行方式',
-      value: 'macOS 原生（槽是 launchd 服务，不用 Docker）',
-    })
-  } else if (health) {
-    const c = health.containers
-    rows.push(
-      health.docker.ok
-        ? {
-            label: 'Docker',
-            value:
-              c && c.total != null
-                ? `${c.total} 个容器，${c.running ?? '—'} 个在跑`
-                : '可用',
-            tone: 'ok',
-          }
-        : {
-            label: 'Docker',
-            value: '不可用',
-            tone: 'bad',
-            hint: health.docker.error || undefined,
-          }
-    )
-  }
-  const h = health?.host
-  if (ready && h) {
-    rows.push({
-      label: '宿主',
-      value: `${h.cpu_count} 核 · load ${[h.load1, h.load5, h.load15].map((n) => (n == null ? '—' : n.toFixed(2))).join(' / ')}`,
-    })
-  }
-  rows.push({
-    label: '主机指纹',
-    value: `${node.host_key_alg} ${node.host_key_sha256}`,
-  })
-  return rows
-}
-
-export function remoteDetailSummary(node: ClusterApiNode): string {
-  if (node.link.state !== 'ready')
-    return `SSH ${LINK_STATE_TEXT[node.link.state]}`
-  const parts = ['SSH 正常']
-  const dl = node.direct_link
-  if (dl)
-    parts.push(
-      dl.state === 'ok'
-        ? '直连正常'
-        : dl.state === 'down'
-          ? '直连断了'
-          : '直连待检查'
-    )
-  const c = node.health?.containers
-  if (node.platform !== 'darwin' && c?.total != null) {
-    parts.push(
-      c.running === c.total
-        ? `${c.total} 个容器全在跑`
-        : `${c.running ?? '—'} / ${c.total} 个容器在跑`
-    )
-  }
   return parts.join(' · ')
 }
