@@ -5,6 +5,7 @@ import {
   stripInvalidThinkingBlocks,
   rewriteToolNames,
   scrubUpstreamClientBody,
+  toStandardAnthropicBody,
   restoreToolNames,
   restoreToolNamesInSSELine,
   sanitizeAnthropicBodyForBetaTokens,
@@ -758,6 +759,26 @@ test('official Claude Code tool names stay, stray mcp_ names do not', () => {
   assert.equal(result.body.messages[0].content[0].name, 'Bash')
   assert.equal(result.reverse.mcp__filesystem_read, 'mcp_filesystem_read')
   assert.equal(result.reverse.Bash, undefined)
+})
+
+test('front clean rewrites Hermes into standard Anthropic blocks before persona', () => {
+  const result = toStandardAnthropicBody({
+    model: 'claude-sonnet-5',
+    max_tokens: 32,
+    system: 'You are Hermes Agent from Nous Research.',
+    extra_body: { drop: true },
+    tools: [{ name: 'read_file', description: 'Hermes Agent read', input_schema: { type: 'object' } }],
+    messages: [{ role: 'user', content: 'hi' }],
+  })
+  assert.equal(result.body.extra_body, undefined)
+  assert.deepEqual(result.body.system[0], {
+    type: 'text',
+    text: 'You are Claude Code from Anthropic.',
+  })
+  assert.deepEqual(result.body.messages[0].content, [{ type: 'text', text: 'hi' }])
+  assert.equal(result.body.tools[0].name, 'mcp__read_file')
+  assert.equal(result.body.tools[0].description, 'Claude Code read')
+  assert.equal(result.reverse.mcp__read_file, 'read_file')
 })
 
 test('duplicate names keep one canonical reference as history grows', () => {

@@ -6,6 +6,7 @@ import {
   mergeConsecutiveAnthropicMessages,
   messageHasTurnControls,
   stripIllegalContentFields,
+  sanitizeAnthropicBody,
 } from './sanitize.mjs'
 import { isAnthropicServerTool } from './web-search.mjs'
 import {
@@ -695,4 +696,29 @@ function scrubMessage(message, rename) {
     return block
   })
   return changed ? { ...message, content } : message
+}
+
+/** Map a hop tool-name table through the front rewrite so the client still sees its names. */
+export function composeToolNames(front = {}, hop = {}) {
+  const out = { ...front }
+  for (const [wire, mid] of Object.entries(hop || {})) {
+    if (!wire || wire === mid) continue
+    const client = front[mid] || mid
+    if (client !== wire) out[wire] = client
+    delete out[mid]
+  }
+  for (const [wire, client] of Object.entries(out)) {
+    if (client === wire) delete out[wire]
+  }
+  return out
+}
+
+/**
+ * Front gate: every non-classifier Messages body becomes standard Anthropic
+ * blocks before persona or either hop. Hermes leaves string content and its
+ * own tool names; those must not reach the template.
+ */
+export function toStandardAnthropicBody(body, { official = false, rewriteTools = true } = {}) {
+  const shaped = sanitizeAnthropicBody(body, { strictPassthrough: false, preserveContentShape: false })
+  return scrubUpstreamClientBody(shaped, { official, rewriteTools })
 }

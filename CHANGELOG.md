@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- 本站 API 入站的第三方请求（含 Hermes）和官方请求在出站前转写客户端指纹：system / 工具描述里的 Hermes Agent、Nous Research、hermes-agent 换成官方口径；第三方工具名改为 `mcp__`，官方 Claude Code 工具名保留，单独的 `mcp_` 仍改成 `mcp__`。回包按原名还原。避免上游把请求当成第三方应用并返回 extra usage 400。
+- 本站 API 入站后、进人设之前，第三方（含 Hermes）和官方请求都先收成标准 Anthropic 结构：system / messages 变成 text block，丢掉 OpenAI 残留字段，Hermes 产品名换成官方口径，第三方工具名改为 `mcp__`。官方 Claude Code 工具名保留。回包按原名还原。避免上游把未转写的 Hermes 请求当成第三方应用并返回 extra usage 400。
 - #836：`ensureSlotGuestBinDir` 原子替换失败时清理 `${dest}.${pid}.tmp` 暂存文件，避免 `data/run/slot-guest-bin` 下残留堆积。
 
 ## 1.4.033 — 2026-11-02
