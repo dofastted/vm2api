@@ -726,21 +726,33 @@ export function toStandardAnthropicBody(body, { official = false, rewriteTools =
   return scrubUpstreamClientBody(shaped, { official, rewriteTools })
 }
 
+function stripBillingText(text) {
+  return String(text || '').replace(/^[ \t]*x-anthropic-billing-header:[^\n]*(?:\n|$)/gim, '')
+}
+
 function stripCallerBilling(body) {
   if (!body || typeof body !== 'object' || body.system == null) return body
-  const billing = (text) => /^\s*x-anthropic-billing-header:/i.test(String(text || ''))
+  const keep = (block) => {
+    const raw = typeof block === 'string' ? block : block?.text
+    if (typeof raw !== 'string' || !/x-anthropic-billing-header:/i.test(raw)) return block
+    const text = stripBillingText(raw)
+    if (!text) return null
+    if (text === raw) return block
+    return typeof block === 'string' ? text : { ...block, text }
+  }
   if (typeof body.system === 'string') {
-    if (!/x-anthropic-billing-header:/i.test(body.system)) return body
-    const text = body.system.replace(/^[ \t]*x-anthropic-billing-header:[^\n]*(?:\n|$)/gim, '').trim()
+    const text = keep(body.system)
+    if (text === body.system) return body
     const next = { ...body }
     if (text) next.system = text
     else delete next.system
     return next
   }
   if (!Array.isArray(body.system)) return body
-  const system = body.system.filter((block) => !billing(typeof block === 'string' ? block : block?.text))
-  if (system.length === body.system.length) return body
-  const next = { ...body, system }
-  if (!system.length) delete next.system
+  const system = body.system.map(keep).filter((block) => block != null)
+  if (system.length === body.system.length && system.every((block, index) => block === body.system[index])) return body
+  const next = { ...body }
+  if (system.length) next.system = system
+  else delete next.system
   return next
 }
