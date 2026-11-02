@@ -2,8 +2,12 @@
 
 ## Unreleased
 
+## 1.4.033 — 2026-11-02
+
 - #850：回滚 #843 对已识别官方 Claude Code 的 cli-hop 强制 persona。识别命中且未开「官方 Claude Code 家族透传」时，cli-hop 保留入站 system 和缓存断点，不再把无 TTL 的调用方断点留给上游当成隐式 5m。`forceConfigured` 仍可改写。API 直连在开关关闭时仍按原分支清洗。
 - 风险审计送审调用方提示词（system / instructions / developer）。「官方提示词」和「官方完整提示词」正文在白名单内，不送审；夹在官方正文后的调用方文字仍送审。工具结果和 Environment 不送审。
+
+已部署机升级：只更新 Node 控制面后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
 ## 1.4.032 — 2026-11-01
 
