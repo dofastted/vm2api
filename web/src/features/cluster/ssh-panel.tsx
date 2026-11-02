@@ -15,24 +15,24 @@ import { StatusMark } from '@/components/status-mark'
 import { WsTerminal } from '@/components/ws-terminal'
 import { DirectLinkConfig } from '@/features/cluster/direct-link-config'
 import { DockerTab } from '@/features/cluster/docker-tab'
-import {
-  LINK_STATE_TEXT,
-  LINK_TONE,
-  remoteLink,
-} from '@/features/cluster/model'
+import { LINK_STATE_TEXT, remoteLinkTone } from '@/features/cluster/model'
 import { NodeConfig } from '@/features/cluster/node-config'
 import { CLUSTER_NODES_KEY } from '@/features/cluster/queries'
 
-/** 弹出式节点面板：终端 / Docker / 连接。`node` 跟着节点列表轮询刷新。 */
+export type SshPanelTab = 'terminal' | 'docker' | 'link'
+
+/** 弹出式节点面板：终端 / Docker / 连接。`node` 跟着节点列表轮询刷新；`tab` 是打开时停在哪一页。 */
 export function SshPanel({
   node,
   nodes,
   vmCount,
+  tab,
   onOpenChange,
 }: {
   node: ClusterApiNode | null
   nodes: ClusterApiNode[]
   vmCount: number | null
+  tab?: SshPanelTab
   onOpenChange: (open: boolean) => void
 }) {
   return (
@@ -40,10 +40,11 @@ export function SshPanel({
       <DialogContent className='flex h-[86vh] flex-col gap-3 sm:max-w-5xl'>
         {node ? (
           <PanelBody
-            key={node.id}
+            key={`${node.id}:${tab || ''}`}
             node={node}
             nodes={nodes}
             vmCount={vmCount}
+            tab={tab}
           />
         ) : null}
       </DialogContent>
@@ -55,12 +56,16 @@ function PanelBody({
   node,
   nodes,
   vmCount,
+  tab,
 }: {
   node: ClusterApiNode
   nodes: ClusterApiNode[]
   vmCount: number | null
+  tab?: SshPanelTab
 }) {
   const ready = node.link.state === 'ready'
+  const initial: SshPanelTab =
+    tab === 'terminal' && !ready ? 'link' : tab || (ready ? 'terminal' : 'link')
   return (
     <>
       <DialogHeader>
@@ -68,16 +73,13 @@ function PanelBody({
           <span className='min-w-0 truncate' title={node.label}>
             {node.label}
           </span>
-          <StatusMark tone={LINK_TONE[remoteLink(node)]} variant='pill' />
+          <StatusMark tone={remoteLinkTone(node)} variant='pill' />
         </DialogTitle>
         <DialogDescription className='font-mono text-xs'>
           {node.username}@{node.host}:{node.port}
         </DialogDescription>
       </DialogHeader>
-      <Tabs
-        defaultValue={ready ? 'terminal' : 'link'}
-        className='min-h-0 flex-1'
-      >
+      <Tabs defaultValue={initial} className='min-h-0 flex-1'>
         <TabsList>
           <TabsTrigger value='terminal' disabled={!ready}>
             终端

@@ -70,7 +70,8 @@ export type Placement = {
  */
 export function usePlacement(
   kernel: string,
-  runtimeType: RuntimeType = 'docker'
+  runtimeType: RuntimeType = 'docker',
+  initialNodeId = ''
 ): Placement {
   const me = useQuery(meQueryOptions())
   const isAdmin = me.data?.role === 'admin'
@@ -79,7 +80,7 @@ export function usePlacement(
     enabled: isAdmin,
   })
   const items = isAdmin ? nodes.data || [] : []
-  const [picked, setPicked] = useState('')
+  const [picked, setPicked] = useState(initialNodeId)
   // 选中的节点被移除后退回本机，避免发一个已不存在的 node_id。
   const nodeId = items.some((n) => n.id === picked) ? picked : ''
   const preflight = useQuery(

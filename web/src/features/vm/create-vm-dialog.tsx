@@ -14,9 +14,12 @@ import { CreateVmForm, useCreateVmDraft } from '@/features/vm/create-vm-form'
 export function CreateVmDialog({
   open,
   onOpenChange,
+  nodeId,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
+  /** 预选放在哪台机器（集群页「在这台机器上新建槽」）；空 = 本机。 */
+  nodeId?: string
 }) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -27,14 +30,22 @@ export function CreateVmDialog({
             只建槽。要一路导入账号到上线，用「导入」页。
           </DialogDescription>
         </DialogHeader>
-        {open ? <DialogBody onDone={() => onOpenChange(false)} /> : null}
+        {open ? (
+          <DialogBody nodeId={nodeId} onDone={() => onOpenChange(false)} />
+        ) : null}
       </DialogContent>
     </Dialog>
   )
 }
 
 // 每次打开都是新草稿：关闭即卸载，不残留上次的选择。
-function DialogBody({ onDone }: { onDone: () => void }) {
-  const draft = useCreateVmDraft({ onCreated: onDone })
+function DialogBody({
+  nodeId,
+  onDone,
+}: {
+  nodeId?: string
+  onDone: () => void
+}) {
+  const draft = useCreateVmDraft({ onCreated: onDone, nodeId })
   return <CreateVmForm draft={draft} variant='dialog' onCancel={onDone} />
 }
