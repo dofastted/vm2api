@@ -218,6 +218,11 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
         postTelemetry: async () => ({ ok: true }),
         runDocker: async (_argv, { stdin, timeoutMs }) =>
           new Promise((resolve, reject) => {
+            const guestPayload = JSON.parse(stdin)
+            assert.equal(guestPayload.proxy_url, '')
+            // This unit fixture uses a host-local SOCKS listener in place of
+            // the transparent kin-eg-* network available to a real slot.
+            guestPayload.proxy_url = proxyUrl
             const child = spawn(binary, [], {
               env: { ...process.env, NODE_EXTRA_CA_CERTS: cert },
               stdio: ['pipe', 'pipe', 'pipe'],
@@ -234,7 +239,7 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
             child.once('error', reject)
             child.once('close', (code) => resolve({ code, stdout, stderr }))
             child.stdin.on('error', () => {})
-            child.stdin.end(stdin)
+            child.stdin.end(`${JSON.stringify(guestPayload)}\n`)
           }),
       },
     )
