@@ -659,11 +659,13 @@ export class FailoverRunner {
         for (const key of bindKeys) {
           if (pinMoved(key)) continue
           const prev = this.stickyRouter.resolve?.(key)
+          // A granted seat follows the scheduler's device home even when the
+          // previous account is still eligible. Capacity spills keep its pin.
           const ownMove =
-            !!outboundSessionAccountId &&
-            prev?.accountId === outboundSessionAccountId &&
+            !!prev?.accountId &&
             prev.accountId !== account.accountId &&
-            opts?.borrowed !== true
+            opts?.borrowed !== true &&
+            (prev.accountId === outboundSessionAccountId || (!!lastSelected?.seatKey && !spilled.has(prev.accountId)))
           if (prev?.accountId && prev.accountId !== account.accountId && !ownMove) continue
           let guard = opts
           if (prev) guard = { ...opts, ifGeneration: prev.generation || 0 }

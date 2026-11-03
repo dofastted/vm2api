@@ -3,6 +3,7 @@
 ## Unreleased
 
 - 修复 `/v1/models` 已列出的 GPT Image 模型（`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst`、`gpt-image-2` 及快照）在 `/v1/chat/completions`、`/v1/responses` 上被 400 `model_not_supported` 拒绝、无法出图。现在这类请求走网关内置 Images 通道：最后一条 user 消息文本作 prompt，带图即 `/images/edits`，否则 `/images/generations`；Chat 回 Markdown 图片，Responses 回 `image_generation_call`，流式等待期间保活。模型开关、Free 槽排除与计费沿用 `/v1/images`。
+- 第三方客户端入站不带 `ttl` 的缓存断点不再以隐式 5m 出站：与 #850 的官方 Claude Code 一样，渲染前按会话 TTL（请求头 → 入站显式值 → 协议页默认，缺省 1h）补齐。只有调用方显式写 `5m` 才发 5m；前面已有 5m 时补 5m，保持 1h 在 5m 前。官方透传打开时不经过这一步。依赖隐式 5m 的调用方需改为显式 `ttl: "5m"` 或带 `x-kin-cache-ttl: 5m`。
 
 已部署机升级：只更新 Node 控制面后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 

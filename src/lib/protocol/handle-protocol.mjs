@@ -1098,11 +1098,12 @@ export function createHandleProtocol(deps) {
     // After OpenAI→Anthropic conversion so function tools already have input_schema;
     // leftover OpenAI-shaped tools are still marked (rewrite / mixed inbound).
     ctx.body = applyEagerToolStreaming(ctx.body, getRouting())
-    // #850: rewritten official traffic. Claude Code leaves cache markers
-    // without a TTL to mean "not chosen"; resolve them to this conversation's
-    // TTL before rendering, so the template budgets against the real value and
-    // no caller marker reaches Anthropic as implicit 5m. Explicit TTLs stay.
-    if (!requestContext && officialTraffic && !officialPassthrough) {
+    // #850: every rewritten inbound. A cache marker without a TTL means "not
+    // chosen", for Claude Code and third-party callers alike; resolve it to this
+    // conversation's TTL before rendering, so the template budgets against the
+    // real value and no caller marker reaches Anthropic as implicit 5m. Explicit
+    // TTLs stay. Passthrough keeps the caller body untouched.
+    if (!requestContext && !officialPassthrough) {
       ctx.body = fillMissingCacheTtl(ctx.body, requestedCacheTtl)
     }
     const personaIn = ctx.body
