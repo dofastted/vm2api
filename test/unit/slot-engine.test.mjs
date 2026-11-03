@@ -14,6 +14,7 @@ import {
   personaModeFromPreset,
   resolveCliSystemLayout,
   resolveInferenceEngine,
+  resolveCragKernelVersion,
   resolveKernelDataplane,
   resolveOfficialCcInference,
   resolveSessionSlots,
@@ -89,6 +90,25 @@ test('kernel dataplane defaults wrap and accepts cc and crag', () => {
   const cragPatch = parseSlotEnginePolicyPatch({ dataplane: 'crag' })
   assert.equal(cragPatch.ok, true)
   assert.equal(cragPatch.patch.dataplane, 'crag')
+})
+
+test('crag kernel version stays legacy unless the VM or routing pins v2', () => {
+  assert.equal(resolveCragKernelVersion({}, {}), 'legacy')
+  assert.equal(resolveCragKernelVersion({}, { inference: { crag_kernel_version: 'crag-v2' } }), 'v2')
+  assert.equal(
+    resolveCragKernelVersion({ crag_kernel_version: 'legacy' }, { inference: { crag_kernel_version: 'v2' } }),
+    'legacy',
+  )
+  assert.equal(resolveCragKernelVersion({ crag_kernel_version: 'crag-v2' }, {}), 'v2')
+  assert.equal(normalizeInferenceConfig({}).crag_kernel_version, 'legacy')
+  assert.equal(parseSlotEnginePolicyPatch({ crag_kernel_version: 'nope' }).ok, false)
+  const patch = parseSlotEnginePolicyPatch({ dataplane: 'crag', crag_kernel_version: 'v2' })
+  assert.equal(patch.ok, true)
+  assert.equal(patch.patch.dataplane, 'crag')
+  assert.equal(patch.patch.crag_kernel_version, 'v2')
+  assert.deepEqual(validateInferenceRoutingPatch({ inference: { crag_kernel_version: '' } }), [
+    'inference.crag_kernel_version 必须是 legacy 或 v2',
+  ])
 })
 
 test('resolveCliSystemLayout follows persona_preset, not leftover inject-only', () => {

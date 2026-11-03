@@ -27,6 +27,7 @@ import {
   KERNEL_NATIVE_SLOT_COUNT,
   normalizeSessionIdleTtlSeconds,
   resolveCliSystemLayout,
+  resolveCragKernelVersion,
   resolveKernelDataplane,
   resolveSlotPersonaPreset,
 } from '../vm/slot-engine.mjs'
@@ -862,6 +863,17 @@ export function writeKernelConfig(
     auto_compact_window: autoCompactWindow,
     model_effort: modelEffort,
     ...(!host.native && !isCodexVm(record) ? { telemetry: buildNativeTelemetry(record, projectRoot, routing) } : {}),
+  }
+  if (
+    dataplane === 'crag' &&
+    resolveCragKernelVersion(record, routing || {}) === 'v2' &&
+    !String(record?.node_id || '').trim() &&
+    !isKvmRuntime(record)
+  ) {
+    config.crag_kernel_version = 'v2'
+    config.runtime_variant = 'crag-v2'
+    config.crag_v2_root = '/home/kincli/.kin/crag-v2'
+    config.node_bin = '/home/kincli/.kin/kin-kernel.bin'
   }
 
   if (tz) config.timezone = tz

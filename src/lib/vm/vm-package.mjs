@@ -35,8 +35,10 @@ import { normalizeVmConfig, resolveMachineSpec } from './machine-spec.mjs'
 import {
   SESSION_SLOT_MAX,
   SESSION_SLOT_MIN,
+  normalizeCragKernelVersion,
   normalizeKernelDataplane,
   normalizeSlotPersonaPreset,
+  parseCragKernelVersionPatch,
   parseKernelDataplanePatch,
 } from './slot-engine.mjs'
 export const VM_PACKAGE_TYPE = 'vm2api-vm-package'
@@ -174,6 +176,7 @@ export function buildVmPackage({
       persona_preset: personaOf(vm.persona_preset) || '',
       inference_engine: engineOf(vm.inference_engine) || '',
       dataplane: normalizeKernelDataplane(vm.dataplane, { inherit: true }) || '',
+      crag_kernel_version: normalizeCragKernelVersion(vm.crag_kernel_version, { inherit: true }) || '',
       auth_scheme: codex ? '' : normalizeAuthScheme(vm.claude?.auth_scheme || vm.auth_scheme),
       proxy_cli_enabled: hasBoundExit(proxy || vm.proxy),
       schedulable: operatorSchedulable(vm),
@@ -343,6 +346,8 @@ export function parseVmPackage(doc) {
   if (persona == null) return fail('invalid_package', 'persona_preset 无效')
   const dataplane = parseKernelDataplanePatch(vm.dataplane)
   if (!dataplane.ok) return fail('invalid_package', dataplane.error || 'dataplane 无效')
+  const cragVersion = parseCragKernelVersionPatch(vm.crag_kernel_version)
+  if (!cragVersion.ok) return fail('invalid_package', cragVersion.error || 'crag_kernel_version 无效')
   const policy = parsePolicy(vm.policy, codex)
   if (!policy.ok) return policy
   const proxy = parseProxy(doc.proxy)
@@ -369,6 +374,7 @@ export function parseVmPackage(doc) {
         persona_preset: persona,
         inference_engine: engine,
         dataplane: dataplane.value,
+        crag_kernel_version: cragVersion.value,
         auth_scheme: auth,
         proxy_cli_enabled: vm.proxy_cli_enabled === true,
         schedulable: vm.schedulable !== false,
@@ -445,6 +451,8 @@ function applyTraits(vm, spec) {
   else delete vm.inference_engine
   if (traits.dataplane) vm.dataplane = traits.dataplane
   else delete vm.dataplane
+  if (traits.crag_kernel_version) vm.crag_kernel_version = traits.crag_kernel_version
+  else delete vm.crag_kernel_version
   if (!spec.codex) {
     vm.claude = vm.claude && typeof vm.claude === 'object' ? vm.claude : {}
     if (traits.auth_scheme) vm.claude.auth_scheme = traits.auth_scheme

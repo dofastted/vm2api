@@ -1,5 +1,6 @@
 import test, { after, before } from 'node:test'
 import assert from 'node:assert/strict'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -11,6 +12,8 @@ import {
   inspectLinuxAmd64Elf,
   inspectWrapCliDir,
   makeWrapSample,
+  materializeCragV2,
+  materializeResolvedKernel,
   materializeSlotDataplane,
   materializeWrapCli,
   replaceKernelBinary,
@@ -429,6 +432,112 @@ test('replaceKernelBinary rejects non-ELF payloads', () => {
     assert.equal(replaced.ok, false)
     assert.equal(replaced.code, 'kernel_not_elf')
     assert.equal(fs.existsSync(path.join(project, 'bin', 'kin-kernel')), false)
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
+
+function sha256(body) {
+  return crypto.createHash('sha256').update(body).digest('hex')
+}
+
+function seedV2Package(project, { worker = 'worker\n' } = {}) {
+  const useArch = process.arch === 'x64' ? 'amd64' : process.arch === 'arm64' ? 'arm64' : process.arch
+  const dir = path.join(project, 'share', 'crag', 'kernels', 'v2', useArch)
+  fs.mkdirSync(path.join(dir, 'bin'), { recursive: true })
+  const workerBody = Buffer.from(worker)
+  const pkg = Buffer.from('{}\n')
+  fs.writeFileSync(path.join(dir, 'bin', 'crag-kernel-worker.mjs'), workerBody)
+  fs.writeFileSync(path.join(dir, 'package.json'), pkg)
+  fs.writeFileSync(
+    path.join(dir, 'manifest.json'),
+    JSON.stringify({
+      family: 'crag',
+      version: 'v2',
+      arch: useArch,
+      entrypoint: 'bin/crag-kernel-worker.mjs',
+      node_version: 'v24.0.0',
+      capabilities: ['official_full', 'zero', 'cancel', 'telemetry', 'unix_socket_envelope'],
+      sha256: {
+        'bin/crag-kernel-worker.mjs': sha256(workerBody),
+        'package.json': sha256(pkg),
+      },
+    }),
+  )
+  return dir
+}
+
+test('omitted crag version stays on the legacy ELF even when a v2 package exists', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-legacy-pin-'))
+  const prev = process.env.KIN_CRAG_V2_ROOT
+  try {
+    seedTemplate(project)
+    const v2 = seedV2Package(project)
+    process.env.KIN_CRAG_V2_ROOT = v2
+    fs.mkdirSync(path.join(project, 'share', 'crag'), { recursive: true })
+    fs.writeFileSync(path.join(project, 'share', 'crag', 'kin-kernel'), 'crag-kernel')
+    const result = materializeSlotDataplane(project, { id: 'vm-13', dataplane: 'crag' }, 'crag')
+    assert.equal(result.ok, true)
+    const dest = wrapCliHomeDir(project, 'vm-13')
+    assert.equal(fs.readFileSync(path.join(dest, 'kin-kernel.bin'), 'utf8'), 'crag-kernel')
+    assert.equal(fs.existsSync(path.join(dest, 'crag-v2')), false)
+  } finally {
+    if (prev == null) delete process.env.KIN_CRAG_V2_ROOT
+    else process.env.KIN_CRAG_V2_ROOT = prev
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
+
+test('one VM can switch cli-node to CRAG v2 and back without deleting cli-node', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-v2-switch-'))
+  try {
+    seedTemplate(project)
+    seedV2Package(project)
+    const node = path.join(project, 'node-bin')
+    fs.writeFileSync(node, 'node-bytes')
+    const dest = wrapCliHomeDir(project, 'vm-13')
+    fs.mkdirSync(dest, { recursive: true })
+    fs.writeFileSync(path.join(dest, 'cli-node'), 'keep-cli')
+    const vm = { id: 'vm-13', dataplane: 'crag', crag_kernel_version: 'v2' }
+    const laid = materializeResolvedKernel(project, vm, { nodeBin: node })
+    assert.equal(laid.ok, true)
+    assert.equal(laid.kernel_changed, true)
+    assert.equal(laid.kernel_version, 'v2')
+    assert.equal(fs.readFileSync(path.join(dest, 'cli-node'), 'utf8'), 'keep-cli')
+    assert.equal(fs.readFileSync(path.join(dest, 'kin-kernel.bin'), 'utf8'), 'node-bytes')
+    assert.match(fs.readFileSync(path.join(dest, 'kin-kernel'), 'utf8'), /crag-v2\/bin\/crag-kernel-worker\.mjs/)
+    assert.equal(materializeResolvedKernel(project, vm, { nodeBin: node }).kernel_changed, false)
+    const back = materializeResolvedKernel(project, { id: 'vm-13', dataplane: 'wrap' })
+    assert.equal(back.ok, true)
+    assert.equal(fs.existsSync(path.join(dest, 'cli-node')), true)
+    assert.doesNotMatch(fs.readFileSync(path.join(dest, 'kin-kernel'), 'utf8'), /crag-v2/)
+    assert.notEqual(fs.readFileSync(path.join(dest, 'kin-kernel.bin'), 'utf8'), 'node-bytes')
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
+
+test('CRAG v2 rejects a bad package and a non-local slot without replacing cli-node', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-v2-reject-'))
+  try {
+    const dir = seedV2Package(project)
+    const manifestPath = path.join(dir, 'manifest.json')
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+    manifest.sha256['bin/crag-kernel-worker.mjs'] = '0'.repeat(64)
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest))
+    const dest = wrapCliHomeDir(project, 'vm-13')
+    fs.mkdirSync(dest, { recursive: true })
+    fs.writeFileSync(path.join(dest, 'cli-node'), 'keep-cli')
+    const bad = materializeCragV2(project, { id: 'vm-13', crag_kernel_version: 'v2' }, { nodeBin: process.execPath })
+    assert.equal(bad.ok, false)
+    assert.equal(bad.code, 'crag_v2_hash_mismatch')
+    assert.equal(fs.readFileSync(path.join(dest, 'cli-node'), 'utf8'), 'keep-cli')
+    assert.equal(fs.existsSync(path.join(dest, 'crag-v2')), false)
+    const remote = materializeCragV2(project, { id: 'vm-remote', node_id: 'node-1' })
+    assert.equal(remote.code, 'crag_v2_unsupported_placement')
+    assert.equal(fs.existsSync(wrapCliHomeDir(project, 'vm-remote')), false)
+    const kvm = materializeCragV2(project, { id: 'vm-kvm', runtime: { type: 'kvm' } })
+    assert.equal(kvm.code, 'crag_v2_unsupported_placement')
   } finally {
     fs.rmSync(project, { recursive: true, force: true })
   }

@@ -1,4 +1,4 @@
-import { useMemo, type ReactNode } from 'react'
+import { useMemo, useState, type ReactNode } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import type { Vm, VmKernelSnapshot } from '@/types/panel-vm'
@@ -6,6 +6,7 @@ import { toast } from 'sonner'
 import { patchVm } from '@/lib/api'
 import { isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
+import { ConfirmDialog } from '@/components/confirm-dialog'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import {
   DATAPLANE_HINT,
@@ -83,12 +84,17 @@ export function VmEngineEditor({
         />
       </div>
       <p className='mt-3 text-xs leading-relaxed text-muted-foreground'>
-        运输固定 {HOP_TRANSPORT_LABEL}。{DATAPLANE_HINT} 数据面在{' '}
+        运输固定 {HOP_TRANSPORT_LABEL}。{DATAPLANE_HINT} 本槽可在 cli-node 与
+        CRAG v2 之间切换，不改其他槽、不改凭证、不删容器。舰队级 cc / crag
+        legacy 仍在{' '}
         <Link to='/wrap' className='underline underline-offset-4'>
           内核页
-        </Link>{' '}
-        切换。Go HTTP 转发不再启用。
+        </Link>
+        。Go HTTP 转发不再启用。
       </p>
+      {canEdit && !isCodexVm(vm) ? (
+        <SlotKernelSwitch id={id} vm={vm} remote={remote} />
+      ) : null}
       {inherits || !canEdit ? null : (
         <Button
           className='mt-3'
@@ -105,6 +111,108 @@ export function VmEngineEditor({
         </p>
       ) : null}
     </CardSection>
+  )
+}
+
+function kernelLabel(vm: Vm) {
+  if (
+    vm.resolved_dataplane === 'crag' &&
+    vm.resolved_crag_kernel_version === 'v2'
+  )
+    return 'CRAG v2'
+  if (vm.resolved_dataplane === 'crag') return 'crag legacy'
+  if (vm.resolved_dataplane === 'cc') return 'cc-node'
+  return 'cli-node'
+}
+
+function SlotKernelSwitch({
+  id,
+  vm,
+  remote,
+}: {
+  id: string
+  vm: Vm
+  remote: boolean
+}) {
+  const qc = useQueryClient()
+  const [pending, setPending] = useState<'wrap' | 'v2' | null>(null)
+  const kvm = vm.runtime_type === 'kvm'
+  const blocked = remote || kvm
+  const onV2 =
+    vm.resolved_dataplane === 'crag' && vm.resolved_crag_kernel_version === 'v2'
+  const onCli =
+    vm.resolved_dataplane == null || vm.resolved_dataplane === 'wrap'
+  const switchKernel = useMutation({
+    mutationFn: (next: 'wrap' | 'v2') =>
+      patchVm(
+        id,
+        next === 'v2'
+          ? { dataplane: 'crag', crag_kernel_version: 'v2' }
+          : { dataplane: 'wrap', crag_kernel_version: '' }
+      ),
+    onSuccess: async (_data, next) => {
+      toast.success(
+        next === 'v2' ? '本槽已切到 CRAG v2' : '本槽已切回 cli-node'
+      )
+      setPending(null)
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: vmQueryOptions(id).queryKey }),
+        qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
+      ])
+    },
+    onError: (error: Error) => {
+      toast.error(error.message)
+      setPending(null)
+    },
+  })
+  return (
+    <div className='mt-3 space-y-2'>
+      <div className='flex flex-wrap gap-2'>
+        <Button
+          variant='outline'
+          disabled={blocked || switchKernel.isPending || onCli}
+          onClick={() => setPending('wrap')}
+        >
+          本槽切回 cli-node
+        </Button>
+        <Button
+          variant='outline'
+          disabled={blocked || switchKernel.isPending || onV2}
+          onClick={() => setPending('v2')}
+        >
+          本槽切到 CRAG v2
+        </Button>
+      </div>
+      <p className='text-xs text-muted-foreground'>
+        当前 {kernelLabel(vm)}。只改这一槽。cli-node 留在盘上。没有 CRAG v2
+        包时拒绝切换，原内核不动。
+      </p>
+      {blocked ? (
+        <p className='text-xs text-muted-foreground'>
+          {remote
+            ? `CRAG v2：${REMOTE_UNSUPPORTED_TEXT}`
+            : 'KVM 槽不运行 CRAG v2'}
+        </p>
+      ) : null}
+      <ConfirmDialog
+        open={pending != null}
+        onOpenChange={(open) => {
+          if (!open && !switchKernel.isPending) setPending(null)
+        }}
+        title={pending === 'v2' ? '本槽切到 CRAG v2？' : '本槽切回 cli-node？'}
+        desc={
+          pending === 'v2'
+            ? '重启本槽内核。不 docker rm，不改凭证，不影响其他槽。cli-node 保留，可再切回。'
+            : '铺回 wrap kernel 和 cli-node，并重启本槽内核。CRAG v2 文件留在盘上但不再 exec。'
+        }
+        cancelBtnText='取消'
+        confirmText='切换'
+        isLoading={switchKernel.isPending}
+        handleConfirm={() => {
+          if (pending) switchKernel.mutate(pending)
+        }}
+      />
+    </div>
   )
 }
 
