@@ -177,6 +177,7 @@ import {
   parseSlotEnginePolicyPatch,
   parseSlotPolicyTargets,
   resolveInferenceEngine,
+  resolveCragKernelVersion,
   resolveKernelDataplane,
   SESSION_SLOT_MAX,
   SESSION_SLOT_MIN,
@@ -259,8 +260,8 @@ import {
   captureWrapSample,
   describeWrapSample,
   makeWrapSample,
+  materializeResolvedKernel,
   materializeSlotDataplane,
-  materializeWrapCli,
   replaceCragKernelBinary,
   replaceKernelBinary,
   replaceCliNodeBinary,
@@ -1055,6 +1056,10 @@ export function createPanelHandler(ctx) {
       if (patch.dataplane) desired.dataplane = patch.dataplane
       else delete desired.dataplane
     }
+    if (Object.prototype.hasOwnProperty.call(patch, 'crag_kernel_version')) {
+      if (patch.crag_kernel_version) desired.crag_kernel_version = patch.crag_kernel_version
+      else delete desired.crag_kernel_version
+    }
     return desired
   }
 
@@ -1066,6 +1071,12 @@ export function createPanelHandler(ctx) {
     const targetEngine = resolveInferenceEngine(desired, ctx.routingConfig)
     const previousDataplane = resolveKernelDataplane(current, ctx.routingConfig)
     const targetDataplane = resolveKernelDataplane(desired, ctx.routingConfig)
+    const previousVersion = resolveCragKernelVersion(current, ctx.routingConfig)
+    const targetVersion = resolveCragKernelVersion(desired, ctx.routingConfig)
+    const dataplaneChanged = previousDataplane !== targetDataplane
+    const versionChanged =
+      previousVersion !== targetVersion && (previousDataplane === 'crag' || targetDataplane === 'crag')
+    const kernelSwitch = dataplaneChanged || versionChanged
     let switched = null
     if (Object.prototype.hasOwnProperty.call(patch, 'inference_engine') && previousEngine !== targetEngine) {
       switched = await switchSlotInferenceEngine(desired, cfg.paths.project, targetEngine)
@@ -1076,19 +1087,21 @@ export function createPanelHandler(ctx) {
     try {
       const saved = persistSlotEnginePolicy(cfg.paths.project, id, patch)
       if (!saved) return { ok: false, id, code: 'vm_not_found', error: 'vm not found' }
-      if (
-        !isCodexVm(saved) &&
-        (Object.prototype.hasOwnProperty.call(patch, 'persona_preset') || previousDataplane !== targetDataplane)
-      ) {
-        if (previousDataplane !== targetDataplane) {
-          const laid = materializeSlotDataplane(cfg.paths.project, saved, targetDataplane || 'wrap')
+      if (!isCodexVm(saved) && (Object.prototype.hasOwnProperty.call(patch, 'persona_preset') || kernelSwitch)) {
+        if (kernelSwitch) {
+          const laid = materializeSlotDataplane(cfg.paths.project, saved, targetDataplane || 'wrap', {
+            routing: ctx.routingConfig,
+          })
           if (!laid.ok) {
-            persistSlotEnginePolicy(cfg.paths.project, id, { dataplane: current.dataplane || '' })
+            persistSlotEnginePolicy(cfg.paths.project, id, {
+              dataplane: current.dataplane || '',
+              crag_kernel_version: current.crag_kernel_version || '',
+            })
             return { ok: false, id, code: laid.code || 'dataplane_materialize_failed', error: laid.error }
           }
         }
         writeKernelConfig(cfg.paths.project, saved, { routing: ctx.routingConfig })
-        if (previousDataplane !== targetDataplane && saved.status === 'running') {
+        if (kernelSwitch && saved.status === 'running') {
           const exec = slotExec(cfg.paths.project, saved)
           const restarted = await restartRustKernel(exec).catch((e) => ({
             ok: false,
@@ -2810,7 +2823,9 @@ export function createPanelHandler(ctx) {
         const hasSlotPolicy =
           body &&
           (Object.prototype.hasOwnProperty.call(body, 'inference_engine') ||
-            Object.prototype.hasOwnProperty.call(body, 'persona_preset'))
+            Object.prototype.hasOwnProperty.call(body, 'persona_preset') ||
+            Object.prototype.hasOwnProperty.call(body, 'dataplane') ||
+            Object.prototype.hasOwnProperty.call(body, 'crag_kernel_version'))
         if (
           !hasConcurrency &&
           !hasRpm &&
@@ -2833,7 +2848,7 @@ export function createPanelHandler(ctx) {
             ok: false,
             error: {
               message:
-                'max_concurrency, max_rpm, max_sessions, session_slots, quota_override, allowed_models, auth_scheme, inference_engine, persona_preset, schedule_level, active_hours, timezone, weight, machine.memory or timezone_follow_proxy required',
+                'max_concurrency, max_rpm, max_sessions, session_slots, quota_override, allowed_models, auth_scheme, inference_engine, persona_preset, dataplane, crag_kernel_version, schedule_level, active_hours, timezone, weight, machine.memory or timezone_follow_proxy required',
             },
           })
         }
@@ -3853,7 +3868,7 @@ export function createPanelHandler(ctx) {
             })
           return json(res, 200, panel.ok({ mode, rebuild: 'traits', boot: panel.publicSlotBoot(boot) }))
         }
-        const wrap = materializeWrapCli(cfg.paths.project, vm)
+        const wrap = materializeResolvedKernel(cfg.paths.project, vm, { routing: ctx.routingConfig })
         if (!wrap.ok) return json(res, 400, { ok: false, error: { code: wrap.code, message: wrap.error } })
         writeKernelConfig(cfg.paths.project, vm, { routing: ctx.routingConfig })
 

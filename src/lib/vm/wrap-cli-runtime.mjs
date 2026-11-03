@@ -4,16 +4,20 @@
  * one kernel.json.claude_bin runs:
  *   wrap: cli-node + wrap kin-kernel
  *   cc:   cc-node + wrap kin-kernel
- *   crag: cc-node + share/crag/kin-kernel
+ *   crag + legacy: cc-node + share/crag/kin-kernel
+ *   crag + v2: Node CRAG worker, only when this VM pins crag_kernel_version=v2
  * Engine rust only chooses which process serves /v1. Credentials stay out.
+ * Switching one VM never deletes cli-node and never rewrites routing.json.
  */
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { kernelBinPath } from '../transport/rust-kernel-supervisor.mjs'
 import { isCodexVm } from './vm-kind.mjs'
+import { isKvmRuntime } from './runtime-kind.mjs'
 import { nativeCliForVm, NATIVE_CLI_FILES } from './native-cli.mjs'
-import { resolveKernelDataplane } from './slot-engine.mjs'
+import { resolveCragKernelVersion, resolveKernelDataplane } from './slot-engine.mjs'
 
 export const WRAP_CLI_BIN = 'cli-node'
 export const CC_NODE_BIN = 'cc-node'
@@ -70,6 +74,280 @@ if [ -x "$BIN" ]; then
 fi
 exec "$DIR/${WRAP_KERNEL_WRAPPER}.real" "$@"
 `
+}
+
+export const CRAG_V2_DIR = 'crag-v2'
+const CRAG_V2_ENTRY = 'bin/crag-kernel-worker.mjs'
+const CRAG_V2_CAPS = Object.freeze(['official_full', 'zero', 'cancel', 'telemetry', 'unix_socket_envelope'])
+
+export function cragV2Arch() {
+  if (process.arch === 'x64') return 'amd64'
+  if (process.arch === 'arm64') return 'arm64'
+  return process.arch
+}
+
+/** Package location only. This does not select v2 for VMs that omitted the version. */
+export function cragV2PackageRoot(projectRoot) {
+  const env = String(process.env.KIN_CRAG_V2_ROOT || '').trim()
+  if (env && isFile(path.join(env, 'manifest.json'))) return env
+  if (!projectRoot) return ''
+  const staged = path.join(projectRoot, 'share', 'crag', 'kernels', 'v2', cragV2Arch())
+  return isFile(path.join(staged, 'manifest.json')) ? staged : ''
+}
+
+export function cragV2KernelWrapperScript() {
+  return `#!/bin/sh
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$DIR/${WRAP_KERNEL_BIN}" "$DIR/${CRAG_V2_DIR}/${CRAG_V2_ENTRY}" "$@"
+`
+}
+
+function cragV2PlacementError(vm) {
+  if (String(vm?.node_id || '').trim() || isKvmRuntime(vm)) {
+    return {
+      ok: false,
+      code: 'crag_v2_unsupported_placement',
+      error: 'CRAG v2 only runs on a local Linux Docker slot',
+    }
+  }
+  return null
+}
+
+function listCragV2Files(dir, prefix = '') {
+  const rows = []
+  let names = []
+  try {
+    names = fs.readdirSync(dir)
+  } catch {
+    return { ok: false, code: 'crag_v2_package_missing', error: 'CRAG v2 package directory is missing' }
+  }
+  for (const name of names) {
+    const rel = prefix ? `${prefix}/${name}` : name
+    if (rel.split('/').some((part) => part === '..' || part === '')) {
+      return { ok: false, code: 'crag_v2_manifest_invalid', error: `CRAG v2 path is unsafe: ${rel}` }
+    }
+    const abs = path.join(dir, name)
+    let st
+    try {
+      st = fs.lstatSync(abs)
+    } catch {
+      return { ok: false, code: 'crag_v2_package_missing', error: `CRAG v2 package missing ${rel}` }
+    }
+    if (st.isSymbolicLink()) {
+      return { ok: false, code: 'crag_v2_symlink', error: `CRAG v2 package symlink is not allowed: ${rel}` }
+    }
+    if (st.isDirectory()) {
+      const nested = listCragV2Files(abs, rel)
+      if (nested.ok === false) return nested
+      rows.push(...nested)
+    } else if (st.isFile()) rows.push(rel)
+  }
+  return rows
+}
+
+function verifyCragV2Tree(dir) {
+  let manifest
+  try {
+    manifest = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json'), 'utf8'))
+  } catch {
+    return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 manifest.json is missing or invalid' }
+  }
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+    return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 manifest must be an object' }
+  }
+  if (manifest.family !== 'crag' || manifest.version !== 'v2') {
+    return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 manifest family/version mismatch' }
+  }
+  if (manifest.arch !== cragV2Arch()) {
+    return {
+      ok: false,
+      code: 'crag_v2_arch_mismatch',
+      error: `CRAG v2 arch ${manifest.arch} does not match ${cragV2Arch()}`,
+    }
+  }
+  if (manifest.entrypoint !== CRAG_V2_ENTRY) {
+    return {
+      ok: false,
+      code: 'crag_v2_manifest_invalid',
+      error: 'CRAG v2 entrypoint must be bin/crag-kernel-worker.mjs',
+    }
+  }
+  const nodeMajor = /^v(\d+)\./.exec(String(manifest.node_version || ''))
+  if (!nodeMajor || Number(nodeMajor[1]) < 24) {
+    return { ok: false, code: 'crag_v2_node_version', error: 'CRAG v2 node_version must be >= 24' }
+  }
+  if (!Array.isArray(manifest.capabilities) || CRAG_V2_CAPS.some((cap) => !manifest.capabilities.includes(cap))) {
+    return { ok: false, code: 'crag_v2_capabilities', error: 'CRAG v2 manifest is missing required capabilities' }
+  }
+  if (!manifest.sha256 || typeof manifest.sha256 !== 'object' || Array.isArray(manifest.sha256)) {
+    return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 manifest sha256 map is missing' }
+  }
+  const listed = listCragV2Files(dir)
+  if (listed.ok === false) return listed
+  const expected = new Set(Object.keys(manifest.sha256))
+  if (!expected.has(CRAG_V2_ENTRY)) {
+    return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 manifest does not hash the entrypoint' }
+  }
+  const present = new Set(listed.filter((rel) => rel !== 'manifest.json'))
+  for (const rel of expected) {
+    if (rel.includes('..') || rel.startsWith('/') || rel.includes('\\')) {
+      return { ok: false, code: 'crag_v2_manifest_invalid', error: `CRAG v2 manifest path is unsafe: ${rel}` }
+    }
+    if (!present.has(rel)) return { ok: false, code: 'crag_v2_hash_mismatch', error: `CRAG v2 package missing ${rel}` }
+  }
+  for (const rel of present) {
+    if (!expected.has(rel)) {
+      return { ok: false, code: 'crag_v2_hash_mismatch', error: `CRAG v2 package has unlisted file ${rel}` }
+    }
+    const digest = crypto
+      .createHash('sha256')
+      .update(fs.readFileSync(path.join(dir, rel)))
+      .digest('hex')
+    if (digest !== manifest.sha256[rel]) {
+      return { ok: false, code: 'crag_v2_hash_mismatch', error: `CRAG v2 hash mismatch: ${rel}` }
+    }
+  }
+  return { ok: true, manifest }
+}
+
+function stageCragV2Tree(src, dest) {
+  const parent = path.dirname(dest)
+  const base = path.basename(dest)
+  const staging = path.join(parent, `.${base}.${process.pid}.new`)
+  const backup = path.join(parent, `.${base}.${process.pid}.bak`)
+  fs.rmSync(staging, { recursive: true, force: true })
+  fs.rmSync(backup, { recursive: true, force: true })
+  fs.cpSync(src, staging, { recursive: true, dereference: false })
+  const verified = verifyCragV2Tree(staging)
+  if (!verified.ok) {
+    fs.rmSync(staging, { recursive: true, force: true })
+    return verified
+  }
+  const had = fs.existsSync(dest)
+  if (had) fs.renameSync(dest, backup)
+  try {
+    fs.renameSync(staging, dest)
+  } catch {
+    if (had) {
+      try {
+        fs.renameSync(backup, dest)
+      } catch {}
+    }
+    fs.rmSync(staging, { recursive: true, force: true })
+    return { ok: false, code: 'crag_v2_stage_failed', error: 'failed to replace the CRAG v2 package' }
+  }
+  return {
+    ok: true,
+    rollback() {
+      fs.rmSync(dest, { recursive: true, force: true })
+      if (had && fs.existsSync(backup)) fs.renameSync(backup, dest)
+      fs.rmSync(staging, { recursive: true, force: true })
+    },
+    commit() {
+      fs.rmSync(backup, { recursive: true, force: true })
+      fs.rmSync(staging, { recursive: true, force: true })
+    },
+  }
+}
+
+function cragV2WouldChange(src, destDir, nodeSrc) {
+  const destRoot = path.join(destDir, CRAG_V2_DIR)
+  if (!filesEqual(path.join(src, 'manifest.json'), path.join(destRoot, 'manifest.json'))) return true
+  if (verifyCragV2Tree(destRoot).ok !== true) return true
+  if (!filesEqual(nodeSrc, path.join(destDir, WRAP_KERNEL_BIN))) return true
+  try {
+    if (fs.readFileSync(path.join(destDir, WRAP_KERNEL_WRAPPER), 'utf8') !== cragV2KernelWrapperScript()) return true
+  } catch {
+    return true
+  }
+  return false
+}
+
+function writeCragV2Wrapper(destDir) {
+  const wrapper = path.join(destDir, WRAP_KERNEL_WRAPPER)
+  const body = cragV2KernelWrapperScript()
+  try {
+    if (fs.readFileSync(wrapper, 'utf8') === body) return
+  } catch {}
+  const tmp = path.join(destDir, `.${WRAP_KERNEL_WRAPPER}.${process.pid}.new`)
+  fs.writeFileSync(tmp, body, { mode: 0o755 })
+  try {
+    fs.unlinkSync(wrapper)
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      try {
+        fs.unlinkSync(tmp)
+      } catch {}
+      throw error
+    }
+  }
+  fs.renameSync(tmp, wrapper)
+}
+
+export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, nodeBin = '' } = {}) {
+  if (!projectRoot || !vm?.id) {
+    return { ok: false, code: 'vm_required', error: 'projectRoot and vm id required' }
+  }
+  const placement = cragV2PlacementError(vm)
+  if (placement) return placement
+  const src = cragV2PackageRoot(projectRoot)
+  if (!src) {
+    return {
+      ok: false,
+      code: 'crag_v2_package_missing',
+      error: 'CRAG v2 package missing (share/crag/kernels/v2/<arch> or KIN_CRAG_V2_ROOT)',
+    }
+  }
+  const nodeSrc = String(nodeBin || '').trim() || process.execPath
+  if (!isFile(nodeSrc)) {
+    return { ok: false, code: 'crag_v2_node_missing', error: 'control-plane Node binary missing' }
+  }
+  const dest = wrapCliHomeDir(projectRoot, vm.id)
+  fs.mkdirSync(dest, { recursive: true })
+  if (!cragV2WouldChange(src, dest, nodeSrc)) {
+    return {
+      ok: true,
+      dest,
+      src,
+      dataplane: 'crag',
+      kernel_version: 'v2',
+      runtime_variant: 'crag-v2',
+      changed: false,
+      kernel_changed: false,
+      glibc_shim: false,
+      wrapper: true,
+      kernel_bin: true,
+    }
+  }
+  const tree = stageCragV2Tree(src, path.join(dest, CRAG_V2_DIR))
+  if (!tree.ok) return tree
+  try {
+    replaceFile(nodeSrc, path.join(dest, WRAP_KERNEL_BIN))
+    fs.chmodSync(path.join(dest, WRAP_KERNEL_BIN), 0o755)
+    if (!isFile(path.join(dest, WRAP_KERNEL_BIN))) {
+      tree.rollback()
+      return { ok: false, code: 'crag_v2_node_missing', error: 'failed to install the CRAG v2 Node binary' }
+    }
+    writeCragV2Wrapper(dest)
+  } catch (error) {
+    tree.rollback()
+    return { ok: false, code: 'crag_v2_stage_failed', error: String(error?.message || error) }
+  }
+  tree.commit()
+  chownTree(dest, uid, gid)
+  return {
+    ok: true,
+    dest,
+    src,
+    dataplane: 'crag',
+    kernel_version: 'v2',
+    runtime_variant: 'crag-v2',
+    changed: true,
+    kernel_changed: true,
+    glibc_shim: false,
+    wrapper: isFile(path.join(dest, WRAP_KERNEL_WRAPPER)),
+    kernel_bin: isFile(path.join(dest, WRAP_KERNEL_BIN)),
+  }
 }
 
 export function cragTemplateDir(projectRoot) {
@@ -419,8 +697,17 @@ export function replaceCragKernelBinary(projectRoot, buf) {
 }
 
 export function materializeSlotDataplane(projectRoot, vm, dataplane, opts = {}) {
-  if (dataplane === 'crag') return materializeCragKernel(projectRoot, vm, opts)
+  const resolved = dataplane || resolveKernelDataplane(vm, opts.routing) || 'wrap'
+  if (resolved === 'crag' && resolveCragKernelVersion(vm, opts.routing) === 'v2') {
+    return materializeCragV2(projectRoot, vm, opts)
+  }
+  if (resolved === 'crag') return materializeCragKernel(projectRoot, vm, opts)
   return materializeWrapCli(projectRoot, vm, opts)
+}
+
+export function materializeResolvedKernel(projectRoot, vm, opts = {}) {
+  const dataplane = resolveKernelDataplane(vm, opts.routing) || 'wrap'
+  return materializeSlotDataplane(projectRoot, vm, dataplane, opts)
 }
 
 function writeWrapper(destDir) {
@@ -763,7 +1050,37 @@ export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptio
   for (const vm of vms || []) {
     if (isCodexVm(vm)) continue
     const dataplane = resolveKernelDataplane(vm, routing) || 'wrap'
+    const version = dataplane === 'crag' ? resolveCragKernelVersion(vm, routing) : null
     const destDir = wrapCliHomeDir(projectRoot, vm.id)
+    if (version === 'v2') {
+      const placement = cragV2PlacementError(vm)
+      const src = cragV2PackageRoot(projectRoot)
+      if (placement) {
+        items.push({
+          id: vm.id,
+          dataplane,
+          kernel_version: 'v2',
+          ok: false,
+          code: placement.code,
+          kernel_changed: false,
+        })
+        continue
+      }
+      if (!src) {
+        items.push({
+          id: vm.id,
+          dataplane,
+          kernel_version: 'v2',
+          ok: false,
+          code: 'crag_v2_package_missing',
+          kernel_changed: false,
+        })
+        continue
+      }
+      const kernelChanged = cragV2WouldChange(src, destDir, process.execPath) || Boolean(vm?.kernel_restart_pending)
+      items.push({ id: vm.id, dataplane, kernel_version: 'v2', ok: true, kernel_changed: kernelChanged })
+      continue
+    }
     const src = dataplane === 'crag' ? crag.path : kernelPayloadPath(sample.dir, projectRoot)
     if (dataplane === 'crag' && !crag.ok) {
       items.push({ id: vm.id, dataplane, ok: false, code: 'crag_kernel_missing', kernel_changed: false })
@@ -804,11 +1121,12 @@ export function syncWrapSample(projectRoot, vms, { uidOf, routing } = {}) {
   for (const vm of vms || []) {
     if (isCodexVm(vm)) continue
     const dataplane = resolveKernelDataplane(vm, routing) || 'wrap'
+    const version = dataplane === 'crag' ? resolveCragKernelVersion(vm, routing) : null
     if ((dataplane === 'wrap' || dataplane === 'cc') && !sample.ok) {
       items.push({ id: vm.id, dataplane, ok: false, code: sample.code, error: sample.error })
       continue
     }
-    if (dataplane === 'crag' && !crag.ok) {
+    if (version !== 'v2' && dataplane === 'crag' && !crag.ok) {
       items.push({
         id: vm.id,
         dataplane,
@@ -823,6 +1141,7 @@ export function syncWrapSample(projectRoot, vms, { uidOf, routing } = {}) {
     const out = materializeSlotDataplane(projectRoot, vm, dataplane, {
       uid: uid?.uid ?? uid,
       gid: gid ?? null,
+      routing,
     })
     if (vm?.kernel_restart_pending) out.kernel_changed = true
     items.push({ id: vm.id, dataplane, ...out })

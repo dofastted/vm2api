@@ -20,6 +20,7 @@ export const INFERENCE_ENGINES = Object.freeze(['rust'])
 export const SLOT_PERSONA_PRESETS = Object.freeze(['official', 'official_full', 'zero', OFFICIAL_303_PRESET])
 export const OFFICIAL_CC_INFERENCES = Object.freeze(['http', 'cli-hop'])
 export const KERNEL_DATAPLANES = Object.freeze(['wrap', 'cc', 'crag'])
+export const CRAG_KERNEL_VERSIONS = Object.freeze(['legacy', 'v2'])
 export const CONTAINER_CLI_NODE_BIN = '/home/kincli/.kin/cli-node'
 export const CONTAINER_CC_NODE_BIN = '/home/kincli/.kin/cc-node'
 export const CONTAINER_CRAG_CLAUDE_BIN = CONTAINER_CC_NODE_BIN
@@ -128,6 +129,7 @@ export function normalizeInferenceConfig(raw = {}) {
     session_slots: normalizeSessionSlots(raw.session_slots),
     session_idle_ttl_seconds: normalizeSessionIdleTtlSeconds(raw.session_idle_ttl_seconds),
     dataplane: normalizeKernelDataplane(raw.dataplane),
+    crag_kernel_version: normalizeCragKernelVersion(raw.crag_kernel_version) || 'legacy',
   }
 }
 
@@ -161,6 +163,37 @@ export function resolveKernelDataplane(vm, routing = {}) {
   const fromVm = normalizeKernelDataplane(vm?.dataplane, { inherit: true })
   if (fromVm) return fromVm
   return normalizeKernelDataplane(routing?.inference?.dataplane)
+}
+
+/** Public ids are `crag-legacy` and `crag-v2`. Omitted stays legacy; a VM pin beats routing. */
+export function normalizeCragKernelVersion(value, { inherit = false } = {}) {
+  const raw = String(value ?? '')
+    .trim()
+    .toLowerCase()
+    .replaceAll('_', '-')
+  if (!raw || raw === 'inherit' || raw === 'global' || raw === 'default' || raw === 'auto') {
+    return inherit ? '' : 'legacy'
+  }
+  if (raw === 'legacy' || raw === 'crag-legacy' || raw === 'elf') return 'legacy'
+  if (raw === 'v2' || raw === 'crag-v2') return 'v2'
+  return null
+}
+
+export function resolveCragKernelVersion(vm, routing = {}) {
+  if (isCodexVm(vm)) return null
+  const fromVm = normalizeCragKernelVersion(vm?.crag_kernel_version, { inherit: true })
+  if (fromVm) return fromVm
+  const fromRouting = normalizeCragKernelVersion(routing?.inference?.crag_kernel_version, { inherit: true })
+  if (fromRouting) return fromRouting
+  return 'legacy'
+}
+
+export function parseCragKernelVersionPatch(value) {
+  if (value == null || value === '') return { ok: true, value: '' }
+  const parsed = normalizeCragKernelVersion(value, { inherit: true })
+  if (parsed == null) return { ok: false, error: 'crag_kernel_version must be legacy or v2' }
+  if (!parsed) return { ok: true, value: '' }
+  return { ok: true, value: parsed }
 }
 
 export function parseKernelDataplanePatch(value) {
@@ -276,8 +309,9 @@ export function parseSlotEnginePolicyPatch(body = {}) {
   const hasEngine = Object.prototype.hasOwnProperty.call(body, 'inference_engine')
   const hasPersona = Object.prototype.hasOwnProperty.call(body, 'persona_preset')
   const hasDataplane = Object.prototype.hasOwnProperty.call(body, 'dataplane')
-  if (!hasEngine && !hasPersona && !hasDataplane) {
-    return { ok: false, error: 'inference_engine, persona_preset or dataplane required' }
+  const hasCragVersion = Object.prototype.hasOwnProperty.call(body, 'crag_kernel_version')
+  if (!hasEngine && !hasPersona && !hasDataplane && !hasCragVersion) {
+    return { ok: false, error: 'inference_engine, persona_preset, dataplane or crag_kernel_version required' }
   }
   const patch = {}
   if (hasEngine) {
@@ -294,6 +328,11 @@ export function parseSlotEnginePolicyPatch(body = {}) {
     const parsed = parseKernelDataplanePatch(body.dataplane)
     if (!parsed.ok) return parsed
     patch.dataplane = parsed.value
+  }
+  if (hasCragVersion) {
+    const parsed = parseCragKernelVersionPatch(body.crag_kernel_version)
+    if (!parsed.ok) return parsed
+    patch.crag_kernel_version = parsed.value
   }
   return { ok: true, patch }
 }
@@ -360,6 +399,11 @@ export function validateInferenceRoutingPatch(body = {}) {
     const parsed = parseKernelDataplanePatch(body.inference.dataplane)
     if (!parsed.ok) errors.push(parsed.error)
     else if (!parsed.value) errors.push('inference.dataplane 必须是 wrap、cc 或 crag')
+  }
+  if (Object.prototype.hasOwnProperty.call(body.inference, 'crag_kernel_version')) {
+    const parsed = parseCragKernelVersionPatch(body.inference.crag_kernel_version)
+    if (!parsed.ok) errors.push(parsed.error)
+    else if (!parsed.value) errors.push('inference.crag_kernel_version 必须是 legacy 或 v2')
   }
   return errors
 }

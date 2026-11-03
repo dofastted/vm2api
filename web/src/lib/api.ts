@@ -144,6 +144,8 @@ export async function api<T = unknown>(
 export type VmPatch = {
   inference_engine?: 'go' | 'rust' | ''
   persona_preset?: string
+  dataplane?: 'wrap' | 'cc' | 'crag' | ''
+  crag_kernel_version?: 'legacy' | 'v2' | ''
   /** null = 去掉本槽覆盖，跟随分档 / 全局。 */
   max_concurrency?: number | null
   max_rpm?: number | null

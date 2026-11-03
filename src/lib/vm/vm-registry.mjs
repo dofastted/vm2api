@@ -432,6 +432,10 @@ function applySlotEnginePatch(vm, patch = {}) {
     if (patch.dataplane) vm.dataplane = patch.dataplane
     else delete vm.dataplane
   }
+  if (Object.prototype.hasOwnProperty.call(patch, 'crag_kernel_version')) {
+    if (patch.crag_kernel_version) vm.crag_kernel_version = patch.crag_kernel_version
+    else delete vm.crag_kernel_version
+  }
 }
 
 export function persistSlotEnginePolicy(projectRoot, vmId, patch = {}) {

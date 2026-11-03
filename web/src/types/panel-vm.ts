@@ -346,6 +346,8 @@ export type Vm = {
   resolved_persona_preset?: string | null
   dataplane?: 'wrap' | 'cc' | 'crag' | null
   resolved_dataplane?: 'wrap' | 'cc' | 'crag' | null
+  crag_kernel_version?: 'legacy' | 'v2' | null
+  resolved_crag_kernel_version?: 'legacy' | 'v2' | null
   kernel?: string
   /** docker | kvm。缺省按 docker 展示。 */
   runtime_type?: RuntimeType | null

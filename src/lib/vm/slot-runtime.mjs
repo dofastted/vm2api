@@ -18,7 +18,7 @@ import {
 } from '../transport/codex-kernel-supervisor.mjs'
 import { runtimeKind, isKvmRuntime } from './runtime-kind.mjs'
 import { getVm, listVms, isCodexVm, persistVmRuntime } from './vm-registry.mjs'
-import { resolveInferenceEngine } from './slot-engine.mjs'
+import { resolveInferenceEngine, resolveKernelDataplane } from './slot-engine.mjs'
 import {
   containerHasKernelMount,
   containerName,
@@ -26,7 +26,7 @@ import {
   startVmRuntime,
   reloadSlotWorker,
 } from './vm-runtime.mjs'
-import { inspectWrapCliDir, materializeWrapCli, wrapCliHomeDir } from './wrap-cli-runtime.mjs'
+import { inspectWrapCliDir, materializeSlotDataplane, materializeWrapCli, wrapCliHomeDir } from './wrap-cli-runtime.mjs'
 import { isLocalEgressProxy } from './egress.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm, slotHost } from './slot-host.mjs'
@@ -165,9 +165,13 @@ export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
   // KVM bind-mounts payload at /opt/kin-guest, not /usr/local/bin/kin-kernel.
   if (!slotHost(vm).bakedKernel) {
     const dest = wrapCliHomeDir(projectRoot, vm.id)
-    let wrap = inspectWrapCliDir(dest)
+    const dataplane = resolveKernelDataplane(vm, routing) || 'wrap'
+    let wrap = dataplane === 'crag' ? null : inspectWrapCliDir(dest)
     if (!wrap?.ok) {
-      wrap = (opts.ops?.materializeWrapCli || materializeWrapCli)(projectRoot, vm)
+      wrap =
+        dataplane === 'crag'
+          ? materializeSlotDataplane(projectRoot, vm, dataplane, { routing })
+          : (opts.ops?.materializeWrapCli || materializeWrapCli)(projectRoot, vm)
     }
     if (!wrap?.ok) {
       return {
@@ -273,7 +277,11 @@ export async function switchSlotInferenceEngine(vm, projectRoot, engine, { timeo
   const kernelBin = (ops.kernelBinPath || kernelBinPath)()
   let wrap = null
   if (engine === 'rust') {
-    wrap = (ops.materializeWrapCli || materializeWrapCli)(projectRoot, vm)
+    const dataplane = resolveKernelDataplane(vm, ops.routing) || 'wrap'
+    wrap =
+      dataplane === 'crag'
+        ? materializeSlotDataplane(projectRoot, vm, dataplane, { routing: ops.routing })
+        : (ops.materializeWrapCli || materializeWrapCli)(projectRoot, vm)
     if (!wrap?.ok) {
       return {
         ok: false,

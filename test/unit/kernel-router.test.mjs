@@ -778,6 +778,44 @@ test('writeKernelConfig points cc and crag at cc-node', () => {
   }
 })
 
+test('writeKernelConfig adds CRAG v2 fields only for a pinned local slot', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-crag-v2-cfg-'))
+  try {
+    const legacy = JSON.parse(
+      fs.readFileSync(writeKernelConfig(root, { id: 'vm-09', dataplane: 'crag' }, { token: 'tok' }).configPath, 'utf8'),
+    )
+    assert.equal(legacy.claude_bin, '/home/kincli/.kin/cc-node')
+    assert.equal(legacy.crag_v2_root, undefined)
+    assert.equal(legacy.node_bin, undefined)
+    const v2 = JSON.parse(
+      fs.readFileSync(
+        writeKernelConfig(root, { id: 'vm-09', dataplane: 'crag', crag_kernel_version: 'v2' }, { token: 'tok' })
+          .configPath,
+        'utf8',
+      ),
+    )
+    assert.equal(v2.dataplane, 'crag')
+    assert.equal(v2.claude_bin, '/home/kincli/.kin/cc-node')
+    assert.equal(v2.crag_kernel_version, 'v2')
+    assert.equal(v2.runtime_variant, 'crag-v2')
+    assert.equal(v2.crag_v2_root, '/home/kincli/.kin/crag-v2')
+    assert.equal(v2.node_bin, '/home/kincli/.kin/kin-kernel.bin')
+    const remote = JSON.parse(
+      fs.readFileSync(
+        writeKernelConfig(
+          root,
+          { id: 'vm-09', dataplane: 'crag', crag_kernel_version: 'v2', node_id: 'node-1' },
+          { token: 'tok' },
+        ).configPath,
+        'utf8',
+      ),
+    )
+    assert.equal(remote.crag_v2_root, undefined)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('writeKernelConfig uses identity layout when persona_inject is rewrite', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-identity-'))
   const written = writeKernelConfig(
