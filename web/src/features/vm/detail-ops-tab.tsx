@@ -126,16 +126,18 @@ export function VmOpsTab(props: VmOpsTabProps) {
         <Button
           size='sm'
           variant='outline'
-          disabled={isActiveVmPointer(vm)}
-          loading={busy('/activate')}
+          disabled={busy('/activate') || busy('/deactivate')}
+          loading={busy('/activate') || busy('/deactivate')}
           title={
             isActiveVmPointer(vm)
-              ? '已是当前活跃槽'
+              ? '清空面板默认槽位，不影响调度'
               : '写入 vms/active.json，面板默认接口指向此槽'
           }
-          onClick={() => onAction('/activate')}
+          onClick={() =>
+            onAction(isActiveVmPointer(vm) ? '/deactivate' : '/activate')
+          }
         >
-          设为活跃
+          {isActiveVmPointer(vm) ? '取消活跃' : '设为活跃'}
         </Button>
         <Button
           size='sm'

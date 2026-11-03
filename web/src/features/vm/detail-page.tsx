@@ -232,6 +232,8 @@ function VmDetailBody({
           else toast.warning(boot.message)
         } else if (path === '/stop') {
           toast.success('已关机，调度已关闭')
+        } else if (path === '/deactivate') {
+          toast.success('已取消活跃')
         } else if (path === '/activate') {
           toast.success('已设为活跃槽')
         } else {

@@ -130,16 +130,23 @@ export function VmActionMenu({
           ) : null}
           {actions.activate ? (
             <DropdownMenuItem
-              disabled={isActiveVmPointer(vm) || actions.activatingId === vm.id}
+              disabled={
+                actions.activatingId === vm.id ||
+                (isActiveVmPointer(vm) && !actions.deactivate)
+              }
               title={
                 isActiveVmPointer(vm)
-                  ? '已是当前活跃槽'
+                  ? '清空面板默认槽位，不影响调度'
                   : '写入 vms/active.json，面板默认接口指向此槽'
               }
-              onSelect={() => actions.activate?.(vm)}
+              onSelect={() =>
+                isActiveVmPointer(vm)
+                  ? actions.deactivate?.(vm)
+                  : actions.activate?.(vm)
+              }
             >
               <Star />
-              设为活跃
+              {isActiveVmPointer(vm) ? '取消活跃' : '设为活跃'}
             </DropdownMenuItem>
           ) : null}
           <DropdownMenuSeparator />
