@@ -1057,7 +1057,7 @@ function rejectCodexAdmission({ res, json, stats, logBag, picked, model }) {
     // Queue-full has no retryAt. Every Codex pool_overloaded 429 still advertises >= 1s.
     const waitMs = Number(picked.retryAt) - Date.now()
     const retryAfterSec = Math.max(1, waitMs > 0 ? Math.ceil(waitMs / 1000) : 0)
-    res.setHeader?.('retry-after', String(retryAfterSec))
+    if (!res.headersSent) res.setHeader?.('retry-after', String(retryAfterSec))
     return json(res, 429, {
       error: {
         type: 'rate_limit_error',
@@ -1070,7 +1070,7 @@ function rejectCodexAdmission({ res, json, stats, logBag, picked, model }) {
   if (picked.error === 'pool_resting') {
     // Every slot is off-shift: 503 like the Claude pool, timed to the first window open.
     const waitMs = Number(picked.retryAt) - Date.now()
-    res.setHeader?.('retry-after', String(Math.max(1, Math.ceil(waitMs / 1000) || 1)))
+    if (!res.headersSent) res.setHeader?.('retry-after', String(Math.max(1, Math.ceil(waitMs / 1000) || 1)))
     return json(res, 503, {
       error: {
         type: 'api_error',
