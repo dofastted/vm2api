@@ -976,6 +976,15 @@ export function createPanelHandler(ctx) {
     return { ...config, account_scope: jevScopeInventory(config.account_platform_plans) }
   }
 
+  function deactivateVmSlot(id) {
+    if (getActiveVmId(cfg.paths.project) === id) {
+      clearActiveVmFromDb()
+      clearActiveVm(cfg.paths.project)
+      reloadActiveVm(cfg)
+    }
+    return { ok: true, active_vm: getActiveVmId(cfg.paths.project) }
+  }
+
   function activateVmSlot(id) {
     setActiveVm(cfg.paths.project, id)
     reloadActiveVm(cfg)
@@ -1283,6 +1292,12 @@ export function createPanelHandler(ctx) {
       const id = p.split('/')[3]
       if (!getVm(cfg.paths.project, id)) return json(res, 404, { error: { message: 'vm not found' } })
       return json(res, 200, activateVmSlot(id))
+    }
+    if (req.method === 'POST' && /^\/admin\/vms\/[^/]+\/deactivate$/.test(p)) {
+      if (!requireAuth(req, res)) return
+      const id = p.split('/')[3]
+      if (!getVm(cfg.paths.project, id)) return json(res, 404, { error: { message: 'vm not found' } })
+      return json(res, 200, deactivateVmSlot(id))
     }
     if (req.method === 'POST' && /^\/admin\/vms\/[^/]+\/probe$/.test(p)) {
       if (!requireAuth(req, res)) return
@@ -3294,6 +3309,21 @@ export function createPanelHandler(ctx) {
           return json(res, e.status, { ok: false, error: e.body.error })
         }
         return json(res, 200, panel.ok(activateVmSlot(id)))
+      }
+
+      // POST /api/panel/vms/:id/deactivate
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/deactivate$/.test(p)) {
+        const id = p.split('/')[4]
+        if (!getVm(cfg.paths.project, id)) {
+          const e = makeError({
+            type: ErrorType.NOT_FOUND,
+            code: ErrorCode.VM_NOT_FOUND,
+            message: 'vm not found',
+            status: 404,
+          })
+          return json(res, e.status, { ok: false, error: e.body.error })
+        }
+        return json(res, 200, panel.ok(deactivateVmSlot(id)))
       }
 
       // POST /api/panel/vms/:id/update-claude-code — Claude CLI runtime was removed

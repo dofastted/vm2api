@@ -467,8 +467,10 @@ export function setActiveVm(projectRoot, id) {
 export function clearActiveVm(projectRoot) {
   const file = path.join(projectRoot, 'vms', 'active.json')
   try {
-    fs.rmSync(file, { force: true })
-  } catch {}
+    fs.unlinkSync(file)
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error
+  }
   invalidateReadCache(file)
 }
 

@@ -18,6 +18,8 @@ export type VmActions = {
   remove?: (vm: Vm) => void
   /** 设为全局活跃槽（`POST …/activate`）。 */
   activate?: (vm: Vm) => void
+  /** 取消全局活跃槽，不影响调度。 */
+  deactivate?: (vm: Vm) => void
   activatingId?: string | null
   /** admin：打开分配租户对话框 / 收回确认。 */
   openAssignOwner?: (vm: Vm) => void

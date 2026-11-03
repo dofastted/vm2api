@@ -72,6 +72,7 @@ const PANEL_ROUTE_SAMPLES = [
   ['POST', '/api/panel/vms/vm-01/start'],
   ['POST', '/api/panel/vms/vm-01/stop'],
   ['POST', '/api/panel/vms/vm-01/activate'],
+  ['POST', '/api/panel/vms/vm-01/deactivate'],
   ['POST', '/api/panel/vms/vm-01/reset'],
   ['POST', '/api/panel/vms/vm-01/reset-fingerprint'],
   ['POST', '/api/panel/vms/vm-01/allocate-proxy'],
