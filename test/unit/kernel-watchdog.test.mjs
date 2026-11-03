@@ -92,7 +92,7 @@ test('container restarts are bounded, spaced out, then the VM is faulted until h
     await wd.tick()
     assert.deepEqual(ensured, [60_000, 360_000], 'budget spent: no third restart')
     assert.equal(faults.length, 1)
-    assert.match(faults[0][1], /2 container restarts: cli restarts spent/)
+    assert.match(faults[0][1], /2 recovery attempts: cli restarts spent/)
     assert.ok(kernelFaults.has('vm-loop'), 'faulted VM is skipped by scheduling')
     now = 10_000_000
     await wd.tick()
@@ -173,7 +173,7 @@ test('inherited rust slot reaches the restart ladder after CLI budget is spent',
     await wd.tick()
     assert.deepEqual(ensured, ['vm-inherit', 'vm-inherit', 'vm-inherit'], 'budget spent: no fourth restart')
     assert.equal(faults.length, 1)
-    assert.match(faults[0][1], /3 container restarts: native cli stdout closed/)
+    assert.match(faults[0][1], /3 recovery attempts: native cli stdout closed/)
     assert.ok(kernelFaults.has('vm-inherit'))
   } finally {
     kernelFaults.delete('vm-inherit')
