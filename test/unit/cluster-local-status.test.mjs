@@ -1,10 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import fs from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
-import os from 'node:os'
-import path from 'node:path'
 import { collectLocalStatus, containerMemoryUsed, localDisk } from '../../src/lib/cluster/local-status.mjs'
 
 test('containerMemoryUsed subtracts inactive_file on cgroup v2 and v1', () => {
@@ -16,15 +13,13 @@ test('containerMemoryUsed subtracts inactive_file on cgroup v2 and v1', () => {
 })
 
 test('localDisk reads the filesystem behind a directory, null when missing', () => {
-  const disk = localDisk(os.tmpdir())
+  const disk = localDisk(process.cwd())
   assert.ok(disk.disk_total > 0 && disk.disk_used >= 0 && disk.disk_pct >= 0 && disk.disk_pct <= 100)
   assert.deepEqual(localDisk('/nonexistent-vm2api-dir'), { disk_total: null, disk_used: null, disk_pct: null })
 })
 
-/** Minimal Docker Engine API on a unix socket: version, info, slot list, per-slot stats. */
+/** Task-owned mock Docker API on an ephemeral loopback port; no Docker daemon or disk state. */
 async function fakeDocker(t, stats) {
-  const dir = fs.mkdtempSync(path.join(process.env.TMPDIR && process.env.TMPDIR.length < 40 ? process.env.TMPDIR : '/tmp', 'vls-'))
-  const sock = path.join(dir, 'd.sock')
   const seen = []
   const server = http.createServer((req, res) => {
     seen.push(req.url)
@@ -34,21 +29,29 @@ async function fakeDocker(t, stats) {
     }
     if (req.url === '/version') return send(200, { Version: '29.9.2', ApiVersion: '1.51' })
     if (req.url === '/info') return send(200, { Containers: 5, ContainersRunning: 4 })
-    if (req.url.startsWith('/containers/json')) return send(200, Object.keys(stats).map((Id) => ({ Id })))
+    if (req.url.startsWith('/containers/json'))
+      return send(
+        200,
+        Object.keys(stats).map((Id) => ({ Id })),
+      )
     const m = req.url.match(/^\/containers\/([^/]+)\/stats\?stream=false&one-shot=true$/)
     if (m && stats[m[1]] !== undefined) {
       return stats[m[1]] === 'fail' ? send(500, { message: 'boom' }) : send(200, stats[m[1]])
     }
     return send(404, { message: 'no' })
   })
-  await new Promise((resolve) => server.listen(sock, resolve))
-  t.after(() => {
-    server.close()
-    fs.rmSync(dir, { recursive: true, force: true })
+  t.after(async () => {
+    server.closeAllConnections()
+    await new Promise((resolve) => server.close(resolve))
   })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  const port = server.address().port
   const connect = () =>
     new Promise((resolve, reject) => {
-      const s = net.connect(sock)
+      const s = net.connect({ host: '127.0.0.1', port })
       s.once('connect', () => resolve(s))
       s.once('error', reject)
     })

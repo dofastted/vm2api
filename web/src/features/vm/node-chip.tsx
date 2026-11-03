@@ -2,7 +2,6 @@ import { useQuery } from '@tanstack/react-query'
 import { Server } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { meQueryOptions } from '@/features/auth/queries'
-import { shortNodeLabel } from '@/features/cluster/model'
 import { clusterNodesQueryOptions } from '@/features/cluster/queries'
 
 /**

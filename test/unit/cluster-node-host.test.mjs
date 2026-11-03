@@ -1,7 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { NODE_HOST_COMMAND, NODE_HOST_COMMAND_DARWIN, diskFigures, parseNodeHost } from '../../src/lib/cluster/node-host.mjs'
+import {
+  NODE_HOST_COMMAND,
+  NODE_HOST_COMMAND_DARWIN,
+  diskFigures,
+  parseNodeHost,
+} from '../../src/lib/cluster/node-host.mjs'
 
 const SAMPLE = [
   'ncpu 2',

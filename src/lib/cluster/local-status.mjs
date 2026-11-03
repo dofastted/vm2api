@@ -86,7 +86,15 @@ async function localDockerStatus(docker) {
       error: null,
     }
   } catch (err) {
-    return { ok: false, version: null, running: null, containers: null, slots: null, slots_mem: null, error: err.message }
+    return {
+      ok: false,
+      version: null,
+      running: null,
+      containers: null,
+      slots: null,
+      slots_mem: null,
+      error: err.message,
+    }
   }
 }
 
