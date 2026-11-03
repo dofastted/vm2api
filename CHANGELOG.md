@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 第三方客户端入站不带 `ttl` 的缓存断点不再以隐式 5m 出站：与 #850 的官方 Claude Code 一样，渲染前按会话 TTL（请求头 → 入站显式值 → 协议页默认，缺省 1h）补齐。只有调用方显式写 `5m` 才发 5m；前面已有 5m 时补 5m，保持 1h 在 5m 前。官方透传打开时不经过这一步。依赖隐式 5m 的调用方需改为显式 `ttl: "5m"` 或带 `x-kin-cache-ttl: 5m`。
+
 ## 1.4.037 — 2026-11-03
 
 - #866：协议改写按请求体补 `inline-tools-2026-09-15`：`messages` 里出现 `tool_addition.tool.type=tool_definition` 时写入 cli-hop 的 `betas` 和直连 `anthropic-beta`。没有该块不加。修复上游 400 `a tool_definition requires anthropic-beta: inline-tools-2026-09-15`。
