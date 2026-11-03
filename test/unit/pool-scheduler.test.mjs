@@ -2575,6 +2575,72 @@ test('rebuild outbound session stays on one VM and changes after failover', asyn
   assert.equal(sticky.resolve(stickyKey).sessionId, seen[0].sessionId)
 })
 
+test('a device-affinity seat migrates a stale session pin and reuses its outbound session after restart', async (t) => {
+  const root = project()
+  let sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  t.after(() => {
+    sticky.db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const caller = 'device-migration-session'
+  const stickyKey = sticky.canonicalSessionKey(caller)
+  const legacyKey = 'p:anthropic:sess:device-migration-session:klegacy'
+  const deviceKey = sticky.canonicalDeviceKey('device-migration-machine')
+  for (const key of [stickyKey, legacyKey]) {
+    sticky.bind(key, { accountId: 'account-1', vmId: 'vm-01', sessionId: 'old-outbound' }, { countHit: false })
+  }
+  sticky.bindDeviceAffinity(deviceKey, { accountId: 'account-2', vmId: 'vm-02' })
+  const makeRunner = () =>
+    new FailoverRunner({ scheduler: scheduler(root, { stickyRouter: sticky }), stickyRouter: sticky })
+  let runner = makeRunner()
+  const seen = []
+  const headers = []
+  const run = (turn) =>
+    runner.run({
+      requestId: `device-migration-${turn}`,
+      canonicalBody: { model: 'claude-opus-test' },
+      model: 'claude-opus-test',
+      stickyKey,
+      stickyKeys: [stickyKey, legacyKey],
+      seatKey: `seat:sess:${caller}`,
+      deviceKey,
+      applyAttempt: applyRebuildAttempt(caller, { seen, headers, epoch: turn }),
+      callAttempt: () => verifiedHop('reply'),
+    })
+
+  const first = await run(1)
+  assert.equal(first.ok, true)
+  assert.equal(first.vmId, 'vm-02')
+  const sessionId = seen[0].sessionId
+  assert.notEqual(sessionId, 'old-outbound')
+  const assertBound = () => {
+    for (const key of [stickyKey, legacyKey]) {
+      const bound = sticky.resolve(key)
+      assert.equal(bound.accountId, 'account-2')
+      assert.equal(bound.vmId, 'vm-02')
+      assert.equal(bound.sessionId, sessionId)
+      assert.equal(bound.slotIndex, null)
+    }
+  }
+  assertBound()
+  const second = await run(2)
+  assert.equal(second.ok, true)
+  assertBound()
+
+  sticky.db.close()
+  sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+  runner = makeRunner()
+  const restarted = await run(3)
+  assert.equal(restarted.ok, true)
+  assertBound()
+  assert.deepEqual(
+    seen.map((item) => item.sessionId),
+    [sessionId, sessionId, sessionId],
+  )
+  assert.ok(headers.every((item) => item['x-claude-code-session-id'] === sessionId))
+  assert.ok(headers.every((item) => item.metadata_session_id === sessionId))
+})
+
 test('held and restored seats keep their outbound session despite a different family home', async (t) => {
   const root = project()
   const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
