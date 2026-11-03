@@ -198,7 +198,13 @@ test('slot_busy spill serves the turn elsewhere but keeps the session pinned', a
   const callerSession = 'slot-busy-caller'
   const stickyKey = sticky.canonicalSessionKey(callerSession)
   sticky.bind(stickyKey, { accountId: 'account-1', vmId: 'vm-01', sessionId: 'stored-home' }, { countHit: false })
-  const selections = [1, 2].map((n) => ({ ok: true, accountId: `account-${n}`, vmId: `vm-0${n}`, release() {} }))
+  const selections = [1, 2].map((n) => ({
+    ok: true,
+    accountId: `account-${n}`,
+    vmId: `vm-0${n}`,
+    seatKey: `seat:sess:${callerSession}`,
+    release() {},
+  }))
   let index = 0
   const scheduler = {
     async selectAndReserve() {
@@ -217,6 +223,7 @@ test('slot_busy spill serves the turn elsewhere but keeps the session pinned', a
     canonicalBody: { model: 'claude-opus-test' },
     model: 'claude-opus-test',
     stickyKey,
+    seatKey: `seat:sess:${callerSession}`,
     applyAttempt: (body, selected, extra) => ({
       body,
       meta: {
@@ -245,6 +252,43 @@ test('slot_busy spill serves the turn elsewhere but keeps the session pinned', a
     vmId: 'vm-01',
     sessionId: 'stored-home',
   })
+})
+
+test('a late device-affinity hop does not overwrite a newer cross-account session pin', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-device-move-race-'))
+  const sticky = new StickyRouter({ dataDir, config: { sticky: { enabled: true } } })
+  t.after(() => {
+    sticky.db.close()
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  })
+  const callerSession = 'device-move-race'
+  const stickyKey = sticky.canonicalSessionKey(callerSession)
+  sticky.bind(stickyKey, { accountId: 'account-1', vmId: 'vm-01', sessionId: 'old-outbound' }, { countHit: false })
+  const scheduler = new Scheduler([
+    { ...candidate(2), selectionReason: 'device-affinity', seatKey: `seat:sess:${callerSession}` },
+  ])
+  const runner = new FailoverRunner({ scheduler, stickyRouter: sticky })
+  const result = await runner.run({
+    requestId: 'req-device-move-race',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey,
+    seatKey: `seat:sess:${callerSession}`,
+    applyAttempt: (body) => ({ body, meta: { sessionId: 'moved-outbound' } }),
+    callAttempt: () => {
+      sticky.bind(
+        stickyKey,
+        { accountId: 'account-3', vmId: 'vm-03', sessionId: 'newer-outbound' },
+        { allowMove: true, replaceSession: true },
+      )
+      return success()
+    },
+  })
+  assert.equal(result.ok, true)
+  const bound = sticky.resolve(stickyKey)
+  assert.equal(bound.accountId, 'account-3')
+  assert.equal(bound.vmId, 'vm-03')
+  assert.equal(bound.sessionId, 'newer-outbound')
 })
 
 test('#A20: a late completion never writes back a pin another request released', async () => {
