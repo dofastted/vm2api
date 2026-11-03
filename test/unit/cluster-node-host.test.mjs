@@ -1,7 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { NODE_HOST_COMMAND, parseNodeHost } from '../../src/lib/cluster/node-host.mjs'
+import {
+  NODE_HOST_COMMAND,
+  NODE_HOST_COMMAND_DARWIN,
+  diskFigures,
+  parseNodeHost,
+} from '../../src/lib/cluster/node-host.mjs'
 
 const SAMPLE = [
   'ncpu 2',
@@ -24,7 +29,36 @@ test('parseNodeHost uses the local host column scale', () => {
     mem_used: 1_536_000_000,
     mem_pct: 75,
     containers_mem: 250_000_000,
+    disk_total: null,
+    disk_used: null,
+    disk_pct: null,
   })
+})
+
+test('parseNodeHost reads the df line on df scale (reserved blocks are not free)', () => {
+  // 100 GiB disk, 30 GiB used, 65 GiB available (5 GiB reserved for root).
+  const host = parseNodeHost(`${SAMPLE}disk 104857600 31457280 68157440\n`)
+  assert.equal(host.disk_total, 100 * 1024 ** 3)
+  assert.equal(host.disk_used, 30 * 1024 ** 3)
+  assert.equal(host.disk_pct, 31.6)
+})
+
+test('parseNodeHost keeps host stats when the df line is garbage', () => {
+  const host = parseNodeHost(`${SAMPLE}disk - - -\n`)
+  assert.equal(host.cpu_count, 2)
+  assert.equal(host.disk_pct, null)
+})
+
+test('diskFigures rejects empty or impossible readings', () => {
+  assert.deepEqual(diskFigures(null), { disk_total: null, disk_used: null, disk_pct: null })
+  assert.equal(diskFigures(10, 0, 0).disk_pct, null)
+  assert.equal(diskFigures(10, -1, 5).disk_pct, null)
+  assert.equal(diskFigures(10, 5, 5).disk_pct, 50)
+})
+
+test('both host scripts print a disk line', () => {
+  assert.match(NODE_HOST_COMMAND, /df -Pk \//)
+  assert.match(NODE_HOST_COMMAND_DARWIN, /df -Pk .*HOME/)
 })
 
 test('parseNodeHost caps CPU at 100% and reports no containers as null', () => {
@@ -42,4 +76,5 @@ test('parseNodeHost returns null when essentials are missing', () => {
 test('NODE_HOST_COMMAND runs on Linux and parses', { skip: process.platform !== 'linux' }, () => {
   const host = parseNodeHost(execFileSync('sh', ['-c', NODE_HOST_COMMAND], { encoding: 'utf8' }))
   assert.ok(host && host.cpu_count >= 1 && host.mem_total > 0)
+  assert.ok(host.disk_total > 0 && host.disk_pct >= 0)
 })

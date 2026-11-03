@@ -12,6 +12,7 @@ import fs from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
 import { dockerInfo, dockerJson, localDocker } from './docker-remote.mjs'
+import { diskFigures } from './node-host.mjs'
 import { execCollect } from './ssh-link.mjs'
 import { readRoutingConfigFile } from '../core/config.mjs'
 import { probeLocalKvm } from '../vm/kvm-host.mjs'
@@ -72,20 +73,67 @@ async function controlPlane({ listen, containerName, docker }) {
 async function localDockerStatus(docker) {
   try {
     const info = await dockerInfo(docker)
+    const slots = await dockerJson(docker, {
+      path: `/containers/json?filters=${encodeURIComponent(JSON.stringify({ label: ['kin.vm=1'] }))}`,
+    })
     return {
       ok: true,
       version: info.version,
       running: info.running,
       containers: info.containers,
-      slots: (
-        await dockerJson(docker, {
-          path: `/containers/json?filters=${encodeURIComponent(JSON.stringify({ label: ['kin.vm=1'] }))}`,
-        })
-      ).length,
+      slots: slots.length,
+      slots_mem: await slotContainersMemory(docker, slots),
       error: null,
     }
   } catch (err) {
-    return { ok: false, version: null, running: null, containers: null, slots: null, error: err.message }
+    return {
+      ok: false,
+      version: null,
+      running: null,
+      containers: null,
+      slots: null,
+      slots_mem: null,
+      error: err.message,
+    }
+  }
+}
+
+/** `docker stats` memory: usage minus inactive_file (cgroup v2) / total_inactive_file (v1). */
+export function containerMemoryUsed(stats) {
+  const m = stats?.memory_stats
+  if (!m || !Number.isFinite(m.usage)) return null
+  const inactive = Number(m.stats?.inactive_file ?? m.stats?.total_inactive_file ?? 0) || 0
+  return Math.max(0, m.usage - inactive)
+}
+
+/**
+ * Memory the running local slot containers use now (KVM: the guest RAM qemu has
+ * touched). The cluster page subtracts it from host usage to get what everything
+ * else on this host takes. One one-shot stats read per slot, only on this 30s-cached
+ * path; any failed read gives null rather than an undercount.
+ */
+async function slotContainersMemory(docker, slots) {
+  if (!slots.length) return 0
+  const reads = await Promise.all(
+    slots.map((c) =>
+      dockerJson(docker, {
+        path: `/containers/${encodeURIComponent(c.Id)}/stats?stream=false&one-shot=true`,
+        timeoutMs: 5_000,
+      })
+        .then(containerMemoryUsed)
+        .catch(() => null),
+    ),
+  )
+  return reads.some((v) => v == null) ? null : reads.reduce((sum, v) => sum + v, 0)
+}
+
+/** Disk holding the control plane's data (the host's own filesystem, not the container layer). */
+export function localDisk(dir = process.env.KIN_DATA_DIR || process.cwd()) {
+  try {
+    const st = fs.statfsSync(dir)
+    return diskFigures(st.blocks * st.bsize, (st.blocks - st.bfree) * st.bsize, st.bavail * st.bsize)
+  } catch {
+    return diskFigures(null)
   }
 }
 
@@ -133,5 +181,5 @@ export async function collectLocalStatus({ listen, containerName, observer, dock
     probeLocalKvm({ routing: probeRouting }),
   ])
   const nat = await natStatus({ observer, control, addresses })
-  return { checked_at: new Date().toISOString(), control, nat, docker: dockerStatus, kvm }
+  return { checked_at: new Date().toISOString(), control, nat, docker: dockerStatus, kvm, disk: localDisk() }
 }

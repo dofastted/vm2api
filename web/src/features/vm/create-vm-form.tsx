@@ -159,9 +159,12 @@ export interface CreateVmDraft {
 export function useCreateVmDraft({
   pinnedAfter,
   onCreated,
+  nodeId,
 }: {
   pinnedAfter?: CreateVmAfter
   onCreated?: (id: string) => void
+  /** 预选的目标机器；空 = 本机。 */
+  nodeId?: string
 } = {}): CreateVmDraft {
   const qc = useQueryClient()
   const [platform, setPlatform] = useState<Platform>('anthropic')
@@ -186,7 +189,7 @@ export function useCreateVmDraft({
   const diskGb = diskOverride ?? vmCfg.disk_gb
 
   const typedName = name.trim()
-  const placement = usePlacement(kernel, preferredRuntime)
+  const placement = usePlacement(kernel, preferredRuntime, nodeId)
   const kvmAvail: KvmAvailability = placement.nodeId
     ? kvmAvailabilityFromPreflight({
         fetching: placement.preflight.isFetching,
