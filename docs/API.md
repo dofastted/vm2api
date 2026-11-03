@@ -46,6 +46,7 @@ x-api-key: sk-vm-…
 
 上游 hop **永远** `stream: true`。客户端 `stream: true` 收 SSE；`stream: false` 或 `x-kin-delivery: verified` 由网关聚合成 JSON。
 OpenAI 模型页的 Fast 开关只对已同步、已启用且目录明确声明 `service_tiers[].id = "priority"` 的模型生效。客户端使用 `<model>-fast` 时，网关在调度前还原基模型并发送 `service_tier: "priority"`；普通模型 ID 和普通档位不改写。图像目录包含启用的 `gpt-image-2`（及 `gpt-image-2-2026-04-21` 快照）、`gpt-image-2.5-flare` 和 `gpt-image-2.5-sunburst`；Images 请求直连 Codex Images 槽位，Free 套餐槽位不参与。
+`/v1/models` 列出的图像模型也可直接用在 `/v1/chat/completions` 与 `/v1/responses`：网关取最后一条 user 消息的文本作 prompt，经内置 Images 通道调用（该消息带 `image_url` / `input_image` 时走 `/images/edits`，否则 `/images/generations`）；顶层 `size`、`quality`、`background`、`output_format`、`output_compression`、`moderation`、`n`、`input_fidelity` 原样带上。Chat 返回 Markdown 图片（`![image 1](data:image/png;base64,…)`），Responses 返回 `image_generation_call` 输出项；`stream: true` 时等待期间发 SSE 注释保活。日志按 Images 行（`openai.images`）计费。
 
 别名路径（无 `/v1` 前缀）与上表相同处理函数。
 
