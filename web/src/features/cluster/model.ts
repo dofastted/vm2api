@@ -10,7 +10,7 @@ import { claudeTier, isRestrictedSchedule, poolStatus } from '@/lib/vm-status'
 
 /**
  * 链路只在真慢时才黄。量的是一次往返（SSH 开通道 / 直连握手），跨洋节点本来就
- * 三四百毫秒；10-19 那次 SSH 被压到 1780ms 才是要报的情况。
+ * 三四百毫秒，不应只因一次正常的跨洋 RTT 标为异常。
  */
 export const LINK_SLOW_MS = 800
 
@@ -18,16 +18,16 @@ const MiB = 1024 ** 2
 export const GiB = 1024 ** 3
 /**
  * KVM 槽在虚拟机内存之外实际多用的（qemu 进程本身）。容器上限给了 512M（`vm-runtime.mjs` 的
- * KVM_MEMORY_OVERHEAD_MIB），但那只是上限：11-01 实测 1G 的槽 qemu 约 1.12G。按上限算会把每台多扣
- * 约 0.35G，12 台的节点就少算 4G 多（11-02 用户指出），所以按实测取 150M。
+ * KVM_MEMORY_OVERHEAD_MIB），但那只是上限。这里按观测到的典型开销估算为 150M；
+ * 「还能放」仅是容量估算，并非资源预留或创建保证。
  */
 export const KVM_OVERHEAD_BYTES = 150 * MiB
 /** 「还能放」按一台 2G 的 KVM 槽算。 */
 export const NEW_SLOT_MEMORY_BYTES = 2 * GiB
 export const NEW_SLOT_QUOTA_BYTES = NEW_SLOT_MEMORY_BYTES + KVM_OVERHEAD_BYTES
 
-/** 本机在代理页、监控里都叫这个名字。 */
-export const LOCAL_MACHINE_NAME = '德国主控'
+/** 通用的本机名称；部署地址单独展示。 */
+export const LOCAL_MACHINE_NAME = '本机 VPS'
 
 export type ClusterLink = 'ok' | 'caution' | 'bad' | 'none'
 
@@ -156,7 +156,7 @@ export type MachineCapacity = {
 }
 
 /**
- * 按槽用满时算余量，不按此刻用量：虚拟机会慢慢把分到的内存用满（11-01 挪槽就是这么算的）。
+ * 按槽用满时算余量，不按此刻用量：虚拟机会慢慢把分到的内存用满。
  * 每台按虚拟机内存 + 实测 qemu 开销，不按容器上限。`slotsActual` 是槽此刻实际占的内存，
  * 只用来把「系统占用」从总用量里剥出来。
  */

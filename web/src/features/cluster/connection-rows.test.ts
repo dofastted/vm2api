@@ -8,8 +8,8 @@ import {
 
 const node = (over: Partial<ClusterApiNode> = {}): ClusterApiNode => ({
   id: 'node-1',
-  label: '德国集群1',
-  host: '10.0.69.11',
+  label: '节点 A',
+  host: '10.10.0.11',
   port: 22,
   username: 'root',
   auth_type: 'key',
@@ -29,7 +29,7 @@ const node = (over: Partial<ClusterApiNode> = {}): ClusterApiNode => ({
   bridge: null,
   install: null,
   direct_link: {
-    address: '10.0.69.11',
+    address: '10.10.0.11',
     port: 7790,
     state: 'ok',
     latency_ms: 21,
@@ -51,9 +51,9 @@ const status = {
     loopback_only: false,
   },
   nat: {
-    public_ip: '94.103.170.163',
-    observed_via: { id: 'node-us', label: '美国机 154.36.171.158' },
-    local_ips: ['94.103.170.163', '172.30.0.1', '10.0.69.10'],
+    public_ip: '192.0.2.10',
+    observed_via: { id: 'node-us', label: '远端节点 198.51.100.20' },
+    local_ips: ['192.0.2.10', '172.30.0.1', '10.10.0.10'],
     behind_nat: false,
     inbound: 'closed',
   },
@@ -76,9 +76,9 @@ describe('local connection details', () => {
       nodes: [node()],
     })
     const by = Object.fromEntries(rows.map((r) => [r.label, r]))
-    expect(by['公网'].value).toBe('94.103.170.163 · 外网连不进 8787（正常）')
+    expect(by['公网'].value).toBe('192.0.2.10 · 外网连不进 8787（正常）')
     expect(by['公网'].tone).toBe('ok')
-    expect(by['内网'].value).toBe('10.0.69.10（连集群节点）')
+    expect(by['内网'].value).toBe('10.10.0.10（连集群节点）')
     expect(by['Docker'].value).toContain('其中槽 6 个')
     expect(by['KVM'].value).toBe('可用（硬件加速）')
     expect(by['控制面进程'].value).toBe('内存 394MB · 已运行 10 小时')
@@ -98,11 +98,11 @@ describe('local connection details', () => {
   })
 
   it('only treats same-/24 addresses as internal', () => {
-    expect(internalAddresses(['10.0.69.10', '172.30.0.1'], [node()])).toEqual([
-      '10.0.69.10',
+    expect(internalAddresses(['10.10.0.10', '172.30.0.1'], [node()])).toEqual([
+      '10.10.0.10',
     ])
     expect(
-      internalAddresses(['10.0.69.10'], [node({ host: '154.36.171.158' })])
+      internalAddresses(['10.10.0.10'], [node({ host: '198.51.100.20' })])
     ).toEqual([])
   })
 })

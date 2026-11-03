@@ -41,8 +41,8 @@ function api(
   const { state = 'ready', ssh = 4, direct = null, stats, ...rest } = partial
   return {
     id: 'node-1',
-    label: '德国集群1',
-    host: '10.0.69.11',
+    label: '节点 A',
+    host: '10.10.0.11',
     port: 22,
     username: 'root',
     auth_type: 'key',
@@ -84,7 +84,7 @@ function api(
 }
 
 const directOk = (ms: number): ClusterDirectLink => ({
-  address: '10.0.69.11',
+  address: '10.10.0.11',
   port: 7790,
   state: 'ok',
   latency_ms: ms,
@@ -111,7 +111,7 @@ describe('remoteLink', () => {
   it('does not flag a far node for one slow-ish round trip', () => {
     const us = api({
       ssh: 327,
-      direct: { ...directOk(431), address: '154.36.171.158' },
+      direct: { ...directOk(431), address: '198.51.100.20' },
     })
     expect(remoteLink(us)).toBe('ok')
     expect(remoteLinkTone(us).text).toBe('正常')
@@ -161,7 +161,7 @@ describe('capacity', () => {
   })
 
   it('counts room by quota, with the system share taken from measured use', () => {
-    // 德国集群1 on 11-02: 12 Pro × (2G + 150M) on 31.35G, 0.93G outside containers, 22.59G in use.
+    // Example capacity: 12 Pro × (2G + 150M) on 31.35G, 0.93G outside containers, 22.59G in use.
     // The 512M container ceiling used to make this read 「满 · 剩 0.4G」 while about 8G sat free.
     const full = machineCapacity({
       total: 31.35 * G,
@@ -198,17 +198,12 @@ describe('capacity', () => {
 describe('slots', () => {
   it('sorts Max first, then by name with numbers in order', () => {
     const out = sortSlots([
-      vm({ id: 'niutopia906' }),
-      vm({ id: 'niutopia2004', account_tier: 'max' }),
-      vm({ id: 'Niutopia262' }),
-      vm({ id: 'niutopia2001', account_tier: 'max' }),
+      vm({ id: 'slot906' }),
+      vm({ id: 'slot2004', account_tier: 'max' }),
+      vm({ id: 'Slot262' }),
+      vm({ id: 'slot2001', account_tier: 'max' }),
     ]).map((v) => v.id)
-    expect(out).toEqual([
-      'niutopia2001',
-      'niutopia2004',
-      'Niutopia262',
-      'niutopia906',
-    ])
+    expect(out).toEqual(['slot2001', 'slot2004', 'Slot262', 'slot906'])
     expect(
       tierSummary([
         vm({ id: 'a', account_tier: 'max' }),
@@ -248,9 +243,9 @@ describe('machines', () => {
       loopback_only: false,
     },
     nat: {
-      public_ip: '94.103.170.163',
+      public_ip: '192.0.2.10',
       observed_via: null,
-      local_ips: ['94.103.170.163', '10.0.69.10'],
+      local_ips: ['192.0.2.10', '10.10.0.10'],
       behind_nat: false,
       inbound: 'closed',
     },
@@ -275,26 +270,26 @@ describe('machines', () => {
   }
   const vms = [
     vm({
-      id: 'niutopia2001',
+      id: 'slot2001',
       account_tier: 'max',
       machine: { memory: '4g' },
       today_cost: 107.24,
     }),
     vm({ id: 'oliva', today_cost: 7.72 }),
-    vm({ id: 'Niutopia2011', node_id: 'node-1', today_cost: 37.21 }),
+    vm({ id: 'Slot2011', node_id: 'node-1', today_cost: 37.21 }),
   ]
 
   it('builds the control host on the same scale as nodes', () => {
     const local = buildLocalMachine({
-      hostname: 'vm.niutopia.cn',
+      hostname: 'panel.example.test',
       vms,
       host,
       status,
       available: true,
     })
-    expect(local.name).toBe('德国主控')
-    expect(local.address).toBe('94.103.170.163')
-    expect(local.slots.map((v) => v.id)).toEqual(['niutopia2001', 'oliva'])
+    expect(local.name).toBe('本机 VPS')
+    expect(local.address).toBe('192.0.2.10')
+    expect(local.slots.map((v) => v.id)).toEqual(['slot2001', 'oliva'])
     expect(local.todayUsd).toBeCloseTo(114.96)
     expect(local.disk?.pct).toBe(33.7)
     // 23.5 − (14 − 6) − (4G + 150M + 2G + 150M) ≈ 9.2G → 4 台（每台约 2.15G）
@@ -311,15 +306,15 @@ describe('machines', () => {
   })
 
   it('names nodes without the trailing IP and keeps the control host first', () => {
-    expect(shortNodeLabel('美国机 154.36.171.158')).toBe('美国机')
+    expect(shortNodeLabel('远端节点 198.51.100.20')).toBe('远端节点')
     const ms = buildMachines({
       hostname: 'x',
       vms,
       nodes: [
         api({
           id: 'node-us',
-          label: '美国机 154.36.171.158',
-          host: '154.36.171.158',
+          label: '远端节点 198.51.100.20',
+          host: '198.51.100.20',
         }),
         api(),
       ],
@@ -327,7 +322,7 @@ describe('machines', () => {
       status,
       available: true,
     })
-    expect(ms.map((m) => m.name)).toEqual(['德国主控', '德国集群1', '美国机'])
+    expect(ms.map((m) => m.name)).toEqual(['本机 VPS', '节点 A', '远端节点'])
     const sum = clusterSummary(ms)
     expect(sum).toMatchObject({
       machines: 3,
