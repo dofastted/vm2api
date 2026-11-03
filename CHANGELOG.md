@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 新增可选 `compatibility.preserve_pruned_tool_results`：在槽位Claude推理中，按认证密钥和DSH会话隔离保存成功请求的有限工具原文；精确识别默认工具文本裁剪后恢复原始前缀，避免小幅历史裁剪造成整段缓存重写。真实编辑/压缩、失败/重试、并发歧义和内存/上下文预算不足时不恢复；缺省关闭，不改变客户端配置或API直连端点。
+
 ## 1.4.038 — 2026-11-03
 
 - #873：修复 `/v1/models` 已列出的 GPT Image 模型（`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst`、`gpt-image-2` 及快照）在 `/v1/chat/completions`、`/v1/responses` 上被 400 `model_not_supported` 拒绝、无法出图。现在这类请求走网关内置 Images 通道：最后一条 user 消息文本作 prompt，带图即 `/images/edits`，否则 `/images/generations`；Chat 回 Markdown 图片，Responses 回 `image_generation_call`，流式等待期间保活。模型开关、Free 槽排除与计费沿用 `/v1/images`。

@@ -64,6 +64,16 @@ Go worker JSON 透传，不必因人设重建 worker。
 
 全部非官方协议（Messages / Chat / Completions / Responses）回包 usage 按「没有被网关改写的 system、没有注入 tools」显示：藏网关注入的 persona system 块与 server tools，保留用户 prompt 与用户自己的 tools，抹掉因 persona 产生的官方 cache。官方 CC 不遮罩。
 
+## DSH 工具结果裁剪与缓存
+
+`routing.compatibility.preserve_pruned_tool_results: true` 可为槽位推理开启 DSH 工具结果裁剪保护；缺省关闭，API 直连端点不启用。它不会修改客户端配置或路由粘性。
+
+DSH 在压缩压力下会把旧工具结果改为前4096码点、固定middle-pruned标记和后1024码点。开启后，网关在同一认证密钥、严格的DSH `session-UUID`、模型和完整历史前缀内，仅恢复精确等于该裁剪结果的旧文本。必须有此前完整verified且未重试的请求作为原文基线；仅收到keepalive、取消、失败或不完整流不会提交原文。真正的历史编辑、删消息、工具参数变化及摘要替换不还原。
+
+原文只在进程内保存：TTL 1小时、总量16MiB、最多128会话、每会话2MiB、单工具文本256KiB，待确认快照也计入总预算。凭据和会话仅用于进程HMAC隔离，日志只记录 `hop_meta.tool_result_prune` 的恢复数量和原因，不增加正文日志。并发同会话、快照缺失、超预算或无法确认上下文空间时，整组保持调用方较短的原请求；不做部分还原。重启后从自然成功请求重新建立基线。
+
+恢复在persona重渲染、额度风险估算和传输前完成。上下文检查使用上一次真实输入/输出、追加消息的UTF-8字节上界、输出预留和16K余量；新增图片、文档或其它无法可靠估价的内容时不恢复。该保护不能让真实摘要或新摘要后的上下文免于冷写，也不能保证上游缓存永不淘汰。
+
 ## thinking 与 max_tokens
 
 `max_tokens` **就是** thinking 预算（thinking + 可见输出共享）。调用方有值则不覆盖；缺失时 OAuth 默认 **128000**。绝对上限 128000。仅当超过模型 `max_tokens_cap` 时 `applyMaxTokensCap` 下调。
