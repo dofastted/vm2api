@@ -76,7 +76,7 @@ DSH 在压缩压力下会把旧工具结果改为前4096码点、固定middle-pr
 
 ## thinking 与 max_tokens
 
-`max_tokens` **就是** thinking 预算（thinking + 可见输出共享）。调用方有值则不覆盖，包括低于旧下限的 64。缺失时用该模型目录的 `max_tokens_default`，目录没有时用 4096。仅当超过模型 `max_tokens_cap` 时 `applyMaxTokensCap` 下调。
+`max_tokens` **就是** thinking 预算（thinking + 可见输出共享）。缺失时用该模型目录的 `max_tokens_default`，目录没有时用 4096。调用方有值且低于 `compatibility.min_max_tokens` 时默认抬到该值，模式「不改」则不抬。仅当超过模型 `max_tokens_cap` 时 `applyMaxTokensCap` 下调。
 
 | 模型 | thinking |
 |------|----------|
