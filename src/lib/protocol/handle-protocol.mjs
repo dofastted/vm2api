@@ -366,7 +366,17 @@ export function createHandleProtocol(deps) {
     return jevScopeWaits(jev, 'claude')
   }
 
-  async function applyProtocolIntercept({ req, inbound, body, fp, logBag, requestId, res, account = null }) {
+  async function applyProtocolIntercept({
+    req,
+    inbound,
+    body,
+    fp,
+    logBag,
+    requestId,
+    res,
+    account = null,
+    scopeMatched = false,
+  }) {
     const official =
       isOfficialClaudeCodeTraffic(req.headers, inbound) ||
       isOfficialClaudeClient(fp.client_class) ||
@@ -391,6 +401,7 @@ export function createHandleProtocol(deps) {
       devices: deviceRepo(),
       requestId,
       account,
+      scopeMatched,
     })
     if (!decision || decision.action !== 'block') {
       if (decision?.intercept) logBag.intercept = decision.intercept
@@ -800,6 +811,8 @@ export function createHandleProtocol(deps) {
         ? { ok: true, platform: 'openai' }
         : detectInboundPlatform(ctx.body?.model)
     const apiOpenAI = inferenceBackend === 'api' && platform.platform === 'openai'
+    const apiRiskReview = !!apiPicked && !apiOpenAI && apiPicked.endpoint.risk_review_enabled === true
+    const preReviewEnabled = !apiPicked || apiOpenAI || apiRiskReview
     if (!platform.ok) {
       stats.errors++
       const errorResult = makeError({
@@ -866,7 +879,19 @@ export function createHandleProtocol(deps) {
         return json(res, 200, mock)
       }
     }
-    if (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res })) {
+    if (
+      preReviewEnabled &&
+      (await applyProtocolIntercept({
+        req,
+        inbound,
+        body: ctx.body,
+        fp,
+        logBag,
+        requestId: logCtx.request_id,
+        res,
+        scopeMatched: apiRiskReview,
+      }))
+    ) {
       return
     }
     if (platform.platform === 'openai' && inferenceBackend !== 'api') {
@@ -1062,7 +1087,12 @@ export function createHandleProtocol(deps) {
         }
       }
     }
-    if (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res })) {
+    // API endpoint opt-in is checked once before conversion, including when dedup is disabled.
+    if (
+      !apiRiskReview &&
+      preReviewEnabled &&
+      (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res }))
+    ) {
       return
     }
     const officialClient = isOfficialClaudeClient(fp.client_class)

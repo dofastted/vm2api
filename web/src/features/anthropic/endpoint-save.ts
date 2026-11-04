@@ -14,6 +14,7 @@ export type AuthScheme = 'x_api_key' | 'authorization_bearer'
 /** 载入时的服务端值；保存已存地址只发和它不同的字段。 */
 export type StoredSnapshot = {
   protocol?: ApiProtocol
+  riskReviewEnabled?: boolean
   baseUrl: string
   authScheme: AuthScheme
   proxyId: string
@@ -21,6 +22,7 @@ export type StoredSnapshot = {
 
 export type EndpointDraft = {
   protocol?: ApiProtocol
+  riskReviewEnabled?: boolean
   fetchedModels?: string[]
   id: string
   storedId?: string
@@ -35,6 +37,7 @@ export type EndpointDraft = {
 type StoredItem = {
   id: string
   protocol?: ApiProtocol
+  risk_review_enabled?: boolean
   base_url?: string
   auth_scheme?: string
   api_key_entries?: { id?: string; proxy_id?: string }[]
@@ -44,6 +47,7 @@ export function draftFromStored(item: StoredItem): EndpointDraft {
   const key = item.api_key_entries?.[0]
   const stored: StoredSnapshot = {
     protocol: item.protocol || 'anthropic',
+    riskReviewEnabled: item.risk_review_enabled === true,
     baseUrl:
       item.base_url || API_DEFAULTS[item.protocol || 'anthropic'].baseUrl,
     authScheme:
@@ -94,6 +98,9 @@ export function endpointSaveRequest(
       body: {
         kind: kindOf(baseUrl, protocol),
         protocol,
+        ...(protocol === 'anthropic'
+          ? { risk_review_enabled: item.riskReviewEnabled === true }
+          : {}),
         name: baseUrl,
         base_url: baseUrl,
         auth_scheme: item.authScheme,
@@ -108,6 +115,12 @@ export function endpointSaveRequest(
   const was = item.stored
   const body: Record<string, unknown> = { key_id: item.keyId || '' }
   if (apiKey) body.api_key = apiKey
+  if (
+    protocol === 'anthropic' &&
+    item.riskReviewEnabled !== undefined &&
+    (!was || item.riskReviewEnabled !== (was.riskReviewEnabled === true))
+  )
+    body.risk_review_enabled = item.riskReviewEnabled
   if (!was || item.proxyId !== was.proxyId) body.proxy_id = proxyId
   if (!was || item.authScheme !== was.authScheme)
     body.auth_scheme = item.authScheme
