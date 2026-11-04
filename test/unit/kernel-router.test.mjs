@@ -800,6 +800,32 @@ test('writeKernelConfig adds CRAG v2 fields only for a pinned local slot', () =>
     assert.equal(v2.runtime_variant, 'crag-v2')
     assert.equal(v2.crag_v2_root, '/home/kincli/.kin/crag-v2')
     assert.equal(v2.node_bin, '/home/kincli/.kin/kin-kernel.bin')
+    assert.equal(v2.telemetry.identity, undefined)
+    const enabled = JSON.parse(
+      fs.readFileSync(
+        writeKernelConfig(
+          root,
+          {
+            id: 'vm-09',
+            dataplane: 'crag',
+            crag_kernel_version: 'v2',
+            kernel: 'ubuntu-24.04',
+            seed_policy: { telemetry_disabled: false },
+          },
+          { token: 'tok' },
+        ).configPath,
+        'utf8',
+      ),
+    )
+    assert.equal(enabled.telemetry.enabled, true)
+    assert.equal(enabled.telemetry.dmi_dir, '/etc/kin-dmi')
+    assert.equal(enabled.telemetry.identity.enabled, true)
+    assert.equal(enabled.telemetry.identity.linux_distro_id, 'ubuntu')
+    assert.equal(enabled.telemetry.identity.linux_distro_version, '24.04')
+    assert.equal(enabled.telemetry.identity.linux_kernel, '6.8.0-51-generic')
+    assert.equal(enabled.telemetry.identity.shell, '/bin/bash')
+    assert.equal(enabled.telemetry.identity.terminal, 'xterm-256color')
+    assert.equal(enabled.telemetry.identity.package_managers, 'apt')
     const remote = JSON.parse(
       fs.readFileSync(
         writeKernelConfig(
