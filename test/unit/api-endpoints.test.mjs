@@ -50,6 +50,47 @@ test('official kinds lock base_url', () => {
   assert.equal(openai.protocol, 'openai')
 })
 
+test('endpoint risk review defaults off and preserves explicit toggles across reloads', () => {
+  const dataDir = tmpDir()
+  let store = new ApiEndpointStore({ dataDir })
+  try {
+    const rec = store.create({ kind: 'claude' })
+    assert.equal(rec.risk_review_enabled, false)
+    assert.equal(store.listRaw()[0].risk_review_enabled, false)
+    assert.equal(store.update(rec.id, { risk_review_enabled: true }).risk_review_enabled, true)
+    store.db.close()
+    store = new ApiEndpointStore({ dataDir })
+    assert.equal(store.list()[0].risk_review_enabled, true)
+    assert.equal(store.update(rec.id, { name: 'renamed' }).risk_review_enabled, true)
+    assert.equal(store.update(rec.id, { risk_review_enabled: false }).risk_review_enabled, false)
+    const enabled = store.create({ kind: 'claude', risk_review_enabled: true })
+    assert.equal(enabled.risk_review_enabled, true)
+    store.db.close()
+    store = new ApiEndpointStore({ dataDir })
+    assert.equal(store.getRaw(rec.id).risk_review_enabled, false)
+    assert.equal(store.getRaw(enabled.id).risk_review_enabled, true)
+  } finally {
+    store.db.close()
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  }
+})
+
+test('endpoint risk review rejects nonboolean values without changing the stored setting', () => {
+  const dataDir = tmpDir()
+  const store = new ApiEndpointStore({ dataDir })
+  try {
+    const rec = store.create({ kind: 'claude', risk_review_enabled: true })
+    for (const value of ['false', 0, null, {}]) {
+      assert.throws(() => store.create({ kind: 'claude', risk_review_enabled: value }), { code: 'invalid_risk_review' })
+      assert.throws(() => store.update(rec.id, { risk_review_enabled: value }), { code: 'invalid_risk_review' })
+      assert.equal(store.getRaw(rec.id).risk_review_enabled, true)
+    }
+  } finally {
+    store.db.close()
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  }
+})
+
 test('sk-kin category defaults oauth and can switch to api', () => {
   const keys = new ApiKeyStore({ dataDir: tmpDir() })
   const rec = keys.create({ name: 'c' })

@@ -18,6 +18,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { PageHeader } from '@/components/page-header'
 import { apiEndpointsQueryOptions } from '@/features/api-endpoints/queries'
@@ -47,6 +48,7 @@ function freshEndpoint(protocol: ApiProtocol = 'anthropic'): EndpointDraft {
   return {
     id: crypto.randomUUID(),
     protocol,
+    riskReviewEnabled: false,
     ...API_DEFAULTS[protocol],
     apiKey: '',
     proxyId: DIRECT,
@@ -205,6 +207,7 @@ export function AnthropicConsolePage() {
                   fetchedModels: undefined,
                   stored: {
                     protocol: item.protocol,
+                    riskReviewEnabled: item.riskReviewEnabled === true,
                     baseUrl: item.baseUrl.trim() || defaultUrl,
                     authScheme: item.authScheme,
                     proxyId: item.proxyId,
@@ -414,6 +417,37 @@ export function AnthropicConsolePage() {
                       </Button>
                     </div>
                   </div>
+                  {protocol === 'anthropic' ? (
+                    <div className='mt-3 flex items-start gap-3 px-1 pb-1'>
+                      <Switch
+                        id={`risk-review-${item.id}`}
+                        aria-describedby={`risk-review-help-${item.id}`}
+                        checked={item.riskReviewEnabled === true}
+                        disabled={save.isPending}
+                        onCheckedChange={(checked) =>
+                          patchEndpoint(item.id, { riskReviewEnabled: checked })
+                        }
+                      />
+                      <div className='grid gap-1 text-sm'>
+                        <label htmlFor={`risk-review-${item.id}`}>
+                          风控前置审查
+                        </label>
+                        <p
+                          id={`risk-review-help-${item.id}`}
+                          className='text-xs text-muted-foreground'
+                        >
+                          默认关闭，修改后需保存。开启后，API Key 推理请求先按
+                          <a
+                            href='#/risk'
+                            className='underline underline-offset-4'
+                          >
+                            风险审计
+                          </a>
+                          中启用的规则与决策模型审查，通过后再调用此端点；不影响本页连通性测试。
+                        </p>
+                      </div>
+                    </div>
+                  ) : null}
                   {result ? (
                     <p
                       className={cn(

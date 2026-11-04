@@ -19,6 +19,7 @@ describe('anthropic console endpoint save', () => {
     expect(stored.proxyId).toBe('px_9')
     expect(stored.keyId).toBe('ek_1')
     expect(stored.authScheme).toBe('authorization_bearer')
+    expect(stored.riskReviewEnabled).toBe(false)
   })
 
   it('saving an unchanged stored row never sends name, models or proxy', () => {
@@ -57,6 +58,7 @@ describe('anthropic console endpoint save', () => {
     expect(req.method).toBe('POST')
     expect(req.body).toMatchObject({
       kind: 'claude',
+      risk_review_enabled: false,
       proxy_id: 'px_1',
       api_key_entries: [{ api_key: 'sk-1234' }],
       models: [{ name: 'claude-sonnet-4-5', alias: 'claude-sonnet-4-5' }],
@@ -118,5 +120,36 @@ describe('anthropic console endpoint save', () => {
     expect(() =>
       endpointSaveRequest({ ...stored, storedId: undefined }, '')
     ).toThrow('模型')
+  })
+
+  it('saves risk opt-in on creation and sends only changed stored toggles', () => {
+    const row = draftFromStored({ id: 'review', risk_review_enabled: true })
+    expect(row.riskReviewEnabled).toBe(true)
+    expect(endpointSaveRequest(row, 'm').body).not.toHaveProperty(
+      'risk_review_enabled'
+    )
+    expect(
+      endpointSaveRequest({ ...row, riskReviewEnabled: false }, 'm').body
+    ).toMatchObject({ risk_review_enabled: false })
+    expect(
+      endpointSaveRequest({ ...stored, riskReviewEnabled: true }, 'm').body
+    ).toMatchObject({ risk_review_enabled: true })
+    expect(
+      endpointSaveRequest({ ...row, storedId: undefined }, 'm').body
+    ).toMatchObject({ risk_review_enabled: true })
+  })
+
+  it('does not enroll OpenAI endpoints in the Anthropic risk toggle', () => {
+    const row = draftFromStored({
+      id: 'oai',
+      protocol: 'openai',
+      risk_review_enabled: true,
+    })
+    expect(
+      endpointSaveRequest({ ...row, riskReviewEnabled: false }, 'm').body
+    ).not.toHaveProperty('risk_review_enabled')
+    expect(
+      endpointSaveRequest({ ...row, storedId: undefined }, 'm').body
+    ).not.toHaveProperty('risk_review_enabled')
   })
 })
