@@ -94,7 +94,7 @@ curl -sS http://127.0.0.1:8787/v1/messages \
   }'
 ```
 
-必填：`model`、非空 `messages[]`（每条有 `role`，以及 `content` 或 `tool_calls`）。`max_tokens` 可省，缺省填 **128000**。
+必填：`model`、非空 `messages[]`（每条有 `role`，以及 `content` 或 `tool_calls`）。`max_tokens` 可省；写了就原样出站，没写则用该模型目录的 `max_tokens_default`。
 
 流式：`"stream": true`，响应 `text/event-stream`，事件与 Anthropic 相同（`message_start` … `message_stop`）。
 

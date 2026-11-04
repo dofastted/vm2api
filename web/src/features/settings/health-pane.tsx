@@ -119,7 +119,7 @@ export function HealthPane(props: HealthPaneProps) {
           </SettingRow>
           <SettingRow
             label='max_tokens 下限'
-            desc='Claude 出站时把过小的 max_tokens 抬到下限，避免探测请求在输出前被截断。未传 max_tokens 的请求不受影响。'
+            desc='调用方写了 max_tokens 就原样出站，不再抬高。没写时用该模型目录里的 max_tokens_default。这个数值只在 enabled thinking 的 budget 不小于 max_tokens 时用来补出合法间隔。'
           >
             <div className='flex items-center gap-3'>
               <Input

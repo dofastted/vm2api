@@ -3,9 +3,11 @@ import assert from 'node:assert/strict'
 import { applyMinMaxTokens, normalizeMinMaxTokensConfig } from '../../src/lib/protocol/min-max-tokens.mjs'
 import { prepareCliHopBody } from '../../src/lib/protocol/outbound-attempt.mjs'
 
-test('raises small max_tokens to the default floor', () => {
-  assert.equal(applyMinMaxTokens({ max_tokens: 1 }, undefined).max_tokens, 128)
-  assert.equal(applyMinMaxTokens({ max_tokens: 16 }, { enabled: true, value: 128 }).max_tokens, 128)
+test('keeps a caller max_tokens instead of raising it to the floor', () => {
+  assert.equal(applyMinMaxTokens({ max_tokens: 1 }, undefined).max_tokens, 1)
+  assert.equal(applyMinMaxTokens({ max_tokens: 16 }, { enabled: true, value: 128 }).max_tokens, 16)
+  assert.equal(applyMinMaxTokens({ max_tokens: 64 }, { enabled: true, value: 128 }).max_tokens, 64)
+  assert.equal(applyMinMaxTokens({ max_tokens: 1 }, { value: 512 }).max_tokens, 1)
 })
 
 test('keeps values at or above the floor and leaves missing max_tokens alone', () => {
@@ -19,16 +21,15 @@ test('disabled floor passes max_tokens through', () => {
   assert.equal(applyMinMaxTokens({ max_tokens: 1 }, { enabled: false, value: 128 }).max_tokens, 1)
 })
 
-test('disabling the floor preserves the caller budget through cli-hop preparation', () => {
+test('an enabled floor still preserves the caller budget through cli-hop preparation', () => {
   const body = applyMinMaxTokens(
     { model: 'claude-haiku-4-5', max_tokens: 64, messages: [{ role: 'user', content: 'Print integers.' }] },
-    { enabled: false },
+    { enabled: true, value: 128 },
   )
   assert.equal(prepareCliHopBody(body).max_tokens, 64)
 })
 
-test('custom floor value is honored and clamped', () => {
-  assert.equal(applyMinMaxTokens({ max_tokens: 1 }, { value: 512 }).max_tokens, 512)
+test('floor config stays clamped even though it no longer replaces a caller budget', () => {
   assert.deepEqual(normalizeMinMaxTokensConfig({ value: 99999 }), { enabled: true, value: 4096 })
   assert.deepEqual(normalizeMinMaxTokensConfig({ value: 0 }), { enabled: true, value: 128 })
 })
