@@ -25,14 +25,18 @@ import {
 import { listVms } from '../../src/lib/vm/vm-registry.mjs'
 
 const prevKernelBin = process.env.KIN_KERNEL_BIN
+const prevCragV2Root = process.env.KIN_CRAG_V2_ROOT
 
 before(() => {
   delete process.env.KIN_KERNEL_BIN
+  delete process.env.KIN_CRAG_V2_ROOT
 })
 
 after(() => {
   if (prevKernelBin == null) delete process.env.KIN_KERNEL_BIN
   else process.env.KIN_KERNEL_BIN = prevKernelBin
+  if (prevCragV2Root == null) delete process.env.KIN_CRAG_V2_ROOT
+  else process.env.KIN_CRAG_V2_ROOT = prevCragV2Root
 })
 
 function seedTemplate(root) {
@@ -441,26 +445,31 @@ function sha256(body) {
   return crypto.createHash('sha256').update(body).digest('hex')
 }
 
-function seedV2Package(project, { worker = 'worker\n' } = {}) {
+function seedV2Package(project, { revision = '' } = {}) {
   const useArch = process.arch === 'x64' ? 'amd64' : process.arch === 'arm64' ? 'arm64' : process.arch
   const dir = path.join(project, 'share', 'crag', 'kernels', 'v2', useArch)
-  fs.mkdirSync(path.join(dir, 'bin'), { recursive: true })
-  const workerBody = Buffer.from(worker)
-  const pkg = Buffer.from('{}\n')
-  fs.writeFileSync(path.join(dir, 'bin', 'crag-kernel-worker.mjs'), workerBody)
-  fs.writeFileSync(path.join(dir, 'package.json'), pkg)
+  fs.mkdirSync(path.join(dir, 'claude-code-2.1.317'), { recursive: true })
+  // Structural ELF fixtures validate membership and machine checks, not Claude execution.
+  const worker = fakeElf64Amd64(`native-fixture-${revision}`)
+  worker[6] = 1
+  worker.writeUInt16LE(useArch === 'arm64' ? 183 : 62, 18)
+  worker.writeUInt32LE(1, 20)
+  worker.writeUInt16LE(64, 52)
+  const claude = Buffer.from(worker)
+  fs.writeFileSync(path.join(dir, 'crag-v2'), worker, { mode: 0o755 })
+  fs.writeFileSync(path.join(dir, 'claude-code-2.1.317', 'claude'), claude, { mode: 0o755 })
   fs.writeFileSync(
     path.join(dir, 'manifest.json'),
     JSON.stringify({
       family: 'crag',
       version: 'v2',
       arch: useArch,
-      entrypoint: 'bin/crag-kernel-worker.mjs',
-      node_version: 'v24.0.0',
+      runtime: 'native',
+      entrypoint: 'crag-v2',
       capabilities: ['official_full', 'zero', 'cancel', 'telemetry', 'unix_socket_envelope'],
       sha256: {
-        'bin/crag-kernel-worker.mjs': sha256(workerBody),
-        'package.json': sha256(pkg),
+        'crag-v2': sha256(worker),
+        'claude-code-2.1.317/claude': sha256(claude),
       },
     }),
   )
@@ -492,26 +501,27 @@ test('one VM can switch cli-node to CRAG v2 and back without deleting cli-node',
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-v2-switch-'))
   try {
     seedTemplate(project)
-    seedV2Package(project)
-    const node = path.join(project, 'node-bin')
-    fs.writeFileSync(node, 'node-bytes')
+    const pkg = seedV2Package(project)
     const dest = wrapCliHomeDir(project, 'vm-13')
     fs.mkdirSync(dest, { recursive: true })
     fs.writeFileSync(path.join(dest, 'cli-node'), 'keep-cli')
     const vm = { id: 'vm-13', dataplane: 'crag', crag_kernel_version: 'v2' }
-    const laid = materializeResolvedKernel(project, vm, { nodeBin: node })
+    const laid = materializeResolvedKernel(project, vm)
     assert.equal(laid.ok, true)
     assert.equal(laid.kernel_changed, true)
     assert.equal(laid.kernel_version, 'v2')
     assert.equal(fs.readFileSync(path.join(dest, 'cli-node'), 'utf8'), 'keep-cli')
-    assert.equal(fs.readFileSync(path.join(dest, 'kin-kernel.bin'), 'utf8'), 'node-bytes')
-    assert.match(fs.readFileSync(path.join(dest, 'kin-kernel'), 'utf8'), /crag-v2\/bin\/crag-kernel-worker\.mjs/)
-    assert.equal(materializeResolvedKernel(project, vm, { nodeBin: node }).kernel_changed, false)
+    assert.deepEqual(fs.readFileSync(path.join(dest, 'crag-v2', 'crag-v2')), fs.readFileSync(path.join(pkg, 'crag-v2')))
+    assert.equal(fs.existsSync(path.join(dest, 'kin-kernel.bin')), false)
+    assert.ok(fs.statSync(path.join(dest, 'kin-kernel')).mode & 0o111)
+    const installed = fs.statSync(path.join(dest, 'crag-v2', 'crag-v2'))
+    assert.equal(materializeResolvedKernel(project, vm).kernel_changed, false)
+    assert.equal(fs.statSync(path.join(dest, 'crag-v2', 'crag-v2')).ino, installed.ino)
+    assert.equal(inspectKernelChanges(project, [vm]).changed, false)
     const back = materializeResolvedKernel(project, { id: 'vm-13', dataplane: 'wrap' })
     assert.equal(back.ok, true)
     assert.equal(fs.existsSync(path.join(dest, 'cli-node')), true)
-    assert.doesNotMatch(fs.readFileSync(path.join(dest, 'kin-kernel'), 'utf8'), /crag-v2/)
-    assert.notEqual(fs.readFileSync(path.join(dest, 'kin-kernel.bin'), 'utf8'), 'node-bytes')
+    assert.equal(fs.readFileSync(path.join(dest, 'kin-kernel.bin'), 'utf8'), 'kin-kernel')
   } finally {
     fs.rmSync(project, { recursive: true, force: true })
   }
@@ -523,12 +533,12 @@ test('CRAG v2 rejects a bad package and a non-local slot without replacing cli-n
     const dir = seedV2Package(project)
     const manifestPath = path.join(dir, 'manifest.json')
     const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
-    manifest.sha256['bin/crag-kernel-worker.mjs'] = '0'.repeat(64)
+    manifest.sha256['crag-v2'] = '0'.repeat(64)
     fs.writeFileSync(manifestPath, JSON.stringify(manifest))
     const dest = wrapCliHomeDir(project, 'vm-13')
     fs.mkdirSync(dest, { recursive: true })
     fs.writeFileSync(path.join(dest, 'cli-node'), 'keep-cli')
-    const bad = materializeCragV2(project, { id: 'vm-13', crag_kernel_version: 'v2' }, { nodeBin: process.execPath })
+    const bad = materializeCragV2(project, { id: 'vm-13', crag_kernel_version: 'v2' })
     assert.equal(bad.ok, false)
     assert.equal(bad.code, 'crag_v2_hash_mismatch')
     assert.equal(fs.readFileSync(path.join(dest, 'cli-node'), 'utf8'), 'keep-cli')
@@ -539,6 +549,282 @@ test('CRAG v2 rejects a bad package and a non-local slot without replacing cli-n
     const kvm = materializeCragV2(project, { id: 'vm-kvm', runtime: { type: 'kvm' } })
     assert.equal(kvm.code, 'crag_v2_unsupported_placement')
   } finally {
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
+
+function rewriteV2Manifest(dir, mutate) {
+  const file = path.join(dir, 'manifest.json')
+  const manifest = JSON.parse(fs.readFileSync(file, 'utf8'))
+  mutate(manifest)
+  fs.writeFileSync(file, JSON.stringify(manifest))
+}
+
+const invalidNativePackages = [
+  [
+    'bad hash',
+    'crag_v2_hash_mismatch',
+    (dir) =>
+      rewriteV2Manifest(dir, (m) => {
+        m.sha256['crag-v2'] = '0'.repeat(64)
+      }),
+  ],
+  [
+    'declared architecture',
+    'crag_v2_arch_mismatch',
+    (dir) =>
+      rewriteV2Manifest(dir, (m) => {
+        m.arch = m.arch === 'amd64' ? 'arm64' : 'amd64'
+      }),
+  ],
+  [
+    'worker machine',
+    'crag_v2_arch_mismatch',
+    (dir) => {
+      const file = path.join(dir, 'crag-v2')
+      const body = fs.readFileSync(file)
+      body.writeUInt16LE(body.readUInt16LE(18) === 62 ? 183 : 62, 18)
+      fs.writeFileSync(file, body)
+      rewriteV2Manifest(dir, (m) => {
+        m.sha256['crag-v2'] = sha256(body)
+      })
+    },
+  ],
+  [
+    'Claude machine',
+    'crag_v2_arch_mismatch',
+    (dir) => {
+      const file = path.join(dir, 'claude-code-2.1.317', 'claude')
+      const body = fs.readFileSync(file)
+      body.writeUInt16LE(body.readUInt16LE(18) === 62 ? 183 : 62, 18)
+      fs.writeFileSync(file, body)
+      rewriteV2Manifest(dir, (m) => {
+        m.sha256['claude-code-2.1.317/claude'] = sha256(body)
+      })
+    },
+  ],
+  [
+    'non ELF worker',
+    'crag_v2_elf_invalid',
+    (dir) => {
+      fs.writeFileSync(path.join(dir, 'crag-v2'), 'not an ELF')
+      rewriteV2Manifest(dir, (m) => {
+        m.sha256['crag-v2'] = sha256('not an ELF')
+      })
+    },
+  ],
+  [
+    'unsafe path',
+    'crag_v2_manifest_invalid',
+    (dir) =>
+      rewriteV2Manifest(dir, (m) => {
+        m.sha256['../outside'] = '0'.repeat(64)
+      }),
+  ],
+  [
+    'noncanonical path',
+    'crag_v2_manifest_invalid',
+    (dir) =>
+      rewriteV2Manifest(dir, (m) => {
+        m.sha256['./crag-v2'] = m.sha256['crag-v2']
+      }),
+  ],
+  ['unhashed member', 'crag_v2_hash_mismatch', (dir) => fs.writeFileSync(path.join(dir, 'unlisted'), 'extra')],
+  [
+    'missing hashed member',
+    'crag_v2_hash_mismatch',
+    (dir) => fs.unlinkSync(path.join(dir, 'claude-code-2.1.317', 'claude')),
+  ],
+  [
+    'unbundled Claude',
+    'crag_v2_manifest_invalid',
+    (dir) => {
+      fs.unlinkSync(path.join(dir, 'claude-code-2.1.317', 'claude'))
+      rewriteV2Manifest(dir, (m) => {
+        delete m.sha256['claude-code-2.1.317/claude']
+      })
+    },
+  ],
+  [
+    'non-native runtime',
+    'crag_v2_manifest_invalid',
+    (dir) =>
+      rewriteV2Manifest(dir, (m) => {
+        m.runtime = 'node'
+      }),
+  ],
+  [
+    'wrong entrypoint',
+    'crag_v2_manifest_invalid',
+    (dir) =>
+      rewriteV2Manifest(dir, (m) => {
+        m.entrypoint = 'worker.mjs'
+      }),
+  ],
+  ['nonexecutable worker', 'crag_v2_elf_invalid', (dir) => fs.chmodSync(path.join(dir, 'crag-v2'), 0o644)],
+  [
+    'symlink member',
+    'crag_v2_symlink',
+    (dir) => {
+      const file = path.join(dir, 'claude-code-2.1.317', 'claude')
+      fs.unlinkSync(file)
+      fs.symlinkSync('../crag-v2', file)
+    },
+  ],
+  [
+    'symlink root',
+    'crag_v2_symlink',
+    (dir) => {
+      fs.renameSync(dir, `${dir}.real`)
+      fs.symlinkSync(`${dir}.real`, dir)
+    },
+  ],
+]
+
+for (const [label, code, mutate] of invalidNativePackages) {
+  test(`CRAG v2 rejects ${label} without changing an installed package`, () => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-native-integrity-'))
+    try {
+      const dir = seedV2Package(project)
+      const vm = { id: 'vm-13', dataplane: 'crag', crag_kernel_version: 'v2' }
+      assert.equal(materializeResolvedKernel(project, vm).ok, true)
+      const dest = wrapCliHomeDir(project, vm.id)
+      const oldManifest = fs.readFileSync(path.join(dest, 'crag-v2', 'manifest.json'))
+      const oldWorker = fs.readFileSync(path.join(dest, 'crag-v2', 'crag-v2'))
+      const oldWrapper = fs.readFileSync(path.join(dest, 'kin-kernel'))
+      mutate(dir)
+      const result = materializeResolvedKernel(project, vm)
+      assert.equal(result.ok, false)
+      assert.equal(result.code, code)
+      assert.deepEqual(fs.readFileSync(path.join(dest, 'crag-v2', 'manifest.json')), oldManifest)
+      assert.deepEqual(fs.readFileSync(path.join(dest, 'crag-v2', 'crag-v2')), oldWorker)
+      assert.deepEqual(fs.readFileSync(path.join(dest, 'kin-kernel')), oldWrapper)
+      const inspection = inspectKernelChanges(project, [vm])
+      assert.equal(inspection.ok, false)
+      assert.equal(inspection.items[0].code, code)
+    } finally {
+      fs.rmSync(project, { recursive: true, force: true })
+    }
+  })
+}
+
+test('CRAG v2 revalidates staged bytes before replacing the installed package', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-native-stage-'))
+  const copy = fs.cpSync
+  try {
+    seedV2Package(project)
+    const vm = { id: 'vm-13', dataplane: 'crag', crag_kernel_version: 'v2' }
+    assert.equal(materializeResolvedKernel(project, vm).ok, true)
+    const dest = wrapCliHomeDir(project, vm.id)
+    const oldManifest = fs.readFileSync(path.join(dest, 'crag-v2', 'manifest.json'))
+    seedV2Package(project, { revision: 'updated' })
+    fs.cpSync = (src, staging, options) => {
+      copy(src, staging, options)
+      fs.appendFileSync(path.join(staging, 'crag-v2'), 'corruption during copy')
+    }
+    const result = materializeResolvedKernel(project, vm)
+    assert.equal(result.ok, false)
+    assert.equal(result.code, 'crag_v2_hash_mismatch')
+    assert.deepEqual(fs.readFileSync(path.join(dest, 'crag-v2', 'manifest.json')), oldManifest)
+    assert.deepEqual(fs.readdirSync(dest).sort(), ['crag-v2', 'kin-kernel'])
+  } finally {
+    fs.cpSync = copy
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
+
+test('CRAG v2 rolls back the package and preserves the wrapper when publication fails', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-native-rollback-'))
+  const rename = fs.renameSync
+  try {
+    seedTemplate(project)
+    const vm = { id: 'vm-13', dataplane: 'wrap' }
+    assert.equal(materializeResolvedKernel(project, vm).ok, true)
+    const dest = wrapCliHomeDir(project, vm.id)
+    const wrapper = path.join(dest, 'kin-kernel')
+    const oldWrapper = fs.readFileSync(wrapper)
+    const oldKernel = fs.readFileSync(path.join(dest, 'kin-kernel.bin'))
+    const packageRoot = path.join(dest, 'crag-v2')
+    fs.mkdirSync(packageRoot)
+    fs.writeFileSync(path.join(packageRoot, 'old-package'), 'keep')
+    seedV2Package(project)
+    fs.renameSync = (from, to) => {
+      if (to === wrapper) throw Object.assign(new Error('publication denied'), { code: 'EACCES' })
+      return rename(from, to)
+    }
+    const result = materializeResolvedKernel(project, { ...vm, dataplane: 'crag', crag_kernel_version: 'v2' })
+    assert.equal(result.ok, false)
+    assert.equal(result.code, 'crag_v2_stage_failed')
+    assert.equal(fs.readFileSync(path.join(packageRoot, 'old-package'), 'utf8'), 'keep')
+    assert.deepEqual(fs.readFileSync(wrapper), oldWrapper)
+    assert.deepEqual(fs.readFileSync(path.join(dest, 'kin-kernel.bin')), oldKernel)
+    assert.equal(
+      fs.readdirSync(dest).some((name) => name.startsWith('.crag-v2.') || name.startsWith('.kin-kernel.')),
+      false,
+    )
+  } finally {
+    fs.renameSync = rename
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
+
+test('CRAG v2 publishes complete upgrades, repairs damaged installs, and leaves no stage files', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-native-upgrade-'))
+  try {
+    const dir = seedV2Package(project)
+    const vm = { id: 'vm-13', dataplane: 'crag', crag_kernel_version: 'v2' }
+    assert.equal(materializeResolvedKernel(project, vm).ok, true)
+    const dest = wrapCliHomeDir(project, vm.id)
+    fs.writeFileSync(path.join(dest, 'cli-node'), 'preserved legacy CLI')
+    seedV2Package(project, { revision: 'next-package' })
+    assert.equal(inspectKernelChanges(project, [vm]).changed, true)
+    const upgraded = materializeResolvedKernel(project, vm)
+    assert.equal(upgraded.ok, true)
+    assert.equal(upgraded.kernel_changed, true)
+    for (const member of ['manifest.json', 'crag-v2', 'claude-code-2.1.317/claude']) {
+      assert.deepEqual(fs.readFileSync(path.join(dest, 'crag-v2', member)), fs.readFileSync(path.join(dir, member)))
+    }
+    assert.equal(materializeResolvedKernel(project, vm).changed, false)
+    fs.appendFileSync(path.join(dest, 'crag-v2', 'crag-v2'), 'damaged installed file')
+    assert.equal(inspectKernelChanges(project, [vm]).changed, true)
+    assert.equal(materializeResolvedKernel(project, vm).kernel_changed, true)
+    assert.deepEqual(fs.readFileSync(path.join(dest, 'crag-v2', 'crag-v2')), fs.readFileSync(path.join(dir, 'crag-v2')))
+    assert.equal(fs.readFileSync(path.join(dest, 'cli-node'), 'utf8'), 'preserved legacy CLI')
+    assert.deepEqual(fs.readdirSync(dest).sort(), ['cli-node', 'crag-v2', 'kin-kernel'])
+    assert.equal(materializeResolvedKernel(project, vm).changed, false)
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
+
+test('CRAG v2 restores the previous tree if staged directory promotion fails', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-native-promotion-'))
+  const rename = fs.renameSync
+  try {
+    seedV2Package(project)
+    const vm = { id: 'vm-13', dataplane: 'crag', crag_kernel_version: 'v2' }
+    assert.equal(materializeResolvedKernel(project, vm).ok, true)
+    const dest = wrapCliHomeDir(project, vm.id)
+    const packageRoot = path.join(dest, 'crag-v2')
+    const oldManifest = fs.readFileSync(path.join(packageRoot, 'manifest.json'))
+    const oldWorker = fs.readFileSync(path.join(packageRoot, 'crag-v2'))
+    const oldWrapper = fs.readFileSync(path.join(dest, 'kin-kernel'))
+    seedV2Package(project, { revision: 'promotion-failure' })
+    fs.renameSync = (from, to) => {
+      if (to === packageRoot && !from.endsWith('.bak')) {
+        throw Object.assign(new Error('promotion denied'), { code: 'EACCES' })
+      }
+      return rename(from, to)
+    }
+    const result = materializeResolvedKernel(project, vm)
+    assert.equal(result.ok, false)
+    assert.equal(result.code, 'crag_v2_stage_failed')
+    assert.deepEqual(fs.readFileSync(path.join(packageRoot, 'manifest.json')), oldManifest)
+    assert.deepEqual(fs.readFileSync(path.join(packageRoot, 'crag-v2')), oldWorker)
+    assert.deepEqual(fs.readFileSync(path.join(dest, 'kin-kernel')), oldWrapper)
+    assert.deepEqual(fs.readdirSync(dest).sort(), ['crag-v2', 'kin-kernel'])
+  } finally {
+    fs.renameSync = rename
     fs.rmSync(project, { recursive: true, force: true })
   }
 })

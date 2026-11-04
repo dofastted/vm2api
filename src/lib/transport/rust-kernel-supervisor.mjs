@@ -144,14 +144,15 @@ export function readExistingKernelConfig(configPath) {
   }
 }
 
-/** crag and cc run cc-node. Restarting that slot SIGKILLs the worker. */
+/** Legacy crag and cc use cc-node; native V2 owns its own child lifecycle. */
 export function dataplaneUsesCcNode(exec) {
   const configPath = rustKernelPaths(exec).configPath
   if (!configPath) return false
-  const plane = String(readExistingKernelConfig(configPath).dataplane || '')
+  const config = readExistingKernelConfig(configPath)
+  const plane = String(config.dataplane || '')
     .trim()
     .toLowerCase()
-  return plane === 'crag' || plane === 'cc' || plane === 'cc-node'
+  return (plane === 'crag' && config.crag_kernel_version !== 'v2') || plane === 'cc' || plane === 'cc-node'
 }
 function projectRootFromExec(exec = {}) {
   if (exec?.projectRoot) return exec.projectRoot
@@ -191,7 +192,15 @@ export function stopRustKernel(exec = {}) {
     execArgv(exec, [
       'sh',
       '-lc',
-      'kill $(pidof kin-kernel) >/dev/null 2>&1 || true; kill $(pidof bun) >/dev/null 2>&1 || true',
+      [
+        'for p in $(pidof crag-v2 2>/dev/null); do',
+        '  case "$(tr "\\000" " " < "/proc/$p/cmdline" 2>/dev/null)" in',
+        '    *" --gateway-worker "*) kill -TERM "$p" 2>/dev/null || true ;;',
+        '  esac',
+        'done',
+        'kill $(pidof kin-kernel) >/dev/null 2>&1 || true',
+        'kill $(pidof bun) >/dev/null 2>&1 || true',
+      ].join('\n'),
     ]),
     { encoding: 'utf8', timeout: 5000, ...(env ? { env } : {}) },
   )
@@ -255,14 +264,19 @@ async function waitForHealth(exec, timeoutMs, allowMissingCredential = false) {
 async function kernelProcessAlive(exec, runDockerExec) {
   const container = slotContainerName(exec)
   if (!container) return false
-  const result = await runDockerExec(
-    execArgv(exec, [
-      'sh',
-      '-c',
-      'pgrep -f /home/kincli/.kin/kin-kernel.bin >/dev/null || pgrep -f /home/kincli/.kin/kin-kernel >/dev/null || pidof kin-kernel >/dev/null',
-    ]),
-    { timeoutMs: 1500 },
-  )
+  const config = readExistingKernelConfig(rustKernelPaths(exec).configPath)
+  const probe =
+    config.dataplane === 'crag' && config.crag_kernel_version === 'v2'
+      ? [
+          'for p in $(pidof crag-v2 2>/dev/null); do',
+          '  case "$(tr "\\000" " " < "/proc/$p/cmdline" 2>/dev/null)" in',
+          '    *" --gateway-worker "*) exit 0 ;;',
+          '  esac',
+          'done',
+          'exit 1',
+        ].join('\n')
+      : 'pgrep -f /home/kincli/.kin/kin-kernel.bin >/dev/null || pgrep -f /home/kincli/.kin/kin-kernel >/dev/null || pidof kin-kernel >/dev/null'
+  const result = await runDockerExec(execArgv(exec, ['sh', '-c', probe]), { timeoutMs: 1500 })
   return result?.ok === true
 }
 
@@ -346,8 +360,11 @@ async function killWrapDataplane(exec, runDockerExec) {
         'for d in /proc/[0-9]*; do',
         '  exe=$(readlink "$d/exe" 2>/dev/null || true)',
         '  case "$exe" in */qemu-*) exe=$(tr "\\000" "\\n" < "$d/cmdline" 2>/dev/null | sed -n 2p) ;; esac',
+        '  case "$exe" in */.kin/crag-v2/crag-v2)',
+        '    case "$(tr "\\000" " " < "$d/cmdline" 2>/dev/null)" in *" --internal-execution-guard "*) continue ;; esac ;;',
+        '  esac',
         '  case "$exe" in',
-        '    */.kin/cli-node*|*/.kin/kin-kernel*|*/.kin/glibc239/ld-linux*|*/.kin/glibc239/arm64/ld-linux*|/opt/kin/cli-node*|/opt/kin/kin-kernel*|/opt/kin/glibc239/ld-linux*|/opt/kin/glibc239/arm64/ld-linux*)',
+        '    */.kin/crag-v2/*|*/.kin/cli-node*|*/.kin/kin-kernel*|*/.kin/glibc239/ld-linux*|*/.kin/glibc239/arm64/ld-linux*|/opt/kin/cli-node*|/opt/kin/kin-kernel*|/opt/kin/glibc239/ld-linux*|/opt/kin/glibc239/arm64/ld-linux*)',
         '      kill -KILL "${d#/proc/}" 2>/dev/null || true',
         '  esac',
         'done',
@@ -468,6 +485,14 @@ const kernelReloadPending = new Map()
 function kernelJobsRunning(exec, health) {
   if (!rustKernelProcessUp(health)) return 0
   if (health.recovering === true) return 1
+  if (health.runtime_variant === 'crag-v2') {
+    return (
+      Math.max(
+        Number(health.active || 0) + Number(health.waiting || 0),
+        Array.isArray(health.pids) ? health.pids.length : 0,
+      ) + Number(health.queued || 0)
+    )
+  }
   const ready = Number(health.ready_slots)
   if (!Number.isFinite(ready)) return 0
   const total = Number(readExistingKernelConfig(rustKernelPaths(exec).configPath).slots_per_worker) || WRAP_SLOT_MAX
@@ -560,7 +585,7 @@ export async function recycleWrapIfIdle(
 async function containerKernelIsPid1(container, runDockerExec, vm) {
   if (isKvmRuntime(vm)) return false
   const info = await runDockerExec(['inspect', '--format', '{{.Path}}', container], { timeoutMs: 3000 })
-  return /kin-kernel/.test(String(info?.stdout || ''))
+  return /kin-kernel|(?:^|\/)crag-v2$/.test(String(info?.stdout || '').trim())
 }
 function bootWaitMs(timeoutMs, { pid1Kernel, wedged }) {
   if (!pid1Kernel && !wedged) return 0
@@ -882,8 +907,9 @@ export function writeKernelConfig(
   ) {
     config.crag_kernel_version = 'v2'
     config.runtime_variant = 'crag-v2'
-    config.crag_v2_root = '/home/kincli/.kin/crag-v2'
-    config.node_bin = '/home/kincli/.kin/kin-kernel.bin'
+    config.claude_bin = '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude'
+    // Native Claude owns UA/billing version; never inject a legacy profile version.
+    config.cli_version = ''
     if (config.telemetry && isTelemetryEnabled(defaultSeedPolicy(record.seed_policy || {}))) {
       const workstation = resolveWorkstationProfile(record)
       config.telemetry = {
@@ -914,7 +940,7 @@ export function writeKernelConfig(
   try {
     fs.chmodSync(configPath, privileged ? 0o600 : 0o640)
   } catch {}
-  // kin-kernel hot-reloads kernel.json: the change must reach wherever the slot reads it.
+  // Legacy cli-node hot-reads settings; native V2 uses an explicit idle restart.
   if (changed && publish) host.queueSyncRun(record, path.join(projectRoot, 'vms', vm.id))
   return {
     runDir,

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- CRAG V2 发布协议切换到原生 ELF（`runtime: native`、`entrypoint: crag-v2`）：验证实际架构、完整 SHA 成员与安全路径，原子物化并直接执行，不再复制 Node 或写出 `node_bin` / `crag_v2_root`。保留 legacy 版本选择和 Linux Docker 放置限制；真实 CLI 版本由 native worker 探测。
+- native V2 生命周期探测、停止、切换回收和 idle reload 识别新进程名；动态 runnable 上限不再被误算为占用任务。配置写入本身不触发额外热重载，沿用显式空闲重启流程。
 - 新增可选 `compatibility.preserve_pruned_tool_results`：在槽位Claude推理中，按认证密钥和DSH会话隔离保存成功请求的有限工具原文；精确识别默认工具文本裁剪后恢复原始前缀，避免小幅历史裁剪造成整段缓存重写。真实编辑/压缩、失败/重试、并发歧义和内存/上下文预算不足时不恢复；缺省关闭，不改变客户端配置或API直连端点。
 
 ## 1.4.038 — 2026-11-04

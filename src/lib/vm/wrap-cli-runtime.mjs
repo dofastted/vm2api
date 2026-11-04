@@ -5,7 +5,7 @@
  *   wrap: cli-node + wrap kin-kernel
  *   cc:   cc-node + wrap kin-kernel
  *   crag + legacy: cc-node + share/crag/kin-kernel
- *   crag + v2: Node CRAG worker, only when this VM pins crag_kernel_version=v2
+ *   crag + v2: native CRAG worker, only when this VM pins crag_kernel_version=v2
  * Engine rust only chooses which process serves /v1. Credentials stay out.
  * Switching one VM never deletes cli-node and never rewrites routing.json.
  */
@@ -77,7 +77,8 @@ exec "$DIR/${WRAP_KERNEL_WRAPPER}.real" "$@"
 }
 
 export const CRAG_V2_DIR = 'crag-v2'
-const CRAG_V2_ENTRY = 'bin/crag-kernel-worker.mjs'
+const CRAG_V2_ENTRY = 'crag-v2'
+const CRAG_V2_CLAUDE = 'claude-code-2.1.317/claude'
 const CRAG_V2_CAPS = Object.freeze(['official_full', 'zero', 'cancel', 'telemetry', 'unix_socket_envelope'])
 
 export function cragV2Arch() {
@@ -98,7 +99,7 @@ export function cragV2PackageRoot(projectRoot) {
 export function cragV2KernelWrapperScript() {
   return `#!/bin/sh
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec "$DIR/${WRAP_KERNEL_BIN}" "$DIR/${CRAG_V2_DIR}/${CRAG_V2_ENTRY}" "$@"
+exec "$DIR/${CRAG_V2_DIR}/${CRAG_V2_ENTRY}" "$@"
 `
 }
 
@@ -141,11 +142,28 @@ function listCragV2Files(dir, prefix = '') {
       if (nested.ok === false) return nested
       rows.push(...nested)
     } else if (st.isFile()) rows.push(rel)
+    else
+      return {
+        ok: false,
+        code: 'crag_v2_manifest_invalid',
+        error: `CRAG v2 package member is not a regular file: ${rel}`,
+      }
   }
   return rows
 }
 
 function verifyCragV2Tree(dir) {
+  try {
+    const root = fs.lstatSync(dir)
+    if (root.isSymbolicLink())
+      return { ok: false, code: 'crag_v2_symlink', error: 'CRAG v2 package root must not be a symlink' }
+    if (!root.isDirectory())
+      return { ok: false, code: 'crag_v2_package_missing', error: 'CRAG v2 package root must be a directory' }
+  } catch {
+    return { ok: false, code: 'crag_v2_package_missing', error: 'CRAG v2 package directory is missing' }
+  }
+  const listed = listCragV2Files(dir)
+  if (listed.ok === false) return listed
   let manifest
   try {
     manifest = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json'), 'utf8'))
@@ -158,23 +176,19 @@ function verifyCragV2Tree(dir) {
   if (manifest.family !== 'crag' || manifest.version !== 'v2') {
     return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 manifest family/version mismatch' }
   }
-  if (manifest.arch !== cragV2Arch()) {
+  if (!['amd64', 'arm64'].includes(manifest.arch) || manifest.arch !== cragV2Arch()) {
     return {
       ok: false,
       code: 'crag_v2_arch_mismatch',
       error: `CRAG v2 arch ${manifest.arch} does not match ${cragV2Arch()}`,
     }
   }
-  if (manifest.entrypoint !== CRAG_V2_ENTRY) {
+  if (manifest.runtime !== 'native' || manifest.entrypoint !== CRAG_V2_ENTRY) {
     return {
       ok: false,
       code: 'crag_v2_manifest_invalid',
-      error: 'CRAG v2 entrypoint must be bin/crag-kernel-worker.mjs',
+      error: 'CRAG v2 requires runtime=native and entrypoint=crag-v2',
     }
-  }
-  const nodeMajor = /^v(\d+)\./.exec(String(manifest.node_version || ''))
-  if (!nodeMajor || Number(nodeMajor[1]) < 24) {
-    return { ok: false, code: 'crag_v2_node_version', error: 'CRAG v2 node_version must be >= 24' }
   }
   if (!Array.isArray(manifest.capabilities) || CRAG_V2_CAPS.some((cap) => !manifest.capabilities.includes(cap))) {
     return { ok: false, code: 'crag_v2_capabilities', error: 'CRAG v2 manifest is missing required capabilities' }
@@ -182,15 +196,20 @@ function verifyCragV2Tree(dir) {
   if (!manifest.sha256 || typeof manifest.sha256 !== 'object' || Array.isArray(manifest.sha256)) {
     return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 manifest sha256 map is missing' }
   }
-  const listed = listCragV2Files(dir)
-  if (listed.ok === false) return listed
   const expected = new Set(Object.keys(manifest.sha256))
-  if (!expected.has(CRAG_V2_ENTRY)) {
-    return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 manifest does not hash the entrypoint' }
+  for (const required of [CRAG_V2_ENTRY, CRAG_V2_CLAUDE]) {
+    if (!expected.has(required)) {
+      return { ok: false, code: 'crag_v2_manifest_invalid', error: `CRAG v2 manifest does not hash ${required}` }
+    }
   }
   const present = new Set(listed.filter((rel) => rel !== 'manifest.json'))
   for (const rel of expected) {
-    if (rel.includes('..') || rel.startsWith('/') || rel.includes('\\')) {
+    if (
+      rel.includes('\\') ||
+      rel.includes('\0') ||
+      rel.includes(':') ||
+      rel.split('/').some((part) => !part || part === '.' || part === '..')
+    ) {
       return { ok: false, code: 'crag_v2_manifest_invalid', error: `CRAG v2 manifest path is unsafe: ${rel}` }
     }
     if (!present.has(rel)) return { ok: false, code: 'crag_v2_hash_mismatch', error: `CRAG v2 package missing ${rel}` }
@@ -199,12 +218,35 @@ function verifyCragV2Tree(dir) {
     if (!expected.has(rel)) {
       return { ok: false, code: 'crag_v2_hash_mismatch', error: `CRAG v2 package has unlisted file ${rel}` }
     }
-    const digest = crypto
-      .createHash('sha256')
-      .update(fs.readFileSync(path.join(dir, rel)))
-      .digest('hex')
+    const file = path.join(dir, rel)
+    const body = fs.readFileSync(file)
+    const digest = crypto.createHash('sha256').update(body).digest('hex')
     if (digest !== manifest.sha256[rel]) {
       return { ok: false, code: 'crag_v2_hash_mismatch', error: `CRAG v2 hash mismatch: ${rel}` }
+    }
+    const requiredElf = rel === CRAG_V2_ENTRY || rel === CRAG_V2_CLAUDE
+    if (requiredElf || body.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) {
+      if (
+        body.length < 64 ||
+        body.readUInt32BE(0) !== 0x7f454c46 ||
+        body[4] !== 2 ||
+        body[5] !== 1 ||
+        body[6] !== 1 ||
+        ![2, 3].includes(body.readUInt16LE(16))
+      ) {
+        return { ok: false, code: 'crag_v2_elf_invalid', error: `CRAG v2 requires a Linux ELF64 executable: ${rel}` }
+      }
+      const machine = body.readUInt16LE(18)
+      if (machine !== (manifest.arch === 'amd64' ? 62 : 183)) {
+        return {
+          ok: false,
+          code: 'crag_v2_arch_mismatch',
+          error: `CRAG v2 ELF machine does not match ${manifest.arch}: ${rel}`,
+        }
+      }
+      if (requiredElf && !(fs.statSync(file).mode & 0o111)) {
+        return { ok: false, code: 'crag_v2_elf_invalid', error: `CRAG v2 executable permission is missing: ${rel}` }
+      }
     }
   }
   return { ok: true, manifest }
@@ -212,50 +254,52 @@ function verifyCragV2Tree(dir) {
 
 function stageCragV2Tree(src, dest) {
   const parent = path.dirname(dest)
-  const base = path.basename(dest)
-  const staging = path.join(parent, `.${base}.${process.pid}.new`)
-  const backup = path.join(parent, `.${base}.${process.pid}.bak`)
-  fs.rmSync(staging, { recursive: true, force: true })
-  fs.rmSync(backup, { recursive: true, force: true })
-  fs.cpSync(src, staging, { recursive: true, dereference: false })
-  const verified = verifyCragV2Tree(staging)
-  if (!verified.ok) {
-    fs.rmSync(staging, { recursive: true, force: true })
-    return verified
-  }
-  const had = fs.existsSync(dest)
-  if (had) fs.renameSync(dest, backup)
+  const staging = fs.mkdtempSync(path.join(parent, `.${path.basename(dest)}.new-`))
+  const backup = `${staging}.bak`
+  let had = false
   try {
-    fs.renameSync(staging, dest)
-  } catch {
-    if (had) {
-      try {
-        fs.renameSync(backup, dest)
-      } catch {}
+    fs.cpSync(src, staging, { recursive: true, dereference: false })
+    const verified = verifyCragV2Tree(staging)
+    if (!verified.ok) {
+      fs.rmSync(staging, { recursive: true, force: true })
+      return verified
     }
+    try {
+      fs.lstatSync(dest)
+      had = true
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+    }
+    if (had) fs.renameSync(dest, backup)
+    try {
+      fs.renameSync(staging, dest)
+    } catch (error) {
+      if (had) fs.renameSync(backup, dest)
+      throw error
+    }
+  } catch (error) {
     fs.rmSync(staging, { recursive: true, force: true })
-    return { ok: false, code: 'crag_v2_stage_failed', error: 'failed to replace the CRAG v2 package' }
+    return { ok: false, code: 'crag_v2_stage_failed', error: String(error?.message || error) }
   }
   return {
     ok: true,
     rollback() {
       fs.rmSync(dest, { recursive: true, force: true })
-      if (had && fs.existsSync(backup)) fs.renameSync(backup, dest)
-      fs.rmSync(staging, { recursive: true, force: true })
+      if (had) fs.renameSync(backup, dest)
     },
     commit() {
       fs.rmSync(backup, { recursive: true, force: true })
-      fs.rmSync(staging, { recursive: true, force: true })
     },
   }
 }
 
-function cragV2WouldChange(src, destDir, nodeSrc) {
+function cragV2WouldChange(src, destDir) {
   const destRoot = path.join(destDir, CRAG_V2_DIR)
   if (!filesEqual(path.join(src, 'manifest.json'), path.join(destRoot, 'manifest.json'))) return true
   if (verifyCragV2Tree(destRoot).ok !== true) return true
-  if (!filesEqual(nodeSrc, path.join(destDir, WRAP_KERNEL_BIN))) return true
   try {
+    const wrapper = fs.lstatSync(path.join(destDir, WRAP_KERNEL_WRAPPER))
+    if (!wrapper.isFile() || !(wrapper.mode & 0o111)) return true
     if (fs.readFileSync(path.join(destDir, WRAP_KERNEL_WRAPPER), 'utf8') !== cragV2KernelWrapperScript()) return true
   } catch {
     return true
@@ -267,24 +311,20 @@ function writeCragV2Wrapper(destDir) {
   const wrapper = path.join(destDir, WRAP_KERNEL_WRAPPER)
   const body = cragV2KernelWrapperScript()
   try {
-    if (fs.readFileSync(wrapper, 'utf8') === body) return
+    const st = fs.lstatSync(wrapper)
+    if (st.isFile() && st.mode & 0o111 && fs.readFileSync(wrapper, 'utf8') === body) return
   } catch {}
-  const tmp = path.join(destDir, `.${WRAP_KERNEL_WRAPPER}.${process.pid}.new`)
-  fs.writeFileSync(tmp, body, { mode: 0o755 })
+  const tmp = path.join(destDir, `.${WRAP_KERNEL_WRAPPER}.${crypto.randomUUID()}.new`)
   try {
-    fs.unlinkSync(wrapper)
+    fs.writeFileSync(tmp, body, { mode: 0o755, flag: 'wx' })
+    fs.renameSync(tmp, wrapper)
   } catch (error) {
-    if (error?.code !== 'ENOENT') {
-      try {
-        fs.unlinkSync(tmp)
-      } catch {}
-      throw error
-    }
+    fs.rmSync(tmp, { force: true })
+    throw error
   }
-  fs.renameSync(tmp, wrapper)
 }
 
-export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, nodeBin = '' } = {}) {
+export function materializeCragV2(projectRoot, vm, { uid = null, gid = null } = {}) {
   if (!projectRoot || !vm?.id) {
     return { ok: false, code: 'vm_required', error: 'projectRoot and vm id required' }
   }
@@ -298,13 +338,11 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, nod
       error: 'CRAG v2 package missing (share/crag/kernels/v2/<arch> or KIN_CRAG_V2_ROOT)',
     }
   }
-  const nodeSrc = String(nodeBin || '').trim() || process.execPath
-  if (!isFile(nodeSrc)) {
-    return { ok: false, code: 'crag_v2_node_missing', error: 'control-plane Node binary missing' }
-  }
+  const verified = verifyCragV2Tree(src)
+  if (!verified.ok) return verified
   const dest = wrapCliHomeDir(projectRoot, vm.id)
   fs.mkdirSync(dest, { recursive: true })
-  if (!cragV2WouldChange(src, dest, nodeSrc)) {
+  if (!cragV2WouldChange(src, dest)) {
     return {
       ok: true,
       dest,
@@ -322,12 +360,6 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, nod
   const tree = stageCragV2Tree(src, path.join(dest, CRAG_V2_DIR))
   if (!tree.ok) return tree
   try {
-    replaceFile(nodeSrc, path.join(dest, WRAP_KERNEL_BIN))
-    fs.chmodSync(path.join(dest, WRAP_KERNEL_BIN), 0o755)
-    if (!isFile(path.join(dest, WRAP_KERNEL_BIN))) {
-      tree.rollback()
-      return { ok: false, code: 'crag_v2_node_missing', error: 'failed to install the CRAG v2 Node binary' }
-    }
     writeCragV2Wrapper(dest)
   } catch (error) {
     tree.rollback()
@@ -346,7 +378,7 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, nod
     kernel_changed: true,
     glibc_shim: false,
     wrapper: isFile(path.join(dest, WRAP_KERNEL_WRAPPER)),
-    kernel_bin: isFile(path.join(dest, WRAP_KERNEL_BIN)),
+    kernel_bin: isFile(path.join(dest, CRAG_V2_DIR, CRAG_V2_ENTRY)),
   }
 }
 
@@ -1077,7 +1109,19 @@ export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptio
         })
         continue
       }
-      const kernelChanged = cragV2WouldChange(src, destDir, process.execPath) || Boolean(vm?.kernel_restart_pending)
+      const verified = verifyCragV2Tree(src)
+      if (!verified.ok) {
+        items.push({
+          id: vm.id,
+          dataplane,
+          kernel_version: 'v2',
+          ok: false,
+          code: verified.code,
+          kernel_changed: false,
+        })
+        continue
+      }
+      const kernelChanged = cragV2WouldChange(src, destDir) || Boolean(vm?.kernel_restart_pending)
       items.push({ id: vm.id, dataplane, kernel_version: 'v2', ok: true, kernel_changed: kernelChanged })
       continue
     }
