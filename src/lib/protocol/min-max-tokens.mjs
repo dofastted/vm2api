@@ -1,7 +1,8 @@
 /**
- * max_tokens floor for the Anthropic hop (sub2api apicompat minMaxOutputTokens).
- * Health checks and third-party pings send 1..16; very small values end the
- * hop before any visible text. A missing max_tokens is left to the defaults.
+ * A caller max_tokens is the output budget and is not replaced.
+ * A missing value is filled later from the model catalog.
+ * Enabled thinking still needs max_tokens above budget_tokens; only that
+ * invalid pair is raised, using the configured padding.
  */
 export const DEFAULT_MIN_MAX_TOKENS = Object.freeze({ enabled: true, value: 128 })
 
@@ -20,7 +21,7 @@ export function applyMinMaxTokens(body, raw) {
   if (!cfg.enabled) return body
   const current = Number(body.max_tokens)
   if (body.max_tokens == null || !Number.isFinite(current)) return body
-  let next = Math.max(current, cfg.value)
+  let next = current
   const thinking = body.thinking
   const budget = Number(thinking?.budget_tokens)
   // Upstream rejects max_tokens <= budget_tokens on enabled thinking.

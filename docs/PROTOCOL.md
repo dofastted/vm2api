@@ -66,7 +66,7 @@ Go worker JSON 透传，不必因人设重建 worker。
 
 ## thinking 与 max_tokens
 
-`max_tokens` **就是** thinking 预算（thinking + 可见输出共享）。调用方有值则不覆盖；缺失时 OAuth 默认 **128000**。绝对上限 128000。仅当超过模型 `max_tokens_cap` 时 `applyMaxTokensCap` 下调。
+`max_tokens` **就是** thinking 预算（thinking + 可见输出共享）。调用方有值则不覆盖，包括低于旧下限的 64。缺失时用该模型目录的 `max_tokens_default`，目录没有时用 4096。仅当超过模型 `max_tokens_cap` 时 `applyMaxTokensCap` 下调。
 
 | 模型 | thinking |
 |------|----------|

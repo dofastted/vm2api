@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- #885：没写 `max_tokens` 时用模型目录的 `max_tokens_default`（例如 Haiku 5.5 为 100000，Sonnet 5 为 64000），不再一律填 128000。写了且低于 `compatibility.min_max_tokens.value` 时默认仍抬到该值；模式「不改」或 `no_raise` / 面板「不抬升」则不抬。超过该模型 `max_tokens_cap` 仍会下调。`enabled` thinking 的 `budget_tokens` 不小于 `max_tokens` 时，仍用该配置值只补 thinking 合法间隔。健康探测页文案与「不抬升」控件见 `web/dist`。
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
 ## 1.4.038 — 2026-11-04
 
 - #882：放行 Sonnet 5.5 的 `thinking: {"type":"between_tools"}`，修复 Claude Code auto 模式分类器被本地 400 拒绝。分类器与普通 Messages 保留该模式及签名 thinking 历史；不支持的模型、`xhigh` / `max` effort 或额外 thinking 字段仍在分配账号前拒绝。
