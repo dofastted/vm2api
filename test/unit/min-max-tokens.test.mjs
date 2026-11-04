@@ -74,6 +74,16 @@ test('normalizeMinMaxTokensMode accepts tier aliases', () => {
   assert.equal(normalizeMinMaxTokensMode({}), 'floor')
 })
 
+test('explicit modes take precedence over legacy raise flags', () => {
+  for (const mode of ['preserve', 'unchanged', '不改', ' preserve ']) {
+    assert.equal(applyMinMaxTokens({ max_tokens: 64 }, { mode, raise: true }).max_tokens, 64)
+  }
+  for (const mode of ['floor', 'default', 'raise']) {
+    assert.equal(applyMinMaxTokens({ max_tokens: 64 }, { mode, no_raise: true }).max_tokens, 128)
+  }
+  assert.equal(applyMinMaxTokens({ max_tokens: 64 }, { mode: 'unknown', no_raise: true }).max_tokens, 64)
+})
+
 test('enabled thinking keeps max_tokens above budget_tokens', () => {
   const out = applyMinMaxTokens({ max_tokens: 1024, thinking: { type: 'enabled', budget_tokens: 2048 } }, {})
   assert.equal(out.max_tokens, 2048 + 128)
