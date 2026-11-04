@@ -621,11 +621,7 @@ export class PoolScheduler extends EventEmitter {
         return fail('all_accounts_busy', waitCandidates, waitAvailable, waitPool)
       }
       const waitCap = Math.min(waitDeadline, loopDeadline)
-      const sliceDeadline = wakeAts.length
-        ? Math.min(waitCap, ...wakeAts)
-        : staleWindowWake
-          ? now + 1
-          : waitCap
+      const sliceDeadline = wakeAts.length ? Math.min(waitCap, ...wakeAts) : staleWindowWake ? now + 1 : waitCap
       const queuedAt = Date.now()
       const waited = await this.waitForCapacity({
         signal,
