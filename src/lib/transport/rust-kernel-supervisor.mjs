@@ -291,7 +291,13 @@ async function waitForHealthOrExit(exec, { timeoutMs, container, runDockerExec, 
 
 export async function ensureRustKernel(
   exec,
-  { timeoutMs = 30000, runDockerExec = runDocker, force = false, allowMissingCredential = false } = {},
+  {
+    timeoutMs = 30000,
+    healthTimeoutMs = 800,
+    runDockerExec = runDocker,
+    force = false,
+    allowMissingCredential = false,
+  } = {},
 ) {
   const vmId = exec?.vmId || exec?.vm?.id || 'unknown'
   const pending = starts.get(vmId)
@@ -302,7 +308,15 @@ export async function ensureRustKernel(
   }
   const control = { cancelled: false }
   const run = slotRunner(exec, runDockerExec)
-  const promise = startRustKernel(exec, { timeoutMs, vmId, control, runDockerExec: run, force, allowMissingCredential })
+  const promise = startRustKernel(exec, {
+    timeoutMs,
+    healthTimeoutMs,
+    vmId,
+    control,
+    runDockerExec: run,
+    force,
+    allowMissingCredential,
+  })
   const start = { promise, control }
   starts.set(vmId, start)
   try {
@@ -616,7 +630,7 @@ async function startNativeKernel(exec, { timeoutMs, control, host }) {
 
 async function startRustKernel(
   exec,
-  { timeoutMs, control, runDockerExec, force = false, allowMissingCredential = false },
+  { timeoutMs, healthTimeoutMs = 800, control, runDockerExec, force = false, allowMissingCredential = false },
 ) {
   if (exec?.homeDir) {
     const ids = slotUidGidFromHomeDir(exec.homeDir)
@@ -627,7 +641,7 @@ async function startRustKernel(
   }
   const paths = rustKernelPaths(exec)
   if (!paths.socketPath) return { ok: false, reason: 'socket_missing' }
-  const existing = await rustKernelHealth(exec, { timeoutMs: 800 })
+  const existing = await rustKernelHealth(exec, { timeoutMs: healthTimeoutMs })
   if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
   const staleWrap = wrapNewerThanKernel(exec)
   const slotMismatch =

@@ -1189,6 +1189,43 @@ unixTest('Rust supervisor does not recycle a busy CLI with ready_slots=0', async
   }
 })
 
+unixTest('Rust supervisor honors a longer preflight timeout for a slow kernel response', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-slow-remote-'))
+  const vm = { id: 'vm-slow-remote' }
+  const written = writeKernelConfig(root, vm, { token: 'tok', proxyUrl: '', proxyRequired: false })
+  const homeDir = path.join(root, 'vms', vm.id, 'cli-home')
+  const exec = {
+    vmId: vm.id,
+    homeDir,
+    vm: {
+      ...vm,
+      runtime: { container: 'kin-slow-remote', kernel_socket: written.socketPath },
+    },
+  }
+  const server = http.createServer((_req, res) => {
+    setTimeout(() => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 1, worker_version: 'fixture' }))
+    }, 900)
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(written.socketPath, resolve)
+  })
+  try {
+    const ready = await ensureRustKernel(exec, {
+      timeoutMs: 3000,
+      healthTimeoutMs: 2000,
+      runDockerExec: async () => ({ ok: true }),
+    })
+    assert.equal(ready.ok, true, JSON.stringify(ready))
+    assert.equal(ready.reason, 'already_up')
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 for (const state of ['idle', 'partly occupied', 'full']) {
   unixTest(`credential rotation does not restart the ${state} PID-1 kernel`, async () => {
     resetWrapRecycleState()

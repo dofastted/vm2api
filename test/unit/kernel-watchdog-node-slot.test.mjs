@@ -4,6 +4,7 @@ import {
   createKernelWatchdog,
   watchdogProbeVm,
   NODE_SLOT_HEALTH_TIMEOUT_MS,
+  NODE_SLOT_FAILURES_BEFORE_RESTART,
 } from '../../src/lib/transport/kernel-watchdog.mjs'
 import { kernelFaults } from '../../src/lib/transport/rust-kernel-client.mjs'
 
@@ -87,7 +88,7 @@ test('a node slot that answers on its relay is left alone', async () => {
   assert.deepEqual(ensured, [])
 })
 
-test('a genuinely dead remote kernel behind a live relay keeps the bounded L4/L5 budget', async () => {
+test('a genuinely dead remote kernel behind a live relay keeps the bounded L4/L5 budget after repeated probe failures', async () => {
   kernelFaults.delete('slot-a1')
   const ensured = []
   const faults = []
@@ -107,11 +108,11 @@ test('a genuinely dead remote kernel behind a live relay keeps the bounded L4/L5
     onFault: (vm, reason) => faults.push([vm.id, reason]),
     now: () => now,
   })
-  for (const at of [0, 30_000, 60_000, 200_000, 360_000, 1_000_000, 1_260_000, 1_500_000, 2_200_000]) {
+  for (const at of [0, 30_000, 60_000, 200_000, 360_000, 1_000_000, 1_260_000, 1_500_000, 2_200_000, 2_240_000]) {
     now = at
     await wd.tick()
   }
-  assert.deepEqual(ensured, [60_000, 360_000, 1_260_000])
+  assert.deepEqual(ensured, [200_000, 1_000_000, 2_200_000])
   assert.equal(faults.length, 1)
   assert.equal(faults[0][0], 'slot-a1')
   assert.equal(kernelFaults.has('slot-a1'), true)
@@ -160,4 +161,79 @@ test('a node slot gets a relay-sized health timeout; a local slot keeps 800ms', 
   await wd.tick()
   assert.deepEqual(timeouts, { 'slot-a1': NODE_SLOT_HEALTH_TIMEOUT_MS, 'slot-local': 800 })
   assert.ok(NODE_SLOT_HEALTH_TIMEOUT_MS >= 3000)
+})
+
+test('intermittent node transport failures do not spend the kernel recovery budget', async () => {
+  let now = 0
+  let probes = 0
+  const ensured = []
+  const ensureHealthTimeouts = []
+  const wd = createKernelWatchdog({
+    config: { interval_sec: 5, restart_backoff_sec: [10] },
+    listTargets: () => [{ id: 'slot-flaky', node_id: 'node-a', status: 'running' }],
+    probeVm: (vm) => watchdogProbeVm(vm, { relayPaths: RELAY, exists: () => true }),
+    health: async () => {
+      probes += 1
+      return { ok: false, status: 0, code: 'worker_timeout' }
+    },
+    observeRuntime: async () => ({ state: 'running' }),
+    ensure: async (_exec, options) => {
+      ensured.push(now)
+      ensureHealthTimeouts.push(options.healthTimeoutMs)
+      return { ok: true, reason: 'already_up' }
+    },
+    now: () => now,
+  })
+  try {
+    for (const at of [0, 5_000, 10_000, 15_000, 20_000, 25_000]) {
+      now = at
+      await wd.tick()
+    }
+    assert.equal(NODE_SLOT_FAILURES_BEFORE_RESTART, 3)
+    assert.deepEqual(ensured, [20_000], 'recovery preflight sees the kernel is already healthy')
+    assert.deepEqual(ensureHealthTimeouts, [NODE_SLOT_HEALTH_TIMEOUT_MS])
+    assert.equal(probes, 6)
+    assert.equal(wd.restartsInWindow('slot-flaky'), 0)
+    assert.equal(kernelFaults.has('slot-flaky'), false)
+  } finally {
+    kernelFaults.delete('slot-flaky')
+  }
+})
+
+test('a rejected node recovery still spends the bounded recovery budget', async () => {
+  kernelFaults.delete('slot-rejected')
+  let now = 0
+  const ensured = []
+  const faults = []
+  const wd = createKernelWatchdog({
+    config: { interval_sec: 5, restart_backoff_sec: [10] },
+    listTargets: () => [{ id: 'slot-rejected', node_id: 'node-a', status: 'running' }],
+    probeVm: (vm) => watchdogProbeVm(vm, { relayPaths: RELAY, exists: () => true }),
+    health: async () => ({
+      ok: false,
+      status: 0,
+      code: 'worker_timeout',
+      error: 'slot worker timeout after 3000ms',
+    }),
+    observeRuntime: async () => ({ state: 'running' }),
+    ensure: async () => {
+      ensured.push(now)
+      throw new Error('recovery transport failed')
+    },
+    onFault: (vm, reason) => faults.push([vm.id, reason]),
+    now: () => now,
+  })
+  try {
+    for (const at of [0, 5_000, 10_000, 15_000, 20_000, 25_000]) {
+      now = at
+      await wd.tick()
+    }
+    assert.deepEqual(ensured, [20_000])
+    assert.equal(wd.restartsInWindow('slot-rejected'), 1)
+    assert.equal(faults.length, 1)
+    assert.match(faults[0][1], /1 recovery attempts: slot worker timeout after 3000ms/)
+    assert.equal(kernelFaults.has('slot-rejected'), true)
+  } finally {
+    kernelFaults.delete('slot-rejected')
+  }
 })
