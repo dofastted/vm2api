@@ -1,16 +1,27 @@
 export const DEFAULT_URL = 'https://api.anthropic.com'
 export const DIRECT = '__direct__'
+export type ApiProtocol = 'anthropic' | 'openai'
+export const API_DEFAULTS = {
+  anthropic: { baseUrl: DEFAULT_URL, authScheme: 'x_api_key' },
+  openai: {
+    baseUrl: 'https://api.openai.com',
+    authScheme: 'authorization_bearer',
+  },
+} as const
 
 export type AuthScheme = 'x_api_key' | 'authorization_bearer'
 
 /** 载入时的服务端值；保存已存地址只发和它不同的字段。 */
 export type StoredSnapshot = {
+  protocol?: ApiProtocol
   baseUrl: string
   authScheme: AuthScheme
   proxyId: string
 }
 
 export type EndpointDraft = {
+  protocol?: ApiProtocol
+  fetchedModels?: string[]
   id: string
   storedId?: string
   keyId?: string
@@ -23,6 +34,7 @@ export type EndpointDraft = {
 
 type StoredItem = {
   id: string
+  protocol?: ApiProtocol
   base_url?: string
   auth_scheme?: string
   api_key_entries?: { id?: string; proxy_id?: string }[]
@@ -31,9 +43,11 @@ type StoredItem = {
 export function draftFromStored(item: StoredItem): EndpointDraft {
   const key = item.api_key_entries?.[0]
   const stored: StoredSnapshot = {
-    baseUrl: item.base_url || DEFAULT_URL,
+    protocol: item.protocol || 'anthropic',
+    baseUrl:
+      item.base_url || API_DEFAULTS[item.protocol || 'anthropic'].baseUrl,
     authScheme:
-      item.auth_scheme === 'authorization_bearer'
+      item.protocol === 'openai' || item.auth_scheme === 'authorization_bearer'
         ? 'authorization_bearer'
         : 'x_api_key',
     proxyId: key?.proxy_id || DIRECT,
@@ -48,36 +62,45 @@ export function draftFromStored(item: StoredItem): EndpointDraft {
   }
 }
 
-function kindOf(baseUrl: string) {
-  return baseUrl === DEFAULT_URL ? 'claude' : 'custom'
+function kindOf(baseUrl: string, protocol: ApiProtocol) {
+  if (protocol === 'anthropic' && baseUrl === DEFAULT_URL) return 'claude'
+  if (protocol === 'openai' && baseUrl === API_DEFAULTS.openai.baseUrl)
+    return 'openai'
+  return 'custom'
 }
 
 /**
  * 新地址整条创建；已存地址只发密钥和改过的字段。后端 PATCH 对 name / models
- * 是整体覆盖，发了就会把已存的模型表和名称冲掉，所以从不发这两项。
+ * 是整体覆盖，因此只发送 fetched_models 让服务端合并，不覆盖名称或已有别名。
  */
 export function endpointSaveRequest(
   item: EndpointDraft,
   model: string
 ): { method: 'POST' | 'PATCH'; path: string; body: Record<string, unknown> } {
-  const baseUrl = item.baseUrl.trim() || DEFAULT_URL
+  const protocol = item.protocol || 'anthropic'
+  const baseUrl = item.baseUrl.trim() || API_DEFAULTS[protocol].baseUrl
   const apiKey = item.apiKey.trim()
   const proxyId = item.proxyId === DIRECT ? '' : item.proxyId
   if (!item.storedId) {
-    const name = model.trim() || 'claude-sonnet-4-5'
+    const names = item.fetchedModels?.length
+      ? item.fetchedModels
+      : model.trim()
+        ? [model.trim()]
+        : []
+    if (!names.length) throw new Error('先获取模型或填写模型再保存')
     return {
       method: 'POST',
       path: '/api/panel/api-endpoints',
       body: {
-        kind: kindOf(baseUrl),
-        protocol: 'anthropic',
+        kind: kindOf(baseUrl, protocol),
+        protocol,
         name: baseUrl,
         base_url: baseUrl,
         auth_scheme: item.authScheme,
         proxy_id: proxyId,
         key_id: item.keyId || '',
         api_key: apiKey,
-        models: [{ name, alias: name }],
+        models: names.map((name) => ({ name, alias: name })),
         api_key_entries: apiKey ? [{ api_key: apiKey }] : [],
       },
     }
@@ -88,9 +111,19 @@ export function endpointSaveRequest(
   if (!was || item.proxyId !== was.proxyId) body.proxy_id = proxyId
   if (!was || item.authScheme !== was.authScheme)
     body.auth_scheme = item.authScheme
-  if (was && baseUrl !== was.baseUrl) {
-    body.kind = kindOf(baseUrl)
+  if (
+    was &&
+    (baseUrl !== was.baseUrl || protocol !== (was.protocol || 'anthropic'))
+  ) {
+    body.kind = kindOf(baseUrl, protocol)
     body.base_url = baseUrl
+    if (protocol !== (was.protocol || 'anthropic')) body.protocol = protocol
+  }
+  if (item.fetchedModels?.length) {
+    body.fetched_models = item.fetchedModels.map((name) => ({
+      name,
+      alias: name,
+    }))
   }
   return {
     method: 'PATCH',
