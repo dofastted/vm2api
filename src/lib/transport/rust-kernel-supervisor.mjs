@@ -15,6 +15,7 @@ import {
 } from './rust-kernel-client.mjs'
 import { maxRequestBytes, streamIdleTimeoutMs } from '../core/config.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
+import { resolveWorkstationProfile } from '../identity/workstation-profile.mjs'
 import { cacheTtlFromRouting, normalizeCacheTtl } from '../protocol/cache-ttl.mjs'
 import { thinkingDisplayMode } from '../protocol/thinking.mjs'
 import { getModelPolicy } from '../protocol/model-policy.mjs'
@@ -42,6 +43,7 @@ import {
 } from '../oauth/oauth-credentials.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { buildNativeTelemetry } from '../vm/native-telemetry.mjs'
+import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { RETIRE_LEGACY_TELEMETRY } from '../vm/slot-process-status.mjs'
 
 /** The native host is authenticated separately from account scheduling readiness. */
@@ -882,6 +884,23 @@ export function writeKernelConfig(
     config.runtime_variant = 'crag-v2'
     config.crag_v2_root = '/home/kincli/.kin/crag-v2'
     config.node_bin = '/home/kincli/.kin/kin-kernel.bin'
+    if (config.telemetry && isTelemetryEnabled(defaultSeedPolicy(record.seed_policy || {}))) {
+      const workstation = resolveWorkstationProfile(record)
+      config.telemetry = {
+        ...config.telemetry,
+        enabled: true,
+        dmi_dir: '/etc/kin-dmi',
+        identity: {
+          enabled: true,
+          linux_kernel: workstation.linux_kernel,
+          linux_distro_id: workstation.linux_distro_id,
+          linux_distro_version: workstation.linux_distro_version,
+          shell: workstation.shell,
+          terminal: workstation.terminal,
+          package_managers: workstation.package_managers,
+        },
+      }
+    }
   }
 
   if (tz) config.timezone = tz
