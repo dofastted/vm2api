@@ -27,6 +27,10 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
     { model: true, enabled: true, block: true, scoped: true },
   ],
   ['anthropic.messages', 'claude-review', 'anthropic', false, { model: true, enabled: true, scoped: true }],
+  ['anthropic.messages', 'claude-opus-5-5', 'anthropic', false, { invalid: 'thinking' }],
+  ['anthropic.messages', 'claude-sonnet-5-5', 'anthropic', false, { invalid: 'tools' }],
+  ['openai.chat', 'claude-sonnet-5-5', 'anthropic', false, { invalid: 'tools' }],
+  ['openai.responses', 'claude-sonnet-5-5', 'anthropic', false, { invalid: 'tools' }],
 ]) {
   test(`API key routes ${protocol} ${model}, review=${review.enabled ?? 'default'}, risky=${!!review.risky}, decision=${!!review.model}, block=${!!review.block}`, async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'api-channel-'))
@@ -106,6 +110,22 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
               ? { reasoning_effort: 'low', temperature: 0.2, parallel_tool_calls: false }
               : {}),
           }
+    if (review.invalid === 'thinking') body.thinking = { type: 'between_tools' }
+    if (review.invalid === 'tools') {
+      const tool = { name: 'chosen', parameters: { type: 'object', properties: {} } }
+      body.tools =
+        protocol === 'anthropic.messages'
+          ? [{ name: tool.name, input_schema: tool.parameters }]
+          : protocol === 'openai.chat'
+            ? [{ type: 'function', function: tool }]
+            : [{ type: 'function', ...tool }]
+      body.tool_choice =
+        protocol === 'anthropic.messages'
+          ? { type: 'tool', name: tool.name }
+          : protocol === 'openai.chat'
+            ? { type: 'function', function: { name: tool.name } }
+            : { type: 'function', name: tool.name }
+    }
     let acquired = 0
     let released = 0
     const handler = createHandleProtocol({
@@ -177,6 +197,16 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
     }
     try {
       await handler.handleProtocol(req, response, protocol, req.url)
+      if (review.invalid) {
+        assert.equal(response.status, 400, JSON.stringify(response.body))
+        assert.equal(
+          response.body.error.code,
+          review.invalid === 'thinking' ? 'thinking_incompatible' : 'tool_choice_incompatible',
+        )
+        assert.equal(captured.length, 0, 'invalid content must not reach the selected API upstream')
+        assert.equal(acquired, 0, 'invalid content must not consume key admission')
+        return
+      }
       assert.equal(audited.length, review.model && review.enabled ? 1 : 0)
       if (audited.length) assert.match(audited[0].state, /hello/)
       if (review.enabled && (review.risky || review.block)) {

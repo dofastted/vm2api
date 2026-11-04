@@ -16,7 +16,7 @@ for (const classifier of [false, true]) {
     { thinking: { type: 'between_tools', budget_tokens: 1024 } },
     { thinking: { type: 'between_tools', block_binding: true } },
   ]) {
-    test(`${classifier ? 'classifier' : 'ordinary'} ingress rejects ${JSON.stringify(invalid)} before allocation`, async () => {
+    test(`${classifier ? 'classifier' : 'ordinary'} OAuth ingress rejects ${JSON.stringify(invalid)} before allocation`, async () => {
       const input = {
         ...(classifier
           ? classifierFixture({ model: 'claude-sonnet-5-5' })
@@ -76,7 +76,7 @@ for (const classifier of [false, true]) {
           ? { 'user-agent': 'claude-cli/2.1.293 (external, cli)', 'anthropic-beta': 'claude-code-20250219' }
           : { 'user-agent': 'test-client' },
         apiKeyKind: 'managed',
-        apiKeyRecord: { category: 'api', user_id: 'admin' },
+        apiKeyRecord: { category: 'oauth', user_id: 'admin' },
         once() {},
         off() {},
       }

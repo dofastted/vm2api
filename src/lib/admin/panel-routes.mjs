@@ -1944,7 +1944,7 @@ export function createPanelHandler(ctx) {
         const item = publicEndpointView(ep)?.api_key_entries?.find((k) => k.id === kid)
         return json(res, 200, { ok: true, item })
       }
-      if (req.method === 'POST' && (p === '/api/panel/api/messages' || p === '/api/panel/anthropic/messages')) {
+      if (req.method === 'POST' && /^\/api\/panel\/(?:api|anthropic)\/messages$/.test(p)) {
         const body = await readBody(req, 64 * 1024).catch(() => ({}))
         try {
           const result = await runAnthropicConsole({
