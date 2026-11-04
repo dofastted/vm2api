@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import { EventEmitter } from 'node:events'
 import { Readable } from 'node:stream'
 import { applySseSocketTuning, createRespond, parseRequestUrl, readBody } from '../../src/lib/http/respond.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
@@ -97,7 +98,9 @@ test('oversized protocol body returns 413 before scheduling', async () => {
     Buffer.from('{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hello hello"}]}'),
   ])
   req.headers = {}
-  const res = { statusCode: 0, body: null, on() {} }
+  const res = new EventEmitter()
+  res.statusCode = 0
+  res.body = null
   await handleProtocol(req, res, 'anthropic.messages', '/v1/messages')
   assert.equal(scheduled, false)
   assert.equal(res.statusCode, 413)
