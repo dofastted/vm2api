@@ -58,7 +58,16 @@ async function fakeSocks(t, { greeting = [5, 0], connect = () => CONNECT_OK } = 
 }
 
 test('loopback rows classify as local forwarders, remote endpoints do not', () => {
-  for (const host of ['127.0.0.1', 'localhost', '::1', '[::1]', '10.1.2.3', '172.20.0.1', '192.168.1.9', '::ffff:127.0.0.1'])
+  for (const host of [
+    '127.0.0.1',
+    'localhost',
+    '::1',
+    '[::1]',
+    '10.1.2.3',
+    '172.20.0.1',
+    '192.168.1.9',
+    '::ffff:127.0.0.1',
+  ])
     assert.equal(isLocalForwarderHost(host), true, host)
   for (const host of ['203.0.113.10', 'proxy.example.com', '8.8.8.8', '2001:4860:4860::8888'])
     assert.equal(isLocalForwarderHost(host), false, host)
