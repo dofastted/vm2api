@@ -98,7 +98,13 @@ export function HealthPane(props: HealthPaneProps) {
   const setMinTokens = (patch: Obj) =>
     onCompatibilityChange({
       ...compatibility,
-      min_max_tokens: { enabled: true, value: 128, mode: 'floor', ...minTokens, ...patch },
+      min_max_tokens: {
+        enabled: true,
+        value: 128,
+        mode: 'floor',
+        ...minTokens,
+        ...patch,
+      },
     })
 
   return (
@@ -153,7 +159,13 @@ export function HealthPane(props: HealthPaneProps) {
                   variant={preserveCaller ? 'outline' : 'default'}
                   className='min-h-11'
                   disabled={minTokens.enabled === false}
-                  onClick={() => setMinTokens({ mode: 'floor', no_raise: false, raise: true })}
+                  onClick={() =>
+                    setMinTokens({
+                      mode: 'floor',
+                      no_raise: false,
+                      raise: true,
+                    })
+                  }
                 >
                   默认抬升
                 </Button>
@@ -163,7 +175,9 @@ export function HealthPane(props: HealthPaneProps) {
                   variant={preserveCaller ? 'default' : 'outline'}
                   className='min-h-11'
                   disabled={minTokens.enabled === false}
-                  onClick={() => setMinTokens({ mode: '不改', no_raise: true, raise: false })}
+                  onClick={() =>
+                    setMinTokens({ mode: '不改', no_raise: true, raise: false })
+                  }
                 >
                   不改
                 </Button>
@@ -176,7 +190,7 @@ export function HealthPane(props: HealthPaneProps) {
                     setMinTokens(
                       checked
                         ? { mode: '不改', no_raise: true, raise: false }
-                        : { mode: 'floor', no_raise: false, raise: true },
+                        : { mode: 'floor', no_raise: false, raise: true }
                     )
                   }
                   aria-label='不抬升'
