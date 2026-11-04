@@ -1,6 +1,6 @@
 import { createFileRoute } from '@tanstack/react-router'
-import { ApiEndpointsPage } from '@/features/api-endpoints'
+import { AnthropicConsolePage } from '@/features/anthropic'
 
 export const Route = createFileRoute('/_authenticated/api')({
-  component: ApiEndpointsPage,
+  component: AnthropicConsolePage,
 })
