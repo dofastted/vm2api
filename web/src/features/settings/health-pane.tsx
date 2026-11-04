@@ -118,7 +118,7 @@ export function HealthPane(props: HealthPaneProps) {
             />
           </SettingRow>
           <SettingRow
-            label='max_tokens 下限'
+            label='thinking 合法间隔'
             desc='调用方写了 max_tokens 就原样出站，不再抬高。没写时用该模型目录里的 max_tokens_default。这个数值只在 enabled thinking 的 budget 不小于 max_tokens 时用来补出合法间隔。'
           >
             <div className='flex items-center gap-3'>
@@ -134,14 +134,14 @@ export function HealthPane(props: HealthPaneProps) {
                     value: clampInt(event.target.value, 1, 4096, 128),
                   })
                 }
-                aria-label='max_tokens 下限'
+                aria-label='thinking 合法间隔'
               />
               <Switch
                 checked={minTokens.enabled !== false}
                 onCheckedChange={(checked) =>
                   setMinTokens({ enabled: checked })
                 }
-                aria-label='启用 max_tokens 下限'
+                aria-label='启用 thinking 合法间隔'
               />
             </div>
           </SettingRow>
