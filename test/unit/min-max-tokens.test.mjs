@@ -20,14 +20,8 @@ test('passes through max_tokens at or above the floor', () => {
 })
 
 test('不改 mode keeps caller max_tokens below the floor', () => {
-  assert.equal(
-    applyMinMaxTokens({ max_tokens: 64 }, { enabled: true, value: 128, mode: '不改' }).max_tokens,
-    64,
-  )
-  assert.equal(
-    applyMinMaxTokens({ max_tokens: 1 }, { enabled: true, value: 128, no_raise: true }).max_tokens,
-    1,
-  )
+  assert.equal(applyMinMaxTokens({ max_tokens: 64 }, { enabled: true, value: 128, mode: '不改' }).max_tokens, 64)
+  assert.equal(applyMinMaxTokens({ max_tokens: 1 }, { enabled: true, value: 128, no_raise: true }).max_tokens, 1)
 })
 
 test('leaves missing max_tokens alone', () => {
