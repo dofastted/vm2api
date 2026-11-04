@@ -3,6 +3,7 @@
 ## Unreleased
 
 - 新增可选 `compatibility.preserve_pruned_tool_results`：在槽位Claude推理中，按认证密钥和DSH会话隔离保存成功请求的有限工具原文；精确识别默认工具文本裁剪后恢复原始前缀，避免小幅历史裁剪造成整段缓存重写。真实编辑/压缩、失败/重试、并发歧义和内存/上下文预算不足时不恢复；缺省关闭，不改变客户端配置或API直连端点。
+- `kernel.json` 写出面板的 `compatibility.thinking_display`（缺省 `summarized`，显式 `passthrough` 才保留调用方 display）。CRAG helper 在 fetch 边界使用它；没传 routing 时保留已写入的 `passthrough`。
 
 ## 1.4.038 — 2026-11-03
 

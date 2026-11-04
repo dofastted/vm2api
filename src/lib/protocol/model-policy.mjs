@@ -303,7 +303,7 @@ export function seedDefaultPolicy() {
     display_name: 'Sonnet 5.5',
     family: 'sonnet',
     sort: 31,
-    capabilities: CAP_ADAPTIVE_ONLY,
+    capabilities: { ...CAP_ADAPTIVE_ONLY, supports_between_tools: true },
     betas: { pass_context_1m: true },
     params: {
       max_tokens_default: 128000,
@@ -874,6 +874,7 @@ function applyHaiku55Thinking(body) {
  */
 export function applyModelRequestRules(body = {}) {
   if (!body || typeof body !== 'object') return body
+  validateBetweenToolsThinking(body)
   const canonical = resolvePolicyModelId(body.model)
   if (isHaiku55Model(body.model) || canonical === HAIKU_55_ID) {
     if (canonical === HAIKU_55_ID) body.model = canonical
@@ -1051,6 +1052,28 @@ export function applyMaxTokensCap(body = {}) {
   const mt = Number(body.max_tokens)
   if (Number.isFinite(mt) && mt > cap) body.max_tokens = cap
   return body
+}
+
+/** between_tools is a distinct mode; never repair it into adaptive thinking. */
+export function validateBetweenToolsThinking(body = {}, { code = 'thinking_incompatible' } = {}) {
+  if (body.thinking?.type !== 'between_tools') return
+  const invalid = (message) => {
+    const error = new Error(message)
+    error.status = 400
+    error.body = { type: 'error', error: { type: 'invalid_request_error', code, message } }
+    throw error
+  }
+  if (getModelEntry(body.model).capabilities.supports_between_tools !== true)
+    invalid('The selected model does not support between_tools thinking.')
+  if (Object.keys(body.thinking).some((key) => key !== 'type'))
+    invalid('between_tools thinking accepts only type; additional thinking fields are not supported.')
+  // A per-turn control can override effort, but the top-level field must also
+  // be legal when it is forwarded by a transport.
+  const efforts = [body.output_config?.effort, reasoningEffortOf(body)].map((effort) =>
+    String(effort || '').toLowerCase(),
+  )
+  if (efforts.some((effort) => ['xhigh', 'max'].includes(effort.trim())))
+    invalid('between_tools thinking does not support xhigh or max effort.')
 }
 
 /** Validate the caller contract before any model or persona rewrite. */

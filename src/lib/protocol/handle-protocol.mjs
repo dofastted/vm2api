@@ -5,7 +5,7 @@
 import { applyIntercept } from '../core/intercept.mjs'
 import { resolveStreamIdleTimeoutMs, inboundBodyLimit, queueKeepaliveDelayMs } from '../core/config.mjs'
 import { applyEagerToolStreaming } from './eager-tool-streaming.mjs'
-import { validateToolChoice, getCapabilities } from './model-policy.mjs'
+import { validateBetweenToolsThinking, validateToolChoice, getCapabilities } from './model-policy.mjs'
 import { ToolResultPruneCache, dshPruneScope } from './tool-result-prune-cache.mjs'
 import {
   inboundRefusalDeviceId,
@@ -983,6 +983,7 @@ export function createHandleProtocol(deps) {
       inboundToolReverse = standard.reverse
     }
     try {
+      validateBetweenToolsThinking(ctx.body)
       validateToolChoice(ctx.body)
     } catch (error) {
       if (!error.body?.error) throw error
