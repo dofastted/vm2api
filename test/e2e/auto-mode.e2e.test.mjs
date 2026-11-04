@@ -593,7 +593,7 @@ test('classifier terminal/error/cancel/concurrency boundaries through actual ELF
   ])
   for (const result of mixed) assert.equal(result.status, 200, result.text)
   assert.equal(h.captured.find((b) => JSON.stringify(b.messages).includes('CASE_CONCURRENT_CLASSIFIER')).max_tokens, 64)
-  assert.equal(h.captured.find((b) => JSON.stringify(b.messages).includes('CASE_CONCURRENT_ORDINARY')).max_tokens, 64)
+  assert.equal(h.captured.find((b) => JSON.stringify(b.messages).includes('CASE_CONCURRENT_ORDINARY')).max_tokens, 128)
   const ordinary = await h.send({
     model: 'claude-sonnet-5-5',
     max_tokens: 64,
@@ -604,7 +604,7 @@ test('classifier terminal/error/cancel/concurrency boundaries through actual ELF
   })
   assert.equal(ordinary.status, 200, ordinary.text)
   const wire = h.captured.at(-1)
-  assert.equal(wire.max_tokens, 64)
+  assert.equal(wire.max_tokens, 128)
   assert.deepEqual(wire.thinking, { type: 'adaptive', display: 'summarized' })
   assert.equal(wire.request_context, undefined)
   assert.equal(wire.system.at(-1).text, 'Ordinary caller prompt')
