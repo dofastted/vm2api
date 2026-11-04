@@ -1069,8 +1069,10 @@ export function validateBetweenToolsThinking(body = {}, { code = 'thinking_incom
     invalid('between_tools thinking accepts only type; additional thinking fields are not supported.')
   // A per-turn control can override effort, but the top-level field must also
   // be legal when it is forwarded by a transport.
-  const efforts = [body.output_config?.effort, reasoningEffortOf(body)]
-  if (efforts.some((effort) => ['xhigh', 'max'].includes(String(effort || '').trim().toLowerCase())))
+  const efforts = [body.output_config?.effort, reasoningEffortOf(body)].map((effort) =>
+    String(effort || '').toLowerCase(),
+  )
+  if (efforts.some((effort) => ['xhigh', 'max'].includes(effort.trim())))
     invalid('between_tools thinking does not support xhigh or max effort.')
 }
 

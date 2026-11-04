@@ -3,11 +3,19 @@ import assert from 'node:assert/strict'
 import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
 import { classifierFixture } from '../fixtures/auto-mode.mjs'
 import { officialMessagesBody } from '../../src/lib/protocol/anthropic-messages.mjs'
-import { prepareCliHopBody, prepareOutboundAttempt, prepareOutboundEnvelope } from '../../src/lib/protocol/outbound-attempt.mjs'
+import {
+  prepareCliHopBody,
+  prepareOutboundAttempt,
+  prepareOutboundEnvelope,
+} from '../../src/lib/protocol/outbound-attempt.mjs'
 import { finalizeWorkerPayload } from '../../src/lib/transport/go-worker-client.mjs'
 import { outboundShape } from '../../src/lib/protocol/outbound-shape.mjs'
 import { prepareAnthropicRequest } from '../../src/lib/protocol/anthropic-policy.mjs'
-import { applyThinkingDisplay, ensureOfficialPrintThinking, ensureUnofficialAdaptiveThinking } from '../../src/lib/protocol/thinking.mjs'
+import {
+  applyThinkingDisplay,
+  ensureOfficialPrintThinking,
+  ensureUnofficialAdaptiveThinking,
+} from '../../src/lib/protocol/thinking.mjs'
 
 openDatabase({ dbPath: ':memory:' })
 after(() => closeDatabase())
@@ -31,7 +39,14 @@ for (const requestContext of [null, classifierContext]) {
         officialMessagesBody(input, { stream }),
         prepareCliHopBody(input, { stream, requestContext }),
         prepareOutboundAttempt({ canonicalBody: input, identity: {}, requestContext, stream }).body,
-        prepareOutboundEnvelope({ canonicalBody: input, inbound: input, identity: {}, requestContext, stream, unofficial: true }).body,
+        prepareOutboundEnvelope({
+          canonicalBody: input,
+          inbound: input,
+          identity: {},
+          requestContext,
+          stream,
+          unofficial: true,
+        }).body,
       ]
       for (const body of assembled) {
         assert.deepEqual(body.thinking, { type: 'between_tools' })
@@ -53,11 +68,20 @@ for (const requestContext of [null, classifierContext]) {
 }
 
 test('display helpers and unofficial assembly never add fields to between_tools', () => {
-  const input = { model: 'claude-sonnet-5-5', max_tokens: 64, thinking: { type: 'between_tools' }, messages: [{ role: 'user', content: 'Hi' }] }
+  const input = {
+    model: 'claude-sonnet-5-5',
+    max_tokens: 64,
+    thinking: { type: 'between_tools' },
+    messages: [{ role: 'user', content: 'Hi' }],
+  }
   for (const mode of ['summarized', 'omitted', 'updates']) {
     assert.deepEqual(applyThinkingDisplay(input, mode).thinking, input.thinking)
   }
-  for (const out of [ensureOfficialPrintThinking(input), ensureUnofficialAdaptiveThinking(input), prepareAnthropicRequest(input, { unofficial: true })]) {
+  for (const out of [
+    ensureOfficialPrintThinking(input),
+    ensureUnofficialAdaptiveThinking(input),
+    prepareAnthropicRequest(input, { unofficial: true }),
+  ]) {
     assert.deepEqual(out.thinking, { type: 'between_tools' })
     assert.equal(out.max_tokens, 64)
   }

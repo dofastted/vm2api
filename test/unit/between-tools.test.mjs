@@ -5,7 +5,14 @@ import { classifierFixture } from '../fixtures/auto-mode.mjs'
 import { prepareClassifierBody } from '../../src/lib/protocol/request-purpose.mjs'
 import { prepareAnthropicRequest, stripInvalidThinkingBlocks } from '../../src/lib/protocol/anthropic-policy.mjs'
 import { prepareCliHopBody } from '../../src/lib/protocol/outbound-attempt.mjs'
-import { applyModelRequestRules, getModelPolicy, resetModelPolicy, saveModelPolicy, seedDefaultPolicy, validateToolChoice } from '../../src/lib/protocol/model-policy.mjs'
+import {
+  applyModelRequestRules,
+  getModelPolicy,
+  resetModelPolicy,
+  saveModelPolicy,
+  seedDefaultPolicy,
+  validateToolChoice,
+} from '../../src/lib/protocol/model-policy.mjs'
 
 openDatabase({ dbPath: ':memory:' })
 resetModelPolicy()
@@ -44,17 +51,31 @@ for (const model of ['claude-sonnet-5-5', 'sonnet', 'anthropic/claude-sonnet-5-5
 for (const [name, prepare, code] of paths) {
   test(`${name}: rejects unsupported models, efforts and every extra thinking field`, () => {
     const invalid = [
-      ...['claude-sonnet-4-6', 'claude-opus-5-5', 'claude-haiku-5-5', 'claude-sonnet-future'].map(model => fixture({ model })),
-      ...['xhigh', 'max'].map(effort => fixture({ output_config: { effort } })),
+      ...['claude-sonnet-4-6', 'claude-opus-5-5', 'claude-haiku-5-5', 'claude-sonnet-future'].map((model) =>
+        fixture({ model }),
+      ),
+      ...['xhigh', 'max'].map((effort) => fixture({ output_config: { effort } })),
       fixture({ messages: [{ role: 'user', content: 'Hello', output_config: { effort: 'max' } }] }),
-      fixture({ output_config: { effort: 'xhigh' }, messages: [{ role: 'user', content: 'Hello', output_config: { effort: 'high' } }] }),
-      ...[{ display: 'omitted' }, { display: 'summarized' }, { display: 'updates' },
-        { budget_tokens: 1024 }, { budget_tokens: null }, { block_binding: true }, { future_field: false }]
-        .map(extra => fixture({ thinking: { type: 'between_tools', ...extra } })),
+      fixture({
+        output_config: { effort: 'xhigh' },
+        messages: [{ role: 'user', content: 'Hello', output_config: { effort: 'high' } }],
+      }),
+      ...[
+        { display: 'omitted' },
+        { display: 'summarized' },
+        { display: 'updates' },
+        { budget_tokens: 1024 },
+        { budget_tokens: null },
+        { block_binding: true },
+        { future_field: false },
+      ].map((extra) => fixture({ thinking: { type: 'between_tools', ...extra } })),
     ]
     for (const input of invalid) {
       const before = structuredClone(input)
-      assert.throws(() => prepare(input), e => e.status === 400 && e.body.error.code === code)
+      assert.throws(
+        () => prepare(input),
+        (e) => e.status === 400 && e.body.error.code === code,
+      )
       assert.deepEqual(input, before)
     }
   })
@@ -77,11 +98,14 @@ test('between_tools is an explicit capability that survives saved policy merging
 test('between_tools preserves signed and redacted history through a tool loop', () => {
   const history = [
     { role: 'user', content: [{ type: 'text', text: 'Use lookup.' }] },
-    { role: 'assistant', content: [
-      { type: 'thinking', thinking: '', signature: 'abcdefghijklmnopqrstuvwxyz0123456789' },
-      { type: 'redacted_thinking', data: 'encrypted-fixture' },
-      { type: 'tool_use', id: 'toolu_fixture', name: 'lookup', input: {} },
-    ] },
+    {
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: '', signature: 'abcdefghijklmnopqrstuvwxyz0123456789' },
+        { type: 'redacted_thinking', data: 'encrypted-fixture' },
+        { type: 'tool_use', id: 'toolu_fixture', name: 'lookup', input: {} },
+      ],
+    },
     { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_fixture', content: 'found' }] },
   ]
   const input = fixture({ messages: history, tools: [{ name: 'lookup', input_schema: { type: 'object' } }] })
@@ -112,7 +136,16 @@ test('between_tools rejects incompatible injected effort without changing saved 
 })
 
 test('between_tools keeps the Sonnet 5.5 forced-tool restriction', () => {
-  const input = { ...classifierFixture({ model: 'claude-sonnet-5-5', format: 'tool' }), thinking: { type: 'between_tools' } }
-  assert.throws(() => prepareClassifierBody(input), e => e.status === 400 && e.body.error.code === 'classifier_model_incompatible')
-  assert.throws(() => validateToolChoice(input), e => e.status === 400 && e.body.error.code === 'tool_choice_incompatible')
+  const input = {
+    ...classifierFixture({ model: 'claude-sonnet-5-5', format: 'tool' }),
+    thinking: { type: 'between_tools' },
+  }
+  assert.throws(
+    () => prepareClassifierBody(input),
+    (e) => e.status === 400 && e.body.error.code === 'classifier_model_incompatible',
+  )
+  assert.throws(
+    () => validateToolChoice(input),
+    (e) => e.status === 400 && e.body.error.code === 'tool_choice_incompatible',
+  )
 })

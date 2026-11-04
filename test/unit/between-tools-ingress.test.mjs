@@ -18,9 +18,13 @@ for (const classifier of [false, true]) {
   ]) {
     test(`${classifier ? 'classifier' : 'ordinary'} ingress rejects ${JSON.stringify(invalid)} before allocation`, async () => {
       const input = {
-        ...(classifier ? classifierFixture({ model: 'claude-sonnet-5-5' }) : {
-          model: 'claude-sonnet-5-5', max_tokens: 64, messages: [{ role: 'user', content: 'Hello' }],
-        }),
+        ...(classifier
+          ? classifierFixture({ model: 'claude-sonnet-5-5' })
+          : {
+              model: 'claude-sonnet-5-5',
+              max_tokens: 64,
+              messages: [{ role: 'user', content: 'Hello' }],
+            }),
         thinking: { type: 'between_tools' },
         ...invalid,
       }
@@ -29,31 +33,52 @@ for (const classifier of [false, true]) {
       let selections = 0
       const response = { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
       const handler = createHandleProtocol({
-        json: (_res, status, body) => { response.status = status; response.body = body },
-        writeSSEHeaders() {}, readBody: async () => input, requireAuth: () => true,
+        json: (_res, status, body) => {
+          response.status = status
+          response.body = body
+        },
+        writeSSEHeaders() {},
+        readBody: async () => input,
+        requireAuth: () => true,
         cfg: {
-          rewrite: { enabled: false }, intercept: { rules: [] }, distill: { enabled: false },
+          rewrite: { enabled: false },
+          intercept: { rules: [] },
+          distill: { enabled: false },
           limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
           paths: { data: os.tmpdir(), project: os.tmpdir() },
         },
         requestLog: { start: () => ({ request_id: 'between-tools-test' }), finish() {} },
-        stickyRouter: {}, accountQuota: {},
+        stickyRouter: {},
+        accountQuota: {},
         apiKeyStore: {
-          acquire: () => { admissions++; return { ok: true } }, release() {},
+          acquire: () => {
+            admissions++
+            return { ok: true }
+          },
+          release() {},
           users: { getById: () => ({ role: 'admin' }) },
         },
-        apiScheduler: { pick: () => { selections++; return { ok: false } } },
+        apiScheduler: {
+          pick: () => {
+            selections++
+            return { ok: false }
+          },
+        },
         apiEndpointStore: {},
         stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
-        routingConfig: { failover: {} }, groupsRepo: { rateMultiplier: () => 1 },
+        routingConfig: { failover: {} },
+        groupsRepo: { rateMultiplier: () => 1 },
       })
       const req = {
-        method: 'POST', url: '/v1/messages',
+        method: 'POST',
+        url: '/v1/messages',
         headers: classifier
           ? { 'user-agent': 'claude-cli/2.1.293 (external, cli)', 'anthropic-beta': 'claude-code-20250219' }
           : { 'user-agent': 'test-client' },
-        apiKeyKind: 'managed', apiKeyRecord: { category: 'api', user_id: 'admin' },
-        once() {}, off() {},
+        apiKeyKind: 'managed',
+        apiKeyRecord: { category: 'api', user_id: 'admin' },
+        once() {},
+        off() {},
       }
       await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages')
       assert.equal(response.status, 400)
