@@ -118,12 +118,33 @@ test('remove deletes a proxy and updateConfig rejects bad bind_limit', () => {
   pool.stopScheduler()
 })
 
-async function listenSocks() {
-  const server = net.createServer((socket) => {
-    socket.on('data', () => {
+// A 127.0.0.1 row is a local forwarder: the probe sends CONNECT after the
+// greeting and needs a bound-address reply, not just 0x05 0x00. Greeting and
+// CONNECT can arrive in one chunk, so parse by length instead of per write.
+function answerSocks(socket) {
+  let buf = Buffer.alloc(0)
+  let greeted = false
+  socket.on('error', () => {})
+  socket.on('data', (chunk) => {
+    buf = Buffer.concat([buf, chunk])
+    if (!greeted) {
+      if (buf.length < 2) return
+      const need = 2 + buf[1]
+      if (buf.length < need) return
+      buf = buf.subarray(need)
+      greeted = true
       socket.write(Buffer.from([0x05, 0x00]))
-    })
+    }
+    const at = buf.indexOf(Buffer.from([0x05, 0x01]))
+    if (at >= 0 && buf.length >= at + 10) {
+      buf = buf.subarray(at + 10)
+      socket.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]))
+    }
   })
+}
+
+async function listenSocks() {
+  const server = net.createServer((socket) => answerSocks(socket))
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
   const addr = server.address()
   return { server, host: addr.address, port: addr.port }
@@ -278,16 +299,32 @@ test('HTTP banner is not_socks5', async () => {
 })
 
 test('split SOCKS5 method reply still counts as healthy', async () => {
-  let client
   let releaseSecond
   const firstHandled = new Promise((resolve) => {
     releaseSecond = resolve
   })
   const server = net.createServer((socket) => {
-    client = socket
+    let buf = Buffer.alloc(0)
+    let greeted = false
+    socket.on('error', () => {})
     socket.write(Buffer.from([0x05]))
     firstHandled.then(() => {
       if (!socket.destroyed) socket.write(Buffer.from([0x00]))
+    })
+    socket.on('data', (chunk) => {
+      buf = Buffer.concat([buf, chunk])
+      if (!greeted) {
+        if (buf.length < 2) return
+        const need = 2 + buf[1]
+        if (buf.length < need) return
+        buf = buf.subarray(need)
+        greeted = true
+      }
+      const at = buf.indexOf(Buffer.from([0x05, 0x01]))
+      if (at >= 0 && buf.length >= at + 10) {
+        buf = buf.subarray(at + 10)
+        socket.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]))
+      }
     })
   })
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
@@ -313,8 +350,9 @@ test('split SOCKS5 method reply still counts as healthy', async () => {
   try {
     pool.importLines(`${addr.address}:${addr.port}`)
     const result = await pool._probeSocks(pool.state.proxies[0])
-    assert.equal(client.bytesWritten, 2)
-    assert.deepEqual(chunks, [1, 1])
+    // 0x05 and 0x00 arrive as two 1-byte reads and must be merged before the
+    // method is decided.
+    assert.deepEqual(chunks.slice(0, 2), [1, 1])
     assert.equal(result.ok, true)
     assert.equal(result.error, null)
   } finally {
@@ -323,7 +361,6 @@ test('split SOCKS5 method reply still counts as healthy', async () => {
     server.close()
   }
 })
-
 test('probeAll resurrects a probe-killed proxy', async () => {
   const socks = await listenSocks()
   const pool = new ProxyPool({ dataDir: tmpDir() })

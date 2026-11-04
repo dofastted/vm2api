@@ -142,8 +142,25 @@ test('URL-imported IPv6 probes connect only when enabled and closing cancels in-
     connections += 1
     socket.on('close', () => sockets.delete(socket))
     const respond = connections === 1
-    socket.on('data', () => {
-      if (respond) socket.write(Buffer.from([5, 0]))
+    let buf = Buffer.alloc(0)
+    let greeted = false
+    socket.on('data', (chunk) => {
+      if (!respond) return
+      buf = Buffer.concat([buf, chunk])
+      if (!greeted) {
+        if (buf.length < 2) return
+        const need = 2 + buf[1]
+        if (buf.length < need) return
+        buf = buf.subarray(need)
+        greeted = true
+        socket.write(Buffer.from([5, 0]))
+      }
+      // ::1 is a loopback (forwarder) row, so the probe also sends CONNECT.
+      const at = buf.indexOf(Buffer.from([5, 1]))
+      if (at >= 0 && buf.length >= at + 10) {
+        buf = buf.subarray(at + 10)
+        socket.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]))
+      }
     })
   })
   server.listen({ host: '::1', port: 0 })
