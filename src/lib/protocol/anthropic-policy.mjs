@@ -21,6 +21,7 @@ import {
   getCapabilities,
   isHaiku55Model,
   isOpus55Model,
+  validateBetweenToolsThinking,
 } from './model-policy.mjs'
 import { ensureOutputConfigSchema, rectifyUnofficialRequest } from './request-rectifier.mjs'
 import { DEFAULT_CACHE_TTL, applyCacheBreakpoints, stripCacheScopeFields } from './cache-ttl.mjs'
@@ -184,8 +185,9 @@ export function alignSamplingWithThinking(body = {}) {
  */
 export function stripInvalidThinkingBlocks(body = {}, { preserveThinkingBlocks = false } = {}) {
   if (!Array.isArray(body.messages)) return body
-  const keepSigned = thinkingModeEnabled(body)
-  const chainModel = !preserveThinkingBlocks && signedThinkingModel(body.model)
+  const betweenTools = body.thinking?.type === 'between_tools'
+  const keepSigned = thinkingModeEnabled(body) || betweenTools
+  const chainModel = !preserveThinkingBlocks && (betweenTools || signedThinkingModel(body.model))
   let changed = false
   let chainBroken = false
   const messages = body.messages.map((message) => {
@@ -439,6 +441,7 @@ export function prepareAnthropicRequest(
   if (unofficial) {
     out = ensureUnofficialAdaptiveThinking(out)
     out = ensureUnofficialEffortHigh(out)
+    validateBetweenToolsThinking(out)
     out = rectifyUnofficialRequest(out)
   } else out = ensureOutputConfigSchema(out)
   if (Array.isArray(out.system)) {

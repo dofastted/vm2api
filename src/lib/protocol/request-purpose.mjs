@@ -1,5 +1,5 @@
 import { findClaudeSecurityMonitorPrompt } from '../identity/crs-persona.mjs'
-import { getModelEntry } from './model-policy.mjs'
+import { getModelEntry, validateBetweenToolsThinking } from './model-policy.mjs'
 import { officialMessagesBody } from './anthropic-messages.mjs'
 import { stripIllegalCacheControlFields } from './cache-ttl.mjs'
 
@@ -77,8 +77,9 @@ export function prepareClassifierBody(input, { stream = true } = {}) {
   let body = officialMessagesBody(input, { stream })
   body.model = entry.id
   const alwaysOn = entry.capabilities.requires_adaptive === true
-  if (body.thinking && !['disabled', 'adaptive', 'enabled'].includes(body.thinking.type))
+  if (body.thinking && !['disabled', 'adaptive', 'enabled', 'between_tools'].includes(body.thinking.type))
     incompatible('Invalid classifier thinking configuration.')
+  validateBetweenToolsThinking(body, { code: 'classifier_model_incompatible' })
   if (body.thinking?.type === 'adaptive' && !entry.capabilities.supports_adaptive)
     incompatible('The selected classifier model does not support adaptive thinking.')
   if (

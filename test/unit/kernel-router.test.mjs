@@ -634,12 +634,32 @@ test('writeKernelConfig separates container paths from host socket paths', () =>
   assert.equal(doc.https_proxy, undefined)
   assert.equal(doc.slots_per_worker, WRAP_SLOT_MAX)
   assert.equal(doc.default_cache_ttl, '1h')
+  assert.equal(doc.thinking_display, 'summarized')
   assert.equal(doc.auto_compact_window, null)
   assert.match(written.socketPath.replace(/\\/g, '/'), /vms\/vm-09\/run\/kernel\.sock$/)
   assert.equal(fs.readFileSync(written.tokenPath, 'utf8').trim(), 'tok')
   const exec = { vmId: 'vm-09', homeDir: path.join(root, 'vms', 'vm-09', 'cli-home'), vm: { id: 'vm-09' } }
   assert.equal(rustKernelPaths(exec).socketPath, written.socketPath)
   fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('writeKernelConfig projects thinking display and preserves it only without routing', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-thinking-cfg-'))
+  const vm = { id: 'vm-09' }
+  const displayOf = (options = {}) => {
+    const written = writeKernelConfig(root, vm, { token: 'tok', ...options })
+    return JSON.parse(fs.readFileSync(written.configPath, 'utf8')).thinking_display
+  }
+  try {
+    assert.equal(displayOf(), 'summarized')
+    assert.equal(displayOf({ routing: { compatibility: { thinking_display: 'passthrough' } } }), 'passthrough')
+    assert.equal(displayOf(), 'passthrough')
+    assert.equal(displayOf({ routing: {} }), 'summarized')
+    assert.equal(displayOf({ routing: { compatibility: { thinking_display: 'invalid' } } }), 'summarized')
+    assert.equal(displayOf(), 'summarized')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('model effort changes rewrite kernel.json without a routing save or restart', () => {

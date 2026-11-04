@@ -2,13 +2,19 @@
 
 ## Unreleased
 
-## 1.4.038 — 2026-11-03
+## 1.4.038 — 2026-11-04
 
+- #882：放行 Sonnet 5.5 的 `thinking: {"type":"between_tools"}`，修复 Claude Code auto 模式分类器被本地 400 拒绝。分类器与普通 Messages 保留该模式及签名 thinking 历史；不支持的模型、`xhigh` / `max` effort 或额外 thinking 字段仍在分配账号前拒绝。
+- #886：`kernel.json` 写出面板的 `compatibility.thinking_display`（缺省 `summarized`，显式 `passthrough` 才保留调用方 display）；没传 routing 时保留已写入的 `passthrough`。本版只补配置投影，不更换 CRAG / CLI payload。
+- #878 / #883：本地转发代理的健康探测改为真实 SOCKS CONNECT，鉴权拒绝（`0xff`）或无法连接目标不再误算健康。
+- #876：远端 kernel 的短暂健康探测超时不再立即将槽位置为故障，避免瞬时抖动中断可用槽。
+- #869：集群页统一展示本机和节点的链路、槽位与机器余量；“还能放”按虚拟机内存和实测开销估算。
+- #871：允许清空当前激活 VM 选择。
 - #873：修复 `/v1/models` 已列出的 GPT Image 模型（`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst`、`gpt-image-2` 及快照）在 `/v1/chat/completions`、`/v1/responses` 上被 400 `model_not_supported` 拒绝、无法出图。现在这类请求走网关内置 Images 通道：最后一条 user 消息文本作 prompt，带图即 `/images/edits`，否则 `/images/generations`；Chat 回 Markdown 图片，Responses 回 `image_generation_call`，流式等待期间保活。模型开关、Free 槽排除与计费沿用 `/v1/images`。
 - #874：第三方客户端入站不带 `ttl` 的缓存断点不再以隐式 5m 出站：与 #850 的官方 Claude Code 一样，渲染前按会话 TTL（请求头 → 入站显式值 → 协议页默认，缺省 1h）补齐。只有调用方显式写 `5m` 才发 5m；前面已有 5m 时补 5m，保持 1h 在 5m 前。官方透传打开时不经过这一步。依赖隐式 5m 的调用方需改为显式 `ttl: "5m"` 或带 `x-kin-cache-ttl: 5m`。
 - #872：设备亲和把已有会话分到另一账号 / VM 时，实际拿到会话席位的请求会迁移跨账号 sticky 绑定并持久化新出站 session，同一入站对话不再逐请求变号。`slot_busy` 临时借用仍保留原绑定，晚到的结果不能覆盖新绑定。
 
-已部署机升级：只更新 Node 控制面后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
 ## 1.4.037 — 2026-11-03
 
