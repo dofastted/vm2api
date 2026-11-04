@@ -59,7 +59,7 @@ import {
   formatHealthSse,
   healthUnavailableError,
 } from '../admin/health-probe.mjs'
-import { resolveInferenceBackend, runApiInference } from '../pool/api-protocol.mjs'
+import { resolveInferenceBackend, runApiInference, validateApiOpenAIRequest } from '../pool/api-protocol.mjs'
 import { classifyClaudeRequestPurpose, prepareClassifierBody, classifierRequestSummary } from './request-purpose.mjs'
 import { agentSummarySession } from './agent-summary.mjs'
 import { summarizeBody, redactHeaders, presentedApiKeyForLog } from '../admin/request-log.mjs'
@@ -811,6 +811,13 @@ export function createHandleProtocol(deps) {
         ? { ok: true, platform: 'openai' }
         : detectInboundPlatform(ctx.body?.model)
     const apiOpenAI = inferenceBackend === 'api' && platform.platform === 'openai'
+    const apiInputError = apiOpenAI ? validateApiOpenAIRequest(protocol, apiInbound) : null
+    if (apiInputError) {
+      stats.errors++
+      logBag.error_code = apiInputError.code
+      logBag.error_message = apiInputError.message
+      return json(res, 400, { type: 'error', error: { type: 'invalid_request_error', ...apiInputError } })
+    }
     const apiRiskReview = !!apiPicked && !apiOpenAI && apiPicked.endpoint.risk_review_enabled === true
     const preReviewEnabled = !apiPicked || apiOpenAI || apiRiskReview
     if (!platform.ok) {

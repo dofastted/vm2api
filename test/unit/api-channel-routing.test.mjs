@@ -31,8 +31,22 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
   ['anthropic.messages', 'claude-sonnet-5-5', 'anthropic', false, { invalid: 'tools' }],
   ['openai.chat', 'claude-sonnet-5-5', 'anthropic', false, { invalid: 'tools' }],
   ['openai.responses', 'claude-sonnet-5-5', 'anthropic', false, { invalid: 'tools' }],
+  ...[
+    { previous_response_id: 'resp_other_key' },
+    { conversation: 'conv_other_key' },
+    { prompt: { id: 'pmpt_operator' } },
+    { background: true },
+    { tools: [{ type: 'mcp', server_label: 'external', server_url: 'https://untrusted.invalid/mcp' }] },
+    { tools: [{ type: 'file_search', vector_store_ids: ['vs_operator'] }] },
+    { tools: [{ type: 'code_interpreter', container: 'cntr_operator' }] },
+    { input: [{ type: 'item_reference', id: 'msg_other_key' }] },
+    { input: [{ id: 'msg_other_key' }] },
+    { input: [{ role: 'user', content: [{ type: 'input_file', file_id: 'file_operator' }] }] },
+    { tools: [{ type: 'image_generation', input_image_mask: { file_id: 'file_operator' } }] },
+  ].map((unsafe) => ['openai.responses', 'gpt-5.4', 'openai', false, { invalid: 'shared', unsafe }]),
+  ['openai.responses', 'gpt-5.4', 'openai', false, { stateless: true }],
 ]) {
-  test(`API key routes ${protocol} ${model}, review=${review.enabled ?? 'default'}, risky=${!!review.risky}, decision=${!!review.model}, block=${!!review.block}`, async () => {
+  test(`API key routes ${protocol} ${model}, review=${review.enabled ?? 'default'}, risky=${!!review.risky}, decision=${!!review.model}, block=${!!review.block}, input=${JSON.stringify(review.unsafe || review.stateless || null)}`, async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'api-channel-'))
     fs.mkdirSync(path.join(root, 'run'))
     const routingFile = path.join(root, 'routing.json')
@@ -126,6 +140,24 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
             ? { type: 'function', function: { name: tool.name } }
             : { type: 'function', name: tool.name }
     }
+    if (review.unsafe) Object.assign(body, review.unsafe)
+    if (review.stateless) {
+      Object.assign(body, {
+        store: true,
+        input: [
+          { role: 'user', content: [{ type: 'input_text', text: 'hello' }] },
+          { type: 'reasoning', encrypted_content: 'caller-replayed-reasoning', summary: [] },
+        ],
+        include: ['reasoning.encrypted_content'],
+        tools: [
+          {
+            type: 'function',
+            name: 'lookup',
+            parameters: { type: 'object', properties: { file_id: { type: 'string' } } },
+          },
+        ],
+      })
+    }
     let acquired = 0
     let released = 0
     const handler = createHandleProtocol({
@@ -201,7 +233,11 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
         assert.equal(response.status, 400, JSON.stringify(response.body))
         assert.equal(
           response.body.error.code,
-          review.invalid === 'thinking' ? 'thinking_incompatible' : 'tool_choice_incompatible',
+          review.invalid === 'thinking'
+            ? 'thinking_incompatible'
+            : review.invalid === 'shared'
+              ? 'api_shared_resource_forbidden'
+              : 'tool_choice_incompatible',
         )
         assert.equal(captured.length, 0, 'invalid content must not reach the selected API upstream')
         assert.equal(acquired, 0, 'invalid content must not consume key admission')
@@ -228,10 +264,15 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
       assert.equal(acquired, 1)
       assert.equal(released, 1)
       if (upstreamProtocol === 'openai') {
+        assert.equal(outbound.store, false, 'shared credentials must never persist caller responses')
         assert.equal(captured[0].headers.authorization, 'Bearer sk-upstream')
         assert.doesNotMatch(JSON.stringify(outbound), /Claude Code|Environment|billing-header/)
         if (protocol === 'openai.responses') {
-          assert.equal(outbound.input, 'hello')
+          assert.deepEqual(outbound.input, review.stateless ? body.input : 'hello')
+          if (review.stateless) {
+            assert.deepEqual(outbound.tools, body.tools)
+            assert.deepEqual(outbound.include, body.include)
+          }
           assert.deepEqual(outbound.reasoning, { effort: 'low' })
           assert.equal(response.body.output[0].content[0].text, 'pong')
         } else if (protocol === 'openai.chat') {
