@@ -90,11 +90,13 @@ export function HealthPane(props: HealthPaneProps) {
   const minTokens = obj(compatibility.min_max_tokens)
   const setProbe = (patch: Obj) => onHealthProbeChange({ ...probe, ...patch })
   const setReal = (patch: Obj) => setProbe({ real: { ...real, ...patch } })
-  const minTokensMode = String(minTokens.mode ?? minTokens.tier ?? 'floor')
+  const minTokensMode = String(minTokens.mode ?? minTokens.tier ?? '').trim()
+  const explicitFloor = ['floor', 'default', 'raise'].includes(minTokensMode)
+  // Match the backend: an explicit mode takes precedence over legacy flags.
   const preserveCaller =
-    minTokensMode === '不改' ||
-    minTokens.no_raise === true ||
-    minTokens.raise === false
+    ['不改', 'preserve', 'unchanged'].includes(minTokensMode) ||
+    (!explicitFloor &&
+      (minTokens.no_raise === true || minTokens.raise === false))
   const setMinTokens = (patch: Obj) =>
     onCompatibilityChange({
       ...compatibility,
