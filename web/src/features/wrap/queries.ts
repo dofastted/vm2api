@@ -31,6 +31,13 @@ export type WrapSample = {
   cli_node?: WrapKernelPayload | null
   cc_node?: WrapKernelPayload | null
   crag?: (WrapKernelPayload & { ok?: boolean }) | null
+  crag_v2?: (WrapKernelPayload & {
+    ok?: boolean
+    code?: string
+    error?: string
+    arch?: string
+    version?: string
+  }) | null
   dataplane?: 'wrap' | 'cc' | 'crag'
   written?: string[]
   sample_ok?: boolean
@@ -151,4 +158,21 @@ export function setKernelDataplane(body: {
       body: JSON.stringify(body),
     }
   )
+}
+
+export type SlotPolicyReport = {
+  updated?: number
+  missing?: string[]
+  failed?: { id?: string; code?: string; error?: string }[]
+}
+
+export function applySlotKernelPolicy(body: {
+  ids: string[]
+  dataplane: 'crag'
+  crag_kernel_version: 'v2'
+}) {
+  return api<SlotPolicyReport>('/api/panel/vms/slot-policy', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
 }

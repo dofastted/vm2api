@@ -32,6 +32,7 @@ import {
   normalizeInferenceEngine,
 } from '@/features/vm/engine-contract'
 import {
+  applySlotKernelPolicy,
   installReleaseKernel,
   makeWrapSample,
   promoteWrapSample,
@@ -43,6 +44,11 @@ import {
   type WrapKernelPayload,
   type WrapSyncReport,
 } from '@/features/wrap/queries'
+import {
+  cragV2BlockedReason,
+  cragV2UpdateIds,
+  slotPolicyFailure,
+} from './crag-v2-targets'
 import {
   slotFailureLabel,
   syncItemFailed,
@@ -88,9 +94,23 @@ function selectedDataplane(
   return value === 'cc' || value === 'crag' ? value : 'wrap'
 }
 
-function dataplaneOf(vm: Vm): 'wrap' | 'cc' | 'crag' | '—' {
+function kernelOf(vm: Vm): string {
   if (isCodexVm(vm)) return '—'
-  return selectedDataplane(vm.resolved_dataplane)
+  if (
+    vm.resolved_dataplane === 'crag' &&
+    vm.resolved_crag_kernel_version === 'v2'
+  ) {
+    return 'CRAG v2'
+  }
+  return dataplaneLabel(selectedDataplane(vm.resolved_dataplane))
+}
+
+function cragV2PackageHint(ok?: boolean, code?: string, error?: string) {
+  if (ok) return '仓内 CRAG v2 包可用'
+  if (code === 'crag_v2_package_missing') {
+    return '未找到 share/crag/kernels/v2/<arch> 或 KIN_CRAG_V2_ROOT'
+  }
+  return error || 'CRAG v2 包不可用'
 }
 
 function DataplaneOption({
@@ -141,6 +161,7 @@ function DataplaneOption({
 }
 
 type HopJob = {
+  kind?: 'reinstall' | 'v2'
   phase: 'download' | 'slots' | 'done'
   done: number
   total: number
@@ -166,8 +187,14 @@ function slotFailure(report: WrapSyncReport, id: string) {
 }
 
 function HopProgress({ job }: { job: HopJob }) {
-  const label =
-    job.phase === 'download'
+  const v2 = job.kind === 'v2'
+  const label = v2
+    ? job.phase === 'done'
+      ? job.failed.length
+        ? `CRAG v2 更新结束，失败 ${job.failed.length}`
+        : `CRAG v2 已更新 ${job.done}/${job.total}`
+      : `正在把 ${job.current || '槽'} 更新到 CRAG v2`
+    : job.phase === 'download'
       ? '拉取 GitHub wrap kernel、cli-node、cc-node 和 crag kernel'
       : job.phase === 'done'
         ? job.failed.length
@@ -266,16 +293,29 @@ export function WrapSamplePage() {
   const [hopOpen, setHopOpen] = useState(false)
   const [hopIds, setHopIds] = useState<string[]>([])
   const [pullLatest, setPullLatest] = useState(true)
+  const [v2Open, setV2Open] = useState(false)
+  const [v2Ids, setV2Ids] = useState<string[]>([])
   const [hopJob, setHopJob] = useState<HopJob | null>(null)
   const [hopBusy, setHopBusy] = useState(false)
   const hopToken = useRef(0)
   const fileRef = useRef<HTMLInputElement>(null)
 
+  const v2Targets = useMemo(
+    () => cragV2UpdateIds(vms, selected),
+    [selected, vms]
+  )
+  const reinstallIds = selected.length ? selected : vms.map((vm) => vm.id)
+  const allV2Targets = useMemo(() => cragV2UpdateIds(vms, []), [vms])
+  const cragV2Ready = sample.data?.crag_v2?.ok === true
+  const cragV2Hint = cragV2PackageHint(
+    sample.data?.crag_v2?.ok,
+    sample.data?.crag_v2?.code,
+    sample.data?.crag_v2?.error
+  )
   const rustVms = useMemo(
     () => vms.filter((vm) => engineOf(vm) === 'rust'),
     [vms]
   )
-  const reinstallIds = selected.length ? selected : vms.map((vm) => vm.id)
 
   const invalidate = async () => {
     await Promise.all([
@@ -351,6 +391,89 @@ export function WrapSamplePage() {
       setHopJob((cur) =>
         cur
           ? { ...cur, phase: 'done', failed: failed.length ? failed : ['下载'] }
+          : cur
+      )
+    } finally {
+      if (alive()) setHopBusy(false)
+    }
+  }
+
+  const openV2 = (ids: string[]) => {
+    if (!ids.length || hopBusy) return
+    setV2Ids(ids)
+    setV2Open(true)
+  }
+
+  const runV2 = async (ids: string[]) => {
+    if (!ids.length || hopBusy) return
+    const token = hopToken.current + 1
+    hopToken.current = token
+    const alive = () => hopToken.current === token
+    setHopBusy(true)
+    const failed: string[] = []
+    setHopJob({
+      kind: 'v2',
+      phase: 'slots',
+      done: 0,
+      total: ids.length,
+      current: ids[0] || '',
+      failed,
+    })
+    try {
+      for (let i = 0; i < ids.length; i++) {
+        if (!alive()) return
+        const id = ids[i]
+        setHopJob({
+          kind: 'v2',
+          phase: 'slots',
+          done: i,
+          total: ids.length,
+          current: id,
+          failed: [...failed],
+        })
+        try {
+          const pinned = await applySlotKernelPolicy({
+            ids: [id],
+            dataplane: 'crag',
+            crag_kernel_version: 'v2',
+          })
+          const pinError = slotPolicyFailure(pinned, id)
+          if (pinError) {
+            failed.push(pinError)
+            continue
+          }
+          const report = await syncWrapSample({ ids: [id], restart: true })
+          if (slotSyncFailed(report, id)) failed.push(slotFailure(report, id))
+        } catch (error) {
+          const report = syncReportFromError(error)
+          failed.push(
+            report
+              ? slotFailure(report, id)
+              : `${id}（${error instanceof Error ? error.message : '失败'}）`
+          )
+        }
+      }
+      if (!alive()) return
+      setHopJob({
+        kind: 'v2',
+        phase: 'done',
+        done: ids.length,
+        total: ids.length,
+        current: '',
+        failed: [...failed],
+      })
+      if (failed.length) {
+        toast.error(`CRAG v2 更新 ${ids.length - failed.length}/${ids.length}`)
+      } else {
+        toast.success(`CRAG v2 更新 ${ids.length}/${ids.length}`)
+      }
+      await invalidate()
+    } catch (error) {
+      if (!alive()) return
+      toast.error(error instanceof Error ? error.message : 'CRAG v2 更新失败')
+      setHopJob((cur) =>
+        cur
+          ? { ...cur, phase: 'done', failed: failed.length ? failed : ['更新'] }
           : cur
       )
     } finally {
@@ -539,12 +662,25 @@ export function WrapSamplePage() {
           <Button
             size='sm'
             disabled={!complete || !reinstallIds.length || hopBusy}
-            loading={hopBusy && hopIds.length !== 1}
+            loading={
+              hopBusy && hopJob?.kind !== 'v2' && hopIds.length !== 1
+            }
             onClick={() => openHop(reinstallIds, true)}
           >
             {selected.length
               ? `重装当前内核 ${selected.length}`
               : '重装当前内核'}
+          </Button>
+          <Button
+            size='sm'
+            disabled={!cragV2Ready || !v2Targets.length || hopBusy}
+            loading={hopBusy && hopJob?.kind === 'v2' && v2Ids.length !== 1}
+            title={cragV2Ready ? undefined : cragV2Hint}
+            onClick={() => openV2(v2Targets)}
+          >
+            {selected.length
+              ? `更新到 CRAG v2 ${v2Targets.length}`
+              : '全部更新到 CRAG v2'}
           </Button>
         </div>
       }
@@ -693,19 +829,55 @@ export function WrapSamplePage() {
                 crag + cc-node。可先从 GitHub Release 拉 linux amd64
                 文件。不改凭证、不改 SOCKS、不删容器。
               </p>
-              <Button
-                size='sm'
-                disabled={!complete || vms.length === 0 || hopBusy}
-                loading={hopBusy && hopIds.length > 1}
-                onClick={() =>
-                  openHop(
-                    vms.map((vm) => vm.id),
-                    true
-                  )
-                }
-              >
-                一键全部重装最新内核
-              </Button>
+              <p>
+                CRAG v2 单独更新：把本机 Docker 的 Claude 槽钉到{' '}
+                <code>crag</code> + <code>v2</code>
+                ，铺仓内包并重启运行中的内核。Codex、集群和 KVM
+                不参与。cli-node 留在盘上。
+              </p>
+              <div className='flex items-center justify-between gap-2'>
+                <span>CRAG v2 包</span>
+                <span
+                  className={
+                    cragV2Ready ? 'text-foreground' : 'text-destructive'
+                  }
+                >
+                  {cragV2Hint}
+                </span>
+              </div>
+              {data?.crag_v2?.path ? (
+                <code className='block text-xs'>
+                  {kernelPathLabel(data.crag_v2.path)}
+                </code>
+              ) : null}
+              <div className='flex flex-wrap gap-2'>
+                <Button
+                  size='sm'
+                  disabled={!complete || vms.length === 0 || hopBusy}
+                  loading={
+                    hopBusy && hopJob?.kind !== 'v2' && hopIds.length > 1
+                  }
+                  onClick={() =>
+                    openHop(
+                      vms.map((vm) => vm.id),
+                      true
+                    )
+                  }
+                >
+                  一键全部重装最新内核
+                </Button>
+                <Button
+                  size='sm'
+                  disabled={!cragV2Ready || !allV2Targets.length || hopBusy}
+                  loading={
+                    hopBusy && hopJob?.kind === 'v2' && v2Ids.length > 1
+                  }
+                  title={cragV2Ready ? undefined : cragV2Hint}
+                  onClick={() => openV2(allV2Targets)}
+                >
+                  一键全部更新到 CRAG v2
+                </Button>
+              </div>
               {hopJob ? <HopProgress job={hopJob} /> : null}
             </CardContent>
           </Card>
@@ -768,9 +940,7 @@ export function WrapSamplePage() {
                             )}
                           </td>
                           <td className='py-2 font-mono text-xs'>
-                            {dataplaneOf(vm) === '—'
-                              ? '—'
-                              : dataplaneLabel(dataplaneOf(vm))}
+                            {kernelOf(vm)}
                           </td>
                           <td className='py-2 text-muted-foreground'>
                             {source ? '当前母本' : rust ? '可收成' : '只收文件'}
@@ -791,12 +961,35 @@ export function WrapSamplePage() {
                                 disabled={!complete || hopBusy}
                                 loading={
                                   hopBusy &&
+                                  hopJob?.kind !== 'v2' &&
                                   hopIds.length === 1 &&
                                   hopIds[0] === vm.id
                                 }
                                 onClick={() => openHop([vm.id], false)}
                               >
                                 替换此槽
+                              </Button>
+                              <Button
+                                size='sm'
+                                variant='outline'
+                                disabled={
+                                  !cragV2Ready ||
+                                  hopBusy ||
+                                  Boolean(cragV2BlockedReason(vm))
+                                }
+                                loading={
+                                  hopBusy &&
+                                  hopJob?.kind === 'v2' &&
+                                  v2Ids.length === 1 &&
+                                  v2Ids[0] === vm.id
+                                }
+                                title={
+                                  cragV2BlockedReason(vm) ||
+                                  (cragV2Ready ? undefined : cragV2Hint)
+                                }
+                                onClick={() => openV2([vm.id])}
+                              >
+                                更新到 v2
                               </Button>
                             </div>
                           </td>
@@ -955,6 +1148,28 @@ export function WrapSamplePage() {
           </label>
         )}
       </ConfirmDialog>
+      <ConfirmDialog
+        open={v2Open}
+        onOpenChange={(open) => {
+          if (!open && !hopBusy) setV2Open(false)
+        }}
+        title={
+          v2Ids.length === 1
+            ? `把 ${v2Ids[0]} 更新到 CRAG v2？`
+            : v2Ids.length === allV2Targets.length
+              ? '一键把全部本机 Claude 槽更新到 CRAG v2？'
+              : `把所选 ${v2Ids.length} 个槽更新到 CRAG v2？`
+        }
+        desc='写入本槽 dataplane=crag、crag_kernel_version=v2，铺仓内 CRAG v2 包，并重启运行中的 rust kernel。不改凭证，不删容器，不改 routing.json。cli-node 留在盘上。已是 v2 的槽只在包有变化时重铺。'
+        confirmText={v2Ids.length === 1 ? '更新此槽' : '开始更新'}
+        cancelBtnText='取消'
+        isLoading={hopBusy}
+        handleConfirm={() => {
+          const ids = v2Ids
+          setV2Open(false)
+          void runV2(ids)
+        }}
+      />
     </PageHeader>
   )
 }

@@ -20,6 +20,7 @@ import {
 } from '@/components/ui/tooltip'
 import { ChoiceTiles } from '@/components/choice-tiles'
 import { isActiveVmPointer } from '@/features/vm/active-vm'
+import { VmSlotKernelSwitch } from '@/features/vm/engine-editor'
 import { Field } from '@/features/vm/detail-section-primitives'
 import { VmEnvironmentCard } from '@/features/vm/environment-card'
 import { NodeChip } from '@/features/vm/node-chip'
@@ -71,6 +72,16 @@ export function VmOpsTab(props: VmOpsTabProps) {
   const remote = isRemoteVm(vm)
   return (
     <TabsContent value='ops' className='space-y-3 pt-4'>
+      {gpt ? null : (
+        <Card>
+          <CardHeader className='pb-2'>
+            <CardTitle className='text-sm'>内核</CardTitle>
+          </CardHeader>
+          <CardContent className='pt-0'>
+            <VmSlotKernelSwitch id={vm.id} vm={vm} flush />
+          </CardContent>
+        </Card>
+      )}
       <VmOwnerAdminCard vm={vm} />
       <Card>
         <CardHeader className='pb-2'>

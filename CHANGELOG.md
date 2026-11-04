@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 内核页可把本机 Docker 的 Claude 槽全部或逐槽更新到 CRAG v2：钉 `dataplane=crag` 与 `crag_kernel_version=v2`，铺仓内包，并重启运行中的内核。Codex、集群和 KVM 不参与；缺包时拒绝，不改原内核。槽位详情「运维」顶部可在 cli-node 与 CRAG v2 之间切换。
 - 新增可选 `compatibility.preserve_pruned_tool_results`：在槽位Claude推理中，按认证密钥和DSH会话隔离保存成功请求的有限工具原文；精确识别默认工具文本裁剪后恢复原始前缀，避免小幅历史裁剪造成整段缓存重写。真实编辑/压缩、失败/重试、并发歧义和内存/上下文预算不足时不恢复；缺省关闭，不改变客户端配置或API直连端点。
 
 ## 1.4.038 — 2026-11-04

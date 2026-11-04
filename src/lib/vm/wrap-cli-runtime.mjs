@@ -848,6 +848,63 @@ export function captureWrapSample(projectRoot, vm) {
   }
 }
 
+export function describeCragV2Package(projectRoot) {
+  const root = cragV2PackageRoot(projectRoot)
+  if (!root) {
+    return {
+      ok: false,
+      path: '',
+      code: 'crag_v2_package_missing',
+      error: 'CRAG v2 package missing (share/crag/kernels/v2/<arch> or KIN_CRAG_V2_ROOT)',
+    }
+  }
+  let manifest
+  try {
+    manifest = JSON.parse(fs.readFileSync(path.join(root, 'manifest.json'), 'utf8'))
+  } catch {
+    return {
+      ok: false,
+      path: root,
+      code: 'crag_v2_manifest_invalid',
+      error: 'CRAG v2 manifest.json is missing or invalid',
+    }
+  }
+  if (!manifest || typeof manifest !== 'object' || manifest.family !== 'crag' || manifest.version !== 'v2') {
+    return {
+      ok: false,
+      path: root,
+      code: 'crag_v2_manifest_invalid',
+      error: 'CRAG v2 manifest family/version mismatch',
+    }
+  }
+  if (manifest.arch !== cragV2Arch()) {
+    return {
+      ok: false,
+      path: root,
+      code: 'crag_v2_arch_mismatch',
+      error: `CRAG v2 arch ${manifest.arch} does not match ${cragV2Arch()}`,
+    }
+  }
+  const entry = String(manifest.entrypoint || '')
+  if (entry !== CRAG_V2_ENTRY || !isFile(path.join(root, entry))) {
+    return {
+      ok: false,
+      path: root,
+      code: 'crag_v2_manifest_invalid',
+      error: 'CRAG v2 entrypoint must be bin/crag-kernel-worker.mjs',
+    }
+  }
+  const info = fileInfo(path.join(root, 'manifest.json'))
+  return {
+    ok: true,
+    path: root,
+    size: info?.size || 0,
+    mtime: info?.mtime || '',
+    arch: manifest.arch || '',
+    version: 'v2',
+  }
+}
+
 export function describeWrapSample(projectRoot) {
   const dir = wrapCliTemplateDir(projectRoot)
   const inspect = inspectWrapCliDir(dir)
@@ -862,6 +919,8 @@ export function describeWrapSample(projectRoot) {
     kernel: describeKernelPayload(projectRoot),
     cli_node: describeCliNodePayload(projectRoot),
     cc_node: describeCcNodePayload(projectRoot),
+    crag: describeCragPayload(projectRoot),
+    crag_v2: describeCragV2Package(projectRoot),
   }
 }
 

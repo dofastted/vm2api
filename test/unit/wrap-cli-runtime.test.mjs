@@ -13,6 +13,7 @@ import {
   inspectWrapCliDir,
   makeWrapSample,
   materializeCragV2,
+  describeCragV2Package,
   materializeResolvedKernel,
   materializeSlotDataplane,
   materializeWrapCli,
@@ -539,6 +540,27 @@ test('CRAG v2 rejects a bad package and a non-local slot without replacing cli-n
     const kvm = materializeCragV2(project, { id: 'vm-kvm', runtime: { type: 'kvm' } })
     assert.equal(kvm.code, 'crag_v2_unsupported_placement')
   } finally {
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
+
+test('describeCragV2Package reports a verified staged tree and a missing package', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-v2-describe-'))
+  const prev = process.env.KIN_CRAG_V2_ROOT
+  delete process.env.KIN_CRAG_V2_ROOT
+  try {
+    const missing = describeCragV2Package(project)
+    assert.equal(missing.ok, false)
+    assert.equal(missing.code, 'crag_v2_package_missing')
+    const dir = seedV2Package(project)
+    const found = describeCragV2Package(project)
+    assert.equal(found.ok, true)
+    assert.equal(found.path, dir)
+    assert.equal(found.version, 'v2')
+    assert.equal(found.arch, process.arch === 'x64' ? 'amd64' : process.arch === 'arm64' ? 'arm64' : process.arch)
+  } finally {
+    if (prev == null) delete process.env.KIN_CRAG_V2_ROOT
+    else process.env.KIN_CRAG_V2_ROOT = prev
     fs.rmSync(project, { recursive: true, force: true })
   }
 })

@@ -93,7 +93,7 @@ export function VmEngineEditor({
         。Go HTTP 转发不再启用。
       </p>
       {canEdit && !isCodexVm(vm) ? (
-        <SlotKernelSwitch id={id} vm={vm} remote={remote} />
+        <VmSlotKernelSwitch id={id} vm={vm} />
       ) : null}
       {inherits || !canEdit ? null : (
         <Button
@@ -125,14 +125,35 @@ function kernelLabel(vm: Vm) {
   return 'cli-node'
 }
 
+export function VmSlotKernelSwitch({
+  id,
+  vm,
+  flush = false,
+}: {
+  id: string
+  vm: Vm
+  flush?: boolean
+}) {
+  return (
+    <SlotKernelSwitch
+      id={id}
+      vm={vm}
+      remote={isRemoteVm(vm)}
+      flush={flush}
+    />
+  )
+}
+
 function SlotKernelSwitch({
   id,
   vm,
   remote,
+  flush,
 }: {
   id: string
   vm: Vm
   remote: boolean
+  flush: boolean
 }) {
   const qc = useQueryClient()
   const [pending, setPending] = useState<'wrap' | 'v2' | null>(null)
@@ -166,7 +187,7 @@ function SlotKernelSwitch({
     },
   })
   return (
-    <div className='mt-3 space-y-2'>
+    <div className={flush ? 'space-y-2' : 'mt-3 space-y-2'}>
       <div className='flex flex-wrap gap-2'>
         <Button
           variant='outline'
