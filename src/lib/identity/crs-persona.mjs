@@ -1618,6 +1618,8 @@ export function looksLikeOhMyPiSystem(system, headers = {}) {
   if (/<system-conventions>/i.test(text) && /<workstation>/i.test(text)) return true
   if (/^ROLE\s*\n\s*=+/m.test(text) && /^PROJECT\s*\n\s*=+/m.test(text)) return true
   if (/\b(?:oh my pi|pi coding harness|omp coding harness)\b/i.test(text)) return true
+  // OMP 18.12–18.16 send the Claude Code envelope plus their own role line (captured).
+  if (/^You are omp['’]s trusted coding assistant\.?\s*$/im.test(text)) return true
   return false
 }
 
@@ -1693,7 +1695,7 @@ function headerBetaTokens(headers = {}) {
     .filter(Boolean)
 }
 
-function systemLooksLikeRelayedClaudeCode(system) {
+export function systemLooksLikeRelayedClaudeCode(system) {
   if (hasOfficialClaudeLine(system)) return true
   if (isOfficialClaudeSecurityMonitorPrompt(system)) return true
   return eachSystemText(system).some((text) => looksLikeAgentPrompt(text))

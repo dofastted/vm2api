@@ -374,6 +374,7 @@ test('routing patch rejects a non-boolean claude_code_only', () => {
   ])
 })
 
+<<<<<<< HEAD
 // Side queries the CLI sends without the claude-code beta (captured from 2.1.318).
 const SIDE_HEADERS = {
   ...CLI_HEADERS,
@@ -517,4 +518,41 @@ test('switch on: anything but the exact sign-in probe is still refused', async (
 test('switch off: the sign-in probe is an ordinary request', async () => {
   const result = await runAnswered({ routing: {}, body: SIGN_IN_PROBE, headers: SIGN_IN_HEADERS })
   assert.equal(result.reached, true)
+})
+
+test('switch on: a pasted billing line is not relayed Claude Code', async () => {
+  const pasted = {
+    model: 'claude-sonnet-5',
+    max_tokens: 4096,
+    system: [
+      { type: 'text', text: BILLING },
+      { type: 'text', text: 'You are a helpful assistant.' },
+    ],
+    messages: [{ role: 'user', content: 'hi' }],
+  }
+  assert.deepEqual(await runProtocol({ routing: ON, body: pasted, headers: AXIOS }), BLOCKED)
+  const withUserId = { ...pasted, metadata: { user_id: USER_ID } }
+  assert.deepEqual(await runProtocol({ routing: ON, body: withUserId, headers: AXIOS }), BLOCKED)
+  // A relay that rewrote the UA but kept the official body and user_id still gets through.
+  const relayed = await runProtocol({
+    routing: ON,
+    body: OFFICIAL_BODY,
+    headers: { 'user-agent': 'Go-http-client/1.1' },
+  })
+  assert.equal(relayed.reached, true)
+})
+
+test('switch on: OMP inside the Claude Code envelope is refused', async () => {
+  const omp = {
+    ...OFFICIAL_BODY,
+    system: [
+      ...OFFICIAL_BODY.system,
+      {
+        type: 'text',
+        text: "RFC 2119 keywords: MUST, REQUIRED, SHOULD.\n\n§ Role\nYou are omp's trusted coding assistant.\n",
+      },
+    ],
+  }
+  assert.equal(isClaudeCodeFamilyRequest(CLI_HEADERS, omp), false)
+  assert.deepEqual(await runProtocol({ routing: ON, body: omp, headers: CLI_HEADERS }), BLOCKED)
 })
