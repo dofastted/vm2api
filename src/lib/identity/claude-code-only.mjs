@@ -12,7 +12,9 @@ import {
   inboundHasOpenAIToolShape,
   isOfficialClaudeCodeTraffic,
   isProxiedOfficialClaudeCode,
+  isValidOfficialUserId,
   looksLikeOhMyPiSystem,
+  systemLooksLikeRelayedClaudeCode,
 } from './crs-persona.mjs'
 
 const CLAUDE_CODE_BETA = 'claude-code-20250219'
@@ -109,7 +111,16 @@ export function isClaudeCodeFamilyRequest(headers = {}, body = {}, { routing = {
       return true
     }
   }
-  return !countTokens && detectProxiedOfficialCcFromRouting(routing) && isProxiedOfficialClaudeCode(body, headers)
+  // The persona/cache claim may rest on the billing block alone (relays that drop user_id), but
+  // that block is one line any client can paste, so admission also needs a valid user_id and an
+  // official Claude Code system.
+  return (
+    !countTokens &&
+    detectProxiedOfficialCcFromRouting(routing) &&
+    isProxiedOfficialClaudeCode(body, headers) &&
+    isValidOfficialUserId(body?.metadata?.user_id) &&
+    systemLooksLikeRelayedClaudeCode(body?.system)
+  )
 }
 
 export function claudeCodeOnlyError() {
