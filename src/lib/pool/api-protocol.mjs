@@ -15,6 +15,7 @@ import {
   responsesSseToAnthropicEvents,
   isToolArgumentsError,
   responsesSseToChatChunk,
+  chatToCodexResponses,
 } from '../protocol/codex-convert.mjs'
 import { usageFromSseLine } from '../protocol/handle-codex.mjs'
 import { BETA_CONTEXT_1M } from '../protocol/claude-code-betas.mjs'
@@ -207,6 +208,7 @@ export async function runApiInference({
   res,
   cfg,
   scheduler,
+  picked: selected = null,
   store,
   protocol,
   inbound,
@@ -223,7 +225,7 @@ export async function runApiInference({
 } = {}) {
   const canonical = officialMessagesBody(convertedBody)
   const model = canonical.model
-  const picked = scheduler.pick(model)
+  const picked = selected || scheduler.pick(model)
   if (!picked.ok) {
     return {
       ok: false,
@@ -254,8 +256,25 @@ export async function runApiInference({
     }
   }
   const body = isOpenAI
-    ? { ...claudeToOpenAIResponsesRequest({ ...canonical, model: picked.upstream_model }), stream: true }
+    ? {
+        ...(protocol === 'openai.responses'
+          ? inbound
+          : protocol === 'openai.chat'
+            ? chatToCodexResponses(inbound)
+            : claudeToOpenAIResponsesRequest(canonical)),
+        model: picked.upstream_model,
+        stream: true,
+      }
     : { ...canonical, model: picked.upstream_model, stream: true }
+  if (isOpenAI && protocol === 'openai.chat') {
+    for (const name of ['temperature', 'top_p', 'parallel_tool_calls']) {
+      if (inbound?.[name] != null) body[name] = inbound[name]
+    }
+    if (body.reasoning_effort != null) {
+      body.reasoning = { ...body.reasoning, effort: body.reasoning?.effort ?? body.reasoning_effort }
+      delete body.reasoning_effort
+    }
+  }
   if (requestContext) Object.assign(body, prepareClassifierBody(body))
   const callerProtocolHeaders = forwardAnthropicProtocolHeaders(req?.headers, protocol, protocolKind, {
     passthrough,
@@ -630,7 +649,7 @@ async function runOpenAIResponsesUpstream({
     try {
       assembled = assembleCodexBodyFromSse(chunks, {})
       outBody =
-        protocol === 'anthropic.messages'
+        protocol !== 'openai.responses'
           ? codexBodyToAnthropicMessage(assembled, inbound?.model || body?.model)
           : assembled
     } catch (error) {
