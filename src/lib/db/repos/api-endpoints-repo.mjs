@@ -11,6 +11,7 @@ const EP_COLS = [
   'priority',
   'kind',
   'protocol',
+  'risk_review_enabled',
   'created_at',
   'updated_at',
 ]
@@ -40,6 +41,7 @@ function rowEp(row) {
     priority: Number(row.priority) || 0,
     kind: row.kind || 'custom',
     protocol: row.protocol || 'anthropic',
+    risk_review_enabled: !!row.risk_review_enabled,
     created_at: row.created_at,
     updated_at: row.updated_at,
   }
@@ -134,6 +136,7 @@ export class ApiEndpointsRepo {
       priority: Number(rec.priority) || 0,
       kind: rec.kind || 'custom',
       protocol: rec.protocol || 'anthropic',
+      risk_review_enabled: bool01(rec.risk_review_enabled),
       created_at: rec.created_at,
       updated_at: rec.updated_at,
     }
