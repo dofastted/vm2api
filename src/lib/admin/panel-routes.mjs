@@ -107,6 +107,7 @@ import { authorizePanelRoute, mePayload, panelIdentity } from './panel-acl.mjs'
 import {
   denyIfUserCannotDeleteVm,
   denyIfUserMissesKey,
+  panelOwnsKey,
   denyIfUserMissesProxy,
   denyIfUserMissesVm,
   userMissesVmId,
@@ -875,8 +876,8 @@ export function createPanelHandler(ctx) {
 
   function normalizePanelApiKeyInput(body = {}, req) {
     const normalized = { ...body }
+    normalized.user_id = req.apiKeyKind === 'master' ? null : normalizeOwnerId(req.panelUserId)
     if (panelIdentity(req).role !== 'admin') {
-      delete normalized.user_id
       delete normalized.group_id
       delete normalized.vm_pool_id
     }
@@ -1613,18 +1614,13 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'GET' && p === '/api/panel/api-keys') {
         const snap = apiKeyStore.snapshot()
-        if (panelIdentity(req).role === 'user') {
-          const mine = (snap.keys || []).filter(
-            (k) => normalizeOwnerId(k.user_id) === normalizeOwnerId(req.panelUserId),
-          )
-          return json(res, 200, {
-            ok: true,
-            total: mine.length,
-            active: mine.filter((k) => k.status === 'active').length,
-            keys: mine,
-          })
-        }
-        return json(res, 200, { ok: true, ...snap })
+        const mine = (snap.keys || []).filter((key) => panelOwnsKey(req, key))
+        return json(res, 200, {
+          ok: true,
+          total: mine.length,
+          active: mine.filter((k) => k.status === 'active').length,
+          keys: mine,
+        })
       }
       if (req.method === 'GET' && /^\/api\/panel\/api-keys\/[^/]+\/stats$/.test(p)) {
         const id = p.split('/')[4]
@@ -1650,6 +1646,12 @@ export function createPanelHandler(ctx) {
           })
         }
         const input = normalizePanelApiKeyInput(body, req)
+        if (!input.user_id && req.apiKeyKind !== 'master') {
+          return json(res, 403, {
+            ok: false,
+            error: { code: 'key_owner_required', message: 'API key owner is required' },
+          })
+        }
         try {
           const scopeInput = { group_type: body?.group_type, allowed_vms: body?.allowed_vms }
           if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
@@ -1668,8 +1670,7 @@ export function createPanelHandler(ctx) {
             name: body?.name,
             key: body?.key || body?.custom_key || undefined,
             category: body?.category,
-            user_id:
-              panelIdentity(req).role === 'user' ? req.panelUserId || null : body?.user_id || req.panelUserId || null,
+            user_id: input.user_id,
             group_id: input.group_id,
             group_type: scope.group_type,
             allowed_vms: scope.allowed_vms,
