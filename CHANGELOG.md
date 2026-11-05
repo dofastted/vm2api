@@ -12,6 +12,16 @@
 - CRAG V2 发布协议切换到原生 ELF（`runtime: native`、`entrypoint: crag-v2`）：验证实际架构、完整 SHA 成员与安全路径，原子物化并直接执行，不再复制 Node 或写出 `node_bin` / `crag_v2_root`。保留 legacy 版本选择和 Linux Docker 放置限制；真实 CLI 版本由 native worker 探测。
 - native V2 生命周期探测、停止、切换回收和 idle reload 识别新进程名；动态 runnable 上限不再被误算为占用任务。配置写入本身不触发额外热重载，沿用显式空闲重启流程。
 
+## 1.4.046 — 2026-11-06
+
+- #376：控制面平滑停机与排空（Graceful Draining）：收到 SIGTERM/SIGINT 时停止接入新请求，`/health` 与 `/healthz` 立即返回 503 `shutting_down` 通知上游反代/负载均衡安全摘流；等待在途长文本推理流自然排空（默认超时 25s，支持 `KIN_SHUTDOWN_DRAIN_TIMEOUT_MS`），避免升级或重启切断活跃会话导致客户端收到 `UND_ERR_SOCKET`。
+- #852：推理槽位假死显式感知与连续超时熔断：
+  - 诊断显式感知：槽位健康检查若发现存在异常闭合槽位时上报 `warn`（`kernel_degraded`），全部闭合时上报 `error`（`kernel_slots_closed`），彻底消除假死诊断盲区；
+  - 看门狗全闭合重启：`rustKernelNeedsRestart` 识别 `ready_slots === 0 && closed_slots > 0` 触发重启，不再无限期当作 busy；
+  - VM 级连续超时熔断：引入 `vmTimeoutTracker`，单台 VM 连续 3 次静默无首帧超时（504 / `worker_timeout`）立即标记 `kernelFaults` 熔断，阻止持续调度与级联超时。
+
+已部署机升级：只更新 Node 控制面后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
 ## 1.4.045 — 2026-11-05
 
 - #896：claude_code_only 完整替代 #892+#893：放行 CLI WebSearch/WebFetch 侧查询（缺 `claude-code-20250219` 的窄形状仍保留其余官方指纹检查）；Desktop Gateway 登录探针本地回 OK（零用量、不选账号）；中转准入不再仅凭计费行放行（须合法 `metadata.user_id` + 可识别的官方 Claude Code system）；拒 OMP 18.x（认出 `You are omp's trusted coding assistant`）。
