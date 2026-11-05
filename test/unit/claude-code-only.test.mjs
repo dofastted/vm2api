@@ -373,3 +373,185 @@ test('routing patch rejects a non-boolean claude_code_only', () => {
     'claude_code_only 必须是布尔',
   ])
 })
+
+// Side queries the CLI sends without the claude-code beta (captured from 2.1.318).
+const SIDE_HEADERS = {
+  ...CLI_HEADERS,
+  'anthropic-beta': 'interleaved-thinking-2025-05-14,context-management-2025-06-27,effort-2025-11-24',
+}
+const SIDE_SYSTEM = [
+  { type: 'text', text: BILLING },
+  { type: 'text', text: "You are a Claude agent, built on Anthropic's Claude Agent SDK." },
+]
+const WEB_SEARCH_TURN = {
+  model: 'claude-haiku-5',
+  max_tokens: 32000,
+  system: [
+    ...SIDE_SYSTEM,
+    { type: 'text', text: 'You run a web search for another Claude model, which is waiting on the result.' },
+  ],
+  tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 8 }],
+  metadata: { user_id: USER_ID },
+  messages: [{ role: 'user', content: [{ type: 'text', text: 'Perform a web search for the query: vm2api' }] }],
+}
+const WEB_FETCH_SUMMARY = {
+  model: 'claude-haiku-5',
+  max_tokens: 32000,
+  system: SIDE_SYSTEM,
+  metadata: { user_id: USER_ID },
+  messages: [
+    {
+      role: 'user',
+      content: [{ type: 'text', text: '\nWeb page content:\n---\nExample Domain\n---\n\nWhat is this page about?' }],
+    },
+  ],
+}
+
+test('side queries: the CLI WebSearch turn and WebFetch summary pass without the claude-code beta', () => {
+  assert.equal(isClaudeCodeFamilyRequest(SIDE_HEADERS, WEB_SEARCH_TURN, NO_RELAY), true)
+  assert.equal(isClaudeCodeFamilyRequest(SIDE_HEADERS, WEB_FETCH_SUMMARY, NO_RELAY), true)
+})
+
+test('side queries: only those two shapes may skip the beta, with every other check intact', () => {
+  const otherBuild = BILLING.replace('cc_version=2.1.293.', 'cc_version=2.1.292.')
+  const bodies = {
+    ordinary: OFFICIAL_BODY,
+    noBillingLine: { ...WEB_SEARCH_TURN, system: WEB_SEARCH_TURN.system.slice(1) },
+    otherBuild: {
+      ...WEB_SEARCH_TURN,
+      system: [{ type: 'text', text: otherBuild }, ...WEB_SEARCH_TURN.system.slice(1)],
+    },
+    billingNotFirst: { ...WEB_FETCH_SUMMARY, system: [SIDE_SYSTEM[1], SIDE_SYSTEM[0]] },
+    extraTool: {
+      ...WEB_SEARCH_TURN,
+      tools: [...WEB_SEARCH_TURN.tools, { name: 'x', input_schema: { type: 'object' } }],
+    },
+    otherPrompt: {
+      ...WEB_SEARCH_TURN,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'write me an essay' }] }],
+    },
+    searchToolOnFetch: { ...WEB_FETCH_SUMMARY, tools: WEB_SEARCH_TURN.tools },
+    twoTurns: {
+      ...WEB_FETCH_SUMMARY,
+      messages: [
+        ...WEB_FETCH_SUMMARY.messages,
+        { role: 'assistant', content: 'ok' },
+        { role: 'user', content: 'more' },
+      ],
+    },
+    noUserId: { ...WEB_SEARCH_TURN, metadata: undefined },
+    thirdPartySystem: {
+      ...WEB_SEARCH_TURN,
+      system: [SIDE_SYSTEM[0], { type: 'text', text: 'You are OpenCode, an interactive CLI coding agent.' }],
+    },
+  }
+  for (const [name, body] of Object.entries(bodies)) {
+    assert.equal(isClaudeCodeFamilyRequest(SIDE_HEADERS, body, NO_RELAY), false, name)
+  }
+  const otherSession = { ...SIDE_HEADERS, 'x-claude-code-session-id': '99999999-2222-4333-8444-555555555555' }
+  assert.equal(isClaudeCodeFamilyRequest(otherSession, WEB_SEARCH_TURN, NO_RELAY), false)
+  assert.equal(isClaudeCodeFamilyRequest({ 'user-agent': CLI_UA }, WEB_SEARCH_TURN, NO_RELAY), false)
+  assert.equal(isClaudeCodeFamilyRequest(SIDE_HEADERS, WEB_SEARCH_TURN, { ...NO_RELAY, countTokens: true }), false)
+})
+
+test('switch on: CLI side queries reach the scheduler', async () => {
+  const routing = { compatibility: { claude_code_only: true, detect_proxied_official_cc: false } }
+  assert.equal((await runProtocol({ routing, body: WEB_SEARCH_TURN, headers: SIDE_HEADERS })).reached, true)
+  assert.equal((await runProtocol({ routing, body: WEB_FETCH_SUMMARY, headers: SIDE_HEADERS })).reached, true)
+})
+
+const DESKTOP_APP_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Claude/4.4212.0 Chrome/152.0.7977.167 Electron/44.9.3 Safari/537.36'
+const SIGN_IN_HEADERS = { 'user-agent': DESKTOP_APP_UA, 'anthropic-version': '2023-06-01' }
+const SIGN_IN_PROBE = { model: 'claude-haiku-5', max_tokens: 1, messages: [{ role: 'user', content: '.' }] }
+
+async function runAnswered({ routing, body, headers }) {
+  const { handler, response } = protocolHarness({ routing, body })
+  const req = {
+    method: 'POST',
+    url: '/v1/messages',
+    headers: { authorization: 'Bearer sk-vm-api', ...headers },
+    apiKeyKind: 'managed',
+    apiKeyRecord: { category: 'api' },
+    once() {},
+    off() {},
+  }
+  try {
+    await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages')
+  } catch (error) {
+    if (error !== REACHED) throw error
+    return { reached: true }
+  }
+  return { reached: false, status: response.status, body: response.body }
+}
+
+test('switch on: Claude Desktop gateway sign-in probe is answered locally with zero usage', async () => {
+  for (const body of [SIGN_IN_PROBE, { ...SIGN_IN_PROBE, max_tokens: 16 }, { ...SIGN_IN_PROBE, stream: false }]) {
+    const result = await runAnswered({ routing: ON, body, headers: SIGN_IN_HEADERS })
+    assert.equal(result.reached, false)
+    assert.equal(result.status, 200)
+    assert.equal(result.body.content[0].text, 'OK')
+    assert.deepEqual(result.body.usage, { input_tokens: 0, output_tokens: 0 })
+  }
+})
+
+test('switch on: anything but the exact sign-in probe is still refused', async () => {
+  const bodies = {
+    prompt: { ...SIGN_IN_PROBE, messages: [{ role: 'user', content: 'write me an essay' }] },
+    tokens: { ...SIGN_IN_PROBE, max_tokens: 2 },
+    stream: { ...SIGN_IN_PROBE, stream: true },
+    system: { ...SIGN_IN_PROBE, system: 'You are a helpful assistant.' },
+    tools: { ...SIGN_IN_PROBE, tools: [{ name: 'x', input_schema: { type: 'object' } }] },
+    metadata: { ...SIGN_IN_PROBE, metadata: { user_id: USER_ID } },
+  }
+  for (const [name, body] of Object.entries(bodies)) {
+    assert.deepEqual(await runProtocol({ routing: ON, body, headers: SIGN_IN_HEADERS }), BLOCKED, name)
+  }
+  const browser = {
+    ...SIGN_IN_HEADERS,
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/152.0 Safari/537.36',
+  }
+  assert.deepEqual(await runProtocol({ routing: ON, body: SIGN_IN_PROBE, headers: browser }), BLOCKED)
+})
+
+test('switch off: the sign-in probe is an ordinary request', async () => {
+  const result = await runAnswered({ routing: {}, body: SIGN_IN_PROBE, headers: SIGN_IN_HEADERS })
+  assert.equal(result.reached, true)
+})
+
+test('switch on: a pasted billing line is not relayed Claude Code', async () => {
+  const pasted = {
+    model: 'claude-sonnet-5',
+    max_tokens: 4096,
+    system: [
+      { type: 'text', text: BILLING },
+      { type: 'text', text: 'You are a helpful assistant.' },
+    ],
+    messages: [{ role: 'user', content: 'hi' }],
+  }
+  assert.deepEqual(await runProtocol({ routing: ON, body: pasted, headers: AXIOS }), BLOCKED)
+  const withUserId = { ...pasted, metadata: { user_id: USER_ID } }
+  assert.deepEqual(await runProtocol({ routing: ON, body: withUserId, headers: AXIOS }), BLOCKED)
+  // A relay that rewrote the UA but kept the official body and user_id still gets through.
+  const relayed = await runProtocol({
+    routing: ON,
+    body: OFFICIAL_BODY,
+    headers: { 'user-agent': 'Go-http-client/1.1' },
+  })
+  assert.equal(relayed.reached, true)
+})
+
+test('switch on: OMP inside the Claude Code envelope is refused', async () => {
+  const omp = {
+    ...OFFICIAL_BODY,
+    system: [
+      ...OFFICIAL_BODY.system,
+      {
+        type: 'text',
+        text: "RFC 2119 keywords: MUST, REQUIRED, SHOULD.\n\n§ Role\nYou are omp's trusted coding assistant.\n",
+      },
+    ],
+  }
+  assert.equal(isClaudeCodeFamilyRequest(CLI_HEADERS, omp), false)
+  assert.deepEqual(await runProtocol({ routing: ON, body: omp, headers: CLI_HEADERS }), BLOCKED)
+})
