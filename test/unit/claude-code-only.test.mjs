@@ -374,7 +374,6 @@ test('routing patch rejects a non-boolean claude_code_only', () => {
   ])
 })
 
-<<<<<<< HEAD
 // Side queries the CLI sends without the claude-code beta (captured from 2.1.318).
 const SIDE_HEADERS = {
   ...CLI_HEADERS,
