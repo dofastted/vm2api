@@ -4,6 +4,78 @@ import { startGateway, api } from '../harness.mjs'
 
 const MODEL = 'claude-haiku-4-5-20251001'
 
+test('real admin and user sessions cannot list or operate each other personal keys', async () => {
+  const gw = await startGateway()
+  try {
+    const login = async (username, password) => {
+      const response = await api(gw, 'POST', '/api/panel/login', { body: { username, password } })
+      assert.equal(response.status, 200, response.text)
+      return response.headers.get('set-cookie')
+    }
+    const adminCookie = await login('admin', 'testpass')
+    const user = await api(gw, 'POST', '/api/panel/users', {
+      body: { username: 'key-owner', password: 'fixture-key-owner-pass', role: 'user' },
+    })
+    assert.equal(user.status, 201, user.text)
+    const userId = (user.json.data?.item || user.json.item).id
+    const userCookie = await login('key-owner', 'fixture-key-owner-pass')
+    const personal = (cookie, method, path, body) =>
+      api(gw, method, path, {
+        headers: { authorization: '', cookie },
+        body,
+      })
+    const platform = await api(gw, 'POST', '/api/panel/api-keys', { body: { name: 'platform' } })
+    assert.equal(platform.status, 201, platform.text)
+    const userKey = await personal(userCookie, 'POST', '/api/panel/api-keys', { name: 'user-key' })
+    assert.equal(userKey.status, 201, userKey.text)
+    assert.equal(userKey.json.item.user_id, userId)
+    const adminKey = await personal(adminCookie, 'POST', '/api/panel/api-keys', { name: 'admin-key', user_id: userId })
+    assert.equal(adminKey.status, 201, adminKey.text)
+    assert.ok(adminKey.json.item.user_id)
+    assert.notEqual(adminKey.json.item.user_id, userId)
+    for (const [cookie, own, foreign] of [
+      [adminCookie, adminKey.json.item.id, userKey.json.item.id],
+      [userCookie, userKey.json.item.id, adminKey.json.item.id],
+    ]) {
+      const list = await personal(cookie, 'GET', `/api/panel/api-keys?user_id=${userId}`)
+      assert.equal(list.status, 200, list.text)
+      assert.equal(list.json.total, 1)
+      assert.equal(list.json.active, 1)
+      assert.deepEqual(
+        list.json.keys.map((key) => key.id),
+        [own],
+      )
+      for (const [method, suffix] of [
+        ['GET', '/stats'],
+        ['POST', '/reveal'],
+        ['PATCH', ''],
+        ['POST', '/rotate'],
+        ['POST', '/reset-quota'],
+        ['DELETE', ''],
+      ]) {
+        for (const id of [foreign, platform.json.item.id, 'missing']) {
+          const denied = await personal(
+            cookie,
+            method,
+            `/api/panel/api-keys/${id}${suffix}`,
+            method === 'PATCH' ? { name: 'hijacked' } : undefined,
+          )
+          assert.equal(denied.status, 404, `${method} ${suffix}: ${denied.text}`)
+        }
+      }
+      const reveal = await personal(cookie, 'POST', `/api/panel/api-keys/${own}/reveal`)
+      assert.equal(reveal.status, 200, reveal.text)
+    }
+    const masterList = await api(gw, 'GET', '/api/panel/api-keys')
+    assert.deepEqual(
+      masterList.json.keys.map((key) => key.id),
+      [platform.json.item.id],
+    )
+  } finally {
+    await gw.stop()
+  }
+})
+
 test('panel creates managed key; key can call /v1/messages', async () => {
   const gw = await startGateway({ mockText: 'hello-key' })
   try {
