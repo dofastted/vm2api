@@ -289,8 +289,27 @@ async function kernelCheck(vm, projectRoot, engine, hasCredential, probes, inter
   if (pub.recovering)
     return check('kernel', label, 'warn', 'kernel_recovering', '内核正在重启 CLI，稍后自动恢复', detail)
   if (pub.ready_slots === 0) {
+    if (pub.closed_slots > 0)
+      return check(
+        'kernel',
+        label,
+        'error',
+        'kernel_slots_closed',
+        `所有会话槽均已闭合（${pub.closed_slots} 个槽闭合），无可用会话槽`,
+        detail,
+      )
     if (pub.cli_pid > 0) return check('kernel', label, 'warn', 'kernel_busy', '所有会话槽都在忙', detail)
     return check('kernel', label, 'error', 'kernel_no_cli', '内核在线但 CLI 未运行，没有可用会话槽', detail)
+  }
+  if (pub.closed_slots > 0) {
+    return check(
+      'kernel',
+      label,
+      'warn',
+      'kernel_degraded',
+      `内核降级：存在 ${pub.closed_slots} 个异常闭合槽位（可用会话槽 ${pub.ready_slots}）`,
+      detail,
+    )
   }
   const slots = pub.ready_slots == null ? '' : `，可用会话槽 ${pub.ready_slots}`
   return check('kernel', label, 'ok', null, `内核在线${slots}`, detail)

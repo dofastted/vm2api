@@ -103,9 +103,11 @@ export function rustKernelReachable(health) {
   return rustKernelProcessUp(health) && health?.healthy !== false && rustKernelCliReady(health)
 }
 
-/** Only the container restart (L4) can help: the kernel is gone or gave up on its CLI. */
+/** Only the container restart (L4) can help: the kernel is gone, gave up on CLI, or all slots are closed. */
 export function rustKernelNeedsRestart(health) {
-  return !rustKernelProcessUp(health) || health?.healthy === false
+  if (!rustKernelProcessUp(health) || health?.healthy === false) return true
+  if (health?.ready_slots === 0 && Number(health?.closed_slots) > 0) return true
+  return false
 }
 
 /**
