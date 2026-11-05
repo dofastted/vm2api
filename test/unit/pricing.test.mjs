@@ -544,8 +544,13 @@ function imageUsage(over = {}) {
   }
 }
 
-test('gpt-image-2.5 builtin prices text and image tokens separately', () => {
-  for (const id of ['gpt-image-2.5-flare', 'gpt-image-2.5-sunburst-2026-09-08']) {
+test('gpt-image-2.5 and 2.6 builtin prices text and image tokens separately', () => {
+  for (const id of [
+    'gpt-image-2.6-flare',
+    'gpt-image-2.6-sunburst',
+    'gpt-image-2.5-flare',
+    'gpt-image-2.5-sunburst-2026-09-08',
+  ]) {
     const got = resolvePrice(id)
     assert.equal(got.platform, 'openai')
     assert.equal(got.price.input, 5)
@@ -564,6 +569,13 @@ test('imageCostFromUsage matches the codex-proxy-rs image token formula', () => 
   close(c.image_cost, 0.0005 + 0.0016 + 0.03)
   assert.equal(c.image_input_tokens, 300)
   assert.equal(c.image_output_tokens, 1000)
+})
+
+test('imageCostFromUsage prices gpt-image-2.6-flare correctly', () => {
+  const c = imageCostFromUsage(imageUsage(), 'gpt-image-2.6-flare')
+  assert.equal(c.known, true)
+  assert.equal(c.pricing_key, 'gpt-image-2.6-flare')
+  close(c.image_cost, 0.0005 + 0.0016 + 0.03)
 })
 
 test('GPT Image 2 snapshot usage is billed without double-counting image tokens', () => {

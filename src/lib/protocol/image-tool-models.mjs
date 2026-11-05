@@ -5,25 +5,39 @@
 
 export const IMAGE_TOOL_MODELS = Object.freeze([
   Object.freeze({
+    id: 'gpt-image-2.6-flare',
+    display_name: 'GPT Image 2.6 Flare',
+    snapshots: Object.freeze([]),
+    upstream_default: true,
+    sort: 10,
+  }),
+  Object.freeze({
+    id: 'gpt-image-2.6-sunburst',
+    display_name: 'GPT Image 2.6 Sunburst',
+    snapshots: Object.freeze([]),
+    upstream_default: false,
+    sort: 20,
+  }),
+  Object.freeze({
     id: 'gpt-image-2.5-flare',
     display_name: 'GPT Image 2.5 Flare',
     snapshots: Object.freeze(['gpt-image-2.5-flare-2026-09-08']),
-    upstream_default: true,
-    sort: 10,
+    upstream_default: false,
+    sort: 30,
   }),
   Object.freeze({
     id: 'gpt-image-2.5-sunburst',
     display_name: 'GPT Image 2.5 Sunburst',
     snapshots: Object.freeze(['gpt-image-2.5-sunburst-2026-09-08']),
     upstream_default: false,
-    sort: 20,
+    sort: 40,
   }),
   Object.freeze({
     id: 'gpt-image-2',
     display_name: 'GPT Image 2',
     snapshots: Object.freeze(['gpt-image-2-2026-04-21']),
     upstream_default: false,
-    sort: 30,
+    sort: 50,
   }),
 ])
 

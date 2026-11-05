@@ -223,7 +223,7 @@ Claude PATCH `max_sessions` 返回 400 `claude_max_sessions_forbidden`；OpenAI 
 
 上游目录启动 5 秒后和每 6 小时自动同步一次，结果写在 settings `model_catalog_sync`。已有条目的编辑一律保留。新 Claude id 只在 `worker_only` 下直接对外，其他模式加入后默认关闭；新 GPT id 一律默认关闭，等管理员打开。OpenAI 行的「Fast 别名」开关另存 `expose_fast`，只有同步目录声明 `service_tiers[].id = "priority"` 时才可打开；公开别名为 `<model>-fast`，请求会在调度前还原基模型并发送 `service_tier: "priority"`。models.dev 只提供新条目的显示名。
 
-OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理；当前目录包括 `gpt-image-2`（快照 `gpt-image-2-2026-04-21`）、`gpt-image-2.5-flare` 和 `gpt-image-2.5-sunburst`。启用后可在 Codex 槽模型白名单中选择其规范 ID 或快照，Images 与 Responses `image_generation` 工具共用该开关。
+OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理；当前目录包括 `gpt-image-2`（快照 `gpt-image-2-2026-04-21`）、`gpt-image-2.5-flare`、`gpt-image-2.5-sunburst`、`gpt-image-2.6-flare` 和 `gpt-image-2.6-sunburst`。启用后可在 Codex 槽模型白名单中选择其规范 ID 或快照，Images 与 Responses `image_generation` 工具共用该开关。
 
 `catalog_mode`：`policy_only`（默认，控制台 #/models 即目录）/ `worker_intersect_policy` / `worker_only`。矩阵行可改 `betas.pass_context_1m`、thinking 策略、`max_tokens_cap`。
 价格与模型目录的独立同步仍按下方计费接口执行。
