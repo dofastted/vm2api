@@ -354,6 +354,19 @@ function classifyUpstreamResultRaw(
   const reset = resetFromHeaders(result.headers, now)
 
   const hay = `${code} ${message} ${workerCode}`
+  if (
+    [code, workerCode].some((value) =>
+      /^license_(required|expired|not_yet_valid|invalid|binding_mismatch|unconfigured)$/.test(value),
+    )
+  ) {
+    return {
+      scope: 'request',
+      action: 'stop',
+      reason: code || workerCode,
+      cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
   // Claude Code wraps an AUP refusal as "API Error" and the kernel often
   // surfaces it as HTTP 400. That is the prompt, not a repairable request
   // and not an account failure: stop, do not hop again, cache forever.

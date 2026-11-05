@@ -14,7 +14,7 @@ import { manualScheduleLevelOf } from '../pool/credential-weight.mjs'
 import { applyUnschedulable, deriveScheduleFields, pickScheduleFields } from '../pool/schedule-state.mjs'
 import { activeHoursOf } from '../pool/active-hours.mjs'
 import { stampVmKind } from './vm-kind.mjs'
-import { materializeWrapCli } from './wrap-cli-runtime.mjs'
+import { materializeResolvedKernel } from './wrap-cli-runtime.mjs'
 import { listVms } from './vm-registry.mjs'
 import { slotHost } from './slot-host.mjs'
 import {
@@ -98,8 +98,11 @@ export function seedFreshCliHome(projectRoot, vm) {
   // A baked slot image carries its binaries; no .kin copy in the home.
   if (!slotHost(vm).bakedKernel) {
     try {
-      materializeWrapCli(projectRoot, vm)
-    } catch {}
+      const laid = materializeResolvedKernel(projectRoot, vm)
+      if (laid?.ok === false && vm?.dataplane === 'crag') throw new Error(laid.error || laid.code)
+    } catch (error) {
+      if (vm?.dataplane === 'crag') throw error
+    }
   }
   return { homeDir: written.homeDir, seed_policy: written.seed_policy || defaultSeedPolicy(vm.seed_policy || {}) }
 }

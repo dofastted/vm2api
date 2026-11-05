@@ -21,6 +21,7 @@ hypervisor/*.env
 /web/dist/
 /share/crag/
 /share/wrap-cli/*
+/share/wrap-cli-releases/
 !/share/wrap-cli/kin-kernel
 !/share/wrap-cli/SAMPLE.json
 .workflow/

@@ -70,6 +70,31 @@ export type VmProxySnap = {
 
 export type InferenceEngine = 'auto' | 'go' | 'rust'
 
+export type CragLicenseStatus = {
+  status:
+    | 'unlicensed'
+    | 'valid'
+    | 'expired'
+    | 'not_yet_valid'
+    | 'invalid'
+    | 'unconfigured'
+  valid: boolean
+  vm_id: string
+  license_id?: string
+  term?: '1m' | '6m' | '1y'
+  /** Signed UTC epoch seconds, not browser-local timestamps. */
+  issued_at?: number
+  not_before?: number
+  expires_at?: number
+  code?: string
+  message?: string
+}
+
+export type CragLicenseResponse = {
+  license: CragLicenseStatus
+  machine_code: string
+}
+
 export type VmTelemetryState = {
   enabled: boolean
   state:
@@ -346,6 +371,8 @@ export type Vm = {
   resolved_persona_preset?: string | null
   dataplane?: 'wrap' | 'cc' | 'crag' | null
   resolved_dataplane?: 'wrap' | 'cc' | 'crag' | null
+  crag_kernel_version?: 'legacy' | 'v2' | null
+  resolved_crag_kernel_version?: 'legacy' | 'v2' | null
   kernel?: string
   /** docker | kvm。缺省按 docker 展示。 */
   runtime_type?: RuntimeType | null

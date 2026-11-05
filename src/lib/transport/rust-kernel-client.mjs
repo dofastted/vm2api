@@ -4,6 +4,12 @@
  */
 import path from 'node:path'
 import { callGoWorker, callWorkerPost, streamGoWorker, workerHealth, workerPaths } from './go-worker-client.mjs'
+import { checkCragLicense, cragLicenseDeniedResult } from '../vm/crag-license.mjs'
+
+function licenseCheck(opts) {
+  const root = opts.exec?.projectRoot || (opts.exec?.homeDir ? path.resolve(opts.exec.homeDir, '../../..') : '')
+  return checkCragLicense(root, opts.exec?.vm, opts.routing)
+}
 
 export function rustKernelPaths(exec = {}) {
   const base = workerPaths(exec)
@@ -41,10 +47,14 @@ function remapVia(result) {
 }
 
 export async function callRustKernel(opts = {}) {
+  const licensed = licenseCheck(opts)
+  if (!licensed.ok) return cragLicenseDeniedResult(licensed)
   return remapVia(await callGoWorker({ ...opts, exec: withRustKernelExec(opts.exec) }))
 }
 
 export async function streamRustKernel(opts = {}) {
+  const licensed = licenseCheck(opts)
+  if (!licensed.ok) return cragLicenseDeniedResult(licensed)
   return remapVia(await streamGoWorker({ ...opts, exec: withRustKernelExec(opts.exec) }))
 }
 
@@ -168,6 +178,7 @@ export function isNeedsRefreshResult(result) {
   const code = String(result?.body?.error?.code || result?.error?.code || '')
   const message = String(result?.body?.error?.message || result?.error?.message || '')
   const hay = `${code} ${message}`
+  if (code.startsWith('license_')) return false
   if (code === 'needs_refresh' || /needs_refresh/i.test(hay)) return true
   if (status === 401) return true
   if (/authentication_error|token has been revoked|oauth_revoked|invalid_grant/i.test(hay)) return true
