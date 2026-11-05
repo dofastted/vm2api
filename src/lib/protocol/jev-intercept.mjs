@@ -11,7 +11,7 @@
  */
 import { ErrorCode, ErrorType, makeError } from '../core/errors.mjs'
 import { refusalUserDocument } from '../core/refusal-similarity.mjs'
-import { normalizeText } from '../core/distill-detect.mjs'
+import { isNegatedExtraction, normalizeText } from '../core/distill-detect.mjs'
 import { hasAccessPresence } from '../oauth/oauth-credentials.mjs'
 import { prepareInterceptText, stripEnvironmentSection, stripReminders } from './jev-prepare.mjs'
 import { isOfficialTypeSafeUrl, jevKeyFingerprint, recordJevUsage } from './jev-usage.mjs'
@@ -999,7 +999,7 @@ export function policyBlockError(requestId) {
 function compileRule(category, source) {
   const text = cleanPattern(source)
   if (!text) return null
-  return { category, source: text, re: new RegExp(text, 'i') }
+  return { category, source: text, re: new RegExp(text, 'gi') }
 }
 
 export function matchHardPolicy(text, extra = [], rules = null) {
@@ -1016,16 +1016,17 @@ export function matchHardPolicy(text, extra = [], rules = null) {
     if (item) compiled.push(item)
   }
   for (const rule of compiled) {
-    const found = rule.re.exec(hay)
-    if (!found) continue
-    const keyword = String(found[0] || '')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .slice(0, 40)
-    return {
-      category: rule.category,
-      evidence: rule.source.slice(0, 120),
-      keyword: keyword || rule.category,
+    for (const found of hay.matchAll(rule.re)) {
+      if (rule.category === 'distill' && isNegatedExtraction(hay, found.index)) continue
+      const keyword = String(found[0] || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 40)
+      return {
+        category: rule.category,
+        evidence: rule.source.slice(0, 120),
+        keyword: keyword || rule.category,
+      }
     }
   }
   return null
