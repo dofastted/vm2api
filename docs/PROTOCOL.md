@@ -8,9 +8,15 @@
 
 ## CRAG native V2 部署边界
 
-仅 `dataplane: "crag"` 且显式 `crag_kernel_version: "v2"` 的本地 Linux Docker 槽采用 native V2；省略版本仍选 legacy ELF。`KIN_CRAG_V2_ROOT` 指向解压后的原生发布目录，必须包含 native manifest、完整 SHA-256 成员、可执行且架构匹配的 `crag-v2` 与官方 Claude，不接受旧 Node V2 包或未 bundled 的独立部署变体。
+仅 `dataplane: "crag"` 且显式 `crag_kernel_version: "v2"` 的本地 Linux Docker 槽采用 native V2；省略版本仍选 legacy ELF。`KIN_CRAG_V2_ROOT` 指向解压后的签名加密发布目录，必须包含 `encrypted: true` native manifest、完整 SHA-256 成员、架构匹配的 `crag-v2` 启动器、签名 `crag-v2.payload.enc`、发布公钥与官方 Claude；不接受旧 Node、明文 native V2 或未 bundled 的独立部署变体。
 
 物化后的 `.kin/kin-kernel` 直接 exec `.kin/crag-v2/crag-v2`，Claude 位于 `.kin/crag-v2/claude-code-2.1.317/claude`；不复制 Node 或注入旧 CLI 版本。替换产物后沿用现有显式 idle-restart 流程；写 `kernel.json` 本身不新增自动重启。判断 idle 必须计入 active、waiting-tool、queued 和实际 PID，不能把 runnable ceiling 与物理容量之差当作运行任务数。
+
+所有 CRAG 选择与正常 hop 都要求该 VM 的离线注册码；V2 原生网关再次校验签名、设备绑定和当前 UTC 到期时间。缺失/无效/错误 VM/未生效/已到期均为终态 403，不当作 OAuth 刷新、模型策略、账号冷却或 Go 回退。cli-node/wrap 不要求 CRAG 注册码。
+
+槽详情「推理内核」提供机器码复制、注册码激活/替换，以及签名内的期限、生效时间和到期时间；无授权点击 CRAG 会进入激活，不提前改 VM 配置或停内核。期限只能由供应方签发为 1个月/半年/1年（UTC 自然月 1/6/12，月底收敛），客户不能直接改过期时间。错误替换码不破坏现有有效授权，续期只换授权，不隐式切换内核。
+
+设备私钥/注册码保存在与现有 worker run 映射一致的 Linux 私有目录；保留运行数据与 machine-id 的普通容器重建保留授权，复制到不同 VM/设备无效。不要把 `license_dir` 放在 WSL DrvFS。启动器只在 sealed memfd 解密业务程序，不写明文；客户包不含供应方私钥/产品 AES key。离线授权不支持远程吊销，不能可靠阻止 root 回拨时间或复制全部设备材料。
 
 
 ## 官方 Claude Code 判定

@@ -432,6 +432,14 @@ export function mapUpstreamError(status, body, headers = {}) {
     (upType ? body?.message : null) ||
     body?.raw ||
     null
+  if (/^license_(required|expired|not_yet_valid|invalid|binding_mismatch|unconfigured)$/.test(inboundCode)) {
+    return makeError({
+      type: ErrorType.PERMISSION,
+      code: inboundCode,
+      message: String(msg || 'CRAG registration is required.'),
+      status: 403,
+    })
+  }
   if (inboundCode === ErrorCode.FABLE_REQUIRES_MAX) {
     return makeError({
       type: ErrorType.RATE_LIMIT,

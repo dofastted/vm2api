@@ -227,7 +227,7 @@ import { preflightNode } from '../cluster/placement.mjs'
 import { probeLocalKvm } from '../vm/kvm-host.mjs'
 import { normalizeVmConfig, resolveMachineSpec, validateVmConfigPatch } from '../vm/machine-spec.mjs'
 import { raiseDockerSlotMemory } from '../vm/docker-slot-memory.mjs'
-import { RUNTIME_KVM } from '../vm/runtime-kind.mjs'
+import { isKvmRuntime, RUNTIME_KVM } from '../vm/runtime-kind.mjs'
 import { hostProxyUrlForVm, slotHost } from '../vm/slot-host.mjs'
 import { syncIpv6ProxyEgress } from '../vm/proxy-policy-runtime.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
@@ -278,6 +278,7 @@ import { restartRustKernel, syncClaudeKernelConfigs, writeKernelConfig } from '.
 import { countTokensViaWorker } from '../transport/go-worker-client.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from '../protocol/claude-code-betas.mjs'
 import { rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
+import { activateCragLicense, checkCragLicense, CragLicenseError, getCragLicense } from '../vm/crag-license.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
@@ -1073,6 +1074,8 @@ export function createPanelHandler(ctx) {
     const targetDataplane = resolveKernelDataplane(desired, ctx.routingConfig)
     const previousVersion = resolveCragKernelVersion(current, ctx.routingConfig)
     const targetVersion = resolveCragKernelVersion(desired, ctx.routingConfig)
+    const licensed = checkCragLicense(cfg.paths.project, desired, ctx.routingConfig)
+    if (!licensed.ok) return { ...licensed, id }
     const dataplaneChanged = previousDataplane !== targetDataplane
     const versionChanged =
       previousVersion !== targetVersion && (previousDataplane === 'crag' || targetDataplane === 'crag')
@@ -2756,6 +2759,39 @@ export function createPanelHandler(ctx) {
         return json(res, 200, panel.ok({ vm: summarizeVm(saved, cfg.paths.project, ctx.routingConfig) }))
       }
 
+      if (['GET', 'POST'].includes(req.method) && /^\/api\/panel\/vms\/[^/]+\/crag-license$/.test(p)) {
+        if (panelIdentity(req).role !== 'admin')
+          return json(res, 403, {
+            ok: false,
+            error: { code: 'forbidden', message: 'CRAG activation requires an administrator.' },
+          })
+        const vm = getVm(cfg.paths.project, p.split('/')[4])
+        if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
+        if (isCodexVm(vm) || vm.node_id || isKvmRuntime(vm))
+          return json(res, 400, {
+            ok: false,
+            error: {
+              code: 'crag_v2_unsupported_placement',
+              message: 'CRAG activation requires a local Linux Docker Claude slot.',
+            },
+          })
+        try {
+          if (req.method === 'GET')
+            return json(res, 200, panel.ok(getCragLicense(cfg.paths.project, vm, { initialize: true })))
+          const body = await readBody(req, 32768)
+          return json(res, 200, panel.ok(activateCragLicense(cfg.paths.project, vm, body?.registration_code)))
+        } catch (error) {
+          const typed = error instanceof CragLicenseError
+          return json(res, typed ? 403 : 400, {
+            ok: false,
+            error: {
+              code: typed ? error.code : 'license_invalid',
+              message: typed ? error.message : 'The CRAG activation request is invalid.',
+            },
+          })
+        }
+      }
+
       // GET /api/panel/vms/:id
       if (req.method === 'GET' && /^\/api\/panel\/vms\/[^/]+$/.test(p)) {
         const id = p.split('/').pop()
@@ -2920,6 +2956,13 @@ export function createPanelHandler(ctx) {
         if (hasSlotPolicy) {
           const parsed = parseSlotEnginePolicyPatch(body)
           if (!parsed.ok) return json(res, 400, { ok: false, error: { message: parsed.error } })
+          const licensed = checkCragLicense(
+            cfg.paths.project,
+            vmWithSlotPolicyPatch(currentVm, parsed.patch),
+            ctx.routingConfig,
+          )
+          if (!licensed.ok)
+            return json(res, 403, { ok: false, error: { code: licensed.code, message: licensed.error } })
         }
         let timezoneSync = null
         if (hasTimezone) {
@@ -3009,9 +3052,11 @@ export function createPanelHandler(ctx) {
             const status =
               slotPolicyResult.code === 'vm_not_found'
                 ? 404
-                : slotPolicyResult.code === 'gpt_engine_forbidden'
-                  ? 400
-                  : 503
+                : slotPolicyResult.code?.startsWith('license_')
+                  ? 403
+                  : slotPolicyResult.code === 'gpt_engine_forbidden'
+                    ? 400
+                    : 503
             return json(res, status, {
               ok: false,
               error: {

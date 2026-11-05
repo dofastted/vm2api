@@ -785,6 +785,7 @@ test('writeKernelConfig adds CRAG v2 fields only for a pinned local slot', () =>
       fs.readFileSync(writeKernelConfig(root, { id: 'vm-09', dataplane: 'crag' }, { token: 'tok' }).configPath, 'utf8'),
     )
     assert.equal(legacy.claude_bin, '/home/kincli/.kin/cc-node')
+    assert.equal(legacy.license_dir, '/run/kin/crag-license')
     assert.equal(legacy.crag_v2_root, undefined)
     assert.equal(legacy.node_bin, undefined)
     const v2 = JSON.parse(
@@ -798,6 +799,7 @@ test('writeKernelConfig adds CRAG v2 fields only for a pinned local slot', () =>
     assert.equal(v2.claude_bin, '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude')
     assert.equal(v2.crag_kernel_version, 'v2')
     assert.equal(v2.runtime_variant, 'crag-v2')
+    assert.equal(v2.license_dir, '/run/kin/crag-license')
     assert.equal(v2.crag_v2_root, undefined)
     assert.equal(v2.node_bin, undefined)
     assert.equal(v2.telemetry.identity, undefined)

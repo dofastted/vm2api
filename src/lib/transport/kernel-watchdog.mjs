@@ -26,6 +26,8 @@ import { resolveInferenceEngine } from '../vm/slot-engine.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { dockerRequest } from '../cluster/docker-remote.mjs'
 import { clusterManager, vmNodeId } from '../cluster/placement.mjs'
+import path from 'node:path'
+import { checkCragLicense } from '../vm/crag-license.mjs'
 
 /** A failed observation is not evidence of a dead container. Use the slot's own host, including KVM runners. */
 export async function observeWatchdogContainer(
@@ -229,6 +231,9 @@ export function createKernelWatchdog({
   }
 
   async function checkVm(vm, routing) {
+    const home = typeof homeDirFor === 'function' ? homeDirFor(vm) : null
+    const licensed = checkCragLicense(home ? path.resolve(home, '../../..') : '', vm, routing)
+    if (!licensed.ok) return // Activation, not container recovery, repairs licensing failures.
     const probed = probeVm(vm)
     if (!probed) {
       // The kernel cannot be probed without its relay; only a container that is really down is revived.

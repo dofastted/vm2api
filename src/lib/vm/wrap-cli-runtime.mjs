@@ -18,6 +18,7 @@ import { isCodexVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { nativeCliForVm, NATIVE_CLI_FILES } from './native-cli.mjs'
 import { resolveCragKernelVersion, resolveKernelDataplane } from './slot-engine.mjs'
+import { checkCragLicense, decodeLicenseBytes } from './crag-license.mjs'
 
 export const WRAP_CLI_BIN = 'cli-node'
 export const CC_NODE_BIN = 'cc-node'
@@ -152,7 +153,7 @@ function listCragV2Files(dir, prefix = '') {
   return rows
 }
 
-function verifyCragV2Tree(dir) {
+export function verifyCragV2Tree(dir) {
   try {
     const root = fs.lstatSync(dir)
     if (root.isSymbolicLink())
@@ -183,7 +184,7 @@ function verifyCragV2Tree(dir) {
       error: `CRAG v2 arch ${manifest.arch} does not match ${cragV2Arch()}`,
     }
   }
-  if (manifest.runtime !== 'native' || manifest.entrypoint !== CRAG_V2_ENTRY) {
+  if (manifest.encrypted !== true || manifest.runtime !== 'native' || manifest.entrypoint !== CRAG_V2_ENTRY) {
     return {
       ok: false,
       code: 'crag_v2_manifest_invalid',
@@ -197,7 +198,7 @@ function verifyCragV2Tree(dir) {
     return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 manifest sha256 map is missing' }
   }
   const expected = new Set(Object.keys(manifest.sha256))
-  for (const required of [CRAG_V2_ENTRY, CRAG_V2_CLAUDE]) {
+  for (const required of [CRAG_V2_ENTRY, CRAG_V2_CLAUDE, 'crag-license-public.pem', 'crag-v2.payload.enc']) {
     if (!expected.has(required)) {
       return { ok: false, code: 'crag_v2_manifest_invalid', error: `CRAG v2 manifest does not hash ${required}` }
     }
@@ -211,6 +212,21 @@ function verifyCragV2Tree(dir) {
       rel.split('/').some((part) => !part || part === '.' || part === '..')
     ) {
       return { ok: false, code: 'crag_v2_manifest_invalid', error: `CRAG v2 manifest path is unsafe: ${rel}` }
+    }
+    if (!/^[a-f0-9]{64}$/.test(manifest.sha256[rel])) {
+      return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 hashes must be lowercase SHA-256' }
+    }
+    if (
+      rel === 'crag-v2-core' ||
+      /(?:^|\/)(?:src|node_modules)(?:\/|$)/.test(rel) ||
+      /\.(?:[cm]?js|rs|pem\.key)$/.test(rel) ||
+      /(?:private|payload-key|crag-license(?:\.exe)?$)/i.test(rel)
+    ) {
+      return {
+        ok: false,
+        code: 'crag_v2_manifest_invalid',
+        error: 'CRAG v2 package contains prohibited plaintext or supplier material',
+      }
     }
     if (!present.has(rel)) return { ok: false, code: 'crag_v2_hash_mismatch', error: `CRAG v2 package missing ${rel}` }
   }
@@ -226,6 +242,12 @@ function verifyCragV2Tree(dir) {
     }
     const requiredElf = rel === CRAG_V2_ENTRY || rel === CRAG_V2_CLAUDE
     if (requiredElf || body.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]))) {
+      if (!requiredElf)
+        return {
+          ok: false,
+          code: 'crag_v2_manifest_invalid',
+          error: 'CRAG v2 may only ship the native bootstrap and separate official Claude executables',
+        }
       if (
         body.length < 64 ||
         body.readUInt32BE(0) !== 0x7f454c46 ||
@@ -248,6 +270,51 @@ function verifyCragV2Tree(dir) {
         return { ok: false, code: 'crag_v2_elf_invalid', error: `CRAG v2 executable permission is missing: ${rel}` }
       }
     }
+  }
+  try {
+    const auth = manifest.authorization
+    const payload = manifest.payload
+    const pem = fs.readFileSync(path.join(dir, 'crag-license-public.pem'), 'utf8')
+    if (!/^-----BEGIN PUBLIC KEY-----\s+[A-Za-z0-9+/=\r\n]+-----END PUBLIC KEY-----\s*$/.test(pem))
+      throw new Error('public key')
+    const pub = crypto.createPublicKey(pem)
+    const raw = pub.export({ format: 'der', type: 'spki' }).subarray(-32)
+    if (
+      pub.asymmetricKeyType !== 'ed25519' ||
+      auth?.scheme !== 'ed25519-x25519-v1' ||
+      auth.product !== 'crag-v2' ||
+      !decodeLicenseBytes(auth.public_key, 32).equals(raw) ||
+      auth.public_key_id !== crypto.createHash('sha256').update(raw).digest('hex') ||
+      payload?.path !== 'crag-v2.payload.enc' ||
+      payload.format !== 'CRAGV2E1' ||
+      payload.algorithm !== 'aes-256-gcm' ||
+      ![payload.key_id, payload.plaintext_sha256, payload.ciphertext_sha256].every(
+        (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value),
+      ) ||
+      payload.ciphertext_sha256 !== manifest.sha256[payload.path]
+    )
+      throw new Error('metadata')
+    const bytes = fs.readFileSync(path.join(dir, payload.path))
+    if (bytes.length <= 36 || bytes.subarray(0, 8).toString('ascii') !== 'CRAGV2E1') throw new Error('payload')
+    const signed = {
+      product: 'crag-v2',
+      format: payload.format,
+      algorithm: payload.algorithm,
+      key_id: payload.key_id,
+      plaintext_sha256: payload.plaintext_sha256,
+      ciphertext_sha256: payload.ciphertext_sha256,
+    }
+    if (
+      !crypto.verify(
+        null,
+        Buffer.concat([Buffer.from('CRAG-PAYLOAD-V1\0'), Buffer.from(JSON.stringify(signed))]),
+        pub,
+        decodeLicenseBytes(payload.signature, 64),
+      )
+    )
+      throw new Error('signature')
+  } catch {
+    return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 encrypted package authorization is invalid' }
   }
   return { ok: true, manifest }
 }
@@ -340,6 +407,8 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null } = 
   }
   const verified = verifyCragV2Tree(src)
   if (!verified.ok) return verified
+  const licensed = checkCragLicense(projectRoot, { ...vm, dataplane: 'crag' })
+  if (!licensed.ok) return licensed
   const dest = wrapCliHomeDir(projectRoot, vm.id)
   fs.mkdirSync(dest, { recursive: true })
   if (!cragV2WouldChange(src, dest)) {
@@ -679,6 +748,8 @@ export function materializeCragKernel(projectRoot, vm, { uid = null, gid = null 
   if (!projectRoot || !vm?.id) {
     return { ok: false, code: 'vm_required', error: 'projectRoot and vm id required' }
   }
+  const licensed = checkCragLicense(projectRoot, { ...vm, dataplane: 'crag' })
+  if (!licensed.ok) return licensed
   const src = cragKernelPath(projectRoot)
   if (!src) {
     return {

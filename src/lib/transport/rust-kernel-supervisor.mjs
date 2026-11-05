@@ -45,6 +45,8 @@ import { slotHost } from '../vm/slot-host.mjs'
 import { buildNativeTelemetry } from '../vm/native-telemetry.mjs'
 import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { RETIRE_LEGACY_TELEMETRY } from '../vm/slot-process-status.mjs'
+import { checkCragLicense } from '../vm/crag-license.mjs'
+import { workerPaths } from './go-worker-client.mjs'
 
 /** The native host is authenticated separately from account scheduling readiness. */
 function runtimeReady(health, allowMissingCredential) {
@@ -661,6 +663,10 @@ async function startRustKernel(
   exec,
   { timeoutMs, healthTimeoutMs = 800, control, runDockerExec, force = false, allowMissingCredential = false },
 ) {
+  const licensed = checkCragLicense(projectRootFromExec(exec), exec?.vm, {
+    inference: { dataplane: readExistingKernelConfig(rustKernelPaths(exec).configPath).dataplane },
+  })
+  if (!licensed.ok) return { ...licensed, reason: licensed.code }
   if (exec?.homeDir) {
     const ids = slotUidGidFromHomeDir(exec.homeDir)
     ensureOfficialCredentialLink(exec.homeDir, ids || {})
@@ -788,9 +794,14 @@ export function writeKernelConfig(
   vm,
   { token, proxyUrl, proxyRequired, officialCcInference, timezone, routing, publish = true } = {},
 ) {
-  const root = String(process.env.KIN_SLOT_RUN_ROOT || '').trim()
-  const runDir = root ? path.join(root, vm.id) : path.join(projectRoot, 'vms', vm.id, 'run')
+  // Callers pass partial vm snapshots; persisted placement owns the guest run mount.
+  const record = getVm(projectRoot, vm.id) || vm
   const homeDir = path.join(projectRoot, 'vms', vm.id, 'cli-home')
+  const runDir = workerPaths({
+    vm: record,
+    homeDir,
+    runRoot: String(process.env.KIN_SLOT_RUN_ROOT || '').trim(),
+  }).runDir
   const privileged = typeof process.getuid === 'function' && process.getuid() === 0
   const dirMode = privileged ? 0o700 : 0o2770
   fs.mkdirSync(runDir, { recursive: true, mode: dirMode })
@@ -820,8 +831,6 @@ export function writeKernelConfig(
   const testEndpoints = process.env.KIN_KERNEL_TEST_ENDPOINTS === '1'
   const dataplane = resolveKernelDataplane(vm, routing || {}) || 'wrap'
   const envBin = String(process.env.KIN_CLAUDE_BIN || '').trim()
-  // Callers pass partial vm snapshots (summaries, exec contexts); the vm json decides placement.
-  const record = getVm(projectRoot, vm.id) || vm
   const host = slotHost(record)
   // A macOS node runs the kernel on the host itself: real node paths instead of the container mounts.
   // Unknown until that node has connected once; the slot's own start writes the config then.
@@ -884,6 +893,7 @@ export function writeKernelConfig(
     test_endpoints: testEndpoints,
     provider: 'local_cli',
     dataplane,
+    ...(dataplane === 'crag' ? { license_dir: '/run/kin/crag-license' } : {}),
     claude_bin: claudeBin,
     slots_per_worker: wrapSlotCount(vm, routing || {}),
     persona_preset: resolveSlotPersonaPreset(vm, routing || {}),

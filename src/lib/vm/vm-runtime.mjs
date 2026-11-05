@@ -15,6 +15,8 @@ import { runtimeKind, isKvmRuntime, RUNTIME_KVM } from './runtime-kind.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { kernelBinPath, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
+import { checkCragLicense } from './crag-license.mjs'
+import { workerPaths as transportWorkerPaths } from '../transport/go-worker-client.mjs'
 import {
   assertCliHopAllowed,
   resolveKernelDataplane,
@@ -340,12 +342,13 @@ export function runtimePatch(vm, info, extra = {}) {
   return vm
 }
 
-function workerPaths(projectRoot, vmId) {
+function workerPaths(projectRoot, vmId, vm = { id: vmId }) {
   const slotRoot = path.join(projectRoot, 'vms', vmId)
-  // Docker Desktop on WSL hides Unix sockets created on the mounted project
-  // disk. A local deploy can point the slot runtime at a persistent Linux path.
-  const root = String(process.env.KIN_SLOT_RUN_ROOT || '').trim()
-  const runDir = root ? path.join(root, vmId) : path.join(slotRoot, 'run')
+  const runDir = transportWorkerPaths({
+    vm,
+    homeDir: path.join(slotRoot, 'cli-home'),
+    runRoot: String(process.env.KIN_SLOT_RUN_ROOT || '').trim(),
+  }).runDir
   return {
     slotRoot,
     runDir,
@@ -444,10 +447,12 @@ export function slotWorkerNeedsRecreate(existing, vm, paths) {
  * KVM restarts the guest kin-kernel unit; docker restart would reboot the VM.
  */
 export async function reloadSlotWorker(vm, projectRoot, { routing } = {}) {
+  const licensed = checkCragLicense(projectRoot, vm, resolveSlotRouting(projectRoot, routing))
+  if (!licensed.ok) return licensed
   if (!vm?.id) return { ok: false, error: 'vm required' }
   // Outside the cached-config fallback: invalid quotas must never reach restart.
   if (!isKvmRuntime(vm)) slotDockerCpus(vm)
-  const paths = workerPaths(projectRoot, vm.id)
+  const paths = workerPaths(projectRoot, vm.id, vm)
   const name = containerName(vm.id)
   let worker
   try {
@@ -533,7 +538,7 @@ function resolveSlotRouting(projectRoot, routing) {
 
 export function writeWorkerFiles(vm, projectRoot, { transparent, routing } = {}) {
   assertProxyAllowed(vm.proxy)
-  const paths = workerPaths(projectRoot, vm.id)
+  const paths = workerPaths(projectRoot, vm.id, vm)
   const uid = runtimeUidNum(vm)
   const gid = Number(GID)
   const root = typeof process.getuid === 'function' && process.getuid() === 0
@@ -946,6 +951,8 @@ export function dockerSlotResourceArgs(vm, routing) {
 }
 
 export async function startVmRuntime(vm, projectRoot, { recreate = false, routing, accel: accelOpt } = {}) {
+  const licensed = checkCragLicense(projectRoot, vm, resolveSlotRouting(projectRoot, routing))
+  if (!licensed.ok) return licensed
   if (!isKvmRuntime(vm)) slotDockerCpus(vm) // reject corrupt persisted quotas before any lifecycle changes
   if (isKvmRuntime(vm) && accelOpt !== 'kvm' && accelOpt !== 'tcg') {
     const recorded = vm.runtime?.accel
@@ -990,7 +997,7 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
   }
   const restartPolicy = updateSlotRestartPolicy(vm, existing, sh)
   if (!restartPolicy.ok) return { ok: false, error: restartPolicy.stderr || 'slot restart policy update failed' }
-  const paths = workerPaths(projectRoot, vm.id)
+  const paths = workerPaths(projectRoot, vm.id, vm)
   const replace = recreate || !slotKernelAlive(existing, paths, vm) || codexContainerStale(existing, vm)
   // Node restart / 开机 must not bounce a live slot with a healthy worker.
   if (existing?.running && !replace) {

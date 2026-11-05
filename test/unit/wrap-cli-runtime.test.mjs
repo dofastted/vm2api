@@ -23,13 +23,16 @@ import {
   wrapCliTemplateDir,
 } from '../../src/lib/vm/wrap-cli-runtime.mjs'
 import { listVms } from '../../src/lib/vm/vm-registry.mjs'
+import { activateFixture, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
 const prevKernelBin = process.env.KIN_KERNEL_BIN
 const prevCragV2Root = process.env.KIN_CRAG_V2_ROOT
+const prevRunRoot = process.env.KIN_SLOT_RUN_ROOT
 
 before(() => {
   delete process.env.KIN_KERNEL_BIN
   delete process.env.KIN_CRAG_V2_ROOT
+  delete process.env.KIN_SLOT_RUN_ROOT
 })
 
 after(() => {
@@ -37,6 +40,8 @@ after(() => {
   else process.env.KIN_KERNEL_BIN = prevKernelBin
   if (prevCragV2Root == null) delete process.env.KIN_CRAG_V2_ROOT
   else process.env.KIN_CRAG_V2_ROOT = prevCragV2Root
+  if (prevRunRoot == null) delete process.env.KIN_SLOT_RUN_ROOT
+  else process.env.KIN_SLOT_RUN_ROOT = prevRunRoot
 })
 
 function seedTemplate(root) {
@@ -87,6 +92,7 @@ test('crag materialize copies the crag kernel and cc-node', () => {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-cc-'))
   try {
     seedTemplate(project)
+    seedV2Package(project)
     fs.mkdirSync(path.join(project, 'share', 'crag'), { recursive: true })
     fs.writeFileSync(path.join(project, 'share', 'crag', 'kin-kernel'), 'crag-kernel')
     const result = materializeSlotDataplane(project, { id: 'vm-13' }, 'crag')
@@ -102,6 +108,7 @@ test('crag inspection reports a change and sync marks the kernel for restart', (
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-change-'))
   try {
     seedTemplate(project)
+    seedV2Package(project)
     const crag = path.join(project, 'share', 'crag', 'kin-kernel')
     fs.mkdirSync(path.dirname(crag), { recursive: true })
     fs.writeFileSync(crag, 'crag-kernel')
@@ -445,34 +452,9 @@ function sha256(body) {
   return crypto.createHash('sha256').update(body).digest('hex')
 }
 
-function seedV2Package(project, { revision = '' } = {}) {
-  const useArch = process.arch === 'x64' ? 'amd64' : process.arch === 'arm64' ? 'arm64' : process.arch
-  const dir = path.join(project, 'share', 'crag', 'kernels', 'v2', useArch)
-  fs.mkdirSync(path.join(dir, 'claude-code-2.1.317'), { recursive: true })
-  // Structural ELF fixtures validate membership and machine checks, not Claude execution.
-  const worker = fakeElf64Amd64(`native-fixture-${revision}`)
-  worker[6] = 1
-  worker.writeUInt16LE(useArch === 'arm64' ? 183 : 62, 18)
-  worker.writeUInt32LE(1, 20)
-  worker.writeUInt16LE(64, 52)
-  const claude = Buffer.from(worker)
-  fs.writeFileSync(path.join(dir, 'crag-v2'), worker, { mode: 0o755 })
-  fs.writeFileSync(path.join(dir, 'claude-code-2.1.317', 'claude'), claude, { mode: 0o755 })
-  fs.writeFileSync(
-    path.join(dir, 'manifest.json'),
-    JSON.stringify({
-      family: 'crag',
-      version: 'v2',
-      arch: useArch,
-      runtime: 'native',
-      entrypoint: 'crag-v2',
-      capabilities: ['official_full', 'zero', 'cancel', 'telemetry', 'unix_socket_envelope'],
-      sha256: {
-        'crag-v2': sha256(worker),
-        'claude-code-2.1.317/claude': sha256(claude),
-      },
-    }),
-  )
+function seedV2Package(project, options = {}) {
+  const dir = seedEncryptedPackage(project, options)
+  activateFixture(project)
   return dir
 }
 
@@ -781,7 +763,13 @@ test('CRAG v2 publishes complete upgrades, repairs damaged installs, and leaves 
     const upgraded = materializeResolvedKernel(project, vm)
     assert.equal(upgraded.ok, true)
     assert.equal(upgraded.kernel_changed, true)
-    for (const member of ['manifest.json', 'crag-v2', 'claude-code-2.1.317/claude']) {
+    for (const member of [
+      'manifest.json',
+      'crag-v2',
+      'crag-v2.payload.enc',
+      'crag-license-public.pem',
+      'claude-code-2.1.317/claude',
+    ]) {
       assert.deepEqual(fs.readFileSync(path.join(dest, 'crag-v2', member)), fs.readFileSync(path.join(dir, member)))
     }
     assert.equal(materializeResolvedKernel(project, vm).changed, false)
