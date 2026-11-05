@@ -9,7 +9,7 @@ import type {
   VmSeedSettings,
   VmsListResponse,
 } from '@/types/panel-vm'
-import { api } from '@/lib/api'
+import { api, getVmCragLicense } from '@/lib/api'
 
 /** 创建表单默认规格 + 本机 KVM 能力。ACL 与 POST /vms/create 相同，租户可读。 */
 export function vmCreateOptionsQueryOptions() {
@@ -40,6 +40,15 @@ export function vmQueryOptions(id: string) {
     queryKey: ['panel', 'vm', id] as const,
     queryFn: () =>
       api<VmDetailPayload>(`/api/panel/vms/${encodeURIComponent(id)}`),
+  })
+}
+
+export function vmCragLicenseQueryOptions(id: string) {
+  return queryOptions({
+    queryKey: ['panel', 'vm', id, 'crag-license'] as const,
+    queryFn: () => getVmCragLicense(id),
+    staleTime: 0,
+    retry: false,
   })
 }
 
