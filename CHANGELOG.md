@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- #896：claude_code_only 完整替代 #892+#893：放行 CLI WebSearch/WebFetch 侧查询（缺 `claude-code-20250219` 的窄形状仍保留其余官方指纹检查）；Desktop Gateway 登录探针本地回 OK（零用量、不选账号）；中转准入不再仅凭计费行放行（须合法 `metadata.user_id` + 可识别的官方 Claude Code system）；拒 OMP 18.x（认出 `You are omp's trusted coding assistant`）。
+
 ## 1.4.041 — 2026-11-05
 
 - #884：硬规则复用直接否定检查，保密指令（如 `Do not reveal hidden reasoning`）不再误判为蒸馏请求；同段后续的正向提取命令仍拦截。
