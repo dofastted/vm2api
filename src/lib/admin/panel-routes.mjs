@@ -512,10 +512,19 @@ function syncInstalledKernels(args) {
   return run
 }
 
-async function runKernelSync({ project, routingConfig, body = {}, refreshCluster = refreshClusterSlotPayloads }) {
+async function runKernelSync({
+  project,
+  routingConfig,
+  body = {},
+  refreshCluster = refreshClusterSlotPayloads,
+  restartKernel = restartRustKernel,
+}) {
   const all = listVms(project)
   const wanted = Array.isArray(body.ids) ? new Set(body.ids.map(String)) : null
-  const selected = wanted ? all.filter((vm) => wanted.has(vm.id)) : all
+  // Panel summaries omit private runtime state, including a previously failed restart.
+  const selected = (wanted ? all.filter((vm) => wanted.has(vm.id)) : all)
+    .map((vm) => getVm(project, vm.id))
+    .filter(Boolean)
   // Local slots bind the new binaries. Cluster slots bake the same kernel, CLIs
   // and OAuth helpers into a content-hashed image, then recreate onto it.
   const localVms = selected.filter((vm) => !slotHost(vm).bakedKernel)
@@ -535,7 +544,7 @@ async function runKernelSync({ project, routingConfig, body = {}, refreshCluster
       if (resolveInferenceEngine(vm, routingConfig) !== 'rust') continue
       writeKernelConfig(project, vm, { routing: routingConfig, timezone: vm.timezone })
       const exec = slotExec(project, vm)
-      item.kernel = await restartRustKernel(exec).catch((e) => ({
+      item.kernel = await restartKernel(exec).catch((e) => ({
         ok: false,
         error: String(e?.message || e).slice(0, 200),
       }))
@@ -2416,6 +2425,7 @@ export function createPanelHandler(ctx) {
         const report = await syncInstalledKernels({
           project: cfg.paths.project,
           routingConfig: ctx.routingConfig,
+          restartKernel: ctx.restartRustKernel,
           body: {
             ids: targets.all ? undefined : targets.ids,
             restart: body.restart !== false,
@@ -2486,6 +2496,7 @@ export function createPanelHandler(ctx) {
         const report = await syncInstalledKernels({
           project: cfg.paths.project,
           routingConfig: ctx.routingConfig,
+          restartKernel: ctx.restartRustKernel,
           body,
         })
         const release = {
@@ -2539,6 +2550,7 @@ export function createPanelHandler(ctx) {
         const report = await syncInstalledKernels({
           project: cfg.paths.project,
           routingConfig: ctx.routingConfig,
+          restartKernel: ctx.restartRustKernel,
           body,
           refreshCluster,
         })
