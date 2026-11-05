@@ -246,10 +246,10 @@ function matchNeedles(text, needles) {
   }
   return ''
 }
-function isNegatedExtraction(text, index) {
+export function isNegatedExtraction(text, index) {
   // A ban on disclosing reasoning is not itself a request to extract it.
   // Only ignore a directly negated match; another match later in the prompt still blocks.
-  return /\b(?:do not|don't|never|must not|should not)\s+$/i.test(text.slice(0, index))
+  return /\b(?:do\s+not|don't|never|must\s+not|should\s+not)\s+$/i.test(text.slice(0, index))
 }
 
 function matchPatterns(text, patterns) {
