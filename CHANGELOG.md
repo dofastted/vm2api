@@ -12,6 +12,12 @@
 - CRAG V2 发布协议切换到原生 ELF（`runtime: native`、`entrypoint: crag-v2`）：验证实际架构、完整 SHA 成员与安全路径，原子物化并直接执行，不再复制 Node 或写出 `node_bin` / `crag_v2_root`。保留 legacy 版本选择和 Linux Docker 放置限制；真实 CLI 版本由 native worker 探测。
 - native V2 生命周期探测、停止、切换回收和 idle reload 识别新进程名；动态 runnable 上限不再被误算为占用任务。配置写入本身不触发额外热重载，沿用显式空闲重启流程。
 
+## 1.4.044 — 2026-11-05
+
+- #890：修复本地转发代理的 lazy CONNECT 误判：SOCKS 成功但隧道没有应用层响应时不再标记健康。探测先要求经隧道完成 TLS 握手，TLS 不可用时回退到经隧道的 TCP DNS；延迟改为完整探测往返。
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
 ## 1.4.043 — 2026-11-05
 
 - #885：没写 `max_tokens` 时用模型目录的 `max_tokens_default`（例如 Haiku 5.5 为 100000，Sonnet 5 为 64000），不再一律填 128000。写了且低于 `compatibility.min_max_tokens.value` 时默认仍抬到该值；模式「不改」/ `preserve` / `unchanged` 或面板「不抬升」则不抬。未指定有效模式时兼容 `no_raise: true` / `raise: false`，显式模式优先。超过该模型 `max_tokens_cap` 仍会下调。`enabled` thinking 的 `budget_tokens` 不小于 `max_tokens` 时，仍用该配置值补 thinking 合法间隔。
@@ -30,11 +36,6 @@
 已部署机升级：更新 Node 控制面与 `web/dist` 后重启，启动时自动迁移端点开关字段。不更换 CRAG / CLI payload，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
 ## 1.4.041 — 2026-11-05
-
-- #884：硬规则复用直接否定检查，保密指令（如 `Do not reveal hidden reasoning`）不再误判为蒸馏请求；同段后续的正向提取命令仍拦截。
-- #835：Messages 转 Codex 保留有序的 `tool_use` / `tool_result` 历史、调用 ID、JSON 参数及字符串/文本块结果，修复工具返回值丢失导致的重复调用。
-- #862：“我的密钥”在服务端按认证用户隔离列表、统计和全部密钥操作，管理员不能读取或操作其他用户的密钥，也不能通过 `user_id` 转移归属；Master 仅管理无归属的平台密钥。
-- #834：槽位同步从完整 VM 记录读取待重启状态；即使 payload 未变也能重试待办，仅在重启成功后清除，检查模式、停止槽和失败重启保留标记。
 - 新增可选 `compatibility.preserve_pruned_tool_results`：在槽位Claude推理中，按认证密钥和DSH会话隔离保存成功请求的有限工具原文；精确识别默认工具文本裁剪后恢复原始前缀，避免小幅历史裁剪造成整段缓存重写。真实编辑/压缩、失败/重试、并发歧义和内存/上下文预算不足时不恢复；缺省关闭，不改变客户端配置或API直连端点。
 
 ## 1.4.038 — 2026-11-04

@@ -12,6 +12,7 @@
 import { EventEmitter } from 'node:events'
 import net from 'node:net'
 import crypto from 'node:crypto'
+import tls from 'node:tls'
 import { resolveStoreDb } from '../db/database.mjs'
 import { ProxiesRepo } from '../db/repos/proxies-repo.mjs'
 import { canBindProxyToVm, normalizeOwnerId, proxyOwnerId, vmOwnerId } from '../admin/resource-owner.mjs'
@@ -56,14 +57,32 @@ const DEFAULT_CONFIG = {
 /**
  * A row on the loopback or a private address is a local forwarder (sing-box /
  * clash / 3proxy on this host). Its listener only proves the forwarder is up:
- * the node behind it is only as alive as a CONNECT through it, so probing one
- * of these rows must dial a real target. Two targets so one blocked
- * destination does not fail an otherwise healthy exit.
+ * the node behind it is only as alive as an application reply through it.
+ * Require a real TLS handshake first, then retry with framed DNS over TCP for
+ * exits that block TLS or 1.1.1.1. SOCKS CONNECT alone is not enough because
+ * sing-box's mixed inbound uses a lazy upstream connection.
  */
 const FORWARDER_CONNECT_TARGETS = Object.freeze([
-  Object.freeze({ host: '1.1.1.1', port: 443 }),
-  Object.freeze({ host: '8.8.8.8', port: 53 }),
+  Object.freeze({ host: '1.1.1.1', port: 443, kind: 'tls', servername: 'one.one.one.one' }),
+  Object.freeze({ host: '8.8.8.8', port: 53, kind: 'dns' }),
 ])
+
+function forwarderDnsQuery() {
+  const id = crypto.randomInt(0, 0x10000)
+  const labels = ['example', 'com']
+  const name = Buffer.concat([
+    ...labels.map((label) => Buffer.from([label.length, ...Buffer.from(label)])),
+    Buffer.from([0]),
+  ])
+  const query = Buffer.alloc(12 + name.length + 4)
+  query.writeUInt16BE(id, 0)
+  query.writeUInt16BE(0x0100, 2)
+  query.writeUInt16BE(1, 4)
+  name.copy(query, 12)
+  query.writeUInt16BE(1, 12 + name.length)
+  query.writeUInt16BE(1, 14 + name.length)
+  return query
+}
 
 export function isLocalForwarderHost(value) {
   const host = String(value || '')
@@ -1133,14 +1152,16 @@ export class ProxyPool extends EventEmitter {
     const timeout = this.state.config.probe_timeout_ms || 8000
     // Remote SOCKS endpoints *are* the proxy, so the greeting is the whole
     // check. A local forwarder only owns its listener: the node behind it is
-    // only as alive as a CONNECT through it, and only then does the measured
-    // round trip describe the tunnel instead of loopback.
+    // only as alive as an application reply through it, and only then does the
+    // measured round trip describe the tunnel instead of loopback.
     const targets = isLocalForwarderHost(host) ? FORWARDER_CONNECT_TARGETS : [null]
-    const started = Date.now()
+    // Split the operator's total probe budget across targets so a blocked
+    // first destination cannot consume the whole timeout before the fallback.
+    const attemptTimeout = targets.length > 1 ? Math.max(1, Math.floor(timeout / targets.length)) : timeout
     let last = null
     for (const target of targets) {
-      last = await this._socksProbe(proxy, host, timeout, target)
-      if (last.ok) return { ...last, latency_ms: Date.now() - started }
+      last = await this._socksProbe(proxy, host, attemptTimeout, target)
+      if (last.ok) return last
       // Auth and protocol failures answer the same for every target; only a
       // refused/unreachable destination is worth retrying elsewhere.
       if (!last.retryable) break
@@ -1152,19 +1173,29 @@ export class ProxyPool extends EventEmitter {
     return new Promise((resolve) => {
       const socket = net.connect({ host, port: proxy.port })
       this._probeSockets.set(socket, proxy)
+      const started = Date.now()
+      let activeSocket = socket
       let done = false
       let connected = false
       let greeted = false
       let phase = 'greeting'
       let buf = Buffer.alloc(0)
+      let dnsId = 0
       const finish = (ok, error, extra = {}) => {
         if (done) return
         done = true
         this._probeSockets.delete(socket)
         try {
-          socket.destroy()
+          activeSocket.destroy()
         } catch {
           /* */
+        }
+        if (activeSocket !== socket) {
+          try {
+            socket.destroy()
+          } catch {
+            /* */
+          }
         }
         const reason = proxyBlockedReason(proxy, this.state.config.ipv6_enabled)
         if (reason) {
@@ -1172,7 +1203,7 @@ export class ProxyPool extends EventEmitter {
           return
         }
         if (ok) {
-          resolve({ ok: true, latency_ms: null, error: null })
+          resolve({ ok: true, latency_ms: Date.now() - started, error: null })
           return
         }
         resolve({ ok: false, scope: 'socks', error: error || null, latency_ms: null, ...extra })
@@ -1188,6 +1219,64 @@ export class ProxyPool extends EventEmitter {
         port.writeUInt16BE(target.port)
         const ip = Buffer.from(target.host.split('.').map((n) => Number(n) & 0xff))
         socket.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x01]), ip, port]))
+      }
+      const startDnsProbe = () => {
+        phase = 'dns'
+        buf = Buffer.alloc(0)
+        const query = forwarderDnsQuery()
+        dnsId = query.readUInt16BE(0)
+        const frame = Buffer.alloc(2 + query.length)
+        frame.writeUInt16BE(query.length, 0)
+        query.copy(frame, 2)
+        socket.write(frame)
+      }
+      const startTlsProbe = () => {
+        phase = 'tls'
+        socket.removeAllListeners('data')
+        socket.removeAllListeners('connect')
+        socket.removeAllListeners('timeout')
+        socket.removeAllListeners('error')
+        socket.removeAllListeners('close')
+        socket.setTimeout(0)
+        try {
+          const secure = tls.connect({
+            socket,
+            servername: target.servername,
+            // Liveness only: the exit may terminate TLS with any certificate.
+            rejectUnauthorized: false,
+          })
+          activeSocket = secure
+          secure.setTimeout(timeout, () =>
+            finish(false, 'egress_tls_timeout：经代理 TLS 握手超时', { retryable: true }),
+          )
+          secure.once('secureConnect', () => finish(true, null))
+          secure.once('error', (err) =>
+            finish(false, `egress_tls_failed：经代理 TLS 握手失败 (${String(err?.message || err)})`, {
+              retryable: true,
+            }),
+          )
+          secure.once('close', () => {
+            if (!done) finish(false, 'egress_tls_closed：代理在 TLS 握手前断开', { retryable: true })
+          })
+          socket.once('error', (err) =>
+            finish(false, `egress_tls_failed：经代理 TLS 握手失败 (${String(err?.message || err)})`, {
+              retryable: true,
+            }),
+          )
+          socket.once('close', () => {
+            if (!done) finish(false, 'egress_tls_closed：代理在 TLS 握手前断开', { retryable: true })
+          })
+        } catch (err) {
+          finish(false, `egress_tls_failed：经代理 TLS 握手失败 (${String(err?.message || err)})`, {
+            retryable: true,
+          })
+        }
+      }
+      const startApplicationProbe = () => {
+        if (!target) return finish(true, null)
+        if (target.kind === 'tls') return startTlsProbe()
+        if (target.kind === 'dns') return startDnsProbe()
+        finish(true, null)
       }
 
       socket.setTimeout(timeout)
@@ -1242,15 +1331,37 @@ export class ProxyPool extends EventEmitter {
           // mistaken for a later phase.
           if (need < 0) return finish(false, 'not_socks5：请填写 SOCKS5 端口')
           if (buf.length < need) return
+          startApplicationProbe()
+          return
+        }
+        if (phase === 'dns') {
+          if (buf.length < 2) return
+          const need = 2 + buf.readUInt16BE(0)
+          if (buf.length < need) return
+          const response = buf.subarray(2, need)
+          if (response.length < 12 || response.readUInt16BE(0) !== dnsId || (response[2] & 0x80) === 0) {
+            return finish(false, 'egress_dns_invalid：经代理 DNS 响应无效', { retryable: true })
+          }
           finish(true, null)
         }
       })
       socket.on('timeout', () =>
-        finish(false, notSocks() || (phase === 'connect' ? 'egress_timeout：经代理连接检测目标超时' : 'timeout')),
+        finish(
+          false,
+          notSocks() ||
+            (phase === 'connect'
+              ? 'egress_timeout：经代理连接检测目标超时'
+              : phase === 'dns'
+                ? 'egress_dns_timeout：经代理 DNS 探测超时'
+                : 'timeout'),
+          phase === 'dns' ? { retryable: true } : {},
+        ),
       )
-      socket.on('error', (e) => finish(false, notSocks() || String(e.message || e)))
+      socket.on('error', (e) =>
+        finish(false, notSocks() || String(e.message || e), phase === 'dns' ? { retryable: true } : {}),
+      )
       socket.on('close', () => {
-        if (!done) finish(false, notSocks() || 'connection_closed')
+        if (!done) finish(false, notSocks() || 'connection_closed', phase === 'dns' ? { retryable: true } : {})
       })
     })
   }
