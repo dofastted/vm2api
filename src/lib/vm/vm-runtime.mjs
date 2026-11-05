@@ -20,6 +20,7 @@ import { workerPaths as transportWorkerPaths } from '../transport/go-worker-clie
 import {
   assertCliHopAllowed,
   resolveKernelDataplane,
+  resolveCragKernelVersion,
   resolveOfficialCcInference,
   resolveSlotPersonaPreset,
 } from './slot-engine.mjs'
@@ -1164,6 +1165,10 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
       '/tmp:rw,noexec,nosuid,size=32m',
       '--security-opt',
       'no-new-privileges',
+      ...(resolveKernelDataplane(vm, resolvedRouting) === 'crag' &&
+      resolveCragKernelVersion(vm, resolvedRouting) === 'v2'
+        ? ['--security-opt', `seccomp=${fileURLToPath(new URL('./crag-v2-seccomp.json', import.meta.url))}`]
+        : []),
       '--cap-drop',
       'ALL',
       '--label',

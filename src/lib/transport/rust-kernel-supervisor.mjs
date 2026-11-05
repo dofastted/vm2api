@@ -918,6 +918,8 @@ export function writeKernelConfig(
     config.crag_kernel_version = 'v2'
     config.runtime_variant = 'crag-v2'
     config.claude_bin = '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude'
+    config.asset_dir = '/run/kin/crag-native-assets'
+    config.work_dir = '/run/kin/work'
     // Native Claude owns UA/billing version; never inject a legacy profile version.
     config.cli_version = ''
     if (config.telemetry && isTelemetryEnabled(defaultSeedPolicy(record.seed_policy || {}))) {
