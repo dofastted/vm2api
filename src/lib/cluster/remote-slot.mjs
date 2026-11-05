@@ -987,7 +987,7 @@ export async function refreshClusterSlotPayloads(
   }
 }
 
-async function prepare(vm, projectRoot, routing) {
+async function prepare(vm, projectRoot, routing, { pinnedImageId = null } = {}) {
   if (resolveKernelDataplane(vm, routing || {}) === 'crag') {
     return { fail: { ok: false, code: 'remote_unsupported', error: 'crag 数据面暂不支持集群节点' } }
   }
@@ -997,7 +997,16 @@ async function prepare(vm, projectRoot, routing) {
   const nodeId = vmNodeId(vm)
   const session = await nodeSession(nodeId)
   const kind = runtimeKind(vm)
-  const spec = await ensureNodeSlotImage(session, nodeId, projectRoot, vm.kernel, kind)
+  // A cold migration must boot the exact checked base, even if its tag changes during the copy.
+  if (
+    pinnedImageId &&
+    (!/^sha256:[a-f0-9]{64}$/.test(pinnedImageId) || !(await imagePresent(session.docker, pinnedImageId)))
+  ) {
+    return { fail: { ok: false, code: 'migration_image_missing', error: '迁移锁定的原始镜像不存在' } }
+  }
+  const spec = pinnedImageId
+    ? { ref: pinnedImageId }
+    : await ensureNodeSlotImage(session, nodeId, projectRoot, vm.kernel, kind)
   if (spec.fail) return spec
   // Egress helper runs kin-egress at /usr/local/bin; kvm images bake payload under /opt/kin-guest.
   let egressImage = spec.ref
@@ -1043,10 +1052,10 @@ async function chownRemoteKvmBinds(session, name, vm) {
 }
 
 /** Remote twin of startVmRuntime. Running + same image/network is left alone (Node restart must not bounce slots). */
-export async function startRemoteSlot(vm, projectRoot, { recreate = false, routing } = {}) {
+export async function startRemoteSlot(vm, projectRoot, { recreate = false, routing, pinnedImageId = null } = {}) {
   try {
     if (!isKvmRuntime(vm)) slotDockerCpus(vm)
-    const p = await prepare(vm, projectRoot, routing)
+    const p = await prepare(vm, projectRoot, routing, { pinnedImageId })
     if (p.fail) return p.fail
     const { nodeId, session, image, egressImage, user, remoteDir, slotDir } = p
     const kvm = isKvmRuntime(vm)
