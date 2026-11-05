@@ -40,6 +40,7 @@ export type ApiEndpoint = {
   disable_cooling?: boolean
   kind?: 'claude' | 'openai' | 'custom'
   protocol?: 'anthropic' | 'openai'
+  risk_review_enabled?: boolean
   /** 上游认证方案，后端 `endpointAuthScheme()` 计算得出，openai 协议恒为 bearer。 */
   auth_scheme?: AuthScheme
   headers?: Record<string, string>

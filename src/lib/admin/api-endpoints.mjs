@@ -24,6 +24,13 @@ function trimUrl(url) {
   return trimBaseUrl(url)
 }
 
+function riskReviewEnabled(value) {
+  if (value !== undefined && typeof value !== 'boolean') {
+    throw Object.assign(new Error('risk_review_enabled must be a boolean'), { code: 'invalid_risk_review' })
+  }
+  return value === true
+}
+
 function maskUpstreamKey(key) {
   const s = String(key || '')
   if (s.length <= 8) return s.slice(0, 2) + '…'
@@ -64,6 +71,7 @@ export function publicEndpointView(ep, { reveal = false } = {}) {
     prefix: ep.prefix || '',
     kind: resolvePreset(ep.kind, ep).kind,
     protocol: resolvePreset(ep.kind, ep).protocol,
+    risk_review_enabled: ep.risk_review_enabled === true,
     base_url: resolvePreset(ep.kind, ep).base_url || ep.base_url,
     headers: stripAuthSchemeHeader(ep.headers),
     auth_scheme: endpointAuthScheme(ep),
@@ -130,6 +138,7 @@ export class ApiEndpointStore {
       base_url,
       kind: preset.kind,
       protocol: preset.protocol,
+      risk_review_enabled: riskReviewEnabled(input.risk_review_enabled),
       headers: headersWithAuthScheme(
         input.headers && typeof input.headers === 'object' ? input.headers : {},
         input.auth_scheme || input.authScheme,
@@ -152,6 +161,7 @@ export class ApiEndpointStore {
     if (!rec) return null
     if (patch.name != null) rec.name = String(patch.name).trim().slice(0, 80) || rec.name
     if (patch.disabled != null) rec.disabled = !!patch.disabled
+    if (patch.risk_review_enabled !== undefined) rec.risk_review_enabled = riskReviewEnabled(patch.risk_review_enabled)
     if (patch.prefix != null) rec.prefix = String(patch.prefix).trim()
     if (patch.kind != null || patch.protocol != null || patch.base_url != null) {
       const preset = resolvePreset(patch.kind ?? rec.kind, {

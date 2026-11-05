@@ -132,13 +132,15 @@ export async function evaluateProtocolIntercept({
   devices,
   requestId,
   account = null,
+  scopeMatched = false,
   fetchImpl,
 } = {}) {
+  // Explicit API endpoint opt-in supplies scope without an OAuth account.
   // GPT / Codex skips every layer unless the panel opts it in. Once a scope
   // is set, the slot decides GPT: a scope with no GPT pair and no named
   // account is out of range. Claude stays in the gate until a Claude pair
   // or a named account is selected; a GPT-only scope does not turn it off.
-  if (isOpenaiPlatformModel(inbound, body)) {
+  if (!scopeMatched && isOpenaiPlatformModel(inbound, body)) {
     if (!jevScopeConfigured(jev)) {
       if (jev?.openai_platform_enabled !== true) return pass('platform')
     } else if (!jevScopeWaits(jev, 'gpt')) {
@@ -148,7 +150,7 @@ export async function evaluateProtocolIntercept({
     } else if (!jevAccountInScope(jev, account)) {
       return pass('scope')
     }
-  } else if (jevScopeWaits(jev, 'claude')) {
+  } else if (!scopeMatched && jevScopeWaits(jev, 'claude')) {
     if (!account) return pass('scope-wait')
     if (!jevAccountInScope(jev, account)) return pass('scope')
   }

@@ -6,7 +6,13 @@
  * The browser never dials upstream.
  */
 import { normalizeAuthScheme, AUTH_SCHEME_BEARER, AUTH_SCHEME_X_API_KEY } from '../oauth/auth-scheme.mjs'
-import { messagesUrl, trimBaseUrl, upstreamAuthHeaders } from '../pool/api-presets.mjs'
+import {
+  messagesUrl,
+  responsesUrl,
+  OPENAI_OFFICIAL_URL,
+  trimBaseUrl,
+  upstreamAuthHeaders,
+} from '../pool/api-presets.mjs'
 import { forwardApi, readApiJson } from '../transport/api-kernel-client.mjs'
 
 export const ANTHROPIC_CONSOLE_URL = 'https://api.anthropic.com'
@@ -80,6 +86,7 @@ function directKeys(input = {}, store = null) {
       proxy_id: chosen(source, 'proxy_id', 'proxyId', saved?.proxy_id || ''),
       base_url: chosen(source, 'base_url', 'baseUrl', saved?.base_url || ''),
       auth_scheme: chosen(source, 'auth_scheme', 'authScheme', saved?.auth_scheme || ''),
+      protocol: chosen(source, 'protocol', 'protocol', saved?.protocol || input.protocol || 'anthropic'),
     })
   }
   if (!keys.length) {
@@ -108,6 +115,7 @@ export function savedEndpointKey(store, keyId) {
       proxy_id: key.proxy_id || '',
       proxy_url: key.proxy_url || '',
       base_url: endpoint.base_url || '',
+      protocol: endpoint.protocol || 'anthropic',
       auth_scheme: endpoint.auth_scheme || endpoint.headers?.auth_scheme || '',
     }
   }
@@ -150,14 +158,23 @@ export function buildAnthropicConsoleRequest(input = {}, picked = null, proxyPoo
   }
 
   const endpoint = scheduled ? picked.endpoint : null
+  const protocol = (scheduled ? endpoint.protocol : input.protocol) || 'anthropic'
+  if (!['anthropic', 'openai'].includes(protocol)) {
+    throw Object.assign(new Error('不支持的 API 协议'), { code: 'invalid_protocol', status: 400 })
+  }
+  const openai = protocol === 'openai'
   const key = scheduled ? String(picked.key?.api_key || '').trim() : String(input.api_key || input.apiKey || '').trim()
   if (!key) {
     throw Object.assign(new Error('先填 API key'), { code: 'api_key_required', status: 400 })
   }
   const scheme =
-    normalizeAuthScheme(scheduled ? endpoint.auth_scheme : input.auth_scheme || input.authScheme) ||
+    (openai
+      ? AUTH_SCHEME_BEARER
+      : normalizeAuthScheme(scheduled ? endpoint.auth_scheme : input.auth_scheme || input.authScheme)) ||
     AUTH_SCHEME_X_API_KEY
-  const baseUrl = scheduled ? endpoint.base_url : input.base_url || input.baseUrl || ANTHROPIC_CONSOLE_URL
+  const baseUrl = scheduled
+    ? endpoint.base_url
+    : input.base_url || input.baseUrl || (openai ? OPENAI_OFFICIAL_URL : ANTHROPIC_CONSOLE_URL)
   const proxyUrl = scheduled
     ? anthropicProxyUrl(picked.key?.proxy_url)
     : resolveConsoleProxyUrl(proxyPool, input.proxy_id || input.proxyId)
@@ -165,22 +182,25 @@ export function buildAnthropicConsoleRequest(input = {}, picked = null, proxyPoo
   const headers = {
     'content-type': 'application/json',
     accept: 'application/json',
-    ...upstreamAuthHeaders('anthropic', key, { ...extra, auth_scheme: scheme }),
+    ...upstreamAuthHeaders(protocol, key, { ...extra, auth_scheme: scheme }),
   }
+  const messageUrl = anthropicMessagesUrl(baseUrl)
 
   return {
     method: 'POST',
-    url: anthropicMessagesUrl(baseUrl),
+    url: openai ? responsesUrl(baseUrl) : messageUrl,
     headers,
     body: {
       model,
-      max_tokens: maxTokens,
-      messages: [{ role: 'user', content: message }],
+      ...(openai
+        ? { max_output_tokens: maxTokens, input: message, stream: false }
+        : { max_tokens: maxTokens, messages: [{ role: 'user', content: message }] }),
     },
     proxyUrl,
     timeoutMs: ANTHROPIC_CONSOLE_TIMEOUT_MS,
     meta: {
       mode: scheduled ? 'scheduled' : 'direct',
+      protocol,
       auth_scheme: scheme === AUTH_SCHEME_BEARER ? AUTH_SCHEME_BEARER : AUTH_SCHEME_X_API_KEY,
       endpoint_id: endpoint?.id || null,
       endpoint_name: endpoint?.name || null,
@@ -209,7 +229,8 @@ export function anthropicConsoleResult(upstream, meta) {
     return {
       ok: status >= 200 && status < 300,
       status,
-      text: textFromContent(body?.content),
+      text:
+        textFromContent(body?.content) || (body?.output || []).map((item) => textFromContent(item?.content)).join(''),
       error: status >= 400 ? String(message || `上游返回 ${status}`).slice(0, 500) : '',
       body,
       ...meta,
