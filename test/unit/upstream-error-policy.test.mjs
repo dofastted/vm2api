@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  CREDENTIAL_ENSURE_COOLDOWN_MS,
   classifyUpstreamResult,
   repairAnthropicRequest,
   shouldContinue,
@@ -906,5 +907,62 @@ test('disabled organization 400 is an org pause, not an invalid request', () => 
   })
   assert.equal(policy.reason, 'organization_disabled')
   assert.equal(policy.pauseSchedule, true)
+  assert.equal(shouldContinue(policy), true)
+})
+
+test('a slot that cannot refresh its credential hops instead of blaming the request', () => {
+  const now = 1_700_000_000_000
+  const policy = classifyUpstreamResult(
+    {
+      ok: false,
+      status: 400,
+      credential_ensure_failed: true,
+      terminalState: 'rejected',
+      body: {
+        type: 'error',
+        error: { type: 'worker_error', code: 'refresh_failed', message: 'OAuth refresh failed' },
+      },
+    },
+    { model: 'claude-opus-test', now },
+  )
+  assert.equal(policy.reason, 'credential_refresh_failed')
+  assert.notEqual(policy.reason, 'invalid_request')
+  assert.equal(policy.scope, 'account')
+  assert.equal(policy.action, 'continue-and-cooldown')
+  assert.equal(policy.cooldownUntil, now + CREDENTIAL_ENSURE_COOLDOWN_MS)
+  assert.equal(policy.retrySameAccount, false)
+  assert.equal(shouldContinue(policy), true)
+})
+
+test('a credential ensure failure that already committed is not replayed', () => {
+  const policy = classifyUpstreamResult({
+    ok: false,
+    status: 400,
+    committed: true,
+    credential_ensure_failed: true,
+    body: { error: { type: 'worker_error', code: 'refresh_failed', message: 'OAuth refresh failed' } },
+  })
+  assert.equal(policy.action, 'stop')
+  assert.equal(shouldContinue(policy), false)
+})
+
+test('fatal credential ensure escalation stays on permanent oauth_revoked', () => {
+  const policy = classifyUpstreamResult({
+    ok: false,
+    status: 401,
+    credential_ensure_failed: true,
+    terminalState: 'rejected',
+    body: {
+      type: 'error',
+      error: {
+        type: 'authentication_error',
+        code: 'oauth_revoked',
+        message: 'OAuth access token has been revoked',
+      },
+    },
+  })
+  assert.equal(policy.reason, 'oauth_revoked')
+  assert.notEqual(policy.reason, 'credential_refresh_failed')
+  assert.equal(policy.cooldownUntil, Number.MAX_SAFE_INTEGER)
   assert.equal(shouldContinue(policy), true)
 })
