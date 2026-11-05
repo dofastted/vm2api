@@ -255,6 +255,13 @@ export function isSilentClaudeRefusal(result = {}) {
 
 export const DEFAULT_OAUTH_401_COOLDOWN_MS = 120_000
 export const MAX_OAUTH_401_COOLDOWN_MS = 600_000
+/**
+ * A slot whose own credential refresh failed stops taking traffic for a while.
+ * Bounded rather than permanent: the worker only forwards the token endpoint's
+ * status, so a slot that is merely temporarily unable to refresh gets another
+ * chance instead of being parked until an operator re-imports it by hand.
+ */
+export const CREDENTIAL_ENSURE_COOLDOWN_MS = 10 * 60_000
 /** Upstream 5xx: stop the account and the same prompt. Do not open another slot. */
 export const PROVIDER_PAUSE_MS = 60 * 60 * 1000
 
@@ -325,6 +332,29 @@ function classifyUpstreamResultRaw(
       action: 'stop',
       reason: 'client_cancelled',
       cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
+  // A slot that could not refresh its own credential is a seat failure, never
+  // a malformed caller request. The worker answers with the token endpoint's
+  // own 400/403 there, and without this guard that status fell through to the
+  // invalid_request branch below: the hop stopped, the caller was told its
+  // request was invalid, and every healthy seat in the pool stayed idle while
+  // the broken one kept the conversation.
+  if (result.credential_ensure_failed === true) {
+    if (result.committed) {
+      return {
+        scope: 'stream',
+        action: 'stop',
+        reason: 'downstream_committed_or_incomplete',
+        cooldownUntil: null,
+      }
+    }
+    return {
+      scope: 'account',
+      action: 'continue-and-cooldown',
+      reason: 'credential_refresh_failed',
+      cooldownUntil: now + CREDENTIAL_ENSURE_COOLDOWN_MS,
       retrySameAccount: false,
     }
   }
