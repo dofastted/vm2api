@@ -107,6 +107,7 @@ import { authorizePanelRoute, mePayload, panelIdentity } from './panel-acl.mjs'
 import {
   denyIfUserCannotDeleteVm,
   denyIfUserMissesKey,
+  panelOwnsKey,
   denyIfUserMissesProxy,
   denyIfUserMissesVm,
   userMissesVmId,
@@ -515,10 +516,19 @@ function syncInstalledKernels(args) {
   return run
 }
 
-async function runKernelSync({ project, routingConfig, body = {}, refreshCluster = refreshClusterSlotPayloads }) {
+async function runKernelSync({
+  project,
+  routingConfig,
+  body = {},
+  refreshCluster = refreshClusterSlotPayloads,
+  restartKernel = restartRustKernel,
+}) {
   const all = listVms(project)
   const wanted = Array.isArray(body.ids) ? new Set(body.ids.map(String)) : null
-  const selected = wanted ? all.filter((vm) => wanted.has(vm.id)) : all
+  // Panel summaries omit private runtime state, including a previously failed restart.
+  const selected = (wanted ? all.filter((vm) => wanted.has(vm.id)) : all)
+    .map((vm) => getVm(project, vm.id))
+    .filter(Boolean)
   // Local slots bind the new binaries. Cluster slots bake the same kernel, CLIs
   // and OAuth helpers into a content-hashed image, then recreate onto it.
   const localVms = selected.filter((vm) => !slotHost(vm).bakedKernel)
@@ -538,7 +548,7 @@ async function runKernelSync({ project, routingConfig, body = {}, refreshCluster
       if (resolveInferenceEngine(vm, routingConfig) !== 'rust') continue
       writeKernelConfig(project, vm, { routing: routingConfig, timezone: vm.timezone })
       const exec = slotExec(project, vm)
-      item.kernel = await restartRustKernel(exec).catch((e) => ({
+      item.kernel = await restartKernel(exec).catch((e) => ({
         ok: false,
         error: String(e?.message || e).slice(0, 200),
       }))
@@ -879,8 +889,8 @@ export function createPanelHandler(ctx) {
 
   function normalizePanelApiKeyInput(body = {}, req) {
     const normalized = { ...body }
+    normalized.user_id = req.apiKeyKind === 'master' ? null : normalizeOwnerId(req.panelUserId)
     if (panelIdentity(req).role !== 'admin') {
-      delete normalized.user_id
       delete normalized.group_id
       delete normalized.vm_pool_id
     }
@@ -1631,18 +1641,13 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'GET' && p === '/api/panel/api-keys') {
         const snap = apiKeyStore.snapshot()
-        if (panelIdentity(req).role === 'user') {
-          const mine = (snap.keys || []).filter(
-            (k) => normalizeOwnerId(k.user_id) === normalizeOwnerId(req.panelUserId),
-          )
-          return json(res, 200, {
-            ok: true,
-            total: mine.length,
-            active: mine.filter((k) => k.status === 'active').length,
-            keys: mine,
-          })
-        }
-        return json(res, 200, { ok: true, ...snap })
+        const mine = (snap.keys || []).filter((key) => panelOwnsKey(req, key))
+        return json(res, 200, {
+          ok: true,
+          total: mine.length,
+          active: mine.filter((k) => k.status === 'active').length,
+          keys: mine,
+        })
       }
       if (req.method === 'GET' && /^\/api\/panel\/api-keys\/[^/]+\/stats$/.test(p)) {
         const id = p.split('/')[4]
@@ -1668,6 +1673,12 @@ export function createPanelHandler(ctx) {
           })
         }
         const input = normalizePanelApiKeyInput(body, req)
+        if (!input.user_id && req.apiKeyKind !== 'master') {
+          return json(res, 403, {
+            ok: false,
+            error: { code: 'key_owner_required', message: 'API key owner is required' },
+          })
+        }
         try {
           const scopeInput = { group_type: body?.group_type, allowed_vms: body?.allowed_vms }
           if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
@@ -1686,8 +1697,7 @@ export function createPanelHandler(ctx) {
             name: body?.name,
             key: body?.key || body?.custom_key || undefined,
             category: body?.category,
-            user_id:
-              panelIdentity(req).role === 'user' ? req.panelUserId || null : body?.user_id || req.panelUserId || null,
+            user_id: input.user_id,
             group_id: input.group_id,
             group_type: scope.group_type,
             allowed_vms: scope.allowed_vms,
@@ -2474,6 +2484,7 @@ export function createPanelHandler(ctx) {
         const report = await syncInstalledKernels({
           project: cfg.paths.project,
           routingConfig: ctx.routingConfig,
+          restartKernel: ctx.restartRustKernel,
           body: {
             ids: targets.all ? undefined : targets.ids,
             restart: body.restart !== false,
@@ -2544,6 +2555,7 @@ export function createPanelHandler(ctx) {
         const report = await syncInstalledKernels({
           project: cfg.paths.project,
           routingConfig: ctx.routingConfig,
+          restartKernel: ctx.restartRustKernel,
           body,
         })
         const release = {
@@ -2597,6 +2609,7 @@ export function createPanelHandler(ctx) {
         const report = await syncInstalledKernels({
           project: cfg.paths.project,
           routingConfig: ctx.routingConfig,
+          restartKernel: ctx.restartRustKernel,
           body,
           refreshCluster,
         })
