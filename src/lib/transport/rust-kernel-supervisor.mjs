@@ -911,7 +911,7 @@ export function writeKernelConfig(
   }
   if (
     dataplane === 'crag' &&
-    resolveCragKernelVersion(record, routing || {}) === 'v2' &&
+    resolveCragKernelVersion({ ...record, ...vm }, routing || {}) === 'v2' &&
     !String(record?.node_id || '').trim() &&
     !isKvmRuntime(record)
   ) {

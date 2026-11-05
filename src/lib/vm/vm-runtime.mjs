@@ -8,6 +8,7 @@ import { execFileSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 import { slotHost } from './slot-host.mjs'
 import { maxRequestBytes, readRoutingConfigFile, streamIdleTimeoutMs } from '../core/config.mjs'
 import { US_TIMEZONES, validTimezone } from '../core/timezone.mjs'
@@ -57,6 +58,8 @@ const KVM_MEMORY_OVERHEAD_MIB = 512
 const NET = process.env.KIN_VM_NETWORK || 'bridge'
 const PUBLIC_IP = process.env.PUBLIC_HOST || '166.88.96.199'
 const MODULE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
+const CRAG_V2_SECCOMP_PATH = fileURLToPath(new URL('./crag-v2-seccomp.json', import.meta.url))
+const CRAG_V2_SECCOMP = JSON.parse(fs.readFileSync(CRAG_V2_SECCOMP_PATH, 'utf8'))
 // Root in the runner must write into the slot-uid 0700 dirs and drop qemu to the slot uid.
 export const KVM_CAPS = ['SETUID', 'SETGID', 'SETPCAP', 'CHOWN', 'FOWNER', 'DAC_OVERRIDE']
 
@@ -160,7 +163,7 @@ export function displayName(vmId) {
 }
 
 function parseInspectStdout(name, stdout) {
-  const [running, pid, networkMode, startedAt, image, hostname, runtime, role, restarting, restartPolicy] =
+  const [running, pid, networkMode, startedAt, image, hostname, runtime, role, restarting, restartPolicy, securityOpts] =
     stdout.split('|')
   // Docker reports Running=true during a restart-policy backoff; nothing can be exec'd there.
   const crashLooping = restarting === 'true'
@@ -177,11 +180,12 @@ function parseInspectStdout(name, stdout) {
     runtime: String(runtime || '').trim() || null,
     role: String(role || '').trim() || null,
     restartPolicy: restartPolicy || null,
+    securityOpts: securityOpts ? JSON.parse(securityOpts) : [],
   }
 }
 
 const INSPECT_FORMAT =
-  '{{.State.Running}}|{{.State.Pid}}|{{.HostConfig.NetworkMode}}|{{.State.StartedAt}}|{{.Config.Image}}|{{.Config.Hostname}}|{{index .Config.Labels "kin.vm.runtime"}}|{{index .Config.Labels "kin.vm.role"}}|{{.State.Restarting}}|{{.HostConfig.RestartPolicy.Name}}'
+  '{{.State.Running}}|{{.State.Pid}}|{{.HostConfig.NetworkMode}}|{{.State.StartedAt}}|{{.Config.Image}}|{{.Config.Hostname}}|{{index .Config.Labels "kin.vm.runtime"}}|{{index .Config.Labels "kin.vm.role"}}|{{.State.Restarting}}|{{.HostConfig.RestartPolicy.Name}}|{{json .HostConfig.SecurityOpt}}'
 
 /**
  * @returns {{ status: 'found', container: object } | { status: 'missing' } | { status: 'error', error: string, code?: number }}
@@ -212,6 +216,30 @@ function updateSlotRestartPolicy(vm, existing, run) {
   if (!existing || existing.restartPolicy === policy) return { ok: true, changed: false }
   const result = run(['docker', 'update', '--restart', policy, existing.name])
   return { ...result, changed: result.ok === true }
+}
+
+/** A stopped installation must not be revived by Docker policy before a manual start. */
+export function suspendVmRuntimeRestart(vm, { run = sh } = {}) {
+  const outcome = inspectContainerOutcome(containerName(vm.id), { run })
+  if (outcome.status === 'error') return { ok: false, code: 'kernel_restart_policy_failed', error: outcome.error }
+  if (outcome.status === 'missing' || outcome.container.restartPolicy === 'no') return { ok: true }
+  const result = run(['docker', 'update', '--restart', 'no', outcome.container.name])
+  return { ok: result.ok === true, code: result.ok ? undefined : 'kernel_restart_policy_failed', error: result.stderr }
+}
+
+/** Docker cannot change seccomp on restart; upgrade only targets missing this exact narrow profile. */
+export function nativeSlotSandboxNeedsRecreate(existing, vm, routing = {}) {
+  if (!existing || isKvmRuntime(vm) || resolveKernelDataplane(vm, routing) !== 'crag' ||
+      resolveCragKernelVersion(vm, routing) !== 'v2') return false
+  return !(existing.securityOpts || []).some((option) => {
+    if (option === `seccomp=${CRAG_V2_SECCOMP_PATH}`) return true
+    if (!option.startsWith('seccomp=')) return false
+    try {
+      return isDeepStrictEqual(JSON.parse(option.slice('seccomp='.length)), CRAG_V2_SECCOMP)
+    } catch {
+      return false
+    }
+  })
 }
 
 /** Migrate existing local slots in place, including paused ones; never start or recreate them. */
@@ -999,7 +1027,8 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
   const restartPolicy = updateSlotRestartPolicy(vm, existing, sh)
   if (!restartPolicy.ok) return { ok: false, error: restartPolicy.stderr || 'slot restart policy update failed' }
   const paths = workerPaths(projectRoot, vm.id, vm)
-  const replace = recreate || !slotKernelAlive(existing, paths, vm) || codexContainerStale(existing, vm)
+  const replace = recreate || (existing?.running && !slotKernelAlive(existing, paths, vm)) || codexContainerStale(existing, vm) ||
+    nativeSlotSandboxNeedsRecreate(existing, vm, resolvedRouting)
   // Node restart / 开机 must not bounce a live slot with a healthy worker.
   if (existing?.running && !replace) {
     runtimePatch(vm, existing, {
@@ -1167,7 +1196,7 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
       'no-new-privileges',
       ...(resolveKernelDataplane(vm, resolvedRouting) === 'crag' &&
       resolveCragKernelVersion(vm, resolvedRouting) === 'v2'
-        ? ['--security-opt', `seccomp=${fileURLToPath(new URL('./crag-v2-seccomp.json', import.meta.url))}`]
+        ? ['--security-opt', `seccomp=${CRAG_V2_SECCOMP_PATH}`]
         : []),
       '--cap-drop',
       'ALL',

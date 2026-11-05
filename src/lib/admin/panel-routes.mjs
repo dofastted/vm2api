@@ -200,6 +200,8 @@ import {
   startHostUpgrade,
 } from './release.mjs'
 import { downloadReleaseKernel, kernelReleaseHttpStatus } from './release-kernel.mjs'
+import { describeKernelCatalog, pullKernelRelease } from './kernel-catalog.mjs'
+import { installKernelTargets, validateKernelTargets } from '../vm/kernel-install.mjs'
 import { clearActiveVmFromDb, removeVmFromDb } from '../vm/vm-db-sync.mjs'
 import { normalizeCredentialMode } from '../oauth/credential-mode.mjs'
 import { reloadActiveVm } from '../core/config.mjs'
@@ -2381,6 +2383,46 @@ export function createPanelHandler(ctx) {
         })
         return json(res, 200, panel.ok(report))
       }
+      if (req.method === 'GET' && p === '/api/panel/kernels') {
+        const vms = keyScopeVms(req).filter((vm) => !isCodexVm(vm))
+        const licenses = Object.create(null)
+        const installations = Object.create(null)
+        for (const summary of vms) {
+          const vm = getVm(cfg.paths.project, summary.id)
+          if (!vm) continue
+          // Inventory is read-only: only the explicit activation endpoint creates identities.
+          const { license } = getCragLicense(cfg.paths.project, vm, { initialize: false })
+          licenses[vm.id] = license
+          if (summary.kernel_installation) installations[vm.id] = summary.kernel_installation
+        }
+        return json(res, 200, panel.ok({ kernels: describeKernelCatalog(cfg.paths.project), licenses, installations }))
+      }
+      if (req.method === 'POST' && p === '/api/panel/kernels/pull') {
+        const body = await readBody(req, 8 * 1024)
+        if (!body || !['cli-node', 'crag'].includes(body.kernel) || (body.tag != null && typeof body.tag !== 'string')) {
+          return json(res, 400, { ok: false, error: { code: 'kernel_target_invalid', message: '请选择 cli-node 或 CRAG' } })
+        }
+        const result = await pullKernelRelease(cfg.paths.project, { kernel: body.kernel, tag: body.tag || '' }, { fetchImpl: ctx.fetchImpl })
+        if (!result.ok) return json(res, kernelReleaseHttpStatus(result.code), { ok: false, error: { code: result.code, message: result.error } })
+        return json(res, 200, panel.ok({ kernel: result.kernel, ...(result.release ? { release: result.release } : {}) }))
+      }
+      if (req.method === 'POST' && p === '/api/panel/kernels/install') {
+        const body = await readBody(req, 32 * 1024)
+        const selection = validateKernelTargets(cfg.paths.project, body?.targets)
+        if (!selection.ok) return json(res, selection.status, { ok: false, error: { code: selection.code, message: selection.error } })
+        // Check the entire explicit scope before the first target can be stopped.
+        if (body.targets.some((target) => userMissesVmId(req, cfg.paths.project, target.id))) {
+          return json(res, 403, { ok: false, error: { code: 'forbidden', message: '无权管理所选虚拟机' } })
+        }
+        const report = await installKernelTargets({
+          projectRoot: cfg.paths.project,
+          targets: body.targets,
+          routing: ctx.routingConfig,
+          watchdog: ctx.kernelWatchdog,
+          ops: ctx.kernelInstallOps,
+        })
+        return json(res, 200, panel.ok(report))
+      }
       if (req.method === 'GET' && p === '/api/panel/wrap-cli') {
         const sample = describeWrapSample(cfg.paths.project)
         return json(
@@ -4416,13 +4458,17 @@ export function createPanelHandler(ctx) {
       // POST /api/panel/vms/:id/start
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/start$/.test(p)) {
         const id = p.split('/')[4]
-        const started = await powerOnSlot({
-          projectRoot: cfg.paths.project,
-          id,
-          proxyPool,
-          routing: ctx.routingConfig,
-          fillTimezone: fillTimezoneFromExit,
-          by: 'start',
+        const started = await withVmLock(path.join(cfg.paths.project, 'vms', `${id}.json`), async () => {
+          const result = await powerOnSlot({
+            projectRoot: cfg.paths.project,
+            id,
+            proxyPool,
+            routing: ctx.routingConfig,
+            fillTimezone: fillTimezoneFromExit,
+            by: 'start',
+          })
+          if (result.ok) ctx.kernelWatchdog?.release?.(id)
+          return result
         })
         if (!started.ok) {
           return json(res, started.status, { ok: false, error: { code: started.code, message: started.error } })
@@ -4458,15 +4504,16 @@ export function createPanelHandler(ctx) {
       }
       // POST /api/panel/vms/:id/recover — power cycle (stop → start) plus a fresh diagnosis
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/recover$/.test(p)) {
-        const recovered = await recoverSlot({
+        const id = p.split('/')[4]
+        const recovered = await withVmLock(path.join(cfg.paths.project, 'vms', `${id}.json`), () => recoverSlot({
           projectRoot: cfg.paths.project,
-          id: p.split('/')[4],
+          id,
           proxyPool,
           routing: ctx.routingConfig,
           fillTimezone: fillTimezoneFromExit,
           watchdog: ctx.kernelWatchdog,
           internal: panelIdentity(req).role === 'admin',
-        })
+        }))
         if (!recovered.ok) {
           return json(res, recovered.status, { ok: false, error: { code: recovered.code, message: recovered.error } })
         }
@@ -4476,24 +4523,26 @@ export function createPanelHandler(ctx) {
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/stop$/.test(p)) {
         const id = p.split('/')[4]
         const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
-        if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-        const halt = await stopSlot(vm)
-        if (!halt.ok) return json(res, 500, { ok: false, error: { message: halt.error || 'runtime stop failed' } })
-        vm.status = 'stopped'
-        migrateScheduleRecord(vm)
-        applyScheduleOff(vm, true, { reason: 'stopped' })
-        atomicWriteJson(vmPath, vm, { mode: 0o600 })
-        return json(
-          res,
-          200,
-          panel.ok({
-            vm: summarizeVm(vm, cfg.paths.project, ctx.routingConfig),
-            runtime: panel.publicRuntimeView(vm.runtime) || GATEWAY_CAPABILITIES.runtime,
-            kernel: GATEWAY_CAPABILITIES.kernel,
-            halt: panel.publicSlotBoot(halt),
-          }),
-        )
+        return await withVmLock(vmPath, async () => {
+          if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+          const halt = await stopSlot(vm)
+          if (!halt.ok) return json(res, 500, { ok: false, error: { message: halt.error || 'runtime stop failed' } })
+          vm.status = 'stopped'
+          migrateScheduleRecord(vm)
+          applyScheduleOff(vm, true, { reason: 'stopped' })
+          atomicWriteJson(vmPath, vm, { mode: 0o600 })
+          return json(
+            res,
+            200,
+            panel.ok({
+              vm: summarizeVm(vm, cfg.paths.project, ctx.routingConfig),
+              runtime: panel.publicRuntimeView(vm.runtime) || GATEWAY_CAPABILITIES.runtime,
+              kernel: GATEWAY_CAPABILITIES.kernel,
+              halt: panel.publicSlotBoot(halt),
+            }),
+          )
+        })
       }
 
       // POST /api/panel/vms/import

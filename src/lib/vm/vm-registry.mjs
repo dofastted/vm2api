@@ -92,6 +92,13 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     persona_preset: vm.persona_preset || null,
     dataplane: vm.dataplane || null,
     crag_kernel_version: vm.crag_kernel_version || null,
+    kernel_installation: vm.kernel_installation
+      ? {
+          kernel: vm.kernel_installation.kernel,
+          version: vm.kernel_installation.version ?? null,
+          installed_at: vm.kernel_installation.installed_at,
+        }
+      : null,
     seed_policy: vm.seed_policy || null,
     region: vm.region || vm.zone || null,
     node_id: vm.node_id || null,
