@@ -236,6 +236,95 @@ test('anthropic array system becomes a developer message', () => {
   )
 })
 
+for (const stream of [false, true]) {
+  for (const asBlocks of [false, true]) {
+    test(`anthropic tool history survives conversion (stream=${stream}, blocks=${asBlocks})`, () => {
+      const value = 'TOOL_HISTORY_PROBE'
+      const body = {
+        model: 'gpt-6.1-sol',
+        stream,
+        messages: [
+          { role: 'user', content: 'Read the probe.' },
+          {
+            role: 'assistant',
+            content: [{ type: 'tool_use', id: 'call_probe', name: 'read_probe', input: { path: 'a"b', n: 2 } }],
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'call_probe',
+                content: asBlocks ? [{ type: 'text', text: value }] : value,
+              },
+            ],
+          },
+        ],
+      }
+      const original = structuredClone(body)
+      const converted = toCodexResponses('anthropic.messages', body, { anthropic_to_codex: true })
+      assert.equal(converted.ok, true)
+      assert.equal(converted.body.stream, stream)
+      assert.deepEqual(converted.body.input.slice(1), [
+        { type: 'function_call', call_id: 'call_probe', name: 'read_probe', arguments: '{"path":"a\\"b","n":2}' },
+        { type: 'function_call_output', call_id: 'call_probe', output: value },
+      ])
+      assert.deepEqual(body, original)
+    })
+  }
+}
+
+test('anthropic mixed text and multiple tools retain block order', () => {
+  const converted = toCodexResponses(
+    'anthropic.messages',
+    {
+      model: 'gpt-6.1-sol',
+      system: [{ type: 'text', text: 'Keep system.' }],
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'before' },
+            { type: 'tool_use', id: 'call_a', name: 'a', input: {} },
+            { type: 'text', text: 'between' },
+            { type: 'tool_use', id: 'call_b', name: 'b', input: { nested: [true] } },
+            { type: 'text', text: 'after' },
+          ],
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_a',
+              content: [
+                { type: 'text', text: 'first' },
+                { type: 'text', text: 'second' },
+              ],
+            },
+            { type: 'text', text: 'between results' },
+            { type: 'tool_result', tool_use_id: 'call_b', content: '', is_error: true },
+            { type: 'text', text: 'finish' },
+          ],
+        },
+      ],
+    },
+    { anthropic_to_codex: true },
+  )
+  assert.deepEqual(converted.body.input, [
+    { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'Keep system.' }] },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'before' }] },
+    { type: 'function_call', call_id: 'call_a', name: 'a', arguments: '{}' },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'between' }] },
+    { type: 'function_call', call_id: 'call_b', name: 'b', arguments: '{"nested":[true]}' },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'after' }] },
+    { type: 'function_call_output', call_id: 'call_a', output: 'first\nsecond' },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'between results' }] },
+    { type: 'function_call_output', call_id: 'call_b', output: '' },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'finish' }] },
+  ])
+})
+
 test('responses SSE maps to chat chunks', () => {
   const delta = responsesSseToChatChunk('data: {"type":"response.output_text.delta","delta":"Hi"}')
   assert.match(delta, /chat.completion.chunk/)

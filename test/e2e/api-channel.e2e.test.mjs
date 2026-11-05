@@ -84,6 +84,13 @@ test('generated API key lists configured models and calls both protocols through
       })
       assert.equal(checked.status, 200, checked.text)
       assert.equal(checked.json.data.items[0].text, 'pong')
+      if (protocol === 'anthropic') {
+        const legacy = await api(gw, 'POST', '/api/panel/anthropic/messages', {
+          body: { model, message: 'hi', keys: [{ key_id: saved.json.item.api_key_entries[0].id }] },
+        })
+        assert.equal(legacy.status, 200, legacy.text)
+        assert.equal(legacy.json.data.items[0].text, 'pong')
+      }
     }
     const created = await api(gw, 'POST', '/api/panel/api-keys', { body: { name: 'API-channel', category: 'api' } })
     assert.equal(created.status, 201, created.text)
@@ -100,7 +107,7 @@ test('generated API key lists configured models and calls both protocols through
       assert.equal(result.status, 200, result.text)
       assert.match(result.text, /pong/)
     }
-    assert.equal(captures.length, 7)
+    assert.equal(captures.length, 8)
     assert.ok(captures.every((env) => env.url.startsWith('https://relay.invalid/v1/')))
     assert.ok(
       captures
