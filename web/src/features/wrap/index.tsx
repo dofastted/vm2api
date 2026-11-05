@@ -93,6 +93,18 @@ function dataplaneOf(vm: Vm): 'wrap' | 'cc' | 'crag' | '—' {
   return selectedDataplane(vm.resolved_dataplane)
 }
 
+function isNativeCragV2(vm?: Vm) {
+  return (
+    vm?.resolved_dataplane === 'crag' &&
+    vm.resolved_crag_kernel_version === 'v2'
+  )
+}
+
+function kernelLabel(vm: Vm) {
+  if (isNativeCragV2(vm)) return 'CRAG V2 · 授权加密版'
+  return dataplaneOf(vm) === '—' ? '—' : dataplaneLabel(dataplaneOf(vm))
+}
+
 function DataplaneOption({
   value,
   title,
@@ -276,6 +288,9 @@ export function WrapSamplePage() {
     [vms]
   )
   const reinstallIds = selected.length ? selected : vms.map((vm) => vm.id)
+  const nativeV2Ids = reinstallIds.filter((id) =>
+    isNativeCragV2(vms.find((vm) => vm.id === id))
+  )
 
   const invalidate = async () => {
     await Promise.all([
@@ -292,12 +307,14 @@ export function WrapSamplePage() {
 
   const runHop = async (ids: string[], pull: boolean) => {
     if (!ids.length || hopBusy) return
+    const fetchLegacyRelease =
+      pull && ids.some((id) => !isNativeCragV2(vms.find((vm) => vm.id === id)))
     const token = hopToken.current + 1
     hopToken.current = token
     const alive = () => hopToken.current === token
     setHopBusy(true)
     setHopJob({
-      phase: pull ? 'download' : 'slots',
+      phase: fetchLegacyRelease ? 'download' : 'slots',
       done: 0,
       total: ids.length,
       current: ids[0] || '',
@@ -305,7 +322,7 @@ export function WrapSamplePage() {
     })
     const failed: string[] = []
     try {
-      if (pull) {
+      if (fetchLegacyRelease) {
         await installReleaseKernel({ ids: [], restart: false })
         if (!alive()) return
       }
@@ -443,7 +460,7 @@ export function WrapSamplePage() {
       } else {
         toast.success(
           next === 'crag'
-            ? '已切换到 crag + cc-node'
+            ? '已切换到 CRAG 数据面（按槽位版本）'
             : next === 'cc'
               ? '已切换到 cc-node + kernel'
               : '已切换到 cli-node + kernel'
@@ -557,12 +574,36 @@ export function WrapSamplePage() {
         }
       >
         <p className='mb-4 max-w-3xl text-sm leading-relaxed text-muted-foreground'>
-          三种搭配，点卡片切换。默认是 <code>cli-node + kernel</code>
-          （一进程 20 native 槽）。<code>cc-node + kernel</code> 用同一份 wrap
-          kernel。<code>crag + cc-node</code> 用 crag kernel，claude_bin
-          指向仓内 cc-node。未勾选槽时改全局默认；勾选后只切这些 Claude
-          槽。Codex 不动。不改凭证、不删容器。
+          默认是 <code>cli-node + kernel</code>。<code>cc-node + kernel</code>
+          使用同一份 wrap kernel。CRAG 按槽位版本使用 legacy 母本或授权加密 V2；
+          V2 的切换、机器码与授权在对应 VM 的「运维 → 推理内核」管理。
+          未勾选时重装当前类型的全部槽，勾选后只处理所选槽。不改凭据、不删容器。
         </p>
+        <Card className='mb-4'>
+          <CardHeader>
+            <CardTitle>CRAG V2 · 授权加密版</CardTitle>
+          </CardHeader>
+          <CardContent className='space-y-3'>
+            <p className='text-sm text-muted-foreground'>
+              从服务器已安装的受信任加密包重装，不拉取 legacy GitHub Release。
+              每槽仍须通过注册码验证；未授权或已到期时，请先在该槽运维页激活或续期。
+            </p>
+            <Button
+              disabled={!nativeV2Ids.length || hopBusy}
+              loading={hopBusy}
+              onClick={() => openHop(nativeV2Ids, false)}
+            >
+              {selected.length ? '重装所选 CRAG V2' : '重装 CRAG V2'}
+              {nativeV2Ids.length ? ` · ${nativeV2Ids.length} 槽` : ''}
+            </Button>
+            {!nativeV2Ids.length ? (
+              <p className='text-xs text-muted-foreground'>
+                当前范围内没有已切换到 CRAG V2 的槽；请先进入对应 VM
+                的运维页切换。
+              </p>
+            ) : null}
+          </CardContent>
+        </Card>
         <Card className='mb-4'>
           <CardHeader>
             <CardTitle>内核</CardTitle>
@@ -611,8 +652,8 @@ export function WrapSamplePage() {
               </DataplaneOption>
               <DataplaneOption
                 value='crag'
-                title='crag + cc-node'
-                desc='crag kernel，一进程多槽。claude_bin 指向仓内 cc-node。'
+                title='CRAG 数据面'
+                desc='版本以槽位固定值或全局配置为准。下方 ELF 是 legacy 母本；V2 请使用上方授权加密版入口。'
                 current={data?.dataplane === 'crag'}
                 disabled={!data?.crag?.ok || !data?.cc_node?.size}
               >
@@ -768,9 +809,7 @@ export function WrapSamplePage() {
                             )}
                           </td>
                           <td className='py-2 font-mono text-xs'>
-                            {dataplaneOf(vm) === '—'
-                              ? '—'
-                              : dataplaneLabel(dataplaneOf(vm))}
+                            {kernelLabel(vm)}
                           </td>
                           <td className='py-2 text-muted-foreground'>
                             {source ? '当前母本' : rust ? '可收成' : '只收文件'}
@@ -923,11 +962,14 @@ export function WrapSamplePage() {
               : `重装所选 ${hopIds.length} 槽？`
         }
         desc={
-          hopIds.length === 1
-            ? '按该槽当前数据面铺内核并重启 rust kernel。不改凭证，不删容器。'
-            : pullLatest
-              ? '先从 GitHub 拉 wrap kernel、cli-node、cc-node 和 crag kernel，再按各槽数据面逐槽换上。不改凭证，不删容器。'
-              : '按各槽当前数据面铺仓内内核并显示进度。不改凭证，不删容器。'
+          hopIds.length > 0 &&
+          hopIds.every((id) => isNativeCragV2(vms.find((vm) => vm.id === id)))
+            ? '使用服务器已验证的授权加密 V2 包，逐槽核验注册码并重装。不拉取 legacy Release，不改凭据，不删容器。'
+            : hopIds.length === 1
+              ? '按该槽当前数据面铺内核并重启 rust kernel。不改凭证，不删容器。'
+              : pullLatest
+                ? '先从 GitHub 拉 wrap kernel、cli-node、cc-node 和 crag kernel，再按各槽数据面逐槽换上。不改凭证，不删容器。'
+                : '按各槽当前数据面铺仓内内核并显示进度。不改凭证，不删容器。'
         }
         confirmText={
           hopIds.length === 1

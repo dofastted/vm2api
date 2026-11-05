@@ -112,6 +112,10 @@
 | GET | `/models` | 策略目录（不 hop worker） |
 | GET | `/oauth` | 全槽脱敏 credential |
 
+管理员在 VM 详情的「运维 → 推理内核」管理单槽 cli-node / CRAG V2 切换，以及机器码、授权激活和续期；概览不再重复显示修改控件。当前数据面会区分原生授权 V2 与 legacy CRAG。
+
+`/wrap` 的「CRAG V2 · 授权加密版」重装入口仅选择当前解析为 `crag` / `v2` 的槽，使用服务器已安装、签名校验通过的加密包并逐槽验证授权，不拉取 legacy GitHub Release。已勾选时只处理勾选范围内的 V2 槽，未勾选时处理当前类型的全部 V2 槽；确认框显示目标数量，单槽会显示具体 ID。旧 ELF 上传/Release 拉取仍属于 legacy 母本，不会替代授权加密 V2 包。
+
 `/vms`、`/vms/:id`、`/usage` 的账号行带窗口估算 `estimate_5h` / `estimate_7d` / `estimate_fable`（Fable 只在有 `7d_oi` 窗口的 Claude 号上非空）和 `window_fable_cost`。结构：`{ status, spent_usd, total_usd, remaining_usd, total_tokens, used_ratio }`。总量 = 窗口内官方费用 ÷ 已用比例，按官方价算，不乘分组倍率。`status` 不是 `ok` 时 `total_usd` / `remaining_usd` 为 `null`：`no_data`（无用量读数）、`no_reset`（无重置时间或已过期）、`log_gap`（日志没覆盖窗口起点，或已用比例动了但网关内无花费）、`low_usage`（已用 < 5%）、`unpriced`（窗口内有未定价请求）。token 字段 `total_tokens` / `today_tokens` / `window_*_tokens` 都是输入 + 输出 + 缓存读 + 缓存写，每类只算一次。
 
 `/vms/:id` 的 `billing.prev_window_5h` / `prev_window_7d` 是上一个已结束的额度窗口：`{ start, end, used_ratio, requests, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, total_cost, tokens, unpriced, … }`。`used_ratio`（0–1）是窗口结束前最后一次读到的已用比例；花费按 `[start, end)` 从请求日志汇总，官方价。窗口归档在每次额度写入时进行（Claude 存 accounts `extra.window_history`，GPT 存 `vm.codex.window_history`）：新读数的重置时间比当前窗口晚出半个窗口以上，或重置时间后移且已用比例下降超过 2 个百分点（重置券），就把旧窗口归档。上线后第一次翻转前为 `null`。`billing.window_5h_projection` = `{ source, total_usd, remaining_usd }`：`estimate_5h` 为 `ok` 时 `source: 'current'`；否则用上个 5H 窗口的「花费 ÷ 结束时已用」当总额度，`source: 'previous'`，剩余 = 总额度 − 本窗口花费。上个窗口已用 < 5%、有未定价请求、或日志没覆盖其起点时三项都为 `null`。

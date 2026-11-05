@@ -16,7 +16,6 @@ import {
 import {
   DATAPLANE_HINT,
   HOP_TRANSPORT_LABEL,
-  dataplaneLabel,
 } from '@/features/vm/dataplane-contract'
 import {
   DEFAULT_RESOLVED_ENGINE,
@@ -88,7 +87,7 @@ export function VmEngineEditor({
       <div className='mt-3 grid gap-2 text-sm sm:grid-cols-2'>
         <EngineValue
           label='数据面'
-          value={isCodexVm(vm) ? '—' : dataplaneLabel(vm.resolved_dataplane)}
+          value={isCodexVm(vm) ? '—' : kernelLabel(vm)}
         />
       </div>
       <p className='mt-3 text-xs leading-relaxed text-muted-foreground'>
