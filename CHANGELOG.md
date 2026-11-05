@@ -12,6 +12,14 @@
 - CRAG V2 发布协议切换到原生 ELF（`runtime: native`、`entrypoint: crag-v2`）：验证实际架构、完整 SHA 成员与安全路径，原子物化并直接执行，不再复制 Node 或写出 `node_bin` / `crag_v2_root`。保留 legacy 版本选择和 Linux Docker 放置限制；真实 CLI 版本由 native worker 探测。
 - native V2 生命周期探测、停止、切换回收和 idle reload 识别新进程名；动态 runnable 上限不再被误算为占用任务。配置写入本身不触发额外热重载，沿用显式空闲重启流程。
 
+## 1.4.043 — 2026-11-05
+
+- #885：没写 `max_tokens` 时用模型目录的 `max_tokens_default`（例如 Haiku 5.5 为 100000，Sonnet 5 为 64000），不再一律填 128000。写了且低于 `compatibility.min_max_tokens.value` 时默认仍抬到该值；模式「不改」/ `preserve` / `unchanged` 或面板「不抬升」则不抬。未指定有效模式时兼容 `no_raise: true` / `raise: false`，显式模式优先。超过该模型 `max_tokens_cap` 仍会下调。`enabled` thinking 的 `budget_tokens` 不小于 `max_tokens` 时，仍用该配置值补 thinking 合法间隔。
+- 修复健康探测页「不抬升」对 `preserve` / `unchanged`、模式空白和旧配置标志的显示，与后端模式优先级一致；补充 12 项实际组件渲染回归及后端优先级测试。
+- 池调度：健康探针等异步路径中 RPM 窗口过期后 stale `availableAt` 会重新判定可准入，避免直接路径空等至超时。
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
 ## 1.4.042 — 2026-11-05
 
 - API 配置页统一到 `#/api`，旧 `#/anthropic` 自动跳转；提供 Anthropic / OpenAI 两套默认地址和认证，支持获取模型、连通性测试及保存。获取的模型由服务端合并，不覆盖已有模型别名。

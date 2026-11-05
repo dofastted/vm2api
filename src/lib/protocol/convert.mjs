@@ -327,7 +327,9 @@ export function toClaudeMessages(protocol, body, opts = { rewrite: false, model_
       claude: withUpstreamStream({
         ...body,
         model: mapModel(body.model || DEFAULT_MODEL, { allowMap: opts.model_map }),
-        max_tokens: body.max_tokens || 1024,
+        max_tokens:
+          body.max_tokens ||
+          defaultMaxTokensForModel(mapModel(body.model || DEFAULT_MODEL, { allowMap: opts.model_map })),
       }),
       mode: 'rewrite',
     }
@@ -415,7 +417,7 @@ function responsesToClaude(body, opts) {
   if (messages[0].role !== 'user') messages.unshift({ role: 'user', content: '' })
   const out = {
     model: mapModel(body.model, { allowMap: opts.model_map !== false }),
-    max_tokens: body.max_output_tokens || body.max_tokens || 1024,
+    max_tokens: body.max_output_tokens || body.max_tokens || defaultMaxTokensForModel(body.model),
     messages,
   }
   if (systemParts.length) out.system = systemParts

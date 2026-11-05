@@ -1822,14 +1822,19 @@ test('a full pool queue still lets a free account be selected without waiting', 
 test('rpm window expiry rechecks instead of failing the waiter', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const resetAt = Date.now() + 40
+  let resetAt = 0
   const pool = scheduler(root, {
     accountQuota: {
       canAccept: () => {
+        if (!resetAt) resetAt = Date.now() + 40
         if (Date.now() < resetAt) return { ok: false, reason: 'rpm_limit', detail: { reset_at: resetAt } }
         return { ok: true }
       },
       tryAcquire: () => ({ ok: true }),
+    },
+    workerHealth: async (exec) => {
+      if (exec.vmId === 'vm-01') await new Promise((resolve) => setTimeout(resolve, 15))
+      return { ok: true, credential: { generation: 1, has_access: true } }
     },
   })
   applyShortWaits(pool, { sticky: 400, fallback: 400 })

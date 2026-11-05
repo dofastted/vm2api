@@ -1,6 +1,7 @@
 import { type ComponentProps, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
@@ -89,10 +90,23 @@ export function HealthPane(props: HealthPaneProps) {
   const minTokens = obj(compatibility.min_max_tokens)
   const setProbe = (patch: Obj) => onHealthProbeChange({ ...probe, ...patch })
   const setReal = (patch: Obj) => setProbe({ real: { ...real, ...patch } })
+  const minTokensMode = String(minTokens.mode ?? minTokens.tier ?? '').trim()
+  const explicitFloor = ['floor', 'default', 'raise'].includes(minTokensMode)
+  // Match the backend: an explicit mode takes precedence over legacy flags.
+  const preserveCaller =
+    ['不改', 'preserve', 'unchanged'].includes(minTokensMode) ||
+    (!explicitFloor &&
+      (minTokens.no_raise === true || minTokens.raise === false))
   const setMinTokens = (patch: Obj) =>
     onCompatibilityChange({
       ...compatibility,
-      min_max_tokens: { enabled: true, value: 128, ...minTokens, ...patch },
+      min_max_tokens: {
+        enabled: true,
+        value: 128,
+        mode: 'floor',
+        ...minTokens,
+        ...patch,
+      },
     })
 
   return (
@@ -118,10 +132,10 @@ export function HealthPane(props: HealthPaneProps) {
             />
           </SettingRow>
           <SettingRow
-            label='max_tokens 下限'
-            desc='Claude 出站时把过小的 max_tokens 抬到下限，避免探测请求在输出前被截断。未传 max_tokens 的请求不受影响。'
+            label='thinking 合法间隔'
+            desc='未写 max_tokens 时用模型目录 max_tokens_default。写了且低于此值时抬到该值；「不抬升」或模式「不改」时不抬。该数值在 enabled thinking 的 budget 不小于 max_tokens 时只补 thinking 合法间隔。'
           >
-            <div className='flex items-center gap-3'>
+            <div className='flex flex-col items-end gap-3 sm:flex-row sm:flex-wrap sm:items-center'>
               <Input
                 className='w-24'
                 type='number'
@@ -134,14 +148,63 @@ export function HealthPane(props: HealthPaneProps) {
                     value: clampInt(event.target.value, 1, 4096, 128),
                   })
                 }
-                aria-label='max_tokens 下限'
+                aria-label='thinking 合法间隔'
               />
+              <div
+                className='flex flex-wrap gap-2'
+                role='group'
+                aria-label='max_tokens 抬升模式'
+              >
+                <Button
+                  type='button'
+                  size='sm'
+                  variant={preserveCaller ? 'outline' : 'default'}
+                  className='min-h-11'
+                  disabled={minTokens.enabled === false}
+                  onClick={() =>
+                    setMinTokens({
+                      mode: 'floor',
+                      no_raise: false,
+                      raise: true,
+                    })
+                  }
+                >
+                  默认抬升
+                </Button>
+                <Button
+                  type='button'
+                  size='sm'
+                  variant={preserveCaller ? 'default' : 'outline'}
+                  className='min-h-11'
+                  disabled={minTokens.enabled === false}
+                  onClick={() =>
+                    setMinTokens({ mode: '不改', no_raise: true, raise: false })
+                  }
+                >
+                  不改
+                </Button>
+              </div>
+              <label className='flex items-center gap-2 text-xs text-muted-foreground'>
+                <Switch
+                  checked={preserveCaller}
+                  disabled={minTokens.enabled === false}
+                  onCheckedChange={(checked) =>
+                    setMinTokens(
+                      checked
+                        ? { mode: '不改', no_raise: true, raise: false }
+                        : { mode: 'floor', no_raise: false, raise: true }
+                    )
+                  }
+                  aria-label='不抬升'
+                />
+                不抬升
+              </label>
               <Switch
                 checked={minTokens.enabled !== false}
                 onCheckedChange={(checked) =>
                   setMinTokens({ enabled: checked })
                 }
-                aria-label='启用 max_tokens 下限'
+                aria-label='启用 thinking 合法间隔'
               />
             </div>
           </SettingRow>

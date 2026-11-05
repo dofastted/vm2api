@@ -599,6 +599,13 @@ export class PoolScheduler extends EventEmitter {
       }
       const now = Date.now()
       const wakeAts = waitPool.map((candidate) => Number(candidate.availableAt) || 0).filter((value) => value > now)
+      // Health / quota hops are async; availableAt can expire before we slice the wait.
+      const staleWindowWake =
+        !wakeAts.length &&
+        waitPool.some((candidate) => {
+          const at = Number(candidate.availableAt) || 0
+          return at > 0 && at <= now
+        })
       const concurrencyWait = waitPool.some((candidate) => candidate.busy && stickyShouldWait(candidate.waitReason))
       const waitPlan = this.resolveWaitPlan({
         candidates: waitPool,
@@ -614,7 +621,7 @@ export class PoolScheduler extends EventEmitter {
         return fail('all_accounts_busy', waitCandidates, waitAvailable, waitPool)
       }
       const waitCap = Math.min(waitDeadline, loopDeadline)
-      const sliceDeadline = wakeAts.length ? Math.min(waitCap, ...wakeAts) : waitCap
+      const sliceDeadline = wakeAts.length ? Math.min(waitCap, ...wakeAts) : staleWindowWake ? now + 1 : waitCap
       const queuedAt = Date.now()
       const waited = await this.waitForCapacity({
         signal,

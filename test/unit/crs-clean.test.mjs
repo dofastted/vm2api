@@ -424,9 +424,17 @@ test('OpenAI response_format survives Anthropic sanitize as output_config', () =
   assert.equal(native.response_format, undefined)
 })
 
-test('officialMessagesBody fills missing max_tokens with 128000', () => {
-  const out = officialMessagesBody({ model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] })
-  assert.equal(out.max_tokens, 128000)
+test('officialMessagesBody keeps a caller max_tokens and fills a missing one from the model', () => {
+  const kept = officialMessagesBody({
+    model: 'claude-haiku-5-5',
+    max_tokens: 64,
+    messages: [{ role: 'user', content: 'hi' }],
+  })
+  assert.equal(kept.max_tokens, 64)
+  const sonnet = officialMessagesBody({ model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hi' }] })
+  assert.equal(sonnet.max_tokens, 64000)
+  const haiku = officialMessagesBody({ model: 'claude-haiku-5-5', messages: [{ role: 'user', content: 'hi' }] })
+  assert.equal(haiku.max_tokens, 100000)
 })
 
 test('test14 OpenAI tools on /v1/messages convert to Anthropic get_weather', () => {

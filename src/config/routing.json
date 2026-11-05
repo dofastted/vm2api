@@ -133,7 +133,7 @@
     "overlay_preset": "off",
     "persona_park": false,
     "cache_ttl": "1h",
-    "min_max_tokens": { "enabled": true, "value": 128 }
+    "min_max_tokens": { "enabled": true, "value": 128, "mode": "floor" }
   },
   "official_cc": {
     "enabled": true,
