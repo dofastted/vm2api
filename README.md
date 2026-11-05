@@ -439,3 +439,8 @@ Before opening an issue, follow [ISSUE_GUIDE.md](ISSUE_GUIDE.md): version, repro
 - **个人与非商用**：本仓库遵循 [Noncommercial License](LICENSE)，仅供个人学习、技术研究与个人自建使用。
 - **商业使用授权**：任何将本项目用于商业运营（包括对外付费 API、作为转售云服务基础组件、公司内部营利用途等）**必须事先取得作者正式书面授权**。授权联系请洽 [Telegram @VM2API](https://t.me/VM2API)。
 - **免责声明**：vm2api 为独立的开源实验项目，与 Anthropic PBC 或 OpenAI 无任何直接关联。相关商标权属均归其对应公司所有。
+
+
+### 集群槽位迁移与扩容
+
+管理员可在「集群 → 机器 → 槽位行 → 迁移 / 扩容」选择目标节点或原节点扩内存。首版限定运行中的远程 Linux KVM 槽；停机迁移、预检、进度、失败回滚及人工恢复边界见 [操作说明](docs/slot-migration.md)。

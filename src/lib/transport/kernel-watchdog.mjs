@@ -100,6 +100,7 @@ const HARD_DOWN = new Set(['stopped', 'dead', 'error', 'disabled'])
 
 export function isKernelWatchdogTarget(vm, routing = {}) {
   if (!vm?.id) return false
+  if (vm.migration_pending || ['running', 'needs_attention'].includes(vm.slot_migration?.status)) return false
   if (HARD_DOWN.has(String(vm.status || '').toLowerCase())) return false
   // Effective engine, not the slot's own fields: panel-created slots omit
   // inference_engine and inherit routing.inference.engine (usually rust).

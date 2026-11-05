@@ -87,6 +87,7 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     status: vm.status || 'unknown',
     kernel: vm.kernel || null,
     runtime_type: runtimeKind(vm),
+    migration_pending: ['running', 'needs_attention'].includes(vm.slot_migration?.status),
     machine: vm.machine || null,
     inference_engine: vm.inference_engine || null,
     persona_preset: vm.persona_preset || null,

@@ -224,8 +224,9 @@ import {
   slotExec,
 } from '../vm/slot-runtime.mjs'
 import { recreateVmFiles, seedFreshCliHome } from '../vm/vm-recreate.mjs'
-import { diagnoseSlotServices, powerOnSlot, recoverSlot } from '../vm/slot-recovery.mjs'
+import { diagnoseSlotServices, powerOnSlot, recoverSlot, redactSecrets } from '../vm/slot-recovery.mjs'
 import { commitVmPackage, exportVmPackage, parseVmPackage } from '../vm/vm-package.mjs'
+import { slotMigrationBusy, slotMigrationJob, startSlotMigration } from '../cluster/slot-migration.mjs'
 import { preflightNode } from '../cluster/placement.mjs'
 import { probeLocalKvm } from '../vm/kvm-host.mjs'
 import { normalizeVmConfig, resolveMachineSpec, validateVmConfigPatch } from '../vm/machine-spec.mjs'
@@ -1481,6 +1482,42 @@ export function createPanelHandler(ctx) {
         denyIfUserMissesProxy(req, res, { proxyPool, json, path: p })
       ) {
         return true
+      }
+      // Cold slot moves are administrator-only (not a tenant placement edit).
+      const migrationRoute = /^\/api\/panel\/vms\/([^/]+)\/migration$/.exec(p)
+      if (migrationRoute && ['GET', 'POST'].includes(req.method)) {
+        const id = migrationRoute[1]
+        if (!isValidVmId(id))
+          return json(res, 400, { ok: false, error: { code: 'invalid_vm_id', message: '非法槽位 ID' } })
+        if (!getVm(cfg.paths.project, id))
+          return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: '槽位不存在' } })
+        if (req.method === 'GET') return json(res, 200, panel.ok(slotMigrationJob(cfg.paths.project, id)))
+        try {
+          const body = await readBody(req, 8192)
+          const { job } = startSlotMigration({
+            projectRoot: cfg.paths.project,
+            id,
+            body,
+            routing: ctx.routingConfig,
+            proxyPool,
+            watchdog: ctx.kernelWatchdog,
+            poolScheduler: ctx.poolScheduler,
+            ops: ctx.slotMigrationOps,
+          })
+          return json(res, 202, panel.ok(job))
+        } catch (err) {
+          return json(res, err.status || 500, {
+            ok: false,
+            error: { code: err.code || 'migration_failed', message: redactSecrets(err.message) },
+          })
+        }
+      }
+      const movingVm = /^\/api\/panel\/vms\/([^/]+)(?:\/|$)/.exec(p)?.[1]
+      if (req.method !== 'GET' && movingVm && isValidVmId(movingVm) && slotMigrationBusy(cfg.paths.project, movingVm)) {
+        return json(res, 409, {
+          ok: false,
+          error: { code: 'migration_busy', message: '槽位迁移中或待人工恢复，暂不能修改' },
+        })
       }
       if ((req.method === 'GET' || req.method === 'PUT') && p === '/api/panel/onboarding') {
         if (req.method === 'PUT') {
