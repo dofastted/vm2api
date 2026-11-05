@@ -11,6 +11,7 @@ export const KERNEL_RELEASE_ASSET = 'kin-kernel'
 export const CLI_NODE_RELEASE_ASSET = 'cli-node'
 export const CC_NODE_RELEASE_ASSET = 'cc-node'
 export const KERNEL_CRAG_RELEASE_ASSET = 'kin-kernel-crag'
+export const CRAG_V2_RELEASE_ASSET = 'crag-v2-licensed-amd64.tar.gz'
 export const MAX_KERNEL_DOWNLOAD_BYTES = 32 * 1024 * 1024
 export const MAX_CLI_NODE_DOWNLOAD_BYTES = 64 * 1024 * 1024
 export const MAX_CC_NODE_DOWNLOAD_BYTES = MAX_CLI_NODE_DOWNLOAD_BYTES
@@ -66,7 +67,7 @@ export function isAllowedKernelUrl(raw, { redirect = false } = {}) {
   }
   if (url.hostname === 'github.com') {
     return new RegExp(
-      `^/${GITHUB_REPO}/releases/download/v\\d+\\.\\d+\\.\\d+/(?:${KERNEL_RELEASE_ASSET}|${CLI_NODE_RELEASE_ASSET}|${CC_NODE_RELEASE_ASSET}|${KERNEL_CRAG_RELEASE_ASSET})$`,
+      `^/${GITHUB_REPO}/releases/download/v\\d+\\.\\d+\\.\\d+/(?:${KERNEL_RELEASE_ASSET}|${CLI_NODE_RELEASE_ASSET}|${CC_NODE_RELEASE_ASSET}|${KERNEL_CRAG_RELEASE_ASSET}|crag-v2-licensed-amd64\\.tar\\.gz)$`,
     ).test(url.pathname)
   }
   return (
@@ -182,7 +183,7 @@ async function readCappedBody(res, maxBytes, label) {
   return Buffer.concat(chunks, total)
 }
 
-async function fetchReleaseBytes(startUrl, fetchImpl, maxBytes, label) {
+export async function openKernelReleaseAsset(startUrl, fetchImpl = globalThis.fetch, label = KERNEL_RELEASE_ASSET) {
   let current = startUrl
   let headers = githubApiHeaders('application/octet-stream')
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
@@ -215,9 +216,38 @@ async function fetchReleaseBytes(startUrl, fetchImpl, maxBytes, label) {
               : 'kernel_download_failed'
       throw coded(code, `GitHub ${label} 下载失败 (${res.status})`)
     }
-    return readCappedBody(res, maxBytes, label)
+    return res
   }
   throw coded('kernel_redirect_blocked', 'GitHub 下载跳转过多')
+}
+
+async function fetchReleaseBytes(startUrl, fetchImpl, maxBytes, label) {
+  return readCappedBody(await openKernelReleaseAsset(startUrl, fetchImpl, label), maxBytes, label)
+}
+
+export async function fetchKernelReleaseMetadata({ tag = '', fetchImpl = globalThis.fetch } = {}) {
+  const trimmed = String(tag || '').trim()
+  const normalized = trimmed ? normalizeTag(trimmed) : ''
+  if (trimmed && (!normalized || !isReleaseTag(normalized)))
+    throw coded('kernel_tag_invalid', 'Release tag 必须是 vX.Y.Z')
+  if (!fetchImpl) throw coded('fetch_unavailable', 'fetch unavailable')
+  const url = `https://api.github.com/repos/${GITHUB_REPO}/releases/${normalized ? `tags/${normalized}` : 'latest'}`
+  const res = await fetchImpl(url, {
+    headers: githubApiHeaders(),
+    redirect: 'manual',
+    signal: AbortSignal.timeout(META_TIMEOUT_MS),
+  })
+  if (res.status !== 200) throw coded(`github_http_${res.status}`, `GitHub Release 查询失败 (${res.status})`)
+  let payload
+  try {
+    payload = JSON.parse((await readCappedBody(res, 1024 * 1024, 'metadata')).toString('utf8'))
+  } catch (error) {
+    if (error.code) throw error
+    throw coded('github_bad_json', 'GitHub Release 响应不是 JSON')
+  }
+  if (!isReleaseTag(payload?.tag_name) || (normalized && payload.tag_name !== normalized))
+    throw coded('kernel_tag_invalid', 'GitHub Release 版本号不匹配')
+  return payload
 }
 
 export async function downloadReleaseKernel({ tag = '', fetchImpl = globalThis.fetch } = {}) {

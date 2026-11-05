@@ -90,6 +90,15 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
     machine: vm.machine || null,
     inference_engine: vm.inference_engine || null,
     persona_preset: vm.persona_preset || null,
+    dataplane: vm.dataplane || null,
+    crag_kernel_version: vm.crag_kernel_version || null,
+    kernel_installation: vm.kernel_installation
+      ? {
+          kernel: vm.kernel_installation.kernel,
+          version: vm.kernel_installation.version ?? null,
+          installed_at: vm.kernel_installation.installed_at,
+        }
+      : null,
     seed_policy: vm.seed_policy || null,
     region: vm.region || vm.zone || null,
     node_id: vm.node_id || null,
@@ -431,6 +440,10 @@ function applySlotEnginePatch(vm, patch = {}) {
   if (Object.prototype.hasOwnProperty.call(patch, 'dataplane')) {
     if (patch.dataplane) vm.dataplane = patch.dataplane
     else delete vm.dataplane
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, 'crag_kernel_version')) {
+    if (patch.crag_kernel_version) vm.crag_kernel_version = patch.crag_kernel_version
+    else delete vm.crag_kernel_version
   }
 }
 

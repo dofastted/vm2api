@@ -1,45 +1,87 @@
 import { queryOptions } from '@tanstack/react-query'
+import type { CragLicenseStatus } from '@/types/panel-vm'
 import { api } from '@/lib/api'
 
-export type WrapSampleMeta = {
-  source?: string
-  source_vm?: string
-  captured_at?: string
-  kernel?: string
-  release_tag?: string
-  glibc_shim?: boolean
-  files?: string[]
-}
+export type KernelId = 'cli-node' | 'crag'
 
-export type WrapKernelPayload = {
-  source?: 'configured' | 'sample' | 'missing' | string
-  path?: string
-  size?: number
-  mtime?: string
-}
-
-export type WrapSample = {
-  ok: boolean
-  dir?: string
-  kernel_bin?: boolean
-  glibc_shim?: boolean
-  wrapper?: boolean
+export type KernelProduct = {
+  id: KernelId
+  name: string
+  paid: boolean
+  ready: boolean
+  version: string | null
+  updated_at: string | null
   code?: string
   error?: string
-  meta?: WrapSampleMeta | null
-  kernel?: WrapKernelPayload | null
-  cli_node?: WrapKernelPayload | null
-  cc_node?: WrapKernelPayload | null
-  crag?: (WrapKernelPayload & { ok?: boolean }) | null
-  dataplane?: 'wrap' | 'cc' | 'crag'
-  written?: string[]
-  sample_ok?: boolean
 }
 
+export type KernelInstallation = {
+  kernel: KernelId
+  version: string | null
+  installed_at: string
+}
+
+export type KernelCatalog = {
+  kernels: KernelProduct[]
+  licenses: Record<string, CragLicenseStatus>
+  installations?: Record<string, KernelInstallation>
+}
+
+export type KernelTarget = { id: string; kernel: KernelId }
+
+export type KernelInstallItem = KernelTarget & {
+  ok: boolean
+  stopped: boolean
+  version?: string | null
+  code?: string
+  error?: string
+}
+
+export type KernelInstallReport = {
+  ok: boolean
+  total: number
+  ok_count: number
+  failed_count: number
+  items: KernelInstallItem[]
+}
+
+export function kernelCatalogQueryOptions() {
+  return queryOptions({
+    queryKey: ['panel', 'kernels'] as const,
+    queryFn: () => api<KernelCatalog>('/api/panel/kernels'),
+  })
+}
+
+export function pullKernelRelease(body: { kernel: KernelId; tag?: string }) {
+  return api<{
+    kernel: KernelProduct
+    release?: { tag: string; version: string; asset: string }
+  }>('/api/panel/kernels/pull', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+export function installKernelTargets(targets: KernelTarget[]) {
+  return api<KernelInstallReport>('/api/panel/kernels/install', {
+    method: 'POST',
+    body: JSON.stringify({ targets }),
+  })
+}
+
+// Fleet actions outside /wrap still consume the existing runtime-sync report.
 export type WrapSyncReport = {
   ok?: boolean
   src?: string
-  meta?: WrapSampleMeta | null
+  meta?: {
+    source?: string
+    source_vm?: string
+    captured_at?: string
+    kernel?: string
+    release_tag?: string
+    glibc_shim?: boolean
+    files?: string[]
+  } | null
   total?: number
   ok_count?: number
   failed_count?: number
@@ -50,105 +92,4 @@ export type WrapSyncReport = {
     code?: string
     kernel?: { ok?: boolean; skipped?: boolean; error?: string }
   }[]
-}
-
-export type WrapRepairReport = {
-  wrap?: { ok?: boolean; dest?: string; error?: string }
-  kernel?: { ok?: boolean; skipped?: boolean; reason?: string; error?: string }
-}
-
-export function wrapSampleQueryOptions() {
-  return queryOptions({
-    queryKey: ['panel', 'wrap-cli'] as const,
-    queryFn: () => api<WrapSample>('/api/panel/wrap-cli'),
-  })
-}
-
-export function syncWrapSample(
-  body: { ids?: string[]; restart?: boolean } = {}
-) {
-  return api<WrapSyncReport>('/api/panel/wrap-cli/sync', {
-    method: 'POST',
-    body: JSON.stringify(body),
-  })
-}
-
-export function makeWrapSample(body: { glibc_vm?: string } = {}) {
-  const glibc_vm = String(body.glibc_vm || '').trim()
-  return api<WrapSample>('/api/panel/wrap-cli/make', {
-    method: 'POST',
-    body: JSON.stringify(glibc_vm ? { glibc_vm } : {}),
-  })
-}
-
-export function promoteWrapSample(id: string) {
-  return api<WrapSample>(
-    `/api/panel/vms/${encodeURIComponent(id)}/wrap-cli/promote`,
-    { method: 'POST', body: JSON.stringify({}) }
-  )
-}
-
-export function repairWrapSample(id: string) {
-  return api<WrapRepairReport>(
-    `/api/panel/vms/${encodeURIComponent(id)}/wrap-cli/repair`,
-    { method: 'POST', body: JSON.stringify({}) }
-  )
-}
-
-export type WrapReleaseUpdate = {
-  release?: {
-    tag?: string
-    version?: string
-    asset?: string
-    size?: number
-    cli_node?: string
-    cli_node_size?: number
-    cc_node?: string
-    cc_node_size?: number
-    crag?: string | null
-    crag_size?: number
-    crag_skipped?: boolean
-  }
-  kernel?: WrapSample
-  sync?: WrapSyncReport
-}
-
-export function installReleaseKernel(
-  body: { ids?: string[]; restart?: boolean } = {}
-) {
-  return api<WrapReleaseUpdate>('/api/panel/wrap-cli/kernel/release', {
-    method: 'POST',
-    body: JSON.stringify(body),
-  })
-}
-
-export function uploadKernelBinary(file: Blob) {
-  return api<WrapSample>('/api/panel/wrap-cli/kernel', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/octet-stream' },
-    body: file,
-  })
-}
-
-export function uploadCragKernelBinary(file: Blob) {
-  return api<WrapSample>('/api/panel/wrap-cli/crag-kernel', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/octet-stream' },
-    body: file,
-  })
-}
-
-export function setKernelDataplane(body: {
-  dataplane: 'wrap' | 'cc' | 'crag'
-  ids?: string[]
-  all?: boolean
-  restart?: boolean
-}) {
-  return api<WrapSyncReport & { dataplane?: 'wrap' | 'cc' | 'crag' }>(
-    '/api/panel/dataplane',
-    {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }
-  )
 }

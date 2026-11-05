@@ -24,6 +24,7 @@ import {
 import { clearRecoverableVmCooldown, markVmRefreshError } from '../oauth/oauth-credentials.mjs'
 import {
   resolveInferenceEngine,
+  resolveCragKernelVersion,
   resolveKernelDataplane,
   normalizeSessionSlots,
   normalizeSessionIdleTtlSeconds,
@@ -1975,6 +1976,8 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     resolved_inference_engine: resolveInferenceEngine(v, extras.routingConfig || {}),
     resolved_persona_preset: resolveSlotPersonaPreset(v, extras.routingConfig || {}),
     resolved_dataplane: resolveKernelDataplane(v, extras.routingConfig || {}),
+    crag_kernel_version: v.crag_kernel_version || null,
+    resolved_crag_kernel_version: isCodex ? null : resolveCragKernelVersion(v, extras.routingConfig || {}),
     note: v.note || null,
     region: v.region || null,
     node_id: v.node_id || null,

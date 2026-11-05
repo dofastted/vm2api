@@ -416,6 +416,30 @@ test('withTransaction only runs inline for a real outer transaction', () => {
   assert.equal(called, false)
 })
 
+test('migration 048 leaves existing API endpoints opted out of risk review', () => {
+  const src = path.resolve('src/lib/db/migrations')
+  const oldDir = path.join(tmp, 'before048')
+  fs.mkdirSync(oldDir)
+  for (const file of fs.readdirSync(src)) {
+    if (file.endsWith('.sql') && file < '048') fs.copyFileSync(path.join(src, file), path.join(oldDir, file))
+  }
+  const db = new DatabaseSync(':memory:')
+  try {
+    applyMigrations(db, { migrationsDir: oldDir })
+    db.prepare(`INSERT INTO api_endpoints (id, name, base_url, created_at, updated_at)
+      VALUES ('legacy', 'Legacy', 'https://api.anthropic.com', '2026-11-01', '2026-11-01')`).run()
+    applyMigrations(db, { migrationsDir: src })
+    assert.equal(
+      db.prepare('SELECT risk_review_enabled FROM api_endpoints WHERE id = ?').get('legacy').risk_review_enabled,
+      0,
+    )
+    assert.throws(() => db.prepare('UPDATE api_endpoints SET risk_review_enabled = 2').run(), /CHECK/)
+    assert.doesNotThrow(() => applyMigrations(db, { migrationsDir: src }))
+  } finally {
+    db.close()
+  }
+})
+
 test('migration 042 adds image generation columns; old rows and prompt totals stay the same', () => {
   const src = path.join(process.cwd(), 'src/lib/db/migrations')
   const migSrc = path.join(tmp, 'mig042')

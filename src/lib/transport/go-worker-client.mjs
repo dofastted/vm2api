@@ -62,7 +62,10 @@ function withCredentialRefreshLock(key, fn) {
 
 export function workerPaths(exec = {}) {
   const slotRoot = exec.homeDir ? path.dirname(exec.homeDir) : null
-  const runDir = exec.vm?.runtime?.worker_run_dir || (slotRoot ? path.join(slotRoot, 'run') : null)
+  const runDir =
+    exec.runRoot && exec.vm?.id
+      ? path.join(exec.runRoot, exec.vm.id)
+      : exec.vm?.runtime?.worker_run_dir || (slotRoot ? path.join(slotRoot, 'run') : null)
   return {
     runDir,
     socketPath: exec.vm?.runtime?.worker_socket || (runDir ? path.join(runDir, 'worker.sock') : null),

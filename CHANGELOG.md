@@ -2,7 +2,40 @@
 
 ## Unreleased
 
-- 修复本地转发代理的 lazy CONNECT 误判：SOCKS 成功但隧道没有应用层响应时不再标记健康。探测先要求经隧道完成 TLS 握手，TLS 不可用时回退到经隧道的 TCP DNS；延迟改为完整探测往返。
+- 内核页收敛为默认免费 cli-node 与注册码授权 CRAG：精简母本/旧 ELF/cc-node 入口，逐 VM 选择安装、就地激活/续期，全局确认明确范围，显示逐槽进度和停止结果。
+- 新增两产品独立拉取与可信缓存发布：cli-node 只下载所需的一对二进制；CRAG 校验官方签名加密归档并固定原发行公钥，缺少授权附件时明确失败，不回退 legacy。缓存指针原子切换，损坏时拒绝使用。
+- 新增显式范围重装并停用接口：授权/包校验先于停止，停止先于替换，保留身份与数据，关闭自动重启且不隐式开机；恢复流程只在完整成功时解除安装器自己的异常安全暂停。后续原生启动按需补齐窄 seccomp 策略，正确配置的容器不重建。
+- 修复 VM 摘要丢失 `dataplane` / `crag_kernel_version`：详情、dashboard 与重装选择保留每槽固定值，不再把已启用 CRAG V2 的槽误判为全局默认 wrap。
+- CRAG 增加离线、每 VM 注册码授权：选择/使用前验证，支持签发 1个月/半年/1年；签名绑定 VM、machine-id 和独立设备密钥。新增机器码复制、激活/替换及绝对 UTC 到期提示；错误码不破坏现有有效授权，续期不隐式切内核。
+- 原生 V2 仅接收签名加密包：校验 bootstrap ELF、密文、公钥与发布签名，不再接受旧明文 V2。内核独立校验授权，过期/错误设备/篡改为终态403，不触发OAuth刷新、账号冷却或Go回退；cli-node/wrap不受收费授权限制。
+- 授权设备存储复用既有 Linux worker run 映射，普通重建保留授权，不将私钥写入 DrvFS。不可变包信任采用有界元数据缓存，避免每次请求重复哈希大型 Claude；注册码当前有效期仍逐次检查。
+- CRAG V2 发布协议切换到原生 ELF（`runtime: native`、`entrypoint: crag-v2`）：验证实际架构、完整 SHA 成员与安全路径，原子物化并直接执行，不再复制 Node 或写出 `node_bin` / `crag_v2_root`。保留 legacy 版本选择和 Linux Docker 放置限制；真实 CLI 版本由 native worker 探测。
+- native V2 生命周期探测、停止、切换回收和 idle reload 识别新进程名；动态 runnable 上限不再被误算为占用任务。配置写入本身不触发额外热重载，沿用显式空闲重启流程。
+
+## 1.4.044 — 2026-11-05
+
+- #890：修复本地转发代理的 lazy CONNECT 误判：SOCKS 成功但隧道没有应用层响应时不再标记健康。探测先要求经隧道完成 TLS 握手，TLS 不可用时回退到经隧道的 TCP DNS；延迟改为完整探测往返。
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.043 — 2026-11-05
+
+- #885：没写 `max_tokens` 时用模型目录的 `max_tokens_default`（例如 Haiku 5.5 为 100000，Sonnet 5 为 64000），不再一律填 128000。写了且低于 `compatibility.min_max_tokens.value` 时默认仍抬到该值；模式「不改」/ `preserve` / `unchanged` 或面板「不抬升」则不抬。未指定有效模式时兼容 `no_raise: true` / `raise: false`，显式模式优先。超过该模型 `max_tokens_cap` 仍会下调。`enabled` thinking 的 `budget_tokens` 不小于 `max_tokens` 时，仍用该配置值补 thinking 合法间隔。
+- 修复健康探测页「不抬升」对 `preserve` / `unchanged`、模式空白和旧配置标志的显示，与后端模式优先级一致；补充 12 项实际组件渲染回归及后端优先级测试。
+- 池调度：健康探针等异步路径中 RPM 窗口过期后 stale `availableAt` 会重新判定可准入，避免直接路径空等至超时。
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.042 — 2026-11-05
+
+- API 配置页统一到 `#/api`，旧 `#/anthropic` 自动跳转；提供 Anthropic / OpenAI 两套默认地址和认证，支持获取模型、连通性测试及保存。获取的模型由服务端合并，不覆盖已有模型别名。
+- 渠道选择 `api` 的密钥按配置端点协议调用上游，不再误入 OAuth / Codex 槽位。OpenAI 原生 Responses 输入和推理设置保持不变，不注入 Claude persona；修复非流式回复转换。
+- 共享 OpenAI API 凭证强制 `store: false`，拒绝上游对话、存储提示词、文件/向量库引用及 MCP 等账户资源工具；调用方需发送完整的无状态历史，可保留加密推理内容和普通函数工具，避免不同密钥跨读运营方账户资源。
+- Anthropic API 端点新增独立的“风控前置审查”开关，默认关闭，旧端点迁移后也保持关闭。开启并保存后，推理请求先按风险审计中启用的规则和决策模型审查，再调用上游；不依赖 OAuth 账号范围，单请求只审查一次。本页连通性测试仍为直连诊断。
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启，启动时自动迁移端点开关字段。不更换 CRAG / CLI payload，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.041 — 2026-11-05
 - 新增可选 `compatibility.preserve_pruned_tool_results`：在槽位Claude推理中，按认证密钥和DSH会话隔离保存成功请求的有限工具原文；精确识别默认工具文本裁剪后恢复原始前缀，避免小幅历史裁剪造成整段缓存重写。真实编辑/压缩、失败/重试、并发歧义和内存/上下文预算不足时不恢复；缺省关闭，不改变客户端配置或API直连端点。
 
 ## 1.4.038 — 2026-11-04

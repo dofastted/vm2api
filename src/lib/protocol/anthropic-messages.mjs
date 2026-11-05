@@ -10,6 +10,7 @@ import {
   stripIllegalBodyContentFields,
 } from './sanitize.mjs'
 import { sanitizeAnthropicTools } from './web-search.mjs'
+import { defaultMaxTokensForModel } from './model-policy.mjs'
 
 export function officialMessagesBody(body = {}, { stream = undefined, preserveContentShape = false } = {}) {
   const out = copyOfficialAnthropicFields(body)
@@ -18,7 +19,7 @@ export function officialMessagesBody(body = {}, { stream = undefined, preserveCo
   stripIllegalBodyContentFields(out)
   if (Array.isArray(out.tools)) out.tools = sanitizeAnthropicTools(out.tools)
   if (stream !== undefined) out.stream = !!stream
-  if (!out.max_tokens) out.max_tokens = 128000
+  if (!out.max_tokens) out.max_tokens = defaultMaxTokensForModel(out.model)
   if (Array.isArray(out.tools) && out.tools.length === 0) delete out.tools
   if (out.stop_sequences) delete out.stop
   else if (out.stop != null) {
