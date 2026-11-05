@@ -310,8 +310,43 @@ export function normalizeCodexResponsesInput(body = {}) {
   return stripUnsupportedCodexFields(next)
 }
 
+function anthropicMessageToChat(message) {
+  if (!Array.isArray(message?.content)) return [message]
+  const messages = []
+  let content = []
+  // Flush at each tool boundary so mixed text and parallel tool results keep their order.
+  const flush = () => {
+    if (content.length) messages.push({ ...message, content })
+    content = []
+  }
+  for (const block of message.content) {
+    if (message.role === 'assistant' && block?.type === 'tool_use') {
+      flush()
+      messages.push({
+        role: 'assistant',
+        tool_calls: [
+          {
+            id: block.id,
+            type: 'function',
+            function: { name: block.name, arguments: JSON.stringify(block.input ?? {}) },
+          },
+        ],
+      })
+      continue
+    }
+    if (message.role === 'user' && block?.type === 'tool_result') {
+      flush()
+      messages.push({ role: 'tool', tool_call_id: block.tool_use_id, content: block.content })
+      continue
+    }
+    content.push(block)
+  }
+  flush()
+  return messages
+}
+
 export function anthropicToCodexResponses(body = {}) {
-  const messages = Array.isArray(body.messages) ? body.messages : []
+  const messages = Array.isArray(body.messages) ? body.messages.flatMap(anthropicMessageToChat) : []
   const system = body.system == null || body.system === '' ? [] : [{ role: 'system', content: body.system }]
   return chatToCodexResponses({
     model: body.model,

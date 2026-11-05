@@ -4,6 +4,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
+import { materializeWrapCli } from '../../src/lib/vm/wrap-cli-runtime.mjs'
+import { getVm, markKernelRestartPending } from '../../src/lib/vm/vm-registry.mjs'
 
 const prevKernelBin = process.env.KIN_KERNEL_BIN
 
@@ -214,13 +216,14 @@ function releaseFetch(
   }
 }
 
-function panelFor(project, { readBody, readRawBody, fetchImpl, refreshClusterSlotPayloads } = {}) {
+function panelFor(project, { readBody, readRawBody, fetchImpl, refreshClusterSlotPayloads, restartRustKernel } = {}) {
   const response = {}
   const handlePanel = createPanelHandler({
     cfg: { paths: { project } },
     routingConfig: {},
     fetchImpl,
     refreshClusterSlotPayloads,
+    restartRustKernel,
     requireAuth(req) {
       req.apiKeyKind = 'master'
       req.panelRole = 'admin'
@@ -235,6 +238,48 @@ function panelFor(project, { readBody, readRawBody, fetchImpl, refreshClusterSlo
     readRawBody,
   })
   return { response, handlePanel }
+}
+
+for (const scenario of ['check', 'success', 'failure', 'throw', 'stopped']) {
+  test(`unchanged wrap payload reconciles persisted restart pending (${scenario})`, async (t) => {
+    const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-panel-pending-sync-'))
+    t.after(() => fs.rmSync(project, { recursive: true, force: true }))
+    seedWrapTemplate(project)
+    const vm = {
+      id: 'pending-slot',
+      status: scenario === 'stopped' ? 'stopped' : 'running',
+      inference_engine: 'rust',
+      proxy: { id: 'px-local', kind: 'local' },
+    }
+    fs.mkdirSync(path.join(project, 'vms'), { recursive: true })
+    fs.writeFileSync(path.join(project, 'vms', `${vm.id}.json`), JSON.stringify(vm))
+    assert.equal(materializeWrapCli(project, vm).ok, true)
+    markKernelRestartPending(project, vm.id, 'legacy_telemetry_stop_failed')
+    let restarts = 0
+    const { response, handlePanel } = panelFor(project, {
+      readBody: async () => ({ ids: [vm.id], restart: scenario !== 'check' }),
+      restartRustKernel: async (exec) => {
+        restarts++
+        assert.equal(exec.vm.kernel_restart_pending, 'legacy_telemetry_stop_failed')
+        if (scenario === 'throw') throw new Error('fixture restart failure')
+        return scenario === 'failure' ? { ok: false, reason: 'fixture_restart_failed' } : { ok: true }
+      },
+    })
+    await handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/wrap-cli/sync'))
+    const failed = scenario === 'failure' || scenario === 'throw'
+    assert.equal(response.status, failed ? 400 : 200, JSON.stringify(response.body))
+    assert.equal(response.body.data.items[0].kernel_changed, true)
+    assert.equal(restarts, scenario === 'check' || scenario === 'stopped' ? 0 : 1)
+    const pending = getVm(project, vm.id).kernel_restart_pending
+    if (scenario === 'success') {
+      assert.equal(pending, undefined)
+      await handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/wrap-cli/sync'))
+      assert.equal(response.body.data.items[0].kernel_changed, false)
+      assert.equal(restarts, 1)
+    } else {
+      assert.ok(pending, 'a check, failed restart or stopped slot must retain the pending state')
+    }
+  })
 }
 
 test('github kernel release replaces host kernel and syncs stopped slots', async () => {
