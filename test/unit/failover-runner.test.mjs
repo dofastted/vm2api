@@ -2020,3 +2020,36 @@ test('org OAuth refusal pauses that slot and the family request hops to another'
   assert.equal(pauses[0].policy.reason, 'organization_disabled')
   assert.equal(pauses[0].policy.detail.status, 403)
 })
+
+test('a slot that cannot refresh its credential hops and cools down', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const seen = []
+  const runner = new FailoverRunner({ scheduler })
+  const result = await runner.run({
+    requestId: 'req-credential-ensure',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      if (selected.accountId === 'account-1') {
+        return {
+          ok: false,
+          status: 400,
+          credential_ensure_failed: true,
+          terminalState: 'rejected',
+          body: {
+            type: 'error',
+            error: { type: 'worker_error', code: 'refresh_failed', message: 'OAuth refresh failed' },
+          },
+        }
+      }
+      return success()
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.accountId, 'account-2')
+  assert.deepEqual(seen, ['account-1', 'account-2'])
+  assert.equal(scheduler.cooldowns.length, 1)
+  assert.equal(scheduler.cooldowns[0].update.reason, 'credential_refresh_failed')
+  assert.equal(scheduler.cooldowns[0].update.status, 'cooldown')
+})
