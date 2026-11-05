@@ -16,8 +16,9 @@
 
 - #896：claude_code_only 完整替代 #892+#893：放行 CLI WebSearch/WebFetch 侧查询（缺 `claude-code-20250219` 的窄形状仍保留其余官方指纹检查）；Desktop Gateway 登录探针本地回 OK（零用量、不选账号）；中转准入不再仅凭计费行放行（须合法 `metadata.user_id` + 可识别的官方 Claude Code system）；拒 OMP 18.x（认出 `You are omp's trusted coding assistant`）。
 - #900（取代 #899）：槽位 credential ensure 非致命失败（生产 400 + `credential_ensure_failed`）按席位故障换槽并冷却 10 分钟，不再误判为 `invalid_request`；fatal 升级（401 + oauth 码，仍带 `credential_ensure_failed`）继续走永久 `oauth_revoked`，不被 10 分钟冷却截断。
+- `scripts/fetch-payload.mjs` 从 Release 下载 payload 资产遇瞬时失败时会重试（最多 4 次，递增退避），减轻 CI/本地构建偶发网络错误。
 
-已部署机升级：更新 Node 控制面与 `web/dist` 后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+已部署机升级：只更新 Node 控制面后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
 ## 1.4.044 — 2026-11-05
 
