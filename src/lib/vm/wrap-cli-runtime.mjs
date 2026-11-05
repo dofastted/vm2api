@@ -1,7 +1,8 @@
 /**
  * Wrap inference CLIs live in the slot home, next to the kernel.
- * share/wrap-cli holds both cli-node and cc-node. The dataplane picks which
- * one kernel.json.claude_bin runs:
+ * share/wrap-cli holds the factory CLIs; an atomic sibling-cache pointer may
+ * select a pulled cli-node/kernel pair. cc-node remains a separate legacy asset.
+ * The dataplane picks which executable kernel.json.claude_bin runs:
  *   wrap: cli-node + wrap kin-kernel
  *   cc:   cc-node + wrap kin-kernel
  *   crag + legacy: cc-node + share/crag/kin-kernel
@@ -88,12 +89,43 @@ export function cragV2Arch() {
   return process.arch
 }
 
+// A cache pointer is data, never a symlink or an arbitrary filesystem path.
+function cachedPackageRoot(base, arch) {
+  const pointer = path.join(base, `current-${arch}.json`)
+  const invalid = () =>
+    Object.assign(new Error('内核缓存选择无效或不可读，请重新拉取内核'), { code: 'kernel_cache_invalid' })
+  let st
+  try {
+    st = fs.lstatSync(pointer)
+  } catch (error) {
+    if (error.code === 'ENOENT') return ''
+    throw invalid()
+  }
+  try {
+    if (!st.isFile() || st.size > 4096) throw invalid()
+    const value = JSON.parse(fs.readFileSync(pointer, 'utf8'))
+    if (!new RegExp(`^packages/${arch}-[a-f0-9-]{36}$`).test(value?.package)) throw invalid()
+    const packages = path.join(base, 'packages')
+    const target = path.join(base, value.package)
+    if (!fs.lstatSync(packages).isDirectory() || !fs.lstatSync(target).isDirectory()) throw invalid()
+    return target
+  } catch {
+    throw invalid()
+  }
+}
 /** Package location only. This does not select v2 for VMs that omitted the version. */
 export function cragV2PackageRoot(projectRoot) {
   const env = String(process.env.KIN_CRAG_V2_ROOT || '').trim()
   if (env && isFile(path.join(env, 'manifest.json'))) return env
   if (!projectRoot) return ''
-  const staged = path.join(projectRoot, 'share', 'crag', 'kernels', 'v2', cragV2Arch())
+  const base = path.join(projectRoot, 'share', 'crag', 'kernels', 'v2')
+  const cached = cachedPackageRoot(base, cragV2Arch())
+  if (cached) {
+    if (!isFile(path.join(cached, 'manifest.json')))
+      throw Object.assign(new Error('CRAG 缓存缺少发行清单，请重新拉取'), { code: 'kernel_cache_invalid' })
+    return cached
+  }
+  const staged = path.join(base, cragV2Arch())
   return isFile(path.join(staged, 'manifest.json')) ? staged : ''
 }
 
@@ -397,7 +429,12 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null } = 
   }
   const placement = cragV2PlacementError(vm)
   if (placement) return placement
-  const src = cragV2PackageRoot(projectRoot)
+  let src
+  try {
+    src = cragV2PackageRoot(projectRoot)
+  } catch (error) {
+    return { ok: false, code: error.code, error: error.message }
+  }
   if (!src) {
     return {
       ok: false,
@@ -469,10 +506,24 @@ export function cragKernelPath(projectRoot) {
   return isFile(alt) ? alt : ''
 }
 
+function cliPayloadPath(projectRoot, name, dir = wrapCliTemplateDir(projectRoot)) {
+  const selected = path.join(dir, name)
+  if (isFile(selected) || name !== CC_NODE_BIN) return selected
+  // Pulling the free pair does not remove the separately shipped legacy CLI.
+  const factory = String(process.env.KIN_WRAP_CLI_ROOT || '').trim() || path.join(projectRoot, 'share', 'wrap-cli')
+  return path.join(factory, name)
+}
+
 export function wrapCliTemplateDir(projectRoot) {
   const env = String(process.env.KIN_WRAP_CLI_ROOT || '').trim()
   if (env) return env
   if (!projectRoot) return ''
+  const cached = cachedPackageRoot(path.join(projectRoot, 'share', 'wrap-cli-releases'), 'amd64')
+  if (cached) {
+    if (!isFile(path.join(cached, WRAP_KERNEL_BIN)) || !isFile(path.join(cached, WRAP_CLI_BIN)))
+      throw Object.assign(new Error('cli-node 缓存不完整，请重新拉取'), { code: 'kernel_cache_invalid' })
+    return cached
+  }
   return path.join(projectRoot, 'share', 'wrap-cli')
 }
 
@@ -501,8 +552,24 @@ function hasKernelPayload(dir) {
   return isFile(path.join(dir, WRAP_KERNEL_BIN)) || isFile(path.join(dir, WRAP_KERNEL_WRAPPER))
 }
 
+export function hasCustomKernelOverride(projectRoot) {
+  const configured = String(process.env.KIN_KERNEL_BIN || '').trim()
+  return Boolean(
+    configured && (!projectRoot || path.resolve(configured) !== path.resolve(projectRoot, 'bin', 'kin-kernel')),
+  )
+}
+
 function configuredKernelPath(projectRoot = '') {
   const env = kernelBinPath()
+  // Explicit kernel overrides win, but a pulled pair must not use an older bundled kernel.
+  if (!hasCustomKernelOverride(projectRoot) && !String(process.env.KIN_WRAP_CLI_ROOT || '').trim() && projectRoot) {
+    const cached = cachedPackageRoot(path.join(projectRoot, 'share', 'wrap-cli-releases'), 'amd64')
+    if (cached) {
+      if (!isFile(path.join(cached, WRAP_KERNEL_BIN)))
+        throw Object.assign(new Error('cli-node 缓存缺少 kin-kernel，请重新拉取'), { code: 'kernel_cache_invalid' })
+      return path.join(cached, WRAP_KERNEL_BIN)
+    }
+  }
   if (isFile(env)) return env
   if (projectRoot) {
     const bundled = path.join(projectRoot, 'bin', 'kin-kernel')
@@ -541,7 +608,7 @@ export function describeKernelPayload(projectRoot) {
 }
 export function describeCliPayload(projectRoot, name) {
   const dir = wrapCliTemplateDir(projectRoot)
-  const chosen = path.join(dir, name)
+  const chosen = cliPayloadPath(projectRoot, name, dir)
   const info = fileInfo(chosen)
   return {
     source: info ? 'sample' : 'missing',
@@ -583,7 +650,7 @@ export function inspectWrapCliDir(dir) {
   if (!dir || !fs.existsSync(dir)) {
     return { ok: false, code: 'wrap_cli_template_missing', error: `wrap CLI template missing: ${dir || '(unset)'}` }
   }
-  for (const name of WRAP_CLI_FILES) {
+  for (const name of [WRAP_CLI_BIN]) {
     const p = path.join(dir, name)
     if (!isFile(p)) {
       return { ok: false, code: 'wrap_cli_incomplete', error: `wrap CLI missing ${name}` }
@@ -758,7 +825,7 @@ export function materializeCragKernel(projectRoot, vm, { uid = null, gid = null 
       error: 'Crag kernel ELF missing (share/crag/kin-kernel)',
     }
   }
-  const cliSrc = path.join(wrapCliTemplateDir(projectRoot) || '', CC_NODE_BIN)
+  const cliSrc = cliPayloadPath(projectRoot, CC_NODE_BIN)
   if (!isFile(cliSrc)) {
     return {
       ok: false,
@@ -837,7 +904,8 @@ function writeWrapper(destDir) {
 function installKernelPayload(src, dest, projectRoot = '') {
   const binSrc = kernelPayloadPath(src, projectRoot)
   const kernelChanged = binSrc && isFile(binSrc) ? replaceFile(binSrc, path.join(dest, WRAP_KERNEL_BIN)) : false
-  const glibcSrc = path.join(src, WRAP_GLIBC_DIR)
+  const selectedGlibc = path.join(src, WRAP_GLIBC_DIR)
+  const glibcSrc = isDir(selectedGlibc) ? selectedGlibc : path.join(projectRoot, 'share', 'wrap-cli', WRAP_GLIBC_DIR)
   if (isDir(glibcSrc)) copyDir(glibcSrc, path.join(dest, WRAP_GLIBC_DIR), { exclude: ['arm64'] })
   writeWrapper(dest)
   return kernelChanged
@@ -847,7 +915,12 @@ export function materializeWrapCli(projectRoot, vm, { uid = null, gid = null, na
   if (!projectRoot || !vm?.id) {
     return { ok: false, code: 'vm_required', error: 'projectRoot and vm id required' }
   }
-  const src = wrapCliTemplateDir(projectRoot)
+  let src
+  try {
+    src = wrapCliTemplateDir(projectRoot)
+  } catch (error) {
+    return { ok: false, code: error.code, error: error.message }
+  }
   const status = inspectWrapCliDir(src)
   if (!status.ok) return status
   const native = nativeCliForVm(vm, src, nativeCliOptions)
@@ -863,8 +936,10 @@ export function materializeWrapCli(projectRoot, vm, { uid = null, gid = null, na
     }
   }
   for (const name of WRAP_CLI_FILES) {
-    const from = native?.ok && name === WRAP_CLI_BIN ? native.dir : src
-    payloadChanged = replaceFile(path.join(from, name), path.join(dest, name)) || payloadChanged
+    const from =
+      native?.ok && name === WRAP_CLI_BIN ? path.join(native.dir, name) : cliPayloadPath(projectRoot, name, src)
+    if (name === CC_NODE_BIN && !isFile(from)) continue
+    payloadChanged = replaceFile(from, path.join(dest, name)) || payloadChanged
   }
   const changed = payloadChanged || kernelChanged
   chownTree(dest, uid, gid)
@@ -952,7 +1027,12 @@ export function captureWrapSample(projectRoot, vm) {
 }
 
 export function describeWrapSample(projectRoot) {
-  const dir = wrapCliTemplateDir(projectRoot)
+  let dir
+  try {
+    dir = wrapCliTemplateDir(projectRoot)
+  } catch (error) {
+    return { ok: false, code: error.code, error: error.message, dir: '', meta: null }
+  }
   const inspect = inspectWrapCliDir(dir)
   let meta = null
   try {
@@ -1157,7 +1237,13 @@ export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptio
     const destDir = wrapCliHomeDir(projectRoot, vm.id)
     if (version === 'v2') {
       const placement = cragV2PlacementError(vm)
-      const src = cragV2PackageRoot(projectRoot)
+      let src
+      try {
+        src = cragV2PackageRoot(projectRoot)
+      } catch (error) {
+        items.push({ id: vm.id, dataplane, kernel_version: 'v2', ok: false, code: error.code, kernel_changed: false })
+        continue
+      }
       if (placement) {
         items.push({
           id: vm.id,
@@ -1196,7 +1282,6 @@ export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptio
       items.push({ id: vm.id, dataplane, kernel_version: 'v2', ok: true, kernel_changed: kernelChanged })
       continue
     }
-    const src = dataplane === 'crag' ? crag.path : kernelPayloadPath(sample.dir, projectRoot)
     if (dataplane === 'crag' && !crag.ok) {
       items.push({ id: vm.id, dataplane, ok: false, code: 'crag_kernel_missing', kernel_changed: false })
       continue
@@ -1205,6 +1290,7 @@ export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptio
       items.push({ id: vm.id, dataplane, ok: false, code: sample.code, kernel_changed: false })
       continue
     }
+    const src = dataplane === 'crag' ? crag.path : kernelPayloadPath(sample.dir, projectRoot)
     const native = dataplane === 'crag' ? null : nativeCliForVm(vm, sample.dir, nativeCliOptions)
     if (native && !native.ok) {
       items.push({ id: vm.id, dataplane, ...native, kernel_changed: false })
