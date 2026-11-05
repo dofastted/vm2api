@@ -23,7 +23,13 @@ import {
   validateInferenceRoutingPatch,
 } from '../../src/lib/vm/slot-engine.mjs'
 
-import { persistSlotEnginePolicy, persistSlotEnginePolicyMany, summarizeVm } from '../../src/lib/vm/vm-registry.mjs'
+import {
+  getVm,
+  listVms,
+  persistSlotEnginePolicy,
+  persistSlotEnginePolicyMany,
+  summarizeVm,
+} from '../../src/lib/vm/vm-registry.mjs'
 
 test('session slots default to native capacity and clamp persisted values', () => {
   assert.equal(KERNEL_NATIVE_SLOT_COUNT, 20)
@@ -179,6 +185,24 @@ test('persistSlotEnginePolicy writes inherit as deleted fields', () => {
   assert.equal(summarizeVm(saved).inference_engine, null)
   assert.equal(summarizeVm(saved).persona_preset, null)
   fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('persisted CRAG pin survives summary projection and overrides conflicting global defaults', (t) => {
+  const root = makeRoot()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  writeVm(root, 'vm-01', { dataplane: 'wrap', crag_kernel_version: 'legacy' })
+  getVm(root, 'vm-01')
+  persistSlotEnginePolicy(root, 'vm-01', { dataplane: 'crag', crag_kernel_version: 'v2' })
+  const summary = listVms(root)[0]
+  assert.equal(summary.dataplane, 'crag')
+  assert.equal(summary.crag_kernel_version, 'v2')
+  assert.equal(resolveKernelDataplane(summary, { inference: { dataplane: 'wrap' } }), 'crag')
+  assert.equal(resolveCragKernelVersion(summary, { inference: { crag_kernel_version: 'legacy' } }), 'v2')
+  persistSlotEnginePolicy(root, 'vm-01', { dataplane: 'wrap', crag_kernel_version: '' })
+  const wrapped = listVms(root)[0]
+  assert.equal(wrapped.dataplane, 'wrap')
+  assert.equal(wrapped.crag_kernel_version, null)
+  assert.equal(resolveKernelDataplane(wrapped, { inference: { dataplane: 'crag' } }), 'wrap')
 })
 
 test('persistSlotEnginePolicyMany updates listed ids only', () => {

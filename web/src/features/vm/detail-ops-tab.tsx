@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { Vm, VmProxySnap } from '@/types/panel-vm'
+import type { Vm, VmKernelSnapshot, VmProxySnap } from '@/types/panel-vm'
 import { type CredType, credTypeLabel } from '@/lib/cred-type'
 import { isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
@@ -20,8 +20,8 @@ import {
 } from '@/components/ui/tooltip'
 import { ChoiceTiles } from '@/components/choice-tiles'
 import { isActiveVmPointer } from '@/features/vm/active-vm'
-import { VmSlotKernelSwitch } from '@/features/vm/engine-editor'
 import { Field } from '@/features/vm/detail-section-primitives'
+import { VmEngineEditor } from '@/features/vm/engine-editor'
 import { VmEnvironmentCard } from '@/features/vm/environment-card'
 import { NodeChip } from '@/features/vm/node-chip'
 import { VmPhysicalFeaturesCard } from '@/features/vm/physical-features-card'
@@ -31,6 +31,7 @@ import { VmShellCard } from '@/features/vm/vm-shell-card'
 
 type VmOpsTabProps = {
   vm: Vm
+  kernel?: VmKernelSnapshot | null
   proxy: VmProxySnap
   officialCc: boolean
   credType: CredType
@@ -72,17 +73,10 @@ export function VmOpsTab(props: VmOpsTabProps) {
   const remote = isRemoteVm(vm)
   return (
     <TabsContent value='ops' className='space-y-3 pt-4'>
-      {gpt ? null : (
-        <Card>
-          <CardHeader className='pb-2'>
-            <CardTitle className='text-sm'>内核</CardTitle>
-          </CardHeader>
-          <CardContent className='pt-0'>
-            <VmSlotKernelSwitch id={vm.id} vm={vm} flush />
-          </CardContent>
-        </Card>
-      )}
       <VmOwnerAdminCard vm={vm} />
+      {!gpt ? (
+        <VmEngineEditor id={vm.id} vm={vm} kernel={props.kernel} />
+      ) : null}
       <Card>
         <CardHeader className='pb-2'>
           <CardTitle className='text-sm'>容器</CardTitle>

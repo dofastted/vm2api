@@ -785,6 +785,7 @@ test('writeKernelConfig adds CRAG v2 fields only for a pinned local slot', () =>
       fs.readFileSync(writeKernelConfig(root, { id: 'vm-09', dataplane: 'crag' }, { token: 'tok' }).configPath, 'utf8'),
     )
     assert.equal(legacy.claude_bin, '/home/kincli/.kin/cc-node')
+    assert.equal(legacy.license_dir, '/run/kin/crag-license')
     assert.equal(legacy.crag_v2_root, undefined)
     assert.equal(legacy.node_bin, undefined)
     const v2 = JSON.parse(
@@ -795,11 +796,12 @@ test('writeKernelConfig adds CRAG v2 fields only for a pinned local slot', () =>
       ),
     )
     assert.equal(v2.dataplane, 'crag')
-    assert.equal(v2.claude_bin, '/home/kincli/.kin/cc-node')
+    assert.equal(v2.claude_bin, '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude')
     assert.equal(v2.crag_kernel_version, 'v2')
     assert.equal(v2.runtime_variant, 'crag-v2')
-    assert.equal(v2.crag_v2_root, '/home/kincli/.kin/crag-v2')
-    assert.equal(v2.node_bin, '/home/kincli/.kin/kin-kernel.bin')
+    assert.equal(v2.license_dir, '/run/kin/crag-license')
+    assert.equal(v2.crag_v2_root, undefined)
+    assert.equal(v2.node_bin, undefined)
     assert.equal(v2.telemetry.identity, undefined)
     const enabled = JSON.parse(
       fs.readFileSync(
@@ -837,6 +839,7 @@ test('writeKernelConfig adds CRAG v2 fields only for a pinned local slot', () =>
       ),
     )
     assert.equal(remote.crag_v2_root, undefined)
+    assert.equal(remote.crag_kernel_version, undefined)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -1567,5 +1570,51 @@ test('writeKernelConfig gates local upstream endpoints behind test mode', () => 
     if (previous.oauth == null) delete process.env.KIN_OAUTH_TOKEN_URL
     else process.env.KIN_OAUTH_TOKEN_URL = previous.oauth
     fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('native V2 idle reload distinguishes runnable ceiling from live tool waits', async () => {
+  const exec = { vmId: 'vm-native-idle' }
+  const restarts = []
+  let status = {
+    ok: true,
+    runtime_variant: 'crag-v2',
+    capacity: 20,
+    runnable_capacity: 4,
+    ready_slots: 3,
+    active: 0,
+    waiting: 1,
+    queued: 0,
+    pids: [42],
+  }
+  let observed
+  const firstProbe = new Promise((resolve) => {
+    observed = resolve
+  })
+  let timer
+  try {
+    const request = requestKernelReloadWhenIdle(exec, {
+      pollMs: 10,
+      health: async () => {
+        const snapshot = status
+        observed()
+        return snapshot
+      },
+      restart: async (target) => {
+        restarts.push(target.vmId)
+        return { ok: true }
+      },
+    })
+    await firstProbe
+    assert.deepEqual(restarts, [])
+    status = { ...status, ready_slots: 4, waiting: 0, pids: [] }
+    const deadline = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('native idle reload did not complete')), 3000)
+    })
+    assert.deepEqual(await Promise.race([request.done, deadline]), { ok: true })
+    assert.deepEqual(restarts, ['vm-native-idle'])
+  } finally {
+    clearTimeout(timer)
+    resetWrapRecycleState()
   }
 })

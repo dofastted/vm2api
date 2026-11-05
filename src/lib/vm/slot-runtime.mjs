@@ -30,6 +30,7 @@ import { inspectWrapCliDir, materializeSlotDataplane, materializeWrapCli, wrapCl
 import { isLocalEgressProxy } from './egress.mjs'
 import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm, slotHost } from './slot-host.mjs'
+import { checkCragLicense } from './crag-license.mjs'
 
 export { runtimeKind }
 
@@ -128,6 +129,8 @@ function wrapUsesSlotKernel(wrap) {
 
 export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
   const routing = opts.routing || {}
+  const licensed = checkCragLicense(projectRoot, vm, routing)
+  if (!licensed.ok) return licensed
   const eager = routing?.inference?.eager_start !== false
   if (isCodexVm(vm)) {
     if (!eager) return { ok: true, skipped: true, reason: 'eager_start_off', engine: 'codex' }
