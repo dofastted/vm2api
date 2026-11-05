@@ -2663,10 +2663,9 @@ export function createPanelHandler(ctx) {
         const report = await syncInstalledKernels({
           project: cfg.paths.project,
           routingConfig: ctx.routingConfig,
-          restartKernel: ctx.restartRustKernel,
           body,
           refreshCluster,
-          restartKernel: ctx.kernelPolicyOps?.restartRustKernel,
+          restartKernel: ctx.kernelPolicyOps?.restartRustKernel || ctx.restartRustKernel,
         })
         return json(res, report.ok ? 200 : 400, panel.ok(report))
       }
