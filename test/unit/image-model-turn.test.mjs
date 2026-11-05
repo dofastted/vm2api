@@ -265,3 +265,34 @@ test('no prompt, a disabled model or an upstream rejection keeps an HTTP error s
     await live.close()
   }
 })
+
+test('gpt-image-2.6-flare and sunburst generate image through chat and responses endpoints', async () => {
+  const live = await serve((url, body) => {
+    assert.equal(url, CODEX_IMAGE_GENERATIONS_URL)
+    assert.ok(body.model === 'gpt-image-2.6-flare' || body.model === 'gpt-image-2.6-sunburst')
+    assert.equal(body.prompt, 'draw a sunset')
+    return [200, IMAGE]
+  })
+  try {
+    const res = await live.post('/v1/chat/completions', {
+      model: 'gpt-image-2.6-flare',
+      messages: [{ role: 'user', content: 'draw a sunset' }],
+    })
+    assert.equal(res.status, 200)
+    const json = JSON.parse(res.text)
+    assert.equal(json.model, 'gpt-image-2.6-flare')
+    assert.ok(json.choices[0].message.content.includes('data:image/png;base64,aGk='))
+
+    const resp = await live.post('/v1/responses', {
+      model: 'gpt-image-2.6-sunburst',
+      input: [{ role: 'user', content: 'draw a sunset' }],
+    })
+    assert.equal(resp.status, 200)
+    const respJson = JSON.parse(resp.text)
+    assert.equal(respJson.model, 'gpt-image-2.6-sunburst')
+    assert.equal(respJson.output[0].type, 'image_generation_call')
+    assert.equal(respJson.output[0].result, 'aGk=')
+  } finally {
+    await live.close()
+  }
+})

@@ -277,6 +277,8 @@ const OPENAI = {
   'gpt-5.1-chat-latest': openaiFrom({ input: 1.25, output: 10, cache_read: 0.125, cache_write: 0 }),
   'gpt-5.2-codex': openaiFrom({ input: 1.75, output: 14, cache_read: 0.175, cache_write: 0 }),
   'gpt-5.2-chat-latest': openaiFrom({ input: 1.75, output: 14, cache_read: 0.175, cache_write: 0 }),
+  'gpt-image-2.6-flare': gptImage(),
+  'gpt-image-2.6-sunburst': gptImage(),
   'gpt-image-2.5-flare': gptImage(),
   'gpt-image-2.5-sunburst': gptImage(),
   'gpt-image-2': gptImage(),

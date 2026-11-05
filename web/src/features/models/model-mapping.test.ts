@@ -10,6 +10,8 @@ import {
 } from './model-mapping'
 
 const IMAGE_IDS = [
+  'gpt-image-2.6-flare',
+  'gpt-image-2.6-sunburst',
   'gpt-image-2.5-flare',
   'gpt-image-2.5-flare-2026-09-08',
   'gpt-image-2.5-sunburst',
@@ -91,6 +93,7 @@ describe('targets and problems', () => {
     expect(check('sonnet-5')).toBe('anthropic')
     expect(check('gpt-image-2.5-flare-2026-09-08')).toBe('image_tool')
     expect(check('openai/gpt-image-2.5-sunburst')).toBe('image_tool')
+    expect(check('gpt-image-2.6-flare')).toBe('image_tool')
     expect(check('gpt-5')).toBeNull()
   })
 })

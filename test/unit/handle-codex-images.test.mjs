@@ -368,3 +368,20 @@ test('the images route reads JSON generations', async () => {
   assert.equal(res.body.error.code, 'proxy_required')
   assert.equal(rows[0].model, 'gpt-image-2.5-flare')
 })
+
+test('generations supports gpt-image-2.6-flare and gpt-image-2.6-sunburst', async () => {
+  writeGptVm('vm-a')
+  const calls = []
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, init })
+    return upstream(200, { created: 1, data: [{ b64_json: 'aGk=' }], usage: USAGE })
+  }
+  for (const model of ['gpt-image-2.6-flare', 'gpt-image-2.6-sunburst']) {
+    const { res, logBag } = await images({
+      body: { model, prompt: 'a beautiful mountain' },
+      ops: { fetchImpl },
+    })
+    assert.equal(res.statusCode, 200)
+    assert.equal(logBag.image_model, model)
+  }
+})

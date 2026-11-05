@@ -27,6 +27,8 @@ function withDb(t) {
 test('seed enables image models', (t) => {
   withDb(t)
   assert.deepEqual(getGptModelPolicy().image_tools, {
+    'gpt-image-2.6-flare': { enabled: true },
+    'gpt-image-2.6-sunburst': { enabled: true },
     'gpt-image-2.5-flare': { enabled: true },
     'gpt-image-2.5-sunburst': { enabled: true },
     'gpt-image-2': { enabled: true },
@@ -34,7 +36,9 @@ test('seed enables image models', (t) => {
   assert.deepEqual(
     listImageToolModels().map((m) => [m.id, m.enabled, m.upstream_default]),
     [
-      ['gpt-image-2.5-flare', true, true],
+      ['gpt-image-2.6-flare', true, true],
+      ['gpt-image-2.6-sunburst', true, false],
+      ['gpt-image-2.5-flare', true, false],
       ['gpt-image-2.5-sunburst', true, false],
       ['gpt-image-2', true, false],
     ],
@@ -52,6 +56,8 @@ test('save keeps only known image ids with boolean enabled', (t) => {
     },
   })
   assert.deepEqual(getGptModelPolicy().image_tools, {
+    'gpt-image-2.6-flare': { enabled: true },
+    'gpt-image-2.6-sunburst': { enabled: true },
     'gpt-image-2.5-flare': { enabled: true },
     'gpt-image-2.5-sunburst': { enabled: false },
     'gpt-image-2': { enabled: false },

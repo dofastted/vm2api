@@ -291,8 +291,8 @@ export function billingBandFromUsage(usage = {}) {
   return { service_tier: tier || null, speed: speed || null }
 }
 
-// Both GPT Image 2.5 variants share one price; an omitted model is priced with it.
-const IMAGE_DEFAULT_PRICE_ID = 'gpt-image-2.5-flare'
+// GPT Image variants share one price; an omitted model is priced with it.
+const IMAGE_DEFAULT_PRICE_ID = 'gpt-image-2.6-flare'
 
 function tokenCount(v) {
   return Number.isSafeInteger(v) && v >= 0 ? v : null
