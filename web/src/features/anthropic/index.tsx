@@ -18,6 +18,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { PageHeader } from '@/components/page-header'
 import { apiEndpointsQueryOptions } from '@/features/api-endpoints/queries'
@@ -31,7 +32,8 @@ import {
 } from './console-results'
 import {
   type AuthScheme,
-  DEFAULT_URL,
+  API_DEFAULTS,
+  type ApiProtocol,
   DIRECT,
   type EndpointDraft,
   draftFromStored,
@@ -42,11 +44,12 @@ type ModelList = {
   models?: { id?: string; name?: string; alias?: string }[]
 }
 
-function freshEndpoint(): EndpointDraft {
+function freshEndpoint(protocol: ApiProtocol = 'anthropic'): EndpointDraft {
   return {
     id: crypto.randomUUID(),
-    baseUrl: DEFAULT_URL,
-    authScheme: 'x_api_key',
+    protocol,
+    riskReviewEnabled: false,
+    ...API_DEFAULTS[protocol],
     apiKey: '',
     proxyId: DIRECT,
   }
@@ -58,7 +61,13 @@ export function AnthropicConsolePage() {
   const stored = useQuery(apiEndpointsQueryOptions())
   const options = (proxies.data?.proxies || []).filter((item) => item.id)
   const [loaded, setLoaded] = useState(false)
-  const [endpoints, setEndpoints] = useState<EndpointDraft[]>([freshEndpoint()])
+  const [protocol, setProtocol] = useState<ApiProtocol>('anthropic')
+  const [allEndpoints, setEndpoints] = useState<EndpointDraft[]>([
+    freshEndpoint('anthropic'),
+    freshEndpoint('openai'),
+  ])
+  const endpoints = allEndpoints.filter((item) => item.protocol === protocol)
+  const defaultUrl = API_DEFAULTS[protocol].baseUrl
   const [openProxy, setOpenProxy] = useState<string | null>(null)
   const [models, setModels] = useState<string[]>([])
   const [model, setModel] = useState('')
@@ -68,10 +77,12 @@ export function AnthropicConsolePage() {
   const [results, setResults] = useState<Record<string, KeyResult>>({})
   useEffect(() => {
     if (loaded || !stored.data) return
-    const rows = (stored.data.items || [])
-      .filter((item) => item.protocol !== 'openai')
-      .map(draftFromStored)
-    if (rows.length) setEndpoints(rows)
+    const rows = (stored.data.items || []).map(draftFromStored)
+    for (const kind of ['anthropic', 'openai'] as const) {
+      if (!rows.some((item) => item.protocol === kind))
+        rows.push(freshEndpoint(kind))
+    }
+    setEndpoints(rows)
     setLoaded(true)
   }, [loaded, stored.data])
   function patchEndpoint(id: string, patch: Partial<EndpointDraft>) {
@@ -100,7 +111,7 @@ export function AnthropicConsolePage() {
 
   const send = useMutation({
     mutationFn: (index: number | null) =>
-      api<ConsoleResult>('/api/panel/anthropic/messages', {
+      api<ConsoleResult>('/api/panel/api/messages', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -108,7 +119,8 @@ export function AnthropicConsolePage() {
           max_tokens: Number(maxTokens),
           message,
           keys: endpoints.map((item) => ({
-            base_url: item.baseUrl.trim() || DEFAULT_URL,
+            protocol,
+            base_url: item.baseUrl.trim() || defaultUrl,
             auth_scheme: item.authScheme,
             api_key: item.apiKey.trim(),
             key_id: item.apiKey.trim() ? '' : item.keyId || '',
@@ -128,9 +140,11 @@ export function AnthropicConsolePage() {
   })
 
   const fetchModels = useMutation({
-    mutationFn: () => {
+    mutationFn: (endpointId?: string) => {
       const endpoint = endpoints.find(
-        (item) => item.apiKey.trim() || item.keyId
+        (item) =>
+          (!endpointId || item.id === endpointId) &&
+          (item.apiKey.trim() || item.keyId)
       )
       if (!endpoint) throw new Error('先保存或填写一把密钥')
       return api<ModelList>('/api/panel/api-endpoints/fetch-models', {
@@ -138,16 +152,16 @@ export function AnthropicConsolePage() {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           kind: 'custom',
-          protocol: 'anthropic',
-          base_url: endpoint.baseUrl.trim() || DEFAULT_URL,
+          protocol,
+          base_url: endpoint.baseUrl.trim() || defaultUrl,
           api_key: endpoint.apiKey.trim(),
           key_id: endpoint.apiKey.trim() ? '' : endpoint.keyId || '',
           auth_scheme: endpoint.authScheme,
           proxy_id: endpoint.proxyId === DIRECT ? '' : endpoint.proxyId,
         }),
-      })
+      }).then((data) => ({ data, endpointId: endpoint.id }))
     },
-    onSuccess: (data) => {
+    onSuccess: ({ data, endpointId }) => {
       const seen: Record<string, true> = {}
       const ids: string[] = []
       for (const item of data.models || []) {
@@ -157,7 +171,8 @@ export function AnthropicConsolePage() {
         ids.push(id)
       }
       setModels(ids)
-      if (!model && ids[0]) setModel(ids[0])
+      if (ids.length) patchEndpoint(endpointId, { fetchedModels: ids })
+      if (!ids.includes(model) && ids[0]) setModel(ids[0])
       if (!ids.length) toast.error('上游没有返回模型')
     },
     onError: (error: Error) => toast.error(error.message),
@@ -167,7 +182,11 @@ export function AnthropicConsolePage() {
     mutationFn: async (item: EndpointDraft) => {
       const request = endpointSaveRequest(item, model)
       return api<{
-        item?: { id?: string; api_key_entries?: { id?: string }[] }
+        item?: {
+          id?: string
+          api_key_entries?: { id?: string }[]
+          models?: { name: string; alias: string }[]
+        }
       }>(request.path, {
         method: request.method,
         headers: { 'content-type': 'application/json' },
@@ -185,8 +204,11 @@ export function AnthropicConsolePage() {
                   storedId: saved.id,
                   keyId: saved.api_key_entries?.[0]?.id || row.keyId,
                   apiKey: '',
+                  fetchedModels: undefined,
                   stored: {
-                    baseUrl: item.baseUrl.trim() || DEFAULT_URL,
+                    protocol: item.protocol,
+                    riskReviewEnabled: item.riskReviewEnabled === true,
+                    baseUrl: item.baseUrl.trim() || defaultUrl,
                     authScheme: item.authScheme,
                     proxyId: item.proxyId,
                   },
@@ -204,8 +226,35 @@ export function AnthropicConsolePage() {
   })
 
   return (
-    <PageHeader title={VIEW_TITLES.anthropic}>
+    <PageHeader title={VIEW_TITLES.api}>
       <div className='mx-auto grid max-w-5xl gap-6'>
+        <div
+          className='flex flex-wrap gap-2'
+          role='group'
+          aria-label='API 协议'
+        >
+          {(['anthropic', 'openai'] as const).map((kind) => (
+            <Button
+              key={kind}
+              variant={protocol === kind ? 'secondary' : 'outline'}
+              disabled={
+                testing !== null || fetchModels.isPending || save.isPending
+              }
+              aria-pressed={protocol === kind}
+              onClick={() => {
+                setProtocol(kind)
+                setModel('')
+                setModels([])
+              }}
+            >
+              {kind}
+            </Button>
+          ))}
+        </div>
+        <p className='text-sm text-muted-foreground'>
+          保存地址、密钥及模型后，渠道选择 API 的密钥会从这里调用，不使用 OAuth
+          虚拟机。
+        </p>
         <div>
           <div className='mb-2 hidden grid-cols-[minmax(10rem,1.1fr)_8rem_minmax(0,1.4fr)_8rem_auto] gap-2 px-1 text-xs text-muted-foreground @2xl/content:grid'>
             <span>地址</span>
@@ -217,7 +266,7 @@ export function AnthropicConsolePage() {
           <div className='divide-y rounded-md border'>
             {endpoints.map((item, index) => {
               const result = results[item.id]
-              const custom = item.baseUrl.trim() !== DEFAULT_URL
+              const custom = item.baseUrl.trim() !== defaultUrl
               return (
                 <div key={item.id} className='px-2 py-2'>
                   <div className='grid items-center gap-2 @2xl/content:grid-cols-[minmax(10rem,1.1fr)_8rem_minmax(0,1.4fr)_8rem_auto]'>
@@ -234,6 +283,7 @@ export function AnthropicConsolePage() {
                     />
                     <Select
                       value={item.authScheme}
+                      disabled={protocol === 'openai'}
                       onValueChange={(value) =>
                         patchEndpoint(item.id, {
                           authScheme: value as AuthScheme,
@@ -260,7 +310,7 @@ export function AnthropicConsolePage() {
                       onChange={(event) =>
                         patchEndpoint(item.id, { apiKey: event.target.value })
                       }
-                      placeholder='sk-ant-…'
+                      placeholder={protocol === 'openai' ? 'sk-…' : 'sk-ant-…'}
                       aria-label={`密钥 ${index + 1}`}
                     />
                     <Popover
@@ -319,7 +369,15 @@ export function AnthropicConsolePage() {
                         ))}
                       </PopoverContent>
                     </Popover>
-                    <div className='grid grid-cols-3 gap-1'>
+                    <div className='grid grid-cols-4 gap-1'>
+                      <Button
+                        type='button'
+                        variant='outline'
+                        disabled={fetchModels.isPending}
+                        onClick={() => fetchModels.mutate(item.id)}
+                      >
+                        模型
+                      </Button>
                       <Button
                         type='button'
                         variant='outline'
@@ -359,6 +417,37 @@ export function AnthropicConsolePage() {
                       </Button>
                     </div>
                   </div>
+                  {protocol === 'anthropic' ? (
+                    <div className='mt-3 flex items-start gap-3 px-1 pb-1'>
+                      <Switch
+                        id={`risk-review-${item.id}`}
+                        aria-describedby={`risk-review-help-${item.id}`}
+                        checked={item.riskReviewEnabled === true}
+                        disabled={save.isPending}
+                        onCheckedChange={(checked) =>
+                          patchEndpoint(item.id, { riskReviewEnabled: checked })
+                        }
+                      />
+                      <div className='grid gap-1 text-sm'>
+                        <label htmlFor={`risk-review-${item.id}`}>
+                          风控前置审查
+                        </label>
+                        <p
+                          id={`risk-review-help-${item.id}`}
+                          className='text-xs text-muted-foreground'
+                        >
+                          默认关闭，修改后需保存。开启后，API Key 推理请求先按
+                          <a
+                            href='#/risk'
+                            className='underline underline-offset-4'
+                          >
+                            风险审计
+                          </a>
+                          中启用的规则与决策模型审查，通过后再调用此端点；不影响本页连通性测试。
+                        </p>
+                      </div>
+                    </div>
+                  ) : null}
                   {result ? (
                     <p
                       className={cn(
@@ -383,7 +472,7 @@ export function AnthropicConsolePage() {
             variant='ghost'
             className='mt-1 px-2'
             onClick={() =>
-              setEndpoints((current) => [...current, freshEndpoint()])
+              setEndpoints((current) => [...current, freshEndpoint(protocol)])
             }
           >
             添加一个地址

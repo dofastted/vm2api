@@ -1818,7 +1818,7 @@ export function createPanelHandler(ctx) {
           const result = await fetchUpstreamModels({
             cfg,
             kind: body?.kind,
-            protocol: body?.protocol,
+            protocol: body?.protocol || saved?.protocol,
             base_url: body?.base_url || saved?.base_url,
             api_key: body?.api_key || saved?.api_key,
             proxy_url: proxyUrl,
@@ -1861,6 +1861,7 @@ export function createPanelHandler(ctx) {
           const proxyUrl = body?.proxy_id ? resolveConsoleProxyUrl(proxyPool, body.proxy_id) : ''
           const rec = apiEndpointStore.update(id, body || {})
           if (!rec) return json(res, 404, { ok: false, error: { message: 'endpoint not found' } })
+          if (Array.isArray(body?.fetched_models)) apiEndpointStore.mergeFetchedModels(id, body.fetched_models)
           const keyId = String(body?.key_id || '').trim()
           const apiKey = String(body?.api_key || '').trim()
           if (keyId) {
@@ -1953,7 +1954,7 @@ export function createPanelHandler(ctx) {
         const item = publicEndpointView(ep)?.api_key_entries?.find((k) => k.id === kid)
         return json(res, 200, { ok: true, item })
       }
-      if (req.method === 'POST' && p === '/api/panel/anthropic/messages') {
+      if (req.method === 'POST' && /^\/api\/panel\/(?:api|anthropic)\/messages$/.test(p)) {
         const body = await readBody(req, 64 * 1024).catch(() => ({}))
         try {
           const result = await runAnthropicConsole({

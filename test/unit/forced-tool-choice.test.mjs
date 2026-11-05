@@ -101,7 +101,7 @@ for (const protocol of ['anthropic.messages', 'openai.chat', 'openai.responses']
     )
   })
 
-  test(`${protocol} rejects unsupported requests before admission or upstream selection`, async () => {
+  test(`${protocol} OAuth rejects unsupported requests before admission or upstream selection`, async () => {
     const input = protocolRequest(protocol, 'claude-sonnet-5-5')
     let admissions = 0
     let selections = 0
@@ -148,7 +148,7 @@ for (const protocol of ['anthropic.messages', 'openai.chat', 'openai.responses']
       url: '/v1/messages',
       headers: { 'user-agent': 'test-client' },
       apiKeyKind: 'managed',
-      apiKeyRecord: { category: 'api', user_id: 'admin' },
+      apiKeyRecord: { category: 'oauth', user_id: 'admin' },
       once() {},
       off() {},
     }

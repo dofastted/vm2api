@@ -1,6 +1,7 @@
-import { createFileRoute } from '@tanstack/react-router'
-import { AnthropicConsolePage } from '@/features/anthropic'
+import { createFileRoute, redirect } from '@tanstack/react-router'
 
 export const Route = createFileRoute('/_authenticated/anthropic')({
-  component: AnthropicConsolePage,
+  beforeLoad: () => {
+    throw redirect({ to: '/api', replace: true })
+  },
 })
