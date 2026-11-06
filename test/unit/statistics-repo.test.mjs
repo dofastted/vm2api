@@ -276,6 +276,7 @@ test('API OpenAI replies converted to non-streaming Anthropic retain disjoint hi
           actual_cost: 0.2,
         },
       ])
+      db.prepare(`UPDATE vms SET owner_user_id = 'u1' WHERE id = 'vm-a'`).run()
       const stored = db.prepare('SELECT * FROM usage_logs').all()
       assert.equal(stored[0].input_tokens, 20 - cacheWrite)
       assert.equal(stored[0].cache_read_tokens, 80)
@@ -327,6 +328,7 @@ test('mixed-provider cache rates weight each row by prompt tokens for every scop
       // Outside the current window: must not change its denominator.
       { ...shared, created_at: '2026-04-30T23:59:59.000Z', cache_creation_tokens: 10_000 },
     ])
+    db.prepare(`UPDATE vms SET owner_user_id = 'u1' WHERE id = 'vm-a'`).run()
     const repo = new StatisticsRepo(db)
     const options = { range: 'today', tz: 'UTC', now }
     const expected = 480 / 1100
@@ -349,7 +351,7 @@ test('mixed-provider cache rates weight each row by prompt tokens for every scop
   }
 })
 
-test('panel routes owner-scope statistics for users and reject user/vm groupings', async () => {
+test('panel routes owner-scope statistics for users and reject the user grouping', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-stats-route-'))
   const db = openDatabase({ dbPath: path.join(dir, 'panel.db') })
   try {
@@ -379,7 +381,9 @@ test('panel routes owner-scope statistics for users and reject user/vm groupings
       return response
     }
     assert.equal((await call('user', '/api/panel/statistics?dimension=user')).status, 400)
-    assert.equal((await call('user', '/api/panel/statistics/leaderboard?scope=vm')).status, 400)
+    const vmBoard = await call('user', '/api/panel/statistics/leaderboard?scope=vm')
+    assert.equal(vmBoard.status, 200)
+    assert.deepEqual(vmBoard.body.data.entries, [])
     assert.equal((await call('admin', '/api/panel/statistics?range=never')).status, 400)
 
     const mine = await call('user', '/api/panel/statistics/leaderboard?scope=key&range=today&user_id=u2')
@@ -391,6 +395,72 @@ test('panel routes owner-scope statistics for users and reject user/vm groupings
     const all = await call('admin', '/api/panel/statistics?dimension=user&range=today')
     assert.equal(all.status, 200)
     assert.equal(all.body.data.totals.cost, 8)
+  } finally {
+    closeDatabase()
+  }
+})
+
+test('tenant vm scope lists each owned slot and hides pool slots', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-stats-owned-'))
+  const db = openDatabase({ dbPath: path.join(dir, 'panel.db') })
+  try {
+    seedUsers(db)
+    db.exec(`
+      UPDATE vms SET owner_user_id = 'u1' WHERE id = 'vm-a';
+      INSERT INTO vms (id, name, vm_json, owner_user_id) VALUES
+        ('vm-idle', 'Idle', '{}', 'u1'),
+        ('vm-pool', 'Pool', '{}', NULL);
+    `)
+    const at = new Date(Date.now() - 1000).toISOString()
+    seed(db, [
+      {
+        created_at: at,
+        user_id: 'u1',
+        api_key_id: 'k1',
+        vm_id: 'vm-a',
+        total_cost: 3,
+        input_tokens: 10,
+        output_tokens: 4,
+        cache_read_tokens: 6,
+        cache_creation_tokens: 2,
+        cache_creation_5m_tokens: 1,
+        cache_creation_1h_tokens: 1,
+      },
+      {
+        created_at: at,
+        user_id: 'u1',
+        api_key_id: 'k1',
+        vm_id: 'vm-pool',
+        total_cost: 9,
+        input_tokens: 100,
+      },
+    ])
+    const repo = new StatisticsRepo(db)
+    const board = repo.leaderboard({ range: 'today', scope: 'vm', owner_user_id: 'u1', limit: 100 })
+    assert.deepEqual(
+      board.entries.map((entry) => entry.id),
+      ['vm-a', 'vm-idle'],
+    )
+    assert.equal(board.entries[0].name, 'Slot A')
+    assert.equal(board.entries[0].totalCost, 3)
+    assert.equal(board.entries[0].inputTokens, 10)
+    assert.equal(board.entries[0].outputTokens, 4)
+    assert.equal(board.entries[0].cacheReadTokens, 6)
+    assert.equal(board.entries[0].cacheCreationTokens, 2)
+    assert.equal(board.entries[0].cacheCreation5mTokens, 1)
+    assert.equal(board.entries[0].cacheCreation1hTokens, 1)
+    assert.equal(board.entries[0].totalTokens, 22)
+    assert.equal(board.entries[1].name, 'Idle')
+    assert.equal(board.entries[1].totalRequests, 0)
+    assert.equal(board.entries[1].totalCost, 0)
+    const chart = repo.statistics({ range: 'today', dimension: 'vm', owner_user_id: 'u1' })
+    assert.deepEqual(
+      chart.series.map((series) => series.id),
+      ['vm-a'],
+    )
+    assert.equal(chart.totals.cost, 12)
+    assert.equal(chart.totals.inputTokens, 110)
+    assert.equal(chart.totals.cacheCreation5mTokens, 1)
   } finally {
     closeDatabase()
   }
