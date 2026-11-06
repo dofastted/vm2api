@@ -12,6 +12,7 @@ import {
   PackageCheck,
   RadioTower,
   ScrollText,
+  ShieldCheck,
   type LucideIcon,
 } from 'lucide-react'
 
@@ -22,6 +23,7 @@ export const SETTINGS_TABS = [
   ['openai', 'OpenAI'],
   ['logs', '日志'],
   ['protocol', '协议'],
+  ['redaction', '脱敏'],
   ['init', '初装'],
   ['health', '探测'],
   ['notify', '通知'],
@@ -52,7 +54,10 @@ export const SETTINGS_NAV_GROUPS: {
   },
   {
     label: '协议',
-    items: [{ id: 'protocol', icon: Fingerprint }],
+    items: [
+      { id: 'protocol', icon: Fingerprint },
+      { id: 'redaction', icon: ShieldCheck },
+    ],
   },
   {
     label: '槽位',

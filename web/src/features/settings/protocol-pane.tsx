@@ -51,19 +51,13 @@ function autoCompactWindowValue(value: unknown) {
 export function ProtocolPane({
   compat,
   inference,
-  redaction,
-  runtime,
   onCompatChange,
   onInferenceChange,
-  onRedactionChange,
 }: {
   compat: Block
   inference: Block
-  redaction: Block
-  runtime: Block
   onCompatChange: (next: Block) => void
   onInferenceChange: (patch: Block) => void
-  onRedactionChange: (next: Block) => void
 }) {
   const strict = compat.claude_code_only === true
   const relay = detectProxiedOfficialCcFromCompat(compat)
@@ -298,85 +292,6 @@ export function ProtocolPane({
             onInferenceChange({ session_idle_ttl_seconds: value })
           }
         />
-      </PaneSection>
-      <PaneSection
-        icon={ShieldCheck}
-        title='内容脱敏'
-        desc='保存后只影响新请求。关闭不清空规则。签名 thinking、图片和 opaque 内容不在此承诺内。'
-        aside={
-          <Badge
-            variant={runtime.ready && runtime.enabled ? 'default' : 'secondary'}
-          >
-            {runtime.error
-              ? '不可用，新请求会被阻断'
-              : runtime.enabled && runtime.ready
-                ? '正在保护新请求'
-                : redaction.enabled
-                  ? '已保存，等待生效'
-                  : '未开启'}
-          </Badge>
-        }
-      >
-        <div className='divide-y'>
-          <SettingRow
-            label='Node 内容脱敏'
-            desc='关闭时明文会发给上游。保存后对新进入的请求生效，进行中的请求保持原策略。'
-          >
-            <Switch
-              checked={redaction.enabled === true}
-              onCheckedChange={(on) =>
-                onRedactionChange({ ...redaction, enabled: on })
-              }
-              aria-label='Node 内容脱敏'
-            />
-          </SettingRow>
-          <SettingRow
-            label='凭据与秘密'
-            desc='API key、token、私钥和连接串密码。'
-          >
-            <Switch
-              checked={redaction.secrets !== false}
-              disabled={redaction.enabled !== true}
-              onCheckedChange={(on) =>
-                onRedactionChange({ ...redaction, secrets: on })
-              }
-              aria-label='脱敏凭据与秘密'
-            />
-          </SettingRow>
-          <SettingRow
-            label='个人信息'
-            desc='邮箱、电话、证件号和卡号。不把协议 ID 一律遮住。'
-          >
-            <Switch
-              checked={redaction.personal !== false}
-              disabled={redaction.enabled !== true}
-              onCheckedChange={(on) =>
-                onRedactionChange({ ...redaction, personal: on })
-              }
-              aria-label='脱敏个人信息'
-            />
-          </SettingRow>
-          <SettingRow
-            label='自定义词'
-            desc='一行一个。关闭总开关后仍保留，不会被清空。'
-          >
-            <textarea
-              aria-label='自定义敏感词'
-              disabled={redaction.enabled !== true}
-              rows={4}
-              value={
-                Array.isArray(redaction.words) ? redaction.words.join('\n') : ''
-              }
-              onChange={(event) =>
-                onRedactionChange({
-                  ...redaction,
-                  words: event.target.value.split('\n'),
-                })
-              }
-              className='w-full rounded-md border bg-transparent p-2 font-mono text-sm'
-            />
-          </SettingRow>
-        </div>
       </PaneSection>
       <OutboundReference />
     </div>
