@@ -1611,6 +1611,7 @@ export function createPanelHandler(ctx) {
             role: body.role || 'user',
             enabled: body.enabled !== false,
             vm_create_quota: body.vm_create_quota,
+            concurrency: body.concurrency,
           })
           return json(res, 201, panel.ok({ item: publicUserView(rec) }))
         } catch (e) {

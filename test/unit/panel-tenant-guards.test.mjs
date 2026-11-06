@@ -540,6 +540,58 @@ test('unrelated user edits keep sessions alive', async (t) => {
   assert.equal(verifyPanelSession(token)?.user, 'quota')
 })
 
+test('admin user routes show, set and validate user concurrency', async (t) => {
+  const panelUsers = usersFixture(t)
+  const root = makeProject(t)
+  const call = (who, body, method, url) => makeHandler(root, who, body, { panelUsers }).call(method, url)
+
+  const created = await call(
+    ADMIN,
+    { username: 'heavy', password: 'heavy-pass', concurrency: 20 },
+    'POST',
+    '/api/panel/users',
+  )
+  assert.equal(created.status, 201, JSON.stringify(created.body))
+  assert.equal(created.body.data.item.concurrency, 20)
+  const id = created.body.data.item.id
+
+  const listed = await call(ADMIN, {}, 'GET', '/api/panel/users')
+  assert.equal(listed.body.data.items.find((u) => u.id === id).concurrency, 20)
+  assert.equal(listed.body.data.items.find((u) => u.username === 'boss').concurrency, 5)
+
+  const patched = await call(ADMIN, { concurrency: 3 }, 'PATCH', `/api/panel/users/${id}`)
+  assert.equal(patched.status, 200, JSON.stringify(patched.body))
+  assert.equal(patched.body.data.item.concurrency, 3)
+
+  const unlimited = await call(ADMIN, { concurrency: 0 }, 'PATCH', `/api/panel/users/${id}`)
+  assert.equal(unlimited.status, 200, JSON.stringify(unlimited.body))
+  assert.equal(unlimited.body.data.item.concurrency, 0)
+  const restored = await call(ADMIN, { concurrency: 3 }, 'PATCH', `/api/panel/users/${id}`)
+  assert.equal(restored.status, 200, JSON.stringify(restored.body))
+
+  for (const concurrency of [-1, 1001, 1.5, '4']) {
+    const bad = await call(ADMIN, { concurrency }, 'PATCH', `/api/panel/users/${id}`)
+    assert.equal(bad.status, 400, JSON.stringify(concurrency))
+    assert.equal(bad.body.error.code, 'invalid_concurrency')
+  }
+  const badCreate = await call(
+    ADMIN,
+    { username: 'nope', password: 'nope-pass1', concurrency: -2 },
+    'POST',
+    '/api/panel/users',
+  )
+  assert.equal(badCreate.status, 400)
+  assert.equal(badCreate.body.error.code, 'invalid_concurrency')
+  assert.equal(panelUsers.getByUsername('nope'), null)
+  assert.equal(panelUsers.getById(id).concurrency, 3)
+
+  for (const who of [TENANT, { panelUser: 'ops', panelRole: 'super', panelUserId: 'u-ops' }]) {
+    const denied = await call(who, { concurrency: 999 }, 'PATCH', `/api/panel/users/${id}`)
+    assert.equal(denied.status, 403, who.panelRole)
+  }
+  assert.equal(panelUsers.getById(id).concurrency, 3)
+})
+
 test('test-models is readable by user and super; other routes stay closed', () => {
   for (const role of ['user', 'super', 'admin']) {
     assert.equal(authorizePanelRoute('GET', '/api/panel/test-models', role).ok, true, role)
