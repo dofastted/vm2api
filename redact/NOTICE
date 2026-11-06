@@ -1,0 +1,13 @@
+Ported from AgentDock/magpie engine/internal/redact (MIT, Copyright (c) 2026 yetone).
+Snapshot SHA-256 of the copied production sources before vm2api scope edits:
+
+5d0cd0652532e431f2fa45c68f1709b4b537c04e4d75b2c1e77f2721a53c7c34  redact.go
+237094817a630d759aedf51ce3ed16ae9f25721839c8b4604d93c890674cfbe4  json.go
+c61261b2fed73e1519811386849edf60908ac1d2e05a9e59e9e7db7c26b0c492  known.go
+69714f373ea974ae0167ba4c2d0ebea1202b9aae228ff6732af66c8ed2a3ff0c  writer.go
+51a4415d832340c0aacfefa053f3c5c7cebb5af7eecf7d3bf299ad691b94a87c  rules.go
+45b48000ed772462e07290d19b942cc29764285ce5dfdfcace3fed6a7a9bde47  more.go
+5eec597962b2fdb89dd3c7230e2455c6a2731c88c3ed4f567027f07fa7498e6b  zhname.go
+6bbb845e684b8972f8da4443e8bd4fa66c295a5917c48030784073e2d115146a  ids.go
+46c6b445baf8a7a27f7220fc91aae9db3776f3508488a6fe06d59cff02d64817  model.go
+3156a28003978e68b94ca85750db4f923c881e3e0292ff4f35c8395c2b86eb58  shape.go

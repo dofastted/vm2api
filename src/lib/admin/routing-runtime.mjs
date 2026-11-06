@@ -31,6 +31,8 @@ import { normalizeOfficialCcConfig } from '../oauth/official-cc-bootstrap.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
 import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
 import { mergeNotifyConfig } from './notify.mjs'
+import { normalizeRedaction } from '../redaction/policy.mjs'
+import { ensureRedaction } from '../redaction/runtime.mjs'
 import { normalizeLoggingConfig } from './request-log.mjs'
 import { markVmRefreshError } from '../oauth/oauth-credentials.mjs'
 import { shouldMarkMissingRefresh } from '../pool/schedule-eligibility.mjs'
@@ -435,6 +437,13 @@ export function createRoutingRuntime(ctx) {
     const hasCodexQuota = body?.codex && Object.prototype.hasOwnProperty.call(body.codex, 'quota')
     if (hasCodexQuota) validateOpenAIQuotaPatch(body.codex.quota)
     validateInferenceWebsocketPatch(body)
+    let nextRedaction = null
+    if (body.redaction !== undefined) {
+      nextRedaction = normalizeRedaction(body.redaction)
+      if (nextRedaction.enabled) {
+        await ensureRedaction({ redaction: nextRedaction }, { projectRoot: ctx.cfg.paths.project })
+      }
+    }
     let routingConfig = getRouting()
     const prevOfficialCc = routingConfig.official_cc
     const prevHealthProbe = routingConfig.health_probe
@@ -517,6 +526,7 @@ export function createRoutingRuntime(ctx) {
         mutedErrorClasses: routingConfig.logging.muted_error_classes,
       })
     }
+    if (nextRedaction) routingConfig.redaction = nextRedaction
     fs.mkdirSync(path.dirname(ctx.routingConfigPath), { recursive: true })
     fs.writeFileSync(ctx.routingConfigPath, JSON.stringify(routingConfig, null, 2))
     ctx.stickyRouter.reloadConfig(routingConfig)
@@ -594,6 +604,7 @@ export function createRoutingRuntime(ctx) {
       doc.pool = normalizePoolRouting(doc.pool)
       doc.vm = normalizeVmConfig(doc.vm)
       if (!hasOpenAIQuota) migrateLegacyOpenAIPolicies(doc)
+      if (doc.redaction != null) doc.redaction = normalizeRedaction(doc.redaction)
       return doc
     } catch (error) {
       throw new Error(`Routing config '${ctx.routingConfigPath}' has invalid JSON: ${error?.message || error}`, {
