@@ -4,7 +4,6 @@ import { VIEW_DESCRIPTIONS, VIEW_TITLES } from '@/config/nav'
 import type { LeaderboardScope, StatsDimension } from '@/types/panel-statistics'
 import { Activity, Clock, DollarSign, TrendingUp } from 'lucide-react'
 import { formatCurrency, formatDuration } from '@/lib/usage-format'
-import { cn } from '@/lib/utils'
 import { PageHeader } from '@/components/page-header'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
@@ -16,10 +15,10 @@ import { BentoMetricCard } from './metric-card'
 import { usageOverviewQueryOptions } from './queries'
 import { StatisticsChartCard } from './statistics-chart-card'
 import { browserTimeZone, percentChange } from './stats-format'
+import { TenantUsage } from './tenant-usage'
 
 const ADMIN_DIMENSIONS: StatsDimension[] = ['user', 'key', 'model', 'vm']
-// user 角色只能看本人数据，后端对 user / vm 维度回 400。
-const USER_DIMENSIONS: StatsDimension[] = ['key', 'model']
+const USER_DIMENSIONS: StatsDimension[] = ['vm', 'key', 'model']
 
 const ADMIN_CARDS: { scope: LeaderboardScope; title: string }[] = [
   { scope: 'user', title: '用户排行' },
@@ -27,9 +26,11 @@ const ADMIN_CARDS: { scope: LeaderboardScope; title: string }[] = [
   { scope: 'model', title: '模型排行' },
 ]
 const USER_CARDS: { scope: LeaderboardScope; title: string }[] = [
+  { scope: 'vm', title: '可用 VM' },
   { scope: 'key', title: '密钥排行' },
   { scope: 'model', title: '模型排行' },
 ]
+const TENANT_SCOPE_LABELS = { vm: '可用 VM' } as const
 const CARD_ACCENTS = ['primary', 'purple', 'blue'] as const
 
 export function StatisticsPage() {
@@ -117,16 +118,15 @@ function StatisticsDashboard({ isUser }: { isUser: boolean }) {
         />
       </BentoGrid>
 
-      <StatisticsChartCard dimensions={dimensions} tz={tz} />
+      {isUser ? <TenantUsage tz={tz} /> : null}
 
-      <div
-        className={cn(
-          'grid grid-cols-1 gap-6 sm:grid-cols-2',
-          isUser
-            ? 'lg:grid-cols-[1fr_1fr_280px]'
-            : 'lg:grid-cols-[1fr_1fr_1fr_280px]'
-        )}
-      >
+      <StatisticsChartCard
+        dimensions={dimensions}
+        dimensionLabels={isUser ? TENANT_SCOPE_LABELS : undefined}
+        tz={tz}
+      />
+
+      <div className='grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-[1fr_1fr_1fr_280px]'>
         {cards.map((card, index) => (
           <LeaderboardCard
             key={card.scope}
@@ -146,6 +146,8 @@ function StatisticsDashboard({ isUser }: { isUser: boolean }) {
           tz={tz}
           scope={boardScope}
           onScopeChange={setBoardScope}
+          scopeLabels={isUser ? TENANT_SCOPE_LABELS : undefined}
+          entryLimit={isUser ? 100 : undefined}
         />
       </div>
     </div>
