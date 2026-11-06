@@ -4,6 +4,7 @@ package server
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,6 +52,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /health", s.health)
 	mux.HandleFunc("POST /v1/mask", s.mask)
 	mux.HandleFunc("POST /v1/restore", s.restore)
+	mux.HandleFunc("POST /v1/validate", s.validate)
 	mux.HandleFunc("POST /v1/release", s.release)
 	return mux
 }
@@ -70,6 +73,17 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) mask(w http.ResponseWriter, r *http.Request) {
 	s.transform(w, r, true)
+}
+
+func (s *Server) validate(w http.ResponseWriter, r *http.Request) {
+	if !s.allow(w, r) {
+		return
+	}
+	if _, err := policyFrom(r); err != nil {
+		http.Error(w, "invalid_redaction_config", http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) restore(w http.ResponseWriter, r *http.Request) {
@@ -161,12 +175,12 @@ func subtleEq(got, want string) bool {
 }
 
 func policyFrom(r *http.Request) (Policy, error) {
-	raw := r.Header.Get("X-Kin-Redact-Policy")
-	if raw == "" {
-		return Policy{}, errors.New("missing policy")
+	payload, err := policyPayload(r.Header.Get("X-Kin-Redact-Policy"))
+	if err != nil {
+		return Policy{}, err
 	}
 	var p Policy
-	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+	if err := json.Unmarshal(payload, &p); err != nil {
 		return Policy{}, err
 	}
 	if !p.Secrets && !p.Personal && len(p.Words) == 0 && len(p.Rules) == 0 {
@@ -193,6 +207,21 @@ func policyFrom(r *http.Request) (Policy, error) {
 		p.Rules = checked
 	}
 	return p, nil
+}
+
+func policyPayload(raw string) ([]byte, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, errors.New("missing policy")
+	}
+	if strings.HasPrefix(raw, "{") {
+		return []byte(raw), nil
+	}
+	decoded, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, err
+	}
+	return decoded, nil
 }
 
 func scopeID(principal, session string) string {

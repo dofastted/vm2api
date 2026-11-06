@@ -11,7 +11,7 @@ function request({ socketPath, capability, method, path, principal, session, pol
           'x-kin-redact-capability': capability,
           'x-kin-redact-principal': principal || '',
           'x-kin-redact-session': session || '',
-          'x-kin-redact-policy': JSON.stringify(policy || {}),
+          'x-kin-redact-policy': Buffer.from(JSON.stringify(policy || {}), 'utf8').toString('base64'),
           'x-kin-redact-codec': codec || 'text',
           'content-type': 'application/octet-stream',
         },
@@ -73,6 +73,16 @@ export function createRedactionClient({ socketPath, capability }) {
         policy,
         body,
         codec,
+      })
+    },
+    validate({ policy }) {
+      return request({
+        socketPath,
+        capability,
+        method: 'POST',
+        path: '/v1/validate',
+        policy,
+        body: '',
       })
     },
   }

@@ -36,7 +36,7 @@ import {
 import { extraHeadersFromLimitError } from '../pool/quota-window.mjs'
 import { createStreamTiming } from '../protocol/stream-timing.mjs'
 import { mergeUsage } from '../protocol/openai-usage.mjs'
-import { ensureRedaction, maskJson, restoreJsonValue, restoreSseLine } from '../redaction/runtime.mjs'
+import { ensureRedaction, maskJson, restoreJsonValue, createSseRestorer } from '../redaction/runtime.mjs'
 
 const MAX_BODY = 64 * 1024 * 1024
 const credentialRefreshTail = new Map()
@@ -913,13 +913,14 @@ export async function streamGoWorker({
       // message_stop is the protocol terminal event, but the kernel still sends
       // job_done and its trailers afterward. Keep reading until the worker
       // closes the response so a normal completion is not mistaken for cancel.
+      const sseRestorer = prepared.redaction ? createSseRestorer(prepared.redaction) : null
       for await (const chunk of response) {
         receivedAt = Date.now()
         buffer += Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
         let newline
         while ((newline = buffer.indexOf('\n')) >= 0) {
           let line = buffer.slice(0, newline).replace(/\r$/, '')
-          if (prepared.redaction) line = await restoreSseLine(line, prepared.redaction)
+          if (sseRestorer) line = await sseRestorer.line(line)
           buffer = buffer.slice(newline + 1)
           // CLI diagnostics share the internal stream, never the caller's SSE.
           if (line.startsWith('event:')) outboundHeadersFrame = line.slice(6).trim() === 'kin_outbound_headers'

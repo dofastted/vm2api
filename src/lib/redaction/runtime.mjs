@@ -107,6 +107,7 @@ async function bootHelper(policy, { projectRoot, binPath }) {
     const capability = await waitForFile(helper.capabilityFile)
     const client = createRedactionClient({ socketPath: helper.sock, capability })
     await client.health()
+    await client.validate({ policy: policyView(policy) })
     state = { enabled: true, ready: true, policy, client, child: helper.child, error: null }
     return state
   } catch (error) {
@@ -162,4 +163,58 @@ export async function restoreSseLine(line, ctx = {}) {
   if (!piece || piece === '[DONE]') return line
   const restored = await restoreJsonText(piece, ctx)
   return `data: ${restored}`
+}
+
+const TEXT_FIELDS = [
+  ['delta', 'text'],
+  ['delta', 'thinking'],
+  ['delta', 'partial_json'],
+]
+
+/** Suffix that can only be the start of a {{R_KIND_<26>}} tag. */
+export function incompleteTagTail(text) {
+  const at = String(text).lastIndexOf('{{')
+  if (at < 0) return ''
+  const tail = String(text).slice(at)
+  if (tail.length > 128 || tail.includes('}}')) return ''
+  if (/^\{\{R_[A-Z][A-Z0-9_]{0,23}(?:_[a-z2-7]{0,25})?$/.test(tail)) return tail
+  return ''
+}
+
+/**
+ * Restores one SSE data line. A tag split across two events of the same block
+ * and field is held, then prepended to the next event. Other fields keep their own tail.
+ */
+export function createSseRestorer(ctx) {
+  const carry = new Map()
+  return {
+    async line(line) {
+      if (!state.enabled || typeof line !== 'string' || !line.startsWith('data:')) return line
+      const piece = line.slice(5).trim()
+      if (!piece || piece === '[DONE]') return line
+      let event
+      try {
+        event = JSON.parse(piece)
+      } catch {
+        return line
+      }
+      const index = event.index ?? 0
+      for (const [parent, field] of TEXT_FIELDS) {
+        const holder = event[parent]
+        if (!holder || typeof holder[field] !== 'string') continue
+        const key = `${index}:${parent}.${field}`
+        let text = `${carry.get(key) || ''}${holder[field]}`
+        const tail = incompleteTagTail(text)
+        if (tail) {
+          carry.set(key, tail)
+          text = text.slice(0, -tail.length)
+        } else {
+          carry.delete(key)
+        }
+        holder[field] = text
+      }
+      const restored = await restoreJsonText(JSON.stringify(event), ctx)
+      return `data: ${restored}`
+    },
+  }
 }
