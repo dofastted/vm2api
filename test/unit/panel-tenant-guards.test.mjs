@@ -79,22 +79,20 @@ function makeHandler(root, who, body, extra = {}) {
   return { call, response }
 }
 
-test('tenant cannot import credentials into another tenant slot; missing and foreign look the same', async (t) => {
+test('tenant cannot import credentials into any slot', async (t) => {
   const root = makeProject(t)
   codexVm(root, 'vm-mine', 'u-1')
   codexVm(root, 'vm-other', 'u-2')
   const body = (vm_id) => ({ vm_id, mode: 'access_token', raw: 'tenant-at' })
 
   const foreign = await makeHandler(root, TENANT, body('vm-other')).call('POST', '/api/panel/vms/import')
-  assert.equal(foreign.status, 404)
+  assert.equal(foreign.status, 403)
   const missing = await makeHandler(root, TENANT, body('vm-nope')).call('POST', '/api/panel/vms/import')
-  assert.equal(missing.status, 404)
-  assert.deepEqual(foreign.body, missing.body)
-  assert.equal(readCodexAccounts(root, 'vm-other')[0].access_token, 'old-vm-other')
-
+  assert.equal(missing.status, 403)
   const own = await makeHandler(root, TENANT, body('vm-mine')).call('POST', '/api/panel/vms/import')
-  assert.equal(own.status, 200, JSON.stringify(own.body))
-  assert.equal(readCodexAccounts(root, 'vm-mine')[0].access_token, 'tenant-at')
+  assert.equal(own.status, 403)
+  assert.equal(readCodexAccounts(root, 'vm-other')[0].access_token, 'old-vm-other')
+  assert.equal(readCodexAccounts(root, 'vm-mine')[0].access_token, 'old-vm-mine')
 })
 
 test('admin import still reaches any slot', async (t) => {
@@ -126,7 +124,7 @@ test('tenant proxy import cannot bind a slot it does not own', async (t) => {
     'POST',
     '/api/panel/proxies/import',
   )
-  assert.equal(tenant.status, 404)
+  assert.equal(tenant.status, 403)
   assert.deepEqual(calls, [])
 
   const admin = await makeHandler(root, ADMIN, { text: 'h:1080', bind_vm_id: 'vm-other' }, { proxyPool }).call(
