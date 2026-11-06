@@ -524,6 +524,8 @@ export function createHandleProtocol(deps) {
     noGoFallback = false,
     onEnvelope = null,
     onOutboundHeaders = null,
+    redactionPrincipal = '',
+    redactionSession = '',
   }) {
     const assembler = createClaudeMessageAssembler()
     const workerResult = await dispatchStreamInference({
@@ -544,8 +546,8 @@ export function createHandleProtocol(deps) {
       slotWaitMs: candidate.slotWaitMs,
       noGoFallback,
       ensureCredential: (exec) => ensureWorkerCredential(exec),
-      redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
-      redactionSession: String(req.headers?.['x-claude-code-session-id'] || ''),
+      redactionPrincipal,
+      redactionSession,
       onEnvelope,
       onEvent: async (line) => {
         if (/response_headers/.test(String(line))) return
@@ -1801,6 +1803,8 @@ export function createHandleProtocol(deps) {
               noGoFallback: !!pinVmId,
               onEnvelope: noteOutboundEnvelope,
               onOutboundHeaders: noteOutboundHeaders,
+              redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
+              redactionSession: String(req.headers?.['x-claude-code-session-id'] || ''),
             })
           }
           let state
