@@ -2,7 +2,7 @@
 
 本目录是 **vm2api 当前仓库内的权威设计资料**。目标是在现有 **Node 请求清洗链路**中接入可开启/关闭的关键元素脱敏，并提供 **Web 控制面板**进行配置、保存和状态展示。
 
-当前状态：**施工中，默认关闭。** `redact/` 是 Scope 隔离的 Go 核心和 `kin-redact`。Node 在 worker / API 出站封口前脱敏，并在响应里还原。`routing.redaction.enabled` 只有在 helper 二进制可用时才能保存；二进制缺失或 helper 没就绪时新请求返回 `redaction_unavailable`，不发明文。设置 → 协议有内容脱敏区。Codex 图片字节、签名 thinking 命中仍按设计拒绝或保持原样。多路交错流的 tail 还不是最终形态。
+当前状态：**默认关闭，helper/Node 边界已用 replay 验证。** `node scripts/redaction-replay.mjs` 对 V01、V03、V05、V06、V07、V10、V15、V17 为 9/9 通过（真实 `kin-redact`，无上游厂商）。这不覆盖真实 kernel/CLI/Codex ELF 抓包，也不覆盖 V02 面板、V04 并发保存、V18 continuation、V20 日志落盘。
 
 ## 阅读顺序
 
