@@ -97,9 +97,13 @@ function firstOf(set: Set<string>): string {
 }
 
 export function ProxiesPage() {
-  const px = useQuery(proxiesQueryOptions())
   const me = useQuery(meQueryOptions())
-  // 租户只能增删改自己的代理；测通、测地理、启停、绑定、池设置都是管理员接口。
+  const tenant = me.data?.role === 'user'
+  const px = useQuery({
+    ...proxiesQueryOptions(),
+    enabled: !!me.data && !tenant,
+  })
+  // 测通、测地理、启停、绑定、池设置都是管理员接口。租户不开放代理。
   const canManage = me.data?.role === 'admin'
   const { list: vms } = useVmIndex()
   const refresh = useRefreshProxies()
@@ -358,6 +362,16 @@ export function ProxiesPage() {
       })
       hover.set(id)
     })
+  }
+
+  if (tenant) {
+    return (
+      <PageHeader title={VIEW_TITLES.proxies}>
+        <p className='text-sm text-muted-foreground'>
+          当前账号只能查看虚拟机，不能管理代理。
+        </p>
+      </PageHeader>
+    )
   }
 
   return (

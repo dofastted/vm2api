@@ -54,6 +54,10 @@ const LIMIT = 50
 type SortKey =
   | 'totalRequests'
   | 'totalTokens'
+  | 'inputTokens'
+  | 'outputTokens'
+  | 'cacheCreationTokens'
+  | 'cacheReadTokens'
   | 'totalCost'
   | 'totalActualCost'
   | 'successRate'
@@ -89,6 +93,30 @@ const COLUMNS: Column[] = [
     header: 'Token 数',
     value: (row) => row.totalTokens,
     cell: (row) => formatTokenAmount(row.totalTokens),
+  },
+  {
+    key: 'inputTokens',
+    header: '输入',
+    value: (row) => row.inputTokens,
+    cell: (row) => formatTokenAmount(row.inputTokens),
+  },
+  {
+    key: 'outputTokens',
+    header: '输出',
+    value: (row) => row.outputTokens,
+    cell: (row) => formatTokenAmount(row.outputTokens),
+  },
+  {
+    key: 'cacheCreationTokens',
+    header: '缓存写入',
+    value: (row) => row.cacheCreationTokens,
+    cell: (row) => formatTokenAmount(row.cacheCreationTokens),
+  },
+  {
+    key: 'cacheReadTokens',
+    header: '缓存读取',
+    value: (row) => row.cacheReadTokens,
+    cell: (row) => formatTokenAmount(row.cacheReadTokens),
   },
   {
     key: 'totalCost',
@@ -179,16 +207,20 @@ export function LeaderboardSection({
   tz,
   scope,
   onScopeChange,
+  scopeLabels,
+  entryLimit = LIMIT,
 }: {
   scopes: LeaderboardScope[]
   tz: string
   scope: LeaderboardScope
   onScopeChange: (scope: LeaderboardScope) => void
+  scopeLabels?: Partial<Record<LeaderboardScope, string>>
+  entryLimit?: number
 }) {
   const [period, setPeriod] = useState<StatsRange>('today')
   const [sortKey, setSortKey] = useState<SortKey | null>(null)
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc')
-  const board = useQuery(leaderboardQueryOptions(period, scope, LIMIT, tz))
+  const board = useQuery(leaderboardQueryOptions(period, scope, entryLimit, tz))
   const entries = board.data?.entries
 
   const sorted = useMemo(() => {
@@ -239,7 +271,7 @@ export function LeaderboardSection({
             >
               {scopes.map((item) => (
                 <TabsTrigger key={item} value={item}>
-                  {SCOPE_LABELS[item]}
+                  {scopeLabels?.[item] ?? SCOPE_LABELS[item]}
                 </TabsTrigger>
               ))}
             </TabsList>

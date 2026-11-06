@@ -299,14 +299,41 @@ test('overview splits today/yesterday-same-time in the requested zone', () => {
   seed(db, [
     { created_at: '2026-03-09T02:00:00.000Z', total_cost: 1 }, // yesterday 10:00 local
     { created_at: '2026-03-09T06:00:00.000Z', total_cost: 2 }, // yesterday 14:00 local, after same-time
-    { created_at: '2026-03-09T17:00:00.000Z', total_cost: 4, status: 500, error_code: 'upstream_error' },
-    { created_at: '2026-03-10T03:59:30.000Z', total_cost: 8, session_id: 's-live', outbound_session_id: 'out-live' },
+    {
+      created_at: '2026-03-09T17:00:00.000Z',
+      total_cost: 4,
+      status: 500,
+      error_code: 'upstream_error',
+      input_tokens: 10,
+      output_tokens: 4,
+      cache_read_tokens: 6,
+      cache_creation_tokens: 2,
+      cache_creation_5m_tokens: 2,
+    },
+    {
+      created_at: '2026-03-10T03:59:30.000Z',
+      total_cost: 8,
+      session_id: 's-live',
+      outbound_session_id: 'out-live',
+      input_tokens: 1,
+      output_tokens: 1,
+      cache_creation_tokens: 3,
+      cache_creation_1h_tokens: 3,
+    },
   ])
   const view = new UsageLogsView(db)
   const sh = view.overview({ tz: 'Asia/Shanghai', now })
   assert.equal(sh.todayRequests, 2)
   assert.equal(sh.todayCost, 12)
   assert.equal(sh.todayErrors, 1)
+  assert.equal(sh.todayInputTokens, 11)
+  assert.equal(sh.todayOutputTokens, 5)
+  assert.equal(sh.todayCacheReadTokens, 6)
+  assert.equal(sh.todayCacheCreationTokens, 5)
+  assert.equal(sh.todayCacheCreation5mTokens, 2)
+  assert.equal(sh.todayCacheCreation1hTokens, 3)
+  assert.equal(sh.todayTokens, 27)
+  assert.equal(sh.todayCacheHitRate, 6 / 22)
   assert.equal(sh.yesterdayRequests, 1)
   assert.equal(sh.yesterdayCost, 1)
   assert.equal(sh.rpm, 1)

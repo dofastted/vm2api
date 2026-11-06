@@ -400,8 +400,8 @@ function usageLogFilters(req, u) {
 }
 
 /**
- * Validated statistics params. `user` may only group by key/model: user and
- * vm groupings would reveal other tenants or the pool layout.
+ * Validated statistics params. A tenant may group by key, model, or their own
+ * VMs. Grouping by user would name other tenants.
  */
 function statsParams(req, u, dimensionKey) {
   const isUser = panelIdentity(req).role === 'user'

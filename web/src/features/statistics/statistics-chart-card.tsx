@@ -80,11 +80,13 @@ export function StatisticsChartCard({
   dimensions,
   tz,
   className,
+  dimensionLabels,
 }: {
   /** 当前角色可用的维度，第一个为默认值。 */
   dimensions: StatsDimension[]
   tz: string
   className?: string
+  dimensionLabels?: Partial<Record<StatsDimension, string>>
 }) {
   const [range, setRange] = useState<StatsRange>('today')
   const [dimension, setDimension] = useState<StatsDimension>(dimensions[0])
@@ -210,7 +212,7 @@ export function StatisticsChartCard({
                   active={activeDimension === dim}
                   onClick={() => changeDimension(dim)}
                 >
-                  {DIMENSION_LABELS[dim]}
+                  {dimensionLabels?.[dim] ?? DIMENSION_LABELS[dim]}
                 </ToggleChip>
               ))}
             </div>

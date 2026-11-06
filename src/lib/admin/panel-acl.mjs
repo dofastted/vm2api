@@ -3,7 +3,7 @@
  *
  *   admin  — full console + user management
  *   super  — overview / cluster / logs / statistics + VM page (schedule only)
- *   user   — tenant: vm / proxies / keys / billing / logs / statistics (owner-scoped)
+ *   user   — tenant: vm (view, no reauth) / keys / billing / logs / statistics
  */
 
 export const PANEL_VIEWS = [
@@ -29,23 +29,13 @@ export const PANEL_VIEWS = [
 ]
 
 const ROLE_VIEWS = {
-  user: ['vm', 'proxies', 'keys', 'billing', 'logs', 'statistics'],
+  user: ['vm', 'keys', 'billing', 'logs', 'statistics'],
   super: ['overview', 'cluster', 'logs', 'statistics', 'vm'],
   admin: PANEL_VIEWS.slice(),
 }
 
 const ROLE_CAPS = {
-  user: [
-    'panel.read',
-    'vm.read',
-    'vm.schedule',
-    'vm.credential_write',
-    'vm.create',
-    'vm.delete_owned',
-    'proxy.write',
-    'keys.write',
-    'billing.read',
-  ],
+  user: ['panel.read', 'vm.read', 'vm.schedule', 'vm.create', 'keys.write', 'billing.read'],
   super: ['panel.read', 'vm.read', 'vm.schedule'],
   admin: ['*'],
 }
@@ -92,8 +82,6 @@ const USER_EXACT_GET = new Set([
   '/api/panel/vms',
   '/api/panel/vms/create-options',
   '/api/panel/pool/stream',
-  '/api/panel/proxies',
-  '/api/panel/proxies/config',
   '/api/panel/api-keys',
   '/api/panel/request-logs',
   '/api/panel/request-logs/export',
@@ -103,12 +91,7 @@ const USER_EXACT_GET = new Set([
   '/api/panel/test-models',
 ])
 
-const USER_EXACT_POST = new Set([
-  '/api/panel/vms/create',
-  '/api/panel/vms/import',
-  '/api/panel/proxies/import',
-  '/api/panel/test-schedule/sync',
-])
+const USER_EXACT_POST = new Set(['/api/panel/vms/create', '/api/panel/test-schedule/sync'])
 
 const USER_VM_DENIED = new Set([
   'fleet-status',
@@ -171,7 +154,6 @@ function userVmPathAllowed(method, path) {
     if (rest === 'oauth/credential' || rest === 'package') return false
     return (
       rest === 'test-schedule' ||
-      rest.startsWith('oauth/') ||
       rest === 'probe' ||
       rest === 'count-tokens' ||
       rest === 'test-chat' ||
@@ -180,7 +162,7 @@ function userVmPathAllowed(method, path) {
     )
   }
   if (method === 'POST') {
-    if (id === 'create' || id === 'import' || id === 'package') return true
+    if (id === 'create') return true
     if (!rest) return false
     if (head === 'official-cc-bootstrap' || head === 'wrap-cli' || head === 'reset-fingerprint') return false
     if (head === 'owner') return false
@@ -197,23 +179,15 @@ function userVmPathAllowed(method, path) {
       rest === 'openai-quota/refresh' ||
       rest === 'openai-quota/reset' ||
       rest === 'claude-reset/query' ||
-      rest === 'claude-reset/redeem' ||
-      rest.startsWith('oauth/')
+      rest === 'claude-reset/redeem'
     )
   }
-  if (method === 'PUT') return rest === 'test-schedule' || rest === 'oauth/credential'
+  if (method === 'PUT') return rest === 'test-schedule'
   if (method === 'DELETE') return rest === 'test-schedule'
   return false
 }
 
-function userProxyPathAllowed(method, path) {
-  if (path === '/api/panel/proxies' && (method === 'GET' || method === 'POST')) return true
-  if (path === '/api/panel/proxies/import' && method === 'POST') return true
-  if (path === '/api/panel/proxies/config') return method === 'GET'
-  if (path === '/api/panel/proxies/probe') return false
-  if (/^\/api\/panel\/proxies\/[^/]+$/.test(path))
-    return method === 'GET' || method === 'PATCH' || method === 'PUT' || method === 'DELETE'
-  if (/^\/api\/panel\/proxies\/[^/]+\/reveal$/.test(path) && method === 'POST') return true
+function userProxyPathAllowed() {
   return false
 }
 
