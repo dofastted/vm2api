@@ -14,6 +14,7 @@
 
 ## 1.4.048 — 2026-11-06
 
+- #908：官方 API 端点自动接入完整官方协议模型目录，并在调度时动态匹配协议模型，无需手动逐一录入。
 - #907：修复 API 直连密钥模型目录与协议调度绑定：
   - 生成/编辑 API 直连密钥（`category: 'api'`）时，分组选择 `anthropic` 或 `openai` 不再强制校验 VM，移除前端阻塞与后端 `key_vms_required` 限制；
   - `/v1/models` 与 `/models` 按密钥协议作用域过滤 API 端点模型，`anthropic` 密钥仅返回 Anthropic 端点模型，`openai` 密钥仅返回 OpenAI 端点模型；
