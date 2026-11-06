@@ -42,7 +42,7 @@ export function seedModelCatalog() {
   return setModelCatalog(ids, { source: 'model-policy' })
 }
 
-function listGptPublicModels(mappingKeys = []) {
+export function listGptPublicModels(mappingKeys = []) {
   try {
     const models = listGptPolicyModels().map((m) => ({
       id: m.id,
