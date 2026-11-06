@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { navGroupsFor } from './sidebar-data'
+import { homePathFor, navGroupsFor } from './sidebar-data'
 
 describe('sidebar permissions', () => {
   it('does not treat an explicit empty view list as unrestricted', () => {
@@ -30,5 +30,14 @@ describe('sidebar permissions', () => {
       '/logs',
     ])
     expect(groups[1].items.map((item) => item.url)).toEqual(['/vm'])
+  })
+
+  it('lands each role on 总览, else 虚拟机, else its first page', () => {
+    expect(homePathFor(null)).toBe('/overview')
+    expect(homePathFor(['overview', 'cluster', 'logs', 'vm'])).toBe('/overview')
+    expect(homePathFor(['vm', 'proxies', 'keys', 'logs'])).toBe('/vm')
+    expect(homePathFor(['keys', 'logs'])).toBe('/logs')
+    expect(homePathFor(['billing'])).toBe('/welcome')
+    expect(homePathFor([])).toBe('/welcome')
   })
 })

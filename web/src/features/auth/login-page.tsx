@@ -13,6 +13,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { ThemeSwitch } from '@/components/theme-switch'
 import { onboardingQueryOptions } from '@/features/welcome/queries'
+import { meQueryOptions } from './queries'
 
 /** Standalone sign-in page; layout follows the newapi /sign-in screen. */
 export function LoginPage() {
@@ -41,6 +42,8 @@ export function LoginPage() {
         base: hideBase ? '' : base.trim().replace(/\/$/, '') || apiBase(),
       })
       signIn(result.token, result.user)
+      // The route guard reads this cache; drop the previous account's views.
+      queryClient.removeQueries({ queryKey: meQueryOptions().queryKey })
       let needsWelcome = false
       try {
         const onboarding = await queryClient.fetchQuery(

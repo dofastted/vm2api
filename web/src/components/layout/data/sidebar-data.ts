@@ -1,3 +1,4 @@
+import { canOpenPath } from '@/config/nav'
 import {
   Boxes,
   Cable,
@@ -16,7 +17,7 @@ import {
   ShieldAlert,
   Sparkles,
 } from 'lucide-react'
-import type { NavGroup, NavItem, SidebarData } from '../types'
+import type { NavGroup, SidebarData } from '../types'
 
 // 监控组对应 claude-code-hub 的 仪表盘 / 使用记录：
 // 总览看集群健康，统计看趋势与排行，日志看逐条请求。账号限额在虚拟机列表的用量窗口。
@@ -59,22 +60,24 @@ const ALL_GROUPS: NavGroup[] = [
   },
 ]
 
-function itemView(item: NavItem): string {
-  if (item.url) return String(item.url).replace(/^\//, '')
-  return item.title
-}
-
-export function navGroupsFor(views?: string[] | null): NavGroup[] {
+export function navGroupsFor(views?: readonly string[] | null): NavGroup[] {
   if (views == null) return ALL_GROUPS
-  const allow = new Set(views.map((v) => String(v).trim()).filter(Boolean))
-  if (allow.size === 0) return []
   return ALL_GROUPS.map((group) => ({
     ...group,
-    items: group.items.filter((item) => {
-      const key = itemView(item)
-      return allow.has(key) || allow.has(`/${key}`)
-    }),
+    items: group.items.filter(
+      (item) => item.url != null && canOpenPath(views, String(item.url))
+    ),
   })).filter((group) => group.items.length > 0)
+}
+
+/** Landing page for a role: 总览, else 虚拟机, else its first sidebar page. */
+export function homePathFor(views?: readonly string[] | null): string {
+  const preferred = ['/overview', '/vm'].find((path) =>
+    canOpenPath(views, path)
+  )
+  if (preferred) return preferred
+  const first = navGroupsFor(views)[0]?.items[0]?.url
+  return first ? String(first) : '/welcome'
 }
 
 export const sidebarData: SidebarData = {
