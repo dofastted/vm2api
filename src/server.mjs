@@ -45,6 +45,7 @@ import { AccountQuota } from './lib/pool/account-quota.mjs'
 import { normalizeTiers } from './lib/pool/quota-tiers.mjs'
 import { ApiKeyStore } from './lib/admin/api-keys.mjs'
 import { keyScopeFromRequest } from './lib/admin/key-scope.mjs'
+import { filterModelCatalogForKey } from './lib/admin/key-models.mjs'
 import { GroupsRepo } from './lib/db/repos/groups-repo.mjs'
 import { SettingsRepo } from './lib/db/repos/settings-repo.mjs'
 import { ApiEndpointStore } from './lib/admin/api-endpoints.mjs'
@@ -1186,10 +1187,10 @@ const server = http.createServer(async (req, res) => {
       if (!requireAuth(req, res)) return
       const groupType = keyScopeFromRequest(req).group_type
       if (resolveInferenceBackend(req) === 'api') {
-        return json(res, 200, apiScheduler.catalog({ groupType }))
+        return json(res, 200, filterModelCatalogForKey(apiScheduler.catalog({ groupType }), req))
       }
       const result = await fetchWorkerModels({ groupType })
-      return json(res, 200, result)
+      return json(res, 200, filterModelCatalogForKey(result, req))
     }
     if (req.method === 'POST' && p === '/admin/models/refresh') {
       if (!requireAuth(req, res)) return

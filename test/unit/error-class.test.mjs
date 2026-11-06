@@ -13,6 +13,7 @@ test('classifyRequestError maps known codes and statuses', () => {
   assert.equal(classifyRequestError({ status: 503, error_code: 'server_overloaded' }).error_class, 'overloaded')
   assert.equal(classifyRequestError({ status: 429, error_code: 'upstream_rate_limit' }).error_class, 'rate_limit')
   assert.equal(classifyRequestError({ status: 400, error_code: 'invalid_json' }).error_class, 'request')
+  assert.equal(classifyRequestError({ status: 400, error_code: 'api_key_model_not_allowed' }).error_class, 'request')
   assert.equal(
     classifyRequestError({ status: 400, error_message: 'thinking signature invalid' }).error_class,
     'signature',

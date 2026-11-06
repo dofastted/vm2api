@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { keyLimitsPayload, type KeyLimitsDraft } from './key-payload'
+import {
+  keyLimitsPayload,
+  parseModelList,
+  type KeyLimitsDraft,
+} from './key-payload'
 
 const draft: KeyLimitsDraft = {
   name: ' ops ',
@@ -11,6 +15,7 @@ const draft: KeyLimitsDraft = {
   expires_in_days: 30,
   group_type: 'anthropic',
   allowed_vms: ['vm-01', 'vm-01', ' '],
+  allowed_models: '',
 }
 
 describe('API key limit payload', () => {
@@ -25,7 +30,35 @@ describe('API key limit payload', () => {
       expires_in_days: 30,
       group_type: 'anthropic',
       allowed_vms: ['vm-01'],
+      allowed_models: [],
     })
+  })
+
+  it('splits allowed models on commas, spaces and new lines, deduping by case', () => {
+    expect(
+      parseModelList(
+        ' claude-sonnet-5, gpt-6-sol，CLAUDE-SONNET-5\nclaude-haiku-4-5  '
+      )
+    ).toEqual(['claude-sonnet-5', 'gpt-6-sol', 'claude-haiku-4-5'])
+    expect(parseModelList(' ,  ')).toEqual([])
+  })
+
+  it('sends allowed models on create and edit; empty clears the limit', () => {
+    const limited = { ...draft, allowed_models: 'claude-sonnet-5, gpt-6-sol' }
+    for (const mode of ['create', 'edit'] as const) {
+      expect(keyLimitsPayload(limited, mode).allowed_models).toEqual([
+        'claude-sonnet-5',
+        'gpt-6-sol',
+      ])
+      expect(
+        keyLimitsPayload(limited, mode, { isAdmin: false }).allowed_models
+      ).toEqual(['claude-sonnet-5', 'gpt-6-sol'])
+    }
+    expect(keyLimitsPayload(draft, 'edit').allowed_models).toEqual([])
+    const tooMany = Array.from({ length: 201 }, (_, i) => `m-${i}`).join(',')
+    expect(() =>
+      keyLimitsPayload({ ...draft, allowed_models: tooMany }, 'create')
+    ).toThrow('最多 200 个')
   })
 
   it('sends category only for admins', () => {
