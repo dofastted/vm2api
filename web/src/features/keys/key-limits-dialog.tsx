@@ -123,6 +123,7 @@ export function KeyLimitsDialog({
         allowed_vms:
           group === 'all' || group === 'pool' ? [] : initial.allowed_vms || [],
         ...(pools ? { vm_pool_id: initial.vm_pool_id || '' } : {}),
+        allowed_models: (initial.allowed_models || []).join(', '),
       })
       return
     }
@@ -359,6 +360,21 @@ export function KeyLimitsDialog({
               </Field>
             </div>
           )}
+          <div className='sm:col-span-2'>
+            <Field label='允许的模型'>
+              <Input
+                value={draft.allowed_models}
+                placeholder='留空不限，例如 claude-sonnet-5, gpt-6-sol'
+                onChange={(e) =>
+                  setDraft((d) => ({ ...d, allowed_models: e.target.value }))
+                }
+              />
+            </Field>
+            <p className='mt-1 text-xs text-muted-foreground'>
+              按客户端请求里写的模型名匹配（不分大小写，映射前，Claude Code 的
+              [1m] 后缀自动忽略），逗号分隔；名单外的模型直接返回 400。
+            </p>
+          </div>
         </div>
         <DialogFooter>
           <Button
@@ -396,6 +412,7 @@ function blankDraft(): KeyLimitsDraft {
     expires_in_days: 30,
     group_type: 'all',
     allowed_vms: [],
+    allowed_models: '',
   }
 }
 

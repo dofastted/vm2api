@@ -21,6 +21,7 @@ const { authorizePanelRoute } = await import('../../src/lib/admin/panel-acl.mjs'
 const { ApiKeyStore } = await import('../../src/lib/admin/api-keys.mjs')
 const { PanelUserStore } = await import('../../src/lib/admin/panel-users.mjs')
 const { parseAllowedVms } = await import('../../src/lib/admin/key-scope.mjs')
+const { parseKeyAllowedModels } = await import('../../src/lib/admin/key-models.mjs')
 const { createVmPool } = await import('../../src/lib/admin/vm-pools.mjs')
 const { VmPoolsRepo } = await import('../../src/lib/db/repos/vm-pools-repo.mjs')
 const { createDatabase } = await import('../../src/lib/db/database.mjs')
@@ -403,6 +404,45 @@ test('admin key edits keep their own user_id while retaining group and slot cont
   assert.equal(rec.user_id, 'u-1')
   assert.equal(rec.group_id, 7)
 })
+
+for (const who of [TENANT, ADMIN]) {
+  test(`${who.panelRole} can limit their own key to listed models`, async (t) => {
+    const { root, store, key } = keyFixture(t)
+    const call = (body, method, url) => makeHandler(root, who, body, { apiKeyStore: store }).call(method, url)
+    const created = await call(
+      { name: 'limited', allowed_models: [' claude-haiku-4-5 ', 'CLAUDE-HAIKU-4-5', ''] },
+      'POST',
+      '/api/panel/api-keys',
+    )
+    assert.equal(created.status, 201, JSON.stringify(created.body))
+    assert.deepEqual(created.body.item.allowed_models, ['claude-haiku-4-5'])
+
+    const patched = await call({ allowed_models: ['gpt-6-sol'] }, 'PATCH', `/api/panel/api-keys/${key.id}`)
+    assert.equal(patched.status, 200, JSON.stringify(patched.body))
+    assert.deepEqual(patched.body.item.allowed_models, ['gpt-6-sol'])
+    const listed = await call(null, 'GET', '/api/panel/api-keys')
+    assert.deepEqual(listed.body.keys.find((item) => item.id === key.id).allowed_models, ['gpt-6-sol'])
+    const renamed = await call({ name: 'renamed' }, 'PATCH', `/api/panel/api-keys/${key.id}`)
+    assert.deepEqual(renamed.body.item.allowed_models, ['gpt-6-sol'], 'omitted field keeps the list')
+
+    const count = store.list().length
+    const tooMany = Array.from({ length: 201 }, (_, i) => `model-${i}`)
+    for (const bad of ['gpt-6-sol', [1], tooMany]) {
+      const rejected = await call({ name: 'bad', allowed_models: bad }, 'POST', '/api/panel/api-keys')
+      assert.equal(rejected.status, 400, JSON.stringify(rejected.body))
+      assert.equal(rejected.body.error.code, 'invalid_allowed_models')
+      const badPatch = await call({ allowed_models: bad }, 'PATCH', `/api/panel/api-keys/${key.id}`)
+      assert.equal(badPatch.status, 400)
+      assert.equal(badPatch.body.error.code, 'invalid_allowed_models')
+    }
+    assert.equal(store.list().length, count)
+    assert.deepEqual(parseKeyAllowedModels(store.getById(key.id).allowed_models), ['gpt-6-sol'])
+
+    const cleared = await call({ allowed_models: [] }, 'PATCH', `/api/panel/api-keys/${key.id}`)
+    assert.equal(cleared.status, 200)
+    assert.deepEqual(cleared.body.item.allowed_models, [])
+  })
+}
 
 test('tenant key create/patch vm_pool_id guard; admin can set pool', async (t) => {
   const { root, store, key } = keyFixture(t)

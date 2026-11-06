@@ -67,6 +67,7 @@ import { loggedReasoningEffort } from './thinking.mjs'
 import { reasoningEffortOf, sessionIdForLog } from './log-fields.mjs'
 import { ownerScopeFromRequest } from '../admin/resource-owner.mjs'
 import { keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
+import { keyModelError } from '../admin/key-models.mjs'
 import {
   resolveInferenceEngine,
   resolveOfficialCcInference,
@@ -237,6 +238,17 @@ export function createHandleProtocol(deps) {
       status: gate.status,
       details: gate.detail || undefined,
     }).body
+  }
+
+  /** Key allowlist on the model the client named, before any mapping: 400 in the caller's protocol. */
+  function rejectKeyModel(req, res, protocol, model, logBag) {
+    const denied = keyModelError(req, model, { anthropic: protocol === 'anthropic.messages' })
+    if (!denied) return false
+    stats.errors++
+    logBag.error_code = denied.body.error.code
+    logBag.error_message = denied.body.error.message
+    json(res, denied.status, denied.body)
+    return true
   }
 
   // Codex handlers write usage onto logBag themselves. The key is charged the
@@ -700,6 +712,8 @@ export function createHandleProtocol(deps) {
         usage: logBag.usage,
       })
     }
+    // After the Desktop sign-in probe, which runs no model.
+    if (rejectKeyModel(req, res, protocol, inbound?.model, logBag)) return
     if (
       claudeCodeOnlyFromRouting(routingNow) &&
       !panelDiagnostics &&
@@ -2108,6 +2122,7 @@ export function createHandleProtocol(deps) {
     }
     logBag.model = typeof body?.model === 'string' ? body.model : null
     logBag.inbound_summary = summarizeBody(body)
+    if (rejectKeyModel(req, res, protocol, body?.model, logBag)) return
     return runWithCodexKey(req, res, logBag, () =>
       handleCodexSearch({
         req,
@@ -2320,6 +2335,8 @@ export function createHandleProtocol(deps) {
     }
     logBag.model = typeof body?.model === 'string' ? body.model : null
     logBag.inbound_summary = summarizeImagesBody(body)
+    // No model means the upstream default, which a limited key cannot name.
+    if (rejectKeyModel(req, res, protocol, body?.model, logBag)) return
     return runWithCodexKey(req, res, logBag, () =>
       handleCodexImages({
         req,

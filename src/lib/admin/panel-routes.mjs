@@ -316,6 +316,8 @@ function logsOwner(req, u) {
 }
 
 const LOCAL_PROXY_MISMATCH_MESSAGE = '本地代理只能绑定到它所在 VPS 上的槽位'
+// Room for a full allowed_models list (200 names) next to the other key fields.
+const API_KEY_BODY_MAX = 32 * 1024
 
 function clusterNodesOf(ctx) {
   try {
@@ -1753,7 +1755,7 @@ export function createPanelHandler(ctx) {
         return json(res, 200, { ok: true, item: publicKeyView(rec, { reveal: false }), usage_stats })
       }
       if (req.method === 'POST' && p === '/api/panel/api-keys') {
-        const body = await readBody(req, 8192).catch(() => ({}))
+        const body = await readBody(req, API_KEY_BODY_MAX).catch(() => ({}))
         const ident = panelIdentity(req)
         if (ident.role !== 'admin' && body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') {
           return json(res, 403, {
@@ -1800,6 +1802,7 @@ export function createPanelHandler(ctx) {
             group_type: scope.group_type,
             allowed_vms: scope.allowed_vms,
             vm_pool_id: scope.vm_pool_id,
+            allowed_models: body?.allowed_models,
             max_concurrency: body?.max_concurrency ?? defaultConc,
             default_concurrency: defaultConc,
             quota_requests: input.quota_requests,
@@ -1830,7 +1833,7 @@ export function createPanelHandler(ctx) {
       if (req.method === 'PATCH' && /^\/api\/panel\/api-keys\/[^/]+$/.test(p)) {
         const id = p.split('/').pop()
         if (denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
-        const body = await readBody(req, 8192).catch(() => ({}))
+        const body = await readBody(req, API_KEY_BODY_MAX).catch(() => ({}))
         const ident = panelIdentity(req)
         if (ident.role !== 'admin' && body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') {
           return json(res, 403, {
