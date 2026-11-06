@@ -1,3 +1,5 @@
+import { normalizeProtocol } from './api-presets.mjs'
+
 /**
  * CLIProxy-shaped picker: grouped round-robin by endpoint then key.
  * Same alias across endpoints shares a model id; prefix/alias pins an endpoint.
@@ -90,11 +92,15 @@ export class ApiScheduler {
     this.endpoints = Array.isArray(endpoints) ? endpoints : []
   }
 
-  catalog() {
+  catalog({ groupType = 'all' } = {}) {
     const data = []
     const seen = new Set()
+    const targetGroup = String(groupType || 'all').toLowerCase()
     for (const ep of this.endpoints) {
       if (ep.disabled) continue
+      const proto = normalizeProtocol(ep.protocol, ep.kind)
+      if (targetGroup === 'anthropic' && proto !== 'anthropic') continue
+      if (targetGroup === 'openai' && proto !== 'openai') continue
       for (const id of modelIdsForEndpoint(ep, { forcePrefix: this.forcePrefix })) {
         const k = lower(id)
         if (seen.has(k)) continue
@@ -111,9 +117,16 @@ export class ApiScheduler {
     return { object: 'list', data, source: 'api-endpoints' }
   }
 
-  pick(requestedModel, now = Date.now()) {
+  pick(requestedModel, now = Date.now(), { groupType = 'all' } = {}) {
+    const targetGroup = String(groupType || 'all').toLowerCase()
     const parents = this.endpoints
-      .filter((ep) => endpointMatchesModel(ep, requestedModel))
+      .filter((ep) => {
+        if (ep.disabled) return false
+        const proto = normalizeProtocol(ep.protocol, ep.kind)
+        if (targetGroup === 'anthropic' && proto !== 'anthropic') return false
+        if (targetGroup === 'openai' && proto !== 'openai') return false
+        return endpointMatchesModel(ep, requestedModel)
+      })
       .sort((a, b) => (Number(b.priority) || 0) - (Number(a.priority) || 0))
     if (!parents.length) {
       return { ok: false, code: 'model_not_found', message: `no api endpoint serves ${requestedModel}` }

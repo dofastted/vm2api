@@ -1744,14 +1744,17 @@ export function createPanelHandler(ctx) {
           })
         }
         try {
-          const scopeInput = { group_type: body?.group_type, allowed_vms: body?.allowed_vms }
+          const isApi = isApiCategory(body?.category)
+          const scopeInput = { group_type: body?.group_type, allowed_vms: body?.allowed_vms, category: body?.category }
           if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id
           }
-          const scope = normalizeKeyScope(scopeInput)
+          const scope = normalizeKeyScope(scopeInput, { isApi })
           const pools = vmPoolsFor(apiKeyStore.db)
-          if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
-          else assertVmScope(keyScopeVms(req), scope)
+          if (!isApi) {
+            if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
+            else assertVmScope(keyScopeVms(req), scope)
+          }
           const defaultConc = Number(
             ctx.routingConfig?.concurrency?.default_key_concurrency ??
               ctx.routingConfig?.concurrency?.default_max_per_account ??
@@ -1813,18 +1816,25 @@ export function createPanelHandler(ctx) {
         try {
           const input = normalizePanelApiKeyInput(body || {}, req)
           const currentRec = apiKeyStore.getById(id)
-          const scopeInput = { group_type: body?.group_type, allowed_vms: body?.allowed_vms }
+          const isApi = isApiCategory(body?.category ?? currentRec?.category)
+          const scopeInput = {
+            group_type: body?.group_type,
+            allowed_vms: body?.allowed_vms,
+            ...(isApi ? { category: 'api' } : {}),
+          }
           if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id
           }
-          const scope = normalizeKeyScope(scopeInput, { partial: true, current: currentRec })
+          const scope = normalizeKeyScope(scopeInput, { partial: true, current: currentRec, isApi })
           if (scope) {
             if (ident.role !== 'admin' && currentRec?.vm_pool_id) {
               scope.vm_pool_id = currentRec.vm_pool_id
             }
             const pools = vmPoolsFor(apiKeyStore.db)
-            if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
-            else assertVmScope(keyScopeVms(req), scope)
+            if (!isApi) {
+              if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
+              else assertVmScope(keyScopeVms(req), scope)
+            }
             input.group_type = scope.group_type
             input.allowed_vms = scope.allowed_vms
             input.vm_pool_id = scope.vm_pool_id

@@ -68,3 +68,59 @@ test('catalog is unique aliases', () => {
   const ids = cat.data.map((x) => x.id)
   assert.equal(ids.filter((id) => id === 'sonnet').length, 1)
 })
+
+test('catalog filters by protocol group_type', () => {
+  const s = new ApiScheduler()
+  const anthropicEp = ep({
+    id: 'anthropic-ep',
+    protocol: 'anthropic',
+    prefix: '',
+    models: [{ name: 'claude-sonnet-4-5', alias: 'claude-sonnet-4-5' }],
+  })
+  const openaiEp = ep({
+    id: 'openai-ep',
+    protocol: 'openai',
+    prefix: '',
+    models: [{ name: 'gpt-4o', alias: 'gpt-4o' }],
+  })
+  s.reload([anthropicEp, openaiEp])
+
+  const all = s.catalog({ groupType: 'all' }).data.map((m) => m.id)
+  assert.deepEqual(all.sort(), ['claude-sonnet-4-5', 'gpt-4o'])
+
+  const anthropicOnly = s.catalog({ groupType: 'anthropic' }).data.map((m) => m.id)
+  assert.deepEqual(anthropicOnly, ['claude-sonnet-4-5'])
+
+  const openaiOnly = s.catalog({ groupType: 'openai' }).data.map((m) => m.id)
+  assert.deepEqual(openaiOnly, ['gpt-4o'])
+})
+
+test('pick filters endpoints by protocol group_type', () => {
+  const s = new ApiScheduler()
+  const anthropicEp = ep({
+    id: 'anthropic-ep',
+    protocol: 'anthropic',
+    prefix: '',
+    models: [{ name: 'shared-model', alias: 'shared-model' }],
+    api_key_entries: [{ id: 'k-ant', api_key: 'sk-ant', disabled: false }],
+  })
+  const openaiEp = ep({
+    id: 'openai-ep',
+    protocol: 'openai',
+    prefix: '',
+    models: [{ name: 'shared-model', alias: 'shared-model' }],
+    api_key_entries: [{ id: 'k-oai', api_key: 'sk-oai', disabled: false }],
+  })
+  s.reload([anthropicEp, openaiEp])
+
+  const pickAnthropic = s.pick('shared-model', Date.now(), { groupType: 'anthropic' })
+  assert.equal(pickAnthropic.ok, true)
+  assert.equal(pickAnthropic.endpoint.id, 'anthropic-ep')
+
+  const pickOpenai = s.pick('shared-model', Date.now(), { groupType: 'openai' })
+  assert.equal(pickOpenai.ok, true)
+  assert.equal(pickOpenai.endpoint.id, 'openai-ep')
+
+  const failUnknown = s.pick('nonexistent', Date.now(), { groupType: 'anthropic' })
+  assert.equal(failUnknown.ok, false)
+})

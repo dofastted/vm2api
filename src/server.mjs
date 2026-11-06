@@ -1171,12 +1171,13 @@ const server = http.createServer(async (req, res) => {
       })
     }
 
-    if (req.method === 'GET' && p === '/v1/models') {
+    if (req.method === 'GET' && (p === '/v1/models' || p === '/models')) {
       if (!requireAuth(req, res)) return
+      const groupType = keyScopeFromRequest(req).group_type
       if (resolveInferenceBackend(req) === 'api') {
-        return json(res, 200, apiScheduler.catalog())
+        return json(res, 200, apiScheduler.catalog({ groupType }))
       }
-      const result = await fetchWorkerModels({ groupType: keyScopeFromRequest(req).group_type })
+      const result = await fetchWorkerModels({ groupType })
       return json(res, 200, result)
     }
     if (req.method === 'POST' && p === '/admin/models/refresh') {
