@@ -40,7 +40,10 @@ function policyView(policy) {
     secrets: policy.secrets,
     personal: policy.personal,
     words: policy.words,
+    wordsAnyCase: policy.wordsAnyCase === true,
     rules: policy.rules,
+    kinds: policy.kinds || {},
+    allow: policy.allow || [],
   }
 }
 
