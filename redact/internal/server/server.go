@@ -22,10 +22,13 @@ import (
 const ProtocolVersion = 1
 
 type Policy struct {
-	Secrets  bool          `json:"secrets"`
-	Personal bool          `json:"personal"`
-	Words    []string      `json:"words"`
-	Rules    []engine.Rule `json:"rules"`
+	Secrets      bool            `json:"secrets"`
+	Personal     bool            `json:"personal"`
+	Words        []string        `json:"words"`
+	WordsAnyCase bool            `json:"wordsAnyCase"`
+	Rules        []engine.Rule   `json:"rules"`
+	Kinds        map[string]bool `json:"kinds"`
+	Allow        []string        `json:"allow"`
 }
 
 type Server struct {
@@ -116,7 +119,15 @@ func (s *Server) transform(w http.ResponseWriter, r *http.Request, mask bool) {
 		return
 	}
 	defer s.drop(principal, session)
-	opts := engine.Options{Secrets: policy.Secrets, Personal: policy.Personal, Words: policy.Words, Rules: policy.Rules}
+	opts := engine.Options{
+		Secrets:      policy.Secrets,
+		Personal:     policy.Personal,
+		Words:        policy.Words,
+		WordsAnyCase: policy.WordsAnyCase,
+		Rules:        policy.Rules,
+		Kinds:        policy.Kinds,
+		Allow:        policy.Allow,
+	}
 	if mask {
 		out, _, err := scope.MaskBody(body, opts)
 		if err != nil {
@@ -186,19 +197,17 @@ func policyFrom(r *http.Request) (Policy, error) {
 	if !p.Secrets && !p.Personal && len(p.Words) == 0 && len(p.Rules) == 0 {
 		return Policy{}, errors.New("empty policy")
 	}
-	if len(p.Words) > 256 {
-		return Policy{}, errors.New("too many words")
+	if err := limitTextList(p.Words); err != nil {
+		return Policy{}, err
 	}
-	total := 0
-	for _, w := range p.Words {
-		if len(w) > 1024 {
-			return Policy{}, errors.New("word too long")
-		}
-		total += len(w)
+	if err := limitTextList(p.Allow); err != nil {
+		return Policy{}, err
 	}
-	if total > 64<<10 {
-		return Policy{}, errors.New("words too large")
+	kinds, err := cleanKinds(p.Kinds)
+	if err != nil {
+		return Policy{}, err
 	}
+	p.Kinds = kinds
 	if len(p.Rules) > 0 {
 		checked, err := engine.CheckRules(p.Rules)
 		if err != nil {
@@ -207,6 +216,39 @@ func policyFrom(r *http.Request) (Policy, error) {
 		p.Rules = checked
 	}
 	return p, nil
+}
+
+func limitTextList(items []string) error {
+	if len(items) > 256 {
+		return errors.New("too many words")
+	}
+	total := 0
+	for _, item := range items {
+		if len(item) > 1024 {
+			return errors.New("word too long")
+		}
+		total += len(item)
+	}
+	if total > 64<<10 {
+		return errors.New("words too large")
+	}
+	return nil
+}
+
+func cleanKinds(in map[string]bool) (map[string]bool, error) {
+	if len(in) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]bool, len(in))
+	for key, on := range in {
+		switch key {
+		case "ssn", "passport", "iban", "birthday", "mac", "serial", "home", "userhost", "ip", "bucket":
+			out[key] = on
+		default:
+			return nil, errors.New("unknown kind")
+		}
+	}
+	return out, nil
 }
 
 func policyPayload(raw string) ([]byte, error) {

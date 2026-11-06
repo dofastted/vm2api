@@ -31,7 +31,30 @@ describe('redaction policy', () => {
       secrets: true,
       personal: false,
       words: ['夜莺'],
+      wordsAnyCase: false,
       rules: [],
+      kinds: {},
+      allow: [],
+    })
+  })
+
+  it('keeps kind overrides, case folding, and the allow list', () => {
+    expect(
+      normalizeRedaction({
+        enabled: true,
+        secrets: true,
+        personal: true,
+        words: ['Nightjar'],
+        wordsAnyCase: true,
+        rules: [{ kind: 'GATEWAY_KEY', prefix: 'oc_sk_' }],
+        kinds: { ip: true, home: false },
+        allow: [' build-01 '],
+      }),
+    ).toMatchObject({
+      wordsAnyCase: true,
+      kinds: { ip: true, home: false },
+      allow: ['build-01'],
+      rules: [{ kind: 'GATEWAY_KEY', prefix: 'oc_sk_', regex: '' }],
     })
   })
 })

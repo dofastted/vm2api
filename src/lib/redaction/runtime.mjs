@@ -40,7 +40,10 @@ function policyView(policy) {
     secrets: policy.secrets,
     personal: policy.personal,
     words: policy.words,
+    wordsAnyCase: policy.wordsAnyCase === true,
     rules: policy.rules,
+    kinds: policy.kinds || {},
+    allow: policy.allow || [],
   }
 }
 
@@ -96,7 +99,8 @@ export async function ensureRedaction(routing, { projectRoot, binPath } = {}) {
 }
 
 async function bootHelper(policy, { projectRoot, binPath }) {
-  const bin = binPath || process.env.KIN_REDACT_BIN || ''
+  const bundled = path.join(projectRoot || '', 'bin', 'kin-redact')
+  const bin = binPath || process.env.KIN_REDACT_BIN || (fs.existsSync(bundled) ? bundled : '')
   if (!bin || !fs.existsSync(bin)) {
     state = { enabled: true, ready: false, policy, client: null, error: 'redaction_unavailable' }
     throw unavailable('redaction helper is not installed')

@@ -61,3 +61,18 @@ func TestMaskRestoreIsolatesPrincipals(t *testing.T) {
 		t.Fatalf("health %d %s", res.Code, res.Body.Bytes())
 	}
 }
+
+func TestWordsAnyCaseMasksOtherCapitals(t *testing.T) {
+	s := New("cap-1", key32())
+	h := s.Handler()
+	folded := Policy{Words: []string{"Nightjar"}, WordsAnyCase: true}
+	code, masked := call(t, h, "POST", "/v1/mask", "cap-1", "key-a", folded, "plan NIGHTJAR")
+	if code != 200 || strings.Contains(masked, "NIGHTJAR") {
+		t.Fatalf("folded %d %q", code, masked)
+	}
+	exact := Policy{Words: []string{"Nightjar"}}
+	code, plain := call(t, h, "POST", "/v1/mask", "cap-1", "key-b", exact, "plan NIGHTJAR")
+	if code != 200 || !strings.Contains(plain, "NIGHTJAR") {
+		t.Fatalf("exact %d %q", code, plain)
+	}
+}
