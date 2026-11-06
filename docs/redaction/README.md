@@ -2,7 +2,7 @@
 
 本目录是 **vm2api 当前仓库内的权威设计资料**。目标是在现有 **Node 请求清洗链路**中接入可开启/关闭的关键元素脱敏，并提供 **Web 控制面板**进行配置、保存和状态展示。
 
-当前状态：设计完成，**尚未实现插件、Node 挂点或 Web 页面改动，未部署**。AgentDock/magpie 的资料目录只是源码参考，不是本插件的安装位置。
+当前状态：**施工中，默认关闭。** `redact/` 是 Scope 隔离的 Go 核心和 `kin-redact`。Node 在 worker / API 出站封口前脱敏，并在响应里还原。`routing.redaction.enabled` 只有在 helper 二进制可用时才能保存；二进制缺失或 helper 没就绪时新请求返回 `redaction_unavailable`，不发明文。设置 → 协议有内容脱敏区。Codex 图片字节、签名 thinking 命中仍按设计拒绝或保持原样。多路交错流的 tail 还不是最终形态。
 
 ## 阅读顺序
 
