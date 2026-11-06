@@ -1,4 +1,12 @@
-import { normalizeProtocol } from './api-presets.mjs'
+import { CLAUDE_OFFICIAL_URL, OPENAI_OFFICIAL_URL, normalizeProtocol, trimBaseUrl } from './api-presets.mjs'
+import {
+  isCatalogModelId,
+  isCodexCatalogModel,
+  listGptPublicModels,
+  listOfficialModels,
+  resolveCatalogModel,
+} from '../protocol/models.mjs'
+import { isGptSeriesId } from '../protocol/gpt-ids.mjs'
 
 /**
  * CLIProxy-shaped picker: grouped round-robin by endpoint then key.
@@ -11,6 +19,20 @@ function norm(s) {
 
 function lower(s) {
   return norm(s).toLowerCase()
+}
+
+function isOfficialClaude(ep) {
+  if (!ep) return false
+  if (ep.kind === 'claude') return true
+  const u = trimBaseUrl(ep.base_url)
+  return u === CLAUDE_OFFICIAL_URL
+}
+
+function isOfficialOpenAI(ep) {
+  if (!ep) return false
+  if (ep.kind === 'openai') return true
+  const u = trimBaseUrl(ep.base_url)
+  return u === OPENAI_OFFICIAL_URL
 }
 
 export function stripPrefix(model, prefix) {
@@ -26,32 +48,48 @@ export function modelIdsForEndpoint(ep, { forcePrefix = false } = {}) {
   const prefix = norm(ep.prefix)
   const ids = []
   const seen = new Set()
-  for (const m of ep.models || []) {
-    const alias = norm(m.alias)
-    if (!alias) continue
+  const add = (alias) => {
+    const a = norm(alias)
+    if (!a) return
     if (!forcePrefix || !prefix) {
-      if (!seen.has(lower(alias))) {
-        seen.add(lower(alias))
-        ids.push(alias)
+      if (!seen.has(lower(a))) {
+        seen.add(lower(a))
+        ids.push(a)
       }
     }
     if (prefix) {
-      const pref = `${prefix}/${alias}`
+      const pref = `${prefix}/${a}`
       if (!seen.has(lower(pref))) {
         seen.add(lower(pref))
         ids.push(pref)
       }
     }
   }
+  for (const m of ep?.models || []) {
+    add(m.alias || m.name)
+  }
+  if (isOfficialClaude(ep)) {
+    try {
+      for (const m of listOfficialModels()) {
+        add(m.id)
+      }
+    } catch {}
+  } else if (isOfficialOpenAI(ep)) {
+    try {
+      for (const m of listGptPublicModels()) {
+        add(m.id)
+      }
+    } catch {}
+  }
   return ids
 }
 
 export function resolveUpstreamPool(ep, requestedModel) {
-  const want = lower(stripPrefix(requestedModel, ep.prefix))
+  const want = lower(stripPrefix(requestedModel, ep?.prefix))
   if (!want) return []
   const out = []
   const seen = new Set()
-  for (const m of ep.models || []) {
+  for (const m of ep?.models || []) {
     if (lower(m.alias) !== want) continue
     const name = norm(m.name) || norm(m.alias)
     const key = lower(name)
@@ -59,7 +97,17 @@ export function resolveUpstreamPool(ep, requestedModel) {
     seen.add(key)
     out.push(name)
   }
-  return out
+  if (out.length > 0) return out
+  if (isOfficialClaude(ep)) {
+    const raw = stripPrefix(requestedModel, ep?.prefix)
+    const resolved = resolveCatalogModel(raw)
+    if (resolved?.ok && resolved.model) return [resolved.model]
+    if (isCatalogModelId(raw)) return [raw]
+  } else if (isOfficialOpenAI(ep)) {
+    const raw = stripPrefix(requestedModel, ep?.prefix)
+    if (isGptSeriesId(raw) || isCodexCatalogModel(raw)) return [raw]
+  }
+  return []
 }
 
 export function endpointMatchesModel(ep, requestedModel) {

@@ -124,3 +124,35 @@ test('pick filters endpoints by protocol group_type', () => {
   const failUnknown = s.pick('nonexistent', Date.now(), { groupType: 'anthropic' })
   assert.equal(failUnknown.ok, false)
 })
+
+test('official endpoint catalog includes protocol models even with single or empty models list', () => {
+  const s = new ApiScheduler()
+  const epClaude = ep({
+    id: 'ep-claude',
+    kind: 'claude',
+    protocol: 'anthropic',
+    base_url: 'https://api.anthropic.com',
+    prefix: '',
+    models: [{ name: 'claude-sonnet-4-5', alias: 'claude-sonnet-4-5' }],
+    api_key_entries: [{ id: 'k1', api_key: 'sk-ant-test', disabled: false }],
+  })
+  s.reload([epClaude])
+
+  const cat = s.catalog({ groupType: 'anthropic' })
+  const ids = cat.data.map((m) => m.id)
+  assert.ok(ids.length > 5, 'should return full official catalog, got: ' + ids.length)
+  assert.ok(ids.includes('claude-sonnet-4-5'), 'should include claude-sonnet-4-5')
+  assert.ok(
+    ids.some((id) => id.includes('haiku')),
+    'should include haiku models',
+  )
+  assert.ok(
+    ids.some((id) => id.includes('opus')),
+    'should include opus models',
+  )
+
+  const picked = s.pick('claude-sonnet-4-6')
+  assert.equal(picked.ok, true)
+  assert.equal(picked.endpoint.id, 'ep-claude')
+  assert.equal(picked.upstream_model, 'claude-sonnet-4-6')
+})
