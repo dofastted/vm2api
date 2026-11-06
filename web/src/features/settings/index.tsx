@@ -119,6 +119,7 @@ export function SettingsPage() {
         body.official_cc = { ...official, inference: 'cli-hop' }
       }
       if (tab === 'protocol') {
+        delete body.redaction_runtime
         const inference = (body.inference as Record<string, unknown>) || {}
         body.inference = {
           ...inference,
@@ -411,6 +412,19 @@ export function SettingsPage() {
                       Record<string, unknown> | undefined) || {}
                   }
                   inference={inference}
+                  redaction={
+                    (draft.redaction as
+                      Record<string, unknown> | undefined) || {
+                      enabled: false,
+                      secrets: true,
+                      personal: true,
+                      words: [],
+                    }
+                  }
+                  runtime={
+                    (draft.redaction_runtime as
+                      Record<string, unknown> | undefined) || {}
+                  }
                   onCompatChange={(next) =>
                     setDraft((current) => ({ ...current, compatibility: next }))
                   }
@@ -423,6 +437,9 @@ export function SettingsPage() {
                         ...patch,
                       },
                     }))
+                  }
+                  onRedactionChange={(next) =>
+                    setDraft((current) => ({ ...current, redaction: next }))
                   }
                 />
               ) : null}
