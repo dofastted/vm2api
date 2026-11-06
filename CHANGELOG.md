@@ -14,10 +14,14 @@
 
 ## 1.4.048 — 2026-11-06
 
+- #907：修复 API 直连密钥模型目录与协议调度绑定：
+  - 生成/编辑 API 直连密钥（`category: 'api'`）时，分组选择 `anthropic` 或 `openai` 不再强制校验 VM，移除前端阻塞与后端 `key_vms_required` 限制；
+  - `/v1/models` 与 `/models` 按密钥协议作用域过滤 API 端点模型，`anthropic` 密钥仅返回 Anthropic 端点模型，`openai` 密钥仅返回 OpenAI 端点模型；
+  - `ApiScheduler.pick` 按请求密钥协议过滤候选端点，避免跨协议错误调度；
+  - API 配置页保留已有端点模型状态，端点更新时同步携带最新模型。
 - #904：graceful-shutdown drain 超时定时器去掉 `unref`，修复孤立单测在 event loop 提前结束时被误杀的 CI flake（#376/#904）。
 
-已部署机升级：只更新 Node 控制面后重启。不必 `wrap-cli/sync`，不必换 payload，不必更新 `web/dist`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
-
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 ## 1.4.047 — 2026-11-06
 
 - #905：追加 OpenAI 最新图像模型 `gpt-image-2.6-flare`（上游默认）与 `gpt-image-2.6-sunburst`，接入 `/v1/models`、`/v1/images/*`、Responses `image_generation` 工具及 Chat/Responses 图像桥接，内置单价与用量计费同步更新。
