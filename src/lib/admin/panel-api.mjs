@@ -7,6 +7,8 @@
  */
 
 import { THINKING_DISPLAY_MODES } from '../protocol/thinking.mjs'
+import { normalizeRedaction } from '../redaction/policy.mjs'
+import { redactionStatus } from '../redaction/runtime.mjs'
 import { readSlotProcessStatus } from '../vm/slot-process-status.mjs'
 import os from 'node:os'
 import { usagePoolEnabled, usageRead } from '../db/sqlite-pool.mjs'
@@ -1510,6 +1512,8 @@ export function buildRouting({ routingConfig, stickyRouter }) {
     notify: publicNotifyConfig(routingConfig?.notify),
     vm: normalizeVmConfig(routingConfig?.vm),
     telemetry: { upload_interval_seconds: telemetryUploadInterval(routingConfig) },
+    redaction: normalizeRedaction(routingConfig?.redaction),
+    redaction_runtime: redactionStatus(),
     sessions: stickyRouter.stats(),
   })
 }

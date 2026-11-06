@@ -29,6 +29,7 @@ import {
 } from './codex-usage.mjs'
 import { disjointOpenaiUsage, mergeUsage, preferUsage } from './openai-usage.mjs'
 import { streamCodexKernel } from '../transport/codex-kernel-client.mjs'
+import { ensureRedaction, maskJson, restoreJsonValue } from '../redaction/runtime.mjs'
 import {
   codexKernelRequestOptions,
   ensureCodexKernel,
@@ -817,8 +818,9 @@ export async function handleCodexProtocol({
               timeoutMs: cfg?.limits?.upstream_timeout_ms ?? 600_000,
               idleTimeoutMs: resolveStreamIdleTimeoutMs(routing, cfg),
               routing,
+              redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
+              redactionSession: String(req.headers?.['x-session-id'] || inboundSession.session_id || ''),
               body: outboundBody,
-              reqHeaders: req.headers,
               envelope: {
                 body: outboundBody,
                 headers: outboundHeaders,
@@ -1238,7 +1240,14 @@ export async function handleCodexSearch({
   }
   const outbound = { ...body }
   for (const key of CODEX_SEARCH_DROP_FIELDS) delete outbound[key]
-  const turnMetadata = headerString(req.headers, 'x-codex-turn-metadata')
+  const redactionState = await ensureRedaction(routing, { projectRoot })
+  const redaction = redactionState.enabled
+    ? {
+        principal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
+        session: String(req.headers?.['x-session-id'] || ''),
+      }
+    : null
+  if (redaction) Object.assign(outbound, await maskJson(outbound, redaction))
   const post = ops.postCodexSearch || postCodexSearch
   const pickOpts = { stickyRouter, sessions: null, body: outbound, excluded: new Set(), ownerScope }
   const deadline = Date.now() + codexWaitTimeoutMs(routing)
@@ -1310,7 +1319,8 @@ export async function handleCodexSearch({
     stats.errors++
     logBag.error_code = payload?.error?.code || `upstream_${last.status}`
   }
-  return json(res, last.status, payload)
+  const responseBody = redaction ? await restoreJsonValue(payload, redaction) : payload
+  return json(res, last.status, responseBody)
 }
 
 // Image generation runs for minutes. codex-proxy-rs sets no total deadline on these JSON endpoints
@@ -1389,6 +1399,14 @@ export async function handleCodexImages({
   const turnMetadata = headerString(req.headers, 'x-codex-turn-metadata')
   const imageTurnId = headerString(req.headers, 'x-codex-image-turn-id')
   const extraHeaders = imageTurnId ? { 'x-codex-image-turn-id': imageTurnId } : {}
+  const redactionState = await ensureRedaction(routing, { projectRoot })
+  const redaction = redactionState.enabled
+    ? {
+        principal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
+        session: String(req.headers?.['x-session-id'] || ''),
+      }
+    : null
+  const outboundBody = redaction ? await maskJson(body, redaction) : body
   const post = ops.postCodexJson || postCodexJson
   // Selection-only body: the turn id becomes the sticky session; the upstream body is untouched.
   const pickBody = { model: model || null, ...(imageTurnId ? { session_id: `codex-image-turn:${imageTurnId}` } : {}) }
@@ -1425,7 +1443,7 @@ export async function handleCodexImages({
           timeoutMs: CODEX_IMAGES_TIMEOUT_MS,
           projectRoot,
           vm,
-          body,
+          body: outboundBody,
           turnMetadata,
           extraHeaders,
           fetchImpl: ops.fetchImpl,
@@ -1470,5 +1488,6 @@ export async function handleCodexImages({
   } else if (payload?.usage && typeof payload.usage === 'object') {
     logBag.image_usage = payload.usage
   }
-  return json(res, last.status, payload)
+  const responseBody = redaction ? await restoreJsonValue(payload, redaction) : payload
+  return json(res, last.status, responseBody)
 }
