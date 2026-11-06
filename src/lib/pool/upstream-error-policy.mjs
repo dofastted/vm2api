@@ -255,6 +255,13 @@ export function isSilentClaudeRefusal(result = {}) {
 
 export const DEFAULT_OAUTH_401_COOLDOWN_MS = 120_000
 export const MAX_OAUTH_401_COOLDOWN_MS = 600_000
+/**
+ * A slot whose own credential refresh failed stops taking traffic for a while.
+ * Bounded rather than permanent: the worker only forwards the token endpoint's
+ * status, so a slot that is merely temporarily unable to refresh gets another
+ * chance instead of being parked until an operator re-imports it by hand.
+ */
+export const CREDENTIAL_ENSURE_COOLDOWN_MS = 10 * 60_000
 /** Upstream 5xx: stop the account and the same prompt. Do not open another slot. */
 export const PROVIDER_PAUSE_MS = 60 * 60 * 1000
 
@@ -411,6 +418,17 @@ function classifyUpstreamResultRaw(
       action: 'stop',
       reason: 'downstream_committed_or_incomplete',
       cooldownUntil: null,
+    }
+  }
+  // Non-fatal ensure failures keep the token endpoint's 400. Fatal grants are
+  // escalated to 401 above and must keep the permanent oauth_revoked path.
+  if (result.credential_ensure_failed === true && status === 400) {
+    return {
+      scope: 'account',
+      action: 'continue-and-cooldown',
+      reason: 'credential_refresh_failed',
+      cooldownUntil: now + CREDENTIAL_ENSURE_COOLDOWN_MS,
+      retrySameAccount: false,
     }
   }
   // Plan limit arrives as 429, as a kernel 502 provider_error, or (pre-restore)

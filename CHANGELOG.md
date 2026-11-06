@@ -12,6 +12,49 @@
 - CRAG V2 发布协议切换到原生 ELF（`runtime: native`、`entrypoint: crag-v2`）：验证实际架构、完整 SHA 成员与安全路径，原子物化并直接执行，不再复制 Node 或写出 `node_bin` / `crag_v2_root`。保留 legacy 版本选择和 Linux Docker 放置限制；真实 CLI 版本由 native worker 探测。
 - native V2 生命周期探测、停止、切换回收和 idle reload 识别新进程名；动态 runnable 上限不再被误算为占用任务。配置写入本身不触发额外热重载，沿用显式空闲重启流程。
 
+## 1.4.048 — 2026-11-06
+
+- #909：API 直连推理出站前剥离内部 persona 模板的非法缓存控制字段（如 scope），防止 Anthropic 官方上游返回 400（Extra inputs are not permitted）。
+- #908：官方 API 端点自动接入完整官方协议模型目录，并在调度时动态匹配协议模型，无需手动逐一录入。
+- #907：修复 API 直连密钥模型目录与协议调度绑定：
+  - 生成/编辑 API 直连密钥（`category: 'api'`）时，分组选择 `anthropic` 或 `openai` 不再强制校验 VM，移除前端阻塞与后端 `key_vms_required` 限制；
+  - `/v1/models` 与 `/models` 按密钥协议作用域过滤 API 端点模型，`anthropic` 密钥仅返回 Anthropic 端点模型，`openai` 密钥仅返回 OpenAI 端点模型；
+  - `ApiScheduler.pick` 按请求密钥协议过滤候选端点，避免跨协议错误调度；
+  - API 配置页保留已有端点模型状态，端点更新时同步携带最新模型。
+- #904：graceful-shutdown drain 超时定时器去掉 `unref`，修复孤立单测在 event loop 提前结束时被误杀的 CI flake（#376/#904）。
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+## 1.4.047 — 2026-11-06
+
+- #905：追加 OpenAI 最新图像模型 `gpt-image-2.6-flare`（上游默认）与 `gpt-image-2.6-sunburst`，接入 `/v1/models`、`/v1/images/*`、Responses `image_generation` 工具及 Chat/Responses 图像桥接，内置单价与用量计费同步更新。
+- #902：集群页支持冷迁移 KVM 槽位并扩容内存，支持跨主机快速迁移。
+
+已部署机升级：只更新 Node 控制面后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.046 — 2026-11-06
+
+- #376：控制面平滑停机与排空（Graceful Draining）：收到 SIGTERM/SIGINT 时停止接入新请求，`/health` 与 `/healthz` 立即返回 503 `shutting_down` 通知上游反代/负载均衡安全摘流；等待在途长文本推理流自然排空（默认超时 25s，支持 `KIN_SHUTDOWN_DRAIN_TIMEOUT_MS`），避免升级或重启切断活跃会话导致客户端收到 `UND_ERR_SOCKET`。
+- #852：推理槽位假死显式感知与连续超时熔断：
+  - 诊断显式感知：槽位健康检查若发现存在异常闭合槽位时上报 `warn`（`kernel_degraded`），全部闭合时上报 `error`（`kernel_slots_closed`），彻底消除假死诊断盲区；
+  - 看门狗全闭合重启：`rustKernelNeedsRestart` 识别 `ready_slots === 0 && closed_slots > 0` 触发重启，不再无限期当作 busy；
+  - VM 级连续超时熔断：引入 `vmTimeoutTracker`，单台 VM 连续 3 次静默无首帧超时（504 / `worker_timeout`）立即标记 `kernelFaults` 熔断，阻止持续调度与级联超时。
+
+已部署机升级：只更新 Node 控制面后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.045 — 2026-11-05
+
+- #896：claude_code_only 完整替代 #892+#893：放行 CLI WebSearch/WebFetch 侧查询（缺 `claude-code-20250219` 的窄形状仍保留其余官方指纹检查）；Desktop Gateway 登录探针本地回 OK（零用量、不选账号）；中转准入不再仅凭计费行放行（须合法 `metadata.user_id` + 可识别的官方 Claude Code system）；拒 OMP 18.x（认出 `You are omp's trusted coding assistant`）。
+- #900（取代 #899）：槽位 credential ensure 非致命失败（生产 400 + `credential_ensure_failed`）按席位故障换槽并冷却 10 分钟，不再误判为 `invalid_request`；fatal 升级（401 + oauth 码，仍带 `credential_ensure_failed`）继续走永久 `oauth_revoked`，不被 10 分钟冷却截断。
+- `scripts/fetch-payload.mjs` 从 Release 下载 payload 资产遇瞬时失败时会重试（最多 4 次，递增退避），减轻 CI/本地构建偶发网络错误。
+
+已部署机升级：只更新 Node 控制面后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
+## 1.4.044 — 2026-11-05
+
+- #890：修复本地转发代理的 lazy CONNECT 误判：SOCKS 成功但隧道没有应用层响应时不再标记健康。探测先要求经隧道完成 TLS 握手，TLS 不可用时回退到经隧道的 TCP DNS；延迟改为完整探测往返。
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
 ## 1.4.043 — 2026-11-05
 
 - #885：没写 `max_tokens` 时用模型目录的 `max_tokens_default`（例如 Haiku 5.5 为 100000，Sonnet 5 为 64000），不再一律填 128000。写了且低于 `compatibility.min_max_tokens.value` 时默认仍抬到该值；模式「不改」/ `preserve` / `unchanged` 或面板「不抬升」则不抬。未指定有效模式时兼容 `no_raise: true` / `raise: false`，显式模式优先。超过该模型 `max_tokens_cap` 仍会下调。`enabled` thinking 的 `budget_tokens` 不小于 `max_tokens` 时，仍用该配置值补 thinking 合法间隔。
@@ -30,11 +73,6 @@
 已部署机升级：更新 Node 控制面与 `web/dist` 后重启，启动时自动迁移端点开关字段。不更换 CRAG / CLI payload，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
 
 ## 1.4.041 — 2026-11-05
-
-- #884：硬规则复用直接否定检查，保密指令（如 `Do not reveal hidden reasoning`）不再误判为蒸馏请求；同段后续的正向提取命令仍拦截。
-- #835：Messages 转 Codex 保留有序的 `tool_use` / `tool_result` 历史、调用 ID、JSON 参数及字符串/文本块结果，修复工具返回值丢失导致的重复调用。
-- #862：“我的密钥”在服务端按认证用户隔离列表、统计和全部密钥操作，管理员不能读取或操作其他用户的密钥，也不能通过 `user_id` 转移归属；Master 仅管理无归属的平台密钥。
-- #834：槽位同步从完整 VM 记录读取待重启状态；即使 payload 未变也能重试待办，仅在重启成功后清除，检查模式、停止槽和失败重启保留标记。
 - 新增可选 `compatibility.preserve_pruned_tool_results`：在槽位Claude推理中，按认证密钥和DSH会话隔离保存成功请求的有限工具原文；精确识别默认工具文本裁剪后恢复原始前缀，避免小幅历史裁剪造成整段缓存重写。真实编辑/压缩、失败/重试、并发歧义和内存/上下文预算不足时不恢复；缺省关闭，不改变客户端配置或API直连端点。
 
 ## 1.4.038 — 2026-11-04

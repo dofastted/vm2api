@@ -131,6 +131,7 @@ import {
   claudeCodeOnlyError,
   claudeCodeOnlyFromRouting,
   isClaudeCodeFamilyRequest,
+  isClaudeDesktopConnectionProbe,
 } from '../identity/claude-code-only.mjs'
 import { createDownstreamKeepalive } from './stream-keepalive.mjs'
 import {
@@ -673,6 +674,32 @@ export function createHandleProtocol(deps) {
     if (
       claudeCodeOnlyFromRouting(routingNow) &&
       !panelDiagnostics &&
+      protocol === 'anthropic.messages' &&
+      isClaudeDesktopConnectionProbe(req.headers, inbound)
+    ) {
+      // Claude Desktop's gateway sign-in check: acknowledge the authenticated connection
+      // locally. No account is picked and no model runs, so the fixed body spends nothing.
+      stats.requests++
+      stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
+      logBag.via = 'desktop-connection-probe'
+      logBag.attempt_count = 0
+      logBag.usage = { input_tokens: 0, output_tokens: 0 }
+      logBag.stop_reason = 'end_turn'
+      logBag.final_state = 'desktop-connection-probe'
+      return json(res, 200, {
+        id: `msg_probe_${logCtx.request_id}`,
+        type: 'message',
+        role: 'assistant',
+        model: inbound.model,
+        content: [{ type: 'text', text: 'OK' }],
+        stop_reason: 'end_turn',
+        stop_sequence: null,
+        usage: logBag.usage,
+      })
+    }
+    if (
+      claudeCodeOnlyFromRouting(routingNow) &&
+      !panelDiagnostics &&
       detectInboundPlatform(inbound?.model).platform === 'anthropic' &&
       (protocol !== 'anthropic.messages' ||
         isHealthShape(req.headers, inbound, getHealthMonitor()?.getConfig?.() || DEFAULT_HEALTH_PROBE, protocol) ||
@@ -794,7 +821,11 @@ export function createHandleProtocol(deps) {
     // API endpoint protocols own routing; apply model overrides before choosing the channel.
     if (inferenceBackend === 'api') ctx = applyIntercept(cfg.intercept.rules, 'before_upstream', ctx)
     const apiInbound = inferenceBackend === 'api' ? ctx.body : null
-    const apiPicked = inferenceBackend === 'api' ? apiScheduler.pick(ctx.body?.model) : null
+    const apiKeyScope = inferenceBackend === 'api' ? keyScopeFromRequest(req) : null
+    const apiPicked =
+      inferenceBackend === 'api'
+        ? apiScheduler.pick(ctx.body?.model, Date.now(), { groupType: apiKeyScope?.group_type })
+        : null
     if (apiPicked && !apiPicked.ok) {
       stats.errors++
       logBag.error_code = apiPicked.code

@@ -141,25 +141,53 @@ test('URL-imported IPv6 probes connect only when enabled and closing cancels in-
     sockets.add(socket)
     connections += 1
     socket.on('close', () => sockets.delete(socket))
-    const respond = connections === 1
+    // The first probe now opens one connection for TLS and one for the DNS
+    // fallback; the third connection is the intentionally pending probe.
+    const respond = connections <= 2
     let buf = Buffer.alloc(0)
-    let greeted = false
+    let phase = 'greeting'
     socket.on('data', (chunk) => {
       if (!respond) return
       buf = Buffer.concat([buf, chunk])
-      if (!greeted) {
-        if (buf.length < 2) return
-        const need = 2 + buf[1]
-        if (buf.length < need) return
-        buf = buf.subarray(need)
-        greeted = true
-        socket.write(Buffer.from([5, 0]))
-      }
-      // ::1 is a loopback (forwarder) row, so the probe also sends CONNECT.
-      const at = buf.indexOf(Buffer.from([5, 1]))
-      if (at >= 0 && buf.length >= at + 10) {
-        buf = buf.subarray(at + 10)
-        socket.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]))
+      while (true) {
+        if (phase === 'greeting') {
+          if (buf.length < 2) return
+          const need = 2 + buf[1]
+          if (buf.length < need) return
+          buf = buf.subarray(need)
+          phase = 'request'
+          socket.write(Buffer.from([5, 0]))
+          continue
+        }
+        if (phase === 'request') {
+          // ::1 is a loopback (forwarder) row, so the probe also sends CONNECT.
+          if (buf.length < 10) return
+          const port = (buf[8] << 8) | buf[9]
+          buf = buf.subarray(10)
+          socket.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0]))
+          if (port === 53) {
+            phase = 'tunnel'
+            continue
+          }
+          phase = 'closed'
+          socket.end()
+          return
+        }
+        if (phase === 'tunnel') {
+          if (buf.length < 2) return
+          const need = 2 + buf.readUInt16BE(0)
+          if (buf.length < need) return
+          const query = buf.subarray(2, need)
+          buf = buf.subarray(need)
+          const response = Buffer.from(query)
+          response[2] |= 0x80
+          const frame = Buffer.alloc(2 + response.length)
+          frame.writeUInt16BE(response.length, 0)
+          response.copy(frame, 2)
+          socket.write(frame)
+          continue
+        }
+        return
       }
     })
   })

@@ -61,8 +61,21 @@ describe('API key limit payload', () => {
       allowed_vms: [],
     })
     expect(() =>
-      keyLimitsPayload({ ...draft, allowed_vms: [] }, 'create')
+      keyLimitsPayload(
+        { ...draft, category: 'oauth', allowed_vms: [] },
+        'create'
+      )
     ).toThrow('至少选择一台 VM')
+    expect(
+      keyLimitsPayload(
+        { ...draft, category: 'api', group_type: 'openai', allowed_vms: [] },
+        'create'
+      )
+    ).toMatchObject({
+      category: 'api',
+      group_type: 'openai',
+      allowed_vms: [],
+    })
   })
 
   it('handles vm_pool_id for admin and strips it for non-admin', () => {

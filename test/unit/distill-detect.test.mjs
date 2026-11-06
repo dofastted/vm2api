@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   DEFAULT_DISTILL_RULES,
   HARD_DISTILL_PATTERNS,
@@ -17,6 +18,7 @@ import { ErrorCode } from '../../src/lib/core/errors.mjs'
 import { evaluateProtocolIntercept } from '../../src/lib/protocol/intercept-gate.mjs'
 import { matchHardPolicy } from '../../src/lib/protocol/jev-intercept.mjs'
 
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const REASON_ASK = '请分步解答。先写推理过程，最后单独一行写：\n最终答案：...'
 
 function inbound(user, extra = {}) {
@@ -601,4 +603,35 @@ test('normalize keeps default fingerprints when omitted', () => {
   const r = normalizeDistillRules({ enabled: true })
   assert.ok(r.fingerprints.length >= 5)
   assert.equal(r.error.message, '不允许蒸馏')
+})
+
+test('handleProtocol intercepts before credential hop', () => {
+  const src = fs.readFileSync(path.join(root, 'src/lib/protocol/handle-protocol.mjs'), 'utf8')
+  const early = src.indexOf('await applyProtocolIntercept(')
+  const codex = src.indexOf('handleCodexProtocol({')
+  assert.ok(early > 0 && early < codex)
+  const before = src.indexOf("applyIntercept(cfg.intercept.rules, 'before_upstream'")
+  const late = src.indexOf('await applyProtocolIntercept(', early + 1)
+  const apiHop = src.indexOf('picked: apiPicked')
+  assert.ok(before > 0)
+  assert.ok(late > before)
+  assert.ok(apiHop > late)
+  const guard = src.slice(
+    src.indexOf('async function applyProtocolIntercept'),
+    src.indexOf('function isZeroInjectMode'),
+  )
+  assert.ok(guard.includes('isProxiedOfficialClaudeCode'))
+  const countSrc = fs.readFileSync(path.join(root, 'src/lib/protocol/user-count-tokens.mjs'), 'utf8')
+  const countGuard = countSrc.indexOf('blockCountTokensBeforeHop(req, parsed.body, deps)')
+  const countHop = countSrc.indexOf('countTokensViaWorker)(peeked.exec')
+  assert.ok(countGuard > 0 && countHop > countGuard)
+})
+
+test('assemble path does not forward onCommit to the kernel hop', () => {
+  const src = fs.readFileSync(path.join(root, 'src/lib/protocol/handle-protocol.mjs'), 'utf8')
+  const start = src.indexOf('async function streamAndAssembleClaudeMessage')
+  const end = src.indexOf('async function handleProtocol')
+  assert.ok(start > 0 && end > start)
+  const chunk = src.slice(start, end)
+  assert.equal(chunk.includes('onCommit'), false)
 })

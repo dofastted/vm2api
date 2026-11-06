@@ -129,7 +129,7 @@ export function keyAllowsVm(scope, vm) {
  * A named pool replaces the copied allowlist. An explicit platform list
  * clears a previously bound pool. Does not check that the VM or pool exists.
  */
-export function normalizeKeyScope(input = {}, { partial = false, current = null } = {}) {
+export function normalizeKeyScope(input = {}, { partial = false, current = null, isApi = false } = {}) {
   const hasType = input.group_type != null && input.group_type !== ''
   const hasVms = input.allowed_vms != null
   const hasPool = Object.prototype.hasOwnProperty.call(input, 'vm_pool_id')
@@ -144,8 +144,16 @@ export function normalizeKeyScope(input = {}, { partial = false, current = null 
     }
     group_type = parsed
   }
+  const apiMode =
+    isApi ||
+    String(input.category || current?.category || '')
+      .trim()
+      .toLowerCase() === 'api'
   let allowed_vms = hasVms ? parseAllowedVms(input.allowed_vms) : !partial && !hasType ? [] : base.allowed_vms
   let vm_pool_id = hasPool ? parsePoolId(input.vm_pool_id) : base.vm_pool_id
+  if (apiMode) {
+    return { group_type, allowed_vms: [], vm_pool_id: null }
+  }
   const manual = (hasType && group_type !== 'all') || (hasVms && allowed_vms.length > 0)
   if (!hasPool && manual) vm_pool_id = null
   if (vm_pool_id) {

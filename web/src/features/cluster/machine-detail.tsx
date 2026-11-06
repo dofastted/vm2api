@@ -129,7 +129,7 @@ function CapacityBar({ m }: { m: ClusterMachine }) {
 }
 
 const SLOT_GRID =
-  'grid-cols-[minmax(150px,1.3fr)_minmax(52px,.5fr)_minmax(44px,.45fr)_minmax(130px,1.3fr)_minmax(130px,1.2fr)_minmax(130px,1.2fr)_minmax(40px,.4fr)_minmax(72px,.7fr)]'
+  'grid-cols-[minmax(150px,1.3fr)_minmax(52px,.5fr)_minmax(44px,.45fr)_minmax(130px,1.3fr)_minmax(130px,1.2fr)_minmax(130px,1.2fr)_minmax(40px,.4fr)_minmax(72px,.7fr)_minmax(80px,.7fr)]'
 
 function memText(vm: Vm): string {
   const b = memoryBytes(vm.machine?.memory)
@@ -141,11 +141,13 @@ function SlotTable({
   poolNameOf,
   canManage,
   onCreate,
+  onMigrate,
 }: {
   m: ClusterMachine
   poolNameOf: (vmId: string) => string | null
   canManage: boolean
   onCreate: () => void
+  onMigrate: (vm: Vm) => void
 }) {
   if (!m.slots.length) {
     const fit = m.capacity?.fit
@@ -184,6 +186,7 @@ function SlotTable({
             '状态',
             '在途',
             '今日',
+            '操作',
           ].map((h, i) => (
             <div
               key={h}
@@ -251,6 +254,25 @@ function SlotTable({
                 )}
               >
                 {fmtUsd(today, 2)}
+              </div>
+              <div className='text-right'>
+                {canManage ? (
+                  <Button
+                    variant='ghost'
+                    size='sm'
+                    disabled={!vm.node_id || vm.runtime_type !== 'kvm'}
+                    title={
+                      !vm.node_id || vm.runtime_type !== 'kvm'
+                        ? '首版仅支持远程 Linux KVM 槽'
+                        : '迁移到其他节点，或在原节点扩内存'
+                    }
+                    onClick={() => onMigrate(vm)}
+                  >
+                    迁移 / 扩容
+                  </Button>
+                ) : (
+                  '—'
+                )}
               </div>
             </div>
           )
@@ -333,6 +355,7 @@ export function MachineDetail({
   onOpenNode,
   onRemove,
   onCreate,
+  onMigrate,
 }: {
   machines: ClusterMachine[]
   selectedId: string
@@ -350,6 +373,7 @@ export function MachineDetail({
   onOpenNode: (nodeId: string, tab: SshPanelTab) => void
   onRemove: (m: ClusterMachine) => void
   onCreate: (m: ClusterMachine) => void
+  onMigrate: (vm: Vm) => void
 }) {
   const m = machines.find((x) => x.id === selectedId) || machines[0]
   if (!m) return null
@@ -428,6 +452,7 @@ export function MachineDetail({
         poolNameOf={poolNameOf}
         canManage={canManage}
         onCreate={() => onCreate(m)}
+        onMigrate={onMigrate}
       />
       {m.role === 'local' ? <ConnectionDetails {...localDetails} /> : null}
     </>

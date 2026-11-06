@@ -22,6 +22,7 @@ import {
 import { JoinVpsDialog } from '@/features/cluster/join-dialog'
 import { MachineDetail } from '@/features/cluster/machine-detail'
 import { MachineTable } from '@/features/cluster/machine-table'
+import { MigrateSlotDialog } from '@/features/cluster/migrate-slot-dialog'
 import {
   buildMachines,
   clusterSummary,
@@ -139,6 +140,7 @@ export function ClusterPage() {
     null
   )
   const [dropTarget, setDropTarget] = useState<ClusterMachine | null>(null)
+  const [moveVm, setMoveVm] = useState<Vm | null>(null)
   const [createOn, setCreateOn] = useState<ClusterMachine | null>(null)
   const panelNode = apiNodes.find((n) => n.id === panel?.id) || null
 
@@ -300,6 +302,7 @@ ANTI-PATTERN: Local board vs remote table, lifetime spend per host, one-sample l
               onOpenNode={(id, tab) => setPanel({ id, tab })}
               onRemove={setDropTarget}
               onCreate={setCreateOn}
+              onMigrate={setMoveVm}
             />
           </Card>
         </div>
@@ -328,6 +331,13 @@ ANTI-PATTERN: Local board vs remote table, lifetime spend per host, one-sample l
           if (!open) setPanel(null)
         }}
       />
+      {canManage ? (
+        <MigrateSlotDialog
+          vm={moveVm}
+          nodes={apiNodes}
+          onClose={() => setMoveVm(null)}
+        />
+      ) : null}
       <CreateVmDialog
         open={!!createOn}
         onOpenChange={(open) => {

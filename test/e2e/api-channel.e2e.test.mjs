@@ -98,6 +98,31 @@ test('generated API key lists configured models and calls both protocols through
     const listed = await api(gw, 'GET', '/v1/models', { headers })
     assert.equal(listed.status, 200, listed.text)
     assert.deepEqual(listed.json.data.map((item) => item.id).sort(), ['claude-fixture', 'gpt-fixture'])
+    const antKey = await api(gw, 'POST', '/api/panel/api-keys', {
+      body: { name: 'API-anthropic', category: 'api', group_type: 'anthropic' },
+    })
+    assert.equal(antKey.status, 201, antKey.text)
+    const antListed = await api(gw, 'GET', '/v1/models', {
+      headers: { authorization: `Bearer ${antKey.json.item.key}` },
+    })
+    assert.equal(antListed.status, 200, antListed.text)
+    assert.deepEqual(
+      antListed.json.data.map((item) => item.id),
+      ['claude-fixture'],
+    )
+
+    const oaiKey = await api(gw, 'POST', '/api/panel/api-keys', {
+      body: { name: 'API-openai', category: 'api', group_type: 'openai' },
+    })
+    assert.equal(oaiKey.status, 201, oaiKey.text)
+    const oaiListed = await api(gw, 'GET', '/v1/models', {
+      headers: { authorization: `Bearer ${oaiKey.json.item.key}` },
+    })
+    assert.equal(oaiListed.status, 200, oaiListed.text)
+    assert.deepEqual(
+      oaiListed.json.data.map((item) => item.id),
+      ['gpt-fixture'],
+    )
     for (const [url, body] of [
       ['/v1/messages', { model: 'claude-fixture', messages: [{ role: 'user', content: 'hi' }], max_tokens: 32 }],
       ['/v1/chat/completions', { model: 'gpt-fixture', messages: [{ role: 'user', content: 'hi' }], max_tokens: 32 }],

@@ -224,8 +224,9 @@ import {
   slotExec,
 } from '../vm/slot-runtime.mjs'
 import { recreateVmFiles, seedFreshCliHome } from '../vm/vm-recreate.mjs'
-import { diagnoseSlotServices, powerOnSlot, recoverSlot } from '../vm/slot-recovery.mjs'
+import { diagnoseSlotServices, powerOnSlot, recoverSlot, redactSecrets } from '../vm/slot-recovery.mjs'
 import { commitVmPackage, exportVmPackage, parseVmPackage } from '../vm/vm-package.mjs'
+import { slotMigrationBusy, slotMigrationJob, startSlotMigration } from '../cluster/slot-migration.mjs'
 import { preflightNode } from '../cluster/placement.mjs'
 import { probeLocalKvm } from '../vm/kvm-host.mjs'
 import { normalizeVmConfig, resolveMachineSpec, validateVmConfigPatch } from '../vm/machine-spec.mjs'
@@ -1482,6 +1483,42 @@ export function createPanelHandler(ctx) {
       ) {
         return true
       }
+      // Cold slot moves are administrator-only (not a tenant placement edit).
+      const migrationRoute = /^\/api\/panel\/vms\/([^/]+)\/migration$/.exec(p)
+      if (migrationRoute && ['GET', 'POST'].includes(req.method)) {
+        const id = migrationRoute[1]
+        if (!isValidVmId(id))
+          return json(res, 400, { ok: false, error: { code: 'invalid_vm_id', message: '非法槽位 ID' } })
+        if (!getVm(cfg.paths.project, id))
+          return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: '槽位不存在' } })
+        if (req.method === 'GET') return json(res, 200, panel.ok(slotMigrationJob(cfg.paths.project, id)))
+        try {
+          const body = await readBody(req, 8192)
+          const { job } = startSlotMigration({
+            projectRoot: cfg.paths.project,
+            id,
+            body,
+            routing: ctx.routingConfig,
+            proxyPool,
+            watchdog: ctx.kernelWatchdog,
+            poolScheduler: ctx.poolScheduler,
+            ops: ctx.slotMigrationOps,
+          })
+          return json(res, 202, panel.ok(job))
+        } catch (err) {
+          return json(res, err.status || 500, {
+            ok: false,
+            error: { code: err.code || 'migration_failed', message: redactSecrets(err.message) },
+          })
+        }
+      }
+      const movingVm = /^\/api\/panel\/vms\/([^/]+)(?:\/|$)/.exec(p)?.[1]
+      if (req.method !== 'GET' && movingVm && isValidVmId(movingVm) && slotMigrationBusy(cfg.paths.project, movingVm)) {
+        return json(res, 409, {
+          ok: false,
+          error: { code: 'migration_busy', message: '槽位迁移中或待人工恢复，暂不能修改' },
+        })
+      }
       if ((req.method === 'GET' || req.method === 'PUT') && p === '/api/panel/onboarding') {
         if (req.method === 'PUT') {
           const body = await readBody(req, 4096).catch(() => ({}))
@@ -1707,14 +1744,17 @@ export function createPanelHandler(ctx) {
           })
         }
         try {
-          const scopeInput = { group_type: body?.group_type, allowed_vms: body?.allowed_vms }
+          const isApi = isApiCategory(body?.category)
+          const scopeInput = { group_type: body?.group_type, allowed_vms: body?.allowed_vms, category: body?.category }
           if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id
           }
-          const scope = normalizeKeyScope(scopeInput)
+          const scope = normalizeKeyScope(scopeInput, { isApi })
           const pools = vmPoolsFor(apiKeyStore.db)
-          if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
-          else assertVmScope(keyScopeVms(req), scope)
+          if (!isApi) {
+            if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
+            else assertVmScope(keyScopeVms(req), scope)
+          }
           const defaultConc = Number(
             ctx.routingConfig?.concurrency?.default_key_concurrency ??
               ctx.routingConfig?.concurrency?.default_max_per_account ??
@@ -1776,18 +1816,25 @@ export function createPanelHandler(ctx) {
         try {
           const input = normalizePanelApiKeyInput(body || {}, req)
           const currentRec = apiKeyStore.getById(id)
-          const scopeInput = { group_type: body?.group_type, allowed_vms: body?.allowed_vms }
+          const isApi = isApiCategory(body?.category ?? currentRec?.category)
+          const scopeInput = {
+            group_type: body?.group_type,
+            allowed_vms: body?.allowed_vms,
+            ...(isApi ? { category: 'api' } : {}),
+          }
           if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id
           }
-          const scope = normalizeKeyScope(scopeInput, { partial: true, current: currentRec })
+          const scope = normalizeKeyScope(scopeInput, { partial: true, current: currentRec, isApi })
           if (scope) {
             if (ident.role !== 'admin' && currentRec?.vm_pool_id) {
               scope.vm_pool_id = currentRec.vm_pool_id
             }
             const pools = vmPoolsFor(apiKeyStore.db)
-            if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
-            else assertVmScope(keyScopeVms(req), scope)
+            if (!isApi) {
+              if (scope.vm_pool_id) assertVmPoolExists(pools, scope.vm_pool_id)
+              else assertVmScope(keyScopeVms(req), scope)
+            }
             input.group_type = scope.group_type
             input.allowed_vms = scope.allowed_vms
             input.vm_pool_id = scope.vm_pool_id

@@ -246,6 +246,10 @@ export function authorizePanelRoute(method, path, role) {
   const m = String(method || 'GET').toUpperCase()
   const p = String(path || '')
 
+  if (/^\/api\/panel\/vms\/[^/]+\/migration(?:\/|$)/.test(p)) {
+    return { ok: false, role: r, code: 'forbidden', message: '只有管理员可以迁移槽位' }
+  }
+
   // Kernel cache, license inventory and installation are operator-only, like /wrap-cli.
   if (p === '/api/panel/kernels' || p.startsWith('/api/panel/kernels/')) {
     return { ok: false, role: r, code: 'forbidden', message: '只有管理员可以管理内核' }

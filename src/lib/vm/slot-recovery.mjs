@@ -289,8 +289,27 @@ async function kernelCheck(vm, projectRoot, engine, hasCredential, probes, inter
   if (pub.recovering)
     return check('kernel', label, 'warn', 'kernel_recovering', '内核正在重启 CLI，稍后自动恢复', detail)
   if (pub.ready_slots === 0) {
+    if (pub.closed_slots > 0)
+      return check(
+        'kernel',
+        label,
+        'error',
+        'kernel_slots_closed',
+        `所有会话槽均已闭合（${pub.closed_slots} 个槽闭合），无可用会话槽`,
+        detail,
+      )
     if (pub.cli_pid > 0) return check('kernel', label, 'warn', 'kernel_busy', '所有会话槽都在忙', detail)
     return check('kernel', label, 'error', 'kernel_no_cli', '内核在线但 CLI 未运行，没有可用会话槽', detail)
+  }
+  if (pub.closed_slots > 0) {
+    return check(
+      'kernel',
+      label,
+      'warn',
+      'kernel_degraded',
+      `内核降级：存在 ${pub.closed_slots} 个异常闭合槽位（可用会话槽 ${pub.ready_slots}）`,
+      detail,
+    )
   }
   const slots = pub.ready_slots == null ? '' : `，可用会话槽 ${pub.ready_slots}`
   return check('kernel', label, 'ok', null, `内核在线${slots}`, detail)
@@ -379,6 +398,7 @@ export async function powerOnSlot({
   fillTimezone = null,
   ops = {},
   by = null,
+  runtimeOptions = {},
 }) {
   let vm = getVm(projectRoot, id)
   if (!vm) return { ok: false, status: 404, code: 'vm_not_found', error: 'vm not found' }
@@ -395,7 +415,7 @@ export async function powerOnSlot({
   await (fillTimezone || ((vmId) => fillVmTimezoneFromExit(projectRoot, proxyPool, vmId)))(id)
   vm = getVm(projectRoot, id) || vm
   const runtimeBeforeBoot = structuredClone(vm.runtime || {})
-  const boot = await (ops.startSlotReady || startSlotReady)(vm, projectRoot, { routing })
+  const boot = await (ops.startSlotReady || startSlotReady)(vm, projectRoot, { ...runtimeOptions, routing })
   if (!boot.ok) {
     return {
       ok: false,
@@ -418,7 +438,7 @@ export async function powerOnSlot({
       else if (by === 'recover_ok') applyClearUnschedulable(record, { by })
       else if (by === 'start' && record.unschedulable?.reason === 'runtime_start_failed') {
         applyClearUnschedulable(record, { by: 'operator' })
-      } else applyClearUnschedulable(record, { by: 'credential_present' })
+      } else if (by !== 'migration') applyClearUnschedulable(record, { by: 'credential_present' })
       deriveScheduleFields(record)
       const next = { status: 'running' }
       if (runtime) {
@@ -600,6 +620,7 @@ export async function reviveDownSlots({
   const revived = []
   for (const vm of vms) {
     if (vm?.status !== 'running') continue
+    if (vm.migration_pending || ['running', 'needs_attention'].includes(vm.slot_migration?.status)) continue
     const nodeId = vmNodeId(vm)
     if (nodeId && !linkReady(nodeId)) continue
     let state
