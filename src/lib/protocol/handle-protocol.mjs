@@ -821,7 +821,11 @@ export function createHandleProtocol(deps) {
     // API endpoint protocols own routing; apply model overrides before choosing the channel.
     if (inferenceBackend === 'api') ctx = applyIntercept(cfg.intercept.rules, 'before_upstream', ctx)
     const apiInbound = inferenceBackend === 'api' ? ctx.body : null
-    const apiPicked = inferenceBackend === 'api' ? apiScheduler.pick(ctx.body?.model) : null
+    const apiKeyScope = inferenceBackend === 'api' ? keyScopeFromRequest(req) : null
+    const apiPicked =
+      inferenceBackend === 'api'
+        ? apiScheduler.pick(ctx.body?.model, Date.now(), { groupType: apiKeyScope?.group_type })
+        : null
     if (apiPicked && !apiPicked.ok) {
       stats.errors++
       logBag.error_code = apiPicked.code

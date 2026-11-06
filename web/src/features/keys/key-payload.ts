@@ -38,6 +38,7 @@ export function keyLimitsPayload(
     quota_usd: nonNegative(draft.quota_usd, 'USD 额度'),
     rpm: nonNegative(draft.rpm, 'RPM'),
   }
+  const isApi = draft.category === 'api'
   // API 直连不经过槽位，只有管理员可以设置
   if (isAdmin) body.category = draft.category
   if (isAdmin && draft.group_type === 'pool') {
@@ -52,7 +53,7 @@ export function keyLimitsPayload(
       group_type === 'all'
         ? []
         : [...new Set(draft.allowed_vms.map((id) => id.trim()).filter(Boolean))]
-    if (group_type !== 'all' && allowed_vms.length === 0) {
+    if (!isApi && group_type !== 'all' && allowed_vms.length === 0) {
       throw new Error('至少选择一台 VM')
     }
     body.group_type = group_type
