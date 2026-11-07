@@ -317,7 +317,15 @@ export const WsTerminal = forwardRef<
       termRef.current = null
       term.dispose()
     }
-  }, [ticketPath, socketPath, session, execute, startupCommand, officialLogin, fontSize])
+  }, [
+    ticketPath,
+    socketPath,
+    session,
+    execute,
+    startupCommand,
+    officialLogin,
+    fontSize,
+  ])
 
   useImperativeHandle(
     ref,
