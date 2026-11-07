@@ -12,6 +12,8 @@ import {
   normalizeJevConfig,
   parsePolicyDecision,
   publicJevConfig,
+  probePolicyBaseline,
+  probePolicyQuota,
   questionsFor,
   USAGE_POLICY_INSTRUCTION,
   ABUSE_INSTRUCTION,
@@ -1149,4 +1151,166 @@ test('a network error does not retire the key and still tries the other host', a
     proved = true
   }
   assert.equal(proved, true)
+})
+
+function settingsBag() {
+  const saved = new Map()
+  return {
+    saved,
+    settings: {
+      get: (key, fallback) => (saved.has(key) ? saved.get(key) : fallback),
+      set: (key, value) => saved.set(key, value),
+    },
+  }
+}
+
+test('endpoints group keys by address and never echo secrets', () => {
+  const { saved, settings } = settingsBag()
+  const secret = 'sk-live-typesafe-aaaa'
+  const local = 'local-key-cccc-dddd'
+  const first = applyJevPatch(settings, {
+    enabled: true,
+    endpoints: [
+      { base_url: 'https://api.typesafe.ai', api_keys: [secret] },
+      { base_url: 'http://127.0.0.1:8000', api_keys: [local] },
+    ],
+  })
+  assert.equal(first.ok, true)
+  assert.equal(first.config.endpoints.length, 2)
+  assert.equal(first.config.endpoints[0].base_url, 'https://api.typesafe.ai')
+  assert.equal(first.config.endpoints[0].keys[0].masked_key, 'sk-l********aaaa')
+  assert.equal(first.config.api_key_count, 2)
+  const published = JSON.stringify(first.config)
+  assert.equal(published.includes(secret), false)
+  assert.equal(published.includes(local), false)
+  const moved = applyJevPatch(settings, {
+    endpoints: [
+      { base_url: 'https://api.typesafe.ai', from_base_url: 'https://api.typesafe.ai' },
+      { base_url: 'http://127.0.0.1:9000', from_base_url: 'http://127.0.0.1:8000' },
+    ],
+  })
+  assert.equal(moved.ok, true)
+  const stored = saved.get('jev_intercept')
+  assert.ok(stored.api_keys.includes(secret))
+  assert.ok(stored.api_keys.some((line) => line.includes('127.0.0.1:9000') && line.includes(local)))
+  const added = applyJevPatch(settings, {
+    endpoints: [
+      {
+        base_url: 'https://api.typesafe.ai',
+        from_base_url: 'https://api.typesafe.ai',
+        api_keys: ['sk-live-typesafe-bbbb'],
+        append: true,
+      },
+      { base_url: 'http://127.0.0.1:9000', from_base_url: 'http://127.0.0.1:9000' },
+    ],
+  })
+  assert.equal(added.ok, true)
+  assert.equal(added.config.endpoints[0].keys.length, 2)
+  assert.equal(
+    validateJevPatch({
+      endpoints: [{ base_url: 'https://api.typesafe.ai' }, { base_url: 'https://api.typesafe.ai/v1' }],
+    }).some((item) => item.includes('重复')),
+    true,
+  )
+})
+
+test('a keyless extra address stays callable and is not shown as a key', async () => {
+  const cfg = {
+    enabled: true,
+    provider: 'jev',
+    base_url: 'https://api.typesafe.ai',
+    api_keys: ['sk-live-typesafe-aaaa', 'http://127.0.0.1:8000'],
+    timeout_ms: 2000,
+  }
+  const pub = publicJevConfig(cfg)
+  assert.equal(pub.api_key_count, 1)
+  assert.equal(pub.endpoints[1].base_url, 'http://127.0.0.1:8000')
+  assert.equal(pub.endpoints[1].keys.length, 0)
+  const seen = []
+  const verdict = await classifyJev('keyless-host-unique-text', cfg, async (url, init) => {
+    seen.push(`${url} ${init.headers.authorization || ''}`)
+    if (String(url).includes('typesafe')) return { ok: false, status: 500 }
+    return { ok: true, json: async () => ({ answers: { usage_policy: { noul: 0.2 } } }) }
+  })
+  const keyless = seen.find((line) => line.startsWith('http://127.0.0.1:8000/v1/systemone'))
+  assert.equal(keyless, 'http://127.0.0.1:8000/v1/systemone ')
+  assert.equal(verdict.action, 'block')
+})
+
+test('probe checks availability and the judgment baseline without echoing the key', async () => {
+  const secret = 'sk-live-typesafe-aaaa'
+  const seen = []
+  const result = await probePolicyBaseline({
+    config: { provider: 'jev', base_url: 'https://api.typesafe.ai', api_keys: [secret] },
+    baseUrl: 'https://api.typesafe.ai',
+    fetchImpl: async (url, init) => {
+      seen.push(`${init.method} ${url}`)
+      if (String(url).endsWith('/v1/models')) {
+        return { ok: true, status: 200, json: async () => ({ data: [{ id: 'jev-latest' }] }) }
+      }
+      const noul = JSON.parse(init.body).state.includes('museum') ? 0.93 : 0.11
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          model: 'jev-latest',
+          answers: { usage_policy: { noul } },
+          usage: { input_tokens: 3, output_tokens: 1 },
+        }),
+      }
+    },
+  })
+  assert.equal(result.results[0].available, true)
+  assert.equal(result.results[0].baseline_ok, true)
+  assert.ok(result.results[0].safe_score > 0.5)
+  assert.ok(result.results[0].unsafe_score < 0.5)
+  assert.equal(JSON.stringify(result).includes(secret), false)
+  assert.equal(seen[0], 'GET https://api.typesafe.ai/v1/models')
+  assert.equal(seen.filter((line) => line.startsWith('POST')).length, 2)
+})
+
+test('probe does not spend a decision call when the key is rejected', async () => {
+  let posts = 0
+  const result = await probePolicyBaseline({
+    config: { base_url: 'https://api.typesafe.ai', api_keys: ['sk-live-typesafe-aaaa'] },
+    baseUrl: 'https://api.typesafe.ai',
+    fetchImpl: async (_url, init) => {
+      if (init.method === 'POST') posts += 1
+      return { ok: false, status: 401, json: async () => ({}) }
+    },
+  })
+  assert.equal(posts, 0)
+  assert.equal(result.results[0].available, false)
+  assert.equal(result.results[0].message, '鉴权失败')
+})
+
+test('quota reports a balance, a missing endpoint, or exhaustion', async () => {
+  const secret = 'sk-live-typesafe-aaaa'
+  const found = await probePolicyQuota({
+    config: { base_url: 'https://api.typesafe.ai', api_keys: [secret] },
+    baseUrl: 'https://api.typesafe.ai',
+    fetchImpl: async (url) => {
+      if (String(url).endsWith('/v1/credits')) return { ok: false, status: 404, json: async () => ({}) }
+      if (String(url).endsWith('/v1/balance')) {
+        return { ok: true, status: 200, json: async () => ({ balance: '1.5', currency: 'usd' }) }
+      }
+      throw new Error(String(url))
+    },
+  })
+  assert.equal(found.results[0].remaining, 1.5)
+  assert.equal(found.results[0].unit, 'usd')
+  assert.equal(JSON.stringify(found).includes(secret), false)
+  const missing = await probePolicyQuota({
+    config: { base_url: 'http://127.0.0.1:8000', api_keys: [secret] },
+    baseUrl: 'http://127.0.0.1:8000',
+    fetchImpl: async () => ({ ok: false, status: 404, json: async () => ({}) }),
+  })
+  assert.equal(missing.results[0].status, 'unsupported')
+  const spent = await probePolicyQuota({
+    config: { base_url: 'https://api.typesafe.ai', api_keys: [secret] },
+    baseUrl: 'https://api.typesafe.ai',
+    fetchImpl: async () => ({ ok: false, status: 402, json: async () => ({}) }),
+  })
+  assert.equal(spent.results[0].status, 'insufficient_balance')
+  assert.equal(spent.results[0].remaining, 0)
 })
