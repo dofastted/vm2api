@@ -70,6 +70,13 @@ export function keyExpiryText(k: ApiKeyItem): {
   return { text: `${relMs(d)} 后`, expired: false }
 }
 
+/** 模型白名单：没设是「模型不限」，设了显示个数，完整名单放 title。 */
+export function keyModelsText(k: ApiKeyItem): { text: string; title?: string } {
+  const list = k.allowed_models || []
+  if (!list.length) return { text: '模型不限' }
+  return { text: `限 ${list.length} 个模型`, title: list.join('\n') }
+}
+
 /** 次数额度和 USD 额度各自显示；两项都没设才算「不限」。 */
 export function keyQuotaLabel(k: ApiKeyItem): string {
   const q = Number(k.quota_requests || 0)

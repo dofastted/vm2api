@@ -32,6 +32,8 @@ export type ApiKeyItem = {
   allowed_vms?: string[]
   vm_pool_id?: string | null
   vm_pool_name?: string | null
+  /** 允许的模型（按客户端请求里的名字精确匹配，不分大小写）。空 = 不限。 */
+  allowed_models?: string[]
 }
 
 export type VmPool = {
