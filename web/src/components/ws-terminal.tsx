@@ -56,6 +56,7 @@ function withBuiltins(own: SlashCommand[]): SlashCommand[] {
  */
 export type LoginTerminalHandle = {
   paste: (text: string) => void
+  focus: () => void
 }
 
 export const WsTerminal = forwardRef<
@@ -84,6 +85,7 @@ export const WsTerminal = forwardRef<
   const hostRef = useRef<HTMLDivElement>(null)
   const termRef = useRef<Terminal | null>(null)
   const sendRef = useRef<(data: string) => void>(() => {})
+  const pendingMessagesRef = useRef<string[]>([])
   const lineRef = useRef<SlashLine>(SLASH_IDLE)
   const busyRef = useRef(false)
   const commandsRef = useRef<SlashCommand[]>([])
@@ -207,8 +209,20 @@ export const WsTerminal = forwardRef<
 
     let ws: WebSocket | null = null
     let disposed = false
+    pendingMessagesRef.current = []
     const send = (msg: unknown) => {
-      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg))
+      const payload = JSON.stringify(msg)
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(payload)
+        return
+      }
+      // Keep keystrokes typed while the ticket/exec is opening. Dropping the
+      // first pasted callback makes the terminal look broken even though the
+      // TTY is still healthy.
+      if (!ws || ws.readyState === WebSocket.CONNECTING) {
+        const pending = pendingMessagesRef.current
+        if (pending.length < 512) pending.push(payload)
+      }
     }
     sendRef.current = (d) => send({ t: 'd', d })
     const onData = term.onData((d) => {
@@ -250,6 +264,8 @@ export const WsTerminal = forwardRef<
         ws.binaryType = 'arraybuffer'
         ws.onopen = () => {
           setPhase('open')
+          for (const payload of pendingMessagesRef.current) ws?.send(payload)
+          pendingMessagesRef.current = []
           term.focus()
           if (startupCommand && !officialLogin)
             send({ t: 'd', d: `${startupCommand}\r` })
@@ -271,11 +287,13 @@ export const WsTerminal = forwardRef<
           if (msg.t === 'error') setNote(msg.message || '终端错误')
         }
         ws.onclose = () => {
+          pendingMessagesRef.current = []
           if (!disposed) setPhase('closed')
         }
       })
       .catch((err: Error) => {
         if (disposed) return
+        pendingMessagesRef.current = []
         setNote(err.message)
         setPhase('closed')
       })
@@ -286,6 +304,7 @@ export const WsTerminal = forwardRef<
       onData.dispose()
       onResize.dispose()
       ws?.close()
+      pendingMessagesRef.current = []
       sendRef.current = () => {}
       termRef.current = null
       term.dispose()
@@ -300,6 +319,9 @@ export const WsTerminal = forwardRef<
         if (!value || !termRef.current) return
         termRef.current.paste(value.endsWith('\n') ? value : `${value}\n`)
         termRef.current.focus()
+      },
+      focus() {
+        termRef.current?.focus()
       },
     }),
     []
