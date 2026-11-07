@@ -361,6 +361,12 @@ Claude `routing.quota` 的 5h/7d 闸分三段（`critical_band` 默认 0.05，`g
 
 三个后端走同一套 `/v1/systemone`。题库存在 `questions`：可增删改，缺省是内置六题（综合、色情、破限、逆向、渗透、网络攻击）。每题都是「是否安全」，高分表示安全，启用的题目一起问，任一题低于阈值就拦。`safety_instruction` 非空时再多问一题自定义要求。`POST /jev-intercept/models` 用地址和 Key（留空则用已存的第一把）请求 `{base}/v1/models`，失败回 502，不会把上游 401 当成面板登出。
 
+面板按地址管理，不再用 Jev / Laya / ModernBERT 切换。`PUT` 可带 `endpoints`（1–20 项）：`base_url`、可选 `from_base_url`、可选 `api_keys`、可选 `append`。省略 `api_keys` 保留该地址原来的 Key，地址变了就改绑；`append: true` 把新 Key 追加到后面；`api_keys: []` 清空。第一项是主 `base_url`。同一个决策地址不能重复。后面的项可以只有 URL、没有 Key，请求仍会打到那里。GET 的 `endpoints` 含地址、脱敏 Key、指纹、`retired` 和最近 `status`，不含密钥。
+
+`POST /jev-intercept/probe` 对一个地址最多测 8 把 Key，留空则用已保存的。先请求 `/v1/models`，404 仍继续打 `/v1/systemone`。再用已保存的题库和阈值问两句固定样本：一句普通说明应放行，一句明确的入侵请求应拦截。401 / 429 / 529 暂停该 Key。不回明文 Key。
+
+`POST /jev-intercept/quota` 只读尝试 `/v1/credits`、`/v1/balance`、`/v1/billing`。官方 TypeSafe 没有这些接口，返回不支持，不会为了查余额去打 systemone。402 视为额度用尽。
+
 内置正则覆盖 NSFW、蒸馏、破解、破限，面板删不掉。比较的是用户自己写下的正文，不含 user 轮里的 `tool_result` / `*_tool_result` / `function_call_output`，也不含 `system`、`instructions`、`# Environment` 和已闭合的 `<system-reminder>`。决策模型只看这些用户正文；多轮时当前用户句再附在末尾。命中硬正则或模型返回 HTTP 403 `policy_blocked`，不 hop，不写入拒答缓存；device 封禁开启时封禁入站 device id。模型不可用且 `fail_open` 为 false 时同样 403，不封设备。上游 `content_policy` / `content_filter` / `cyber_policy` / `moderation_blocked` / `safety_violation` / `usage_policy` 同样入库。仅 admin。
 
 账号范围（`account_platform_plans[]`、`account_ids[]`，都可为空）把关卡收窄到部分槽位。每一项是 `平台:套餐`，例如 `claude:max`、`gpt:plus`、`gpt:business`；`none` 是没标注套餐。Claude 的 Max/Pro 与虚拟机列表相同（usage 里有 Fable 就是 Max，盖过落盘的 Pro）。指定账号收槽位 id、邮箱或名称，和勾选取并集，全空 = 所有账号都进关卡。只选了 GPT 套餐时 Claude 仍全部进关卡；选了 Claude 套餐或指定账号后，Claude 在选中槽位后再判，没命中的放行。GPT 一旦有范围就只由范围决定，没有范围时仍看 `openai_platform_enabled`。`GET` / `PUT` 都回 `account_scope.account_platform_plan_options`（带当前槽位数）和槽位清单（每条有 `scope_key`）。旧的 `account_types` 不再参与判断；只写过 `account_plan_types`、还没有 `account_platform_plans` 的配置会收成对应的 GPT 套餐（`none` 同时包含两边的未标注）。

@@ -144,6 +144,20 @@ export type JevScopeInventory = {
   accounts: JevScopeAccount[]
 }
 
+export type JevEndpointKey = {
+  number: number
+  masked_key: string
+  key_fingerprint: string
+  retired: boolean
+  status?: string
+  last_http_status?: number | null
+}
+
+export type JevEndpoint = {
+  base_url: string
+  keys: JevEndpointKey[]
+}
+
 /** `GET/PUT /api/panel/jev-intercept`。决策模型与硬正则。密钥只回 api_key_set。 */
 export type JevInterceptConfig = {
   enabled: boolean
@@ -181,6 +195,7 @@ export type JevInterceptConfig = {
   timeout_ms: number
   api_key_set: boolean
   api_key_count: number
+  endpoints?: JevEndpoint[]
   safety_instruction: string
   question_ids: string[]
   question_bank?: PolicyQuestion[]
