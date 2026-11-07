@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createDatabase } from '../../src/lib/db/database.mjs'
+import { ApiKeyStore } from '../../src/lib/admin/api-keys.mjs'
 import { PanelUserStore, hashPassword, verifyPassword, publicUserView } from '../../src/lib/admin/panel-users.mjs'
 
 function tmpStore() {
@@ -96,6 +97,70 @@ test('rejects bad username / short password / unknown role', () => {
   assert.throws(() => store.create({ username: '1bad', password: 'longenough', role: 'user' }), /用户名/)
   assert.throws(() => store.create({ username: 'okuser', password: 'short', role: 'user' }), /密码/)
   assert.throws(() => store.create({ username: 'okuser', password: 'longenough', role: 'root' }), /角色/)
+})
+
+function ownedStore(t) {
+  const fixture = tmpStore()
+  t.after(() => {
+    fixture.db.close()
+    fs.rmSync(fixture.dir, { recursive: true, force: true })
+  })
+  return fixture
+}
+
+test('user concurrency defaults to 5, is visible, and can be changed', (t) => {
+  const { store } = ownedStore(t)
+  const plain = store.create({ username: 'tenant', password: 'tenant-pass' })
+  const heavy = store.create({ username: 'heavy', password: 'heavy-pass', concurrency: 12 })
+  assert.equal(publicUserView(plain).concurrency, 5)
+  assert.equal(publicUserView(heavy).concurrency, 12)
+  const listed = Object.fromEntries(store.list().map((u) => [u.username, u.concurrency]))
+  assert.deepEqual(listed, { tenant: 5, heavy: 12 })
+
+  assert.equal(store.update(plain.id, { concurrency: 1000 }).concurrency, 1000)
+  assert.equal(store.update(plain.id, { concurrency: 1 }).concurrency, 1)
+  // Patches without the field and logins keep the stored value.
+  store.update(plain.id, { vm_create_quota: 2, role: 'super', concurrency: null })
+  assert.ok(store.authenticate('tenant', 'tenant-pass'))
+  assert.equal(store.getById(plain.id).concurrency, 1)
+})
+
+test('user concurrency rejects non-integers and values outside 0–1000', (t) => {
+  const { store } = ownedStore(t)
+  const user = store.create({ username: 'tenant', password: 'tenant-pass', concurrency: 7 })
+  for (const bad of [-1, 1001, 2.5, '8', 'abc', true, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.throws(() => store.update(user.id, { concurrency: bad }), { code: 'invalid_concurrency' }, String(bad))
+    assert.throws(
+      () => store.create({ username: 'other', password: 'other-pass', concurrency: bad }),
+      { code: 'invalid_concurrency' },
+      String(bad),
+    )
+  }
+  assert.equal(store.getById(user.id).concurrency, 7)
+  assert.equal(store.getByUsername('other'), null)
+})
+
+test('a changed user concurrency applies to the next key request', (t) => {
+  const { db, store } = ownedStore(t)
+  const keys = new ApiKeyStore({ db })
+  const user = store.create({ username: 'tenant', password: 'tenant-pass' })
+  const key = keys.create({ name: 'k', max_concurrency: 0, user_id: user.id })
+  assert.equal(keys.acquire(key).ok, true)
+  assert.equal(keys.canAccept(key).ok, true)
+
+  store.update(user.id, { concurrency: 1 })
+  const blocked = keys.canAccept(key)
+  assert.equal(blocked.code, 'user_concurrency_limit')
+  assert.deepEqual(blocked.detail, { inflight: 1, max: 1 })
+
+  store.update(user.id, { concurrency: 2 })
+  assert.equal(keys.canAccept(key).ok, true)
+
+  // 0 lifts the per-user cap, matching canAccept's existing semantics.
+  keys.acquire(key)
+  store.update(user.id, { concurrency: 0 })
+  assert.equal(store.getById(user.id).concurrency, 0)
+  assert.equal(keys.canAccept(key).ok, true)
 })
 
 function seedOwnedVm(project, id, owner, extra = {}) {
