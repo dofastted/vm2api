@@ -23,7 +23,7 @@ const VIEW_METHODS = new Set([
   'sessionSuggestions',
   'exportRows',
 ])
-const REPO_METHODS = new Set(['totals', 'aggregate', 'windowStats'])
+const REPO_METHODS = new Set(['totals', 'aggregate', 'windowStats', 'keyUsagePeriods', 'keyRecentRequests'])
 
 const cache = new Map()
 
