@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 修复 Codex `/v1/alpha/search`：1.4.049 接入脱敏时删掉了 `turnMetadata` 声明，选到可用账号后、请求发往上游前抛出 `ReferenceError`。关闭脱敏或补上 `x-codex-turn-metadata` 都绕不过。补回该头的读取。
 - 面板官方登录改为执行 `claude auth login`，不再只打开空的 `claude`。登录框加大；终端在容器有尺寸后再 fit，避免打开时被压成一条。
 - 内核页收敛为默认免费 cli-node 与注册码授权 CRAG：精简母本/旧 ELF/cc-node 入口，逐 VM 选择安装、就地激活/续期，全局确认明确范围，显示逐槽进度和停止结果。
 - 新增两产品独立拉取与可信缓存发布：cli-node 只下载所需的一对二进制；CRAG 校验官方签名加密归档并固定原发行公钥，缺少授权附件时明确失败，不回退 legacy。缓存指针原子切换，损坏时拒绝使用。
