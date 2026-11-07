@@ -718,18 +718,25 @@ for (const preset of ['official', 'official_full']) {
 
   for (const backend of ['cli', 'api']) {
     const run = backend === 'api' ? unixTest : test
-    run(`${backend} ${preset} reserves all four caller message breakpoints`, async (t) => {
+    run(`${backend} ${preset} budgets caller message breakpoints with final system boundaries`, async (t) => {
       const messages = Array.from({ length: 4 }, (_, i) => ({
         role: i % 2 ? 'assistant' : 'user',
         content: [text(`turn ${i}`, '1h')],
       }))
       messages.push({ role: 'user', content: [text('Continue', null)] })
       const out = await outbound(t, { preset, backend, input: { messages } })
-      assert.equal(listCacheMarkers(out).length, 4)
+      // CLI restores two system markers after Node's template budgeting.
+      // API forwarding does not add those markers, so it keeps all four.
+      assert.equal(listCacheMarkers(out).length, backend === 'cli' ? 2 : 4)
       assert.ok(listCacheMarkers(out).every((marker) => marker.section === 'messages'))
+      const expected = structuredClone(messages)
+      if (backend === 'cli') {
+        delete expected[0].content[0].cache_control
+        delete expected[1].content[0].cache_control
+      }
       assert.deepEqual(
         out.messages.filter((message) => message.role !== 'system'),
-        messages,
+        expected,
       )
     })
     run(`${backend} ${preset} omits an explicit template 5m before caller 1h`, async (t) => {
