@@ -1240,6 +1240,7 @@ export async function handleCodexSearch({
   }
   const outbound = { ...body }
   for (const key of CODEX_SEARCH_DROP_FIELDS) delete outbound[key]
+  const turnMetadata = headerString(req.headers, 'x-codex-turn-metadata')
   const redactionState = await ensureRedaction(routing, { projectRoot })
   const redaction = redactionState.enabled
     ? {

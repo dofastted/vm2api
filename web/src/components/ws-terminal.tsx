@@ -67,6 +67,7 @@ export const WsTerminal = forwardRef<
     commands?: SlashCommand[]
     startupCommand?: string
     officialLogin?: boolean
+    fontSize?: number
     onLogin?: () => void
     onAuthUrl?: (url: string) => void
   }
@@ -77,6 +78,7 @@ export const WsTerminal = forwardRef<
     commands,
     startupCommand,
     officialLogin,
+    fontSize,
     onLogin,
     onAuthUrl,
   },
@@ -159,7 +161,8 @@ export const WsTerminal = forwardRef<
     if (!host) return
     const term = new Terminal({
       cursorBlink: true,
-      fontSize: 13,
+      fontSize: fontSize ?? (officialLogin ? 17 : 13),
+      lineHeight: 1.15,
       fontFamily:
         'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace',
       scrollback: 5000,
@@ -201,7 +204,10 @@ export const WsTerminal = forwardRef<
     const fit = new FitAddon()
     term.loadAddon(fit)
     term.open(host)
-    fit.fit()
+    const fitTerminal = () => {
+      if (host.clientWidth > 0 && host.clientHeight > 0) fit.fit()
+    }
+    const initialFit = requestAnimationFrame(fitTerminal)
     termRef.current = term
     lineRef.current = SLASH_IDLE
     setPhase('connecting')
@@ -244,7 +250,8 @@ export const WsTerminal = forwardRef<
     const onResize = term.onResize(({ cols, rows }) =>
       send({ t: 'r', c: cols, r: rows })
     )
-    const observer = new ResizeObserver(() => fit.fit())
+    const observer = new ResizeObserver(fitTerminal)
+    observer.observe(host)
     api<{ ticket: string }>(ticketPath, {
       method: 'POST',
       body: officialLogin ? JSON.stringify({ login: true }) : undefined,
@@ -300,6 +307,7 @@ export const WsTerminal = forwardRef<
 
     return () => {
       disposed = true
+      cancelAnimationFrame(initialFit)
       observer.disconnect()
       onData.dispose()
       onResize.dispose()
@@ -309,7 +317,15 @@ export const WsTerminal = forwardRef<
       termRef.current = null
       term.dispose()
     }
-  }, [ticketPath, socketPath, session, execute, startupCommand, officialLogin])
+  }, [
+    ticketPath,
+    socketPath,
+    session,
+    execute,
+    startupCommand,
+    officialLogin,
+    fontSize,
+  ])
 
   useImperativeHandle(
     ref,
@@ -367,7 +383,7 @@ export const WsTerminal = forwardRef<
       </div>
       <div
         ref={hostRef}
-        className='min-h-0 flex-1 overflow-hidden rounded-md border bg-[#0b0d10] p-1'
+        className='h-full min-h-0 min-w-0 flex-1 overflow-hidden rounded-md border bg-[#0b0d10] p-1'
       />
     </div>
   )

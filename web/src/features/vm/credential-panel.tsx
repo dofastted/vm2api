@@ -457,8 +457,8 @@ function ClaudeCredentialPanel({
                 : '启动并打开官方登录终端'}
           </Button>
           <Dialog open={loginOpen} onOpenChange={setLoginOpen}>
-            <DialogContent className='flex h-[min(820px,calc(100svh-1.5rem))] w-[min(1120px,calc(100vw-1.5rem))] max-w-none flex-col gap-0 overflow-hidden border-border/70 bg-background p-0'>
-              <div className='shrink-0 border-b bg-muted/15 px-5 py-4'>
+            <DialogContent className='flex h-[min(960px,calc(100svh-1rem))] w-[min(1500px,calc(100vw-1rem))] max-w-none flex-col gap-0 overflow-hidden border-border/70 bg-background p-0 sm:h-[min(960px,calc(100svh-2rem))] sm:w-[min(1500px,calc(100vw-2rem))]'>
+              <div className='shrink-0 border-b bg-muted/15 px-4 py-3 sm:px-6 sm:py-4'>
                 <DialogHeader className='gap-1'>
                   <div className='flex items-center gap-2.5'>
                     <span className='grid size-8 place-items-center rounded-md bg-foreground text-background'>
@@ -481,11 +481,11 @@ function ClaudeCredentialPanel({
                 </DialogHeader>
               </div>
 
-              <div className='grid min-h-0 flex-1 grid-rows-[minmax(340px,1fr)_auto] lg:grid-cols-[minmax(0,1fr)_320px] lg:grid-rows-1'>
-                <section className='flex min-h-0 flex-col bg-[#080a0d] p-3 sm:p-4'>
-                  <div className='mb-2 flex shrink-0 items-center justify-between gap-3 px-1 text-[11px] text-zinc-400'>
+              <div className='grid min-h-0 flex-1 grid-rows-[minmax(400px,1fr)_auto] overflow-y-auto lg:grid-cols-[minmax(0,1fr)_380px] lg:grid-rows-1 lg:overflow-hidden'>
+                <section className='flex min-h-[400px] flex-col bg-[#080a0d] p-3 sm:p-5'>
+                  <div className='mb-3 flex shrink-0 items-center justify-between gap-3 px-1 text-xs text-zinc-400'>
                     <div className='flex min-w-0 items-center gap-2'>
-                      <span className='font-mono text-zinc-200'>
+                      <span className='font-mono text-sm text-zinc-100'>
                         claude auth login
                       </span>
                       <span className='truncate text-zinc-600'>
@@ -494,7 +494,7 @@ function ClaudeCredentialPanel({
                     </div>
                     <button
                       type='button'
-                      className='inline-flex shrink-0 items-center gap-1 rounded border border-zinc-700 px-2 py-1 text-[10px] text-zinc-400 transition-colors hover:border-zinc-500 hover:text-zinc-100 focus-visible:ring-2 focus-visible:ring-zinc-400 focus-visible:outline-none'
+                      className='inline-flex shrink-0 items-center gap-1.5 rounded border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 transition-colors hover:border-zinc-500 hover:text-zinc-100 focus-visible:ring-2 focus-visible:ring-zinc-400 focus-visible:outline-none'
                       onClick={() => loginTerm.current?.focus()}
                     >
                       <Keyboard className='size-3' aria-hidden='true' />
@@ -508,6 +508,7 @@ function ClaudeCredentialPanel({
                         ticketPath={`/api/panel/vms/${encodeURIComponent(vmId)}/shell-ticket`}
                         socketPath={`/api/panel/vms/${encodeURIComponent(vmId)}/shell`}
                         officialLogin
+                        fontSize={17}
                         onAuthUrl={setLoginUrl}
                         onLogin={() => {
                           void invalidate()
@@ -516,23 +517,25 @@ function ClaudeCredentialPanel({
                       />
                     ) : null}
                   </div>
-                  <p className='mt-2 shrink-0 px-1 text-[11px] leading-relaxed text-zinc-500'>
+                  <p className='mt-3 shrink-0 px-1 text-xs leading-relaxed text-zinc-400'>
                     终端已连接后可直接键入或粘贴{' '}
                     <code className='text-zinc-300'>code#state</code>，再按
                     Enter；右侧回填框适合从浏览器复制完整回调码。
                   </p>
                 </section>
 
-                <aside className='min-h-0 overflow-y-auto border-t bg-muted/20 p-4 lg:border-t-0 lg:border-l'>
-                  <div className='space-y-4'>
+                <aside className='min-h-0 border-t bg-muted/20 p-4 sm:p-6 lg:overflow-y-auto lg:border-t-0 lg:border-l'>
+                  <div className='space-y-6'>
                     <div>
                       <div className='mb-2 flex items-center gap-2'>
                         <span className='grid size-6 place-items-center rounded-full bg-foreground text-[11px] font-semibold text-background'>
                           1
                         </span>
                         <div>
-                          <p className='text-sm font-medium'>复制授权链接</p>
-                          <p className='text-[11px] text-muted-foreground'>
+                          <p className='text-base font-semibold'>
+                            复制授权链接
+                          </p>
+                          <p className='text-xs text-muted-foreground'>
                             打开浏览器完成 Claude 登录
                           </p>
                         </div>
@@ -543,13 +546,13 @@ function ClaudeCredentialPanel({
                           readOnly
                           value={loginUrl}
                           placeholder='等待终端显示链接…'
-                          className='h-9 min-w-0 bg-background font-mono text-[11px]'
+                          className='h-11 min-w-0 bg-background font-mono text-xs'
                         />
                         <Button
                           type='button'
                           size='sm'
                           variant='outline'
-                          className='h-9 shrink-0 gap-1.5 px-2.5'
+                          className='h-11 shrink-0 gap-1.5 px-3'
                           aria-label='复制授权链接'
                           disabled={!loginUrl}
                           onClick={async () => {
@@ -562,9 +565,7 @@ function ClaudeCredentialPanel({
                           }}
                         >
                           <Copy className='size-3.5' aria-hidden='true' />
-                          <span className='sr-only sm:not-sr-only'>
-                            复制链接
-                          </span>
+                          <span>复制链接</span>
                         </Button>
                       </div>
                       {loginUrl ? (
@@ -587,22 +588,22 @@ function ClaudeCredentialPanel({
                           2
                         </span>
                         <div>
-                          <p className='text-sm font-medium'>
+                          <p className='text-base font-semibold'>
                             回填 callback code
                           </p>
-                          <p className='text-[11px] text-muted-foreground'>
+                          <p className='text-xs text-muted-foreground'>
                             必须包含 # 后半段 state
                           </p>
                         </div>
                       </div>
                       <Textarea
                         id='login-auth-code'
-                        rows={4}
+                        rows={5}
                         value={loginCode}
                         autoComplete='off'
                         spellCheck={false}
                         placeholder='粘贴完整 code#state'
-                        className='resize-none bg-background font-mono text-xs leading-relaxed'
+                        className='resize-none bg-background font-mono text-sm leading-relaxed'
                         onChange={(event) => setLoginCode(event.target.value)}
                         onKeyDown={(event) => {
                           if (
@@ -621,7 +622,7 @@ function ClaudeCredentialPanel({
                       <Button
                         type='button'
                         size='sm'
-                        className='mt-2 w-full'
+                        className='mt-3 h-11 w-full text-sm'
                         disabled={!loginAuthCode(loginCode)}
                         onClick={() => {
                           loginTerm.current?.paste(loginAuthCode(loginCode))
@@ -630,7 +631,7 @@ function ClaudeCredentialPanel({
                       >
                         回填到终端
                       </Button>
-                      <p className='mt-2 text-[11px] leading-relaxed text-muted-foreground'>
+                      <p className='mt-3 text-xs leading-relaxed text-muted-foreground'>
                         回填后终端会自动按
                         Enter。也可以点击左侧终端，直接粘贴并提交。
                       </p>
