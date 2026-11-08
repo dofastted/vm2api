@@ -74,7 +74,7 @@
 
 ## 🆕 近期更新
 
-对照 **1.4.053**（`main` 当前版本）。下列为 1.4.038–1.4.053 已上线、调用方或管理员能直接感知的变化摘要；完整条目与升级注意见 [CHANGELOG.md](CHANGELOG.md)，操作说明见 [入门文档](https://vm2api.fkcodex.com/zh/)。
+对照 **1.4.053**（`main` 当前版本）。下列为 1.4.038–1.4.053 已上线、调用方或管理员能直接感知的变化摘要；完整条目见 [CHANGELOG.md](CHANGELOG.md)，操作说明见 [入门文档](https://vm2api.fkcodex.com/zh/)。下文升级概述不能替代逐版说明，**具体以各版本 CHANGELOG 的升级注意为准**。
 
 - **内容脱敏（可选）**：设置 →「脱敏」页（`/console/#/settings/redaction`）可配置凭据、个人信息与自定义规则；默认关闭。启用需本机 `bin/kin-redact`，helper 未就绪时不能保存为开启，请求也不会回落明文。
 - **API 直连**：管理台 API 配置统一到 `#/api`；`api` 类密钥按端点协议调度上游，不经 OAuth / Codex 槽位。Anthropic 端点可单独开关「风控前置审查」。
@@ -288,7 +288,7 @@ Traditional methods of converting AI subscriptions into API endpoints via simple
 
 ## Recent changes (1.4.053)
 
-Shipped in **1.4.038–1.4.053** on `main` (summary only; see [CHANGELOG.md](CHANGELOG.md) for upgrade notes):
+Shipped in **1.4.038–1.4.053** on `main` (summary only; see [CHANGELOG.md](CHANGELOG.md) for full entries). The upgrade notes below are not version-specific—**follow each release’s upgrade section in the CHANGELOG**:
 
 - **Redaction (optional)**: Settings → Redaction (`/console/#/settings/redaction`). Off by default; requires local `bin/kin-redact`—no plaintext fallback when the helper is missing.
 - **Direct API**: Panel API config at `#/api`; `api` keys route to upstream by endpoint protocol, not OAuth/Codex slots. Anthropic endpoints can enable pre-hop risk review separately.
@@ -413,7 +413,7 @@ Before opening an issue, follow [ISSUE_GUIDE.md](ISSUE_GUIDE.md): version, repro
 
 ### 开发者交流群 / Developer community
 
-Telegram 群组 **[t.me/vm2api](https://t.me/vm2api)**（`@VM2API`）：部署排障、版本升级与使用讨论。商业授权亦可通过该账号联系。
+Telegram 群组 **[t.me/vm2api](https://t.me/vm2api)**（`@VM2API`）：部署排障、版本升级与使用讨论。商业授权可在群内咨询。
 
 <div align="center">
   <a href="https://t.me/vm2api">
@@ -458,7 +458,7 @@ Telegram 群组 **[t.me/vm2api](https://t.me/vm2api)**（`@VM2API`）：部署�
 ## 📜 许可证与免责声明 / License
 
 - **个人与非商用**：本仓库遵循 [Noncommercial License](LICENSE)，仅供个人学习、技术研究与个人自建使用。
-- **商业使用授权**：任何将本项目用于商业运营（包括对外付费 API、作为转售云服务基础组件、公司内部营利用途等）**必须事先取得作者正式书面授权**。授权联系请洽 [Telegram @VM2API](https://t.me/vm2api)。
+- **商业使用授权**：任何将本项目用于商业运营（包括对外付费 API、作为转售云服务基础组件、公司内部营利用途等）**必须事先取得作者正式书面授权**。可在开发者交流群 [t.me/vm2api](https://t.me/vm2api)（`@VM2API`）内咨询。
 - **免责声明**：vm2api 为独立的开源实验项目，与 Anthropic PBC 或 OpenAI 无任何直接关联。相关商标权属均归其对应公司所有。
 
 
