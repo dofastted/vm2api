@@ -426,7 +426,7 @@ Telegram 群组 **[t.me/vm2api](https://t.me/vm2api)**（`@VM2API`）：部署�
 <div align="center">
   <table style="border-collapse: separate; border-spacing: 20px; background: transparent;">
     <tr>
-      <td align="center" width="320" style="padding: 24px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.03); backdrop-filter: blur(10px); box-shadow: 0 8px 24px rgba(0,0,0,0.25);">
+      <td align="center" valign="middle" width="280" style="padding: 24px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.03); backdrop-filter: blur(10px); box-shadow: 0 8px 24px rgba(0,0,0,0.25);">
         <img src="docs/images/support-wechat.png" alt="微信赞助收款码" width="220" style="border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,0.3); border: 2px solid rgba(7,193,96,0.3);" />
         <br/><br/>
         <b style="font-size: 16px;">☕ 支持与赞助项目</b>
@@ -436,6 +436,11 @@ Telegram 群组 **[t.me/vm2api](https://t.me/vm2api)**（`@VM2API`）：部署�
         <a href="#-交流与赞助支持--community--sponsorship">
           <img src="https://img.shields.io/badge/Sponsor-Alipay%20Pay-07C160?style=for-the-badge&logo=alipay&logoColor=white" />
         </a>
+      </td>
+      <td align="center" valign="middle" style="padding: 8px 4px;">
+        <img src="docs/images/sponsor-coin-hearts.gif" alt="赞助区装饰动效（硬币投入与爱心冒泡，非真实交易或金额提示）" width="160" style="border-radius: 12px;" />
+        <br/>
+        <span style="color: #666; font-size: 11px;">纯装饰动效</span>
       </td>
     </tr>
   </table>
