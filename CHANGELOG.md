@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Infrastructure: PR/main `ci` 对仅改 `README.md`、`CHANGELOG.md`、`docs/**`、`VERSION` 的变更走 docs-lite（format/syntax；跳过 unit/go/web、native 打包单测与 `arm64-native-cli`）；业务 PR 仍跑满门，且 `test:unit`、Go 与 web 并行以缩短墙钟（REQ-CI-1.4）。
 - README：功能说明与快速开始对齐 **1.4.053**（含登录入口、API 直连、脱敏与升级摘要），新增 Telegram 开发者交流群（`@VM2API`），赞助区增加本地装饰 GIF；版式参考 cc-switch 重整信息层级（折叠赞助商、界面预览表、部署/功能分节）。
 - 内核页收敛为默认免费 cli-node 与注册码授权 CRAG：精简母本/旧 ELF/cc-node 入口，逐 VM 选择安装、就地激活/续期，全局确认明确范围，显示逐槽进度和停止结果。
 - 新增两产品独立拉取与可信缓存发布：cli-node 只下载所需的一对二进制；CRAG 校验官方签名加密归档并固定原发行公钥，缺少授权附件时明确失败，不回退 legacy。缓存指针原子切换，损坏时拒绝使用。
