@@ -22,10 +22,8 @@ test('readJsonParsedCached hot-reloads when bytes change but stat metadata is un
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-cache-'))
   const file = path.join(dir, 'routing.json')
   try {
-    const first =
-      '{"compatibility":{"persona_inject":"append","_pad":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
-    const second =
-      '{"compatibility":{"persona_inject":"rewrite","_pad":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+    const first = '{"compatibility":{"persona_inject":"append","_pad":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+    const second = '{"compatibility":{"persona_inject":"rewrite","_pad":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
     assert.equal(Buffer.byteLength(first), Buffer.byteLength(second))
     fs.writeFileSync(file, first)
     const stat = fs.statSync(file)
