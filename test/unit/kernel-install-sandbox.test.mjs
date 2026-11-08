@@ -41,6 +41,24 @@ test('later native manual start upgrades a default or unconfined container but k
       'already secured native target must be reused',
     )
   }
+  const restricted = inspectContainerOutcome('kin-13', {
+    run: () => ({ ok: true, stdout: output(['no-new-privileges', `seccomp=${JSON.stringify(profile)}`]) }),
+  })
+  assert.equal(
+    nativeSlotSandboxNeedsRecreate(restricted.container, native, {}, { userNamespaceRestricted: true }),
+    true,
+    'Ubuntu AppArmor userns policy requires a recreated container',
+  )
+  const unrestricted = inspectContainerOutcome('kin-13', {
+    run: () => ({
+      ok: true,
+      stdout: output(['no-new-privileges', `seccomp=${JSON.stringify(profile)}`, 'apparmor=unconfined']),
+    }),
+  })
+  assert.equal(
+    nativeSlotSandboxNeedsRecreate(unrestricted.container, native, {}, { userNamespaceRestricted: true }),
+    false,
+  )
   assert.equal(
     nativeSlotSandboxNeedsRecreate(null, native),
     false,

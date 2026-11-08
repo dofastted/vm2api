@@ -60,6 +60,14 @@ const PUBLIC_IP = process.env.PUBLIC_HOST || '166.88.96.199'
 const MODULE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 const CRAG_V2_SECCOMP_PATH = fileURLToPath(new URL('./crag-v2-seccomp.json', import.meta.url))
 const CRAG_V2_SECCOMP = JSON.parse(fs.readFileSync(CRAG_V2_SECCOMP_PATH, 'utf8'))
+function apparmorUserNamespaceRestricted() {
+  try {
+    return fs.readFileSync('/proc/sys/kernel/unprivileged_userns_apparmor_policy', 'utf8').trim() === '1'
+  } catch {
+    return false
+  }
+}
+
 // Root in the runner must write into the slot-uid 0700 dirs and drop qemu to the slot uid.
 export const KVM_CAPS = ['SETUID', 'SETGID', 'SETPCAP', 'CHOWN', 'FOWNER', 'DAC_OVERRIDE']
 
@@ -238,8 +246,8 @@ export function suspendVmRuntimeRestart(vm, { run = sh } = {}) {
   return { ok: result.ok === true, code: result.ok ? undefined : 'kernel_restart_policy_failed', error: result.stderr }
 }
 
-/** Docker cannot change seccomp on restart; upgrade only targets missing this exact narrow profile. */
-export function nativeSlotSandboxNeedsRecreate(existing, vm, routing = {}) {
+/** Docker cannot change seccomp or AppArmor on restart. */
+export function nativeSlotSandboxNeedsRecreate(existing, vm, routing = {}, options = {}) {
   if (
     !existing ||
     isKvmRuntime(vm) ||
@@ -247,7 +255,8 @@ export function nativeSlotSandboxNeedsRecreate(existing, vm, routing = {}) {
     resolveCragKernelVersion(vm, routing) !== 'v2'
   )
     return false
-  return !(existing.securityOpts || []).some((option) => {
+  const opts = existing.securityOpts || []
+  const seccompOk = opts.some((option) => {
     if (option === `seccomp=${CRAG_V2_SECCOMP_PATH}`) return true
     if (!option.startsWith('seccomp=')) return false
     try {
@@ -256,6 +265,9 @@ export function nativeSlotSandboxNeedsRecreate(existing, vm, routing = {}) {
       return false
     }
   })
+  if (!seccompOk) return true
+  const restricted = options.userNamespaceRestricted ?? apparmorUserNamespaceRestricted()
+  return restricted && !opts.includes('apparmor=unconfined')
 }
 
 /** Migrate existing local slots in place, including paused ones; never start or recreate them. */
@@ -1215,7 +1227,11 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
       'no-new-privileges',
       ...(resolveKernelDataplane(vm, resolvedRouting) === 'crag' &&
       resolveCragKernelVersion(vm, resolvedRouting) === 'v2'
-        ? ['--security-opt', `seccomp=${CRAG_V2_SECCOMP_PATH}`]
+        ? [
+            '--security-opt',
+            `seccomp=${CRAG_V2_SECCOMP_PATH}`,
+            ...(apparmorUserNamespaceRestricted() ? ['--security-opt', 'apparmor=unconfined'] : []),
+          ]
         : []),
       '--cap-drop',
       'ALL',
