@@ -413,10 +413,12 @@ Before opening an issue, follow [ISSUE_GUIDE.md](ISSUE_GUIDE.md): version, repro
 
 ### 开发者交流群 / Developer community
 
-Telegram 群组 **[t.me/VM2API](https://t.me/VM2API)**（`@VM2API`）：部署排障、版本升级与使用讨论。商业授权亦可通过该账号联系。
+Telegram 群组 **[t.me/vm2api](https://t.me/vm2api)**（`@VM2API`）：部署排障、版本升级与使用讨论。商业授权亦可通过该账号联系。
 
 <div align="center">
-  <img src="docs/images/tg-vm2api.jpg" alt="Telegram 开发者群 @VM2API" width="220" style="border-radius: 12px; margin: 8px 0;" />
+  <a href="https://t.me/vm2api">
+    <img src="docs/images/tg-vm2api.jpg" alt="Telegram 开发者群 @VM2API" width="220" style="border-radius: 12px; margin: 8px 0;" />
+  </a>
 </div>
 
 ### 赞助 / Sponsorship
@@ -451,7 +453,7 @@ Telegram 群组 **[t.me/VM2API](https://t.me/VM2API)**（`@VM2API`）：部署�
 ## 📜 许可证与免责声明 / License
 
 - **个人与非商用**：本仓库遵循 [Noncommercial License](LICENSE)，仅供个人学习、技术研究与个人自建使用。
-- **商业使用授权**：任何将本项目用于商业运营（包括对外付费 API、作为转售云服务基础组件、公司内部营利用途等）**必须事先取得作者正式书面授权**。授权联系请洽 [Telegram @VM2API](https://t.me/VM2API)。
+- **商业使用授权**：任何将本项目用于商业运营（包括对外付费 API、作为转售云服务基础组件、公司内部营利用途等）**必须事先取得作者正式书面授权**。授权联系请洽 [Telegram @VM2API](https://t.me/vm2api)。
 - **免责声明**：vm2api 为独立的开源实验项目，与 Anthropic PBC 或 OpenAI 无任何直接关联。相关商标权属均归其对应公司所有。
 
 
