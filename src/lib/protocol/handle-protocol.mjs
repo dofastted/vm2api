@@ -73,7 +73,7 @@ import {
   resolveSlotPersonaPreset,
   slotPersonaModeOverride,
 } from '../vm/slot-engine.mjs'
-import { isValidVmId } from '../vm/vm-file.mjs'
+import { isValidVmId, readJsonParsedCached } from '../vm/vm-file.mjs'
 import {
   makeError,
   mapUpstreamError,
@@ -1579,7 +1579,8 @@ export function createHandleProtocol(deps) {
           const modeOverride = slotPersonaModeOverride(selected.vm)
           let routingNow = getRouting()
           try {
-            routingNow = JSON.parse(fs.readFileSync(routingConfigPath, 'utf8'))
+            const disk = readJsonParsedCached(routingConfigPath)
+            if (disk) routingNow = disk
           } catch {
             // A mid-write routing file keeps the in-memory snapshot for this request.
           }
