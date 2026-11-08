@@ -528,12 +528,7 @@ export function describeCacheContinuity({
  * Compare `body` with the stored turn of `sessionKey` without recording.
  * `confirmed` is true only after a successful hop called confirmCachePrefix.
  */
-export function peekCachePrefix(
-  sessionKey,
-  body,
-  now = Date.now(),
-  { preserveMessageCache = null, ctx = null } = {},
-) {
+export function peekCachePrefix(sessionKey, body, now = Date.now(), { preserveMessageCache = null, ctx = null } = {}) {
   const key = String(sessionKey || '').trim()
   if (!key || !body || typeof body !== 'object') return null
   const previous = liveSession(key, now)

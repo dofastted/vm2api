@@ -152,7 +152,9 @@ export function refusalUserDocument(inbound, body = inbound, options = {}) {
 export function refusalUserDocumentCache(inbound, body = inbound, options = {}) {
   const collected = collectRefusalUserParts(inbound, body, options)
   return {
-    messageIds: (Array.isArray(body?.messages) ? body.messages : []).map((message) => messageIdentity(message, options.ctx)),
+    messageIds: (Array.isArray(body?.messages) ? body.messages : []).map((message) =>
+      messageIdentity(message, options.ctx),
+    ),
     parts: collected.parts,
     seen: collected.seen,
   }
