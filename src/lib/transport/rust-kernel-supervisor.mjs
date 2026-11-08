@@ -920,6 +920,13 @@ export function writeKernelConfig(
     config.claude_bin = '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude'
     config.asset_dir = '/run/kin/crag-native-assets'
     config.work_dir = '/run/kin/work'
+    const owner = runtimeFileOwner(vm)
+    for (const name of ['crag-native-assets', 'work']) {
+      const dir = path.join(runDir, name)
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+      fs.chmodSync(dir, 0o700)
+      if (privileged) fs.chownSync(dir, owner.uid, owner.gid)
+    }
     // Native Claude owns UA/billing version; never inject a legacy profile version.
     config.cli_version = ''
     if (config.telemetry && isTelemetryEnabled(defaultSeedPolicy(record.seed_policy || {}))) {
