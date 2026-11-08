@@ -240,7 +240,8 @@ export function CragLicenseEditor({
             id={`${formId}-registration-help`}
             className='text-xs leading-relaxed text-muted-foreground'
           >
-            粘贴授权方签发的完整注册码。校验通过后才替换现有授权；失败不会改动原授权或内核。
+            粘贴授权方签发的 CRAGU1 通用码或 CRAGL1
+            设备码。通用码不绑定本槽机器码；设备码必须与本槽机器码一致。校验通过后才替换现有授权，失败不改动原授权或内核。
           </p>
         </div>
         {activationError ? (

@@ -24,6 +24,7 @@ import {
   fixtureAuthority,
   issueFixtureCode,
   seedEncryptedPackage,
+  issueUniversalCode,
   signedCode,
 } from '../fixtures/crag-license.mjs'
 
@@ -96,6 +97,30 @@ test('challenge and atomic activation expose only authenticated public status', 
   assert.equal(denied.body.error.code, 'license_invalid')
   assert.deepEqual(fs.readFileSync(path.join(dir, 'registration.code')), stored)
   assert.equal(getCragLicense(root, vm).license.valid, true)
+})
+
+test('universal CRAGU1 activates without creating a device binding', async (t) => {
+  const { root, vm } = fixture(t)
+  const issued = issueUniversalCode(root)
+  const activated = await route(root, 'POST', '/crag-license', { registration_code: issued.code })
+  assert.equal(activated.status, 200)
+  assert.equal(activated.body.data.license.valid, true)
+  assert.equal(activated.body.data.license.license_id, issued.claims.license_id)
+  assert.equal(activated.body.data.machine_code, '')
+  assert.doesNotMatch(JSON.stringify(activated.body), /CRAGU1|wrapped_key|ciphertext|private_key/)
+  const dir = cragLicenseDirectory(root, vm)
+  assert.equal(fs.existsSync(path.join(dir, 'device.json')), false)
+  assert.equal(fs.statSync(path.join(dir, 'registration.code')).mode & 0o777, 0o600)
+  const stored = fs.readFileSync(path.join(dir, 'registration.code'))
+  assert.throws(() => activateCragLicense(root, vm, `${issued.code}x`), { code: 'license_invalid' })
+  assert.deepEqual(fs.readFileSync(path.join(dir, 'registration.code')), stored)
+  const current = getCragLicense(root, vm)
+  assert.equal(current.license.valid, true)
+  assert.equal(current.machine_code, '')
+  assert.equal(checkCragLicense(root, { ...vm, dataplane: 'crag' }).ok, true)
+  const expired = issueUniversalCode(root, { issued_at: Math.floor(Date.now() / 1000) - 70 * 86400 })
+  assert.throws(() => activateCragLicense(root, vm, expired.code), { code: 'license_expired' })
+  assert.deepEqual(fs.readFileSync(path.join(dir, 'registration.code')), stored)
 })
 
 test('wrong VM, machine, signer, tamper and wrapped-key failure never replace an existing grant', (t) => {
