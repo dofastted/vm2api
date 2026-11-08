@@ -32,13 +32,12 @@ import {
   shellQuote,
   writeRemoteFile,
 } from './remote-fs.mjs'
-
+import { cragSlotPayload } from './slot-image.mjs'
 const SEED_SETTINGS_FILES = Object.freeze([
   'cli-home/.claude/settings.json',
   'cli-home/.claude/claude.setting',
   'cli-home/.claude/kin-seed.json',
 ])
-
 export const SLOT_FILE_SETS = Object.freeze({
   run: ['run/kernel.json', 'run/worker.json', 'run/internal.token'],
   seed: [...SEED_SETTINGS_FILES, 'machine-id'],
@@ -145,7 +144,39 @@ export async function pushSlotBinaries(vm, projectRoot, session = null) {
     digest.update(name).update(data)
     pushed.push(name)
   }
-  return { pushed, digest: digest.digest('hex') }
+  const crag = await pushCragSlot(vm, projectRoot, s)
+  return { pushed, digest: digest.digest('hex'), crag }
+}
+
+/** Same CRAG tree the slot image bakes, for containers created before that image. */
+export async function pushCragSlot(vm, projectRoot, session = null) {
+  const s = session || (await nodeSession(vmNodeId(vm)))
+  await prepareRemoteDir(s, vm)
+  const payload = cragSlotPayload(projectRoot)
+  const remote = `${remoteSlotDir(s.host, vm.id)}/slot-bin`
+  const marker = `${remote}/crag.digest`
+  const current = await readRemoteFileNoFollow(s.client, marker)
+  if (current?.toString('utf8').trim() === payload.digest) return { pushed: false, digest: payload.digest }
+  const dirs = new Set()
+  for (const file of payload.files) {
+    const rel = file.name.slice('opt/kin/'.length)
+    const slash = rel.lastIndexOf('/')
+    if (slash > 0) dirs.add(`${remote}/${rel.slice(0, slash)}`)
+  }
+  const owner = ownerFor(s, vm)
+  if (dirs.size) {
+    const quoted = [...dirs].sort().map(shellQuote).join(' ')
+    const chown = owner ? ` && chown ${owner.uid}:${owner.gid} ${quoted}` : ''
+    await runRemote(s.client, `umask 022 && mkdir -p ${quoted} && chmod 755 ${quoted}${chown}`, { timeoutMs: 20_000 })
+  }
+  const sftp = await openSftp(s.client)
+  for (const file of payload.files) {
+    const rel = file.name.slice('opt/kin/'.length)
+    const data = file.body || fs.readFileSync(file.src)
+    await writeRemoteFile(sftp, `${remote}/${rel}`, data, { mode: file.mode, owner })
+  }
+  await writeRemoteFile(sftp, marker, `${payload.digest}\n`, { mode: 0o644, owner })
+  return { pushed: true, digest: payload.digest }
 }
 
 /** Explicit import only: replace the remote credential with the local one. */
