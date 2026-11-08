@@ -126,11 +126,12 @@ export function cacheColdForAccount({
   body = null,
   now = Date.now(),
   preserveMessageCache = null,
+  ctx = null,
 } = {}) {
   const account = String(accountId || '').trim()
   const session = String(sessionId || '').trim()
   if (!account || !session || !body) return { cold: true, reason: 'unknown', prefix: null }
-  const prefix = peekCachePrefix(`${account}:${session}`, body, now, { preserveMessageCache })
+  const prefix = peekCachePrefix(`${account}:${session}`, body, now, { preserveMessageCache, ctx })
   if (!prefix) return { cold: true, reason: 'unknown', prefix: null }
   if (prefix.turn <= 1) return { cold: true, reason: 'first_turn', prefix }
   if (!prefix.confirmed) return { cold: true, reason: 'unconfirmed', prefix }
@@ -155,6 +156,7 @@ export function estimateRequestRisk(
     body,
     now,
     preserveMessageCache: quotaRequest?.preserveMessageCache,
+    ctx: quotaRequest?.bodyCtx || null,
   })
   const uncached = cache.cold ? parts.prompt : parts.lastUser
   return {
