@@ -764,6 +764,22 @@ export function patchVmRecord(projectRoot, id, patch) {
   return vm
 }
 
+/** Panel label only. The slot id stays the creation number. */
+export const VM_DISPLAY_NAME_MAX = 80
+
+export function parseVmDisplayName(value) {
+  if (typeof value !== 'string') return { ok: false, error: '名称必须是文本' }
+  const name = value.trim()
+  if (!name) return { ok: false, error: '名称不能为空' }
+  if (/[\u0000-\u001F\u007F\u2028\u2029]/.test(name)) {
+    return { ok: false, error: '名称不能包含控制字符' }
+  }
+  if ([...name].length > VM_DISPLAY_NAME_MAX) {
+    return { ok: false, error: `名称最长 ${VM_DISPLAY_NAME_MAX} 个字符` }
+  }
+  return { ok: true, value: name }
+}
+
 /**
  * Heal slots whose bound exit and `proxy_cli_enabled` drifted (the #332 stale
  * write). False was never an operator switch — panel/API have no such toggle.

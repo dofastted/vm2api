@@ -57,7 +57,7 @@ export function KernelLicenseDialog({
       >
         <DialogTitle>{vm.name || vm.id}</DialogTitle>
         <DialogDescription className='sr-only'>
-          复制本机机器码，粘贴授权方签发的注册码。激活不会安装或启动内核。
+          离线通用码直接粘贴。在线设备授权需复制本槽机器码，再粘贴对应注册码。激活不会安装或启动内核。
         </DialogDescription>
         <CragLicenseEditor
           data={license.data}

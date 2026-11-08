@@ -80,6 +80,8 @@ export type CragLicenseStatus = {
     | 'unconfigured'
   valid: boolean
   vm_id: string
+  /** offline: CRAGU1 universal code. online: device-bound CRAGL1. */
+  kind?: 'offline' | 'online'
   license_id?: string
   term?: '1m' | '6m' | '1y'
   /** Signed UTC epoch seconds, not browser-local timestamps. */

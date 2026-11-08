@@ -358,6 +358,8 @@ function stageCragV2Tree(src, dest) {
   let had = false
   try {
     fs.cpSync(src, staging, { recursive: true, dereference: false })
+    // mkdtemp is 0700. The slot user is not root, so it cannot exec the bootstrap inside it.
+    fs.chmodSync(staging, 0o755)
     const verified = verifyCragV2Tree(staging)
     if (!verified.ok) {
       fs.rmSync(staging, { recursive: true, force: true })
@@ -449,6 +451,10 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null } = 
   const dest = wrapCliHomeDir(projectRoot, vm.id)
   fs.mkdirSync(dest, { recursive: true })
   if (!cragV2WouldChange(src, dest)) {
+    try {
+      fs.chmodSync(path.join(dest, CRAG_V2_DIR), 0o755)
+    } catch {}
+    chownTree(dest, uid, gid)
     return {
       ok: true,
       dest,

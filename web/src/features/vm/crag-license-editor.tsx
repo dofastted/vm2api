@@ -1,4 +1,4 @@
-import { useId } from 'react'
+import { useId, useState } from 'react'
 import type { CragLicenseResponse, CragLicenseStatus } from '@/types/panel-vm'
 import { toast } from 'sonner'
 import { isApiError } from '@/lib/api'
@@ -8,7 +8,8 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
 
 const licenseMessages: Record<string, string> = {
-  license_required: '本槽尚未授权。请将机器码交给授权方，再粘贴签发的注册码。',
+  license_required:
+    '本槽尚未授权。可直接粘贴离线通用码，或复制机器码申请在线设备授权。',
   license_expired: '授权已到期。请向授权方申请续期，并在下方替换注册码。',
   license_not_yet_valid:
     '授权尚未生效。请核对服务器 UTC 时间和生效时间；如签发时间有误，请联系授权方重新签发。',
@@ -54,6 +55,13 @@ function utcTimestamp(seconds?: number) {
   return date.toISOString().replace('T', ' ').replace('.000Z', ' UTC')
 }
 
+function codeMode(code: string) {
+  const value = code.trim()
+  if (value.startsWith('CRAGU1.')) return 'offline' as const
+  if (value.startsWith('CRAGL1.')) return 'online' as const
+  return null
+}
+
 export function CragLicenseSummary({
   license,
 }: {
@@ -68,6 +76,14 @@ export function CragLicenseSummary({
           {statusLabels[license.status] || '状态未知，请刷新授权状态'}
         </dd>
       </div>
+      {license.kind ? (
+        <div>
+          <dt className='text-xs text-muted-foreground'>授权方式</dt>
+          <dd className='mt-1'>
+            {license.kind === 'offline' ? '离线通用码' : '在线设备授权'}
+          </dd>
+        </div>
+      ) : null}
       <div>
         <dt className='text-xs text-muted-foreground'>签发期限</dt>
         <dd className='mt-1'>
@@ -122,6 +138,10 @@ export function CragLicenseEditor({
         '授权状态未知。请刷新状态，并联系管理员检查授权配置。'
       : null
   const busy = loading || activating
+  const detected = codeMode(registrationCode)
+  const [chosen, setChosen] = useState<'offline' | 'online' | null>(null)
+  const mode =
+    detected ?? chosen ?? (license?.kind === 'online' ? 'online' : 'offline')
 
   return (
     <section
@@ -173,7 +193,30 @@ export function CragLicenseEditor({
           {statusMessage}
         </p>
       ) : null}
-      {data?.machine_code ? (
+      <div className='flex flex-wrap gap-2' role='group' aria-label='授权方式'>
+        <Button
+          type='button'
+          variant={mode === 'offline' ? 'default' : 'outline'}
+          disabled={busy}
+          aria-pressed={mode === 'offline'}
+          onClick={() => setChosen('offline')}
+        >
+          离线码
+        </Button>
+        <Button
+          type='button'
+          variant={mode === 'online' ? 'default' : 'outline'}
+          disabled={busy}
+          aria-pressed={mode === 'online'}
+          onClick={() => {
+            setChosen('online')
+            if (!data?.machine_code) onRefresh()
+          }}
+        >
+          在线授权
+        </Button>
+      </div>
+      {mode === 'online' && data?.machine_code ? (
         <div className='space-y-2'>
           <div className='flex flex-wrap items-center justify-between gap-2'>
             <Label htmlFor={`${formId}-machine`}>本槽机器码</Label>
@@ -207,7 +250,7 @@ export function CragLicenseEditor({
             id={`${formId}-machine-help`}
             className='text-xs leading-relaxed text-muted-foreground'
           >
-            将机器码交给授权方。注册码仅适用于本槽；期限与到期时间由签名确定，不能在此修改。
+            将机器码交给授权方换取在线设备码。该码只属于本槽；期限由签名确定，不能在此修改。
           </p>
         </div>
       ) : null}
@@ -221,7 +264,7 @@ export function CragLicenseEditor({
       >
         <div className='space-y-2'>
           <Label htmlFor={`${formId}-registration`}>
-            {license?.valid ? '替换注册码 / 续期' : '注册码'}
+            {mode === 'offline' ? '离线通用码' : '在线设备授权码'}
           </Label>
           <Textarea
             id={`${formId}-registration`}
@@ -240,7 +283,9 @@ export function CragLicenseEditor({
             id={`${formId}-registration-help`}
             className='text-xs leading-relaxed text-muted-foreground'
           >
-            粘贴授权方签发的完整注册码。校验通过后才替换现有授权；失败不会改动原授权或内核。
+            {mode === 'offline'
+              ? '粘贴 CRAGU1 离线通用码。不需要机器码，也不绑定本槽。校验通过后才替换当前授权。'
+              : '粘贴与上方机器码对应的 CRAGL1。不属于本槽的码会被拒绝，已有授权不会被破坏。'}
           </p>
         </div>
         {activationError ? (

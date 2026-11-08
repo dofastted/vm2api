@@ -91,6 +91,7 @@ import { SeedPolicyCard } from '@/features/vm/seed-policy-card'
 import { seedSaveState } from '@/features/vm/seed-settings'
 import { usePoolSeatStream } from '@/features/vm/use-pool-seat-stream'
 import { useVmTestChat } from '@/features/vm/use-vm-test-chat'
+import { VmNameField } from '@/features/vm/vm-name-field'
 import {
   pickBindTarget,
   useVmPerms,
@@ -255,6 +256,18 @@ function VmDetailBody({
       toast.success(
         (body.timezone_follow_proxy ? '已跟随代理时区' : '已保存时区') + hot
       )
+      await refreshAll()
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
+  const saveName = useMutation({
+    mutationFn: (name: string) =>
+      api(`/api/panel/vms/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name }),
+      }),
+    onSuccess: async () => {
+      toast.success('已保存名称')
       await refreshAll()
     },
     onError: (error: Error) => toast.error(error.message),
@@ -480,6 +493,12 @@ function VmDetailBody({
             </div>
           ) : null}
         </div>
+        <VmNameField
+          vm={vm}
+          canEdit={perms.admin}
+          saving={saveName.isPending}
+          onSave={(name) => saveName.mutate(name)}
+        />
         <Tabs value={tab} onValueChange={onTabChange}>
           <TabsList>
             <TabsTrigger value='overview'>概览</TabsTrigger>

@@ -775,6 +775,55 @@ function kernelConfigText(config) {
   return JSON.stringify(config, null, 2) + '\n'
 }
 
+function acceptNativeClaudeSetup(homeDir, workDir) {
+  // The TUI refuses login, theme, and folder-trust screens. The credential file is
+  // separate; these flags are what Claude reads before it will take a prompt.
+  for (const file of [path.join(homeDir, '.claude', '.claude.json'), path.join(homeDir, '.claude.json')]) {
+    let raw
+    try {
+      raw = fs.readFileSync(file, 'utf8')
+    } catch {
+      continue
+    }
+    let doc
+    try {
+      doc = JSON.parse(raw)
+    } catch {
+      continue
+    }
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc)) continue
+    let changed = false
+    if (doc.hasCompletedOnboarding !== true) {
+      doc.hasCompletedOnboarding = true
+      changed = true
+    }
+    if (typeof doc.theme !== 'string' || !doc.theme) {
+      doc.theme = 'dark'
+      changed = true
+    }
+    if (!doc.projects || typeof doc.projects !== 'object' || Array.isArray(doc.projects)) {
+      doc.projects = {}
+      changed = true
+    }
+    for (const folder of [workDir, '/home/kincli']) {
+      const current = doc.projects[folder]
+      const project = current && typeof current === 'object' && !Array.isArray(current) ? current : {}
+      if (project.hasTrustDialogAccepted === true) continue
+      project.hasTrustDialogAccepted = true
+      doc.projects[folder] = project
+      changed = true
+    }
+    if (!changed) continue
+    const st = fs.statSync(file)
+    const tmp = `${file}.${process.pid}.tmp`
+    fs.writeFileSync(tmp, `${JSON.stringify(doc)}\n`, { mode: st.mode & 0o777 })
+    try {
+      fs.chownSync(tmp, st.uid, st.gid)
+    } catch {}
+    fs.renameSync(tmp, file)
+  }
+}
+
 function writeKernelJsonAtomically(configPath, config, vm) {
   const body = kernelConfigText(config)
   let same = false
@@ -920,6 +969,14 @@ export function writeKernelConfig(
     config.claude_bin = '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude'
     config.asset_dir = '/run/kin/crag-native-assets'
     config.work_dir = '/run/kin/work'
+    const owner = runtimeFileOwner(vm)
+    for (const name of ['crag-native-assets', 'work']) {
+      const dir = path.join(runDir, name)
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+      fs.chmodSync(dir, 0o700)
+      if (privileged) fs.chownSync(dir, owner.uid, owner.gid)
+    }
+    acceptNativeClaudeSetup(homeDir, '/run/kin/work')
     // Native Claude owns UA/billing version; never inject a legacy profile version.
     config.cli_version = ''
     if (config.telemetry && isTelemetryEnabled(defaultSeedPolicy(record.seed_policy || {}))) {

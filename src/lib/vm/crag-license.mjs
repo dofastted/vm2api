@@ -272,7 +272,7 @@ export function verifyCragRegistration(
       key.fill(0)
       payload?.fill(0)
     }
-    const status = { status: 'valid', valid: true, vm_id: device.vm_id }
+    const status = { status: 'valid', valid: true, vm_id: device.vm_id, kind: 'online' }
     for (const key of ['license_id', 'term', 'issued_at', 'not_before', 'expires_at']) status[key] = c[key]
     if (now < c.issued_at || now < c.not_before)
       return {
@@ -344,13 +344,125 @@ function publicFailure(vm, error) {
   return { status: STATES[code], valid: false, vm_id: vm?.id || '', code, message: MESSAGES[code] }
 }
 
+const UNIVERSAL_DOMAIN = Buffer.from('CRAG-UNIVERSAL-LICENSE-V1\0')
+const UNIVERSAL_WRAP = Buffer.from('CRAG-UNIVERSAL-WRAP-V1\0')
+const UNIVERSAL_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+
+function exactKeys(value, keys) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) fail()
+  const present = Object.keys(value)
+  if (present.length !== keys.length || keys.some((key) => !Object.hasOwn(value, key))) fail()
+}
+
+export function verifyCragUniversal(code, { publicKey, keyId, now = Math.floor(Date.now() / 1000) }) {
+  let bearer
+  try {
+    if (typeof code !== 'string' || code.length > 4096) fail()
+    const parts = code.trim().split('.')
+    if (parts.length !== 4 || parts[0] !== 'CRAGU1') fail()
+    const raw = decodeLicenseBytes(parts[1])
+    if (!crypto.verify(null, Buffer.concat([UNIVERSAL_DOMAIN, raw]), publicKey, decodeLicenseBytes(parts[2], 64)))
+      fail()
+    bearer = decodeLicenseBytes(parts[3], 32)
+    const claims = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw))
+    exactKeys(claims, [
+      'version',
+      'product',
+      'license_id',
+      'issued_at',
+      'not_before',
+      'expires_at',
+      'term',
+      'payload_key_id',
+      'wrapped_key',
+    ])
+    exactKeys(claims.wrapped_key, ['nonce', 'ciphertext', 'tag'])
+    if (claims.version !== 1 || claims.product !== 'crag-v2' || !UNIVERSAL_ID.test(claims.license_id)) fail()
+    if (!['1m', '6m', '1y'].includes(claims.term)) fail()
+    for (const key of ['issued_at', 'not_before', 'expires_at']) if (!Number.isSafeInteger(claims[key])) fail()
+    if (
+      claims.not_before !== claims.issued_at ||
+      claims.expires_at <= claims.issued_at ||
+      claims.expires_at !== calendarExpiry(claims.issued_at, claims.term) ||
+      !hex(claims.payload_key_id) ||
+      claims.payload_key_id !== keyId
+    )
+      fail()
+    const aad = Buffer.concat([
+      UNIVERSAL_WRAP,
+      Buffer.from(claims.license_id),
+      Buffer.from([0]),
+      Buffer.from(claims.payload_key_id),
+    ])
+    let payload
+    try {
+      const decipher = crypto.createDecipheriv('aes-256-gcm', bearer, decodeLicenseBytes(claims.wrapped_key.nonce, 12))
+      decipher.setAAD(aad)
+      decipher.setAuthTag(decodeLicenseBytes(claims.wrapped_key.tag, 16))
+      payload = Buffer.concat([
+        decipher.update(decodeLicenseBytes(claims.wrapped_key.ciphertext, 32)),
+        decipher.final(),
+      ])
+      if (payload.length !== 32 || sha(payload) !== claims.payload_key_id) fail()
+    } finally {
+      payload?.fill(0)
+    }
+    const status = { status: 'valid', valid: true, vm_id: '', kind: 'offline' }
+    for (const key of ['license_id', 'term', 'issued_at', 'not_before', 'expires_at']) status[key] = claims[key]
+    if (now < claims.issued_at)
+      return {
+        ...status,
+        status: 'not_yet_valid',
+        valid: false,
+        code: 'license_not_yet_valid',
+        message: MESSAGES.license_not_yet_valid,
+      }
+    if (now >= claims.expires_at)
+      return { ...status, status: 'expired', valid: false, code: 'license_expired', message: MESSAGES.license_expired }
+    return status
+  } catch (error) {
+    if (error instanceof CragLicenseError) throw error
+    fail()
+  } finally {
+    bearer?.fill(0)
+  }
+}
+
+function storedRegistration(dir) {
+  try {
+    return readPrivate(path.join(dir, 'registration.code')).trim()
+  } catch (error) {
+    if (error?.code === 'ENOENT') return ''
+    throw error
+  }
+}
+
 export function getCragLicense(projectRoot, vm, { initialize = false } = {}) {
   let ctx
   try {
+    const dir = cragLicenseDirectory(projectRoot, vm)
+    const stored = storedRegistration(dir)
+    if (stored.startsWith('CRAGU1.')) {
+      const license = verifyCragUniversal(stored, trust(projectRoot))
+      if (!initialize) return { license, machine_code: '' }
+      try {
+        // A machine-code failure must not hide an already valid offline license.
+        ctx = deviceContext(projectRoot, vm, true)
+      } catch {
+        return { license, machine_code: '' }
+      }
+      return { license, machine_code: ctx.machine_code }
+    }
     ctx = deviceContext(projectRoot, vm, initialize)
-    const authority = trust(projectRoot)
-    const code = readPrivate(path.join(ctx.dir, 'registration.code'))
-    return { license: verifyCragRegistration(code, { ...ctx, ...authority }), machine_code: ctx.machine_code }
+    if (!stored) {
+      const missing = new Error('missing registration')
+      missing.code = 'ENOENT'
+      throw missing
+    }
+    return {
+      license: verifyCragRegistration(stored, { ...ctx, ...trust(projectRoot) }),
+      machine_code: ctx.machine_code,
+    }
   } catch (error) {
     return { license: publicFailure(vm, error), machine_code: ctx?.machine_code || '' }
   }
@@ -358,10 +470,19 @@ export function getCragLicense(projectRoot, vm, { initialize = false } = {}) {
 
 export function activateCragLicense(projectRoot, vm, code) {
   try {
+    const trimmed = typeof code === 'string' ? code.trim() : ''
+    if (trimmed.startsWith('CRAGU1.')) {
+      const license = verifyCragUniversal(trimmed, trust(projectRoot))
+      if (!license.valid) fail(license.code)
+      const dir = cragLicenseDirectory(projectRoot, vm)
+      checkDirectory(dir, true, vm)
+      writePrivate(dir, 'registration.code', `${trimmed}\n`, vm, true)
+      return { license, machine_code: '' }
+    }
     const ctx = deviceContext(projectRoot, vm, true)
-    const license = verifyCragRegistration(code, { ...ctx, ...trust(projectRoot) })
+    const license = verifyCragRegistration(trimmed, { ...ctx, ...trust(projectRoot) })
     if (!license.valid) fail(license.code)
-    writePrivate(ctx.dir, 'registration.code', code.trim() + '\n', vm, true)
+    writePrivate(ctx.dir, 'registration.code', `${trimmed}\n`, vm, true)
     return { license, machine_code: ctx.machine_code }
   } catch (error) {
     if (error instanceof CragLicenseError) throw error
