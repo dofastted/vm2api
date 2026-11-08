@@ -3,6 +3,7 @@
 ## Unreleased
 
 - 清理：删除零引用死导出（cache-ttl / convert / model-policy / thinking / user-count-tokens / web-search / codex-route / codex-models）及 `copyBodyWithMessages`（REQ-CLEANUP-02 第一批 / DEC-0001）。
+- 测试模型和内核说明按当前内核区分：cli-node 仍写明老 cli-hop（`-p`、bypassPermissions、20 槽）；CRAG v2 显示 CRAG 内核，不再标成 cli-hop。
 - 内核页收敛为默认免费 cli-node 与注册码授权 CRAG：精简母本/旧 ELF/cc-node 入口，逐 VM 选择安装、就地激活/续期，全局确认明确范围，显示逐槽进度和停止结果。
 - 新增两产品独立拉取与可信缓存发布：cli-node 只下载所需的一对二进制；CRAG 校验官方签名加密归档并固定原发行公钥，缺少授权附件时明确失败，不回退 legacy。缓存指针原子切换，损坏时拒绝使用。
 - 新增显式范围重装并停用接口：授权/包校验先于停止，停止先于替换，保留身份与数据，关闭自动重启且不隐式开机；恢复流程只在完整成功时解除安装器自己的异常安全暂停。后续原生启动按需补齐窄 seccomp 策略，正确配置的容器不重建。

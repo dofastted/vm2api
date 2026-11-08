@@ -16,14 +16,17 @@ export function kernelHopReady(health?: VmKernelHealth | null): boolean {
   return !!health?.reachable
 }
 
-export function wrapHealthLabel(health?: VmKernelHealth | null): string {
+export function wrapHealthLabel(
+  health?: VmKernelHealth | null,
+  hop = 'cli-hop'
+): string {
   if (!health) return '—'
   const version = kernelVersionOf(health)
   const slots = health.ready_slots
   const processUp = kernelProcessUp(health)
   if (kernelHopReady(health)) {
     const bits = ['在线']
-    if (health.provider === 'local_cli') bits.push('cli-hop')
+    if (health.provider === 'local_cli' && hop) bits.push(hop)
     if (slots != null) bits.push(`${slots} 槽就绪`)
     if (version) bits.push(version)
     return bits.join(' · ')

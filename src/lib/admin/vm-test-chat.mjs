@@ -46,6 +46,7 @@ import {
   resolveOfficialCcInference,
   resolveCliSystemLayout,
   resolveKernelDataplane,
+  resolveCragKernelVersion,
 } from '../vm/slot-engine.mjs'
 import {
   codexTextInput,
@@ -903,12 +904,19 @@ export async function runVmTestChat(opts = {}) {
   const inferenceEngine = codex ? null : resolveInferenceEngine(vm, routing)
   const cliHop = !codex && resolveOfficialCcInference(vm, routing) === 'cli-hop'
   const dataplane = codex ? null : resolveKernelDataplane(vm, routing) || 'wrap'
+  const cragVersion = dataplane === 'crag' ? resolveCragKernelVersion(vm, routing) : null
+  const kernelRoute =
+    dataplane === 'crag'
+      ? `CRAG ${cragVersion === 'v2' ? 'v2' : 'legacy'} 内核`
+      : dataplane === 'cc'
+        ? 'cli-hop cc-node'
+        : 'cli-hop cli-node'
   push(
     'info',
     codex
       ? '推理 codex-kernel / ChatGPT'
       : cliHop
-        ? `推理 ${inferenceEngine} / cli-hop ${dataplane}`
+        ? `推理 ${inferenceEngine} / ${kernelRoute}`
         : `推理 ${inferenceEngine} / http hop`,
   )
 
@@ -949,13 +957,15 @@ export async function runVmTestChat(opts = {}) {
     codex
       ? '凭证 Codex OAuth · OpenAI Responses 入站'
       : `凭证 ${credMode}${
-          cliHop
-            ? cliLayout === 'identity'
-              ? ' · cli-hop CLI 官方提示词'
-              : ' · cli-hop 0注入'
-            : unofficial
-              ? ' · 非官方 inference 入站'
-              : ' · 官方 Claude Code 入站'
+          dataplane === 'crag'
+            ? ` · ${kernelRoute}`
+            : cliHop
+              ? cliLayout === 'identity'
+                ? ' · cli-node cli-hop · CLI 官方提示词'
+                : ' · cli-node cli-hop · 0注入'
+              : unofficial
+                ? ' · 非官方 inference 入站'
+                : ' · 官方 Claude Code 入站'
         }`,
   )
 
