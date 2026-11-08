@@ -4,10 +4,10 @@ export function kernelRouteLabel(
   dataplane: unknown,
   cragVersion?: unknown
 ): string {
-  if (dataplane === 'crag')
-    return cragVersion === 'v2' ? 'CRAG v2' : 'CRAG legacy'
-  if (dataplane === 'cc') return 'cc-node · cli-hop'
-  return 'cli-node · cli-hop'
+  if (dataplane === 'crag' && cragVersion === 'v2') return 'CRAG v2 原生 worker'
+  if (dataplane === 'crag') return 'cc-node + CRAG kernel'
+  if (dataplane === 'cc') return 'cc-node + wrap kernel'
+  return 'cli-node + wrap kernel'
 }
 
 export function kernelRouteHint(
@@ -15,13 +15,13 @@ export function kernelRouteHint(
   cragVersion?: unknown
 ): string {
   if (dataplane === 'crag' && cragVersion === 'v2') {
-    return '这一槽是 CRAG v2，不是 cli-hop。官方 Claude Code 用手动权限；目录信任只认 CRAG 自己的工作目录。'
+    return '本槽把 crag_kernel_version 固定为 v2。跑原生 CRAG worker，不用 cli-node，也不用 wrap kin-kernel。'
   }
   if (dataplane === 'crag') {
-    return '这一槽是旧 CRAG kernel（仓内 cc-node），不是 cli-node 的 cli-hop，也不是 CRAG v2。'
+    return 'claude_bin 是 cc-node，内核是 share/crag 的 kin-kernel。不是 cli-node + wrap kernel，也不是 CRAG v2。'
   }
   if (dataplane === 'cc') {
-    return 'cc-node 仍走 cli-hop，和 cli-node 共用 wrap kernel，不是 CRAG。'
+    return 'claude_bin 是 cc-node，内核仍是 wrap kin-kernel，推理走 cli-hop。不是 CRAG kernel。'
   }
-  return '老 cli-node 路线：Rust cli-hop 用 -p 和 bypassPermissions 拉起 cli-node，一进程 20 个 native 槽。不走官方 Claude 的登录、引导或目录信任页。'
+  return '老 cli-node 路线。claude_bin 是 cli-node，内核是 wrap kin-kernel，推理走 cli-hop。'
 }
