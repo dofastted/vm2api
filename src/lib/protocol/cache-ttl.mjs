@@ -3,8 +3,8 @@
  * Default 1h (2× input). Customers may request 5m (1.25× input);
  * billing must use the TTL we actually sent.
  */
-import fs from 'node:fs'
 import { isAnthropicServerTool } from './web-search.mjs'
+import { readJsonParsedCached } from '../vm/vm-file.mjs'
 
 export const DEFAULT_CACHE_TTL = '1h'
 export const CACHE_TTL_HEADER = 'x-kin-cache-ttl'
@@ -35,7 +35,9 @@ export function cacheTtlFromRouting(routing = {}) {
 export function cacheTtlFromRoutingFile(filePath) {
   if (!filePath) return DEFAULT_CACHE_TTL
   try {
-    return cacheTtlFromRouting(JSON.parse(fs.readFileSync(filePath, 'utf8')))
+    const routing = readJsonParsedCached(filePath)
+    if (!routing) return DEFAULT_CACHE_TTL
+    return cacheTtlFromRouting(routing)
   } catch {
     return DEFAULT_CACHE_TTL
   }
@@ -424,7 +426,9 @@ export function cacheBreakpointsFromRouting(routing = {}) {
 export function cacheBreakpointsFromRoutingFile(filePath) {
   if (!filePath) return normalizeCacheBreakpoints(null)
   try {
-    return cacheBreakpointsFromRouting(JSON.parse(fs.readFileSync(filePath, 'utf8')))
+    const routing = readJsonParsedCached(filePath)
+    if (!routing) return normalizeCacheBreakpoints(null)
+    return cacheBreakpointsFromRouting(routing)
   } catch {
     return normalizeCacheBreakpoints(null)
   }
