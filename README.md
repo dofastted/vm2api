@@ -3,6 +3,7 @@
 # vm2api
 
 ### 完全隔离的虚拟机级 AI 订阅转 API 生产网关
+
 **Next-Generation Fully Isolated VM-Level AI Subscription-to-API Gateway**
 
 [![Release](https://img.shields.io/badge/Release-v1.4.053-blue.svg?style=for-the-badge&logo=github)](https://github.com/dofastted/vm2api/releases)
@@ -10,55 +11,52 @@
 [![Benchmarks](https://img.shields.io/badge/Benchmarks-Clean%20Verified-00C853?style=for-the-badge&logo=shield)](docs/benchmarks/README.md)
 [![Cluster](https://img.shields.io/badge/Cluster-Multi--VPS%20Ready-7928CA?style=for-the-badge&logo=docker)](docs/DEPLOY.md)
 
-<p align="center">
-  <a href="#-简体中文"><b>🇨🇳 简体中文</b></a> •
-  <a href="#-english"><b>🇬🇧 English</b></a> •
-  <a href="https://vm2api.fkcodex.com/zh/"><b>📖 入门文档</b></a> •
-  <a href="docs/技术路线.md"><b>🗺️ 技术路线</b></a> •
-  <a href="docs/DEPLOY.md"><b>🚀 部署指南</b></a> •
-  <a href="docs/benchmarks/README.md"><b>📊 干净度基准</b></a> •
-  <a href="#-交流与赞助支持--community--sponsorship"><b>☕ 支持捐赠</b></a>
-</p>
+[🇨🇳 简体中文](#-简体中文) | [🇬🇧 English](#-english) | [入门文档](https://vm2api.fkcodex.com/zh/) | [CHANGELOG](CHANGELOG.md) | [技术路线](docs/技术路线.md) | [部署指南](docs/DEPLOY.md)
 
----
-
-<img src="docs/images/brand-hero.png" alt="vm2api Hero Banner" width="100%" style="border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.4);" />
-
-<br/>
-
-<a href="https://proxylane.dev/zh-cn/isp-proxies?utm_source=vm2api&utm_medium=affiliate&utm_campaign=vm2api_sponsor_202610&utm_content=github_readme"><img src="docs/images/sponsor-proxylane.png" alt="ProxyLane（赞助商）" width="100%" /></a>
-
-**赞助商**：[ProxyLane](https://proxylane.dev/zh-cn/isp-proxies?utm_source=vm2api&utm_medium=affiliate&utm_campaign=vm2api_sponsor_202610&utm_content=github_readme) AI 账号专用的原生静态住宅 IP，Scamalytics 低欺诈评分，每个 IP 独享，不限流量，$3.90 起。一个槽位绑一个 IP：把 SOCKS5 `host:port:user:pass` 粘贴到「代理池」→「添加代理」即可。首次购买使用优惠码 `VM2API30` 享 7 折。
+**[部署安装](#-部署安装) · [近期更新](#-近期更新) · [功能特性](#-功能特性) · [界面预览](#-界面预览) · [交流与支持](#-交流与赞助支持--community--sponsorship)**
 
 </div>
 
-<br/>
 
 > [!NOTE]
 > **vm2api** 专为高可靠 AI 订阅转化为生产级标准 API 设计。摒弃传统的简单 HTTP 逆向与易被封禁的公用代理方案，采用**全隔离虚拟机/容器环境 + 官方真实客户端进程常驻 + 真实硬件指纹拟真 + 单槽单独立网络出口 + 进槽前封控拦截**，实现真正稳定、长效、高并发的订阅转 API 基础设施。
+
+
+---
+
+## ❤️ 赞助商 / Sponsors
+
+<details>
+<summary>点击展开赞助商说明 · Click to expand</summary>
+
+<a href="https://proxylane.dev/zh-cn/isp-proxies?utm_source=vm2api&utm_medium=affiliate&utm_campaign=vm2api_sponsor_202610&utm_content=github_readme"><img src="docs/images/sponsor-proxylane.png" alt="ProxyLane（赞助商）" width="100%" /></a>
+
+**赞助商（ProxyLane）**：AI 账号专用的原生静态住宅 IP，Scamalytics 低欺诈评分，每个 IP 独享，不限流量，$3.90 起。一个槽位绑一个 IP：把 SOCKS5 `host:port:user:pass` 粘贴到「代理池」→「添加代理」即可。首次购买优惠码 `VM2API30` 享 7 折。详见 [ProxyLane](https://proxylane.dev/zh-cn/isp-proxies?utm_source=vm2api&utm_medium=affiliate&utm_campaign=vm2api_sponsor_202610&utm_content=github_readme)。
+
+</details>
 
 ---
 
 # 🇨🇳 简体中文
 
 ## 目录
-- [💡 项目概览](#-项目概览)
-- [🆕 近期更新](#-近期更新)
-- [🛡️ 九大核心特性（特色防封与拟真矩阵）](#️-九大核心特性特色防封与拟真矩阵)
-  - [0️⃣ 独家 0 提示词注入机制 & 改写引擎](#0️⃣-独家-0-提示词注入机制--改写引擎)
-  - [1️⃣ 真实拟真物理机环境](#1️⃣-真实拟真物理机环境)
-  - [2️⃣ 官方 Claude Code 真实进程转发](#2️⃣-官方-claude-code-真实进程转发)
-  - [3️⃣ 封控拦截与风险审计](#3️⃣-封控拦截与风险审计)
-  - [4️⃣ 完整的隔离网络环境（1 VM = 1 独立网络出口）](#4️⃣-完整的隔离网络环境1-vm--1-独立网络出口)
-  - [5️⃣ 前置协议清洗与多协议统一结构化](#5️⃣-前置协议清洗与多协议统一结构化)
-  - [6️⃣ 官方遥测（Telemetry）可控开关](#6️⃣-官方遥测telemetry可控开关)
-  - [7️⃣ 分布式集群系统（多 VPS 跨机舰队管理）](#7️⃣-分布式集群系统多-vps-跨机舰队管理)
-  - [8️⃣ 完整的企业级 API 密钥与配额管理](#8️⃣-完整的企业级-api-密钥与配额管理)
-- [📊 干净度基准评测（Benchmarks）](#-干净度基准评测benchmarks)
-- [🚀 快速开始（生产部署）](#-快速开始生产部署)
-- [🔌 接口与协议兼容](#-接口与协议兼容)
-- [💬 交流与赞助支持](#-交流与赞助支持--community--sponsorship)
-- [📜 许可证与免责声明](#-许可证与免责声明--license)
+
+- [为什么选择 vm2api？](#为什么选择-vm2api)
+- [近期更新](#-近期更新)
+- [功能特性](#-功能特性)
+- [界面预览](#-界面预览)
+- [干净度基准（Benchmarks）](#-干净度基准评测benchmarks)
+- [部署安装](#-部署安装)
+- [接口与协议兼容](#-接口与协议兼容)
+- [问题反馈](#-问题反馈)
+
+---
+
+## 为什么选择 vm2api？
+
+- **订阅转标准 API**：Anthropic / OpenAI 订阅与可选 **API 直连**（`api` 类密钥）统一入口。
+- **虚拟机级拟真**：官方 Claude Code 真实进程、硬件指纹、单槽单出口，而非简单 HTTP 逆向。
+- **生产可运维**：进槽前封控、多 VPS 集群、租户与密钥体系；**升级以各版本 CHANGELOG 为准**。
 
 ---
 
@@ -85,11 +83,10 @@
 
 ---
 
-## 🛡️ 九大核心特性（特色防封与拟真矩阵）
+## 功能特性
 
-<div align="center">
-  <img src="docs/images/vm2api-security-distill.jpg" alt="Security & Distillation Protection" width="95%" style="border-radius: 10px; margin: 12px 0;" />
-</div>
+涵盖防封、拟真与生产运维相关能力（九大支柱）：
+
 
 ### 0️⃣ 独家 0 提示词注入机制 & 改写引擎
 - **无感透传，告别 System 篡改**：传统中继依赖向 Prompt 注入大段系统人设与假装指令，不仅消耗高昂 Token，还极易引发模型“自我认知混乱”并被上游识别封号。vm2api 身份在凭证层即对齐官方形态，**做到真正 0 提示词注入（Zero Prompt Injection）**。
@@ -106,17 +103,9 @@
 - **5h / 7d 官方用量窗口智能对齐**：控制面实时对齐 Anthropic 官方 5 小时滚动窗口与 7 天硬限消耗，精确计算重置倒计时（精确到分钟级）。支持设置水位报警阈值，额度逼近硬限时自动熔断并将流量平滑降级调度至空闲槽位。
 - **全生命周期槽位状态机与健康监控**：实时追踪槽位调度状态（在池调度、5h/7d 冷却保护、调用关闭、凭证失效）。支持优先级分级路由（高优先级 VIP 槽位专属调度）、单槽独立成本流水统计与一键额度全槽健康探测。
 
-<div align="center">
-  <img src="docs/images/console-vms.png" alt="vm2api 虚拟机槽位管理与官方进程运行实机看板" width="95%" style="border-radius: 10px; border: 1px solid rgba(255,255,255,0.12); box-shadow: 0 6px 24px rgba(0,0,0,0.4);" />
-  <br/>
-  <sub><i>线上生产环境实机运行脱敏截图：Claude / GPT 多槽位舰队状态、20 路并发承载、5h/7d 官方配额窗口追踪与实时成本流水</i></sub>
-</div>
 
 ---
 
-<div align="center">
-  <img src="docs/images/vm2api-vm-hardware-network.jpg" alt="VM Hardware & Network Isolation" width="95%" style="border-radius: 10px; margin: 12px 0;" />
-</div>
 
 ### 3️⃣ 封控拦截与风险审计
 
@@ -145,9 +134,6 @@
 
 ---
 
-<div align="center">
-  <img src="docs/images/vm2api-04-telemetry.png" alt="Official Telemetry" width="85%" style="border-radius: 10px; margin: 12px 0;" />
-</div>
 
 ### 6️⃣ 官方遥测（Telemetry）可控开关
 - **全量遥测模拟**：目标是让官方服务判定每一个槽位都是一台完全独立、在真实开发中活跃运行的电脑。
@@ -162,6 +148,24 @@
 - **多层级密钥体系**：拥有主控制 Master Key 以及针对团队或租户的多级 API Key，密钥入库采用 HMAC 索引与高强度加密。
 - **官方配额窗口精确对齐**：对齐官方 5h / 7d 动态用量窗口与硬限保护，支持槽位独立配额覆盖，提供自动熔断、故障降级与空闲负载平衡。
 - **实时审计与成本统计**：提供精确到 TTFT（首 Token 延迟）、真实 Prompt / Completion / 缓存命中 Token 的详尽流水与可视化图表分析。
+
+---
+
+## 界面预览
+
+<table>
+<tr>
+<td align="center" width="50%"><img src="docs/images/brand-hero.png" alt="vm2api 品牌概览" width="420"><br><sub>品牌概览</sub></td>
+<td align="center" width="50%"><img src="docs/images/console-vms.png" alt="虚拟机槽位管理看板" width="420"><br><sub>槽位舰队与配额看板（脱敏）</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/images/vm2api-security-distill.jpg" alt="封控与蒸馏防护" width="420"><br><sub>封控拦截</sub></td>
+<td align="center"><img src="docs/images/vm2api-vm-hardware-network.jpg" alt="硬件与网络隔离" width="420"><br><sub>硬件指纹与网络隔离</sub></td>
+</tr>
+<tr>
+<td align="center" colspan="2"><img src="docs/images/vm2api-04-telemetry.png" alt="遥测配置" width="520"><br><sub>官方遥测开关</sub></td>
+</tr>
+</table>
 
 ---
 
@@ -183,7 +187,7 @@ vm2api 严格遵循行业最严苛的**纯净度基准**。入站请求不泄露
 
 ---
 
-## 🚀 快速开始（生产部署）
+## 部署安装
 
 推荐在 **Ubuntu 24.04 LTS** 环境使用官方 Docker Compose 一键启动。
 
@@ -252,27 +256,28 @@ vm2api 内置全栈自适应网关，原生支持以下所有主流生态：
 
 <br/>
 
+
+<br/>
+
 # 🇬🇧 English
 
-> **Sponsor**: [ProxyLane](https://proxylane.dev/zh-cn/isp-proxies?utm_source=vm2api&utm_medium=affiliate&utm_campaign=vm2api_sponsor_202610&utm_content=github_readme_en) native static residential ISP IPs built for AI accounts: low Scamalytics fraud scores, a dedicated IP with unlimited traffic, from $3.90. Bind one IP per slot: paste the SOCKS5 line `host:port:user:pass` into 代理池 → 添加代理 (Proxy pool → Add proxy). Code `VM2API30` gives 30% off your first purchase.
-
 ## Table of Contents
-- [💡 Overview](#-overview)
-- [🆕 Recent changes](#recent-changes)
-- [🛡️ 9 Core Pillars (Anti-Ban & Emulation Matrix)](#️-9-core-pillars-anti-ban--emulation-matrix)
-  - [0️⃣ Zero Prompt Injection Engine](#0️⃣-zero-prompt-injection-engine)
-  - [1️⃣ Physical Hardware Fingerprint Emulation](#1️⃣-physical-hardware-fingerprint-emulation)
-  - [2️⃣ Official Claude Code Native Process Forwarding](#2️⃣-official-claude-code-native-process-forwarding)
-  - [3️⃣ Pre-hop risk gates](#3️⃣-pre-hop-risk-gates)
-  - [4️⃣ Completely Isolated Network (1 VM = 1 Egress)](#4️⃣-completely-isolated-network-1-vm--1-egress)
-  - [5️⃣ Deep Protocol Cleansing & Multi-Inbound Structuring](#5️⃣-deep-protocol-cleansing--multi-inbound-structuring)
-  - [6️⃣ Configurable Official Telemetry](#6️⃣-configurable-official-telemetry)
-  - [7️⃣ Multi-VPS Cluster Management](#7️⃣-multi-vps-cluster-management)
-  - [8️⃣ Enterprise API Key & Quota Management](#8️⃣-enterprise-api-key--quota-management)
-- [📊 Cleanliness Benchmarks](#-cleanliness-benchmarks)
-- [🚀 Quick Start (Production Setup)](#-quick-start-production-setup)
-- [💬 Community & Sponsorship](#-交流与赞助支持--community--sponsorship)
-- [📜 License & Compliance](#-许可证与免责声明--license)
+
+- [Why vm2api?](#why-vm2api)
+- [Recent changes](#recent-changes-14053)
+- [Features](#features)
+- [Screenshots](#screenshots)
+- [Cleanliness Benchmarks](#-cleanliness-benchmarks)
+- [Deployment](#deployment)
+- [Issue reporting](#-问题反馈--issue-reporting)
+
+---
+
+## Why vm2api?
+
+- **Subscription → standard APIs** — Anthropic / OpenAI slots plus optional **direct API** keys.
+- **VM-fidelity** — Official Claude Code processes, hardware fingerprints, one egress per slot.
+- **Operations-ready** — Pre-hop risk gates, multi-VPS cluster, tenants and keys; **per-release CHANGELOG upgrade notes**.
 
 ---
 
@@ -301,7 +306,9 @@ Guide: [vm2api.fkcodex.com/zh](https://vm2api.fkcodex.com/zh/).
 
 ---
 
-## 🛡️ 9 Core Pillars (Anti-Ban & Emulation Matrix)
+## Features
+
+Nine pillars for anti-ban emulation and production operations:
 
 ### 0️⃣ Zero Prompt Injection Engine
 - **No System Prompt Tampering**: Unlike ordinary proxies that tamper with the system prompt and poison model identity, vm2api aligns credentials at the protocol layer as a genuine Console client.
@@ -318,11 +325,6 @@ Guide: [vm2api.fkcodex.com/zh](https://vm2api.fkcodex.com/zh/).
 - **5h / 7d Upstream Quota Alignment**: Automatically aligns with Anthropic's rolling 5-hour and 7-day budget windows, calculating reset deadlines down to the minute. Integrates dynamic circuit breakers to gracefully divert traffic when a slot approaches its capacity limit.
 - **Full Slot Lifecycle & Health Observability**: Visual real-time tracking of slot states (In-Pool, Cooldown Guard, Suspended, Token Expired), multi-tier priority routing, and real-time per-slot financial cost accounting.
 
-<div align="center">
-  <img src="docs/images/console-vms.png" alt="vm2api VM Slot Management & Process Forwarding Live Dashboard" width="95%" style="border-radius: 10px; border: 1px solid rgba(255,255,255,0.12); box-shadow: 0 6px 24px rgba(0,0,0,0.4);" />
-  <br/>
-  <sub><i>Production live dashboard: Multi-slot fleet status, 20-concurrency subagent scheduling, 5h/7d quota window telemetry, and cost accounting (sanitized).</i></sub>
-</div>
 
 ### 3️⃣ Pre-hop risk gates
 
@@ -362,6 +364,24 @@ Open a hit and read the body. A false positive means tighten that gate, not dele
 
 ---
 
+## Screenshots
+
+<table>
+<tr>
+<td align="center" width="50%"><img src="docs/images/brand-hero.png" alt="vm2api brand" width="420"><br><sub>Brand overview</sub></td>
+<td align="center" width="50%"><img src="docs/images/console-vms.png" alt="VM slot dashboard" width="420"><br><sub>Slot fleet dashboard (sanitized)</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/images/vm2api-security-distill.jpg" alt="Risk gates" width="420"><br><sub>Risk gates</sub></td>
+<td align="center"><img src="docs/images/vm2api-vm-hardware-network.jpg" alt="Hardware and network" width="420"><br><sub>Hardware & network isolation</sub></td>
+</tr>
+<tr>
+<td align="center" colspan="2"><img src="docs/images/vm2api-04-telemetry.png" alt="Telemetry" width="520"><br><sub>Telemetry controls</sub></td>
+</tr>
+</table>
+
+---
+
 ## 📊 Cleanliness Benchmarks
 
 | Test Item | Description | Evaluation | Core Result |
@@ -376,7 +396,7 @@ Open a hit and read the body. A false positive means tighten that gate, not dele
 
 ---
 
-## 🚀 Quick Start (Production Setup)
+## Deployment
 
 ```bash
 # Recommended one-line installation on Ubuntu 24.04 LTS
@@ -395,8 +415,8 @@ See [docs/DEPLOY.md](docs/DEPLOY.md) for panel one-click updates and compose wor
 
 ---
 
-## 🐞 问题反馈 / Issue Reporting
 
+## 🐞 问题反馈 / Issue Reporting
 提交 Issue 前请阅读 [ISSUE_GUIDE.md](ISSUE_GUIDE.md)，按“版本 → 复现路线 → 环境（VPS / 代理）→ VM 与请求日志 → 源码定位（可选）→ 脱敏”收集信息，再用 [Bug 报告表单](https://github.com/dofastted/vm2api/issues/new/choose) 提交。
 
 Before opening an issue, follow [ISSUE_GUIDE.md](ISSUE_GUIDE.md): version, reproduction steps, host/proxy environment, VM and request logs, optional source pointers — and redact all secrets.
