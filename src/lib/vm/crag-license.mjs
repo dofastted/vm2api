@@ -272,7 +272,7 @@ export function verifyCragRegistration(
       key.fill(0)
       payload?.fill(0)
     }
-    const status = { status: 'valid', valid: true, vm_id: device.vm_id }
+    const status = { status: 'valid', valid: true, vm_id: device.vm_id, kind: 'online' }
     for (const key of ['license_id', 'term', 'issued_at', 'not_before', 'expires_at']) status[key] = c[key]
     if (now < c.issued_at || now < c.not_before)
       return {
@@ -407,7 +407,7 @@ export function verifyCragUniversal(code, { publicKey, keyId, now = Math.floor(D
     } finally {
       payload?.fill(0)
     }
-    const status = { status: 'valid', valid: true, vm_id: '' }
+    const status = { status: 'valid', valid: true, vm_id: '', kind: 'offline' }
     for (const key of ['license_id', 'term', 'issued_at', 'not_before', 'expires_at']) status[key] = claims[key]
     if (now < claims.issued_at)
       return {
@@ -443,7 +443,15 @@ export function getCragLicense(projectRoot, vm, { initialize = false } = {}) {
     const dir = cragLicenseDirectory(projectRoot, vm)
     const stored = storedRegistration(dir)
     if (stored.startsWith('CRAGU1.')) {
-      return { license: verifyCragUniversal(stored, trust(projectRoot)), machine_code: '' }
+      const license = verifyCragUniversal(stored, trust(projectRoot))
+      if (!initialize) return { license, machine_code: '' }
+      try {
+        // A machine-code failure must not hide an already valid offline license.
+        ctx = deviceContext(projectRoot, vm, true)
+      } catch {
+        return { license, machine_code: '' }
+      }
+      return { license, machine_code: ctx.machine_code }
     }
     ctx = deviceContext(projectRoot, vm, initialize)
     if (!stored) {
