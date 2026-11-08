@@ -54,6 +54,7 @@ export const ErrorCode = {
   API_KEY_QUOTA_EXHAUSTED: 'api_key_quota_exhausted',
   API_KEY_RATE_LIMIT: 'api_key_rate_limit',
   API_KEY_CONCURRENCY_LIMIT: 'api_key_concurrency_limit',
+  API_KEY_MODEL_NOT_ALLOWED: 'api_key_model_not_allowed',
   KEY_GROUP_MISMATCH: 'key_group_mismatch',
   VM_POOL_UNAVAILABLE: 'vm_pool_unavailable',
   API_BACKEND_FORBIDDEN: 'api_backend_forbidden',

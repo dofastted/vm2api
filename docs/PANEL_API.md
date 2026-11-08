@@ -386,7 +386,11 @@ Claude `routing.quota` 的 5h/7d 闸分三段（`critical_band` 默认 0.05，`g
 
 `/api-keys` 是“我的密钥”接口：所有面板角色（包括管理员）均只列出当前认证用户自己的密钥，数量统计使用相同范围；查询参数不能切换属主。创建和修改时忽略调用方的 `user_id`，以认证用户为准。stats、reveal、rotate、reset-quota、PATCH 和 DELETE 对他人的或不存在的密钥统一返回 404。Master 机器凭证仅管理无用户归属的平台密钥，不能通过这些接口读取或修改用户密钥；缺失用户 ID 的面板会话不匹配任何密钥，创建返回 403 `key_owner_required`。本接口不提供全站用户密钥管理。
 
-创建密钥只在响应里明文出现一次。存储为 HMAC 索引。`group_type` 为 `all`（默认，全局可调度）、`anthropic` 或 `openai`。后两个必须带 `allowed_vms`（该平台的 VM id，可多台）。`vm_pool_id` 绑定命名账号池：成员以池为准，不复制到密钥；`allowed_vms` 被清空。池停用、为空或不存在时请求返回 403 `vm_pool_unavailable`，不回落到全局池。改成员或解除绑定对下一次请求生效，包括已有粘性会话。一台槽只属于一个池。缺字段的旧密钥视为 `all`。`GET /api-keys/:id/stats` 是该密钥近 30 天用量：上海日桶、模型分布、VM 分布。不是 VM 的上游额度窗口。
+创建密钥只在响应里明文出现一次。存储为 HMAC 索引。`group_type` 为 `all`（默认，全局可调度）、`anthropic` 或 `openai`。后两个必须带 `allowed_vms`（该平台的 VM id，可多台）。`vm_pool_id` 绑定命名账号池：成员以池为准，不复制到密钥；`allowed_vms` 被清空。池停用、为空或不存在时请求返回 403 `vm_pool_unavailable`，不回落到全局池。改成员或解除绑定对下一次请求生效，包括已有粘性会话。一台槽只属于一个池。缺字段的旧密钥视为 `all`。
+
+`allowed_models`（字符串数组，可选）是密钥级模型白名单：创建和 PATCH 都可带，去首尾空白、去空项、按不分大小写去重（保留第一次的写法），最多 200 个、每个不超过 128 字符；不是字符串数组、超数或超长返回 400 `invalid_allowed_models`。`[]` 或 `null` 表示不限（默认，迁移 054 前的旧密钥也是 `[]`）；PATCH 不带这个字段则保持原值。租户和管理员都能给自己的密钥设置。判断用客户端请求里写的模型名，在任何模型映射、别名、拦截规则改写之前，精确匹配、不分大小写；Claude Code 的客户端后缀 `[1m]`（1M 上下文开关，不是模型名）两边都会去掉再比较，所以写 `claude-opus-5-5` 也放行 `claude-opus-5-5[1m]`。不做前缀或日期快照的归并，带日期的快照名要单独列出。名单外的请求在调度前直接返回 400 `api_key_model_not_allowed`（`invalid_request_error`，`param: "model"`；`/v1/messages` 带顶层 `type: "error"`），覆盖 `/v1/messages`、`/v1/chat/completions`、`/v1/completions`、`/v1/responses`（含 WebSocket）、`/v1/alpha/search`、`/v1/images/*`；设了名单的密钥调用 `/v1/images/*` 必须写明 `model`。`GET /v1/models` 对设了名单的密钥只列名单内的 id。槽位级 `policy.allowed_models` 不受影响，两者同时生效。Master 密钥不受限。
+
+`GET /api-keys/:id/stats` 是该密钥近 30 天用量：上海日桶、模型分布、VM 分布。不是 VM 的上游额度窗口。
 
 attempts：每次选中的 VM/账号、错误域、cooldown、提交边界、终态。`normal` 摘要；`debug` 另存入站原文及脱敏出站数据。`outbound_body` 仍为最后一次真正 POST 给 worker 的 envelope body，Node → worker 的头为 `worker_envelope_headers`。`outbound_headers_source=cli_final` 表示 `outbound_headers` 来自 cli-node 完成组装、CCH 和长度处理后的最终 fetch 调用边界；不包含底层补的 Host / HTTP/2 伪头，凭证及未知自定义头值已在 CLI 脱敏。每次重试覆盖，最后一次尝试未回传则 source=`unavailable`、headers=null，绝不以 envelope 代替。旧记录没有 source，原值不能视作最终值。最终 HTTP body 字节仍不在日志里。该功能需升级 Node、web 与 cli-node，旧 CLI 不支持回传。`X-Request-ID` 回写。`X-Kin-Debug` / `X-Kin-Log` 可单请求覆盖，但出站数据仅按管理员配置的 debug 采样保存。
 
@@ -592,4 +596,4 @@ sessionKey / 授权码导入必须走该槽 SOCKS5。
 
 ## 管理口（master）
 
-常用：`GET/PUT /admin/routing`、`GET /admin/vms`、`POST /admin/vms/probe-all`、`GET /admin/usage/summary`、`GET /admin/vm/oauth`、`POST /admin/vm/oauth/refresh`、`GET/PUT/DELETE /admin/intercept/rules`。`POST /admin/models/refresh` 只读本地策略目录、回完整目录，不 hop 槽位；`GET /v1/models` 同样不 hop，但按密钥 `group_type` 过滤。`GET/POST /admin/vm/claude-code/*` 返回 410。
+常用：`GET/PUT /admin/routing`、`GET /admin/vms`、`POST /admin/vms/probe-all`、`GET /admin/usage/summary`、`GET /admin/vm/oauth`、`POST /admin/vm/oauth/refresh`、`GET/PUT/DELETE /admin/intercept/rules`。`POST /admin/models/refresh` 只读本地策略目录、回完整目录，不 hop 槽位；`GET /v1/models` 同样不 hop，但按密钥 `group_type` 和 `allowed_models` 过滤。`GET/POST /admin/vm/claude-code/*` 返回 410。
