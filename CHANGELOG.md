@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- 测试模型和内核说明按当前内核区分：cli-node 仍写明老 cli-hop（`-p`、bypassPermissions、20 槽）；CRAG v2 显示 CRAG 内核，不再标成 cli-hop。
 - 槽位完整页可改创建时的自定义名称。VM 编号仍是创建时的编号，改名称不换编号、不重启槽。
 - 性能：`routing.json` 热路径统一经 `readFileVerifiedCached` / `readJsonParsedCached` 读盘并复用稳定内容的解析结果；`applyCrsUnofficialPersona` 单次调用只解析一次。同源字节在元数据未变时仍每次读盘校验，保持 scp/面板「下一请求生效」语义；逐调用方错误回落不变。 [#925](https://github.com/dofastted/vm2api/issues/925)（REQ-0925）
 - Infrastructure: PR/main `ci` 对仅改 `README.md`、`CHANGELOG.md`、`docs/**`、`VERSION` 的变更走 docs-lite（format/syntax；跳过 unit/go/web、native 打包单测与 `arm64-native-cli`）；业务 PR 仍跑满门，且 `test:unit`、Go 与 web 并行以缩短墙钟（REQ-CI-1.4）。

@@ -14,9 +14,8 @@ import {
 import { TabsContent } from '@/components/ui/tabs'
 import { Textarea } from '@/components/ui/textarea'
 import {
-  DATAPLANE_HINT,
-  HOP_TRANSPORT_LABEL,
-  dataplaneLabel,
+  kernelRouteHint,
+  kernelRouteLabel,
 } from '@/features/vm/dataplane-contract'
 import { TestChatResultCard } from '@/features/vm/test-chat-result-card'
 import type { TestChatResult } from '@/features/vm/test-chat-types'
@@ -31,6 +30,7 @@ type VmTestTabProps = {
   credType: CredType
   isCodex?: boolean
   dataplane?: string | null
+  cragKernelVersion?: 'legacy' | 'v2' | null
   result: TestChatResult | null
   running: boolean
   modelsRefreshing: boolean
@@ -73,6 +73,7 @@ export function VmTestPanel(props: VmTestTabProps & { className?: string }) {
     credType,
     isCodex = false,
     dataplane,
+    cragKernelVersion,
     result,
     running,
     modelsRefreshing,
@@ -172,8 +173,8 @@ export function VmTestPanel(props: VmTestTabProps & { className?: string }) {
             <div className='space-y-1'>
               <Label>内核</Label>
               <p className='text-xs text-muted-foreground'>
-                {HOP_TRANSPORT_LABEL} · {dataplaneLabel(dataplane)}。
-                {DATAPLANE_HINT}
+                {kernelRouteLabel(dataplane, cragKernelVersion)}。
+                {kernelRouteHint(dataplane, cragKernelVersion)}
               </p>
             </div>
           )}

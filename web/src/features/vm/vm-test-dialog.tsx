@@ -22,6 +22,7 @@ function TestBody({ vm }: { vm: Vm }) {
       credType={credTypeOf(vm)}
       isCodex={isCodexVm(vm)}
       dataplane={vm.resolved_dataplane}
+      cragKernelVersion={vm.resolved_crag_kernel_version}
       schedule={<VmTestSchedule key={vm.id} vm={vm} {...chat} />}
     />
   )

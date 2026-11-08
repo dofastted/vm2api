@@ -1,5 +1,4 @@
 import type { InferenceEngine } from '@/types/panel-vm'
-import { HOP_TRANSPORT_LABEL } from '@/features/vm/dataplane-contract'
 
 export const DEFAULT_RESOLVED_ENGINE: InferenceEngine = 'rust'
 
@@ -8,7 +7,7 @@ export const INFERENCE_ENGINE_OPTIONS: {
   label: string
 }[] = [
   { value: 'auto', label: '自动（继承 rust）' },
-  { value: 'rust', label: HOP_TRANSPORT_LABEL },
+  { value: 'rust', label: 'Rust' },
 ]
 
 export function normalizeInferenceEngine(
@@ -37,7 +36,7 @@ export function isFallbackToGo(_value: unknown): boolean {
 export function inferenceEngineLabel(
   value: InferenceEngine | null | undefined
 ) {
-  if (value === 'go') return HOP_TRANSPORT_LABEL
+  if (value === 'go') return 'Rust'
   return (
     INFERENCE_ENGINE_OPTIONS.find((option) => option.value === value)?.label ||
     '未知'
