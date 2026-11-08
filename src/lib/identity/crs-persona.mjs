@@ -32,6 +32,7 @@
 import { createHash } from 'node:crypto'
 import { resolveWorkstationProfile } from './workstation-profile.mjs'
 import fs from 'node:fs'
+import { readJsonParsedCached } from '../vm/vm-file.mjs'
 import { uuidFromSeed } from './identity-rewrite.mjs'
 import { OFFICIAL_CLI_VERSION } from './vm-identity.mjs'
 import { CCH_PLACEHOLDER } from './cch.mjs'
@@ -1200,7 +1201,8 @@ export function personaExpansionToolsFromRouting(routing = {}) {
 export function personaExpansionFromRoutingFile(filePath) {
   if (!filePath) return { mode: DEFAULT_PERSONA_EXPANSION, extraNames: [] }
   try {
-    const routing = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+    const routing = readJsonParsedCached(filePath)
+    if (!routing) return { mode: DEFAULT_PERSONA_EXPANSION, extraNames: [] }
     return {
       mode: personaExpansionFromRouting(routing),
       extraNames: personaExpansionToolsFromRouting(routing),
@@ -1220,7 +1222,8 @@ export const PERSONA_STANDING_MAX = 800
 export function standingConstraintFromRoutingFile(filePath) {
   if (filePath) {
     try {
-      const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'))?.compatibility?.persona_standing
+      const routing = readJsonParsedCached(filePath)
+      const raw = routing?.compatibility?.persona_standing
       const text = String(raw ?? '').trim()
       if (text) return text.slice(0, PERSONA_STANDING_MAX)
     } catch {
@@ -1430,7 +1433,11 @@ export function personaOptionsFromRoutingFile(filePath) {
     return { mode: DEFAULT_PERSONA_MODE, park: DEFAULT_PERSONA_PARK, agent: DEFAULT_PERSONA_AGENT }
   }
   try {
-    return personaOptionsFromRouting(JSON.parse(fs.readFileSync(filePath, 'utf8')))
+    const routing = readJsonParsedCached(filePath)
+    if (!routing) {
+      return { mode: DEFAULT_PERSONA_MODE, park: DEFAULT_PERSONA_PARK, agent: DEFAULT_PERSONA_AGENT }
+    }
+    return personaOptionsFromRouting(routing)
   } catch {
     return { mode: DEFAULT_PERSONA_MODE, park: DEFAULT_PERSONA_PARK, agent: DEFAULT_PERSONA_AGENT }
   }
@@ -1498,7 +1505,9 @@ export function personaTemplateSettingsFromRouting(routing = {}) {
 export function personaTemplateSettingsFromRoutingFile(filePath) {
   if (!filePath) return personaTemplateSettingsFallback()
   try {
-    return personaTemplateSettingsFromRouting(JSON.parse(fs.readFileSync(filePath, 'utf8')))
+    const routing = readJsonParsedCached(filePath)
+    if (!routing) return personaTemplateSettingsFallback()
+    return personaTemplateSettingsFromRouting(routing)
   } catch {
     return personaTemplateSettingsFallback()
   }
@@ -1725,7 +1734,9 @@ export function detectProxiedOfficialCcFromRouting(routing = {}) {
 export function detectProxiedOfficialCcFromRoutingFile(filePath) {
   if (!filePath) return true
   try {
-    return detectProxiedOfficialCcFromRouting(JSON.parse(fs.readFileSync(filePath, 'utf8')))
+    const routing = readJsonParsedCached(filePath)
+    if (!routing) return true
+    return detectProxiedOfficialCcFromRouting(routing)
   } catch {
     return true
   }
@@ -2210,17 +2221,27 @@ export function applyCrsUnofficialPersona(
   // Looking like Claude Code is not passthrough. The handler sets officialClient
   // only when routing.compatibility.official_cc_passthrough is on.
   if (!forceConfigured && officialClient) return body
-  const fromFile = routingFile ? personaOptionsFromRoutingFile(routingFile) : null
+  let fromFile = null
+  let fileSettings = personaTemplateSettingsFallback()
+  let routing = null
+  if (routingFile) {
+    try {
+      routing = readJsonParsedCached(routingFile)
+      if (routing) {
+        fromFile = personaOptionsFromRouting(routing)
+        fileSettings = personaTemplateSettingsFromRouting(routing)
+      } else {
+        fromFile = { mode: DEFAULT_PERSONA_MODE, park: DEFAULT_PERSONA_PARK, agent: DEFAULT_PERSONA_AGENT }
+      }
+    } catch {
+      routing = null
+      fromFile = { mode: DEFAULT_PERSONA_MODE, park: DEFAULT_PERSONA_PARK, agent: DEFAULT_PERSONA_AGENT }
+      fileSettings = personaTemplateSettingsFallback()
+    }
+  }
   const resolved = normalizePersonaMode(mode ?? fromFile?.mode)
   // Read the caller's agent prompt before stripLeakySystem drops it as known official text.
   const rawCallerAgent = extractCallerAgentPrompt(body.system)
-  const fileSettings = personaTemplateSettingsFromRoutingFile(routingFile)
-  let routing = null
-  try {
-    routing = routingFile ? JSON.parse(fs.readFileSync(routingFile, 'utf8')) : null
-  } catch {
-    routing = null
-  }
   const resolvedEntrypoint =
     entrypoint === 'cli' || entrypoint === 'sdk-cli' ? entrypoint : ccEntrypointFromRouting(routing)
   const hopPreset = mode != null ? personaPresetFromHopMode(mode) : null
