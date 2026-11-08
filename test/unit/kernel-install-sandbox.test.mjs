@@ -11,8 +11,9 @@ import {
 const profileUrl = new URL('../../src/lib/vm/crag-v2-seccomp.json', import.meta.url)
 const profile = JSON.parse(fs.readFileSync(profileUrl, 'utf8'))
 const native = { id: 'vm-13', dataplane: 'crag', crag_kernel_version: 'v2' }
-const output = (securityOpts, restart = 'unless-stopped') =>
-  `false|0|kin-eg-local||kin-os/ubuntu:24.04|existing-host|docker||false|${restart}|${JSON.stringify(securityOpts)}`
+const output = (securityOpts, restart = 'unless-stopped', init = 'true') =>
+  `false|0|kin-eg-local||kin-os/ubuntu:24.04|existing-host|docker||false|${restart}|${JSON.stringify(securityOpts)}|${init}`
+
 const reorderedProfile = Object.fromEntries(Object.entries(profile).reverse())
 
 test('later native manual start upgrades a default or unconfined container but keeps the exact narrow sandbox', () => {

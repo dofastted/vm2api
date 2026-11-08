@@ -183,6 +183,7 @@ function parseInspectStdout(name, stdout) {
     restarting,
     restartPolicy,
     securityOpts,
+    init,
   ] = stdout.split('|')
   // Docker reports Running=true during a restart-policy backoff; nothing can be exec'd there.
   const crashLooping = restarting === 'true'
@@ -200,11 +201,12 @@ function parseInspectStdout(name, stdout) {
     role: String(role || '').trim() || null,
     restartPolicy: restartPolicy || null,
     securityOpts: securityOpts ? JSON.parse(securityOpts) : [],
+    init: init === 'true',
   }
 }
 
 const INSPECT_FORMAT =
-  '{{.State.Running}}|{{.State.Pid}}|{{.HostConfig.NetworkMode}}|{{.State.StartedAt}}|{{.Config.Image}}|{{.Config.Hostname}}|{{index .Config.Labels "kin.vm.runtime"}}|{{index .Config.Labels "kin.vm.role"}}|{{.State.Restarting}}|{{.HostConfig.RestartPolicy.Name}}|{{json .HostConfig.SecurityOpt}}'
+  '{{.State.Running}}|{{.State.Pid}}|{{.HostConfig.NetworkMode}}|{{.State.StartedAt}}|{{.Config.Image}}|{{.Config.Hostname}}|{{index .Config.Labels "kin.vm.runtime"}}|{{index .Config.Labels "kin.vm.role"}}|{{.State.Restarting}}|{{.HostConfig.RestartPolicy.Name}}|{{json .HostConfig.SecurityOpt}}|{{.HostConfig.Init}}'
 
 /**
  * @returns {{ status: 'found', container: object } | { status: 'missing' } | { status: 'error', error: string, code?: number }}
@@ -267,7 +269,7 @@ export function nativeSlotSandboxNeedsRecreate(existing, vm, routing = {}, optio
   })
   if (!seccompOk) return true
   const restricted = options.userNamespaceRestricted ?? apparmorUserNamespaceRestricted()
-  return restricted && !opts.includes('apparmor=unconfined')
+  return (restricted && !opts.includes('apparmor=unconfined')) || existing.init !== true
 }
 
 /** Migrate existing local slots in place, including paused ones; never start or recreate them. */
@@ -1225,6 +1227,10 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
       '/tmp:rw,noexec,nosuid,size=32m',
       '--security-opt',
       'no-new-privileges',
+      ...(resolveKernelDataplane(vm, resolvedRouting) === 'crag' &&
+      resolveCragKernelVersion(vm, resolvedRouting) === 'v2'
+        ? ['--init']
+        : []),
       ...(resolveKernelDataplane(vm, resolvedRouting) === 'crag' &&
       resolveCragKernelVersion(vm, resolvedRouting) === 'v2'
         ? [
