@@ -1635,20 +1635,17 @@ export function createHandleProtocol(deps) {
             const outboundProfile = profileForPreset(resolvedPersona)
             // Render once from caller input with the selected slot's identity, not the pre-selection environment.
             if (!requestContext && !officialPassthrough) {
-              hopBody = applyCrsUnofficialPersona(
-                prepareCliPersonaInput(shallowCopyBody(personaIn, { omit: ['cache_control'] }), resolvedPersona),
-                {
-                  forceConfigured: true,
-                  routingFile: routingConfigPath,
-                  cacheTtl: requestedCacheTtl,
-                  mode: resolvedPersona,
-                  sessionId: attemptSessionId,
-                  model: hopBody?.model,
-                  cliVersion: outboundProfile.cliVersion,
-                  identity,
-                  entrypoint: entrypointNow,
-                },
-              )
+              hopBody = applyCrsUnofficialPersona(prepareCliPersonaInput(shallowCopyBody(personaIn), resolvedPersona), {
+                forceConfigured: true,
+                routingFile: routingConfigPath,
+                cacheTtl: requestedCacheTtl,
+                mode: resolvedPersona,
+                sessionId: attemptSessionId,
+                model: hopBody?.model,
+                cliVersion: outboundProfile.cliVersion,
+                identity,
+                entrypoint: entrypointNow,
+              })
               // The re-render starts from the raw caller body; re-apply this account's thinking ownership to it.
               hopBody = filterThinkingForAccount(hopBody, selected.accountId, thinkingOwnerStore).body
               for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
