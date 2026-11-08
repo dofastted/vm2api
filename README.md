@@ -5,7 +5,7 @@
 ### 完全隔离的虚拟机级 AI 订阅转 API 生产网关
 **Next-Generation Fully Isolated VM-Level AI Subscription-to-API Gateway**
 
-[![Release](https://img.shields.io/badge/Release-v1.3.133-blue.svg?style=for-the-badge&logo=github)](https://github.com/dofastted/vm2api/releases)
+[![Release](https://img.shields.io/badge/Release-v1.4.053-blue.svg?style=for-the-badge&logo=github)](https://github.com/dofastted/vm2api/releases)
 [![License](https://img.shields.io/badge/License-Noncommercial-amber.svg?style=for-the-badge)](LICENSE)
 [![Benchmarks](https://img.shields.io/badge/Benchmarks-Clean%20Verified-00C853?style=for-the-badge&logo=shield)](docs/benchmarks/README.md)
 [![Cluster](https://img.shields.io/badge/Cluster-Multi--VPS%20Ready-7928CA?style=for-the-badge&logo=docker)](docs/DEPLOY.md)
@@ -66,7 +66,7 @@
 
 在当今大模型服务中，直接使用第三方逆向脚本或共享代理极易触发风控导致封号、降权与服务中断。**vm2api** 是业界领先的虚拟机级 API 转换中继系统：
 
-- **支持平台**：全面支持 **Anthropic (Claude Pro / Team / Enterprise / Max)** 以及 **OpenAI (ChatGPT / Codex)** 订阅转标准 API。
+- **支持平台**：全面支持 **Anthropic (Claude Pro / Team / Enterprise / Max)** 以及 **OpenAI (ChatGPT / Codex)** 订阅转标准 API；另支持在管理台配置 **Anthropic / OpenAI 官方 API 端点**，用 `api` 类密钥直连上游（不占用 OAuth / Codex 槽位）。
 - **真实载体**：Anthropic 采用官方客户端在隔离 VM / 容器内运行**真实系统进程**，而非第三方伪造 HTTP 模拟。
 - **全链路拟真**：从物理机硬件指纹（SMBIOS、MAC、Machine-ID）到独立 SOCKS5 / 本地网络出口，全方位还原真实开发者电脑环境。
 - **极简集成**：向上游输出标准 OpenAI `/v1/chat/completions`、`/v1/responses` 与 Anthropic `/v1/messages` 兼容接口，任何支持标准 API 的前端、Agent 或应用均可无缝接入。
@@ -74,16 +74,14 @@
 
 ## 🆕 近期更新
 
-对照 **1.3.133**。自 1.3.122 起，调用方能直接碰到的变化如下。明细和升级注意见 [CHANGELOG.md](CHANGELOG.md)，操作说明见 [入门文档](https://vm2api.fkcodex.com/zh/)。
+对照 **1.4.053**（`main` 当前版本）。下列为 1.4.038–1.4.053 已上线、调用方或管理员能直接感知的变化摘要；完整条目与升级注意见 [CHANGELOG.md](CHANGELOG.md)，操作说明见 [入门文档](https://vm2api.fkcodex.com/zh/)。
 
-- **遥测**只认种子里的 `telemetry_disabled === false`。虚拟机页的遥测开关与这项一致，默认开时显示为开；非必要流量和 DNT 跟着它走，不能单独拨。
-- **入门文档**放在控制台左上角 GitHub 右侧，打开 [vm2api.fkcodex.com/zh](https://vm2api.fkcodex.com/zh/)。
-- **封控拦截**收成管理台「风险审计」。进槽前按蒸馏 → 硬正则 → 拒答缓存 → 决策模型依次拦，过关才出站。见 [下文](#3️⃣-封控拦截与风险审计) 与 [docs/RISK.md](docs/RISK.md)。
-- **本地代理**是槽位所在 VPS 的出口，不是控制面自己的网卡。集群节点上，控制面代发的换票、刷新、测试对话和地理检测也从该节点出去；节点没连上就失败，不改走控制面直连。
-- **模型**页改为卡片矩阵。`claude-haiku-5-5` 的默认上下文、`max_tokens` 和输出上限是 100K；已经改过的管理员值不会被重置。
-- **托管密钥**可以限定平台（全部 / Anthropic / OpenAI）和勾选的槽。打到范围外返回 403。
-- **流空闲**默认 180 秒，在「重试与切号」里改。长工具参数可打开流式下发，避免静默超时。
-- **cli-node** 本机交付文件已换成 2.1.303：`share/wrap-cli/cli-node`，UPX 后 27,932,800 字节，SHA256 `ae120fa09a61d6ba7afa3bb57e8e389a0183c4d2026957607143d9b39562c421`。构建基线 `bbadf5d4`。payload 尚未更新，线上槽位未部署。
+- **内容脱敏（可选）**：设置 →「脱敏」页（`/console/#/settings/redaction`）可配置凭据、个人信息与自定义规则；默认关闭。启用需本机 `bin/kin-redact`，helper 未就绪时不能保存为开启，请求也不会回落明文。
+- **API 直连**：管理台 API 配置统一到 `#/api`；`api` 类密钥按端点协议调度上游，不经 OAuth / Codex 槽位。Anthropic 端点可单独开关「风控前置审查」。
+- **协议与计费**：官方 Claude Code 透传、缓存断点 TTL 与 `max_tokens` 默认值（如 Haiku 5.5 为 100K）与面板一致；GPT Image 模型可在 Chat / Responses 路径出图；第三方计费限制类上游错误写入拒答缓存（`refusal_guard`）。
+- **封控与配额**：决策模型支持多组 URL / Key；托管密钥可 `GET /v1/me/quota` 与 `GET /v1/me/usage`；租户可看用量统计，虚拟机只读（无代理与重新授权）。
+- **面板与运维**：按角色隐藏无权页面；槽位官方登录执行 `claude auth login`；平滑停机时 `/health` 返回 503 `shutting_down`；控制面升级多为更新镜像并重启（多数版本不必 `wrap-cli/sync` 或换 payload，勿覆盖 `routing.json`、`vms/`、`data/`、`.env`）。
+- **集群**：支持运行中 / 冷迁移 Linux KVM 槽与内存扩容，见 [槽位迁移说明](docs/slot-migration.md)。
 
 ---
 
@@ -217,10 +215,12 @@ docker compose pull && docker compose up -d
 
 服务启动后，系统暴露统一服务端口（默认 `8787`）：
 
-- **可视化管理面板**：`http://<您的IP>:8787/console`（默认账号：`admin` / 密码：`123456` 或自定义环境变量）
-- **服务健康探活**：`GET http://<您的IP>:8787/health`
+- **登录与管理台**：`http://<您的IP>:8787/cc#/login`（亦可用 `http://<您的IP>:8787/console` 进入欢迎页后点「登录」）。默认账号 `admin` / `123456`，或由 `.env` 中 `VM2API_ADMIN_USER` / `VM2API_ADMIN_PASSWORD` 指定。
+- **服务健康探活**：`GET http://<您的IP>:8787/health`（升级排空期间可能返回 503 `shutting_down`）
 - **Anthropic 协议调用**：`POST http://<您的IP>:8787/v1/messages`
 - **OpenAI 兼容协议**：`POST http://<您的IP>:8787/v1/chat/completions`
+
+生产环境升级与面板一键更新见 [docs/DEPLOY.md](docs/DEPLOY.md) 或 `curl …/deploy/install.sh | sudo bash -s -- upgrade`。
 
 ```bash
 # 调用示例（以 Anthropic 原生接口为例）
@@ -229,7 +229,7 @@ curl -sS http://127.0.0.1:8787/v1/messages \
   -H "content-type: application/json" \
   -d '{
     "model": "claude-sonnet-5-5",
-    "max_tokens": 128000,
+    "max_tokens": 8192,
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 ```
@@ -245,7 +245,8 @@ vm2api 内置全栈自适应网关，原生支持以下所有主流生态：
 | `/v1/messages` | Anthropic Messages API | Claude 官方 SDK、Cursor、Continue、LibreChat、Roo Code |
 | `/v1/chat/completions` | OpenAI Chat API | NextChat、Open WebUI、Lobechat、LangChain、AutoGPT |
 | `/v1/responses` | OpenAI Responses API | 新一代结构化智能体与高级编码工具生态 |
-| `/v1/models` | 标准模型列表 API | 按密钥 `group_type` 列出可调度模型：`openai` 仅 GPT，`anthropic` 仅 Claude，`all` 与 master 两者都列 |
+| `/v1/models` | 标准模型列表 API | 订阅密钥按 `group_type` 过滤（`openai` / `anthropic` / `all`）；`api` 类密钥按所配端点协议列出上游模型 |
+| `/v1/images/*` | OpenAI Images API | GPT Image 系列；亦可通过 Chat / Responses 图像桥接调用 |
 
 ---
 
@@ -279,26 +280,24 @@ vm2api 内置全栈自适应网关，原生支持以下所有主流生态：
 
 Traditional methods of converting AI subscriptions into API endpoints via simple reverse proxies frequently result in immediate account suspensions, stealth downgrades, and token corruption. **vm2api** is an enterprise-grade virtual machine gateway designed for ultra-reliable subscription-to-API infrastructure:
 
-- **Universal Support**: Seamlessly converts **Anthropic (Claude Pro / Team / Enterprise / Max)** and **OpenAI (ChatGPT / Codex)** subscriptions into robust standard APIs.
+- **Universal Support**: Seamlessly converts **Anthropic (Claude Pro / Team / Enterprise / Max)** and **OpenAI (ChatGPT / Codex)** subscriptions into robust standard APIs. **Direct API** keys (`api` category) call configured Anthropic / OpenAI upstream endpoints without OAuth or Codex slots.
 - **Genuine Client Process**: Runs the **authentic official Claude Code CLI system process** inside an isolated VM / container instance instead of fragile HTTP emulation.
 - **High-Fidelity Emulation**: From physical SMBIOS, NIC MAC, and Machine-ID to dedicated per-slot network egress and pre-hop risk gates.
 - **Standard Compatibility**: Provides drop-in replacements for Anthropic `/v1/messages` and OpenAI `/v1/chat/completions` / `/v1/responses`.
 
 
-## Recent changes (1.3.133)
+## Recent changes (1.4.053)
 
-Since 1.3.122, the caller-visible changes are:
+Shipped in **1.4.038–1.4.053** on `main` (summary only; see [CHANGELOG.md](CHANGELOG.md) for upgrade notes):
 
-- **Telemetry** reads only `telemetry_disabled === false`. The VM switch matches that bit and is on for the default; nonessential traffic and DNT follow it.
-- **Intro docs** sit to the right of GitHub in the console sidebar and open [vm2api.fkcodex.com/zh](https://vm2api.fkcodex.com/zh/).
-- **Risk gates** run before a slot is chosen: distill, hard regex, refusal cache, decision model, then egress. See [below](#3️⃣-pre-hop-risk-gates) and [docs/RISK.md](docs/RISK.md).
-- **Local proxy** is the VPS that owns the slot. On a cluster node, ticket refresh, test chat, and geo also leave through that node. A disconnected node fails instead of falling back to the control plane.
-- **Models** are a card matrix. Haiku 5.5 defaults to a 100K context and output cap; an admin override is kept.
-- **Keys** can be limited to Anthropic or OpenAI and to selected slots. A call outside that scope returns 403.
-- **Stream idle** defaults to 180 seconds under retry settings. Long tool arguments can be streamed.
-- **cli-node** local delivery is now 2.1.303: `share/wrap-cli/cli-node`, 27,932,800 bytes after UPX, SHA256 `ae120fa09a61d6ba7afa3bb57e8e389a0183c4d2026957607143d9b39562c421`. Built from `bbadf5d4`. The payload and live slots are unchanged.
+- **Redaction (optional)**: Settings → Redaction (`/console/#/settings/redaction`). Off by default; requires local `bin/kin-redact`—no plaintext fallback when the helper is missing.
+- **Direct API**: Panel API config at `#/api`; `api` keys route to upstream by endpoint protocol, not OAuth/Codex slots. Anthropic endpoints can enable pre-hop risk review separately.
+- **Protocol & billing**: Official Claude Code passthrough, cache TTL, and default `max_tokens` align with the panel; GPT Image works via Chat/Responses; upstream third-party billing limits map to `refusal_guard` + refusal cache.
+- **Gates & tenants**: Decision model supports multiple URL/key sets; keys expose `GET /v1/me/quota` and `GET /v1/me/usage`; tenant stats and read-only VM views.
+- **Panel & ops**: Role-based page access; slot login runs `claude auth login`; draining upgrades expose 503 on `/health`. Most upgrades are image + restart—do not overwrite `routing.json`, `vms/`, `data/`, or `.env`.
+- **Cluster**: Live and cold KVM slot migration plus RAM resize—[docs/slot-migration.md](docs/slot-migration.md).
 
-Details: [CHANGELOG.md](CHANGELOG.md). Guide: [vm2api.fkcodex.com/zh](https://vm2api.fkcodex.com/zh/).
+Guide: [vm2api.fkcodex.com/zh](https://vm2api.fkcodex.com/zh/).
 
 ---
 
@@ -382,12 +381,17 @@ Open a hit and read the body. A false positive means tighten that gate, not dele
 ```bash
 # Recommended one-line installation on Ubuntu 24.04 LTS
 curl -sSL https://raw.githubusercontent.com/dofastted/vm2api/main/deploy/install.sh | sudo bash
+
+# Upgrades
+curl -sSL https://raw.githubusercontent.com/dofastted/vm2api/main/deploy/install.sh | sudo bash -s -- upgrade
 ```
 
 After deployment, access:
-- **Management Console**: `http://<YOUR_IP>:8787/console`
-- **Health Check**: `http://<YOUR_IP>:8787/health`
+- **Login / console**: `http://<YOUR_IP>:8787/cc#/login` (or `/console` welcome → Sign in). Default `admin` / `123456` unless set in `.env`.
+- **Health Check**: `http://<YOUR_IP>:8787/health` (may return 503 `shutting_down` during drain)
 - **API Endpoint**: `POST http://<YOUR_IP>:8787/v1/messages`
+
+See [docs/DEPLOY.md](docs/DEPLOY.md) for panel one-click updates and compose workflows.
 
 ---
 
@@ -405,7 +409,17 @@ Before opening an issue, follow [ISSUE_GUIDE.md](ISSUE_GUIDE.md): version, repro
 
 ## 💬 交流与赞助支持 / Community & Sponsorship
 
-开源与持续维护离不开社区大家的支持与反馈。如果您觉得 **vm2api** 为您的业务或学习带来了实质帮助， 交流群或请作者喝杯咖啡！
+开源与持续维护离不开社区支持与反馈。欢迎加入开发者群交流部署与使用问题；若 **vm2api** 对您有帮助，也可请作者喝杯咖啡。
+
+### 开发者交流群 / Developer community
+
+Telegram 群组 **[t.me/VM2API](https://t.me/VM2API)**（`@VM2API`）：部署排障、版本升级与使用讨论。商业授权亦可通过该账号联系。
+
+<div align="center">
+  <img src="docs/images/tg-vm2api.jpg" alt="Telegram 开发者群 @VM2API" width="220" style="border-radius: 12px; margin: 8px 0;" />
+</div>
+
+### 赞助 / Sponsorship
 
 <div align="center">
   <table style="border-collapse: separate; border-spacing: 20px; background: transparent;">
