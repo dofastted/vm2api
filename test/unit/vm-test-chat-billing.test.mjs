@@ -233,8 +233,8 @@ test('runVmTestChat reports cli-hop when slot engine is rust', async (t) => {
   assert.equal(result.debug.inbound_class, 'cli_hop_passthrough')
   assert.equal(calls[0].headers['user-agent'], 'kin-console-test/1.0')
   assert.equal(calls[0].body.system, undefined)
-  assert.ok(result.log.some((l) => /cli-hop cli-node/.test(l.message)))
-  assert.ok(result.log.some((l) => /cli-node cli-hop · CLI 官方提示词/.test(l.message)))
+  assert.ok(result.log.some((l) => /cli-node \+ wrap kernel/.test(l.message)))
+  assert.ok(result.log.some((l) => /cli-hop · CLI 官方提示词/.test(l.message)))
 })
 
 test('runVmTestChat reports crag dataplane when routing says crag', async (t) => {
@@ -270,7 +270,7 @@ test('runVmTestChat reports crag dataplane when routing says crag', async (t) =>
   })
   assert.equal(result.ok, true)
   assert.equal(result.dataplane, 'crag')
-  assert.ok(result.log.some((l) => /CRAG v2 内核/.test(l.message)))
+  assert.ok(result.log.some((l) => /CRAG v2 原生 worker/.test(l.message)))
   assert.equal(
     result.log.some((l) => /cli-hop/.test(l.message)),
     false,

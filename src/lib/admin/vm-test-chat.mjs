@@ -906,11 +906,13 @@ export async function runVmTestChat(opts = {}) {
   const dataplane = codex ? null : resolveKernelDataplane(vm, routing) || 'wrap'
   const cragVersion = dataplane === 'crag' ? resolveCragKernelVersion(vm, routing) : null
   const kernelRoute =
-    dataplane === 'crag'
-      ? `CRAG ${cragVersion === 'v2' ? 'v2' : 'legacy'} 内核`
-      : dataplane === 'cc'
-        ? 'cli-hop cc-node'
-        : 'cli-hop cli-node'
+    dataplane === 'crag' && cragVersion === 'v2'
+      ? 'CRAG v2 原生 worker'
+      : dataplane === 'crag'
+        ? 'cc-node + CRAG kernel'
+        : dataplane === 'cc'
+          ? 'cc-node + wrap kernel'
+          : 'cli-node + wrap kernel'
   push(
     'info',
     codex
@@ -961,8 +963,8 @@ export async function runVmTestChat(opts = {}) {
             ? ` · ${kernelRoute}`
             : cliHop
               ? cliLayout === 'identity'
-                ? ' · cli-node cli-hop · CLI 官方提示词'
-                : ' · cli-node cli-hop · 0注入'
+                ? ' · cli-hop · CLI 官方提示词'
+                : ' · cli-hop · 0注入'
               : unofficial
                 ? ' · 非官方 inference 入站'
                 : ' · 官方 Claude Code 入站'
