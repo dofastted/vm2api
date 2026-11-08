@@ -3,62 +3,60 @@
 # vm2api
 
 ### 完全隔离的虚拟机级 AI 订阅转 API 生产网关
+
 **Next-Generation Fully Isolated VM-Level AI Subscription-to-API Gateway**
 
-[![Release](https://img.shields.io/badge/Release-v1.3.133-blue.svg?style=for-the-badge&logo=github)](https://github.com/dofastted/vm2api/releases)
+[![Release](https://img.shields.io/badge/Release-v1.4.053-blue.svg?style=for-the-badge&logo=github)](https://github.com/dofastted/vm2api/releases)
 [![License](https://img.shields.io/badge/License-Noncommercial-amber.svg?style=for-the-badge)](LICENSE)
 [![Benchmarks](https://img.shields.io/badge/Benchmarks-Clean%20Verified-00C853?style=for-the-badge&logo=shield)](docs/benchmarks/README.md)
 [![Cluster](https://img.shields.io/badge/Cluster-Multi--VPS%20Ready-7928CA?style=for-the-badge&logo=docker)](docs/DEPLOY.md)
 
-<p align="center">
-  <a href="#-简体中文"><b>🇨🇳 简体中文</b></a> •
-  <a href="#-english"><b>🇬🇧 English</b></a> •
-  <a href="https://vm2api.fkcodex.com/zh/"><b>📖 入门文档</b></a> •
-  <a href="docs/技术路线.md"><b>🗺️ 技术路线</b></a> •
-  <a href="docs/DEPLOY.md"><b>🚀 部署指南</b></a> •
-  <a href="docs/benchmarks/README.md"><b>📊 干净度基准</b></a> •
-  <a href="#-交流与赞助支持--community--sponsorship"><b>☕ 支持捐赠</b></a>
-</p>
+[🇨🇳 简体中文](#-简体中文) | [🇬🇧 English](#-english) | [入门文档](https://vm2api.fkcodex.com/zh/) | [CHANGELOG](CHANGELOG.md) | [技术路线](docs/技术路线.md) | [部署指南](docs/DEPLOY.md)
 
----
-
-<img src="docs/images/brand-hero.png" alt="vm2api Hero Banner" width="100%" style="border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.4);" />
-
-<br/>
-
-<a href="https://proxylane.dev/zh-cn/isp-proxies?utm_source=vm2api&utm_medium=affiliate&utm_campaign=vm2api_sponsor_202610&utm_content=github_readme"><img src="docs/images/sponsor-proxylane.png" alt="ProxyLane（赞助商）" width="100%" /></a>
-
-**赞助商**：[ProxyLane](https://proxylane.dev/zh-cn/isp-proxies?utm_source=vm2api&utm_medium=affiliate&utm_campaign=vm2api_sponsor_202610&utm_content=github_readme) AI 账号专用的原生静态住宅 IP，Scamalytics 低欺诈评分，每个 IP 独享，不限流量，$3.90 起。一个槽位绑一个 IP：把 SOCKS5 `host:port:user:pass` 粘贴到「代理池」→「添加代理」即可。首次购买使用优惠码 `VM2API30` 享 7 折。
+**[部署安装](#部署安装) · [近期更新](#-近期更新) · [功能特性](#功能特性) · [界面预览](#界面预览) · [交流与支持](#-交流与赞助支持--community--sponsorship)**
 
 </div>
 
-<br/>
 
 > [!NOTE]
 > **vm2api** 专为高可靠 AI 订阅转化为生产级标准 API 设计。摒弃传统的简单 HTTP 逆向与易被封禁的公用代理方案，采用**全隔离虚拟机/容器环境 + 官方真实客户端进程常驻 + 真实硬件指纹拟真 + 单槽单独立网络出口 + 进槽前封控拦截**，实现真正稳定、长效、高并发的订阅转 API 基础设施。
+
+
+---
+
+## ❤️ 赞助商 / Sponsors
+
+<details>
+<summary>点击展开赞助商说明 · Click to expand</summary>
+
+<a href="https://proxylane.dev/zh-cn/isp-proxies?utm_source=vm2api&utm_medium=affiliate&utm_campaign=vm2api_sponsor_202610&utm_content=github_readme"><img src="docs/images/sponsor-proxylane.png" alt="ProxyLane（赞助商）" width="100%" /></a>
+
+**赞助商（ProxyLane）**：AI 账号专用的原生静态住宅 IP，Scamalytics 低欺诈评分，每个 IP 独享，不限流量，$3.90 起。一个槽位绑一个 IP：把 SOCKS5 `host:port:user:pass` 粘贴到「代理池」→「添加代理」即可。首次购买优惠码 `VM2API30` 享 7 折。详见 [ProxyLane](https://proxylane.dev/zh-cn/isp-proxies?utm_source=vm2api&utm_medium=affiliate&utm_campaign=vm2api_sponsor_202610&utm_content=github_readme)。
+
+</details>
 
 ---
 
 # 🇨🇳 简体中文
 
 ## 目录
-- [💡 项目概览](#-项目概览)
-- [🆕 近期更新](#-近期更新)
-- [🛡️ 九大核心特性（特色防封与拟真矩阵）](#️-九大核心特性特色防封与拟真矩阵)
-  - [0️⃣ 独家 0 提示词注入机制 & 改写引擎](#0️⃣-独家-0-提示词注入机制--改写引擎)
-  - [1️⃣ 真实拟真物理机环境](#1️⃣-真实拟真物理机环境)
-  - [2️⃣ 官方 Claude Code 真实进程转发](#2️⃣-官方-claude-code-真实进程转发)
-  - [3️⃣ 封控拦截与风险审计](#3️⃣-封控拦截与风险审计)
-  - [4️⃣ 完整的隔离网络环境（1 VM = 1 独立网络出口）](#4️⃣-完整的隔离网络环境1-vm--1-独立网络出口)
-  - [5️⃣ 前置协议清洗与多协议统一结构化](#5️⃣-前置协议清洗与多协议统一结构化)
-  - [6️⃣ 官方遥测（Telemetry）可控开关](#6️⃣-官方遥测telemetry可控开关)
-  - [7️⃣ 分布式集群系统（多 VPS 跨机舰队管理）](#7️⃣-分布式集群系统多-vps-跨机舰队管理)
-  - [8️⃣ 完整的企业级 API 密钥与配额管理](#8️⃣-完整的企业级-api-密钥与配额管理)
-- [📊 干净度基准评测（Benchmarks）](#-干净度基准评测benchmarks)
-- [🚀 快速开始（生产部署）](#-快速开始生产部署)
-- [🔌 接口与协议兼容](#-接口与协议兼容)
-- [💬 交流与赞助支持](#-交流与赞助支持--community--sponsorship)
-- [📜 许可证与免责声明](#-许可证与免责声明--license)
+
+- [为什么选择 vm2api？](#为什么选择-vm2api)
+- [近期更新](#-近期更新)
+- [功能特性](#功能特性)
+- [界面预览](#界面预览)
+- [干净度基准（Benchmarks）](#-干净度基准评测benchmarks)
+- [部署安装](#部署安装)
+- [接口与协议兼容](#-接口与协议兼容)
+- [问题反馈](#-问题反馈--issue-reporting)
+
+---
+
+## 为什么选择 vm2api？
+
+- **订阅转标准 API**：Anthropic / OpenAI 订阅与可选 **API 直连**（`api` 类密钥）统一入口。
+- **虚拟机级拟真**：官方 Claude Code 真实进程、硬件指纹、单槽单出口，而非简单 HTTP 逆向。
+- **生产可运维**：进槽前封控、多 VPS 集群、租户与密钥体系；**升级以各版本 CHANGELOG 为准**。
 
 ---
 
@@ -66,7 +64,7 @@
 
 在当今大模型服务中，直接使用第三方逆向脚本或共享代理极易触发风控导致封号、降权与服务中断。**vm2api** 是业界领先的虚拟机级 API 转换中继系统：
 
-- **支持平台**：全面支持 **Anthropic (Claude Pro / Team / Enterprise / Max)** 以及 **OpenAI (ChatGPT / Codex)** 订阅转标准 API。
+- **支持平台**：全面支持 **Anthropic (Claude Pro / Team / Enterprise / Max)** 以及 **OpenAI (ChatGPT / Codex)** 订阅转标准 API；另支持在管理台配置 **Anthropic / OpenAI 官方 API 端点**，用 `api` 类密钥直连上游（不占用 OAuth / Codex 槽位）。
 - **真实载体**：Anthropic 采用官方客户端在隔离 VM / 容器内运行**真实系统进程**，而非第三方伪造 HTTP 模拟。
 - **全链路拟真**：从物理机硬件指纹（SMBIOS、MAC、Machine-ID）到独立 SOCKS5 / 本地网络出口，全方位还原真实开发者电脑环境。
 - **极简集成**：向上游输出标准 OpenAI `/v1/chat/completions`、`/v1/responses` 与 Anthropic `/v1/messages` 兼容接口，任何支持标准 API 的前端、Agent 或应用均可无缝接入。
@@ -74,24 +72,21 @@
 
 ## 🆕 近期更新
 
-对照 **1.3.133**。自 1.3.122 起，调用方能直接碰到的变化如下。明细和升级注意见 [CHANGELOG.md](CHANGELOG.md)，操作说明见 [入门文档](https://vm2api.fkcodex.com/zh/)。
+对照 **1.4.053**（`main` 当前版本）。下列为 1.4.038–1.4.053 已上线、调用方或管理员能直接感知的变化摘要；完整条目见 [CHANGELOG.md](CHANGELOG.md)，操作说明见 [入门文档](https://vm2api.fkcodex.com/zh/)。下文升级概述不能替代逐版说明，**具体以各版本 CHANGELOG 的升级注意为准**。
 
-- **遥测**只认种子里的 `telemetry_disabled === false`。虚拟机页的遥测开关与这项一致，默认开时显示为开；非必要流量和 DNT 跟着它走，不能单独拨。
-- **入门文档**放在控制台左上角 GitHub 右侧，打开 [vm2api.fkcodex.com/zh](https://vm2api.fkcodex.com/zh/)。
-- **封控拦截**收成管理台「风险审计」。进槽前按蒸馏 → 硬正则 → 拒答缓存 → 决策模型依次拦，过关才出站。见 [下文](#3️⃣-封控拦截与风险审计) 与 [docs/RISK.md](docs/RISK.md)。
-- **本地代理**是槽位所在 VPS 的出口，不是控制面自己的网卡。集群节点上，控制面代发的换票、刷新、测试对话和地理检测也从该节点出去；节点没连上就失败，不改走控制面直连。
-- **模型**页改为卡片矩阵。`claude-haiku-5-5` 的默认上下文、`max_tokens` 和输出上限是 100K；已经改过的管理员值不会被重置。
-- **托管密钥**可以限定平台（全部 / Anthropic / OpenAI）和勾选的槽。打到范围外返回 403。
-- **流空闲**默认 180 秒，在「重试与切号」里改。长工具参数可打开流式下发，避免静默超时。
-- **cli-node** 本机交付文件已换成 2.1.303：`share/wrap-cli/cli-node`，UPX 后 27,932,800 字节，SHA256 `ae120fa09a61d6ba7afa3bb57e8e389a0183c4d2026957607143d9b39562c421`。构建基线 `bbadf5d4`。payload 尚未更新，线上槽位未部署。
+- **内容脱敏（可选）**：设置 →「脱敏」页（`/console/#/settings/redaction`）可配置凭据、个人信息与自定义规则；默认关闭。启用需本机 `bin/kin-redact`，helper 未就绪时不能保存为开启，请求也不会回落明文。
+- **API 直连**：管理台 API 配置统一到 `#/api`；`api` 类密钥按端点协议调度上游，不经 OAuth / Codex 槽位。Anthropic 端点可单独开关「风控前置审查」。
+- **协议与计费**：官方 Claude Code 透传、缓存断点 TTL 与 `max_tokens` 默认值（如 Haiku 5.5 为 100K）与面板一致；GPT Image 模型可在 Chat / Responses 路径出图；第三方计费限制类上游错误写入拒答缓存（`refusal_guard`）。
+- **封控与配额**：决策模型支持多组 URL / Key；托管密钥可 `GET /v1/me/quota` 与 `GET /v1/me/usage`；租户可看用量统计，虚拟机只读（无代理与重新授权）。
+- **面板与运维**：按角色隐藏无权页面；槽位官方登录执行 `claude auth login`；平滑停机时 `/health` 返回 503 `shutting_down`；控制面升级多为更新镜像并重启（多数版本不必 `wrap-cli/sync` 或换 payload，勿覆盖 `routing.json`、`vms/`、`data/`、`.env`）。
+- **集群**：支持运行中 / 冷迁移 Linux KVM 槽与内存扩容，见 [槽位迁移说明](docs/slot-migration.md)。
 
 ---
 
-## 🛡️ 九大核心特性（特色防封与拟真矩阵）
+## 功能特性
 
-<div align="center">
-  <img src="docs/images/vm2api-security-distill.jpg" alt="Security & Distillation Protection" width="95%" style="border-radius: 10px; margin: 12px 0;" />
-</div>
+涵盖防封、拟真与生产运维相关能力（九大支柱）：
+
 
 ### 0️⃣ 独家 0 提示词注入机制 & 改写引擎
 - **无感透传，告别 System 篡改**：传统中继依赖向 Prompt 注入大段系统人设与假装指令，不仅消耗高昂 Token，还极易引发模型“自我认知混乱”并被上游识别封号。vm2api 身份在凭证层即对齐官方形态，**做到真正 0 提示词注入（Zero Prompt Injection）**。
@@ -108,17 +103,9 @@
 - **5h / 7d 官方用量窗口智能对齐**：控制面实时对齐 Anthropic 官方 5 小时滚动窗口与 7 天硬限消耗，精确计算重置倒计时（精确到分钟级）。支持设置水位报警阈值，额度逼近硬限时自动熔断并将流量平滑降级调度至空闲槽位。
 - **全生命周期槽位状态机与健康监控**：实时追踪槽位调度状态（在池调度、5h/7d 冷却保护、调用关闭、凭证失效）。支持优先级分级路由（高优先级 VIP 槽位专属调度）、单槽独立成本流水统计与一键额度全槽健康探测。
 
-<div align="center">
-  <img src="docs/images/console-vms.png" alt="vm2api 虚拟机槽位管理与官方进程运行实机看板" width="95%" style="border-radius: 10px; border: 1px solid rgba(255,255,255,0.12); box-shadow: 0 6px 24px rgba(0,0,0,0.4);" />
-  <br/>
-  <sub><i>线上生产环境实机运行脱敏截图：Claude / GPT 多槽位舰队状态、20 路并发承载、5h/7d 官方配额窗口追踪与实时成本流水</i></sub>
-</div>
 
 ---
 
-<div align="center">
-  <img src="docs/images/vm2api-vm-hardware-network.jpg" alt="VM Hardware & Network Isolation" width="95%" style="border-radius: 10px; margin: 12px 0;" />
-</div>
 
 ### 3️⃣ 封控拦截与风险审计
 
@@ -147,9 +134,6 @@
 
 ---
 
-<div align="center">
-  <img src="docs/images/vm2api-04-telemetry.png" alt="Official Telemetry" width="85%" style="border-radius: 10px; margin: 12px 0;" />
-</div>
 
 ### 6️⃣ 官方遥测（Telemetry）可控开关
 - **全量遥测模拟**：目标是让官方服务判定每一个槽位都是一台完全独立、在真实开发中活跃运行的电脑。
@@ -164,6 +148,24 @@
 - **多层级密钥体系**：拥有主控制 Master Key 以及针对团队或租户的多级 API Key，密钥入库采用 HMAC 索引与高强度加密。
 - **官方配额窗口精确对齐**：对齐官方 5h / 7d 动态用量窗口与硬限保护，支持槽位独立配额覆盖，提供自动熔断、故障降级与空闲负载平衡。
 - **实时审计与成本统计**：提供精确到 TTFT（首 Token 延迟）、真实 Prompt / Completion / 缓存命中 Token 的详尽流水与可视化图表分析。
+
+---
+
+## 界面预览
+
+<table>
+<tr>
+<td align="center" width="50%"><img src="docs/images/brand-hero.png" alt="vm2api 品牌概览" width="420"><br><sub>品牌概览</sub></td>
+<td align="center" width="50%"><img src="docs/images/console-vms.png" alt="虚拟机槽位管理看板" width="420"><br><sub>槽位舰队与配额看板（脱敏）</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/images/vm2api-security-distill.jpg" alt="封控与蒸馏防护" width="420"><br><sub>封控拦截</sub></td>
+<td align="center"><img src="docs/images/vm2api-vm-hardware-network.jpg" alt="硬件与网络隔离" width="420"><br><sub>硬件指纹与网络隔离</sub></td>
+</tr>
+<tr>
+<td align="center" colspan="2"><img src="docs/images/vm2api-04-telemetry.png" alt="遥测配置" width="520"><br><sub>官方遥测开关</sub></td>
+</tr>
+</table>
 
 ---
 
@@ -185,7 +187,7 @@ vm2api 严格遵循行业最严苛的**纯净度基准**。入站请求不泄露
 
 ---
 
-## 🚀 快速开始（生产部署）
+## 部署安装
 
 推荐在 **Ubuntu 24.04 LTS** 环境使用官方 Docker Compose 一键启动。
 
@@ -217,10 +219,12 @@ docker compose pull && docker compose up -d
 
 服务启动后，系统暴露统一服务端口（默认 `8787`）：
 
-- **可视化管理面板**：`http://<您的IP>:8787/console`（默认账号：`admin` / 密码：`123456` 或自定义环境变量）
-- **服务健康探活**：`GET http://<您的IP>:8787/health`
+- **登录与管理台**：`http://<您的IP>:8787/cc#/login`（亦可用 `http://<您的IP>:8787/console` 进入欢迎页后点「登录」）。默认账号 `admin` / `123456`，或由 `.env` 中 `VM2API_ADMIN_USER` / `VM2API_ADMIN_PASSWORD` 指定。
+- **服务健康探活**：`GET http://<您的IP>:8787/health`（升级排空期间可能返回 503 `shutting_down`）
 - **Anthropic 协议调用**：`POST http://<您的IP>:8787/v1/messages`
 - **OpenAI 兼容协议**：`POST http://<您的IP>:8787/v1/chat/completions`
+
+生产环境升级与面板一键更新见 [docs/DEPLOY.md](docs/DEPLOY.md) 或 `curl …/deploy/install.sh | sudo bash -s -- upgrade`。
 
 ```bash
 # 调用示例（以 Anthropic 原生接口为例）
@@ -229,7 +233,7 @@ curl -sS http://127.0.0.1:8787/v1/messages \
   -H "content-type: application/json" \
   -d '{
     "model": "claude-sonnet-5-5",
-    "max_tokens": 128000,
+    "max_tokens": 8192,
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 ```
@@ -245,33 +249,35 @@ vm2api 内置全栈自适应网关，原生支持以下所有主流生态：
 | `/v1/messages` | Anthropic Messages API | Claude 官方 SDK、Cursor、Continue、LibreChat、Roo Code |
 | `/v1/chat/completions` | OpenAI Chat API | NextChat、Open WebUI、Lobechat、LangChain、AutoGPT |
 | `/v1/responses` | OpenAI Responses API | 新一代结构化智能体与高级编码工具生态 |
-| `/v1/models` | 标准模型列表 API | 按密钥 `group_type` 列出可调度模型：`openai` 仅 GPT，`anthropic` 仅 Claude，`all` 与 master 两者都列 |
+| `/v1/models` | 标准模型列表 API | 订阅密钥按 `group_type` 过滤（`openai` / `anthropic` / `all`）；`api` 类密钥按所配端点协议列出上游模型 |
+| `/v1/images/*` | OpenAI Images API | GPT Image 系列；亦可通过 Chat / Responses 图像桥接调用 |
 
 ---
 
 <br/>
 
+
+<br/>
+
 # 🇬🇧 English
 
-> **Sponsor**: [ProxyLane](https://proxylane.dev/zh-cn/isp-proxies?utm_source=vm2api&utm_medium=affiliate&utm_campaign=vm2api_sponsor_202610&utm_content=github_readme_en) native static residential ISP IPs built for AI accounts: low Scamalytics fraud scores, a dedicated IP with unlimited traffic, from $3.90. Bind one IP per slot: paste the SOCKS5 line `host:port:user:pass` into 代理池 → 添加代理 (Proxy pool → Add proxy). Code `VM2API30` gives 30% off your first purchase.
-
 ## Table of Contents
-- [💡 Overview](#-overview)
-- [🆕 Recent changes](#recent-changes)
-- [🛡️ 9 Core Pillars (Anti-Ban & Emulation Matrix)](#️-9-core-pillars-anti-ban--emulation-matrix)
-  - [0️⃣ Zero Prompt Injection Engine](#0️⃣-zero-prompt-injection-engine)
-  - [1️⃣ Physical Hardware Fingerprint Emulation](#1️⃣-physical-hardware-fingerprint-emulation)
-  - [2️⃣ Official Claude Code Native Process Forwarding](#2️⃣-official-claude-code-native-process-forwarding)
-  - [3️⃣ Pre-hop risk gates](#3️⃣-pre-hop-risk-gates)
-  - [4️⃣ Completely Isolated Network (1 VM = 1 Egress)](#4️⃣-completely-isolated-network-1-vm--1-egress)
-  - [5️⃣ Deep Protocol Cleansing & Multi-Inbound Structuring](#5️⃣-deep-protocol-cleansing--multi-inbound-structuring)
-  - [6️⃣ Configurable Official Telemetry](#6️⃣-configurable-official-telemetry)
-  - [7️⃣ Multi-VPS Cluster Management](#7️⃣-multi-vps-cluster-management)
-  - [8️⃣ Enterprise API Key & Quota Management](#8️⃣-enterprise-api-key--quota-management)
-- [📊 Cleanliness Benchmarks](#-cleanliness-benchmarks)
-- [🚀 Quick Start (Production Setup)](#-quick-start-production-setup)
-- [💬 Community & Sponsorship](#-交流与赞助支持--community--sponsorship)
-- [📜 License & Compliance](#-许可证与免责声明--license)
+
+- [Why vm2api?](#why-vm2api)
+- [Recent changes](#recent-changes-14053)
+- [Features](#features)
+- [Screenshots](#screenshots)
+- [Cleanliness Benchmarks](#-cleanliness-benchmarks)
+- [Deployment](#deployment)
+- [Issue reporting](#-问题反馈--issue-reporting)
+
+---
+
+## Why vm2api?
+
+- **Subscription → standard APIs** — Anthropic / OpenAI slots plus optional **direct API** keys.
+- **VM-fidelity** — Official Claude Code processes, hardware fingerprints, one egress per slot.
+- **Operations-ready** — Pre-hop risk gates, multi-VPS cluster, tenants and keys; **per-release CHANGELOG upgrade notes**.
 
 ---
 
@@ -279,30 +285,30 @@ vm2api 内置全栈自适应网关，原生支持以下所有主流生态：
 
 Traditional methods of converting AI subscriptions into API endpoints via simple reverse proxies frequently result in immediate account suspensions, stealth downgrades, and token corruption. **vm2api** is an enterprise-grade virtual machine gateway designed for ultra-reliable subscription-to-API infrastructure:
 
-- **Universal Support**: Seamlessly converts **Anthropic (Claude Pro / Team / Enterprise / Max)** and **OpenAI (ChatGPT / Codex)** subscriptions into robust standard APIs.
+- **Universal Support**: Seamlessly converts **Anthropic (Claude Pro / Team / Enterprise / Max)** and **OpenAI (ChatGPT / Codex)** subscriptions into robust standard APIs. **Direct API** keys (`api` category) call configured Anthropic / OpenAI upstream endpoints without OAuth or Codex slots.
 - **Genuine Client Process**: Runs the **authentic official Claude Code CLI system process** inside an isolated VM / container instance instead of fragile HTTP emulation.
 - **High-Fidelity Emulation**: From physical SMBIOS, NIC MAC, and Machine-ID to dedicated per-slot network egress and pre-hop risk gates.
 - **Standard Compatibility**: Provides drop-in replacements for Anthropic `/v1/messages` and OpenAI `/v1/chat/completions` / `/v1/responses`.
 
 
-## Recent changes (1.3.133)
+## Recent changes (1.4.053)
 
-Since 1.3.122, the caller-visible changes are:
+Shipped in **1.4.038–1.4.053** on `main` (summary only; see [CHANGELOG.md](CHANGELOG.md) for full entries). The upgrade notes below are not version-specific—**follow each release’s upgrade section in the CHANGELOG**:
 
-- **Telemetry** reads only `telemetry_disabled === false`. The VM switch matches that bit and is on for the default; nonessential traffic and DNT follow it.
-- **Intro docs** sit to the right of GitHub in the console sidebar and open [vm2api.fkcodex.com/zh](https://vm2api.fkcodex.com/zh/).
-- **Risk gates** run before a slot is chosen: distill, hard regex, refusal cache, decision model, then egress. See [below](#3️⃣-pre-hop-risk-gates) and [docs/RISK.md](docs/RISK.md).
-- **Local proxy** is the VPS that owns the slot. On a cluster node, ticket refresh, test chat, and geo also leave through that node. A disconnected node fails instead of falling back to the control plane.
-- **Models** are a card matrix. Haiku 5.5 defaults to a 100K context and output cap; an admin override is kept.
-- **Keys** can be limited to Anthropic or OpenAI and to selected slots. A call outside that scope returns 403.
-- **Stream idle** defaults to 180 seconds under retry settings. Long tool arguments can be streamed.
-- **cli-node** local delivery is now 2.1.303: `share/wrap-cli/cli-node`, 27,932,800 bytes after UPX, SHA256 `ae120fa09a61d6ba7afa3bb57e8e389a0183c4d2026957607143d9b39562c421`. Built from `bbadf5d4`. The payload and live slots are unchanged.
+- **Redaction (optional)**: Settings → Redaction (`/console/#/settings/redaction`). Off by default; requires local `bin/kin-redact`—no plaintext fallback when the helper is missing.
+- **Direct API**: Panel API config at `#/api`; `api` keys route to upstream by endpoint protocol, not OAuth/Codex slots. Anthropic endpoints can enable pre-hop risk review separately.
+- **Protocol & billing**: Official Claude Code passthrough, cache TTL, and default `max_tokens` align with the panel; GPT Image works via Chat/Responses; upstream third-party billing limits map to `refusal_guard` + refusal cache.
+- **Gates & tenants**: Decision model supports multiple URL/key sets; keys expose `GET /v1/me/quota` and `GET /v1/me/usage`; tenant stats and read-only VM views.
+- **Panel & ops**: Role-based page access; slot login runs `claude auth login`; draining upgrades expose 503 on `/health`. Most upgrades are image + restart—do not overwrite `routing.json`, `vms/`, `data/`, or `.env`.
+- **Cluster**: Live and cold KVM slot migration plus RAM resize—[docs/slot-migration.md](docs/slot-migration.md).
 
-Details: [CHANGELOG.md](CHANGELOG.md). Guide: [vm2api.fkcodex.com/zh](https://vm2api.fkcodex.com/zh/).
+Guide: [vm2api.fkcodex.com/zh](https://vm2api.fkcodex.com/zh/).
 
 ---
 
-## 🛡️ 9 Core Pillars (Anti-Ban & Emulation Matrix)
+## Features
+
+Nine pillars for anti-ban emulation and production operations:
 
 ### 0️⃣ Zero Prompt Injection Engine
 - **No System Prompt Tampering**: Unlike ordinary proxies that tamper with the system prompt and poison model identity, vm2api aligns credentials at the protocol layer as a genuine Console client.
@@ -319,11 +325,6 @@ Details: [CHANGELOG.md](CHANGELOG.md). Guide: [vm2api.fkcodex.com/zh](https://vm
 - **5h / 7d Upstream Quota Alignment**: Automatically aligns with Anthropic's rolling 5-hour and 7-day budget windows, calculating reset deadlines down to the minute. Integrates dynamic circuit breakers to gracefully divert traffic when a slot approaches its capacity limit.
 - **Full Slot Lifecycle & Health Observability**: Visual real-time tracking of slot states (In-Pool, Cooldown Guard, Suspended, Token Expired), multi-tier priority routing, and real-time per-slot financial cost accounting.
 
-<div align="center">
-  <img src="docs/images/console-vms.png" alt="vm2api VM Slot Management & Process Forwarding Live Dashboard" width="95%" style="border-radius: 10px; border: 1px solid rgba(255,255,255,0.12); box-shadow: 0 6px 24px rgba(0,0,0,0.4);" />
-  <br/>
-  <sub><i>Production live dashboard: Multi-slot fleet status, 20-concurrency subagent scheduling, 5h/7d quota window telemetry, and cost accounting (sanitized).</i></sub>
-</div>
 
 ### 3️⃣ Pre-hop risk gates
 
@@ -363,6 +364,24 @@ Open a hit and read the body. A false positive means tighten that gate, not dele
 
 ---
 
+## Screenshots
+
+<table>
+<tr>
+<td align="center" width="50%"><img src="docs/images/brand-hero.png" alt="vm2api brand" width="420"><br><sub>Brand overview</sub></td>
+<td align="center" width="50%"><img src="docs/images/console-vms.png" alt="VM slot dashboard" width="420"><br><sub>Slot fleet dashboard (sanitized)</sub></td>
+</tr>
+<tr>
+<td align="center"><img src="docs/images/vm2api-security-distill.jpg" alt="Risk gates" width="420"><br><sub>Risk gates</sub></td>
+<td align="center"><img src="docs/images/vm2api-vm-hardware-network.jpg" alt="Hardware and network" width="420"><br><sub>Hardware & network isolation</sub></td>
+</tr>
+<tr>
+<td align="center" colspan="2"><img src="docs/images/vm2api-04-telemetry.png" alt="Telemetry" width="520"><br><sub>Telemetry controls</sub></td>
+</tr>
+</table>
+
+---
+
 ## 📊 Cleanliness Benchmarks
 
 | Test Item | Description | Evaluation | Core Result |
@@ -377,22 +396,27 @@ Open a hit and read the body. A false positive means tighten that gate, not dele
 
 ---
 
-## 🚀 Quick Start (Production Setup)
+## Deployment
 
 ```bash
 # Recommended one-line installation on Ubuntu 24.04 LTS
 curl -sSL https://raw.githubusercontent.com/dofastted/vm2api/main/deploy/install.sh | sudo bash
+
+# Upgrades
+curl -sSL https://raw.githubusercontent.com/dofastted/vm2api/main/deploy/install.sh | sudo bash -s -- upgrade
 ```
 
 After deployment, access:
-- **Management Console**: `http://<YOUR_IP>:8787/console`
-- **Health Check**: `http://<YOUR_IP>:8787/health`
+- **Login / console**: `http://<YOUR_IP>:8787/cc#/login` (or `/console` welcome → Sign in). Default `admin` / `123456` unless set in `.env`.
+- **Health Check**: `http://<YOUR_IP>:8787/health` (may return 503 `shutting_down` during drain)
 - **API Endpoint**: `POST http://<YOUR_IP>:8787/v1/messages`
+
+See [docs/DEPLOY.md](docs/DEPLOY.md) for panel one-click updates and compose workflows.
 
 ---
 
-## 🐞 问题反馈 / Issue Reporting
 
+## 🐞 问题反馈 / Issue Reporting
 提交 Issue 前请阅读 [ISSUE_GUIDE.md](ISSUE_GUIDE.md)，按“版本 → 复现路线 → 环境（VPS / 代理）→ VM 与请求日志 → 源码定位（可选）→ 脱敏”收集信息，再用 [Bug 报告表单](https://github.com/dofastted/vm2api/issues/new/choose) 提交。
 
 Before opening an issue, follow [ISSUE_GUIDE.md](ISSUE_GUIDE.md): version, reproduction steps, host/proxy environment, VM and request logs, optional source pointers — and redact all secrets.
@@ -405,12 +429,24 @@ Before opening an issue, follow [ISSUE_GUIDE.md](ISSUE_GUIDE.md): version, repro
 
 ## 💬 交流与赞助支持 / Community & Sponsorship
 
-开源与持续维护离不开社区大家的支持与反馈。如果您觉得 **vm2api** 为您的业务或学习带来了实质帮助， 交流群或请作者喝杯咖啡！
+开源与持续维护离不开社区支持与反馈。欢迎加入开发者群交流部署与使用问题；若 **vm2api** 对您有帮助，也可请作者喝杯咖啡。
+
+### 开发者交流群 / Developer community
+
+Telegram 群组 **[t.me/vm2api](https://t.me/vm2api)**（`@VM2API`）：部署排障、版本升级与使用讨论。商业授权可在群内咨询。
+
+<div align="center">
+  <a href="https://t.me/vm2api">
+    <img src="docs/images/tg-vm2api.jpg" alt="Telegram 开发者群 @VM2API" width="220" style="border-radius: 12px; margin: 8px 0;" />
+  </a>
+</div>
+
+### 赞助 / Sponsorship
 
 <div align="center">
   <table style="border-collapse: separate; border-spacing: 20px; background: transparent;">
     <tr>
-      <td align="center" width="320" style="padding: 24px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.03); backdrop-filter: blur(10px); box-shadow: 0 8px 24px rgba(0,0,0,0.25);">
+      <td align="center" valign="middle" width="280" style="padding: 24px; border-radius: 16px; border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.03); backdrop-filter: blur(10px); box-shadow: 0 8px 24px rgba(0,0,0,0.25);">
         <img src="docs/images/support-wechat.png" alt="微信赞助收款码" width="220" style="border-radius: 12px; box-shadow: 0 4px 16px rgba(0,0,0,0.3); border: 2px solid rgba(7,193,96,0.3);" />
         <br/><br/>
         <b style="font-size: 16px;">☕ 支持与赞助项目</b>
@@ -420,6 +456,11 @@ Before opening an issue, follow [ISSUE_GUIDE.md](ISSUE_GUIDE.md): version, repro
         <a href="#-交流与赞助支持--community--sponsorship">
           <img src="https://img.shields.io/badge/Sponsor-Alipay%20Pay-07C160?style=for-the-badge&logo=alipay&logoColor=white" />
         </a>
+      </td>
+      <td align="center" valign="middle" style="padding: 8px 4px;">
+        <img src="docs/images/sponsor-coin-hearts.gif" alt="赞助区装饰动效（硬币投入与爱心冒泡，非真实交易或金额提示）" width="160" style="border-radius: 12px;" />
+        <br/>
+        <span style="color: #666; font-size: 11px;">纯装饰动效</span>
       </td>
     </tr>
   </table>
@@ -437,7 +478,7 @@ Before opening an issue, follow [ISSUE_GUIDE.md](ISSUE_GUIDE.md): version, repro
 ## 📜 许可证与免责声明 / License
 
 - **个人与非商用**：本仓库遵循 [Noncommercial License](LICENSE)，仅供个人学习、技术研究与个人自建使用。
-- **商业使用授权**：任何将本项目用于商业运营（包括对外付费 API、作为转售云服务基础组件、公司内部营利用途等）**必须事先取得作者正式书面授权**。授权联系请洽 [Telegram @VM2API](https://t.me/VM2API)。
+- **商业使用授权**：任何将本项目用于商业运营（包括对外付费 API、作为转售云服务基础组件、公司内部营利用途等）**必须事先取得作者正式书面授权**。可在开发者交流群 [t.me/vm2api](https://t.me/vm2api)（`@VM2API`）内咨询。
 - **免责声明**：vm2api 为独立的开源实验项目，与 Anthropic PBC 或 OpenAI 无任何直接关联。相关商标权属均归其对应公司所有。
 
 
