@@ -27,7 +27,7 @@ import {
 import { isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { runSlotOauth } from './slot-oauth.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
-import { cragV2KernelActive, readSlotKernelConfig } from '../protocol/crag-print-prompt.mjs'
+import { cragConsumesModelDirective, cragV2KernelActive, readSlotKernelConfig } from '../protocol/crag-print-prompt.mjs'
 import { applyClaudeSSELineToMessage, createClaudeMessageAssembler } from '../protocol/convert.mjs'
 import {
   clientCancelledResult,
@@ -460,7 +460,8 @@ export function prepareWorkerPayload({
   // carries request gates to the native CLI, which builds the actual HTTP wire.
   const gated = cliHop ? { ...main, betas } : sanitizeAnthropicBodyForBetaTokens(main, headers['anthropic-beta'])
   // CRAG's CLI rebuilds the wire from its own model table. Pass the preset
-  // boundary here; the standard kernel must not see this field on the Anthropic body.
+  // boundary only when that worker applies it locally. A cluster hop forwards
+  // unknown fields and Anthropic rejects `crag_model`.
   const print =
     cragPrint == null
       ? cragV2KernelActive({
@@ -469,7 +470,10 @@ export function prepareWorkerPayload({
           kernelConfig: readSlotKernelConfig(exec?.homeDir),
         })
       : cragPrint === true
-  const directed = print ? { ...gated, crag_model: modelDirectiveForCrag(gated?.model) } : stripCragEnvelope(gated)
+  const directed =
+    print && cragConsumesModelDirective(exec?.workerStatus)
+      ? { ...gated, crag_model: modelDirectiveForCrag(gated?.model) }
+      : stripCragEnvelope(gated)
   return {
     headers,
     gated: directed,

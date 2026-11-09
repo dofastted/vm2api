@@ -2,9 +2,10 @@
 
 ## Unreleased
 
-- 集群节点不再对槽内可替换的 `run/crag-native-assets`、`run/work`、`run/crag-license` 做会跟随符号链接的 `chmod`/`chown`。链接只删链接本身，模式和属主用 `-h` 或已打开的目录 fd。
+- 集群部署更新和内核切换不再调用 `chmod -h` / `chown -h`。coreutils 8.32 之前和 BusyBox 会报 `chmod: invalid option -- 'h'` 并中断切换。私有目录改用 `find -P`，符号链接不跟随，匹配不到就失败。
+- `crag_model` 只发给 health capabilities 含 `linux_tui_pty` 或 `model_directive` 的 worker。集群 hop / 旧内核会把该字段原样打到 Anthropic，得到 `crag_model: Extra inputs are not permitted` / `upstream_invalid_request`。没有这个能力时，部署、切换和出站都丢掉 `crag_model` 与 `crag_prompt`。
 - 集群 Docker 槽的 VM 面板可以在 cli-node 与 CRAG v2 之间切换。KVM 和 macOS 原生节点仍然不能切。切换会按该槽自己的内核重建容器，不再把未选择 CRAG 的集群槽写回 v2。
-- 出站按 VM 实际启用的内核切换：只有运行中的 CRAG v2（health `runtime_variant`，否则槽位自己的 `dataplane` / `crag_kernel_version`，再否则该槽 `kernel.json`）走 print 和 `crag_model`。全局 `routing.inference=crag` 不再把 wrap / cc / 未写内核的槽送上 print。cli-node 信封会丢掉调用方塞进来的 `crag_prompt`。
+- 出站按 VM 实际启用的内核切换：只有运行中的 CRAG v2（health `runtime_variant`，否则槽位自己的 `dataplane` / `crag_kernel_version`，再否则该槽 `kernel.json`）走 print。`crag_model` 还要该 worker 的 capabilities 声明会在本地消化。全局 `routing.inference=crag` 不再把 wrap / cc / 未写内核的槽送上 print。cli-node 信封会丢掉调用方塞进来的 `crag_prompt`。
 - system提示词页分成两套：cli-node 原生内核仍用模板并投影 `kernel.json`；CRAG v2 print 另存 `compatibility.crag_persona_preset`。print worker 不读 `persona_preset` / `CLAUDE_CODE_SYSTEM_LAYOUT`。`official_full` 只 append 调用方尾巴，不重贴官方四块；`zero` 必须 `crag_prompt.mode=replace`，超过 64 KiB 返回 400。不使用 `--bare`、`--tools ""` 或 `--no-chrome`。thinking、temperature、betas 和 system 上的 cache_control 仍不转发。
 - CRAG 离线通用码 `CRAGU1` 一次解锁内核：写入安装级授权并同步到每个本地槽和每台集群机器，Warp 上不再逐槽、逐机器重复激活。在线 `CRAGL1` 仍绑定单槽设备，且不会被通用码覆盖。正式状态为 `kind: offline`、`scope: kernel`。
 - 清理：删除零引用死导出（cache-ttl / convert / model-policy / thinking / user-count-tokens / web-search / codex-route / codex-models）及 `copyBodyWithMessages`（REQ-CLEANUP-02 第一批 / DEC-0001）。

@@ -48,6 +48,19 @@ export function cragV2KernelActive({ vm, health, kernelConfig } = {}) {
   return false
 }
 
+const MODEL_DIRECTIVE_CAPS = ['model_directive', 'linux_tui_pty']
+
+/**
+ * Only a worker that applies the directive inside its own CLI fetch may see
+ * `crag_model`. A hop or older cluster kernel forwards the envelope body and
+ * Anthropic answers `crag_model: Extra inputs are not permitted`.
+ */
+export function cragConsumesModelDirective(health) {
+  const caps = health?.capabilities
+  if (!Array.isArray(caps)) return false
+  return caps.some((cap) => MODEL_DIRECTIVE_CAPS.includes(String(cap || '')))
+}
+
 export const CRAG_PRINT_PROMPT_MAX_BYTES = 64 * 1024
 const BILLING_LINE = /^x-anthropic-billing-header:/i
 

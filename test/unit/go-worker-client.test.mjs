@@ -257,15 +257,17 @@ test('cli-hop appends inline-tools when a message carries a tool_definition', ()
   assert.ok(!plain.body.betas.includes('inline-tools-2026-09-15'))
 })
 
-test('CRAG v2 receives the preset model boundary and the standard kernel does not', () => {
+test('CRAG v2 receives the preset model boundary only from a worker that consumes it', () => {
   const body = { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] }
   const reqHeaders = {}
+  const vm = { dataplane: 'crag', crag_kernel_version: 'v2', claude: { mode: 'setup-token', scope: 'user:inference' } }
   const crag = finalizeWorkerPayload({
     body,
     reqHeaders,
     exec: {
       homeDir: '',
-      vm: { dataplane: 'crag', crag_kernel_version: 'v2', claude: { mode: 'setup-token', scope: 'user:inference' } },
+      vm,
+      workerStatus: { runtime_variant: 'crag-v2', capabilities: ['linux_tui_pty'] },
     },
     identity: null,
   })
@@ -275,6 +277,14 @@ test('CRAG v2 receives the preset model boundary and the standard kernel does no
   assert.equal(crag.body.crag_model.params.max_tokens_default, 8192)
   assert.equal(crag.body.crag_model.params.max_tokens_cap, 64000)
   assert.ok(crag.body.crag_model.betas.drop.includes('context-management-2025-06-27'))
+  const forwarded = finalizeWorkerPayload({
+    body: { ...body, crag_prompt: { mode: 'append', text: 'caller' }, crag_model: { id: 'leaked' } },
+    reqHeaders,
+    exec: { homeDir: '', vm, workerStatus: { runtime_variant: 'crag-v2', execution_mode: 'crag_slots' } },
+    identity: null,
+  })
+  assert.equal(forwarded.body.crag_model, undefined)
+  assert.equal(forwarded.body.crag_prompt, undefined)
   const wrap = finalizeWorkerPayload({
     body,
     reqHeaders,
@@ -302,7 +312,11 @@ test('a wrap VM does not inherit a global CRAG v2 route', () => {
   const forced = finalizeWorkerPayload({
     body,
     reqHeaders: {},
-    exec: { homeDir: '', vm: { dataplane: 'wrap' }, workerStatus: { runtime_variant: 'crag-v2' } },
+    exec: {
+      homeDir: '',
+      vm: { dataplane: 'wrap' },
+      workerStatus: { runtime_variant: 'crag-v2', capabilities: ['linux_tui_pty'] },
+    },
     identity: null,
     cragPrint: false,
   })
@@ -310,7 +324,11 @@ test('a wrap VM does not inherit a global CRAG v2 route', () => {
   const live = finalizeWorkerPayload({
     body,
     reqHeaders: {},
-    exec: { homeDir: '', vm: { dataplane: 'wrap' }, workerStatus: { runtime_variant: 'crag-v2' } },
+    exec: {
+      homeDir: '',
+      vm: { dataplane: 'wrap' },
+      workerStatus: { runtime_variant: 'crag-v2', capabilities: ['model_directive'] },
+    },
     identity: null,
   })
   assert.equal(live.body.crag_model.id, 'claude-haiku-4-5-20251001')
