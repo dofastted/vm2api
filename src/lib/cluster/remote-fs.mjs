@@ -113,12 +113,17 @@ export async function remoteSymlink(sftp, target, linkPath) {
 
 /**
  * Make each final component a real directory. Parents must be mount roots.
- * `chmod`/`chown` use `-h`: GNU coreutils otherwise follow a symlink the guest
- * swapped in, and `-h` on a symlink fails or changes the link instead.
+ * Mode and owner go through `find -P`: GNU chmod before 8.32 and BusyBox reject
+ * `chmod -h` (`invalid option -- 'h'`), which aborted kernel switch and deploy.
+ * `-P` does not follow a symlink the guest swapped in; a link matches nothing
+ * and the script fails closed instead of changing the target.
  * `owner` is only meaningful for a root SSH session.
  */
 export function privateDirectoriesScript(dirs, owner = null) {
-  const own = owner == null ? '' : `chown -h ${requireId(owner.uid)}:${requireId(owner.gid)} "$d" || exit 1;`
+  const own =
+    owner == null
+      ? ''
+      : `find -P "$d" -maxdepth 0 -type d -exec chown ${requireId(owner.uid)}:${requireId(owner.gid)} {} + || exit 1;`
   return dirs
     .map((dir) => {
       const d = shellQuote(dir)
@@ -128,7 +133,9 @@ export function privateDirectoriesScript(dirs, owner = null) {
         'if [ -e "$d" ] && [ ! -d "$d" ]; then rm "$d" || exit 1; fi;',
         'if [ ! -d "$d" ]; then mkdir "$d" || exit 1; fi;',
         'if [ -L "$d" ] || [ ! -d "$d" ]; then echo "private directory was replaced" >&2; exit 1; fi;',
-        'chmod -h 700 "$d" || exit 1;',
+        'hit=$(find -P "$d" -maxdepth 0 -type d -exec chmod 700 {} + -print);',
+        '[ -n "$hit" ] || { echo "private directory was replaced" >&2; exit 1; };',
+        'if [ -L "$d" ] || [ ! -d "$d" ]; then echo "private directory was replaced" >&2; exit 1; fi;',
         own,
       ].join(' ')
     })
