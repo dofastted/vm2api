@@ -122,34 +122,6 @@ export function isWebSearchDisabled({ body, headers } = {}) {
   return false
 }
 
-function contentToText(content) {
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => {
-        if (typeof part === 'string') return part
-        if (part && typeof part.text === 'string') return part.text
-        if (part && typeof part.content === 'string') return part.content
-        return ''
-      })
-      .filter(Boolean)
-      .join('\n')
-  }
-  if (content && typeof content.text === 'string') return content.text
-  return ''
-}
-
-/** Last user turn only. Older turns do not keep search armed. */
-export function lastUserPromptText(body) {
-  const messages = Array.isArray(body?.messages) ? body.messages : []
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]?.role === 'user') return contentToText(messages[i].content)
-  }
-  if (typeof body?.input === 'string') return body.input
-  if (Array.isArray(body?.input)) return contentToText(body.input)
-  return ''
-}
-
 const MAX_BLOCK_DEPTH = 4
 
 /** Nested encrypted_content (web_search_result payloads live inside the result block). */
@@ -304,11 +276,4 @@ export function sanitizeAnthropicTools(tools) {
     }
     return next
   })
-}
-
-export function sanitizeBodyServerTools(body) {
-  if (!body || typeof body !== 'object' || !Array.isArray(body.tools)) return body
-  const tools = sanitizeAnthropicTools(body.tools)
-  if (tools === body.tools) return body
-  return { ...body, tools }
 }

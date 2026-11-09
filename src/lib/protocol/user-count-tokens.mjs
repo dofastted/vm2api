@@ -37,15 +37,6 @@ import { summarizeCodexSlot } from '../vm/codex-slot.mjs'
 import { pickCodexSlots } from '../pool/codex-slot-pool.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
 import { resolveInboundIdentity } from '../identity/identity-rewrite.mjs'
-export function countTokensUnsupportedError() {
-  return makeError({
-    type: ErrorType.INVALID_REQUEST,
-    code: ErrorCode.COUNT_TOKENS_UNSUPPORTED,
-    message: 'count_tokens 只支持 Setup Token / Console API Key，OAuth 请用 GET /v1/usage',
-    status: 400,
-  })
-}
-
 export function usageUnsupportedError() {
   return makeError({
     type: ErrorType.INVALID_REQUEST,

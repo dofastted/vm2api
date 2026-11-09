@@ -67,16 +67,3 @@ export function shallowCopyBody(body, { omit = [] } = {}) {
   for (const key of omit) delete out[key]
   return out
 }
-
-/**
- * Copy-on-write: replace `messages` only when the mapper returns a new array.
- * Other top-level fields are shallow-copied once.
- */
-export function copyBodyWithMessages(body, mapMessages) {
-  if (!body || typeof body !== 'object') return body
-  const messages = Array.isArray(body.messages) ? body.messages : null
-  if (!messages || typeof mapMessages !== 'function') return shallowCopyBody(body)
-  const next = mapMessages(messages)
-  if (next === messages) return shallowCopyBody(body)
-  return { ...body, messages: next }
-}
