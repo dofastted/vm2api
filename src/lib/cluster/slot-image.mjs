@@ -58,7 +58,7 @@ function requireElf(file, label) {
 /** Cluster slot images are linux amd64 even when the control plane is not. */
 export function cragSlotPayload(projectRoot) {
   const root = cragV2PackageRoot(projectRoot, 'amd64')
-  if (!root) throw new ClusterError(500, 'slot_payload_missing', 'CRAG v2 缺失')
+  if (!root) throw new ClusterError(500, 'slot_payload_missing', 'CRAG v2 缺失。原生 Claude Code 在 CRAG 包内，请先在内核页拉取 CRAG')
   const verified = verifyCragV2Tree(root, { arch: 'amd64' })
   if (!verified.ok) {
     const missing = verified.code === 'crag_v2_package_missing'

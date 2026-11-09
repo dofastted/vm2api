@@ -268,6 +268,21 @@ for (const [patch, kernel, code] of [
   })
 }
 
+test('cluster Docker CRAG install is not rejected as a local-only slot', async (t) => {
+  const { root } = fixture(t, { node_id: 'remote-node' })
+  const result = await installKernelTargets({
+    projectRoot: root,
+    targets: target('crag'),
+    ops: {
+      stopSlot() {
+        assert.fail('preflight cannot stop')
+      },
+    },
+  })
+  assert.notEqual(result.items[0].code, 'crag_v2_unsupported_placement')
+  assert.equal(result.items[0].stopped, false)
+})
+
 for (const stage of ['policy', 'materialize', 'config']) {
   test(`post-stop ${stage} failure retains previous selection and remains durably stopped`, async (t) => {
     const { root, vm } = fixture(t, { dataplane: 'crag', crag_kernel_version: 'v2' })
