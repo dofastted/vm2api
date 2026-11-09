@@ -7,6 +7,7 @@ import { sanitizeAnthropicBodyForBetaTokens } from '../protocol/anthropic-policy
 import { withRequestProtocolBetas } from '../protocol/claude-code-betas.mjs'
 import { pinThreadBetas, rememberThreadTurn } from '../protocol/thread-betas.mjs'
 import { applyThinkingDisplay, ensureOfficialPrintThinking, thinkingDisplayMode } from '../protocol/thinking.mjs'
+import { modelDirectiveForCrag } from '../protocol/model-policy.mjs'
 import { stripSubagentBilling } from '../identity/crs-persona.mjs'
 import { sealClaudeCodeCch } from '../identity/cch.mjs'
 import { credentialModeFromOauth } from '../oauth/credential-mode.mjs'
@@ -26,6 +27,7 @@ import {
 import { isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { runSlotOauth } from './slot-oauth.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { resolveCragKernelVersion, resolveKernelDataplane } from '../vm/slot-engine.mjs'
 import { applyClaudeSSELineToMessage, createClaudeMessageAssembler } from '../protocol/convert.mjs'
 import {
   clientCancelledResult,
@@ -440,9 +442,15 @@ export function prepareWorkerPayload({
   // Envelope headers are discarded; the existing MessageRequest.betas channel
   // carries request gates to the native CLI, which builds the actual HTTP wire.
   const gated = cliHop ? { ...main, betas } : sanitizeAnthropicBodyForBetaTokens(main, headers['anthropic-beta'])
+  // CRAG's CLI rebuilds the wire from its own model table. Pass the preset
+  // boundary here; the standard kernel must not see this field on the Anthropic body.
+  const directed =
+    resolveKernelDataplane(exec?.vm, routing) === 'crag' && resolveCragKernelVersion(exec?.vm, routing) === 'v2'
+      ? { ...gated, crag_model: modelDirectiveForCrag(gated?.model) }
+      : gated
   return {
     headers,
-    gated,
+    gated: directed,
     cliHop,
     routing,
     thread: thread.turn,
