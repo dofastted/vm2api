@@ -440,6 +440,28 @@ test('migration 048 leaves existing API endpoints opted out of risk review', () 
   }
 })
 
+test('migration 054 gives existing API keys an empty model allowlist (no limit)', () => {
+  const src = path.resolve('src/lib/db/migrations')
+  const oldDir = path.join(tmp, 'before054')
+  fs.mkdirSync(oldDir)
+  for (const file of fs.readdirSync(src)) {
+    if (file.endsWith('.sql') && file < '054') fs.copyFileSync(path.join(src, file), path.join(oldDir, file))
+  }
+  const db = new DatabaseSync(':memory:')
+  try {
+    applyMigrations(db, { migrationsDir: oldDir })
+    db.prepare(
+      `INSERT INTO api_keys (id, name, key, created_at) VALUES ('legacy', 'Legacy', 'hmac:x', '2026-11-01')`,
+    ).run()
+    applyMigrations(db, { migrationsDir: src })
+    assert.equal(db.prepare('SELECT allowed_models FROM api_keys WHERE id = ?').get('legacy').allowed_models, '[]')
+    assert.throws(() => db.prepare('UPDATE api_keys SET allowed_models = NULL').run(), /NOT NULL/)
+    assert.doesNotThrow(() => applyMigrations(db, { migrationsDir: src }))
+  } finally {
+    db.close()
+  }
+})
+
 test('migration 042 adds image generation columns; old rows and prompt totals stay the same', () => {
   const src = path.join(process.cwd(), 'src/lib/db/migrations')
   const migSrc = path.join(tmp, 'mig042')

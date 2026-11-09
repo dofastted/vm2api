@@ -2,6 +2,7 @@ import type { ApiKeyItem } from '@/types/panel-keys'
 import { describe, expect, it } from 'vitest'
 import {
   keyIsDead,
+  keyModelsText,
   keyQuotaLabel,
   keyQuotaPct,
   keyStatusTone,
@@ -65,5 +66,20 @@ describe('API key status and quota', () => {
     expect(keyStatusTone(key({ quota_usd: 5, quota_usd_used: 1 })).text).toBe(
       '启用'
     )
+  })
+})
+
+describe('API key model allowlist', () => {
+  it('reads an empty or missing list as unlimited', () => {
+    expect(keyModelsText(key({}))).toEqual({ text: '模型不限' })
+    expect(keyModelsText(key({ allowed_models: [] }))).toEqual({
+      text: '模型不限',
+    })
+  })
+
+  it('counts a limited list and lists the names in the title', () => {
+    expect(
+      keyModelsText(key({ allowed_models: ['claude-sonnet-5', 'gpt-6-sol'] }))
+    ).toEqual({ text: '限 2 个模型', title: 'claude-sonnet-5\ngpt-6-sol' })
   })
 })

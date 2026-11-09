@@ -731,10 +731,6 @@ export function getCapabilities(modelId = '') {
   return getModelEntry(modelId).capabilities
 }
 
-export function getBetaPolicy(modelId = '') {
-  return getModelEntry(modelId).betas
-}
-
 export function getContext1mWhitelist() {
   if (!loaded) loadModelPolicy()
   return normalizeContext1mWhitelist(policy.defaults?.context_1m_whitelist, DEFAULT_CONTEXT_1M_WHITELIST)

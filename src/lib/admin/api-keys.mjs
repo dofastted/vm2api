@@ -16,6 +16,7 @@
  */
 
 import { keyScopeFromRecord, normalizeKeyScope } from './key-scope.mjs'
+import { normalizeKeyAllowedModels, parseKeyAllowedModels } from './key-models.mjs'
 import { VmPoolsRepo } from '../db/repos/vm-pools-repo.mjs'
 import crypto from 'node:crypto'
 import { resolveStoreDb } from '../db/database.mjs'
@@ -135,6 +136,7 @@ export function publicKeyView(rec, { reveal = false } = {}) {
     tokens_out: rec.tokens_out || 0,
     category: rec.category === 'api' ? 'api' : 'oauth',
     ...keyScopeFromRecord(rec),
+    allowed_models: parseKeyAllowedModels(rec.allowed_models),
     inflight: undefined, // filled by store.snapshot
   }
 }
@@ -283,6 +285,7 @@ export class ApiKeyStore {
           { isApi: String(input.category || 'oauth').toLowerCase() === 'api' },
         ),
       ),
+      allowed_models: JSON.stringify(normalizeKeyAllowedModels(input.allowed_models)),
     }
     if (rec.expires_at && Number.isNaN(Date.parse(rec.expires_at))) {
       throw Object.assign(new Error('invalid expires_at'), { code: 'invalid_expires_at' })
@@ -336,6 +339,9 @@ export class ApiKeyStore {
     }
     const scope = normalizeKeyScope(patch, { partial: true, current: rec, isApi: rec.category === 'api' })
     if (scope) Object.assign(rec, storedKeyScope(scope))
+    if (Object.hasOwn(patch, 'allowed_models')) {
+      rec.allowed_models = JSON.stringify(normalizeKeyAllowedModels(patch.allowed_models))
+    }
     rec.updated_at = nowIso()
     return this.repo.update(rec)
   }

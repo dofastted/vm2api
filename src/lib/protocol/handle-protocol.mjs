@@ -67,6 +67,7 @@ import { loggedReasoningEffort } from './thinking.mjs'
 import { reasoningEffortOf, sessionIdForLog } from './log-fields.mjs'
 import { ownerScopeFromRequest } from '../admin/resource-owner.mjs'
 import { keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
+import { keyModelError } from '../admin/key-models.mjs'
 import {
   resolveInferenceEngine,
   resolveOfficialCcInference,
@@ -154,7 +155,15 @@ import {
   fillMissingCacheTtl,
   validateCacheBreakpoints,
 } from './cache-ttl.mjs'
-import { confirmCachePrefix, describeCacheContinuity, formatCacheBreak, prepareCachePrefix } from './cache-prefix.mjs'
+import {
+  confirmCachePrefix,
+  describeCacheContinuity,
+  formatCacheBreak,
+  peekInterceptSession,
+  prepareCachePrefix,
+} from './cache-prefix.mjs'
+import { createRequestBodyContext, shallowCopyBody } from './request-body-context.mjs'
+import { jevInterceptSessionCache } from './jev-intercept.mjs'
 import { ensureClaudeWebSearch, shouldInjectClaudeWebSearch } from './web-search.mjs'
 import { dispatchStreamInference } from '../transport/kernel-router.mjs'
 import { syncClaudeKernelConfigsFromFile } from '../transport/rust-kernel-supervisor.mjs'
@@ -237,6 +246,17 @@ export function createHandleProtocol(deps) {
       status: gate.status,
       details: gate.detail || undefined,
     }).body
+  }
+
+  /** Key allowlist on the model the client named, before any mapping: 400 in the caller's protocol. */
+  function rejectKeyModel(req, res, protocol, model, logBag) {
+    const denied = keyModelError(req, model, { anthropic: protocol === 'anthropic.messages' })
+    if (!denied) return false
+    stats.errors++
+    logBag.error_code = denied.body.error.code
+    logBag.error_message = denied.body.error.message
+    json(res, denied.status, denied.body)
+    return true
   }
 
   // Codex handlers write usage onto logBag themselves. The key is charged the
@@ -377,6 +397,8 @@ export function createHandleProtocol(deps) {
     res,
     account = null,
     scopeMatched = false,
+    bodyCtx = null,
+    interceptSessionKey = null,
   }) {
     const official =
       isOfficialClaudeCodeTraffic(req.headers, inbound) ||
@@ -389,6 +411,7 @@ export function createHandleProtocol(deps) {
     } catch {
       jev = readJevConfig()
     }
+    const interceptSession = interceptSessionKey ? peekInterceptSession(interceptSessionKey) : null
     const decision = await runProtocolIntercept({
       inbound,
       body,
@@ -403,6 +426,8 @@ export function createHandleProtocol(deps) {
       requestId,
       account,
       scopeMatched,
+      bodyCtx,
+      interceptSession,
     })
     if (!decision || decision.action !== 'block') {
       if (decision?.intercept) logBag.intercept = decision.intercept
@@ -700,6 +725,8 @@ export function createHandleProtocol(deps) {
         usage: logBag.usage,
       })
     }
+    // After the Desktop sign-in probe, which runs no model.
+    if (rejectKeyModel(req, res, protocol, inbound?.model, logBag)) return
     if (
       claudeCodeOnlyFromRouting(routingNow) &&
       !panelDiagnostics &&
@@ -920,6 +947,7 @@ export function createHandleProtocol(deps) {
         return json(res, 200, mock)
       }
     }
+    const earlyBodyCtx = createRequestBodyContext(ctx.body)
     if (
       preReviewEnabled &&
       (await applyProtocolIntercept({
@@ -931,6 +959,7 @@ export function createHandleProtocol(deps) {
         requestId: logCtx.request_id,
         res,
         scopeMatched: apiRiskReview,
+        bodyCtx: earlyBodyCtx,
       }))
     ) {
       return
@@ -1128,11 +1157,21 @@ export function createHandleProtocol(deps) {
         }
       }
     }
+    const bodyCtx = createRequestBodyContext(ctx.body)
     // API endpoint opt-in is checked once before conversion, including when dedup is disabled.
     if (
       !apiRiskReview &&
       preReviewEnabled &&
-      (await applyProtocolIntercept({ req, inbound, body: ctx.body, fp, logBag, requestId: logCtx.request_id, res }))
+      (await applyProtocolIntercept({
+        req,
+        inbound,
+        body: ctx.body,
+        fp,
+        logBag,
+        requestId: logCtx.request_id,
+        res,
+        bodyCtx,
+      }))
     ) {
       return
     }
@@ -1470,6 +1509,7 @@ export function createHandleProtocol(deps) {
       const { body: prepared, ...prefix } = prepareCachePrefix(key, body, Date.now(), {
         imageKey,
         preserveMessageCache,
+        ctx: bodyCtx,
       }) || { body }
       logBag.cache_prefix = prefix
       logBag.cache_prefix_key = key
@@ -1523,6 +1563,7 @@ export function createHandleProtocol(deps) {
           body: canonicalBody,
           sessionId: outboundSessionId || callerSession || stickyKey,
           preserveMessageCache,
+          bodyCtx,
         },
         stream: upstreamStream,
         deliveryMode,
@@ -1549,6 +1590,8 @@ export function createHandleProtocol(deps) {
               requestId: logCtx.request_id,
               res,
               account: scopeAccountFromVm(selected?.vm, findAccount(accountQuota, selected?.vm)?.unified),
+              bodyCtx,
+              interceptSessionKey: attemptSessionId ? `${selected.accountId}:${attemptSessionId}` : null,
             })
             if (blocked) {
               const error = new Error('response already sent')
@@ -1606,7 +1649,7 @@ export function createHandleProtocol(deps) {
             const outboundProfile = profileForPreset(resolvedPersona)
             // Render once from caller input with the selected slot's identity, not the pre-selection environment.
             if (!requestContext && !officialPassthrough) {
-              hopBody = applyCrsUnofficialPersona(prepareCliPersonaInput(structuredClone(personaIn), resolvedPersona), {
+              hopBody = applyCrsUnofficialPersona(prepareCliPersonaInput(shallowCopyBody(personaIn), resolvedPersona), {
                 forceConfigured: true,
                 routingFile: routingConfigPath,
                 cacheTtl: requestedCacheTtl,
@@ -1704,7 +1747,7 @@ export function createHandleProtocol(deps) {
           cacheTtl = requestedCacheTtl
           if (!requestContext && !officialPassthrough && (modeOverride || officialTraffic)) {
             const configuredMode = modeOverride || resolveSlotPersonaPreset(selected.vm, routingNow)
-            const rewritten = applyCrsUnofficialPersona(structuredClone(personaIn), {
+            const rewritten = applyCrsUnofficialPersona(shallowCopyBody(personaIn), {
               officialClient: false,
               forceConfigured: true,
               routingFile: routingConfigPath,
@@ -1913,7 +1956,9 @@ export function createHandleProtocol(deps) {
 
     result = acceptAssistantHop(result)
     if (result?.finalState === 'verified' && logBag.cache_prefix_key) {
-      confirmCachePrefix(logBag.cache_prefix_key)
+      confirmCachePrefix(logBag.cache_prefix_key, Date.now(), {
+        intercept: jevInterceptSessionCache(inbound, ctx.body, { ctx: bodyCtx }),
+      })
     }
     logBag.vm_id = result?.vmId || null
     logBag.account_id = result?.accountId || null
@@ -2109,6 +2154,7 @@ export function createHandleProtocol(deps) {
     }
     logBag.model = typeof body?.model === 'string' ? body.model : null
     logBag.inbound_summary = summarizeBody(body)
+    if (rejectKeyModel(req, res, protocol, body?.model, logBag)) return
     return runWithCodexKey(req, res, logBag, () =>
       handleCodexSearch({
         req,
@@ -2321,6 +2367,8 @@ export function createHandleProtocol(deps) {
     }
     logBag.model = typeof body?.model === 'string' ? body.model : null
     logBag.inbound_summary = summarizeImagesBody(body)
+    // No model means the upstream default, which a limited key cannot name.
+    if (rejectKeyModel(req, res, protocol, body?.model, logBag)) return
     return runWithCodexKey(req, res, logBag, () =>
       handleCodexImages({
         req,

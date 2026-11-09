@@ -134,7 +134,10 @@ export async function evaluateProtocolIntercept({
   account = null,
   scopeMatched = false,
   fetchImpl,
+  bodyCtx = null,
+  interceptSession = null,
 } = {}) {
+  const interceptOpts = { interceptSession, ctx: bodyCtx }
   // Explicit API endpoint opt-in supplies scope without an OAuth account.
   // GPT / Codex skips every layer unless the panel opts it in. Once a scope
   // is set, the slot decides GPT: a scope with no GPT pair and no named
@@ -175,11 +178,11 @@ export async function evaluateProtocolIntercept({
     })
   }
 
-  const document = prepareInterceptText(jevDocument(inbound, body), {
+  const document = prepareInterceptText(jevDocument(inbound, body, interceptOpts), {
     stripReminders: jev?.strip_reminders !== false,
     expandBase64: jev?.expand_base64 !== false,
   })
-  const modelDocument = prepareInterceptText(jevModelDocument(inbound, body), {
+  const modelDocument = prepareInterceptText(jevModelDocument(inbound, body, interceptOpts), {
     stripReminders: jev?.strip_reminders !== false,
     expandBase64: jev?.expand_base64 !== false,
   })
