@@ -9,7 +9,6 @@ import { atomicWriteJson } from '../vm/vm-file.mjs'
 import {
   listVms,
   getVm,
-  persistAccountTier,
   persistVmQuotaOverride,
   persistVmSessionSlots,
   persistVmMaxSessions,
@@ -754,13 +753,8 @@ export function createRoutingRuntime(ctx) {
         const accountId = selected?.accountId
         if (accountId) {
           try {
-            ctx.accountQuota.setAccountTier(accountId, 'max')
+            // Model access is not subscription evidence (Pro may also have it).
             ctx.accountQuota.clearModelUnsupported(accountId, model)
-          } catch {}
-        }
-        if (selected?.vmId) {
-          try {
-            persistAccountTier(ctx.cfg.paths.project, selected.vmId, 'max')
           } catch {}
         }
       },
