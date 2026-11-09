@@ -37,6 +37,7 @@ const KEEP = [
   'x-stainless-helper-method',
   'x-claude-code-session-id',
   'x-claude-code-request-class',
+  'x-claude-code-sandy-plover',
   'x-claude-code-agent-id',
   'x-claude-code-agent-type',
   'x-claude-code-parent-agent-id',
@@ -64,6 +65,7 @@ const DEVICE_HEADER_KEYS = [
   'x-stainless-helper-method',
   'x-claude-code-session-id',
   'x-claude-code-request-class',
+  'x-claude-code-sandy-plover',
   'x-claude-code-agent-id',
   'x-claude-code-agent-type',
   'x-claude-code-parent-agent-id',
@@ -96,6 +98,7 @@ const DEFAULTS = {
   'x-stainless-retry-count': '0',
   'x-stainless-timeout': '600',
   'anthropic-dangerous-direct-browser-access': 'true',
+  'x-claude-code-sandy-plover': '[]',
 }
 
 /** Betas that must not be replayed for unofficial clients. */

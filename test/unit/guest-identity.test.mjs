@@ -26,7 +26,7 @@ test('merge keeps device/session and maps arch', () => {
   assert.equal(out.stainless_os, 'Linux')
   assert.equal(out.stainless_arch, 'x64')
   assert.equal(out.hostname, '01')
-  assert.equal(out.stainless_runtime_version, 'v26.3.0')
+  assert.equal(out.stainless_runtime_version, 'v26.12.1')
 })
 
 test('merge keeps official machine as device_id and parks guest machine', () => {

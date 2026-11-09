@@ -147,6 +147,7 @@ const MODEL_SENTENCE_CATALOG = Object.freeze({
   'claude-opus-5-5': ['Opus 5.5', 'June 2026'],
   'claude-fable-5': ['Fable 5', 'January 2026'],
   'claude-fable-5-1': ['Fable 5.1', 'June 2026'],
+  'claude-fable-5-2': ['Fable 5.2', 'June 2026'],
   'claude-mythos-5': ['Mythos 5', 'January 2026'],
   'claude-mythos-5-1': ['Mythos 5.1', 'June 2026'],
 })
@@ -225,7 +226,8 @@ export function classifySystemText(text) {
   if (t.trimStart().startsWith('# Environment')) return 'env'
   if (t.includes('You are an agent working with the user toward their goals')) return 'harness'
   if (t.trim() === '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__') return 'boundary'
-  if (t.includes('Write code that reads like the surrounding code')) return 'guidance'
+  if (t.includes('When you use a pronoun for someone') || t.includes('Write code that reads like the surrounding code'))
+    return 'guidance'
   if (t.includes('You are an interactive agent that helps users')) return 'main_full'
   if (t.trimStart().startsWith('# Reporting outcomes')) return 'reporting'
   return 'other'

@@ -14,7 +14,7 @@ import {
 } from './usage-interpret.mjs'
 
 /** Current Max model first; the previous id is only a fallback when this one is missing. */
-export const FABLE_TIER_MODELS = Object.freeze(['claude-fable-5-1', 'claude-fable-5'])
+export const FABLE_TIER_MODELS = Object.freeze(['claude-fable-5-2', 'claude-fable-5-1', 'claude-fable-5'])
 export const FABLE_PROBE_MODEL = FABLE_TIER_MODELS[0]
 export const OAUTH_USAGE_PATH = '/api/oauth/usage'
 /** sub2api Extra / Messages 响应头被动采样，不打 GET /api/oauth/usage。 */

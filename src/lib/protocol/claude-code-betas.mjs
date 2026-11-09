@@ -21,6 +21,7 @@ export const BETA_THINKING_BINDING_CONTROLS = 'thinking-binding-controls-2026-08
 export const BETA_EFFORT = 'effort-2025-11-24'
 export const BETA_EXTENDED_CACHE_TTL = 'extended-cache-ttl-2025-04-11'
 export const BETA_CACHE_DIAGNOSIS = 'cache-diagnosis-2026-04-07'
+export const BETA_TOOL_PROVENANCE = 'tool-provenance-2026-10-26'
 export const BETA_CONTEXT_MANAGEMENT = 'context-management-2025-06-27'
 export const BETA_FALLBACK_CREDIT = 'fallback-credit-2026-06-01'
 export const BETA_CONTEXT_1M = 'context-1m-2025-08-07'
@@ -35,6 +36,7 @@ const PER_TURN_MODELS = {
   'claude-sonnet-5-5': true,
   'claude-opus-5-5': true,
   'claude-fable-5-1': true,
+  'claude-fable-5-2': true,
 }
 const MID_TOOL_CHANGE_MODELS = {
   'claude-haiku-5-5': true,
@@ -44,6 +46,7 @@ const MID_TOOL_CHANGE_MODELS = {
   'claude-opus-5-5': true,
   'claude-fable-5': true,
   'claude-fable-5-1': true,
+  'claude-fable-5-2': true,
   'claude-mythos-5-1': true,
 }
 const FAST_MODE_MODELS = {
@@ -57,6 +60,7 @@ const MID_OUTPUT_CONFIG_MODELS = {
   'claude-opus-5': true,
   'claude-opus-5-5': true,
   'claude-fable-5-1': true,
+  'claude-fable-5-2': true,
   'claude-mythos-5-1': true,
 }
 
@@ -100,7 +104,7 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
   if (Object.hasOwn(MID_TOOL_CHANGE_MODELS, model) || model === 'auto') add(BETA_MID_CONVERSATION_TOOL_CHANGES)
   if (body.thread != null && Object.hasOwn(MID_OUTPUT_CONFIG_MODELS, model)) add(BETA_MID_CONVERSATION_OUTPUT_CONFIG)
   if (body.output_config?.effort != null) add(BETA_EFFORT)
-  if (body.thinking?.display === 'updates') add(BETA_THINKING_DISPLAY_UPDATES)
+  if (body.thinking?.display === 'updates') add(BETA_THINKING_DISPLAY_UPDATES, BETA_EXTENDED_CACHE_TTL)
   if (Array.isArray(body.safeguards) && body.safeguards.some((item) => item?.type === 'dangerous_tool_use'))
     add(BETA_DANGEROUS_TOOL_USE)
   if (body.output_config?.format) add('structured-outputs-2025-12-15')
@@ -159,17 +163,18 @@ export function withRequestProtocolBetas(tokens = [], body = {}) {
 
 export const HAIKU_BETA_HEADER = `${BETA_OAUTH},${BETA_INTERLEAVED}`
 
-/** Official 2.1.303 `--print` prefix. Field-gated tokens stay after it. */
+/** Official 2.1.321 `--print` prefix. Field-gated tokens stay after it. */
 export function fullClaudeCodeMimicryBetas() {
   return [
     BETA_CLAUDE_CODE,
     BETA_OAUTH,
     BETA_INTERLEAVED,
-    BETA_THINKING_TOKEN_COUNT,
     BETA_CONTEXT_MANAGEMENT,
     BETA_PROMPT_CACHING_SCOPE,
     'per-turn-control-2026-07-01',
     BETA_MID_CONVERSATION_TOOL_CHANGES,
+    BETA_TOOL_PROVENANCE,
+    BETA_THINKING_TOKEN_COUNT,
     BETA_ADVANCED_TOOL_USE,
     BETA_MID_CONVERSATION_SYSTEM_CLEAR_AT,
     BETA_EFFORT,

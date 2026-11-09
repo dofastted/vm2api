@@ -22,7 +22,7 @@ export const OFFICIAL_CLI_HEADERS = Object.freeze({
   'x-stainless-os': 'Linux',
   'x-stainless-arch': 'x64',
   'x-stainless-runtime': 'node',
-  'x-stainless-runtime-version': 'v26.3.0',
+  'x-stainless-runtime-version': 'v26.12.1',
   'x-stainless-package-version': '0.128.0',
   'x-stainless-retry-count': '0',
   'x-stainless-timeout': '600',

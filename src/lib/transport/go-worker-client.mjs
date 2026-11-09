@@ -10,7 +10,7 @@ import { pinThreadBetas, rememberThreadTurn } from '../protocol/thread-betas.mjs
 import { applyThinkingDisplay, ensureOfficialPrintThinking, thinkingDisplayMode } from '../protocol/thinking.mjs'
 import { modelDirectiveForCrag } from '../protocol/model-policy.mjs'
 import { capOutboundBody } from '../protocol/outbound-snapshot.mjs'
-import { stripSubagentBilling } from '../identity/crs-persona.mjs'
+import { ccEntrypointFromRouting, stripSubagentBilling } from '../identity/crs-persona.mjs'
 import { sealClaudeCodeCch } from '../identity/cch.mjs'
 import { credentialModeFromOauth } from '../oauth/credential-mode.mjs'
 import { isCrsMock, writeCrsTrace, mockCrsPayload, emitMockSse } from './crs-mock.mjs'
@@ -454,7 +454,10 @@ export function prepareWorkerPayload({
   const displayed =
     requestContext?.purpose === 'auto_mode_classifier' || repaired
       ? canonicalBody
-      : ensureOfficialPrintThinking(applyThinkingDisplay(canonicalBody, thinkingDisplayMode(routing)))
+      : ensureOfficialPrintThinking(
+          applyThinkingDisplay(canonicalBody, thinkingDisplayMode(routing)),
+          ccEntrypointFromRouting(routing),
+        )
   const main = stripSubagentBilling(displayed)
   const thread = pinThreadBetas(
     main,

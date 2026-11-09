@@ -152,7 +152,7 @@ test('fable attempts: 200 is Max, 403-only is Pro, 429 does not classify', () =>
   )
   assert.equal(tierFromFableAttempts([{ ok: false, limited: true, status: 429, model: FABLE_PROBE_MODEL }]).tier, null)
   assert.equal(tierFromFableAttempts([{ transport: true, status: 0 }]).tier, null)
-  assert.equal(FABLE_PROBE_MODEL, 'claude-fable-5-1')
+  assert.equal(FABLE_PROBE_MODEL, 'claude-fable-5-2')
 })
 
 test('fable 403 permission is plan denied, not account ban', () => {
