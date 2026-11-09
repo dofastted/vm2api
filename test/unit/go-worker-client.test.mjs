@@ -257,6 +257,33 @@ test('cli-hop appends inline-tools when a message carries a tool_definition', ()
   assert.ok(!plain.body.betas.includes('inline-tools-2026-09-15'))
 })
 
+test('CRAG v2 receives the preset model boundary and the standard kernel does not', () => {
+  const body = { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] }
+  const reqHeaders = {}
+  const crag = finalizeWorkerPayload({
+    body,
+    reqHeaders,
+    exec: {
+      homeDir: '',
+      vm: { dataplane: 'crag', crag_kernel_version: 'v2', claude: { mode: 'setup-token', scope: 'user:inference' } },
+    },
+    identity: null,
+  })
+  assert.equal(crag.body.crag_model.id, 'claude-haiku-4-5-20251001')
+  assert.equal(crag.body.crag_model.capabilities.supports_context_management, false)
+  assert.equal(crag.body.crag_model.capabilities.supports_effort, false)
+  assert.equal(crag.body.crag_model.params.max_tokens_default, 8192)
+  assert.equal(crag.body.crag_model.params.max_tokens_cap, 64000)
+  assert.ok(crag.body.crag_model.betas.drop.includes('context-management-2025-06-27'))
+  const wrap = finalizeWorkerPayload({
+    body,
+    reqHeaders,
+    exec: { homeDir: '', vm: { dataplane: 'wrap', claude: { mode: 'setup-token', scope: 'user:inference' } } },
+    identity: null,
+  })
+  assert.equal(wrap.body.crag_model, undefined)
+})
+
 const unix = process.platform !== 'win32'
 const unixTest = unix ? test : test.skip
 
