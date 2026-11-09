@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { SLOT_CAPS_NODE } from '../../src/lib/cluster/placement.mjs'
 import { codexRoleMatches, slotContainerBody } from '../../src/lib/cluster/remote-slot.mjs'
-import { REMOTE_KERNEL_ENTRY } from '../../src/lib/vm/slot-engine.mjs'
+import { REMOTE_CRAG_ENTRY, REMOTE_KERNEL_ENTRY } from '../../src/lib/vm/slot-engine.mjs'
 import { CODEX_SLOT_ROLE, slotContainerCommand } from '../../src/lib/vm/vm-runtime.mjs'
 import { slotHost } from '../../src/lib/vm/slot-host.mjs'
 import { startSlotReady } from '../../src/lib/vm/slot-runtime.mjs'
@@ -42,6 +42,17 @@ for (const runtime of [undefined, { type: 'docker' }]) {
     assert.equal(spec.Labels['kin.vm.runtime'], 'docker')
   })
 }
+
+test('a remote Claude slot switched to CRAG v2 boots the live kernel with the userns sandbox', () => {
+  const spec = body({ ...claude, dataplane: 'crag', crag_kernel_version: 'v2' })
+  assert.deepEqual(spec.Cmd, [REMOTE_CRAG_ENTRY, '--gateway-worker', '--config', '/run/kin/kernel.json'])
+  assert.equal(spec.HostConfig.Init, true)
+  assert.deepEqual(spec.HostConfig.SecurityOpt, [
+    'no-new-privileges',
+    'seccomp=/home/node/vms/vm-codex-01/crag-v2-seccomp.json',
+    'apparmor=unconfined',
+  ])
+})
 
 test('local Claude commands retain their bind-mounted and wrapped kernel entries', () => {
   assert.deepEqual(slotContainerCommand(claude), [
