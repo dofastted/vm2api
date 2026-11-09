@@ -17,6 +17,43 @@ import {
   probeVmUsage,
 } from '../../src/lib/oauth/crs-usage-probe.mjs'
 
+test('probe takes the plan from official profile even when native usage has no model catalog', async () => {
+  const result = await probeVmUsage({
+    exec: { vmId: 'vm-01' },
+    includeFable: false,
+    usageGet: async () => ({
+      ok: true,
+      status: 200,
+      body: {
+        five_hour: { utilization: 10 },
+        seven_day: { utilization: 20 },
+        seven_day_sonnet: null,
+        extra_usage: null,
+      },
+    }),
+    slotOauth: async (_exec, op) => {
+      assert.equal(op, 'profile')
+      return { ok: true, body: { account: { has_claude_pro: true, has_claude_max: false } } }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.account_tier, 'pro')
+  assert.equal(result.account_tier_source, 'profile')
+  assert.equal(result.usage_has_fable, null)
+})
+
+test('unavailable profile leaves the plan unknown without hiding a successful usage read', async () => {
+  const result = await probeVmUsage({
+    exec: { vmId: 'vm-01' },
+    includeFable: false,
+    usageGet: async () => ({ ok: true, status: 200, body: { seven_day: { utilization: 20 }, extra_usage: null } }),
+    slotOauth: async () => ({ ok: false, body: { error: { code: 'profile_failed' } } }),
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.account_tier, null)
+  assert.equal(result.profile_error, 'profile_failed')
+})
+
 test('official weekly-only usage is complete without inventing a session window', () => {
   const data = {
     five_hour: null,

@@ -1233,7 +1233,10 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       stats = { ...stats, subscription_type: account.subscription_type, rate_limit_tier: account.rate_limit_tier }
     }
     let tierSource = null
-    if (stats?.limits_present === true && !stats.account_tier) {
+    if (account.account_tier) {
+      stats = { ...stats, account_tier: account.account_tier }
+      tierSource = 'profile'
+    } else if (stats?.limits_present === true && !stats.account_tier) {
       const accountTier = inferTierFromOfficialStats('', stats)
       if (accountTier) stats = { ...stats, account_tier: accountTier }
     }

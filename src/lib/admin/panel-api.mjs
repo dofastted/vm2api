@@ -1258,6 +1258,7 @@ export async function buildProbeOne({
     {
       has_token: true,
       account_tier: after?.unified?.account_tier || null,
+      account_tier_source: after?.unified?.account_tier_source || null,
       fable: qAfter.fable,
       utilization_7d_oi: qAfter.utilization_7d_oi,
       reset_7d_oi: qAfter.reset_7d_oi,
@@ -1267,10 +1268,17 @@ export async function buildProbeOne({
     qAfter,
   ).key
   const completeUsage = result.ok === true && result.limits_present === true
-  if (completeUsage && (result.account_tier === 'pro' || result.account_tier === 'max')) {
+  if (result.account_tier_source === 'profile' && (result.account_tier === 'pro' || result.account_tier === 'max')) {
+    accountQuota.setAccountTier(accountId, result.account_tier, { source: 'profile' })
+    persistAccountTier(cfg.paths.project, id, result.account_tier, { source: 'profile' })
+  } else if (completeUsage && (result.account_tier === 'pro' || result.account_tier === 'max')) {
     accountQuota.setAccountTier(accountId, result.account_tier, { source: 'usage' })
     persistAccountTier(cfg.paths.project, id, result.account_tier, { source: 'usage' })
-  } else if (completeUsage && (tier === 'pro' || tier === 'max')) {
+  } else if (
+    completeUsage &&
+    (result.usage_has_fable != null || result.seven_day_oi) &&
+    (tier === 'pro' || tier === 'max')
+  ) {
     accountQuota.setAccountTier(accountId, tier, { source: 'usage' })
     persistAccountTier(cfg.paths.project, id, tier, { source: 'usage' })
   }
@@ -1668,6 +1676,7 @@ export function quotaFromAccount(acc, quotaConfig) {
     last_probe_check: u.last_probe_check || null,
     probe_source: u.source || acc?.last_probe?.source || null,
     account_tier: u.account_tier || null,
+    account_tier_source: u.account_tier_source || null,
     usage_has_fable: u.usage_has_fable ?? null,
   }
   const cfg = weeklySplitConfig(quotaConfig || {})
@@ -1862,7 +1871,8 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     : inferClaudeTier(
         {
           has_token: hasToken,
-          account_tier: v.account_tier || q.account_tier,
+          account_tier: v.account_tier,
+          account_tier_source: v.account_tier_source,
           fable: q.fable,
           utilization_7d_oi: q.utilization_7d_oi,
           reset_7d_oi: q.reset_7d_oi,
