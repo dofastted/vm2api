@@ -8,6 +8,7 @@ import {
   activateCragLicense,
   checkCragLicense,
   cragLicenseDirectory,
+  cragUniversalDirectory,
   getCragLicense,
   verifyCragRegistration,
 } from '../../src/lib/vm/crag-license.mjs'
@@ -128,6 +129,36 @@ test('universal CRAGU1 activates without creating a device binding', async (t) =
   const expired = issueUniversalCode(root, { issued_at: Math.floor(Date.now() / 1000) - 70 * 86400 })
   assert.throws(() => activateCragLicense(root, vm, expired.code), { code: 'license_expired' })
   assert.deepEqual(fs.readFileSync(path.join(dir, 'registration.code')), stored)
+})
+
+test('one offline code licenses every slot and does not replace a device grant', (t) => {
+  const { root, vm } = fixture(t)
+  const bound = activateFixture(root, vm)
+  assert.equal(bound.license.kind, 'online')
+  const before = fs.readFileSync(path.join(cragLicenseDirectory(root, vm), 'registration.code'))
+  const other = { id: 'vm-14', status: 'stopped', dataplane: 'crag' }
+  fs.mkdirSync(path.join(root, 'vms', other.id), { recursive: true })
+  fs.writeFileSync(path.join(root, 'vms', `${other.id}.json`), JSON.stringify(other))
+  fs.writeFileSync(path.join(root, 'vms', other.id, 'machine-id'), crypto.randomBytes(16).toString('hex') + '\n')
+  const issued = issueUniversalCode(root)
+  const activated = activateCragLicense(root, other, issued.code)
+  assert.equal(activated.license.scope, 'kernel')
+  assert.equal(fs.readFileSync(path.join(cragLicenseDirectory(root, vm), 'registration.code')).equals(before), true)
+  assert.equal(getCragLicense(root, vm).license.kind, 'online')
+  const shared = getCragLicense(root, other)
+  assert.equal(shared.license.valid, true)
+  assert.equal(shared.license.kind, 'offline')
+  assert.equal(shared.license.scope, 'kernel')
+  assert.equal(checkCragLicense(root, other).ok, true)
+  assert.equal(fs.existsSync(path.join(cragLicenseDirectory(root, other), 'device.json')), false)
+  const third = { id: 'vm-15', status: 'stopped', dataplane: 'crag' }
+  fs.mkdirSync(path.join(root, 'vms', third.id), { recursive: true })
+  fs.writeFileSync(path.join(root, 'vms', `${third.id}.json`), JSON.stringify(third))
+  assert.equal(getCragLicense(root, third).license.license_id, issued.claims.license_id)
+  assert.equal(
+    fs.readFileSync(path.join(cragUniversalDirectory(root), 'registration.code'), 'utf8').trim(),
+    issued.code,
+  )
 })
 
 test('wrong VM, machine, signer, tamper and wrapped-key failure never replace an existing grant', (t) => {

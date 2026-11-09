@@ -285,7 +285,13 @@ import { restartRustKernel, syncClaudeKernelConfigs, writeKernelConfig } from '.
 import { countTokensViaWorker } from '../transport/go-worker-client.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from '../protocol/claude-code-betas.mjs'
 import { rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
-import { activateCragLicense, checkCragLicense, CragLicenseError, getCragLicense } from '../vm/crag-license.mjs'
+import {
+  activateCragLicense,
+  checkCragLicense,
+  CragLicenseError,
+  distributeCragUniversalGrant,
+  getCragLicense,
+} from '../vm/crag-license.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
@@ -2970,7 +2976,9 @@ export function createPanelHandler(ctx) {
           if (req.method === 'GET')
             return json(res, 200, panel.ok(getCragLicense(cfg.paths.project, vm, { initialize: true })))
           const body = await readBody(req, 32768)
-          return json(res, 200, panel.ok(activateCragLicense(cfg.paths.project, vm, body?.registration_code)))
+          const activated = activateCragLicense(cfg.paths.project, vm, body?.registration_code)
+          if (activated.license?.scope === 'kernel') await distributeCragUniversalGrant(cfg.paths.project)
+          return json(res, 200, panel.ok(activated))
         } catch (error) {
           const typed = error instanceof CragLicenseError
           return json(res, typed ? 403 : 400, {

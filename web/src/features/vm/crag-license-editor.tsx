@@ -9,7 +9,7 @@ import { Textarea } from '@/components/ui/textarea'
 
 const licenseMessages: Record<string, string> = {
   license_required:
-    '本槽尚未授权。可直接粘贴离线通用码，或复制机器码申请在线设备授权。',
+    '尚未授权。可粘贴一张离线通用码解锁全部槽位和机器，或复制机器码申请在线设备授权。',
   license_expired: '授权已到期。请向授权方申请续期，并在下方替换注册码。',
   license_not_yet_valid:
     '授权尚未生效。请核对服务器 UTC 时间和生效时间；如签发时间有误，请联系授权方重新签发。',
@@ -284,7 +284,7 @@ export function CragLicenseEditor({
             className='text-xs leading-relaxed text-muted-foreground'
           >
             {mode === 'offline'
-              ? '粘贴 CRAGU1 离线通用码。不需要机器码，也不绑定本槽。校验通过后才替换当前授权。'
+              ? '粘贴一张 CRAGU1。不需要机器码，也不按槽或机器核销。校验通过后，同一授权同步到全部槽位。'
               : '粘贴与上方机器码对应的 CRAGL1。不属于本槽的码会被拒绝，已有授权不会被破坏。'}
           </p>
         </div>
