@@ -71,7 +71,7 @@ native cli-hop 优先完整保留 Node 已组装、带 billing 的 wire system�
 
 ### CRAG v2 print
 
-CRAG v2 槽的 worker 传输是 **print**，不是 TUI。官方二进制是 `claude-code-2.1.317`。`kernel.json` 的 `persona_preset` 和 `CLAUDE_CODE_SYSTEM_LAYOUT` 不被这个 worker 读取，也不能靠 `--bare` 做 0注入：`--bare` 会把 OAuth 槽切成只认 API key。
+CRAG v2 槽的 worker 传输是 **print**，不是 TUI。官方二进制是 `claude-code-2.1.317`。`kernel.json` 的 `persona_preset` 和 `CLAUDE_CODE_SYSTEM_LAYOUT` 不被这个 worker 读取，也不能靠 `--bare` 做 0注入：`--bare` 会把 OAuth 槽切成只认 API key。是否走 print 只看这台 VM 实际启用的内核：运行中的 health `runtime_variant=crag-v2` 优先，其次是槽位自己写明的 `dataplane` / `crag_kernel_version`，再其次是该槽 `run/kernel.json`。全局 `routing.inference` 不能把 wrap、cc 或未写内核的槽送上 print。legacy CRAG 仍走 cli-node。
 
 system提示词页有两套。cli-node 仍用上面的模板。CRAG 一套只认 `compatibility.crag_persona_preset`：
 
