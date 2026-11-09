@@ -45,7 +45,12 @@ import { applyOfficialFingerprintToVm, readOfficialCcIdentity } from '../identit
 import { writeSlotSeedFiles, inferProjectRootFromCliHome } from '../vm/slot-seed.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import { atomicWriteJson, listVmRecordFiles } from '../vm/vm-file.mjs'
-import { CONTAINER_CLI_NODE_BIN, normalizeOfficialCcInference, resolveOfficialCcInference } from '../vm/slot-engine.mjs'
+import {
+  CONTAINER_CLI_NODE_BIN,
+  normalizeOfficialCcInference,
+  resolveOfficialCcInference,
+  resolveSlotClaude,
+} from '../vm/slot-engine.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { CRS_OFFICIAL_CLI_SYSTEM } from '../identity/crs-persona.mjs'
@@ -146,7 +151,7 @@ export function applyOfficialCcConfig(opts = {}, config = null) {
 export function officialCcQuotaSucceeded(usage) {
   if (!usage || typeof usage !== 'object') return false
   if (usage.ok) return true
-  return !!(usage.five_hour || usage.seven_day || usage.seven_day_oi || usage.extra_usage || usage.account_tier)
+  return !!(usage.five_hour || usage.seven_day || usage.seven_day_oi || usage.extra_usage)
 }
 
 export function slotIdleMemory(vm, routing) {
@@ -790,21 +795,20 @@ export function buildOfficialCcDockerArgs({
   bridgeUrl,
   prompt = DEFAULT_PLAN_PROMPT,
   vm,
+  routing = {},
 }) {
   const text = String(prompt || '').trim() || DEFAULT_PLAN_PROMPT
   const slash = isOfficialCcSlashPrompt(text)
+  const selected = resolveSlotClaude(vm || { id: vmId }, routing, slotHost(vm || { id: vmId }))
   return slotExecArgv(
     vm || { id: vmId },
     [
-      CONTAINER_CLI_NODE_BIN,
+      selected.bin,
       ...(slash
         ? [text, '--print', '--permission-mode', 'bypassPermissions', '--output-format', 'stream-json', '--verbose']
         : ['-p', text, '--permission-mode', 'bypassPermissions', '--output-format', 'json']),
-      // Direct api.anthropic.com: this CLI build drops the first-party identity
-      // block, and the gateway persona never runs. Compact Agent SDK identity
-      // is refused; the official CLI sentence has to land as system[0].
-      '--append-system-prompt',
-      CRS_OFFICIAL_CLI_SYSTEM,
+      // cli-node drops the first-party identity; the native CLI owns its own.
+      ...(!selected.native ? ['--append-system-prompt', CRS_OFFICIAL_CLI_SYSTEM] : []),
     ],
     {
       user: `${uid}:${gid}`,
@@ -817,7 +821,7 @@ export function buildOfficialCcDockerArgs({
         'PATH=/home/kincli/.local/bin:/usr/bin:/bin',
         'CLAUDE_CODE_HOST_REFRESH=1',
         OFFICIAL_CC_MARKER,
-        `CLAUDE_CODE_VERSION=${OFFICIAL_CLI_VERSION}`,
+        ...(!selected.native ? [`CLAUDE_CODE_VERSION=${OFFICIAL_CLI_VERSION}`] : []),
         'USER_TYPE=external',
         'CLAUDE_CODE_USE_BEDROCK=0',
         'CLAUDE_CODE_USE_VERTEX=0',
@@ -869,6 +873,7 @@ export async function runOfficialCcTurn({
   errFile,
   timeoutMs,
   vm,
+  routing,
 }) {
   const out = fs.openSync(outFile, 'w', 0o600)
   const err = fs.openSync(errFile, 'w', 0o600)
@@ -883,8 +888,9 @@ export async function runOfficialCcTurn({
       bridgeUrl,
       prompt,
       vm,
+      routing,
     }),
-    { stdio: ['ignore', out, err] },
+    { stdio: ['ignore', out, err], env: slotHost(vm || { id: vmId }).dockerEnv() || process.env },
   )
   const finished = await waitExit(child, timeoutMs)
   try {
@@ -985,9 +991,21 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 export async function runOfficialCcUsage({
   turn,
   homeDir,
+  nativeUsage = null,
   retries = OFFICIAL_USAGE_RETRIES,
   retryDelayMs = OFFICIAL_USAGE_RETRY_DELAY_MS,
 }) {
+  // Original Claude's /usage is interactive, not a print-mode command. Keep
+  // automated bootstrap on the same in-slot OAuth endpoint instead of sending
+  // the slash command as a model prompt.
+  if (nativeUsage) {
+    const result = await nativeUsage()
+    return {
+      turn: { ok: result.ok, code: result.ok ? 0 : 1, timed_out: false, error: result.body?.error?.code || null },
+      stats: result.ok ? parseOfficialCcStats(result.body) : null,
+      attempts: 1,
+    }
+  }
   const outFile = path.join(homeDir, '.claude', 'kin-official-usage.json')
   const errFile = path.join(homeDir, '.claude', 'kin-official-usage.err')
   let last = { turn: { ok: false, code: null, timed_out: false, error: null }, stats: null, attempts: 0 }
@@ -1154,19 +1172,27 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       step: 'hello',
     })
 
-    const cliNode = officialCcHostCli(homeDir)
-    if (!fs.existsSync(cliNode)) {
+    const host = slotHost(vm)
+    const selected = resolveSlotClaude(vm, routing, host)
+    const cliNode = path.join(homeDir, '.kin', path.posix.relative('/home/kincli/.kin', selected.bin))
+    if (!host.bakedKernel && !fs.existsSync(cliNode)) {
       const status = writeOfficialCcStatus(homeDir, {
         status: 'error',
         vm_id: vmId,
         started_at: startedAt,
         finished_at: new Date().toISOString(),
         wiped: wiped.wiped,
-        error: 'slot cli-node missing; run wrap-cli sync first',
+        error: 'selected Claude CLI missing; sync the selected kernel first',
       })
       return { ok: false, error: status.error, status }
     }
-    const claudeVersion = (await spawnCaptured([cliNode, '--version'], { timeoutMs: 15_000 })).stdout || null
+    const claudeVersion =
+      (
+        await spawnCaptured(['docker', ...slotExecArgv(vm, [selected.bin, '--version'], { user: host.execUser(vm) })], {
+          timeoutMs: 15_000,
+          env: host.dockerEnv() || process.env,
+        })
+      ).stdout || null
 
     const timezone = vm.timezone || vm.fingerprint?.timezone || 'UTC'
     const locale = vm.locale || vm.fingerprint?.locale || 'en_US.UTF-8'
@@ -1191,10 +1217,11 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       errFile: path.join(homeDir, '.claude', 'kin-official-hello.err'),
       timeoutMs,
       vm,
+      routing,
     })
     helloOk = !!hello.ok
     const turn = ({ prompt: text, outFile, errFile }) =>
-      runTurn({ vmId, uid, gid, timezone, locale, prompt: text, outFile, errFile, timeoutMs, vm })
+      runTurn({ vmId, uid, gid, timezone, locale, prompt: text, outFile, errFile, timeoutMs, vm, routing })
     writeOfficialCcStatus(homeDir, {
       status: 'running',
       vm_id: vmId,
@@ -1206,8 +1233,14 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       force,
       step: 'usage',
     })
+    const nativeOauth = selected.native ? slotOauth || (await import('../transport/slot-oauth.mjs')).runSlotOauth : null
     const usageRun = hello.ok
-      ? await runOfficialCcUsage({ turn, homeDir, retryDelayMs })
+      ? await runOfficialCcUsage({
+          turn,
+          homeDir,
+          retryDelayMs,
+          nativeUsage: nativeOauth ? () => nativeOauth({ vmId, homeDir, vm }, 'usage', { timeoutMs }) : null,
+        })
       : { turn: { ok: false, code: null, timed_out: false, error: null }, stats: null, attempts: 0 }
     const statsTurn = usageRun.turn
     let stats = usageRun.stats
@@ -1237,7 +1270,7 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       } catch {}
     }
 
-    const usageOk = officialCcQuotaSucceeded(stats)
+    const usageOk = statsTurn.ok === true && officialCcQuotaSucceeded(usageRun.stats)
     writeOfficialCcStatus(homeDir, {
       status: 'running',
       vm_id: vmId,

@@ -33,6 +33,7 @@ export const REMOTE_CC_NODE_BIN = `${REMOTE_KIN_DIR}/cc-node`
 // The slot-bin mount, not the image copy: a payload push updates this tree without a new image.
 export const REMOTE_CRAG_ENTRY = '/opt/kin-live/crag-kernel'
 export const REMOTE_CRAG_CLAUDE = '/opt/kin-live/crag-v2/claude-code-2.1.317/claude'
+export const CONTAINER_CRAG_V2_CLAUDE = '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude'
 
 export const KERNEL_NATIVE_SLOT_COUNT = 20
 export const SESSION_SLOT_MIN = 1
@@ -189,6 +190,17 @@ export function resolveCragKernelVersion(vm, routing = {}) {
   const fromRouting = normalizeCragKernelVersion(routing?.inference?.crag_kernel_version, { inherit: true })
   if (fromRouting) return fromRouting
   return 'legacy'
+}
+
+/** Terminal and OAuth must run the same CLI family as the selected kernel. */
+export function resolveSlotClaude(vm, routing = {}, host = {}) {
+  const dataplane = resolveKernelDataplane(vm, routing)
+  const native = dataplane === 'crag' && resolveCragKernelVersion(vm, routing) === 'v2'
+  if (native) return { bin: host.bakedKernel ? REMOTE_CRAG_CLAUDE : CONTAINER_CRAG_V2_CLAUDE, native: true }
+  return {
+    bin: dataplane === 'wrap' ? host.bins?.cli || CONTAINER_CLI_NODE_BIN : host.bins?.cc || CONTAINER_CC_NODE_BIN,
+    native: false,
+  }
 }
 
 export function parseCragKernelVersionPatch(value) {

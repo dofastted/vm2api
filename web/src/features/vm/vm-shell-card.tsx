@@ -128,6 +128,11 @@ export function VmShellCard({
     () => [
       {
         name: '/usage',
+        desc: '打开当前内核对应 Claude CLI 的用量',
+        input: 'claude /usage',
+      },
+      {
+        name: '/probe',
         desc: '查看用量（同「探测」）',
         run: async () => {
           const probe = await postVm<UsageProbe>(id, '/probe')

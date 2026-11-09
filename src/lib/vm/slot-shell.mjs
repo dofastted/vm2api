@@ -24,6 +24,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { ensureRemoteOfficialCredentialLink, reconcileSlotCredentials } from '../cluster/remote-slot-files.mjs'
 import { officialCcUidGid } from './vm-runtime.mjs'
+import { resolveSlotClaude } from './slot-engine.mjs'
 
 const SHELL_RE = /^\/api\/panel\/vms\/([^/]+)\/shell$/
 const TICKET_TTL_MS = 30_000
@@ -340,7 +341,7 @@ const SYSTEM_FACTS_RC = [
 ].join('\n')
 
 /**
- * Interactive shell for one panel session. `claude` is this slot's cli-node,
+ * Interactive shell for one panel session. `claude` is this slot's selected CLI,
  * not whatever `claude` is on PATH. The rcfile is session-only; the slot's
  * own ~/.bashrc is sourced, not rewritten. Startup prints a live 系统特征
  * block: slot computer files and cgroup limits first, then guest /proc and
@@ -348,13 +349,13 @@ const SYSTEM_FACTS_RC = [
  * unknown/未采集 and must not prevent the prompt.
  * @returns {{ cmd: string[], rc: string }}
  */
-export function panelShellLaunch(cliBin) {
+export function panelShellLaunch(cliBin, { native = false } = {}) {
   const bin = String(cliBin || '')
-  if (!bin.startsWith('/') || /[\n\r\0]/.test(bin)) throw new Error('invalid cli-node path')
+  if (!bin.startsWith('/') || /[\n\r\0]/.test(bin)) throw new Error('invalid Claude CLI path')
   const q = `'${bin.replace(/'/g, `'\\''`)}'`
   const rc = [
     'if [ -n "${BASH_VERSION:-}" ]; then [ -f /etc/bash.bashrc ] && . /etc/bash.bashrc; [ -f ~/.bashrc ] && . ~/.bashrc; fi',
-    'unalias claude 2>/dev/null || true',
+    'unalias claude usage /usage 2>/dev/null || true',
     // Official CLI reads ~/.claude/.credentials.json and, unless CLAUDE_CONFIG_DIR
     // is set, ~/.claude.json. Slot tokens already live in .claude; point the
     // session there and expose the nested account file at the home path.
@@ -362,12 +363,16 @@ export function panelShellLaunch(cliBin) {
     'export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"',
     // Same credentials.json as the host Refresher; a second refresher here would spend the shared RT.
     `export CLAUDE_CODE_HOST_REFRESH=1`,
-    `export CLAUDE_CODE_VERSION=${OFFICIAL_CLI_VERSION}`,
+    native ? 'unset CLAUDE_CODE_VERSION' : `export CLAUDE_CODE_VERSION=${OFFICIAL_CLI_VERSION}`,
     'export USER_TYPE=external',
     'mkdir -p "$CLAUDE_CONFIG_DIR"',
     'if [ -f "$CLAUDE_CONFIG_DIR/credentials.json" ] && [ ! -e "$CLAUDE_CONFIG_DIR/.credentials.json" ]; then ln -s credentials.json "$CLAUDE_CONFIG_DIR/.credentials.json" 2>/dev/null || true; fi',
     'if [ ! -e "$HOME/.claude.json" ] && [ -f "$CLAUDE_CONFIG_DIR/.claude.json" ]; then ln -s .claude/.claude.json "$HOME/.claude.json" 2>/dev/null || true; fi',
-    `claude() { export HOME="\${HOME:-/home/kincli}"; export CLAUDE_CONFIG_DIR="\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}"; if [ -x ${q} ]; then ${q} "$@"; else echo "cli-node 不在 ${q}" >&2; return 127; fi; }`,
+    `claude() { export HOME="\${HOME:-/home/kincli}"; export CLAUDE_CONFIG_DIR="\${CLAUDE_CONFIG_DIR:-\$HOME/.claude}"; if [ -x ${q} ]; then ${q} "$@"; else echo "Claude CLI 未安装" >&2; return 127; fi; }`,
+    'usage() { claude /usage "$@"; }',
+    'if [ -n "${BASH_VERSION:-}" ]; then eval \'/usage() { usage "$@"; }\'; fi',
+    // OSC 133 distinguishes a real shell prompt from a normal-buffer CLI TUI.
+    'if [ -n "${BASH_VERSION:-}" ]; then PS1=\'\\[\\e]133;A\\a\\]\'"${PS1:-$ }"; PS0=$(printf \'\\033]133;C\\007\'); else PS1="$(printf \'\\033]133;A\\007\')${PS1:-$ }"; fi',
     SYSTEM_FACTS_RC,
     'if [ -n "${KIN_PANEL_LOGIN:-}" ]; then printf "\\n"; claude auth login; fi',
     'rm -f "$KIN_PANEL_RCFILE"',
@@ -397,6 +402,7 @@ function refuse(status, code, message) {
 
 export function createSlotShell({
   projectRoot,
+  routing = () => ({}),
   logger = console,
   importOauth = null,
   authLoginReady = null,
@@ -413,7 +419,7 @@ export function createSlotShell({
     if (isCodexVm(vm)) return refuse(409, 'no_container', 'GPT 槽没有容器，无法打开终端')
     if (login) {
       try {
-        await (authLoginReady || assertAuthLoginReady)(projectRoot, vm)
+        await (authLoginReady || assertAuthLoginReady)(projectRoot, vm, { routing: routing() })
       } catch (err) {
         return refuse(409, err.code || 'auth_login_not_ready', err.message)
       }
@@ -480,14 +486,16 @@ export function createSlotShell({
       accept()
       return true
     }
-    ;(upgradeLoginReady || authLoginReady || assertAuthLoginReady)(projectRoot, vm).then(accept, (err) =>
-      rejectUpgrade(
-        socket,
-        409,
-        String(err?.message || 'Conflict')
-          .replace(/[\r\n]+/g, ' ')
-          .slice(0, 120) || 'Conflict',
-      ),
+    ;(upgradeLoginReady || authLoginReady || assertAuthLoginReady)(projectRoot, vm, { routing: routing() }).then(
+      accept,
+      (err) =>
+        rejectUpgrade(
+          socket,
+          409,
+          String(err?.message || 'Conflict')
+            .replace(/[\r\n]+/g, ' ')
+            .slice(0, 120) || 'Conflict',
+        ),
     )
     return true
   }
@@ -547,7 +555,8 @@ export function createSlotShell({
     try {
       connect = slotHost(vm).dockerApi()
       if (size.login) await preparePanelShellLogin(projectRoot, vm)
-      const launch = panelShellLaunch(slotHost(vm).bins.cli)
+      const selected = resolveSlotClaude(vm, routing(), slotHost(vm))
+      const launch = panelShellLaunch(selected.bin, selected)
       const env = ['TERM=xterm-256color', `${SESSION_ENV}=${token}`, `${RC_ENV}=${launch.rc}`]
       // guest-exec 经 root SSH 降权后仍继承 /root，终端须显式切换到槽用户目录。
       if (isKvmRuntime(vm)) env.push('HOME=/home/kincli', 'CLAUDE_CONFIG_DIR=/home/kincli/.claude')

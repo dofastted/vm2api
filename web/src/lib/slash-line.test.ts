@@ -4,12 +4,17 @@ import { SLASH_IDLE, type SlashLine, slashInput } from './slash-line'
 const NAMES = ['/usage', '/wrap', '/reload', '/help', '/clear']
 
 /** 逐键喂入，收集发给 shell 的字节与执行的指令。 */
-function feed(keys: string[], intercept = true, start: SlashLine = SLASH_IDLE) {
+function feed(
+  keys: string[],
+  intercept = true,
+  start: SlashLine = SLASH_IDLE,
+  names = NAMES
+) {
   let line = start
   let shell = ''
   const runs: string[] = []
   for (const key of keys) {
-    const step = slashInput(line, key, NAMES, intercept)
+    const step = slashInput(line, key, names, intercept)
     line = step.line
     for (const a of step.actions) {
       if (a.kind === 'shell') shell += a.data
@@ -46,6 +51,17 @@ describe('slashInput', () => {
     const vim = feed([...keys('/usage'), '\r'], false)
     expect(vim.runs).toEqual([])
     expect(vim.shell).toBe('/usage\r')
+  })
+
+  it('passes native CLI /usage through when the shell-prompt marker is not active', () => {
+    const r = feed(
+      [...keys('/usage'), '\r'],
+      true,
+      SLASH_IDLE,
+      NAMES.filter((name) => name !== '/usage')
+    )
+    expect(r.runs).toEqual([])
+    expect(r.shell).toBe('/usage\r')
   })
 
   it('re-arms after Enter and Ctrl-C but not after arrow keys', () => {
