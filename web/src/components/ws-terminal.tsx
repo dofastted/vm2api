@@ -22,12 +22,14 @@ import { Button } from '@/components/ui/button'
 
 type Phase = 'connecting' | 'open' | 'closed'
 
-/** 面板侧快捷指令：不进 shell，结果逐行写进终端。 */
+/** 快捷指令可调用面板接口，或在空提示符发送槽内命令。 */
 export type SlashCommand = {
   name: string
   desc: string
-  run: () => Promise<string[]>
-}
+} & (
+  | { run: () => Promise<string[]>; input?: never }
+  | { input: string; run?: never }
+)
 
 const RED = '\x1b[31m'
 const DIM = '\x1b[2m'
@@ -91,6 +93,7 @@ export const WsTerminal = forwardRef<
   const lineRef = useRef<SlashLine>(SLASH_IDLE)
   const busyRef = useRef(false)
   const commandsRef = useRef<SlashCommand[]>([])
+  const shellPromptRef = useRef(false)
   const [phase, setPhase] = useState<Phase>('connecting')
   const [note, setNote] = useState('')
   const [session, setSession] = useState(0)
@@ -117,6 +120,15 @@ export const WsTerminal = forwardRef<
     const shellLineEmpty = echoed > 0 || line.clean || line.buf !== null
     if (!echoed && line.buf !== null) term.write(eraseEcho(line.buf.length))
     lineRef.current = shellLineEmpty ? SLASH_IDLE : line
+    if (cmd.input) {
+      if (!shellLineEmpty || !shellPromptRef.current) {
+        setNote('请先退出前台程序并清空输入，再执行槽内指令')
+        return
+      }
+      if (echoed) term.write(eraseEcho(echoed))
+      sendRef.current(`${cmd.input}\r`)
+      return
+    }
     if (name === '/clear') {
       if (echoed) term.write(eraseEcho(echoed))
       term.clear()
@@ -129,7 +141,7 @@ export const WsTerminal = forwardRef<
     setRunning(name)
     let rows: string[]
     try {
-      rows = await cmd.run()
+      rows = await cmd.run!()
     } catch (err) {
       rows = [`${RED}✗ ${(err as Error).message}${RESET}`]
     } finally {
@@ -168,6 +180,11 @@ export const WsTerminal = forwardRef<
       scrollback: 5000,
       theme: { background: '#0b0d10' },
       windowOptions: { getWinSizeChars: true, getCellSizePixels: true },
+    })
+    shellPromptRef.current = false
+    term.parser.registerOscHandler(133, (data) => {
+      shellPromptRef.current = data === 'A'
+      return true
     })
     term.parser.registerOscHandler(52, (data) => {
       const payload = data.split(';').pop() || ''
@@ -217,6 +234,9 @@ export const WsTerminal = forwardRef<
     let disposed = false
     pendingMessagesRef.current = []
     const send = (msg: unknown) => {
+      const input = msg as { t?: string; d?: string }
+      if (input.t === 'd' && /[\r\n]/.test(input.d || ''))
+        shellPromptRef.current = false
       const payload = JSON.stringify(msg)
       if (ws?.readyState === WebSocket.OPEN) {
         ws.send(payload)
@@ -237,7 +257,9 @@ export const WsTerminal = forwardRef<
       const step = slashInput(
         lineRef.current,
         d,
-        withBuiltins(commandsRef.current).map((c) => c.name),
+        withBuiltins(commandsRef.current)
+          .filter((c) => !c.input || shellPromptRef.current)
+          .map((c) => c.name),
         term.buffer.active.type === 'normal'
       )
       lineRef.current = step.line

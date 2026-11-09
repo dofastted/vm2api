@@ -115,6 +115,35 @@ test('official login starts claude auth login only when the panel login marker i
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
+test('native shell uses its own version and routes usage and login to the selected Claude', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-native-'))
+  try {
+    const bin = path.join(dir, 'claude')
+    fs.writeFileSync(bin, '#!/bin/sh\nprintf "native:%s:%s\\n" "$*" "${CLAUDE_CODE_VERSION-unset}"\n', { mode: 0o755 })
+    const { rc } = panelShellLaunch(bin, { native: true })
+    const ran = spawnSync('bash', ['-c', `${rc}\nusage\n/usage\nclaude auth login`], {
+      encoding: 'utf8',
+      env: { ...process.env, HOME: dir, CLAUDE_CODE_VERSION: 'stale', KIN_PANEL_RCFILE: path.join(dir, 'rc') },
+    })
+    assert.equal(ran.status, 0, ran.stderr)
+    assert.match(ran.stdout, /native:\/usage:unset/)
+    assert.match(ran.stdout, /native:auth login:unset/)
+    const rcPath = path.join(dir, 'interactive-rc')
+    fs.writeFileSync(rcPath, rc)
+    const interactive = spawnSync('bash', ['--rcfile', rcPath, '-i'], {
+      input: '/usage\nexit\n',
+      encoding: 'utf8',
+      env: { ...process.env, HOME: dir, KIN_PANEL_RCFILE: rcPath },
+    })
+    assert.equal(interactive.status, 0, interactive.stderr)
+    assert.match(interactive.stdout, /native:\/usage:unset/)
+    assert.match(interactive.stderr, /\x1b\]133;A\x07/)
+    assert.match(interactive.stderr, /\x1b\]133;C\x07/)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('a fresh slot login links the official credential file onto the worker file', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-cred-'))
   const home = path.join(root, 'cli-home')
@@ -560,8 +589,8 @@ test('a stopped container rejects the official login upgrade', async () => {
 })
 
 test('panelShellLaunch rejects a non-absolute cli-node path', () => {
-  assert.throws(() => panelShellLaunch('cli-node'), /invalid cli-node path/)
-  assert.throws(() => panelShellLaunch('/tmp/a\nb'), /invalid cli-node path/)
+  assert.throws(() => panelShellLaunch('cli-node'), /invalid Claude CLI path/)
+  assert.throws(() => panelShellLaunch('/tmp/a\nb'), /invalid Claude CLI path/)
 })
 
 function escapeRe(s) {
@@ -627,8 +656,9 @@ test('panel shell 系统特征 still prints under sh -i fallback', () => {
   const home = path.join(dir, 'home')
   fs.mkdirSync(home)
   const rcPath = writeLaunchRc(dir)
-  const ran = spawnSync('sh', ['-ic', ':'], {
+  const ran = spawnSync('sh', ['-i'], {
     encoding: 'utf8',
+    input: ':\nexit\n',
     env: {
       ...process.env,
       HOME: home,
@@ -640,6 +670,7 @@ test('panel shell 系统特征 still prints under sh -i fallback', () => {
   assert.equal(ran.status, 0, ran.stderr)
   assert.match(ran.stdout, /系统特征/)
   assert.match(ran.stdout, /机器ID\s+(已采集|未采集)/)
+  assert.match(ran.stderr, /\x1b\]133;A\x07/)
   fs.rmSync(dir, { recursive: true, force: true })
 })
 

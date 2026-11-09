@@ -61,6 +61,7 @@ def write_status(**fields) -> None:
     doc.update(fields)
     doc.setdefault("session_id", os.environ.get("KIN_SESSION_ID", ""))
     doc.setdefault("vm_id", os.environ.get("KIN_VM_ID", ""))
+    doc.setdefault("cli_bin", os.environ.get("KIN_CLI_BIN", ""))
     doc.setdefault("created_at", int(os.environ.get("KIN_CREATED_AT") or "0"))
     doc.setdefault("expires_at", int(os.environ.get("KIN_EXPIRES_AT") or "0"))
     doc["updated_at"] = int(time.time() * 1000)

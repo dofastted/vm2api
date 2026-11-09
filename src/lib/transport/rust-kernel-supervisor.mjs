@@ -31,6 +31,7 @@ import {
   normalizeSessionIdleTtlSeconds,
   LOCAL_CRAG_CLAUDE,
   REMOTE_CRAG_CLAUDE,
+  resolveSlotClaude,
   resolveCliSystemLayout,
   resolveCragKernelVersion,
   resolveKernelDataplane,
@@ -893,7 +894,7 @@ export function writeKernelConfig(
     if (host.native) return null
     throw err
   }
-  const claudeBin = envBin || (dataplane === 'wrap' ? host.bins.cli : host.bins.cc)
+  const claudeBin = envBin || resolveSlotClaude(vm, routing || {}, host).bin
   const tz = String(timezone || vm.timezone || previous.timezone || '').trim()
   const defaultCacheTtl = routing != null ? cacheTtlFromRouting(routing) : normalizeCacheTtl(previous.default_cache_ttl)
   const thinkingDisplay =

@@ -166,6 +166,57 @@ test('docker args use hello//usage bypassPermissions without CONNECT proxy', () 
   assert.equal(usageArgs[usageArgs.indexOf('--append-system-prompt') + 1], CRS_OFFICIAL_CLI_SYSTEM)
 })
 
+test('native bootstrap runs the selected CLI without cli-node identity overrides', () => {
+  for (const vm of [{ id: 'vm-30' }, { id: 'vm-30', node_id: 'node-a' }]) {
+    const args = buildOfficialCcDockerArgs({
+      vmId: vm.id,
+      vm,
+      uid: 10030,
+      gid: 987,
+      routing: { inference: { dataplane: 'crag', crag_kernel_version: 'v2' } },
+    })
+    assert.equal(
+      args[args.indexOf('kin-30') + 1],
+      vm.node_id
+        ? '/opt/kin-live/crag-v2/claude-code-2.1.321/claude'
+        : '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude',
+    )
+    assert.equal(
+      args.some((arg) => arg.startsWith('CLAUDE_CODE_VERSION=')),
+      false,
+    )
+    assert.equal(args.includes('--append-system-prompt'), false)
+  }
+})
+
+test('native automated usage uses the slot OAuth endpoint, not a print-mode slash prompt', async () => {
+  const result = await runOfficialCcUsage({
+    turn: () => {
+      throw new Error('native /usage must not run in print mode')
+    },
+    nativeUsage: async () => ({
+      ok: true,
+      body: {
+        five_hour: { utilization: 10 },
+        seven_day: { utilization: 20 },
+        seven_day_sonnet: null,
+        extra_usage: null,
+      },
+    }),
+  })
+  assert.equal(result.turn.ok, true)
+  assert.equal(result.stats.five_hour.utilization, 0.1)
+  assert.equal(result.stats.account_tier, null)
+  const failed = await runOfficialCcUsage({
+    nativeUsage: async () => ({ ok: false, body: { error: { code: 'usage_denied' } } }),
+  })
+  assert.equal(failed.turn.ok, false)
+  assert.equal(
+    officialCcQuotaSucceeded({ ...failed.stats, account_tier: 'pro', account_tier_source: 'profile' }),
+    false,
+  )
+})
+
 test('official hello success requires a parsed result, empty stdout is a failure', () => {
   assert.equal(officialCcTurnSucceeded({ code: 0, raw: '', slash: false }), false)
   assert.equal(officialCcTurnSucceeded({ code: 0, raw: 'not json', slash: false }), false)

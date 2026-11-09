@@ -193,6 +193,17 @@ export function resolveCragKernelVersion(vm, routing = {}) {
   return 'legacy'
 }
 
+/** Terminal and OAuth must run the same CLI family as the selected kernel. */
+export function resolveSlotClaude(vm, routing = {}, host = {}) {
+  const dataplane = resolveKernelDataplane(vm, routing)
+  const native = dataplane === 'crag' && resolveCragKernelVersion(vm, routing) === 'v2'
+  if (native) return { bin: host.bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE, native: true }
+  return {
+    bin: dataplane === 'wrap' ? host.bins?.cli || CONTAINER_CLI_NODE_BIN : host.bins?.cc || CONTAINER_CC_NODE_BIN,
+    native: false,
+  }
+}
+
 export function parseCragKernelVersionPatch(value) {
   if (value == null || value === '') return { ok: true, value: '' }
   const parsed = normalizeCragKernelVersion(value, { inherit: true })
