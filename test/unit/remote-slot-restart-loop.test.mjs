@@ -2,9 +2,11 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import vmContext from 'node:vm'
 import test from 'node:test'
+import { assignClusterCragVersion, clusterCragContainerReady } from '../../src/lib/cluster/remote-slot.mjs'
 import { createKernelWatchdog } from '../../src/lib/transport/kernel-watchdog.mjs'
 import { kernelFaults } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { dockerEnvMap, ensureKvmMachineRecord, kvmEnvMapIncomplete } from '../../src/lib/vm/kvm-machine.mjs'
+import { REMOTE_CRAG_ENTRY } from '../../src/lib/vm/slot-engine.mjs'
 
 // Execute the exact production lifecycle body with synthetic I/O boundaries.
 // No SSH, Docker daemon, credentials or production filesystem is accessed.
@@ -14,6 +16,21 @@ const start = source.slice(
   source.indexOf('/** Remote twin of reloadSlotWorker'),
 )
 
+function cragReadyContainer(base) {
+  return {
+    ...base,
+    Config: {
+      ...base.Config,
+      Cmd: [REMOTE_CRAG_ENTRY, '--gateway-worker', '--config', '/run/kin/kernel.json'],
+    },
+    HostConfig: {
+      ...base.HostConfig,
+      Init: true,
+      SecurityOpt: ['seccomp=/fixture/crag-v2-seccomp.json', 'apparmor=unconfined'],
+    },
+  }
+}
+
 function fixture({
   running = true,
   restarting = false,
@@ -21,6 +38,7 @@ function fixture({
   mismatch = false,
   kind = 'docker',
   removeFails = false,
+  cragReady = kind === 'docker',
 } = {}) {
   const calls = []
   const target = {
@@ -30,17 +48,16 @@ function fixture({
     runtime: { type: kind, accel: 'kvm' },
   }
   const kvmEnv = kind === 'kvm' ? ['KIN_KVM_MAC=52:54:00:11:22:33', 'KIN_KVM_DISK_SERIAL=KINfixture01'] : undefined
-  let info = missing
-    ? null
-    : {
-        Config: {
-          Image: mismatch ? 'old-image' : 'image',
-          Labels: { 'kin.vm.layout': '2' },
-          ...(kvmEnv ? { Env: kvmEnv } : {}),
-        },
-        HostConfig: { NetworkMode: 'network' },
-        State: { Running: running, Restarting: restarting },
-      }
+  const base = {
+    Config: {
+      Image: mismatch ? 'old-image' : 'image',
+      Labels: { 'kin.vm.layout': '2' },
+      ...(kvmEnv ? { Env: kvmEnv } : {}),
+    },
+    HostConfig: { NetworkMode: 'network' },
+    State: { Running: running, Restarting: restarting },
+  }
+  let info = missing ? null : cragReady && kind === 'docker' ? cragReadyContainer(base) : base
   const io = {
     prepare: async () => ({
       nodeId: target.node_id,
@@ -91,6 +108,11 @@ function fixture({
     ensureKvmMachineRecord,
     kvmEnvMapIncomplete,
     patchVmRecord: () => null,
+    assignClusterCragVersion,
+    clusterCragContainerReady,
+    clusterDockerClaude: (vm) => kind === 'docker' && Boolean(vm?.node_id),
+    resolveKernelDataplane: (vm) => vm?.dataplane || 'kernel',
+    projectCragUniversalVm: async () => {},
   }
   const boot = vmContext.runInNewContext(`${start.replace('export ', '')}; startRemoteSlot`, io)
   return { calls, target, boot: () => boot(target, '/fixture'), state: () => info?.State }
