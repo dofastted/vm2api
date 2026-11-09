@@ -111,6 +111,36 @@ export async function remoteSymlink(sftp, target, linkPath) {
   }
 }
 
+/**
+ * Make each final component a real directory. Parents must be mount roots.
+ * `chmod`/`chown` use `-h`: GNU coreutils otherwise follow a symlink the guest
+ * swapped in, and `-h` on a symlink fails or changes the link instead.
+ * `owner` is only meaningful for a root SSH session.
+ */
+export function privateDirectoriesScript(dirs, owner = null) {
+  const own = owner == null ? '' : `chown -h ${requireId(owner.uid)}:${requireId(owner.gid)} "$d" || exit 1;`
+  return dirs
+    .map((dir) => {
+      const d = shellQuote(dir)
+      return [
+        `d=${d};`,
+        'if [ -L "$d" ]; then rm "$d" || exit 1; fi;',
+        'if [ -e "$d" ] && [ ! -d "$d" ]; then rm "$d" || exit 1; fi;',
+        'if [ ! -d "$d" ]; then mkdir "$d" || exit 1; fi;',
+        'if [ -L "$d" ] || [ ! -d "$d" ]; then echo "private directory was replaced" >&2; exit 1; fi;',
+        'chmod -h 700 "$d" || exit 1;',
+        own,
+      ].join(' ')
+    })
+    .join(' ')
+}
+
+function requireId(value) {
+  const id = Number(value)
+  if (!Number.isInteger(id) || id < 0) throw new Error('remote owner id is not an integer')
+  return id
+}
+
 /** Run a shell script; non-zero exit is an error carrying stderr. */
 export async function runRemote(client, script, { timeoutMs = 60_000, code = 'remote_exec_failed' } = {}) {
   const r = await execCollect(client, `sh -c ${shellQuote(script)}`, { timeoutMs })

@@ -30,21 +30,13 @@ import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
 import { listQuotaFromHeaders, publicUsageWindow, usageWindowsEmpty } from '../pool/quota-window.mjs'
 import { ownerScopeFromRequest, vmMatchesOwnerScope } from '../admin/resource-owner.mjs'
 import { keyAllowsVm, keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
+import { keyModelError } from '../admin/key-models.mjs'
 import { getVm, listVms } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { summarizeCodexSlot } from '../vm/codex-slot.mjs'
 import { pickCodexSlots } from '../pool/codex-slot-pool.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
 import { resolveInboundIdentity } from '../identity/identity-rewrite.mjs'
-export function countTokensUnsupportedError() {
-  return makeError({
-    type: ErrorType.INVALID_REQUEST,
-    code: ErrorCode.COUNT_TOKENS_UNSUPPORTED,
-    message: 'count_tokens 只支持 Setup Token / Console API Key，OAuth 请用 GET /v1/usage',
-    status: 400,
-  })
-}
-
 export function usageUnsupportedError() {
   return makeError({
     type: ErrorType.INVALID_REQUEST,
@@ -268,6 +260,8 @@ export async function handleUserCountTokens(req, res, deps) {
   }
   const parsed = parseCountTokensBody(inbound)
   if (!parsed.ok) return json(res, parsed.error.status, parsed.error.body)
+  const modelDenied = keyModelError(req, parsed.body.model, { anthropic: true })
+  if (modelDenied) return json(res, modelDenied.status, modelDenied.body)
   const routing = typeof deps.getRoutingConfig === 'function' ? deps.getRoutingConfig() : null
   if (
     claudeCodeOnlyFromRouting(routing) &&

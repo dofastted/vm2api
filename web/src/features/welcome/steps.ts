@@ -1,6 +1,8 @@
 import type { ViewId } from '@/config/nav'
 import { DOCS_URL } from '@/config/repo'
 
+export { hasPanelView } from '@/config/nav'
+
 export type OnboardingStepId =
   | 'admin_password'
   | 'egress'
@@ -80,13 +82,4 @@ export function isOnboardingStepId(id: string): id is OnboardingStepId {
 export function docsHref(relativePath: string): string {
   const base = DOCS_URL.endsWith('/') ? DOCS_URL : `${DOCS_URL}/`
   return `${base}${relativePath.replace(/^\//, '')}`
-}
-
-/** Missing views list = admin default (show the link). */
-export function hasPanelView(
-  views: string[] | null | undefined,
-  view: ViewId
-): boolean {
-  if (views == null) return true
-  return views.includes(view) || views.includes(`/${view}`)
 }

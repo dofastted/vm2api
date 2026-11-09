@@ -11,15 +11,21 @@ import { ApiError } from '@/lib/api'
 import { hasSession } from '@/lib/session'
 import { AuthenticatedLayout } from '@/components/layout/authenticated-layout'
 import { meQueryOptions } from '@/features/auth/queries'
+import { guardPanelRoute } from '@/features/auth/route-guard'
 import { FleetActions } from '@/features/fleet/fleet-actions'
 
 export const Route = createFileRoute('/_authenticated')({
-  beforeLoad: ({ location }) => {
+  beforeLoad: async ({ context, location, preload }) => {
     if (!hasSession()) {
       // Bare console entry is the public welcome; deep links go to the sign-in page.
       if (location.pathname === '/') throw redirect({ to: '/welcome' })
       throw redirect({ to: '/login', search: { redirect: location.href } })
     }
+    await guardPanelRoute({
+      queryClient: context.queryClient,
+      location,
+      preload,
+    })
   },
   component: Authenticated,
 })

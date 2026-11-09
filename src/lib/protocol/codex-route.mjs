@@ -10,8 +10,6 @@ export { isCodexVm, normalizeVmKind } from '../vm/vm-kind.mjs'
 export const DEFAULT_CODEX_USER_AGENT = 'codex_cli_rs/0.160.0 (linux x86_64)'
 export const CODEX_UPSTREAM_TRANSPORTS = Object.freeze(['prefer_websocket', 'http'])
 
-export const DEFAULT_INFERENCE_WEBSOCKET = Object.freeze({ enabled: true })
-
 export const DEFAULT_CODEX_ROUTING = Object.freeze({
   enabled: true,
   // `auto` resolves the official Codex catalog client version at sync time,

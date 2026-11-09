@@ -1,12 +1,27 @@
 export type KernelDataplane = 'wrap' | 'cc' | 'crag'
 
-export const HOP_TRANSPORT_LABEL = 'Rust · cli-hop'
+export function kernelRouteLabel(
+  dataplane: unknown,
+  cragVersion?: unknown
+): string {
+  if (dataplane === 'crag' && cragVersion === 'v2') return 'CRAG v2 原生 worker'
+  if (dataplane === 'crag') return 'cc-node + CRAG kernel'
+  if (dataplane === 'cc') return 'cc-node + wrap kernel'
+  return 'cli-node + wrap kernel'
+}
 
-export const DATAPLANE_HINT =
-  '运输固定 Rust cli-hop。cli-node + kernel 是默认（一进程 20 native 槽）；cc-node + kernel 用同一份 wrap kernel；crag + cc-node 用 crag kernel，claude_bin 指向仓内 cc-node。'
-
-export function dataplaneLabel(value: unknown): string {
-  if (value === 'crag') return 'crag + cc-node'
-  if (value === 'cc') return 'cc-node + kernel'
-  return 'cli-node + kernel'
+export function kernelRouteHint(
+  dataplane: unknown,
+  cragVersion?: unknown
+): string {
+  if (dataplane === 'crag' && cragVersion === 'v2') {
+    return '本槽把 crag_kernel_version 固定为 v2。跑原生 CRAG worker，不用 cli-node，也不用 wrap kin-kernel。'
+  }
+  if (dataplane === 'crag') {
+    return 'claude_bin 是 cc-node，内核是 share/crag 的 kin-kernel。不是 cli-node + wrap kernel，也不是 CRAG v2。'
+  }
+  if (dataplane === 'cc') {
+    return 'claude_bin 是 cc-node，内核仍是 wrap kin-kernel，推理走 cli-hop。不是 CRAG kernel。'
+  }
+  return '老 cli-node 路线。claude_bin 是 cli-node，内核是 wrap kin-kernel，推理走 cli-hop。'
 }

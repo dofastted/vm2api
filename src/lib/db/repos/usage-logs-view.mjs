@@ -802,7 +802,15 @@ export class UsageLogsView {
                COALESCE(SUM(CASE WHEN ${ERROR_PRED} THEN 1 ELSE 0 END), 0) AS errors,
                COALESCE(SUM(total_cost), 0) AS cost,
                COALESCE(SUM(actual_cost), 0) AS actual_cost,
+               COALESCE(SUM(input_tokens), 0) AS input_tokens,
+               COALESCE(SUM(output_tokens), 0) AS output_tokens,
+               COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+               COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+               COALESCE(SUM(cache_creation_5m_tokens), 0) AS cache_creation_5m_tokens,
+               COALESCE(SUM(cache_creation_1h_tokens), 0) AS cache_creation_1h_tokens,
+               COALESCE(SUM(${PROMPT_TOKENS_SQL}), 0) AS prompt_tokens,
                AVG(duration_ms) AS avg_duration_ms,
+               AVG(first_token_ms) AS avg_ttft_ms,
                COUNT(DISTINCT outbound_session_id) AS sessions
         FROM usage_logs WHERE ${where.join(' AND ')}
       `)
@@ -814,6 +822,11 @@ export class UsageLogsView {
     const active = agg(now - 5 * 60_000, now + 1)
     const lastMinute = agg(now - 60_000, now + 1)
     const avg = (v) => (v == null ? null : Math.round(Number(v)))
+    const input = num(today.input_tokens)
+    const output = num(today.output_tokens)
+    const cacheRead = num(today.cache_read_tokens)
+    const cacheCreation = num(today.cache_creation_tokens)
+    const prompt = num(today.prompt_tokens)
     return {
       activeSessions: num(active.sessions),
       rpm: num(lastMinute.requests),
@@ -821,7 +834,16 @@ export class UsageLogsView {
       todayCost: num(today.cost),
       todayActualCost: num(today.actual_cost),
       todayErrors: num(today.errors),
+      todayTokens: input + output + cacheRead + cacheCreation,
+      todayInputTokens: input,
+      todayOutputTokens: output,
+      todayCacheReadTokens: cacheRead,
+      todayCacheCreationTokens: cacheCreation,
+      todayCacheCreation5mTokens: num(today.cache_creation_5m_tokens),
+      todayCacheCreation1hTokens: num(today.cache_creation_1h_tokens),
+      todayCacheHitRate: prompt > 0 ? Math.min(1, cacheRead / prompt) : 0,
       todayAvgDurationMs: avg(today.avg_duration_ms),
+      todayAvgTtftMs: avg(today.avg_ttft_ms),
       yesterdayRequests: num(yesterday.requests),
       yesterdayCost: num(yesterday.cost),
       yesterdayAvgDurationMs: avg(yesterday.avg_duration_ms),

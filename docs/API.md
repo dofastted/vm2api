@@ -35,6 +35,8 @@ x-api-key: sk-vm-…
 |------|------|------|--------------|
 | `POST` | `/v1/messages` 或 `/messages` | Anthropic Messages | Anthropic Messages / SSE |
 | `GET` | `/v1/usage` | — | 当前账户 5H/7D，Claude 与 GPT 均可（`unit=percent_used`） |
+| `GET` | `/v1/me/quota` | — | 本 Key 的额度、窗口、RPM、并发，以及现在会不会被拦（只限托管 Key） |
+| `GET` | `/v1/me/usage` | — | 本 Key 今天 / 近 7 天 / 近 30 天用量（按模型）和最近请求（只限托管 Key） |
 | `POST` | `/v1/chat/completions` 或 `/chat/completions` | OpenAI Chat | OpenAI Chat / SSE |
 | `POST` | `/v1/completions` 或 `/completions` | OpenAI Completions | OpenAI Completions |
 | `POST` | `/v1/responses` 或 `/responses` | OpenAI Responses | OpenAI Responses |
@@ -200,6 +202,117 @@ curl -sS http://127.0.0.1:8787/v1/usage -H "Authorization: Bearer $KEY"
 `platform` 为 `anthropic` 或 `openai`。GPT 槽位读本地记录的 Codex 5h/7d 窗口（`source=codex`），不发起上游请求。
 
 `utilization` 0–100。Claude 槽位：有 Messages Extra 用 Extra；两窗都空才走一次带缓存的官方 `/api/oauth/usage`（`source=oauth-usage`）。Setup Token 只有 `user:inference` 时官方 usage 会返回 scope 错误；服务端保留失败原因，不把它当吊销/封禁，也不改历史套餐。Console API Key 调 `/v1/usage` → `400 usage_unsupported`。窗缺失为 `null`，不伪装 0%。
+
+## Key 自助查询
+
+`/v1/usage` 看的是上游账户；拿托管 Key（`sk-vm-…`）的人要看**这把 Key 自己**的已用 / 剩余，用下面两个只读接口。鉴权同其他 `/v1/*`（`Authorization: Bearer` 或 `x-api-key`）。
+
+- 只返回本 Key 的数据：不含槽位、上游账户、代理 / 出口、属主用户、客户端 IP 或其他 Key。
+- 已到期、额度用尽、窗口超限、RPM / 并发已满的 Key **照常可查**，用来看被拦的原因；停用、删除或属主被停用的 Key → `401`（停用为 `api_key_disabled`）。主密钥和面板会话 → `400 managed_key_required`。
+- 不占并发、不计 RPM、不记用量、不进调度，也不消耗网关的按密钥令牌桶；另有按 Key 的限频，每分钟 60 次（突发 60、每秒补 1），超出 `429 gateway_rate_limit` 并带 `retry-after`。
+- 限额字段 `limit` 为 `null` 表示不限（面板里填 0）。
+
+### `GET /v1/me/quota`
+
+```bash
+curl -sS http://127.0.0.1:8787/v1/me/quota -H "Authorization: Bearer $KEY"
+```
+
+```json
+{
+  "object": "api_key_quota",
+  "checked_at": "2026-11-06T12:00:00.000Z",
+  "key": {
+    "name": "client-a",
+    "masked_key": "sk-vm-3f…9c1d",
+    "status": "active",
+    "expires_at": "2027-01-01T00:00:00.000Z",
+    "expired": false,
+    "created_at": "2026-11-01T08:00:00.000Z",
+    "last_used_at": "2026-11-06T11:58:41.000Z"
+  },
+  "accepting": false,
+  "blocked_by": { "code": "api_key_rate_limit", "message": "API key 5h spend limit exceeded", "status": 429 },
+  "usd": { "limit": 30, "used": 21.7, "remaining": 8.3, "exceeded": false },
+  "windows": {
+    "5h": { "limit": 5, "used": 5.1, "remaining": 0, "exceeded": true, "window_start": "2026-11-06T09:10:00.000Z", "reset_at": "2026-11-06T14:10:00.000Z" },
+    "1d": { "limit": null, "used": 6.2, "remaining": null, "exceeded": false, "window_start": "2026-11-06T02:00:00.000Z", "reset_at": "2026-11-07T02:00:00.000Z" },
+    "7d": { "limit": 50, "used": 18.4, "remaining": 31.6, "exceeded": false, "window_start": "2026-11-02T07:30:00.000Z", "reset_at": "2026-11-09T07:30:00.000Z" }
+  },
+  "requests": { "limit": 1000, "used": 412, "remaining": 588, "exceeded": false },
+  "rpm": { "limit": 30, "current": 2, "exceeded": false },
+  "concurrency": { "limit": 4, "inflight": 1, "exceeded": false },
+  "user_concurrency": { "limit": 5, "inflight": 3, "exceeded": false }
+}
+```
+
+数值就是调度前 Key 闸门读的那几列，`accepting` / `blocked_by` 是同一时刻闸门的判定（按闸门顺序取第一个原因：状态 → 到期 → 请求次数 → 美元 → 5h / 1d / 7d → RPM → Key 并发 → 用户并发）。
+
+- `usd`：美元配额，按实际费用（官方价 × 分组倍率）累计。`requests`：已计费的请求数。二者都是累计值，面板「重置额度」才清零。
+- `windows`：美元窗口从第一笔花费开始计时，满 5h / 24h / 7d 后关闭；关闭后 `used` 为 0、`window_start` / `reset_at` 为 `null`，下一笔花费再开新窗口。没设上限的窗口也照样累计。
+- `rpm.current`：最近 60 秒被受理的请求数。`concurrency.inflight`：本 Key 正在进行的请求。
+- `user_concurrency`：Key 有属主时，属主所有 Key 合计的在途数与属主的并发上限（管理员属主不限，为 `null`）；没有属主时整个字段为 `null`。
+- `rpm`、并发是本进程内存里的实时值。
+
+### `GET /v1/me/usage`
+
+```bash
+curl -sS "http://127.0.0.1:8787/v1/me/usage?limit=20&tz=Asia/Shanghai" -H "Authorization: Bearer $KEY"
+```
+
+| 参数 | 说明 |
+|------|------|
+| `limit` | 最近请求条数，默认 20，最多 100（超出按 100） |
+| `before` | 翻页游标：上一页的 `recent.next_before`；也可直接给 ISO 时间，只取更早的请求 |
+| `tz` | 「今天」的时区（IANA 名），默认 / 无法识别时为 `UTC` |
+
+```json
+{
+  "object": "api_key_usage",
+  "timezone": "Asia/Shanghai",
+  "periods": {
+    "today": {
+      "since": "2026-11-05T16:00:00.000Z",
+      "requests": 2,
+      "input_tokens": 10,
+      "output_tokens": 20,
+      "cache_read_tokens": 30,
+      "cache_creation_tokens": 40,
+      "total_tokens": 100,
+      "cost": 0.5,
+      "models": [
+        { "model": "claude-sonnet-5", "requests": 2, "input_tokens": 10, "output_tokens": 20, "cache_read_tokens": 30, "cache_creation_tokens": 40, "total_tokens": 100, "cost": 0.5 }
+      ]
+    },
+    "7d": { "since": "2026-10-30T16:00:00.000Z", "...": "同上" },
+    "30d": { "since": "2026-10-07T16:00:00.000Z", "...": "同上" }
+  },
+  "recent": {
+    "items": [
+      {
+        "request_id": "req_…",
+        "created_at": "2026-11-06T11:59:00.000Z",
+        "model": "claude-sonnet-5",
+        "status": 200,
+        "error_code": null,
+        "input_tokens": 10,
+        "output_tokens": 20,
+        "cache_read_tokens": 30,
+        "cache_creation_tokens": 40,
+        "cost": 0.5,
+        "duration_ms": 2310
+      }
+    ],
+    "has_more": true,
+    "next_before": "MjAyNi0xMS0wNlQxMTo1OTowMC4wMDBaCmxvZ18…"
+  }
+}
+```
+
+- 统计来自请求日志，含失败请求（失败通常 0 费用）；日志被清理后的部分不再计入。`7d` / `30d` 按 `tz` 的自然日，包含今天。
+- `cost` 是实际费用（官方价 × 分组倍率），和 `usd.used` 同一口径；未定价的请求 `cost` 为 `null`，合计按 0 计。
+- `model` 是客户端请求里写的模型名，不显示网关映射后的上游模型。`models` 按费用、请求数降序，最多 50 个。
+- 游标格式不保证稳定，原样回传即可；非法 `before` → `400 invalid_cursor`。
 
 ## 面板额度探测
 

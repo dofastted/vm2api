@@ -12,14 +12,17 @@ COPY worker/go.mod worker/go.sum ./worker/
 RUN cd worker && go mod download
 COPY worker/ ./worker/
 COPY api-kernel/go.mod api-kernel/go.sum ./api-kernel/
-RUN cd api-kernel && go mod download
+COPY redact/go.mod redact/go.sum ./redact/
+RUN cd api-kernel && go mod download && cd ../redact && go mod download
 COPY api-kernel/ ./api-kernel/
+COPY redact/ ./redact/
 RUN cd worker && go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/kin-egress ./cmd/kin-egress \
     && go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/kin-worker ./cmd/kin-worker \
     && GOARCH=amd64 go build -buildvcs=false -trimpath -o /out/amd64/kin-egress ./cmd/kin-egress \
     && GOARCH=amd64 go build -buildvcs=false -trimpath -o /out/amd64/kin-worker ./cmd/kin-worker \
     && CGO_ENABLED=0 GOARCH=amd64 go build -buildvcs=false -trimpath -o /out/amd64/kin-slot-gate ./cmd/kin-slot-gate \
-    && cd ../api-kernel && go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/kin-api-kernel ./cmd/kin-api-kernel
+    && cd ../api-kernel && go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/kin-api-kernel ./cmd/kin-api-kernel \
+    && cd ../redact && go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/kin-redact ./cmd/kin-redact
 
 FROM --platform=linux/arm64 ${NODE_IMAGE} AS web
 RUN npm install -g pnpm@10
@@ -70,7 +73,7 @@ COPY --from=amd64-runtime /usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/
 COPY --from=amd64-runtime /usr/lib64/ /usr/lib64/
 RUN test -e /lib64 || ln -s usr/lib64 /lib64
 # The standard entrypoint refreshes bind-mounted helpers from image-bin on boot.
-COPY --from=helpers /out/kin-egress /out/kin-worker /out/kin-api-kernel /opt/vm2api/image-bin/
+COPY --from=helpers /out/kin-egress /out/kin-worker /out/kin-api-kernel /out/kin-redact /opt/vm2api/image-bin/
 COPY scripts/docker-entrypoint.sh /usr/local/bin/vm2api-entrypoint
 RUN chmod 755 /usr/local/bin/vm2api-entrypoint /opt/vm2api/image-bin/* \
     /opt/vm2api/image-wrap-cli/cli-node /opt/vm2api/image-wrap-cli/cc-node \
@@ -89,6 +92,7 @@ ENV NODE_ENV=production \
     KIN_OAUTH_AUTH_BIN=/opt/vm2api/bin/kin-oauth-auth \
     KIN_COMPUTER_BIN=/opt/vm2api/bin/kin-computer \
     KIN_API_KERNEL_BIN=/opt/vm2api/bin/kin-api-kernel \
+    KIN_REDACT_BIN=/opt/vm2api/bin/kin-redact \
     KIN_CLUSTER_WORKER_BIN=/opt/vm2api/cluster-bin-amd64/kin-worker \
     KIN_CLUSTER_EGRESS_BIN=/opt/vm2api/cluster-bin-amd64/kin-egress \
     KIN_CLUSTER_GATE_BIN=/opt/vm2api/cluster-bin-amd64/kin-slot-gate \

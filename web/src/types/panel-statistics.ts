@@ -26,7 +26,7 @@ export type StatsSeries = {
   dataKey: string
 }
 
-/** 聚合维度。user 角色只允许 `key` / `model`（后端对其它值回 400）。 */
+/** 聚合维度。user 角色允许 `key` / `model` / `vm`（vm 只含本人可用槽）；`user` 回 400。 */
 export type StatsDimension = 'user' | 'key' | 'model' | 'vm'
 
 /** 指标页签。三个指标一次性下发，切页签不重新请求。 */
@@ -58,6 +58,8 @@ export type StatisticsData = {
     outputTokens: number
     cacheReadTokens: number
     cacheCreationTokens: number
+    cacheCreation5mTokens: number
+    cacheCreation1hTokens: number
     cacheHitRate: number
     avgDurationMs: number | null
     avgTtftMs: number | null
@@ -70,7 +72,7 @@ export type StatisticsData = {
   }
 }
 
-/** 排行榜范围。user 角色只允许 `key` / `model`。 */
+/** 排行榜范围。user 角色允许 `key` / `model` / `vm`（vm 只含本人可用槽）。 */
 export type LeaderboardScope = 'user' | 'key' | 'model' | 'vm'
 
 export type LeaderboardEntry = {
@@ -86,6 +88,8 @@ export type LeaderboardEntry = {
   outputTokens: number
   cacheReadTokens: number
   cacheCreationTokens: number
+  cacheCreation5mTokens: number
+  cacheCreation1hTokens: number
   /** cache_read / (input + cache_read)，0-1。 */
   cacheHitRate: number
   /** 官方标准价。 */

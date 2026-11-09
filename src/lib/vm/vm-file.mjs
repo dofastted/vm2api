@@ -120,6 +120,74 @@ export function readFileCached(file) {
   return text
 }
 
+/**
+ * File text with a fresh `readFileSync` on every hit so same-mtime/size content
+ * swaps still show up on the next call. Updates the LRU text cache when bytes change.
+ */
+export function readFileVerifiedCached(file) {
+  if (!readCacheEnabled) {
+    try {
+      return fs.readFileSync(file, 'utf8')
+    } catch (err) {
+      if (isNotFound(err)) return null
+      throw err
+    }
+  }
+  let stat
+  try {
+    stat = fs.statSync(file)
+  } catch (err) {
+    readCache.delete(file)
+    parsedJsonCache.delete(file)
+    if (isNotFound(err)) return null
+    throw err
+  }
+  let text
+  try {
+    text = fs.readFileSync(file, 'utf8')
+  } catch (err) {
+    readCache.delete(file)
+    parsedJsonCache.delete(file)
+    if (isNotFound(err)) return null
+    throw err
+  }
+  const hit = readCache.get(file)
+  if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size && hit.ino === stat.ino && hit.text === text) {
+    putReadCache(file, hit)
+    return hit.text
+  }
+  putReadCache(file, { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, text })
+  return text
+}
+
+const parsedJsonCache = new Map()
+
+function routingJsonDigest(text) {
+  return crypto.createHash('sha256').update(text).digest('hex')
+}
+
+/**
+ * Parsed JSON with verified bytes and a digest-keyed parse cache. Missing file → null;
+ * corrupt JSON throws (and drops any stale parse entry). Each call returns a fresh clone
+ * so callers can mutate without cross-request pollution.
+ */
+export function readJsonParsedCached(file) {
+  const text = readFileVerifiedCached(file)
+  if (text == null) return null
+  const digest = routingJsonDigest(text)
+  const hit = parsedJsonCache.get(file)
+  if (hit && hit.digest === digest) return structuredClone(hit.parsed)
+  let parsed
+  try {
+    parsed = JSON.parse(text)
+  } catch (err) {
+    parsedJsonCache.delete(file)
+    throw err
+  }
+  parsedJsonCache.set(file, { digest, parsed })
+  return structuredClone(parsed)
+}
+
 /** Parsed JSON for `file`. Missing file → null; corrupt JSON and other I/O throw. */
 export function readJsonCached(file) {
   const text = readFileCached(file)
@@ -131,8 +199,10 @@ export function readJsonCached(file) {
 export function invalidateReadCache(file = null) {
   if (!file) {
     readCache.clear()
+    parsedJsonCache.clear()
     return
   }
+  parsedJsonCache.delete(file)
   return readCache.delete(file)
 }
 

@@ -39,6 +39,7 @@ ensure_bin kin-egress
 ensure_bin kin-slot-gate
 ensure_bin kin-worker
 ensure_bin kin-api-kernel
+ensure_bin kin-redact
 ensure_bin kin-codex-kernel
 ensure_bin kin-oauth-auth
 ensure_bin kin-computer

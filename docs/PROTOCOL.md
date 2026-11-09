@@ -69,6 +69,20 @@ native cli-hop 优先完整保留 Node 已组装、带 billing 的 wire system�
 
 权威开关是 `routing.json` 的 `compatibility.persona_preset`（system提示词）与 `cache_ttl`（设置 → 协议 → 提示词缓存 → 默认缓存写入 TTL，可选 `5m` / `1h`，缺省 `1h`，点击「保存」生效）。该值仅是默认值，不覆盖请求头、请求显式 TTL、已有会话锁定值或 system 模板显式 TTL；官方透传的调用方 marker 及缺失 TTL 保持原样。`vms/<id>/run/kernel.json` 不是第二套面板：面板保存、槽位「跟随全局」、外部改写 `routing.json`，或虚拟机环境保存时区之后，才把解析结果投影进去（`persona_preset`、`system_layout`、`default_cache_ttl`、`timezone`）。`system_layout` 只有 `zero` 与 `identity`（`official` / `official_full` / `custom` 都是 `identity`）。字节没变不重写。kernel 热读该文件，不必重启槽。Codex 槽不写。手改 `kernel.json` 会在下一次投影时被盖掉。
 
+### CRAG v2 print
+
+CRAG v2 槽的 worker 传输是 **print**，不是 TUI。官方二进制是 `claude-code-2.1.317`。`kernel.json` 的 `persona_preset` 和 `CLAUDE_CODE_SYSTEM_LAYOUT` 不被这个 worker 读取，也不能靠 `--bare` 做 0注入：`--bare` 会把 OAuth 槽切成只认 API key。是否走 print 只看这台 VM 实际启用的内核：运行中的 health `runtime_variant=crag-v2` 优先，其次是槽位自己写明的 `dataplane` / `crag_kernel_version`，再其次是该槽 `run/kernel.json`。全局 `routing.inference` 不能把 wrap、cc 或未写内核的槽送上 print。legacy CRAG 仍走 cli-node。
+
+system提示词页有两套。cli-node 仍用上面的模板。CRAG 一套只认 `compatibility.crag_persona_preset`：
+
+| 值 | 清洗 |
+|----|------|
+| `official_full`（缺省） | 不把官方四块 system 再贴进去。调用方剩余文本走 `crag_prompt.mode=append`（裸 `system` 在 v2 里也是 append）。≤ 64 KiB 才是 `--append-system-prompt`；更长由 helper 写进用户消息，不是 system 缓存块。没有尾巴就不发 system 旗标。 |
+| `zero` | 必须 `crag_prompt.mode=replace`。超过 64 KiB 直接 400，不假装替换成功。没有调用方文本时发不出 replace。`--system-prompt` 是否换掉 identity/harness/guidance，2.1.303 没复抓，未证实。 |
+
+槽位显式 `zero` 覆盖成 replace。`official` / `official_full` / `official_303` 在这条 print 上都收成 append 尾巴；只要 identity 没有旗标，自定义模板不贴进去。print 不传 `--tools ""` 和 `--no-chrome`，内置工具和 Chrome 保持官方默认。thinking、temperature、betas、system 上的 `cache_control` 协议层可以收到，helper 不转发。今天进官方 CLI 的是 `--model`、64 KiB append/replace 文本、preload 的 `max_tokens` / `effort` / 已有 cache marker 的 ttl，以及调用方工具变成 MCP。
+
+
 面板预览表达 Node 给出的模板内容；cli-hop 最终线序以上述 CLI-owned 前缀为准，不把 Node 对象预览当成最终 wire 抓包。更新 CLI 二进制后需要替换槽内副本并重启相应 kernel/CLI；配置热读不能让旧进程自动加载新 ELF。删除旧环境文本后首次前缀会冷写，后续 cache_read 数值须实测，不能保证必然不低于旧值。0注入 + 常驻约束关闭 + 无调用方 agent 的真实模型可见输出须单独验收。
 
 Go worker JSON 透传，不必因人设重建 worker。

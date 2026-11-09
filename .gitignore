@@ -70,7 +70,7 @@ patches/
 /src/lib/oauth/auth.js
 /docs/auto-mode
 /docs/jev.md
-
+/docs/AFO_INTEGRATION.md
 .omp
 /dist/
 share/wrap-cli/dist/

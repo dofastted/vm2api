@@ -31,6 +31,31 @@ import {
 } from './usage-log-preds.mjs'
 import { collapseBlockKeywords, foldInterceptRows } from '../../protocol/intercept-stats.mjs'
 
+// Key self-service rows name the model the client sent; mapping targets stay internal.
+const CLIENT_MODEL_SQL = "COALESCE(NULLIF(model, ''), NULLIF(requested_model, ''), NULLIF(upstream_model, ''))"
+const KEY_SELF_MODELS = 50
+const KEY_SELF_RECENT_MAX = 100
+
+function emptyKeyUsage() {
+  return {
+    requests: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_tokens: 0,
+    cache_creation_tokens: 0,
+    total_tokens: 0,
+    cost: 0,
+  }
+}
+
+function addKeyUsage(into, row) {
+  for (const k of ['requests', 'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_creation_tokens', 'cost']) {
+    into[k] += Number(row[k] || 0)
+  }
+  into.total_tokens = into.input_tokens + into.output_tokens + into.cache_read_tokens + into.cache_creation_tokens
+  into.cost = Math.round(into.cost * 1e6) / 1e6
+}
+
 /** settings key: ISO instant before which usage_logs rows may have been pruned. Monotonic. */
 const PRUNED_THROUGH_KEY = 'usage_logs_pruned_through'
 const BILLING_STATS_CACHE_TTL_MS = 10_000
@@ -938,6 +963,84 @@ export class UsageLogsRepo {
       rankKey: 'vms',
       rankLimit: 12,
     })
+  }
+
+  /**
+   * One managed key's totals for nested periods ending now (GET /v1/me/usage),
+   * read in one scan from the earliest `since`. `cost` is actual_cost, the
+   * group-rated spend the key quota counts. Only client-facing columns.
+   */
+  keyUsagePeriods({ apiKeyId, periods = [] } = {}) {
+    const list = periods
+      .map((p) => ({ name: String(p.name), since: new Date(p.since).toISOString() }))
+      .sort((a, b) => b.since.localeCompare(a.since))
+    if (!apiKeyId || !list.length) return {}
+    const bands = list.map((_, i) => `WHEN created_at >= ? THEN ${i}`).join(' ')
+    const rows = this.db
+      .prepare(`
+      SELECT ${CLIENT_MODEL_SQL} AS model,
+             CASE ${bands} END AS band,
+             COUNT(*) AS requests,
+             COALESCE(SUM(input_tokens), 0) AS input_tokens,
+             COALESCE(SUM(output_tokens), 0) AS output_tokens,
+             COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+             COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+             COALESCE(SUM(actual_cost), 0) AS cost
+      FROM usage_logs
+      WHERE api_key_id = ? AND created_at >= ?
+      GROUP BY 1, 2
+    `)
+      .all(...list.map((p) => p.since), apiKeyId, list[list.length - 1].since)
+    const out = {}
+    list.forEach((period, i) => {
+      const total = { since: period.since, ...emptyKeyUsage(), models: [] }
+      const byModel = new Map()
+      for (const row of rows) {
+        if (Number(row.band) > i) continue
+        addKeyUsage(total, row)
+        const name = row.model ?? null
+        if (!byModel.has(name)) byModel.set(name, { model: name, ...emptyKeyUsage() })
+        addKeyUsage(byModel.get(name), row)
+      }
+      total.models = [...byModel.values()]
+        .sort((a, b) => b.cost - a.cost || b.requests - a.requests)
+        .slice(0, KEY_SELF_MODELS)
+      out[period.name] = total
+    })
+    return out
+  }
+
+  /**
+   * Newest rows of one managed key, keyset on (created_at, id) like the log
+   * view. `before` is { created_at, id? }; without id it is a plain time bound.
+   */
+  keyRecentRequests({ apiKeyId, limit = 20, before = null } = {}) {
+    if (!apiKeyId) return { items: [], has_more: false, next: null }
+    const n = Math.max(1, Math.min(KEY_SELF_RECENT_MAX, Math.floor(Number(limit)) || 20))
+    const where = ['api_key_id = ?']
+    const params = [apiKeyId]
+    if (before?.created_at && before.id) {
+      // the leading bound lets idx_reqlog_key seek instead of skipping newer rows
+      where.push('created_at <= ?', '(created_at < ? OR (created_at = ? AND id < ?))')
+      params.push(before.created_at, before.created_at, before.created_at, before.id)
+    } else if (before?.created_at) {
+      where.push('created_at < ?')
+      params.push(before.created_at)
+    }
+    const rows = this.db
+      .prepare(`
+      SELECT id, request_id, created_at, ${CLIENT_MODEL_SQL} AS model, status, error_code,
+             input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, actual_cost, duration_ms
+      FROM usage_logs
+      WHERE ${where.join(' AND ')}
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?
+    `)
+      .all(...params, n + 1)
+    const page = rows.slice(0, n)
+    const last = page[page.length - 1]
+    const hasMore = rows.length > n
+    return { items: page, has_more: hasMore, next: hasMore ? { created_at: last.created_at, id: last.id } : null }
   }
 
   _usageWindow({ vmId = null, apiKeyId = null, days = 30, rankExpr, rankKey, rankLimit = 8 } = {}) {

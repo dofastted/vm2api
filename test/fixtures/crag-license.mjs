@@ -42,6 +42,49 @@ export function issueFixtureCode(root, challenge, overrides = {}) {
     wrapped_key: { ephemeral_public_key: ephemeral.publicKey.export({ format: 'jwk' }).x, nonce: nonce.toString('base64url'), ciphertext: ciphertext.toString('base64url'), tag: cipher.getAuthTag().toString('base64url') }, ...overrides }
   return { code: signedCode(authority, claims), claims }
 }
+export function issueUniversalCode(root, overrides = {}) {
+  const authority = fixtureAuthority(root)
+  const issued = overrides.issued_at ?? Math.floor(Date.now() / 1000) - 60
+  const term = overrides.term || '1m'
+  const keyId = sha(authority.payloadKey)
+  const licenseId = overrides.license_id || crypto.randomUUID()
+  const bearer = crypto.randomBytes(32)
+  const nonce = crypto.randomBytes(12)
+  const expires = overrides.expires_at ?? calendarExpiry(issued, term)
+  const claims = {
+    version: 1,
+    product: 'crag-v2',
+    license_id: licenseId,
+    issued_at: issued,
+    not_before: issued,
+    expires_at: expires,
+    term,
+    payload_key_id: keyId,
+    wrapped_key: { nonce: nonce.toString('base64url'), ciphertext: '', tag: '' },
+  }
+  const cipher = crypto.createCipheriv('aes-256-gcm', bearer, nonce)
+  cipher.setAAD(
+    Buffer.concat([
+      Buffer.from('CRAG-UNIVERSAL-WRAP-V1\0'),
+      Buffer.from(licenseId),
+      Buffer.from([0]),
+      Buffer.from(keyId),
+    ]),
+  )
+  const ciphertext = Buffer.concat([cipher.update(authority.payloadKey), cipher.final()])
+  claims.wrapped_key.ciphertext = ciphertext.toString('base64url')
+  claims.wrapped_key.tag = cipher.getAuthTag().toString('base64url')
+  const raw = Buffer.from(JSON.stringify(claims))
+  const signature = crypto.sign(
+    null,
+    Buffer.concat([Buffer.from('CRAG-UNIVERSAL-LICENSE-V1\0'), raw]),
+    authority.privateKey,
+  )
+  return {
+    code: `CRAGU1.${raw.toString('base64url')}.${signature.toString('base64url')}.${bearer.toString('base64url')}`,
+    claims,
+  }
+}
 export function seedEncryptedPackage(root, { revision = '' } = {}) {
   const authority = fixtureAuthority(root)
   const arch = process.arch === 'arm64' ? 'arm64' : 'amd64'

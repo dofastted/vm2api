@@ -54,6 +54,7 @@ import { StickyPane } from '@/features/settings/sticky-pane'
 import { uploadIntervalOf } from '@/features/settings/telemetry-interval'
 import { TelemetryPane } from '@/features/settings/telemetry-pane'
 import { ProtocolPane } from './protocol-pane'
+import { RedactionPane } from './redaction-pane'
 
 export function SettingsPage() {
   const { tab: raw } = useParams({ from: '/_authenticated/settings/$tab' })
@@ -86,6 +87,7 @@ export function SettingsPage() {
   const save = useMutation({
     mutationFn: () => {
       const body = { ...draft }
+      delete body.redaction_runtime
       const compat = (body.compatibility as Record<string, unknown>) || {}
       if (tab === 'protocol') {
         const preset = personaPresetFromCompat(compat)
@@ -423,6 +425,29 @@ export function SettingsPage() {
                         ...patch,
                       },
                     }))
+                  }
+                />
+              ) : null}
+              {tab === 'redaction' ? (
+                <RedactionPane
+                  redaction={
+                    (draft.redaction as Record<string, unknown> | undefined) || {
+                      enabled: false,
+                      secrets: true,
+                      personal: true,
+                      words: [],
+                      wordsAnyCase: false,
+                      rules: [],
+                      kinds: {},
+                      allow: [],
+                    }
+                  }
+                  runtime={
+                    (draft.redaction_runtime as
+                      Record<string, unknown> | undefined) || {}
+                  }
+                  onChange={(next) =>
+                    setDraft((current) => ({ ...current, redaction: next }))
                   }
                 />
               ) : null}

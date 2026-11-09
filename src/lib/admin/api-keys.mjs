@@ -16,6 +16,7 @@
  */
 
 import { keyScopeFromRecord, normalizeKeyScope } from './key-scope.mjs'
+import { normalizeKeyAllowedModels, parseKeyAllowedModels } from './key-models.mjs'
 import { VmPoolsRepo } from '../db/repos/vm-pools-repo.mjs'
 import crypto from 'node:crypto'
 import { resolveStoreDb } from '../db/database.mjs'
@@ -26,6 +27,33 @@ import { UsersRepo } from '../db/repos/users-repo.mjs'
 
 const KEY_PREFIX = 'sk-vm-'
 const HASH_MARKER = 'hmac:'
+// sub2api USD rate windows; ApiKeysRepo opens one at the first spend.
+const RATE_WINDOWS = [
+  { name: '5h', limit: 'rate_limit_5h', usage: 'usage_5h', start: 'window_5h_start', ms: 5 * 3600_000 },
+  { name: '1d', limit: 'rate_limit_1d', usage: 'usage_1d', start: 'window_1d_start', ms: 24 * 3600_000 },
+  { name: '7d', limit: 'rate_limit_7d', usage: 'usage_7d', start: 'window_7d_start', ms: 7 * 24 * 3600_000 },
+]
+
+/** A window is open while now - start < size; a closed one counts 0 until the next spend reopens it. */
+function rateWindow(rec, win, now) {
+  const limit = Number(rec[win.limit]) || 0
+  const start = rec[win.start] ? Date.parse(rec[win.start]) : NaN
+  const open = Number.isFinite(start) && now - start < win.ms
+  return { limit, open, start, used: open ? Number(rec[win.usage]) || 0 : 0 }
+}
+
+// Six decimals is below any billed unit and hides float noise (8.300000000000001).
+const money = (n) => Math.round(n * 1e6) / 1e6
+
+/** 0 means unlimited: limit / remaining read null. */
+function limitView(limit, used) {
+  return {
+    limit: limit > 0 ? limit : null,
+    used: money(used),
+    remaining: limit > 0 ? money(Math.max(0, limit - used)) : null,
+    exceeded: limit > 0 && used >= limit,
+  }
+}
 
 function clampInt(n, min, max, fallback) {
   const v = Number(n)
@@ -108,6 +136,7 @@ export function publicKeyView(rec, { reveal = false } = {}) {
     tokens_out: rec.tokens_out || 0,
     category: rec.category === 'api' ? 'api' : 'oauth',
     ...keyScopeFromRecord(rec),
+    allowed_models: parseKeyAllowedModels(rec.allowed_models),
     inflight: undefined, // filled by store.snapshot
   }
 }
@@ -256,6 +285,7 @@ export class ApiKeyStore {
           { isApi: String(input.category || 'oauth').toLowerCase() === 'api' },
         ),
       ),
+      allowed_models: JSON.stringify(normalizeKeyAllowedModels(input.allowed_models)),
     }
     if (rec.expires_at && Number.isNaN(Date.parse(rec.expires_at))) {
       throw Object.assign(new Error('invalid expires_at'), { code: 'invalid_expires_at' })
@@ -309,6 +339,9 @@ export class ApiKeyStore {
     }
     const scope = normalizeKeyScope(patch, { partial: true, current: rec, isApi: rec.category === 'api' })
     if (scope) Object.assign(rec, storedKeyScope(scope))
+    if (Object.hasOwn(patch, 'allowed_models')) {
+      rec.allowed_models = JSON.stringify(normalizeKeyAllowedModels(patch.allowed_models))
+    }
     rec.updated_at = nowIso()
     return this.repo.update(rec)
   }
@@ -399,22 +432,15 @@ export class ApiKeyStore {
       }
     }
     // sub2api rate windows: limit > 0 and the current window is still open
-    for (const [limitKey, usageKey, startKey, ms] of [
-      ['rate_limit_5h', 'usage_5h', 'window_5h_start', 5 * 3600_000],
-      ['rate_limit_1d', 'usage_1d', 'window_1d_start', 24 * 3600_000],
-      ['rate_limit_7d', 'usage_7d', 'window_7d_start', 7 * 24 * 3600_000],
-    ]) {
-      const limit = Number(rec[limitKey]) || 0
-      if (limit <= 0) continue
-      const start = rec[startKey] ? Date.parse(rec[startKey]) : NaN
-      const windowOpen = Number.isFinite(start) && now - start < ms
-      if (windowOpen && (Number(rec[usageKey]) || 0) >= limit) {
+    for (const win of RATE_WINDOWS) {
+      const w = rateWindow(rec, win, now)
+      if (w.limit > 0 && w.open && w.used >= w.limit) {
         return {
           ok: false,
           code: 'api_key_rate_limit',
-          message: `API key ${limitKey.replace('rate_limit_', '')} spend limit exceeded`,
+          message: `API key ${win.name} spend limit exceeded`,
           status: 429,
-          detail: { limit, used: Number(rec[usageKey]) || 0 },
+          detail: { limit: w.limit, used: w.used },
         }
       }
     }
@@ -443,19 +469,9 @@ export class ApiKeyStore {
     // sub2api user-level cap: sum of inflight across all of the owner's keys.
     // The operator (admin) is never capped: its traffic is the platform's own.
     if (rec.user_id) {
-      const owner = (() => {
-        try {
-          return this.users.getById(rec.user_id)
-        } catch {
-          return null
-        }
-      })()
-      const cap = owner?.role === 'admin' ? 0 : Number(owner?.concurrency) || 0
+      const cap = this._userConcurrencyCap(rec.user_id)
       if (cap > 0) {
-        let total = 0
-        for (const k of this.repo.list()) {
-          if (k.user_id === rec.user_id) total += this.inflight.get(k.id) || 0
-        }
+        const total = this._userInflight(rec.user_id)
         if (total >= cap) {
           return {
             ok: false,
@@ -468,6 +484,75 @@ export class ApiKeyStore {
       }
     }
     return { ok: true }
+  }
+
+  /** users.concurrency of the key owner; 0 = none. The admin operator is never capped. */
+  _userConcurrencyCap(userId) {
+    let owner = null
+    try {
+      owner = this.users.getById(userId)
+    } catch {
+      return 0
+    }
+    return owner?.role === 'admin' ? 0 : Number(owner?.concurrency) || 0
+  }
+
+  _userInflight(userId) {
+    let total = 0
+    for (const k of this.repo.list()) {
+      if (k.user_id === userId) total += this.inflight.get(k.id) || 0
+    }
+    return total
+  }
+
+  /**
+   * The holder's view of one key (GET /v1/me/quota): the numbers canAccept
+   * reads and its verdict. Never the owner, slot, pool or other keys.
+   */
+  selfQuota(rec, now = Date.now()) {
+    const gate = this.canAccept(rec, now)
+    const windows = {}
+    for (const win of RATE_WINDOWS) {
+      const w = rateWindow(rec, win, now)
+      windows[win.name] = {
+        ...limitView(w.limit, w.used),
+        window_start: w.open ? new Date(w.start).toISOString() : null,
+        reset_at: w.open ? new Date(w.start + win.ms).toISOString() : null,
+      }
+    }
+    const rpm = Number(rec.rpm) || 0
+    const rpmNow = this._rpmCount(rec.id, now)
+    const maxConcurrency = Number(rec.max_concurrency) || 0
+    const inflight = this.inflight.get(rec.id) || 0
+    let user = null
+    if (rec.user_id) {
+      const cap = this._userConcurrencyCap(rec.user_id)
+      const total = this._userInflight(rec.user_id)
+      user = { limit: cap > 0 ? cap : null, inflight: total, exceeded: cap > 0 && total >= cap }
+    }
+    return {
+      key: {
+        name: rec.name,
+        masked_key: `${String(rec.key_prefix || KEY_PREFIX).slice(0, 8)}…${rec.key_suffix || ''}`,
+        status: rec.status,
+        expires_at: rec.expires_at || null,
+        expired: this._expired(rec, now),
+        created_at: rec.created_at || null,
+        last_used_at: rec.last_used_at || null,
+      },
+      accepting: gate.ok,
+      blocked_by: gate.ok ? null : { code: gate.code, message: gate.message, status: gate.status },
+      usd: limitView(Number(rec.quota) || 0, Number(rec.quota_used) || 0),
+      windows,
+      requests: limitView(Number(rec.quota_requests) || 0, Number(rec.quota_requests_used) || 0),
+      rpm: { limit: rpm > 0 ? rpm : null, current: rpmNow, exceeded: rpm > 0 && rpmNow >= rpm },
+      concurrency: {
+        limit: maxConcurrency > 0 ? maxConcurrency : null,
+        inflight,
+        exceeded: maxConcurrency > 0 && inflight >= maxConcurrency,
+      },
+      user_concurrency: user,
+    }
   }
 
   acquire(rec, now = Date.now()) {

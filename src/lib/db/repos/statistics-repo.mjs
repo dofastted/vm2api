@@ -17,8 +17,8 @@ import { lookupNames } from './usage-logs-view.mjs'
 
 export const STATS_RANGES = ['today', '7days', '30days', 'thisMonth']
 export const STATS_DIMENSIONS = ['user', 'key', 'model', 'vm']
-/** Dimensions a tenant may group by; user/vm would expose other tenants or the pool layout. */
-export const USER_ROLE_DIMENSIONS = ['key', 'model']
+/** Tenant groupings. `user` would name other tenants. `vm` is only that tenant's own slots. */
+export const USER_ROLE_DIMENSIONS = ['key', 'model', 'vm']
 
 const MAX_SERIES = 8
 const OTHERS_ID = '__others__'
@@ -98,12 +98,64 @@ function delta(cur, prev) {
   return prev > 0 ? (cur - prev) / prev : null
 }
 
+function zeroLeaderboardEntry(id, name) {
+  return {
+    id,
+    name,
+    totalRequests: 0,
+    successRequests: 0,
+    errorRequests: 0,
+    successRate: 0,
+    totalTokens: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheCreationTokens: 0,
+    cacheCreation5mTokens: 0,
+    cacheCreation1hTokens: 0,
+    cacheHitRate: 0,
+    totalCost: 0,
+    totalActualCost: 0,
+    avgDurationMs: null,
+    avgTtftMs: null,
+  }
+}
+
+function leaderboardEntry(row, id, name) {
+  const input = num(row.input_tokens)
+  const output = num(row.output_tokens)
+  const cacheRead = num(row.cache_read_tokens)
+  const cacheCreation = num(row.cache_creation_tokens)
+  const requests = num(row.requests)
+  const prompt = num(row.prompt_tokens)
+  return {
+    id,
+    name,
+    totalRequests: requests,
+    successRequests: num(row.success),
+    errorRequests: num(row.errors),
+    successRate: requests > 0 ? num(row.success) / requests : 0,
+    totalTokens: input + output + cacheRead + cacheCreation,
+    inputTokens: input,
+    outputTokens: output,
+    cacheReadTokens: cacheRead,
+    cacheCreationTokens: cacheCreation,
+    cacheCreation5mTokens: num(row.cache_creation_5m_tokens),
+    cacheCreation1hTokens: num(row.cache_creation_1h_tokens),
+    cacheHitRate: prompt > 0 ? Math.min(1, cacheRead / prompt) : 0,
+    totalCost: num(row.cost),
+    totalActualCost: num(row.actual_cost),
+    avgDurationMs: avgOrNull(row.avg_duration_ms),
+    avgTtftMs: avgOrNull(row.avg_ttft_ms),
+  }
+}
+
 export class StatisticsRepo {
   constructor(db = getDb()) {
     this.db = db
   }
 
-  _scope(sinceMs, untilMs, ownerUserId) {
+  _scope(sinceMs, untilMs, ownerUserId, extra = null) {
     const where = ['created_at >= ?', 'created_at < ?']
     const params = [new Date(sinceMs).toISOString(), new Date(untilMs).toISOString()]
     const own = ownerPred(ownerUserId)
@@ -111,7 +163,17 @@ export class StatisticsRepo {
       where.push(own.sql)
       params.push(...own.params)
     }
+    if (extra?.sql) {
+      where.push(extra.sql)
+      params.push(...extra.params)
+    }
     return { cond: `WHERE ${where.join(' AND ')}`, params }
+  }
+
+  /** Pool slots that merely served a tenant stay unnamed. */
+  _ownedVmFilter(ownerUserId) {
+    if (!ownerUserId) return null
+    return { sql: 'vm_id IN (SELECT id FROM vms WHERE owner_user_id = ?)', params: [String(ownerUserId)] }
   }
 
   _totals(sinceMs, untilMs, ownerUserId) {
@@ -126,6 +188,8 @@ export class StatisticsRepo {
              COALESCE(SUM(output_tokens), 0) AS output_tokens,
              COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
              COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+             COALESCE(SUM(cache_creation_5m_tokens), 0) AS cache_creation_5m_tokens,
+             COALESCE(SUM(cache_creation_1h_tokens), 0) AS cache_creation_1h_tokens,
              COALESCE(SUM(${PROMPT_TOKENS_SQL}), 0) AS prompt_tokens,
              AVG(duration_ms) AS avg_duration_ms,
              AVG(first_token_ms) AS avg_ttft_ms
@@ -147,6 +211,8 @@ export class StatisticsRepo {
       outputTokens: output,
       cacheReadTokens: cacheRead,
       cacheCreationTokens: cacheCreation,
+      cacheCreation5mTokens: num(row.cache_creation_5m_tokens),
+      cacheCreation1hTokens: num(row.cache_creation_1h_tokens),
       cacheHitRate: prompt > 0 ? Math.min(1, cacheRead / prompt) : 0,
       avgDurationMs: avgOrNull(row.avg_duration_ms),
       avgTtftMs: avgOrNull(row.avg_ttft_ms),
@@ -175,7 +241,8 @@ export class StatisticsRepo {
     const zone = reportTimezone(tz)
     const { since, until, resolution, buckets } = resolveWindow(r, zone, now)
     const col = DIMENSION_COLUMN[dim]
-    const { cond, params } = this._scope(since, until, owner_user_id)
+    const extra = dim === 'vm' ? this._ownedVmFilter(owner_user_id) : null
+    const { cond, params } = this._scope(since, until, owner_user_id, extra)
     const rows = this.db
       .prepare(`
       SELECT ${col} AS sid, ${SLOT_SQL} AS slot,
@@ -268,7 +335,9 @@ export class StatisticsRepo {
     const n = Math.min(LEADERBOARD_MAX, Math.max(1, Math.trunc(Number(limit)) || LEADERBOARD_DEFAULT))
     const { since, until } = resolveWindow(r, zone, now)
     const col = DIMENSION_COLUMN[s]
-    const { cond, params } = this._scope(since, until, owner_user_id)
+    const listOwned = s === 'vm' && !!owner_user_id
+    const extra = listOwned ? this._ownedVmFilter(owner_user_id) : null
+    const { cond, params } = this._scope(since, until, owner_user_id, extra)
     const rows = this.db
       .prepare(`
       SELECT ${col} AS sid,
@@ -279,6 +348,8 @@ export class StatisticsRepo {
              COALESCE(SUM(output_tokens), 0) AS output_tokens,
              COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
              COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+             COALESCE(SUM(cache_creation_5m_tokens), 0) AS cache_creation_5m_tokens,
+             COALESCE(SUM(cache_creation_1h_tokens), 0) AS cache_creation_1h_tokens,
              COALESCE(SUM(${PROMPT_TOKENS_SQL}), 0) AS prompt_tokens,
              COALESCE(SUM(total_cost), 0) AS cost,
              COALESCE(SUM(actual_cost), 0) AS actual_cost,
@@ -287,41 +358,30 @@ export class StatisticsRepo {
       FROM usage_logs ${cond}
       GROUP BY IFNULL(${col}, '')
       ORDER BY cost DESC, requests DESC
-      LIMIT ?
+      ${listOwned ? '' : 'LIMIT ?'}
     `)
-      .all(...params, n)
+      .all(...params, ...(listOwned ? [] : [n]))
     const ids = rows.map((row) => (row.sid == null || row.sid === '' ? NONE_ID : String(row.sid)))
     const names = this._names(s, ids)
-    return {
-      scope: s,
-      range: r,
-      tz: zone,
-      entries: rows.map((row, i) => {
-        const input = num(row.input_tokens)
-        const output = num(row.output_tokens)
-        const cacheRead = num(row.cache_read_tokens)
-        const cacheCreation = num(row.cache_creation_tokens)
-        const requests = num(row.requests)
-        const prompt = num(row.prompt_tokens)
-        return {
-          id: ids[i],
-          name: this._nameOf(names, ids[i]),
-          totalRequests: requests,
-          successRequests: num(row.success),
-          errorRequests: num(row.errors),
-          successRate: requests > 0 ? num(row.success) / requests : 0,
-          totalTokens: input + output + cacheRead + cacheCreation,
-          inputTokens: input,
-          outputTokens: output,
-          cacheReadTokens: cacheRead,
-          cacheCreationTokens: cacheCreation,
-          cacheHitRate: prompt > 0 ? Math.min(1, cacheRead / prompt) : 0,
-          totalCost: num(row.cost),
-          totalActualCost: num(row.actual_cost),
-          avgDurationMs: avgOrNull(row.avg_duration_ms),
-          avgTtftMs: avgOrNull(row.avg_ttft_ms),
-        }
-      }),
+    let entries = rows.map((row, i) => leaderboardEntry(row, ids[i], this._nameOf(names, ids[i])))
+    if (listOwned) {
+      const present = new Set(entries.map((entry) => entry.id))
+      const owned = this.db
+        .prepare('SELECT id, name FROM vms WHERE owner_user_id = ? ORDER BY name, id')
+        .all(String(owner_user_id))
+      for (const vm of owned) {
+        const id = String(vm.id)
+        if (!present.has(id)) entries.push(zeroLeaderboardEntry(id, vm.name || id))
+      }
+      entries.sort(
+        (a, b) =>
+          b.totalCost - a.totalCost ||
+          b.totalRequests - a.totalRequests ||
+          a.name.localeCompare(b.name) ||
+          a.id.localeCompare(b.id),
+      )
+      entries = entries.slice(0, n)
     }
+    return { scope: s, range: r, tz: zone, entries }
   }
 }

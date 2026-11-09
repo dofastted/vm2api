@@ -14,8 +14,8 @@ import {
   cragLicenseErrorMessage,
 } from '@/features/vm/crag-license-editor'
 import {
-  DATAPLANE_HINT,
-  HOP_TRANSPORT_LABEL,
+  kernelRouteHint,
+  kernelRouteLabel,
 } from '@/features/vm/dataplane-contract'
 import {
   DEFAULT_RESOLVED_ENGINE,
@@ -87,13 +87,28 @@ export function VmEngineEditor({
       <div className='mt-3 grid gap-2 text-sm sm:grid-cols-2'>
         <EngineValue
           label='数据面'
-          value={isCodexVm(vm) ? '—' : kernelLabel(vm)}
+          value={
+            isCodexVm(vm)
+              ? '—'
+              : kernelRouteLabel(
+                  vm.resolved_dataplane,
+                  vm.resolved_crag_kernel_version
+                )
+          }
         />
       </div>
       <p className='mt-3 text-xs leading-relaxed text-muted-foreground'>
-        运输固定 {HOP_TRANSPORT_LABEL}。{DATAPLANE_HINT} 本槽可在 cli-node 与
-        CRAG v2 之间切换，不改其他槽、不改凭证、不删容器。舰队级 cc / crag
-        legacy 仍在{' '}
+        {kernelRouteLabel(
+          vm.resolved_dataplane,
+          vm.resolved_crag_kernel_version
+        )}
+        。
+        {kernelRouteHint(
+          vm.resolved_dataplane,
+          vm.resolved_crag_kernel_version
+        )}{' '}
+        本槽可在 cli-node 与 CRAG v2
+        之间切换，不改其他槽、不改凭证、不删容器。舰队级 cc / crag legacy 仍在{' '}
         <Link to='/wrap' className='underline underline-offset-4'>
           内核页
         </Link>
@@ -121,17 +136,6 @@ export function VmEngineEditor({
   )
 }
 
-function kernelLabel(vm: Vm) {
-  if (
-    vm.resolved_dataplane === 'crag' &&
-    vm.resolved_crag_kernel_version === 'v2'
-  )
-    return 'CRAG v2'
-  if (vm.resolved_dataplane === 'crag') return 'crag legacy'
-  if (vm.resolved_dataplane === 'cc') return 'cc-node'
-  return 'cli-node'
-}
-
 function SlotKernelSwitch({
   id,
   vm,
@@ -148,7 +152,8 @@ function SlotKernelSwitch({
   const [checkingLicense, setCheckingLicense] = useState(false)
   const [registrationCode, setRegistrationCode] = useState('')
   const kvm = vm.runtime_type === 'kvm'
-  const blocked = remote || kvm
+  const nativeMac = vm.node_platform === 'darwin'
+  const blocked = kvm || nativeMac
   const onV2 =
     vm.resolved_dataplane === 'crag' && vm.resolved_crag_kernel_version === 'v2'
   const onCli =
@@ -261,14 +266,16 @@ function SlotKernelSwitch({
         ) : null}
       </div>
       <p className='text-xs text-muted-foreground'>
-        当前 {kernelLabel(vm)}。只改这一槽。cli-node 留在盘上。没有 CRAG v2
-        包时拒绝切换，原内核不动。
+        当前{' '}
+        {kernelRouteLabel(
+          vm.resolved_dataplane,
+          vm.resolved_crag_kernel_version
+        )}
+        。只改这一槽。cli-node 留在盘上。没有 CRAG v2 包时拒绝切换，原内核不动。
       </p>
       {blocked ? (
         <p className='text-xs text-muted-foreground'>
-          {remote
-            ? `CRAG v2：${REMOTE_UNSUPPORTED_TEXT}`
-            : 'KVM 槽不运行 CRAG v2'}
+          {kvm ? 'KVM 槽不运行 CRAG v2' : 'macOS 原生节点不运行 CRAG v2'}
         </p>
       ) : null}
       {!blocked ? (
@@ -317,9 +324,11 @@ function SlotKernelSwitch({
         }}
         title={pending === 'v2' ? '本槽切到 CRAG v2？' : '本槽切回 cli-node？'}
         desc={
-          pending === 'v2'
-            ? '重启本槽内核。不 docker rm，不改凭证，不影响其他槽。cli-node 保留，可再切回。'
-            : '铺回 wrap kernel 和 cli-node，并重启本槽内核。CRAG v2 文件留在盘上但不再 exec。'
+          remote
+            ? '重建本槽容器以更换内核命令。不改凭证，不影响其他槽。'
+            : pending === 'v2'
+              ? '重启本槽内核。不 docker rm，不改凭证，不影响其他槽。cli-node 保留，可再切回。'
+              : '铺回 wrap kernel 和 cli-node，并重启本槽内核。CRAG v2 文件留在盘上但不再 exec。'
         }
         cancelBtnText='取消'
         confirmText='切换'

@@ -130,6 +130,7 @@
 
   "compatibility": {
     "persona_preset": "official_full",
+    "crag_persona_preset": "official_full",
     "overlay_preset": "off",
     "persona_park": false,
     "cache_ttl": "1h",

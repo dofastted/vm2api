@@ -414,6 +414,27 @@ export function prepareCliHopBody(
         const ttl = markers.some((marker) => marker.ttl !== '1h') ? '5m' : cacheTtl
         body.messages = officialMessageMarker(body.messages, ttl, Math.min(2, available))
       }
+      // These CLI presets always stamp both system boundaries, including one
+      // Node may have unmarked while preserving interpolated caller anchors.
+      // Budget the final wire shape, retaining the newest message anchors.
+      if (personaPreset === 'official' || personaPreset === 'official_full') {
+        const markers = listCacheMarkers(body)
+        const prefixCount = markers.filter((marker) => marker.section !== 'messages').length
+        const messages = markers.filter((marker) => marker.section === 'messages')
+        const excess = messages.length - Math.max(0, 4 - Math.max(2, prefixCount))
+        if (excess > 0) {
+          const drop = new Set(messages.slice(0, excess).map((marker) => `${marker.index}:${marker.blockIndex}`))
+          body.messages = body.messages.map((message, index) => {
+            if (!Array.isArray(message?.content)) return message
+            const content = message.content.map((block, blockIndex) => {
+              if (!drop.has(`${index}:${blockIndex}`)) return block
+              const { cache_control, ...rest } = block
+              return rest
+            })
+            return { ...message, content }
+          })
+        }
+      }
     }
   }
   return applyEagerToolStreaming(body, routing)

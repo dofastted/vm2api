@@ -328,7 +328,17 @@ export type UsageLogsOverview = {
   todayCost: number
   todayActualCost: number
   todayErrors: number
+  todayTokens: number
+  todayInputTokens: number
+  todayOutputTokens: number
+  todayCacheReadTokens: number
+  todayCacheCreationTokens: number
+  todayCacheCreation5mTokens: number
+  todayCacheCreation1hTokens: number
+  /** cache_read / (input + cache_read + cache_write)，0-1。 */
+  todayCacheHitRate: number
   todayAvgDurationMs: number | null
+  todayAvgTtftMs: number | null
   /** 昨日同一时刻之前的累计，用于「较昨日同期」。 */
   yesterdayRequests: number
   yesterdayCost: number

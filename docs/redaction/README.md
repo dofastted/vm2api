@@ -2,7 +2,7 @@
 
 本目录是 **vm2api 当前仓库内的权威设计资料**。目标是在现有 **Node 请求清洗链路**中接入可开启/关闭的关键元素脱敏，并提供 **Web 控制面板**进行配置、保存和状态展示。
 
-当前状态：设计完成，**尚未实现插件、Node 挂点或 Web 页面改动，未部署**。AgentDock/magpie 的资料目录只是源码参考，不是本插件的安装位置。
+当前状态：**默认关闭，helper/Node 边界已用 replay 验证。** `node scripts/redaction-replay.mjs` 对 V01、V03、V05、V06、V07、V10、V15、V17 为 9/9 通过（真实 `kin-redact`，无上游厂商）。这不覆盖真实 kernel/CLI/Codex ELF 抓包，也不覆盖 V02 面板、V04 并发保存、V18 continuation、V20 日志落盘。
 
 ## 阅读顺序
 

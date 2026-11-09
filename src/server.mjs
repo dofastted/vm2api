@@ -45,6 +45,7 @@ import { AccountQuota } from './lib/pool/account-quota.mjs'
 import { normalizeTiers } from './lib/pool/quota-tiers.mjs'
 import { ApiKeyStore } from './lib/admin/api-keys.mjs'
 import { keyScopeFromRequest } from './lib/admin/key-scope.mjs'
+import { filterModelCatalogForKey } from './lib/admin/key-models.mjs'
 import { GroupsRepo } from './lib/db/repos/groups-repo.mjs'
 import { SettingsRepo } from './lib/db/repos/settings-repo.mjs'
 import { ApiEndpointStore } from './lib/admin/api-endpoints.mjs'
@@ -105,6 +106,7 @@ import { createImportCommit } from './lib/oauth/import-commit.mjs'
 import { createHandleProtocol } from './lib/protocol/handle-protocol.mjs'
 import { createResponsesWsHandler } from './lib/protocol/responses-ws.mjs'
 import { handleUserUsage } from './lib/protocol/user-count-tokens.mjs'
+import { createKeySelfHandler, KEY_SELF_PATHS } from './lib/protocol/key-self.mjs'
 import { createPanelHandler } from './lib/admin/panel-routes.mjs'
 
 const FEATURES = [
@@ -698,7 +700,8 @@ function rejectAuth(req, res, error) {
   return false
 }
 
-function requireAuth(req, res) {
+/** `keyGate: false` (key self-service) skips the managed key's quota / RPM / concurrency gate and the gateway bucket. */
+function requireAuth(req, res, { keyGate = true } = {}) {
   req.presentedApiKey = extractApiKey(req)
   const token = extractPanelToken(req) || req.presentedApiKey
   if (!token) {
@@ -769,7 +772,7 @@ function requireAuth(req, res) {
       }),
     )
   }
-  const gate = apiKeyStore.canAccept(managed.record)
+  const gate = keyGate ? apiKeyStore.canAccept(managed.record) : { ok: true }
   if (!gate.ok) {
     const type =
       gate.status === 429
@@ -789,7 +792,7 @@ function requireAuth(req, res) {
       }),
     )
   }
-  if (!allowRate(token)) {
+  if (keyGate && !allowRate(token)) {
     return rejectAuth(
       req,
       res,
@@ -831,6 +834,13 @@ const importCommit = createImportCommit({
 })
 
 const { commitImportedOauth, requireSlotProxy, officialCcStatsHandler } = importCommit
+
+const handleKeySelf = createKeySelfHandler({
+  json,
+  requireAuth,
+  apiKeyStore,
+  getUsageLogs: () => requestLog.repo,
+})
 
 const { handleProtocol, handleSearch, handleImages } = createHandleProtocol({
   json,
@@ -1164,6 +1174,8 @@ const server = http.createServer(async (req, res) => {
           responses: '/v1/responses',
           messages: '/v1/messages',
           usage: '/v1/usage',
+          me_quota: '/v1/me/quota',
+          me_usage: '/v1/me/usage',
           models: '/v1/models',
           intercept_rules: '/admin/intercept/rules',
         },
@@ -1175,10 +1187,10 @@ const server = http.createServer(async (req, res) => {
       if (!requireAuth(req, res)) return
       const groupType = keyScopeFromRequest(req).group_type
       if (resolveInferenceBackend(req) === 'api') {
-        return json(res, 200, apiScheduler.catalog({ groupType }))
+        return json(res, 200, filterModelCatalogForKey(apiScheduler.catalog({ groupType }), req))
       }
       const result = await fetchWorkerModels({ groupType })
-      return json(res, 200, result)
+      return json(res, 200, filterModelCatalogForKey(result, req))
     }
     if (req.method === 'POST' && p === '/admin/models/refresh') {
       if (!requireAuth(req, res)) return
@@ -1195,6 +1207,9 @@ const server = http.createServer(async (req, res) => {
         projectRoot: cfg.paths.project,
         getPoolScheduler: () => poolScheduler,
       })
+    }
+    if (req.method === 'GET' && KEY_SELF_PATHS.has(p)) {
+      return await handleKeySelf(req, res, url)
     }
     if (req.method === 'POST' && (p === '/v1/messages/count_tokens' || p === '/messages/count_tokens')) {
       return json(res, 404, { error: { message: 'not found: ' + p } })
@@ -1293,6 +1308,8 @@ const pub = {
     responses: publicEndpoint('/v1/responses'),
     messages: publicEndpoint('/v1/messages'),
     usage: publicEndpoint('/v1/usage'),
+    me_quota: publicEndpoint('/v1/me/quota'),
+    me_usage: publicEndpoint('/v1/me/usage'),
     intercept_rules: publicEndpoint('/admin/intercept/rules'),
   },
 }

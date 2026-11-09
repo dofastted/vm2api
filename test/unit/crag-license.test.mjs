@@ -8,6 +8,7 @@ import {
   activateCragLicense,
   checkCragLicense,
   cragLicenseDirectory,
+  cragUniversalDirectory,
   getCragLicense,
   verifyCragRegistration,
 } from '../../src/lib/vm/crag-license.mjs'
@@ -24,6 +25,7 @@ import {
   fixtureAuthority,
   issueFixtureCode,
   seedEncryptedPackage,
+  issueUniversalCode,
   signedCode,
 } from '../fixtures/crag-license.mjs'
 
@@ -85,6 +87,7 @@ test('challenge and atomic activation expose only authenticated public status', 
   assert.equal(activated.status, 200)
   assert.equal(activated.body.data.license.expires_at, issued.claims.expires_at)
   assert.equal(activated.body.data.license.valid, true)
+  assert.equal(activated.body.data.license.kind, 'online')
   assert.doesNotMatch(JSON.stringify(activated.body), /CRAGL1|private_key|wrapped_key|ciphertext/)
   const dir = cragLicenseDirectory(root, vm)
   assert.equal(fs.statSync(dir).mode & 0o777, 0o700)
@@ -96,6 +99,66 @@ test('challenge and atomic activation expose only authenticated public status', 
   assert.equal(denied.body.error.code, 'license_invalid')
   assert.deepEqual(fs.readFileSync(path.join(dir, 'registration.code')), stored)
   assert.equal(getCragLicense(root, vm).license.valid, true)
+})
+
+test('universal CRAGU1 activates without creating a device binding', async (t) => {
+  const { root, vm } = fixture(t)
+  const issued = issueUniversalCode(root)
+  const activated = await route(root, 'POST', '/crag-license', { registration_code: issued.code })
+  assert.equal(activated.status, 200)
+  assert.equal(activated.body.data.license.valid, true)
+  assert.equal(activated.body.data.license.kind, 'offline')
+  assert.equal(activated.body.data.license.license_id, issued.claims.license_id)
+  assert.equal(activated.body.data.machine_code, '')
+  assert.doesNotMatch(JSON.stringify(activated.body), /CRAGU1|wrapped_key|ciphertext|private_key/)
+  const dir = cragLicenseDirectory(root, vm)
+  assert.equal(fs.existsSync(path.join(dir, 'device.json')), false)
+  assert.equal(fs.statSync(path.join(dir, 'registration.code')).mode & 0o777, 0o600)
+  const stored = fs.readFileSync(path.join(dir, 'registration.code'))
+  assert.throws(() => activateCragLicense(root, vm, `${issued.code}x`), { code: 'license_invalid' })
+  assert.deepEqual(fs.readFileSync(path.join(dir, 'registration.code')), stored)
+  const current = getCragLicense(root, vm)
+  assert.equal(current.license.valid, true)
+  assert.equal(current.machine_code, '')
+  const panel = await route(root, 'GET', '/crag-license')
+  assert.equal(panel.status, 200)
+  assert.equal(panel.body.data.license.kind, 'offline')
+  assert.match(panel.body.data.machine_code, /^CRAGM1\./)
+  assert.equal(fs.existsSync(path.join(dir, 'device.json')), true)
+  assert.equal(checkCragLicense(root, { ...vm, dataplane: 'crag' }).ok, true)
+  const expired = issueUniversalCode(root, { issued_at: Math.floor(Date.now() / 1000) - 70 * 86400 })
+  assert.throws(() => activateCragLicense(root, vm, expired.code), { code: 'license_expired' })
+  assert.deepEqual(fs.readFileSync(path.join(dir, 'registration.code')), stored)
+})
+
+test('one offline code licenses every slot and does not replace a device grant', (t) => {
+  const { root, vm } = fixture(t)
+  const bound = activateFixture(root, vm)
+  assert.equal(bound.license.kind, 'online')
+  const before = fs.readFileSync(path.join(cragLicenseDirectory(root, vm), 'registration.code'))
+  const other = { id: 'vm-14', status: 'stopped', dataplane: 'crag' }
+  fs.mkdirSync(path.join(root, 'vms', other.id), { recursive: true })
+  fs.writeFileSync(path.join(root, 'vms', `${other.id}.json`), JSON.stringify(other))
+  fs.writeFileSync(path.join(root, 'vms', other.id, 'machine-id'), crypto.randomBytes(16).toString('hex') + '\n')
+  const issued = issueUniversalCode(root)
+  const activated = activateCragLicense(root, other, issued.code)
+  assert.equal(activated.license.scope, 'kernel')
+  assert.equal(fs.readFileSync(path.join(cragLicenseDirectory(root, vm), 'registration.code')).equals(before), true)
+  assert.equal(getCragLicense(root, vm).license.kind, 'online')
+  const shared = getCragLicense(root, other)
+  assert.equal(shared.license.valid, true)
+  assert.equal(shared.license.kind, 'offline')
+  assert.equal(shared.license.scope, 'kernel')
+  assert.equal(checkCragLicense(root, other).ok, true)
+  assert.equal(fs.existsSync(path.join(cragLicenseDirectory(root, other), 'device.json')), false)
+  const third = { id: 'vm-15', status: 'stopped', dataplane: 'crag' }
+  fs.mkdirSync(path.join(root, 'vms', third.id), { recursive: true })
+  fs.writeFileSync(path.join(root, 'vms', `${third.id}.json`), JSON.stringify(third))
+  assert.equal(getCragLicense(root, third).license.license_id, issued.claims.license_id)
+  assert.equal(
+    fs.readFileSync(path.join(cragUniversalDirectory(root), 'registration.code'), 'utf8').trim(),
+    issued.code,
+  )
 })
 
 test('wrong VM, machine, signer, tamper and wrapped-key failure never replace an existing grant', (t) => {

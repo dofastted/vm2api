@@ -731,8 +731,41 @@ export function getCapabilities(modelId = '') {
   return getModelEntry(modelId).capabilities
 }
 
-export function getBetaPolicy(modelId = '') {
-  return getModelEntry(modelId).betas
+/**
+ * Preset capability boundary for one model. CRAG's official CLI table is not
+ * this matrix: the pre-clean stage hands the entry across, and CRAG applies it.
+ */
+export function modelDirectiveForCrag(modelId = '') {
+  const entry = getModelEntry(modelId)
+  const caps = entry.capabilities || {}
+  const params = entry.params || {}
+  const positive = (value) => {
+    const n = Number(value)
+    return Number.isSafeInteger(n) && n > 0 ? n : 0
+  }
+  const drop = Array.isArray(entry.betas?.drop)
+    ? entry.betas.drop.map((beta) => String(beta || '')).filter(Boolean)
+    : []
+  return {
+    id: entry.id || String(modelId || ''),
+    capabilities: {
+      thinking_mode: String(caps.thinking_mode || ''),
+      supports_adaptive: caps.supports_adaptive === true,
+      supports_effort: caps.supports_effort === true,
+      supports_context_management: caps.supports_context_management === true,
+      supports_1m: caps.supports_1m === true,
+      supports_interleaved: caps.supports_interleaved === true,
+    },
+    params: {
+      max_tokens_default: positive(params.max_tokens_default),
+      max_tokens_cap: positive(params.max_tokens_cap),
+      thinking_fallback_budget: positive(params.thinking_fallback_budget),
+      on_adaptive: String(params.on_adaptive || ''),
+      on_enabled: String(params.on_enabled || ''),
+      ...(params.default_effort ? { default_effort: String(params.default_effort) } : {}),
+    },
+    betas: { drop },
+  }
 }
 
 export function getContext1mWhitelist() {

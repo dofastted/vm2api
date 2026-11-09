@@ -13,9 +13,12 @@ FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS helpers
 ENV CGO_ENABLED=0 GOOS=linux GOARCH=amd64
 WORKDIR /src
 COPY api-kernel/go.mod api-kernel/go.sum ./api-kernel/
-RUN cd api-kernel && go mod download
+COPY redact/go.mod redact/go.sum ./redact/
+RUN cd api-kernel && go mod download && cd ../redact && go mod download
 COPY api-kernel/ ./api-kernel/
-RUN cd api-kernel && go build -buildvcs=false -trimpath -o /out/kin-api-kernel ./cmd/kin-api-kernel
+COPY redact/ ./redact/
+RUN cd api-kernel && go build -buildvcs=false -trimpath -o /out/kin-api-kernel ./cmd/kin-api-kernel \
+  && cd ../redact && go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/kin-redact ./cmd/kin-redact
 
 FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS payload
 WORKDIR /src
@@ -58,6 +61,7 @@ ENV NODE_ENV=production \
     KIN_CODEX_KERNEL_BIN=/opt/vm2api/bin/kin-codex-kernel \
     KIN_OAUTH_AUTH_BIN=/opt/vm2api/bin/kin-oauth-auth \
     KIN_COMPUTER_BIN=/opt/vm2api/bin/kin-computer \
-    KIN_API_KERNEL_BIN=/opt/vm2api/bin/kin-api-kernel
+    KIN_API_KERNEL_BIN=/opt/vm2api/bin/kin-api-kernel \
+    KIN_REDACT_BIN=/opt/vm2api/bin/kin-redact
 EXPOSE 8787
 ENTRYPOINT ["/usr/local/bin/vm2api-entrypoint"]

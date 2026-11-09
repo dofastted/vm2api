@@ -50,11 +50,31 @@ export function VmPersonaEditor({ id, vm }: { id: string; vm: Vm }) {
         </div>
       </div>
       <p className='mt-3 text-xs leading-relaxed text-muted-foreground'>
-        方案只在{' '}
-        <Link to='/system' className='underline underline-offset-4'>
-          system提示词
-        </Link>{' '}
-        修改。槽位覆盖会盖掉全局方案，这是上次第三方请求没带上官方完整提示词的原因。
+        {vm.resolved_dataplane === 'crag' &&
+        vm.resolved_crag_kernel_version === 'v2' ? (
+          <>
+            本槽是 CRAG v2 print，不读 kernel.json 的
+            persona_preset。实际送出是「
+            {vm.resolved_crag_print_persona === 'zero'
+              ? '0注入 replace'
+              : '只 append 调用方尾巴'}
+            」。方案在{' '}
+            <Link to='/system' className='underline underline-offset-4'>
+              system提示词
+            </Link>{' '}
+            的 CRAG 一套里改。槽位显式 0注入走 replace；其它档不贴 cli-node
+            模板。
+          </>
+        ) : (
+          <>
+            方案只在{' '}
+            <Link to='/system' className='underline underline-offset-4'>
+              system提示词
+            </Link>{' '}
+            的 cli-node
+            一套里改。槽位覆盖会盖掉全局方案，这是上次第三方请求没带上官方完整提示词的原因。
+          </>
+        )}
       </p>
       {inherits || !canEdit ? null : (
         <Button

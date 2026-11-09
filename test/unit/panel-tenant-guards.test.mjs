@@ -21,6 +21,7 @@ const { authorizePanelRoute } = await import('../../src/lib/admin/panel-acl.mjs'
 const { ApiKeyStore } = await import('../../src/lib/admin/api-keys.mjs')
 const { PanelUserStore } = await import('../../src/lib/admin/panel-users.mjs')
 const { parseAllowedVms } = await import('../../src/lib/admin/key-scope.mjs')
+const { parseKeyAllowedModels } = await import('../../src/lib/admin/key-models.mjs')
 const { createVmPool } = await import('../../src/lib/admin/vm-pools.mjs')
 const { VmPoolsRepo } = await import('../../src/lib/db/repos/vm-pools-repo.mjs')
 const { createDatabase } = await import('../../src/lib/db/database.mjs')
@@ -79,22 +80,20 @@ function makeHandler(root, who, body, extra = {}) {
   return { call, response }
 }
 
-test('tenant cannot import credentials into another tenant slot; missing and foreign look the same', async (t) => {
+test('tenant cannot import credentials into any slot', async (t) => {
   const root = makeProject(t)
   codexVm(root, 'vm-mine', 'u-1')
   codexVm(root, 'vm-other', 'u-2')
   const body = (vm_id) => ({ vm_id, mode: 'access_token', raw: 'tenant-at' })
 
   const foreign = await makeHandler(root, TENANT, body('vm-other')).call('POST', '/api/panel/vms/import')
-  assert.equal(foreign.status, 404)
+  assert.equal(foreign.status, 403)
   const missing = await makeHandler(root, TENANT, body('vm-nope')).call('POST', '/api/panel/vms/import')
-  assert.equal(missing.status, 404)
-  assert.deepEqual(foreign.body, missing.body)
-  assert.equal(readCodexAccounts(root, 'vm-other')[0].access_token, 'old-vm-other')
-
+  assert.equal(missing.status, 403)
   const own = await makeHandler(root, TENANT, body('vm-mine')).call('POST', '/api/panel/vms/import')
-  assert.equal(own.status, 200, JSON.stringify(own.body))
-  assert.equal(readCodexAccounts(root, 'vm-mine')[0].access_token, 'tenant-at')
+  assert.equal(own.status, 403)
+  assert.equal(readCodexAccounts(root, 'vm-other')[0].access_token, 'old-vm-other')
+  assert.equal(readCodexAccounts(root, 'vm-mine')[0].access_token, 'old-vm-mine')
 })
 
 test('admin import still reaches any slot', async (t) => {
@@ -126,7 +125,7 @@ test('tenant proxy import cannot bind a slot it does not own', async (t) => {
     'POST',
     '/api/panel/proxies/import',
   )
-  assert.equal(tenant.status, 404)
+  assert.equal(tenant.status, 403)
   assert.deepEqual(calls, [])
 
   const admin = await makeHandler(root, ADMIN, { text: 'h:1080', bind_vm_id: 'vm-other' }, { proxyPool }).call(
@@ -406,6 +405,45 @@ test('admin key edits keep their own user_id while retaining group and slot cont
   assert.equal(rec.group_id, 7)
 })
 
+for (const who of [TENANT, ADMIN]) {
+  test(`${who.panelRole} can limit their own key to listed models`, async (t) => {
+    const { root, store, key } = keyFixture(t)
+    const call = (body, method, url) => makeHandler(root, who, body, { apiKeyStore: store }).call(method, url)
+    const created = await call(
+      { name: 'limited', allowed_models: [' claude-haiku-4-5 ', 'CLAUDE-HAIKU-4-5', ''] },
+      'POST',
+      '/api/panel/api-keys',
+    )
+    assert.equal(created.status, 201, JSON.stringify(created.body))
+    assert.deepEqual(created.body.item.allowed_models, ['claude-haiku-4-5'])
+
+    const patched = await call({ allowed_models: ['gpt-6-sol'] }, 'PATCH', `/api/panel/api-keys/${key.id}`)
+    assert.equal(patched.status, 200, JSON.stringify(patched.body))
+    assert.deepEqual(patched.body.item.allowed_models, ['gpt-6-sol'])
+    const listed = await call(null, 'GET', '/api/panel/api-keys')
+    assert.deepEqual(listed.body.keys.find((item) => item.id === key.id).allowed_models, ['gpt-6-sol'])
+    const renamed = await call({ name: 'renamed' }, 'PATCH', `/api/panel/api-keys/${key.id}`)
+    assert.deepEqual(renamed.body.item.allowed_models, ['gpt-6-sol'], 'omitted field keeps the list')
+
+    const count = store.list().length
+    const tooMany = Array.from({ length: 201 }, (_, i) => `model-${i}`)
+    for (const bad of ['gpt-6-sol', [1], tooMany]) {
+      const rejected = await call({ name: 'bad', allowed_models: bad }, 'POST', '/api/panel/api-keys')
+      assert.equal(rejected.status, 400, JSON.stringify(rejected.body))
+      assert.equal(rejected.body.error.code, 'invalid_allowed_models')
+      const badPatch = await call({ allowed_models: bad }, 'PATCH', `/api/panel/api-keys/${key.id}`)
+      assert.equal(badPatch.status, 400)
+      assert.equal(badPatch.body.error.code, 'invalid_allowed_models')
+    }
+    assert.equal(store.list().length, count)
+    assert.deepEqual(parseKeyAllowedModels(store.getById(key.id).allowed_models), ['gpt-6-sol'])
+
+    const cleared = await call({ allowed_models: [] }, 'PATCH', `/api/panel/api-keys/${key.id}`)
+    assert.equal(cleared.status, 200)
+    assert.deepEqual(cleared.body.item.allowed_models, [])
+  })
+}
+
 test('tenant key create/patch vm_pool_id guard; admin can set pool', async (t) => {
   const { root, store, key } = keyFixture(t)
   const poolRepo = new VmPoolsRepo(store.db)
@@ -538,6 +576,58 @@ test('unrelated user edits keep sessions alive', async (t) => {
   )
   assert.equal(out.status, 200, JSON.stringify(out.body))
   assert.equal(verifyPanelSession(token)?.user, 'quota')
+})
+
+test('admin user routes show, set and validate user concurrency', async (t) => {
+  const panelUsers = usersFixture(t)
+  const root = makeProject(t)
+  const call = (who, body, method, url) => makeHandler(root, who, body, { panelUsers }).call(method, url)
+
+  const created = await call(
+    ADMIN,
+    { username: 'heavy', password: 'heavy-pass', concurrency: 20 },
+    'POST',
+    '/api/panel/users',
+  )
+  assert.equal(created.status, 201, JSON.stringify(created.body))
+  assert.equal(created.body.data.item.concurrency, 20)
+  const id = created.body.data.item.id
+
+  const listed = await call(ADMIN, {}, 'GET', '/api/panel/users')
+  assert.equal(listed.body.data.items.find((u) => u.id === id).concurrency, 20)
+  assert.equal(listed.body.data.items.find((u) => u.username === 'boss').concurrency, 5)
+
+  const patched = await call(ADMIN, { concurrency: 3 }, 'PATCH', `/api/panel/users/${id}`)
+  assert.equal(patched.status, 200, JSON.stringify(patched.body))
+  assert.equal(patched.body.data.item.concurrency, 3)
+
+  const unlimited = await call(ADMIN, { concurrency: 0 }, 'PATCH', `/api/panel/users/${id}`)
+  assert.equal(unlimited.status, 200, JSON.stringify(unlimited.body))
+  assert.equal(unlimited.body.data.item.concurrency, 0)
+  const restored = await call(ADMIN, { concurrency: 3 }, 'PATCH', `/api/panel/users/${id}`)
+  assert.equal(restored.status, 200, JSON.stringify(restored.body))
+
+  for (const concurrency of [-1, 1001, 1.5, '4']) {
+    const bad = await call(ADMIN, { concurrency }, 'PATCH', `/api/panel/users/${id}`)
+    assert.equal(bad.status, 400, JSON.stringify(concurrency))
+    assert.equal(bad.body.error.code, 'invalid_concurrency')
+  }
+  const badCreate = await call(
+    ADMIN,
+    { username: 'nope', password: 'nope-pass1', concurrency: -2 },
+    'POST',
+    '/api/panel/users',
+  )
+  assert.equal(badCreate.status, 400)
+  assert.equal(badCreate.body.error.code, 'invalid_concurrency')
+  assert.equal(panelUsers.getByUsername('nope'), null)
+  assert.equal(panelUsers.getById(id).concurrency, 3)
+
+  for (const who of [TENANT, { panelUser: 'ops', panelRole: 'super', panelUserId: 'u-ops' }]) {
+    const denied = await call(who, { concurrency: 999 }, 'PATCH', `/api/panel/users/${id}`)
+    assert.equal(denied.status, 403, who.panelRole)
+  }
+  assert.equal(panelUsers.getById(id).concurrency, 3)
 })
 
 test('test-models is readable by user and super; other routes stay closed', () => {

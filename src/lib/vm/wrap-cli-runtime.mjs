@@ -114,18 +114,18 @@ function cachedPackageRoot(base, arch) {
   }
 }
 /** Package location only. This does not select v2 for VMs that omitted the version. */
-export function cragV2PackageRoot(projectRoot) {
+export function cragV2PackageRoot(projectRoot, arch = cragV2Arch()) {
   const env = String(process.env.KIN_CRAG_V2_ROOT || '').trim()
   if (env && isFile(path.join(env, 'manifest.json'))) return env
   if (!projectRoot) return ''
   const base = path.join(projectRoot, 'share', 'crag', 'kernels', 'v2')
-  const cached = cachedPackageRoot(base, cragV2Arch())
+  const cached = cachedPackageRoot(base, arch)
   if (cached) {
     if (!isFile(path.join(cached, 'manifest.json')))
       throw Object.assign(new Error('CRAG 缓存缺少发行清单，请重新拉取'), { code: 'kernel_cache_invalid' })
     return cached
   }
-  const staged = path.join(base, cragV2Arch())
+  const staged = path.join(base, arch)
   return isFile(path.join(staged, 'manifest.json')) ? staged : ''
 }
 
@@ -185,7 +185,7 @@ function listCragV2Files(dir, prefix = '') {
   return rows
 }
 
-export function verifyCragV2Tree(dir) {
+export function verifyCragV2Tree(dir, { arch = cragV2Arch() } = {}) {
   try {
     const root = fs.lstatSync(dir)
     if (root.isSymbolicLink())
@@ -209,11 +209,11 @@ export function verifyCragV2Tree(dir) {
   if (manifest.family !== 'crag' || manifest.version !== 'v2') {
     return { ok: false, code: 'crag_v2_manifest_invalid', error: 'CRAG v2 manifest family/version mismatch' }
   }
-  if (!['amd64', 'arm64'].includes(manifest.arch) || manifest.arch !== cragV2Arch()) {
+  if (!['amd64', 'arm64'].includes(manifest.arch) || manifest.arch !== arch) {
     return {
       ok: false,
       code: 'crag_v2_arch_mismatch',
-      error: `CRAG v2 arch ${manifest.arch} does not match ${cragV2Arch()}`,
+      error: `CRAG v2 arch ${manifest.arch} does not match ${arch}`,
     }
   }
   if (manifest.encrypted !== true || manifest.runtime !== 'native' || manifest.entrypoint !== CRAG_V2_ENTRY) {
@@ -358,6 +358,8 @@ function stageCragV2Tree(src, dest) {
   let had = false
   try {
     fs.cpSync(src, staging, { recursive: true, dereference: false })
+    // mkdtemp is 0700. The slot user is not root, so it cannot exec the bootstrap inside it.
+    fs.chmodSync(staging, 0o755)
     const verified = verifyCragV2Tree(staging)
     if (!verified.ok) {
       fs.rmSync(staging, { recursive: true, force: true })
@@ -449,6 +451,10 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null } = 
   const dest = wrapCliHomeDir(projectRoot, vm.id)
   fs.mkdirSync(dest, { recursive: true })
   if (!cragV2WouldChange(src, dest)) {
+    try {
+      fs.chmodSync(path.join(dest, CRAG_V2_DIR), 0o755)
+    } catch {}
+    chownTree(dest, uid, gid)
     return {
       ok: true,
       dest,
@@ -506,7 +512,7 @@ export function cragKernelPath(projectRoot) {
   return isFile(alt) ? alt : ''
 }
 
-function cliPayloadPath(projectRoot, name, dir = wrapCliTemplateDir(projectRoot)) {
+export function cliPayloadPath(projectRoot, name, dir = wrapCliTemplateDir(projectRoot)) {
   const selected = path.join(dir, name)
   if (isFile(selected) || name !== CC_NODE_BIN) return selected
   // Pulling the free pair does not remove the separately shipped legacy CLI.

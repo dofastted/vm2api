@@ -11,8 +11,9 @@ import {
 const profileUrl = new URL('../../src/lib/vm/crag-v2-seccomp.json', import.meta.url)
 const profile = JSON.parse(fs.readFileSync(profileUrl, 'utf8'))
 const native = { id: 'vm-13', dataplane: 'crag', crag_kernel_version: 'v2' }
-const output = (securityOpts, restart = 'unless-stopped') =>
-  `false|0|kin-eg-local||kin-os/ubuntu:24.04|existing-host|docker||false|${restart}|${JSON.stringify(securityOpts)}`
+const output = (securityOpts, restart = 'unless-stopped', init = 'true') =>
+  `false|0|kin-eg-local||kin-os/ubuntu:24.04|existing-host|docker||false|${restart}|${JSON.stringify(securityOpts)}|${init}`
+
 const reorderedProfile = Object.fromEntries(Object.entries(profile).reverse())
 
 test('later native manual start upgrades a default or unconfined container but keeps the exact narrow sandbox', () => {
@@ -41,6 +42,24 @@ test('later native manual start upgrades a default or unconfined container but k
       'already secured native target must be reused',
     )
   }
+  const restricted = inspectContainerOutcome('kin-13', {
+    run: () => ({ ok: true, stdout: output(['no-new-privileges', `seccomp=${JSON.stringify(profile)}`]) }),
+  })
+  assert.equal(
+    nativeSlotSandboxNeedsRecreate(restricted.container, native, {}, { userNamespaceRestricted: true }),
+    true,
+    'Ubuntu AppArmor userns policy requires a recreated container',
+  )
+  const unrestricted = inspectContainerOutcome('kin-13', {
+    run: () => ({
+      ok: true,
+      stdout: output(['no-new-privileges', `seccomp=${JSON.stringify(profile)}`, 'apparmor=unconfined']),
+    }),
+  })
+  assert.equal(
+    nativeSlotSandboxNeedsRecreate(unrestricted.container, native, {}, { userNamespaceRestricted: true }),
+    false,
+  )
   assert.equal(
     nativeSlotSandboxNeedsRecreate(null, native),
     false,

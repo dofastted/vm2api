@@ -61,7 +61,7 @@ test('claude in the panel shell runs cli-node and points config at .claude', () 
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('official login starts claude only when the panel login marker is set', () => {
+test('official login starts claude auth login only when the panel login marker is set', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-login-'))
   const bin = path.join(dir, 'cli-node')
   fs.writeFileSync(bin, '#!/bin/sh\necho "cli-node $*"\n', { mode: 0o755 })
@@ -79,8 +79,8 @@ test('official login starts claude only when the panel login marker is set', () 
   assert.equal(plain.status, 0, plain.stderr)
   assert.doesNotMatch(plain.stdout, /cli-node/)
   assert.equal(login.status, 0, login.stderr)
-  assert.match(login.stdout, /cli-node\s*$/m)
-  assert.doesNotMatch(login.stdout, /auth login/)
+  assert.match(login.stdout, /cli-node auth login\s*$/m)
+  assert.doesNotMatch(plain.stdout, /auth login/)
   fs.rmSync(dir, { recursive: true, force: true })
 })
 

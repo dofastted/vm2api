@@ -39,7 +39,7 @@ import { iptablesPlan } from '../../src/lib/vm/egress.mjs'
 import { PoolScheduler } from '../../src/lib/pool/pool-scheduler.mjs'
 import { getVm, listVms } from '../../src/lib/vm/vm-registry.mjs'
 import { atomicWriteJson } from '../../src/lib/vm/vm-file.mjs'
-
+import { seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 const { Server, utils } = ssh2
 
 function tmpDir(prefix) {
@@ -400,6 +400,74 @@ function fakeElf(file, fill) {
   fs.writeFileSync(file, buf, { mode: 0o755 })
 }
 
+const SLOT_IMAGE_ENV_KEYS = [
+  'KIN_KERNEL_BIN',
+  'KIN_WORKER_BIN',
+  'KIN_EGRESS_BIN',
+  'KIN_CODEX_KERNEL_BIN',
+  'KIN_OAUTH_AUTH_BIN',
+  'KIN_WRAP_CLI_ROOT',
+  'KIN_CLUSTER_WORKER_BIN',
+  'KIN_CLUSTER_EGRESS_BIN',
+]
+
+function withSlotImageEnv(t, root) {
+  const saved = Object.fromEntries(SLOT_IMAGE_ENV_KEYS.map((k) => [k, process.env[k]]))
+  t.after(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  })
+  for (const k of SLOT_IMAGE_ENV_KEYS) delete process.env[k]
+  process.env.KIN_CODEX_KERNEL_BIN = path.join(root, 'bin/kin-codex-kernel')
+  process.env.KIN_CLUSTER_WORKER_BIN = path.join(root, 'bin/kin-worker')
+  process.env.KIN_CLUSTER_EGRESS_BIN = path.join(root, 'bin/kin-egress')
+}
+
+function seedSlotImagePayload(root, { factoryCcNode = true, cacheCcNode = false } = {}) {
+  const pkgId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+  const pkgDir = path.join(root, 'share/wrap-cli-releases/packages', `amd64-${pkgId}`)
+  fs.mkdirSync(pkgDir, { recursive: true })
+  fakeElf(path.join(pkgDir, 'kin-kernel.bin'), 1)
+  fakeElf(path.join(pkgDir, 'cli-node'), 2)
+  if (cacheCcNode) fakeElf(path.join(pkgDir, 'cc-node'), 2)
+  fs.mkdirSync(path.join(root, 'share/wrap-cli-releases'), { recursive: true })
+  fs.writeFileSync(
+    path.join(root, 'share/wrap-cli-releases/current-amd64.json'),
+    JSON.stringify({ package: `packages/amd64-${pkgId}` }),
+  )
+  if (factoryCcNode) fakeElf(path.join(root, 'share/wrap-cli/cc-node'), 3)
+  for (const f of ['bin/kin-worker', 'bin/kin-egress', 'bin/kin-oauth-auth', 'bin/kin-codex-kernel']) {
+    fakeElf(path.join(root, f), 1)
+  }
+}
+
+test('slot image uses factory cc-node when the wrap-cli cache package omits it', (t) => {
+  const root = tmpDir('kin-slot-cc-fallback-')
+  withSlotImageEnv(t, root)
+  seedSlotImagePayload(root, { factoryCcNode: true, cacheCcNode: false })
+  seedEncryptedPackage(root)
+  const factoryCc = path.join(root, 'share/wrap-cli/cc-node')
+  const spec = slotImageSpec(root, 'ubuntu-24.04')
+  const cc = spec.files.find((file) => file.name === 'opt/kin/cc-node')
+  assert.ok(cc, 'cc-node must be baked into the slot image')
+  assert.equal(path.resolve(cc.src), path.resolve(factoryCc))
+})
+
+test('slot image reports factory cc-node path when both cache and factory omit it', (t) => {
+  const root = tmpDir('kin-slot-cc-missing-')
+  withSlotImageEnv(t, root)
+  seedSlotImagePayload(root, { factoryCcNode: false, cacheCcNode: false })
+  seedEncryptedPackage(root)
+  const factoryCc = path.join(root, 'share/wrap-cli/cc-node')
+  assert.throws(
+    () => slotImageSpec(root, 'ubuntu-24.04'),
+    (err) => err.code === 'slot_payload_missing' && String(err.message).includes(factoryCc),
+    'missing cc-node must name the factory path',
+  )
+})
+
 test('slot image tag follows payload bytes only; a VERSION bump keeps the image', (t) => {
   const root = tmpDir('kin-slot-image-')
   fs.writeFileSync(path.join(root, 'VERSION'), '9.9.9\n')
@@ -423,6 +491,7 @@ test('slot image tag follows payload bytes only; a VERSION bump keeps the image'
     'KIN_WRAP_CLI_ROOT',
     'KIN_CLUSTER_WORKER_BIN',
     'KIN_CLUSTER_EGRESS_BIN',
+    'KIN_CRAG_V2_ROOT',
   ]
   const saved = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]))
   t.after(() => {
@@ -436,6 +505,8 @@ test('slot image tag follows payload bytes only; a VERSION bump keeps the image'
   // Use this test's amd64 fixtures independently of native controller defaults.
   process.env.KIN_CLUSTER_WORKER_BIN = path.join(root, 'bin/kin-worker')
   process.env.KIN_CLUSTER_EGRESS_BIN = path.join(root, 'bin/kin-egress')
+  delete process.env.KIN_CRAG_V2_ROOT
+  seedEncryptedPackage(root)
   fs.chmodSync(process.env.KIN_CODEX_KERNEL_BIN, 0o755)
 
   const a = slotImageSpec(root, 'ubuntu-24.04')
@@ -446,6 +517,10 @@ test('slot image tag follows payload bytes only; a VERSION bump keeps the image'
   const entry = a.files.find((file) => `/${file.name}` === container.Cmd[0])
   assert.ok(entry, 'the remote Claude command must name a file baked into its slot image')
   assert.equal(entry.mode, 0o755)
+  assert.ok(a.files.some((file) => file.name === 'opt/kin/kin-kernel'))
+  assert.ok(a.files.some((file) => file.name === 'opt/kin/crag-kernel' && file.mode === 0o755))
+  assert.ok(a.files.some((file) => file.name === 'opt/kin/crag-v2/crag-v2' && file.mode === 0o755))
+  assert.ok(a.files.some((file) => file.name === 'opt/kin/crag-v2/crag-v2.payload.enc'))
   assert.match(entry.body.toString(), /^#!\/bin\/sh/)
   assert.match(a.ref, /^vm2api\/kin-slot-ubuntu-24\.04:[0-9a-f]{12}$/)
   const kvm = slotImageSpec(root, 'ubuntu-24.04', { runtime: 'kvm' })
@@ -461,7 +536,10 @@ test('slot image tag follows payload bytes only; a VERSION bump keeps the image'
   fakeElf(cli, 2)
   fs.utimesSync(cli, new Date(), new Date(Date.now() + 5000))
   assert.notEqual(slotImageSpec(root, 'ubuntu-24.04').ref, a.ref, 'rebuilt cli-node = new image')
-
+  const cragDir = path.join(root, 'share/crag')
+  fs.renameSync(cragDir, path.join(root, 'crag-hidden'))
+  assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'slot_payload_missing' })
+  fs.renameSync(path.join(root, 'crag-hidden'), cragDir)
   fs.writeFileSync(path.join(root, 'bin/kin-worker'), '#!/bin/sh\n')
   assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'slot_payload_invalid' })
   assert.throws(() => slotImageSpec(root, 'nope-os'), { code: 'invalid_kernel' })
@@ -476,6 +554,7 @@ test('cluster payload check skips a container already on the content-hashed imag
     'KIN_OAUTH_AUTH_BIN',
     'KIN_CLUSTER_WORKER_BIN',
     'KIN_CLUSTER_EGRESS_BIN',
+    'KIN_CRAG_V2_ROOT',
   ]
   const saved = envKeys.map((key) => [key, process.env[key]])
   t.after(() => {
@@ -499,6 +578,7 @@ test('cluster payload check skips a container already on the content-hashed imag
     process.env.KIN_CODEX_KERNEL_BIN = path.join(root, 'bin/kin-codex-kernel')
     process.env.KIN_CLUSTER_WORKER_BIN = path.join(root, 'bin/kin-worker')
     process.env.KIN_CLUSTER_EGRESS_BIN = path.join(root, 'bin/kin-egress')
+    seedEncryptedPackage(root)
     const vm = { id: 'vm-03', node_id: 'node-a', kernel: 'ubuntu-24.04' }
     const current = slotImageSpec(root, 'ubuntu-24.04').ref
     const inspect = async () => ({ Config: { Image: current } })
@@ -526,7 +606,7 @@ test('cluster payload check skips a container already on the content-hashed imag
   }
 })
 
-test('node payload refresh leaves a running slot already on the current image up', async (t) => {
+test('node payload refresh recreates a running slot whose command does not match its kernel', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cluster-refresh-'))
   const saved = [
     'KIN_KERNEL_BIN',
@@ -535,6 +615,7 @@ test('node payload refresh leaves a running slot already on the current image up
     'KIN_CLUSTER_EGRESS_BIN',
     'KIN_CODEX_KERNEL_BIN',
     'KIN_OAUTH_AUTH_BIN',
+    'KIN_CRAG_V2_ROOT',
   ].map((key) => [key, process.env[key]])
   t.after(() => {
     for (const [key, value] of saved) {
@@ -557,22 +638,75 @@ test('node payload refresh leaves a running slot already on the current image up
   process.env.KIN_CLUSTER_WORKER_BIN = path.join(root, 'bin/kin-worker')
   process.env.KIN_CLUSTER_EGRESS_BIN = path.join(root, 'bin/kin-egress')
   process.env.KIN_CODEX_KERNEL_BIN = path.join(root, 'bin/kin-codex-kernel')
-  const vm = { id: 'vm-03', node_id: 'node-a', kernel: 'ubuntu-24.04', status: 'running' }
+  seedEncryptedPackage(root)
+  const vm = {
+    id: 'vm-03',
+    node_id: 'node-a',
+    kernel: 'ubuntu-24.04',
+    status: 'running',
+    dataplane: 'crag',
+    crag_kernel_version: 'v2',
+  }
   const current = slotImageSpec(root, 'ubuntu-24.04').ref
   const inspected = []
+  const started = []
   const report = await refreshNodeSlotPayload(vm, root, {
     sessionFor: async () => ({ docker: {} }),
     inspect: async (_docker, name) => {
       inspected.push(name)
       return { State: { Running: true }, Config: { Image: current } }
     },
-    startFn: async () => assert.fail('a slot on the current image must not be recreated'),
+    startFn: async (target, _root, opts) => {
+      started.push({
+        id: target.id,
+        dataplane: target.dataplane,
+        version: target.crag_kernel_version,
+        recreate: opts.recreate,
+      })
+      return { ok: true, action: 'created' }
+    },
   })
   assert.deepEqual(inspected, ['kin-03'])
   assert.equal(report.ok, true)
-  assert.equal(report.kernel_changed, false)
-  assert.equal(report.restarted, false)
-  assert.deepEqual(report.kernel, { ok: true, skipped: true, reason: 'unchanged' })
+  assert.equal(report.kernel_changed, true)
+  assert.equal(report.restarted, true)
+  assert.deepEqual(started, [{ id: 'vm-03', dataplane: 'crag', version: 'v2', recreate: true }])
+  const stayed = []
+  const again = await refreshNodeSlotPayload(vm, root, {
+    sessionFor: async () => ({ docker: {} }),
+    inspect: async () => ({
+      State: { Running: true },
+      Config: {
+        Image: current,
+        Cmd: ['/opt/kin-live/crag-kernel', '--gateway-worker', '--config', '/run/kin/kernel.json'],
+      },
+      HostConfig: {
+        Init: true,
+        SecurityOpt: ['no-new-privileges', 'seccomp=/tmp/crag-v2-seccomp.json', 'apparmor=unconfined'],
+      },
+    }),
+    startFn: async () => {
+      stayed.push('started')
+      return { ok: false }
+    },
+  })
+  assert.equal(again.kernel_changed, false)
+  assert.deepEqual(stayed, [])
+  const wrapStarted = []
+  const wrap = { ...vm, dataplane: 'wrap', crag_kernel_version: '' }
+  const wrapReport = await refreshNodeSlotPayload(wrap, root, {
+    sessionFor: async () => ({ docker: {} }),
+    inspect: async () => ({
+      State: { Running: true },
+      Config: { Image: current, Cmd: ['/opt/kin/kin-kernel', '--gateway-worker', '--config', '/run/kin/kernel.json'] },
+    }),
+    startFn: async () => {
+      wrapStarted.push('started')
+      return { ok: false }
+    },
+  })
+  assert.equal(wrapReport.kernel_changed, false)
+  assert.deepEqual(wrapStarted, [])
 })
 
 test('amd64 node payload stays separate from native ARM control helpers', (t) => {
@@ -606,6 +740,7 @@ test('amd64 node payload stays separate from native ARM control helpers', (t) =>
     'KIN_WRAP_CLI_ROOT',
     'KIN_CLUSTER_WORKER_BIN',
     'KIN_CLUSTER_EGRESS_BIN',
+    'KIN_CRAG_V2_ROOT',
   ]
   const saved = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]))
   t.after(() => {
@@ -620,6 +755,7 @@ test('amd64 node payload stays separate from native ARM control helpers', (t) =>
   fs.chmodSync(process.env.KIN_CODEX_KERNEL_BIN, 0o755)
   process.env.KIN_CLUSTER_WORKER_BIN = path.join(root, 'amd64', 'kin-worker')
   process.env.KIN_CLUSTER_EGRESS_BIN = path.join(root, 'amd64', 'kin-egress')
+  seedEncryptedPackage(root)
   const payload = slotImageSpec(root, 'ubuntu-24.04')
   for (const name of ['kin-worker', 'kin-egress']) {
     const entry = payload.files.find((file) => file.name === `usr/local/bin/${name}`)
@@ -758,6 +894,7 @@ test('startSlotImageBuild returns a job awaitSlotImageBuild can finish', async (
     'KIN_OAUTH_AUTH_BIN',
     'KIN_CLUSTER_WORKER_BIN',
     'KIN_CLUSTER_EGRESS_BIN',
+    'KIN_CRAG_V2_ROOT',
   ]
   const saved = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]))
   const hits = []
@@ -781,6 +918,7 @@ test('startSlotImageBuild returns a job awaitSlotImageBuild can finish', async (
   process.env.KIN_CODEX_KERNEL_BIN = path.join(root, 'bin/kin-codex-kernel')
   process.env.KIN_CLUSTER_WORKER_BIN = path.join(root, 'bin/kin-worker')
   process.env.KIN_CLUSTER_EGRESS_BIN = path.join(root, 'bin/kin-egress')
+  seedEncryptedPackage(root)
   bindPlacement({
     manager: {
       client() {

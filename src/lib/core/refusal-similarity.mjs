@@ -9,6 +9,8 @@
  * with a small edit stays above the line; a different ask does not.
  */
 import { normalizeText } from './distill-detect.mjs'
+import { computeMessageIdentity } from '../protocol/cache-prefix.mjs'
+import { contextMessageIdentity } from '../protocol/request-body-context.mjs'
 
 export const REFUSAL_SIMILARITY = 0.9
 /** Below this, shingle overlap is noise. Exact fingerprint still applies. */
@@ -65,18 +67,35 @@ function responsesInputTexts(input, includeToolResults = true) {
   return out
 }
 
-function userTexts(body, includeToolResults = true) {
+function messageIdentity(message, ctx = null) {
+  if (!ctx) return computeMessageIdentity(message)
+  return contextMessageIdentity(ctx, message, computeMessageIdentity)
+}
+
+function userTexts(body, includeToolResults = true, { startIndex = 0, ctx = null } = {}) {
   if (!body || typeof body !== 'object') return []
   const out = []
   const messages = Array.isArray(body.messages) ? body.messages : []
-  for (const message of messages) {
+  for (let i = Math.max(0, startIndex); i < messages.length; i++) {
+    const message = messages[i]
     if (message?.role === 'user') {
       const text = contentToText(message.content, includeToolResults)
       if (text) out.push(text)
     }
   }
-  out.push(...responsesInputTexts(body.input, includeToolResults))
+  if (startIndex === 0) out.push(...responsesInputTexts(body.input, includeToolResults))
   return out
+}
+
+export function historyPrefixIntact(body, interceptSession, ctx = null) {
+  const ids = interceptSession?.messageIds
+  if (!Array.isArray(ids) || !ids.length) return false
+  const messages = Array.isArray(body?.messages) ? body.messages : []
+  if (messages.length < ids.length) return false
+  for (let i = 0; i < ids.length; i++) {
+    if (messageIdentity(messages[i], ctx) !== ids[i]) return false
+  }
+  return true
 }
 /** Raw user turns, tool payloads omitted, repeats dropped. Not normalized. */
 export function refusalAskTurns(inbound, body = inbound) {
@@ -100,13 +119,21 @@ export function refusalAskTurns(inbound, body = inbound) {
  * `clean` drops closed reminders and `# Environment` before comparison.
  * The current ask is repeated at the end so a long history cannot hide it.
  */
-export function refusalUserDocument(inbound, body = inbound, options = {}) {
+function collectRefusalUserParts(inbound, body = inbound, options = {}) {
   const includeToolResults = options.includeToolResults !== false
   const clean = typeof options.clean === 'function' ? options.clean : null
-  const seen = new Set()
-  const parts = []
-  for (const src of [inbound, body]) {
-    for (const raw of userTexts(src, includeToolResults)) {
+  const ctx = options.ctx || null
+  const intercept = options.interceptSession
+  const seen = new Set(intercept?.seen || [])
+  const parts = intercept?.parts?.length && historyPrefixIntact(body, intercept, ctx) ? [...intercept.parts] : []
+  const startIndexes =
+    intercept?.parts?.length && historyPrefixIntact(body, intercept, ctx)
+      ? [intercept.messageIds.length, intercept.messageIds.length]
+      : [0, 0]
+  if (!parts.length) seen.clear()
+  for (let s = 0; s < 2; s++) {
+    const src = s === 0 ? inbound : body
+    for (const raw of userTexts(src, includeToolResults, { startIndex: startIndexes[s], ctx })) {
       const text = clean ? clean(raw) : raw
       const norm = normalizeText(text)
       if (!norm || seen.has(norm)) continue
@@ -115,7 +142,22 @@ export function refusalUserDocument(inbound, body = inbound, options = {}) {
     }
   }
   if (clean && parts.length > 1) parts.push(parts[parts.length - 1])
-  return parts.join('\n')
+  return { parts, seen: [...seen] }
+}
+
+export function refusalUserDocument(inbound, body = inbound, options = {}) {
+  return collectRefusalUserParts(inbound, body, options).parts.join('\n')
+}
+
+export function refusalUserDocumentCache(inbound, body = inbound, options = {}) {
+  const collected = collectRefusalUserParts(inbound, body, options)
+  return {
+    messageIds: (Array.isArray(body?.messages) ? body.messages : []).map((message) =>
+      messageIdentity(message, options.ctx),
+    ),
+    parts: collected.parts,
+    seen: collected.seen,
+  }
 }
 
 function fnv1a(text) {

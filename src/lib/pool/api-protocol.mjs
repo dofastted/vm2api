@@ -23,6 +23,7 @@ import { BETA_CONTEXT_1M } from '../protocol/claude-code-betas.mjs'
 import { shouldPassContext1mByPolicy } from '../protocol/model-policy.mjs'
 import { createStreamTiming } from '../protocol/stream-timing.mjs'
 import { mergeUsage } from '../protocol/openai-usage.mjs'
+import { ensureRedaction, maskJson, restoreSseLine } from '../redaction/runtime.mjs'
 
 export function resolveInferenceBackend(req) {
   if (req?.apiKeyKind !== 'managed') return 'oauth'
@@ -287,6 +288,9 @@ export async function runApiInference({
   converters,
   requestContext = null,
   passthrough = false,
+  routing = null,
+  redactionPrincipal = '',
+  redactionSession = '',
 } = {}) {
   const canonical = officialMessagesBody(convertedBody)
   const model = canonical.model
@@ -342,6 +346,9 @@ export async function runApiInference({
     }
   }
   if (requestContext) Object.assign(body, prepareClassifierBody(body))
+  const redactionState = await ensureRedaction(routing || {}, { projectRoot: cfg?.paths?.project })
+  const redaction = redactionState.enabled ? { principal: redactionPrincipal, session: redactionSession } : null
+  if (redaction) body = await maskJson(body, redaction)
   const callerProtocolHeaders = forwardAnthropicProtocolHeaders(req?.headers, protocol, protocolKind, {
     passthrough,
   })
@@ -521,6 +528,7 @@ export async function runApiInference({
     let sawMessageStop = false
     let terminalError = null
     await readUpstreamLines(async (line) => {
+      if (redaction) line = await restoreSseLine(line, redaction)
       applyMaybeUsageHide(line, personaHideTokens, cacheTtl, converters)
       converters.applyClaudeSSELineToMessage(line, assembler)
       const raw = String(line || '')
@@ -591,6 +599,7 @@ export async function runApiInference({
   let committed = false
   let sawStop = false
   await readUpstreamLines(async (line) => {
+    if (redaction) line = await restoreSseLine(line, redaction)
     if (personaHideTokens) line = converters.hidePersonaUsageInSseLine(line, personaHideTokens, cacheTtl) || line
     if (String(line).includes('message_stop')) sawStop = true
     if (!committed && String(line).startsWith('data:')) {

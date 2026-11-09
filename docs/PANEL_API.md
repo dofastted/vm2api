@@ -45,9 +45,9 @@
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/users` | 列表（含 `vm_create_quota`） |
-| POST | `/users` | `{ username, password, role, enabled, vm_create_quota? }` |
-| PATCH | `/users/:id` | 改角色/密码/启用/配额；改密会撤销该用户其它会话 |
+| GET | `/users` | 列表（含 `vm_create_quota`、`concurrency`） |
+| POST | `/users` | `{ username, password, role, enabled, vm_create_quota?, concurrency? }` |
+| PATCH | `/users/:id` | 改角色/密码/启用/配额/并发；改密会撤销该用户其它会话 |
 | DELETE | `/users/:id` | 软删除用户并撤销会话；将其 `admin_assigned` VM 收回平台池，保留调度开关与额度冷却；`user_created` VM 保持原归属，不自动转入平台池 |
 | PATCH | `/vms/:id/owner` | admin：`{ user_id }` 分配，`{ user_id: null }` 收回（仅 `admin_assigned`） |
 | GET | `/billing` | 用户计费汇总。`from`/`until`/`group_by=vm|key`。user 隐式只看自己；admin 可 `user_id=` |
@@ -55,7 +55,7 @@
 启动时会修复旧版本遗留的已删除用户 VM 归属：仅收回 `admin_assigned`（旧记录未写 `origin` 时按已有归属规则推断），不收回租户自建 VM、停用用户或无用户记录的 VM。修改经 `vms/*.json` 写入并同步到 SQLite，不重启槽位。
 
 
-用户名 `^[a-zA-Z][a-zA-Z0-9._-]{1,31}$`，密码 8–128。`vm_create_quota` 整数 0–100，默认 0。
+用户名 `^[a-zA-Z][a-zA-Z0-9._-]{1,31}$`，密码 8–128。`vm_create_quota` 整数 0–100，默认 0。`concurrency` 是该用户所有 key 同时在途请求的合计上限，整数 0–1000（0 表示不限），默认 5，越界或非整数回 400 `invalid_concurrency`；admin 的 key 不受此限。
 
 ## 总览 / 槽位
 
@@ -65,9 +65,9 @@
 | GET | `/vms` | 列表（`has_token`、`cred_status`、`proxy_configured`、`can_import_credential`、`account_tier`、`schedule_level`、`schedule_level_mode`、`worker_credential`、Fable 轨；Claude 行 `seats_used` / `seats_max` / `seats_grace` / `seat_sessions` / `queue_depth` / `conc_waiting` / `inflight`）。`seats_used` 是正在占槽的 client session 数，只含在飞请求和已排在这台 VM 上的后续请求；对话结束即释放，粘性 TTL 不占槽。`seats_grace` 只在重启交接的短窗口里计数；`seat_sessions` 是 `{ index, session_id, state, inflight, held_until }[]`，`state` 为 `active` 或 `held`。响应另带 `pool_queue: { global_queue_depth, queue_max }`。`availability.key` 取值 `ok` / `drain` / `quota` / `cool` / `rest` / `off` / `bad` / `none`，`drain` = 临近闸线（仍接单），`rest` = 工作时段外休息中 |
 | GET | `/pool/stream` | SSE。`event: seats`：`{ seats: { [vmId]: { seats_used, seats_max, seats_grace, queue_depth, conc_waiting, inflight, sessions } }, global_queue_depth, queue_max, ts }`，`sessions` 与列表的 `seat_sessions` 同形；缺席的 VM 表示空闲；每次请求开始/结束都会推。`event: proxy`：`{ proxies: { [vmId]: { id, status, enabled, blocked_reason, latency_ms, last_error, last_probe_at } }, ts }`，每次探测或代理状态变化推送。两类帧都按 250ms 节流，租户只收到自己 VM 的条目 |
 | GET | `/vms/:id` | 详情 + 调度等级 + 代理健康 + `billing.today/window_5h/window_7d/prev_window_5h/prev_window_7d/window_5h_projection/by_model/usage_stats`（`usage_stats` = 近 30 个上海自然日的按日用量 + 模型 / 入站路径排名，日界同 `billing.today`；`prev_window_*` 与 `window_5h_projection` 见下） + `account.runtime_window` |
-| PATCH | `/vms/:id` | 热改并发/RPM、OpenAI 会话上限、Claude 席位/配额、模型白名单、槽策略、Claude `schedule_level`、`weight`（Codex 选槽权重 1–100，`null` 回默认 1）、`active_hours` 或 `timezone`（不重启槽）。`timezone` 为任意有效 IANA 名称，会钉住该槽（后续绑定不覆盖）；`timezone_follow_proxy: true` 重新跟随已绑代理的出口时区 |
-| GET | `/vms/:id/crag-license` | 仅 admin/master，沿用 VM 属主校验。返回 `{license,machine_code}`；显式初始化/复用本槽设备机器码，VM 列表不会生成设备私钥。`license` 只含签名期限、绝对 UTC 生效/到期和公开状态，不回注册码/私钥/解密 key。需要已安装签名加密 native V2 包及 Linux 私有 run 映射 |
-| POST | `/vms/:id/crag-license` | `{registration_code}`；先验证 Ed25519 签名、VM/machine-id/设备绑定、封装 key 和当前有效期，再原子替换。`1m`/`6m`/`1y` 从签发时间按自然月计；客户不能请求任意延期。错误码保持 `license_required` / `license_invalid` / `license_binding_mismatch` / `license_not_yet_valid` / `license_expired` / `license_unconfigured`，失败不破坏已有有效授权；激活本身不隐式切换内核 |
+| PATCH | `/vms/:id` | 热改并发/RPM、OpenAI 会话上限、Claude 席位/配额、模型白名单、槽策略、Claude `schedule_level`、`weight`（Codex 选槽权重 1–100，`null` 回默认 1）、`active_hours`、`timezone` 或 `name`（不重启槽，不改 VM 编号）。`name` 是 1–80 字符的面板显示名，创建时的编号保持不变。`timezone` 为任意有效 IANA 名称，会钉住该槽（后续绑定不覆盖）；`timezone_follow_proxy: true` 重新跟随已绑代理的出口时区 |
+| GET | `/vms/:id/crag-license` | 仅 admin/master，沿用 VM 属主校验。返回 `{license,machine_code}`。在线授权显式初始化/复用本槽设备机器码；离线 `CRAGU1` 通用码不需机器码、不绑本槽，`machine_code` 可为空。`license` 含签名期限、绝对 UTC 生效/到期、公开状态及 `kind: 'online' \| 'offline'`，不回注册码/私钥/解密 key。需要已安装签名加密 native V2 包及 Linux 私有 run 映射 |
+| POST | `/vms/:id/crag-license` | `{registration_code}`。支持离线 `CRAGU1` 通用码（不绑 VM/machine-id/设备）与在线设备绑定码；响应 `license.kind` 区分 `offline` / `online`。在线码先验证 Ed25519 签名、VM/machine-id/设备绑定、封装 key 和当前有效期，再原子替换。`1m`/`6m`/`1y` 从签发时间按自然月计；客户不能请求任意延期。错误码保持 `license_required` / `license_invalid` / `license_binding_mismatch` / `license_not_yet_valid` / `license_expired` / `license_unconfigured`，失败不破坏已有有效授权；激活本身不隐式切换内核 |
 | POST | `/vms/pool-policy` | 批量槽策略。`{ ids: [...] }` 或 `{ all: true }`，可带 `weight`(1–100) / `schedule_level`(1–10 或 `"auto"`) / `max_concurrency`(1–256) / `max_rpm`(0–1000000) / `max_sessions`(0–256)；`null`（或 `""`）取消钉住：weight 回默认 1、schedule_level 回 auto、上限回 tier / 全局默认，语义与逐槽 PATCH 一致。只写 `vms/*.json`、不重建槽详情，100+ 槽一次调用即可（逐个 `PATCH /vms/:id` 每槽约 4s，并发下发会压住控制面）。返回 `{ updated, missing, failed, items: [{ id, weight, schedule_level, max_concurrency, concurrency_override, max_rpm, max_sessions }] }` |
 | POST | `/vms/:id/probe` | 槽 SOCKS5 探官方 `/usage` + Fable（Pro 跳过 Fable） |
 | POST | `/vms/:id/exit-probe` | 测这个槽真实出口的 IP 与地理（仅 admin）：SOCKS5 槽经代理查；本地代理槽查它所在 VPS 那条本地代理并刷新该行地理。未绑定 502 `proxy_required` |
@@ -116,6 +116,8 @@
 | GET | `/oauth` | 全槽脱敏 credential |
 
 `/wrap` 仅展示 cli-node 默认内核与需注册码授权的 CRAG。每台 VM 可独立选择后安装；「全部重装并停用」先展示明确范围，再按各 VM 选择逐槽处理并显示结果。CRAG 可直接在行内打开授权管理；VM 详情「运维 → 推理内核」的既有授权入口仍可用。激活授权与安装是两个独立动作，不隐式开机。
+
+离线 `CRAGU1` 一次写入安装级授权，并把同一正式状态复制到每个本地槽和每台集群机器的 `registration.code`。不按 VM 槽或机器核销。在线 `CRAGL1` 仍只绑定本槽设备，已有在线授权不会被通用码覆盖。响应里的 `license.scope` 为 `kernel`（离线）或 `device`（在线）。
 
 拉取与安装分离：拉取失败保留旧包，安装包就绪不代表服务已启动。默认内核不依赖 cc-node 或 legacy CRAG。注册码无效、过期或包未就绪时不停止该槽；停用后的复制/配置失败仍保持 stopped 并返回 `stopped:true`。凭据、授权设备密钥、指纹和工作数据保留；后续需显式启动。若停止状态写入失败，保留本次安装器的安全暂停，修复存储后成功重装、启动或恢复服务才清除；不会清除无关维护暂停。
 
@@ -281,6 +283,9 @@ Analytics 按官方 [`codex_thread_initialized`](https://github.com/openai/codex
 
 `compatibility.persona_preset`（`official` / `official_full` / `zero` / `custom`）和 `compatibility.cache_ttl`（`5m` / `1h`）保存后投影到每个 Claude 槽的 `vms/<id>/run/kernel.json`：`persona_preset`、`system_layout`（`zero`→`zero`，其余→`identity`）、`default_cache_ttl`。响应 `kernel_persona.updated` 是本次字节有变化的槽数。`PATCH /vms/:id` 的 `timezone` / `timezone_follow_proxy` 另把 `timezone` 热写进该槽 `kernel.json`，`timezone_sync.kernel_hot` 表示文件有变化。容器 `TZ` 不在这次写入里。Codex 槽不写。
 
+`compatibility.crag_persona_preset`（`official_full` / `zero`，缺省 `official_full`）只给 CRAG v2 print 清洗，不投影进 `kernel.json`。v2 worker 不读 `persona_preset` 或 `CLAUDE_CODE_SYSTEM_LAYOUT`。`official_full` 只 append 调用方尾巴；`zero` 送 `crag_prompt.mode=replace`。其它值保存时 400。槽位显式 `zero` 覆盖该档；其它槽位人设在 print 上收成 append。这不是 TUI：不关内置工具，也不加 `--no-chrome`。
+
+
 `compatibility.cch_enabled`（布尔，默认 `true`，设置 → 协议）：开启时统一给出站 billing 补齐 `cch` 并计算真实五位摘要；关闭时仍补齐该参数，但固定为 `cch=00000;`，跳过摘要计算。native hop 仅保留占位，最终紧凑 SDK JSON 才计算真实摘要；HTTP hop 在最终 Node 请求体密封。CCH 是 billing system body 参数，不是 User-Agent header。
 
 `inference.session_idle_ttl_seconds`（整数 `1`–`86400`，默认 `600`，设置 → 协议）：投影为 `kernel.json.session_idle_ttl_seconds`，与 CCH 设置集中在同一页，账号池不再重复显示。原生 CLI 槽从最后一次任务完成开始计算空闲时间；到期后由既有巡检释放 session / sticky pin，活动任务不回收。修改不会重置已有空闲计时，也不重启 kernel / CLI；缩短期限可在下一轮巡检释放已空闲足够久的槽。它不是 `sticky.ttl_seconds` 的账号绑定有效期，也不是流空闲超时。
@@ -361,6 +366,12 @@ Claude `routing.quota` 的 5h/7d 闸分三段（`critical_band` 默认 0.05，`g
 
 三个后端走同一套 `/v1/systemone`。题库存在 `questions`：可增删改，缺省是内置六题（综合、色情、破限、逆向、渗透、网络攻击）。每题都是「是否安全」，高分表示安全，启用的题目一起问，任一题低于阈值就拦。`safety_instruction` 非空时再多问一题自定义要求。`POST /jev-intercept/models` 用地址和 Key（留空则用已存的第一把）请求 `{base}/v1/models`，失败回 502，不会把上游 401 当成面板登出。
 
+面板按地址管理，不再用 Jev / Laya / ModernBERT 切换。`PUT` 可带 `endpoints`（1–20 项）：`base_url`、可选 `from_base_url`、可选 `api_keys`、可选 `append`。省略 `api_keys` 保留该地址原来的 Key，地址变了就改绑；`append: true` 把新 Key 追加到后面；`api_keys: []` 清空。第一项是主 `base_url`。同一个决策地址不能重复。后面的项可以只有 URL、没有 Key，请求仍会打到那里。GET 的 `endpoints` 含地址、脱敏 Key、指纹、`retired` 和最近 `status`，不含密钥。
+
+`POST /jev-intercept/probe` 对一个地址最多测 8 把 Key，留空则用已保存的。先请求 `/v1/models`，404 仍继续打 `/v1/systemone`。再用已保存的题库和阈值问两句固定样本：一句普通说明应放行，一句明确的入侵请求应拦截。401 / 429 / 529 暂停该 Key。不回明文 Key。
+
+`POST /jev-intercept/quota` 只读尝试 `/v1/credits`、`/v1/balance`、`/v1/billing`。官方 TypeSafe 没有这些接口，返回不支持，不会为了查余额去打 systemone。402 视为额度用尽。
+
 内置正则覆盖 NSFW、蒸馏、破解、破限，面板删不掉。比较的是用户自己写下的正文，不含 user 轮里的 `tool_result` / `*_tool_result` / `function_call_output`，也不含 `system`、`instructions`、`# Environment` 和已闭合的 `<system-reminder>`。决策模型只看这些用户正文；多轮时当前用户句再附在末尾。命中硬正则或模型返回 HTTP 403 `policy_blocked`，不 hop，不写入拒答缓存；device 封禁开启时封禁入站 device id。模型不可用且 `fail_open` 为 false 时同样 403，不封设备。上游 `content_policy` / `content_filter` / `cyber_policy` / `moderation_blocked` / `safety_violation` / `usage_policy` 同样入库。仅 admin。
 
 账号范围（`account_platform_plans[]`、`account_ids[]`，都可为空）把关卡收窄到部分槽位。每一项是 `平台:套餐`，例如 `claude:max`、`gpt:plus`、`gpt:business`；`none` 是没标注套餐。Claude 的 Max/Pro 与虚拟机列表相同（usage 里有 Fable 就是 Max，盖过落盘的 Pro）。指定账号收槽位 id、邮箱或名称，和勾选取并集，全空 = 所有账号都进关卡。只选了 GPT 套餐时 Claude 仍全部进关卡；选了 Claude 套餐或指定账号后，Claude 在选中槽位后再判，没命中的放行。GPT 一旦有范围就只由范围决定，没有范围时仍看 `openai_platform_enabled`。`GET` / `PUT` 都回 `account_scope.account_platform_plan_options`（带当前槽位数）和槽位清单（每条有 `scope_key`）。旧的 `account_types` 不再参与判断；只写过 `account_plan_types`、还没有 `account_platform_plans` 的配置会收成对应的 GPT 套餐（`none` 同时包含两边的未标注）。
@@ -380,7 +391,11 @@ Claude `routing.quota` 的 5h/7d 闸分三段（`critical_band` 默认 0.05，`g
 
 `/api-keys` 是“我的密钥”接口：所有面板角色（包括管理员）均只列出当前认证用户自己的密钥，数量统计使用相同范围；查询参数不能切换属主。创建和修改时忽略调用方的 `user_id`，以认证用户为准。stats、reveal、rotate、reset-quota、PATCH 和 DELETE 对他人的或不存在的密钥统一返回 404。Master 机器凭证仅管理无用户归属的平台密钥，不能通过这些接口读取或修改用户密钥；缺失用户 ID 的面板会话不匹配任何密钥，创建返回 403 `key_owner_required`。本接口不提供全站用户密钥管理。
 
-创建密钥只在响应里明文出现一次。存储为 HMAC 索引。`group_type` 为 `all`（默认，全局可调度）、`anthropic` 或 `openai`。后两个必须带 `allowed_vms`（该平台的 VM id，可多台）。`vm_pool_id` 绑定命名账号池：成员以池为准，不复制到密钥；`allowed_vms` 被清空。池停用、为空或不存在时请求返回 403 `vm_pool_unavailable`，不回落到全局池。改成员或解除绑定对下一次请求生效，包括已有粘性会话。一台槽只属于一个池。缺字段的旧密钥视为 `all`。`GET /api-keys/:id/stats` 是该密钥近 30 天用量：上海日桶、模型分布、VM 分布。不是 VM 的上游额度窗口。
+创建密钥只在响应里明文出现一次。存储为 HMAC 索引。`group_type` 为 `all`（默认，全局可调度）、`anthropic` 或 `openai`。后两个必须带 `allowed_vms`（该平台的 VM id，可多台）。`vm_pool_id` 绑定命名账号池：成员以池为准，不复制到密钥；`allowed_vms` 被清空。池停用、为空或不存在时请求返回 403 `vm_pool_unavailable`，不回落到全局池。改成员或解除绑定对下一次请求生效，包括已有粘性会话。一台槽只属于一个池。缺字段的旧密钥视为 `all`。
+
+`allowed_models`（字符串数组，可选）是密钥级模型白名单：创建和 PATCH 都可带，去首尾空白、去空项、按不分大小写去重（保留第一次的写法），最多 200 个、每个不超过 128 字符；不是字符串数组、超数或超长返回 400 `invalid_allowed_models`。`[]` 或 `null` 表示不限（默认，迁移 054 前的旧密钥也是 `[]`）；PATCH 不带这个字段则保持原值。租户和管理员都能给自己的密钥设置。判断用客户端请求里写的模型名，在任何模型映射、别名、拦截规则改写之前，精确匹配、不分大小写；Claude Code 的客户端后缀 `[1m]`（1M 上下文开关，不是模型名）两边都会去掉再比较，所以写 `claude-opus-5-5` 也放行 `claude-opus-5-5[1m]`。不做前缀或日期快照的归并，带日期的快照名要单独列出。名单外的请求在调度前直接返回 400 `api_key_model_not_allowed`（`invalid_request_error`，`param: "model"`；`/v1/messages` 带顶层 `type: "error"`），覆盖 `/v1/messages`、`/v1/chat/completions`、`/v1/completions`、`/v1/responses`（含 WebSocket）、`/v1/alpha/search`、`/v1/images/*`；设了名单的密钥调用 `/v1/images/*` 必须写明 `model`。`GET /v1/models` 对设了名单的密钥只列名单内的 id。槽位级 `policy.allowed_models` 不受影响，两者同时生效。Master 密钥不受限。
+
+`GET /api-keys/:id/stats` 是该密钥近 30 天用量：上海日桶、模型分布、VM 分布。不是 VM 的上游额度窗口。
 
 attempts：每次选中的 VM/账号、错误域、cooldown、提交边界、终态。`normal` 摘要；`debug` 另存入站原文及脱敏出站数据。`outbound_body` 仍为最后一次真正 POST 给 worker 的 envelope body，Node → worker 的头为 `worker_envelope_headers`。`outbound_headers_source=cli_final` 表示 `outbound_headers` 来自 cli-node 完成组装、CCH 和长度处理后的最终 fetch 调用边界；不包含底层补的 Host / HTTP/2 伪头，凭证及未知自定义头值已在 CLI 脱敏。每次重试覆盖，最后一次尝试未回传则 source=`unavailable`、headers=null，绝不以 envelope 代替。旧记录没有 source，原值不能视作最终值。最终 HTTP body 字节仍不在日志里。该功能需升级 Node、web 与 cli-node，旧 CLI 不支持回传。`X-Request-ID` 回写。`X-Kin-Debug` / `X-Kin-Log` 可单请求覆盖，但出站数据仅按管理员配置的 debug 采样保存。
 
@@ -586,4 +601,4 @@ sessionKey / 授权码导入必须走该槽 SOCKS5。
 
 ## 管理口（master）
 
-常用：`GET/PUT /admin/routing`、`GET /admin/vms`、`POST /admin/vms/probe-all`、`GET /admin/usage/summary`、`GET /admin/vm/oauth`、`POST /admin/vm/oauth/refresh`、`GET/PUT/DELETE /admin/intercept/rules`。`POST /admin/models/refresh` 只读本地策略目录、回完整目录，不 hop 槽位；`GET /v1/models` 同样不 hop，但按密钥 `group_type` 过滤。`GET/POST /admin/vm/claude-code/*` 返回 410。
+常用：`GET/PUT /admin/routing`、`GET /admin/vms`、`POST /admin/vms/probe-all`、`GET /admin/usage/summary`、`GET /admin/vm/oauth`、`POST /admin/vm/oauth/refresh`、`GET/PUT/DELETE /admin/intercept/rules`。`POST /admin/models/refresh` 只读本地策略目录、回完整目录，不 hop 槽位；`GET /v1/models` 同样不 hop，但按密钥 `group_type` 和 `allowed_models` 过滤。`GET/POST /admin/vm/claude-code/*` 返回 410。

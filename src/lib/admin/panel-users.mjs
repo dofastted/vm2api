@@ -18,6 +18,9 @@ const SCRYPT_R = 8
 const SCRYPT_P = 1
 const KEYLEN = 32
 const USERNAME_RE = /^[a-zA-Z][a-zA-Z0-9._-]{1,31}$/
+// users.concurrency caps the summed inflight requests of all of a user's keys (api-keys canAccept); 0 = no cap.
+const USER_CONCURRENCY_MIN = 0
+const USER_CONCURRENCY_MAX = 1000
 
 function nowIso() {
   return new Date().toISOString()
@@ -93,6 +96,15 @@ function assertPassword(password) {
   return pass
 }
 
+function assertConcurrency(value) {
+  if (!Number.isInteger(value) || value < USER_CONCURRENCY_MIN || value > USER_CONCURRENCY_MAX) {
+    const err = new Error(`并发须为 ${USER_CONCURRENCY_MIN}–${USER_CONCURRENCY_MAX} 的整数（0 表示不限）`)
+    err.code = 'invalid_concurrency'
+    throw err
+  }
+  return value
+}
+
 function assertRole(role) {
   const r = normalizeRole(role)
   if (!isPanelRole(r)) {
@@ -111,6 +123,7 @@ export function publicUserView(rec) {
     role: rec.role,
     enabled: rec.enabled !== false,
     vm_create_quota: clampVmCreateQuota(rec.vm_create_quota, 0),
+    concurrency: Number(rec.concurrency) || 0,
     created_at: rec.created_at,
     updated_at: rec.updated_at,
     last_login_at: rec.last_login_at || null,
@@ -175,13 +188,14 @@ export class PanelUserStore {
     return publicUserView(next)
   }
 
-  create({ username, password, role = 'user', enabled = true, vm_create_quota = 0 } = {}) {
+  create({ username, password, role = 'user', enabled = true, vm_create_quota = 0, concurrency } = {}) {
     const name = assertUsername(username)
     if (this.repo.getByUsername(name)) {
       const err = new Error('用户名已存在')
       err.code = 'username_exists'
       throw err
     }
+    const limit = concurrency == null ? null : assertConcurrency(concurrency)
     const rec = {
       id: crypto.randomUUID(),
       username: name,
@@ -189,6 +203,7 @@ export class PanelUserStore {
       role: assertRole(role),
       enabled: enabled !== false,
       vm_create_quota: clampVmCreateQuota(vm_create_quota, 0),
+      concurrency: limit,
       created_at: nowIso(),
       updated_at: nowIso(),
       last_login_at: null,
@@ -232,6 +247,10 @@ export class PanelUserStore {
 
     if (patch.vm_create_quota != null) {
       next.vm_create_quota = clampVmCreateQuota(patch.vm_create_quota, rec.vm_create_quota || 0)
+    }
+
+    if (patch.concurrency != null) {
+      next.concurrency = assertConcurrency(patch.concurrency)
     }
 
     next.updated_at = nowIso()
