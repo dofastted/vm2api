@@ -963,7 +963,7 @@ export function writeKernelConfig(
   if (dataplane === 'crag' && resolveCragKernelVersion({ ...record, ...vm }, routing || {}) === 'v2' && !host.native) {
     config.crag_kernel_version = 'v2'
     config.runtime_variant = 'crag-v2'
-    config.claude_bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude'
+    config.claude_bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude'
     config.asset_dir = '/run/kin/crag-native-assets'
     config.work_dir = '/run/kin/work'
     config.cli_version = ''

@@ -394,9 +394,9 @@ for (const mutation of [
       fs.renameSync(temporary, file)
     }
     if (mutation === 'native member replacement') {
-      const bytes = fs.readFileSync(path.join(pkg, 'claude-code-2.1.317/claude'))
+      const bytes = fs.readFileSync(path.join(pkg, 'claude-code-2.1.321/claude'))
       bytes[bytes.length - 1] ^= 1
-      replace('claude-code-2.1.317/claude', bytes)
+      replace('claude-code-2.1.321/claude', bytes)
     } else if (mutation === 'in-place member tamper') {
       const file = path.join(pkg, 'crag-v2.payload.enc')
       const original = fs.statSync(file)

@@ -284,11 +284,11 @@ class PackageTar extends Writable {
       'kernel.json.example',
       'LICENSES.txt',
       'LICENSE.txt',
-      'claude-code-2.1.317/claude',
-      'claude-code-2.1.317/LICENSE.md',
-      'claude-code-2.1.317/THIRD_PARTY_NOTICES.txt',
+      'claude-code-2.1.321/claude',
+      'claude-code-2.1.321/LICENSE.md',
+      'claude-code-2.1.321/THIRD_PARTY_NOTICES.txt',
     ]
-    if (directory ? !['.', 'claude-code-2.1.317'].includes(name) : !allowedFiles.includes(name))
+    if (directory ? !['.', 'claude-code-2.1.321'].includes(name) : !allowedFiles.includes(name))
       throw coded('crag_v2_archive_invalid', 'CRAG tar 包含非官方发行成员')
     if (this.names.has(name) || this.names.size >= MAX_MEMBERS)
       throw coded('crag_v2_archive_invalid', 'CRAG tar 成员重复或过多')
@@ -296,7 +296,7 @@ class PackageTar extends Writable {
     const size = this.number(h, 124, 12)
     const mode = this.number(h, 100, 8)
     const memberLimit =
-      name === 'claude-code-2.1.317/claude'
+      name === 'claude-code-2.1.321/claude'
         ? MAX_ARCHIVE
         : name === 'crag-v2.payload.enc'
           ? 128 * 1024 * 1024

@@ -79,7 +79,7 @@ exec "$DIR/${WRAP_KERNEL_WRAPPER}.real" "$@"
 
 export const CRAG_V2_DIR = 'crag-v2'
 const CRAG_V2_ENTRY = 'crag-v2'
-const CRAG_V2_CLAUDE = 'claude-code-2.1.317/claude'
+const CRAG_V2_CLAUDE = 'claude-code-2.1.321/claude'
 const CRAG_V2_CAPS = Object.freeze(['official_full', 'zero', 'cancel', 'telemetry', 'unix_socket_envelope'])
 
 export function cragV2Arch() {

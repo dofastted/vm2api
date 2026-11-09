@@ -328,9 +328,9 @@ test('payload publish replaces only changed files and the kvm selector execs the
   const plan = selectChangedPayloadFiles(
     [
       { rel: 'crag-kernel', sha256: 'aaa' },
-      { rel: 'crag-v2/claude-code-2.1.317/claude', sha256: 'bbb' },
+      { rel: 'crag-v2/claude-code-2.1.321/claude', sha256: 'bbb' },
     ],
-    new Map([['crag-v2/claude-code-2.1.317/claude', 'bbb']]),
+    new Map([['crag-v2/claude-code-2.1.321/claude', 'bbb']]),
   )
   assert.deepEqual(
     plan.map((file) => file.rel),
