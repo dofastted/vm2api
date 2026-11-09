@@ -37,7 +37,7 @@ import { SlotIdentity } from '@/components/platform-chip'
 import { StatusMark } from '@/components/status-mark'
 import { ClaudeResetActions } from '@/features/vm/claude-reset-actions'
 import { CodexKernelHealthFields } from '@/features/vm/codex-kernel-health-card'
-import { dataplaneLabel } from '@/features/vm/dataplane-contract'
+import { kernelRouteLabel } from '@/features/vm/dataplane-contract'
 import { CircuitField } from '@/features/vm/detail-circuit-field'
 import {
   Field,
@@ -168,7 +168,7 @@ function slotVerdict(
 
 function workerLabel(value: unknown) {
   const raw = String(value || '').trim()
-  if (raw === 'go' || raw === 'rust') return 'Rust · cli-hop'
+  if (raw === 'go' || raw === 'rust') return 'Rust'
   return raw || '—'
 }
 
@@ -227,7 +227,14 @@ export function VmStatusBoard(props: Props) {
   const spendFable = formatWindowSpend(fableCost, vm.estimate_fable)
   const telemetry = kernel?.telemetry
   const topology = kernel?.process_topology
-  const rust = wrapHealthLabel(kernel?.rust_health)
+  const route = kernelRouteLabel(
+    vm.resolved_dataplane,
+    vm.resolved_crag_kernel_version
+  )
+  const rust = wrapHealthLabel(
+    kernel?.rust_health,
+    vm.resolved_dataplane === 'crag' ? route : 'cli-hop'
+  )
 
   return (
     <section className='rounded-lg border bg-card'>
@@ -440,11 +447,17 @@ export function VmStatusBoard(props: Props) {
               <CodexKernelHealthFields health={kernel?.codex_health} />
             ) : (
               <>
-                <Field label='cli-hop' compact>
+                <Field
+                  label={vm.resolved_dataplane === 'crag' ? route : 'cli-hop'}
+                  compact
+                >
                   {rust}
                 </Field>
                 <Field label='内核' compact>
-                  {isCodexVm(vm) ? '—' : dataplaneLabel(vm.resolved_dataplane)}
+                  {kernelRouteLabel(
+                    vm.resolved_dataplane,
+                    vm.resolved_crag_kernel_version
+                  )}
                 </Field>
                 <Field label='拓扑' compact>
                   {topologyLabel(topology)}

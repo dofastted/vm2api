@@ -628,6 +628,7 @@ function VmDetailBody({
               credType={credType}
               isCodex={isCodexVm(vm)}
               dataplane={vm.resolved_dataplane}
+              cragKernelVersion={vm.resolved_crag_kernel_version}
               schedule={<VmTestSchedule key={vm.id} vm={vm} {...test} />}
             />
           ) : null}
