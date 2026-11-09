@@ -1,6 +1,8 @@
 # Changelog
 
 ## Unreleased
+- 集群 Linux Docker 槽切换 CRAG 时认本机已经激活的同一张离线码，不再因为没有本槽机器身份而停在未配置。内核页只拦截 KVM 和 macOS，不再把 Linux 集群槽的 CRAG 选项禁用。
+
 
 ## 1.4.056 — 2026-11-09
 
