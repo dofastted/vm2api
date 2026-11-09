@@ -245,8 +245,10 @@ export type Vm = {
   id: string
   name?: string
   owner_user_id?: string | null
-  /** 所在集群节点；null / 缺省 = 本机。远端槽位不支持官方初装、wrap-cli、换内核等。 */
+  /** 所在集群节点；null / 缺省 = 本机。 */
   node_id?: string | null
+  /** linux Docker 节点可切 CRAG；darwin 是 macOS 原生槽，不能切。 */
+  node_platform?: 'linux' | 'darwin' | null
   /** Admin-only cluster node label for `node_id`. Tenants never receive this. */
   node_name?: string | null
   origin?: string | null

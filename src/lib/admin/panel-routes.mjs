@@ -230,7 +230,7 @@ import { recreateVmFiles, seedFreshCliHome } from '../vm/vm-recreate.mjs'
 import { diagnoseSlotServices, powerOnSlot, recoverSlot, redactSecrets } from '../vm/slot-recovery.mjs'
 import { commitVmPackage, exportVmPackage, parseVmPackage } from '../vm/vm-package.mjs'
 import { slotMigrationBusy, slotMigrationJob, startSlotMigration } from '../cluster/slot-migration.mjs'
-import { preflightNode } from '../cluster/placement.mjs'
+import { isNativeNodeVm, preflightNode } from '../cluster/placement.mjs'
 import { probeLocalKvm } from '../vm/kvm-host.mjs'
 import { normalizeVmConfig, resolveMachineSpec, validateVmConfigPatch } from '../vm/machine-spec.mjs'
 import { raiseDockerSlotMemory } from '../vm/docker-slot-memory.mjs'
@@ -1159,6 +1159,14 @@ export function createPanelHandler(ctx) {
     const versionChanged =
       previousVersion !== targetVersion && (previousDataplane === 'crag' || targetDataplane === 'crag')
     const kernelSwitch = dataplaneChanged || versionChanged
+    if (kernelSwitch && targetDataplane === 'crag' && targetVersion === 'v2') {
+      if (isKvmRuntime(desired)) {
+        return { ok: false, id, code: 'remote_unsupported', error: 'crag 数据面暂不支持 KVM 槽' }
+      }
+      if (isNativeNodeVm(desired)) {
+        return { ok: false, id, code: 'native_crag_unsupported', error: 'crag 数据面暂不支持 macOS 原生节点' }
+      }
+    }
     let switched = null
     if (Object.prototype.hasOwnProperty.call(patch, 'inference_engine') && previousEngine !== targetEngine) {
       switched = await switchSlotInferenceEngine(desired, cfg.paths.project, targetEngine)
@@ -1184,12 +1192,14 @@ export function createPanelHandler(ctx) {
         }
         writeKernelConfig(cfg.paths.project, saved, { routing: ctx.routingConfig })
         if (kernelSwitch && saved.status === 'running') {
+          const remoteDocker =
+            Boolean(String(saved.node_id || '').trim()) && !isKvmRuntime(saved) && !isNativeNodeVm(saved)
           const recreateNative =
-            targetDataplane === 'crag' &&
-            targetVersion === 'v2' &&
-            !String(saved.node_id || '').trim() &&
-            !isKvmRuntime(saved)
-          // docker restart keeps HostConfig, so a pre-sandbox container still EPERMs on unshare.
+            !isKvmRuntime(saved) &&
+            (remoteDocker ||
+              (targetDataplane === 'crag' && targetVersion === 'v2' && !String(saved.node_id || '').trim()))
+          // docker restart keeps HostConfig. A CRAG v2 command, or any cluster
+          // kernel change, has to recreate the container.
           if (recreateNative) {
             const booted = await startSlotReady(saved, cfg.paths.project, {
               recreate: true,

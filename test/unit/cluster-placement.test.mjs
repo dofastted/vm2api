@@ -538,7 +538,7 @@ test('cluster payload check skips a container already on the content-hashed imag
   }
 })
 
-test('node payload refresh switches a running wrap slot on the current image to CRAG', async (t) => {
+test('node payload refresh recreates a running slot whose command does not match its kernel', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cluster-refresh-'))
   const saved = [
     'KIN_KERNEL_BIN',
@@ -571,7 +571,14 @@ test('node payload refresh switches a running wrap slot on the current image to 
   process.env.KIN_CLUSTER_EGRESS_BIN = path.join(root, 'bin/kin-egress')
   process.env.KIN_CODEX_KERNEL_BIN = path.join(root, 'bin/kin-codex-kernel')
   seedEncryptedPackage(root)
-  const vm = { id: 'vm-03', node_id: 'node-a', kernel: 'ubuntu-24.04', status: 'running' }
+  const vm = {
+    id: 'vm-03',
+    node_id: 'node-a',
+    kernel: 'ubuntu-24.04',
+    status: 'running',
+    dataplane: 'crag',
+    crag_kernel_version: 'v2',
+  }
   const current = slotImageSpec(root, 'ubuntu-24.04').ref
   const inspected = []
   const started = []
@@ -617,6 +624,21 @@ test('node payload refresh switches a running wrap slot on the current image to 
   })
   assert.equal(again.kernel_changed, false)
   assert.deepEqual(stayed, [])
+  const wrapStarted = []
+  const wrap = { ...vm, dataplane: 'wrap', crag_kernel_version: '' }
+  const wrapReport = await refreshNodeSlotPayload(wrap, root, {
+    sessionFor: async () => ({ docker: {} }),
+    inspect: async () => ({
+      State: { Running: true },
+      Config: { Image: current, Cmd: ['/opt/kin/kin-kernel', '--gateway-worker', '--config', '/run/kin/kernel.json'] },
+    }),
+    startFn: async () => {
+      wrapStarted.push('started')
+      return { ok: false }
+    },
+  })
+  assert.equal(wrapReport.kernel_changed, false)
+  assert.deepEqual(wrapStarted, [])
 })
 
 test('amd64 node payload stays separate from native ARM control helpers', (t) => {
