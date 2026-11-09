@@ -352,9 +352,23 @@ function SlotCell({ vm, now }: { vm: Vm; now: number }) {
   const name = slotNameLabel(vm)
   const email = String(vm.email || '').trim()
   const sub = subscriptionListLabel(vm, now)
+  const crag = (vm.resolved_dataplane ?? vm.dataplane) === 'crag'
   return (
     <div className='min-w-0 space-y-0.5 overflow-hidden'>
-      <SlotIdentity vm={vm} compact className='text-sm font-medium' />
+      <div className='flex min-w-0 items-center gap-1.5'>
+        <SlotIdentity vm={vm} compact className='flex-1 text-sm font-medium' />
+        <span
+          className={cn(
+            'inline-flex shrink-0 items-center rounded px-1.5 py-0.5 text-[10px] leading-none font-semibold',
+            crag
+              ? 'bg-orange-200 text-orange-900 dark:bg-orange-400/20 dark:text-orange-300'
+              : 'bg-zinc-200 text-zinc-700 dark:bg-zinc-300/20 dark:text-zinc-300'
+          )}
+          title='当前内核'
+        >
+          {crag ? 'crag' : '标准内核'}
+        </span>
+      </div>
       <div className='flex min-w-0 items-center gap-1.5'>
         <ActiveVmBadge vm={vm} />
         <TierBadge vm={vm} />
