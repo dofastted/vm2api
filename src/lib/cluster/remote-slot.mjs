@@ -11,6 +11,7 @@
  */
 
 import crypto from 'node:crypto'
+import fs from 'node:fs'
 import path from 'node:path'
 import { ensureGuestMachineIdFile } from '../identity/workstation-fingerprint.mjs'
 import {
@@ -89,6 +90,10 @@ import {
   removeRemoteSlotDir,
 } from './remote-slot-files.mjs'
 import { slotImageSpec } from './slot-image.mjs'
+
+const CRAG_V2_SECCOMP = JSON.stringify(
+  JSON.parse(fs.readFileSync(new URL('../vm/crag-v2-seccomp.json', import.meta.url), 'utf8')),
+)
 
 /** Bump when the slot's mount layout changes; a running container with an older label is recreated. */
 const SLOT_LAYOUT = '3'
@@ -775,7 +780,7 @@ export function slotContainerBody(vm, { image, network, remoteDir, user, routing
       ReadonlyRootfs: true,
       Tmpfs: { '/tmp': 'rw,noexec,nosuid,size=32m' },
       SecurityOpt: crag
-        ? ['no-new-privileges', `seccomp=${remoteDir}/crag-v2-seccomp.json`, 'apparmor=unconfined']
+        ? ['no-new-privileges', `seccomp=${CRAG_V2_SECCOMP}`, 'apparmor=unconfined']
         : ['no-new-privileges'],
       ...(crag ? { Init: true } : {}),
       CapDrop: ['ALL'],

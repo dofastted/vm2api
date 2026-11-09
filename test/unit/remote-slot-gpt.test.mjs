@@ -47,11 +47,10 @@ test('a remote Claude slot switched to CRAG v2 boots the live kernel with the us
   const spec = body({ ...claude, dataplane: 'crag', crag_kernel_version: 'v2' })
   assert.deepEqual(spec.Cmd, [REMOTE_CRAG_ENTRY, '--gateway-worker', '--config', '/run/kin/kernel.json'])
   assert.equal(spec.HostConfig.Init, true)
-  assert.deepEqual(spec.HostConfig.SecurityOpt, [
-    'no-new-privileges',
-    'seccomp=/home/node/vms/vm-codex-01/crag-v2-seccomp.json',
-    'apparmor=unconfined',
-  ])
+  const [privileges, seccomp, apparmor] = spec.HostConfig.SecurityOpt
+  assert.equal(privileges, 'no-new-privileges')
+  assert.equal(apparmor, 'apparmor=unconfined')
+  assert.equal(JSON.parse(seccomp.slice('seccomp='.length)).defaultAction, 'SCMP_ACT_ERRNO')
 })
 
 test('local Claude commands retain their bind-mounted and wrapped kernel entries', () => {
