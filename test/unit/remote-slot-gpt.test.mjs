@@ -34,9 +34,9 @@ test('a remote GPT container idles instead of booting the Claude kernel', () => 
 })
 
 for (const runtime of [undefined, { type: 'docker' }]) {
-  test(`a remote Claude slot uses the baked kernel entry (${runtime?.type || 'default'} runtime)`, () => {
+  test(`a remote Claude slot uses the live kernel entry (${runtime?.type || 'default'} runtime)`, () => {
     const spec = body({ ...claude, runtime })
-    assert.equal(REMOTE_KERNEL_ENTRY, '/opt/kin/kin-kernel')
+    assert.equal(REMOTE_KERNEL_ENTRY, '/opt/kin-live/kin-kernel')
     assert.deepEqual(spec.Cmd, [REMOTE_KERNEL_ENTRY, '--gateway-worker', '--config', '/run/kin/kernel.json'])
     assert.equal(spec.Labels['kin.vm.role'], undefined)
     assert.equal(spec.Labels['kin.vm.runtime'], 'docker')

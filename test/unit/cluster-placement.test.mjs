@@ -446,8 +446,9 @@ test('slot image tag follows payload bytes only; a VERSION bump keeps the image'
     { id: 'vm-03', platform: 'anthropic', node_id: 'node-a', kernel: 'ubuntu-24.04' },
     { image: a.ref, network: 'test-net', remoteDir: '/home/node/vms/vm-03', user: '1000:1000', routing: {} },
   )
-  const entry = a.files.find((file) => `/${file.name}` === container.Cmd[0])
-  assert.ok(entry, 'the remote Claude command must name a file baked into its slot image')
+  assert.equal(container.Cmd[0], '/opt/kin-live/kin-kernel')
+  const entry = a.files.find((file) => file.name === 'opt/kin/kin-kernel')
+  assert.ok(entry, 'the image still bakes the cli-node wrapper for guests that have not mounted slot-bin')
   assert.equal(entry.mode, 0o755)
   assert.ok(a.files.some((file) => file.name === 'opt/kin/kin-kernel'))
   assert.ok(a.files.some((file) => file.name === 'opt/kin/crag-kernel' && file.mode === 0o755))
@@ -630,7 +631,10 @@ test('node payload refresh recreates a running slot whose command does not match
     sessionFor: async () => ({ docker: {} }),
     inspect: async () => ({
       State: { Running: true },
-      Config: { Image: current, Cmd: ['/opt/kin/kin-kernel', '--gateway-worker', '--config', '/run/kin/kernel.json'] },
+      Config: {
+        Image: current,
+        Cmd: ['/opt/kin-live/kin-kernel', '--gateway-worker', '--config', '/run/kin/kernel.json'],
+      },
     }),
     startFn: async () => {
       wrapStarted.push('started')
@@ -639,6 +643,20 @@ test('node payload refresh recreates a running slot whose command does not match
   })
   assert.equal(wrapReport.kernel_changed, false)
   assert.deepEqual(wrapStarted, [])
+  const legacyStarted = []
+  const legacy = await refreshNodeSlotPayload(wrap, root, {
+    sessionFor: async () => ({ docker: {} }),
+    inspect: async () => ({
+      State: { Running: true },
+      Config: { Image: current, Cmd: ['/opt/kin/kin-kernel', '--gateway-worker', '--config', '/run/kin/kernel.json'] },
+    }),
+    startFn: async () => {
+      legacyStarted.push('started')
+      return { ok: true, action: 'recreated' }
+    },
+  })
+  assert.equal(legacy.restarted, true)
+  assert.deepEqual(legacyStarted, ['started'])
 })
 
 test('amd64 node payload stays separate from native ARM control helpers', (t) => {

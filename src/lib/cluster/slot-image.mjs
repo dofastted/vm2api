@@ -64,7 +64,14 @@ export function cragSlotPayload(projectRoot) {
   }
   const wrapper = Buffer.from(cragV2KernelWrapperScript())
   const digest = crypto.createHash('sha256').update(wrapper)
-  const files = [{ name: 'opt/kin/crag-kernel', body: wrapper, mode: 0o755 }]
+  const files = [
+    {
+      name: 'opt/kin/crag-kernel',
+      body: wrapper,
+      mode: 0o755,
+      sha256: crypto.createHash('sha256').update(wrapper).digest('hex'),
+    },
+  ]
   for (const rel of Object.keys(verified.manifest.sha256).sort()) {
     digest.update(rel).update(verified.manifest.sha256[rel])
     const executable = rel === 'crag-v2' || rel.endsWith('/claude')
@@ -72,6 +79,7 @@ export function cragSlotPayload(projectRoot) {
       name: `opt/kin/crag-v2/${rel}`,
       src: path.join(root, rel),
       mode: executable ? 0o755 : 0o644,
+      sha256: verified.manifest.sha256[rel],
     })
   }
   return { files, digest: digest.digest('hex') }
