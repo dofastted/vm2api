@@ -373,6 +373,8 @@ export type Vm = {
   resolved_inference_engine?: 'go' | 'rust' | null
   persona_preset?: string | null
   resolved_persona_preset?: string | null
+  /** CRAG v2 print only: official_full appends the caller tail; zero replaces. */
+  resolved_crag_print_persona?: 'official_full' | 'zero' | null
   dataplane?: 'wrap' | 'cc' | 'crag' | null
   resolved_dataplane?: 'wrap' | 'cc' | 'crag' | null
   crag_kernel_version?: 'legacy' | 'v2' | null

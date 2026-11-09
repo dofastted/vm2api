@@ -14,6 +14,7 @@ import { inheritProtocolOnSlots } from '@/features/settings/protocol-authority'
 import { routingQueryOptions } from '@/features/settings/queries'
 import { SaveBar } from '@/features/settings/save-bar'
 import { SettingsSkeleton } from '@/features/settings/settings-skeleton'
+import { CragPrintPanel } from '@/features/system/crag-print-panel'
 import { SystemPromptWorkspace } from '@/features/system/prompt-workspace'
 import { compatibilityPatch } from './compat-patch'
 
@@ -35,6 +36,7 @@ export function SystemPromptPage() {
   const [draft, setDraft] = useState<Record<string, unknown>>({})
   const [personaProblems, setPersonaProblems] = useState<string[]>([])
   const [discardKey, setDiscardKey] = useState(0)
+  const [kernelSet, setKernelSet] = useState<'cli-node' | 'crag'>('cli-node')
 
   useEffect(() => {
     if (routing.data) setDraft(routing.data)
@@ -125,17 +127,64 @@ export function SystemPromptPage() {
           error={routing.error}
           skeleton={<SettingsSkeleton />}
         >
-          <SystemPromptWorkspace
-            key={discardKey}
-            compat={
-              (draft.compatibility as Record<string, unknown> | undefined) || {}
-            }
-            server={
-              routing.data?.compatibility as Record<string, unknown> | undefined
-            }
-            onChange={(next) => setDraft({ ...draft, compatibility: next })}
-            onProblemsChange={setPersonaProblems}
-          />
+          <div
+            role='tablist'
+            aria-label='提示词内核'
+            className='mb-4 grid gap-2 sm:grid-cols-2'
+          >
+            {(
+              [
+                ['cli-node', 'cli-node 原生内核', '模板注入，写入 kernel.json'],
+                ['crag', 'CRAG v2 print', '不读 persona_preset，不是 TUI'],
+              ] as const
+            ).map(([value, label, detail]) => {
+              const selected = kernelSet === value
+              return (
+                <button
+                  key={value}
+                  type='button'
+                  role='tab'
+                  aria-selected={selected}
+                  onClick={() => setKernelSet(value)}
+                  className={cn(
+                    'cursor-pointer rounded-xl border px-3.5 py-2.5 text-left transition-colors duration-200 focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none',
+                    selected
+                      ? 'border-primary/50 bg-primary/5'
+                      : 'border-border/60 bg-card hover:border-border hover:bg-muted/40'
+                  )}
+                >
+                  <span className='block text-sm font-medium'>{label}</span>
+                  <span className='text-[11px] text-muted-foreground'>
+                    {detail}
+                  </span>
+                </button>
+              )
+            })}
+          </div>
+          <div hidden={kernelSet !== 'cli-node'}>
+            <SystemPromptWorkspace
+              key={discardKey}
+              compat={
+                (draft.compatibility as Record<string, unknown> | undefined) ||
+                {}
+              }
+              server={
+                routing.data?.compatibility as
+                  Record<string, unknown> | undefined
+              }
+              onChange={(next) => setDraft({ ...draft, compatibility: next })}
+              onProblemsChange={setPersonaProblems}
+            />
+          </div>
+          <div hidden={kernelSet !== 'crag'}>
+            <CragPrintPanel
+              compat={
+                (draft.compatibility as Record<string, unknown> | undefined) ||
+                {}
+              }
+              onChange={(next) => setDraft({ ...draft, compatibility: next })}
+            />
+          </div>
         </QueryGate>
       </div>
       {dirty ? (
