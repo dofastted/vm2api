@@ -152,7 +152,8 @@ function SlotKernelSwitch({
   const [checkingLicense, setCheckingLicense] = useState(false)
   const [registrationCode, setRegistrationCode] = useState('')
   const kvm = vm.runtime_type === 'kvm'
-  const blocked = remote || kvm
+  const nativeMac = vm.node_platform === 'darwin'
+  const blocked = kvm || nativeMac
   const onV2 =
     vm.resolved_dataplane === 'crag' && vm.resolved_crag_kernel_version === 'v2'
   const onCli =
@@ -274,9 +275,7 @@ function SlotKernelSwitch({
       </p>
       {blocked ? (
         <p className='text-xs text-muted-foreground'>
-          {remote
-            ? `CRAG v2：${REMOTE_UNSUPPORTED_TEXT}`
-            : 'KVM 槽不运行 CRAG v2'}
+          {kvm ? 'KVM 槽不运行 CRAG v2' : 'macOS 原生节点不运行 CRAG v2'}
         </p>
       ) : null}
       {!blocked ? (
@@ -325,9 +324,11 @@ function SlotKernelSwitch({
         }}
         title={pending === 'v2' ? '本槽切到 CRAG v2？' : '本槽切回 cli-node？'}
         desc={
-          pending === 'v2'
-            ? '重启本槽内核。不 docker rm，不改凭证，不影响其他槽。cli-node 保留，可再切回。'
-            : '铺回 wrap kernel 和 cli-node，并重启本槽内核。CRAG v2 文件留在盘上但不再 exec。'
+          remote
+            ? '重建本槽容器以更换内核命令。不改凭证，不影响其他槽。'
+            : pending === 'v2'
+              ? '重启本槽内核。不 docker rm，不改凭证，不影响其他槽。cli-node 保留，可再切回。'
+              : '铺回 wrap kernel 和 cli-node，并重启本槽内核。CRAG v2 文件留在盘上但不再 exec。'
         }
         cancelBtnText='取消'
         confirmText='切换'

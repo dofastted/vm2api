@@ -100,17 +100,14 @@ function clusterDockerClaude(vm) {
   return !isCodexVm(vm) && !isKvmRuntime(vm) && !isNativeNodeVm(vm) && Boolean(vmNodeId(vm))
 }
 
-/** Docker cluster slots run the pushed CRAG tree. KVM and Codex stay on their own runners. */
-export function assignClusterCragVersion(projectRoot, vm) {
-  if (!clusterDockerClaude(vm)) return false
-  if (vm.dataplane === 'crag' && vm.crag_kernel_version === 'v2') return false
-  vm.dataplane = 'crag'
-  vm.crag_kernel_version = 'v2'
-  patchVmRecord(projectRoot, vm.id, (record) => {
-    record.dataplane = 'crag'
-    record.crag_kernel_version = 'v2'
-  })
-  return true
+/** The running command has to match this slot's kernel. CRAG v2 also needs the userns sandbox. */
+export function clusterDockerCommandReady(vm, info, routing) {
+  if (!clusterDockerClaude(vm)) return true
+  const crag =
+    resolveKernelDataplane(vm, routing || {}) === 'crag' && resolveCragKernelVersion(vm, routing || {}) === 'v2'
+  if (crag) return clusterCragContainerReady(info)
+  const cmd = info?.Config?.Cmd || []
+  return Array.isArray(cmd) && cmd[0] === REMOTE_KERNEL_ENTRY
 }
 
 export function clusterCragContainerReady(info) {
@@ -862,21 +859,16 @@ export async function refreshNodeSlotPayload(
   const kernel = vm.kernel && OS_CATALOG[vm.kernel] ? vm.kernel : 'ubuntu-24.04'
   const kind = runtimeKind(vm)
   try {
-    assignClusterCragVersion(projectRoot, vm)
     const session = await sessionFor(nodeId)
     // Older images have no CRAG layer. The slot-bin mount is already there, so publish
     // the tree without recreating a container whose image is otherwise current.
     if (session?.client) await pushCragSlot(vm, projectRoot, session)
     const running = recreate !== false && vm.status === 'running'
-    // A current image stays up only after its command is the CRAG worker.
+    // A current image stays up only when its command matches this slot's kernel.
     if (running) {
       const ref = slotImageSpec(projectRoot, kernel, { runtime: kind }).ref
       const info = await inspect(session.docker, vm.runtime?.container || containerName(id))
-      if (
-        info?.State?.Running &&
-        info.Config?.Image === ref &&
-        (!clusterDockerClaude(vm) || clusterCragContainerReady(info))
-      ) {
+      if (info?.State?.Running && info.Config?.Image === ref && clusterDockerCommandReady(vm, info, routing)) {
         return {
           id,
           node_id: nodeId,
@@ -895,7 +887,7 @@ export async function refreshNodeSlotPayload(
             node_id: nodeId,
             ok: false,
             code: boot?.code || 'slot_payload_refresh_failed',
-            error: boot?.error || '集群槽切换 CRAG 失败',
+            error: boot?.error || '集群槽切换内核失败',
             image: ref,
           }
         }
@@ -1124,7 +1116,6 @@ async function chownRemoteKvmBinds(session, name, vm) {
 export async function startRemoteSlot(vm, projectRoot, { recreate = false, routing, pinnedImageId = null } = {}) {
   try {
     if (!isKvmRuntime(vm)) slotDockerCpus(vm)
-    assignClusterCragVersion(projectRoot, vm)
     const p = await prepare(vm, projectRoot, routing, { pinnedImageId })
     if (p.fail) return p.fail
     if (resolveKernelDataplane(vm, routing) === 'crag') await projectCragUniversalVm(projectRoot, vm)
@@ -1157,7 +1148,7 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
       existing.Config?.Labels?.['kin.vm.layout'] === SLOT_LAYOUT &&
       runtimeLabelOf(existing) === runtimeKind(vm) &&
       codexRoleMatches(existing, vm) &&
-      (!clusterDockerClaude(vm) || clusterCragContainerReady(existing)) &&
+      clusterDockerCommandReady(vm, existing, routing) &&
       // Running stays true during Docker restart-policy backoff. Recreate the
       // loop just like the local runtime; otherwise watchdog revival is a no-op.
       !existing.State?.Restarting &&
@@ -1240,7 +1231,7 @@ export async function reloadRemoteSlot(vm, projectRoot, { routing } = {}) {
       existing.Config?.Labels?.['kin.vm.layout'] !== SLOT_LAYOUT ||
       runtimeLabelOf(existing) !== runtimeKind(vm) ||
       !codexRoleMatches(existing, vm) ||
-      (clusterDockerClaude(vm) && !clusterCragContainerReady(existing))
+      !clusterDockerCommandReady(vm, existing, routing)
     ) {
       return startRemoteSlot(vm, projectRoot, { recreate: !!existing, routing })
     }

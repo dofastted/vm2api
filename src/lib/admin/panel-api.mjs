@@ -41,6 +41,7 @@ import { canOfficialUsage, credentialModeOfVm, isSetupTokenMode } from '../oauth
 import { getUsageCache } from '../oauth/usage-cache.mjs'
 import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import { filterVmsForPanel } from './resource-owner.mjs'
+import { nodePlatform } from '../cluster/placement.mjs'
 import { computeWeeklySplit, publicWeeklySplit, weeklySplitConfig } from '../pool/weekly-split.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { pickScheduleFields } from '../pool/schedule-state.mjs'
@@ -1993,6 +1994,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     note: v.note || null,
     region: v.region || null,
     node_id: v.node_id || null,
+    node_platform: v.node_id ? nodePlatform(v.node_id) : null,
     owner_user_id: v.owner_user_id || null,
     origin: v.origin || null,
     ...(canRevealClusterNodes(extras.role || 'admin') && v.node_id
