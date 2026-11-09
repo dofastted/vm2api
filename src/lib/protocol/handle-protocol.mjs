@@ -92,6 +92,12 @@ import {
 import { resolveWorkspaceMode, isOfficialClaudeClient } from './workspace-mode.mjs'
 import { officialMessagesBody } from './anthropic-messages.mjs'
 import { prepareOutboundEnvelope, prepareCliHopBody, prepareCliPersonaInput } from './outbound-attempt.mjs'
+import {
+  cragV2KernelActive,
+  prepareCragPrintBody,
+  readSlotKernelConfig,
+  resolveCragPrintPersona,
+} from './crag-print-prompt.mjs'
 import { repairAnthropicRequest } from '../pool/upstream-error-policy.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
 import { loadVmIdentity, OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
@@ -543,6 +549,7 @@ export function createHandleProtocol(deps) {
     want1m = false,
     preserveCacheBreakpoints = false,
     cliHop = false,
+    cragPrint = false,
     repaired = false,
     requestContext = null,
     routing = {},
@@ -566,6 +573,7 @@ export function createHandleProtocol(deps) {
       routing,
       preserveCacheBreakpoints,
       cliHop,
+      cragPrint,
       repaired,
       requestContext,
       slotWaitMs: candidate.slotWaitMs,
@@ -1645,6 +1653,67 @@ export function createHandleProtocol(deps) {
           )
           let hopBody = body
           if (cliHop) {
+            const cragPrint =
+              !requestContext &&
+              cragV2KernelActive({
+                vm: selected.vm,
+                health: selected.workerStatus,
+                kernelConfig: readSlotKernelConfig(selected.exec?.homeDir),
+              })
+            if (cragPrint) {
+              const cragPersona = resolveCragPrintPersona(selected.vm, routingNow)
+              let source = filterThinkingForAccount(
+                shallowCopyBody(personaIn),
+                selected.accountId,
+                thinkingOwnerStore,
+              ).body
+              for (const policy of extra.repairs || []) source = repairAnthropicRequest(source, policy)
+              hopBody = prepareCragPrintBody(source, { preset: cragPersona, officialPassthrough })
+              hopBody = await materializeRemoteImageSources(hopBody)
+              if (identity) {
+                hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, req.headers, {
+                  officialClient: officialTraffic,
+                  sessionId: attemptSessionId,
+                  mode: sessionMode,
+                  boundSessionId: keptSession,
+                  boundAccountId: keptAccount,
+                  boundVmId: keptVm,
+                  vmId: selected.vmId,
+                  epoch: attemptStartedAt,
+                })
+              }
+              const scrubbed = scrubUpstreamClientBody(hopBody, {
+                official: officialTraffic === true,
+                rewriteTools: routingNow?.compatibility?.tool_name_rewrite !== false,
+              })
+              hopBody = scrubbed.body
+              preserveCacheBreakpoints = true
+              cacheTtl = null
+              personaHideTokens = 0
+              logBag.inference_engine = resolveInferenceEngine(selected.vm, routingNow)
+              logBag.persona_preset = cragPersona
+              logBag.crag_print = {
+                transport: 'print',
+                persona: cragPersona,
+                prompt_mode: hopBody.crag_prompt?.mode || 'default',
+              }
+              logBag.official_cc_inference = 'crag-print'
+              logBag.provider = 'local_cli'
+              hopBody = noteCachePrefix(selected, attemptSessionId, hopBody)
+              logBag.outbound_summary = summarizeBody(hopBody)
+              logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(hopBody) || attemptSessionId)
+              return {
+                body: hopBody,
+                meta: {
+                  toolNames: composeToolNames(inboundToolReverse, scrubbed.reverse),
+                  sessionId: attemptSessionId,
+                  cliHop: true,
+                  cragPrint: true,
+                  requestContext,
+                  repaired,
+                },
+              }
+            }
             // The front rewrite already produces the official two-block shape.
             const outboundProfile = profileForPreset(resolvedPersona)
             // Render once from caller input with the selected slot's identity, not the pre-selection environment.
@@ -1738,6 +1807,7 @@ export function createHandleProtocol(deps) {
                 toolNames: composeToolNames(inboundToolReverse, clientToolNames),
                 sessionId: attemptSessionId,
                 cliHop: true,
+                cragPrint: false,
                 requestContext,
                 repaired,
               },
@@ -1840,6 +1910,7 @@ export function createHandleProtocol(deps) {
               cacheTtl,
               preserveCacheBreakpoints,
               cliHop: attemptMeta?.cliHop === true,
+              cragPrint: attemptMeta?.cragPrint === true,
               repaired: attemptMeta?.repaired === true,
               requestContext: attemptMeta?.requestContext || requestContext,
               want1m,
@@ -1882,6 +1953,7 @@ export function createHandleProtocol(deps) {
               cacheTtl,
               preserveCacheBreakpoints,
               cliHop: attemptMeta?.cliHop === true,
+              cragPrint: attemptMeta?.cragPrint === true,
               repaired: attemptMeta?.repaired === true,
               requestContext: attemptMeta?.requestContext || requestContext,
               body,

@@ -72,13 +72,18 @@ async function prepareRemoteDir(session, vm) {
   const owner = remoteSlotOwner(session.host, vm)
   // Mount roots only: nothing here resolves through a path the guest can rewrite.
   const roots = [`${dir}/run`, `${dir}/claude`, `${dir}/claude/telemetry`, `${dir}/cli-home`].map(shellQuote).join(' ')
+  const cragDirs = ['crag-native-assets', 'work', 'crag-license']
+    .map((name) => shellQuote(`${dir}/run/${name}`))
+    .join(' ')
   const binDir = shellQuote(`${dir}/slot-bin`)
   // Docker creates a missing bind source as root:root, which the slot uid cannot write.
   const chown =
-    session.host.uid === 0 ? ` && chown ${owner.uid}:${owner.gid} ${shellQuote(dir)} ${roots} ${binDir}` : ''
+    session.host.uid === 0
+      ? ` && chown ${owner.uid}:${owner.gid} ${shellQuote(dir)} ${roots} ${cragDirs} ${binDir}`
+      : ''
   await runRemote(
     session.client,
-    `umask 077 && mkdir -p ${roots} ${binDir} && chmod 700 ${shellQuote(dir)} ${roots} && chmod 755 ${binDir}${chown}`,
+    `umask 077 && mkdir -p ${roots} ${cragDirs} ${binDir} && chmod 700 ${shellQuote(dir)} ${roots} ${cragDirs} && chmod 755 ${binDir}${chown}`,
     { timeoutMs: 20_000 },
   )
   done.add(vm.id)
@@ -153,8 +158,13 @@ export async function pushCragSlot(vm, projectRoot, session = null) {
   const s = session || (await nodeSession(vmNodeId(vm)))
   await prepareRemoteDir(s, vm)
   const payload = cragSlotPayload(projectRoot)
-  const remote = `${remoteSlotDir(s.host, vm.id)}/slot-bin`
+  const slotDir = remoteSlotDir(s.host, vm.id)
+  const remote = `${slotDir}/slot-bin`
   const marker = `${remote}/crag.digest`
+  const seccomp = fs.readFileSync(new URL('../vm/crag-v2-seccomp.json', import.meta.url))
+  const owner = ownerFor(s, vm)
+  const sftp = await openSftp(s.client)
+  await writeRemoteFile(sftp, `${slotDir}/crag-v2-seccomp.json`, seccomp, { mode: 0o644, owner })
   const current = await readRemoteFileNoFollow(s.client, marker)
   if (current?.toString('utf8').trim() === payload.digest) return { pushed: false, digest: payload.digest }
   const dirs = new Set()
@@ -163,13 +173,11 @@ export async function pushCragSlot(vm, projectRoot, session = null) {
     const slash = rel.lastIndexOf('/')
     if (slash > 0) dirs.add(`${remote}/${rel.slice(0, slash)}`)
   }
-  const owner = ownerFor(s, vm)
   if (dirs.size) {
     const quoted = [...dirs].sort().map(shellQuote).join(' ')
     const chown = owner ? ` && chown ${owner.uid}:${owner.gid} ${quoted}` : ''
     await runRemote(s.client, `umask 022 && mkdir -p ${quoted} && chmod 755 ${quoted}${chown}`, { timeoutMs: 20_000 })
   }
-  const sftp = await openSftp(s.client)
   for (const file of payload.files) {
     const rel = file.name.slice('opt/kin/'.length)
     const data = file.body || fs.readFileSync(file.src)

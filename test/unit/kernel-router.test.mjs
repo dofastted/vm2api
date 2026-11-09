@@ -778,7 +778,7 @@ test('writeKernelConfig points cc and crag at cc-node', () => {
   }
 })
 
-test('writeKernelConfig adds CRAG v2 fields only for a pinned local slot', () => {
+test('writeKernelConfig adds CRAG v2 fields for a local slot and a cluster Docker slot', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-crag-v2-cfg-'))
   try {
     const legacy = JSON.parse(
@@ -838,8 +838,11 @@ test('writeKernelConfig adds CRAG v2 fields only for a pinned local slot', () =>
         'utf8',
       ),
     )
-    assert.equal(remote.crag_v2_root, undefined)
-    assert.equal(remote.crag_kernel_version, undefined)
+    assert.equal(remote.crag_kernel_version, 'v2')
+    assert.equal(remote.runtime_variant, 'crag-v2')
+    assert.equal(remote.claude_bin, '/opt/kin-live/crag-v2/claude-code-2.1.317/claude')
+    assert.equal(remote.license_dir, '/run/kin/crag-license')
+    assert.equal(remote.asset_dir, '/run/kin/crag-native-assets')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

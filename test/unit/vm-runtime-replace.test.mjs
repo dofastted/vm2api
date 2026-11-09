@@ -197,9 +197,10 @@ test('reloadSlotWorker recreates on network mismatch before the KVM restart path
     src.indexOf('export function slotKernelAlive'),
   )
   assert.match(reload, /slotWorkerNeedsRecreate\(existing, vm, paths\)/)
+  assert.match(reload, /nativeSlotSandboxNeedsRecreate\(existing, vm, resolveSlotRouting\(projectRoot, routing\)\)/)
   assert.ok(
-    reload.indexOf('slotWorkerNeedsRecreate') < reload.indexOf('if (isKvmRuntime(vm)) {'),
-    'network recreate must run before systemctl restart',
+    reload.indexOf('nativeSlotSandboxNeedsRecreate') < reload.indexOf('if (isKvmRuntime(vm)) {'),
+    'sandbox recreate must run before systemctl restart',
   )
 })
 

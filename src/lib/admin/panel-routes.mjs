@@ -230,7 +230,7 @@ import { recreateVmFiles, seedFreshCliHome } from '../vm/vm-recreate.mjs'
 import { diagnoseSlotServices, powerOnSlot, recoverSlot, redactSecrets } from '../vm/slot-recovery.mjs'
 import { commitVmPackage, exportVmPackage, parseVmPackage } from '../vm/vm-package.mjs'
 import { slotMigrationBusy, slotMigrationJob, startSlotMigration } from '../cluster/slot-migration.mjs'
-import { preflightNode } from '../cluster/placement.mjs'
+import { isNativeNodeVm, preflightNode } from '../cluster/placement.mjs'
 import { probeLocalKvm } from '../vm/kvm-host.mjs'
 import { normalizeVmConfig, resolveMachineSpec, validateVmConfigPatch } from '../vm/machine-spec.mjs'
 import { raiseDockerSlotMemory } from '../vm/docker-slot-memory.mjs'
@@ -285,7 +285,13 @@ import { restartRustKernel, syncClaudeKernelConfigs, writeKernelConfig } from '.
 import { countTokensViaWorker } from '../transport/go-worker-client.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from '../protocol/claude-code-betas.mjs'
 import { rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
-import { activateCragLicense, checkCragLicense, CragLicenseError, getCragLicense } from '../vm/crag-license.mjs'
+import {
+  activateCragLicense,
+  checkCragLicense,
+  CragLicenseError,
+  distributeCragUniversalGrant,
+  getCragLicense,
+} from '../vm/crag-license.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
@@ -1153,6 +1159,14 @@ export function createPanelHandler(ctx) {
     const versionChanged =
       previousVersion !== targetVersion && (previousDataplane === 'crag' || targetDataplane === 'crag')
     const kernelSwitch = dataplaneChanged || versionChanged
+    if (kernelSwitch && targetDataplane === 'crag' && targetVersion === 'v2') {
+      if (isKvmRuntime(desired)) {
+        return { ok: false, id, code: 'remote_unsupported', error: 'crag 数据面暂不支持 KVM 槽' }
+      }
+      if (isNativeNodeVm(desired)) {
+        return { ok: false, id, code: 'native_crag_unsupported', error: 'crag 数据面暂不支持 macOS 原生节点' }
+      }
+    }
     let switched = null
     if (Object.prototype.hasOwnProperty.call(patch, 'inference_engine') && previousEngine !== targetEngine) {
       switched = await switchSlotInferenceEngine(desired, cfg.paths.project, targetEngine)
@@ -1178,17 +1192,40 @@ export function createPanelHandler(ctx) {
         }
         writeKernelConfig(cfg.paths.project, saved, { routing: ctx.routingConfig })
         if (kernelSwitch && saved.status === 'running') {
-          const exec = slotExec(cfg.paths.project, saved)
-          const restarted = await (ctx.kernelPolicyOps?.restartRustKernel || restartRustKernel)(exec).catch((e) => ({
-            ok: false,
-            error: String(e?.message || e).slice(0, 200),
-          }))
-          if (!restarted?.ok) {
-            return {
+          const remoteDocker =
+            Boolean(String(saved.node_id || '').trim()) && !isKvmRuntime(saved) && !isNativeNodeVm(saved)
+          const recreateNative =
+            !isKvmRuntime(saved) &&
+            (remoteDocker ||
+              (targetDataplane === 'crag' && targetVersion === 'v2' && !String(saved.node_id || '').trim()))
+          // docker restart keeps HostConfig. A CRAG v2 command, or any cluster
+          // kernel change, has to recreate the container.
+          if (recreateNative) {
+            const booted = await startSlotReady(saved, cfg.paths.project, {
+              recreate: true,
+              routing: ctx.routingConfig,
+            })
+            if (!booted?.ok) {
+              return {
+                ok: false,
+                id,
+                code: booted?.code || 'kernel_restart_failed',
+                error: booted?.error || 'kernel recreate failed',
+              }
+            }
+          } else {
+            const exec = slotExec(cfg.paths.project, saved)
+            const restarted = await (ctx.kernelPolicyOps?.restartRustKernel || restartRustKernel)(exec).catch((e) => ({
               ok: false,
-              id,
-              code: 'kernel_restart_failed',
-              error: restarted?.error || 'kernel restart failed',
+              error: String(e?.message || e).slice(0, 200),
+            }))
+            if (!restarted?.ok) {
+              return {
+                ok: false,
+                id,
+                code: 'kernel_restart_failed',
+                error: restarted?.error || 'kernel restart failed',
+              }
             }
           }
         }
@@ -2970,7 +3007,9 @@ export function createPanelHandler(ctx) {
           if (req.method === 'GET')
             return json(res, 200, panel.ok(getCragLicense(cfg.paths.project, vm, { initialize: true })))
           const body = await readBody(req, 32768)
-          return json(res, 200, panel.ok(activateCragLicense(cfg.paths.project, vm, body?.registration_code)))
+          const activated = activateCragLicense(cfg.paths.project, vm, body?.registration_code)
+          if (activated.license?.scope === 'kernel') await distributeCragUniversalGrant(cfg.paths.project)
+          return json(res, 200, panel.ok(activated))
         } catch (error) {
           const typed = error instanceof CragLicenseError
           return json(res, typed ? 403 : 400, {

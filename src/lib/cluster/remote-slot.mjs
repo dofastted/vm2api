@@ -28,7 +28,12 @@ import {
   proxyKey,
 } from '../vm/egress.mjs'
 import { OS_CATALOG } from '../vm/os-catalog.mjs'
-import { REMOTE_KERNEL_ENTRY, resolveKernelDataplane } from '../vm/slot-engine.mjs'
+import {
+  REMOTE_CRAG_ENTRY,
+  REMOTE_KERNEL_ENTRY,
+  resolveCragKernelVersion,
+  resolveKernelDataplane,
+} from '../vm/slot-engine.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
@@ -45,6 +50,8 @@ import {
   STANDARD_LOCALE,
   writeWorkerFiles,
 } from '../vm/vm-runtime.mjs'
+import { projectCragUniversalVm } from '../vm/crag-license.mjs'
+import { patchVmRecord } from '../vm/vm-registry.mjs'
 import {
   containerAction,
   createContainerRaw,
@@ -88,6 +95,28 @@ const SLOT_LAYOUT = '3'
 const LIVE_BIN = '/opt/kin-live'
 const LIVE_BIN_GUEST = '/opt/kin-guest/opt/kin-live'
 const LIVE_SERVICE_MOUNT_DESTINATIONS = Object.freeze([LIVE_BIN, LIVE_BIN_GUEST])
+
+function clusterDockerClaude(vm) {
+  return !isCodexVm(vm) && !isKvmRuntime(vm) && !isNativeNodeVm(vm) && Boolean(vmNodeId(vm))
+}
+
+/** The running command has to match this slot's kernel. CRAG v2 also needs the userns sandbox. */
+export function clusterDockerCommandReady(vm, info, routing) {
+  if (!clusterDockerClaude(vm)) return true
+  const crag =
+    resolveKernelDataplane(vm, routing || {}) === 'crag' && resolveCragKernelVersion(vm, routing || {}) === 'v2'
+  if (crag) return clusterCragContainerReady(info)
+  const cmd = info?.Config?.Cmd || []
+  return Array.isArray(cmd) && cmd[0] === REMOTE_KERNEL_ENTRY
+}
+
+export function clusterCragContainerReady(info) {
+  const cmd = info?.Config?.Cmd || []
+  if (!Array.isArray(cmd) || cmd[0] !== REMOTE_CRAG_ENTRY) return false
+  if (info?.HostConfig?.Init !== true) return false
+  const opts = info?.HostConfig?.SecurityOpt || []
+  return opts.some((opt) => String(opt).startsWith('seccomp=')) && opts.includes('apparmor=unconfined')
+}
 
 function failure(err, fallbackCode = 'remote_slot_failed') {
   return { ok: false, code: err?.code || fallbackCode, error: String(err?.message || err) }
@@ -696,6 +725,9 @@ export function slotContainerBody(vm, { image, network, remoteDir, user, routing
   const mem = parseMemoryBytes(slotMemory(vm, routing))
   const cpus = slotDockerCpus(vm)
   const codex = isCodexVm(vm)
+  const crag =
+    !codex && resolveKernelDataplane(vm, routing) === 'crag' && resolveCragKernelVersion(vm, routing) === 'v2'
+  const entry = crag ? REMOTE_CRAG_ENTRY : REMOTE_KERNEL_ENTRY
   return {
     Image: image,
     Hostname: String(vm.fingerprint?.hostname || '').trim() || slotName,
@@ -711,7 +743,7 @@ export function slotContainerBody(vm, { image, network, remoteDir, user, routing
       `KIN_VM_OS=${vm.kernel}`,
     ],
     // Node images bake the Claude kernel here; local slots bind-mount a different path.
-    Cmd: codex ? ['sleep', 'infinity'] : [REMOTE_KERNEL_ENTRY, '--gateway-worker', '--config', '/run/kin/kernel.json'],
+    Cmd: codex ? ['sleep', 'infinity'] : [entry, '--gateway-worker', '--config', '/run/kin/kernel.json'],
     Labels: {
       'kin.vm': '1',
       'kin.vm.id': vm.id,
@@ -742,7 +774,10 @@ export function slotContainerBody(vm, { image, network, remoteDir, user, routing
       PidsLimit: 256,
       ReadonlyRootfs: true,
       Tmpfs: { '/tmp': 'rw,noexec,nosuid,size=32m' },
-      SecurityOpt: ['no-new-privileges'],
+      SecurityOpt: crag
+        ? ['no-new-privileges', `seccomp=${remoteDir}/crag-v2-seccomp.json`, 'apparmor=unconfined']
+        : ['no-new-privileges'],
+      ...(crag ? { Init: true } : {}),
       CapDrop: ['ALL'],
       Dns: ['8.8.8.8'],
       DnsOptions: ['use-vc'],
@@ -829,11 +864,11 @@ export async function refreshNodeSlotPayload(
     // the tree without recreating a container whose image is otherwise current.
     if (session?.client) await pushCragSlot(vm, projectRoot, session)
     const running = recreate !== false && vm.status === 'running'
-    // Upgrade and the entrypoint auto-sync both land here: a slot already up on this payload stays up.
+    // A current image stays up only when its command matches this slot's kernel.
     if (running) {
       const ref = slotImageSpec(projectRoot, kernel, { runtime: kind }).ref
       const info = await inspect(session.docker, vm.runtime?.container || containerName(id))
-      if (info?.State?.Running && info.Config?.Image === ref) {
+      if (info?.State?.Running && info.Config?.Image === ref && clusterDockerCommandReady(vm, info, routing)) {
         return {
           id,
           node_id: nodeId,
@@ -842,6 +877,28 @@ export async function refreshNodeSlotPayload(
           kernel_changed: false,
           restarted: false,
           kernel: { ok: true, skipped: true, reason: 'unchanged' },
+        }
+      }
+      if (info?.State?.Running && info.Config?.Image === ref && clusterDockerClaude(vm)) {
+        const boot = await startFn(vm, projectRoot, { recreate: true, routing })
+        if (!boot?.ok) {
+          return {
+            id,
+            node_id: nodeId,
+            ok: false,
+            code: boot?.code || 'slot_payload_refresh_failed',
+            error: boot?.error || '集群槽切换内核失败',
+            image: ref,
+          }
+        }
+        return {
+          id,
+          node_id: nodeId,
+          ok: true,
+          image: ref,
+          kernel_changed: true,
+          restarted: true,
+          kernel: { ok: true, action: boot.action || 'recreated' },
         }
       }
     }
@@ -957,12 +1014,12 @@ export async function refreshClusterSlotPayloads(
   for (const vm of vms || []) {
     // Codex inference is the host Codex kernel; this update targets Claude CLI payloads.
     if (isCodexVm(vm)) continue
-    if (resolveKernelDataplane(vm, routing || {}) === 'crag' || vm?.dataplane === 'crag') {
+    if (isKvmRuntime(vm) && (resolveKernelDataplane(vm, routing || {}) === 'crag' || vm?.dataplane === 'crag')) {
       items.push({
         id: vm.id,
         ok: false,
         code: 'remote_unsupported',
-        error: 'crag 数据面暂不支持集群节点',
+        error: 'crag 数据面暂不支持 KVM 槽',
         kernel_changed: false,
       })
       continue
@@ -992,8 +1049,8 @@ export async function refreshClusterSlotPayloads(
 }
 
 async function prepare(vm, projectRoot, routing, { pinnedImageId = null } = {}) {
-  if (resolveKernelDataplane(vm, routing || {}) === 'crag') {
-    return { fail: { ok: false, code: 'remote_unsupported', error: 'crag 数据面暂不支持集群节点' } }
+  if (isKvmRuntime(vm) && resolveKernelDataplane(vm, routing || {}) === 'crag') {
+    return { fail: { ok: false, code: 'remote_unsupported', error: 'crag 数据面暂不支持 KVM 槽' } }
   }
   vm.kernel = vm.kernel && OS_CATALOG[vm.kernel] ? vm.kernel : 'ubuntu-24.04'
   vm.timezone = normalizeTimezone(vm.timezone)
@@ -1061,6 +1118,7 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
     if (!isKvmRuntime(vm)) slotDockerCpus(vm)
     const p = await prepare(vm, projectRoot, routing, { pinnedImageId })
     if (p.fail) return p.fail
+    if (resolveKernelDataplane(vm, routing) === 'crag') await projectCragUniversalVm(projectRoot, vm)
     const { nodeId, session, image, egressImage, user, remoteDir, slotDir } = p
     const kvm = isKvmRuntime(vm)
     let accel = vm.runtime?.accel
@@ -1090,6 +1148,7 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
       existing.Config?.Labels?.['kin.vm.layout'] === SLOT_LAYOUT &&
       runtimeLabelOf(existing) === runtimeKind(vm) &&
       codexRoleMatches(existing, vm) &&
+      clusterDockerCommandReady(vm, existing, routing) &&
       // Running stays true during Docker restart-policy backoff. Recreate the
       // loop just like the local runtime; otherwise watchdog revival is a no-op.
       !existing.State?.Restarting &&
@@ -1171,7 +1230,8 @@ export async function reloadRemoteSlot(vm, projectRoot, { routing } = {}) {
       existing.HostConfig?.NetworkMode !== eg.network ||
       existing.Config?.Labels?.['kin.vm.layout'] !== SLOT_LAYOUT ||
       runtimeLabelOf(existing) !== runtimeKind(vm) ||
-      !codexRoleMatches(existing, vm)
+      !codexRoleMatches(existing, vm) ||
+      !clusterDockerCommandReady(vm, existing, routing)
     ) {
       return startRemoteSlot(vm, projectRoot, { recreate: !!existing, routing })
     }

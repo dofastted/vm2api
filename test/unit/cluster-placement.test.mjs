@@ -606,7 +606,7 @@ test('cluster payload check skips a container already on the content-hashed imag
   }
 })
 
-test('node payload refresh leaves a running slot already on the current image up', async (t) => {
+test('node payload refresh recreates a running slot whose command does not match its kernel', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cluster-refresh-'))
   const saved = [
     'KIN_KERNEL_BIN',
@@ -639,22 +639,74 @@ test('node payload refresh leaves a running slot already on the current image up
   process.env.KIN_CLUSTER_EGRESS_BIN = path.join(root, 'bin/kin-egress')
   process.env.KIN_CODEX_KERNEL_BIN = path.join(root, 'bin/kin-codex-kernel')
   seedEncryptedPackage(root)
-  const vm = { id: 'vm-03', node_id: 'node-a', kernel: 'ubuntu-24.04', status: 'running' }
+  const vm = {
+    id: 'vm-03',
+    node_id: 'node-a',
+    kernel: 'ubuntu-24.04',
+    status: 'running',
+    dataplane: 'crag',
+    crag_kernel_version: 'v2',
+  }
   const current = slotImageSpec(root, 'ubuntu-24.04').ref
   const inspected = []
+  const started = []
   const report = await refreshNodeSlotPayload(vm, root, {
     sessionFor: async () => ({ docker: {} }),
     inspect: async (_docker, name) => {
       inspected.push(name)
       return { State: { Running: true }, Config: { Image: current } }
     },
-    startFn: async () => assert.fail('a slot on the current image must not be recreated'),
+    startFn: async (target, _root, opts) => {
+      started.push({
+        id: target.id,
+        dataplane: target.dataplane,
+        version: target.crag_kernel_version,
+        recreate: opts.recreate,
+      })
+      return { ok: true, action: 'created' }
+    },
   })
   assert.deepEqual(inspected, ['kin-03'])
   assert.equal(report.ok, true)
-  assert.equal(report.kernel_changed, false)
-  assert.equal(report.restarted, false)
-  assert.deepEqual(report.kernel, { ok: true, skipped: true, reason: 'unchanged' })
+  assert.equal(report.kernel_changed, true)
+  assert.equal(report.restarted, true)
+  assert.deepEqual(started, [{ id: 'vm-03', dataplane: 'crag', version: 'v2', recreate: true }])
+  const stayed = []
+  const again = await refreshNodeSlotPayload(vm, root, {
+    sessionFor: async () => ({ docker: {} }),
+    inspect: async () => ({
+      State: { Running: true },
+      Config: {
+        Image: current,
+        Cmd: ['/opt/kin-live/crag-kernel', '--gateway-worker', '--config', '/run/kin/kernel.json'],
+      },
+      HostConfig: {
+        Init: true,
+        SecurityOpt: ['no-new-privileges', 'seccomp=/tmp/crag-v2-seccomp.json', 'apparmor=unconfined'],
+      },
+    }),
+    startFn: async () => {
+      stayed.push('started')
+      return { ok: false }
+    },
+  })
+  assert.equal(again.kernel_changed, false)
+  assert.deepEqual(stayed, [])
+  const wrapStarted = []
+  const wrap = { ...vm, dataplane: 'wrap', crag_kernel_version: '' }
+  const wrapReport = await refreshNodeSlotPayload(wrap, root, {
+    sessionFor: async () => ({ docker: {} }),
+    inspect: async () => ({
+      State: { Running: true },
+      Config: { Image: current, Cmd: ['/opt/kin/kin-kernel', '--gateway-worker', '--config', '/run/kin/kernel.json'] },
+    }),
+    startFn: async () => {
+      wrapStarted.push('started')
+      return { ok: false }
+    },
+  })
+  assert.equal(wrapReport.kernel_changed, false)
+  assert.deepEqual(wrapStarted, [])
 })
 
 test('amd64 node payload stays separate from native ARM control helpers', (t) => {

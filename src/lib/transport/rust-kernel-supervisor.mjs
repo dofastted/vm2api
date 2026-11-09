@@ -28,6 +28,7 @@ import {
   CONTAINER_CLI_NODE_BIN,
   KERNEL_NATIVE_SLOT_COUNT,
   normalizeSessionIdleTtlSeconds,
+  REMOTE_CRAG_CLAUDE,
   resolveCliSystemLayout,
   resolveCragKernelVersion,
   resolveKernelDataplane,
@@ -961,39 +962,40 @@ export function writeKernelConfig(
   if (
     dataplane === 'crag' &&
     resolveCragKernelVersion({ ...record, ...vm }, routing || {}) === 'v2' &&
-    !String(record?.node_id || '').trim() &&
-    !isKvmRuntime(record)
+    !isKvmRuntime(record) &&
+    !host.native
   ) {
     config.crag_kernel_version = 'v2'
     config.runtime_variant = 'crag-v2'
-    config.claude_bin = '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude'
+    config.claude_bin = host.bakedKernel ? REMOTE_CRAG_CLAUDE : '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude'
     config.asset_dir = '/run/kin/crag-native-assets'
     config.work_dir = '/run/kin/work'
-    const owner = runtimeFileOwner(vm)
-    for (const name of ['crag-native-assets', 'work']) {
-      const dir = path.join(runDir, name)
-      fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
-      fs.chmodSync(dir, 0o700)
-      if (privileged) fs.chownSync(dir, owner.uid, owner.gid)
-    }
-    acceptNativeClaudeSetup(homeDir, '/run/kin/work')
-    // Native Claude owns UA/billing version; never inject a legacy profile version.
     config.cli_version = ''
-    if (config.telemetry && isTelemetryEnabled(defaultSeedPolicy(record.seed_policy || {}))) {
-      const workstation = resolveWorkstationProfile(record)
-      config.telemetry = {
-        ...config.telemetry,
-        enabled: true,
-        dmi_dir: '/etc/kin-dmi',
-        identity: {
+    if (!host.bakedKernel) {
+      const owner = runtimeFileOwner(vm)
+      for (const name of ['crag-native-assets', 'work']) {
+        const dir = path.join(runDir, name)
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+        fs.chmodSync(dir, 0o700)
+        if (privileged) fs.chownSync(dir, owner.uid, owner.gid)
+      }
+      acceptNativeClaudeSetup(homeDir, '/run/kin/work')
+      if (config.telemetry && isTelemetryEnabled(defaultSeedPolicy(record.seed_policy || {}))) {
+        const workstation = resolveWorkstationProfile(record)
+        config.telemetry = {
+          ...config.telemetry,
           enabled: true,
-          linux_kernel: workstation.linux_kernel,
-          linux_distro_id: workstation.linux_distro_id,
-          linux_distro_version: workstation.linux_distro_version,
-          shell: workstation.shell,
-          terminal: workstation.terminal,
-          package_managers: workstation.package_managers,
-        },
+          dmi_dir: '/etc/kin-dmi',
+          identity: {
+            enabled: true,
+            linux_kernel: workstation.linux_kernel,
+            linux_distro_id: workstation.linux_distro_id,
+            linux_distro_version: workstation.linux_distro_version,
+            shell: workstation.shell,
+            terminal: workstation.terminal,
+            package_managers: workstation.package_managers,
+          },
+        }
       }
     }
   }

@@ -16,7 +16,7 @@ import { runtimeKind, isKvmRuntime, RUNTIME_KVM } from './runtime-kind.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { kernelBinPath, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
-import { checkCragLicense } from './crag-license.mjs'
+import { checkCragLicense, projectCragUniversalVm } from './crag-license.mjs'
 import { workerPaths as transportWorkerPaths } from '../transport/go-worker-client.mjs'
 import {
   assertCliHopAllowed,
@@ -500,8 +500,9 @@ export function slotWorkerNeedsRecreate(existing, vm, paths) {
 
 /**
  * Rewrite worker.json from the current vm proxy and bounce the process.
- * Recreate when the kernel is dead or NetworkMode != slotNetworkForVm(vm);
- * otherwise never docker rm — killing a live worker mid-refresh can invalidate the grant.
+ * Recreate when the kernel is dead, NetworkMode != slotNetworkForVm(vm),
+ * or a CRAG v2 container lacks the user-namespace seccomp, AppArmor profile, or init.
+ * Otherwise never docker rm — killing a live worker mid-refresh can invalidate the grant.
  * KVM without a relay sock is still live and must not be recreated for that reason.
  * KVM restarts the guest kin-kernel unit; docker restart would reboot the VM.
  */
@@ -527,7 +528,11 @@ export async function reloadSlotWorker(vm, projectRoot, { routing } = {}) {
   const existing = inspectContainer(name)
   if (!existing) return await startVmRuntime(vm, projectRoot, { recreate: false, routing })
   // Before the KVM branch so a runner on the wrong kin-eg-* is recreated too.
-  if (slotWorkerNeedsRecreate(existing, vm, paths)) {
+  // Docker restart keeps HostConfig, so a pre-sandbox CRAG v2 container stays EPERM until rm.
+  if (
+    slotWorkerNeedsRecreate(existing, vm, paths) ||
+    nativeSlotSandboxNeedsRecreate(existing, vm, resolveSlotRouting(projectRoot, routing))
+  ) {
     return await startVmRuntime(vm, projectRoot, { recreate: true, routing })
   }
   if (isKvmRuntime(vm)) {
@@ -1012,6 +1017,7 @@ export function dockerSlotResourceArgs(vm, routing) {
 export async function startVmRuntime(vm, projectRoot, { recreate = false, routing, accel: accelOpt } = {}) {
   const licensed = checkCragLicense(projectRoot, vm, resolveSlotRouting(projectRoot, routing))
   if (!licensed.ok) return licensed
+  if (licensed.license?.scope === 'kernel') await projectCragUniversalVm(projectRoot, vm)
   if (!isKvmRuntime(vm)) slotDockerCpus(vm) // reject corrupt persisted quotas before any lifecycle changes
   if (isKvmRuntime(vm) && accelOpt !== 'kvm' && accelOpt !== 'tcg') {
     const recorded = vm.runtime?.accel
