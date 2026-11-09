@@ -33,6 +33,7 @@ import {
   resolveSessionSlots,
   resolveSlotPersonaPreset,
 } from '../vm/slot-engine.mjs'
+import { resolveCragPrintPersona } from '../protocol/crag-print-prompt.mjs'
 import { probeAccount } from '../oauth/usage-probe.mjs'
 import { queryOpenaiQuota, resetOpenaiQuota } from '../oauth/openai-quota.mjs'
 import { queryClaudeResetCredits, redeemClaudeResetCredit } from '../oauth/claude-reset-credits.mjs'
@@ -433,6 +434,12 @@ export function validatePersonaRoutingPatch(body = {}) {
     const raw = String(compat.persona_preset).trim()
     if (!PERSONA_PRESETS.includes(raw)) {
       problems.push(`persona_preset 必须是 ${PERSONA_PRESETS.join(' / ')}，收到 ${raw}`)
+    }
+  }
+  if (compat.crag_persona_preset != null && String(compat.crag_persona_preset).trim() !== '') {
+    const raw = String(compat.crag_persona_preset).trim()
+    if (raw !== 'official_full' && raw !== 'zero') {
+      problems.push(`crag_persona_preset 必须是 official_full / zero，收到 ${raw}`)
     }
   }
   if (compat.overlay_preset != null && String(compat.overlay_preset).trim() !== '') {
@@ -1979,6 +1986,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     dataplane: v.dataplane || null,
     resolved_inference_engine: resolveInferenceEngine(v, extras.routingConfig || {}),
     resolved_persona_preset: resolveSlotPersonaPreset(v, extras.routingConfig || {}),
+    resolved_crag_print_persona: isCodex ? null : resolveCragPrintPersona(v, extras.routingConfig || {}),
     resolved_dataplane: resolveKernelDataplane(v, extras.routingConfig || {}),
     crag_kernel_version: v.crag_kernel_version || null,
     resolved_crag_kernel_version: isCodex ? null : resolveCragKernelVersion(v, extras.routingConfig || {}),
