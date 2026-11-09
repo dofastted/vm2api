@@ -3,7 +3,15 @@
  * go-worker-client; the socket is run/kernel.sock instead of worker.sock.
  */
 import path from 'node:path'
-import { callGoWorker, callWorkerPost, streamGoWorker, workerHealth, workerPaths } from './go-worker-client.mjs'
+import {
+  callGoWorker,
+  callWorkerPost,
+  credentialSummary,
+  streamGoWorker,
+  workerHealth,
+  workerPaths,
+} from './go-worker-client.mjs'
+import { readWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
 import { checkCragLicense, cragLicenseDeniedResult } from '../vm/crag-license.mjs'
 
 function licenseCheck(opts) {
@@ -62,12 +70,21 @@ export async function postRustKernelTelemetryEvent(exec, event, options = {}) {
   return remapVia(await callWorkerPost(withRustKernelExec(exec), '/internal/v1/telemetry/events', event, options))
 }
 
+export function withCragCredential(exec, health) {
+  if (!health || health.credential) return health
+  const native = health.runtime_variant === 'crag-v2' || (health.dataplane === 'crag' && health.kernel_version === 'v2')
+  if (!native) return health
+  const file = readWorkerCredentialFile(exec?.homeDir)
+  if (!file) return health
+  return { ...health, credential: credentialSummary(file) }
+}
+
 export async function rustKernelHealth(exec, opts = {}) {
   const health = await workerHealth(withRustKernelExec(exec), opts)
-  if (health?.source) {
-    return { ...health, source: String(health.source).replace(/go-worker/g, 'rust-kernel') }
-  }
-  return health
+  const reported = health?.source
+    ? { ...health, source: String(health.source).replace(/go-worker/g, 'rust-kernel') }
+    : health
+  return withCragCredential(exec, reported)
 }
 
 export function rustKernelProcessUp(health) {

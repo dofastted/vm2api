@@ -1239,7 +1239,7 @@ export async function ensureWorkerCredential(exec, { force = false } = {}) {
   })
 }
 
-function credentialSummary(credential, now = Date.now()) {
+export function credentialSummary(credential, now = Date.now()) {
   if (!credential) return undefined
   const expiresAt = credential.expires_at ?? null
   const expiresAtMs =
