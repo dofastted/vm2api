@@ -74,6 +74,7 @@ import {
 import { openSftp, readRemoteFileNoFollow, runRemote, shellQuote, writeRemoteFile } from './remote-fs.mjs'
 
 import {
+  pushCragSlot,
   pushSlotBinaries,
   pushSlotFiles,
   reconcileSlotCredentials,
@@ -824,6 +825,9 @@ export async function refreshNodeSlotPayload(
   const kind = runtimeKind(vm)
   try {
     const session = await sessionFor(nodeId)
+    // Older images have no CRAG layer. The slot-bin mount is already there, so publish
+    // the tree without recreating a container whose image is otherwise current.
+    if (session?.client) await pushCragSlot(vm, projectRoot, session)
     const running = recreate !== false && vm.status === 'running'
     // Upgrade and the entrypoint auto-sync both land here: a slot already up on this payload stays up.
     if (running) {

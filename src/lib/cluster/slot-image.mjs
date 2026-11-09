@@ -1,8 +1,8 @@
 /**
  * Self-contained slot image for cluster nodes: the kin-os guest image plus every
- * slot service baked in (kin-kernel + glibc shim, cli-node, cc-node, kin-worker
- * for oauth/telemetry, kin-egress, kin-codex-kernel). A remote node never
- * bind-mounts binaries from the control plane; it only receives per-slot config.
+ * slot service baked in (kin-kernel and crag-v2, glibc shim, cli-node, cc-node,
+ * kin-worker for oauth/telemetry, kin-egress, kin-codex-kernel). A remote node
+ * never bind-mounts these image binaries from the control plane.
  *
  * The tag carries a content hash of the payload: a rebuilt cli-node with the
  * same VERSION is a different image (version strings do not prove bytes).
@@ -17,8 +17,11 @@ import zlib from 'node:zlib'
 import { OS_CATALOG, imageForKernel, kvmImageForKernel } from '../vm/os-catalog.mjs'
 import { EGRESS_BIN } from '../vm/egress.mjs'
 import {
+  cragV2KernelWrapperScript,
+  cragV2PackageRoot,
   describeKernelPayload,
   inspectLinuxAmd64Elf,
+  verifyCragV2Tree,
   wrapCliTemplateDir,
   wrapKernelWrapperScript,
   WRAP_GLIBC_DIR,
@@ -49,6 +52,29 @@ function requireElf(file, label) {
   } finally {
     if (fd != null) fs.closeSync(fd)
   }
+}
+/** Cluster slot images are linux amd64 even when the control plane is not. */
+export function cragSlotPayload(projectRoot) {
+  const root = cragV2PackageRoot(projectRoot, 'amd64')
+  if (!root) throw new ClusterError(500, 'slot_payload_missing', 'CRAG v2 缺失')
+  const verified = verifyCragV2Tree(root, { arch: 'amd64' })
+  if (!verified.ok) {
+    const missing = verified.code === 'crag_v2_package_missing'
+    throw new ClusterError(500, missing ? 'slot_payload_missing' : 'slot_payload_invalid', verified.error)
+  }
+  const wrapper = Buffer.from(cragV2KernelWrapperScript())
+  const digest = crypto.createHash('sha256').update(wrapper)
+  const files = [{ name: 'opt/kin/crag-kernel', body: wrapper, mode: 0o755 }]
+  for (const rel of Object.keys(verified.manifest.sha256).sort()) {
+    digest.update(rel).update(verified.manifest.sha256[rel])
+    const executable = rel === 'crag-v2' || rel.endsWith('/claude')
+    files.push({
+      name: `opt/kin/crag-v2/${rel}`,
+      src: path.join(root, rel),
+      mode: executable ? 0o755 : 0o644,
+    })
+  }
+  return { files, digest: digest.digest('hex') }
 }
 
 /**
@@ -89,6 +115,7 @@ export function slotPayload(projectRoot) {
   )
   requireElf(egress, 'kin-egress')
   files.push({ name: 'usr/local/bin/kin-egress', src: egress, mode: 0o755 })
+  files.push(...cragSlotPayload(projectRoot).files)
   const codex = codexKernelBinPath() || path.join(projectRoot, 'bin', 'kin-codex-kernel')
   requireElf(codex, 'kin-codex-kernel')
   files.push({ name: 'usr/local/bin/kin-codex-kernel', src: codex, mode: 0o755 })
