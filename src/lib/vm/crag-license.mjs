@@ -504,9 +504,8 @@ function projectLocalGrantAll(projectRoot, code, requiredVm) {
 
 async function projectRemoteGrant(vm, code) {
   const { nodeSession, remoteSlotDir, remoteSlotOwner, vmNodeId } = await import('../cluster/placement.mjs')
-  const { openSftp, readRemoteFileNoFollow, runRemote, shellQuote, writeRemoteFile } = await import(
-    '../cluster/remote-fs.mjs'
-  )
+  const { openSftp, privateDirectoriesScript, readRemoteFileNoFollow, runRemote, shellQuote, writeRemoteFile } =
+    await import('../cluster/remote-fs.mjs')
   const nodeId = vmNodeId(vm)
   if (!nodeId) return false
   const session = await nodeSession(nodeId)
@@ -519,12 +518,14 @@ async function projectRemoteGrant(vm, code) {
   } catch {
     // Missing or unreadable: create the private directory below.
   }
-  const owner = remoteSlotOwner(session.host, vm)
-  const quoted = shellQuote(dir)
-  const chown = session.host.uid === 0 ? ` && chown ${owner.uid}:${owner.gid} ${quoted}` : ''
-  await runRemote(session.client, `umask 077 && mkdir -p ${quoted} && chmod 700 ${quoted}${chown}`, {
-    timeoutMs: 20_000,
-  })
+  const owner = session.host.uid === 0 ? remoteSlotOwner(session.host, vm) : null
+  const runDir = shellQuote(dir.slice(0, dir.lastIndexOf('/')))
+  const chown = owner ? ` && chown ${owner.uid}:${owner.gid} ${runDir}` : ''
+  await runRemote(
+    session.client,
+    `umask 077 && mkdir -p ${runDir} && chmod 700 ${runDir}${chown} && ${privateDirectoriesScript([dir], owner)}`,
+    { timeoutMs: 20_000 },
+  )
   const sftp = await openSftp(session.client)
   await writeRemoteFile(sftp, file, `${code}\n`, {
     mode: 0o600,

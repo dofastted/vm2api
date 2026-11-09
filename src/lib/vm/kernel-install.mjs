@@ -5,6 +5,7 @@ import { writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 import { applyScheduleOff, migrateScheduleRecord } from '../pool/schedule-state.mjs'
 import { checkCragLicense } from './crag-license.mjs'
 import { isValidVmId, withVmLock } from './vm-file.mjs'
+import { ensureHostPrivateDir } from './private-dir.mjs'
 import { getVm, patchVmRecord } from './vm-registry.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
@@ -62,15 +63,13 @@ function prepareNativeDirectories(runDir, owner) {
       code: 'crag_v2_private_directory_invalid',
     })
   }
+  const privileged = typeof process.getuid === 'function' && process.getuid() === 0
   for (const name of ['crag-native-assets', 'work']) {
-    const dir = path.join(runDir, name)
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { mode: 0o700 })
-    const stat = fs.lstatSync(dir)
-    if (!stat.isDirectory() || stat.isSymbolicLink()) {
-      throw Object.assign(new Error('CRAG 私有目录不能是链接或文件'), { code: 'crag_v2_private_directory_invalid' })
-    }
-    fs.chmodSync(dir, 0o700)
-    if (typeof process.getuid === 'function' && process.getuid() === 0) fs.chownSync(dir, owner.uid, owner.gid)
+    ensureHostPrivateDir(path.join(runDir, name), {
+      uid: owner.uid,
+      gid: owner.gid,
+      privileged,
+    })
   }
 }
 
