@@ -1184,17 +1184,38 @@ export function createPanelHandler(ctx) {
         }
         writeKernelConfig(cfg.paths.project, saved, { routing: ctx.routingConfig })
         if (kernelSwitch && saved.status === 'running') {
-          const exec = slotExec(cfg.paths.project, saved)
-          const restarted = await (ctx.kernelPolicyOps?.restartRustKernel || restartRustKernel)(exec).catch((e) => ({
-            ok: false,
-            error: String(e?.message || e).slice(0, 200),
-          }))
-          if (!restarted?.ok) {
-            return {
+          const recreateNative =
+            targetDataplane === 'crag' &&
+            targetVersion === 'v2' &&
+            !String(saved.node_id || '').trim() &&
+            !isKvmRuntime(saved)
+          // docker restart keeps HostConfig, so a pre-sandbox container still EPERMs on unshare.
+          if (recreateNative) {
+            const booted = await startSlotReady(saved, cfg.paths.project, {
+              recreate: true,
+              routing: ctx.routingConfig,
+            })
+            if (!booted?.ok) {
+              return {
+                ok: false,
+                id,
+                code: booted?.code || 'kernel_restart_failed',
+                error: booted?.error || 'kernel recreate failed',
+              }
+            }
+          } else {
+            const exec = slotExec(cfg.paths.project, saved)
+            const restarted = await (ctx.kernelPolicyOps?.restartRustKernel || restartRustKernel)(exec).catch((e) => ({
               ok: false,
-              id,
-              code: 'kernel_restart_failed',
-              error: restarted?.error || 'kernel restart failed',
+              error: String(e?.message || e).slice(0, 200),
+            }))
+            if (!restarted?.ok) {
+              return {
+                ok: false,
+                id,
+                code: 'kernel_restart_failed',
+                error: restarted?.error || 'kernel restart failed',
+              }
             }
           }
         }
