@@ -33,7 +33,6 @@ import { PageHeader } from '@/components/page-header'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
 import { dashboardQueryOptions } from '@/features/overview/queries'
-import { isRemoteVm } from '@/features/vm/placement'
 import { KernelLicenseDialog } from './license-dialog'
 import {
   installKernelTargets,
@@ -117,7 +116,11 @@ export function WrapSamplePage() {
     },
   })
   const busy = installing || pull.isPending
-  const allTargets = rows.map(({ vm, kernel }) => ({ id: vm.id, kernel }))
+  const eligible = rows.filter(({ vm }) => vm.node_platform !== 'darwin')
+  const allTargets = eligible.map(({ vm, kernel }) => ({ id: vm.id, kernel }))
+  function slotTargets(kernel: KernelId) {
+    return eligible.map(({ vm }) => ({ id: vm.id, kernel }))
+  }
   const failedCount = job
     ? Object.values(job.results).filter((item) => !item.ok).length
     : 0
@@ -139,17 +142,12 @@ export function WrapSamplePage() {
       toast.error(`请先下载 ${KERNEL_NAMES[missingPackage.kernel]} 安装包`)
       return
     }
-    const unsupported = targets.find((target) => {
-      const vm = vmById.get(target.id)
-      return (
-        target.kernel === 'crag' &&
-        vm &&
-        (isRemoteVm(vm) || vm.runtime_type === 'kvm')
-      )
-    })
-    if (unsupported) {
+    const mac = targets.find(
+      (target) => vmById.get(target.id)?.node_platform === 'darwin'
+    )
+    if (mac) {
       toast.error(
-        `${vmById.get(unsupported.id)?.name || unsupported.id} 仅能安装默认内核`
+        `${vmById.get(mac.id)?.name || mac.id} 是 macOS 原生节点，不能在内核页重装`
       )
       return
     }
@@ -341,17 +339,30 @@ export function WrapSamplePage() {
                     </p>
                   ) : null}
                 </div>
-                <Button
-                  variant='outline'
-                  className='h-11'
-                  aria-label={`拉取 ${KERNEL_NAMES[product.id]} 最新二进制`}
-                  disabled={!canEdit || busy}
-                  loading={pull.isPending && pull.variables === product.id}
-                  onClick={() => pull.mutate(product.id)}
-                >
-                  <Download aria-hidden='true' />
-                  拉取最新
-                </Button>
+                <div className='flex flex-wrap gap-2'>
+                  <Button
+                    variant='outline'
+                    className='h-11'
+                    aria-label={`拉取 ${KERNEL_NAMES[product.id]} 最新二进制`}
+                    disabled={!canEdit || busy}
+                    loading={pull.isPending && pull.variables === product.id}
+                    onClick={() => pull.mutate(product.id)}
+                  >
+                    <Download aria-hidden='true' />
+                    拉取最新
+                  </Button>
+                  <Button
+                    variant='outline'
+                    className='h-11'
+                    aria-label={`把 ${KERNEL_NAMES[product.id]} 更新到全部槽位`}
+                    disabled={
+                      !canEdit || busy || !product.ready || !eligible.length
+                    }
+                    onClick={() => requestInstall(slotTargets(product.id))}
+                  >
+                    更新全部槽位
+                  </Button>
+                </div>
               </div>
             ))}
           </section>
@@ -456,8 +467,7 @@ export function WrapSamplePage() {
                     const installed = catalog.data?.installations?.[vm.id]
                     const result = job?.results[vm.id]
                     const active = installing && job?.activeId === vm.id
-                    const nativeUnsupported =
-                      isRemoteVm(vm) || vm.runtime_type === 'kvm'
+                    const macNative = vm.node_platform === 'darwin'
                     const currentKernel =
                       vm.resolved_dataplane === 'crag' &&
                       vm.resolved_crag_kernel_version === 'v2'
@@ -551,10 +561,7 @@ export function WrapSamplePage() {
                               <SelectItem value='cli-node'>
                                 cli-node · 默认
                               </SelectItem>
-                              <SelectItem
-                                value='crag'
-                                disabled={nativeUnsupported}
-                              >
+                              <SelectItem value='crag' disabled={macNative}>
                                 CRAG · 付费
                               </SelectItem>
                             </SelectContent>
@@ -579,8 +586,8 @@ export function WrapSamplePage() {
                                       : 'text-destructive'
                                   }
                                 >
-                                  {nativeUnsupported
-                                    ? '仅支持本地 Docker'
+                                  {macNative
+                                    ? 'macOS 原生节点不支持'
                                     : license
                                       ? LICENSE_LABELS[license.status]
                                       : '状态未知'}
@@ -597,7 +604,7 @@ export function WrapSamplePage() {
                               <Button
                                 variant='ghost'
                                 className='h-11'
-                                disabled={!canEdit || busy || nativeUnsupported}
+                                disabled={!canEdit || busy || macNative}
                                 onClick={() => setLicenseVm(vm)}
                                 aria-label={`管理 ${vm.name || vm.id} CRAG 授权`}
                               >
@@ -618,11 +625,7 @@ export function WrapSamplePage() {
                           <Button
                             variant='outline'
                             className='h-11 w-full sm:w-auto'
-                            disabled={
-                              !canEdit ||
-                              busy ||
-                              (kernel === 'crag' && nativeUnsupported)
-                            }
+                            disabled={!canEdit || busy || macNative}
                             loading={active}
                             aria-label={`${changed ? '安装' : '重装'} ${vm.name || vm.id} 并停用`}
                             onClick={() =>

@@ -16,7 +16,6 @@ import os from 'node:os'
 import path from 'node:path'
 import { kernelBinPath } from '../transport/rust-kernel-supervisor.mjs'
 import { isCodexVm } from './vm-kind.mjs'
-import { isKvmRuntime } from './runtime-kind.mjs'
 import { nativeCliForVm, NATIVE_CLI_FILES } from './native-cli.mjs'
 import { resolveCragKernelVersion, resolveKernelDataplane } from './slot-engine.mjs'
 import { checkCragLicense, decodeLicenseBytes } from './crag-license.mjs'
@@ -137,11 +136,13 @@ exec "$DIR/${CRAG_V2_DIR}/${CRAG_V2_ENTRY}" "$@"
 }
 
 function cragV2PlacementError(vm) {
-  if (String(vm?.node_id || '').trim() || isKvmRuntime(vm)) {
+  // A cluster slot's tree is the node slot-bin, not this control plane's home.
+  // Local KVM reads the same cli-home the installer writes.
+  if (String(vm?.node_id || '').trim()) {
     return {
       ok: false,
       code: 'crag_v2_unsupported_placement',
-      error: 'CRAG v2 only runs on a local Linux Docker slot',
+      error: '集群槽的 CRAG 由内核页推到节点，不在控制面本机物化',
     }
   }
   return null

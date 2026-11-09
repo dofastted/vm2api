@@ -509,7 +509,7 @@ test('one VM can switch cli-node to CRAG v2 and back without deleting cli-node',
   }
 })
 
-test('CRAG v2 rejects a bad package and a non-local slot without replacing cli-node', () => {
+test('CRAG v2 rejects a bad package and a cluster slot without replacing cli-node', () => {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-v2-reject-'))
   try {
     const dir = seedV2Package(project)
@@ -529,7 +529,8 @@ test('CRAG v2 rejects a bad package and a non-local slot without replacing cli-n
     assert.equal(remote.code, 'crag_v2_unsupported_placement')
     assert.equal(fs.existsSync(wrapCliHomeDir(project, 'vm-remote')), false)
     const kvm = materializeCragV2(project, { id: 'vm-kvm', runtime: { type: 'kvm' } })
-    assert.equal(kvm.code, 'crag_v2_unsupported_placement')
+    assert.notEqual(kvm.code, 'crag_v2_unsupported_placement')
+    assert.equal(kvm.ok, false)
   } finally {
     fs.rmSync(project, { recursive: true, force: true })
   }
