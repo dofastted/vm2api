@@ -45,6 +45,7 @@ import {
   STANDARD_LOCALE,
   writeWorkerFiles,
 } from '../vm/vm-runtime.mjs'
+import { projectCragUniversalVm } from '../vm/crag-license.mjs'
 import {
   containerAction,
   createContainerRaw,
@@ -1061,6 +1062,7 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
     if (!isKvmRuntime(vm)) slotDockerCpus(vm)
     const p = await prepare(vm, projectRoot, routing, { pinnedImageId })
     if (p.fail) return p.fail
+    if (resolveKernelDataplane(vm, routing) === 'crag') await projectCragUniversalVm(projectRoot, vm)
     const { nodeId, session, image, egressImage, user, remoteDir, slotDir } = p
     const kvm = isKvmRuntime(vm)
     let accel = vm.runtime?.accel

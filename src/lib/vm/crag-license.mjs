@@ -5,6 +5,8 @@ import { runtimeFileOwner } from '../oauth/oauth-credentials.mjs'
 import { resolveKernelDataplane } from './slot-engine.mjs'
 import { cragV2PackageRoot, verifyCragV2Tree } from './wrap-cli-runtime.mjs'
 import { workerPaths } from '../transport/go-worker-client.mjs'
+import { isCodexVm } from './vm-kind.mjs'
+import { getVm, listVms } from './vm-registry.mjs'
 
 const MESSAGES = {
   license_required: 'Activate a CRAG registration code for this VM before using CRAG.',
@@ -72,6 +74,13 @@ export function cragLicenseDirectory(projectRoot, vm) {
     runRoot: String(process.env.KIN_SLOT_RUN_ROOT || '').trim(),
   }).runDir
   return path.join(runDir, 'crag-license')
+}
+
+/** One installation directory. CRAGU1 is not stored once per VM slot. */
+export function cragUniversalDirectory(projectRoot) {
+  if (!projectRoot) fail('license_unconfigured')
+  const runRoot = String(process.env.KIN_SLOT_RUN_ROOT || '').trim()
+  return path.join(runRoot || path.join(projectRoot, 'run'), 'crag-universal')
 }
 function calendarExpiry(issued, term) {
   const date = new Date(issued * 1000)
@@ -272,7 +281,7 @@ export function verifyCragRegistration(
       key.fill(0)
       payload?.fill(0)
     }
-    const status = { status: 'valid', valid: true, vm_id: device.vm_id, kind: 'online' }
+    const status = { status: 'valid', valid: true, vm_id: device.vm_id, kind: 'online', scope: 'device' }
     for (const key of ['license_id', 'term', 'issued_at', 'not_before', 'expires_at']) status[key] = c[key]
     if (now < c.issued_at || now < c.not_before)
       return {
@@ -407,7 +416,7 @@ export function verifyCragUniversal(code, { publicKey, keyId, now = Math.floor(D
     } finally {
       payload?.fill(0)
     }
-    const status = { status: 'valid', valid: true, vm_id: '', kind: 'offline' }
+    const status = { status: 'valid', valid: true, vm_id: '', kind: 'offline', scope: 'kernel' }
     for (const key of ['license_id', 'term', 'issued_at', 'not_before', 'expires_at']) status[key] = claims[key]
     if (now < claims.issued_at)
       return {
@@ -437,6 +446,123 @@ function storedRegistration(dir) {
   }
 }
 
+function readUniversalCode(projectRoot) {
+  try {
+    const stored = storedRegistration(cragUniversalDirectory(projectRoot))
+    return stored.startsWith('CRAGU1.') ? stored : ''
+  } catch (error) {
+    if (error?.code === 'ENOENT') return ''
+    throw error
+  }
+}
+
+function sharedUniversalLicense(projectRoot) {
+  const stored = readUniversalCode(projectRoot)
+  if (!stored) return null
+  return verifyCragUniversal(stored, trust(projectRoot))
+}
+
+function withMachineCode(projectRoot, vm, license, initialize) {
+  if (!initialize) return { license, machine_code: '' }
+  try {
+    // A machine-code failure must not hide an already valid offline license.
+    return { license, machine_code: deviceContext(projectRoot, vm, true).machine_code }
+  } catch {
+    return { license, machine_code: '' }
+  }
+}
+
+/** Copy the installation grant into a slot directory. Never replaces a device-bound L1. */
+export function projectLocalGrant(projectRoot, vm, code) {
+  if (!vm?.id || isCodexVm(vm) || vm.node_id) return false
+  const dir = cragLicenseDirectory(projectRoot, vm)
+  let existing = ''
+  try {
+    existing = storedRegistration(dir)
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error
+  }
+  if (existing.startsWith('CRAGL1.') || existing === code) return false
+  checkDirectory(dir, true, vm)
+  writePrivate(dir, 'registration.code', `${code}\n`, vm, true)
+  return true
+}
+
+function projectLocalGrantAll(projectRoot, code, requiredVm) {
+  projectLocalGrant(projectRoot, requiredVm, code)
+  for (const summary of listVms(projectRoot)) {
+    if (summary.id === requiredVm.id) continue
+    const other = getVm(projectRoot, summary.id)
+    if (!other) continue
+    try {
+      projectLocalGrant(projectRoot, other, code)
+    } catch {
+      // The next start of that slot retries. The installation grant stays valid.
+    }
+  }
+}
+
+async function projectRemoteGrant(vm, code) {
+  const { nodeSession, remoteSlotDir, remoteSlotOwner, vmNodeId } = await import('../cluster/placement.mjs')
+  const { openSftp, readRemoteFileNoFollow, runRemote, shellQuote, writeRemoteFile } = await import(
+    '../cluster/remote-fs.mjs'
+  )
+  const nodeId = vmNodeId(vm)
+  if (!nodeId) return false
+  const session = await nodeSession(nodeId)
+  const dir = `${remoteSlotDir(session.host, vm.id)}/run/crag-license`
+  const file = `${dir}/registration.code`
+  try {
+    const current = await readRemoteFileNoFollow(session.client, file, { maxBytes: 32768 })
+    const text = current.toString('utf8').trim()
+    if (text.startsWith('CRAGL1.') || text === code) return false
+  } catch {
+    // Missing or unreadable: create the private directory below.
+  }
+  const owner = remoteSlotOwner(session.host, vm)
+  const quoted = shellQuote(dir)
+  const chown = session.host.uid === 0 ? ` && chown ${owner.uid}:${owner.gid} ${quoted}` : ''
+  await runRemote(session.client, `umask 077 && mkdir -p ${quoted} && chmod 700 ${quoted}${chown}`, {
+    timeoutMs: 20_000,
+  })
+  const sftp = await openSftp(session.client)
+  await writeRemoteFile(sftp, file, `${code}\n`, {
+    mode: 0o600,
+    owner: session.host.uid === 0 ? owner : null,
+  })
+  return true
+}
+
+/** Make the installation grant visible to one slot kernel. No-op without a CRAGU1 grant. */
+export async function projectCragUniversalVm(projectRoot, vm) {
+  const code = readUniversalCode(projectRoot)
+  if (!code || !vm?.id || isCodexVm(vm)) return { ok: true, skipped: true }
+  if (vm.node_id) {
+    await projectRemoteGrant(vm, code)
+    return { ok: true }
+  }
+  projectLocalGrant(projectRoot, vm, code)
+  return { ok: true }
+}
+
+/** Push the one offline grant to every local slot and every cluster machine. */
+export async function distributeCragUniversalGrant(projectRoot) {
+  const code = readUniversalCode(projectRoot)
+  if (!code) return { ok: true, skipped: true }
+  const errors = []
+  for (const summary of listVms(projectRoot)) {
+    const vm = getVm(projectRoot, summary.id)
+    if (!vm?.id || isCodexVm(vm)) continue
+    try {
+      if (vm.node_id) await projectRemoteGrant(vm, code)
+      else projectLocalGrant(projectRoot, vm, code)
+    } catch {
+      errors.push(vm.id)
+    }
+  }
+  return { ok: errors.length === 0, errors }
+}
+
 export function getCragLicense(projectRoot, vm, { initialize = false } = {}) {
   let ctx
   try {
@@ -444,14 +570,12 @@ export function getCragLicense(projectRoot, vm, { initialize = false } = {}) {
     const stored = storedRegistration(dir)
     if (stored.startsWith('CRAGU1.')) {
       const license = verifyCragUniversal(stored, trust(projectRoot))
-      if (!initialize) return { license, machine_code: '' }
-      try {
-        // A machine-code failure must not hide an already valid offline license.
-        ctx = deviceContext(projectRoot, vm, true)
-      } catch {
-        return { license, machine_code: '' }
-      }
-      return { license, machine_code: ctx.machine_code }
+      const chosen = license.valid ? license : sharedUniversalLicense(projectRoot) || license
+      return withMachineCode(projectRoot, vm, chosen, initialize)
+    }
+    if (!stored.startsWith('CRAGL1.')) {
+      const grant = sharedUniversalLicense(projectRoot)
+      if (grant) return withMachineCode(projectRoot, vm, grant, initialize)
     }
     ctx = deviceContext(projectRoot, vm, initialize)
     if (!stored) {
@@ -474,9 +598,10 @@ export function activateCragLicense(projectRoot, vm, code) {
     if (trimmed.startsWith('CRAGU1.')) {
       const license = verifyCragUniversal(trimmed, trust(projectRoot))
       if (!license.valid) fail(license.code)
-      const dir = cragLicenseDirectory(projectRoot, vm)
-      checkDirectory(dir, true, vm)
-      writePrivate(dir, 'registration.code', `${trimmed}\n`, vm, true)
+      const dir = cragUniversalDirectory(projectRoot)
+      checkDirectory(dir, true, { id: 'crag-universal' })
+      writePrivate(dir, 'registration.code', `${trimmed}\n`, { id: 'crag-universal' }, true)
+      projectLocalGrantAll(projectRoot, trimmed, vm)
       return { license, machine_code: '' }
     }
     const ctx = deviceContext(projectRoot, vm, true)

@@ -16,7 +16,7 @@ import { runtimeKind, isKvmRuntime, RUNTIME_KVM } from './runtime-kind.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { kernelBinPath, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
-import { checkCragLicense } from './crag-license.mjs'
+import { checkCragLicense, projectCragUniversalVm } from './crag-license.mjs'
 import { workerPaths as transportWorkerPaths } from '../transport/go-worker-client.mjs'
 import {
   assertCliHopAllowed,
@@ -1012,6 +1012,7 @@ export function dockerSlotResourceArgs(vm, routing) {
 export async function startVmRuntime(vm, projectRoot, { recreate = false, routing, accel: accelOpt } = {}) {
   const licensed = checkCragLicense(projectRoot, vm, resolveSlotRouting(projectRoot, routing))
   if (!licensed.ok) return licensed
+  if (licensed.license?.scope === 'kernel') await projectCragUniversalVm(projectRoot, vm)
   if (!isKvmRuntime(vm)) slotDockerCpus(vm) // reject corrupt persisted quotas before any lifecycle changes
   if (isKvmRuntime(vm) && accelOpt !== 'kvm' && accelOpt !== 'tcg') {
     const recorded = vm.runtime?.accel
