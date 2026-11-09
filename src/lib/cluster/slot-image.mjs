@@ -17,6 +17,8 @@ import zlib from 'node:zlib'
 import { OS_CATALOG, imageForKernel, kvmImageForKernel } from '../vm/os-catalog.mjs'
 import { EGRESS_BIN } from '../vm/egress.mjs'
 import {
+  CC_NODE_BIN,
+  cliPayloadPath,
   cragV2KernelWrapperScript,
   cragV2PackageRoot,
   describeKernelPayload,
@@ -90,11 +92,12 @@ export function slotPayload(projectRoot) {
     { name: 'opt/kin/kin-kernel', body: Buffer.from(wrapKernelWrapperScript()), mode: 0o755 },
     { name: 'opt/kin/kin-kernel.bin', src: kernel.path, mode: 0o755 },
   ]
-  for (const bin of ['cli-node', 'cc-node']) {
-    const src = path.join(wrapDir, bin)
-    requireElf(src, bin)
-    files.push({ name: `opt/kin/${bin}`, src, mode: 0o755 })
-  }
+  const cliSrc = path.join(wrapDir, 'cli-node')
+  requireElf(cliSrc, 'cli-node')
+  files.push({ name: 'opt/kin/cli-node', src: cliSrc, mode: 0o755 })
+  const ccSrc = cliPayloadPath(projectRoot, CC_NODE_BIN, wrapDir)
+  requireElf(ccSrc, CC_NODE_BIN)
+  files.push({ name: `opt/kin/${CC_NODE_BIN}`, src: ccSrc, mode: 0o755 })
   const glibc = path.join(wrapDir, WRAP_GLIBC_DIR)
   if (fs.existsSync(glibc)) {
     for (const name of fs.readdirSync(glibc).sort()) {

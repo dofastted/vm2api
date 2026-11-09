@@ -512,7 +512,7 @@ export function cragKernelPath(projectRoot) {
   return isFile(alt) ? alt : ''
 }
 
-function cliPayloadPath(projectRoot, name, dir = wrapCliTemplateDir(projectRoot)) {
+export function cliPayloadPath(projectRoot, name, dir = wrapCliTemplateDir(projectRoot)) {
   const selected = path.join(dir, name)
   if (isFile(selected) || name !== CC_NODE_BIN) return selected
   // Pulling the free pair does not remove the separately shipped legacy CLI.

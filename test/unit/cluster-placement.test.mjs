@@ -400,6 +400,74 @@ function fakeElf(file, fill) {
   fs.writeFileSync(file, buf, { mode: 0o755 })
 }
 
+const SLOT_IMAGE_ENV_KEYS = [
+  'KIN_KERNEL_BIN',
+  'KIN_WORKER_BIN',
+  'KIN_EGRESS_BIN',
+  'KIN_CODEX_KERNEL_BIN',
+  'KIN_OAUTH_AUTH_BIN',
+  'KIN_WRAP_CLI_ROOT',
+  'KIN_CLUSTER_WORKER_BIN',
+  'KIN_CLUSTER_EGRESS_BIN',
+]
+
+function withSlotImageEnv(t, root) {
+  const saved = Object.fromEntries(SLOT_IMAGE_ENV_KEYS.map((k) => [k, process.env[k]]))
+  t.after(() => {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  })
+  for (const k of SLOT_IMAGE_ENV_KEYS) delete process.env[k]
+  process.env.KIN_CODEX_KERNEL_BIN = path.join(root, 'bin/kin-codex-kernel')
+  process.env.KIN_CLUSTER_WORKER_BIN = path.join(root, 'bin/kin-worker')
+  process.env.KIN_CLUSTER_EGRESS_BIN = path.join(root, 'bin/kin-egress')
+}
+
+function seedSlotImagePayload(root, { factoryCcNode = true, cacheCcNode = false } = {}) {
+  const pkgId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+  const pkgDir = path.join(root, 'share/wrap-cli-releases/packages', `amd64-${pkgId}`)
+  fs.mkdirSync(pkgDir, { recursive: true })
+  fakeElf(path.join(pkgDir, 'kin-kernel.bin'), 1)
+  fakeElf(path.join(pkgDir, 'cli-node'), 2)
+  if (cacheCcNode) fakeElf(path.join(pkgDir, 'cc-node'), 2)
+  fs.mkdirSync(path.join(root, 'share/wrap-cli-releases'), { recursive: true })
+  fs.writeFileSync(
+    path.join(root, 'share/wrap-cli-releases/current-amd64.json'),
+    JSON.stringify({ package: `packages/amd64-${pkgId}` }),
+  )
+  if (factoryCcNode) fakeElf(path.join(root, 'share/wrap-cli/cc-node'), 3)
+  for (const f of ['bin/kin-worker', 'bin/kin-egress', 'bin/kin-oauth-auth', 'bin/kin-codex-kernel']) {
+    fakeElf(path.join(root, f), 1)
+  }
+}
+
+test('slot image uses factory cc-node when the wrap-cli cache package omits it', (t) => {
+  const root = tmpDir('kin-slot-cc-fallback-')
+  withSlotImageEnv(t, root)
+  seedSlotImagePayload(root, { factoryCcNode: true, cacheCcNode: false })
+  seedEncryptedPackage(root)
+  const factoryCc = path.join(root, 'share/wrap-cli/cc-node')
+  const spec = slotImageSpec(root, 'ubuntu-24.04')
+  const cc = spec.files.find((file) => file.name === 'opt/kin/cc-node')
+  assert.ok(cc, 'cc-node must be baked into the slot image')
+  assert.equal(path.resolve(cc.src), path.resolve(factoryCc))
+})
+
+test('slot image reports factory cc-node path when both cache and factory omit it', (t) => {
+  const root = tmpDir('kin-slot-cc-missing-')
+  withSlotImageEnv(t, root)
+  seedSlotImagePayload(root, { factoryCcNode: false, cacheCcNode: false })
+  seedEncryptedPackage(root)
+  const factoryCc = path.join(root, 'share/wrap-cli/cc-node')
+  assert.throws(
+    () => slotImageSpec(root, 'ubuntu-24.04'),
+    (err) => err.code === 'slot_payload_missing' && String(err.message).includes(factoryCc),
+    'missing cc-node must name the factory path',
+  )
+})
+
 test('slot image tag follows payload bytes only; a VERSION bump keeps the image', (t) => {
   const root = tmpDir('kin-slot-image-')
   fs.writeFileSync(path.join(root, 'VERSION'), '9.9.9\n')
