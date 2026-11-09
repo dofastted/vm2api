@@ -137,14 +137,21 @@ exec "$DIR/${CRAG_V2_DIR}/${CRAG_V2_ENTRY}" "$@"
 }
 
 function cragV2PlacementError(vm) {
-  if (String(vm?.node_id || '').trim() || isKvmRuntime(vm)) {
+  if (isCodexVm(vm)) {
+    return { ok: false, code: 'kernel_codex_unsupported', error: '请选择 Claude 虚拟机' }
+  }
+  if (isKvmRuntime(vm) || vm?.node_platform === 'darwin') {
     return {
       ok: false,
       code: 'crag_v2_unsupported_placement',
-      error: 'CRAG v2 only runs on a local Linux Docker slot',
+      error: isKvmRuntime(vm) ? 'CRAG v2 不支持 KVM 槽' : 'CRAG v2 不支持 macOS 原生节点',
     }
   }
   return null
+}
+
+function clusterDockerSlot(vm) {
+  return Boolean(String(vm?.node_id || '').trim())
 }
 
 function listCragV2Files(dir, prefix = '') {
@@ -446,8 +453,26 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null } = 
   }
   const verified = verifyCragV2Tree(src)
   if (!verified.ok) return verified
-  const licensed = checkCragLicense(projectRoot, { ...vm, dataplane: 'crag' })
+  const licensed = checkCragLicense(projectRoot, { ...vm, dataplane: 'crag', crag_kernel_version: 'v2' })
   if (!licensed.ok) return licensed
+  // The node receives this tree, including native Claude Code, through the CRAG package push.
+  if (clusterDockerSlot(vm)) {
+    return {
+      ok: true,
+      remote: true,
+      dest: '',
+      src,
+      dataplane: 'crag',
+      kernel_version: 'v2',
+      runtime_variant: 'crag-v2',
+      claude_bin: CRAG_V2_CLAUDE,
+      changed: false,
+      kernel_changed: false,
+      glibc_shim: false,
+      wrapper: true,
+      kernel_bin: true,
+    }
+  }
   const dest = wrapCliHomeDir(projectRoot, vm.id)
   fs.mkdirSync(dest, { recursive: true })
   if (!cragV2WouldChange(src, dest)) {
@@ -1284,7 +1309,9 @@ export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptio
         })
         continue
       }
-      const kernelChanged = cragV2WouldChange(src, destDir) || Boolean(vm?.kernel_restart_pending)
+      const kernelChanged = clusterDockerSlot(vm)
+        ? false
+        : cragV2WouldChange(src, destDir) || Boolean(vm?.kernel_restart_pending)
       items.push({ id: vm.id, dataplane, kernel_version: 'v2', ok: true, kernel_changed: kernelChanged })
       continue
     }
