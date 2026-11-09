@@ -70,8 +70,6 @@ import { keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
 import { keyModelError } from '../admin/key-models.mjs'
 import {
   resolveInferenceEngine,
-  resolveCragKernelVersion,
-  resolveKernelDataplane,
   resolveOfficialCcInference,
   resolveSlotPersonaPreset,
   slotPersonaModeOverride,
@@ -94,7 +92,12 @@ import {
 import { resolveWorkspaceMode, isOfficialClaudeClient } from './workspace-mode.mjs'
 import { officialMessagesBody } from './anthropic-messages.mjs'
 import { prepareOutboundEnvelope, prepareCliHopBody, prepareCliPersonaInput } from './outbound-attempt.mjs'
-import { prepareCragPrintBody, resolveCragPrintPersona } from './crag-print-prompt.mjs'
+import {
+  cragV2KernelActive,
+  prepareCragPrintBody,
+  readSlotKernelConfig,
+  resolveCragPrintPersona,
+} from './crag-print-prompt.mjs'
 import { repairAnthropicRequest } from '../pool/upstream-error-policy.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
 import { loadVmIdentity, OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
@@ -546,6 +549,7 @@ export function createHandleProtocol(deps) {
     want1m = false,
     preserveCacheBreakpoints = false,
     cliHop = false,
+    cragPrint = false,
     repaired = false,
     requestContext = null,
     routing = {},
@@ -569,6 +573,7 @@ export function createHandleProtocol(deps) {
       routing,
       preserveCacheBreakpoints,
       cliHop,
+      cragPrint,
       repaired,
       requestContext,
       slotWaitMs: candidate.slotWaitMs,
@@ -1650,8 +1655,11 @@ export function createHandleProtocol(deps) {
           if (cliHop) {
             const cragPrint =
               !requestContext &&
-              resolveKernelDataplane(selected.vm, routingNow) === 'crag' &&
-              resolveCragKernelVersion(selected.vm, routingNow) === 'v2'
+              cragV2KernelActive({
+                vm: selected.vm,
+                health: selected.workerStatus,
+                kernelConfig: readSlotKernelConfig(selected.exec?.homeDir),
+              })
             if (cragPrint) {
               const cragPersona = resolveCragPrintPersona(selected.vm, routingNow)
               let source = filterThinkingForAccount(
@@ -1799,6 +1807,7 @@ export function createHandleProtocol(deps) {
                 toolNames: composeToolNames(inboundToolReverse, clientToolNames),
                 sessionId: attemptSessionId,
                 cliHop: true,
+                cragPrint: false,
                 requestContext,
                 repaired,
               },
@@ -1901,6 +1910,7 @@ export function createHandleProtocol(deps) {
               cacheTtl,
               preserveCacheBreakpoints,
               cliHop: attemptMeta?.cliHop === true,
+              cragPrint: attemptMeta?.cragPrint === true,
               repaired: attemptMeta?.repaired === true,
               requestContext: attemptMeta?.requestContext || requestContext,
               want1m,
@@ -1943,6 +1953,7 @@ export function createHandleProtocol(deps) {
               cacheTtl,
               preserveCacheBreakpoints,
               cliHop: attemptMeta?.cliHop === true,
+              cragPrint: attemptMeta?.cragPrint === true,
               repaired: attemptMeta?.repaired === true,
               requestContext: attemptMeta?.requestContext || requestContext,
               body,

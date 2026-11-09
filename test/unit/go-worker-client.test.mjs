@@ -284,6 +284,39 @@ test('CRAG v2 receives the preset model boundary and the standard kernel does no
   assert.equal(wrap.body.crag_model, undefined)
 })
 
+test('a wrap VM does not inherit a global CRAG v2 route', () => {
+  const body = {
+    model: 'claude-haiku-4-5',
+    crag_prompt: { mode: 'append', text: 'caller' },
+    messages: [{ role: 'user', content: 'hi' }],
+  }
+  const wrap = finalizeWorkerPayload({
+    body,
+    reqHeaders: {},
+    exec: { homeDir: '', vm: { dataplane: 'wrap' } },
+    routing: { inference: { dataplane: 'crag', crag_kernel_version: 'v2' } },
+    identity: null,
+  })
+  assert.equal(wrap.body.crag_model, undefined)
+  assert.equal(wrap.body.crag_prompt, undefined)
+  const forced = finalizeWorkerPayload({
+    body,
+    reqHeaders: {},
+    exec: { homeDir: '', vm: { dataplane: 'wrap' }, workerStatus: { runtime_variant: 'crag-v2' } },
+    identity: null,
+    cragPrint: false,
+  })
+  assert.equal(forced.body.crag_model, undefined)
+  const live = finalizeWorkerPayload({
+    body,
+    reqHeaders: {},
+    exec: { homeDir: '', vm: { dataplane: 'wrap' }, workerStatus: { runtime_variant: 'crag-v2' } },
+    identity: null,
+  })
+  assert.equal(live.body.crag_model.id, 'claude-haiku-4-5-20251001')
+  assert.equal(live.body.crag_prompt.mode, 'append')
+})
+
 const unix = process.platform !== 'win32'
 const unixTest = unix ? test : test.skip
 

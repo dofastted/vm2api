@@ -5,7 +5,48 @@
  * crag_prompt.mode=replace. --bare is not used: it drops OAuth.
  * Print keeps builtin tools and Chrome; --tools "" / --no-chrome are TUI-only.
  */
-import { normalizeSlotPersonaPreset } from '../vm/slot-engine.mjs'
+import fs from 'node:fs'
+import path from 'node:path'
+import { normalizeCragKernelVersion, normalizeKernelDataplane, normalizeSlotPersonaPreset } from '../vm/slot-engine.mjs'
+/**
+ * Print is the CRAG v2 worker only. A live health report wins, then an
+ * explicit dataplane on the VM, then the kernel.json that worker was started
+ * with. routing.inference is not a kernel: an empty or wrap slot stays on
+ * cli-node even when the global default is crag v2.
+ */
+function namedKernel(source) {
+  if (!source || typeof source !== 'object') return ''
+  const variant = String(source.runtime_variant || '')
+    .trim()
+    .toLowerCase()
+  if (variant === 'crag-v2') return 'crag-v2'
+  if (variant) return 'cli-node'
+  const plane = normalizeKernelDataplane(source.dataplane, { inherit: true })
+  if (!plane) return ''
+  const version = normalizeCragKernelVersion(source.kernel_version ?? source.crag_kernel_version, { inherit: true })
+  return plane === 'crag' && version === 'v2' ? 'crag-v2' : 'cli-node'
+}
+
+export function readSlotKernelConfig(homeDir) {
+  if (!homeDir) return null
+  try {
+    return JSON.parse(fs.readFileSync(path.join(homeDir, '..', 'run', 'kernel.json'), 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+export function cragV2KernelActive({ vm, health, kernelConfig } = {}) {
+  const live = namedKernel(health)
+  if (live) return live === 'crag-v2'
+  const plane = normalizeKernelDataplane(vm?.dataplane, { inherit: true })
+  const version = normalizeCragKernelVersion(vm?.crag_kernel_version, { inherit: true })
+  if (plane && plane !== 'crag') return false
+  if (plane === 'crag' && version) return version === 'v2'
+  const filed = namedKernel(kernelConfig)
+  if (filed) return filed === 'crag-v2'
+  return false
+}
 
 export const CRAG_PRINT_PROMPT_MAX_BYTES = 64 * 1024
 const BILLING_LINE = /^x-anthropic-billing-header:/i

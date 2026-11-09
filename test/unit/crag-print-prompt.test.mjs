@@ -1,9 +1,14 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { validatePersonaRoutingPatch } from '../../src/lib/admin/panel-api.mjs'
 import {
   callerSystemTail,
+  cragV2KernelActive,
   prepareCragPrintBody,
+  readSlotKernelConfig,
   resolveCragPrintPersona,
 } from '../../src/lib/protocol/crag-print-prompt.mjs'
 
@@ -90,6 +95,45 @@ test('CRAG print persona does not follow the cli-node preset', () => {
   assert.equal(resolveCragPrintPersona({ persona_preset: 'official_303' }, routing), 'official_full')
   assert.equal(resolveCragPrintPersona({ persona_preset: 'zero' }, routing), 'zero')
   assert.equal(resolveCragPrintPersona({}, { compatibility: { persona_preset: 'zero' } }), 'official_full')
+})
+
+test('print follows the kernel enabled on the VM, not the global dataplane', () => {
+  const routingOnly = { dataplane: 'crag', crag_kernel_version: 'v2' }
+  assert.equal(cragV2KernelActive({ vm: { dataplane: 'wrap' }, kernelConfig: routingOnly }), false)
+  assert.equal(cragV2KernelActive({ vm: { dataplane: 'cc' } }), false)
+  assert.equal(cragV2KernelActive({ vm: { dataplane: 'crag', crag_kernel_version: 'legacy' } }), false)
+  assert.equal(cragV2KernelActive({ vm: {} }), false)
+  assert.equal(cragV2KernelActive({ vm: { dataplane: 'crag', crag_kernel_version: 'v2' } }), true)
+  assert.equal(
+    cragV2KernelActive({
+      vm: { dataplane: 'wrap' },
+      health: { runtime_variant: 'crag-v2', dataplane: 'crag', kernel_version: 'v2' },
+    }),
+    true,
+  )
+  assert.equal(
+    cragV2KernelActive({
+      vm: { dataplane: 'crag', crag_kernel_version: 'v2' },
+      health: { runtime_variant: 'cli-node', dataplane: 'wrap' },
+    }),
+    false,
+  )
+  assert.equal(
+    cragV2KernelActive({
+      vm: { dataplane: 'crag' },
+      kernelConfig: { dataplane: 'crag', crag_kernel_version: 'v2', runtime_variant: 'crag-v2' },
+    }),
+    true,
+  )
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-route-'))
+  const home = path.join(root, 'cli-home')
+  fs.mkdirSync(path.join(root, 'run'), { recursive: true })
+  fs.writeFileSync(
+    path.join(root, 'run', 'kernel.json'),
+    JSON.stringify({ dataplane: 'crag', crag_kernel_version: 'v2', runtime_variant: 'crag-v2' }),
+  )
+  assert.equal(cragV2KernelActive({ vm: {}, kernelConfig: readSlotKernelConfig(home) }), true)
+  fs.rmSync(root, { recursive: true, force: true })
 })
 
 test('routing save accepts only the two CRAG print presets', () => {
