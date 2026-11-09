@@ -24,6 +24,7 @@ import { setVmSchedulable, listVms, getVm } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
+import { ensureHostPrivateDir } from '../vm/private-dir.mjs'
 import {
   CONTAINER_CLI_NODE_BIN,
   KERNEL_NATIVE_SLOT_COUNT,
@@ -974,10 +975,11 @@ export function writeKernelConfig(
     if (!host.bakedKernel) {
       const owner = runtimeFileOwner(vm)
       for (const name of ['crag-native-assets', 'work']) {
-        const dir = path.join(runDir, name)
-        fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
-        fs.chmodSync(dir, 0o700)
-        if (privileged) fs.chownSync(dir, owner.uid, owner.gid)
+        ensureHostPrivateDir(path.join(runDir, name), {
+          uid: owner.uid,
+          gid: owner.gid,
+          privileged,
+        })
       }
       acceptNativeClaudeSetup(homeDir, '/run/kin/work')
       if (config.telemetry && isTelemetryEnabled(defaultSeedPolicy(record.seed_policy || {}))) {

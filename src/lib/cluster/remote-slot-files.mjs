@@ -26,6 +26,7 @@ import { EGRESS_BIN } from '../vm/egress.mjs'
 import { readJsonCached } from '../vm/vm-file.mjs'
 import {
   openSftp,
+  privateDirectoriesScript,
   readRemoteFileNoFollow,
   remoteSymlink,
   runRemote,
@@ -72,18 +73,14 @@ async function prepareRemoteDir(session, vm) {
   const owner = remoteSlotOwner(session.host, vm)
   // Mount roots only: nothing here resolves through a path the guest can rewrite.
   const roots = [`${dir}/run`, `${dir}/claude`, `${dir}/claude/telemetry`, `${dir}/cli-home`].map(shellQuote).join(' ')
-  const cragDirs = ['crag-native-assets', 'work', 'crag-license']
-    .map((name) => shellQuote(`${dir}/run/${name}`))
-    .join(' ')
   const binDir = shellQuote(`${dir}/slot-bin`)
-  // Docker creates a missing bind source as root:root, which the slot uid cannot write.
   const chown =
-    session.host.uid === 0
-      ? ` && chown ${owner.uid}:${owner.gid} ${shellQuote(dir)} ${roots} ${cragDirs} ${binDir}`
-      : ''
+    session.host.uid === 0 ? ` && chown ${owner.uid}:${owner.gid} ${shellQuote(dir)} ${roots} ${binDir}` : ''
+  const privateDirs = ['crag-native-assets', 'work', 'crag-license'].map((name) => `${dir}/run/${name}`)
+  const privateScript = privateDirectoriesScript(privateDirs, session.host.uid === 0 ? owner : null)
   await runRemote(
     session.client,
-    `umask 077 && mkdir -p ${roots} ${cragDirs} ${binDir} && chmod 700 ${shellQuote(dir)} ${roots} ${cragDirs} && chmod 755 ${binDir}${chown}`,
+    `umask 077 && mkdir -p ${roots} ${binDir} && chmod 700 ${shellQuote(dir)} ${roots} && chmod 755 ${binDir}${chown} && ${privateScript}`,
     { timeoutMs: 20_000 },
   )
   done.add(vm.id)
