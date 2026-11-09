@@ -97,18 +97,6 @@ export function modelSupportsAdaptiveThinking(model = '') {
   return false
 }
 
-/** Models that reject thinking.type=enabled (adaptive-only) */
-export function modelRequiresAdaptiveThinking(model = '') {
-  const m = String(model || '')
-    .toLowerCase()
-    .split('[')[0]
-  if (m.includes('haiku')) return false
-  if (/claude-opus-4-[7-9]/.test(m) || /claude-opus-4\.[7-9]/.test(m)) return true
-  if (/claude-(opus|sonnet|fable|mythos)-5/.test(m)) return true
-  if (m.includes('fable') || m.includes('mythos')) return true
-  return false
-}
-
 /**
  * Normalize body.thinking for the target model (mutates body).
  * - adaptive on unsupported (Haiku / 4.5) -> enabled + budget (keep thinking intent)
@@ -167,27 +155,6 @@ export function downgradeUngatedThinkingDisplay(body = {}, anthropicBetaHeader =
 }
 
 const HIDDEN_THINKING_DISPLAYS = new Set(['omitted', 'updates'])
-
-function bareModel(model) {
-  return (
-    String(model || '')
-      .toLowerCase()
-      .split('[')[0]
-      .split('/')
-      .filter(Boolean)
-      .pop() || ''
-  )
-}
-
-/** Opus 4.7+, the 5 series, Haiku 5.5, Fable and Mythos return empty thinking unless asked. */
-export function modelHidesThinkingByDefault(model) {
-  const m = bareModel(model)
-  if (!m) return false
-  if (/^claude-haiku-5(?:[-.]|$)/.test(m)) return true
-  if (/^claude-opus-4[-.][7-9](?:[-.]|$)/.test(m)) return true
-  if (/^claude-(?:opus|sonnet|fable|mythos)-5(?:[-.]|$)/.test(m)) return true
-  return /(?:^|-)(?:fable|mythos)(?:-|$)/.test(m)
-}
 
 /**
  * `summarized` (the default) asks for a readable summary whenever the caller

@@ -350,23 +350,6 @@ export function enforceCacheTtlOrder(body) {
   return changed ? out : body
 }
 
-/** Retarget every Node marker to one TTL. Default matches DEFAULT_CACHE_TTL. */
-export function forceEphemeralCacheTtl(body, ttl = DEFAULT_CACHE_TTL) {
-  const target = normalizeCacheTtl(ttl)
-  if (!body || typeof body !== 'object') return body
-  let changed = false
-  const fix = (node) => {
-    if (!node?.cache_control) return node
-    const control = node.cache_control
-    if (control.type && control.type !== 'ephemeral') return node
-    if (control.type === 'ephemeral' && control.ttl === target) return node
-    changed = true
-    return { ...node, cache_control: { ...control, type: 'ephemeral', ttl: target } }
-  }
-  const out = walkCacheNodes(body, fix)
-  return changed ? out : body
-}
-
 /** Rewrite every outbound cache breakpoint to this request's resolved TTL. */
 export function applyCacheTtlToBody(body, ttl = DEFAULT_CACHE_TTL) {
   const target = normalizeCacheTtl(ttl)
