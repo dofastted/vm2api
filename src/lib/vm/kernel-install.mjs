@@ -9,6 +9,7 @@ import { ensureHostPrivateDir } from './private-dir.mjs'
 import { getVm, patchVmRecord } from './vm-registry.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
+import { isNativeNodeVm } from '../cluster/placement.mjs'
 import { stopSlot } from './slot-runtime.mjs'
 import { officialCcUidGid, suspendVmRuntimeRestart } from './vm-runtime.mjs'
 import { materializeResolvedKernel } from './wrap-cli-runtime.mjs'
@@ -48,9 +49,21 @@ function desiredVm(vm, kernel) {
 
 function placementFailure(vm, kernel) {
   if (isCodexVm(vm)) return { code: 'kernel_codex_unsupported', error: '请选择 Claude 虚拟机' }
+  if (kernel === 'crag') {
+    if (isKvmRuntime(vm) || isNativeNodeVm(vm)) {
+      return {
+        code: 'crag_v2_unsupported_placement',
+        error: isKvmRuntime(vm) ? 'CRAG v2 不支持 KVM 槽' : 'CRAG v2 不支持 macOS 原生节点',
+      }
+    }
+    if (process.platform !== 'linux') {
+      return { code: 'crag_v2_unsupported_placement', error: '内核重装仅支持 Linux' }
+    }
+    return null
+  }
   if (vm.node_id || isKvmRuntime(vm) || process.platform !== 'linux') {
     return {
-      code: kernel === 'crag' ? 'crag_v2_unsupported_placement' : 'kernel_install_unsupported_placement',
+      code: 'kernel_install_unsupported_placement',
       error: '内核重装仅支持本机 Linux Docker 虚拟机',
     }
   }
