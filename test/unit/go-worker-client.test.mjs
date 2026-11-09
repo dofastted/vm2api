@@ -649,6 +649,40 @@ unixTest('final headers survive an upstream error without becoming a downstream 
   }
 })
 
+unixTest('a reported final body is capped at 10000 tokens and stays off the caller stream', async () => {
+  const fx = await fixture((req, res) => {
+    req.resume()
+    res.setHeader('content-type', 'text/event-stream')
+    const body = '汉'.repeat(10_050)
+    res.write(
+      `event: kin_outbound_headers\ndata: ${JSON.stringify({
+        type: 'kin_outbound_headers',
+        headers: { 'user-agent': 'claude-cli/2.1.317 (external, cli)', authorization: 'Bearer secret' },
+        body,
+        body_truncated: false,
+      })}\n\n`,
+    )
+    res.end('event: message_stop\ndata: {"type":"message_stop"}\n\n')
+  })
+  try {
+    const lines = []
+    const snapshots = []
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: { model: 'claude-test', messages: [{ role: 'user', content: 'hi' }] },
+      onOutboundHeaders: (headers, extra) => snapshots.push({ headers, extra }),
+      onEvent: (line) => lines.push(line),
+    })
+    assert.equal(result.ok, true)
+    assert.equal(snapshots[0].headers['user-agent'], 'claude-cli/2.1.317 (external, cli)')
+    assert.equal(snapshots[0].extra.body.length, 10_000)
+    assert.equal(snapshots[0].extra.body_truncated, true)
+    assert.doesNotMatch(lines.join('\n'), /kin_outbound_headers|2\.1\.317/)
+  } finally {
+    await fx.close()
+  }
+})
+
 unixTest('streamGoWorker names the aborted hop to the kernel cancel route', async () => {
   let hopId = null
   let cancelled = null
