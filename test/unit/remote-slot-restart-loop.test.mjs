@@ -2,11 +2,11 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import vmContext from 'node:vm'
 import test from 'node:test'
-import { assignClusterCragVersion, clusterCragContainerReady } from '../../src/lib/cluster/remote-slot.mjs'
+import { clusterCragContainerReady, clusterDockerCommandReady } from '../../src/lib/cluster/remote-slot.mjs'
 import { createKernelWatchdog } from '../../src/lib/transport/kernel-watchdog.mjs'
 import { kernelFaults } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { dockerEnvMap, ensureKvmMachineRecord, kvmEnvMapIncomplete } from '../../src/lib/vm/kvm-machine.mjs'
-import { REMOTE_CRAG_ENTRY } from '../../src/lib/vm/slot-engine.mjs'
+import { REMOTE_CRAG_ENTRY, REMOTE_KERNEL_ENTRY } from '../../src/lib/vm/slot-engine.mjs'
 
 // Execute the exact production lifecycle body with synthetic I/O boundaries.
 // No SSH, Docker daemon, credentials or production filesystem is accessed.
@@ -30,6 +30,15 @@ function cragReadyContainer(base) {
     },
   }
 }
+function kernelContainer(base) {
+  return {
+    ...base,
+    Config: {
+      ...base.Config,
+      Cmd: [REMOTE_KERNEL_ENTRY, '--gateway-worker', '--config', '/run/kin/kernel.json'],
+    },
+  }
+}
 
 function fixture({
   running = true,
@@ -38,7 +47,7 @@ function fixture({
   mismatch = false,
   kind = 'docker',
   removeFails = false,
-  cragReady = kind === 'docker',
+  cragReady = false,
 } = {}) {
   const calls = []
   const target = {
@@ -57,7 +66,11 @@ function fixture({
     HostConfig: { NetworkMode: 'network' },
     State: { Running: running, Restarting: restarting },
   }
-  let info = missing ? null : cragReady && kind === 'docker' ? cragReadyContainer(base) : base
+  let info = missing
+    ? null
+    : kind !== 'docker'
+      ? base
+      : (cragReady ? cragReadyContainer(base) : kernelContainer(base))
   const io = {
     prepare: async () => ({
       nodeId: target.node_id,
@@ -108,7 +121,7 @@ function fixture({
     ensureKvmMachineRecord,
     kvmEnvMapIncomplete,
     patchVmRecord: () => null,
-    assignClusterCragVersion,
+    clusterDockerCommandReady,
     clusterCragContainerReady,
     clusterDockerClaude: (vm) => kind === 'docker' && Boolean(vm?.node_id),
     resolveKernelDataplane: (vm) => vm?.dataplane || 'kernel',
@@ -135,6 +148,7 @@ for (const [options, action, calls] of [
   [{ running: false }, 'started', ['files', 'start', 'runtime']],
   [{ missing: true }, 'created', ['files', 'create', 'start', 'runtime']],
   [{ mismatch: true }, 'created', ['remove', 'files', 'create', 'start', 'runtime']],
+  [{ cragReady: true }, 'created', ['remove', 'files', 'create', 'start', 'runtime']],
 ]) {
   test(`remote lifecycle preserves ${action} behavior: ${JSON.stringify(options)}`, async () => {
     const f = fixture(options)
