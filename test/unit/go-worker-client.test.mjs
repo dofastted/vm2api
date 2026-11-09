@@ -140,6 +140,39 @@ test('setup-token worker envelope is inference-only', () => {
   assert.match(String(out.headers['anthropic-beta'] || ''), /oauth-2025-04-20/)
 })
 
+test('worker canonicalizes passthrough bodies before either kernel', () => {
+  const body = {
+    model: 'claude-sonnet-5',
+    settings: { theme: 'dark' },
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'hello', annotations: [{ type: 'client-only' }] }],
+      },
+    ],
+    crag_prompt: { mode: 'append', text: 'caller tail' },
+  }
+  for (const cragPrint of [false, true]) {
+    const out = finalizeWorkerPayload({
+      body,
+      reqHeaders: {},
+      exec: {
+        homeDir: '',
+        vm: { claude: { mode: 'setup-token', scope: 'user:inference' } },
+        workerStatus: { runtime_variant: 'crag-v2', capabilities: ['linux_tui_pty'] },
+      },
+      identity: null,
+      cliHop: true,
+      cragPrint,
+    })
+    assert.equal(out.body.settings, undefined)
+    assert.deepEqual(out.body.output_config?.format, { type: 'json_schema', schema: { type: 'object' } })
+    assert.deepEqual(out.body.messages[0].content, [{ type: 'text', text: 'hello' }])
+    assert.deepEqual(out.body.crag_prompt, cragPrint ? body.crag_prompt : undefined)
+  }
+})
+
 test('cli-hop envelope keeps role=system turns that the VM betas do not declare', () => {
   const body = {
     model: 'claude-opus-5-5',
