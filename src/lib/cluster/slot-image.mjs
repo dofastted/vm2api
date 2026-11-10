@@ -55,9 +55,12 @@ function requireElf(file, label) {
   }
 }
 /** Cluster slot images are linux amd64 even when the control plane is not. */
-export function cragSlotPayload(projectRoot) {
+export function cragSlotPayload(projectRoot, { required = true } = {}) {
   const root = cragV2PackageRoot(projectRoot, 'amd64')
-  if (!root) throw new ClusterError(500, 'slot_payload_missing', 'CRAG v2 缺失')
+  if (!root) {
+    if (!required) return null
+    throw new ClusterError(500, 'slot_payload_missing', 'CRAG v2 缺失')
+  }
   const verified = verifyCragV2Tree(root, { arch: 'amd64' })
   if (!verified.ok) {
     const missing = verified.code === 'crag_v2_package_missing'
@@ -124,7 +127,8 @@ export function slotPayload(projectRoot) {
   )
   requireElf(egress, 'kin-egress')
   files.push({ name: 'usr/local/bin/kin-egress', src: egress, mode: 0o755 })
-  files.push(...cragSlotPayload(projectRoot).files)
+  const crag = cragSlotPayload(projectRoot, { required: false })
+  if (crag) files.push(...crag.files)
   const codex = codexKernelBinPath() || path.join(projectRoot, 'bin', 'kin-codex-kernel')
   requireElf(codex, 'kin-codex-kernel')
   files.push({ name: 'usr/local/bin/kin-codex-kernel', src: codex, mode: 0o755 })

@@ -27,11 +27,12 @@ import {
 import {
   ensureRemoteOfficialCredentialLink,
   pullSlotCredentials,
+  pushCragSlot,
   pushSlotCredentials,
   reconcileSlotCredentials,
   remoteSlotPath,
 } from '../../src/lib/cluster/remote-slot-files.mjs'
-import { slotImageAction, slotImageSpec } from '../../src/lib/cluster/slot-image.mjs'
+import { cragSlotPayload, slotImageAction, slotImageSpec } from '../../src/lib/cluster/slot-image.mjs'
 import { tarStream } from '../../src/lib/cluster/tar.mjs'
 import { SocketRelay } from '../../src/lib/cluster/socket-relay.mjs'
 import { connectSsh } from '../../src/lib/cluster/ssh-link.mjs'
@@ -471,8 +472,17 @@ test('slot image tag follows payload bytes only; a VERSION bump keeps the image'
   assert.notEqual(slotImageSpec(root, 'ubuntu-24.04').ref, a.ref, 'rebuilt cli-node = new image')
   const cragDir = path.join(root, 'share/crag')
   fs.renameSync(cragDir, path.join(root, 'crag-hidden'))
-  assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'slot_payload_missing' })
+  assert.throws(() => cragSlotPayload(root), { code: 'slot_payload_missing' })
+  for (const runtime of ['docker', 'kvm']) {
+    const withoutCrag = slotImageSpec(root, 'ubuntu-24.04', { runtime })
+    assert.ok(withoutCrag.files.some((file) => file.name === 'opt/kin/cli-node'))
+    assert.ok(withoutCrag.files.every((file) => !file.name.startsWith('opt/kin/crag')))
+  }
   fs.renameSync(path.join(root, 'crag-hidden'), cragDir)
+  const payloadFile = path.join(cragDir, 'kernels/v2/amd64/crag-v2.payload.enc')
+  fs.appendFileSync(payloadFile, 'tampered')
+  assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'slot_payload_invalid' })
+  fs.truncateSync(payloadFile, fs.statSync(payloadFile).size - 'tampered'.length)
   fs.writeFileSync(path.join(root, 'bin/kin-worker'), '#!/bin/sh\n')
   assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'slot_payload_invalid' })
   assert.throws(() => slotImageSpec(root, 'nope-os'), { code: 'invalid_kernel' })
@@ -545,6 +555,26 @@ test('slot images use the pulled CLI pair with the factory cc-node fallback', (t
   )
   fs.writeFileSync(selectedCc, '#!/bin/sh\n')
   assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'slot_payload_invalid' })
+})
+
+test('optional CRAG publication skips absent packages while explicit CRAG remains required', async (t) => {
+  const root = tmpDir('kin-slot-optional-crag-')
+  const saved = process.env.KIN_CRAG_V2_ROOT
+  delete process.env.KIN_CRAG_V2_ROOT
+  t.after(() => {
+    if (saved === undefined) delete process.env.KIN_CRAG_V2_ROOT
+    else process.env.KIN_CRAG_V2_ROOT = saved
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  assert.deepEqual(await pushCragSlot(vm, root, null, { required: false }), {
+    ok: true,
+    pushed: false,
+    skipped: 'missing',
+  })
+  await assert.rejects(pushCragSlot(vm, root), { code: 'slot_payload_missing' })
+  const pkg = seedEncryptedPackage(root)
+  fs.appendFileSync(path.join(pkg, 'crag-v2.payload.enc'), 'tampered')
+  await assert.rejects(pushCragSlot(vm, root, null, { required: false }), { code: 'slot_payload_invalid' })
 })
 
 test('cluster payload check skips a container already on the content-hashed image', async (t) => {
