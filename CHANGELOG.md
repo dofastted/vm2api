@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.4.061 — 2026-11-10
+
+- 升级同步二进制时不再先删除正在使用的文件。cli-node、内核和 CRAG 都是改名覆盖；已经挂载的目录保持原 inode。旧的 `claude-code-*` 目录先留着，槽位切到新路径之前仍能执行。写入失败会把原来的目录内容放回去。
+
+已部署机升级：更新 Node 控制面后重启。不必为了这次修复 `docker rm` 槽。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。
+
 ## 1.4.060 — 2026-11-10
 
 - Claude 订阅档从 OAuth 的订阅元数据和官方 `/api/oauth/profile` 识别，不再用 Fable 是否可用、用量窗口或旧调度档推断。面板保留 `subscription_type` 和 `rate_limit_tier`，有数据时显示 Max 5x/20x，没有就保持未识别。调度策略和 Codex 档不变。
