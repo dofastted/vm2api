@@ -527,7 +527,7 @@ export function createRoutingRuntime(ctx) {
     }
     if (nextRedaction) routingConfig.redaction = nextRedaction
     fs.mkdirSync(path.dirname(ctx.routingConfigPath), { recursive: true })
-    fs.writeFileSync(ctx.routingConfigPath, JSON.stringify(routingConfig, null, 2))
+    atomicWriteJson(ctx.routingConfigPath, routingConfig, { mode: 0o600 })
     ctx.stickyRouter.reloadConfig(routingConfig)
     ctx.accountQuota.reloadConfig(routingConfig)
     getPool()?.reloadConfig?.(poolSchedulerConfig())

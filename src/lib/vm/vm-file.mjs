@@ -120,72 +120,62 @@ export function readFileCached(file) {
   return text
 }
 
-/**
- * File text with a fresh `readFileSync` on every hit so same-mtime/size content
- * swaps still show up on the next call. Updates the LRU text cache when bytes change.
+/*
+ * Shared parse cache for hot-path config files (routing.json).
+ *
+ * In-process writers go through atomicWriteJson, which invalidates the entry
+ * after the rename; the next read re-parses lazily. Writers outside the process
+ * (scp, manual edits, other processes) send no notice, so every read still does
+ * one stat and compares dev/ino/size/mtimeNs/ctimeNs. ctime moves on any content
+ * or utimes change, so a same-size swap with a restored mtime is still caught.
+ *
+ * The returned object is deep-frozen and shared across callers: read it, never
+ * mutate it. Copy first when a caller needs a modified version.
  */
-export function readFileVerifiedCached(file) {
-  if (!readCacheEnabled) {
-    try {
-      return fs.readFileSync(file, 'utf8')
-    } catch (err) {
-      if (isNotFound(err)) return null
-      throw err
-    }
-  }
-  let stat
-  try {
-    stat = fs.statSync(file)
-  } catch (err) {
-    readCache.delete(file)
-    parsedJsonCache.delete(file)
-    if (isNotFound(err)) return null
-    throw err
-  }
+const parsedJsonCache = new Map()
+
+function deepFreeze(value) {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value
+  for (const child of Object.values(value)) deepFreeze(child)
+  return Object.freeze(value)
+}
+
+function statSignature(stat) {
+  return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`
+}
+
+function parseFrozen(file) {
   let text
   try {
     text = fs.readFileSync(file, 'utf8')
   } catch (err) {
-    readCache.delete(file)
+    if (isNotFound(err)) return null
+    throw err
+  }
+  return deepFreeze(JSON.parse(text))
+}
+
+/**
+ * Parsed JSON shared across callers as one deep-frozen object. Missing file → null;
+ * corrupt JSON throws (and drops any stale entry) so each caller keeps its own fallback.
+ */
+export function readJsonParsedCached(file) {
+  if (!readCacheEnabled) return parseFrozen(file)
+  let stat
+  try {
+    stat = fs.statSync(file, { bigint: true })
+  } catch (err) {
     parsedJsonCache.delete(file)
     if (isNotFound(err)) return null
     throw err
   }
-  const hit = readCache.get(file)
-  if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size && hit.ino === stat.ino && hit.text === text) {
-    putReadCache(file, hit)
-    return hit.text
-  }
-  putReadCache(file, { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, text })
-  return text
-}
-
-const parsedJsonCache = new Map()
-
-function routingJsonDigest(text) {
-  return crypto.createHash('sha256').update(text).digest('hex')
-}
-
-/**
- * Parsed JSON with verified bytes and a digest-keyed parse cache. Missing file → null;
- * corrupt JSON throws (and drops any stale parse entry). Each call returns a fresh clone
- * so callers can mutate without cross-request pollution.
- */
-export function readJsonParsedCached(file) {
-  const text = readFileVerifiedCached(file)
-  if (text == null) return null
-  const digest = routingJsonDigest(text)
+  const sig = statSignature(stat)
   const hit = parsedJsonCache.get(file)
-  if (hit && hit.digest === digest) return structuredClone(hit.parsed)
-  let parsed
-  try {
-    parsed = JSON.parse(text)
-  } catch (err) {
-    parsedJsonCache.delete(file)
-    throw err
-  }
-  parsedJsonCache.set(file, { digest, parsed })
-  return structuredClone(parsed)
+  if (hit && hit.sig === sig) return hit.doc
+  parsedJsonCache.delete(file)
+  const doc = parseFrozen(file)
+  if (doc != null) parsedJsonCache.set(file, { sig, doc })
+  return doc
 }
 
 /** Parsed JSON for `file`. Missing file → null; corrupt JSON and other I/O throw. */
