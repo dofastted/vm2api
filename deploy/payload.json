@@ -1,6 +1,6 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.11.01-codex-image-kernel",
+  "release": "payload-2026.11.11-claude-321-upx",
   "files": [
     {
       "path": "bin/kin-kernel",
@@ -47,8 +47,8 @@
     {
       "path": "share/wrap-cli/cli-node",
       "asset": "cli-node",
-      "size": 27933052,
-      "sha256": "8484c4c58f4b7782a190f7cab7c8aa5d1f706ae26b2d2a5cafe81af070f0611b"
+      "size": 27934360,
+      "sha256": "e58c526f0f0e0521909b3cf501a987b653cc4d8747b3b4015a8953578043d687"
     },
     {
       "path": "share/wrap-cli/kin-kernel.bin",
@@ -85,6 +85,54 @@
       "asset": "kin-kernel-crag",
       "size": 9734168,
       "sha256": "5764a186e3778278a8733ecaf924211070968def7c6648c6f6ecf3b76120a537"
+    },
+    {
+      "path": "share/crag/kernels/v2/amd64/LICENSES.txt",
+      "asset": "crag-v2-amd64-LICENSES.txt",
+      "size": 514,
+      "sha256": "e0127f77b4e8ad7c2233b9079cdaa4d4bc11e79eb03ca880ceb1dbe2fced9068"
+    },
+    {
+      "path": "share/crag/kernels/v2/amd64/claude-code-2.1.321/LICENSE.md",
+      "asset": "crag-v2-amd64-claude-code-2.1.321-LICENSE.md",
+      "size": 147,
+      "sha256": "8ce94b9478bb9868f9641f818e06cd722fbe55d4c22e2d2ed11971b20146173a"
+    },
+    {
+      "path": "share/crag/kernels/v2/amd64/claude-code-2.1.321/claude",
+      "asset": "crag-v2-amd64-claude-code-2.1.321-claude",
+      "size": 341910032,
+      "sha256": "426c33815ca6645a772f722fbff10dbf2cbdb124a8aeab733c1365dbf8bbf61f"
+    },
+    {
+      "path": "share/crag/kernels/v2/amd64/crag-license-public.pem",
+      "asset": "crag-v2-amd64-crag-license-public.pem",
+      "size": 113,
+      "sha256": "a38372fb87af66678f7823538f2cf8b9fa7e0f3cbefcd612a4d5c47ebef10126"
+    },
+    {
+      "path": "share/crag/kernels/v2/amd64/crag-v2",
+      "asset": "crag-v2-amd64-crag-v2",
+      "size": 356276,
+      "sha256": "66553ead2937434db9dcc6b15d0a76049f6c64da7461bfa72a302e2b9d7fc678"
+    },
+    {
+      "path": "share/crag/kernels/v2/amd64/crag-v2.payload.enc",
+      "asset": "crag-v2-amd64-crag-v2.payload.enc",
+      "size": 2758180,
+      "sha256": "14ea9f988c5726d91631e9700c86b977852df2413975e66ac4c9adf75104a58e"
+    },
+    {
+      "path": "share/crag/kernels/v2/amd64/kernel.json.example",
+      "asset": "crag-v2-amd64-kernel.json.example",
+      "size": 806,
+      "sha256": "0c9397fe94231702611f87d260381575b225c561f3683a2c77d9e5016bb3985e"
+    },
+    {
+      "path": "share/crag/kernels/v2/amd64/manifest.json",
+      "asset": "crag-v2-amd64-manifest.json",
+      "size": 2467,
+      "sha256": "658c440d855bd632fce1a06d920b4ede73b7c3bab687d3311236c25eedaace3e"
     }
   ]
 }
