@@ -49,6 +49,10 @@ for name in ('kin-kernel', 'kin-codex-kernel'):
     assert 'not found' not in loaded.stdout + loaded.stderr, name + ': ' + loaded.stderr
 for name in ('cli-node', 'cc-node'):
     binary = root / 'image-wrap-cli' / name
+    # The pinned payload no longer ships cc-node (#967); check it only when present.
+    if name == 'cc-node' and not binary.exists():
+        print(name + ': absent (optional)')
+        continue
     elf(binary, 62)
     version = subprocess.check_output([str(binary), '--version'], text=True, timeout=60).strip()
     assert version, name

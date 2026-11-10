@@ -544,7 +544,11 @@ test('slot images use the pulled CLI pair with the factory cc-node fallback', (t
   fs.writeFileSync(factoryCc, '#!/bin/sh\n')
   assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'slot_payload_invalid' })
   fs.unlinkSync(factoryCc)
-  assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'slot_payload_missing' })
+  const withoutCc = slotImageSpec(root, 'ubuntu-24.04')
+  assert.ok(
+    withoutCc.files.every((entry) => entry.name !== 'opt/kin/cc-node'),
+    'missing cc-node must not block slot image preparation',
+  )
 
   const selectedCc = path.join(selected, 'cc-node')
   fakeElf(selectedCc, 3)
@@ -555,6 +559,13 @@ test('slot images use the pulled CLI pair with the factory cc-node fallback', (t
   )
   fs.writeFileSync(selectedCc, '#!/bin/sh\n')
   assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'slot_payload_invalid' })
+  fs.unlinkSync(path.join(cache, 'current-amd64.json'))
+  fs.unlinkSync(path.join(root, 'share/wrap-cli/cli-node'))
+  assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'slot_payload_missing' })
+  const kernelBin = path.join(root, 'bin/kin-kernel')
+  fs.unlinkSync(kernelBin)
+  fakeElf(path.join(root, 'share/wrap-cli/cli-node'), 1)
+  assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'slot_payload_missing' })
 })
 
 test('optional CRAG publication skips absent packages while explicit CRAG remains required', async (t) => {
