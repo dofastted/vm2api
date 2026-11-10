@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.4.060 — 2026-11-10
+
+- Claude 订阅档从 OAuth 的订阅元数据和官方 `/api/oauth/profile` 识别，不再用 Fable 是否可用、用量窗口或旧调度档推断。面板保留 `subscription_type` 和 `rate_limit_tier`，有数据时显示 Max 5x/20x，没有就保持未识别。调度策略和 Codex 档不变。
+
+已部署机升级：更新 Node 控制面后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。不要 `docker rm` 槽。
+
 ## 1.4.059 — 2026-11-10
 
 - Codex 模型 `codex-auto-review` 默认改写成 `gpt-6-luna`。
