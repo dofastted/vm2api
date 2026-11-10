@@ -102,10 +102,13 @@ export function slotPayload(projectRoot) {
     { name: 'opt/kin/kin-kernel', body: Buffer.from(wrapKernelWrapperScript()), mode: 0o755 },
     { name: 'opt/kin/kin-kernel.bin', src: kernel.path, mode: 0o755 },
   ]
-  for (const bin of ['cli-node', 'cc-node']) {
-    const src = cliPayloadPath(projectRoot, bin, wrapDir)
-    requireElf(src, bin)
-    files.push({ name: `opt/kin/${bin}`, src, mode: 0o755 })
+  const cliSrc = cliPayloadPath(projectRoot, 'cli-node', wrapDir)
+  requireElf(cliSrc, 'cli-node')
+  files.push({ name: 'opt/kin/cli-node', src: cliSrc, mode: 0o755 })
+  const ccSrc = cliPayloadPath(projectRoot, 'cc-node', wrapDir)
+  if (fs.existsSync(ccSrc)) {
+    requireElf(ccSrc, 'cc-node')
+    files.push({ name: 'opt/kin/cc-node', src: ccSrc, mode: 0o755 })
   }
   const glibc = path.join(wrapDir, WRAP_GLIBC_DIR)
   if (fs.existsSync(glibc)) {
