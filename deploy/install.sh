@@ -461,7 +461,7 @@ sync_wrap_cli() {
     echo "  curl -sS -X POST http://127.0.0.1:${port}/api/panel/wrap-cli/sync -H \"Authorization: Bearer \$VM2API_API_KEY\" -H 'Content-Type: application/json' -d '{\"restart\":true}'"
     return 1
   fi
-  info "检查本机槽和集群槽的 kernel、cli-node、cc-node 是否变化"
+  info "检查本机槽和集群槽的 kernel、cli-node 是否变化"
   response="$(curl -fsS -X POST "http://127.0.0.1:${port}/api/panel/wrap-cli/sync" \
     -H "Authorization: Bearer ${key}" \
     -H "Content-Type: application/json" \

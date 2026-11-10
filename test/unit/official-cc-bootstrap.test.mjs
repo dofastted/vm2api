@@ -178,8 +178,8 @@ test('native bootstrap runs the selected CLI without cli-node identity overrides
     assert.equal(
       args[args.indexOf('kin-30') + 1],
       vm.node_id
-        ? '/opt/kin-live/crag-v2/claude-code-2.1.317/claude'
-        : '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude',
+        ? '/opt/kin-live/crag-v2/claude-code-2.1.321/claude'
+        : '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude',
     )
     assert.equal(
       args.some((arg) => arg.startsWith('CLAUDE_CODE_VERSION=')),

@@ -18,7 +18,7 @@ import { execDetached, inspectContainerOrNull } from '../cluster/docker-remote.m
 import {
   CONTAINER_CLI_NODE_BIN,
   CONTAINER_CC_NODE_BIN,
-  CONTAINER_CRAG_V2_CLAUDE,
+  LOCAL_CRAG_CLAUDE,
   REMOTE_CRAG_CLAUDE,
   resolveSlotClaude,
 } from '../vm/slot-engine.mjs'
@@ -203,7 +203,7 @@ export async function stopClaudeAuthLoginSession(projectRoot, vmId, { execDetach
         host.bins.cc,
         CONTAINER_CLI_NODE_BIN,
         CONTAINER_CC_NODE_BIN,
-        CONTAINER_CRAG_V2_CLAUDE,
+        LOCAL_CRAG_CLAUDE,
         REMOTE_CRAG_CLAUDE,
       ]),
     ]

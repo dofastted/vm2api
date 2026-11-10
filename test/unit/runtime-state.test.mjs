@@ -3,6 +3,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import http from 'node:http'
+import { localDocker } from '../../src/lib/cluster/docker-remote.mjs'
 import { raiseDockerSlotMemory } from '../../src/lib/vm/docker-slot-memory.mjs'
 import { powerOnSlot } from '../../src/lib/vm/slot-recovery.mjs'
 import { runtimePatch } from '../../src/lib/vm/vm-runtime.mjs'
@@ -122,17 +124,43 @@ test('power-on preserves a verified memory raise made while boot readiness is pe
     },
   })
   await ready.promise
-  let updated = false
-  const raised = raiseDockerSlotMemory(options.projectRoot, getVm(options.projectRoot, options.id), '4g', {
-    execImpl: (argv) => {
-      if (argv[1] === 'update') updated = true
-      const bytes = (updated ? 4 : 2) * 1024 ** 3
-      return {
-        ok: true,
-        stdout: argv[1] === 'inspect' ? `${bytes} ${bytes} true` : argv[1] === 'exec' ? String(bytes) : '',
-        stderr: '',
-      }
-    },
+  let bytes = 2 * 1024 ** 3
+  const socketPath = path.join(options.projectRoot, 'docker.sock')
+  const sockets = new Set()
+  const server = http.createServer(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    if (req.url.endsWith('/update')) {
+      bytes = JSON.parse(Buffer.concat(chunks)).Memory
+      return res.end('{"Warnings":null}')
+    }
+    if (req.url.endsWith('/exec')) return res.writeHead(201).end(JSON.stringify({ Id: 'e'.repeat(64) }))
+    if (req.url.endsWith('/start')) {
+      const body = Buffer.from(String(bytes))
+      const header = Buffer.alloc(8)
+      header[0] = 1
+      header.writeUInt32BE(body.length, 4)
+      return res.end(Buffer.concat([header, body]))
+    }
+    res.end(
+      JSON.stringify(
+        req.url.startsWith('/exec/')
+          ? { Running: false, ExitCode: 0 }
+          : { Id: 'c'.repeat(64), HostConfig: { Memory: bytes, MemorySwap: bytes }, State: { Running: true } },
+      ),
+    )
+  })
+  server.on('connection', (socket) => {
+    sockets.add(socket)
+    socket.on('close', () => sockets.delete(socket))
+  })
+  await new Promise((resolve) => server.listen(socketPath, resolve))
+  t.after(async () => {
+    for (const socket of sockets) socket.destroy()
+    await new Promise((resolve) => server.close(resolve))
+  })
+  const raised = await raiseDockerSlotMemory(options.projectRoot, getVm(options.projectRoot, options.id), '4g', {
+    connect: localDocker(socketPath),
   })
   assert.equal(raised.ok, true)
   resume.resolve()

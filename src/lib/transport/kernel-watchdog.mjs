@@ -257,7 +257,7 @@ export function createKernelWatchdog({
     } else {
       nodeProbeFailures.delete(vm.id)
     }
-    // cc-node is the crag worker. Restarting a live kernel SIGKILLs it.
+    // The cc dataplane's worker is cc-node. Restarting a live kernel SIGKILLs it.
     if (dataplaneUsesCcNode(exec) && rustKernelProcessUp(current)) return
     if (!rustKernelNeedsRestart(current)) {
       // Healthy again after a fault means someone fixed it: start a fresh budget.

@@ -94,7 +94,7 @@ test('auth login session stays reusable until force regenerate or login_ready', 
 test('auth readiness checks the selected native CLI, never the installed standard CLI', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-auth-native-'))
   const vm = { id: 'vm-01', dataplane: 'crag', crag_kernel_version: 'v2' }
-  const cli = path.join(root, 'vms/vm-01/cli-home/.kin/crag-v2/claude-code-2.1.317/claude')
+  const cli = path.join(root, 'vms/vm-01/cli-home/.kin/crag-v2/claude-code-2.1.321/claude')
   try {
     fs.mkdirSync(path.dirname(cli), { recursive: true })
     fs.writeFileSync(path.join(root, 'vms/vm-01/cli-home/.kin/cli-node'), '')
@@ -121,7 +121,7 @@ test('auth readiness checks the selected native CLI, never the installed standar
 test('native auth dispatch passes the selected executable and leaves its version untouched', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-auth-native-start-'))
   const vm = { id: 'vm-01', dataplane: 'crag', crag_kernel_version: 'v2' }
-  const cli = path.join(root, 'vms/vm-01/cli-home/.kin/crag-v2/claude-code-2.1.317/claude')
+  const cli = path.join(root, 'vms/vm-01/cli-home/.kin/crag-v2/claude-code-2.1.321/claude')
   try {
     fs.mkdirSync(path.dirname(cli), { recursive: true })
     fs.writeFileSync(cli, '')
@@ -149,7 +149,7 @@ test('native auth dispatch passes the selected executable and leaves its version
       },
     })
     assert.match(result.auth_url, /native=1/)
-    assert.equal(env.KIN_CLI_BIN, '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude')
+    assert.equal(env.KIN_CLI_BIN, '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude')
     const argv = JSON.parse(env.KIN_DOCKER_ARGV)
     assert.deepEqual(argv.slice(-3), [env.KIN_CLI_BIN, 'auth', 'login'])
     assert.equal(

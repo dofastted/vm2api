@@ -101,7 +101,7 @@ test('print follows the kernel enabled on the VM, not the global dataplane', () 
   const routingOnly = { dataplane: 'crag', crag_kernel_version: 'v2' }
   assert.equal(cragV2KernelActive({ vm: { dataplane: 'wrap' }, kernelConfig: routingOnly }), false)
   assert.equal(cragV2KernelActive({ vm: { dataplane: 'cc' } }), false)
-  assert.equal(cragV2KernelActive({ vm: { dataplane: 'crag', crag_kernel_version: 'legacy' } }), false)
+  assert.equal(cragV2KernelActive({ vm: { dataplane: 'crag', crag_kernel_version: 'legacy' } }), true)
   assert.equal(cragV2KernelActive({ vm: {} }), false)
   assert.equal(cragV2KernelActive({ vm: { dataplane: 'crag', crag_kernel_version: 'v2' } }), true)
   assert.equal(

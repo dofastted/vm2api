@@ -20,10 +20,9 @@ export const INFERENCE_ENGINES = Object.freeze(['rust'])
 export const SLOT_PERSONA_PRESETS = Object.freeze(['official', 'official_full', 'zero', OFFICIAL_303_PRESET])
 export const OFFICIAL_CC_INFERENCES = Object.freeze(['http', 'cli-hop'])
 export const KERNEL_DATAPLANES = Object.freeze(['wrap', 'cc', 'crag'])
-export const CRAG_KERNEL_VERSIONS = Object.freeze(['legacy', 'v2'])
+export const CRAG_KERNEL_VERSIONS = Object.freeze(['v2'])
 export const CONTAINER_CLI_NODE_BIN = '/home/kincli/.kin/cli-node'
 export const CONTAINER_CC_NODE_BIN = '/home/kincli/.kin/cc-node'
-export const CONTAINER_CRAG_CLAUDE_BIN = CONTAINER_CC_NODE_BIN
 // Image copies under /opt/kin stay for old containers. New commands and the
 // CLI path use the slot-bin mount, so a kernel pull updates bytes without a
 // new image. The wrapper is replaced by rename, never unlinked first.
@@ -135,7 +134,7 @@ export function normalizeInferenceConfig(raw = {}) {
     session_slots: normalizeSessionSlots(raw.session_slots),
     session_idle_ttl_seconds: normalizeSessionIdleTtlSeconds(raw.session_idle_ttl_seconds),
     dataplane: normalizeKernelDataplane(raw.dataplane),
-    crag_kernel_version: normalizeCragKernelVersion(raw.crag_kernel_version) || 'legacy',
+    crag_kernel_version: normalizeCragKernelVersion(raw.crag_kernel_version) || 'v2',
   }
 }
 
@@ -171,17 +170,16 @@ export function resolveKernelDataplane(vm, routing = {}) {
   return normalizeKernelDataplane(routing?.inference?.dataplane)
 }
 
-/** Public ids are `crag-legacy` and `crag-v2`. Omitted stays legacy; a VM pin beats routing. */
+/** Public id is `crag-v2`. Omitted and stored legacy both run native Claude. */
 export function normalizeCragKernelVersion(value, { inherit = false } = {}) {
   const raw = String(value ?? '')
     .trim()
     .toLowerCase()
     .replaceAll('_', '-')
   if (!raw || raw === 'inherit' || raw === 'global' || raw === 'default' || raw === 'auto') {
-    return inherit ? '' : 'legacy'
+    return inherit ? '' : 'v2'
   }
-  if (raw === 'legacy' || raw === 'crag-legacy' || raw === 'elf') return 'legacy'
-  if (raw === 'v2' || raw === 'crag-v2') return 'v2'
+  if (raw === 'legacy' || raw === 'crag-legacy' || raw === 'elf' || raw === 'v2' || raw === 'crag-v2') return 'v2'
   return null
 }
 
@@ -191,14 +189,14 @@ export function resolveCragKernelVersion(vm, routing = {}) {
   if (fromVm) return fromVm
   const fromRouting = normalizeCragKernelVersion(routing?.inference?.crag_kernel_version, { inherit: true })
   if (fromRouting) return fromRouting
-  return 'legacy'
+  return 'v2'
 }
 
 /** Terminal and OAuth must run the same CLI family as the selected kernel. */
 export function resolveSlotClaude(vm, routing = {}, host = {}) {
   const dataplane = resolveKernelDataplane(vm, routing)
   const native = dataplane === 'crag' && resolveCragKernelVersion(vm, routing) === 'v2'
-  if (native) return { bin: host.bakedKernel ? REMOTE_CRAG_CLAUDE : CONTAINER_CRAG_V2_CLAUDE, native: true }
+  if (native) return { bin: host.bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE, native: true }
   return {
     bin: dataplane === 'wrap' ? host.bins?.cli || CONTAINER_CLI_NODE_BIN : host.bins?.cc || CONTAINER_CC_NODE_BIN,
     native: false,
@@ -208,7 +206,7 @@ export function resolveSlotClaude(vm, routing = {}, host = {}) {
 export function parseCragKernelVersionPatch(value) {
   if (value == null || value === '') return { ok: true, value: '' }
   const parsed = normalizeCragKernelVersion(value, { inherit: true })
-  if (parsed == null) return { ok: false, error: 'crag_kernel_version must be legacy or v2' }
+  if (parsed == null) return { ok: false, error: 'crag_kernel_version must be v2' }
   if (!parsed) return { ok: true, value: '' }
   return { ok: true, value: parsed }
 }
@@ -420,7 +418,7 @@ export function validateInferenceRoutingPatch(body = {}) {
   if (Object.prototype.hasOwnProperty.call(body.inference, 'crag_kernel_version')) {
     const parsed = parseCragKernelVersionPatch(body.inference.crag_kernel_version)
     if (!parsed.ok) errors.push(parsed.error)
-    else if (!parsed.value) errors.push('inference.crag_kernel_version 必须是 legacy 或 v2')
+    else if (!parsed.value) errors.push('inference.crag_kernel_version 必须是 v2')
   }
   return errors
 }

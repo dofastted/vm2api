@@ -1312,7 +1312,7 @@ function writeTier(root, id, tier, extras = {}) {
   fs.writeFileSync(file, JSON.stringify(vm))
 }
 
-test('fable skips pro and unknown, lands on max', async (t) => {
+test('fable does not skip a pro slot when a max slot is also up', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   writeTier(root, 'vm-01', 'pro')
@@ -1320,7 +1320,7 @@ test('fable skips pro and unknown, lands on max', async (t) => {
   const pool = scheduler(root)
   const selected = await pool.selectAndReserve({ model: 'claude-fable-5', allowWait: false })
   assert.equal(selected.ok, true)
-  assert.equal(selected.vmId, 'vm-02')
+  assert.equal(selected.vmId, 'vm-01')
   selected.release()
 })
 
@@ -1348,7 +1348,7 @@ test('fable skips a Max account recently denied that model', async (t) => {
   selected.release()
 })
 
-test('fable with only pro slots returns fable_requires_max', async (t) => {
+test('fable lands on a pro slot', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   writeTier(root, 'vm-01', 'pro')
@@ -1357,8 +1357,9 @@ test('fable with only pro slots returns fable_requires_max', async (t) => {
     model: 'claude-fable-5',
     allowWait: false,
   })
-  assert.equal(selected.ok, false)
-  assert.equal(selected.reason, 'fable_requires_max')
+  assert.equal(selected.ok, true)
+  assert.ok(selected.vmId === 'vm-01' || selected.vmId === 'vm-02')
+  selected.release()
 })
 
 test('sonnet still lands on a pro slot', async (t) => {
@@ -1396,7 +1397,7 @@ test('allowed_models whitelist skips other families', async (t) => {
 test('allowed_models prefix matches dated fable ids', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  writeTier(root, 'vm-01', 'pro')
+  writeTier(root, 'vm-01', 'pro', { allowed_models: ['claude-sonnet-5'] })
   writeTier(root, 'vm-02', 'max', { allowed_models: ['claude-fable-5'] })
   const selected = await scheduler(root).selectAndReserve({
     model: 'claude-fable-5-20260801',

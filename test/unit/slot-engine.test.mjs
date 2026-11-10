@@ -98,22 +98,26 @@ test('kernel dataplane defaults wrap and accepts cc and crag', () => {
   assert.equal(cragPatch.patch.dataplane, 'crag')
 })
 
-test('crag kernel version stays legacy unless the VM or routing pins v2', () => {
-  assert.equal(resolveCragKernelVersion({}, {}), 'legacy')
+test('crag kernel version is native v2, including a stored legacy pin', () => {
+  assert.equal(resolveCragKernelVersion({}, {}), 'v2')
   assert.equal(resolveCragKernelVersion({}, { inference: { crag_kernel_version: 'crag-v2' } }), 'v2')
   assert.equal(
     resolveCragKernelVersion({ crag_kernel_version: 'legacy' }, { inference: { crag_kernel_version: 'v2' } }),
-    'legacy',
+    'v2',
   )
+  assert.equal(resolveCragKernelVersion({ crag_kernel_version: 'elf' }, {}), 'v2')
   assert.equal(resolveCragKernelVersion({ crag_kernel_version: 'crag-v2' }, {}), 'v2')
-  assert.equal(normalizeInferenceConfig({}).crag_kernel_version, 'legacy')
+  assert.equal(normalizeInferenceConfig({}).crag_kernel_version, 'v2')
   assert.equal(parseSlotEnginePolicyPatch({ crag_kernel_version: 'nope' }).ok, false)
+  const legacy = parseSlotEnginePolicyPatch({ crag_kernel_version: 'legacy' })
+  assert.equal(legacy.ok, true)
+  assert.equal(legacy.patch.crag_kernel_version, 'v2')
   const patch = parseSlotEnginePolicyPatch({ dataplane: 'crag', crag_kernel_version: 'v2' })
   assert.equal(patch.ok, true)
   assert.equal(patch.patch.dataplane, 'crag')
   assert.equal(patch.patch.crag_kernel_version, 'v2')
   assert.deepEqual(validateInferenceRoutingPatch({ inference: { crag_kernel_version: '' } }), [
-    'inference.crag_kernel_version 必须是 legacy 或 v2',
+    'inference.crag_kernel_version 必须是 v2',
   ])
 })
 
