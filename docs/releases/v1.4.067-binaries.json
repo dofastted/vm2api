@@ -1,0 +1,21 @@
+{
+  "claude_version": "2.1.321",
+  "cli_source_commit": "4154b4e6",
+  "crag_native_source_commit": "41254045",
+  "crag_packaging_commit": "4c1eda1c",
+  "upx": "5.0.2",
+  "upx_options": [
+    "--best",
+    "--lzma"
+  ],
+  "official_claude_unmodified": true,
+  "cli_plain_sha256": "c87fd25b6815671aed1044290bf09113dcab8da3e1d7dd940745043749f095e7",
+  "cli_upx_sha256": "e58c526f0f0e0521909b3cf501a987b653cc4d8747b3b4015a8953578043d687",
+  "crag_core_upx_sha256": "03c8e44e7f8a63d68ea97cd556f091590b97bf3b095484907625cd763af3310f",
+  "crag_bootstrap_upx_sha256": "66553ead2937434db9dcc6b15d0a76049f6c64da7461bfa72a302e2b9d7fc678",
+  "crag_payload_ciphertext_sha256": "14ea9f988c5726d91631e9700c86b977852df2413975e66ac4c9adf75104a58e",
+  "builder": {
+    "mode": "container",
+    "image": "rust:1-bookworm@sha256:c9155318d07341301a78b45ecdd81af2e43b8b297d64e8fd4c5e80d7735607c3"
+  }
+}
