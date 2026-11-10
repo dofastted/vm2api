@@ -2,8 +2,16 @@
 
 ## Unreleased
 
-- CRAG v2 子进程连 OAuth token 主机（`platform.claude.com` / `console.anthropic.com` 的 443）时先写 `KIN-BLOCK`。kin-egress 在拨上游 SOCKS 之前关掉这条连接，刷新请求不出站。登录、`kin-oauth-auth` 和 `kin-worker oauth refresh` 不写标记，不受影响。
+## 1.4.062 — 2026-11-11
+
+- CRAG v2 子进程连 OAuth token 主机（`platform.claude.com` / `console.anthropic.com` 的 443）时先写 `KIN-BLOCK`。kin-egress 在拨上游 SOCKS 之前关掉这条连接，刷新请求不出站。登录、`kin-oauth-auth` 和 `kin-worker oauth refresh` 不写标记，不受影响。随包发布的 `kin-egress` 仍是 `deploy/payload.json` 里钉住的那枚，这次不换二进制。
 - Fable 不再要求 Max 订阅。Pro 和未标明等级的槽可以接 `claude-fable-*`；型号拒绝和允许列表仍生效。号池空了按原来的冷却或无可用账号返回，不再一律报 `fable_requires_max`。
+- 集群节点可以只拉 CLI、不带可选 CRAG 包。拉完 CLI 后从工厂解析 cc-node，不再要求过时的 cc-node payload。
+- CRAG 槽一律走原生 Claude。面板终端和 OAuth 跟随该槽当前选中的内核。工具续接保留公开思考块。
+- 已停机的槽不再显示成「调度开」。Docker 内存上调改为异步，不再卡住面板请求。
+- 签名二进制更新会核对每一份槽内副本。OAuth 订阅档只认 profile 证据，不再用模型是否调用成功来推断。
+
+已部署机升级：更新 Node 控制面与 `web/dist` 后重启。cli-node、kernel、kin-egress 的 payload 哈希未变，不必 `fetch:payload`，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。不要 `docker rm` 槽。
 
 ## 1.4.061 — 2026-11-10
 
