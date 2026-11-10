@@ -125,6 +125,9 @@
       "max_concurrency": 2,
       "max_rpm": 0,
       "max_sessions": 0
+    },
+    "model_mappings": {
+      "codex-auto-review": "gpt-6-luna"
     }
   },
 
