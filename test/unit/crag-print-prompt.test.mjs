@@ -7,7 +7,7 @@ import { validatePersonaRoutingPatch } from '../../src/lib/admin/panel-api.mjs'
 import {
   callerSystemTail,
   cragV2KernelActive,
-  omitClientIdleNudge,
+  omitContinuationSystemSuffix,
   prepareCragPrintBody,
   readSlotKernelConfig,
   resolveCragPrintPersona,
@@ -62,28 +62,37 @@ test('zero replace does not leave a bare system, and refuses argv overflow', () 
   assert.equal(longAppend.crag_prompt.text.length, 64 * 1024 + 1)
 })
 
-test('a tool continuation drops the client idle nudge and keeps the environment', () => {
+test('a continuation drops a system suffix added after an in-place environment', () => {
+  const env = '# Environment stay'
   const nudge = "The user hasn't heard from you in a while. As you continue, keep them updated."
-  const body = {
-    model: 'claude-opus-5-5',
+  const mcp = '# MCP Server Instructions\n\nThe following MCP servers have provided instructions'
+  const turn = [
+    { role: 'user', content: [{ type: 'text', text: 'go' }] },
+    { role: 'system', content: env },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'a', name: 'Bash', input: {} }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a', content: 'ok' }] },
+  ]
+  for (const suffix of [nudge, mcp]) {
+    const out = omitContinuationSystemSuffix({ messages: [...turn, { role: 'system', content: suffix }] })
+    assert.equal(
+      out.messages.some((message) => message.content === suffix),
+      false,
+    )
+    assert.equal(
+      out.messages.some((message) => message.content === env),
+      true,
+    )
+  }
+  const moved = omitContinuationSystemSuffix({
     messages: [
       { role: 'user', content: [{ type: 'text', text: 'go' }] },
-      { role: 'system', content: '# Environment stay' },
       { role: 'assistant', content: [{ type: 'tool_use', id: 'a', name: 'Bash', input: {} }] },
       { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a', content: 'ok' }] },
-      { role: 'system', content: nudge },
+      { role: 'system', content: env },
     ],
-  }
-  const out = omitClientIdleNudge(body)
-  assert.equal(
-    out.messages.some((message) => message.content === nudge),
-    false,
-  )
-  assert.equal(
-    out.messages.some((message) => message.content === '# Environment stay'),
-    true,
-  )
-  const fresh = omitClientIdleNudge({
+  })
+  assert.equal(moved.messages.at(-1).content, env)
+  const fresh = omitContinuationSystemSuffix({
     messages: [
       { role: 'user', content: [{ type: 'text', text: 'go' }] },
       { role: 'system', content: nudge },
