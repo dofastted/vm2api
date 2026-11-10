@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- CRAG 续接在环境系统消息还留在原位时，丢掉工具结果后面新加的系统消息（MCP server instructions，以及 “hasn't heard from you”）。这条后缀不在工具调用停住时的指纹里，原样转发会让内核返回 `tool_result history mismatch`。环境被挪到工具结果后面时仍保留。新鲜请求不改。
+- CRAG 官方请求不再在网关删 `messages` 里的系统块。原生 Claude Code 2.1.321 的 Environment 在 system 第四块里；客户端还会在工具结果后追加 MCP 说明和 idle 提示。这些块要原样进 CRAG。PR #6 从 system 和每条 message 读取调用方写过的 cwd、git、platform、shell、OS，没写的不拿宿主机填。指纹是否把工具结果后的新系统块算进续接，由 CRAG 自己决定，不靠删正文。
 
 
 ## 1.4.063 — 2026-11-11

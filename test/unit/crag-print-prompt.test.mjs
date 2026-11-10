@@ -7,7 +7,6 @@ import { validatePersonaRoutingPatch } from '../../src/lib/admin/panel-api.mjs'
 import {
   callerSystemTail,
   cragV2KernelActive,
-  omitContinuationSystemSuffix,
   prepareCragPrintBody,
   readSlotKernelConfig,
   resolveCragPrintPersona,
@@ -60,62 +59,6 @@ test('zero replace does not leave a bare system, and refuses argv overflow', () 
   const longAppend = prepareCragPrintBody({ system: 'y'.repeat(64 * 1024 + 1) }, { preset: 'official_full' })
   assert.equal(longAppend.crag_prompt.mode, 'append')
   assert.equal(longAppend.crag_prompt.text.length, 64 * 1024 + 1)
-})
-
-test('a continuation drops a system suffix added after an in-place environment', () => {
-  const env = '# Environment stay'
-  const nudge = "The user hasn't heard from you in a while. As you continue, keep them updated."
-  const mcp = '# MCP Server Instructions\n\nThe following MCP servers have provided instructions'
-  const turn = [
-    { role: 'user', content: [{ type: 'text', text: 'go' }] },
-    { role: 'system', content: env },
-    { role: 'assistant', content: [{ type: 'tool_use', id: 'a', name: 'Bash', input: {} }] },
-    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a', content: 'ok' }] },
-  ]
-  for (const suffix of [nudge, mcp]) {
-    const out = omitContinuationSystemSuffix({ messages: [...turn, { role: 'system', content: suffix }] })
-    assert.equal(
-      out.messages.some((message) => message.content === suffix),
-      false,
-    )
-    assert.equal(
-      out.messages.some((message) => message.content === env),
-      true,
-    )
-  }
-  const later = omitContinuationSystemSuffix({
-    messages: [
-      ...turn,
-      { role: 'assistant', content: [{ type: 'tool_use', id: 'b', name: 'Bash', input: {} }] },
-      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'b', content: 'ok' }] },
-      { role: 'system', content: nudge },
-    ],
-  })
-  assert.equal(
-    later.messages.some((message) => message.content === nudge),
-    false,
-  )
-  assert.equal(
-    later.messages.some((message) => message.content === env),
-    true,
-  )
-
-  const moved = omitContinuationSystemSuffix({
-    messages: [
-      { role: 'user', content: [{ type: 'text', text: 'go' }] },
-      { role: 'assistant', content: [{ type: 'tool_use', id: 'a', name: 'Bash', input: {} }] },
-      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a', content: 'ok' }] },
-      { role: 'system', content: env },
-    ],
-  })
-  assert.equal(moved.messages.at(-1).content, env)
-  const fresh = omitContinuationSystemSuffix({
-    messages: [
-      { role: 'user', content: [{ type: 'text', text: 'go' }] },
-      { role: 'system', content: nudge },
-    ],
-  })
-  assert.equal(fresh.messages.at(-1).content, nudge)
 })
 
 test('official passthrough does not append the caller system', () => {
