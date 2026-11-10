@@ -130,6 +130,39 @@ export function cragPromptTooLarge(bytes) {
   return error
 }
 
+const CLIENT_IDLE_NUDGE = "The user hasn't heard from you in a while."
+
+function messagePlainText(content) {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content.map((block) => (typeof block === 'string' ? block : block?.text || '')).join('')
+}
+
+function pureToolResultTurn(message) {
+  const blocks = Array.isArray(message?.content) ? message.content : []
+  return message?.role === 'user' && blocks.length > 0 && blocks.every((block) => block?.type === 'tool_result')
+}
+
+/**
+ * Claude Code appends this reminder after a tool_result. CRAG hashes every
+ * system message after the previous user turn, so the reminder no longer
+ * matches the history parked when the tool call was published. The waiting
+ * TUI already has the turn; the reminder is not the slot environment.
+ * A fresh request keeps it, because that path renders the text into the prompt.
+ */
+export function omitClientIdleNudge(body) {
+  const messages = body?.messages
+  if (!Array.isArray(messages)) return body
+  const last = [...messages].reverse().find((message) => message?.role !== 'system')
+  if (!pureToolResultTurn(last)) return body
+  const kept = messages.filter(
+    (message) =>
+      message?.role !== 'system' || !messagePlainText(message.content).trimStart().startsWith(CLIENT_IDLE_NUDGE),
+  )
+  if (kept.length === messages.length) return body
+  return { ...body, messages: kept }
+}
+
 /**
  * @param {object} body caller body, before cli-node persona injection
  * @param {{ preset?: 'official_full' | 'zero', officialPassthrough?: boolean }} [options]

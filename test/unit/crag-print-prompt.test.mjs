@@ -7,6 +7,7 @@ import { validatePersonaRoutingPatch } from '../../src/lib/admin/panel-api.mjs'
 import {
   callerSystemTail,
   cragV2KernelActive,
+  omitClientIdleNudge,
   prepareCragPrintBody,
   readSlotKernelConfig,
   resolveCragPrintPersona,
@@ -59,6 +60,36 @@ test('zero replace does not leave a bare system, and refuses argv overflow', () 
   const longAppend = prepareCragPrintBody({ system: 'y'.repeat(64 * 1024 + 1) }, { preset: 'official_full' })
   assert.equal(longAppend.crag_prompt.mode, 'append')
   assert.equal(longAppend.crag_prompt.text.length, 64 * 1024 + 1)
+})
+
+test('a tool continuation drops the client idle nudge and keeps the environment', () => {
+  const nudge = "The user hasn't heard from you in a while. As you continue, keep them updated."
+  const body = {
+    model: 'claude-opus-5-5',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'go' }] },
+      { role: 'system', content: '# Environment stay' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'a', name: 'Bash', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'a', content: 'ok' }] },
+      { role: 'system', content: nudge },
+    ],
+  }
+  const out = omitClientIdleNudge(body)
+  assert.equal(
+    out.messages.some((message) => message.content === nudge),
+    false,
+  )
+  assert.equal(
+    out.messages.some((message) => message.content === '# Environment stay'),
+    true,
+  )
+  const fresh = omitClientIdleNudge({
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'go' }] },
+      { role: 'system', content: nudge },
+    ],
+  })
+  assert.equal(fresh.messages.at(-1).content, nudge)
 })
 
 test('official passthrough does not append the caller system', () => {

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- CRAG 续接不再把 Claude Code 追加的 “hasn't heard from you” 系统提示算进历史。这条提示不在工具调用停住时的指纹里，原样转发会让内核返回 `tool_result history mismatch`。槽的 Environment 系统消息保留。新鲜请求仍把这条提示写进 TUI。
+
 ## 1.4.064 — 2026-11-11
 
 - 修复指定 Claude 订阅档位或账号作为风控范围时，普通 Messages 请求返回 503：attempt 会话 ID 在范围审核之前初始化（#952）。

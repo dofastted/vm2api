@@ -94,6 +94,7 @@ import { officialMessagesBody } from './anthropic-messages.mjs'
 import { prepareOutboundEnvelope, prepareCliHopBody, prepareCliPersonaInput } from './outbound-attempt.mjs'
 import {
   cragV2KernelActive,
+  omitClientIdleNudge,
   prepareCragPrintBody,
   readSlotKernelConfig,
   resolveCragPrintPersona,
@@ -1680,7 +1681,7 @@ export function createHandleProtocol(deps) {
               // The CRAG kernel fingerprints the public stream it already sent,
               // including thinking. Rewriting an unrecorded signature into text
               // makes the tool continuation fail with tool_result history mismatch.
-              let source = shallowCopyBody(cragStandard.body)
+              let source = omitClientIdleNudge(shallowCopyBody(cragStandard.body))
               for (const policy of extra.repairs || []) source = repairAnthropicRequest(source, policy)
               hopBody = prepareCragPrintBody(source, { preset: cragPersona, officialPassthrough })
               hopBody = await materializeRemoteImageSources(hopBody)
