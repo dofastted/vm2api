@@ -115,6 +115,146 @@ export async function dockerJson(connect, opts, okStatuses = [200]) {
   return JSON.parse(res.body.toString('utf8'))
 }
 
+/** Bound new short operations, including SSH channel creation (dockerRequest's
+ * own timer starts after connect). A late connection must never send a request.
+ */
+export async function withDockerDeadline(connect, operation, timeoutMs = 15_000) {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new RangeError('invalid Docker deadline')
+  const timeout = new ClusterError(504, 'docker_timeout', 'Docker API 操作超时（含连接建立）')
+  const streams = new Set()
+  let active = true
+  let timer
+  const scopedConnect = async () => {
+    if (!active) throw timeout
+    const stream = await connect()
+    if (!active) {
+      stream.destroy()
+      throw timeout
+    }
+    streams.add(stream)
+    stream.once('close', () => streams.delete(stream))
+    return stream
+  }
+  try {
+    return await Promise.race([
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          active = false
+          reject(timeout)
+          for (const stream of streams) stream.destroy()
+        }, timeoutMs)
+      }),
+      Promise.resolve().then(() => operation(scopedConnect)),
+    ])
+  } finally {
+    active = false
+    clearTimeout(timer)
+    for (const stream of streams) stream.destroy()
+  }
+}
+
+/** Update only the two memory limits; callers still verify HostConfig/cgroup. */
+export async function updateContainerMemory(connect, id, { memory, memorySwap }, { timeoutMs = 15_000 } = {}) {
+  if (!Number.isSafeInteger(memory) || memory <= 0 || !Number.isSafeInteger(memorySwap) || memorySwap < -1) {
+    throw new ClusterError(400, 'invalid_memory', 'Docker 内存上限不合法')
+  }
+  return withDockerDeadline(
+    connect,
+    async (scopedConnect) => {
+      const result = await dockerJson(scopedConnect, {
+        method: 'POST',
+        path: `${containerPath(id)}/update`,
+        body: { Memory: memory, MemorySwap: memorySwap },
+        timeoutMs,
+      })
+      return { warnings: Array.isArray(result?.Warnings) ? result.Warnings : [] }
+    },
+    timeoutMs,
+  )
+}
+
+function captureDockerOutput(buf, maxOutputBytes) {
+  const stdout = []
+  const stderr = []
+  let off = 0
+  let size = 0
+  while (off < buf.length) {
+    if (off + 8 > buf.length || ![1, 2].includes(buf[off]) || buf.subarray(off + 1, off + 4).some((v) => v !== 0)) {
+      throw new ClusterError(502, 'docker_exec_invalid_output', 'Docker exec 输出帧不完整或不合法')
+    }
+    const length = buf.readUInt32BE(off + 4)
+    if (off + 8 + length > buf.length) {
+      throw new ClusterError(502, 'docker_exec_invalid_output', 'Docker exec 输出帧不完整或不合法')
+    }
+    size += length
+    if (size > maxOutputBytes) throw new ClusterError(502, 'docker_exec_output_limit', 'Docker exec 输出超过上限')
+    ;(buf[off] === 2 ? stderr : stdout).push(buf.subarray(off + 8, off + 8 + length))
+    off += 8 + length
+  }
+  // Decode once per stream: UTF-8 characters can cross Docker frame boundaries.
+  return { stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8') }
+}
+
+/** Finite non-TTY commands only. Closing a timed-out stream is not a process kill. */
+export async function execCapture(connect, id, cmd, { timeoutMs = 10_000, maxOutputBytes = 65_536 } = {}) {
+  if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0 || maxOutputBytes > MAX_RESPONSE_BYTES / 2 - 8) {
+    throw new RangeError('invalid Docker exec output limit')
+  }
+  return withDockerDeadline(
+    connect,
+    async (scopedConnect) => {
+      const created = await dockerJson(
+        scopedConnect,
+        {
+          method: 'POST',
+          path: `${containerPath(id)}/exec`,
+          body: { Cmd: cmd, Tty: false, AttachStdout: true, AttachStderr: true },
+          timeoutMs,
+        },
+        [201],
+      )
+      let wireBytes = 0
+      let overflow = false
+      let startStream
+      const startConnect = async () => (startStream = await scopedConnect())
+      let res
+      try {
+        res = await dockerRequest(startConnect, {
+          method: 'POST',
+          path: `${execPath(created.Id)}/start`,
+          body: { Detach: false, Tty: false },
+          timeoutMs,
+          onChunk: (chunk) => {
+            wireBytes += chunk.length
+            // Bound framing overhead too, including a stream of empty frames.
+            if (wireBytes > maxOutputBytes * 2 + 8) {
+              overflow = true
+              startStream.destroy()
+            }
+          },
+        })
+      } catch (error) {
+        if (!overflow) throw error
+      }
+      if (overflow) throw new ClusterError(502, 'docker_exec_output_limit', 'Docker exec 输出超过上限')
+      if (res.status !== 200) {
+        throw new ClusterError(
+          res.status === 404 ? 404 : res.status === 409 ? 409 : 502,
+          'docker_api_error',
+          dockerMessage(res),
+        )
+      }
+      const output = captureDockerOutput(res.body, maxOutputBytes)
+      const inspected = await inspectExec(scopedConnect, created.Id)
+      if (inspected?.Running !== false || !Number.isInteger(inspected.ExitCode) || inspected.ExitCode < 0) {
+        throw new ClusterError(502, 'docker_exec_unverified', '无法确认 Docker exec 已结束及退出码')
+      }
+      return { ...output, exitCode: inspected.ExitCode }
+    },
+    timeoutMs,
+  )
+}
+
 /**
  * Split Docker's multiplexed log stream (non-TTY containers):
  * 8-byte header [stream, 0, 0, 0, size uint32 BE] + payload.
