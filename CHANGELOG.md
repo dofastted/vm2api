@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.4.063 — 2026-11-11
+
+- 导出 `cliPayloadPath`。v1.4.062 的集群镜像代码引用了它，但模块没有导出，控制面启动即退出。
+
+已部署机升级：更新 Node 控制面后重启。不必 `fetch:payload`，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。不要 `docker rm` 槽。不要部署 v1.4.062。
+
 ## 1.4.062 — 2026-11-11
 
 - CRAG v2 子进程连 OAuth token 主机（`platform.claude.com` / `console.anthropic.com` 的 443）时先写 `KIN-BLOCK`。kin-egress 在拨上游 SOCKS 之前关掉这条连接，刷新请求不出站。登录、`kin-oauth-auth` 和 `kin-worker oauth refresh` 不写标记，不受影响。随包发布的 `kin-egress` 仍是 `deploy/payload.json` 里钉住的那枚，这次不换二进制。
