@@ -156,7 +156,7 @@ export async function pushSlotBinaries(vm, projectRoot, session = null) {
     pushed.push(name)
   }
   await pushLiveWrap(vm, projectRoot, s, { required: false })
-  const crag = await pushCragSlot(vm, projectRoot, s)
+  const crag = await pushCragSlot(vm, projectRoot, s, { required: false })
   return { pushed, digest: digest.digest('hex'), crag }
 }
 
@@ -248,10 +248,11 @@ async function pushLiveWrap(vm, projectRoot, session, { required }) {
 }
 
 /** Same CRAG tree the slot image bakes, for containers created before that image. */
-export async function pushCragSlot(vm, projectRoot, session = null) {
+export async function pushCragSlot(vm, projectRoot, session = null, { required = true } = {}) {
+  const payload = cragSlotPayload(projectRoot, { required })
+  if (!payload) return { ok: true, pushed: false, skipped: 'missing' }
   const s = session || (await nodeSession(vmNodeId(vm)))
   await prepareRemoteDir(s, vm)
-  const payload = cragSlotPayload(projectRoot)
   const slotDir = remoteSlotDir(s.host, vm.id)
   const remote = `${slotDir}/slot-bin`
   const marker = `${remote}/crag.digest`
@@ -296,7 +297,7 @@ export async function pushKernelSelection(vm, projectRoot, kernel) {
   if (!wrap.ok) return wrap
   let crag = { ok: true, pushed: false }
   try {
-    crag = await pushCragSlot(vm, projectRoot, session)
+    crag = await pushCragSlot(vm, projectRoot, session, { required: kernel === 'crag' })
   } catch (error) {
     if (kernel === 'crag') {
       return {

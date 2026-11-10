@@ -867,7 +867,8 @@ export async function refreshNodeSlotPayload(
     const session = await sessionFor(nodeId)
     // Older images have no CRAG layer. The slot-bin mount is already there, so publish
     // the tree without recreating a container whose image is otherwise current.
-    if (session?.client) await pushCragSlot(vm, projectRoot, session)
+    if (session?.client)
+      await pushCragSlot(vm, projectRoot, session, { required: resolveKernelDataplane(vm, routing || {}) === 'crag' })
     const running = recreate !== false && vm.status === 'running'
     // A current image stays up only when its command matches this slot's kernel.
     if (running) {
