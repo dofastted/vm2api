@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- CRAG 续接不再把 Claude Code 追加的 “hasn't heard from you” 系统提示算进历史。这条提示不在工具调用停住时的指纹里，原样转发会让内核返回 `tool_result history mismatch`。槽的 Environment 系统消息保留。新鲜请求仍把这条提示写进 TUI。
+- CRAG 续接在环境系统消息还留在原位时，丢掉工具结果后面新加的系统消息（MCP server instructions，以及 “hasn't heard from you”）。这条后缀不在工具调用停住时的指纹里，原样转发会让内核返回 `tool_result history mismatch`。环境被挪到工具结果后面时仍保留。新鲜请求不改。
 
 ## 1.4.064 — 2026-11-11
 

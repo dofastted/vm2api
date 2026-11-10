@@ -130,35 +130,41 @@ export function cragPromptTooLarge(bytes) {
   return error
 }
 
-const CLIENT_IDLE_NUDGE = "The user hasn't heard from you in a while."
-
-function messagePlainText(content) {
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return ''
-  return content.map((block) => (typeof block === 'string' ? block : block?.text || '')).join('')
-}
-
 function pureToolResultTurn(message) {
   const blocks = Array.isArray(message?.content) ? message.content : []
   return message?.role === 'user' && blocks.length > 0 && blocks.every((block) => block?.type === 'tool_result')
 }
 
 /**
- * Claude Code appends this reminder after a tool_result. CRAG hashes every
- * system message after the previous user turn, so the reminder no longer
- * matches the history parked when the tool call was published. The waiting
- * TUI already has the turn; the reminder is not the slot environment.
- * A fresh request keeps it, because that path renders the text into the prompt.
+ * Claude Code keeps the slot environment where it was and appends another
+ * system message after the tool_result (MCP server instructions, or the
+ * "hasn't heard from you" reminder). CRAG hashes every system after the
+ * previous user turn, so the new suffix no longer matches the parked turn.
+ * Drop that suffix only when an earlier system is still in place. A
+ * continuation that moved the environment itself behind the tool_result
+ * keeps it. A fresh request is unchanged.
  */
-export function omitClientIdleNudge(body) {
+export function omitContinuationSystemSuffix(body) {
   const messages = body?.messages
   if (!Array.isArray(messages)) return body
-  const last = [...messages].reverse().find((message) => message?.role !== 'system')
-  if (!pureToolResultTurn(last)) return body
-  const kept = messages.filter(
-    (message) =>
-      message?.role !== 'system' || !messagePlainText(message.content).trimStart().startsWith(CLIENT_IDLE_NUDGE),
-  )
+  let tail = -1
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i]?.role !== 'system') {
+      tail = i
+      break
+    }
+  }
+  if (!pureToolResultTurn(messages[tail])) return body
+  let lastUser = -1
+  for (let i = tail - 1; i >= 0; i -= 1) {
+    if (messages[i]?.role === 'user') {
+      lastUser = i
+      break
+    }
+  }
+  const inplace = messages.some((message, index) => message?.role === 'system' && index > lastUser && index < tail)
+  if (!inplace) return body
+  const kept = messages.filter((message, index) => !(message?.role === 'system' && index > tail))
   if (kept.length === messages.length) return body
   return { ...body, messages: kept }
 }
