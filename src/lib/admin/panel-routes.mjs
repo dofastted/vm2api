@@ -3371,7 +3371,7 @@ export function createPanelHandler(ctx) {
                 : body.memory
             const liveVm = getVm(cfg.paths.project, id) || currentVm
             const raiseMemory = ctx.raiseDockerSlotMemory || raiseDockerSlotMemory
-            const raised = raiseMemory(cfg.paths.project, liveVm, requestedMemory, {
+            const raised = await raiseMemory(cfg.paths.project, liveVm, requestedMemory, {
               routing: ctx.routingConfig,
             })
             if (!raised.ok) {
@@ -3391,6 +3391,13 @@ export function createPanelHandler(ctx) {
                   requested: raised.requested ?? requestedMemory ?? null,
                   container_memory: raised.container_memory ?? null,
                   current: raised.current ?? null,
+                  application_state: raised.application_state ?? null,
+                  config_unchanged: raised.config_unchanged ?? null,
+                  rollback_attempted: raised.rollback_attempted ?? false,
+                  rollback_succeeded: raised.rollback_succeeded ?? false,
+                  before_memory: raised.before_memory ?? null,
+                  before_swap_bytes: raised.before_swap_bytes ?? null,
+                  observed_memory_swap: raised.observed_memory_swap ?? null,
                 },
               })
             }
