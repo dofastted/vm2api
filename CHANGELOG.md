@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 集群槽位镜像准备时 `cc-node` 与本地 wrap 运行时一致为可选：缺失不报 `slot_payload_missing`，存在则校验并打包；`cli-node` 与 kin-kernel 仍为必填。
+
 ## 1.4.063 — 2026-11-11
 
 - 导出 `cliPayloadPath`。v1.4.062 的集群镜像代码引用了它，但模块没有导出，控制面启动即退出。
