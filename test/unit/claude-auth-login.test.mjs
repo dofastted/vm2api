@@ -76,6 +76,89 @@ test('auth login session stays reusable until force regenerate or login_ready', 
   assert.equal(isPersistentAuthLoginSession(session, { force: true }), false)
   assert.equal(isPersistentAuthLoginSession({ ...session, status: 'login_ready' }), false)
   assert.equal(isPersistentAuthLoginSession({ ...session, alive: false }), false)
+  assert.equal(isPersistentAuthLoginSession(session, { cliBin: '/home/kincli/.kin/cli-node' }), true)
+  assert.equal(
+    isPersistentAuthLoginSession(session, { cliBin: '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude' }),
+    false,
+  )
+  assert.equal(
+    isPersistentAuthLoginSession({ ...session, cli_bin: '/native/claude' }, { cliBin: '/native/claude' }),
+    true,
+  )
+  assert.equal(
+    isPersistentAuthLoginSession({ ...session, cli_bin: '/native/claude' }, { cliBin: '/home/kincli/.kin/cli-node' }),
+    false,
+  )
+})
+
+test('auth readiness checks the selected native CLI, never the installed standard CLI', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-auth-native-'))
+  const vm = { id: 'vm-01', dataplane: 'crag', crag_kernel_version: 'v2' }
+  const cli = path.join(root, 'vms/vm-01/cli-home/.kin/crag-v2/claude-code-2.1.321/claude')
+  try {
+    fs.mkdirSync(path.dirname(cli), { recursive: true })
+    fs.writeFileSync(path.join(root, 'vms/vm-01/cli-home/.kin/cli-node'), '')
+    await assert.rejects(assertAuthLoginReady(root, vm, { inspect: () => ({ running: true }) }), {
+      code: 'claude_cli_missing',
+    })
+    fs.writeFileSync(cli, '')
+    const ready = await assertAuthLoginReady(root, vm, { inspect: () => ({ running: true }) })
+    assert.equal(ready.cli, cli)
+    const inherited = await assertAuthLoginReady(
+      root,
+      { id: 'vm-01' },
+      {
+        inspect: () => ({ running: true }),
+        routing: { inference: { dataplane: 'crag', crag_kernel_version: 'v2' } },
+      },
+    )
+    assert.equal(inherited.cli, cli)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('native auth dispatch passes the selected executable and leaves its version untouched', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-auth-native-start-'))
+  const vm = { id: 'vm-01', dataplane: 'crag', crag_kernel_version: 'v2' }
+  const cli = path.join(root, 'vms/vm-01/cli-home/.kin/crag-v2/claude-code-2.1.321/claude')
+  try {
+    fs.mkdirSync(path.dirname(cli), { recursive: true })
+    fs.writeFileSync(cli, '')
+    let env
+    const result = await startClaudeAuthLoginSession({
+      vm,
+      projectRoot: root,
+      inspect: () => ({ running: true }),
+      prepare: async ({ exec }) => ({ exec }),
+      stopSession: async () => {},
+      spawnPty: (_bin, _args, opts) => {
+        env = opts.env
+        fs.writeFileSync(
+          path.join(env.KIN_SESSION_DIR, 'status.json'),
+          JSON.stringify({
+            session_id: env.KIN_SESSION_ID,
+            cli_bin: env.KIN_CLI_BIN,
+            auth_url: 'https://claude.com/cai/oauth/authorize?native=1',
+            status: 'waiting_auth',
+            updated_at: Date.now(),
+            expires_at: Number(env.KIN_EXPIRES_AT),
+          }),
+        )
+        return { unref() {} }
+      },
+    })
+    assert.match(result.auth_url, /native=1/)
+    assert.equal(env.KIN_CLI_BIN, '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude')
+    const argv = JSON.parse(env.KIN_DOCKER_ARGV)
+    assert.deepEqual(argv.slice(-3), [env.KIN_CLI_BIN, 'auth', 'login'])
+    assert.equal(
+      argv.some((arg) => arg.startsWith('CLAUDE_CODE_VERSION=')),
+      false,
+    )
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('assertAuthLoginReady refuses a missing container and a missing cli-node', async () => {
@@ -216,6 +299,8 @@ test('stopClaudeAuthLoginSession pkills auth login, not setup-token', async () =
     assert.equal(seen[0].id, 'kin-02')
     assert.deepEqual(seen[0].cmd.slice(0, 2), ['sh', '-lc'])
     assert.match(seen[0].cmd.at(-1), /auth login/)
+    assert.match(seen[0].cmd.at(-1), /crag-v2\/claude-code-/)
+    assert.match(seen[0].cmd.at(-1), /opt\/kin-live/)
     assert.doesNotMatch(seen[0].cmd.at(-1), /setup-token/)
 
     fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify({ id: 'vm-01', runtime: { type: 'kvm' } }))
