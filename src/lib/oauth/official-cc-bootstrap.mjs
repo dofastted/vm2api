@@ -39,6 +39,7 @@ import {
 import { canOfficialCc, credentialModeOfVm } from './credential-mode.mjs'
 import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
 import { inferTierFromOfficialStats, parseOfficialCcStats, tierFromOauthProfile } from './official-cc-stats.mjs'
+import { flattenOauthIdentity } from './oauth-identity.mjs'
 import { defaultSeedPolicy } from '../protocol/seed-policy.mjs'
 import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import { applyOfficialFingerprintToVm, readOfficialCcIdentity } from '../identity/official-fingerprint.mjs'
@@ -572,6 +573,8 @@ export function writeOfficialCcStatus(homeDir, status) {
     step: status.step || null,
     official_login: !!status.official_login,
     account_tier: status.account_tier || null,
+    subscription_type: status.subscription_type || null,
+    rate_limit_tier: status.rate_limit_tier || null,
     has_oauth_account: !!status.has_oauth_account,
     has_user_id: !!status.has_user_id,
     has_machine_id: !!status.has_machine_id,
@@ -1015,6 +1018,8 @@ export async function collectOfficialCcAccount(exec, { slotOauth } = {}) {
   const list = Array.isArray(models?.body?.data) ? models.body.data : []
   return {
     account_tier: tier,
+    subscription_type: tier,
+    rate_limit_tier: profile?.ok ? flattenOauthIdentity(profile.body).rate_limit_tier : null,
     profile_ok: !!profile?.ok,
     profile_error: profile?.ok ? null : profile?.body?.error?.code || `http_${profile?.status || 0}`,
     available_models: models?.ok ? list.map((m) => String(m?.id || '')).filter(Boolean) : null,
@@ -1224,6 +1229,9 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       step: 'profile',
     })
     const account = await collectOfficialCcAccount({ vmId, homeDir, vm }, { slotOauth })
+    if (account.subscription_type) {
+      stats = { ...stats, subscription_type: account.subscription_type, rate_limit_tier: account.rate_limit_tier }
+    }
     let tierSource = null
     if (stats?.limits_present === true && !stats.account_tier) {
       const accountTier = inferTierFromOfficialStats('', stats)
@@ -1321,6 +1329,8 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
       official_login: true,
       account_tier: stats?.account_tier || null,
       account_tier_source: tierSource,
+      subscription_type: account.subscription_type,
+      rate_limit_tier: account.rate_limit_tier,
       available_models: account.available_models,
       profile_error: account.profile_error,
       models_error: account.models_error,

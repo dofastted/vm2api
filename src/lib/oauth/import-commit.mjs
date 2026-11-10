@@ -11,6 +11,7 @@ import {
   bindVmProxy,
   getVm,
   persistAccountTier,
+  persistVmSubscription,
   isCodexVm,
   patchVmRecord,
 } from '../vm/vm-registry.mjs'
@@ -100,8 +101,8 @@ export function createImportCommit(ctx) {
       email: identity.email || existing.claude?.email || null,
       account_uuid: identity.account_uuid || existing.claude?.account_uuid || null,
       org_uuid: identity.org_uuid || existing.claude?.org_uuid || null,
-      subscription_type:
-        identity.subscription_type || normalizeSubscriptionType(existing?.claude?.account_tier) || 'pro',
+      subscription_type: identity.subscription_type,
+      rate_limit_tier: identity.rate_limit_tier,
       account_tier: normalizeSubscriptionType(existing?.claude?.account_tier) || 'pro',
       scopes: Array.isArray(oauth.scopes)
         ? oauth.scopes
@@ -114,6 +115,7 @@ export function createImportCommit(ctx) {
 
   function officialCcStatsHandler(vmId, accountUuid = null) {
     return (stats) => {
+      if (stats?.subscription_type) persistVmSubscription(ctx.cfg.paths.project, vmId, stats, { accountUuid })
       const accountId = accountUuid || getVm(ctx.cfg.paths.project, vmId)?.claude?.account_uuid || vmId
       if (stats?.five_hour || stats?.seven_day || stats?.seven_day_oi || stats?.extra_usage) {
         try {

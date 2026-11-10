@@ -2,7 +2,8 @@ import type { Vm } from '@/types/panel-vm'
 import { isCodexVm } from '@/lib/vm-kind'
 import { claudeTier } from '@/lib/vm-status'
 
-export type TierKey = 'pro' | 'max' | 'codex' | 'none' | 'unknown'
+export type TierKey =
+  'free' | 'pro' | 'max' | 'team' | 'enterprise' | 'codex' | 'none' | 'unknown'
 
 /**
  * 账号等级的视觉皮肤。等级轴与健康状态轴正交：
@@ -26,8 +27,6 @@ const NEUTRAL: TierVisual = {
   row: '',
   badge: 'bg-muted text-muted-foreground',
 }
-
-const UNCONFIRMED: TierVisual = { ...NEUTRAL, label: '待探测' }
 
 const SKIN: Record<'pro' | 'max' | 'codex', TierVisual> = {
   pro: {
@@ -55,8 +54,15 @@ const SKIN: Record<'pro' | 'max' | 'codex', TierVisual> = {
 
 export function tierVisual(vm: Vm | undefined): TierVisual {
   if (isCodexVm(vm)) return SKIN.codex
-  const key = claudeTier(vm).key
-  if (key === 'pro' || key === 'max') return SKIN[key]
-  if (key === 'unknown') return UNCONFIRMED
+  const { key, label } = claudeTier(vm)
+  if (key === 'pro' || key === 'max')
+    return { ...SKIN[key], label: label || SKIN[key].label }
+  if (
+    key === 'free' ||
+    key === 'team' ||
+    key === 'enterprise' ||
+    key === 'unknown'
+  )
+    return { ...NEUTRAL, key, label: label || '未识别' }
   return NEUTRAL
 }

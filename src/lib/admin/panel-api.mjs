@@ -20,6 +20,7 @@ import {
   getActiveVmId,
   vmHasClaudeCredential,
   persistAccountTier,
+  persistVmSubscription,
   isCodexVm,
   migrateVmSchedule,
 } from '../vm/vm-registry.mjs'
@@ -1233,6 +1234,12 @@ export async function buildProbeOne({
     } catch {}
   }
   if (!skipHop) accountQuota.ingestOAuthUsage(accountId, result)
+  if (result.subscription_type) {
+    persistVmSubscription(cfg.paths.project, id, result, {
+      accountUuid: vm.claude?.account_uuid,
+      orgUuid: vm.claude?.org_uuid,
+    })
+  }
   if (isSetupTokenMode(credentialModeOfVm(vm)) && (force || includeFable) && !result.usage_scope_missing) {
     try {
       await applyFableProbeResult(accountQuota, accountId, await fableProbe({ exec, timeoutMs: 20000 }))
@@ -1293,6 +1300,9 @@ export async function buildProbeOne({
   })
   const data = {
     vm_id: id,
+    subscription_type: result.subscription_type || vm.claude?.subscription_type || null,
+    rate_limit_tier: result.subscription_type ? result.rate_limit_tier : vm.claude?.rate_limit_tier || null,
+    subscription_error: result.subscription_error || null,
     account_uuid: vm.claude?.account_uuid || null,
     source: passive?.source || result.source,
     via: passive?.via || result.via || null,
@@ -2100,6 +2110,8 @@ function enrichVm(v, accountQuota, active, extras = {}) {
         }
       : null,
     account_tier: tierKey,
+    subscription_type: isCodex ? null : v.subscription_type || null,
+    rate_limit_tier: isCodex ? null : v.rate_limit_tier || null,
     usage_has_fable: isCodex ? null : q.usage_has_fable,
     availability,
     cred_status: credStatusFromAvailability(availability),
