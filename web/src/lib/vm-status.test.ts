@@ -1,5 +1,6 @@
 import type { Vm } from '@/types/panel-vm'
 import { describe, expect, it } from 'vitest'
+import { tierVisual } from './tier-visual'
 import {
   accountStatus,
   accountUsable,
@@ -227,29 +228,31 @@ describe('health probe must not paint a live ticket unavailable', () => {
   })
 })
 
-describe('claudeTier follows usage Fable presence', () => {
-  it('treats usage Fable as Max even when stored Pro and hop denied', () => {
+describe('claudeTier follows OAuth subscription metadata', () => {
+  it('keeps Pro despite Fable usage and probe results', () => {
     expect(
       claudeTier(
         liveVm({
           account_tier: 'pro',
+          subscription_type: 'pro',
           usage_has_fable: true,
           fable: { plan_denied: true, ok: false, status: 403 },
         })
       ).key
-    ).toBe('max')
+    ).toBe('pro')
   })
 
-  it('treats a real 7d_oi window as Max over stored Pro', () => {
+  it('does not infer Max from a 7d_oi window', () => {
     expect(
       claudeTier(
         liveVm({
           account_tier: 'pro',
+          subscription_type: 'pro',
           utilization_7d_oi: 0.21,
           reset_7d_oi: '2026-08-24T00:00:00Z',
         })
       ).key
-    ).toBe('max')
+    ).toBe('pro')
   })
 
   it('keeps Pro when usage has no Fable evidence', () => {
@@ -257,16 +260,56 @@ describe('claudeTier follows usage Fable presence', () => {
       claudeTier(
         liveVm({
           account_tier: 'pro',
+          subscription_type: 'pro',
           fable: { plan_denied: true, status: 403 },
         })
       ).key
     ).toBe('pro')
   })
 
-  it('defaults token accounts to Pro until Max evidence appears', () => {
-    expect(claudeTier(liveVm({ account_tier: 'unknown' })).key).toBe('pro')
-    expect(claudeTier(liveVm({})).key).toBe('pro')
-    expect(claudeTier(liveVm({ account_tier: 'max' })).key).toBe('max')
+  it('shows unknown rather than trusting legacy usage-derived tiers', () => {
+    expect(claudeTier(liveVm({ account_tier: 'unknown' })).key).toBe('unknown')
+    expect(claudeTier(liveVm({})).key).toBe('unknown')
+    expect(
+      claudeTier(liveVm({ account_tier: 'max', usage_has_fable: true })).key
+    ).toBe('unknown')
+  })
+
+  it('keeps Max when Fable is unavailable and exposes the official multiplier', () => {
+    expect(
+      claudeTier(
+        liveVm({
+          subscription_type: 'max',
+          rate_limit_tier: 'default_claude_max_5x',
+          usage_has_fable: false,
+          fable: { plan_denied: true, status: 403 },
+        })
+      )
+    ).toMatchObject({ key: 'max', label: 'Max 5x' })
+    expect(
+      tierVisual(
+        liveVm({
+          subscription_type: 'max',
+          rate_limit_tier: 'default_claude_max_20x',
+        })
+      )
+    ).toMatchObject({ key: 'max', label: 'Max 20x' })
+    expect(tierVisual(liveVm({}))).toMatchObject({
+      key: 'unknown',
+      label: '未识别',
+    })
+  })
+
+  it('supports team, enterprise and free without guessing from Fable', () => {
+    for (const [subscription_type, label] of [
+      ['team', 'Team'],
+      ['enterprise', 'Enterprise'],
+      ['free', 'Free'],
+    ]) {
+      expect(
+        claudeTier(liveVm({ subscription_type, usage_has_fable: true }))
+      ).toMatchObject({ key: subscription_type, label })
+    }
   })
 
   it('does not paint quota restriction as 调度关', () => {

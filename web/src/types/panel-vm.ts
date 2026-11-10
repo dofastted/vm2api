@@ -364,7 +364,10 @@ export type Vm = {
   fable?: Record<string, unknown>
   weekly_split?: Record<string, unknown>
   account_tier?: string
-  /** Complete official usage: true = Max, false = Pro, null = unconfirmed. */
+  /** Official OAuth subscription metadata, independent of model availability. */
+  subscription_type?: string | null
+  rate_limit_tier?: string | null
+  /** Whether official usage lists a Fable window; not a subscription identifier. */
   usage_has_fable?: boolean | null
   /** anthropic | openai。缺省按 Claude 槽展示。 */
   platform?: string | null
@@ -753,6 +756,8 @@ export type OfficialCcStatus = {
   hello_ok?: boolean
   usage_ok?: boolean
   account_tier?: string
+  subscription_type?: string | null
+  rate_limit_tier?: string | null
   /** `profile` = 官方 /api/oauth/profile；`usage` = /usage 推断兜底。 */
   account_tier_source?: string
   /** 槽内 GET /v1/models 返回的模型 id。 */

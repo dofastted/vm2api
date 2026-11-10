@@ -721,22 +721,34 @@ export function claudeTier(vm: Vm | undefined): StatusTone {
     return { key: 'codex', label: plan, cls: 'codex', text: plan }
   }
   if (!vm?.has_token) return { key: 'none', label: '—', cls: 'none', text: '—' }
-  if (vm.usage_has_fable === false)
-    return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
-  const raw = String(vm.account_tier || '').toLowerCase()
-  const oi = vm.utilization_7d_oi
-  const oiN =
-    oi == null ? null : Number(oi) > 1.5 ? Number(oi) / 100 : Number(oi)
-  const realFable =
-    vm.usage_has_fable === true ||
-    (oiN != null && Boolean(vm.reset_7d_oi || oiN < 1))
-  // Usage 里有 Fable 就是 Max。落盘 pro / hop 403 不能盖掉。
-  // 没有套餐证据时不要画成 Pro，否则 Max 探测未完成的槽会一直显示 Pro。
-  if (realFable || raw === 'max')
-    return { key: 'max', label: 'Max', cls: 'max', text: 'Max' }
-  if (raw === 'pro')
-    return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
-  return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
+  // Legacy account_tier may come from Fable usage or a default Pro policy.
+  const raw = String(vm.subscription_type || '')
+    .trim()
+    .toLowerCase()
+  const labels: Record<string, string> = {
+    free: 'Free',
+    pro: 'Pro',
+    max: 'Max',
+    team: 'Team',
+    enterprise: 'Enterprise',
+  }
+  let label = Object.prototype.hasOwnProperty.call(labels, raw)
+    ? labels[raw]
+    : ''
+  if (!label)
+    return { key: 'unknown', label: '未识别', cls: 'none', text: '未识别' }
+  if (raw === 'max') {
+    const multiplier = String(vm.rate_limit_tier || '').match(
+      /(?:^|_)claude_max_(5x|20x)(?:_|$)/i
+    )?.[1]
+    if (multiplier) label += ` ${multiplier.toLowerCase()}`
+  }
+  return {
+    key: raw,
+    label,
+    cls: raw === 'max' || raw === 'pro' ? raw : 'none',
+    text: label,
+  }
 }
 
 export function vmBuckets(vms: Vm[]) {

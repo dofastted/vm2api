@@ -165,6 +165,7 @@ describe('vmWindows', () => {
   it('adds Fable only on Max, after 5H and 7D', () => {
     const max = vmWindows(
       vm({
+        subscription_type: 'max',
         usage_has_fable: true,
         utilization_7d_oi: 0.3,
         reset_7d_oi: '2099-01-01T00:00:00Z',

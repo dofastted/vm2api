@@ -70,6 +70,8 @@ export function normalizeOauth(cred = {}) {
     email: identity.email,
     account_uuid: identity.account_uuid,
     org_uuid: identity.org_uuid,
+    subscription_type: identity.subscription_type,
+    rate_limit_tier: identity.rate_limit_tier,
     scope: cred.scope || (scopes.length ? scopes.join(' ') : null),
     source: cred.source || null,
     session_key: cred.session_key || cred.sessionKey || null,
@@ -291,6 +293,7 @@ export function readWorkerCredentialFile(homeDir) {
       org_uuid: oauth.orgUuid || oauth.org_uuid || null,
       scope,
       subscription_type: oauth.subscriptionType || oauth.subscription_type || null,
+      rate_limit_tier: oauth.rateLimitTier || oauth.rate_limit_tier || null,
       source: 'go-slot-worker',
       auth_scheme: resolveAuthScheme({
         mode,
@@ -478,6 +481,7 @@ export function writeWorkerCredentialFile(homeDir, cred) {
   if (isAnySetupTokenMode(mode)) oauth.type = mode
 
   if (subscriptionType) oauth.subscriptionType = subscriptionType
+  if (n.rate_limit_tier) oauth.rateLimitTier = n.rate_limit_tier
   const generation = Number(n._token_version || cred.kinGeneration || cred.kin_generation) || Date.now()
   oauth.kinGeneration = generation
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
@@ -606,6 +610,16 @@ export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false, operat
     !!(n._token_version && prev._token_version && Number(n._token_version) > Number(prev._token_version))
   const mode = credentialModeFromOauth({ ...cred, mode: cred?.mode || cred?.type || prev.mode })
   vm.claude = stripCredentialSecrets({ ...prev })
+  if (
+    operatorImport ||
+    (n.account_uuid && prev.account_uuid && n.account_uuid !== prev.account_uuid) ||
+    (n.org_uuid && prev.org_uuid && n.org_uuid !== prev.org_uuid)
+  ) {
+    delete vm.claude.subscription_type
+    delete vm.claude.rate_limit_tier
+  }
+  if (n.subscription_type) vm.claude.subscription_type = n.subscription_type
+  if (n.rate_limit_tier) vm.claude.rate_limit_tier = n.rate_limit_tier
   if (n.access_token || cred.has_access || cred.has_api_key || cred.api_key) vm.claude.has_access = true
   if (n.refresh_token || cred.has_refresh) vm.claude.has_refresh = true
   if (n.expires_at) vm.claude.expires_at = n.expires_at

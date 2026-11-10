@@ -100,6 +100,7 @@ function vm(partial: Partial<Vm> & Pick<Vm, 'id'>): Vm {
     status: 'running',
     schedule_state: 'on',
     account_tier: 'pro',
+    subscription_type: 'pro',
     runtime_type: 'kvm',
     machine: { memory: '2g' },
     today_cost: 0,
@@ -199,18 +200,28 @@ describe('slots', () => {
   it('sorts Max first, then by name with numbers in order', () => {
     const out = sortSlots([
       vm({ id: 'slot906' }),
-      vm({ id: 'slot2004', account_tier: 'max' }),
+      vm({ id: 'slot2004', subscription_type: 'max' }),
       vm({ id: 'Slot262' }),
-      vm({ id: 'slot2001', account_tier: 'max' }),
+      vm({ id: 'slot2001', subscription_type: 'max' }),
     ]).map((v) => v.id)
     expect(out).toEqual(['slot2001', 'slot2004', 'Slot262', 'slot906'])
     expect(
       tierSummary([
-        vm({ id: 'a', account_tier: 'max' }),
+        vm({ id: 'a', subscription_type: 'max' }),
         vm({ id: 'b' }),
         vm({ id: 'c' }),
       ])
     ).toBe('1 Max · 2 Pro')
+    expect(
+      tierSummary([
+        vm({ id: 'pro' }),
+        vm({
+          id: 'max',
+          subscription_type: 'max',
+          rate_limit_tier: 'default_claude_max_20x',
+        }),
+      ])
+    ).toBe('1 Max 20x · 1 Pro')
     expect(tierSummary([])).toBe('空')
   })
 
@@ -271,7 +282,7 @@ describe('machines', () => {
   const vms = [
     vm({
       id: 'slot2001',
-      account_tier: 'max',
+      subscription_type: 'max',
       machine: { memory: '4g' },
       today_cost: 107.24,
     }),
