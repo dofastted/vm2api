@@ -34,6 +34,7 @@ export const REMOTE_CLI_NODE_BIN = `${REMOTE_LIVE_DIR}/cli-node`
 export const REMOTE_CC_NODE_BIN = `${REMOTE_LIVE_DIR}/cc-node`
 export const REMOTE_CRAG_ENTRY = `${REMOTE_LIVE_DIR}/crag-kernel`
 export const REMOTE_CRAG_CLAUDE = `${REMOTE_LIVE_DIR}/crag-v2/claude-code-2.1.321/claude`
+export const LOCAL_CRAG_CLAUDE = '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude'
 
 export const KERNEL_NATIVE_SLOT_COUNT = 20
 export const SESSION_SLOT_MIN = 1

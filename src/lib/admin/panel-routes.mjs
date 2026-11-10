@@ -2995,12 +2995,16 @@ export function createPanelHandler(ctx) {
           })
         const vm = getVm(cfg.paths.project, p.split('/')[4])
         if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
-        if (isCodexVm(vm))
+        if (isCodexVm(vm) || isKvmRuntime(vm) || isNativeNodeVm(vm))
           return json(res, 400, {
             ok: false,
             error: {
               code: 'crag_v2_unsupported_placement',
-              message: 'CRAG activation requires a local Linux Docker Claude slot.',
+              message: isCodexVm(vm)
+                ? '请选择 Claude 虚拟机'
+                : isKvmRuntime(vm)
+                  ? 'CRAG v2 不支持 KVM 槽'
+                  : 'CRAG v2 不支持 macOS 原生节点',
             },
           })
         const remotePlacement = Boolean(vm.node_id) || isKvmRuntime(vm)
