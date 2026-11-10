@@ -51,12 +51,6 @@
       "sha256": "8484c4c58f4b7782a190f7cab7c8aa5d1f706ae26b2d2a5cafe81af070f0611b"
     },
     {
-      "path": "share/wrap-cli/cc-node",
-      "asset": "cc-node",
-      "size": 32484148,
-      "sha256": "be5eec49a78345dd935e302e88c9d7ad0afbb09a195356d81be1bdea766f3960"
-    },
-    {
       "path": "share/wrap-cli/kin-kernel.bin",
       "asset": "kin-kernel",
       "size": 13228472,

@@ -71,7 +71,6 @@ jobs:
             dist/kin-oauth-auth
             dist/kin-computer
             dist/cli-node
-            dist/cc-node
 
   image-amd64:
     runs-on: ubuntu-latest
