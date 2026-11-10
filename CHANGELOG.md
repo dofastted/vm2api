@@ -2,7 +2,12 @@
 
 ## Unreleased
 
+## 1.4.065 — 2026-11-11
+
+- 发布流程的 ARM64 镜像冒烟检查不再强制要求 `cc-node`（pinned payload 已不带它）。v1.4.062–v1.4.064 因此 `image-arm64` 失败、多架构镜像标签未更新，本版补齐。
 - CRAG 官方请求不再在网关删 `messages` 里的系统块。原生 Claude Code 2.1.321 的 Environment 在 system 第四块里；客户端还会在工具结果后追加 MCP 说明和 idle 提示。这些块要原样进 CRAG。PR #6 从 system 和每条 message 读取调用方写过的 cwd、git、platform、shell、OS，没写的不拿宿主机填。指纹是否把工具结果后的新系统块算进续接，由 CRAG 自己决定，不靠删正文。
+
+已部署机升级：更新 Node 控制面后重启。不必 `fetch:payload`，不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。不要 `docker rm` 槽。
 
 ## 1.4.064 — 2026-11-11
 
