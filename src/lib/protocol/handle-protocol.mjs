@@ -1593,6 +1593,23 @@ export function createHandleProtocol(deps) {
               thinking_owner: { account_id: selected.accountId, kept, converted, dropped, unknown },
             }
           }
+          const attemptStartedAt = extra.attemptStartedAt ?? Date.now()
+          // The runner snapshots after this session's queue turn, before VM prebinding.
+          const attemptBound = extra.stickyBound
+          const keptSession = extra.freshSlot ? '' : attemptBound?.sessionId || ''
+          const keptAccount = extra.freshSlot ? '' : attemptBound?.accountId || ''
+          const keptVm = extra.freshSlot ? '' : attemptBound?.vmId || ''
+          const attemptSessionId = resolveOutboundSessionId(executionSession, {
+            ...sessionContext,
+            accountId: selected.accountId,
+            boundSessionId: keptSession,
+            boundAccountId: keptAccount,
+            boundVmId: keptVm,
+            vmId: selected.vmId,
+            epoch: extra.freshSlot
+              ? `slot:${selected.slotIndex ?? 'x'}:${attemptStartedAt}`
+              : `${attemptStartedAt}:${selected.vmId || extra.attemptNo || ''}`,
+          })
           if (claudeScopePending()) {
             const blocked = await applyProtocolIntercept({
               req,
@@ -1613,23 +1630,6 @@ export function createHandleProtocol(deps) {
             }
           }
           const identity = loadVmIdentity(selected.exec)
-          const attemptStartedAt = extra.attemptStartedAt ?? Date.now()
-          // The runner snapshots after this session's queue turn, before VM prebinding.
-          const attemptBound = extra.stickyBound
-          const keptSession = extra.freshSlot ? '' : attemptBound?.sessionId || ''
-          const keptAccount = extra.freshSlot ? '' : attemptBound?.accountId || ''
-          const keptVm = extra.freshSlot ? '' : attemptBound?.vmId || ''
-          const attemptSessionId = resolveOutboundSessionId(executionSession, {
-            ...sessionContext,
-            accountId: selected.accountId,
-            boundSessionId: keptSession,
-            boundAccountId: keptAccount,
-            boundVmId: keptVm,
-            vmId: selected.vmId,
-            epoch: extra.freshSlot
-              ? `slot:${selected.slotIndex ?? 'x'}:${attemptStartedAt}`
-              : `${attemptStartedAt}:${selected.vmId || extra.attemptNo || ''}`,
-          })
           if (identity && attemptSessionId) identity.callerSessionId = attemptSessionId
           const credMode = credentialModeFromOauth(selected.vm?.claude || {})
           const modeOverride = slotPersonaModeOverride(selected.vm)
