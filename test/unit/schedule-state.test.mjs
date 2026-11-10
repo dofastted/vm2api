@@ -258,6 +258,27 @@ test('resolveSlotState: off > unschedulable > restricted > on', () => {
   assert.equal(resolveSlotState({ vm: { schedulable: true }, availability: { key: 'ok' } }).schedule_state, 'on')
 })
 
+test('resolveSlotState does not call a down slot 调度开', () => {
+  const stopped = resolveSlotState({
+    vm: { schedulable: true, status: 'stopped' },
+    availability: { key: 'ok' },
+  })
+  assert.equal(stopped.schedule_state, 'unschedulable')
+  assert.equal(stopped.unschedulable_reason, 'vm_stopped')
+  assert.equal(stopped.unschedulable_text, '已关机')
+  const cooled = resolveSlotState({
+    vm: { schedulable: true, status: 'dead' },
+    availability: { key: 'quota', reason: 'quota_5h_header', until: Date.now() + 60_000 },
+  })
+  assert.equal(cooled.schedule_state, 'unschedulable')
+  assert.equal(cooled.unschedulable_reason, 'vm_dead')
+  assert.equal(
+    resolveSlotState({ vm: { schedulable: true, status: 'paused' }, availability: { key: 'ok' } }).schedule_state,
+    'on',
+  )
+  assert.equal(resolveSlotState({ vm: { schedule_off: true, status: 'stopped' } }).schedule_state, 'off')
+})
+
 test('resolveSlotState reads records written before the migration', () => {
   assert.equal(
     resolveSlotState({ vm: { schedulable: false, schedule_disabled_reason: 'oauth_revoked' } }).schedule_state,

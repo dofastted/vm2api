@@ -31,6 +31,10 @@ const UNSCHEDULABLE_REASONS = Object.freeze({
   runtime_start_failed: '启动失败',
   circuit_escalated: '熔断升级',
   legacy_unknown: '待确认',
+  vm_stopped: '已关机',
+  vm_dead: '进程已退出',
+  vm_error: '槽位错误',
+  vm_disabled: '已禁用',
 })
 
 /** System holds: written and cleared by the system itself (受限 · slot). */
@@ -119,6 +123,18 @@ export function stateOfReason(reason) {
 
 export function isUnschedulableReason(reason) {
   return stateOfReason(reason)?.state === 'unschedulable'
+}
+
+/** Statuses isVmScheduleReady refuses. `paused` is a soft mark and stays out. */
+const HARD_DOWN_REASON = Object.freeze({
+  stopped: 'vm_stopped',
+  dead: 'vm_dead',
+  error: 'vm_error',
+  disabled: 'vm_disabled',
+})
+
+function hardDownReason(status) {
+  return HARD_DOWN_REASON[String(status || '').toLowerCase()] || null
 }
 
 /**
@@ -340,11 +356,14 @@ export function resolveSlotState({
     if (legacy?.state === 'unschedulable') return unschedulable(vm.schedule_disabled_reason)
     if (!legacy || legacy.state !== 'restricted') return { ...base, schedule_state: 'off' }
   }
-  // Live credential verdicts (no ticket, dead grant) read as 不可调度 too.
   if (availability?.key === 'none' || availability?.key === 'bad') {
     const reason = availability.reason || (availability.key === 'none' ? 'no_credential' : 'credential_refresh_failed')
     return unschedulable(isUnschedulableReason(reason) ? reason : 'credential_refresh_failed')
   }
+  // A down slot is not in the pool. 受限 also paints the switch as 调度开, so
+  // this has to win over quota, cooldown, and the final on.
+  const down = hardDownReason(vm.status)
+  if (down) return unschedulable(down)
   const restricted = (reason, until, scope = 'slot', soft = false) => ({
     ...base,
     schedule_state: 'restricted',
