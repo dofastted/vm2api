@@ -348,7 +348,9 @@ export class BackupService {
       if (this.configDir && fs.existsSync(cfgDirSrc)) {
         fs.mkdirSync(this.configDir, { recursive: true })
         for (const f of fs.readdirSync(cfgDirSrc)) {
-          fs.copyFileSync(path.join(cfgDirSrc, f), path.join(this.configDir, f))
+          const dest = path.join(this.configDir, f)
+          fs.copyFileSync(path.join(cfgDirSrc, f), dest)
+          invalidateReadCache(dest)
         }
       }
 
