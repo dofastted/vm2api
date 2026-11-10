@@ -9,10 +9,10 @@ import { ensureHostPrivateDir } from '../../src/lib/vm/private-dir.mjs'
 
 test('remote private directories are chmodded without following a symlink', () => {
   const script = privateDirectoriesScript(['/slot/run/crag-license', '/slot/run/work'], { uid: 10000, gid: 10000 })
-  assert.match(script, /chmod -h 700/)
-  assert.match(script, /chown -h 10000:10000/)
-  assert.equal(script.includes('chmod 700'), false)
-  assert.equal(script.includes('chown 10000'), false)
+  assert.equal(script.includes('chmod -h'), false)
+  assert.equal(script.includes('chown -h'), false)
+  assert.match(script, /find -P "\$d" -maxdepth 0 -type d -exec chmod 700/)
+  assert.match(script, /find -P "\$d" -maxdepth 0 -type d -exec chown 10000:10000/)
   assert.throws(() => privateDirectoriesScript(['/slot/run/work'], { uid: '1;rm', gid: 1 }))
 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-private-remote-'))

@@ -17,8 +17,6 @@ import zlib from 'node:zlib'
 import { OS_CATALOG, imageForKernel, kvmImageForKernel } from '../vm/os-catalog.mjs'
 import { EGRESS_BIN } from '../vm/egress.mjs'
 import {
-  CC_NODE_BIN,
-  cliPayloadPath,
   cragV2KernelWrapperScript,
   cragV2PackageRoot,
   describeKernelPayload,
@@ -58,7 +56,7 @@ function requireElf(file, label) {
 /** Cluster slot images are linux amd64 even when the control plane is not. */
 export function cragSlotPayload(projectRoot) {
   const root = cragV2PackageRoot(projectRoot, 'amd64')
-  if (!root) throw new ClusterError(500, 'slot_payload_missing', 'CRAG v2 缺失。原生 Claude Code 在 CRAG 包内，请先在内核页拉取 CRAG')
+  if (!root) throw new ClusterError(500, 'slot_payload_missing', 'CRAG v2 缺失')
   const verified = verifyCragV2Tree(root, { arch: 'amd64' })
   if (!verified.ok) {
     const missing = verified.code === 'crag_v2_package_missing'
@@ -66,7 +64,14 @@ export function cragSlotPayload(projectRoot) {
   }
   const wrapper = Buffer.from(cragV2KernelWrapperScript())
   const digest = crypto.createHash('sha256').update(wrapper)
-  const files = [{ name: 'opt/kin/crag-kernel', body: wrapper, mode: 0o755 }]
+  const files = [
+    {
+      name: 'opt/kin/crag-kernel',
+      body: wrapper,
+      mode: 0o755,
+      sha256: crypto.createHash('sha256').update(wrapper).digest('hex'),
+    },
+  ]
   for (const rel of Object.keys(verified.manifest.sha256).sort()) {
     digest.update(rel).update(verified.manifest.sha256[rel])
     const executable = rel === 'crag-v2' || rel.endsWith('/claude')
@@ -74,6 +79,7 @@ export function cragSlotPayload(projectRoot) {
       name: `opt/kin/crag-v2/${rel}`,
       src: path.join(root, rel),
       mode: executable ? 0o755 : 0o644,
+      sha256: verified.manifest.sha256[rel],
     })
   }
   return { files, digest: digest.digest('hex') }
@@ -92,12 +98,11 @@ export function slotPayload(projectRoot) {
     { name: 'opt/kin/kin-kernel', body: Buffer.from(wrapKernelWrapperScript()), mode: 0o755 },
     { name: 'opt/kin/kin-kernel.bin', src: kernel.path, mode: 0o755 },
   ]
-  const cliSrc = path.join(wrapDir, 'cli-node')
-  requireElf(cliSrc, 'cli-node')
-  files.push({ name: 'opt/kin/cli-node', src: cliSrc, mode: 0o755 })
-  const ccSrc = cliPayloadPath(projectRoot, CC_NODE_BIN, wrapDir)
-  requireElf(ccSrc, CC_NODE_BIN)
-  files.push({ name: `opt/kin/${CC_NODE_BIN}`, src: ccSrc, mode: 0o755 })
+  for (const bin of ['cli-node', 'cc-node']) {
+    const src = path.join(wrapDir, bin)
+    requireElf(src, bin)
+    files.push({ name: `opt/kin/${bin}`, src, mode: 0o755 })
+  }
   const glibc = path.join(wrapDir, WRAP_GLIBC_DIR)
   if (fs.existsSync(glibc)) {
     for (const name of fs.readdirSync(glibc).sort()) {

@@ -15,6 +15,12 @@ import { slotContainerName } from '../transport/rust-kernel-supervisor.mjs'
 import { slotHost } from './slot-host.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
+import {
+  LOCAL_CRAG_CLAUDE,
+  REMOTE_CRAG_CLAUDE,
+  resolveCragKernelVersion,
+  resolveKernelDataplane,
+} from './slot-engine.mjs'
 import { slotExecCmd } from './slot-exec.mjs'
 import { getVm } from './vm-registry.mjs'
 import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
@@ -341,14 +347,23 @@ const SYSTEM_FACTS_RC = [
 ].join('\n')
 
 /**
- * Interactive shell for one panel session. `claude` is this slot's selected CLI,
- * not whatever `claude` is on PATH. The rcfile is session-only; the slot's
+ * Interactive shell for one panel session. `claude` is this slot's kernel
+ * binary: cli-node, or the CRAG package's native claude after a v2 switch.
+ * Not whatever `claude` is on PATH. The rcfile is session-only; the slot's
  * own ~/.bashrc is sourced, not rewritten. Startup prints a live 系统特征
  * block: slot computer files and cgroup limits first, then guest /proc and
  * sysfs; missing optional probes become
  * unknown/未采集 and must not prevent the prompt.
- * @returns {{ cmd: string[], rc: string }}
  */
+export function terminalClaudeBin(vm) {
+  const host = slotHost(vm)
+  const dataplane = resolveKernelDataplane(vm) || 'wrap'
+  if (dataplane === 'crag' && resolveCragKernelVersion(vm) === 'v2' && !isKvmRuntime(vm) && !host.native)
+    return host.bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE
+  return host.bins.cli
+}
+
+/** @returns {{ cmd: string[], rc: string }} */
 export function panelShellLaunch(cliBin, { native = false } = {}) {
   const bin = String(cliBin || '')
   if (!bin.startsWith('/') || /[\n\r\0]/.test(bin)) throw new Error('invalid Claude CLI path')
@@ -388,7 +403,7 @@ export function panelShellLaunch(cliBin, { native = false } = {}) {
 }
 // Closing the hijacked stream does not end a TTY exec: bash would linger in the
 // slot. Every process of the session inherits the marker, so HUP them by it.
-const REAP_SCRIPT = `for d in /proc/[0-9]*; do tr '\\0' '\\n' < "$d/environ" 2>/dev/null | grep -qx "${SESSION_ENV}=$1" || continue; cmd=$(tr '\\0' ' ' < "$d/cmdline" 2>/dev/null || true); case "$cmd" in *cli-node*) kill -KILL "\${d#/proc/}" 2>/dev/null || true ;; *) kill -HUP "\${d#/proc/}" 2>/dev/null || true ;; esac; done; exit 0`
+const REAP_SCRIPT = `for d in /proc/[0-9]*; do tr '\\0' '\\n' < "$d/environ" 2>/dev/null | grep -qx "${SESSION_ENV}=$1" || continue; cmd=$(tr '\\0' ' ' < "$d/cmdline" 2>/dev/null || true); case "$cmd" in *cli-node*|*${LOCAL_CRAG_CLAUDE.slice(LOCAL_CRAG_CLAUDE.lastIndexOf('claude-code-'))}*) kill -KILL "\${d#/proc/}" 2>/dev/null || true ;; *) kill -HUP "\${d#/proc/}" 2>/dev/null || true ;; esac; done; exit 0`
 
 function clampInt(v, lo, hi, dflt) {
   const n = Number.parseInt(v, 10)

@@ -227,7 +227,8 @@ export function tierSummary(vms: Vm[]): string {
   return [...counts.entries()]
     .sort(
       ([a], [b]) =>
-        (TIER_ORDER[a.toLowerCase()] ?? 2) - (TIER_ORDER[b.toLowerCase()] ?? 2)
+        (TIER_ORDER[a.toLowerCase().split(' ')[0]] ?? 2) -
+        (TIER_ORDER[b.toLowerCase().split(' ')[0]] ?? 2)
     )
     .map(([label, n]) => `${n} ${label}`)
     .join(' · ')

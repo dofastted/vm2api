@@ -53,7 +53,7 @@ function fixture(t) {
   const pkg = seedEncryptedPackage(root)
   return { root, vm, pkg }
 }
-function route(root, method, suffix, body, role = 'admin') {
+function route(root, method, suffix, body, role = 'admin', id = 'vm-13') {
   const result = {}
   const handle = createPanelHandler({
     cfg: { paths: { project: root }, vm: { id: null } },
@@ -71,7 +71,7 @@ function route(root, method, suffix, body, role = 'admin') {
     },
     proxyPool: { unbindVm() {} },
   })
-  return handle({ method }, {}, new URL(`http://localhost/api/panel/vms/vm-13${suffix}`)).then(() => result)
+  return handle({ method }, {}, new URL(`http://localhost/api/panel/vms/${id}${suffix}`)).then(() => result)
 }
 
 test('challenge and atomic activation expose only authenticated public status', async (t) => {
@@ -129,6 +129,53 @@ test('universal CRAGU1 activates without creating a device binding', async (t) =
   const expired = issueUniversalCode(root, { issued_at: Math.floor(Date.now() / 1000) - 70 * 86400 })
   assert.throws(() => activateCragLicense(root, vm, expired.code), { code: 'license_expired' })
   assert.deepEqual(fs.readFileSync(path.join(dir, 'registration.code')), stored)
+})
+
+test('cluster slot uses the universal grant and rejects a device code', async (t) => {
+  const { root } = fixture(t)
+  const cluster = { id: 'vm-remote', status: 'running', dataplane: 'crag', node_id: 'node-1' }
+  fs.mkdirSync(path.join(root, 'vms', cluster.id), { recursive: true })
+  fs.writeFileSync(path.join(root, 'vms', `${cluster.id}.json`), JSON.stringify(cluster))
+  const before = await route(root, 'GET', '/crag-license', null, 'admin', cluster.id)
+  assert.equal(before.status, 200)
+  assert.notEqual(before.body.error?.code, 'crag_v2_unsupported_placement')
+  const device = await route(
+    root,
+    'POST',
+    '/crag-license',
+    { registration_code: 'CRAGL1.not-a-grant' },
+    'admin',
+    cluster.id,
+  )
+  assert.equal(device.status, 400)
+  assert.equal(device.body.error.code, 'crag_v2_unsupported_placement')
+  const issued = issueUniversalCode(root)
+  const activated = await route(root, 'POST', '/crag-license', { registration_code: issued.code }, 'admin', cluster.id)
+  assert.equal(activated.status, 200)
+  assert.equal(activated.body.data.license.valid, true)
+  assert.equal(activated.body.data.license.kind, 'offline')
+  const current = await route(root, 'GET', '/crag-license', null, 'admin', cluster.id)
+  assert.equal(current.status, 200)
+  assert.equal(current.body.data.license.valid, true)
+  assert.equal(current.body.data.license.scope, 'kernel')
+})
+
+test('a cluster slot reuses a CRAGU1 stored on a local slot when the installation file is missing', (t) => {
+  const { root, vm } = fixture(t)
+  const issued = issueUniversalCode(root)
+  const dir = cragLicenseDirectory(root, vm)
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+  fs.writeFileSync(path.join(dir, 'registration.code'), `${issued.code}\n`, { mode: 0o600 })
+  assert.equal(fs.existsSync(cragUniversalDirectory(root)), false)
+  const remote = { id: 'vm-remote', node_id: 'node-a', status: 'stopped', dataplane: 'crag', crag_kernel_version: 'v2' }
+  fs.mkdirSync(path.join(root, 'vms', remote.id), { recursive: true })
+  fs.writeFileSync(path.join(root, 'vms', `${remote.id}.json`), JSON.stringify(remote))
+  const license = getCragLicense(root, remote)
+  assert.equal(license.license.valid, true)
+  assert.equal(license.license.kind, 'offline')
+  assert.equal(license.license.license_id, issued.claims.license_id)
+  assert.equal(checkCragLicense(root, remote).ok, true)
+  assert.doesNotMatch(JSON.stringify(license), /CRAGU1|wrapped_key|ciphertext|private_key/)
 })
 
 test('one offline code licenses every slot and does not replace a device grant', (t) => {
@@ -365,9 +412,9 @@ for (const mutation of [
       fs.renameSync(temporary, file)
     }
     if (mutation === 'native member replacement') {
-      const bytes = fs.readFileSync(path.join(pkg, 'claude-code-2.1.317/claude'))
+      const bytes = fs.readFileSync(path.join(pkg, 'claude-code-2.1.321/claude'))
       bytes[bytes.length - 1] ^= 1
-      replace('claude-code-2.1.317/claude', bytes)
+      replace('claude-code-2.1.321/claude', bytes)
     } else if (mutation === 'in-place member tamper') {
       const file = path.join(pkg, 'crag-v2.payload.enc')
       const original = fs.statSync(file)

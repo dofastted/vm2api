@@ -30,7 +30,7 @@ type UsageProbe = {
   source?: string
   via?: string | null
   probed_at?: string
-  account_tier?: string | null
+  subscription_type?: string | null
   five_hour?: UsageWindow
   seven_day?: UsageWindow
   seven_day_oi?: UsageWindow
@@ -67,7 +67,7 @@ function windowRow(label: string, w: UsageWindow): string {
 
 function usageLines(p: UsageProbe): string[] {
   const meta = [
-    p.account_tier ? `层级 ${p.account_tier}` : null,
+    p.subscription_type ? `套餐 ${p.subscription_type}` : null,
     `来源 ${probeSourceLabel(p.source)}${p.via ? ` · ${p.via}` : ''}`,
     fmtResetClock(p.probed_at),
   ]

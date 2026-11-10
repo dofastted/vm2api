@@ -10,10 +10,12 @@ import {
   createLiveLoginAdoption,
   createSlotShell,
   panelShellLaunch,
+  terminalClaudeBin,
   syncShellLoginCredentials,
 } from '../../src/lib/vm/slot-shell.mjs'
 import { FULL_OAUTH_SCOPE } from '../../src/lib/oauth/oauth-contract.mjs'
 import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
+import { CONTAINER_CLI_NODE_BIN, LOCAL_CRAG_CLAUDE, REMOTE_CRAG_CLAUDE } from '../../src/lib/vm/slot-engine.mjs'
 import {
   ensureOfficialCredentialLink,
   readWorkerCredentialFile,
@@ -58,6 +60,35 @@ test('claude in the panel shell runs cli-node and points config at .claude', () 
   assert.doesNotMatch(ran.stdout, /DECOY/)
   assert.equal(fs.readlinkSync(path.join(home, '.claude', '.credentials.json')), 'credentials.json')
   assert.equal(fs.readlinkSync(path.join(home, '.claude.json')), '.claude/.claude.json')
+  fs.rmSync(dir, { recursive: true, force: true })
+})
+
+test('a CRAG v2 terminal runs the package claude instead of cli-node', () => {
+  assert.equal(terminalClaudeBin({ id: 'vm-local', dataplane: 'crag', crag_kernel_version: 'v2' }), LOCAL_CRAG_CLAUDE)
+  assert.equal(
+    terminalClaudeBin({ id: 'vm-remote', node_id: 'node-a', dataplane: 'crag', crag_kernel_version: 'v2' }),
+    REMOTE_CRAG_CLAUDE,
+  )
+  assert.equal(terminalClaudeBin({ id: 'vm-wrap', dataplane: 'wrap' }), CONTAINER_CLI_NODE_BIN)
+  assert.equal(
+    terminalClaudeBin({ id: 'vm-kvm', dataplane: 'crag', crag_kernel_version: 'v2', runtime: { type: 'kvm' } }),
+    CONTAINER_CLI_NODE_BIN,
+  )
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-crag-'))
+  const binDir = path.join(dir, 'crag-v2')
+  const bin = path.join(binDir, 'claude')
+  fs.mkdirSync(binDir)
+  fs.writeFileSync(bin, '#!/bin/sh\necho "crag-claude $*"\n', { mode: 0o755 })
+  const { rc } = panelShellLaunch(bin)
+  const rcPath = path.join(dir, 'rc')
+  fs.writeFileSync(rcPath, `${rc}\n`)
+  const ran = spawnSync('bash', ['--rcfile', rcPath, '-ic', 'claude --flag'], {
+    encoding: 'utf8',
+    env: { ...process.env, HOME: dir, PATH: `${dir}:${process.env.PATH}`, KIN_PANEL_RCFILE: rcPath },
+  })
+  assert.equal(ran.status, 0, ran.stderr)
+  assert.match(ran.stdout, /crag-claude --flag/)
+  assert.doesNotMatch(rc, /cli-node/)
   fs.rmSync(dir, { recursive: true, force: true })
 })
 

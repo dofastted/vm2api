@@ -400,74 +400,6 @@ function fakeElf(file, fill) {
   fs.writeFileSync(file, buf, { mode: 0o755 })
 }
 
-const SLOT_IMAGE_ENV_KEYS = [
-  'KIN_KERNEL_BIN',
-  'KIN_WORKER_BIN',
-  'KIN_EGRESS_BIN',
-  'KIN_CODEX_KERNEL_BIN',
-  'KIN_OAUTH_AUTH_BIN',
-  'KIN_WRAP_CLI_ROOT',
-  'KIN_CLUSTER_WORKER_BIN',
-  'KIN_CLUSTER_EGRESS_BIN',
-]
-
-function withSlotImageEnv(t, root) {
-  const saved = Object.fromEntries(SLOT_IMAGE_ENV_KEYS.map((k) => [k, process.env[k]]))
-  t.after(() => {
-    for (const [k, v] of Object.entries(saved)) {
-      if (v === undefined) delete process.env[k]
-      else process.env[k] = v
-    }
-  })
-  for (const k of SLOT_IMAGE_ENV_KEYS) delete process.env[k]
-  process.env.KIN_CODEX_KERNEL_BIN = path.join(root, 'bin/kin-codex-kernel')
-  process.env.KIN_CLUSTER_WORKER_BIN = path.join(root, 'bin/kin-worker')
-  process.env.KIN_CLUSTER_EGRESS_BIN = path.join(root, 'bin/kin-egress')
-}
-
-function seedSlotImagePayload(root, { factoryCcNode = true, cacheCcNode = false } = {}) {
-  const pkgId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
-  const pkgDir = path.join(root, 'share/wrap-cli-releases/packages', `amd64-${pkgId}`)
-  fs.mkdirSync(pkgDir, { recursive: true })
-  fakeElf(path.join(pkgDir, 'kin-kernel.bin'), 1)
-  fakeElf(path.join(pkgDir, 'cli-node'), 2)
-  if (cacheCcNode) fakeElf(path.join(pkgDir, 'cc-node'), 2)
-  fs.mkdirSync(path.join(root, 'share/wrap-cli-releases'), { recursive: true })
-  fs.writeFileSync(
-    path.join(root, 'share/wrap-cli-releases/current-amd64.json'),
-    JSON.stringify({ package: `packages/amd64-${pkgId}` }),
-  )
-  if (factoryCcNode) fakeElf(path.join(root, 'share/wrap-cli/cc-node'), 3)
-  for (const f of ['bin/kin-worker', 'bin/kin-egress', 'bin/kin-oauth-auth', 'bin/kin-codex-kernel']) {
-    fakeElf(path.join(root, f), 1)
-  }
-}
-
-test('slot image uses factory cc-node when the wrap-cli cache package omits it', (t) => {
-  const root = tmpDir('kin-slot-cc-fallback-')
-  withSlotImageEnv(t, root)
-  seedSlotImagePayload(root, { factoryCcNode: true, cacheCcNode: false })
-  seedEncryptedPackage(root)
-  const factoryCc = path.join(root, 'share/wrap-cli/cc-node')
-  const spec = slotImageSpec(root, 'ubuntu-24.04')
-  const cc = spec.files.find((file) => file.name === 'opt/kin/cc-node')
-  assert.ok(cc, 'cc-node must be baked into the slot image')
-  assert.equal(path.resolve(cc.src), path.resolve(factoryCc))
-})
-
-test('slot image reports factory cc-node path when both cache and factory omit it', (t) => {
-  const root = tmpDir('kin-slot-cc-missing-')
-  withSlotImageEnv(t, root)
-  seedSlotImagePayload(root, { factoryCcNode: false, cacheCcNode: false })
-  seedEncryptedPackage(root)
-  const factoryCc = path.join(root, 'share/wrap-cli/cc-node')
-  assert.throws(
-    () => slotImageSpec(root, 'ubuntu-24.04'),
-    (err) => err.code === 'slot_payload_missing' && String(err.message).includes(factoryCc),
-    'missing cc-node must name the factory path',
-  )
-})
-
 test('slot image tag follows payload bytes only; a VERSION bump keeps the image', (t) => {
   const root = tmpDir('kin-slot-image-')
   fs.writeFileSync(path.join(root, 'VERSION'), '9.9.9\n')
@@ -514,8 +446,9 @@ test('slot image tag follows payload bytes only; a VERSION bump keeps the image'
     { id: 'vm-03', platform: 'anthropic', node_id: 'node-a', kernel: 'ubuntu-24.04' },
     { image: a.ref, network: 'test-net', remoteDir: '/home/node/vms/vm-03', user: '1000:1000', routing: {} },
   )
-  const entry = a.files.find((file) => `/${file.name}` === container.Cmd[0])
-  assert.ok(entry, 'the remote Claude command must name a file baked into its slot image')
+  assert.equal(container.Cmd[0], '/opt/kin-live/kin-kernel')
+  const entry = a.files.find((file) => file.name === 'opt/kin/kin-kernel')
+  assert.ok(entry, 'the image still bakes the cli-node wrapper for guests that have not mounted slot-bin')
   assert.equal(entry.mode, 0o755)
   assert.ok(a.files.some((file) => file.name === 'opt/kin/kin-kernel'))
   assert.ok(a.files.some((file) => file.name === 'opt/kin/crag-kernel' && file.mode === 0o755))
@@ -698,7 +631,10 @@ test('node payload refresh recreates a running slot whose command does not match
     sessionFor: async () => ({ docker: {} }),
     inspect: async () => ({
       State: { Running: true },
-      Config: { Image: current, Cmd: ['/opt/kin/kin-kernel', '--gateway-worker', '--config', '/run/kin/kernel.json'] },
+      Config: {
+        Image: current,
+        Cmd: ['/opt/kin-live/kin-kernel', '--gateway-worker', '--config', '/run/kin/kernel.json'],
+      },
     }),
     startFn: async () => {
       wrapStarted.push('started')
@@ -707,6 +643,20 @@ test('node payload refresh recreates a running slot whose command does not match
   })
   assert.equal(wrapReport.kernel_changed, false)
   assert.deepEqual(wrapStarted, [])
+  const legacyStarted = []
+  const legacy = await refreshNodeSlotPayload(wrap, root, {
+    sessionFor: async () => ({ docker: {} }),
+    inspect: async () => ({
+      State: { Running: true },
+      Config: { Image: current, Cmd: ['/opt/kin/kin-kernel', '--gateway-worker', '--config', '/run/kin/kernel.json'] },
+    }),
+    startFn: async () => {
+      legacyStarted.push('started')
+      return { ok: true, action: 'recreated' }
+    },
+  })
+  assert.equal(legacy.restarted, true)
+  assert.deepEqual(legacyStarted, ['started'])
 })
 
 test('amd64 node payload stays separate from native ARM control helpers', (t) => {

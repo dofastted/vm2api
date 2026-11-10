@@ -66,11 +66,7 @@ function fixture({
     HostConfig: { NetworkMode: 'network' },
     State: { Running: running, Restarting: restarting },
   }
-  let info = missing
-    ? null
-    : kind !== 'docker'
-      ? base
-      : (cragReady ? cragReadyContainer(base) : kernelContainer(base))
+  let info = missing ? null : kind !== 'docker' ? base : cragReady ? cragReadyContainer(base) : kernelContainer(base)
   const io = {
     prepare: async () => ({
       nodeId: target.node_id,

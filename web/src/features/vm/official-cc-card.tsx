@@ -135,7 +135,7 @@ export function OfficialCcFacts({ cc }: { cc: OfficialCcStatus | null }) {
       : cc.telemetry_enabled
         ? '遥测已写'
         : ''
-  const bits = [cc.account_tier, quota, resident, tel].filter(Boolean)
+  const bits = [cc.subscription_type, quota, resident, tel].filter(Boolean)
   return (
     <p className='text-xs text-muted-foreground'>
       {bits.length ? bits.join(' · ') : '初装尚未产出探测结果。'}
@@ -179,7 +179,7 @@ export function OfficialCcCard({
     if (st === 'ok') {
       toast.success(
         '官方初装完成' +
-          (cc?.account_tier ? ` · ${cc.account_tier}` : '') +
+          (cc?.subscription_type ? ` · ${cc.subscription_type}` : '') +
           (cc?.telemetry_official ? ' · 遥测已对齐' : '')
       )
     } else if (st === 'error') {
@@ -244,7 +244,7 @@ export function OfficialCcCard({
       <CardContent className='space-y-3'>
         <OfficialCcTrack cc={cc || null} />
         <div className='flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground'>
-          {cc?.account_tier ? <span>{cc.account_tier}</span> : null}
+          {cc?.subscription_type ? <span>{cc.subscription_type}</span> : null}
           {cc?.available_models?.length ? (
             <span title={cc.available_models.join('\n')}>
               {cc.available_models.length} 个可用模型

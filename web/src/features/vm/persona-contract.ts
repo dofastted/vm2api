@@ -6,7 +6,7 @@ const SLOT_LABELS: Record<SlotPersonaPreset, string> = {
   official: '官方提示词',
   official_full: '官方完整提示词',
   zero: '0注入',
-  official_303: '官方 2.1.303（按模型）',
+  official_303: '官方 2.1.321（按模型）',
 }
 
 export const SLOT_PERSONA_OPTIONS: {

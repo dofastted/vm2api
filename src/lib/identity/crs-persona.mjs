@@ -77,6 +77,7 @@ import {
   OFFICIAL_303_PRESET,
 } from './persona-template.mjs'
 import {
+  OFFICIAL_303_AGENT_IDENTITY,
   OFFICIAL_303_HARNESS,
   OFFICIAL_303_ENV_INSTRUCTIONS,
   buildOfficial303Environment,
@@ -335,12 +336,13 @@ function boundedBillingIndex(value, min) {
   return n
 }
 
-/** 2.1.293 appends both indexes, or neither. */
-export function billingTurnSuffix(promptIndex, turnIndex) {
-  const prompt = boundedBillingIndex(promptIndex, 0)
+/** First-turn indexes stay frozen. `cli` is the TUI capture; `sdk-cli` is `--print`. */
+export function billingTurnSuffix(promptIndex, turnIndex, entrypoint = 'sdk-cli') {
+  const prompt = entrypoint === 'cli' ? 1 : boundedBillingIndex(promptIndex, 0)
   const turn = boundedBillingIndex(turnIndex, 1)
   if (prompt == null || turn == null) return ''
-  return ` cc_turn_origin=sdk; cc_prompt_index=${prompt}; cc_turn_index=${turn};`
+  const origin = entrypoint === 'cli' ? 'human' : 'sdk'
+  return ` cc_turn_origin=${origin}; cc_prompt_index=${prompt}; cc_turn_index=${turn};`
 }
 
 function toolResultOnlyMessage(message) {
@@ -350,14 +352,14 @@ function toolResultOnlyMessage(message) {
 }
 
 /** First-turn indexes only. A moving cc_turn_index rewrites system[0] and invalidates every breakpoint after tools. */
-export function billingIndexesFromMessages(messages) {
+export function billingIndexesFromMessages(messages, entrypoint = 'sdk-cli') {
   if (!Array.isArray(messages)) return null
   let prompts = 0
   for (const message of messages) {
     if (message?.role === 'user' && !toolResultOnlyMessage(message)) prompts += 1
   }
   if (prompts < 1) return null
-  return { promptIndex: 0, turnIndex: 1 }
+  return { promptIndex: entrypoint === 'cli' ? 1 : 0, turnIndex: 1 }
 }
 
 const BILLING_PROMPT_ID_RE = /cc_prompt_id=[^;\s]*/g
@@ -430,8 +432,8 @@ export function buildBillingAttributionText(
   const ver = parseCliVersion(cliVersion)
   const fp = computeClaudeCodeFingerprint(firstUserText ?? '', ver)
   const promptId = billingPromptId(sessionId, firstUserText, ver)
-  const tail = billingTurnSuffix(indexes?.promptIndex, indexes?.turnIndex)
   const entry = entrypoint === 'cli' ? 'cli' : 'sdk-cli'
+  const tail = billingTurnSuffix(indexes?.promptIndex, indexes?.turnIndex, entry)
   return `x-anthropic-billing-header: cc_version=${ver}.${fp}; cc_entrypoint=${entry}; cch=${CCH_PLACEHOLDER}; cc_prompt_id=${promptId};${tail}`
 }
 
@@ -879,15 +881,15 @@ export function personaTemplateVars({
     firstUserText,
     cliVersion,
     sessionId,
-    billingIndexesFromMessages(messages),
+    billingIndexesFromMessages(messages, entrypoint),
     entrypoint,
   )
   const envTimezoneOnly = () => buildOfficialEnvironmentSection(env, { sourceTexts, contextManagement: false })
   return {
     billing,
     billing_semi: billing.endsWith(';') ? billing : `${billing};`,
-    identity: CRS_OFFICIAL_CLI_SYSTEM,
-    identity_cli: CRS_OFFICIAL_CLI_SYSTEM,
+    identity: entrypoint === 'sdk-cli' ? OFFICIAL_303_AGENT_IDENTITY : CRS_OFFICIAL_CLI_SYSTEM,
+    identity_cli: entrypoint === 'sdk-cli' ? OFFICIAL_303_AGENT_IDENTITY : CRS_OFFICIAL_CLI_SYSTEM,
     identity_compact: CRS_COMPACT_IDENTITY,
     reporting: CRS_REPORTING_OUTCOMES,
     dynamic_boundary: '__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__',

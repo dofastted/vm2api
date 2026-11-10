@@ -2,6 +2,41 @@
 
 ## Unreleased
 
+## 1.4.060 — 2026-11-10
+
+- Claude 订阅档从 OAuth 的订阅元数据和官方 `/api/oauth/profile` 识别，不再用 Fable 是否可用、用量窗口或旧调度档推断。面板保留 `subscription_type` 和 `rate_limit_tier`，有数据时显示 Max 5x/20x，没有就保持未识别。调度策略和 Codex 档不变。
+
+已部署机升级：更新 Node 控制面后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。不要 `docker rm` 槽。
+
+## 1.4.059 — 2026-11-10
+
+- Codex 模型 `codex-auto-review` 默认改写成 `gpt-6-luna`。
+
+已部署机升级：更新 Node 控制面后重启。这是默认 `routing.json`。已经部署的机器不要覆盖本机 `routing.json`；要这条别名就在本机配置里加同样的 `model_mappings`。
+
+## 1.4.058 — 2026-11-10
+
+- CRAG v2 默认官方 Claude 改为 2.1.321（2026-11-09）。包成员、槽内路径和安装校验都是 `claude-code-2.1.321/claude`。已经发出的 2.1.317 归档不改写。
+- 面板和 cli-node 的默认出站版本改为 2.1.321。`cli` 用交互身份、`cc_turn_origin=human`、`cc_prompt_index=1`、`thinking.display=updates` 和 `thinking-display-updates` beta。`sdk-cli` 用 Agent SDK 身份、`cc_turn_origin=sdk`、`cc_prompt_index=0`、`thinking.display=omitted`，不加那条 beta。两边都带 `tool-provenance-2026-10-26`、`x-claude-code-sandy-plover: []`，Node 运行时 `v26.12.1`。目录加入 `claude-fable-5-2`（输入 $8 / 输出 $40 / 缓存读 $0.20，默认 effort medium）；短名 `fable` 指向它。
+- CRAG v2 槽的 health 会带上凭证是否可用（不含密钥）。创建槽时写入的 API key 不再因为 worker 没回报 `credential` 被判成 `oauth_unconfirmed`，密钥可以选中这些 VM。
+- 本机 Docker 切到 CRAG v2 时，只要宿主启用了 AppArmor 就带 `apparmor=unconfined` 并在缺它时重建容器。docker-default 会拒绝 `/proc/self` 的 uid_map 写入和 bind mount，guest identity 因此得到 `Permission denied (os error 13)`，而不是以前的 seccomp `os error 1`。
+- 内核页可以在本机 Docker、集群槽和 KVM 上重装 cli-node 或 CRAG，完成后保持停用。macOS 原生节点仍然不行。拉取旁边的「更新全部槽位」把刚拉取的内核装到每一台 Claude 槽。集群字节写到 `slot-bin`，哈希相同的文件不重传，`crag-kernel` 只覆盖不先删。cli-node 的新容器命令改为 `/opt/kin-live/kin-kernel`。
+- 集群部署更新和内核切换不再调用 `chmod -h` / `chown -h`。coreutils 8.32 之前和 BusyBox 会报 `chmod: invalid option -- 'h'` 并中断切换。私有目录改用 `find -P`，符号链接不跟随，匹配不到就失败。
+- `crag_model` 只发给 health capabilities 含 `linux_tui_pty` 或 `model_directive` 的 worker。集群 hop / 旧内核会把该字段原样打到 Anthropic，得到 `crag_model: Extra inputs are not permitted` / `upstream_invalid_request`。没有这个能力时，部署、切换和出站都丢掉 `crag_model` 与 `crag_prompt`。
+- 最终出站：cli-node 与 CRAG 都经 `kin_outbound_headers` 回传 fetch 前的真实请求头。CRAG 另带回请求体，只保留前 10000 token（CJK 一字一 token，ASCII 四字一 token），凭证在离开 CLI 前打码。没有回传体时，日志里的出站体仍是发给 worker 的信封。
+- 集群 Docker 槽的 VM 面板可以在 cli-node 与 CRAG v2 之间切换。KVM 和 macOS 原生节点仍然不能切。切换会按该槽自己的内核重建容器，不再把未选择 CRAG 的集群槽写回 v2。
+- 出站按 VM 实际启用的内核切换：只有运行中的 CRAG v2（health `runtime_variant`，否则槽位自己的 `dataplane` / `crag_kernel_version`，再否则该槽 `kernel.json`）走 print。`crag_model` 还要该 worker 的 capabilities 声明会在本地消化。全局 `routing.inference=crag` 不再把 wrap / cc / 未写内核的槽送上 print。cli-node 信封会丢掉调用方塞进来的 `crag_prompt`。
+
+已部署机升级：更新 Node 控制面后重启。CRAG 要换成 2.1.321 时先在内核页拉取新包。不必 `wrap-cli/sync`。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。不要 `docker rm` 槽。
+
+## 1.4.057 — 2026-11-10
+
+- 集群 Linux Docker 槽切换 CRAG 时认本机已经激活的同一张离线码，不再因为没有本槽机器身份而停在未配置。内核页只拦截 KVM 和 macOS，不再把 Linux 集群槽的 CRAG 选项禁用。
+- 面板终端的 `claude` 跟随本槽内核。切到 CRAG v2 后执行包内原生 `claude-code-2.1.317/claude`，不再启动 `cli-node`。
+- #937：Anthropic Messages `type=image` + `source`（base64/url）在转 Codex Responses 时不再被静默丢弃，顺序与 OpenAI `image_url` 路径兼容。
+
+已部署机升级：更新 Node 控制面后重启。不必 `wrap-cli/sync`，不必换 payload。不要覆盖 `routing.json`、`vms/`、`data/`、`.env`。不要 `docker rm` 槽。
+
 ## 1.4.056 — 2026-11-09
 
 - 集群 Linux Docker 槽可以激活并安装 CRAG v2。原生 Claude Code（`claude-code-2.1.317/claude`）随 CRAG 包一起推到节点，不再要求本机槽。KVM 和 macOS 原生节点仍然不行。

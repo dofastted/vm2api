@@ -1544,10 +1544,15 @@ export function createHandleProtocol(deps) {
       logBag.outbound_headers = null
       logBag.outbound_headers_source = 'unavailable'
     }
-    const noteOutboundHeaders = (headers) => {
+    const noteOutboundHeaders = (headers, extra = {}) => {
       if (!logCtx.capture_outbound) return
       logBag.outbound_headers = redactHeaders(headers)
       logBag.outbound_headers_source = 'cli_final'
+      if (extra?.body != null) {
+        logBag.outbound_body = extra.body
+        logBag.outbound_body_source = 'cli_final'
+        logBag.outbound_body_truncated = extra.body_truncated === true
+      }
     }
     let result
     try {
@@ -1662,8 +1667,18 @@ export function createHandleProtocol(deps) {
               })
             if (cragPrint) {
               const cragPersona = resolveCragPrintPersona(selected.vm, routingNow)
+              // CRAG print bypasses the cli-node envelope builder. Canonicalize
+              // once more at this boundary so passthrough traffic cannot carry
+              // client/OpenAI fields into the native worker.
+              const cragStandard = toStandardAnthropicBody(personaIn, {
+                official: officialTraffic === true,
+                rewriteTools: routingNow?.compatibility?.tool_name_rewrite !== false,
+              })
+              if (Object.keys(cragStandard.reverse || {}).length) {
+                inboundToolReverse = composeToolNames(inboundToolReverse, cragStandard.reverse)
+              }
               let source = filterThinkingForAccount(
-                shallowCopyBody(personaIn),
+                shallowCopyBody(cragStandard.body),
                 selected.accountId,
                 thinkingOwnerStore,
               ).body

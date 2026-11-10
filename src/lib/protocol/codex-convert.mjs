@@ -60,6 +60,13 @@ function imageUrlOf(part) {
   if (typeof part?.image_url === 'string') return part.image_url
   if (typeof part?.image_url?.url === 'string') return part.image_url.url
   if (typeof part?.url === 'string') return part.url
+  const source = part?.source
+  if (source && typeof source === 'object') {
+    if (source.type === 'base64' && typeof source.data === 'string' && typeof source.media_type === 'string') {
+      return `data:${source.media_type};base64,${source.data}`
+    }
+    if (source.type === 'url' && typeof source.url === 'string') return source.url
+  }
   return ''
 }
 

@@ -4,6 +4,7 @@
  * lines, --output-format json envelopes, or raw CLI text. Never logs secrets.
  */
 import { isCompleteOAuthUsage, normUtilization, parseOAuthUsage } from './crs-usage-probe.mjs'
+import { subscriptionTypeFromOauthRaw } from './oauth-identity.mjs'
 
 export function officialStatsText(raw) {
   if (raw == null) return ''
@@ -50,14 +51,7 @@ function windowFromText(text, patterns) {
  * reads for "Max"/"Pro"). Returns null when the profile does not say.
  */
 export function tierFromOauthProfile(profile = {}) {
-  const account = profile?.account || {}
-  const org = profile?.organization || {}
-  if (account.has_claude_max === true) return 'max'
-  const orgType = String(org.organization_type || '').toLowerCase()
-  const rateTier = String(org.rate_limit_tier || '').toLowerCase()
-  if (orgType === 'claude_max' || rateTier.includes('max')) return 'max'
-  if (account.has_claude_pro === true || orgType === 'claude_pro' || rateTier.includes('pro')) return 'pro'
-  return null
+  return subscriptionTypeFromOauthRaw(profile)
 }
 
 export function inferTierFromOfficialStats(text = '', structured = {}) {

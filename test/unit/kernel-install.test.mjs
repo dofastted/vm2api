@@ -4,12 +4,18 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { installKernelTargets, releaseKernelInstallSafetyHold } from '../../src/lib/vm/kernel-install.mjs'
+import { kvmKernelSelector, selectChangedPayloadFiles } from '../../src/lib/cluster/remote-slot-files.mjs'
 import { describeKernelCatalog } from '../../src/lib/admin/kernel-catalog.mjs'
 import { getVm, patchVmRecord, summarizeVm } from '../../src/lib/vm/vm-registry.mjs'
 import { withVmLock } from '../../src/lib/vm/vm-file.mjs'
-import { cragLicenseDirectory } from '../../src/lib/vm/crag-license.mjs'
+import { activateCragLicense, cragLicenseDirectory } from '../../src/lib/vm/crag-license.mjs'
 import { writeKernelConfig } from '../../src/lib/transport/rust-kernel-supervisor.mjs'
-import { activateFixture, issueFixtureCode, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
+import {
+  activateFixture,
+  issueFixtureCode,
+  issueUniversalCode,
+  seedEncryptedPackage,
+} from '../fixtures/crag-license.mjs'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 
 const savedEnv = Object.fromEntries(
@@ -249,8 +255,7 @@ for (const state of ['unlicensed', 'expired', 'wrong-vm', 'package-tamper']) {
 
 for (const [patch, kernel, code] of [
   [{ platform: 'openai', family: 'codex', codex_kernel: true }, 'cli-node', 'kernel_codex_unsupported'],
-  [{ node_id: 'remote-node' }, 'cli-node', 'kernel_install_unsupported_placement'],
-  [{ runtime: { type: 'kvm' } }, 'crag', 'crag_v2_unsupported_placement'],
+  [{ node_platform: 'darwin' }, 'crag', 'kernel_install_unsupported_placement'],
 ]) {
   test(`unsupported target rejects ${code} without stopping`, async (t) => {
     const { root } = fixture(t, patch)
@@ -267,6 +272,74 @@ for (const [patch, kernel, code] of [
     assert.equal(result.items[0].stopped, false)
   })
 }
+
+test('cluster install pushes the kernel and leaves the local tree, including crag-kernel, untouched', async (t) => {
+  const { root, vm, home, run } = fixture(t, { node_id: 'remote-node' })
+  const calls = []
+  const life = lifecycle(root, {
+    checkCragLicense() {
+      return { ok: true }
+    },
+    deployBakedKernel(_project, candidate, kernel) {
+      calls.push({ id: candidate.id, node_id: candidate.node_id, kernel, dataplane: candidate.dataplane })
+      assert.equal(fs.existsSync(path.join(home, '.kin', 'crag-v2')), false)
+      return { ok: true }
+    },
+    writeKernelConfig() {
+      return { configPath: path.join(run, 'kernel.json'), runDir: run }
+    },
+  })
+  const result = await installKernelTargets({
+    projectRoot: root,
+    targets: target('crag'),
+    ops: life.ops,
+  })
+  assert.equal(result.ok, true, JSON.stringify(result))
+  assert.equal(life.stops(), 1)
+  assert.deepEqual(calls, [{ id: 'vm-13', node_id: 'remote-node', kernel: 'crag', dataplane: 'crag' }])
+  assert.equal(fs.readFileSync(path.join(home, '.kin', 'kin-kernel.bin'), 'utf8'), 'previous-kernel')
+  assert.equal(fs.existsSync(path.join(home, '.kin', 'crag-kernel')), false)
+  assert.equal(getVm(root, vm.id).dataplane, 'crag')
+  assert.equal(getVm(root, vm.id).status, 'stopped')
+})
+
+test('local kvm crag install writes the guest entry and does not push to a node', async (t) => {
+  const built = fixture(t)
+  activateCragLicense(built.root, built.vm, issueUniversalCode(built.root).code)
+  const vm = { ...built.vm, runtime: { ...built.vm.runtime, type: 'kvm' } }
+  fs.writeFileSync(path.join(built.root, 'vms', `${vm.id}.json`), JSON.stringify(vm))
+  const life = lifecycle(built.root, {
+    deployBakedKernel() {
+      assert.fail('local kvm does not push')
+    },
+  })
+  const result = await installKernelTargets({
+    projectRoot: built.root,
+    targets: target('crag'),
+    ops: life.ops,
+  })
+  assert.equal(result.ok, true, JSON.stringify(result))
+  assert.match(fs.readFileSync(path.join(built.home, '.kin', 'kin-kernel'), 'utf8'), /crag-v2/)
+  assert.equal(fs.readFileSync(path.join(built.home, 'workspace.txt'), 'utf8'), 'protected-workspace')
+  assert.equal(getVm(built.root, vm.id).status, 'stopped')
+})
+
+test('payload publish replaces only changed files and the kvm selector execs the live entry', () => {
+  const plan = selectChangedPayloadFiles(
+    [
+      { rel: 'crag-kernel', sha256: 'aaa' },
+      { rel: 'crag-v2/claude-code-2.1.321/claude', sha256: 'bbb' },
+    ],
+    new Map([['crag-v2/claude-code-2.1.321/claude', 'bbb']]),
+  )
+  assert.deepEqual(
+    plan.map((file) => file.rel),
+    ['crag-kernel'],
+  )
+  assert.equal(Object.hasOwn(plan[0], 'unlink'), false)
+  assert.match(kvmKernelSelector('crag'), /^#!\/bin\/sh\nexec \/opt\/kin-live\/crag-kernel "\$@"\n$/)
+  assert.match(kvmKernelSelector('cli-node'), /exec \/opt\/kin-live\/kin-kernel /)
+})
 
 test('cluster Docker CRAG install is not rejected as a local-only slot', async (t) => {
   const { root } = fixture(t, { node_id: 'remote-node' })

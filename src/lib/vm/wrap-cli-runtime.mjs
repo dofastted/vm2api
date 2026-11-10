@@ -16,7 +16,6 @@ import os from 'node:os'
 import path from 'node:path'
 import { kernelBinPath } from '../transport/rust-kernel-supervisor.mjs'
 import { isCodexVm } from './vm-kind.mjs'
-import { isKvmRuntime } from './runtime-kind.mjs'
 import { nativeCliForVm, NATIVE_CLI_FILES } from './native-cli.mjs'
 import { resolveCragKernelVersion, resolveKernelDataplane } from './slot-engine.mjs'
 import { checkCragLicense, decodeLicenseBytes } from './crag-license.mjs'
@@ -80,7 +79,7 @@ exec "$DIR/${WRAP_KERNEL_WRAPPER}.real" "$@"
 
 export const CRAG_V2_DIR = 'crag-v2'
 const CRAG_V2_ENTRY = 'crag-v2'
-const CRAG_V2_CLAUDE = 'claude-code-2.1.317/claude'
+const CRAG_V2_CLAUDE = 'claude-code-2.1.321/claude'
 const CRAG_V2_CAPS = Object.freeze(['official_full', 'zero', 'cancel', 'telemetry', 'unix_socket_envelope'])
 
 export function cragV2Arch() {
@@ -140,11 +139,19 @@ function cragV2PlacementError(vm) {
   if (isCodexVm(vm)) {
     return { ok: false, code: 'kernel_codex_unsupported', error: '请选择 Claude 虚拟机' }
   }
-  if (isKvmRuntime(vm) || vm?.node_platform === 'darwin') {
+  if (vm?.node_platform === 'darwin') {
     return {
       ok: false,
       code: 'crag_v2_unsupported_placement',
-      error: isKvmRuntime(vm) ? 'CRAG v2 不支持 KVM 槽' : 'CRAG v2 不支持 macOS 原生节点',
+      error: 'CRAG v2 不支持 macOS 原生节点',
+    }
+  }
+  // A cluster slot's tree is the node slot-bin, not this control plane's home.
+  if (String(vm?.node_id || '').trim()) {
+    return {
+      ok: false,
+      code: 'crag_v2_unsupported_placement',
+      error: '集群槽的 CRAG 由内核页推到节点，不在控制面本机物化',
     }
   }
   return null

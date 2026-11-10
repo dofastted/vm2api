@@ -53,7 +53,46 @@ const WRITE_CHUNK = 32 * 1024
  * Atomic, symlink-safe write. `owner` is only set when the SSH user is root (the
  * slot then runs as 10000+n and must own its files); a non-root SSH user already is the slot uid.
  */
-export async function writeRemoteFile(sftp, file, data, { mode = 0o600, owner = null } = {}) {
+export async function writeRemoteFile(sftp, file, data, { mode = 0o600, owner = null, timeoutMs = 0 } = {}) {
+  let timedOut = false
+  const work = writeRemoteFileBody(sftp, file, data, { mode, owner }).catch((error) => {
+    if (timedOut) return undefined
+    throw error
+  })
+  if (!timeoutMs) return work
+  let timer
+  try {
+    return await Promise.race([
+      work,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true
+          reject(new ClusterError(504, 'sftp_timeout', `写入超时：${file}`))
+        }, timeoutMs)
+        timer.unref?.()
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/** Regular-file SHA-256, or null when the path is missing. A symlink is not hashed. */
+export async function remoteFileSha256(client, file) {
+  const script = `f=${shellQuote(file)}; if [ -L "$f" ] || [ ! -f "$f" ]; then exit 3; fi; sha256sum "$f"`
+  const result = await execCollect(client, `sh -c ${shellQuote(script)}`, { timeoutMs: 120_000, maxBytes: 4096 })
+  if (result.code === 3) return null
+  if (result.code !== 0) {
+    const detail = (result.stderr || `exit ${result.code}`).trim().slice(-200)
+    throw new ClusterError(502, 'remote_hash_failed', `校验 ${file} 失败：${detail}`)
+  }
+  const hash = result.stdout.trim().split(/\s+/)[0]
+  if (!/^[a-f0-9]{64}$/.test(hash)) {
+    throw new ClusterError(502, 'remote_hash_failed', `校验 ${file} 返回异常`)
+  }
+  return hash
+}
+async function writeRemoteFileBody(sftp, file, data, { mode = 0o600, owner = null } = {}) {
   if (!Buffer.isBuffer(data)) data = Buffer.from(data)
   const dir = file.slice(0, file.lastIndexOf('/'))
   const tmp = `${dir}/.kin-${crypto.randomBytes(8).toString('hex')}.tmp`
@@ -68,6 +107,7 @@ export async function writeRemoteFile(sftp, file, data, { mode = 0o600, owner = 
     if (owner) await call((cb) => sftp.fchown(handle, owner.uid, owner.gid, cb))
     await call((cb) => sftp.close(handle, cb))
     handle = null
+    // Rename over the live path. Never unlink it first: a container command may point at it.
     await call((cb) => sftp.ext_openssh_rename(tmp, file, cb))
   } catch (err) {
     if (handle) await call((cb) => sftp.close(handle, cb)).catch(() => {})
@@ -113,12 +153,17 @@ export async function remoteSymlink(sftp, target, linkPath) {
 
 /**
  * Make each final component a real directory. Parents must be mount roots.
- * `chmod`/`chown` use `-h`: GNU coreutils otherwise follow a symlink the guest
- * swapped in, and `-h` on a symlink fails or changes the link instead.
+ * Mode and owner go through `find -P`: GNU chmod before 8.32 and BusyBox reject
+ * `chmod -h` (`invalid option -- 'h'`), which aborted kernel switch and deploy.
+ * `-P` does not follow a symlink the guest swapped in; a link matches nothing
+ * and the script fails closed instead of changing the target.
  * `owner` is only meaningful for a root SSH session.
  */
 export function privateDirectoriesScript(dirs, owner = null) {
-  const own = owner == null ? '' : `chown -h ${requireId(owner.uid)}:${requireId(owner.gid)} "$d" || exit 1;`
+  const own =
+    owner == null
+      ? ''
+      : `find -P "$d" -maxdepth 0 -type d -exec chown ${requireId(owner.uid)}:${requireId(owner.gid)} {} + || exit 1;`
   return dirs
     .map((dir) => {
       const d = shellQuote(dir)
@@ -128,7 +173,9 @@ export function privateDirectoriesScript(dirs, owner = null) {
         'if [ -e "$d" ] && [ ! -d "$d" ]; then rm "$d" || exit 1; fi;',
         'if [ ! -d "$d" ]; then mkdir "$d" || exit 1; fi;',
         'if [ -L "$d" ] || [ ! -d "$d" ]; then echo "private directory was replaced" >&2; exit 1; fi;',
-        'chmod -h 700 "$d" || exit 1;',
+        'hit=$(find -P "$d" -maxdepth 0 -type d -exec chmod 700 {} + -print);',
+        '[ -n "$hit" ] || { echo "private directory was replaced" >&2; exit 1; };',
+        'if [ -L "$d" ] || [ ! -d "$d" ]; then echo "private directory was replaced" >&2; exit 1; fi;',
         own,
       ].join(' ')
     })

@@ -68,6 +68,26 @@ function apparmorUserNamespaceRestricted() {
   }
 }
 
+function hostAppArmorEnabled() {
+  try {
+    return fs.readFileSync('/sys/module/apparmor/parameters/enabled', 'utf8').trim() === 'Y'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * docker-default denies writes under /proc/self (uid_map, setgroups, gid_map)
+ * and denies mount. Guest identity needs both, so the denial is EACCES (13),
+ * not the seccomp EPERM (1). The Ubuntu userns sysctl is only one of the cases.
+ */
+export function cragV2NeedsApparmorUnconfined(options = {}) {
+  if (Object.hasOwn(options, 'appArmorEnabled') || Object.hasOwn(options, 'userNamespaceRestricted')) {
+    return options.appArmorEnabled === true || options.userNamespaceRestricted === true
+  }
+  return hostAppArmorEnabled() || apparmorUserNamespaceRestricted()
+}
+
 // Root in the runner must write into the slot-uid 0700 dirs and drop qemu to the slot uid.
 export const KVM_CAPS = ['SETUID', 'SETGID', 'SETPCAP', 'CHOWN', 'FOWNER', 'DAC_OVERRIDE']
 
@@ -268,8 +288,8 @@ export function nativeSlotSandboxNeedsRecreate(existing, vm, routing = {}, optio
     }
   })
   if (!seccompOk) return true
-  const restricted = options.userNamespaceRestricted ?? apparmorUserNamespaceRestricted()
-  return (restricted && !opts.includes('apparmor=unconfined')) || existing.init !== true
+  const needsUnconfined = cragV2NeedsApparmorUnconfined(options)
+  return (needsUnconfined && !opts.includes('apparmor=unconfined')) || existing.init !== true
 }
 
 /** Migrate existing local slots in place, including paused ones; never start or recreate them. */
@@ -1242,7 +1262,7 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
         ? [
             '--security-opt',
             `seccomp=${CRAG_V2_SECCOMP_PATH}`,
-            ...(apparmorUserNamespaceRestricted() ? ['--security-opt', 'apparmor=unconfined'] : []),
+            ...(cragV2NeedsApparmorUnconfined() ? ['--security-opt', 'apparmor=unconfined'] : []),
           ]
         : []),
       '--cap-drop',

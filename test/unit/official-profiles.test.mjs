@@ -67,7 +67,7 @@ test('model shape follows official 2.1.303 he(model)', () => {
 
 test('official presets and zero bind 2.1.303 while custom/legacy presets retain 2.1.296', () => {
   for (const preset of ['official', 'official_full', 'official_303', '303', 'official-303', 'zero']) {
-    assert.equal(profileForPreset(preset).cliVersion, '2.1.303', String(preset))
+    assert.equal(profileForPreset(preset).cliVersion, '2.1.321', String(preset))
   }
   for (const preset of ['custom', '', undefined]) {
     assert.equal(profileForPreset(preset).cliVersion, '2.1.296', String(preset))
@@ -139,7 +139,7 @@ test('2.1.303 harness and guidance keep the captured split and fill the memory d
   assert.equal(OFFICIAL_303_AGENT_IDENTITY, "You are a Claude agent, built on Anthropic's Claude Agent SDK.")
   assert.ok(OFFICIAL_303_HARNESS.startsWith('\nYou are an agent working with the user toward their goals'))
   assert.ok(OFFICIAL_303_HARNESS.trimEnd().endsWith("it's clickable."))
-  assert.ok(OFFICIAL_303_GUIDANCE.startsWith('Write code that reads like the surrounding code'))
+  assert.ok(OFFICIAL_303_GUIDANCE.startsWith('When you use a pronoun for someone'))
   assert.ok(OFFICIAL_303_GUIDANCE.endsWith('<total_tokens>15000000 tokens left</total_tokens>'))
   assert.equal(OFFICIAL_303_MAIN_PROMPT, `${OFFICIAL_303_HARNESS}${OFFICIAL_303_GUIDANCE}`)
   assert.equal(OFFICIAL_303_GUIDANCE.split('{{memory_dir}}').length, 2)
@@ -155,7 +155,7 @@ test('2.1.303 harness and guidance keep the captured split and fill the memory d
   const omitted = renderOfficial303Guidance()
   assert.equal(omitted.includes('# Memory'), false)
   assert.equal(omitted.includes('/home/kincli'), false)
-  assert.match(omitted, /Write code that reads like the surrounding code/)
+  assert.match(omitted, /When you use a pronoun for someone/)
   assert.equal(renderOfficial303MainPrompt({ cwd: '/srv/app' }), `${OFFICIAL_303_HARNESS}${rendered}`)
   assert.equal(
     renderOfficial303MainPrompt({ cwd: '/srv/app', entrypoint: 'sdk-cli' }),
