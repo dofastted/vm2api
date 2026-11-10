@@ -155,14 +155,7 @@ export function omitContinuationSystemSuffix(body) {
     }
   }
   if (!pureToolResultTurn(messages[tail])) return body
-  let lastUser = -1
-  for (let i = tail - 1; i >= 0; i -= 1) {
-    if (messages[i]?.role === 'user') {
-      lastUser = i
-      break
-    }
-  }
-  const inplace = messages.some((message, index) => message?.role === 'system' && index > lastUser && index < tail)
+  const inplace = messages.some((message, index) => message?.role === 'system' && index < tail)
   if (!inplace) return body
   const kept = messages.filter((message, index) => !(message?.role === 'system' && index > tail))
   if (kept.length === messages.length) return body

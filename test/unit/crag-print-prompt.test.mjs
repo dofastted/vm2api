@@ -83,6 +83,23 @@ test('a continuation drops a system suffix added after an in-place environment',
       true,
     )
   }
+  const later = omitContinuationSystemSuffix({
+    messages: [
+      ...turn,
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'b', name: 'Bash', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'b', content: 'ok' }] },
+      { role: 'system', content: nudge },
+    ],
+  })
+  assert.equal(
+    later.messages.some((message) => message.content === nudge),
+    false,
+  )
+  assert.equal(
+    later.messages.some((message) => message.content === env),
+    true,
+  )
+
   const moved = omitContinuationSystemSuffix({
     messages: [
       { role: 'user', content: [{ type: 'text', text: 'go' }] },
