@@ -1,5 +1,5 @@
 /**
- * CRAG v2 print worker (claude-code-2.1.317) does not read kernel.json
+ * CRAG v2 print worker (claude-code-2.1.321) does not read kernel.json
  * persona_preset or CLAUDE_CODE_SYSTEM_LAYOUT. Bare `system` is append.
  * official_full must not resend the official four blocks. zero must be
  * crag_prompt.mode=replace. --bare is not used: it drops OAuth.

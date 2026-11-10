@@ -577,12 +577,12 @@ const invalidNativePackages = [
     'Claude machine',
     'crag_v2_arch_mismatch',
     (dir) => {
-      const file = path.join(dir, 'claude-code-2.1.317', 'claude')
+      const file = path.join(dir, 'claude-code-2.1.321', 'claude')
       const body = fs.readFileSync(file)
       body.writeUInt16LE(body.readUInt16LE(18) === 62 ? 183 : 62, 18)
       fs.writeFileSync(file, body)
       rewriteV2Manifest(dir, (m) => {
-        m.sha256['claude-code-2.1.317/claude'] = sha256(body)
+        m.sha256['claude-code-2.1.321/claude'] = sha256(body)
       })
     },
   ],
@@ -616,15 +616,15 @@ const invalidNativePackages = [
   [
     'missing hashed member',
     'crag_v2_hash_mismatch',
-    (dir) => fs.unlinkSync(path.join(dir, 'claude-code-2.1.317', 'claude')),
+    (dir) => fs.unlinkSync(path.join(dir, 'claude-code-2.1.321', 'claude')),
   ],
   [
     'unbundled Claude',
     'crag_v2_manifest_invalid',
     (dir) => {
-      fs.unlinkSync(path.join(dir, 'claude-code-2.1.317', 'claude'))
+      fs.unlinkSync(path.join(dir, 'claude-code-2.1.321', 'claude'))
       rewriteV2Manifest(dir, (m) => {
-        delete m.sha256['claude-code-2.1.317/claude']
+        delete m.sha256['claude-code-2.1.321/claude']
       })
     },
   ],
@@ -649,7 +649,7 @@ const invalidNativePackages = [
     'symlink member',
     'crag_v2_symlink',
     (dir) => {
-      const file = path.join(dir, 'claude-code-2.1.317', 'claude')
+      const file = path.join(dir, 'claude-code-2.1.321', 'claude')
       fs.unlinkSync(file)
       fs.symlinkSync('../crag-v2', file)
     },
@@ -769,7 +769,7 @@ test('CRAG v2 publishes complete upgrades, repairs damaged installs, and leaves 
       'crag-v2',
       'crag-v2.payload.enc',
       'crag-license-public.pem',
-      'claude-code-2.1.317/claude',
+      'claude-code-2.1.321/claude',
     ]) {
       assert.deepEqual(fs.readFileSync(path.join(dest, 'crag-v2', member)), fs.readFileSync(path.join(dir, member)))
     }

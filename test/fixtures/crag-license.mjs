@@ -89,7 +89,7 @@ export function seedEncryptedPackage(root, { revision = '' } = {}) {
   const authority = fixtureAuthority(root)
   const arch = process.arch === 'arm64' ? 'arm64' : 'amd64'
   const dir = path.join(root, 'share/crag/kernels/v2', arch)
-  fs.mkdirSync(path.join(dir, 'claude-code-2.1.317'), { recursive: true })
+  fs.mkdirSync(path.join(dir, 'claude-code-2.1.321'), { recursive: true })
   const elf = Buffer.alloc(96 + Buffer.byteLength(revision))
   elf.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1])
   elf.writeUInt16LE(3, 16); elf.writeUInt16LE(arch === 'amd64' ? 62 : 183, 18); elf.writeUInt32LE(1, 20)
@@ -101,7 +101,7 @@ export function seedEncryptedPackage(root, { revision = '' } = {}) {
   const payloadBytes = Buffer.concat([Buffer.from('CRAGV2E1'), nonce, cipher.getAuthTag(), encrypted])
   const pub = authority.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32)
   const signed = { product: 'crag-v2', format: 'CRAGV2E1', algorithm: 'aes-256-gcm', key_id: sha(authority.payloadKey), plaintext_sha256: sha(elf), ciphertext_sha256: sha(payloadBytes) }
-  const files = { 'crag-v2': elf, 'claude-code-2.1.317/claude': elf, 'crag-v2.payload.enc': payloadBytes, 'crag-license-public.pem': authority.publicKey.export({ format: 'pem', type: 'spki' }) }
+  const files = { 'crag-v2': elf, 'claude-code-2.1.321/claude': elf, 'crag-v2.payload.enc': payloadBytes, 'crag-license-public.pem': authority.publicKey.export({ format: 'pem', type: 'spki' }) }
   for (const [name, body] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), body, { mode: name === 'crag-v2' || name.endsWith('/claude') ? 0o755 : 0o644 })
   const manifest = { family: 'crag', version: 'v2', arch, runtime: 'native', entrypoint: 'crag-v2', encrypted: true,
     capabilities: ['official_full', 'zero', 'cancel', 'telemetry', 'unix_socket_envelope'],
