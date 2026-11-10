@@ -17,6 +17,7 @@ import zlib from 'node:zlib'
 import { OS_CATALOG, imageForKernel, kvmImageForKernel } from '../vm/os-catalog.mjs'
 import { EGRESS_BIN } from '../vm/egress.mjs'
 import {
+  cliPayloadPath,
   cragV2KernelWrapperScript,
   cragV2PackageRoot,
   describeKernelPayload,
@@ -99,7 +100,7 @@ export function slotPayload(projectRoot) {
     { name: 'opt/kin/kin-kernel.bin', src: kernel.path, mode: 0o755 },
   ]
   for (const bin of ['cli-node', 'cc-node']) {
-    const src = path.join(wrapDir, bin)
+    const src = cliPayloadPath(projectRoot, bin, wrapDir)
     requireElf(src, bin)
     files.push({ name: `opt/kin/${bin}`, src, mode: 0o755 })
   }

@@ -478,6 +478,75 @@ test('slot image tag follows payload bytes only; a VERSION bump keeps the image'
   assert.throws(() => slotImageSpec(root, 'nope-os'), { code: 'invalid_kernel' })
 })
 
+test('slot images use the pulled CLI pair with the factory cc-node fallback', (t) => {
+  const root = tmpDir('kin-slot-image-pulled-')
+  const envKeys = [
+    'KIN_KERNEL_BIN',
+    'KIN_WRAP_CLI_ROOT',
+    'KIN_CODEX_KERNEL_BIN',
+    'KIN_OAUTH_AUTH_BIN',
+    'KIN_CLUSTER_WORKER_BIN',
+    'KIN_CLUSTER_EGRESS_BIN',
+    'KIN_CRAG_V2_ROOT',
+  ]
+  const saved = envKeys.map((key) => [key, process.env[key]])
+  t.after(() => {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  for (const key of envKeys) delete process.env[key]
+  for (const file of [
+    'share/wrap-cli/cli-node',
+    'share/wrap-cli/cc-node',
+    'bin/kin-kernel',
+    'bin/kin-worker',
+    'bin/kin-egress',
+    'bin/kin-oauth-auth',
+    'bin/kin-codex-kernel',
+  ])
+    fakeElf(path.join(root, file), 1)
+  process.env.KIN_CODEX_KERNEL_BIN = path.join(root, 'bin/kin-codex-kernel')
+  process.env.KIN_CLUSTER_WORKER_BIN = path.join(root, 'bin/kin-worker')
+  process.env.KIN_CLUSTER_EGRESS_BIN = path.join(root, 'bin/kin-egress')
+  seedEncryptedPackage(root)
+
+  const cache = path.join(root, 'share/wrap-cli-releases')
+  const relative = 'packages/amd64-00000000-0000-4000-8000-000000000001'
+  const selected = path.join(cache, relative)
+  fakeElf(path.join(selected, 'kin-kernel.bin'), 2)
+  fakeElf(path.join(selected, 'cli-node'), 2)
+  fs.writeFileSync(path.join(cache, 'current-amd64.json'), JSON.stringify({ package: relative }))
+  const factoryCc = path.join(root, 'share/wrap-cli/cc-node')
+  for (const runtime of ['docker', 'kvm']) {
+    const spec = slotImageSpec(root, 'ubuntu-24.04', { runtime })
+    for (const file of ['kin-kernel.bin', 'cli-node']) {
+      assert.equal(spec.files.find((entry) => entry.name === `opt/kin/${file}`).src, path.join(selected, file))
+    }
+    assert.equal(spec.files.find((entry) => entry.name === 'opt/kin/cc-node').src, factoryCc)
+  }
+
+  const before = slotImageSpec(root, 'ubuntu-24.04').ref
+  fs.appendFileSync(factoryCc, 'updated legacy CLI')
+  assert.notEqual(slotImageSpec(root, 'ubuntu-24.04').ref, before, 'factory cc-node changes must rebuild the image')
+  fs.writeFileSync(factoryCc, '#!/bin/sh\n')
+  assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'slot_payload_invalid' })
+  fs.unlinkSync(factoryCc)
+  assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'slot_payload_missing' })
+
+  const selectedCc = path.join(selected, 'cc-node')
+  fakeElf(selectedCc, 3)
+  fakeElf(factoryCc, 1)
+  assert.equal(
+    slotImageSpec(root, 'ubuntu-24.04').files.find((entry) => entry.name === 'opt/kin/cc-node').src,
+    selectedCc,
+  )
+  fs.writeFileSync(selectedCc, '#!/bin/sh\n')
+  assert.throws(() => slotImageSpec(root, 'ubuntu-24.04'), { code: 'slot_payload_invalid' })
+})
+
 test('cluster payload check skips a container already on the content-hashed image', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cluster-payload-'))
   const envKeys = [
