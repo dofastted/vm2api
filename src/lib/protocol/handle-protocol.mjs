@@ -1677,11 +1677,10 @@ export function createHandleProtocol(deps) {
               if (Object.keys(cragStandard.reverse || {}).length) {
                 inboundToolReverse = composeToolNames(inboundToolReverse, cragStandard.reverse)
               }
-              let source = filterThinkingForAccount(
-                shallowCopyBody(cragStandard.body),
-                selected.accountId,
-                thinkingOwnerStore,
-              ).body
+              // The CRAG kernel fingerprints the public stream it already sent,
+              // including thinking. Rewriting an unrecorded signature into text
+              // makes the tool continuation fail with tool_result history mismatch.
+              let source = shallowCopyBody(cragStandard.body)
               for (const policy of extra.repairs || []) source = repairAnthropicRequest(source, policy)
               hopBody = prepareCragPrintBody(source, { preset: cragPersona, officialPassthrough })
               hopBody = await materializeRemoteImageSources(hopBody)
