@@ -449,11 +449,31 @@ function storedRegistration(dir) {
 function readUniversalCode(projectRoot) {
   try {
     const stored = storedRegistration(cragUniversalDirectory(projectRoot))
-    return stored.startsWith('CRAGU1.') ? stored : ''
+    if (stored.startsWith('CRAGU1.')) return stored
   } catch (error) {
-    if (error?.code === 'ENOENT') return ''
-    throw error
+    if (error?.code !== 'ENOENT') throw error
   }
+  // Older activations wrote the grant onto local slots only. A cluster slot has
+  // no machine identity, so it has to reuse that same installation code.
+  return universalCodeFromLocalSlots(projectRoot)
+}
+
+function universalCodeFromLocalSlots(projectRoot) {
+  let found = ''
+  for (const summary of listVms(projectRoot)) {
+    const vm = getVm(projectRoot, summary.id)
+    if (!vm || vm.node_id || isCodexVm(vm)) continue
+    let code = ''
+    try {
+      code = storedRegistration(cragLicenseDirectory(projectRoot, vm))
+    } catch (error) {
+      if (error?.code !== 'ENOENT') continue
+    }
+    if (!code.startsWith('CRAGU1.')) continue
+    if (!found) found = code
+    else if (found !== code) return ''
+  }
+  return found
 }
 
 function sharedUniversalLicense(projectRoot) {

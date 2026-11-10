@@ -33,6 +33,7 @@ export const REMOTE_CC_NODE_BIN = `${REMOTE_KIN_DIR}/cc-node`
 // The slot-bin mount, not the image copy: a payload push updates this tree without a new image.
 export const REMOTE_CRAG_ENTRY = '/opt/kin-live/crag-kernel'
 export const REMOTE_CRAG_CLAUDE = '/opt/kin-live/crag-v2/claude-code-2.1.317/claude'
+export const LOCAL_CRAG_CLAUDE = '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude'
 
 export const KERNEL_NATIVE_SLOT_COUNT = 20
 export const SESSION_SLOT_MIN = 1

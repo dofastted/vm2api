@@ -131,6 +131,24 @@ test('universal CRAGU1 activates without creating a device binding', async (t) =
   assert.deepEqual(fs.readFileSync(path.join(dir, 'registration.code')), stored)
 })
 
+test('a cluster slot reuses a CRAGU1 stored on a local slot when the installation file is missing', (t) => {
+  const { root, vm } = fixture(t)
+  const issued = issueUniversalCode(root)
+  const dir = cragLicenseDirectory(root, vm)
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+  fs.writeFileSync(path.join(dir, 'registration.code'), `${issued.code}\n`, { mode: 0o600 })
+  assert.equal(fs.existsSync(cragUniversalDirectory(root)), false)
+  const remote = { id: 'vm-remote', node_id: 'node-a', status: 'stopped', dataplane: 'crag', crag_kernel_version: 'v2' }
+  fs.mkdirSync(path.join(root, 'vms', remote.id), { recursive: true })
+  fs.writeFileSync(path.join(root, 'vms', `${remote.id}.json`), JSON.stringify(remote))
+  const license = getCragLicense(root, remote)
+  assert.equal(license.license.valid, true)
+  assert.equal(license.license.kind, 'offline')
+  assert.equal(license.license.license_id, issued.claims.license_id)
+  assert.equal(checkCragLicense(root, remote).ok, true)
+  assert.doesNotMatch(JSON.stringify(license), /CRAGU1|wrapped_key|ciphertext|private_key/)
+})
+
 test('one offline code licenses every slot and does not replace a device grant', (t) => {
   const { root, vm } = fixture(t)
   const bound = activateFixture(root, vm)
