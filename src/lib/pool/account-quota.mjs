@@ -313,6 +313,12 @@ export class AccountQuota {
    */
   ingestOAuthUsage(accountId, probe = {}) {
     const acc = this.ensure({ account_id: accountId })
+    const profileTier =
+      probe.account_tier_source === 'profile' && ['pro', 'max'].includes(probe.account_tier) ? probe.account_tier : null
+    if (profileTier) {
+      acc.unified.account_tier = profileTier
+      acc.unified.account_tier_source = 'profile'
+    }
     const nowIso = probe.probed_at || new Date().toISOString()
     if (isOfficialUsageRateLimited(probe)) {
       const retryMs = Number(probe.retry_after_ms)
@@ -392,8 +398,7 @@ export class AccountQuota {
     if (completeOfficialUsage) {
       if (probe.usage_has_fable === true || hasFableUsage) acc.unified.account_tier = 'max'
       else if (probe.usage_has_fable === false) acc.unified.account_tier = 'pro'
-      if (acc.unified.account_tier === 'pro' || acc.unified.account_tier === 'max')
-        acc.unified.account_tier_source = 'usage'
+      if (probe.usage_has_fable != null || hasFableUsage) acc.unified.account_tier_source = 'usage'
     }
     if (probe.fable && !fableTransport) {
       const planDenied = completeOfficialUsage && !hasFableUsage && isFablePlanDenied(probe.fable)
@@ -429,6 +434,10 @@ export class AccountQuota {
           }
         }
       }
+    }
+    if (profileTier) {
+      acc.unified.account_tier = profileTier
+      acc.unified.account_tier_source = 'profile'
     }
     acc.unified.source = 'vm-oauth-usage'
     acc.unified.updated_at = new Date().toISOString()

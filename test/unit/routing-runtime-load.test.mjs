@@ -11,6 +11,43 @@ function runtimeFor(file) {
   return createRoutingRuntime({ routingConfigPath: file })
 }
 
+test('successful model access clears its denial without promoting a Pro account to Max', async () => {
+  const { openDatabase, closeDatabase } = await import('../../src/lib/db/database.mjs')
+  const { AccountQuota } = await import('../../src/lib/pool/account-quota.mjs')
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'routing-model-tier-'))
+  fs.mkdirSync(path.join(root, 'vms'))
+  const db = openDatabase({ dataDir: path.join(root, 'data') })
+  const quota = new AccountQuota({ db })
+  quota.ensure({ account_id: 'pro-account' })
+  quota.setAccountTier('pro-account', 'pro')
+  quota.markModelUnsupported('pro-account', 'claude-fable-5')
+  const ctx = {
+    cfg: { paths: { project: root } },
+    routingConfig: {},
+    accountQuota: quota,
+    setFailoverRunner(value) {
+      this.runner = value
+    },
+  }
+  const runtime = createRoutingRuntime(ctx)
+  try {
+    runtime.initPoolRuntime()
+    const file = path.join(root, 'vms/vm-01.json')
+    fs.writeFileSync(file, JSON.stringify({ id: 'vm-01', claude: { account_tier: 'pro' } }))
+    const before = fs.readFileSync(file, 'utf8')
+    ctx.runner.onFableSuccess({ selected: { accountId: 'pro-account', vmId: 'vm-01' }, model: 'claude-fable-5' })
+    const account = quota.repo.get('pro-account')
+    assert.equal(account.unified.account_tier, 'pro')
+    assert.equal(account.unified.model_denied_until?.['claude-fable-5'], undefined)
+    assert.equal(fs.readFileSync(file, 'utf8'), before)
+  } finally {
+    ctx.poolScheduler?.stopMaintenance()
+    await ctx.poolScheduler?.maintenanceFlight
+    closeDatabase()
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('loadRoutingConfig fails when routing.json is missing', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-runtime-missing-'))
   try {

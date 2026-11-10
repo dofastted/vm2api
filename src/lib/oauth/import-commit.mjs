@@ -122,8 +122,11 @@ export function createImportCommit(ctx) {
           ctx.accountQuota.ingestOAuthUsage(accountId, { usage_status: 200, ok: true, ...stats })
         } catch {}
       }
-      if ((stats?.account_tier === 'pro' || stats?.account_tier === 'max') && stats?.limits_present === true) {
-        const source = 'usage'
+      if (
+        (stats?.account_tier === 'pro' || stats?.account_tier === 'max') &&
+        (stats?.limits_present === true || stats?.account_tier_source === 'profile')
+      ) {
+        const source = stats.account_tier_source === 'profile' ? 'profile' : 'usage'
         try {
           ctx.accountQuota.setAccountTier(accountId, stats.account_tier, { source })
         } catch {}

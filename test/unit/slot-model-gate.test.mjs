@@ -60,6 +60,18 @@ test('a recent model denial still blocks Fable', () => {
   assert.deepEqual(slotAllowsModel({ vm: maxVm, account: denied, model: 'claude-sonnet-5' }), { ok: true })
 })
 
+test('official profile controls model gating despite stale stored and usage plan hints', () => {
+  const vm = { claude: { account_tier: 'pro' } }
+  const account = { unified: { account_tier: 'max', account_tier_source: 'profile', usage_has_fable: false } }
+  assert.deepEqual(slotAllowsModel({ vm, account, model: 'claude-fable-5' }), { ok: true })
+  account.unified = { account_tier: 'pro', account_tier_source: 'profile', usage_has_fable: true }
+  vm.claude.account_tier = 'max'
+  assert.deepEqual(slotAllowsModel({ vm, account, model: 'claude-fable-5' }), { ok: true })
+  vm.claude = { account_tier: 'max', account_tier_source: 'profile' }
+  account.unified = { account_tier: 'pro', usage_has_fable: false }
+  assert.deepEqual(slotAllowsModel({ vm, account, model: 'claude-fable-5' }), { ok: true })
+})
+
 test('legacy Fable 5.1 allowlists accept the corrected id without allowing Fable 5', () => {
   assert.equal(modelMatchesAllowlist('claude-fable-5-1', ['claude-fable-5.1']), true)
   assert.equal(modelMatchesAllowlist('claude-fable-5.1', ['claude-fable-5-1']), true)

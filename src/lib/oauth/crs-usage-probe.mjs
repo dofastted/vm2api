@@ -4,6 +4,8 @@
  */
 import { isCrsMock } from '../transport/crs-mock.mjs'
 import { callGoWorker, callWorkerGet } from '../transport/go-worker-client.mjs'
+import { runSlotOauth } from '../transport/slot-oauth.mjs'
+import { tierFromOauthProfile } from './official-cc-stats.mjs'
 import {
   compareUsageInterpretations,
   fableScopeText,
@@ -358,7 +360,14 @@ function mockUsage() {
   }
 }
 
-export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 20000, identity = null } = {}) {
+export async function probeVmUsage({
+  exec,
+  includeFable = true,
+  timeoutMs = 20000,
+  identity = null,
+  slotOauth = runSlotOauth,
+  usageGet = callWorkerGet,
+} = {}) {
   if (!exec) {
     return { ok: false, source: 'official-cc-usage', error: 'no_exec', probed_at: new Date().toISOString() }
   }
@@ -391,7 +400,11 @@ export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 2000
       probed_at: new Date().toISOString(),
     }
   }
-  const usageRes = await callWorkerGet(exec, '/internal/oauth/usage', { timeoutMs })
+  const [usageRes, profileRes] = await Promise.all([
+    usageGet(exec, '/internal/oauth/usage', { timeoutMs }),
+    slotOauth(exec, 'profile', { timeoutMs }),
+  ])
+  const profileTier = profileRes?.ok ? tierFromOauthProfile(profileRes.body) : null
   const usageRateLimited =
     usageRes.status === 429 ||
     isOfficialUsageRateLimited({
@@ -451,6 +464,9 @@ export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 2000
     source: 'official-cc-usage',
     via: usageRes.via || 'go-worker',
     usage_status: usageRes.status,
+    account_tier: profileTier,
+    account_tier_source: profileTier ? 'profile' : null,
+    profile_error: profileRes?.ok ? null : profileRes?.body?.error?.code || 'profile_unavailable',
     limits_present: usageRes.ok ? isCompleteOAuthUsage(rawBody, parsed) : false,
     usage_scope_missing: usageMissingScope,
     credential_scope_required: usageMissingScope ? 'user:profile' : null,

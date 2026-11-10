@@ -101,12 +101,21 @@ function quotaView(vm, account) {
     status_7d_oi: unified.status_7d_oi || unified['7d_oi']?.status || vm?.status_7d_oi,
     '7d_oi': unified['7d_oi'],
     account_tier: unified.account_tier || vm?.claude?.account_tier || vm?.account_tier,
+    account_tier_source: unified.account_tier
+      ? unified.account_tier_source
+      : vm?.claude?.account_tier
+        ? vm.claude.account_tier_source
+        : vm?.account_tier_source,
     usage_has_fable: unified.usage_has_fable ?? vm?.usage_has_fable ?? null,
   }
 }
 
 export function resolveSlotTier(vm, account = null) {
+  const vmPlan = vm?.claude?.account_tier ? vm.claude : vm
+  if (vmPlan?.account_tier_source === 'profile' && ['pro', 'max'].includes(vmPlan.account_tier))
+    return vmPlan.account_tier
   const quota = quotaView(vm, account)
+  if (quota.account_tier_source === 'profile' && ['pro', 'max'].includes(quota.account_tier)) return quota.account_tier
   // An explicit Pro classification must veto stale Max usage evidence. The
   // latter can survive a credential change or a Fable entitlement rejection.
   if (
