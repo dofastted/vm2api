@@ -510,6 +510,32 @@ test('one VM can switch cli-node to CRAG v2 and back without deleting cli-node',
   }
 })
 
+test('CRAG resync keeps the mounted directory and the previous Claude binary', () => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-v2-keep-'))
+  try {
+    seedTemplate(project)
+    seedV2Package(project)
+    const vm = { id: 'vm-13', dataplane: 'crag', crag_kernel_version: 'v2' }
+    const laid = materializeResolvedKernel(project, vm)
+    assert.equal(laid.ok, true, laid.error)
+    const dest = wrapCliHomeDir(project, 'vm-13')
+    const tree = path.join(dest, 'crag-v2')
+    const mounted = fs.statSync(tree).ino
+    const previous = path.join(tree, 'claude-code-2.1.317', 'claude')
+    fs.mkdirSync(path.dirname(previous), { recursive: true })
+    fs.writeFileSync(previous, 'still-running')
+    fs.writeFileSync(path.join(dest, 'kin-kernel'), 'not-the-wrapper')
+    const synced = materializeResolvedKernel(project, vm)
+    assert.equal(synced.ok, true, synced.error)
+    assert.equal(synced.kernel_changed, true)
+    assert.equal(fs.statSync(tree).ino, mounted)
+    assert.equal(fs.readFileSync(previous, 'utf8'), 'still-running')
+    assert.equal(materializeResolvedKernel(project, vm).kernel_changed, false)
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true })
+  }
+})
+
 test('CRAG v2 rejects a bad package and a cluster slot without replacing cli-node', () => {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-v2-reject-'))
   try {
@@ -822,7 +848,7 @@ test('CRAG v2 restores the previous tree if staged directory promotion fails', (
     const oldWrapper = fs.readFileSync(path.join(dest, 'kin-kernel'))
     seedV2Package(project, { revision: 'promotion-failure' })
     fs.renameSync = (from, to) => {
-      if (to === packageRoot && !from.endsWith('.bak')) {
+      if (to === path.join(packageRoot, 'manifest.json')) {
         throw Object.assign(new Error('promotion denied'), { code: 'EACCES' })
       }
       return rename(from, to)
