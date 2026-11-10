@@ -175,6 +175,88 @@ test('Codex hop drops max_output_tokens and keeps reasoning effort', () => {
   assert.equal(converted.body.reasoning.effort, 'high')
 })
 
+test('anthropic base64 image converts to input_image data url', () => {
+  const converted = toCodexResponses(
+    'anthropic.messages',
+    {
+      model: 'gpt-6.1-sol',
+      messages: [
+        {
+          role: 'user',
+          content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aaaa' } }],
+        },
+      ],
+    },
+    { anthropic_to_codex: true },
+  )
+  assert.equal(converted.ok, true)
+  assert.deepEqual(converted.body.input[0].content, [{ type: 'input_image', image_url: 'data:image/png;base64,aaaa' }])
+})
+
+test('anthropic url image converts to input_image', () => {
+  const converted = toCodexResponses(
+    'anthropic.messages',
+    {
+      model: 'gpt-6.1-sol',
+      messages: [
+        {
+          role: 'user',
+          content: [{ type: 'image', source: { type: 'url', url: 'https://example.com/pic.png' } }],
+        },
+      ],
+    },
+    { anthropic_to_codex: true },
+  )
+  assert.equal(converted.ok, true)
+  assert.deepEqual(converted.body.input[0].content, [{ type: 'input_image', image_url: 'https://example.com/pic.png' }])
+})
+
+test('anthropic mixed text and images preserve block order', () => {
+  const converted = toCodexResponses(
+    'anthropic.messages',
+    {
+      model: 'gpt-6.1-sol',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: 'first' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: 'b64a' } },
+            { type: 'text', text: 'second' },
+            { type: 'image', source: { type: 'url', url: 'https://example.com/b.png' } },
+          ],
+        },
+      ],
+    },
+    { anthropic_to_codex: true },
+  )
+  assert.deepEqual(converted.body.input[0].content, [
+    { type: 'input_text', text: 'first' },
+    { type: 'input_image', image_url: 'data:image/jpeg;base64,b64a' },
+    { type: 'input_text', text: 'second' },
+    { type: 'input_image', image_url: 'https://example.com/b.png' },
+  ])
+})
+
+test('chat image_url still converts after anthropic image handling', () => {
+  const body = chatToCodexResponses({
+    model: 'gpt-5.5',
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'image_url', image_url: 'https://openai.example/x.png' },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,bbbb' } },
+        ],
+      },
+    ],
+  })
+  assert.deepEqual(body.input[0].content, [
+    { type: 'input_image', image_url: 'https://openai.example/x.png' },
+    { type: 'input_image', image_url: 'data:image/png;base64,bbbb' },
+  ])
+})
+
 test('anthropic convert stays off by default', () => {
   const rejected = toCodexResponses(
     'anthropic.messages',
