@@ -203,6 +203,10 @@ func (s *Server) handleTCP(ctx context.Context, conn net.Conn) {
 }
 
 func (s *Server) ForwardTCP(ctx context.Context, client net.Conn, dest string) error {
+	client, err := consumeOAuthBlock(client, dest)
+	if err != nil {
+		return err
+	}
 	dialDest, err := s.dialDest(dest)
 	if err != nil {
 		return err

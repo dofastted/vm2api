@@ -55,7 +55,7 @@ SSH 扩展槽同样由控制面经绑定出口换票。拿到授权后，提交�
 8. `invalid_grant` 先重读 generation，识别其他路径已完成的竞争刷新。
 9. 上游 401 **不** force-refresh（端点拒票 ≠ 过期；硬刷会把还能用的 grant 烧成 `invalid_grant`）。
 10. 目录 / 模型列表 **不** hop worker `/v1/models`。
-11. 槽内 cli-node（kernel 拉起的 native 槽、面板运维终端里的 `claude`、初装 hello / `/usage` / 常驻、`setup-token`）带 `CLAUDE_CODE_HOST_REFRESH=1` 和 `CLAUDE_CODE_VERSION`：临期或 401 时只重读 `credentials.json`，不请求 token 端点，不写回凭证。否则它与 host 同用一个轮换 RT，后到的一方拿 `invalid_grant`，且其写回会丢掉 `kinGeneration`。
+11. 槽内 cli-node（kernel 拉起的 native 槽、面板运维终端里的 `claude`、初装 hello / `/usage` / 常驻、`setup-token`）带 `CLAUDE_CODE_HOST_REFRESH=1` 和 `CLAUDE_CODE_VERSION`：临期或 401 时只重读 `credentials.json`，不请求 token 端点，不写回凭证。否则它与 host 同用一个轮换 RT，后到的一方拿 `invalid_grant`，且其写回会丢掉 `kinGeneration`。官方 Claude 2.1.321 不读这个变量。CRAG v2 拉起的那个进程会在连上 `platform.claude.com:443` / `console.anthropic.com:443` 后先写 `KIN-BLOCK\n`；kin-egress 看到标记就关掉连接，不向 SOCKS 拨号。登录、`kin-oauth-auth` 和 `kin-worker oauth refresh` 不写这个标记，换票仍走原来的出口。
 
 过期且无 refresh 的槽不入调度池。面板「网页可用」与调度选槽同一套资格。
 
