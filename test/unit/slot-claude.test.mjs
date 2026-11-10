@@ -16,5 +16,8 @@ test('slot CLI follows VM kernel pins, inherited routing and placement without f
     native: false,
   })
   assert.equal(resolveSlotClaude({ dataplane: 'cc' }, routing, local).bin, local.bins.cc)
-  assert.equal(resolveSlotClaude({ crag_kernel_version: 'legacy' }, routing, local).bin, local.bins.cc)
+  assert.equal(
+    resolveSlotClaude({ crag_kernel_version: 'legacy' }, routing, local).bin,
+    '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude',
+  )
 })

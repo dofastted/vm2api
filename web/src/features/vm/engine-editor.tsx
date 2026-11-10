@@ -2,9 +2,11 @@ import { useMemo, useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import type { Vm, VmKernelSnapshot } from '@/types/panel-vm'
+import { Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
 import { activateVmCragLicense, isApiError, patchVm } from '@/lib/api'
 import { isCodexVm } from '@/lib/vm-kind'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { dashboardQueryOptions } from '@/features/overview/queries'
@@ -27,6 +29,7 @@ import { isRemoteVm, REMOTE_UNSUPPORTED_TEXT } from '@/features/vm/placement'
 import {
   vmCragLicenseQueryOptions,
   vmQueryOptions,
+  vmsListQueryOptions,
 } from '@/features/vm/queries'
 import { useVmPerms } from '@/features/vm/vm-perms'
 
@@ -108,7 +111,8 @@ export function VmEngineEditor({
           vm.resolved_crag_kernel_version
         )}{' '}
         本槽可在 cli-node 与 CRAG v2
-        之间切换，不改其他槽、不改凭证、不删容器。舰队级 cc / crag legacy 仍在{' '}
+        之间切换。运行中切换会重启内核，必要时重建容器；保留凭证和数据，不影响其他槽。
+        舰队级 cc / crag legacy 仍在{' '}
         <Link to='/wrap' className='underline underline-offset-4'>
           内核页
         </Link>
@@ -127,13 +131,27 @@ export function VmEngineEditor({
           {inherit.isPending ? '恢复中…' : '恢复跟随全局'}
         </Button>
       )}
-      {remote && canEdit ? (
+      {remote && canEdit && !inherits ? (
         <p className='mt-2 text-xs text-muted-foreground'>
-          切换推理内核：{REMOTE_UNSUPPORTED_TEXT}
+          恢复跟随全局：{REMOTE_UNSUPPORTED_TEXT}
         </p>
       ) : null}
     </CardSection>
   )
+}
+
+type SlotKernelTarget = 'wrap' | 'v2'
+
+function slotKernelLabel(next: SlotKernelTarget) {
+  return next === 'v2' ? 'CRAG v2' : 'cli-node'
+}
+
+function kernelSwitchSuccess(next: SlotKernelTarget, status?: string) {
+  const label = slotKernelLabel(next)
+  if (status === 'stopped') {
+    return `本槽内核配置已切换为 ${label}；VM 保持停止，下次启动生效。`
+  }
+  return `本槽已切换到 ${label}${status === 'running' ? '，内核重启完成' : ''}。`
 }
 
 function SlotKernelSwitch({
@@ -146,11 +164,12 @@ function SlotKernelSwitch({
   remote: boolean
 }) {
   const qc = useQueryClient()
-  const [pending, setPending] = useState<'wrap' | 'v2' | null>(null)
+  const [pending, setPending] = useState<SlotKernelTarget | null>(null)
   const [licenseOpen, setLicenseOpen] = useState(false)
   const [switchAfterActivation, setSwitchAfterActivation] = useState(false)
   const [checkingLicense, setCheckingLicense] = useState(false)
   const [registrationCode, setRegistrationCode] = useState('')
+  const switchToastId = `vm-kernel-switch-${id}`
   const kvm = vm.runtime_type === 'kvm'
   const nativeMac = vm.node_platform === 'darwin'
   const blocked = kvm || nativeMac
@@ -198,37 +217,62 @@ function SlotKernelSwitch({
     }
   }
   const switchKernel = useMutation({
-    mutationFn: (next: 'wrap' | 'v2') =>
+    mutationFn: (next: SlotKernelTarget) =>
       patchVm(
         id,
         next === 'v2'
           ? { dataplane: 'crag', crag_kernel_version: 'v2' }
           : { dataplane: 'wrap', crag_kernel_version: '' }
       ),
-    onSuccess: async (_data, next) => {
-      toast.success(
-        next === 'v2' ? '本槽已切到 CRAG v2' : '本槽已切回 cli-node'
-      )
+    onMutate: (next) => {
+      toast.loading(`正在切换到 ${slotKernelLabel(next)}…`, {
+        id: switchToastId,
+        description:
+          vm.status === 'running'
+            ? '正在重启本槽内核，请勿重复操作。'
+            : '正在保存内核配置，VM 不会因此启动。',
+      })
+    },
+    onSuccess: (_data, next) => {
+      toast.success(kernelSwitchSuccess(next, vm.status), {
+        id: switchToastId,
+        description: undefined,
+      })
       setPending(null)
-      await Promise.all([
-        qc.invalidateQueries({ queryKey: vmQueryOptions(id).queryKey }),
-        qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
-      ])
     },
     onError: (error: Error) => {
       if (isApiError(error) && error.code.startsWith('license_')) {
-        toast.error(cragLicenseErrorMessage(error))
+        toast.error(cragLicenseErrorMessage(error), {
+          id: switchToastId,
+          description: undefined,
+        })
         setLicenseOpen(true)
         setSwitchAfterActivation(true)
         void qc.invalidateQueries({
           queryKey: vmCragLicenseQueryOptions(id).queryKey,
         })
       } else {
-        toast.error(error.message)
+        toast.error(`内核切换未完成：${error.message}`, {
+          id: switchToastId,
+          description: '请先核对当前内核、VM 运行和调度状态，再重试。',
+        })
       }
       setPending(null)
     },
+    // A failed restart can still persist the new policy. Refresh both outcomes.
+    onSettled: () =>
+      Promise.all([
+        qc.invalidateQueries({ queryKey: vmQueryOptions(id).queryKey }),
+        qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey }),
+        qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
+      ]),
   })
+  const target = pending ?? switchKernel.variables ?? 'wrap'
+  const switchError = switchKernel.error
+  const switchErrorMessage =
+    isApiError(switchError) && switchError.code.startsWith('license_')
+      ? cragLicenseErrorMessage(switchError)
+      : switchError?.message
   const busy =
     checkingLicense || switchKernel.isPending || activateLicense.isPending
   return (
@@ -237,16 +281,26 @@ function SlotKernelSwitch({
         <Button
           variant='outline'
           disabled={blocked || busy || onCli}
+          aria-busy={switchKernel.isPending && target === 'wrap'}
           onClick={() => setPending('wrap')}
         >
-          本槽切回 cli-node
+          {switchKernel.isPending && target === 'wrap'
+            ? '正在切回 cli-node…'
+            : '本槽切回 cli-node'}
         </Button>
         <Button
           variant='outline'
           disabled={blocked || busy || onV2}
+          aria-busy={
+            checkingLicense || (switchKernel.isPending && target === 'v2')
+          }
           onClick={() => void requestV2()}
         >
-          {checkingLicense ? '正在检查授权…' : '本槽切到 CRAG v2'}
+          {checkingLicense
+            ? '正在检查授权…'
+            : switchKernel.isPending && target === 'v2'
+              ? '正在切换到 CRAG v2…'
+              : '本槽切到 CRAG v2'}
         </Button>
         {!blocked ? (
           <Button
@@ -265,6 +319,40 @@ function SlotKernelSwitch({
           </Button>
         ) : null}
       </div>
+      {switchKernel.isPending ||
+      switchKernel.isSuccess ||
+      switchKernel.isError ? (
+        <Alert
+          role={switchKernel.isError ? 'alert' : 'status'}
+          aria-live={switchKernel.isError ? 'assertive' : 'polite'}
+          aria-atomic='true'
+          variant={switchKernel.isError ? 'destructive' : 'default'}
+        >
+          {switchKernel.isPending ? (
+            <Loader2
+              aria-hidden='true'
+              className='size-4 animate-spin motion-reduce:animate-none'
+            />
+          ) : null}
+          <AlertTitle>
+            {switchKernel.isPending
+              ? `正在切换到 ${slotKernelLabel(target)}…`
+              : switchKernel.isError
+                ? '内核切换未完成'
+                : '内核切换完成'}
+          </AlertTitle>
+          <AlertDescription className='break-words'>
+            {switchKernel.isPending
+              ? '请勿重复操作。正在等待服务端完成切换，并刷新 VM 运行和调度状态。'
+              : switchKernel.isError
+                ? `${switchErrorMessage} 请先核对当前内核、VM 运行和调度状态，再重试；也可在“恢复服务”中查看诊断。`
+                : kernelSwitchSuccess(
+                    switchKernel.variables ?? target,
+                    vm.status
+                  )}
+          </AlertDescription>
+        </Alert>
+      ) : null}
       <p className='text-xs text-muted-foreground'>
         当前{' '}
         {kernelRouteLabel(
@@ -318,20 +406,44 @@ function SlotKernelSwitch({
         </div>
       ) : null}
       <ConfirmDialog
-        open={pending != null}
+        open={pending != null || switchKernel.isPending}
         onOpenChange={(open) => {
           if (!open && !switchKernel.isPending) setPending(null)
         }}
-        title={pending === 'v2' ? '本槽切到 CRAG v2？' : '本槽切回 cli-node？'}
+        title={`本槽切换到 ${slotKernelLabel(target)}？`}
         desc={
-          remote
-            ? '重建本槽容器以更换内核命令。不改凭证，不影响其他槽。'
-            : pending === 'v2'
-              ? '重启本槽内核。不 docker rm，不改凭证，不影响其他槽。cli-node 保留，可再切回。'
-              : '铺回 wrap kernel 和 cli-node，并重启本槽内核。CRAG v2 文件留在盘上但不再 exec。'
+          <div className='space-y-2'>
+            <p>
+              {vm.status !== 'running'
+                ? '仅修改本槽内核配置，VM 保持当前停机状态，下次启动生效。'
+                : remote
+                  ? '重建本槽容器以更换内核命令，并等待内核就绪。'
+                  : '切换并重启本槽内核，必要时重建容器。'}
+              保留凭证和数据，不影响其他槽；原有调度关闭设置不变。
+            </p>
+            {switchKernel.isPending ? (
+              <p role='status' aria-live='polite'>
+                正在切换到 {slotKernelLabel(target)}，请勿重复操作。
+              </p>
+            ) : null}
+          </div>
         }
         cancelBtnText='取消'
-        confirmText='切换'
+        confirmText={
+          switchKernel.isPending ? (
+            <>
+              <Loader2
+                aria-hidden='true'
+                className='size-4 animate-spin motion-reduce:animate-none'
+              />
+              正在切换…
+            </>
+          ) : vm.status === 'running' ? (
+            '切换并重启'
+          ) : (
+            '保存内核配置'
+          )
+        }
         isLoading={switchKernel.isPending}
         handleConfirm={() => {
           if (pending) switchKernel.mutate(pending)

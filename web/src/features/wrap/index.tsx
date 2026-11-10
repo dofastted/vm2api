@@ -192,8 +192,8 @@ export function WrapSamplePage() {
             stopped: false,
             error: '未收到该 VM 的安装结果',
           }
-          if (result.ok && !result.stopped)
-            result = { ...result, ok: false, error: '服务未确认关闭' }
+          if (result.ok && result.restarted !== true)
+            result = { ...result, ok: false, error: '服务未确认重启完成' }
         } catch (error) {
           const data = isApiError(error)
             ? (error.data as { items?: KernelInstallItem[] } | undefined)
@@ -226,7 +226,7 @@ export function WrapSamplePage() {
         toast.error(
           `${targets.length - failures}/${targets.length} 台安装成功，请检查失败项`
         )
-      else toast.success(`${targets.length} 台内核已安装，服务保持关闭`)
+      else toast.success(`${targets.length} 台内核已安装并重启，调度状态已更新`)
     } finally {
       setJob((previous) =>
         previous ? { ...previous, activeId: null } : previous
@@ -374,7 +374,7 @@ export function WrapSamplePage() {
                   VM 安装
                 </h3>
                 <p className='mt-1 text-base text-muted-foreground sm:text-sm'>
-                  按所选内核重装，完成后保持停用。
+                  按所选内核重装并重启，完成后恢复调度状态。
                 </p>
               </div>
               <Button
@@ -385,7 +385,7 @@ export function WrapSamplePage() {
                 onClick={() => requestInstall(allTargets)}
               >
                 <Power aria-hidden='true' />
-                全部重装并停用{rows.length ? ` · ${rows.length} 台` : ''}
+                全部重装并重启{rows.length ? ` · ${rows.length} 台` : ''}
               </Button>
             </div>
 
@@ -500,11 +500,13 @@ export function WrapSamplePage() {
                               )}
                               aria-hidden='true'
                             />
-                            {result?.stopped
-                              ? '已停用'
-                              : VM_STATUS[vm.status || 'unknown'] ||
-                                vm.status ||
-                                '未知'}
+                            {result?.restarted
+                              ? '运行中'
+                              : result?.stopped
+                                ? '已停用'
+                                : VM_STATUS[vm.status || 'unknown'] ||
+                                  vm.status ||
+                                  '未知'}
                             {installed?.version &&
                             installed.kernel === currentKernel ? (
                               <span>{installed.version}</span>
@@ -530,7 +532,7 @@ export function WrapSamplePage() {
                               )}
                               <span>
                                 {result.ok
-                                  ? '安装完成，服务已停用'
+                                  ? `重启完成${result.schedulable ? '，已恢复调度' : '，原调度限制保留'}`
                                   : `${result.error || '安装失败'}${result.stopped ? '；服务已停用' : ''}`}
                               </span>
                             </p>
@@ -627,7 +629,7 @@ export function WrapSamplePage() {
                             className='h-11 w-full sm:w-auto'
                             disabled={!canEdit || busy || macNative}
                             loading={active}
-                            aria-label={`${changed ? '安装' : '重装'} ${vm.name || vm.id} 并停用`}
+                            aria-label={`${changed ? '安装' : '重装'} ${vm.name || vm.id} 并重启`}
                             onClick={() =>
                               requestInstall([{ id: vm.id, kernel }])
                             }
@@ -657,11 +659,11 @@ export function WrapSamplePage() {
         }}
         title={
           confirm?.length === 1
-            ? `重装 ${vmById.get(confirm[0].id)?.name || confirm[0].id} 并停用？`
-            : `重装全部 ${confirm?.length || 0} 台 VM 并停用？`
+            ? `重装 ${vmById.get(confirm[0].id)?.name || confirm[0].id} 并重启？`
+            : `重装全部 ${confirm?.length || 0} 台 VM 并重启？`
         }
-        desc='按所选内核安装，完成后服务保持关闭。凭据、授权和工作数据保留。'
-        confirmText='重装并停用'
+        desc='按所选内核安装并重启，健康检查完成后恢复调度；手动关闭和凭证限制保留。凭据、授权和工作数据不变。'
+        confirmText='重装并重启'
         cancelBtnText='取消'
         disabled={missingLicenses.length > 0}
         destructive
