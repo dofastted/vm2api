@@ -1,12 +1,12 @@
 /**
  * Wrap inference CLIs live in the slot home, next to the kernel.
  * share/wrap-cli holds the factory CLIs; an atomic sibling-cache pointer may
- * select a pulled cli-node/kernel pair. cc-node remains a separate legacy asset.
+ * select a pulled cli-node/kernel pair. cc-node stays with the cc dataplane.
  * The dataplane picks which executable kernel.json.claude_bin runs:
  *   wrap: cli-node + wrap kin-kernel
  *   cc:   cc-node + wrap kin-kernel
- *   crag + legacy: cc-node + share/crag/kin-kernel
- *   crag + v2: native CRAG worker, only when this VM pins crag_kernel_version=v2
+ *   crag: native CRAG worker and official Claude. Omitted or legacy versions
+ *         are v2; CRAG does not install cc-node or share/crag/kin-kernel.
  * Engine rust only chooses which process serves /v1. Credentials stay out.
  * Switching one VM never deletes cli-node and never rewrites routing.json.
  */
@@ -17,7 +17,7 @@ import path from 'node:path'
 import { kernelBinPath } from '../transport/rust-kernel-supervisor.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { nativeCliForVm, NATIVE_CLI_FILES } from './native-cli.mjs'
-import { resolveCragKernelVersion, resolveKernelDataplane } from './slot-engine.mjs'
+import { resolveKernelDataplane } from './slot-engine.mjs'
 import { checkCragLicense, decodeLicenseBytes } from './crag-license.mjs'
 
 export const WRAP_CLI_BIN = 'cli-node'
@@ -50,21 +50,6 @@ if [ -z "$JOB_IDLE_SECS" ]; then
     [ -n "$IDLE" ] && [ "$IDLE" -gt 0 ] && export JOB_IDLE_SECS="$IDLE"
   fi
 fi
-BIN="$DIR/${WRAP_KERNEL_BIN}"
-LOADER="$DIR/${WRAP_GLIBC_DIR}/ld-linux-x86-64.so.2"
-if [ -x "$LOADER" ] && [ -x "$BIN" ]; then
-  exec "$LOADER" --library-path "$DIR/${WRAP_GLIBC_DIR}" "$BIN" "$@"
-fi
-if [ -x "$BIN" ]; then
-  exec "$BIN" "$@"
-fi
-exec "$DIR/${WRAP_KERNEL_WRAPPER}.real" "$@"
-`
-}
-
-export function cragKernelWrapperScript() {
-  return `#!/bin/sh
-DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 BIN="$DIR/${WRAP_KERNEL_BIN}"
 LOADER="$DIR/${WRAP_GLIBC_DIR}/ld-linux-x86-64.so.2"
 if [ -x "$LOADER" ] && [ -x "$BIN" ]; then
@@ -144,14 +129,6 @@ function cragV2PlacementError(vm) {
       ok: false,
       code: 'crag_v2_unsupported_placement',
       error: 'CRAG v2 不支持 macOS 原生节点',
-    }
-  }
-  // A cluster slot's tree is the node slot-bin, not this control plane's home.
-  if (String(vm?.node_id || '').trim()) {
-    return {
-      ok: false,
-      code: 'crag_v2_unsupported_placement',
-      error: '集群槽的 CRAG 由内核页推到节点，不在控制面本机物化',
     }
   }
   return null
@@ -566,18 +543,7 @@ export function cragTemplateDir(projectRoot) {
   return path.join(projectRoot, 'share', 'crag')
 }
 
-export function cragKernelPath(projectRoot) {
-  const env = String(process.env.KIN_CRAG_KERNEL_BIN || '').trim()
-  if (env && isFile(env)) return env
-  const dir = cragTemplateDir(projectRoot)
-  if (!dir) return ''
-  const bin = path.join(dir, 'kin-kernel')
-  if (isFile(bin)) return bin
-  const alt = path.join(dir, WRAP_KERNEL_BIN)
-  return isFile(alt) ? alt : ''
-}
-
-export function cliPayloadPath(projectRoot, name, dir = wrapCliTemplateDir(projectRoot)) {
+function cliPayloadPath(projectRoot, name, dir = wrapCliTemplateDir(projectRoot)) {
   const selected = path.join(dir, name)
   if (isFile(selected) || name !== CC_NODE_BIN) return selected
   // Pulling the free pair does not remove the separately shipped legacy CLI.
@@ -847,80 +813,6 @@ function chownTree(root, uid, gid) {
   walk(root)
 }
 
-function writeCragWrapper(destDir) {
-  const wrapper = path.join(destDir, WRAP_KERNEL_WRAPPER)
-  const body = cragKernelWrapperScript()
-  try {
-    if (fs.readFileSync(wrapper, 'utf8') === body) return
-  } catch {}
-  const tmp = path.join(destDir, `.${WRAP_KERNEL_WRAPPER}.${process.pid}.new`)
-  fs.writeFileSync(tmp, body, { mode: 0o755 })
-  try {
-    fs.unlinkSync(wrapper)
-  } catch (error) {
-    if (error?.code !== 'ENOENT') {
-      try {
-        fs.unlinkSync(tmp)
-      } catch {}
-      throw error
-    }
-  }
-  fs.renameSync(tmp, wrapper)
-}
-
-export function describeCragPayload(projectRoot) {
-  const chosen = cragKernelPath(projectRoot)
-  const info = fileInfo(chosen)
-  return {
-    source: info ? 'sample' : 'missing',
-    path: info?.path || '',
-    size: info?.size || 0,
-    mtime: info?.mtime || '',
-    ok: Boolean(info),
-  }
-}
-
-export function materializeCragKernel(projectRoot, vm, { uid = null, gid = null } = {}) {
-  if (!projectRoot || !vm?.id) {
-    return { ok: false, code: 'vm_required', error: 'projectRoot and vm id required' }
-  }
-  const licensed = checkCragLicense(projectRoot, { ...vm, dataplane: 'crag' })
-  if (!licensed.ok) return licensed
-  const src = cragKernelPath(projectRoot)
-  if (!src) {
-    return {
-      ok: false,
-      code: 'crag_kernel_missing',
-      error: 'Crag kernel ELF missing (share/crag/kin-kernel)',
-    }
-  }
-  const cliSrc = cliPayloadPath(projectRoot, CC_NODE_BIN)
-  if (!isFile(cliSrc)) {
-    return {
-      ok: false,
-      code: 'cc_node_missing',
-      error: 'cc-node missing (share/wrap-cli/cc-node)',
-    }
-  }
-  const dest = wrapCliHomeDir(projectRoot, vm.id)
-  fs.mkdirSync(dest, { recursive: true })
-  const kernelChanged = replaceFile(src, path.join(dest, WRAP_KERNEL_BIN))
-  copyFile(cliSrc, path.join(dest, CC_NODE_BIN))
-  writeCragWrapper(dest)
-  chownTree(dest, uid, gid)
-  return {
-    ok: true,
-    dest,
-    src,
-    dataplane: 'crag',
-    changed: kernelChanged,
-    kernel_changed: kernelChanged,
-    glibc_shim: false,
-    wrapper: isFile(path.join(dest, WRAP_KERNEL_WRAPPER)),
-    kernel_bin: isFile(path.join(dest, WRAP_KERNEL_BIN)),
-  }
-}
-
 export function replaceCragKernelBinary(projectRoot, buf) {
   const bytes = Buffer.isBuffer(buf) ? buf : Buffer.from(buf || [])
   const check = inspectLinuxAmd64Elf(bytes)
@@ -937,10 +829,7 @@ export function replaceCragKernelBinary(projectRoot, buf) {
 
 export function materializeSlotDataplane(projectRoot, vm, dataplane, opts = {}) {
   const resolved = dataplane || resolveKernelDataplane(vm, opts.routing) || 'wrap'
-  if (resolved === 'crag' && resolveCragKernelVersion(vm, opts.routing) === 'v2') {
-    return materializeCragV2(projectRoot, vm, opts)
-  }
-  if (resolved === 'crag') return materializeCragKernel(projectRoot, vm, opts)
+  if (resolved === 'crag') return materializeCragV2(projectRoot, vm, opts)
   return materializeWrapCli(projectRoot, vm, opts)
 }
 
@@ -1294,14 +1183,12 @@ function payloadWouldChange(srcDir, destDir, projectRoot, native) {
 }
 export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptions } = {}) {
   const sample = describeWrapSample(projectRoot)
-  const crag = describeCragPayload(projectRoot)
   const items = []
   for (const vm of vms || []) {
     if (isCodexVm(vm)) continue
     const dataplane = resolveKernelDataplane(vm, routing) || 'wrap'
-    const version = dataplane === 'crag' ? resolveCragKernelVersion(vm, routing) : null
     const destDir = wrapCliHomeDir(projectRoot, vm.id)
-    if (version === 'v2') {
+    if (dataplane === 'crag') {
       const placement = cragV2PlacementError(vm)
       let src
       try {
@@ -1350,24 +1237,17 @@ export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptio
       items.push({ id: vm.id, dataplane, kernel_version: 'v2', ok: true, kernel_changed: kernelChanged })
       continue
     }
-    if (dataplane === 'crag' && !crag.ok) {
-      items.push({ id: vm.id, dataplane, ok: false, code: 'crag_kernel_missing', kernel_changed: false })
-      continue
-    }
-    if (dataplane !== 'crag' && !sample.ok) {
+    if (!sample.ok) {
       items.push({ id: vm.id, dataplane, ok: false, code: sample.code, kernel_changed: false })
       continue
     }
-    const src = dataplane === 'crag' ? crag.path : kernelPayloadPath(sample.dir, projectRoot)
-    const native = dataplane === 'crag' ? null : nativeCliForVm(vm, sample.dir, nativeCliOptions)
+    const native = nativeCliForVm(vm, sample.dir, nativeCliOptions)
     if (native && !native.ok) {
       items.push({ id: vm.id, dataplane, ...native, kernel_changed: false })
       continue
     }
     const kernelChanged =
-      (dataplane === 'crag'
-        ? kernelWouldChange(src, path.join(destDir, WRAP_KERNEL_BIN))
-        : payloadWouldChange(sample.dir, destDir, projectRoot, native)) || Boolean(vm?.kernel_restart_pending)
+      payloadWouldChange(sample.dir, destDir, projectRoot, native) || Boolean(vm?.kernel_restart_pending)
     items.push({ id: vm.id, dataplane, ok: true, kernel_changed: kernelChanged })
   }
   const failed = items.filter((item) => !item.ok)
@@ -1385,24 +1265,12 @@ export function inspectKernelChanges(projectRoot, vms, { routing, nativeCliOptio
 
 export function syncWrapSample(projectRoot, vms, { uidOf, routing } = {}) {
   const sample = describeWrapSample(projectRoot)
-  const crag = describeCragPayload(projectRoot)
   const items = []
   for (const vm of vms || []) {
     if (isCodexVm(vm)) continue
     const dataplane = resolveKernelDataplane(vm, routing) || 'wrap'
-    const version = dataplane === 'crag' ? resolveCragKernelVersion(vm, routing) : null
     if ((dataplane === 'wrap' || dataplane === 'cc') && !sample.ok) {
       items.push({ id: vm.id, dataplane, ok: false, code: sample.code, error: sample.error })
-      continue
-    }
-    if (version !== 'v2' && dataplane === 'crag' && !crag.ok) {
-      items.push({
-        id: vm.id,
-        dataplane,
-        ok: false,
-        code: 'crag_kernel_missing',
-        error: crag.error || 'Crag kernel ELF missing (share/crag/kin-kernel)',
-      })
       continue
     }
     const uid = typeof uidOf === 'function' ? uidOf(vm) : null
@@ -1422,7 +1290,6 @@ export function syncWrapSample(projectRoot, vms, { uidOf, routing } = {}) {
     changed: changed.length > 0,
     src: sample.dir,
     meta: sample.meta,
-    crag,
     total: items.length,
     ok_count: items.length - failed.length,
     failed_count: failed.length,

@@ -764,15 +764,21 @@ test('writeKernelConfig cli-hop writes local_cli without secrets', () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('writeKernelConfig points cc and crag at cc-node', () => {
+test('writeKernelConfig points cc at cc-node and crag at native Claude', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-cc-cfg-'))
   try {
-    for (const dataplane of ['cc', 'crag']) {
-      const written = writeKernelConfig(root, { id: 'vm-09', dataplane }, { token: 'tok' })
-      const doc = JSON.parse(fs.readFileSync(written.configPath, 'utf8'))
-      assert.equal(doc.dataplane, dataplane)
-      assert.equal(doc.claude_bin, '/home/kincli/.kin/cc-node')
-    }
+    const cc = JSON.parse(
+      fs.readFileSync(writeKernelConfig(root, { id: 'vm-09', dataplane: 'cc' }, { token: 'tok' }).configPath, 'utf8'),
+    )
+    assert.equal(cc.dataplane, 'cc')
+    assert.equal(cc.claude_bin, '/home/kincli/.kin/cc-node')
+    const crag = JSON.parse(
+      fs.readFileSync(writeKernelConfig(root, { id: 'vm-09', dataplane: 'crag' }, { token: 'tok' }).configPath, 'utf8'),
+    )
+    assert.equal(crag.dataplane, 'crag')
+    assert.equal(crag.claude_bin, '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude')
+    assert.equal(crag.crag_kernel_version, 'v2')
+    assert.equal(crag.runtime_variant, 'crag-v2')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -784,10 +790,10 @@ test('writeKernelConfig adds CRAG v2 fields for a local slot and a cluster Docke
     const legacy = JSON.parse(
       fs.readFileSync(writeKernelConfig(root, { id: 'vm-09', dataplane: 'crag' }, { token: 'tok' }).configPath, 'utf8'),
     )
-    assert.equal(legacy.claude_bin, '/home/kincli/.kin/cc-node')
+    assert.equal(legacy.claude_bin, '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude')
+    assert.equal(legacy.crag_kernel_version, 'v2')
+    assert.equal(legacy.runtime_variant, 'crag-v2')
     assert.equal(legacy.license_dir, '/run/kin/crag-license')
-    assert.equal(legacy.crag_v2_root, undefined)
-    assert.equal(legacy.node_bin, undefined)
     const v2 = JSON.parse(
       fs.readFileSync(
         writeKernelConfig(root, { id: 'vm-09', dataplane: 'crag', crag_kernel_version: 'v2' }, { token: 'tok' })
