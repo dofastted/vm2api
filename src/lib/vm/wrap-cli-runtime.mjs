@@ -356,7 +356,7 @@ function restoreDirectoryContents(backup, dest) {
   }
 }
 
-function stageCragV2Tree(src, dest) {
+export function stageCragV2Tree(src, dest) {
   const parent = path.dirname(dest)
   const staging = fs.mkdtempSync(path.join(parent, `.${path.basename(dest)}.new-`))
   let backup = ''

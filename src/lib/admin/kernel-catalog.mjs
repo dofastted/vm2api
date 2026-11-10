@@ -411,7 +411,7 @@ export async function pullKernelRelease(projectRoot, { kernel, tag = '' } = {}, 
     return { ok: false, code: 'kernel_invalid', error: '请选择 cli-node 或 CRAG' }
   let stage, published, lock, pointerTemp
   try {
-    const payload = await fetchKernelReleaseMetadata({ tag, fetchImpl })
+    const payload = await fetchKernelReleaseMetadata({ tag, kernel, fetchImpl })
     const specs =
       kernel === 'cli-node'
         ? [selectKernelAsset(payload), selectCliNodeAsset(payload)]

@@ -31,6 +31,36 @@ def run_installer(command, response=None, extra_env=None, mock=None):
 
 
 class ScheduleTests(unittest.TestCase):
+    def test_crag_update_uses_existing_host_or_container_without_compose_restart(self):
+        for container in (False, True):
+            with self.subTest(container=container), tempfile.TemporaryDirectory() as tmp:
+                trace = Path(tmp) / "trace"
+                mock = r'''
+need_root() { :; }
+docker() {
+  if [ "$1" = inspect ]; then echo "$CONTAINER"; return; fi
+  printf 'docker:%s\n' "$*" >> "$TRACE"
+}
+node() { printf 'node:%s\n' "$*" >> "$TRACE"; }
+'''
+                result = run_installer(
+                    'INSTALL_DIR=/test-root; CRAG_TARGET_VERSION=v2.0.1; cmd_update_crag',
+                    mock=mock, extra_env={"TRACE": str(trace), "CONTAINER": str(container).lower()},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                expected = (
+                    'docker:exec vm2api node /opt/vm2api/scripts/update-crag.mjs /opt/vm2api v2.0.1'
+                    if container else 'node:/test-root/scripts/update-crag.mjs /test-root v2.0.1'
+                )
+                self.assertEqual(trace.read_text().strip(), expected)
+
+    def test_crag_update_rejects_no_start_before_any_mutation(self):
+        result = run_installer(
+            'NO_START=1; cmd_update_crag',
+            mock='need_root() { :; }; node() { exit 99; }; docker() { exit 99; }',
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+
     def test_inline_python_supports_python_38_grammar(self):
         snippets = re.findall(r"python3 -c '([^']*)'", DEFINITIONS)
         self.assertTrue(snippets)

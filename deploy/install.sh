@@ -30,6 +30,7 @@ INSTALL_DIR="${VM2API_DIR:-/opt/vm2api}"
 SERVICE_NAME="vm2api"
 DEFAULT_PORT="${PORT:-8787}"
 TARGET_VERSION=""
+CRAG_TARGET_VERSION=""
 ASSUME_YES=0
 NO_START=0
 SYNC_WRAP=1
@@ -63,6 +64,7 @@ usage() {
 命令:
   install              安装到 ${INSTALL_DIR}（默认）
   upgrade | update     升到最新 GitHub Release（保留 .env / vms / data）
+  crag-update          独立更新 CRAG V2 包及全部既有 CRAG 副本，不切换槽位内核
   check                对比当前版本与最新 Release，打印 changelog
   changelog            打印本地 CHANGELOG.md
   status               当前版本、容器、探活
@@ -70,6 +72,7 @@ usage() {
 
 选项:
   --version vX.Y.Z     指定 tag（可带 -amd64 / -arm64 后缀，须与宿主架构一致）
+  --crag-version vX.Y.Z 指定 CRAG 供应仓 Release（省略为最新正式版）
   --dir PATH           安装目录（默认 ${INSTALL_DIR}）
   --yes                非交互
   --no-start           只拉代码，不 compose up
@@ -448,8 +451,9 @@ raise SystemExit(0 if d.get("ok") else 1)'
 }
 
 sync_wrap_cli() {
-  local key port response changed
-  key="$(read_env_key VM2API_API_KEY)"
+  local key port response probe
+  key="$(read_env_key VM2API_API_KEY || true)"
+  key="${key:-$(read_env_key KIN_API_KEY || true)}"
   port="$(read_env_key PORT)"
   port="${port:-$DEFAULT_PORT}"
   if [ -z "$key" ]; then
@@ -734,6 +738,27 @@ refresh_slot_services() {
   fi
 }
 
+cmd_update_crag() {
+  need_root
+  if [ "$NO_START" = 1 ]; then
+    err "crag-update 需要更新槽内运行二进制，不能与 --no-start 一起使用"
+    return 1
+  fi
+  if [ "$(docker inspect --format '{{.State.Running}}' "$SERVICE_NAME" 2>/dev/null || true)" = true ]; then
+    docker exec "$SERVICE_NAME" node /opt/vm2api/scripts/update-crag.mjs /opt/vm2api "$CRAG_TARGET_VERSION"
+    return
+  fi
+  node "${INSTALL_DIR}/scripts/update-crag.mjs" "$INSTALL_DIR" "$CRAG_TARGET_VERSION"
+}
+
+update_bundled_crag() {
+  # Do not install CRAG on ordinary cli-node-only installations.
+  if [ -f "${INSTALL_DIR}/share/crag/kernels/v2/amd64/manifest.json" ] ||
+     docker exec "$SERVICE_NAME" test -f /opt/vm2api/share/crag/kernels/v2/amd64/manifest.json 2>/dev/null; then
+    cmd_update_crag
+  fi
+}
+
 print_banner() {
   echo ""
   echo -e "${CYAN}==============================================${NC}"
@@ -766,6 +791,7 @@ cmd_install() {
   start_stack
   ok "安装完成  ${INSTALL_DIR}  @ $(local_version)"
   if [ "$NO_START" = 0 ] && [ "$SYNC_WRAP" = 1 ]; then
+    update_bundled_crag || { err "CRAG 二进制更新失败，安装未完成"; exit 1; }
     sync_wrap_cli || { err "槽内 wrap CLI / kernel 同步失败，安装未完成"; exit 1; }
   fi
 
@@ -813,6 +839,7 @@ cmd_upgrade() {
   prepare_arm64_host
   start_stack
   if [ "$NO_START" = 0 ] && [ "$SYNC_WRAP" = 1 ]; then
+    update_bundled_crag || { err "CRAG 二进制更新失败，升级未完成"; exit 1; }
     sync_wrap_cli || { err "槽内 wrap CLI / kernel 同步失败，升级未完成"; exit 1; }
 
   elif [ "$NO_START" = 1 ]; then
@@ -907,7 +934,7 @@ cmd_uninstall() {
 COMMAND="install"
 while [ $# -gt 0 ]; do
   case "$1" in
-    install|upgrade|update|check|changelog|status|uninstall)
+    install|upgrade|update|crag-update|check|changelog|status|uninstall)
       COMMAND="$1"
       shift
       ;;
@@ -922,6 +949,14 @@ while [ $# -gt 0 ]; do
         err "无效版本 $2：格式 vX.Y.Z，可带 -amd64 / -arm64 后缀"
         exit 1
       fi
+      shift 2
+      ;;
+    --crag-version)
+      if [ $# -lt 2 ] || ! [[ "$2" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        err "--crag-version 需要 vX.Y.Z"
+        exit 1
+      fi
+      CRAG_TARGET_VERSION="$2"
       shift 2
       ;;
     --dir)
@@ -963,6 +998,7 @@ done
 case "$COMMAND" in
   install) cmd_install ;;
   upgrade|update) cmd_upgrade ;;
+  crag-update) cmd_update_crag ;;
   check) cmd_check ;;
   changelog) cmd_changelog ;;
   status) cmd_status ;;

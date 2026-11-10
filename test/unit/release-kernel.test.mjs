@@ -5,7 +5,35 @@ import {
   isAllowedKernelUrl,
   selectKernelAsset,
   selectCliNodeAsset,
+  fetchKernelReleaseMetadata,
+  selectReleaseAsset,
+  CRAG_V2_RELEASE_ASSET,
 } from '../../src/lib/admin/release-kernel.mjs'
+
+test('CRAG metadata uses its supplier release, never the vm2api source-only release', async () => {
+  const seen = []
+  const fetchImpl = async (url) => {
+    seen.push(String(url))
+    return new Response(JSON.stringify({ tag_name: 'v2.0.1', assets: [] }))
+  }
+  await fetchKernelReleaseMetadata({ kernel: 'crag', tag: 'v2.0.1', fetchImpl })
+  await fetchKernelReleaseMetadata({ kernel: 'crag', fetchImpl })
+  assert.deepEqual(seen, [
+    'https://api.github.com/repos/dofastted/claude-code/releases/tags/v2.0.1',
+    'https://api.github.com/repos/dofastted/claude-code/releases/latest',
+  ])
+  const url = 'https://github.com/dofastted/claude-code/releases/download/v2.0.1/'
+  assert.equal(isAllowedKernelUrl(`${url}kin-kernel`, { crag: true }), false)
+  assert.equal(isAllowedKernelUrl(`${url}${CRAG_V2_RELEASE_ASSET}`), false)
+  const picked = selectReleaseAsset(
+    {
+      tag_name: 'v2.0.1',
+      assets: [{ name: CRAG_V2_RELEASE_ASSET, size: 10, browser_download_url: `${url}${CRAG_V2_RELEASE_ASSET}` }],
+    },
+    { name: CRAG_V2_RELEASE_ASSET, maxBytes: 100, missingCode: 'missing', tooLargeCode: 'large' },
+  )
+  assert.equal(picked.ok, true)
+})
 
 function fakeElf64Amd64() {
   const buf = Buffer.alloc(64)

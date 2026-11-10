@@ -12,6 +12,7 @@ export const CLI_NODE_RELEASE_ASSET = 'cli-node'
 export const CC_NODE_RELEASE_ASSET = 'cc-node'
 export const KERNEL_CRAG_RELEASE_ASSET = 'kin-kernel-crag'
 export const CRAG_V2_RELEASE_ASSET = 'crag-v2-licensed-amd64.tar.gz'
+export const CRAG_RELEASE_REPO = 'dofastted/claude-code'
 export const MAX_KERNEL_DOWNLOAD_BYTES = 32 * 1024 * 1024
 export const MAX_CLI_NODE_DOWNLOAD_BYTES = 64 * 1024 * 1024
 export const MAX_CC_NODE_DOWNLOAD_BYTES = MAX_CLI_NODE_DOWNLOAD_BYTES
@@ -52,7 +53,7 @@ export function kernelReleaseHttpStatus(code) {
   return 502
 }
 
-export function isAllowedKernelUrl(raw, { redirect = false } = {}) {
+export function isAllowedKernelUrl(raw, { redirect = false, crag = false } = {}) {
   let url
   try {
     url = new URL(String(raw || ''))
@@ -61,11 +62,17 @@ export function isAllowedKernelUrl(raw, { redirect = false } = {}) {
   }
   if (url.protocol !== 'https:' || url.username || url.password) return false
   if (url.hostname === 'api.github.com') {
-    return new RegExp(`^/repos/${GITHUB_REPO}/releases/(?:latest|tags/v\\d+\\.\\d+\\.\\d+|assets/\\d+)$`).test(
-      url.pathname,
-    )
+    const repos = crag ? `(?:${GITHUB_REPO}|${CRAG_RELEASE_REPO})` : GITHUB_REPO
+    return new RegExp(`^/repos/${repos}/releases/(?:latest|tags/v\\d+\\.\\d+\\.\\d+|assets/\\d+)$`).test(url.pathname)
   }
   if (url.hostname === 'github.com') {
+    if (
+      crag &&
+      new RegExp(
+        `^/${CRAG_RELEASE_REPO}/releases/download/v\\d+\\.\\d+\\.\\d+/crag-v2-licensed-amd64\\.tar\\.gz$`,
+      ).test(url.pathname)
+    )
+      return true
     return new RegExp(
       `^/${GITHUB_REPO}/releases/download/v\\d+\\.\\d+\\.\\d+/(?:${KERNEL_RELEASE_ASSET}|${CLI_NODE_RELEASE_ASSET}|${CC_NODE_RELEASE_ASSET}|${KERNEL_CRAG_RELEASE_ASSET}|crag-v2-licensed-amd64\\.tar\\.gz)$`,
     ).test(url.pathname)
@@ -88,7 +95,8 @@ export function selectReleaseAsset(payload, { name, maxBytes, missingCode, tooLa
   }
   const apiUrl = typeof asset.url === 'string' ? asset.url : ''
   const browserUrl = typeof asset.browser_download_url === 'string' ? asset.browser_download_url : ''
-  const url = isAllowedKernelUrl(apiUrl) ? apiUrl : isAllowedKernelUrl(browserUrl) ? browserUrl : ''
+  const scope = { crag: name === CRAG_V2_RELEASE_ASSET }
+  const url = isAllowedKernelUrl(apiUrl, scope) ? apiUrl : isAllowedKernelUrl(browserUrl, scope) ? browserUrl : ''
   if (!url)
     return {
       ok: false,
@@ -187,7 +195,7 @@ export async function openKernelReleaseAsset(startUrl, fetchImpl = globalThis.fe
   let current = startUrl
   let headers = githubApiHeaders('application/octet-stream')
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    if (!isAllowedKernelUrl(current, { redirect: hop > 0 })) {
+    if (!isAllowedKernelUrl(current, { redirect: hop > 0, crag: label === CRAG_V2_RELEASE_ASSET })) {
       throw coded('kernel_redirect_blocked', 'GitHub 跳转到了不允许的地址')
     }
     const res = await fetchImpl(current, {
@@ -225,13 +233,14 @@ async function fetchReleaseBytes(startUrl, fetchImpl, maxBytes, label) {
   return readCappedBody(await openKernelReleaseAsset(startUrl, fetchImpl, label), maxBytes, label)
 }
 
-export async function fetchKernelReleaseMetadata({ tag = '', fetchImpl = globalThis.fetch } = {}) {
+export async function fetchKernelReleaseMetadata({ tag = '', kernel = 'cli-node', fetchImpl = globalThis.fetch } = {}) {
   const trimmed = String(tag || '').trim()
   const normalized = trimmed ? normalizeTag(trimmed) : ''
   if (trimmed && (!normalized || !isReleaseTag(normalized)))
     throw coded('kernel_tag_invalid', 'Release tag 必须是 vX.Y.Z')
   if (!fetchImpl) throw coded('fetch_unavailable', 'fetch unavailable')
-  const url = `https://api.github.com/repos/${GITHUB_REPO}/releases/${normalized ? `tags/${normalized}` : 'latest'}`
+  const repo = kernel === 'crag' ? CRAG_RELEASE_REPO : GITHUB_REPO
+  const url = `https://api.github.com/repos/${repo}/releases/${normalized ? `tags/${normalized}` : 'latest'}`
   const res = await fetchImpl(url, {
     headers: githubApiHeaders(),
     redirect: 'manual',
