@@ -130,38 +130,6 @@ export function cragPromptTooLarge(bytes) {
   return error
 }
 
-function pureToolResultTurn(message) {
-  const blocks = Array.isArray(message?.content) ? message.content : []
-  return message?.role === 'user' && blocks.length > 0 && blocks.every((block) => block?.type === 'tool_result')
-}
-
-/**
- * Claude Code keeps the slot environment where it was and appends another
- * system message after the tool_result (MCP server instructions, or the
- * "hasn't heard from you" reminder). CRAG hashes every system after the
- * previous user turn, so the new suffix no longer matches the parked turn.
- * Drop that suffix only when an earlier system is still in place. A
- * continuation that moved the environment itself behind the tool_result
- * keeps it. A fresh request is unchanged.
- */
-export function omitContinuationSystemSuffix(body) {
-  const messages = body?.messages
-  if (!Array.isArray(messages)) return body
-  let tail = -1
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if (messages[i]?.role !== 'system') {
-      tail = i
-      break
-    }
-  }
-  if (!pureToolResultTurn(messages[tail])) return body
-  const inplace = messages.some((message, index) => message?.role === 'system' && index < tail)
-  if (!inplace) return body
-  const kept = messages.filter((message, index) => !(message?.role === 'system' && index > tail))
-  if (kept.length === messages.length) return body
-  return { ...body, messages: kept }
-}
-
 /**
  * @param {object} body caller body, before cli-node persona injection
  * @param {{ preset?: 'official_full' | 'zero', officialPassthrough?: boolean }} [options]
