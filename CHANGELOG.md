@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.4.059 — 2026-11-10
+
+- Codex 模型 `codex-auto-review` 默认改写成 `gpt-6-luna`。
+
+已部署机升级：更新 Node 控制面后重启。这是默认 `routing.json`。已经部署的机器不要覆盖本机 `routing.json`；要这条别名就在本机配置里加同样的 `model_mappings`。
+
 ## 1.4.058 — 2026-11-10
 
 - CRAG v2 默认官方 Claude 改为 2.1.321（2026-11-09）。包成员、槽内路径和安装校验都是 `claude-code-2.1.321/claude`。已经发出的 2.1.317 归档不改写。
