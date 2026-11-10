@@ -72,6 +72,7 @@ function beginInstall(root, id) {
         return { ok: true }
       },
       suspendVmRuntimeRestart: () => ({ ok: true }),
+      startSlotReady: () => ({ ok: true, rust_ok: true }),
     },
   })
   return { stopping: stopping.promise, resume: resume.resolve, operation }
@@ -119,9 +120,9 @@ function beginRequest(root, method, endpoint, body, extra = {}) {
 for (const mode of ['PATCH', 'slot-policy']) {
   test(`${mode} waits for the installer record lock before metadata, materialization or restart`, async (t) => {
     const { root, vm, dir } = fixture(t)
-    const record = fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`))
     const install = beginInstall(root, vm.id)
     await install.stopping
+    const record = fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`))
     const request =
       mode === 'PATCH'
         ? beginRequest(root, 'PATCH', `/vms/${vm.id}`, { dataplane: 'cc', persona_preset: 'zero', max_concurrency: 7 })
@@ -141,13 +142,13 @@ for (const mode of ['PATCH', 'slot-policy']) {
     await request.operation
     assert.equal(installed.ok, true, JSON.stringify(installed))
     assert.equal(request.response.status, 200, JSON.stringify(request.response.body))
-    assert.equal(getVm(root, vm.id).status, 'stopped')
+    assert.equal(getVm(root, vm.id).status, 'running')
     assert.equal(getVm(root, vm.id).dataplane, 'cc')
     if (mode === 'PATCH') assert.equal(getVm(root, vm.id).policy.maxConcurrency, 7)
     const config = JSON.parse(fs.readFileSync(path.join(root, 'vms', vm.id, 'run', 'kernel.json')))
     assert.equal(config.dataplane, 'cc')
     assert.equal(config.persona_preset, 'zero')
-    assert.equal(request.restarts(), 0, 'queued policy observes the stopped record, not stale running intent')
+    assert.equal(request.restarts(), 1, 'queued policy restarts the now-running slot after the installer completes')
   })
 }
 
@@ -185,9 +186,9 @@ for (const checkOnly of [false, true]) {
 
 test('explicit legacy dataplane selection defers metadata and sync together until installation finishes', async (t) => {
   const { root, vm, dir } = fixture(t)
-  const record = fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`))
   const install = beginInstall(root, vm.id)
   await install.stopping
+  const record = fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`))
   const request = beginRequest(root, 'POST', '/dataplane', { ids: [vm.id], dataplane: 'cc', restart: false })
   try {
     await request.read
@@ -203,7 +204,7 @@ test('explicit legacy dataplane selection defers metadata and sync together unti
   assert.equal(installed.ok, true)
   assert.equal(request.response.status, 200, JSON.stringify(request.response.body))
   assert.equal(getVm(root, vm.id).dataplane, 'cc')
-  assert.equal(getVm(root, vm.id).status, 'stopped')
+  assert.equal(getVm(root, vm.id).status, 'running')
   assert.equal(
     JSON.parse(fs.readFileSync(path.join(root, 'vms', vm.id, 'run', 'kernel.json'))).dataplane,
     'wrap',

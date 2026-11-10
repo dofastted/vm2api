@@ -32,6 +32,9 @@ export type KernelTarget = { id: string; kernel: KernelId }
 export type KernelInstallItem = KernelTarget & {
   ok: boolean
   stopped: boolean
+  restarted?: boolean
+  schedulable?: boolean
+  status?: string
   version?: string | null
   code?: string
   error?: string

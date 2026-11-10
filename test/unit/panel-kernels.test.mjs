@@ -223,6 +223,9 @@ test('install route changes only explicit Claude target, returns partial outcome
           suspendVmRuntimeRestart() {
             return { ok: true }
           },
+          startSlotReady() {
+            return { ok: true, rust_ok: true }
+          },
         },
       },
     },
@@ -234,10 +237,11 @@ test('install route changes only explicit Claude target, returns partial outcome
   assert.equal(report.failed_count, 1)
   assert.equal(report.ok, false)
   assert.deepEqual(stopped, ['vm-13'])
-  assert.equal(report.items[0].stopped, true)
+  assert.equal(report.items[0].stopped, false)
+  assert.equal(report.items[0].restarted, true)
   assert.equal(report.items[1].stopped, false)
   assert.equal(report.items[1].code, 'license_unconfigured')
-  assert.equal(getVm(root, 'vm-13').status, 'stopped')
+  assert.equal(getVm(root, 'vm-13').status, 'running')
   assert.equal(getVm(root, 'vm-14').status, 'running')
   assert.equal(fs.existsSync(cragLicenseDirectory(root, { id: 'vm-14' })), false)
   assert.deepEqual(fs.readFileSync(path.join(root, 'vms', 'vm-gpt.json')), untouched)

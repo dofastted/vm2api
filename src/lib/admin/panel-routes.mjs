@@ -2595,6 +2595,7 @@ export function createPanelHandler(ctx) {
           targets: body.targets,
           routing: ctx.routingConfig,
           watchdog: ctx.kernelWatchdog,
+          poolScheduler: ctx.poolScheduler,
           ops: ctx.kernelInstallOps,
         })
         return json(res, 200, panel.ok(report))
