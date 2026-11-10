@@ -76,7 +76,7 @@ RUN test -e /lib64 || ln -s usr/lib64 /lib64
 COPY --from=helpers /out/kin-egress /out/kin-worker /out/kin-api-kernel /out/kin-redact /opt/vm2api/image-bin/
 COPY scripts/docker-entrypoint.sh /usr/local/bin/vm2api-entrypoint
 RUN chmod 755 /usr/local/bin/vm2api-entrypoint /opt/vm2api/image-bin/* \
-    /opt/vm2api/image-wrap-cli/cli-node /opt/vm2api/image-wrap-cli/cc-node \
+    /opt/vm2api/image-wrap-cli/cli-node \
     && rm -f /opt/vm2api/src/lib/oauth/auth.js \
     && cp -a /opt/vm2api/src/config /opt/vm2api/image-config \
     && mkdir -p /opt/vm2api/vms /opt/vm2api/data /opt/vm2api/bin /opt/vm2api/share
