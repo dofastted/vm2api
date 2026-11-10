@@ -149,7 +149,7 @@ export function readExistingKernelConfig(configPath) {
   }
 }
 
-/** Legacy crag and cc use cc-node; native V2 owns its own child lifecycle. */
+/** The cc dataplane runs cc-node. CRAG always runs native Claude. */
 export function dataplaneUsesCcNode(exec) {
   const configPath = rustKernelPaths(exec).configPath
   if (!configPath) return false
@@ -157,7 +157,7 @@ export function dataplaneUsesCcNode(exec) {
   const plane = String(config.dataplane || '')
     .trim()
     .toLowerCase()
-  return (plane === 'crag' && config.crag_kernel_version !== 'v2') || plane === 'cc' || plane === 'cc-node'
+  return plane === 'cc' || plane === 'cc-node'
 }
 function projectRootFromExec(exec = {}) {
   if (exec?.projectRoot) return exec.projectRoot
