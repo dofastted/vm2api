@@ -37,9 +37,17 @@ test('later native manual start upgrades a default or unconfined container but k
       run: () => ({ ok: true, stdout: output(['no-new-privileges', seccomp]) }),
     })
     assert.equal(
-      nativeSlotSandboxNeedsRecreate(observed.container, native),
+      nativeSlotSandboxNeedsRecreate(
+        observed.container,
+        native,
+        {},
+        {
+          appArmorEnabled: false,
+          userNamespaceRestricted: false,
+        },
+      ),
       false,
-      'already secured native target must be reused',
+      'already secured native target must be reused when AppArmor is off',
     )
   }
   const restricted = inspectContainerOutcome('kin-13', {
@@ -49,6 +57,11 @@ test('later native manual start upgrades a default or unconfined container but k
     nativeSlotSandboxNeedsRecreate(restricted.container, native, {}, { userNamespaceRestricted: true }),
     true,
     'Ubuntu AppArmor userns policy requires a recreated container',
+  )
+  assert.equal(
+    nativeSlotSandboxNeedsRecreate(restricted.container, native, {}, { appArmorEnabled: true }),
+    true,
+    'docker-default denies /proc/self uid_map writes and mount with EACCES',
   )
   const unrestricted = inspectContainerOutcome('kin-13', {
     run: () => ({

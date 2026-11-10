@@ -380,7 +380,7 @@ function modelSupportsPerMessageEffort(modelId = '') {
     .trim()
     .toLowerCase()
     .replace(/\[1m\]$/i, '')
-  return /^claude-(?:(?:fable|mythos)-5[-.]1|opus-5(?:[-.]5)?|(?:sonnet|haiku)-5[-.]5)(?:-|$)/.test(id)
+  return /^claude-(?:(?:fable|mythos)-5[-.](?:1|2)|opus-5(?:[-.]5)?|(?:sonnet|haiku)-5[-.]5)(?:-|$)/.test(id)
 }
 
 function applyLiftedEffort(body, effort) {

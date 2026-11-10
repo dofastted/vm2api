@@ -13,14 +13,14 @@ test('outbound reference follows 303 official presets and legacy presets', () =>
     {},
   ]) {
     const profile = buildOutboundProfile(routing)
-    assert.equal(profile.cli_version, '2.1.303', JSON.stringify(routing))
-    assert.match(profile.user_agent, /^claude-cli\/2\.1\.303 \(external, cli\)$/)
+    assert.equal(profile.cli_version, '2.1.321', JSON.stringify(routing))
+    assert.match(profile.user_agent, /^claude-cli\/2\.1\.321 \(external, cli\)$/)
   }
   const legacy = buildOutboundProfile({
     compatibility: { persona_preset: 'zero' },
   })
-  assert.equal(legacy.cli_version, '2.1.303')
-  assert.match(legacy.user_agent, /^claude-cli\/2\.1\.303 \(external, cli\)$/)
+  assert.equal(legacy.cli_version, '2.1.321')
+  assert.match(legacy.user_agent, /^claude-cli\/2\.1\.321 \(external, cli\)$/)
   assert.match(
     buildOutboundProfile({ compatibility: { persona_preset: 'official_303' } }).anthropic_beta,
     /oauth-2025-04-20/,

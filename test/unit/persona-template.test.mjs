@@ -132,7 +132,7 @@ test('guidance is off by default and explicit enable keeps cwd memory behavior',
     false,
   )
   assert.equal(
-    omitted.some((block) => String(block.text).includes('Write code that reads like the surrounding code')),
+    omitted.some((block) => String(block.text).includes('When you use a pronoun for someone')),
     true,
   )
 })
@@ -1012,7 +1012,7 @@ test('official full can drop the env block while the opt-in timezone switch stil
         { routingFile: file, identity: { timezone: 'Asia/Tokyo' } },
       )
       assert.equal(
-        out.system.some((block) => block.text.startsWith('Write code that reads like the surrounding code')),
+        out.system.some((block) => block.text.startsWith('When you use a pronoun for someone')),
         true,
       )
       assert.deepEqual(envMessages(out), [' - Timezone: Asia/Tokyo'])
@@ -1062,7 +1062,8 @@ test('official preset preserves caller system verbatim in a reminder at the fron
 })
 
 test('routing persona_guidance_presets turns the 303 guidance block on; default leaves it off', () => {
-  const guidance = (out) => out.system.filter((block) => String(block.text).startsWith('Write code that reads like'))
+  const guidance = (out) =>
+    out.system.filter((block) => String(block.text).startsWith('When you use a pronoun for someone'))
   withRoutingFile({ persona_preset: 'official_full', overlay_preset: 'off' }, (file) => {
     const out = applyCrsUnofficialPersona({ messages: [{ role: 'user', content: 'hi' }] }, { routingFile: file })
     assert.equal(guidance(out).length, 0)

@@ -24,16 +24,17 @@ export const CRAG_KERNEL_VERSIONS = Object.freeze(['legacy', 'v2'])
 export const CONTAINER_CLI_NODE_BIN = '/home/kincli/.kin/cli-node'
 export const CONTAINER_CC_NODE_BIN = '/home/kincli/.kin/cc-node'
 export const CONTAINER_CRAG_CLAUDE_BIN = CONTAINER_CC_NODE_BIN
-// Cluster-node slots run the self-contained image: binaries live in the image,
-// not in the bind-mounted home (see cluster/slot-image.mjs).
+// Image copies under /opt/kin stay for old containers. New commands and the
+// CLI path use the slot-bin mount, so a kernel pull updates bytes without a
+// new image. The wrapper is replaced by rename, never unlinked first.
 export const REMOTE_KIN_DIR = '/opt/kin'
-export const REMOTE_KERNEL_ENTRY = `${REMOTE_KIN_DIR}/kin-kernel`
-export const REMOTE_CLI_NODE_BIN = `${REMOTE_KIN_DIR}/cli-node`
-export const REMOTE_CC_NODE_BIN = `${REMOTE_KIN_DIR}/cc-node`
-// The slot-bin mount, not the image copy: a payload push updates this tree without a new image.
-export const REMOTE_CRAG_ENTRY = '/opt/kin-live/crag-kernel'
-export const REMOTE_CRAG_CLAUDE = '/opt/kin-live/crag-v2/claude-code-2.1.317/claude'
-export const LOCAL_CRAG_CLAUDE = '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude'
+export const REMOTE_LIVE_DIR = '/opt/kin-live'
+export const REMOTE_KERNEL_ENTRY = `${REMOTE_LIVE_DIR}/kin-kernel`
+export const REMOTE_CLI_NODE_BIN = `${REMOTE_LIVE_DIR}/cli-node`
+export const REMOTE_CC_NODE_BIN = `${REMOTE_LIVE_DIR}/cc-node`
+export const REMOTE_CRAG_ENTRY = `${REMOTE_LIVE_DIR}/crag-kernel`
+export const REMOTE_CRAG_CLAUDE = `${REMOTE_LIVE_DIR}/crag-v2/claude-code-2.1.321/claude`
+export const LOCAL_CRAG_CLAUDE = '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude'
 
 export const KERNEL_NATIVE_SLOT_COUNT = 20
 export const SESSION_SLOT_MIN = 1

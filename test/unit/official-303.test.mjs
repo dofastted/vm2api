@@ -123,7 +123,7 @@ test('official caller: system is billing, identity, harness, guidance; caller sy
   assert.equal(out.system.length, 5)
   assert.match(
     out.system[0].text,
-    /^x-anthropic-billing-header: cc_version=2\.1\.303\.[0-9a-f]{3}; cc_entrypoint=cli; cch=00000;/,
+    /^x-anthropic-billing-header: cc_version=2\.1\.321\.[0-9a-f]{3}; cc_entrypoint=cli; cch=00000;/,
   )
   assert.equal(out.system[0].text.includes('cc_is_subagent'), false)
   assert.equal(out.system[0].cache_control, undefined)
@@ -213,7 +213,18 @@ test('missing thinking stays omitted through the final payload; a repair does no
     routing: { compatibility: { thinking_display: 'summarized' } },
     cliHop: true,
   })
-  assert.deepEqual(out.body.thinking, { type: 'adaptive', display: 'omitted' })
+  assert.deepEqual(out.body.thinking, { type: 'adaptive', display: 'updates' })
+  assert.ok(out.body.betas.includes('thinking-display-updates-2026-08-18'))
+  const print = finalizeWorkerPayload({
+    body: prepared,
+    reqHeaders: {},
+    exec,
+    identity: null,
+    routing: { compatibility: { cc_entrypoint: 'sdk-cli', thinking_display: 'summarized' } },
+    cliHop: true,
+  })
+  assert.deepEqual(print.body.thinking, { type: 'adaptive', display: 'omitted' })
+  assert.equal(print.body.betas.includes('thinking-display-updates-2026-08-18'), false)
   const repairedHop = prepareCliHopBody(missing, { repaired: true, outboundShape: 'lean' })
   const repaired = finalizeWorkerPayload({
     body: repairedHop,
@@ -536,12 +547,12 @@ test('kernel.json cli_version follows the slot profile', () => {
   const read = (vm, routing) =>
     JSON.parse(fs.readFileSync(writeKernelConfig(root, vm, { token: 't', routing }).configPath, 'utf8'))
   try {
-    assert.equal(read({ id: 'vm-01' }, { compatibility: { persona_preset: 'official_303' } }).cli_version, '2.1.303')
-    assert.equal(read({ id: 'vm-02' }, { compatibility: { persona_preset: 'official_full' } }).cli_version, '2.1.303')
-    assert.equal(read({ id: 'vm-03' }, {}).cli_version, '2.1.303')
+    assert.equal(read({ id: 'vm-01' }, { compatibility: { persona_preset: 'official_303' } }).cli_version, '2.1.321')
+    assert.equal(read({ id: 'vm-02' }, { compatibility: { persona_preset: 'official_full' } }).cli_version, '2.1.321')
+    assert.equal(read({ id: 'vm-03' }, {}).cli_version, '2.1.321')
     assert.equal(
       read({ id: 'vm-04', persona_preset: 'official_303' }, { compatibility: { persona_preset: 'zero' } }).cli_version,
-      '2.1.303',
+      '2.1.321',
     )
     const slot = read({ id: 'vm-05', persona_preset: 'official_303' }, {})
     assert.equal(slot.persona_preset, 'official_303')

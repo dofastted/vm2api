@@ -139,7 +139,7 @@ export function buildFullEnvJson(id = {}) {
     platform,
     platform_raw: str(id.platform_raw || platform),
     arch: str(id.arch || 'x64'),
-    node_version: str(id.node_version || 'v26.3.0'),
+    node_version: str(id.node_version || 'v26.12.1'),
     terminal: str(id.terminal || 'unknown'),
     shell: telemetryShell(id.shell),
     package_managers: str(id.package_managers || ''),

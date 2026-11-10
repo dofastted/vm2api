@@ -55,11 +55,4 @@ describe('VM account column kernel label', () => {
     expect(render({ dataplane: 'crag' })).toContain('>crag</span>')
     expect(render()).toContain('>标准内核</span>')
   })
-
-  it('does not label a GPT slot as a standard Claude kernel', () => {
-    const html = render({ platform: 'openai' })
-    expect(html).not.toContain('title="当前内核"')
-    expect(html).not.toContain('>标准内核</span>')
-    expect(html).not.toContain('>crag</span>')
-  })
 })

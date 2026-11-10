@@ -573,7 +573,7 @@ test('native accepts the exact shipped customer wrapper directory', { skip: crag
   const factory = seedEncryptedPackage(root)
   const wrapped = archive(factory, (rows) => [
     { name: 'crag-v2-licensed-amd64/', body: Buffer.alloc(0), type: '5', mode: 0o755 },
-    { name: 'crag-v2-licensed-amd64/claude-code-2.1.317/', body: Buffer.alloc(0), type: '5', mode: 0o755 },
+    { name: 'crag-v2-licensed-amd64/claude-code-2.1.321/', body: Buffer.alloc(0), type: '5', mode: 0o755 },
     ...rows.map((row) => ({ ...row, name: `crag-v2-licensed-amd64/${row.name}` })),
   ])
   const result = await pullKernelRelease(root, { kernel: 'crag' }, transport({ [CRAG_V2_RELEASE_ASSET]: wrapped }))

@@ -1,5 +1,5 @@
 /**
- * CRAG v2 print worker (claude-code-2.1.317) does not read kernel.json
+ * CRAG v2 print worker (claude-code-2.1.321) does not read kernel.json
  * persona_preset or CLAUDE_CODE_SYSTEM_LAYOUT. Bare `system` is append.
  * official_full must not resend the official four blocks. zero must be
  * crag_prompt.mode=replace. --bare is not used: it drops OAuth.
@@ -46,6 +46,19 @@ export function cragV2KernelActive({ vm, health, kernelConfig } = {}) {
   const filed = namedKernel(kernelConfig)
   if (filed) return filed === 'crag-v2'
   return false
+}
+
+const MODEL_DIRECTIVE_CAPS = ['model_directive', 'linux_tui_pty']
+
+/**
+ * Only a worker that applies the directive inside its own CLI fetch may see
+ * `crag_model`. A hop or older cluster kernel forwards the envelope body and
+ * Anthropic answers `crag_model: Extra inputs are not permitted`.
+ */
+export function cragConsumesModelDirective(health) {
+  const caps = health?.capabilities
+  if (!Array.isArray(caps)) return false
+  return caps.some((cap) => MODEL_DIRECTIVE_CAPS.includes(String(cap || '')))
 }
 
 export const CRAG_PRINT_PROMPT_MAX_BYTES = 64 * 1024

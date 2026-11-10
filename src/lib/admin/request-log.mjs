@@ -641,6 +641,8 @@ export class RequestLogStore {
           ctx.capture_outbound && !extra.classifier && extra.outbound_body != null
             ? clampBody(extra.outbound_body, this.maxDebugBodyChars)
             : null,
+        outbound_body_source: ctx.capture_outbound ? extra.outbound_body_source || null : null,
+        outbound_body_truncated: ctx.capture_outbound ? extra.outbound_body_truncated === true : false,
         response: ctx.response ? debugResponse(ctx.response) : null,
       }
       try {

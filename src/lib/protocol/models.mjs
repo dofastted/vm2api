@@ -235,6 +235,7 @@ export function setModelCatalog(ids, { source = 'go-slot-worker' } = {}) {
         (ids || [])
           .map((id) => {
             if (id === 'claude-fable-5.1') return 'claude-fable-5-1'
+            if (id === 'claude-fable-5.2') return 'claude-fable-5-2'
             if (id === 'claude-opus-5.5') return 'claude-opus-5-5'
             return id
           })

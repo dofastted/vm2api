@@ -63,6 +63,7 @@ function openaiFrom(std, extra = {}) {
 const ANTHROPIC = {
   'claude-fable-5': claude(10, 50, 1, 12.5, 20),
   'claude-fable-5-1': claude(10, 50, 0.25, 12.5, 20),
+  'claude-fable-5-2': claude(8, 40, 0.2, 10, 16),
   'claude-mythos-5': claude(10, 50, 1, 12.5, 20),
   'claude-mythos-5-1': claude(10, 50, 0.25, 12.5, 20),
   'claude-opus-5-5': claude(4, 20, 0.2, 5, 8, {
@@ -292,6 +293,7 @@ export const BUILTIN_ALIASES = {
   sonnet: 'claude-sonnet-5-5',
   haiku: 'claude-haiku-4-5-20251001',
   'claude-fable-5.1': 'claude-fable-5-1',
+  'claude-fable-5.2': 'claude-fable-5-2',
   'claude-mythos-5.1': 'claude-mythos-5-1',
   'claude-opus-5.5': 'claude-opus-5-5',
   'claude-sonnet-5.5': 'claude-sonnet-5-5',

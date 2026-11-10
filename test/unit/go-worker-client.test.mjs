@@ -140,6 +140,39 @@ test('setup-token worker envelope is inference-only', () => {
   assert.match(String(out.headers['anthropic-beta'] || ''), /oauth-2025-04-20/)
 })
 
+test('worker canonicalizes passthrough bodies before either kernel', () => {
+  const body = {
+    model: 'claude-sonnet-5',
+    settings: { theme: 'dark' },
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'user',
+        content: [{ type: 'text', text: 'hello', annotations: [{ type: 'client-only' }] }],
+      },
+    ],
+    crag_prompt: { mode: 'append', text: 'caller tail' },
+  }
+  for (const cragPrint of [false, true]) {
+    const out = finalizeWorkerPayload({
+      body,
+      reqHeaders: {},
+      exec: {
+        homeDir: '',
+        vm: { claude: { mode: 'setup-token', scope: 'user:inference' } },
+        workerStatus: { runtime_variant: 'crag-v2', capabilities: ['linux_tui_pty'] },
+      },
+      identity: null,
+      cliHop: true,
+      cragPrint,
+    })
+    assert.equal(out.body.settings, undefined)
+    assert.deepEqual(out.body.output_config?.format, { type: 'json_schema', schema: { type: 'object' } })
+    assert.deepEqual(out.body.messages[0].content, [{ type: 'text', text: 'hello' }])
+    assert.deepEqual(out.body.crag_prompt, cragPrint ? body.crag_prompt : undefined)
+  }
+})
+
 test('cli-hop envelope keeps role=system turns that the VM betas do not declare', () => {
   const body = {
     model: 'claude-opus-5-5',
@@ -257,15 +290,17 @@ test('cli-hop appends inline-tools when a message carries a tool_definition', ()
   assert.ok(!plain.body.betas.includes('inline-tools-2026-09-15'))
 })
 
-test('CRAG v2 receives the preset model boundary and the standard kernel does not', () => {
+test('CRAG v2 receives the preset model boundary only from a worker that consumes it', () => {
   const body = { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] }
   const reqHeaders = {}
+  const vm = { dataplane: 'crag', crag_kernel_version: 'v2', claude: { mode: 'setup-token', scope: 'user:inference' } }
   const crag = finalizeWorkerPayload({
     body,
     reqHeaders,
     exec: {
       homeDir: '',
-      vm: { dataplane: 'crag', crag_kernel_version: 'v2', claude: { mode: 'setup-token', scope: 'user:inference' } },
+      vm,
+      workerStatus: { runtime_variant: 'crag-v2', capabilities: ['linux_tui_pty'] },
     },
     identity: null,
   })
@@ -275,6 +310,14 @@ test('CRAG v2 receives the preset model boundary and the standard kernel does no
   assert.equal(crag.body.crag_model.params.max_tokens_default, 8192)
   assert.equal(crag.body.crag_model.params.max_tokens_cap, 64000)
   assert.ok(crag.body.crag_model.betas.drop.includes('context-management-2025-06-27'))
+  const forwarded = finalizeWorkerPayload({
+    body: { ...body, crag_prompt: { mode: 'append', text: 'caller' }, crag_model: { id: 'leaked' } },
+    reqHeaders,
+    exec: { homeDir: '', vm, workerStatus: { runtime_variant: 'crag-v2', execution_mode: 'crag_slots' } },
+    identity: null,
+  })
+  assert.equal(forwarded.body.crag_model, undefined)
+  assert.equal(forwarded.body.crag_prompt, undefined)
   const wrap = finalizeWorkerPayload({
     body,
     reqHeaders,
@@ -302,7 +345,11 @@ test('a wrap VM does not inherit a global CRAG v2 route', () => {
   const forced = finalizeWorkerPayload({
     body,
     reqHeaders: {},
-    exec: { homeDir: '', vm: { dataplane: 'wrap' }, workerStatus: { runtime_variant: 'crag-v2' } },
+    exec: {
+      homeDir: '',
+      vm: { dataplane: 'wrap' },
+      workerStatus: { runtime_variant: 'crag-v2', capabilities: ['linux_tui_pty'] },
+    },
     identity: null,
     cragPrint: false,
   })
@@ -310,7 +357,11 @@ test('a wrap VM does not inherit a global CRAG v2 route', () => {
   const live = finalizeWorkerPayload({
     body,
     reqHeaders: {},
-    exec: { homeDir: '', vm: { dataplane: 'wrap' }, workerStatus: { runtime_variant: 'crag-v2' } },
+    exec: {
+      homeDir: '',
+      vm: { dataplane: 'wrap' },
+      workerStatus: { runtime_variant: 'crag-v2', capabilities: ['model_directive'] },
+    },
     identity: null,
   })
   assert.equal(live.body.crag_model.id, 'claude-haiku-4-5-20251001')
@@ -626,6 +677,40 @@ unixTest('final headers survive an upstream error without becoming a downstream 
     assert.equal(result.ok, false)
     assert.equal(result.committed, false)
     assert.deepEqual(snapshots, [{ 'x-stainless-retry-count': '1' }])
+  } finally {
+    await fx.close()
+  }
+})
+
+unixTest('a reported final body is capped at 10000 tokens and stays off the caller stream', async () => {
+  const fx = await fixture((req, res) => {
+    req.resume()
+    res.setHeader('content-type', 'text/event-stream')
+    const body = '汉'.repeat(10_050)
+    res.write(
+      `event: kin_outbound_headers\ndata: ${JSON.stringify({
+        type: 'kin_outbound_headers',
+        headers: { 'user-agent': 'claude-cli/2.1.317 (external, cli)', authorization: 'Bearer secret' },
+        body,
+        body_truncated: false,
+      })}\n\n`,
+    )
+    res.end('event: message_stop\ndata: {"type":"message_stop"}\n\n')
+  })
+  try {
+    const lines = []
+    const snapshots = []
+    const result = await streamGoWorker({
+      exec: fx.exec,
+      body: { model: 'claude-test', messages: [{ role: 'user', content: 'hi' }] },
+      onOutboundHeaders: (headers, extra) => snapshots.push({ headers, extra }),
+      onEvent: (line) => lines.push(line),
+    })
+    assert.equal(result.ok, true)
+    assert.equal(snapshots[0].headers['user-agent'], 'claude-cli/2.1.317 (external, cli)')
+    assert.equal(snapshots[0].extra.body.length, 10_000)
+    assert.equal(snapshots[0].extra.body_truncated, true)
+    assert.doesNotMatch(lines.join('\n'), /kin_outbound_headers|2\.1\.317/)
   } finally {
     await fx.close()
   }

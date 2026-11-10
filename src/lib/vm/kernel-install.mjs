@@ -9,10 +9,10 @@ import { ensureHostPrivateDir } from './private-dir.mjs'
 import { getVm, patchVmRecord } from './vm-registry.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
-import { isNativeNodeVm } from '../cluster/placement.mjs'
 import { stopSlot } from './slot-runtime.mjs'
 import { officialCcUidGid, suspendVmRuntimeRestart } from './vm-runtime.mjs'
 import { materializeResolvedKernel } from './wrap-cli-runtime.mjs'
+import { pushKernelSelection } from '../cluster/remote-slot-files.mjs'
 
 const PRODUCTS = new Set(['cli-node', 'crag'])
 // Only exceptional installer holds may be cleared by a later explicit start.
@@ -49,25 +49,28 @@ function desiredVm(vm, kernel) {
 
 function placementFailure(vm, kernel) {
   if (isCodexVm(vm)) return { code: 'kernel_codex_unsupported', error: '请选择 Claude 虚拟机' }
-  if (kernel === 'crag') {
-    if (isKvmRuntime(vm) || isNativeNodeVm(vm)) {
-      return {
-        code: 'crag_v2_unsupported_placement',
-        error: isKvmRuntime(vm) ? 'CRAG v2 不支持 KVM 槽' : 'CRAG v2 不支持 macOS 原生节点',
-      }
-    }
-    if (process.platform !== 'linux') {
-      return { code: 'crag_v2_unsupported_placement', error: '内核重装仅支持 Linux' }
-    }
-    return null
+  if (vm.node_platform === 'darwin') {
+    return { code: 'kernel_install_unsupported_placement', error: 'macOS 原生节点不能在内核页重装' }
   }
-  if (vm.node_id || isKvmRuntime(vm) || process.platform !== 'linux') {
+  if (!vm.node_id && !isKvmRuntime(vm) && process.platform !== 'linux') {
     return {
-      code: 'kernel_install_unsupported_placement',
+      code: kernel === 'crag' ? 'crag_v2_unsupported_placement' : 'kernel_install_unsupported_placement',
       error: '内核重装仅支持本机 Linux Docker 虚拟机',
     }
   }
   return null
+}
+
+async function deployBakedKernel(projectRoot, vm, kernel) {
+  try {
+    return await pushKernelSelection(vm, projectRoot, kernel)
+  } catch (error) {
+    return {
+      ok: false,
+      code: error?.code || 'kernel_materialize_failed',
+      error: String(error?.message || error).slice(0, 300),
+    }
+  }
 }
 
 function prepareNativeDirectories(runDir, owner) {
@@ -186,10 +189,13 @@ export async function installKernelTargets({ projectRoot, targets, routing = {},
               installedProduct?.error || '内核缓存已变化，请重新拉取',
               true,
             )
-          const laid = await (ops.materializeResolvedKernel || materializeResolvedKernel)(projectRoot, candidate, {
-            ...owner,
-            routing,
-          })
+          const baked = !!String(candidate.node_id || '').trim()
+          const laid = baked
+            ? await (ops.deployBakedKernel || deployBakedKernel)(projectRoot, candidate, target.kernel)
+            : await (ops.materializeResolvedKernel || materializeResolvedKernel)(projectRoot, candidate, {
+                ...owner,
+                routing,
+              })
           if (!laid?.ok) return failure(target, laid?.code || phase, laid?.error || '内核文件安装失败', true)
           phase = 'kernel_config_failed'
           const config = (ops.writeKernelConfig || writeKernelConfig)(projectRoot, candidate, {
@@ -198,7 +204,7 @@ export async function installKernelTargets({ projectRoot, targets, routing = {},
             publish: false,
           })
           if (!config?.configPath) return failure(target, phase, '内核配置生成失败', true)
-          if (target.kernel === 'crag') prepareNativeDirectories(config.runDir, owner)
+          if (target.kernel === 'crag' && !baked) prepareNativeDirectories(config.runDir, owner)
           phase = 'kernel_selection_persist_failed'
           const saved = patchVmRecord(projectRoot, target.id, (record) => {
             record.dataplane = candidate.dataplane

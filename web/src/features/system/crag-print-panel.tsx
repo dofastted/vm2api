@@ -73,7 +73,7 @@ export function CragPrintPanel({
       <div className='space-y-3 rounded-xl border bg-card px-5 py-4 text-sm leading-6 text-muted-foreground sm:px-6'>
         <p>
           这套只给 CRAG v2 print worker（官方二进制
-          claude-code-2.1.317）。vm2api 不走 TUI。
+          claude-code-2.1.321）。vm2api 不走 TUI。
           <code className='mx-1'>kernel.json</code>的{' '}
           <code>persona_preset</code> 和 <code>CLAUDE_CODE_SYSTEM_LAYOUT</code>{' '}
           这条路径不读。

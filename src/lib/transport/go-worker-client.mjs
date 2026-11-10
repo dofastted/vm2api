@@ -4,11 +4,13 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { prepareOutboundHeaders } from '../protocol/outbound-attempt.mjs'
 import { sanitizeAnthropicBodyForBetaTokens } from '../protocol/anthropic-policy.mjs'
+import { sanitizeAnthropicBody } from '../protocol/sanitize.mjs'
 import { withRequestProtocolBetas } from '../protocol/claude-code-betas.mjs'
 import { pinThreadBetas, rememberThreadTurn } from '../protocol/thread-betas.mjs'
 import { applyThinkingDisplay, ensureOfficialPrintThinking, thinkingDisplayMode } from '../protocol/thinking.mjs'
 import { modelDirectiveForCrag } from '../protocol/model-policy.mjs'
-import { stripSubagentBilling } from '../identity/crs-persona.mjs'
+import { capOutboundBody } from '../protocol/outbound-snapshot.mjs'
+import { ccEntrypointFromRouting, stripSubagentBilling } from '../identity/crs-persona.mjs'
 import { sealClaudeCodeCch } from '../identity/cch.mjs'
 import { credentialModeFromOauth } from '../oauth/credential-mode.mjs'
 import { isCrsMock, writeCrsTrace, mockCrsPayload, emitMockSse } from './crs-mock.mjs'
@@ -27,7 +29,7 @@ import {
 import { isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { runSlotOauth } from './slot-oauth.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
-import { cragV2KernelActive, readSlotKernelConfig } from '../protocol/crag-print-prompt.mjs'
+import { cragConsumesModelDirective, cragV2KernelActive, readSlotKernelConfig } from '../protocol/crag-print-prompt.mjs'
 import { applyClaudeSSELineToMessage, createClaudeMessageAssembler } from '../protocol/convert.mjs'
 import {
   clientCancelledResult,
@@ -439,7 +441,11 @@ export function prepareWorkerPayload({
   requestContext = null,
   repaired = false,
 } = {}) {
-  const model = body?.model || ''
+  // This is the last panel-owned boundary before either kernel. Keep the
+  // worker contract Anthropic-shaped even when a caller selected passthrough;
+  // cli-node and CRAG must never receive OpenAI/client-only request fields.
+  const canonicalBody = sanitizeAnthropicBody(body, { preserveContentShape: false }) || body
+  const model = canonicalBody?.model || ''
   const credMode = credentialModeFromOauth(exec?.vm?.claude || {})
   const headers = prepareOutboundHeaders(reqHeaders, exec?.homeDir, identity, model, {
     credentialMode: credMode,
@@ -447,8 +453,11 @@ export function prepareWorkerPayload({
   })
   const displayed =
     requestContext?.purpose === 'auto_mode_classifier' || repaired
-      ? body
-      : ensureOfficialPrintThinking(applyThinkingDisplay(body, thinkingDisplayMode(routing)))
+      ? canonicalBody
+      : ensureOfficialPrintThinking(
+          applyThinkingDisplay(canonicalBody, thinkingDisplayMode(routing)),
+          ccEntrypointFromRouting(routing),
+        )
   const main = stripSubagentBilling(displayed)
   const thread = pinThreadBetas(
     main,
@@ -460,7 +469,8 @@ export function prepareWorkerPayload({
   // carries request gates to the native CLI, which builds the actual HTTP wire.
   const gated = cliHop ? { ...main, betas } : sanitizeAnthropicBodyForBetaTokens(main, headers['anthropic-beta'])
   // CRAG's CLI rebuilds the wire from its own model table. Pass the preset
-  // boundary here; the standard kernel must not see this field on the Anthropic body.
+  // boundary only when that worker applies it locally. A cluster hop forwards
+  // unknown fields and Anthropic rejects `crag_model`.
   const print =
     cragPrint == null
       ? cragV2KernelActive({
@@ -469,7 +479,10 @@ export function prepareWorkerPayload({
           kernelConfig: readSlotKernelConfig(exec?.homeDir),
         })
       : cragPrint === true
-  const directed = print ? { ...gated, crag_model: modelDirectiveForCrag(gated?.model) } : stripCragEnvelope(gated)
+  const directed =
+    print && cragConsumesModelDirective(exec?.workerStatus)
+      ? { ...gated, crag_model: modelDirectiveForCrag(gated?.model) }
+      : stripCragEnvelope(gated)
   return {
     headers,
     gated: directed,
@@ -973,7 +986,12 @@ export async function streamGoWorker({
                 typeof onOutboundHeaders === 'function'
               ) {
                 try {
-                  onOutboundHeaders(event.headers)
+                  const body = event.body == null ? undefined : capOutboundBody(event.body)
+                  onOutboundHeaders(event.headers, {
+                    body,
+                    body_truncated:
+                      event.body_truncated === true || (typeof event.body === 'string' && body !== event.body),
+                  })
                 } catch {
                   console.warn('[worker] outbound header observer failed')
                 }
@@ -1224,7 +1242,7 @@ export async function ensureWorkerCredential(exec, { force = false } = {}) {
   })
 }
 
-function credentialSummary(credential, now = Date.now()) {
+export function credentialSummary(credential, now = Date.now()) {
   if (!credential) return undefined
   const expiresAt = credential.expires_at ?? null
   const expiresAtMs =

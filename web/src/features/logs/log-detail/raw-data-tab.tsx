@@ -41,7 +41,15 @@ function sections(item: RequestLogItem): Section[] {
   const all: Section[] = [
     { id: 'inbound_body', label: '入站请求体', value: item.inbound_body },
     { id: 'headers', label: '入站请求头', value: item.headers },
-    { id: 'outbound_body', label: '出站请求体', value: item.outbound_body },
+    {
+      id: 'outbound_body',
+      label: item.outbound_body_source === 'cli_final' ? '最终出站请求体' : '出站请求体',
+      value: item.outbound_body,
+      note:
+        item.outbound_body_source === 'cli_final'
+          ? `CLI fetch 前的请求体${item.outbound_body_truncated ? '，已截到前 10000 token' : ''}`
+          : undefined,
+    },
     {
       id: 'outbound_headers',
       label:
