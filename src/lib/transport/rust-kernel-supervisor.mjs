@@ -616,7 +616,7 @@ function bootWaitMs(timeoutMs, { pid1Kernel, wedged }) {
 /** Only actual Linux launches retire the old sender; healthy kernels do no extra exec. */
 async function retireLegacyTelemetryBeforeStart(exec, runDockerExec) {
   try {
-    const retired = await runDockerExec(execArgv(exec, ['sh', '-c', RETIRE_LEGACY_TELEMETRY], { user: '0' }), {
+    const retired = await runDockerExec(execArgv(exec, ['sh', '-c', RETIRE_LEGACY_TELEMETRY]), {
       timeoutMs: 5000,
     })
     if (retired?.ok) return { ok: true }
