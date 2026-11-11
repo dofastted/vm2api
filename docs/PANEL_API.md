@@ -88,7 +88,7 @@
 | POST | `/vms/:id/collect-identity` | guest 采集（locale/tz/`guest_machine_id`、槽内 `/etc/os-release` 的 `VERSION_ID`、系统与架构）；Codex Analytics 只使用这次采集的运行环境 |
 | POST | `/vms/:id/reload` | 重载该槽 worker |
 | GET | `/kernels` | 仅 admin/master。返回两种产品 `kernels`（`cli-node` 默认免费、`crag` 签名加密 V2）、真实本地版本/就绪状态、按 VM 的公开 `licenses` 与 `installations`。读取不会初始化设备身份，不返回机器码、注册码或私钥 |
-| POST | `/kernels/pull` | `{ kernel: "cli-node" \| "crag", tag?: "vX.Y.Z" }`，省略 tag 拉最新正式 Release。只更新安装包缓存，不安装、不停 VM。默认内核从 vm2api Release 下载 `kin-kernel` 与 `cli-node`；CRAG 从供应仓 `dofastted/claude-code` Release 下载 `crag-v2-licensed-amd64.tar.gz`，按本机可信发行公钥校验签名、密文与成员。缺失返回 `crag_v2_asset_missing`，不退回 legacy ELF |
+| POST | `/kernels/pull` | `{ kernel: "cli-node" \| "crag", tag?: "vX.Y.Z" }`。只更新安装包缓存，不安装、不停 VM。默认内核从 vm2api Release 下载 `kin-kernel` 与 `cli-node`；CRAG 优先使用应用固定的配套 Release（省略 tag 或请求该 tag），否则从供应仓 `dofastted/claude-code` 下载 `crag-v2-licensed-amd64.tar.gz`。两种来源都按本机可信发行公钥校验签名、密文与成员；缺少附件返回 `crag_v2_asset_missing`，不退回 legacy ELF |
 | POST | `/kernels/install` | `{ targets: [{ id, kernel: "cli-node" \| "crag" }] }`，仅处理非空显式范围；未知/重复/越权/Codex 目标在任何停用前拒绝。每槽先检查包与授权，再停服务、禁用自动重启、安装并保存选择；完成后保持 stopped，不自动启动。返回 `{ ok,total,ok_count,failed_count,items:[{id,kernel,ok,stopped,version?,code?,error?}] }`，逐项失败不伪装成全局成功 |
 | GET | `/wrap-cli` | kernel / wrap 样本 inspect：`ok, dir, kernel_bin, glibc_shim, wrapper, meta, kernel`。`kernel.source` 为 `configured`（仓内 `KIN_KERNEL_BIN` / `bin/kin-kernel`）或 `sample` |
 | POST | `/wrap-cli/make` | `{ glibc_vm? }` 重整 share/wrap-cli；叠上仓内最新 kernel；可从指定槽拷 glibc shim |
