@@ -51,6 +51,7 @@ const CODEX_EFFORTS = [
   { id: 'high', label: 'high' },
   { id: 'xhigh', label: 'xhigh' },
   { id: 'max', label: 'max' },
+  { id: 'ultra', label: 'ultra' },
 ] as const
 
 export function VmTestTab(props: VmTestTabProps) {

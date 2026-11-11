@@ -1,0 +1,96 @@
+{
+  "repo": "dofastted/vm2api",
+  "release": "v1.4.070",
+  "files": [
+    {
+      "path": "bin/kin-kernel",
+      "asset": "kin-kernel",
+      "size": 13228472,
+      "sha256": "f57d4e71081bbca0b5bc2ba15886a7149c3e34c256a890ec51e084a9fcd14288"
+    },
+    {
+      "path": "bin/kin-codex-kernel",
+      "asset": "kin-codex-kernel",
+      "size": 7899968,
+      "sha256": "afdb433ebf3c719eb8596e09ca6493e8f769af1aab136426e82cbcd54c9bdc4a"
+    },
+    {
+      "path": "bin/kin-oauth-auth",
+      "asset": "kin-oauth-auth",
+      "size": 14430374,
+      "sha256": "fe64b4ea20ca694863f9041fd02fd2c0c4e6d30cce99e273ee693d7d730a8095"
+    },
+    {
+      "path": "bin/kin-computer",
+      "asset": "kin-computer",
+      "size": 5531864,
+      "sha256": "a64970838469da0e3b86831212e8f6b0806e3433a65dd062f6556252403c2bb9"
+    },
+    {
+      "path": "bin/kin-worker",
+      "asset": "kin-worker",
+      "size": 16455001,
+      "sha256": "d6b29f1144cd389696fe11edd6b5a024499bfc598da6a9ac96a4c7a9f9d6071b"
+    },
+    {
+      "path": "bin/kin-egress",
+      "asset": "kin-egress",
+      "size": 9047621,
+      "sha256": "0bf1eeb0424fb341ad371fed1e40c39e68e940770222a0ac940d3340f3b4e277"
+    },
+    {
+      "path": "bin/kin-slot-gate",
+      "asset": "kin-slot-gate",
+      "size": 8120583,
+      "sha256": "78f78d59e4f61917aca202a384eb687488a8f511acfc41662d3877223431c859"
+    },
+    {
+      "path": "share/wrap-cli/cli-node",
+      "asset": "cli-node",
+      "size": 27941064,
+      "sha256": "2fb99a6d58939e33b2402e862966f81668bf6266bb78f9a01b46bacf5e086c5c"
+    },
+    {
+      "path": "share/wrap-cli/cc-node",
+      "asset": "cc-node",
+      "size": 32484148,
+      "sha256": "be5eec49a78345dd935e302e88c9d7ad0afbb09a195356d81be1bdea766f3960"
+    },
+    {
+      "path": "share/wrap-cli/kin-kernel.bin",
+      "asset": "kin-kernel",
+      "size": 13228472,
+      "sha256": "f57d4e71081bbca0b5bc2ba15886a7149c3e34c256a890ec51e084a9fcd14288"
+    },
+    {
+      "path": "share/wrap-cli/glibc239/ld-linux-x86-64.so.2",
+      "asset": "ld-linux-x86-64.so.2",
+      "size": 236616,
+      "sha256": "cd4df4f3c7b83673d61189bf2eaebd33ca4f2853ab9772b8a25e025ef99b1e81"
+    },
+    {
+      "path": "share/wrap-cli/glibc239/libc.so.6",
+      "asset": "libc.so.6",
+      "size": 2125328,
+      "sha256": "8db37cf3f2169f59a0f07ef1fea308c35656668c64c8ff294e1860f4121eb161"
+    },
+    {
+      "path": "share/wrap-cli/glibc239/libgcc_s.so.1",
+      "asset": "libgcc_s.so.1",
+      "size": 183024,
+      "sha256": "d93224d2b0dab4247598be683adca02f5cf00586f99c187579cd7e92058fb7cb"
+    },
+    {
+      "path": "share/wrap-cli/glibc239/libm.so.6",
+      "asset": "libm.so.6",
+      "size": 952616,
+      "sha256": "e9c4b28d340e415b8137480ec442662f981e1399386c5931dae0e886e3639e91"
+    },
+    {
+      "path": "share/crag/kin-kernel",
+      "asset": "kin-kernel-crag",
+      "size": 9734168,
+      "sha256": "5764a186e3778278a8733ecaf924211070968def7c6648c6f6ecf3b76120a537"
+    }
+  ]
+}

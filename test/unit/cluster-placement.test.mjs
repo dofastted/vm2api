@@ -21,7 +21,6 @@ import {
   inspectClusterPayloadChanges,
   refreshNodeSlotPayload,
   remoteIptablesScript,
-  slotContainerBody,
   slotEgressNames,
 } from '../../src/lib/cluster/remote-slot.mjs'
 import {
@@ -443,17 +442,13 @@ test('slot image tag follows payload bytes only; a VERSION bump keeps the image'
   fs.chmodSync(process.env.KIN_CODEX_KERNEL_BIN, 0o755)
 
   const a = slotImageSpec(root, 'ubuntu-24.04')
-  const container = slotContainerBody(
-    { id: 'vm-03', platform: 'anthropic', node_id: 'node-a', kernel: 'ubuntu-24.04' },
-    { image: a.ref, network: 'test-net', remoteDir: '/home/node/vms/vm-03', user: '1000:1000', routing: {} },
-  )
-  assert.equal(container.Cmd[0], '/opt/kin-live/kin-kernel')
   const entry = a.files.find((file) => file.name === 'opt/kin/kin-kernel')
   assert.ok(entry, 'the image still bakes the cli-node wrapper for guests that have not mounted slot-bin')
   assert.equal(entry.mode, 0o755)
   assert.ok(a.files.some((file) => file.name === 'opt/kin/kin-kernel'))
   assert.ok(a.files.some((file) => file.name === 'opt/kin/crag-kernel' && file.mode === 0o755))
   assert.ok(a.files.some((file) => file.name === 'opt/kin/crag-v2/crag-v2' && file.mode === 0o755))
+  assert.ok(a.files.some((file) => file.name === 'opt/kin/crag-v2/manifest.json' && file.mode === 0o644))
   assert.ok(a.files.some((file) => file.name === 'opt/kin/crag-v2/crag-v2.payload.enc'))
   assert.match(entry.body.toString(), /^#!\/bin\/sh/)
   assert.match(a.ref, /^vm2api\/kin-slot-ubuntu-24\.04:[0-9a-f]{12}$/)

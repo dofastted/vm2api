@@ -1,6 +1,6 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.11.11-claude-321-upx",
+  "release": "v1.4.071",
   "files": [
     {
       "path": "bin/kin-kernel",
@@ -11,8 +11,8 @@
     {
       "path": "bin/kin-codex-kernel",
       "asset": "kin-codex-kernel",
-      "size": 7899968,
-      "sha256": "afdb433ebf3c719eb8596e09ca6493e8f769af1aab136426e82cbcd54c9bdc4a"
+      "size": 5927624,
+      "sha256": "ec9abb0160eaa0c8fda474c52fcfab592a4a2b905da4e4525e14fee9fb61376d"
     },
     {
       "path": "bin/kin-oauth-auth",
@@ -47,8 +47,8 @@
     {
       "path": "share/wrap-cli/cli-node",
       "asset": "cli-node",
-      "size": 27934360,
-      "sha256": "e58c526f0f0e0521909b3cf501a987b653cc4d8747b3b4015a8953578043d687"
+      "size": 27941064,
+      "sha256": "2fb99a6d58939e33b2402e862966f81668bf6266bb78f9a01b46bacf5e086c5c"
     },
     {
       "path": "share/wrap-cli/kin-kernel.bin",
