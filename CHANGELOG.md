@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- 请求执行许可由单个调度器同步授予；归还时先把许可交给通过实时准入的排队请求，再唤醒它。会话席位和粘性绑定不占用执行许可；取消、请求准备失败和故障转移按各次尝试归还自己的许可。
+- 面板最多使用两个按需 worker 处理大包推理 JSON 编码与缓冲回包解码；小包和超预算任务留在原线程，成功 SSE 的提交与回调顺序不变。worker 失败仅回退编解码，不重发请求。
+- 新建的 Claude Docker 槽和新装的 KVM guest 启动时按可用 CPU 设置 Tokio worker 数；不改变 CPU 配额、KVM vCPU 数或账号并发。Docker 兼容原启动命令，既有 KVM 磁盘不自动迁移。
 - Codex kernel `0.1.2` 独立发布，交付已验证的 SSE 字节/CRLF 解码、严格终态判定、20 MiB 图像帧完整性及内部命名迁移。干净内核 36 项 Rust、配套 Node 162 项测试、前端构建与正式 ELF 回环通过；本次按操作员要求不等待 GitHub CI，发布后执行带备份的服务器更新。应用 VERSION、Latest、全局 payload 和 Claude 二进制不变。
 - 修复 ARM64 native CLI 构建沿用旧 CLI / 嵌入源码 pin 导致的 SHA-256 mismatch：按当前 payload 的真实 `cli-node` 验证外层摘要，并经固定 ARM64 UPX 解包、现有源码边界提取器校验后同步两项摘要。不跳过校验、不改测试期望，也不更换全局 payload 或已发布 CLI。7 项打包测试及真实 ARM64 镜像构建通过；当前 x86/QEMU 路径的大并发仍会触发既有 stdin 10 秒保护，同源原生 x86 对照的并发与取消通过，未调大超时；ARM 原生并发验收仍需原生 runner 确认。
 - 纳入 Codex 并行源码修复：HTTP SSE 按字节缓冲，保留跨 chunk UTF-8 和 CRLF；终态按事件 type 判定，避免正文包含 `response.completed` 时提前断流；WebSocket 允许图像大帧；内部 crate / 启动配置与响应元数据统一使用当前命名。这些修复通过 `codex-kernel-v0.1.2` 独立交付，不替换已发布 `codex-kernel-v0.1.1` 的 ELF。
