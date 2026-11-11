@@ -1,0 +1,206 @@
+{
+  "schema": 1,
+  "application_release": "v1.4.072",
+  "integrated_main": "0955288f6cc45dbd88d338921b8390c2c179162c",
+  "merged_pull_requests": [
+    974,
+    975,
+    976,
+    977
+  ],
+  "payload_paths": 22,
+  "unique_payload_assets": 21,
+  "public_worker_tree": "72b8ce706fd9ad783b87eb840ddbed97614f5e74",
+  "toolchains": {
+    "go_payload": "1.25.14 linux CGO_ENABLED=0 trimpath stripped",
+    "claude_kernel_rust": "1.98.0",
+    "codex_rust": "1.98.1",
+    "cli": "Bun 1.3.14; UPX 5.0.2 --best --lzma",
+    "oauth": "pkg 5.8.1 linux-x64 node18, uncompressed",
+    "computer": "Ubuntu 22.04, Python 3.10, Nuitka"
+  },
+  "component_sources": {
+    "local_src_snapshot": "3f4b4e0dfcbf016a182de329bbce1f1754624938",
+    "codex_kernel_commit": "ec32e55f1fdf22657a4595571bc03985586f6984",
+    "computer_algorithm_commit": "61a8722fea5b6f3acdfff9ee26489cd5cb6604e7",
+    "cli_shared_betas_sha256": "48fd78f173778c7879678ee7dc537f3169f208f0a83c672ce12f6bec24a7ee41",
+    "cli_embedded_source_sha256": "29a4bf26b5b00a5d2bb7eea0993b33a6b26d9ffecef925dae43e3744568c208f"
+  },
+  "assets": [
+    {
+      "name": "cc-node",
+      "size": 32484148,
+      "sha256": "be5eec49a78345dd935e302e88c9d7ad0afbb09a195356d81be1bdea766f3960",
+      "bytes_changed": false,
+      "source": "verified_v1.4.071"
+    },
+    {
+      "name": "cli-node",
+      "size": 27934408,
+      "sha256": "b5dac65de06499edce028379cfd07413bc0d50aef04bb9f906553d0e1a234471",
+      "bytes_changed": true,
+      "source": "rebuilt_from_committed_source"
+    },
+    {
+      "name": "crag-v2-amd64-LICENSES.txt",
+      "size": 514,
+      "sha256": "e0127f77b4e8ad7c2233b9079cdaa4d4bc11e79eb03ca880ceb1dbe2fced9068",
+      "bytes_changed": false,
+      "source": "verified_v1.4.071"
+    },
+    {
+      "name": "crag-v2-amd64-claude-code-2.1.321-LICENSE.md",
+      "size": 147,
+      "sha256": "8ce94b9478bb9868f9641f818e06cd722fbe55d4c22e2d2ed11971b20146173a",
+      "bytes_changed": false,
+      "source": "verified_v1.4.071"
+    },
+    {
+      "name": "crag-v2-amd64-claude-code-2.1.321-claude",
+      "size": 341910032,
+      "sha256": "426c33815ca6645a772f722fbff10dbf2cbdb124a8aeab733c1365dbf8bbf61f",
+      "bytes_changed": false,
+      "source": "verified_v1.4.071"
+    },
+    {
+      "name": "crag-v2-amd64-crag-license-public.pem",
+      "size": 113,
+      "sha256": "a38372fb87af66678f7823538f2cf8b9fa7e0f3cbefcd612a4d5c47ebef10126",
+      "bytes_changed": false,
+      "source": "verified_v1.4.071"
+    },
+    {
+      "name": "crag-v2-amd64-crag-v2",
+      "size": 356276,
+      "sha256": "66553ead2937434db9dcc6b15d0a76049f6c64da7461bfa72a302e2b9d7fc678",
+      "bytes_changed": false,
+      "source": "verified_v1.4.071"
+    },
+    {
+      "name": "crag-v2-amd64-crag-v2.payload.enc",
+      "size": 2758180,
+      "sha256": "14ea9f988c5726d91631e9700c86b977852df2413975e66ac4c9adf75104a58e",
+      "bytes_changed": false,
+      "source": "verified_v1.4.071"
+    },
+    {
+      "name": "crag-v2-amd64-kernel.json.example",
+      "size": 806,
+      "sha256": "0c9397fe94231702611f87d260381575b225c561f3683a2c77d9e5016bb3985e",
+      "bytes_changed": false,
+      "source": "verified_v1.4.071"
+    },
+    {
+      "name": "crag-v2-amd64-manifest.json",
+      "size": 2467,
+      "sha256": "658c440d855bd632fce1a06d920b4ede73b7c3bab687d3311236c25eedaace3e",
+      "bytes_changed": false,
+      "source": "verified_v1.4.071"
+    },
+    {
+      "name": "kin-codex-kernel",
+      "size": 5927624,
+      "sha256": "ec9abb0160eaa0c8fda474c52fcfab592a4a2b905da4e4525e14fee9fb61376d",
+      "bytes_changed": false,
+      "source": "rebuilt_from_committed_source"
+    },
+    {
+      "name": "kin-computer",
+      "size": 5519576,
+      "sha256": "1512b4551f520528425f38c8e262fcab52f071bb7a435471eda9dccc1fc3f198",
+      "bytes_changed": true,
+      "source": "rebuilt_from_committed_source"
+    },
+    {
+      "name": "kin-egress",
+      "size": 6213816,
+      "sha256": "4ab11e58294c8eec6e76dc649af0cf27058f1811fe7179aa35c7d644746d395f",
+      "bytes_changed": true,
+      "source": "rebuilt_from_committed_source"
+    },
+    {
+      "name": "kin-egress-linux-arm64",
+      "size": 5832888,
+      "sha256": "e8221b4499855b8daf991238493654590843ae3a21321aa33f3c6116994d1274",
+      "bytes_changed": false,
+      "source": "rebuilt_from_committed_source"
+    },
+    {
+      "name": "kin-kernel",
+      "size": 13270264,
+      "sha256": "09fc853d818e339544e494a309ee4e5a75a5c492817f818eb4b8de15842b5a87",
+      "bytes_changed": true,
+      "source": "rebuilt_from_committed_source"
+    },
+    {
+      "name": "kin-kernel-crag",
+      "size": 9734168,
+      "sha256": "5764a186e3778278a8733ecaf924211070968def7c6648c6f6ecf3b76120a537",
+      "bytes_changed": false,
+      "source": "verified_v1.4.071"
+    },
+    {
+      "name": "kin-oauth-auth",
+      "size": 47385574,
+      "sha256": "04c926c7a3e56c22421c9281efe61af126d0acd4114d05ee0334e59f08d85f65",
+      "bytes_changed": true,
+      "source": "rebuilt_from_committed_source"
+    },
+    {
+      "name": "kin-slot-gate",
+      "size": 5603512,
+      "sha256": "99233d86da0476100acf026fdaa2246da765d4f1792e9f6294edbdd0901d5d29",
+      "bytes_changed": true,
+      "source": "rebuilt_from_committed_source"
+    },
+    {
+      "name": "kin-worker",
+      "size": 11555000,
+      "sha256": "132a3267b6c9a2fd03571b8c6baebc533f10914ada57ddf8b8b099c6f1de0d97",
+      "bytes_changed": true,
+      "source": "rebuilt_from_committed_source"
+    },
+    {
+      "name": "kin-worker-linux-arm64",
+      "size": 10813624,
+      "sha256": "bdc47f9cc54ae3d140b7891793302c5e91ab040e398484a387edf5e5b8ad0bc6",
+      "bytes_changed": false,
+      "source": "rebuilt_from_committed_source"
+    },
+    {
+      "name": "ld-linux-x86-64.so.2",
+      "size": 236616,
+      "sha256": "cd4df4f3c7b83673d61189bf2eaebd33ca4f2853ab9772b8a25e025ef99b1e81",
+      "bytes_changed": false,
+      "source": "verified_v1.4.071"
+    },
+    {
+      "name": "libc.so.6",
+      "size": 2125328,
+      "sha256": "8db37cf3f2169f59a0f07ef1fea308c35656668c64c8ff294e1860f4121eb161",
+      "bytes_changed": false,
+      "source": "verified_v1.4.071"
+    },
+    {
+      "name": "libgcc_s.so.1",
+      "size": 183024,
+      "sha256": "d93224d2b0dab4247598be683adca02f5cf00586f99c187579cd7e92058fb7cb",
+      "bytes_changed": false,
+      "source": "verified_v1.4.071"
+    },
+    {
+      "name": "libm.so.6",
+      "size": 952616,
+      "sha256": "e9c4b28d340e415b8137480ec442662f981e1399386c5931dae0e886e3639e91",
+      "bytes_changed": false,
+      "source": "verified_v1.4.071"
+    },
+    {
+      "name": "payload.json",
+      "size": 4627,
+      "sha256": "21ed44031c33966ad78b952f90e1b70dab7f8865a5501f1b1d9161a434ae068b",
+      "bytes_changed": true,
+      "source": "recomputed_manifest"
+    }
+  ]
+}
