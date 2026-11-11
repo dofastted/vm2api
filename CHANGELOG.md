@@ -3,6 +3,7 @@
 ## Unreleased
 
 - 管理端在非安全上下文（HTTP）下生成 Idempotency-Key 等 UUID 时不再依赖 `crypto.randomUUID`，限额重置确认框可正常打开（#970）。
+- 第三方出站工具名改写为 `mcp__` 时，同步改写历史 `tool_result` 内 `tool_reference.tool_name` 与 `tool_search_tool_result.tool_references[].tool_name`，修复工具搜索下一轮 400（#953）。
 
 ## 1.4.071 — 2026-11-12
 
