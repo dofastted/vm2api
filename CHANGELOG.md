@@ -12,6 +12,25 @@
 - 修复协议页选择 `cc_entrypoint=cli` 后，面板协议清洗与 worker envelope 仍输出 `(external, sdk-cli)`：公共出站头组装读取当前路由配置，保留槽位版本 pin，不再让槽位身份的旧入口覆盖面板设置；Setup Token / API Key 的 inference-only UA 不变。增加入口往返切换、调用方 UA 隔离和凭证边界回归，删除历史抓包中固定旧入口 / runtime / prompt index 的过时断言。
 - 验证面板 API 保存 `cli → sdk-cli → cli` 后 UA 与 billing 同步变化，并通过真实 kin-kernel → cli-node → 本地 HTTP 抓包验证最终 UA。升级此修复只需更新 Node 控制面并重启；现有 cli-node 已支持 `kernel.json.cc_entrypoint`，本次不更换 payload 或线上配置。
 
+## 1.4.070 - 2026-11-11
+
+- 更新 cli-node 2.1.321：文件监看事件未提供 filename 时，按完整配置失效处理，避免 undefined.toString() 导致 CLI 退出、槽位自动恢复耗尽。
+- 同步固定 amd64 CLI 的大小、SHA256 与 ARM64 原生 CLI 的嵌入源码 SHA256，修复只更新二进制 pin 后 ARM64 构建失败的问题。
+- 为 v1.4.057-v1.4.069 追加同一修复 CLI 及保持各版其他 payload 不变的升级清单；保留原 tag、附件和历史镜像，不破坏旧清单的完整性校验。用法见 docs/releases/cli321-watchfix/README.md。
+
+升级后仍需通过面板排空并重启所选 Claude 槽位，确认运行中 CLI 已更换；仅更新出厂文件不等于已修复现有进程。本次不修改恢复次数，也不处理独立的 OOM 问题。
+
+## 1.4.069 — 2026-11-11
+
+- 修复集群 CRAG 包热替换漏传 `manifest.json` 的问题。更换加密 core/bootstrap 时同步发布对应签名清单，并将清单内容纳入节点 payload digest，防止旧清单与新密文混用导致 license 校验失败、VM 无法恢复调度。
+- 沿用 2.1.321 UPX CLI 与签名加密 CRAG payload；ARM64 native CLI pin 指向同一精确二进制 SHA。
+
+部署更新后通过内核页重启已选择 Claude/CRAG 的 VM，核实包成员与实际 memfd core。失败保持维护锁，恢复旧包并显式恢复运行/调度；不要手动跳过健康检查。
+
+## 1.4.068 - 2026-11-11
+
+- 修正 ARM64 原生 CLI 构建 pin，与 2.1.321 UPX payload 的精确 SHA 一致；发布 payload tag 使用标准 vm2api 版本格式，避免内核页拒绝非版本 tag。
+
 ## 1.4.067 — 2026-11-11
 
 - 将 cli-node 交付更新为当前本地源码构建的 2.1.321，使用 UPX 5.0.2 压缩并验证；不再沿用旧下载缓存中的 CLI。

@@ -454,6 +454,7 @@ test('slot image tag follows payload bytes only; a VERSION bump keeps the image'
   assert.ok(a.files.some((file) => file.name === 'opt/kin/kin-kernel'))
   assert.ok(a.files.some((file) => file.name === 'opt/kin/crag-kernel' && file.mode === 0o755))
   assert.ok(a.files.some((file) => file.name === 'opt/kin/crag-v2/crag-v2' && file.mode === 0o755))
+  assert.ok(a.files.some((file) => file.name === 'opt/kin/crag-v2/manifest.json' && file.mode === 0o644))
   assert.ok(a.files.some((file) => file.name === 'opt/kin/crag-v2/crag-v2.payload.enc'))
   assert.match(entry.body.toString(), /^#!\/bin\/sh/)
   assert.match(a.ref, /^vm2api\/kin-slot-ubuntu-24\.04:[0-9a-f]{12}$/)
