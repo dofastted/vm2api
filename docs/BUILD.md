@@ -18,7 +18,7 @@ gh release create payload-YYYY.MM.DD /tmp/payload/* --prerelease --latest=false 
 
 ## Codex 独立内核 Release
 
-`codex-kernel-v0.1.1` 只交付 Linux amd64 的 `kin-codex-kernel`、`SHA256SUMS` 和 `codex-kernel-v0.1.1-build.json`。编译采用私有源码的干净提交，不混入本地未提交改动；源码 commit/tree、工具链、文件大小、SHA-256 与验收结果见 [构建记录](releases/codex-kernel-v0.1.1.json)。私有源码和 ELF 不进入公开 git，ELF 作为 Release 资产上传。
+当前 `codex-kernel-v0.1.2` 只交付 Linux amd64 的 `kin-codex-kernel`、`SHA256SUMS` 和 `codex-kernel-v0.1.2-build.json`。编译采用私有源码的干净提交，不混入本地未提交改动；源码 commit/tree、工具链、文件大小、SHA-256 与验收结果见 [0.1.2 构建记录](releases/codex-kernel-v0.1.2.json)。历史 [0.1.1 构建记录](releases/codex-kernel-v0.1.1.json) 和资产保持不变。私有源码和 ELF 不进入公开 git，ELF 作为 Release 资产上传。
 
 专属 tag 不使用 `v*`，不触发应用 Release 工作流；发布时采用 `--prerelease --latest=false`，不替换应用 Latest，不发布 Docker 镜像，也不修改根 `VERSION` 或全局 `deploy/payload.json`。因此 `fetch:payload` 仍会恢复原来的整包基线，不能用它安装这个独立版本。
 
