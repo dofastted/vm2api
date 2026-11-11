@@ -287,6 +287,8 @@ Analytics 按官方 [`codex_thread_initialized`](https://github.com/openai/codex
 
 `compatibility.crag_persona_preset`（`official_full` / `zero`，缺省 `official_full`）只给 CRAG v2 print 清洗，不投影进 `kernel.json`。v2 worker 不读 `persona_preset` 或 `CLAUDE_CODE_SYSTEM_LAYOUT`。`official_full` 只 append 调用方尾巴；`zero` 送 `crag_prompt.mode=replace`。其它值保存时 400。槽位显式 `zero` 覆盖该档；其它槽位人设在 print 上收成 append。这不是 TUI：不关内置工具，也不加 `--no-chrome`。
 
+`compatibility.cc_entrypoint`（`cli` / `sdk-cli`，缺省 `cli`）：OAuth 请求的 Node 协议清洗与 worker envelope 每次读取当前配置，UA 入口覆盖槽位身份中旧的 `sdk-cli` / `cli`，版本仍由槽位身份 / 代码 pin 提供。网关生成的 billing 使用同一入口，调用方已有 billing 不改写；Setup Token / API Key 的 inference-only UA 不变。保存同时投影到 Claude 槽的 `kernel.json.cc_entrypoint`，由支持该字段的 cli-node 在下次请求生成最终 UA；不需要为此次 Node 修复重建 CLI。
+
 
 `compatibility.cch_enabled`（布尔，默认 `true`，设置 → 协议）：开启时统一给出站 billing 补齐 `cch` 并计算真实五位摘要；关闭时仍补齐该参数，但固定为 `cch=00000;`，跳过摘要计算。native hop 仅保留占位，最终紧凑 SDK JSON 才计算真实摘要；HTTP hop 在最终 Node 请求体密封。CCH 是 billing system body 参数，不是 User-Agent header。
 

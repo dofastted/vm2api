@@ -6,6 +6,8 @@
 - 参照 codex-proxy-rs 收紧 Codex 出站身份：originator/version 从所选 UA 构造，下游不能覆盖；正确解析 `Codex Desktop/...` 的含空格产品名。保留 HTTP/WS、会话和单槽出口策略。
 - Codex Analytics 不再读取控制面宿主 OS/编译架构，改用槽内采集的 OS、`VERSION_ID` 和架构，并经每请求选项热传递；缺失时仅跳过上报。沿用官方初始化事件、账号鉴权和槽位出口，队列对齐 256，复用遥测 HTTP 客户端，不上传硬件标识或正文。升级后先采集槽位身份，再按需显式开启 Analytics。
 - Codex kernel `0.1.1` 按 `codex-kernel-v0.1.1` 独立交付 Linux amd64 ELF、校验和与构建记录；从私有干净提交编译并验证 HTTP/WS 与 VM 遥测。它不是官方 CLI 版本，也不是 vm2api 整包版本；不改应用 VERSION、Latest、Docker 镜像或全局 payload 清单。仅 Codex 内核的校验与安装边界见 `docs/BUILD.md`，现有槽不会自动重启。
+- 修复协议页选择 `cc_entrypoint=cli` 后，面板协议清洗与 worker envelope 仍输出 `(external, sdk-cli)`：公共出站头组装读取当前路由配置，保留槽位版本 pin，不再让槽位身份的旧入口覆盖面板设置；Setup Token / API Key 的 inference-only UA 不变。增加入口往返切换、调用方 UA 隔离和凭证边界回归，删除历史抓包中固定旧入口 / runtime / prompt index 的过时断言。
+- 验证面板 API 保存 `cli → sdk-cli → cli` 后 UA 与 billing 同步变化，并通过真实 kin-kernel → cli-node → 本地 HTTP 抓包验证最终 UA。升级此修复只需更新 Node 控制面并重启；现有 cli-node 已支持 `kernel.json.cc_entrypoint`，本次不更换 payload 或线上配置。
 
 ## 1.4.067 — 2026-11-11
 
