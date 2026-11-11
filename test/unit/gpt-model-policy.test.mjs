@@ -5,6 +5,7 @@ import { SettingsRepo } from '../../src/lib/db/repos/settings-repo.mjs'
 import {
   getGptModelPolicy,
   isGptFastAliasAvailable,
+  isGptModelEnabled,
   isImageToolModelEnabled,
   listGptPolicyModels,
   listGptFastAliases,
@@ -180,4 +181,18 @@ test('panel save keeps the synced catalog; only a sync writes it', (t) => {
   assert.equal(getGptModelPolicy().models['gpt-6-luna'].catalog.context_window, 272000)
   saveGptModelPolicy({ models: { 'gpt-7': { enabled: true, catalog: { context_window: 9 } } } })
   assert.equal(getGptModelPolicy().models['gpt-7'].catalog, undefined)
+})
+
+test('new 6.2 catalog IDs require explicit enablement without invented capabilities', (t) => {
+  withDb(t)
+  const id = 'gpt-6.2-astra'
+  syncGptIdsIntoPolicy([{ id, display_name: 'Account catalog model', catalog: {} }])
+  assert.equal(isGptModelEnabled(id), false)
+  assert.equal(getGptModelPolicy().models[id].capabilities.context_window, undefined)
+  assert.equal(getGptModelPolicy().models[id].params.max_tokens_cap, undefined)
+  saveGptModelPolicy({ models: { [id]: { enabled: true } } })
+  loadGptModelPolicy({ force: true })
+  syncGptIdsIntoPolicy([{ id, catalog: {} }])
+  assert.equal(isGptModelEnabled(id), true)
+  assert.equal(isGptModelEnabled('gpt-6.2-not-in-account-catalog'), false)
 })

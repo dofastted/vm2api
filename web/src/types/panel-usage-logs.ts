@@ -79,7 +79,15 @@ export type CacheTtlApplied = '5m' | '1h' | 'mixed' | null
 
 /** 发往槽位的思考强度。调用方值优先，否则模型缺省。见 `loggedReasoningEffort()`。 */
 export type ReasoningEffort =
-  'none' | 'minimal' | 'auto' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+  | 'none'
+  | 'minimal'
+  | 'auto'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'xhigh'
+  | 'max'
+  | 'ultra'
 
 /** 滚动日志的一行。`null` = 本行该字段为空（vm2api 不产出的 hub 字段已整体删去）。 */
 export type UsageLogRow = {

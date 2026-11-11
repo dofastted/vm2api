@@ -12,7 +12,7 @@ import { ChipGroup, PaneSection } from './scheduler-controls'
 type Block = Record<string, unknown>
 type Transport = 'prefer_websocket' | 'http'
 
-const DEFAULT_USER_AGENT = 'codex_cli_rs/0.160.0 (linux x86_64)'
+const DEFAULT_USER_AGENT = 'codex_cli_rs/0.167.1 (linux x86_64)'
 const TRANSPORT_OPTIONS: [Transport, string][] = [
   ['prefer_websocket', '优先 WebSocket'],
   ['http', '仅 HTTP'],
@@ -290,7 +290,7 @@ export function OpenaiPane({
           </SettingRow>
           <SettingRow
             label='Codex 目录客户端版本'
-            desc='auto 取官方 @openai/codex 版本并缓存，失败用 0.160.0。'
+            desc='auto 取官方 @openai/codex 版本并缓存，失败用已验证的 0.167.1。'
           >
             <Input
               className='w-28'
