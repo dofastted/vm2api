@@ -843,52 +843,7 @@ export class FailoverRunner {
         }
         throw error
       }
-      if (selected?.familyGated && familyKey && familyVmId) {
-        // The family home left the pool (quota, credential): the family moves
-        // with the next bind. An exclusion this request made itself is not proof.
-        const home = this.stickyRouter?.resolve?.(familyKey)
-        const ownExclusion =
-          !!home && (budget.tried.has(home.accountId) || budget.tried.has(home.vmId) || spilled.has(home.accountId))
-        if (!ownExclusion) this.stickyRouter?.unbind?.(familyKey)
-        familyVmId = null
-      }
-      if (!selected?.ok && selected?.reason === 'fable_requires_max') {
-        return {
-          ...fableRequiresMaxError({
-            wait_ms: selected?.waitMs ?? selected?.wait_ms ?? 0,
-            eligible: selected?.eligible ?? 0,
-            available: selected?.available ?? 0,
-            attempt_count: budget.hops,
-          }),
-          ...attribution(),
-        }
-      }
-      if (!selected?.ok) {
-        const exhausted = selectionFailure(selected, { excluded, lastPolicy, lastResult, hops: budget.hops })
-        return preferLastResult(lastResult, lastPolicy, exhausted, attribution())
-      }
-      repairPending = false
-      snapshotPins()
-      const attemptStickyBound = pinBaseline.get(stickyKey) || null
-      lastSelected = selected
-      pinnedSlot = selected.slotIndex ?? null
-      if (selected.seatMoved) seatMovedTo = selected.vmId
-      bindAll(
-        { accountId: selected.accountId, vmId: selected.vmId, slotIndex: pinnedSlot },
-        { countHit: false, borrowed: lastPolicy?.reason === 'slot_busy' },
-      )
-      const attemptStarted = Date.now()
-      this.attemptsRepo?.begin?.({
-        requestId,
-        attemptNo,
-        vmId: selected.vmId,
-        accountId: selected.accountId,
-        model,
-        selectionReason: selected.selectionReason,
-        waitMs: selected.waitMs,
-        queueWaitMs: selected.queueWaitMs,
-        schedulingMs: selected.schedulingMs,
-      })
+      let attemptStarted
       let result
       let policy
       let committed = false
@@ -900,6 +855,56 @@ export class FailoverRunner {
         if (executions > 0) budget.noteHop(selected.accountId, selected.vmId, executions)
       }
       try {
+        if (signal?.aborted) {
+          return { ...clientCancelledResult(), via: 'pool-failover', ...attribution() }
+        }
+        if (selected?.familyGated && familyKey && familyVmId) {
+          // The family home left the pool (quota, credential): the family moves
+          // with the next bind. An exclusion this request made itself is not proof.
+          const home = this.stickyRouter?.resolve?.(familyKey)
+          const ownExclusion =
+            !!home && (budget.tried.has(home.accountId) || budget.tried.has(home.vmId) || spilled.has(home.accountId))
+          if (!ownExclusion) this.stickyRouter?.unbind?.(familyKey)
+          familyVmId = null
+        }
+        if (!selected?.ok && selected?.reason === 'fable_requires_max') {
+          return {
+            ...fableRequiresMaxError({
+              wait_ms: selected?.waitMs ?? selected?.wait_ms ?? 0,
+              eligible: selected?.eligible ?? 0,
+              available: selected?.available ?? 0,
+              attempt_count: budget.hops,
+            }),
+            ...attribution(),
+          }
+        }
+        if (!selected?.ok) {
+          const exhausted = selectionFailure(selected, { excluded, lastPolicy, lastResult, hops: budget.hops })
+          return preferLastResult(lastResult, lastPolicy, exhausted, attribution())
+        }
+        repairPending = false
+        snapshotPins()
+        const attemptStickyBound = pinBaseline.get(stickyKey) || null
+        lastSelected = selected
+        pinnedSlot = selected.slotIndex ?? null
+        if (selected.seatMoved) seatMovedTo = selected.vmId
+        bindAll(
+          { accountId: selected.accountId, vmId: selected.vmId, slotIndex: pinnedSlot },
+          { countHit: false, borrowed: lastPolicy?.reason === 'slot_busy' },
+        )
+        const started = Date.now()
+        this.attemptsRepo?.begin?.({
+          requestId,
+          attemptNo,
+          vmId: selected.vmId,
+          accountId: selected.accountId,
+          model,
+          selectionReason: selected.selectionReason,
+          waitMs: selected.waitMs,
+          queueWaitMs: selected.queueWaitMs,
+          schedulingMs: selected.schedulingMs,
+        })
+        attemptStarted = started
         const repairKey = searchRepairKey(stickyKey, model, selected)
         const hint = this.searchRepairs.get(repairKey)
         if (hint && hint.expiresAt <= Date.now()) this.searchRepairs.delete(repairKey)
@@ -921,6 +926,10 @@ export class FailoverRunner {
                 stickyBound: attemptStickyBound,
               })
             : clone(attemptBody)
+        if (signal?.aborted) {
+          noteHop({ upstreamExecutions: 0 })
+          throw Object.assign(new Error('Request cancelled'), { code: 'request_cancelled' })
+        }
         const wrappedAttempt =
           prepared &&
           typeof prepared === 'object' &&
@@ -1104,6 +1113,7 @@ export class FailoverRunner {
         }
         budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
       } catch (error) {
+        if (attemptStarted === undefined) throw error
         const invalidRequest =
           error?.status === 400 &&
           (error.body?.error?.code === 'invalid_cache_control' || error.body?.error?.code === 'crag_prompt_too_large')
@@ -1220,7 +1230,8 @@ export class FailoverRunner {
         }
         budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
       } finally {
-        selected.release?.()
+        // Setup and attempt share the same permit lifetime.
+        selected?.release?.()
       }
     }
   }

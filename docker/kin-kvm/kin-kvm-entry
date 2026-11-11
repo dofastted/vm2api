@@ -140,7 +140,7 @@ ensure_ovmf_vars() {
 }
 
 write_seed() {
-  local seed_dir pub instance
+  local seed_dir pub instance cpu_ceiling
   seed_dir=$(mktemp -d /tmp/kin-seed.XXXXXX)
   pub=$(tr -d '\r\n' < "$SLOT_KVM/id_ed25519.pub")
   instance=$(tr -d '[:space:]' < "$SLOT_KVM/instance-id")
@@ -164,6 +164,10 @@ KIN_KVM_SHARES=$KIN_KVM_SHARES
 TZ=$TZ
 LANG=$LANG
 EOF
+  if [ "${KIN_KVM_KERNEL_CPU_LIMIT:-}" = 1 ]; then
+    cpu_ceiling=$(/bin/sh /opt/kin-kvm/guest/kin-kernel-cpu --count)
+    printf 'KIN_KERNEL_CPU_CEILING=%s\n' "$cpu_ceiling" >> "$seed_dir/guest.env"
+  fi
   # Files must sit at ISO root; passing a directory would nest them.
   ( cd "$seed_dir" && genisoimage -quiet -output "$SLOT_KVM/seed.iso" -volid cidata -joliet -rock . )
   rm -rf "$seed_dir"

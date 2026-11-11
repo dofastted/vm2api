@@ -3,7 +3,7 @@
   "application_version": "1.4.071",
   "release_tag": "v1.4.071",
   "cloud_source_basis": {
-    "main_commit": "bcd35262cac2f56b5116e51b714db940b02257e7",
+    "main_commit": "270fa09ab2264055a24600bbce07294a272ac903",
     "latest_full_release": "v1.4.070",
     "latest_full_release_commit": "c37c77c7cf51475a34ed8d33a08cdd5150d27be5",
     "integration": "Merge both cloud histories without rebasing or rewriting existing commits."

@@ -21,6 +21,7 @@ import {
   CODEX_SLOT_ROLE,
 } from '../../src/lib/vm/vm-runtime.mjs'
 import { slotNetworkForVm } from '../../src/lib/vm/egress.mjs'
+import { kernelCpuCommand } from '../../src/lib/vm/kernel-cpu.mjs'
 
 const running = { running: true, networkMode: 'host', image: 'kin-os/ubuntu:24.04' }
 const stopped = { running: false, networkMode: 'host', image: 'kin-os/ubuntu:24.04' }
@@ -418,12 +419,10 @@ test('a GPT slot container idles instead of booting the Claude kernel', () => {
   const codex = { id: 'vm-codex-01', platform: 'openai', family: 'codex', codex_kernel: true }
   const claude = { id: 'vm-03', platform: 'anthropic' }
   assert.deepEqual(slotContainerCommand(codex, { wrapKernel: true }), ['sleep', 'infinity'])
-  assert.deepEqual(slotContainerCommand(claude, { wrapKernel: true }), [
-    '/home/kincli/.kin/kin-kernel',
-    '--gateway-worker',
-    '--config',
-    '/run/kin/kernel.json',
-  ])
+  assert.deepEqual(
+    slotContainerCommand(claude, { wrapKernel: true }),
+    kernelCpuCommand(['/home/kincli/.kin/kin-kernel', '--gateway-worker', '--config', '/run/kin/kernel.json']),
+  )
 })
 
 test('a GPT slot container is live without kernel.sock, and an old kin-kernel one is recreated once', (t) => {

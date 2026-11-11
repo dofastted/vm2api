@@ -10,6 +10,9 @@
 - Codex Analytics 使用槽内采集的 OS、`VERSION_ID` 和架构，经每请求选项热传递，不读取控制面宿主环境。缺失时仅跳过上报，保留官方事件、账号鉴权和槽位出口，不上传硬件标识或正文，沿用已保存的隐私开关。
 - 出站身份从已选 UA 构造 originator/version，调用方不能覆盖，正确解析 `Codex Desktop/...`。协议页 `cc_entrypoint` 在公共出站头和 worker envelope 实际生效，不再被槽位旧入口覆盖；保留版本 pin 和 inference-only 凭证边界。
 - 保留 `v1.4.070` 的 Claude `2.1.321` 文件监看崩溃修复、匹配的 ARM64 CLI/源码双重 pin，以及 CRAG 集群发布签名清单的修复；其余已发布 kernel/helper、CRAG 包与签名权威不变。
+- 请求执行许可由单个调度器同步授予；归还时先把许可交给通过实时准入的排队请求，再唤醒它。会话席位和粘性绑定不占用执行许可；取消、请求准备失败和故障转移按各次尝试归还自己的许可。
+- 面板最多使用两个按需 worker 处理大包推理 JSON 编码与缓冲回包解码；小包和超预算任务留在原线程，成功 SSE 的提交与回调顺序不变。worker 失败仅回退编解码，不重发请求。
+- 新建的 Claude Docker 槽和新装的 KVM guest 启动时按可用 CPU 设置 Tokio worker 数；不改变 CPU 配额、KVM vCPU 数或账号并发。Docker 兼容原启动命令，既有 KVM 磁盘不自动迁移。
 
 已部署机升级：完整更新 Node 源码、前端、VERSION 与全部 pinned 出厂文件，再重启 Node。官方 Claude CLI 必须持久切换到本版包，并对明确选中的槽位排空、同步和重启 dataplane；只换出厂文件或临时替换 current 不等于激活。保留用户自定义内核、账号、授权、配置与运行数据，已停止槽不强启；远端槽需另行明确维护范围，不做无差别重建。不要覆盖 `routing.json`、`.env`、`vms/`、`data/`，不要 `docker rm` 槽。
 
