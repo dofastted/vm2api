@@ -1,6 +1,6 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.11.11-claude-321-upx",
+  "release": "v1.4.068",
   "files": [
     {
       "path": "bin/kin-kernel",
