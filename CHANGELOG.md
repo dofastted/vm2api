@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.4.069 — 2026-11-11
+
+- 修复集群 CRAG 包热替换漏传 `manifest.json` 的问题。更换加密 core/bootstrap 时同步发布对应签名清单，并将清单内容纳入节点 payload digest，防止旧清单与新密文混用导致 license 校验失败、VM 无法恢复调度。
+- 沿用 2.1.321 UPX CLI 与签名加密 CRAG payload；ARM64 native CLI pin 指向同一精确二进制 SHA。
+
+部署更新后通过内核页重启已选择 Claude/CRAG 的 VM，核实包成员与实际 memfd core。失败保持维护锁，恢复旧包并显式恢复运行/调度；不要手动跳过健康检查。
+
 ## 1.4.068 - 2026-11-11
 
 - 修正 ARM64 原生 CLI 构建 pin，与 2.1.321 UPX payload 的精确 SHA 一致；发布 payload tag 使用标准 vm2api 版本格式，避免内核页拒绝非版本 tag。
