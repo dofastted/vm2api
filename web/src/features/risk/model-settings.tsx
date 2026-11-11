@@ -8,6 +8,7 @@ import type {
 import type { StatusTone } from '@/types/status'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
+import { randomUUID } from '@/lib/random-uuid'
 import { cn } from '@/lib/utils'
 import { useServerDraft } from '@/hooks/use-server-draft'
 import { Button } from '@/components/ui/button'
@@ -162,7 +163,7 @@ function endpointsDirty(
 
 function blankForm(base = ''): EndpointForm {
   return {
-    uid: `custom:${crypto.randomUUID()}`,
+    uid: `custom:${randomUUID()}`,
     base_url: base,
     from_base_url: '',
     keys: [''],
