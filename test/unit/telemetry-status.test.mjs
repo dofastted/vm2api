@@ -1,6 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { readSlotProcessStatus, retireLegacyTelemetry } from '../../src/lib/vm/slot-process-status.mjs'
+import {
+  RETIRE_LEGACY_TELEMETRY,
+  readSlotProcessStatus,
+  retireLegacyTelemetry,
+} from '../../src/lib/vm/slot-process-status.mjs'
 
 const telemetry = {
   enabled: true,
@@ -33,6 +37,19 @@ test('unreachable native VM remains unknown rather than claiming upload or disab
     },
   })
   assert.equal(result.telemetry, null)
+})
+test('retire legacy telemetry execs without root user override', async () => {
+  let argv
+  const result = await retireLegacyTelemetry({
+    vm: { id: 'vm-retire', runtime: { container: 'kin-retire' } },
+    inspect: async () => ({ State: { Running: true }, Config: { User: '10001:987' } }),
+    run: async (args) => {
+      argv = args
+      return { code: 0, timed_out: false }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.deepEqual(argv, ['exec', 'kin-retire', 'sh', '-c', RETIRE_LEGACY_TELEMETRY])
 })
 test('stopped VM publication does not spawn a process to retire telemetry', async () => {
   let ran = false

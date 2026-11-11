@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 升级时以槽位容器默认用户（而非 root）停止旧的 `kin-worker telemetry`，避免 `cap-drop ALL` 下 `legacy_telemetry_stop_failed`（#954）。
+
 ## 1.4.067 — 2026-11-11
 
 - 将 cli-node 交付更新为当前本地源码构建的 2.1.321，使用 UPX 5.0.2 压缩并验证；不再沿用旧下载缓存中的 CLI。
