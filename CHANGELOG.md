@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- 修复 CRAG 按候选槽旧快照组包、导致 `crag_prompt` 等字段在发送时丢失的问题。按本次发送所用 worker 的健康能力分别启用 append、replace、模型指令和 `caller_cwd`；旧 worker 不接收未声明支持的字段。
+- 从本轮原始 Anthropic 顶层 `system` 提取有效的 `<cwd>` 声明，只从 CRAG 提示词投影移除原声明，不删除同值历史。脱敏后仍有效的目录通过已认证的内部 envelope 传给原生内核，仅用于模型环境事实，不改变实际工作目录。
+
 ## 1.4.072 — 2026-11-12
 
 - 管理端在非安全上下文（HTTP）下生成 Idempotency-Key 等 UUID 时不再依赖 `crypto.randomUUID`，限额重置确认框可正常打开（#970）。

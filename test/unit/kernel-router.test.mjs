@@ -205,6 +205,156 @@ async function kernelFixture(handler) {
   }
 }
 
+const cragCapabilities = ['prompt_append', 'prompt_replace', 'model_directive', 'caller_cwd']
+const cragHealth = (capabilities) => ({ ok: true, runtime_variant: 'crag-v2', ready_slots: 1, capabilities })
+
+function cragHopBody(mode) {
+  return {
+    model: 'claude-haiku-4-5',
+    messages: [{ role: 'user', content: 'hi' }],
+    crag_prompt: { mode, text: 'prepared caller guidance' },
+    crag_model: { id: 'caller-supplied-model' },
+  }
+}
+
+async function readPostedEnvelope(req) {
+  const chunks = []
+  for await (const chunk of req) chunks.push(chunk)
+  return JSON.parse(Buffer.concat(chunks).toString('utf8'))
+}
+
+function respondToCragHop(res, stream) {
+  if (stream) {
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'x-terminal-state': 'verified' })
+    res.end(
+      'data: {"type":"message_start","message":{"id":"msg_crag","type":"message","role":"assistant","content":[]}}\n\n' +
+        'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"ok"}}\n\n' +
+        'data: {"type":"message_stop"}\n\n',
+    )
+  } else {
+    res.writeHead(200, { 'content-type': 'application/json', 'x-terminal-state': 'verified' })
+    res.end(JSON.stringify({ type: 'message', role: 'assistant', content: [{ type: 'text', text: 'ok' }] }))
+  }
+}
+
+for (const [name, dispatch, stream] of [
+  ['call', dispatchCallInference, false],
+  ['stream', dispatchStreamInference, true],
+]) {
+  unixTest(`${name} dispatch gates each CRAG field on final readiness, not the scheduler snapshot`, async () => {
+    const previous = process.env.KIN_KERNEL_BIN
+    const posted = []
+    const fx = await kernelFixture(async (req, res) => {
+      posted.push({ url: req.url, token: req.headers['x-kin-internal-token'], envelope: await readPostedEnvelope(req) })
+      respondToCragHop(res, stream)
+    })
+    process.env.KIN_KERNEL_BIN = '/bin/true'
+    const callerCwd = '/synthetic/router-workspace'
+    try {
+      for (const mode of ['append', 'replace']) {
+        const body = cragHopBody(mode)
+        for (const capabilities of [[], ...cragCapabilities.map((cap) => [cap]), cragCapabilities]) {
+          const label = `${mode}: ${capabilities.join(', ') || 'no capabilities'}`
+          const stale = cragHealth(cragCapabilities.filter((cap) => !capabilities.includes(cap)))
+          const result = await dispatch({
+            exec: { ...fx.exec, workerStatus: stale },
+            body: { ...body, stream },
+            callerCwd,
+            cliHop: true,
+            routing: { inference: { engine: 'rust' } },
+            ensureRust: async () => ({ ok: true, health: cragHealth(capabilities) }),
+            timeoutMs: 3000,
+          })
+          assert.equal(result.engine, 'rust', label)
+          assert.equal(result.ok, true, label)
+          assert.equal(posted.length, 1, label)
+          const { url, token, envelope } = posted.pop()
+          assert.equal(url, '/internal/v1/messages', label)
+          assert.equal(token, 'internal-test', label)
+          assert.equal(envelope.stream, stream, label)
+          assert.deepEqual(
+            envelope.body.crag_prompt,
+            capabilities.includes(`prompt_${mode}`) ? body.crag_prompt : undefined,
+            label,
+          )
+          assert.equal(
+            envelope.body.crag_model?.id,
+            capabilities.includes('model_directive') ? 'claude-haiku-4-5-20251001' : undefined,
+            label,
+          )
+          assert.equal(Object.hasOwn(envelope, 'caller_cwd'), capabilities.includes('caller_cwd'), label)
+          if (capabilities.includes('caller_cwd')) assert.equal(envelope.caller_cwd, callerCwd, label)
+          assert.equal(Object.hasOwn(envelope.body, 'caller_cwd'), false, label)
+          assert.equal(JSON.stringify(envelope.body).includes(callerCwd), false, label)
+        }
+      }
+    } finally {
+      if (previous == null) delete process.env.KIN_KERNEL_BIN
+      else process.env.KIN_KERNEL_BIN = previous
+      await fx.close()
+    }
+  })
+}
+
+unixTest('transport and credential retries preserve the readiness-gated CRAG envelope', async () => {
+  const previous = process.env.KIN_KERNEL_BIN
+  const posted = []
+  const fx = await kernelFixture(async (req, res) => {
+    posted.push(await readPostedEnvelope(req))
+    if (posted.length === 1) {
+      res.destroy()
+      return
+    }
+    if (posted.length === 2) {
+      res.writeHead(401, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ type: 'error', error: { code: 'needs_refresh', message: 'credential needs refresh' } }))
+      return
+    }
+    respondToCragHop(res, false)
+  })
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  const callerCwd = '/synthetic/retry-workspace'
+  const body = cragHopBody('replace')
+  let readyChecks = 0
+  let credentialEnsures = 0
+  try {
+    const result = await dispatchCallInference({
+      exec: { ...fx.exec, workerStatus: cragHealth(['prompt_append', 'model_directive']) },
+      body,
+      callerCwd,
+      cliHop: true,
+      routing: { inference: { engine: 'rust' } },
+      ensureRust: async () => {
+        readyChecks++
+        return { ok: true, health: cragHealth(['prompt_replace', 'caller_cwd']) }
+      },
+      ensureCredential: async (_exec, { force }) => {
+        credentialEnsures++
+        assert.equal(force, true)
+        return { ok: true }
+      },
+      timeoutMs: 3000,
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.credential_retried, true)
+    assert.equal(readyChecks, 1)
+    assert.equal(credentialEnsures, 1)
+    assert.equal(posted.length, 3)
+    const comparable = posted.map(({ request_id: _id, ...envelope }) => envelope)
+    assert.deepEqual(comparable[1], comparable[0], 'transport retry')
+    assert.deepEqual(comparable[2], comparable[0], 'credential retry')
+    assert.equal(comparable[0].caller_cwd, callerCwd)
+    assert.deepEqual(comparable[0].body.crag_prompt, body.crag_prompt)
+    assert.equal(Object.hasOwn(comparable[0].body, 'crag_model'), false)
+    assert.equal(Object.hasOwn(comparable[0].body, 'caller_cwd'), false)
+    assert.equal(JSON.stringify(comparable[0].body).includes(callerCwd), false)
+  } finally {
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+    await fx.close()
+  }
+})
+
 unixTest('dispatchStreamInference uses rust socket when ready', async () => {
   const prev = process.env.KIN_KERNEL_BIN
   process.env.KIN_KERNEL_BIN = '/bin/true'

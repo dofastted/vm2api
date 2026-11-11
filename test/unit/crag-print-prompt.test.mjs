@@ -5,17 +5,97 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { validatePersonaRoutingPatch } from '../../src/lib/admin/panel-api.mjs'
 import {
+  callerCwdDeclaration,
   callerSystemTail,
   cragV2KernelActive,
   prepareCragPrintBody,
+  projectCallerSystem,
   readSlotKernelConfig,
   resolveCragPrintPersona,
+  trackCallerSystemBlock,
 } from '../../src/lib/protocol/crag-print-prompt.mjs'
+import { sanitizeAnthropicBody } from '../../src/lib/protocol/sanitize.mjs'
 
 const billing = 'x-anthropic-billing-header: cc_version=2.1.317'
 const identity = 'You are Claude Code, an agent.'
 const harness = 'You are an agent working with the user.'
 const guidance = 'Bias toward working.'
+
+const cwdTag = (cwd) => `<cwd>\n${cwd}\n</cwd>`
+const callerCwdFromSystem = (system) => callerCwdDeclaration(system)?.cwd ?? null
+
+test('caller cwd accepts a single standalone absolute path from the raw system', () => {
+  const posix = '/synthetic/work space/项目'
+  const drive = String.raw`C:\Synthetic Work\project`
+  const unc = String.raw`\\fixture\share\project`
+  assert.equal(callerCwdFromSystem(`instructions\r\n  <cwd>\r\n  ${posix}  \r\n  </cwd>\r\nmore`), posix)
+  assert.equal(
+    callerCwdFromSystem([{ type: 'text', text: cwdTag(drive), cache_control: { type: 'ephemeral' } }]),
+    drive,
+  )
+  assert.equal(callerCwdFromSystem([cwdTag(unc)]), unc)
+  assert.equal(
+    callerCwdFromSystem([
+      { type: 'image', text: cwdTag('/not-a-text-block') },
+      { type: 'text', text: cwdTag(posix) },
+    ]),
+    posix,
+  )
+})
+
+test('caller cwd rejects malformed or ambiguous declarations', () => {
+  const tag = cwdTag('/synthetic/workspace')
+  for (const [name, system] of [
+    ['missing system', undefined],
+    ['no tag', 'caller instructions'],
+    ['inline', '<cwd>/synthetic/workspace</cwd>'],
+    ['uppercase tags', '<CWD>\n/synthetic/workspace\n</CWD>'],
+    ['opening tag in prose', `example: ${tag}`],
+    ['closing tag in prose', `${tag} is an example`],
+    ['multiline value', cwdTag('/synthetic\n/workspace')],
+    [
+      'split across blocks',
+      [
+        { type: 'text', text: '<cwd>\n/synthetic/workspace' },
+        { type: 'text', text: '</cwd>' },
+      ],
+    ],
+    ['non-text block', [{ type: 'image', text: tag }]],
+    ['messages instead of top-level system', { messages: [{ role: 'system', content: tag }] }],
+    ['duplicate in one block', `${tag}\n${tag}`],
+    [
+      'duplicate across blocks',
+      [
+        { type: 'text', text: tag },
+        { type: 'text', text: cwdTag('/other') },
+      ],
+    ],
+  ]) {
+    assert.equal(callerCwdFromSystem(system), null, name)
+  }
+})
+
+test('caller cwd validates the path and caps the trimmed value at 512 UTF-8 bytes', () => {
+  const atLimit = `/${'é'.repeat(255)}a`
+  assert.equal(callerCwdFromSystem(cwdTag(` ${atLimit} `)), atLimit)
+  for (const [name, value] of [
+    ['one byte over the limit', `${atLimit}a`],
+    ['blank', '   '],
+    ['relative POSIX path', 'synthetic/workspace'],
+    ['drive-relative path', String.raw`C:workspace`],
+    ['UNC without share', String.raw`\\fixture`],
+    ['Windows device path', String.raw`\\.\pipe\fixture`],
+    ['forbidden Windows punctuation', String.raw`C:\synthetic\bad?name`],
+    ['NUL', '/synthetic/\u0000workspace'],
+    ['tab', '/synthetic/work\tspace'],
+    ['Unicode line separator', '/synthetic/\u2028workspace'],
+    ['markup', '/synthetic/<workspace>'],
+    ['named entity', '/synthetic/one&amp;two'],
+    ['numeric entity', '/synthetic/one&#x2f;two'],
+  ]) {
+    assert.equal(callerCwdFromSystem(cwdTag(value)), null, name)
+  }
+})
 
 test('official_full appends only the caller tail', () => {
   const out = prepareCragPrintBody(
@@ -41,6 +121,57 @@ test('official_full appends only the caller tail', () => {
   assert.equal(out.thinking.type, 'adaptive')
   assert.equal(out.tools[0].name, 'Read')
   assert.equal(out.messages[0].content, 'hi')
+})
+
+test('an extracted caller cwd is not copied into append or replacement prompt text', () => {
+  const callerCwd = '/synthetic/workspace'
+  const body = {
+    model: 'claude-sonnet-5',
+    system: [
+      { type: 'text', text: billing },
+      { type: 'text', text: `${cwdTag(callerCwd)}\ncaller guidance` },
+    ],
+    messages: [{ role: 'user', content: 'hi' }],
+  }
+  const system = projectCallerSystem(body.system, callerCwdDeclaration(body.system))
+  for (const [preset, mode] of [
+    ['official_full', 'append'],
+    ['zero', 'replace'],
+  ]) {
+    const out = prepareCragPrintBody({ ...body, system }, { preset })
+    assert.equal(Object.hasOwn(out, 'system'), false, preset)
+    assert.equal(Object.hasOwn(out, 'caller_cwd'), false, preset)
+    assert.deepEqual(out.crag_prompt, { mode, text: 'caller guidance' }, preset)
+    assert.deepEqual(out.messages, body.messages, preset)
+  }
+  assert.equal(body.system[1].text, `${cwdTag(callerCwd)}\ncaller guidance`)
+})
+
+test('print preparation does not extract cwd again from normalized system history', () => {
+  const raw = cwdTag('/synthetic/declared')
+  const lifted = `historical instructions\n${raw}`
+  const declaration = callerCwdDeclaration(raw)
+  const body = sanitizeAnthropicBody(
+    {
+      system: raw,
+      messages: [
+        { role: 'system', content: lifted },
+        { role: 'user', content: 'hi' },
+      ],
+    },
+    { onSystemBlock: trackCallerSystemBlock(raw, declaration) },
+  )
+  assert.deepEqual(
+    prepareCragPrintBody({ ...body, system: projectCallerSystem(body.system, declaration) }).crag_prompt,
+    {
+      mode: 'append',
+      text: lifted,
+    },
+  )
+  for (const preset of ['official_full', 'zero']) {
+    const out = prepareCragPrintBody({ system: projectCallerSystem(raw, callerCwdDeclaration(raw)) }, { preset })
+    assert.equal(Object.hasOwn(out, 'crag_prompt'), false, preset)
+  }
 })
 
 test('zero replace does not leave a bare system, and refuses argv overflow', () => {

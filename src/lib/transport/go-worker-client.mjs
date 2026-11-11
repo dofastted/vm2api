@@ -29,7 +29,12 @@ import {
 import { isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { runSlotOauth } from './slot-oauth.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
-import { cragConsumesModelDirective, cragV2KernelActive, readSlotKernelConfig } from '../protocol/crag-print-prompt.mjs'
+import {
+  cragConsumesModelDirective,
+  cragV2KernelActive,
+  readSlotKernelConfig,
+  validateCallerCwd,
+} from '../protocol/crag-print-prompt.mjs'
 import { applyClaudeSSELineToMessage, createClaudeMessageAssembler } from '../protocol/convert.mjs'
 import {
   clientCancelledResult,
@@ -398,12 +403,19 @@ function dumpSessionEnvelope(envelope) {
   } catch {}
 }
 
-function stripCragEnvelope(body) {
+function gateCragBody(body, print, health) {
   if (!body || typeof body !== 'object') return body
-  if (!body.crag_prompt && !body.crag_model && !body.crag_options?.prompt) return body
+  const caps = print && Array.isArray(health?.capabilities) ? health.capabilities : []
+  const prompt = body.crag_prompt
+  const model = print && cragConsumesModelDirective(health) ? modelDirectiveForCrag(body.model) : null
+  const hasAlias = body.crag_options != null && Object.hasOwn(body.crag_options, 'prompt')
+  if (!model && !Object.hasOwn(body, 'crag_prompt') && !Object.hasOwn(body, 'crag_model') && !hasAlias) {
+    return body
+  }
   const out = { ...body }
-  delete out.crag_prompt
-  delete out.crag_model
+  if (!['append', 'replace'].includes(prompt?.mode) || !caps.includes(`prompt_${prompt.mode}`)) delete out.crag_prompt
+  if (model) out.crag_model = model
+  else delete out.crag_model
   if (out.crag_options && typeof out.crag_options === 'object' && !Array.isArray(out.crag_options)) {
     const { prompt: _prompt, ...rest } = out.crag_options
     if (Object.keys(rest).length) out.crag_options = rest
@@ -460,26 +472,21 @@ export function prepareWorkerPayload({
   // Envelope headers are discarded; the existing MessageRequest.betas channel
   // carries request gates to the native CLI, which builds the actual HTTP wire.
   const gated = cliHop ? { ...main, betas } : sanitizeAnthropicBodyForBetaTokens(main, headers['anthropic-beta'])
-  // CRAG's CLI rebuilds the wire from its own model table. Pass the preset
-  // boundary only when that worker applies it locally. A cluster hop forwards
-  // unknown fields and Anthropic rejects `crag_model`.
+  const health = exec?.workerStatus
   const print =
-    cragPrint == null
-      ? cragV2KernelActive({
-          vm: exec?.vm,
-          health: exec?.workerStatus,
-          kernelConfig: readSlotKernelConfig(exec?.homeDir),
-        })
-      : cragPrint === true
-  const directed =
-    print && cragConsumesModelDirective(exec?.workerStatus)
-      ? { ...gated, crag_model: modelDirectiveForCrag(gated?.model) }
-      : stripCragEnvelope(gated)
+    cragPrint !== false &&
+    cragV2KernelActive({
+      vm: exec?.vm,
+      health,
+      kernelConfig: readSlotKernelConfig(exec?.homeDir),
+    })
+  const directed = gateCragBody(gated, print, health)
   return {
     headers,
     gated: directed,
     cliHop,
     routing,
+    acceptsCallerCwd: print && Array.isArray(health?.capabilities) && health.capabilities.includes('caller_cwd'),
     thread: thread.turn,
   }
 }
@@ -514,6 +521,7 @@ async function workerEnvelope({
   preserveCacheBreakpoints = null,
   cliHop = false,
   cragPrint = null,
+  callerCwd = null,
   repaired = false,
   redactionPrincipal = '',
   redactionSession = '',
@@ -531,10 +539,15 @@ async function workerEnvelope({
     repaired,
   })
   const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
-  const gated = redaction ? await maskJson(prepared.gated, redaction) : prepared.gated
+  // Mask the separated path with the same policy as the original system text.
+  const cwd = (prepared.acceptsCallerCwd && validateCallerCwd(callerCwd)) || undefined
+  const masked = redaction ? await maskJson({ body: prepared.gated, caller_cwd: cwd }, redaction) : null
+  const gated = redaction ? masked.body : prepared.gated
+  const outgoingCwd = redaction ? validateCallerCwd(masked.caller_cwd) : cwd
   const finalized = sealPreparedPayload(prepared, gated)
   const envelope = {
     ...(requestContext ? { request_context: requestContext } : {}),
+    ...(typeof outgoingCwd === 'string' ? { caller_cwd: outgoingCwd } : {}),
     body: finalized.body,
     headers: finalized.headers,
     stream: !!stream,
@@ -553,9 +566,15 @@ async function redactionContext({ routing, exec, redactionPrincipal, redactionSe
   return { principal: redactionPrincipal, session: redactionSession || '' }
 }
 
-async function maskEnvelopeBody(envelope, redaction) {
-  if (!redaction || !envelope?.body) return envelope
-  return { ...envelope, body: await maskJson(envelope.body, redaction) }
+async function preparePrebuiltEnvelope(envelope, redaction) {
+  // A prebuilt (e.g. Codex) envelope has no trusted Messages-side cwd source.
+  const { caller_cwd: _callerCwd, ...out } = envelope
+  if (out.body && Object.hasOwn(out.body, 'caller_cwd')) {
+    const { caller_cwd: _bodyCwd, ...body } = out.body
+    out.body = body
+  }
+  if (redaction && out.body) out.body = await maskJson(out.body, redaction)
+  return out
 }
 
 function redactionResult(error) {
@@ -617,6 +636,7 @@ export async function callGoWorker({
   envelope = null,
   cliHop = false,
   cragPrint = null,
+  callerCwd = null,
   repaired = false,
   onEnvelope = null,
   redactionPrincipal = '',
@@ -652,7 +672,7 @@ export async function callGoWorker({
   try {
     const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
     const prepared = envelope
-      ? { envelope: await maskEnvelopeBody(envelope, redaction), thread: null, redaction }
+      ? { envelope: await preparePrebuiltEnvelope(envelope, redaction), thread: null, redaction }
       : await workerEnvelope({
           body,
           reqHeaders,
@@ -665,6 +685,7 @@ export async function callGoWorker({
           preserveCacheBreakpoints,
           cliHop,
           cragPrint,
+          callerCwd,
           requestContext,
           repaired,
           redactionPrincipal,
@@ -747,6 +768,7 @@ export async function streamGoWorker({
   envelope = null,
   cliHop = false,
   cragPrint = null,
+  callerCwd = null,
   repaired = false,
   onEnvelope = null,
   onOutboundHeaders = null,
@@ -841,7 +863,7 @@ export async function streamGoWorker({
   try {
     const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
     const prepared = envelope
-      ? { envelope: await maskEnvelopeBody(envelope, redaction), thread: null, redaction }
+      ? { envelope: await preparePrebuiltEnvelope(envelope, redaction), thread: null, redaction }
       : await workerEnvelope({
           body,
           reqHeaders,
@@ -855,6 +877,7 @@ export async function streamGoWorker({
           preserveCacheBreakpoints,
           cliHop,
           cragPrint,
+          callerCwd,
           requestContext,
           repaired,
           redactionPrincipal,
