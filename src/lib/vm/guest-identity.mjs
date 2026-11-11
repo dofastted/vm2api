@@ -177,6 +177,9 @@ export async function collectSlotIdentity(projectRoot, vm, { callGet = readGuest
     type: runtimeKind(current),
     guest_hostname: current.fingerprint.guest_hostname || current.fingerprint.hostname,
     guest_os: current.fingerprint.os_pretty,
+    guest_os_version: guest.os_version || null,
+    guest_platform: guest.goos || null,
+    guest_arch: guest.arch || null,
     guest_kernel: current.fingerprint.guest_kernel_release || current.fingerprint.kernel_release,
     identity_collected_at: current.fingerprint.collected_at,
   }
