@@ -3,6 +3,7 @@
 ## Unreleased
 
 - 升级时以槽位容器默认用户（而非 root）停止旧的 `kin-worker telemetry`，避免 `cap-drop ALL` 下 `legacy_telemetry_stop_failed`（#954）。
+- 第三方出站工具名改写为 `mcp__` 时，同步改写历史 `tool_result` 内 `tool_reference.tool_name` 与 `tool_search_tool_result.tool_references[].tool_name`，修复工具搜索下一轮 400（#953）。
 
 ## 1.4.071 — 2026-11-12
 

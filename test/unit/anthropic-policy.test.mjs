@@ -761,6 +761,138 @@ test('official Claude Code tool names stay, stray mcp_ names do not', () => {
   assert.equal(result.reverse.Bash, undefined)
 })
 
+test('#953 third-party scrub rewrites tool_reference inside tool_result history', () => {
+  const result = scrubUpstreamClientBody({
+    tools: [
+      { name: 'ToolSearch', input_schema: { type: 'object', properties: { query: { type: 'string' } } } },
+      {
+        name: 'WebSearch',
+        defer_loading: true,
+        input_schema: { type: 'object', properties: { query: { type: 'string' } } },
+      },
+    ],
+    messages: [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'toolu_01REPRO', name: 'ToolSearch', input: { query: 'select:WebSearch' } }],
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'toolu_01REPRO',
+            content: [{ type: 'tool_reference', tool_name: 'WebSearch' }],
+          },
+          { type: 'text', text: 'Reply with exactly: READY' },
+        ],
+      },
+    ],
+  })
+  assert.equal(result.body.tools[0].name, 'mcp__ToolSearch')
+  assert.equal(result.body.tools[1].name, 'mcp__WebSearch')
+  assert.equal(result.body.messages[0].content[0].name, 'mcp__ToolSearch')
+  assert.equal(result.body.messages[1].content[0].content[0].tool_name, 'mcp__WebSearch')
+  assert.equal(result.reverse.mcp__WebSearch, 'WebSearch')
+})
+
+test('#953 client-supplied mcp__ names in tool_reference stay unchanged', () => {
+  const result = scrubUpstreamClientBody({
+    tools: [
+      { name: 'mcp__ToolSearch', input_schema: { type: 'object' } },
+      { name: 'mcp__WebSearch', defer_loading: true, input_schema: { type: 'object' } },
+    ],
+    messages: [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 't1', name: 'mcp__ToolSearch', input: { query: 'select:mcp__WebSearch' } }],
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 't1',
+            content: [{ type: 'tool_reference', tool_name: 'mcp__WebSearch' }],
+          },
+        ],
+      },
+    ],
+  })
+  assert.equal(result.body.tools[0].name, 'mcp__ToolSearch')
+  assert.equal(result.body.tools[1].name, 'mcp__WebSearch')
+  assert.equal(result.body.messages[0].content[0].name, 'mcp__ToolSearch')
+  assert.equal(result.body.messages[1].content[0].content[0].tool_name, 'mcp__WebSearch')
+  assert.equal(result.reverse.mcp__WebSearch, undefined)
+})
+
+test('#953 official passthrough leaves tool_reference names untouched', () => {
+  const result = scrubUpstreamClientBody(
+    {
+      tools: [{ name: 'WebSearch', input_schema: { type: 'object' } }],
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 't1',
+              content: [{ type: 'tool_reference', tool_name: 'WebSearch' }],
+            },
+          ],
+        },
+      ],
+    },
+    { official: true },
+  )
+  assert.equal(result.body.tools[0].name, 'WebSearch')
+  assert.equal(result.body.messages[0].content[0].content[0].tool_name, 'WebSearch')
+})
+
+test('#953 tool_search_tool_result history rewrites tool_references', () => {
+  const result = scrubUpstreamClientBody({
+    tools: [{ name: 'WebSearch', input_schema: { type: 'object' } }],
+    messages: [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool_search_tool_result',
+            tool_use_id: 't1',
+            tool_references: [{ tool_name: 'WebSearch' }],
+          },
+        ],
+      },
+    ],
+  })
+  assert.equal(result.body.tools[0].name, 'mcp__WebSearch')
+  assert.equal(result.body.messages[0].content[0].tool_references[0].tool_name, 'mcp__WebSearch')
+})
+
+test('#953 restoreToolNames maps tool_reference fields back to client names', () => {
+  const reverse = { mcp__WebSearch: 'WebSearch' }
+  const response = restoreToolNames(
+    {
+      type: 'message',
+      content: [
+        {
+          type: 'tool_search_tool_result',
+          tool_use_id: 't1',
+          tool_references: [{ tool_name: 'mcp__WebSearch' }],
+        },
+        {
+          type: 'tool_result',
+          tool_use_id: 't2',
+          content: [{ type: 'tool_reference', tool_name: 'mcp__WebSearch' }],
+        },
+      ],
+    },
+    reverse,
+  )
+  assert.equal(response.content[0].tool_references[0].tool_name, 'WebSearch')
+  assert.equal(response.content[1].content[0].tool_name, 'WebSearch')
+})
+
 test('front clean rewrites Hermes into standard Anthropic blocks before persona', () => {
   const result = toStandardAnthropicBody({
     model: 'claude-sonnet-5',
