@@ -76,6 +76,15 @@ export function cragSlotPayload(projectRoot, { required = true } = {}) {
       sha256: crypto.createHash('sha256').update(wrapper).digest('hex'),
     },
   ]
+  const manifestPath = path.join(root, 'manifest.json')
+  const manifestBody = fs.readFileSync(manifestPath)
+  files.push({
+    name: 'opt/kin/crag-v2/manifest.json',
+    body: manifestBody,
+    mode: 0o644,
+    sha256: crypto.createHash('sha256').update(manifestBody).digest('hex'),
+  })
+  digest.update('manifest.json').update(crypto.createHash('sha256').update(manifestBody).digest('hex'))
   for (const rel of Object.keys(verified.manifest.sha256).sort()) {
     digest.update(rel).update(verified.manifest.sha256[rel])
     const executable = rel === 'crag-v2' || rel.endsWith('/claude')
