@@ -1,6 +1,6 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "v1.4.070",
+  "release": "v1.4.071",
   "files": [
     {
       "path": "bin/kin-kernel",
@@ -11,8 +11,8 @@
     {
       "path": "bin/kin-codex-kernel",
       "asset": "kin-codex-kernel",
-      "size": 7899968,
-      "sha256": "afdb433ebf3c719eb8596e09ca6493e8f769af1aab136426e82cbcd54c9bdc4a"
+      "size": 5927624,
+      "sha256": "ec9abb0160eaa0c8fda474c52fcfab592a4a2b905da4e4525e14fee9fb61376d"
     },
     {
       "path": "bin/kin-oauth-auth",
