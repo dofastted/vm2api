@@ -1208,6 +1208,58 @@ test('writeKernelConfig cli-hop native slots ignore live 并行', () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
+unixTest('Rust supervisor retires legacy telemetry without root docker exec', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-retire-user-'))
+  const written = writeKernelConfig(
+    root,
+    { id: 'vm-retire-user' },
+    { token: 'tok', proxyUrl: '', proxyRequired: false },
+  )
+  const exec = {
+    vmId: 'vm-retire-user',
+    homeDir: path.join(root, 'vms', 'vm-retire-user', 'cli-home'),
+    vm: {
+      id: 'vm-retire-user',
+      runtime: { container: 'kin-retire-user', kernel_socket: written.socketPath },
+    },
+  }
+  let readySlots = 0
+  let server = null
+  const serve = async () => {
+    if (server) await new Promise((resolve) => server.close(resolve))
+    server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: readySlots, worker_version: 'fixture' }))
+    })
+    await new Promise((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(written.socketPath, resolve)
+    })
+  }
+  const execCalls = []
+  const runDockerExec = async (args) => {
+    execCalls.push(args)
+    if (args[0] === 'inspect') return kernelInspectResult()
+    if (args[0] === 'restart' && args[1] === 'kin-retire-user') {
+      readySlots = 1
+      await serve()
+    }
+    return { ok: true }
+  }
+  await serve()
+  try {
+    const ready = await ensureRustKernel(exec, { timeoutMs: 8000, runDockerExec })
+    assert.equal(ready.ok, true, JSON.stringify(ready))
+    const retireArgv = execCalls.find((args) => args[0] === 'exec' && args.includes('sh'))
+    assert.ok(retireArgv, execCalls.map((args) => args.slice(0, 6)).join('\n'))
+    assert.equal(retireArgv.includes('-u'), false)
+    assert.equal(retireArgv[1], 'kin-retire-user')
+  } finally {
+    if (server) await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 unixTest('Rust supervisor recycles when ready_slots stay at 0', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-wedged-'))
   const written = writeKernelConfig(root, { id: 'vm-wedged' }, { token: 'tok', proxyUrl: '', proxyRequired: false })
