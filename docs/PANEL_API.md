@@ -85,7 +85,7 @@
 | POST | `/vms/:id/oauth/exchange-code` | 粘贴授权码，经槽代理换票。完整 OAuth 才排队初装。flavor 以 session 为准 |
 | GET/POST | `/vms/:id/official-cc-bootstrap` | 初装进度 / `{ manual:true }` 再跑 |
 | GET/PUT | `/vms/:id/seed-settings` | 播种；面板默认锁定，解锁后改、播种前确认。`settings.json` 可编辑 env（经 `extra_env`）与 `theme`；`autoUpdates`/`grove_enabled` 与 TZ/LANG/LC_ALL、telemetry/bedrock/vertex 等契约 env 只读展示，TZ/LANG 经 PUT `timezone` / `timezone_follow_proxy` / `locale` 写入槽位后再播种，不经 `extra_env`；`claude_setting` 可编辑。`GET ?debug=1` 额外返回 `telemetry_log`（最近 40 行脱敏上传审计，默认不带） |
-| POST | `/vms/:id/collect-identity` | guest 采集（locale/tz/`guest_machine_id`） |
+| POST | `/vms/:id/collect-identity` | guest 采集（locale/tz/`guest_machine_id`、槽内 `/etc/os-release` 的 `VERSION_ID`、系统与架构）；Codex Analytics 只使用这次采集的运行环境 |
 | POST | `/vms/:id/reload` | 重载该槽 worker |
 | GET | `/kernels` | 仅 admin/master。返回两种产品 `kernels`（`cli-node` 默认免费、`crag` 签名加密 V2）、真实本地版本/就绪状态、按 VM 的公开 `licenses` 与 `installations`。读取不会初始化设备身份，不返回机器码、注册码或私钥 |
 | POST | `/kernels/pull` | `{ kernel: "cli-node" \| "crag", tag?: "vX.Y.Z" }`，省略 tag 拉最新正式 Release。只更新安装包缓存，不安装、不停 VM。默认内核从 vm2api Release 下载 `kin-kernel` 与 `cli-node`；CRAG 从供应仓 `dofastted/claude-code` Release 下载 `crag-v2-licensed-amd64.tar.gz`，按本机可信发行公钥校验签名、密文与成员。缺失返回 `crag_v2_asset_missing`，不退回 legacy ELF |
@@ -257,7 +257,7 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 | `websocket.enabled` | `true` | 全局推理 WS 总闸，不影响面板终端或集群连接 |
 | `codex.websocket.enabled` | `true` | GPT 推理 WS 子闸；必须与总闸同时开启 |
 | `codex.upstream_transport` | `prefer_websocket` | `prefer_websocket` 或 `http`；入站与上游传输不是同一段连接 |
-| `codex.user_agent` | `codex_cli_rs/0.160.0 (linux x86_64)` | 上游客户端画像，不读取下游用户的系统信息 |
+| `codex.user_agent` | `codex_cli_rs/0.167.1 (linux x86_64)` | 上游客户端画像，不读取下游用户的系统信息；originator/version 由内核按该画像生成，调用方不能覆盖 |
 | `codex.catalog_client_version` | `auto` | 模型目录同步的客户端版本，与推理 UA 分开 |
 | `codex.client_features.enabled` | `false` | 显式开启后上送槽位独立安装 UUID 与官方 `client_metadata`；不使用 VM/硬件指纹 |
 | `codex.analytics.enabled` | `false` | 显式开启后独立上报运行环境 Analytics，不是推理成功的前提 |
@@ -275,7 +275,9 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 
 安装 UUID 存在槽位 `run/codex-installation-id`，不取 MAC、主机名、machine-id 或调用方安装 ID。每次 envelope 的 `options.installation_id` 使用该文件的 UUID，覆盖运行中 kernel 的旧启动身份；非法安装 ID 在拨号前拒绝，避免复用旧进程时重新上传 VM 指纹。关闭安装元数据时，不生成 `client_metadata`，并从调用方的 turn 元数据移除安装 ID；会话路由所需信息保留。
 
-Analytics 按官方 [`codex_thread_initialized`](https://github.com/openai/codex/blob/main/codex-rs/analytics/src/events.rs) 的事件结构，向 `https://chatgpt.com/backend-api/codex/analytics-events/events` 单独 POST，使用所选账号鉴权并沿用该槽出口。包含真实 kernel 版本、kernel 所在宿主的系统/系统版本/架构、会话标识、模型和 Unix 秒级时间；不上传提示词、文件内容、仓库路径、主机名或 MAC。每进程每账号/会话去重（最多保留 4096 个键），队列最多 32 条，单次上传最多 10 秒，失败只记录状态、不重放推理、不重试上报。未启用时零 Analytics 请求。OTEL/Statsig 与 Sentry 反馈不随这个开关启用。官方发送实现见 [`analytics/src/client.rs`](https://github.com/openai/codex/blob/main/codex-rs/analytics/src/client.rs)。
+Analytics 按官方 [`codex_thread_initialized`](https://github.com/openai/codex/blob/main/codex-rs/analytics/src/events.rs) 的事件结构，向 `https://chatgpt.com/backend-api/codex/analytics-events/events` 单独 POST，使用所选账号鉴权并沿用该槽出口及客户端画像。包含真实 kernel 版本、**所选 VM 内采集**的系统/系统版本/架构、会话标识、模型和 Unix 秒级时间；不读取控制面宿主的 `/etc/os-release` 或编译目标架构，也不使用随机工作站画像和下游电脑信息。不上传提示词、文件内容、仓库路径、主机名、MAC、SMBIOS 或 machine-id。每进程每账号/会话去重（最多保留 4096 个键），队列最多 256 条，单次上传最多 10 秒，失败只记录状态、不重放推理、不重试上报。未启用时零 Analytics 请求。OTEL/Statsig 与 Sentry 反馈不随这个开关启用。官方发送实现见 [`analytics/src/client.rs`](https://github.com/openai/codex/blob/main/codex-rs/analytics/src/client.rs)。
+
+升级后先对 Codex 槽调用 `POST /api/panel/vms/:id/collect-identity`，取得 `runtime.guest_platform` / `guest_os_version` / `guest_arch` 与 `identity_collected_at`。每次内部请求通过 `options.telemetry_runtime` 传递当前快照，运行中的新 kernel 无需为重新采集而重启；缺失、空白或非法运行环境时只跳过 Analytics，不阻断推理，不回退宿主特征。安装 UUID 与这些运行环境字段仍相互独立。
 
 ### 通用路由选项
 
@@ -284,6 +286,8 @@ Analytics 按官方 [`codex_thread_initialized`](https://github.com/openai/codex
 `compatibility.persona_preset`（`official` / `official_full` / `zero` / `custom`）和 `compatibility.cache_ttl`（`5m` / `1h`）保存后投影到每个 Claude 槽的 `vms/<id>/run/kernel.json`：`persona_preset`、`system_layout`（`zero`→`zero`，其余→`identity`）、`default_cache_ttl`。响应 `kernel_persona.updated` 是本次字节有变化的槽数。`PATCH /vms/:id` 的 `timezone` / `timezone_follow_proxy` 另把 `timezone` 热写进该槽 `kernel.json`，`timezone_sync.kernel_hot` 表示文件有变化。容器 `TZ` 不在这次写入里。Codex 槽不写。
 
 `compatibility.crag_persona_preset`（`official_full` / `zero`，缺省 `official_full`）只给 CRAG v2 print 清洗，不投影进 `kernel.json`。v2 worker 不读 `persona_preset` 或 `CLAUDE_CODE_SYSTEM_LAYOUT`。`official_full` 只 append 调用方尾巴；`zero` 送 `crag_prompt.mode=replace`。其它值保存时 400。槽位显式 `zero` 覆盖该档；其它槽位人设在 print 上收成 append。这不是 TUI：不关内置工具，也不加 `--no-chrome`。
+
+`compatibility.cc_entrypoint`（`cli` / `sdk-cli`，缺省 `cli`）：OAuth 请求的 Node 协议清洗与 worker envelope 每次读取当前配置，UA 入口覆盖槽位身份中旧的 `sdk-cli` / `cli`，版本仍由槽位身份 / 代码 pin 提供。网关生成的 billing 使用同一入口，调用方已有 billing 不改写；Setup Token / API Key 的 inference-only UA 不变。保存同时投影到 Claude 槽的 `kernel.json.cc_entrypoint`，由支持该字段的 cli-node 在下次请求生成最终 UA；不需要为此次 Node 修复重建 CLI。
 
 
 `compatibility.cch_enabled`（布尔，默认 `true`，设置 → 协议）：开启时统一给出站 billing 补齐 `cch` 并计算真实五位摘要；关闭时仍补齐该参数，但固定为 `cch=00000;`，跳过摘要计算。native hop 仅保留占位，最终紧凑 SDK JSON 才计算真实摘要；HTTP hop 在最终 Node 请求体密封。CCH 是 billing system body 参数，不是 User-Agent header。

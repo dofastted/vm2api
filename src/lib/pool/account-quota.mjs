@@ -75,7 +75,7 @@ export class AccountQuota {
     // Settled-in-band hops whose Extra reading has not yet moved.
     this.staleSettled = new Map()
     this.observedUtil = new Map()
-    this.reservationBand = new Map() // accountId → boolean[] (in-band at acquire)
+    this.reservationBand = new Map() // accountId → Map<reservation, boolean> (in-band at acquire)
     this.sessions = config?.sessions instanceof SessionLimitRegistry ? config.sessions : new SessionLimitRegistry()
     // vm_id → normalized `vm.policy.quota`; vm.json is the source of truth, this is the hot-path copy.
     this.vmQuota = new Map()
@@ -750,12 +750,13 @@ export class AccountQuota {
       return { ok: false, reason: 'concurrency_limit', detail: { inflight, max: limit, source: 'quota-reservation' } }
     }
     const inBand = this.gateZoneOf(accountId, { tier: opts.tier, account: acc }) === GATE_DRAINING
-    const stack = this.reservationBand.get(accountId) || []
-    stack.push(inBand)
-    this.reservationBand.set(accountId, stack)
+    const token = Symbol('quota-reservation')
+    const reservations = this.reservationBand.get(accountId) || new Map()
+    reservations.set(token, inBand)
+    this.reservationBand.set(accountId, reservations)
     this.inflight.set(accountId, inflight + 1)
     this._rpmTouch(accountId)
-    return { ok: true }
+    return { ok: true, release: () => this.release(accountId, token), token }
   }
 
   /** sub2api 7d_oi: Fable-only window. Does not unschedulable the account. */
@@ -806,12 +807,16 @@ export class AccountQuota {
     return n
   }
 
-  release(accountId) {
+  release(accountId, token) {
+    const reservations = this.reservationBand.get(accountId)
+    if (token !== undefined) {
+      if (!reservations?.delete(token)) return this.inflight.get(accountId) || 0
+    } else if (reservations?.size) {
+      reservations.delete([...reservations.keys()].at(-1))
+    }
+    if (reservations && !reservations.size) this.reservationBand.delete(accountId)
     const n = Math.max(0, (this.inflight.get(accountId) || 1) - 1)
     this.inflight.set(accountId, n)
-    const stack = this.reservationBand.get(accountId)
-    if (stack?.length) stack.pop()
-    if (stack && !stack.length) this.reservationBand.delete(accountId)
     return n
   }
 
@@ -820,10 +825,11 @@ export class AccountQuota {
    * previous percent, so the next large request treats the reading as stale
    * until headers/official usage move.
    */
-  noteBandSettled(accountId) {
+  noteBandSettled(accountId, token) {
     if (!accountId) return 0
-    const stack = this.reservationBand.get(accountId)
-    const reservedInBand = Array.isArray(stack) ? stack.some(Boolean) : false
+    const reservations = this.reservationBand.get(accountId)
+    const reservedInBand =
+      token === undefined ? [...(reservations?.values() || [])].some(Boolean) : reservations?.get(token)
     if (!reservedInBand && !this._drainingNow(accountId)) return this.staleSettled.get(accountId) || 0
     const next = (this.staleSettled.get(accountId) || 0) + 1
     this.staleSettled.set(accountId, next)

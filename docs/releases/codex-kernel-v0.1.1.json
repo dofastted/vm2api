@@ -1,0 +1,52 @@
+{
+  "component": "codex-kernel",
+  "version": "0.1.1",
+  "release_tag": "codex-kernel-v0.1.1",
+  "source": {
+    "visibility": "private",
+    "commit": "f318892f594ade42383670f4774a2ddcbe144ff0",
+    "tree": "7962148e4ae1d91ac01a7e967fb574d7a93c6190",
+    "working_tree_changes_included": false,
+    "cargo_lock_sha256": "ff745e98cf4df8c4263a346ba24141a4a07f61725790aaa00f380c8df975ad30"
+  },
+  "toolchain": {
+    "rustc": "1.98.1 (48a229cea 2026-09-01)",
+    "cargo": "1.98.1 (797e8a9bc 2026-08-05)",
+    "target": "x86_64-unknown-linux-gnu"
+  },
+  "build": {
+    "profile": "release",
+    "locked": true,
+    "strip": "symbols",
+    "source_paths_remapped": true
+  },
+  "artifact": {
+    "name": "kin-codex-kernel",
+    "platform": "linux",
+    "architecture": "amd64",
+    "size": 5928344,
+    "sha256": "5b497fc4339b375771f08394c4a7d15b885b3fc45b3a5f5e894dd2283bd468bd",
+    "max_required_glibc": "2.34"
+  },
+  "verification": {
+    "rust_tests_passed": 32,
+    "codex_node_tests_passed": 143,
+    "loopback_smoke": {
+      "http_requests": 5,
+      "websocket_requests": 1,
+      "analytics_events": 2,
+      "runtime_metadata_source": "selected VM observations",
+      "analytics_dedupe_verified": true,
+      "analytics_optout_verified": true,
+      "missing_runtime_suppression_verified": true,
+      "profile_header_isolation_verified": true,
+      "prompt_exclusion_verified": true
+    }
+  },
+  "scope": {
+    "application_version_changed": false,
+    "global_payload_manifest_changed": false,
+    "application_latest_changed": false,
+    "docker_images_published": false
+  }
+}

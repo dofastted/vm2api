@@ -45,13 +45,23 @@ export function codexKernelBinPath() {
 }
 
 /** Per-hop policy keeps settings live without interrupting another request's kernel. */
-export function codexKernelRequestOptions(routing = {}) {
+export function codexKernelRequestOptions(routing = {}, vm = null) {
   const codex = normalizeCodexRouting(routing.codex)
+  const guest = vm?.runtime
+  const telemetryRuntime =
+    guest?.identity_collected_at && guest.guest_platform && guest.guest_os_version && guest.guest_arch
+      ? {
+          runtime_os: guest.guest_platform,
+          runtime_os_version: guest.guest_os_version,
+          runtime_arch: guest.guest_arch,
+        }
+      : null
   return {
     upstream_transport: computedUpstreamTransport(routing),
     user_agent: codex.user_agent,
     client_features: codex.client_features.enabled === true,
     analytics: codex.analytics.enabled === true,
+    telemetry_runtime: telemetryRuntime,
   }
 }
 
@@ -101,7 +111,7 @@ export function writeCodexKernelConfig(projectRoot, vm, { token, proxyUrl, proxy
     proxy_required: required,
     internal_token: secret,
     max_request_bytes: maxRequestBytes(routing),
-    ...codexKernelRequestOptions(routing),
+    ...codexKernelRequestOptions(routing, vm),
     test_endpoints: process.env.KIN_CODEX_TEST_ENDPOINTS === '1',
   }
   fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', { mode: 0o600 })
