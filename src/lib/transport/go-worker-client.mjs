@@ -2,6 +2,7 @@ import http from 'node:http'
 import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
 import { prepareOutboundHeaders } from '../protocol/outbound-attempt.mjs'
 import { sanitizeAnthropicBodyForBetaTokens } from '../protocol/anthropic-policy.mjs'
 import { sanitizeAnthropicBody } from '../protocol/sanitize.mjs'
@@ -29,6 +30,7 @@ import {
 import { isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { runSlotOauth } from './slot-oauth.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { normalizeSessionIdleTtlSeconds } from '../vm/slot-engine.mjs'
 import {
   cragConsumesModelDirective,
   cragV2KernelActive,
@@ -48,6 +50,8 @@ import { mergeUsage } from '../protocol/openai-usage.mjs'
 import { ensureRedaction, maskJson, restoreJsonValue, createSseRestorer } from '../redaction/runtime.mjs'
 
 const MAX_BODY = 64 * 1024 * 1024
+const MAX_GATEWAY_CLOCK_MS = 86_400_000
+const CRAG_HEADER_ALLOWANCE_MS = 5_000
 const credentialRefreshTail = new Map()
 
 function withCredentialRefreshLock(key, fn) {
@@ -104,6 +108,7 @@ function workerRequest(
     timeoutMode = 'overall',
     headers = {},
     maxRequestBytes = 0,
+    requireInternalToken = false,
   } = {},
 ) {
   return new Promise((resolve, reject) => {
@@ -124,6 +129,10 @@ function workerRequest(
       return
     }
     const internalToken = readInternalToken(exec)
+    if (requireInternalToken && !internalToken) {
+      reject(Object.assign(new Error('slot worker internal token is not configured'), { code: 'worker_token_missing' }))
+      return
+    }
     const requestHeaders = { ...headers }
     if (payload) {
       requestHeaders['content-type'] = 'application/json'
@@ -162,12 +171,91 @@ function workerRequest(
         resolve(res)
       },
     )
-    arm(timeoutMs, `slot worker timeout after ${timeoutMs}ms`)
+    if (timeoutMs != null) arm(timeoutMs, `slot worker timeout after ${timeoutMs}ms`)
     req.once('close', clearTimer)
     req.once('error', reject)
     if (payload) req.write(payload)
     req.end()
   })
+}
+
+function clockMs(value, fallback) {
+  const ms = Number(value)
+  return Number.isFinite(ms) && ms > 0 ? Math.min(MAX_GATEWAY_CLOCK_MS, Math.max(1, Math.round(ms))) : fallback
+}
+
+function withoutGatewayPolicy(body) {
+  if (!body || !Object.hasOwn(body, 'gateway_policy')) return body
+  const { gateway_policy: _ignored, ...rest } = body
+  return rest
+}
+
+function inferenceRequest(
+  exec,
+  {
+    envelope,
+    requestId,
+    stream,
+    deliveryMode,
+    managedCrag,
+    tenantId,
+    slotWaitDeadlineMs,
+    timeoutMs,
+    idleTimeoutMs,
+    routing,
+    requestPath,
+    ...options
+  },
+) {
+  const headers = stream ? { te: 'trailers' } : {}
+  const body = { ...envelope, request_id: requestId }
+  if (managedCrag && requestPath === '/internal/v1/messages') {
+    body.stream = stream
+    body.delivery_mode = deliveryMode === 'verified' ? 'verified' : 'realtime'
+    if (tenantId) headers['x-tenant-id'] = tenantId
+    const firstByteMs = clockMs(timeoutMs, 600_000)
+    const idleMs = clockMs(idleTimeoutMs, clockMs(resolveStreamIdleTimeoutMs(routing), 180_000))
+    const queueWaitMs = Number.isFinite(slotWaitDeadlineMs)
+      ? Math.min(MAX_GATEWAY_CLOCK_MS, Math.max(0, Math.floor(slotWaitDeadlineMs - Date.now())))
+      : 0
+    body.gateway_policy = {
+      queue_wait_ms: queueWaitMs,
+      first_byte_timeout_ms: firstByteMs,
+      stream_idle_timeout_ms: idleMs,
+      session_idle_ttl_seconds: normalizeSessionIdleTtlSeconds(routing?.inference?.session_idle_ttl_seconds),
+    }
+    // Only realtime exposes headers before completion. The native worker owns
+    // activity deadlines while verified and JSON responses are held back.
+    timeoutMs =
+      stream && body.delivery_mode === 'realtime' ? queueWaitMs + firstByteMs + CRAG_HEADER_ALLOWANCE_MS : null
+  }
+  return workerRequest(exec, {
+    ...options,
+    requestPath,
+    requireInternalToken: managedCrag && requestPath === '/internal/v1/messages',
+    method: 'POST',
+    body,
+    headers,
+    timeoutMs,
+    timeoutMode: stream ? 'first-byte' : 'overall',
+  })
+}
+
+function classifyManagedQueueRejection(result, managedCrag) {
+  const error = result.body?.error
+  if (!managedCrag || result.ok || result.body?.type !== 'error') return result
+  if (
+    !(result.status === 503 && error?.type === 'overloaded_error' && error.message === 'runtime queue is full') &&
+    !(result.status === 504 && error?.type === 'timeout_error' && error.message === 'runtime queue timeout')
+  ) {
+    return result
+  }
+  return {
+    ...result,
+    body: { ...result.body, error: { ...error, code: 'slot_busy' } },
+    upstreamExecutions: 0,
+    terminalState: 'rejected',
+  }
 }
 
 /**
@@ -456,7 +544,7 @@ export function prepareWorkerPayload({
   // This is the last panel-owned boundary before either kernel. Keep the
   // worker contract Anthropic-shaped even when a caller selected passthrough;
   // cli-node and CRAG must never receive OpenAI/client-only request fields.
-  const canonicalBody = sanitizeAnthropicBody(body, { preserveContentShape: false }) || body
+  const canonicalBody = withoutGatewayPolicy(sanitizeAnthropicBody(body, { preserveContentShape: false }) || body)
   const model = canonicalBody?.model || ''
   const credMode = credentialModeFromOauth(exec?.vm?.claude || {})
   const headers = prepareOutboundHeaders(reqHeaders, exec?.homeDir, identity, model, {
@@ -575,9 +663,18 @@ async function redactionContext({ routing, exec, redactionPrincipal, redactionSe
   return { principal: redactionPrincipal, session: redactionSession || '' }
 }
 
-async function preparePrebuiltEnvelope(envelope, redaction) {
+async function preparePrebuiltEnvelope(envelope, redaction, messages) {
   // A prebuilt (e.g. Codex) envelope has no trusted Messages-side cwd source.
   const { caller_cwd: _callerCwd, ...out } = envelope
+  if (messages) {
+    delete out.gateway_policy
+    out.body = withoutGatewayPolicy(out.body)
+    if (out.headers && typeof out.headers === 'object') {
+      out.headers = Object.fromEntries(
+        Object.entries(out.headers).filter(([name]) => name.toLowerCase() !== 'x-tenant-id'),
+      )
+    }
+  }
   if (out.body && Object.hasOwn(out.body, 'caller_cwd')) {
     const { caller_cwd: _bodyCwd, ...body } = out.body
     out.body = body
@@ -634,6 +731,10 @@ export async function callGoWorker({
   body,
   reqHeaders = {},
   timeoutMs,
+  idleTimeoutMs,
+  managedCrag = false,
+  tenantId = '',
+  slotWaitDeadlineMs,
   maxRequestBytes = 0,
   identity = null,
   routing,
@@ -681,7 +782,11 @@ export async function callGoWorker({
   try {
     const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
     const prepared = envelope
-      ? { envelope: await preparePrebuiltEnvelope(envelope, redaction), thread: null, redaction }
+      ? {
+          envelope: await preparePrebuiltEnvelope(envelope, redaction, requestPath === '/internal/v1/messages'),
+          thread: null,
+          redaction,
+        }
       : await workerEnvelope({
           body,
           reqHeaders,
@@ -701,10 +806,16 @@ export async function callGoWorker({
           redactionSession,
         })
     reportEnvelope(onEnvelope, prepared.envelope)
-    const response = await workerRequest(exec, {
-      method: 'POST',
+    const response = await inferenceRequest(exec, {
+      stream: false,
+      managedCrag,
+      tenantId,
+      slotWaitDeadlineMs,
+      idleTimeoutMs,
+      routing,
       requestPath,
-      body: { ...prepared.envelope, request_id: requestId },
+      envelope: prepared.envelope,
+      requestId,
       maxRequestBytes,
       signal,
       timeoutMs,
@@ -714,7 +825,7 @@ export async function callGoWorker({
     const parsed = prepared.redaction ? await restoreJsonValue(parsedRaw, prepared.redaction) : parsedRaw
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     const ok = response.statusCode >= 200 && response.statusCode < 300 && parsed?.type !== 'error'
-    return restoreKernelErrorStatus({
+    const result = restoreKernelErrorStatus({
       ok,
       status: response.statusCode || 0,
       via: 'go-worker',
@@ -727,9 +838,11 @@ export async function callGoWorker({
       transportError: false,
       threadBetas: prepared.thread,
     })
+    return classifyManagedQueueRejection(result, managedCrag)
   } catch (error) {
     const blocked = redactionResult(error)
     if (blocked) return blocked
+    if (signal?.aborted) return clientCancelledResult({ via: 'go-worker' })
     return {
       ok: false,
       status: error.status === 413 ? 413 : 0,
@@ -759,6 +872,9 @@ export async function streamGoWorker({
   reqHeaders = {},
   timeoutMs,
   idleTimeoutMs = 0,
+  managedCrag = false,
+  tenantId = '',
+  slotWaitDeadlineMs,
   maxRequestBytes = 0,
   identity = null,
   routing,
@@ -868,7 +984,11 @@ export async function streamGoWorker({
   try {
     const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
     const prepared = envelope
-      ? { envelope: await preparePrebuiltEnvelope(envelope, redaction), thread: null, redaction }
+      ? {
+          envelope: await preparePrebuiltEnvelope(envelope, redaction, requestPath === '/internal/v1/messages'),
+          thread: null,
+          redaction,
+        }
       : await workerEnvelope({
           body,
           reqHeaders,
@@ -889,20 +1009,25 @@ export async function streamGoWorker({
           redactionSession,
         })
     reportEnvelope(onEnvelope, prepared.envelope)
-    const response = await workerRequest(exec, {
-      method: 'POST',
+    const response = await inferenceRequest(exec, {
+      stream: true,
+      deliveryMode,
+      managedCrag,
+      tenantId,
+      slotWaitDeadlineMs,
+      idleTimeoutMs,
+      routing,
       requestPath,
-      body: { ...prepared.envelope, request_id: requestId },
+      envelope: prepared.envelope,
+      requestId,
       maxRequestBytes,
       signal,
       timeoutMs,
-      timeoutMode: 'first-byte',
-      headers: { te: 'trailers' },
     })
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
       const data = await readAll(response, 1024 * 1024)
-      return restoreKernelErrorStatus({
+      const result = restoreKernelErrorStatus({
         ok: false,
         status: response.statusCode || 0,
         via: 'go-worker-stream',
@@ -913,6 +1038,7 @@ export async function streamGoWorker({
         transportError: false,
         threadBetas: prepared.thread,
       })
+      return classifyManagedQueueRejection(result, managedCrag)
     }
     let buffer = ''
     let receivedAt = null
@@ -972,7 +1098,7 @@ export async function streamGoWorker({
     let sawMessageStop = false
     let outboundHeadersFrame = false
     let idleTimer = null
-    if (firstByteMs > 0 || idleMs > 0) {
+    if (!managedCrag && (firstByteMs > 0 || idleMs > 0)) {
       idleTimer = setInterval(() => {
         const limit = sawChunk ? idleMs : firstByteMs
         if (limit <= 0) return
@@ -1076,9 +1202,12 @@ export async function streamGoWorker({
       if (!committed && complete) await flushCommit()
       const terminalState = complete ? 'verified' : 'incomplete'
       const rateHeaders = mergeRateLimitHeaders({ ...sseRateHeaders, ...headers, ...trailers })
+      // A native activity timeout can follow HTTP/SSE metadata but precede
+      // visible output. It is neither an empty hop nor a transport failure.
+      const nativeTimeout = managedCrag && lastError?.error?.type === 'timeout_error'
       return restoreUncommittedHop({
         ok: response.statusCode === 200 && !lastError && complete,
-        status: response.statusCode || 0,
+        status: nativeTimeout && !committed ? 504 : response.statusCode || 0,
         via: 'go-worker-stream',
 
         body: lastError || assembled || { type: 'message', role: 'assistant', content: [] },
@@ -1091,7 +1220,7 @@ export async function streamGoWorker({
         sawMessageStop,
         ...timing.snapshot(),
         committed,
-        terminalState,
+        terminalState: nativeTimeout && !committed ? 'rejected' : terminalState,
         transportError: false,
         threadBetas: prepared.thread,
       })

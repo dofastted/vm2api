@@ -15,6 +15,8 @@ import {
   rustKernelHealth,
   rustKernelReachable,
   rustKernelBusy,
+  gatewayPolicyReady,
+  supportsGatewayPolicy,
   isNeedsRefreshResult,
   kernelFaults,
 } from './rust-kernel-client.mjs'
@@ -66,17 +68,35 @@ export function rustShouldWaitForSlot(health, inflight = 0) {
   return rustKernelBusy(health) || Number(inflight) > 0
 }
 
-export async function waitForReadySlot(exec, timeoutMs = DEFAULT_SLOT_WAIT_MS, pollMs = DEFAULT_SLOT_POLL_MS) {
+function rustHopReady(health) {
+  // Native admission can resume a continuation or queue even with no free slot.
+  if (supportsGatewayPolicy(health)) return gatewayPolicyReady(health)
+  return rustKernelReachable(health)
+}
+
+function hopSlotWaitDeadline({ slotWaitDeadlineMs, slotWaitMs } = {}) {
+  if (Number.isFinite(slotWaitDeadlineMs)) return slotWaitDeadlineMs
+  return Date.now() + (Number.isFinite(slotWaitMs) ? Math.max(0, slotWaitMs) : 0)
+}
+
+export async function waitForReadySlot(
+  exec,
+  timeoutMs = DEFAULT_SLOT_WAIT_MS,
+  pollMs = DEFAULT_SLOT_POLL_MS,
+  initialHealth = null,
+) {
   const parsed = Number(timeoutMs)
   const waitMs = Number.isFinite(parsed) ? Math.max(0, parsed) : DEFAULT_SLOT_WAIT_MS
   const deadline = Date.now() + waitMs
   const gap = Math.max(40, Number(pollMs) || DEFAULT_SLOT_POLL_MS)
-  let last = await rustKernelHealth(exec, { timeoutMs: 400 })
-  if (rustKernelReachable(last)) return { ok: true, reason: 'already_up', health: last }
-  while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, gap))
-    last = await rustKernelHealth(exec, { timeoutMs: 400 })
-    if (rustKernelReachable(last)) return { ok: true, reason: 'slot_ready', health: last }
+  let last = initialHealth || (await rustKernelHealth(exec, { timeoutMs: 400 }))
+  if (rustHopReady(last)) return { ok: true, reason: 'already_up', health: last }
+  for (let remaining = deadline - Date.now(); remaining > 0; remaining = deadline - Date.now()) {
+    await new Promise((resolve) => setTimeout(resolve, initialHealth ? Math.min(gap, remaining) : gap))
+    const probeBudget = deadline - Date.now()
+    if (initialHealth && probeBudget <= 0) break
+    last = await rustKernelHealth(exec, { timeoutMs: initialHealth ? Math.min(400, probeBudget) : 400 })
+    if (rustHopReady(last)) return { ok: true, reason: 'slot_ready', health: last }
   }
   return { ok: false, reason: 'slot_busy', health: last, error: 'rust kernel has no free slot' }
 }
@@ -185,7 +205,7 @@ async function prepareSlotCredentials(exec) {
   ensureOfficialCredentialLink(exec.homeDir, ids || {})
 }
 
-async function prepareRust(exec, { ensure, routing, slotWaitMs } = {}) {
+async function prepareRust(exec, { ensure, routing, slotWaitMs, slotWaitDeadlineMs } = {}) {
   await awaitWrapRecycle(exec)
   const fault = kernelFaults.get(cacheKey(exec))
   if (fault) return { ok: false, reason: 'kernel_unavailable', error: fault }
@@ -193,11 +213,11 @@ async function prepareRust(exec, { ensure, routing, slotWaitMs } = {}) {
   await prepareSlotCredentials(exec)
   const ttl = rustHealthTtlMs(routing)
   const cached = peekRustHealth(exec, ttl)
-  if (cached && rustKernelReachable(cached.health)) {
+  if (cached && rustHopReady(cached.health)) {
     return { ok: true, reason: 'health_cache', health: cached.health }
   }
   const health = await rustKernelHealth(exec, { timeoutMs: 800 })
-  if (rustKernelReachable(health)) {
+  if (rustHopReady(health)) {
     const ready = { ok: true, reason: 'already_up', health }
     rememberRustHealth(exec, ready)
     return ready
@@ -212,7 +232,15 @@ async function prepareRust(exec, { ensure, routing, slotWaitMs } = {}) {
     }
   }
   if (rustShouldWaitForSlot(health, wrapHopInflight(exec))) {
-    const waited = await waitForReadySlot(exec, resolveHopSlotWaitMs({ remainingBudgetMs: slotWaitMs, routing }))
+    const managed = supportsGatewayPolicy(health)
+    const remainingBudgetMs =
+      managed && Number.isFinite(slotWaitDeadlineMs) ? Math.max(0, slotWaitDeadlineMs - Date.now()) : slotWaitMs
+    const waited = await waitForReadySlot(
+      exec,
+      resolveHopSlotWaitMs({ remainingBudgetMs, routing }),
+      DEFAULT_SLOT_POLL_MS,
+      managed ? health : null,
+    )
     if (waited?.ok) {
       rememberRustHealth(exec, waited)
       return waited
@@ -224,18 +252,20 @@ async function prepareRust(exec, { ensure, routing, slotWaitMs } = {}) {
 }
 
 // Resolve before shaping the attempt; the same worker report gates serialization.
-export async function prepareInferenceHop({ exec, routing = {}, slotWaitMs, ensureRust } = {}) {
+export async function prepareInferenceHop({ exec, routing = {}, slotWaitMs, slotWaitDeadlineMs, ensureRust } = {}) {
+  const deadline = hopSlotWaitDeadline({ slotWaitDeadlineMs, slotWaitMs })
   const projectRoot = exec?.projectRoot || (exec?.homeDir ? path.resolve(exec.homeDir, '../../..') : '')
   const licensed = checkCragLicense(projectRoot, exec?.vm, routing)
   if (!licensed.ok) return { rejection: cragLicenseDeniedResult(licensed) }
   const decision = resolveHopEngine(exec?.vm, routing)
   if (decision.blocked) return { decision }
-  const ready = await prepareRust(exec, { ensure: ensureRust, routing, slotWaitMs })
-  return { decision, ready }
+  const ready = await prepareRust(exec, { ensure: ensureRust, routing, slotWaitMs, slotWaitDeadlineMs: deadline })
+  return { decision, ready, slotWaitDeadlineMs: deadline }
 }
 
 async function runHop({ mode, opts }) {
-  const { rejection, decision, ready } = opts.preparedHop || (await prepareInferenceHop(opts))
+  const prepared = opts.preparedHop || (await prepareInferenceHop(opts))
+  const { rejection, decision, ready } = prepared
   if (rejection) return rejection
   const engine = 'rust'
   let reason = decision.reason
@@ -274,7 +304,14 @@ async function runHop({ mode, opts }) {
   }
   const send = mode === 'stream' ? streamRustKernel : callRustKernel
   // The worker that passed readiness may not match the scheduler's snapshot.
-  const sendOpts = { ...opts, exec: { ...opts.exec, workerStatus: ready.health } }
+  const managedCrag =
+    gatewayPolicyReady(ready.health) && (opts.requestPath ?? '/internal/v1/messages') === '/internal/v1/messages'
+  const sendOpts = {
+    ...opts,
+    exec: { ...opts.exec, workerStatus: ready.health },
+    managedCrag,
+    slotWaitDeadlineMs: prepared.slotWaitDeadlineMs ?? hopSlotWaitDeadline(opts),
+  }
   beginWrapHop(opts.exec)
   let result
   try {
@@ -282,16 +319,20 @@ async function runHop({ mode, opts }) {
     noteWrapHop(opts.exec)
     if (opts.signal?.aborted || isClientCancelledResult(result)) {
       result = clientCancelledResult(result)
-    } else if (result.transportError === true && result.committed !== true) {
+    } else if (
+      result.transportError === true &&
+      result.committed !== true &&
+      !(managedCrag && result.body?.error?.code === 'worker_timeout')
+    ) {
       result = await send(sendOpts)
       result = { ...result, rust_transport_retried: true }
       noteWrapHop(opts.exec)
     }
-    if (!isClientCancelledResult(result) && isNeedsRefreshResult(result)) {
+    if (!opts.signal?.aborted && !isClientCancelledResult(result) && isNeedsRefreshResult(result)) {
       const ensure = opts.ensureCredential || ensureWorkerCredential
       const ensured = await ensure(opts.exec, { force: true })
       if (ensured?.ok !== true) result = credentialEnsureFailure(result, ensured)
-      else {
+      else if (!opts.signal?.aborted) {
         // The CLI invalidates its OAuth cache from the shared credential file
         // before creating each API client. Recycling here kills sibling hops.
         result = await send(sendOpts)
@@ -299,6 +340,7 @@ async function runHop({ mode, opts }) {
         noteWrapHop(opts.exec)
       }
     }
+    if (opts.signal?.aborted) result = clientCancelledResult(result)
     return {
       ...result,
       engine,

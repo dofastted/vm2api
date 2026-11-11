@@ -45,6 +45,7 @@ import {
   rustKernelBusy,
   rustKernelProcessUp,
   rustKernelReachable,
+  supportsGatewayPolicy,
 } from '../transport/rust-kernel-client.mjs'
 import { resolveSessionSlots } from '../vm/slot-engine.mjs'
 import { SeatPlanner, rankSeatCandidates } from './seat-planner.mjs'
@@ -508,6 +509,7 @@ export class PoolScheduler extends EventEmitter {
     const failoverDeadline = Number(deadline) || null
     const defaultPlanMs = stickyKey ? this.config.sticky_wait_timeout_ms : this.config.fallback_wait_timeout_ms
     const loopDeadline = failoverDeadline || startedAt + defaultPlanMs
+    let queuedDeadline = Infinity
     const finishReserve = (selected, reservation) => ({
       ...selected,
       ...reservation,
@@ -524,6 +526,12 @@ export class PoolScheduler extends EventEmitter {
         startedAt,
         loopDeadline,
         sticky: selected.selectionReason === 'sticky',
+      }),
+      slotWaitDeadlineMs: this.slotWaitDeadlineMs({
+        startedAt,
+        loopDeadline: Math.min(loopDeadline, queuedDeadline),
+        sticky: selected.selectionReason === 'sticky',
+        allowWait,
       }),
     })
     for (;;) {
@@ -612,15 +620,28 @@ export class PoolScheduler extends EventEmitter {
         stickyCleared,
         requestDeadline: loopDeadline,
       })
-      const waitDeadline = waitPlan?.deadline || loopDeadline
+      const phaseDeadline = Math.min(
+        queuedDeadline,
+        this.slotWaitDeadlineMs({ startedAt, loopDeadline, sticky: waitPlan?.sticky, allowWait }),
+      )
+      const waitTarget = waitPool.find((candidate) => candidate.vmId === waitPlan?.vmId)
+      // Leave legacy direct waits unchanged; only capable workers share this
+      // absolute phase deadline with the gateway queue.
+      const waitDeadline = supportsGatewayPolicy(waitTarget?.workerStatus)
+        ? phaseDeadline
+        : waitPlan?.deadline || loopDeadline
       if (wakeAts.length && Math.min(...wakeAts) >= waitDeadline && !concurrencyWait) {
         return fail('all_accounts_busy', waitCandidates, waitAvailable, waitPool)
       }
-      if (!waitPlan || waitPlan.timeoutMs <= 0) {
+      if (!waitPlan || waitPlan.timeoutMs <= 0 || waitDeadline <= now) {
         return fail('all_accounts_busy', waitCandidates, waitAvailable, waitPool)
       }
-      const waitCap = Math.min(waitDeadline, loopDeadline)
-      const sliceDeadline = wakeAts.length ? Math.min(waitCap, ...wakeAts) : staleWindowWake ? now + 1 : waitCap
+      queuedDeadline = phaseDeadline
+      const sliceDeadline = wakeAts.length
+        ? Math.min(waitDeadline, ...wakeAts)
+        : staleWindowWake
+          ? now + 1
+          : waitDeadline
       const queuedAt = Date.now()
       const waited = await this.waitForCapacity({
         signal,
@@ -633,7 +654,7 @@ export class PoolScheduler extends EventEmitter {
       queueWaitMs += Date.now() - queuedAt
       // Notify continues the loop and re-reads eligibility from scratch.
       // Only a wait-plan / failover deadline timeout is all_accounts_busy.
-      if (!waited?.woken && sliceDeadline >= waitCap) {
+      if (!waited?.woken && sliceDeadline >= waitDeadline) {
         return fail('all_accounts_busy', waitCandidates, waitAvailable, waitPool)
       }
     }
@@ -697,6 +718,10 @@ export class PoolScheduler extends EventEmitter {
     }
     const finish = (granted) => {
       consumed = true
+      // The handoff to a managed worker inherits the phase that granted the
+      // seat, not a fresh sticky wait. Preserve the legacy relative value below.
+      const phaseDeadline = ticket?.grantedDeadline
+      const sticky = ['seat-held', 'sticky', 'device-affinity', 'family-affinity'].includes(granted.selectionReason)
       return {
         ...granted.candidate,
         ...granted.reservation,
@@ -707,6 +732,10 @@ export class PoolScheduler extends EventEmitter {
         stickyCleared,
         ...timings(),
         slotWaitMs: this.remainingSlotWaitMs({ startedAt: Date.now(), loopDeadline: failoverDeadline, sticky: true }),
+        slotWaitDeadlineMs:
+          allowWait && phaseDeadline != null
+            ? Math.min(failoverDeadline, phaseDeadline)
+            : this.slotWaitDeadlineMs({ startedAt, loopDeadline: failoverDeadline, sticky, allowWait }),
       }
     }
     try {
@@ -961,9 +990,13 @@ export class PoolScheduler extends EventEmitter {
       accepts: (id) => ticket.kind === 'global' && ticket.candidates.has(id),
       vmIds: () => [...ticket.candidates.keys()],
       tryGrant: (id) => {
+        // Opening a seat can rehome the ticket during claimSeat. Capture
+        // the granting phase before its deadline is replaced.
+        const grantingDeadline = ticket.kind === 'seat' ? ticket.stickyUntil : ticket.deadline
         const granted = this.claimSeat(ticket.seatKey, ticket.candidates.get(id), 'queued')
         if (!granted) return false
         ticket.granted = granted
+        ticket.grantedDeadline = grantingDeadline
         ticket.grantedAt = Date.now()
         return true
       },
@@ -1969,6 +2002,12 @@ export class PoolScheduler extends EventEmitter {
     const failoverLeft = Number.isFinite(loopDeadline) ? loopDeadline - now : Infinity
     const planLeft = base - (now - Number(startedAt || now))
     return Math.max(0, Math.min(base, failoverLeft, planLeft))
+  }
+
+  slotWaitDeadlineMs({ startedAt, loopDeadline, sticky, allowWait }) {
+    if (!allowWait) return Date.now()
+    const base = sticky ? this.config.sticky_wait_timeout_ms : this.config.fallback_wait_timeout_ms
+    return Math.min(loopDeadline, startedAt + base)
   }
 
   resolveWaitPlan({ candidates = [], stickyKey = null, stickyCleared = false, requestDeadline = null } = {}) {
