@@ -45,7 +45,7 @@ import {
   mergeOpenAIQuotaPolicy,
   normalizeOpenAIQuotaPolicy,
 } from '../pool/openai-quota-policy.mjs'
-import { rustKernelHealth } from '../transport/rust-kernel-client.mjs'
+import { gatewayPolicyReady, rustKernelHealth } from '../transport/rust-kernel-client.mjs'
 import { requestKernelReloadWhenIdle, syncClaudeKernelConfigs } from '../transport/rust-kernel-supervisor.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
@@ -394,17 +394,27 @@ export function createRoutingRuntime(ctx) {
     return syncClaudeKernelConfigs(ctx.cfg.paths.project, routingConfig)
   }
 
-  // kernel.json hot-reloads, but the job watchdog reads its idle limit from env at start.
-  function reloadClaudeKernelsWhenIdle(routingConfig) {
+  // Legacy watchdogs read idle limits at startup. Native policy-capable
+  // workers get the new limit on each request instead.
+  async function reloadClaudeKernelsWhenIdle(routingConfig, { idleOnly }) {
     const project = ctx.cfg.paths.project
-    let queued = 0
+    const pending = []
     for (const { id } of listVms(project)) {
       const vm = getVm(project, id)
       if (!vm || isCodexVm(vm) || vm.status !== 'running') continue
       if (resolveInferenceEngine(vm, routingConfig) !== 'rust') continue
-      if (requestKernelReloadWhenIdle(slotExec(project, vm)).ok) queued += 1
+      const exec = slotExec(project, vm)
+      pending.push(
+        (async () => {
+          if (idleOnly) {
+            const health = await rustKernelHealth(exec, { timeoutMs: 800 }).catch(() => null)
+            if (gatewayPolicyReady(health)) return false
+          }
+          return requestKernelReloadWhenIdle(exec).ok
+        })(),
+      )
     }
-    return queued
+    return (await Promise.all(pending)).filter(Boolean).length
   }
 
   // Native slots hot-read kernel.json; publication must be acknowledged per VM.
@@ -541,8 +551,10 @@ export function createRoutingRuntime(ctx) {
       requestBytesChanged
         ? syncKernelPanelConfig(routingConfig)
         : null
-    // Stream idle / body-limit still need an idle restart; CCH and sticky-slot TTL hot-read kernel.json.
-    const kernelReload = idleChanged || requestBytesChanged ? reloadClaudeKernelsWhenIdle(routingConfig) : 0
+    const reloadNeeded =
+      idleChanged || requestBytesChanged
+        ? reloadClaudeKernelsWhenIdle(routingConfig, { idleOnly: !requestBytesChanged })
+        : 0
     const telemetrySync =
       telemetryUploadInterval(routingConfig) !== prevUploadInterval
         ? await syncTelemetryUploadInterval(routingConfig)
@@ -552,6 +564,7 @@ export function createRoutingRuntime(ctx) {
     // still run (the panel sends `failover` with every routing save).
     if (body.pool) configureUnitCircuit(routingConfig)
     if (body.failover) ctx.failoverRunner?.reloadConfig?.(routingConfig.failover || {})
+    const kernelReload = await reloadNeeded
     try {
       return {
         concurrency: applyRoutingTierConcurrency(routingConfig.tiers),

@@ -12,6 +12,7 @@ import {
   workerPaths,
 } from './go-worker-client.mjs'
 import { readWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
+import { cragV2KernelActive } from '../protocol/crag-print-prompt.mjs'
 import { checkCragLicense, cragLicenseDeniedResult } from '../vm/crag-license.mjs'
 
 function licenseCheck(opts) {
@@ -85,6 +86,21 @@ export async function rustKernelHealth(exec, opts = {}) {
     ? { ...health, source: String(health.source).replace(/go-worker/g, 'rust-kernel') }
     : health
   return withCragCredential(exec, reported)
+}
+
+export function supportsGatewayPolicy(health) {
+  return health?.gateway_policy_v1 === true && cragV2KernelActive({ health })
+}
+
+export function gatewayPolicyReady(health) {
+  return (
+    supportsGatewayPolicy(health) &&
+    health.ok === true &&
+    (health.status == null || health.status === 200) &&
+    health.healthy !== false &&
+    health.ready !== false &&
+    health.recovering !== true
+  )
 }
 
 export function rustKernelProcessUp(health) {

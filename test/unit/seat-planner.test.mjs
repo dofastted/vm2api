@@ -498,6 +498,24 @@ test('balanced spreads 4 devices 2/2, fill packs 4/0; headroom then vmId break t
   assert.equal(rankSeatCandidates(even, { strategy: 'balanced', openOf })[0].vmId, 'vm-a')
 })
 
+test('a granted global ticket keeps its original fallback deadline for native admission', async (t) => {
+  const pool = setup(t, [{ id: 'vm-01', policy: { sessionSlots: 1 } }], { fallback: 1000, sticky: 5000 })
+  const held = await seat(pool, 'held')
+  const started = Date.now()
+  const pending = seat(pool, 'queued', { deadline: started + 8000 })
+  await waitFor(() => pool.planner.pending() === 1)
+  const ticketDeadline = pool.planner.globalQueue[0].deadline
+  held.release()
+  const granted = await pending
+  assert.equal(granted.ok, true)
+  assert.equal(granted.slotWaitDeadlineMs, ticketDeadline)
+  granted.release()
+  const noWait = await seat(pool, 'no-wait', { allowWait: false })
+  assert.equal(noWait.ok, true)
+  assert.ok(noWait.slotWaitDeadlineMs <= Date.now())
+  noWait.release()
+})
+
 test('queue timeout is pool_queue_timeout', async (t) => {
   const pool = setup(t, [{ id: 'vm-01', policy: { sessionSlots: 1 } }], { fallback: 80 })
   const held = await seat(pool, 'd1')

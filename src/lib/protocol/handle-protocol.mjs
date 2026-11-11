@@ -4,6 +4,7 @@
  */
 import { applyIntercept } from '../core/intercept.mjs'
 import { resolveStreamIdleTimeoutMs, inboundBodyLimit, queueKeepaliveDelayMs } from '../core/config.mjs'
+import { hashKey } from '../core/security.mjs'
 import { applyEagerToolStreaming } from './eager-tool-streaming.mjs'
 import { validateBetweenToolsThinking, validateToolChoice, getCapabilities } from './model-policy.mjs'
 import { ToolResultPruneCache, dshPruneScope } from './tool-result-prune-cache.mjs'
@@ -563,6 +564,7 @@ export function createHandleProtocol(deps) {
     onOutboundHeaders = null,
     redactionPrincipal = '',
     redactionSession = '',
+    tenantId = '',
   }) {
     const assembler = createClaudeMessageAssembler()
     const workerResult = await dispatchStreamInference({
@@ -584,6 +586,8 @@ export function createHandleProtocol(deps) {
       repaired,
       requestContext,
       slotWaitMs: candidate.slotWaitMs,
+      slotWaitDeadlineMs: candidate.slotWaitDeadlineMs,
+      tenantId,
       noGoFallback,
       ensureCredential: (exec) => ensureWorkerCredential(exec),
       redactionPrincipal,
@@ -1475,6 +1479,14 @@ export function createHandleProtocol(deps) {
     const queueKeepaliveDelay = queueKeepaliveDelayMs(getRouting(), cfg.limits?.queue_keepalive_delay_ms)
     const streamIdleTimeoutMs = resolveStreamIdleTimeoutMs(getRouting(), cfg)
     const managedKey = req.apiKeyRecord || null
+    // Only the authentication layer supplies these identities. Namespace the
+    // sources so a key ID cannot share native sessions with a panel login.
+    let tenantPrincipal = ''
+    if (managedKey?.id != null) tenantPrincipal = `key:${managedKey.id}`
+    else if (req.apiKeyKind === 'master') tenantPrincipal = 'master'
+    else if (req.panelUserId != null) tenantPrincipal = `panel-id:${req.panelUserId}`
+    else if (req.panelUser) tenantPrincipal = `panel-user:${req.panelUser}`
+    const tenantId = tenantPrincipal ? hashKey(`crag-tenant:${tenantPrincipal}`) : ''
     if (managedKey) {
       const gate = apiKeyStore.acquire(managedKey)
       if (!gate.ok) {
@@ -1678,6 +1690,7 @@ export function createHandleProtocol(deps) {
               exec: selected.exec,
               routing: transportRouting,
               slotWaitMs: selected.slotWaitMs,
+              slotWaitDeadlineMs: selected.slotWaitDeadlineMs,
             })
             const cragPrint =
               !requestContext &&
@@ -1969,6 +1982,7 @@ export function createHandleProtocol(deps) {
               onOutboundHeaders: noteOutboundHeaders,
               redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
               redactionSession: String(req.headers?.['x-claude-code-session-id'] || ''),
+              tenantId,
             })
           }
           let state
@@ -2017,6 +2031,8 @@ export function createHandleProtocol(deps) {
               want1m,
               routing: attemptMeta?.transportRouting ?? getRouting(),
               slotWaitMs: candidate.slotWaitMs,
+              slotWaitDeadlineMs: candidate.slotWaitDeadlineMs,
+              tenantId,
               noGoFallback: !!pinVmId,
               ensureCredential: (exec) => ensureWorkerCredential(exec),
               redactionPrincipal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),

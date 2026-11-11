@@ -355,6 +355,230 @@ unixTest('transport and credential retries preserve the readiness-gated CRAG env
   }
 })
 
+unixTest('managed CRAG retries consume the original queue deadline', async (t) => {
+  const previous = process.env.KIN_KERNEL_BIN
+  const posted = []
+  const tenantId = 'a'.repeat(64)
+  const startedAt = Date.now()
+  let now = startedAt
+  t.mock.method(Date, 'now', () => now)
+  const fx = await kernelFixture(async (req, res) => {
+    posted.push({ path: req.url, headers: req.headers, envelope: await readPostedEnvelope(req) })
+    if (posted.length === 1) {
+      now += 300
+      res.destroy()
+    } else if (posted.length === 2) {
+      res.writeHead(401, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ type: 'error', error: { code: 'needs_refresh', message: 'credential needs refresh' } }))
+    } else {
+      // JSON headers arrive after the first-byte budget, as they can on native CRAG.
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      respondToCragHop(res, false)
+    }
+  })
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  try {
+    const result = await dispatchCallInference({
+      exec: { ...fx.exec, workerStatus: cragHealth([]) },
+      envelope: {
+        body: { ...cragHopBody('append'), gateway_policy: { queue_wait_ms: 5000 } },
+        headers: { 'X-Tenant-ID': 'prebuilt-tenant' },
+        gateway_policy: { queue_wait_ms: 5000 },
+      },
+      reqHeaders: { 'x-tenant-id': 'inbound-tenant' },
+      routing: { inference: { engine: 'rust', session_idle_ttl_seconds: 75 } },
+      tenantId,
+      slotWaitMs: 1000,
+      slotWaitDeadlineMs: startedAt + 1000,
+      timeoutMs: 1,
+      idleTimeoutMs: 25_000.4,
+      ensureRust: async () => {
+        now += 200
+        return { ok: true, health: { ...cragHealth([]), gateway_policy_v1: true } }
+      },
+      ensureCredential: async () => {
+        now += 600
+        return { ok: true }
+      },
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.credential_retried, true)
+    assert.equal(posted.length, 3)
+    for (const [i, hop] of posted.entries()) {
+      assert.equal(hop.path, '/internal/v1/messages')
+      assert.equal(hop.headers['x-kin-internal-token'], 'internal-test')
+      assert.equal(hop.headers['x-tenant-id'], tenantId)
+      assert.equal(Object.hasOwn(hop.envelope.body, 'gateway_policy'), false)
+      assert.equal(Object.hasOwn(hop.envelope.headers, 'X-Tenant-ID'), false)
+      assert.deepEqual(hop.envelope.gateway_policy, {
+        queue_wait_ms: [800, 500, 0][i],
+        first_byte_timeout_ms: 1,
+        stream_idle_timeout_ms: 25_000,
+        session_idle_ttl_seconds: 75,
+      })
+    }
+  } finally {
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+    await fx.close()
+  }
+})
+
+unixTest('only exact managed queue errors become local slot rejections', async () => {
+  const previous = process.env.KIN_KERNEL_BIN
+  const native = { ...cragHealth([]), gateway_policy_v1: true, ready: true, ready_slots: 0 }
+  const legacy = cragHealth([])
+  const replies = [
+    { status: 503, type: 'overloaded_error', message: 'runtime queue is full', busy: true },
+    { status: 504, type: 'timeout_error', message: 'runtime queue timeout', busy: true },
+    { status: 504, type: 'timeout_error', message: 'upstream first byte timeout' },
+    { status: 504, type: 'timeout_error', message: 'runtime queue timeout', legacy: true },
+  ]
+  let health = native
+  const posted = []
+  const fx = await kernelFixture(async (req, res) => {
+    if (req.url === '/internal/health') {
+      res.end(JSON.stringify(health))
+      return
+    }
+    const reply = replies[posted.length]
+    posted.push({ headers: req.headers, envelope: await readPostedEnvelope(req) })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    res.writeHead(reply.status, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ type: 'error', error: { type: reply.type, message: reply.message } }))
+  })
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  try {
+    for (const [i, reply] of replies.entries()) {
+      health = reply.legacy ? legacy : native
+      const dispatch = i === 0 ? dispatchCallInference : dispatchStreamInference
+      const result = await dispatch({
+        exec: { ...fx.exec, workerStatus: reply.legacy ? native : legacy },
+        body: { ...cragHopBody('append'), gateway_policy: { queue_wait_ms: 5000 } },
+        reqHeaders: { 'x-tenant-id': 'inbound-tenant' },
+        routing: { inference: { engine: 'rust', health_ttl_ms: 0 } },
+        deliveryMode: 'verified',
+        slotWaitDeadlineMs: Date.now(),
+        timeoutMs: reply.legacy ? 3000 : 1,
+      })
+      assert.equal(result.status, reply.status)
+      assert.equal(result.body.error.code, reply.busy ? 'slot_busy' : undefined)
+      assert.equal(result.upstreamExecutions, reply.busy ? 0 : undefined)
+      if (reply.busy) assert.equal(result.terminalState, 'rejected')
+      assert.equal(posted[i].envelope.gateway_policy?.queue_wait_ms, reply.legacy ? undefined : 0)
+      assert.equal(Object.hasOwn(posted[i].envelope.body, 'gateway_policy'), false)
+      assert.equal(posted[i].headers['x-tenant-id'], undefined)
+    }
+    assert.equal(posted.length, replies.length)
+  } finally {
+    clearRustHealthCache(fx.exec.vmId)
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+    await fx.close()
+  }
+})
+
+unixTest('recovering native worker does not poll beyond the original slot budget', async () => {
+  const previous = process.env.KIN_KERNEL_BIN
+  let probes = 0
+  const fx = await kernelFixture((req, res) => {
+    assert.equal(req.url, '/internal/health')
+    probes++
+    res.end(JSON.stringify({ ...cragHealth([]), gateway_policy_v1: true, recovering: true, ready_slots: 0 }))
+  })
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  try {
+    const result = await dispatchCallInference({
+      exec: fx.exec,
+      body: cragHopBody('append'),
+      routing: { inference: { engine: 'rust', health_ttl_ms: 0 } },
+      slotWaitMs: 1000,
+      slotWaitDeadlineMs: Date.now() - 1,
+    })
+    assert.equal(result.body.error.code, 'slot_busy')
+    assert.equal(probes, 1)
+  } finally {
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+    await fx.close()
+  }
+})
+
+unixTest('managed timeout SSE remains a timeout before and after downstream commit', async () => {
+  const previous = process.env.KIN_KERNEL_BIN
+  let visible = false
+  const fx = await kernelFixture(async (req, res) => {
+    await readPostedEnvelope(req)
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.write('data: {"type":"message_start","message":{"content":[]}}\n\n')
+    if (visible)
+      res.write('data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}\n\n')
+    res.end('data: {"type":"error","error":{"type":"timeout_error","message":"request timed out"}}\n\n')
+  })
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  try {
+    const dispatch = () =>
+      dispatchStreamInference({
+        exec: fx.exec,
+        body: cragHopBody('append'),
+        routing: { inference: { engine: 'rust' } },
+        timeoutMs: 3000,
+        ensureRust: async () => ({ ok: true, health: { ...cragHealth([]), gateway_policy_v1: true } }),
+      })
+    const uncommitted = await dispatch()
+    assert.equal(uncommitted.committed, false)
+    assert.equal(uncommitted.status, 504)
+    assert.equal(uncommitted.terminalState, 'rejected')
+    assert.equal(uncommitted.body.error.type, 'timeout_error')
+    visible = true
+    const committed = await dispatch()
+    assert.equal(committed.committed, true)
+    assert.equal(committed.status, 200)
+    assert.equal(committed.terminalState, 'incomplete')
+    assert.equal(committed.body.error.type, 'timeout_error')
+  } finally {
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+    await fx.close()
+  }
+})
+
+unixTest('managed realtime header timeout is not replayed', async (t) => {
+  const previous = process.env.KIN_KERNEL_BIN
+  let posts = 0
+  let expireHeaderTimer
+  const fx = await kernelFixture(async (req, res) => {
+    await readPostedEnvelope(req)
+    posts++
+    if (expireHeaderTimer) expireHeaderTimer()
+    else respondToCragHop(res, true)
+  })
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  const schedule = globalThis.setTimeout
+  const headerTimers = t.mock.method(globalThis, 'setTimeout', (fn, ms, ...args) => {
+    if (ms === 5001) expireHeaderTimer = fn
+    return schedule(fn, ms, ...args)
+  })
+  try {
+    const result = await dispatchStreamInference({
+      exec: fx.exec,
+      body: cragHopBody('append'),
+      routing: { inference: { engine: 'rust' } },
+      slotWaitDeadlineMs: Date.now(),
+      timeoutMs: 1,
+      ensureRust: async () => ({ ok: true, health: { ...cragHealth([]), gateway_policy_v1: true } }),
+    })
+    assert.equal(result.body.error.code, 'worker_timeout')
+    assert.equal(result.rust_transport_retried, undefined)
+    assert.equal(headerTimers.mock.calls.filter(({ arguments: [, ms] }) => ms === 5001).length, 1)
+    assert.equal(posts, 1)
+  } finally {
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+    await fx.close()
+  }
+})
+
 unixTest('dispatchStreamInference uses rust socket when ready', async () => {
   const prev = process.env.KIN_KERNEL_BIN
   process.env.KIN_KERNEL_BIN = '/bin/true'
