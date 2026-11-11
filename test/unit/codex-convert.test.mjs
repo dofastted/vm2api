@@ -175,6 +175,22 @@ test('Codex hop drops max_output_tokens and keeps reasoning effort', () => {
   assert.equal(converted.body.reasoning.effort, 'high')
 })
 
+test('new GPT family requests keep ultra reasoning through each public dialect', () => {
+  for (const [protocol, body] of [
+    ['openai.responses', { model: 'gpt-6.2-astra', input: 'hello', reasoning: { effort: 'ultra' } }],
+    [
+      'openai.chat',
+      { model: 'gpt-6.2-sol', messages: [{ role: 'user', content: 'hello' }], reasoning_effort: 'ultra' },
+    ],
+    ['openai.completions', { model: 'gpt-6.2-sol', prompt: 'hello', reasoning_effort: 'ultra' }],
+  ]) {
+    const converted = toCodexResponses(protocol, body)
+    assert.equal(converted.ok, true)
+    assert.equal(converted.body.model, body.model)
+    assert.equal(converted.body.reasoning.effort, 'ultra')
+  }
+})
+
 test('anthropic base64 image converts to input_image data url', () => {
   const converted = toCodexResponses(
     'anthropic.messages',

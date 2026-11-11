@@ -244,6 +244,8 @@ export function completionsToCodexResponses(body = {}) {
     stream: body.stream !== false,
     store: false,
   }
+  if (body.reasoning) out.reasoning = body.reasoning
+  if (body.reasoning_effort) out.reasoning_effort = body.reasoning_effort
   if (body.prompt_cache_key) out.prompt_cache_key = body.prompt_cache_key
   if (body.service_tier != null) out.service_tier = body.service_tier
   return out
@@ -260,7 +262,7 @@ export function codexTextInput(text) {
   ]
 }
 
-export const CODEX_REASONING_EFFORTS = Object.freeze(['none', 'low', 'medium', 'high', 'xhigh', 'max'])
+export const CODEX_REASONING_EFFORTS = Object.freeze(['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
 export const DEFAULT_CODEX_REASONING_EFFORT = 'medium'
 
 export function normalizeCodexReasoningEffort(raw) {

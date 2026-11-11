@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Codex 客户端兼容 pin 更新到已核实的官方 `0.167.1`，补齐参考目录中的 Astra、6.1 Sol/Terra 和 5.6 家族静态回退项；账号实时目录仍优先，新增型号沿用默认关闭，不猜测 6.2 灰度型号的能力或价格。修复 `ultra` 被降到 `medium` 及 Completions 丢失推理参数，槽位测试、定时计划和日志同步支持。
 - 修复协议页选择 `cc_entrypoint=cli` 后，面板协议清洗与 worker envelope 仍输出 `(external, sdk-cli)`：公共出站头组装读取当前路由配置，保留槽位版本 pin，不再让槽位身份的旧入口覆盖面板设置；Setup Token / API Key 的 inference-only UA 不变。增加入口往返切换、调用方 UA 隔离和凭证边界回归，删除历史抓包中固定旧入口 / runtime / prompt index 的过时断言。
 - 验证面板 API 保存 `cli → sdk-cli → cli` 后 UA 与 billing 同步变化，并通过真实 kin-kernel → cli-node → 本地 HTTP 抓包验证最终 UA。升级此修复只需更新 Node 控制面并重启；现有 cli-node 已支持 `kernel.json.cc_entrypoint`，本次不更换 payload 或线上配置。
 

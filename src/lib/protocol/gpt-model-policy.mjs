@@ -125,9 +125,17 @@ function normalizeImageTools(raw, base = null) {
 export function seedGptPolicy() {
   const models = {}
   for (const [id, extra] of [
+    ['gpt-6-astra', { display_name: 'GPT-6 Astra', sort: 66 }],
+    ['gpt-6.1-sol', { display_name: 'GPT-6.1 Sol', sort: 67 }],
+    [
+      'gpt-6.1-terra',
+      { display_name: 'GPT-6.1 Terra', sort: 68, capabilities: { ...CAP_GPT, context_window: 500000 } },
+    ],
     ['gpt-6-sol', { display_name: 'GPT-6 Sol', sort: 70 }],
     ['gpt-6-luna', { display_name: 'GPT-6 Luna', sort: 71 }],
-    ['gpt-5.6', { display_name: 'GPT-5.6', sort: 76 }],
+    ['gpt-5.6-sol', { display_name: 'GPT-5.6 Sol', sort: 73 }],
+    ['gpt-5.6-terra', { display_name: 'GPT-5.6 Terra', sort: 74 }],
+    ['gpt-5.6-luna', { display_name: 'GPT-5.6 Luna', sort: 75 }],
     ['gpt-5.5', { display_name: 'GPT-5.5', sort: 77 }],
     ['gpt-5.4', { display_name: 'GPT-5.4', sort: 80, aliases: ['codex'] }],
     ['gpt-5.4-mini', { display_name: 'GPT-5.4 Mini', sort: 81 }],
@@ -307,6 +315,9 @@ export function syncGptIdsIntoPolicy(ids = [], { displayNameOf = null } = {}) {
     if (!prev) added.push(row.id)
     next[row.id] = entry(row.id, {
       ...prev,
+      // A new catalog ID has no local capability or token-limit evidence yet.
+      capabilities: prev?.capabilities || {},
+      params: prev?.params || {},
       display_name: row.display_name || prev?.display_name || displayNameOf?.(row.id) || row.id,
       enabled: prev ? prev.enabled !== false : false,
       source: 'codex',

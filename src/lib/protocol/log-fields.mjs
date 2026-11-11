@@ -3,7 +3,7 @@
  * Kept dependency-free so protocol handlers can import them without the DB.
  */
 
-export const REASONING_EFFORTS = new Set(['none', 'minimal', 'auto', 'low', 'medium', 'high', 'xhigh', 'max'])
+export const REASONING_EFFORTS = new Set(['none', 'minimal', 'auto', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
 
 /**
  * Requested thinking effort across inbound dialects: Anthropic
