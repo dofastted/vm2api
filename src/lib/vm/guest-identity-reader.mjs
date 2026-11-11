@@ -177,6 +177,7 @@ hw_json=$(printf '{"cpu_model":%s,"cpu_cores":%s,"memory_bytes":%s,"root_disk":%
 [ -n "$hw_json" ] || hw_json='{}'
 set -e
 printf '%s\\000' "$hw_json"
+printf '%s\\000' "\${VERSION_ID:-}"
 `
 
 export async function readGuestIdentity(exec, _requestPath, { timeoutMs = 5000, run = runFile } = {}) {
@@ -192,24 +193,19 @@ export async function readGuestIdentity(exec, _requestPath, { timeoutMs = 5000, 
       ...(env ? { env } : {}),
     })
     const fields = stdout.split('\0')
-    if (
-      fields[fields.length - 1] !== '' ||
-      (fields.length !== 9 && fields.length !== 10) ||
-      !fields[0] ||
-      !fields[3] ||
-      !fields[4]
-    ) {
+    if (fields[fields.length - 1] !== '' || fields.length !== 11 || !fields[0] || !fields[3] || !fields[4]) {
       return fail('guest_identity_invalid', 'Guest returned incomplete identity data')
     }
     const [hostname, os_id, os_pretty, kernel_release, arch, machine_id, timezone, locale] = fields
     const collected_at = new Date().toISOString()
-    const hardware = fields.length === 10 ? parseGuestHardware(fields[8]) : null
+    const hardware = parseGuestHardware(fields[8])
     const identity = {
       schema_version: '1',
       runtime_kind: runtimeKind(vm),
       hostname,
       os_id,
       os_pretty,
+      os_version: fields[9],
       kernel_release,
       arch,
       machine_id,

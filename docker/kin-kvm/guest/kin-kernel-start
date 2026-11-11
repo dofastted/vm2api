@@ -3,6 +3,9 @@
 set -eu
 for p in /home/kincli/.kin/kin-kernel /usr/local/bin/kin-kernel /opt/kin/kin-kernel; do
   if [ -x "$p" ]; then
+    if [ -n "${KIN_KERNEL_CPU_CEILING:-}" ]; then
+      exec /bin/sh /usr/local/sbin/kin-kernel-cpu "$p" --gateway-worker --config /run/kin/kernel.json
+    fi
     exec "$p" --gateway-worker --config /run/kin/kernel.json
   fi
 done

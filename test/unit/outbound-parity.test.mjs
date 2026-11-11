@@ -23,6 +23,41 @@ import {
 } from '../../src/lib/protocol/claude-code-inbound.mjs'
 import { buildVmTestInbound } from '../../src/lib/admin/vm-test-chat.mjs'
 import { classifyClient } from '../../src/lib/protocol/client-fingerprint.mjs'
+import { finalizeWorkerPayload } from '../../src/lib/transport/go-worker-client.mjs'
+
+test('saved entrypoint overrides stale slot and caller UAs on both outbound boundaries', () => {
+  const body = { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hello' }] }
+  const routing = { compatibility: { cc_entrypoint: 'cli' } }
+  const identity = { userAgent: 'claude-cli/2.1.321 (external, sdk-cli)' }
+  const reqHeaders = { 'user-agent': 'claude-cli/9.9.9 (external, vscode)' }
+  for (const slotIdentity of [identity, {}]) {
+    for (const entrypoint of ['cli', 'sdk-cli', 'cli']) {
+      routing.compatibility.cc_entrypoint = entrypoint
+      const envelope = prepareOutboundEnvelope({ canonicalBody: body, identity: slotIdentity, reqHeaders, routing })
+      const worker = finalizeWorkerPayload({ body, identity: slotIdentity, reqHeaders, routing })
+      for (const outbound of [envelope, worker]) {
+        assert.equal(outbound.headers['user-agent'], `claude-cli/2.1.321 (external, ${entrypoint})`)
+        assert.equal(outbound.headers['x-stainless-lang'], 'js')
+      }
+    }
+  }
+  assert.equal(identity.userAgent, 'claude-cli/2.1.321 (external, sdk-cli)')
+})
+
+test('entrypoint selection leaves inference-only credential headers unchanged', () => {
+  const body = { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hello' }] }
+  for (const credentialMode of ['setup-token', 'official-setup-token', 'apikey']) {
+    for (const entrypoint of ['cli', 'sdk-cli']) {
+      const routing = { compatibility: { cc_entrypoint: entrypoint } }
+      const envelope = prepareOutboundEnvelope({ canonicalBody: body, identity: {}, credentialMode, routing })
+      const worker = finalizeWorkerPayload({ body, exec: { vm: { claude: { mode: credentialMode } } }, routing })
+      for (const outbound of [envelope, worker]) {
+        assert.equal(outbound.headers['user-agent'], 'kin-inference/1.0')
+        assert.equal(outbound.headers['x-stainless-lang'], undefined)
+      }
+    }
+  }
+})
 
 function fixtureIdentity(homeDir) {
   return {

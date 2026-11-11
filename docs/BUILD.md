@@ -3,18 +3,26 @@
 git 里只有源码。`bin/`、`web/dist`、`share/crag` 与 `share/wrap-cli` 里的 ELF / glibc 都不进 git：
 
 - `web/dist` 与 `kin-api-kernel` 由源码编译（镜像构建内或本机）。
-- 生产验证过的 linux amd64 产物（`kin-kernel`、`kin-codex-kernel`、`kin-oauth-auth`、`kin-computer`、`kin-worker`、`kin-egress`、`kin-slot-gate`、`cli-node`、`cc-node`、crag kernel、glibc 2.39 shim）放在独立的 payload Release，由 [`deploy/payload.json`](../deploy/payload.json) 按 sha256 / 大小钉住。`npm run fetch:payload` 下载并校验到 `bin/` / `share/`；镜像构建同样按清单下载，校验不过即失败。
+- 生产验证过的 linux amd64 kernel / helper、Claude CLI、完整签名加密 CRAG native v2 包与 glibc shim 由 [`deploy/payload.json`](../deploy/payload.json) 按大小和 SHA-256 钉住。清单指向完整应用版本的 Release；`npm run fetch:payload` 与镜像构建使用同一份清单，校验失败即停止。
 
-换 payload：把新文件放到本机对应路径，然后
+## 完整应用交付
 
-```bash
-node scripts/fetch-payload.mjs --pin payload-YYYY.MM.DD     # 重算清单 sha256 / 大小并指向新 Release
-node scripts/fetch-payload.mjs --stage /tmp/payload          # 按 asset 名导出
-gh release create payload-YYYY.MM.DD /tmp/payload/* --prerelease --latest=false \
-  --title "slot payload YYYY.MM.DD" --notes "Pinned by deploy/payload.json"
-```
+发版必须先取得最新 `origin/main` 和最新应用正式版。正式版 tag 若包含尚未进入 `main` 的提交，先保留历史地合并，不能从旧本地分支或单一组件分支覆盖云端已发布功能。`v1.4.071` 同时包含最新主分支 Codex 改动与 `v1.4.070` 的 Claude 监看、CRAG 清单修复。
 
-再提交 `deploy/payload.json`。payload Release 必须 `--prerelease --latest=false`：一键脚本与面板按 `releases/latest` 找应用版本。
+1. 将最新完整正式版的全部 payload 资产下载、校验并展开；只替换此次确有更新且来源可核验的组件。不从未提交的本地 `bin/` 取出厂文件。
+2. 使用 `node scripts/fetch-payload.mjs --pin v<VERSION>` 重算清单，再以 `--check` 校验、`--stage <目录>` 导出全部同名资产。清单的 `release` 必须是面板支持的标准应用版本 tag。
+3. 提交完整清单、构建来源及应用 `VERSION` / `CHANGELOG.md`，创建并合并 PR。tag 必须落在包含上述提交的云端合并结果，不能重打历史 tag。
+4. 对自指同版本 Release 的清单，先上传完整资产到草稿 Release，再推送 tag 并发布该草稿；避免工作流下载尚不存在的资产。首次发布保持 prerelease / 非 Latest，构建完成后才切换正式版与应用 Latest。
+5. `release` 工作流必须完成全部 amd64 payload 资产、ARM64 helper、amd64/arm64 控制面镜像及多架构 manifest。必要时在同一不可变 tag 上手动触发 `gh workflow run release.yml --ref v<VERSION>`。不等待 CI 检查不等于省略发布构建。
+6. 核对完整附件、`payload.json`、`SHA256SUMS`、构建来源与两种镜像架构，再发布正式版并部署完整源码、前端和出厂 payload。槽内已有选择/缓存仍需排空并通过内核安装流程激活；仅换出厂文件不能证明运行中 CLI 已更新。
+
+`v1.4.071` 的全量 payload 纳入 Codex kernel `0.1.2`，`fetch:payload` 不再恢复旧 `0.1.0`。其余 kernel/helper、Claude `2.1.321` watch 修复版及签名 CRAG 包沿用云端 `v1.4.070` 的已发布字节，不混入本地并行工作区产物。
+
+## Codex 组件版本与历史资产
+
+Codex kernel `0.1.2` 是组件版本，不是应用版本；从 `v1.4.071` 起随完整应用清单、Release 和镜像交付。私有源码不进入公开 git，来源与工具链见 [0.1.2 构建记录](releases/codex-kernel-v0.1.2.json)。
+
+历史 `codex-kernel-v0.1.1` / `codex-kernel-v0.1.2` 的三个组件资产保持不变，作为可校验的来源记录，不作为完整应用升级的替代方案。正常升级使用应用 `v*` Release；不要把只替换 `bin/kin-codex-kernel` 当作完整部署。VM Analytics 的槽内身份采集、开关和出口边界见 [OpenAI 传输与隐私](PANEL_API.md#openai-传输与隐私)。
 
 ## 版本怎么记
 
