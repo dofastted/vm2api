@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 第三方出站工具名改写为 `mcp__` 时，同步改写历史 `tool_result` 内 `tool_reference.tool_name` 与 `tool_search_tool_result.tool_references[].tool_name`，修复工具搜索下一轮 400（#953）。
+
 ## 1.4.067 — 2026-11-11
 
 - 将 cli-node 交付更新为当前本地源码构建的 2.1.321，使用 UPX 5.0.2 压缩并验证；不再沿用旧下载缓存中的 CLI。
