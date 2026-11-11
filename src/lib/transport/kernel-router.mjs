@@ -223,20 +223,23 @@ async function prepareRust(exec, { ensure, routing, slotWaitMs } = {}) {
   return { ok: false, reason: 'kernel_unavailable', error: 'rust kernel is down; watchdog recovery pending' }
 }
 
+// Resolve before shaping the attempt; the same worker report gates serialization.
+export async function prepareInferenceHop({ exec, routing = {}, slotWaitMs, ensureRust } = {}) {
+  const projectRoot = exec?.projectRoot || (exec?.homeDir ? path.resolve(exec.homeDir, '../../..') : '')
+  const licensed = checkCragLicense(projectRoot, exec?.vm, routing)
+  if (!licensed.ok) return { rejection: cragLicenseDeniedResult(licensed) }
+  const decision = resolveHopEngine(exec?.vm, routing)
+  if (decision.blocked) return { decision }
+  const ready = await prepareRust(exec, { ensure: ensureRust, routing, slotWaitMs })
+  return { decision, ready }
+}
+
 async function runHop({ mode, opts }) {
-  const routing = opts.routing || {}
-  const projectRoot = opts.exec?.projectRoot || (opts.exec?.homeDir ? path.resolve(opts.exec.homeDir, '../../..') : '')
-  const licensed = checkCragLicense(projectRoot, opts.exec?.vm, routing)
-  if (!licensed.ok) return cragLicenseDeniedResult(licensed)
-  const decision = resolveHopEngine(opts.exec?.vm, routing)
-  let engine = 'rust'
+  const { rejection, decision, ready } = opts.preparedHop || (await prepareInferenceHop(opts))
+  if (rejection) return rejection
+  const engine = 'rust'
   let reason = decision.reason
   if (!decision.blocked) {
-    const ready = await prepareRust(opts.exec, {
-      ensure: opts.ensureRust,
-      routing,
-      slotWaitMs: opts.slotWaitMs,
-    })
     if (ready?.ok) {
       if (opts.requestContext && opts.cliHop && ready.health?.classifier_request_context !== true) {
         return {
@@ -270,15 +273,17 @@ async function runHop({ mode, opts }) {
     }
   }
   const send = mode === 'stream' ? streamRustKernel : callRustKernel
+  // The worker that passed readiness may not match the scheduler's snapshot.
+  const sendOpts = { ...opts, exec: { ...opts.exec, workerStatus: ready.health } }
   beginWrapHop(opts.exec)
   let result
   try {
-    result = await send(opts)
+    result = await send(sendOpts)
     noteWrapHop(opts.exec)
     if (opts.signal?.aborted || isClientCancelledResult(result)) {
       result = clientCancelledResult(result)
     } else if (result.transportError === true && result.committed !== true) {
-      result = await send(opts)
+      result = await send(sendOpts)
       result = { ...result, rust_transport_retried: true }
       noteWrapHop(opts.exec)
     }
@@ -289,7 +294,7 @@ async function runHop({ mode, opts }) {
       else {
         // The CLI invalidates its OAuth cache from the shared credential file
         // before creating each API client. Recycling here kills sibling hops.
-        result = await send(opts)
+        result = await send(sendOpts)
         result = { ...result, credential_retried: true }
         noteWrapHop(opts.exec)
       }

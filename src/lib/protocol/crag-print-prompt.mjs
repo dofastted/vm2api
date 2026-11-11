@@ -58,7 +58,7 @@ const MODEL_DIRECTIVE_CAPS = ['model_directive', 'linux_tui_pty']
 export function cragConsumesModelDirective(health) {
   const caps = health?.capabilities
   if (!Array.isArray(caps)) return false
-  return caps.some((cap) => MODEL_DIRECTIVE_CAPS.includes(String(cap || '')))
+  return caps.some((cap) => MODEL_DIRECTIVE_CAPS.includes(cap))
 }
 
 export const CRAG_PRINT_PROMPT_MAX_BYTES = 64 * 1024
@@ -91,11 +91,84 @@ function textOf(block) {
   return ''
 }
 
+// Use literal LF boundaries: JavaScript's multiline anchors also match Unicode separators.
+const cwdDeclaration = /(?:^|\n)([ \t]*<cwd>[ \t]*\r?\n([^\r\n]+)\r?\n[ \t]*<\/cwd>[ \t]*)(?:\r?\n|(?![\s\S]))/
+
+function systemBlocks(system) {
+  return typeof system === 'string' ? [system] : Array.isArray(system) ? system : []
+}
+
+export function validateCallerCwd(raw) {
+  if (typeof raw !== 'string') return null
+  const cwd = raw.replace(/^ +| +$/g, '')
+  if (!cwd.isWellFormed() || Buffer.byteLength(cwd) > 512) return null
+  if (/[<>\p{Cc}\p{Zl}\p{Zp}]/u.test(cwd) || /&(?:#[0-9]+|#x[0-9a-f]+|[a-z][a-z0-9]*);/i.test(cwd)) return null
+  if (cwd.startsWith('/')) return cwd
+  const drive = /^[a-z]:[\\/]/i.test(cwd)
+  const unc = cwd.match(/^\\\\([^\\/]+)[\\/]([^\\/]+)/)
+  if (!drive && (!unc || unc.slice(1).some((part) => ['', '.', '..'].includes(part.replace(/^ +| +$/g, '')))))
+    return null
+  return /["|?*:]/.test(drive ? cwd.slice(2) : cwd) ? null : cwd
+}
+
+/** Separate the declaration before normalization can lift history into system. */
+export function callerCwdDeclaration(system) {
+  let tags = 0
+  let declaration
+  let index
+  const blocks = systemBlocks(system)
+  for (const [i, block] of blocks.entries()) {
+    const text = textOf(block)
+    for (const _tag of text.matchAll(/<\/?cwd>/g)) if (++tags > 2) return null
+    const match = cwdDeclaration.exec(text)
+    if (match) {
+      declaration = match
+      index = i
+    }
+  }
+  const cwd = tags === 2 && validateCallerCwd(declaration?.[2])
+  if (!cwd) return null
+  const block = blocks[index]
+  const text = textOf(block)
+  const start = declaration.index + Number(declaration[0].startsWith('\n'))
+  const rest = text.slice(0, start) + text.slice(declaration.index + declaration[0].length)
+  return { cwd, index, text, rest, source: system, block }
+}
+
+// Conversion reports the normalized counterpart of the raw block before any
+// history is lifted. Intercepts can replace it; never search other blocks by value.
+export function projectCallerSystem(system, declaration) {
+  if (!declaration) return system
+  if (typeof system === 'string') {
+    return system === declaration.source && system === declaration.text ? declaration.rest : system
+  }
+  if (!Array.isArray(system)) return system
+  const index = declaration.normalizedBlock
+    ? system.indexOf(declaration.normalizedBlock)
+    : system === declaration.source && system[declaration.index] === declaration.block
+      ? declaration.index
+      : -1
+  if (index < 0 || textOf(system[index]) !== declaration.text) return system
+  const out = system.slice()
+  const block = out[index]
+  if (!declaration.rest.trim()) out.splice(index, 1)
+  else out[index] = typeof block === 'string' ? declaration.rest : { ...block, text: declaration.rest }
+  return out
+}
+
+export function trackCallerSystemBlock(system, declaration) {
+  if (!declaration || system !== declaration.source) return undefined
+  const original = systemBlocks(system)[declaration.index]
+  if (original !== declaration.block || textOf(original) !== declaration.text) return undefined
+  return (block, index) => {
+    if (index === declaration.index) declaration.normalizedBlock = block
+  }
+}
+
 /** Caller tail only. Drops non-text blocks, cache_control and billing lines. */
 export function callerSystemTail(system) {
-  const list = typeof system === 'string' ? [system] : Array.isArray(system) ? system : []
   const parts = []
-  for (const block of list) {
+  for (const block of systemBlocks(system)) {
     const text = textOf(block)
     if (!text) continue
     const kept = text
@@ -132,14 +205,19 @@ export function cragPromptTooLarge(bytes) {
 
 /**
  * @param {object} body caller body, before cli-node persona injection
- * @param {{ preset?: 'official_full' | 'zero', officialPassthrough?: boolean }} [options]
+ * @param {{ preset?: 'official_full' | 'zero', officialPassthrough?: boolean, capabilities?: string[] }} [options]
  */
-export function prepareCragPrintBody(body, { preset = 'official_full', officialPassthrough = false } = {}) {
+export function prepareCragPrintBody(
+  body,
+  { preset = 'official_full', officialPassthrough = false, capabilities } = {},
+) {
   const out = { ...(body || {}) }
   const mode = preset === 'zero' ? 'replace' : 'append'
-  const tail = officialPassthrough ? '' : callerSystemTail(out.system)
   delete out.system
   stripCallerPromptAlias(out)
+  if (capabilities !== undefined && (!Array.isArray(capabilities) || !capabilities.includes(`prompt_${mode}`)))
+    return out
+  const tail = officialPassthrough ? '' : callerSystemTail(body?.system)
   if (!tail) return out
   if (mode === 'replace' && Buffer.byteLength(tail, 'utf8') > CRAG_PRINT_PROMPT_MAX_BYTES) {
     throw cragPromptTooLarge(Buffer.byteLength(tail, 'utf8'))

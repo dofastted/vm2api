@@ -8,6 +8,7 @@ import { defaultMaxTokensForModel } from './model-policy.mjs'
  * keys, pass through unknown official fields such as output_config.
  */
 const DROP_TOP = new Set([
+  'caller_cwd',
   'settings',
   'claude_settings',
   'env',
@@ -192,25 +193,25 @@ export function canonicalizeClaudeMessagesShape(body, { preserveContentShape = f
   return out
 }
 
-export function sanitizeAnthropicBody(body, { preserveContentShape = false } = {}) {
+export function sanitizeAnthropicBody(body, { preserveContentShape = false, onSystemBlock } = {}) {
   if (!body || typeof body !== 'object') return body
 
   const out = copyOfficialAnthropicFields(body)
   applyStructuredOutput(out, body)
 
   if (!preserveContentShape && Array.isArray(out.system)) {
-    const blocks = out.system
-      .map((b) => {
-        if (typeof b === 'string') return { type: 'text', text: b }
-        if (b && typeof b.text === 'string') {
-          const block = { type: 'text', text: b.text }
+    out.system = out.system
+      .map((b, index) => {
+        let block = b && typeof b === 'object' ? b : null
+        if (typeof b === 'string') block = { type: 'text', text: b }
+        else if (typeof b?.text === 'string') {
+          block = { type: 'text', text: b.text }
           if (b.cache_control) block.cache_control = b.cache_control
-          return block
         }
-        return b && typeof b === 'object' ? b : null
+        onSystemBlock?.(block, index)
+        return block
       })
       .filter(Boolean)
-    out.system = blocks
   }
 
   normalizeAnthropicMessages(out)
@@ -220,7 +221,12 @@ export function sanitizeAnthropicBody(body, { preserveContentShape = false } = {
   // Do not overwrite caller max_tokens (thinking budget). Only fill if missing.
   if (!out.max_tokens) out.max_tokens = defaultMaxTokensForModel(out.model)
   normalizeStop(out)
-  return canonicalizeClaudeMessagesShape(out, { preserveContentShape })
+  const normalized = canonicalizeClaudeMessagesShape(out, { preserveContentShape })
+  // A nonempty source string becomes the first block; lifted history only appends.
+  if (!preserveContentShape && onSystemBlock && typeof body.system === 'string') {
+    onSystemBlock(normalized.system?.[0], 0)
+  }
+  return normalized
 }
 
 /**

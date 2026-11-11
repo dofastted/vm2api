@@ -184,6 +184,7 @@ export function standardSeedPolicy(partial = {}) {
 export function sanitizeInboundBody(body, seedPolicy = {}) {
   if (!body || typeof body !== 'object') return body || {}
   const out = { ...body }
+  delete out.caller_cwd // Internal worker envelope field, never a public body field.
   const rejectMeta = seedPolicy.reject_client_metadata_identity !== false
   const rejectSettings = seedPolicy.reject_client_settings !== false
   if (rejectMeta && out.metadata && typeof out.metadata === 'object') {

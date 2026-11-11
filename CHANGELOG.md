@@ -10,6 +10,8 @@
 - 本地私有 Codex kernel 已构建为 `0.1.1` 并通过回环报文验证；这是网关内核版本，不是官方 CLI 发布版本。此变更不自动发布 Release、不更改远端 payload URL/摘要，也不重启已有槽；发版前需把验证后的新 ELF 发布并更新 `deploy/payload.json`，不能以旧 payload 代替。
 - 修复协议页选择 `cc_entrypoint=cli` 后，面板协议清洗与 worker envelope 仍输出 `(external, sdk-cli)`：公共出站头组装读取当前路由配置，保留槽位版本 pin，不再让槽位身份的旧入口覆盖面板设置；Setup Token / API Key 的 inference-only UA 不变。增加入口往返切换、调用方 UA 隔离和凭证边界回归，删除历史抓包中固定旧入口 / runtime / prompt index 的过时断言。
 - 验证面板 API 保存 `cli → sdk-cli → cli` 后 UA 与 billing 同步变化，并通过真实 kin-kernel → cli-node → 本地 HTTP 抓包验证最终 UA。升级此修复只需更新 Node 控制面并重启；现有 cli-node 已支持 `kernel.json.cc_entrypoint`，本次不更换 payload 或线上配置。
+- 修复 CRAG 按候选槽旧快照组包、导致 `crag_prompt` 等字段在发送时丢失的问题。按本次发送所用 worker 的健康能力分别启用 append、replace、模型指令和 `caller_cwd`；旧 worker 不接收未声明支持的字段。
+- 从本轮原始 Anthropic 顶层 `system` 提取有效的 `<cwd>` 声明，只从 CRAG 提示词投影移除原声明，不删除同值历史。脱敏后仍有效的目录通过已认证的内部 envelope 传给原生内核，仅用于模型环境事实，不改变实际工作目录。官方 Claude Code 2.1.321 已在隔离回环验证 print/TUI、三个 preset 及两类续接；未部署生产。
 
 ## 1.4.069 — 2026-11-11
 
