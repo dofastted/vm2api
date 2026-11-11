@@ -41,6 +41,8 @@ import { extraHeadersFromLimitError } from '../pool/quota-window.mjs'
 import { createStreamTiming } from '../protocol/stream-timing.mjs'
 import { mergeUsage } from '../protocol/openai-usage.mjs'
 import { ensureRedaction, maskJson, restoreJsonValue, createSseRestorer } from '../redaction/runtime.mjs'
+import { inferenceCodec } from './inference-codec.mjs'
+import { parseWorkerJson as parseJson } from './inference-codec-json.mjs'
 
 const MAX_BODY = 64 * 1024 * 1024
 const credentialRefreshTail = new Map()
@@ -88,7 +90,7 @@ function readInternalToken(exec) {
   }
 }
 
-function workerRequest(
+async function workerRequest(
   exec,
   {
     method = 'GET',
@@ -99,15 +101,23 @@ function workerRequest(
     timeoutMode = 'overall',
     headers = {},
     maxRequestBytes = 0,
+    inference = false,
+    onRequestStarted,
   } = {},
 ) {
+  if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
+  const { socketPath } = workerPaths(exec)
+  if (!socketPath) {
+    throw Object.assign(new Error('slot worker socket is not configured'), { code: 'worker_socket_missing' })
+  }
+  const payload =
+    body == null
+      ? null
+      : inference
+        ? await inferenceCodec.encode(body, { signal })
+        : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))
+  if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
   return new Promise((resolve, reject) => {
-    const { socketPath } = workerPaths(exec)
-    if (!socketPath) {
-      reject(Object.assign(new Error('slot worker socket is not configured'), { code: 'worker_socket_missing' }))
-      return
-    }
-    const payload = body == null ? null : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))
     // Include the headers, session metadata and request_id added around the caller's body.
     if (maxRequestBytes > 0 && payload?.length > maxRequestBytes) {
       reject(
@@ -162,6 +172,8 @@ function workerRequest(
     req.once('error', reject)
     if (payload) req.write(payload)
     req.end()
+    // Once handed to HTTP, the kernel may see the request before 'finish'.
+    onRequestStarted?.()
   })
 }
 
@@ -172,7 +184,7 @@ function workerRequest(
  * and an old worker without the route just answers 404.
  */
 function cancelOnAbort(exec, signal, requestId) {
-  if (!signal || signal.aborted) return () => {}
+  if (!signal) return () => {}
   const onAbort = () => {
     workerRequest(exec, {
       method: 'POST',
@@ -186,6 +198,7 @@ function cancelOnAbort(exec, signal, requestId) {
       })
   }
   signal.addEventListener('abort', onAbort, { once: true })
+  if (signal.aborted) onAbort()
   return () => signal.removeEventListener('abort', onAbort)
 }
 
@@ -202,28 +215,6 @@ async function readAll(stream, limit = MAX_BODY) {
     chunks.push(value)
   }
   return Buffer.concat(chunks)
-}
-
-function parseJson(buffer, status = 0) {
-  try {
-    return JSON.parse(String(buffer || ''))
-  } catch {
-    if (status === 413) {
-      return {
-        type: 'error',
-        error: {
-          type: 'invalid_request_error',
-          code: 'body_too_large',
-          message: 'Request body exceeds the slot kernel limit',
-          details: { retryable: false },
-        },
-      }
-    }
-    return {
-      type: 'error',
-      error: { type: 'worker_error', code: 'worker_invalid_json', message: String(buffer || '').slice(0, 400) },
-    }
-  }
 }
 
 function publicHeaders(headers = {}) {
@@ -657,7 +648,7 @@ export async function callGoWorker({
     }
   }
   const requestId = randomUUID()
-  const stopCancel = cancelOnAbort(exec, signal, requestId)
+  let stopCancel = () => {}
   try {
     const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
     const prepared = envelope
@@ -685,11 +676,15 @@ export async function callGoWorker({
       requestPath,
       body: { ...prepared.envelope, request_id: requestId },
       maxRequestBytes,
+      inference: true,
+      onRequestStarted: () => {
+        stopCancel = cancelOnAbort(exec, signal, requestId)
+      },
       signal,
       timeoutMs,
     })
     const data = await readAll(response)
-    const parsedRaw = parseJson(data, response.statusCode)
+    const parsedRaw = await inferenceCodec.decode(data, { status: response.statusCode, signal })
     const parsed = prepared.redaction ? await restoreJsonValue(parsedRaw, prepared.redaction) : parsedRaw
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
     const ok = response.statusCode >= 200 && response.statusCode < 300 && parsed?.type !== 'error'
@@ -842,7 +837,7 @@ export async function streamGoWorker({
   let committed = false
   const timing = createStreamTiming()
   const requestId = randomUUID()
-  const stopCancel = cancelOnAbort(exec, signal, requestId)
+  let stopCancel = () => {}
   try {
     const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
     const prepared = envelope
@@ -871,6 +866,10 @@ export async function streamGoWorker({
       requestPath,
       body: { ...prepared.envelope, request_id: requestId },
       maxRequestBytes,
+      inference: true,
+      onRequestStarted: () => {
+        stopCancel = cancelOnAbort(exec, signal, requestId)
+      },
       signal,
       timeoutMs,
       timeoutMode: 'first-byte',
@@ -883,7 +882,7 @@ export async function streamGoWorker({
         ok: false,
         status: response.statusCode || 0,
         via: 'go-worker-stream',
-        body: parseJson(data, response.statusCode),
+        body: await inferenceCodec.decode(data, { status: response.statusCode, signal }),
         headers,
         committed: false,
         terminalState: headers['x-terminal-state'] || 'error',

@@ -26,6 +26,16 @@ client ──nginx──► Node :8787
 - 历史 `go` / `fallback_to_go` 写入一律收成 rust / false。
 - Go hop 服务端已删除。`kin-worker` 只剩 `telemetry` 子命令。
 
+## 面板到槽的 CPU 并行
+
+- `PoolScheduler` 仍只有一个权威实例。每次执行先原子取得许可；粘性绑定、会话席位和执行许可独立。见 [调度准入](performance/scheduler-admission.md)。不要复制 `src/server.mjs` 进程来扩展编解码。
+- 大推理请求的 JSON 编码、缓冲 JSON 回包及缓冲的非 2xx SSE 错误可由最多两个按需启动的 Node worker 处理。编码以估算大小、解码以实际字节判断 256 KiB 门槛；超过预算或 worker 繁忙走原线程，不排无界队列。worker 故障只回退本地编解码，不重放 HTTP。
+- HTTP I/O、成功 SSE 的分帧和回调、可见提交及取消仍由原线程处理。既有 413、回包上限和提交后不重试的规则不变。客户端模块保留历史 `go-worker-client` 名称，不代表恢复 Go 推理。
+
+本机 Unix socket 合成回环（2 路并发，预热 1.2 秒，每组约 3 秒；不计 fixture CPU）：请求、回包各约 1.79 MB 时，吞吐 65.0 → 89.8 req/s，请求 p95 47.28 → 29.84 ms，面板事件循环 p95 16.40 → 3.02 ms；面板总 CPU 时间 3.01 → 6.53 秒。203 B 请求、137 B 回包未启动 worker，请求 p95 均为 0.68 ms。收益是大包响应性，不是 CPU 效率或真实上游吞吐。
+
+槽内 Claude `kin-kernel` 的 Tokio 线程预算和生效边界见 [Docker CPU 限制](docker-cpu-limits.md)，与账号并发、CLI 子进程和上游模型计算分开。
+
 ## 不要和这两件事搞混
 
 | 名字 | 是不是推理 |
