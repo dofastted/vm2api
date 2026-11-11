@@ -449,6 +449,7 @@ export function prepareWorkerPayload({
   const credMode = credentialModeFromOauth(exec?.vm?.claude || {})
   const headers = prepareOutboundHeaders(reqHeaders, exec?.homeDir, identity, model, {
     credentialMode: credMode,
+    routing,
     want1m: want1m === true,
   })
   const displayed =
