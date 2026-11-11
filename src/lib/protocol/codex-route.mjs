@@ -7,13 +7,13 @@ import { normalizeCodexModelMappings, validateCodexModelMappingsPatch } from './
 
 export { isCodexVm, normalizeVmKind } from '../vm/vm-kind.mjs'
 
-export const DEFAULT_CODEX_USER_AGENT = 'codex_cli_rs/0.160.0 (linux x86_64)'
+export const DEFAULT_CODEX_USER_AGENT = 'codex_cli_rs/0.167.1 (linux x86_64)'
 export const CODEX_UPSTREAM_TRANSPORTS = Object.freeze(['prefer_websocket', 'http'])
 
 export const DEFAULT_CODEX_ROUTING = Object.freeze({
   enabled: true,
   // `auto` resolves the official Codex catalog client version at sync time,
-  // falling back to 0.160.0 when the registry is unavailable.
+  // falling back to the verified release pin when the registry is unavailable.
   catalog_client_version: 'auto',
   user_agent: DEFAULT_CODEX_USER_AGENT,
   upstream_transport: 'prefer_websocket',

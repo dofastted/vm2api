@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- 修复 ARM64 native CLI 构建沿用旧 CLI / 嵌入源码 pin 导致的 SHA-256 mismatch：按当前 payload 的真实 `cli-node` 验证外层摘要，并经固定 ARM64 UPX 解包、现有源码边界提取器校验后同步两项摘要。不跳过校验、不改测试期望，也不更换全局 payload 或已发布 CLI。7 项打包测试及真实 ARM64 镜像构建通过；当前 x86/QEMU 路径的大并发仍会触发既有 stdin 10 秒保护，同源原生 x86 对照的并发与取消通过，未调大超时；ARM 原生并发验收仍需原生 runner 确认。
+- 纳入本地 Codex 并行源码修复：HTTP SSE 按字节缓冲，保留跨 chunk UTF-8 和 CRLF；终态按事件 type 判定，避免正文包含 `response.completed` 时提前断流；WebSocket 允许图像大帧；内部 crate / 启动配置与响应元数据统一使用当前命名。36 项 Rust 测试及实际 Node 健康客户端、HTTP 字节拆分回环通过。这些并行源码改动仅作本地提交，不替换已发布 `codex-kernel-v0.1.1` 的 ELF。
+- Codex 客户端兼容 pin 更新到已核实的官方 `0.167.1`，补齐参考目录中的 Astra、6.1 Sol/Terra 和 5.6 家族静态回退项；账号实时目录仍优先，新增型号沿用默认关闭，不猜测 6.2 灰度型号的能力或价格。修复 `ultra` 被降到 `medium` 及 Completions 丢失推理参数，槽位测试、定时计划和日志同步支持。
+- 参照 codex-proxy-rs 收紧 Codex 出站身份：originator/version 从所选 UA 构造，下游不能覆盖；正确解析 `Codex Desktop/...` 的含空格产品名。保留 HTTP/WS、会话和单槽出口策略。
+- Codex Analytics 不再读取控制面宿主 OS/编译架构，改用槽内采集的 OS、`VERSION_ID` 和架构，并经每请求选项热传递；缺失时仅跳过上报。沿用官方初始化事件、账号鉴权和槽位出口，队列对齐 256，复用遥测 HTTP 客户端，不上传硬件标识或正文。升级后先采集槽位身份，再按需显式开启 Analytics。
+- 本地私有 Codex kernel 已构建为 `0.1.1` 并通过回环报文验证；这是网关内核版本，不是官方 CLI 发布版本。此变更不自动发布 Release、不更改远端 payload URL/摘要，也不重启已有槽；发版前需把验证后的新 ELF 发布并更新 `deploy/payload.json`，不能以旧 payload 代替。
+- 修复协议页选择 `cc_entrypoint=cli` 后，面板协议清洗与 worker envelope 仍输出 `(external, sdk-cli)`：公共出站头组装读取当前路由配置，保留槽位版本 pin，不再让槽位身份的旧入口覆盖面板设置；Setup Token / API Key 的 inference-only UA 不变。增加入口往返切换、调用方 UA 隔离和凭证边界回归，删除历史抓包中固定旧入口 / runtime / prompt index 的过时断言。
+- 验证面板 API 保存 `cli → sdk-cli → cli` 后 UA 与 billing 同步变化，并通过真实 kin-kernel → cli-node → 本地 HTTP 抓包验证最终 UA。升级此修复只需更新 Node 控制面并重启；现有 cli-node 已支持 `kernel.json.cc_entrypoint`，本次不更换 payload 或线上配置。
+
 ## 1.4.069 — 2026-11-11
 
 - 修复集群 CRAG 包热替换漏传 `manifest.json` 的问题。更换加密 core/bootstrap 时同步发布对应签名清单，并将清单内容纳入节点 payload digest，防止旧清单与新密文混用导致 license 校验失败、VM 无法恢复调度。
@@ -12,7 +21,6 @@
 ## 1.4.068 - 2026-11-11
 
 - 修正 ARM64 原生 CLI 构建 pin，与 2.1.321 UPX payload 的精确 SHA 一致；发布 payload tag 使用标准 vm2api 版本格式，避免内核页拒绝非版本 tag。
-
 
 ## 1.4.067 — 2026-11-11
 

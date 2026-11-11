@@ -97,7 +97,7 @@
   "codex": {
     "enabled": true,
     "catalog_client_version": "auto",
-    "user_agent": "codex_cli_rs/0.160.0 (linux x86_64)",
+    "user_agent": "codex_cli_rs/0.167.1 (linux x86_64)",
     "upstream_transport": "prefer_websocket",
     "websocket": { "enabled": true },
     "client_features": { "enabled": false },

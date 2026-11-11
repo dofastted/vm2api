@@ -12,7 +12,7 @@ import { ChipGroup, PaneSection } from './scheduler-controls'
 type Block = Record<string, unknown>
 type Transport = 'prefer_websocket' | 'http'
 
-const DEFAULT_USER_AGENT = 'codex_cli_rs/0.160.0 (linux x86_64)'
+const DEFAULT_USER_AGENT = 'codex_cli_rs/0.167.1 (linux x86_64)'
 const TRANSPORT_OPTIONS: [Transport, string][] = [
   ['prefer_websocket', '优先 WebSocket'],
   ['http', '仅 HTTP'],
@@ -275,7 +275,7 @@ export function OpenaiPane({
           </SettingRow>
           <SettingRow
             label='运行环境 Analytics 上报'
-            desc='默认关闭。打开后对 kernel 观察到的每个会话独立 POST 一次官方 codex_thread_initialized（/backend-api/codex/analytics-events/events）：真实 kernel 版本、系统、系统版本、架构、会话标识、模型与秒级时间。上报的是 kernel 所在宿主，不是下游用户电脑；此事件没有 turn_id，也不含 prompt、文件、主机名或 MAC。与安装标识无关。'
+            desc='默认关闭。打开后对 kernel 观察到的每个会话独立 POST 一次官方 codex_thread_initialized（/backend-api/codex/analytics-events/events）：真实 kernel 版本、所选 VM 内采集的系统、系统版本、架构、会话标识、模型与秒级时间。先对槽位采集身份；缺少 VM 特征时不发送，不回退控制面宿主或下游电脑。此事件没有 turn_id，也不含 prompt、文件、主机名或 MAC。与安装标识无关。'
           >
             <Switch
               checked={analytics.enabled === true}
@@ -290,7 +290,7 @@ export function OpenaiPane({
           </SettingRow>
           <SettingRow
             label='Codex 目录客户端版本'
-            desc='auto 取官方 @openai/codex 版本并缓存，失败用 0.160.0。'
+            desc='auto 取官方 @openai/codex 版本并缓存，失败用已验证的 0.167.1。'
           >
             <Input
               className='w-28'

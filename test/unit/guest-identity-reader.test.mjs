@@ -17,6 +17,8 @@ const guestOutput = [
   'guest-machine',
   'UTC',
   'en_US.UTF-8',
+  '{}',
+  '24.04',
   '',
 ].join('\0')
 
@@ -162,6 +164,7 @@ const guestOutputWithHardware = [
   'UTC',
   'en_US.UTF-8',
   hardwareJson,
+  '24.04',
   '',
 ].join('\0')
 
@@ -201,6 +204,7 @@ test('invalid optional hardware JSON does not fail identity collection', async (
     'UTC',
     'en_US.UTF-8',
     '{',
+    '24.04',
     '',
   ].join('\0')
   const result = await readGuestIdentity({ vmId: 'vm-01' }, '', { run: async () => ({ stdout }) })

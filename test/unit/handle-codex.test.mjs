@@ -1218,48 +1218,6 @@ test('codex rebuild outbound session is not the inbound session', async () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('codex kernel envelope preserves official routing headers without client auth', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-routing-headers-'))
-  const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
-  writeGptVm(root, 'vm-gpt-a')
-  const { envelopes } = await hopCodex({
-    root,
-    stickyRouter: sticky,
-    headers: {
-      authorization: 'Bearer sub2api-key',
-      originator: 'Codex Desktop',
-      'openai-beta': 'responses_websockets=2026-02-06',
-      'session-id': 'session:t',
-      'thread-id': 'thread:t',
-      'x-client-request-id': 'request:t',
-      'x-codex-beta-features': 'remote_compaction_v2',
-      'x-codex-turn-metadata': '{"thread_id":"t"}',
-      'x-codex-window-id': 'window:2',
-      'x-openai-internal-codex-responses-lite': 'true',
-    },
-    body: { model: 'gpt-6.1-sol', input: 'hi', stream: false, service_tier: 'fast' },
-  })
-  const session = envelopes[0].session
-  assert.deepEqual(envelopes[0].headers, {
-    originator: 'Codex Desktop',
-    'openai-beta': 'responses_websockets=2026-02-06',
-    'session-id': session.session_id,
-    'thread-id': 'thread:t',
-    'x-client-request-id': 'request:t',
-    'x-codex-beta-features': 'remote_compaction_v2',
-    'x-codex-turn-metadata': '{"thread_id":"t"}',
-    'x-codex-window-id': 'window:2',
-    'x-openai-internal-codex-responses-lite': 'true',
-    'x-codex-routing-hint': 'model=gpt-6.1-sol;tier=priority',
-  })
-  assert.notEqual(envelopes[0].headers['session-id'], 'session:t')
-  assert.equal(envelopes[0].headers['session-id'], session.session_id)
-  assert.equal(envelopes[0].headers.authorization, undefined)
-  assert.equal(envelopes[0].body.service_tier, 'priority')
-  sticky.db?.close?.()
-  fs.rmSync(root, { recursive: true, force: true })
-})
-
 test('codex rebuild outbound session is stable on the same slot', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-codex-stable-'))
   const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
