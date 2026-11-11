@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 第三方出站工具名改写为 `mcp__` 时，同步改写历史 `tool_result` 内 `tool_reference.tool_name` 与 `tool_search_tool_result.tool_references[].tool_name`，修复工具搜索下一轮 400（#953）。
+
 ## 1.4.071 — 2026-11-12
 
 - 以云端最新主分支和最新正式版 `v1.4.070` 的完整合并结果发版，不用独立内核 Release 替代应用交付。应用版本、全量 payload 清单、完整附件和 amd64/arm64 控制面镜像统一到本版本；发布工作流上传全部 pinned 资产，不再只列九个 amd64 文件。
