@@ -275,7 +275,7 @@ export function OpenaiPane({
           </SettingRow>
           <SettingRow
             label='运行环境 Analytics 上报'
-            desc='默认关闭。打开后对 kernel 观察到的每个会话独立 POST 一次官方 codex_thread_initialized（/backend-api/codex/analytics-events/events）：真实 kernel 版本、系统、系统版本、架构、会话标识、模型与秒级时间。上报的是 kernel 所在宿主，不是下游用户电脑；此事件没有 turn_id，也不含 prompt、文件、主机名或 MAC。与安装标识无关。'
+            desc='默认关闭。打开后对 kernel 观察到的每个会话独立 POST 一次官方 codex_thread_initialized（/backend-api/codex/analytics-events/events）：真实 kernel 版本、所选 VM 内采集的系统、系统版本、架构、会话标识、模型与秒级时间。先对槽位采集身份；缺少 VM 特征时不发送，不回退控制面宿主或下游电脑。此事件没有 turn_id，也不含 prompt、文件、主机名或 MAC。与安装标识无关。'
           >
             <Switch
               checked={analytics.enabled === true}
