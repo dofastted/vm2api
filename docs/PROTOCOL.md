@@ -179,6 +179,14 @@ native CLI `2.1.296` 保留带 billing 的 wire system（含官方 CLI / 子代�
 
 `routing.compatibility.thinking_display` 默认 `summarized`（设置 → 协议 → thinking 显示；缺省即开，显式 `passthrough` 关闭）。只改已经打开的 thinking（`adaptive` / `enabled`）：`omitted`、`updates`，以及 Opus 4.7+、5 系列、Haiku 5.5、Fable、Mythos 上没写 display 的请求，出站改成 `summarized`。其它值、`disabled`、没开 thinking 不动。改写在 beta 计算之前，所以被改掉的 `updates` 不再带 `thinking-display-updates-2026-08-18`。`passthrough` 时 `updates` 仍只在出站 beta 声明该 token 时保留，否则降成 `omitted`。分类器请求不经过这条出站改写。
 
+## Codex 模型与运行环境
+
+Codex 目录客户端 `auto` 跟随官方 npm 发布；网络不可用且没有缓存时使用已核实的 `0.167.1`。推理 UA 单独配置，新安装的默认画像同步到该版本，不覆盖已部署机自定义 UA。内核保留所选画像的 originator/version，忽略下游伪造的身份与设备证明头。
+
+GPT 模型以账号返回的 `/backend-api/codex/models` 为准，6.2 等新增 ID 不在网关改名，也不按型号猜测能力、可用性或价格。同步发现的新 ID 沿用默认关闭，管理员启用后才调度。静态回退目录补齐官方参考目录中的 `gpt-6-astra`、`gpt-6.1-sol`、`gpt-6.1-terra` 与 `gpt-5.6-sol/terra/luna`。Responses、Chat 和 Completions 的 `ultra` 推理档位原样保留；Completions 也保留显式 `reasoning` / `reasoning_effort`。槽位测试、定时计划和日志支持该档位，具体模型是否接受由上游判断。
+
+`codex.analytics.enabled` 仍默认关闭。启用后的 `codex_thread_initialized` 使用当前槽内采集的系统、系统版本和架构，不读取内核所在控制面宿主。先执行槽位 `collect-identity`；数据不完整时不发送，不伪造环境或 CLI 工具事件。字段、队列和隐私边界见 [面板 API · OpenAI 传输与隐私](PANEL_API.md#openai-传输与隐私)。
+
 ## 健康探测缓存
 
 `routing.health_probe`：

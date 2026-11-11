@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Codex 客户端兼容 pin 更新到已核实的官方 `0.167.1`，补齐参考目录中的 Astra、6.1 Sol/Terra 和 5.6 家族静态回退项；账号实时目录仍优先，新增型号沿用默认关闭，不猜测 6.2 灰度型号的能力或价格。修复 `ultra` 被降到 `medium` 及 Completions 丢失推理参数，槽位测试、定时计划和日志同步支持。
+- 参照 codex-proxy-rs 收紧 Codex 出站身份：originator/version 从所选 UA 构造，下游不能覆盖；正确解析 `Codex Desktop/...` 的含空格产品名。保留 HTTP/WS、会话和单槽出口策略。
+- Codex Analytics 不再读取控制面宿主 OS/编译架构，改用槽内采集的 OS、`VERSION_ID` 和架构，并经每请求选项热传递；缺失时仅跳过上报。沿用官方初始化事件、账号鉴权和槽位出口，队列对齐 256，复用遥测 HTTP 客户端，不上传硬件标识或正文。升级后先采集槽位身份，再按需显式开启 Analytics。
+- Codex kernel `0.1.1` 按 `codex-kernel-v0.1.1` 独立交付 Linux amd64 ELF、校验和与构建记录；从私有干净提交编译并验证 HTTP/WS 与 VM 遥测。它不是官方 CLI 版本，也不是 vm2api 整包版本；不改应用 VERSION、Latest、Docker 镜像或全局 payload 清单。仅 Codex 内核的校验与安装边界见 `docs/BUILD.md`，现有槽不会自动重启。
+
 ## 1.4.067 — 2026-11-11
 
 - 将 cli-node 交付更新为当前本地源码构建的 2.1.321，使用 UPX 5.0.2 压缩并验证；不再沿用旧下载缓存中的 CLI。

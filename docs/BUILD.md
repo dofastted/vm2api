@@ -16,6 +16,14 @@ gh release create payload-YYYY.MM.DD /tmp/payload/* --prerelease --latest=false 
 
 再提交 `deploy/payload.json`。payload Release 必须 `--prerelease --latest=false`：一键脚本与面板按 `releases/latest` 找应用版本。
 
+## Codex 独立内核 Release
+
+`codex-kernel-v0.1.1` 只交付 Linux amd64 的 `kin-codex-kernel`、`SHA256SUMS` 和 `codex-kernel-v0.1.1-build.json`。编译采用私有源码的干净提交，不混入本地未提交改动；源码 commit/tree、工具链、文件大小、SHA-256 与验收结果见 [构建记录](releases/codex-kernel-v0.1.1.json)。私有源码和 ELF 不进入公开 git，ELF 作为 Release 资产上传。
+
+专属 tag 不使用 `v*`，不触发应用 Release 工作流；发布时采用 `--prerelease --latest=false`，不替换应用 Latest，不发布 Docker 镜像，也不修改根 `VERSION` 或全局 `deploy/payload.json`。因此 `fetch:payload` 仍会恢复原来的整包基线，不能用它安装这个独立版本。
+
+升级时下载该 tag 的全部三个资产并执行 `sha256sum -c SHA256SUMS`；确认架构与 glibc 要求后，只替换控制面的 `bin/kin-codex-kernel`。先排空所选 Codex 槽的请求，再重启其 Codex kernel 进程；不重建槽容器，不替换 Claude kernel/CLI。VM Analytics 还需要匹配本次主分支 Node 改动、重新采集槽位身份，并显式开启开关，见 [OpenAI 传输与隐私](PANEL_API.md#openai-传输与隐私)。
+
 ## 版本怎么记
 
 | 记号 | 谁写 | 含义 |

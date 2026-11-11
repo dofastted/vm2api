@@ -13,7 +13,7 @@ const MAX_CRON_LENGTH = 120
 const MAX_MODEL_LENGTH = 200
 const MAX_PROMPT_LENGTH = 16_000
 const MAX_ERROR_LENGTH = 300
-const REASONING_EFFORTS = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max'])
+const REASONING_EFFORTS = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
 const FREQUENCIES = new Set(['hourly', 'daily', 'weekly'])
 const DEFAULT_PROMPT = 'hello'
 const DEFAULT_MAX_TOKENS = 64
@@ -223,7 +223,7 @@ export function normalizeVmTestSchedule(input, vm) {
   let reasoningEffort = input.reasoning_effort == null ? null : String(input.reasoning_effort).trim()
   if (reasoningEffort === '') reasoningEffort = null
   if (reasoningEffort != null && !REASONING_EFFORTS.has(reasoningEffort)) {
-    throw new VmTestScheduleError('reasoning_effort must be none, low, medium, high, xhigh, or max')
+    throw new VmTestScheduleError('reasoning_effort must be none, low, medium, high, xhigh, max, or ultra')
   }
   if (isCodexVm(vm)) {
     if (maxTokens != null || reasoningEffort == null) {
