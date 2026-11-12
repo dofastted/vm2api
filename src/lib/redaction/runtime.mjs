@@ -1,9 +1,11 @@
 import { spawn } from 'node:child_process'
+import { once } from 'node:events'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createRedactionClient } from './client.mjs'
 import { normalizeRedaction } from './policy.mjs'
+import { maxRequestBytes } from '../core/config.mjs'
 
 const disabled = {
   enabled: false,
@@ -59,7 +61,7 @@ async function waitForFile(file, timeoutMs = 3000) {
   throw unavailable('redaction helper did not publish a capability')
 }
 
-function startHelper({ bin, directory }) {
+function startHelper({ bin, directory, maxBodyBytes }) {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
   const sock = path.join(directory, 'kin-redact.sock')
   const key = path.join(directory, 'redact.key')
@@ -69,9 +71,11 @@ function startHelper({ bin, directory }) {
       fs.rmSync(file, { force: true })
     } catch {}
   }
-  const child = spawn(bin, ['-sock', sock, '-key', key, '-capability', capabilityFile], {
-    stdio: 'ignore',
-  })
+  const child = spawn(
+    bin,
+    ['-sock', sock, '-key', key, '-capability', capabilityFile, '-max-body-bytes', String(maxBodyBytes)],
+    { stdio: 'ignore' },
+  )
   return { child, sock, capabilityFile }
 }
 
@@ -87,18 +91,29 @@ export async function ensureRedaction(routing, { projectRoot, binPath } = {}) {
     state = { ...disabled, policy }
     return state
   }
-  if (state.ready && state.enabled && JSON.stringify(state.policy) === JSON.stringify(policy) && state.client) {
+  const maxBodyBytes = maxRequestBytes(routing)
+  if (
+    state.ready &&
+    state.enabled &&
+    (state.maxBodyBytes == null || state.maxBodyBytes === maxBodyBytes) &&
+    state.client
+  ) {
     return state
   }
   if (!boot) {
-    boot = bootHelper(policy, { projectRoot, binPath }).finally(() => {
+    boot = bootHelper(policy, { projectRoot, binPath, maxBodyBytes }).finally(() => {
       boot = null
     })
   }
   return boot
 }
 
-async function bootHelper(policy, { projectRoot, binPath }) {
+async function bootHelper(policy, { projectRoot, binPath, maxBodyBytes }) {
+  if (state.child && state.child.exitCode == null && state.child.signalCode == null) {
+    const exited = once(state.child, 'exit')
+    state.child.kill()
+    await exited
+  }
   const bundled = path.join(projectRoot || '', 'bin', 'kin-redact')
   const bin = binPath || process.env.KIN_REDACT_BIN || (fs.existsSync(bundled) ? bundled : '')
   if (!bin || !fs.existsSync(bin)) {
@@ -106,13 +121,21 @@ async function bootHelper(policy, { projectRoot, binPath }) {
     throw unavailable('redaction helper is not installed')
   }
   const directory = path.join(projectRoot || os.tmpdir(), 'data', 'redact')
-  const helper = startHelper({ bin, directory })
+  const helper = startHelper({ bin, directory, maxBodyBytes })
   try {
     const capability = await waitForFile(helper.capabilityFile)
     const client = createRedactionClient({ socketPath: helper.sock, capability })
     await client.health()
     await client.validate({ policy: policyView(policy) })
-    state = { enabled: true, ready: true, policy, client, child: helper.child, error: null }
+    state = {
+      enabled: true,
+      ready: true,
+      policy,
+      maxBodyBytes,
+      client,
+      child: helper.child,
+      error: null,
+    }
     return state
   } catch (error) {
     helper.child.kill()

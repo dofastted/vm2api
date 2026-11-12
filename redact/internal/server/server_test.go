@@ -76,3 +76,20 @@ func TestWordsAnyCaseMasksOtherCapitals(t *testing.T) {
 		t.Fatalf("exact %d %q", code, plain)
 	}
 }
+func TestTransformRejectsOversizeWithoutTruncating(t *testing.T) {
+	s := NewWithMaxBodyBytes("cap-1", key32(), 8)
+	h := s.Handler()
+	policy := Policy{Secrets: true}
+	code, body := call(t, h, "POST", "/v1/mask", "cap-1", "key-a", policy, `{"a":"123456"}`)
+	if code != http.StatusRequestEntityTooLarge || body != "redaction_body_too_large\n" {
+		t.Fatalf("oversize mask status=%d body=%q", code, body)
+	}
+	code, body = call(t, h, "POST", "/v1/restore", "cap-1", "key-a", policy, `{"a":"123456"}`)
+	if code != http.StatusRequestEntityTooLarge || body != "redaction_body_too_large\n" {
+		t.Fatalf("oversize restore status=%d body=%q", code, body)
+	}
+	code, body = call(t, h, "POST", "/v1/mask", "cap-1", "key-a", policy, `1234567`)
+	if code != http.StatusOK || body != `1234567` {
+		t.Fatalf("at-limit body was not processed intact: status=%d body=%q", code, body)
+	}
+}

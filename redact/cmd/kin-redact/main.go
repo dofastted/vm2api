@@ -15,6 +15,7 @@ func main() {
 	sock := flag.String("sock", "", "unix socket path")
 	keyPath := flag.String("key", "", "32-byte deployment key file")
 	capPath := flag.String("capability", "", "file that receives the process capability")
+	maxBodyBytes := flag.Int64("max-body-bytes", server.DefaultMaxBodyBytes, "maximum request body size")
 	flag.Parse()
 	if *sock == "" || *keyPath == "" || *capPath == "" {
 		log.Fatal("kin-redact: -sock, -key and -capability are required")
@@ -35,7 +36,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	srv := server.New(capability, key)
+	srv := server.NewWithMaxBodyBytes(capability, key, *maxBodyBytes)
 	if err := http.Serve(ln, srv.Handler()); err != nil {
 		log.Fatal(err)
 	}

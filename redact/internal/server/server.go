@@ -31,22 +31,33 @@ type Policy struct {
 	Allow        []string        `json:"allow"`
 }
 
+const DefaultMaxBodyBytes int64 = 32 << 20
+
 type Server struct {
-	cap      string
-	key      []byte
-	mu       sync.Mutex
-	scopes   map[string]*engine.Scope
-	lastUsed map[string]time.Time
-	active   map[string]int
+	cap          string
+	key          []byte
+	maxBodyBytes int64
+	mu           sync.Mutex
+	scopes       map[string]*engine.Scope
+	lastUsed     map[string]time.Time
+	active       map[string]int
 }
 
 func New(capability string, deployKey []byte) *Server {
+	return NewWithMaxBodyBytes(capability, deployKey, DefaultMaxBodyBytes)
+}
+
+func NewWithMaxBodyBytes(capability string, deployKey []byte, maxBodyBytes int64) *Server {
+	if maxBodyBytes <= 0 {
+		maxBodyBytes = DefaultMaxBodyBytes
+	}
 	return &Server{
-		cap:      capability,
-		key:      append([]byte(nil), deployKey...),
-		scopes:   map[string]*engine.Scope{},
-		lastUsed: map[string]time.Time{},
-		active:   map[string]int{},
+		cap:          capability,
+		key:          append([]byte(nil), deployKey...),
+		maxBodyBytes: maxBodyBytes,
+		scopes:       map[string]*engine.Scope{},
+		lastUsed:     map[string]time.Time{},
+		active:       map[string]int{},
 	}
 }
 
@@ -108,9 +119,13 @@ func (s *Server) transform(w http.ResponseWriter, r *http.Request, mask bool) {
 		http.Error(w, "invalid_redaction_config", http.StatusBadRequest)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
+	body, err := io.ReadAll(io.LimitReader(r.Body, s.maxBodyBytes+1))
 	if err != nil {
 		http.Error(w, "redaction_unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if int64(len(body)) > s.maxBodyBytes {
+		http.Error(w, "redaction_body_too_large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	scope, err := s.hold(principal, session)
