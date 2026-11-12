@@ -1,8 +1,7 @@
 /**
- * Official `claude auth login` inside a slot that already has a running
- * container and its selected Claude CLI. The CLI owns PKCE, the authorize URL
- * and the token exchange. The host only extracts the URL, feeds the pasted
- * code, and reads the full OAuth grant the CLI wrote.
+ * Official `claude auth login` uses the native Claude shipped in the CRAG
+ * package, independently of the inference engine. The CLI owns PKCE and token
+ * exchange; the panel keeps credential storage and refresh ownership.
  *
  * This is not `claude setup-token` or the separate kin-oauth-auth helper.
  * Cookie import and setup-token stay on their own paths.
@@ -14,15 +13,13 @@ import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { containerName, inspectContainer, officialCcUidGid } from '../vm/vm-runtime.mjs'
 import { officialCcHome } from './official-cc-bootstrap.mjs'
-import { execDetached, inspectContainerOrNull } from '../cluster/docker-remote.mjs'
+import { execCapture, execDetached, inspectContainerOrNull } from '../cluster/docker-remote.mjs'
 import {
   CONTAINER_CLI_NODE_BIN,
   CONTAINER_CC_NODE_BIN,
   LOCAL_CRAG_CLAUDE,
   REMOTE_CRAG_CLAUDE,
-  resolveSlotClaude,
 } from '../vm/slot-engine.mjs'
-import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import { slotExecArgv, slotExecCmd } from '../vm/slot-exec.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
@@ -30,6 +27,7 @@ import { FULL_OAUTH_SCOPE } from './oauth-contract.mjs'
 import { flattenOauthIdentity } from './oauth-identity.mjs'
 import { prepareSlotOAuth } from './guest-oauth-helper.mjs'
 import { slotExec } from '../vm/slot-runtime.mjs'
+import { cragV2PackageRoot, verifyCragV2Tree } from '../vm/wrap-cli-runtime.mjs'
 
 export const AUTH_LOGIN_SESSION_TTL_MS = 30 * 60 * 1000
 export const AUTH_LOGIN_SOURCE = 'claude-auth-login'
@@ -117,7 +115,7 @@ export function readAuthLoginSession(projectRoot, vmId) {
 
 export function isPersistentAuthLoginSession(session, { force = false, cliBin = null } = {}) {
   if (force || !session) return false
-  if (cliBin && (session.cli_bin || CONTAINER_CLI_NODE_BIN) !== cliBin) return false
+  if (cliBin && session.cli_bin !== cliBin) return false
   return !!(session.alive && session.auth_url && !session.expired && session.status !== 'login_ready')
 }
 
@@ -135,22 +133,49 @@ async function waitFor(fn, timeoutMs, intervalMs = 200) {
   return null
 }
 
-/**
- * Official login may run only after the slot container is running and its CLI
- * is executable inside it. A local slot keeps that binary on the host home;
- * a cluster slot bakes it into the image, so the host file is not the check.
- * A seed file or a stopped container is not enough.
- */
+/** Authentication never inherits a patched inference CLI or a PATH alias. */
+export function resolveAuthLoginClaude(vm, cliBin = '') {
+  if (typeof cliBin !== 'string' || /[\x00-\x1f\x7f]/.test(cliBin)) {
+    throw fail('invalid_claude_path', '请指定槽内原生 Claude Code 可执行文件的绝对路径')
+  }
+  const bin = cliBin.trim() || (slotHost(vm).bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE)
+  if (!path.posix.isAbsolute(bin) || bin.endsWith('/')) {
+    throw fail('invalid_claude_path', '请指定槽内原生 Claude Code 可执行文件的绝对路径')
+  }
+  return { bin, native: true }
+}
+
+/** Only stage the official executable; installing/licensing a CRAG worker is unrelated. */
+function stageBundledAuthClaude(projectRoot, vm) {
+  if (slotHost(vm).bakedKernel) return
+  const relative = path.posix.relative('/home/kincli/.kin', LOCAL_CRAG_CLAUDE)
+  const target = path.join(officialCcHome(projectRoot, vm.id), '.kin', relative)
+  if (fs.existsSync(target)) return
+  const source = cragV2PackageRoot(projectRoot, 'amd64')
+  if (!source) return
+  const verified = verifyCragV2Tree(source, { arch: 'amd64' })
+  if (!verified.ok) throw fail(verified.code, verified.error)
+  const member = path.posix.relative('crag-v2', relative)
+  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o755 })
+  const temporary = `${target}.${crypto.randomUUID()}.new`
+  try {
+    fs.copyFileSync(path.join(source, member), temporary, fs.constants.COPYFILE_EXCL)
+    fs.chmodSync(temporary, 0o755)
+    fs.renameSync(temporary, target)
+  } finally {
+    fs.rmSync(temporary, { force: true })
+  }
+}
 
 export async function assertAuthLoginReady(
   projectRoot,
   vm,
-  { inspect = inspectContainer, cliExists = null, routing = {} } = {},
+  { inspect = inspectContainer, cliExists = null, cliBin = '' } = {},
 ) {
   const vmId = vm?.id
   if (!vmId || !projectRoot) throw fail('vm_required', 'vm_id required')
   const host = slotHost(vm)
-  const name = containerName(vmId)
+  const name = vm.runtime?.container || containerName(vmId)
   let inspected
   if (host.bakedKernel) {
     try {
@@ -166,22 +191,26 @@ export async function assertAuthLoginReady(
   if (!inspected?.running) {
     throw fail('container_not_ready', '容器尚未创建或未运行，请先完成容器创建再登录')
   }
-  const selected = resolveSlotClaude(vm, routing, host)
-  const cli = host.bakedKernel
-    ? selected.bin
-    : path.join(officialCcHome(projectRoot, vmId), '.kin', path.posix.relative('/home/kincli/.kin', selected.bin))
-  const present = cliExists ? await cliExists(cli, vm) : host.bakedKernel ? true : fs.existsSync(cli)
+  const selected = resolveAuthLoginClaude(vm, cliBin)
+  if (selected.bin === resolveAuthLoginClaude(vm).bin) stageBundledAuthClaude(projectRoot, vm)
+  const { Cmd } = slotExecCmd(vm, ['sh', '-c', 'test -f "$1" && test -x "$1"', 'auth-cli', selected.bin], {
+    user: host.execUser(vm),
+  })
+  const present = cliExists
+    ? await cliExists(selected.bin, vm)
+    : (await execCapture(host.dockerApi(), name, Cmd, { timeoutMs: 10_000 })).exitCode === 0
   if (!present) {
     throw fail(
-      selected.native ? 'claude_cli_missing' : 'cli_node_missing',
-      '所选内核的 Claude CLI 尚未安装，请先同步对应内核',
+      'claude_cli_missing',
+      '原生 Claude Code 不存在或不可执行：请同步 CRAG 包，或指定槽内已安装的原生 CC 绝对路径',
     )
   }
-  return { container: name, cli }
+  return { container: name, cli: selected.bin, ...selected }
 }
 
 export async function stopClaudeAuthLoginSession(projectRoot, vmId, { execDetach = execDetached } = {}) {
   const dir = authLoginSessionDir(projectRoot, vmId)
+  const previousCli = readJson(path.join(dir, 'status.json'))?.cli_bin
   const ptyPid = readPidFile(path.join(dir, 'pty.pid'))
   const childPid = readPidFile(path.join(dir, 'child.pid'))
   for (const pid of [ptyPid, childPid]) {
@@ -205,12 +234,18 @@ export async function stopClaudeAuthLoginSession(projectRoot, vmId, { execDetach
         CONTAINER_CC_NODE_BIN,
         LOCAL_CRAG_CLAUDE,
         REMOTE_CRAG_CLAUDE,
+        ...(typeof previousCli === 'string' && previousCli.startsWith('/') && !/[\x00-\x1f\x7f]/.test(previousCli)
+          ? [previousCli]
+          : []),
       ]),
     ]
     const cleanup = bins
       .map(
         (bin) =>
-          `pkill -f '${bin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/^\//, '[/]')} auth login' >/dev/null 2>&1 || true`,
+          `pkill -f '${bin
+            .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            .replace(/^\//, '[/]')
+            .replace(/'/g, `'\\''`)} auth login' >/dev/null 2>&1 || true`,
       )
       .join('; ')
     const { Cmd, User } = slotExecCmd(vm, ['sh', '-lc', cleanup])
@@ -237,7 +272,7 @@ export async function stopClaudeAuthLoginSession(projectRoot, vmId, { execDetach
   return { ok: true }
 }
 
-function loginEnv(vm, { native = false } = {}) {
+function loginEnv(vm) {
   const locale = vm.locale || vm.fingerprint?.locale || 'en_US.UTF-8'
   const tz = vm.timezone || vm.fingerprint?.timezone || 'UTC'
   return [
@@ -250,7 +285,6 @@ function loginEnv(vm, { native = false } = {}) {
     `LC_ALL=${locale}`,
     'PATH=/home/kincli/.local/bin:/usr/bin:/bin',
     'CLAUDE_CODE_HOST_REFRESH=1',
-    ...(!native ? [`CLAUDE_CODE_VERSION=${OFFICIAL_CLI_VERSION}`] : []),
     'USER_TYPE=external',
     // The slot cli-node guard spares this host-run official login.
     'KIN_AUTH_LOGIN=1',
@@ -275,6 +309,8 @@ export async function startClaudeAuthLoginSession({
   projectRoot,
   routing,
   force = false,
+  cliBin = '',
+  cliExists = null,
   inspect = inspectContainer,
   prepare = prepareSlotOAuth,
   spawnPty = spawn,
@@ -287,8 +323,8 @@ export async function startClaudeAuthLoginSession({
     const prepared = await prepare({ exec: slotExec(projectRoot, vm), projectRoot, routing })
     vm = prepared.exec.vm
   }
-  const selected = resolveSlotClaude(vm, routing || {}, slotHost(vm))
-  await assertAuthLoginReady(projectRoot, vm, { inspect, routing })
+  const selected = resolveAuthLoginClaude(vm, cliBin)
+  await assertAuthLoginReady(projectRoot, vm, { inspect, cliExists, cliBin })
   if (fake) {
     return {
       session_id: 'fake-auth-login',
@@ -324,7 +360,7 @@ export async function startClaudeAuthLoginSession({
   const ptyScript = path.join(scriptsDir(), 'claude-auth-login-pty.py')
   const execArgv = slotExecArgv(vm, [selected.bin, 'auth', 'login'], {
     user,
-    env: loginEnv(vm, selected),
+    env: loginEnv(vm),
     workdir: '/home/kincli',
     interactive: true,
     tty: true,

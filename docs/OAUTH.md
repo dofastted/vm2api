@@ -70,6 +70,16 @@ SSH 扩展槽同样由控制面经绑定出口换票。拿到授权后，提交�
 
 代理缺失或连接失败时槽位 fail closed，不允许 VPS 直连 Anthropic。
 
+## 原生 Claude Code 登录终端
+
+面板选择「OAuth → Claude Code」后，认证调用方默认使用 CRAG 包携带的官方原生 CC，**不跟随槽位推理内核**，也不回落 `cli-node` 或 PATH 上的 `claude`。本地 Docker / KVM 槽使用 `/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude`，集群 Docker 槽使用 `/opt/kin-live/crag-v2/claude-code-2.1.321/claude`。
+
+- 本地槽缺少该程序时，仅从已校验的 CRAG 发布包暂存官方 Claude 可执行文件；不安装或启动 CRAG worker，不切换推理内核，也不要求为官方登录激活 CRAG 授权。缺少包或程序不可执行会明确报错。
+- 选择「指定原生 CC 路径」可使用槽内另一个已安装的原生程序。必须填写**槽内 / guest 内的绝对可执行文件路径**，不是浏览器或控制面的文件路径；空格和单引号可正常使用。
+- 登录票据绑定最终程序路径，WebSocket 建立前再次检查同一路径。窗口显示本次实际调用的程序；运行中修改选择不会替换已打开会话。
+- 终端占据近全屏主区域，底部提供授权链接复制 / 打开，以及完整 `code#state` 回填。可用 `Ctrl / ⌘ + Enter` 提交；断连时不会清空尚未发送的授权码。
+- 原生 CC 只负责授权交互与换票。凭证沿用面板的槽位导入、远端同步和 worker 刷新链路；`.credentials.json` 与面板管理的 `credentials.json` 保持关联，不另建凭证库。重新授权前已存在的凭证不算本次登录成功。
+
 ## 官方 Claude Code 初装
 
 换票（import / exchange-code）进入 `commitImportedOauth` 后，按 `routing.official_cc` 排队。默认自动；**同一槽再次换票也会重新初装**，不因 `already_initialized` 跳过。
