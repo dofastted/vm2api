@@ -203,12 +203,11 @@ test('CCH settings apply per hop and native sealing waits for final CLI serializ
   assert.doesNotMatch(enabled.system[0].text, /cch=(00000|cc746);/)
 })
 
-test('applyCrsUnofficialPersona keeps the placeholder until hop finalize', () => {
+test('persona assembly seals a CCH matching the serialized request projection', () => {
   const out = applyCrsUnofficialPersona({
+    model: 'claude-sonnet-5',
     messages: [{ role: 'user', content: 'ping' }],
   })
-  const billing = out.system.find((block) => /x-anthropic-billing-header:/i.test(block?.text || ''))
-  assert.match(billing.text, new RegExp(`cch=${CCH_PLACEHOLDER};`))
   const sealed = finalizeWorkerPayload({
     body: out,
     reqHeaders: {},

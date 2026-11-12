@@ -22,6 +22,7 @@ import { callCodexKernel, streamCodexKernel } from '../../src/lib/transport/code
 import { forwardApi, readApiJson } from '../../src/lib/transport/api-kernel-client.mjs'
 import { normalizeRedaction } from '../../src/lib/redaction/policy.mjs'
 import { publishRedactionForTests } from '../../src/lib/redaction/runtime.mjs'
+import { classifyUpstreamResult } from '../../src/lib/pool/upstream-error-policy.mjs'
 
 test('restoreUncommittedHop keeps a structured upstream code', () => {
   const restored = restoreUncommittedHop({
@@ -594,7 +595,8 @@ unixTest('prebuilt call and stream envelopes cannot carry caller cwd', async (t)
     assert.equal(posted.length, 1)
     const sent = posted.pop()
     assert.equal(Object.hasOwn(sent, 'caller_cwd'), false)
-    assert.deepEqual(sent.body, body)
+    assert.equal(sent.body.caller_cwd, undefined)
+    assert.deepEqual(sent.body.messages, [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }])
   }
 })
 
@@ -949,7 +951,8 @@ unixTest('streamGoWorker does not stamp TTFT on metadata-only Responses complete
   try {
     const result = await streamGoWorker({
       exec: fx.exec,
-      body: { model: 'gpt-5.4', stream: true, input: [] },
+      envelope: { body: { model: 'gpt-5.4', input: [] }, stream: true },
+      requestPath: '/internal/v1/codex/responses',
       onEvent: () => {},
     })
     assert.equal(result.usage.input_tokens, 12)
@@ -1007,7 +1010,8 @@ unixTest('streamGoWorker stamps TTFT on a Responses function name, not response.
   try {
     const result = await streamGoWorker({
       exec: fx.exec,
-      body: { model: 'gpt-5.4', stream: true, input: [] },
+      envelope: { body: { model: 'gpt-5.4', input: [] }, stream: true },
+      requestPath: '/internal/v1/codex/responses',
       onEvent: () => {},
     })
     assert.ok(result.ttftMs != null && result.ttftMs >= 0)
@@ -1474,7 +1478,8 @@ unixTest('streamGoWorker merges SSE cache details into a totals-only usage trail
   try {
     const result = await streamGoWorker({
       exec: fx.exec,
-      body: { model: 'gpt-5.4', stream: true, input: [] },
+      envelope: { body: { model: 'gpt-5.4', input: [] }, stream: true },
+      requestPath: '/internal/v1/codex/responses',
       onEvent: () => {},
     })
     assert.equal(result.usage.input_tokens, 120)
@@ -1599,7 +1604,11 @@ for (const call of [callGoWorker, streamGoWorker]) {
         res.end(structured ? JSON.stringify(upstream) : 'Failed to buffer the request body: length limit exceeded')
       })
       try {
-        const result = await call({ exec: fx.exec, envelope: { body: { input: 'hi' } } })
+        const result = await call({
+          exec: fx.exec,
+          envelope: { body: { input: 'hi' } },
+          requestPath: '/internal/v1/codex/responses',
+        })
         assert.equal(result.status, 413)
         assert.equal(result.ok, false)
         assert.equal(result.transportError, false)
@@ -1628,13 +1637,23 @@ for (const call of [callGoWorker, streamGoWorker]) {
       res.end(JSON.stringify({ error: { code: 'fixture_reached' } }))
     })
     try {
-      const oversized = await call({ exec: fx.exec, envelope, maxRequestBytes: bytes - 1 })
+      const oversized = await call({
+        exec: fx.exec,
+        envelope,
+        maxRequestBytes: bytes - 1,
+        requestPath: '/internal/v1/codex/responses',
+      })
       assert.equal(oversized.status, 413)
       assert.equal(oversized.body.error.code, 'body_too_large')
       assert.equal(oversized.body.error.details.retryable, false)
       assert.equal(oversized.transportError, false)
       assert.equal(requests, 0)
-      const exact = await call({ exec: fx.exec, envelope, maxRequestBytes: bytes })
+      const exact = await call({
+        exec: fx.exec,
+        envelope,
+        maxRequestBytes: bytes,
+        requestPath: '/internal/v1/codex/responses',
+      })
       assert.equal(exact.status, 400)
       assert.equal(exact.body.error.code, 'fixture_reached')
       assert.equal(requests, 1)
@@ -1658,6 +1677,7 @@ for (const mode of ['first-byte', 'idle']) {
       const result = await streamGoWorker({
         exec: fx.exec,
         envelope: { body: { input: 'hi' } },
+        requestPath: '/internal/v1/codex/responses',
         timeoutMs: mode === 'first-byte' ? 20 : 4000,
         idleTimeoutMs: 20,
         signal: controller.signal,
@@ -1692,5 +1712,105 @@ unixTest('Codex clients enforce the panel limit on their serialized envelope', a
     assert.equal(requests, 0)
   } finally {
     await fx.close()
+  }
+})
+
+unixTest('invalid Messages are rejected before either kernel accepts a turn', async (t) => {
+  let requests = 0
+  const fx = await fixture((req, res) => {
+    requests++
+    req.resume()
+    res.writeHead(500).end('{}')
+  })
+  t.after(() => fx.close())
+  for (const runtime_variant of ['cli-node', 'crag-v2']) {
+    const exec = { ...fx.exec, workerStatus: { runtime_variant } }
+    for (const send of [callGoWorker, streamGoWorker]) {
+      for (const prebuilt of [false, true]) {
+        for (const messages of [
+          [],
+          [{ role: 'user', content: ' \n\t' }],
+          [{ role: 'user', content: 42 }],
+          [{ role: 'user', content: [{ type: 'tool_result', content: 'result' }] }],
+        ]) {
+          const body = { model: 'claude-sonnet-5', messages }
+          const result = await send({ exec, ...(prebuilt ? { envelope: { body } } : { body }) })
+          assert.equal(result.status, 400)
+          assert.equal(result.body.error.code, 'invalid_kernel_request')
+          assert.equal(result.transportError, false)
+          assert.equal(result.upstreamExecutions, 0)
+          assert.equal(result.committed, false)
+          const policy = classifyUpstreamResult(result)
+          assert.equal(policy.scope, 'request')
+          assert.equal(policy.action, 'stop')
+        }
+      }
+    }
+  }
+  assert.equal(requests, 0)
+})
+
+unixTest('kernel preparation isolates controls without rewriting tool continuation history', async (t) => {
+  const history = [
+    { role: 'user', content: [{ type: 'text', text: 'read the file' }] },
+    {
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'plan', signature: 'signed-history-12345678901234567890' },
+        { type: 'tool_use', id: 'tool_history_1', name: 'Read', input: { path: '/synthetic/file' } },
+      ],
+    },
+    {
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'tool_history_1', content: 'file content' },
+        { type: 'text', text: 'continue' },
+      ],
+    },
+  ]
+  const fx = await fixture(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const sent = JSON.parse(Buffer.concat(chunks))
+    assert.deepEqual(sent.body.messages, history)
+    for (const key of ['request_context', 'gateway_policy', 'kin_outbound_shape', 'request_id', 'delivery_mode']) {
+      assert.equal(Object.hasOwn(sent.body, key), false)
+    }
+    assert.deepEqual(sent.body.safeguards, { synthetic_extension: true })
+    if (sent.body.crag_prompt) {
+      assert.deepEqual(sent.body.crag_options, { effort: 'high' })
+      assert.equal(sent.body.auto_compact_window, undefined)
+    } else {
+      assert.equal(sent.body.crag_model, undefined)
+      assert.equal(sent.body.crag_options, undefined)
+      assert.equal(sent.body.auto_compact_window, 200000)
+    }
+    res.writeHead(409, { 'content-type': 'application/json' })
+    res.end(
+      JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'tool_result replayed' } }),
+    )
+  })
+  t.after(() => fx.close())
+  for (const runtime_variant of ['cli-node', 'crag-v2']) {
+    const exec = { ...fx.exec, workerStatus: { runtime_variant, capabilities: ['prompt_append', 'model_directive'] } }
+    for (const prebuilt of [false, true]) {
+      const body = {
+        model: 'claude-sonnet-5',
+        max_tokens: 128,
+        messages: structuredClone(history),
+        request_context: { purpose: 'untrusted' },
+        gateway_policy: {},
+        kin_outbound_shape: 'lean',
+        request_id: 'untrusted',
+        delivery_mode: 'untrusted',
+        crag_prompt: { mode: 'append', text: 'caller instruction' },
+        crag_options: { transport: 'print', effort: 'high' },
+        auto_compact_window: 200000,
+        safeguards: { synthetic_extension: true },
+      }
+      const result = await callGoWorker({ exec, cliHop: true, ...(prebuilt ? { envelope: { body } } : { body }) })
+      assert.equal(result.status, 409)
+      assert.equal(result.transportError, false)
+    }
   }
 })

@@ -495,6 +495,9 @@ function classifyUpstreamResultRaw(
     })
   }
   if (status === 400) {
+    if (code === 'invalid_kernel_request') {
+      return { scope: 'request', action: 'stop', reason: 'invalid_request', cooldownUntil: null }
+    }
     const hay = `${code} ${message}`
     // Default off. Turning this on drops thinking history and retries, so the
     // client sees 200 and never learns the upstream rejected the signature.
