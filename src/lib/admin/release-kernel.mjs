@@ -236,17 +236,17 @@ async function fetchReleaseBytes(startUrl, fetchImpl, maxBytes, label) {
 export async function fetchKernelReleaseMetadata({
   tag = '',
   kernel = 'cli-node',
-  bundledCragTag = '',
+  cragReleaseTag = '',
   fetchImpl = globalThis.fetch,
 } = {}) {
   const requested = String(tag || '').trim()
-  const bundled = kernel === 'crag' && bundledCragTag && (!requested || normalizeTag(requested) === bundledCragTag)
-  const trimmed = bundled ? bundledCragTag : requested
+  const configured = kernel === 'crag' ? String(cragReleaseTag || '').trim() : ''
+  const trimmed = requested || configured
   const normalized = trimmed ? normalizeTag(trimmed) : ''
   if (trimmed && (!normalized || !isReleaseTag(normalized)))
     throw coded('kernel_tag_invalid', 'Release tag 必须是 vX.Y.Z')
   if (!fetchImpl) throw coded('fetch_unavailable', 'fetch unavailable')
-  const repo = kernel === 'crag' && !bundled ? CRAG_RELEASE_REPO : GITHUB_REPO
+  const repo = kernel === 'crag' ? CRAG_RELEASE_REPO : GITHUB_REPO
   const url = `https://api.github.com/repos/${repo}/releases/${normalized ? `tags/${normalized}` : 'latest'}`
   const res = await fetchImpl(url, {
     headers: githubApiHeaders(),

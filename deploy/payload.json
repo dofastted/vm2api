@@ -1,7 +1,7 @@
 {
   "repo": "dofastted/vm2api",
   "release": "v1.4.077",
-  "crag_release": "v1.4.078",
+  "crag_release": "v2.8.16",
   "files": [
     {
       "path": "bin/kin-kernel",
