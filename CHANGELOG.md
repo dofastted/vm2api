@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.079 — 2026-11-13
+
+- 修正 CRAG 版本语义：`crag_release` 使用供应仓独立版本 `v2.8.16`，不再跟随 vm2api 的 `v1.4.x` 应用版本。面板默认 CRAG 拉取始终查询 `dofastted/claude-code`，保留显式 CRAG tag。
+- 修正服务器遗留的 CRAG `v1.4.076` 版本指针来源，CRAG 包版本与 vm2api 控制面版本彻底分离。
+
 ## 1.4.078 — 2026-11-13
 
 - 同步 CRAG v2.8.16：TUI 正文输入改用会话专属 tmpfs 共享映射、Unix socket commit 和官方原生队列，保留安全页检测、MCP 工具续接、流式输出、取消、超时与 transcript 收件确认。固定绑定官方 Claude Code 2.1.321；未知构建失败关闭，不回退到 PTY 正文输入。
