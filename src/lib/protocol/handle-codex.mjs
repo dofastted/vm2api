@@ -1243,6 +1243,7 @@ export async function handleCodexSearch({
   const redactionState = await ensureRedaction(routing, { projectRoot })
   const redaction = redactionState.enabled
     ? {
+        maxBodyBytes: redactionState.maxBodyBytes,
         principal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
         session: String(req.headers?.['x-session-id'] || ''),
       }
@@ -1402,6 +1403,7 @@ export async function handleCodexImages({
   const redactionState = await ensureRedaction(routing, { projectRoot })
   const redaction = redactionState.enabled
     ? {
+        maxBodyBytes: redactionState.maxBodyBytes,
         principal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
         session: String(req.headers?.['x-session-id'] || ''),
       }

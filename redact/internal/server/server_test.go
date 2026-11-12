@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -74,5 +75,72 @@ func TestWordsAnyCaseMasksOtherCapitals(t *testing.T) {
 	code, plain := call(t, h, "POST", "/v1/mask", "cap-1", "key-b", exact, "plan NIGHTJAR")
 	if code != 200 || !strings.Contains(plain, "NIGHTJAR") {
 		t.Fatalf("exact %d %q", code, plain)
+	}
+}
+
+func TestTransformBodyLimit(t *testing.T) {
+	for _, path := range []string{"/v1/mask", "/v1/restore"} {
+		for _, knownLength := range []bool{true, false} {
+			for _, size := range []int{63, 64, 65} {
+				t.Run(path+"/"+strconv.FormatBool(knownLength)+"/"+strconv.Itoa(size), func(t *testing.T) {
+					s := New("cap-1", key32())
+					body := `{"data":"` + strings.Repeat("x", size-11) + `"}`
+					req := httptest.NewRequest("POST", path, strings.NewReader(body))
+					if !knownLength {
+						req.ContentLength = -1
+					}
+					req.Header.Set("X-Kin-Redact-Capability", "cap-1")
+					req.Header.Set("X-Kin-Redact-Principal", "key-a")
+					req.Header.Set("X-Kin-Redact-Policy", `{"secrets":true}`)
+					req.Header.Set("X-Kin-Redact-Max-Body-Bytes", "64")
+					res := httptest.NewRecorder()
+					s.Handler().ServeHTTP(res, req)
+					if size <= 64 {
+						if res.Code != http.StatusOK || res.Body.String() != body {
+							t.Fatalf("body not preserved: status=%d bytes=%d", res.Code, res.Body.Len())
+						}
+						return
+					}
+					var fault struct {
+						Error struct {
+							Code    string `json:"code"`
+							Details struct {
+								Retryable *bool `json:"retryable"`
+							} `json:"details"`
+						} `json:"error"`
+					}
+					if res.Code != http.StatusRequestEntityTooLarge || json.Unmarshal(res.Body.Bytes(), &fault) != nil ||
+						fault.Error.Code != "redaction_body_too_large" || fault.Error.Details.Retryable == nil || *fault.Error.Details.Retryable {
+						t.Fatalf("expected non-retryable 413, got %d %s", res.Code, res.Body.String())
+					}
+					if len(s.scopes) != 0 {
+						t.Fatal("oversized body must be rejected before creating a scope")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestTransformDefaultBodyLimit(t *testing.T) {
+	code, body := call(t, New("cap-1", key32()).Handler(), "POST", "/v1/mask", "cap-1", "key-a",
+		Policy{Secrets: true}, strings.Repeat("x", int(DefaultMaxBodyBytes)+1))
+	if code != http.StatusRequestEntityTooLarge || !strings.Contains(body, `"redaction_body_too_large"`) {
+		t.Fatalf("default limit must reject instead of truncating: %d", code)
+	}
+}
+
+func TestTransformRejectsInvalidBodyLimit(t *testing.T) {
+	for _, raw := range []string{"0", "-1", "NaN", "1.5", "9223372036854775808"} {
+		req := httptest.NewRequest("POST", "/v1/mask", strings.NewReader("{}"))
+		req.Header.Set("X-Kin-Redact-Capability", "cap-1")
+		req.Header.Set("X-Kin-Redact-Principal", "key-a")
+		req.Header.Set("X-Kin-Redact-Policy", `{"secrets":true}`)
+		req.Header.Set("X-Kin-Redact-Max-Body-Bytes", raw)
+		res := httptest.NewRecorder()
+		New("cap-1", key32()).Handler().ServeHTTP(res, req)
+		if res.Code != http.StatusBadRequest {
+			t.Fatalf("limit %q: expected 400, got %d", raw, res.Code)
+		}
 	}
 }
