@@ -98,6 +98,8 @@
 | POST | `/vms/:id/wrap-cli/promote` | 从该槽晋升 wrap 文件，不复制凭证/SOCKS。下次 sync 仍优先仓内最新 kernel |
 | POST | `/vms/:id/wrap-cli/repair` | 单槽重装 kernel。`{ wrap, kernel }`；wrap 成功时 HTTP 200 |
 | POST | `/vms/:id/start` · `/stop` | 容器生命周期。运行中容器除非显式 recreate，禁止 `docker rm -f` |
+| GET | `/vms/:id/diagnose` | 只读检查凭证、出口、容器、所选内核和自动恢复状态；CRAG 满载进程池不要求常驻 `cli_pid`，返回忙碌而非故障 |
+| POST | `/vms/:id/recover` | 按当前选择的 cli-node / CRAG 执行排空 → 关机 → 开机 → 就绪诊断；仅完整成功后清除请求熔断。授权错误在停机前拒绝；启动失败保留故障与不可调度原因 |
 | POST | `/vms/:id/activate` | 写入 `vms/active.json` 与 DB `active_vm`；列表/详情 `vm.active === true` 表示当前指针。管理台表格、机架、详情与行菜单可切换 |
 | POST | `/vms/:id/reset` | 销毁容器与家目录，再按原槽位重建（保留 ID/代理/种子；凭证清空） |
 | POST | `/vms/:id/reset-fingerprint` | |
@@ -126,6 +128,8 @@
 该重装入口当前仅支持本机 Linux Docker Claude 槽；远端、KVM 和 Codex 目标明确拒绝且不停止服务，不伪装成已安装。
 
 新安装与既有 PATCH/槽策略、同步、数据面切换、Release 同步及单槽修复共用同一记录锁；多槽操作在接收时固定目标并按稳定顺序加锁。其他页面的并发重装不能在安装器停止服务后穿插复制或自动重启；`restart:false` 仍只读检查。
+
+运行中槽位通过 PATCH、槽策略或 `/dataplane` 切核时，会先加入独立维护暂停并等待在途请求归零，同时暂停并排空该槽的看门狗操作。cli-node ↔ CRAG 双向切换重建需要变更创建参数的容器；容器已启动不等于内核就绪，`rust_ok:false` 仍视为失败。成功切核 / 重装重置该账号的请求熔断及内核恢复预算；失败不抹除故障。维护结束仅清除本次暂停，保留操作员调度关及其他出口 / 维护暂停。`restart:false` 的检查行为不变。
 
 `/vms`、`/vms/:id`、`/usage` 的账号行带窗口估算 `estimate_5h` / `estimate_7d` / `estimate_fable`（Fable 只在有 `7d_oi` 窗口的 Claude 号上非空）和 `window_fable_cost`。结构：`{ status, spent_usd, total_usd, remaining_usd, total_tokens, used_ratio }`。总量 = 窗口内官方费用 ÷ 已用比例，按官方价算，不乘分组倍率。`status` 不是 `ok` 时 `total_usd` / `remaining_usd` 为 `null`：`no_data`（无用量读数）、`no_reset`（无重置时间或已过期）、`log_gap`（日志没覆盖窗口起点，或已用比例动了但网关内无花费）、`low_usage`（已用 < 5%）、`unpriced`（窗口内有未定价请求）。token 字段 `total_tokens` / `today_tokens` / `window_*_tokens` 都是输入 + 输出 + 缓存读 + 缓存写，每类只算一次。
 

@@ -23,6 +23,9 @@ import { startSlotReady, stopSlot } from './slot-runtime.mjs'
 import { officialCcUidGid, suspendVmRuntimeRestart } from './vm-runtime.mjs'
 import { materializeResolvedKernel } from './wrap-cli-runtime.mjs'
 import { pushKernelSelection } from '../cluster/remote-slot-files.mjs'
+import { accountIdOf } from '../pool/pool-scheduler.mjs'
+import { unitCircuit } from '../pool/unit-circuit.mjs'
+import { clearRustHealthCache } from '../transport/kernel-router.mjs'
 
 const PRODUCTS = new Set(['cli-node', 'crag'])
 const INTERRUPTED_COMMAND =
@@ -308,6 +311,10 @@ export async function installKernelTargets({
           installed = true
           stopped = false
           watchdog?.reset?.(target.id)
+          clearRustHealthCache(target.id)
+          poolScheduler?.healthCache?.delete?.(target.id)
+          const accountId = accountIdOf(running, projectRoot)
+          unitCircuit.reset(accountId)
           return {
             id: target.id,
             kernel: target.kernel,
