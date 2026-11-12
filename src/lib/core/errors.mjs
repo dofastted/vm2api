@@ -423,6 +423,7 @@ export function mapUpstreamError(status, body, headers = {}) {
       'classifier_runtime_unsupported',
       'classifier_invalid_cache',
       'invalid_request_context',
+      'invalid_kernel_request',
     ].includes(inboundCode)
   ) {
     return makeError({ type: ErrorType.INVALID_REQUEST, code: inboundCode, message: body.error.message, status: 400 })
