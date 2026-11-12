@@ -12,6 +12,7 @@ import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { ThinkingOwnerStore } from '../../src/lib/pool/thinking-owner.mjs'
 import { extractCallerSession, sessionIdFromOutboundBody } from '../../src/lib/identity/identity-rewrite.mjs'
 import { agentBody } from '../fixtures/agent-summary.mjs'
+import { clearRustHealthCache, rememberRustHealth } from '../../src/lib/transport/kernel-router.mjs'
 
 function deferred() {
   let resolve
@@ -38,7 +39,7 @@ function success() {
   }
 }
 
-function harness({ mode = 'rebuild', capacity = 2, agentId = '' } = {}) {
+function harness({ mode = 'rebuild', capacity = 2, agentId = '', crag = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-summary-'))
   const routing = { compatibility: {}, failover: {}, sticky: { enabled: true, outbound_session: mode } }
   const routingFile = path.join(root, 'routing.json')
@@ -48,6 +49,14 @@ function harness({ mode = 'rebuild', capacity = 2, agentId = '' } = {}) {
   // Only discovery/health are simulated. The seat planner, reservations,
   // session queue, sticky writes and outbound preparation are the real ones.
   const vm = { id: 'vm-01', fingerprint: {}, claude: { account_tier: 'max' } }
+  const previousKernelBin = process.env.KIN_KERNEL_BIN
+  if (crag) {
+    process.env.KIN_KERNEL_BIN = '/bin/true'
+    rememberRustHealth(
+      { vmId: vm.id },
+      { ok: true, health: { ok: true, runtime_variant: 'crag-v2', ready_slots: 2, capabilities: ['prompt_append'] } },
+    )
+  }
   pool.eligibleCandidates = async ({ model, excluded }) =>
     excluded.has('account-1')
       ? []
@@ -77,6 +86,7 @@ function harness({ mode = 'rebuild', capacity = 2, agentId = '' } = {}) {
   const requests = []
   const calls = []
   const clients = new Map()
+  const consumed = new Set()
   const parentStarted = deferred()
   const parentGate = deferred()
   const thinkingDb = new DatabaseSync(':memory:')
@@ -120,6 +130,22 @@ function harness({ mode = 'rebuild', capacity = 2, agentId = '' } = {}) {
           ...opts,
           callAttempt: async (call) => {
             calls.push({ id: opts.requestId, ...call })
+            if (crag) {
+              // CRAG claims by tool ID, even when the gateway gives a fork a new session ID.
+              const user = call.body.messages.findLast((message) => message.role === 'user')
+              const results = Array.isArray(user?.content)
+                ? user.content.filter((block) => block.type === 'tool_result')
+                : []
+              if (results.some((block) => consumed.has(block.tool_use_id))) {
+                return {
+                  ok: false,
+                  status: 409,
+                  terminalState: 'rejected',
+                  body: { type: 'error', error: { type: 'invalid_request_error', message: 'tool_result replayed' } },
+                }
+              }
+              for (const block of results) consumed.add(block.tool_use_id)
+            }
             if (opts.requestId === 'parent') {
               parentStarted.resolve()
               await parentGate.promise
@@ -171,10 +197,60 @@ function harness({ mode = 'rebuild', capacity = 2, agentId = '' } = {}) {
       return res
     },
     close() {
+      if (crag) {
+        clearRustHealthCache(vm.id)
+        if (previousKernelBin === undefined) delete process.env.KIN_KERNEL_BIN
+        else process.env.KIN_KERNEL_BIN = previousKernelBin
+      }
       sticky.db.close()
       thinkingDb.close()
     },
   }
+}
+for (const summaryFirst of [false, true]) {
+  test(`CRAG summary cannot consume its parent's tool result (summary first: ${summaryFirst})`, async () => {
+    const h = harness({ crag: true })
+    const summaryBody = agentBody({ summary: true })
+    const before = structuredClone(summaryBody)
+    let parent
+    try {
+      if (summaryFirst) {
+        const response = await h.invoke('summary', summaryBody)
+        assert.equal(response.statusCode, 200, JSON.stringify(response.body))
+      }
+      parent = h.invoke('parent')
+      await Promise.race([
+        h.parentStarted.promise,
+        parent.then((response) => {
+          throw new Error(JSON.stringify(response.body))
+        }),
+      ])
+      if (!summaryFirst) {
+        const response = await h.invoke('summary', summaryBody)
+        assert.equal(response.statusCode, 200, JSON.stringify(response.body))
+      }
+      const side = h.calls.find((call) => call.id === 'summary').body
+      const main = h.calls.find((call) => call.id === 'parent').body
+      const sideUser = side.messages.findLast((message) => message.role === 'user')
+      const mainUser = main.messages.findLast((message) => message.role === 'user')
+      assert.equal(
+        sideUser.content.some((block) => block.type === 'tool_result'),
+        false,
+      )
+      assert.ok(sideUser.content.some((block) => block.type === 'text' && block.text.includes('File written.')))
+      assert.deepEqual(sideUser.content.at(-1), before.messages[2].content.at(-1))
+      assert.equal(mainUser.content[0].type, 'tool_result')
+      assert.equal(mainUser.content[0].tool_use_id, 'test-tool')
+      assert.deepEqual(side.messages.slice(0, 2), main.messages.slice(0, 2))
+      assert.deepEqual(summaryBody, before)
+      h.parentGate.resolve()
+      assert.equal((await parent).statusCode, 200)
+    } finally {
+      h.parentGate.resolve()
+      if (parent) await parent
+      h.close()
+    }
+  })
 }
 
 for (const mode of ['rebuild', 'passthrough']) {

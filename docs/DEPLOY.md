@@ -42,7 +42,7 @@ CRAG V2 的资产、工作区和设备授权目录分别使用 Linux 私有 run 
 
 ### CRAG V2 二进制更新
 
-CRAG 签名加密包的附件名为 `crag-v2-licensed-amd64.tar.gz`，包含原版 Claude Code 2.1.321。若 `deploy/payload.json` 固定了 `crag_release`，不指定 tag 时从对应 vm2api Release 拉取配套包；旧版本及显式指定的其他 tag 仍走供应仓 `dofastted/claude-code`。`manifest.version` 的 `v2` 是协议族，实际发行版本见缓存指针的 `release.tag`。原生进程使用非 bare 的 CC TUI。
+CRAG 签名加密包的附件名为 `crag-v2-licensed-amd64.tar.gz`，包含原版 Claude Code 2.1.321。`deploy/payload.json` 的 `crag_release` 是独立的供应仓 tag（例如 `v2.8.16`），不跟随 vm2api 应用版本；未指定 tag 时从 `dofastted/claude-code` 拉取该独立版本。`manifest.version` 的 `v2` 是协议族，实际发行版本见缓存指针的 `release.tag`。原生进程使用非 bare 的 CC TUI。
 
 已有可信出厂包后，可在服务器独立更新，不升级或重启控制面：
 
