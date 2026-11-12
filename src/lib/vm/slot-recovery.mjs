@@ -591,7 +591,7 @@ export async function recoverSlot({
         if (proceed && settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs))
         const current = getVm(projectRoot, id) || vm
         let diagnosis = await diagnose(current)
-        const errors = diagnosis.checks.filter((c) => c.status === 'error')
+        const errors = (diagnosis.checks ?? []).filter((c) => c.status === 'error')
         const onlyOldFault = errors.length === 1 && errors[0].id === 'watchdog' && errors[0].code === 'kernel_faulted'
         // Verify the repaired services first. Only the old L5 marker may remain before reset.
         if (watchdog?.reset && proceed && (diagnosis.ok || onlyOldFault)) {
@@ -600,7 +600,7 @@ export async function recoverSlot({
             return { ok: true, message: faulted ? '已清除内核故障标记与重启计数' : '重启计数已清零' }
           })
           if (reset) {
-            const checks = diagnosis.checks.map((c) =>
+            const checks = (diagnosis.checks ?? []).map((c) =>
               c.id === 'watchdog' ? watchdogCheck(current, slotEngine(current, routing), watchdog, internal) : c,
             )
             const failed = checks.find((c) => c.status === 'error')
