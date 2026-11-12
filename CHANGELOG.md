@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+- 修复 CRAG print 绕过普通出站准备时未应用模型 `max_tokens_cap` 的问题；前置协议清洗现在保留模型缺省 `max_tokens`，并限制超出模型上限的请求。
+
 ## 1.4.078 — 2026-11-13
 
 - 同步 CRAG v2.8.16：TUI 正文输入改用会话专属 tmpfs 共享映射、Unix socket commit 和官方原生队列，保留安全页检测、MCP 工具续接、流式输出、取消、超时与 transcript 收件确认。固定绑定官方 Claude Code 2.1.321；未知构建失败关闭，不回退到 PTY 正文输入。
