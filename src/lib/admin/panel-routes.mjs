@@ -2945,9 +2945,20 @@ export function createPanelHandler(ctx) {
       // POST /api/panel/vms/:id/shell-ticket — single-use ticket for the slot terminal WebSocket
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/shell-ticket$/.test(p)) {
         const body = await readBody(req, 1024).catch(() => ({}))
-        const issued = await ctx.slotShell.issueTicket(p.split('/')[4], { login: body.login === true })
+        const issued = await ctx.slotShell.issueTicket(p.split('/')[4], {
+          login: body.login === true,
+          cliBin: body.cli_bin ?? '',
+        })
         if (!issued.ok) return json(res, issued.status, { ok: false, error: issued.error })
-        return json(res, 200, panel.ok({ ticket: issued.ticket, expires_in: issued.expires_in }))
+        return json(
+          res,
+          200,
+          panel.ok({
+            ticket: issued.ticket,
+            expires_in: issued.expires_in,
+            ...(issued.cli_bin ? { cli_bin: issued.cli_bin } : {}),
+          }),
+        )
       }
       // POST /api/panel/vms/:id/collect-identity
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/collect-identity$/.test(p)) {
@@ -5019,6 +5030,7 @@ export function createPanelHandler(ctx) {
               vm: existing,
               projectRoot: cfg.paths.project,
               routing: ctx.routingConfig,
+              cliBin: body.cli_bin ?? '',
               force: body.force === true || body.force === 'true' || body.force === 1,
             })
             const px = existing.proxy || {}

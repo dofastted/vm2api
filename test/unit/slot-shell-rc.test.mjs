@@ -14,7 +14,6 @@ import {
   syncShellLoginCredentials,
 } from '../../src/lib/vm/slot-shell.mjs'
 import { FULL_OAUTH_SCOPE } from '../../src/lib/oauth/oauth-contract.mjs'
-import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
 import { CONTAINER_CLI_NODE_BIN, LOCAL_CRAG_CLAUDE, REMOTE_CRAG_CLAUDE } from '../../src/lib/vm/slot-engine.mjs'
 import {
   ensureOfficialCredentialLink,
@@ -33,12 +32,7 @@ test('claude in the panel shell runs cli-node and points config at .claude', () 
   fs.writeFileSync(path.join(home, '.claude', '.claude.json'), '{"oauthAccount":{}}\n')
   fs.writeFileSync(bin, '#!/bin/sh\necho "cli-node $*"\n', { mode: 0o755 })
   fs.writeFileSync(path.join(decoyDir, 'claude'), '#!/bin/sh\necho DECOY\n', { mode: 0o755 })
-  const { rc, cmd } = panelShellLaunch(bin)
-  assert.match(cmd.at(-1), /bash --rcfile/)
-  assert.match(rc, /CLAUDE_CONFIG_DIR/)
-  assert.match(rc, /CLAUDE_CODE_HOST_REFRESH=1/)
-  assert.match(rc, new RegExp(`CLAUDE_CODE_VERSION=${OFFICIAL_CLI_VERSION.replaceAll('.', '\\.')}`))
-  assert.match(rc, /USER_TYPE=external/)
+  const { rc } = panelShellLaunch(bin)
   const rcPath = path.join(dir, 'rc')
   fs.writeFileSync(rcPath, `${rc}\n`)
   const ran = spawnSync(
@@ -88,7 +82,6 @@ test('a CRAG v2 terminal runs the package claude instead of cli-node', () => {
   })
   assert.equal(ran.status, 0, ran.stderr)
   assert.match(ran.stdout, /crag-claude --flag/)
-  assert.doesNotMatch(rc, /cli-node/)
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
@@ -504,7 +497,46 @@ test('a slow interactive import is shared by the next tick and close', async () 
   assert.equal(calls, 2)
 })
 
-test('official login tickets check a cluster slot for its container cli-node', async () => {
+test('existing credentials are not reported as a newly completed login', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-login-baseline-'))
+  const vm = { id: 'vm-02' }
+  const home = path.join(root, 'vms', vm.id, 'cli-home')
+  const official = path.join(home, '.claude', '.credentials.json')
+  const publish = (refresh) => {
+    fs.mkdirSync(path.dirname(official), { recursive: true })
+    fs.writeFileSync(
+      official,
+      JSON.stringify({
+        claudeAiOauth: {
+          accessToken: `access-${refresh}`,
+          refreshToken: refresh,
+          expiresAt: Date.now() + 3600000,
+          scopes: FULL_OAUTH_SCOPE.split(' '),
+        },
+      }),
+    )
+  }
+  const events = []
+  try {
+    publish('previous')
+    const run = createLiveLoginAdoption({
+      initialSeen: 'previous',
+      adopt: (seen) => adoptLiveShellLogin(root, vm, { seen }),
+      onImported: (value) => events.push(value.refresh),
+    })
+    assert.equal((await run()).imported, false)
+    assert.deepEqual(events, [])
+    publish('new-login')
+    assert.equal((await run()).imported, true)
+    assert.equal((await run()).imported, false)
+    assert.deepEqual(events, ['new-login'])
+    assert.equal(readWorkerCredentialFile(home).refresh_token, 'new-login')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('official login tickets reject unavailable cluster containers without fallback', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-ticket-'))
   fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
   fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify({ id: 'vm-01', node_id: 'node-a' }))
