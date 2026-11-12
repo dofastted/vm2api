@@ -182,7 +182,7 @@ test('phrase, same-name tool, short budget or public context cannot set purpose'
     assert.equal(classifyClaudeRequestPurpose(input, { officialTraffic: true }), null)
 })
 
-for (const model of ['claude-sonnet-5', 'claude-sonnet-5-5', 'claude-opus-5.5'])
+for (const model of ['claude-sonnet-5-5', 'claude-opus-5.5'])
   test(`${model} XML headroom is bounded and applied once`, () => {
     const input = classifierFixture({ model })
     const body = prepareClassifierBody(input)
@@ -200,6 +200,15 @@ for (const model of ['claude-sonnet-5', 'claude-sonnet-5-5', 'claude-opus-5.5'])
       (e) => e.status === 400 && e.body.error.code === 'classifier_model_incompatible',
     )
   })
+
+test('optional-thinking classifiers preserve an explicit disabled budget and forced tool selection', () => {
+  const input = classifierFixture({ model: 'claude-sonnet-5', format: 'tool' })
+  const body = prepareClassifierBody(input)
+  assert.deepEqual(body.thinking, input.thinking)
+  assert.equal(body.max_tokens, input.max_tokens)
+  assert.deepEqual(body.tool_choice, input.tool_choice)
+  assert.equal(body.temperature, input.temperature)
+})
 
 test('unknown capabilities fail explicitly and never substitute a model', () => {
   assert.throws(
