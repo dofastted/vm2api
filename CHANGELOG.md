@@ -4,6 +4,8 @@
 
 - 修正 CRAG 版本语义：`crag_release` 使用供应仓独立版本 `v2.8.16`，不再跟随 vm2api 的 `v1.4.x` 应用版本。面板默认 CRAG 拉取始终查询 `dofastted/claude-code`，保留显式 CRAG tag。
 - 修正服务器遗留的 CRAG `v1.4.076` 版本指针来源，CRAG 包版本与 vm2api 控制面版本彻底分离。
+- 随 Release 携带现有最新正式 CRAG v2.8.16 的完整签名加密包 `crag-v2-licensed-amd64.tar.gz`（SHA256 `52f602bb0e1074dfd2685f69d045cc22590690a9c0cfc1b83ae133d943e4faad`），同步出厂目录并核验 22 项 pinned payload；原样复用供应包，不重新编译或签名，不宣称包含尚未构建的源码修复。
+- 控制面更新无需 `wrap-cli/sync`；本次不安装或重启槽内 CRAG。需要切换运行内核时，另按排空与授权校验流程执行。
 
 ## 1.4.078 — 2026-11-13
 
