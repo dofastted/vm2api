@@ -58,11 +58,21 @@ export function slashInput(
   intercept: boolean
 ): { line: SlashLine; actions: SlashAction[] } {
   const { buf } = line
+  if (!intercept && buf !== null) return handOff(buf, data)
+  const text =
+    data.startsWith('\x1b[200~') && data.endsWith('\x1b[201~')
+      ? data.slice(6, -6)
+      : data
   if (buf === null) {
-    if (line.clean && intercept && data === '/' && names.length) {
+    if (
+      line.clean &&
+      intercept &&
+      text.startsWith('/') &&
+      names.some((name) => name.startsWith(text))
+    ) {
       return {
-        line: { clean: true, buf: '/' },
-        actions: [{ kind: 'echo', data: '/' }],
+        line: { clean: true, buf: text },
+        actions: [{ kind: 'echo', data: text }],
       }
     }
     return {
@@ -104,12 +114,12 @@ export function slashInput(
       actions: rest ? [{ kind: 'echo', data: rest }] : [],
     }
   }
-  if (printable(data)) {
-    const next = buf + data
+  if (printable(text)) {
+    const next = buf + text
     if (names.some((n) => n.startsWith(next))) {
       return {
         line: { clean: true, buf: next },
-        actions: [{ kind: 'echo', data }],
+        actions: [{ kind: 'echo', data: text }],
       }
     }
   }

@@ -82,7 +82,8 @@
 | POST | `/vms/:id/oauth/refresh` | 只转发 worker `Ensure`，不回 token |
 | POST | `/vms/:id/oauth/to-setup-token` | 把当前完整 OAuth 活票改成 Setup Token（保留 refresh/过期）。已是 setup-token 则幂等 |
 | POST | `/vms/:id/oauth/generate-auth-url` | PKCE 授权链接；无 SOCKS5 拒绝。`{ flavor: "claude_code" }` 为官方 Claude Code 授权页。`{ flavor: "setup_token" }` 为 inference-only PKCE，不启槽内 CLI |
-| POST | `/vms/:id/oauth/exchange-code` | 粘贴授权码，经槽代理换票。完整 OAuth 才排队初装。flavor 以 session 为准 |
+| POST | `/vms/:id/oauth/exchange-code` | 粘贴授权码，经槽代理换票；导入并同步 VM 客户端后才返回成功。完整 OAuth 才排队初装。flavor 以 session 为准 |
+| POST | `/vms/:id/credentials/sync` | 管理员手动同步 Claude 客户端凭证，成功返回 `{ synced: true }`。无凭证返回 409，同步失败返回 502；不换票、不回传 token。远程槽保留节点已轮换凭证并修复客户端链接 |
 | GET/POST | `/vms/:id/official-cc-bootstrap` | 初装进度 / `{ manual:true }` 再跑 |
 | GET/PUT | `/vms/:id/seed-settings` | 播种；面板默认锁定，解锁后改、播种前确认。`settings.json` 可编辑 env（经 `extra_env`）与 `theme`；`autoUpdates`/`grove_enabled` 与 TZ/LANG/LC_ALL、telemetry/bedrock/vertex 等契约 env 只读展示，TZ/LANG 经 PUT `timezone` / `timezone_follow_proxy` / `locale` 写入槽位后再播种，不经 `extra_env`；`claude_setting` 可编辑。`GET ?debug=1` 额外返回 `telemetry_log`（最近 40 行脱敏上传审计，默认不带） |
 | POST | `/vms/:id/collect-identity` | guest 采集（locale/tz/`guest_machine_id`、槽内 `/etc/os-release` 的 `VERSION_ID`、系统与架构）；Codex Analytics 只使用这次采集的运行环境 |
@@ -108,8 +109,8 @@
 | DELETE | `/vms/:id` | 多槽时不能删仍占 `active.json` 的槽（409 `switch active first`）；管理台删除确认可在有健康可调度候选时先 `activate` 再删。只解绑本槽代理 |
 | POST | `/vms/create` | 种子 VM + Claude Code home；依赖私有 `kin-computer`。未安装返回 400 `computer_service_missing`，身份生成失败返回 400 `computer_create_failed`。Docker 槽可在 `machine` 里可选传 `docker_cpus`（见下） |
 | POST | `/vms/import` | sessionKey 导入（必须已有 VM+代理） |
-| POST | `/vms/:id/shell-ticket` | 30 秒单次终端票据。普通运维 `{}`；原生 CC 登录 `{ login: true, cli_bin?: "/槽内/原生/claude" }`。省略 / 空路径使用 CRAG 包内原生 CC，与推理内核无关；登录响应含最终 `cli_bin`。程序不存在或不可执行时拒绝，不回落 cli-node |
-| WS | `/vms/:id/shell?ticket=&cols=&rows=&login=1` | 登录标志须与票据一致，程序路径只取票据，不接受 query 覆盖。输入 `{"t":"d","d":"…"}`，尺寸 `{"t":"r","c":列,"r":行}`；二进制输出，文本 `exit` / `error` / `login`（面板导入凭证成功） |
+| POST | `/vms/:id/shell-ticket` | `{}` 获取 30 秒单次运维终端票据。`login: true` 返回 409 `panel_login_required`，换票统一走账号面板。终端 Claude 使用包内原生客户端，与推理内核无关 |
+| WS | `/vms/:id/shell?ticket=&cols=&rows=` | 输入 `{"t":"d","d":"…"}`，尺寸 `{"t":"r","c":列,"r":行}`；二进制输出，文本 `exit` / `error`。启动前检查原生 CC 可执行文件；不接受登录升级 |
 | GET | `/vms/fleet-status` | 全槽更新状态 |
 | POST | `/vms/fleet-update` | 全槽 roll / 采集；`action=telemetry` 只更新 Go telemetry/egress 服务，不重建 VM |
 | POST | `/vms/reconcile-fingerprints` | 用官方 `~/.claude.json` 对齐指纹 |

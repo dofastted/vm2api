@@ -187,14 +187,14 @@ function officialGrantWins(official, worker) {
  * grant is copied onto the worker file first. Deleting it and refreshing
  * the older RT is what revokes the new grant.
  */
-export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false } = {}) {
+export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false, adoptOfficial = true } = {}) {
   const claudeDir = path.join(homeDir || '', '.claude')
   const workerFile = path.join(claudeDir, 'credentials.json')
   const officialFile = path.join(claudeDir, '.credentials.json')
   if (!homeDir) return { wrote: false, error: 'home missing' }
   const officialGrant = regularOauthGrant(officialFile)
   const workerGrant = regularOauthGrant(workerFile)
-  const adopt = officialGrantWins(officialGrant, workerGrant)
+  const adopt = adoptOfficial && officialGrantWins(officialGrant, workerGrant)
   if (!workerGrant && !fs.existsSync(workerFile)) {
     if (!adopt && !create) return { wrote: false, error: 'worker credentials.json missing' }
     fs.mkdirSync(claudeDir, { recursive: true, mode: 0o700 })
@@ -443,7 +443,7 @@ export function writeWorkerCredentialFile(homeDir, cred) {
     )
     chownSlotCredentialFile(homeDir, file)
     sealSlotCredentialFile(file)
-    ensureOfficialCredentialLink(homeDir)
+    ensureOfficialCredentialLink(homeDir, { adoptOfficial: false })
     return file
   }
   const n = normalizeOauth(cred)
@@ -492,7 +492,7 @@ export function writeWorkerCredentialFile(homeDir, cred) {
   atomicWriteJson(file, { type: mode, authScheme, kinGeneration: generation, claudeAiOauth: oauth }, { mode: 0o600 })
   chownSlotCredentialFile(homeDir, file)
   sealSlotCredentialFile(file)
-  ensureOfficialCredentialLink(homeDir)
+  ensureOfficialCredentialLink(homeDir, { adoptOfficial: false })
   return file
 }
 
