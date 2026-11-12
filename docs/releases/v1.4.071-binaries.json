@@ -1,0 +1,93 @@
+{
+  "schema": 1,
+  "application_version": "1.4.071",
+  "release_tag": "v1.4.071",
+  "cloud_source_basis": {
+    "main_commit": "270fa09ab2264055a24600bbce07294a272ac903",
+    "latest_full_release": "v1.4.070",
+    "latest_full_release_commit": "c37c77c7cf51475a34ed8d33a08cdd5150d27be5",
+    "integration": "Merge both cloud histories without rebasing or rewriting existing commits."
+  },
+  "payload": {
+    "manifest": "deploy/payload.json",
+    "release": "v1.4.071",
+    "paths": 22,
+    "unique_assets": 21,
+    "changed_from_latest_full_release": [
+      "bin/kin-codex-kernel"
+    ],
+    "other_payload_paths_preserved": 21
+  },
+  "codex_kernel": {
+    "version": "0.1.2",
+    "source_release": "codex-kernel-v0.1.2",
+    "size": 5927624,
+    "sha256": "ec9abb0160eaa0c8fda474c52fcfab592a4a2b905da4e4525e14fee9fb61376d",
+    "source_commit": "ec32e55f1fdf22657a4595571bc03985586f6984",
+    "source_tree": "c601a593f387071729926336ff98058904fdd5c0",
+    "build_record": "docs/releases/codex-kernel-v0.1.2.json"
+  },
+  "claude_cli": {
+    "version": "2.1.321",
+    "source_release": "v1.4.070",
+    "size": 27941064,
+    "sha256": "2fb99a6d58939e33b2402e862966f81668bf6266bb78f9a01b46bacf5e086c5c",
+    "embedded_source_sha256": "a35349bbd7e1b706f35beab73d66e7d141b01da7c0b5283f4531ed2804bfaff8",
+    "build_record": "docs/releases/v1.4.070-binaries.json"
+  },
+  "native_crag": {
+    "source_release": "v1.4.070",
+    "signed_manifest": "share/crag/kernels/v2/amd64/manifest.json",
+    "member_count": 8,
+    "signing_authority_and_bytes_preserved": true
+  },
+  "complete_release_assets": [
+    "SHA256SUMS",
+    "build-provenance.json",
+    "cc-node",
+    "cli-node",
+    "crag-v2-amd64-LICENSES.txt",
+    "crag-v2-amd64-claude-code-2.1.321-LICENSE.md",
+    "crag-v2-amd64-claude-code-2.1.321-claude",
+    "crag-v2-amd64-crag-license-public.pem",
+    "crag-v2-amd64-crag-v2",
+    "crag-v2-amd64-crag-v2.payload.enc",
+    "crag-v2-amd64-kernel.json.example",
+    "crag-v2-amd64-manifest.json",
+    "kin-codex-kernel",
+    "kin-computer",
+    "kin-egress",
+    "kin-egress-linux-arm64",
+    "kin-kernel",
+    "kin-kernel-crag",
+    "kin-oauth-auth",
+    "kin-slot-gate",
+    "kin-worker",
+    "kin-worker-linux-arm64",
+    "ld-linux-x86-64.so.2",
+    "libc.so.6",
+    "libgcc_s.so.1",
+    "libm.so.6",
+    "payload.json"
+  ],
+  "images": {
+    "repository": "ghcr.io/dofastted/vm2api",
+    "tag": "v1.4.071",
+    "architectures": [
+      "amd64",
+      "arm64"
+    ],
+    "publication_gate": "The release workflow and platform manifest must complete before marking the application release Latest."
+  },
+  "activation": {
+    "existing_slot_processes_require_explicit_activation": true,
+    "preserve_custom_kernel_selections": true,
+    "preserve_stopped_slots": true
+  },
+  "verification_policy": {
+    "github_ci_wait": false,
+    "release_build_required": true,
+    "cloud_asset_digest_and_checksum_verification_required": true,
+    "actual_live_requests_required": true
+  }
+}

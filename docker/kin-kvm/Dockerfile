@@ -43,6 +43,7 @@ RUN chmod 755 /usr/local/bin/kin-kvm-entry /usr/local/bin/kin-guest-exec \
       /opt/kin-kvm/guest/kin-guest-setup \
       /opt/kin-kvm/guest/install-guest.sh \
       /opt/kin-kvm/guest/kin-kernel-start \
+      /opt/kin-kvm/guest/kin-kernel-cpu \
       /opt/kin-kvm/guest/kin-kernel-relay.py \
  && chmod 644 /opt/kin-kvm/guest/*.service /opt/kin-kvm/guest/user-data
 

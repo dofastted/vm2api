@@ -7,6 +7,7 @@ import { createKernelWatchdog } from '../../src/lib/transport/kernel-watchdog.mj
 import { kernelFaults } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { dockerEnvMap, ensureKvmMachineRecord, kvmEnvMapIncomplete } from '../../src/lib/vm/kvm-machine.mjs'
 import { REMOTE_CRAG_ENTRY, REMOTE_KERNEL_ENTRY } from '../../src/lib/vm/slot-engine.mjs'
+import { kernelCpuCommand } from '../../src/lib/vm/kernel-cpu.mjs'
 
 // Execute the exact production lifecycle body with synthetic I/O boundaries.
 // No SSH, Docker daemon, credentials or production filesystem is accessed.
@@ -30,12 +31,13 @@ function cragReadyContainer(base) {
     },
   }
 }
-function kernelContainer(base) {
+function kernelContainer(base, cpuWrapped = false) {
+  const argv = [REMOTE_KERNEL_ENTRY, '--gateway-worker', '--config', '/run/kin/kernel.json']
   return {
     ...base,
     Config: {
       ...base.Config,
-      Cmd: [REMOTE_KERNEL_ENTRY, '--gateway-worker', '--config', '/run/kin/kernel.json'],
+      Cmd: cpuWrapped ? kernelCpuCommand(argv) : argv,
     },
   }
 }
@@ -48,6 +50,7 @@ function fixture({
   kind = 'docker',
   removeFails = false,
   cragReady = false,
+  cpuWrapped = false,
 } = {}) {
   const calls = []
   const target = {
@@ -66,7 +69,13 @@ function fixture({
     HostConfig: { NetworkMode: 'network' },
     State: { Running: running, Restarting: restarting },
   }
-  let info = missing ? null : kind !== 'docker' ? base : cragReady ? cragReadyContainer(base) : kernelContainer(base)
+  let info = missing
+    ? null
+    : kind !== 'docker'
+      ? base
+      : cragReady
+        ? cragReadyContainer(base)
+        : kernelContainer(base, cpuWrapped)
   const io = {
     prepare: async () => ({
       nodeId: target.node_id,
@@ -141,6 +150,7 @@ for (const kind of ['docker', 'kvm']) {
 
 for (const [options, action, calls] of [
   [{}, 'already-running', ['runtime']],
+  [{ cpuWrapped: true }, 'already-running', ['runtime']],
   [{ running: false }, 'started', ['files', 'start', 'runtime']],
   [{ missing: true }, 'created', ['files', 'create', 'start', 'runtime']],
   [{ mismatch: true }, 'created', ['remove', 'files', 'create', 'start', 'runtime']],
@@ -152,6 +162,15 @@ for (const [options, action, calls] of [
     assert.deepEqual(f.calls, calls)
   })
 }
+
+test('remote readiness accepts direct and CPU-wrapped entries but not another executable', () => {
+  const vm = { node_id: 'node-fixture' }
+  for (const cpuWrapped of [false, true]) {
+    assert.equal(clusterDockerCommandReady(vm, kernelContainer({}, cpuWrapped), {}), true)
+  }
+  const wrong = kernelCpuCommand(['/bin/sleep', 'infinity'])
+  assert.equal(clusterDockerCommandReady(vm, { Config: { Cmd: wrong } }, {}), false)
+})
 
 test('failed restart-loop removal does not create or claim successful recovery', async () => {
   const f = fixture({ restarting: true, removeFails: true })

@@ -1,0 +1,132 @@
+#!/bin/sh
+set -eu
+
+TOKIO_WORKER_THREADS=$(awk -v proc="${KIN_KERNEL_PROC_ROOT:-/proc}" -v ceiling="${KIN_KERNEL_CPU_CEILING:-}" '
+function lower(value) {
+  value = int(value) + (value > int(value))
+  if (value < 1) value = 1
+  if (value < count) count = value
+}
+function unescape(value) {
+  gsub(/\\040/, " ", value)
+  gsub(/\\011/, "\t", value)
+  gsub(/\\012/, "\n", value)
+  gsub(/\\134/, "\\\\", value)
+  return value
+}
+function safe_path(value) {
+  return value ~ /^\// && value !~ /(^|\/)\.\.?($|\/)/
+}
+function belongs_to_process(directory, pid, file, row) {
+  file = directory "/cgroup.procs"
+  while ((getline row < file) > 0) {
+    sub(/\r$/, "", row)
+    if (row == pid) { close(file); return 1 }
+  }
+  close(file)
+  return 0
+}
+function quotas(directory, mount, version, quota, period, row, fields, file) {
+  while (1) {
+    if (version == 2) {
+      file = directory "/cpu.max"
+      if ((getline row < file) > 0) {
+        split(row, fields)
+        quota = fields[1]
+        period = fields[2]
+      } else quota = period = ""
+      close(file)
+    } else {
+      file = directory "/cpu.cfs_quota_us"
+      quota = ""
+      if ((getline row < file) > 0) quota = row
+      close(file)
+      file = directory "/cpu.cfs_period_us"
+      period = ""
+      if ((getline row < file) > 0) period = row
+      close(file)
+    }
+    if (quota ~ /^[0-9]+$/ && period ~ /^[0-9]+$/ && period + 0 > 0)
+      lower(quota / period)
+    if (directory == mount) break
+    sub(/\/[^/]+$/, "", directory)
+    if (directory == "") directory = "/"
+  }
+}
+BEGIN {
+  count = 1
+  file = proc "/self/status"
+  while ((getline row < file) > 0) {
+    if (row !~ /^Cpus_allowed_list:/) continue
+    sub(/^[^:]*:[ \t]*/, "", row)
+    sub(/[ \t]+$/, "", row)
+    total = 0
+    valid = 1
+    size = split(row, cpus, ",")
+    for (cpu = 1; cpu <= size; cpu++) {
+      if (cpus[cpu] !~ /^[0-9]+(-[0-9]+)?$/) { valid = 0; break }
+      parts = split(cpus[cpu], range, "-")
+      if (parts == 2 && range[2] + 0 < range[1] + 0) { valid = 0; break }
+      total += parts == 2 ? range[2] - range[1] + 1 : 1
+    }
+    if (valid && total > 0) count = total
+    break
+  }
+  close(file)
+  if (ceiling ~ /^[0-9]+$/ && ceiling + 0 > 0) lower(ceiling + 0)
+
+  file = proc "/self/stat"
+  if ((getline row < file) > 0) {
+    sub(/ .*/, "", row)
+    if (row ~ /^[0-9]+$/) currentPid = row
+  }
+  close(file)
+  file = proc "/self/cgroup"
+  while ((getline row < file) > 0) {
+    split(row, fields, ":")
+    membership = row
+    sub(/^[^:]*:[^:]*:/, "", membership)
+    if (fields[1] == "0" && fields[2] == "") unified = membership
+    if (index("," fields[2] ",", ",cpu,")) legacy = membership
+  }
+  close(file)
+  file = proc "/self/mountinfo"
+  while ((getline row < file) > 0) {
+    split(row, sides, " - ")
+    split(sides[1], mountFields, " ")
+    split(sides[2], fsFields, " ")
+    version = 0
+    if (fsFields[1] == "cgroup2") { version = 2; membership = unified }
+    if (fsFields[1] == "cgroup" && index("," fsFields[3] ",", ",cpu,")) {
+      version = 1
+      membership = legacy
+    }
+    if (!version || !safe_path(membership)) continue
+    root = unescape(mountFields[4])
+    mount = unescape(mountFields[5])
+    if (!safe_path(root) || !safe_path(mount)) continue
+    namespaceRelative = 0
+    if (root == "/") suffix = membership == "/" ? "" : membership
+    else if (membership == root) suffix = ""
+    else if (index(membership, root "/") == 1) suffix = substr(membership, length(root) + 1)
+    else {
+      namespaceRelative = 1
+      suffix = membership == "/" ? "" : membership
+    }
+    directory = (mount == "/" ? "" : mount) suffix
+    if (directory == "") directory = "/"
+    # Only namespace-relative guesses need PID proof; normal mappings may lack readable cgroup.procs.
+    # Skip unverified inherited paths: unrelated mounts or hidden namespace ancestors cannot be resolved safely.
+    if (namespaceRelative && (currentPid !~ /^[0-9]+$/ || !belongs_to_process(directory, currentPid))) continue
+    quotas(directory, mount, version)
+  }
+  close(file)
+  printf "%.0f\n", count
+}')
+export TOKIO_WORKER_THREADS
+
+if [ "${1:-}" = --count ]; then
+  printf '%s\n' "$TOKIO_WORKER_THREADS"
+  exit 0
+fi
+exec "$@"

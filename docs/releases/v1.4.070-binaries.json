@@ -1,0 +1,35 @@
+{
+  "source_commit": "3f4b4e0dfcbf016a182de329bbce1f1754624938",
+  "embedded_source_sha256": "a35349bbd7e1b706f35beab73d66e7d141b01da7c0b5283f4531ed2804bfaff8",
+  "plain_sha256": "b32c5670a7df9bb9934a81ff2df6d94d5824f32ba8bc7ad65c7c58705a87242c",
+  "embedded_source_bytes": 24884027,
+  "claude_version": "2.1.321",
+  "bun_version": "1.3.14",
+  "target": "bun-linux-x64-baseline",
+  "upx_version": "5.0.2",
+  "upx_options": ["--best", "--lzma"],
+  "cli_upx_sha256": "2fb99a6d58939e33b2402e862966f81668bf6266bb78f9a01b46bacf5e086c5c",
+  "cli_upx_bytes": 27941064,
+  "shared_betas_sha256": "48fd78f173778c7879678ee7dc537f3169f208f0a83c672ce12f6bec24a7ee41",
+  "source_baseline": "v1.4.069",
+  "regression_tests": {
+    "telemetry_passed": 32,
+    "failed": 0
+  },
+  "historical_tags": [
+    "v1.4.057",
+    "v1.4.058",
+    "v1.4.059",
+    "v1.4.060",
+    "v1.4.061",
+    "v1.4.062",
+    "v1.4.063",
+    "v1.4.064",
+    "v1.4.065",
+    "v1.4.066",
+    "v1.4.067",
+    "v1.4.068",
+    "v1.4.069"
+  ],
+  "production_deployed": false
+}

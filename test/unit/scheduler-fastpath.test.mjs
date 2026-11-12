@@ -212,6 +212,129 @@ test('capacity queue time is separate and cancellation frees its ticket', async 
   assert.equal(pool.inflight.size, 0)
 })
 
+async function queueRequest(pool, args) {
+  const before = pool.queuedTotal()
+  const entered = new Promise((resolve) => {
+    const listener = () => {
+      if (pool.queuedTotal() <= before) return
+      pool.off('change', listener)
+      resolve()
+    }
+    pool.on('change', listener)
+  })
+  const result = pool.selectAndReserve({ ...options, excluded: new Set(['fast-account-2']), allowWait: true, ...args })
+  await Promise.race([entered, result.then(() => assert.fail('request did not queue'))])
+  return { result }
+}
+
+for (const seatKey of [null, 'seat:sess:handoff']) {
+  test(`${seatKey ? 'seat' : 'direct'} handoff owns capacity before wake and recycles a cancelled grant`, async (t) => {
+    const { pool, quota } = fixture(t, { concurrency: 1 })
+    const args = { ...options, excluded: new Set(['fast-account-2']), seatKey }
+    const held = await pool.selectAndReserve(args)
+    assert(held.ok)
+    const controller = new AbortController()
+    const cancelled = await queueRequest(pool, { seatKey, signal: controller.signal })
+    const next = await queueRequest(pool, { seatKey })
+    const rejected = assert.rejects(cancelled.result, { code: 'selection_cancelled' })
+    held.release()
+    assert.equal(pool.inflight.get(held.accountId), 1, 'release synchronously transfers the permit')
+    assert.equal(quota.inflight.get(held.accountId), 1)
+    assert.equal(pool.queuedTotal(), 1)
+    const newcomer = pool.selectAndReserve(args)
+    controller.abort()
+    await rejected
+    const granted = await next.result
+    assert(granted.ok)
+    assert.equal((await newcomer).ok, false)
+    granted.release()
+    assert.equal(pool.inflight.size, 0)
+    assert.equal(quota.inflight.get(held.accountId), 0)
+    assert.equal(pool.queuedTotal(), 0)
+  })
+}
+
+test('direct handoff skips an expired waiter and does not dispatch into a new cooldown', async (t) => {
+  const { pool, runtime } = fixture(t, { concurrency: 1 })
+  const held = await pool.selectAndReserve(options)
+  assert.equal(held.accountId, 'fast-account-1')
+  const deadline = Date.now() + 500
+  const expired = await queueRequest(pool, { deadline })
+  const waiting = await queueRequest(pool, {})
+  runtime.updateWindow(held.accountId, { vmId: held.vmId, overloadUntil: Date.now() + 60000 })
+  held.release()
+  assert.equal(pool.inflight.size, 0)
+  runtime.updateWindow(held.accountId, { vmId: held.vmId, overloadUntil: Date.now() - 1 })
+  const now = Date.now
+  Date.now = () => deadline + 1
+  try {
+    pool.notifyCapacity()
+    assert.equal(pool.inflight.get(held.accountId), 1, 'threshold lift grants without another release')
+  } finally {
+    Date.now = now
+  }
+  assert.equal((await expired.result).ok, false)
+  const granted = await waiting.result
+  assert(granted.ok)
+  granted.release()
+})
+
+test('a direct queue refresh cannot restart the shorter lane timeout', async (t) => {
+  const { pool } = fixture(t, { concurrency: 1 })
+  t.mock.timers.enable({ apis: ['Date'] })
+  const start = Date.now()
+  const held = await pool.selectAndReserve({ ...options, excluded: new Set(['fast-account-2']) })
+  const waiting = await queueRequest(pool, { deadline: start + 10_000 })
+  const requeued = new Promise((resolve) => {
+    const listener = () => {
+      if (pool.queuedTotal() !== 1) return
+      pool.off('change', listener)
+      resolve()
+    }
+    pool.on('change', listener)
+  })
+  t.mock.timers.setTime(start + 600)
+  pool.notifyCapacity()
+  await requeued
+  t.mock.timers.setTime(start + 1001)
+  held.release()
+  assert.equal(pool.inflight.size, 0)
+  assert.equal((await waiting.result).ok, false)
+})
+
+test('maintenance grants a queued request after cooldown without another release', async (t) => {
+  const { pool, runtime } = fixture(t, { concurrency: 1 })
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: Date.now() })
+  pool.config.fallback_wait_timeout_ms = 4000
+  const held = await pool.selectAndReserve(options)
+  const waiting = await queueRequest(pool, {})
+  runtime.updateWindow(held.accountId, { vmId: held.vmId, overloadUntil: Date.now() + 1000 })
+  held.release()
+  assert.equal(pool.inflight.size, 0)
+  assert.equal(pool.queuedTotal(), 1)
+  t.mock.timers.tick(2000)
+  const granted = await waiting.result
+  assert(granted.ok)
+  assert.equal(granted.accountId, held.accountId)
+  granted.release()
+})
+
+test('failed device affinity setup does not strand a seat request permit', async (t) => {
+  const { pool, quota } = fixture(t, { concurrency: 1 })
+  const accountId = 'fast-account-1'
+  const args = { ...options, excluded: new Set(['fast-account-2']), seatKey: 'seat:sess:setup' }
+  const binding = t.mock.method(pool, 'rememberMachine', () => {
+    throw new Error('affinity write failed')
+  })
+  await assert.rejects(pool.selectAndReserve(args), /affinity write failed/)
+  binding.mock.restore()
+  assert.equal(pool.inflight.size, 0)
+  assert.equal(quota.inflight.get(accountId), 0)
+  const next = await pool.selectAndReserve(args)
+  assert(next.ok)
+  next.release()
+})
+
 test('late heartbeat and generic runtime updates cannot overwrite newer health or cooldowns', async (t) => {
   const { pool, runtime } = fixture(t)
   const exec = { vmId: 'vm-01', accountId: 'fast-account-1' }

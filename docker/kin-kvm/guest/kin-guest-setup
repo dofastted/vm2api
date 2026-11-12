@@ -152,6 +152,9 @@ KIN_VM_NAME=${KIN_VM_NAME:-}
 KIN_VM_OS=${KIN_VM_OS:-}
 KIN_SUBMIT_WAIT_MS=30000
 EOF
+  if [ -n "${KIN_KERNEL_CPU_CEILING:-}" ]; then
+    printf 'KIN_KERNEL_CPU_CEILING=%s\n' "$KIN_KERNEL_CPU_CEILING" >> /run/kin-guest/slot.env
+  fi
   chown kincli:"$KIN_KVM_GID" /run/kin-guest /run/kin-guest/slot.env 2>/dev/null || true
   chmod 0770 /run/kin-guest
   cat > /etc/systemd/system/kin-kernel.service.d/slot.conf <<EOF

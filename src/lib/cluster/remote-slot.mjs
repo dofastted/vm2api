@@ -36,6 +36,7 @@ import {
   resolveKernelDataplane,
 } from '../vm/slot-engine.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
+import { kernelCpuCommand, kernelCpuCommandMatches, usesKernelCpuLimit } from '../vm/kernel-cpu.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
 import { slotMemory, slotDockerCpus, memoryMiB, normalizeVmConfig } from '../vm/machine-spec.mjs'
@@ -112,7 +113,7 @@ export function clusterDockerCommandReady(vm, info, routing) {
     resolveKernelDataplane(vm, routing || {}) === 'crag' && resolveCragKernelVersion(vm, routing || {}) === 'v2'
   if (crag) return clusterCragContainerReady(info)
   const cmd = info?.Config?.Cmd || []
-  return Array.isArray(cmd) && cmd[0] === REMOTE_KERNEL_ENTRY
+  return Array.isArray(cmd) && (cmd[0] === REMOTE_KERNEL_ENTRY || kernelCpuCommandMatches(cmd, REMOTE_KERNEL_ENTRY))
 }
 
 export function clusterCragContainerReady(info) {
@@ -687,6 +688,7 @@ function kvmSlotContainerBody(vm, { image, network, remoteDir, routing, accel, s
       `KIN_KVM_MACHINE_ID=${machineId}`,
       `KIN_KVM_ACCEL=${accel}`,
       'KIN_KVM_SHARES=home,run,claude',
+      ...(usesKernelCpuLimit(vm, routing) ? ['KIN_KVM_KERNEL_CPU_LIMIT=1'] : []),
     ],
     Labels: {
       'kin.vm': '1',
@@ -733,6 +735,7 @@ export function slotContainerBody(vm, { image, network, remoteDir, user, routing
   const crag =
     !codex && resolveKernelDataplane(vm, routing) === 'crag' && resolveCragKernelVersion(vm, routing) === 'v2'
   const entry = crag ? REMOTE_CRAG_ENTRY : REMOTE_KERNEL_ENTRY
+  const argv = [entry, '--gateway-worker', '--config', '/run/kin/kernel.json']
   return {
     Image: image,
     Hostname: String(vm.fingerprint?.hostname || '').trim() || slotName,
@@ -748,7 +751,7 @@ export function slotContainerBody(vm, { image, network, remoteDir, user, routing
       `KIN_VM_OS=${vm.kernel}`,
     ],
     // Node images bake the Claude kernel here; local slots bind-mount a different path.
-    Cmd: codex ? ['sleep', 'infinity'] : [entry, '--gateway-worker', '--config', '/run/kin/kernel.json'],
+    Cmd: codex ? ['sleep', 'infinity'] : usesKernelCpuLimit(vm, routing) ? kernelCpuCommand(argv) : argv,
     Labels: {
       'kin.vm': '1',
       'kin.vm.id': vm.id,

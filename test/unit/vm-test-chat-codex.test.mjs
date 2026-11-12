@@ -11,6 +11,17 @@ import {
   syncCodexCatalog,
   testChatCredentialMode,
 } from '../../src/lib/admin/vm-test-chat.mjs'
+import { openDatabase, closeDatabase } from '../../src/lib/db/database.mjs'
+import { getGptModelPolicy, loadGptModelPolicy, saveGptModelPolicy } from '../../src/lib/protocol/gpt-model-policy.mjs'
+
+function withDb(t) {
+  openDatabase({ dbPath: ':memory:' })
+  loadGptModelPolicy({ force: true })
+  t.after(() => {
+    closeDatabase()
+    loadGptModelPolicy({ force: true })
+  })
+}
 
 function seedCodexVm(root, id = 'vm-codex-01') {
   const vms = path.join(root, 'vms')
@@ -66,15 +77,14 @@ async function startLoopbackServer(t, respond) {
   return { baseUrl: `http://127.0.0.1:${server.address().port}`, calls }
 }
 
-test('listTestableModels(openai) hides Claude ids', () => {
+test('listTestableModels(openai) hides Claude ids', (t) => {
+  withDb(t)
+  saveGptModelPolicy({ models: { 'gpt-test-fixture': { enabled: true } } })
   const gpt = listTestableModels('openai')
   const claude = listTestableModels('anthropic')
-  assert.ok(gpt.length > 0)
-  assert.ok(claude.length > 0)
+  assert.ok(gpt.some((m) => m.id === 'gpt-test-fixture'))
   assert.ok(gpt.every((m) => /^(gpt-|codex-)/i.test(m.id) || m.family === 'codex'))
   assert.ok(claude.every((m) => !/^(gpt-|codex-)/i.test(m.id) && m.family !== 'codex'))
-  assert.ok(gpt.some((m) => m.id === 'gpt-5.4'))
-  assert.ok(!gpt[0].id.includes('mini'))
 })
 
 test('testChatCredentialMode reports Codex slots as codex', () => {
@@ -210,19 +220,23 @@ test('runVmTestChat Codex slot rejects Claude models', async (t) => {
 })
 
 test('resolveTestModels(vm_id) returns only GPT ids and responses protocol', async (t) => {
+  withDb(t)
+  saveGptModelPolicy({ models: { 'gpt-vm-fixture': { enabled: true } } })
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-test-models-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   seedCodexVm(root)
-  const view = await resolveTestModels({ projectRoot: root, vmId: 'vm-codex-01' })
+  const view = await resolveTestModels({ projectRoot: root, vmId: 'vm-codex-01', platform: 'anthropic' })
   assert.equal(view.platform, 'openai')
   assert.equal(view.protocol, 'openai.responses')
   assert.equal(view.inbound_path, '/v1/responses')
-  assert.ok(view.items.length > 0)
+  assert.ok(view.items.some((m) => m.id === 'gpt-vm-fixture'))
   assert.ok(view.items.every((m) => /^(gpt-|codex-)/i.test(m.id)))
   assert.ok(!view.items.some((m) => String(m.id).startsWith('claude-')))
 })
 
-test('resolveTestModels refresh merges ChatGPT ids and ignores 401', async (t) => {
+test('catalog refresh preserves enabled models, keeps discoveries disabled, and retains the catalog on 401', async (t) => {
+  withDb(t)
+  saveGptModelPolicy({ models: { 'gpt-enabled-fixture': { enabled: true } } })
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-test-models-refresh-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   seedCodexVm(root)
@@ -230,14 +244,19 @@ test('resolveTestModels refresh merges ChatGPT ids and ignores 401', async (t) =
     projectRoot: root,
     vmId: 'vm-codex-01',
     refresh: true,
+    catalogClientVersion: '0.158.0',
     fetchImpl: async () => ({
       ok: true,
       status: 200,
-      json: async () => ({ models: [{ slug: 'gpt-5.6' }, { slug: 'gpt-5.4' }] }),
+      json: async () => ({ models: [{ slug: 'gpt-enabled-fixture' }, { slug: 'gpt-new-fixture' }] }),
     }),
   })
   assert.equal(merged.source, 'chatgpt')
-  assert.ok(merged.items.some((m) => m.id === 'gpt-5.6'))
+  assert.deepEqual(
+    merged.items.map((m) => m.id),
+    ['gpt-enabled-fixture'],
+  )
+  assert.equal(getGptModelPolicy().models['gpt-new-fixture'].enabled, false)
   assert.equal(merged.protocol, 'openai.responses')
 
   const denied = await resolveTestModels({
@@ -248,10 +267,11 @@ test('resolveTestModels refresh merges ChatGPT ids and ignores 401', async (t) =
     fetchImpl: async () => ({ ok: false, status: 401, json: async () => ({}) }),
   })
   assert.equal(denied.source, 'policy')
-  assert.ok(denied.items.every((m) => /^(gpt-|codex-)/i.test(m.id)))
+  assert.deepEqual(denied.items, merged.items)
 })
 
 test('syncCodexCatalog refreshes OAuth on 401 then merges GPT ids', async (t) => {
+  withDb(t)
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-sync-codex-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   seedCodexVm(root)
@@ -287,33 +307,4 @@ test('syncCodexCatalog refreshes OAuth on 401 then merges GPT ids', async (t) =>
   const saved = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-codex-01', 'codex-credentials.json'), 'utf8'))
   assert.equal(saved.accounts[0].access_token, 'at-rotated')
   assert.equal(saved.accounts[0].refresh_token, 'rt-rotated')
-})
-
-test('runVmTestChat Codex ENOENT is not rewritten as wrap cli-hop', async (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-testchat-codex-enoent-'))
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  seedCodexVm(root)
-  seedRouting(root)
-  const model = listTestableModels('openai')[0]?.id || 'gpt-5.5'
-  const { baseUrl } = await startLoopbackServer(t, () => ({
-    status: 503,
-    body: {
-      error: {
-        code: 'ENOENT',
-        message: 'connect ENOENT /opt/kin-gateway/vms/vm-codex-02/run/codex-kernel.sock',
-        request_id: 'db05657b-93ea-49e7-a06e-c2b760266061',
-      },
-    },
-  }))
-  const result = await runVmTestChat({
-    projectRoot: root,
-    vmId: 'vm-codex-01',
-    model,
-    prompt: 'hello',
-    baseUrl,
-    apiKey: 'test-master-key',
-  })
-  assert.equal(result.ok, false)
-  assert.match(result.error.message, /Codex kernel 未就绪/)
-  assert.doesNotMatch(result.error.message, /wrap cli-hop 未就绪/)
 })

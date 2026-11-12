@@ -61,16 +61,7 @@ jobs:
             控制面镜像：`ghcr.io/dofastted/vm2api:${{ github.ref_name }}`（多架构），`${{ github.ref_name }}-amd64` / `${{ github.ref_name }}-arm64`（单架构）。一键脚本按宿主架构自动选择。
 
             升级见 [CHANGELOG.md](https://github.com/dofastted/vm2api/blob/main/CHANGELOG.md)、[docs/DEPLOY.md](https://github.com/dofastted/vm2api/blob/main/docs/DEPLOY.md) 与 [docs/ARM64.md](https://github.com/dofastted/vm2api/blob/main/docs/ARM64.md)。
-          files: |
-            dist/kin-kernel
-            dist/kin-kernel-crag
-            dist/kin-codex-kernel
-            dist/kin-worker
-            dist/kin-egress
-            dist/kin-slot-gate
-            dist/kin-oauth-auth
-            dist/kin-computer
-            dist/cli-node
+          files: dist/*
 
   image-amd64:
     runs-on: ubuntu-latest

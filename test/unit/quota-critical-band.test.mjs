@@ -128,6 +128,22 @@ test('failed or cancelled release does not leave a reservation or stale band deb
   assert.equal(q.canAccept('rel', { requestRisk: smallRisk }).ok, true)
 })
 
+test('out-of-order release preserves the surviving reservation’s draining-band charge', () => {
+  const q = quota()
+  setUtil(q, 'ordered', { u5: 0.79 })
+  const first = q.tryAcquire('ordered', { requestRisk: smallRisk })
+  assert(first.ok)
+  setUtil(q, 'ordered', { u5: 0.5 })
+  const second = q.tryAcquire('ordered', { requestRisk: smallRisk })
+  assert(second.ok)
+  first.release()
+  first.release()
+  assert.equal(q.inflight.get('ordered'), 1)
+  assert.equal(q.noteBandSettled('ordered', second.token), 0)
+  second.release()
+  assert.equal(q.inflight.get('ordered'), 0)
+})
+
 test('stale reading after an in-band settle blocks the next large request', () => {
   const q = quota()
   setUtil(q, 'stale', { u5: 0.79 })

@@ -45,6 +45,10 @@ import { socksUidFor } from '../../src/lib/vm/vm-runtime.mjs'
 const unix = process.platform !== 'win32'
 const unixTest = unix ? test : test.skip
 
+function kernelInspectResult(path = '/home/kincli/.kin/kin-kernel', args = null) {
+  return { ok: true, stdout: `${JSON.stringify(path)}\n${JSON.stringify(args)}` }
+}
+
 test('wrap system error is not a credential ensure; 401 still is', () => {
   assert.equal(
     isNeedsRefreshResult({
@@ -1578,6 +1582,58 @@ test('writeKernelConfig cli-hop native slots ignore live 并行', () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
+unixTest('Rust supervisor retires legacy telemetry without root docker exec', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-retire-user-'))
+  const written = writeKernelConfig(
+    root,
+    { id: 'vm-retire-user' },
+    { token: 'tok', proxyUrl: '', proxyRequired: false },
+  )
+  const exec = {
+    vmId: 'vm-retire-user',
+    homeDir: path.join(root, 'vms', 'vm-retire-user', 'cli-home'),
+    vm: {
+      id: 'vm-retire-user',
+      runtime: { container: 'kin-retire-user', kernel_socket: written.socketPath },
+    },
+  }
+  let readySlots = 0
+  let server = null
+  const serve = async () => {
+    if (server) await new Promise((resolve) => server.close(resolve))
+    server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: readySlots, worker_version: 'fixture' }))
+    })
+    await new Promise((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(written.socketPath, resolve)
+    })
+  }
+  const execCalls = []
+  const runDockerExec = async (args) => {
+    execCalls.push(args)
+    if (args[0] === 'inspect') return kernelInspectResult()
+    if (args[0] === 'restart' && args[1] === 'kin-retire-user') {
+      readySlots = 1
+      await serve()
+    }
+    return { ok: true }
+  }
+  await serve()
+  try {
+    const ready = await ensureRustKernel(exec, { timeoutMs: 8000, runDockerExec })
+    assert.equal(ready.ok, true, JSON.stringify(ready))
+    const retireArgv = execCalls.find((args) => args[0] === 'exec' && args.includes('sh'))
+    assert.ok(retireArgv, execCalls.map((args) => args.slice(0, 6)).join('\n'))
+    assert.equal(retireArgv.includes('-u'), false)
+    assert.equal(retireArgv[1], 'kin-retire-user')
+  } finally {
+    if (server) await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 unixTest('Rust supervisor recycles when ready_slots stay at 0', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-wedged-'))
   const written = writeKernelConfig(root, { id: 'vm-wedged' }, { token: 'tok', proxyUrl: '', proxyRequired: false })
@@ -1604,7 +1660,7 @@ unixTest('Rust supervisor recycles when ready_slots stay at 0', async () => {
     })
   }
   const runDockerExec = async (args) => {
-    if (args[0] === 'inspect') return { ok: true, stdout: '/home/kincli/.kin/kin-kernel' }
+    if (args[0] === 'inspect') return kernelInspectResult()
     if (args[0] === 'restart' && args[1] === 'kin-wedged') {
       restarts += 1
       readySlots = 1
@@ -1640,7 +1696,7 @@ unixTest('Rust supervisor does not recycle a busy CLI with ready_slots=0', async
     res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 0, cli_pid: 4412, worker_version: 'fixture' }))
   })
   const runDockerExec = async (args) => {
-    if (args[0] === 'inspect') return { ok: true, stdout: '/home/kincli/.kin/kin-kernel' }
+    if (args[0] === 'inspect') return kernelInspectResult()
     if (args[0] === 'restart') restarts += 1
     return { ok: true }
   }
@@ -1726,7 +1782,7 @@ for (const state of ['idle', 'partly occupied', 'full']) {
     const commands = []
     const runDockerExec = async (args) => {
       commands.push(args)
-      if (args[0] === 'inspect') return { ok: true, stdout: '/home/kincli/.kin/kin-kernel' }
+      if (args[0] === 'inspect') return kernelInspectResult()
       if (args[0] === 'restart') return { ok: false, error: 'unexpected restart' }
       return { ok: true }
     }
@@ -1794,7 +1850,7 @@ unixTest('Rust supervisor launches the gateway worker with docker restart', asyn
   }
   let server = null
   const runDockerExec = async (args) => {
-    if (args[0] === 'inspect') return { ok: true, stdout: '/home/kincli/.kin/kin-kernel' }
+    if (args[0] === 'inspect') return kernelInspectResult()
     if (args[0] === 'restart' && args[1] === 'kin-container') {
       server = http.createServer((_req, res) => {
         res.writeHead(200, { 'content-type': 'application/json' })
@@ -1832,7 +1888,7 @@ unixTest('pid1 kernel already booting is not docker-restarted', async () => {
   let restarts = 0
   let server = null
   const runDockerExec = async (args) => {
-    if (args[0] === 'inspect') return { ok: true, stdout: '/home/kincli/.kin/kin-kernel' }
+    if (args[0] === 'inspect') return kernelInspectResult()
     if (args[0] === 'restart') {
       restarts += 1
       return { ok: true }
@@ -1856,6 +1912,63 @@ unixTest('pid1 kernel already booting is not docker-restarted', async () => {
   }
 })
 
+unixTest('wrapped PID1 recovery restarts the container instead of detaching a second kernel', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-wrapped-pid1-'))
+  const written = writeKernelConfig(
+    root,
+    { id: 'vm-wrapped-pid1' },
+    { token: 'tok', proxyUrl: '', proxyRequired: false },
+  )
+  const exec = {
+    vmId: 'vm-wrapped-pid1',
+    homeDir: path.join(root, 'vms', 'vm-wrapped-pid1', 'cli-home'),
+    vm: {
+      id: 'vm-wrapped-pid1',
+      runtime: { container: 'kin-wrapped-pid1', kernel_socket: written.socketPath },
+    },
+  }
+  const wrapped = [
+    '/bin/sh',
+    '-c',
+    'export TOKIO_WORKER_THREADS=2; exec "$@"',
+    'kin-kernel-cpu',
+    '/home/kincli/.kin/kin-kernel',
+    '--gateway-worker',
+    '--config',
+    '/run/kin/kernel.json',
+  ]
+  const calls = []
+  let server = null
+  const runDockerExec = async (args) => {
+    calls.push(args)
+    if (args[0] === 'inspect') return kernelInspectResult(wrapped[0], wrapped.slice(1))
+    if (args[0] === 'restart' && args[1] === 'kin-wrapped-pid1') {
+      server = http.createServer((_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 1, worker_version: 'fixture' }))
+      })
+      await new Promise((resolve, reject) => {
+        server.once('error', reject)
+        server.listen(written.socketPath, resolve)
+      })
+    }
+    return { ok: true }
+  }
+
+  try {
+    const ready = await ensureRustKernel(exec, { timeoutMs: 1000, healthTimeoutMs: 200, runDockerExec })
+    assert.equal(ready.ok, true, JSON.stringify(ready))
+    assert.equal(calls.filter((args) => args[0] === 'restart').length, 1)
+    assert.equal(
+      calls.some((args) => args.includes('-d')),
+      false,
+    )
+  } finally {
+    if (server) await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 unixTest('concurrent Rust ensures issue one docker restart', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-concurrent-'))
   const written = writeKernelConfig(root, { id: 'vm-concurrent' }, { token: 'tok', proxyUrl: '', proxyRequired: false })
@@ -1867,7 +1980,7 @@ unixTest('concurrent Rust ensures issue one docker restart', async () => {
   let starts = 0
   let server = null
   const runDockerExec = async (args) => {
-    if (args[0] === 'inspect') return { ok: true, stdout: '/home/kincli/.kin/kin-kernel' }
+    if (args[0] === 'inspect') return kernelInspectResult()
     if (args[0] === 'restart' && args[1] === 'kin-concurrent') {
       starts += 1
       server = http.createServer((_req, res) => {
@@ -1924,6 +2037,7 @@ unixTest('Rust supervisor fails fast when kernel process never stays up', async 
     assert.equal(ready.reason, 'start_failed')
     assert.ok(Date.now() - started < 3500)
     assert.ok(calls.some((args) => args.map(String).join(' ').includes('pgrep') || args.includes('pidof')))
+    assert.ok(calls.some((args) => args.includes('-d')))
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

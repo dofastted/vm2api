@@ -7,10 +7,8 @@
  * device are two seats. Seat capacity is the VM's `session_slots`;
  * concurrency and RPM stay with PoolScheduler.reserve().
  *
- * A seat stays taken after its last request ends. It frees only when sticky
- * TTL expires, or when the scheduler drops it because the home left the pool
- * (unschedulable, quota, credential, failover). `graceMs` is unused; the
- * field remains so older routing config still loads.
+ * The live seat frees when its last request and any queued follow-up finish.
+ * Sticky VM memory and persisted restart holds have their own lifetimes.
  *
  * Queues:
  *   vmQueue[vm]  `conc` tickets: a seated session waiting for VM concurrency.
@@ -405,8 +403,9 @@ export class SeatPlanner {
     }
     const deadline = Date.now() + this.stickyWaitMs()
     for (const ticket of moved) {
+      if (ticket.expired?.()) continue
+      ticket.deadline = Math.min(deadline, ticket.requestDeadline ?? Infinity)
       this.place(ticket, { kind: 'conc', vmId })
-      ticket.deadline = deadline
       if (!ticket.granted) ticket.wake?.()
     }
     if (moved.length) this.pump(vmId)
@@ -444,6 +443,10 @@ export class SeatPlanner {
     for (const kind of ['conc', 'seat']) {
       for (const ticket of [...(this.vmQueues.get(vmId) || [])]) {
         if (!ticket.queued || ticket.kind !== kind) continue
+        if (ticket.expired?.()) {
+          ticket.wake?.()
+          continue
+        }
         if (!this.grant(ticket, vmId)) break
       }
     }

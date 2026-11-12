@@ -1,60 +1,61 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "v1.4.069",
+  "release": "v1.4.073",
+  "crag_release": "v1.4.073",
   "files": [
     {
       "path": "bin/kin-kernel",
       "asset": "kin-kernel",
-      "size": 13228472,
-      "sha256": "f57d4e71081bbca0b5bc2ba15886a7149c3e34c256a890ec51e084a9fcd14288"
+      "size": 13270264,
+      "sha256": "09fc853d818e339544e494a309ee4e5a75a5c492817f818eb4b8de15842b5a87"
     },
     {
       "path": "bin/kin-codex-kernel",
       "asset": "kin-codex-kernel",
-      "size": 7899968,
-      "sha256": "afdb433ebf3c719eb8596e09ca6493e8f769af1aab136426e82cbcd54c9bdc4a"
+      "size": 5927624,
+      "sha256": "ec9abb0160eaa0c8fda474c52fcfab592a4a2b905da4e4525e14fee9fb61376d"
     },
     {
       "path": "bin/kin-oauth-auth",
       "asset": "kin-oauth-auth",
-      "size": 14430374,
-      "sha256": "fe64b4ea20ca694863f9041fd02fd2c0c4e6d30cce99e273ee693d7d730a8095"
+      "size": 47385574,
+      "sha256": "04c926c7a3e56c22421c9281efe61af126d0acd4114d05ee0334e59f08d85f65"
     },
     {
       "path": "bin/kin-computer",
       "asset": "kin-computer",
-      "size": 5531864,
-      "sha256": "a64970838469da0e3b86831212e8f6b0806e3433a65dd062f6556252403c2bb9"
+      "size": 5519576,
+      "sha256": "1512b4551f520528425f38c8e262fcab52f071bb7a435471eda9dccc1fc3f198"
     },
     {
       "path": "bin/kin-worker",
       "asset": "kin-worker",
-      "size": 16455001,
-      "sha256": "d6b29f1144cd389696fe11edd6b5a024499bfc598da6a9ac96a4c7a9f9d6071b"
+      "size": 11555000,
+      "sha256": "132a3267b6c9a2fd03571b8c6baebc533f10914ada57ddf8b8b099c6f1de0d97"
     },
     {
       "path": "bin/kin-egress",
       "asset": "kin-egress",
-      "size": 9047621,
-      "sha256": "0bf1eeb0424fb341ad371fed1e40c39e68e940770222a0ac940d3340f3b4e277"
+      "size": 6213816,
+      "sha256": "4ab11e58294c8eec6e76dc649af0cf27058f1811fe7179aa35c7d644746d395f"
     },
     {
       "path": "bin/kin-slot-gate",
       "asset": "kin-slot-gate",
-      "size": 8120583,
-      "sha256": "78f78d59e4f61917aca202a384eb687488a8f511acfc41662d3877223431c859"
+      "size": 5603512,
+      "sha256": "99233d86da0476100acf026fdaa2246da765d4f1792e9f6294edbdd0901d5d29"
     },
     {
       "path": "share/wrap-cli/cli-node",
       "asset": "cli-node",
-      "size": 27934360,
-      "sha256": "e58c526f0f0e0521909b3cf501a987b653cc4d8747b3b4015a8953578043d687"
+      "size": 27934408,
+      "sha256": "b5dac65de06499edce028379cfd07413bc0d50aef04bb9f906553d0e1a234471"
     },
     {
       "path": "share/wrap-cli/kin-kernel.bin",
       "asset": "kin-kernel",
-      "size": 13228472,
-      "sha256": "f57d4e71081bbca0b5bc2ba15886a7149c3e34c256a890ec51e084a9fcd14288"
+      "size": 13270264,
+      "sha256": "09fc853d818e339544e494a309ee4e5a75a5c492817f818eb4b8de15842b5a87"
     },
     {
       "path": "share/wrap-cli/glibc239/ld-linux-x86-64.so.2",
@@ -113,26 +114,26 @@
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2",
       "asset": "crag-v2-amd64-crag-v2",
-      "size": 356276,
-      "sha256": "66553ead2937434db9dcc6b15d0a76049f6c64da7461bfa72a302e2b9d7fc678"
+      "size": 854200,
+      "sha256": "1dc535dff9894591e8aeeea287972661e43251715a23f2e9612e0871812c12fb"
     },
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2.payload.enc",
       "asset": "crag-v2-amd64-crag-v2.payload.enc",
-      "size": 2758180,
-      "sha256": "14ea9f988c5726d91631e9700c86b977852df2413975e66ac4c9adf75104a58e"
+      "size": 9512908,
+      "sha256": "dba8dbb3c1b6ddf1bf13b831ed8bb839f8aac6db7d2429b4640337d2f750030a"
     },
     {
       "path": "share/crag/kernels/v2/amd64/kernel.json.example",
       "asset": "crag-v2-amd64-kernel.json.example",
-      "size": 806,
-      "sha256": "0c9397fe94231702611f87d260381575b225c561f3683a2c77d9e5016bb3985e"
+      "size": 1180,
+      "sha256": "10c1d364d8dfb3aa773402056ed94c9c35626676c80347b5324683c96db7ada3"
     },
     {
       "path": "share/crag/kernels/v2/amd64/manifest.json",
       "asset": "crag-v2-amd64-manifest.json",
       "size": 2467,
-      "sha256": "658c440d855bd632fce1a06d920b4ede73b7c3bab687d3311236c25eedaace3e"
+      "sha256": "e1565454001be4c93b7472d0b147c6f86cd737d6fcfc18af6a66f006649c764f"
     }
   ]
 }

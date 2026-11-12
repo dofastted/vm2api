@@ -39,10 +39,10 @@ const vm = {
 
 const kvmArgsProjectRoot = path.join(os.tmpdir(), 'kin-kvm-run-args')
 
-function argsFor(accel) {
+function argsFor(accel, target = vm, routing = {}) {
   fs.mkdirSync(kvmArgsProjectRoot, { recursive: true })
   return buildKvmRunArgs({
-    vm,
+    vm: target,
     name: 'kin-02',
     image: 'ghcr.io/example/kin-kvm-ubuntu:24.04',
     hostName: 'guest-02',
@@ -59,8 +59,22 @@ function argsFor(accel) {
     shares: 'home,run',
     hostOf: (p) => p,
     projectRoot: kvmArgsProjectRoot,
+    routing,
   })
 }
+
+test('local KVM CPU opt-in excludes GPT and explicit or inherited CRAG', () => {
+  for (const [target, routing, enabled] of [
+    [vm, {}, true],
+    [{ ...vm, platform: 'openai', family: 'codex' }, {}, false],
+    [{ ...vm, dataplane: 'crag' }, {}, false],
+    [vm, { inference: { dataplane: 'crag' } }, false],
+    [{ ...vm, dataplane: 'wrap' }, { inference: { dataplane: 'crag' } }, true],
+  ]) {
+    const args = argsFor('tcg', target, routing)
+    assert.equal(args.includes('KIN_KVM_KERNEL_CPU_LIMIT=1'), enabled)
+  }
+})
 
 test('kvm docker run mounts slot paths, stop-timeout 30, memory overhead', () => {
   const args = argsFor('tcg')

@@ -370,6 +370,9 @@ export class PoolScheduler extends EventEmitter {
     /** vmId → live reservations; mirrors `inflight` (per account) for the panel. */
     this.vmInflight = new Map()
     this.waiters = new Map()
+    this.waiterSequence = 0
+    this.dueWaiterRefreshes = new Set()
+    this.changePending = false
     this.healthCache = new Map()
     this.healthFlights = new Map()
     this.healthWrites = new Map()
@@ -384,7 +387,7 @@ export class PoolScheduler extends EventEmitter {
       strategy: this.config.strategy,
       stickyWaitMs: () => this.config.sticky_wait_timeout_ms,
       stickyTtlMs: () => (Number(this.stickyRouter?.config?.ttl_seconds) || 86400) * 1000,
-      onChange: () => this.emit('change'),
+      onChange: () => this.signalChange(),
     })
     this.unitCircuit = unitCircuit
     if (runtimeRepo) this.unitCircuit.bindRepo(runtimeRepo)
@@ -509,6 +512,8 @@ export class PoolScheduler extends EventEmitter {
     const failoverDeadline = Number(deadline) || null
     const defaultPlanMs = stickyKey ? this.config.sticky_wait_timeout_ms : this.config.fallback_wait_timeout_ms
     const loopDeadline = failoverDeadline || startedAt + defaultPlanMs
+    let waitStartedAt = null
+    let waitCutoff = loopDeadline
     let queuedDeadline = Infinity
     const finishReserve = (selected, reservation) => ({
       ...selected,
@@ -545,6 +550,10 @@ export class PoolScheduler extends EventEmitter {
         keyScope,
         quotaRequest,
       })
+      if (signal?.aborted) throw makeAbortError()
+      if ((failoverDeadline || waitStartedAt !== null) && Date.now() >= waitCutoff) {
+        return fail('all_accounts_busy', candidates)
+      }
       // A gated family home (quota, credential, excluded) is a migration
       // signal for the caller. Busy is not: it still yields a candidate.
       const familyVm = familyVmId ? String(familyVmId).trim() : ''
@@ -567,6 +576,12 @@ export class PoolScheduler extends EventEmitter {
       // Free capacity first: a sticky or preferred miss scans every other
       // candidate before anything waits. Borrowing never moves the durable pin.
       while (selected) {
+        // A fresh scan can see capacity before an older request's refresh timer.
+        if (this.waiters.size) this.notifyCapacity(selected.accountId)
+        if (signal?.aborted) throw makeAbortError()
+        if ((failoverDeadline || waitStartedAt !== null) && Date.now() >= waitCutoff) {
+          return fail('all_accounts_busy', candidates)
+        }
         const reservation = this.reserve(selected, { skipQuota: pinned, pinned })
         if (reservation) return finishReserve(selected, reservation)
         reserveMisses.push({ ...selected, busy: true, waitReason: selected.waitReason || 'concurrency_limit' })
@@ -620,41 +635,82 @@ export class PoolScheduler extends EventEmitter {
         stickyCleared,
         requestDeadline: loopDeadline,
       })
+      waitStartedAt ??= now
+      const waitBudget = waitPlan?.sticky ? this.config.sticky_wait_timeout_ms : this.config.fallback_wait_timeout_ms
+      waitCutoff = Math.min(loopDeadline, waitStartedAt + waitBudget)
       const phaseDeadline = Math.min(
         queuedDeadline,
         this.slotWaitDeadlineMs({ startedAt, loopDeadline, sticky: waitPlan?.sticky, allowWait }),
       )
       const waitTarget = waitPool.find((candidate) => candidate.vmId === waitPlan?.vmId)
-      // Leave legacy direct waits unchanged; only capable workers share this
-      // absolute phase deadline with the gateway queue.
-      const waitDeadline = supportsGatewayPolicy(waitTarget?.workerStatus)
-        ? phaseDeadline
-        : waitPlan?.deadline || loopDeadline
-      if (wakeAts.length && Math.min(...wakeAts) >= waitDeadline && !concurrencyWait) {
+      const waitCap = supportsGatewayPolicy(waitTarget?.workerStatus) ? Math.min(waitCutoff, phaseDeadline) : waitCutoff
+      if (wakeAts.length && Math.min(...wakeAts) >= waitCap && !concurrencyWait) {
         return fail('all_accounts_busy', waitCandidates, waitAvailable, waitPool)
       }
-      if (!waitPlan || waitPlan.timeoutMs <= 0 || waitDeadline <= now) {
+      if (!waitPlan || now >= waitCap) {
         return fail('all_accounts_busy', waitCandidates, waitAvailable, waitPool)
       }
       queuedDeadline = phaseDeadline
-      const sliceDeadline = wakeAts.length
-        ? Math.min(waitDeadline, ...wakeAts)
-        : staleWindowWake
-          ? now + 1
-          : waitDeadline
+      const refreshAt = Math.min(waitCap, now + QUEUE_REFRESH_MS, staleWindowWake ? now + 1 : Infinity, ...wakeAts)
       const queuedAt = Date.now()
       const waited = await this.waitForCapacity({
         signal,
-        deadline: sliceDeadline,
+        deadline: waitCap,
+        refreshAt,
         accountId: waitPlan.accountId,
         vmId: waitPlan.vmId,
         sticky: waitPlan.sticky,
         stickyKey,
+        tryGrant: (accountId) => {
+          if (accountId && !waitPool.some((candidate) => candidate.accountId === accountId)) return null
+          const live = new Map()
+          for (const candidate of waitPool) {
+            if (!grantable(candidate)) continue
+            const inflight = this.inflight.get(candidate.accountId) || 0
+            live.set(candidate.accountId, {
+              ...candidate,
+              inflight,
+              busy: false,
+              loadRatio: (inflight + this.waiterCount(candidate.accountId)) / candidate.maxConcurrency,
+            })
+          }
+          const available = [...live.values()].filter(
+            (candidate) =>
+              (!accountId || candidate.accountId === accountId) &&
+              !avoid?.has(candidate.accountId) &&
+              !avoid?.has(candidate.vmId) &&
+              !blocked.has(candidate.accountId) &&
+              !blocked.has(candidate.vmId),
+          )
+          for (let remaining = available; remaining.length; ) {
+            const next = this.pick(remaining, {
+              stickyKey,
+              eligible: waitCandidates.map((candidate) => live.get(candidate.accountId) || candidate),
+              spilled,
+              stickyKeys,
+              deviceVmId,
+              familyVmId: familyGated ? null : familyVm,
+            })
+            if (this.lastStickyCleared) stickyCleared = true
+            if (Date.now() >= waitCap) return null
+            const reservation = this.reserve(next, { skipQuota: pinned, pinned })
+            if (reservation) return { selected: next, reservation }
+            remaining = remaining.filter((candidate) => candidate.accountId !== next.accountId)
+          }
+          return null
+        },
       })
       queueWaitMs += Date.now() - queuedAt
-      // Notify continues the loop and re-reads eligibility from scratch.
-      // Only a wait-plan / failover deadline timeout is all_accounts_busy.
-      if (!waited?.woken && sliceDeadline >= waitDeadline) {
+      if (waited?.grant) {
+        const { selected: next, reservation } = waited.grant
+        if (signal?.aborted) {
+          reservation.release()
+          throw makeAbortError()
+        }
+        return finishReserve(next, reservation)
+      }
+      // Re-read asynchronously on timed refreshes and configuration/health changes.
+      if (!waited?.woken && Date.now() >= waitCap) {
         return fail('all_accounts_busy', waitCandidates, waitAvailable, waitPool)
       }
     }
@@ -667,7 +723,7 @@ export class PoolScheduler extends EventEmitter {
    * sticky VM until `sticky_wait_timeout_ms`, then globally until
    * `fallback_wait_timeout_ms`. A seated session's concurrency wait times out
    * after `sticky_wait_timeout_ms`. Timeouts are `pool_queue_timeout`.
-   * Finishing a request keeps the seat until sticky TTL.
+   * Sticky VM memory outlives the last request's live seat.
    */
   async selectSeat({
     model,
@@ -716,13 +772,14 @@ export class PoolScheduler extends EventEmitter {
         ...selectionSnapshot(candidates, available, { reason, waitMs, stickyCleared }),
       }
     }
+    let pendingGrant = null
     const finish = (granted) => {
-      consumed = true
-      // The handoff to a managed worker inherits the phase that granted the
-      // seat, not a fresh sticky wait. Preserve the legacy relative value below.
+      pendingGrant = granted
+      if (signal?.aborted) throw makeAbortError()
+      // Keep the granting phase across rehome; legacy workers retain the relative wait.
       const phaseDeadline = ticket?.grantedDeadline
       const sticky = ['seat-held', 'sticky', 'device-affinity', 'family-affinity'].includes(granted.selectionReason)
-      return {
+      const result = {
         ...granted.candidate,
         ...granted.reservation,
         selectionReason: granted.selectionReason,
@@ -737,6 +794,8 @@ export class PoolScheduler extends EventEmitter {
             ? Math.min(failoverDeadline, phaseDeadline)
             : this.slotWaitDeadlineMs({ startedAt, loopDeadline: failoverDeadline, sticky, allowWait }),
       }
+      consumed = true
+      return result
     }
     try {
       for (;;) {
@@ -760,18 +819,22 @@ export class PoolScheduler extends EventEmitter {
         if (!checkedHomeOnly) {
           candidates = await this.eligibleCandidates({ model, excluded, signal, ownerScope, keyScope, quotaRequest })
         }
+        if (signal?.aborted) throw makeAbortError()
+        const now = Date.now()
         // A grant can land while eligibility was being re-read.
         if (ticket?.granted) return finish(ticket.granted)
+        if (now >= failoverDeadline || (ticket && ticket.kind !== 'seat' && now >= ticket.deadline)) {
+          return fail('pool_queue_timeout')
+        }
         if (!checkedHomeOnly && familyVm && !candidates.some((candidate) => candidate.vmId === familyVm))
           familyGated = true
         const byVm = new Map(candidates.map((candidate) => [candidate.vmId, candidate]))
         if (ticket) ticket.candidates = byVm
-        const now = Date.now()
         // Home left the pool (circuit open, unschedulable, hard cooldown, removed).
         // A full home is still a candidate, so that wait keeps its sticky clock.
-        if (ticket?.kind === 'seat' && ticket.vmId && !byVm.has(ticket.vmId)) {
-          this.planner.toGlobal(ticket)
+        if (ticket?.kind === 'seat' && (now >= ticket.stickyUntil || !byVm.has(ticket.vmId))) {
           ticket.deadline = Math.min(failoverDeadline, now + this.config.fallback_wait_timeout_ms)
+          this.planner.toGlobal(ticket)
         }
         let seat = this.planner.seatOf(seatKey)
         if (seat) {
@@ -808,7 +871,9 @@ export class PoolScheduler extends EventEmitter {
             if (!allowWait || now >= failoverDeadline) return fail('all_accounts_busy')
             ticket = this.enqueueTicket({
               seatKey,
+              signal,
               kind: 'conc',
+              requestDeadline: failoverDeadline,
               vmId: seat.vmId,
               candidates: byVm,
               deadline: Math.min(failoverDeadline, now + this.config.sticky_wait_timeout_ms),
@@ -846,7 +911,9 @@ export class PoolScheduler extends EventEmitter {
             ticket = home
               ? this.enqueueTicket({
                   seatKey,
+                  signal,
                   kind: 'seat',
+                  requestDeadline: failoverDeadline,
                   vmId: home.vmId,
                   candidates: byVm,
 
@@ -855,7 +922,9 @@ export class PoolScheduler extends EventEmitter {
                 })
               : this.enqueueTicket({
                   seatKey,
+                  signal,
                   kind: 'global',
+                  requestDeadline: failoverDeadline,
                   vmId: null,
                   candidates: byVm,
                   deadline: Math.min(failoverDeadline, now + this.config.fallback_wait_timeout_ms),
@@ -868,22 +937,20 @@ export class PoolScheduler extends EventEmitter {
           for (const vmId of ticket.vmId ? [ticket.vmId] : byVm.keys()) this.planner.pump(vmId)
         }
         if (ticket.granted) return finish(ticket.granted)
+        if (Date.now() >= failoverDeadline) return fail('pool_queue_timeout')
         const until = ticket.kind === 'seat' ? ticket.stickyUntil : ticket.deadline
         await this.waitTicket(ticket, { signal, until: Math.min(until, Date.now() + QUEUE_REFRESH_MS) })
         if (ticket.granted) return finish(ticket.granted)
         const after = Date.now()
-        if (ticket.kind === 'seat' && after >= ticket.stickyUntil) {
-          this.planner.toGlobal(ticket)
-          ticket.deadline = Math.min(failoverDeadline, after + this.config.fallback_wait_timeout_ms)
-          continue
-        }
+        if (after >= failoverDeadline) return fail('pool_queue_timeout')
+        if (ticket.kind === 'seat' && after >= ticket.stickyUntil) continue
         if (after >= ticket.deadline) return fail('pool_queue_timeout')
       }
     } finally {
       this.planner.forgetGranted(ticket)
       this.planner.remove(ticket)
       // Granted while the caller went away: hand the seat and the slot back.
-      if (ticket?.granted && !consumed) ticket.granted.reservation.release()
+      if (!consumed) (pendingGrant ?? ticket?.granted)?.reservation.release()
     }
   }
 
@@ -949,11 +1016,17 @@ export class PoolScheduler extends EventEmitter {
     if (!current && !this.planner.canOpen(candidate.vmId, candidate.seatCap, candidate.headroom)) return null
     const reservation = this.reserve(candidate)
     if (!reservation) return null
-    this.rememberMachine(deviceKey, { vmId: candidate.vmId, accountId: candidate.accountId })
-    const seat =
-      current ||
-      this.planner.open(seatKey, { vmId: candidate.vmId, accountId: candidate.accountId, cap: candidate.seatCap })
-    this.planner.hold(seat)
+    let seat
+    try {
+      this.rememberMachine(deviceKey, { vmId: candidate.vmId, accountId: candidate.accountId })
+      seat =
+        current ||
+        this.planner.open(seatKey, { vmId: candidate.vmId, accountId: candidate.accountId, cap: candidate.seatCap })
+      this.planner.hold(seat)
+    } catch (error) {
+      reservation.release()
+      throw error
+    }
     const releaseRequest = reservation.release
     let released = false
     return {
@@ -966,14 +1039,13 @@ export class PoolScheduler extends EventEmitter {
         release: () => {
           if (released) return
           released = true
-          releaseRequest()
-          this.planner.release(seat)
+          releaseRequest(() => this.planner.release(seat))
         },
       },
     }
   }
 
-  enqueueTicket({ seatKey, kind, vmId, candidates, deadline, stickyUntil = null }) {
+  enqueueTicket({ signal, seatKey, kind, vmId, candidates, deadline, stickyUntil = null, requestDeadline }) {
     if (this.queuedTotal() >= this.config.queue_max) throw this.queueFullError([...candidates.keys()])
     const ticket = {
       seatKey,
@@ -982,7 +1054,8 @@ export class PoolScheduler extends EventEmitter {
       candidates,
       deadline,
       stickyUntil,
-
+      requestDeadline,
+      expired: () => signal?.aborted || Date.now() >= (ticket.kind === 'seat' ? ticket.stickyUntil : ticket.deadline),
       enqueuedAt: Date.now(),
       queued: false,
       granted: null,
@@ -990,6 +1063,7 @@ export class PoolScheduler extends EventEmitter {
       accepts: (id) => ticket.kind === 'global' && ticket.candidates.has(id),
       vmIds: () => [...ticket.candidates.keys()],
       tryGrant: (id) => {
+        if (ticket.expired()) return false
         // Opening a seat can rehome the ticket during claimSeat. Capture
         // the granting phase before its deadline is replaced.
         const grantingDeadline = ticket.kind === 'seat' ? ticket.stickyUntil : ticket.deadline
@@ -1730,16 +1804,10 @@ export class PoolScheduler extends EventEmitter {
       reservePct: this.config.seat_budget_reserve_pct,
       strategy: this.config.strategy,
     })
-    // A larger queue_max or a new strategy can admit waiters right away.
-    this.planner.pumpAll()
+    this.notifyCapacity()
   }
 
-  /**
-   * One atomic claim: concurrency, Fable cap, quota/RPM, then circuit. Any
-   * refusal hands back exactly what this call took, in reverse order.
-   * release() is idempotent and hands freed concurrency to the VM's queue.
-   * Seats are layered on top by claimSeat().
-   */
+  /** Revalidate the live account/VM state before a request claims execution capacity. */
   admissionSnapshot(candidate, { pinned = false } = {}) {
     if (candidate.signal?.aborted) throw makeAbortError()
     const vm = getVm(this.projectRoot, candidate.vmId)
@@ -1822,7 +1890,9 @@ export class PoolScheduler extends EventEmitter {
     return { account }
   }
 
+  /** Synchronous request permit; affinity seats and transport workers never own the counters. */
   reserve(candidate, { skipQuota = false, pinned = false } = {}) {
+    const { accountId, vmId } = candidate
     const snapshot = candidate.exec ? this.admissionSnapshot(candidate, { pinned }) : {}
     if (!snapshot) return null
     const requestInflight = this.inflight.get(candidate.accountId) || 0
@@ -1837,40 +1907,46 @@ export class PoolScheduler extends EventEmitter {
     ) {
       return null
     }
-    const quotaReservation = this.accountQuota?.tryAcquire?.(candidate.accountId, {
+    const quotaReservation = this.accountQuota?.tryAcquire?.(accountId, {
       skipGate: !!skipQuota,
       tier: vmTierOf(candidate.vm),
       quotaRequest: candidate.quotaRequest,
       account: snapshot.account,
     })
     if (quotaReservation && !quotaReservation.ok) return null
+    const releaseQuota = () => {
+      if (quotaReservation?.release) quotaReservation.release()
+      else if (quotaReservation) this.accountQuota?.release?.(accountId)
+    }
     // A pin is an operator diagnostic: it reaches the slot without taking the probe.
-    const circuitHold = pinned ? null : this.unitCircuit?.admit?.(candidate.accountId)
+    const circuitHold = pinned ? null : this.unitCircuit?.admit?.(accountId)
     if (circuitHold && !circuitHold.ok) {
-      if (quotaReservation) this.accountQuota?.release?.(candidate.accountId)
+      releaseQuota()
       return null
     }
     // Admission hooks may release an existing reservation. Use the live count
     // rather than restoring occupancy from before those hooks ran.
-    this.inflight.set(candidate.accountId, (this.inflight.get(candidate.accountId) || 0) + 1)
-    this.bumpFamily(candidate.accountId, family, 1)
-    this.bumpVmInflight(candidate.vmId, 1)
+    this.inflight.set(accountId, (this.inflight.get(accountId) || 0) + 1)
+    this.bumpFamily(accountId, family, 1)
+    this.bumpVmInflight(vmId, 1)
     let released = false
     return {
       reserved: true,
       slotIndex: null,
-      release: () => {
+      quotaToken: quotaReservation?.token,
+      release: (releaseSeat) => {
         if (released) return
         released = true
-        const next = Math.max(0, (this.inflight.get(candidate.accountId) || 1) - 1)
-        if (next === 0) this.inflight.delete(candidate.accountId)
-        else this.inflight.set(candidate.accountId, next)
-        this.bumpFamily(candidate.accountId, family, -1)
-        this.bumpVmInflight(candidate.vmId, -1)
-        this.accountQuota?.release?.(candidate.accountId)
-        if (circuitHold?.probe) this.unitCircuit?.releaseProbe?.(candidate.accountId)
-        this.planner.pump(candidate.vmId)
-        this.notifyCapacity(candidate.accountId)
+        const next = this.inflight.get(accountId) - 1
+        if (next === 0) this.inflight.delete(accountId)
+        else this.inflight.set(accountId, next)
+        this.bumpFamily(accountId, family, -1)
+        this.bumpVmInflight(vmId, -1)
+        releaseQuota()
+        if (circuitHold?.probe) this.unitCircuit?.releaseProbe?.(accountId)
+        if (releaseSeat) releaseSeat()
+        else this.planner.pump(vmId)
+        this.notifyCapacity(accountId)
       },
     }
   }
@@ -1882,12 +1958,22 @@ export class PoolScheduler extends EventEmitter {
     const next = Math.max(0, (this.vmInflight.get(id) || 0) + delta)
     if (next === 0) this.vmInflight.delete(id)
     else this.vmInflight.set(id, next)
-    this.emit('change')
+    this.signalChange()
+  }
+
+  /** Observers must not run in the middle of a seat/permit transition. */
+  signalChange() {
+    if (this.changePending) return
+    this.changePending = true
+    queueMicrotask(() => {
+      this.changePending = false
+      this.emit('change')
+    })
   }
 
   markSuccess(candidate, { workerStatus = null, countUsage = true } = {}) {
     const now = Date.now()
-    if (countUsage !== false) this.accountQuota?.noteBandSettled?.(candidate.accountId)
+    if (countUsage !== false) this.accountQuota?.noteBandSettled?.(candidate.accountId, candidate.quotaToken)
     const prev = this.runtimeRepo?.get?.(candidate.accountId)
     if (countUsage !== false) this.lastUsed.set(candidate.accountId, now)
     this.runtimeRepo?.upsert?.({
@@ -2030,8 +2116,17 @@ export class PoolScheduler extends EventEmitter {
     return peek ? this.makeWaitPlan(peek, { sticky: false, requestDeadline }) : null
   }
 
-  /** Direct-path wait (cooldown / RPM / concurrency); it counts against the pool-wide `queue_max`. */
-  waitForCapacity({ signal, deadline, stickyKey, accountId = null, vmId = null, sticky = false } = {}) {
+  /** Direct waiters can receive a permit, not just a notification to try again. */
+  waitForCapacity({
+    signal,
+    deadline,
+    refreshAt,
+    stickyKey,
+    accountId = null,
+    vmId = null,
+    sticky = false,
+    tryGrant,
+  } = {}) {
     const bucketId = String(accountId || stickyKey || '_pool')
     if (this.queuedTotal() >= this.config.queue_max) throw this.queueFullError(vmId ? [vmId] : null)
     const id = Symbol('pool-waiter')
@@ -2041,75 +2136,88 @@ export class PoolScheduler extends EventEmitter {
       this.waiters.set(bucketId, bucket)
     }
     return new Promise((resolve, reject) => {
-      const remaining = Math.max(1, deadline - Date.now())
-      const finish = (woken) => resolve({ woken: !!woken })
-      const timer = setTimeout(() => {
+      const cleanup = () => {
+        if (!bucket.delete(id)) return
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+        if (!bucket.size) this.waiters.delete(bucketId)
+        this.signalChange()
+      }
+      const finish = (result) => {
         cleanup()
-        finish(false)
-      }, remaining)
+        resolve(result)
+      }
       const onAbort = () => {
         cleanup()
         reject(makeAbortError())
       }
-      let left = false
-      const cleanup = () => {
-        clearTimeout(timer)
-        signal?.removeEventListener?.('abort', onAbort)
-        const live = this.waiters.get(bucketId)
-        live?.delete(id)
-        if (live && live.size === 0) this.waiters.delete(bucketId)
-        // notifyCapacity() detaches entries before waking them; count the exit once.
-        if (left) return
-        left = true
-        this.emit('change')
+      const refresh = () => {
+        if (bucket.has(id)) finish({ woken: Date.now() < deadline })
       }
+      const timer = setTimeout(
+        () => {
+          if (Date.now() >= deadline) return refresh()
+          this.dueWaiterRefreshes.add(refresh)
+          if (this.dueWaiterRefreshes.size === 1) {
+            setImmediate(() => {
+              const due = this.dueWaiterRefreshes
+              this.dueWaiterRefreshes = new Set()
+              // Keep tickets queued for one ordered grant sweep before refreshing snapshots.
+              this.notifyCapacity(null, { refresh: false })
+              for (const wake of due) wake()
+            })
+          }
+        },
+        Math.max(1, (refreshAt ?? deadline) - Date.now()),
+      )
+      let granting = false
       bucket.set(id, {
+        sequence: ++this.waiterSequence,
         sticky: !!sticky,
         vmId: vmId ? String(vmId) : null,
-        wake: () => {
-          cleanup()
-          const jitter = stickyKey ? Math.floor(Math.random() * 20) : 0
-          if (jitter) setTimeout(() => finish(true), jitter)
-          else finish(true)
+        wake: (releasedAccount, refresh) => {
+          if (granting || !bucket.has(id)) return
+          if (signal?.aborted) return onAbort()
+          if (Date.now() >= deadline) return finish({ woken: false })
+          granting = true
+          try {
+            const grant = tryGrant?.(releasedAccount)
+            if (signal?.aborted && grant) {
+              grant.reservation.release()
+              return
+            }
+            if (grant || refresh) finish({ woken: true, grant })
+            return !!grant
+          } catch (error) {
+            cleanup()
+            reject(error)
+          } finally {
+            granting = false
+          }
         },
       })
-      this.emit('change')
+      this.signalChange()
       if (signal?.aborted) onAbort()
       else signal?.addEventListener?.('abort', onAbort, { once: true })
     })
   }
 
-  /** Cooldown lifted, credential back, or a direct release: wake direct waiters and re-pump seat queues. */
-  notifyCapacity(accountId = null) {
-    const wakeEntry = (entry) => {
-      try {
-        const wake = typeof entry === 'function' ? entry : entry?.wake
-        wake?.()
-      } catch {}
-    }
-    if (accountId) {
-      const bucket = this.waiters.get(accountId)
-      if (bucket) {
-        this.waiters.delete(accountId)
-        for (const entry of bucket.values()) wakeEntry(entry)
+  /** On release, claim before waking; on a broad state change also refresh stale candidates. */
+  notifyCapacity(accountId = null, { refresh = !accountId } = {}) {
+    if (!accountId) this.planner.pumpAll()
+    const local = accountId ? [...(this.waiters.get(accountId)?.values() || [])] : []
+    for (const entry of local) if (entry.wake(accountId)) return
+    const pending = []
+    for (const [id, bucket] of this.waiters) {
+      if (id === accountId) continue
+      for (const entry of bucket.values()) {
+        if (!accountId || !entry.sticky) pending.push(entry)
       }
-      for (const [id, other] of [...this.waiters]) {
-        if (id === accountId) continue
-        for (const [token, entry] of [...other]) {
-          if (entry?.sticky) continue
-          other.delete(token)
-          wakeEntry(entry)
-        }
-        if (other.size === 0) this.waiters.delete(id)
-      }
-      return
     }
-    const buckets = [...this.waiters.values()]
-    this.waiters.clear()
-    for (const bucket of buckets) {
-      for (const entry of bucket.values()) wakeEntry(entry)
+    pending.sort((a, b) => a.sequence - b.sequence)
+    for (const entry of pending) {
+      if (entry.wake(accountId, refresh) && accountId) return
     }
-    this.planner.pumpAll()
   }
 
   /**

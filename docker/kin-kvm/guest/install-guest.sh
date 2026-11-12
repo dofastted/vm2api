@@ -26,6 +26,7 @@ fi
 install_files() {
   install -m 0755 "$SEED/kin-guest-setup" /usr/local/sbin/kin-guest-setup
   install -m 0755 "$SEED/kin-kernel-start" /usr/local/sbin/kin-kernel-start
+  install -m 0755 "$SEED/kin-kernel-cpu" /usr/local/sbin/kin-kernel-cpu
   install -m 0755 "$SEED/kin-kernel-relay.py" /usr/local/sbin/kin-kernel-relay
   install -m 0644 "$SEED/kin-guest-setup.service" /etc/systemd/system/kin-guest-setup.service
   install -m 0644 "$SEED/kin-kernel.service" /etc/systemd/system/kin-kernel.service

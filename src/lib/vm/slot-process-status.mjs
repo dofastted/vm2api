@@ -36,7 +36,7 @@ export async function retireLegacyTelemetry({ vm, run = runSlotProcess, inspect 
     return { ok: false, code: 'telemetry_runtime_unavailable' }
   }
   if (!runtime?.State?.Running) return { ok: true, running: false, state: 'stopped' }
-  const result = await run(slotExecArgv(vm, ['sh', '-c', RETIRE_LEGACY_TELEMETRY], { user: '0' }), {
+  const result = await run(slotExecArgv(vm, ['sh', '-c', RETIRE_LEGACY_TELEMETRY]), {
     timeoutMs: 5000,
     env: host.dockerEnv(),
   })

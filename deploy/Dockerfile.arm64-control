@@ -60,7 +60,9 @@ RUN npm ci --omit=dev --no-audit --no-fund
 COPY src ./src
 COPY scripts ./scripts
 COPY VERSION CHANGELOG.md ./
+COPY deploy/payload.json ./deploy/payload.json
 COPY docker/kin-os ./docker/kin-os
+COPY docker/kin-kvm/guest/kin-kernel-cpu ./docker/kin-kvm/guest/kin-kernel-cpu
 COPY --from=web /src/web/dist ./web/dist
 COPY --from=payload /payload/bin/ /opt/vm2api/image-bin/
 COPY --from=helpers /out/amd64/ /opt/vm2api/cluster-bin-amd64/

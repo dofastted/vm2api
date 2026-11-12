@@ -6,6 +6,7 @@ import { REMOTE_CRAG_ENTRY, REMOTE_KERNEL_ENTRY } from '../../src/lib/vm/slot-en
 import { CODEX_SLOT_ROLE, slotContainerCommand } from '../../src/lib/vm/vm-runtime.mjs'
 import { slotHost } from '../../src/lib/vm/slot-host.mjs'
 import { startSlotReady } from '../../src/lib/vm/slot-runtime.mjs'
+import { kernelCpuCommand } from '../../src/lib/vm/kernel-cpu.mjs'
 
 const gpt = { id: 'vm-codex-01', platform: 'openai', family: 'codex', node_id: 'node-a', kernel: 'ubuntu-24.04' }
 const claude = { id: 'vm-03', platform: 'anthropic', node_id: 'node-a', kernel: 'ubuntu-24.04' }
@@ -37,7 +38,10 @@ for (const runtime of [undefined, { type: 'docker' }]) {
   test(`a remote Claude slot uses the live kernel entry (${runtime?.type || 'default'} runtime)`, () => {
     const spec = body({ ...claude, runtime })
     assert.equal(REMOTE_KERNEL_ENTRY, '/opt/kin-live/kin-kernel')
-    assert.deepEqual(spec.Cmd, [REMOTE_KERNEL_ENTRY, '--gateway-worker', '--config', '/run/kin/kernel.json'])
+    assert.deepEqual(
+      spec.Cmd,
+      kernelCpuCommand([REMOTE_KERNEL_ENTRY, '--gateway-worker', '--config', '/run/kin/kernel.json']),
+    )
     assert.equal(spec.Labels['kin.vm.role'], undefined)
     assert.equal(spec.Labels['kin.vm.runtime'], 'docker')
   })
@@ -54,19 +58,24 @@ test('a remote Claude slot switched to CRAG v2 boots the live kernel with the us
 })
 
 test('local Claude commands retain their bind-mounted and wrapped kernel entries', () => {
-  assert.deepEqual(slotContainerCommand(claude), [
-    '/usr/local/bin/kin-kernel',
-    '--gateway-worker',
-    '--config',
-    '/run/kin/kernel.json',
-  ])
-  assert.deepEqual(slotContainerCommand(claude, { wrapKernel: true }), [
-    '/home/kincli/.kin/kin-kernel',
-    '--gateway-worker',
-    '--config',
-    '/run/kin/kernel.json',
-  ])
+  assert.deepEqual(
+    slotContainerCommand(claude),
+    kernelCpuCommand(['/usr/local/bin/kin-kernel', '--gateway-worker', '--config', '/run/kin/kernel.json']),
+  )
+  assert.deepEqual(
+    slotContainerCommand(claude, { wrapKernel: true }),
+    kernelCpuCommand(['/home/kincli/.kin/kin-kernel', '--gateway-worker', '--config', '/run/kin/kernel.json']),
+  )
   assert.deepEqual(slotContainerCommand(gpt), ['sleep', 'infinity'])
+})
+
+test('local CPU wrapping respects both explicit and inherited CRAG routing', () => {
+  const argv = ['/home/kincli/.kin/kin-kernel', '--gateway-worker', '--config', '/run/kin/kernel.json']
+  assert.deepEqual(slotContainerCommand({ ...claude, dataplane: 'crag' }, { wrapKernel: true }), argv)
+  assert.deepEqual(
+    slotContainerCommand(claude, { wrapKernel: true, routing: { inference: { dataplane: 'crag' } } }),
+    argv,
+  )
 })
 
 test('remote KVM slots retain the runner image command for both platforms', () => {
@@ -74,6 +83,24 @@ test('remote KVM slots retain the runner image command for both platforms', () =
     const spec = body({ ...vm, runtime: { type: 'kvm' } })
     assert.equal(spec.Labels['kin.vm.runtime'], 'kvm')
     assert.equal(Object.hasOwn(spec, 'Cmd'), false)
+    assert.equal(spec.Env.includes('KIN_KVM_KERNEL_CPU_LIMIT=1'), vm === claude)
+  }
+})
+
+test('remote KVM CPU opt-in follows inherited routing and explicit Claude overrides', () => {
+  const kvm = { ...claude, runtime: { type: 'kvm' } }
+  for (const [target, enabled] of [
+    [kvm, false],
+    [{ ...kvm, dataplane: 'wrap' }, true],
+  ]) {
+    const spec = slotContainerBody(target, {
+      image: 'kvm',
+      network: 'network',
+      remoteDir: '/fixture',
+      user: '1000:1000',
+      routing: { inference: { dataplane: 'crag' } },
+    })
+    assert.equal(spec.Env.includes('KIN_KVM_KERNEL_CPU_LIMIT=1'), enabled)
   }
 })
 

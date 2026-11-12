@@ -49,6 +49,7 @@ import { ensureKvmMachineRecord, kvmContainerEnvIncomplete, kvmMachineFields } f
 import { probeLocalKvm } from './kvm-host.mjs'
 import { slotExecArgv } from './slot-exec.mjs'
 import { isDockerInspectNotFound } from './docker-container.mjs'
+import { kernelCpuCommand, usesKernelCpuLimit } from './kernel-cpu.mjs'
 
 export const RUNTIME = 'docker'
 const WORKER_BIN = process.env.KIN_WORKER_BIN || '/opt/kin-gateway/bin/kin-worker'
@@ -317,14 +318,15 @@ export const CODEX_SLOT_ROLE = 'codex'
  * Claude local_cli with no Claude credential, which times out and exits every
  * few minutes under `--restart unless-stopped`.
  */
-export function slotContainerCommand(vm, { wrapKernel = false } = {}) {
+export function slotContainerCommand(vm, { wrapKernel = false, routing = {} } = {}) {
   if (isCodexVm(vm)) return ['sleep', 'infinity']
-  return [
+  const argv = [
     wrapKernel ? '/home/kincli/.kin/kin-kernel' : '/usr/local/bin/kin-kernel',
     '--gateway-worker',
     '--config',
     '/run/kin/kernel.json',
   ]
+  return usesKernelCpuLimit(vm, routing) ? kernelCpuCommand(argv) : argv
 }
 
 /** A GPT slot container created before CODEX_SLOT_ROLE still runs kin-kernel as PID 1. */
@@ -723,7 +725,7 @@ export function shouldReplaceSlotContainer({ existing, recreate = false, network
   return !!(wrongNet || wrongImg || wrongRuntime)
 }
 
-function kvmEnvPairs(vm, { uid, gid, memMb, accel, hostName, machineId, shares, smbios }) {
+function kvmEnvPairs(vm, { uid, gid, memMb, accel, hostName, machineId, shares, smbios, routing }) {
   const m = kvmMachineFields(vm)
   // Current kin-kvm-entry requires these vars, then uses qemu-smbios.args for -smbios.
   // A missing fingerprint field stays "-", never the OptiPlex default. smc_version and
@@ -754,6 +756,7 @@ function kvmEnvPairs(vm, { uid, gid, memMb, accel, hostName, machineId, shares, 
     `KIN_KVM_MACHINE_ID=${machineId}`,
     `KIN_KVM_ACCEL=${accel}`,
     `KIN_KVM_SHARES=${shares}`,
+    ...(usesKernelCpuLimit(vm, routing) ? ['KIN_KVM_KERNEL_CPU_LIMIT=1'] : []),
   ]
 }
 
@@ -959,13 +962,14 @@ export function buildKvmRunArgs({
   shares = 'home,run',
   hostOf = (p) => p,
   projectRoot,
+  routing = {},
 }) {
   const slotName = displayName(vm.id)
   const mem = kvmContainerMemory(memory)
   const memMb = memoryMiB(memory)
   const machineId = String(vm.fingerprint?.guest_machine_id || vm.fingerprint?.machine_id || '').trim()
   const smbios = readFingerprintSmbios(kvmDir)
-  const env = kvmEnvPairs(vm, { uid, gid, memMb, accel, hostName, machineId, shares, smbios })
+  const env = kvmEnvPairs(vm, { uid, gid, memMb, accel, hostName, machineId, shares, smbios, routing })
   const capAdd = KVM_CAPS.flatMap((cap) => ['--cap-add', cap])
   const device = accel === 'kvm' ? ['--device', '/dev/kvm'] : []
   return [
@@ -1218,6 +1222,7 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
       shares: 'home,run',
       hostOf,
       projectRoot,
+      routing: resolvedRouting,
     })
   } else {
     const machineMounts = machineIdFile
@@ -1313,7 +1318,7 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
       '-w',
       '/home/kincli',
       image,
-      ...slotContainerCommand(vm, { wrapKernel: fs.existsSync(wrapKernel) }),
+      ...slotContainerCommand(vm, { wrapKernel: fs.existsSync(wrapKernel), routing: resolvedRouting }),
     ]
   }
 
