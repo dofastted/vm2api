@@ -396,12 +396,53 @@ export async function ensureRemoteOfficialCredentialLink(vm, slotDir, session = 
 
 const queues = new Map()
 
+/**
+ * Retry gaps for a failed queued push. A restart can queue a push for every
+ * slot on a node at once; they all share one SSH connection, and once the
+ * open channels pass the node's sshd MaxSessions (default 10) the rest fail
+ * with "Channel open failure". Nothing republishes run/ until the next change,
+ * so a dropped push would leave the node on stale settings.
+ */
+export const SLOT_PUSH_RETRY_DELAYS_MS = Object.freeze([1_000, 5_000, 15_000])
+
+function jittered(ms) {
+  return Math.round(ms * (0.75 + Math.random() * 0.5))
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms).unref?.())
+}
+
 /** Fire-and-forget push, serialized per VM so a slow push never races the next one. */
-export function queueSlotPush(vm, slotDir, sets, { logger = console } = {}) {
+export function queueSlotPush(
+  vm,
+  slotDir,
+  sets,
+  { logger = console, push = pushSlotFiles, retryDelaysMs = SLOT_PUSH_RETRY_DELAYS_MS, wait = sleep } = {},
+) {
   const prev = queues.get(vm.id) || Promise.resolve()
   const next = prev
     .catch(() => {})
-    .then(() => pushSlotFiles(vm, slotDir, sets))
+    .then(async () => {
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          return await push(vm, slotDir, sets)
+        } catch (err) {
+          if (attempt >= retryDelaysMs.length) throw err
+          logger.warn(
+            JSON.stringify({
+              event: 'remote_slot_push_retry',
+              vm_id: vm.id,
+              sets,
+              attempt: attempt + 1,
+              error: String(err?.message || err),
+            }),
+          )
+          // Re-reads the local files, so a retry always publishes the latest copy.
+          await wait(jittered(retryDelaysMs[attempt]))
+        }
+      }
+    })
     .catch((err) => {
       logger.warn(
         JSON.stringify({ event: 'remote_slot_push_failed', vm_id: vm.id, sets, error: String(err?.message || err) }),
