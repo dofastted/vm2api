@@ -32,7 +32,6 @@ import {
 } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { dashboardQueryOptions } from '@/features/overview/queries'
-import { ClaudeLogin } from '@/features/vm/claude-login'
 import { CodexCredentialPanel } from '@/features/vm/codex-credential-panel'
 import { ConvertOauthToSetupButton } from '@/features/vm/convert-oauth-button'
 import { vmQueryOptions } from '@/features/vm/queries'
@@ -247,7 +246,8 @@ function ClaudeCredentialPanel({
       setCode('')
       setLink(EMPTY_LINK)
       await invalidate()
-      onCommitted?.(d, vmId, '换票完成')
+      toast.success('换票完成，已同步到 VM 客户端')
+      onCommitted?.(d, vmId, '换票并同步完成')
     },
     onError: (e: Error) => toast.error(importErrorMessage(e)),
   })
@@ -282,7 +282,8 @@ function ClaudeCredentialPanel({
       setApiKey('')
       setSessionKey('')
       await invalidate()
-      onCommitted?.(d, vmId, '已导入')
+      toast.success('凭证已导入并同步到 VM 客户端')
+      onCommitted?.(d, vmId, '已导入并同步')
     },
     onError: (e: Error) => toast.error(importErrorMessage(e)),
   })
@@ -404,14 +405,6 @@ function ClaudeCredentialPanel({
             {importCred.isPending ? '换票中…' : '导入'}
           </Button>
         </div>
-      ) : activeMethod === 'cc' ? (
-        <ClaudeLogin
-          vm={vm}
-          disabled={busy}
-          onLogin={() => {
-            void invalidate()
-          }}
-        />
       ) : linkReady ? (
         <div className='space-y-2'>
           <div className='flex flex-wrap items-center gap-2'>

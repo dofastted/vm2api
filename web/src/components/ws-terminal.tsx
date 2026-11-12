@@ -118,8 +118,8 @@ export const WsTerminal = forwardRef<
     const term = termRef.current
     const cmd = withBuiltins(commandsRef.current).find((c) => c.name === name)
     if (!term || !cmd || busyRef.current) return
-    if (term.buffer.active.type !== 'normal') {
-      setNote('全屏程序运行中，退出后再执行快捷指令')
+    if (term.buffer.active.type !== 'normal' || !shellPromptRef.current) {
+      setNote('请先退出前台程序，返回 shell 后再执行快捷指令')
       return
     }
     const line = lineRef.current
@@ -195,6 +195,7 @@ export const WsTerminal = forwardRef<
     shellPromptRef.current = false
     term.parser.registerOscHandler(133, (data) => {
       shellPromptRef.current = data === 'A'
+      if (data === 'A') lineRef.current = SLASH_IDLE
       return true
     })
     term.parser.registerOscHandler(52, (data) => {
@@ -275,7 +276,7 @@ export const WsTerminal = forwardRef<
         withBuiltins(commandsRef.current)
           .filter((c) => !c.input || shellPromptRef.current)
           .map((c) => c.name),
-        term.buffer.active.type === 'normal'
+        term.buffer.active.type === 'normal' && shellPromptRef.current
       )
       lineRef.current = step.line
       for (const a of step.actions) {
