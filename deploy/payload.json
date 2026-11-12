@@ -1,7 +1,7 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "v1.4.076",
-  "crag_release": "v1.4.076",
+  "release": "v1.4.077",
+  "crag_release": "v1.4.077",
   "files": [
     {
       "path": "bin/kin-kernel",
@@ -114,14 +114,14 @@
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2",
       "asset": "crag-v2-amd64-crag-v2",
-      "size": 854504,
-      "sha256": "87a7f7cf6650a81bba456fb7a721615c871de919ba5ec94107903297add3ada2"
+      "size": 854200,
+      "sha256": "0e273762fe0f89d5860cdb80cf0559cf62dc597d7583ac9c45a0a6ff01e36828"
     },
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2.payload.enc",
       "asset": "crag-v2-amd64-crag-v2.payload.enc",
-      "size": 9586364,
-      "sha256": "c141ce115a4d4a46a91cc075e4e2573bd9f2170de3e38ff4f8f7c253d0af3db2"
+      "size": 9591484,
+      "sha256": "5ff6efa94c67d393fbf84e04b0e7bb2ad6b940601e0ddbbb0090321453695197"
     },
     {
       "path": "share/crag/kernels/v2/amd64/kernel.json.example",
@@ -133,7 +133,7 @@
       "path": "share/crag/kernels/v2/amd64/manifest.json",
       "asset": "crag-v2-amd64-manifest.json",
       "size": 2467,
-      "sha256": "bd5a46f30154baa49409b9b4a7b39e5390c5f0cec286298fbd11e3e3752bb94d"
+      "sha256": "fb1ec505c5f2824d5f8d667cd4ba687d8fff317225efe06027a0df5690592ed0"
     }
   ]
 }
