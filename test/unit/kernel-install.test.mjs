@@ -21,6 +21,7 @@ import {
   seedEncryptedPackage,
 } from '../fixtures/crag-license.mjs'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
+import { unitCircuit } from '../../src/lib/pool/unit-circuit.mjs'
 
 const savedEnv = Object.fromEntries(
   ['KIN_SLOT_RUN_ROOT', 'KIN_CRAG_V2_ROOT', 'KIN_WRAP_CLI_ROOT', 'KIN_KERNEL_BIN', 'KIN_NATIVE_CLI_ROOT'].map((key) => [
@@ -784,7 +785,10 @@ for (const recoveredOk of [true, false]) {
           return { ok: true, boot: { rust: { ok: true } } }
         },
         // The failed case boots but fails diagnosis: recoverSlot still returns outer ok:true.
-        diagnose: () => ({ ok: recoveredOk }),
+        diagnose: () => ({
+          ok: recoveredOk,
+          checks: recoveredOk ? [] : [{ id: 'kernel', status: 'error', code: 'kernel_down' }],
+        }),
       },
       requireAuth(req) {
         req.panelUser = 'fixture'
@@ -823,3 +827,27 @@ for (const recoveredOk of [true, false]) {
     )
   })
 }
+
+test('kernel installation resets an open request circuit only after verified readiness', async (t) => {
+  const { root } = fixture(t)
+  const account = 'existing-account'
+  t.after(() => unitCircuit.reset(account))
+  for (let i = 0; i < 3; i++) unitCircuit.recordFailure(account)
+  const failed = await installKernelTargets({
+    projectRoot: root,
+    targets: target('cli-node'),
+    ops: lifecycle(root, { startSlotReady: () => ({ ok: true, rust_ok: false }) }).ops,
+  })
+  assert.equal(failed.ok, false)
+  assert.equal(unitCircuit.view(account).state, 'open')
+  const repaired = await installKernelTargets({
+    projectRoot: root,
+    targets: target('cli-node'),
+    ops: {
+      ...lifecycle(root).ops,
+      stopSlot: () => ({ ok: true }),
+    },
+  })
+  assert.equal(repaired.ok, true, JSON.stringify(repaired))
+  assert.equal(unitCircuit.view(account).state, 'closed')
+})

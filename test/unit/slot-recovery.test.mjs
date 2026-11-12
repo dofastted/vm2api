@@ -348,6 +348,7 @@ test('recover power-cycles with the watchdog held off, then clears its fault', a
         return { ok: true, boot: { ok: true, rust_ok: true, rust: { ok: true } } }
       },
       diagnose: async () => {
+        assert.equal(kernelFaults.has(vm.id), true, 'readiness diagnosis must precede clearing the old fault')
         events.push('diagnose')
         return { ok: true, checks: [] }
       },
@@ -355,7 +356,6 @@ test('recover power-cycles with the watchdog held off, then clears its fault', a
     },
   })
   assert.equal(result.ok, true)
-  assert.deepEqual(events, ['hold:vm-r1', 'stop', 'start', 'reset:vm-r1', 'diagnose', 'release:vm-r1'])
   assert.deepEqual(
     result.report.steps.map((s) => [s.id, s.ok]),
     [

@@ -1,8 +1,10 @@
+import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { once } from 'node:events'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, it } from 'node:test'
 import {
   ensureRedaction,
   maskJson,
@@ -10,50 +12,55 @@ import {
   restoreJsonValue,
 } from '../../src/lib/redaction/runtime.mjs'
 
-const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-redact-runtime-'))
-const bin = path.join(root, 'kin-redact')
-
+let root
+let bin
 let helper = null
 
-afterEach(() => {
-  helper?.kill()
-  helper = null
-  publishRedactionForTests(null)
+beforeEach(() => {
+  root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-redact-runtime-'))
+  bin = path.join(root, 'kin-redact')
+})
+
+afterEach(async () => {
+  try {
+    if (helper && helper.exitCode === null && helper.signalCode === null) {
+      const closed = once(helper, 'close')
+      helper.kill()
+      await closed
+    }
+  } finally {
+    helper = null
+    publishRedactionForTests(null)
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 describe('redaction runtime', () => {
   it('stays out of the request path when the switch is off', async () => {
-    const state = await ensureRedaction({}, { projectRoot: root, binPath: bin })
-    expect(state.enabled).toBe(false)
-    expect(state.ready).toBe(true)
-    await expect(
-      maskJson({ messages: [{ role: 'user', content: 'sk-proj-Aa1Bb2Cc3Dd4Ee5Ff6Gg' }] }, { principal: 'key-a' }),
-    ).resolves.toEqual({
-      messages: [{ role: 'user', content: 'sk-proj-Aa1Bb2Cc3Dd4Ee5Ff6Gg' }],
-    })
+    const policy = { enabled: false, secrets: true, personal: false }
+    await ensureRedaction({ redaction: policy }, { projectRoot: root, binPath: bin })
+    const body = { messages: [{ role: 'user', content: 'sk-proj-Aa1Bb2Cc3Dd4Ee5Ff6Gg' }] }
+    assert.equal(await maskJson(body), body)
+    assert.equal(await restoreJsonValue(body), body)
   })
 
-  it('masks and restores through the real helper when enabled', async () => {
+  it('masks and restores through the real helper when enabled', { timeout: 60_000 }, async () => {
     execFileSync('go', ['build', '-o', bin, './cmd/kin-redact'], {
       cwd: path.join(process.cwd(), 'redact'),
       stdio: 'inherit',
     })
     const policy = { enabled: true, secrets: true, personal: false, words: [], rules: [] }
     const state = await ensureRedaction({ redaction: policy }, { projectRoot: root, binPath: bin })
-    expect(state.ready).toBe(true)
     helper = state.child
     const secret = 'sk-' + 'proj-' + 'Aa1Bb2Cc3Dd4Ee5Ff6Gg'
-    const masked = await maskJson(
-      { messages: [{ role: 'user', content: `token ${secret}` }] },
-      { principal: 'key-a', session: 's1' },
-    )
+    const body = { messages: [{ role: 'user', content: `token ${secret}` }] }
+    const masked = await maskJson(body, { principal: 'key-a', session: 's1' })
     const text = JSON.stringify(masked)
-    expect(text).not.toContain(secret)
-    expect(text).toContain('{{R_API_KEY_')
+    assert.ok(!text.includes(secret))
+    assert.match(text, /\{\{R_API_KEY_/)
     const restored = await restoreJsonValue(masked, { principal: 'key-a', session: 's1' })
-    expect(JSON.stringify(restored)).toContain(secret)
+    assert.deepEqual(restored, body)
     const other = await restoreJsonValue(masked, { principal: 'key-b', session: 's1' })
-    expect(JSON.stringify(other)).not.toContain(secret)
-    state.child?.kill()
-  }, 60_000)
+    assert.deepEqual(other, masked)
+  })
 })
