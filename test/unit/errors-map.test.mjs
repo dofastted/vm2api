@@ -363,6 +363,18 @@ test('upstream 429 / 529 hand their Retry-After to the client; 529 always has on
   assert.equal(overloaded.retryAfterSec, 1)
 })
 
+test('tool continuation conflicts and expiry retain their native client status', () => {
+  for (const [status, message] of [
+    [409, 'tool_result replayed'],
+    [410, 'tool continuation expired'],
+  ]) {
+    const mapped = mapUpstreamError(status, { error: { type: 'invalid_request_error', message } })
+    assert.equal(mapped.status, status)
+    assert.equal(mapped.body.error.type, 'invalid_request_error')
+    assert.equal(mapped.body.error.details.upstream_status, status)
+  }
+})
+
 test('retryAfterSeconds reads delta seconds and HTTP dates', () => {
   const now = Date.parse('2026-10-06T00:00:00Z')
   assert.equal(retryAfterSeconds('2.2', now), 3)
