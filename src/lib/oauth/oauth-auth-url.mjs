@@ -122,9 +122,6 @@ export function buildAuthorizationURL(state, codeChallenge, scope = SCOPE_OAUTH,
 
 export function generateAuthUrl({ vmId, proxyUrl, flavor } = {}) {
   sweepExpired()
-  if (normalizeOauthFlavor(flavor) === 'claude_code') {
-    throw fail('claude_code_in_slot', '官方 Claude Code 登录必须由槽内 cli-node 执行，不能由宿主机生成授权链接')
-  }
   if (!vmId) throw fail('vm_required', 'vm_id required (先创建虚拟机)')
   if (normalizeSocks(proxyUrl) == null) {
     throw fail('proxy_required', '虚拟机未绑定 SOCKS5，请先分配代理再生成授权链接')

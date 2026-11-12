@@ -19,17 +19,13 @@ import { isSlotProxyDesynced } from '../vm/vm-runtime.mjs'
 import { reloadSlotReady, startSlotReady } from '../vm/slot-runtime.mjs'
 import { resolveImportProxy } from '../vm/proxy-resolve.mjs'
 import { collectSlotIdentity } from '../vm/guest-identity.mjs'
-import { importWorkerCredential } from '../transport/go-worker-client.mjs'
+import { importWorkerCredential, syncClaudeClientCredentials } from '../transport/go-worker-client.mjs'
 import { rustKernelHealth, rustKernelReachable, rustKernelBusy } from '../transport/rust-kernel-client.mjs'
 import { credentialModeFromOauth, canOfficialCc } from './credential-mode.mjs'
 import { resolveAuthScheme } from './auth-scheme.mjs'
 import { flattenOauthIdentity, normalizeSubscriptionType } from './oauth-identity.mjs'
 import { persistOauthToVm } from './oauth-credentials.mjs'
-import {
-  officialCcUidGid,
-  scheduleOfficialCcBootstrap,
-  materializeOfficialClaudeCredentials,
-} from './official-cc-bootstrap.mjs'
+import { scheduleOfficialCcBootstrap } from './official-cc-bootstrap.mjs'
 import { normalizeTiers } from '../pool/quota-tiers.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { finishOAuthImport } from './guest-oauth-helper.mjs'
@@ -241,10 +237,8 @@ export function createImportCommit(ctx) {
         Object.assign(existing, refreshed)
       }
     })
-    try {
-      const ids = officialCcUidGid(vmId)
-      materializeOfficialClaudeCredentials(workerExec.homeDir, ids)
-    } catch {}
+    const clientSync = await syncClaudeClientCredentials(workerExec)
+    if (!clientSync.ok) return clientSync
     const mode = importedCredential.mode || credentialModeFromOauth(oauth)
     const ccUnsupported = !slotHost(existing).supports('official_cc')
     const skipCc = skipOfficialCc || ccUnsupported || isCodexVm(existing) || !canOfficialCc(mode)
@@ -274,7 +268,7 @@ export function createImportCommit(ctx) {
             email: importedCredential.email,
           },
         })
-    return { ok: true, existing, official_cc_bootstrap: officialCc }
+    return { ok: true, existing, client_sync: clientSync, official_cc_bootstrap: officialCc }
   }
   async function commitImportedOauth(options) {
     let result

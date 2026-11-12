@@ -1157,6 +1157,13 @@ test('writeKernelConfig points cc at cc-node and crag at native Claude', () => {
     assert.equal(crag.claude_bin, '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude')
     assert.equal(crag.crag_kernel_version, 'v2')
     assert.equal(crag.runtime_variant, 'crag-v2')
+    const wrap = JSON.parse(
+      fs.readFileSync(writeKernelConfig(root, { id: 'vm-09', dataplane: 'wrap' }, { token: 'tok' }).configPath, 'utf8'),
+    )
+    assert.equal(wrap.dataplane, 'wrap')
+    assert.equal(wrap.claude_bin, '/home/kincli/.kin/cli-node')
+    assert.equal(wrap.crag_kernel_version, undefined)
+    assert.equal(wrap.runtime_variant, undefined)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

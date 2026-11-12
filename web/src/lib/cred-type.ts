@@ -121,7 +121,7 @@ export function importMethodsFor(
 ): { id: ImportMethod; label: string }[] {
   if (kind === 'apikey') return []
   const methods: { id: ImportMethod; label: string }[] = [
-    { id: 'cc', label: 'Claude Code' },
+    { id: 'cc', label: 'Claude Code 授权' },
     { id: 'link', label: '授权链接' },
     { id: 'session', label: 'Cookie' },
   ]
