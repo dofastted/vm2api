@@ -614,7 +614,12 @@ export function mapUpstreamError(status, body, headers = {}) {
       type: ErrorType.INVALID_REQUEST,
       code: ErrorCode.UPSTREAM_INVALID,
       message: String(msg),
-      status: inboundCode === ErrorCode.UPSTREAM_INVALID && status >= 400 && status < 500 ? status : 400,
+      status:
+        (inboundCode === ErrorCode.UPSTREAM_INVALID || upType === 'invalid_request_error') &&
+        status >= 400 &&
+        status < 500
+          ? status
+          : 400,
       param: body?.error?.param || undefined,
       details: {
         upstream_type: upType,
