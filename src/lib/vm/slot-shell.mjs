@@ -25,7 +25,11 @@ import { slotExecCmd } from './slot-exec.mjs'
 import { getVm } from './vm-registry.mjs'
 import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import { ensureOfficialCredentialLink, writeWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
-import { assertAuthLoginReady, officialLoginCredentialToOauth } from '../oauth/claude-auth-login.mjs'
+import {
+  assertAuthLoginReady,
+  officialLoginCredentialToOauth,
+  resolveAuthLoginClaude,
+} from '../oauth/claude-auth-login.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
 import { ensureRemoteOfficialCredentialLink, reconcileSlotCredentials } from '../cluster/remote-slot-files.mjs'
@@ -141,8 +145,8 @@ export async function adoptLiveShellLogin(projectRoot, vm, { importOauth = null,
 }
 
 /** One interactive import at a time. A tick and terminal close share it. */
-export function createLiveLoginAdoption({ adopt, onImported, onError }) {
-  let seen = ''
+export function createLiveLoginAdoption({ adopt, onImported, onError, initialSeen = '' }) {
+  let seen = initialSeen
   let pending = null
   return (report = false) => {
     if (pending) return pending
@@ -403,7 +407,7 @@ export function panelShellLaunch(cliBin, { native = false } = {}) {
 }
 // Closing the hijacked stream does not end a TTY exec: bash would linger in the
 // slot. Every process of the session inherits the marker, so HUP them by it.
-const REAP_SCRIPT = `for d in /proc/[0-9]*; do tr '\\0' '\\n' < "$d/environ" 2>/dev/null | grep -qx "${SESSION_ENV}=$1" || continue; cmd=$(tr '\\0' ' ' < "$d/cmdline" 2>/dev/null || true); case "$cmd" in *cli-node*|*${LOCAL_CRAG_CLAUDE.slice(LOCAL_CRAG_CLAUDE.lastIndexOf('claude-code-'))}*) kill -KILL "\${d#/proc/}" 2>/dev/null || true ;; *) kill -HUP "\${d#/proc/}" 2>/dev/null || true ;; esac; done; exit 0`
+const REAP_SCRIPT = `for d in /proc/[0-9]*; do tr '\\0' '\\n' < "$d/environ" 2>/dev/null | grep -qx "${SESSION_ENV}=$1" || continue; cmd=$(tr '\\0' ' ' < "$d/cmdline" 2>/dev/null || true); case "$cmd" in *cli-node*|*"$2"*) kill -KILL "\${d#/proc/}" 2>/dev/null || true ;; *) kill -HUP "\${d#/proc/}" 2>/dev/null || true ;; esac; done; exit 0`
 
 function clampInt(v, lo, hi, dflt) {
   const n = Number.parseInt(v, 10)
@@ -428,13 +432,15 @@ export function createSlotShell({
   let sessions = 0
   const wss = new WebSocketServer({ noServer: true, maxPayload: 1 << 20 })
 
-  async function issueTicket(vmId, { login = false } = {}) {
+  async function issueTicket(vmId, { login = false, cliBin = '' } = {}) {
     const vm = getVm(projectRoot, vmId)
     if (!vm) return refuse(404, 'vm_not_found', 'vm not found')
     if (isCodexVm(vm)) return refuse(409, 'no_container', 'GPT 槽没有容器，无法打开终端')
+    let selected = null
     if (login) {
       try {
-        await (authLoginReady || assertAuthLoginReady)(projectRoot, vm, { routing: routing() })
+        selected = resolveAuthLoginClaude(vm, cliBin)
+        await (authLoginReady || assertAuthLoginReady)(projectRoot, vm, { cliBin: selected.bin })
       } catch (err) {
         return refuse(409, err.code || 'auth_login_not_ready', err.message)
       }
@@ -444,8 +450,8 @@ export function createSlotShell({
     for (const [t, v] of tickets) if (v.exp <= now) tickets.delete(t)
     if (tickets.size >= MAX_TICKETS) return refuse(429, 'shell_limit', '终端 ticket 过多，请稍后再试')
     const ticket = crypto.randomBytes(24).toString('base64url')
-    tickets.set(ticket, { vmId: vm.id, exp: now + TICKET_TTL_MS, login })
-    return { ok: true, ticket, expires_in: TICKET_TTL_MS / 1000 }
+    tickets.set(ticket, { vmId: vm.id, exp: now + TICKET_TTL_MS, login, cliBin: selected?.bin })
+    return { ok: true, ticket, expires_in: TICKET_TTL_MS / 1000, ...(login ? { cli_bin: selected.bin } : {}) }
   }
 
   /** Single use: the ticket is burned whether or not it matches. */
@@ -494,6 +500,7 @@ export function createSlotShell({
         cols: clampInt(url.searchParams.get('cols'), 10, 500, 80),
         rows: clampInt(url.searchParams.get('rows'), 5, 200, 24),
         login,
+        cliBin: entry.cliBin,
       }
       wss.handleUpgrade(req, socket, head, (ws) => attach(ws, vm, size))
     }
@@ -501,7 +508,7 @@ export function createSlotShell({
       accept()
       return true
     }
-    ;(upgradeLoginReady || authLoginReady || assertAuthLoginReady)(projectRoot, vm, { routing: routing() }).then(
+    ;(upgradeLoginReady || authLoginReady || assertAuthLoginReady)(projectRoot, vm, { cliBin: entry.cliBin }).then(
       accept,
       (err) =>
         rejectUpgrade(
@@ -522,6 +529,8 @@ export function createSlotShell({
     let connect = null
     let session = null
     let closed = false
+    let initialRefresh = ''
+    let sessionCli = size.cliBin || terminalClaudeBin(vm)
     let released = false
     const release = () => {
       if (released) return
@@ -552,7 +561,7 @@ export function createSlotShell({
       else if (pending.length < 256) pending.push(msg)
     })
     const reap = () => {
-      const { Cmd, User } = slotExecCmd(vm, ['/bin/sh', '-c', REAP_SCRIPT, 'reap', token], {
+      const { Cmd, User } = slotExecCmd(vm, ['/bin/sh', '-c', REAP_SCRIPT, 'reap', token, sessionCli], {
         detach: true,
         user: isKvmRuntime(vm) ? '0' : undefined,
       })
@@ -569,8 +578,15 @@ export function createSlotShell({
     })
     try {
       connect = slotHost(vm).dockerApi()
-      if (size.login) await preparePanelShellLogin(projectRoot, vm)
-      const selected = resolveSlotClaude(vm, routing(), slotHost(vm))
+      if (size.login) {
+        await preparePanelShellLogin(projectRoot, vm)
+        const doc = readJsonFile(path.join(projectRoot, 'vms', vm.id, 'cli-home', '.claude', '.credentials.json'))
+        initialRefresh = String(doc?.claudeAiOauth?.refreshToken || doc?.claudeAiOauth?.refresh_token || '')
+      }
+      const selected = size.login
+        ? resolveAuthLoginClaude(vm, size.cliBin)
+        : resolveSlotClaude(vm, routing(), slotHost(vm))
+      sessionCli = selected.bin
       const launch = panelShellLaunch(selected.bin, selected)
       const env = ['TERM=xterm-256color', `${SESSION_ENV}=${token}`, `${RC_ENV}=${launch.rc}`]
       // guest-exec 经 root SSH 降权后仍继承 /root，终端须显式切换到槽用户目录。
@@ -603,6 +619,7 @@ export function createSlotShell({
     // ConsoleSize on exec start is API >= 1.42; resize covers older daemons.
     resize(size.cols, size.rows)
     const adoptLive = createLiveLoginAdoption({
+      initialSeen: initialRefresh,
       adopt: (seen) => {
         if (!size.login) return { imported: false, refresh: seen }
         return adoptLiveShellLogin(projectRoot, vm, {

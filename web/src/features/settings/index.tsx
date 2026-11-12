@@ -431,7 +431,8 @@ export function SettingsPage() {
               {tab === 'redaction' ? (
                 <RedactionPane
                   redaction={
-                    (draft.redaction as Record<string, unknown> | undefined) || {
+                    (draft.redaction as
+                      Record<string, unknown> | undefined) || {
                       enabled: false,
                       secrets: true,
                       personal: true,

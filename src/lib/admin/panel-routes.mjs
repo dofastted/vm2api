@@ -206,6 +206,7 @@ import {
 import { downloadReleaseKernel, kernelReleaseHttpStatus } from './release-kernel.mjs'
 import { describeKernelCatalog, pullKernelRelease } from './kernel-catalog.mjs'
 import { installKernelTargets, releaseKernelInstallSafetyHold, validateKernelTargets } from '../vm/kernel-install.mjs'
+import { withSlotMaintenance } from '../vm/slot-maintenance.mjs'
 import { clearActiveVmFromDb, removeVmFromDb } from '../vm/vm-db-sync.mjs'
 import { normalizeCredentialMode } from '../oauth/credential-mode.mjs'
 import { reloadActiveVm } from '../core/config.mjs'
@@ -1143,15 +1144,19 @@ export function createPanelHandler(ctx) {
   }
 
   // PATCH already owns the full record lock, including its other metadata/config writes.
-  async function applySlotPolicyWithRuntimeLocked(id, patch) {
+  async function applySlotPolicyWithRuntimeLocked(
+    id,
+    patch,
+    { maintenance = false, previousRouting = structuredClone(ctx.routingConfig) } = {},
+  ) {
     const current = getVm(cfg.paths.project, id)
     if (!current) return { ok: false, id, code: 'vm_not_found', error: 'vm not found' }
     const desired = vmWithSlotPolicyPatch(current, patch)
-    const previousEngine = resolveInferenceEngine(current, ctx.routingConfig)
+    const previousEngine = resolveInferenceEngine(current, previousRouting)
     const targetEngine = resolveInferenceEngine(desired, ctx.routingConfig)
-    const previousDataplane = resolveKernelDataplane(current, ctx.routingConfig)
+    const previousDataplane = resolveKernelDataplane(current, previousRouting)
     const targetDataplane = resolveKernelDataplane(desired, ctx.routingConfig)
-    const previousVersion = resolveCragKernelVersion(current, ctx.routingConfig)
+    const previousVersion = resolveCragKernelVersion(current, previousRouting)
     const targetVersion = resolveCragKernelVersion(desired, ctx.routingConfig)
     const licensed = checkCragLicense(cfg.paths.project, desired, ctx.routingConfig)
     if (!licensed.ok) return { ...licensed, id }
@@ -1166,6 +1171,19 @@ export function createPanelHandler(ctx) {
       if (isNativeNodeVm(desired)) {
         return { ok: false, id, code: 'native_crag_unsupported', error: 'crag 数据面暂不支持 macOS 原生节点' }
       }
+    }
+    if (kernelSwitch && current.status === 'running' && !maintenance) {
+      return withSlotMaintenance({
+        projectRoot: cfg.paths.project,
+        id,
+        watchdog: ctx.kernelWatchdog,
+        poolScheduler: ctx.poolScheduler,
+        operation: () => applySlotPolicyWithRuntimeLocked(id, patch, { maintenance: true, previousRouting }),
+      })
+    }
+    const restartFailed = (result) => {
+      markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', { code: result.code })
+      return result
     }
     if (kernelSwitch && !isCodexVm(desired)) {
       try {
@@ -1202,23 +1220,20 @@ export function createPanelHandler(ctx) {
           const remoteDocker =
             Boolean(String(saved.node_id || '').trim()) && !isKvmRuntime(saved) && !isNativeNodeVm(saved)
           const recreateNative =
-            !isKvmRuntime(saved) &&
-            (remoteDocker ||
-              (targetDataplane === 'crag' && targetVersion === 'v2' && !String(saved.node_id || '').trim()))
-          // docker restart keeps HostConfig. A CRAG v2 command, or any cluster
-          // kernel change, has to recreate the container.
+            !isKvmRuntime(saved) && (remoteDocker || previousDataplane === 'crag' || targetDataplane === 'crag')
+          // Both directions must replace CRAG's creation-only sandbox and command.
           if (recreateNative) {
-            const booted = await startSlotReady(saved, cfg.paths.project, {
+            const booted = await (ctx.kernelPolicyOps?.startSlotReady || startSlotReady)(saved, cfg.paths.project, {
               recreate: true,
               routing: ctx.routingConfig,
             })
-            if (!booted?.ok) {
-              return {
+            if (!booted?.ok || booted.rust_ok === false || booted.rust?.ok === false || booted.kernel?.ok === false) {
+              return restartFailed({
                 ok: false,
                 id,
                 code: booted?.code || 'kernel_restart_failed',
-                error: booted?.error || 'kernel recreate failed',
-              }
+                error: booted?.error || booted?.rust?.error || booted?.rust?.reason || 'kernel recreate failed',
+              })
             }
           } else {
             const exec = slotExec(cfg.paths.project, saved)
@@ -1227,13 +1242,18 @@ export function createPanelHandler(ctx) {
               error: String(e?.message || e).slice(0, 200),
             }))
             if (!restarted?.ok) {
-              return {
+              return restartFailed({
                 ok: false,
                 id,
                 code: 'kernel_restart_failed',
                 error: restarted?.error || 'kernel restart failed',
-              }
+              })
             }
+          }
+          ctx.kernelWatchdog?.reset?.(id)
+          panel.resetVmCircuit({ cfg, poolScheduler: ctx.poolScheduler, id })
+          if (getVm(cfg.paths.project, id)?.unschedulable?.reason === 'runtime_start_failed') {
+            clearUnschedulable(cfg.paths.project, id, { by: 'operator' })
           }
         }
       }
@@ -1249,6 +1269,9 @@ export function createPanelHandler(ctx) {
         runtime: switched?.runtime || null,
       }
     } catch (error) {
+      if (kernelSwitch && current.status === 'running') {
+        markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', { code: 'kernel_switch_failed' })
+      }
       let rollback = null
       if (switched) rollback = await switchSlotInferenceEngine(current, cfg.paths.project, previousEngine)
       return {
@@ -2654,6 +2677,69 @@ export function createPanelHandler(ctx) {
               })
             }
             const previous = structuredClone(ctx.routingConfig)
+            if (body.restart !== false) {
+              const nextRouting = targets.all
+                ? { ...ctx.routingConfig, inference: { ...ctx.routingConfig.inference, dataplane: parsed.value } }
+                : ctx.routingConfig
+              for (const id of syncArgs.body.ids) {
+                const vm = getVm(cfg.paths.project, id)
+                const desired = targets.all ? vm : vmWithSlotPolicyPatch(vm, { dataplane: parsed.value })
+                const licensed = checkCragLicense(cfg.paths.project, desired, nextRouting)
+                if (!licensed.ok)
+                  return json(res, 403, { ok: false, error: { code: licensed.code, message: licensed.error } })
+                if (
+                  resolveKernelDataplane(desired, nextRouting) === 'crag' &&
+                  (isKvmRuntime(desired) || isNativeNodeVm(desired))
+                ) {
+                  return json(res, 400, {
+                    ok: false,
+                    error: { code: 'remote_unsupported', message: 'CRAG 切核暂不支持 KVM 或 macOS 原生槽' },
+                  })
+                }
+              }
+              let switchAll = async () => {
+                if (targets.all) await persistRoutingPatch({ inference: nextRouting.inference })
+                const items = []
+                for (const id of syncArgs.body.ids) {
+                  const switched = await applySlotPolicyWithRuntimeLocked(
+                    id,
+                    targets.all ? {} : { dataplane: parsed.value },
+                    { maintenance: true, previousRouting: previous },
+                  )
+                  items.push({ id, ok: switched.ok, code: switched.code, error: switched.error })
+                }
+                const failed = items.filter((item) => !item.ok).length
+                return {
+                  ok: failed === 0,
+                  total: items.length,
+                  ok_count: items.length - failed,
+                  failed_count: failed,
+                  items,
+                }
+              }
+              for (const id of [...syncArgs.body.ids].reverse()) {
+                if (getVm(cfg.paths.project, id)?.status !== 'running') continue
+                const operation = switchAll
+                switchAll = () =>
+                  withSlotMaintenance({
+                    projectRoot: cfg.paths.project,
+                    id,
+                    watchdog: ctx.kernelWatchdog,
+                    poolScheduler: ctx.poolScheduler,
+                    operation,
+                  })
+              }
+              try {
+                const report = await switchAll()
+                return json(res, report.ok ? 200 : 503, panel.ok({ dataplane: parsed.value, ...report }))
+              } catch (error) {
+                ctx.routingConfig = previous
+                return json(res, 503, {
+                  ok: false,
+                  error: { code: 'dataplane_persist_failed', message: String(error?.message || error) },
+                })
+              }
+            }
             try {
               if (targets.all) {
                 await persistRoutingPatch({
@@ -2964,9 +3050,20 @@ export function createPanelHandler(ctx) {
       // POST /api/panel/vms/:id/shell-ticket — single-use ticket for the slot terminal WebSocket
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/shell-ticket$/.test(p)) {
         const body = await readBody(req, 1024).catch(() => ({}))
-        const issued = await ctx.slotShell.issueTicket(p.split('/')[4], { login: body.login === true })
+        const issued = await ctx.slotShell.issueTicket(p.split('/')[4], {
+          login: body.login === true,
+          cliBin: body.cli_bin ?? '',
+        })
         if (!issued.ok) return json(res, issued.status, { ok: false, error: issued.error })
-        return json(res, 200, panel.ok({ ticket: issued.ticket, expires_in: issued.expires_in }))
+        return json(
+          res,
+          200,
+          panel.ok({
+            ticket: issued.ticket,
+            expires_in: issued.expires_in,
+            ...(issued.cli_bin ? { cli_bin: issued.cli_bin } : {}),
+          }),
+        )
       }
       // POST /api/panel/vms/:id/collect-identity
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/collect-identity$/.test(p)) {
@@ -4785,11 +4882,13 @@ export function createPanelHandler(ctx) {
             routing: ctx.routingConfig,
             fillTimezone: fillTimezoneFromExit,
             watchdog: ctx.kernelWatchdog,
+            poolScheduler: ctx.poolScheduler,
             internal: panelIdentity(req).role === 'admin',
             ops: ctx.kernelRecoveryOps,
           })
           // Recovery returns outer ok even when a boot/readiness/diagnosis step failed.
           if (result.ok && result.report?.ok === true) {
+            panel.resetVmCircuit({ cfg, poolScheduler: ctx.poolScheduler, id })
             releaseKernelInstallSafetyHold(cfg.paths.project, id, ctx.kernelWatchdog)
           }
           return result
@@ -5038,6 +5137,7 @@ export function createPanelHandler(ctx) {
               vm: existing,
               projectRoot: cfg.paths.project,
               routing: ctx.routingConfig,
+              cliBin: body.cli_bin ?? '',
               force: body.force === true || body.force === 'true' || body.force === 1,
             })
             const px = existing.proxy || {}

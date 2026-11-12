@@ -6,7 +6,7 @@ import { toClaudeMessages } from '../../src/lib/protocol/convert.mjs'
 import { officialMessagesBody } from '../../src/lib/protocol/anthropic-messages.mjs'
 import { prepareAnthropicRequest } from '../../src/lib/protocol/anthropic-policy.mjs'
 import { prepareCliHopBody } from '../../src/lib/protocol/outbound-attempt.mjs'
-import { validateToolChoice } from '../../src/lib/protocol/model-policy.mjs'
+import { getCapabilities, normalizePolicy, validateToolChoice } from '../../src/lib/protocol/model-policy.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 
 openDatabase({ dbPath: ':memory:' })
@@ -86,6 +86,31 @@ test('unsupported thinking and malformed choices fail explicitly', () => {
     validateToolChoice({ ...fixture(), model: 'claude-opus-5-5', tool_choice: { type: 'auto' } }),
   )
   assert.doesNotThrow(() => validateToolChoice({ ...fixture(), tools: [], tool_choice: { type: 'none' } }))
+})
+
+test('opus 5 and sonnet 5 keep forced tool choice when thinking is omitted', () => {
+  for (const model of ['claude-opus-5', 'claude-kin/claude-opus-5', 'claude-sonnet-5', 'claude-opus-4-8']) {
+    assert.equal(getCapabilities(model).requires_adaptive, false)
+    const input = { ...fixture(), model }
+    delete input.thinking
+    assert.doesNotThrow(() => validateToolChoice(input))
+    const cleaned = prepareAnthropicRequest(input, { unofficial: true })
+    assert.equal(cleaned.thinking, undefined)
+    assert.deepEqual(cleaned.tool_choice, input.tool_choice)
+  }
+  assert.equal(getCapabilities('claude-opus-5-5').requires_adaptive, true)
+})
+
+test('stored adaptive-only flag on optional-thinking models is corrected', () => {
+  const normalized = normalizePolicy({
+    models: {
+      'claude-opus-5': { capabilities: { requires_adaptive: true, thinking_mode: 'adaptive_only' } },
+    },
+  })
+  assert.equal(normalized.models['claude-opus-5'].capabilities.requires_adaptive, false)
+  assert.equal(normalized.models['claude-opus-5'].capabilities.thinking_mode, 'adaptive_or_enabled')
+  assert.equal(normalized.models['claude-opus-5-5'].capabilities.requires_adaptive, true)
+  assert.equal(normalized.models['claude-sonnet-5-5'].capabilities.requires_adaptive, true)
 })
 
 for (const protocol of ['anthropic.messages', 'openai.chat', 'openai.responses']) {

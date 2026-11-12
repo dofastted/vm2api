@@ -103,6 +103,15 @@ const CAP_ADAPTIVE_ONLY = {
   supports_context_management: true,
 }
 
+// Adaptive is allowed, not required. CRAG rejectsDisabledThinking is false for
+// these ids, so a third-party forced tool_choice with thinking omitted is legal.
+const ADAPTIVE_OPTIONAL_IDS = new Set(['claude-opus-4-7', 'claude-opus-4-8', 'claude-sonnet-5', 'claude-opus-5'])
+const CAP_ADAPTIVE = {
+  ...CAP_ADAPTIVE_ONLY,
+  thinking_mode: 'adaptive_or_enabled',
+  requires_adaptive: false,
+}
+
 const CAP_CODEX = {
   context_window: 272000,
   supports_1m: false,
@@ -259,7 +268,7 @@ export function seedDefaultPolicy() {
     display_name: 'Opus 4.7',
     family: 'opus',
     sort: 28,
-    capabilities: CAP_ADAPTIVE_ONLY,
+    capabilities: CAP_ADAPTIVE,
     betas: { pass_context_1m: false },
     params: {
       max_tokens_default: 32000,
@@ -273,7 +282,7 @@ export function seedDefaultPolicy() {
     display_name: 'Opus 4.8',
     family: 'opus',
     sort: 29,
-    capabilities: CAP_ADAPTIVE_ONLY,
+    capabilities: CAP_ADAPTIVE,
     betas: { pass_context_1m: false },
     params: {
       max_tokens_default: 32000,
@@ -287,7 +296,7 @@ export function seedDefaultPolicy() {
     display_name: 'Sonnet 5',
     family: 'sonnet',
     sort: 30,
-    capabilities: CAP_ADAPTIVE_ONLY,
+    capabilities: CAP_ADAPTIVE,
     betas: { pass_context_1m: true },
     params: {
       max_tokens_default: 64000,
@@ -320,7 +329,7 @@ export function seedDefaultPolicy() {
     display_name: 'Opus 5',
     family: 'opus',
     sort: 35,
-    capabilities: CAP_ADAPTIVE_ONLY,
+    capabilities: CAP_ADAPTIVE,
     betas: { pass_context_1m: false },
     params: {
       max_tokens_default: 32000,
@@ -512,6 +521,16 @@ export function normalizePolicy(raw) {
     if (cfg.params?.on_enabled === 'convert_to_adaptive' && id !== OPUS_55_ID) {
       cfg.params = { ...cfg.params, on_enabled: 'passthrough' }
     }
+    // Older panel rows copied adaptive-only onto models that still accept
+    // disabled thinking. Stored true would keep rejecting forced tool_choice.
+    if (ADAPTIVE_OPTIONAL_IDS.has(id)) {
+      cfg.capabilities = {
+        ...cfg.capabilities,
+        thinking_mode: 'adaptive_or_enabled',
+        supports_adaptive: true,
+        requires_adaptive: false,
+      }
+    }
     if (typeof cfg.betas?.pass_context_1m !== 'boolean') {
       const seeded = seed.models[id]?.betas?.pass_context_1m
       cfg.betas = {
@@ -564,8 +583,11 @@ function heuristicCapabilities(modelId = '') {
   if (/claude-haiku-5/.test(m)) return { ...CAP_HAIKU_55 }
   if (m.includes('haiku') || /claude-3[.-]/.test(m)) return { ...CAP_HAIKU }
   if (/claude-(sonnet|opus)-4-5/.test(m)) return { ...CAP_SONNET45 }
-  if (/claude-(opus|sonnet|fable|mythos)-5/.test(m) || /claude-opus-4-[78]/.test(m)) {
+  if (/claude-(?:opus|sonnet)-5(?:-5|\.5)(?![0-9])/.test(m) || /claude-(?:fable|mythos)-5/.test(m)) {
     return { ...CAP_ADAPTIVE_ONLY }
+  }
+  if (/claude-(?:opus|sonnet)-5/.test(m) || /claude-opus-4-[78]/.test(m)) {
+    return { ...CAP_ADAPTIVE }
   }
   if (/claude-(sonnet|opus)-4-6/.test(m)) return { ...CAP_46 }
   return { ...CAP_46 }

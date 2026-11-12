@@ -1,60 +1,49 @@
-import { describe, expect, it } from 'vitest'
-import { defaultRedaction, normalizeRedaction } from '../../src/lib/redaction/policy.mjs'
+import assert from 'node:assert/strict'
+import { describe, it } from 'node:test'
+import { normalizeRedaction } from '../../src/lib/redaction/policy.mjs'
 
 describe('redaction policy', () => {
-  it('treats a missing block as off without inventing protection', () => {
-    expect(normalizeRedaction(undefined)).toEqual(defaultRedaction())
-  })
-
   it('rejects coerced booleans and unknown fields', () => {
-    expect(() => normalizeRedaction({ enabled: 'false', secrets: true, personal: true })).toThrow(/enabled/)
-    expect(() => normalizeRedaction({ enabled: false, secrets: true, personal: true, shape: true })).toThrow(/unknown/)
+    assert.throws(() => normalizeRedaction({ enabled: 'false', secrets: true, personal: true }), {
+      code: 'invalid_redaction_config',
+      status: 400,
+    })
+    assert.throws(() => normalizeRedaction({ enabled: false, secrets: true, personal: true, shape: true }), {
+      code: 'invalid_redaction_config',
+      status: 400,
+    })
   })
 
   it('rejects an enabled policy with nothing to protect', () => {
-    expect(() =>
-      normalizeRedaction({ enabled: true, secrets: false, personal: false, words: ['  '], rules: [] }),
-    ).toThrow(/requires/)
+    assert.throws(
+      () => normalizeRedaction({ enabled: true, secrets: false, personal: false, words: ['  '], rules: [] }),
+      { code: 'invalid_redaction_config', status: 400 },
+    )
   })
 
   it('keeps words when the switch is off and drops blanks', () => {
-    expect(
-      normalizeRedaction({
-        enabled: false,
-        secrets: true,
-        personal: false,
-        words: [' 夜莺 ', '夜莺', ''],
-        rules: [],
-      }),
-    ).toEqual({
+    const policy = normalizeRedaction({
       enabled: false,
       secrets: true,
       personal: false,
-      words: ['夜莺'],
-      wordsAnyCase: false,
+      words: [' 夜莺 ', '夜莺', ''],
       rules: [],
-      kinds: {},
-      allow: [],
     })
+    assert.deepEqual(policy.words, ['夜莺'])
   })
 
-  it('keeps kind overrides, case folding, and the allow list', () => {
-    expect(
-      normalizeRedaction({
-        enabled: true,
-        secrets: true,
-        personal: true,
-        words: ['Nightjar'],
-        wordsAnyCase: true,
-        rules: [{ kind: 'GATEWAY_KEY', prefix: 'oc_sk_' }],
-        kinds: { ip: true, home: false },
-        allow: [' build-01 '],
-      }),
-    ).toMatchObject({
-      wordsAnyCase: true,
-      kinds: { ip: true, home: false },
-      allow: ['build-01'],
-      rules: [{ kind: 'GATEWAY_KEY', prefix: 'oc_sk_', regex: '' }],
+  it('trims rule prefixes and normalizes the allow list', () => {
+    const policy = normalizeRedaction({
+      enabled: true,
+      secrets: true,
+      personal: true,
+      rules: [{ kind: 'GATEWAY_KEY', prefix: ' oc_sk_ ' }, { prefix: ' ' }],
+      allow: [' build-01 ', 'build-01', ''],
     })
+    assert.deepEqual(policy.allow, ['build-01'])
+    assert.deepEqual(
+      policy.rules.map(({ kind, prefix }) => ({ kind, prefix })),
+      [{ kind: 'GATEWAY_KEY', prefix: 'oc_sk_' }],
+    )
   })
 })

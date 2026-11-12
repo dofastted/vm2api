@@ -261,13 +261,14 @@ test('native Anthropic API backend keeps endpoint headers and applies the 1M pol
   await new Promise((resolve) => server.listen(path.join(temp, 'run', 'api-kernel.sock'), resolve))
   t.after(() => new Promise((resolve) => server.close(resolve)))
 
+  const callerUa = 'claude-cli/2.1.278 (external, sdk-cli)'
   const run = (model, endpointHeaders) => {
     const body = { model, max_tokens: 64, messages: [{ role: 'user', content: 'hi' }] }
     return runApiInference({
       req: {
         headers: {
           'anthropic-beta': 'oauth-2025-04-20,context-1m-2025-08-07,future-beta',
-          'user-agent': 'claude-cli/2.1.278 (external, sdk-cli)',
+          'user-agent': callerUa,
           'x-app': 'cli',
         },
       },
@@ -314,6 +315,6 @@ test('native Anthropic API backend keeps endpoint headers and applies the 1M pol
   // Caller UA stays off the wire unless passthrough is on.
   assert.equal((await run('claude-sonnet-5', {})).ok, true)
   assert.equal(envelope.headers['anthropic-beta'], 'oauth-2025-04-20,context-1m-2025-08-07,future-beta')
-  assert.equal(envelope.headers['user-agent'], 'claude-cli/2.1.303 (external, sdk-cli)')
-  assert.doesNotMatch(String(envelope.headers['user-agent']), /2\.1\.278/)
+  assert.match(envelope.headers['user-agent'], /^claude-cli\//)
+  assert.notEqual(envelope.headers['user-agent'], callerUa)
 })

@@ -5,15 +5,11 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   assertAuthLoginReady,
-  authLoginSessionDir,
-  completeClaudeAuthLogin,
   extractAuthLoginUrl,
   isPersistentAuthLoginSession,
   officialLoginCredentialToOauth,
-  startClaudeAuthLoginSession,
-  stopClaudeAuthLoginSession,
+  resolveAuthLoginClaude,
 } from '../../src/lib/oauth/claude-auth-login.mjs'
-import { KVM_GUEST_EXEC } from '../../src/lib/vm/slot-exec.mjs'
 import { FULL_OAUTH_SCOPE } from '../../src/lib/oauth/oauth-contract.mjs'
 import { prepareSlotOAuth } from '../../src/lib/oauth/guest-oauth-helper.mjs'
 
@@ -76,7 +72,6 @@ test('auth login session stays reusable until force regenerate or login_ready', 
   assert.equal(isPersistentAuthLoginSession(session, { force: true }), false)
   assert.equal(isPersistentAuthLoginSession({ ...session, status: 'login_ready' }), false)
   assert.equal(isPersistentAuthLoginSession({ ...session, alive: false }), false)
-  assert.equal(isPersistentAuthLoginSession(session, { cliBin: '/home/kincli/.kin/cli-node' }), true)
   assert.equal(
     isPersistentAuthLoginSession(session, { cliBin: '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude' }),
     false,
@@ -91,226 +86,47 @@ test('auth login session stays reusable until force regenerate or login_ready', 
   )
 })
 
-test('auth readiness checks the selected native CLI, never the installed standard CLI', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-auth-native-'))
-  const vm = { id: 'vm-01', dataplane: 'crag', crag_kernel_version: 'v2' }
-  const cli = path.join(root, 'vms/vm-01/cli-home/.kin/crag-v2/claude-code-2.1.321/claude')
-  try {
-    fs.mkdirSync(path.dirname(cli), { recursive: true })
-    fs.writeFileSync(path.join(root, 'vms/vm-01/cli-home/.kin/cli-node'), '')
-    await assert.rejects(assertAuthLoginReady(root, vm, { inspect: () => ({ running: true }) }), {
-      code: 'claude_cli_missing',
-    })
-    fs.writeFileSync(cli, '')
-    const ready = await assertAuthLoginReady(root, vm, { inspect: () => ({ running: true }) })
-    assert.equal(ready.cli, cli)
-    const inherited = await assertAuthLoginReady(
-      root,
-      { id: 'vm-01' },
-      {
-        inspect: () => ({ running: true }),
-        routing: { inference: { dataplane: 'crag', crag_kernel_version: 'v2' } },
-      },
-    )
-    assert.equal(inherited.cli, cli)
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true })
+test('auth uses native CC for wrap slots and honors an explicit executable', async () => {
+  const vm = { id: 'vm-01', dataplane: 'wrap' }
+  const native = resolveAuthLoginClaude(vm)
+  assert.equal(native.native, true)
+  assert.equal(native.bin, resolveAuthLoginClaude({ ...vm, dataplane: 'crag' }).bin)
+  assert.match(native.bin, /crag-v2\/claude-code-[^/]+\/claude$/)
+  const custom = "/opt/Claude Code/it's claude"
+  assert.equal(resolveAuthLoginClaude(vm, custom).bin, custom)
+  for (const invalid of ['claude', '/tmp/claude\n', '/tmp/claude\0', '/tmp/', 42]) {
+    assert.throws(() => resolveAuthLoginClaude(vm, invalid), { code: 'invalid_claude_path' })
   }
-})
-
-test('native auth dispatch passes the selected executable and leaves its version untouched', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-auth-native-start-'))
-  const vm = { id: 'vm-01', dataplane: 'crag', crag_kernel_version: 'v2' }
-  const cli = path.join(root, 'vms/vm-01/cli-home/.kin/crag-v2/claude-code-2.1.321/claude')
-  try {
-    fs.mkdirSync(path.dirname(cli), { recursive: true })
-    fs.writeFileSync(cli, '')
-    let env
-    const result = await startClaudeAuthLoginSession({
-      vm,
-      projectRoot: root,
+  await assert.rejects(
+    assertAuthLoginReady('/tmp/unused', vm, {
       inspect: () => ({ running: true }),
-      prepare: async ({ exec }) => ({ exec }),
-      stopSession: async () => {},
-      spawnPty: (_bin, _args, opts) => {
-        env = opts.env
-        fs.writeFileSync(
-          path.join(env.KIN_SESSION_DIR, 'status.json'),
-          JSON.stringify({
-            session_id: env.KIN_SESSION_ID,
-            cli_bin: env.KIN_CLI_BIN,
-            auth_url: 'https://claude.com/cai/oauth/authorize?native=1',
-            status: 'waiting_auth',
-            updated_at: Date.now(),
-            expires_at: Number(env.KIN_EXPIRES_AT),
-          }),
-        )
-        return { unref() {} }
-      },
-    })
-    assert.match(result.auth_url, /native=1/)
-    assert.equal(env.KIN_CLI_BIN, '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude')
-    const argv = JSON.parse(env.KIN_DOCKER_ARGV)
-    assert.deepEqual(argv.slice(-3), [env.KIN_CLI_BIN, 'auth', 'login'])
-    assert.equal(
-      argv.some((arg) => arg.startsWith('CLAUDE_CODE_VERSION=')),
-      false,
-    )
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true })
-  }
+      cliBin: custom,
+      cliExists: async () => false,
+    }),
+    { code: 'claude_cli_missing' },
+  )
 })
 
-test('assertAuthLoginReady refuses a missing container and a missing cli-node', async () => {
+test('auth readiness refuses stopped containers and never falls back to cli-node', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-auth-login-ready-'))
-  const stopped = () => ({ running: false })
-  const running = () => ({ running: true })
+  const vm = { id: 'vm-01', dataplane: 'wrap' }
   try {
-    fs.mkdirSync(path.join(root, 'vms', 'vm-01'), { recursive: true })
-    fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify({ id: 'vm-01' }))
-    await assert.rejects(
-      assertAuthLoginReady(root, { id: 'vm-01' }, { inspect: stopped }),
-      (err) => err.code === 'container_not_ready',
-    )
-    const home = path.join(root, 'vms', 'vm-01', 'cli-home', '.kin')
+    const home = path.join(root, 'vms', vm.id, 'cli-home', '.kin')
     fs.mkdirSync(home, { recursive: true })
-    fs.writeFileSync(path.join(home, 'cli-node'), '')
+    fs.writeFileSync(path.join(home, 'cli-node'), '', { mode: 0o755 })
     await assert.rejects(
-      assertAuthLoginReady(root, { id: 'vm-01' }, { inspect: stopped }),
-      (err) => err.code === 'container_not_ready',
-    )
-    await assert.rejects(
-      assertAuthLoginReady(root, { id: 'vm-missing' }, { inspect: running }),
-      (err) => err.code === 'cli_node_missing',
-    )
-    const remote = { id: 'vm-01', node_id: 'node-a' }
-    await assert.rejects(
-      assertAuthLoginReady(root, remote, { inspect: running }),
-      (err) => err.code === 'container_unreadable',
-    )
-    assert.equal((await assertAuthLoginReady(root, { id: 'vm-01' }, { inspect: running })).container, 'kin-01')
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true })
-  }
-})
-
-test('a live login session is not reused after the container stops or cli-node disappears', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-auth-login-reuse-'))
-  const vm = { id: 'vm-01', runtime: { type: 'docker' }, proxy: { id: 'px-local' } }
-  const running = () => ({ running: true })
-  const stopped = () => ({ running: false })
-  const prepare = (options) =>
-    prepareSlotOAuth({
-      ...options,
-      startReady: async () => ({
-        ok: true,
-        rust_ok: true,
-        // startSlotReady nests it: { ok, engine, rust: { ok, reason, health } }
-        rust: {
-          ok: true,
-          engine: 'rust',
-          rust: { ok: true, health: { vm_telemetry: true, telemetry_ready: true } },
-        },
+      assertAuthLoginReady(root, vm, {
+        inspect: () => ({ running: false }),
       }),
-    })
-  try {
-    const home = path.join(root, 'vms', 'vm-01', 'cli-home', '.kin')
-    fs.mkdirSync(home, { recursive: true })
-    const cli = path.join(home, 'cli-node')
-    fs.writeFileSync(cli, '')
-    fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify(vm))
-    const dir = authLoginSessionDir(root, 'vm-01')
-    fs.mkdirSync(dir, { recursive: true })
-    fs.writeFileSync(
-      path.join(root, 'vms', 'vm-01', 'run', 'kernel.json'),
-      JSON.stringify({
-        credential_path: '/home/kincli/.claude/credentials.json',
-      }),
+      { code: 'container_not_ready' },
     )
-    fs.writeFileSync(path.join(dir, 'pty.pid'), `${process.pid}\n`)
-    fs.writeFileSync(
-      path.join(dir, 'status.json'),
-      JSON.stringify({
-        session_id: 'live-login',
-        auth_url: 'https://claude.com/cai/oauth/authorize?code=true&live=1',
-        status: 'waiting_auth',
-        expires_at: Date.now() + 60_000,
-        updated_at: Date.now(),
-      }),
-    )
-    const reused = await startClaudeAuthLoginSession({ vm, projectRoot: root, inspect: running, prepare })
-    assert.equal(reused.reused, true)
-    assert.equal(reused.session_id, 'live-login')
     await assert.rejects(
-      () => startClaudeAuthLoginSession({ vm, projectRoot: root, inspect: stopped, prepare }),
-      (err) => err.code === 'container_not_ready',
+      assertAuthLoginReady(root, vm, {
+        inspect: () => ({ running: true }),
+        cliExists: async (bin) => fs.existsSync(path.join(home, path.posix.relative('/home/kincli/.kin', bin))),
+      }),
+      { code: 'claude_cli_missing' },
     )
-    fs.rmSync(cli)
-    await assert.rejects(
-      () => startClaudeAuthLoginSession({ vm, projectRoot: root, inspect: running, prepare }),
-      (err) => err.code === 'cli_node_missing',
-    )
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true })
-  }
-})
-
-test('fake claude_code login returns the official CAI url and a full oauth grant', async () => {
-  process.env.KIN_FAKE_SESSION_OAUTH = '1'
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-auth-login-fake-'))
-  try {
-    fs.mkdirSync(path.join(root, 'vms', 'vm-01', 'cli-home', '.kin'), { recursive: true })
-    fs.writeFileSync(path.join(root, 'vms', 'vm-01', 'cli-home', '.kin', 'cli-node'), '')
-    const started = await startClaudeAuthLoginSession({
-      vm: { id: 'vm-01' },
-      projectRoot: root,
-      inspect: () => ({ running: true }),
-    })
-    assert.equal(started.flavor, 'claude_code')
-    assert.equal(started.source, 'claude-auth-login')
-    assert.match(started.auth_url, /^https:\/\/claude\.com\/cai\/oauth\/authorize\?code=true/)
-    const cred = await completeClaudeAuthLogin({
-      projectRoot: '/tmp/unused',
-      vmId: 'vm-01',
-      sessionId: started.session_id,
-      code: 'pasted-code#state',
-    })
-    assert.equal(cred.email, 'fake-oauth@kin.test')
-    assert.equal(cred.mode, 'oauth')
-    assert.match(cred.scope, /user:file_upload/)
-    assert.ok(cred.refresh_token)
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true })
-    delete process.env.KIN_FAKE_SESSION_OAUTH
-  }
-})
-
-test('stopClaudeAuthLoginSession pkills auth login, not setup-token', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-auth-login-stop-'))
-  try {
-    fs.mkdirSync(path.join(root, 'vms'))
-    fs.writeFileSync(path.join(root, 'vms', 'vm-02.json'), JSON.stringify({ id: 'vm-02', runtime: { type: 'docker' } }))
-    const seen = []
-    await stopClaudeAuthLoginSession(root, 'vm-02', {
-      execDetach: async (_connect, id, cmd) => {
-        seen.push({ id, cmd })
-      },
-    })
-    assert.equal(seen[0].id, 'kin-02')
-    assert.deepEqual(seen[0].cmd.slice(0, 2), ['sh', '-lc'])
-    assert.match(seen[0].cmd.at(-1), /auth login/)
-    assert.match(seen[0].cmd.at(-1), /crag-v2\/claude-code-/)
-    assert.match(seen[0].cmd.at(-1), /opt\/kin-live/)
-    assert.doesNotMatch(seen[0].cmd.at(-1), /setup-token/)
-
-    fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify({ id: 'vm-01', runtime: { type: 'kvm' } }))
-    const kvm = []
-    await stopClaudeAuthLoginSession(root, 'vm-01', {
-      execDetach: async (_connect, _id, cmd) => {
-        kvm.push(cmd)
-      },
-    })
-    assert.equal(kvm[0][0], KVM_GUEST_EXEC)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

@@ -144,7 +144,7 @@ for (const options of [{ quota: 0 }, { quota: 0.25 }, { quota: 'bad', kind: 'kvm
           calls.push('start')
           return { ok: true }
         },
-        diagnose: async () => ({ ok: true }),
+        diagnose: async () => ({ ok: true, checks: [] }),
         settleMs: 0,
       },
     })

@@ -194,11 +194,16 @@ function thinkingNeedsOfficialDisplay(thinking) {
   return display == null || String(display).trim() === ''
 }
 
-/** Official 2.1.241 unofficial fill: missing thinking → adaptive+omitted; missing display only → omitted. Never overwrite caller display. */
+function forcedToolChoice(body) {
+  const type = String(body?.tool_choice?.type || '').toLowerCase()
+  return type === 'tool' || type === 'any'
+}
+
+/** Official 2.1.241 unofficial fill: missing thinking → adaptive+omitted; missing display only → omitted. Never overwrite caller display. Forced tool_choice cannot carry adaptive thinking, so a third-party omit stays omitted. */
 export function ensureUnofficialAdaptiveThinking(body = {}) {
   if (!body || typeof body !== 'object') return body
   if (body.thinking == null) {
-    if (!modelSupportsAdaptiveThinking(body.model)) return body
+    if (!modelSupportsAdaptiveThinking(body.model) || forcedToolChoice(body)) return body
     return { ...body, thinking: { type: 'adaptive', display: OFFICIAL_THINKING_DISPLAY } }
   }
   if (!thinkingNeedsOfficialDisplay(body.thinking)) return body
