@@ -406,7 +406,7 @@ function pinnedAuthority(projectRoot) {
     .export({ format: 'der', type: 'spki' })
 }
 
-function bundledCragTag(projectRoot) {
+function cragReleaseTag(projectRoot) {
   try {
     return jsonFile(path.join(projectRoot, 'deploy/payload.json')).crag_release || ''
   } catch (error) {
@@ -423,7 +423,7 @@ export async function pullKernelRelease(projectRoot, { kernel, tag = '' } = {}, 
     const payload = await fetchKernelReleaseMetadata({
       tag,
       kernel,
-      bundledCragTag: kernel === 'crag' ? bundledCragTag(projectRoot) : '',
+      cragReleaseTag: kernel === 'crag' ? cragReleaseTag(projectRoot) : '',
       fetchImpl,
     })
     const specs =
