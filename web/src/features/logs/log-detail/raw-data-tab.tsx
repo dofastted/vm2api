@@ -43,7 +43,10 @@ function sections(item: RequestLogItem): Section[] {
     { id: 'headers', label: '入站请求头', value: item.headers },
     {
       id: 'outbound_body',
-      label: item.outbound_body_source === 'cli_final' ? '最终出站请求体' : '出站请求体',
+      label:
+        item.outbound_body_source === 'cli_final'
+          ? '最终出站请求体'
+          : '出站请求体',
       value: item.outbound_body,
       note:
         item.outbound_body_source === 'cli_final'
