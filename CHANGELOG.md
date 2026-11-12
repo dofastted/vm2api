@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.080 — 2026-11-13
+
+- CRAG print 的官方 `agent_summary` 旁路在入核前将末条用户消息里继承的工具结果转换为只读上下文，保留正文、图片、错误标记与摘要指令，避免与父请求抢占同一工具续接而出现一条 200 伴随 `409 tool_result replayed`；正常工具续接与真实重复提交的报错行为不变。
+- 沿用 v1.4.079 的已校验 pinned payload 与独立 CRAG v2.8.16 供应包；本版不重编或切换内核。
+
+已部署机升级：更新控制面并重启 Node 即可，不必 `wrap-cli/sync`，不安装或重启槽内 CRAG。保留 `routing.json`、`.env`、`vms/`、`data/`、授权、凭据与操作员调度状态；真实重复提交仍由内核拒绝。
+
 ## 1.4.079 — 2026-11-13
 
 - 修正 CRAG 版本语义：`crag_release` 使用供应仓独立版本 `v2.8.16`，不再跟随 vm2api 的 `v1.4.x` 应用版本。面板默认 CRAG 拉取始终查询 `dofastted/claude-code`，保留显式 CRAG tag。
