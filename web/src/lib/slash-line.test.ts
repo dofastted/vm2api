@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { SLASH_IDLE, type SlashLine, slashInput } from './slash-line'
 
-const NAMES = ['/usage', '/wrap', '/reload', '/help', '/clear']
+const NAMES = ['/usage', '/wrap', '/reload', '/sync', '/help', '/clear']
 
 /** 逐键喂入，收集发给 shell 的字节与执行的指令。 */
 function feed(
@@ -27,6 +27,30 @@ function feed(
 const keys = (s: string) => [...s]
 
 describe('slashInput', () => {
+  it('recognizes pasted shortcuts without forwarding them to bash', () => {
+    expect(feed(['/sync', '\r']).runs).toEqual(['/sync'])
+    expect(feed(['/usage', '\r']).shell).toBe('')
+    expect(feed(['/usr/bin/id', '\r']).shell).toBe('/usr/bin/id\r')
+  })
+
+  it('recognizes bracketed paste without executing pasted newlines', () => {
+    const paste = (text: string) => `\x1b[200~${text}\x1b[201~`
+    expect(feed([paste('/sync'), '\r']).runs).toEqual(['/sync'])
+    expect(feed(['/s', paste('ync'), '\r']).runs).toEqual(['/sync'])
+    expect(feed([paste('/sync'), '\r'], false).shell).toBe(
+      `${paste('/sync')}\r`
+    )
+    expect(feed([paste('/sync\nwhoami')]).shell).toBe(paste('/sync\nwhoami'))
+    expect(feed([paste('/usr/bin/id')]).shell).toBe(paste('/usr/bin/id'))
+  })
+
+  it('hands a buffered prefix back when the shell prompt is lost', () => {
+    const started = slashInput(SLASH_IDLE, '/sy', NAMES, true)
+    const next = slashInput(started.line, 'nc', NAMES, false)
+    expect(next.actions).toContainEqual({ kind: 'shell', data: '/sync' })
+    expect(next.line.buf).toBeNull()
+    expect(feed(['/sync', '\r'], false).runs).toEqual([])
+  })
   it('runs an exact command on Enter without touching the shell', () => {
     const r = feed([...keys('/usage'), '\r'])
     expect(r.runs).toEqual(['/usage'])

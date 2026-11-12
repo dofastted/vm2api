@@ -30,6 +30,7 @@ import {
 import { isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { runSlotOauth } from './slot-oauth.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { ensureRemoteOfficialCredentialLink } from '../cluster/remote-slot-files.mjs'
 import { normalizeSessionIdleTtlSeconds } from '../vm/slot-engine.mjs'
 import {
   cragConsumesModelDirective,
@@ -1423,27 +1424,62 @@ export function credentialSummary(credential, now = Date.now()) {
 }
 
 export async function importWorkerCredential(exec, credential, { timeoutMs = 60000, signal } = {}) {
-  try {
-    writeWorkerCredentialFile(exec.homeDir, credential)
-    // Import is the one case where the control plane's credential replaces the slot's copy.
-    await slotHost(exec.vm).onImport(exec.vm, path.dirname(exec.homeDir))
-  } catch (error) {
-    return {
-      ok: false,
-      status: 500,
-      error: { code: 'credential_import_failed', message: String(error.message || error).slice(0, 300) },
+  return withCredentialRefreshLock(String(exec.homeDir || exec.vm?.id || 'credential'), async () => {
+    try {
+      if (!writeWorkerCredentialFile(exec.homeDir, credential)) throw new Error('credential_required')
+      // Import is the one case where the control plane's credential replaces the slot's copy.
+      await slotHost(exec.vm).onImport(exec.vm, path.dirname(exec.homeDir))
+    } catch (error) {
+      return {
+        ok: false,
+        status: 500,
+        error: { code: 'credential_import_failed', message: '凭证导入未完成，请检查 VM 连接后重试面板导入' },
+      }
     }
-  }
-  return {
-    ok: true,
-    status: 200,
-    credential: {
-      has_access: !!credential?.access_token || !!credential?.api_key,
-      has_refresh: !!credential?.refresh_token,
-      expires_at: credential?.expires_at || null,
-      generation: Date.now(),
-    },
-  }
+    return {
+      ok: true,
+      status: 200,
+      credential: {
+        has_access: !!credential?.access_token || !!credential?.api_key,
+        has_refresh: !!credential?.refresh_token,
+        expires_at: credential?.expires_at || null,
+        generation: Date.now(),
+      },
+    }
+  })
+}
+
+export async function syncClaudeClientCredentials(
+  exec,
+  { host = slotHost(exec.vm), ensureRemoteLink = ensureRemoteOfficialCredentialLink } = {},
+) {
+  return withCredentialRefreshLock(String(exec.homeDir || exec.vm?.id || 'credential'), async () => {
+    try {
+      const slotDir = path.dirname(exec.homeDir)
+      if (host.kind === 'node') {
+        const pulled = await host.afterRefresh(exec.vm, slotDir)
+        if (pulled?.reason === 'remote_missing') throw new Error('remote_missing')
+        const linked = await ensureRemoteLink(exec.vm, slotDir)
+        if (!linked?.linked) throw new Error('remote_link_failed')
+      }
+      const credential = readWorkerCredentialFile(exec.homeDir)
+      if (!credential?.access_token && !credential?.api_key) {
+        return { ok: false, status: 409, error: { code: 'credential_required', message: '请先在面板导入凭证' } }
+      }
+      const linked = ensureOfficialCredentialLink(exec.homeDir, { adoptOfficial: false })
+      if (!linked.linked) throw new Error('credential_link_failed')
+      return { ok: true, synced: true, credential: credentialSummary(credential) }
+    } catch {
+      return {
+        ok: false,
+        status: 502,
+        error: {
+          code: 'client_credential_sync_failed',
+          message: '客户端凭证同步失败，请检查 VM 连接后重试同步；无需重新换票',
+        },
+      }
+    }
+  })
 }
 
 export async function callWorkerPost(exec, requestPath, body, { timeoutMs = 20000, signal } = {}) {
