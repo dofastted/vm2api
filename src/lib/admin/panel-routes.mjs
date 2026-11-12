@@ -238,7 +238,7 @@ import { isKvmRuntime, RUNTIME_KVM } from '../vm/runtime-kind.mjs'
 import { hostProxyUrlForVm, slotHost } from '../vm/slot-host.mjs'
 import { syncIpv6ProxyEgress } from '../vm/proxy-policy-runtime.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
-import { writeSlotSeedFiles } from '../vm/slot-seed.mjs'
+import { initializeSlotSeedFiles, writeSlotSeedFiles } from '../vm/slot-seed.mjs'
 import {
   egressEnabled,
   ensureProxyEgress,
@@ -1165,6 +1165,13 @@ export function createPanelHandler(ctx) {
       }
       if (isNativeNodeVm(desired)) {
         return { ok: false, id, code: 'native_crag_unsupported', error: 'crag 数据面暂不支持 macOS 原生节点' }
+      }
+    }
+    if (kernelSwitch && !isCodexVm(desired)) {
+      try {
+        await initializeSlotSeedFiles(cfg.paths.project, desired, slotHost(desired))
+      } catch {
+        return { ok: false, id, code: 'kernel_seed_failed', error: 'Claude Code 初始化配置生成或发布失败' }
       }
     }
     let switched = null
@@ -2634,6 +2641,18 @@ export function createPanelHandler(ctx) {
             body: { ids: targets.all ? undefined : targets.ids, restart: body.restart !== false },
           },
           async (syncArgs) => {
+            try {
+              for (const id of syncArgs.body.ids) {
+                const vm = getVm(cfg.paths.project, id)
+                if (!vm || isCodexVm(vm)) continue
+                await initializeSlotSeedFiles(cfg.paths.project, vm, slotHost(vm))
+              }
+            } catch {
+              return json(res, 503, {
+                ok: false,
+                error: { code: 'kernel_seed_failed', message: 'Claude Code 初始化配置生成或发布失败' },
+              })
+            }
             const previous = structuredClone(ctx.routingConfig)
             try {
               if (targets.all) {

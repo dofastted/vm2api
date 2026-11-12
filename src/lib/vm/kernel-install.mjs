@@ -22,6 +22,8 @@ import { isKvmRuntime } from './runtime-kind.mjs'
 import { startSlotReady, stopSlot } from './slot-runtime.mjs'
 import { officialCcUidGid, suspendVmRuntimeRestart } from './vm-runtime.mjs'
 import { materializeResolvedKernel } from './wrap-cli-runtime.mjs'
+import { initializeSlotSeedFiles } from './slot-seed.mjs'
+import { slotHost } from './slot-host.mjs'
 import { pushKernelSelection } from '../cluster/remote-slot-files.mjs'
 
 const PRODUCTS = new Set(['cli-node', 'crag'])
@@ -261,6 +263,8 @@ export async function installKernelTargets({
             interrupted = baked && INTERRUPTED_COMMAND.test(laid?.code || '')
             return failure(target, laid?.code || phase, laid?.error || '内核文件安装失败', true)
           }
+          phase = 'kernel_seed_failed'
+          await (ops.initializeSlotSeedFiles || initializeSlotSeedFiles)(projectRoot, candidate, slotHost(candidate))
           phase = 'kernel_config_failed'
           const config = (ops.writeKernelConfig || writeKernelConfig)(projectRoot, candidate, {
             routing,

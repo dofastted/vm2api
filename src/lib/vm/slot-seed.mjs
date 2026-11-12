@@ -10,10 +10,11 @@ import { buildKinSeedJson } from '../identity/workstation-profile.mjs'
 import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import crypto from 'node:crypto'
 import { runtimeFileOwner } from '../oauth/oauth-credentials.mjs'
+import { withVmLock } from './vm-file.mjs'
 
 const SEED_FILES = ['settings.json', 'claude.setting', 'kin-seed.json']
 
-function withSeedDirectory(slotDir, create, fn) {
+function withSeedDirectory(slotDir, create, fn, vm = null) {
   if (create) fs.mkdirSync(slotDir, { recursive: true, mode: 0o700 })
   const handles = []
   try {
@@ -21,21 +22,33 @@ function withSeedDirectory(slotDir, create, fn) {
     handles.push(fd)
     for (const name of ['cli-home', '.claude']) {
       const dir = `/proc/self/fd/${fd}/${name}`
+      let created = false
       if (create) {
         try {
           fs.mkdirSync(dir, { mode: 0o700 })
+          created = true
         } catch (error) {
           if (error.code !== 'EEXIST') throw error
         }
       }
       fd = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW)
       handles.push(fd)
+      if (created) setSeedOwner(fd, vm)
     }
     const result = fn(`/proc/self/fd/${fd}`)
     if (create) fs.fsyncSync(fd)
     return result
   } finally {
     for (const fd of handles.reverse()) fs.closeSync(fd)
+  }
+}
+
+function setSeedOwner(fd, vm) {
+  const { uid, gid } = runtimeFileOwner(vm)
+  try {
+    fs.fchownSync(fd, uid, gid)
+  } catch (error) {
+    if (process.getuid?.() === 0) throw error
   }
 }
 
@@ -76,12 +89,7 @@ function replaceSeedFile(dir, name, body, vm) {
     fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600)
     fs.writeFileSync(fd, body)
     fs.fchmodSync(fd, 0o600)
-    const { uid, gid } = runtimeFileOwner(vm)
-    try {
-      fs.fchownSync(fd, uid, gid)
-    } catch (error) {
-      if (process.getuid?.() === 0) throw error
-    }
+    setSeedOwner(fd, vm)
     fs.fsyncSync(fd)
     fs.closeSync(fd)
     fd = undefined
@@ -139,11 +147,16 @@ export function writeSlotSeedFiles(projectRoot, vm, seedPolicy = null, { existin
     locale,
     cli_version: OFFICIAL_CLI_VERSION,
   })
-  withSeedDirectory(slotDir, true, (dir) => {
-    replaceSeedFile(dir, 'settings.json', JSON.stringify(settings, null, 2), vm)
-    replaceSeedFile(dir, 'claude.setting', `${pol.claude_setting}\n`, vm)
-    replaceSeedFile(dir, 'kin-seed.json', JSON.stringify(seedDoc, null, 2), vm)
-  })
+  withSeedDirectory(
+    slotDir,
+    true,
+    (dir) => {
+      replaceSeedFile(dir, 'settings.json', JSON.stringify(settings, null, 2), vm)
+      replaceSeedFile(dir, 'claude.setting', `${pol.claude_setting}\n`, vm)
+      replaceSeedFile(dir, 'kin-seed.json', JSON.stringify(seedDoc, null, 2), vm)
+    },
+    vm,
+  )
   return {
     wrote: true,
     homeDir,
@@ -152,4 +165,21 @@ export function writeSlotSeedFiles(projectRoot, vm, seedPolicy = null, { existin
     claude_setting: pol.claude_setting,
     kin_seed: seedDoc,
   }
+}
+
+/** Caller holds the VM lifecycle lock; serialize with seed-policy publication too. */
+export async function initializeSlotSeedFiles(projectRoot, vm, host) {
+  const slotDir = path.join(projectRoot, 'vms', vm.id)
+  return withVmLock(`seed-publication:${slotDir}.json`, async () => {
+    // Remote VM settings, not a stale controller mirror, own custom fields.
+    const existing = await host.seedFiles(vm, slotDir)
+    const seed = writeSlotSeedFiles(projectRoot, vm, null, {
+      existingSettings: existing.files['settings.json'] === null ? {} : JSON.parse(existing.files['settings.json']),
+    })
+    const result = await host.syncSeed(vm, slotDir)
+    if (result?.published !== true) {
+      throw Object.assign(new Error('VM seed configuration was not published'), { code: 'seed_publish_failed' })
+    }
+    return seed
+  })
 }

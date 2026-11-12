@@ -12,6 +12,8 @@ import { kvmKernelSelector, selectChangedPayloadFiles } from '../../src/lib/clus
 import { describeKernelCatalog } from '../../src/lib/admin/kernel-catalog.mjs'
 import { getVm, patchVmRecord, summarizeVm } from '../../src/lib/vm/vm-registry.mjs'
 import { withVmLock } from '../../src/lib/vm/vm-file.mjs'
+import { initializeSlotSeedFiles } from '../../src/lib/vm/slot-seed.mjs'
+import { slotHost } from '../../src/lib/vm/slot-host.mjs'
 import { activateCragLicense, cragLicenseDirectory } from '../../src/lib/vm/crag-license.mjs'
 import { writeKernelConfig } from '../../src/lib/transport/rust-kernel-supervisor.mjs'
 import {
@@ -77,10 +79,72 @@ function fixture(t, patch = {}) {
   return { root, vm, home, run }
 }
 const target = (kernel = 'crag') => [{ id: 'vm-13', kernel }]
+
+for (const kernel of ['crag', 'cli-node']) {
+  for (const existing of [false, true]) {
+    test(`${kernel} installation initializes settings before restart (${existing ? 'existing' : 'missing'} settings)`, async (t) => {
+      const { root, vm, home } = fixture(t)
+      if (kernel === 'crag') activateFixture(root, vm)
+      const file = path.join(home, '.claude', 'settings.json')
+      if (existing) {
+        fs.writeFileSync(file, JSON.stringify({ permissions: { allow: ['Read'] }, env: { CUSTOM: 'keep' } }))
+      }
+      const life = lifecycle(root, {
+        startSlotReady() {
+          const settings = JSON.parse(fs.readFileSync(file, 'utf8'))
+          assert.equal(settings.autoUpdates, false)
+          assert.equal(settings.env.TZ, 'UTC')
+          if (existing) {
+            assert.deepEqual(settings.permissions, { allow: ['Read'] })
+            assert.equal(settings.env.CUSTOM, 'keep')
+          }
+          assert.equal(fs.statSync(file).mode & 0o777, 0o600)
+          assert.equal(fs.readFileSync(path.join(home, '.claude', 'credentials.json'), 'utf8'), 'protected-credential')
+          return { ok: true, rust_ok: true }
+        },
+      })
+      const result = await installKernelTargets({ projectRoot: root, targets: target(kernel), ops: life.ops })
+      assert.equal(result.ok, true, JSON.stringify(result))
+    })
+  }
+  test(`${kernel} cluster installation publishes VM settings before restart`, async (t) => {
+    const { root, home, run } = fixture(t, { node_id: 'node-settings' })
+    let published = false
+    const life = lifecycle(root, {
+      checkCragLicense: () => ({ ok: true }),
+      deployBakedKernel: () => ({ ok: true }),
+      writeKernelConfig: () => ({ configPath: path.join(run, 'kernel.json'), runDir: run }),
+      initializeSlotSeedFiles(project, candidate) {
+        return initializeSlotSeedFiles(project, candidate, {
+          async seedFiles() {
+            return { files: { 'settings.json': JSON.stringify({ env: { CUSTOM: 'from-node' } }) } }
+          },
+          async syncSeed() {
+            const settings = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'settings.json'), 'utf8'))
+            assert.equal(settings.env.CUSTOM, 'from-node')
+            assert.equal(settings.env.TZ, 'UTC')
+            published = true
+            return { published: true }
+          },
+        })
+      },
+      startSlotReady() {
+        assert.equal(published, true)
+        return { ok: true, rust_ok: true }
+      },
+    })
+    const result = await installKernelTargets({ projectRoot: root, targets: target(kernel), ops: life.ops })
+    assert.equal(result.ok, true, JSON.stringify(result))
+  })
+}
+
 function lifecycle(root, extra = {}) {
   let stopCount = 0
   return {
     ops: {
+      initializeSlotSeedFiles(project, candidate) {
+        return initializeSlotSeedFiles(project, candidate, slotHost({ ...candidate, node_id: null }))
+      },
       stopSlot(vm) {
         stopCount++
         assert.equal(getVm(root, vm.id).status, 'running')
@@ -513,7 +577,7 @@ test('cluster Docker CRAG install is not rejected as a local-only slot', async (
   assert.equal(result.items[0].stopped, false)
 })
 
-for (const stage of ['policy', 'materialize', 'config']) {
+for (const stage of ['policy', 'materialize', 'seed', 'config']) {
   test(`post-stop ${stage} failure retains previous selection and remains durably stopped`, async (t) => {
     const { root, vm } = fixture(t, { dataplane: 'crag', crag_kernel_version: 'v2' })
     const life = lifecycle(root, {
@@ -522,6 +586,13 @@ for (const stage of ['policy', 'materialize', 'config']) {
         : {}),
       ...(stage === 'materialize'
         ? { materializeResolvedKernel: () => ({ ok: false, code: 'disk_full', error: 'disk full' }) }
+        : {}),
+      ...(stage === 'seed'
+        ? {
+            initializeSlotSeedFiles: () => {
+              throw Object.assign(new Error('publish denied'), { code: 'seed_publish_failed' })
+            },
+          }
         : {}),
       ...(stage === 'config'
         ? {
