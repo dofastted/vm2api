@@ -1503,7 +1503,6 @@ export function createHandleProtocol(deps) {
       clientStream && protocol === 'anthropic.messages' ? createAnthropicSseErrorRemapper() : null
     // One keepalive for the whole Claude stream, including session/seat queues
     // and the gaps between failover attempts. OpenAI keeps its per-attempt one.
-    let activeAttemptCommit = null
     const anthropicKeepalive =
       clientStream && protocol === 'anthropic.messages' && streamKeepaliveMs > 0
         ? createDownstreamKeepalive({
@@ -1514,9 +1513,6 @@ export function createHandleProtocol(deps) {
               if (res.writableEnded || res.destroyed) return
               if (!res.headersSent) writeSSEHeaders(res)
               res.write(chunk)
-              // A queue ping commits the HTTP response only. The slot commits
-              // while an attempt is active, same as an in-attempt ping.
-              activeAttemptCommit?.()
             },
           })
         : null
@@ -2004,12 +2000,8 @@ export function createHandleProtocol(deps) {
                 if (res.writableEnded || res.destroyed) return
                 if (!res.headersSent) writeSSEHeaders(res)
                 res.write(chunk)
-                // A ping is already a downstream byte. Commit so a later upstream
-                // failure cannot switch slots onto this socket.
-                onCommit()
               },
             })
-          if (anthropicKeepalive) activeAttemptCommit = onCommit
           keepalive.arm()
           try {
             return await dispatchStreamInference({
@@ -2075,10 +2067,8 @@ export function createHandleProtocol(deps) {
               },
             })
           } finally {
-            if (anthropicKeepalive) {
-              activeAttemptCommit = null
-              anthropicKeepalive.endAttempt()
-            } else keepalive.stop()
+            if (anthropicKeepalive) anthropicKeepalive.endAttempt()
+            else keepalive.stop()
           }
         },
       })

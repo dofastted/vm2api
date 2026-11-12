@@ -11,10 +11,10 @@ import {
   workerHealth,
   usageFromSseEvent,
   isDownstreamCommitEvent,
+  restoreKernelErrorStatus,
   restoreUncommittedHop,
   semanticStatusForStreamError,
 } from '../../src/lib/transport/go-worker-client.mjs'
-import { prepareCliHopBody } from '../../src/lib/protocol/outbound-attempt.mjs'
 import { callerAutoCompactWindow, defaultSeedPolicy, sanitizeInboundBody } from '../../src/lib/protocol/seed-policy.mjs'
 import { extractOpenaiUsage } from '../../src/lib/protocol/openai-usage.mjs'
 import { callRustKernel, rustKernelHealth } from '../../src/lib/transport/rust-kernel-client.mjs'
@@ -106,6 +106,47 @@ test('semanticStatusForStreamError reads outer Codex status 500 instead of defau
     }),
     502,
   )
+})
+test('server overload errors map to 503 and preserve retry identity', () => {
+  const body = {
+    type: 'error',
+    error: {
+      type: 'service_unavailable_error',
+      code: 'server_is_overloaded',
+      message: 'Our servers are currently overloaded. Please try again later.',
+    },
+  }
+  assert.equal(semanticStatusForStreamError(body), 503)
+  const restored = restoreUncommittedHop({
+    ok: false,
+    status: 200,
+    committed: false,
+    terminalState: 'incomplete',
+    headers: {},
+    body,
+  })
+  assert.equal(restored.status, 503)
+  assert.equal(restored.body.error.code, 'server_is_overloaded')
+  assert.equal(restored.streamError, true)
+})
+test('kernel-wrapped server overload restores 503 but explicit status wins', () => {
+  const body = {
+    type: 'error',
+    error: {
+      type: 'service_unavailable_error',
+      code: 'server_is_overloaded',
+      message: 'overloaded',
+    },
+  }
+  const restored = restoreKernelErrorStatus({ ok: false, status: 502, body })
+  assert.equal(restored.status, 503)
+  assert.equal(restored.body.error.code, 'server_is_overloaded')
+  const explicit = restoreKernelErrorStatus({
+    ok: false,
+    status: 502,
+    body: { ...body, error: { ...body.error, status: 502 } },
+  })
+  assert.equal(explicit.status, 502)
 })
 
 test('restoreUncommittedHop reports Codex outer status 500 rather than 502', () => {
@@ -1491,12 +1532,32 @@ unixTest('streamGoWorker merges SSE cache details into a totals-only usage trail
   }
 })
 
-test('terminal metadata is not a downstream commit', () => {
+test('terminal metadata and empty blocks are not downstream commits', () => {
   assert.equal(isDownstreamCommitEvent({ type: 'message_start', message: {} }), false)
   assert.equal(isDownstreamCommitEvent({ type: 'error', error: { message: 'Connection error' } }), false)
   assert.equal(isDownstreamCommitEvent({ type: 'message_stop' }), false)
   assert.equal(isDownstreamCommitEvent({ type: 'message_delta', delta: { stop_reason: 'end_turn' } }), false)
   assert.equal(isDownstreamCommitEvent({ type: 'message_delta', delta: {} }), false)
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_start', content_block: { type: 'text', text: '' } }),
+    false,
+  )
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_start', content_block: { type: 'thinking', thinking: '' } }),
+    false,
+  )
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_delta', delta: { type: 'thinking_delta', estimated_tokens: 1 } }),
+    true,
+  )
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_start', content_block: { type: 'redacted_thinking', data: '' } }),
+    false,
+  )
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_start', content_block: { type: 'redacted_thinking', data: 'x' } }),
+    true,
+  )
   assert.equal(
     isDownstreamCommitEvent({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'hi' } }),
     true,
