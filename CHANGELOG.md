@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 1.4.078 — 2026-11-13
+
+- 同步 CRAG v2.8.16：TUI 正文输入改用会话专属 tmpfs 共享映射、Unix socket commit 和官方原生队列，保留安全页检测、MCP 工具续接、流式输出、取消、超时与 transcript 收件确认。固定绑定官方 Claude Code 2.1.321；未知构建失败关闭，不回退到 PTY 正文输入。
+- 发布新的签名加密 `crag-v2-licensed-amd64.tar.gz`，沿用既有发行公钥、授权体系和官方 Claude 2.1.321。升级前仍需排空在途请求和工具续接，并核对运行中的 memfd core 摘要。
 
 - 面板最终请求按实际目标内核分别收口：cli-node 不接收 CRAG 控制，原生 CRAG 不接收 wrap compact 控制；移除 body 内的 envelope 私有字段，预构造 Messages 请求也不能绕过。非法内容结构和清洗后空消息在写 socket 前返回 400，不重试、不执行上游。
 - 工具续接冲突和过期保留内核原生 409 / 410，不再被统一映射成 400；保持历史、工具 ID、thinking 签名及防重放状态不变。PTY 粘贴渲染超时仍按原生编辑器故障处理，不声称前置字段清洗可消除此类超时。
