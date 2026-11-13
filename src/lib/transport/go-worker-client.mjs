@@ -51,6 +51,11 @@ import { mergeUsage } from '../protocol/openai-usage.mjs'
 import { ensureRedaction, maskJson, restoreJsonValue, createSseRestorer } from '../redaction/runtime.mjs'
 import { inferenceCodec } from './inference-codec.mjs'
 import { parseWorkerJson as parseJson } from './inference-codec-json.mjs'
+import {
+  createNativeHandoffState,
+  consumeNativeHandoffStream,
+  negotiateNativeHandoff,
+} from '../protocol/native-handoff.mjs'
 
 const MAX_BODY = 64 * 1024 * 1024
 const MAX_GATEWAY_CLOCK_MS = 86_400_000
@@ -216,6 +221,7 @@ function inferenceRequest(
     stream,
     deliveryMode,
     managedCrag,
+    nativeHandoff = false,
     tenantId,
     slotWaitDeadlineMs,
     timeoutMs,
@@ -243,6 +249,7 @@ function inferenceRequest(
       stream_idle_timeout_ms: idleMs,
       session_idle_ttl_seconds: normalizeSessionIdleTtlSeconds(routing?.inference?.session_idle_ttl_seconds),
     }
+    if (nativeHandoff) body.gateway_policy.native_handoff_v1 = true
     // Only realtime exposes headers before completion. The native worker owns
     // activity deadlines while verified and JSON responses are held back.
     timeoutMs =
@@ -325,6 +332,15 @@ function publicHeaders(headers = {}) {
     if (value == null) continue
     const lower = String(key).toLowerCase()
     if (lower === 'set-cookie' || lower === 'authorization' || lower === 'x-api-key') continue
+    if (lower === 'x-kin-provider-result') continue
+    if (lower === 'trailer') {
+      const visible = String(value)
+        .split(',')
+        .map((name) => name.trim())
+        .filter((name) => name.toLowerCase() !== 'x-kin-provider-result')
+      if (visible.length) result[lower] = visible.join(', ')
+      continue
+    }
     result[lower] = Array.isArray(value) ? value.join(',') : String(value)
   }
   return result
@@ -794,6 +810,10 @@ export async function callGoWorker({
   }
   const requestId = randomUUID()
   let stopCancel = () => {}
+  let nativeHandoff = false
+  let handoff = null
+  let observedHeaders = {}
+  const nativeMetadata = () => (nativeHandoff ? handoff.metadata : { nativeHandoff: false, providerResult: null })
   try {
     const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
     const prepared = envelope
@@ -827,9 +847,17 @@ export async function callGoWorker({
           redactionSession,
         })
     reportEnvelope(onEnvelope, prepared.envelope)
+    const useNativeHandoff = negotiateNativeHandoff(exec, {
+      managedCrag,
+      requestPath,
+      requestContext,
+      envelope: prepared.envelope,
+    })
+    if (useNativeHandoff) handoff = createNativeHandoffState()
     const response = await inferenceRequest(exec, {
       stream: false,
       managedCrag,
+      nativeHandoff: useNativeHandoff,
       tenantId,
       slotWaitDeadlineMs,
       idleTimeoutMs,
@@ -840,19 +868,36 @@ export async function callGoWorker({
       maxRequestBytes,
       inference: true,
       onRequestStarted: () => {
+        nativeHandoff = useNativeHandoff
         stopCancel = cancelOnAbort(exec, signal, requestId)
       },
       signal,
       timeoutMs,
     })
+    observedHeaders = mergeRateLimitHeaders(publicHeaders(response.headers))
+    handoff?.observeHeaders(response.headers)
     const data = await readAll(response)
     const parsedRaw = await inferenceCodec.decode(data, { status: response.statusCode, signal })
-    const parsed = prepared.redaction ? await restoreJsonValue(parsedRaw, prepared.redaction) : parsedRaw
-    const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
-    const ok = response.statusCode >= 200 && response.statusCode < 300 && parsed?.type !== 'error'
+    let parsed = prepared.redaction ? await restoreJsonValue(parsedRaw, prepared.redaction) : parsedRaw
+    if (handoff) {
+      handoff.observeHeaders(response.trailers)
+      handoff.observeMessage(parsed?.type === 'error' ? null : parsed)
+      parsed = handoff.finish(parsed)
+    }
+    const headers = mergeRateLimitHeaders(
+      publicHeaders(nativeHandoff ? { ...response.headers, ...response.trailers } : response.headers),
+    )
+    const ok =
+      response.statusCode >= 200 &&
+      response.statusCode < 300 &&
+      parsed?.type !== 'error' &&
+      (!nativeHandoff || !parsed?.error)
     const result = restoreKernelErrorStatus({
       ok,
-      status: response.statusCode || 0,
+      status:
+        nativeHandoff && parsed?.type === 'error' && response.statusCode < 400
+          ? handoff.providerResult?.http_status || semanticStatusForStreamError(parsed)
+          : response.statusCode || 0,
       via: 'go-worker',
       body: parsed,
       headers,
@@ -862,18 +907,26 @@ export async function callGoWorker({
       terminalState: headers['x-terminal-state'] || null,
       transportError: false,
       threadBetas: prepared.thread,
+      ...nativeMetadata(),
     })
     return classifyManagedQueueRejection(result, managedCrag)
   } catch (error) {
     const blocked = redactionResult(error)
-    if (blocked) return blocked
-    if (error.code === 'invalid_kernel_request') return invalidKernelResult(error)
-    if (signal?.aborted) return clientCancelledResult({ via: 'go-worker' })
+    if (blocked) return { ...blocked, ...nativeMetadata() }
+    if (error.code === 'invalid_kernel_request') return { ...invalidKernelResult(error), ...nativeMetadata() }
+    if (signal?.aborted) return clientCancelledResult({ via: 'go-worker', ...nativeMetadata() })
     return {
       ok: false,
-      status: error.status === 413 ? 413 : 0,
+      status:
+        nativeHandoff && handoff?.errorBody
+          ? handoff.providerResult?.http_status || semanticStatusForStreamError(handoff.errorBody)
+          : nativeHandoff
+            ? error.status || 0
+            : error.status === 413
+              ? 413
+              : 0,
       via: 'go-worker',
-      body: {
+      body: handoff?.errorBody || {
         type: 'error',
         error: {
           type: error.status === 413 ? 'invalid_request_error' : 'worker_error',
@@ -882,9 +935,15 @@ export async function callGoWorker({
           message: String(error.message || error).slice(0, 300),
         },
       },
-      headers: {},
-      terminalState: error.status === 413 ? 'rejected' : 'transport_error',
-      transportError: error.status !== 413,
+      headers: observedHeaders,
+      ...nativeMetadata(),
+      terminalState:
+        nativeHandoff && String(error.code).startsWith('native_handoff_')
+          ? 'incomplete'
+          : error.status === 413
+            ? 'rejected'
+            : 'transport_error',
+      transportError: error.status !== 413 && !(nativeHandoff && String(error.code).startsWith('native_handoff_')),
     }
   } finally {
     stopCancel()
@@ -1007,6 +1066,10 @@ export async function streamGoWorker({
   const timing = createStreamTiming()
   const requestId = randomUUID()
   let stopCancel = () => {}
+  let nativeHandoff = false
+  let handoff = null
+  let observedHeaders = {}
+  const nativeMetadata = () => (nativeHandoff ? handoff.metadata : { nativeHandoff: false, providerResult: null })
   try {
     const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
     const prepared = envelope
@@ -1041,10 +1104,18 @@ export async function streamGoWorker({
           redactionSession,
         })
     reportEnvelope(onEnvelope, prepared.envelope)
+    const useNativeHandoff = negotiateNativeHandoff(exec, {
+      managedCrag,
+      requestPath,
+      requestContext,
+      envelope: prepared.envelope,
+    })
+    if (useNativeHandoff) handoff = createNativeHandoffState()
     const response = await inferenceRequest(exec, {
       stream: true,
       deliveryMode,
       managedCrag,
+      nativeHandoff: useNativeHandoff,
       tenantId,
       slotWaitDeadlineMs,
       idleTimeoutMs,
@@ -1055,26 +1126,94 @@ export async function streamGoWorker({
       maxRequestBytes,
       inference: true,
       onRequestStarted: () => {
+        nativeHandoff = useNativeHandoff
         stopCancel = cancelOnAbort(exec, signal, requestId)
       },
       signal,
       timeoutMs,
     })
     const headers = mergeRateLimitHeaders(publicHeaders(response.headers))
+    observedHeaders = headers
+    handoff?.observeHeaders(response.headers)
     if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
       const data = await readAll(response, 1024 * 1024)
+      const decoded = await inferenceCodec.decode(data, { status: response.statusCode, signal })
+      handoff?.observeHeaders(response.trailers)
+      // A real HTTP error remains the failure, even if handoff metadata is absent.
       const result = restoreKernelErrorStatus({
         ok: false,
         status: response.statusCode || 0,
         via: 'go-worker-stream',
-        body: await inferenceCodec.decode(data, { status: response.statusCode, signal }),
+        body: decoded,
         headers,
         committed: false,
         terminalState: headers['x-terminal-state'] || 'error',
         transportError: false,
         threadBetas: prepared.thread,
+        ...nativeMetadata(),
       })
       return classifyManagedQueueRejection(result, managedCrag)
+    }
+    if (nativeHandoff) {
+      const received = await consumeNativeHandoffStream(response, {
+        state: handoff,
+        deliveryMode,
+        onEvent,
+        isCommitEvent: isDownstreamCommitEvent,
+        onCommit: () => {
+          committed = true
+          onCommit?.()
+        },
+        onObserve: (event) => {
+          timing.observe(event)
+          if (event.type === 'message_start') rememberThreadTurn(event.message?.id, prepared.thread)
+        },
+        onProviderResult: (result) => {
+          // Freeze the already-observed generation window at the native stop;
+          // internal metadata alone must not start a TTFT/generation clock.
+          if (result.stop_reason && timing.snapshot().firstByteAt != null) {
+            timing.observe({ type: 'message_delta', delta: { stop_reason: result.stop_reason } })
+          }
+        },
+        restoreEvent: prepared.redaction ? (event) => restoreJsonValue(event, prepared.redaction) : null,
+        onOutboundHeaders: (event) => {
+          if (
+            !event.headers ||
+            typeof event.headers !== 'object' ||
+            Array.isArray(event.headers) ||
+            typeof onOutboundHeaders !== 'function'
+          )
+            return
+          try {
+            const body = event.body == null ? undefined : capOutboundBody(event.body)
+            onOutboundHeaders(event.headers, {
+              body,
+              body_truncated: event.body_truncated === true || (typeof event.body === 'string' && body !== event.body),
+            })
+          } catch {
+            console.warn('[worker] outbound header observer failed')
+          }
+        },
+      })
+      const body = received.body
+      const failed = body?.type === 'error' || !!body?.error
+      const trailers = publicHeaders(response.trailers)
+      return {
+        ok: !failed,
+        status: failed
+          ? handoff.providerResult?.http_status || semanticStatusForStreamError(body)
+          : response.statusCode,
+        via: 'go-worker-stream',
+        body,
+        headers: mergeRateLimitHeaders(publicHeaders({ ...received.headers, ...headers, ...trailers })),
+        ...nativeMetadata(),
+        ...timing.snapshot(),
+        sawMessageStop: received.sawMessageStop,
+        committed,
+        terminalState: failed ? 'incomplete' : 'verified',
+        transportError: false,
+        threadBetas: prepared.thread,
+      }
     }
     let buffer = ''
     let receivedAt = null
@@ -1160,7 +1299,8 @@ export async function streamGoWorker({
           if (sseRestorer) line = await sseRestorer.line(line)
           buffer = buffer.slice(newline + 1)
           // CLI diagnostics share the internal stream, never the caller's SSE.
-          if (line.startsWith('event:')) outboundHeadersFrame = line.slice(6).trim() === 'kin_outbound_headers'
+          if (line.startsWith('event:'))
+            outboundHeadersFrame = ['kin_outbound_headers', 'kin_provider_result'].includes(line.slice(6).trim())
           if (outboundHeadersFrame) {
             if (line.startsWith('data:')) {
               const event = parseJson(line.slice(5).trim())
@@ -1265,21 +1405,29 @@ export async function streamGoWorker({
     }
   } catch (error) {
     const blocked = redactionResult(error)
-    if (blocked) return { ...blocked, ...timing.snapshot(), committed }
+    if (blocked) return { ...blocked, ...timing.snapshot(), committed, ...nativeMetadata() }
     if (error.code === 'invalid_kernel_request')
-      return { ...invalidKernelResult(error), ...timing.snapshot(), committed }
+      return { ...invalidKernelResult(error), ...timing.snapshot(), committed, ...nativeMetadata() }
     if (signal?.aborted) {
       return clientCancelledResult({
         via: 'go-worker-stream',
         ...timing.snapshot(),
         committed,
+        ...nativeMetadata(),
       })
     }
     return {
       ok: false,
-      status: error.status === 413 ? 413 : 0,
+      status:
+        nativeHandoff && handoff?.errorBody
+          ? handoff.providerResult?.http_status || semanticStatusForStreamError(handoff.errorBody)
+          : nativeHandoff
+            ? error.status || 0
+            : error.status === 413
+              ? 413
+              : 0,
       via: 'go-worker-stream',
-      body: {
+      body: handoff?.errorBody || {
         type: 'error',
         error: {
           type: error.status === 413 ? 'invalid_request_error' : 'worker_error',
@@ -1288,11 +1436,17 @@ export async function streamGoWorker({
           message: String(error.message || error).slice(0, 300),
         },
       },
-      headers: {},
+      headers: observedHeaders,
+      ...nativeMetadata(),
       ...timing.snapshot(),
       committed,
-      terminalState: committed ? 'incomplete' : error.status === 413 ? 'rejected' : 'transport_error',
-      transportError: error.status !== 413,
+      terminalState:
+        committed || (nativeHandoff && String(error.code).startsWith('native_handoff_'))
+          ? 'incomplete'
+          : error.status === 413
+            ? 'rejected'
+            : 'transport_error',
+      transportError: error.status !== 413 && !(nativeHandoff && String(error.code).startsWith('native_handoff_')),
     }
   } finally {
     stopCancel()
