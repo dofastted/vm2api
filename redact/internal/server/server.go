@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ import (
 )
 
 const ProtocolVersion = 1
+const DefaultMaxBodyBytes int64 = 32 << 20
 
 type Policy struct {
 	Secrets      bool            `json:"secrets"`
@@ -65,12 +67,13 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"protocol":      ProtocolVersion,
-		"tag_format":    "R_v1",
-		"scope":         true,
-		"multi_channel": false,
-		"model":         false,
-		"shape":         false,
+		"protocol":           ProtocolVersion,
+		"tag_format":         "R_v1",
+		"scope":              true,
+		"multi_channel":      false,
+		"model":              false,
+		"shape":              false,
+		"request_body_limit": true,
 	})
 }
 
@@ -108,8 +111,30 @@ func (s *Server) transform(w http.ResponseWriter, r *http.Request, mask bool) {
 		http.Error(w, "invalid_redaction_config", http.StatusBadRequest)
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
+	// The authenticated caller supplies the live gateway limit on each operation,
+	// so changing it does not restart the helper and lose its scope mappings.
+	limit := DefaultMaxBodyBytes
+	if raw := r.Header.Get("X-Kin-Redact-Max-Body-Bytes"); raw != "" {
+		limit, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || limit <= 0 {
+			http.Error(w, "invalid_redaction_config", http.StatusBadRequest)
+			return
+		}
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
+				"error": map[string]any{
+					"type":    "invalid_request_error",
+					"code":    "redaction_body_too_large",
+					"message": "redaction body exceeds the configured request body limit",
+					"details": map[string]any{"retryable": false},
+				},
+			})
+			return
+		}
 		http.Error(w, "redaction_unavailable", http.StatusServiceUnavailable)
 		return
 	}

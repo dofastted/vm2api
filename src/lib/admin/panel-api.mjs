@@ -50,7 +50,7 @@ import { socksProxyFamily, normalizeSocksHost } from '../vm/socks-address.mjs'
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from '../pool/quota-tiers.mjs'
 import { applyVmQuotaConfig, applyVmQuotaPolicy, vmQuotaOverrideOf, vmQuotaView } from '../pool/vm-quota-override.mjs'
 import { GATE_OPEN, gatePolicyFields, gateZone, quotaGateOf } from '../pool/quota-gate.mjs'
-import { inferClaudeTier } from '../pool/claude-tier.mjs'
+import { guardUsageTier, inferClaudeTier } from '../pool/claude-tier.mjs'
 import { listQuotaFromHeaders, isOfficialWindowLimited } from '../pool/quota-window.mjs'
 import { lastClosedWindow } from '../pool/window-history.mjs'
 import { hardBlockOf } from '../pool/rate-limit-service.mjs'
@@ -1233,6 +1233,10 @@ export async function buildProbeOne({
       })
     } catch {}
   }
+  // A failed/missing profile must not let usage replace an already verified plan.
+  const profile = [result, acc?.unified, vm.claude, vm].find(
+    (record) => record?.account_tier_source === 'profile' && ['pro', 'max'].includes(record.account_tier),
+  )
   if (!skipHop) accountQuota.ingestOAuthUsage(accountId, result)
   if (result.subscription_type) {
     persistVmSubscription(cfg.paths.project, id, result, {
@@ -1254,11 +1258,14 @@ export async function buildProbeOne({
     qAfter.status_5h ||
     qAfter.utilization_7d != null ||
     !!(passive?.five_hour || passive?.seven_day)
-  const tier = inferClaudeTier(
+  const tierRecord = profile || after?.unified || {}
+  const rateLimitTier = result.rate_limit_tier || vm.claude?.rate_limit_tier || vm.rate_limit_tier || null
+  const inferredTier = inferClaudeTier(
     {
       has_token: true,
-      account_tier: after?.unified?.account_tier || null,
-      account_tier_source: after?.unified?.account_tier_source || null,
+      account_tier: tierRecord.account_tier || null,
+      account_tier_source: tierRecord.account_tier_source || null,
+      rate_limit_tier: rateLimitTier,
       fable: qAfter.fable,
       utilization_7d_oi: qAfter.utilization_7d_oi,
       reset_7d_oi: qAfter.reset_7d_oi,
@@ -1268,12 +1275,18 @@ export async function buildProbeOne({
     qAfter,
   ).key
   const completeUsage = result.ok === true && result.limits_present === true
-  if (result.account_tier_source === 'profile' && (result.account_tier === 'pro' || result.account_tier === 'max')) {
-    accountQuota.setAccountTier(accountId, result.account_tier, { source: 'profile' })
-    persistAccountTier(cfg.paths.project, id, result.account_tier, { source: 'profile' })
+  const tier =
+    profile?.account_tier ||
+    (completeUsage && ['pro', 'max'].includes(result.account_tier)
+      ? guardUsageTier(result.account_tier, rateLimitTier)
+      : inferredTier)
+  if (profile) {
+    accountQuota.setAccountTier(accountId, profile.account_tier, { source: 'profile' })
+    persistAccountTier(cfg.paths.project, id, profile.account_tier, { source: 'profile' })
   } else if (completeUsage && (result.account_tier === 'pro' || result.account_tier === 'max')) {
-    accountQuota.setAccountTier(accountId, result.account_tier, { source: 'usage' })
-    persistAccountTier(cfg.paths.project, id, result.account_tier, { source: 'usage' })
+    const usageTier = guardUsageTier(result.account_tier, rateLimitTier)
+    accountQuota.setAccountTier(accountId, usageTier, { source: 'usage' })
+    persistAccountTier(cfg.paths.project, id, usageTier, { source: 'usage' })
   } else if (
     completeUsage &&
     (result.usage_has_fable != null || result.seven_day_oi) &&
@@ -1355,7 +1368,7 @@ export async function buildProbeOne({
     cred_status: credStatusFromAvailability(availability),
     fable: result.usage_scope_missing ? q.fable || null : after?.unified?.fable || result.fable || q.fable || null,
     fable_probed: includeFable && !skipHop && !result.usage_scope_missing,
-    account_tier: completeUsage ? result.account_tier || tier : tier,
+    account_tier: tier,
     probed_at: result.probed_at,
     ok: !!(result.ok || passive || (rateLimited && cachedWindow)),
     rate_limited: rateLimited,
@@ -1873,6 +1886,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
           has_token: hasToken,
           account_tier: v.account_tier,
           account_tier_source: v.account_tier_source,
+          rate_limit_tier: v.rate_limit_tier,
           fable: q.fable,
           utilization_7d_oi: q.utilization_7d_oi,
           reset_7d_oi: q.reset_7d_oi,
@@ -2120,6 +2134,15 @@ function enrichVm(v, accountQuota, active, extras = {}) {
         }
       : null,
     account_tier: tierKey,
+    account_tier_source: isCodex
+      ? null
+      : [v, q].some(
+            (record) => record.account_tier_source === 'profile' && ['pro', 'max'].includes(record.account_tier),
+          )
+        ? 'profile'
+        : v.account_tier_source === 'usage' || q.account_tier_source === 'usage'
+          ? 'usage'
+          : null,
     subscription_type: isCodex ? null : v.subscription_type || null,
     rate_limit_tier: isCodex ? null : v.rate_limit_tier || null,
     usage_has_fable: isCodex ? null : q.usage_has_fable,

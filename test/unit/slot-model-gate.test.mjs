@@ -6,6 +6,7 @@ import path from 'node:path'
 import {
   modelMatchesAllowlist,
   parseAllowedModelsPatch,
+  resolveSlotTier,
   slotAllowsModel,
   normalizeAllowedModels,
 } from '../../src/lib/pool/slot-model-gate.mjs'
@@ -172,4 +173,35 @@ test('Claude slot rejects GPT models', () => {
   })
   assert.equal(hit.ok, false)
   assert.equal(hit.reason, 'claude_model_required')
+})
+
+test('slot scheduling tier honors Pro rate veto and profile precedence', () => {
+  const account = { unified: { usage_has_fable: true, utilization_7d_oi: 0, status_7d_oi: 'allowed' } }
+  const vm = { claude: { account_tier: 'max', account_tier_source: 'usage', rate_limit_tier: 'default_claude_ai' } }
+  assert.equal(resolveSlotTier(vm, account), 'pro')
+  assert.equal(resolveSlotTier({ claude: { rate_limit_tier: 'default_claude_max_5x' } }), 'pro')
+  assert.equal(
+    resolveSlotTier(
+      {
+        claude: { account_tier: 'max', account_tier_source: 'usage', rate_limit_tier: 'default_claude_max_5x' },
+      },
+      account,
+    ),
+    'max',
+  )
+  assert.equal(
+    resolveSlotTier(
+      {
+        claude: { account_tier: 'max', account_tier_source: 'profile', rate_limit_tier: 'default_claude_ai' },
+      },
+      account,
+    ),
+    'max',
+  )
+  assert.equal(
+    resolveSlotTier(vm, {
+      unified: { ...account.unified, account_tier: 'max', account_tier_source: 'profile' },
+    }),
+    'max',
+  )
 })

@@ -722,9 +722,24 @@ export function claudeTier(vm: Vm | undefined): StatusTone {
   }
   if (!vm?.has_token) return { key: 'none', label: '—', cls: 'none', text: '—' }
   // Legacy account_tier may come from Fable usage or a default Pro policy.
-  const raw = String(vm.subscription_type || '')
+  let raw = String(vm.subscription_type || '')
     .trim()
     .toLowerCase()
+  const profileTier = String(vm.account_tier || '')
+    .trim()
+    .toLowerCase()
+  if (
+    vm.account_tier_source === 'profile' &&
+    (profileTier === 'pro' || profileTier === 'max')
+  ) {
+    raw = profileTier
+  } else if (
+    (!raw || raw === 'free' || raw === 'pro') &&
+    /(?:^|_)claude_max(?:_|$)/i.test(String(vm.rate_limit_tier || ''))
+  ) {
+    // Imported credentials may carry a default Pro subscription.
+    raw = 'max'
+  }
   const labels: Record<string, string> = {
     free: 'Free',
     pro: 'Pro',
