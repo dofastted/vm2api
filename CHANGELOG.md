@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- 风控页送审范围的「套餐」和按套餐的审核范围改为跟面板徽章一致：先看官方 profile 核实的套餐，再看 OAuth `subscription_type`（`rate_limit_tier` 为 `claude_max_*` 时纠正导入时默认写入的 `pro`），都没有才用 /usage Fable 推断。现在 Pro 号的 /usage 也列出 Fable 窗口，原来的推断会把所有 Pro 号算成 Max，范围选了 `claude:max` 时 Pro 号也会被送审。面板 Claude 徽章同样用 `claude_max_*` 纠正导入默认的 `pro`。
+
 ## 1.4.081 — 2026-11-13 · CRAG KVM 适配版
 
 - 支持 Linux amd64 本机与集群 KVM 槽部署 CRAG V2，移除集群启动和内核同步入口的 KVM 限制。

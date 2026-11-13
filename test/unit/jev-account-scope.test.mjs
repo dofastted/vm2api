@@ -114,6 +114,38 @@ test('the slot file and the panel summary produce the same key', () => {
   assert.equal(inventory.accounts[0].scope_key, 'claude:max')
 })
 
+test('the scope plan follows the panel chip, not Fable usage, now that Pro lists Fable too', () => {
+  const quota = { usage_has_fable: true, utilization_7d_oi: 0, status_7d_oi: 'allowed' }
+  const maxOnly = normalizeJevConfig({ hard_regex_enabled: true, account_platform_plans: ['claude:max'] })
+  const profilePro = {
+    id: 'vm-11',
+    platform: 'anthropic',
+    claude: { account_tier: 'pro', account_tier_source: 'profile', subscription_type: 'pro', has_access: true },
+  }
+  const account = scopeAccountFromVm(profilePro, quota)
+  assert.equal(scopeKeyOf(account), 'claude:pro')
+  assert.equal(jevAccountInScope(maxOnly, account), false)
+  assert.equal(buildScopeInventory([{ ...profilePro, quota }]).accounts[0].scope_key, 'claude:pro')
+
+  const subscribedPro = { id: 'vm-12', platform: 'anthropic', has_token: true, subscription_type: 'pro' }
+  assert.equal(scopeKeyOf(scopeAccountFromVm(subscribedPro, quota)), 'claude:pro')
+  // An imported credential can carry a default `pro`; the per-account rate-limit tier corrects it.
+  const importedMax = {
+    id: 'vm-13',
+    platform: 'anthropic',
+    claude: { account_tier: 'max', account_tier_source: 'profile', has_access: true },
+    subscription_type: 'pro',
+    rate_limit_tier: 'default_claude_max_5x',
+  }
+  assert.equal(scopeKeyOf(scopeAccountFromVm(importedMax)), 'claude:max')
+  assert.equal(
+    scopeKeyOf(scopeAccountFromVm({ ...importedMax, claude: { has_access: true } })),
+    'claude:max',
+    'the rate-limit tier corrects the imported subscription without a profile tier',
+  )
+  assert.equal(jevAccountInScope(maxOnly, scopeAccountFromVm(importedMax)), true)
+})
+
 test('a scoped gate waits for the slot, then only checks the accounts in range', async () => {
   const jev = normalizeJevConfig({ hard_regex_enabled: true, account_platform_plans: ['gpt:pro'] })
   const inbound = codexBody(JAILBREAK)

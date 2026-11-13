@@ -275,6 +275,25 @@ describe('claudeTier follows OAuth subscription metadata', () => {
     ).toBe('unknown')
   })
 
+  it('trusts a Max rate-limit tier over an imported default Pro subscription', () => {
+    expect(
+      claudeTier(
+        liveVm({
+          subscription_type: 'pro',
+          rate_limit_tier: 'default_claude_max_5x',
+        })
+      )
+    ).toMatchObject({ key: 'max', label: 'Max 5x' })
+    expect(
+      claudeTier(
+        liveVm({
+          subscription_type: 'pro',
+          rate_limit_tier: 'default_claude_ai',
+        })
+      ).key
+    ).toBe('pro')
+  })
+
   it('keeps Max when Fable is unavailable and exposes the official multiplier', () => {
     expect(
       claudeTier(
