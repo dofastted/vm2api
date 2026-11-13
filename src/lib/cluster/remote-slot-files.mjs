@@ -121,12 +121,15 @@ export async function pushSlotFiles(vm, slotDir, sets = ['run', 'seed'], session
       if (error?.code !== 'ENOENT') throw error
       continue
     }
+    // Config can select a newer official Claude without an explicit kernel install.
+    // Publish its verified package first so the new claude_bin already exists on the node.
+    const config = rel === 'run/kernel.json' ? JSON.parse(data.toString('utf8')) : null
+    if (config?.dataplane === 'crag') await pushCragSlot(vm, path.dirname(path.dirname(slotDir)), s)
     // Never mirror local modes: a drvfs / 0777 checkout would publish tokens world-readable on the node.
     await writeRemoteFile(sftp, `${remote}/${remoteSlotPath(rel)}`, data, { mode: REMOTE_FILE_MODE, owner })
     if (rel === 'run/kernel.json' && isKvmRuntime(vm) && !isCodexVm(vm)) {
       // The guest service starts .kin/kin-kernel first, including on its first boot.
       // Derive selection from the published config so inherited routing agrees too.
-      const config = JSON.parse(data.toString('utf8'))
       await pushKvmKernelSelector(vm, s, config.dataplane === 'crag' ? 'crag' : 'cli-node')
     }
     pushed.push(rel)
@@ -279,8 +282,8 @@ export async function pushCragSlot(vm, projectRoot, session = null, { required =
   const owner = ownerFor(s, vm)
   const sftp = await openSftp(s.client)
   await writeRemoteFile(sftp, `${slotDir}/crag-v2-seccomp.json`, seccomp, { mode: 0o644, owner })
-  const current = await readRemoteFileNoFollow(s.client, marker)
-  if (current?.toString('utf8').trim() === payload.digest) return { ok: true, pushed: false, digest: payload.digest }
+  // A matching marker cannot prove that every slot file still exists and matches.
+  // The per-file hashes below also repair incomplete installations without rewriting good files.
   const dirs = new Set()
   for (const file of payload.files) {
     const rel = file.name.slice('opt/kin/'.length)
