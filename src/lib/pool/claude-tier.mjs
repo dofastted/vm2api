@@ -10,7 +10,7 @@ function quotaView(vm = {}, quota = {}) {
   }
 }
 
-/** Official /usage listing a Fable model, or a real 7d_oi window, is Max. */
+/** Whether official /usage contains a real Fable window (not a subscription verdict). */
 export function hasClaudeFableUsage(vm = {}, quota = {}) {
   const q = quotaView(vm, quota)
   if (q.usage_has_fable != null) return q.usage_has_fable === true
@@ -28,19 +28,38 @@ export function hasClaudeFableUsage(vm = {}, quota = {}) {
   return !isInventedFableWindow(fb, q)
 }
 
+/** Pro/Free OAuth rate metadata vetoes usage-derived Max; Max metadata never promotes it. */
+export function isProRateLimitTier(tier) {
+  return (
+    String(tier || '')
+      .trim()
+      .toLowerCase() === 'default_claude_ai'
+  )
+}
+
+export function guardUsageTier(tier, rateLimitTier) {
+  return tier === 'max' && isProRateLimitTier(rateLimitTier) ? 'pro' : tier
+}
+
 /**
- * Claude-only: official /usage 有 Fable 模型或真实 7d_oi=Max。
- * 落盘 pro / Fable hop 拒绝不能盖掉 usage 里的 Fable。
+ * Scheduling tier: verified profile first, then usage constrained by OAuth rate metadata.
+ * Subscription display is separate; Max rate metadata alone is not a scheduling upgrade.
  * Shared by the panel and the pool picker so they cannot drift.
  */
 export function inferClaudeTier(vm = {}, quota = {}) {
   const hasToken = !!(vm.has_token || vm.has_access)
   if (!hasToken) return { key: 'none', label: null }
-  const profile = vm.account_tier_source === 'profile' ? vm : quota.account_tier_source === 'profile' ? quota : null
+  const profile =
+    vm.account_tier_source === 'profile' && ['pro', 'max'].includes(vm.account_tier)
+      ? vm
+      : quota.account_tier_source === 'profile' && ['pro', 'max'].includes(quota.account_tier)
+        ? quota
+        : null
   if (profile?.account_tier === 'pro') return { key: 'pro', label: 'Pro' }
   if (profile?.account_tier === 'max') return { key: 'max', label: 'Max' }
   const q = quotaView(vm, quota)
   if (q.usage_has_fable === false) return { key: 'pro', label: 'Pro' }
+  if (isProRateLimitTier(vm.rate_limit_tier || quota.rate_limit_tier)) return { key: 'pro', label: 'Pro' }
   const stored = String(vm.account_tier || quota.account_tier || '').toLowerCase()
   if (hasClaudeFableUsage(vm, quota) || stored === 'max') {
     return { key: 'max', label: 'Max' }

@@ -53,6 +53,44 @@ test('server_is_overloaded retries only before output commitment', () => {
   assert.equal(isRetryableSameCodexAccount(result, { signal: AbortSignal.abort() }), false)
 })
 
+function overloadedResult(status, code) {
+  return {
+    ok: false,
+    committed: false,
+    status,
+    body: { error: { code, message: 'busy' } },
+  }
+}
+
+test('same-account retries accept server_is_overloaded on transient 5xx before commit', () => {
+  for (const status of [500, 502, 503, 504]) {
+    assert.equal(
+      isRetryableSameCodexAccount(overloadedResult(status, 'server_is_overloaded')),
+      true,
+      `status ${status}`,
+    )
+  }
+  assert.equal(isRetryableSameCodexAccount(overloadedResult(503, 'overloaded_error')), true)
+})
+
+test('same-account retries stop after commit, headers, cancel, conversion, or non-retryable status', () => {
+  const base = overloadedResult(502, 'server_is_overloaded')
+  assert.equal(isRetryableSameCodexAccount({ ...base, committed: true }), false)
+  assert.equal(isRetryableSameCodexAccount(base, { headersSent: true }), false)
+  assert.equal(isRetryableSameCodexAccount(base, { conversionError: new Error('bad stream') }), false)
+  assert.equal(isRetryableSameCodexAccount(base, { signal: AbortSignal.abort() }), false)
+  assert.equal(isRetryableSameCodexAccount(overloadedResult(429, 'server_is_overloaded')), false)
+  assert.equal(
+    isRetryableSameCodexAccount({
+      ok: false,
+      committed: false,
+      status: 502,
+      body: { error: { code: 'usage_limit_reached' } },
+    }),
+    false,
+  )
+})
+
 test('runCodexKernelHop retries a silent first-hop 502 then succeeds', async () => {
   let n = 0
   const events = []

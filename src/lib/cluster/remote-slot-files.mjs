@@ -36,6 +36,7 @@ import {
 } from './remote-fs.mjs'
 import { cragSlotPayload } from './slot-image.mjs'
 import { isKvmRuntime } from '../vm/runtime-kind.mjs'
+import { isCodexVm } from '../vm/vm-kind.mjs'
 import {
   WRAP_GLIBC_DIR,
   describeCliPayload,
@@ -120,8 +121,17 @@ export async function pushSlotFiles(vm, slotDir, sets = ['run', 'seed'], session
       if (error?.code !== 'ENOENT') throw error
       continue
     }
+    // Config can select a newer official Claude without an explicit kernel install.
+    // Publish its verified package first so the new claude_bin already exists on the node.
+    const config = rel === 'run/kernel.json' ? JSON.parse(data.toString('utf8')) : null
+    if (config?.dataplane === 'crag') await pushCragSlot(vm, path.dirname(path.dirname(slotDir)), s)
     // Never mirror local modes: a drvfs / 0777 checkout would publish tokens world-readable on the node.
     await writeRemoteFile(sftp, `${remote}/${remoteSlotPath(rel)}`, data, { mode: REMOTE_FILE_MODE, owner })
+    if (rel === 'run/kernel.json' && isKvmRuntime(vm) && !isCodexVm(vm)) {
+      // The guest service starts .kin/kin-kernel first, including on its first boot.
+      // Derive selection from the published config so inherited routing agrees too.
+      await pushKvmKernelSelector(vm, s, config.dataplane === 'crag' ? 'crag' : 'cli-node')
+    }
     pushed.push(rel)
   }
   return { pushed }
@@ -207,6 +217,18 @@ export function kvmKernelSelector(kernel) {
   return `#!/bin/sh\nexec ${entry} "$@"\n`
 }
 
+async function pushKvmKernelSelector(vm, session, kernel) {
+  const dir = `${remoteSlotDir(session.host, vm.id)}/cli-home/.kin`
+  const owner = ownerFor(session, vm)
+  await runRemote(session.client, privateDirectoriesScript([dir], owner), { timeoutMs: 20_000 })
+  const sftp = await openSftp(session.client)
+  await writeRemoteFile(sftp, `${dir}/kin-kernel`, kvmKernelSelector(kernel), {
+    mode: 0o755,
+    owner,
+    timeoutMs: 60_000,
+  })
+}
+
 async function pushLiveWrap(vm, projectRoot, session, { required }) {
   const kernel = describeKernelPayload(projectRoot)
   if (!kernel.path) {
@@ -260,8 +282,8 @@ export async function pushCragSlot(vm, projectRoot, session = null, { required =
   const owner = ownerFor(s, vm)
   const sftp = await openSftp(s.client)
   await writeRemoteFile(sftp, `${slotDir}/crag-v2-seccomp.json`, seccomp, { mode: 0o644, owner })
-  const current = await readRemoteFileNoFollow(s.client, marker)
-  if (current?.toString('utf8').trim() === payload.digest) return { ok: true, pushed: false, digest: payload.digest }
+  // A matching marker cannot prove that every slot file still exists and matches.
+  // The per-file hashes below also repair incomplete installations without rewriting good files.
   const dirs = new Set()
   for (const file of payload.files) {
     const rel = file.name.slice('opt/kin/'.length)
@@ -308,16 +330,7 @@ export async function pushKernelSelection(vm, projectRoot, kernel) {
     }
   }
   if (isKvmRuntime(vm)) {
-    const dir = `${remoteSlotDir(session.host, vm.id)}/cli-home/.kin`
-    await runRemote(session.client, `umask 022 && mkdir -p ${shellQuote(dir)} && chmod 755 ${shellQuote(dir)}`, {
-      timeoutMs: 20_000,
-    })
-    const sftp = await openSftp(session.client)
-    await writeRemoteFile(sftp, `${dir}/kin-kernel`, kvmKernelSelector(kernel), {
-      mode: 0o755,
-      owner: ownerFor(session, vm),
-      timeoutMs: 60_000,
-    })
+    await pushKvmKernelSelector(vm, session, kernel)
   }
   return { ok: true, wrap, crag }
 }
@@ -396,12 +409,49 @@ export async function ensureRemoteOfficialCredentialLink(vm, slotDir, session = 
 
 const queues = new Map()
 
+// Startup can exhaust a node's SSH MaxSessions; retry without racing later writes.
+const SLOT_PUSH_RETRY_DELAYS_MS = Object.freeze([1_000, 5_000, 15_000])
+
+function jittered(ms) {
+  return Math.round(ms * (0.75 + Math.random() * 0.5))
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms).unref?.())
+}
+
 /** Fire-and-forget push, serialized per VM so a slow push never races the next one. */
-export function queueSlotPush(vm, slotDir, sets, { logger = console } = {}) {
+export function queueSlotPush(
+  vm,
+  slotDir,
+  sets,
+  { logger = console, push = pushSlotFiles, retryDelaysMs = SLOT_PUSH_RETRY_DELAYS_MS, wait = sleep } = {},
+) {
   const prev = queues.get(vm.id) || Promise.resolve()
   const next = prev
     .catch(() => {})
-    .then(() => pushSlotFiles(vm, slotDir, sets))
+    .then(async () => {
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          return await push(vm, slotDir, sets)
+        } catch (err) {
+          if (err?.code === 'host_key_mismatch' || err?.code === 'auth_failed' || attempt >= retryDelaysMs.length) {
+            throw err
+          }
+          logger.warn(
+            JSON.stringify({
+              event: 'remote_slot_push_retry',
+              vm_id: vm.id,
+              sets,
+              attempt: attempt + 1,
+              error: String(err?.message || err),
+            }),
+          )
+          // Re-read local files on every attempt so a retry publishes the newest copy.
+          await wait(jittered(retryDelaysMs[attempt]))
+        }
+      }
+    })
     .catch((err) => {
       logger.warn(
         JSON.stringify({ event: 'remote_slot_push_failed', vm_id: vm.id, sets, error: String(err?.message || err) }),

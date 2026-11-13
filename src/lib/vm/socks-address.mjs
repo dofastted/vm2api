@@ -26,21 +26,26 @@ export function socksEndpoint(host, port) {
 }
 
 /** URL serialization is independent of policy, so disabled records can still be edited/copied. */
+/**
+ * `scheme` picks socks5 vs socks5h for SOCKS rows only; an HTTP proxy row
+ * (scheme 'http' or an http:// url) always serializes as http://.
+ */
 export function socksProxyUrl(proxy, scheme = 'socks5h') {
   if (!proxy) return ''
   if (proxy.url) {
     const u = new URL(proxy.url)
-    const endpoint = socksEndpoint(u.hostname, u.port || 1080)
-    if (!/^socks5h?:$/.test(u.protocol) || !endpoint) throw new Error('invalid SOCKS5 URL')
+    const http = u.protocol === 'http:'
+    const endpoint = socksEndpoint(u.hostname, u.port || (http ? 80 : 1080))
+    if ((!http && !/^socks5h?:$/.test(u.protocol)) || !endpoint) throw new Error('invalid proxy URL')
     const auth = u.username || u.password ? `${u.username}:${u.password}@` : ''
-    return `${scheme}://${auth}${endpoint}`
+    return `${http ? 'http' : scheme}://${auth}${endpoint}`
   }
   const endpoint = socksEndpoint(proxy.host, proxy.port)
   if (!endpoint) return ''
   const auth = proxy.username
     ? `${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password || '')}@`
     : ''
-  return `${scheme}://${auth}${endpoint}`
+  return `${String(proxy.scheme || '').toLowerCase() === 'http' ? 'http' : scheme}://${auth}${endpoint}`
 }
 
 export function socksProxyFamily(proxy) {
@@ -60,7 +65,7 @@ export function socksProxyEndpoint(proxy) {
   if (!proxy?.url) return null
   try {
     const u = new URL(proxy.url)
-    return socksEndpoint(u.hostname, u.port || 1080) || null
+    return socksEndpoint(u.hostname, u.port || (u.protocol === 'http:' ? 80 : 1080)) || null
   } catch {
     return null
   }

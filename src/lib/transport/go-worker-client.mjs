@@ -655,7 +655,7 @@ async function redactionContext({ routing, exec, redactionPrincipal, redactionSe
   const projectRoot = exec?.projectRoot || process.env.KIN_PROJECT_ROOT || ''
   const state = await ensureRedaction(routing, { projectRoot })
   if (!state.enabled) return null
-  return { principal: redactionPrincipal, session: redactionSession || '' }
+  return { principal: redactionPrincipal, session: redactionSession || '', maxBodyBytes: state.maxBodyBytes }
 }
 
 async function preparePrebuiltEnvelope(envelope, redaction, messages, exec, cragPrint) {
@@ -706,9 +706,10 @@ function redactionResult(error) {
     body: {
       type: 'error',
       error: {
-        type: 'api_error',
+        type: error.status === 413 ? 'invalid_request_error' : 'api_error',
         code: error.code,
         message: String(error.message || error).slice(0, 300),
+        ...(error.status === 413 ? { details: { retryable: false } } : {}),
       },
     },
     headers: {},

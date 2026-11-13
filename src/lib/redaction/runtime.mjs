@@ -1,5 +1,4 @@
 import { spawn } from 'node:child_process'
-import { once } from 'node:events'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -61,7 +60,7 @@ async function waitForFile(file, timeoutMs = 3000) {
   throw unavailable('redaction helper did not publish a capability')
 }
 
-function startHelper({ bin, directory, maxBodyBytes }) {
+function startHelper({ bin, directory }) {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
   const sock = path.join(directory, 'kin-redact.sock')
   const key = path.join(directory, 'redact.key')
@@ -71,11 +70,9 @@ function startHelper({ bin, directory, maxBodyBytes }) {
       fs.rmSync(file, { force: true })
     } catch {}
   }
-  const child = spawn(
-    bin,
-    ['-sock', sock, '-key', key, '-capability', capabilityFile, '-max-body-bytes', String(maxBodyBytes)],
-    { stdio: 'ignore' },
-  )
+  const child = spawn(bin, ['-sock', sock, '-key', key, '-capability', capabilityFile], {
+    stdio: 'ignore',
+  })
   return { child, sock, capabilityFile }
 }
 
@@ -92,28 +89,21 @@ export async function ensureRedaction(routing, { projectRoot, binPath } = {}) {
     return state
   }
   const maxBodyBytes = maxRequestBytes(routing)
-  if (
-    state.ready &&
-    state.enabled &&
-    (state.maxBodyBytes == null || state.maxBodyBytes === maxBodyBytes) &&
-    state.client
-  ) {
+  if (state.ready && state.enabled && JSON.stringify(state.policy) === JSON.stringify(policy) && state.client) {
+    state = { ...state, maxBodyBytes }
     return state
   }
   if (!boot) {
-    boot = bootHelper(policy, { projectRoot, binPath, maxBodyBytes }).finally(() => {
+    boot = bootHelper(policy, { projectRoot, binPath }).finally(() => {
       boot = null
     })
   }
-  return boot
+  const ready = await boot
+  state = { ...ready, maxBodyBytes }
+  return state
 }
 
-async function bootHelper(policy, { projectRoot, binPath, maxBodyBytes }) {
-  if (state.child && state.child.exitCode == null && state.child.signalCode == null) {
-    const exited = once(state.child, 'exit')
-    state.child.kill()
-    await exited
-  }
+async function bootHelper(policy, { projectRoot, binPath }) {
   const bundled = path.join(projectRoot || '', 'bin', 'kin-redact')
   const bin = binPath || process.env.KIN_REDACT_BIN || (fs.existsSync(bundled) ? bundled : '')
   if (!bin || !fs.existsSync(bin)) {
@@ -121,21 +111,16 @@ async function bootHelper(policy, { projectRoot, binPath, maxBodyBytes }) {
     throw unavailable('redaction helper is not installed')
   }
   const directory = path.join(projectRoot || os.tmpdir(), 'data', 'redact')
-  const helper = startHelper({ bin, directory, maxBodyBytes })
+  const helper = startHelper({ bin, directory })
   try {
     const capability = await waitForFile(helper.capabilityFile)
     const client = createRedactionClient({ socketPath: helper.sock, capability })
-    await client.health()
-    await client.validate({ policy: policyView(policy) })
-    state = {
-      enabled: true,
-      ready: true,
-      policy,
-      maxBodyBytes,
-      client,
-      child: helper.child,
-      error: null,
+    const health = await client.health()
+    if (JSON.parse(health.body)?.request_body_limit !== true) {
+      throw unavailable('redaction helper must be rebuilt to support configurable body limits')
     }
+    await client.validate({ policy: policyView(policy) })
+    state = { enabled: true, ready: true, policy, client, child: helper.child, error: null }
     return state
   } catch (error) {
     helper.child.kill()
@@ -160,6 +145,7 @@ export async function maskJson(value, ctx = {}) {
     session,
     policy: policyView(state.policy),
     body: JSON.stringify(value),
+    maxBodyBytes: ctx.maxBodyBytes ?? state.maxBodyBytes,
   })
   return JSON.parse(body)
 }
@@ -174,6 +160,7 @@ export async function restoreJsonText(text, ctx = {}) {
     policy: policyView(state.policy),
     body: String(text),
     codec: 'json',
+    maxBodyBytes: ctx.maxBodyBytes ?? state.maxBodyBytes,
   })
   return body
 }
