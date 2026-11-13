@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+- 修复 Haiku 4.5 小预算探针省略 thinking 时被 CLI 隐式思考耗尽的问题：连接测试显式关闭可关闭模型的思考，普通无 system/tools/显式 thinking 的 1–64 token 短探针补 disabled；保留显式预算、既有输出下限与普通会话语义。CRAG 需要配套的新原生 helper；本提交不更换已发布签名内核，也不代表线上已生效。
+
 ## 1.4.081 — 2026-11-13 · CRAG KVM 适配版
 
 - 支持 Linux amd64 本机与集群 KVM 槽部署 CRAG V2，移除集群启动和内核同步入口的 KVM 限制。
