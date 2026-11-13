@@ -20,7 +20,14 @@
 import fs from 'node:fs'
 import crypto from 'node:crypto'
 import path from 'node:path'
-import { nodeSession, remoteSlotDir, remoteSlotOwner, vmNodeId } from './placement.mjs'
+import {
+  isNativeNodeVm,
+  nodeSession,
+  placementProjectRoot,
+  remoteSlotDir,
+  remoteSlotOwner,
+  vmNodeId,
+} from './placement.mjs'
 import { hasCredentialPresence, mirrorWorkerCredentialsToVm } from '../oauth/oauth-credentials.mjs'
 import { EGRESS_BIN } from '../vm/egress.mjs'
 import { readJsonCached } from '../vm/vm-file.mjs'
@@ -35,6 +42,7 @@ import {
   writeRemoteFile,
 } from './remote-fs.mjs'
 import { cragSlotPayload } from './slot-image.mjs'
+import { ClusterError } from './ssh-link.mjs'
 import { isKvmRuntime } from '../vm/runtime-kind.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import {
@@ -58,6 +66,8 @@ export const SLOT_FILE_SETS = Object.freeze({
 })
 const CREDENTIALS = 'cli-home/.claude/credentials.json'
 const SLOT_BINARIES = Object.freeze(['kin-worker', 'kin-egress'])
+/** slot-bin marker: digest of the live wrap last published there. */
+const LIVE_WRAP_MARKER = 'kin-live.digest'
 
 function clusterBin(envKey, fallback) {
   const value = process.env[envKey]
@@ -121,6 +131,7 @@ export async function pushSlotFiles(vm, slotDir, sets = ['run', 'seed'], session
       if (error?.code !== 'ENOENT') throw error
       continue
     }
+    if (rel === 'run/kernel.json') await ensureKernelPayload(vm, data, s)
     // Never mirror local modes: a drvfs / 0777 checkout would publish tokens world-readable on the node.
     await writeRemoteFile(sftp, `${remote}/${remoteSlotPath(rel)}`, data, { mode: REMOTE_FILE_MODE, owner })
     if (rel === 'run/kernel.json' && isKvmRuntime(vm) && !isCodexVm(vm)) {
@@ -132,6 +143,29 @@ export async function pushSlotFiles(vm, slotDir, sets = ['run', 'seed'], session
     pushed.push(rel)
   }
   return { pushed }
+}
+
+/**
+ * kernel.json (claude_bin) and the KVM .kin/kin-kernel selector derived from it
+ * point into /opt/kin-live, the slot-bin mount. slot-bin used to be filled only
+ * when a slot started or recovered, so a release that moved claude_bin there left
+ * running slots working until their kernel restarted, which then crash-looped on
+ * the missing binary. Publish the payload before the config that names it.
+ */
+async function ensureKernelPayload(vm, data, session) {
+  if (isCodexVm(vm) || isNativeNodeVm(vm)) return
+  const projectRoot = placementProjectRoot()
+  if (!projectRoot) return
+  let config
+  try {
+    config = JSON.parse(data.toString('utf8'))
+  } catch {
+    return
+  }
+  const crag = config?.dataplane === 'crag'
+  const wrap = await pushLiveWrap(vm, projectRoot, session, { required: !crag, skipCurrent: true })
+  if (!wrap.ok) throw new ClusterError(409, wrap.code, `${wrap.error}，未发布 kernel.json`)
+  if (crag) await pushCragSlot(vm, projectRoot, session, { required: true })
 }
 
 /** Publish Go service payloads into the persistent per-slot mount. */
@@ -186,10 +220,18 @@ function hashStream(file) {
   })
 }
 
+// Payload files are tens of MB and every kernel.json publish checks them: hash each version once.
+const srcSha256 = new Map()
+
 async function withSha256(file) {
   if (file.sha256) return file
   if (file.body) return { ...file, sha256: crypto.createHash('sha256').update(file.body).digest('hex') }
-  return { ...file, sha256: await hashStream(file.src) }
+  const { size, mtimeMs } = fs.statSync(file.src)
+  const cached = srcSha256.get(file.src)
+  if (cached?.size === size && cached.mtimeMs === mtimeMs) return { ...file, sha256: cached.sha256 }
+  const sha256 = await hashStream(file.src)
+  srcSha256.set(file.src, { size, mtimeMs, sha256 })
+  return { ...file, sha256 }
 }
 
 async function publishSlotBinFiles(sftp, client, remote, files, owner) {
@@ -226,7 +268,7 @@ async function pushKvmKernelSelector(vm, session, kernel) {
   })
 }
 
-async function pushLiveWrap(vm, projectRoot, session, { required }) {
+async function pushLiveWrap(vm, projectRoot, session, { required, skipCurrent = false }) {
   const kernel = describeKernelPayload(projectRoot)
   if (!kernel.path) {
     if (!required) return { ok: true, pushed: false, skipped: 'missing' }
@@ -253,7 +295,23 @@ async function pushLiveWrap(vm, projectRoot, session, { required }) {
   }
   const remote = `${remoteSlotDir(session.host, vm.id)}/slot-bin`
   const owner = ownerFor(session, vm)
-  const nested = [...new Set(files.map((file) => file.rel.slice(0, file.rel.lastIndexOf('/'))).filter(Boolean))]
+  const hashed = []
+  for (const file of files) hashed.push(await withSha256(file))
+  const digest = crypto
+    .createHash('sha256')
+    .update(hashed.map((file) => `${file.rel} ${file.mode.toString(8)} ${file.sha256}\n`).join(''))
+    .digest('hex')
+  const marker = `${remote}/${LIVE_WRAP_MARKER}`
+  // A config publish only needs the files present; start and recovery still re-hash every remote file.
+  if (skipCurrent && (await readRemoteFileNoFollow(session.client, marker))?.toString('utf8').trim() === digest) {
+    return { ok: true, pushed: false, digest }
+  }
+  // Top-level files have no parent to create (slicing at index -1 used to mkdir `cli-nod`, `kin-kerne`, …).
+  const nested = [
+    ...new Set(
+      files.filter((file) => file.rel.includes('/')).map((file) => file.rel.slice(0, file.rel.lastIndexOf('/'))),
+    ),
+  ]
   if (nested.length) {
     const quoted = nested.map((rel) => shellQuote(`${remote}/${rel}`)).join(' ')
     const chown = owner ? ` && chown ${owner.uid}:${owner.gid} ${quoted}` : ''
@@ -262,8 +320,9 @@ async function pushLiveWrap(vm, projectRoot, session, { required }) {
     })
   }
   const sftp = await openSftp(session.client)
-  const published = await publishSlotBinFiles(sftp, session.client, remote, files, owner)
-  return { ok: true, pushed: published.written.length > 0, ...published }
+  const published = await publishSlotBinFiles(sftp, session.client, remote, hashed, owner)
+  await writeRemoteFile(sftp, marker, `${digest}\n`, { mode: 0o644, owner, timeoutMs: 60_000 })
+  return { ok: true, pushed: published.written.length > 0, digest, ...published }
 }
 
 /** Same CRAG tree the slot image bakes, for containers created before that image. */

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- 扩展节点槽发布 `run/kernel.json` 前，先把它指向的 `/opt/kin-live` 内容（cli-node 内核包；CRAG 数据面再加 CRAG 包）补进节点 `slot-bin`，按哈希只写变化的文件，`slot-bin/kin-live.digest` 一致时跳过；本机缺包时不发布新配置，节点保留原 kernel.json。以前 `slot-bin` 只在槽启动/恢复时填充：控制面升级把 `claude_bin` 改到 `/opt/kin-live/cli-node`（KVM 还会写指向 `/opt/kin-live/kin-kernel` 的入口）后，运行中的槽照常工作，内核一旦空闲重启就因找不到程序反复崩溃，面板仍显示正常。顺带修正发布内核包时把 `cli-node` 等顶层文件名截掉最后一个字符当目录创建（节点上出现 `cli-nod`、`kin-kerne` 空目录）。
+
 ## 1.4.081 — 2026-11-13 · CRAG KVM 适配版
 
 - 支持 Linux amd64 本机与集群 KVM 槽部署 CRAG V2，移除集群启动和内核同步入口的 KVM 限制。
