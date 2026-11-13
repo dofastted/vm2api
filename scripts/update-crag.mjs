@@ -12,22 +12,17 @@ import { resolveKernelDataplane, resolveCragKernelVersion } from '../src/lib/vm/
 import { cragV2PackageRoot, stageCragV2Tree, verifyCragV2Tree } from '../src/lib/vm/wrap-cli-runtime.mjs'
 import { rustKernelHealth } from '../src/lib/transport/rust-kernel-client.mjs'
 import { slotExec } from '../src/lib/vm/slot-runtime.mjs'
-import { isKvmRuntime } from '../src/lib/vm/runtime-kind.mjs'
-import { containerName } from '../src/lib/vm/vm-runtime.mjs'
+import { slotExecArgv } from '../src/lib/vm/slot-exec.mjs'
 
 const execute = promisify(execFile)
 
-export async function runningCragHashes(vm) {
+export async function runningCragHashes(vm, { execute: run = execute } = {}) {
   const command =
     'for p in /proc/[0-9]*/exe; do case "$(readlink "$p" 2>/dev/null)" in *memfd:crag-v2-core*) sha256sum "$p" || exit 1;; esac; done'
-  const { stdout } = await execute(
-    'docker',
-    ['exec', vm.runtime?.container || containerName(vm.id), 'sh', '-c', command],
-    {
-      timeout: 10_000,
-      maxBuffer: 64 * 1024,
-    },
-  )
+  const { stdout } = await run('docker', slotExecArgv(vm, ['sh', '-c', command], { user: '0' }), {
+    timeout: 10_000,
+    maxBuffer: 64 * 1024,
+  })
   return stdout
     .trim()
     .split('\n')
@@ -96,8 +91,8 @@ export async function updateCrag(
     const routing = JSON.parse(fs.readFileSync(path.join(root, 'src/config/routing.json'), 'utf8'))
     const inventory = cragUpdateInventory(root, routing)
     const targets = inventory.filter((row) => row.action === 'sync')
-    // Native V2 on cluster/KVM is not supported by this materializer.
-    if (targets.some(({ vm }) => vm.node_id || isKvmRuntime(vm))) throw new Error('crag_v2_unsupported_placement')
+    // This standalone updater reads local files/processes; node installs use the panel lifecycle.
+    if (targets.some(({ vm }) => vm.node_id)) throw new Error('crag_v2_unsupported_placement')
     const pulled = await pull(root, { kernel: 'crag', tag })
     if (!pulled.ok) throw new Error(pulled.code || 'crag_pull_failed')
     const src = cragV2PackageRoot(root)
