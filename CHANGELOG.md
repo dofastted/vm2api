@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- 控制面启动时不再改写槽 JSON 里已有的 `policy.maxConcurrency`：以前每次重启都把所有非手动锁定槽的记录改成档位值并写上 `concurrencyOverride: false`、更新 `updated_at`，没有设 `concurrencyOverride` 的旧槽也因此在启动时被「释放」，与 `isConcurrencyPinned` 约定的「旧值保留到下次保存路由」不符。启动仍按档位同步账号库与准入并发；没有该字段的槽照常初始化；管理员保存路由时照常更新继承值。
+
 ## 1.4.081 — 2026-11-13 · CRAG KVM 适配版
 
 - 支持 Linux amd64 本机与集群 KVM 槽部署 CRAG V2，移除集群启动和内核同步入口的 KVM 限制。

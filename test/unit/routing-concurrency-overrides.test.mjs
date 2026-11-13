@@ -7,7 +7,8 @@ import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
 import { createRoutingRuntime } from '../../src/lib/admin/routing-runtime.mjs'
 
 function fixture(t, cap, { override = true, tier = 'default' } = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'routing-concurrency-'))
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'review-a-routing-concurrency-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   const accountId = 'test-account'
   const quota = new AccountQuota({
     dataDir: path.join(root, 'data'),
@@ -20,6 +21,7 @@ function fixture(t, cap, { override = true, tier = 'default' } = {}) {
       },
     ],
   })
+  t.after(() => quota.db.close())
   quota.setAccountTier(accountId, tier)
   const vmPath = path.join(root, 'vms/vm-02.json')
   fs.mkdirSync(path.dirname(vmPath), { recursive: true })
@@ -36,12 +38,10 @@ function fixture(t, cap, { override = true, tier = 'default' } = {}) {
     accountQuota: quota,
     routingConfig: { tiers: {}, quota: {}, concurrency: {} },
   })
-  t.after(() => {
-    quota.db.close()
-    fs.rmSync(root, { recursive: true, force: true })
-  })
   return {
     runtime,
+    quota,
+    accountId,
     vmPath,
     policy: () => JSON.parse(fs.readFileSync(vmPath, 'utf8')).policy,
     account: () => quota.repo.get(accountId),
@@ -79,6 +79,86 @@ for (const tier of ['default', 'pro', 'max']) {
     assert.equal(f.account().max_concurrency, 6)
   })
 }
+
+for (const tier of ['default', 'pro', 'max']) {
+  test(`startup preserves inherited ${tier} JSON while DB and admission retain the live tier`, (t) => {
+    const f = fixture(t, 1, { override: false, tier })
+    const tiers = { [tier]: { max_concurrency: 2 } }
+    f.quota.reloadConfig({ tiers })
+    const before = fs.readFileSync(f.vmPath, 'utf8')
+    const applied = f.runtime.applyRoutingTierConcurrency(tiers, { preserveExisting: true })
+    assert.equal(applied[tier], 0)
+    assert.equal(fs.readFileSync(f.vmPath, 'utf8'), before)
+    assert.deepEqual(f.policy(), { maxConcurrency: 1, concurrencyOverride: false })
+    assert.equal(f.account().max_concurrency, 2)
+    assert.equal(Boolean(f.account().concurrency_override), false)
+    assert.equal(f.quota.limitFor(f.account()), 2)
+    const reservations = []
+    try {
+      for (let i = 0; i < 2; i++) {
+        const reserved = f.quota.tryAcquire(f.accountId, { skipGate: true })
+        assert.equal(reserved.ok, true)
+        reservations.push(reserved)
+      }
+      const blocked = f.quota.tryAcquire(f.accountId, { skipGate: true })
+      assert.equal(blocked.ok, false)
+      assert.equal(blocked.reason, 'concurrency_limit')
+      assert.equal(blocked.detail.max, 2)
+    } finally {
+      for (const reservation of reservations) reservation.release()
+    }
+    assert.equal(f.runtime.applyRoutingTierConcurrency(tiers, { preserveExisting: true })[tier], 0)
+    assert.equal(fs.readFileSync(f.vmPath, 'utf8'), before)
+
+    // The administrator's existing explicit update path must still take effect.
+    const updated = { [tier]: { max_concurrency: 6 } }
+    f.quota.reloadConfig({ tiers: updated })
+    assert.equal(f.runtime.applyRoutingTierConcurrency(updated)[tier], 1)
+    assert.deepEqual(f.policy(), { maxConcurrency: 6, concurrencyOverride: false })
+    assert.equal(f.account().max_concurrency, 6)
+    assert.equal(f.quota.limitFor(f.account()), 6)
+  })
+}
+
+for (const cap of [0, 1, 16, 20]) {
+  test(`startup retains manual concurrency ${cap} in JSON, DB and admission`, (t) => {
+    const f = fixture(t, cap)
+    const before = fs.readFileSync(f.vmPath, 'utf8')
+    assert.equal(
+      f.runtime.applyRoutingTierConcurrency({ default: { max_concurrency: 2 } }, { preserveExisting: true }).skipped,
+      1,
+    )
+    assert.equal(fs.readFileSync(f.vmPath, 'utf8'), before)
+    assert.equal(f.account().max_concurrency, cap)
+    assert.equal(Boolean(f.account().concurrency_override), true)
+    assert.equal(f.quota.limitFor(f.account()), cap)
+  })
+}
+
+for (const cap of [0, '1']) {
+  test(`startup preserves the existing inherited ${JSON.stringify(cap)} field without coercing JSON`, (t) => {
+    const f = fixture(t, cap, { override: false })
+    const before = fs.readFileSync(f.vmPath, 'utf8')
+    f.runtime.applyRoutingTierConcurrency({ default: { max_concurrency: 2 } }, { preserveExisting: true })
+    assert.equal(fs.readFileSync(f.vmPath, 'utf8'), before)
+    assert.equal(f.account().max_concurrency, 2)
+    assert.equal(f.quota.limitFor(f.account()), 2)
+  })
+}
+
+test('startup still initializes an absent inherited concurrency field', (t) => {
+  const f = fixture(t, 1, { override: false })
+  const vm = JSON.parse(fs.readFileSync(f.vmPath, 'utf8'))
+  delete vm.policy.maxConcurrency
+  fs.writeFileSync(f.vmPath, JSON.stringify(vm))
+  assert.equal(
+    f.runtime.applyRoutingTierConcurrency({ default: { max_concurrency: 2 } }, { preserveExisting: true }).default,
+    1,
+  )
+  assert.deepEqual(f.policy(), { maxConcurrency: 2, concurrencyOverride: false })
+  assert.equal(f.account().max_concurrency, 2)
+  assert.equal(f.quota.limitFor(f.account()), 2)
+})
 
 test('global default updates still reach inherited concurrency', (t) => {
   const f = fixture(t, 2, { override: false })
