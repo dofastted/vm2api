@@ -1,6 +1,6 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "v1.4.077",
+  "release": "v1.4.085",
   "crag_release": "v2.8.16",
   "files": [
     {
@@ -30,14 +30,14 @@
     {
       "path": "bin/kin-worker",
       "asset": "kin-worker",
-      "size": 11555000,
-      "sha256": "132a3267b6c9a2fd03571b8c6baebc533f10914ada57ddf8b8b099c6f1de0d97"
+      "size": 11542712,
+      "sha256": "cbe6594b8e17746a35b1a4e9a4859c80676489441b914d219324d7419ec1719f"
     },
     {
       "path": "bin/kin-egress",
       "asset": "kin-egress",
-      "size": 6213816,
-      "sha256": "4ab11e58294c8eec6e76dc649af0cf27058f1811fe7179aa35c7d644746d395f"
+      "size": 6201528,
+      "sha256": "0df15a554e0bc23e1b831c353b89baf60136f2b028c61183211ceaa48da52f19"
     },
     {
       "path": "bin/kin-slot-gate",
