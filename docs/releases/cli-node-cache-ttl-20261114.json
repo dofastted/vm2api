@@ -1,0 +1,50 @@
+{
+  "component": "cli-node",
+  "version": "2.1.321",
+  "release_tag": "payload-2026.11.14-cache-ttl",
+  "baseline": {
+    "application": "v1.4.086",
+    "payload": "payload-2026.11.13-crag-2.8.17",
+    "unchanged_assets": 21
+  },
+  "source": {
+    "visibility": "private",
+    "commit": "68d5b398cf92d2dcb466c9a71cec45ef253f26dc",
+    "cli_tree": "993e0cf983aa567c6f93b4e0c41a5f9abc72e7b5",
+    "working_tree_changes_included": false,
+    "bun_lock_sha256": "07448966315a735b9ed7a242c774461f5375f175bae2acc708a74ced0b64b41e",
+    "build_script_sha256": "7996e066ed01f3b87e926ac53163f3490b972e6db8e743a6a59bf69ffdce41cd"
+  },
+  "toolchain": {
+    "bun": "1.3.14",
+    "target": "bun-linux-x64-baseline",
+    "upx": "5.0.1"
+  },
+  "build": {
+    "command": "bun run scripts/compile-cli-node.ts <outfile>",
+    "missing_module_stubs": 0,
+    "compression": "upx --best --lzma"
+  },
+  "artifact": {
+    "name": "cli-node",
+    "platform": "linux",
+    "architecture": "amd64",
+    "size": 27934744,
+    "sha256": "62a184ee1d42f8923cd39b398fdaf7bea5faca25c3244038061a3378b0c8c766"
+  },
+  "verification": {
+    "node_related_tests_passed": 533,
+    "native_tests_passed": 47,
+    "packed_elf_integrity": "passed",
+    "packed_elf_final_http_cache_cases_passed": 7,
+    "payload_entries_verified": 23,
+    "real_kernel_exercised": false,
+    "real_anthropic_exercised": false
+  },
+  "scope": {
+    "application_version_changed": false,
+    "application_latest_changed": false,
+    "docker_images_published": false,
+    "production_deployed": false
+  }
+}

@@ -51,9 +51,10 @@ export function bodyCacheTtl(body) {
   const collect = (node) => {
     const control = node?.cache_control
     if (control?.type !== 'ephemeral') return
-    const raw = String(control.ttl || '').trim()
-    if (first == null) first = raw ? normalizeCacheTtl(raw) : '5m'
-    if (raw) hasExplicit = true
+    const raw = control.ttl
+    if (raw != null && raw !== '5m' && raw !== '1h') return
+    if (first == null) first = raw ?? '5m'
+    if (raw != null) hasExplicit = true
   }
   for (const tool of Array.isArray(body.tools) ? body.tools : []) collect(tool)
   for (const block of Array.isArray(body.system) ? body.system : []) collect(block)
@@ -70,8 +71,8 @@ export function bodyRequestsHourCache(body) {
 
 /**
  * Header, then an explicit 5m/1h on any inbound marker, then the settings menu.
- * Official Claude Code is included: its ttl-less markers mean "not chosen", so
- * they take the menu value instead of Anthropic's implicit 5m.
+ * This selects the default for new markers. Existing ttl-less caller markers
+ * retain Anthropic's implicit 5m regardless of this selection.
  */
 export function resolveCacheTtl({ headers = {}, body, routing, routingFile } = {}) {
   const hdr = headers[CACHE_TTL_HEADER] || headers['X-Kin-Cache-Ttl']
@@ -306,10 +307,6 @@ export function ephemeralCacheTtl(control) {
 
 function walkCacheNodes(body, mapFn) {
   const out = { ...body }
-  if (out.cache_control) {
-    const mapped = mapFn({ cache_control: out.cache_control })
-    out.cache_control = mapped?.cache_control
-  }
   if (Array.isArray(out.tools)) out.tools = out.tools.map(mapFn)
   if (Array.isArray(out.system)) out.system = out.system.map(mapFn)
   if (Array.isArray(out.messages)) {
@@ -319,41 +316,36 @@ function walkCacheNodes(body, mapFn) {
       return content.some((block, i) => block !== message.content[i]) ? { ...message, content } : message
     })
   }
+  if (out.cache_control) {
+    const mapped = mapFn({ cache_control: out.cache_control })
+    out.cache_control = mapped?.cache_control
+  }
   return out
 }
 
 /**
- * Anthropic permits one cache TTL per request prefix. Read markers in the
- * provider's evaluation order so a caller's first 5m marker also governs
- * markers added later by persona or CLI assembly.
+ * Anthropic accepts 1h followed by 5m, but never the reverse. Missing TTL is
+ * already a valid implicit 5m; the platform default only repairs invalid values.
+ * Evaluate automatic caching last, after tools, system and message markers.
  */
-function firstCacheTtlInWireOrder(body) {
-  const ttlOf = (node) => {
-    const control = node?.cache_control
-    return control?.type === 'ephemeral' ? ephemeralCacheTtl(control) : null
-  }
-  for (const tool of Array.isArray(body?.tools) ? body.tools : []) {
-    const ttl = ttlOf(tool)
-    if (ttl) return ttl
-  }
-  for (const block of Array.isArray(body?.system) ? body.system : []) {
-    const ttl = ttlOf(block)
-    if (ttl) return ttl
-  }
-  for (const message of Array.isArray(body?.messages) ? body.messages : []) {
-    for (const block of Array.isArray(message?.content) ? message.content : []) {
-      const ttl = ttlOf(block)
-      if (ttl) return ttl
-    }
-  }
-  return ttlOf(body)
-}
-
-/** Normalize every final marker to the first wire TTL. */
-export function enforceCacheTtlOrder(body) {
+export function enforceCacheTtlOrder(body, ttl = DEFAULT_CACHE_TTL) {
   if (!body || typeof body !== 'object') return body
-  const target = firstCacheTtlInWireOrder(body)
-  return target ? normalizeCacheTtlToBody(body, target) : body
+  const fallback = normalizeCacheTtl(ttl)
+  let short = false
+  let changed = false
+  const fix = (node) => {
+    const control = node?.cache_control
+    if (control?.type !== 'ephemeral') return node
+    let target = control.ttl
+    if (target != null && target !== '1h' && target !== '5m') target = fallback
+    if (short && target === '1h') target = '5m'
+    if (target !== '1h') short = true
+    if (target === control.ttl) return node
+    changed = true
+    return { ...node, cache_control: { ...control, ttl: target } }
+  }
+  const out = walkCacheNodes(body, fix)
+  return changed ? out : body
 }
 
 /** Normalize ephemeral TTLs without discarding scope or other marker fields. */
@@ -464,7 +456,7 @@ export function callerSystemCacheControl(body) {
 function politeEphemeral(control, ttl) {
   if (!control || typeof control !== 'object') return { type: 'ephemeral', ttl }
   if (control.type && control.type !== 'ephemeral') return null
-  if (String(control.ttl || '').trim()) return control
+  if (control.type === 'ephemeral') return control
   return { ...control, type: 'ephemeral', ttl }
 }
 
@@ -762,7 +754,8 @@ export function applyCacheBreakpoints(body, { ttl = DEFAULT_CACHE_TTL, config, i
       out = injectSystemTailBreakpoint(out, target)
     }
   }
-  out = applyMessageBreakpoints(out, target, cfg.messages)
+  const mode = cfg.preserve_client && hasMessageBreakpoint(out.messages) ? 'fill' : cfg.messages
+  out = applyMessageBreakpoints(out, target, mode)
   return out
 }
 
@@ -771,9 +764,8 @@ function n(v) {
 }
 
 /**
- * Put cache-creation tokens into the TTL we actually sent.
- * If Anthropic omitted the 5m/1h split, or reported 5m after we sent 1h,
- * reclassify so pricing charges the 1h difference.
+ * Preserve reported cache-write buckets, including legal mixed-TTL requests.
+ * Only an unclassified total (or a delta above the start split) needs a fallback.
  */
 export function applyCacheTtlToUsage(usage, ttl = DEFAULT_CACHE_TTL) {
   if (!usage || typeof usage !== 'object') return usage
@@ -788,6 +780,17 @@ export function applyCacheTtlToUsage(usage, ttl = DEFAULT_CACHE_TTL) {
   // message_delta can raise the total without resending the message_start split.
   const total = Math.max(five + hour, create)
   if (!total) return out
+  if (five + hour > 0) {
+    const remainder = total - five - hour
+    out.cache_creation_5m_tokens = five + (target === '5m' ? remainder : 0)
+    out.cache_creation_1h_tokens = hour + (target === '1h' ? remainder : 0)
+    out.cache_creation = {
+      ...out.cache_creation,
+      ephemeral_5m_input_tokens: out.cache_creation_5m_tokens,
+      ephemeral_1h_input_tokens: out.cache_creation_1h_tokens,
+    }
+    return out
+  }
   if (target === '1h') {
     out.cache_creation_1h_tokens = total
     out.cache_creation_5m_tokens = 0

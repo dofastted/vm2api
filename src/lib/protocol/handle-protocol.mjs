@@ -159,11 +159,10 @@ import {
 } from '../identity/crs-persona-usage.mjs'
 import {
   applyCacheTtlToUsage,
-  normalizeCacheTtlToBody,
+  enforceCacheTtlOrder,
   cacheBreakpointsFromRoutingFile,
   pinConversationCacheTtl,
   resolveCacheTtl,
-  fillMissingCacheTtl,
   validateCacheBreakpoints,
 } from './cache-ttl.mjs'
 import {
@@ -1335,10 +1334,10 @@ export function createHandleProtocol(deps) {
     // After OpenAI→Anthropic conversion so function tools already have input_schema;
     // leftover OpenAI-shaped tools are still marked (rewrite / mixed inbound).
     if (!apiOpenAI) ctx.body = applyEagerToolStreaming(ctx.body, getRouting())
-    // Resolve the session TTL before persona assembly; generated markers must
-    // follow the first inbound cache TTL rather than a later mixed marker.
+    // Repair TTL order before rendering, retaining valid caller omissions and
+    // mixed TTLs. The session default only governs platform-created markers.
     if (!apiOpenAI && !requestContext && !officialPassthrough) {
-      ctx.body = fillMissingCacheTtl(ctx.body, requestedCacheTtl)
+      ctx.body = enforceCacheTtlOrder(ctx.body, requestedCacheTtl)
     }
     const personaIn = ctx.body
     // Capture ownership before rendering supplies gateway markers or projects
@@ -1363,7 +1362,7 @@ export function createHandleProtocol(deps) {
         model: ctx.body?.model,
         cliVersion: OFFICIAL_CLI_VERSION,
       })
-    if (!officialPassthrough && !requestContext) ctx.body = normalizeCacheTtlToBody(ctx.body, requestedCacheTtl)
+    if (!officialPassthrough && !requestContext) ctx.body = enforceCacheTtlOrder(ctx.body, requestedCacheTtl)
     let personaHideTokens =
       requestContext || apiOpenAI
         ? 0

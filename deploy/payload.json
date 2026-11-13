@@ -1,6 +1,6 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.11.13-crag-2.8.17",
+  "release": "payload-2026.11.14-cache-ttl",
   "crag_release": "v2.8.17",
   "files": [
     {
@@ -48,8 +48,8 @@
     {
       "path": "share/wrap-cli/cli-node",
       "asset": "cli-node",
-      "size": 27934408,
-      "sha256": "b5dac65de06499edce028379cfd07413bc0d50aef04bb9f906553d0e1a234471"
+      "size": 27934744,
+      "sha256": "62a184ee1d42f8923cd39b398fdaf7bea5faca25c3244038061a3378b0c8c766"
     },
     {
       "path": "share/wrap-cli/kin-kernel.bin",

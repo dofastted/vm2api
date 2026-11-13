@@ -44,7 +44,6 @@ import {
   CRS_OFFICIAL_AGENT_IDENTITY,
 } from '../identity/official-cc-system-2.1.241.mjs'
 import {
-  applyCacheTtlToBody,
   applyMessageBreakpoints,
   normalizeCacheTtlToBody,
   DEFAULT_CACHE_TTL,
@@ -440,8 +439,7 @@ export function prepareCliHopBody(
     }
   }
   const prepared = applyEagerToolStreaming(body, routing)
-  const finalTtl = normalizeCacheTtl(cacheTtl)
-  return preserveSystem ? prepared : normalizeCacheTtlToBody(prepared, finalTtl)
+  return preserveSystem ? prepared : enforceCacheTtlOrder(prepared, cacheTtl)
 }
 
 export function prepareOutboundAttempt({
@@ -530,8 +528,7 @@ export function prepareOutboundAttempt({
     preserveThinkingBlocks,
   })
   cleaned = stripIllegalCacheControlFields(cleaned)
-  if (cacheTtl) cleaned = applyCacheTtlToBody(cleaned, cacheTtl)
-  cleaned = enforceCacheTtlOrder(cleaned)
+  cleaned = enforceCacheTtlOrder(cleaned, cacheTtl || DEFAULT_CACHE_TTL)
   const scrubbed = scrubUpstreamClientBody(cleaned, {
     official: !unofficial,
     rewriteTools: toolNameRewrite !== false,
