@@ -1771,7 +1771,7 @@ export function createHandleProtocol(deps) {
               logBag.inference_engine = resolveInferenceEngine(selected.vm, routingNow)
               logBag.persona_preset = cragPersona
               logBag.crag_print = {
-                transport: 'print',
+                transport: preparedHop.ready.health?.transport,
                 persona: cragPersona,
                 prompt_mode: hopBody.crag_prompt?.mode || 'default',
               }
