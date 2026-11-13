@@ -409,12 +409,49 @@ export async function ensureRemoteOfficialCredentialLink(vm, slotDir, session = 
 
 const queues = new Map()
 
+// Startup can exhaust a node's SSH MaxSessions; retry without racing later writes.
+const SLOT_PUSH_RETRY_DELAYS_MS = Object.freeze([1_000, 5_000, 15_000])
+
+function jittered(ms) {
+  return Math.round(ms * (0.75 + Math.random() * 0.5))
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms).unref?.())
+}
+
 /** Fire-and-forget push, serialized per VM so a slow push never races the next one. */
-export function queueSlotPush(vm, slotDir, sets, { logger = console } = {}) {
+export function queueSlotPush(
+  vm,
+  slotDir,
+  sets,
+  { logger = console, push = pushSlotFiles, retryDelaysMs = SLOT_PUSH_RETRY_DELAYS_MS, wait = sleep } = {},
+) {
   const prev = queues.get(vm.id) || Promise.resolve()
   const next = prev
     .catch(() => {})
-    .then(() => pushSlotFiles(vm, slotDir, sets))
+    .then(async () => {
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          return await push(vm, slotDir, sets)
+        } catch (err) {
+          if (err?.code === 'host_key_mismatch' || err?.code === 'auth_failed' || attempt >= retryDelaysMs.length) {
+            throw err
+          }
+          logger.warn(
+            JSON.stringify({
+              event: 'remote_slot_push_retry',
+              vm_id: vm.id,
+              sets,
+              attempt: attempt + 1,
+              error: String(err?.message || err),
+            }),
+          )
+          // Re-read local files on every attempt so a retry publishes the newest copy.
+          await wait(jittered(retryDelaysMs[attempt]))
+        }
+      }
+    })
     .catch((err) => {
       logger.warn(
         JSON.stringify({ event: 'remote_slot_push_failed', vm_id: vm.id, sets, error: String(err?.message || err) }),

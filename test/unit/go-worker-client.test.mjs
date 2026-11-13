@@ -22,6 +22,7 @@ import { callCodexKernel, streamCodexKernel } from '../../src/lib/transport/code
 import { forwardApi, readApiJson } from '../../src/lib/transport/api-kernel-client.mjs'
 import { normalizeRedaction } from '../../src/lib/redaction/policy.mjs'
 import { publishRedactionForTests } from '../../src/lib/redaction/runtime.mjs'
+import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { classifyUpstreamResult } from '../../src/lib/pool/upstream-error-policy.mjs'
 
 test('restoreUncommittedHop keeps a structured upstream code', () => {
@@ -1713,6 +1714,78 @@ unixTest('Codex clients enforce the panel limit on their serialized envelope', a
   } finally {
     await fx.close()
   }
+})
+
+unixTest('redaction 413 stops failover before any worker dispatch for call and stream clients', async (t) => {
+  let requests = 0
+  const fx = await fixture((req, res) => {
+    requests++
+    req.resume()
+    res.writeHead(500).end('{}')
+  })
+  t.after(async () => {
+    publishRedactionForTests(null)
+    await fx.close()
+  })
+  fx.exec.vm.runtime.codex_kernel_socket = fx.exec.vm.runtime.worker_socket
+  const policy = normalizeRedaction({ enabled: true, secrets: true, personal: false })
+  let masks = 0
+  publishRedactionForTests({
+    enabled: true,
+    ready: true,
+    policy,
+    client: {
+      async mask({ maxBodyBytes }) {
+        masks++
+        assert.equal(maxBodyBytes, 64 * 1024 * 1024)
+        throw Object.assign(new Error('redaction body exceeds the configured request body limit'), {
+          code: 'redaction_body_too_large',
+          status: 413,
+          details: { retryable: false },
+        })
+      },
+    },
+  })
+  for (const call of [callGoWorker, streamGoWorker, callCodexKernel, streamCodexKernel]) {
+    const body =
+      call === callCodexKernel || call === streamCodexKernel
+        ? { input: 'fixture' }
+        : { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'fixture' }] }
+    let selections = 0
+    const runner = new FailoverRunner({
+      scheduler: {
+        async selectAndReserve() {
+          selections++
+          assert.equal(selections, 1, 'a local size error must not select another account')
+          return { ok: true, accountId: 'fixture', vmId: 'vm-fixture', release() {} }
+        },
+        markCooldown() {
+          assert.fail('a local size error must not cool down an account')
+        },
+      },
+    })
+    const result = await runner.run({
+      requestId: `redaction-size-${call.name}`,
+      model: 'fixture-model',
+      canonicalBody: body,
+      callAttempt: () =>
+        call({
+          exec: fx.exec,
+          envelope: { body },
+          routing: { redaction: policy, failover: { max_request_mib: 64 } },
+          redactionPrincipal: 'fixture-principal',
+        }),
+    })
+    assert.equal(result.status, 413, call.name)
+    assert.equal(result.body.error.code, 'redaction_body_too_large')
+    assert.equal(result.body.error.type, 'invalid_request_error')
+    assert.equal(result.body.error.details.retryable, false)
+    assert.equal(result.transportError, false)
+    assert.equal(result.attemptCount, 0)
+    assert.equal(selections, 1)
+  }
+  assert.equal(masks, 4)
+  assert.equal(requests, 0)
 })
 
 unixTest('invalid Messages are rejected before either kernel accepts a turn', async (t) => {

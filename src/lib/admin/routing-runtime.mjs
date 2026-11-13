@@ -168,7 +168,7 @@ export function createRoutingRuntime(ctx) {
     return vm.claude?.has_access || vm.has_token ? 'pro' : accountTier
   }
 
-  function applyRoutingTierConcurrency(tiers) {
+  function applyRoutingTierConcurrency(tiers, { preserveExisting = false } = {}) {
     const routingConfig = getRouting()
     const policies = normalizeTiers(tiers, routingConfig.quota, routingConfig.concurrency)
     const skip = []
@@ -188,10 +188,17 @@ export function createRoutingRuntime(ctx) {
         applied.skipped += 1
         continue
       }
+      // Boot keeps persisted slot settings; explicit routing saves update inherited
+      // values. Account DB synchronization and live tier admission still run below.
+      if (preserveExisting && Object.prototype.hasOwnProperty.call(storedVm?.policy || {}, 'maxConcurrency')) {
+        continue
+      }
       const key = vmTierKey(vm)
       const next = Number(policies[key]?.max_concurrency ?? 2)
       const cur = Number(storedVm?.policy?.maxConcurrency)
-      if (cur === next) continue
+      // An explicit save also releases a legacy unflagged pin when its value
+      // already matches the tier; a materialized inherited value needs no write.
+      if (cur === next && storedVm?.policy?.concurrencyOverride === false) continue
       applyVmConcurrency(vm.id, next, { override: false })
       applied[key] += 1
     }
