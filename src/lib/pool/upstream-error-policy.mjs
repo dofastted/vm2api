@@ -335,6 +335,21 @@ function classifyUpstreamResultRaw(
       retrySameAccount: false,
     }
   }
+  const handoffCode = result?.body?.error?.code
+  if (
+    result.nativeHandoff === true &&
+    /^native_handoff_(missing|invalid|conflict|incomplete)$/.test(handoffCode || '')
+  ) {
+    // The provider may already have finished. Missing terminal proof is not
+    // permission to execute the same turn again or penalize another account.
+    return {
+      scope: 'request',
+      action: 'stop',
+      reason: handoffCode,
+      cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
   if (isContentFilterRefusal(result) && !result.committed) {
     return cacheRefusal('content_filter_refusal')
   }
