@@ -13,7 +13,8 @@ import { writeSlotSeedFiles } from './slot-seed.mjs'
 import { manualScheduleLevelOf } from '../pool/credential-weight.mjs'
 import { applyUnschedulable, deriveScheduleFields, pickScheduleFields } from '../pool/schedule-state.mjs'
 import { activeHoursOf } from '../pool/active-hours.mjs'
-import { stampVmKind } from './vm-kind.mjs'
+import { isCodexVm, stampVmKind } from './vm-kind.mjs'
+import { isKvmRuntime } from './runtime-kind.mjs'
 import { materializeResolvedKernel } from './wrap-cli-runtime.mjs'
 import { listVms } from './vm-registry.mjs'
 import { slotHost } from './slot-host.mjs'
@@ -97,11 +98,14 @@ export function seedFreshCliHome(projectRoot, vm) {
   const written = writeSlotSeedFiles(projectRoot, vm)
   // A baked slot image carries its binaries; no .kin copy in the home.
   if (!slotHost(vm).bakedKernel) {
+    const required = vm?.dataplane === 'crag' || (isKvmRuntime(vm) && !isCodexVm(vm))
     try {
       const laid = materializeResolvedKernel(projectRoot, vm)
-      if (laid?.ok === false && vm?.dataplane === 'crag') throw new Error(laid.error || laid.code)
+      if (laid?.ok === false && required) {
+        throw Object.assign(new Error(laid.error || laid.code), { code: laid.code })
+      }
     } catch (error) {
-      if (vm?.dataplane === 'crag') throw error
+      if (required) throw error
     }
   }
   return { homeDir: written.homeDir, seed_policy: written.seed_policy || defaultSeedPolicy(vm.seed_policy || {}) }

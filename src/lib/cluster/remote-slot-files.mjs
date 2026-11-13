@@ -166,7 +166,7 @@ export async function pushSlotBinaries(vm, projectRoot, session = null) {
     pushed.push(name)
   }
   await pushLiveWrap(vm, projectRoot, s, { required: false })
-  const crag = await pushCragSlot(vm, projectRoot, s, { required: false })
+  const crag = await pushCragSlot(vm, projectRoot, s, { required: isKvmRuntime(vm) && !isCodexVm(vm) })
   return { pushed, digest: digest.digest('hex'), crag }
 }
 
@@ -318,10 +318,11 @@ export async function pushKernelSelection(vm, projectRoot, kernel) {
   const wrap = await pushLiveWrap(vm, projectRoot, session, { required: kernel !== 'crag' })
   if (!wrap.ok) return wrap
   let crag = { ok: true, pushed: false }
+  const requireCrag = kernel === 'crag' || isKvmRuntime(vm)
   try {
-    crag = await pushCragSlot(vm, projectRoot, session, { required: kernel === 'crag' })
+    crag = await pushCragSlot(vm, projectRoot, session, { required: requireCrag })
   } catch (error) {
-    if (kernel === 'crag') {
+    if (requireCrag) {
       return {
         ok: false,
         code: error?.code || 'kernel_materialize_failed',

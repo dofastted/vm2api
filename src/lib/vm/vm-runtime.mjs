@@ -1114,9 +1114,9 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
         gid: Number(GID),
         routing: resolvedRouting,
       })
-      if (dataplane === 'crag' && laid?.ok === false) return laid
+      if ((dataplane === 'crag' || kvm) && laid?.ok === false) return laid
     } catch (error) {
-      if (dataplane === 'crag') {
+      if (dataplane === 'crag' || kvm) {
         return { ok: false, code: 'dataplane_materialize_failed', error: String(error?.message || error) }
       }
     }
