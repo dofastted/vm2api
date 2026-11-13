@@ -13,6 +13,33 @@ import {
 } from '../../src/lib/identity/crs-persona.mjs'
 import { CRS_OFFICIAL_AGENT_PROMPT } from '../../src/lib/identity/official-cc-system-2.1.241.mjs'
 
+test('CLI zero preserves caller TTLs against a different platform default', () => {
+  for (const controls of [
+    [{ type: 'ephemeral', ttl: '1h' }],
+    [{ type: 'ephemeral', ttl: '5m' }],
+    [{ type: 'ephemeral' }],
+    [
+      { type: 'ephemeral', ttl: '1h' },
+      { type: 'ephemeral', ttl: '5m' },
+    ],
+  ]) {
+    const input = {
+      model: 'claude-sonnet-5',
+      system: controls.map((cache_control) => ({ type: 'text', text: 'cached', cache_control })),
+      messages: [{ role: 'user', content: 'hello' }],
+    }
+    const before = structuredClone(input)
+    for (const cacheTtl of ['5m', '1h']) {
+      const body = prepareCliHopBody(input, { personaPreset: 'zero', cacheTtl })
+      assert.deepEqual(
+        body.system.map((block) => block.cache_control),
+        controls,
+      )
+    }
+    assert.deepEqual(input, before)
+  }
+})
+
 test('prepareCliHopBody drops metadata and CLI-owned system but keeps official agent leftover', () => {
   const body = prepareCliHopBody({
     model: 'claude-sonnet-5',
