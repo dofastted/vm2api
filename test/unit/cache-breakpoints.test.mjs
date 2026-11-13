@@ -72,6 +72,46 @@ function withRoutingFile(compatibility, fn) {
   }
 }
 
+test('HTTP assembly preserves explicit mixed TTLs and caller omissions with default injection enabled', () => {
+  for (const tailControl of [{ type: 'ephemeral', ttl: '5m' }, { type: 'ephemeral' }]) {
+    const input = {
+      model: 'claude-sonnet-5',
+      max_tokens: 256,
+      system: [{ type: 'text', text: 'cached', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello', cache_control: tailControl }] }],
+    }
+    const before = structuredClone(input)
+    for (const cacheTtl of ['5m', '1h']) {
+      const { body } = prepareOutboundEnvelope({
+        canonicalBody: input,
+        inbound: input,
+        identity: { ...IDENTITY },
+        unofficial: false,
+        officialClient: false,
+        cacheTtl,
+        cacheBreakpoints: DEFAULT_CACHE_BREAKPOINTS,
+      })
+      assert.deepEqual(body.system[0].cache_control, input.system[0].cache_control)
+      assert.deepEqual(body.messages[0].content.at(-1).cache_control, tailControl)
+    }
+    assert.deepEqual(input, before)
+  }
+})
+
+test('the selected 5m default applies to platform-added markers on an unmarked request', () => {
+  const input = {
+    model: 'claude-sonnet-5',
+    tools: [{ name: 'Read', input_schema: { type: 'object' } }],
+    messages: [{ role: 'user', content: 'hello' }],
+  }
+  const out = applyCacheBreakpoints(input, { ttl: '5m', config: DEFAULT_CACHE_BREAKPOINTS })
+  assert.deepEqual(
+    breakpoints(out).map((marker) => marker.ttl),
+    ['5m', '5m'],
+  )
+  assert.equal(breakpoints(input).length, 0)
+})
+
 test('defaults are on, and messages mode aliases normalize', () => {
   assert.deepEqual(normalizeCacheBreakpoints(undefined), { ...DEFAULT_CACHE_BREAKPOINTS })
   assert.equal(DEFAULT_CACHE_BREAKPOINTS.messages, 'rewrite')
@@ -181,11 +221,11 @@ test('an existing 5m is not overwritten when injecting 1h', () => {
   assert.equal(injectToolsTailBreakpoint(body, '1h'), body)
 })
 
-test('a cache_control without ttl is filled in place', () => {
+test('an existing cache_control without ttl keeps its implicit 5m', () => {
   const out = injectSystemTailBreakpoint({
     system: [{ type: 'text', text: 'x', cache_control: { type: 'ephemeral' } }],
   })
-  assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral', ttl: DEFAULT_CACHE_TTL })
+  assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral' })
 })
 
 test('tools tail skips server tools and deferred tools', () => {
