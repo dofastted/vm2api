@@ -41,7 +41,7 @@
 | `persona_preset` | `official_full` | 使用独立的完整官方模板；`official` 保留原有官方提示词 |
 | `overlay_preset` | `off` | 不向首条 user 注入 overlay |
 | `persona_park` | `false` | 与 `overlay_preset=off` 对齐 |
-| `cache_ttl` | `1h` | Node 重写时新增点的缺省 TTL；`x-kin-cache-ttl` 参与首次会话选择，不覆盖 native 透传 caller / 模板显式 TTL |
+| `cache_ttl` | `1h` | 平台新增 marker 的缺省 TTL；`x-kin-cache-ttl` 参与首次会话选择。调用方合法 `1h`、`5m`、`1h → 5m` 及省略 TTL 均保留，不按菜单值统一改写 |
 
 **official / official_full 模板**统一采用 2.1.303 OAuth 抓包中的 harness + guidance；顶层 `system` 只装提示词与调用方 `caller_system`。Environment 放入 `messages[].role=system`，不打缓存点，不混入顶层提示词。身份和 billing 入口跟随 `cc_entrypoint`。所有档位均使用 2.1.303，不再提供单独的 `official_303` 选项；旧值读写时归一为 `official_full`，旧开关和模板迁移到完整版，已有明确的完整版配置优先。
 
@@ -105,7 +105,7 @@ DSH 在压缩压力下会把旧工具结果改为前4096码点、固定middle-pr
 
 ## thinking 与 max_tokens
 
-`max_tokens` **就是** thinking 预算（thinking + 可见输出共享）。缺失时用该模型目录的 `max_tokens_default`，目录没有时用 4096。调用方有值且低于 `compatibility.min_max_tokens` 时默认抬到该值，模式「不改」则不抬。仅当超过模型 `max_tokens_cap` 时 `applyMaxTokensCap` 下调。
+`max_tokens` **就是** thinking 预算（thinking + 可见输出共享）。前置协议清洗时缺失值用该模型目录的 `max_tokens_default`，目录没有时用 4096。调用方有值且低于 `compatibility.min_max_tokens` 时默认抬到该值，模式「不改」则不抬；超过模型 `max_tokens_cap` 时下调。CRAG print 绕过普通出站准备，因此协议清洗阶段也必须应用模型上限。
 
 | 模型 | thinking |
 |------|----------|
@@ -116,6 +116,13 @@ DSH 在压缩压力下会把旧工具结果改为前4096码点、固定middle-pr
 非官方缺省还可补 `output_config.effort=high`，**不覆盖**已有 thinking / max_tokens。最新 main 在 unofficial 缺 `thinking.display` 时补 `omitted`。
 
 虚拟机测试未传 `max_tokens` 时用模型策略 `max_tokens_default`，再不行用 64（健康探测 hello 同口径）。
+
+连接测试及真实健康探针显式选择 thinking：允许关闭的模型发送 `{"type":"disabled"}`，要求 adaptive 的模型仍发送 adaptive。普通入站只有 Haiku 4.5 的小预算单次探针（原始 `max_tokens` 为 1–64 的整数、单条最多 64 字符的纯文本 user、无 system/tools/显式 thinking，且非官方透传）补 disabled；输出下限与模型 cap 沿用现有配置，不扩大预算、不改普通会话或调用方显式思考选择。
+
+显式携带既有 `x-kin-health-real` 标记的真实健康请求，在同样的 Haiku 4.5、1–64 token、单 user、无 system/tools/显式 thinking 条件下补 disabled，不以诊断标记的正文长度排除；没有此标记的普通长正文保持原行为。
+
+CRAG 需配套原生 helper 将显式 disabled 送到官方 Claude 的最终 fetch 边界；旧签名内核可能忽略该字段。修改 Node 或只热写配置不等于已更新运行中的 CRAG；新内核需要按现有签名交付与排空安装流程生效，不能用全局 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` 覆盖所有模型来替代。
+
 
 ## beta 与 1M
 
@@ -169,11 +176,13 @@ Rikka / 客户端 `search_web`、`scrape_web` **不是** Anthropic 自带搜索�
 
 HTTP hop 与 cli-hop（`prepareCliHopBody`）共用内容预过滤，但缓存职责不同。cli-hop 首跳保留签名可用的 thinking 指纹，没有可用签名的删掉；签名修复重试才清除其余块。官方家族开启 `official_cc_passthrough` 时，Node 保留 system/tools/messages 的 caller marker、显式 TTL、缺失 TTL 和位置，不添点、不裁剪；超过四点、thinking marker、非法 TTL 或 5m（含缺失）后出现 1h，在调度前返回 `400 invalid_cache_control`。
 
-关闭透传或非官方请求仍走 Node rewrite：清除 caller marker，生成最后消息及 `messages.length>=4` 时倒数第二 user 的点，TTL 用入站会话 pin 值。应用 persona 后，模板显式 TTL 保留，只补自产缺失 TTL；超额时优先删 tools、system 尾部的自产点。非法模板返回 request-scoped 400，零上游执行，不换号、不冷却。
+关闭透传或非官方请求仍按所选人设组装。保留的 caller marker 不再统一改写 TTL：显式 `1h` 保留 `1h`，显式 `5m` 保留 `5m`，合法的 `1h → 5m` 各自保留；省略 TTL 的已有 marker 保持省略，语义为隐式 `5m`。HTTP hop 的 `preserve_client=true` 也保留已有 message marker；无 message marker 时，才按配置补最后消息及 `messages.length>=4` 时倒数第二 user 的点。
 
-识别为官方 Claude Code 家族但未开 `official_cc_passthrough` 时，请求与第三方一样先剥离成标准 Anthropic 结构，再按槽位档重写 system；识别本身不再保留入站 system。凡经重写的入站（官方家族与第三方客户端一样），不写 `ttl` 的 marker 都表示未选择，渲染前按会话 pin 值补齐（调用方显式 `5m` / `1h` 保留，前面已有 5m 时补 5m），cli-hop、HTTP hop 与 API 直连一致。只有协议页打开透传，官方家族才跳过剥离与重写，按前文 `official_cc_passthrough` 的规则处理。入站请求头不能跳过剥离。
+平台新增的缺省 marker 使用入站会话 pin 值（菜单选 `5m` 且请求没有另选时，新增点使用 `5m`），不覆盖 caller 或模板显式 TTL。按 `tools → system → messages → 顶层自动缓存` 检查顺序；Node 整流只把非法 TTL 修正为本次缺省值，并把 `5m`（含省略 TTL）之后非法出现的 `1h` 降为 `5m`，此前合法 marker 不动。模板自产点仍遵守剩余预算；非法模板返回 request-scoped 400，零上游执行，不换号、不冷却。
 
-native CLI `2.1.296` 保留带 billing 的 wire system（含官方 CLI / 子代理布局）、wire tools 和 wire messages，不自动给最后一个 tool 加点；caller tool 的缺失 TTL 也保持缺失。仅对 CLI 自有 marker 补 TTL，优先请求显式 TTL（混合时 5m）→ slot `kernel.json.default_cache_ttl` → 1h，并按保留内容占用后的剩余预算裁剪。Rust kernel 不增删 marker、不重打 last、不自动降级 TTL。Node native envelope 不用菜单 TTL 重分类上游 usage，日志/计费保留真实 5m/1h 分桶。Node 对象不等于最终 wire；HTTP hop 原有独立缓存整流不变。
+识别为官方 Claude Code 家族但未开 `official_cc_passthrough` 时，请求与第三方一样先剥离成标准 Anthropic 结构，再按槽位档重写 system；识别本身不再保留入站 system。人设组装保留下来的 caller marker 适用上述 TTL 规则，不再把缺失 TTL 当作菜单选择后补齐。只有协议页打开透传，官方家族才跳过剥离与重写，按前文 `official_cc_passthrough` 的规则处理。入站请求头不能跳过剥离。
+
+native CLI 对已有缓存 marker 的 wire system 直接保留块边界、显式 TTL 和省略 TTL，wire tools / messages 同样保留。仅对 CLI 自有 marker 补 TTL，优先请求显式 TTL（混合时 5m）→ slot `kernel.json.default_cache_ttl` → 1h，并按保留内容占用后的剩余预算裁剪。Rust kernel 不增删 marker、不重打 last、不自动降级 TTL。HTTP hop 与 native envelope 的日志/计费保留上游真实 5m/1h 分桶；仅缺少分桶的用量或 message_delta 超过既有分桶的增量使用缺省 TTL 归类。Node 对象不等于最终 wire，源码验证也不等于已发布或部署新 CLI 二进制。
 
 长度够的签名原样转发，由 Anthropic 验。5.5 的非 dummy 签名在非保留路径原样转发，不按 24 字符预过滤；保留路径仍要求不少于 24。签名是 opaque 加密内容，当前模型 / 账户 / 会话前缀不匹配时可能被丢弃或返回 400 `Invalid \`signature\` in \`thinking\` block`。网关不伪造真实签名，也不给缺签名的块补空字段。切换账号时不改写已有签名；`cli-node` 仍按现有登录 / fallback 逻辑清理签名块。
 

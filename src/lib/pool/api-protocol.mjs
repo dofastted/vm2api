@@ -347,7 +347,9 @@ export async function runApiInference({
   }
   if (requestContext) Object.assign(body, prepareClassifierBody(body))
   const redactionState = await ensureRedaction(routing || {}, { projectRoot: cfg?.paths?.project })
-  const redaction = redactionState.enabled ? { principal: redactionPrincipal, session: redactionSession } : null
+  const redaction = redactionState.enabled
+    ? { principal: redactionPrincipal, session: redactionSession, maxBodyBytes: redactionState.maxBodyBytes }
+    : null
   if (redaction) body = await maskJson(body, redaction)
   const callerProtocolHeaders = forwardAnthropicProtocolHeaders(req?.headers, protocol, protocolKind, {
     passthrough,

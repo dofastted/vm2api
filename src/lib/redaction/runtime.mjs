@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { createRedactionClient } from './client.mjs'
 import { normalizeRedaction } from './policy.mjs'
+import { maxRequestBytes } from '../core/config.mjs'
 
 const disabled = {
   enabled: false,
@@ -87,7 +88,9 @@ export async function ensureRedaction(routing, { projectRoot, binPath } = {}) {
     state = { ...disabled, policy }
     return state
   }
+  const maxBodyBytes = maxRequestBytes(routing)
   if (state.ready && state.enabled && JSON.stringify(state.policy) === JSON.stringify(policy) && state.client) {
+    state = { ...state, maxBodyBytes }
     return state
   }
   if (!boot) {
@@ -95,7 +98,9 @@ export async function ensureRedaction(routing, { projectRoot, binPath } = {}) {
       boot = null
     })
   }
-  return boot
+  const ready = await boot
+  state = { ...ready, maxBodyBytes }
+  return state
 }
 
 async function bootHelper(policy, { projectRoot, binPath }) {
@@ -110,7 +115,10 @@ async function bootHelper(policy, { projectRoot, binPath }) {
   try {
     const capability = await waitForFile(helper.capabilityFile)
     const client = createRedactionClient({ socketPath: helper.sock, capability })
-    await client.health()
+    const health = await client.health()
+    if (JSON.parse(health.body)?.request_body_limit !== true) {
+      throw unavailable('redaction helper must be rebuilt to support configurable body limits')
+    }
     await client.validate({ policy: policyView(policy) })
     state = { enabled: true, ready: true, policy, client, child: helper.child, error: null }
     return state
@@ -137,6 +145,7 @@ export async function maskJson(value, ctx = {}) {
     session,
     policy: policyView(state.policy),
     body: JSON.stringify(value),
+    maxBodyBytes: ctx.maxBodyBytes ?? state.maxBodyBytes,
   })
   return JSON.parse(body)
 }
@@ -151,6 +160,7 @@ export async function restoreJsonText(text, ctx = {}) {
     policy: policyView(state.policy),
     body: String(text),
     codec: 'json',
+    maxBodyBytes: ctx.maxBodyBytes ?? state.maxBodyBytes,
   })
   return body
 }

@@ -53,6 +53,7 @@ import {
   resolveSlotClaude,
 } from '../vm/slot-engine.mjs'
 import { getVm } from '../vm/vm-registry.mjs'
+import { guardUsageTier } from '../pool/claude-tier.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { CRS_OFFICIAL_CLI_SYSTEM } from '../identity/crs-persona.mjs'
 
@@ -1272,6 +1273,15 @@ export async function runOfficialCcBootstrap(rawOpts = {}) {
     } else if (stats?.limits_present === true && !stats.account_tier) {
       const accountTier = inferTierFromOfficialStats('', stats)
       if (accountTier) stats = { ...stats, account_tier: accountTier }
+    }
+    if (!tierSource && stats?.account_tier) {
+      stats = {
+        ...stats,
+        account_tier: guardUsageTier(
+          stats.account_tier,
+          account.rate_limit_tier || vm?.claude?.rate_limit_tier || vm?.rate_limit_tier,
+        ),
+      }
     }
     if (!tierSource && stats?.account_tier) tierSource = 'usage'
     if (stats) stats = { ...stats, account_tier_source: tierSource }

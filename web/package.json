@@ -6,6 +6,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "test": "vitest run",
+    "test:ci": "vitest run src/lib/api.test.ts src/features/auth/route-guard.test.ts src/features/keys/key-payload.test.ts src/features/vm/engine-contract.test.ts src/features/logs/log-display.test.ts src/features/proxies/proxy-results.test.ts",
     "typecheck": "tsc -b",
     "lint": "eslint .",
     "format": "prettier --write src package.json vite.config.ts eslint.config.js",

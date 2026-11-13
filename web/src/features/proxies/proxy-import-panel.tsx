@@ -114,12 +114,13 @@ export function ProxyImportPanel({ hasLocal }: { hasLocal: boolean }) {
         spellCheck={false}
         autoComplete='off'
         placeholder={
-          'host:port\nuser:pass@host:port\nsocks5://user:pass@host:port'
+          'host:port\nuser:pass@host:port\nsocks5://user:pass@host:port\nhttp://user:pass@host:port'
         }
         className='field-host min-h-40 resize-y text-xs leading-relaxed'
       />
       <p className='mt-1.5 text-[11px] text-muted-foreground'>
-        也支持 host:port:user:pass。账密入库后不再回显，重复的自动跳过。
+        也支持 host:port:user:pass；不带协议默认 SOCKS5，HTTP 代理请写
+        http://。账密入库后不再回显，重复的自动跳过。
       </p>
       <div className='mt-3 flex flex-wrap items-center gap-2'>
         <Button

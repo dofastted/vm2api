@@ -29,7 +29,6 @@ type VmOverviewTabProps = {
   dash: { data: Dashboard | undefined }
   u5: number
   u7: number
-  tierKey: string
   now: number
   cost: VmCostSummary
   split: WeeklySplitSummary | null

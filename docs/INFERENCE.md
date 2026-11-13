@@ -86,6 +86,51 @@ Codex `/internal/v1/codex/responses` 不套用 Messages 校验。
 不能删除 tool_result、改 ID、清空防重放状态或换槽重发来规避。排查需要本轮末尾内容与原批次交付/认领记录；
 仅有截断的请求前缀不足以区分真实重放和内核误判。
 
+## 面板拥有整流：原生交接 v1
+
+仅当受管 CRAG 的认证 health 在 `capabilities` 中声明 `native_handoff_v1`，面板才在内部
+`gateway_policy` 中设置布尔值 `native_handoff_v1: true`。分类器继续使用独立的
+`request_context` 契约，不冒充普通推理。配套发行包为 CRAG 2.8.17，但仍不能仅凭版本号推断支持；
+CRAG 2.8.16 没有该能力，旧槽保留 legacy 路径，不能将只更新 Node 宣称为两项故障已修复。
+
+职责分工：
+
+- CRAG 只执行一次主模型请求，交接 provider 原始 message ID、model、stop、usage 和结构化错误；
+  不执行交互式恢复，不抬预算，不替面板关闭思考，也不把 refusal 改成工具成功。
+- 面板验证原生事实，决定公共 JSON/SSE 交付、拒绝、记账及既有重试/切号策略。正文和思考可实时
+  交付；客户端工具 ID、参数和终态须等完整响应及权威终态验证后才公开。非 `tool_use` 停止中的
+  客户端工具块由面板抑制，`server_tool_use` 等服务端记录保留，不另建 pending/consumed 账本。
+- 内核仅为真正 `tool_use` 且匹配完整 MCP 回调集的响应登记安全 handoff。新模式每个调用方回合
+  使用独立原生进程，工具结果按原有租户、集合、历史、期限和防重放校验交给下一进程；不重跑客户端
+  工具。这牺牲热进程复用以隔离 CLI 的交互恢复，存在额外启动开销，不保证历史热进程性能或缓存命中。
+- CLI 内部 MCP 取消是原生观察，不是调用方取消。它不能抢先覆盖随后到达的 provider refusal；
+  调用方断连及 `/internal/v1/cancel` 仍取消真实回合，已取消的真正工具回调不被恢复为成功批次。
+
+原生事实通过内部 SSE `kin_provider_result` 及 JSON/verified/流式回包的
+`x-kin-provider-result` 头或 trailer 交接，面板均从公共响应中剥离。摘要包含
+`message_id`、`model`、`stop_reason`、`stop_sequence`、`usage`、`usage_complete`，可带
+`stop_details`、实际 `http_status`、原始 `error` 和 `request_id`。元信息有独立大小限制；
+无法交付必要成功证明时失败关闭，不把丢失的字段猜成成功。
+
+`usage_complete` 只说明模型用量是否完整，不等于客户端交付成功。原生终态已确认而后续传输失败时，
+保留已确认用量；尚无最终用量只保留真实观察值，不以首帧或估算替代最终值。相互冲突或非法摘要
+失去权威，不能再给计费提供最终用量，也不能覆盖实际收到的错误。
+真实 HTTP/SSE 错误及调用方取消仍保留原状；如果取消早于任何 provider 响应观察，摘要和用量可以
+缺失，不补造 message ID、model 或 token 数。
+
+声称成功却缺少必要证明，或证明非法、冲突、不完整时，分别返回 `native_handoff_missing`、`native_handoff_invalid`、
+`native_handoff_conflict`、`native_handoff_incomplete`；不自动重放、不给账号施加冷却，也不补造
+`stop_reason=max_tokens` 成功收尾。真实 `max_tokens` 原样完成，真实 refusal 不触发客户端工具；
+既有 409/410 保留真实失败，不能从 410 反推拒绝原因或靠删除历史复活续接。
+
+回归入口：面板 `test/unit/native-handoff.test.mjs`；供应仓 `kernel/tests/native_handoff.test.mjs`
+与 `native_v2` 中的 `real_claude_native_handoff_*`。联合回归使用真实 Node 传输、编译后的签名/授权
+测试内核、官方 Claude 2.1.321 和 loopback 上游，覆盖 print/TUI、4096 adaptive 截断、拒绝、
+连续两批工具及真实错误。公开 RFC 8032 测试向量只用于隔离测试，不是生产发行授权。
+
+上线必须分别更新面板及具备新能力的受信签名内核包，按现有流程排空请求和工具续接、安装后核对
+运行中 core 摘要与能力。源码、测试通过、下载包和正在运行的槽不是同一证据；本轮没有切换运行槽。
+
 ## 面板到槽的 CPU 并行
 
 - `PoolScheduler` 仍只有一个权威实例。每次执行先原子取得许可；粘性绑定、会话席位和执行许可独立。见 [调度准入](performance/scheduler-admission.md)。不要复制 `src/server.mjs` 进程来扩展编解码。

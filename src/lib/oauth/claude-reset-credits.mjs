@@ -4,6 +4,9 @@
  * Grant and organization IDs never leave this module.
  * Mirrors sub2api ClaudeResetCreditService, including the org fence:
  * an unconfirmed claim blocks another redemption until it settles.
+ * Each held grant is exposed as an opaque card ref so the operator can pick
+ * which reset to spend (e.g. a Fable reset vs a full reset); without a ref the
+ * server's next grant is used, as before.
  */
 import crypto from 'node:crypto'
 import fs from 'node:fs'
@@ -18,9 +21,21 @@ export const CLAUDE_RESET_USAGE_PATH = '/api/oauth/usage?cedar_ember=1&skip_spen
 export const CLAUDE_RESET_REDEEM_PATH = '/api/organizations/%s/reset_rate_limits'
 
 const GRANT_ID = /^[a-z0-9_-]{1,40}$/
+const CARD_REF = /^[a-f0-9]{24}$/
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const NIL_UUID = '00000000-0000-0000-0000-000000000000'
 const KNOWN_WINDOWS = new Set(['five_hour', 'seven_day', 'seven_day_overage_included'])
+// Every window the official client recognises; only used to classify a grant.
+const CLAIM_WINDOWS = new Set([
+  ...KNOWN_WINDOWS,
+  'seven_day_opus',
+  'seven_day_sonnet',
+  'seven_day_cowork',
+  'seven_day_omelette',
+  'seven_day_oauth_apps',
+])
+const GRANT_TYPES = new Set(['session', 'weekly', 'full'])
+const CARD_KINDS = new Set(['session', 'weekly', 'fable', 'full'])
 const KNOWN_REASONS = new Set([
   'no_grant',
   'unknown_grant',
@@ -54,6 +69,26 @@ export function claudeResetOperationId(vmId, idempotencyKey) {
 
 export function claudeResetOrgId(orgUuid) {
   return sha256(`claude-org:${orgUuid}`)
+}
+
+/** Stable, opaque per-slot handle for one grant; the grant id itself never leaves this module. */
+export function claudeResetCardRef(vmId, grantId) {
+  return sha256(`claude-grant:${vmId}:${grantId}`).slice(0, 24)
+}
+
+/**
+ * session | weekly | fable | full, as the official client names a grant. A grant that
+ * refills the Fable window but not the weekly one is a Fable reset even when upstream
+ * omits gives_back_weekly, so it is never shown as a full reset.
+ */
+export function claudeResetGrantKind(grant) {
+  if (grant?.gives_back_weekly === true) return 'fable'
+  const clears = Array.isArray(grant?.clears) ? grant.clears.filter((item) => CLAIM_WINDOWS.has(item)) : []
+  if (clears.includes('seven_day_overage_included') && !clears.includes('seven_day')) return 'fable'
+  if (GRANT_TYPES.has(grant?.type)) return grant.type
+  const session = clears.includes('five_hour')
+  const other = clears.some((item) => item !== 'five_hour')
+  return session && !other ? 'session' : other && !session ? 'weekly' : 'full'
 }
 
 function sha256(value) {
@@ -103,7 +138,8 @@ function requiresLimit(grant) {
 function held(grant, now) {
   if (!grant || typeof grant !== 'object') return false
   if (!GRANT_ID.test(String(grant.id || ''))) return false
-  if (!Array.isArray(grant.clears) || grant.clears.length === 0) return false
+  if (!Array.isArray(grant.clears)) return false
+  if (grant.clears.length === 0 && grant.gives_back_weekly !== true) return false
   const left = grant.resets_left
   if (typeof left !== 'number' || !Number.isInteger(left) || left <= 0) return false
   if (grant.paused === true) return false
@@ -121,33 +157,54 @@ export function claudeResetGrantRedeemable(block, grant, now = Date.now()) {
   return (
     block.eligible === true &&
     grant.usable_now === true &&
-    grant.id === block.next_grant_id &&
     (!requiresLimit(grant) || block.at_limit === true) &&
     (!Array.isArray(grant.blocking) || grant.blocking.length === 0) &&
     (cooldown == null || !(now < cooldown))
   )
 }
 
-export function projectClaudeResetCredits(block, now = Date.now()) {
+function cardState(block, grant, now, cooling) {
+  if (claudeResetGrantRedeemable(block, grant, now)) return 'ready'
+  // A reset just spent puts the account in a short cooldown; the other cards are still held.
+  const blocked = Array.isArray(grant.blocking) && grant.blocking.length > 0
+  if (cooling && block.eligible === true && !blocked) return 'cooldown'
+  return 'unavailable'
+}
+
+function byExpiry(a, b) {
+  const left = a.expires_at ? Date.parse(a.expires_at) : Number.POSITIVE_INFINITY
+  const right = b.expires_at ? Date.parse(b.expires_at) : Number.POSITIVE_INFINITY
+  return left - right
+}
+
+export function projectClaudeResetCredits(block, now = Date.now(), vmId = '') {
   const credits = []
   const out = {
     eligible: false,
     available_count: 0,
+    held_count: 0,
     credits,
     fetched_at: iso(now),
   }
   if (!block) return out
   out.eligible = block.eligible === true
   const cooldown = timeOf(block.cooldown_until)
-  if (cooldown != null && !Number.isNaN(cooldown) && now < cooldown) out.cooldown_until = iso(cooldown)
+  const cooling = cooldown != null && !Number.isNaN(cooldown) && now < cooldown
+  if (cooling) out.cooldown_until = iso(cooldown)
   const weekly = timeOf(block.weekly_resets_at)
   if (weekly != null && !Number.isNaN(weekly)) out.weekly_resets_at = iso(weekly)
   const grantIds = new Set((Array.isArray(block.grants) ? block.grants : []).map((grant) => grant?.id))
   let available = 0
+  let shown = 0
   for (const grant of Array.isArray(block.grants) ? block.grants : []) {
     if (!held(grant, now)) continue
-    const redeemable = claudeResetGrantRedeemable(block, grant, now)
+    const state = cardState(block, grant, now, cooling)
+    const redeemable = state === 'ready'
     const credit = {
+      ...(vmId ? { ref: claudeResetCardRef(vmId, grant.id) } : {}),
+      kind: claudeResetGrantKind(grant),
+      state,
+      gives_back_weekly: grant.gives_back_weekly === true,
       label: publicLabel(grant, grantIds),
       resets_left: grant.resets_left,
       clears: knownWindows(grant.clears),
@@ -162,8 +219,11 @@ export function projectClaudeResetCredits(block, now = Date.now()) {
     if (ends != null && !Number.isNaN(ends)) credit.expires_at = iso(ends)
     credits.push(credit)
     if (redeemable) available += grant.resets_left
+    if (state !== 'unavailable') shown += grant.resets_left
   }
+  credits.sort(byExpiry)
   out.available_count = available
+  out.held_count = shown
   return out
 }
 
@@ -364,6 +424,7 @@ function publicOutcome(outcome) {
     outcome: outcome.outcome,
     replayed: outcome.replayed === true,
   }
+  if (CARD_KINDS.has(outcome.kind)) out.kind = outcome.kind
   if (outcome.reason) out.reason = outcome.reason
   if (Array.isArray(outcome.cleared) && outcome.cleared.length) out.cleared = outcome.cleared
   if (outcome.cooldown_until) out.cooldown_until = outcome.cooldown_until
@@ -405,12 +466,20 @@ async function claim(transport, exec, org, grantId, operation) {
   return unknown
 }
 
-function pickGrant(block, now) {
+function pickGrant(block, now, vmId, card) {
   if (!block || !Array.isArray(block.grants)) return null
-  return (
-    block.grants.find((grant) => grant?.id === block.next_grant_id && claudeResetGrantRedeemable(block, grant, now)) ||
-    null
-  )
+  const chosen = card
+    ? (grant) => held(grant, now) && claudeResetCardRef(vmId, grant.id) === card
+    : (grant) => grant?.id === block.next_grant_id
+  return block.grants.find((grant) => chosen(grant) && claudeResetGrantRedeemable(block, grant, now)) || null
+}
+
+function normalizeCard(raw) {
+  if (raw == null || raw === '') return { card: '' }
+  if (typeof raw !== 'string' || !CARD_REF.test(raw)) {
+    return { error: fail('CLAUDE_RESET_CARD_INVALID', '重置卡标识无效', 400) }
+  }
+  return { card: raw }
 }
 
 function fenceBlocks(fence, now) {
@@ -449,7 +518,12 @@ function persistedCredits(view) {
   return {
     eligible: view.eligible === true,
     available_count: Math.max(0, Number(view.available_count) || 0),
+    held_count: Math.max(0, Number(view.held_count) || 0),
     credits: (Array.isArray(view.credits) ? view.credits : []).map((credit) => ({
+      ...(CARD_REF.test(String(credit.ref || '')) ? { ref: credit.ref } : {}),
+      kind: CARD_KINDS.has(credit.kind) ? credit.kind : 'full',
+      state: ['ready', 'cooldown'].includes(credit.state) ? credit.state : 'unavailable',
+      gives_back_weekly: credit.gives_back_weekly === true,
       label: String(credit.label || ''),
       resets_left: Math.max(0, Number(credit.resets_left) || 0),
       ...(credit.starts_at ? { starts_at: credit.starts_at } : {}),
@@ -476,7 +550,7 @@ export async function queryClaudeResetCredits({
   if (!account.ok) return account
   const fetched = await fetchBlock(transport, account.exec)
   if (!fetched.ok) return fetched
-  const credits = projectClaudeResetCredits(fetched.block, now())
+  const credits = projectClaudeResetCredits(fetched.block, now(), vmId)
   await persistCredits(projectRoot, vmId, credits)
   return { ok: true, claude_reset_credits: credits }
 }
@@ -485,11 +559,14 @@ export async function redeemClaudeResetCredit({
   projectRoot,
   vmId,
   idempotencyKey,
+  card,
   transport = defaultTransport,
   now = () => Date.now(),
 } = {}) {
   const normalized = normalizeKey(idempotencyKey)
   if (normalized.error) return normalized.error
+  const picked = normalizeCard(card)
+  if (picked.error) return picked.error
   const account = loadAccount(projectRoot, vmId)
   if (!account.ok) return account
   const operation = claudeResetOperationId(vmId, normalized.key)
@@ -503,6 +580,7 @@ export async function redeemClaudeResetCredit({
       projectRoot,
       vmId,
       operation,
+      card: picked.card,
       exec: account.exec,
       transport,
       now,
@@ -511,6 +589,7 @@ export async function redeemClaudeResetCredit({
     const saved = await mutateState(projectRoot, async (state) => {
       state.operations[operation] = {
         outcome: outcome.outcome,
+        ...(outcome.kind ? { kind: outcome.kind } : {}),
         ...(outcome.reason ? { reason: outcome.reason } : {}),
         ...(outcome.cleared ? { cleared: outcome.cleared } : {}),
         ...(outcome.cooldown_until ? { cooldown_until: outcome.cooldown_until } : {}),
@@ -523,7 +602,7 @@ export async function redeemClaudeResetCredit({
   })
 }
 
-async function redeemOnce({ projectRoot, vmId, operation, exec, transport, now }) {
+async function redeemOnce({ projectRoot, vmId, operation, card, exec, transport, now }) {
   const orgResult = await fetchOrg(transport, exec)
   if (!orgResult.ok) return orgResult
   const orgKey = claudeResetOrgId(orgResult.org)
@@ -552,8 +631,13 @@ async function redeemOnce({ projectRoot, vmId, operation, exec, transport, now }
     if (blocked) return blocked
     const status = await fetchBlock(transport, exec)
     if (!status.ok) return status
-    const grant = pickGrant(status.block, now())
-    if (!grant) return fail('CLAUDE_RESET_NOT_AVAILABLE', '当前没有可兑换的限额重置', 409)
+    const grant = pickGrant(status.block, now(), vmId, card)
+    if (!grant) {
+      return card
+        ? fail('CLAUDE_RESET_NOT_AVAILABLE', '这张重置卡现在不能用，请先点限额查询刷新', 409)
+        : fail('CLAUDE_RESET_NOT_AVAILABLE', '当前没有可兑换的限额重置', 409)
+    }
+    const kind = claudeResetGrantKind(grant)
     const marked = await writeFence(projectRoot, orgKey, {
       operation,
       outcome: 'unknown',
@@ -562,6 +646,7 @@ async function redeemOnce({ projectRoot, vmId, operation, exec, transport, now }
     })
     if (marked?.ok === false) return marked
     const claimed = await claim(transport, exec, orgResult.org, grant.id, operation)
+    claimed.kind = kind
     const settled = await writeFence(projectRoot, orgKey, {
       operation,
       outcome: claimed.outcome,
@@ -573,7 +658,7 @@ async function redeemOnce({ projectRoot, vmId, operation, exec, transport, now }
     if (claimed.outcome !== 'unknown') {
       const fresh = await fetchBlock(transport, exec)
       if (fresh.ok) {
-        claimed.credits = projectClaudeResetCredits(fresh.block, now())
+        claimed.credits = projectClaudeResetCredits(fresh.block, now(), vmId)
         await persistCredits(projectRoot, vmId, claimed.credits)
       }
     }

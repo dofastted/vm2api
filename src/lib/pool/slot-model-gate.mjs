@@ -106,6 +106,7 @@ function quotaView(vm, account) {
       : vm?.claude?.account_tier
         ? vm.claude.account_tier_source
         : vm?.account_tier_source,
+    rate_limit_tier: vm?.claude?.rate_limit_tier || vm?.rate_limit_tier || unified.rate_limit_tier || null,
     usage_has_fable: unified.usage_has_fable ?? vm?.usage_has_fable ?? null,
   }
 }
@@ -128,6 +129,7 @@ export function resolveSlotTier(vm, account = null) {
     {
       has_token: true,
       account_tier: quota.account_tier,
+      rate_limit_tier: quota.rate_limit_tier,
       fable: quota.fable,
       utilization_7d_oi: quota.utilization_7d_oi,
       reset_7d_oi: quota.reset_7d_oi,

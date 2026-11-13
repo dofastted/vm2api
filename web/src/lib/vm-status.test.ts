@@ -275,6 +275,50 @@ describe('claudeTier follows OAuth subscription metadata', () => {
     ).toBe('unknown')
   })
 
+  it('corrects imported default Pro using the Max rate-limit tier', () => {
+    expect(
+      claudeTier(
+        liveVm({
+          subscription_type: 'pro',
+          rate_limit_tier: 'default_claude_max_5x',
+        })
+      )
+    ).toMatchObject({ key: 'max', label: 'Max 5x' })
+    expect(
+      claudeTier(
+        liveVm({
+          subscription_type: 'pro',
+          rate_limit_tier: 'default_claude_ai',
+        })
+      ).key
+    ).toBe('pro')
+  })
+
+  it('trusts verified profile ahead of conflicting subscription and rate metadata', () => {
+    expect(
+      claudeTier(
+        liveVm({
+          account_tier: 'pro',
+          account_tier_source: 'profile',
+          subscription_type: 'max',
+          rate_limit_tier: 'default_claude_max_20x',
+          usage_has_fable: true,
+        })
+      )
+    ).toMatchObject({ key: 'pro', label: 'Pro' })
+    expect(
+      claudeTier(
+        liveVm({
+          account_tier: 'max',
+          account_tier_source: 'profile',
+          subscription_type: 'pro',
+          rate_limit_tier: 'default_claude_ai',
+          usage_has_fable: false,
+        })
+      )
+    ).toMatchObject({ key: 'max', label: 'Max' })
+  })
+
   it('keeps Max when Fable is unavailable and exposes the official multiplier', () => {
     expect(
       claudeTier(
