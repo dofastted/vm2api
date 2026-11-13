@@ -199,14 +199,12 @@ export function MoneyCard({
 /** Fable 配额小卡片。`usedPct` 非空画进度条，为空画徽标。对齐 index.html 的 `vdFableStat`/`fableCard`。 */
 export function FableCard({
   vm,
-  tierKey,
   dashRouting,
 }: {
   vm: Vm
-  tierKey: string
   dashRouting: Dashboard | undefined
 }) {
-  const info = fableCardInfo(vm, tierKey, fableCap(dashRouting))
+  const info = fableCardInfo(vm, fableCap(dashRouting))
   return (
     <Card>
       <CardHeader className='pb-2'>

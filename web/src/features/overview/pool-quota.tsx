@@ -135,7 +135,7 @@ function WindowCell({
         </>
       ) : (
         <div className='mt-0.5 text-[11px] text-muted-foreground'>
-          无 Fable 凭证（仅 Max 档计入）
+          无 Fable 窗口数据
         </div>
       )}
     </div>
@@ -146,7 +146,7 @@ function WindowCell({
  * 号池三窗口（5h / 7d / Fable）总额度。容量按「有效凭证」全量计
  * （每张 = 1 个满窗口，含调度关 / 冷却 / 限制中——额度真实存在），
  * 消耗逐凭证相加；无效 / 过期 / revoke 不计入。口径与 KPI「可用账号」
- * 同源（都走 accountUsable，凭证有效=可用）；仅 Fable 窗容量更小——只计 Max 档。
+ * 同源（都走 accountUsable，凭证有效=可用）；Fable 按套餐窗口或上游返回的窗口计入。
  * 竖条一凭证一段、按已用降序——风险集中在最左侧，值班扫一眼即得。
  */
 export function PoolQuota({ vms }: { vms: Vm[] }) {
