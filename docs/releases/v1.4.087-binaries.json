@@ -2,7 +2,7 @@
   "schema": 1,
   "application_release": "v1.4.087",
   "integrated_cloud_main": "dd0ce1324b00d479fb36f8cccaa39b6a9a622885",
-  "code_verification_commit": "73ea67ecdae2542c5f15bd9a8fa37a18cf36631b",
+  "application_code_snapshot": "73ea67ecdae2542c5f15bd9a8fa37a18cf36631b",
   "payload_release": "payload-2026.11.14-cache-ttl",
   "payload_paths": 23,
   "unique_payload_assets": 22,
