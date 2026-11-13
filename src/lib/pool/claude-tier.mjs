@@ -29,6 +29,20 @@ export function hasClaudeFableUsage(vm = {}, quota = {}) {
 }
 
 /**
+ * `default_claude_ai` is the OAuth rate-limit tier of a Pro (or Free) plan; Max plans
+ * carry `default_claude_max_5x/20x`. Pro plans now list Fable in /usage as well, so
+ * Fable usage must not turn an account with this tier into a Max.
+ */
+export function isProRateLimitTier(tier) {
+  return String(tier || '').toLowerCase() === 'default_claude_ai'
+}
+
+/** A tier guessed from usage (no profile): Max is vetoed by a Pro rate-limit tier. */
+export function guardUsageTier(tier, rateLimitTier) {
+  return tier === 'max' && isProRateLimitTier(rateLimitTier) ? 'pro' : tier
+}
+
+/**
  * Claude-only: official /usage 有 Fable 模型或真实 7d_oi=Max。
  * 落盘 pro / Fable hop 拒绝不能盖掉 usage 里的 Fable。
  * Shared by the panel and the pool picker so they cannot drift.
@@ -41,6 +55,8 @@ export function inferClaudeTier(vm = {}, quota = {}) {
   if (profile?.account_tier === 'max') return { key: 'max', label: 'Max' }
   const q = quotaView(vm, quota)
   if (q.usage_has_fable === false) return { key: 'pro', label: 'Pro' }
+  // Only vetoes Max; a Max rate-limit tier does not promote the scheduling tier.
+  if (isProRateLimitTier(vm.rate_limit_tier || quota.rate_limit_tier)) return { key: 'pro', label: 'Pro' }
   const stored = String(vm.account_tier || quota.account_tier || '').toLowerCase()
   if (hasClaudeFableUsage(vm, quota) || stored === 'max') {
     return { key: 'max', label: 'Max' }

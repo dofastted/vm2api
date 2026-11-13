@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Claude 调度档：账号自己的 OAuth 速率档是 `default_claude_ai`（Pro/Free）时，/usage 里的 Fable 不再把它推成 Max。Pro 套餐的 /usage 现在也列出 Fable（`7d_oi`）窗口；profile 没读到时，`inferClaudeTier`（「限额查询」第三分支会按 `usage` 来源写回）和官方登录流程的 `/usage` 推断都会把 Pro 号写成 Max，`usage` 来源还会覆盖原来 profile 核实的套餐并改写槽内 `subscriptionType`，随后按 Max 的并发档和 Fable 闸门调度。官方 profile 仍然优先；速率档是 Max 的不会因此被升成 Max（调度档与订阅分开的约定不变）。
+
 ## 1.4.081 — 2026-11-13 · CRAG KVM 适配版
 
 - 支持 Linux amd64 本机与集群 KVM 槽部署 CRAG V2，移除集群启动和内核同步入口的 KVM 限制。
