@@ -47,10 +47,9 @@ const cases = [
     setting: '1h',
   },
   {
-    name: 'caller marker without TTL takes the 1h setting',
+    name: 'caller marker without TTL retains implicit 5m under the 1h setting',
     system: [{ type: 'text', text: 'Caller policy', cache_control: { type: 'ephemeral' } }],
-    expectedSystem: [{ type: 'text', text: 'Caller policy', cache_control: { type: 'ephemeral', ttl: '1h' } }],
-    usage: cacheUsage(0, 1000),
+    usage: cacheUsage(1000, 0),
     setting: '1h',
   },
   {
