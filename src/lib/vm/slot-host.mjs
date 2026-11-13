@@ -96,6 +96,7 @@ import { nodeEgressProxyUrl } from '../cluster/node-egress-socks.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { stopCodexKernel } from '../transport/codex-kernel-supervisor.mjs'
 import { readLocalSlotSeedFiles } from './slot-seed.mjs'
+import { queueSlotPlanSync } from '../oauth/slot-plan-sync.mjs'
 
 const noop = async () => ({ skipped: true })
 
@@ -265,7 +266,12 @@ function nodeHost(nodeId) {
     },
     queueSyncRun: (vm, slotDir) => queueSlotPush(vm, slotDir, ['run']),
     onImport: (vm, slotDir) => pushSlotCredentials(vm, slotDir),
-    afterRefresh: (vm, slotDir) => pullSlotCredentials(vm, slotDir),
+    afterRefresh: async (vm, slotDir) => {
+      const pulled = await pullSlotCredentials(vm, slotDir)
+      // The pull just replaced the local copy with the slot's: an import-default plan comes back here.
+      queueSlotPlanSync(vm, slotDir, slotHost(vm))
+      return pulled
+    },
   }
 }
 

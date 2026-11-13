@@ -28,6 +28,8 @@ import {
 } from './lib/oauth/credential-refresh-monitor.mjs'
 import { createKernelWatchdog, normalizeKernelWatchdogConfig } from './lib/transport/kernel-watchdog.mjs'
 import { ensureSlotSubscriptionType } from './lib/oauth/oauth-credentials.mjs'
+import { planToSync, queueSlotPlanSync } from './lib/oauth/slot-plan-sync.mjs'
+import { slotHost } from './lib/vm/slot-host.mjs'
 import { createCliNodeGuard } from './lib/vm/cli-node-guard.mjs'
 
 import { createSlotBridgeHealer, powerOnSlot, reviveDownSlots } from './lib/vm/slot-recovery.mjs'
@@ -83,7 +85,7 @@ import { BackupService } from './lib/admin/backup-service.mjs'
 import { ClusterNodesRepo } from './lib/db/repos/cluster-nodes-repo.mjs'
 import { ClusterManager } from './lib/cluster/cluster-manager.mjs'
 import { createClusterRoutes } from './lib/cluster/cluster-routes.mjs'
-import { bindPlacement, nodeImageBuildRunning } from './lib/cluster/placement.mjs'
+import { bindPlacement, isNativeNodeVm, nodeImageBuildRunning, vmNodeId } from './lib/cluster/placement.mjs'
 import { ClusterError } from './lib/cluster/ssh-link.mjs'
 import { nodeEgressProxyUrl, startNodeEgressSocks } from './lib/cluster/node-egress-socks.mjs'
 import { createSlotShell } from './lib/vm/slot-shell.mjs'
@@ -946,6 +948,23 @@ const slotShell = createSlotShell({
   importOauth: commitImportedOauth,
   routing: () => routingConfig,
 })
+// A node slot's own credential wins at the next pull: compare before the loop below corrects the local copy.
+const nodePlanSyncs = []
+for (const vm of listVms(cfg.paths.project)) {
+  if (isCodexVm(vm) || !vmNodeId(vm) || isNativeNodeVm(vm)) continue
+  const slotDir = path.join(cfg.paths.project, 'vms', vm.id)
+  const plan = planToSync(vm, slotDir)
+  if (plan) nodePlanSyncs.push({ id: vm.id, slotDir, plan })
+}
+if (nodePlanSyncs.length) {
+  // After the cluster links are up; each slot is fixed once, under its own credential lock.
+  setTimeout(() => {
+    for (const { id, slotDir, plan } of nodePlanSyncs) {
+      const record = getVm(cfg.paths.project, id)
+      if (record) queueSlotPlanSync(record, slotDir, slotHost(record), { plan })
+    }
+  }, 60_000).unref()
+}
 for (const vm of listVms(cfg.paths.project)) {
   if (isCodexVm(vm)) continue
   try {

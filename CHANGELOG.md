@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- 扩展节点槽的凭据 `subscriptionType` 与官方 profile 核实的套餐不一致时，在槽里（KVM 进 guest）以 worker 同一用户、在 `credentials.json.lock` 的同一把 flock 下只改这个字段（`kinGeneration` 照 worker 规则递增、临时文件 fsync 后原子替换），本地镜像随即跟上。触发：每次从节点拉回凭据之后，以及控制面启动时（在本地纠正之前比对，延迟 60 秒）。以前导入时默认写入的 `pro` 会被 worker 每次续期原样保留，控制面只改本地镜像，下次拉回又被节点那份盖回；宿主侧加锁也挡不住 guest 里的 worker（QEMU 9p 不转发锁）。
+
 ## 1.4.081 — 2026-11-13 · CRAG KVM 适配版
 
 - 支持 Linux amd64 本机与集群 KVM 槽部署 CRAG V2，移除集群启动和内核同步入口的 KVM 限制。
