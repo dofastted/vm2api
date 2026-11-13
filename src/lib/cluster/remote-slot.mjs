@@ -1023,16 +1023,6 @@ export async function refreshClusterSlotPayloads(
   for (const vm of vms || []) {
     // Codex inference is the host Codex kernel; this update targets Claude CLI payloads.
     if (isCodexVm(vm)) continue
-    if (isKvmRuntime(vm) && (resolveKernelDataplane(vm, routing || {}) === 'crag' || vm?.dataplane === 'crag')) {
-      items.push({
-        id: vm.id,
-        ok: false,
-        code: 'remote_unsupported',
-        error: 'crag 数据面暂不支持 KVM 槽',
-        kernel_changed: false,
-      })
-      continue
-    }
     const nodeId = vmNodeId(vm)
     const kernel = vm.kernel && OS_CATALOG[vm.kernel] ? vm.kernel : 'ubuntu-24.04'
     const kind = runtimeKind(vm)
@@ -1058,9 +1048,6 @@ export async function refreshClusterSlotPayloads(
 }
 
 async function prepare(vm, projectRoot, routing, { pinnedImageId = null } = {}) {
-  if (isKvmRuntime(vm) && resolveKernelDataplane(vm, routing || {}) === 'crag') {
-    return { fail: { ok: false, code: 'remote_unsupported', error: 'crag 数据面暂不支持 KVM 槽' } }
-  }
   vm.kernel = vm.kernel && OS_CATALOG[vm.kernel] ? vm.kernel : 'ubuntu-24.04'
   vm.timezone = normalizeTimezone(vm.timezone)
   vm.locale = vm.locale || STANDARD_LOCALE

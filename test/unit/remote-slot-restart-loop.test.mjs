@@ -17,6 +17,38 @@ const start = source.slice(
   source.indexOf('/** Remote twin of reloadSlotWorker'),
 )
 
+test('remote CRAG KVM preparation resolves guest and egress images instead of rejecting placement', async () => {
+  const prepare = source.slice(source.indexOf('async function prepare('), source.indexOf('function runtimeLabelOf('))
+  const images = []
+  const session = { host: {}, docker: {} }
+  const target = { id: 'vm-kvm', node_id: 'node-a', dataplane: 'crag', runtime: { type: 'kvm' } }
+  const run = vmContext.runInNewContext(`${prepare}; prepare`, {
+    isKvmRuntime: () => true,
+    resolveKernelDataplane: () => 'crag',
+    OS_CATALOG: { 'ubuntu-24.04': {} },
+    normalizeTimezone: (value) => value || 'UTC',
+    STANDARD_LOCALE: 'en_US.UTF-8',
+    vmNodeId: (vm) => vm.node_id,
+    nodeSession: async () => session,
+    runtimeKind: () => 'kvm',
+    ensureNodeSlotImage: async (_session, _node, _root, kernel, kind) => {
+      images.push([kernel, kind])
+      return { ref: `image-${kind}` }
+    },
+    remoteSlotOwner: () => ({ uid: 1000, gid: 1000 }),
+    remoteSlotDir: () => '/remote/vms/vm-kvm',
+    path: { join: (...parts) => parts.join('/') },
+  })
+  const result = await run(target, '/fixture', {})
+  assert.equal(result.fail, undefined)
+  assert.equal(result.image, 'image-kvm')
+  assert.equal(result.egressImage, 'image-docker')
+  assert.deepEqual(images, [
+    ['ubuntu-24.04', 'kvm'],
+    ['ubuntu-24.04', 'docker'],
+  ])
+})
+
 function cragReadyContainer(base) {
   return {
     ...base,
