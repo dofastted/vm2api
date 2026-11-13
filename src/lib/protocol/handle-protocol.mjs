@@ -1757,6 +1757,14 @@ export function createHandleProtocol(deps) {
                 rewriteTools: routingNow?.compatibility?.tool_name_rewrite !== false,
               })
               hopBody = scrubbed.body
+              if (
+                caps?.includes('generation_controls_v3') &&
+                hopBody.cache_ttl == null &&
+                hopBody.crag_options?.cache_ttl == null
+              ) {
+                // Carry the resolved session/menu default separately from usage accounting.
+                hopBody.cache_ttl = requestedCacheTtl
+              }
               preserveCacheBreakpoints = true
               cacheTtl = null
               personaHideTokens = 0

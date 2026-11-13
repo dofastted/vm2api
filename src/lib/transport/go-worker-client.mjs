@@ -11,6 +11,7 @@ import { pinThreadBetas, rememberThreadTurn } from '../protocol/thread-betas.mjs
 import { applyThinkingDisplay, ensureOfficialPrintThinking, thinkingDisplayMode } from '../protocol/thinking.mjs'
 import { modelDirectiveForCrag } from '../protocol/model-policy.mjs'
 import { capOutboundBody } from '../protocol/outbound-snapshot.mjs'
+import { cacheTtlFromRouting } from '../protocol/cache-ttl.mjs'
 import { ccEntrypointFromRouting, stripSubagentBilling } from '../identity/crs-persona.mjs'
 import { sealClaudeCodeCch } from '../identity/cch.mjs'
 import { credentialModeFromOauth } from '../oauth/credential-mode.mjs'
@@ -671,6 +672,10 @@ async function workerEnvelope({
   const gated = redaction ? masked.body : prepared.gated
   const outgoingCwd = redaction ? validateCallerCwd(masked.caller_cwd) : cwd
   const finalized = sealPreparedPayload(prepared, gated)
+  const nativeV3 =
+    nativeCragRequest(exec, cragPrint) && exec?.workerStatus?.capabilities?.includes('generation_controls_v3')
+  // Resolve execution defaults even when cacheTtl is null for mixed-TTL accounting.
+  const defaultCacheTtl = cacheTtl ?? (nativeV3 && routing != null ? cacheTtlFromRouting(routing) : null)
   const envelope = {
     ...(requestContext ? { request_context: requestContext } : {}),
     ...(typeof outgoingCwd === 'string' ? { caller_cwd: outgoingCwd } : {}),
@@ -679,7 +684,7 @@ async function workerEnvelope({
     stream: !!stream,
     delivery_mode: deliveryMode || 'realtime',
     preserve_cache_breakpoints: preserveCacheBreakpoints == null ? cacheTtl == null : preserveCacheBreakpoints === true,
-    cache_ttl: cacheTtl == null ? null : String(cacheTtl),
+    cache_ttl: defaultCacheTtl == null ? null : String(defaultCacheTtl),
   }
   dumpSessionEnvelope(envelope)
   return { envelope, thread: finalized.thread, redaction }
