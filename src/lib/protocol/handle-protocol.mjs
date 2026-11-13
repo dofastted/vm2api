@@ -2120,6 +2120,17 @@ export function createHandleProtocol(deps) {
           message_id: provider?.message_id ?? null,
           stop_reason: provider?.stop_reason ?? null,
           usage_complete: provider?.usage_complete === true,
+          ...(provider?.schema_version === 2
+            ? {
+                provider_complete: provider.provider_complete,
+                handoff_complete: provider.handoff_complete ?? null,
+                delivery_complete: provider.delivery_complete ?? null,
+                response_valid: provider.response_valid ?? null,
+                source: provider.source ?? null,
+                http_status: provider.http_status ?? null,
+                public_status: provider.public_status ?? null,
+              }
+            : {}),
         },
       }
     }
