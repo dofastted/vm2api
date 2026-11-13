@@ -468,6 +468,18 @@ export function WrapSamplePage() {
                     const result = job?.results[vm.id]
                     const active = installing && job?.activeId === vm.id
                     const macNative = vm.node_platform === 'darwin'
+                    const kvm = ['kvm', 'qemu', 'libvirt'].includes(
+                      String(vm.runtime?.type || vm.runtime_type || '')
+                        .trim()
+                        .toLowerCase()
+                    )
+                    const repairCrag =
+                      kvm &&
+                      !macNative &&
+                      !(
+                        installed?.kernel === 'crag' &&
+                        installed.version?.trim()
+                      )
                     const currentKernel =
                       vm.resolved_dataplane === 'crag' &&
                       vm.resolved_crag_kernel_version === 'v2'
@@ -511,7 +523,13 @@ export function WrapSamplePage() {
                             installed.kernel === currentKernel ? (
                               <span>{installed.version}</span>
                             ) : null}
+                            {kvm ? <Badge variant='outline'>KVM</Badge> : null}
                           </div>
+                          {repairCrag ? (
+                            <p className='mt-2 text-sm text-muted-foreground'>
+                              未记录 CRAG 版本，可重装补齐内核和配置。
+                            </p>
+                          ) : null}
                           {result ? (
                             <p
                               className={cn(
@@ -622,8 +640,23 @@ export function WrapSamplePage() {
                         </div>
                         <div
                           role='cell'
-                          className='flex items-center justify-end'
+                          className='flex flex-wrap items-center justify-end gap-2'
                         >
+                          {repairCrag ? (
+                            <Button
+                              variant='outline'
+                              className='h-11 w-full sm:w-auto'
+                              disabled={!canEdit || busy}
+                              loading={active}
+                              aria-label={`重装 ${vm.name || vm.id} 的 CRAG 并重启`}
+                              onClick={() =>
+                                requestInstall([{ id: vm.id, kernel: 'crag' }])
+                              }
+                            >
+                              <RefreshCw aria-hidden='true' />
+                              重装 CRAG
+                            </Button>
+                          ) : null}
                           <Button
                             variant='outline'
                             className='h-11 w-full sm:w-auto'
