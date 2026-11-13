@@ -184,7 +184,10 @@ export function isRetryableSameCodexAccount(
   if (status === 408) return true
   if (status === 500 || status === 502 || status === 503 || status === 504) {
     return (
-      code === '' || /server_error|provider_error|upstream_error|overloaded_error|internal_error|transport/i.test(code)
+      code === '' ||
+      /server_error|provider_error|upstream_error|overloaded_error|internal_error|server_is_overloaded|transport/i.test(
+        code,
+      )
     )
   }
   return false

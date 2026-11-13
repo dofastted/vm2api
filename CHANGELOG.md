@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Codex 同账号瞬时重试：未提交响应时，将上游结构化错误码 `server_is_overloaded`（500/502/503/504）纳入与现有 5xx 瞬态码相同的判定，不改动重试次数与延迟配置。（#982）
+
 ## 1.4.081 — 2026-11-13 · CRAG KVM 适配版
 
 - 支持 Linux amd64 本机与集群 KVM 槽部署 CRAG V2，移除集群启动和内核同步入口的 KVM 限制。
