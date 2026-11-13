@@ -13,13 +13,17 @@ import { cragV2PackageRoot, stageCragV2Tree, verifyCragV2Tree } from '../src/lib
 import { rustKernelHealth } from '../src/lib/transport/rust-kernel-client.mjs'
 import { slotExec } from '../src/lib/vm/slot-runtime.mjs'
 import { slotExecArgv } from '../src/lib/vm/slot-exec.mjs'
+import { isKvmRuntime } from '../src/lib/vm/runtime-kind.mjs'
 
 const execute = promisify(execFile)
 
 export async function runningCragHashes(vm, { execute: run = execute } = {}) {
   const command =
     'for p in /proc/[0-9]*/exe; do case "$(readlink "$p" 2>/dev/null)" in *memfd:crag-v2-core*) sha256sum "$p" || exit 1;; esac; done'
-  const { stdout } = await run('docker', slotExecArgv(vm, ['sh', '-c', command], { user: '0' }), {
+  // Guest root can inspect memfds across guest users. A capability-dropped Docker
+  // root cannot inspect kincli's processes, so keep that container's default user.
+  const argv = slotExecArgv(vm, ['sh', '-c', command], isKvmRuntime(vm) ? { user: '0' } : {})
+  const { stdout } = await run('docker', argv, {
     timeout: 10_000,
     maxBuffer: 64 * 1024,
   })

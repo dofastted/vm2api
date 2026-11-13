@@ -141,30 +141,34 @@ test('local KVM CRAG update replaces active and stopped packages through the man
   assert.equal(f.calls.at(-1).endpoint, '/api/panel/vms/schedule/resume')
 })
 
-test('running CRAG hashes are read inside the KVM guest with a bounded root probe', async () => {
-  const calls = []
-  const hashes = await runningCragHashes(
-    { id: 'vm-probe', runtime: { type: 'kvm', container: 'custom-runner' } },
-    {
-      execute: async (binary, argv, options) => {
-        calls.push({ binary, argv, options })
-        return { stdout: `${'a'.repeat(64)}  /proc/42/exe\n` }
+for (const type of ['docker', 'kvm']) {
+  test(`running CRAG hashes use the ${type} execution boundary with a bounded probe`, async () => {
+    const calls = []
+    const hashes = await runningCragHashes(
+      { id: 'vm-probe', runtime: { type, container: 'custom-runner' } },
+      {
+        execute: async (binary, argv, options) => {
+          calls.push({ binary, argv, options })
+          return { stdout: `${'a'.repeat(64)}  /proc/42/exe\n` }
+        },
       },
-    },
-  )
-  assert.deepEqual(hashes, ['a'.repeat(64)])
-  assert.equal(calls[0].binary, 'docker')
-  assert.deepEqual(calls[0].argv.slice(0, 7), [
-    'exec',
-    'custom-runner',
-    '/usr/local/bin/kin-guest-exec',
-    '-u',
-    '0',
-    '--',
-    'sh',
-  ])
-  assert.equal(calls[0].options.timeout, 10_000)
-})
+    )
+    assert.deepEqual(hashes, ['a'.repeat(64)])
+    assert.equal(calls[0].binary, 'docker')
+    if (type === 'kvm')
+      assert.deepEqual(calls[0].argv.slice(0, 7), [
+        'exec',
+        'custom-runner',
+        '/usr/local/bin/kin-guest-exec',
+        '-u',
+        '0',
+        '--',
+        'sh',
+      ])
+    else assert.deepEqual(calls[0].argv.slice(0, 4), ['exec', 'custom-runner', 'sh', '-c'])
+    assert.equal(calls[0].options.timeout, 10_000)
+  })
+}
 
 test('unsupported cluster CRAG fails before downloading and another updater cannot remove its lock', async (t) => {
   const f = fixture(t)
