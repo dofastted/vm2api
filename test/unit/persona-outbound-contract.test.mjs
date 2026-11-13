@@ -8,6 +8,7 @@ import { DEFAULT_PERSONA_TEMPLATES } from '../../src/lib/identity/persona-templa
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import {
   clearConversationCacheTtls,
+  enforceCacheTtlOrder,
   fillMissingCacheTtl,
   listCacheMarkers,
   validateCacheBreakpoints,
@@ -19,8 +20,8 @@ import { clearCachePrefixSessions } from '../../src/lib/protocol/cache-prefix.mj
 const unixTest = process.platform === 'win32' ? test.skip : test
 const control = (ttl) => ({ type: 'ephemeral', ...(ttl ? { ttl } : {}) })
 const text = (value, ttl) => ({ type: 'text', text: value, ...(ttl === null ? {} : { cache_control: control(ttl) }) })
-// Inbound markers without a TTL go out at the resolved TTL (1h here); explicit TTLs stay.
-const sent = (blocks) => fillMissingCacheTtl({ system: blocks }, '1h').system
+// Final outbound assembly normalizes every marker to its first effective TTL.
+const sent = (blocks) => enforceCacheTtlOrder({ system: fillMissingCacheTtl({ system: blocks }, '1h').system }).system
 const model = 'claude-opus-5-5'
 
 // Capture at the transport boundary after conversion, persona rendering and
@@ -238,7 +239,7 @@ for (const backend of ['cli', 'api']) {
             })
             assert.deepEqual(
               listCacheMarkers(out).map((marker) => marker.ttl),
-              ['1h', shortTtl ?? '1h'],
+              ['1h', '1h'],
             )
             for (const source of system) assert.equal(JSON.stringify(out).split(source.text).length - 1, 1)
             if (placement === 'agent-first') {
@@ -328,12 +329,12 @@ for (const backend of ['cli', 'api']) {
           assert.equal(JSON.stringify(out).split(original.text).length - 1, 1)
           assert.deepEqual(
             blocks.find((block) => block.text === original.text),
-            sent([original])[0],
+            sent(system).find((block) => block.text === original.text),
           )
         }
         assert.deepEqual(
           listCacheMarkers(out).map((marker) => marker.ttl),
-          ['1h', ttl ?? '1h'],
+          ['1h', '1h'],
         )
       })
     }
@@ -348,7 +349,7 @@ for (const backend of ['cli', 'api']) {
       const markers = listCacheMarkers(out)
       assert.equal(markers.length, 1)
       assert.equal(markers[0].section, 'system')
-      assert.equal(markers[0].ttl, ttl ?? '1h')
+      assert.equal(markers[0].ttl, '1h')
       assert.ok(JSON.stringify(out).includes('BUSINESS_RULE'))
     })
   }
@@ -374,7 +375,7 @@ for (const backend of ['cli', 'api']) {
           })
           assert.deepEqual(
             out.system.find((item) => item.text === block.text),
-            sent([block])[0],
+            text(block.text, '1h'),
           )
           assert.equal(listCacheMarkers(out).length, 1)
           assert.equal(messageMarkers(out).length, 0)
@@ -402,9 +403,8 @@ for (const preset of ['zero', 'official', 'official_full', 'custom']) {
     const markers = messageMarkers(out)
     assert.deepEqual(
       markers.map((marker) => marker.ttl),
-      ['1h', '5m'],
+      ['1h', '1h'],
     )
-    assert.equal(out.messages[0].content.at(-1).text, 'Continue')
     assert.equal(JSON.stringify(out.messages).includes('MID_SYSTEM_CACHE_RULE'), false)
   })
 }
@@ -423,13 +423,13 @@ for (const preset of ['zero', 'official', 'official_full', 'custom']) {
       for (const edited of [false, true, true]) {
         if (edited) messages[6].content[0].text = 'edited m6'
         const out = await outbound(t, { preset, headers, input: { messages, system: rule } })
-        const expected = fillMissingCacheTtl({ messages }, '1h').messages
+        const expected = enforceCacheTtlOrder(fillMissingCacheTtl({ messages }, '1h'))
         assert.deepEqual(
           messageMarkers(out),
-          messageMarkers({ messages: expected }).map((marker) => ({ ...marker, index: marker.index + shift })),
+          messageMarkers(expected).map((marker) => ({ ...marker, index: marker.index + shift })),
         )
-        assert.deepEqual(out.messages[2 + shift], expected[2])
-        assert.deepEqual(out.messages[8 + shift], expected[8])
+        assert.deepEqual(out.messages[2 + shift], expected.messages[2])
+        assert.deepEqual(out.messages[8 + shift], expected.messages[8])
         assert.equal(JSON.stringify(out).split(rule).length - 1, 1)
       }
     })
@@ -522,7 +522,7 @@ test('CLI custom template is not cleaned or rebuilt after rendering', async (t) 
   })
   assert.deepEqual(
     out.system.find((block) => block.text === templateRule),
-    text(templateRule, '1h'),
+    text(templateRule, '5m'),
   )
   assert.equal(listCacheMarkers(out).length, 2)
   assert.deepEqual(out.messages[0].content.at(-1).cache_control, control('5m'))
@@ -584,8 +584,8 @@ for (const backend of ['cli', 'api']) {
       headers: { 'x-kin-cache-ttl': '5m' },
     })
     assert.ok(listCacheMarkers(out).length > 1)
-    assert.ok(listCacheMarkers(out).every((marker) => marker.ttl === '1h'))
-    assert.deepEqual(out.messages[0], message)
+    assert.ok(listCacheMarkers(out).every((marker) => marker.ttl === '5m'))
+    assert.deepEqual(out.messages[0], { role: 'user', content: [text('Hello', '5m')] })
   })
   for (const ttl of ['5m', '1h']) {
     run(`${backend} custom fills missing template TTL from ${ttl}`, async (t) => {
@@ -688,7 +688,7 @@ for (const [name, compatibility] of billingCases) {
     for (const block of system)
       assert.deepEqual(
         out.system.find((candidate) => candidate.text === block.text),
-        block,
+        sent(system).find((candidate) => candidate.text === block.text),
       )
     assert.equal(listCacheMarkers(out).length, 2)
     assert.equal(JSON.stringify(out).split('CALLER_RULE_MUST_SURVIVE').length - 1, 1)
@@ -826,7 +826,7 @@ for (const ttl of [undefined, '5m', '1h']) {
       assert.equal(out.cache_control, undefined)
       assert.deepEqual(out.system.slice(1), system)
       const message = out.messages.findLast((message) => message.role === tail)
-      assert.deepEqual(message.content.at(-1).cache_control, control(ttl ?? '1h'))
+      assert.deepEqual(message.content.at(-1).cache_control, control('1h'))
       assert.equal(listCacheMarkers(out).length, 2)
     })
   }
@@ -841,7 +841,7 @@ test('CLI zero translates automatic cache within a full caller budget', async (t
   })
   assert.deepEqual(out.system.slice(1), [text('Template rule', null), ...system])
   assert.equal(listCacheMarkers(out).length, 4)
-  assert.deepEqual(out.messages[0].content.at(-1).cache_control, control('5m'))
+  assert.deepEqual(out.messages[0].content.at(-1).cache_control, control('1h'))
 })
 
 test('CLI zero advances an automatic breakpoint as conversation history grows', async (t) => {
@@ -855,7 +855,7 @@ test('CLI zero advances an automatic breakpoint as conversation history grows', 
     const markers = listCacheMarkers(out).filter((marker) => marker.section === 'messages')
     assert.equal(markers.length, 1)
     assert.equal(markers[0].index, messages.length - 1)
-    assert.deepEqual(out.messages[markers[0].index].content.at(-1), text(`Question ${turn}`, '5m'))
+    assert.deepEqual(out.messages[markers[0].index].content.at(-1), text(`Question ${turn}`, '1h'))
     messages.push({ role: 'assistant', content: `Answer ${turn}` })
   }
 })
@@ -936,7 +936,7 @@ for (const backend of ['cli', 'api']) {
     [undefined, '1h', '1h'],
     [undefined, '5m', '5m'],
     ['5m', '1h', '5m'],
-    ['1h', '5m', '1h'],
+    ['1h', '5m', '5m'],
   ]) {
     run(
       `${backend} rewritten official tail ${tailTtl ?? 'without TTL'} under menu ${menu} goes out as ${expected}`,

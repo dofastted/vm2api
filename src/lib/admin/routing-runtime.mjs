@@ -457,7 +457,7 @@ export function createRoutingRuntime(ctx) {
     if (body.redaction !== undefined) {
       nextRedaction = normalizeRedaction(body.redaction)
       if (nextRedaction.enabled) {
-        await ensureRedaction({ redaction: nextRedaction }, { projectRoot: ctx.cfg.paths.project })
+        await ensureRedaction({ ...getRouting(), redaction: nextRedaction }, { projectRoot: ctx.cfg.paths.project })
       }
     }
     let routingConfig = getRouting()

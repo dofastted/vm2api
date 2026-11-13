@@ -40,6 +40,18 @@ test('502 upstream_transport is retryable before commit', () => {
   assert.equal(isRetryableCodexTransport({ ok: true, status: 200 }), false)
   assert.equal(isRetryableCodexTransport({ ok: false, status: 401, body: { error: { code: 'oauth_revoked' } } }), false)
 })
+test('server_is_overloaded retries only before output commitment', () => {
+  const result = {
+    ok: false,
+    committed: false,
+    status: 503,
+    body: { error: { type: 'service_unavailable_error', code: 'server_is_overloaded' } },
+  }
+  assert.equal(isRetryableSameCodexAccount(result), true)
+  assert.equal(isRetryableSameCodexAccount({ ...result, committed: true }), false)
+  assert.equal(isRetryableSameCodexAccount(result, { headersSent: true }), false)
+  assert.equal(isRetryableSameCodexAccount(result, { signal: AbortSignal.abort() }), false)
+})
 
 function overloadedResult(status, code) {
   return {

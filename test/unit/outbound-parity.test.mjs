@@ -11,6 +11,7 @@ import {
 import { storeAccountHeaders, resolveCrsHeaders } from '../../src/lib/identity/crs-headers.mjs'
 import { sanitizeInboundBody, defaultSeedPolicy } from '../../src/lib/protocol/seed-policy.mjs'
 import {
+  prepareCliHopBody,
   prepareOutboundAttempt,
   prepareOutboundHeaders,
   prepareOutboundEnvelope,
@@ -25,6 +26,23 @@ import { buildVmTestInbound } from '../../src/lib/admin/vm-test-chat.mjs'
 import { classifyClient } from '../../src/lib/protocol/client-fingerprint.mjs'
 import { finalizeWorkerPayload } from '../../src/lib/transport/go-worker-client.mjs'
 
+test('CLI hop normalizes markers added after a caller 5m marker', () => {
+  const out = prepareCliHopBody(
+    {
+      model: 'claude-sonnet-5',
+      tools: [{ name: 'Read', cache_control: { type: 'ephemeral', ttl: '5m' } }],
+      system: [{ type: 'text', text: 'generated', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'hello', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+      ],
+    },
+    { personaPreset: 'zero', cacheTtl: '5m' },
+  )
+  assert.deepEqual(
+    [out.tools[0], out.system[0], out.messages[0].content[0]].map((block) => block.cache_control.ttl),
+    ['5m', '5m', '5m'],
+  )
+})
 test('saved entrypoint overrides stale slot and caller UAs on both outbound boundaries', () => {
   const body = { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'hello' }] }
   const routing = { compatibility: { cc_entrypoint: 'cli' } }

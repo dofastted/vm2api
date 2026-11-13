@@ -787,6 +787,7 @@ export function composeToolNames(front = {}, hop = {}) {
  */
 export function toStandardAnthropicBody(body, { official = false, rewriteTools = true } = {}) {
   const shaped = sanitizeAnthropicBody(stripCallerBilling(body), { preserveContentShape: false })
+  applyMaxTokensCap(shaped)
   return scrubUpstreamClientBody(shaped, { official, rewriteTools })
 }
 

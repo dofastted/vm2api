@@ -73,8 +73,12 @@ http.createServer((req, res) => {
       stdio: 'inherit',
     })
     const policy = { enabled: true, secrets: true, personal: false, words: [], rules: [] }
-    const state = await ensureRedaction({ redaction: policy }, { projectRoot: root, binPath: bin })
+    const state = await ensureRedaction(
+      { redaction: policy, failover: { max_request_mib: 64 } },
+      { projectRoot: root, binPath: bin },
+    )
     helper = state.child
+    assert.equal(state.maxBodyBytes, 64 * 1024 * 1024)
     const secret = 'sk-' + 'proj-' + 'Aa1Bb2Cc3Dd4Ee5Ff6Gg'
     const body = { messages: [{ role: 'user', content: `token ${secret}` }] }
     const masked = await maskJson(body, { principal: 'key-a', session: 's1' })

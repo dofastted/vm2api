@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- 修复 CRAG print 绕过普通出站准备时未应用模型 `max_tokens_cap` 的问题；前置协议清洗现在保留模型缺省 `max_tokens`，并限制超出模型上限的请求。
 
 ## 1.4.086 — 2026-11-14 · 原生交接与面板整流
 

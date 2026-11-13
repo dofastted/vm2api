@@ -389,21 +389,25 @@ export function isDownstreamCommitEvent(event) {
 
   if (t === 'content_block_delta') {
     const d = event.delta || {}
-    return !!(d.text || d.thinking || d.partial_json || d.refusal || d.signature)
+    return !!(
+      d.text ||
+      d.thinking ||
+      d.partial_json ||
+      d.refusal ||
+      d.signature ||
+      (d.type === 'thinking_delta' && Number.isFinite(d.estimated_tokens) && d.estimated_tokens > 0)
+    )
   }
   if (t === 'content_block_start') {
     const b = event.content_block || {}
     const kind = String(b.type || '')
     return (
-      kind === 'text' ||
-      kind === 'thinking' ||
-      kind === 'redacted_thinking' ||
-      kind === 'refusal' ||
+      (kind === 'redacted_thinking' && !!b.data) ||
       kind === 'tool_use' ||
       kind === 'server_tool_use' ||
       kind === 'mcp_tool_use' ||
       kind.endsWith('_tool_use') ||
-      !!(b.text || b.thinking)
+      !!(b.text || b.thinking || b.refusal)
     )
   }
   return t.startsWith('response.output_')
@@ -431,7 +435,7 @@ export function restoreKernelErrorStatus(result = {}, { now = Date.now() } = {})
   const body = result.body
   if (!(body?.type === 'error' || body?.error)) return result
   const status = semanticStatusForStreamError(body)
-  if (status !== 403 && status !== 429 && status !== 529) return result
+  if (status !== 403 && status !== 429 && status !== 503 && status !== 529) return result
   const headers =
     status === 429
       ? extraHeadersFromLimitError(String(body?.error?.message || ''), result.headers || {}, now)
