@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.4.085 — 2026-11-13 · HTTP 代理出口
+
+- 槽位透明出口支持 HTTP 代理：`kin-egress` 与 `kin-worker` 的 Dialer 接受 `http://`（无端口按 80），按 CONNECT 建隧道，带账密时发 `Proxy-Authorization: Basic`；2xx 成功，407 报认证失败，非 HTTP 响应报 `not an HTTP proxy`。响应头逐字节读到空行为止（上限 16 KiB），避免缓冲吞掉隧道里紧随的数据。`socks5://` 与 `socks5h://` 行为不变，`https://` 及其它协议仍拒绝。
+- worker 配置的 `proxy_url` 允许 http scheme，http 不强制写端口；守卫信息由 `refusing SOCKS CONNECT` 改为 `refusing proxy CONNECT`（两种协议共用该路径）。
+- 解除 1.4.084 的已知限制：HTTP 代理行现在可以绑定给槽位，绑定后出口不再启动失败。
+
+已部署机升级：本版更新出厂文件 `kin-worker` 与 `kin-egress`（见 [deploy/payload.json](deploy/payload.json)），需随控制面一起更新 payload 并重启 Node。槽内已有选择/缓存仍需排空并经内核安装流程激活，仅换出厂文件不能证明运行中出口已更新。ARM64 原生 helper 由 release 工作流从源码编译，随本版一并生效。
+
 ## 1.4.084 — 2026-11-13 · HTTP 代理写入
 
 - 代理池支持写入 HTTP 代理：可粘贴 `http://user:pass@host:port`，或在字段导入时传 `scheme`/`protocol: http`；按协议去重，编辑保留协议，复制地址输出 `http://`。探活走 HTTP CONNECT（Basic 认证，407 报认证错误，非 HTTP 端口报 `not_http_proxy`）。不带协议的 `host:port` 仍默认 SOCKS5；`https://` 及其它协议拒绝。
