@@ -6,6 +6,8 @@ import { canClaudeResetCredits } from '../../src/lib/oauth/credential-mode.mjs'
 import test from 'node:test'
 import { buildClaudeResetQuery, buildClaudeResetRedeem } from '../../src/lib/admin/panel-api.mjs'
 import {
+  claudeResetCardRef,
+  claudeResetGrantKind,
   claudeResetOperationId,
   claudeResetOrgId,
   parseClaudeResetStatus,
@@ -85,7 +87,7 @@ test.beforeEach(() => {
   resetClaudeResetLeasesForTest()
 })
 
-test('query projects the next grant and hides grant ids', async () => {
+test('query projects every held grant with an opaque card ref and hides grant ids', async () => {
   const root = rootDir()
   writeVm(root)
   const status = {
@@ -120,13 +122,108 @@ test('query projects the next grant and hides grant ids', async () => {
   })
   assert.equal(result.ok, true)
   assert.equal(calls, 1)
-  assert.equal(result.claude_reset_credits.available_count, 2)
-  assert.equal(result.claude_reset_credits.credits[0].redeemable, true)
-  assert.equal(result.claude_reset_credits.credits[1].redeemable, false)
+  const view = result.claude_reset_credits
+  assert.equal(view.available_count, 3)
+  assert.equal(view.held_count, 3)
+  assert.deepEqual(
+    view.credits.map((credit) => [credit.redeemable, credit.state, credit.kind]),
+    [
+      [true, 'ready', 'session'],
+      [true, 'ready', 'session'],
+    ],
+  )
+  assert.equal(view.credits[0].ref, claudeResetCardRef('vm-1', 'launch'))
+  assert.equal(view.credits[1].ref, claudeResetCardRef('vm-1', 'later'))
+  assert.match(view.credits[0].ref, /^[a-f0-9]{24}$/)
+  assert.notEqual(view.credits[0].ref, claudeResetCardRef('vm-2', 'launch'))
   const raw = JSON.stringify(result)
   for (const secret of ['"id"', 'launch', 'later', 'synthetic-token']) assert.equal(raw.includes(secret), false)
   const saved = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-1.json'), 'utf8'))
   assert.equal(JSON.stringify(saved.claude_reset_credits).includes('launch'), false)
+  assert.equal(saved.claude_reset_credits.held_count, 3)
+  assert.equal(saved.claude_reset_credits.credits[0].ref, view.credits[0].ref)
+  assert.equal(saved.claude_reset_credits.credits[0].state, 'ready')
+})
+
+test('Fable resets and full resets are told apart', () => {
+  const fable = {
+    id: 'fable_launch',
+    label: 'New model launch: one Fable reset for Pro and Team Standard, launch week only',
+    resets_left: 1,
+    usable_now: true,
+    use_requires_limit: false,
+    gives_back_weekly: true,
+    ends_at: '2026-11-17T07:59:00Z',
+    clears: ['five_hour', 'seven_day_overage_included'],
+  }
+  const full = {
+    id: 'full_nov',
+    label: 'One full limit reset (November 2026)',
+    resets_left: 1,
+    usable_now: true,
+    use_requires_limit: false,
+    ends_at: '2026-12-10T22:00:00Z',
+    clears: ['five_hour', 'seven_day', 'seven_day_overage_included'],
+  }
+  const view = projectClaudeResetCredits(
+    { eligible: true, next_grant_id: 'fable_launch', grants: [full, fable] },
+    Date.parse('2026-11-13T07:00:00Z'),
+    'vm-1',
+  )
+  assert.deepEqual(
+    view.credits.map((credit) => [credit.kind, credit.state, credit.gives_back_weekly]),
+    [
+      ['fable', 'ready', true],
+      ['full', 'ready', false],
+    ],
+  )
+  assert.equal(view.available_count, 2)
+  const { gives_back_weekly: _omit, ...plain } = fable
+  assert.equal(claudeResetGrantKind(plain), 'fable')
+  assert.equal(claudeResetGrantKind({ type: 'full', clears: ['five_hour', 'seven_day_overage_included'] }), 'fable')
+  assert.equal(claudeResetGrantKind({ clears: ['five_hour'] }), 'session')
+  assert.equal(claudeResetGrantKind({ clears: ['seven_day'] }), 'weekly')
+  assert.equal(claudeResetGrantKind({ clears: ['five_hour', 'seven_day'] }), 'full')
+  assert.equal(claudeResetGrantKind({ type: 'weekly', clears: ['five_hour', 'seven_day'] }), 'weekly')
+  assert.equal(claudeResetGrantKind({ gives_back_weekly: true, clears: [] }), 'fable')
+})
+
+test('a cooldown keeps held cards visible and unusable cards are counted apart', () => {
+  const now = Date.parse('2026-11-13T07:00:00Z')
+  const card = (id, extra = {}) => ({
+    id,
+    resets_left: 1,
+    usable_now: true,
+    use_requires_limit: false,
+    clears: ['five_hour', 'seven_day'],
+    ...extra,
+  })
+  const cooling = projectClaudeResetCredits(
+    {
+      eligible: true,
+      cooldown_until: new Date(now + 120_000).toISOString(),
+      grants: [card('a', { usable_now: false }), card('b', { usable_now: false, blocking: ['seven_day'] })],
+    },
+    now,
+    'vm-1',
+  )
+  assert.deepEqual(
+    cooling.credits.map((credit) => credit.state),
+    ['cooldown', 'unavailable'],
+  )
+  assert.equal(cooling.available_count, 0)
+  assert.equal(cooling.held_count, 1)
+  const withheld = projectClaudeResetCredits(
+    { eligible: true, grants: [card('a'), card('b', { usable_now: false })] },
+    now,
+    'vm-1',
+  )
+  assert.deepEqual(
+    withheld.credits.map((credit) => credit.state),
+    ['ready', 'unavailable'],
+  )
+  assert.equal(withheld.available_count, 1)
+  assert.equal(withheld.held_count, 1)
 })
 
 test('past cooldown is cleared and a future cooldown blocks', () => {
@@ -162,7 +259,6 @@ test('eligibility fails closed', () => {
     blocking: { grant: { blocking: ['seven_day'] } },
     ineligible: { block: { eligible: false } },
     spent: { grant: { resets_left: 0 } },
-    'not-next': { block: { next_grant_id: 'other' } },
   }
   for (const [name, patch] of Object.entries(cases)) {
     const grant = { ...base, ...patch.grant }
@@ -170,6 +266,8 @@ test('eligibility fails closed', () => {
     const block = { eligible: true, next_grant_id: grant.id, grants: [grant], ...patch.block }
     assert.equal(projectClaudeResetCredits(block, now).available_count, 0, name)
   }
+  const other = { eligible: true, next_grant_id: 'other', grants: [base] }
+  assert.equal(projectClaudeResetCredits(other, now).available_count, 1, 'a held card need not be the next grant')
 })
 
 test('missing profile scope does not call the worker', async () => {
@@ -263,6 +361,89 @@ test('redeem lets the server pick the next grant and hides ids', async () => {
   for (const secret of ['grant_next', 'grant_other', ORG, posts[0].request_id, '"id"']) {
     assert.equal(raw.includes(secret), false, secret)
   }
+})
+
+test('redeem spends the chosen card instead of the next grant', async () => {
+  const root = rootDir()
+  writeVm(root)
+  const { transport, posts } = scripted({ claim: { result: 'reset', cleared: ['five_hour'] } })
+  const result = await redeemClaudeResetCredit({
+    projectRoot: root,
+    vmId: 'vm-1',
+    idempotencyKey: 'op-card',
+    card: claudeResetCardRef('vm-1', 'grant_other'),
+    now: () => NOW,
+    transport,
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.outcome, 'reset')
+  assert.equal(result.kind, 'session')
+  assert.equal(posts.length, 1)
+  assert.equal(posts[0].grant_id, 'grant_other')
+  assert.equal(JSON.stringify(result).includes('grant_other'), false)
+  const again = await redeemClaudeResetCredit({
+    projectRoot: root,
+    vmId: 'vm-1',
+    idempotencyKey: 'op-card',
+    card: claudeResetCardRef('vm-1', 'grant_other'),
+    transport,
+  })
+  assert.equal(again.replayed, true)
+  assert.equal(again.kind, 'session')
+  assert.equal(posts.length, 1)
+})
+
+test('a chosen card that cannot be used sends no claim', async () => {
+  const withheld = {
+    cedar_ember: {
+      ...REDEEMABLE.cedar_ember,
+      grants: [{ ...REDEEMABLE.cedar_ember.grants[0], usable_now: false }, REDEEMABLE.cedar_ember.grants[1]],
+    },
+  }
+  const cases = [
+    ['not usable now', withheld, claudeResetCardRef('vm-1', 'grant_other')],
+    ['unknown card', REDEEMABLE, claudeResetCardRef('vm-1', 'gone')],
+    ['card of another slot', REDEEMABLE, claudeResetCardRef('vm-2', 'grant_other')],
+  ]
+  for (const [name, status, card] of cases) {
+    resetClaudeResetLeasesForTest()
+    const root = rootDir()
+    writeVm(root)
+    const { transport, posts } = scripted({ status })
+    const result = await redeemClaudeResetCredit({
+      projectRoot: root,
+      vmId: 'vm-1',
+      idempotencyKey: 'op-1',
+      card,
+      transport,
+    })
+    assert.equal(result.error, 'CLAUDE_RESET_NOT_AVAILABLE', name)
+    assert.equal(posts.length, 0, name)
+  }
+  for (const card of ['grant_other', 'ABCDEF0123456789abcdef01', 42, { ref: 'x' }]) {
+    let calls = 0
+    const root = rootDir()
+    writeVm(root)
+    const result = await redeemClaudeResetCredit({
+      projectRoot: root,
+      vmId: 'vm-1',
+      idempotencyKey: 'op-1',
+      card,
+      transport: async () => {
+        calls += 1
+        return { ok: true, status: 200, body: REDEEMABLE }
+      },
+    })
+    assert.equal(result.error, 'CLAUDE_RESET_CARD_INVALID', String(card))
+    assert.equal(calls, 0)
+  }
+  const routed = await buildClaudeResetRedeem({
+    cfg: { paths: { project: rootDir() } },
+    id: 'vm-1',
+    idempotencyKey: 'op-1',
+    card: 'nope',
+  })
+  assert.equal(routed.status, 400)
 })
 
 test('a non-redeemable status sends no claim', async () => {
@@ -502,6 +683,7 @@ test('panel query route returns the public snapshot', async () => {
     transport: scripted().transport,
   })
   assert.equal(result.ok, true)
-  assert.equal(result.data.claude_reset_credits.available_count, 2)
+  assert.equal(result.data.claude_reset_credits.available_count, 3)
+  assert.equal(result.data.claude_reset_credits.held_count, 3)
   assert.equal(JSON.stringify(result).includes('grant_next'), false)
 })

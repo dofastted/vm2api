@@ -392,7 +392,18 @@ export function VmStatusBoard(props: Props) {
                     />
                   </div>
                 ) : null}
-                <ClaudeResetActions vm={vm} now={now} />
+                <ClaudeResetActions
+                  vm={vm}
+                  now={now}
+                  usage={{
+                    fiveHour: u5,
+                    sevenDay: u7,
+                    fable: fable.usedPct,
+                    sevenDayGate: vm.quota_policy
+                      ? vm.quota_policy.limit_7d * 100
+                      : null,
+                  }}
+                />
               </>
             )}
           </div>
