@@ -7,6 +7,30 @@ import {
   shouldContinue,
 } from '../../src/lib/pool/upstream-error-policy.mjs'
 
+test('broken native handoff contracts stop without replaying or cooling an account', () => {
+  for (const code of [
+    'native_handoff_missing',
+    'native_handoff_invalid',
+    'native_handoff_conflict',
+    'native_handoff_incomplete',
+  ]) {
+    for (const committed of [false, true]) {
+      const policy = classifyUpstreamResult({
+        ok: false,
+        status: 502,
+        nativeHandoff: true,
+        terminalState: 'incomplete',
+        committed,
+        body: { type: 'error', error: { type: 'api_error', code, message: 'Provider terminal proof is unavailable' } },
+      })
+      assert.equal(policy.action, 'stop')
+      assert.equal(policy.retrySameAccount, false)
+      assert.equal(policy.cooldownUntil, null)
+      assert.equal(policy.scope, 'request')
+    }
+  }
+})
+
 test('unified account 429 without reset header uses usage window then 30 minutes', () => {
   const now = 1_700_000_000_000
   const usageReset = now + 3_600_000

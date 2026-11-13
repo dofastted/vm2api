@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import http from 'node:http'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 
 const MESSAGE = {
@@ -199,6 +200,77 @@ test('a non-stream Claude request does not emit queue pings', async () => {
     assert.equal(res.statusCode, 529)
     assert.equal(res.body.error.type, 'overloaded_error')
   } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('an incomplete native handoff never becomes a successful output-limit terminal', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-native-terminal-'))
+  const socketPath = path.join(root, 'kernel.sock')
+  const tokenPath = path.join(root, 'internal.token')
+  fs.writeFileSync(tokenPath, 'offline-native-handoff-token')
+  let upstreamRequests = 0
+  const server = http.createServer(async (req, response) => {
+    for await (const _chunk of req) {
+    }
+    upstreamRequests++
+    response.writeHead(200, { 'content-type': 'text/event-stream', trailer: 'x-terminal-state' })
+    const events = [
+      {
+        type: 'message_start',
+        message: {
+          id: 'native-cut',
+          type: 'message',
+          role: 'assistant',
+          model: MESSAGE.model,
+          content: [],
+          usage: { input_tokens: 2, output_tokens: 1 },
+        },
+      },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'partial native output' } },
+    ]
+    for (const event of events) response.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
+    response.addTrailers({ 'x-terminal-state': 'error' })
+    response.end()
+  })
+  await new Promise((resolve) => server.listen(socketPath, resolve))
+  const health = { ok: true, runtime_variant: 'crag-v2', gateway_policy_v1: true, capabilities: ['native_handoff_v1'] }
+  const exec = {
+    projectRoot: root,
+    homeDir: path.join(root, 'cli-home'),
+    vm: {
+      id: 'native-test',
+      runtime: { kernel_socket: socketPath, worker_run_dir: root, worker_token_file: tokenPath },
+    },
+  }
+  const res = createResponse()
+  const handler = createHandler({
+    root,
+    routing: { compatibility: {}, failover: { stream_keepalive_ms: 1000, queue_keepalive_delay_ms: 5000 } },
+    run: async ({ callAttempt }) =>
+      callAttempt({
+        candidate: { exec, vmId: 'native-test' },
+        body: { ...MESSAGE, stream: true },
+        attemptMeta: {
+          cliHop: true,
+          cragPrint: true,
+          preparedHop: { decision: { wanted: 'rust', blocked: false }, ready: { ok: true, health } },
+        },
+        deliveryMode: 'realtime',
+        onCommit() {},
+      }),
+  })
+  try {
+    await invoke(handler, res)
+    const body = res.chunks.join('')
+    assert.equal(upstreamRequests, 1)
+    assert.doesNotMatch(body, /"stop_reason":"max_tokens"|event: message_stop/)
+    if (res.statusCode === 200) assert.match(body, /event: error/)
+    else assert.equal(res.statusCode, 502)
+  } finally {
+    server.closeAllConnections()
+    await new Promise((resolve) => server.close(resolve))
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
