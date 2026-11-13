@@ -14,7 +14,7 @@ import {
   syncShellLoginCredentials,
 } from '../../src/lib/vm/slot-shell.mjs'
 import { FULL_OAUTH_SCOPE } from '../../src/lib/oauth/oauth-contract.mjs'
-import { CONTAINER_CLI_NODE_BIN, LOCAL_CRAG_CLAUDE, REMOTE_CRAG_CLAUDE } from '../../src/lib/vm/slot-engine.mjs'
+import { LOCAL_CRAG_CLAUDE, REMOTE_CRAG_CLAUDE } from '../../src/lib/vm/slot-engine.mjs'
 import {
   ensureOfficialCredentialLink,
   readWorkerCredentialFile,
@@ -57,16 +57,18 @@ test('claude in the panel shell runs cli-node and points config at .claude', () 
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('a CRAG v2 terminal runs the package claude instead of cli-node', () => {
+test('all inference kernels use native Claude for the interactive terminal', () => {
   assert.equal(terminalClaudeBin({ id: 'vm-local', dataplane: 'crag', crag_kernel_version: 'v2' }), LOCAL_CRAG_CLAUDE)
   assert.equal(
     terminalClaudeBin({ id: 'vm-remote', node_id: 'node-a', dataplane: 'crag', crag_kernel_version: 'v2' }),
     REMOTE_CRAG_CLAUDE,
   )
-  assert.equal(terminalClaudeBin({ id: 'vm-wrap', dataplane: 'wrap' }), CONTAINER_CLI_NODE_BIN)
+  assert.equal(terminalClaudeBin({ id: 'vm-wrap', dataplane: 'wrap' }), LOCAL_CRAG_CLAUDE)
+  assert.equal(terminalClaudeBin({ id: 'vm-cc', dataplane: 'cc' }), LOCAL_CRAG_CLAUDE)
+  assert.equal(terminalClaudeBin({ id: 'vm-remote', node_id: 'node-a', dataplane: 'wrap' }), REMOTE_CRAG_CLAUDE)
   assert.equal(
     terminalClaudeBin({ id: 'vm-kvm', dataplane: 'crag', crag_kernel_version: 'v2', runtime: { type: 'kvm' } }),
-    CONTAINER_CLI_NODE_BIN,
+    LOCAL_CRAG_CLAUDE,
   )
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-crag-'))
   const binDir = path.join(dir, 'crag-v2')
@@ -85,7 +87,7 @@ test('a CRAG v2 terminal runs the package claude instead of cli-node', () => {
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('official login starts claude auth login only when the panel login marker is set', () => {
+test('a legacy login marker cannot start credential exchange in the terminal', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-login-'))
   const bin = path.join(dir, 'cli-node')
   fs.writeFileSync(bin, '#!/bin/sh\necho "cli-node $*"\n', { mode: 0o755 })
@@ -103,24 +105,26 @@ test('official login starts claude auth login only when the panel login marker i
   assert.equal(plain.status, 0, plain.stderr)
   assert.doesNotMatch(plain.stdout, /cli-node/)
   assert.equal(login.status, 0, login.stderr)
-  assert.match(login.stdout, /cli-node auth login\s*$/m)
+  assert.doesNotMatch(login.stdout, /cli-node auth login/)
   assert.doesNotMatch(plain.stdout, /auth login/)
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('native shell uses its own version and routes usage and login to the selected Claude', () => {
+test('native shell routes usage and cc to native Claude and directs login to the panel', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-native-'))
   try {
     const bin = path.join(dir, 'claude')
     fs.writeFileSync(bin, '#!/bin/sh\nprintf "native:%s:%s\\n" "$*" "${CLAUDE_CODE_VERSION-unset}"\n', { mode: 0o755 })
     const { rc } = panelShellLaunch(bin, { native: true })
-    const ran = spawnSync('bash', ['-c', `${rc}\nusage\n/usage\nclaude auth login`], {
+    const ran = spawnSync('bash', ['-c', `${rc}\nusage\n/usage\ncc --version\nclaude auth login`], {
       encoding: 'utf8',
       env: { ...process.env, HOME: dir, CLAUDE_CODE_VERSION: 'stale', KIN_PANEL_RCFILE: path.join(dir, 'rc') },
     })
-    assert.equal(ran.status, 0, ran.stderr)
+    assert.equal(ran.status, 2, ran.stderr)
     assert.match(ran.stdout, /native:\/usage:unset/)
-    assert.match(ran.stdout, /native:auth login:unset/)
+    assert.match(ran.stdout, /native:--version:unset/)
+    assert.doesNotMatch(ran.stdout, /native:auth login/)
+    assert.match(ran.stderr, /面板账号页/)
     const rcPath = path.join(dir, 'interactive-rc')
     fs.writeFileSync(rcPath, rc)
     const interactive = spawnSync('bash', ['--rcfile', rcPath, '-i'], {
@@ -536,7 +540,7 @@ test('existing credentials are not reported as a newly completed login', async (
   }
 })
 
-test('official login tickets reject unavailable cluster containers without fallback', async () => {
+test('login tickets require panel exchange for both local and cluster slots', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-ticket-'))
   fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
   fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify({ id: 'vm-01', node_id: 'node-a' }))
@@ -545,10 +549,10 @@ test('official login tickets reject unavailable cluster containers without fallb
   try {
     const remote = await shell.issueTicket('vm-01', { login: true })
     assert.equal(remote.ok, false)
-    assert.notEqual(remote.error.code, 'remote_unsupported')
+    assert.equal(remote.error.code, 'panel_login_required')
     const missing = await shell.issueTicket('vm-02', { login: true })
     assert.equal(missing.ok, false)
-    assert.equal(missing.error.code, 'container_not_ready')
+    assert.equal(missing.error.code, 'panel_login_required')
     const ops = await shell.issueTicket('vm-02')
     assert.equal(ops.ok, true)
   } finally {
@@ -584,7 +588,7 @@ test('an ops shell ticket cannot be upgraded into an official login', async () =
   }
 })
 
-test('a stopped container rejects the official login upgrade', async () => {
+test('a ready native client cannot bypass panel-only exchange', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-shell-stopped-'))
   fs.mkdirSync(path.join(root, 'vms', 'vm-02', 'cli-home', '.kin'), { recursive: true })
   fs.writeFileSync(path.join(root, 'vms', 'vm-02.json'), JSON.stringify({ id: 'vm-02' }))
@@ -606,7 +610,8 @@ test('a stopped container rejects the official login upgrade', async () => {
     destroy() {},
   }
   try {
-    assert.equal(login.ok, true)
+    assert.equal(login.ok, false)
+    assert.equal(login.error.code, 'panel_login_required')
     const handled = shell.handleUpgrade(
       { url: `/api/panel/vms/vm-02/shell?ticket=${login.ticket}&login=1` },
       socket,
@@ -614,7 +619,7 @@ test('a stopped container rejects the official login upgrade', async () => {
     )
     assert.equal(handled, true)
     await new Promise((resolve) => setImmediate(resolve))
-    assert.match(seen[0], /^HTTP\/1\.1 409 /)
+    assert.match(seen[0], /^HTTP\/1\.1 401 /)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

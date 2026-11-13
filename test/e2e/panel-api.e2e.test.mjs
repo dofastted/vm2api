@@ -389,14 +389,52 @@ test('pasted setup token survives identity enrichment and persists inference cre
   }
 })
 
-test('claude_code flavor refuses login before the slot container and cli-node exist', async () => {
-  const gw = await startGateway({ oauth: false })
+test('panel Claude Code exchange automatically syncs native credentials and supports manual sync', async () => {
+  const gw = await startGateway({ oauth: false, readyMs: 30000 })
   try {
     const gen = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/generate-auth-url', {
       body: { flavor: 'claude_code' },
     })
-    assert.equal(gen.status, 400, gen.text)
-    assert.equal(gen.json.error.code, 'container_not_ready')
+    assert.equal(gen.status, 200, gen.text)
+    const generated = gen.json.data || gen.json
+    const exchanged = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/exchange-code', {
+      body: { session_id: generated.session_id, code: 'pasted-auth-code' },
+    })
+    assert.equal(exchanged.status, 200, exchanged.text)
+    const claudeDir = path.join(gw.project, 'vms', 'vm-sim-01', 'cli-home', '.claude')
+    const official = path.join(claudeDir, '.credentials.json')
+    const worker = path.join(claudeDir, 'credentials.json')
+    assert.equal(fs.readlinkSync(official), 'credentials.json')
+    assert.equal(fs.readFileSync(official, 'utf8'), fs.readFileSync(worker, 'utf8'))
+    fs.unlinkSync(official)
+    const synced = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/credentials/sync', { body: {} })
+    assert.equal(synced.status, 200, synced.text)
+    assert.equal(synced.json.data.synced, true)
+    assert.equal(fs.readlinkSync(official), 'credentials.json')
+    fs.unlinkSync(official)
+    fs.mkdirSync(official)
+    const failed = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/credentials/sync', { body: {} })
+    assert.equal(failed.status, 502, failed.text)
+    assert.equal(failed.json.error.code, 'client_credential_sync_failed')
+    assert.equal(failed.text.includes(claudeDir), false)
+    const retryLink = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/generate-auth-url', {
+      body: { flavor: 'claude_code' },
+    })
+    assert.equal(retryLink.status, 200, retryLink.text)
+    const syncFailure = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/exchange-code', {
+      body: { session_id: retryLink.json.data.session_id, code: 'pasted-auth-code' },
+    })
+    assert.equal(syncFailure.status, 502, syncFailure.text)
+    assert.equal(syncFailure.json.error.code, 'client_credential_sync_failed')
+    const saved = JSON.parse(fs.readFileSync(path.join(gw.project, 'vms', 'vm-sim-01.json'), 'utf8'))
+    assert.equal(saved.claude.has_access, true)
+    fs.rmdirSync(official)
+    const repaired = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/credentials/sync', { body: {} })
+    assert.equal(repaired.status, 200, repaired.text)
+    assert.equal(fs.readlinkSync(official), 'credentials.json')
+    const ticket = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/shell-ticket', { body: { login: true } })
+    assert.equal(ticket.status, 409, ticket.text)
+    assert.equal(ticket.json.error.code, 'panel_login_required')
   } finally {
     await gw.stop()
   }

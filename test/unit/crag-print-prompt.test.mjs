@@ -15,6 +15,7 @@ import {
   trackCallerSystemBlock,
 } from '../../src/lib/protocol/crag-print-prompt.mjs'
 import { sanitizeAnthropicBody } from '../../src/lib/protocol/sanitize.mjs'
+import { agentBody } from '../fixtures/agent-summary.mjs'
 
 const billing = 'x-anthropic-billing-header: cc_version=2.1.317'
 const identity = 'You are Claude Code, an agent.'
@@ -275,4 +276,30 @@ test('routing save accepts only the two CRAG print presets', () => {
     validatePersonaRoutingPatch({ compatibility: { crag_persona_preset: 'official' } })[0],
     /official_full \/ zero/,
   )
+})
+
+test('summary cleanup preserves result text, media, errors and historical tool pairs', () => {
+  const body = agentBody({ summary: true })
+  const historical = [
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'old', name: 'Read', input: {} }] },
+    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'old', content: 'old output' }] },
+  ]
+  body.messages.splice(1, 0, ...historical)
+  const current = body.messages[4].content[0]
+  const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aW1hZ2U=' } }
+  current.content = [{ type: 'text', text: 'tool_result replayed' }, image]
+  current.is_error = true
+  current.cache_control = { type: 'ephemeral', ttl: '1h' }
+  const before = structuredClone(body)
+  const out = prepareCragPrintBody(body, { agentSummary: true, officialPassthrough: true })
+  assert.deepEqual(out.messages.slice(0, 4), before.messages.slice(0, 4))
+  assert.deepEqual(out.messages[4].content, [
+    { type: 'text', text: '[tool result test-tool (error)]', cache_control: current.cache_control },
+    ...current.content,
+    before.messages[4].content.at(-1),
+  ])
+  assert.deepEqual(out.messages[5], before.messages[5])
+  assert.deepEqual(body, before)
+  // A normal continuation, including a tool reporting this error, remains live.
+  assert.deepEqual(prepareCragPrintBody(body).messages, before.messages)
 })

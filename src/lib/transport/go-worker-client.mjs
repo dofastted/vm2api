@@ -5,7 +5,7 @@ import path from 'node:path'
 import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
 import { prepareOutboundHeaders } from '../protocol/outbound-attempt.mjs'
 import { sanitizeAnthropicBodyForBetaTokens } from '../protocol/anthropic-policy.mjs'
-import { sanitizeAnthropicBody } from '../protocol/sanitize.mjs'
+import { prepareCliNodeRequest, prepareCragRequest } from '../protocol/kernel-request.mjs'
 import { withRequestProtocolBetas } from '../protocol/claude-code-betas.mjs'
 import { pinThreadBetas, rememberThreadTurn } from '../protocol/thread-betas.mjs'
 import { applyThinkingDisplay, ensureOfficialPrintThinking, thinkingDisplayMode } from '../protocol/thinking.mjs'
@@ -30,6 +30,7 @@ import {
 import { isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { runSlotOauth } from './slot-oauth.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
+import { ensureRemoteOfficialCredentialLink } from '../cluster/remote-slot-files.mjs'
 import { normalizeSessionIdleTtlSeconds } from '../vm/slot-engine.mjs'
 import {
   cragConsumesModelDirective,
@@ -196,10 +197,15 @@ function clockMs(value, fallback) {
   return Number.isFinite(ms) && ms > 0 ? Math.min(MAX_GATEWAY_CLOCK_MS, Math.max(1, Math.round(ms))) : fallback
 }
 
-function withoutGatewayPolicy(body) {
-  if (!body || !Object.hasOwn(body, 'gateway_policy')) return body
-  const { gateway_policy: _ignored, ...rest } = body
-  return rest
+function nativeCragRequest(exec, cragPrint) {
+  return (
+    cragPrint !== false &&
+    cragV2KernelActive({
+      vm: exec?.vm,
+      health: exec?.workerStatus,
+      kernelConfig: readSlotKernelConfig(exec?.homeDir),
+    })
+  )
 }
 
 function inferenceRequest(
@@ -483,7 +489,7 @@ function dumpSessionEnvelope(envelope) {
     const rec = {
       ts: new Date().toISOString(),
       hop: 'go-worker-envelope',
-      note: 'This is the JSON body+headers the slot worker POSTs to api.anthropic.com/v1/messages. Authorization is attached by the worker from OAuth and is not in this envelope.',
+      note: 'Panel-to-kernel body and protocol headers, not the final Anthropic wire request. The selected CLI owns outbound authentication and wire assembly.',
       stream: envelope.stream,
       delivery_mode: envelope.delivery_mode,
       headers,
@@ -535,10 +541,9 @@ export function prepareWorkerPayload({
   requestContext = null,
   repaired = false,
 } = {}) {
-  // This is the last panel-owned boundary before either kernel. Keep the
-  // worker contract Anthropic-shaped even when a caller selected passthrough;
-  // cli-node and CRAG must never receive OpenAI/client-only request fields.
-  const canonicalBody = withoutGatewayPolicy(sanitizeAnthropicBody(body, { preserveContentShape: false }) || body)
+  const health = exec?.workerStatus
+  const print = nativeCragRequest(exec, cragPrint)
+  const canonicalBody = print ? prepareCragRequest(body) : prepareCliNodeRequest(body)
   const model = canonicalBody?.model || ''
   const credMode = credentialModeFromOauth(exec?.vm?.claude || {})
   const headers = prepareOutboundHeaders(reqHeaders, exec?.homeDir, identity, model, {
@@ -563,14 +568,6 @@ export function prepareWorkerPayload({
   // Envelope headers are discarded; the existing MessageRequest.betas channel
   // carries request gates to the native CLI, which builds the actual HTTP wire.
   const gated = cliHop ? { ...main, betas } : sanitizeAnthropicBodyForBetaTokens(main, headers['anthropic-beta'])
-  const health = exec?.workerStatus
-  const print =
-    cragPrint !== false &&
-    cragV2KernelActive({
-      vm: exec?.vm,
-      health,
-      kernelConfig: readSlotKernelConfig(exec?.homeDir),
-    })
   const directed = gateCragBody(gated, print, health)
   return {
     headers,
@@ -657,12 +654,17 @@ async function redactionContext({ routing, exec, redactionPrincipal, redactionSe
   return { principal: redactionPrincipal, session: redactionSession || '', maxBodyBytes: state.maxBodyBytes }
 }
 
-async function preparePrebuiltEnvelope(envelope, redaction, messages) {
+async function preparePrebuiltEnvelope(envelope, redaction, messages, exec, cragPrint) {
   // A prebuilt (e.g. Codex) envelope has no trusted Messages-side cwd source.
   const { caller_cwd: _callerCwd, ...out } = envelope
   if (messages) {
     delete out.gateway_policy
-    out.body = withoutGatewayPolicy(out.body)
+    const print = nativeCragRequest(exec, cragPrint)
+    out.body = gateCragBody(
+      print ? prepareCragRequest(out.body) : prepareCliNodeRequest(out.body),
+      print,
+      exec?.workerStatus,
+    )
     if (out.headers && typeof out.headers === 'object') {
       out.headers = Object.fromEntries(
         Object.entries(out.headers).filter(([name]) => name.toLowerCase() !== 'x-tenant-id'),
@@ -675,6 +677,20 @@ async function preparePrebuiltEnvelope(envelope, redaction, messages) {
   }
   if (redaction && out.body) out.body = await maskJson(out.body, redaction)
   return out
+}
+
+function invalidKernelResult(error) {
+  return {
+    ok: false,
+    status: 400,
+    via: 'kernel-preflight',
+    body: error.body,
+    headers: {},
+    terminalState: 'rejected',
+    transportError: false,
+    committed: false,
+    upstreamExecutions: 0,
+  }
 }
 
 function redactionResult(error) {
@@ -778,7 +794,13 @@ export async function callGoWorker({
     const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
     const prepared = envelope
       ? {
-          envelope: await preparePrebuiltEnvelope(envelope, redaction, requestPath === '/internal/v1/messages'),
+          envelope: await preparePrebuiltEnvelope(
+            envelope,
+            redaction,
+            requestPath === '/internal/v1/messages',
+            exec,
+            cragPrint,
+          ),
           thread: null,
           redaction,
         }
@@ -841,6 +863,7 @@ export async function callGoWorker({
   } catch (error) {
     const blocked = redactionResult(error)
     if (blocked) return blocked
+    if (error.code === 'invalid_kernel_request') return invalidKernelResult(error)
     if (signal?.aborted) return clientCancelledResult({ via: 'go-worker' })
     return {
       ok: false,
@@ -984,7 +1007,13 @@ export async function streamGoWorker({
     const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
     const prepared = envelope
       ? {
-          envelope: await preparePrebuiltEnvelope(envelope, redaction, requestPath === '/internal/v1/messages'),
+          envelope: await preparePrebuiltEnvelope(
+            envelope,
+            redaction,
+            requestPath === '/internal/v1/messages',
+            exec,
+            cragPrint,
+          ),
           thread: null,
           redaction,
         }
@@ -1233,6 +1262,8 @@ export async function streamGoWorker({
   } catch (error) {
     const blocked = redactionResult(error)
     if (blocked) return { ...blocked, ...timing.snapshot(), committed }
+    if (error.code === 'invalid_kernel_request')
+      return { ...invalidKernelResult(error), ...timing.snapshot(), committed }
     if (signal?.aborted) {
       return clientCancelledResult({
         via: 'go-worker-stream',
@@ -1424,27 +1455,62 @@ export function credentialSummary(credential, now = Date.now()) {
 }
 
 export async function importWorkerCredential(exec, credential, { timeoutMs = 60000, signal } = {}) {
-  try {
-    writeWorkerCredentialFile(exec.homeDir, credential)
-    // Import is the one case where the control plane's credential replaces the slot's copy.
-    await slotHost(exec.vm).onImport(exec.vm, path.dirname(exec.homeDir))
-  } catch (error) {
-    return {
-      ok: false,
-      status: 500,
-      error: { code: 'credential_import_failed', message: String(error.message || error).slice(0, 300) },
+  return withCredentialRefreshLock(String(exec.homeDir || exec.vm?.id || 'credential'), async () => {
+    try {
+      if (!writeWorkerCredentialFile(exec.homeDir, credential)) throw new Error('credential_required')
+      // Import is the one case where the control plane's credential replaces the slot's copy.
+      await slotHost(exec.vm).onImport(exec.vm, path.dirname(exec.homeDir))
+    } catch (error) {
+      return {
+        ok: false,
+        status: 500,
+        error: { code: 'credential_import_failed', message: '凭证导入未完成，请检查 VM 连接后重试面板导入' },
+      }
     }
-  }
-  return {
-    ok: true,
-    status: 200,
-    credential: {
-      has_access: !!credential?.access_token || !!credential?.api_key,
-      has_refresh: !!credential?.refresh_token,
-      expires_at: credential?.expires_at || null,
-      generation: Date.now(),
-    },
-  }
+    return {
+      ok: true,
+      status: 200,
+      credential: {
+        has_access: !!credential?.access_token || !!credential?.api_key,
+        has_refresh: !!credential?.refresh_token,
+        expires_at: credential?.expires_at || null,
+        generation: Date.now(),
+      },
+    }
+  })
+}
+
+export async function syncClaudeClientCredentials(
+  exec,
+  { host = slotHost(exec.vm), ensureRemoteLink = ensureRemoteOfficialCredentialLink } = {},
+) {
+  return withCredentialRefreshLock(String(exec.homeDir || exec.vm?.id || 'credential'), async () => {
+    try {
+      const slotDir = path.dirname(exec.homeDir)
+      if (host.kind === 'node') {
+        const pulled = await host.afterRefresh(exec.vm, slotDir)
+        if (pulled?.reason === 'remote_missing') throw new Error('remote_missing')
+        const linked = await ensureRemoteLink(exec.vm, slotDir)
+        if (!linked?.linked) throw new Error('remote_link_failed')
+      }
+      const credential = readWorkerCredentialFile(exec.homeDir)
+      if (!credential?.access_token && !credential?.api_key) {
+        return { ok: false, status: 409, error: { code: 'credential_required', message: '请先在面板导入凭证' } }
+      }
+      const linked = ensureOfficialCredentialLink(exec.homeDir, { adoptOfficial: false })
+      if (!linked.linked) throw new Error('credential_link_failed')
+      return { ok: true, synced: true, credential: credentialSummary(credential) }
+    } catch {
+      return {
+        ok: false,
+        status: 502,
+        error: {
+          code: 'client_credential_sync_failed',
+          message: '客户端凭证同步失败，请检查 VM 连接后重试同步；无需重新换票',
+        },
+      }
+    }
+  })
 }
 
 export async function callWorkerPost(exec, requestPath, body, { timeoutMs = 20000, signal } = {}) {

@@ -42,13 +42,7 @@ import {
   looksLikeOfficialSetupToken,
   SETUP_TOKEN_FLAVOR,
 } from '../oauth/claude-setup-token.mjs'
-import {
-  completeClaudeAuthLogin,
-  readAuthLoginSession,
-  startClaudeAuthLoginSession,
-  AUTH_LOGIN_FLAVOR,
-  AUTH_LOGIN_SOURCE,
-} from '../oauth/claude-auth-login.mjs'
+import { AUTH_LOGIN_FLAVOR, AUTH_LOGIN_SOURCE } from '../oauth/claude-auth-login.mjs'
 import {
   canOfficialCc,
   isApiKeyMode,
@@ -283,7 +277,7 @@ import { readRawBody as defaultReadRawBody } from '../http/respond.mjs'
 import { corsHeadersForRequest } from '../http/cors.mjs'
 import { restartRustKernel, syncClaudeKernelConfigs, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 
-import { countTokensViaWorker } from '../transport/go-worker-client.mjs'
+import { countTokensViaWorker, syncClaudeClientCredentials } from '../transport/go-worker-client.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from '../protocol/claude-code-betas.mjs'
 import { rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
 import {
@@ -3028,6 +3022,19 @@ export function createPanelHandler(ctx) {
         }
         return json(res, 200, panel.ok({ id, reload: reloaded }))
       }
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/credentials\/sync$/.test(p)) {
+        const id = p.split('/')[4]
+        const vm = getVm(cfg.paths.project, id)
+        if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'VM not found' } })
+        if (isCodexVm(vm))
+          return json(res, 409, {
+            ok: false,
+            error: { code: 'credential_kind_mismatch', message: '此同步仅用于 Claude 客户端' },
+          })
+        const result = await syncClaudeClientCredentials(slotExec(cfg.paths.project, vm))
+        if (!result.ok) return json(res, result.status, result)
+        return json(res, 200, panel.ok({ synced: true }))
+      }
       // POST /api/panel/vms/:id/shell-ticket — single-use ticket for the slot terminal WebSocket
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/shell-ticket$/.test(p)) {
         const body = await readBody(req, 1024).catch(() => ({}))
@@ -5113,24 +5120,6 @@ export function createPanelHandler(ctx) {
             )
           }
           const flavor = body.flavor || body.type || 'cai'
-          if (normalizeOauthFlavor(flavor) === 'claude_code') {
-            const generated = await startClaudeAuthLoginSession({
-              vm: existing,
-              projectRoot: cfg.paths.project,
-              routing: ctx.routingConfig,
-              cliBin: body.cli_bin ?? '',
-              force: body.force === true || body.force === 'true' || body.force === 1,
-            })
-            const px = existing.proxy || {}
-            return json(
-              res,
-              200,
-              panel.ok({
-                ...generated,
-                proxy_hint: slotProxyHint(px, proxyPool?.labelOf(px.id)),
-              }),
-            )
-          }
           const generated = generateAuthUrl({
             vmId: id,
             proxyUrl: slotProxy.proxyUrl,
@@ -5218,25 +5207,11 @@ export function createPanelHandler(ctx) {
           }
           const code = body.code || body.auth_code || ''
           const flavor = body.flavor || body.type || ''
-          const loginSession = readAuthLoginSession(cfg.paths.project, id)
           const sessionKey = String(body.session_id || body.sessionId || '')
-          const officialLogin =
-            normalizeOauthFlavor(flavor) === 'claude_code' ||
-            (loginSession?.alive &&
-              !loginSession.expired &&
-              loginSession.session_id &&
-              loginSession.session_id === sessionKey)
           let oauth
           let oauthFromVm = false
           if (looksLikeOfficialSetupToken(code)) {
             oauth = await completeClaudeSetupToken({
-              projectRoot: cfg.paths.project,
-              vmId: id,
-              sessionId: sessionKey,
-              code,
-            })
-          } else if (officialLogin) {
-            oauth = await completeClaudeAuthLogin({
               projectRoot: cfg.paths.project,
               vmId: id,
               sessionId: sessionKey,

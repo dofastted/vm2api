@@ -1723,6 +1723,7 @@ export function createHandleProtocol(deps) {
                 preset: cragPersona,
                 officialPassthrough,
                 capabilities: Array.isArray(caps) ? caps : [],
+                agentSummary: !!summarySession,
               })
               hopBody = await materializeRemoteImageSources(hopBody)
               if (identity) {

@@ -14,13 +14,16 @@ test('CRAG metadata uses its supplier release, never the vm2api source-only rele
   const seen = []
   const fetchImpl = async (url) => {
     seen.push(String(url))
-    return new Response(JSON.stringify({ tag_name: 'v2.0.1', assets: [] }))
+    const match = String(url).match(/\/tags\/(v\d+\.\d+\.\d+)$/)
+    return new Response(JSON.stringify({ tag_name: match?.[1] || 'v2.0.1', assets: [] }))
   }
   await fetchKernelReleaseMetadata({ kernel: 'crag', tag: 'v2.0.1', fetchImpl })
   await fetchKernelReleaseMetadata({ kernel: 'crag', fetchImpl })
+  await fetchKernelReleaseMetadata({ kernel: 'crag', cragReleaseTag: 'v2.8.16', fetchImpl })
   assert.deepEqual(seen, [
     'https://api.github.com/repos/dofastted/claude-code/releases/tags/v2.0.1',
     'https://api.github.com/repos/dofastted/claude-code/releases/latest',
+    'https://api.github.com/repos/dofastted/claude-code/releases/tags/v2.8.16',
   ])
   const url = 'https://github.com/dofastted/claude-code/releases/download/v2.0.1/'
   assert.equal(isAllowedKernelUrl(`${url}kin-kernel`, { crag: true }), false)

@@ -50,7 +50,11 @@ async function requestBytes(req) {
 }
 
 const text = '你好🧪\\\n"'.repeat(40000)
-const largeEnvelope = { body: { input: text }, headers: { 'session-id': 'codec-session' }, stream: false }
+const largeEnvelope = {
+  body: { model: 'claude-test', max_tokens: 4096, messages: [{ role: 'user', content: [{ type: 'text', text }] }] },
+  headers: { 'session-id': 'codec-session' },
+  stream: false,
+}
 
 test('bounded codec on the real slot Unix-socket inference path', {
   skip: process.platform === 'win32',
@@ -88,20 +92,24 @@ test('bounded codec on the real slot Unix-socket inference path', {
   for (const call of [callGoWorker, callRustKernel, callCodexKernel]) {
     await t.test(`${call.name} preserves envelope bytes, auth, route and buffered JSON`, async (t) => {
       const before = operations.length
+      const envelope =
+        call === callCodexKernel
+          ? { body: { model: 'gpt-5.4', input: text }, headers: largeEnvelope.headers, stream: false }
+          : largeEnvelope
       let requests = 0
       const response = { type: 'message', model: 'codec-test', content: [{ type: 'text', text }] }
       const exec = await fixture(t, async (req, res) => {
         requests++
         const raw = await requestBytes(req)
         const received = JSON.parse(raw)
-        assert.deepEqual(raw, Buffer.from(JSON.stringify({ ...largeEnvelope, request_id: received.request_id })))
+        assert.deepEqual(raw, Buffer.from(JSON.stringify({ ...envelope, request_id: received.request_id })))
         assert.equal(req.headers['content-length'], String(raw.length))
         assert.equal(req.headers['x-kin-internal-token'], 'codec-test-token')
         assert.equal(req.headers['x-internal-token'], 'codec-test-token')
         assert.equal(req.url, call === callCodexKernel ? '/internal/v1/codex/responses' : '/internal/v1/messages')
         res.end(JSON.stringify(response))
       })
-      const result = await call({ exec, envelope: largeEnvelope })
+      const result = await call({ exec, envelope })
       assert.equal(result.ok, true)
       assert.deepEqual(result.body, response)
       assert.equal(requests, 1)
