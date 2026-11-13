@@ -202,7 +202,7 @@ function quotaRemaining7d(vm) {
 /** 7d 窗重置时刻（ms）；无快照返回 null。 */
 function quotaReset7dAt(vm) {
   const limits = normalizeCodexLimits(extraToCodexSnapshot(extraFromSummary(vm)))
-  const ms = Date.parse(limits.reset_7d_at || vm?.reset_7d || "")
+  const ms = Date.parse(limits.reset_7d_at || vm?.reset_7d || '')
   return Number.isFinite(ms) ? ms : null
 }
 
