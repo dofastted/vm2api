@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import crypto from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
@@ -60,6 +61,7 @@ function fakeNode(files = new Map()) {
   const modes = new Map()
   const links = new Map()
   const handles = new Map()
+  const published = []
   sftp.open = (p, flags, attrs, cb) => {
     if (flags !== 'wx') return fail(cb, `unexpected flags ${flags}`)
     if (files.has(p) || links.has(p)) return fail(cb, 'EEXIST')
@@ -89,6 +91,7 @@ function fakeNode(files = new Map()) {
     ok(cb)
   }
   sftp.ext_openssh_rename = (from, to, cb) => {
+    published.push(to)
     links.delete(to)
     files.set(to, files.get(from))
     modes.set(to, modes.get(from))
@@ -117,6 +120,12 @@ function fakeNode(files = new Map()) {
         else if (!files.has(p)) code = 3
         else out = files.get(p).toString('base64')
       }
+      const hash = /f='\\''(.+?)'\\''.*sha256sum/.exec(cmd)
+      if (hash) {
+        const p = hash[1]
+        if (links.has(p) || !files.has(p)) code = 3
+        else out = `${crypto.createHash('sha256').update(files.get(p)).digest('hex')}  ${p}\n`
+      }
       setImmediate(() => {
         if (out) stream.emit('data', Buffer.from(out))
         if (code === 1) stream.stderr.emit('data', Buffer.from('Too many levels of symbolic links'))
@@ -130,6 +139,7 @@ function fakeNode(files = new Map()) {
     files,
     modes,
     links,
+    published,
     session: { nodeId: 'node-t', client, host },
     remoteCred: `${host.root}/vms/vm-07/claude/credentials.json`,
   }
@@ -151,8 +161,11 @@ const vm = { id: 'vm-07', node_id: 'node-t' }
 
 test('KVM run publication selects the live guest kernel and preserves node credentials', async (t) => {
   const node = fakeNode()
-  const slotDir = localSlot('local-credential')
-  t.after(() => fs.rmSync(path.dirname(slotDir), { recursive: true, force: true }))
+  const root = tmpDir('kin-kvm-config-')
+  const slotDir = path.join(root, 'vms', vm.id)
+  fs.mkdirSync(slotDir, { recursive: true })
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pkg = seedEncryptedPackage(root)
   node.files.set(node.remoteCred, Buffer.from('rotated-credential'))
   const target = { ...vm, runtime: { type: 'kvm' } }
   fs.mkdirSync(path.join(slotDir, 'run'))
@@ -166,7 +179,67 @@ test('KVM run publication selects the live guest kernel and preserves node crede
     assert.equal(node.files.get(entry)?.toString(), `#!/bin/sh\nexec /opt/kin-live/${expected} "$@"\n`)
     assert.equal(node.modes.get(entry), 0o755)
     assert.equal(node.files.get(node.remoteCred).toString(), 'rotated-credential')
+    if (dataplane === 'crag') {
+      const remote = `${node.session.host.root}/vms/${vm.id}`
+      const configIndex = node.published.indexOf(`${remote}/run/kernel.json`)
+      for (const file of cragSlotPayload(root).files) {
+        const dest = `${remote}/slot-bin/${file.name.slice('opt/kin/'.length)}`
+        assert.deepEqual(node.files.get(dest), file.body || fs.readFileSync(file.src))
+        assert.ok(node.published.indexOf(dest) < configIndex, `${dest} must precede config publication`)
+      }
+      assert.deepEqual(
+        node.files.get(`${remote}/slot-bin/crag-v2/manifest.json`),
+        fs.readFileSync(path.join(pkg, 'manifest.json')),
+      )
+    }
   }
+})
+
+test('CRAG config publication rejects missing or corrupt packages before changing node selection', async (t) => {
+  const root = tmpDir('kin-kvm-config-fail-')
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const slotDir = path.join(root, 'vms', vm.id)
+  fs.mkdirSync(path.join(slotDir, 'run'), { recursive: true })
+  fs.writeFileSync(path.join(slotDir, 'run/kernel.json'), JSON.stringify({ dataplane: 'crag' }))
+  const node = fakeNode()
+  const remote = `${node.session.host.root}/vms/${vm.id}`
+  const config = `${remote}/run/kernel.json`
+  const entry = `${remote}/cli-home/.kin/kin-kernel`
+  node.files.set(config, Buffer.from('old-config'))
+  node.files.set(entry, Buffer.from('old-entry'))
+  const target = { ...vm, runtime: { type: 'kvm' } }
+  await assert.rejects(pushSlotFiles(target, slotDir, ['run'], node.session), { code: 'slot_payload_missing' })
+  const pkg = seedEncryptedPackage(root)
+  fs.appendFileSync(path.join(pkg, 'crag-v2.payload.enc'), 'corrupt')
+  await assert.rejects(pushSlotFiles(target, slotDir, ['run'], node.session), { code: 'slot_payload_invalid' })
+  assert.equal(node.files.get(config).toString(), 'old-config')
+  assert.equal(node.files.get(entry).toString(), 'old-entry')
+})
+
+test('matching CRAG digest repairs missing and corrupt slot files without rewriting matching files', async (t) => {
+  const root = tmpDir('kin-slot-crag-repair-')
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  seedEncryptedPackage(root)
+  const node = fakeNode()
+  const remote = `${node.session.host.root}/vms/${vm.id}/slot-bin`
+  const payload = cragSlotPayload(root)
+  for (const file of payload.files)
+    node.files.set(`${remote}/${file.name.slice('opt/kin/'.length)}`, file.body || fs.readFileSync(file.src))
+  node.files.set(`${remote}/crag.digest`, Buffer.from(`${payload.digest}\n`))
+  const claude = 'crag-v2/claude-code-2.1.321/claude'
+  node.files.delete(`${remote}/${claude}`)
+  node.files.set(`${remote}/crag-kernel`, Buffer.from('stale-entry'))
+  const repaired = await pushCragSlot(vm, root, node.session)
+  assert.deepEqual(repaired.written.sort(), ['crag-kernel', claude].sort())
+  assert.equal(repaired.pushed, true)
+  for (const file of payload.files)
+    assert.deepEqual(
+      node.files.get(`${remote}/${file.name.slice('opt/kin/'.length)}`),
+      file.body || fs.readFileSync(file.src),
+    )
+  const again = await pushCragSlot(vm, root, node.session)
+  assert.equal(again.pushed, false)
+  assert.deepEqual(again.written, [])
 })
 
 test('cluster CRAG KVM refresh reaches the managed lifecycle for running and stopped slots', async () => {
