@@ -1,5 +1,5 @@
-# PR/main gate against the production baseline: deploy/payload.json pins the
-# exact ELFs running live, so CI only checks source and the pinned bytes.
+# Daily CI checks core behavior in changed components. Full regression and
+# native ARM packaging remain explicit manual checks, independent of PRs.
 name: ci
 
 on:
@@ -7,21 +7,34 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      full:
+        description: Run all unit/web tests and formatting checks
+        type: boolean
+        default: false
+      arm64:
+        description: Build and smoke-test the native ARM image
+        type: boolean
+        default: false
 
-# Only PR runs supersede each other; every main push keeps its own verdict so
-# it is visible when main turned red and when it recovered.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   changes:
     runs-on: ubuntu-latest
     outputs:
-      docs_only: ${{ steps.classify.outputs.docs_only }}
+      backend: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.backend == 'true' }}
+      go: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.go == 'true' }}
+      web: ${{ github.event_name == 'workflow_dispatch' || steps.filter.outputs.web == 'true' }}
+      packaging: ${{ inputs.full || steps.filter.outputs.packaging == 'true' }}
+      unit_tests: ${{ steps.filter.outputs.unit_tests_files || '[]' }}
+      web_tests: ${{ steps.filter.outputs.web_tests_files || '[]' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -30,186 +43,145 @@ jobs:
         if: github.event_name != 'workflow_dispatch'
         id: filter
         with:
+          list-files: json
           filters: |
-            docs:
-              - 'README.md'
-              - 'CHANGELOG.md'
-              - 'docs/**'
-              - 'VERSION'
-            non_docs:
-              - '**'
-              - '!README.md'
-              - '!CHANGELOG.md'
-              - '!docs/**'
-              - '!VERSION'
-      - id: classify
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-          elif [ "${{ steps.filter.outputs.docs }}" = "true" ] && [ "${{ steps.filter.outputs.non_docs }}" != "true" ]; then
-            echo "docs_only=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-          fi
+            backend:
+              - 'src/**'
+              - 'test/unit/**'
+              - 'test/fixtures/**'
+              - 'test/harness.mjs'
+              - 'scripts/**/*.mjs'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'pnpm-lock.yaml'
+              - 'biome.json'
+              - '.github/workflows/test.yml'
+            go:
+              - 'worker/**'
+              - 'api-kernel/**'
+              - 'redact/**'
+              - '.github/workflows/test.yml'
+            web:
+              - 'web/**'
+              - '.github/workflows/test.yml'
+            packaging:
+              - 'deploy/**'
+              - 'docker/**'
+              - 'share/**'
+              - 'scripts/docker-entrypoint.sh'
+              - 'scripts/fetch-payload.mjs'
+              - 'test/deploy/**'
+              - '.github/workflows/test.yml'
+            unit_tests:
+              - added|modified: 'test/unit/*.test.mjs'
+            web_tests:
+              - added|modified: 'web/src/**/*.test.ts'
+              - added|modified: 'web/src/**/*.test.tsx'
 
-  ci-lite:
+  ci:
     needs: changes
-    if: needs.changes.outputs.docs_only == 'true'
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - name: require change classification
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+        run: test "$CHANGES_RESULT" = success
       - uses: actions/checkout@v7
+        if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.go == 'true' || needs.changes.outputs.web == 'true' || needs.changes.outputs.packaging == 'true'
         with:
           fetch-depth: 0
       - name: merge current base
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request' && (needs.changes.outputs.backend == 'true' || needs.changes.outputs.go == 'true' || needs.changes.outputs.web == 'true' || needs.changes.outputs.packaging == 'true')
         env:
           BASE_REF: ${{ github.base_ref }}
         run: |
           git fetch --no-tags origin "$BASE_REF"
           git -c user.name=ci -c user.email=ci@localhost merge --no-edit FETCH_HEAD
       - uses: actions/setup-node@v7
+        if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.web == 'true' || needs.changes.outputs.packaging == 'true'
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: package-lock.json
       - run: npm ci
-      - name: format and syntax
-        run: |
-          npx biome format
-          test -z "$(gofmt -l worker api-kernel)" || { gofmt -l worker api-kernel; exit 1; }
-          find src scripts -name '*.mjs' -print0 | xargs -0 -n1 node --check
-
-  ci-prep:
-    needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - name: merge current base
-        if: github.event_name == 'pull_request'
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          git fetch --no-tags origin "$BASE_REF"
-          git -c user.name=ci -c user.email=ci@localhost merge --no-edit FETCH_HEAD
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: package-lock.json
-      - run: npm ci
-      - name: format and syntax
-        run: |
-          npx biome format
-          test -z "$(gofmt -l worker api-kernel)" || { gofmt -l worker api-kernel; exit 1; }
-          find src scripts -name '*.mjs' -print0 | xargs -0 -n1 node --check
-      - name: pinned payload
-        run: |
-          node scripts/fetch-payload.mjs
-          node scripts/fetch-payload.mjs --check
-      - name: native CLI packaging unit tests
-        run: python3 -m unittest discover -s test/deploy -p test_native_cli.py -v
-
-  ci-unit:
-    needs: [changes, ci-prep]
-    if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - name: merge current base
-        if: github.event_name == 'pull_request'
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          git fetch --no-tags origin "$BASE_REF"
-          git -c user.name=ci -c user.email=ci@localhost merge --no-edit FETCH_HEAD
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: package-lock.json
-      - run: npm ci
+        if: needs.changes.outputs.backend == 'true'
       - uses: actions/setup-go@v7
-        with:
-          go-version: '1.25.x'
-          cache-dependency-path: redact/go.sum
-      - name: stage pinned runtime helpers for unit tests
-        run: |
-          node scripts/fetch-payload.mjs
-          node scripts/fetch-payload.mjs --check
-      - run: npm run test:unit
-
-  ci-go:
-    needs: [changes, ci-prep]
-    if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - name: merge current base
-        if: github.event_name == 'pull_request'
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          git fetch --no-tags origin "$BASE_REF"
-          git -c user.name=ci -c user.email=ci@localhost merge --no-edit FETCH_HEAD
-      - uses: actions/setup-go@v7
+        if: needs.changes.outputs.go == 'true' || inputs.full
         with:
           go-version: '1.25.x'
           cache-dependency-path: |
             worker/go.sum
             api-kernel/go.sum
-      - name: go vet and test
+            redact/go.sum
+      - name: pinned payload
+        if: needs.changes.outputs.packaging == 'true'
         run: |
-          (cd worker && go vet ./... && go test ./...)
-          (cd api-kernel && go vet ./... && go test ./...)
-
-  ci-web:
-    needs: [changes, ci-prep]
-    if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - name: merge current base
-        if: github.event_name == 'pull_request'
+          node scripts/fetch-payload.mjs
+          node scripts/fetch-payload.mjs --check
+      - name: native CLI packaging unit tests
+        if: needs.changes.outputs.packaging == 'true'
+        run: python3 -m unittest discover -s test/deploy -p test_native_cli.py -v
+      - name: backend syntax
+        if: needs.changes.outputs.backend == 'true'
+        run: find src scripts -name '*.mjs' -print0 | xargs -0 -n1 node --check
+      - name: backend tests
+        if: needs.changes.outputs.backend == 'true'
         env:
-          BASE_REF: ${{ github.base_ref }}
+          FULL: ${{ inputs.full }}
+          CHANGED_TESTS: ${{ needs.changes.outputs.unit_tests }}
         run: |
-          git fetch --no-tags origin "$BASE_REF"
-          git -c user.name=ci -c user.email=ci@localhost merge --no-edit FETCH_HEAD
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: package-lock.json
+          if [ "$FULL" = true ]; then
+            npm run test:unit
+          else
+            tests=$(jq -r '.[] | split("/")[-1]' <<< "$CHANGED_TESTS")
+            changed=()
+            if [ -n "$tests" ]; then
+              mapfile -t changed <<< "$tests"
+            fi
+            npm run test:ci -- "${changed[@]}"
+          fi
+      - name: Go tests
+        if: needs.changes.outputs.go == 'true'
+        run: |
+          (cd worker && go test ./...)
+          (cd api-kernel && go test ./...)
+          (cd redact && go test ./...)
       - uses: pnpm/action-setup@v6
+        if: needs.changes.outputs.web == 'true'
         with:
           version: 10
           cache: true
           cache_dependency_path: web/pnpm-lock.yaml
-      - name: web
+      - name: web tests and build
+        if: needs.changes.outputs.web == 'true'
         working-directory: web
+        env:
+          FULL: ${{ inputs.full }}
+          CHANGED_TESTS: ${{ needs.changes.outputs.web_tests }}
         run: |
           pnpm install --frozen-lockfile
-          pnpm format:check
-          pnpm test
+          if [ "$FULL" = true ]; then
+            pnpm test
+          else
+            tests=$(jq -r '.[] | ltrimstr("web/")' <<< "$CHANGED_TESTS")
+            changed=()
+            if [ -n "$tests" ]; then
+              mapfile -t changed <<< "$tests"
+            fi
+            pnpm test:ci "${changed[@]}"
+          fi
           pnpm build
+      - name: full formatting checks
+        if: inputs.full
+        run: |
+          npx biome format
+          test -z "$(gofmt -l worker api-kernel redact)" || { gofmt -l worker api-kernel redact; exit 1; }
+          pnpm -C web format:check
 
   arm64-native-cli:
-    needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    if: github.event_name == 'workflow_dispatch' && inputs.arm64
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
