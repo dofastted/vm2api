@@ -2,12 +2,19 @@
 
 ## Unreleased
 
+## 1.4.084 — 2026-11-13 · HTTP 代理写入
+
+- 代理池支持写入 HTTP 代理：可粘贴 `http://user:pass@host:port`，或在字段导入时传 `scheme`/`protocol: http`；按协议去重，编辑保留协议，复制地址输出 `http://`。探活走 HTTP CONNECT（Basic 认证，407 报认证错误，非 HTTP 端口报 `not_http_proxy`）。不带协议的 `host:port` 仍默认 SOCKS5；`https://` 及其它协议拒绝。
 - 修复 Codex `server_is_overloaded` 在未提交响应前未进入同账号瞬时重试的问题；沿用现有预算，取消、响应已提交或非瞬时错误不重放。（#1004）
 - 脱敏 helper 按每次请求的 `failover.max_request_mib` 限额完整读取正文，超限返回不可重试的 413，不再固定截断到 32 MiB；保留在途请求限额快照和热更新后的脱敏映射。更新时须同步重编 `kin-redact`，不支持新限额协议的旧 helper 会明确拒绝启动。（#994）
 - 套餐徽章与 Jev 送审范围统一优先使用 profile 核实的套餐，保留套餐来源跨层传递；仅在缺少权威 profile 时使用 OAuth 订阅与 Max 速率档纠正导入默认 Pro，不再按 Fable 用量把 Pro 显示或送审为 Max。（#1008）
 - 调度档与官方登录用量推断增加 Pro OAuth 速率档否决，禁止 Fable 用量把 Pro 误升成 Max；profile 仍优先，用量回写不再丢失已核实的 profile 来源。（#1010）
 - 控制面启动保留槽 JSON 已有并发记录，仍初始化缺失值并同步账号准入；显式保存路由时才释放旧槽继承锁定，包括并发值恰好与档位相同的情况。（#1009）
 - 节点槽后台推送失败后按 1s / 5s / 15s 加抖动限次重试，同槽后续写入仍串行，重试读取最新文件；SSH 指纹不符或认证失败立即停止，仍须操作员处理。（#998）
+
+已知限制：槽位透明出口 `kin-egress` 仍只拨 SOCKS5，本版未改；HTTP 代理行可导入、探活，但绑到槽位后出口会启动失败，暂勿将 HTTP 代理绑定给槽位。
+
+已部署机升级：更新控制面并重启 Node；`kin-redact` 按 #994 说明同步重编。不执行 `wrap-cli/sync`，不切换 CRAG 内核。
 
 ## 1.4.083 — 2026-11-13 · Haiku 小预算探针
 
