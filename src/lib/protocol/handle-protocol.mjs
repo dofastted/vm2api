@@ -159,6 +159,7 @@ import {
 } from '../identity/crs-persona-usage.mjs'
 import {
   applyCacheTtlToUsage,
+  normalizeCacheTtlToBody,
   cacheBreakpointsFromRoutingFile,
   pinConversationCacheTtl,
   resolveCacheTtl,
@@ -1314,11 +1315,8 @@ export function createHandleProtocol(deps) {
     // After OpenAI→Anthropic conversion so function tools already have input_schema;
     // leftover OpenAI-shaped tools are still marked (rewrite / mixed inbound).
     if (!apiOpenAI) ctx.body = applyEagerToolStreaming(ctx.body, getRouting())
-    // #850: every rewritten inbound. A cache marker without a TTL means "not
-    // chosen", for Claude Code and third-party callers alike; resolve it to this
-    // conversation's TTL before rendering, so the template budgets against the
-    // real value and no caller marker reaches Anthropic as implicit 5m. Explicit
-    // TTLs stay. Passthrough keeps the caller body untouched.
+    // Resolve the session TTL before persona assembly; generated markers must
+    // follow the first inbound cache TTL rather than a later mixed marker.
     if (!apiOpenAI && !requestContext && !officialPassthrough) {
       ctx.body = fillMissingCacheTtl(ctx.body, requestedCacheTtl)
     }
@@ -1345,6 +1343,7 @@ export function createHandleProtocol(deps) {
         model: ctx.body?.model,
         cliVersion: OFFICIAL_CLI_VERSION,
       })
+    if (!officialPassthrough && !requestContext) ctx.body = normalizeCacheTtlToBody(ctx.body, requestedCacheTtl)
     let personaHideTokens =
       requestContext || apiOpenAI
         ? 0

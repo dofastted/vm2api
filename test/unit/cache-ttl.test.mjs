@@ -12,6 +12,7 @@ import {
   pinConversationCacheTtl,
   resolveCacheTtl,
   stripIllegalCacheControlFields,
+  normalizeCacheTtlToBody,
 } from '../../src/lib/protocol/cache-ttl.mjs'
 import { calculateCost } from '../../src/lib/admin/pricing.mjs'
 
@@ -31,6 +32,26 @@ test('header overrides routing default', () => {
   assert.equal(resolveCacheTtl({ headers: {}, routing: { compatibility: { cache_ttl: '1h' } } }), '1h')
   assert.equal(resolveCacheTtl({ headers: {}, routing: { compatibility: {} } }), '1h')
   assert.equal(resolveCacheTtl({ headers: {}, routing: { compatibility: { cache_ttl: '5m' } } }), '5m')
+})
+test('the first explicit TTL in Anthropic wire order controls session resolution', () => {
+  const body = {
+    tools: [{ name: 'Read', cache_control: { type: 'ephemeral', ttl: '5m' } }],
+    system: [{ type: 'text', text: 'system', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'tail', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+    ],
+  }
+  assert.equal(resolveCacheTtl({ headers: {}, body, routing: { compatibility: { cache_ttl: '1h' } } }), '5m')
+  const implicitFirst = {
+    system: [
+      { type: 'text', text: 'implicit', cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: 'later hour', cache_control: { type: 'ephemeral', ttl: '1h' } },
+    ],
+  }
+  assert.equal(
+    resolveCacheTtl({ headers: {}, body: implicitFirst, routing: { compatibility: { cache_ttl: '1h' } } }),
+    '5m',
+  )
 })
 
 test('ttl-less markers (official Claude Code) take the settings menu value', () => {
@@ -163,8 +184,16 @@ test('applyCacheTtlToBody default 5m overwrites leftover system 1h', () => {
   )
   assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral', ttl: '5m' })
 })
+test('final TTL normalization retains cache marker scope', () => {
+  const input = {
+    system: [{ type: 'text', text: 'cached', cache_control: { type: 'ephemeral', ttl: '1h', scope: 'global' } }],
+  }
+  const out = normalizeCacheTtlToBody(input, '5m')
+  assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral', ttl: '5m', scope: 'global' })
+  assert.equal(input.system[0].cache_control.ttl, '1h')
+})
 
-test('tool 5m then system 1h is downgraded so Anthropic order stays legal', () => {
+test('a 5m tool marker normalizes all later cache markers to 5m', () => {
   const live = {
     tools: [
       { name: 'search' },
@@ -172,31 +201,39 @@ test('tool 5m then system 1h is downgraded so Anthropic order stays legal', () =
       { name: 'web_search' },
     ],
     system: [
-      { type: 'text', text: 'billing' },
-      { type: 'text', text: 'identity' },
       { type: 'text', text: 'expansion', cache_control: { type: 'ephemeral', ttl: '1h', scope: 'global' } },
       { type: 'text', text: 'env', cache_control: { type: 'ephemeral', ttl: '5m' } },
     ],
     messages: [
-      {
-        role: 'user',
-        content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral', ttl: '5m' } }],
-      },
+      { role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
     ],
   }
   const out = enforceCacheTtlOrder(live)
   assert.equal(out.tools[1].cache_control.ttl, '5m')
-  assert.deepEqual(out.system[2].cache_control, { type: 'ephemeral', ttl: '5m' })
-  assert.deepEqual(out.system[3].cache_control, { type: 'ephemeral', ttl: '5m' })
+  assert.equal(out.system[0].cache_control.ttl, '5m')
+  assert.equal(out.system[1].cache_control.ttl, '5m')
+  assert.equal(out.messages[0].content[0].cache_control.ttl, '5m')
+  assert.equal(live.system[0].cache_control.ttl, '1h')
 })
 
-test('a leading 1h is removed when any later breakpoint is 5m', () => {
+test('a 1h first marker normalizes later 5m markers to 1h', () => {
+  const out = enforceCacheTtlOrder({
+    system: [{ type: 'text', text: 'first', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'later', cache_control: { type: 'ephemeral', ttl: '5m' } }] },
+    ],
+  })
+  assert.equal(out.system[0].cache_control.ttl, '1h')
+  assert.equal(out.messages[0].content[0].cache_control.ttl, '1h')
+})
+
+test('a missing TTL is normalized to the first marker TTL', () => {
   const out = enforceCacheTtlOrder({
     system: [{ type: 'text', text: 'early', cache_control: { type: 'ephemeral', ttl: '1h' } }],
     messages: [{ role: 'user', content: [{ type: 'text', text: 'later', cache_control: { type: 'ephemeral' } }] }],
   })
-  assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral', ttl: '5m' })
-  assert.deepEqual(out.messages[0].content[0].cache_control, { type: 'ephemeral' })
+  assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+  assert.deepEqual(out.messages[0].content[0].cache_control, { type: 'ephemeral', ttl: '1h' })
 })
 
 test('applyCacheTtlToBody rewrites every cache marker to selected 5m', () => {

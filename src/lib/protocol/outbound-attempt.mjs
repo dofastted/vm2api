@@ -46,11 +46,11 @@ import {
 import {
   applyCacheTtlToBody,
   applyMessageBreakpoints,
+  normalizeCacheTtlToBody,
   DEFAULT_CACHE_TTL,
   enforceCacheTtlOrder,
   normalizeCacheTtl,
   listCacheMarkers,
-  removeCacheControlFields,
   stripIllegalCacheControlFields,
   validateCacheBreakpoints,
 } from './cache-ttl.mjs'
@@ -439,7 +439,9 @@ export function prepareCliHopBody(
       }
     }
   }
-  return applyEagerToolStreaming(body, routing)
+  const prepared = applyEagerToolStreaming(body, routing)
+  const finalTtl = normalizeCacheTtl(cacheTtl)
+  return preserveSystem ? prepared : normalizeCacheTtlToBody(prepared, finalTtl)
 }
 
 export function prepareOutboundAttempt({

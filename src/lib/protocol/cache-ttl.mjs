@@ -43,26 +43,25 @@ export function cacheTtlFromRoutingFile(filePath) {
   }
 }
 
-/** Highest explicit inbound TTL. Mixed requests use 1h, then every marker is normalized to it. */
+/** First effective inbound TTL; TTL-less-only bodies still use the menu setting. */
 export function bodyCacheTtl(body) {
   if (!body || typeof body !== 'object') return null
-  const ttls = []
-  const collect = (control) => {
-    if (!control || typeof control !== 'object') return
+  let first = null
+  let hasExplicit = false
+  const collect = (node) => {
+    const control = node?.cache_control
+    if (control?.type !== 'ephemeral') return
     const raw = String(control.ttl || '').trim()
-    if (raw) ttls.push(normalizeCacheTtl(raw))
+    if (first == null) first = raw ? normalizeCacheTtl(raw) : '5m'
+    if (raw) hasExplicit = true
   }
-  collect(body.cache_control)
-  if (Array.isArray(body.tools)) for (const tool of body.tools) collect(tool?.cache_control)
-  if (Array.isArray(body.system)) for (const block of body.system) collect(block?.cache_control)
-  if (Array.isArray(body.messages)) {
-    for (const message of body.messages) {
-      if (!Array.isArray(message?.content)) continue
-      for (const block of message.content) collect(block?.cache_control)
-    }
+  for (const tool of Array.isArray(body.tools) ? body.tools : []) collect(tool)
+  for (const block of Array.isArray(body.system) ? body.system : []) collect(block)
+  for (const message of Array.isArray(body.messages) ? body.messages : []) {
+    for (const block of Array.isArray(message?.content) ? message.content : []) collect(block)
   }
-  if (ttls.includes('1h')) return '1h'
-  return ttls.includes('5m') ? '5m' : null
+  collect(body)
+  return hasExplicit ? first : null
 }
 
 export function bodyRequestsHourCache(body) {
@@ -305,10 +304,6 @@ export function ephemeralCacheTtl(control) {
   return String(control.ttl || '5m').toLowerCase() === '1h' ? '1h' : '5m'
 }
 
-function downgradePinnedHourToFive() {
-  return { type: 'ephemeral', ttl: '5m' }
-}
-
 function walkCacheNodes(body, mapFn) {
   const out = { ...body }
   if (out.cache_control) {
@@ -328,23 +323,49 @@ function walkCacheNodes(body, mapFn) {
 }
 
 /**
- * One TTL per request. Anthropic reads a missing ttl as 5m and rejects a later
- * 1h. If any breakpoint is 5m, every 1h is rewritten to 5m. Never upgrade 5m
- * to 1h: wrap re-adds ttl-less tools after that upgrade and the 1h 400s.
+ * Anthropic permits one cache TTL per request prefix. Read markers in the
+ * provider's evaluation order so a caller's first 5m marker also governs
+ * markers added later by persona or CLI assembly.
  */
+function firstCacheTtlInWireOrder(body) {
+  const ttlOf = (node) => {
+    const control = node?.cache_control
+    return control?.type === 'ephemeral' ? ephemeralCacheTtl(control) : null
+  }
+  for (const tool of Array.isArray(body?.tools) ? body.tools : []) {
+    const ttl = ttlOf(tool)
+    if (ttl) return ttl
+  }
+  for (const block of Array.isArray(body?.system) ? body.system : []) {
+    const ttl = ttlOf(block)
+    if (ttl) return ttl
+  }
+  for (const message of Array.isArray(body?.messages) ? body.messages : []) {
+    for (const block of Array.isArray(message?.content) ? message.content : []) {
+      const ttl = ttlOf(block)
+      if (ttl) return ttl
+    }
+  }
+  return ttlOf(body)
+}
+
+/** Normalize every final marker to the first wire TTL. */
 export function enforceCacheTtlOrder(body) {
   if (!body || typeof body !== 'object') return body
-  let has5m = false
-  walkCacheNodes(body, (node) => {
-    if (node?.cache_control && ephemeralCacheTtl(node.cache_control) === '5m') has5m = true
-    return node
-  })
-  if (!has5m) return body
+  const target = firstCacheTtlInWireOrder(body)
+  return target ? normalizeCacheTtlToBody(body, target) : body
+}
+
+/** Normalize ephemeral TTLs without discarding scope or other marker fields. */
+export function normalizeCacheTtlToBody(body, ttl = DEFAULT_CACHE_TTL) {
+  if (!body || typeof body !== 'object') return body
+  const target = normalizeCacheTtl(ttl)
   let changed = false
   const fix = (node) => {
-    if (!node?.cache_control || ephemeralCacheTtl(node.cache_control) !== '1h') return node
+    const control = node?.cache_control
+    if (control?.type !== 'ephemeral' || control.ttl === target) return node
     changed = true
-    return { ...node, cache_control: downgradePinnedHourToFive() }
+    return { ...node, cache_control: { ...control, ttl: target } }
   }
   const out = walkCacheNodes(body, fix)
   return changed ? out : body
@@ -418,15 +439,11 @@ export function cacheBreakpointsFromRoutingFile(filePath) {
 }
 
 /**
- * enforceCacheTtlOrder downgrades a 1h block that lands after a 5m one, so
- * injecting 5m ahead of a caller's 1h breakpoint would silently kill the
- * caller's intent. Inject at the highest tier the body already asks for.
- *
- * Read this from the inbound body: persona rebuilds `system` from a template and
- * drops the caller's blocks, so by outbound time the 1h marker may be gone.
+ * Use the first inbound TTL in wire order. Persona or CLI assembly must not
+ * introduce a later 1h marker after a caller-selected 5m prefix.
  */
 export function highestInboundCacheTtl(body, fallback = DEFAULT_CACHE_TTL) {
-  return bodyRequestsHourCache(body) ? '1h' : normalizeCacheTtl(fallback)
+  return bodyCacheTtl(body) ?? normalizeCacheTtl(fallback)
 }
 
 /**
