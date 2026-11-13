@@ -1129,7 +1129,7 @@ export function createHandleProtocol(deps) {
       }
     } else if (!apiOpenAI) {
       // Classify against the original budget, before the floor and persona add content.
-      // Only the legacy Haiku one-shot probe shape opts out of implicit CLI thinking.
+      // The health monitor can carry a longer diagnostic marker than an external short probe.
       if (
         !officialPassthrough &&
         !Object.hasOwn(ctx.body, 'thinking') &&
@@ -1138,7 +1138,11 @@ export function createHandleProtocol(deps) {
         Number.isInteger(inbound.max_tokens) &&
         inbound.max_tokens > 0 &&
         inbound.max_tokens <= 64 &&
-        isShortProbeRequest(inbound)
+        (isShortProbeRequest(inbound) ||
+          (isHealthRealBypass(req.headers) &&
+            !ctx.body.tools?.length &&
+            ctx.body.messages?.length === 1 &&
+            ctx.body.messages[0]?.role === 'user'))
       ) {
         ctx.body = { ...ctx.body, thinking: { type: 'disabled' } }
       }

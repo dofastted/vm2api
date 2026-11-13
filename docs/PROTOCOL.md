@@ -119,6 +119,8 @@ DSH 在压缩压力下会把旧工具结果改为前4096码点、固定middle-pr
 
 连接测试及真实健康探针显式选择 thinking：允许关闭的模型发送 `{"type":"disabled"}`，要求 adaptive 的模型仍发送 adaptive。普通入站只有 Haiku 4.5 的小预算单次探针（原始 `max_tokens` 为 1–64 的整数、单条最多 64 字符的纯文本 user、无 system/tools/显式 thinking，且非官方透传）补 disabled；输出下限与模型 cap 沿用现有配置，不扩大预算、不改普通会话或调用方显式思考选择。
 
+显式携带既有 `x-kin-health-real` 标记的真实健康请求，在同样的 Haiku 4.5、1–64 token、单 user、无 system/tools/显式 thinking 条件下补 disabled，不以诊断标记的正文长度排除；没有此标记的普通长正文保持原行为。
+
 CRAG 需配套原生 helper 将显式 disabled 送到官方 Claude 的最终 fetch 边界；旧签名内核可能忽略该字段。修改 Node 或只热写配置不等于已更新运行中的 CRAG；新内核需要按现有签名交付与排空安装流程生效，不能用全局 `CLAUDE_CODE_MAX_OUTPUT_TOKENS` 覆盖所有模型来替代。
 
 

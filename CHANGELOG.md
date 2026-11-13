@@ -4,9 +4,9 @@
 
 - Haiku 4.5 无 system/tools/显式 thinking 的 1–64 token 单次短探针显式关闭思考；保留原请求预算、既有输出下限和调用方显式思考选择，不调整普通会话或全局输出上限。
 - 面板连接测试与真实健康探针显式选择 thinking：允许关闭的模型发送 disabled，必须 adaptive 的模型保持 adaptive。
-- 配套 CRAG v2.8.17 正式签名加密包，将显式 disabled 送达原版 Claude Code 2.1.321 的最终 fetch 边界，不再被 CLI 自产 enabled/adaptive 块覆盖。发行公钥、产品授权与官方 Claude 字节保持不变。
+- 沿用现有 pinned payload 与 CRAG v2.8.16，不构建、发布或切换新内核。本版仅更新 Node 控制面的请求整流和配套控制台版本。
 
-已部署机升级：控制面更新并重启 Node 后，CRAG 槽还必须逐个排空、安装本版签名内核并核对实际运行的 memfd core 摘要；仅更新版本号、配置或下载指针不会使已运行的旧内核生效。普通 cli-node/wrap 字节未变，不需要为本修复执行全池 `wrap-cli/sync`。保留配置、凭据、设备授权、人工调度关与停止槽原状态。
+已部署机升级：只更新控制面并重启 Node；不执行 `wrap-cli/sync`，不改 CRAG 出厂包、下载指针或槽内运行进程。保留配置、凭据、设备授权、人工调度关与停止槽原状态。实际请求结果以部署后的原始 Haiku 探针验收为准。
 
 ## 1.4.081 — 2026-11-13 · CRAG KVM 适配版
 

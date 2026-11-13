@@ -166,6 +166,22 @@ test('Haiku small one-shot probes disable implicit thinking without increasing t
   }
 })
 
+test('declared real Haiku health probes disable thinking without rewriting ordinary longer prompts', async (t) => {
+  const input = {
+    model: 'claude-haiku-4-5',
+    max_tokens: 32,
+    messages: [
+      { role: 'user', content: 'Reply with the single word pong. Release check 00000000000000000000000000000000' },
+    ],
+  }
+  const options = { preset: 'zero', compatibility: { min_max_tokens: { enabled: true, value: 64 } }, input }
+  const probe = await outbound(t, { ...options, headers: { 'x-kin-health-real': '1' } })
+  assert.deepEqual(probe.thinking, { type: 'disabled' })
+  assert.equal(probe.max_tokens, 64)
+  const ordinary = await outbound(t, options)
+  assert.equal(ordinary.thinking, undefined)
+})
+
 test('Haiku probe normalization preserves explicit thinking and ordinary requests', async (t) => {
   const base = { model: 'claude-haiku-4-5', max_tokens: 32, messages: [{ role: 'user', content: 'hello' }] }
   for (const input of [
