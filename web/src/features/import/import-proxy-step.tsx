@@ -251,7 +251,9 @@ export function ImportProxyStep({
           ref={pasteRef}
           rows={2}
           aria-label='粘贴 SOCKS5'
-          placeholder={'host:port:user:pass\nsocks5://user:pass@host:1080\nhttp://user:pass@host:8080'}
+          placeholder={
+            'host:port:user:pass\nsocks5://user:pass@host:1080\nhttp://user:pass@host:8080'
+          }
           onBlur={() => void flushPaste()}
         />
         <Button
