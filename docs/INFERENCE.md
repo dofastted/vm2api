@@ -90,8 +90,8 @@ Codex `/internal/v1/codex/responses` 不套用 Messages 校验。
 
 仅当受管 CRAG 的认证 health 在 `capabilities` 中声明 `native_handoff_v1`，面板才在内部
 `gateway_policy` 中设置布尔值 `native_handoff_v1: true`。分类器继续使用独立的
-`request_context` 契约，不冒充普通推理。不能仅凭版本号推断支持；已发布的 CRAG 2.8.16
-没有该能力，旧槽保留 legacy 路径，不能将只更新 Node 宣称为两项故障已修复。
+`request_context` 契约，不冒充普通推理。配套发行包为 CRAG 2.8.17，但仍不能仅凭版本号推断支持；
+CRAG 2.8.16 没有该能力，旧槽保留 legacy 路径，不能将只更新 Node 宣称为两项故障已修复。
 
 职责分工：
 
