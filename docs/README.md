@@ -2,7 +2,8 @@
 
 - [DEPLOY.md](DEPLOY.md) — 安装与升级（含 `deploy/install.sh` 一键安装 / 更新）
 - [nginx-shell.md](nginx-shell.md) — 集群 / 槽运维终端 WebSocket 连不上时查 nginx Upgrade
-- [FORMAT.md](FORMAT.md) — 本地与 CI 同一套格式（Biome / gofmt / Prettier，LF）
+- [开发验证与 CI](../README.md#开发验证与-ci) — 核心集、指定测试文件、按目录触发与手动全量 / ARM 检查
+- [FORMAT.md](FORMAT.md) — 仅格式化改动文件；手动全量 CI 使用同一套 Biome / gofmt / Prettier 配置（LF）
 - [API.md](API.md) — `/v1`
 - [RISK.md](RISK.md) — 封控拦截（蒸馏 → 硬正则 → 拒答缓存 → 决策模型 → 放行出站）
 - [PANEL_API.md](PANEL_API.md) — 管理台 API

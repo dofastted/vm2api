@@ -48,6 +48,7 @@
 - [干净度基准（Benchmarks）](#-干净度基准评测benchmarks)
 - [部署安装](#部署安装)
 - [接口与协议兼容](#-接口与协议兼容)
+- [开发验证与 CI](#开发验证与-ci)
 - [问题反馈](#-问题反馈--issue-reporting)
 
 ---
@@ -269,6 +270,7 @@ vm2api 内置全栈自适应网关，原生支持以下所有主流生态：
 - [Screenshots](#screenshots)
 - [Cleanliness Benchmarks](#-cleanliness-benchmarks)
 - [Deployment](#deployment)
+- [Development checks](#开发验证与-ci)
 - [Issue reporting](#-问题反馈--issue-reporting)
 
 ---
@@ -412,6 +414,37 @@ After deployment, access:
 - **API Endpoint**: `POST http://<YOUR_IP>:8787/v1/messages`
 
 See [docs/DEPLOY.md](docs/DEPLOY.md) for panel one-click updates and compose workflows.
+
+---
+
+## 开发验证与 CI
+
+CI 配置以 [`.github/workflows/test.yml`](.github/workflows/test.yml) 为准，使用 Node.js 22、pnpm 10 和 Go 1.25。日常验证优先运行本次改动涉及的核心测试或指定测试文件，完整回归按需运行。
+
+先按需安装依赖：后端 `npm ci`，前端 `pnpm -C web install --frozen-lockfile`。以下命令均在仓库根目录执行：
+
+| 目的                        | 命令                                                          |
+| --------------------------- | ------------------------------------------------------------- |
+| 后端核心集（12 个测试文件） | `npm run test:ci`                                             |
+| 前端核心集（6 个测试文件）  | `pnpm -C web test:ci`                                         |
+| 指定后端测试文件            | `npm run test:unit -- api-keys`（也接受 `api-keys.test.mjs`） |
+| 指定前端测试文件            | `pnpm -C web exec vitest run src/lib/session.test.ts`         |
+| 后端全量单测                | `npm run test:unit`                                           |
+| 前端全量单测                | `pnpm -C web test`                                            |
+| 前端类型检查与生产构建      | `pnpm -C web build`                                           |
+
+日常 CI 的业务结果统一为 `ci`，`changes` 负责识别改动目录：
+
+- 后端改动运行语法检查和核心集，追加本次新增或修改的后端单测文件；前端改动运行核心集、追加新增或修改的前端测试文件，并执行类型检查与生产构建。本地 `test:ci` 命令只运行固定核心集。
+- `worker/`、`api-kernel/` 或 `redact/` 改动会运行这三个 Go 模块的 `go test ./...`；打包相关改动才下载和校验 pinned payload、执行 native CLI 打包单测。
+- 纯文档或 `VERSION` 改动只做目录识别与状态收尾，不安装依赖、不运行业务测试。
+- 全仓格式检查与 ARM 镜像构建不作为日常 CI 的必过条件。格式工具和仅处理改动文件的方法见 [docs/FORMAT.md](docs/FORMAT.md)。
+
+需要更广的验证时，在 GitHub Actions 的 `ci` 工作流选择 **Run workflow**：`full=true` 运行后端、前端全量单测、三个 Go 模块测试、payload/打包检查和全仓格式检查；`arm64=true` 独立启用原生 ARM 镜像构建及离线 smoke 测试，`full` 不会自动开启 ARM 检查。两项默认均为 `false`。
+
+原有 `npm test` / `npm run test:all` 仍执行后端全量单测和 `worker` race 测试，不包含前端、`api-kernel`、`redact` 或 E2E。CI 绿灯只表示该次实际执行的检查通过；日常 CI 不代表全量、ARM 或生产验证已经完成。
+
+Daily CI runs core tests plus added or modified test files for affected components. Full regression and formatting checks are available with `full=true`; native ARM packaging is enabled separately with `arm64=true`.
 
 ---
 
