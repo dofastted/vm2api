@@ -6,4 +6,6 @@ Linux amd64 的本机和集群 KVM 槽使用同一套 CRAG V2 签名加密发行
 
 集群 KVM 的入口和完整发行包放在节点的持久 slot-bin 中，经只读 payload 共享给 guest。发布 kernel.json 时同步 guest 的内核选择，首次启动、重载和双向更换都使用对应入口。Unix socket 留在 guest 的 `/run/kin-guest`，授权与工作目录使用现有 `/run/kin` 共享。
 
+自 v1.4.082 起，发布 CRAG 配置前先验证并补齐节点 slot-bin 的完整签名包，包括配置引用的官方 Claude；包缺失或校验失败时不发布新配置。同步逐文件核对 SHA256，即使 crag.digest 相同也会修复缺失或损坏的文件，已匹配的二进制不重复替换。旧版受影响的集群 KVM 槽可升级控制面后在内核页重装。
+
 仅管理本机槽时，也可用 `deploy/install.sh crag-update` 更新既有 CRAG 副本，包括本机 KVM；运行核心哈希通过 guest 执行通道读取。该独立脚本仍拒绝包含活动集群 CRAG 槽的安装，集群槽请使用内核页选择目标并重装。此功能不包含 CRAG KVM 的跨节点迁移支持。
