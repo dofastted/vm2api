@@ -97,7 +97,7 @@ export type WindowReadout = {
   reset: unknown
 }
 
-/** 5H → 7D → Fable。Fable 只在 Max 且有读数或明确态时出现。 */
+/** 5H → 7D → Fable；无读数的 Fable 窗口展示探测状态。 */
 export function vmWindows(vm: Vm): WindowReadout[] {
   const probed = (w: '5h' | '7d') =>
     vm.has_token && windowProbed(vm, w) ? usedPctOf(vm, w) : null

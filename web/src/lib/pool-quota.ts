@@ -1,6 +1,7 @@
 import type { Vm } from '@/types/panel-vm'
 import { expiresAtToMs, fableUsedOf, fableWeeklyFull } from '@/lib/fable-status'
 import { pct, usedPctOf } from '@/lib/format'
+import { isCodexVm } from '@/lib/vm-kind'
 import { accountUsable, claudeTier, fablePlanDenied } from '@/lib/vm-status'
 
 /**
@@ -13,8 +14,8 @@ import { accountUsable, claudeTier, fablePlanDenied } from '@/lib/vm-status'
  * - 容量按「账号数」计：每张可用凭证贡献 1 个满窗口。
  * - 消耗为各凭证已用比例之和（账号当量）。未探测的凭证计容量、消耗按 0，
  *   在分段图里以虚线空段标出，不冒充「确认可用」。
- * - Fable 容量只含 Max 档且未被拒 Fable 权限、未被 Fable 封禁的凭证——
- *   Pro 号没有 Fable 窗口，计入只会稀释这个数。
+ * - Fable 容量包含 Max 的套餐窗口，以及其他档位由上游返回的窗口。
+ *   没有窗口证据的其他档位、被拒 Fable 权限或被封禁的凭证不计入。
  */
 export type PoolQuotaSeg = {
   id: string
@@ -113,14 +114,17 @@ export function poolQuota(vms: Vm[]): {
     })
     const fb = vm.fable || {}
     const tier = claudeTier(vm)
-    if (tier.key !== 'max' || fablePlanDenied(fb) || fb.banned) continue
-    const used = fableUsedOf(vm, tier.key)
-    const weeklyFull = fableWeeklyFull(vm, tier.key)
+    if (isCodexVm(vm) || fablePlanDenied(fb) || fb.banned) continue
+    const used = fableUsedOf(vm)
+    const weeklyFull = fableWeeklyFull(vm)
+    const hasWindow =
+      used != null || weeklyFull || Boolean(fb.ok) || Boolean(vm.reset_7d_oi)
+    if (tier.key !== 'max' && !hasWindow) continue
     wf.push({
       id: vm.id,
       name,
       usedPct: weeklyFull ? 100 : used == null ? 0 : clampPct(used),
-      probed: used != null || weeklyFull || Boolean(fb.ok),
+      probed: used != null || weeklyFull,
       resetAt: expiresAtToMs(vm.reset_7d_oi),
     })
   }

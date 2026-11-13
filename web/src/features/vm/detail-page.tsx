@@ -522,7 +522,6 @@ function VmDetailBody({
             dash={dash}
             u5={u5}
             u7={u7}
-            tierKey={tierKey}
             now={now}
             cost={cost}
             split={split}
