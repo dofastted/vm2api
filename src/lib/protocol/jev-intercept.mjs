@@ -509,8 +509,23 @@ export function scopePlatformOf(account = {}) {
   return 'claude'
 }
 
+/** Profile and OAuth subscription drive review scope; usage only fills missing metadata. */
+function claudeSubscriptionPlan(account = {}) {
+  const tier = scopeText(account.account_tier)
+  if (account.account_tier_source === 'profile' && (tier === 'max' || tier === 'pro')) return tier
+  let plan = scopeText(account.subscription_type)
+  if (
+    (!plan || plan === 'free' || plan === 'pro') &&
+    /(?:^|_)claude_max(?:_|$)/.test(scopeText(account.rate_limit_tier))
+  )
+    plan = 'max'
+  return plan === 'max' || plan === 'pro' ? plan : null
+}
+
 export function scopePlanOf(account = {}) {
   if (scopePlatformOf(account) === 'gpt') return gptPlanBucket(account.plan_type)
+  const plan = claudeSubscriptionPlan(account)
+  if (plan) return plan
   const hasUsage =
     account.usage_has_fable != null ||
     account.utilization_7d_oi != null ||
@@ -564,9 +579,8 @@ function compareScopeKeys(left, right) {
 }
 
 /**
- * The same key the panel chip uses. Claude Max/Pro follows `inferClaudeTier`
- * (usage Fable wins over a stored or defaulted Pro). `quota` is the account
- * unified record when the caller has it; summaries often lack it.
+ * The same subscription precedence as the panel chip, with usage as a legacy fallback.
+ * `quota` is the account unified record when available; summaries often lack it.
  */
 export function scopeAccountFromVm(vm = {}, quota = null) {
   if (!vm || typeof vm !== 'object') return null
@@ -574,11 +588,20 @@ export function scopeAccountFromVm(vm = {}, quota = null) {
   const attached = vm.quota && typeof vm.quota === 'object' ? vm.quota.unified || vm.quota : {}
   const passed = quota && typeof quota === 'object' ? quota.unified || quota : {}
   const q = { ...attached, ...passed }
-  const storedTier = scopeText(vm.claude?.account_tier || q.account_tier || vm.account_tier)
+  // Keep each tier paired with its source, and do not mask a verified quota profile
+  // with a legacy usage tier from the slot file.
+  const profile = [vm.claude, q, vm].find(
+    (record) => record?.account_tier_source === 'profile' && ['pro', 'max'].includes(scopeText(record.account_tier)),
+  )
+  const tierFrom = profile || (vm.claude?.account_tier ? vm.claude : q.account_tier ? q : vm)
+  const storedTier = scopeText(tierFrom.account_tier)
   const view = {
     has_token: !!(vm.has_token || vm.has_access || hasAccessPresence(vm.claude || {})),
     has_access: !!(vm.has_access || vm.claude?.has_access || vm.has_token || hasAccessPresence(vm.claude || {})),
     account_tier: storedTier === 'codex' ? null : storedTier || null,
+    account_tier_source: tierFrom.account_tier_source || null,
+    subscription_type: vm.claude?.subscription_type || vm.subscription_type || null,
+    rate_limit_tier: vm.claude?.rate_limit_tier || vm.rate_limit_tier || q.rate_limit_tier || null,
     usage_has_fable: q.usage_has_fable ?? vm.usage_has_fable ?? null,
     utilization_7d_oi: q.utilization_7d_oi ?? vm.utilization_7d_oi ?? null,
     reset_7d_oi: q.reset_7d_oi || vm.reset_7d_oi || null,
@@ -594,6 +617,10 @@ export function scopeAccountFromVm(vm = {}, quota = null) {
     platform,
     plan_type: platform === 'gpt' ? vm.plan_type || vm.codex?.plan_type || null : null,
     account_tier: tier === 'max' || tier === 'pro' ? tier : null,
+    // Preserve the metadata so scopeKeyOf re-derives the same subscription plan.
+    account_tier_source: view.account_tier_source,
+    subscription_type: view.subscription_type,
+    rate_limit_tier: view.rate_limit_tier,
     has_token: view.has_token,
     usage_has_fable: view.usage_has_fable,
     utilization_7d_oi: view.utilization_7d_oi,

@@ -60,7 +60,7 @@ function rewriteStamps(body) {
   )
 }
 
-test('openai.chat / messages / responses convert to the same cacheable block shape', () => {
+test('openai.chat / messages / responses convert to blocks and retain caller cache boundaries', () => {
   const chat = toClaudeMessages('openai.chat', {
     model: MODEL,
     max_tokens: 256,
@@ -138,8 +138,10 @@ test('openai.chat / messages / responses convert to the same cacheable block sha
     assert.deepEqual(body.tools[0].cache_control, { type: 'ephemeral', ttl: '1h' })
   }
 
-  assert.deepEqual(rewriteStamps(chat), rewriteStamps(messages))
-  assert.deepEqual(rewriteStamps(responses), rewriteStamps(messages))
+  const callerStamps = ['tools[0]', 'messages[2].content[0]']
+  assert.deepEqual(rewriteStamps(chat), callerStamps)
+  assert.deepEqual(rewriteStamps(messages), callerStamps)
+  assert.deepEqual(rewriteStamps(responses), [...callerStamps, 'messages[4].content[0]'])
 })
 
 test('unofficial cli-hop converts openai.chat and messages to the same marked shape', () => {

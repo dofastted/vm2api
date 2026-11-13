@@ -9,6 +9,7 @@ import {
   normalizePanelExpiresAt,
   quotaFromAccount,
 } from '../../src/lib/admin/panel-api.mjs'
+import { guardUsageTier } from '../../src/lib/pool/claude-tier.mjs'
 
 const usageOk = { ok: true, source: 'vm-oauth-usage', at: '2026-08-24T00:00:00.000Z' }
 const officialOk = { ok: true, source: 'official-cc-usage', at: '2026-08-24T00:00:00.000Z' }
@@ -581,4 +582,54 @@ test('quotaFromAccount clears to 0 and active when reset has elapsed', () => {
   const q = quotaFromAccount(acc)
   assert.equal(q.utilization_5h, 0)
   assert.equal(q.status_5h, 'active')
+})
+
+test('Pro rate metadata vetoes usage-derived Max but never a verified profile', () => {
+  const fable = { usage_has_fable: true, utilization_7d_oi: 0, status_7d_oi: 'allowed' }
+  assert.equal(inferClaudeTier({ has_token: true, rate_limit_tier: 'default_claude_ai' }, fable).key, 'pro')
+  assert.equal(
+    inferClaudeTier(
+      { has_token: true, account_tier: 'max', account_tier_source: 'usage' },
+      { ...fable, rate_limit_tier: 'default_claude_ai' },
+    ).key,
+    'pro',
+  )
+  assert.equal(
+    inferClaudeTier(
+      {
+        has_token: true,
+        account_tier: 'max',
+        account_tier_source: 'profile',
+        rate_limit_tier: 'default_claude_ai',
+      },
+      fable,
+    ).key,
+    'max',
+  )
+  assert.equal(
+    inferClaudeTier(
+      { has_token: true, rate_limit_tier: 'default_claude_ai' },
+      { ...fable, account_tier: 'max', account_tier_source: 'profile' },
+    ).key,
+    'max',
+  )
+  assert.equal(
+    inferClaudeTier(
+      {
+        has_token: true,
+        account_tier: 'unknown',
+        account_tier_source: 'profile',
+        rate_limit_tier: 'default_claude_ai',
+      },
+      { account_tier: 'max', account_tier_source: 'profile' },
+    ).key,
+    'max',
+    'an incomplete VM profile does not hide a verified quota profile',
+  )
+  assert.equal(inferClaudeTier({ has_token: true, rate_limit_tier: 'default_claude_max_20x' }).key, 'pro')
+  assert.equal(inferClaudeTier({ has_token: true, rate_limit_tier: 'default_claude_max_5x' }, fable).key, 'max')
+  assert.equal(guardUsageTier('max', 'default_claude_ai'), 'pro')
+  assert.equal(guardUsageTier('max', 'default_claude_max_5x'), 'max')
+  assert.equal(guardUsageTier('max', null), 'max')
+  assert.equal(guardUsageTier('pro', 'default_claude_max_20x'), 'pro')
 })

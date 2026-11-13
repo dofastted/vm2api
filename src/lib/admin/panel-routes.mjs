@@ -3584,10 +3584,21 @@ export function createPanelHandler(ctx) {
       }
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/claude-reset\/redeem$/.test(p)) {
         const id = p.split('/')[4]
+        // A body that cannot be read must not fall back to the server's next grant.
+        let body
+        try {
+          body = (await readBody(req, 4096)) || {}
+        } catch (error) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'invalid_request', message: String(error?.message || 'invalid JSON body') },
+          })
+        }
         const result = await panel.buildClaudeResetRedeem({
           cfg,
           id,
           idempotencyKey: req.headers['idempotency-key'],
+          card: body.card,
         })
         if (result.status) return json(res, result.status, result.body)
         return json(res, 200, result)

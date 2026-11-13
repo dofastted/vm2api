@@ -15,10 +15,6 @@ import { fablePlanDenied, windowLimited } from '@/lib/vm-status'
  * `fable_max` / `fable_inflight` / `fable_cooldown_*` —— 那几个字段只在
  * `enrichVm()` 里算）。两种来源结构不同但字段名一致，所以这里用一个宽松的
  * `FableSubject`（`Record<string, unknown>`）承接，而不是强绑定 `Vm` 类型。
- *
- * `tierKey` 由调用方传入（`claudeTier(vm).key`），因为 `claudeTier` 只认
- * `Vm.has_token`，用量行天然没有这个字段——传参数而不是在这里重新推断，
- * 避免和 vm-status.ts 的 tier 判定逻辑产生第二份真相。
  */
 export type FableSubject = Record<string, unknown>
 
@@ -109,48 +105,34 @@ export function inventedFableWindow(subject: FableSubject): boolean {
 }
 
 /** Fable 已用比例（0-100 或 0-1，未归一化，交给 `pct()` 处理）。对齐 `fableUsedOf`。 */
-export function fableUsedOf(
-  subject: FableSubject,
-  tierKey: string
-): number | null {
+export function fableUsedOf(subject: FableSubject): number | null {
   const fb = (subject.fable as Record<string, unknown> | undefined) || {}
-  if (
-    tierKey === 'pro' ||
-    fablePlanDenied(fb) ||
-    inventedFableWindow(subject)
-  ) {
+  if (fablePlanDenied(fb) || inventedFableWindow(subject)) {
     return null
   }
-  if (subject.utilization_7d_oi != null)
-    return Number(subject.utilization_7d_oi)
-  if (fb.utilization != null) return Number(fb.utilization)
-  return null
+  const raw = subject.utilization_7d_oi ?? fb.utilization
+  if (typeof raw !== 'number' && typeof raw !== 'string') return null
+  if (typeof raw === 'string' && !raw.trim()) return null
+  const used = Number(raw)
+  return Number.isFinite(used) && used >= 0 ? used : null
 }
 
 /** 对齐 `fableWeeklyFull`。 */
-export function fableWeeklyFull(
-  subject: FableSubject,
-  tierKey: string
-): boolean {
+export function fableWeeklyFull(subject: FableSubject): boolean {
   const fb = (subject.fable as Record<string, unknown> | undefined) || {}
-  const used = fableUsedOf(subject, tierKey)
+  const used = fableUsedOf(subject)
   if (windowLimited(subject.status_7d_oi, pct(used))) return true
   if (used != null) return pct(used) >= 100
   return Boolean(fb.limited)
 }
 
 /** 对齐 `fableProbeLabel`。 */
-export function fableProbeLabel(
-  subject: FableSubject,
-  tierKey: string
-): string {
+export function fableProbeLabel(subject: FableSubject): string {
   const fb = subject.fable as Record<string, unknown> | undefined
-  if (tierKey === 'pro') return 'Pro 无 Fable'
-  // 落盘 Max 但 Fable 被拒：套餐没带 Fable 权限，不是 Pro。
   if (fablePlanDenied(fb)) return '无 Fable 权限'
   if (!fb) return '未探测'
   if (fb.banned) return '账号拒'
-  if (fableWeeklyFull(subject, tierKey)) return '周额度满'
+  if (fableWeeklyFull(subject)) return '周额度满'
   if (fb.ok) return '可用'
   const err = String(fb.error || '')
   if (/invalid_grant|refresh token|oauth refresh/i.test(err)) return '未探测'
@@ -162,14 +144,20 @@ export function fableProbeLabel(
  * 为空时应改画 `tone` 徽标（未探测 / 周满 / 可用 / 账号拒）。
  * 对齐 `fableBadge`（把它拆成「数据」与「渲染」两半）。
  */
-export function fableState(
-  subject: FableSubject,
-  tierKey: string
-): { usedPct: number | null; tone: StatusTone } {
+export function fableState(subject: FableSubject): {
+  usedPct: number | null
+  tone: StatusTone
+} {
   const fb = subject.fable as Record<string, unknown> | undefined
   if (fb?.banned)
     return { usedPct: null, tone: { key: 'bad', cls: 'bad', text: '拒' } }
-  const used = fableUsedOf(subject, tierKey)
+  if (fablePlanDenied(fb)) {
+    return {
+      usedPct: null,
+      tone: { key: 'bad', cls: 'bad', text: '无 Fable 权限' },
+    }
+  }
+  const used = fableUsedOf(subject)
   if (used != null) {
     const u = pct(used)
     return {
@@ -179,7 +167,7 @@ export function fableState(
   }
   if (!fb)
     return { usedPct: null, tone: { key: 'none', cls: 'none', text: '未探测' } }
-  if (fableWeeklyFull(subject, tierKey)) {
+  if (fableWeeklyFull(subject)) {
     return { usedPct: null, tone: { key: 'warn', cls: 'warn', text: '满' } }
   }
   if (fb.ok)
@@ -188,18 +176,15 @@ export function fableState(
 }
 
 /** Fable 5h 冷却/占满归一到 0-100，用于卡片小轨道。对齐 `fableUtil`。 */
-export function fableUtil(subject: FableSubject, tierKey: string): number {
+export function fableUtil(subject: FableSubject): number {
   const coolUntil = num(subject.fable_cooldown_until)
   if (coolUntil && coolUntil > Date.now()) return 100
   const fb = subject.fable as Record<string, unknown> | undefined
   if (fb?.banned) return 100
-  if (
-    fableWeeklyFull(subject, tierKey) &&
-    fableUsedOf(subject, tierKey) == null
-  ) {
+  if (fableWeeklyFull(subject) && fableUsedOf(subject) == null) {
     return 100
   }
-  return pct(fableUsedOf(subject, tierKey))
+  return pct(fableUsedOf(subject))
 }
 
 /** 每账号 Fable 并发上限的兜底值。对齐 `fableCap`。 */
@@ -337,7 +322,6 @@ export function extraUsageText(ex: unknown): string {
  */
 export function fableCardInfo(
   subject: FableSubject,
-  tierKey: string,
   fableCapValue: number
 ): {
   usedPct: number | null
@@ -347,7 +331,7 @@ export function fableCardInfo(
   badgeCls: 'ok' | 'warn' | 'bad' | 'none'
 } {
   const fb = subject.fable as Record<string, unknown> | undefined
-  const used = fableUsedOf(subject, tierKey)
+  const used = fableUsedOf(subject)
   const reset = String(subject.reset_7d_oi || fb?.reset || '')
   const bits: string[] = [
     `并发 ${num(subject.fable_inflight)}/${num(subject.fable_max) || fableCapValue}`,
@@ -355,25 +339,24 @@ export function fableCardInfo(
   const coolUntil = num(subject.fable_cooldown_until)
   if (coolUntil && coolUntil > Date.now()) bits.push('冷却中')
   if (fb?.banned) bits.unshift('账号拒')
-  else if (fableWeeklyFull(subject, tierKey)) bits.unshift('周额度满')
+  else if (fableWeeklyFull(subject)) bits.unshift('周额度满')
+  if (reset) bits.push(fmtReset(reset))
 
   if (used != null) {
     return { usedPct: pct(used), reset, bits, badgeText: '', badgeCls: 'ok' }
   }
-  const txt = fableProbeLabel(subject, tierKey)
-  const pro =
-    tierKey === 'pro' || fablePlanDenied(fb) || inventedFableWindow(subject)
-  const badgeCls: 'ok' | 'warn' | 'bad' | 'none' = !fb
-    ? 'none'
-    : pro || fb.banned
-      ? 'bad'
-      : fb.limited
-        ? 'warn'
-        : fb.ok
-          ? 'ok'
-          : 'none'
+  const txt = fableProbeLabel(subject)
+  let badgeCls: 'ok' | 'warn' | 'bad' | 'none' = 'none'
+  if (fb) {
+    if (fablePlanDenied(fb) || fb.banned) {
+      badgeCls = 'bad'
+    } else if (fb.limited) {
+      badgeCls = 'warn'
+    } else if (fb.ok) {
+      badgeCls = 'ok'
+    }
+  }
   const fullBits = [String(fb?.model || 'claude-fable-5'), ...bits]
-  if (reset) fullBits.push(fmtReset(reset))
   return { usedPct: null, reset, bits: fullBits, badgeText: txt, badgeCls }
 }
 

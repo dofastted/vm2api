@@ -73,6 +73,10 @@ export const ErrorCode = {
   KERNEL_UNAVAILABLE: 'kernel_unavailable',
   KERNEL_ERROR: 'kernel_error',
   FABLE_REQUIRES_MAX: 'fable_requires_max',
+  NATIVE_HANDOFF_MISSING: 'native_handoff_missing',
+  NATIVE_HANDOFF_INVALID: 'native_handoff_invalid',
+  NATIVE_HANDOFF_CONFLICT: 'native_handoff_conflict',
+  NATIVE_HANDOFF_INCOMPLETE: 'native_handoff_incomplete',
 
   INCOMPLETE_RESPONSE: 'incomplete_response',
   CLIENT_CANCELLED: 'client_cancelled',
@@ -110,6 +114,10 @@ export const KERNEL_FAILURE_STATUS = Object.freeze({
   [ErrorCode.CLI_ERROR]: 502,
   [ErrorCode.KERNEL_ERROR]: 502,
   [ErrorCode.KERNEL_UNAVAILABLE]: 503,
+  [ErrorCode.NATIVE_HANDOFF_MISSING]: 502,
+  [ErrorCode.NATIVE_HANDOFF_INVALID]: 502,
+  [ErrorCode.NATIVE_HANDOFF_CONFLICT]: 502,
+  [ErrorCode.NATIVE_HANDOFF_INCOMPLETE]: 502,
 })
 
 export const CLIENT_POOL_BUSY_MESSAGE = '号池负载过高，稍后再试'
@@ -358,6 +366,15 @@ export function assistantStopReason(result = {}) {
 export function isCompleteAssistantMessage(result = {}) {
   const body = result?.body && typeof result.body === 'object' ? result.body : result
   if (!isAssistantMessageBody(body)) return false
+  if (result?.nativeHandoff) {
+    return (
+      result.ok === true &&
+      result.providerResult?.usage_complete === true &&
+      !result.providerResult.error &&
+      result.providerResult.message_id === body.id &&
+      result.providerResult.stop_reason === assistantStopReason(result)
+    )
+  }
   if (result?.sawMessageStop) return true
   if (!assistantStopReason({ body, stopReason: result?.stopReason })) return false
   return assistantVisibleOutput(body)
@@ -371,6 +388,7 @@ export function isIncompleteAssistantMessage(result = {}) {
 
 export function finalizeAssembledAssistantHop(result = {}) {
   if (isClientCancelledResult(result)) return result
+  if (result?.nativeHandoff) return result
   if (isCompleteAssistantMessage(result)) return result?.ok ? result : { ...result, ok: true }
   if (isIncompleteAssistantMessage(result) || result?.ok) {
     return {
@@ -385,6 +403,10 @@ export function finalizeAssembledAssistantHop(result = {}) {
 
 export function mergeAssembledAssistantHop(result = {}, assembled = null) {
   if (!assembled || result?.body?.error || result?.body?.type === 'error') return result
+  // Native transport already assembled and validated its public content. In
+  // particular, an outer assembler must not resurrect suppressed refusal tools
+  // or replace final trailer usage with an earlier SSE observation.
+  if (result?.nativeHandoff) return result
   const assembledResult = { body: assembled, stopReason: assembled.stop_reason }
   if (!isCompleteAssistantMessage(assembledResult) && isCompleteAssistantMessage(result)) return result
   return {
@@ -455,7 +477,7 @@ export function mapUpstreamError(status, body, headers = {}) {
       type: ErrorType.RATE_LIMIT,
       code: ErrorCode.QUOTA_GUARD_REQUEST_TOO_LARGE,
       message: String(
-        msg || '临近额度闸线，本请求预估未命中缓存过大，未发往上游。请缩短上下文、等待窗口重置，或稍后再试。',
+        msg || '临近额度闸线，本请求预估未命中缓存过大，未发往上游。请缩短上下文、等待窗口重置，或改用其他模型。',
       ),
       status: 429,
       details: body?.error?.details,

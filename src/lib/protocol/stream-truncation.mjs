@@ -142,6 +142,9 @@ export function createAnthropicStreamTracker() {
 
 /** A timeout would just stall again if the client retries. An upstream error event already reached the client. */
 export function isRecoverableTruncation(result) {
+  // A negotiated provider handoff must supply its own terminal proof.
+  // Closing a failed handoff as max_tokens would manufacture a success.
+  if (result?.nativeHandoff === true) return false
   const error = result?.body?.error
   if (!error) return true
   return !/timeout/i.test(`${error.code || ''} ${error.type || ''} ${error.message || ''}`)

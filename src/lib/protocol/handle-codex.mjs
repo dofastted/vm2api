@@ -184,7 +184,10 @@ export function isRetryableSameCodexAccount(
   if (status === 408) return true
   if (status === 500 || status === 502 || status === 503 || status === 504) {
     return (
-      code === '' || /server_error|provider_error|upstream_error|overloaded_error|internal_error|transport/i.test(code)
+      code === '' ||
+      /server_error|provider_error|upstream_error|overloaded_error|internal_error|server_is_overloaded|transport/i.test(
+        code,
+      )
     )
   }
   return false
@@ -1243,6 +1246,7 @@ export async function handleCodexSearch({
   const redactionState = await ensureRedaction(routing, { projectRoot })
   const redaction = redactionState.enabled
     ? {
+        maxBodyBytes: redactionState.maxBodyBytes,
         principal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
         session: String(req.headers?.['x-session-id'] || ''),
       }
@@ -1402,6 +1406,7 @@ export async function handleCodexImages({
   const redactionState = await ensureRedaction(routing, { projectRoot })
   const redaction = redactionState.enabled
     ? {
+        maxBodyBytes: redactionState.maxBodyBytes,
         principal: req.apiKeyRecord?.id || (req.apiKeyKind === 'master' ? 'master' : ''),
         session: String(req.headers?.['x-session-id'] || ''),
       }

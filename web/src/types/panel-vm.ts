@@ -348,7 +348,14 @@ export type Vm = {
   claude_reset_credits?: {
     eligible?: boolean
     available_count?: number
+    /** Cards shown to the operator: ready or cooling down, not withheld by upstream. */
+    held_count?: number
     credits?: Array<{
+      /** Opaque per-slot card handle used to pick the card to spend. */
+      ref?: string
+      kind?: 'session' | 'weekly' | 'fable' | 'full'
+      state?: 'ready' | 'cooldown' | 'unavailable'
+      gives_back_weekly?: boolean
       label?: string
       resets_left?: number
       starts_at?: string

@@ -115,6 +115,8 @@ test('runVmTestChat loopbacks /v1/messages with x-kin-vm pin and never calls a w
   assert.equal(calls[0].body.stream, true)
   assert.match(String(calls[0].body.messages[0].content || ''), /hello/)
   assert.equal(calls[0].body.system, undefined)
+  assert.deepEqual(calls[0].body.thinking, { type: 'disabled' })
+  assert.equal(calls[0].body.max_tokens, 64)
   assert.equal(result.official_cc_inference, 'cli-hop')
   assert.ok(result.log.some((l) => /\/v1\/messages/.test(l.message)))
   assert.ok(!result.log.some((l) => /Go slot worker|streamGoWorker|callGoWorker/i.test(l.message)))
@@ -179,6 +181,18 @@ test('buildVmTestInbound stays Claude Code shaped for /v1 loopback', () => {
   assert.equal(headers['anthropic-beta'], undefined)
   assert.equal(inbound.stream, true)
 })
+
+test('VM connectivity probes explicitly select disabled or model-required adaptive thinking', () => {
+  for (const [model, type] of [
+    ['claude-haiku-4-5', 'disabled'],
+    ['claude-sonnet-5-5', 'adaptive'],
+  ]) {
+    const { inbound } = buildVmTestInbound({ model, prompt: 'hello', maxTokens: 64 })
+    assert.deepEqual(inbound.thinking, { type })
+    assert.equal(inbound.max_tokens, 64)
+  }
+})
+
 test('health probe mode uses the full official Claude Code prompt', () => {
   const { inbound, headers } = buildVmTestInbound({
     model: 'claude-haiku-4-5',

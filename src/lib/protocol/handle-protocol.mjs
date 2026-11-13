@@ -159,10 +159,10 @@ import {
 } from '../identity/crs-persona-usage.mjs'
 import {
   applyCacheTtlToUsage,
+  enforceCacheTtlOrder,
   cacheBreakpointsFromRoutingFile,
   pinConversationCacheTtl,
   resolveCacheTtl,
-  fillMissingCacheTtl,
   validateCacheBreakpoints,
 } from './cache-ttl.mjs'
 import {
@@ -1127,7 +1127,27 @@ export function createHandleProtocol(deps) {
         logBag.error_message = error.body.error.message
         return json(res, error.status, error.body)
       }
-    } else if (!apiOpenAI) ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
+    } else if (!apiOpenAI) {
+      // Classify against the original budget, before the floor and persona add content.
+      // The health monitor can carry a longer diagnostic marker than an external short probe.
+      if (
+        !officialPassthrough &&
+        !Object.hasOwn(ctx.body, 'thinking') &&
+        !ctx.body.system?.length &&
+        /^claude-haiku-4-5(?:-|$)/i.test(ctx.body.model || '') &&
+        Number.isInteger(inbound.max_tokens) &&
+        inbound.max_tokens > 0 &&
+        inbound.max_tokens <= 64 &&
+        (isShortProbeRequest(inbound) ||
+          (isHealthRealBypass(req.headers) &&
+            !ctx.body.tools?.length &&
+            ctx.body.messages?.length === 1 &&
+            ctx.body.messages[0]?.role === 'user'))
+      ) {
+        ctx.body = { ...ctx.body, thinking: { type: 'disabled' } }
+      }
+      ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
+    }
     let inboundToolReverse = {}
     const cragSystem = projectCallerSystem(ctx.body.system, callerEnvironment)
     const hasCragSystem = cragSystem !== ctx.body.system
@@ -1314,13 +1334,10 @@ export function createHandleProtocol(deps) {
     // After OpenAI→Anthropic conversion so function tools already have input_schema;
     // leftover OpenAI-shaped tools are still marked (rewrite / mixed inbound).
     if (!apiOpenAI) ctx.body = applyEagerToolStreaming(ctx.body, getRouting())
-    // #850: every rewritten inbound. A cache marker without a TTL means "not
-    // chosen", for Claude Code and third-party callers alike; resolve it to this
-    // conversation's TTL before rendering, so the template budgets against the
-    // real value and no caller marker reaches Anthropic as implicit 5m. Explicit
-    // TTLs stay. Passthrough keeps the caller body untouched.
+    // Repair TTL order before rendering, retaining valid caller omissions and
+    // mixed TTLs. The session default only governs platform-created markers.
     if (!apiOpenAI && !requestContext && !officialPassthrough) {
-      ctx.body = fillMissingCacheTtl(ctx.body, requestedCacheTtl)
+      ctx.body = enforceCacheTtlOrder(ctx.body, requestedCacheTtl)
     }
     const personaIn = ctx.body
     // Capture ownership before rendering supplies gateway markers or projects
@@ -1345,6 +1362,7 @@ export function createHandleProtocol(deps) {
         model: ctx.body?.model,
         cliVersion: OFFICIAL_CLI_VERSION,
       })
+    if (!officialPassthrough && !requestContext) ctx.body = enforceCacheTtlOrder(ctx.body, requestedCacheTtl)
     let personaHideTokens =
       requestContext || apiOpenAI
         ? 0
@@ -1503,7 +1521,6 @@ export function createHandleProtocol(deps) {
       clientStream && protocol === 'anthropic.messages' ? createAnthropicSseErrorRemapper() : null
     // One keepalive for the whole Claude stream, including session/seat queues
     // and the gaps between failover attempts. OpenAI keeps its per-attempt one.
-    let activeAttemptCommit = null
     const anthropicKeepalive =
       clientStream && protocol === 'anthropic.messages' && streamKeepaliveMs > 0
         ? createDownstreamKeepalive({
@@ -1514,9 +1531,6 @@ export function createHandleProtocol(deps) {
               if (res.writableEnded || res.destroyed) return
               if (!res.headersSent) writeSSEHeaders(res)
               res.write(chunk)
-              // A queue ping commits the HTTP response only. The slot commits
-              // while an attempt is active, same as an in-attempt ping.
-              activeAttemptCommit?.()
             },
           })
         : null
@@ -2004,12 +2018,8 @@ export function createHandleProtocol(deps) {
                 if (res.writableEnded || res.destroyed) return
                 if (!res.headersSent) writeSSEHeaders(res)
                 res.write(chunk)
-                // A ping is already a downstream byte. Commit so a later upstream
-                // failure cannot switch slots onto this socket.
-                onCommit()
               },
             })
-          if (anthropicKeepalive) activeAttemptCommit = onCommit
           keepalive.arm()
           try {
             return await dispatchStreamInference({
@@ -2075,10 +2085,8 @@ export function createHandleProtocol(deps) {
               },
             })
           } finally {
-            if (anthropicKeepalive) {
-              activeAttemptCommit = null
-              anthropicKeepalive.endAttempt()
-            } else keepalive.stop()
+            if (anthropicKeepalive) anthropicKeepalive.endAttempt()
+            else keepalive.stop()
           }
         },
       })
@@ -2104,6 +2112,17 @@ export function createHandleProtocol(deps) {
     logBag.account_id = result?.accountId || null
     logBag.final_account_id = result?.accountId || null
     if (result?.threadBetas) logBag.hop_meta = { ...logBag.hop_meta, thread_betas: result.threadBetas }
+    if (result?.nativeHandoff === true) {
+      const provider = result.providerResult
+      logBag.hop_meta = {
+        ...logBag.hop_meta,
+        native_handoff: {
+          message_id: provider?.message_id ?? null,
+          stop_reason: provider?.stop_reason ?? null,
+          usage_complete: provider?.usage_complete === true,
+        },
+      }
+    }
     if (result?.accountId && (result.ok || result.committed))
       recordThinkingOwners(result.body, result.accountId, thinkingOwnerStore)
     // Zero executions is a real 0, not unknown; the VM is the last one that ran.
@@ -2188,11 +2207,11 @@ export function createHandleProtocol(deps) {
         else if (
           protocol === 'anthropic.messages' &&
           !res.writableEnded &&
-          !streamTracker?.hasStarted() &&
+          (result?.nativeHandoff === true || !streamTracker?.hasStarted()) &&
           !streamTracker?.isFinished()
         ) {
-          // Headers already went out (queue ping or an in-attempt ping), so the
-          // status can no longer be 429/529/503. Close with the Anthropic event.
+          // A strict handoff failure must remain an error even after partial
+          // content. Legacy queue pings still receive the mapped SSE error.
           const mapped = mapProtocolClientError(result, logBag, logBag.error_code)
           res.write(buildAnthropicSseError(mapped.body?.error || {}))
         }

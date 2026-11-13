@@ -51,11 +51,11 @@ function parseSocksHint(text: string): { host: string; port: string } | null {
       .find(Boolean) || ''
   if (!line) return null
   try {
-    if (/^socks5h?:\/\//i.test(line)) {
+    if (/^(socks5h?|http):\/\//i.test(line)) {
       const url = new URL(line)
       return {
         host: url.hostname.replace(/^\[|\]$/g, ''),
-        port: url.port || '1080',
+        port: url.port || (url.protocol === 'http:' ? '80' : '1080'),
       }
     }
     const bracketed = line.match(/^(\[[^\]]+\]):(\d+)/)
@@ -251,7 +251,9 @@ export function ImportProxyStep({
           ref={pasteRef}
           rows={2}
           aria-label='粘贴 SOCKS5'
-          placeholder={'host:port:user:pass\nsocks5://user:pass@host:1080'}
+          placeholder={
+            'host:port:user:pass\nsocks5://user:pass@host:1080\nhttp://user:pass@host:8080'
+          }
           onBlur={() => void flushPaste()}
         />
         <Button

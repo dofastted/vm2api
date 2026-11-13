@@ -103,7 +103,7 @@ func TestDialerRejectsProxyAddressAsTarget(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when CONNECT target is the proxy itself")
 	}
-	if got := err.Error(); !contains(got, "refusing SOCKS CONNECT") {
+	if got := err.Error(); !contains(got, "refusing proxy CONNECT") {
 		t.Fatalf("error = %q", got)
 	}
 }

@@ -18,20 +18,28 @@ type Dialer struct {
 	Username string
 	Password string
 	Timeout  time.Duration
+	// HTTP selects an HTTP CONNECT tunnel instead of the SOCKS5 handshake.
+	HTTP bool
 }
 
+// New accepts socks5://, socks5h:// and http:// proxy URLs. An http:// URL
+// without a port uses 80; SOCKS URLs must name the port.
 func New(rawURL string, timeout time.Duration) (*Dialer, error) {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
-		return nil, fmt.Errorf("parse SOCKS5 URL: %w", err)
+		return nil, fmt.Errorf("parse proxy URL: %w", err)
 	}
-	if u.Scheme != "socks5" && u.Scheme != "socks5h" {
-		return nil, fmt.Errorf("unsupported SOCKS5 scheme %q", u.Scheme)
+	httpProxy := u.Scheme == "http"
+	if !httpProxy && u.Scheme != "socks5" && u.Scheme != "socks5h" {
+		return nil, fmt.Errorf("unsupported proxy scheme %q", u.Scheme)
 	}
 	host := u.Hostname()
 	port := u.Port()
+	if httpProxy && port == "" {
+		port = "80"
+	}
 	if host == "" || port == "" {
-		return nil, errors.New("SOCKS5 URL requires host and port")
+		return nil, errors.New("proxy URL requires host and port")
 	}
 	username := ""
 	password := ""
@@ -50,23 +58,24 @@ func New(rawURL string, timeout time.Duration) (*Dialer, error) {
 		Username: username,
 		Password: password,
 		Timeout:  timeout,
+		HTTP:     httpProxy,
 	}, nil
 }
 
 func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	if d == nil {
-		return nil, errors.New("SOCKS5 dialer is nil")
+		return nil, errors.New("proxy dialer is nil")
 	}
 	if network != "tcp" && network != "tcp4" && network != "tcp6" {
-		return nil, fmt.Errorf("SOCKS5 only supports TCP, got %q", network)
+		return nil, fmt.Errorf("proxy only supports TCP, got %q", network)
 	}
 	if sameHostPort(address, d.Address) {
-		return nil, fmt.Errorf("refusing SOCKS CONNECT to the proxy address %s; DialContext must receive the upstream host", d.Address)
+		return nil, fmt.Errorf("refusing proxy CONNECT to the proxy address %s; DialContext must receive the upstream host", d.Address)
 	}
 	base := &net.Dialer{Timeout: d.Timeout}
 	conn, err := base.DialContext(ctx, "tcp", d.Address)
 	if err != nil {
-		return nil, fmt.Errorf("connect SOCKS5 proxy: %w", err)
+		return nil, fmt.Errorf("connect %s proxy: %w", d.kind(), err)
 	}
 	ok := false
 	defer func() {
@@ -88,7 +97,12 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 	} else if d.Timeout > 0 {
 		_ = conn.SetDeadline(time.Now().Add(d.Timeout))
 	}
-	if err = d.negotiate(conn, address); err != nil {
+	if d.HTTP {
+		err = d.httpConnect(conn, address)
+	} else {
+		err = d.negotiate(conn, address)
+	}
+	if err != nil {
 		return nil, err
 	}
 	if err = ctx.Err(); err != nil {

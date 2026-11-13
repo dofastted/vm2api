@@ -162,7 +162,7 @@ describe('rackTotals', () => {
 })
 
 describe('vmWindows', () => {
-  it('adds Fable only on Max, after 5H and 7D', () => {
+  it('shows measured Fable usage for Pro and Max after 5H and 7D', () => {
     const max = vmWindows(
       vm({
         subscription_type: 'max',
@@ -173,9 +173,24 @@ describe('vmWindows', () => {
     )
     expect(max.map((w) => w.key)).toEqual(['5h', '7d', 'fable'])
     expect(max[2].pct).toBe(30)
-    expect(vmWindows(vm({ usage_has_fable: false })).map((w) => w.key)).toEqual(
-      ['5h', '7d']
+    const pro = vmWindows(
+      vm({ subscription_type: 'pro', utilization_7d_oi: 0.2 })
     )
+    expect(pro.map((w) => w.key)).toEqual(['5h', '7d', 'fable'])
+    expect(pro[2].pct).toBe(20)
+  })
+
+  it('shows an unknown Fable window as unprobed instead of zero', () => {
+    const windows = vmWindows(vm({ subscription_type: 'pro' }))
+    expect(windows[2]).toMatchObject({
+      key: 'fable',
+      pct: null,
+      note: '未探测',
+    })
+    expect(vmWindows(vm({ platform: 'openai' })).map((w) => w.key)).toEqual([
+      '5h',
+      '7d',
+    ])
   })
 
   it('reports an unprobed or tokenless window as null, not 0%', () => {

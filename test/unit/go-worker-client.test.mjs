@@ -11,10 +11,10 @@ import {
   workerHealth,
   usageFromSseEvent,
   isDownstreamCommitEvent,
+  restoreKernelErrorStatus,
   restoreUncommittedHop,
   semanticStatusForStreamError,
 } from '../../src/lib/transport/go-worker-client.mjs'
-import { prepareCliHopBody } from '../../src/lib/protocol/outbound-attempt.mjs'
 import { callerAutoCompactWindow, defaultSeedPolicy, sanitizeInboundBody } from '../../src/lib/protocol/seed-policy.mjs'
 import { extractOpenaiUsage } from '../../src/lib/protocol/openai-usage.mjs'
 import { callRustKernel, rustKernelHealth } from '../../src/lib/transport/rust-kernel-client.mjs'
@@ -22,6 +22,7 @@ import { callCodexKernel, streamCodexKernel } from '../../src/lib/transport/code
 import { forwardApi, readApiJson } from '../../src/lib/transport/api-kernel-client.mjs'
 import { normalizeRedaction } from '../../src/lib/redaction/policy.mjs'
 import { publishRedactionForTests } from '../../src/lib/redaction/runtime.mjs'
+import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { classifyUpstreamResult } from '../../src/lib/pool/upstream-error-policy.mjs'
 
 test('restoreUncommittedHop keeps a structured upstream code', () => {
@@ -106,6 +107,47 @@ test('semanticStatusForStreamError reads outer Codex status 500 instead of defau
     }),
     502,
   )
+})
+test('server overload errors map to 503 and preserve retry identity', () => {
+  const body = {
+    type: 'error',
+    error: {
+      type: 'service_unavailable_error',
+      code: 'server_is_overloaded',
+      message: 'Our servers are currently overloaded. Please try again later.',
+    },
+  }
+  assert.equal(semanticStatusForStreamError(body), 503)
+  const restored = restoreUncommittedHop({
+    ok: false,
+    status: 200,
+    committed: false,
+    terminalState: 'incomplete',
+    headers: {},
+    body,
+  })
+  assert.equal(restored.status, 503)
+  assert.equal(restored.body.error.code, 'server_is_overloaded')
+  assert.equal(restored.streamError, true)
+})
+test('kernel-wrapped server overload restores 503 but explicit status wins', () => {
+  const body = {
+    type: 'error',
+    error: {
+      type: 'service_unavailable_error',
+      code: 'server_is_overloaded',
+      message: 'overloaded',
+    },
+  }
+  const restored = restoreKernelErrorStatus({ ok: false, status: 502, body })
+  assert.equal(restored.status, 503)
+  assert.equal(restored.body.error.code, 'server_is_overloaded')
+  const explicit = restoreKernelErrorStatus({
+    ok: false,
+    status: 502,
+    body: { ...body, error: { ...body.error, status: 502 } },
+  })
+  assert.equal(explicit.status, 502)
 })
 
 test('restoreUncommittedHop reports Codex outer status 500 rather than 502', () => {
@@ -1100,7 +1142,6 @@ unixTest('streamGoWorker stamps TTFT on text and thinking deltas', async () => {
 unixTest('streamGoWorker stamps TTFT on omitted thinking progress before visible output', async (t) => {
   let now = 1_000
   t.mock.method(Date, 'now', () => now)
-  const sawEmpty = gate()
   const sawProgress = gate()
   const fx = await fixture(async (req, res) => {
     res.setHeader('content-type', 'text/event-stream')
@@ -1111,7 +1152,9 @@ unixTest('streamGoWorker stamps TTFT on omitted thinking progress before visible
       index: 0,
       delta: { type: 'thinking_delta', thinking: '', estimated_tokens: 0 },
     })
-    await sawEmpty.ready
+    // Empty progress is intentionally held before commit. Advance the server
+    // clock rather than waiting for that uncommitted frame downstream.
+    now = 2_000
     writeData(res, {
       type: 'content_block_delta',
       index: 0,
@@ -1135,10 +1178,7 @@ unixTest('streamGoWorker stamps TTFT on omitted thinking progress before visible
         messages: [{ role: 'user', content: 'hi' }],
       },
       onEvent: (line) => {
-        if (line.includes('"estimated_tokens":0')) {
-          now = 2_000
-          sawEmpty.release()
-        } else if (line.includes('"estimated_tokens":50')) {
+        if (line.includes('"estimated_tokens":50')) {
           now = 5_000
           sawProgress.release()
         }
@@ -1491,12 +1531,32 @@ unixTest('streamGoWorker merges SSE cache details into a totals-only usage trail
   }
 })
 
-test('terminal metadata is not a downstream commit', () => {
+test('terminal metadata and empty blocks are not downstream commits', () => {
   assert.equal(isDownstreamCommitEvent({ type: 'message_start', message: {} }), false)
   assert.equal(isDownstreamCommitEvent({ type: 'error', error: { message: 'Connection error' } }), false)
   assert.equal(isDownstreamCommitEvent({ type: 'message_stop' }), false)
   assert.equal(isDownstreamCommitEvent({ type: 'message_delta', delta: { stop_reason: 'end_turn' } }), false)
   assert.equal(isDownstreamCommitEvent({ type: 'message_delta', delta: {} }), false)
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_start', content_block: { type: 'text', text: '' } }),
+    false,
+  )
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_start', content_block: { type: 'thinking', thinking: '' } }),
+    false,
+  )
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_delta', delta: { type: 'thinking_delta', estimated_tokens: 1 } }),
+    true,
+  )
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_start', content_block: { type: 'redacted_thinking', data: '' } }),
+    false,
+  )
+  assert.equal(
+    isDownstreamCommitEvent({ type: 'content_block_start', content_block: { type: 'redacted_thinking', data: 'x' } }),
+    true,
+  )
   assert.equal(
     isDownstreamCommitEvent({ type: 'content_block_delta', delta: { type: 'text_delta', text: 'hi' } }),
     true,
@@ -1713,6 +1773,78 @@ unixTest('Codex clients enforce the panel limit on their serialized envelope', a
   } finally {
     await fx.close()
   }
+})
+
+unixTest('redaction 413 stops failover before any worker dispatch for call and stream clients', async (t) => {
+  let requests = 0
+  const fx = await fixture((req, res) => {
+    requests++
+    req.resume()
+    res.writeHead(500).end('{}')
+  })
+  t.after(async () => {
+    publishRedactionForTests(null)
+    await fx.close()
+  })
+  fx.exec.vm.runtime.codex_kernel_socket = fx.exec.vm.runtime.worker_socket
+  const policy = normalizeRedaction({ enabled: true, secrets: true, personal: false })
+  let masks = 0
+  publishRedactionForTests({
+    enabled: true,
+    ready: true,
+    policy,
+    client: {
+      async mask({ maxBodyBytes }) {
+        masks++
+        assert.equal(maxBodyBytes, 64 * 1024 * 1024)
+        throw Object.assign(new Error('redaction body exceeds the configured request body limit'), {
+          code: 'redaction_body_too_large',
+          status: 413,
+          details: { retryable: false },
+        })
+      },
+    },
+  })
+  for (const call of [callGoWorker, streamGoWorker, callCodexKernel, streamCodexKernel]) {
+    const body =
+      call === callCodexKernel || call === streamCodexKernel
+        ? { input: 'fixture' }
+        : { model: 'claude-sonnet-5', messages: [{ role: 'user', content: 'fixture' }] }
+    let selections = 0
+    const runner = new FailoverRunner({
+      scheduler: {
+        async selectAndReserve() {
+          selections++
+          assert.equal(selections, 1, 'a local size error must not select another account')
+          return { ok: true, accountId: 'fixture', vmId: 'vm-fixture', release() {} }
+        },
+        markCooldown() {
+          assert.fail('a local size error must not cool down an account')
+        },
+      },
+    })
+    const result = await runner.run({
+      requestId: `redaction-size-${call.name}`,
+      model: 'fixture-model',
+      canonicalBody: body,
+      callAttempt: () =>
+        call({
+          exec: fx.exec,
+          envelope: { body },
+          routing: { redaction: policy, failover: { max_request_mib: 64 } },
+          redactionPrincipal: 'fixture-principal',
+        }),
+    })
+    assert.equal(result.status, 413, call.name)
+    assert.equal(result.body.error.code, 'redaction_body_too_large')
+    assert.equal(result.body.error.type, 'invalid_request_error')
+    assert.equal(result.body.error.details.retryable, false)
+    assert.equal(result.transportError, false)
+    assert.equal(result.attemptCount, 0)
+    assert.equal(selections, 1)
+  }
+  assert.equal(masks, 4)
+  assert.equal(requests, 0)
 })
 
 unixTest('invalid Messages are rejected before either kernel accepts a turn', async (t) => {

@@ -182,7 +182,7 @@ function fableRequiresMaxError(details = {}) {
 }
 
 const QUOTA_GUARD_TOO_LARGE_MESSAGE =
-  '临近额度闸线，本请求预估未命中缓存过大，未发往上游。请缩短上下文、等待窗口重置，或稍后再试。'
+  '临近额度闸线，本请求预估未命中缓存过大，未发往上游。请缩短上下文、等待窗口重置，或改用其他模型。'
 
 function quotaGuardTooLargeError(details = {}) {
   return {
@@ -199,7 +199,7 @@ function quotaGuardTooLargeError(details = {}) {
         details: {
           ...details,
           message_en:
-            'Near the quota safety line, this request looks like a large uncached prompt and was not sent upstream.',
+            'Near the quota safety line, this request looks like a large uncached prompt and was not sent upstream. Shorten the context, wait for the window to reset, or switch to another model.',
         },
       },
     },
