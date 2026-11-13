@@ -726,7 +726,7 @@ export class AccountQuota {
             reset_5h: w5.reset,
             reset_7d: w7.reset,
             message:
-              '临近额度闸线，本请求预估未命中缓存过大。Near the quota safety line, this large uncached request is not eligible on this account.',
+              '临近额度闸线，本请求预估未命中缓存过大。请缩短上下文、等待窗口重置，或改用其他模型。Near the quota safety line, this large uncached request is not eligible on this account; shorten the context, wait for the window to reset, or switch to another model.',
           },
         }
       }

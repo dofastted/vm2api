@@ -477,7 +477,7 @@ export function mapUpstreamError(status, body, headers = {}) {
       type: ErrorType.RATE_LIMIT,
       code: ErrorCode.QUOTA_GUARD_REQUEST_TOO_LARGE,
       message: String(
-        msg || '临近额度闸线，本请求预估未命中缓存过大，未发往上游。请缩短上下文、等待窗口重置，或稍后再试。',
+        msg || '临近额度闸线，本请求预估未命中缓存过大，未发往上游。请缩短上下文、等待窗口重置，或改用其他模型。',
       ),
       status: 429,
       details: body?.error?.details,
