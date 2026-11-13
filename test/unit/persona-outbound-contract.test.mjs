@@ -152,6 +152,52 @@ async function outbound(
   return sent[0]
 }
 
+test('Haiku small one-shot probes disable implicit thinking without increasing the configured budget', async (t) => {
+  for (const model of ['claude-haiku-4-5', 'claude-haiku-4-5-20251001']) {
+    for (const max_tokens of [1, 32, 64]) {
+      const out = await outbound(t, {
+        preset: 'zero',
+        compatibility: { min_max_tokens: { enabled: true, value: 64 } },
+        input: { model, max_tokens, messages: [{ role: 'user', content: '.' }] },
+      })
+      assert.deepEqual(out.thinking, { type: 'disabled' })
+      assert.equal(out.max_tokens, 64)
+    }
+  }
+})
+
+test('declared real Haiku health probes disable thinking without rewriting ordinary longer prompts', async (t) => {
+  const input = {
+    model: 'claude-haiku-4-5',
+    max_tokens: 32,
+    messages: [
+      { role: 'user', content: 'Reply with the single word pong. Release check 00000000000000000000000000000000' },
+    ],
+  }
+  const options = { preset: 'zero', compatibility: { min_max_tokens: { enabled: true, value: 64 } }, input }
+  const probe = await outbound(t, { ...options, headers: { 'x-kin-health-real': '1' } })
+  assert.deepEqual(probe.thinking, { type: 'disabled' })
+  assert.equal(probe.max_tokens, 64)
+  const ordinary = await outbound(t, options)
+  assert.equal(ordinary.thinking, undefined)
+})
+
+test('Haiku probe normalization preserves explicit thinking and ordinary requests', async (t) => {
+  const base = { model: 'claude-haiku-4-5', max_tokens: 32, messages: [{ role: 'user', content: 'hello' }] }
+  for (const input of [
+    { ...base, thinking: { type: 'adaptive' } },
+    { ...base, thinking: { type: 'enabled', budget_tokens: 1024 }, max_tokens: 2048 },
+    { ...base, max_tokens: 65 },
+    { ...base, system: 'caller instructions' },
+    { ...base, tools: [{ name: 'Read', input_schema: { type: 'object' } }] },
+    { ...base, messages: [...base.messages, { role: 'assistant', content: 'hello' }, ...base.messages] },
+    { ...base, model: 'claude-sonnet-5-5' },
+  ]) {
+    const out = await outbound(t, { preset: 'zero', compatibility: { thinking_display: 'passthrough' }, input })
+    assert.deepEqual(out.thinking, input.thinking)
+  }
+})
+
 const history = () =>
   Array.from({ length: 9 }, (_, i) => ({
     role: i % 2 ? 'assistant' : 'user',
