@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { updateCrag, cragUpdateInventory, localPanelApi } from '../../scripts/update-crag.mjs'
+import { updateCrag, cragUpdateInventory, localPanelApi, runningCragHashes } from '../../scripts/update-crag.mjs'
 import { spawn } from 'node:child_process'
 import { once } from 'node:events'
 import { seedEncryptedPackage } from '../fixtures/crag-license.mjs'
@@ -126,6 +126,49 @@ test('CRAG update is idempotent and does not pause or restart already current sl
   assert.equal(f.calls.length, 1)
   assert.equal(f.calls[0].body.restart, false)
 })
+
+test('local KVM CRAG update replaces active and stopped packages through the managed sync', async (t) => {
+  const f = fixture(t)
+  for (const id of ['vm-live', 'vm-stop']) {
+    const file = path.join(f.root, 'vms', `${id}.json`)
+    const record = JSON.parse(fs.readFileSync(file))
+    fs.writeFileSync(file, JSON.stringify({ ...record, runtime: { type: 'kvm' } }))
+  }
+  const result = await updateCrag(f.root, f)
+  assert.equal(result.ok, true)
+  assert.equal(result.items.find((item) => item.id === 'vm-stop').status, 'stopped')
+  assert.ok(f.calls.some(({ body }) => body.restart === true))
+  assert.equal(f.calls.at(-1).endpoint, '/api/panel/vms/schedule/resume')
+})
+
+for (const type of ['docker', 'kvm']) {
+  test(`running CRAG hashes use the ${type} execution boundary with a bounded probe`, async () => {
+    const calls = []
+    const hashes = await runningCragHashes(
+      { id: 'vm-probe', runtime: { type, container: 'custom-runner' } },
+      {
+        execute: async (binary, argv, options) => {
+          calls.push({ binary, argv, options })
+          return { stdout: `${'a'.repeat(64)}  /proc/42/exe\n` }
+        },
+      },
+    )
+    assert.deepEqual(hashes, ['a'.repeat(64)])
+    assert.equal(calls[0].binary, 'docker')
+    if (type === 'kvm')
+      assert.deepEqual(calls[0].argv.slice(0, 7), [
+        'exec',
+        'custom-runner',
+        '/usr/local/bin/kin-guest-exec',
+        '-u',
+        '0',
+        '--',
+        'sh',
+      ])
+    else assert.deepEqual(calls[0].argv.slice(0, 4), ['exec', 'custom-runner', 'sh', '-c'])
+    assert.equal(calls[0].options.timeout, 10_000)
+  })
+}
 
 test('unsupported cluster CRAG fails before downloading and another updater cannot remove its lock', async (t) => {
   const f = fixture(t)

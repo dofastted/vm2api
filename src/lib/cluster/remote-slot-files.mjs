@@ -36,6 +36,7 @@ import {
 } from './remote-fs.mjs'
 import { cragSlotPayload } from './slot-image.mjs'
 import { isKvmRuntime } from '../vm/runtime-kind.mjs'
+import { isCodexVm } from '../vm/vm-kind.mjs'
 import {
   WRAP_GLIBC_DIR,
   describeCliPayload,
@@ -122,6 +123,12 @@ export async function pushSlotFiles(vm, slotDir, sets = ['run', 'seed'], session
     }
     // Never mirror local modes: a drvfs / 0777 checkout would publish tokens world-readable on the node.
     await writeRemoteFile(sftp, `${remote}/${remoteSlotPath(rel)}`, data, { mode: REMOTE_FILE_MODE, owner })
+    if (rel === 'run/kernel.json' && isKvmRuntime(vm) && !isCodexVm(vm)) {
+      // The guest service starts .kin/kin-kernel first, including on its first boot.
+      // Derive selection from the published config so inherited routing agrees too.
+      const config = JSON.parse(data.toString('utf8'))
+      await pushKvmKernelSelector(vm, s, config.dataplane === 'crag' ? 'crag' : 'cli-node')
+    }
     pushed.push(rel)
   }
   return { pushed }
@@ -205,6 +212,18 @@ async function publishSlotBinFiles(sftp, client, remote, files, owner) {
 export function kvmKernelSelector(kernel) {
   const entry = kernel === 'crag' ? '/opt/kin-live/crag-kernel' : '/opt/kin-live/kin-kernel'
   return `#!/bin/sh\nexec ${entry} "$@"\n`
+}
+
+async function pushKvmKernelSelector(vm, session, kernel) {
+  const dir = `${remoteSlotDir(session.host, vm.id)}/cli-home/.kin`
+  const owner = ownerFor(session, vm)
+  await runRemote(session.client, privateDirectoriesScript([dir], owner), { timeoutMs: 20_000 })
+  const sftp = await openSftp(session.client)
+  await writeRemoteFile(sftp, `${dir}/kin-kernel`, kvmKernelSelector(kernel), {
+    mode: 0o755,
+    owner,
+    timeoutMs: 60_000,
+  })
 }
 
 async function pushLiveWrap(vm, projectRoot, session, { required }) {
@@ -308,16 +327,7 @@ export async function pushKernelSelection(vm, projectRoot, kernel) {
     }
   }
   if (isKvmRuntime(vm)) {
-    const dir = `${remoteSlotDir(session.host, vm.id)}/cli-home/.kin`
-    await runRemote(session.client, `umask 022 && mkdir -p ${shellQuote(dir)} && chmod 755 ${shellQuote(dir)}`, {
-      timeoutMs: 20_000,
-    })
-    const sftp = await openSftp(session.client)
-    await writeRemoteFile(sftp, `${dir}/kin-kernel`, kvmKernelSelector(kernel), {
-      mode: 0o755,
-      owner: ownerFor(session, vm),
-      timeoutMs: 60_000,
-    })
+    await pushKvmKernelSelector(vm, session, kernel)
   }
   return { ok: true, wrap, crag }
 }

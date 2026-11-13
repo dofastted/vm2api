@@ -19,6 +19,7 @@ import {
 } from '../../src/lib/cluster/placement.mjs'
 import {
   inspectClusterPayloadChanges,
+  refreshClusterSlotPayloads,
   refreshNodeSlotPayload,
   remoteIptablesScript,
   slotEgressNames,
@@ -28,6 +29,7 @@ import {
   pullSlotCredentials,
   pushCragSlot,
   pushSlotCredentials,
+  pushSlotFiles,
   reconcileSlotCredentials,
   remoteSlotPath,
 } from '../../src/lib/cluster/remote-slot-files.mjs'
@@ -146,6 +148,49 @@ function localSlot(cred) {
 }
 
 const vm = { id: 'vm-07', node_id: 'node-t' }
+
+test('KVM run publication selects the live guest kernel and preserves node credentials', async (t) => {
+  const node = fakeNode()
+  const slotDir = localSlot('local-credential')
+  t.after(() => fs.rmSync(path.dirname(slotDir), { recursive: true, force: true }))
+  node.files.set(node.remoteCred, Buffer.from('rotated-credential'))
+  const target = { ...vm, runtime: { type: 'kvm' } }
+  fs.mkdirSync(path.join(slotDir, 'run'))
+  const entry = `${node.session.host.root}/vms/${vm.id}/cli-home/.kin/kin-kernel`
+  for (const [dataplane, expected] of [
+    ['crag', 'crag-kernel'],
+    ['wrap', 'kin-kernel'],
+  ]) {
+    fs.writeFileSync(path.join(slotDir, 'run/kernel.json'), JSON.stringify({ dataplane }))
+    await pushSlotFiles(target, slotDir, ['run'], node.session)
+    assert.equal(node.files.get(entry)?.toString(), `#!/bin/sh\nexec /opt/kin-live/${expected} "$@"\n`)
+    assert.equal(node.modes.get(entry), 0o755)
+    assert.equal(node.files.get(node.remoteCred).toString(), 'rotated-credential')
+  }
+})
+
+test('cluster CRAG KVM refresh reaches the managed lifecycle for running and stopped slots', async () => {
+  const targets = ['running', 'stopped'].map((status, i) => ({
+    id: `vm-kvm-${i}`,
+    node_id: 'node-t',
+    runtime: { type: 'kvm' },
+    dataplane: 'crag',
+    status,
+  }))
+  const visited = []
+  const result = await refreshClusterSlotPayloads('/fixture', targets, {
+    refreshFn: async (target) => {
+      visited.push(target)
+      return { id: target.id, ok: true, kernel_changed: true, restarted: target.status === 'running' }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.deepEqual(visited, targets)
+  assert.deepEqual(
+    result.items.map((item) => item.restarted),
+    [true, false],
+  )
+})
 
 test('login prepare reconcile keeps a live remote credential when local is stale', async () => {
   const node = fakeNode()
