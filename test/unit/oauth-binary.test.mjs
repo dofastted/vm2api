@@ -22,6 +22,8 @@ import { slotExec } from '../../src/lib/vm/slot-runtime.mjs'
 test('guest OAuth helper preserves provider state, PKCE and cookie authorization', {
   timeout: 30000,
 }, async (t) => {
+  const binary = fileURLToPath(new URL('../../bin/kin-oauth-auth', import.meta.url))
+  fs.accessSync(binary, fs.constants.X_OK)
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-authorize-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   t.after(resetAuthUrlSessions)
@@ -193,7 +195,6 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
     }),
   )
   const exec = slotExec(root, vm)
-  const binary = fileURLToPath(new URL('../../bin/kin-oauth-auth', import.meta.url))
   // Only guest process execution is substituted. The shipped provider engine
   // talks to the real TLS/SOCKS fixture; this does not prove Docker isolation.
   const run = (payload) =>

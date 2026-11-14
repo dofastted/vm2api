@@ -436,7 +436,7 @@ CI 配置以 [`.github/workflows/test.yml`](.github/workflows/test.yml) 为准�
 日常 CI 的业务结果统一为 `ci`，`changes` 负责识别改动目录：
 
 - 后端改动运行语法检查和核心集，追加本次新增或修改的后端单测文件；前端改动运行核心集、追加新增或修改的前端测试文件，并执行类型检查与生产构建。本地 `test:ci` 命令只运行固定核心集。
-- `worker/`、`api-kernel/` 或 `redact/` 改动会运行这三个 Go 模块的 `go test ./...`；打包相关改动才下载和校验 pinned payload、执行 native CLI 打包单测。
+- `worker/`、`api-kernel/` 或 `redact/` 改动会运行这三个 Go 模块的 `go test ./...`；打包相关改动才下载和校验完整 pinned payload、执行 native CLI 打包单测。日常 CI 选中 `oauth-binary.test.mjs` 时，单独准备并校验其依赖的 `kin-oauth-auth`。
 - 纯文档或 `VERSION` 改动只做目录识别与状态收尾，不安装依赖、不运行业务测试。
 - 全仓格式检查与 ARM 镜像构建不作为日常 CI 的必过条件。格式工具和仅处理改动文件的方法见 [docs/FORMAT.md](docs/FORMAT.md)。
 

@@ -135,6 +135,12 @@ jobs:
           if [ "$FULL" = true ]; then
             npm run test:unit
           else
+            if jq -e 'index("test/unit/oauth-binary.test.mjs") != null' <<< "$CHANGED_TESTS" >/dev/null; then
+              manifest="$RUNNER_TEMP/oauth-test-payload.json"
+              jq -e '.files |= map(select(.path == "bin/kin-oauth-auth")) | select(.files | length == 1)' deploy/payload.json > "$manifest"
+              node scripts/fetch-payload.mjs --manifest "$manifest"
+              node scripts/fetch-payload.mjs --manifest "$manifest" --check
+            fi
             tests=$(jq -r '.[] | split("/")[-1]' <<< "$CHANGED_TESTS")
             changed=()
             if [ -n "$tests" ]; then
