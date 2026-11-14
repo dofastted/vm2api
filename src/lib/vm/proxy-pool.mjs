@@ -255,7 +255,7 @@ function localEgressRecord(nodeId = null) {
 }
 
 /** Upstream proxy protocols a pool row can speak; anything else is rejected, not coerced. */
-function proxyScheme(value) {
+export function proxyScheme(value) {
   const s = String(value ?? '')
     .trim()
     .toLowerCase()
@@ -302,8 +302,10 @@ export function parseSocks5Fields(fields = {}) {
  *  host:port
  *  host:port:user:pass
  *  user:pass:host:port
+ *
+ * `defaultScheme` only applies to forms without an explicit `scheme://` prefix.
  */
-export function parseSocks5Line(line) {
+export function parseSocks5Line(line, defaultScheme = 'socks5') {
   let raw = String(line || '').trim()
   if (!raw || raw.startsWith('#')) return null
   raw = raw.replace(/^['"]|['"]$/g, '').trim()
@@ -343,6 +345,7 @@ export function parseSocks5Line(line) {
         const [, host, port] = match
         const colon = cred.indexOf(':')
         return socks5Record({
+          scheme: defaultScheme,
           host,
           port,
           username: colon >= 0 ? cred.slice(0, colon) : cred,
@@ -355,19 +358,34 @@ export function parseSocks5Line(line) {
     if (raw.includes('[') || raw.includes(']')) {
       const match = raw.match(/^\[([^\]]+)\]:(\d+)(?::([^:]*)(?::(.*))?)?$/)
       if (!match || !net.isIPv6(match[1])) return null
-      return socks5Record({ host: match[1], port: match[2], username: match[3], password: match[4], raw })
+      return socks5Record({
+        scheme: defaultScheme,
+        host: match[1],
+        port: match[2],
+        username: match[3],
+        password: match[4],
+        raw,
+      })
     }
     // A colon-delimited IPv6 endpoint has no unambiguous port boundary.
     if (net.isIPv6(raw) || net.isIPv6(raw.slice(0, raw.lastIndexOf(':')))) return null
     const parts = raw.split(':')
     if (parts.length === 2) {
-      return socks5Record({ host: parts[0], port: parts[1], raw })
+      return socks5Record({ scheme: defaultScheme, host: parts[0], port: parts[1], raw })
     }
     if (parts.length === 3 && looksLikeHost(parts[0]) && isSocksPort(parts[1])) {
-      return socks5Record({ host: parts[0], port: parts[1], username: parts[2], password: '', raw })
+      return socks5Record({
+        scheme: defaultScheme,
+        host: parts[0],
+        port: parts[1],
+        username: parts[2],
+        password: '',
+        raw,
+      })
     }
     if (parts.length >= 4 && looksLikeHost(parts[0]) && isSocksPort(parts[1])) {
       return socks5Record({
+        scheme: defaultScheme,
         host: parts[0],
         port: parts[1],
         username: parts[2],
@@ -377,6 +395,7 @@ export function parseSocks5Line(line) {
     }
     if (parts.length >= 4 && isSocksPort(parts[parts.length - 1]) && looksLikeHost(parts[parts.length - 2])) {
       return socks5Record({
+        scheme: defaultScheme,
         host: parts[parts.length - 2],
         port: parts[parts.length - 1],
         username: parts[0],
@@ -731,18 +750,29 @@ export class ProxyPool extends EventEmitter {
   }
 
   importLines(text, extra = {}) {
+    // Protocol for rows that do not name one themselves (bare host:port, fields
+    // without scheme). Callers validate it; an unknown value falls back to SOCKS5.
+    const defaultScheme = proxyScheme(extra.defaultScheme) || 'socks5'
     const parsed = []
     for (const line of String(text || '').split(/\r?\n/)) {
       if (!String(line || '').trim()) continue
-      parsed.push(parseSocks5Line(line) || { __invalid: String(line).trim() })
+      parsed.push(parseSocks5Line(line, defaultScheme) || { __invalid: String(line).trim() })
     }
     const fields = extra.fields || extra.proxies || extra.entries || []
     for (const item of Array.isArray(fields) ? fields : [fields]) {
       if (!item || typeof item !== 'object') continue
-      parsed.push(parseSocks5Fields(item) || { __invalid: `${item.host || ''}:${item.port || ''}` })
+      parsed.push(
+        parseSocks5Fields({ ...item, scheme: item.scheme ?? item.protocol ?? item.type ?? defaultScheme }) || {
+          __invalid: `${item.host || ''}:${item.port || ''}`,
+        },
+      )
     }
     if (extra.host || extra.port) {
-      parsed.push(parseSocks5Fields(extra) || { __invalid: `${extra.host || ''}:${extra.port || ''}` })
+      parsed.push(
+        parseSocks5Fields({ ...extra, scheme: extra.scheme ?? defaultScheme }) || {
+          __invalid: `${extra.host || ''}:${extra.port || ''}`,
+        },
+      )
     }
     return this.importParsed(parsed, extra)
   }
@@ -947,13 +977,14 @@ export class ProxyPool extends EventEmitter {
    * and port. Absent key = leave alone; empty string = clear.
    *
    * The merged record goes through socks5Record() so this shares the exact
-   * validation and normalization the import path uses.
+   * validation and normalization the import path uses. `scheme` (socks5 / http)
+   * counts as a connection field: switching it changes how bound slots dial out.
    */
   update(proxyId, patch = {}) {
     const p = this.state.proxies.find((x) => x.id === proxyId)
     if (!p) return { ok: false, error: 'proxy_not_found' }
     const has = (k) => Object.prototype.hasOwnProperty.call(patch, k)
-    const connection = ['host', 'port', 'username', 'password'].some(has)
+    const connection = ['scheme', 'host', 'port', 'username', 'password'].some(has)
     if (!connection && !has('label') && !has('domain_forward')) {
       return { ok: false, error: 'no_editable_fields' }
     }
@@ -976,6 +1007,12 @@ export class ProxyPool extends EventEmitter {
       this.save()
       return { ok: true, proxy: this.publicProxy(p), connection_changed: false, domain_forward_changed: domainChanged }
     }
+    let scheme = p.scheme || 'socks5'
+    if (has('scheme')) {
+      if (isLocalEgressProxy(p)) return { ok: false, error: 'scheme_unsupported' }
+      scheme = proxyScheme(patch.scheme)
+      if (!scheme) return { ok: false, error: 'invalid_scheme' }
+    }
     const username = has('username') ? patch.username : p.username
     // SOCKS5 has no password-only auth: socks5Record() drops the password
     // whenever the username is empty. Setting one without the other would
@@ -984,7 +1021,7 @@ export class ProxyPool extends EventEmitter {
       return { ok: false, error: 'password_without_username' }
     }
     const next = socks5Record({
-      scheme: p.scheme || 'socks5',
+      scheme,
       host: has('host') ? patch.host : p.host,
       port: has('port') ? patch.port : p.port,
       username,
@@ -994,6 +1031,7 @@ export class ProxyPool extends EventEmitter {
       password: has('password') ? patch.password : username ? p.password : null,
     })
     if (!next) return { ok: false, error: 'invalid_proxy' }
+    p.scheme = next.scheme
     p.host = next.host
     p.port = next.port
     p.username = next.username

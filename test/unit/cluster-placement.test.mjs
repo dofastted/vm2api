@@ -181,6 +181,47 @@ test('KVM binary publication requires a complete CRAG preinstall even while cli-
   assert.equal(node.files.get(node.remoteCred).toString(), 'rotated-credential')
 })
 
+test('service binary publication rewrites only binaries whose node copy differs', async (t) => {
+  const node = fakeNode()
+  const root = tmpDir('kin-slot-bin-skip-')
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const worker = path.join(root, 'kin-worker')
+  const egress = path.join(root, 'kin-egress')
+  fs.writeFileSync(worker, 'worker-v1')
+  fs.writeFileSync(egress, 'egress-v1')
+  const saved = { worker: process.env.KIN_CLUSTER_WORKER_BIN, egress: process.env.KIN_CLUSTER_EGRESS_BIN }
+  process.env.KIN_CLUSTER_WORKER_BIN = worker
+  process.env.KIN_CLUSTER_EGRESS_BIN = egress
+  t.after(() => {
+    for (const [key, value] of [
+      ['KIN_CLUSTER_WORKER_BIN', saved.worker],
+      ['KIN_CLUSTER_EGRESS_BIN', saved.egress],
+    ]) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  })
+  const remote = `${node.session.host.root}/vms/${vm.id}/slot-bin`
+  const writes = () => node.published.filter((p) => p === `${remote}/kin-worker` || p === `${remote}/kin-egress`)
+
+  const first = await pushSlotBinaries(vm, root, node.session)
+  assert.deepEqual(writes().sort(), [`${remote}/kin-egress`, `${remote}/kin-worker`])
+  assert.equal(node.files.get(`${remote}/kin-worker`).toString(), 'worker-v1')
+  assert.equal(node.modes.get(`${remote}/kin-worker`), 0o755)
+
+  // Slot starts (OAuth, recovery) repeat this on slow node links; unchanged binaries must not be resent.
+  const again = await pushSlotBinaries(vm, root, node.session)
+  assert.equal(writes().length, 2)
+  assert.equal(again.digest, first.digest)
+  assert.deepEqual(again.pushed, first.pushed)
+
+  fs.writeFileSync(egress, 'egress-v2')
+  const changed = await pushSlotBinaries(vm, root, node.session)
+  assert.deepEqual(writes().slice(2), [`${remote}/kin-egress`])
+  assert.equal(node.files.get(`${remote}/kin-egress`).toString(), 'egress-v2')
+  assert.notEqual(changed.digest, first.digest)
+})
+
 test('KVM run publication selects the live guest kernel and preserves node credentials', async (t) => {
   const node = fakeNode()
   const root = tmpDir('kin-kvm-config-')

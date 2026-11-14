@@ -6,6 +6,8 @@ import { api } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { ProxyPanel } from './proxy-panel'
+import type { ProxyScheme } from './proxy-scheme'
+import { ProxySchemeToggle } from './proxy-scheme-toggle'
 import { useRefreshProxies } from './queries'
 
 type ImportResult = {
@@ -47,6 +49,8 @@ function countLines(raw: string): number {
 export function ProxyImportPanel({ hasLocal }: { hasLocal: boolean }) {
   const refresh = useRefreshProxies()
   const [raw, setRaw] = useState('')
+  // 只决定「没写 scheme:// 前缀」的行按什么协议入库；写了前缀的以前缀为准。
+  const [scheme, setScheme] = useState<ProxyScheme>('socks5')
   const [outcome, setOutcome] = useState<ImportOutcome | null>(null)
   const lines = countLines(raw)
 
@@ -54,7 +58,7 @@ export function ProxyImportPanel({ hasLocal }: { hasLocal: boolean }) {
     mutationFn: () =>
       api<ImportResult>('/api/panel/proxies/import', {
         method: 'POST',
-        body: JSON.stringify({ text: raw }),
+        body: JSON.stringify({ text: raw, default_scheme: scheme }),
       }),
     onSuccess: async (data) => {
       const next = outcomeOf(data)
@@ -94,8 +98,17 @@ export function ProxyImportPanel({ hasLocal }: { hasLocal: boolean }) {
         </span>
       }
     >
+      <div className='mb-2 flex flex-wrap items-center gap-2'>
+        <span className='text-xs text-muted-foreground'>协议</span>
+        <ProxySchemeToggle
+          value={scheme}
+          onChange={setScheme}
+          disabled={importPx.isPending}
+          label='未写协议前缀的行按此协议导入'
+        />
+      </div>
       <label htmlFor='proxy-import' className='sr-only'>
-        SOCKS5 列表，每行一条
+        {scheme === 'http' ? 'HTTP' : 'SOCKS5'} 代理列表，每行一条
       </label>
       <Textarea
         id='proxy-import'
@@ -113,14 +126,13 @@ export function ProxyImportPanel({ hasLocal }: { hasLocal: boolean }) {
         rows={8}
         spellCheck={false}
         autoComplete='off'
-        placeholder={
-          'host:port\nuser:pass@host:port\nsocks5://user:pass@host:port\nhttp://user:pass@host:port'
-        }
+        placeholder={'host:port\nuser:pass@host:port\nhost:port:user:pass'}
         className='field-host min-h-40 resize-y text-xs leading-relaxed'
       />
       <p className='mt-1.5 text-[11px] text-muted-foreground'>
-        也支持 host:port:user:pass；不带协议默认 SOCKS5，HTTP 代理请写
-        http://。账密入库后不再回显，重复的自动跳过。
+        未写协议的行按上方所选（当前 {scheme === 'http' ? 'HTTP' : 'SOCKS5'}
+        ）导入；写了 socks5:// 或 http://
+        前缀的以前缀为准，可混填。账密入库后不再回显，重复的自动跳过。
       </p>
       <div className='mt-3 flex flex-wrap items-center gap-2'>
         <Button
