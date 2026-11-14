@@ -31,11 +31,11 @@ commitImportedOauth → 仅完整 OAuth 运行模式排队官方 Claude Code 初
 | sessionKey（默认 Setup Token） | `POST /api/panel/vms/import` `{ type: "setup-token", sessionKey }` | `sk-ant-sid*` 经槽位 SOCKS5 申请完整 OAuth scope（profile、inference、sessions、MCP、文件），采集 bootstrap 身份；落盘后以 Setup Token 运行模式执行，不跑官方初装。 |
 | 已有 OAuth → Setup Token | `POST /api/panel/vms/:id/oauth/to-setup-token` | 读 worker 活票，仅切换运行模式；保留 access、refresh、真实过期时间和全部实际 scope。不会凭空增加权限，也不会删 scope。官方一年期 token（`official-setup-token`）不能转。 |
 | 官方 `claude setup-token` | 槽内 PTY / 粘贴一年期 oat | 只有 `user:inference`、无 refresh。落盘 `credential_mode=official-setup-token`，与面板转换的完整 Setup Token 区分。 |
-| 授权链接 | `POST /api/panel/vms/:id/oauth/generate-auth-url` | CAI、Claude Code、Setup Token flavor 都请求完整 OAuth scope。Setup Token flavor 仍只改变运行模式；服务端 PKCE，30min；未绑定出口不能生成 URL，本地出口可以。 |
+| 授权链接 | `POST /api/panel/vms/:id/oauth/generate-auth-url` | CAI 和 Setup Token 使用面板 PKCE；Claude Code 使用 VM 内 CRAG 包自带的原生 `claude auth login`。均要求绑定可用出口。 |
 
 换出的 access/refresh 只写入 credentials.json；导入时文档顶层和 `claudeAiOauth` 都写 `kinGeneration`，文件仍是 `0444`。`vm.json` / DB 只留 `has_access` / `has_refresh` / email / expiry / generation。Claude 面板默认选 Setup Token + Cookie。
 
-完整 OAuth 授权链接（`cai` / `claude_code`）的粘贴码按 sub2api 换票规则处理：`code#state` 只将 `#` 后的上游返回值作为 token 请求的 `state`；只有 code 时不发送 `state`，不补生成链接时的 nonce。手动粘贴不是浏览器自动回调，code 与授权会话仍由 PKCE verifier 绑定，30 分钟期限与 VM 绑定检查不变。`setup_token` flavor、Cookie 换票和官方 Setup Token 流程不变。该修复只改控制面，现有 `kin-oauth-auth` 已支持可选 `state`，无需重编或 `wrap-cli/sync`。
+CAI 粘贴码按 sub2api 规则换票：`code#state` 只将 `#` 后的上游返回值作为 token 请求的 `state`；只有 code 时不发送 `state`。Claude Code 由原生客户端保存 PKCE，面板将完整授权码交给原进程处理。Setup Token 和 Cookie 流程不变。
 
 Cookie authorize 的组织 UUID 同时出现在 `/v1/oauth/{uuid}/authorize` 路径和 JSON 的 `organization_uuid` 字段；只有路径 UUID 不够，上游会返回 400 `Invalid request format`。
 
@@ -72,7 +72,7 @@ SSH 扩展槽同样由控制面经绑定出口换票。拿到授权后，提交�
 
 ## 面板换票与原生 Claude Code 终端
 
-所有授权换票在账号面板完成。「OAuth → Claude Code 授权」使用面板管理的 PKCE 会话：生成链接、浏览器授权、粘贴授权码。凭证导入后自动同步给 VM 客户端；同步失败会返回错误，不显示完成。
+「OAuth → Claude Code 授权」保持现有面板入口。先启动已绑定出口的 VM，再生成链接、浏览器授权并粘贴完整授权码。原生 CC 使用临时配置换票；面板读取新凭证并通过现有导入流程同步到 VM 客户端，同步失败不显示完成。
 
 - 原生客户端的 `.credentials.json` 链接到面板管理的 `credentials.json`。显式导入以面板新凭证为准，不让旧原生客户端留下的文件覆盖新账号。远程槽导入时先推送凭证；后续手动同步保留节点已轮换的凭证，再修复原生客户端链接。
 - 运维终端的 `/sync` 可重新同步凭证。它不触发 OAuth 换票、不输出 token；同步完成后重新启动 `claude` 或 `cc` 使用当前凭证。
