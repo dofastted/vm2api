@@ -19,6 +19,7 @@ import {
   type ImportMethod,
 } from '@/lib/cred-type'
 import { importErrorMessage } from '@/lib/import-errors'
+import type { LoginCommit } from '@/lib/login-terminal'
 import { proxyNamedLabel } from '@/lib/vm-status'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -32,12 +33,12 @@ import {
 } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import { dashboardQueryOptions } from '@/features/overview/queries'
+import { ClaudeLogin } from '@/features/vm/claude-login'
 import { CodexCredentialPanel } from '@/features/vm/codex-credential-panel'
 import { ConvertOauthToSetupButton } from '@/features/vm/convert-oauth-button'
 import { vmQueryOptions } from '@/features/vm/queries'
 
-export type CommitResult = {
-  official_cc_bootstrap?: { scheduled?: boolean; reason?: string } | null
+export type CommitResult = LoginCommit & {
   oauth_email?: string
 }
 
@@ -371,6 +372,17 @@ function ClaudeCredentialPanel({
             <Hint>需要 sk-ant-api03- 开头的 Console API Key。</Hint>
           ) : null}
         </div>
+      ) : activeMethod === 'cc' ? (
+        <ClaudeLogin
+          vm={vm}
+          disabled={busy}
+          onLogin={async (result) => {
+            await invalidate()
+            const message = 'Claude Code 授权已保存并同步'
+            toast.success(message)
+            onCommitted?.(result, vmId, message)
+          }}
+        />
       ) : activeMethod === 'session' ? (
         <div className='space-y-2'>
           <Label htmlFor='cred-session-key'>sessionKey / access token</Label>

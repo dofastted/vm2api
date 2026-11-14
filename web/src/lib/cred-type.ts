@@ -111,8 +111,8 @@ export function importSurfaceFor(vm: Vm | undefined): 'claude' | 'codex' {
 export type ImportMethod = 'session' | 'link' | 'cc'
 
 export const IMPORT_KINDS: { id: ImportKind; label: string }[] = [
-  { id: 'setup-token', label: 'Setup Token' },
   { id: 'oauth', label: 'OAuth' },
+  { id: 'setup-token', label: 'Setup Token' },
   { id: 'apikey', label: 'Console' },
 ]
 
@@ -130,10 +130,11 @@ export function importMethodsFor(
 }
 
 export function defaultImportKind(): ImportKind {
-  return 'setup-token'
+  return 'oauth'
 }
 
 export function defaultImportMethod(kind: ImportKind): ImportMethod {
+  if (kind === 'oauth') return 'cc'
   return kind === 'apikey' ? 'link' : 'session'
 }
 

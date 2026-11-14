@@ -196,7 +196,7 @@ function captureDockerOutput(buf, maxOutputBytes) {
 }
 
 /** Finite non-TTY commands only. Closing a timed-out stream is not a process kill. */
-export async function execCapture(connect, id, cmd, { timeoutMs = 10_000, maxOutputBytes = 65_536 } = {}) {
+export async function execCapture(connect, id, cmd, { user, timeoutMs = 10_000, maxOutputBytes = 65_536 } = {}) {
   if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes <= 0 || maxOutputBytes > MAX_RESPONSE_BYTES / 2 - 8) {
     throw new RangeError('invalid Docker exec output limit')
   }
@@ -208,7 +208,7 @@ export async function execCapture(connect, id, cmd, { timeoutMs = 10_000, maxOut
         {
           method: 'POST',
           path: `${containerPath(id)}/exec`,
-          body: { Cmd: cmd, Tty: false, AttachStdout: true, AttachStderr: true },
+          body: { Cmd: cmd, Tty: false, AttachStdout: true, AttachStderr: true, ...(user ? { User: user } : {}) },
           timeoutMs,
         },
         [201],
@@ -537,10 +537,9 @@ function execPath(execId) {
 /**
  * `docker exec -it` over the Engine API. The start call is hijacked
  * (`Upgrade: tcp`); with Tty the stream is raw, no 8-byte frame headers.
- * No `User`: the session runs as the container's configured user.
  * @returns {Promise<{ execId: string, stream: import('node:stream').Duplex }>}
  */
-export async function openExecTty(connect, id, { cmd, env = [], workingDir, cols = 80, rows = 24 } = {}) {
+export async function openExecTty(connect, id, { cmd, env = [], user, workingDir, cols = 80, rows = 24 } = {}) {
   const created = await dockerJson(
     connect,
     {
@@ -553,6 +552,7 @@ export async function openExecTty(connect, id, { cmd, env = [], workingDir, cols
         AttachStdin: true,
         AttachStdout: true,
         AttachStderr: true,
+        ...(user ? { User: user } : {}),
         ...(workingDir ? { WorkingDir: workingDir } : {}),
       },
     },

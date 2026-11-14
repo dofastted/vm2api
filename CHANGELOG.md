@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 1.4.095 — 2026-11-15 · Claude Code 授权终端
+
+- Claude Code OAuth 默认通过专用弹窗授权：同一窗口提供 VM 原生终端、可复制链接和回调输入，凭证同步后才显示成功。运维终端会检查凭证链接并按需刷新临期 OAuth。
+
 ## 1.4.094 — 2026-11-15 · Claude Code 原生 OAuth
 
 - 账号面板的 Claude Code OAuth 由 VM 内 CRAG 包自带的原生 CC 生成链接并处理授权码；保留现有页面及其他授权方式。
