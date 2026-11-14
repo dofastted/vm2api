@@ -1,10 +1,17 @@
-import { useMemo, useState, type ReactNode } from 'react'
+import type { ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import type { Vm, VmKernelSnapshot } from '@/types/panel-vm'
 import { Loader2 } from 'lucide-react'
 import { toast } from 'sonner'
-import { activateVmCragLicense, isApiError, patchVm } from '@/lib/api'
+import {
+  ApiError,
+  activateVmCragLicense,
+  isApiError,
+  patchVm,
+  startVmKernelSwitch,
+} from '@/lib/api'
 import { isCodexVm } from '@/lib/vm-kind'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -28,6 +35,7 @@ import {
 import { isRemoteVm, REMOTE_UNSUPPORTED_TEXT } from '@/features/vm/placement'
 import {
   vmCragLicenseQueryOptions,
+  vmKernelSwitchQueryOptions,
   vmQueryOptions,
   vmsListQueryOptions,
 } from '@/features/vm/queries'
@@ -169,6 +177,7 @@ function SlotKernelSwitch({
   const [switchAfterActivation, setSwitchAfterActivation] = useState(false)
   const [checkingLicense, setCheckingLicense] = useState(false)
   const [registrationCode, setRegistrationCode] = useState('')
+  const handledObservation = useRef('')
   const switchToastId = `vm-kernel-switch-${id}`
   const kvm = ['kvm', 'qemu', 'libvirt'].includes(
     String(vm.runtime?.type || vm.runtime_type || '')
@@ -176,6 +185,97 @@ function SlotKernelSwitch({
       .toLowerCase()
   )
   const blocked = vm.node_platform === 'darwin'
+  const jobQuery = useQuery({
+    ...vmKernelSwitchQueryOptions(id),
+    enabled: remote && !blocked,
+  })
+  const canRetry =
+    vm.status === 'running' &&
+    vm.unschedulable_reason === 'runtime_start_failed'
+  const refreshVmState = useCallback(
+    () =>
+      Promise.all([
+        qc.invalidateQueries({ queryKey: vmQueryOptions(id).queryKey }),
+        qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey }),
+        qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
+      ]),
+    [id, qc]
+  )
+  const showSwitchError = useCallback(
+    (error: Error) => {
+      if (isApiError(error) && error.code.startsWith('license_')) {
+        toast.error(cragLicenseErrorMessage(error), {
+          id: switchToastId,
+          description: undefined,
+        })
+        setLicenseOpen(true)
+        setSwitchAfterActivation(true)
+        void qc.invalidateQueries({
+          queryKey: vmCragLicenseQueryOptions(id).queryKey,
+        })
+      } else {
+        toast.error(`内核切换未完成：${error.message}`, {
+          id: switchToastId,
+          description: '请先核对当前内核、VM 运行和调度状态，再重试。',
+        })
+      }
+    },
+    [id, qc, switchToastId]
+  )
+  useEffect(() => {
+    if (!remote || blocked || jobQuery.isPending || jobQuery.isFetching) return
+    if (jobQuery.isError) {
+      const observation = `error:${jobQuery.errorUpdatedAt}`
+      if (handledObservation.current === observation) return
+      handledObservation.current = observation
+      showSwitchError(jobQuery.error)
+      void refreshVmState()
+      return
+    }
+    const job = jobQuery.data
+    if (!job) return
+    const observation = `${job.id}:${job.status}`
+    if (handledObservation.current === observation) return
+    handledObservation.current = observation
+    const next = job.dataplane === 'crag' ? 'v2' : 'wrap'
+    if (job.status === 'running') {
+      setPending(null)
+      toast.loading(`正在切换到 ${slotKernelLabel(next)}…`, {
+        id: switchToastId,
+        description:
+          '正在等待本槽内核切换完成，请勿重复操作。关闭页面不会取消任务，可重新打开查看进度。',
+      })
+      return
+    }
+    if (job.status === 'failed') {
+      showSwitchError(
+        new ApiError(
+          job.error?.message || '服务端内核切换失败',
+          0,
+          job.error?.code
+        )
+      )
+    } else {
+      toast.success(kernelSwitchSuccess(next, vm.status), {
+        id: switchToastId,
+        description: undefined,
+      })
+    }
+    void refreshVmState()
+  }, [
+    blocked,
+    jobQuery.data,
+    jobQuery.error,
+    jobQuery.errorUpdatedAt,
+    jobQuery.isError,
+    jobQuery.isFetching,
+    jobQuery.isPending,
+    refreshVmState,
+    remote,
+    showSwitchError,
+    switchToastId,
+    vm.status,
+  ])
   const onV2 =
     vm.resolved_dataplane === 'crag' && vm.resolved_crag_kernel_version === 'v2'
   const onCli =
@@ -195,7 +295,7 @@ function SlotKernelSwitch({
         return
       }
       toast.success('CRAG 授权已激活')
-      if (switchAfterActivation && !onV2) setPending('v2')
+      if (switchAfterActivation && (!onV2 || canRetry)) setPending('v2')
       await Promise.all([
         qc.invalidateQueries({ queryKey: vmQueryOptions(id).queryKey }),
         qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
@@ -220,13 +320,17 @@ function SlotKernelSwitch({
     }
   }
   const switchKernel = useMutation({
-    mutationFn: (next: SlotKernelTarget) =>
-      patchVm(
-        id,
+    mutationFn: async (next: SlotKernelTarget) => {
+      const body =
         next === 'v2'
-          ? { dataplane: 'crag', crag_kernel_version: 'v2' }
-          : { dataplane: 'wrap', crag_kernel_version: '' }
-      ),
+          ? ({ dataplane: 'crag', crag_kernel_version: 'v2' } as const)
+          : ({ dataplane: 'wrap', crag_kernel_version: '' } as const)
+      if (remote) return startVmKernelSwitch(id, body)
+      await patchVm(id, body)
+      return null
+    },
+    // A disconnected POST may already have started the task. Never resubmit it.
+    retry: false,
     onMutate: (next) => {
       toast.loading(`正在切换到 ${slotKernelLabel(next)}…`, {
         id: switchToastId,
@@ -236,72 +340,88 @@ function SlotKernelSwitch({
             : '正在保存内核配置，VM 不会因此启动。',
       })
     },
-    onSuccess: (_data, next) => {
+    onSuccess: (data, next) => {
+      setPending(null)
+      if (remote && data) {
+        qc.setQueryData(vmKernelSwitchQueryOptions(id).queryKey, data)
+        return
+      }
       toast.success(kernelSwitchSuccess(next, vm.status), {
         id: switchToastId,
         description: undefined,
       })
-      setPending(null)
     },
     onError: (error: Error) => {
-      if (isApiError(error) && error.code.startsWith('license_')) {
-        toast.error(cragLicenseErrorMessage(error), {
-          id: switchToastId,
-          description: undefined,
-        })
-        setLicenseOpen(true)
-        setSwitchAfterActivation(true)
-        void qc.invalidateQueries({
-          queryKey: vmCragLicenseQueryOptions(id).queryKey,
-        })
-      } else {
-        toast.error(`内核切换未完成：${error.message}`, {
-          id: switchToastId,
-          description: '请先核对当前内核、VM 运行和调度状态，再重试。',
-        })
-      }
+      showSwitchError(error)
       setPending(null)
     },
     // A failed restart can still persist the new policy. Refresh both outcomes.
-    onSettled: () =>
-      Promise.all([
-        qc.invalidateQueries({ queryKey: vmQueryOptions(id).queryKey }),
-        qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey }),
-        qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
-      ]),
+    onSettled: (_data, error) => {
+      if (!remote || error) return refreshVmState()
+    },
   })
-  const target = pending ?? switchKernel.variables ?? 'wrap'
-  const switchError = switchKernel.error
+  const job = remote ? jobQuery.data : null
+  const target =
+    pending ??
+    (job && !switchKernel.isPending
+      ? job.dataplane === 'crag'
+        ? 'v2'
+        : 'wrap'
+      : switchKernel.variables) ??
+    'wrap'
+  const switchError =
+    switchKernel.error ??
+    (remote ? jobQuery.error : null) ??
+    (job?.status === 'failed'
+      ? new ApiError(
+          job.error?.message || '服务端内核切换失败',
+          0,
+          job.error?.code
+        )
+      : null)
   const switchErrorMessage =
     isApiError(switchError) && switchError.code.startsWith('license_')
       ? cragLicenseErrorMessage(switchError)
       : switchError?.message
+  const switching =
+    switchKernel.isPending ||
+    (!!job && job.status === 'running' && !switchError)
+  const switchFailed = !switching && !!switchError
+  const switchSucceeded =
+    !switching &&
+    !switchFailed &&
+    (remote ? job?.status === 'succeeded' : switchKernel.isSuccess)
+  const checkingJob = remote && !blocked && jobQuery.isPending
+  const needsCheck = remote && (switchKernel.isError || jobQuery.isError)
   const busy =
-    checkingLicense || switchKernel.isPending || activateLicense.isPending
+    checkingLicense ||
+    switching ||
+    activateLicense.isPending ||
+    checkingJob ||
+    needsCheck ||
+    (remote && jobQuery.isFetching)
   return (
     <div className='mt-3 space-y-2'>
       <div className='flex flex-wrap gap-2'>
         <Button
           variant='outline'
-          disabled={blocked || busy || onCli}
-          aria-busy={switchKernel.isPending && target === 'wrap'}
+          disabled={blocked || busy || (onCli && !canRetry)}
+          aria-busy={switching && target === 'wrap'}
           onClick={() => setPending('wrap')}
         >
-          {switchKernel.isPending && target === 'wrap'
+          {switching && target === 'wrap'
             ? '正在切回 cli-node…'
             : '本槽切回 cli-node'}
         </Button>
         <Button
           variant='outline'
-          disabled={blocked || busy || onV2}
-          aria-busy={
-            checkingLicense || (switchKernel.isPending && target === 'v2')
-          }
+          disabled={blocked || busy || (onV2 && !canRetry)}
+          aria-busy={checkingLicense || (switching && target === 'v2')}
           onClick={() => void requestV2()}
         >
           {checkingLicense
             ? '正在检查授权…'
-            : switchKernel.isPending && target === 'v2'
+            : switching && target === 'v2'
               ? '正在切换到 CRAG v2…'
               : '本槽切到 CRAG v2'}
         </Button>
@@ -322,37 +442,55 @@ function SlotKernelSwitch({
           </Button>
         ) : null}
       </div>
-      {switchKernel.isPending ||
-      switchKernel.isSuccess ||
-      switchKernel.isError ? (
-        <Alert
-          role={switchKernel.isError ? 'alert' : 'status'}
-          aria-live={switchKernel.isError ? 'assertive' : 'polite'}
-          aria-atomic='true'
-          variant={switchKernel.isError ? 'destructive' : 'default'}
+      {checkingJob ? (
+        <p role='status' className='text-sm text-muted-foreground'>
+          正在核对本槽是否有未完成的内核切换…
+        </p>
+      ) : null}
+      {needsCheck ? (
+        <Button
+          variant='outline'
+          disabled={jobQuery.isFetching}
+          onClick={async () => {
+            // Explicitly acknowledge an interrupted observation before checking again.
+            // Only GET is retried here; never repeat the POST automatically.
+            qc.setQueryData(vmKernelSwitchQueryOptions(id).queryKey, null)
+            const result = await jobQuery.refetch()
+            if (!result.isError) {
+              switchKernel.reset()
+            }
+            await refreshVmState()
+          }}
         >
-          {switchKernel.isPending ? (
+          {jobQuery.isFetching ? '正在核对切换状态…' : '核对切换状态'}
+        </Button>
+      ) : null}
+      {switching || switchSucceeded || switchFailed ? (
+        <Alert
+          role={switchFailed ? 'alert' : 'status'}
+          aria-live={switchFailed ? 'assertive' : 'polite'}
+          aria-atomic='true'
+          variant={switchFailed ? 'destructive' : 'default'}
+        >
+          {switching ? (
             <Loader2
               aria-hidden='true'
               className='size-4 animate-spin motion-reduce:animate-none'
             />
           ) : null}
           <AlertTitle>
-            {switchKernel.isPending
+            {switching
               ? `正在切换到 ${slotKernelLabel(target)}…`
-              : switchKernel.isError
+              : switchFailed
                 ? '内核切换未完成'
                 : '内核切换完成'}
           </AlertTitle>
           <AlertDescription className='break-words'>
-            {switchKernel.isPending
-              ? '请勿重复操作。正在等待服务端完成切换，并刷新 VM 运行和调度状态。'
-              : switchKernel.isError
+            {switching
+              ? '请勿重复操作。正在等待服务端完成切换，并刷新 VM 运行和调度状态。关闭页面不会取消任务，可重新打开查看进度。'
+              : switchFailed
                 ? `${switchErrorMessage} 请先核对当前内核、VM 运行和调度状态，再重试；也可在“恢复服务”中查看诊断。`
-                : kernelSwitchSuccess(
-                    switchKernel.variables ?? target,
-                    vm.status
-                  )}
+                : kernelSwitchSuccess(target, vm.status)}
           </AlertDescription>
         </Alert>
       ) : null}
@@ -426,7 +564,7 @@ function SlotKernelSwitch({
                     : '切换并重启本槽内核，必要时重建容器。'}
               保留凭证和数据，不影响其他槽；原有调度关闭设置不变。
             </p>
-            {switchKernel.isPending ? (
+            {switching ? (
               <p role='status' aria-live='polite'>
                 正在切换到 {slotKernelLabel(target)}，请勿重复操作。
               </p>
@@ -435,7 +573,7 @@ function SlotKernelSwitch({
         }
         cancelBtnText='取消'
         confirmText={
-          switchKernel.isPending ? (
+          switching ? (
             <>
               <Loader2
                 aria-hidden='true'
@@ -449,9 +587,9 @@ function SlotKernelSwitch({
             '保存内核配置'
           )
         }
-        isLoading={switchKernel.isPending}
+        isLoading={switching}
         handleConfirm={() => {
-          if (pending) switchKernel.mutate(pending)
+          if (pending && !busy) switchKernel.mutate(pending)
         }}
       />
     </div>

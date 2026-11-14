@@ -13,6 +13,10 @@ test('remote atomic writes preserve UTF-8 byte offsets and do not follow destina
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-sftp-write-'))
   const handles = new Map()
   const connections = new Set()
+  let pendingWrites = 0
+  let peakWrites = 0
+  let failAt = null
+  let closedWithPendingWrites = false
   // ssh2 1.17 emits a malformed ed25519 OpenSSH key ~0.4% of the time; ECDSA keys parse every time.
   const server = new Server({ hostKeys: [utils.generateKeyPairSync('ecdsa', { bits: 256 }).private] }, (conn) => {
     connections.add(conn)
@@ -40,12 +44,23 @@ test('remote atomic writes preserve UTF-8 byte offsets and do not follow destina
             sftp.status(id, utils.sftp.STATUS_CODE.FAILURE, e.message)
           }
         })
-        sftp.on('WRITE', (id, h, position, data) =>
-          reply(id, () => fs.writeSync(handles.get(h.toString()), data, 0, data.length, position)),
-        )
+        sftp.on('WRITE', (id, h, position, data) => {
+          pendingWrites++
+          peakWrites = Math.max(peakWrites, pendingWrites)
+          // A distant node can accept more data before acknowledging earlier chunks.
+          setTimeout(
+            () => {
+              pendingWrites--
+              if (position === failAt) return sftp.status(id, utils.sftp.STATUS_CODE.FAILURE, 'disk full')
+              reply(id, () => fs.writeSync(handles.get(h.toString()), data, 0, data.length, position))
+            },
+            position === failAt ? 1 : 10,
+          )
+        })
         sftp.on('FSETSTAT', (id, h, attrs) => reply(id, () => fs.fchmodSync(handles.get(h.toString()), attrs.mode)))
         sftp.on('CLOSE', (id, h) =>
           reply(id, () => {
+            if (pendingWrites) closedWithPendingWrites = true
             fs.closeSync(handles.get(h.toString()))
             handles.delete(h.toString())
           }),
@@ -88,6 +103,14 @@ test('remote atomic writes preserve UTF-8 byte offsets and do not follow destina
   assert.equal(fs.readFileSync(file, 'utf8'), text)
   assert.equal(fs.statSync(file).mode & 0o777, 0o600)
   assert.equal(fs.readFileSync(sibling, 'utf8'), 'other slot must stay unchanged')
+  assert.ok(peakWrites > 1, 'large uploads must not wait one network round trip per 32 KiB')
+  failAt = 32 * 1024
+  await assert.rejects(writeRemoteFile(sftp, file, Buffer.alloc(96 * 1024, 7)), /写入.*失败/)
+  assert.equal(fs.readFileSync(file, 'utf8'), text, 'a rejected upload must retain the prior complete file')
+  assert.equal(pendingWrites, 0, 'all submitted writes must settle before failure cleanup')
+  assert.equal(closedWithPendingWrites, false)
+  assert.equal(handles.size, 0)
+  failAt = null
   const binary = Buffer.from([0, 255, 128, 1])
   await writeRemoteFile(sftp, file, binary)
   assert.deepEqual(fs.readFileSync(file), binary)

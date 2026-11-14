@@ -9,7 +9,8 @@ import type {
   VmSeedSettings,
   VmsListResponse,
 } from '@/types/panel-vm'
-import { api, getVmCragLicense } from '@/lib/api'
+import type { VmKernelSwitchJob } from '@/lib/api'
+import { ApiError, api, getVmCragLicense, getVmKernelSwitch } from '@/lib/api'
 
 /** 创建表单默认规格 + 本机 KVM 能力。ACL 与 POST /vms/create 相同，租户可读。 */
 export function vmCreateOptionsQueryOptions() {
@@ -48,6 +49,33 @@ export function vmCragLicenseQueryOptions(id: string) {
     queryKey: ['panel', 'vm', id, 'crag-license'] as const,
     queryFn: () => getVmCragLicense(id),
     staleTime: 0,
+    retry: false,
+  })
+}
+
+export function vmKernelSwitchQueryOptions(id: string) {
+  const queryKey = ['panel', 'vm-kernel-switch', id] as const
+  return queryOptions({
+    queryKey,
+    queryFn: async ({ client, queryKey, signal }) => {
+      const previous = client.getQueryData<VmKernelSwitchJob | null>(queryKey)
+      const job = await getVmKernelSwitch(id, signal)
+      if (!job && previous?.status === 'running') {
+        throw new ApiError(
+          '切换任务记录已丢失，操作可能已中断（控制面可能已重启）。请核对 VM 实际状态。',
+          0,
+          'kernel_switch_interrupted'
+        )
+      }
+      return job
+    },
+    refetchInterval: (query) =>
+      query.state.status !== 'error' && query.state.data?.status === 'running'
+        ? 2000
+        : false,
+    refetchOnMount: 'always',
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
     retry: false,
   })
 }
@@ -99,10 +127,12 @@ export function vmCredentialQueryOptions(id: string, enabled = true) {
 }
 
 export function testModelsQueryOptions(vmId: string) {
-  const q = vmId ? `?vm_id=${encodeURIComponent(vmId)}` : ''
   return queryOptions({
     queryKey: ['panel', 'test-models', vmId || ''] as const,
-    queryFn: () => api<TestModelsPayload>(`/api/panel/test-models${q}`),
+    queryFn: () => {
+      const q = vmId ? `?vm_id=${encodeURIComponent(vmId)}` : ''
+      return api<TestModelsPayload>(`/api/panel/test-models${q}`)
+    },
     enabled: !!vmId,
   })
 }

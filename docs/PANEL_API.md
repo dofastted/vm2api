@@ -98,6 +98,7 @@
 | POST | `/wrap-cli/sync` | `{ ids?, restart? }` 铺到槽 `.kin`（cli-node ELF + **最新** kernel.bin + 包装器）。kernel 优先仓内二进制，不被旧母样本盖回。`restart` 默认 true：有 kernel 字节变化时复制并 rust 槽 bounce kernel。**`restart: false`** 只读对比仓内 kernel 与各槽 `.kin`（含待重启标记），**不** hold 调度、**不**复制、**不**重启；用于升级前判断是否需要动槽 |
 | POST | `/vms/:id/wrap-cli/promote` | 从该槽晋升 wrap 文件，不复制凭证/SOCKS。下次 sync 仍优先仓内最新 kernel |
 | POST | `/vms/:id/wrap-cli/repair` | 单槽重装 kernel。`{ wrap, kernel }`；wrap 成功时 HTTP 200 |
+| POST / GET | `/vms/:id/kernel-switch` | 仅 admin/master。POST `{ dataplane: "crag" \| "wrap", crag_kernel_version?: "v2" \| "" }`，授权及参数预检后返回 202 任务；GET 返回本进程该槽最近任务或 `null`。任务含 `id,vm_id,dataplane,crag_kernel_version,status,started_at,finished_at,error`，`status` 为 `running` / `succeeded` / `failed`，失败 `error={code,message}`。同槽进行中再次提交回 409 `kernel_switch_in_progress`；202 不表示已切换成功 |
 | POST | `/vms/:id/start` · `/stop` | 容器生命周期。运行中容器除非显式 recreate，禁止 `docker rm -f` |
 | GET | `/vms/:id/diagnose` | 只读检查凭证、出口、容器、所选内核和自动恢复状态；CRAG 满载进程池不要求常驻 `cli_pid`，返回忙碌而非故障 |
 | POST | `/vms/:id/recover` | 按当前选择的 cli-node / CRAG 执行排空 → 关机 → 开机 → 就绪诊断；仅完整成功后清除请求熔断。授权错误在停机前拒绝；启动失败保留故障与不可调度原因 |
@@ -121,6 +122,8 @@
 | GET | `/oauth` | 全槽脱敏 credential |
 
 `/wrap` 仅展示 cli-node 默认内核与需注册码授权的 CRAG。每台 VM 可独立选择后安装；「全部重装并停用」先展示明确范围，再按各 VM 选择逐槽处理并显示结果。CRAG 可直接在行内打开授权管理；VM 详情「运维 → 推理内核」的既有授权入口仍可用。激活授权与安装是两个独立动作，不隐式开机。
+
+集群详情的一键切核通过上述异步任务等待真实完成：运行槽沿用排空、授权校验、规范 VM 锁及所选运行时就绪检查；关机槽只保存选择，不开机。失败后即使选择已经写成目标内核，运行槽仍可重试相同选择以修复 `runtime_start_failed`；其他不可调度原因及人工调度关闭不因此清除。任务只保留在控制面进程内，查询中的运行任务因控制面重启而消失时，页面提示核对 VM 状态，不把任务消失视为成功或自动重新提交。
 
 离线 `CRAGU1` 一次写入安装级授权，并把同一正式状态复制到每个本地槽和每台集群机器的 `registration.code`。不按 VM 槽或机器核销。在线 `CRAGL1` 仍只绑定本槽设备，已有在线授权不会被通用码覆盖。响应里的 `license.scope` 为 `kernel`（离线）或 `device`（在线）。
 
