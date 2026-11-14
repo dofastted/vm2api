@@ -1,7 +1,7 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.11.14-crag-2.8.18",
-  "crag_release": "v2.8.18",
+  "release": "payload-2026.11.14-crag-3.0.3",
+  "crag_release": "v3.0.3",
   "files": [
     {
       "path": "bin/kin-kernel",
@@ -91,7 +91,7 @@
       "path": "share/crag/kernels/v2/amd64/LICENSES.txt",
       "asset": "crag-v2-amd64-LICENSES.txt",
       "size": 514,
-      "sha256": "e0127f77b4e8ad7c2233b9079cdaa4d4bc11e79eb03ca880ceb1dbe2fced9068"
+      "sha256": "80ee2b207aa7a45ad09360dd874d62b3be2e079bfa84de368092940889e84784"
     },
     {
       "path": "share/crag/kernels/v2/amd64/claude-code-2.1.321/LICENSE.md",
@@ -113,15 +113,15 @@
     },
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2",
-      "asset": "crag-v2-amd64-v2.8.18-crag-v2",
+      "asset": "crag-v2-amd64-v3.0.3-crag-v2",
       "size": 854200,
-      "sha256": "72d3a1a67510884eb8447340958ef611bd342b33f041efbb4d144b6b3dc30f78"
+      "sha256": "1b6f1653083d02be325d74ba938d2e68e78b1a88a030488e9fc3e820f67ec09e"
     },
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2.payload.enc",
-      "asset": "crag-v2-amd64-v2.8.18-crag-v2.payload.enc",
-      "size": 9684300,
-      "sha256": "a6133789eb687cee84599a2fb14327322dfea5769f9771f9fb0a647ce4ffeea1"
+      "asset": "crag-v2-amd64-v3.0.3-crag-v2.payload.enc",
+      "size": 10028308,
+      "sha256": "c282ce953e1d167bc4705aa39f4adc06ac2fb617606a3324ec26b611799af012"
     },
     {
       "path": "share/crag/kernels/v2/amd64/kernel.json.example",
@@ -131,15 +131,15 @@
     },
     {
       "path": "share/crag/kernels/v2/amd64/manifest.json",
-      "asset": "crag-v2-amd64-v2.8.18-manifest.json",
-      "size": 2467,
-      "sha256": "02d387b1c2d48b20e42835a784a794531e4a46d746b80b39d92de49529650be6"
+      "asset": "crag-v2-amd64-v3.0.3-manifest.json",
+      "size": 2630,
+      "sha256": "760771f85c17699054b8a1b472d60fa289c6690fd504e09c0981adecc04a5d17"
     },
     {
       "path": "dist/crag-v2-licensed-amd64.tar.gz",
       "asset": "crag-v2-licensed-amd64.tar.gz",
-      "size": 167493268,
-      "sha256": "b940fbf200759326898519397bf4f4200c8cff24e72077291bc53aad99209152"
+      "size": 167838032,
+      "sha256": "2cd1f43bf1eee7383339c44e4e61e69551742f277277112ba74c9939f1cd4637"
     }
   ]
 }
