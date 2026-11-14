@@ -56,7 +56,7 @@ import { lastClosedWindow } from '../pool/window-history.mjs'
 import { hardBlockOf } from '../pool/rate-limit-service.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { accountIdOf, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
-import { codexMaxSessions } from '../pool/codex-slot-pool.mjs'
+import { codexMaxSessions, codexScheduleLevel } from '../pool/codex-slot-pool.mjs'
 import { resolveCredentialScheduleLevel } from '../pool/credential-weight.mjs'
 import { activeHoursZoneOf, evaluateActiveHours } from '../pool/active-hours.mjs'
 import {
@@ -1860,11 +1860,10 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     vmQuotaConfig,
   )
   const fablePool = fablePoolFields(acc, runtime, extras.pool || {}, extras.routingConfig || {}, v)
-  const scheduleLevel = resolveCredentialScheduleLevel({
-    manualLevel: v.schedule_level_manual,
-    unified: acc?.unified || {},
-  })
   const isCodex = isCodexVm(v)
+  const scheduleLevel = isCodex
+    ? codexScheduleLevel(v)
+    : resolveCredentialScheduleLevel({ manualLevel: v.schedule_level_manual, unified: acc?.unified || {} })
   // OpenAI quota mirrors are observations; admission uses the current raw windows and policy.
   if (isCodex && isQuotaWindowReason(v.temp_unschedulable_reason)) {
     v = { ...v, temp_unschedulable_until: null, temp_unschedulable_reason: null }

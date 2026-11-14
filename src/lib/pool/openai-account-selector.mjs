@@ -2,8 +2,8 @@
  * OpenAI account decision, ported from codex-proxy-rs
  * `gateway-core` AccountSelector (`selection.rs`).
  *
- * Eligibility, then session affinity as a preferred account, then the
- * highest weight band. `smart` is the default strategy.
+ * Eligibility, highest scheduling level, then session affinity and weight.
+ * `smart` is the default strategy.
  */
 
 export const SMART_LOAD_WEIGHT = 1
@@ -111,13 +111,18 @@ export function schedulingBlocker(candidate, context = {}) {
   return null
 }
 
-function preferredOutcome(candidates, context, highestWeight) {
+function priorityOf(candidate) {
+  return Number(candidate.priority) || 0
+}
+
+function preferredOutcome(candidates, context, highestPriority, highestWeight) {
   const preferredId = context.preferredAccountId ? asId(context.preferredAccountId) : ''
   if (!preferredId) return { kind: 'not_requested', candidate: null, blocker: null }
   const candidate = candidates.find((item) => asId(item.id) === preferredId) || null
   if (!candidate) return { kind: 'missing', candidate: null, blocker: null }
   const blocker = schedulingBlocker(candidate, context)
   if (blocker) return { kind: 'blocked', candidate, blocker }
+  if (priorityOf(candidate) < highestPriority) return { kind: 'blocked', candidate, blocker: 'lower_priority' }
   if (!context.preferredOverridesWeight && weightOf(candidate) < highestWeight) {
     return { kind: 'blocked', candidate, blocker: 'lower_weight' }
   }
@@ -183,12 +188,14 @@ export function selectOpenAIAccount(candidates, context = {}) {
   const list = Array.isArray(candidates) ? candidates : []
   const eligible = list.filter((candidate) => !schedulingBlocker(candidate, context))
   if (!eligible.length) return null
-  const highestWeight = eligible.reduce((max, candidate) => Math.max(max, weightOf(candidate)), -Infinity)
-  const preferred = preferredOutcome(list, context, highestWeight)
+  const highestPriority = Math.max(...eligible.map(priorityOf))
+  const tier = eligible.filter((candidate) => priorityOf(candidate) === highestPriority)
+  const highestWeight = Math.max(...tier.map(weightOf))
+  const preferred = preferredOutcome(list, context, highestPriority, highestWeight)
   if (preferred.kind === 'hit') {
     return { candidate: preferred.candidate, preferred: 'hit', blocker: null }
   }
-  const band = eligible.filter((candidate) => weightOf(candidate) === highestWeight)
+  const band = tier.filter((candidate) => weightOf(candidate) === highestWeight)
   const candidate = selectInBand(band, context)
   if (!candidate) return null
   return {
@@ -198,7 +205,7 @@ export function selectOpenAIAccount(candidates, context = {}) {
   }
 }
 
-/** Failover order: affinity first, then the same decision with that id excluded. */
+/** Failover order: repeat the same decision with the preceding IDs excluded. */
 export function orderOpenAIAccounts(candidates, context = {}) {
   const excluded = new Set(context.excludedAccountIds || [])
   const ids = []

@@ -11,6 +11,7 @@ import {
   hasSpendableCodexCredits,
 } from '../protocol/codex-usage.mjs'
 import { isLeftoverQuotaScheduleOff, isQuotaWindowReason } from './availability.mjs'
+import { resolveCredentialScheduleLevel } from './credential-weight.mjs'
 import { orderOpenAIAccounts } from './openai-account-selector.mjs'
 import { expiresAtToMs } from '../oauth/oauth-credentials.mjs'
 import {
@@ -92,7 +93,7 @@ function parkUntil(vm, now) {
 
 /**
  * Ordered candidate ids. Pinned master hops stay on that slot.
- * Ready slots first (lowest 5h/7d stress), parked slots last so a
+ * Ready slots first (level, then lowest 5h/7d stress), parked slots last so a
  * total-exhaust pool still has somewhere to fail instead of 503.
  */
 export function pickCodexSlots(vms, { pin = null, now = Date.now(), quotaPolicy = null, model = null } = {}) {
@@ -122,7 +123,7 @@ export function pickCodexSlots(vms, { pin = null, now = Date.now(), quotaPolicy 
     else ready.push(vm)
   }
   ready.sort((a, b) => {
-    const d = stressOf(a) - stressOf(b)
+    const d = codexScheduleLevel(b, now).level - codexScheduleLevel(a, now).level || stressOf(a) - stressOf(b)
     return d !== 0 ? d : String(a.id).localeCompare(String(b.id))
   })
   parked.sort((a, b) => {
@@ -206,6 +207,10 @@ function quotaReset7dAt(vm) {
   return Number.isFinite(ms) ? ms : null
 }
 
+export function codexScheduleLevel(vm, now = Date.now(), resetAt = quotaReset7dAt(vm)) {
+  return resolveCredentialScheduleLevel({ vm, manualLevel: vm?.schedule_level_manual ?? undefined, resetAt, now })
+}
+
 export function codexAccountStatus(vm, now = Date.now(), policy = null) {
   if (!vm || !isCodexVm(vm)) return 'error'
   if (proxyBlockedReason(vm.proxy)) return 'disabled'
@@ -228,8 +233,10 @@ export function codexSlotAllowsModel(vm, model) {
 export function codexAccountCandidate(vm, now = Date.now(), signals = null, policy = null) {
   const runtime = signals || openAIRuntimeSignals(vm?.id, now)
   const effective = effectiveOpenAIPolicy(vm, normalizeOpenAIQuotaPolicy(policy))
+  const reset7dAt = quotaReset7dAt(vm)
   return {
     id: vm.id,
+    priority: codexScheduleLevel(vm, now, reset7dAt).level,
     weight: Number(vm?.policy?.weight ?? vm?.weight ?? 1) || 1,
     concurrency: effective.max_concurrency,
     maxRpm: effective.max_rpm,
@@ -242,7 +249,7 @@ export function codexAccountCandidate(vm, now = Date.now(), signals = null, poli
     quotaResetAt: quotaResetAt(vm),
     quotaRemainingRank: quotaRemainingRank(vm),
     quotaStockRank: quotaStockRank(vm),
-    quotaReset7dAt: quotaReset7dAt(vm),
+    quotaReset7dAt: reset7dAt,
     quotaRemaining7d: quotaRemaining7d(vm),
     failureRateBps: runtime.failureRateBps || 0,
     firstOutputLatencyMs: runtime.firstOutputLatencyMs ?? null,
