@@ -125,6 +125,33 @@ describe('VM page kernel switch feedback', () => {
     expect(html).not.toContain('切换推理内核：远端节点暂不支持')
   })
 
+  it.each<Partial<Vm>>([
+    { runtime_type: 'kvm' },
+    { runtime: { type: 'qemu' } },
+    { node_id: 'node-kvm', runtime: { type: 'kvm' } },
+  ])('allows CRAG selection and licensing on KVM placement %j', (placement) => {
+    const html = render(placement)
+    const button = html.match(
+      /<button\b([^>]*)>(?:(?!<\/button>)[\s\S])*?本槽切到 CRAG v2(?:(?!<\/button>)[\s\S])*?<\/button>/
+    )
+    expect(button).not.toBeNull()
+    expect(button?.[1]).not.toContain(' disabled=""')
+    expect(html).toContain('CRAG 授权 / 续期')
+    mocks.mutationState = { isPending: true, variables: 'v2' }
+    const pending = render(placement)
+    expect(pending).toContain('保留 KVM 虚拟机和磁盘')
+    expect(pending).not.toContain('重建本槽容器以更换内核命令')
+  })
+
+  it('keeps CRAG selection unavailable on native macOS nodes', () => {
+    const html = render({ node_platform: 'darwin' })
+    const button = html.match(
+      /<button\b([^>]*)>(?:(?!<\/button>)[\s\S])*?本槽切到 CRAG v2(?:(?!<\/button>)[\s\S])*?<\/button>/
+    )
+    expect(button?.[1]).toContain(' disabled=""')
+    expect(html).not.toContain('CRAG 授权 / 续期')
+  })
+
   it.each(['wrap', 'v2'] as const)(
     'keeps a completed switch to %s visible after the toast',
     (target) => {

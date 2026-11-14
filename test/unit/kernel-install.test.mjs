@@ -511,6 +511,48 @@ test('local kvm crag install writes the guest entry and does not push to a node'
   assert.equal(fs.readFileSync(path.join(built.home, '.claude/credentials.json'), 'utf8'), 'protected-credential')
 })
 
+test('KVM preflight requires the CRAG preload before stopping even for a free-kernel install', async (t) => {
+  const { root, vm } = fixture(t, { runtime: { type: 'kvm' } })
+  fs.rmSync(path.join(root, 'share/crag'), { recursive: true })
+  const life = lifecycle(root)
+  const result = await installKernelTargets({ projectRoot: root, targets: target('cli-node'), ops: life.ops })
+  assert.equal(result.ok, false)
+  assert.equal(result.items[0].code, 'crag_v2_package_missing')
+  assert.equal(life.stops(), 0)
+  assert.equal(getVm(root, vm.id).status, 'running')
+})
+
+test('legacy KVM without a CRAG version migrates stale config and missing payload through reinstall', async (t) => {
+  const built = fixture(t, { dataplane: 'crag', runtime_type: 'kvm' })
+  delete built.vm.runtime.type
+  fs.writeFileSync(path.join(built.root, 'vms', `${built.vm.id}.json`), JSON.stringify(built.vm))
+  activateFixture(built.root, built.vm)
+  fs.mkdirSync(built.run, { recursive: true })
+  fs.writeFileSync(
+    path.join(built.run, 'kernel.json'),
+    JSON.stringify({
+      dataplane: 'crag',
+      claude_bin: '/opt/kin/cc-node',
+      socket_path: '/run/kin/kernel.sock',
+    }),
+  )
+  const life = lifecycle(built.root)
+  const result = await installKernelTargets({ projectRoot: built.root, targets: target(), ops: life.ops })
+  assert.equal(result.ok, true, JSON.stringify(result))
+  const saved = getVm(built.root, built.vm.id)
+  assert.equal(saved.crag_kernel_version, 'v2')
+  assert.equal(saved.kernel_installation.kernel, 'crag')
+  assert.ok(saved.kernel_installation.version)
+  const config = JSON.parse(fs.readFileSync(path.join(built.run, 'kernel.json')))
+  assert.equal(config.runtime_kind, 'kvm')
+  assert.equal(config.socket_path, '/run/kin-guest/kernel.sock')
+  assert.equal(config.claude_bin, '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude')
+  assert.ok(fs.existsSync(path.join(built.home, '.kin/crag-v2/claude-code-2.1.321/claude')))
+  assert.equal(result.items[0].restarted, true)
+  assert.equal(saved.schedulable, true)
+  assert.equal(fs.readFileSync(path.join(built.home, '.claude/credentials.json'), 'utf8'), 'protected-credential')
+})
+
 test('payload publish replaces only changed files and the kvm selector execs the live entry', () => {
   const plan = selectChangedPayloadFiles(
     [

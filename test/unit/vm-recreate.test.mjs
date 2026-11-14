@@ -4,8 +4,33 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { buildRecreatedVmRecord, recreateVmFiles } from '../../src/lib/vm/vm-recreate.mjs'
+import { buildRecreatedVmRecord, recreateVmFiles, seedFreshCliHome } from '../../src/lib/vm/vm-recreate.mjs'
 import { destroyVmRuntime } from '../../src/lib/vm/vm-runtime.mjs'
+import { verifyCragV2Tree } from '../../src/lib/vm/wrap-cli-runtime.mjs'
+import { seedEncryptedPackage } from '../fixtures/crag-license.mjs'
+
+test('fresh KVM home requires CRAG preinstallation and keeps the free kernel selected', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fresh-kvm-crag-'))
+  const keys = ['KIN_WRAP_CLI_ROOT', 'KIN_CRAG_V2_ROOT', 'KIN_KERNEL_BIN']
+  const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]))
+  for (const key of keys) delete process.env[key]
+  t.after(() => {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value == null) delete process.env[key]
+      else process.env[key] = value
+    }
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const template = path.join(root, 'share/wrap-cli')
+  fs.mkdirSync(template, { recursive: true })
+  for (const name of ['kin-kernel.bin', 'cli-node']) fs.writeFileSync(path.join(template, name), 'fixture')
+  const vm = { id: 'vm-12', runtime_type: 'kvm', dataplane: 'wrap' }
+  assert.throws(() => seedFreshCliHome(root, vm), { code: 'crag_v2_package_missing' })
+  seedEncryptedPackage(root)
+  const home = seedFreshCliHome(root, vm).homeDir
+  assert.equal(verifyCragV2Tree(path.join(home, '.kin/crag-v2')).ok, true)
+  assert.doesNotMatch(fs.readFileSync(path.join(home, '.kin/kin-kernel'), 'utf8'), /crag-v2/)
+})
 
 test('recreated record keeps slot identity and drops credentials', () => {
   const prev = {

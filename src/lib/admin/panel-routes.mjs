@@ -1159,9 +1159,6 @@ export function createPanelHandler(ctx) {
       previousVersion !== targetVersion && (previousDataplane === 'crag' || targetDataplane === 'crag')
     const kernelSwitch = dataplaneChanged || versionChanged
     if (kernelSwitch && targetDataplane === 'crag' && targetVersion === 'v2') {
-      if (isKvmRuntime(desired)) {
-        return { ok: false, id, code: 'remote_unsupported', error: 'crag 数据面暂不支持 KVM 槽' }
-      }
       if (isNativeNodeVm(desired)) {
         return { ok: false, id, code: 'native_crag_unsupported', error: 'crag 数据面暂不支持 macOS 原生节点' }
       }
@@ -2662,13 +2659,10 @@ export function createPanelHandler(ctx) {
                 const licensed = checkCragLicense(cfg.paths.project, desired, nextRouting)
                 if (!licensed.ok)
                   return json(res, 403, { ok: false, error: { code: licensed.code, message: licensed.error } })
-                if (
-                  resolveKernelDataplane(desired, nextRouting) === 'crag' &&
-                  (isKvmRuntime(desired) || isNativeNodeVm(desired))
-                ) {
+                if (resolveKernelDataplane(desired, nextRouting) === 'crag' && isNativeNodeVm(desired)) {
                   return json(res, 400, {
                     ok: false,
-                    error: { code: 'remote_unsupported', message: 'CRAG 切核暂不支持 KVM 或 macOS 原生槽' },
+                    error: { code: 'remote_unsupported', message: 'CRAG 切核暂不支持 macOS 原生槽' },
                   })
                 }
               }
@@ -3100,16 +3094,12 @@ export function createPanelHandler(ctx) {
           })
         const vm = getVm(cfg.paths.project, p.split('/')[4])
         if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: 'vm not found' } })
-        if (isCodexVm(vm) || isKvmRuntime(vm) || isNativeNodeVm(vm))
+        if (isCodexVm(vm) || isNativeNodeVm(vm))
           return json(res, 400, {
             ok: false,
             error: {
               code: 'crag_v2_unsupported_placement',
-              message: isCodexVm(vm)
-                ? '请选择 Claude 虚拟机'
-                : isKvmRuntime(vm)
-                  ? 'CRAG v2 不支持 KVM 槽'
-                  : 'CRAG v2 不支持 macOS 原生节点',
+              message: isCodexVm(vm) ? '请选择 Claude 虚拟机' : 'CRAG v2 不支持 macOS 原生节点',
             },
           })
         const remotePlacement = Boolean(vm.node_id) || isKvmRuntime(vm)
@@ -3123,7 +3113,7 @@ export function createPanelHandler(ctx) {
               ok: false,
               error: {
                 code: 'crag_v2_unsupported_placement',
-                message: '集群槽只能激活离线通用码。设备注册码仍需要本机 Linux Docker 槽。',
+                message: '集群或 KVM 槽只能激活离线通用码。设备注册码仍需要本机 Linux Docker 槽。',
               },
             })
           }

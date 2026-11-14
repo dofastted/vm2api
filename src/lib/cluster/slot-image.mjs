@@ -102,7 +102,7 @@ export function cragSlotPayload(projectRoot, { required = true } = {}) {
  * Files that go into the image, as tar entries `{ name, src?, body?, mode }`.
  * Throws slot_payload_missing / slot_payload_invalid with the offending path.
  */
-export function slotPayload(projectRoot) {
+export function slotPayload(projectRoot, { runtime } = {}) {
   const wrapDir = wrapCliTemplateDir(projectRoot)
   const kernel = describeKernelPayload(projectRoot)
   if (kernel.source === 'missing') throw new ClusterError(500, 'slot_payload_missing', 'kin-kernel 缺失')
@@ -139,7 +139,7 @@ export function slotPayload(projectRoot) {
   )
   requireElf(egress, 'kin-egress')
   files.push({ name: 'usr/local/bin/kin-egress', src: egress, mode: 0o755 })
-  const crag = cragSlotPayload(projectRoot, { required: false })
+  const crag = cragSlotPayload(projectRoot, { required: runtime === 'kvm' })
   if (crag) files.push(...crag.files)
   const codex = codexKernelBinPath() || path.join(projectRoot, 'bin', 'kin-codex-kernel')
   requireElf(codex, 'kin-codex-kernel')
@@ -188,7 +188,7 @@ export function slotImageSpec(projectRoot, kernel, { runtime } = {}) {
   if (!OS_CATALOG[kernel]) throw new ClusterError(400, 'invalid_kernel', `未知系统：${kernel}`)
   const kvm = runtime === 'kvm'
   const base = kvm ? kvmImageForKernel(kernel) : imageForKernel(kernel)
-  const files = slotPayload(projectRoot)
+  const files = slotPayload(projectRoot, { runtime })
   const hash = crypto.createHash('sha256')
   hash.update(slotDockerfile(base, { runtime: kvm ? 'kvm' : 'docker' }))
   for (const f of files) {
