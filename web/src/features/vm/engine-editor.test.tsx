@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import type { ComponentProps, ReactNode } from 'react'
 import type { Vm } from '@/types/panel-vm'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -16,6 +16,8 @@ type SwitchOptions = {
 
 const mocks = vi.hoisted(() => ({
   mutations: [] as unknown[],
+  queries: [] as { enabled?: boolean }[],
+  buttons: [] as { children?: ReactNode; disabled?: boolean }[],
   mutationState: {} as Record<string, unknown>,
   invalidateQueries: vi.fn().mockResolvedValue(undefined),
   loading: vi.fn(),
@@ -26,7 +28,10 @@ const mocks = vi.hoisted(() => ({
 vi.mock('@tanstack/react-query', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@tanstack/react-query')>()),
   useQueryClient: () => ({ invalidateQueries: mocks.invalidateQueries }),
-  useQuery: () => ({}),
+  useQuery: (options: { enabled?: boolean }) => {
+    mocks.queries.push(options)
+    return {}
+  },
   useMutation: (options: unknown) => {
     const index = mocks.mutations.push(options) - 1
     return {
@@ -56,6 +61,17 @@ vi.mock('@/lib/api', async (importOriginal) => ({
 vi.mock('@/features/vm/vm-perms', () => ({
   useVmPerms: () => ({ admin: true }),
 }))
+vi.mock('@/components/ui/button', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/components/ui/button')>()
+  const OriginalButton = actual.Button
+  return {
+    ...actual,
+    Button: (props: ComponentProps<typeof OriginalButton>) => {
+      mocks.buttons.push({ children: props.children, disabled: props.disabled })
+      return <OriginalButton {...props} />
+    },
+  }
+})
 vi.mock('@/components/confirm-dialog', () => ({
   ConfirmDialog: (props: {
     open: boolean
@@ -75,6 +91,8 @@ vi.mock('@/components/confirm-dialog', () => ({
 
 function render(overrides: Partial<Vm> = {}) {
   mocks.mutations.length = 0
+  mocks.queries.length = 0
+  mocks.buttons.length = 0
   return renderToStaticMarkup(
     <VmEngineEditor
       id='vm-01'
@@ -98,6 +116,66 @@ beforeEach(() => {
 })
 
 describe('VM page kernel switch feedback', () => {
+  it.each([undefined, 'node-jp'])(
+    'enables KVM switching and license queries with node_id=%s',
+    (node_id) => {
+      const vm = { runtime_type: 'kvm' as const, node_id }
+      const html = render(vm)
+      expect(mocks.buttons).toContainEqual({
+        children: '本槽切到 CRAG v2',
+        disabled: false,
+      })
+      expect(mocks.buttons).toContainEqual({
+        children: 'CRAG 授权 / 续期',
+        disabled: false,
+      })
+      expect(html).not.toContain('KVM 槽不运行 CRAG v2')
+      expect(mocks.queries).toEqual([
+        expect.objectContaining({
+          queryKey: ['panel', 'vm', 'vm-01', 'crag-license'],
+          enabled: true,
+        }),
+      ])
+
+      render({
+        ...vm,
+        resolved_dataplane: 'crag',
+        resolved_crag_kernel_version: 'v2',
+      })
+      expect(mocks.buttons).toContainEqual({
+        children: '本槽切回 cli-node',
+        disabled: false,
+      })
+    }
+  )
+
+  it('keeps native macOS switching and license controls unavailable', () => {
+    const html = render({ node_id: 'node-mac', node_platform: 'darwin' })
+    expect(mocks.buttons).toContainEqual({
+      children: '本槽切到 CRAG v2',
+      disabled: true,
+    })
+    expect(html).not.toContain('CRAG 授权 / 续期')
+    expect(html).toContain('macOS 原生节点不运行 CRAG v2')
+    expect(mocks.queries).toEqual([expect.objectContaining({ enabled: false })])
+  })
+
+  it('does not expose Claude kernel or license controls for Codex KVM slots', () => {
+    const html = render({ runtime_type: 'kvm', family: 'codex' })
+    expect(html).not.toContain('本槽切到 CRAG v2')
+    expect(html).not.toContain('本槽切回 cli-node')
+    expect(html).not.toContain('CRAG 授权 / 续期')
+    expect(mocks.queries).toEqual([])
+  })
+
+  it('does not describe remote KVM switching as replacing a Docker container', () => {
+    mocks.mutationState = { isPending: true, variables: 'v2' }
+    const html = render({ runtime_type: 'kvm', node_id: 'node-kvm' })
+    expect(html).toContain('切换并重启本槽内核')
+    expect(html).toContain('原有调度关闭设置不变')
+    expect(html).not.toContain('重建本槽容器以更换内核命令')
+  })
+
   it.each(['wrap', 'v2'] as const)(
     'shows persistent progress and a disabled confirmation for %s',
     (target) => {
