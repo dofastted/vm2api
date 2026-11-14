@@ -10,32 +10,74 @@ import {
   CRAG_V2_RELEASE_ASSET,
 } from '../../src/lib/admin/release-kernel.mjs'
 
-test('CRAG metadata uses its supplier release, never the vm2api source-only release', async () => {
+test('CRAG metadata selects published component payloads and preserves kernel tags', async () => {
   const seen = []
+  const assets = [{ name: CRAG_V2_RELEASE_ASSET, size: 10 }]
   const fetchImpl = async (url) => {
     seen.push(String(url))
-    const match = String(url).match(/\/tags\/(v\d+\.\d+\.\d+)$/)
-    return new Response(JSON.stringify({ tag_name: match?.[1] || 'v2.0.1', assets: [] }))
+    return Response.json([
+      { tag_name: 'payload-2026.11.16-crag-3.0.6', draft: true, assets },
+      { tag_name: 'payload-2026.11.16-crag-3.0.7', draft: false, assets: [] },
+      { tag_name: 'v1.4.092', draft: false, assets },
+      { tag_name: 'payload-2026.11.15-crag-3.0.5', draft: false, assets, prerelease: true },
+      { tag_name: 'payload-2026.11.15-crag-3.0.4', draft: false, assets, prerelease: true },
+      { tag_name: 'payload-2026.11.14-crag-3.0.3', draft: false, assets, prerelease: true },
+    ])
   }
-  await fetchKernelReleaseMetadata({ kernel: 'crag', tag: 'v2.0.1', fetchImpl })
-  await fetchKernelReleaseMetadata({ kernel: 'crag', fetchImpl })
-  await fetchKernelReleaseMetadata({ kernel: 'crag', cragReleaseTag: 'v2.8.16', fetchImpl })
-  assert.deepEqual(seen, [
-    'https://api.github.com/repos/dofastted/claude-code/releases/tags/v2.0.1',
-    'https://api.github.com/repos/dofastted/claude-code/releases/latest',
-    'https://api.github.com/repos/dofastted/claude-code/releases/tags/v2.8.16',
-  ])
-  const url = 'https://github.com/dofastted/claude-code/releases/download/v2.0.1/'
+  assert.equal((await fetchKernelReleaseMetadata({ kernel: 'crag', fetchImpl })).tag_name, 'v3.0.5')
+  assert.equal(
+    (await fetchKernelReleaseMetadata({ kernel: 'crag', cragReleaseTag: 'v3.0.4', fetchImpl })).tag_name,
+    'v3.0.4',
+  )
+  assert.equal(
+    (await fetchKernelReleaseMetadata({ kernel: 'crag', tag: 'v3.0.3', cragReleaseTag: 'v3.0.4', fetchImpl })).tag_name,
+    'v3.0.3',
+  )
+  await assert.rejects(fetchKernelReleaseMetadata({ kernel: 'crag', tag: 'v3.0.6', fetchImpl }), {
+    code: 'github_http_404',
+  })
+  assert.deepEqual(seen, Array(4).fill('https://api.github.com/repos/dofastted/vm2api/releases?per_page=30&page=1'))
+  const url = 'https://github.com/dofastted/vm2api/releases/download/payload-2026.11.15-crag-3.0.5/'
   assert.equal(isAllowedKernelUrl(`${url}kin-kernel`, { crag: true }), false)
   assert.equal(isAllowedKernelUrl(`${url}${CRAG_V2_RELEASE_ASSET}`), false)
+  assert.equal(
+    isAllowedKernelUrl(`https://github.com/dofastted/crag/releases/download/v3.0.5/${CRAG_V2_RELEASE_ASSET}`, {
+      crag: true,
+    }),
+    false,
+  )
+  assert.equal(
+    isAllowedKernelUrl('https://api.github.com/repos/dofastted/claude-code/releases/assets/1', { crag: true }),
+    false,
+  )
   const picked = selectReleaseAsset(
     {
-      tag_name: 'v2.0.1',
+      tag_name: 'v3.0.5',
       assets: [{ name: CRAG_V2_RELEASE_ASSET, size: 10, browser_download_url: `${url}${CRAG_V2_RELEASE_ASSET}` }],
     },
     { name: CRAG_V2_RELEASE_ASSET, maxBytes: 100, missingCode: 'missing', tooLargeCode: 'large' },
   )
   assert.equal(picked.ok, true)
+  assert.equal(picked.url, `${url}${CRAG_V2_RELEASE_ASSET}`)
+})
+
+test('CRAG finds an explicit component version behind a page of application releases', async () => {
+  const pages = []
+  const release = await fetchKernelReleaseMetadata({
+    kernel: 'crag',
+    tag: 'v3.0.4',
+    fetchImpl: async (url) => {
+      const params = new URL(url).searchParams
+      pages.push(params.get('page'))
+      return Response.json(
+        pages.length === 1
+          ? Array.from({ length: Number(params.get('per_page')) }, () => ({ tag_name: 'v1.4.092', draft: false }))
+          : [{ tag_name: 'payload-2026.11.15-crag-3.0.4', draft: false }],
+      )
+    },
+  })
+  assert.equal(release.tag_name, 'v3.0.4')
+  assert.deepEqual(pages, ['1', '2'])
 })
 
 function fakeElf64Amd64() {

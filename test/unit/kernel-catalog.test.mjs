@@ -58,17 +58,19 @@ function transport(files, { tag = 'v1.2.3', size, redirect } = {}) {
   const fetchImpl = async (url, options) => {
     seen.push(String(url))
     assert.equal(options.redirect, 'manual')
-    if (String(url).includes('/releases/latest') || String(url).includes('/releases/tags/'))
-      return new Response(
-        JSON.stringify({
-          tag_name: tag,
-          assets: entries.map(([name, body], index) => ({
-            name,
-            size: size ?? body.length,
-            url: `https://api.github.com/repos/dofastted/vm2api/releases/assets/${index + 1}`,
-          })),
-        }),
+    const endpoint = new URL(url).pathname
+    if (!endpoint.includes('/assets/')) {
+      const assets = entries.map(([name, body], index) => ({
+        name,
+        size: size ?? body.length,
+        url: `https://api.github.com/repos/dofastted/vm2api/releases/assets/${index + 1}`,
+      }))
+      return Response.json(
+        endpoint.endsWith('/releases')
+          ? [{ tag_name: `payload-2026.11.15-crag-${tag.slice(1)}`, draft: false, assets }]
+          : { tag_name: tag, assets },
       )
+    }
     const index = Number(String(url).split('/').at(-1)) - 1
     assert.ok(entries[index], `unexpected asset request ${url}`)
     if (redirect) return new Response(null, { status: 302, headers: { location: redirect } })
@@ -276,19 +278,19 @@ for (const [label, tag, standalone, expected] of [
         const version = versions[Number(endpoint.split('/').at(-1)) - 1]
         return new Response(releases.get(version).bytes)
       }
-      const version = endpoint.endsWith('/latest') ? 'v2.0.2' : endpoint.split('/').at(-1)
-      const release = releases.get(version)
-      return new Response(
-        JSON.stringify({
-          tag_name: version,
+      assert.equal(endpoint, '/repos/dofastted/vm2api/releases')
+      return Response.json(
+        versions.map((version, index) => ({
+          tag_name: `payload-2026.11.15-crag-${version.slice(1)}`,
+          draft: false,
           assets: [
             {
               name: CRAG_V2_RELEASE_ASSET,
-              size: release.bytes.length,
-              url: `https://api.github.com/repos/dofastted/claude-code/releases/assets/${versions.indexOf(version) + 1}`,
+              size: releases.get(version).bytes.length,
+              url: `https://api.github.com/repos/dofastted/vm2api/releases/assets/${index + 1}`,
             },
           ],
-        }),
+        })),
       )
     }
     const pull = (projectRoot, options) => pullKernelRelease(projectRoot, options, { fetchImpl })
@@ -391,7 +393,7 @@ test('missing native release is explicit and never fetches the legacy ELF', asyn
   const root = fixture(t)
   const factory = seedEncryptedPackage(root)
   const http = transport({ 'kin-kernel-crag': elf() })
-  const result = await pullKernelRelease(root, { kernel: 'crag' }, http)
+  const result = await pullKernelRelease(root, { kernel: 'crag', tag: 'v1.2.3' }, http)
   assert.equal(result.code, 'crag_v2_asset_missing')
   assert.equal(http.seen.length, 1)
   assert.equal(cragV2PackageRoot(root), factory)
@@ -504,7 +506,7 @@ test('archive download honors declared bounds before reading a body', { skip: cr
     { kernel: 'crag' },
     {
       fetchImpl: async (url, options) => {
-        if (String(url).includes('/releases/latest')) return http.fetchImpl(url, options)
+        if (new URL(url).pathname.endsWith('/releases')) return http.fetchImpl(url, options)
         return {
           status: 200,
           ok: true,
