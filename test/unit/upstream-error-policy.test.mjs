@@ -201,7 +201,7 @@ test('response-header timeout does not cool the account', () => {
   assert.equal(shouldContinue(policy), true)
 })
 
-test('generic 502 overload switches units through the circuit, not a 15s cooldown', () => {
+test('generic 502 server error switches units through the circuit, not a 15s cooldown', () => {
   const policy = classifyUpstreamResult(
     {
       status: 502,
@@ -210,7 +210,7 @@ test('generic 502 overload switches units through the circuit, not a 15s cooldow
     { now: 1000 },
   )
   assert.equal(policy.action, 'continue')
-  assert.equal(policy.reason, 'provider_overloaded')
+  assert.equal(policy.reason, 'upstream_server_error')
   assert.equal(policy.cooldownUntil, null)
   assert.equal(policy.circuit, true)
   assert.equal(policy.decision.scope, 'unit')
@@ -989,4 +989,42 @@ test('fatal credential ensure escalation stays on permanent oauth_revoked', () =
   assert.notEqual(policy.reason, 'credential_refresh_failed')
   assert.equal(policy.cooldownUntil, Number.MAX_SAFE_INTEGER)
   assert.equal(shouldContinue(policy), true)
+})
+
+test('native launch permission errors stop at the worker without overload classification', () => {
+  const result = {
+    status: 502,
+    body: {
+      error: {
+        code: 'upstream_error',
+        message:
+          'Claude native launch failed (guest identity requires user/mount namespaces and bind-mount permissions): Permission denied (os error 13)',
+      },
+    },
+  }
+  const policy = classifyUpstreamResult(result)
+  assert.equal(policy.scope, 'worker')
+  assert.equal(policy.reason, 'native_launch_permission_denied')
+  assert.equal(policy.action, 'stop')
+  assert.equal(policy.cooldownUntil, null)
+  assert.equal(policy.retrySameAccount, false)
+})
+
+test('non-permission native launch failures remain local worker errors', () => {
+  const body = {
+    error: { code: 'upstream_error', message: 'Claude native launch failed: No such file or directory (os error 2)' },
+  }
+  const policy = classifyUpstreamResult({ status: 502, body })
+  assert.equal(policy.reason, 'native_launch_failed')
+  assert.equal(policy.scope, 'worker')
+  assert.equal(policy.action, 'stop')
+  assert.equal(policy.circuit, undefined)
+  assert.equal(body.error.code, 'upstream_error')
+})
+
+test('explicit overload errors retain overload classification', () => {
+  for (const status of [502, 529]) {
+    const policy = classifyUpstreamResult({ status, body: { error: { message: 'Overloaded' } } })
+    assert.equal(policy.reason, 'provider_overloaded')
+  }
 })
