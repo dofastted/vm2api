@@ -114,6 +114,9 @@ test('supplier transport bounds, gateway pairing and response projection', async
   const valid = await supplier.create(row, PROOF)
   assert.deepEqual(valid.form, { url: ACTION, data: fields(id) })
   assert.equal('redemption_code' in valid.order, false)
+  const kpay = 'https://api.kpay.cc/epay/submit.php'
+  reply = { ...order(id), url: kpay, data: fields(id) }
+  assert.deepEqual((await supplier.create(row, PROOF)).form, { url: kpay, data: fields(id) })
   for (const url of [
     'http://gateway.example.test/submit.php',
     `${ACTION}?a=1`,
@@ -123,6 +126,8 @@ test('supplier transport bounds, gateway pairing and response projection', async
     'https://0x7f000001/submit.php',
     'https://localhost/submit.php',
     'https://gateway.example.test/a/../submit.php',
+    'https://api.kpay.cc/epay%2Fredirect/submit.php',
+    'https://api.kpay.cc//epay/submit.php',
   ]) {
     reply = { ...order(id), url, data: fields(id) }
     await assert.rejects(supplier.create(row, PROOF), { code: 'shop_invalid_reply' })

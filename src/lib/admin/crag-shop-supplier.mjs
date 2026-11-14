@@ -65,7 +65,7 @@ const FORM_KEYS = [
 // The merchant's pinned TLS origin authorizes the gateway action. Do not normalize or infer an action.
 function validGateway(value) {
   if (typeof value !== 'string' || value.length > 300) return false
-  const match = /^https:\/\/([a-z0-9.-]+)(?::([1-9][0-9]{0,4}))?\/submit\.php$/.exec(value)
+  const match = /^https:\/\/([a-z0-9.-]+)(?::([1-9][0-9]{0,4}))?(?:\/[A-Za-z0-9_-]+)*\/submit\.php$/.exec(value)
   if (!match) return false
   const labels = match[1].split('.')
   if (labels.length < 2 || labels.some((label) => !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) return false
