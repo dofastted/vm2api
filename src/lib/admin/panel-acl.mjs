@@ -28,11 +28,12 @@ export const PANEL_VIEWS = [
   'users',
   'wrap',
   'billing',
+  'crag-subscription',
 ]
 
 const ROLE_VIEWS = {
-  user: ['vm', 'keys', 'billing', 'logs', 'statistics'],
-  super: ['overview', 'cluster', 'logs', 'statistics', 'vm'],
+  user: ['vm', 'keys', 'billing', 'logs', 'statistics', 'crag-subscription'],
+  super: ['overview', 'cluster', 'logs', 'statistics', 'vm', 'crag-subscription'],
   admin: PANEL_VIEWS.slice(),
 }
 

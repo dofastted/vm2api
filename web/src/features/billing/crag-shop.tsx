@@ -1,15 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
+import { Link } from '@tanstack/react-router'
+import { VIEW_TITLES } from '@/config/nav'
 import { api, isApiError } from '@/lib/api'
 import { Button } from '@/components/ui/button'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from '@/components/ui/dialog'
 import { Skeleton } from '@/components/ui/skeleton'
+import { PageHeader } from '@/components/page-header'
 
 const root = '/api/panel/crag-shop'
 const terms = { '1m': '月卡', '3m': '季卡', '1y': '年卡' }
@@ -47,24 +42,22 @@ function planTerms(plan: Pick<Order, 'amount_minor' | 'slot_limit'>) {
   return `${money.format(plan.amount_minor / 100)} · ${plan.slot_limit === 'unlimited' ? '应用锁不限' : `${plan.slot_limit} 把应用锁`}`
 }
 
-export function CragShopDialog() {
+export function CragShopLink() {
   return (
-    <Dialog>
-      <DialogTrigger asChild>
-        <Button variant='outline' size='sm'>
-          购买 CRAG 订阅
-        </Button>
-      </DialogTrigger>
-      <DialogContent className='max-h-[85dvh] overflow-y-auto sm:max-w-2xl'>
-        <DialogHeader>
-          <DialogTitle>购买 CRAG 订阅</DialogTitle>
-          <DialogDescription>
-            每单一枚兑换码，仅限一台受支持的宿主机。确认内核支持宿主订阅后再购买；付款后回到本人订单领取，不通过邮件发码。
-          </DialogDescription>
-        </DialogHeader>
-        <ShopOrders />
-      </DialogContent>
-    </Dialog>
+    <Button variant='outline' size='sm' asChild>
+      <Link to='/crag-subscription'>{VIEW_TITLES['crag-subscription']}</Link>
+    </Button>
+  )
+}
+
+export function CragSubscriptionPage() {
+  return (
+    <PageHeader
+      title={VIEW_TITLES['crag-subscription']}
+      description='每单一枚兑换码，仅限一台受支持的宿主机。购买前请确认内核支持宿主订阅；付款后在本人订单领取兑换码。'
+    >
+      <ShopOrders />
+    </PageHeader>
   )
 }
 
@@ -221,6 +214,19 @@ function ShopOrders() {
   return (
     <div className='min-w-0 space-y-5'>
       <section aria-label='选择套餐' className='space-y-3'>
+        <div className='flex flex-wrap items-center justify-between gap-2'>
+          <h2 className='font-medium'>可用套餐</h2>
+          {failed.catalog || (catalog && !selectedPlan) ? (
+            <Button
+              size='sm'
+              variant='ghost'
+              disabled={loading || busy}
+              onClick={() => refresh((n) => n + 1)}
+            >
+              刷新套餐
+            </Button>
+          ) : null}
+        </div>
         {loading && !catalog && !failed.catalog ? (
           <Skeleton className='h-24 w-full' />
         ) : null}
@@ -314,7 +320,7 @@ function ShopOrders() {
       </section>
       <section aria-label='本人订单' className='space-y-3 border-t pt-4'>
         <div className='flex items-center justify-between gap-2'>
-          <h3 className='font-medium'>本人订单</h3>
+          <h2 className='font-medium'>本人订单</h2>
           <Button
             size='sm'
             variant='ghost'
