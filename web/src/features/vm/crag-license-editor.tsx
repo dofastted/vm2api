@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
+import { CragShopDialog } from '@/features/billing/crag-shop-dialog'
 
 const licenseMessages: Record<string, string> = {
   license_required:
@@ -152,6 +153,7 @@ export function CragLicenseEditor({
       <div className='flex flex-wrap items-center justify-between gap-2'>
         <h4 className='text-sm font-medium'>本槽 CRAG 授权</h4>
         <div className='flex gap-2'>
+          <CragShopDialog />
           <Button
             type='button'
             variant='ghost'
