@@ -52,6 +52,7 @@ import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.m
 import { RETIRE_LEGACY_TELEMETRY } from '../vm/slot-process-status.mjs'
 import { checkCragLicense } from '../vm/crag-license.mjs'
 import { kernelCpuCommand, kernelCpuCommandMatches, usesKernelCpuLimit } from '../vm/kernel-cpu.mjs'
+import { kvmCragAppArmorCommand } from '../vm/kvm-crag-apparmor.mjs'
 import { workerPaths } from './go-worker-client.mjs'
 
 /** The native host is authenticated separately from account scheduling readiness. */
@@ -323,14 +324,21 @@ export async function ensureRustKernel(
     runDockerExec = runDocker,
     force = false,
     allowMissingCredential = false,
+    prepareGuestAppArmor = false,
   } = {},
 ) {
   const vmId = exec?.vmId || exec?.vm?.id || 'unknown'
-  const pending = starts.get(vmId)
-  if (pending && !force) {
+  let pending = starts.get(vmId)
+  while (pending && !force) {
     const result = await pending.promise
-    if (!allowMissingCredential || runtimeReady(result?.health, true)) return result
-    return { ok: false, reason: 'telemetry_not_ready', health: result?.health }
+    if (!prepareGuestAppArmor || pending.prepareGuestAppArmor) {
+      if (!allowMissingCredential || runtimeReady(result?.health, true)) return result
+      return { ok: false, reason: 'telemetry_not_ready', health: result?.health }
+    }
+    // A normal health check cannot satisfy cold-boot permission preparation.
+    const next = starts.get(vmId)
+    if (next === pending) break
+    pending = next
   }
   const control = { cancelled: false }
   const run = slotRunner(exec, runDockerExec)
@@ -342,8 +350,9 @@ export async function ensureRustKernel(
     runDockerExec: run,
     force,
     allowMissingCredential,
+    prepareGuestAppArmor,
   })
-  const start = { promise, control }
+  const start = { promise, control, prepareGuestAppArmor }
   starts.set(vmId, start)
   try {
     return await promise
@@ -406,6 +415,9 @@ export function wrapNewerThanKernel(exec) {
 }
 
 export async function restartRustKernel(exec, { timeoutMs = 30000, runDockerExec = runDocker } = {}) {
+  if (isKvmRuntime(exec?.vm)) {
+    return ensureRustKernel(exec, { timeoutMs, runDockerExec, force: true })
+  }
   const run = slotRunner(exec, runDockerExec)
   await killWrapDataplane(exec, run)
   const paths = rustKernelPaths(exec)
@@ -628,22 +640,44 @@ async function retireLegacyTelemetryBeforeStart(exec, runDockerExec) {
 
 async function startKvmGuestKernel(
   exec,
-  { timeoutMs, control, runDockerExec, force, host, paths, container, allowMissingCredential },
+  { timeoutMs, control, runDockerExec, force, host, paths, container, allowMissingCredential, prepareGuestAppArmor },
 ) {
   const budget = kvmBootBudget(exec.vm, timeoutMs)
   if (!force) {
     const waited = await waitForHealth(exec, budget, allowMissingCredential)
-    if (waited?.ok) {
+    if (waited?.ok && !prepareGuestAppArmor) {
       waited.reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
       return waited
+    }
+  }
+  const sshDeadline = Date.now() + 15_000
+  let prepared
+  do {
+    prepared = await runDockerExec(execArgv(exec, kvmCragAppArmorCommand(), { user: '0', interactive: true }), {
+      timeoutMs: 30_000,
+    })
+    if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
+    if (prepared?.ok) break
+    // The guest health relay can become ready before sshd during cold boot.
+    const sshUnavailable = `${prepared?.error || ''}\n${prepared?.stderr || ''}`.includes('guest ssh unavailable')
+    if (!prepareGuestAppArmor || !sshUnavailable || Date.now() >= sshDeadline) break
+    await new Promise((resolve) => setTimeout(resolve, 250))
+  } while (startCurrent(control))
+  if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
+  if (!prepared?.ok) {
+    return {
+      ok: false,
+      reason: 'guest_apparmor_failed',
+      error: String(prepared?.error || prepared?.stderr || 'Guest AppArmor preparation failed'),
     }
   }
   const retired = await retireLegacyTelemetryBeforeStart(exec, runDockerExec)
   if (!retired.ok) return retired
   await killWrapDataplane(exec, runDockerExec)
-  const launched = await runDockerExec(execArgv(exec, ['systemctl', 'restart', 'kin-kernel.service'], { user: '0' }), {
-    timeoutMs: Math.min(budget, 30_000),
-  })
+  const launched = await runDockerExec(
+    execArgv(exec, ['systemctl', 'restart', 'kin-kernel.service'], { user: '0', interactive: true }),
+    { timeoutMs: Math.min(budget, 30_000) },
+  )
   if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
   if (!launched?.ok) {
     const waited = await waitForHealth(exec, budget, allowMissingCredential)
@@ -679,7 +713,15 @@ async function startNativeKernel(exec, { timeoutMs, control, host }) {
 
 async function startRustKernel(
   exec,
-  { timeoutMs, healthTimeoutMs = 800, control, runDockerExec, force = false, allowMissingCredential = false },
+  {
+    timeoutMs,
+    healthTimeoutMs = 800,
+    control,
+    runDockerExec,
+    force = false,
+    allowMissingCredential = false,
+    prepareGuestAppArmor = false,
+  },
 ) {
   const licensed = checkCragLicense(projectRootFromExec(exec), exec?.vm, {
     inference: { dataplane: readExistingKernelConfig(rustKernelPaths(exec).configPath).dataplane },
@@ -704,11 +746,17 @@ async function startRustKernel(
   const occupied = rustKernelBusy(existing) || wrapHopInflight(exec) > 0
   const host = slotHost(exec?.vm)
   // Credential rotation is read by the live kernel/CLI; it is not a lifecycle change.
-  if (!allowMissingCredential && !force && occupied && !staleWrap && !slotMismatch) {
+  if (!allowMissingCredential && !force && !prepareGuestAppArmor && occupied && !staleWrap && !slotMismatch) {
     const reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
     return { ok: true, reason: 'busy', health: existing, reconcile }
   }
-  if (!force && runtimeReady(existing, allowMissingCredential) && !staleWrap && !slotMismatch) {
+  if (
+    !force &&
+    !prepareGuestAppArmor &&
+    runtimeReady(existing, allowMissingCredential) &&
+    !staleWrap &&
+    !slotMismatch
+  ) {
     const reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
     return { ok: true, reason: 'already_up', health: existing, reconcile }
   }
@@ -732,6 +780,7 @@ async function startRustKernel(
       paths,
       container,
       allowMissingCredential,
+      prepareGuestAppArmor,
     })
   }
   const wedged = rustKernelProcessUp(existing) && !rustKernelReachable(existing) && !occupied

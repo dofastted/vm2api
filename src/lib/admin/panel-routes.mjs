@@ -160,6 +160,7 @@ import {
   migrateScheduleRecord,
 } from '../pool/schedule-state.mjs'
 import { fillVmTimezoneFromExit, syncVmTimezoneFromProxy } from '../vm/proxy-timezone.mjs'
+import { proxyScheme } from '../vm/proxy-pool.mjs'
 import { validTimezone } from '../core/timezone.mjs'
 import { stampVmKind, isCodexVm } from '../vm/vm-kind.mjs'
 import { parseAllowedModelsPatch } from '../pool/slot-model-gate.mjs'
@@ -6176,7 +6177,22 @@ export function createPanelHandler(ctx) {
         if (bindVmId && userMissesVmId(req, cfg.paths.project, bindVmId)) {
           return json(res, 404, { ok: false, error: { message: 'vm not found' } })
         }
+        // Protocol for lines without their own scheme:// prefix. Reject unknown
+        // values rather than silently importing them as SOCKS5.
+        const defaultScheme =
+          body.default_scheme == null || body.default_scheme === '' ? 'socks5' : proxyScheme(body.default_scheme)
+        if (!defaultScheme) {
+          return json(res, 400, {
+            ok: false,
+            error: {
+              type: 'invalid_request_error',
+              code: 'invalid_scheme',
+              message: 'default_scheme must be socks5 or http',
+            },
+          })
+        }
         const result = proxyPool.importLines(text, {
+          defaultScheme,
           fields: body.proxies || body.entries || null,
           host: body.host,
           port: body.port,
@@ -6268,7 +6284,7 @@ export function createPanelHandler(ctx) {
         // Forward only the keys the caller actually sent — update() reads
         // presence, not value, to tell "leave alone" from "clear".
         const patch = {}
-        for (const key of ['host', 'port', 'username', 'password', 'label', 'domain_forward']) {
+        for (const key of ['scheme', 'host', 'port', 'username', 'password', 'label', 'domain_forward']) {
           if (Object.prototype.hasOwnProperty.call(body, key)) patch[key] = body[key]
         }
         const result = proxyPool.update(id, patch)

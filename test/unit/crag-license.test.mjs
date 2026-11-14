@@ -136,6 +136,7 @@ for (const [placement, extra] of [
   ['local KVM', { runtime: { type: 'kvm' } }],
   ['cluster Docker', { node_id: 'node-1' }],
   ['cluster KVM', { node_id: 'node-1', runtime: { type: 'kvm' } }],
+  ['remote legacy KVM', { node_id: 'node-1', runtime_type: 'kvm' }],
 ]) {
   test(`${placement} uses the universal grant without creating a device binding or switching kernels`, async (t) => {
     const { root } = fixture(t)

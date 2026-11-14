@@ -390,6 +390,74 @@ test('native macOS still rejects licensed CRAG switching through both legacy end
   assert.deepEqual(fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`)), record)
 })
 
+for (const [label, placement, endpoint] of [
+  ['local legacy KVM', { runtime_type: 'kvm' }, 'patch'],
+  ['remote KVM', { node_id: 'node-kvm', runtime: { type: 'kvm' } }, 'selected'],
+  ['inherited QEMU', { runtime: { type: 'qemu' } }, 'all'],
+]) {
+  test(`${label} switches CRAG in both directions without recreating the guest`, async (t) => {
+    const priorHold = { reason: 'proxy_cooldown', detail: { tag: 'proxy-owned' } }
+    const { root, vm } = fixture(t, {
+      ...placement,
+      ...(endpoint === 'all' ? { dataplane: undefined } : {}),
+      schedule_off: true,
+      schedule_hold: priorHold,
+    })
+    seedEncryptedPackage(root)
+    activateCragLicense(root, vm, issueUniversalCode(root).code)
+    const routing = { inference: { dataplane: 'wrap' } }
+    const selections = []
+    for (const target of ['crag', 'wrap']) {
+      const response = await request(
+        root,
+        endpoint === 'patch' ? 'PATCH' : 'POST',
+        '',
+        {
+          dataplane: target,
+          ...(endpoint === 'selected' ? { ids: [vm.id] } : endpoint === 'all' ? { all: true } : {}),
+        },
+        {
+          routingConfig: routing,
+          persistRoutingPatch: async (patch) => Object.assign(routing.inference, patch.inference),
+          kernelPolicyOps: {
+            projectCragUniversalVm: async (project, selected) =>
+              selected.node_id ? { ok: true } : projectCragUniversalVm(project, selected),
+            writeKernelConfig: (project, selected, options) =>
+              writeKernelConfig(project, selected, { ...options, publish: false }),
+            startSlotReady: async () => assert.fail('kernel switching must preserve the KVM guest'),
+            restartRustKernel: async () => {
+              const selected = getVm(root, vm.id)
+              assert.equal(selected.schedule_hold.reason, 'maintenance')
+              const config = JSON.parse(fs.readFileSync(path.join(root, 'vms', vm.id, 'run/kernel.json')))
+              assert.equal(config.dataplane, target)
+              assert.equal(config.runtime_kind, 'kvm')
+              assert.equal(config.socket_path, '/run/kin-guest/kernel.sock')
+              if (target === 'crag') {
+                assert.equal(config.runtime_variant, 'crag-v2')
+                assert.match(config.claude_bin, /crag-v2\/claude-code-[^/]+\/claude$/)
+                assert.equal(config.license_dir, '/run/kin/crag-license')
+              } else {
+                assert.equal(config.runtime_variant, undefined)
+                assert.equal(config.license_dir, undefined)
+              }
+              selections.push(config.dataplane)
+              return { ok: true }
+            },
+          },
+        },
+        endpoint === 'patch' ? '/vms/vm-switch' : '/dataplane',
+      )
+      assert.equal(response.status, 200, JSON.stringify(response.body))
+      if (endpoint !== 'patch') assert.equal(response.body.data.ok_count, 1)
+      const saved = getVm(root, vm.id)
+      assert.equal(endpoint === 'all' ? routing.inference.dataplane : saved.dataplane, target)
+      assert.equal(saved.status, 'running')
+      assert.equal(saved.schedule_off, true)
+      assert.deepEqual(saved.schedule_hold, priorHold)
+    }
+    assert.deepEqual(selections, ['crag', 'wrap'])
+  })
+}
 test('failed readiness blocks scheduling and retains the circuit for explicit recovery', async (t) => {
   const { root, vm } = fixture(t)
   seedEncryptedPackage(root)

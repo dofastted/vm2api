@@ -37,6 +37,7 @@ import {
 } from '../vm/slot-engine.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { kernelCpuCommand, kernelCpuCommandMatches, usesKernelCpuLimit } from '../vm/kernel-cpu.mjs'
+import { kvmCragAppArmorCommand } from '../vm/kvm-crag-apparmor.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
 import { slotMemory, slotDockerCpus, memoryMiB, normalizeVmConfig } from '../vm/machine-spec.mjs'
@@ -1240,8 +1241,8 @@ export async function reloadRemoteSlot(vm, projectRoot, { routing } = {}) {
       await chownRemoteKvmBinds(session, name, vm)
       const argv = slotExecArgv(
         { ...vm, runtime: { ...(vm.runtime || {}), container: name, type: 'kvm' } },
-        ['systemctl', 'restart', 'kin-kernel.service'],
-        { user: '0' },
+        kvmCragAppArmorCommand({ restart: true }),
+        { user: '0', interactive: true },
       )
       await runRemote(session.client, ['docker', ...argv].map(shellQuote).join(' '), { timeoutMs: 60_000 })
     } else {

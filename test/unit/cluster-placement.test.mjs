@@ -29,6 +29,7 @@ import {
   ensureRemoteOfficialCredentialLink,
   pullSlotCredentials,
   pushCragSlot,
+  pushSlotBinaries,
   pushSlotCredentials,
   pushSlotFiles,
   reconcileSlotCredentials,
@@ -158,6 +159,68 @@ function localSlot(cred) {
 }
 
 const vm = { id: 'vm-07', node_id: 'node-t' }
+
+test('KVM binary publication requires a complete CRAG preinstall even while cli-node is selected', async (t) => {
+  const node = fakeNode()
+  const root = tmpDir('kin-kvm-preinstall-')
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const target = { ...vm, runtime: { type: 'kvm' }, dataplane: 'wrap' }
+  const remote = `${node.session.host.root}/vms/${vm.id}`
+  const selector = `${remote}/cli-home/.kin/kin-kernel`
+  node.files.set(selector, Buffer.from('existing-selector'))
+  node.files.set(node.remoteCred, Buffer.from('rotated-credential'))
+  await assert.rejects(pushSlotBinaries(target, root, node.session), { code: 'slot_payload_missing' })
+  seedEncryptedPackage(root)
+  const result = await pushSlotBinaries(target, root, node.session)
+  assert.equal(result.crag.ok, true)
+  for (const file of cragSlotPayload(root).files) {
+    const dest = `${remote}/slot-bin/${file.name.slice('opt/kin/'.length)}`
+    assert.deepEqual(node.files.get(dest), file.body || fs.readFileSync(file.src))
+  }
+  assert.equal(node.files.get(selector).toString(), 'existing-selector')
+  assert.equal(node.files.get(node.remoteCred).toString(), 'rotated-credential')
+})
+
+test('service binary publication rewrites only binaries whose node copy differs', async (t) => {
+  const node = fakeNode()
+  const root = tmpDir('kin-slot-bin-skip-')
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const worker = path.join(root, 'kin-worker')
+  const egress = path.join(root, 'kin-egress')
+  fs.writeFileSync(worker, 'worker-v1')
+  fs.writeFileSync(egress, 'egress-v1')
+  const saved = { worker: process.env.KIN_CLUSTER_WORKER_BIN, egress: process.env.KIN_CLUSTER_EGRESS_BIN }
+  process.env.KIN_CLUSTER_WORKER_BIN = worker
+  process.env.KIN_CLUSTER_EGRESS_BIN = egress
+  t.after(() => {
+    for (const [key, value] of [
+      ['KIN_CLUSTER_WORKER_BIN', saved.worker],
+      ['KIN_CLUSTER_EGRESS_BIN', saved.egress],
+    ]) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  })
+  const remote = `${node.session.host.root}/vms/${vm.id}/slot-bin`
+  const writes = () => node.published.filter((p) => p === `${remote}/kin-worker` || p === `${remote}/kin-egress`)
+
+  const first = await pushSlotBinaries(vm, root, node.session)
+  assert.deepEqual(writes().sort(), [`${remote}/kin-egress`, `${remote}/kin-worker`])
+  assert.equal(node.files.get(`${remote}/kin-worker`).toString(), 'worker-v1')
+  assert.equal(node.modes.get(`${remote}/kin-worker`), 0o755)
+
+  // Slot starts (OAuth, recovery) repeat this on slow node links; unchanged binaries must not be resent.
+  const again = await pushSlotBinaries(vm, root, node.session)
+  assert.equal(writes().length, 2)
+  assert.equal(again.digest, first.digest)
+  assert.deepEqual(again.pushed, first.pushed)
+
+  fs.writeFileSync(egress, 'egress-v2')
+  const changed = await pushSlotBinaries(vm, root, node.session)
+  assert.deepEqual(writes().slice(2), [`${remote}/kin-egress`])
+  assert.equal(node.files.get(`${remote}/kin-egress`).toString(), 'egress-v2')
+  assert.notEqual(changed.digest, first.digest)
+})
 
 test('KVM run publication selects the live guest kernel and preserves node credentials', async (t) => {
   const node = fakeNode()
@@ -586,11 +649,10 @@ test('slot image tag follows payload bytes only; a VERSION bump keeps the image'
   const cragDir = path.join(root, 'share/crag')
   fs.renameSync(cragDir, path.join(root, 'crag-hidden'))
   assert.throws(() => cragSlotPayload(root), { code: 'slot_payload_missing' })
-  for (const runtime of ['docker', 'kvm']) {
-    const withoutCrag = slotImageSpec(root, 'ubuntu-24.04', { runtime })
-    assert.ok(withoutCrag.files.some((file) => file.name === 'opt/kin/cli-node'))
-    assert.ok(withoutCrag.files.every((file) => !file.name.startsWith('opt/kin/crag')))
-  }
+  const withoutCrag = slotImageSpec(root, 'ubuntu-24.04', { runtime: 'docker' })
+  assert.ok(withoutCrag.files.some((file) => file.name === 'opt/kin/cli-node'))
+  assert.ok(withoutCrag.files.every((file) => !file.name.startsWith('opt/kin/crag')))
+  assert.throws(() => slotImageSpec(root, 'ubuntu-24.04', { runtime: 'kvm' }), { code: 'slot_payload_missing' })
   fs.renameSync(path.join(root, 'crag-hidden'), cragDir)
   const payloadFile = path.join(cragDir, 'kernels/v2/amd64/crag-v2.payload.enc')
   fs.appendFileSync(payloadFile, 'tampered')

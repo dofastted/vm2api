@@ -167,3 +167,50 @@ test('labelOf 只给名称，不带账密；未知代理返回 null', () => {
   assert.equal(pool.labelOf(p.id), 'tw-box')
   assert.equal(pool.labelOf('px-missing'), null)
 })
+
+test('update: scheme 可在 socks5 / http 间切换，算连接变更，账密保留', () => {
+  const pool = makePool()
+  const p = seed(pool)
+  const r = pool.update(p.id, { scheme: 'http' })
+  assert.equal(r.ok, true)
+  assert.equal(r.connection_changed, true)
+  assert.equal(p.scheme, 'http')
+  assert.equal(r.proxy.scheme, 'http')
+  assert.equal(p.username, 'alice')
+  assert.equal(p.password, 's3cret')
+  assert.equal(pool.update(p.id, { scheme: 'socks5h' }).ok, true)
+  assert.equal(p.scheme, 'socks5', 'socks5h 归一为 socks5')
+})
+
+test('update: 非法 scheme 被拒，本地代理不能改协议', () => {
+  const pool = makePool()
+  const p = seed(pool)
+  assert.equal(pool.update(p.id, { scheme: 'https' }).error, 'invalid_scheme')
+  assert.equal(pool.update(p.id, { scheme: 'local' }).error, 'invalid_scheme')
+  assert.equal(p.scheme, 'socks5', '被拒后原值不变')
+  pool.ensureLocal()
+  const lp = pool.state.proxies.find((x) => x.scheme === 'local')
+  assert.ok(lp, '前提：已有本地代理')
+  assert.equal(pool.update(lp.id, { scheme: 'http' }).error, 'scheme_unsupported')
+})
+
+test('importLines: defaultScheme 只作用于未写协议的行', () => {
+  const pool = makePool()
+  const r = pool.importLines('1.1.1.1:8080\nu:p@2.2.2.2:3128\nsocks5://3.3.3.3:1080', { defaultScheme: 'http' })
+  assert.equal(r.added, 3)
+  const by = Object.fromEntries(pool.state.proxies.map((x) => [x.host, x.scheme]))
+  assert.deepEqual(by, { '1.1.1.1': 'http', '2.2.2.2': 'http', '3.3.3.3': 'socks5' })
+  // 同端点不同协议不算重复
+  assert.equal(pool.importLines('1.1.1.1:8080').added, 1)
+})
+
+test('update: 从库加载后改 scheme，重开仍是新协议（protocol 列不被旧值覆盖）', () => {
+  const pool = makePool()
+  seed(pool)
+  pool.load()
+  const p = pool.state.proxies[0]
+  assert.equal(p.protocol, 'socks5', '前提：库里加载的行带 protocol 列')
+  assert.equal(pool.update(p.id, { scheme: 'http' }).ok, true)
+  pool.load()
+  assert.equal(pool.state.proxies[0].scheme, 'http')
+})
