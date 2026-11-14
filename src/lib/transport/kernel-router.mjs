@@ -41,6 +41,13 @@ export function rustHealthTtlMs(routing = {}) {
   return n
 }
 
+export function rustHealthTimeoutMs(routing = {}) {
+  const n = Number(routing?.inference?.health_timeout_ms)
+  // SSH relays can exceed the local-socket budget without the kernel being down.
+  if (!Number.isFinite(n) || n <= 0) return 800
+  return Math.min(30_000, Math.max(800, Math.round(n)))
+}
+
 export function rustSlotWaitMs(routing = {}) {
   const raw = routing?.inference?.slot_wait_ms
   if (raw == null || raw === '') return DEFAULT_SLOT_WAIT_MS
@@ -216,7 +223,7 @@ async function prepareRust(exec, { ensure, routing, slotWaitMs, slotWaitDeadline
   if (cached && rustHopReady(cached.health)) {
     return { ok: true, reason: 'health_cache', health: cached.health }
   }
-  const health = await rustKernelHealth(exec, { timeoutMs: 800 })
+  const health = await rustKernelHealth(exec, { timeoutMs: rustHealthTimeoutMs(routing) })
   if (rustHopReady(health)) {
     const ready = { ok: true, reason: 'already_up', health }
     rememberRustHealth(exec, ready)

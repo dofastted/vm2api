@@ -367,12 +367,17 @@ export function isCompleteAssistantMessage(result = {}) {
   const body = result?.body && typeof result.body === 'object' ? result.body : result
   if (!isAssistantMessageBody(body)) return false
   if (result?.nativeHandoff) {
+    const facts = result.providerResult
+    const complete = facts?.schema_version === 2 ? facts.provider_complete === true : facts?.usage_complete === true
     return (
       result.ok === true &&
-      result.providerResult?.usage_complete === true &&
-      !result.providerResult.error &&
-      result.providerResult.message_id === body.id &&
-      result.providerResult.stop_reason === assistantStopReason(result)
+      complete &&
+      !facts.error &&
+      !facts.delivery_error &&
+      facts.response_valid !== false &&
+      (facts.schema_version !== 2 || facts.stop_reason !== 'tool_use' || facts.handoff_complete === true) &&
+      facts.message_id === body.id &&
+      facts.stop_reason === assistantStopReason(result)
     )
   }
   if (result?.sawMessageStop) return true

@@ -11,6 +11,7 @@ import { pinThreadBetas, rememberThreadTurn } from '../protocol/thread-betas.mjs
 import { applyThinkingDisplay, ensureOfficialPrintThinking, thinkingDisplayMode } from '../protocol/thinking.mjs'
 import { modelDirectiveForCrag } from '../protocol/model-policy.mjs'
 import { capOutboundBody } from '../protocol/outbound-snapshot.mjs'
+import { cacheTtlFromRouting } from '../protocol/cache-ttl.mjs'
 import { ccEntrypointFromRouting, stripSubagentBilling } from '../identity/crs-persona.mjs'
 import { sealClaudeCodeCch } from '../identity/cch.mjs'
 import { credentialModeFromOauth } from '../oauth/credential-mode.mjs'
@@ -55,6 +56,7 @@ import {
   createNativeHandoffState,
   consumeNativeHandoffStream,
   negotiateNativeHandoff,
+  negotiateProviderResult,
 } from '../protocol/native-handoff.mjs'
 
 const MAX_BODY = 64 * 1024 * 1024
@@ -250,6 +252,7 @@ function inferenceRequest(
       session_idle_ttl_seconds: normalizeSessionIdleTtlSeconds(routing?.inference?.session_idle_ttl_seconds),
     }
     if (nativeHandoff) body.gateway_policy.native_handoff_v1 = true
+    if (negotiateProviderResult(exec, { managedCrag, requestPath })) body.gateway_policy.provider_result_v2 = true
     // Only realtime exposes headers before completion. The native worker owns
     // activity deadlines while verified and JSON responses are held back.
     timeoutMs =
@@ -426,12 +429,23 @@ import { semanticStatusForStreamError } from '../protocol/stream-error-status.mj
 
 export { semanticStatusForStreamError } from '../protocol/stream-error-status.mjs'
 
+function nativeErrorStatus(handoff, body) {
+  const facts = handoff?.providerResult
+  for (const status of [facts?.public_status, facts?.http_status]) {
+    if (Number.isInteger(status) && status >= 400 && status < 600) return status
+  }
+  // A real HTTP 200 on an SSE error is an observation, never an error status.
+  // V3's structured facts must not be reinterpreted from error prose.
+  return facts?.schema_version === 2 ? 502 : semanticStatusForStreamError(body)
+}
+
 /**
  * Kernel `map_kernel` folds every provider failure into 502 `provider_error`.
  * Restore recognized permission denials and plan-limit / overload statuses.
  */
 export function restoreKernelErrorStatus(result = {}, { now = Date.now() } = {}) {
   if (!result || result.ok || Number(result.status) !== 502) return result
+  if (result.providerResult?.schema_version === 2) return result
   const body = result.body
   if (!(body?.type === 'error' || body?.error)) return result
   const status = semanticStatusForStreamError(body)
@@ -520,11 +534,11 @@ function dumpSessionEnvelope(envelope) {
   } catch {}
 }
 
-function gateCragBody(body, print, health) {
+function gateCragBody(body, print, health, isolated = false) {
   if (!body || typeof body !== 'object') return body
   const caps = print && Array.isArray(health?.capabilities) ? health.capabilities : []
   const prompt = body.crag_prompt
-  const model = print && cragConsumesModelDirective(health) ? modelDirectiveForCrag(body.model) : null
+  const model = print && !isolated && cragConsumesModelDirective(health) ? modelDirectiveForCrag(body.model) : null
   const hasAlias = body.crag_options != null && Object.hasOwn(body.crag_options, 'prompt')
   if (!model && !Object.hasOwn(body, 'crag_prompt') && !Object.hasOwn(body, 'crag_model') && !hasAlias) {
     return body
@@ -585,10 +599,15 @@ export function prepareWorkerPayload({
   )
   const betas = thread.betas
   headers['anthropic-beta'] = betas.join(',')
-  // Envelope headers are discarded; the existing MessageRequest.betas channel
-  // carries request gates to the native CLI, which builds the actual HTTP wire.
-  const gated = cliHop ? { ...main, betas } : sanitizeAnthropicBodyForBetaTokens(main, headers['anthropic-beta'])
-  const directed = gateCragBody(gated, print, health)
+  // V3's official CC owns beta selection. Its strict request contract does not
+  // accept the panel's legacy cli-node beta body extension.
+  const officialBetas = print && health?.capabilities?.includes('generation_controls_v3')
+  const gated = cliHop
+    ? officialBetas
+      ? main
+      : { ...main, betas }
+    : sanitizeAnthropicBodyForBetaTokens(main, headers['anthropic-beta'])
+  const directed = gateCragBody(gated, print, health, requestContext?.purpose === 'auto_mode_classifier')
   return {
     headers,
     gated: directed,
@@ -653,6 +672,10 @@ async function workerEnvelope({
   const gated = redaction ? masked.body : prepared.gated
   const outgoingCwd = redaction ? validateCallerCwd(masked.caller_cwd) : cwd
   const finalized = sealPreparedPayload(prepared, gated)
+  const nativeV3 =
+    nativeCragRequest(exec, cragPrint) && exec?.workerStatus?.capabilities?.includes('generation_controls_v3')
+  // Resolve execution defaults even when cacheTtl is null for mixed-TTL accounting.
+  const defaultCacheTtl = cacheTtl ?? (nativeV3 && routing != null ? cacheTtlFromRouting(routing) : null)
   const envelope = {
     ...(requestContext ? { request_context: requestContext } : {}),
     ...(typeof outgoingCwd === 'string' ? { caller_cwd: outgoingCwd } : {}),
@@ -661,7 +684,7 @@ async function workerEnvelope({
     stream: !!stream,
     delivery_mode: deliveryMode || 'realtime',
     preserve_cache_breakpoints: preserveCacheBreakpoints == null ? cacheTtl == null : preserveCacheBreakpoints === true,
-    cache_ttl: cacheTtl == null ? null : String(cacheTtl),
+    cache_ttl: defaultCacheTtl == null ? null : String(defaultCacheTtl),
   }
   dumpSessionEnvelope(envelope)
   return { envelope, thread: finalized.thread, redaction }
@@ -684,6 +707,7 @@ async function preparePrebuiltEnvelope(envelope, redaction, messages, exec, crag
       print ? prepareCragRequest(out.body) : prepareCliNodeRequest(out.body),
       print,
       exec?.workerStatus,
+      out.request_context?.purpose === 'auto_mode_classifier',
     )
     if (out.headers && typeof out.headers === 'object') {
       out.headers = Object.fromEntries(
@@ -813,7 +837,8 @@ export async function callGoWorker({
   let nativeHandoff = false
   let handoff = null
   let observedHeaders = {}
-  const nativeMetadata = () => (nativeHandoff ? handoff.metadata : { nativeHandoff: false, providerResult: null })
+  const nativeMetadata = () =>
+    handoff ? { ...handoff.metadata, nativeHandoff } : { nativeHandoff: false, providerResult: null }
   try {
     const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
     const prepared = envelope
@@ -853,7 +878,8 @@ export async function callGoWorker({
       requestContext,
       envelope: prepared.envelope,
     })
-    if (useNativeHandoff) handoff = createNativeHandoffState()
+    if (useNativeHandoff || negotiateProviderResult(exec, { managedCrag, requestPath }))
+      handoff = createNativeHandoffState({ nativeHandoff: useNativeHandoff })
     const response = await inferenceRequest(exec, {
       stream: false,
       managedCrag,
@@ -878,7 +904,8 @@ export async function callGoWorker({
     handoff?.observeHeaders(response.headers)
     const data = await readAll(response)
     const parsedRaw = await inferenceCodec.decode(data, { status: response.statusCode, signal })
-    let parsed = prepared.redaction ? await restoreJsonValue(parsedRaw, prepared.redaction) : parsedRaw
+    let parsed = handoff ? handoff.consumeBody(parsedRaw) : parsedRaw
+    if (prepared.redaction) parsed = await restoreJsonValue(parsed, prepared.redaction)
     if (handoff) {
       handoff.observeHeaders(response.trailers)
       handoff.observeMessage(parsed?.type === 'error' ? null : parsed)
@@ -896,7 +923,7 @@ export async function callGoWorker({
       ok,
       status:
         nativeHandoff && parsed?.type === 'error' && response.statusCode < 400
-          ? handoff.providerResult?.http_status || semanticStatusForStreamError(parsed)
+          ? nativeErrorStatus(handoff, parsed)
           : response.statusCode || 0,
       via: 'go-worker',
       body: parsed,
@@ -919,7 +946,7 @@ export async function callGoWorker({
       ok: false,
       status:
         nativeHandoff && handoff?.errorBody
-          ? handoff.providerResult?.http_status || semanticStatusForStreamError(handoff.errorBody)
+          ? nativeErrorStatus(handoff, handoff.errorBody)
           : nativeHandoff
             ? error.status || 0
             : error.status === 413
@@ -1069,7 +1096,8 @@ export async function streamGoWorker({
   let nativeHandoff = false
   let handoff = null
   let observedHeaders = {}
-  const nativeMetadata = () => (nativeHandoff ? handoff.metadata : { nativeHandoff: false, providerResult: null })
+  const nativeMetadata = () =>
+    handoff ? { ...handoff.metadata, nativeHandoff } : { nativeHandoff: false, providerResult: null }
   try {
     const redaction = await redactionContext({ routing, exec, redactionPrincipal, redactionSession })
     const prepared = envelope
@@ -1110,7 +1138,8 @@ export async function streamGoWorker({
       requestContext,
       envelope: prepared.envelope,
     })
-    if (useNativeHandoff) handoff = createNativeHandoffState()
+    if (useNativeHandoff || negotiateProviderResult(exec, { managedCrag, requestPath }))
+      handoff = createNativeHandoffState({ nativeHandoff: useNativeHandoff })
     const response = await inferenceRequest(exec, {
       stream: true,
       deliveryMode,
@@ -1136,9 +1165,12 @@ export async function streamGoWorker({
     observedHeaders = headers
     handoff?.observeHeaders(response.headers)
     if ((response.statusCode || 0) < 200 || (response.statusCode || 0) >= 300) {
-      const data = await readAll(response, 1024 * 1024)
-      const decoded = await inferenceCodec.decode(data, { status: response.statusCode, signal })
+      const data = await readAll(response, handoff ? MAX_BODY : 1024 * 1024)
+      let decoded = await inferenceCodec.decode(data, { status: response.statusCode, signal })
+      if (handoff) decoded = handoff.consumeBody(decoded)
+      if (prepared.redaction) decoded = await restoreJsonValue(decoded, prepared.redaction)
       handoff?.observeHeaders(response.trailers)
+      if (handoff) decoded = handoff.finish(decoded)
       // A real HTTP error remains the failure, even if handoff metadata is absent.
       const result = restoreKernelErrorStatus({
         ok: false,
@@ -1200,9 +1232,7 @@ export async function streamGoWorker({
       const trailers = publicHeaders(response.trailers)
       return {
         ok: !failed,
-        status: failed
-          ? handoff.providerResult?.http_status || semanticStatusForStreamError(body)
-          : response.statusCode,
+        status: failed ? nativeErrorStatus(handoff, body) : response.statusCode,
         via: 'go-worker-stream',
         body,
         headers: mergeRateLimitHeaders(publicHeaders({ ...received.headers, ...headers, ...trailers })),
@@ -1256,7 +1286,10 @@ export async function streamGoWorker({
       if (event.type === 'response_headers' && event.headers && typeof event.headers === 'object') {
         sseRateHeaders = { ...sseRateHeaders, ...event.headers }
       }
-      if (event.type === 'error') lastError = event
+      if (event.type === 'error') {
+        lastError = event
+        handoff?.observeError(event)
+      }
       if (event.type === 'message_stop') sawMessageStop = true
       if (event.type === 'message_start') rememberThreadTurn(event.message?.id, prepared.thread)
       const evUsage = usageFromSseEvent(event)
@@ -1304,6 +1337,7 @@ export async function streamGoWorker({
           if (outboundHeadersFrame) {
             if (line.startsWith('data:')) {
               const event = parseJson(line.slice(5).trim())
+              if (event?.type === 'kin_provider_result') handoff?.observeResult(event)
               if (
                 event?.type === 'kin_outbound_headers' &&
                 event.headers &&
@@ -1371,6 +1405,7 @@ export async function streamGoWorker({
         if (isDownstreamCommitEvent(event)) await flushCommit()
       }
       const trailers = mergeRateLimitHeaders(publicHeaders(response.trailers))
+      handoff?.observeHeaders(response.trailers)
       const meta = streamMetaFromHeaders({ ...headers, ...trailers })
       const assembled = assembler.message
       const stopReason = meta.stopReason || sseStop || assembled?.stop_reason || null
@@ -1383,10 +1418,17 @@ export async function streamGoWorker({
       const nativeTimeout = managedCrag && lastError?.error?.type === 'timeout_error'
       return restoreUncommittedHop({
         ok: response.statusCode === 200 && !lastError && complete,
-        status: nativeTimeout && !committed ? 504 : response.statusCode || 0,
+        status:
+          lastError && handoff?.providerResult
+            ? nativeErrorStatus(handoff, lastError)
+            : nativeTimeout && !committed
+              ? 504
+              : response.statusCode || 0,
         via: 'go-worker-stream',
 
-        body: lastError || assembled || { type: 'message', role: 'assistant', content: [] },
+        body: handoff
+          ? handoff.finish(lastError || assembled || { type: 'message', role: 'assistant', content: [] })
+          : lastError || assembled || { type: 'message', role: 'assistant', content: [] },
         headers: rateHeaders,
         // Trailer stays authoritative, but it may carry totals only (Codex/Responses hops).
         // Merge so SSE `input_tokens_details` / cache breakdown survives instead of being short-circuited.
@@ -1399,6 +1441,7 @@ export async function streamGoWorker({
         terminalState: nativeTimeout && !committed ? 'rejected' : terminalState,
         transportError: false,
         threadBetas: prepared.thread,
+        ...nativeMetadata(),
       })
     } finally {
       if (idleTimer) clearInterval(idleTimer)
@@ -1420,7 +1463,7 @@ export async function streamGoWorker({
       ok: false,
       status:
         nativeHandoff && handoff?.errorBody
-          ? handoff.providerResult?.http_status || semanticStatusForStreamError(handoff.errorBody)
+          ? nativeErrorStatus(handoff, handoff.errorBody)
           : nativeHandoff
             ? error.status || 0
             : error.status === 413
