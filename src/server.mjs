@@ -65,6 +65,7 @@ import {
   isCodexVm,
   syncCodexQuotaSchedule,
 } from './lib/vm/vm-registry.mjs'
+import { createCragSubscription } from './lib/vm/crag-subscription.mjs'
 import { makeError, ErrorType, ErrorCode } from './lib/core/errors.mjs'
 import { HOLD_PROXY } from './lib/pool/schedule-state.mjs'
 import * as panel from './lib/admin/panel-api.mjs'
@@ -88,7 +89,11 @@ import { ClusterError } from './lib/cluster/ssh-link.mjs'
 import { nodeEgressProxyUrl, startNodeEgressSocks } from './lib/cluster/node-egress-socks.mjs'
 import { createSlotShell } from './lib/vm/slot-shell.mjs'
 import { vmLockBusy } from './lib/vm/vm-file.mjs'
-import { refreshSlotGuestBinDir, syncLocalSlotRestartPolicies } from './lib/vm/vm-runtime.mjs'
+import {
+  assertCragSubscriptionTarget,
+  refreshSlotGuestBinDir,
+  syncLocalSlotRestartPolicies,
+} from './lib/vm/vm-runtime.mjs'
 
 import {
   classifyCredentialRefresh,
@@ -970,8 +975,15 @@ cliNodeGuard = createCliNodeGuard({
   liveTokens: () => slotShell.liveShellTokens?.() || [],
 })
 
+const cragSubscription = createCragSubscription({
+  projectRoot: cfg.paths.project,
+  listTargets: () => listVms(cfg.paths.project),
+  assertReady: (vm) => assertCragSubscriptionTarget(cfg.paths.project, vm, routingConfig),
+})
+
 const handlePanel = createPanelHandler({
   getDb,
+  cragSubscription,
   json,
   writeSSEHeaders,
   readBody,
@@ -1350,6 +1362,11 @@ server.headersTimeout = 125_000
 server.timeout = 0
 
 server.listen(cfg.port, cfg.host, () => {
+  if (process.env.KIN_CRS_MOCK !== '1') {
+    void cragSubscription.recover().catch(() => {
+      console.warn('[crag-subscription] startup recovery failed; use the administrator panel to retry')
+    })
+  }
   // Installation intent is durable; reconnecting nodes must not depend on a lost HTTP callback.
   if (process.env.KIN_CRS_MOCK !== '1') {
     let resuming = false

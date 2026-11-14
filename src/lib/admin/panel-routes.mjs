@@ -278,6 +278,7 @@ import { inspectClusterPayloadChanges, refreshClusterSlotPayloads } from '../clu
 import { readRawBody as defaultReadRawBody } from '../http/respond.mjs'
 import { corsHeadersForRequest } from '../http/cors.mjs'
 import { createCragShopHandler, cragShopRoute, isCragShopPath } from './crag-shop.mjs'
+import { createCragSubscriptionHandler, cragSubscriptionRoute } from './crag-subscription-routes.mjs'
 import { restartRustKernel, syncClaudeKernelConfigs, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 
 import { countTokensViaWorker, syncClaudeClientCredentials } from '../transport/go-worker-client.mjs'
@@ -664,6 +665,13 @@ export function createPanelHandler(ctx) {
   const handleCragShop = createCragShopHandler({
     getDb: ctx.getDb,
     dataDir: cfg?.paths?.data,
+    publicBaseUrl: cfg?.base_url,
+    json,
+    readRawBody,
+  })
+  const handleCragSubscription = createCragSubscriptionHandler({
+    subscription: ctx.cragSubscription,
+    getVm: (id) => (isValidVmId(id) ? getVm(cfg.paths.project, id) : null),
     publicBaseUrl: cfg?.base_url,
     json,
     readRawBody,
@@ -1612,6 +1620,9 @@ export function createPanelHandler(ctx) {
           }).body,
         )
       }
+      const subscriptionRoute = cragSubscriptionRoute(req.method, p)
+      if (subscriptionRoute) return handleCragSubscription(req, res, subscriptionRoute)
+
       if (
         denyIfUserMissesVm(req, res, {
           projectRoot: cfg.paths.project,
