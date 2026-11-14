@@ -165,8 +165,7 @@ export function trackCallerSystemBlock(system, declaration) {
   }
 }
 
-/** Caller tail only. Drops non-text blocks, cache_control and billing lines. */
-export function callerSystemTail(system) {
+function callerSystemBlocks(system) {
   const parts = []
   for (const block of systemBlocks(system)) {
     const text = textOf(block)
@@ -176,9 +175,20 @@ export function callerSystemTail(system) {
       .filter((line) => !BILLING_LINE.test(line.trim()))
       .join('\n')
       .trim()
-    if (kept) parts.push(kept)
+    if (kept) {
+      const part = { type: 'text', text: kept }
+      if (block?.cache_control != null) part.cache_control = block.cache_control
+      parts.push(part)
+    }
   }
-  return parts.join('\n\n')
+  return parts
+}
+
+/** Caller tail only. Drops non-text blocks, cache_control and billing lines. */
+export function callerSystemTail(system) {
+  return callerSystemBlocks(system)
+    .map((block) => block.text)
+    .join('\n\n')
 }
 
 function stripCallerPromptAlias(body) {
@@ -239,6 +249,7 @@ export function prepareCragPrintBody(
   if (capabilities !== undefined && (!Array.isArray(capabilities) || !capabilities.includes(`prompt_${mode}`)))
     return out
   const nativeV3 = Array.isArray(capabilities) && capabilities.includes('generation_controls_v3')
+  const textCache = nativeV3 && capabilities.includes('system_text_cache_v3')
   if (
     nativeV3 &&
     !officialPassthrough &&
@@ -249,7 +260,7 @@ export function prepareCragPrintBody(
         (!block ||
           block.type !== 'text' ||
           typeof block.text !== 'string' ||
-          Object.keys(block).some((key) => !['type', 'text'].includes(key))),
+          Object.keys(block).some((key) => !['type', 'text'].includes(key) && !(textCache && key === 'cache_control'))),
     )
   ) {
     const message =
@@ -274,5 +285,9 @@ export function prepareCragPrintBody(
     throw cragPromptTooLarge(Buffer.byteLength(tail, 'utf8'))
   }
   out.crag_prompt = { mode, text: tail }
+  if (textCache) {
+    const blocks = callerSystemBlocks(body?.system)
+    if (blocks.some((block) => block.cache_control != null)) out.crag_prompt.blocks = blocks
+  }
   return out
 }
