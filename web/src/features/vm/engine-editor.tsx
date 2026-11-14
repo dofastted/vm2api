@@ -172,7 +172,7 @@ function SlotKernelSwitch({
   const switchToastId = `vm-kernel-switch-${id}`
   const kvm = vm.runtime_type === 'kvm'
   const nativeMac = vm.node_platform === 'darwin'
-  const blocked = kvm || nativeMac
+  const blocked = nativeMac
   const onV2 =
     vm.resolved_dataplane === 'crag' && vm.resolved_crag_kernel_version === 'v2'
   const onCli =
@@ -363,7 +363,7 @@ function SlotKernelSwitch({
       </p>
       {blocked ? (
         <p className='text-xs text-muted-foreground'>
-          {kvm ? 'KVM 槽不运行 CRAG v2' : 'macOS 原生节点不运行 CRAG v2'}
+          macOS 原生节点不运行 CRAG v2
         </p>
       ) : null}
       {!blocked ? (
@@ -416,7 +416,7 @@ function SlotKernelSwitch({
             <p>
               {vm.status !== 'running'
                 ? '仅修改本槽内核配置，VM 保持当前停机状态，下次启动生效。'
-                : remote
+                : remote && !kvm
                   ? '重建本槽容器以更换内核命令，并等待内核就绪。'
                   : '切换并重启本槽内核，必要时重建容器。'}
               保留凭证和数据，不影响其他槽；原有调度关闭设置不变。
