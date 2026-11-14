@@ -35,6 +35,7 @@ import { parseCodexImportPayload, upsertCodexAccount, readCodexAccounts } from '
 import { generateAuthUrl, exchangeAuthCode, normalizeOauthFlavor } from '../oauth/oauth-auth-url.mjs'
 import { sessionKeyToOAuth, panelImportErrorPayload } from '../oauth/cookie-auth.mjs'
 import { enrichOauthIdentity } from '../oauth/oauth-identity.mjs'
+import { exchangedOnController } from '../oauth/guest-oauth-helper.mjs'
 import { generateCodexAuthUrl, exchangeCodexAuthCode } from '../oauth/codex-oauth.mjs'
 import {
   completeClaudeSetupToken,
@@ -5054,7 +5055,8 @@ export function createPanelHandler(ctx) {
               projectRoot: cfg.paths.project,
               routing: ctx.routingConfig,
             })
-            oauthFromVm = true
+            // Controller fallback (pre-telemetry slot kernel): fill identity through the bound SOCKS as before.
+            oauthFromVm = !exchangedOnController(oauth)
             if (inference) {
               oauth.type = 'setup-token'
               oauth.mode = 'setup-token'
@@ -5256,7 +5258,6 @@ export function createPanelHandler(ctx) {
               code,
             })
           } else {
-            oauthFromVm = true
             oauth = await exchangeAuthCode({
               sessionId: sessionKey,
               code,
@@ -5265,6 +5266,8 @@ export function createPanelHandler(ctx) {
               projectRoot: cfg.paths.project,
               routing: ctx.routingConfig,
             })
+            // Controller fallback (pre-telemetry slot kernel): fill identity through the bound SOCKS as before.
+            oauthFromVm = !exchangedOnController(oauth)
           }
           if (looksLikeOfficialSetupToken(code) || oauth.flavor === SETUP_TOKEN_FLAVOR) {
             oauth.type = 'official-setup-token'
