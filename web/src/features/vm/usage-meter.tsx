@@ -1,7 +1,7 @@
 import type { Vm } from '@/types/panel-vm'
 import { fableState } from '@/lib/fable-status'
 import { cn } from '@/lib/utils'
-import { claudeTier } from '@/lib/vm-status'
+import { isCodexVm } from '@/lib/vm-kind'
 
 /** 用量条统一朝一个方向：值越高越危险。四档对应状态轴。 */
 export type RiskLevel = 'ok' | 'caution' | 'warn' | 'bad'
@@ -104,17 +104,15 @@ export type FableRow =
   { kind: 'bar'; pct: number } | { kind: 'note'; text: string }
 
 /**
- * Max 账号的 Fable 额度。Pro 没有这个窗口，返回 null 时不占位。
+ * Claude 凭证的 Fable 额度；没有实测读数时展示状态，不画百分比。
  *
  * 「拒 / 满」这些态没有百分比，此时返回 `note` 走文案而不是画满格条——
  * 满格红条在一个 5h/7d 都是 0% 的号上会被误读成「烧满了」，
  * 而实际含义是「这个号根本用不了 Fable」。
  */
 export function fableRow(vm: Vm): FableRow | null {
-  const tier = claudeTier(vm)
-  if (tier.key !== 'max') return null
-  const st = fableState(vm, tier.key)
+  if (!vm.has_token || isCodexVm(vm)) return null
+  const st = fableState(vm)
   if (st.usedPct != null) return { kind: 'bar', pct: st.usedPct }
-  if (st.tone.key === 'none') return null
   return { kind: 'note', text: st.tone.text }
 }

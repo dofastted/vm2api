@@ -16,6 +16,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { kernelBinPath } from '../transport/rust-kernel-supervisor.mjs'
 import { isCodexVm } from './vm-kind.mjs'
+import { isKvmRuntime } from './runtime-kind.mjs'
 import { nativeCliForVm, NATIVE_CLI_FILES } from './native-cli.mjs'
 import { resolveKernelDataplane } from './slot-engine.mjs'
 import { checkCragLicense, decodeLicenseBytes } from './crag-license.mjs'
@@ -418,10 +419,11 @@ function publishCragTree(src, dest) {
   }
 }
 
-function cragV2WouldChange(src, destDir) {
+function cragV2WouldChange(src, destDir, select = true) {
   const destRoot = path.join(destDir, CRAG_V2_DIR)
   if (!filesEqual(path.join(src, 'manifest.json'), path.join(destRoot, 'manifest.json'))) return true
   if (verifyCragV2Tree(destRoot, { allowPreviousClaude: true }).ok !== true) return true
+  if (!select) return false
   try {
     const wrapper = fs.lstatSync(path.join(destDir, WRAP_KERNEL_WRAPPER))
     if (!wrapper.isFile() || !(wrapper.mode & 0o111)) return true
@@ -449,7 +451,7 @@ function writeCragV2Wrapper(destDir) {
   }
 }
 
-export function materializeCragV2(projectRoot, vm, { uid = null, gid = null } = {}) {
+export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, select = true } = {}) {
   if (!projectRoot || !vm?.id) {
     return { ok: false, code: 'vm_required', error: 'projectRoot and vm id required' }
   }
@@ -470,8 +472,12 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null } = 
   }
   const verified = verifyCragV2Tree(src)
   if (!verified.ok) return verified
-  const licensed = checkCragLicense(projectRoot, { ...vm, dataplane: 'crag', crag_kernel_version: 'v2' })
-  if (!licensed.ok) return licensed
+  // Preinstallation only copies encrypted distribution files. Selecting the entry
+  // still requires authorization, including when those files already exist.
+  if (select) {
+    const licensed = checkCragLicense(projectRoot, { ...vm, dataplane: 'crag', crag_kernel_version: 'v2' })
+    if (!licensed.ok) return licensed
+  }
   // The node receives this tree, including native Claude Code, through the CRAG package push.
   if (clusterDockerSlot(vm)) {
     return {
@@ -492,7 +498,7 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null } = 
   }
   const dest = wrapCliHomeDir(projectRoot, vm.id)
   fs.mkdirSync(dest, { recursive: true })
-  if (!cragV2WouldChange(src, dest)) {
+  if (!cragV2WouldChange(src, dest, select)) {
     try {
       fs.chmodSync(path.join(dest, CRAG_V2_DIR), 0o755)
     } catch {}
@@ -514,7 +520,7 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null } = 
   const tree = stageCragV2Tree(src, path.join(dest, CRAG_V2_DIR))
   if (!tree.ok) return tree
   try {
-    writeCragV2Wrapper(dest)
+    if (select) writeCragV2Wrapper(dest)
   } catch (error) {
     tree.rollback()
     return { ok: false, code: 'crag_v2_stage_failed', error: String(error?.message || error) }
@@ -529,7 +535,7 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null } = 
     kernel_version: 'v2',
     runtime_variant: 'crag-v2',
     changed: true,
-    kernel_changed: true,
+    kernel_changed: select,
     glibc_shim: false,
     wrapper: isFile(path.join(dest, WRAP_KERNEL_WRAPPER)),
     kernel_bin: isFile(path.join(dest, CRAG_V2_DIR, CRAG_V2_ENTRY)),
@@ -883,6 +889,10 @@ export function materializeWrapCli(projectRoot, vm, { uid = null, gid = null, na
   if (!status.ok) return status
   const native = nativeCliForVm(vm, src, nativeCliOptions)
   if (native && !native.ok) return native
+  if (isKvmRuntime(vm) && !isCodexVm(vm) && !clusterDockerSlot(vm)) {
+    const crag = materializeCragV2(projectRoot, vm, { uid, gid, select: false })
+    if (!crag.ok) return crag
+  }
   const dest = wrapCliHomeDir(projectRoot, vm.id)
   fs.mkdirSync(dest, { recursive: true })
   const kernelChanged = installKernelPayload(src, dest, projectRoot)

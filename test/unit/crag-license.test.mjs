@@ -13,6 +13,7 @@ import {
   verifyCragRegistration,
 } from '../../src/lib/vm/crag-license.mjs'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
+import { bindPlacement, unbindPlacement } from '../../src/lib/cluster/placement.mjs'
 import { dispatchCallInference } from '../../src/lib/transport/kernel-router.mjs'
 import { callRustKernel, isNeedsRefreshResult, streamRustKernel } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { writeKernelConfig } from '../../src/lib/transport/rust-kernel-supervisor.mjs'
@@ -131,34 +132,82 @@ test('universal CRAGU1 activates without creating a device binding', async (t) =
   assert.deepEqual(fs.readFileSync(path.join(dir, 'registration.code')), stored)
 })
 
-test('cluster slot uses the universal grant and rejects a device code', async (t) => {
-  const { root } = fixture(t)
-  const cluster = { id: 'vm-remote', status: 'running', dataplane: 'crag', node_id: 'node-1' }
-  fs.mkdirSync(path.join(root, 'vms', cluster.id), { recursive: true })
-  fs.writeFileSync(path.join(root, 'vms', `${cluster.id}.json`), JSON.stringify(cluster))
-  const before = await route(root, 'GET', '/crag-license', null, 'admin', cluster.id)
-  assert.equal(before.status, 200)
-  assert.notEqual(before.body.error?.code, 'crag_v2_unsupported_placement')
-  const device = await route(
-    root,
-    'POST',
-    '/crag-license',
-    { registration_code: 'CRAGL1.not-a-grant' },
-    'admin',
-    cluster.id,
-  )
-  assert.equal(device.status, 400)
-  assert.equal(device.body.error.code, 'crag_v2_unsupported_placement')
-  const issued = issueUniversalCode(root)
-  const activated = await route(root, 'POST', '/crag-license', { registration_code: issued.code }, 'admin', cluster.id)
-  assert.equal(activated.status, 200)
-  assert.equal(activated.body.data.license.valid, true)
-  assert.equal(activated.body.data.license.kind, 'offline')
-  const current = await route(root, 'GET', '/crag-license', null, 'admin', cluster.id)
-  assert.equal(current.status, 200)
-  assert.equal(current.body.data.license.valid, true)
-  assert.equal(current.body.data.license.scope, 'kernel')
-})
+for (const [placement, extra] of [
+  ['local KVM', { runtime: { type: 'kvm' } }],
+  ['cluster Docker', { node_id: 'node-1' }],
+  ['cluster KVM', { node_id: 'node-1', runtime: { type: 'kvm' } }],
+  ['remote legacy KVM', { node_id: 'node-1', runtime_type: 'kvm' }],
+]) {
+  test(`${placement} uses the universal grant without creating a device binding or switching kernels`, async (t) => {
+    const { root } = fixture(t)
+    const vm = { id: 'vm-universal', status: 'stopped', dataplane: 'wrap', schedule_off: true, ...extra }
+    fs.mkdirSync(path.join(root, 'vms', vm.id), { recursive: true })
+    const vmPath = path.join(root, 'vms', `${vm.id}.json`)
+    fs.writeFileSync(vmPath, JSON.stringify(vm))
+    const record = fs.readFileSync(vmPath)
+    const before = await route(root, 'GET', '/crag-license', null, 'admin', vm.id)
+    assert.equal(before.status, 200)
+    assert.equal(before.body.data.machine_code, '')
+    assert.equal(before.body.data.license.valid, false)
+    const issued = issueUniversalCode(root)
+    const activated = await route(root, 'POST', '/crag-license', { registration_code: issued.code }, 'admin', vm.id)
+    assert.equal(activated.status, 200)
+    assert.equal(activated.body.data.license.valid, true)
+    assert.equal(activated.body.data.license.kind, 'offline')
+    const current = await route(root, 'GET', '/crag-license', null, 'admin', vm.id)
+    assert.equal(current.status, 200)
+    assert.equal(current.body.data.license.valid, true)
+    assert.equal(current.body.data.license.scope, 'kernel')
+    assert.equal(current.body.data.machine_code, '')
+    assert.doesNotMatch(JSON.stringify(current.body), /CRAGU1|private_key|wrapped_key|ciphertext/)
+    const grant = path.join(cragUniversalDirectory(root), 'registration.code')
+    const registration = fs.readFileSync(grant)
+    const device = await route(
+      root,
+      'POST',
+      '/crag-license',
+      { registration_code: 'CRAGL1.not-a-grant' },
+      'admin',
+      vm.id,
+    )
+    assert.equal(device.status, 400)
+    assert.equal(device.body.error.code, 'crag_v2_unsupported_placement')
+    assert.match(device.body.error.message, /CRAGU1/)
+    assert.deepEqual(fs.readFileSync(grant), registration)
+    assert.equal(checkCragLicense(root, { ...vm, dataplane: 'crag' }).ok, true)
+    assert.equal(fs.existsSync(path.join(cragLicenseDirectory(root, vm), 'device.json')), false)
+    assert.deepEqual(fs.readFileSync(vmPath), record)
+    if (!vm.node_id) {
+      const dir = cragLicenseDirectory(root, vm)
+      assert.equal(fs.statSync(dir).mode & 0o777, 0o700)
+      assert.equal(fs.statSync(path.join(dir, 'registration.code')).mode & 0o777, 0o600)
+    }
+    for (const method of ['GET', 'POST']) {
+      const denied = await route(root, method, '/crag-license', { registration_code: issued.code }, 'super', vm.id)
+      assert.equal(denied.status, 403)
+      assert.equal(denied.body.error.code, 'forbidden')
+    }
+  })
+}
+
+for (const [placement, extra] of [
+  ['Codex', { platform: 'openai', runtime: { type: 'kvm' } }],
+  ['native macOS', { node_id: 'node-mac', node_platform: 'darwin' }],
+]) {
+  test(`${placement} still rejects CRAG license status and activation`, async (t) => {
+    const { root, vm } = fixture(t)
+    bindPlacement({ projectRoot: root, manager: { nodePlatform: () => 'darwin' } })
+    t.after(unbindPlacement)
+    fs.writeFileSync(path.join(root, 'vms', `${vm.id}.json`), JSON.stringify({ ...vm, ...extra }))
+    const issued = issueUniversalCode(root)
+    for (const method of ['GET', 'POST']) {
+      const denied = await route(root, method, '/crag-license', { registration_code: issued.code })
+      assert.equal(denied.status, 400)
+      assert.equal(denied.body.error.code, 'crag_v2_unsupported_placement')
+    }
+    assert.equal(fs.existsSync(cragUniversalDirectory(root)), false)
+  })
+}
 
 test('a cluster slot reuses a CRAGU1 stored on a local slot when the installation file is missing', (t) => {
   const { root, vm } = fixture(t)

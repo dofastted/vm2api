@@ -10,8 +10,17 @@ export const SMART_LOAD_WEIGHT = 1
 export const SMART_QUOTA_WEIGHT = 0.8
 export const SMART_FAILURE_WEIGHT = 1
 export const SMART_LATENCY_WEIGHT = 0.5
-export const SMART_SCORE_TOLERANCE = 0.05
+export const SMART_SCORE_TOLERANCE = 0.15
 export const SMART_LATENCY_HALF_SCORE_MS = 10_000
+/** 重置紧迫度因子权重；VM2API_CODEX_RESET_WEIGHT=0 可整体关闭。 */
+export const SMART_RESET_WEIGHT = (() => {
+  const n = Number(process.env.VM2API_CODEX_RESET_WEIGHT)
+  return Number.isFinite(n) && n >= 0 ? n : 1
+})()
+/** 基准：需要在 24 小时内烧完剩余 7d 额度 = 满分 1.0。 */
+export const SMART_RESET_BURN_REF_HOURS = 24
+/** 库存（7d 余量）权重：低于 reset 的 1.0，只作安全带（防止没有重置时间的号被误奖）。 */
+export const SMART_STOCK_WEIGHT = 0.3
 
 const STRATEGIES = new Set(['smart', 'quota_reset_priority', 'round_robin', 'sticky'])
 
@@ -36,23 +45,46 @@ export function capacityUtilization(candidate, defaultConcurrency) {
   return Number(candidate?.inFlight || 0) / effectiveConcurrency(candidate, defaultConcurrency)
 }
 
-export function smartScore(candidate, defaultConcurrency) {
+/**
+ * 剩余额度在 7d 重置前被烧完的紧迫度，0..1。
+ * 无 7d 重置时间 / 重置时间已过 / 已无剩余额度 → 0（中性，不奖励也不惩罚）。
+ */
+export function resetBurnFactor(candidate, now) {
+  const resetAt = Number(candidate?.quotaReset7dAt)
+  const remaining = Number(candidate?.quotaRemaining7d)
+  if (!Number.isFinite(resetAt) || !Number.isFinite(remaining)) return 0
+  if (!(remaining > 0)) return 0
+  const hours = (resetAt - now) / 3_600_000
+  if (!(hours > 0)) return 0
+  const burn = Math.min(1, Math.max(0, remaining)) / hours
+  return Math.min(1, burn * SMART_RESET_BURN_REF_HOURS)
+}
+
+export function smartScore(candidate, defaultConcurrency, now = Date.now()) {
   const load = 1 - Math.min(1, Math.max(0, capacityUtilization(candidate, defaultConcurrency)))
   const rank = candidate?.quotaRemainingRank
   const quota =
     rank == null || !Number.isFinite(Number(rank)) ? 0.5 : Math.min(10_000, Math.max(0, Number(rank))) / 10_000
+  const stockRank = candidate?.quotaStockRank
+  const stock =
+    stockRank == null || !Number.isFinite(Number(stockRank))
+      ? 0.5
+      : Math.min(10_000, Math.max(0, Number(stockRank))) / 10_000
   const failureBps = Math.min(10_000, Math.max(0, Number(candidate?.failureRateBps || 0)))
   const failure = 1 - failureBps / 10_000
   const latencyMs = Number(candidate?.firstOutputLatencyMs)
   const latency =
     Number.isFinite(latencyMs) && latencyMs > 0
       ? SMART_LATENCY_HALF_SCORE_MS / (SMART_LATENCY_HALF_SCORE_MS + latencyMs)
-      : 1
+      : 0.5
+  const reset = resetBurnFactor(candidate, now)
   return (
     SMART_LOAD_WEIGHT * load +
     SMART_QUOTA_WEIGHT * quota +
     SMART_FAILURE_WEIGHT * failure +
-    SMART_LATENCY_WEIGHT * latency
+    SMART_LATENCY_WEIGHT * latency +
+    SMART_STOCK_WEIGHT * stock +
+    SMART_RESET_WEIGHT * reset
   )
 }
 
@@ -134,7 +166,7 @@ function selectInBand(eligible, context) {
   }
   const scored = eligible.map((candidate) => ({
     candidate,
-    score: smartScore(candidate, fallbackConcurrency),
+    score: smartScore(candidate, fallbackConcurrency, Number(context.now) || Date.now()),
   }))
   const best = scored.reduce((max, item) => (item.score > max ? item.score : max), -Infinity)
   const band = scored

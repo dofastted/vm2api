@@ -17,6 +17,7 @@ import {
   wrapCliTemplateDir,
 } from '../../src/lib/vm/wrap-cli-runtime.mjs'
 import { seedEncryptedPackage } from '../fixtures/crag-license.mjs'
+import { updateCrag } from '../../scripts/update-crag.mjs'
 
 const envNames = ['KIN_CRAG_V2_ROOT', 'KIN_WRAP_CLI_ROOT', 'KIN_KERNEL_BIN']
 const env = Object.fromEntries(envNames.map((name) => [name, process.env[name]]))
@@ -246,6 +247,64 @@ test('native pull atomically selects an immutable sibling without touching the r
   assert.equal(describeKernelCatalog(root)[1].version, '1.2.3')
   assert.equal(describeKernelCatalog(root)[1].ready, true)
 })
+
+for (const [label, tag, standalone, expected] of [
+  ['standalone latest', '', true, 'v2.0.2'],
+  ['standalone explicit version', 'v2.0.1', true, 'v2.0.1'],
+  ['panel application pin', '', false, 'v2.0.0'],
+]) {
+  test(`native ${label} installs the selected signed release with an older application pin`, {
+    skip: cragV2Arch() !== 'amd64',
+  }, async (t) => {
+    const root = fixture(t)
+    const releases = new Map()
+    let factory
+    for (const version of ['v2.0.2', 'v2.0.1', 'v2.0.0']) {
+      factory = seedEncryptedPackage(root, { revision: version })
+      releases.set(version, { bytes: archive(factory), manifest: fs.readFileSync(path.join(factory, 'manifest.json')) })
+    }
+    fs.mkdirSync(path.join(root, 'deploy'))
+    fs.writeFileSync(path.join(root, 'deploy/payload.json'), JSON.stringify({ crag_release: 'v2.0.0' }))
+    fs.mkdirSync(path.join(root, 'src/config'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'src/config/routing.json'), '{}')
+    fs.mkdirSync(path.join(root, 'vms'))
+    const before = snapshot(factory)
+    const versions = [...releases.keys()]
+    const fetchImpl = async (url) => {
+      const endpoint = new URL(url).pathname
+      if (endpoint.includes('/releases/assets/')) {
+        const version = versions[Number(endpoint.split('/').at(-1)) - 1]
+        return new Response(releases.get(version).bytes)
+      }
+      const version = endpoint.endsWith('/latest') ? 'v2.0.2' : endpoint.split('/').at(-1)
+      const release = releases.get(version)
+      return new Response(
+        JSON.stringify({
+          tag_name: version,
+          assets: [
+            {
+              name: CRAG_V2_RELEASE_ASSET,
+              size: release.bytes.length,
+              url: `https://api.github.com/repos/dofastted/claude-code/releases/assets/${versions.indexOf(version) + 1}`,
+            },
+          ],
+        }),
+      )
+    }
+    const pull = (projectRoot, options) => pullKernelRelease(projectRoot, options, { fetchImpl })
+    const result = standalone
+      ? await updateCrag(root, { tag, pull, api: () => assert.fail('an empty fleet must not be paused or restarted') })
+      : await pull(root, { kernel: 'crag', tag })
+    assert.equal(result.ok, true, result.error)
+    assert.equal(result.release.tag, expected)
+    assert.deepEqual(
+      fs.readFileSync(path.join(cragV2PackageRoot(root), 'manifest.json')),
+      releases.get(expected).manifest,
+    )
+    assert.deepEqual(snapshot(factory), before)
+    assert.equal(fs.readdirSync(path.join(root, 'vms')).length, 0)
+  })
+}
 
 const nativeMutations = [
   [

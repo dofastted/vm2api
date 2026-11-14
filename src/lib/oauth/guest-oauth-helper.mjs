@@ -1,13 +1,13 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { slotHost } from '../vm/slot-host.mjs'
+import { hostProxyUrlForVm, slotHost } from '../vm/slot-host.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
 import { slotExec, startSlotReady } from '../vm/slot-runtime.mjs'
 import { getVm, patchVmRecord } from '../vm/vm-registry.mjs'
 import { hasBoundExit } from '../vm/egress.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
-import { postRustKernelTelemetryEvent, rustKernelPaths } from '../transport/rust-kernel-client.mjs'
+import { postRustKernelTelemetryEvent, rustKernelHealth, rustKernelPaths } from '../transport/rust-kernel-client.mjs'
 import { runSlotProcess } from '../transport/slot-oauth.mjs'
 
 const pendingAttempt = Symbol('guestOAuthAttempt')
@@ -24,6 +24,7 @@ export async function prepareSlotOAuth({
   routing = {},
   timeoutMs,
   startReady = startSlotReady,
+  readHealth = rustKernelHealth,
 } = {}) {
   if (!projectRoot || !exec?.vmId || (exec.vm?.id && exec.vm.id !== exec.vmId)) {
     throw fail('oauth_vm_required', 'OAuth requires a target VM execution context')
@@ -36,19 +37,17 @@ export async function prepareSlotOAuth({
   if (blocked || !hasBoundExit(vm.proxy)) {
     throw fail(blocked || 'proxy_required', 'OAuth requires the target VM bound egress')
   }
+  Object.assign(exec, slotExec(projectRoot, vm))
+  const health = await readHealth(exec, { timeoutMs: 1000 })
+  // Legacy kernels cannot gain telemetry by restarting. Exchange through the
+  // same bound exit on the controller before entering the slot startup path.
+  if (health?.vm_telemetry !== true || health?.telemetry_ready !== true) {
+    const proxyUrl = hostProxyUrlForVm(vm)
+    if (proxyUrl == null) throw fail('proxy_required', 'OAuth requires the target VM bound egress')
+    return { exec, host, controlPlane: true, proxyUrl }
+  }
   const boot = await startReady(vm, projectRoot, { routing, allowMissingCredential: true, timeoutMs })
-  // startSlotReady nests the kernel result: boot.rust = { ok, engine, rust: { ok, reason, health } }.
-  // startReady is injectable, so accept a flat boot.rust.health as well.
-  const kernel = boot?.rust?.rust || boot?.rust
-  const health = kernel?.health || boot?.rust?.health
-  if (
-    !boot?.ok ||
-    boot.rust_ok === false ||
-    !boot.rust?.ok ||
-    boot.rust.skipped ||
-    health?.vm_telemetry !== true ||
-    health?.telemetry_ready !== true
-  ) {
+  if (!boot?.ok || boot.rust_ok === false || !boot.rust?.ok || boot.rust.skipped) {
     throw fail(boot?.rust?.code || boot?.code || 'oauth_runtime_not_ready', 'Target VM native CLI is not ready')
   }
   const patch = { ...(boot.runtime ? { runtime: boot.runtime } : {}), status: 'running' }
@@ -99,9 +98,8 @@ export async function runGuestOAuthAuthService(
   const context = await prepare({ exec, projectRoot, routing, timeoutMs })
   const { host, configDir, home } = context
   exec = context.exec
-  // The approved Linux cutover must not change macOS non-telemetry behavior.
-  // This is an explicit native-host path, never a Linux execution fallback.
   if (host.native) return runNative(payload)
+  if (context.controlPlane) return runNative({ ...payload, proxy_url: context.proxyUrl })
   const bin = host.bins.oauthAuth
   if (!bin) throw fail('oauth_auth_bin_missing', 'Target VM OAuth helper is not installed')
   const argv = slotExecArgv(exec.vm, [bin], {

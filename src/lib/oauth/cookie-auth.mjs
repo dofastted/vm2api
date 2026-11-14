@@ -1,6 +1,7 @@
 /**
- * Linux exchanges execute kin-oauth-auth in the target VM. The native macOS
- * path preserves its existing helper; auth.js is loaded only by fetch test seams.
+ * Linux exchanges use the target VM when native telemetry is ready; older
+ * kernels use the controller helper through that VM's bound exit. The native
+ * macOS path is unchanged; auth.js is loaded only by fetch test seams.
  */
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'

@@ -201,4 +201,5 @@ link_payload
 apply_identity
 apply_resolv
 write_slot_env
+python3 /usr/local/sbin/kin-crag-apparmor
 log "ready uid=$KIN_KVM_UID gid=$KIN_KVM_GID host=${KIN_KVM_HOSTNAME:-} shares=${KIN_KVM_SHARES:-}"

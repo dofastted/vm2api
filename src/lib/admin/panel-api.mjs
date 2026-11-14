@@ -1069,11 +1069,12 @@ export async function buildClaudeResetQuery({ cfg, id, transport, now } = {}) {
   })
 }
 
-export async function buildClaudeResetRedeem({ cfg, id, idempotencyKey, transport, now } = {}) {
+export async function buildClaudeResetRedeem({ cfg, id, idempotencyKey, card, transport, now } = {}) {
   const result = await redeemClaudeResetCredit({
     projectRoot: cfg.paths.project,
     vmId: id,
     idempotencyKey,
+    card,
     ...(transport ? { transport } : {}),
     ...(now ? { now } : {}),
   })

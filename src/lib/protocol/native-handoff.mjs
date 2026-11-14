@@ -202,6 +202,14 @@ export function createNativeHandoffState({ nativeHandoff = true } = {}) {
       return failure ? null : providerResult
     },
     get errorBody() {
+      // V1 metadata already contains the public provider error and outranks
+      // later CLI diagnostics. V2 observations remain private to the gateway.
+      if (!failure && nativeHandoff && providerResult?.schema_version !== 2 && providerResult?.error)
+        return {
+          type: 'error',
+          error: providerResult.error,
+          ...(providerResult.request_id ? { request_id: providerResult.request_id } : {}),
+        }
       if (observedError) return observedError
       if (!failure && nativeHandoff && providerResult?.error)
         return {

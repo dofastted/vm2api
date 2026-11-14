@@ -8,7 +8,13 @@ import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { generateAuthUrl, peekAuthUrlSession, resetAuthUrlSessions } from '../../src/lib/oauth/oauth-auth-url.mjs'
+import {
+  exchangeAuthCode,
+  generateAuthUrl,
+  peekAuthUrlSession,
+  resetAuthUrlSessions,
+} from '../../src/lib/oauth/oauth-auth-url.mjs'
+import { sessionKeyToOAuth } from '../../src/lib/oauth/cookie-auth.mjs'
 import { CLIENT_ID, FULL_OAUTH_SCOPE, REDIRECT_URI, TOKEN_UA } from '../../src/lib/oauth/oauth-contract.mjs'
 import { prepareSlotOAuth, runGuestOAuthAuthService } from '../../src/lib/oauth/guest-oauth-helper.mjs'
 import { slotExec } from '../../src/lib/vm/slot-runtime.mjs'
@@ -16,6 +22,8 @@ import { slotExec } from '../../src/lib/vm/slot-runtime.mjs'
 test('guest OAuth helper preserves provider state, PKCE and cookie authorization', {
   timeout: 30000,
 }, async (t) => {
+  const binary = fileURLToPath(new URL('../../bin/kin-oauth-auth', import.meta.url))
+  fs.accessSync(binary, fs.constants.X_OK)
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-authorize-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   t.after(resetAuthUrlSessions)
@@ -187,7 +195,6 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
     }),
   )
   const exec = slotExec(root, vm)
-  const binary = fileURLToPath(new URL('../../bin/kin-oauth-auth', import.meta.url))
   // Only guest process execution is substituted. The shipped provider engine
   // talks to the real TLS/SOCKS fixture; this does not prove Docker isolation.
   const run = (payload) =>
@@ -204,6 +211,7 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
         prepare: (options) =>
           prepareSlotOAuth({
             ...options,
+            readHealth: async () => ({ ok: true, vm_telemetry: true, telemetry_ready: true }),
             startReady: async () => ({
               ok: true,
               rust_ok: true,
@@ -347,4 +355,41 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
     })
   }
   assert.equal(tokenRequests, 5)
+  await t.test(
+    'legacy kernel authorization-link and Cookie exchanges use the real helper and bound SOCKS exit',
+    async (t) => {
+      const previousCert = process.env.NODE_EXTRA_CA_CERTS
+      process.env.NODE_EXTRA_CA_CERTS = cert
+      t.after(() => {
+        if (previousCert === undefined) delete process.env.NODE_EXTRA_CA_CERTS
+        else process.env.NODE_EXTRA_CA_CERTS = previousCert
+      })
+      const generated = generateAuthUrl({ vmId: vm.id, proxyUrl: 'socks5h://127.0.0.1:1' })
+      const url = new URL(generated.auth_url)
+      expectedExchange = {
+        code: 'legacy-auth-code',
+        challenge: url.searchParams.get('code_challenge'),
+        redirectUri: url.searchParams.get('redirect_uri'),
+        state: 'legacy-provider-state',
+      }
+      const before = tokenRequests
+      const vmFile = path.join(root, 'vms', `${vm.id}.json`)
+      const vmBefore = fs.readFileSync(vmFile, 'utf8')
+      const linked = await exchangeAuthCode({
+        sessionId: generated.session_id,
+        code: `${expectedExchange.code}#${expectedExchange.state}`,
+        vmId: vm.id,
+        exec,
+      })
+      assert.equal(linked.access_token, accessToken)
+      assert.equal(linked.email, 'exchange@example.test')
+      assert.equal(peekAuthUrlSession(generated.session_id), null)
+      authorizeMode = 'success'
+      const cookie = await sessionKeyToOAuth(sessionKey, { exec, proxyUrl: 'socks5h://127.0.0.1:1' })
+      assert.equal(cookie.access_token, accessToken)
+      assert.equal(cookie.email, 'exchange@example.test')
+      assert.equal(tokenRequests, before + 2)
+      assert.equal(fs.readFileSync(vmFile, 'utf8'), vmBefore)
+    },
+  )
 })

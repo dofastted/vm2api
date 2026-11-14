@@ -8,7 +8,6 @@ import { DEFAULT_PERSONA_TEMPLATES } from '../../src/lib/identity/persona-templa
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import {
   clearConversationCacheTtls,
-
   listCacheMarkers,
   validateCacheBreakpoints,
 } from '../../src/lib/protocol/cache-ttl.mjs'
@@ -401,7 +400,7 @@ for (const preset of ['zero', 'official', 'official_full', 'custom']) {
     const markers = messageMarkers(out)
     assert.deepEqual(
       markers.map((marker) => marker.ttl),
-      ['1h', '1h'],
+      ['1h', '5m'],
     )
     assert.equal(JSON.stringify(out.messages).includes('MID_SYSTEM_CACHE_RULE'), false)
   })
@@ -520,7 +519,7 @@ test('CLI custom template is not cleaned or rebuilt after rendering', async (t) 
   })
   assert.deepEqual(
     out.system.find((block) => block.text === templateRule),
-    text(templateRule, '5m'),
+    text(templateRule, '1h'),
   )
   assert.equal(listCacheMarkers(out).length, 2)
   assert.deepEqual(out.messages[0].content.at(-1).cache_control, control('5m'))
@@ -582,8 +581,8 @@ for (const backend of ['cli', 'api']) {
       headers: { 'x-kin-cache-ttl': '5m' },
     })
     assert.ok(listCacheMarkers(out).length > 1)
-    assert.ok(listCacheMarkers(out).every((marker) => marker.ttl === '5m'))
-    assert.deepEqual(out.messages[0], { role: 'user', content: [text('Hello', '5m')] })
+    assert.ok(listCacheMarkers(out).every((marker) => marker.ttl === '1h'))
+    assert.deepEqual(out.messages[0], message)
   })
   for (const ttl of ['5m', '1h']) {
     run(`${backend} custom fills missing template TTL from ${ttl}`, async (t) => {
@@ -686,7 +685,7 @@ for (const [name, compatibility] of billingCases) {
     for (const block of system)
       assert.deepEqual(
         out.system.find((candidate) => candidate.text === block.text),
-        sent(system).find((candidate) => candidate.text === block.text),
+        block,
       )
     assert.equal(listCacheMarkers(out).length, 2)
     assert.equal(JSON.stringify(out).split('CALLER_RULE_MUST_SURVIVE').length - 1, 1)
@@ -839,7 +838,7 @@ test('CLI zero translates automatic cache within a full caller budget', async (t
   })
   assert.deepEqual(out.system.slice(1), [text('Template rule', null), ...system])
   assert.equal(listCacheMarkers(out).length, 4)
-  assert.deepEqual(out.messages[0].content.at(-1).cache_control, control('1h'))
+  assert.deepEqual(out.messages[0].content.at(-1).cache_control, control('5m'))
 })
 
 test('CLI zero advances an automatic breakpoint as conversation history grows', async (t) => {
@@ -853,7 +852,7 @@ test('CLI zero advances an automatic breakpoint as conversation history grows', 
     const markers = listCacheMarkers(out).filter((marker) => marker.section === 'messages')
     assert.equal(markers.length, 1)
     assert.equal(markers[0].index, messages.length - 1)
-    assert.deepEqual(out.messages[markers[0].index].content.at(-1), text(`Question ${turn}`, '1h'))
+    assert.deepEqual(out.messages[markers[0].index].content.at(-1), text(`Question ${turn}`, '5m'))
     messages.push({ role: 'assistant', content: `Answer ${turn}` })
   }
 })

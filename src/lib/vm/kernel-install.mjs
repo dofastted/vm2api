@@ -190,11 +190,15 @@ export async function installKernelTargets({
           const unsupported = placementFailure(vm, target.kernel)
           if (unsupported) return failure(target, unsupported.code, unsupported.error)
           const desired = desiredVm(vm, target.kernel)
-          const product = (ops.describeKernelCatalog || describeKernelCatalog)(projectRoot).find(
-            (item) => item.id === target.kernel,
-          )
+          const catalog = (ops.describeKernelCatalog || describeKernelCatalog)(projectRoot)
+          const product = catalog.find((item) => item.id === target.kernel)
           if (!product?.ready)
             return failure(target, product?.code || 'kernel_package_missing', product?.error || '请先拉取所选内核')
+          if (isKvmRuntime(vm) && target.kernel !== 'crag') {
+            const crag = catalog.find((item) => item.id === 'crag')
+            if (!crag?.ready)
+              return failure(target, crag?.code || 'crag_v2_package_missing', crag?.error || '请先拉取 CRAG 预装包')
+          }
           if (target.kernel === 'crag') {
             const grant = (ops.checkCragLicense || checkCragLicense)(projectRoot, desired, routing)
             if (!grant.ok) return failure(target, grant.code || 'license_required', grant.error || '请先激活 CRAG 授权')

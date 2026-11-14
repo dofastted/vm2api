@@ -97,7 +97,7 @@ export async function updateCrag(
     const targets = inventory.filter((row) => row.action === 'sync')
     // This standalone updater reads local files/processes; node installs use the panel lifecycle.
     if (targets.some(({ vm }) => vm.node_id)) throw new Error('crag_v2_unsupported_placement')
-    const pulled = await pull(root, { kernel: 'crag', tag })
+    const pulled = await pull(root, { kernel: 'crag', tag, latest: true })
     if (!pulled.ok) throw new Error(pulled.code || 'crag_pull_failed')
     const src = cragV2PackageRoot(root)
     const verified = verifyCragV2Tree(src)

@@ -15,6 +15,7 @@ import {
   restoreUncommittedHop,
   semanticStatusForStreamError,
 } from '../../src/lib/transport/go-worker-client.mjs'
+import { prepareCliHopBody } from '../../src/lib/protocol/outbound-attempt.mjs'
 import { callerAutoCompactWindow, defaultSeedPolicy, sanitizeInboundBody } from '../../src/lib/protocol/seed-policy.mjs'
 import { extractOpenaiUsage } from '../../src/lib/protocol/openai-usage.mjs'
 import { callRustKernel, rustKernelHealth } from '../../src/lib/transport/rust-kernel-client.mjs'

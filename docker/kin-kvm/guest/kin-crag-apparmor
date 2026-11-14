@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Prepare the KVM kernel's AppArmor userns exception before a launch."""
+
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+MARKER = '# Managed by vm2api kin-crag-apparmor.'
+PROFILE_NAME = 'vm2api-crag'
+PROFILE = (MARKER + '\n'
+           'abi <abi/4.0>,\n'
+           'profile ' + PROFILE_NAME + ' flags=(unconfined) {\n'
+           '  userns,\n'
+           '}\n').encode()
+DROPIN = (MARKER + '\n'
+          '[Unit]\n'
+          'After=apparmor.service\n'
+          'Requires=apparmor.service\n'
+          '\n'
+          '[Service]\n'
+          'AppArmorProfile=' + PROFILE_NAME + '\n').encode()
+RESTART = ['systemctl', 'restart', 'kin-kernel.service']
+
+
+def result(status, reason, profile=PROFILE_NAME):
+    return {'ok': True, 'status': status, 'reason': reason, 'profile': profile}
+
+
+def fixed_path(root, name):
+    path = root / name.lstrip('/')
+    resolved = path.resolve()
+    if resolved != root and root not in resolved.parents:
+        raise RuntimeError('configured root contains an escaping symlink')
+    return path
+
+
+def read_optional(path):
+    try:
+        return path.read_text().strip()
+    except FileNotFoundError:
+        return None
+
+
+def snapshot(path):
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError('managed path is not a regular file: ' + str(path))
+    data = path.read_bytes()
+    if not data.splitlines() or data.splitlines()[0] != MARKER.encode():
+        raise RuntimeError('refusing to overwrite an operator-managed file: ' + str(path))
+    return data, stat.S_IMODE(metadata.st_mode)
+
+
+def atomic_write(path, data, mode=0o644):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'wb') as output:
+            os.fchmod(output.fileno(), mode)
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def restore(path, previous):
+    if previous is None:
+        path.unlink(missing_ok=True)
+    else:
+        atomic_write(path, previous[0], previous[1])
+
+
+def run(argv, action):
+    completed = subprocess.run(argv, text=True, capture_output=True, timeout=30)
+    if completed.returncode:
+        detail = completed.stderr.strip()[:500]
+        raise RuntimeError(action + ' failed (' + str(completed.returncode) + ')' + (': ' + detail if detail else ''))
+    return completed.stdout.strip()
+
+
+def command(name):
+    executable = shutil.which(name)
+    if executable is None:
+        raise RuntimeError(name + ' is required for the AppArmor userns exception')
+    return executable
+
+
+def remove_binding(dropin):
+    previous = snapshot(dropin)
+    if previous is None:
+        return result('skipped', 'not-crag-v2')
+    systemctl = command('systemctl')
+    dropin.unlink()
+    try:
+        run([systemctl, 'daemon-reload'], 'systemd reload')
+    except Exception:
+        restore(dropin, previous)
+        run([systemctl, 'daemon-reload'], 'systemd rollback reload')
+        raise
+    # A still-running CRAG process may use this profile until the caller restarts it.
+    return result('removed', 'not-crag-v2')
+
+
+def prepare(root):
+    config_path = fixed_path(root, '/run/kin/kernel.json')
+    dropin = fixed_path(root, '/etc/systemd/system/kin-kernel.service.d/50-vm2api-crag-userns.conf')
+    try:
+        config = json.loads(config_path.read_text())
+    except FileNotFoundError:
+        return result('skipped', 'kernel-config-missing')
+    except (ValueError, UnicodeError):
+        raise RuntimeError('invalid kernel configuration JSON') from None
+    if not isinstance(config, dict):
+        raise RuntimeError('kernel configuration must be an object')
+    if config.get('dataplane') != 'crag' or config.get('crag_kernel_version') != 'v2':
+        return remove_binding(dropin)
+
+    enabled = read_optional(fixed_path(root, '/sys/module/apparmor/parameters/enabled'))
+    if enabled not in ('Y', '1', 'yes'):
+        return result('skipped', 'apparmor-disabled')
+    restricted = read_optional(fixed_path(root, '/proc/sys/kernel/apparmor_restrict_unprivileged_userns'))
+    if restricted != '1':
+        return result('skipped', 'userns-not-restricted')
+
+    systemctl = command('systemctl')
+    current = run([systemctl, 'show', 'kin-kernel.service', '--property=AppArmorProfile', '--value'],
+                  'kernel AppArmor profile inspection')
+    if current and current != PROFILE_NAME:
+        return result('skipped', 'operator-managed', current)
+    profile = fixed_path(root, '/etc/apparmor.d/vm2api-crag')
+    previous_profile = snapshot(profile)
+    if current == PROFILE_NAME and previous_profile is None:
+        return result('skipped', 'operator-managed', current)
+    parser = command('apparmor_parser')
+    if not fixed_path(root, '/etc/apparmor.d/abi/4.0').is_file():
+        raise RuntimeError('AppArmor ABI 4.0 is required while unprivileged userns are restricted')
+    service = run([systemctl, 'show', 'apparmor.service', '--property=LoadState', '--value'],
+                  'AppArmor boot service inspection')
+    if service != 'loaded':
+        raise RuntimeError('apparmor.service is required to load the profile at guest boot')
+
+    previous_dropin = snapshot(dropin)
+    profile_changed = previous_profile is None or previous_profile[0] != PROFILE
+    dropin_changed = previous_dropin is None or previous_dropin[0] != DROPIN
+    profile_written = False
+    dropin_written = False
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, candidate = tempfile.mkstemp(prefix='.vm2api-crag-check.', dir=profile.parent)
+    try:
+        with os.fdopen(descriptor, 'wb') as output:
+            output.write(PROFILE)
+        run([parser, '-Q', '-K', candidate], 'AppArmor policy check')
+        if profile_changed:
+            atomic_write(profile, PROFILE)
+            profile_written = True
+        run([parser, '-r', '-K', str(profile)], 'AppArmor policy load')
+        if dropin_changed:
+            atomic_write(dropin, DROPIN)
+            dropin_written = True
+        if dropin_changed:
+            run([systemctl, 'daemon-reload'], 'systemd reload')
+    except Exception as error:
+        rollback_errors = []
+        for path, previous, written in ((dropin, previous_dropin, dropin_written),
+                                        (profile, previous_profile, profile_written)):
+            if written:
+                try:
+                    restore(path, previous)
+                except Exception as rollback_error:
+                    rollback_errors.append(str(rollback_error))
+        if profile_written and previous_profile is not None:
+            try:
+                run([parser, '-r', '-K', str(profile)], 'AppArmor rollback load')
+            except Exception as rollback_error:
+                rollback_errors.append(str(rollback_error))
+        if dropin_written:
+            try:
+                run([systemctl, 'daemon-reload'], 'systemd rollback reload')
+            except Exception as rollback_error:
+                rollback_errors.append(str(rollback_error))
+        # Keep a newly loaded, unattached profile: unloading may unconfine live tasks.
+        if rollback_errors:
+            raise RuntimeError(str(error) + '; rollback: ' + '; '.join(rollback_errors)) from error
+        raise
+    finally:
+        os.unlink(candidate)
+    return result('prepared', 'updated' if profile_changed or dropin_changed else 'already-configured')
+
+
+def main():
+    arguments = sys.argv[1:]
+    if arguments[:1] == ['--']:
+        arguments = arguments[1:]
+    if arguments and arguments != RESTART:
+        raise RuntimeError('only systemctl restart kin-kernel.service may follow preparation')
+    if getattr(os, 'geteuid', lambda: -1)() != 0:
+        raise RuntimeError('AppArmor preparation requires root')
+    raw_root = os.environ.get('KIN_CRAG_APPARMOR_ROOT', '/')
+    root = Path(raw_root)
+    if not root.is_absolute() or not root.is_dir():
+        raise RuntimeError('KIN_CRAG_APPARMOR_ROOT must be an existing absolute directory')
+    root = root.resolve()
+    print(json.dumps(prepare(root)), flush=True)
+    if arguments:
+        os.execvp(arguments[0], arguments)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({'ok': False, 'error': str(error)}), file=sys.stderr, flush=True)
+        raise SystemExit(1)
