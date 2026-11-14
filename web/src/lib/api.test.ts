@@ -76,6 +76,18 @@ describe('panelFetch 401', () => {
     expect(expired).toHaveBeenCalledTimes(1)
   })
 
+  it('does not expire a new login when the previous login receives a late 401', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        setSession('replacement-token', 'another-user')
+        return new Response('{}', { status: 401 })
+      })
+    )
+    expect((await panelFetch('/api/panel/me')).status).toBe(401)
+    expect(sessionToken()).toBe('replacement-token')
+  })
+
   it('does not expire session when panel login returns 401', async () => {
     const expired = vi.fn()
     onPanelSessionExpired(expired)
