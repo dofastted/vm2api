@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "component": "crag-native",
+  "version": "3.0.5",
+  "source_repository": "dofastted/claude-code",
+  "source_commit": "fa188934caed0ca0f8f4d6db7db77e94afd755d1",
+  "source_kernel_tree": "a920a560a621fa8c8d433acb0834a119280fcac0",
+  "functional_baseline": "253112b6",
+  "supplier_repository": "dofastted/crag",
+  "supplier_release": "v3.0.5",
+  "supplier_release_commit": "15d5ae63b9ea8019c4d5a7204c5557c11a19b11e",
+  "payload_release": "payload-2026.11.15-crag-3.0.5",
+  "baseline_payload_release": "payload-2026.11.15-crag-3.0.4",
+  "core_sha256": "933a1cc7b1c7d52d639cedfa91f22c31c45ea413bb9e47963c9311f523a7442c",
+  "manifest_sha256": "3677550ac1a2f24ee44e52a004b2092a7ed36e22c2d0e41e38c326e304f4dd34",
+  "archive": {
+    "path": "dist/crag-v2-licensed-amd64.tar.gz",
+    "asset": "crag-v2-licensed-amd64.tar.gz",
+    "size": 167961689,
+    "sha256": "547347000e8597a05bb3917a966b4f4c5bfcc5a9cc0a408565ffccc6077d35f0"
+  },
+  "build_environment": {
+    "mode": "container",
+    "image": "rust:1-bookworm@sha256:c9155318d07341301a78b45ecdd81af2e43b8b297d64e8fd4c5e80d7735607c3"
+  },
+  "official_claude": {
+    "version": "2.1.321",
+    "sha256": "426c33815ca6645a772f722fbff10dbf2cbdb124a8aeab733c1365dbf8bbf61f"
+  },
+  "non_crag_payload_pins_unchanged": true,
+  "capabilities_added": [
+    "native_advisor_20260301"
+  ]
+}
