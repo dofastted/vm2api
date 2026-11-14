@@ -52,11 +52,21 @@ sudo bash /opt/vm2api/deploy/install.sh crag-update --crag-version v2.0.1
 sudo bash /opt/vm2api/deploy/install.sh crag-update
 ```
 
+集群 CRAG 槽需要通过控制面的内核安装流程下发，独立更新器不会把远端槽当成本机进程操作。可以先只拉取指定版本（例如回退到供应仓的 `v2.8.15`）：
+
+```bash
+sudo bash /opt/vm2api/deploy/install.sh crag-update --pull-only --crag-version v2.8.15
+```
+
+`--pull-only` 沿用发行公钥、签名、完整包校验和更新锁，发布控制面的下载缓存，但不读取槽位清单，不调用面板 API，不暂停调度，不改授权或槽内文件，也不重启槽位。成功结果为 `pull_only: true`、目标 `release.tag` 和空 `items`；这不表示运行中的内核已经切换。随后刷新「内核」页，确认下载版本，再对选定集群槽执行 CRAG 安装/重装并核实运行状态。不要在此期间重新拉取其它版本。未指定版本时仍获取最新正式版，`--pull-only` 不会永久锁定版本。
+
+此模式需要部署中包含 `scripts/pull-crag.mjs`；仅更新宿主安装 shell 而保留旧镜像/源码会报缺少入口文件，不会退回全槽更新。非仅拉取模式发现集群 CRAG 槽时，在下载及停调度之前报告槽位 ID 并提示上述两步流程。
+
 需要包含 `scripts/seed-crag.mjs`、`scripts/update-crag.mjs` 的消费端源码/镜像；只下载一个新版 shell 到旧镜像不足以补齐 Node 更新器。支持已有 Docker 控制面和主机 Node 部署；读取进程环境或 `.env` 的 `VM2API_API_KEY` / `KIN_API_KEY`。无 `.env` 的主机 systemd 部署可由 root 从既有 `vm2api.service` 进程环境读取 key/port，不复制或打印完整环境；也可用进程环境 `PORT` 指定本地控制面端口。普通 amd64 `install` / `upgrade` 即使没有 CRAG 缓存也执行获取；`--no-start` / `--no-sync-wrap` 跳过，显式 `crag-update --no-start` 报错。当前 CRAG 发行包仅支持 amd64，ARM64 一键安装明确提示并跳过 CRAG 获取，不影响原有安装路径。主机 Node 部署首次使用仍须由供应方提供可信出厂包。
 
 更新顺序：供应仓完整包下载和原信任锚签名/成员 SHA/ELF 校验 → 原子切换下载指针 → 全槽清点 → 检查已有 CRAG V2 槽 → 有变化时以唯一标记暂停调度并排空在途请求 → 确认原生 `active_requests`、`queued`、`continuations` 全为 0 → 受管同步/必要时重载对应槽 → 核验实际运行 memfd SHA 与签名 payload 承诺一致。安装目录哈希相同不能视为已更新运行进程。
 
-不改变内核选择：CRAG V2 槽更新运行内核；已停止槽只更新磁盘，不开机；非 CRAG 本地槽若留有 `crag-v2` 缓存，仅原子更新该目录，不碰 wrapper、配置和进程；无副本的槽、Codex 槽不安装 CRAG。非 CRAG 集群槽标为 skip，不宣称替换其远端文件；当前物化器不支持的集群/KVM CRAG V2 目标在下载/停调度前失败。报告逐槽列出 `sync` / `cache` / `skip`。
+非仅拉取模式不改变内核选择：本机 Docker/KVM CRAG V2 槽更新运行内核；已停止槽只更新磁盘，不开机；非 CRAG 本地槽若留有 `crag-v2` 缓存，仅原子更新该目录，不碰 wrapper、配置和进程；无副本的槽、Codex 槽不安装 CRAG。非 CRAG 集群槽标为 skip，不宣称替换其远端文件；集群 CRAG V2 目标在下载/停调度前失败，需使用上述仅拉取和面板安装流程。报告逐槽列出 `sync` / `cache` / `skip`。
 
 下载或信任校验失败不覆盖旧包、不停槽；未完成工具续接时拒绝强制重启。更新锁为 `share/crag/kernels/v2/.update-lock`，并发更新失败；强杀后须先确认无更新进程再清理锁。调度 hold 使用本次唯一 `crag_update_*` 标记，正常退出时只恢复自己的 hold；断电/强杀不承诺自动恢复。失败返回非零，不伪装成功。回滚用保留的前一完整包，仍须验证原发行公钥、空闲/续接状态并显式重载；禁止轮换授权身份、用 legacy ELF 降级或仅改指针后宣称已回滚。
 

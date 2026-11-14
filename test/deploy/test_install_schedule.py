@@ -12,7 +12,7 @@ import unittest
 
 INSTALLER = Path(__file__).resolve().parents[2] / "deploy" / "install.sh"
 # Load definitions without running the installer's command dispatch.
-DEFINITIONS, DISPATCH, _ = INSTALLER.read_text().partition('\nCOMMAND="install"\n')
+DEFINITIONS, DISPATCH, DISPATCH_BODY = INSTALLER.read_text().partition('\nCOMMAND="install"\n')
 if not DISPATCH:
     raise RuntimeError("Installer command dispatch marker not found")
 
@@ -26,6 +26,16 @@ def run_installer(command, response=None, extra_env=None, mock=None):
         script += mock + "\n"
     return subprocess.run(
         ["bash", "-c", script + command],
+        env=env, capture_output=True, text=True, timeout=10,
+    )
+
+
+def run_installer_cli(args, mock, extra_env=None):
+    env = os.environ.copy()
+    env.update(extra_env or {})
+    return subprocess.run(
+        ["bash", "-c", DEFINITIONS + "\n" + mock + DISPATCH + DISPATCH_BODY,
+         "install.sh", *args],
         env=env, capture_output=True, text=True, timeout=10,
     )
 
@@ -96,6 +106,61 @@ node() { echo 'CRAG supplier download failed' >&2; return 22; }
             mock='need_root() { :; }; node() { exit 99; }; docker() { exit 99; }',
         )
         self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_crag_pull_only_dispatches_a_separate_entrypoint_in_both_deployments(self):
+        mock = r'''
+need_root() { :; }
+docker() {
+  if [ "$1" = inspect ]; then echo "$CONTAINER"; return; fi
+  printf 'docker:%s\n' "$@"
+}
+node() { printf 'node:%s\n' "$@"; }
+'''
+        for container in (False, True):
+            for pull_only in (False, True):
+                for tag in ("", "v2.8.15"):
+                    with self.subTest(container=container, pull_only=pull_only, tag=tag):
+                        args = ["crag-update", "--dir", "/custom/vm2api install"]
+                        if pull_only:
+                            args.append("--pull-only")
+                        if tag:
+                            args += ["--crag-version", tag]
+                        result = run_installer_cli(
+                            args, mock, {"CONTAINER": str(container).lower()},
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        entry = "pull-crag.mjs" if pull_only else "update-crag.mjs"
+                        if container:
+                            expected = ["exec", "vm2api", "node",
+                                        f"/opt/vm2api/scripts/{entry}", "/opt/vm2api", tag]
+                            prefix = "docker:"
+                        else:
+                            expected = [f"/custom/vm2api install/scripts/{entry}",
+                                        "/custom/vm2api install", tag]
+                            prefix = "node:"
+                        self.assertEqual(result.stdout.splitlines(),
+                                         [prefix + arg for arg in expected])
+
+    def test_pull_only_rejects_other_commands_before_running_them(self):
+        mock = 'need_root() { exit 99; }; node() { exit 99; }; docker() { exit 99; }'
+        for command in ("install", "upgrade", "status"):
+            with self.subTest(command=command):
+                result = run_installer_cli([command, "--pull-only"], mock)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("--pull-only 仅用于 crag-update", result.stderr)
+
+    def test_pull_only_cannot_fall_back_to_an_old_full_updater(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scripts = Path(tmp) / "scripts"
+            scripts.mkdir()
+            (scripts / "update-crag.mjs").write_text("console.log('FULL_UPDATER_EXECUTED')\n")
+            result = run_installer_cli(
+                ["crag-update", "--pull-only", "--crag-version", "v2.8.15", "--dir", tmp],
+                'need_root() { :; }; docker() { return 1; }',
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("pull-crag.mjs", result.stderr)
+            self.assertNotIn("FULL_UPDATER_EXECUTED", result.stdout)
 
     def test_inline_python_supports_python_38_grammar(self):
         snippets = re.findall(r"python3 -c '([^']*)'", DEFINITIONS)

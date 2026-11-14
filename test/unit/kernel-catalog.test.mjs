@@ -4,6 +4,8 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { gzipSync } from 'node:zlib'
+import { execFileSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { describeKernelCatalog, pullKernelRelease } from '../../src/lib/admin/kernel-catalog.mjs'
 import { CRAG_V2_RELEASE_ASSET } from '../../src/lib/admin/release-kernel.mjs'
 import {
@@ -248,9 +250,10 @@ test('native pull atomically selects an immutable sibling without touching the r
   assert.equal(describeKernelCatalog(root)[1].ready, true)
 })
 
-for (const [label, tag, standalone, expected] of [
+for (const [label, tag, standalone, expected, pullOnly = false] of [
   ['standalone latest', '', true, 'v2.0.2'],
   ['standalone explicit version', 'v2.0.1', true, 'v2.0.1'],
+  ['standalone pull-only explicit version', 'v2.0.1', true, 'v2.0.1', true],
   ['panel application pin', '', false, 'v2.0.0'],
 ]) {
   test(`native ${label} installs the selected signed release with an older application pin`, {
@@ -293,10 +296,19 @@ for (const [label, tag, standalone, expected] of [
     }
     const pull = (projectRoot, options) => pullKernelRelease(projectRoot, options, { fetchImpl })
     const result = standalone
-      ? await updateCrag(root, { tag, pull, api: () => assert.fail('an empty fleet must not be paused or restarted') })
+      ? await updateCrag(root, {
+          tag,
+          pullOnly,
+          pull,
+          api: () => assert.fail('an empty fleet must not be paused or restarted'),
+        })
       : await pull(root, { kernel: 'crag', tag })
     assert.equal(result.ok, true, result.error)
     assert.equal(result.release.tag, expected)
+    if (pullOnly) {
+      assert.equal(result.pull_only, true)
+      assert.deepEqual(result.items, [])
+    }
     assert.deepEqual(
       fs.readFileSync(path.join(cragV2PackageRoot(root), 'manifest.json')),
       releases.get(expected).manifest,
@@ -305,6 +317,55 @@ for (const [label, tag, standalone, expected] of [
     assert.equal(fs.readdirSync(path.join(root, 'vms')).length, 0)
   })
 }
+
+test('pull-only CLI publishes the requested signed release without panel credentials or fleet records', {
+  skip: cragV2Arch() !== 'amd64',
+}, (t) => {
+  const root = fixture(t)
+  const factory = seedEncryptedPackage(root, { revision: 'requested' })
+  const bytes = archive(factory)
+  const expected = fs.readFileSync(path.join(factory, 'manifest.json'))
+  seedEncryptedPackage(root, { revision: 'factory' })
+  const before = snapshot(factory)
+  const hook = path.join(root, 'supplier.mjs')
+  fs.writeFileSync(path.join(root, 'release.tar.gz'), bytes)
+  fs.writeFileSync(
+    hook,
+    `
+    import fs from 'node:fs';
+    const metadata = 'https://api.github.com/repos/dofastted/claude-code/releases/tags/v2.8.15';
+    const asset = 'https://api.github.com/repos/dofastted/claude-code/releases/assets/1';
+    const bytes = fs.readFileSync(new URL('./release.tar.gz', import.meta.url));
+    globalThis.fetch = async (url) => {
+      if (String(url) === metadata) return new Response(JSON.stringify({
+        tag_name: 'v2.8.15',
+        assets: [{ name: 'crag-v2-licensed-amd64.tar.gz', size: bytes.length, url: asset }]
+      }));
+      if (String(url) === asset) return new Response(bytes);
+      throw new Error('unexpected request: ' + url);
+    };
+  `,
+  )
+  const output = execFileSync(
+    process.execPath,
+    ['--import', hook, fileURLToPath(new URL('../../scripts/pull-crag.mjs', import.meta.url)), root, 'v2.8.15'],
+    {
+      encoding: 'utf8',
+      timeout: 15_000,
+      env: { ...process.env, VM2API_API_KEY: '', KIN_API_KEY: '' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  )
+  const result = JSON.parse(output)
+  assert.equal(result.ok, true)
+  assert.equal(result.pull_only, true)
+  assert.equal(result.release.tag, 'v2.8.15')
+  assert.deepEqual(result.items, [])
+  assert.deepEqual(fs.readFileSync(path.join(cragV2PackageRoot(root), 'manifest.json')), expected)
+  assert.deepEqual(snapshot(factory), before)
+  assert.equal(fs.existsSync(path.join(root, 'vms')), false)
+  assert.equal(fs.existsSync(path.join(root, '.env')), false)
+})
 
 const nativeMutations = [
   [
