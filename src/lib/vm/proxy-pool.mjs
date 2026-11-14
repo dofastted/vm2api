@@ -1159,6 +1159,8 @@ export class ProxyPool extends EventEmitter {
     const socks = await this._probeSocks(proxy)
     if (socks.scope === 'policy') return socks
     if (!socks.ok) return { ...socks, scope: 'socks' }
+    // Unused proxies need no egress network; probing must not consume Docker subnets.
+    if (!boundVmIdsOf(proxy).length) return { ...socks, scope: 'socks' }
     if (typeof this.egressCheck !== 'function') return { ...socks, scope: 'socks' }
     let eg = this.egressCheck(proxy)
     if (!eg?.ok && typeof this.repairEgress === 'function') {
