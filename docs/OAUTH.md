@@ -74,6 +74,8 @@ SSH 扩展槽同样由控制面经绑定出口换票。拿到授权后，提交�
 
 「OAuth → Claude Code 授权」保持现有面板入口。先启动已绑定出口的 VM，再生成链接、浏览器授权并粘贴完整授权码。原生 CC 使用临时配置换票；面板读取新凭证并通过现有导入流程同步到 VM 客户端，同步失败不显示完成。
 
+此入口使用已装载的签名 CRAG 包内原版 Claude Code，不读取 CRAG 源码，也不回退到 `cli-node`。若缺少原生可执行文件，先按[二进制安装说明](DEPLOY.md#crag-v2-二进制更新)补齐包；仅升级面板 OAuth 代码无需替换已有的同版 CRAG 内核。
+
 - 原生客户端的 `.credentials.json` 链接到面板管理的 `credentials.json`。显式导入以面板新凭证为准，不让旧原生客户端留下的文件覆盖新账号。远程槽导入时先推送凭证；后续手动同步保留节点已轮换的凭证，再修复原生客户端链接。
 - 运维终端的 `/sync` 可重新同步凭证。它不触发 OAuth 换票、不输出 token；同步完成后重新启动 `claude` 或 `cc` 使用当前凭证。
 - 终端中的 `claude` / `cc` 始终使用包内原生 CC。本地 Docker / KVM 槽使用 `/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude`，集群 Docker 槽使用 `/opt/kin-live/crag-v2/claude-code-2.1.321/claude`。本地缺少程序时从已校验发布包暂存原生客户端；缺包或不可执行会报错。
