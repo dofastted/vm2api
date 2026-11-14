@@ -9,10 +9,10 @@ git 里只有源码。`bin/`、`web/dist`、`share/crag` 与 `share/wrap-cli` �
 
 发版必须先取得最新 `origin/main` 和最新应用正式版。正式版 tag 若包含尚未进入 `main` 的提交，先保留历史地合并，不能从旧本地分支或单一组件分支覆盖云端已发布功能。`v1.4.071` 同时包含最新主分支 Codex 改动与 `v1.4.070` 的 Claude 监看、CRAG 清单修复。
 
-1. 将最新完整正式版清单引用的全部 payload 资产下载、校验并展开；只替换此次确有更新且来源可核验的组件。不从未提交的本地 `bin/` 取出厂文件。
-2. 将完整资产集发布到新的不可变 payload prerelease，保持非 Latest；清单的 `release` 指向该已公开下载源。逐项更新实际更换成员的大小与 SHA-256，保留其它成员的既有字节与 pin。`--pin` 会重算全部本地文件，仅可用于已完整核验的隔离 staging；再以 `--check` 校验、`--stage <目录>` 导出全部同名资产。
-3. CRAG 源码与构建在独立私有仓库 `dofastted/crag`。vm2api 从公开 `payload-YYYY.MM.DD-crag-X.Y.Z` Release 分发签名加密包。`crag_release` 指定面板拉取的 CRAG 版本；更新时仍须逐项固定出厂文件，并交付 `dist/crag-v2-licensed-amd64.tar.gz` 完整归档。
-4. 提交完整清单与构建来源，应用 `VERSION` / `CHANGELOG.md` 单独版本提交；完整 PR CI 通过后合并。tag 必须落在包含上述提交的云端合并结果，不能重打历史 tag。不得先让清单指向尚不可下载的 Release。
+1. 对照最新应用正式版与候选提交的 `deploy/payload.json`。清单不变就复用已发布的 payload，不新建二进制发行版；只在更换组件时重新固定实际变更的资产。不从未提交的本地 `bin/` 取出厂文件。
+2. 更换组件时，将完整资产集发布到新的不可变 payload prerelease，保持非 Latest。逐项更新变更成员的大小与 SHA-256，其余保留旧 pin。`--pin` 只用于已完整核验的独立 staging；用 `--check` 校验，`--stage <目录>` 导出发布附件。
+3. CRAG 在独立私有仓库 `dofastted/crag` 构建。vm2api 不检出或编译 CRAG 源码，只消费自己公开的 `payload-YYYY.MM.DD-crag-X.Y.Z` Release：签名加密的 `crag-v2-licensed-amd64.tar.gz` 含原生 CRAG、原版 Claude Code 和校验材料。`release` 固定出厂资产下载源，`crag_release` 固定面板默认拉取的 CRAG 版本。
+4. 如有二进制变更，提交新清单及构建来源。应用 `VERSION` / `CHANGELOG.md` 单独做版本提交；按改动范围验证，并遵守分支必过检查后合并。日常 CI 自动择项；全量回归（`full=true`）与独立 ARM 烟测（`arm64=true`）仅按需启用。tag 只指向包含版本提交的云端合并结果，不移动已有 tag，也不引用尚不可下载的 payload。
 5. `release` 工作流必须完成全部 amd64 payload 资产、ARM64 helper、amd64/arm64 控制面镜像及多架构 manifest。必要时在同一不可变 tag 上手动触发 `gh workflow run release.yml --ref v<VERSION>`。不等待 CI 检查不等于省略发布构建。
 6. 核对完整附件、`payload.json`、`SHA256SUMS`、构建来源与两种镜像架构，再确认正式版与 Latest。发布与部署是独立操作：未部署、未重启不得记为生产验收；槽内已有选择/缓存仍需另行排空并通过内核安装流程激活，不能用出厂文件证明运行中 CLI 已更新。
 
