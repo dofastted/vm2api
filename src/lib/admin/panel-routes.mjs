@@ -997,8 +997,9 @@ export function createPanelHandler(ctx) {
     } catch {
       vms = []
     }
+    const accountSnapshot = accountQuota.snapshot()
     const inventory = buildScopeInventory(
-      vms.map((vm) => ({ ...vm, quota: panel.findAccount(accountQuota, vm)?.unified || null })),
+      vms.map((vm) => ({ ...vm, quota: panel.findAccountInSnapshot(accountSnapshot, vm)?.unified || null })),
       selectedKeys,
     )
     return {
@@ -1012,7 +1013,7 @@ export function createPanelHandler(ctx) {
     const keys = (config.endpoints || []).flatMap((endpoint) => endpoint.keys || [])
     if (!keys.length) return config
     try {
-      const rows = new JevUsageRepo().configuredKeys(keys)
+      const rows = new JevUsageRepo().configuredKeyStatuses(keys)
       const byFp = new Map(rows.map((row) => [row.key_fingerprint, row]))
       return {
         ...config,

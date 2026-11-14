@@ -5,6 +5,9 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   buildDashboard,
+  buildUsage,
+  snapshotAccountPool,
+  findAccountInSnapshot,
   buildVmDetail,
   buildVmList,
   publicAllocatedProxy,
@@ -473,4 +476,42 @@ test('local proxy node labels are present for admin and absent for tenant', asyn
   )
   assert.equal(tenantAlloc.node_name, undefined)
   assert.equal(tenantAlloc.bound_vm_ids, undefined)
+})
+
+test('panel builders read one quota snapshot per request across multiple slots', async () => {
+  const project = tmpDir()
+  for (let i = 0; i < 3; i++)
+    writeVm(project, { id: `vm-${i}`, status: 'stopped', claude: { account_uuid: `uuid-${i}` } })
+  const accounts = Array.from({ length: 3 }, (_, i) => ({
+    account_id: `uuid-${i}`,
+    vm_id: `vm-${i}`,
+    requests: 1,
+    unified: { official: {} },
+  }))
+  const cfg = { paths: { project }, rewrite: { enabled: false } }
+  let reads = 0
+  const accountQuota = {
+    config: {},
+    snapshot: () => {
+      reads++
+      return { accounts }
+    },
+    runtimeRepo: { get: () => null },
+  }
+  const requestLog = { billingStats: () => ({ accounts: [] }) }
+  const options = { cfg, accountQuota, requestLog, routingConfig: {}, stickyRouter: { stats: () => ({}) } }
+  for (const build of [
+    buildDashboard,
+    buildVmList,
+    buildUsage,
+    snapshotAccountPool,
+    (opts) => buildVmDetail({ ...opts, id: 'vm-0' }),
+  ]) {
+    reads = 0
+    await build(options)
+    assert.equal(reads, 1, build.name)
+  }
+  assert.equal(findAccountInSnapshot({ accounts }, { id: 'vm-1', account_uuid: 'uuid-1' }), accounts[1])
+  assert.equal(findAccountInSnapshot({ accounts }, { id: 'vm-2' }), accounts[2])
+  assert.equal(findAccountInSnapshot({ accounts }, { id: 'missing' }), null)
 })

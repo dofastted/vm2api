@@ -652,18 +652,20 @@ export async function buildDashboard({
   const poolSnap = snapshotPool(proxyPool)
   const listed = listVms(cfg.paths.project, routingConfig)
   const liveById = await collectLivePanelCredentials(cfg.paths.project, listed)
+  const accountSnapshot = accountQuota.snapshot()
   const vms = listed.map((v) =>
     enrichVm(v, accountQuota, active, {
       routingConfig,
       pool,
       poolSnap,
       liveById,
+      accountSnapshot,
       projectRoot: cfg.paths.project,
       clusterNodes,
       role: 'admin',
     }),
   )
-  const snap = accountQuota.snapshot()
+  const snap = accountSnapshot
   const accounts = liveAccounts(snap.accounts, listed)
   const peak5 = Math.max(0, ...accounts.map((a) => Number(a.unified?.['5h']?.utilization || 0)), 0)
   const peak7 = Math.max(0, ...accounts.map((a) => Number(a.unified?.['7d']?.utilization || 0)), 0)
@@ -688,7 +690,7 @@ export async function buildDashboard({
     vms,
     (() => {
       try {
-        return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), snap.accounts || [])
+        return attachBillingMeta(panelBillingStats(requestLog, vms, accountSnapshot), snap.accounts || [])
       } catch {
         return null
       }
@@ -797,29 +799,25 @@ export async function buildVmList({
   const poolSnap = snapshotPool(proxyPool)
   const listed = filterVmsForPanel(listVms(cfg.paths.project, routingConfig), { role, userId: ownerUserId })
   const liveById = await collectLivePanelCredentials(cfg.paths.project, listed)
+  const accountSnapshot = accountQuota.snapshot()
   const vms = listed.map((v) =>
     enrichVm(v, accountQuota, active, {
       routingConfig,
       pool,
       poolSnap,
       liveById,
+      accountSnapshot,
       projectRoot: cfg.paths.project,
       clusterNodes,
       role,
     }),
   )
-  const accounts = (() => {
-    try {
-      return accountQuota?.snapshot?.().accounts || []
-    } catch {
-      return []
-    }
-  })()
+  const accounts = accountSnapshot.accounts || []
   stampVmBilling(
     vms,
     (() => {
       try {
-        return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), accounts)
+        return attachBillingMeta(panelBillingStats(requestLog, vms, accountSnapshot), accounts)
       } catch {
         return null
       }
@@ -866,19 +864,21 @@ export async function buildVmDetail({
   const poolSnap = snapshotPool(proxyPool)
   const listed = [summarizeVm(vm, cfg.paths.project, routingConfig)]
   const liveById = await collectLivePanelCredentials(cfg.paths.project, listed, { cacheMs: 0 })
+  const accountSnapshot = accountQuota.snapshot()
   const summary = enrichVm(listed[0], accountQuota, active, {
     routingConfig,
     pool,
     poolSnap,
     liveById,
+    accountSnapshot,
     projectRoot: cfg.paths.project,
     clusterNodes,
     role,
   })
-  const acc = findAccount(accountQuota, summary)
+  const acc = findAccountInSnapshot(accountSnapshot, summary)
   const billing = (() => {
     try {
-      return panelBillingStats(requestLog, accountQuota, [summary])
+      return panelBillingStats(requestLog, [summary], accountSnapshot)
     } catch {
       return null
     }
@@ -1418,7 +1418,7 @@ export function buildUsage({ accountQuota, cfg, requestLog = null }) {
   const listed = listVms(cfg?.paths?.project)
   const billing = (() => {
     try {
-      return panelBillingStats(requestLog, accountQuota, listed)
+      return panelBillingStats(requestLog, listed, snap)
     } catch {
       return null
     }
@@ -1579,27 +1579,23 @@ export async function snapshotAccountPool({
   } catch {
     liveById = null
   }
+  const accountSnapshot = accountQuota.snapshot()
   const vms = listed.map((v) =>
     enrichVm(v, accountQuota, active, {
       routingConfig,
       pool,
       poolSnap,
       liveById,
+      accountSnapshot,
       projectRoot: cfg.paths.project,
     }),
   )
-  const accounts = (() => {
-    try {
-      return accountQuota?.snapshot?.().accounts || []
-    } catch {
-      return []
-    }
-  })()
+  const accounts = accountSnapshot.accounts || []
   const billing = stampVmBilling(
     vms,
     (() => {
       try {
-        return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), accounts)
+        return attachBillingMeta(panelBillingStats(requestLog, vms, accountSnapshot), accounts)
       } catch {
         return null
       }
@@ -1845,8 +1841,8 @@ function enrichVm(v, accountQuota, active, extras = {}) {
       }
     }
   }
-  const acc = findAccount(accountQuota, v)
-  const runtime = findRuntime(accountQuota, v)
+  const acc = findAccountInSnapshot(extras.accountSnapshot, v)
+  const runtime = findRuntime(accountQuota, v, acc)
   const liveCred = extras.liveById instanceof Map ? extras.liveById.get(v.id) : extras.liveById?.[v.id]
   const workerCred = liveCred || runtime?.worker_status?.credential || null
   const quotaOverride = isCodexVm(v) ? null : v.quota_override || null
@@ -2235,7 +2231,10 @@ export function isSeedAccountRow(account) {
 
 export function findAccount(accountQuota, vm) {
   if (!accountQuota || typeof accountQuota.snapshot !== 'function') return null
-  const snap = accountQuota.snapshot()
+  return findAccountInSnapshot(accountQuota.snapshot(), vm)
+}
+
+export function findAccountInSnapshot(snap, vm) {
   const accounts = snap.accounts || []
   const uuid = vm.account_uuid || vm.claude?.account_uuid || null
   if (uuid) {
@@ -2249,11 +2248,10 @@ export function findAccount(accountQuota, vm) {
   )
 }
 
-function findRuntime(accountQuota, vm) {
+function findRuntime(accountQuota, vm, acc) {
   try {
     const repo = accountQuota?.runtimeRepo
     if (!repo?.get) return null
-    const acc = findAccount(accountQuota, vm)
     const keys = [vm.account_uuid, acc?.account_id, vm.id].filter(Boolean)
     for (const key of keys) {
       const state = repo.get(key)
@@ -2428,16 +2426,10 @@ function attachBillingMeta(billing, accounts = []) {
   }
 }
 
-function accountWindowsForBilling(accountQuota, vms = []) {
+function accountWindowsForBilling(vms, snapshot) {
   const listed = Array.isArray(vms) ? vms : []
   const byVm = new Map(listed.map((vm) => [vm.id, vm]))
-  const accounts = (() => {
-    try {
-      return accountQuota?.snapshot?.().accounts || []
-    } catch {
-      return []
-    }
-  })()
+  const accounts = snapshot.accounts || []
   const windows = []
   const seen = new Set()
   for (const acc of accounts) {
@@ -2450,7 +2442,7 @@ function accountWindowsForBilling(accountQuota, vms = []) {
   for (const vm of listed) {
     const key = `${vm.account_uuid || vm.id}\0${vm.id}`
     if (seen.has(key) || seen.has(`${vm.account_uuid || ''}\0${vm.id}`)) continue
-    const acc = findAccount(accountQuota, vm)
+    const acc = findAccountInSnapshot(snapshot, vm)
     windows.push(billingWindowOf(acc?.account_id || vm.account_uuid || vm.id, vm.id, vm, quotaFromAccount(acc)))
   }
   return windows
@@ -2469,9 +2461,9 @@ function billingWindowOf(accountId, vmId, vm, q) {
   }
 }
 
-function panelBillingStats(requestLog, accountQuota, vms) {
+function panelBillingStats(requestLog, vms, snapshot) {
   if (!requestLog?.billingStats) return null
-  return requestLog.billingStats({ accountWindows: accountWindowsForBilling(accountQuota, vms) })
+  return requestLog.billingStats({ accountWindows: accountWindowsForBilling(vms, snapshot) })
 }
 
 function stampVmBilling(vms, billing) {

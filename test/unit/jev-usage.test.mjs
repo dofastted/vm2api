@@ -215,3 +215,35 @@ test('configured keys aggregate separately, include unused keys, and distinguish
   assert.equal(keys[2].status, 'unrequested')
   assert.equal(keys[2].last_request_at, null)
 })
+
+test('configured key statuses preserve usage status without aggregating historical events', (t) => {
+  const repo = fixture(t)
+  repo.record(normalizeJevUsage(value({ http_status: 429, outcome: 'http_error', usage: null })))
+  const keys = [{ key_fingerprint: value().key_fingerprint }, { key_fingerprint: '000000000000', retired: true }]
+  const expected = repo
+    .configuredKeys(keys)
+    .map(({ key_fingerprint, status, last_request_at, last_http_status, retired }) => ({
+      key_fingerprint,
+      status,
+      last_request_at,
+      last_http_status,
+      retired,
+    }))
+  const prepare = repo.db.prepare.bind(repo.db)
+  repo.db = {
+    prepare(sql) {
+      assert.doesNotMatch(sql, /GROUP BY|COUNT\(|SUM\(/i)
+      return prepare(sql)
+    },
+  }
+  assert.deepEqual(
+    repo.configuredKeyStatuses(keys).map(({ key_fingerprint, status, last_request_at, last_http_status, retired }) => ({
+      key_fingerprint,
+      status,
+      last_request_at,
+      last_http_status,
+      retired,
+    })),
+    expected,
+  )
+})

@@ -81,6 +81,16 @@ export class JevUsageRepo {
       FROM jev_usage_events GROUP BY key_fingerprint`)
       .all()
     const totals = new Map(rows.map((row) => [row.key_fingerprint, row]))
+    return this.configuredKeyStatuses(keys).map((key) => ({
+      ...key,
+      requests: 0,
+      successful: 0,
+      estimated_cost_nano_usd: 0,
+      unknown_cost_requests: 0,
+      ...totals.get(key.key_fingerprint),
+    }))
+  }
+  configuredKeyStatuses(keys) {
     const latest = this.db.prepare(`SELECT created_at,http_status,outcome FROM jev_usage_events
       WHERE key_fingerprint=? ORDER BY created_at DESC,id DESC LIMIT 1`)
     return keys.map((key) => {
@@ -101,11 +111,6 @@ export class JevUsageRepo {
                     : 'unrequested'
       return {
         ...key,
-        requests: 0,
-        successful: 0,
-        estimated_cost_nano_usd: 0,
-        unknown_cost_requests: 0,
-        ...totals.get(key.key_fingerprint),
         status,
         last_request_at: last?.created_at ?? null,
         last_http_status: last?.http_status ?? null,

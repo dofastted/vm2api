@@ -131,3 +131,64 @@ test('masked key labels never expose short credentials or endpoint URLs', () => 
   assert.ok(!serialized.includes('token-abcdefghijk'))
   assert.ok(!serialized.includes('example.test'))
 })
+
+test('risk configuration reads one account snapshot and avoids historical event aggregation', async (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'jev-risk-panel-'))
+  t.after(() => {
+    closeDatabase()
+    fs.rmSync(tmp, { recursive: true, force: true })
+  })
+  fs.mkdirSync(path.join(tmp, 'vms'))
+  fs.mkdirSync(path.join(tmp, 'data'))
+  for (let i = 0; i < 3; i++) {
+    fs.writeFileSync(path.join(tmp, 'vms', `vm-${i}.json`), JSON.stringify({ id: `vm-${i}`, claude: {} }))
+  }
+  openDatabase({ dataDir: path.join(tmp, 'data') })
+  const config = { base_url: 'https://api.typesafe.ai', api_keys: ['fixture-risk-key'] }
+  new SettingsRepo().set('jev_intercept', config)
+  const fingerprint = publicJevKeys(config)[0].key_fingerprint
+  new JevUsageRepo().record(
+    normalizeJevUsage({
+      provider: 'jev',
+      model: 'jev-1.14.0',
+      key_fingerprint: fingerprint,
+      http_status: 429,
+      outcome: 'http_error',
+      usage: null,
+    }),
+  )
+  let reads = 0
+  const aggregate = t.mock.method(JevUsageRepo.prototype, 'configuredKeys')
+  const statuses = t.mock.method(JevUsageRepo.prototype, 'configuredKeyStatuses')
+  const response = {}
+  const handler = createPanelHandler({
+    cfg: { paths: { project: tmp } },
+    routingConfig: {},
+    accountQuota: {
+      snapshot: () => {
+        reads++
+        return { accounts: [] }
+      },
+    },
+    requireAuth(req) {
+      req.panelUser = 'fixture-admin'
+      req.panelRole = 'admin'
+      return true
+    },
+    json(_res, status, body) {
+      Object.assign(response, { status, body })
+      return true
+    },
+  })
+  await handler({ method: 'GET' }, {}, new URL('http://localhost/api/panel/jev-intercept'))
+  assert.equal(response.status, 200)
+  assert.equal(reads, 1)
+  assert.ok(response.body.data.account_scope)
+  assert.equal(aggregate.mock.callCount(), 0)
+  assert.equal(statuses.mock.callCount(), 1)
+  const key = response.body.data.endpoints
+    .flatMap((endpoint) => endpoint.keys)
+    .find((item) => item.key_fingerprint === fingerprint)
+  assert.equal(key.status, 'rate_limited')
+  assert.equal(key.last_http_status, 429)
+})

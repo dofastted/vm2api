@@ -15,6 +15,7 @@ import { useAuthStore } from '@/stores/auth-store'
 import { ApiError } from '@/lib/api'
 import { handleServerError } from '@/lib/handle-server-error'
 import { onPanelSessionExpired } from '@/lib/session'
+import { RoutePending } from '@/features/errors/route-pending'
 import { DirectionProvider } from './context/direction-provider'
 import { FontProvider } from './context/font-provider'
 import { ThemeProvider } from './context/theme-provider'
@@ -56,6 +57,7 @@ const router = createRouter({
   context: { queryClient },
   defaultPreload: 'intent',
   defaultPreloadStaleTime: 0,
+  defaultPendingComponent: RoutePending,
 })
 
 declare module '@tanstack/react-router' {
