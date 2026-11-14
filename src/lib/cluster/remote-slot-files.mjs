@@ -410,7 +410,12 @@ export async function ensureRemoteOfficialCredentialLink(vm, slotDir, session = 
   if (!remote) return { linked: false, reason: 'remote_missing' }
   await prepareRemoteDir(s, vm)
   const sftp = await openSftp(s.client)
-  await remoteSymlink(sftp, 'credentials.json', `${remoteSlotDir(s.host, vm.id)}/claude/.credentials.json`)
+  const official = `${remoteSlotDir(s.host, vm.id)}/claude/.credentials.json`
+  // Preflight also runs while a shell is open: don't unlink a working alias on every tick.
+  const target = await new Promise((resolve) =>
+    sftp.readlink(official, (error, value) => resolve(error ? null : value)),
+  )
+  if (target !== 'credentials.json') await remoteSymlink(sftp, 'credentials.json', official)
   return { linked: true }
 }
 

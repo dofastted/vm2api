@@ -10,7 +10,12 @@ import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
 import { api } from '@/lib/api'
-import { captureLoginAuthUrl } from '@/lib/login-terminal'
+import {
+  captureLoginAuthUrl,
+  loginAuthUrl,
+  parseTerminalFrame,
+  type LoginCommit,
+} from '@/lib/login-terminal'
 import { apiBase } from '@/lib/session'
 import {
   eraseEcho,
@@ -69,11 +74,12 @@ export const WsTerminal = forwardRef<
     commands?: SlashCommand[]
     startupCommand?: string
     officialLogin?: boolean
-    loginCliBin?: string
     onCliBin?: (path: string) => void
     onConnectionChange?: (connected: boolean) => void
+    canReconnect?: boolean
+    onReconnect?: () => void
     fontSize?: number
-    onLogin?: () => void
+    onLogin?: (result: LoginCommit) => void
     onAuthUrl?: (url: string) => void
   }
 >(function WsTerminal(
@@ -83,9 +89,10 @@ export const WsTerminal = forwardRef<
     commands,
     startupCommand,
     officialLogin,
-    loginCliBin,
     onCliBin,
     onConnectionChange,
+    canReconnect = true,
+    onReconnect,
     fontSize,
     onLogin,
     onAuthUrl,
@@ -170,18 +177,19 @@ export const WsTerminal = forwardRef<
   onCliBinRef.current = onCliBin
   const onConnectionRef = useRef(onConnectionChange)
   onConnectionRef.current = onConnectionChange
-  const seenUrl = useRef('')
-  const urlTail = useRef('')
-  const captureUrl = (raw: string) => {
-    const found = captureLoginAuthUrl(urlTail.current, raw)
-    urlTail.current = found.pending
-    if (!found.url || found.url === seenUrl.current) return
-    seenUrl.current = found.url
-    onAuthUrlRef.current?.(found.url)
-  }
   useEffect(() => {
     const host = hostRef.current
     if (!host) return
+    let seenUrl = ''
+    let urlTail = ''
+    let loginConfirmed = false
+    let framedError = false
+    const decoder = officialLogin ? new TextDecoder() : null
+    const publishUrl = (url: string) => {
+      if (!url || url === seenUrl || loginConfirmed || framedError) return
+      seenUrl = url
+      onAuthUrlRef.current?.(url)
+    }
     const term = new Terminal({
       cursorBlink: true,
       fontSize: fontSize ?? (officialLogin ? 17 : 13),
@@ -203,8 +211,8 @@ export const WsTerminal = forwardRef<
       if (!payload || payload === '?') return true
       try {
         const text = atob(payload)
-        captureUrl(text)
-        void navigator.clipboard?.writeText(text).catch(() => {})
+        if (officialLogin) publishUrl(loginAuthUrl(text))
+        else void navigator.clipboard?.writeText(text).catch(() => {})
       } catch {
         /* CLI copy is best-effort; the URL stays selectable. */
       }
@@ -243,8 +251,6 @@ export const WsTerminal = forwardRef<
     connectedRef.current = false
     onConnectionRef.current?.(false)
     setNote('')
-    seenUrl.current = ''
-    urlTail.current = ''
 
     let ws: WebSocket | null = null
     let disposed = false
@@ -258,9 +264,8 @@ export const WsTerminal = forwardRef<
         ws.send(payload)
         return
       }
-      // Keep keystrokes typed while the ticket/exec is opening. Dropping the
-      // first pasted callback makes the terminal look broken even though the
-      // TTY is still healthy.
+      // Do not queue input while the native login session is disconnected.
+      if (officialLogin && input.t === 'd') return
       if (!ws || ws.readyState === WebSocket.CONNECTING) {
         const pending = pendingMessagesRef.current
         if (pending.length < 512) pending.push(payload)
@@ -292,9 +297,7 @@ export const WsTerminal = forwardRef<
     observer.observe(host)
     api<{ ticket: string; cli_bin?: string }>(ticketPath, {
       method: 'POST',
-      body: officialLogin
-        ? JSON.stringify({ login: true, cli_bin: loginCliBin || '' })
-        : undefined,
+      body: officialLogin ? JSON.stringify({ login: true }) : undefined,
     })
       .then(({ ticket, cli_bin }) => {
         if (disposed) return
@@ -311,37 +314,68 @@ export const WsTerminal = forwardRef<
         ws = new WebSocket(base.toString())
         ws.binaryType = 'arraybuffer'
         ws.onopen = () => {
+          if (disposed) return
           connectedRef.current = true
           onConnectionRef.current?.(true)
           setPhase('open')
           for (const payload of pendingMessagesRef.current) ws?.send(payload)
           pendingMessagesRef.current = []
-          term.focus()
+          if (!officialLogin) term.focus()
           if (startupCommand && !officialLogin)
             send({ t: 'd', d: `${startupCommand}\r` })
         }
         ws.onmessage = (e) => {
+          if (disposed) return
           if (typeof e.data !== 'string') {
             const bytes = new Uint8Array(e.data as ArrayBuffer)
             term.write(bytes)
-            captureUrl(new TextDecoder().decode(bytes))
+            if (decoder) {
+              const found = captureLoginAuthUrl(
+                urlTail,
+                decoder.decode(bytes, { stream: true })
+              )
+              urlTail = found.pending
+              publishUrl(found.url)
+            }
             return
           }
-          const msg = JSON.parse(e.data) as {
-            t: string
-            code?: number | null
-            message?: string
+          const msg = parseTerminalFrame(e.data)
+          if (
+            msg?.t === 'exit' &&
+            !(officialLogin && (framedError || loginConfirmed))
+          ) {
+            setNote(`会话退出（code ${msg.code ?? '—'}）`)
           }
-          if (msg.t === 'exit') setNote(`会话退出（code ${msg.code ?? '—'}）`)
-          if (msg.t === 'login') onLoginRef.current?.()
-          if (msg.t === 'error') setNote(msg.message || '终端错误')
+          if (msg?.t === 'login' && officialLogin && !loginConfirmed) {
+            loginConfirmed = true
+            connectedRef.current = false
+            term.options.disableStdin = true
+            setNote('凭证已同步')
+            onLoginRef.current?.(msg.result)
+          }
+          if (msg?.t === 'error') {
+            framedError = true
+            if (officialLogin) {
+              connectedRef.current = false
+              onConnectionRef.current?.(false)
+              term.options.disableStdin = true
+            }
+            setNote(msg.message)
+          }
         }
-        ws.onclose = () => {
+        ws.onclose = (event) => {
           if (disposed) return
           connectedRef.current = false
           onConnectionRef.current?.(false)
           pendingMessagesRef.current = []
-          if (!disposed) setPhase('closed')
+          if (officialLogin && !framedError && !loginConfirmed) {
+            setNote(
+              (previous) =>
+                previous ||
+                (event.wasClean ? '授权未确认' : '终端连接中断，请重新连接')
+            )
+          }
+          setPhase('closed')
         }
       })
       .catch((err: Error) => {
@@ -372,7 +406,6 @@ export const WsTerminal = forwardRef<
     execute,
     startupCommand,
     officialLogin,
-    loginCliBin,
     fontSize,
   ])
 
@@ -384,21 +417,24 @@ export const WsTerminal = forwardRef<
         if (!value || !termRef.current || !connectedRef.current) return false
         termRef.current.paste(value.replace(/[\r\n]+$/, ''))
         sendRef.current('\r')
-        termRef.current.focus()
+        if (!officialLogin) termRef.current.focus()
         return true
       },
       focus() {
         termRef.current?.focus()
       },
     }),
-    []
+    [officialLogin]
   )
   return (
     <div className='flex h-full min-h-0 flex-col gap-2'>
       <div
         className={`flex flex-wrap items-center justify-between gap-2 text-xs ${officialLogin ? 'text-zinc-400' : 'text-muted-foreground'}`}
       >
-        <span>
+        <span
+          role={officialLogin ? 'status' : undefined}
+          className='min-w-0 wrap-anywhere'
+        >
           {phase === 'connecting'
             ? '连接中…'
             : phase === 'open'
@@ -422,14 +458,17 @@ export const WsTerminal = forwardRef<
               {running === c.name ? `${c.name}…` : c.name}
             </Button>
           ))}
-          {phase === 'closed' ? (
+          {phase === 'closed' && canReconnect ? (
             <Button
               size='sm'
               variant='outline'
               className='h-7'
-              onClick={() => setSession((n) => n + 1)}
+              onClick={() => {
+                onReconnect?.()
+                setSession((n) => n + 1)
+              }}
             >
-              重新打开
+              {officialLogin ? '重新连接并生成链接' : '重新打开'}
             </Button>
           ) : null}
         </div>

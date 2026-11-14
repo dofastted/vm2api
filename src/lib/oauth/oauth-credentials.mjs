@@ -127,24 +127,6 @@ export function slotWorkerCredentialPath(homeDir) {
   return path.join(homeDir, '.claude', 'credentials.json')
 }
 
-const AUTH_LOGIN_REFRESH_HOLD_MS = 30 * 60 * 1000
-
-/** A live `claude auth login` is about to exchange a new grant. Do not spend the old RT. */
-export function authLoginBlocksRefresh(homeDir, now = Date.now()) {
-  if (!homeDir) return false
-  try {
-    const status = JSON.parse(fs.readFileSync(path.join(homeDir, '..', 'run', 'auth-login', 'status.json'), 'utf8'))
-    const state = String(status.status || '')
-    if (!state || state === 'login_ready' || state === 'error' || state === 'exited') return false
-    const expires = Number(status.expires_at || 0)
-    if (expires > 0) return now < expires
-    const created = Number(status.created_at || 0)
-    return !created || now < created + AUTH_LOGIN_REFRESH_HOLD_MS
-  } catch {
-    return false
-  }
-}
-
 function regularOauthGrant(file) {
   let st
   try {
@@ -192,10 +174,8 @@ export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false
   const workerFile = path.join(claudeDir, 'credentials.json')
   const officialFile = path.join(claudeDir, '.credentials.json')
   if (!homeDir) return { wrote: false, error: 'home missing' }
-  const officialGrant = regularOauthGrant(officialFile)
-  const workerGrant = regularOauthGrant(workerFile)
-  const adopt = adoptOfficial && officialGrantWins(officialGrant, workerGrant)
-  if (!workerGrant && !fs.existsSync(workerFile)) {
+  const adopt = adoptOfficial && officialGrantWins(regularOauthGrant(officialFile), regularOauthGrant(workerFile))
+  if (!fs.existsSync(workerFile)) {
     if (!adopt && !create) return { wrote: false, error: 'worker credentials.json missing' }
     fs.mkdirSync(claudeDir, { recursive: true, mode: 0o700 })
     if (adopt) fs.copyFileSync(officialFile, workerFile)
@@ -219,8 +199,8 @@ export function ensureOfficialCredentialLink(homeDir, { uid, gid, create = false
   try {
     const st = fs.lstatSync(officialFile)
     if (st.isSymbolicLink()) {
-      const target = fs.readlinkSync(officialFile)
-      if (target === 'credentials.json' || path.resolve(claudeDir, target) === path.resolve(workerFile)) {
+      // An absolute host path can resolve here but dangle inside a container or KVM guest.
+      if (fs.readlinkSync(officialFile) === 'credentials.json') {
         return { wrote: true, path: officialFile, linked: true, adopted: adopt }
       }
     }

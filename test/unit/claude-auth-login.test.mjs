@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
@@ -5,22 +6,13 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   assertAuthLoginReady,
-  extractAuthLoginUrl,
-  isPersistentAuthLoginSession,
   officialLoginCredentialToOauth,
+  nativeLoginLaunch,
+  readNativeLoginOauth,
   resolveAuthLoginClaude,
 } from '../../src/lib/oauth/claude-auth-login.mjs'
 import { FULL_OAUTH_SCOPE } from '../../src/lib/oauth/oauth-contract.mjs'
 import { prepareSlotOAuth } from '../../src/lib/oauth/guest-oauth-helper.mjs'
-
-test('extractAuthLoginUrl reads the official manual CAI link', () => {
-  const url =
-    'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&scope=user%3Aprofile'
-  const raw = `If the browser didn't open, visit: \x1b]8;;${url}\x07${url}\x1b]8;;\x07`
-  assert.equal(extractAuthLoginUrl(raw), url)
-  const wrapped = 'https://claude.com/cai/oauth/authorize?code=true&\nclient_id=abc&state=xyz'
-  assert.equal(extractAuthLoginUrl(wrapped), 'https://claude.com/cai/oauth/authorize?code=true&client_id=abc&state=xyz')
-})
 
 test('officialLoginCredentialToOauth keeps a full refresh grant and rejects setup tokens', () => {
   const oauth = officialLoginCredentialToOauth({
@@ -61,50 +53,40 @@ test('officialLoginCredentialToOauth keeps a full refresh grant and rejects setu
   )
 })
 
-test('auth login session stays reusable until force regenerate or login_ready', () => {
-  const session = {
-    alive: true,
-    auth_url: 'https://claude.com/cai/oauth/authorize?code=true',
-    expired: false,
-    status: 'waiting_auth',
+test('only successful native login exposes its fresh private grant', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-auth-login-test-'))
+  const bin = path.join(root, 'claude')
+  const config = path.join(root, 'login')
+  const launch = nativeLoginLaunch(bin, config)
+  const grant = JSON.stringify({
+    claudeAiOauth: {
+      accessToken: 'new-access',
+      refreshToken: 'new-refresh',
+      scopes: ['user:profile', 'user:inference'],
+      expiresAt: Date.now() + 3600_000,
+    },
+  })
+  const run = (args, env = process.env) => {
+    const { status, stdout } = spawnSync(args[0], args.slice(1), { encoding: 'utf8', env })
+    return { exitCode: status, stdout }
   }
-  assert.equal(isPersistentAuthLoginSession(session), true)
-  assert.equal(isPersistentAuthLoginSession(session, { force: true }), false)
-  assert.equal(isPersistentAuthLoginSession({ ...session, status: 'login_ready' }), false)
-  assert.equal(isPersistentAuthLoginSession({ ...session, alive: false }), false)
-  assert.equal(
-    isPersistentAuthLoginSession(session, { cliBin: '/home/kincli/.kin/crag-v2/claude-code-2.1.317/claude' }),
-    false,
-  )
-  assert.equal(
-    isPersistentAuthLoginSession({ ...session, cli_bin: '/native/claude' }, { cliBin: '/native/claude' }),
-    true,
-  )
-  assert.equal(
-    isPersistentAuthLoginSession({ ...session, cli_bin: '/native/claude' }, { cliBin: '/home/kincli/.kin/cli-node' }),
-    false,
-  )
-})
-
-test('auth uses native CC for wrap slots and honors an explicit executable', async () => {
-  const vm = { id: 'vm-01', dataplane: 'wrap' }
-  const native = resolveAuthLoginClaude(vm)
-  assert.equal(native.native, true)
-  assert.equal(native.bin, resolveAuthLoginClaude({ ...vm, dataplane: 'crag' }).bin)
-  assert.match(native.bin, /crag-v2\/claude-code-[^/]+\/claude$/)
-  const custom = "/opt/Claude Code/it's claude"
-  assert.equal(resolveAuthLoginClaude(vm, custom).bin, custom)
-  for (const invalid of ['claude', '/tmp/claude\n', '/tmp/claude\0', '/tmp/', 42]) {
-    assert.throws(() => resolveAuthLoginClaude(vm, invalid), { code: 'invalid_claude_path' })
+  const env = { ...process.env, ...Object.fromEntries(launch.env.map((pair) => pair.split('='))) }
+  const stub = "#!/bin/sh\nprintf '%s' " + `'${grant}' > "$CLAUDE_CONFIG_DIR/.credentials.json"\n`
+  try {
+    fs.writeFileSync(bin, stub + 'exit 1\n', { mode: 0o755 })
+    assert.equal(run(launch.cmd, env).exitCode, 1)
+    await assert.rejects(readNativeLoginOauth(run, config), { code: 'auth_login_incomplete' })
+    fs.rmSync(config, { recursive: true })
+    fs.writeFileSync(bin, stub)
+    assert.equal(run(launch.cmd, env).exitCode, 0)
+    assert.equal(fs.statSync(config).mode & 0o777, 0o700)
+    const oauth = await readNativeLoginOauth(run, config)
+    assert.equal(oauth.refresh_token, 'new-refresh')
+    assert.equal(oauth.source, 'claude-auth-login')
+    assert.match(resolveAuthLoginClaude({ id: 'vm-01', dataplane: 'wrap' }), /crag-v2\/claude-code-[^/]+\/claude$/)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
   }
-  await assert.rejects(
-    assertAuthLoginReady('/tmp/unused', vm, {
-      inspect: () => ({ running: true }),
-      cliBin: custom,
-      cliExists: async () => false,
-    }),
-    { code: 'claude_cli_missing' },
-  )
 })
 
 test('auth readiness refuses stopped containers and never falls back to cli-node', async () => {

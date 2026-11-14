@@ -43,13 +43,7 @@ import {
   looksLikeOfficialSetupToken,
   SETUP_TOKEN_FLAVOR,
 } from '../oauth/claude-setup-token.mjs'
-import {
-  AUTH_LOGIN_FLAVOR,
-  AUTH_LOGIN_SOURCE,
-  completeClaudeAuthLogin,
-  isNativeAuthLoginSessionId,
-  startClaudeAuthLoginSession,
-} from '../oauth/claude-auth-login.mjs'
+import { AUTH_LOGIN_FLAVOR } from '../oauth/claude-auth-login.mjs'
 import {
   canOfficialCc,
   isApiKeyMode,
@@ -3143,7 +3137,6 @@ export function createPanelHandler(ctx) {
         const body = await readBody(req, 1024).catch(() => ({}))
         const issued = await ctx.slotShell.issueTicket(p.split('/')[4], {
           login: body.login === true,
-          cliBin: body.cli_bin ?? '',
         })
         if (!issued.ok) return json(res, issued.status, { ok: false, error: issued.error })
         return json(
@@ -5230,17 +5223,13 @@ export function createPanelHandler(ctx) {
             )
           }
           const flavor = body.flavor || body.type || 'cai'
-          const generated =
-            normalizeOauthFlavor(flavor) === AUTH_LOGIN_FLAVOR
-              ? await withVmLock(`${vmPath}:claude-auth-login`, () =>
-                  startClaudeAuthLoginSession({
-                    vm: existing,
-                    projectRoot: cfg.paths.project,
-                    routing: ctx.routingConfig,
-                    force: body.force === true,
-                  }),
-                )
-              : generateAuthUrl({ vmId: id, proxyUrl: slotProxy.proxyUrl, flavor })
+          if (normalizeOauthFlavor(flavor) === AUTH_LOGIN_FLAVOR) {
+            return json(res, 409, {
+              ok: false,
+              error: { code: 'native_login_required', message: '请使用 Claude Code 授权终端生成链接' },
+            })
+          }
+          const generated = generateAuthUrl({ vmId: id, proxyUrl: slotProxy.proxyUrl, flavor })
           const px = existing.proxy || {}
           return json(
             res,
@@ -5326,12 +5315,13 @@ export function createPanelHandler(ctx) {
           const sessionKey = String(body.session_id || body.sessionId || '')
           let oauth
           let oauthFromVm = false
-          if (normalizeOauthFlavor(flavor) === AUTH_LOGIN_FLAVOR || isNativeAuthLoginSessionId(sessionKey)) {
-            oauthFromVm = true
-            oauth = await withVmLock(`${vmPath}:claude-auth-login`, () =>
-              completeClaudeAuthLogin({ projectRoot: cfg.paths.project, vmId: id, sessionId: sessionKey, code }),
-            )
-          } else if (looksLikeOfficialSetupToken(code)) {
+          if (normalizeOauthFlavor(flavor) === AUTH_LOGIN_FLAVOR || /^native-[a-f0-9]{32}$/.test(sessionKey)) {
+            return json(res, 409, {
+              ok: false,
+              error: { code: 'native_login_required', message: '请在 Claude Code 授权终端提交回调' },
+            })
+          }
+          if (looksLikeOfficialSetupToken(code)) {
             oauth = await completeClaudeSetupToken({
               projectRoot: cfg.paths.project,
               vmId: id,
@@ -5349,10 +5339,7 @@ export function createPanelHandler(ctx) {
               routing: ctx.routingConfig,
             })
           }
-          if (oauth.flavor === AUTH_LOGIN_FLAVOR || oauth.source === AUTH_LOGIN_SOURCE) {
-            oauth.type = 'oauth'
-            oauth.mode = 'oauth'
-          } else if (looksLikeOfficialSetupToken(code) || oauth.flavor === SETUP_TOKEN_FLAVOR) {
+          if (looksLikeOfficialSetupToken(code) || oauth.flavor === SETUP_TOKEN_FLAVOR) {
             oauth.type = 'official-setup-token'
             oauth.mode = 'official-setup-token'
           } else if (

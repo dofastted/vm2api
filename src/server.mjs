@@ -944,7 +944,6 @@ const clusterRoutes = createClusterRoutes({ manager: clusterManager, json, readB
 const slotShell = createSlotShell({
   projectRoot: cfg.paths.project,
   importOauth: commitImportedOauth,
-  routing: () => routingConfig,
 })
 for (const vm of listVms(cfg.paths.project)) {
   if (isCodexVm(vm)) continue

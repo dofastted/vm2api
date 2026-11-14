@@ -63,6 +63,7 @@ function fakeNode(files = new Map()) {
   const links = new Map()
   const handles = new Map()
   const published = []
+  const symlinksCreated = []
   sftp.open = (p, flags, attrs, cb) => {
     if (flags !== 'wx') return fail(cb, `unexpected flags ${flags}`)
     if (files.has(p) || links.has(p)) return fail(cb, 'EEXIST')
@@ -99,7 +100,9 @@ function fakeNode(files = new Map()) {
     files.delete(from)
     ok(cb)
   }
+  sftp.readlink = (p, cb) => (links.has(p) ? ok(cb, links.get(p)) : fail(cb, 'not a symbolic link'))
   sftp.symlink = (target, link, cb) => {
+    symlinksCreated.push(link)
     links.set(link, target)
     ok(cb)
   }
@@ -141,6 +144,7 @@ function fakeNode(files = new Map()) {
     modes,
     links,
     published,
+    symlinksCreated,
     session: { nodeId: 'node-t', client, host },
     remoteCred: `${host.root}/vms/vm-07/claude/credentials.json`,
   }
@@ -337,9 +341,14 @@ test('login prepare reconcile keeps a live remote credential when local is stale
   assert.equal(node.files.get(node.remoteCred).toString(), '{"rt":"rotated-live"}')
   const local = path.join(slotDir, 'cli-home', '.claude', 'credentials.json')
   assert.equal(fs.readFileSync(local, 'utf8'), '{"rt":"rotated-live"}')
+  const official = `${node.session.host.root}/vms/vm-07/claude/.credentials.json`
+  node.files.set(official, Buffer.from('{"rt":"loose-native-copy"}'))
   const link = await ensureRemoteOfficialCredentialLink(vm, slotDir, node.session)
   assert.equal(link.linked, true)
-  assert.equal(node.links.get(`${node.session.host.root}/vms/vm-07/claude/.credentials.json`), 'credentials.json')
+  assert.equal(node.links.get(official), 'credentials.json')
+  assert.equal(node.files.has(official), false)
+  assert.equal((await ensureRemoteOfficialCredentialLink(vm, slotDir, node.session)).linked, true)
+  assert.deepEqual(node.symlinksCreated, [official])
 })
 
 test('start reconcile never overwrites a remote credential the slot already rotated', async () => {
