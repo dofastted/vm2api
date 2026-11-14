@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { RefreshCw } from 'lucide-react'
+import { copyText } from '@/lib/clipboard'
 import { fmtExpiresAt } from '@/lib/format'
 import { subscribeSession } from '@/lib/session'
 import { Button } from '@/components/ui/button'
@@ -297,6 +298,19 @@ function SandboxOrders({
                     <code className='text-sm break-all select-all'>
                       {receipt.value}
                     </code>
+                    <Button
+                      type='button'
+                      variant='outline'
+                      size='sm'
+                      className='mt-2 block'
+                      onClick={async () => {
+                        const copied = await copyText(receipt.value)
+                        if (purchaseScope() === scope)
+                          setNotice(copied ? '已复制测试收据。' : '未能复制。请选中收据并手动复制。')
+                      }}
+                    >
+                      复制测试收据
+                    </Button>
                   </div>
                 ) : null}
               </li>
