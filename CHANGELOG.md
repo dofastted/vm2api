@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 账号面板的 Claude Code OAuth 由 VM 内 CRAG 包自带的原生 CC 生成链接并处理授权码；保留现有页面及其他授权方式。
+
 ## 1.4.093 — 2026-11-15 · CRAG 3.0.5 与启动错误分类修复
 
 - CRAG 出厂包更新至 3.0.5，使用供应方发布的签名加密包；官方 Claude 及非 CRAG payload 固定项不变。

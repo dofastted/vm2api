@@ -43,7 +43,13 @@ import {
   looksLikeOfficialSetupToken,
   SETUP_TOKEN_FLAVOR,
 } from '../oauth/claude-setup-token.mjs'
-import { AUTH_LOGIN_FLAVOR, AUTH_LOGIN_SOURCE } from '../oauth/claude-auth-login.mjs'
+import {
+  AUTH_LOGIN_FLAVOR,
+  AUTH_LOGIN_SOURCE,
+  completeClaudeAuthLogin,
+  isNativeAuthLoginSessionId,
+  startClaudeAuthLoginSession,
+} from '../oauth/claude-auth-login.mjs'
 import {
   canOfficialCc,
   isApiKeyMode,
@@ -5224,11 +5230,17 @@ export function createPanelHandler(ctx) {
             )
           }
           const flavor = body.flavor || body.type || 'cai'
-          const generated = generateAuthUrl({
-            vmId: id,
-            proxyUrl: slotProxy.proxyUrl,
-            flavor,
-          })
+          const generated =
+            normalizeOauthFlavor(flavor) === AUTH_LOGIN_FLAVOR
+              ? await withVmLock(`${vmPath}:claude-auth-login`, () =>
+                  startClaudeAuthLoginSession({
+                    vm: existing,
+                    projectRoot: cfg.paths.project,
+                    routing: ctx.routingConfig,
+                    force: body.force === true,
+                  }),
+                )
+              : generateAuthUrl({ vmId: id, proxyUrl: slotProxy.proxyUrl, flavor })
           const px = existing.proxy || {}
           return json(
             res,
@@ -5314,7 +5326,12 @@ export function createPanelHandler(ctx) {
           const sessionKey = String(body.session_id || body.sessionId || '')
           let oauth
           let oauthFromVm = false
-          if (looksLikeOfficialSetupToken(code)) {
+          if (normalizeOauthFlavor(flavor) === AUTH_LOGIN_FLAVOR || isNativeAuthLoginSessionId(sessionKey)) {
+            oauthFromVm = true
+            oauth = await withVmLock(`${vmPath}:claude-auth-login`, () =>
+              completeClaudeAuthLogin({ projectRoot: cfg.paths.project, vmId: id, sessionId: sessionKey, code }),
+            )
+          } else if (looksLikeOfficialSetupToken(code)) {
             oauth = await completeClaudeSetupToken({
               projectRoot: cfg.paths.project,
               vmId: id,
@@ -5332,12 +5349,12 @@ export function createPanelHandler(ctx) {
               routing: ctx.routingConfig,
             })
           }
-          if (looksLikeOfficialSetupToken(code) || oauth.flavor === SETUP_TOKEN_FLAVOR) {
-            oauth.type = 'official-setup-token'
-            oauth.mode = 'official-setup-token'
-          } else if (oauth.flavor === AUTH_LOGIN_FLAVOR || oauth.source === AUTH_LOGIN_SOURCE) {
+          if (oauth.flavor === AUTH_LOGIN_FLAVOR || oauth.source === AUTH_LOGIN_SOURCE) {
             oauth.type = 'oauth'
             oauth.mode = 'oauth'
+          } else if (looksLikeOfficialSetupToken(code) || oauth.flavor === SETUP_TOKEN_FLAVOR) {
+            oauth.type = 'official-setup-token'
+            oauth.mode = 'official-setup-token'
           } else if (
             normalizeOauthFlavor(flavor) === 'setup_token' ||
             oauth.flavor === 'setup_token' ||

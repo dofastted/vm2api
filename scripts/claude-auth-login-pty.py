@@ -18,7 +18,7 @@ import subprocess
 import time
 from pathlib import Path
 
-URL_RE = re.compile(rb"https://claude\.com/cai/oauth/authorize\?[^\s\x1b\x07\x08\"']+")
+URL_RE = re.compile(rb"https://claude\.com/cai/oauth/authorize\?[^\s\x1b\x07\x08\"']+(?=\s)")
 OSC_URL_RE = re.compile(
     rb"\x1b\]8;[^;]*;(https://claude\.com/cai/oauth/authorize\?[^\x07]+)\x07"
 )
@@ -76,8 +76,7 @@ def decode_url(raw: bytes) -> str:
     osc = OSC_URL_RE.search(raw)
     if osc:
         return osc.group(1).decode("ascii", "ignore")
-    compact = re.sub(rb"[\r\n\s]+", b"", strip_ansi(raw))
-    m = URL_RE.search(compact)
+    m = URL_RE.search(strip_ansi(raw))
     return m.group(0).decode("ascii", "ignore") if m else ""
 
 
@@ -322,12 +321,11 @@ def main() -> int:
                 write_status(status="login_ready", auth_url=url, error=None)
                 return 0
             try:
-                _, status = os.waitpid(pid, os.WNOHANG)
+                finished_pid, _ = os.waitpid(pid, os.WNOHANG)
             except ChildProcessError:
-                status = 0
                 pid_alive = False
             else:
-                pid_alive = status == 0
+                pid_alive = finished_pid == 0
             ready, _, _ = select.select([master], [], [], 0.25)
             if ready:
                 try:
@@ -348,7 +346,8 @@ def main() -> int:
                             write_status(
                                 status="waiting_auth", auth_url=url, error=None
                             )
-                            prompt_ready = True
+                    if url and PROMPT_RE.search(tail) and not waiting_fresh_prompt:
+                        prompt_ready = True
                     if SUCCESS_RE.search(tail):
                         logged_in = True
                     if INVALID_RE.search(tail) and not logged_in:
@@ -421,6 +420,12 @@ def main() -> int:
             os.close(master)
         except OSError:
             pass
+        cleanup = os.environ.get("KIN_CLEANUP_ARGV")
+        if cleanup:
+            try:
+                subprocess.run(["docker", *json.loads(cleanup)], timeout=5, check=False)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
 
 
 if __name__ == "__main__":

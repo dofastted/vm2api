@@ -397,10 +397,19 @@ test('panel Claude Code exchange automatically syncs native credentials and supp
     })
     assert.equal(gen.status, 200, gen.text)
     const generated = gen.json.data || gen.json
+    assert.equal(generated.source, 'claude-auth-login')
+    assert.match(generated.auth_url, /^https:\/\/claude\.com\/cai\/oauth\/authorize\?/)
+    const wrongSession = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/exchange-code', {
+      body: { flavor: 'claude_code', session_id: `native-${'0'.repeat(32)}`, code: 'pasted-auth-code' },
+    })
+    assert.equal(wrongSession.status, 400, wrongSession.text)
+    assert.equal(wrongSession.json.error.code, 'session_vm_mismatch')
     const exchanged = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/exchange-code', {
       body: { session_id: generated.session_id, code: 'pasted-auth-code' },
     })
     assert.equal(exchanged.status, 200, exchanged.text)
+    assert.equal(exchanged.json.data.source, 'claude-auth-login')
+    assert.equal(exchanged.json.data.flavor, 'claude_code')
     const claudeDir = path.join(gw.project, 'vms', 'vm-sim-01', 'cli-home', '.claude')
     const official = path.join(claudeDir, '.credentials.json')
     const worker = path.join(claudeDir, 'credentials.json')
