@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- 修复集群 Docker 槽切换到 CRAG 后总被判为启动失败并停止调度：supervisor 未把节点槽的 PID 1 入口 `/opt/kin-live/crag-kernel` 识别为内核，转而在容器内另起节点上并不存在的 `.kin/kin-kernel`，返回 `kernel_mount_missing`；「恢复服务」与看门狗复活走同一路径，同样无法恢复。现与本机槽一致，等待或重启 PID 1 内核，就绪后正常解除 `runtime_start_failed`。
+
 ## 1.4.087 — 2026-11-14 · 稳定控制面集成与缓存保真
 
 - 保留调用方合法的缓存断点、未填写 TTL 的隐式 5m 和 1h→5m 混合顺序；缺省 TTL 只影响平台新增点，非法后续 1h 才降为 5m。同步钉住的 cli-node 缓存修复产物及配套 ARM64 重建输入，不回退最新云端 payload。（#1023）

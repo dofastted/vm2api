@@ -41,6 +41,7 @@ import { resetModelPolicy, saveModelPolicy } from '../../src/lib/protocol/model-
 import { slotRuntimeOwner } from '../../src/lib/oauth/oauth-credentials.mjs'
 import { closeDatabase, openDatabase } from '../../src/lib/db/database.mjs'
 import { socksUidFor } from '../../src/lib/vm/vm-runtime.mjs'
+import { REMOTE_CRAG_ENTRY } from '../../src/lib/vm/slot-engine.mjs'
 
 const unix = process.platform !== 'win32'
 const unixTest = unix ? test : test.skip
@@ -1919,62 +1920,67 @@ unixTest('pid1 kernel already booting is not docker-restarted', async () => {
   }
 })
 
-unixTest('wrapped PID1 recovery restarts the container instead of detaching a second kernel', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-wrapped-pid1-'))
-  const written = writeKernelConfig(
-    root,
-    { id: 'vm-wrapped-pid1' },
-    { token: 'tok', proxyUrl: '', proxyRequired: false },
-  )
-  const exec = {
-    vmId: 'vm-wrapped-pid1',
-    homeDir: path.join(root, 'vms', 'vm-wrapped-pid1', 'cli-home'),
-    vm: {
-      id: 'vm-wrapped-pid1',
-      runtime: { container: 'kin-wrapped-pid1', kernel_socket: written.socketPath },
-    },
-  }
-  const wrapped = [
-    '/bin/sh',
-    '-c',
-    'export TOKIO_WORKER_THREADS=2; exec "$@"',
-    'kin-kernel-cpu',
-    '/home/kincli/.kin/kin-kernel',
-    '--gateway-worker',
-    '--config',
-    '/run/kin/kernel.json',
-  ]
-  const calls = []
-  let server = null
-  const runDockerExec = async (args) => {
-    calls.push(args)
-    if (args[0] === 'inspect') return kernelInspectResult(wrapped[0], wrapped.slice(1))
-    if (args[0] === 'restart' && args[1] === 'kin-wrapped-pid1') {
-      server = http.createServer((_req, res) => {
-        res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 1, worker_version: 'fixture' }))
-      })
-      await new Promise((resolve, reject) => {
-        server.once('error', reject)
-        server.listen(written.socketPath, resolve)
-      })
+for (const [label, id, pid1] of [
+  [
+    'wrapped',
+    'vm-wrapped-pid1',
+    [
+      '/bin/sh',
+      '-c',
+      'export TOKIO_WORKER_THREADS=2; exec "$@"',
+      'kin-kernel-cpu',
+      '/home/kincli/.kin/kin-kernel',
+      '--gateway-worker',
+      '--config',
+      '/run/kin/kernel.json',
+    ],
+  ],
+  // A cluster node home has no .kin/kin-kernel; detaching one fails and parks the slot.
+  ['cluster CRAG', 'vm-cluster-crag-pid1', [REMOTE_CRAG_ENTRY, '--gateway-worker', '--config', '/run/kin/kernel.json']],
+]) {
+  unixTest(`${label} PID1 recovery restarts the container instead of detaching a second kernel`, async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `kin-kernel-${id}-`))
+    const written = writeKernelConfig(root, { id }, { token: 'tok', proxyUrl: '', proxyRequired: false })
+    const container = `kin-${id.slice(3)}`
+    const exec = {
+      vmId: id,
+      homeDir: path.join(root, 'vms', id, 'cli-home'),
+      vm: { id, runtime: { container, kernel_socket: written.socketPath } },
     }
-    return { ok: true }
-  }
+    const calls = []
+    let server = null
+    const runDockerExec = async (args) => {
+      calls.push(args)
+      if (args[0] === 'inspect') return kernelInspectResult(pid1[0], pid1.slice(1))
+      if (args.includes('-d'))
+        return { ok: false, error: 'stat /home/kincli/.kin/kin-kernel: no such file or directory' }
+      if (args[0] === 'restart' && args[1] === container) {
+        server = http.createServer((_req, res) => {
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 1, worker_version: 'fixture' }))
+        })
+        await new Promise((resolve, reject) => {
+          server.once('error', reject)
+          server.listen(written.socketPath, resolve)
+        })
+      }
+      return { ok: true }
+    }
 
-  try {
-    const ready = await ensureRustKernel(exec, { timeoutMs: 1000, healthTimeoutMs: 200, runDockerExec })
-    assert.equal(ready.ok, true, JSON.stringify(ready))
-    assert.equal(calls.filter((args) => args[0] === 'restart').length, 1)
-    assert.equal(
-      calls.some((args) => args.includes('-d')),
-      false,
-    )
-  } finally {
-    if (server) await new Promise((resolve) => server.close(resolve))
-    fs.rmSync(root, { recursive: true, force: true })
-  }
-})
+    try {
+      const ready = await ensureRustKernel(exec, { timeoutMs: 1000, healthTimeoutMs: 200, runDockerExec })
+      assert.equal(ready.ok, true, JSON.stringify(ready))
+      assert.equal(calls.filter((args) => args[0] === 'restart').length, 1)
+      assert.equal(
+        calls.some((args) => args.includes('-d')),
+        false,
+      )
+    } finally {
+      if (server) await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+}
 
 unixTest('concurrent Rust ensures issue one docker restart', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-concurrent-'))
