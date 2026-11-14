@@ -238,6 +238,7 @@ export async function exchangeTokenViaCookieAuth({
   exec,
   projectRoot,
   routing,
+  controllerProxyUrl,
 } = {}) {
   const parsed = parseFullCode(code, state)
   if (!fetchImpl) {
@@ -251,7 +252,7 @@ export async function exchangeTokenViaCookieAuth({
         proxy_url: proxyUrl,
         timeout_ms: timeoutMs,
       },
-      { exec, projectRoot, routing, timeoutMs, runNative: runNativeOAuthAuthService },
+      { exec, projectRoot, routing, timeoutMs, runNative: runNativeOAuthAuthService, controllerProxyUrl },
     )
   }
   const auth = await loadLocalAuthForTest()
@@ -293,7 +294,15 @@ export async function sessionKeyToOAuth(
             proxy_url: proxyUrl,
             timeout_ms: timeoutMs,
           },
-          { exec, projectRoot, routing, timeoutMs, runNative: runNativeOAuthAuthService },
+          {
+            exec,
+            projectRoot,
+            routing,
+            timeoutMs,
+            runNative: runNativeOAuthAuthService,
+            // Controller fallback route when the target kernel predates guest OAuth (guest-oauth-helper).
+            controllerProxyUrl: exec ? proxyUrl : undefined,
+          },
         )
       : await (async () => {
           const auth = await loadLocalAuthForTest()

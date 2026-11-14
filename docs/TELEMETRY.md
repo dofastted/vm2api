@@ -150,12 +150,15 @@ obsolete Go-only inventory command is removed; alignment uses the native
 publication action rather than broad process kills or automatic enablement.
 
 A rollout requires matching Node, Go OAuth worker, Rust and cli-node payloads.
-The worker must emit actual OAuth-attempt notifications. Old native
-binaries without the capability fail readiness explicitly; there is no shim or
-Go restart fallback. Source/build verification is not payload publication or
-production deployment. Use the private local build instructions before any
-separately authorized rollout, preserve VM storage/identity/credentials, and do
-not replace unrelated working-tree changes.
+The worker must emit actual OAuth-attempt notifications. Old native binaries
+without the capability fail readiness explicitly; there is no shim or Go restart
+fallback. OAuth exchange is the one exception: when the target kernel does not
+report `vm_telemetry`, the controller's `kin-oauth-auth` exchanges through the
+slot's bound SOCKS5 instead of restarting that kernel (see OAUTH.md).
+Source/build verification is not payload publication or production deployment.
+Use the private local build instructions before any separately authorized
+rollout, preserve VM storage/identity/credentials, and do not replace unrelated
+working-tree changes.
 
 ## Safe status and audit
 

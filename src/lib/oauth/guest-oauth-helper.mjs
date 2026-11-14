@@ -7,14 +7,44 @@ import { slotExec, startSlotReady } from '../vm/slot-runtime.mjs'
 import { getVm, patchVmRecord } from '../vm/vm-registry.mjs'
 import { hasBoundExit } from '../vm/egress.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
-import { postRustKernelTelemetryEvent, rustKernelPaths } from '../transport/rust-kernel-client.mjs'
+import { postRustKernelTelemetryEvent, rustKernelHealth, rustKernelPaths } from '../transport/rust-kernel-client.mjs'
 import { runSlotProcess } from '../transport/slot-oauth.mjs'
 
 const pendingAttempt = Symbol('guestOAuthAttempt')
+const controllerExchange = Symbol('controllerOAuthExchange')
 const safeCode = (value, fallback) => (/^[a-z][a-z0-9_]{0,63}$/.test(value) ? value : fallback)
 
 function fail(code, message) {
   return Object.assign(new Error(message), { code })
+}
+
+/** The credential came from the controller fallback below, not from the target VM. */
+export function exchangedOnController(oauth) {
+  return oauth?.[controllerExchange] === true
+}
+
+/**
+ * A slot whose kin-kernel / cli-node payload predates native telemetry never reports
+ * vm_telemetry. prepareSlotOAuth would then restart that kernel, wait out the boot
+ * budget and fail, so the exchange never reaches the provider (and a live slot loses
+ * its in-flight requests). Until the target kernel advertises the capability, exchange
+ * on the controller through the slot's bound SOCKS, as before the guest cutover: no
+ * slot start, kernel restart or guest exec. null = the in-VM path applies (or reports
+ * its own error, e.g. a VM without bound egress).
+ */
+async function controllerExchangeRoute({ exec, projectRoot, controllerProxyUrl, probeHealth, runNative }) {
+  if (controllerProxyUrl === undefined || typeof runNative !== 'function') return null
+  if (!projectRoot || !exec?.vmId || (exec.vm?.id && exec.vm.id !== exec.vmId)) return null
+  const vm = getVm(projectRoot, exec.vmId)
+  if (!vm?.id || slotHost(vm).native) return null
+  if (proxyBlockedReason(vm.proxy) || !hasBoundExit(vm.proxy)) return null
+  let health = null
+  try {
+    health = await probeHealth(slotExec(projectRoot, vm), { timeoutMs: 3000 })
+  } catch {}
+  if (health?.vm_telemetry === true) return null
+  if (controllerProxyUrl == null) throw fail('proxy_required', 'OAuth requires the target VM bound egress')
+  return { proxyUrl: controllerProxyUrl }
 }
 
 /** OS/CLI readiness is not account readiness and never reopens scheduling. */
@@ -72,6 +102,7 @@ export async function prepareSlotOAuth({
 /** Keep operation context in memory only, never in credentials or JSON responses. */
 export function carryOAuthAttempt(source, target) {
   if (source?.[pendingAttempt]) target[pendingAttempt] = source[pendingAttempt]
+  if (source?.[controllerExchange]) target[controllerExchange] = true
   return target
 }
 
@@ -94,8 +125,19 @@ export async function runGuestOAuthAuthService(
     runDocker = runSlotProcess,
     postTelemetry = postRustKernelTelemetryEvent,
     runNative,
+    controllerProxyUrl,
+    probeHealth = rustKernelHealth,
   } = {},
 ) {
+  const controller = await controllerExchangeRoute({ exec, projectRoot, controllerProxyUrl, probeHealth, runNative })
+  if (controller) {
+    const credential = await runNative({ ...payload, proxy_url: controller.proxyUrl })
+    if (!credential?.access_token) {
+      throw fail('oauth_auth_output_invalid', 'Controller OAuth helper did not return a credential')
+    }
+    credential[controllerExchange] = true
+    return credential
+  }
   const context = await prepare({ exec, projectRoot, routing, timeoutMs })
   const { host, configDir, home } = context
   exec = context.exec

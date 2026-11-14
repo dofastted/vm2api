@@ -22,6 +22,8 @@ commitImportedOauth → 仅完整 OAuth 运行模式排队官方 Claude Code 初
                    → Setup Token 运行模式保留完整授权 scope，但不初装
 ```
 
+**旧槽内核回退**：换票前先只读查一次槽内核健康（3 秒）。内核没有报 `vm_telemetry`（10-29 原生遥测之前的 kin-kernel / cli-node payload）或连不上时，不再走 `prepareSlotOAuth`（它会重启该槽内核、等满启动预算后报 `oauth_runtime_not_ready`，授权码根本发不出去，在线槽还会断掉在途请求），改由控制面的 `bin/kin-oauth-auth` 经该槽绑定的 SOCKS5（本地出口为 `""` 直连）换票，与 guest 换票之前的做法相同；不启动槽、不重启内核、不进 VM。这样换到的凭证照旧由控制面经同一出口补全 `oauth_account` 身份。未绑定 / 被封的出口仍报 `proxy_required`，不回退。授权链接和 Cookie（sessionKey）两条入口都适用；内核升级到报 `vm_telemetry` 的 payload 后自动回到 VM 内换票。
+
 ## 导入门控
 
 三条入口都要求槽位已存在且绑定可用出口：远程 SOCKS5，或本地出口 `px-local`。本地出口没有 SOCKS URL，控制面传 `proxy_url: ""`，换票、bootstrap 都走宿主机默认路由直连（GPT 槽沿用 DEPLOY.md 里的部署代理）；未绑定传 `null`，仍报 `proxy_required`。生产忽略 `require_proxy: false`（仅测试 mock 可绕过）。

@@ -172,6 +172,8 @@ async function exchangeCodeForToken(authCode, codeVerifier, state, proxyUrl, ses
     proxyUrl: px,
     redirectUri: session.redirectUri,
     tokenUrls: session.tokenUrls,
+    // Controller fallback route when the target kernel predates guest OAuth (guest-oauth-helper).
+    controllerProxyUrl: options.exec ? normalizeSocks(proxyUrl) : undefined,
     ...options,
   })
 }
