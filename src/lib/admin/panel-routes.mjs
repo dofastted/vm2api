@@ -277,6 +277,7 @@ import {
 import { inspectClusterPayloadChanges, refreshClusterSlotPayloads } from '../cluster/remote-slot.mjs'
 import { readRawBody as defaultReadRawBody } from '../http/respond.mjs'
 import { corsHeadersForRequest } from '../http/cors.mjs'
+import { createCragShopHandler, cragShopRoute, isCragShopPath } from './crag-shop.mjs'
 import { restartRustKernel, syncClaudeKernelConfigs, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 
 import { countTokensViaWorker, syncClaudeClientCredentials } from '../transport/go-worker-client.mjs'
@@ -660,6 +661,13 @@ export function createPanelHandler(ctx) {
   const refreshCluster = ctx.refreshClusterSlotPayloads || refreshClusterSlotPayloads
   const requireAuth = (...args) => ctx.requireAuth(...args)
   const cfg = ctx.cfg
+  const handleCragShop = createCragShopHandler({
+    getDb: ctx.getDb,
+    dataDir: cfg?.paths?.data,
+    publicBaseUrl: cfg?.base_url,
+    json,
+    readRawBody,
+  })
   const routingConfigPath = ctx.routingConfigPath
   const stickyRouter = ctx.stickyRouter
   const accountQuota = ctx.accountQuota
@@ -1526,15 +1534,17 @@ export function createPanelHandler(ctx) {
       const username = body.username || body.user || body.u || ''
       const password = body.password || body.pass || body.p || ''
       const authed = verifyPanelLogin(username, password)
+      let buyerId = authed?.id
       if (!authed) {
         return json(res, 401, { ok: false, error: { message: '用户名或密码错误', type: 'auth' } })
       }
       if (authed.source === 'env') {
         try {
-          panelUsers.bootstrapFromEnv({ username: authed.username, password })
+          buyerId = panelUsers.bootstrapFromEnv({ username: authed.username, password })?.id
         } catch {}
       }
-      const token = createPanelSession(authed.username, { role: authed.role })
+      const buyer = buyerId ? { id: buyerId } : authed.source === 'env' ? { configuredAdmin: true } : undefined
+      const token = createPanelSession(authed.username, { role: authed.role, buyer })
       const secure = panelCookieSecure(req)
       res.setHeader('Set-Cookie', panelSessionCookie(token, { secure }))
       const me = { user: authed.username, role: authed.role }
@@ -1554,6 +1564,16 @@ export function createPanelHandler(ctx) {
       const secure = panelCookieSecure(req)
       res.setHeader('Set-Cookie', clearPanelSessionCookie({ secure }))
       return json(res, 200, { ok: true })
+    }
+
+    if (isCragShopPath(p)) {
+      res.setHeader('Cache-Control', 'no-store')
+      if (!requireAuth(req, res, { buyer: true })) return true
+      const route = cragShopRoute(req.method, p)
+      if (route && !authorizePanelRoute(req.method, p, panelIdentity(req).role).ok) {
+        return json(res, 403, { ok: false, error: { code: 'forbidden', message: 'Forbidden' } })
+      }
+      return handleCragShop(req, res, url, route)
     }
 
     if (p.startsWith('/api/panel')) {

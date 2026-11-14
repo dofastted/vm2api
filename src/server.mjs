@@ -109,6 +109,7 @@ import { createResponsesWsHandler } from './lib/protocol/responses-ws.mjs'
 import { handleUserUsage } from './lib/protocol/user-count-tokens.mjs'
 import { createKeySelfHandler, KEY_SELF_PATHS } from './lib/protocol/key-self.mjs'
 import { createPanelHandler } from './lib/admin/panel-routes.mjs'
+import { isCragShopPath, sessionBuyerOwner } from './lib/admin/crag-shop.mjs'
 
 const FEATURES = [
   'passthrough',
@@ -702,7 +703,7 @@ function rejectAuth(req, res, error) {
 }
 
 /** `keyGate: false` (key self-service) skips the managed key's quota / RPM / concurrency gate and the gateway bucket. */
-function requireAuth(req, res, { keyGate = true } = {}) {
+function requireAuth(req, res, { keyGate = true, buyer = false } = {}) {
   req.presentedApiKey = extractApiKey(req)
   const token = extractPanelToken(req) || req.presentedApiKey
   if (!token) {
@@ -737,7 +738,15 @@ function requireAuth(req, res, { keyGate = true } = {}) {
     const rec = panelUsers.getByUsername(session.user)
     req.panelUserId = rec?.id || null
     req.panelVmCreateQuota = rec?.vm_create_quota ?? 0
+    if (buyer) req.panelBuyerOwner = sessionBuyerOwner(session, rec, getPanelAdmin())
     return true
+  }
+  if (buyer) {
+    json(res, 403, {
+      ok: false,
+      error: { code: 'shop_login_required', message: 'Sign in to the panel to access CRAG shop' },
+    })
+    return false
   }
   // Master env API key — unlimited admin
   if (timingSafeEqualStr(token, cfg.api_key)) {
@@ -962,6 +971,7 @@ cliNodeGuard = createCliNodeGuard({
 })
 
 const handlePanel = createPanelHandler({
+  getDb,
   json,
   writeSSEHeaders,
   readBody,
@@ -1085,12 +1095,13 @@ const gracefulShutdown = createGracefulShutdown({
 const server = http.createServer(async (req, res) => {
   try {
     res.req = req
+    const url = parseRequestUrl(req)
+    if (url && isCragShopPath(url.pathname)) res.setHeader('Cache-Control', 'no-store')
     if (req.method === 'OPTIONS') {
       res.writeHead(204, corsHeadersForRequest(req))
       return res.end()
     }
 
-    const url = parseRequestUrl(req)
     if (!url) {
       return json(res, 400, { error: { message: 'Invalid URL', type: 'invalid_request' } })
     }
