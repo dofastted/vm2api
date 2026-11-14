@@ -7,6 +7,7 @@ import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
 import { CragShopDialog } from '@/features/billing/crag-shop-dialog'
+import { CragHostSubscription } from './crag-host-subscription'
 
 const licenseMessages: Record<string, string> = {
   license_required:
@@ -81,7 +82,11 @@ export function CragLicenseSummary({
         <div>
           <dt className='text-xs text-muted-foreground'>授权方式</dt>
           <dd className='mt-1'>
-            {license.kind === 'offline' ? '离线通用码' : '在线设备授权'}
+            {license.scope === 'host'
+              ? `宿主机订阅 · 应用锁 ${license.seat ?? '—'}`
+              : license.kind === 'offline'
+                ? '离线通用码'
+                : '在线设备授权'}
           </dd>
         </div>
       ) : null}
@@ -108,6 +113,7 @@ export function CragLicenseSummary({
 }
 
 export function CragLicenseEditor({
+  vmId,
   data,
   loading,
   loadError,
@@ -119,6 +125,7 @@ export function CragLicenseEditor({
   onActivate,
   onClose,
 }: {
+  vmId: string
   data?: CragLicenseResponse
   loading: boolean
   loadError: unknown
@@ -195,6 +202,7 @@ export function CragLicenseEditor({
           {statusMessage}
         </p>
       ) : null}
+      <CragHostSubscription vmId={vmId} />
       <div className='flex flex-wrap gap-2' role='group' aria-label='授权方式'>
         <Button
           type='button'

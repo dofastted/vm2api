@@ -511,6 +511,7 @@ function SlotKernelSwitch({
         <div id={`crag-license-${id}`} className='min-w-0 pt-2'>
           {licenseOpen ? (
             <CragLicenseEditor
+              vmId={id}
               data={licenseQuery.data}
               loading={licenseQuery.isFetching}
               loadError={licenseQuery.error}
