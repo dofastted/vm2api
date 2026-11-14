@@ -161,7 +161,13 @@ export async function pushSlotBinaries(vm, projectRoot, session = null) {
     } catch {
       continue
     }
-    await writeRemoteFile(sftp, `${remote}/${name}`, data, { mode: 0o755, owner })
+    // Every slot start (OAuth, recovery, watchdog) lands here; resending unchanged
+    // binaries over a slow node link pushed panel requests past the proxy timeout.
+    const target = `${remote}/${name}`
+    const sha = crypto.createHash('sha256').update(data).digest('hex')
+    if ((await remoteFileSha256(s.client, target)) !== sha) {
+      await writeRemoteFile(sftp, target, data, { mode: 0o755, owner })
+    }
     digest.update(name).update(data)
     pushed.push(name)
   }
