@@ -114,6 +114,61 @@ test('CRAG download failure never holds scheduling or changes installed bytes', 
   assert.deepEqual(f.calls, [])
 })
 
+test('pull-only selects a pinned package without inspecting or changing cluster slots', async (t) => {
+  const f = fixture(t)
+  const file = path.join(f.root, 'vms/vm-live.json')
+  fs.writeFileSync(file, JSON.stringify({ ...f.vms[0], node_id: 'node-one' }))
+  // Pulling must not depend on a healthy fleet or a running control plane.
+  fs.writeFileSync(path.join(f.root, 'vms/vm-incomplete.json'), '{')
+  fs.rmSync(path.join(f.root, 'src/config/routing.json'))
+  const before = f.vms.map((vm) => ({
+    record: fs.readFileSync(path.join(f.root, 'vms', `${vm.id}.json`)),
+    wrapper: fs.readFileSync(path.join(f.root, 'vms', vm.id, 'cli-home/.kin/kin-kernel')),
+  }))
+  const installed = fs.readFileSync(path.join(f.root, 'vms/vm-live/cli-home/.kin/crag-v2/manifest.json'))
+  const unexpected = () => assert.fail('pull-only must not access slot processes or the panel API')
+  const result = await updateCrag(f.root, {
+    pullOnly: true,
+    tag: 'v2.8.15',
+    pull: async (root, options) => {
+      assert.equal(root, f.root)
+      assert.deepEqual(options, { kernel: 'crag', tag: 'v2.8.15', latest: true })
+      return { ok: true, release: { tag: options.tag } }
+    },
+    api: unexpected,
+    health: unexpected,
+    coreHashes: unexpected,
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.pull_only, true)
+  assert.equal(result.release.tag, 'v2.8.15')
+  assert.match(result.manifest_sha256, /^[a-f0-9]{64}$/)
+  assert.deepEqual(result.items, [])
+  for (const [i, vm] of f.vms.entries()) {
+    assert.deepEqual(fs.readFileSync(path.join(f.root, 'vms', `${vm.id}.json`)), before[i].record)
+    assert.deepEqual(fs.readFileSync(path.join(f.root, 'vms', vm.id, 'cli-home/.kin/kin-kernel')), before[i].wrapper)
+  }
+  assert.deepEqual(fs.readFileSync(path.join(f.root, 'vms/vm-live/cli-home/.kin/crag-v2/manifest.json')), installed)
+  assert.equal(fs.existsSync(path.join(f.root, 'share/crag/kernels/v2/.update-lock')), false)
+})
+
+test('pull-only propagates download and package verification failures without touching slots', async (t) => {
+  const f = fixture(t)
+  const api = () => assert.fail('pull-only must not hold or restart slots')
+  await assert.rejects(
+    updateCrag(f.root, {
+      pullOnly: true,
+      api,
+      pull: async () => ({ ok: false, code: 'crag_v2_authority_mismatch' }),
+    }),
+    /crag_v2_authority_mismatch/,
+  )
+  fs.writeFileSync(path.join(f.pkg, 'manifest.json'), '{}')
+  await assert.rejects(updateCrag(f.root, { ...f, api, pullOnly: true }), /crag_v2_manifest_invalid/)
+  assert.deepEqual(f.calls, [])
+  assert.equal(fs.existsSync(path.join(f.root, 'share/crag/kernels/v2/.update-lock')), false)
+})
+
 test('CRAG update is idempotent and does not pause or restart already current slots', async (t) => {
   const f = fixture(t)
   await updateCrag(f.root, f)
@@ -174,10 +229,18 @@ test('unsupported cluster CRAG fails before downloading and another updater cann
   const f = fixture(t)
   const file = path.join(f.root, 'vms/vm-live.json')
   fs.writeFileSync(file, JSON.stringify({ ...f.vms[0], node_id: 'node-one' }))
-  await assert.rejects(updateCrag(f.root, { ...f, pull: () => assert.fail('must preflight') }), /unsupported_placement/)
+  await assert.rejects(updateCrag(f.root, { ...f, pull: () => assert.fail('must preflight') }), (error) => {
+    assert.equal(error.code, 'crag_v2_unsupported_placement')
+    assert.match(error.message, /vm-live/)
+    assert.match(error.message, /--pull-only/)
+    assert.match(error.message, /--crag-version/)
+    return true
+  })
+  assert.deepEqual(f.calls, [])
   const lock = path.join(f.root, 'share/crag/kernels/v2/.update-lock')
   fs.mkdirSync(lock)
   await assert.rejects(updateCrag(f.root, f), /EEXIST/)
+  await assert.rejects(updateCrag(f.root, { ...f, pullOnly: true }), /EEXIST/)
   assert.equal(fs.existsSync(lock), true)
   assert.equal(cragUpdateInventory(f.root, { inference: { dataplane: 'wrap' } }).length, 6)
 })

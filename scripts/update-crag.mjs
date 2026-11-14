@@ -83,7 +83,14 @@ function refreshCachedPackage(src, dest) {
 
 export async function updateCrag(
   root,
-  { tag = '', api, pull = pullKernelRelease, health = rustKernelHealth, coreHashes = runningCragHashes } = {},
+  {
+    tag = '',
+    pullOnly = false,
+    api,
+    pull = pullKernelRelease,
+    health = rustKernelHealth,
+    coreHashes = runningCragHashes,
+  } = {},
 ) {
   const base = path.join(root, 'share/crag/kernels/v2')
   fs.mkdirSync(base, { recursive: true })
@@ -92,17 +99,30 @@ export async function updateCrag(
   const reason = `crag_update_${crypto.randomUUID()}`
   let held = false
   try {
-    const routing = JSON.parse(fs.readFileSync(path.join(root, 'src/config/routing.json'), 'utf8'))
-    const inventory = cragUpdateInventory(root, routing)
+    const routing = pullOnly ? null : JSON.parse(fs.readFileSync(path.join(root, 'src/config/routing.json'), 'utf8'))
+    const inventory = pullOnly ? [] : cragUpdateInventory(root, routing)
     const targets = inventory.filter((row) => row.action === 'sync')
     // This standalone updater reads local files/processes; node installs use the panel lifecycle.
-    if (targets.some(({ vm }) => vm.node_id)) throw new Error('crag_v2_unsupported_placement')
+    const clusterIds = targets.filter(({ vm }) => vm.node_id).map(({ vm }) => vm.id)
+    if (clusterIds.length) {
+      throw Object.assign(
+        new Error(
+          `crag_v2_unsupported_placement: cluster CRAG slots (${clusterIds.join(', ')}) require the panel installer. ` +
+            'Run crag-update --pull-only --crag-version <tag>, then install the downloaded CRAG package on the selected slots from the kernel page.',
+        ),
+        { code: 'crag_v2_unsupported_placement' },
+      )
+    }
     const pulled = await pull(root, { kernel: 'crag', tag, latest: true })
     if (!pulled.ok) throw new Error(pulled.code || 'crag_pull_failed')
     const src = cragV2PackageRoot(root)
     const verified = verifyCragV2Tree(src)
     if (!verified.ok) throw new Error(verified.code)
     const manifest = fs.readFileSync(path.join(src, 'manifest.json'))
+    const manifestSha256 = crypto.createHash('sha256').update(manifest).digest('hex')
+    if (pullOnly) {
+      return { ok: true, pull_only: true, release: pulled.release, manifest_sha256: manifestSha256, items: [] }
+    }
     const expectedCore = verified.manifest.payload.plaintext_sha256
     const running = targets.filter(({ vm }) => vm.status === 'running')
     const matches = (hashes) => hashes.length === 1 && hashes[0] === expectedCore
@@ -181,7 +201,7 @@ export async function updateCrag(
     return {
       ok: true,
       release: pulled.release,
-      manifest_sha256: crypto.createHash('sha256').update(manifest).digest('hex'),
+      manifest_sha256: manifestSha256,
       items,
     }
   } finally {
@@ -256,7 +276,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   try {
     console.log(JSON.stringify(await updateCrag(root, { tag: process.argv[3] || '', api: localPanelApi(root) })))
   } catch (error) {
-    console.error(`CRAG update failed: ${error.message}; check slot state and schedule holds before resuming traffic`)
+    const hint =
+      error.code === 'crag_v2_unsupported_placement'
+        ? 'no package was downloaded and no slots were paused'
+        : 'check slot state and schedule holds before resuming traffic'
+    console.error(`CRAG update failed: ${error.message}; ${hint}`)
     process.exitCode = 1
   }
 }

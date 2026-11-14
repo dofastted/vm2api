@@ -31,6 +31,7 @@ SERVICE_NAME="vm2api"
 DEFAULT_PORT="${PORT:-8787}"
 TARGET_VERSION=""
 CRAG_TARGET_VERSION=""
+CRAG_PULL_ONLY=0
 ASSUME_YES=0
 NO_START=0
 SYNC_WRAP=1
@@ -73,6 +74,7 @@ usage() {
 选项:
   --version vX.Y.Z     指定 tag（可带 -amd64 / -arm64 后缀，须与宿主架构一致）
   --crag-version vX.Y.Z 指定 CRAG 供应仓 Release（省略为最新正式版）
+  --pull-only         crag-update 仅下载并校验 CRAG 包，不安装或重启槽位
   --dir PATH           安装目录（默认 ${INSTALL_DIR}）
   --yes                非交互
   --no-start           只拉代码，不 compose up
@@ -744,11 +746,15 @@ cmd_update_crag() {
     err "crag-update 需要更新槽内运行二进制，不能与 --no-start 一起使用"
     return 1
   fi
+  local updater="update-crag.mjs"
+  if [ "$CRAG_PULL_ONLY" = 1 ]; then
+    updater="pull-crag.mjs"
+  fi
   if [ "$(docker inspect --format '{{.State.Running}}' "$SERVICE_NAME" 2>/dev/null || true)" = true ]; then
-    docker exec "$SERVICE_NAME" node /opt/vm2api/scripts/update-crag.mjs /opt/vm2api "$CRAG_TARGET_VERSION"
+    docker exec "$SERVICE_NAME" node "/opt/vm2api/scripts/${updater}" /opt/vm2api "$CRAG_TARGET_VERSION"
     return
   fi
-  node "${INSTALL_DIR}/scripts/update-crag.mjs" "$INSTALL_DIR" "$CRAG_TARGET_VERSION"
+  node "${INSTALL_DIR}/scripts/${updater}" "$INSTALL_DIR" "$CRAG_TARGET_VERSION"
 }
 
 update_default_crag() {
@@ -960,6 +966,10 @@ while [ $# -gt 0 ]; do
       CRAG_TARGET_VERSION="$2"
       shift 2
       ;;
+    --pull-only)
+      CRAG_PULL_ONLY=1
+      shift
+      ;;
     --dir)
       INSTALL_DIR="$2"
       shift 2
@@ -995,6 +1005,11 @@ while [ $# -gt 0 ]; do
       ;;
   esac
 done
+
+if [ "$CRAG_PULL_ONLY" = 1 ] && [ "$COMMAND" != crag-update ]; then
+  err "--pull-only 仅用于 crag-update；后续请在内核页安装到所选槽位"
+  exit 1
+fi
 
 case "$COMMAND" in
   install) cmd_install ;;
