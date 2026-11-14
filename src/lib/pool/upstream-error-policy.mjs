@@ -376,6 +376,17 @@ function classifyUpstreamResultRaw(
   const reset = resetFromHeaders(result.headers, now)
 
   const hay = `${code} ${message} ${workerCode}`
+  if (/Claude native launch failed/i.test(message)) {
+    return {
+      scope: 'worker',
+      action: 'stop',
+      reason: /Permission denied|Operation not permitted|os error (?:1|13)\b/i.test(message)
+        ? 'native_launch_permission_denied'
+        : 'native_launch_failed',
+      cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
   if (
     [code, workerCode].some((value) =>
       /^license_(required|expired|not_yet_valid|invalid|binding_mismatch|unconfigured)$/.test(value),
@@ -692,7 +703,10 @@ function classifyUpstreamResultRaw(
         retrySameAccount: true,
       })
     }
-    return overloadedUnit(now)
+    return {
+      ...overloadedUnit(now),
+      reason: /overload/i.test(message) ? 'provider_overloaded' : 'upstream_server_error',
+    }
   }
   return { scope: 'request', action: 'stop', reason: `http_${status}`, cooldownUntil: null }
 }
