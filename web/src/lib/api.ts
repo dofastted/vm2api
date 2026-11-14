@@ -57,11 +57,10 @@ export function isApiError(error: unknown): error is ApiError {
 type Json =
   Record<string, unknown> | unknown[] | string | number | boolean | null
 
-function authHeaders(): HeadersInit {
+function authHeaders(token: string): HeadersInit {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
   }
-  const token = sessionToken()
   if (token) headers.Authorization = `Bearer ${token}`
   return headers
 }
@@ -119,13 +118,23 @@ export async function panelFetch(
   path: string,
   opts: RequestInit = {}
 ): Promise<Response> {
-  const url = `${apiBase() || ''}${path}`
+  const base = apiBase()
+  const token = sessionToken()
+  const url = `${base}${path}`
   const res = await fetch(url, {
     ...opts,
     credentials: 'include',
-    headers: { ...authHeaders(), ...(opts.headers || {}) },
+    headers: { ...authHeaders(token), ...(opts.headers || {}) },
   })
-  if (res.status === 401 && isPanelApiPath(path)) expirePanelSession()
+  // A late 401 for the previous panel/session must not sign out its replacement.
+  if (
+    res.status === 401 &&
+    isPanelApiPath(path) &&
+    token === sessionToken() &&
+    base === apiBase()
+  ) {
+    expirePanelSession()
+  }
   return res
 }
 
