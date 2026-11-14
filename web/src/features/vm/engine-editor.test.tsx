@@ -1,8 +1,11 @@
 import type { ComponentProps, ReactNode } from 'react'
+import type * as ReactModule from 'react'
+import { MutationObserver, QueryClient } from '@tanstack/react-query'
 import type { Vm } from '@/types/panel-vm'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, patchVm } from '@/lib/api'
+import type { VmKernelSwitchJob } from '@/lib/api'
+import { ApiError, patchVm, startVmKernelSwitch } from '@/lib/api'
 import { VmEngineEditor } from './engine-editor'
 
 type Target = 'wrap' | 'v2'
@@ -11,26 +14,50 @@ type SwitchOptions = {
   onMutate: (target: Target) => void
   onSuccess: (data: unknown, target: Target) => void
   onError: (error: Error) => void
-  onSettled: () => Promise<unknown>
+  onSettled: (
+    data?: unknown,
+    error?: Error | null
+  ) => Promise<unknown> | undefined
+  retry: false
 }
 
 const mocks = vi.hoisted(() => ({
+  admin: true,
   mutations: [] as unknown[],
   queries: [] as { enabled?: boolean }[],
   buttons: [] as { children?: ReactNode; disabled?: boolean }[],
   mutationState: {} as Record<string, unknown>,
+  jobState: {} as Record<string, unknown>,
+  effects: [] as (() => void)[],
+  setQueryData: vi.fn(),
   invalidateQueries: vi.fn().mockResolvedValue(undefined),
   loading: vi.fn(),
   success: vi.fn(),
   error: vi.fn(),
 }))
 
+vi.mock('react', async (importOriginal) => ({
+  ...(await importOriginal<typeof ReactModule>()),
+  useEffect: (effect: () => void) => {
+    mocks.effects.push(effect)
+  },
+}))
 vi.mock('@tanstack/react-query', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@tanstack/react-query')>()),
-  useQueryClient: () => ({ invalidateQueries: mocks.invalidateQueries }),
-  useQuery: (options: { enabled?: boolean }) => {
+  useQueryClient: () => ({
+    invalidateQueries: mocks.invalidateQueries,
+    setQueryData: mocks.setQueryData,
+  }),
+  useQuery: (options: { enabled?: boolean; queryKey: readonly unknown[] }) => {
     mocks.queries.push(options)
-    return {}
+    return options.queryKey.includes('vm-kernel-switch')
+      ? {
+          isPending: false,
+          isFetching: false,
+          isError: false,
+          ...mocks.jobState,
+        }
+      : {}
   },
   useMutation: (options: unknown) => {
     const index = mocks.mutations.push(options) - 1
@@ -57,9 +84,10 @@ vi.mock('sonner', () => ({
 vi.mock('@/lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/api')>()),
   patchVm: vi.fn().mockResolvedValue({}),
+  startVmKernelSwitch: vi.fn(),
 }))
 vi.mock('@/features/vm/vm-perms', () => ({
-  useVmPerms: () => ({ admin: true }),
+  useVmPerms: () => ({ admin: mocks.admin }),
 }))
 vi.mock('@/components/ui/button', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/components/ui/button')>()
@@ -93,6 +121,7 @@ function render(overrides: Partial<Vm> = {}) {
   mocks.mutations.length = 0
   mocks.queries.length = 0
   mocks.buttons.length = 0
+  mocks.effects.length = 0
   return renderToStaticMarkup(
     <VmEngineEditor
       id='vm-01'
@@ -110,9 +139,30 @@ function options() {
   return mocks.mutations[2] as SwitchOptions
 }
 
+function job(overrides: Partial<VmKernelSwitchJob> = {}): VmKernelSwitchJob {
+  return {
+    id: 'job-01',
+    vm_id: 'vm-01',
+    dataplane: 'crag',
+    crag_kernel_version: 'v2',
+    status: 'running',
+    started_at: '2026-11-15T00:00:00Z',
+    finished_at: null,
+    error: null,
+    ...overrides,
+  }
+}
+
+function runEffects() {
+  for (const effect of mocks.effects) effect()
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
+  mocks.admin = true
   mocks.mutationState = {}
+  mocks.jobState = {}
+  vi.mocked(startVmKernelSwitch).mockResolvedValue(job())
 })
 
 describe('VM page kernel switch feedback', () => {
@@ -130,12 +180,18 @@ describe('VM page kernel switch feedback', () => {
         disabled: false,
       })
       expect(html).not.toContain('KVM 槽不运行 CRAG v2')
-      expect(mocks.queries).toEqual([
+      expect(mocks.queries).toContainEqual(
         expect.objectContaining({
           queryKey: ['panel', 'vm', 'vm-01', 'crag-license'],
           enabled: true,
-        }),
-      ])
+        })
+      )
+      expect(mocks.queries).toContainEqual(
+        expect.objectContaining({
+          queryKey: ['panel', 'vm-kernel-switch', 'vm-01'],
+          enabled: !!node_id,
+        })
+      )
 
       render({
         ...vm,
@@ -157,7 +213,8 @@ describe('VM page kernel switch feedback', () => {
     })
     expect(html).not.toContain('CRAG 授权 / 续期')
     expect(html).toContain('macOS 原生节点不运行 CRAG v2')
-    expect(mocks.queries).toEqual([expect.objectContaining({ enabled: false })])
+    expect(mocks.queries).toHaveLength(2)
+    expect(mocks.queries.every((query) => query.enabled === false)).toBe(true)
   })
 
   it('does not expose Claude kernel or license controls for Codex KVM slots', () => {
@@ -338,6 +395,7 @@ describe('VM page kernel switch feedback', () => {
       ['panel', 'vms'],
       ['panel', 'dashboard'],
     ])
+    if (!settled) throw new Error('Expected the VM refresh to be awaited')
     let finished = false
     void settled.then(() => {
       finished = true
@@ -360,4 +418,223 @@ describe('VM page kernel switch feedback', () => {
       expect(patchVm).toHaveBeenCalledExactlyOnceWith('vm-01', body)
     }
   )
+
+  it('does not treat an accepted remote job as success while the policy already matches', async () => {
+    mocks.mutationState = { isSuccess: true, variables: 'v2' }
+    const running = job()
+    mocks.jobState = { data: running }
+    const html = render({
+      node_id: 'node-docker',
+      resolved_dataplane: 'crag',
+      resolved_crag_kernel_version: 'v2',
+    })
+    options().onSuccess(running, 'v2')
+    await options().onSettled(running, null)
+    runEffects()
+    expect(html).toContain('正在切换到 CRAG v2')
+    expect(html).not.toContain('内核切换完成')
+    expect(html).toContain('aria-busy="true"')
+    expect(mocks.buttons.every((button) => button.disabled)).toBe(true)
+    expect(mocks.success).not.toHaveBeenCalled()
+    expect(mocks.invalidateQueries).not.toHaveBeenCalled()
+  })
+
+  it.each(['wrap', 'v2'] as const)(
+    'reattaches to a running %s job on reopen without submitting another switch',
+    (target) => {
+      mocks.jobState = {
+        data: job({
+          dataplane: target === 'v2' ? 'crag' : 'wrap',
+          crag_kernel_version: target === 'v2' ? 'v2' : '',
+        }),
+      }
+      const html = render({
+        node_id: 'node-kvm',
+        runtime_type: 'kvm',
+        resolved_dataplane: 'crag',
+        resolved_crag_kernel_version: 'v2',
+      })
+      runEffects()
+      const label = target === 'v2' ? 'CRAG v2' : 'cli-node'
+      expect(html).toContain(`正在切换到 ${label}`)
+      expect(html).toContain('可重新打开查看进度')
+      expect(html).not.toContain('内核切换完成')
+      expect(html).not.toContain('role="alertdialog"')
+      expect(mocks.buttons.every((button) => button.disabled)).toBe(true)
+      expect(mocks.loading).toHaveBeenCalledWith(
+        `正在切换到 ${label}…`,
+        expect.objectContaining({ id: 'vm-kernel-switch-vm-01' })
+      )
+      expect(startVmKernelSwitch).not.toHaveBeenCalled()
+      expect(patchVm).not.toHaveBeenCalled()
+    }
+  )
+
+  it('does not query or expose kernel switching for non-admin users', () => {
+    mocks.admin = false
+    const html = render({ node_id: 'node-docker' })
+    expect(html).not.toContain('本槽切到 CRAG v2')
+    expect(html).not.toContain('本槽切回 cli-node')
+    expect(mocks.queries).toEqual([])
+    expect(startVmKernelSwitch).not.toHaveBeenCalled()
+  })
+
+  it('waits for the initial remote job lookup before enabling a new switch', () => {
+    mocks.jobState = { isPending: true, isFetching: true }
+    const html = render({ node_id: 'node-docker' })
+    expect(html).toContain('正在核对本槽是否有未完成的内核切换')
+    expect(mocks.buttons.every((button) => button.disabled)).toBe(true)
+    expect(html).not.toContain('内核切换完成')
+  })
+
+  it('shows success and refreshes real VM state only for a succeeded remote job', () => {
+    mocks.jobState = { data: job({ status: 'succeeded' }) }
+    const html = render({ node_id: 'node-docker' })
+    runEffects()
+    expect(html).toContain('内核切换完成')
+    expect(html).not.toContain('正在切换到 CRAG v2')
+    expect(mocks.success).toHaveBeenCalledWith(
+      expect.stringContaining('内核重启完成'),
+      expect.objectContaining({ id: 'vm-kernel-switch-vm-01' })
+    )
+    expect(
+      mocks.invalidateQueries.mock.calls.map(([query]) => query.queryKey)
+    ).toEqual([
+      ['panel', 'vm', 'vm-01'],
+      ['panel', 'vms'],
+      ['panel', 'dashboard'],
+    ])
+  })
+
+  it('reports a stopped remote slot as configured without claiming it started', () => {
+    mocks.jobState = { data: job({ status: 'succeeded' }) }
+    const html = render({
+      node_id: 'node-docker',
+      status: 'stopped',
+      schedulable: false,
+    })
+    runEffects()
+    expect(html).toContain('VM 保持停止，下次启动生效')
+    expect(html).not.toContain('内核重启完成')
+    expect(mocks.success).toHaveBeenCalledWith(
+      expect.stringContaining('VM 保持停止，下次启动生效'),
+      expect.any(Object)
+    )
+    expect(startVmKernelSwitch).not.toHaveBeenCalled()
+  })
+
+  it('shows the final remote failure and refreshes without claiming success', () => {
+    mocks.mutationState = { isSuccess: true, variables: 'v2' }
+    mocks.jobState = {
+      data: job({
+        status: 'failed',
+        error: { code: 'runtime_start_failed', message: '节点内核未就绪' },
+      }),
+    }
+    const html = render({ node_id: 'node-docker' })
+    runEffects()
+    expect(html).toContain('内核切换未完成')
+    expect(html).toContain('节点内核未就绪')
+    expect(html).not.toContain('内核切换完成')
+    expect(html).not.toContain('aria-busy="true"')
+    expect(mocks.error).toHaveBeenCalledWith(
+      '内核切换未完成：节点内核未就绪',
+      expect.objectContaining({ id: 'vm-kernel-switch-vm-01' })
+    )
+    expect(mocks.success).not.toHaveBeenCalled()
+    expect(mocks.invalidateQueries).toHaveBeenCalledTimes(3)
+  })
+
+  it.each(['请求连接断开', '切换任务记录已丢失，操作可能已中断'])(
+    'stops waiting and requires an explicit state check after %s',
+    (message) => {
+      mocks.jobState = {
+        data: job(),
+        isError: true,
+        error: new Error(message),
+        errorUpdatedAt: 1,
+      }
+      const html = render({ node_id: 'node-docker' })
+      runEffects()
+      expect(html).toContain('内核切换未完成')
+      expect(html).toContain(message)
+      expect(html).toContain('核对切换状态')
+      expect(html).not.toContain('aria-busy="true"')
+      expect(html).not.toContain('内核切换完成')
+      expect(
+        mocks.buttons
+          .filter((button) => button.children !== '核对切换状态')
+          .every((button) => button.disabled)
+      ).toBe(true)
+      expect(mocks.invalidateQueries).toHaveBeenCalledTimes(3)
+      expect(startVmKernelSwitch).not.toHaveBeenCalled()
+      expect(mocks.success).not.toHaveBeenCalled()
+    }
+  )
+
+  it.each([undefined, 'node-docker'])(
+    'allows the same CRAG policy to be retried only for a running runtime failure (%s)',
+    (node_id) => {
+      const failedVm: Partial<Vm> = {
+        node_id,
+        resolved_dataplane: 'crag',
+        resolved_crag_kernel_version: 'v2',
+        unschedulable_reason: 'runtime_start_failed',
+      }
+      render(failedVm)
+      expect(mocks.buttons).toContainEqual({
+        children: '本槽切到 CRAG v2',
+        disabled: false,
+      })
+      render({ ...failedVm, status: 'stopped' })
+      expect(mocks.buttons).toContainEqual({
+        children: '本槽切到 CRAG v2',
+        disabled: true,
+      })
+      render({ ...failedVm, unschedulable_reason: 'proxy_unavailable' })
+      expect(mocks.buttons).toContainEqual({
+        children: '本槽切到 CRAG v2',
+        disabled: true,
+      })
+    }
+  )
+
+  it.each([
+    ['v2', { dataplane: 'crag', crag_kernel_version: 'v2' }],
+    ['wrap', { dataplane: 'wrap', crag_kernel_version: '' }],
+  ] as const)(
+    'uses the async remote endpoint for %s without changing scheduling',
+    async (target, body) => {
+      render({ node_id: 'node-docker', schedulable: false })
+      await options().mutationFn(target)
+      expect(startVmKernelSwitch).toHaveBeenCalledExactlyOnceWith('vm-01', body)
+      expect(patchVm).not.toHaveBeenCalled()
+    }
+  )
+
+  it('never automatically retries a disconnected POST even with a retrying query client', async () => {
+    vi.mocked(startVmKernelSwitch).mockRejectedValueOnce(
+      new Error('节点连接断开')
+    )
+    render({ node_id: 'node-docker' })
+    const client = new QueryClient({
+      defaultOptions: { mutations: { retry: 3 } },
+    })
+    const mutation = new MutationObserver<unknown, Error, Target>(
+      client,
+      options()
+    )
+    try {
+      await expect(mutation.mutate('v2')).rejects.toThrow('节点连接断开')
+      expect(startVmKernelSwitch).toHaveBeenCalledTimes(1)
+      expect(mocks.success).not.toHaveBeenCalled()
+      expect(mocks.error).toHaveBeenCalledWith(
+        '内核切换未完成：节点连接断开',
+        expect.objectContaining({ id: 'vm-kernel-switch-vm-01' })
+      )
+      expect(mocks.invalidateQueries).toHaveBeenCalledTimes(3)
+    } finally {
+      client.clear()
+    }
+  })
 })

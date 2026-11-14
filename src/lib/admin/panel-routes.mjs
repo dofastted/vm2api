@@ -4,6 +4,7 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 import {
   verifyPanelLogin,
   createPanelSession,
@@ -673,6 +674,8 @@ export function createPanelHandler(ctx) {
   const stats = ctx.stats
   const persistRoutingPatch = (...args) => ctx.persistRoutingPatch(...args)
   const applyVmConcurrency = (...args) => ctx.applyVmConcurrency(...args)
+  // Keep the last result per VM so slow SSH cutovers outlive an HTTP request.
+  const kernelSwitchJobs = new Map()
   const applyVmRpm = (...args) => ctx.applyVmRpm(...args)
   const applyVmSessionSlots = (...args) => ctx.applyVmSessionSlots(...args)
   const inheritVmScheduling = (...args) => ctx.inheritVmScheduling(...args)
@@ -1177,7 +1180,11 @@ export function createPanelHandler(ctx) {
     const dataplaneChanged = previousDataplane !== targetDataplane
     const versionChanged =
       previousVersion !== targetVersion && (previousDataplane === 'crag' || targetDataplane === 'crag')
-    const kernelSwitch = dataplaneChanged || versionChanged
+    const retryFailedRuntime =
+      current.status === 'running' &&
+      current.unschedulable?.reason === 'runtime_start_failed' &&
+      (Object.hasOwn(patch, 'dataplane') || Object.hasOwn(patch, 'crag_kernel_version'))
+    const kernelSwitch = dataplaneChanged || versionChanged || retryFailedRuntime
     if (kernelSwitch && targetDataplane === 'crag' && targetVersion === 'v2') {
       if (isNativeNodeVm(desired)) {
         return { ok: false, id, code: 'native_crag_unsupported', error: 'crag 数据面暂不支持 macOS 原生节点' }
@@ -1630,6 +1637,65 @@ export function createPanelHandler(ctx) {
           ok: false,
           error: { code: 'migration_busy', message: '槽位迁移中或待人工恢复，暂不能修改' },
         })
+      }
+      const kernelSwitchRoute = /^\/api\/panel\/vms\/([^/]+)\/kernel-switch$/.exec(p)
+      if (kernelSwitchRoute && ['GET', 'POST'].includes(req.method)) {
+        const id = kernelSwitchRoute[1]
+        if (!isValidVmId(id))
+          return json(res, 400, { ok: false, error: { code: 'invalid_vm_id', message: '非法槽位 ID' } })
+        const vm = getVm(cfg.paths.project, id)
+        if (!vm) return json(res, 404, { ok: false, error: { code: 'vm_not_found', message: '槽位不存在' } })
+        if (req.method === 'GET') return json(res, 200, panel.ok(kernelSwitchJobs.get(id) || null))
+        if (kernelSwitchJobs.get(id)?.status === 'running')
+          return json(res, 409, {
+            ok: false,
+            error: { code: 'kernel_switch_in_progress', message: '该槽位正在切换内核，请等待完成' },
+          })
+        const body = await readBody(req, 4096)
+        if (!['crag', 'wrap'].includes(body?.dataplane))
+          return json(res, 400, { ok: false, error: { code: 'invalid_dataplane', message: '请选择 cli-node 或 CRAG' } })
+        const parsed = parseSlotEnginePolicyPatch({
+          dataplane: body.dataplane,
+          crag_kernel_version: body.dataplane === 'crag' ? (body.crag_kernel_version ?? 'v2') : '',
+        })
+        if (!parsed.ok)
+          return json(res, 400, { ok: false, error: { code: 'invalid_kernel_policy', message: parsed.error } })
+        if (isCodexVm(vm) || isNativeNodeVm(vm))
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'kernel_switch_unsupported', message: '当前槽位不支持切换 Claude 内核' },
+          })
+        const licensed = checkCragLicense(cfg.paths.project, vmWithSlotPolicyPatch(vm, parsed.patch), ctx.routingConfig)
+        if (!licensed.ok) return json(res, 403, { ok: false, error: { code: licensed.code, message: licensed.error } })
+        // readBody yielded: reserve only after checking the latest admission state.
+        if (kernelSwitchJobs.get(id)?.status === 'running')
+          return json(res, 409, {
+            ok: false,
+            error: { code: 'kernel_switch_in_progress', message: '该槽位正在切换内核，请等待完成' },
+          })
+        const job = {
+          id: randomUUID(),
+          vm_id: id,
+          ...parsed.patch,
+          status: 'running',
+          started_at: new Date().toISOString(),
+          finished_at: null,
+          error: null,
+        }
+        kernelSwitchJobs.set(id, job)
+        setImmediate(async () => {
+          try {
+            const result = await applySlotPolicyWithRuntime(id, parsed.patch)
+            if (!result.ok) throw Object.assign(new Error(result.error || '内核切换失败'), { code: result.code })
+            job.status = 'succeeded'
+          } catch (error) {
+            job.status = 'failed'
+            job.error = { code: error.code || 'kernel_switch_failed', message: redactSecrets(error.message) }
+          } finally {
+            job.finished_at = new Date().toISOString()
+          }
+        })
+        return json(res, 202, panel.ok({ ...job }))
       }
       if ((req.method === 'GET' || req.method === 'PUT') && p === '/api/panel/onboarding') {
         if (req.method === 'PUT') {
