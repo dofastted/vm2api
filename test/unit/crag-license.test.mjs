@@ -131,34 +131,47 @@ test('universal CRAGU1 activates without creating a device binding', async (t) =
   assert.deepEqual(fs.readFileSync(path.join(dir, 'registration.code')), stored)
 })
 
-test('cluster slot uses the universal grant and rejects a device code', async (t) => {
-  const { root } = fixture(t)
-  const cluster = { id: 'vm-remote', status: 'running', dataplane: 'crag', node_id: 'node-1' }
-  fs.mkdirSync(path.join(root, 'vms', cluster.id), { recursive: true })
-  fs.writeFileSync(path.join(root, 'vms', `${cluster.id}.json`), JSON.stringify(cluster))
-  const before = await route(root, 'GET', '/crag-license', null, 'admin', cluster.id)
-  assert.equal(before.status, 200)
-  assert.notEqual(before.body.error?.code, 'crag_v2_unsupported_placement')
-  const device = await route(
-    root,
-    'POST',
-    '/crag-license',
-    { registration_code: 'CRAGL1.not-a-grant' },
-    'admin',
-    cluster.id,
-  )
-  assert.equal(device.status, 400)
-  assert.equal(device.body.error.code, 'crag_v2_unsupported_placement')
-  const issued = issueUniversalCode(root)
-  const activated = await route(root, 'POST', '/crag-license', { registration_code: issued.code }, 'admin', cluster.id)
-  assert.equal(activated.status, 200)
-  assert.equal(activated.body.data.license.valid, true)
-  assert.equal(activated.body.data.license.kind, 'offline')
-  const current = await route(root, 'GET', '/crag-license', null, 'admin', cluster.id)
-  assert.equal(current.status, 200)
-  assert.equal(current.body.data.license.valid, true)
-  assert.equal(current.body.data.license.scope, 'kernel')
-})
+for (const [label, placement] of [
+  ['cluster Docker', { node_id: 'node-1' }],
+  ['local KVM', { runtime: { type: 'kvm' } }],
+  ['remote legacy KVM', { node_id: 'node-1', runtime_type: 'kvm' }],
+]) {
+  test(`${label} slot uses the universal grant and rejects a device code`, async (t) => {
+    const { root } = fixture(t)
+    const cluster = { id: 'vm-remote', status: 'running', dataplane: 'crag', ...placement }
+    fs.mkdirSync(path.join(root, 'vms', cluster.id), { recursive: true })
+    fs.writeFileSync(path.join(root, 'vms', `${cluster.id}.json`), JSON.stringify(cluster))
+    const before = await route(root, 'GET', '/crag-license', null, 'admin', cluster.id)
+    assert.equal(before.status, 200)
+    assert.notEqual(before.body.error?.code, 'crag_v2_unsupported_placement')
+    const device = await route(
+      root,
+      'POST',
+      '/crag-license',
+      { registration_code: 'CRAGL1.not-a-grant' },
+      'admin',
+      cluster.id,
+    )
+    assert.equal(device.status, 400)
+    assert.equal(device.body.error.code, 'crag_v2_unsupported_placement')
+    const issued = issueUniversalCode(root)
+    const activated = await route(
+      root,
+      'POST',
+      '/crag-license',
+      { registration_code: issued.code },
+      'admin',
+      cluster.id,
+    )
+    assert.equal(activated.status, 200)
+    assert.equal(activated.body.data.license.valid, true)
+    assert.equal(activated.body.data.license.kind, 'offline')
+    const current = await route(root, 'GET', '/crag-license', null, 'admin', cluster.id)
+    assert.equal(current.status, 200)
+    assert.equal(current.body.data.license.valid, true)
+    assert.equal(current.body.data.license.scope, 'kernel')
+  })
+}
 
 test('a cluster slot reuses a CRAGU1 stored on a local slot when the installation file is missing', (t) => {
   const { root, vm } = fixture(t)
