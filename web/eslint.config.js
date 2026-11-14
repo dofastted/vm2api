@@ -59,8 +59,8 @@ export default defineConfig(
           disallowTypeAnnotations: false,
         },
       ],
-      // Prevent duplicate imports from the same module
-      'no-duplicate-imports': 'error',
+      // Keep formatter-separated type imports without allowing duplicate value imports.
+      'no-duplicate-imports': ['error', { allowSeparateTypeImports: true }],
     },
   },
   {
