@@ -86,7 +86,7 @@ function calendarExpiry(issued, term) {
   const date = new Date(issued * 1000)
   const day = date.getUTCDate()
   date.setUTCDate(1)
-  date.setUTCMonth(date.getUTCMonth() + { '1m': 1, '6m': 6, '1y': 12 }[term])
+  date.setUTCMonth(date.getUTCMonth() + { '1m': 1, '3m': 3, '6m': 6, '1y': 12 }[term])
   const end = new Date(date.getTime())
   end.setUTCMonth(end.getUTCMonth() + 1, 0)
   date.setUTCDate(Math.min(day, end.getUTCDate()))
@@ -242,7 +242,7 @@ export function verifyCragRegistration(
       !text(c.vm_id) ||
       !hex(c.machine_id_hash) ||
       !hex(c.payload_key_id) ||
-      !['1m', '6m', '1y'].includes(c.term)
+      !['1m', '3m', '6m', '1y'].includes(c.term)
     )
       fail()
     for (const key of ['issued_at', 'not_before', 'expires_at']) if (!Number.isSafeInteger(c[key])) fail()
@@ -387,7 +387,7 @@ export function verifyCragUniversal(code, { publicKey, keyId, now = Math.floor(D
     ])
     exactKeys(claims.wrapped_key, ['nonce', 'ciphertext', 'tag'])
     if (claims.version !== 1 || claims.product !== 'crag-v2' || !UNIVERSAL_ID.test(claims.license_id)) fail()
-    if (!['1m', '6m', '1y'].includes(claims.term)) fail()
+    if (!['1m', '3m', '6m', '1y'].includes(claims.term)) fail()
     for (const key of ['issued_at', 'not_before', 'expires_at']) if (!Number.isSafeInteger(claims[key])) fail()
     if (
       claims.not_before !== claims.issued_at ||

@@ -67,7 +67,7 @@ export function CragLicenseSummary({
 }: {
   license: CragLicenseStatus
 }) {
-  const term = { '1m': '1 个月', '6m': '6 个月', '1y': '1 年' }
+  const term = { '1m': '1 个月', '3m': '3 个月', '6m': '6 个月', '1y': '1 年' }
   return (
     <dl className='grid min-w-0 gap-3 text-sm sm:grid-cols-2'>
       <div>

@@ -85,7 +85,7 @@ export type CragLicenseStatus = {
   /** kernel: one offline code covers every slot and machine. device: one VM. */
   scope?: 'kernel' | 'device'
   license_id?: string
-  term?: '1m' | '6m' | '1y'
+  term?: '1m' | '3m' | '6m' | '1y'
   /** Signed UTC epoch seconds, not browser-local timestamps. */
   issued_at?: number
   not_before?: number
