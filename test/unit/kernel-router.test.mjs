@@ -20,6 +20,7 @@ import {
 import { rustKernelBusy, rustKernelReachable } from '../../src/lib/transport/rust-kernel-client.mjs'
 import {
   ensureRustKernel,
+  restartRustKernel,
   writeKernelConfig,
   syncClaudeKernelConfigs,
   syncClaudeKernelConfigsFromFile,
@@ -42,6 +43,7 @@ import { slotRuntimeOwner } from '../../src/lib/oauth/oauth-credentials.mjs'
 import { closeDatabase, openDatabase } from '../../src/lib/db/database.mjs'
 import { socksUidFor } from '../../src/lib/vm/vm-runtime.mjs'
 import { REMOTE_CRAG_ENTRY } from '../../src/lib/vm/slot-engine.mjs'
+import { kvmCragAppArmorCommand } from '../../src/lib/vm/kvm-crag-apparmor.mjs'
 
 const unix = process.platform !== 'win32'
 const unixTest = unix ? test : test.skip
@@ -1589,6 +1591,165 @@ test('writeKernelConfig cli-hop native slots ignore live 并行', () => {
   assert.equal(doc.slots_per_worker, WRAP_SLOT_MAX)
   fs.rmSync(root, { recursive: true, force: true })
 })
+
+for (const [preparation, mode] of [
+  ['ready', 'restart'],
+  ['failed', 'restart'],
+  ['ssh-unavailable', 'restart'],
+  ['ready', 'cold-boot'],
+  ['failed', 'cold-boot'],
+  ['ssh-unavailable', 'cold-boot'],
+  ['ready', 'healthy'],
+]) {
+  unixTest(`KVM AppArmor preparation preserves the running kernel until ready: ${mode}/${preparation}`, async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kvm-apparmor-restart-'))
+    const id = `vm-apparmor-${mode}-${preparation}`
+    const vm = { id, runtime: { type: 'kvm', container: `kin-${id}` } }
+    const written = writeKernelConfig(root, vm, { token: 'tok', proxyUrl: '', proxyRequired: false })
+    const exec = {
+      vmId: id,
+      homeDir: path.join(root, 'vms', id, 'cli-home'),
+      vm: { ...vm, runtime: { ...vm.runtime, kernel_socket: written.socketPath } },
+    }
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 1, worker_version: 'fixture' }))
+    })
+    await new Promise((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(written.socketPath, resolve)
+    })
+    const calls = []
+    const prepareCommand = kvmCragAppArmorCommand()
+    let prepareAttempts = 0
+    const runDockerExec = async (args) => {
+      calls.push(args)
+      if (args.includes(prepareCommand[2])) {
+        prepareAttempts += 1
+        if (preparation === 'failed') return { ok: false, error: 'fixture apparmor_parser refused the policy' }
+        if (preparation === 'ssh-unavailable' && prepareAttempts <= 2) {
+          return prepareAttempts === 1
+            ? { ok: false, error: 'guest ssh unavailable' }
+            : { ok: false, error: 'guest command failed', stderr: 'kin-guest-exec: guest ssh unavailable' }
+        }
+        return { ok: true }
+      }
+      return { ok: true }
+    }
+    try {
+      const result =
+        mode === 'restart'
+          ? await restartRustKernel(exec, { timeoutMs: 2000, runDockerExec })
+          : await ensureRustKernel(exec, {
+              timeoutMs: 2000,
+              runDockerExec,
+              prepareGuestAppArmor: mode === 'cold-boot',
+            })
+      if (mode === 'healthy') {
+        assert.equal(result.ok, true, JSON.stringify(result))
+        assert.equal(result.reason, 'already_up')
+        assert.deepEqual(
+          calls.map((args) => args.slice(-3)),
+          [['kill', '-CHLD', '1']],
+          'routine health keeps only the existing zombie-reap action',
+        )
+        return
+      }
+      assert.deepEqual(calls[0].slice(-prepareCommand.length), prepareCommand)
+      const guest = calls[0].indexOf('/usr/local/bin/kin-guest-exec')
+      assert.ok(guest > 0)
+      assert.ok(calls[0].slice(guest + 1).some((value, index, args) => value === '-u' && args[index + 1] === '0'))
+      assert.equal(fs.existsSync(written.socketPath), true, 'a guest restart must preserve the host relay socket')
+      if (preparation === 'failed' || (preparation === 'ssh-unavailable' && mode === 'restart')) {
+        assert.equal(result.ok, false)
+        assert.equal(result.reason, 'guest_apparmor_failed')
+        assert.match(result.error, preparation === 'failed' ? /apparmor_parser refused/ : /guest ssh unavailable/)
+        assert.equal(calls.length, 1, 'failed preparation must not retire, kill, or restart the running kernel')
+      } else {
+        assert.equal(result.ok, true, JSON.stringify(result))
+        const restart = calls.findIndex((args) => args.includes('systemctl') && args.includes('restart'))
+        assert.ok(restart > 0)
+        const expectedAttempts = preparation === 'ssh-unavailable' ? 3 : 1
+        assert.equal(calls.filter((args) => args.includes(prepareCommand[2])).length, expectedAttempts)
+        assert.equal(
+          calls.slice(0, expectedAttempts).every((args) => args.includes(prepareCommand[2])),
+          true,
+        )
+        assert.equal(calls.filter((args) => args.includes('systemctl') && args.includes('restart')).length, 1)
+        assert.equal(calls.filter((args) => String(args.at(-1)).includes('kill -KILL')).length, 1)
+      }
+    } finally {
+      await new Promise((resolve) => server.close(resolve))
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+}
+
+for (const firstPrepares of [false, true]) {
+  unixTest(
+    `KVM AppArmor preparation coalesces behind a pending ${firstPrepares ? 'preparing' : 'ordinary'} ensure`,
+    async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kvm-aa-pending-'))
+      const id = `vm-aa-pending-${firstPrepares}`
+      const vm = { id, runtime: { type: 'kvm', container: `kin-${id}` } }
+      const written = writeKernelConfig(root, vm, { token: 'tok', proxyUrl: '', proxyRequired: false })
+      const exec = {
+        vmId: id,
+        homeDir: path.join(root, 'vms', id, 'cli-home'),
+        vm: { ...vm, runtime: { ...vm.runtime, kernel_socket: written.socketPath } },
+      }
+      const server = http.createServer((_req, res) => {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 1, worker_version: 'fixture' }))
+      })
+      await new Promise((resolve, reject) => {
+        server.once('error', reject)
+        server.listen(written.socketPath, resolve)
+      })
+      let observeFirst
+      let releaseFirst
+      const firstObserved = new Promise((resolve) => {
+        observeFirst = resolve
+      })
+      const firstReleased = new Promise((resolve) => {
+        releaseFirst = resolve
+      })
+      const calls = []
+      const requests = []
+      const prepareCommand = kvmCragAppArmorCommand()
+      const runDockerExec = async (args) => {
+        calls.push(args)
+        if (calls.length === 1) {
+          observeFirst()
+          await firstReleased
+        }
+        return { ok: true }
+      }
+      try {
+        requests.push(ensureRustKernel(exec, { timeoutMs: 2000, runDockerExec, prepareGuestAppArmor: firstPrepares }))
+        await firstObserved
+        requests.push(ensureRustKernel(exec, { timeoutMs: 2000, runDockerExec, prepareGuestAppArmor: true }))
+        requests.push(ensureRustKernel(exec, { timeoutMs: 2000, runDockerExec, prepareGuestAppArmor: true }))
+        releaseFirst()
+        const results = await Promise.all(requests)
+        assert.equal(
+          results.every((result) => result.ok),
+          true,
+          JSON.stringify(results),
+        )
+        if (!firstPrepares) assert.equal(results[0].reason, 'already_up')
+        assert.equal(results[1], results[2], 'concurrent preparation requests share the same completed start')
+        assert.equal(calls.filter((args) => args.includes(prepareCommand[2])).length, 1)
+        assert.equal(calls.filter((args) => args.includes('systemctl') && args.includes('restart')).length, 1)
+      } finally {
+        releaseFirst()
+        await Promise.allSettled(requests)
+        await new Promise((resolve) => server.close(resolve))
+        fs.rmSync(root, { recursive: true, force: true })
+      }
+    },
+  )
+}
 
 unixTest('Rust supervisor retires legacy telemetry without root docker exec', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-retire-user-'))

@@ -17,3 +17,13 @@ Linux amd64 的本机和集群 KVM 槽使用同一套 CRAG V2 签名加密发行
 自 v1.4.082 起，发布 CRAG 配置前先验证并补齐节点 slot-bin 的完整签名包，包括配置引用的官方 Claude；包缺失或校验失败时不发布新配置。同步逐文件核对 SHA256，即使 crag.digest 相同也会修复缺失或损坏的文件，已匹配的二进制不重复替换。旧版受影响的集群 KVM 槽可升级控制面后在内核页重装。
 
 仅管理本机槽时，也可用 `deploy/install.sh crag-update` 更新既有 CRAG 副本，包括本机 KVM；运行核心哈希通过 guest 执行通道读取。该独立脚本仍拒绝包含活动集群 CRAG 槽的安装，集群槽请使用内核页选择目标并重装。此功能不包含 CRAG KVM 的跨节点迁移支持。
+
+## AppArmor 与原生 Claude 启动权限
+
+Ubuntu 24.04 等启用了 `kernel.apparmor_restrict_unprivileged_userns=1` 的 guest 中，CRAG V2 健康检查可能正常，但实际请求仍报 `Claude native launch failed (guest identity requires user/mount namespaces and bind-mount permissions): Permission denied`。原生 Claude 的 guest identity 需要创建用户、挂载命名空间并执行 bind mount；AppArmor 的默认非特权用户命名空间策略可能阻止这些操作。
+
+KVM guest 的启动准备会为 CRAG V2 加载具备 `userns,` 权限的 `vm2api-crag` 命名 unconfined profile，并通过 `kin-kernel.service` 的 `AppArmorProfile` 绑定，使原生 Claude 子进程继承该策略。策略保存在 `/etc/apparmor.d/vm2api-crag`，systemd 配置保存在 `/etc/systemd/system/kin-kernel.service.d/50-vm2api-crag-userns.conf`。全局用户命名空间限制、服务运行用户、capabilities 和发行包保持原样；该处理仅作用于目标 KVM guest。
+
+新建 guest 在启动准备阶段应用配置。已有磁盘的槽升级控制面后，可通过内核重启、重载或重装应用当前版本的准备逻辑，无需重建磁盘或重新执行 cloud-init；CRAG V2 槽从停止状态启动时也会在确认运行就绪前完成准备。普通健康轮询不会触发权限修改或强制重启。
+
+如果 guest 未启用 AppArmor 或未启用上述用户命名空间限制，准备逻辑直接跳过。管理员设置的其他 `AppArmorProfile` 及非本工具管理的同名配置会保留，所需的命名空间权限应由管理员自行配置。受限制的 guest 缺少 `apparmor_parser`、AppArmor 4 ABI 或 `apparmor.service`，以及策略校验或加载失败时，会明确报错；已有槽的重启流程在准备成功前不会终止运行中的内核。切回其他数据面时，仅移除工具管理的 systemd 绑定，保留已加载策略，避免影响仍使用该策略的进程。

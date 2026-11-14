@@ -50,6 +50,7 @@ import { probeLocalKvm } from './kvm-host.mjs'
 import { slotExecArgv } from './slot-exec.mjs'
 import { isDockerInspectNotFound } from './docker-container.mjs'
 import { kernelCpuCommand, usesKernelCpuLimit } from './kernel-cpu.mjs'
+import { kvmCragAppArmorCommand } from './kvm-crag-apparmor.mjs'
 
 export const RUNTIME = 'docker'
 const WORKER_BIN = process.env.KIN_WORKER_BIN || '/opt/kin-gateway/bin/kin-worker'
@@ -577,8 +578,8 @@ export async function reloadSlotWorker(vm, projectRoot, { routing } = {}) {
         'docker',
         ...slotExecArgv(
           { ...vm, runtime: { ...vm.runtime, container: name } },
-          ['systemctl', 'restart', 'kin-kernel.service'],
-          { user: '0' },
+          kvmCragAppArmorCommand({ restart: true }),
+          { user: '0', interactive: true },
         ),
       ],
       { timeout: 60_000 },
