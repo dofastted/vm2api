@@ -101,6 +101,7 @@ import { publicEndpointView, fetchUpstreamModels, API_ENDPOINT_PRESETS } from '.
 import { runAnthropicConsole, resolveConsoleProxyUrl, savedEndpointKey } from './anthropic-console.mjs'
 import { publicUserView } from './panel-users.mjs'
 import { authorizePanelRoute, mePayload, panelIdentity } from './panel-acl.mjs'
+import { isSandboxPath, servePurchaseSandbox } from './purchase-sandbox.mjs'
 import {
   denyIfUserCannotDeleteVm,
   denyIfUserMissesKey,
@@ -1592,6 +1593,7 @@ export function createPanelHandler(ctx) {
           }).body,
         )
       }
+      if (isSandboxPath(p)) return servePurchaseSandbox(req, res, p, { json, readRawBody })
       if (
         denyIfUserMissesVm(req, res, {
           projectRoot: cfg.paths.project,
