@@ -132,7 +132,7 @@ test('auth readiness refuses stopped containers and never falls back to cli-node
   }
 })
 
-test('prepareSlotOAuth reads the nested kernel health that startSlotReady actually returns', async () => {
+test('prepareSlotOAuth requires runtime readiness, not telemetry acknowledgement after startup', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-auth-login-runtime-'))
   const seed = (id) => {
     fs.mkdirSync(path.join(root, 'vms', id, 'run'), { recursive: true })
@@ -153,32 +153,40 @@ test('prepareSlotOAuth reads the nested kernel health that startSlotReady actual
     rust: { ok: true, engine: 'rust', rust: { ok: true, health } },
   })
   const notReady = (err) => err.code === 'oauth_runtime_not_ready'
+  const prepare = (options) =>
+    prepareSlotOAuth({
+      ...options,
+      readHealth: async () => ({ ok: true, vm_telemetry: true, telemetry_ready: true }),
+    })
   try {
-    const ready = await prepareSlotOAuth({
+    const ready = await prepare({
       exec: seed('vm-11'),
       startReady: nested({ vm_telemetry: true, telemetry_ready: true }),
     })
     assert.equal(ready.configDir, '/home/kincli/.claude')
 
-    await assert.rejects(() => prepareSlotOAuth({ exec: seed('vm-12'), startReady: nested(undefined) }), notReady)
+    for (const health of [undefined, { vm_telemetry: false }, { vm_telemetry: true, telemetry_ready: false }]) {
+      const context = await prepare({ exec: seed('vm-12'), startReady: nested(health) })
+      assert.equal(context.configDir, '/home/kincli/.claude')
+    }
     await assert.rejects(
       () =>
-        prepareSlotOAuth({
+        prepare({
           exec: seed('vm-13'),
-          startReady: nested({ vm_telemetry: false, telemetry_ready: true }),
+          startReady: async () => ({ ok: true, rust_ok: false, rust: { ok: false } }),
         }),
       notReady,
     )
     await assert.rejects(
       () =>
-        prepareSlotOAuth({
+        prepare({
           exec: seed('vm-14'),
-          startReady: nested({ vm_telemetry: true, telemetry_ready: false }),
+          startReady: async () => ({ ok: true, rust: { ok: true, skipped: true } }),
         }),
       notReady,
     )
     // startReady is injectable: a flat boot.rust.health must still pass.
-    const flat = await prepareSlotOAuth({
+    const flat = await prepare({
       exec: seed('vm-15'),
       startReady: async () => ({
         ok: true,

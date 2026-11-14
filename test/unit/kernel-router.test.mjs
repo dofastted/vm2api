@@ -1973,6 +1973,36 @@ for (const state of ['idle', 'partly occupied', 'full']) {
   })
 }
 
+unixTest(
+  'credential-free OAuth readiness does not require native telemetry or restart a live legacy kernel',
+  async () => {
+    const fx = await kernelFixture((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, engine: 'rust', ready_slots: 0, cli_pid: 4412 }))
+    })
+    try {
+      fs.writeFileSync(rustKernelPaths(fx.exec).configPath, JSON.stringify({ slots_per_worker: WRAP_SLOT_MAX }))
+      const commands = []
+      const ready = await ensureRustKernel(fx.exec, {
+        allowMissingCredential: true,
+        timeoutMs: 100,
+        runDockerExec: async (args) => {
+          commands.push(args)
+          return { ok: true }
+        },
+      })
+      assert.equal(ready.ok, true, JSON.stringify(ready))
+      assert.equal(ready.reason, 'already_up')
+      assert.equal(
+        commands.some((args) => args[0] === 'restart'),
+        false,
+      )
+    } finally {
+      await fx.close()
+    }
+  },
+)
+
 unixTest('supervisor repairs a Max subscription from a VM summary without restarting the live kernel', async () => {
   const fx = await kernelFixture((_req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' })

@@ -1,9 +1,9 @@
 /**
  * Browser OAuth-link import.
  * CAI (sub2api) and official Claude Code share PKCE + paste-code,
- * then exchange inside the target VM using its bound egress. proxyUrl still
- * validates the authorize session, but production execution uses the VM context;
- * null means unbound and is refused.
+ * then exchange using the target VM's bound egress. Legacy kernels use the
+ * controller helper with the same exit. The VM context selects the live binding;
+ * proxyUrl validates the authorize session and null means unbound.
  */
 import crypto from 'node:crypto'
 import { exchangeTokenViaCookieAuth } from './cookie-auth.mjs'
@@ -161,8 +161,8 @@ function parseAuthCode(fullCode) {
 }
 
 async function exchangeCodeForToken(authCode, codeVerifier, state, proxyUrl, session, options = {}) {
-  // With an execution context the helper runs inside the target VM and
-  // selects that VM's bound egress. The host proxy is only a test/direct path.
+  // The execution context resolves the VM's current bound exit, including
+  // controller execution for legacy kernels. Do not reuse a stale session proxy.
   const px = options.exec ? null : normalizeSocks(proxyUrl)
   if (px == null && !options.exec) throw fail('proxy_required', '虚拟机未绑定 SOCKS5，无法换票')
   return exchangeTokenViaCookieAuth({
@@ -236,8 +236,8 @@ export async function exchangeAuthCode({
   const expiresIn = Number(token.expires_in || 0)
   const now = Math.floor(Date.now() / 1000)
   const identity = flattenOauthIdentity(token)
-  // kin-oauth-auth completes bootstrap inside the VM, through the same bound
-  // egress as token exchange. Do not bootstrap again from the control plane.
+  // kin-oauth-auth completes bootstrap through the same bound exit as the
+  // exchange, whether in the VM or on the controller. Do not bootstrap twice.
   return carryOAuthAttempt(token, {
     access_token: token.access_token,
     refresh_token: token.refresh_token || '',

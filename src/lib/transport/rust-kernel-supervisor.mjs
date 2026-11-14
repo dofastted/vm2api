@@ -58,12 +58,7 @@ import { workerPaths } from './go-worker-client.mjs'
 /** The native host is authenticated separately from account scheduling readiness. */
 function runtimeReady(health, allowMissingCredential) {
   if (!allowMissingCredential) return rustKernelReachable(health)
-  return (
-    health?.vm_telemetry === true &&
-    health?.telemetry_ready === true &&
-    health?.healthy !== false &&
-    Number(health?.cli_pid) > 0
-  )
+  return rustKernelProcessUp(health) && health?.healthy !== false && Number(health?.cli_pid) > 0
 }
 
 function normalizeAutoCompactWindow(value) {
@@ -333,7 +328,7 @@ export async function ensureRustKernel(
     const result = await pending.promise
     if (!prepareGuestAppArmor || pending.prepareGuestAppArmor) {
       if (!allowMissingCredential || runtimeReady(result?.health, true)) return result
-      return { ok: false, reason: 'telemetry_not_ready', health: result?.health }
+      return { ok: false, reason: 'kernel_not_ready', health: result?.health }
     }
     // A normal health check cannot satisfy cold-boot permission preparation.
     const next = starts.get(vmId)
