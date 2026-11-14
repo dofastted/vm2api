@@ -21,7 +21,6 @@ import { SlotIdentity } from '@/components/platform-chip'
 import { QueryGate } from '@/components/query-gate'
 import { StatCard } from '@/components/stat-card'
 import { billingQueryOptions } from '@/features/billing/queries'
-import { PurchaseSandbox } from './purchase-sandbox'
 import { emptyTotals, splitBilling } from './split'
 
 type PlatformFilter = 'all' | VmKind
@@ -99,7 +98,6 @@ export function BillingPage() {
         </div>
       }
     >
-      <PurchaseSandbox />
       <QueryGate
         loading={q.isLoading}
         error={q.error}
