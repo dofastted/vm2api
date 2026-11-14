@@ -415,7 +415,11 @@ function cragReleaseTag(projectRoot) {
   }
 }
 
-export async function pullKernelRelease(projectRoot, { kernel, tag = '' } = {}, { fetchImpl = globalThis.fetch } = {}) {
+export async function pullKernelRelease(
+  projectRoot,
+  { kernel, tag = '', latest = false } = {},
+  { fetchImpl = globalThis.fetch } = {},
+) {
   if (!['cli-node', 'crag'].includes(kernel))
     return { ok: false, code: 'kernel_invalid', error: '请选择 cli-node 或 CRAG' }
   let stage, published, lock, pointerTemp
@@ -423,7 +427,7 @@ export async function pullKernelRelease(projectRoot, { kernel, tag = '' } = {}, 
     const payload = await fetchKernelReleaseMetadata({
       tag,
       kernel,
-      cragReleaseTag: kernel === 'crag' ? cragReleaseTag(projectRoot) : '',
+      cragReleaseTag: kernel === 'crag' && !latest ? cragReleaseTag(projectRoot) : '',
       fetchImpl,
     })
     const specs =

@@ -62,8 +62,8 @@ usage() {
 用法: $(basename "$0") [命令] [选项]
 
 命令:
-  install              安装到 ${INSTALL_DIR}（默认）
-  upgrade | update     升到最新 GitHub Release（保留 .env / vms / data）
+  install              安装到 ${INSTALL_DIR}（默认，amd64 自动获取最新正式版 CRAG）
+  upgrade | update     升到最新 GitHub Release 并更新 CRAG（保留 .env / vms / data）
   crag-update          独立更新 CRAG V2 包及全部既有 CRAG 副本，不切换槽位内核
   check                对比当前版本与最新 Release，打印 changelog
   changelog            打印本地 CHANGELOG.md
@@ -76,7 +76,7 @@ usage() {
   --dir PATH           安装目录（默认 ${INSTALL_DIR}）
   --yes                非交互
   --no-start           只拉代码，不 compose up
-  --no-sync-wrap       升级后不检查、不停调度、不更新槽内 kernel
+  --no-sync-wrap       跳过 CRAG 获取及槽内 kernel 检查、调度与同步
   --from-source        clone 仓库并在本机构建镜像（默认拉预构建镜像）
   -h, --help           帮助
 EOF
@@ -751,12 +751,13 @@ cmd_update_crag() {
   node "${INSTALL_DIR}/scripts/update-crag.mjs" "$INSTALL_DIR" "$CRAG_TARGET_VERSION"
 }
 
-update_bundled_crag() {
-  # Do not install CRAG on ordinary cli-node-only installations.
-  if [ -f "${INSTALL_DIR}/share/crag/kernels/v2/amd64/manifest.json" ] ||
-     docker exec "$SERVICE_NAME" test -f /opt/vm2api/share/crag/kernels/v2/amd64/manifest.json 2>/dev/null; then
-    cmd_update_crag
+update_default_crag() {
+  if [ "$HOST_ARCH" != amd64 ]; then
+    warn "CRAG 当前仅支持 amd64，已跳过 ${HOST_ARCH} 的 CRAG 自动获取"
+    return 0
   fi
+  info "获取 CRAG ${CRAG_TARGET_VERSION:-最新正式版}（保留槽位内核选择）"
+  cmd_update_crag
 }
 
 print_banner() {
@@ -789,11 +790,11 @@ cmd_install() {
   prepare_arch_env "$mode"
   prepare_arm64_host
   start_stack
-  ok "安装完成  ${INSTALL_DIR}  @ $(local_version)"
   if [ "$NO_START" = 0 ] && [ "$SYNC_WRAP" = 1 ]; then
-    update_bundled_crag || { err "CRAG 二进制更新失败，安装未完成"; exit 1; }
+    update_default_crag || { err "CRAG 二进制更新失败，安装未完成"; exit 1; }
     sync_wrap_cli || { err "槽内 wrap CLI / kernel 同步失败，安装未完成"; exit 1; }
   fi
+  ok "安装完成  ${INSTALL_DIR}  @ $(local_version)"
 
   print_login_banner
   info "以后更新: curl -sSL https://raw.githubusercontent.com/${GITHUB_REPO}/main/deploy/install.sh | sudo bash -s -- upgrade"
@@ -839,7 +840,7 @@ cmd_upgrade() {
   prepare_arm64_host
   start_stack
   if [ "$NO_START" = 0 ] && [ "$SYNC_WRAP" = 1 ]; then
-    update_bundled_crag || { err "CRAG 二进制更新失败，升级未完成"; exit 1; }
+    update_default_crag || { err "CRAG 二进制更新失败，升级未完成"; exit 1; }
     sync_wrap_cli || { err "槽内 wrap CLI / kernel 同步失败，升级未完成"; exit 1; }
 
   elif [ "$NO_START" = 1 ]; then

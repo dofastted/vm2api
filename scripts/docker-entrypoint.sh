@@ -86,6 +86,8 @@ if [ -f /opt/vm2api/image-crag/kin-kernel ]; then
     WRAP_CHANGED=1
   fi
 fi
+# Bind-mounted share starts empty; seed the image's signed native package once.
+node /opt/vm2api/scripts/seed-crag.mjs "$ROOT" /opt/vm2api/image-crag
 
 if [ ! -S /var/run/docker.sock ]; then
   echo "vm2api: /var/run/docker.sock not mounted; slot create/start will fail." >&2

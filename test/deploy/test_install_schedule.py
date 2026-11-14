@@ -31,28 +31,64 @@ def run_installer(command, response=None, extra_env=None, mock=None):
 
 
 class ScheduleTests(unittest.TestCase):
-    def test_crag_update_uses_existing_host_or_container_without_compose_restart(self):
-        for container in (False, True):
-            with self.subTest(container=container), tempfile.TemporaryDirectory() as tmp:
-                trace = Path(tmp) / "trace"
-                mock = r'''
+    install_mock = r'''
 need_root() { :; }
+require_cmds() { :; }
+resolve_host_arch() { HOST_ARCH="${TEST_ARCH:-amd64}"; }
+fetch_release_files() { :; }
+ensure_env() { :; }
+env_set() { :; }
+prepare_arch_env() { :; }
+prepare_arm64_host() { :; }
+start_stack() { :; }
+sync_wrap_cli() { :; }
+print_login_banner() { :; }
+print_changelog_slice() { :; }
+release_notes() { :; }
+local_version() { echo 0.0.0; }
+install_mode() { echo image; }
+TARGET_VERSION=v1.0.0
+'''
+
+    def test_empty_install_and_upgrade_fail_if_default_crag_download_fails(self):
+        for command in ("cmd_install", "cmd_upgrade"):
+            for container in (False, True):
+                with self.subTest(command=command, container=container), tempfile.TemporaryDirectory() as tmp:
+                    (Path(tmp) / "docker-compose.yml").write_text("services: {}\n")
+                    mock = self.install_mock + r'''
 docker() {
   if [ "$1" = inspect ]; then echo "$CONTAINER"; return; fi
-  printf 'docker:%s\n' "$*" >> "$TRACE"
+  if [ "$1" = exec ] && [ "$3" = node ]; then
+    echo 'CRAG supplier download failed' >&2
+    return 22
+  fi
+  return 1
 }
-node() { printf 'node:%s\n' "$*" >> "$TRACE"; }
+node() { echo 'CRAG supplier download failed' >&2; return 22; }
 '''
-                result = run_installer(
-                    'INSTALL_DIR=/test-root; CRAG_TARGET_VERSION=v2.0.1; cmd_update_crag',
-                    mock=mock, extra_env={"TRACE": str(trace), "CONTAINER": str(container).lower()},
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-                expected = (
-                    'docker:exec vm2api node /opt/vm2api/scripts/update-crag.mjs /opt/vm2api v2.0.1'
-                    if container else 'node:/test-root/scripts/update-crag.mjs /test-root v2.0.1'
-                )
-                self.assertEqual(trace.read_text().strip(), expected)
+                    result = run_installer(
+                        'INSTALL_DIR="$TEST_ROOT"; ' + command,
+                        mock=mock,
+                        extra_env={"TEST_ROOT": tmp, "CONTAINER": str(container).lower()},
+                    )
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("CRAG supplier download failed", result.stderr)
+                    self.assertNotIn("安装完成", result.stdout)
+                    self.assertNotIn("已更新到", result.stdout)
+                    self.assertFalse((Path(tmp) / "share").exists())
+
+    def test_default_crag_download_respects_no_start_no_sync_and_arm64(self):
+        for command in ("cmd_install", "cmd_upgrade"):
+            for setup in ("NO_START=1", "SYNC_WRAP=0", "TEST_ARCH=arm64"):
+                with self.subTest(command=command, setup=setup), tempfile.TemporaryDirectory() as tmp:
+                    (Path(tmp) / "docker-compose.yml").write_text("services: {}\n")
+                    result = run_installer(
+                        'INSTALL_DIR="$TEST_ROOT"; ' + setup + '; ' + command,
+                        mock=self.install_mock + '\ndocker() { exit 99; }; node() { exit 99; }',
+                        extra_env={"TEST_ROOT": tmp},
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertFalse((Path(tmp) / "share").exists())
 
     def test_crag_update_rejects_no_start_before_any_mutation(self):
         result = run_installer(
