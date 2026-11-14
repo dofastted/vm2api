@@ -31,6 +31,7 @@ import {
   normalizeSessionIdleTtlSeconds,
   LOCAL_CRAG_CLAUDE,
   REMOTE_CRAG_CLAUDE,
+  REMOTE_CRAG_ENTRY,
   resolveSlotClaude,
   resolveCliSystemLayout,
   resolveCragKernelVersion,
@@ -599,7 +600,8 @@ async function containerKernelIsPid1(container, runDockerExec, vm) {
       .trimEnd()
       .split('\n')
     const executable = JSON.parse(path)
-    if (/kin-kernel|(?:^|\/)crag-v2$/.test(executable)) return true
+    // Cluster CRAG boots the slot-bin entry; its node home has no .kin/kin-kernel to exec.
+    if (/kin-kernel|(?:^|\/)crag-v2$/.test(executable) || executable === REMOTE_CRAG_ENTRY) return true
     return kernelCpuCommandMatches([executable, ...JSON.parse(args)])
   } catch {
     return false
