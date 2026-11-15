@@ -89,8 +89,9 @@
 | POST | `/vms/:id/collect-identity` | guest 采集（locale/tz/`guest_machine_id`、槽内 `/etc/os-release` 的 `VERSION_ID`、系统与架构）；Codex Analytics 只使用这次采集的运行环境 |
 | POST | `/vms/:id/reload` | 重载该槽 worker |
 | GET | `/kernels` | 仅 admin/master。返回两种产品 `kernels`（`cli-node` 默认免费、`crag` 签名加密 V2）、真实本地版本/就绪状态、按 VM 的公开 `licenses` 与 `installations`。读取不会初始化设备身份，不返回机器码、注册码或私钥 |
-| POST | `/kernels/pull` | `{ kernel: "cli-node" \| "crag", tag?: "vX.Y.Z" }`。只更新安装包缓存，不安装、不停 VM。cli-node 从 vm2api 应用 Release 下载 `kin-kernel` 与 `cli-node`；CRAG 默认使用 `crag_release` 固定版本，从同仓独立载荷 Release 下载 `crag-v2-licensed-amd64.tar.gz`。CRAG 用本机可信发行公钥校验签名、密文与成员；载荷缺少附件返回 `crag_v2_asset_missing`，不退回 legacy ELF |
-| POST | `/kernels/install` | `{ targets: [{ id, kernel: "cli-node" \| "crag" }] }`，仅处理非空显式范围；未知/重复/越权/Codex 目标在任何停用前拒绝。每槽先检查包与授权，再停服务、禁用自动重启、安装并保存选择；完成后保持 stopped，不自动启动。返回 `{ ok,total,ok_count,failed_count,items:[{id,kernel,ok,stopped,version?,code?,error?}] }`，逐项失败不伪装成全局成功 |
+| GET | `/kernels/releases` | 返回 `{ "cli-node": ["vX.Y.Z"], "crag": ["vX.Y.Z"] }`。从近期公开 Release 筛选具备完整附件的版本；cli-node 使用 vm2api 应用标签，CRAG 使用独立载荷版本 |
+| POST | `/kernels/pull` | `{ kernel: "cli-node" \| "crag", tag?: "vX.Y.Z" }`。省略 `tag` 拉取最新，指定 `tag` 拉取对应版本。只更新安装包缓存，不安装、不停 VM。cli-node 下载同一 Release 的 `kin-kernel` 与 `cli-node`；CRAG 从公开载荷 Release 下载 `crag-v2-licensed-amd64.tar.gz`，继续用可信发行公钥校验签名、密文与成员 |
+| POST | `/kernels/install` | `{ targets: [{ id, kernel: "cli-node" \| "crag", expected_tag?: "vX.Y.Z" }] }`。仅处理显式目标；指定 `expected_tag` 时，缓存版本不符则不停止该槽。通过检查后排空、安装并重启，健康检查通过后恢复可用调度。返回逐槽安装版本与错误 |
 | GET | `/wrap-cli` | kernel / wrap 样本 inspect：`ok, dir, kernel_bin, glibc_shim, wrapper, meta, kernel`。`kernel.source` 为 `configured`（仓内 `KIN_KERNEL_BIN` / `bin/kin-kernel`）或 `sample` |
 | POST | `/wrap-cli/make` | `{ glibc_vm? }` 重整 share/wrap-cli；叠上仓内最新 kernel；可从指定槽拷 glibc shim |
 | POST | `/wrap-cli/kernel` | 原始 `application/octet-stream` linux amd64 ELF。替换仓内 `bin/kin-kernel` 与 `share/wrap-cli/kin-kernel.bin`。不自动同步槽位 |

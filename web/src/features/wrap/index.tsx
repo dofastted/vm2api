@@ -37,6 +37,7 @@ import { KernelLicenseDialog } from './license-dialog'
 import {
   installKernelTargets,
   kernelCatalogQueryOptions,
+  kernelVersionsQueryOptions,
   pullKernelRelease,
   type KernelId,
   type KernelInstallItem,
@@ -73,6 +74,15 @@ export function WrapSamplePage() {
   const dashboard = useQuery(dashboardQueryOptions())
   const me = useQuery(meQueryOptions())
   const canEdit = me.data?.role === 'admin'
+  const [versionMenuOpened, setVersionMenuOpened] = useState(false)
+  const versions = useQuery({
+    ...kernelVersionsQueryOptions(),
+    enabled: canEdit && versionMenuOpened,
+  })
+  const [selectedTags, setSelectedTags] = useState<Record<KernelId, string>>({
+    'cli-node': 'latest',
+    crag: 'latest',
+  })
   const [drafts, setDrafts] = useState<Record<string, KernelId>>({})
   const [confirm, setConfirm] = useState<KernelTarget[] | null>(null)
   const [licenseVm, setLicenseVm] = useState<Vm | null>(null)
@@ -99,15 +109,17 @@ export function WrapSamplePage() {
     [rows]
   )
   const pull = useMutation({
-    mutationFn: (kernel: KernelId) => pullKernelRelease({ kernel }),
+    mutationFn: pullKernelRelease,
     onMutate: () => setPullError(null),
-    onSuccess: async (_data, kernel) => {
+    onSuccess: async (data, { kernel }) => {
       await qc.invalidateQueries({
         queryKey: kernelCatalogQueryOptions().queryKey,
       })
-      toast.success(`${KERNEL_NAMES[kernel]} 安装包已更新`)
+      toast.success(
+        `${KERNEL_NAMES[kernel]} ${data.release?.tag || ''} 安装包已下载`
+      )
     },
-    onError: (error: Error, kernel) => {
+    onError: (error: Error, { kernel }) => {
       const message =
         isApiError(error) && error.code === 'crag_v2_asset_missing'
           ? '发布源尚无 CRAG 授权包，现有版本未改动。'
@@ -142,6 +154,20 @@ export function WrapSamplePage() {
       toast.error(`请先下载 ${KERNEL_NAMES[missingPackage.kernel]} 安装包`)
       return
     }
+    const products = new Map(
+      catalog.data?.kernels.map((product) => [product.id, product])
+    )
+    const pending = targets.find(
+      ({ kernel }) =>
+        selectedTags[kernel] !== 'latest' &&
+        products.get(kernel)?.release_tag !== selectedTags[kernel]
+    )
+    if (pending) {
+      toast.error(
+        `请先拉取 ${KERNEL_NAMES[pending.kernel]} ${selectedTags[pending.kernel]}`
+      )
+      return
+    }
     const mac = targets.find(
       (target) => vmById.get(target.id)?.node_platform === 'darwin'
     )
@@ -161,7 +187,12 @@ export function WrapSamplePage() {
       if (vm) setLicenseVm(vm)
       return
     }
-    setConfirm(targets)
+    setConfirm(
+      targets.map((target) => ({
+        ...target,
+        expected_tag: products.get(target.kernel)?.release_tag,
+      }))
+    )
   }
 
   async function runInstall(targets: KernelTarget[]) {
@@ -245,7 +276,7 @@ export function WrapSamplePage() {
   return (
     <PageHeader
       title='内核'
-      description='cli-node 默认免费，CRAG 使用注册码授权。'
+      description='可拉取最新或指定版本。拉取只更新缓存；确认重装后才应用到 VM。'
       extra={
         <Button
           variant='ghost'
@@ -316,7 +347,8 @@ export function WrapSamplePage() {
                       {product.ready ? '已下载' : '未就绪'}
                     </span>
                     <span className='text-muted-foreground'>
-                      {product.version || '版本未记录'}
+                      {product.ready ? '缓存：' : ''}
+                      {product.release_tag || product.version || '版本未记录'}
                     </span>
                   </div>
                   {product.error && !product.ready ? (
@@ -340,16 +372,88 @@ export function WrapSamplePage() {
                   ) : null}
                 </div>
                 <div className='flex flex-wrap gap-2'>
+                  <Select
+                    value={selectedTags[product.id]}
+                    disabled={!canEdit || busy}
+                    onOpenChange={(open) => {
+                      if (open) {
+                        if (versions.isError) void versions.refetch()
+                        setVersionMenuOpened(true)
+                      }
+                    }}
+                    onValueChange={(tag) =>
+                      setSelectedTags((previous) => ({
+                        ...previous,
+                        [product.id]: tag,
+                      }))
+                    }
+                  >
+                    <SelectTrigger
+                      aria-label={`${KERNEL_NAMES[product.id]} 下载版本`}
+                      className='min-h-11 min-w-32'
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value='latest'>最新版本</SelectItem>
+                      {Array.from(
+                        new Set([
+                          ...(versions.data?.[product.id] || []),
+                          ...(selectedTags[product.id] !== 'latest'
+                            ? [selectedTags[product.id]]
+                            : []),
+                        ])
+                      ).map((tag) => (
+                        <SelectItem key={tag} value={tag}>
+                          {tag}
+                        </SelectItem>
+                      ))}
+                      {versions.isFetching ? (
+                        <div
+                          role='status'
+                          className='px-2 py-1.5 text-sm text-muted-foreground'
+                        >
+                          正在读取历史版本…
+                        </div>
+                      ) : null}
+                      {versions.isError ? (
+                        <div
+                          role='status'
+                          className='px-2 py-1.5 text-sm text-muted-foreground'
+                        >
+                          历史版本暂不可用，重开菜单可重试
+                        </div>
+                      ) : null}
+                      {versions.isSuccess &&
+                      !versions.data[product.id].length ? (
+                        <div className='px-2 py-1.5 text-sm text-muted-foreground'>
+                          暂无可选版本
+                        </div>
+                      ) : null}
+                    </SelectContent>
+                  </Select>
                   <Button
                     variant='outline'
                     className='h-11'
-                    aria-label={`拉取 ${KERNEL_NAMES[product.id]} 最新二进制`}
+                    aria-label={`拉取 ${KERNEL_NAMES[product.id]} ${selectedTags[product.id] === 'latest' ? '最新版本' : selectedTags[product.id]}`}
                     disabled={!canEdit || busy}
-                    loading={pull.isPending && pull.variables === product.id}
-                    onClick={() => pull.mutate(product.id)}
+                    loading={
+                      pull.isPending && pull.variables?.kernel === product.id
+                    }
+                    onClick={() =>
+                      pull.mutate({
+                        kernel: product.id,
+                        tag:
+                          selectedTags[product.id] === 'latest'
+                            ? undefined
+                            : selectedTags[product.id],
+                      })
+                    }
                   >
                     <Download aria-hidden='true' />
-                    拉取最新
+                    {selectedTags[product.id] === 'latest'
+                      ? '拉取最新'
+                      : '拉取版本'}
                   </Button>
                   <Button
                     variant='outline'
@@ -360,7 +464,7 @@ export function WrapSamplePage() {
                     }
                     onClick={() => requestInstall(slotTargets(product.id))}
                   >
-                    更新全部槽位
+                    应用缓存到全部槽位
                   </Button>
                 </div>
               </div>
@@ -716,6 +820,7 @@ export function WrapSamplePage() {
               </span>
               <span className='shrink-0 font-medium'>
                 {KERNEL_NAMES[target.kernel]}
+                {target.expected_tag ? ` ${target.expected_tag}` : ''}
                 {target.kernel === 'crag' &&
                 !catalog.data?.licenses[target.id]?.valid
                   ? ' · 待授权'

@@ -130,6 +130,7 @@ test('catalog exposes authenticated license status and installed metadata but no
 for (const role of ['user', 'super']) {
   for (const [method, endpoint] of [
     ['GET', ''],
+    ['GET', '/releases'],
     ['POST', '/pull'],
     ['POST', '/install'],
   ]) {
@@ -249,30 +250,38 @@ test('install route changes only explicit Claude target, returns partial outcome
 
 function releaseFetch() {
   const payloads = { 1: elf('pulled-kernel'), 2: elf('pulled-cli') }
+  const assets = [
+    {
+      name: 'kin-kernel',
+      size: payloads['1'].length,
+      url: 'https://api.github.com/repos/dofastted/vm2api/releases/assets/1',
+    },
+    {
+      name: 'cli-node',
+      size: payloads['2'].length,
+      url: 'https://api.github.com/repos/dofastted/vm2api/releases/assets/2',
+    },
+  ]
   return async (url) => {
     const href = String(url)
     if (new URL(href).pathname.endsWith('/releases')) {
-      return Response.json([{ tag_name: 'payload-2026.11.15-crag-1.2.3', draft: false, assets: [] }])
+      const crag = {
+        name: 'crag-v2-licensed-amd64.tar.gz',
+        size: 1024,
+        browser_download_url:
+          'https://github.com/dofastted/vm2api/releases/download/payload-2026.11.14-crag-1.2.1/crag-v2-licensed-amd64.tar.gz',
+      }
+      return Response.json([
+        { tag_name: 'v1.2.4', draft: true, prerelease: false, assets },
+        { tag_name: 'v1.2.3', draft: false, prerelease: false, assets },
+        { tag_name: 'v1.2.2', draft: false, prerelease: false, assets: assets.slice(0, 1) },
+        { tag_name: 'v1.2.1', draft: false, prerelease: false, assets },
+        { tag_name: 'payload-2026.11.15-crag-1.2.3', draft: false, assets: [] },
+        { tag_name: 'payload-2026.11.14-crag-1.2.1', draft: false, prerelease: true, assets: [crag] },
+      ])
     }
-    if (href.endsWith('/releases/latest'))
-      return new Response(
-        JSON.stringify({
-          tag_name: 'v1.2.3',
-          assets: [
-            {
-              name: 'kin-kernel',
-              size: payloads['1'].length,
-              url: 'https://api.github.com/repos/dofastted/vm2api/releases/assets/1',
-            },
-            {
-              name: 'cli-node',
-              size: payloads['2'].length,
-              url: 'https://api.github.com/repos/dofastted/vm2api/releases/assets/2',
-            },
-          ],
-        }),
-        { headers: { 'content-type': 'application/json' } },
-      )
+    if (href.endsWith('/releases/latest')) return Response.json({ tag_name: 'v1.2.3', assets })
+    if (href.endsWith('/releases/tags/v1.2.1')) return Response.json({ tag_name: 'v1.2.1', assets })
     const payload = payloads[href.split('/').pop()]
     assert.ok(payload, `unexpected request: ${href}`)
     return new Response(payload, { headers: { 'content-length': String(payload.length) } })
@@ -299,10 +308,17 @@ test('pull route updates cache only and returns actionable paid asset failure wi
   assert.equal(pulled.body.data.kernel.id, 'cli-node')
   assert.equal(pulled.body.data.kernel.version, '1.2.3')
   assert.equal(pulled.body.data.release.tag, 'v1.2.3')
-  const paid = await route(root, 'POST', '/pull', { kernel: 'crag' }, options)
+  const versions = await route(root, 'GET', '/releases', null, options)
+  assert.equal(versions.status, 200)
+  assert.deepEqual(versions.body.data, { 'cli-node': ['v1.2.3', 'v1.2.1'], crag: ['v1.2.1'] })
+  const historical = await route(root, 'POST', '/pull', { kernel: 'cli-node', tag: 'v1.2.1' }, options)
+  assert.equal(historical.status, 200, JSON.stringify(historical.body))
+  assert.equal(historical.body.data.release.tag, 'v1.2.1')
+  const paid = await route(root, 'POST', '/pull', { kernel: 'crag', tag: 'v1.2.3' }, options)
   assert.notEqual(paid.status, 200)
   assert.match(paid.body.error.code, /crag.*asset.*missing/)
   const inventory = await route(root, 'GET', '')
+  assert.equal(inventory.body.data.kernels[0].release_tag, 'v1.2.1')
   assert.equal(inventory.body.data.kernels[1].ready, true, 'missing paid release must preserve local signed package')
   for (const [index, vm] of vms.entries()) {
     assert.deepEqual(fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`)), records[index])

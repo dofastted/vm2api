@@ -10,6 +10,7 @@ export type KernelProduct = {
   paid: boolean
   ready: boolean
   version: string | null
+  release_tag?: string
   updated_at: string | null
   code?: string
   error?: string
@@ -27,7 +28,11 @@ export type KernelCatalog = {
   installations?: Record<string, KernelInstallation>
 }
 
-export type KernelTarget = { id: string; kernel: KernelId }
+export type KernelTarget = {
+  id: string
+  kernel: KernelId
+  expected_tag?: string
+}
 
 export type KernelInstallItem = KernelTarget & {
   ok: boolean
@@ -52,6 +57,16 @@ export function kernelCatalogQueryOptions() {
   return queryOptions({
     queryKey: ['panel', 'kernels'] as const,
     queryFn: () => api<KernelCatalog>('/api/panel/kernels'),
+  })
+}
+
+export function kernelVersionsQueryOptions() {
+  return queryOptions({
+    queryKey: ['panel', 'kernel-releases'] as const,
+    queryFn: () =>
+      api<Record<KernelId, string[]>>('/api/panel/kernels/releases'),
+    staleTime: 5 * 60_000,
+    retry: false,
   })
 }
 

@@ -15,25 +15,55 @@ import {
   WRAP_KERNEL_BIN,
   wrapKernelWrapperScript,
 } from '../vm/wrap-cli-runtime.mjs'
+import { isReleaseTag } from './release.mjs'
 import {
   CRAG_V2_RELEASE_ASSET,
   fetchKernelReleaseMetadata,
   openKernelReleaseAsset,
-  selectReleaseAsset,
+  selectCragV2Asset,
   selectKernelAsset,
   selectCliNodeAsset,
   MAX_KERNEL_DOWNLOAD_BYTES,
   MAX_CLI_NODE_DOWNLOAD_BYTES,
+  MAX_CRAG_V2_DOWNLOAD_BYTES,
 } from './release-kernel.mjs'
 
-const MAX_ARCHIVE = 512 * 1024 * 1024
+const MAX_ARCHIVE = MAX_CRAG_V2_DOWNLOAD_BYTES
 const MAX_EXPANDED = 768 * 1024 * 1024
 const MAX_MEMBERS = 64
 const verificationCache = new Map()
+const installingCaches = new Set()
 const coded = (code, message) => Object.assign(new Error(message), { code })
 const baseFor = (root, kernel) =>
   kernel === 'crag' ? path.join(root, 'share/crag/kernels/v2') : path.join(root, 'share/wrap-cli-releases')
 const archFor = (kernel) => (kernel === 'crag' ? cragV2Arch() : 'amd64')
+
+export function reserveKernelInstallCache(projectRoot, kernel) {
+  const key = path.resolve(baseFor(projectRoot, kernel))
+  if (installingCaches.has(key)) return null
+  installingCaches.add(key)
+  return () => installingCaches.delete(key)
+}
+
+function ensureKernelCacheNotInstalling(base) {
+  if (installingCaches.has(path.resolve(base))) throw coded('kernel_pull_busy', '正在重装内核，安装包缓存未更改')
+}
+
+function acquireKernelCacheLock(projectRoot, kernel) {
+  const base = baseFor(projectRoot, kernel)
+  ensureKernelCacheNotInstalling(base)
+  const lock = path.join(base, '.pull-lock')
+  try {
+    fs.mkdirSync(base, { recursive: true })
+    fs.mkdirSync(lock, { mode: 0o700 })
+    return lock
+  } catch (error) {
+    throw coded(
+      error.code === 'EEXIST' ? 'kernel_pull_busy' : 'kernel_cache_unwritable',
+      '内核缓存忙或不可写，请稍后重试',
+    )
+  }
+}
 
 function jsonFile(file, max = 64 * 1024) {
   const st = fs.lstatSync(file)
@@ -99,6 +129,7 @@ function publicProduct(id, ready, meta = {}, code) {
     paid: id === 'crag',
     ready,
     version,
+    ...(isReleaseTag(meta.tag) ? { release_tag: meta.tag } : {}),
     updated_at: updated,
     ...(!ready
       ? {
@@ -119,7 +150,7 @@ function selectedReleaseInfo(projectRoot, kernel, root) {
     const base = baseFor(projectRoot, kernel)
     const pointer = jsonFile(path.join(base, `current-${archFor(kernel)}.json`), 4096)
     if (path.join(base, pointer.package) !== root) return {}
-    return { version: pointer.release?.version, updated_at: pointer.updated_at }
+    return { tag: pointer.release?.tag, version: pointer.release?.version, updated_at: pointer.updated_at }
   } catch {
     return {}
   }
@@ -441,16 +472,7 @@ export async function pullKernelRelease(
       fetchImpl,
     })
     const specs =
-      kernel === 'cli-node'
-        ? [selectKernelAsset(payload), selectCliNodeAsset(payload)]
-        : [
-            selectReleaseAsset(payload, {
-              name: CRAG_V2_RELEASE_ASSET,
-              maxBytes: MAX_ARCHIVE,
-              missingCode: 'crag_v2_asset_missing',
-              tooLargeCode: 'crag_v2_too_large',
-            }),
-          ]
+      kernel === 'cli-node' ? [selectKernelAsset(payload), selectCliNodeAsset(payload)] : [selectCragV2Asset(payload)]
     for (const spec of specs) {
       if (!spec.ok) return spec
       if (payload.assets.filter((asset) => asset?.name === spec.asset).length !== 1)
@@ -464,17 +486,7 @@ export async function pullKernelRelease(
       throw coded('kernel_override_active', '已配置显式内核路径，请先移除覆盖配置再拉取')
     const pinned = kernel === 'crag' ? pinnedAuthority(projectRoot) : null
     const base = baseFor(projectRoot, kernel)
-    fs.mkdirSync(base, { recursive: true })
-    lock = path.join(base, '.pull-lock')
-    try {
-      fs.mkdirSync(lock, { mode: 0o700 })
-    } catch (error) {
-      lock = null
-      throw coded(
-        error.code === 'EEXIST' ? 'kernel_pull_busy' : 'kernel_cache_unwritable',
-        '内核缓存忙或不可写，请稍后重试',
-      )
-    }
+    lock = acquireKernelCacheLock(projectRoot, kernel)
     const packages = path.join(base, 'packages')
     fs.mkdirSync(packages, { recursive: true })
     if (fs.lstatSync(packages).isSymbolicLink()) throw coded('kernel_cache_invalid', '内核缓存不能是链接')
@@ -505,6 +517,7 @@ export async function pullKernelRelease(
         throw coded('crag_v2_authority_mismatch', 'CRAG 发行公钥与本机可信公钥不匹配')
       }
     }
+    ensureKernelCacheNotInstalling(base)
     makeReadonly(stage)
     const relative = `packages/${archFor(kernel)}-${crypto.randomUUID()}`
     published = path.join(base, relative)
@@ -540,7 +553,10 @@ export async function pullKernelRelease(
     return {
       ok: false,
       code,
-      error: `${kernel === 'crag' ? message : 'cli-node 拉取失败'}，原包未更改`,
+      error:
+        code === 'kernel_pull_busy'
+          ? error.message
+          : `${kernel === 'crag' ? message : 'cli-node 拉取失败'}，原包未更改`,
     }
   } finally {
     for (const dir of [stage, published]) {
