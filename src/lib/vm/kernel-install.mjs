@@ -225,7 +225,9 @@ export async function installKernelTargets({
             failure(target, 'crag_payload_changed', 'CRAG 下载版本已变更，请刷新并重新确认安装', stopped)
           if (!matchesPayload(product)) return changedPayload()
           if (target.kernel === 'crag') {
-            const grant = (ops.checkCragLicense || checkCragLicense)(projectRoot, desired, routing)
+            const grant = (ops.checkCragLicense || checkCragLicense)(projectRoot, desired, routing, {
+              preferInstalled: false,
+            })
             if (!grant.ok) return failure(target, grant.code || 'license_required', grant.error || '请先激活 CRAG 授权')
           }
           phase = 'kernel_operation_persist_failed'

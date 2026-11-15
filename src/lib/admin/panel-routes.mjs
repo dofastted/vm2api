@@ -294,6 +294,7 @@ import {
   getCragLicense,
   projectCragUniversalVm,
   redeemCragDeviceVoucher,
+  resolveCragVoucherKind,
 } from '../vm/crag-license.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
@@ -3294,28 +3295,41 @@ export function createPanelHandler(ctx) {
             })
           }
           const online = registrationCode.startsWith('CRAGR1.')
-          if (online && !sameOriginPost(req, cfg.base_url)) {
+          if (online && (req.apiKeyKind || !panelIdentity(req).user || !sameOriginPost(req, cfg.base_url))) {
             return json(res, 403, {
               ok: false,
               error: { code: 'license_redeem_origin', message: 'Same origin required.' },
             })
           }
-          const activated = online
-            ? await redeemCragDeviceVoucher(cfg.paths.project, vm, registrationCode, {
+          let activated
+          if (online) {
+            const kind = await resolveCragVoucherKind(cfg.paths.project, vm, registrationCode, ctx.fetchCragDeviceGrant)
+            if (kind === 'host') {
+              activated = await ctx.cragSubscription.activateVoucher(vm.id, registrationCode)
+            } else {
+              activated = await redeemCragDeviceVoucher(cfg.paths.project, vm, registrationCode, {
                 getTarget: () => getVm(cfg.paths.project, vm.id),
                 routing: ctx.routingConfig,
                 fetchImpl: ctx.fetchCragDeviceGrant,
               })
-            : activateCragLicense(cfg.paths.project, vm, registrationCode)
+            }
+          } else {
+            activated = activateCragLicense(cfg.paths.project, vm, registrationCode)
+          }
           if (activated.license?.scope === 'kernel') await distributeCragUniversalGrant(cfg.paths.project)
           return json(res, 200, panel.ok(activated))
         } catch (error) {
-          const typed = error instanceof CragLicenseError
+          const typed =
+            error instanceof CragLicenseError ||
+            (Number.isInteger(error?.status) &&
+              error.status >= 400 &&
+              error.status <= 599 &&
+              /^[a-z][a-z0-9_]{1,63}$/.test(error?.code || ''))
           return json(res, typed ? error.status : 400, {
             ok: false,
             error: {
               code: typed ? error.code : 'license_invalid',
-              message: typed ? error.message : 'The CRAG activation request is invalid.',
+              message: error instanceof CragLicenseError ? error.message : 'CRAG activation did not complete.',
             },
           })
         }

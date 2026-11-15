@@ -16,7 +16,7 @@ import { runtimeKind, isKvmRuntime, RUNTIME_KVM } from './runtime-kind.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { kernelBinPath, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
-import { checkCragLicense, projectCragUniversalVm } from './crag-license.mjs'
+import { checkCragLicense, cragTargetIds, projectCragUniversalVm } from './crag-license.mjs'
 import { CRAG_HOST_MOUNT, cragSubscriptionPublicDirectory } from './crag-subscription-paths.mjs'
 import { workerPaths as transportWorkerPaths } from '../transport/go-worker-client.mjs'
 import {
@@ -28,13 +28,7 @@ import {
 } from './slot-engine.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
 import { ensureSlotClaudeOwnership, chownSlotRuntimeFile, replaceSlotOwnedFile } from '../oauth/oauth-credentials.mjs'
-import {
-  CRAG_V2_DIR,
-  cragV2PackageRoot,
-  materializeResolvedKernel,
-  verifyCragV2Tree,
-  wrapCliHomeDir,
-} from './wrap-cli-runtime.mjs'
+import { installedCragV2Root, materializeResolvedKernel } from './wrap-cli-runtime.mjs'
 import { ensureGuestMachineIdFile } from '../identity/workstation-fingerprint.mjs'
 import { ensureSlotComputer, rememberComputer } from '../identity/slot-computer.mjs'
 import { coerceRfc4122Uuid } from '../identity/rfc4122-uuid.mjs'
@@ -346,17 +340,12 @@ export function assertCragSubscriptionTarget(
       throw unsupported()
     }
   }
-  const staged = path.join(wrapCliHomeDir(projectRoot, vm.id), CRAG_V2_DIR)
-  const installed = verifyCragV2Tree(staged, { allowPreviousClaude: true })
-  const selected = verifyCragV2Tree(cragV2PackageRoot(projectRoot))
-  if (
-    !installed.ok ||
-    !selected.ok ||
-    installed.manifest.sha256['crag-v2'] !== selected.manifest.sha256['crag-v2'] ||
-    installed.manifest.payload.key_id !== selected.manifest.payload.key_id ||
-    installed.manifest.authorization.public_key_id !== selected.manifest.authorization.public_key_id
-  )
+  try {
+    if (!installedCragV2Root(projectRoot, vm)) throw unsupported()
+    cragTargetIds(projectRoot, vm)
+  } catch {
     throw unsupported()
+  }
   // A stopped slot only stages verified files. The normal start path still
   // requires the signed permit and creates the read-only entitlement mount.
   if (prepared) return true
