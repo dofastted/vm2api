@@ -27,6 +27,7 @@ import { slotHost } from '../vm/slot-host.mjs'
 import { dockerRequest } from '../cluster/docker-remote.mjs'
 import { clusterManager, vmNodeId } from '../cluster/placement.mjs'
 import { vmTimeoutTracker } from '../pool/failover-runner.mjs'
+import { clearUnschedulable } from '../vm/vm-registry.mjs'
 import path from 'node:path'
 import { checkCragLicense } from '../vm/crag-license.mjs'
 
@@ -110,6 +111,10 @@ export function isKernelWatchdogTarget(vm, routing = {}) {
 
 /** Remote node probes cross an SSH relay; allow transport jitter beyond the previous 3s probe timeout. */
 export const NODE_SLOT_HEALTH_TIMEOUT_MS = 8000
+
+// A lock younger than this may still belong to a start / panel action in
+// flight; only stale leftovers are lifted automatically.
+const STALE_RUNTIME_LOCK_MS = 10 * 60_000
 export const NODE_SLOT_FAILURES_BEFORE_RESTART = 3
 
 function clusterRelayPaths(nodeId, vmId) {
@@ -260,6 +265,27 @@ export function createKernelWatchdog({
     // The cc dataplane's worker is cc-node. Restarting a live kernel SIGKILLs it.
     if (dataplaneUsesCcNode(exec) && rustKernelProcessUp(current)) return
     if (!rustKernelNeedsRestart(current)) {
+      // A start that timed out on a flaky node link leaves runtime_start_failed
+      // behind while the container itself never died; a healthy kernel proves the
+      // leftover wrong. Lift only that lock, only once it is stale, so a start or
+      // panel action in flight keeps its own bookkeeping.
+      const lockedAt = Date.parse(vm.unschedulable?.at || '') || 0
+      if (
+        vm.unschedulable?.reason === 'runtime_start_failed' &&
+        lockedAt > 0 &&
+        now() - lockedAt >= STALE_RUNTIME_LOCK_MS &&
+        home &&
+        path.resolve(home, '..').endsWith(path.join('/vms', vm.id))
+      ) {
+        const cleared = clearUnschedulable(path.resolve(home, '../../..'), vm.id, {
+          by: 'runtime_recovered',
+          only: ['runtime_start_failed'],
+        })
+        if (cleared) {
+          console.warn(`[kernel-watchdog] ${vm.id} kernel healthy; stale runtime_start_failed lifted`)
+          vm.unschedulable = null
+        }
+      }
       // Healthy again after a fault means someone fixed it: start a fresh budget.
       // Plain recovery keeps past attempts so a crash loop stays bounded by the window.
       if (kernelFaults.delete(vm.id)) {
