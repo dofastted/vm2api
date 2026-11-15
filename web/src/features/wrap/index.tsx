@@ -33,6 +33,11 @@ import { PageHeader } from '@/components/page-header'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
 import { dashboardQueryOptions } from '@/features/overview/queries'
+import {
+  CragRuntimeCounts,
+  CragRuntimeDetail,
+} from '@/features/vm/crag-runtime-counts'
+import { cragHostStatusQueryOptions } from '@/features/vm/queries'
 import { KernelLicenseDialog } from './license-dialog'
 import {
   installKernelTargets,
@@ -74,6 +79,12 @@ export function WrapSamplePage() {
   const dashboard = useQuery(dashboardQueryOptions())
   const me = useQuery(meQueryOptions())
   const canEdit = me.data?.role === 'admin'
+  const cragHost = useQuery({
+    ...cragHostStatusQueryOptions(),
+    enabled: canEdit,
+    refetchInterval: canEdit ? 10_000 : false,
+  })
+  const cragStatus = canEdit && !cragHost.isError ? cragHost.data : undefined
   const [versionMenuOpened, setVersionMenuOpened] = useState(false)
   const versions = useQuery({
     ...kernelVersionsQueryOptions(),
@@ -283,6 +294,9 @@ export function WrapSamplePage() {
         }),
         qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
         qc.invalidateQueries({ queryKey: ['panel', 'vms'] }),
+        qc.invalidateQueries({
+          queryKey: cragHostStatusQueryOptions().queryKey,
+        }),
       ])
       setInstalling(false)
     }
@@ -300,6 +314,7 @@ export function WrapSamplePage() {
           onClick={() => {
             void catalog.refetch()
             void dashboard.refetch()
+            if (canEdit) void cragHost.refetch()
           }}
         >
           <RefreshCw aria-hidden='true' />
@@ -374,6 +389,17 @@ export function WrapSamplePage() {
                         '版本未记录'}
                     </span>
                   </div>
+                  {product.id === 'crag' && canEdit ? (
+                    <>
+                      <CragRuntimeCounts status={cragStatus} />
+                      <Link
+                        to='/crag-subscription'
+                        className='mt-2 inline-flex text-sm text-primary underline underline-offset-4'
+                      >
+                        兑换槽位
+                      </Link>
+                    </>
+                  ) : null}
                   {product.error && !product.ready ? (
                     <p className='mt-2 text-base break-words text-destructive sm:text-sm'>
                       {product.error}
@@ -596,6 +622,7 @@ export function WrapSamplePage() {
                     const license = catalog.data?.licenses[vm.id]
                     const installed = catalog.data?.installations?.[vm.id]
                     const result = job?.results[vm.id]
+                    const runtime = cragStatus?.runtime?.vms[vm.id]
                     const active = installing && job?.activeId === vm.id
                     const macNative = vm.node_platform === 'darwin'
                     const kvm = ['kvm', 'qemu', 'libvirt'].includes(
@@ -663,6 +690,13 @@ export function WrapSamplePage() {
                             ) : null}
                             {kvm ? <Badge variant='outline'>KVM</Badge> : null}
                           </div>
+                          {runtime ? (
+                            <CragRuntimeDetail detail={runtime} />
+                          ) : canEdit && currentKernel === 'crag' ? (
+                            <p className='mt-2 text-sm text-muted-foreground'>
+                              CRAG：运行状态未知
+                            </p>
+                          ) : null}
                           {repairCrag ? (
                             <p className='mt-2 text-sm text-muted-foreground'>
                               未记录 CRAG 版本，可重装补齐内核和配置。

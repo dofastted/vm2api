@@ -535,6 +535,7 @@ export function createSlotShell({
             existing,
             oauth,
             source: oauth.source,
+            fromNativeLogin: true,
           })
           if (!committed?.ok) {
             sendError(committed?.error?.message || '授权成功，但面板未能同步凭证')

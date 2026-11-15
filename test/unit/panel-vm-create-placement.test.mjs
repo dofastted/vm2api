@@ -5,6 +5,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
+import { seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
 const GiB = 1024 ** 3
 
@@ -42,10 +43,16 @@ function createVm(project, body, extra = {}) {
 const AUTO = { cluster: { auto_placement: { enabled: true } } }
 const BODY = { runtime_type: 'docker', start: false, auto_allocate_proxy: false }
 
-function withProject(fn) {
+function withProject(fn, { packages = true } = {}) {
   return async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-place-'))
     try {
+      if (packages && process.platform === 'linux' && process.arch === 'x64') {
+        const wrap = path.join(root, 'share/wrap-cli')
+        fs.mkdirSync(wrap, { recursive: true })
+        for (const file of ['kin-kernel.bin', 'cli-node']) fs.writeFileSync(path.join(wrap, file), 'fixture')
+        seedEncryptedPackage(root)
+      }
       await fn(root)
     } finally {
       fs.rmSync(root, { recursive: true, force: true })
@@ -122,6 +129,30 @@ test(
     assert.equal(report.candidates.find((r) => r.id === 'node-a').reason, 'preflight_failed')
   }),
 )
+
+test('auto placement releases its reservation when required packages are missing', async (t) => {
+  if (process.platform !== 'linux' || process.arch !== 'x64') return t.skip('requires Linux amd64')
+  await withProject(
+    async (root) => {
+      let released = 0
+      const response = await createVm(root, BODY, {
+        routingConfig: AUTO,
+        pickPlacement: async () => ({
+          node_id: null,
+          release: () => {
+            released += 1
+          },
+          report: { mode: 'auto', chosen: 'local' },
+        }),
+      })
+      assert.equal(response.status, 409)
+      assert.equal(response.body.error.code, 'kernel_package_missing')
+      assert.equal(released, 1)
+      assert.equal(fs.existsSync(path.join(root, 'vms/vm-01.json')), false)
+    },
+    { packages: false },
+  )()
+})
 
 test(
   'on_full=reject refuses the create without writing a slot',

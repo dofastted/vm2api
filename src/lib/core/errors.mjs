@@ -461,7 +461,11 @@ export function mapUpstreamError(status, body, headers = {}) {
     (upType ? body?.message : null) ||
     body?.raw ||
     null
-  if (/^license_(required|expired|not_yet_valid|invalid|binding_mismatch|unconfigured)$/.test(inboundCode)) {
+  if (
+    /^license_(required|expired|not_yet_valid|invalid|binding_mismatch|unconfigured|crag_host_over_quota|crag_host_usage_unverified)$/.test(
+      inboundCode,
+    )
+  ) {
     return makeError({
       type: ErrorType.PERMISSION,
       code: inboundCode,

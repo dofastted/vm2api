@@ -20,6 +20,7 @@ const messages = {
   crag_subscription_json_required: 'Expected application/json.',
   crag_subscription_invalid_request: 'Invalid host subscription request.',
   crag_subscription_body_too_large: 'Host subscription request is too large.',
+  crag_subscription_host_package_unready: 'Install or restore the trusted CRAG host package before retrying.',
   vm_not_found: 'VM not found.',
   crag_subscription_failed: 'The host subscription operation failed. Refresh its status before retrying.',
 }

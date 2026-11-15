@@ -14,10 +14,25 @@ import {
 import { readWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
 import { cragV2KernelActive } from '../protocol/crag-print-prompt.mjs'
 import { checkCragLicense, cragLicenseDeniedResult } from '../vm/crag-license.mjs'
+import { resolveKernelDataplane } from '../vm/slot-engine.mjs'
 
-function licenseCheck(opts) {
+function licenseCheck(opts, liveCrag = cragV2KernelActive({ health: opts.exec?.workerStatus })) {
   const root = opts.exec?.projectRoot || (opts.exec?.homeDir ? path.resolve(opts.exec.homeDir, '../../..') : '')
-  return checkCragLicense(root, opts.exec?.vm, opts.routing)
+  // A live CRAG process remains licensed per slot even if the saved selection is stale.
+  const vm = liveCrag ? { ...opts.exec?.vm, dataplane: 'crag', crag_kernel_version: 'v2' } : opts.exec?.vm
+  const licensed = checkCragLicense(root, vm, opts.routing)
+  return licensed.ok ? null : cragLicenseDeniedResult(licensed)
+}
+
+export async function checkRustInferenceAdmission(opts) {
+  const { vm, workerStatus: health } = opts.exec || {}
+  const liveCrag = cragV2KernelActive({ health })
+  if (liveCrag || resolveKernelDataplane(vm, opts.routing) === 'crag') {
+    const rejection = await opts.admitCragInference?.({ vm, routing: opts.routing, health })
+    if (rejection) return rejection
+    return licenseCheck(opts, liveCrag)
+  }
+  return null
 }
 
 export function rustKernelPaths(exec = {}) {
@@ -55,16 +70,27 @@ function remapVia(result) {
   }
 }
 
-export async function callRustKernel(opts = {}) {
-  const licensed = licenseCheck(opts)
-  if (!licensed.ok) return cragLicenseDeniedResult(licensed)
-  return remapVia(await callGoWorker({ ...opts, exec: withRustKernelExec(opts.exec) }))
+async function sendRustInference(send, opts) {
+  const { admitCragInference, ...sendOpts } = opts
+  if (!admitCragInference) {
+    const rejection = licenseCheck(opts)
+    if (rejection) return rejection
+  }
+  return remapVia(
+    await send({
+      ...sendOpts,
+      exec: withRustKernelExec(opts.exec),
+      beforeInferencePost: admitCragInference ? () => checkRustInferenceAdmission(opts) : undefined,
+    }),
+  )
 }
 
-export async function streamRustKernel(opts = {}) {
-  const licensed = licenseCheck(opts)
-  if (!licensed.ok) return cragLicenseDeniedResult(licensed)
-  return remapVia(await streamGoWorker({ ...opts, exec: withRustKernelExec(opts.exec) }))
+export function callRustKernel(opts = {}) {
+  return sendRustInference(callGoWorker, opts)
+}
+
+export function streamRustKernel(opts = {}) {
+  return sendRustInference(streamGoWorker, opts)
 }
 
 export async function postRustKernelTelemetryEvent(exec, event, options = {}) {

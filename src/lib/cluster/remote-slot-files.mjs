@@ -316,6 +316,16 @@ export async function pushCragSlot(vm, projectRoot, session = null, { required =
   return { ok: true, pushed: published.written.length > 0, digest: payload.digest, ...published }
 }
 
+/** Stage both Claude kernels on a fresh node slot without changing its guest selector. */
+export async function stageFreshClaudeKernels(vm, projectRoot) {
+  const session = await nodeSession(vmNodeId(vm))
+  await prepareRemoteDir(session, vm)
+  const wrap = await pushLiveWrap(vm, projectRoot, session, { required: true })
+  if (!wrap.ok) throw Object.assign(new Error(wrap.error || wrap.code), { code: wrap.code })
+  const crag = await pushCragSlot(vm, projectRoot, session, { required: true })
+  return { ok: true, wrap, crag }
+}
+
 /** Stop-accept install: both kernels land in slot-bin. The live entry is renamed over, never unlinked. */
 export async function pushKernelSelection(vm, projectRoot, kernel) {
   if (!vmNodeId(vm)) return { ok: false, code: 'not_cluster_slot', error: '不是集群槽' }

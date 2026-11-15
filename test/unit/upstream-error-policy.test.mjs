@@ -31,6 +31,22 @@ test('broken native handoff contracts stop without replaying or cooling an accou
   }
 })
 
+test('CRAG host capacity rejections stop without an account or egress cooldown', () => {
+  for (const code of ['license_crag_host_over_quota', 'license_crag_host_usage_unverified']) {
+    const policy = classifyUpstreamResult({
+      ok: false,
+      status: 403,
+      terminalState: 'rejected',
+      body: { type: 'error', error: { type: 'permission_error', code } },
+    })
+    assert.equal(policy.reason, code)
+    assert.equal(policy.scope, 'request')
+    assert.equal(policy.action, 'stop')
+    assert.equal(policy.retrySameAccount, false)
+    assert.equal(policy.cooldownUntil, null)
+  }
+})
+
 test('unified account 429 without reset header uses usage window then 30 minutes', () => {
   const now = 1_700_000_000_000
   const usageReset = now + 3_600_000

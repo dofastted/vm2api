@@ -9,9 +9,11 @@ import { ensureOfficialCredentialLink, slotUidGidFromHomeDir } from '../oauth/oa
 import { slotHost } from '../vm/slot-host.mjs'
 import path from 'node:path'
 import { checkCragLicense, cragLicenseDeniedResult } from '../vm/crag-license.mjs'
+import { resolveKernelDataplane } from '../vm/slot-engine.mjs'
 import {
   streamRustKernel,
   callRustKernel,
+  checkRustInferenceAdmission,
   rustKernelHealth,
   rustKernelReachable,
   rustKernelBusy,
@@ -259,8 +261,19 @@ async function prepareRust(exec, { ensure, routing, slotWaitMs, slotWaitDeadline
 }
 
 // Resolve before shaping the attempt; the same worker report gates serialization.
-export async function prepareInferenceHop({ exec, routing = {}, slotWaitMs, slotWaitDeadlineMs, ensureRust } = {}) {
+export async function prepareInferenceHop({
+  exec,
+  routing = {},
+  slotWaitMs,
+  slotWaitDeadlineMs,
+  ensureRust,
+  admitCragInference,
+} = {}) {
   const deadline = hopSlotWaitDeadline({ slotWaitDeadlineMs, slotWaitMs })
+  if (resolveKernelDataplane(exec?.vm, routing) === 'crag') {
+    const rejection = await admitCragInference?.({ vm: exec?.vm, routing })
+    if (rejection) return { rejection }
+  }
   const projectRoot = exec?.projectRoot || (exec?.homeDir ? path.resolve(exec.homeDir, '../../..') : '')
   const licensed = checkCragLicense(projectRoot, exec?.vm, routing)
   if (!licensed.ok) return { rejection: cragLicenseDeniedResult(licensed) }
@@ -336,15 +349,19 @@ async function runHop({ mode, opts }) {
       noteWrapHop(opts.exec)
     }
     if (!opts.signal?.aborted && !isClientCancelledResult(result) && isNeedsRefreshResult(result)) {
-      const ensure = opts.ensureCredential || ensureWorkerCredential
-      const ensured = await ensure(opts.exec, { force: true })
-      if (ensured?.ok !== true) result = credentialEnsureFailure(result, ensured)
+      const rejection = await checkRustInferenceAdmission(sendOpts)
+      if (rejection) result = rejection
       else if (!opts.signal?.aborted) {
-        // The CLI invalidates its OAuth cache from the shared credential file
-        // before creating each API client. Recycling here kills sibling hops.
-        result = await send(sendOpts)
-        result = { ...result, credential_retried: true }
-        noteWrapHop(opts.exec)
+        const ensure = opts.ensureCredential || ensureWorkerCredential
+        const ensured = await ensure(opts.exec, { force: true })
+        if (ensured?.ok !== true) result = credentialEnsureFailure(result, ensured)
+        else if (!opts.signal?.aborted) {
+          // The CLI invalidates its OAuth cache from the shared credential file
+          // before creating each API client. Recycling here kills sibling hops.
+          result = await send(sendOpts)
+          result = { ...result, credential_retried: true }
+          noteWrapHop(opts.exec)
+        }
       }
     }
     if (opts.signal?.aborted) result = clientCancelledResult(result)

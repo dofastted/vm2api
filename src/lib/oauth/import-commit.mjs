@@ -151,7 +151,16 @@ export function createImportCommit(ctx) {
     }
   }
 
-  async function commitImportedOauthGrant({ vmId, vmPath, existing, oauth, source, name, skipOfficialCc = false }) {
+  async function commitImportedOauthGrant({
+    vmId,
+    vmPath,
+    existing,
+    oauth,
+    source,
+    name,
+    skipOfficialCc = false,
+    fromNativeLogin = false,
+  }) {
     const importedCredential = importedCredentialFromOauth(oauth, existing)
     const workerExec = {
       vmId,
@@ -165,7 +174,9 @@ export function createImportCommit(ctx) {
       bindVmProxy(ctx.cfg.paths.project, vmId, bound)
       adoptVmProxyBinding(existing, getVm(ctx.cfg.paths.project, vmId))
     }
-    if (process.env.KIN_CRS_MOCK !== '1') {
+    // The native login terminal has already authenticated in the live guest. Saving its grant
+    // must not depend on (or restart) an inference worker that may still be waiting for credentials.
+    if (!fromNativeLogin && process.env.KIN_CRS_MOCK !== '1') {
       const desynced = isSlotProxyDesynced(existing, ctx.cfg.paths.project)
       const legacy = slotHost(existing).native || isCodexVm(existing)
       const health = legacy ? null : await rustKernelHealth(workerExec)

@@ -63,6 +63,8 @@
 |------|------|------|
 | GET | `/dashboard` | 总览：健康、KPI、`proxy_pool`、`ops`（默认近 1h SLA/TTFT）、`billing` |
 | GET | `/vms` | 列表（`has_token`、`cred_status`、`proxy_configured`、`can_import_credential`、`account_tier`、`schedule_level`、`schedule_level_mode`、`worker_credential`、Fable 轨；Claude 行 `seats_used` / `seats_max` / `seats_grace` / `seat_sessions` / `queue_depth` / `conc_waiting` / `inflight`）。`seats_used` 是正在占槽的 client session 数，只含在飞请求和已排在这台 VM 上的后续请求；对话结束即释放，粘性 TTL 不占槽。`seats_grace` 只在重启交接的短窗口里计数；`seat_sessions` 是 `{ index, session_id, state, inflight, held_until }[]`，`state` 为 `active` 或 `held`。响应另带 `pool_queue: { global_queue_depth, queue_max }`。`availability.key` 取值 `ok` / `drain` / `quota` / `cool` / `rest` / `off` / `bad` / `none`，`drain` = 临近闸线（仍接单），`rest` = 工作时段外休息中 |
+| GET | `/vms/create-options` | 创建默认规格、本机 KVM 探测和 `crag_supported`（本机 Linux amd64 能力，不表示可信包已下载）。 |
+| POST | `/vms/create` | `kernel` 仍是客体系统；Anthropic 可选 `dataplane: "wrap"`（默认）或 `"crag"`（v2）。受支持的目标预装两套内核，包括 `start: false`；缺包返回 `409` 而不创建记录。选 CRAG 但无有效授权时仅创建停机槽，返回 `start_error` 提示先授权。Codex 不接受 `dataplane`；不支持的目标显式选 CRAG 返回 `409 crag_v2_unsupported_placement`。 |
 | GET | `/pool/stream` | SSE。`event: seats`：`{ seats: { [vmId]: { seats_used, seats_max, seats_grace, queue_depth, conc_waiting, inflight, sessions } }, global_queue_depth, queue_max, ts }`，`sessions` 与列表的 `seat_sessions` 同形；缺席的 VM 表示空闲；每次请求开始/结束都会推。`event: proxy`：`{ proxies: { [vmId]: { id, status, enabled, blocked_reason, latency_ms, last_error, last_probe_at } }, ts }`，每次探测或代理状态变化推送。两类帧都按 250ms 节流，租户只收到自己 VM 的条目 |
 | GET | `/vms/:id` | 详情 + 调度等级 + 代理健康 + `billing.today/window_5h/window_7d/prev_window_5h/prev_window_7d/window_5h_projection/by_model/usage_stats`（`usage_stats` = 近 30 个上海自然日的按日用量 + 模型 / 入站路径排名，日界同 `billing.today`；`prev_window_*` 与 `window_5h_projection` 见下） + `account.runtime_window` |
 | PATCH | `/vms/:id` | 热改并发/RPM、OpenAI 会话上限、Claude 席位/配额、模型白名单、槽策略、Claude `schedule_level`、`weight`（Codex 选槽权重 1–100，`null` 回默认 1）、`active_hours`、`timezone`、`name` 或 `id`。`name` 是 1–80 字符的面板显示名，不改编号。单独提交不同的 `id` 才改编号：槽必须已关机、在本机、且没有在飞请求；会移动 `vms/<id>` 与记录，并改写活跃指针、池成员、密钥允许列表和账号归属。运行中、远程节点、编号冲突或容器仍在跑时拒绝。历史请求日志保留旧编号。在线设备授权绑定旧编号，改号后需重新激活。`timezone` 为任意有效 IANA 名称，会钉住该槽（后续绑定不覆盖）；`timezone_follow_proxy: true` 重新跟随已绑代理的出口时区 |
@@ -278,12 +280,14 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 
 收据主密钥保存在数据目录的 `crag-shop-private/receipt.key`，仅控制进程可读；迁移安装或恢复订单库时，须单独安全备份并恢复同一份密钥。标准数据库备份不含该密钥，已有订单而密钥丢失时服务拒绝重建密钥。
 
-宿主订阅状态 `GET /crag-subscription` 仅管理员可查。可展示 `sku`、`months`、`used_slots`、`available_slots`、`enabled_slots`（验证为运行并持有效本机授权的槽）及 `reclaim_supported`；未确认的数据省略。H2 受签名列表 10,000 槽安全上限约束，即使商业额度为 `"unlimited"`，可用槽数仍为整数。仅在已验证运行中的 CRAG 包支持 H2 时对 H1 宿主显示 `upgrade_available`，通过 `POST /crag-subscription/upgrade`（JSON `{}`）显式升级。H2 用签名列表逐一校验 S1 许可摘要。确认本机 Docker 槽已销毁后才提交释放。删除返回 `409` 时可重试原操作；`POST /crag-subscription/recover`（JSON `{}`）或控制面重启可恢复已经确认销毁的释放操作，但不会把未确认的销毁判为成功。
+宿主订阅状态 `GET /crag-subscription` 仅管理员可查。`used_slots` / `available_slots` 表示应用锁用量；旧 `enabled_slots` 不用于统计实际服役。`ready` 仍表示有可绑定的 VM。H2 受签名名单 10,000 槽上限约束。仅受支持的 H1 宿主可通过 `POST /crag-subscription/upgrade`（JSON `{}`）升级；确认本机 Docker 槽已销毁后才释放 H2 应用锁，停机不释放。回收中断可以通过 `POST /crag-subscription/recover`（JSON `{}`）继续，未确认的销毁不会被判为成功。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/crag-subscription/redeem` | 管理员同源登录会话，JSON `{ "redemption_code": "<CRAGR1 宿主码>" }`，按本机宿主身份核销；要求可用的 CRAG 目标，不替目标槽绑定。 |
+| POST | `/crag-subscription/redeem` | 管理员同源登录会话，JSON `{ "redemption_code": "<CRAGR1 宿主码>" }`，无需已有 VM，不自动绑定或启动。没有可信发行包时返回 `409 crag_subscription_host_package_unready`，不核销。新套餐替换额度上限；兑换中断可用 `/crag-subscription/recover` 继续同步。 |
 | POST | `/vms/:id/crag-license/bind` | 管理员同源登录会话，JSON `{}`，将有效宿主订阅绑定到合格的本机 Linux Docker CRAG v2 槽；回读槽授权确认 `license.valid` 与 `license.scope`。 |
+
+可选 `runtime` 返回实际运行的 `running_vms`、`ready_vms`、`unknown_vms`、`host_running_vms`、`host_unknown_vms`、`host_runtime_available`、`host_over_limit`、`checked_at` 和逐 VM 明细 `vms`。独立授权计入全局服役但不占宿主额度；未知不视为零。宿主订阅超额或无法核实在额度内时，新的宿主授权推理请求分别返回 `403 license_crag_host_over_quota` 或 `403 license_crag_host_usage_unverified`，不取消在途请求、不代替逐槽许可。
 
 ## 路由 / 设置
 
