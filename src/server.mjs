@@ -115,7 +115,7 @@ import { createResponsesWsHandler } from './lib/protocol/responses-ws.mjs'
 import { handleUserUsage } from './lib/protocol/user-count-tokens.mjs'
 import { createKeySelfHandler, KEY_SELF_PATHS } from './lib/protocol/key-self.mjs'
 import { createPanelHandler } from './lib/admin/panel-routes.mjs'
-import { isCragShopPath, sessionBuyerOwner } from './lib/admin/crag-shop.mjs'
+import { createCragShopHandler, isCragShopPath, sessionBuyerOwner } from './lib/admin/crag-shop.mjs'
 
 const FEATURES = [
   'passthrough',
@@ -982,13 +982,42 @@ const cragSubscription = createCragSubscription({
     listVms(cfg.paths.project)
       .map(({ id }) => getVm(cfg.paths.project, id))
       .filter(Boolean),
+  getTarget: (id) => getVm(cfg.paths.project, id),
   assertReady: (vm, opts) => assertCragSubscriptionTarget(cfg.paths.project, vm, routingConfig, opts),
   isSlotEnabled: (vm, opts) => isCragSubscriptionSlotEnabled(cfg.paths.project, vm, routingConfig, opts),
+})
+
+function isCragShopAdmin(owner) {
+  if (owner?.startsWith('panel:')) {
+    const record = panelUsers.getById(owner.slice('panel:'.length))
+    return !!record?.enabled && record.role === 'admin'
+  }
+  const configured = getPanelAdmin()
+  return (
+    !!configured.password &&
+    owner === `configured-admin:${configured.username}` &&
+    !panelUsers.getByUsername(configured.username)
+  )
+}
+
+const cragShopActivationEnabled =
+  process.env.KIN_CRS_MOCK !== '1' && process.env.VM2API_CRAG_SHOP_AUTO_ACTIVATION !== '0'
+const handleCragShop = createCragShopHandler({
+  getDb,
+  dataDir: cfg.paths.data,
+  publicBaseUrl: cfg.base_url,
+  json,
+  readRawBody,
+  subscription: cragSubscription,
+  isCurrentAdmin: (req) => isCragShopAdmin(req.panelBuyerOwner),
+  isActivationAdmin: isCragShopAdmin,
+  activationEnabled: cragShopActivationEnabled,
 })
 
 const handlePanel = createPanelHandler({
   getDb,
   cragSubscription,
+  handleCragShop,
   json,
   writeSSEHeaders,
   readBody,
@@ -1371,6 +1400,15 @@ server.listen(cfg.port, cfg.host, () => {
     void cragSubscription.recover().catch(() => {
       console.warn('[crag-subscription] startup recovery failed; use the administrator panel to retry')
     })
+  }
+  if (cragShopActivationEnabled) {
+    const poll = () =>
+      void handleCragShop.pollActivation().catch(() => {
+        console.warn('[crag-shop] activation polling deferred')
+      })
+    const timer = setInterval(poll, 2_000).unref()
+    server.once('close', () => clearInterval(timer))
+    poll()
   }
   // Installation intent is durable; reconnecting nodes must not depend on a lost HTTP callback.
   if (process.env.KIN_CRS_MOCK !== '1') {

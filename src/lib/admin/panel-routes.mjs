@@ -673,19 +673,21 @@ export function createPanelHandler(ctx) {
   const refreshCluster = ctx.refreshClusterSlotPayloads || refreshClusterSlotPayloads
   const requireAuth = (...args) => ctx.requireAuth(...args)
   const cfg = ctx.cfg
-  const handleCragShop = createCragShopHandler({
-    getDb: ctx.getDb,
-    subscription: ctx.cragSubscription,
-    isCurrentAdmin: (req) => {
-      const record = ctx.panelUsers.getByUsername(req.panelUser)
-      if (record) return record.enabled && record.role === 'admin' && req.panelBuyerOwner === `panel:${record.id}`
-      return req.panelBuyerOwner === `configured-admin:${req.panelUser}`
-    },
-    dataDir: cfg?.paths?.data,
-    publicBaseUrl: cfg?.base_url,
-    json,
-    readRawBody,
-  })
+  const handleCragShop =
+    ctx.handleCragShop ??
+    createCragShopHandler({
+      getDb: ctx.getDb,
+      subscription: ctx.cragSubscription,
+      isCurrentAdmin: (req) => {
+        const record = ctx.panelUsers.getByUsername(req.panelUser)
+        if (record) return record.enabled && record.role === 'admin' && req.panelBuyerOwner === `panel:${record.id}`
+        return req.panelBuyerOwner === `configured-admin:${req.panelUser}`
+      },
+      dataDir: cfg?.paths?.data,
+      publicBaseUrl: cfg?.base_url,
+      json,
+      readRawBody,
+    })
   const handleCragSubscription = createCragSubscriptionHandler({
     subscription: ctx.cragSubscription,
     getVm: (id) => (isValidVmId(id) ? getVm(cfg.paths.project, id) : null),

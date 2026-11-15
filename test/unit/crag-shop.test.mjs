@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { createHmac, randomUUID } from 'node:crypto'
+import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -15,6 +15,15 @@ import {
 } from '../../src/lib/admin/crag-shop.mjs'
 import { createShopSupplier } from '../../src/lib/admin/crag-shop-supplier.mjs'
 import { deriveOrderReceipt, loadOrderReceiptKey } from '../../src/lib/admin/crag-shop-receipt.mjs'
+import { checkCragLicense } from '../../src/lib/vm/crag-license.mjs'
+import { createCragSubscription } from '../../src/lib/vm/crag-subscription.mjs'
+import { cragSubscriptionPublicDirectory } from '../../src/lib/vm/crag-subscription-paths.mjs'
+import {
+  issueHostEntitlement,
+  issueSlotPermit,
+  seedEncryptedPackage,
+  signSubscriptionBytes,
+} from '../fixtures/crag-license.mjs'
 
 const PANEL = 'https://panel.example.test'
 const SHOP = 'https://crag.fkcodex.com'
@@ -27,6 +36,8 @@ const PROOF = 'fixture-receipt'
 const PERSON = { panelUser: 'alice', panelBuyerOwner: 'panel:alice-id' }
 const OTHER = { panelUser: 'bob', panelBuyerOwner: 'panel:bob-id', panelRole: 'admin' }
 const MIGRATION = new URL('../../src/lib/db/migrations/055_crag_shop_orders.sql', import.meta.url)
+const COMMERCE_MIGRATION = new URL('../../src/lib/db/migrations/056_crag_shop_commerce.sql', import.meta.url)
+const ACTIVATION_MIGRATION = new URL('../../src/lib/db/migrations/057_crag_shop_activation.sql', import.meta.url)
 const PILOT_TOKEN_FILE_ENV = 'VM2API_CRAG_SHOP_PILOT_TOKEN_FILE'
 
 test.beforeEach((t) => {
@@ -258,7 +269,8 @@ test('SQLite reservation survives restart; owners isolate retries, list, status 
   })
   db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;')
   db.exec(fs.readFileSync(MIGRATION, 'utf8'))
-  db.exec(fs.readFileSync(new URL('../../src/lib/db/migrations/056_crag_shop_commerce.sql', import.meta.url), 'utf8'))
+  db.exec(fs.readFileSync(COMMERCE_MIGRATION, 'utf8'))
+  db.exec(fs.readFileSync(ACTIVATION_MIGRATION, 'utf8'))
   const saved = new Map()
   let lostReply = true
   let status = 'pending'
@@ -392,4 +404,253 @@ test('SQLite reservation survives restart; owners isolate retries, list, status 
   fs.writeFileSync(keyPath, key, { mode: 0o600 })
   fs.chmodSync(keyPath, 0o644)
   assert.equal((await call(PERSON, 'GET', `/orders/${id}`)).error.code, 'shop_private_storage_unavailable')
+})
+
+test('pinned fulfillment survives lost redeem and H2 bind replies without reapplying or rebinding another slot', {
+  skip: process.platform !== 'linux',
+}, async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-auto-activation-'))
+  const dbPath = path.join(root, 'kin.db')
+  let db = new DatabaseSync(dbPath)
+  t.after(() => {
+    db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;')
+  db.exec(fs.readFileSync(MIGRATION, 'utf8'))
+  db.exec(fs.readFileSync(COMMERCE_MIGRATION, 'utf8'))
+  const manualId = randomUUID()
+  db.prepare(`INSERT INTO crag_shop_orders
+    (order_id, owner, request_id, sku, payment_method, reserved_at, status, created_at, term, amount_minor, slot_limit)
+    VALUES (?, ?, 'legacy-id', 'quarter', 'alipay', 1, 'fulfilled', 1, '3m', 59900, 10)`).run(
+    manualId,
+    OTHER.panelBuyerOwner,
+  )
+  db.exec(fs.readFileSync(ACTIVATION_MIGRATION, 'utf8'))
+  // The legacy row normally already has a receipt key from its original checkout.
+  const receiptKey = loadOrderReceiptKey(root, () => false)
+  const publicDir = cragSubscriptionPublicDirectory(root)
+  fs.mkdirSync(path.dirname(path.dirname(publicDir)), { recursive: true })
+  const source = path.join(root, 'host-machine-id')
+  fs.writeFileSync(source, randomBytes(16).toString('hex'), { mode: 0o600 })
+  seedEncryptedPackage(root)
+  const slots = ['vm-ready', 'vm-other', 'vm-stopped'].map((id) => ({
+    id,
+    dataplane: 'crag',
+    crag_kernel_version: 'v2',
+  }))
+  for (const vm of slots) {
+    const dir = path.join(root, 'vms', vm.id)
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'machine-id'), randomBytes(16).toString('hex'))
+  }
+
+  const merchant = new Map()
+  const deliveryRequests = []
+  const supplier = createShopSupplier(async (url, init) => {
+    if (url === `${SHOP}/shop/orders`) {
+      const { order_id: id, ...input } = JSON.parse(init.body)
+      assert.deepEqual(input, { sku: PLAN.sku, payment_method: 'alipay' })
+      const pin = db.prepare('SELECT activation_fingerprint FROM crag_shop_orders WHERE order_id = ?').get(id)
+      assert.match(pin.activation_fingerprint, /^[a-f0-9]{64}$/)
+      assert.equal(init.headers.authorization, `Bearer ${deriveOrderReceipt(receiptKey, id)}`)
+      merchant.set(id, order(id))
+      return Response.json({ ...merchant.get(id), url: ACTION, data: fields(id) })
+    }
+    const [, id, operation] = /\/shop\/orders\/([^/]+)(?:\/(claim|resume))?$/.exec(url)
+    assert.equal(init.headers.authorization, `Bearer ${deriveOrderReceipt(receiptKey, id)}`)
+    assert.equal(init.body, undefined)
+    const remote = merchant.get(id)
+    assert.ok(remote, 'the worker must never poll a legacy order')
+    deliveryRequests.push({ id, operation, method: init.method })
+    if (operation === 'claim') {
+      assert.equal(remote.status, 'fulfilled')
+      return Response.json({ order_id: id, redemption_code: CODE })
+    }
+    if (operation === 'resume' && remote.status === 'pending')
+      return Response.json({ ...remote, url: ACTION, data: fields(id) })
+    return Response.json(remote)
+  })
+  let bearer, rights, machineCode, slotPermit
+  let redeems = 0
+  let bindAttempts = 0
+  let admin = true
+  const signedRights = (hostId, revision, roster) => {
+    const { claims } = issueHostEntitlement(root, hostId, { revision, slot_limit: 1 })
+    return {
+      entitlement: signSubscriptionBytes(root, 'CRAGH2', JSON.stringify({ ...claims, version: 2, roster })),
+      revision,
+      slot_limit: 1,
+      expires_at: claims.expires_at,
+    }
+  }
+  const connect = () =>
+    createCragSubscription({
+      projectRoot: root,
+      machineIdFile: source,
+      listTargets: () => slots,
+      assertReady: (vm) => vm !== slots[2],
+      fetchImpl: async (url, init) => {
+        const input = JSON.parse(init.body)
+        bearer ??= init.headers.authorization
+        assert.equal(init.headers.authorization, bearer)
+        if (url.endsWith('/redeem')) {
+          assert.equal(input.redemption_code, CODE)
+          if (++redeems === 1) {
+            rights = signedRights(input.host_id, 1, [])
+            throw new Error('lost redeem reply after authority commit')
+          }
+        }
+        if (url.endsWith('/bind')) {
+          ++bindAttempts
+          if (!machineCode) {
+            machineCode = input.machine_code
+            slotPermit = issueSlotPermit(root, machineCode, input.host_id, { seat: 1 }).code
+            rights = signedRights(input.host_id, 2, [
+              { seat: 1, permit_sha256: createHash('sha256').update(slotPermit).digest('hex') },
+            ])
+            throw new Error('lost bind reply after authority commit')
+          }
+          assert.equal(input.machine_code, machineCode)
+          return Response.json({ ok: true, data: { ...rights, seat: 1, slot_permit: slotPermit } })
+        }
+        return Response.json({ ok: true, data: rights })
+      },
+    })
+  let subscription = connect()
+  const handler = () =>
+    createCragShopHandler({
+      getDb: () => db,
+      dataDir: root,
+      publicBaseUrl: PANEL,
+      json: (_, http, body) => ({ http, ...body }),
+      readRawBody: (req) => req.raw,
+      isActivationAdmin: (owner) => admin && owner === OTHER.panelBuyerOwner,
+      subscription,
+      supplier,
+    })
+  let handle = handler()
+  const call = (actor, method, endpoint, body) => {
+    const url = new URL(`${PANEL}${BASE}${endpoint}`)
+    return handle(
+      {
+        ...actor,
+        method,
+        headers: {
+          host: 'panel.example.test',
+          origin: PANEL,
+          'sec-fetch-site': 'same-origin',
+          'content-type': 'application/json',
+        },
+        raw: Buffer.from(body === undefined ? '' : JSON.stringify(body)),
+      },
+      {},
+      url,
+      cragShopRoute(method, url.pathname),
+    )
+  }
+  const due = (id) => db.prepare('UPDATE crag_shop_orders SET activation_next_at = 1 WHERE order_id = ?').run(id)
+  const restart = () => {
+    db.close()
+    db = new DatabaseSync(dbPath)
+    subscription = connect()
+    handle = handler()
+  }
+  assert.deepEqual(
+    (await call(OTHER, 'GET', '/activation-targets')).data.targets,
+    slots.slice(0, 2).map(({ id }) => ({ vm_id: id })),
+  )
+  assert.deepEqual((await call(PERSON, 'GET', '/activation-targets')).data.targets, [])
+  const input = { ...INPUT, activation_target: { vm_id: slots[0].id } }
+  assert.equal((await call(PERSON, 'POST', '/orders', input)).http, 403)
+  assert.equal(
+    (await call(OTHER, 'POST', '/orders', { ...input, activation_target: { vm_id: slots[2].id } })).error.code,
+    'shop_activation_target_unavailable',
+  )
+  const created = (await call(OTHER, 'POST', '/orders', input)).data
+  const id = created.order_id
+  assert.deepEqual(created.activation, { vm_id: slots[0].id, state: 'awaiting_fulfillment' })
+  assert.equal((await call(OTHER, 'POST', '/orders', INPUT)).error.code, 'shop_request_conflict')
+  assert.equal((await call(PERSON, 'GET', `/orders/${id}`)).http, 404)
+  assert.equal((await call(OTHER, 'POST', `/orders/${id}/claim`, {})).error.code, 'shop_activation_pinned')
+  assert.deepEqual(
+    (await call(OTHER, 'GET', '/orders')).data.orders.find(({ order_id }) => order_id === manualId).activation,
+    { state: 'manual' },
+  )
+
+  await Promise.all([handle.pollActivation(), handle.pollActivation()])
+  assert.deepEqual(deliveryRequests.splice(0), [{ id, operation: undefined, method: 'GET' }])
+  merchant.get(id).status = 'paid'
+  due(id)
+  await handle.pollActivation()
+  assert.deepEqual(deliveryRequests.splice(0), [{ id, operation: undefined, method: 'GET' }])
+  assert.equal(redeems, 0)
+  merchant.get(id).status = 'fulfilled'
+  due(id)
+  await handle.pollActivation()
+  assert.deepEqual(deliveryRequests.splice(0), [
+    { id, operation: undefined, method: 'GET' },
+    { id, operation: 'claim', method: 'POST' },
+  ])
+  assert.equal((await subscription.status()).state, 'sync_pending')
+  restart()
+  await subscription.recover()
+  assert.equal(redeems, 1, 'generic recovery cannot launch an order-bound redeem without checking its pin')
+  due(id)
+  await handle.pollActivation()
+  assert.equal(redeems, 2)
+  assert.equal(bindAttempts, 1)
+  assert.equal(checkCragLicense(root, slots[0]).ok, false)
+  restart()
+  due(id)
+  await handle.pollActivation()
+  assert.equal(redeems, 2, 'bind recovery must not redeem again')
+  assert.equal(bindAttempts, 2, 'the same seat permit is fetched again')
+  assert.equal(checkCragLicense(root, slots[0]).ok, true)
+  assert.equal(checkCragLicense(root, slots[1]).ok, false)
+  const active = (await call(OTHER, 'GET', `/orders/${id}`)).data
+  assert.deepEqual(active.activation, { vm_id: slots[0].id, state: 'active' })
+  assert.equal(active.status, 'fulfilled')
+  for (const secret of [CODE, bearer, slotPermit, machineCode, deriveOrderReceipt(receiptKey, id)]) {
+    assert.equal(JSON.stringify(active).includes(secret), false)
+  }
+  assert.equal(JSON.stringify(db.prepare('SELECT * FROM crag_shop_orders').all()).includes(CODE), false)
+  deliveryRequests.length = 0
+  await handle.pollActivation()
+  assert.deepEqual(deliveryRequests, [])
+
+  const other = (
+    await call(OTHER, 'POST', '/orders', { ...input, request_id: 'second', activation_target: { vm_id: slots[1].id } })
+  ).data
+  merchant.get(other.order_id).status = 'fulfilled'
+  admin = false
+  await handle.pollActivation()
+  assert.equal((await call(OTHER, 'GET', `/orders/${other.order_id}`)).data.activation.state, 'needs_attention')
+  assert.equal((await call(OTHER, 'POST', `/orders/${other.order_id}/retry-activation`, {})).http, 403)
+  admin = true
+  slots[1].owner_user_id = 'new-owner'
+  assert.equal(
+    (await call(OTHER, 'POST', `/orders/${other.order_id}/retry-activation`, {})).data.activation.state,
+    'activating',
+  )
+  await handle.pollActivation()
+  assert.equal((await call(OTHER, 'GET', `/orders/${other.order_id}`)).data.activation.state, 'needs_attention')
+  assert.equal(deliveryRequests.filter(({ operation }) => operation === 'claim').length, 0)
+  assert.equal(redeems, 2)
+  assert.equal(bindAttempts, 2)
+  const late = (await call(OTHER, 'POST', '/orders', { ...input, request_id: 'late' })).data
+  merchant.get(late.order_id).status = 'fulfilled'
+  db.prepare('UPDATE crag_shop_orders SET activation_deadline = 1 WHERE order_id = ?').run(late.order_id)
+  deliveryRequests.length = 0
+  await handle.pollActivation()
+  assert.deepEqual(deliveryRequests, [], 'expired work must not contact the supplier')
+  assert.equal((await call(OTHER, 'GET', `/orders/${late.order_id}`)).data.activation.state, 'needs_attention')
+  assert.deepEqual(
+    deliveryRequests,
+    [{ id: late.order_id, operation: undefined, method: 'GET' }],
+    'an owner may still explicitly refresh a paused order whose fulfillment is unknown',
+  )
+  assert.equal(redeems, 2)
+  assert.equal(bindAttempts, 2)
+  assert.equal(checkCragLicense(root, slots[0]).ok, true)
 })
