@@ -40,15 +40,27 @@ const baseFor = (root, kernel) =>
 const archFor = (kernel) => (kernel === 'crag' ? cragV2Arch() : 'amd64')
 const CRAG_PINNED_RELEASES = [
   {
+    tag: 'payload-2026.11.16-crag-3.0.9',
+    label: '3.0.9 标准版',
+    size: 169637207,
+    manifestSha256: '2fa0fa5ec860563855659a9209bdb686ba04e37b267ba57f4890494fd898ed73',
+    sha256: 'dab028d2041dc29ac07a6afc6d1d12e73dd33f1417b22a56dbe19a94ac2cc0cd',
+  },
+  {
+    tag: 'payload-2026.11.16-crag-3.0.9-legacy',
+    label: '3.0.9 旧离线授权兼容版',
+    size: 169718051,
+    manifestSha256: '9c608280cfbfb38463f44a5a0125edd84279bd469d18607d9a07bce2e2960ef8',
+    sha256: '95b320100f188ac868a9b8d801c1795ddea03b4fcdb7a311cb53c7912739bd18',
+  },
+  {
     tag: 'payload-2026.11.15-crag-3.0.8',
-    label: '3.0.8 标准版',
     size: 169316226,
     manifestSha256: 'ba6582b37790ab2ffca20c366c08318c4c909df6e7470699b8d81aa403b6cea2',
     sha256: 'a5a386056dff5852e2902d809301aa1cdd4003a3067721d97db9abb1bcf0f079',
   },
   {
     tag: 'payload-2026.11.15-crag-3.0.8-legacy',
-    label: '3.0.8 旧离线授权兼容版',
     size: 169274806,
     manifestSha256: '1893360f958668f1940c86081a0e7a7b72be67704a5c287d94bfc3dd550b91aa',
     sha256: 'c5cb88603a0c5eb73f3b9a9c2de5cdaa204d6a9935fabbaa45aa9805ec8f8b13',

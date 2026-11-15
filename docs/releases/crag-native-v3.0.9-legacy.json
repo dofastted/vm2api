@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "component": "crag-native",
+  "version": "3.0.9",
+  "variant": "legacy",
+  "source_repository": "dofastted/crag",
+  "legacy_source_commit": "bb6324d113f99439c4a3c34c8a946372e3eac139",
+  "runtime_source_commit": "0acabcd34dee5a11afd7fc832703105922c3af78",
+  "baseline_manifest_sha256": "b8d0b0d7aa63cdfaccd1612b5ce292be5b232626182417304e8696e67fcccd57",
+  "baseline_delta": ["src/v2/runtime.rs"],
+  "payload_release": "payload-2026.11.16-crag-3.0.9-legacy",
+  "core_sha256": "59f92dc00cdbddea69c91afb6070c9e0bb964931eaa8a0018fcedbe24655c3d3",
+  "manifest_sha256": "9c608280cfbfb38463f44a5a0125edd84279bd469d18607d9a07bce2e2960ef8",
+  "archive": {
+    "asset": "crag-v2-licensed-amd64.tar.gz",
+    "size": 169718051,
+    "sha256": "95b320100f188ac868a9b8d801c1795ddea03b4fcdb7a311cb53c7912739bd18"
+  },
+  "build_environment": {
+    "mode": "container",
+    "image": "rust:1-bookworm@sha256:c9155318d07341301a78b45ecdd81af2e43b8b297d64e8fd4c5e80d7735607c3"
+  },
+  "official_claude": {
+    "version": "2.1.321",
+    "sha256": "426c33815ca6645a772f722fbff10dbf2cbdb124a8aeab733c1365dbf8bbf61f"
+  }
+}
