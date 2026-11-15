@@ -151,6 +151,10 @@ export const CLEAR_BY = Object.freeze([
   'proxy_rebind',
   'recover_ok',
   'credential_present',
+  // A stale runtime_start_failed lock while the kernel probes healthy is a
+  // leftover from a start attempt that timed out on a flaky node link — the
+  // container never died. Health is a fact, not a verdict, same as above.
+  'runtime_recovered',
 ])
 
 // ---------------------------------------------------------------------------
