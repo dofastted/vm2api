@@ -467,6 +467,7 @@ export type Vm = {
   total_cost?: number
   /** 累计 token（含缓存），与 total_cost 同源。 */
   total_tokens?: number
+  lifetime_usage?: { cost: number; tokens: number }
   expires_at?: string
   refreshed_at?: string
   oauth_source?: string
