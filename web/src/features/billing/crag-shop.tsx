@@ -254,9 +254,11 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
           </dd>
         </div>
         <div>
-          <dt className='text-xs text-muted-foreground'>本机已启用槽位</dt>
+          <dt className='text-xs text-muted-foreground'>
+            本机 CRAG v2 槽位：已启用 / 总数
+          </dt>
           <dd className='mt-1 font-medium tabular-nums'>
-            {status?.enabled_slots ?? '—'}
+            {status?.enabled_slots ?? '—'} / {status?.total_slots ?? '—'}
           </dd>
         </div>
         <div>
@@ -272,6 +274,10 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
           </dd>
         </div>
       </dl>
+      <p className='text-xs text-muted-foreground'>
+        按 VM
+        槽位计数，不按调用次数。已有有效许可的槽位可以继续调用；额度用完后不能启用新的订阅槽位。
+      </p>
       {status?.upgrade_available && !status.reclaim_supported ? (
         <Button
           size='sm'

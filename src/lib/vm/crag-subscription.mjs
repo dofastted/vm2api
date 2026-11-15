@@ -177,6 +177,7 @@ export function createCragSubscription({
   projectRoot,
   listTargets,
   getTarget,
+  isSubscriptionSlot,
   assertReady,
   isSlotEnabled,
   fetchImpl = globalThis.fetch,
@@ -294,7 +295,10 @@ export function createCragSubscription({
   }
 
   async function status() {
+    let total_slots
     try {
+      const targets = await listTargets()
+      if (isSubscriptionSlot) total_slots = targets.filter(isSubscriptionSlot).length
       const hostId = identity()
       storage()
       const previous = current(hostId)
@@ -315,9 +319,9 @@ export function createCragSubscription({
         }
       }
       let enabled_slots
-      if (isSlotEnabled && claims && !pending) {
+      if (isSlotEnabled && (claims || isSubscriptionSlot)) {
         enabled_slots = 0
-        for (const vm of await listTargets()) {
+        for (const vm of claims && !pending ? targets : []) {
           if (await isSlotEnabled(vm, { reclaim: claims.version === 2 })) enabled_slots += 1
         }
       }
@@ -333,13 +337,14 @@ export function createCragSubscription({
             : 'unredeemed',
         ...(claims && { slot_limit: claims.slot_limit, expires_at: claims.expires_at, revision: claims.revision }),
         ...rights,
+        ...(total_slots !== undefined && { total_slots }),
         ...(enabled_slots !== undefined && { enabled_slots }),
         ...(expired && { available_slots: 0 }),
         ...(pending && { available_slots: 0 }),
         ...(claims?.version === 1 && !pending && (await ready({ reclaim: true })) && { upgrade_available: true }),
       }
     } catch {
-      return { ready: false, state: 'unavailable' }
+      return { ready: false, state: 'unavailable', ...(total_slots !== undefined && { total_slots }) }
     }
   }
 

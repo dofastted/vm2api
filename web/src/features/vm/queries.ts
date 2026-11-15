@@ -52,6 +52,7 @@ export type CragHostStatus = {
   sku?: string
   months?: number
   used_slots?: number
+  total_slots?: number
   enabled_slots?: number
   available_slots?: number | null
   reclaim_supported?: boolean

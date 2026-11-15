@@ -40,7 +40,9 @@ test('a lost renewal response suspends real control admission until restart repl
     createCragSubscription({
       projectRoot: root,
       machineIdFile: source,
-      listTargets: () => slots,
+      listTargets: () => [...slots, { id: 'vm-non-crag' }],
+      isSubscriptionSlot: (vm) => vm.dataplane === 'crag',
+      isSlotEnabled: (vm) => checkCragLicense(root, vm).license?.scope === 'host' && checkCragLicense(root, vm).ok,
       assertReady: () => true,
       fetchImpl: async (url, opts) => {
         const body = JSON.parse(opts.body)
@@ -86,20 +88,23 @@ test('a lost renewal response suspends real control admission until restart repl
       },
     })
   const service = connect()
-  assert.deepEqual(await service.status(), { ready: true, state: 'unredeemed' })
+  assert.deepEqual(await service.status(), { ready: true, state: 'unredeemed', total_slots: 2, enabled_slots: 0 })
   await service.redeem(voucher())
   assert.deepEqual(await service.bind(slots[0]), { seat: 1 })
   assert.deepEqual(await service.bind(slots[1]), { seat: 2 })
   assert.equal(checkCragLicense(root, slots[1]).ok, true)
+  assert.equal((await service.status()).enabled_slots, 2)
   const renewal = voucher()
   lose = true
   await assert.rejects(service.redeem(renewal), { code: 'crag_subscription_authority_unavailable' })
   assert.equal((await service.status()).state, 'sync_pending')
+  assert.equal((await service.status()).enabled_slots, 0)
   assert.equal(checkCragLicense(root, slots[0]).ok, false)
   assert.equal(checkCragLicense(root, slots[1]).ok, false)
   const recovered = connect()
   await recovered.recover()
   assert.equal((await recovered.status()).revision, 2)
+  assert.equal((await recovered.status()).enabled_slots, 1)
   assert.equal(issued.size, 2)
   assert.equal(checkCragLicense(root, slots[0]).ok, true)
   assert.equal(checkCragLicense(root, slots[1]).ok, false)

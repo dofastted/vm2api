@@ -89,6 +89,8 @@ import { ClusterError } from './lib/cluster/ssh-link.mjs'
 import { nodeEgressProxyUrl, startNodeEgressSocks } from './lib/cluster/node-egress-socks.mjs'
 import { createSlotShell } from './lib/vm/slot-shell.mjs'
 import { vmLockBusy } from './lib/vm/vm-file.mjs'
+import { isKvmRuntime } from './lib/vm/runtime-kind.mjs'
+import { resolveCragKernelVersion, resolveKernelDataplane } from './lib/vm/slot-engine.mjs'
 import {
   assertCragSubscriptionTarget,
   isCragSubscriptionSlotEnabled,
@@ -983,6 +985,12 @@ const cragSubscription = createCragSubscription({
       .map(({ id }) => getVm(cfg.paths.project, id))
       .filter(Boolean),
   getTarget: (id) => getVm(cfg.paths.project, id),
+  isSubscriptionSlot: (vm) =>
+    !vm.node_id &&
+    !isCodexVm(vm) &&
+    !isKvmRuntime(vm) &&
+    resolveKernelDataplane(vm, routingConfig) === 'crag' &&
+    resolveCragKernelVersion(vm, routingConfig) === 'v2',
   assertReady: (vm, opts) => assertCragSubscriptionTarget(cfg.paths.project, vm, routingConfig, opts),
   isSlotEnabled: (vm, opts) => isCragSubscriptionSlotEnabled(cfg.paths.project, vm, routingConfig, opts),
 })
