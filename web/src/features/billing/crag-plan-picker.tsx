@@ -26,13 +26,13 @@ export function CragPlanPicker({
     termCounts.set(term, (termCounts.get(term) ?? 0) + 1)
 
   return (
-    <fieldset disabled={disabled} className='min-w-0'>
+    <fieldset disabled={disabled} className='m-0 min-w-0 border-0 p-0'>
       <legend className='sr-only'>选择套餐</legend>
-      <div className='grid gap-2 sm:grid-cols-2 lg:grid-cols-3'>
+      <div className='grid min-w-0 gap-2'>
         {plans.map((plan) => (
           <label
             key={plan.sku}
-            className='flex min-h-20 min-w-0 items-start gap-3 rounded-md border bg-card px-3 py-3 text-card-foreground has-checked:border-primary has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring has-enabled:cursor-pointer has-enabled:hover:bg-accent/50'
+            className='grid min-h-14 min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-3 rounded-md border bg-card px-3 py-2.5 text-card-foreground has-checked:border-primary has-focus-visible:outline-2 has-focus-visible:outline-offset-2 has-focus-visible:outline-ring has-enabled:cursor-pointer has-enabled:hover:bg-accent/50'
           >
             <input
               type='radio'
@@ -40,7 +40,7 @@ export function CragPlanPicker({
               value={plan.sku}
               checked={plan.sku === selectedSku}
               onChange={() => onSelect(plan.sku)}
-              className='mt-1 size-4 shrink-0 accent-primary enabled:cursor-pointer'
+              className='size-4 accent-primary enabled:cursor-pointer'
             />
             <span className='grid min-w-0 gap-1'>
               <span className='text-sm font-medium'>
@@ -51,12 +51,12 @@ export function CragPlanPicker({
                   </span>
                 ) : null}
               </span>
-              <span className='text-lg font-semibold wrap-anywhere tabular-nums'>
-                {plan.price}
-              </span>
               <span className='text-sm text-muted-foreground'>
                 {plan.locks}
               </span>
+            </span>
+            <span className='text-end text-base font-semibold whitespace-nowrap tabular-nums'>
+              {plan.price}
             </span>
           </label>
         ))}

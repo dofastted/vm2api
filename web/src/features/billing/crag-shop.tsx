@@ -132,10 +132,11 @@ function ShopOrders() {
             return
           }
           setCatalog({ status: 'ready', data })
-          if (data.plans.length && data.payment_methods.length) {
-            // Set defaults once from a sellable response. Never switch a
-            // selected SKU or payment method to a different one on refresh.
+          if (data.plans.length) {
+            // Keep the buyer's choice across refreshes, even while payment is closed.
             setPlanSku((sku) => sku ?? data.plans[0].sku)
+          }
+          if (data.payment_methods.length) {
             setMethod((channel) => channel ?? data.payment_methods[0])
           }
         })
@@ -306,7 +307,7 @@ function ShopOrders() {
         : !plans.length
           ? '暂无可购买的套餐，仍可查看本人订单。'
           : !channels.length
-            ? '暂无可用的付款方式，暂不能创建订单。'
+            ? '当前未开放收款。可以选择和比较套餐，暂不能创建订单。'
             : !selectedPlan || !selectedMethod
               ? '套餐或付款方式已更新，请重新选择后再创建订单。'
               : ''
@@ -342,7 +343,7 @@ function ShopOrders() {
             }))}
             selectedSku={selectedPlan?.sku}
             onSelect={setPlanSku}
-            disabled={busy || !canOrder}
+            disabled={busy}
           />
         ) : null}
         {canOrder ? (
@@ -386,6 +387,11 @@ function ShopOrders() {
               创建订单
             </Button>
           </div>
+        ) : null}
+        {plans.length > 0 && !canOrder ? (
+          <Button type='button' disabled>
+            暂不可下单
+          </Button>
         ) : null}
         {checkout ? (
           <div className='flex flex-wrap items-center justify-between gap-2 rounded-md border p-3 text-sm'>
