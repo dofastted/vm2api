@@ -14,7 +14,12 @@ import {
   persistVmMaxSessions,
   markUnschedulable,
 } from '../vm/vm-registry.mjs'
-import { normalizeInferenceConfig, normalizeSessionSlots, resolveInferenceEngine } from '../vm/slot-engine.mjs'
+import {
+  normalizeInferenceConfig,
+  normalizeSessionSlots,
+  resolveInferenceEngine,
+  resolveKernelDataplane,
+} from '../vm/slot-engine.mjs'
 import { slotExec } from '../vm/slot-runtime.mjs'
 import { maxRequestBytes, streamIdleTimeoutMs } from '../core/config.mjs'
 
@@ -431,6 +436,10 @@ export function createRoutingRuntime(ctx) {
     for (const { id } of listVms(project)) {
       const vm = getVm(project, id)
       if (!vm || isCodexVm(vm)) continue
+      if (resolveKernelDataplane(vm, routingConfig) === 'crag') {
+        applied.skipped += 1
+        continue
+      }
       try {
         const result = await applyNativeTelemetry({ projectRoot: project, vm, routing: routingConfig })
         if (result.supported === false) {
