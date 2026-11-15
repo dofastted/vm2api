@@ -60,6 +60,7 @@ export function KernelLicenseDialog({
           离线通用码一次解锁全部槽位和机器。在线设备授权仍需复制本槽机器码。激活不会安装或启动内核。
         </DialogDescription>
         <CragLicenseEditor
+          vmId={vm.id}
           data={license.data}
           loading={license.isFetching}
           loadError={license.error}

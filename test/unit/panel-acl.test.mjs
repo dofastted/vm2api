@@ -14,9 +14,10 @@ const serverSrc = [
   fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../src/server.mjs'), 'utf8'),
 ].join('\n')
 
-test('user sees vm / keys / billing / logs / statistics', () => {
-  assert.deepEqual(viewsForRole('user'), ['vm', 'keys', 'billing', 'logs', 'statistics'])
-  assert.deepEqual(viewsForRole('super'), ['overview', 'cluster', 'logs', 'statistics', 'vm'])
+test('signed-in buyers of every panel role can open CRAG subscriptions', () => {
+  for (const role of ['user', 'super', 'admin']) assert.equal(canViewPage(role, 'crag-subscription'), true)
+  assert.deepEqual(viewsForRole('user'), ['vm', 'keys', 'billing', 'logs', 'statistics', 'crag-subscription'])
+  assert.deepEqual(viewsForRole('super'), ['overview', 'cluster', 'logs', 'statistics', 'vm', 'crag-subscription'])
   assert.equal(canViewPage('admin', 'statistics'), true)
   assert.equal(canViewPage('user', 'vm'), true)
   assert.equal(canViewPage('user', 'overview'), false)

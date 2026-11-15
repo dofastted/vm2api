@@ -250,6 +250,26 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 
 价格优先级：覆盖 `provider/model` > `provider/*` > `*/model` > models.dev > 内置快照。models.dev 缺的模型和档位（fast / flex / priority、长上下文、web search 按次费）从内置快照补。models.dev 每 24 小时刷新，遇到未定价模型且上次拉取超过 6 小时会后台补拉。
 
+## CRAG 订阅订单
+
+以下接口只接受实际面板登录会话，不接受 Master 或托管 API 密钥。升级前发出的旧会话需要重新登录一次。管理员也只能访问自己的订单；不存在和不属于本人的订单均返回 `404`。响应禁止缓存，写入请求必须同源，有请求体时须用 `application/json`。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/crag-shop/plans` | 在售 `plans`（`sku`、`term`、`amount_minor`、`slot_limit`）和 `payment_methods`，金额按人民币分计，额度为正整数或 `"unlimited"` |
+| POST | `/crag-shop/orders` | JSON `{ sku, payment_method, request_id }`；超时重试时必须复用同一 `request_id` 和原参数，复用标识但更改参数返回 `409` |
+| GET | `/crag-shop/orders` | 查看本人订单列表 `{ orders, next_offset }`，每页最多 100 单，可用 `?offset=` 继续 |
+| GET | `/crag-shop/orders/:id` | 查看本人订单状态，不返回支付表单或兑换码 |
+| POST | `/crag-shop/orders/:id/claim` | 空请求体或 JSON `{}`，返回 `{ order_id, redemption_code }`；未发货返回 `409`，不兑换到宿主机 |
+
+本人可从订单视图读取原始 `request_id`，用订单中的 `sku` 和 `payment_method` 重发创建请求来恢复付款；无需先从当前套餐目录查回原商品。
+
+订单视图包含 `order_id`、`request_id`、`status`、`sku`、`payment_method`、`created_at`（Unix 秒）、`term`、`amount_minor`、`slot_limit`。`reserved` 表示仅保留了本地订单标识、尚未确认供应方创建，后三个快照字段为 `null`；确认后的状态是 `pending`、`paid` 或 `fulfilled`。目录下架不影响已创建订单的历史快照。
+
+只有创建接口可能返回支付表单。收到配对的 `url` 和 `data` 时，使用 `url` 作为表单 POST 的目标，不能换成买家提供的地址。接口不返回订单私有凭据；仅领取接口返回兑换码。有效的历史订单可能没有可用的支付表单，不能把这种情况当作支付成功。
+
+收据主密钥保存在数据目录的 `crag-shop-private/receipt.key`，仅控制进程可读；迁移安装或恢复订单库时，须单独安全备份并恢复同一份密钥。标准数据库备份不含该密钥，已有订单而密钥丢失时服务拒绝重建密钥。
+
 ## 路由 / 设置
 
 | 方法 | 路径 | 说明 |
