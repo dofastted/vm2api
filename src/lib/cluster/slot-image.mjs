@@ -34,6 +34,19 @@ import { tarStream } from './tar.mjs'
 // Service binaries are supplied by the persistent per-slot slot-bin mount.
 export const REMOTE_WORKER_BIN = '/opt/kin-live/kin-worker'
 
+// Official Claude Code distribution (same source as the vendor install script):
+// <base>/<version>/manifest.json → platforms["linux-x64"].checksum
+// <base>/<version>/linux-x64/claude → binary whose sha256 matches our payload manifest.
+export const CLAUDE_DIST_BASE = 'https://downloads.claude.ai/claude-code-releases'
+const CLAUDE_DIST_REL = /^claude-code-(\d+\.\d+\.\d+)\/claude$/
+
+/** Remote-fetch descriptor for a payload file the node can download itself, or null. */
+export function claudeFetchSpec(rel) {
+  const match = CLAUDE_DIST_REL.exec(rel)
+  if (!match) return null
+  return { kind: 'claude-code', version: match[1], url: `${CLAUDE_DIST_BASE}/${match[1]}/linux-x64/claude` }
+}
+
 function binOr(envKey, fallback) {
   const env = String(process.env[envKey] || '').trim()
   return env && fs.existsSync(env) ? env : fallback
@@ -93,6 +106,9 @@ export function cragSlotPayload(projectRoot, { required = true } = {}) {
       src: path.join(root, rel),
       mode: executable ? 0o755 : 0o644,
       sha256: verified.manifest.sha256[rel],
+      // The pinned claude binary is ~340MB; let the node fetch it from the
+      // vendor CDN instead of streaming it over the control plane's SFTP link.
+      fetch: claudeFetchSpec(rel) || undefined,
     })
   }
   return { files, digest: digest.digest('hex') }

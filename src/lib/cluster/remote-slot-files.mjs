@@ -25,6 +25,7 @@ import { hasCredentialPresence, mirrorWorkerCredentialsToVm } from '../oauth/oau
 import { EGRESS_BIN } from '../vm/egress.mjs'
 import { readJsonCached } from '../vm/vm-file.mjs'
 import {
+  fetchRemoteFile,
   openSftp,
   privateDirectoriesScript,
   readRemoteFileNoFollow,
@@ -35,6 +36,7 @@ import {
   writeRemoteFile,
 } from './remote-fs.mjs'
 import { cragSlotPayload } from './slot-image.mjs'
+import { ClusterError } from './ssh-link.mjs'
 import { isKvmRuntime } from '../vm/runtime-kind.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import {
@@ -201,21 +203,61 @@ async function withSha256(file) {
   return { ...file, sha256: await hashStream(file.src) }
 }
 
-async function publishSlotBinFiles(sftp, client, remote, files, owner) {
+/** KIN_SLOT_PAYLOAD_FETCH: auto (try node-side fetch, fall back to SFTP) | remote | push. */
+export function resolvePayloadFetchMode(raw = process.env.KIN_SLOT_PAYLOAD_FETCH) {
+  const value = String(raw || '').trim().toLowerCase()
+  return value === 'remote' || value === 'push' ? value : 'auto'
+}
+
+// Node-side fetch streams vendor CDN → node at the node's own bandwidth; size the
+// deadline for a slow 128 KiB/s node so a healthy one finishes with headroom.
+function fetchTimeoutMs(size) {
+  return Math.min(60 * 60_000, Math.max(5 * 60_000, Math.round((size / (128 * 1024)) * 1000)))
+}
+
+export async function publishSlotBinFiles(sftp, client, remote, files, owner, { fetchMode = resolvePayloadFetchMode() } = {}) {
   const hashed = []
   for (const file of files) hashed.push(await withSha256(file))
   const remoteSha = new Map()
   for (const file of hashed) remoteSha.set(file.rel, await remoteFileSha256(client, `${remote}/${file.rel}`))
   const changed = selectChangedPayloadFiles(hashed, remoteSha)
+  const fetched = []
+  const written = []
   for (const file of changed) {
+    if (file.fetch && fetchMode !== 'push') {
+      const size = file.body ? file.body.length : fs.statSync(file.src).size
+      let ok = false
+      try {
+        await fetchRemoteFile(client, {
+          ...file.fetch,
+          file: `${remote}/${file.rel}`,
+          sha256: file.sha256,
+          mode: file.mode,
+          owner,
+        }, { timeoutMs: fetchTimeoutMs(size) })
+        // The fetch script verifies sha256 before the rename; re-check so a
+        // matching remote hash is the only path that skips the SFTP write.
+        ok = (await remoteFileSha256(client, `${remote}/${file.rel}`)) === file.sha256
+      } catch {
+        ok = false
+      }
+      if (ok) {
+        fetched.push(file.rel)
+        continue
+      }
+      if (fetchMode === 'remote') {
+        throw new ClusterError(502, 'remote_fetch_failed', `节点自下载 ${file.rel} 失败且未启用 SFTP 回退`)
+      }
+    }
     const data = file.body || fs.readFileSync(file.src)
     await writeRemoteFile(sftp, `${remote}/${file.rel}`, data, {
       mode: file.mode,
       owner,
       timeoutMs: writeTimeoutMs(data.length),
     })
+    written.push(file.rel)
   }
-  return { written: changed.map((file) => file.rel), skipped: hashed.length - changed.length }
+  return { written, fetched, skipped: hashed.length - changed.length }
 }
 
 export function kvmKernelSelector(kernel) {
@@ -272,7 +314,7 @@ async function pushLiveWrap(vm, projectRoot, session, { required }) {
   }
   const sftp = await openSftp(session.client)
   const published = await publishSlotBinFiles(sftp, session.client, remote, files, owner)
-  return { ok: true, pushed: published.written.length > 0, ...published }
+  return { ok: true, pushed: published.written.length + published.fetched.length > 0, ...published }
 }
 
 /** Same CRAG tree the slot image bakes, for containers created before that image. */
@@ -313,7 +355,7 @@ export async function pushCragSlot(vm, projectRoot, session = null, { required =
   }))
   const published = await publishSlotBinFiles(sftp, s.client, remote, files, owner)
   await writeRemoteFile(sftp, marker, `${payload.digest}\n`, { mode: 0o644, owner, timeoutMs: 60_000 })
-  return { ok: true, pushed: published.written.length > 0, digest: payload.digest, ...published }
+  return { ok: true, pushed: published.written.length + published.fetched.length > 0, digest: payload.digest, ...published }
 }
 
 /** Stop-accept install: both kernels land in slot-bin. The live entry is renamed over, never unlinked. */

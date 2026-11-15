@@ -127,6 +127,44 @@ async function writeRemoteFileBody(sftp, file, data, { mode = 0o600, owner = nul
 }
 
 /**
+ * Download a large payload file on the node itself, verified against the
+ * control plane's expected sha256, then atomically renamed over the live path.
+ * Keeps multi-hundred-MB vendor binaries (claude-code) off the control plane's
+ * SFTP link, which is chunk-serialized and far slower than the node's own
+ * egress. Same safety contract as writeRemoteFile: temp + rename (never unlink
+ * the live path), and mktemp creates the temp O_EXCL so a guest-planted symlink
+ * cannot redirect the download.
+ */
+export function remoteFetchScript({ url, file, sha256, mode = 0o755, owner = null }) {
+  const quotedFile = shellQuote(file)
+  const dir = `$(dirname ${quotedFile})`
+  const chown = owner == null ? '' : ` && chown ${requireId(owner.uid)}:${requireId(owner.gid)} "$t"`
+  return [
+    'set -e',
+    'command -v curl >/dev/null 2>&1 || { echo "curl not available" >&2; exit 10; }',
+    `f=${quotedFile}`,
+    `t=$(mktemp "${dir}/.kin-fetch.XXXXXXXX") || exit 11`,
+    "trap 'rm -f \"$t\"' EXIT",
+    `curl -fsSL --connect-timeout 10 --retry 2 -o "$t" ${shellQuote(url)} || exit 12`,
+    `printf '%s  %s\\n' ${shellQuote(sha256)} "$t" | sha256sum -c >/dev/null || { echo "checksum mismatch" >&2; exit 13; }`,
+    `chmod ${mode.toString(8)} "$t"${chown}`,
+    'mv -f "$t" "$f"',
+    'trap - EXIT',
+  ].join('\n')
+}
+
+/** Execute remoteFetchScript; non-zero exit becomes a ClusterError with the remote stderr. */
+export async function fetchRemoteFile(client, spec, { timeoutMs = 60_000 } = {}) {
+  const script = remoteFetchScript(spec)
+  const r = await execCollect(client, `sh -c ${shellQuote(script)}`, { timeoutMs, maxBytes: 4096 })
+  if (r.code !== 0) {
+    const detail = (r.stderr || r.stdout || `exit ${r.code}`).trim().slice(-200)
+    throw new ClusterError(502, 'remote_fetch_failed', `节点自下载 ${spec.file} 失败：${detail}`)
+  }
+  return true
+}
+
+/**
  * Regular-file bytes, or null when absent. A symlink fails (O_NOFOLLOW), a FIFO
  * reads empty (O_NONBLOCK) and a large file is cut at `maxBytes`, so a guest can
  * neither redirect the read nor stall it. base64 keeps the bytes intact across
