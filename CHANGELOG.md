@@ -3,6 +3,7 @@
 ## Unreleased
 
 - CRAG [3.0.8 标准版](docs/releases/crag-native-v3.0.8.json)和 [3.0.8 旧离线授权兼容版](docs/releases/crag-native-v3.0.8-legacy.json)修复 Auto 分类请求携带 `metadata` 时返回 400（#1072），以及串行工具回调等待整批结果的互等；不新增终端 stdout 实时流。
+- CRAG 在线激活统一接收设备码和宿主订阅码，由 Authority 判别类型；优先使用目标槽已安装的受信签名包及其实际载荷 ID，不按发布版本号或下载缓存的版本拒绝兑换。未装 CRAG 的 Wrap 槽可按待安装包申请设备授权；签名、设备绑定和载荷校验仍保留。
 
 ## 1.4.104 — 2026-11-15 · CRAG 套餐只读预览
 

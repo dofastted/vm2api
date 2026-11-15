@@ -67,7 +67,7 @@
 | GET | `/vms/:id` | 详情 + 调度等级 + 代理健康 + `billing.today/window_5h/window_7d/prev_window_5h/prev_window_7d/window_5h_projection/by_model/usage_stats`（`usage_stats` = 近 30 个上海自然日的按日用量 + 模型 / 入站路径排名，日界同 `billing.today`；`prev_window_*` 与 `window_5h_projection` 见下） + `account.runtime_window` |
 | PATCH | `/vms/:id` | 热改并发/RPM、OpenAI 会话上限、Claude 席位/配额、模型白名单、槽策略、Claude `schedule_level`、`weight`（Codex 选槽权重 1–100，`null` 回默认 1）、`active_hours`、`timezone`、`name` 或 `id`。`name` 是 1–80 字符的面板显示名，不改编号。单独提交不同的 `id` 才改编号：槽必须已关机、在本机、且没有在飞请求；会移动 `vms/<id>` 与记录，并改写活跃指针、池成员、密钥允许列表和账号归属。运行中、远程节点、编号冲突或容器仍在跑时拒绝。历史请求日志保留旧编号。在线设备授权绑定旧编号，改号后需重新激活。`timezone` 为任意有效 IANA 名称，会钉住该槽（后续绑定不覆盖）；`timezone_follow_proxy: true` 重新跟随已绑代理的出口时区 |
 | GET | `/vms/:id/crag-license` | 仅 admin/master，沿用 VM 属主校验。返回 `{license,machine_code}`。在线授权显式初始化/复用本槽设备机器码；离线 `CRAGU1` 通用码不需机器码、不绑本槽，`machine_code` 可为空。`license` 含签名期限、绝对 UTC 生效/到期、公开状态及 `kind: 'online' \| 'offline'`，不回注册码/私钥/解密 key。需要已安装签名加密 native V2 包及 Linux 私有 run 映射 |
-| POST | `/vms/:id/crag-license` | `{registration_code}` 接受 `CRAGR1` 联网兑换码（设备或宿主订阅）、`CRAGL1` 已签发设备授权和 `CRAGU1` 离线通用码。管理员从同源对本机 Linux Docker Claude 槽提交 `CRAGR1`；由 Authority 识别类型、核销、签发。面板提交槽内已安装包的发行方和载荷 ID，而不是待安装缓存；未安装 CRAG 的 Wrap 槽可按待安装包申请设备许可。落盘前核对签名、设备、载荷和期限；失败不覆盖已有授权。响应不返回兑换码或注册码；不安装、启动或切换内核。 |
+| POST | `/vms/:id/crag-license` | `{registration_code}`。支持统一激活的构建由 Authority 区分设备码和宿主订阅码，两类 `CRAGR1` 均由管理员从同源提交到本机 Linux Docker Claude 槽。以目标槽已安装的受信签名包的发行方和载荷 ID 为准，不与下载缓存比较发布版本号；未装 CRAG 的 Wrap 槽可按待安装包申请设备许可。`v1.4.104` 正式镜像仍使用旧路径：此接口仅兑换设备码，商城宿主码用 `/crag-subscription/redeem` 后再 `/vms/:id/crag-license/bind`。已签发的 `CRAGL1`、兼容离线码各按对应规则校验。失败不覆盖原授权；成功不返回原码，不安装、启动或切换内核。 |
 | POST | `/vms/pool-policy` | 批量槽策略。`{ ids: [...] }` 或 `{ all: true }`，可带 `weight`(1–100) / `schedule_level`(1–10 或 `"auto"`) / `max_concurrency`(1–256) / `max_rpm`(0–1000000) / `max_sessions`(0–256)；`null`（或 `""`）取消钉住：weight 回默认 1、schedule_level 回 auto、上限回 tier / 全局默认，语义与逐槽 PATCH 一致。只写 `vms/*.json`、不重建槽详情，100+ 槽一次调用即可（逐个 `PATCH /vms/:id` 每槽约 4s，并发下发会压住控制面）。返回 `{ updated, missing, failed, items: [{ id, weight, schedule_level, max_concurrency, concurrency_override, max_rpm, max_sessions }] }` |
 | POST | `/vms/:id/probe` | 槽 SOCKS5 探官方 `/usage` + Fable（Pro 跳过 Fable） |
 | POST | `/vms/:id/exit-probe` | 测这个槽真实出口的 IP 与地理（仅 admin）：SOCKS5 槽经代理查；本地代理槽查它所在 VPS 那条本地代理并刷新该行地理。未绑定 502 `proxy_required` |
@@ -253,6 +253,8 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 
 ## CRAG 订阅订单
 
+支付接口边界、`v1.4.104` 实付验收和复跑步骤见 [CRAG 支付与鉴权验收](crag-payment-acceptance.md)。
+
 仅 `GET /crag-shop/plans` 可匿名读取公开套餐，无需 CRAG Auth 或面板凭据。试点目录仅供有效的面板买家会话；试点凭据文件不可用时仍可读取公开目录。`payment_methods: []` 表示当前未开放收款，不表示套餐读取失败。
 
 其余接口只接受实际面板登录会话，不接受 Master 或托管 API 密钥。升级前发出的旧会话需要重新登录一次。管理员也只能访问自己的订单；不存在和不属于本人的订单均返回 `404`。响应禁止缓存，写入请求必须同源，有请求体时须用 `application/json`。
@@ -277,6 +279,11 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 收据主密钥保存在数据目录的 `crag-shop-private/receipt.key`，仅控制进程可读；迁移安装或恢复订单库时，须单独安全备份并恢复同一份密钥。标准数据库备份不含该密钥，已有订单而密钥丢失时服务拒绝重建密钥。
 
 宿主订阅状态 `GET /crag-subscription` 仅管理员可查。可展示 `sku`、`months`、`used_slots`、`available_slots`、`enabled_slots`（验证为运行并持有效本机授权的槽）及 `reclaim_supported`；未确认的数据省略。H2 受签名列表 10,000 槽安全上限约束，即使商业额度为 `"unlimited"`，可用槽数仍为整数。仅在已验证运行中的 CRAG 包支持 H2 时对 H1 宿主显示 `upgrade_available`，通过 `POST /crag-subscription/upgrade`（JSON `{}`）显式升级。H2 用签名列表逐一校验 S1 许可摘要。确认本机 Docker 槽已销毁后才提交释放。删除返回 `409` 时可重试原操作；`POST /crag-subscription/recover`（JSON `{}`）或控制面重启可恢复已经确认销毁的释放操作，但不会把未确认的销毁判为成功。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/crag-subscription/redeem` | 管理员同源登录会话，JSON `{ "redemption_code": "<CRAGR1 宿主码>" }`，按本机宿主身份核销；要求可用的 CRAG 目标，不替目标槽绑定。 |
+| POST | `/vms/:id/crag-license/bind` | 管理员同源登录会话，JSON `{}`，将有效宿主订阅绑定到合格的本机 Linux Docker CRAG v2 槽；回读槽授权确认 `license.valid` 与 `license.scope`。 |
 
 ## 路由 / 设置
 
