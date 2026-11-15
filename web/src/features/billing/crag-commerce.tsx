@@ -189,19 +189,7 @@ export function CragCommerce({
         优惠后单笔不超过 {yuan(rules.max_amount_minor)}，实付以供应方报价为准。
       </p>
       <fieldset className='grid gap-2' disabled={busy}>
-        <legend className='mb-2 text-sm font-medium'>购买方式</legend>
-        {customEnabled ? (
-          <label className='flex cursor-pointer items-center gap-2 rounded-md border p-3 text-sm has-checked:border-primary'>
-            <input
-              type='radio'
-              name={id}
-              className='accent-primary'
-              checked={sku === 'custom'}
-              onChange={() => onSelect('custom')}
-            />{' '}
-            {customTitle ?? '自定义槽位和时长'}
-          </label>
-        ) : null}
+        <legend className='mb-2 text-sm font-medium'>固定套餐与续费</legend>
         {plans
           .filter((plan) => plan.enabled !== false)
           .map((plan) => (
@@ -268,33 +256,53 @@ export function CragCommerce({
           </label>
         ) : null}
       </fieldset>
-      {sku === 'custom' && customEnabled ? (
-        <div className='grid grid-cols-2 gap-3'>
-          <label className='grid gap-1.5 text-sm'>
-            槽位数
-            <Input
-              value={slots}
-              inputMode='numeric'
-              maxLength={8}
-              onChange={(e) => setSlots(e.target.value)}
+      {customEnabled ? (
+        <fieldset
+          className='space-y-3 rounded-md border p-3 has-checked:border-primary'
+          disabled={busy}
+        >
+          <legend className='px-1 text-sm font-medium'>
+            {customTitle ?? '自定义槽位和时长'}
+          </legend>
+          <label className='flex cursor-pointer items-center gap-2 text-sm'>
+            <input
+              type='radio'
+              name={id}
+              className='accent-primary'
+              checked={sku === 'custom'}
+              onChange={() => onSelect('custom')}
             />
+            选择自定义套餐
           </label>
-          <label className='grid gap-1.5 text-sm'>
-            月数
-            <Input
-              value={months}
-              inputMode='numeric'
-              maxLength={3}
-              onChange={(e) => setMonths(e.target.value)}
-            />
-          </label>
-          {!available ? (
-            <p className='col-span-2 text-sm text-destructive'>
+          <div className='grid gap-3 sm:grid-cols-2'>
+            <label className='grid gap-1.5 text-sm'>
+              槽位数
+              <Input
+                value={slots}
+                inputMode='numeric'
+                maxLength={8}
+                disabled={sku !== 'custom'}
+                onChange={(e) => setSlots(e.target.value)}
+              />
+            </label>
+            <label className='grid gap-1.5 text-sm'>
+              月数
+              <Input
+                value={months}
+                inputMode='numeric'
+                maxLength={3}
+                disabled={sku !== 'custom'}
+                onChange={(e) => setMonths(e.target.value)}
+              />
+            </label>
+          </div>
+          {sku === 'custom' && !available ? (
+            <p className='text-sm text-destructive'>
               槽位数须为 {rules.min_slots ?? 1}–{rules.max_slots} 的整数，
               月份须为 {rules.min_months ?? 1}–{rules.max_months} 的整数。
             </p>
           ) : null}
-        </div>
+        </fieldset>
       ) : null}
       {sku === 'renewal' ? (
         <p className='text-sm text-muted-foreground'>

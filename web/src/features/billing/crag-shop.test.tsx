@@ -74,19 +74,37 @@ vi.mock('@/components/page-header', () => ({
     title,
     description,
     children,
+    extra,
   }: {
     title: string
     description: string
     children: ReactNode
+    extra?: ReactNode
   }) => (
     <main>
       <h1>{title}</h1>
       <p>{description}</p>
+      {extra}
       {children}
     </main>
   ),
 }))
 vi.mock('@/components/confirm-dialog', () => ({ ConfirmDialog: () => null }))
+vi.mock('@/components/ui/dialog', () => {
+  const Children = ({ children }: { children: ReactNode }) => children
+  return {
+    Dialog: Children,
+    DialogContent: Children,
+    DialogDescription: Children,
+    DialogHeader: Children,
+    DialogTitle: Children,
+  }
+})
+vi.mock('@/features/vm/crag-host-subscription', () => ({
+  CragHostSubscription: ({ initialCode }: { initialCode: string }) => (
+    <output aria-label='宿主机兑换码'>{initialCode}</output>
+  ),
+}))
 vi.mock('@/components/ui/button', () => ({
   Button: (props: ButtonHTMLAttributes<HTMLButtonElement>) => {
     state.buttons.push(props)
@@ -186,6 +204,36 @@ beforeEach(() => {
 })
 
 describe('CRAG buyer presentation and activation wire', () => {
+  it('keeps activation above the catalogue when checkout is closed', () => {
+    state.values[1] = { status: 'error' }
+    const html = render()
+    expect(html).toContain('href="#crag-purchase-activation"')
+    expect(html).toContain('href="#crag-order-history"')
+    expect(html.indexOf('自动激活（新订单）')).toBeLessThan(
+      html.indexOf('<section aria-label="订阅套餐"')
+    )
+    expect(html).toContain('自动激活到 vm-a')
+    click('手动激活')
+    expect(render()).toContain('手动激活 CRAG 订阅')
+    expect(api).not.toHaveBeenCalled()
+  })
+
+  it('passes a claimed code to manual activation without redeeming it automatically', () => {
+    const code = `CRAGR1.${'a'.repeat(43)}`
+    state.values[3] = [order]
+    state.values[16] = { order_id: order.order_id, redemption_code: code }
+    render()
+    click('使用此码激活')
+    expect(render()).toContain(`<output aria-label="宿主机兑换码">${code}`)
+    expect(api).not.toHaveBeenCalled()
+    state.role = 'user'
+    const buyer = render()
+    expect(buyer).toContain('href="#crag-order-history"')
+    expect(buyer).not.toContain('手动激活 CRAG 订阅')
+    expect(buyer).not.toContain('使用此码激活')
+    expect(buyer).not.toContain('自动激活（新订单）')
+  })
+
   it('puts the wider plans section first in actual DOM, with payment feedback above both panes', () => {
     state.values[13] = '付款反馈'
     state.values[14] = '订单错误'

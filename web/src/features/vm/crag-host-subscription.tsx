@@ -20,12 +20,18 @@ const statusLabels: Record<CragHostStatus['state'], string> = {
 }
 const root = '/api/panel/crag-subscription'
 
-export function CragHostSubscription({ vmId }: { vmId: string }) {
+export function CragHostSubscription({
+  vmId,
+  initialCode = '',
+}: {
+  vmId?: string
+  initialCode?: string
+}) {
   const id = useId()
   const qc = useQueryClient()
   const options = cragHostStatusQueryOptions()
   const host = useQuery(options)
-  const [code, setCode] = useState('')
+  const [code, setCode] = useState(initialCode)
   const [confirming, setConfirming] = useState(false)
   const [working, setWorking] = useState(false)
   const [notice, setNotice] = useState<{ text: string; error?: boolean }>()
@@ -36,11 +42,11 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
   const busy = host.isFetching || working
 
   async function perform(action: 'redeem' | 'bind' | 'recover') {
-    if (busy) return
+    if (busy || (action === 'bind' && !vmId)) return
     setWorking(true)
     setNotice(undefined)
     try {
-      if (action === 'bind') {
+      if (action === 'bind' && vmId) {
         const result = await api<{ seat: number }>(
           `/api/panel/vms/${encodeURIComponent(vmId)}/crag-license/bind`,
           {
@@ -61,7 +67,7 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
         if (action === 'redeem') {
           setCode('')
           setNotice({
-            text: '宿主机权益已更新。绑定应用锁后，本槽才能使用订阅授权。',
+            text: '宿主机权益已更新。目标槽位绑定应用锁后才能使用订阅授权。',
           })
         }
       }
@@ -77,9 +83,10 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
       setConfirming(false)
       await Promise.all([
         qc.invalidateQueries({ queryKey: options.queryKey }),
-        qc.invalidateQueries({
-          queryKey: vmCragLicenseQueryOptions(vmId).queryKey,
-        }),
+        vmId &&
+          qc.invalidateQueries({
+            queryKey: vmCragLicenseQueryOptions(vmId).queryKey,
+          }),
       ])
       setWorking(false)
     }
@@ -156,14 +163,16 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
         >
           兑换到本机
         </Button>
-        <Button
-          type='button'
-          variant='outline'
-          disabled={!ready || busy || status?.state !== 'active'}
-          onClick={() => void perform('bind')}
-        >
-          给本槽绑定应用锁
-        </Button>
+        {vmId ? (
+          <Button
+            type='button'
+            variant='outline'
+            disabled={!ready || busy || status?.state !== 'active'}
+            onClick={() => void perform('bind')}
+          >
+            给本槽绑定应用锁
+          </Button>
+        ) : null}
       </div>
       <ConfirmDialog
         open={confirming}
