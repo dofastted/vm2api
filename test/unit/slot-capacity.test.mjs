@@ -73,7 +73,9 @@ test('routing.slot_capacity overrides plans and per-session costs', () => {
   const cfg = normalizeSlotCapacityConfig({ plans: { pro: 99, max_5x: 0 }, host_memory_ratio: 5 })
   assert.equal(cfg.plans.pro, 20)
   assert.equal(cfg.plans.max_5x, 1)
-  assert.equal(cfg.host_memory_ratio, 1)
+  assert.equal(cfg.host_memory_ratio, 3)
+  assert.equal(normalizeSlotCapacityConfig({ host_memory_ratio: 1.6 }).host_memory_ratio, 1.6)
+  assert.equal(normalizeSlotCapacityConfig({ host_memory_ratio: 0.1 }).host_memory_ratio, 0.3)
 })
 
 test('new containers start at least at the plan target; codex slots keep their spec', () => {

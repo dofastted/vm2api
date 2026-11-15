@@ -122,6 +122,27 @@ test('the host budget leaves room for non-slot memory and asks for another machi
   fx.cleanup()
 })
 
+test('a host_memory_ratio above 1 overcommits slot limits past free RAM', async () => {
+  // 10 GiB host, 4 GiB outside slots: (10 − 4) × 1.6 ≈ 9830 MiB of limits, more than the 6 GiB left.
+  // Three 512m slots use 1536 MiB; two raises to 4g fit (8704 MiB), the third does not.
+  const fx = fixture({
+    vms: [max5('cf-a'), max5('cf-b'), max5('cf-c')],
+    hostGiB: 10,
+    availableGiB: 6,
+    routing: { slot_capacity: { host_memory_ratio: 1.6 } },
+  })
+  await fx.reconciler.tick()
+  assert.deepEqual(fx.calls.memory, [
+    ['cf-a', '4g'],
+    ['cf-b', '4g'],
+  ])
+  assert.deepEqual(
+    fx.events.filter((e) => e.kind === 'host_memory_exhausted').map((e) => e.vm_id),
+    ['cf-c'],
+  )
+  fx.cleanup()
+})
+
 test('memory the slots themselves use is not counted as non-slot memory', async () => {
   // Same 4 GiB in use, but it is the slots' own: nothing is set aside, both raises fit.
   const busy = { oomKills: 0, pidsMaxHits: 0, pidsLimit: 256, memoryCurrentBytes: 2 * GiB }

@@ -7,7 +7,8 @@
  *      current limit; a new pids-limit hit → double the pids limit.
  *   3. Memory raises respect a per-host budget: the sum of slot memory limits
  *      may not exceed (host RAM − memory used outside slots) × host_memory_ratio,
- *      so every slot can fill at once without exhausting the host. Over budget
+ *      so every slot can fill at once without exhausting the host (a ratio
+ *      above 1 overcommits on purpose; live admission then guards). Over budget
  *      the slot keeps its limits; its slot count (and seats) stay clamped to
  *      what they hold, and an event asks for another machine.
  *

@@ -36,6 +36,10 @@ export const SLOT_CAPACITY_DEFAULTS = Object.freeze({
   base_pids: 128,
   // Sum of slot memory limits on one host may not exceed this share of the
   // RAM left after everything that is not a slot (databases, other services).
+  // Above 1 overcommits: limits are ceilings, not reservations, and slots on
+  // different accounts are rarely busy together. Pair it with
+  // routing.host_memory_pressure so new conversations leave a host whose
+  // real free memory runs low.
   host_memory_ratio: 0.9,
   // Each plan fills its memory step: 2g holds 5 sessions, 4g holds 12, 8g 20.
   // With a 600s idle TTL, 12 slots kept 99% of a busy Max account's new
@@ -49,10 +53,12 @@ function intIn(value, min, max, fallback) {
   return Math.min(max, Math.max(min, Math.round(n)))
 }
 
+export const HOST_MEMORY_RATIO_MAX = 3
+
 function ratioIn(value, fallback) {
   const n = Number(value)
   if (!Number.isFinite(n)) return fallback
-  return Math.min(1, Math.max(0.3, n))
+  return Math.min(HOST_MEMORY_RATIO_MAX, Math.max(0.3, n))
 }
 
 export function normalizeSlotCapacityConfig(raw) {
