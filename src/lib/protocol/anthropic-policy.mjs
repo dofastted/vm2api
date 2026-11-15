@@ -685,8 +685,8 @@ export function scrubUpstreamClientBody(body, { official = false, rewriteTools =
     })
   }
   if (out.tool_choice && typeof out.tool_choice === 'object' && typeof out.tool_choice.name === 'string') {
-    const name = rename(out.tool_choice.name)
-    if (name !== out.tool_choice.name) out.tool_choice = { ...out.tool_choice, name }
+    const name = assigned.get(out.tool_choice.name)
+    if (name !== undefined && name !== out.tool_choice.name) out.tool_choice = { ...out.tool_choice, name }
   }
   if (Array.isArray(out.messages)) {
     out.messages = out.messages.map((message) => scrubMessage(message, rename))
