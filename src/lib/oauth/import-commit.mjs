@@ -21,7 +21,12 @@ import { resolveImportProxy } from '../vm/proxy-resolve.mjs'
 import { collectSlotIdentity } from '../vm/guest-identity.mjs'
 import { importWorkerCredential, syncClaudeClientCredentials } from '../transport/go-worker-client.mjs'
 import { rustKernelHealth, rustKernelReachable, rustKernelBusy } from '../transport/rust-kernel-client.mjs'
-import { credentialModeFromOauth, canOfficialCc } from './credential-mode.mjs'
+import {
+  credentialModeFromOauth,
+  canOfficialCc,
+  isOfficialSetupTokenMode,
+  isSetupTokenMode,
+} from './credential-mode.mjs'
 import { resolveAuthScheme } from './auth-scheme.mjs'
 import { flattenOauthIdentity, normalizeSubscriptionType } from './oauth-identity.mjs'
 import { persistOauthToVm } from './oauth-credentials.mjs'
@@ -210,13 +215,18 @@ export function createImportCommit(ctx) {
       }
     }
     await withVmLock(vmPath, () => {
+      const mode = importedCredential.mode || credentialModeFromOauth(oauth)
+      const setupRegistration =
+        isOfficialSetupTokenMode(mode) ||
+        (isSetupTokenMode(mode) && (oauth.oauth_registration === 'console' || oauth.flavor === 'setup_token'))
       persistOauthToVm(
         vmPath,
         {
           ...importedCredential,
           source: source || oauth.source || 'sessionKey-cookie-auth',
-          mode: importedCredential.mode || credentialModeFromOauth(oauth),
+          mode,
           type: importedCredential.type || importedCredential.mode,
+          oauth_registration: setupRegistration ? 'console' : 'oauth',
         },
         { acceptLiveGrant: true, operatorImport: true },
       )

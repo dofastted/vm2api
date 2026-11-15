@@ -2053,6 +2053,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     has_token: hasToken,
     expires_at: expiresAt,
     oauth_source: v.oauth_source || null,
+    oauth_registration: v.oauth_registration || null,
     credential_mode: v.credential_mode || v.claude?.mode || 'oauth',
     auth_scheme: v.auth_scheme || v.claude?.auth_scheme || null,
     can_claude_reset: isCodex ? false : v.can_claude_reset === true,

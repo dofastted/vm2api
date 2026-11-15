@@ -620,6 +620,7 @@ export function persistOauthToVm(vmPath, cred, { acceptLiveGrant = false, operat
   }
   if (n.source) vm.claude.source = n.source
   vm.claude.mode = mode
+  if (operatorImport) vm.claude.oauth_registration = cred.oauth_registration === 'console' ? 'console' : 'oauth'
   if (mode !== 'apikey' && vm.claude.account_tier !== 'max') {
     vm.claude.account_tier = 'pro'
     vm.claude.account_tier_source = vm.claude.account_tier_source || 'default'

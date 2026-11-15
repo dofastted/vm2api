@@ -471,6 +471,7 @@ export type Vm = {
   expires_at?: string
   refreshed_at?: string
   oauth_source?: string
+  oauth_registration?: 'console' | 'oauth' | null
   account_uuid?: string
   org_uuid?: string
   access_preview?: string
