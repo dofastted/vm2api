@@ -1,36 +1,51 @@
 import type { Vm } from '@/types/panel-vm'
+import ClaudeColor from '@lobehub/icons/es/Claude/components/Color'
+import OpenAI from '@lobehub/icons/es/OpenAI/components/Mono'
 import { credentialRegistrationOf } from '@/lib/cred-type'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
 import { isCodexVm } from '@/lib/vm-kind'
 import { claudeTier } from '@/lib/vm-status'
 import { ActiveVmBadge } from '@/features/vm/active-vm-badge'
+import { VmRentedMark } from '@/features/vm/vm-owner-line'
+
+function PlatformMark({ vm }: { vm: Vm }) {
+  const gpt = isCodexVm(vm)
+  const Icon = gpt ? OpenAI : ClaudeColor
+  const label = gpt ? 'openai' : 'anthropic'
+  return (
+    <span
+      className='inline-flex size-3.5 shrink-0 items-center justify-center'
+      role='img'
+      aria-label={label}
+      title={label}
+    >
+      <Icon className='size-3.5' aria-hidden />
+    </span>
+  )
+}
 
 export function VmAccountIdentity({ vm }: { vm: Vm }) {
   const email = vm.email?.trim() || ''
-  const prefix = email.split('@', 1)[0]
-  const counter = /(?:^|[-_])(\d+)$/.exec(vm.id)?.[1]
   const registration = credentialRegistrationOf(vm)
   const crag = (vm.resolved_dataplane ?? vm.dataplane) === 'crag'
   const node = vm.node_name || vm.node_id || 'local'
   return (
     <div className='min-w-0 space-y-0.5'>
       <div className='flex min-w-0 items-center gap-1.5 text-[11px]'>
-        <span className='shrink-0 font-medium text-muted-foreground'>
-          {isCodexVm(vm) ? 'openai' : 'anthropic'}
-        </span>
-        <span className='shrink-0 font-mono font-medium' title={vm.name}>
+        <PlatformMark vm={vm} />
+        <span
+          className='truncate font-mono font-medium'
+          title={vm.name || vm.id}
+        >
           {vm.id}
         </span>
-        {prefix ? (
-          <span className='truncate'>
-            {counter ? `${counter}·${prefix}` : prefix}
-          </span>
-        ) : null}
-        <ActiveVmBadge vm={vm} />
       </div>
-      <div className='truncate text-xs font-semibold' title={email}>
-        {email || '未绑定邮箱'}
+      <div className='flex min-w-0 items-center gap-1.5'>
+        <div className='truncate text-xs font-semibold' title={email}>
+          {email || '未绑定邮箱'}
+        </div>
+        <ActiveVmBadge vm={vm} />
       </div>
       <div className='flex min-w-0 flex-wrap items-center gap-x-1.5 text-[11px] text-muted-foreground'>
         <span
@@ -42,6 +57,7 @@ export function VmAccountIdentity({ vm }: { vm: Vm }) {
         <span>{vm.runtime_type === 'kvm' ? 'kvm' : 'vm'}</span>
         <span aria-hidden='true'>|</span>
         <span>{registration === 'none' ? '无凭证' : registration}</span>
+        <VmRentedMark vm={vm} />
       </div>
       <div className='flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground'>
         <span

@@ -3,9 +3,12 @@ import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
 import type { StatusTone } from '@/types/status'
 import { GripVertical, RotateCcw } from 'lucide-react'
-import { expiresAtToMs, fmtResetClock } from '@/lib/fable-status'
+import {
+  expiresAtToMs,
+  fmtResetClock,
+  resetCountdown,
+} from '@/lib/fable-status'
 import { fmtNum } from '@/lib/format'
-import { subscriptionListLabel } from '@/lib/subscription-expiry'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
 import {
@@ -48,13 +51,17 @@ import {
 import { VmAccountIdentity } from '@/features/vm/vm-account-identity'
 import { VmActionMenu } from '@/features/vm/vm-action-menu'
 import { useVmActions } from '@/features/vm/vm-actions-context'
-import { VmOwnerLine } from '@/features/vm/vm-owner-line'
+import {
+  depthStyle,
+  resetRemainVisual,
+  scaleT,
+} from '@/features/vm/vm-type-visual'
 
 /** 列的宽度与弹性；顺序由 `useVmColumnOrder` 决定，不写死在这里。 */
 const COL_CLS: Record<VmColumnKey | 'actions', string> = {
   vm: 'min-w-[170px] flex-[1.15]',
   sched: 'min-w-[62px] flex-[0.3]',
-  type: 'min-w-[120px] flex-[0.75]',
+  type: 'min-w-[156px] flex-[0.85]',
   status: 'min-w-[140px] flex-[1.1]',
   req: 'min-w-[124px] flex-[0.7]',
   usage: 'min-w-[208px] flex-[1.3]',
@@ -118,46 +125,89 @@ function StatusReason({ vm, tone }: { vm: Vm; tone: StatusTone }) {
   )
 }
 
-function PriorityChip({ vm }: { vm: Vm }) {
-  const level = Number(vm.schedule_level)
-  const valid = Number.isInteger(level) && level >= 0
-  const text = valid ? `优先级-${level}` : '优先级-—'
-  const mode = vm.schedule_level_mode === 'manual' ? '手动' : '自动'
-  const title = `${mode}调度等级`
+function DepthChip({
+  label,
+  title,
+  t,
+}: {
+  label: string
+  title: string
+  t: number | null
+}) {
   return (
     <span
-      className='inline-flex rounded border border-border/70 px-1.5 py-0.5 font-mono text-[11px] leading-none font-semibold text-muted-foreground tabular-nums'
+      className={cn(
+        'inline-flex rounded px-1.5 py-0.5 font-mono text-[11px] leading-none font-semibold tabular-nums',
+        t == null && 'border border-border/70 text-muted-foreground'
+      )}
+      style={t == null ? undefined : depthStyle(t)}
       title={title}
     >
-      {text}
+      {label}
     </span>
   )
 }
 
-/**
- * 调度优先级与周窗口重置时刻。
- */
+function ResetMeter({ resetAt, now }: { resetAt: unknown; now: number }) {
+  const resetMs = expiresAtToMs(resetAt)
+  const clock = fmtResetClock(resetAt)
+  if (!clock || !resetMs) return null
+  const visual = resetRemainVisual(resetMs, now)
+  const left = resetCountdown(resetAt, now)
+  return (
+    <div className='min-w-0 space-y-1' title='周窗口重置'>
+      <div
+        className='h-1.5 overflow-hidden rounded-full track-recessed'
+        aria-hidden
+      >
+        <div
+          className='h-full rounded-full transition-[width,background-color] duration-200 motion-reduce:transition-none'
+          style={{
+            width: `${visual.overdue ? 100 : visual.pct}%`,
+            backgroundColor: visual.color,
+          }}
+        />
+      </div>
+      <div
+        className={cn(
+          'truncate font-mono text-[11px] tabular-nums',
+          visual.textClass
+        )}
+      >
+        重置 {clock.slice(0, 11)}
+        {left ? ` · ${left}` : ''}
+      </div>
+    </div>
+  )
+}
+
+/** 调度等级和权重用同一套由浅到深的色阶。重置用剩余时间条。 */
 function TypeCell({ vm, now }: { vm: Vm; now: number }) {
+  const level = Number(vm.schedule_level)
+  const levelOk = Number.isInteger(level) && level >= 1 && level <= 10
+  const weight = Number(vm.weight)
+  const weightOk = Number.isInteger(weight) && weight >= 1 && weight <= 100
   const hasToken = Boolean(vm.has_token)
-  const resetAt = vm.reset_7d || vm.reset_7d_oi
-  const clock = hasToken ? fmtResetClock(resetAt) : null
-  const resetMs = clock ? expiresAtToMs(resetAt) : 0
-  const dueCls =
-    resetMs > 0 && resetMs <= now
-      ? 'text-[color:var(--status-bad)]'
-      : 'text-muted-foreground'
   return (
     <div className='min-w-0 space-y-1'>
-      <div className='flex flex-wrap items-center gap-x-1.5 gap-y-1'>
-        <PriorityChip vm={vm} />
+      <div className='flex flex-wrap items-center gap-1'>
+        <DepthChip
+          label={levelOk ? `等级 ${level}` : '等级 —'}
+          title={
+            levelOk
+              ? `${vm.schedule_level_mode === 'manual' ? '手动' : '自动'}调度等级，1 最浅，10 最深`
+              : '没有调度等级'
+          }
+          t={levelOk ? scaleT(level, 1, 10) : null}
+        />
+        <DepthChip
+          label={weightOk ? `权重 ${weight}` : '权重 —'}
+          title={weightOk ? '同级选槽权重，1 最浅，100 最深' : '没有权重'}
+          t={weightOk ? scaleT(weight, 1, 100) : null}
+        />
       </div>
-      {clock ? (
-        <div
-          className={cn('font-mono text-[11px] tabular-nums', dueCls)}
-          title='周窗口重置时刻'
-        >
-          重置 {clock.slice(0, 11)}
-        </div>
+      {hasToken ? (
+        <ResetMeter resetAt={vm.reset_7d || vm.reset_7d_oi} now={now} />
       ) : null}
     </div>
   )
@@ -318,26 +368,10 @@ function WeekPills({ week }: { week: VmWeekOutcome }) {
   )
 }
 
-function SlotCell({ vm, now }: { vm: Vm; now: number }) {
-  const sub = subscriptionListLabel(vm, now)
+function SlotCell({ vm }: { vm: Vm }) {
   return (
     <div className='min-w-0 space-y-0.5 overflow-hidden'>
       <VmAccountIdentity vm={vm} />
-      <div
-        className={cn(
-          'truncate font-mono text-[11px] tabular-nums',
-          sub.tone === 'bad' && 'text-[color:var(--status-bad)]',
-          sub.tone === 'warn' && 'text-[color:var(--status-warn)]',
-          sub.tone === 'muted' && 'text-muted-foreground'
-        )}
-        title={sub.title}
-      >
-        {sub.text}
-      </div>
-      <VmOwnerLine
-        vm={vm}
-        className='truncate text-[10.5px] text-muted-foreground'
-      />
     </div>
   )
 }
@@ -354,7 +388,7 @@ const COLUMNS: Record<
   VmColumnKey,
   { label: string; cell: (ctx: CellCtx) => ReactNode }
 > = {
-  vm: { label: '账号', cell: ({ vm, now }) => <SlotCell vm={vm} now={now} /> },
+  vm: { label: '账号', cell: ({ vm }) => <SlotCell vm={vm} /> },
   sched: {
     label: '调度',
     cell: ({ vm }) => (
