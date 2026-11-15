@@ -232,6 +232,7 @@ import { slotMigrationBusy, slotMigrationJob, startSlotMigration } from '../clus
 import { isNativeNodeVm, preflightNode } from '../cluster/placement.mjs'
 import { stageFreshClaudeKernels } from '../cluster/remote-slot-files.mjs'
 import { cragSlotPayload } from '../cluster/slot-image.mjs'
+import { normalizeAutoPlacement, pickPlacement, readLocalHost, requestedPlacement } from '../cluster/auto-placement.mjs'
 import { probeLocalKvm } from '../vm/kvm-host.mjs'
 import { normalizeVmConfig, resolveMachineSpec, validateVmConfigPatch } from '../vm/machine-spec.mjs'
 import { raiseDockerSlotMemory } from '../vm/docker-slot-memory.mjs'
@@ -4704,8 +4705,8 @@ export function createPanelHandler(ctx) {
         }
         const startNow = body.start !== false && body.status !== 'stopped'
         const wantKernel = body.kernel && OS_CATALOG[body.kernel] ? body.kernel : kernelForIndex(idx)
-        const nodeId = body.node_id ? String(body.node_id) : null
-        const kindProbe = { node_id: nodeId }
+        let nodeId = body.node_id ? String(body.node_id) : null
+        const kindProbe = {}
         stampVmKind(kindProbe, body)
         const codexCreate = isCodexVm(kindProbe)
         if (Object.hasOwn(body, 'dataplane') && (codexCreate || !['wrap', 'crag'].includes(body.dataplane))) {
@@ -4715,7 +4716,6 @@ export function createPanelHandler(ctx) {
           })
         }
         const selectedCrag = body.dataplane === 'crag'
-        let cragSupported = nodeId ? !isNativeNodeVm(kindProbe) : process.platform === 'linux' && process.arch === 'x64'
         const unsupportedCrag = () =>
           json(res, 409, {
             ok: false,
@@ -4752,15 +4752,59 @@ export function createPanelHandler(ctx) {
           }
           throw error
         }
-        if (nodeId) {
+        // No node named: auto placement may still pick one by memory/load headroom.
+        // Only for admin Docker creates whose exit is not pinned to this host.
+        let placement = null
+        let releasePlacement = () => {}
+        const placementPolicy = normalizeAutoPlacement(ctx.routingConfig?.cluster?.auto_placement)
+        const wanted = requestedPlacement(body, placementPolicy)
+        const exitPinsHost = typeof body.proxy_id === 'string' && isLocalEgressId(body.proxy_id.trim())
+        const localCragSupported = process.platform === 'linux' && process.arch === 'x64'
+        const cragCapableNodes = new Set()
+        if (wanted.mode === 'auto' && ident.role === 'admin' && runtime !== RUNTIME_KVM && !exitPinsHost) {
+          const picked = await (ctx.pickPlacement || pickPlacement)({
+            vm: { machine },
+            vms: existing,
+            routing: ctx.routingConfig,
+            policy:
+              selectedCrag && !localCragSupported ? { ...placementPolicy, include_local: false } : placementPolicy,
+            nodes: clusterNodesOf(ctx),
+            localHost: (ctx.readLocalHost || readLocalHost)(),
+            preflight: async (id) => {
+              const checked = await preflightNode(id, { kernel: wantKernel, runtime })
+              const supported =
+                !isNativeNodeVm({ node_id: id }) && checked.checks.some((check) => check.id === 'arch' && check.ok)
+              if (checked.ok && supported) cragCapableNodes.add(id)
+              if (selectedCrag && checked.ok && !supported) {
+                return {
+                  ...checked,
+                  ok: false,
+                  checks: [...checked.checks, { id: 'crag', ok: false, level: 'error', message: '此机器不支持 CRAG' }],
+                }
+              }
+              return checked
+            },
+          })
+          if (picked.error) {
+            return json(res, picked.error.status, {
+              ok: false,
+              error: { code: picked.error.code, message: picked.error.message, placement: picked.error.report },
+            })
+          }
+          placement = picked.report
+          releasePlacement = picked.release || releasePlacement
+          nodeId = picked.node_id || null
+        }
+        if (nodeId && !placement) {
           if (ident.role !== 'admin') {
             return json(res, 403, {
               ok: false,
               error: { code: 'placement_forbidden', message: '只有管理员可以把虚拟机放到集群节点' },
             })
           }
-          if (selectedCrag && !cragSupported) return unsupportedCrag()
-          if (codexCreate && !slotHost(kindProbe).supports('codex')) {
+          const native = isNativeNodeVm({ node_id: nodeId })
+          if (selectedCrag && native) return unsupportedCrag()
+          if (codexCreate && !slotHost({ ...kindProbe, node_id: nodeId }).supports('codex')) {
             return json(res, 400, {
               ok: false,
               error: { code: 'remote_unsupported', message: '集群节点上的虚拟机暂不支持此操作' },
@@ -4777,7 +4821,7 @@ export function createPanelHandler(ctx) {
           }
           const arch = preflight.checks.find((check) => check.id === 'arch')
           if (selectedCrag && arch && !arch.ok) return unsupportedCrag()
-          cragSupported = cragSupported && arch?.ok === true
+          if (!native && arch?.ok) cragCapableNodes.add(nodeId)
           if (!preflight.ok) {
             return json(res, 409, {
               ok: false,
@@ -4789,7 +4833,11 @@ export function createPanelHandler(ctx) {
             })
           }
         }
-        if (selectedCrag && !cragSupported) return unsupportedCrag()
+        const cragSupported = nodeId ? cragCapableNodes.has(nodeId) : localCragSupported
+        if (selectedCrag && !cragSupported) {
+          releasePlacement()
+          return unsupportedCrag()
+        }
         const preinstallBoth = !codexCreate && cragSupported
         // An explicit exit (e.g. local egress for a node: that VPS's own route) replaces auto-allocation.
         let pickedProxyId = typeof body.proxy_id === 'string' ? body.proxy_id.trim() : ''
@@ -4995,6 +5043,7 @@ export function createPanelHandler(ctx) {
             preflightFreshClaudeKernels(project, vm)
             if (nodeId) cragSlotPayload(project, { required: true })
           } catch (error) {
+            releasePlacement()
             return json(res, 409, {
               ok: false,
               error: { code: error.code || 'kernel_package_missing', message: missing },
@@ -5002,6 +5051,8 @@ export function createPanelHandler(ctx) {
           }
         }
         atomicWriteJson(vmPath, vm, { mode: 0o600 })
+        // The record now books this slot's memory itself.
+        releasePlacement()
         writeGuestMachineIdFile(cfg.paths.project, id, generated.guest_machine_id)
         let allocated = null
         let proxyError = null
@@ -5086,6 +5137,7 @@ export function createPanelHandler(ctx) {
               role: ident.role,
               nodes: clusterNodesOf(ctx),
             }),
+            ...(placement ? { placement } : {}),
             ...(startError ? { start_error: startError } : {}),
             ...(proxyError ? { proxy_error: proxyError } : {}),
           }),

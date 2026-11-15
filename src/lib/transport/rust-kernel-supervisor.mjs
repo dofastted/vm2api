@@ -54,6 +54,7 @@ import { checkCragLicense } from '../vm/crag-license.mjs'
 import { kernelCpuCommand, kernelCpuCommandMatches, usesKernelCpuLimit } from '../vm/kernel-cpu.mjs'
 import { kvmCragAppArmorCommand } from '../vm/kvm-crag-apparmor.mjs'
 import { workerPaths } from './go-worker-client.mjs'
+import { effectiveSlotCount } from '../vm/slot-capacity.mjs'
 
 /** The native host is authenticated separately from account scheduling readiness. */
 function runtimeReady(health, allowMissingCredential) {
@@ -108,9 +109,30 @@ export const WRAP_SLOT_MIN = 1
 export const WRAP_SLOT_MAX = KERNEL_NATIVE_SLOT_COUNT
 export const WEDGED_READY_WAIT_MS = 3000
 
-/** Pre-open native slots. 20 multiplexed CLI streams over one residential SOCKS incomplete-storm. */
-export function wrapSlotCount(_vm = {}, _routing = {}) {
-  return WRAP_SLOT_MAX
+/**
+ * Native slots for this VM: the plan's target clamped to what the container's
+ * recorded memory and pids limits hold (see slot-capacity.mjs). A full crag
+ * kernel never evicts idle sessions, so this is the resident process cap.
+ */
+export function wrapSlotCount(vm = {}, routing) {
+  return Math.min(WRAP_SLOT_MAX, Math.max(WRAP_SLOT_MIN, effectiveSlotCount(vm, routing)))
+}
+
+/**
+ * Slot count for a kernel start, from the current VM record. A request or a
+ * pending idle reload carries a VM snapshot that a live capacity raise can
+ * outdate; sizing from it would shrink the kernel back to the old limits.
+ */
+export function expectedKernelSlots(exec = {}) {
+  const root = projectRootFromExec(exec)
+  const id = exec?.vmId || exec?.vm?.id
+  let vm = exec?.vm
+  if (root && id) {
+    try {
+      vm = getVm(root, id) || vm
+    } catch {}
+  }
+  return wrapSlotCount(vm || {})
 }
 
 function startCurrent(control) {
@@ -128,11 +150,11 @@ export function slotContainerName(exec = {}) {
   return vmId ? `kin-${String(vmId).replace(/^vm-/, '')}` : ''
 }
 
-function syncKernelSlotCount(configPath) {
+export function syncKernelSlotCount(configPath, expected = WRAP_SLOT_MAX) {
   const prev = readExistingKernelConfig(configPath)
   if (!prev || typeof prev !== 'object') return false
-  if (Number(prev.slots_per_worker) === WRAP_SLOT_MAX) return false
-  prev.slots_per_worker = WRAP_SLOT_MAX
+  if (Number(prev.slots_per_worker) === expected) return false
+  prev.slots_per_worker = expected
   try {
     fs.writeFileSync(configPath, JSON.stringify(prev, null, 2) + '\n', { mode: 0o600 })
     return true
@@ -146,6 +168,31 @@ export function readExistingKernelConfig(configPath) {
   } catch {
     return {}
   }
+}
+
+/**
+ * Does the kernel's slot count differ from `expected`? A crag kernel reports
+ * the count it runs with as `capacity`; the file alone can already be rewritten
+ * while the old process still runs, so the live value wins when present.
+ */
+export function kernelSlotsDiffer(configPath, health, expected) {
+  // crag reports `capacity`; the wrap dataplane reports its native host's `slots`.
+  const live = Number(health?.capacity ?? health?.memory?.native_host?.slots)
+  if (Number.isInteger(live) && live > 0 && rustKernelProcessUp(health)) return live !== expected
+  const n = Number(readExistingKernelConfig(configPath).slots_per_worker)
+  return Number.isFinite(n) && n !== expected
+}
+
+/**
+ * Watchdog convergence: true when the running kernel needs a reload for its
+ * slot count. When it already runs `expected` but the file holds another
+ * count (an older release or a hand edit), only the file is rewritten so a
+ * later crash restart reads the right count; that needs no reload.
+ */
+export function kernelSlotsConverge(configPath, health, expected) {
+  if (kernelSlotsDiffer(configPath, health, expected)) return true
+  syncKernelSlotCount(configPath, expected)
+  return false
 }
 
 /** The cc dataplane runs cc-node. CRAG always runs native Claude. */
@@ -736,10 +783,18 @@ async function startRustKernel(
   const existing = await rustKernelHealth(exec, { timeoutMs: healthTimeoutMs })
   if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
   const staleWrap = wrapNewerThanKernel(exec)
-  const slotMismatch =
-    !!paths.configPath && Number(readExistingKernelConfig(paths.configPath).slots_per_worker) !== WRAP_SLOT_MAX
+  const expectedSlots = expectedKernelSlots(exec)
+  const slotMismatch = !!paths.configPath && kernelSlotsDiffer(paths.configPath, existing, expectedSlots)
   const occupied = rustKernelBusy(existing) || wrapHopInflight(exec) > 0
   const host = slotHost(exec?.vm)
+  // A slot-count change is config convergence: never kill live sessions for it.
+  // Write the file now and let the idle reload pick it up.
+  if (slotMismatch && occupied && !force && !staleWrap && !prepareGuestAppArmor && !allowMissingCredential) {
+    syncKernelSlotCount(paths.configPath, expectedSlots)
+    requestKernelReloadWhenIdle(exec)
+    const reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
+    return { ok: true, reason: 'busy', slot_reload: 'pending', health: existing, reconcile }
+  }
   // Credential rotation is read by the live kernel/CLI; it is not a lifecycle change.
   if (!allowMissingCredential && !force && !prepareGuestAppArmor && occupied && !staleWrap && !slotMismatch) {
     const reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
@@ -756,7 +811,7 @@ async function startRustKernel(
     return { ok: true, reason: 'already_up', health: existing, reconcile }
   }
   if (!paths.configPath || !fs.existsSync(paths.configPath)) return { ok: false, reason: 'config_missing' }
-  syncKernelSlotCount(paths.configPath)
+  syncKernelSlotCount(paths.configPath, expectedSlots)
   try {
     await host.syncRun(exec.vm, path.dirname(paths.runDir))
   } catch (error) {

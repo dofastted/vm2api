@@ -233,16 +233,134 @@ function readOnlySummaryResults(messages) {
   return out
 }
 
+const SYSTEM_REMINDER_OPEN = '<system-reminder>'
+
+function contentBlocks(content) {
+  if (typeof content === 'string') return content ? [{ type: 'text', text: content }] : []
+  return Array.isArray(content) ? content : []
+}
+
+function reminderBlocks(message) {
+  const out = []
+  for (const block of contentBlocks(message?.content)) {
+    const text = textOf(block)
+    if (!text.trim()) continue
+    const wrapped = text.trimStart().startsWith(SYSTEM_REMINDER_OPEN)
+      ? text
+      : `${SYSTEM_REMINDER_OPEN}\n${text}\n</system-reminder>`
+    const part = { type: 'text', text: wrapped }
+    if (block && typeof block === 'object' && block.cache_control != null) part.cache_control = block.cache_control
+    out.push(part)
+  }
+  return out
+}
+
+function isEmptyText(block) {
+  return block && typeof block === 'object' && block.type === 'text' && block.text === ''
+}
+
+/** Leading tool_result blocks must stay first in a user turn. */
+function prependAfterToolResults(blocks, extra) {
+  let index = 0
+  while (blocks[index]?.type === 'tool_result') index += 1
+  return [...blocks.slice(0, index), ...extra, ...blocks.slice(index)]
+}
+
+/**
+ * Claude Code adds `role: "system"` turns to the history (environment
+ * updates, token counters, task notifications), usually one more per turn.
+ * The CRAG worker replays history through `--resume`, and a history that
+ * carries these turns is cached only up to tools + system on every request:
+ * the whole conversation is written again each turn. Folding each one into
+ * the adjacent user turn as a <system-reminder> keeps every earlier turn
+ * byte-stable, so the previous turn's breakpoint is found again.
+ *
+ * A system turn joins the user turn before it; one that follows an assistant
+ * turn joins the next user turn instead (after its tool_result blocks). Turns
+ * with no user turn to join keep their original shape.
+ */
+export function foldHistorySystemMessages(messages) {
+  if (!Array.isArray(messages) || !messages.some((message) => message?.role === 'system')) return messages
+  const out = []
+  let pending = []
+  let pendingSource = []
+  for (const message of messages) {
+    if (
+      message?.role === 'system' &&
+      !contentBlocks(message.content).every((block) => textOf(block) || isEmptyText(block))
+    ) {
+      // Media or other structured system content has no reminder form; keep it as sent.
+      out.push(...pendingSource, message)
+      pending = []
+      pendingSource = []
+      continue
+    }
+    if (message?.role === 'system') {
+      const blocks = reminderBlocks(message)
+      const previous = out.at(-1)
+      if (!pending.length && previous?.role === 'user') {
+        if (blocks.length)
+          out[out.length - 1] = { ...previous, content: [...contentBlocks(previous.content), ...blocks] }
+      } else {
+        pending = pending.concat(blocks)
+        pendingSource.push(message)
+      }
+      continue
+    }
+    if (pendingSource.length) {
+      if (message?.role === 'user') {
+        const merged = prependAfterToolResults(contentBlocks(message.content), pending)
+        out.push({ ...message, content: merged })
+        pending = []
+        pendingSource = []
+        continue
+      }
+      out.push(...pendingSource)
+      pending = []
+      pendingSource = []
+    }
+    out.push(message)
+  }
+  out.push(...pendingSource)
+  return out
+}
+
+/**
+ * An agent_summary fork ends with its instruction followed by token-budget
+ * system turns; the summary is recognized by that instruction being the last
+ * user text. Fold the shared history (so it matches the parent's prefix) but
+ * leave the trailing system run where the fork sent it.
+ */
+function foldSummaryHistorySystemMessages(messages) {
+  if (!Array.isArray(messages)) return messages
+  let end = messages.length
+  while (end > 0 && messages[end - 1]?.role === 'system') end -= 1
+  if (end === messages.length) return foldHistorySystemMessages(messages)
+  const head = messages.slice(0, end)
+  const folded = foldHistorySystemMessages(head)
+  return folded === head ? messages : [...folded, ...messages.slice(end)]
+}
+
 /**
  * @param {object} body caller body, before cli-node persona injection
- * @param {{ preset?: 'official_full' | 'zero', officialPassthrough?: boolean, capabilities?: string[], agentSummary?: boolean }} [options]
+ * @param {{ preset?: 'official_full' | 'zero', officialPassthrough?: boolean, capabilities?: string[], agentSummary?: boolean, foldSystemMessages?: boolean }} [options]
  */
 export function prepareCragPrintBody(
   body,
-  { preset = 'official_full', officialPassthrough = false, capabilities, agentSummary = false } = {},
+  {
+    preset = 'official_full',
+    officialPassthrough = false,
+    capabilities,
+    agentSummary = false,
+    foldSystemMessages = true,
+  } = {},
 ) {
   const out = { ...(body || {}) }
   if (agentSummary) out.messages = readOnlySummaryResults(out.messages)
+  if (foldSystemMessages)
+    out.messages = agentSummary
+      ? foldSummaryHistorySystemMessages(out.messages)
+      : foldHistorySystemMessages(out.messages)
   const mode = preset === 'zero' ? 'replace' : 'append'
   delete out.system
   stripCallerPromptAlias(out)

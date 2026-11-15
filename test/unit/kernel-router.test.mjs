@@ -37,6 +37,8 @@ import {
   beginWrapHop,
   endWrapHop,
   requestKernelReloadWhenIdle,
+  kernelSlotsDiffer,
+  kernelSlotsConverge,
 } from '../../src/lib/transport/rust-kernel-supervisor.mjs'
 import { rustKernelPaths, isNeedsRefreshResult } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
@@ -47,6 +49,11 @@ import { socksUidFor } from '../../src/lib/vm/vm-runtime.mjs'
 import { REMOTE_CRAG_ENTRY } from '../../src/lib/vm/slot-engine.mjs'
 import { kvmCragAppArmorCommand } from '../../src/lib/vm/kvm-crag-apparmor.mjs'
 import { activateFixture, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
+import { configureSlotCapacity } from '../../src/lib/vm/slot-capacity.mjs'
+
+// These tests cover other behaviour on the legacy fixed 20 native slots;
+// plan-based capacity has its own tests (slot-capacity*.test.mjs).
+configureSlotCapacity({ enabled: false })
 
 const unix = process.platform !== 'win32'
 const unixTest = unix ? test : test.skip
@@ -2112,6 +2119,77 @@ unixTest('Rust supervisor does not recycle a busy CLI with ready_slots=0', async
     assert.equal(ready.reason, 'busy')
     assert.equal(restarts, 0)
   } finally {
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('kernel slot count compares the live count before the file', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-slot-count-'))
+  const file = path.join(root, 'kernel.json')
+  fs.writeFileSync(file, JSON.stringify({ slots_per_worker: 10, dataplane: 'crag' }))
+  const crag = { ok: true, engine: 'rust', healthy: true, capacity: 20, cli_pid: 1 }
+  // The file is already rewritten while the old process still runs 20: a reload is owed.
+  assert.equal(kernelSlotsDiffer(file, crag, 10), true)
+  assert.equal(kernelSlotsDiffer(file, { ...crag, capacity: 10 }, 10), false)
+  // The wrap dataplane reports its count under memory.native_host.slots.
+  const wrap = { ok: true, engine: 'rust', healthy: true, cli_pid: 86, memory: { native_host: { slots: 20 } } }
+  assert.equal(kernelSlotsDiffer(file, wrap, 10), true)
+  assert.equal(kernelSlotsDiffer(file, wrap, 20), false)
+  // No live count: the file decides.
+  assert.equal(kernelSlotsDiffer(file, null, 10), false)
+  assert.equal(kernelSlotsDiffer(file, null, 20), true)
+  // Live count already right, file stale: rewrite the file, no reload.
+  assert.equal(kernelSlotsConverge(file, crag, 20), false)
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { slots_per_worker: 20, dataplane: 'crag' })
+  assert.equal(kernelSlotsConverge(file, { ...crag, capacity: 10 }, 20), true)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+unixTest('Rust supervisor does not restart a busy kernel to change its slot count', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-slots-busy-'))
+  const written = writeKernelConfig(root, { id: 'vm-slots' }, { token: 'tok', proxyUrl: '', proxyRequired: false })
+  const exec = {
+    vmId: 'vm-slots',
+    homeDir: path.join(root, 'vms', 'vm-slots', 'cli-home'),
+    vm: { id: 'vm-slots', runtime: { container: 'kin-slots', kernel_socket: written.socketPath } },
+  }
+  const configPath = rustKernelPaths(exec).configPath
+  // Another count left in the file; the running kernel still serves sessions with it.
+  const doc = JSON.parse(fs.readFileSync(configPath, 'utf8'))
+  fs.writeFileSync(configPath, JSON.stringify({ ...doc, slots_per_worker: 10 }))
+  let restarts = 0
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(
+      JSON.stringify({
+        ok: true,
+        engine: 'rust',
+        ready_slots: 0,
+        capacity: 10,
+        cli_pid: 4412,
+        worker_version: 'fixture',
+      }),
+    )
+  })
+  const runDockerExec = async (args) => {
+    if (args[0] === 'inspect') return kernelInspectResult()
+    if (args[0] === 'restart') restarts += 1
+    return { ok: true }
+  }
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(written.socketPath, resolve)
+  })
+  try {
+    const ready = await ensureRustKernel(exec, { timeoutMs: 8000, runDockerExec })
+    assert.equal(ready.ok, true, JSON.stringify(ready))
+    assert.equal(ready.reason, 'busy')
+    assert.equal(ready.slot_reload, 'pending')
+    assert.equal(restarts, 0, 'live sessions are not killed for a slot-count change')
+    assert.equal(JSON.parse(fs.readFileSync(configPath, 'utf8')).slots_per_worker, WRAP_SLOT_MAX)
+  } finally {
+    resetWrapRecycleState()
     await new Promise((resolve) => server.close(resolve))
     fs.rmSync(root, { recursive: true, force: true })
   }

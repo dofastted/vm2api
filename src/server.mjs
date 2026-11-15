@@ -27,6 +27,8 @@ import {
   normalizeCredentialRefreshConfig,
 } from './lib/oauth/credential-refresh-monitor.mjs'
 import { createKernelWatchdog, normalizeKernelWatchdogConfig } from './lib/transport/kernel-watchdog.mjs'
+import { createSlotCapacityReconciler } from './lib/vm/slot-capacity-reconciler.mjs'
+import { configureSlotCapacity } from './lib/vm/slot-capacity.mjs'
 import { ensureSlotSubscriptionType } from './lib/oauth/oauth-credentials.mjs'
 import { ensureRemoteOfficialCredentialLink } from './lib/cluster/remote-slot-files.mjs'
 import { createCliNodeGuard } from './lib/vm/cli-node-guard.mjs'
@@ -85,6 +87,7 @@ import { initVmDbSync, stopVmWatch } from './lib/vm/vm-db-sync.mjs'
 import { BackupService } from './lib/admin/backup-service.mjs'
 import { ClusterNodesRepo } from './lib/db/repos/cluster-nodes-repo.mjs'
 import { ClusterManager } from './lib/cluster/cluster-manager.mjs'
+import { createHostMemoryPressure, installHostMemoryPressure } from './lib/cluster/host-memory-pressure.mjs'
 import { createClusterRoutes } from './lib/cluster/cluster-routes.mjs'
 import { bindPlacement, nodeImageBuildRunning } from './lib/cluster/placement.mjs'
 import { ClusterError } from './lib/cluster/ssh-link.mjs'
@@ -528,6 +531,25 @@ kernelWatchdog = createKernelWatchdog({
   healBridges: createSlotBridgeHealer({ projectRoot: cfg.paths.project }),
 })
 
+configureSlotCapacity(routingConfig.slot_capacity)
+const slotCapacityReconciler = createSlotCapacityReconciler({
+  projectRoot: cfg.paths.project,
+  listTargets: () => listVms(cfg.paths.project),
+  getRouting: () => routingConfig,
+  // Every cluster node gets a host budget from its 30s health probe (MemTotal / MemAvailable).
+  nodeMemory: (id) => {
+    try {
+      const health = clusterManager.get(id)?.health
+      const total = Number(health?.host?.mem_total)
+      const used = Number(health?.host?.mem_used)
+      if (!(total > 0) || !Number.isFinite(used)) return null
+      return { totalBytes: total, availableBytes: Math.max(0, total - used), at: Date.parse(health.checked_at) || 0 }
+    } catch {
+      return null
+    }
+  },
+})
+
 usageProbeMonitor = createUsageProbeMonitor({
   config: routingConfig.usage_probe,
   listTargets: () => listVms(cfg.paths.project),
@@ -612,6 +634,7 @@ backupService.onRestored((db) => {
   healthMonitor?.setConfig(routingConfig.health_probe)
   credentialRefreshMonitor?.setConfig(normalizeCredentialRefreshConfig(routingConfig.credential_refresh))
   kernelWatchdog?.setConfig(normalizeKernelWatchdogConfig(routingConfig.kernel_watchdog))
+  configureSlotCapacity(routingConfig.slot_capacity)
   usageProbeMonitor?.setConfig(routingConfig.usage_probe)
   notifyMonitor?.setConfig(routingConfig.notify)
 
@@ -956,6 +979,15 @@ bindPlacement({ manager: clusterManager, projectRoot: cfg.paths.project })
 await startNodeEgressSocks({ clientFor: (nodeId) => clusterManager.client(nodeId) })
 clusterManager.start()
 clusterManager.restoreSlotRelays()
+// Live memory pressure per machine: new conversations avoid hosts low on MemAvailable (overcommit guard).
+const hostMemoryPressure = installHostMemoryPressure(
+  createHostMemoryPressure({
+    getConfig: () => routingConfig.host_memory_pressure,
+    listNodes: () => clusterManager.list().map((node) => node.id),
+    readNode: (id) => clusterManager.nodeHostMemory(id),
+  }),
+)
+hostMemoryPressure.start()
 syncNodeLocalEgress()
 if (proxyPool.snapshot().config.ipv6_enabled !== true) {
   const exits = await syncIpv6ProxyEgress(cfg.paths.project, proxyPool)
@@ -1128,6 +1160,10 @@ const gracefulShutdown = createGracefulShutdown({
     } catch {}
     try {
       kernelWatchdog?.stop?.()
+      slotCapacityReconciler.stop()
+    } catch {}
+    try {
+      hostMemoryPressure?.stop?.()
     } catch {}
     try {
       cliNodeGuard?.stop?.()
@@ -1473,7 +1509,15 @@ server.listen(cfg.port, cfg.host, () => {
     console.warn('[credential-refresh] start failed', e?.message || e)
   }
   try {
-    kernelWatchdog?.start?.({ immediate: true })
+    // Size slots before the watchdog compares kernel slot counts: otherwise a slot
+    // still recorded at its old small limits is reloaded down, then up again.
+    slotCapacityReconciler
+      .tick()
+      .catch(() => {})
+      .finally(() => {
+        slotCapacityReconciler.start()
+        kernelWatchdog?.start?.({ immediate: true })
+      })
   } catch (e) {
     console.warn('[kernel-watchdog] start failed', e?.message || e)
   }

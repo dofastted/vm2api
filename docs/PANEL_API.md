@@ -90,7 +90,7 @@
 | GET/PUT | `/vms/:id/seed-settings` | 播种；面板默认锁定，解锁后改、播种前确认。`settings.json` 可编辑 env（经 `extra_env`）与 `theme`；`autoUpdates`/`grove_enabled` 与 TZ/LANG/LC_ALL、telemetry/bedrock/vertex 等契约 env 只读展示，TZ/LANG 经 PUT `timezone` / `timezone_follow_proxy` / `locale` 写入槽位后再播种，不经 `extra_env`；`claude_setting` 可编辑。`GET ?debug=1` 额外返回 `telemetry_log`（最近 40 行脱敏上传审计，默认不带） |
 | POST | `/vms/:id/collect-identity` | guest 采集（locale/tz/`guest_machine_id`、槽内 `/etc/os-release` 的 `VERSION_ID`、系统与架构）；Codex Analytics 只使用这次采集的运行环境 |
 | POST | `/vms/:id/reload` | 重载该槽 worker |
-| GET | `/kernels` | 仅 admin/master。返回两种产品 `kernels`（`cli-node` 默认免费、`crag` 签名加密 V2）、本地包的就绪状态、按 VM 的公开 `licenses` 与 `installations`。CRAG 的 `release_options` 提供 3.0.8 标准版和 3.0.8 旧离线授权兼容版的完整发行标签，`payload_tag` 标识已下载或已安装的实际包（仅在可识别时返回）。不初始化身份，不返回机器码、注册码或私钥 |
+| GET | `/kernels` | 仅 admin/master。返回两种产品 `kernels`（`cli-node` 默认免费、`crag` 签名加密 V2）、本地包的就绪状态、按 VM 的公开 `licenses` 与 `installations`。CRAG 的 `release_options` 提供 3.0.9 标准版和 3.0.9 旧离线授权兼容版的完整发行标签，`payload_tag` 标识已下载或已安装的实际包（仅在可识别时返回）。不初始化身份，不返回机器码、注册码或私钥 |
 | GET | `/kernels/releases` | 返回近期具备完整附件的公开版本。`cli-node` 使用应用标签 `vX.Y.Z`，`crag` 使用完整载荷标签，同版本不同载荷分别列出 |
 | POST | `/kernels/pull` | `{ kernel: "cli-node" \| "crag", tag?: string }`。只更新安装包缓存，不安装、不停 VM。cli-node 接受 `vX.Y.Z`；CRAG 另接受完整 `payload-YYYY.MM.DD-crag-X.Y.Z[-legacy]` 标签。省略 `tag` 拉取最新，CRAG 默认和普通版本号不匹配 `-legacy`。返回 `release.payload_tag`；已固定的 CRAG 包另校验归档 SHA-256，拉取失败保留当前包 |
 | POST | `/kernels/install` | `{ targets: [{ id, kernel: "cli-node" \| "crag", expected_tag?, payload_tag? }] }`。`expected_tag` 是确认时的 `vX.Y.Z`，CRAG 的 `payload_tag` 是确认时的完整载荷标签。缓存不符时拒绝重装。先验证包与授权，再排空、重装和重启，健康检查通过后恢复调度；逐槽报告实际 `version` / `payload_tag` |
@@ -335,6 +335,8 @@ Analytics 按官方 [`codex_thread_initialized`](https://github.com/openai/codex
 `compatibility.persona_preset`（`official` / `official_full` / `zero` / `custom`）和 `compatibility.cache_ttl`（`5m` / `1h`）保存后投影到每个 Claude 槽的 `vms/<id>/run/kernel.json`：`persona_preset`、`system_layout`（`zero`→`zero`，其余→`identity`）、`default_cache_ttl`。响应 `kernel_persona.updated` 是本次字节有变化的槽数。`PATCH /vms/:id` 的 `timezone` / `timezone_follow_proxy` 另把 `timezone` 热写进该槽 `kernel.json`，`timezone_sync.kernel_hot` 表示文件有变化。容器 `TZ` 不在这次写入里。Codex 槽不写。
 
 `compatibility.crag_persona_preset`（`official_full` / `zero`，缺省 `official_full`）只给 CRAG v2 print 清洗，不投影进 `kernel.json`。v2 worker 不读 `persona_preset` 或 `CLAUDE_CODE_SYSTEM_LAYOUT`。`official_full` 只 append 调用方尾巴；`zero` 送 `crag_prompt.mode=replace`。其它值保存时 400。槽位显式 `zero` 覆盖该档；其它槽位人设在 print 上收成 append。这不是 TUI：不关内置工具，也不加 `--no-chrome`。
+
+`compatibility.crag_fold_history_system`（缺省开，写 `false` 关闭）：CRAG print 前把历史里的 `role: "system"` 消息改成 `<system-reminder>` 文本，并入前一条 user 消息（前一条是 assistant 时并入下一条 user，放在 tool_result 之后）；带图片等非文本内容的、找不到 user 可并的保持原样。Claude Code 几乎每轮都追加一条这类消息，不折叠时 CRAG `--resume` 重放出的请求每轮只命中 tools + system，整段对话按 1h 重写。
 
 `compatibility.cc_entrypoint`（`cli` / `sdk-cli`，缺省 `cli`）：OAuth 请求的 Node 协议清洗与 worker envelope 每次读取当前配置，UA 入口覆盖槽位身份中旧的 `sdk-cli` / `cli`，版本仍由槽位身份 / 代码 pin 提供。网关生成的 billing 使用同一入口，调用方已有 billing 不改写；Setup Token / API Key 的 inference-only UA 不变。保存同时投影到 Claude 槽的 `kernel.json.cc_entrypoint`，由支持该字段的 cli-node 在下次请求生成最终 UA；不需要为此次 Node 修复重建 CLI。
 

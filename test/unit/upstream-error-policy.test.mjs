@@ -252,6 +252,24 @@ test('incomplete 502 is an empty hop, not account overload', () => {
   assert.equal(policy.retrySameAccount, true)
 })
 
+test('a dead native Claude process fails over without a cooldown or circuit', () => {
+  // crag-v2 answers 502 when the VM's Claude process dies before replying,
+  // e.g. killed by the container's memory or pids limit. The account is fine.
+  for (const error of [
+    { type: 'process_error', message: 'Claude process exited (None): Claude native process exited with code None' },
+    { type: 'api_error', message: 'Claude process exited (Some(1)): Claude native process exited with code Some(1)' },
+  ]) {
+    const policy = classifyUpstreamResult({ status: 502, body: { type: 'error', error } }, { now: 1000 })
+    assert.equal(policy.action, 'continue', error.type)
+    assert.equal(policy.reason, 'worker_process_exit')
+    assert.equal(policy.scope, 'worker')
+    assert.equal(policy.cooldownUntil, null)
+    assert.notEqual(policy.circuit, true)
+    assert.equal(policy.retrySameAccount, false)
+    assert.equal(shouldContinue(policy), true)
+  }
+})
+
 test('slot_busy 503 does not park the account', () => {
   const policy = classifyUpstreamResult(
     {

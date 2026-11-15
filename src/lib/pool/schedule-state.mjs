@@ -11,6 +11,8 @@
  * `schedule_manual` are derived on every write so older readers keep working.
  */
 
+import { HOST_PRESSURE_CRITICAL, HOST_PRESSURE_TIGHT, hostMemoryLevelForVm } from '../cluster/host-memory-pressure.mjs'
+
 export const SCHEDULE_STATES = Object.freeze(['on', 'off', 'unschedulable', 'restricted'])
 
 /** Deterministic failures. Text is the panel label after 「不可调度 ·」. */
@@ -79,6 +81,9 @@ const RESTRICTED_NEW_SESSION = [
   { match: /^gate_(5h|7d)_draining$/, text: '临近闸线', soft: true },
   { match: /^seats_full$/, text: '席位满', soft: false },
   { match: /^sessions_full$/, text: '对话窗口满', soft: false },
+  // Machine memory (host-memory-pressure.mjs): tight still takes new conversations when no machine has room.
+  { match: /^host_memory_tight$/, text: '主机内存紧张', soft: true },
+  { match: /^host_memory_critical$/, text: '主机内存告急', soft: false },
 ]
 
 /**
@@ -93,7 +98,7 @@ const STATELESS = [
   /^(concurrency_limit|concurrency_disabled|rpm_limit|slot_busy|quota_band_inflight|refresh_pending)$/,
   /^(model_cooldown|fable_cooldown|fable_concurrency|fable_timeout|fable_plan_denied|fable_rate_limited|fable_requires_max|model_not_allowed|platform_mismatch|codex_vm)$/,
   /^(quota_guard_request_too_large|no_eligible_accounts|pool_overload_cooldown|pool_rate_limited|vm_unschedulable)$/,
-  /^(wrap_connection_error|worker_transport_failure|worker_timeout|upstream_network_error|stream_interrupted|empty_response|incomplete_assistant|downstream_committed_or_incomplete|provider_timeout|client_cancelled|oauth_unconfirmed)$/,
+  /^(wrap_connection_error|worker_transport_failure|worker_timeout|worker_process_exit|upstream_network_error|stream_interrupted|empty_response|incomplete_assistant|downstream_committed_or_incomplete|provider_timeout|client_cancelled|oauth_unconfirmed)$/,
   // Seat placement labels (why this VM was picked), not a slot condition.
   /^sticky$/,
 ]
@@ -151,6 +156,10 @@ export const CLEAR_BY = Object.freeze([
   'proxy_rebind',
   'recover_ok',
   'credential_present',
+  // A stale runtime_start_failed lock while the kernel probes healthy is a
+  // leftover from a start attempt that timed out on a flaky node link — the
+  // container never died. Health is a fact, not a verdict, same as above.
+  'runtime_recovered',
 ])
 
 // ---------------------------------------------------------------------------
@@ -392,5 +401,8 @@ export function resolveSlotState({
   if (sessionMax > 0 && (Number(sessions?.active) || 0) >= sessionMax) {
     return restricted('sessions_full', null, 'new_session')
   }
+  const hostLevel = hostMemoryLevelForVm(vm)
+  if (hostLevel === HOST_PRESSURE_CRITICAL) return restricted('host_memory_critical', null, 'new_session')
+  if (hostLevel === HOST_PRESSURE_TIGHT) return restricted('host_memory_tight', null, 'new_session', true)
   return { ...base, schedule_state: 'on' }
 }

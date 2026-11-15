@@ -4,7 +4,81 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { createKernelWatchdog, isKernelWatchdogTarget } from '../../src/lib/transport/kernel-watchdog.mjs'
-import { kernelFaults } from '../../src/lib/transport/rust-kernel-client.mjs'
+import { kernelFaults, rustKernelPaths } from '../../src/lib/transport/rust-kernel-client.mjs'
+import { configureSlotCapacity } from '../../src/lib/vm/slot-capacity.mjs'
+
+// These tests cover other behaviour on the legacy fixed 20 native slots;
+// plan-based capacity has its own tests (slot-capacity*.test.mjs).
+configureSlotCapacity({ enabled: false })
+
+// A stale runtime_start_failed lock with a now-healthy kernel is a leftover
+// from a start that timed out on a flaky node link; health proves it wrong.
+function staleLockFixture(root, id, lockAgeMs, reason = 'runtime_start_failed') {
+  fs.mkdirSync(path.join(root, 'vms', id, 'cli-home'), { recursive: true })
+  const at = new Date(Date.now() - lockAgeMs).toISOString()
+  const vmFile = path.join(root, 'vms', `${id}.json`)
+  fs.writeFileSync(vmFile, JSON.stringify({ id, status: 'running', schedulable: false, unschedulable: { reason, detail: null, at } }))
+  return vmFile
+}
+
+test('a healthy kernel lifts a stale runtime_start_failed lock', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wd-stalelock-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const vmFile = staleLockFixture(root, 'vm-locked', 11 * 60_000)
+  const wd = createKernelWatchdog({
+    probeVm: (vm) => ({ vmId: vm.id }),
+    health: async () => ({ healthy: true, ok: true, ready_slots: 1, closed_slots: 0 }),
+    listTargets: () => [{ id: 'vm-locked', inference_engine: 'rust', status: 'running', unschedulable: { reason: 'runtime_start_failed', detail: null, at: new Date(Date.now() - 11 * 60_000).toISOString() } }],
+    homeDirFor: () => path.join(root, 'vms', 'vm-locked', 'cli-home'),
+    config: { restart_backoff_sec: [60], restart_window_sec: 3600 },
+  })
+  try {
+    await wd.tick()
+    const after = JSON.parse(fs.readFileSync(vmFile, 'utf8'))
+    assert.equal(after.unschedulable, undefined)
+    assert.equal(after.schedulable, true)
+  } finally {
+    wd.stop?.()
+  }
+})
+
+test('a fresh runtime_start_failed lock is left alone (start may still be in flight)', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wd-stalelock-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const vmFile = staleLockFixture(root, 'vm-fresh', 2 * 60_000)
+  const wd = createKernelWatchdog({
+    probeVm: (vm) => ({ vmId: vm.id }),
+    health: async () => ({ healthy: true, ok: true, ready_slots: 1, closed_slots: 0 }),
+    listTargets: () => [{ id: 'vm-fresh', inference_engine: 'rust', status: 'running', unschedulable: { reason: 'runtime_start_failed', at: new Date(Date.now() - 2 * 60_000).toISOString() } }],
+    homeDirFor: () => path.join(root, 'vms', 'vm-fresh', 'cli-home'),
+    config: { restart_backoff_sec: [60], restart_window_sec: 3600 },
+  })
+  try {
+    await wd.tick()
+    assert.equal(JSON.parse(fs.readFileSync(vmFile, 'utf8')).unschedulable?.reason, 'runtime_start_failed')
+  } finally {
+    wd.stop?.()
+  }
+})
+
+test('a healthy kernel never lifts locks it does not own (no_credential)', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wd-stalelock-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const vmFile = staleLockFixture(root, 'vm-ticket', 11 * 60_000, 'no_credential')
+  const wd = createKernelWatchdog({
+    probeVm: (vm) => ({ vmId: vm.id }),
+    health: async () => ({ healthy: true, ok: true, ready_slots: 1, closed_slots: 0 }),
+    listTargets: () => [{ id: 'vm-ticket', inference_engine: 'rust', status: 'running', unschedulable: { reason: 'no_credential', at: new Date(Date.now() - 11 * 60_000).toISOString() } }],
+    homeDirFor: () => path.join(root, 'vms', 'vm-ticket', 'cli-home'),
+    config: { restart_backoff_sec: [60], restart_window_sec: 3600 },
+  })
+  try {
+    await wd.tick()
+    assert.equal(JSON.parse(fs.readFileSync(vmFile, 'utf8')).unschedulable?.reason, 'no_credential')
+  } finally {
+    wd.stop?.()
+  }
+})
 
 test('watchdog targets inherited rust; stored go is rust; skips Codex and stopped', () => {
   const rustRouting = { inference: { engine: 'rust' } }
@@ -437,4 +511,37 @@ test('hold waits for a restart already in flight, and the boot after it is skipp
   await drained
   await ticking
   assert.deepEqual(actions, ['ensure:start', 'ensure:end'], 'no boot once the slot is held')
+})
+
+test('watchdog reloads a kernel only when its live slot count is off; a stale file is just rewritten', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wd-slots-'))
+  const homeDirFor = (vm) => path.join(root, 'vms', vm.id, 'cli-home')
+  const configOf = (id) => rustKernelPaths({ vmId: id, homeDir: homeDirFor({ id }), vm: { id } }).configPath
+  const capacity = { 'vm-file': 20, 'vm-live': 10 }
+  const files = { 'vm-file': 10, 'vm-live': 20 }
+  for (const [id, n] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(configOf(id)), { recursive: true })
+    fs.writeFileSync(configOf(id), JSON.stringify({ slots_per_worker: n }))
+  }
+  const ensured = []
+  const wd = createKernelWatchdog({
+    observeRuntime: async () => ({ state: 'running' }),
+    listTargets: () => [
+      { id: 'vm-file', inference_engine: 'rust' },
+      { id: 'vm-live', inference_engine: 'rust' },
+    ],
+    homeDirFor,
+    health: async (exec) => ({ ok: true, healthy: true, ready_slots: 1, cli_pid: 1, capacity: capacity[exec.vmId] }),
+    ensure: async (exec) => {
+      ensured.push(exec.vmId)
+      return { ok: true }
+    },
+  })
+  try {
+    await wd.tick()
+    assert.deepEqual(ensured, ['vm-live'], 'only the kernel running another count is reloaded')
+    assert.equal(JSON.parse(fs.readFileSync(configOf('vm-file'), 'utf8')).slots_per_worker, 20)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
