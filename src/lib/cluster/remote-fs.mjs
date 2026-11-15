@@ -153,10 +153,21 @@ export async function readRemoteFileNoFollow(client, file, { maxBytes = 1 << 20 
 
 /** Symlink ownership is never checked by the kernel, so root-created links are fine. */
 export async function remoteSymlink(sftp, target, linkPath) {
-  await call((cb) => sftp.unlink(linkPath, cb)).catch(() => {})
+  const tmp = `${linkPath}.${crypto.randomUUID()}.tmp`
+  let created = false
   try {
-    await call((cb) => sftp.symlink(target, linkPath, cb))
+    let stat
+    try {
+      stat = await call((cb) => sftp.lstat(linkPath, cb))
+    } catch (err) {
+      if (err.code !== 2) throw err
+    }
+    if (stat?.isSymbolicLink() && (await call((cb) => sftp.readlink(linkPath, cb))) === target) return
+    await call((cb) => sftp.symlink(target, tmp, cb))
+    created = true
+    await call((cb) => sftp.ext_openssh_rename(tmp, linkPath, cb))
   } catch (err) {
+    if (created) await call((cb) => sftp.unlink(tmp, cb)).catch(() => {})
     throw sftpError(err, `创建链接 ${linkPath} 失败`)
   }
 }
