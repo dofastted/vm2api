@@ -15,25 +15,72 @@ import {
   WRAP_KERNEL_BIN,
   wrapKernelWrapperScript,
 } from '../vm/wrap-cli-runtime.mjs'
+import { isReleaseTag } from './release.mjs'
 import {
   CRAG_V2_RELEASE_ASSET,
   fetchKernelReleaseMetadata,
+  isCragPayloadTag,
   openKernelReleaseAsset,
-  selectReleaseAsset,
+  selectCragV2Asset,
   selectKernelAsset,
   selectCliNodeAsset,
   MAX_KERNEL_DOWNLOAD_BYTES,
   MAX_CLI_NODE_DOWNLOAD_BYTES,
+  MAX_CRAG_V2_DOWNLOAD_BYTES,
 } from './release-kernel.mjs'
 
-const MAX_ARCHIVE = 512 * 1024 * 1024
+const MAX_ARCHIVE = MAX_CRAG_V2_DOWNLOAD_BYTES
 const MAX_EXPANDED = 768 * 1024 * 1024
 const MAX_MEMBERS = 64
 const verificationCache = new Map()
+const installingCaches = new Set()
 const coded = (code, message) => Object.assign(new Error(message), { code })
 const baseFor = (root, kernel) =>
   kernel === 'crag' ? path.join(root, 'share/crag/kernels/v2') : path.join(root, 'share/wrap-cli-releases')
 const archFor = (kernel) => (kernel === 'crag' ? cragV2Arch() : 'amd64')
+const CRAG_305_RELEASES = [
+  {
+    tag: 'payload-2026.11.15-crag-3.0.5',
+    label: '3.0.5 新版',
+    size: 168090914,
+    manifestSha256: 'ec9b706591e9e147059e1be5f689f6ae59ee1e630f97fef07169f53133fba917',
+    sha256: '428b07b65586480473b3f5ebf1fe0a6c3c1444d1a45c611faad40737d22b818a',
+  },
+  {
+    tag: 'payload-2026.11.15-crag-3.0.5-legacy',
+    label: '3.0.5 旧离线授权兼容版',
+    size: 167961689,
+    manifestSha256: '3677550ac1a2f24ee44e52a004b2092a7ed36e22c2d0e41e38c326e304f4dd34',
+    sha256: '547347000e8597a05bb3917a966b4f4c5bfcc5a9cc0a408565ffccc6077d35f0',
+  },
+]
+
+export function reserveKernelInstallCache(projectRoot, kernel) {
+  const key = path.resolve(baseFor(projectRoot, kernel))
+  if (installingCaches.has(key)) return null
+  installingCaches.add(key)
+  return () => installingCaches.delete(key)
+}
+
+function ensureKernelCacheNotInstalling(base) {
+  if (installingCaches.has(path.resolve(base))) throw coded('kernel_pull_busy', '正在重装内核，安装包缓存未更改')
+}
+
+function acquireKernelCacheLock(projectRoot, kernel) {
+  const base = baseFor(projectRoot, kernel)
+  ensureKernelCacheNotInstalling(base)
+  const lock = path.join(base, '.pull-lock')
+  try {
+    fs.mkdirSync(base, { recursive: true })
+    fs.mkdirSync(lock, { mode: 0o700 })
+    return lock
+  } catch (error) {
+    throw coded(
+      error.code === 'EEXIST' ? 'kernel_pull_busy' : 'kernel_cache_unwritable',
+      '内核缓存忙或不可写，请稍后重试',
+    )
+  }
+}
 
 function jsonFile(file, max = 64 * 1024) {
   const st = fs.lstatSync(file)
@@ -99,7 +146,10 @@ function publicProduct(id, ready, meta = {}, code) {
     paid: id === 'crag',
     ready,
     version,
+    ...(isReleaseTag(meta.tag) ? { release_tag: meta.tag } : {}),
     updated_at: updated,
+    ...(id === 'crag' ? { release_options: CRAG_305_RELEASES.map(({ tag, label }) => ({ tag, label })) } : {}),
+    ...(isCragPayloadTag(meta.payload_tag) ? { payload_tag: meta.payload_tag } : {}),
     ...(!ready
       ? {
           code,
@@ -119,7 +169,12 @@ function selectedReleaseInfo(projectRoot, kernel, root) {
     const base = baseFor(projectRoot, kernel)
     const pointer = jsonFile(path.join(base, `current-${archFor(kernel)}.json`), 4096)
     if (path.join(base, pointer.package) !== root) return {}
-    return { version: pointer.release?.version, updated_at: pointer.updated_at }
+    return {
+      tag: pointer.release?.tag,
+      version: pointer.release?.version,
+      updated_at: pointer.updated_at,
+      payload_tag: pointer.release?.payload_tag,
+    }
   } catch {
     return {}
   }
@@ -153,12 +208,21 @@ export function describeKernelCatalog(projectRoot) {
   try {
     const root = cragV2PackageRoot(projectRoot)
     const verified = root ? verifiedPackage(root) : { ok: false, code: 'crag_v2_package_missing' }
+    const release = root ? selectedReleaseInfo(projectRoot, 'crag', root) : {}
+    if (verified.ok && !release.payload_tag) {
+      const manifestSha256 = crypto
+        .createHash('sha256')
+        .update(fs.readFileSync(path.join(root, 'manifest.json')))
+        .digest('hex')
+      const known = CRAG_305_RELEASES.find((entry) => entry.manifestSha256 === manifestSha256)
+      if (known) Object.assign(release, { version: '3.0.5', payload_tag: known.tag })
+    }
     crag = publicProduct(
       'crag',
       verified.ok,
       {
         ...(verified.ok ? { version: verified.manifest.version } : {}),
-        ...(root ? selectedReleaseInfo(projectRoot, 'crag', root) : {}),
+        ...release,
       },
       verified.code,
     )
@@ -173,15 +237,20 @@ export function describeKernelCatalog(projectRoot) {
   return [cli, crag]
 }
 
-function limitBytes(max, code, expected = 0) {
+function limitBytes(max, code, expected = 0, sha256 = '') {
   let size = 0
+  const hash = sha256 && crypto.createHash('sha256')
   return new Transform({
     transform(chunk, encoding, done) {
       size += chunk.length
-      done(size > max ? coded(code, '内核下载或解压大小超限') : null, chunk)
+      if (size > max) return done(coded(code, '内核下载或解压大小超限'))
+      if (hash) hash.update(chunk)
+      done(null, chunk)
     },
     flush(done) {
-      done(expected && size !== expected ? coded('kernel_size_mismatch', '内核下载大小不匹配') : null)
+      if (expected && size !== expected) return done(coded('kernel_size_mismatch', '内核下载大小不匹配'))
+      if (hash && hash.digest('hex') !== sha256) return done(coded('crag_v2_digest_mismatch', 'CRAG 发行包摘要不匹配'))
+      done()
     },
   })
 }
@@ -441,16 +510,7 @@ export async function pullKernelRelease(
       fetchImpl,
     })
     const specs =
-      kernel === 'cli-node'
-        ? [selectKernelAsset(payload), selectCliNodeAsset(payload)]
-        : [
-            selectReleaseAsset(payload, {
-              name: CRAG_V2_RELEASE_ASSET,
-              maxBytes: MAX_ARCHIVE,
-              missingCode: 'crag_v2_asset_missing',
-              tooLargeCode: 'crag_v2_too_large',
-            }),
-          ]
+      kernel === 'cli-node' ? [selectKernelAsset(payload), selectCliNodeAsset(payload)] : [selectCragV2Asset(payload)]
     for (const spec of specs) {
       if (!spec.ok) return spec
       if (payload.assets.filter((asset) => asset?.name === spec.asset).length !== 1)
@@ -464,17 +524,7 @@ export async function pullKernelRelease(
       throw coded('kernel_override_active', '已配置显式内核路径，请先移除覆盖配置再拉取')
     const pinned = kernel === 'crag' ? pinnedAuthority(projectRoot) : null
     const base = baseFor(projectRoot, kernel)
-    fs.mkdirSync(base, { recursive: true })
-    lock = path.join(base, '.pull-lock')
-    try {
-      fs.mkdirSync(lock, { mode: 0o700 })
-    } catch (error) {
-      lock = null
-      throw coded(
-        error.code === 'EEXIST' ? 'kernel_pull_busy' : 'kernel_cache_unwritable',
-        '内核缓存忙或不可写，请稍后重试',
-      )
-    }
+    lock = acquireKernelCacheLock(projectRoot, kernel)
     const packages = path.join(base, 'packages')
     fs.mkdirSync(packages, { recursive: true })
     if (fs.lstatSync(packages).isSymbolicLink()) throw coded('kernel_cache_invalid', '内核缓存不能是链接')
@@ -483,6 +533,7 @@ export async function pullKernelRelease(
       tag: payload.tag_name,
       version: specs[0].version,
       asset: kernel === 'crag' ? CRAG_V2_RELEASE_ASSET : 'kin-kernel,cli-node',
+      ...(payload.payload_tag ? { payload_tag: payload.payload_tag } : {}),
     }
     const metadata = { ...release, updated_at: new Date().toISOString() }
     if (kernel === 'cli-node') {
@@ -491,10 +542,12 @@ export async function pullKernelRelease(
       fs.writeFileSync(path.join(stage, 'kin-kernel'), wrapKernelWrapperScript(), { mode: 0o755, flag: 'wx' })
       fs.writeFileSync(path.join(stage, 'RELEASE.json'), JSON.stringify(metadata), { flag: 'wx' })
     } else {
+      const pin = CRAG_305_RELEASES.find((entry) => entry.tag === release.payload_tag)
+      if (pin && specs[0].size !== pin.size) throw coded('kernel_size_mismatch', 'CRAG 发行包大小不匹配')
       const response = await openKernelReleaseAsset(specs[0].url, fetchImpl, CRAG_V2_RELEASE_ASSET)
       await pipeline(
         responseBody(response, MAX_ARCHIVE, 'crag_v2_too_large'),
-        limitBytes(MAX_ARCHIVE, 'crag_v2_too_large', specs[0].size),
+        limitBytes(MAX_ARCHIVE, 'crag_v2_too_large', specs[0].size, pin?.sha256),
         createGunzip(),
         limitBytes(MAX_EXPANDED, 'crag_v2_archive_invalid'),
         new PackageTar(stage),
@@ -505,6 +558,7 @@ export async function pullKernelRelease(
         throw coded('crag_v2_authority_mismatch', 'CRAG 发行公钥与本机可信公钥不匹配')
       }
     }
+    ensureKernelCacheNotInstalling(base)
     makeReadonly(stage)
     const relative = `packages/${archFor(kernel)}-${crypto.randomUUID()}`
     published = path.join(base, relative)
@@ -536,11 +590,17 @@ export async function pullKernelRelease(
     let message = 'CRAG 拉取失败；需官方签名加密发行包'
     if (code === 'crag_v2_authority_missing') message = '缺少可信 CRAG 发行公钥，请先更新到官方镜像或发行版'
     if (code === 'crag_v2_authority_mismatch') message = 'CRAG 发行公钥与本机可信公钥不匹配'
+    if (code === 'github_http_404') message = '所选 CRAG 发行版本未发布或不可用'
+    if (code === 'crag_v2_digest_mismatch' || code === 'kernel_size_mismatch')
+      message = '下载内容与所选 CRAG 发行包不匹配'
     if (timeout) message = 'CRAG 发行包拉取超时'
     return {
       ok: false,
       code,
-      error: `${kernel === 'crag' ? message : 'cli-node 拉取失败'}，原包未更改`,
+      error:
+        code === 'kernel_pull_busy'
+          ? error.message
+          : `${kernel === 'crag' ? message : 'cli-node 拉取失败'}，原包未更改`,
     }
   } finally {
     for (const dir of [stage, published]) {

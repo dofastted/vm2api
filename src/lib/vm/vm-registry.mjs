@@ -99,6 +99,7 @@ export function summarizeVm(vm, projectRoot = null, routing = null) {
       ? {
           kernel: vm.kernel_installation.kernel,
           version: vm.kernel_installation.version ?? null,
+          ...(vm.kernel_installation.payload_tag ? { payload_tag: vm.kernel_installation.payload_tag } : {}),
           installed_at: vm.kernel_installation.installed_at,
         }
       : null,

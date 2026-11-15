@@ -12,10 +12,13 @@ export const CLI_NODE_RELEASE_ASSET = 'cli-node'
 export const CC_NODE_RELEASE_ASSET = 'cc-node'
 export const KERNEL_CRAG_RELEASE_ASSET = 'kin-kernel-crag'
 export const CRAG_V2_RELEASE_ASSET = 'crag-v2-licensed-amd64.tar.gz'
-const CRAG_PAYLOAD_TAG_PATTERN = 'payload-\\d{4}\\.\\d{2}\\.\\d{2}-crag-(\\d+\\.\\d+\\.\\d+)'
+export const MAX_CRAG_V2_DOWNLOAD_BYTES = 512 * 1024 * 1024
+const CRAG_PAYLOAD_TAG_PATTERN = 'payload-\\d{4}\\.\\d{2}\\.\\d{2}-crag-(\\d+\\.\\d+\\.\\d+)(-legacy)?'
 const CRAG_PAYLOAD_TAG = new RegExp(`^${CRAG_PAYLOAD_TAG_PATTERN}$`)
+export const isCragPayloadTag = (tag) => typeof tag === 'string' && CRAG_PAYLOAD_TAG.test(tag)
 const CRAG_RELEASES_PAGE_SIZE = 30
 const CRAG_RELEASES_MAX_PAGES = 10
+const KERNEL_VERSION_LIST_MAX_PAGES = 3
 export const MAX_KERNEL_DOWNLOAD_BYTES = 32 * 1024 * 1024
 export const MAX_CLI_NODE_DOWNLOAD_BYTES = 64 * 1024 * 1024
 export const MAX_CC_NODE_DOWNLOAD_BYTES = MAX_CLI_NODE_DOWNLOAD_BYTES
@@ -101,9 +104,18 @@ export function selectReleaseAsset(payload, { name, maxBytes, missingCode, tooLa
   const apiUrl = typeof asset.url === 'string' ? asset.url : ''
   const browserUrl = typeof asset.browser_download_url === 'string' ? asset.browser_download_url : ''
   const scope = { crag: name === CRAG_V2_RELEASE_ASSET }
-  // GitHub's public asset URL works without a token and always serves bytes.
+  // A component download must belong to the exact published tag, not just the same version.
+  const expected =
+    scope.crag && isCragPayloadTag(payload.payload_tag)
+      ? `https://github.com/${GITHUB_REPO}/releases/download/${payload.payload_tag}/${name}`
+      : ''
   const candidates = scope.crag ? [browserUrl, apiUrl] : [apiUrl, browserUrl]
-  const url = candidates.find((candidate) => isAllowedKernelUrl(candidate, scope))
+  const url =
+    expected && browserUrl !== ''
+      ? browserUrl === expected
+        ? browserUrl
+        : undefined
+      : candidates.find((candidate) => isAllowedKernelUrl(candidate, scope))
   if (!url)
     return {
       ok: false,
@@ -255,29 +267,70 @@ async function fetchReleaseJson(url, fetchImpl, maxBytes = 1024 * 1024) {
   }
 }
 
-async function fetchCragPayloadRelease(releasesUrl, version, fetchImpl) {
-  // CRAG source is private. Only published component payloads are the public distribution channel.
-  for (let page = 1; page <= CRAG_RELEASES_MAX_PAGES; page++) {
+async function* kernelReleasePages(fetchImpl, maxPages) {
+  const releasesUrl = `https://api.github.com/repos/${GITHUB_REPO}/releases`
+  for (let page = 1; page <= maxPages; page++) {
     const rows = await fetchReleaseJson(
       `${releasesUrl}?per_page=${CRAG_RELEASES_PAGE_SIZE}&page=${page}`,
       fetchImpl,
       4 * 1024 * 1024,
     )
     if (!Array.isArray(rows)) throw coded('github_bad_json', 'GitHub Release 列表格式无效')
+    yield rows
+    if (rows.length < CRAG_RELEASES_PAGE_SIZE) return
+  }
+}
+
+export function selectCragV2Asset(payload) {
+  return selectReleaseAsset(payload, {
+    name: CRAG_V2_RELEASE_ASSET,
+    maxBytes: MAX_CRAG_V2_DOWNLOAD_BYTES,
+    missingCode: 'crag_v2_asset_missing',
+    tooLargeCode: 'crag_v2_too_large',
+  })
+}
+
+function hasUniqueAssets(row, specs) {
+  return specs.every((spec) => spec.ok && row.assets.filter((asset) => asset?.name === spec.asset).length === 1)
+}
+
+export async function listKernelReleaseVersions({ fetchImpl = globalThis.fetch } = {}) {
+  const versions = { 'cli-node': new Set(), crag: new Set() }
+  for await (const rows of kernelReleasePages(fetchImpl, KERNEL_VERSION_LIST_MAX_PAGES)) {
+    for (const row of rows) {
+      if (row?.draft !== false || !Array.isArray(row.assets)) continue
+      const component = CRAG_PAYLOAD_TAG.exec(row.tag_name || '')
+      if (component) {
+        const tag = `v${component[1]}`
+        const release = { ...row, tag_name: tag, payload_tag: row.tag_name }
+        if (hasUniqueAssets(release, [selectCragV2Asset(release)])) versions.crag.add(row.tag_name)
+      } else if (
+        row.prerelease === false &&
+        isReleaseTag(row.tag_name) &&
+        hasUniqueAssets(row, [selectKernelAsset(row), selectCliNodeAsset(row)])
+      ) {
+        versions['cli-node'].add(row.tag_name)
+      }
+    }
+  }
+  return { 'cli-node': [...versions['cli-node']], crag: [...versions.crag] }
+}
+
+async function fetchCragPayloadRelease(version, fetchImpl) {
+  // CRAG source is private. Only published component payloads are the public distribution channel.
+  let incomplete
+  for await (const rows of kernelReleasePages(fetchImpl, CRAG_RELEASES_MAX_PAGES)) {
     for (const row of rows) {
       const match = CRAG_PAYLOAD_TAG.exec(row?.tag_name || '')
-      if (!match || row.draft !== false) continue
+      if (!match || match[2] || row.draft !== false) continue
       const tag = `v${match[1]}`
       if (version && version !== tag) continue
-      if (
-        !version &&
-        (!Array.isArray(row.assets) || !row.assets.some((asset) => asset?.name === CRAG_V2_RELEASE_ASSET))
-      )
-        continue
-      return { ...row, tag_name: tag }
+      const release = { ...row, tag_name: tag, payload_tag: row.tag_name }
+      if (hasUniqueAssets(release, [selectCragV2Asset(release)])) return release
+      incomplete ||= release
     }
-    if (rows.length < CRAG_RELEASES_PAGE_SIZE) break
   }
+  if (incomplete) return incomplete
   throw coded('github_http_404', `vm2api 没有发布对应的 CRAG 载荷${version ? ` (${version})` : ''}`)
 }
 
@@ -290,12 +343,21 @@ export async function fetchKernelReleaseMetadata({
   const requested = String(tag || '').trim()
   const configured = kernel === 'crag' ? String(cragReleaseTag || '').trim() : ''
   const trimmed = requested || configured
-  const normalized = trimmed ? normalizeTag(trimmed) : ''
-  if (trimmed && (!normalized || !isReleaseTag(normalized)))
-    throw coded('kernel_tag_invalid', 'Release tag 必须是 vX.Y.Z')
   if (!fetchImpl) throw coded('fetch_unavailable', 'fetch unavailable')
   const releasesUrl = `https://api.github.com/repos/${GITHUB_REPO}/releases`
-  if (kernel === 'crag') return fetchCragPayloadRelease(releasesUrl, normalized, fetchImpl)
+  if (kernel === 'crag' && isCragPayloadTag(trimmed)) {
+    const row = await fetchReleaseJson(`${releasesUrl}/tags/${trimmed}`, fetchImpl, 4 * 1024 * 1024)
+    if (row?.tag_name !== trimmed || row.draft !== false)
+      throw coded('github_http_404', `vm2api 没有发布对应的 CRAG 载荷 (${trimmed})`)
+    return { ...row, tag_name: `v${CRAG_PAYLOAD_TAG.exec(trimmed)[1]}`, payload_tag: trimmed }
+  }
+  const normalized = trimmed ? normalizeTag(trimmed) : ''
+  if (trimmed && (!normalized || !isReleaseTag(normalized)))
+    throw coded(
+      'kernel_tag_invalid',
+      kernel === 'crag' ? '请选择有效的 CRAG 版本或完整载荷标签' : 'Release tag 必须是 vX.Y.Z',
+    )
+  if (kernel === 'crag') return fetchCragPayloadRelease(normalized, fetchImpl)
   const payload = await fetchReleaseJson(`${releasesUrl}/${normalized ? `tags/${normalized}` : 'latest'}`, fetchImpl)
   if (!isReleaseTag(payload?.tag_name) || (normalized && payload.tag_name !== normalized))
     throw coded('kernel_tag_invalid', 'GitHub Release 版本号不匹配')

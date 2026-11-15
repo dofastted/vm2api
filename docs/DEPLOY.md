@@ -42,12 +42,16 @@ CRAG V2 的资产、工作区和设备授权目录分别使用 Linux 私有 run 
 
 ### CRAG V2 二进制更新
 
-CRAG 源码位于独立私有仓库 `dofastted/crag`。vm2api 从自己的公开 `payload-YYYY.MM.DD-crag-X.Y.Z` Release 下载 `crag-v2-licensed-amd64.tar.gz` 签名加密包（包含原版 Claude Code 2.1.321），无需私有仓库凭据。一键 `install` / `upgrade` 及独立 `crag-update` 未指定 `--crag-version` 时选择最新已发布且包含完整包的 CRAG 载荷；显式版本优先。面板默认拉取 `deploy/payload.json` 的 `crag_release` 固定版本。`manifest.version` 的 `v2` 是协议族，实际下载发行版本见缓存指针的 `release.tag`。原生进程使用非 bare 的 CC TUI。
+vm2api 从自己的公开 payload Release 下载 `crag-v2-licensed-amd64.tar.gz` 签名加密包，无需私有供应仓凭据。CRAG 3.0.5 有两个下载选项：`payload-2026.11.15-crag-3.0.5`（新版，已轮换载荷密钥）和 `payload-2026.11.15-crag-3.0.5-legacy`（原始签名包，支持仍有效的旧离线 `CRAGU1`）。在「内核」页选「3.0.5 旧离线授权兼容版」拉取，再对仍有有效旧授权的槽执行重装；拉取本身不影响运行中的槽。两包共用当前下载指针，不代表全局安装或同时为不同槽选定下载源。
+
+WARP 可分别选择 CRAG 和 cli-node 的历史发行版本，默认拉取最新；下载只更新待安装缓存，确认重装后才应用到所选槽。一键 `install` / `upgrade` 和独立 `crag-update` 未指定 `--crag-version` 时也选择最新的标准载荷；普通 `vX.Y.Z` 不选择 `-legacy`。依赖旧离线授权的环境做后续升级时要继续显式指定兼容标签，或者跳过内核同步。`manifest.version` 的 `v2` 是协议族，实际下载发行版见缓存指针的 `release.payload_tag`。
 
 amd64 默认一键安装/升级会自动完成出厂包初始化和最新版获取，不需要先在面板手动拉取。也可在服务器独立更新，不升级或重启控制面：
 
 ```bash
 sudo bash /opt/vm2api/deploy/install.sh crag-update --crag-version v3.0.5
+# 原样保留旧离线授权（整机 CRAG 更新；只迁移指定槽请用面板）
+sudo bash /opt/vm2api/deploy/install.sh crag-update --crag-version payload-2026.11.15-crag-3.0.5-legacy
 # 省略 --crag-version：从 vm2api 公开 payload Release 选最新完整签名包
 sudo bash /opt/vm2api/deploy/install.sh crag-update
 ```

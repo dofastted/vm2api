@@ -72,7 +72,7 @@ usage() {
 
 选项:
   --version vX.Y.Z     指定 tag（可带 -amd64 / -arm64 后缀，须与宿主架构一致）
-  --crag-version vX.Y.Z 指定 CRAG 供应仓 Release（省略为最新正式版）
+  --crag-version TAG   指定 CRAG Release：vX.Y.Z 或 payload-YYYY.MM.DD-crag-X.Y.Z[-legacy]（省略为最新正式版）
   --dir PATH           安装目录（默认 ${INSTALL_DIR}）
   --yes                非交互
   --no-start           只拉代码，不 compose up
@@ -953,8 +953,8 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --crag-version)
-      if [ $# -lt 2 ] || ! [[ "$2" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        err "--crag-version 需要 vX.Y.Z"
+      if [ $# -lt 2 ] || ! [[ "$2" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+|payload-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-crag-[0-9]+\.[0-9]+\.[0-9]+(-legacy)?)$ ]]; then
+        err "--crag-version 需要 vX.Y.Z 或 payload-YYYY.MM.DD-crag-X.Y.Z[-legacy]"
         exit 1
       fi
       CRAG_TARGET_VERSION="$2"
