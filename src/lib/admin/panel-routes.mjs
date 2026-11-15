@@ -5130,6 +5130,7 @@ export function createPanelHandler(ctx) {
             if (inference) {
               oauth.type = 'setup-token'
               oauth.mode = 'setup-token'
+              oauth.oauth_registration = 'console'
             }
           } else if (isSub2apiAccountExport(exportDoc)) {
             oauth = sub2apiAccountToOauth(exportDoc, existing)

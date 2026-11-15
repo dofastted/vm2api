@@ -8,7 +8,6 @@ import { fmtNum } from '@/lib/format'
 import { subscriptionListLabel } from '@/lib/subscription-expiry'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
-import { isCodexVm, slotNameLabel } from '@/lib/vm-kind'
 import {
   credentialStatus,
   fleetGroup,
@@ -26,13 +25,8 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
-import { CredLaneChip, SlotIdentity } from '@/components/platform-chip'
 import { StatusMark } from '@/components/status-mark'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
-import { ActiveVmBadge } from '@/features/vm/active-vm-badge'
-import { NodeChip } from '@/features/vm/node-chip'
-import { OpenaiPlanBadge } from '@/features/vm/openai-plan-badge'
-import { RuntimeChip } from '@/features/vm/runtime-chip'
 import {
   SchedulableSwitch,
   vmSchedulableProps,
@@ -51,6 +45,7 @@ import {
   useVmColumnOrder,
   type VmColumnKey,
 } from '@/features/vm/use-vm-column-order'
+import { VmAccountIdentity } from '@/features/vm/vm-account-identity'
 import { VmActionMenu } from '@/features/vm/vm-action-menu'
 import { useVmActions } from '@/features/vm/vm-actions-context'
 import { VmOwnerLine } from '@/features/vm/vm-owner-line'
@@ -140,8 +135,7 @@ function PriorityChip({ vm }: { vm: Vm }) {
 }
 
 /**
- * 类型列：调用形式（console / oauth / api）+ 调度优先级，下一行是周窗口重置时刻。
- * 平台（Claude / GPT）与 pro / max 等级都在「账号」列，不在这里重复。
+ * 调度优先级与周窗口重置时刻。
  */
 function TypeCell({ vm, now }: { vm: Vm; now: number }) {
   const hasToken = Boolean(vm.has_token)
@@ -155,11 +149,6 @@ function TypeCell({ vm, now }: { vm: Vm; now: number }) {
   return (
     <div className='min-w-0 space-y-1'>
       <div className='flex flex-wrap items-center gap-x-1.5 gap-y-1'>
-        {hasToken ? (
-          <CredLaneChip vm={vm} />
-        ) : (
-          <span className='text-xs text-muted-foreground'>无凭证</span>
-        )}
         <PriorityChip vm={vm} />
       </div>
       {clock ? (
@@ -329,58 +318,11 @@ function WeekPills({ week }: { week: VmWeekOutcome }) {
   )
 }
 
-/** pro / max（GPT 为套餐名）跟着账号走，放在账号名同一行。 */
-function TierBadge({ vm }: { vm: Vm }) {
-  if (isCodexVm(vm)) return <OpenaiPlanBadge vm={vm} />
-  const skin = tierVisual(vm)
-  if (skin.key !== 'pro' && skin.key !== 'max' && skin.key !== 'unknown') {
-    return null
-  }
-  return (
-    <span
-      className={cn(
-        'shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-none font-bold tracking-[0.03em] uppercase',
-        skin.badge
-      )}
-    >
-      {skin.label}
-    </span>
-  )
-}
-
 function SlotCell({ vm, now }: { vm: Vm; now: number }) {
-  const name = slotNameLabel(vm)
-  const email = String(vm.email || '').trim()
   const sub = subscriptionListLabel(vm, now)
-  const crag = (vm.resolved_dataplane ?? vm.dataplane) === 'crag'
   return (
     <div className='min-w-0 space-y-0.5 overflow-hidden'>
-      <div className='flex min-w-0 items-center gap-1.5'>
-        <SlotIdentity vm={vm} compact className='flex-1 text-sm font-medium' />
-        <span
-          className={cn(
-            'inline-flex shrink-0 items-center rounded px-1.5 py-0.5 text-[10px] leading-none font-semibold',
-            crag
-              ? 'bg-orange-200 text-orange-900 dark:bg-orange-400/20 dark:text-orange-300'
-              : 'bg-zinc-200 text-zinc-700 dark:bg-zinc-300/20 dark:text-zinc-300'
-          )}
-          title='当前内核'
-        >
-          {crag ? 'crag' : '标准内核'}
-        </span>
-      </div>
-      <div className='flex min-w-0 items-center gap-1.5'>
-        <ActiveVmBadge vm={vm} />
-        <TierBadge vm={vm} />
-        <RuntimeChip vm={vm} />
-        <NodeChip nodeId={vm.node_id} />
-        <span
-          className='min-w-0 truncate text-[11px] text-muted-foreground'
-          title={email ? name : undefined}
-        >
-          {name}
-        </span>
-      </div>
+      <VmAccountIdentity vm={vm} />
       <div
         className={cn(
           'truncate font-mono text-[11px] tabular-nums',
