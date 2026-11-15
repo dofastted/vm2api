@@ -282,6 +282,7 @@ class PackageTar extends Writable {
       'crag-v2.payload.enc',
       'crag-license-public.pem',
       'kernel.json.example',
+      'unpack-note.md',
       'LICENSES.txt',
       'LICENSE.txt',
       'claude-code-2.1.321/claude',
@@ -399,18 +400,27 @@ function prunePackages(base, arch, current, previous) {
 function pinnedAuthority(projectRoot) {
   const override = String(process.env.KIN_CRAG_V2_ROOT || '').trim()
   const factory = override || path.join(baseFor(projectRoot, 'crag'), cragV2Arch())
-  const verified = verifiedPackage(factory)
-  if (!verified.ok) throw coded('crag_v2_authority_missing', '缺少可信 CRAG 发行公钥，请先安装官方授权包')
-  return crypto
-    .createPublicKey(fs.readFileSync(path.join(factory, 'crag-license-public.pem')))
-    .export({ format: 'der', type: 'spki' })
+  if (verifiedPackage(factory).ok) {
+    const key = crypto
+      .createPublicKey(fs.readFileSync(path.join(factory, 'crag-license-public.pem')))
+      .export({ format: 'der', type: 'spki' })
+    return (pem) => key.equals(crypto.createPublicKey(pem).export({ format: 'der', type: 'spki' }))
+  }
+  const issuerPath = `share/crag/kernels/v2/${cragV2Arch()}/crag-license-public.pem`
+  const files = releasePayload(projectRoot)?.files
+  const pins = Array.isArray(files) ? files.filter((file) => file?.path === issuerPath) : []
+  const sha256 = pins[0]?.sha256
+  if (pins.length !== 1 || typeof sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(sha256)) {
+    throw coded('crag_v2_authority_missing', '缺少可信 CRAG 发行公钥')
+  }
+  return (pem) => crypto.createHash('sha256').update(pem).digest('hex') === sha256
 }
 
-function cragReleaseTag(projectRoot) {
+function releasePayload(projectRoot) {
   try {
-    return jsonFile(path.join(projectRoot, 'deploy/payload.json')).crag_release || ''
+    return jsonFile(path.join(projectRoot, 'deploy/payload.json'))
   } catch (error) {
-    if (error.code === 'ENOENT') return ''
+    if (error.code === 'ENOENT') return null
     throw error
   }
 }
@@ -427,7 +437,7 @@ export async function pullKernelRelease(
     const payload = await fetchKernelReleaseMetadata({
       tag,
       kernel,
-      cragReleaseTag: kernel === 'crag' && !latest ? cragReleaseTag(projectRoot) : '',
+      cragReleaseTag: kernel === 'crag' && !latest ? releasePayload(projectRoot)?.crag_release || '' : '',
       fetchImpl,
     })
     const specs =
@@ -491,10 +501,9 @@ export async function pullKernelRelease(
       )
       const verified = verifyCragV2Tree(stage)
       if (!verified.ok) throw coded(verified.code, 'CRAG 签名加密包校验失败')
-      const supplied = crypto
-        .createPublicKey(fs.readFileSync(path.join(stage, 'crag-license-public.pem')))
-        .export({ format: 'der', type: 'spki' })
-      if (!pinned.equals(supplied)) throw coded('crag_v2_authority_mismatch', 'CRAG 发行公钥与本机可信公钥不匹配')
+      if (!pinned(fs.readFileSync(path.join(stage, 'crag-license-public.pem')))) {
+        throw coded('crag_v2_authority_mismatch', 'CRAG 发行公钥与本机可信公钥不匹配')
+      }
     }
     makeReadonly(stage)
     const relative = `packages/${archFor(kernel)}-${crypto.randomUUID()}`
@@ -518,10 +527,20 @@ export async function pullKernelRelease(
     prunePackages(base, archFor(kernel), relative, previous)
     return { ok: true, kernel: product, release }
   } catch (error) {
+    const timeout = ['TimeoutError', 'AbortError'].includes(error.name)
+    const code = timeout
+      ? 'kernel_pull_timeout'
+      : typeof error.code === 'string' && /^[a-z][a-z0-9_]+$/.test(error.code)
+        ? error.code
+        : 'kernel_pull_failed'
+    let message = 'CRAG 拉取失败；需官方签名加密发行包'
+    if (code === 'crag_v2_authority_missing') message = '缺少可信 CRAG 发行公钥，请先更新到官方镜像或发行版'
+    if (code === 'crag_v2_authority_mismatch') message = 'CRAG 发行公钥与本机可信公钥不匹配'
+    if (timeout) message = 'CRAG 发行包拉取超时'
     return {
       ok: false,
-      code: typeof error.code === 'string' && /^[a-z][a-z0-9_]+$/.test(error.code) ? error.code : 'kernel_pull_failed',
-      error: kernel === 'crag' ? 'CRAG 拉取失败；需官方签名加密发行包，原包未更改' : 'cli-node 拉取失败，原包未更改',
+      code,
+      error: `${kernel === 'crag' ? message : 'cli-node 拉取失败'}，原包未更改`,
     }
   } finally {
     for (const dir of [stage, published]) {

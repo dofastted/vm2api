@@ -52,7 +52,7 @@ sudo bash /opt/vm2api/deploy/install.sh crag-update --crag-version v3.0.5
 sudo bash /opt/vm2api/deploy/install.sh crag-update
 ```
 
-需要包含 `scripts/seed-crag.mjs`、`scripts/update-crag.mjs` 的消费端源码/镜像；只下载一个新版 shell 到旧镜像不足以补齐 Node 更新器。支持已有 Docker 控制面和主机 Node 部署；读取进程环境或 `.env` 的 `VM2API_API_KEY` / `KIN_API_KEY`。无 `.env` 的主机 systemd 部署可由 root 从既有 `vm2api.service` 进程环境读取 key/port，不复制或打印完整环境；也可用进程环境 `PORT` 指定本地控制面端口。普通 amd64 `install` / `upgrade` 即使没有 CRAG 缓存也执行获取；`--no-start` / `--no-sync-wrap` 跳过，显式 `crag-update --no-start` 报错。当前 CRAG 发行包仅支持 amd64，ARM64 一键安装明确提示并跳过 CRAG 获取，不影响原有安装路径。主机 Node 部署首次使用仍须由供应方提供可信出厂包。
+需要包含 `scripts/seed-crag.mjs`、`scripts/update-crag.mjs` 的消费端源码/镜像；只下载一个新版 shell 到旧镜像不足以补齐 Node 更新器。支持已有 Docker 控制面和主机 Node 部署；读取进程环境或 `.env` 的 `VM2API_API_KEY` / `KIN_API_KEY`。无 `.env` 的主机 systemd 部署可由 root 从既有 `vm2api.service` 进程环境读取 key/port，不复制或打印完整环境；也可用进程环境 `PORT` 指定本地控制面端口。普通 amd64 `install` / `upgrade` 即使没有 CRAG 缓存也执行获取；`--no-start` / `--no-sync-wrap` 跳过，显式 `crag-update --no-start` 报错。当前 CRAG 发行包仅支持 amd64，ARM64 一键安装明确提示并跳过 CRAG 获取，不影响原有安装路径。缺少有效出厂包时，拉取只信任随官方 vm2api 交付的 `deploy/payload.json` 固定公钥摘要；未携带此摘要的部署仍需可信出厂包。
 
 更新顺序：从 vm2api 公开 Release 下载完整包，以原信任锚校验签名、成员 SHA 与 ELF → 原子切换下载指针 → 全槽清点 → 检查已有 CRAG V2 槽 → 有变化时以唯一标记暂停调度并排空在途请求 → 确认原生 `active_requests`、`queued`、`continuations` 全为 0 → 受管同步或重载对应槽 → 核验运行中 memfd 的 SHA 与签名 payload 承诺一致。安装目录哈希相同不能证明运行进程已更新。
 

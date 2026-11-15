@@ -251,6 +251,9 @@ function releaseFetch() {
   const payloads = { 1: elf('pulled-kernel'), 2: elf('pulled-cli') }
   return async (url) => {
     const href = String(url)
+    if (new URL(href).pathname.endsWith('/releases')) {
+      return Response.json([{ tag_name: 'payload-2026.11.15-crag-1.2.3', draft: false, assets: [] }])
+    }
     if (href.endsWith('/releases/latest'))
       return new Response(
         JSON.stringify({
@@ -278,6 +281,8 @@ function releaseFetch() {
 
 test('pull route updates cache only and returns actionable paid asset failure without fallback', async (t) => {
   const { root, vms } = fixture(t)
+  fs.mkdirSync(path.join(root, 'deploy'))
+  fs.writeFileSync(path.join(root, 'deploy/payload.json'), JSON.stringify({ crag_release: 'v1.2.3' }))
   const records = vms.map((vm) => fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`)))
   const options = {
     ctx: {

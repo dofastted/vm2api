@@ -2644,6 +2644,7 @@ export function createPanelHandler(ctx) {
           ids: Array.isArray(body.ids) ? body.ids : null,
           concurrency: body.concurrency,
           routing: ctx.routingConfig,
+          telemetryLifecycle: { watchdog: ctx.kernelWatchdog, poolScheduler: ctx.poolScheduler },
         })
         return json(res, 200, panel.ok(report))
       }
@@ -4320,6 +4321,7 @@ export function createPanelHandler(ctx) {
               projectRoot: cfg.paths.project,
               vm,
               routing: ctx.routingConfig,
+              lifecycle: { watchdog: ctx.kernelWatchdog, poolScheduler: ctx.poolScheduler },
               replaceEnv: Object.hasOwn(body, 'extra_env') || Object.hasOwn(body, 'settings_json_override'),
             })
           }
@@ -4839,9 +4841,6 @@ export function createPanelHandler(ctx) {
         }
         atomicWriteJson(vmPath, vm, { mode: 0o600 })
         writeGuestMachineIdFile(cfg.paths.project, id, generated.guest_machine_id)
-        try {
-          seedFreshCliHome(cfg.paths.project, vm)
-        } catch (e) {}
         let allocated = null
         let proxyError = null
         const wantProxy = body.auto_allocate_proxy === true || startNow || !!pickedProxyId
@@ -4872,13 +4871,21 @@ export function createPanelHandler(ctx) {
           vm.timezone_source = 'proxy_geo'
           if (vm.fingerprint && typeof vm.fingerprint === 'object') vm.fingerprint.timezone = zoned.timezone
         }
-        if (body.activate === true) {
+        let startError = null
+        try {
+          seedFreshCliHome(cfg.paths.project, vm, { routing: ctx.routingConfig, preinstallCrag: true })
+        } catch (error) {
+          const code = /^[a-z0-9_]+$/i.test(error.code || '') ? error.code : 'vm_init_failed'
+          startError = `虚拟机初始化失败（${code}）`
+          patchVmRecord(cfg.paths.project, id, { status: 'error' })
+          markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', { message: startError })
+        }
+        if (!startError && body.activate === true) {
           try {
             activateVmSlot(id)
           } catch (e) {}
         }
-        let startError = null
-        if (startNow && hasExit(vm)) {
+        if (!startError && startNow && hasExit(vm)) {
           let boot
           try {
             boot = await startSlotReady(vm, cfg.paths.project, { routing: ctx.routingConfig })
@@ -4896,7 +4903,7 @@ export function createPanelHandler(ctx) {
           } else {
             patchVmRecord(cfg.paths.project, id, { status: 'running' })
           }
-        } else if (startNow) {
+        } else if (!startError && startNow) {
           patchVmRecord(cfg.paths.project, id, { status: 'stopped' })
         }
         const saved = getVm(cfg.paths.project, id) || vm

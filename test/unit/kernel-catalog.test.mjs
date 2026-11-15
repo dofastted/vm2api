@@ -1,5 +1,6 @@
 import test, { after, before } from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -248,6 +249,72 @@ test('native pull atomically selects an immutable sibling without touching the r
   assert.equal(fs.statSync(selected).mode & 0o222, 0)
   assert.equal(describeKernelCatalog(root)[1].version, '1.2.3')
   assert.equal(describeKernelCatalog(root)[1].ready, true)
+})
+
+test('native pull can restore a missing factory only with the shipped issuer pin', {
+  skip: cragV2Arch() !== 'amd64',
+}, async (t) => {
+  const root = fixture(t)
+  const supplier = seedEncryptedPackage(fixture(t))
+  const attacker = seedEncryptedPackage(fixture(t))
+  const note = '官方发行解包说明\n'
+  const manifestPath = path.join(supplier, 'manifest.json')
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+  manifest.sha256['unpack-note.md'] = createHash('sha256').update(note).digest('hex')
+  fs.writeFileSync(manifestPath, JSON.stringify(manifest))
+  fs.writeFileSync(path.join(supplier, 'unpack-note.md'), note)
+  const pull = (pkg) =>
+    pullKernelRelease(root, { kernel: 'crag' }, transport({ [CRAG_V2_RELEASE_ASSET]: archive(pkg) }))
+  assert.equal((await pull(supplier)).code, 'crag_v2_authority_missing')
+  const issuer = 'crag-license-public.pem'
+  const sha256 = createHash('sha256')
+    .update(fs.readFileSync(path.join(supplier, issuer)))
+    .digest('hex')
+  fs.mkdirSync(path.join(root, 'deploy'))
+  fs.writeFileSync(
+    path.join(root, 'deploy/payload.json'),
+    JSON.stringify({
+      crag_release: 'v1.2.3',
+      files: [{ path: `share/crag/kernels/v2/amd64/${issuer}`, sha256 }],
+    }),
+  )
+  assert.equal((await pull(attacker)).code, 'crag_v2_authority_mismatch')
+  assert.equal(cragV2PackageRoot(root), '')
+  const result = await pull(supplier)
+  assert.equal(result.ok, true, result.error)
+  assert.equal(describeKernelCatalog(root)[1].version, '1.2.3')
+  const selected = cragV2PackageRoot(root)
+  assert.equal(fs.readFileSync(path.join(selected, 'unpack-note.md'), 'utf8'), note)
+  assert.equal((await pull(attacker)).code, 'crag_v2_authority_mismatch')
+  fs.appendFileSync(path.join(supplier, 'unpack-note.md'), 'tampered')
+  assert.equal((await pull(supplier)).code, 'crag_v2_hash_mismatch')
+  assert.equal(cragV2PackageRoot(root), selected)
+})
+
+test('native pull reports a body timeout without replacing its package', {
+  skip: cragV2Arch() !== 'amd64',
+}, async (t) => {
+  const root = fixture(t)
+  const factory = seedEncryptedPackage(root)
+  const http = transport({ [CRAG_V2_RELEASE_ASSET]: archive(factory) })
+  const result = await pullKernelRelease(
+    root,
+    { kernel: 'crag' },
+    {
+      fetchImpl: async (url, options) => {
+        if (!url.includes('/assets/')) return http.fetchImpl(url, options)
+        return new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.error(new DOMException('timed out', 'TimeoutError'))
+            },
+          }),
+        )
+      },
+    },
+  )
+  assert.equal(result.code, 'kernel_pull_timeout')
+  assert.equal(cragV2PackageRoot(root), factory)
 })
 
 for (const [label, tag, standalone, expected] of [
