@@ -268,10 +268,15 @@ function updateSlotRestartPolicy(vm, existing, run) {
   return { ...result, changed: result.ok === true }
 }
 
-/** Check the live mount and installed launcher before an irreversible redemption. */
-export function assertCragSubscriptionTarget(projectRoot, vm, routing, { reclaim = false } = {}) {
+/** A preinstalled, stopped slot can obtain a permit without starting its worker. */
+export function assertCragSubscriptionTarget(
+  projectRoot,
+  vm,
+  routing,
+  { reclaim = false, allowPrepared = false } = {},
+) {
   const unsupported = () =>
-    Object.assign(new Error('A running local Linux Docker CRAG v2 slot is required.'), {
+    Object.assign(new Error('A verified local Linux Docker CRAG v2 slot is required.'), {
       status: 409,
       code: 'crag_subscription_target_unready',
     })
@@ -286,19 +291,23 @@ export function assertCragSubscriptionTarget(projectRoot, vm, routing, { reclaim
   )
     throw unsupported()
 
-  const source = cragSubscriptionPublicDirectory(projectRoot)
   const slot = containerName(vm.id)
-  const result = sh(['docker', 'inspect', '--format', '{{.State.Running}}|{{json .Mounts}}', slot], { timeout: 3000 })
-  if (!result.ok || !result.stdout.startsWith('true|')) throw unsupported()
-  let mounts
-  try {
-    mounts = JSON.parse(result.stdout.slice(5))
-  } catch {
-    throw unsupported()
+  const outcome = inspectContainerOutcome(slot, { run: (args) => sh(args, { timeout: 3000 }) })
+  const prepared = allowPrepared && outcome.status === 'missing' && vm.status === 'stopped' && vm.schedulable === false
+  if (!prepared) {
+    if (outcome.status !== 'found' || !outcome.container?.running) throw unsupported()
+    const result = sh(['docker', 'inspect', '--format', '{{json .Mounts}}', slot], { timeout: 3000 })
+    try {
+      if (!result.ok) throw unsupported()
+      const mounts = JSON.parse(result.stdout)
+      const mount = Array.isArray(mounts) && mounts.find((item) => item.Destination === CRAG_HOST_MOUNT)
+      const source = cragSubscriptionPublicDirectory(projectRoot)
+      if (mount?.Type !== 'bind' || mount.RW !== false || mount.Source !== toHostPath(source, { projectRoot }))
+        throw unsupported()
+    } catch {
+      throw unsupported()
+    }
   }
-  const mount = Array.isArray(mounts) && mounts.find((item) => item.Destination === CRAG_HOST_MOUNT)
-  if (mount?.Type !== 'bind' || mount.RW !== false || mount.Source !== toHostPath(source, { projectRoot }))
-    throw unsupported()
   const staged = path.join(wrapCliHomeDir(projectRoot, vm.id), CRAG_V2_DIR)
   const installed = verifyCragV2Tree(staged, { allowPreviousClaude: true })
   const selected = verifyCragV2Tree(cragV2PackageRoot(projectRoot))
@@ -310,6 +319,9 @@ export function assertCragSubscriptionTarget(projectRoot, vm, routing, { reclaim
     installed.manifest.authorization.public_key_id !== selected.manifest.authorization.public_key_id
   )
     throw unsupported()
+  // A stopped slot only stages verified files. The normal start path still
+  // requires the signed permit and creates the read-only entitlement mount.
+  if (prepared) return true
   const capabilities = sh(['docker', 'exec', slot, '/home/kincli/.kin/crag-v2/crag-v2', '--license-capabilities'], {
     timeout: 3000,
   })

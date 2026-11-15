@@ -16,6 +16,8 @@ const MESSAGES = {
   license_not_yet_valid: 'The CRAG license is not yet valid. Check the UTC clock and activation date.',
   license_invalid: 'The CRAG registration code or device data is invalid.',
   license_binding_mismatch: 'This CRAG registration code belongs to a different VM or device.',
+  license_payload_key_mismatch:
+    'The signed registration is for a different CRAG package. Request a grant for this package.',
   license_unconfigured: 'CRAG requires a configured encrypted native package and private Linux runtime storage.',
 }
 const STATES = {
@@ -24,6 +26,7 @@ const STATES = {
   license_not_yet_valid: 'not_yet_valid',
   license_invalid: 'invalid',
   license_binding_mismatch: 'invalid',
+  license_payload_key_mismatch: 'invalid',
   license_unconfigured: 'unconfigured',
 }
 const sha = (bytes) => crypto.createHash('sha256').update(bytes).digest('hex')
@@ -251,7 +254,6 @@ export function verifyCragRegistration(
     if (
       c.not_before < c.issued_at ||
       c.expires_at <= c.not_before ||
-      c.payload_key_id !== keyId ||
       c.expires_at !== calendarExpiry(c.issued_at, c.term)
     )
       fail()
@@ -262,6 +264,7 @@ export function verifyCragRegistration(
     )
       fail('license_binding_mismatch')
     decodeLicenseBytes(c.device_public_key, 32)
+    if (c.payload_key_id !== keyId) fail('license_payload_key_mismatch')
     unwrapDeviceKey(c.wrapped_key, device, privateKey, keyId)
     const status = { status: 'valid', valid: true, vm_id: device.vm_id, kind: 'online', scope: 'device' }
     for (const key of ['license_id', 'term', 'issued_at', 'not_before', 'expires_at']) status[key] = c[key]
@@ -357,6 +360,10 @@ function trust(projectRoot) {
     if (canonicalRoot) packageTrustCache.delete(canonicalRoot)
     fail('license_unconfigured')
   }
+}
+
+export function selectedCragPayloadId(projectRoot) {
+  return trust(projectRoot).keyId
 }
 function publicFailure(vm, error) {
   const code =
@@ -917,9 +924,18 @@ function withMachineCode(projectRoot, vm, license, initialize) {
   if (!initialize) return { license, machine_code: '' }
   try {
     // A machine-code failure must not hide an already valid offline license.
-    return { license, machine_code: deviceContext(projectRoot, vm, true).machine_code }
+    return { license, ...machineExport(projectRoot, deviceContext(projectRoot, vm, true).machine_code) }
   } catch {
     return { license, machine_code: '' }
+  }
+}
+
+function machineExport(projectRoot, machine_code, keyId) {
+  if (!machine_code) return { machine_code: '' }
+  try {
+    return { machine_code, payload_key_id: keyId ?? selectedCragPayloadId(projectRoot) }
+  } catch {
+    return { machine_code }
   }
 }
 
@@ -1032,12 +1048,13 @@ export function getCragLicense(projectRoot, vm, { initialize = false } = {}) {
       missing.code = 'ENOENT'
       throw missing
     }
+    const authority = trust(projectRoot)
     return {
-      license: verifyCragRegistration(stored, { ...ctx, ...trust(projectRoot) }),
-      machine_code: ctx.machine_code,
+      license: verifyCragRegistration(stored, { ...ctx, ...authority }),
+      ...machineExport(projectRoot, ctx.machine_code, authority.keyId),
     }
   } catch (error) {
-    return { license: publicFailure(vm, error), machine_code: ctx?.machine_code || '' }
+    return { license: publicFailure(vm, error), ...machineExport(projectRoot, ctx?.machine_code) }
   }
 }
 
@@ -1054,10 +1071,11 @@ export function activateCragLicense(projectRoot, vm, code) {
       return { license, machine_code: '' }
     }
     const ctx = deviceContext(projectRoot, vm, true)
-    const license = verifyCragRegistration(trimmed, { ...ctx, ...trust(projectRoot) })
+    const authority = trust(projectRoot)
+    const license = verifyCragRegistration(trimmed, { ...ctx, ...authority })
     if (!license.valid) fail(license.code)
     writePrivate(ctx.dir, 'registration.code', `${trimmed}\n`, vm, true)
-    return { license, machine_code: ctx.machine_code }
+    return { license, ...machineExport(projectRoot, ctx.machine_code, authority.keyId) }
   } catch (error) {
     if (error instanceof CragLicenseError) throw error
     fail()

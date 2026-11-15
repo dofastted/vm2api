@@ -460,6 +460,8 @@ export function createCragShopHandler({
             'redeem_unavailable',
             'host_binding_conflict',
             'slot_limit_reached',
+            'payload_key_unknown',
+            'payload_key_conflict',
           ].includes(error?.code)
         )
           finish(null)

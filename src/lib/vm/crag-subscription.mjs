@@ -6,6 +6,7 @@ import {
   getCragLicense,
   MAX_CRAG_HOST_ENTITLEMENT_BYTES,
   prepareCragSubscriptionBinding,
+  selectedCragPayloadId,
   readCragSubscriptionReleaseCandidate,
   verifyCragHostEntitlement,
 } from './crag-license.mjs'
@@ -24,6 +25,8 @@ const authorityErrors = new Map([
   ['slot_limit_reached', 409],
   ['renewal_unavailable', 409],
   ['request_conflict', 409],
+  ['payload_key_unknown', 400],
+  ['payload_key_conflict', 409],
 ])
 const fail = (code = 'crag_subscription_unavailable', status = 503) => Object.assign(new Error(code), { code, status })
 const uid = () => process.getuid()
@@ -179,6 +182,7 @@ export function createCragSubscription({
   getTarget,
   isSubscriptionSlot,
   assertReady,
+  targetPayloadId = selectedCragPayloadId,
   isSlotEnabled,
   fetchImpl = globalThis.fetch,
   origin = AUTHORITY,
@@ -219,6 +223,16 @@ export function createCragSubscription({
       if (create) {
         try {
           fs.mkdirSync(directory, { mode })
+          // Restore the required traversal mode on this newly created directory
+          // even under a restrictive service umask. Never repair existing paths.
+          const fd = fs.openSync(directory, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW)
+          try {
+            if (fs.fstatSync(fd).uid !== uid()) throw fail()
+            fs.fchmodSync(fd, mode)
+            fs.fsyncSync(fd)
+          } finally {
+            fs.closeSync(fd)
+          }
           sync(path.dirname(directory))
         } catch (error) {
           if (error.code !== 'EEXIST') throw error
@@ -282,16 +296,17 @@ export function createCragSubscription({
   async function orderTarget(hostId, vmId) {
     if (!isOrderVmId(vmId)) throw fail('crag_subscription_target_unready', 409)
     const vm = getTarget ? await getTarget(vmId) : (await listTargets()).find(({ id }) => id === vmId)
-    const options = { reclaim: current(hostId)?.claims.version === 2 }
+    const options = { reclaim: current(hostId)?.claims.version === 2, allowPrepared: true }
     if (vm?.id !== vmId || (await assertReady(vm, options)) === false)
       throw fail('crag_subscription_target_unready', 409)
     preserveOtherLicense(vm)
     const machineCode = prepareCragSubscriptionBinding(projectRoot, vm)
+    const payloadKeyId = targetPayloadId(projectRoot)
     // Pin both the actual device key and the persisted VM owner, not Docker's mutable container ID.
     const fingerprint = createHash('sha256')
-      .update(JSON.stringify([hostId, machineCode, vm.owner_user_id ?? null]))
+      .update(JSON.stringify([hostId, machineCode, vm.owner_user_id ?? null, payloadKeyId]))
       .digest('hex')
-    return { vm, machineCode, fingerprint }
+    return { vm, machineCode, payloadKeyId, fingerprint }
   }
 
   async function status() {
@@ -327,7 +342,7 @@ export function createCragSubscription({
       }
       const expired = claims && claims.expires_at <= Math.floor(Date.now() / 1000)
       return {
-        ready: !pending && (await ready()),
+        ready: !pending && (await ready({ allowPrepared: true })),
         state: pending
           ? 'sync_pending'
           : claims
@@ -463,7 +478,7 @@ export function createCragSubscription({
       const redemption_code = typeof value === 'string' && value.trim()
       if (!validVoucher(redemption_code)) throw fail('crag_subscription_invalid_request', 400)
       const hostId = identity()
-      if (!renewal && !(await ready())) throw fail('crag_subscription_target_unready', 409)
+      if (!renewal && !(await ready({ allowPrepared: true }))) throw fail('crag_subscription_target_unready', 409)
       storage(!renewal)
       const previous = current(hostId)
       if (renewal && !previous) throw fail('host_subscription_inactive', 409)
@@ -481,20 +496,33 @@ export function createCragSubscription({
       throw fail('host_subscription_inactive', 409)
   }
 
-  async function bindTarget(vm, hostId, previous, machineCode, checkTarget) {
+  async function bindTarget(vm, hostId, previous, machineCode, payloadKeyId, checkTarget) {
     assertActive(previous)
     const roster = previous.claims.version === 2
     if (roster) beginRosterIntent({ host_id: hostId, action: 'bind' })
     let data
     try {
-      data = await authority('bind', hostId, credential(hostId), { machine_code: machineCode })
+      data = await authority('bind', hostId, credential(hostId), {
+        machine_code: machineCode,
+        payload_key_id: payloadKeyId,
+      })
     } catch (error) {
-      if (roster && ['slot_limit_reached', 'host_binding_conflict', 'host_subscription_inactive'].includes(error.code))
+      if (
+        roster &&
+        [
+          'slot_limit_reached',
+          'host_binding_conflict',
+          'host_subscription_inactive',
+          'payload_key_unknown',
+          'payload_key_conflict',
+        ].includes(error.code)
+      )
         clearRosterIntent()
       throw error
     }
     if (!Number.isInteger(data.seat) || data.seat <= 0) throw invalidRights()
     if (checkTarget) ({ vm } = await checkTarget())
+    if (targetPayloadId(projectRoot) !== payloadKeyId) throw fail('crag_subscription_target_changed', 409)
     if (!roster) {
       if (data.entitlement !== previous.code) throw invalidRights()
       activateCragSubscriptionBinding(projectRoot, vm, data.slot_permit, { seat: data.seat })
@@ -514,7 +542,7 @@ export function createCragSubscription({
       try {
         const hostId = identity()
         storage()
-        options = { reclaim: current(hostId)?.claims.version === 2 }
+        options = { reclaim: current(hostId)?.claims.version === 2, allowPrepared: true }
       } catch {
         return []
       }
@@ -577,9 +605,9 @@ export function createCragSubscription({
         // before replaying bind for this exact machine code and retrieving its existing permit.
         if (pending?.action === 'bind') await syncRoster(hostId, pending, current(hostId))
         checkNoIntent()
-        const { vm, machineCode } = await checkTarget()
+        const { vm, machineCode, payloadKeyId } = await checkTarget()
         const previous = current(hostId)
-        await bindTarget(vm, hostId, previous, machineCode, checkTarget)
+        await bindTarget(vm, hostId, previous, machineCode, payloadKeyId, checkTarget)
       })
     },
     redeem(value) {
@@ -675,13 +703,20 @@ export function createCragSubscription({
     },
     bind(vm) {
       return exclusive(async () => {
-        if ((await assertReady(vm)) === false) throw fail('crag_subscription_target_unready', 409)
+        if ((await assertReady(vm, { allowPrepared: true })) === false)
+          throw fail('crag_subscription_target_unready', 409)
         const hostId = identity()
         storage()
         checkNoIntent()
         const previous = current(hostId)
         assertActive(previous)
-        return bindTarget(vm, hostId, previous, prepareCragSubscriptionBinding(projectRoot, vm))
+        return bindTarget(
+          vm,
+          hostId,
+          previous,
+          prepareCragSubscriptionBinding(projectRoot, vm),
+          targetPayloadId(projectRoot),
+        )
       })
     },
   }

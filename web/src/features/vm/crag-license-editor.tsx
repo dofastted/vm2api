@@ -19,6 +19,8 @@ const licenseMessages: Record<string, string> = {
     '注册码无法通过校验，可能不完整、已被修改或签发密钥不匹配。请重新复制完整注册码，或联系授权方重新签发。',
   license_binding_mismatch:
     '注册码不属于本槽或当前机器。请使用下方机器码申请匹配的注册码。',
+  license_payload_key_mismatch:
+    '注册码对应另一版 CRAG 内核。请复制含载荷 ID 的机器码，向授权方申请匹配当前版本的注册码。',
   license_unconfigured:
     '服务器尚未配置可信授权公钥或加密 CRAG 包。请联系管理员安装受信任的完整软件包后重试。',
 }
@@ -236,8 +238,18 @@ export function CragLicenseEditor({
               disabled={busy}
               onClick={async () => {
                 try {
-                  await navigator.clipboard.writeText(data.machine_code)
-                  toast.success('机器码已复制')
+                  const challenge = data.payload_key_id
+                    ? JSON.stringify({
+                        machine_code: data.machine_code,
+                        payload_key_id: data.payload_key_id,
+                      })
+                    : data.machine_code
+                  await navigator.clipboard.writeText(challenge)
+                  toast.success(
+                    data.payload_key_id
+                      ? '机器码和目标载荷已复制'
+                      : '机器码已复制'
+                  )
                 } catch {
                   toast.error('复制失败，请选中机器码后手动复制')
                 }
@@ -250,7 +262,18 @@ export function CragLicenseEditor({
             id={`${formId}-machine`}
             readOnly
             rows={3}
-            value={data.machine_code}
+            value={
+              data.payload_key_id
+                ? JSON.stringify(
+                    {
+                      machine_code: data.machine_code,
+                      payload_key_id: data.payload_key_id,
+                    },
+                    null,
+                    2
+                  )
+                : data.machine_code
+            }
             spellCheck={false}
             onFocus={(event) => event.currentTarget.select()}
             className='max-h-36 resize-y font-mono text-sm break-all'
@@ -260,7 +283,8 @@ export function CragLicenseEditor({
             id={`${formId}-machine-help`}
             className='text-xs leading-relaxed text-muted-foreground'
           >
-            将机器码交给授权方换取在线设备码。该码只属于本槽；期限由签名确定，不能在此修改。
+            将完整机器码交给授权方；若显示载荷
+            ID，请一并复制。注册码只对本槽和匹配的内核版本有效。
           </p>
         </div>
       ) : null}

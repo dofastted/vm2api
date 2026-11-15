@@ -529,7 +529,7 @@ test('pinned fulfillment survives lost redeem and H2 bind replies without reappl
       return Response.json({ ...remote, url: ACTION, data: fields(id) })
     return Response.json(remote)
   })
-  let bearer, rights, machineCode, slotPermit
+  let bearer, rights, hostIdAtBind, machineCode, slotPermit
   let redeems = 0
   let bindAttempts = 0
   let admin = true
@@ -562,6 +562,7 @@ test('pinned fulfillment survives lost redeem and H2 bind replies without reappl
         if (url.endsWith('/bind')) {
           ++bindAttempts
           if (!machineCode) {
+            hostIdAtBind = input.host_id
             machineCode = input.machine_code
             slotPermit = issueSlotPermit(root, machineCode, input.host_id, { seat: 1 }).code
             rights = signedRights(input.host_id, 2, [
@@ -676,6 +677,27 @@ test('pinned fulfillment survives lost redeem and H2 bind replies without reappl
   deliveryRequests.length = 0
   await handle.pollActivation()
   assert.deepEqual(deliveryRequests, [])
+
+  // Pre-upgrade pins do not prove which payload was installed at checkout.
+  const legacyPinOrder = (await call(OTHER, 'POST', '/orders', { ...input, request_id: 'old-pin' })).data
+  const oldId = legacyPinOrder.order_id
+  const noPayloadFingerprint = createHash('sha256')
+    .update(JSON.stringify([hostIdAtBind, machineCode, null]))
+    .digest('hex')
+  db.prepare('UPDATE crag_shop_orders SET activation_fingerprint = ? WHERE order_id = ?').run(
+    noPayloadFingerprint,
+    oldId,
+  )
+  assert.equal((await call(OTHER, 'POST', `/orders/${oldId}/resume`, {})).data.order_id, oldId)
+  merchant.get(oldId).status = 'fulfilled'
+  deliveryRequests.length = 0
+  await handle.pollActivation()
+  assert.deepEqual(deliveryRequests.splice(0), [{ id: oldId, operation: undefined, method: 'GET' }])
+  const paused = (await call(OTHER, 'GET', `/orders/${oldId}`)).data
+  assert.equal(paused.status, 'fulfilled')
+  assert.equal(paused.activation.state, 'needs_attention')
+  assert.equal(redeems, 2)
+  assert.equal(bindAttempts, 2)
 
   const other = (
     await call(OTHER, 'POST', '/orders', { ...input, request_id: 'second', activation_target: { vm_id: slots[1].id } })

@@ -318,7 +318,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
           : status?.state === 'sync_pending'
             ? '请到槽位授权页继续同步，不要提交另一张兑换码。'
             : status && !status.ready
-              ? '当前没有就绪的本机 CRAG 槽位。兑换需要已运行的本机 Linux Docker Claude 槽、支持订阅的可信 CRAG v2 包和只读权益挂载。'
+              ? '当前没有就绪的本机 CRAG 槽位。请先创建不启动的本机 Linux Docker Claude 槽并预装可信 CRAG v2 包，或选择已运行且带只读权益挂载的槽。'
               : '本机状态来自宿主权益，不随付款或领码变化。槽位仍需单独绑定应用锁。'}
       </p>
     </section>
