@@ -272,6 +272,19 @@ function VmDetailBody({
     },
     onError: (error: Error) => toast.error(error.message),
   })
+  const saveId = useMutation({
+    mutationFn: (nextId: string) =>
+      api(`/api/panel/vms/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ id: nextId }),
+      }),
+    onSuccess: async (_saved, nextId) => {
+      toast.success(`编号已改为 ${nextId}`)
+      await refreshAll()
+      await navigate({ to: '/vm/$id', params: { id: nextId } })
+    },
+    onError: (error: Error) => toast.error(error.message),
+  })
 
   const saveSeed = useMutation({
     mutationFn: (body: Record<string, unknown>) =>
@@ -497,7 +510,9 @@ function VmDetailBody({
           vm={vm}
           canEdit={perms.admin}
           saving={saveName.isPending}
+          savingId={saveId.isPending}
           onSave={(name) => saveName.mutate(name)}
+          onSaveId={(nextId) => saveId.mutate(nextId)}
         />
         <Tabs value={tab} onValueChange={onTabChange}>
           <TabsList>

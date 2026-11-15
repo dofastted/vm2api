@@ -119,7 +119,7 @@ const LOCAL_HOST = Object.freeze({
   start: (vm, projectRoot, opts) => startVmRuntime(vm, projectRoot, opts),
   reload: (vm, projectRoot, opts) => reloadSlotWorker(vm, projectRoot, opts),
   stop: (vm) => stopVmRuntime(vm),
-  destroy: (vm) => destroyVmRuntime(vm),
+  destroy: (vm, opts) => destroyVmRuntime(vm, opts),
   setProxyEgressEnabled: async (vm, projectRoot, enabled) => {
     if (isCodexVm(vm)) {
       if (enabled) return { ok: true }

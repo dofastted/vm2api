@@ -5,7 +5,7 @@ import { VmTable } from './vm-list-table'
 
 vi.mock('./vm-actions-context', () => ({ useVmActions: () => ({}) }))
 vi.mock('./vm-action-menu', () => ({ VmActionMenu: () => null }))
-vi.mock('./vm-owner-line', () => ({ VmOwnerLine: () => null }))
+vi.mock('./vm-owner-line', () => ({ VmRentedMark: () => null }))
 vi.mock('./use-vm-column-order', () => ({
   useVmColumnOrder: () => ({ order: ['vm'], isDefault: true }),
 }))
@@ -53,7 +53,7 @@ describe('VM account column kernel label', () => {
     expect(render()).toContain('>默认</span>')
   })
 
-  it('shows platform, stable VM number, email and enrollment independently of the auth scheme', () => {
+  it('shows the platform mark, stable VM number, email and enrollment independently of the auth scheme', () => {
     const vm: Partial<Vm> = {
       has_token: true,
       auth_scheme: 'authorization_bearer',
@@ -62,10 +62,9 @@ describe('VM account column kernel label', () => {
       node_name: '测试集群',
     }
     const html = render(vm)
+    expect(html).toContain('aria-label="anthropic"')
     for (const label of [
-      'anthropic',
       'vm-01',
-      '01·account',
       'account@example.com',
       'Max',
       'kvm',
@@ -74,6 +73,8 @@ describe('VM account column kernel label', () => {
     ]) {
       expect(html).toMatch(new RegExp(`>${label}</(?:span|div)>`))
     }
+    expect(html).not.toContain('订阅 未知')
+    expect(html).not.toContain('01·account')
     expect(
       render({
         ...vm,
@@ -89,7 +90,7 @@ describe('VM account column kernel label', () => {
       })
     ).toContain('>console</span>')
     expect(render({ platform: 'openai', has_token: true })).toContain(
-      '>openai</span>'
+      'aria-label="openai"'
     )
     expect(render({ platform: 'openai', has_token: true })).toContain(
       '>local</span>'

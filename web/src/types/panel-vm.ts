@@ -98,6 +98,7 @@ export type CragLicenseStatus = {
 export type CragLicenseResponse = {
   license: CragLicenseStatus
   machine_code: string
+  payload_key_id?: string
 }
 
 export type VmTelemetryState = {

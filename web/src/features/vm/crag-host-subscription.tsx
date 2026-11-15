@@ -5,16 +5,13 @@ import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { ConfirmDialog } from '@/components/confirm-dialog'
-import { vmCragLicenseQueryOptions } from './queries'
+import {
+  cragHostStatusQueryOptions,
+  vmCragLicenseQueryOptions,
+  type CragHostStatus,
+} from './queries'
 
-type HostStatus = {
-  ready: boolean
-  state: 'unavailable' | 'unredeemed' | 'active' | 'expired' | 'sync_pending'
-  slot_limit?: number | 'unlimited'
-  expires_at?: number
-}
-
-const statusLabels: Record<HostStatus['state'], string> = {
+const statusLabels: Record<CragHostStatus['state'], string> = {
   unavailable: '暂不可用',
   unredeemed: '尚未兑换',
   active: '订阅有效',
@@ -22,16 +19,12 @@ const statusLabels: Record<HostStatus['state'], string> = {
   sync_pending: '等待同步',
 }
 const root = '/api/panel/crag-subscription'
-const queryKey = ['crag-host-subscription'] as const
 
 export function CragHostSubscription({ vmId }: { vmId: string }) {
   const id = useId()
   const qc = useQueryClient()
-  const host = useQuery({
-    queryKey,
-    queryFn: () => api<HostStatus>(root),
-    retry: false,
-  })
+  const options = cragHostStatusQueryOptions()
+  const host = useQuery(options)
   const [code, setCode] = useState('')
   const [confirming, setConfirming] = useState(false)
   const [working, setWorking] = useState(false)
@@ -57,14 +50,14 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
         )
         setNotice({ text: `本槽已绑定应用锁 ${result.seat}。` })
       } else {
-        const next = await api<HostStatus>(`${root}/${action}`, {
+        const next = await api<CragHostStatus>(`${root}/${action}`, {
           method: 'POST',
           body:
             action === 'redeem'
               ? JSON.stringify({ redemption_code: code.trim() })
               : '{}',
         })
-        qc.setQueryData(queryKey, next)
+        qc.setQueryData(options.queryKey, next)
         if (action === 'redeem') {
           setCode('')
           setNotice({
@@ -83,7 +76,7 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
     } finally {
       setConfirming(false)
       await Promise.all([
-        qc.invalidateQueries({ queryKey }),
+        qc.invalidateQueries({ queryKey: options.queryKey }),
         qc.invalidateQueries({
           queryKey: vmCragLicenseQueryOptions(vmId).queryKey,
         }),

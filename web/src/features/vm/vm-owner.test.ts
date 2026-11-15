@@ -5,6 +5,7 @@ import {
   canReclaimVm,
   patchVmOwner,
   resolveOwnerUsername,
+  rentedMark,
   vmOriginLabel,
 } from './vm-owner'
 
@@ -42,6 +43,12 @@ describe('canReclaimVm', () => {
     expect(canReclaimVm(vm({ owner_user_id: null, origin: 'platform' }))).toBe(
       false
     )
+  })
+
+  it('shows 出租中 only when a tenant is assigned', () => {
+    expect(rentedMark('user-1')).toBe('出租中')
+    expect(rentedMark(null)).toBeNull()
+    expect(rentedMark('  ')).toBeNull()
   })
 })
 

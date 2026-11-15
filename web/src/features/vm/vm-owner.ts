@@ -8,6 +8,13 @@ export function canReclaimVm(vm: Vm): boolean {
   return vm.origin !== 'user_created'
 }
 
+/** 列表第三行：有租户才显示，没有租户不占位。 */
+export function rentedMark(
+  ownerId: string | null | undefined
+): '出租中' | null {
+  return String(ownerId || '').trim() ? '出租中' : null
+}
+
 export function vmOriginLabel(origin: string | null | undefined): string {
   switch (origin) {
     case 'user_created':

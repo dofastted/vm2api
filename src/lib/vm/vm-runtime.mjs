@@ -190,6 +190,21 @@ export function containerName(vmId) {
   return `kin-${String(vmId || '').replace(/^vm-/, '')}`
 }
 
+/** Remove a stopped slot container so the next boot is created under a new id. */
+export function discardSlotContainer(vmId, { run = sh } = {}) {
+  const name = containerName(vmId)
+  const outcome = inspectContainerOutcome(name, { run })
+  if (outcome.status !== 'found') return { ok: true, removed: false }
+  if (outcome.container.running || outcome.container.restarting) {
+    return { ok: false, code: 'vm_running', error: '容器仍在运行，不能改编号' }
+  }
+  const removed = run(['docker', 'rm', name])
+  if (!removed.ok && !isDockerInspectNotFound(removed)) {
+    return { ok: false, code: 'container_remove_failed', error: removed.stderr || '移除旧容器失败' }
+  }
+  return { ok: true, removed: true }
+}
+
 export function officialCcUidGid(vmId) {
   const n = parseVmIndex(vmId) || 1
   return { uid: UID_BASE + n, gid: Number(process.env.KIN_VM_GID || GID) }
@@ -268,10 +283,15 @@ function updateSlotRestartPolicy(vm, existing, run) {
   return { ...result, changed: result.ok === true }
 }
 
-/** Check the live mount and installed launcher before an irreversible redemption. */
-export function assertCragSubscriptionTarget(projectRoot, vm, routing) {
+/** A preinstalled, stopped slot can obtain a permit without starting its worker. */
+export function assertCragSubscriptionTarget(
+  projectRoot,
+  vm,
+  routing,
+  { reclaim = false, allowPrepared = false } = {},
+) {
   const unsupported = () =>
-    Object.assign(new Error('A running local Linux Docker CRAG v2 slot is required.'), {
+    Object.assign(new Error('A verified local Linux Docker CRAG v2 slot is required.'), {
       status: 409,
       code: 'crag_subscription_target_unready',
     })
@@ -286,19 +306,23 @@ export function assertCragSubscriptionTarget(projectRoot, vm, routing) {
   )
     throw unsupported()
 
-  const source = cragSubscriptionPublicDirectory(projectRoot)
   const slot = containerName(vm.id)
-  const result = sh(['docker', 'inspect', '--format', '{{.State.Running}}|{{json .Mounts}}', slot], { timeout: 3000 })
-  if (!result.ok || !result.stdout.startsWith('true|')) throw unsupported()
-  let mounts
-  try {
-    mounts = JSON.parse(result.stdout.slice(5))
-  } catch {
-    throw unsupported()
+  const outcome = inspectContainerOutcome(slot, { run: (args) => sh(args, { timeout: 3000 }) })
+  const prepared = allowPrepared && outcome.status === 'missing' && vm.status === 'stopped' && vm.schedulable === false
+  if (!prepared) {
+    if (outcome.status !== 'found' || !outcome.container?.running) throw unsupported()
+    const result = sh(['docker', 'inspect', '--format', '{{json .Mounts}}', slot], { timeout: 3000 })
+    try {
+      if (!result.ok) throw unsupported()
+      const mounts = JSON.parse(result.stdout)
+      const mount = Array.isArray(mounts) && mounts.find((item) => item.Destination === CRAG_HOST_MOUNT)
+      const source = cragSubscriptionPublicDirectory(projectRoot)
+      if (mount?.Type !== 'bind' || mount.RW !== false || mount.Source !== toHostPath(source, { projectRoot }))
+        throw unsupported()
+    } catch {
+      throw unsupported()
+    }
   }
-  const mount = Array.isArray(mounts) && mounts.find((item) => item.Destination === CRAG_HOST_MOUNT)
-  if (mount?.Type !== 'bind' || mount.RW !== false || mount.Source !== toHostPath(source, { projectRoot }))
-    throw unsupported()
   const staged = path.join(wrapCliHomeDir(projectRoot, vm.id), CRAG_V2_DIR)
   const installed = verifyCragV2Tree(staged, { allowPreviousClaude: true })
   const selected = verifyCragV2Tree(cragV2PackageRoot(projectRoot))
@@ -310,13 +334,32 @@ export function assertCragSubscriptionTarget(projectRoot, vm, routing) {
     installed.manifest.authorization.public_key_id !== selected.manifest.authorization.public_key_id
   )
     throw unsupported()
+  // A stopped slot only stages verified files. The normal start path still
+  // requires the signed permit and creates the read-only entitlement mount.
+  if (prepared) return true
   const capabilities = sh(['docker', 'exec', slot, '/home/kincli/.kin/crag-v2/crag-v2', '--license-capabilities'], {
     timeout: 3000,
   })
   try {
-    if (capabilities.ok && JSON.parse(capabilities.stdout).host_subscription === 1) return true
+    if (capabilities.ok) {
+      const flags = JSON.parse(capabilities.stdout)
+      if (flags.host_subscription === 1 && (!reclaim || flags.host_subscription_reclaim === 1)) return true
+    }
   } catch {}
   throw unsupported()
+}
+
+/** An enabled slot has both current host authorization and a ready local runtime. */
+export function isCragSubscriptionSlotEnabled(projectRoot, vm, routing, opts) {
+  if (vm.status !== 'running' || vm.node_id || isCodexVm(vm) || isKvmRuntime(vm)) return false
+  const { ok, license } = checkCragLicense(projectRoot, vm, routing)
+  if (!ok || license?.scope !== 'host') return false
+  try {
+    return assertCragSubscriptionTarget(projectRoot, vm, routing, opts)
+  } catch (error) {
+    if (error.code === 'crag_subscription_target_unready') return false
+    throw error
+  }
 }
 
 /** A stopped installation must not be revived by Docker policy before a manual start. */
@@ -1410,8 +1453,35 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
 }
 
 /** Explicit factory reset / delete only. Never call from Node deploy. */
-export function destroyVmRuntime(vm) {
+// For reclaim, the distinction between Docker returning 404 and Docker being unreachable is irreversible.
+function confirmVmTeardown(vm, run) {
+  const name = containerName(vm.id)
+  const inspect = () => run(['docker', 'container', 'inspect', '--format', '{{.Id}}', name], { timeout: 3000 })
+  const missing = (r) =>
+    !r.ok &&
+    r.code === 1 &&
+    !r.stdout &&
+    [
+      `Error: No such container: ${name}`,
+      `Error: No such object: ${name}`,
+      `Error response from daemon: No such container: ${name}`,
+    ].includes(r.stderr?.trim())
+  const failure = { ok: false, code: 'vm_teardown_unconfirmed', error: 'Could not confirm Docker container teardown' }
+  const before = inspect()
+  let action = 'absent'
+  if (!missing(before)) {
+    if (!before.ok || !/^[a-f0-9]{64}$/.test(before.stdout)) return failure
+    const removed = run(['docker', 'rm', '-f', before.stdout], { timeout: 60_000 })
+    if (!removed.ok || !missing(inspect())) return failure
+    action = 'removed'
+  }
+  if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true, removed: true }
+  return { ok: true, action, teardownConfirmed: true, runtime: vm.runtime || null }
+}
+
+export function destroyVmRuntime(vm, { requireConfirmation = false, run = sh } = {}) {
   if (!vm?.id) return { ok: false, error: 'vm required' }
+  if (requireConfirmation) return confirmVmTeardown(vm, run)
   const name = containerName(vm.id)
   const info = inspectContainer(name)
   if (!info) {

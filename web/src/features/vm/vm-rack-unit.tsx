@@ -3,7 +3,6 @@ import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
 import { resetCountdown } from '@/lib/fable-status'
 import { fmtNum, fmtUsd } from '@/lib/format'
-import { subscriptionListLabel } from '@/lib/subscription-expiry'
 import { cn } from '@/lib/utils'
 import { vmCostLedger } from '@/lib/vm-usage'
 import { RISK_SOLID, riskFg, riskLevel } from '@/features/vm/usage-meter'
@@ -94,10 +93,7 @@ export const VmUnit = memo(function VmUnit({
       )}
       {...open}
     >
-      <div
-        className='col-span-2 min-w-0'
-        title={subscriptionListLabel(vm, now).text}
-      >
+      <div className='col-span-2 min-w-0'>
         <VmAccountIdentity vm={vm} />
       </div>
       {state === 'live' ? (

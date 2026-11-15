@@ -1,6 +1,13 @@
+import { constants } from 'node:fs'
+import { open } from 'node:fs/promises'
+
 const ROOT = 'https://crag.fkcodex.com'
 const MAX_RESPONSE = 64 * 1024
+// Catalog descriptions can use the full published 128-plan limit with UTF-8 copy.
+const MAX_PLANS_RESPONSE = 384 * 1024
 const SHOP_TIMEOUT = 8000
+const PILOT_TOKEN_LENGTH = 43 // Unpadded base64url for 32 bytes.
+
 export const isPaymentMethod = (value) => value === 'wxpay' || value === 'alipay'
 export const isSku = (value) =>
   typeof value === 'string' && /^[a-zA-Z0-9]/.test(value) && value.length <= 64 && !/[^a-zA-Z0-9_-]/.test(value)
@@ -10,6 +17,8 @@ export const isOrderId = (value) =>
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
 export const ORDER_STATES = ['reserved', 'pending', 'paid', 'fulfilled']
 export const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value)
+export const isQuantity = (value) => Number.isInteger(value) && value >= 1 && value <= 2147483647
+export const isAmount = (value) => Number.isSafeInteger(value) && value >= 1
 
 export class ShopError extends Error {
   constructor(status, code, message) {
@@ -26,17 +35,58 @@ export function publicPlan(value) {
   const { sku, term, amount_minor, slot_limit } = value
   if (
     !isSku(sku) ||
-    !['1m', '3m', '1y'].includes(term) ||
-    !Number.isSafeInteger(amount_minor) ||
-    amount_minor < 1 ||
-    !(slot_limit === 'unlimited' || (Number.isInteger(slot_limit) && slot_limit >= 1 && slot_limit <= 2147483647))
+    !['1m', '3m', '1y', 'custom', 'monthly'].includes(term) ||
+    !isAmount(amount_minor) ||
+    !(slot_limit === 'unlimited' || isQuantity(slot_limit))
   )
     throw invalidReply()
-  return { sku, term, amount_minor, slot_limit }
+  const plan = { sku, term, amount_minor, slot_limit }
+  if (value.remaining !== undefined) {
+    if (value.remaining !== null && (!Number.isSafeInteger(value.remaining) || value.remaining < 0))
+      throw invalidReply()
+    plan.remaining = value.remaining
+  }
+  if (value.renewable !== undefined) {
+    if (typeof value.renewable !== 'boolean') throw invalidReply()
+    plan.renewable = value.renewable
+  }
+  return plan
+}
+
+function priceSnapshot(value, required = false) {
+  const snapshot = {}
+  for (const key of ['months', 'subtotal_minor', 'discount_minor']) {
+    if (!required && value[key] === undefined) continue
+    const valid = key === 'months' ? isQuantity(value[key]) : Number.isSafeInteger(value[key]) && value[key] >= 0
+    if (!valid) throw invalidReply()
+    snapshot[key] = value[key]
+  }
+  if (
+    (snapshot.subtotal_minor !== undefined && snapshot.subtotal_minor < value.amount_minor) ||
+    (snapshot.subtotal_minor !== undefined &&
+      snapshot.discount_minor !== undefined &&
+      snapshot.subtotal_minor - snapshot.discount_minor !== value.amount_minor)
+  )
+    throw invalidReply()
+  return snapshot
+}
+
+function publicQuote(value, input) {
+  const { renewable, ...plan } = publicPlan(value)
+  const snapshot = priceSnapshot(value, true)
+  if (
+    plan.sku !== input.sku ||
+    (input.slots !== undefined && plan.slot_limit !== input.slots) ||
+    (input.months !== undefined && snapshot.months !== input.months)
+  )
+    throw invalidReply()
+  return { ...plan, ...snapshot }
 }
 
 function publicOrder(value, row) {
   const plan = publicPlan(value)
+  const snapshot = priceSnapshot(value)
+  const purchase = row.purchase_json ? JSON.parse(row.purchase_json) : { sku: row.sku }
   const { order_id, status, created_at, payment_method } = value
   if (
     order_id !== row.order_id ||
@@ -44,10 +94,13 @@ function publicOrder(value, row) {
     payment_method !== row.payment_method ||
     !ORDER_STATES.slice(1).includes(status) ||
     !Number.isSafeInteger(created_at) ||
-    created_at <= 0
+    created_at <= 0 ||
+    (row.expected_amount_minor != null && plan.amount_minor !== row.expected_amount_minor) ||
+    (purchase.slots !== undefined && plan.slot_limit !== purchase.slots) ||
+    (purchase.months !== undefined && snapshot.months !== undefined && snapshot.months !== purchase.months)
   )
     throw invalidReply()
-  return { ...plan, order_id, status, created_at, payment_method }
+  return { ...plan, ...snapshot, order_id, status, created_at, payment_method }
 }
 
 const FORM_KEYS = [
@@ -114,14 +167,14 @@ function checkout(value, order, receipt) {
   return { url: value.url, data: Object.fromEntries(FORM_KEYS.map((key) => [key, fields[key]])) }
 }
 
-async function readReply(res) {
+async function readReply(res, maxBytes = MAX_RESPONSE) {
   if (!res.body || !/^application\/json(?:\s*;|$)/i.test(res.headers.get('content-type') || '')) throw invalidReply()
-  if (Number(res.headers.get('content-length')) > MAX_RESPONSE) throw invalidReply()
+  if (Number(res.headers.get('content-length')) > maxBytes) throw invalidReply()
   const chunks = []
   let bytes = 0
   for await (const chunk of res.body) {
     bytes += chunk.byteLength
-    if (bytes > MAX_RESPONSE) throw invalidReply()
+    if (bytes > maxBytes) throw invalidReply()
     chunks.push(chunk)
   }
   try {
@@ -131,8 +184,16 @@ async function readReply(res) {
   }
 }
 
+const commerceErrors = new Map([
+  ['amount_out_of_range', [400, 'shop_amount_out_of_range', 'Payment amount out of range']],
+  ['quote_changed', [409, 'shop_price_changed', 'Price changed; request a new quote']],
+  ['out_of_stock', [409, 'shop_out_of_stock', 'Launch plan sold out']],
+  ['coupon_unavailable', [409, 'shop_coupon_unavailable', 'Coupon unavailable']],
+  ['renewal_unavailable', [409, 'shop_renewal_unavailable', 'Current plan cannot be renewed']],
+])
+
 function supplierError(status, operation) {
-  if (status === 404 && operation === 'create') {
+  if (status === 404 && ['create', 'quote'].includes(operation)) {
     return new ShopError(404, 'shop_item_unavailable', 'Plan or payment method unavailable')
   }
   if (status === 404 && operation !== 'plans') return new ShopError(404, 'shop_order_not_found', 'Order not found')
@@ -140,9 +201,46 @@ function supplierError(status, operation) {
     return new ShopError(409, 'shop_claim_not_ready', 'Order is not ready to claim')
   if (status === 409 && operation === 'create')
     return new ShopError(409, 'shop_order_conflict', 'Order input conflicts')
+  if ([400, 422].includes(status) && ['create', 'quote'].includes(operation))
+    return new ShopError(400, 'shop_invalid_purchase', 'Purchase options are unavailable or invalid')
+  if ([401, 403, 409].includes(status) && ['create', 'quote'].includes(operation))
+    return new ShopError(409, 'shop_purchase_unavailable', 'Purchase is unavailable; request a new quote')
   if (status === 429) return new ShopError(429, 'shop_rate_limited', 'CRAG shop is busy; try again later')
   if (status === 503) return new ShopError(503, 'shop_unavailable', 'CRAG shop unavailable; try again later')
   return invalidReply()
+}
+
+async function readPilotToken(file) {
+  const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  try {
+    const maxSize = PILOT_TOKEN_LENGTH + 2 // Allow a single trailing LF or CRLF.
+    const stat = await handle.stat()
+    const { mode, size, uid } = stat
+    if (!stat.isFile() || (mode & 0o7777) !== 0o600 || uid !== process.geteuid() || size > maxSize) {
+      throw new Error('Invalid CRAG shop pilot credential file')
+    }
+
+    // Bound the read even if the file grows after stat.
+    const bytes = Buffer.alloc(maxSize + 1)
+    let length = 0
+    while (length < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, length, bytes.length - length, length)
+      if (bytesRead === 0) break
+      length += bytesRead
+    }
+    const token = bytes.toString('latin1', 0, length).replace(/\r?\n$/, '')
+    if (
+      length !== size ||
+      token.length !== PILOT_TOKEN_LENGTH ||
+      /[^A-Za-z0-9_-]/.test(token) ||
+      Buffer.from(token, 'base64url').toString('base64url') !== token
+    ) {
+      throw new Error('Invalid CRAG shop pilot credential file')
+    }
+    return token
+  } finally {
+    await handle.close()
+  }
 }
 
 export function createShopSupplier(fetchImpl = globalThis.fetch) {
@@ -152,6 +250,18 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
     if (body) headers['content-type'] = 'application/json'
     let response
     try {
+      let pilotToken
+      const pilotFile = process.env.VM2API_CRAG_SHOP_PILOT_TOKEN_FILE
+      if (
+        pilotFile !== undefined &&
+        ((operation === 'plans' && method === 'GET' && path === '/shop/plans') ||
+          (operation === 'quote' && method === 'POST' && path === '/shop/quote') ||
+          (operation === 'create' && method === 'POST' && path === '/shop/orders') ||
+          (operation === 'resume' && method === 'POST' && /^\/shop\/orders\/[0-9a-f-]{36}\/resume$/.test(path)))
+      ) {
+        pilotToken = await readPilotToken(pilotFile)
+        headers['X-Crag-Shop-Pilot'] = pilotToken
+      }
       response = await fetchImpl(`${ROOT}${path}`, {
         method,
         headers,
@@ -160,8 +270,20 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
         cache: 'no-store',
         signal: AbortSignal.timeout(SHOP_TIMEOUT),
       })
-      if (!response.ok) throw supplierError(response.status, operation)
-      return await readReply(response)
+      if (!response.ok) {
+        if (['create', 'quote'].includes(operation) && [400, 409].includes(response.status)) {
+          const reply = await readReply(response).catch(() => null)
+          const known = commerceErrors.get(reply?.error)
+          if (known?.[0] === response.status) throw new ShopError(...known)
+        }
+        throw supplierError(response.status, operation)
+      }
+      const value = await readReply(response, operation === 'plans' ? MAX_PLANS_RESPONSE : MAX_RESPONSE)
+      // Never surface an accidentally reflected pilot token in buyer data or payment forms.
+      for (const secret of [pilotToken, body?.renewal_proof]) {
+        if (secret && JSON.stringify(value).includes(JSON.stringify(secret).slice(1, -1))) throw invalidReply()
+      }
+      return value
     } catch (err) {
       if (err instanceof ShopError) throw err
       throw new ShopError(503, 'shop_unavailable', 'CRAG shop unavailable; try again later')
@@ -180,17 +302,112 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
         !value.payment_methods.every(isPaymentMethod)
       )
         throw invalidReply()
-      const plans = value.plans.map(publicPlan)
+      const plans = value.plans.map((value) => {
+        const plan = publicPlan(value)
+        for (const key of ['name', 'description']) {
+          if (value[key] === undefined) continue
+          if (typeof value[key] !== 'string') throw invalidReply()
+          plan[key] = value[key]
+        }
+        if (value.enabled !== undefined) {
+          if (typeof value.enabled !== 'boolean') throw invalidReply()
+          plan.enabled = value.enabled
+        }
+        if (value.stock !== undefined) {
+          if (!Number.isSafeInteger(value.stock) || value.stock < 0) throw invalidReply()
+          plan.stock = value.stock
+        }
+        if (value.months !== undefined) {
+          if (!isQuantity(value.months)) throw invalidReply()
+          plan.months = value.months
+        }
+        return plan
+      })
       if (new Set(plans.map(({ sku }) => sku)).size !== plans.length) throw invalidReply()
-      return { plans, payment_methods: [...new Set(value.payment_methods)] }
+      const result = { plans, payment_methods: [...new Set(value.payment_methods)] }
+      if (value.commerce !== undefined) {
+        const commerce = value.commerce
+        if (
+          !object(commerce) ||
+          !isAmount(commerce.unit_amount_minor) ||
+          !isAmount(commerce.max_amount_minor) ||
+          commerce.unit_amount_minor > commerce.max_amount_minor ||
+          !isQuantity(commerce.max_months) ||
+          !isQuantity(commerce.max_slots) ||
+          !isQuantity(commerce.min_months ?? 1) ||
+          !isQuantity(commerce.min_slots ?? 1) ||
+          commerce.min_months === null ||
+          commerce.min_slots === null ||
+          (commerce.min_months ?? 1) > commerce.max_months ||
+          (commerce.min_slots ?? 1) > commerce.max_slots ||
+          (commerce.custom_enabled !== undefined && typeof commerce.custom_enabled !== 'boolean') ||
+          (commerce.custom_renewable !== undefined && typeof commerce.custom_renewable !== 'boolean')
+        )
+          throw invalidReply()
+        result.commerce = Object.fromEntries(
+          [
+            'unit_amount_minor',
+            'max_amount_minor',
+            'min_months',
+            'max_months',
+            'min_slots',
+            'max_slots',
+            'custom_enabled',
+            'custom_renewable',
+          ]
+            .filter((key) => commerce[key] !== undefined)
+            .map((key) => [key, commerce[key]]),
+        )
+      }
+      if (value.revision !== undefined) {
+        if (!Number.isSafeInteger(value.revision) || value.revision < 0) throw invalidReply()
+        result.revision = value.revision
+      }
+      if (value.presentation !== undefined) {
+        if (!object(value.presentation)) throw invalidReply()
+        result.presentation = {}
+        for (const key of [
+          'title',
+          'description',
+          'plans_title',
+          'orders_title',
+          'custom_title',
+          'unavailable_text',
+          'empty_plans_text',
+          'empty_orders_text',
+        ]) {
+          if (value.presentation[key] === undefined) continue
+          if (typeof value.presentation[key] !== 'string') throw invalidReply()
+          result.presentation[key] = value.presentation[key]
+        }
+      }
+      return result
     },
-    async create(row, receipt) {
-      const { order_id, sku, payment_method } = row
+    async quote(input, renewalProof) {
+      const value = await send('quote', '/shop/quote', {
+        method: 'POST',
+        body: { ...input, ...(renewalProof ? { renewal_proof: renewalProof } : {}) },
+      })
+      return publicQuote(value, input)
+    },
+    async create(row, receipt, renewalProof, purchase = { sku: row.sku }) {
+      const { order_id, payment_method } = row
       const value = await send('create', '/shop/orders', {
         method: 'POST',
         receipt,
-        body: { order_id, sku, payment_method },
+        body: {
+          order_id,
+          ...purchase,
+          payment_method,
+          ...(row.expected_amount_minor != null ? { expected_amount_minor: row.expected_amount_minor } : {}),
+          ...(renewalProof ? { renewal_proof: renewalProof } : {}),
+        },
       })
+      const order = publicOrder(value, row)
+      return { order, form: checkout(value, order, receipt) }
+    },
+    async resume(row, receipt) {
+      const value = await send('resume', `/shop/orders/${row.order_id}/resume`, { method: 'POST', receipt })
       const order = publicOrder(value, row)
       return { order, form: checkout(value, order, receipt) }
     },

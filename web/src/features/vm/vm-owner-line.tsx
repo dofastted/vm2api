@@ -1,25 +1,20 @@
 import { useQuery } from '@tanstack/react-query'
 import type { Vm } from '@/types/panel-vm'
 import { meQueryOptions } from '@/features/auth/queries'
-import { usersQueryOptions } from '@/features/users/queries'
-import { resolveOwnerUsername, vmOriginLabel } from '@/features/vm/vm-owner'
+import { rentedMark } from '@/features/vm/vm-owner'
 
-/** Admin-only：列表 / 卡片上的租户属主读数。 */
-export function VmOwnerLine({ vm, className }: { vm: Vm; className?: string }) {
+/** Admin-only。有租户才显示；平台池不占这一格。 */
+export function VmRentedMark({ vm }: { vm: Vm }) {
   const me = useQuery(meQueryOptions())
-  const admin = me.data?.role === 'admin'
-  const users = useQuery({
-    ...usersQueryOptions(),
-    enabled: admin,
-    staleTime: 60_000,
-  })
-  if (!admin) return null
-  const label = resolveOwnerUsername(vm.owner_user_id, users.data?.items)
-  const origin = vmOriginLabel(vm.origin)
+  if (me.data?.role !== 'admin') return null
+  const label = rentedMark(vm.owner_user_id)
+  if (!label) return null
   return (
-    <p className={className} title={`来源：${origin}`}>
-      租户 {label}
-      <span className='text-muted-foreground'> · {origin}</span>
-    </p>
+    <span
+      className='rounded bg-[color:var(--status-warn-bg)] px-1 font-semibold text-[color:var(--status-warn)]'
+      title='已分配租户'
+    >
+      {label}
+    </span>
   )
 }
