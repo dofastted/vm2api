@@ -279,7 +279,7 @@ import {
 import { inspectClusterPayloadChanges, refreshClusterSlotPayloads } from '../cluster/remote-slot.mjs'
 import { readRawBody as defaultReadRawBody } from '../http/respond.mjs'
 import { corsHeadersForRequest } from '../http/cors.mjs'
-import { createCragShopHandler, cragShopRoute, isCragShopPath } from './crag-shop.mjs'
+import { createCragShopHandler, cragShopRoute, isCragShopPath, sameOriginPost } from './crag-shop.mjs'
 import { createCragSubscriptionHandler, cragSubscriptionRoute } from './crag-subscription-routes.mjs'
 import { restartRustKernel, syncClaudeKernelConfigs, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 
@@ -293,6 +293,7 @@ import {
   distributeCragUniversalGrant,
   getCragLicense,
   projectCragUniversalVm,
+  redeemCragDeviceVoucher,
 } from '../vm/crag-license.mjs'
 import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
@@ -3261,6 +3262,7 @@ export function createPanelHandler(ctx) {
       }
 
       if (['GET', 'POST'].includes(req.method) && /^\/api\/panel\/vms\/[^/]+\/crag-license$/.test(p)) {
+        res.setHeader?.('Cache-Control', 'no-store')
         if (panelIdentity(req).role !== 'admin')
           return json(res, 403, {
             ok: false,
@@ -3291,12 +3293,25 @@ export function createPanelHandler(ctx) {
               },
             })
           }
-          const activated = activateCragLicense(cfg.paths.project, vm, registrationCode)
+          const online = registrationCode.startsWith('CRAGR1.')
+          if (online && !sameOriginPost(req, cfg.base_url)) {
+            return json(res, 403, {
+              ok: false,
+              error: { code: 'license_redeem_origin', message: 'Same origin required.' },
+            })
+          }
+          const activated = online
+            ? await redeemCragDeviceVoucher(cfg.paths.project, vm, registrationCode, {
+                getTarget: () => getVm(cfg.paths.project, vm.id),
+                routing: ctx.routingConfig,
+                fetchImpl: ctx.fetchCragDeviceGrant,
+              })
+            : activateCragLicense(cfg.paths.project, vm, registrationCode)
           if (activated.license?.scope === 'kernel') await distributeCragUniversalGrant(cfg.paths.project)
           return json(res, 200, panel.ok(activated))
         } catch (error) {
           const typed = error instanceof CragLicenseError
-          return json(res, typed ? 403 : 400, {
+          return json(res, typed ? error.status : 400, {
             ok: false,
             error: {
               code: typed ? error.code : 'license_invalid',
