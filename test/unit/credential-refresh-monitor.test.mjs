@@ -57,6 +57,30 @@ test('due when expired, not due after a recorded refresh_error', () => {
   )
 })
 
+test('fresh running remote Claude slots repair links without refreshing or waking other slots', async () => {
+  const fresh = { ...offSlot, status: 'running', node_id: 'node-a', expires_at: Date.now() + 3600_000 }
+  const checked = []
+  const monitor = createCredentialRefreshMonitor({
+    listTargets: () => [
+      fresh,
+      { ...fresh, id: 'local', node_id: null },
+      { ...fresh, id: 'off', status: 'stopped' },
+      { ...fresh, id: 'other', platform: 'openai' },
+    ],
+    refreshOne: () => assert.fail('fresh grant must not be exchanged'),
+    ensureLink: async (vm) => {
+      checked.push(vm.id)
+      if (checked.length === 1) throw new Error('private diagnostic')
+      return { linked: true }
+    },
+  })
+  const failed = await monitor.runOnce()
+  assert.equal(failed.due, 0)
+  assert.deepEqual(failed.link_failures, [{ vm_id: fresh.id, reason: 'credential_link_failed' }])
+  assert.deepEqual((await monitor.runOnce()).link_failures, [])
+  assert.deepEqual(checked, [fresh.id, fresh.id])
+})
+
 test('revoked access with remaining TTL is an operator hint, not a scheduled force', () => {
   const now = Date.now()
   const revoked = {

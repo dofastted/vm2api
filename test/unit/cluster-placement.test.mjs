@@ -64,6 +64,10 @@ function fakeNode(files = new Map()) {
   const handles = new Map()
   const published = []
   const symlinksCreated = []
+  sftp.lstat = (p, cb) => {
+    if (!files.has(p) && !links.has(p)) return setImmediate(() => cb(Object.assign(new Error('missing'), { code: 2 })))
+    return ok(cb, { isFile: () => files.has(p), isSymbolicLink: () => links.has(p) })
+  }
   sftp.open = (p, flags, attrs, cb) => {
     if (flags !== 'wx') return fail(cb, `unexpected flags ${flags}`)
     if (files.has(p) || links.has(p)) return fail(cb, 'EEXIST')
@@ -94,6 +98,12 @@ function fakeNode(files = new Map()) {
   }
   sftp.ext_openssh_rename = (from, to, cb) => {
     published.push(to)
+    if (links.has(from)) {
+      links.set(to, links.get(from))
+      links.delete(from)
+      files.delete(to)
+      return ok(cb)
+    }
     links.delete(to)
     files.set(to, files.get(from))
     modes.set(to, modes.get(from))
@@ -336,19 +346,58 @@ test('login prepare reconcile keeps a live remote credential when local is stale
   const node = fakeNode()
   node.files.set(node.remoteCred, Buffer.from('{"rt":"rotated-live"}'))
   const slotDir = localSlot('{"rt":"stale-local"}')
+  const official = `${node.session.host.root}/vms/vm-07/claude/.credentials.json`
+  node.files.set(official, Buffer.from('{"claudeAiOauth":{"accessToken":"","refreshToken":""}}'))
   const r = await reconcileSlotCredentials(vm, slotDir, node.session)
   assert.equal(r.pulled, true)
   assert.equal(node.files.get(node.remoteCred).toString(), '{"rt":"rotated-live"}')
   const local = path.join(slotDir, 'cli-home', '.claude', 'credentials.json')
   assert.equal(fs.readFileSync(local, 'utf8'), '{"rt":"rotated-live"}')
-  const official = `${node.session.host.root}/vms/vm-07/claude/.credentials.json`
-  node.files.set(official, Buffer.from('{"rt":"loose-native-copy"}'))
-  const link = await ensureRemoteOfficialCredentialLink(vm, slotDir, node.session)
-  assert.equal(link.linked, true)
   assert.equal(node.links.get(official), 'credentials.json')
   assert.equal(node.files.has(official), false)
+  node.files.set(node.remoteCred, Buffer.from('{"rt":"next-rotation"}'))
+  assert.equal(
+    node.files.get(path.posix.join(path.posix.dirname(official), node.links.get(official))).toString(),
+    '{"rt":"next-rotation"}',
+  )
   assert.equal((await ensureRemoteOfficialCredentialLink(vm, slotDir, node.session)).linked, true)
-  assert.deepEqual(node.symlinksCreated, [official])
+  assert.equal(node.symlinksCreated.length, 1)
+  assert.deepEqual(node.published, [official])
+})
+
+test('periodic link repair only inspects metadata and refuses a missing or symlinked authority', async () => {
+  const node = fakeNode()
+  node.session.client.exec = () => assert.fail('maintenance must not pull credential bytes')
+  const check = () => ensureRemoteOfficialCredentialLink(vm, null, node.session)
+  assert.deepEqual(await check(), { linked: false, reason: 'remote_missing' })
+  node.links.set(node.remoteCred, '../other-slot/credentials.json')
+  assert.deepEqual(await check(), { linked: false, reason: 'remote_not_regular' })
+  assert.deepEqual(node.symlinksCreated, [])
+  node.links.delete(node.remoteCred)
+  node.files.set(node.remoteCred, Buffer.from('current'))
+  const official = path.posix.join(path.posix.dirname(node.remoteCred), '.credentials.json')
+  node.links.set(official, '/obsolete/credentials.json')
+  const results = await Promise.all([check(), check()])
+  assert.ok(results.every((result) => result.linked))
+  assert.deepEqual([...node.links], [[official, 'credentials.json']])
+  assert.equal(node.files.get(node.remoteCred).toString(), 'current')
+})
+
+test('failed atomic link publication leaves the old name intact and can retry', async () => {
+  const node = fakeNode()
+  const official = path.posix.join(path.posix.dirname(node.remoteCred), '.credentials.json')
+  node.files.set(official, Buffer.from('old'))
+  node.files.set(node.remoteCred, Buffer.from('current'))
+  const sftp = await new Promise((resolve) => node.session.client.sftp((_, value) => resolve(value)))
+  const rename = sftp.ext_openssh_rename
+  sftp.ext_openssh_rename = (_from, _to, cb) => cb(new Error('rename failed'))
+  const check = () => ensureRemoteOfficialCredentialLink(vm, null, node.session)
+  await assert.rejects(check(), { code: 'sftp_failed' })
+  assert.equal(node.files.get(official).toString(), 'old')
+  assert.deepEqual([...node.links], [])
+  sftp.ext_openssh_rename = rename
+  assert.equal((await check()).linked, true)
+  assert.equal(node.links.get(official), 'credentials.json')
 })
 
 test('start reconcile never overwrites a remote credential the slot already rotated', async () => {

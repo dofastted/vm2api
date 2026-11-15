@@ -389,6 +389,13 @@ export async function pullSlotCredentials(vm, slotDir, session = null) {
     record = mirrorWorkerCredentialsToVm(vmPath, path.join(slotDir, 'cli-home'))
   }
   if (record) vm.claude = record.claude
+  if (!isCodexVm(vm)) {
+    await remoteSymlink(
+      await openSftp(s.client),
+      'credentials.json',
+      `${remoteSlotDir(s.host, vm.id)}/claude/.credentials.json`,
+    )
+  }
   return same ? { pulled: false, reason: 'same' } : { pulled: true }
 }
 
@@ -406,16 +413,17 @@ export async function reconcileSlotCredentials(vm, slotDir, session) {
 export async function ensureRemoteOfficialCredentialLink(vm, slotDir, session = null) {
   const s = session || (await nodeSession(vmNodeId(vm)))
   const remoteCred = `${remoteSlotDir(s.host, vm.id)}/${remoteSlotPath(CREDENTIALS)}`
-  const remote = await readRemoteFileNoFollow(s.client, remoteCred)
-  if (!remote) return { linked: false, reason: 'remote_missing' }
-  await prepareRemoteDir(s, vm)
   const sftp = await openSftp(s.client)
-  const official = `${remoteSlotDir(s.host, vm.id)}/claude/.credentials.json`
-  // Preflight also runs while a shell is open: don't unlink a working alias on every tick.
-  const target = await new Promise((resolve) =>
-    sftp.readlink(official, (error, value) => resolve(error ? null : value)),
-  )
-  if (target !== 'credentials.json') await remoteSymlink(sftp, 'credentials.json', official)
+  const regular = await new Promise((resolve, reject) => {
+    sftp.lstat(remoteCred, (error, stat) => {
+      if (error?.code === 2) return resolve(null)
+      if (error) return reject(error)
+      resolve(stat.isFile())
+    })
+  })
+  if (regular === null) return { linked: false, reason: 'remote_missing' }
+  if (!regular) return { linked: false, reason: 'remote_not_regular' }
+  await remoteSymlink(sftp, 'credentials.json', `${path.posix.dirname(remoteCred)}/.credentials.json`)
   return { linked: true }
 }
 

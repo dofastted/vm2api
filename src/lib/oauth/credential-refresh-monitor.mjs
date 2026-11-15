@@ -6,7 +6,8 @@
  */
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
-import { hasRefreshPresence, needsRefresh } from './oauth-credentials.mjs'
+import { isCodexVm } from '../vm/vm-kind.mjs'
+import { hasCredentialPresence, hasRefreshPresence, needsRefresh } from './oauth-credentials.mjs'
 
 export const DEFAULT_CREDENTIAL_REFRESH = Object.freeze({
   enabled: true,
@@ -100,16 +101,12 @@ export function createCredentialRefreshMonitor(opts = {}) {
   let lastRun = null
   const nowFn = opts.now || (() => Date.now())
 
-  const listDue = () => {
-    const vms = typeof opts.listTargets === 'function' ? opts.listTargets() || [] : []
-    return vms.filter((vm) => isCredentialRefreshTarget(vm) && needsScheduledRefresh(vm, nowFn()))
-  }
-
   const runOnce = async () => {
     if (inflight) return inflight
     inflight = (async () => {
       const started = nowFn()
-      const due = listDue()
+      const vms = opts.listTargets?.() || []
+      const due = vms.filter((vm) => isCredentialRefreshTarget(vm) && needsScheduledRefresh(vm, started))
       const items = []
       if (due.length && typeof opts.refreshOne === 'function') {
         await mapPool(due, config.concurrency, async (vm) => {
@@ -132,10 +129,29 @@ export function createCredentialRefreshMonitor(opts = {}) {
           }
         })
       }
+      const linkFailures = []
+      if (opts.ensureLink) {
+        const running = vms.filter(
+          (vm) =>
+            vm.node_id &&
+            vm.status === 'running' &&
+            !isCodexVm(vm) &&
+            (hasCredentialPresence(vm.claude) || hasCredentialPresence(vm)),
+        )
+        await mapPool(running, config.concurrency, async (vm) => {
+          try {
+            const result = await opts.ensureLink(vm)
+            if (!result.linked) linkFailures.push({ vm_id: vm.id, reason: result.reason })
+          } catch {
+            linkFailures.push({ vm_id: vm.id, reason: 'credential_link_failed' })
+          }
+        })
+      }
       lastRun = {
         at: new Date(nowFn()).toISOString(),
         duration_ms: nowFn() - started,
         due: due.length,
+        link_failures: linkFailures,
         items,
       }
       return lastRun

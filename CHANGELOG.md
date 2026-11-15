@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.4.106 — 2026-11-16 · 修复远端 Claude 槽读取旧凭据
+
+- 凭据回拉和定时巡检修复远端 `.credentials.json`，使官方 CLI 和健康检查使用同一个节点凭据文件。链接替换是原子的；巡检不读取令牌、不发起换票、不重启槽。
+- 修复位于 vm2api 控制面，不改变 CRAG 版本、授权、签名包或已选择的内核。使用历史 CRAG 包的部署也应更新控制面，单独重新下载内核不能修复凭据分裂。见 [OAuth 凭据生命周期](docs/OAUTH.md)。
+
 ## 1.4.105 — 2026-11-16 · CRAG 统一在线兑换
 
 - CRAG [3.0.8 标准版](docs/releases/crag-native-v3.0.8.json)和 [3.0.8 旧离线授权兼容版](docs/releases/crag-native-v3.0.8-legacy.json)修复 Auto 分类请求携带 `metadata` 时返回 400（#1072），以及串行工具回调等待整批结果的互等；不新增终端 stdout 实时流。
