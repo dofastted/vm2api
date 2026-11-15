@@ -456,6 +456,7 @@ export function createCragShopHandler({
           [
             'shop_admin_required',
             'crag_subscription_target_changed',
+            'issuer_mismatch',
             'host_redeem_conflict',
             'redeem_unavailable',
             'host_binding_conflict',

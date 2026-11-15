@@ -44,7 +44,7 @@ const text = (value) => typeof value === 'string' && value.length > 0 && value.l
 const packageTrustCache = new Map()
 const MAX_TRUST_ROOTS = 8
 const redeemingSlots = new Set()
-const DEVICE_REDEEM_URL = 'https://crag.fkcodex.com/v1/device-activation/redeem'
+const DEVICE_ACTIVATION_URL = 'https://crag.fkcodex.com/v1/device-activation'
 
 export class CragLicenseError extends Error {
   constructor(code, status = 403) {
@@ -373,6 +373,10 @@ function trust(projectRoot, installedRoot) {
 
 export function selectedCragPayloadId(projectRoot) {
   return trust(projectRoot).keyId
+}
+
+export function selectedCragIssuerId(projectRoot) {
+  return trust(projectRoot).issuerId
 }
 function publicFailure(vm, error) {
   const code =
@@ -1091,10 +1095,10 @@ export function activateCragLicense(projectRoot, vm, code) {
   }
 }
 
-async function requestDeviceGrant(body, fetchImpl) {
+async function requestVoucher(action, body, fetchImpl) {
   let response
   try {
-    response = await fetchImpl(DEVICE_REDEEM_URL, {
+    response = await fetchImpl(`${DEVICE_ACTIVATION_URL}/${action}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify(body),
@@ -1111,13 +1115,14 @@ async function requestDeviceGrant(body, fetchImpl) {
       chunks.push(chunk)
     }
     const reply = JSON.parse(Buffer.concat(chunks).toString('utf8'))
-    if (
-      response.ok &&
-      reply.ok === true &&
-      typeof reply.data?.registration_code === 'string' &&
-      typeof reply.data.replayed === 'boolean'
-    ) {
-      return { registration: reply.data.registration_code, replayed: reply.data.replayed }
+    if (response.ok && reply.ok === true) {
+      if (action === 'resolve' && ['device', 'host'].includes(reply.data?.kind)) return reply.data.kind
+      if (
+        action === 'redeem' &&
+        typeof reply.data?.registration_code === 'string' &&
+        typeof reply.data.replayed === 'boolean'
+      )
+        return { registration: reply.data.registration_code, replayed: reply.data.replayed }
     }
     if (response.status === 404 && reply.error?.code === 'redeem_unavailable') fail('license_redeem_unavailable')
     if (response.status === 409 && ['redeem_conflict', 'payload_key_conflict'].includes(reply.error?.code))
@@ -1135,6 +1140,16 @@ async function requestDeviceGrant(body, fetchImpl) {
   } finally {
     if (response?.body && !response.body.locked) void response.body.cancel().catch(() => {})
   }
+}
+
+export function resolveCragVoucherKind(projectRoot, voucher, fetchImpl = globalThis.fetch) {
+  if (typeof voucher !== 'string' || !/^CRAGR1\.[A-Za-z0-9_-]{43}$/.test(voucher)) fail('license_redeem_unavailable')
+  decodeLicenseBytes(voucher.slice(7), 32)
+  return requestVoucher(
+    'resolve',
+    { redemption_code: voucher, issuer_public_key_id: selectedCragIssuerId(projectRoot) },
+    fetchImpl,
+  )
 }
 
 export async function redeemCragDeviceVoucher(
@@ -1165,7 +1180,8 @@ export async function redeemCragDeviceVoucher(
     const context = deviceContext(projectRoot, vm, true)
     const original = storedRegistration(context.dir)
     if (selectsSubscription(original)) throw new CragLicenseError('license_redeem_subscription', 409)
-    const { registration, replayed } = await requestDeviceGrant(
+    const { registration, replayed } = await requestVoucher(
+      'redeem',
       {
         redemption_code: voucher,
         machine_code: context.machine_code,

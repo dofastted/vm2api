@@ -25,10 +25,14 @@ import {
   calendarExpiry,
   fixtureAuthority,
   issueFixtureCode,
+  issueHostEntitlement,
+  issueSlotPermit,
   seedEncryptedPackage,
   issueUniversalCode,
   signedCode,
 } from '../fixtures/crag-license.mjs'
+import { createCragSubscription } from '../../src/lib/vm/crag-subscription.mjs'
+import { cragSubscriptionPublicDirectory } from '../../src/lib/vm/crag-subscription-paths.mjs'
 
 const savedEnv = { run: process.env.KIN_SLOT_RUN_ROOT, pkg: process.env.KIN_CRAG_V2_ROOT }
 before(() => {
@@ -54,12 +58,21 @@ function fixture(t) {
   const pkg = seedEncryptedPackage(root)
   return { root, vm, pkg }
 }
-function route(root, method, suffix, body, role = 'admin', id = 'vm-13', { fetchCragDeviceGrant, origin } = {}) {
+function route(
+  root,
+  method,
+  suffix,
+  body,
+  role = 'admin',
+  id = 'vm-13',
+  { fetchCragDeviceGrant, origin, cragSubscription } = {},
+) {
   const result = {}
   const handle = createPanelHandler({
     cfg: { paths: { project: root }, vm: { id: null } },
     routingConfig: {},
     fetchCragDeviceGrant,
+    cragSubscription,
     requireAuth(req) {
       req.panelUser = 'fixture'
       req.panelRole = role
@@ -114,8 +127,13 @@ test('lost voucher response can recover the original device grant without overwr
   const vmFile = path.join(root, 'vms', `${vm.id}.json`)
   let grant
   let requests = 0
-  const fetchCragDeviceGrant = async (_url, init) => {
+  const fetchCragDeviceGrant = async (url, init) => {
     const input = JSON.parse(init.body)
+    if (url.endsWith('/resolve')) {
+      assert.equal(input.redemption_code, credential)
+      assert.match(input.issuer_public_key_id, /^[a-f0-9]{64}$/)
+      return Response.json({ ok: true, data: { kind: 'device' } })
+    }
     grant ??= issueFixtureCode(root, input.machine_code)
     requests++
     if (requests === 1) throw new Error('transport failed after Authority committed')
@@ -144,6 +162,70 @@ test('lost voucher response can recover the original device grant without overwr
   activateCragLicense(root, vm, newer.code)
   assert.equal((await redeem()).body.error.code, 'license_redeem_target_changed')
   assert.equal(fs.readFileSync(file, 'utf8').trim(), newer.code)
+})
+
+test('the shared activation field redeems a purchase and binds the selected slot', async (t) => {
+  const { root, vm } = fixture(t)
+  Object.assign(vm, { dataplane: 'crag', crag_kernel_version: 'v2' })
+  fs.writeFileSync(path.join(root, 'vms', `${vm.id}.json`), JSON.stringify(vm))
+  const machineIdFile = path.join(root, 'host-machine-id')
+  fs.writeFileSync(machineIdFile, crypto.randomBytes(16).toString('hex'), { mode: 0o600 })
+  fs.mkdirSync(path.dirname(path.dirname(cragSubscriptionPublicDirectory(root))), { recursive: true })
+  const registration_code = `CRAGR1.${crypto.randomBytes(32).toString('base64url')}`
+  const calls = []
+  let accepted
+  let issuer
+  let rejectPayload = true
+  const cragSubscription = createCragSubscription({
+    projectRoot: root,
+    machineIdFile,
+    listTargets: () => [vm],
+    assertReady: () => true,
+    fetchImpl: async (url, init) => {
+      const action = new URL(url).pathname.split('/').pop()
+      calls.push(action)
+      const body = JSON.parse(init.body)
+      assert.match(init.headers.authorization, /^Bearer /)
+      if (action === 'redeem') {
+        assert.equal(body.redemption_code, registration_code)
+        assert.equal(body.issuer_public_key_id, issuer)
+        assert.match(body.payload_key_id, /^[a-f0-9]{64}$/)
+        if (rejectPayload) return Response.json({ ok: false, error: { code: 'payload_key_unknown' } }, { status: 400 })
+        accepted ??= issueHostEntitlement(root, body.host_id, { slot_limit: 1 })
+      }
+      const { code, claims } = accepted
+      const data = { entitlement: code, revision: claims.revision, expires_at: claims.expires_at, slot_limit: 1 }
+      if (action === 'bind') {
+        const permit = issueSlotPermit(root, body.machine_code, body.host_id, { seat: 1 })
+        Object.assign(data, { seat: 1, slot_permit: permit.code })
+      }
+      return Response.json({ ok: true, data })
+    },
+  })
+  const fetchCragDeviceGrant = async (url, init) => {
+    assert.match(url, /\/resolve$/)
+    calls.push('resolve')
+    const body = JSON.parse(init.body)
+    assert.equal(body.redemption_code, registration_code)
+    issuer = body.issuer_public_key_id
+    return Response.json({ ok: true, data: { kind: 'host' } })
+  }
+  const submit = () =>
+    route(root, 'POST', '/crag-license', { registration_code }, 'admin', vm.id, {
+      origin: 'http://localhost',
+      fetchCragDeviceGrant,
+      cragSubscription,
+    })
+  const rejected = await submit()
+  assert.equal(rejected.body.error.code, 'payload_key_unknown')
+  assert.equal(fs.existsSync(path.join(cragSubscriptionPublicDirectory(root), 'sync-pending')), false)
+  rejectPayload = false
+  const activated = await submit()
+  assert.equal(activated.status, 200)
+  assert.equal(activated.body.data.license.valid, true)
+  assert.equal(activated.body.data.license.scope, 'host')
+  assert.deepEqual(calls, ['resolve', 'redeem', 'resolve', 'redeem', 'bind'])
+  assert.doesNotMatch(JSON.stringify(activated.body), /CRAGR1|CRAGS1|CRAGH1|wrapped_key/)
 })
 
 test('universal CRAGU1 activates without creating a device binding', async (t) => {
