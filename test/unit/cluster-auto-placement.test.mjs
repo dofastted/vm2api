@@ -33,7 +33,7 @@ test('normalizeAutoPlacement: off by default, bad values fall back', () => {
   assert.equal(d.on_full, 'local')
   const p = normalizeAutoPlacement({
     enabled: true,
-    max_commit_ratio: 2,
+    max_commit_ratio: 5,
     min_free_memory: 'lots',
     slot_reserve_memory: '8G',
     nodes: ['n1', 'n1', ''],
@@ -120,6 +120,30 @@ test('rankPlacement: most booked headroom share first; vetoes full, starved and 
   assert.equal(why.starved, 'memory_available')
   assert.equal(why.busy, 'cpu_load')
   assert.equal(why.full, 'memory_booked')
+})
+
+test('rankPlacement: a commit ratio above 1 books past RAM; live memory still vetoes', () => {
+  const policy = normalizeAutoPlacement({ max_commit_ratio: 1.6 })
+  assert.equal(policy.max_commit_ratio, 1.6)
+  const candidates = [
+    { id: 'roomy', local: false, host: host(64) },
+    { id: 'starved', local: false, host: host(64, { usedGiB: 63 }) },
+  ]
+  // 64G × 1.6 = 102.4G bookable; 80G already booked on each.
+  const booked = new Map([
+    ['roomy', 80 * 1024],
+    ['starved', 80 * 1024],
+  ])
+  const { rows, order } = rankPlacement({ candidates, booked, needMiB: 4096, policy })
+  assert.deepEqual(
+    order.map((r) => r.id),
+    ['roomy'],
+  )
+  const roomy = rows.find((r) => r.id === 'roomy')
+  assert.equal(roomy.capacity_mib, Math.floor(64 * 1024 * 1.6))
+  assert.equal(rows.find((r) => r.id === 'starved').reason, 'memory_available')
+  const full = rankPlacement({ candidates, booked: new Map([['roomy', 100 * 1024]]), needMiB: 4096, policy })
+  assert.equal(full.rows.find((r) => r.id === 'roomy').reason, 'memory_booked')
 })
 
 test('rankPlacement: equal share prefers more absolute room, then local', () => {

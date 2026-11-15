@@ -6,7 +6,9 @@
  * Headroom is booked, not sampled: every slot already placed on a machine holds
  * its container memory limit (`slotMemory`, or `slot_reserve_memory` when that
  * is larger, since a capacity reconciler may raise the limit after create)
- * against `mem_total × max_commit_ratio`. Live figures only veto a machine:
+ * against `mem_total × max_commit_ratio` (above 1 overcommits: limits are
+ * ceilings, and live admission keeps new work off a machine short of memory).
+ * Live figures only veto a machine:
  * MemAvailable below `min_free_memory`, or load1 per core above
  * `max_load_per_core`. Booking keeps the choice stable when slots sit idle and
  * do not yet use their limit.
@@ -39,6 +41,9 @@ export const AUTO_PLACEMENT_DEFAULTS = Object.freeze({
   on_full: 'local',
 })
 
+/** Booked limits may reach up to 3× RAM (overcommit); live vetoes still apply. */
+export const MAX_COMMIT_RATIO_LIMIT = 3
+
 const ratioIn = (v, lo, hi) => typeof v === 'number' && Number.isFinite(v) && v > lo && v <= hi
 const memOk = (v) => typeof v === 'string' && memoryMiB(v) > 0
 const idList = (v) => (Array.isArray(v) ? [...new Set(v.map((x) => String(x || '').trim()).filter(Boolean))] : null)
@@ -51,7 +56,9 @@ export function normalizeAutoPlacement(raw) {
     include_local: src.include_local !== false,
     nodes: idList(src.nodes),
     exclude_nodes: idList(src.exclude_nodes) || [],
-    max_commit_ratio: ratioIn(src.max_commit_ratio, 0, 1) ? src.max_commit_ratio : d.max_commit_ratio,
+    max_commit_ratio: ratioIn(src.max_commit_ratio, 0, MAX_COMMIT_RATIO_LIMIT)
+      ? src.max_commit_ratio
+      : d.max_commit_ratio,
     min_free_memory: memOk(src.min_free_memory) ? src.min_free_memory.trim().toLowerCase() : d.min_free_memory,
     max_load_per_core: ratioIn(src.max_load_per_core, 0, 64) ? src.max_load_per_core : d.max_load_per_core,
     slot_reserve_memory: memOk(src.slot_reserve_memory) ? src.slot_reserve_memory.trim().toLowerCase() : null,
