@@ -1,6 +1,11 @@
+import { constants } from 'node:fs'
+import { open } from 'node:fs/promises'
+
 const ROOT = 'https://crag.fkcodex.com'
 const MAX_RESPONSE = 64 * 1024
 const SHOP_TIMEOUT = 8000
+const PILOT_TOKEN_LENGTH = 43 // Unpadded base64url for 32 bytes.
+
 export const isPaymentMethod = (value) => value === 'wxpay' || value === 'alipay'
 export const isSku = (value) =>
   typeof value === 'string' && /^[a-zA-Z0-9]/.test(value) && value.length <= 64 && !/[^a-zA-Z0-9_-]/.test(value)
@@ -145,6 +150,39 @@ function supplierError(status, operation) {
   return invalidReply()
 }
 
+async function readPilotToken(file) {
+  const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  try {
+    const maxSize = PILOT_TOKEN_LENGTH + 2 // Allow a single trailing LF or CRLF.
+    const stat = await handle.stat()
+    const { mode, size, uid } = stat
+    if (!stat.isFile() || (mode & 0o7777) !== 0o600 || uid !== process.geteuid() || size > maxSize) {
+      throw new Error('Invalid CRAG shop pilot credential file')
+    }
+
+    // Bound the read even if the file grows after stat.
+    const bytes = Buffer.alloc(maxSize + 1)
+    let length = 0
+    while (length < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, length, bytes.length - length, length)
+      if (bytesRead === 0) break
+      length += bytesRead
+    }
+    const token = bytes.toString('latin1', 0, length).replace(/\r?\n$/, '')
+    if (
+      length !== size ||
+      token.length !== PILOT_TOKEN_LENGTH ||
+      /[^A-Za-z0-9_-]/.test(token) ||
+      Buffer.from(token, 'base64url').toString('base64url') !== token
+    ) {
+      throw new Error('Invalid CRAG shop pilot credential file')
+    }
+    return token
+  } finally {
+    await handle.close()
+  }
+}
+
 export function createShopSupplier(fetchImpl = globalThis.fetch) {
   async function send(operation, path, { method = 'GET', receipt, body } = {}) {
     const headers = { accept: 'application/json', 'cache-control': 'no-store' }
@@ -152,6 +190,16 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
     if (body) headers['content-type'] = 'application/json'
     let response
     try {
+      let pilotToken
+      const pilotFile = process.env.VM2API_CRAG_SHOP_PILOT_TOKEN_FILE
+      if (
+        pilotFile !== undefined &&
+        ((operation === 'plans' && method === 'GET' && path === '/shop/plans') ||
+          (operation === 'create' && method === 'POST' && path === '/shop/orders'))
+      ) {
+        pilotToken = await readPilotToken(pilotFile)
+        headers['X-Crag-Shop-Pilot'] = pilotToken
+      }
       response = await fetchImpl(`${ROOT}${path}`, {
         method,
         headers,
@@ -161,7 +209,10 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
         signal: AbortSignal.timeout(SHOP_TIMEOUT),
       })
       if (!response.ok) throw supplierError(response.status, operation)
-      return await readReply(response)
+      const value = await readReply(response)
+      // Never surface an accidentally reflected pilot token in buyer data or payment forms.
+      if (pilotToken && JSON.stringify(value).includes(pilotToken)) throw invalidReply()
+      return value
     } catch (err) {
       if (err instanceof ShopError) throw err
       throw new ShopError(503, 'shop_unavailable', 'CRAG shop unavailable; try again later')

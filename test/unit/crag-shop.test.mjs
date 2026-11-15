@@ -27,6 +27,16 @@ const PROOF = 'fixture-receipt'
 const PERSON = { panelUser: 'alice', panelBuyerOwner: 'panel:alice-id' }
 const OTHER = { panelUser: 'bob', panelBuyerOwner: 'panel:bob-id', panelRole: 'admin' }
 const MIGRATION = new URL('../../src/lib/db/migrations/055_crag_shop_orders.sql', import.meta.url)
+const PILOT_TOKEN_FILE_ENV = 'VM2API_CRAG_SHOP_PILOT_TOKEN_FILE'
+
+test.beforeEach((t) => {
+  const previous = process.env[PILOT_TOKEN_FILE_ENV]
+  delete process.env[PILOT_TOKEN_FILE_ENV]
+  t.after(() => {
+    if (previous === undefined) delete process.env[PILOT_TOKEN_FILE_ENV]
+    else process.env[PILOT_TOKEN_FILE_ENV] = previous
+  })
+})
 
 function order(id, status = 'pending') {
   return { ...PLAN, order_id: id, status, payment_method: 'alipay', created_at: 1_800_000_000, redemption_code: CODE }
@@ -151,6 +161,89 @@ test('supplier transport bounds, gateway pairing and response projection', async
   nextStatus = 302
   reply = { receipt: PROOF }
   await assert.rejects(supplier.create(row, PROOF), { code: 'shop_invalid_reply' })
+})
+
+test('private pilot credential is sent only for plans and order creation and fails closed', {
+  skip: process.platform === 'win32',
+}, async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-shop-pilot-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const file = path.join(root, 'pilot.key')
+  const token = Buffer.alloc(32, 27).toString('base64url')
+  const id = randomUUID()
+  const row = { order_id: id, sku: PLAN.sku, payment_method: 'alipay' }
+  const catalog = { plans: [PLAN], payment_methods: ['alipay'] }
+  const requests = []
+  let plansReply = catalog
+  const supplier = createShopSupplier(async (url, init) => {
+    requests.push({ url, ...init, headers: new Headers(init.headers) })
+    if (url === `${SHOP}/shop/plans`) return Response.json(plansReply)
+    return Response.json(order(id))
+  })
+  const checkRequests = (expected) => {
+    assert.deepEqual(
+      requests.splice(0).map(({ method, url, headers, redirect, body }) => {
+        assert.equal(redirect, 'error')
+        return [method, url, headers.get('X-Crag-Shop-Pilot'), headers.get('authorization'), body]
+      }),
+      expected,
+    )
+  }
+  const planRequest = (pilot) => ['GET', `${SHOP}/shop/plans`, pilot, null, undefined]
+  const createRequest = (pilot) => ['POST', `${SHOP}/shop/orders`, pilot, `Bearer ${PROOF}`, JSON.stringify(row)]
+  const checkReceiptOnlyRequests = async () => {
+    await supplier.status(row, PROOF)
+    assert.deepEqual(await supplier.claim(row, PROOF), { order_id: id, redemption_code: CODE })
+    checkRequests([
+      ['GET', `${SHOP}/shop/orders/${id}`, null, `Bearer ${PROOF}`, undefined],
+      ['POST', `${SHOP}/shop/orders/${id}/claim`, null, `Bearer ${PROOF}`, undefined],
+    ])
+  }
+
+  assert.deepEqual(await supplier.plans(), catalog)
+  await supplier.create(row, PROOF)
+  checkRequests([planRequest(null), createRequest(null)])
+
+  fs.writeFileSync(file, `${token}\n`, { mode: 0o600 })
+  process.env[PILOT_TOKEN_FILE_ENV] = file
+  assert.deepEqual(await supplier.plans(), catalog)
+  await supplier.create(row, PROOF)
+  checkRequests([planRequest(token), createRequest(token)])
+  await checkReceiptOnlyRequests()
+
+  plansReply = { ...catalog, plans: [{ ...PLAN, sku: token }] }
+  await assert.rejects(supplier.plans(), { code: 'shop_invalid_reply' })
+  checkRequests([planRequest(token)])
+
+  const unavailable = (error) => {
+    assert.equal(error.code, 'shop_unavailable')
+    assert.equal(error.status, 503)
+    assert.equal(error.message, 'CRAG shop unavailable; try again later')
+    assert.equal(error.cause, undefined)
+    return true
+  }
+  const checkInvalidFile = async () => {
+    await assert.rejects(supplier.plans(), unavailable)
+    await assert.rejects(supplier.create(row, PROOF), unavailable)
+    checkRequests([])
+  }
+  fs.chmodSync(file, 0o644)
+  await checkInvalidFile()
+  fs.chmodSync(file, 0o600)
+  for (const content of ['', `${token}=`, `${token.slice(0, -1)}B`, `${token}\n\n`, `${token}\nX-Bad: value`]) {
+    fs.writeFileSync(file, content)
+    await checkInvalidFile()
+  }
+  fs.writeFileSync(file, token)
+  const symlink = path.join(root, 'pilot-link')
+  fs.symlinkSync(file, symlink)
+  process.env[PILOT_TOKEN_FILE_ENV] = symlink
+  await checkInvalidFile()
+  for (const invalidPath of [root, path.join(root, 'missing'), '']) {
+    process.env[PILOT_TOKEN_FILE_ENV] = invalidPath
+    await checkInvalidFile()
+  }
+  await checkReceiptOnlyRequests()
 })
 
 test('SQLite reservation survives restart; owners isolate retries, list, status and explicit claim', {
