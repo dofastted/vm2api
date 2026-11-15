@@ -6,6 +6,11 @@ import path from 'node:path'
 import * as spec from '../../src/lib/vm/machine-spec.mjs'
 import * as runtime from '../../src/lib/vm/vm-runtime.mjs'
 import { slotContainerBody, startRemoteSlot } from '../../src/lib/cluster/remote-slot.mjs'
+import { configureSlotCapacity } from '../../src/lib/vm/slot-capacity.mjs'
+
+// These tests cover other behaviour on the legacy fixed 20 native slots;
+// plan-based capacity has its own tests (slot-capacity*.test.mjs).
+configureSlotCapacity({ enabled: false })
 
 const options = { image: 'fixture', network: 'none', remoteDir: '/fixture', user: '1000:1000', routing: {} }
 const vm = (machine = {}) => ({ id: 'vm-01', machine, runtime: { type: 'docker' } })
@@ -22,9 +27,9 @@ test('create freezes an explicit Docker CPU quota separately from KVM vcpus', ()
     const machine = spec.resolveMachineSpec({ runtime: 'docker', overrides: { docker_cpus: quota } })
     assert.equal(machine.docker_cpus, quota)
     const args = runtime.dockerSlotResourceArgs(vm(machine), {})
-    assert.deepEqual(args.slice(0, 4), ['--memory', '512m', '--memory-swap', '512m'])
+    assert.deepEqual(args.slice(0, 6), ['--memory', '512m', '--memory-swap', '512m', '--pids-limit', '256'])
     const expected = quota > 0 ? ['--cpus', String(quota)] : []
-    assert.deepEqual(args.slice(4), expected)
+    assert.deepEqual(args.slice(6), expected)
     assert.equal(
       slotContainerBody(vm(machine), options).HostConfig.NanoCpus,
       quota > 0 ? Math.round(quota * 1e9) : undefined,
@@ -64,6 +69,8 @@ test('CPU caps apply equally to Claude and idle GPT Docker slots', () => {
       '1g',
       '--memory-swap',
       '1g',
+      '--pids-limit',
+      '256',
       '--cpus',
       '0.5',
     ])

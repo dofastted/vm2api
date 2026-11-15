@@ -44,6 +44,11 @@ import { closeDatabase, openDatabase } from '../../src/lib/db/database.mjs'
 import { socksUidFor } from '../../src/lib/vm/vm-runtime.mjs'
 import { REMOTE_CRAG_ENTRY } from '../../src/lib/vm/slot-engine.mjs'
 import { kvmCragAppArmorCommand } from '../../src/lib/vm/kvm-crag-apparmor.mjs'
+import { configureSlotCapacity } from '../../src/lib/vm/slot-capacity.mjs'
+
+// These tests cover other behaviour on the legacy fixed 20 native slots;
+// plan-based capacity has its own tests (slot-capacity*.test.mjs).
+configureSlotCapacity({ enabled: false })
 
 const unix = process.platform !== 'win32'
 const unixTest = unix ? test : test.skip

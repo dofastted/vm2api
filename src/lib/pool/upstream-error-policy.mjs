@@ -235,6 +235,12 @@ function continueWithoutCooldown({ scope, reason, retrySameAccount = true } = {}
   }
 }
 
+/** crag-v2: `process_error` "Claude process exited (None): Claude native process exited with code …". */
+export function isNativeProcessExit(workerCode, text) {
+  if (workerCode === 'process_error') return true
+  return /native process exited|claude process exited/i.test(String(text || ''))
+}
+
 function claudeStopReasonOf(result) {
   return assistantStopReason(result)
 }
@@ -675,6 +681,15 @@ function classifyUpstreamResultRaw(
       return continueWithoutCooldown({
         scope: 'worker',
         reason: 'slot_busy',
+        retrySameAccount: false,
+      })
+    }
+    // The VM's native Claude process died before answering (cgroup OOM or pids
+    // limit, crash). The account is fine: try another unit, open no circuit.
+    if (isNativeProcessExit(workerCode, hay)) {
+      return continueWithoutCooldown({
+        scope: 'worker',
+        reason: 'worker_process_exit',
         retrySameAccount: false,
       })
     }
