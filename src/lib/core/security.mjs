@@ -117,7 +117,7 @@ function loadSessions() {
     for (const [storedKey, s] of Object.entries(raw || {})) {
       if (s && s.exp > now) {
         const key = storedKey.startsWith('kin-panel-') ? panelSessionKey(storedKey) : storedKey
-        panelSessions.set(key, { user: s.user, role: s.role || null, exp: s.exp })
+        panelSessions.set(key, { user: s.user, role: s.role || null, exp: s.exp, buyer: s.buyer })
       }
     }
   } catch (err) {
@@ -152,6 +152,7 @@ export function createPanelSession(username, ttlMs = SESSION_TTL_MS, extra = {})
   panelSessions.set(panelSessionKey(token), {
     user: username,
     role,
+    buyer: extra.buyer,
     exp: Date.now() + ttlMs,
   })
   saveSessions()

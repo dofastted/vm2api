@@ -23,6 +23,7 @@ export const MAX_CRAG_DOWNLOAD_BYTES = MAX_KERNEL_DOWNLOAD_BYTES
 
 const META_TIMEOUT_MS = 8000
 const DOWNLOAD_TIMEOUT_MS = 60_000
+const CRAG_DOWNLOAD_TIMEOUT_MS = 10 * 60_000
 const MAX_REDIRECTS = 3
 function coded(code, message) {
   const error = new Error(message)
@@ -210,7 +211,7 @@ export async function openKernelReleaseAsset(startUrl, fetchImpl = globalThis.fe
     const res = await fetchImpl(current, {
       headers,
       redirect: 'manual',
-      signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
+      signal: AbortSignal.timeout(label === CRAG_V2_RELEASE_ASSET ? CRAG_DOWNLOAD_TIMEOUT_MS : DOWNLOAD_TIMEOUT_MS),
     })
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get('location')

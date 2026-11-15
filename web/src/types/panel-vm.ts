@@ -82,10 +82,11 @@ export type CragLicenseStatus = {
   vm_id: string
   /** offline: CRAGU1 universal code. online: device-bound CRAGL1. */
   kind?: 'offline' | 'online'
-  /** kernel: one offline code covers every slot and machine. device: one VM. */
-  scope?: 'kernel' | 'device'
+  /** kernel: all slots; device: one VM; host: one subscription seat. */
+  scope?: 'kernel' | 'device' | 'host'
+  seat?: number
   license_id?: string
-  term?: '1m' | '6m' | '1y'
+  term?: '1m' | '3m' | '6m' | '1y'
   /** Signed UTC epoch seconds, not browser-local timestamps. */
   issued_at?: number
   not_before?: number
@@ -467,9 +468,11 @@ export type Vm = {
   total_cost?: number
   /** 累计 token（含缓存），与 total_cost 同源。 */
   total_tokens?: number
+  lifetime_usage?: { cost: number; tokens: number }
   expires_at?: string
   refreshed_at?: string
   oauth_source?: string
+  oauth_registration?: 'console' | 'oauth' | null
   account_uuid?: string
   org_uuid?: string
   access_preview?: string

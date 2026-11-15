@@ -15,6 +15,10 @@ import { openaiClaimsFromIdToken, openaiIdentityFromOauthTokens } from '../oauth
 
 export { isCodexVm }
 
+export function openaiUsageAccountId(accountId) {
+  return accountId ? `openai:${accountId}` : null
+}
+
 export function codexCredentialPath(projectRoot, vmId) {
   return path.join(projectRoot, 'vms', vmId, 'codex-credentials.json')
 }

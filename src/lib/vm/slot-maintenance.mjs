@@ -4,7 +4,7 @@ import { applyHold, deriveScheduleFields, HOLD_MAINTENANCE, migrateScheduleRecor
 import { clearRustHealthCache } from '../transport/kernel-router.mjs'
 
 /** Caller owns the VM lifecycle lock. Keep requests and the watchdog off the entire cutover. */
-export async function withSlotMaintenance({ projectRoot, id, watchdog, poolScheduler, operation }) {
+export async function withSlotMaintenance({ projectRoot, id, watchdog, poolScheduler, operation, drainTimeoutMs }) {
   const tag = 'slot-runtime:' + randomUUID()
   let previousHold = null
   let held = false
@@ -17,9 +17,9 @@ export async function withSlotMaintenance({ projectRoot, id, watchdog, poolSched
     if (!saved) return { ok: false, status: 404, code: 'vm_not_found', error: 'vm not found' }
     held = true
     await watchdog?.hold?.(id)
-    const drained = await waitForSlotDrain(poolScheduler, [id])
+    const drained = await waitForSlotDrain(poolScheduler, [id], { timeoutMs: drainTimeoutMs })
     if (!drained.ok) return { ok: false, status: 409, code: 'slot_drain_timeout', error: '在途请求未结束，未重启内核' }
-    return await operation()
+    return await operation(tag)
   } finally {
     try {
       if (getVm(projectRoot, id)?.schedule_hold?.detail?.tag === tag) {

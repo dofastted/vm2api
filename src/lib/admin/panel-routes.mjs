@@ -277,6 +277,8 @@ import {
 import { inspectClusterPayloadChanges, refreshClusterSlotPayloads } from '../cluster/remote-slot.mjs'
 import { readRawBody as defaultReadRawBody } from '../http/respond.mjs'
 import { corsHeadersForRequest } from '../http/cors.mjs'
+import { createCragShopHandler, cragShopRoute, isCragShopPath } from './crag-shop.mjs'
+import { createCragSubscriptionHandler, cragSubscriptionRoute } from './crag-subscription-routes.mjs'
 import { restartRustKernel, syncClaudeKernelConfigs, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 
 import { countTokensViaWorker, syncClaudeClientCredentials } from '../transport/go-worker-client.mjs'
@@ -660,6 +662,20 @@ export function createPanelHandler(ctx) {
   const refreshCluster = ctx.refreshClusterSlotPayloads || refreshClusterSlotPayloads
   const requireAuth = (...args) => ctx.requireAuth(...args)
   const cfg = ctx.cfg
+  const handleCragShop = createCragShopHandler({
+    getDb: ctx.getDb,
+    dataDir: cfg?.paths?.data,
+    publicBaseUrl: cfg?.base_url,
+    json,
+    readRawBody,
+  })
+  const handleCragSubscription = createCragSubscriptionHandler({
+    subscription: ctx.cragSubscription,
+    getVm: (id) => (isValidVmId(id) ? getVm(cfg.paths.project, id) : null),
+    publicBaseUrl: cfg?.base_url,
+    json,
+    readRawBody,
+  })
   const routingConfigPath = ctx.routingConfigPath
   const stickyRouter = ctx.stickyRouter
   const accountQuota = ctx.accountQuota
@@ -1526,15 +1542,17 @@ export function createPanelHandler(ctx) {
       const username = body.username || body.user || body.u || ''
       const password = body.password || body.pass || body.p || ''
       const authed = verifyPanelLogin(username, password)
+      let buyerId = authed?.id
       if (!authed) {
         return json(res, 401, { ok: false, error: { message: '用户名或密码错误', type: 'auth' } })
       }
       if (authed.source === 'env') {
         try {
-          panelUsers.bootstrapFromEnv({ username: authed.username, password })
+          buyerId = panelUsers.bootstrapFromEnv({ username: authed.username, password })?.id
         } catch {}
       }
-      const token = createPanelSession(authed.username, { role: authed.role })
+      const buyer = buyerId ? { id: buyerId } : authed.source === 'env' ? { configuredAdmin: true } : undefined
+      const token = createPanelSession(authed.username, { role: authed.role, buyer })
       const secure = panelCookieSecure(req)
       res.setHeader('Set-Cookie', panelSessionCookie(token, { secure }))
       const me = { user: authed.username, role: authed.role }
@@ -1554,6 +1572,16 @@ export function createPanelHandler(ctx) {
       const secure = panelCookieSecure(req)
       res.setHeader('Set-Cookie', clearPanelSessionCookie({ secure }))
       return json(res, 200, { ok: true })
+    }
+
+    if (isCragShopPath(p)) {
+      res.setHeader('Cache-Control', 'no-store')
+      if (!requireAuth(req, res, { buyer: true })) return true
+      const route = cragShopRoute(req.method, p)
+      if (route && !authorizePanelRoute(req.method, p, panelIdentity(req).role).ok) {
+        return json(res, 403, { ok: false, error: { code: 'forbidden', message: 'Forbidden' } })
+      }
+      return handleCragShop(req, res, url, route)
     }
 
     if (p.startsWith('/api/panel')) {
@@ -1592,6 +1620,9 @@ export function createPanelHandler(ctx) {
           }).body,
         )
       }
+      const subscriptionRoute = cragSubscriptionRoute(req.method, p)
+      if (subscriptionRoute) return handleCragSubscription(req, res, subscriptionRoute)
+
       if (
         denyIfUserMissesVm(req, res, {
           projectRoot: cfg.paths.project,
@@ -2644,6 +2675,7 @@ export function createPanelHandler(ctx) {
           ids: Array.isArray(body.ids) ? body.ids : null,
           concurrency: body.concurrency,
           routing: ctx.routingConfig,
+          telemetryLifecycle: { watchdog: ctx.kernelWatchdog, poolScheduler: ctx.poolScheduler },
         })
         return json(res, 200, panel.ok(report))
       }
@@ -4320,6 +4352,7 @@ export function createPanelHandler(ctx) {
               projectRoot: cfg.paths.project,
               vm,
               routing: ctx.routingConfig,
+              lifecycle: { watchdog: ctx.kernelWatchdog, poolScheduler: ctx.poolScheduler },
               replaceEnv: Object.hasOwn(body, 'extra_env') || Object.hasOwn(body, 'settings_json_override'),
             })
           }
@@ -4839,9 +4872,6 @@ export function createPanelHandler(ctx) {
         }
         atomicWriteJson(vmPath, vm, { mode: 0o600 })
         writeGuestMachineIdFile(cfg.paths.project, id, generated.guest_machine_id)
-        try {
-          seedFreshCliHome(cfg.paths.project, vm)
-        } catch (e) {}
         let allocated = null
         let proxyError = null
         const wantProxy = body.auto_allocate_proxy === true || startNow || !!pickedProxyId
@@ -4872,13 +4902,21 @@ export function createPanelHandler(ctx) {
           vm.timezone_source = 'proxy_geo'
           if (vm.fingerprint && typeof vm.fingerprint === 'object') vm.fingerprint.timezone = zoned.timezone
         }
-        if (body.activate === true) {
+        let startError = null
+        try {
+          seedFreshCliHome(cfg.paths.project, vm, { routing: ctx.routingConfig, preinstallCrag: true })
+        } catch (error) {
+          const code = /^[a-z0-9_]+$/i.test(error.code || '') ? error.code : 'vm_init_failed'
+          startError = `虚拟机初始化失败（${code}）`
+          patchVmRecord(cfg.paths.project, id, { status: 'error' })
+          markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', { message: startError })
+        }
+        if (!startError && body.activate === true) {
           try {
             activateVmSlot(id)
           } catch (e) {}
         }
-        let startError = null
-        if (startNow && hasExit(vm)) {
+        if (!startError && startNow && hasExit(vm)) {
           let boot
           try {
             boot = await startSlotReady(vm, cfg.paths.project, { routing: ctx.routingConfig })
@@ -4896,7 +4934,7 @@ export function createPanelHandler(ctx) {
           } else {
             patchVmRecord(cfg.paths.project, id, { status: 'running' })
           }
-        } else if (startNow) {
+        } else if (!startError && startNow) {
           patchVmRecord(cfg.paths.project, id, { status: 'stopped' })
         }
         const saved = getVm(cfg.paths.project, id) || vm
@@ -5123,6 +5161,7 @@ export function createPanelHandler(ctx) {
             if (inference) {
               oauth.type = 'setup-token'
               oauth.mode = 'setup-token'
+              oauth.oauth_registration = 'console'
             }
           } else if (isSub2apiAccountExport(exportDoc)) {
             oauth = sub2apiAccountToOauth(exportDoc, existing)

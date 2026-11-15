@@ -31,6 +31,12 @@ services:
       PORT: ${PORT:-8787}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - type: bind
+        source: /etc/machine-id
+        target: /run/crag-host-machine-id
+        read_only: true
+        bind:
+          create_host_path: false
       - ./vms:/opt/vm2api/vms
       - ./data:/opt/vm2api/data
       - ./bin:/opt/vm2api/bin

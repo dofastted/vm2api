@@ -62,6 +62,15 @@ describe('GPT vm-id usage rows are live when the slot has no uuid', () => {
     expect(vmTotalCost(vm, [row])).toBe(139.87)
   })
 
+  it('uses the current account lifetime even when the slot history is higher', () => {
+    expect(
+      vmTotalCost({ ...vm, lifetime_usage: { cost: 0, tokens: 0 } }, [row])
+    ).toBe(0)
+    expect(
+      vmTotalCost({ ...vm, lifetime_usage: { cost: 300, tokens: 500 } }, [row])
+    ).toBe(300)
+  })
+
   it('still drops a reused Claude slot leftover', () => {
     const claude = { id: 'vm-02', account_uuid: 'new-uuid' } as Vm
     const leftover = {

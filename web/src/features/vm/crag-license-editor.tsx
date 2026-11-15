@@ -6,6 +6,8 @@ import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Textarea } from '@/components/ui/textarea'
+import { CragShopLink } from '@/features/billing/crag-shop'
+import { CragHostSubscription } from './crag-host-subscription'
 
 const licenseMessages: Record<string, string> = {
   license_required:
@@ -67,7 +69,7 @@ export function CragLicenseSummary({
 }: {
   license: CragLicenseStatus
 }) {
-  const term = { '1m': '1 个月', '6m': '6 个月', '1y': '1 年' }
+  const term = { '1m': '1 个月', '3m': '3 个月', '6m': '6 个月', '1y': '1 年' }
   return (
     <dl className='grid min-w-0 gap-3 text-sm sm:grid-cols-2'>
       <div>
@@ -80,7 +82,11 @@ export function CragLicenseSummary({
         <div>
           <dt className='text-xs text-muted-foreground'>授权方式</dt>
           <dd className='mt-1'>
-            {license.kind === 'offline' ? '离线通用码' : '在线设备授权'}
+            {license.scope === 'host'
+              ? `宿主机订阅 · 应用锁 ${license.seat ?? '—'}`
+              : license.kind === 'offline'
+                ? '离线通用码'
+                : '在线设备授权'}
           </dd>
         </div>
       ) : null}
@@ -107,6 +113,7 @@ export function CragLicenseSummary({
 }
 
 export function CragLicenseEditor({
+  vmId,
   data,
   loading,
   loadError,
@@ -118,6 +125,7 @@ export function CragLicenseEditor({
   onActivate,
   onClose,
 }: {
+  vmId: string
   data?: CragLicenseResponse
   loading: boolean
   loadError: unknown
@@ -152,6 +160,7 @@ export function CragLicenseEditor({
       <div className='flex flex-wrap items-center justify-between gap-2'>
         <h4 className='text-sm font-medium'>本槽 CRAG 授权</h4>
         <div className='flex gap-2'>
+          <CragShopLink />
           <Button
             type='button'
             variant='ghost'
@@ -193,6 +202,7 @@ export function CragLicenseEditor({
           {statusMessage}
         </p>
       ) : null}
+      <CragHostSubscription vmId={vmId} />
       <div className='flex flex-wrap gap-2' role='group' aria-label='授权方式'>
         <Button
           type='button'

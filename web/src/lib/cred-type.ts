@@ -65,6 +65,15 @@ export function credEndpointLabel(endpoint: CredEndpoint): string {
   return CRED_ENDPOINT_LABEL[endpoint]
 }
 
+export function credentialRegistrationOf(vm: Vm): CredEndpoint {
+  if (!vm.has_token) return 'none'
+  if (isCodexVm(vm)) return 'oauth'
+  const type = credTypeOf(vm)
+  if (type === 'apikey') return 'api'
+  if (vm.oauth_registration) return vm.oauth_registration
+  return type === 'official-setup-token' ? 'console' : 'oauth'
+}
+
 /**
  * Claude 槽刷新走 OAuth 接口，但实际推理都是 `Authorization: Bearer` 调 Console
  * （Setup Token 形式），所以 OAuth 与 Setup Token 都归 Console；只有 `x-api-key`
