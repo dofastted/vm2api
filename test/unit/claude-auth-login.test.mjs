@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import {
@@ -13,6 +14,7 @@ import {
 } from '../../src/lib/oauth/claude-auth-login.mjs'
 import { FULL_OAUTH_SCOPE } from '../../src/lib/oauth/oauth-contract.mjs'
 import { prepareSlotOAuth } from '../../src/lib/oauth/guest-oauth-helper.mjs'
+import { createImportCommit } from '../../src/lib/oauth/import-commit.mjs'
 
 test('officialLoginCredentialToOauth keeps a full refresh grant and rejects setup tokens', () => {
   const oauth = officialLoginCredentialToOauth({
@@ -87,6 +89,61 @@ test('only successful native login exposes its fresh private grant', async () =>
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
+})
+
+test('native login publishes the grant and existing CC link without probing the inference worker', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-auth-login-publish-'))
+  const priorMock = process.env.KIN_CRS_MOCK
+  delete process.env.KIN_CRS_MOCK
+  const id = 'vm-01'
+  const slot = path.join(root, 'vms', id)
+  const vmPath = `${slot}.json`
+  const home = path.join(slot, 'cli-home', '.claude')
+  const run = path.join(slot, 'run')
+  fs.mkdirSync(run, { recursive: true })
+  const socket = path.join(run, 'kernel.sock')
+  let probes = 0
+  const server = http.createServer((_req, res) => {
+    probes++
+    res.end(JSON.stringify({ ok: false, engine: 'rust', cli_pid: 1, ready_slots: 1 }))
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(socket, resolve)
+  })
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+    if (priorMock === undefined) delete process.env.KIN_CRS_MOCK
+    else process.env.KIN_CRS_MOCK = priorMock
+  })
+  const existing = { id, status: 'running', dataplane: 'crag', runtime: { kernel_socket: socket } }
+  fs.writeFileSync(vmPath, JSON.stringify(existing))
+  const { commitImportedOauth } = createImportCommit({ cfg: { paths: { project: root } } })
+  const oauth = officialLoginCredentialToOauth({
+    accessToken: 'native-test-access',
+    refreshToken: 'native-test-refresh',
+    expiresAt: Date.now() + 3_600_000,
+    scopes: ['user:profile', 'user:inference'],
+    email: 'native-test@example.test',
+  })
+  const result = await commitImportedOauth({
+    vmId: id,
+    vmPath,
+    existing,
+    oauth,
+    fromNativeLogin: true,
+    skipOfficialCc: true,
+  })
+  assert.equal(result.ok, true, result.error?.message)
+  assert.equal(probes, 0)
+  const panel = JSON.parse(fs.readFileSync(vmPath, 'utf8')).claude
+  assert.equal(panel.email, 'native-test@example.test')
+  assert.equal(panel.has_refresh, true)
+  assert.equal(panel.refresh_token, undefined)
+  assert.equal(fs.readlinkSync(path.join(home, '.credentials.json')), 'credentials.json')
+  const grant = JSON.parse(fs.readFileSync(path.join(home, '.credentials.json'), 'utf8'))
+  assert.equal(grant.claudeAiOauth.refreshToken, 'native-test-refresh')
 })
 
 test('auth readiness refuses stopped containers and never falls back to cli-node', async () => {
