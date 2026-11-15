@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.4.099 — 2026-11-15 · CRAG 3.0.6 双载荷
+
+- CRAG [3.0.6 默认版](docs/releases/crag-native-v3.0.6.json)和 [3.0.6 旧离线授权兼容版](docs/releases/crag-native-v3.0.6-legacy.json)均修复 `defer_loading`；兼容版不改变有效旧离线授权的到期日。
+- 面板保留 `tool_choice` 指定的原生工具名，不再为原生工具误加客户端 MCP 前缀。
+
 ## 1.4.098 — 2026-11-15 · WARP 内核版本选择
 
 - WARP 默认拉取最新，可分别下拉选择 cli-node 和 CRAG 历史版本。下载不影响运行中的槽；重装确认绑定已下载的版本，重启并通过健康检查后恢复原调度意图。

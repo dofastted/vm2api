@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "component": "crag-native",
+  "version": "3.0.6",
+  "variant": "legacy",
+  "source_repository": "dofastted/crag",
+  "source_commit": "4ec5a2382a7a7b8471719e451988dc9f6f3740fd",
+  "source_kernel_tree": "a5fa6acfc9956bfb952ed5066f1de1cebab5a5d2",
+  "payload_release": "payload-2026.11.15-crag-3.0.6-legacy",
+  "baseline_payload_release": "payload-2026.11.15-crag-3.0.5-legacy",
+  "core_sha256": "4e2f8b2aa4a8890aa5e483440c4dd3af4f3a72d16d8e36c6aad6267082ab229a",
+  "manifest_sha256": "a88e9315f05fe8315d107a070ffc0494b0fcf9e66adea09e29e35c8be50fb028",
+  "archive": {
+    "asset": "crag-v2-licensed-amd64.tar.gz",
+    "size": 167962811,
+    "sha256": "ca21ae8863ba94c7e99226d369ab7ee92056a5c04a07d16aa0a551828b41a785"
+  },
+  "build_environment": {
+    "mode": "container",
+    "image": "rust:1-bookworm@sha256:c9155318d07341301a78b45ecdd81af2e43b8b297d64e8fd4c5e80d7735607c3"
+  },
+  "official_claude": {
+    "version": "2.1.321",
+    "sha256": "426c33815ca6645a772f722fbff10dbf2cbdb124a8aeab733c1365dbf8bbf61f"
+  },
+  "authorization_migration": {
+    "payload_key_rotated": false,
+    "offline_activation": "The legacy package uses the same issuer and payload key as 3.0.5-legacy and preserves the expiry of existing valid CRAGU1 authorizations."
+  }
+}
