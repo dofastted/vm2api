@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- CRAG [3.0.7 标准版](docs/releases/crag-native-v3.0.7.json)和 [3.0.7 旧离线授权兼容版](docs/releases/crag-native-v3.0.7-legacy.json)均适配超限图片；多图保持顺序并在同一轮提交。两版各自沿用原授权策略。
+
 ## 1.4.099 — 2026-11-15 · CRAG 3.0.6 双载荷
 
 - CRAG [3.0.6 默认版](docs/releases/crag-native-v3.0.6.json)和 [3.0.6 旧离线授权兼容版](docs/releases/crag-native-v3.0.6-legacy.json)均修复 `defer_loading`；兼容版不改变有效旧离线授权的到期日。
