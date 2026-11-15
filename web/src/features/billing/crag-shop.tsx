@@ -18,12 +18,14 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { PageHeader } from '@/components/page-header'
 import { StatusMark } from '@/components/status-mark'
 import { meQueryOptions } from '@/features/auth/queries'
 import { CragActivationForm } from '@/features/vm/crag-license-editor'
+import { CragRuntimeCounts } from '@/features/vm/crag-runtime-counts'
 import {
   cragHostStatusQueryOptions,
   vmCragLicenseQueryOptions,
@@ -39,6 +41,7 @@ import {
 import { CragPlanPicker } from './crag-plan-picker'
 
 const root = '/api/panel/crag-shop'
+const hostRoot = '/api/panel/crag-subscription'
 const catalogIntervalMs = 25_000
 const catalogTimeoutMs = 12_000
 const terms = { '1m': '月卡', '3m': '季卡', '1y': '年卡' }
@@ -183,16 +186,73 @@ function SubscriptionTime({ seconds }: { seconds: number }) {
   return <time dateTime={date.toISOString()}>{dateTime.format(date)}</time>
 }
 
+function hostRedemptionError(error: unknown) {
+  switch (isApiError(error) ? error.code : undefined) {
+    case 'crag_subscription_invalid_request':
+      return '请输入有效的宿主机兑换码'
+    case 'redeem_unavailable':
+      return '此码不可用于本机订阅或已失效'
+    case 'host_redeem_conflict':
+      return '此码与当前宿主机或订阅不匹配'
+    case 'crag_subscription_host_package_unready':
+      return '请先在内核页拉取可信 CRAG 发行包'
+    default:
+      return '兑换尚未确认，请刷新或继续同步'
+  }
+}
+
 function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
+  const qc = useQueryClient()
   const [confirmUpgrade, setConfirmUpgrade] = useState(false)
-  const [upgrading, setUpgrading] = useState(false)
   const [upgradeFailed, setUpgradeFailed] = useState(false)
+  const [code, setCode] = useState('')
+  const [notice, setNotice] = useState<{ text: string; error?: true }>()
+  const [action, setAction] = useState<'redeem' | 'recover' | 'upgrade'>()
+  const operating = useRef(false)
+  const status = host.isError ? undefined : host.data
+  const syncPending = host.data?.state === 'sync_pending'
+  const upgrading = action === 'upgrade'
+
+  async function updateHost(operation: 'redeem' | 'recover') {
+    const redemptionCode = code.trim()
+    if (operating.current) return
+    if (operation === 'redeem' && (!redemptionCode || syncPending)) return
+    if (operation === 'recover' && !syncPending) return
+    operating.current = true
+    setAction(operation)
+    setNotice(undefined)
+    const { queryKey } = cragHostStatusQueryOptions()
+    try {
+      const next = await api<CragHostStatus>(`${hostRoot}/${operation}`, {
+        method: 'POST',
+        body:
+          operation === 'redeem'
+            ? JSON.stringify({ redemption_code: redemptionCode })
+            : '{}',
+      })
+      qc.setQueryData(queryKey, next)
+      if (next.state === 'active' || next.state === 'expired') {
+        setCode('')
+        setNotice({ text: '宿主机额度已更新，未自动绑定 VM' })
+      } else if (next.state !== 'sync_pending') {
+        setNotice({ text: hostRedemptionError(undefined), error: true })
+      }
+    } catch (error) {
+      setNotice({ text: hostRedemptionError(error), error: true })
+    } finally {
+      await qc.invalidateQueries({ queryKey })
+      operating.current = false
+      setAction(undefined)
+    }
+  }
+
   async function upgrade() {
-    if (upgrading) return
-    setUpgrading(true)
+    if (operating.current) return
+    operating.current = true
+    setAction('upgrade')
     setUpgradeFailed(false)
     try {
-      await api('/api/panel/crag-subscription/upgrade', {
+      await api(`${hostRoot}/upgrade`, {
         method: 'POST',
         body: '{}',
       })
@@ -201,10 +261,11 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
       setUpgradeFailed(true)
     } finally {
       await host.refetch()
-      setUpgrading(false)
+      operating.current = false
+      setAction(undefined)
     }
   }
-  const status = host.isError ? undefined : host.data
+  const probeFailed = status?.target_probe_failed && !status.ready
   const tone = status
     ? hostTones[status.state]
     : host.isError
@@ -225,7 +286,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
         <Button
           size='sm'
           variant='ghost'
-          disabled={host.isFetching}
+          disabled={host.isFetching || !!action}
           onClick={() => void host.refetch()}
         >
           刷新本机订阅
@@ -249,15 +310,9 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
           </dd>
         </div>
         <div>
-          <dt className='text-xs text-muted-foreground'>应用锁总额度</dt>
-          <dd className='mt-1 font-medium tabular-nums'>
-            {status?.slot_limit === 'unlimited'
-              ? '不限'
-              : (status?.slot_limit ?? '—')}
-          </dd>
-        </div>
-        <div>
-          <dt className='text-xs text-muted-foreground'>已占用 / 可用槽位</dt>
+          <dt className='text-xs text-muted-foreground'>
+            已绑定 / 可绑定应用锁
+          </dt>
           <dd className='mt-1 font-medium tabular-nums'>
             {status?.used_slots ?? '—'} /{' '}
             {status?.available_slots === null
@@ -266,35 +321,30 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
           </dd>
         </div>
         <div>
-          <dt className='text-xs text-muted-foreground'>
-            本机 CRAG v2 槽位：已启用 / 总数
-          </dt>
-          <dd className='mt-1 font-medium tabular-nums'>
-            {status?.enabled_slots ?? '—'} / {status?.total_slots ?? '—'}
-          </dd>
-        </div>
-        <div>
-          <dt className='text-xs text-muted-foreground'>本机兑换条件</dt>
+          <dt className='text-xs text-muted-foreground'>本机槽位绑定条件</dt>
           <dd className='mt-1 font-medium'>
-            {!status || status.state === 'unavailable'
-              ? '未知'
-              : status.state === 'sync_pending'
-                ? '等待同步'
-                : status.ready
-                  ? '已就绪'
-                  : '未就绪'}
+            {probeFailed
+              ? '探测失败'
+              : !status || status.state === 'unavailable'
+                ? '未知'
+                : status.state === 'sync_pending'
+                  ? '等待同步'
+                  : status.ready
+                    ? '已就绪'
+                    : '未就绪'}
           </dd>
         </div>
       </dl>
+      <CragRuntimeCounts status={status} />
       <p className='text-xs text-muted-foreground'>
-        按 VM
-        槽位计数，不按调用次数。已有有效许可的槽位可以继续调用；额度用完后不能启用新的订阅槽位。
+        运行名额只统计实际运行的 CRAG。停止不会解绑应用锁；支持 H2
+        的宿主在退役删除并同步后才释放应用锁。
       </p>
       {status?.upgrade_available && !status.reclaim_supported ? (
         <Button
           size='sm'
           variant='outline'
-          disabled={upgrading}
+          disabled={!!action}
           onClick={() => setConfirmUpgrade(true)}
         >
           启用槽位回收
@@ -324,15 +374,74 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
         isLoading={upgrading}
         handleConfirm={() => void upgrade()}
       />
-      <p className='text-sm text-muted-foreground'>
-        {host.isError || status?.state === 'unavailable'
-          ? '无法确认本机权益，请刷新后重试。'
-          : status?.state === 'sync_pending'
-            ? '请到槽位授权页继续同步，不要提交另一张兑换码。'
-            : status && !status.ready
-              ? '当前没有就绪的本机 CRAG 槽位。请先创建不启动的本机 Linux Docker Claude 槽并预装可信 CRAG v2 包，或选择已运行且带只读权益挂载的槽。'
-              : '本机状态来自宿主权益，不随付款或领码变化。槽位仍需单独绑定应用锁。'}
+      {probeFailed ? (
+        <p role='status' className='text-sm text-muted-foreground'>
+          未能确认本机槽位是否就绪。请点击「刷新本机订阅」重试探测。
+        </p>
+      ) : null}
+      <p className='text-sm text-muted-foreground empty:sr-only'>
+        {syncPending
+          ? '如果继续同步后仍在等待，请核对原订单，或回到原 VM 槽位使用原码完成激活。'
+          : host.isError || status?.state === 'unavailable'
+            ? '无法确认本机权益，请刷新后重试。'
+            : probeFailed
+              ? ''
+              : status && !status.ready
+                ? '当前没有就绪的本机 CRAG 槽位，仍可兑换宿主机额度。绑定应用锁需要已预装可信 CRAG v2 包的本机 Linux Docker Claude 槽位。'
+                : '付款或领码不会更新本机权益。可在此兑换宿主机额度，再到所需槽位的授权页绑定应用锁。'}
       </p>
+      {syncPending ? (
+        <Button
+          type='button'
+          size='sm'
+          variant='outline'
+          disabled={!!action}
+          onClick={() => void updateHost('recover')}
+        >
+          {action === 'recover' ? '正在同步…' : '继续同步'}
+        </Button>
+      ) : (
+        <form
+          aria-label='兑换宿主机额度'
+          className='max-w-xl space-y-2 border-t pt-3'
+          onSubmit={(event) => {
+            event.preventDefault()
+            void updateHost('redeem')
+          }}
+        >
+          <label className='grid gap-1 text-sm'>
+            宿主机兑换码
+            <Input
+              type='password'
+              autoComplete='off'
+              value={code}
+              disabled={!!action}
+              aria-describedby='crag-host-redeem-help'
+              onChange={(event) => {
+                setCode(event.target.value)
+                setNotice(undefined)
+              }}
+            />
+          </label>
+          <p
+            id='crag-host-redeem-help'
+            className='text-sm text-muted-foreground'
+          >
+            兑换后以新套餐额度为准；不绑定、不启动 VM。
+          </p>
+          <Button type='submit' size='sm' disabled={!code.trim() || !!action}>
+            {action === 'redeem' ? '正在兑换…' : '兑换到本机'}
+          </Button>
+        </form>
+      )}
+      {notice ? (
+        <p
+          role={notice.error ? 'alert' : 'status'}
+          className={notice.error ? 'text-sm text-destructive' : 'text-sm'}
+        >
+          {notice.text}
+        </p>
+      ) : null}
     </section>
   )
 }

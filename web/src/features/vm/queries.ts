@@ -44,8 +44,31 @@ export function vmQueryOptions(id: string) {
   })
 }
 
+export type CragRuntimeVm = {
+  state: 'running' | 'not_running' | 'unknown'
+  ready: boolean
+  scope: 'host' | 'independent' | 'unknown'
+  version: string | null
+  active_requests: number | null
+  queued: number | null
+  ready_slots: number | null
+}
+
+export type CragRuntime = {
+  running_vms: number
+  ready_vms: number
+  unknown_vms: number
+  host_running_vms: number
+  host_unknown_vms: number
+  host_runtime_available: number | 'unlimited' | null
+  host_over_limit: boolean | null
+  checked_at: string
+  vms: Record<string, CragRuntimeVm>
+}
+
 export type CragHostStatus = {
   ready: boolean
+  target_probe_failed?: true
   state: 'unavailable' | 'unredeemed' | 'active' | 'expired' | 'sync_pending'
   slot_limit?: number | 'unlimited'
   expires_at?: number
@@ -57,6 +80,7 @@ export type CragHostStatus = {
   available_slots?: number | null
   reclaim_supported?: boolean
   upgrade_available?: boolean
+  runtime?: CragRuntime
 }
 
 export function cragHostStatusQueryOptions() {
