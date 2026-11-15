@@ -192,7 +192,7 @@ export function resolveCragKernelVersion(vm, routing = {}) {
   return 'v2'
 }
 
-/** Terminal and OAuth must run the same CLI family as the selected kernel. */
+/** Resolve the CLI that serves inference for this kernel; native OAuth is independent. */
 export function resolveSlotClaude(vm, routing = {}, host = {}) {
   const dataplane = resolveKernelDataplane(vm, routing)
   const native = dataplane === 'crag' && resolveCragKernelVersion(vm, routing) === 'v2'

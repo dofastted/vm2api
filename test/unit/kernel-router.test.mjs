@@ -1172,6 +1172,37 @@ test('writeKernelConfig points cc at cc-node and crag at native Claude', () => {
   }
 })
 
+test('saved or switched Claude kernel owns the executable despite a legacy global CLI override', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-cli-selection-'))
+  const saved = process.env.KIN_CLAUDE_BIN
+  process.env.KIN_CLAUDE_BIN = '/tmp/not-the-selected-claude'
+  try {
+    const vm = { id: 'vm-09', dataplane: 'crag' }
+    fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'vms', `${vm.id}.json`), JSON.stringify(vm))
+    const config = (overrides) =>
+      JSON.parse(
+        fs.readFileSync(
+          writeKernelConfig(root, { id: vm.id, ...overrides }, { routing: { inference: { dataplane: 'wrap' } } })
+            .configPath,
+          'utf8',
+        ),
+      )
+    const crag = config({ timezone: 'UTC' })
+    assert.equal(crag.dataplane, 'crag')
+    assert.equal(crag.claude_bin, '/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude')
+    assert.equal(crag.runtime_variant, 'crag-v2')
+    const wrap = config({ dataplane: 'wrap' })
+    assert.equal(wrap.dataplane, 'wrap')
+    assert.equal(wrap.claude_bin, '/home/kincli/.kin/cli-node')
+    assert.equal(wrap.runtime_variant, undefined)
+  } finally {
+    if (saved === undefined) delete process.env.KIN_CLAUDE_BIN
+    else process.env.KIN_CLAUDE_BIN = saved
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('writeKernelConfig adds CRAG v2 fields for a local slot and a cluster Docker slot', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-crag-v2-cfg-'))
   try {

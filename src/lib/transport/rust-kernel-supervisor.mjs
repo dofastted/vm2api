@@ -947,8 +947,8 @@ export function writeKernelConfig(
   if (!secret) secret = String(previous.internal_token || '').trim()
   if (secret) replaceSlotOwnedFile(tokenPath, secret + '\n', vm)
   const testEndpoints = process.env.KIN_KERNEL_TEST_ENDPOINTS === '1'
-  const dataplane = resolveKernelDataplane(vm, routing || {}) || 'wrap'
-  const envBin = String(process.env.KIN_CLAUDE_BIN || '').trim()
+  const target = { ...record, ...vm }
+  const dataplane = resolveKernelDataplane(target, routing || {}) || 'wrap'
   const host = slotHost(record)
   // A macOS node runs the kernel on the host itself: real node paths instead of the container mounts.
   // Unknown until that node has connected once; the slot's own start writes the config then.
@@ -959,7 +959,7 @@ export function writeKernelConfig(
     if (host.native) return null
     throw err
   }
-  const claudeBin = envBin || resolveSlotClaude(vm, routing || {}, host).bin
+  const claudeBin = resolveSlotClaude(target, routing || {}, host).bin
   const tz = String(timezone || vm.timezone || previous.timezone || '').trim()
   const defaultCacheTtl = routing != null ? cacheTtlFromRouting(routing) : normalizeCacheTtl(previous.default_cache_ttl)
   const thinkingDisplay =
@@ -1027,10 +1027,9 @@ export function writeKernelConfig(
     model_effort: modelEffort,
     ...(!host.native && !isCodexVm(record) ? { telemetry: buildNativeTelemetry(record, projectRoot, routing) } : {}),
   }
-  if (dataplane === 'crag' && resolveCragKernelVersion({ ...record, ...vm }, routing || {}) === 'v2' && !host.native) {
+  if (dataplane === 'crag' && resolveCragKernelVersion(target, routing || {}) === 'v2' && !host.native) {
     config.crag_kernel_version = 'v2'
     config.runtime_variant = 'crag-v2'
-    config.claude_bin = resolveSlotClaude({ ...record, ...vm }, routing || {}, host).bin
     config.asset_dir = '/run/kin/crag-native-assets'
     config.work_dir = '/run/kin/work'
     config.cli_version = ''
