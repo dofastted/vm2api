@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { createKernelWatchdog, isKernelWatchdogTarget } from '../../src/lib/transport/kernel-watchdog.mjs'
-import { kernelFaults } from '../../src/lib/transport/rust-kernel-client.mjs'
+import { kernelFaults, rustKernelPaths } from '../../src/lib/transport/rust-kernel-client.mjs'
 
 test('watchdog targets inherited rust; stored go is rust; skips Codex and stopped', () => {
   const rustRouting = { inference: { engine: 'rust' } }
@@ -437,4 +437,37 @@ test('hold waits for a restart already in flight, and the boot after it is skipp
   await drained
   await ticking
   assert.deepEqual(actions, ['ensure:start', 'ensure:end'], 'no boot once the slot is held')
+})
+
+test('watchdog reloads a kernel only when its live slot count is off; a stale file is just rewritten', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-wd-slots-'))
+  const homeDirFor = (vm) => path.join(root, 'vms', vm.id, 'cli-home')
+  const configOf = (id) => rustKernelPaths({ vmId: id, homeDir: homeDirFor({ id }), vm: { id } }).configPath
+  const capacity = { 'vm-file': 20, 'vm-live': 10 }
+  const files = { 'vm-file': 10, 'vm-live': 20 }
+  for (const [id, n] of Object.entries(files)) {
+    fs.mkdirSync(path.dirname(configOf(id)), { recursive: true })
+    fs.writeFileSync(configOf(id), JSON.stringify({ slots_per_worker: n }))
+  }
+  const ensured = []
+  const wd = createKernelWatchdog({
+    observeRuntime: async () => ({ state: 'running' }),
+    listTargets: () => [
+      { id: 'vm-file', inference_engine: 'rust' },
+      { id: 'vm-live', inference_engine: 'rust' },
+    ],
+    homeDirFor,
+    health: async (exec) => ({ ok: true, healthy: true, ready_slots: 1, cli_pid: 1, capacity: capacity[exec.vmId] }),
+    ensure: async (exec) => {
+      ensured.push(exec.vmId)
+      return { ok: true }
+    },
+  })
+  try {
+    await wd.tick()
+    assert.deepEqual(ensured, ['vm-live'], 'only the kernel running another count is reloaded')
+    assert.equal(JSON.parse(fs.readFileSync(configOf('vm-file'), 'utf8')).slots_per_worker, 20)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
