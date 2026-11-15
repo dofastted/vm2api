@@ -107,8 +107,8 @@ test('small, custom, accessor, sparse and non-cloneable inputs retain native JSO
   for (const value of unusual) assert.deepEqual(await codec.encode(value), encodeInferenceJson(value))
   await assert.rejects(codec.encode({ text: largeText, bad: 1n }), TypeError)
   // The inspector rejects the cycle before sizing it, so a short string covers the
-  // same path. A 280 KB escaped string here sends JSON.stringify on Node 26.7
-  // (V8 14.6) into an unbounded loop instead of throwing.
+  // same path. With a 280 KB flat string, JSON.stringify on Node 26 (V8 14.6+)
+  // allocates tens of GB before it throws.
   const cycle = { text: 'cycle' }
   cycle.self = cycle
   await assert.rejects(codec.encode(cycle), TypeError)
