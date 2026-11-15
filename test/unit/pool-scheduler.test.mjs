@@ -505,6 +505,40 @@ test('wait timeout on cooldown returns busy rather than empty pool', async (t) =
   assert.ok(selected.wait_reasons.includes('account_cooldown'))
 })
 
+test('pinned quota cooldown returns rate limited rather than pool overload', async (t) => {
+  const root = project()
+  let pool
+  t.after(() => cleanupProject(root, pool))
+  const repo = new RuntimeRepo()
+  repo.markCooldown('account-1', {
+    vmId: 'vm-01',
+    until: Date.now() + 60_000,
+    reason: 'quota_5h_header',
+  })
+  pool = new PoolScheduler({
+    projectRoot: root,
+    runtimeRepo: repo,
+    accountQuota: { canAccept: () => ({ ok: true }) },
+    workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
+  })
+  let dispatched = false
+  const runner = new FailoverRunner({ scheduler: pool })
+  const result = await runner.run({
+    requestId: 'quota-cooldown-pin',
+    model: 'claude-test',
+    pinVmId: 'vm-01',
+    callAttempt: async () => {
+      dispatched = true
+      throw new Error('must not dispatch')
+    },
+  })
+  assert.equal(dispatched, false)
+  assert.equal(result.status, 429)
+  assert.equal(result.body.error.code, 'pool_rate_limited')
+  assert.ok(result.retryAfterSec > 0)
+  assert.deepEqual(result.body.error.details.wait_reasons, ['account_cooldown'])
+})
+
 test('long cooldown beyond wait budget fails immediately', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))

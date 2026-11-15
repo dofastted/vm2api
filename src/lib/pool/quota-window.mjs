@@ -97,13 +97,20 @@ export function isPlanLimitMessage(message) {
 
 /**
  * Whether a finished request proves the account's own plan window is spent.
- * A 429 the pool synthesized itself (`fable_requires_max`, `pool_rate_limited`)
- * never reached the provider, so it says nothing about the account's quota.
+ * Only explicit plan-limit text or rejected account-window headers prove
+ * exhaustion. A bare 429 can be a model or RPM limit and must not invent a
+ * persistent 5h rejection for the entire account.
  */
 export function isAccountQuotaExhausted(result = {}, limitText = '') {
   if (!result || result.ok) return false
   if (isPlanLimitMessage(limitText)) return true
-  return Number(result.status) === 429 && result.via !== 'pool-failover'
+  if (Number(result.status) !== 429 || result.via === 'pool-failover') return false
+  const headers = result.headers || {}
+  const entries = typeof headers.entries === 'function' ? [...headers.entries()] : Object.entries(headers)
+  return entries.some(
+    ([key, value]) =>
+      /^anthropic-ratelimit-unified-(5h|7d)-status$/i.test(key) && /^(rejected|rate_limited)$/i.test(String(value)),
+  )
 }
 
 /**

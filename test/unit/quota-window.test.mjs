@@ -253,11 +253,36 @@ test('isAccountQuotaExhausted ignores 429s the pool synthesized itself', () => {
   assert.equal(isAccountQuotaExhausted(poolRateLimited, 'rate limited'), false)
 })
 
-test('isAccountQuotaExhausted keeps provider 429s and plan-limit text', () => {
-  assert.equal(isAccountQuotaExhausted({ ok: false, status: 429, via: 'go-worker-stream' }, ''), true)
-  assert.equal(isAccountQuotaExhausted({ ok: false, status: 429 }, ''), true)
+test('isAccountQuotaExhausted requires quota evidence rather than a bare provider 429', () => {
+  assert.equal(isAccountQuotaExhausted({ ok: false, status: 429, via: 'go-worker-stream' }, ''), false)
+  assert.equal(isAccountQuotaExhausted({ ok: false, status: 429 }, ''), false)
   const planText = "You've hit your limit · resets 3pm"
   assert.equal(isAccountQuotaExhausted({ ok: false, status: 400, via: 'pool-failover' }, planText), true)
   assert.equal(isAccountQuotaExhausted({ ok: true, status: 200 }, planText), false)
   assert.equal(isAccountQuotaExhausted({ ok: false, status: 503, via: 'go-worker' }, ''), false)
+})
+
+test('account-window rejection headers prove quota while Fable-only rejection does not', () => {
+  for (const window of ['5h', '7d']) {
+    assert.equal(
+      isAccountQuotaExhausted({
+        ok: false,
+        status: 429,
+        headers: {
+          [`Anthropic-Ratelimit-Unified-${window}-Status`]: 'rejected',
+        },
+      }),
+      true,
+    )
+  }
+  assert.equal(
+    isAccountQuotaExhausted({
+      ok: false,
+      status: 429,
+      headers: {
+        'anthropic-ratelimit-unified-7d_oi-status': 'rejected',
+      },
+    }),
+    false,
+  )
 })

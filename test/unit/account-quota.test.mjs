@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { AccountQuota, extraHeadersFromLimitError } from '../../src/lib/pool/account-quota.mjs'
-import { parseResetMs } from '../../src/lib/pool/quota-window.mjs'
+import { parseResetMs, isAccountQuotaExhausted } from '../../src/lib/pool/quota-window.mjs'
 
 function tmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'kin-quota-'))
@@ -921,6 +921,34 @@ test('429 unified exhausted marks headers rejected without inventing official 10
   assert.equal(acc.unified.headers['5h'].utilization, 0.84)
   assert.notEqual(acc.unified.official?.['5h']?.utilization, 1)
   assert.equal(q.canAccept('acc-429').ok, false)
+})
+
+test('provider Fable 429 without quota evidence preserves the open account windows', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ingestHeaders('acc-fable-429', {
+    'anthropic-ratelimit-unified-5h-utilization': '0.02',
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+    'anthropic-ratelimit-unified-7d-utilization': '0.07',
+    'anthropic-ratelimit-unified-7d-status': 'allowed',
+  })
+  const result = {
+    ok: false,
+    status: 429,
+    via: 'rust-kernel-stream',
+    headers: {},
+    body: { error: { type: 'rate_limit_error', message: 'Error' } },
+  }
+  const text = result.body.error.message
+  q.ingestHeaders('acc-fable-429', extraHeadersFromLimitError(text, result.headers), null, {
+    exhausted: isAccountQuotaExhausted(result, text),
+    status: result.status,
+  })
+  const account = q.repo.get('acc-fable-429')
+  assert.equal(account.unified.headers['5h'].status, 'allowed')
+  assert.equal(account.unified.headers['5h'].utilization, 0.02)
+  assert.equal(account.unified.headers['7d'].status, 'allowed')
+  assert.equal(account.unified.headers.exhausted_at ?? null, null)
+  assert.equal(q.canAccept('acc-fable-429').ok, true)
 })
 
 test('local 429 without quota evidence does not reject the 5h window', () => {
