@@ -46,6 +46,7 @@ import {
   KVM_BUILD_DIR,
 } from './os-catalog.mjs'
 import { slotMemory, slotDockerCpus, memoryMiB } from './machine-spec.mjs'
+import { slotCreationLimits } from './slot-capacity.mjs'
 import { ensureKvmMachineRecord, kvmContainerEnvIncomplete, kvmMachineFields } from './kvm-machine.mjs'
 import { probeLocalKvm } from './kvm-host.mjs'
 import { slotExecArgv } from './slot-exec.mjs'
@@ -1147,9 +1148,17 @@ export function buildKvmRunArgs({
 
 /** Creation-only resources: restarting an existing container does not change its limits. */
 export function dockerSlotResourceArgs(vm, routing) {
-  const memory = slotMemory(vm, routing)
+  const { memory, pids } = slotCreationLimits(vm, routing)
   const cpus = slotDockerCpus(vm)
-  return ['--memory', memory, '--memory-swap', memory, ...(cpus > 0 ? ['--cpus', String(cpus)] : [])]
+  return [
+    '--memory',
+    memory,
+    '--memory-swap',
+    memory,
+    '--pids-limit',
+    String(pids),
+    ...(cpus > 0 ? ['--cpus', String(cpus)] : []),
+  ]
 }
 
 export async function startVmRuntime(vm, projectRoot, { recreate = false, routing, accel: accelOpt } = {}) {
@@ -1374,8 +1383,6 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
       '--restart',
       slotRestartPolicy(vm),
       ...dockerSlotResourceArgs(vm, resolvedRouting),
-      '--pids-limit',
-      '256',
       '--user',
       runtimeUser(vm),
       ...(typeof process.getuid === 'function' && process.getuid() === 0

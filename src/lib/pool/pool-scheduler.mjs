@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events'
+import { effectiveSlotCount } from '../vm/slot-capacity.mjs'
 import { getVm, listVms, markUnschedulable, migrateVmSchedule } from '../vm/vm-registry.mjs'
 import { vmCliHomePath, vmJsonPath } from '../vm/execution-context.mjs'
 import {
@@ -266,8 +267,9 @@ function maxConcurrencyOf(vm, fallback = 2) {
 }
 
 /** Seats on this VM: its `session_slots` override, else the global default; clamped 1–20 by slot-engine. */
+/** Seats never exceed the native slots the VM's container can hold (slot-capacity.mjs). */
 function seatCapOf(vm, fallback = 20) {
-  return resolveSessionSlots(vm, { inference: { session_slots: fallback } })
+  return Math.min(resolveSessionSlots(vm, { inference: { session_slots: fallback } }), effectiveSlotCount(vm))
 }
 
 function vmTierOf(vm) {

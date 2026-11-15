@@ -8,6 +8,7 @@ import {
   execCapture,
   inspectContainerOrNull,
   updateContainerMemory,
+  updateContainerPids,
   withDockerDeadline,
 } from '../cluster/docker-remote.mjs'
 
@@ -269,4 +270,95 @@ export async function raiseDockerSlotMemory(projectRoot, vm, requestedMemory, { 
   }
   if (!saved) return fail('vm_not_found', 'vm not found')
   return { ok: true, memory: mem, previous: validated.previous, container_memory: mem, warnings, vm: saved }
+}
+
+/** Read a cgroup flat-keyed file (`memory.events`, `pids.events`) into numbers. */
+export function parseCgroupEvents(text) {
+  const out = {}
+  for (const line of String(text || '').split('\n')) {
+    const [key, value] = line.trim().split(/\s+/)
+    if (key && /^\d+$/.test(value || '')) out[key] = Number(value)
+  }
+  return out
+}
+
+/**
+ * Live cgroup counters of a running slot: OOM kills and pids-limit hits since
+ * the container started, the effective limits and current memory use.
+ * null when unreadable.
+ */
+export async function readSlotCgroupStats(vm, { connect, id = containerName(vm?.id) } = {}) {
+  try {
+    connect ||= slotHost(vm).dockerApi()
+    const read = async (file) => {
+      const r = await execCapture(connect, id, ['cat', file])
+      return r.exitCode === 0 ? String(r.stdout || '') : null
+    }
+    const memEvents = await read('/sys/fs/cgroup/memory.events')
+    const pidsEvents = await read('/sys/fs/cgroup/pids.events')
+    if (memEvents == null && pidsEvents == null) return null
+    const pidsMax = await read('/sys/fs/cgroup/pids.max')
+    const memMax = await read('/sys/fs/cgroup/memory.max')
+    const memCurrent = await read('/sys/fs/cgroup/memory.current')
+    const mem = parseCgroupMemoryLimit(memMax)
+    const current = String(memCurrent || '').trim()
+    return {
+      oomKills: parseCgroupEvents(memEvents).oom_kill ?? 0,
+      pidsMaxHits: parseCgroupEvents(pidsEvents).max ?? 0,
+      pidsLimit: /^\d+$/.test(String(pidsMax || '').trim()) ? Number(String(pidsMax).trim()) : null,
+      memoryBytes: mem.kind === 'limited' ? mem.bytes : null,
+      memoryCurrentBytes: /^\d+$/.test(current) ? Number(current) : null,
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Raise a running Docker slot's pids limit without a restart, verify the
+ * cgroup took it, then record it in vm.machine.pids_limit. Raise-only.
+ */
+export async function raiseDockerSlotPids(projectRoot, vm, requested, { connect } = {}) {
+  if (isKvmRuntime(vm)) return { ok: false, code: 'kvm_pids_raise_forbidden', message: 'KVM 槽位不调整 pids 上限' }
+  const target = Number(requested)
+  if (!Number.isSafeInteger(target) || target <= 0) return { ok: false, code: 'invalid_pids_limit' }
+  try {
+    connect ||= slotHost(vm).dockerApi()
+  } catch (error) {
+    return { ok: false, code: 'container_inspect_failed', message: error.message }
+  }
+  const id = containerName(vm?.id)
+  let data
+  try {
+    data = await withDockerDeadline(connect, (c) => inspectContainerOrNull(c, id))
+  } catch (error) {
+    return { ok: false, code: 'container_inspect_failed', message: error.message }
+  }
+  if (!data) return { ok: false, code: 'container_not_found' }
+  if (data.State?.Running !== true) return { ok: false, code: 'container_not_running' }
+  const current = Number(data.HostConfig?.PidsLimit) || 0
+  if (current > 0 && current >= target) {
+    // Already at or above: only the record may lag (e.g. created with plan limits).
+  } else {
+    try {
+      await updateContainerPids(connect, data.Id, target)
+    } catch (error) {
+      return { ok: false, code: 'docker_update_failed', message: error.message }
+    }
+  }
+  const stats = await readSlotCgroupStats(vm, { connect, id: data.Id })
+  const live = stats?.pidsLimit
+  if (!Number.isInteger(live) || live < target) {
+    return { ok: false, code: 'cgroup_pids_unverified', message: '容器实际 pids 上限未确认，未写入配置' }
+  }
+  let saved
+  try {
+    saved = patchVmRecord(projectRoot, vm.id, (record) => ({
+      machine: { ...(record.machine || {}), pids_limit: live },
+    }))
+  } catch {
+    return { ok: false, code: 'vm_config_write_failed' }
+  }
+  if (!saved) return { ok: false, code: 'vm_not_found' }
+  return { ok: true, pids_limit: live, previous: current || null, vm: saved }
 }

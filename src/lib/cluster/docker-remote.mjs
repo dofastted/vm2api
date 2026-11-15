@@ -173,6 +173,26 @@ export async function updateContainerMemory(connect, id, { memory, memorySwap },
   )
 }
 
+/** Live `docker update --pids-limit`; the cgroup pids.max follows without a restart. */
+export async function updateContainerPids(connect, id, pidsLimit, { timeoutMs = 15_000 } = {}) {
+  if (!Number.isSafeInteger(pidsLimit) || pidsLimit <= 0) {
+    throw new ClusterError(400, 'invalid_pids_limit', 'Docker pids 上限不合法')
+  }
+  return withDockerDeadline(
+    connect,
+    async (scopedConnect) => {
+      const result = await dockerJson(scopedConnect, {
+        method: 'POST',
+        path: `${containerPath(id)}/update`,
+        body: { PidsLimit: pidsLimit },
+        timeoutMs,
+      })
+      return { warnings: Array.isArray(result?.Warnings) ? result.Warnings : [] }
+    },
+    timeoutMs,
+  )
+}
+
 function captureDockerOutput(buf, maxOutputBytes) {
   const stdout = []
   const stderr = []
