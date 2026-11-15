@@ -548,12 +548,23 @@ function syncInstalledKernels(args, operation = runKernelSync) {
   return run
 }
 
+async function teardownSlot(vm, subscription) {
+  try {
+    return subscription?.teardown
+      ? await subscription.teardown(vm, (requireConfirmation) => destroySlot(vm, { requireConfirmation }))
+      : await destroySlot(vm)
+  } catch {
+    return { ok: false, code: 'vm_teardown_unconfirmed', error: 'Could not safely finish VM teardown' }
+  }
+}
+
 async function runKernelSync({
   project,
   routingConfig,
   body = {},
   refreshCluster = refreshClusterSlotPayloads,
   restartKernel = restartRustKernel,
+  subscription,
 }) {
   const all = listVms(project)
   const wanted = Array.isArray(body.ids) ? new Set(body.ids.map(String)) : null
@@ -598,7 +609,7 @@ async function runKernelSync({
   if (traits) {
     for (const vm of localVms) {
       if (isCodexVm(vm)) continue
-      const gone = await destroySlot(vm)
+      const gone = await teardownSlot(vm, subscription)
       if (!gone.ok) {
         const item = (local.items || []).find((row) => row.id === vm.id)
         if (item) {
@@ -664,6 +675,12 @@ export function createPanelHandler(ctx) {
   const cfg = ctx.cfg
   const handleCragShop = createCragShopHandler({
     getDb: ctx.getDb,
+    subscription: ctx.cragSubscription,
+    isCurrentAdmin: (req) => {
+      const record = ctx.panelUsers.getByUsername(req.panelUser)
+      if (record) return record.enabled && record.role === 'admin' && req.panelBuyerOwner === `panel:${record.id}`
+      return req.panelBuyerOwner === `configured-admin:${req.panelUser}`
+    },
     dataDir: cfg?.paths?.data,
     publicBaseUrl: cfg?.base_url,
     json,
@@ -2914,6 +2931,7 @@ export function createPanelHandler(ctx) {
           {
             project: cfg.paths.project,
             routingConfig: ctx.routingConfig,
+            subscription: ctx.cragSubscription,
             body: { ...body, ids: requestedIds },
             restartKernel: ctx.kernelPolicyOps?.restartRustKernel,
           },
@@ -2991,6 +3009,7 @@ export function createPanelHandler(ctx) {
         const report = await syncInstalledKernels({
           project: cfg.paths.project,
           routingConfig: ctx.routingConfig,
+          subscription: ctx.cragSubscription,
           body,
           refreshCluster,
           restartKernel: ctx.kernelPolicyOps?.restartRustKernel || ctx.restartRustKernel,
@@ -3921,57 +3940,51 @@ export function createPanelHandler(ctx) {
           return json(res, 400, { ok: false, error: { message: 'invalid vm id' } })
         }
         const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
-        if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        const active = getActiveVmId(cfg.paths.project)
-        if (active === id && listVms(cfg.paths.project).some((vm) => vm.id !== id)) {
-          return json(res, 409, { ok: false, error: { message: 'cannot delete active VM, switch active first' } })
-        }
-        const vm = getVm(cfg.paths.project, id)
-        if (denyIfUserCannotDeleteVm(req, res, vm, json)) return true
-        try {
-          if (vm) {
-            const gone = await destroySlot(vm)
-            // A node slot that could not be removed keeps running there with the account's credential.
-            if (!gone.ok && slotHost(vm).kind === 'node') {
-              return json(res, 409, {
-                ok: false,
-                error: { code: gone.code || 'remote_destroy_failed', message: gone.error || 'remote destroy failed' },
-              })
-            }
+        return await withVmLock(vmPath, async () => {
+          const vm = getVm(cfg.paths.project, id)
+          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const active = getActiveVmId(cfg.paths.project)
+          if (active === id && listVms(cfg.paths.project).some((slot) => slot.id !== id)) {
+            return json(res, 409, { ok: false, error: { message: 'cannot delete active VM, switch active first' } })
           }
-        } catch {}
-        // detach this VM only — do not unbind other slots sharing the SOCKS5
-        try {
-          proxyPool.unbindVm(id)
-        } catch {}
-        // remove cli-home
-        try {
-          fs.rmSync(path.join(cfg.paths.project, 'vms', id), { recursive: true, force: true })
-        } catch {}
-        fs.unlinkSync(vmPath)
-        invalidateVmSlotReadCache(cfg.paths.project, id)
-        try {
-          vmTestSchedule.remove(id)
-        } catch {}
-        if (active === id) {
-          clearActiveVm(cfg.paths.project)
+          if (denyIfUserCannotDeleteVm(req, res, vm, json)) return true
+          const gone = await teardownSlot(vm, ctx.cragSubscription)
+          if (!gone.ok) {
+            return json(res, 409, {
+              ok: false,
+              error: { code: gone.code || 'vm_destroy_failed', message: gone.error || 'VM teardown failed' },
+            })
+          }
+          // Detach this VM only — do not unbind other slots sharing the SOCKS5.
           try {
-            clearActiveVmFromDb()
+            proxyPool.unbindVm(id)
           } catch {}
           try {
-            reloadActiveVm(cfg)
+            fs.rmSync(path.join(cfg.paths.project, 'vms', id), { recursive: true, force: true })
           } catch {}
-        }
-        // drop the DB credential mirror row too
-        try {
-          removeVmFromDb(id)
-        } catch {}
-        // optional chat side files
-        try {
-          const chat = path.join(cfg.paths.project, 'vms', `${id}-chat.json`)
-          if (fs.existsSync(chat)) fs.unlinkSync(chat)
-        } catch {}
-        return json(res, 200, panel.ok({ deleted: id }))
+          fs.unlinkSync(vmPath)
+          invalidateVmSlotReadCache(cfg.paths.project, id)
+          try {
+            vmTestSchedule.remove(id)
+          } catch {}
+          if (active === id) {
+            clearActiveVm(cfg.paths.project)
+            try {
+              clearActiveVmFromDb()
+            } catch {}
+            try {
+              reloadActiveVm(cfg)
+            } catch {}
+          }
+          try {
+            removeVmFromDb(id)
+          } catch {}
+          try {
+            const chat = path.join(cfg.paths.project, 'vms', `${id}-chat.json`)
+            if (fs.existsSync(chat)) fs.unlinkSync(chat)
+          } catch {}
+          return json(res, 200, panel.ok({ deleted: id, ...(gone.reclaim_pending && { reclaim_pending: true }) }))
+        })
       }
       // POST /api/panel/vms/:id/reset — destroy container + home, recreate same slot
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/reset$/.test(p)) {
@@ -3983,7 +3996,7 @@ export function createPanelHandler(ctx) {
         return await withVmLock(vmPath, async () => {
           if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
           const prev = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-          const gone = await destroySlot(prev)
+          const gone = await teardownSlot(prev, mode === 'traits' ? ctx.cragSubscription : null)
           if (!gone.ok) {
             return json(res, 500, { ok: false, error: { message: gone.error || 'destroy failed', code: gone.code } })
           }
@@ -4416,7 +4429,7 @@ export function createPanelHandler(ctx) {
             )
           }
           if (mode === 'traits') {
-            const gone = await destroySlot(vm)
+            const gone = await teardownSlot(vm, ctx.cragSubscription)
             if (!gone.ok)
               return json(res, 500, { ok: false, error: { code: gone.code, message: gone.error || '重建新特征失败' } })
             const rebuilt = recreateVmFiles(cfg.paths.project, vm, { mode: 'traits' })

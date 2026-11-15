@@ -9,6 +9,7 @@ export function cragSubscriptionRoute(method, path) {
   if (method !== 'POST') return null
   if (path === `${ROOT}/redeem`) return { action: 'redeem' }
   if (path === `${ROOT}/recover`) return { action: 'recover' }
+  if (path === `${ROOT}/upgrade`) return { action: 'upgrade' }
   const match = BIND.exec(path)
   return match ? { action: 'bind', id: match[1] } : null
 }
@@ -61,6 +62,7 @@ export function createCragSubscriptionHandler({ subscription, getVm, publicBaseU
 
     try {
       if (action === 'redeem') return ok(res, await subscription.redeem(body.redemption_code))
+      if (action === 'upgrade') return ok(res, await subscription.upgrade())
       if (action === 'bind') {
         const vm = getVm(id)
         if (!vm) return reject(res, 404, 'vm_not_found')

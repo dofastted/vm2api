@@ -258,6 +258,7 @@ test('SQLite reservation survives restart; owners isolate retries, list, status 
   })
   db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;')
   db.exec(fs.readFileSync(MIGRATION, 'utf8'))
+  db.exec(fs.readFileSync(new URL('../../src/lib/db/migrations/056_crag_shop_commerce.sql', import.meta.url), 'utf8'))
   const saved = new Map()
   let lostReply = true
   let status = 'pending'
@@ -271,6 +272,11 @@ test('SQLite reservation survives restart; owners isolate retries, list, status 
       return Response.json({ plans: [{ ...PLAN, secret: CODE }], payment_methods: ['alipay'] })
     }
     const receipt = init.headers.authorization.slice('Bearer '.length)
+    if (url.endsWith('/resume')) {
+      const id = url.split('/').at(-2)
+      assert.equal(receipt, saved.get(id))
+      return Response.json({ ...order(id, status), url: ACTION, data: fields(id) })
+    }
     if (url === `${SHOP}/shop/orders`) {
       const { order_id: id, ...input } = JSON.parse(init.body)
       assert.deepEqual(input, { sku: PLAN.sku, payment_method: 'alipay' })

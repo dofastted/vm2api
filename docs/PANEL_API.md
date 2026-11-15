@@ -256,19 +256,24 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/crag-shop/plans` | 在售 `plans`（`sku`、`term`、`amount_minor`、`slot_limit`）和 `payment_methods`，金额按人民币分计，额度为正整数或 `"unlimited"` |
-| POST | `/crag-shop/orders` | JSON `{ sku, payment_method, request_id }`；超时重试时必须复用同一 `request_id` 和原参数，复用标识但更改参数返回 `409` |
+| GET | `/crag-shop/plans` | 在售 `plans`（`sku`、`term`、`amount_minor`、`slot_limit`，可选 `remaining`、`renewable`）、`payment_methods`，以及上线时的 `commerce` 核价规则 |
+| POST | `/crag-shop/quote` | JSON `{ sku, slots?, months?, coupon? }`；返回 `{ sku, term, months, slot_limit, subtotal_minor, discount_minor, amount_minor, remaining? }`。金额按人民币分计；仅自定义套餐接受槽位和月数，续费必须由管理员发起 |
+| POST | `/crag-shop/orders` | 在核价输入上增加 `{ payment_method, request_id, expected_amount_minor }`；提交金额不同于供应方当前核价时不创建订单。重试必须复用同一 `request_id` 及全部原参数；参数不一致返回 `409` |
 | GET | `/crag-shop/orders` | 查看本人订单列表 `{ orders, next_offset }`，每页最多 100 单，可用 `?offset=` 继续 |
 | GET | `/crag-shop/orders/:id` | 查看本人订单状态，不返回支付表单或兑换码 |
-| POST | `/crag-shop/orders/:id/claim` | 空请求体或 JSON `{}`，返回 `{ order_id, redemption_code }`；未发货返回 `409`，不兑换到宿主机 |
+| POST | `/crag-shop/orders/:id/resume` | 空请求体或 JSON `{}`；按订单 ID 恢复原付款表单（若仍可用），不会创建新订单。供应方未确认创建时返回 `404` |
+| POST | `/crag-shop/orders/:id/claim` | 空请求体或 JSON `{}`，普通订单返回 `{ order_id, redemption_code }`；未发货返回 `409`，不兑换到宿主机，续费订单不提供兑换码 |
+| POST | `/crag-shop/orders/:id/apply-renewal` | 空请求体或 JSON `{}`；仅管理员本人可将已发货的续费订单应用到当前宿主机，返回宿主订阅状态，不返回兑换码或续费证明 |
 
-本人可从订单视图读取原始 `request_id`，用订单中的 `sku` 和 `payment_method` 重发创建请求来恢复付款；无需先从当前套餐目录查回原商品。
+历史订单优先按订单 ID 恢复。仅在供应方未收到建单时，才需要用原选项和 `request_id` 重新发起建单。未核价的旧方案仅在兼容模式下可建单。浏览器不能提交续费证明；控制面用已有的宿主凭据向固定供应方申请证明。
 
 订单视图包含 `order_id`、`request_id`、`status`、`sku`、`payment_method`、`created_at`（Unix 秒）、`term`、`amount_minor`、`slot_limit`。`reserved` 表示仅保留了本地订单标识、尚未确认供应方创建，后三个快照字段为 `null`；确认后的状态是 `pending`、`paid` 或 `fulfilled`。目录下架不影响已创建订单的历史快照。
 
-只有创建接口可能返回支付表单。收到配对的 `url` 和 `data` 时，使用 `url` 作为表单 POST 的目标，不能换成买家提供的地址。接口不返回订单私有凭据；仅领取接口返回兑换码。有效的历史订单可能没有可用的支付表单，不能把这种情况当作支付成功。
+创建或恢复接口可能返回付款表单。收到配对的 `url` 和 `data` 时，使用 `url` 作为表单 POST 的目标，不能换成买家提供的地址。接口不返回订单私有凭据；仅普通订单的领取接口返回兑换码。有效的历史订单可能没有可用的支付表单，不能把这种情况当作支付成功。
 
 收据主密钥保存在数据目录的 `crag-shop-private/receipt.key`，仅控制进程可读；迁移安装或恢复订单库时，须单独安全备份并恢复同一份密钥。标准数据库备份不含该密钥，已有订单而密钥丢失时服务拒绝重建密钥。
+
+宿主订阅状态 `GET /crag-subscription` 仅管理员可查。可展示 `sku`、`months`、`used_slots`、`available_slots`、`enabled_slots`（验证为运行并持有效本机授权的槽）及 `reclaim_supported`；未确认的数据省略。H2 受签名列表 10,000 槽安全上限约束，即使商业额度为 `"unlimited"`，可用槽数仍为整数。仅在已验证运行中的 CRAG 包支持 H2 时对 H1 宿主显示 `upgrade_available`，通过 `POST /crag-subscription/upgrade`（JSON `{}`）显式升级。H2 用签名列表逐一校验 S1 许可摘要。确认本机 Docker 槽已销毁后才提交释放。删除返回 `409` 时可重试原操作；`POST /crag-subscription/recover`（JSON `{}`）或控制面重启可恢复已经确认销毁的释放操作，但不会把未确认的销毁判为成功。
 
 ## 路由 / 设置
 

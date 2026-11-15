@@ -223,7 +223,9 @@ export function authorizePanelRoute(method, path, role) {
   const m = String(method || 'GET').toUpperCase()
   const p = String(path || '')
 
-  if (cragShopRoute(m, p)) return { ok: true, role: r }
+  const shopRoute = cragShopRoute(m, p)
+  if (shopRoute === 'apply-renewal') return { ok: false, role: r, code: 'forbidden', message: 'Forbidden' }
+  if (shopRoute) return { ok: true, role: r }
 
   if (/^\/api\/panel\/vms\/[^/]+\/migration(?:\/|$)/.test(p)) {
     return { ok: false, role: r, code: 'forbidden', message: '只有管理员可以迁移槽位' }

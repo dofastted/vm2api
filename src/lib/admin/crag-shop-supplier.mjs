@@ -15,6 +15,8 @@ export const isOrderId = (value) =>
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
 export const ORDER_STATES = ['reserved', 'pending', 'paid', 'fulfilled']
 export const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value)
+export const isQuantity = (value) => Number.isInteger(value) && value >= 1 && value <= 2147483647
+export const isAmount = (value) => Number.isSafeInteger(value) && value >= 1
 
 export class ShopError extends Error {
   constructor(status, code, message) {
@@ -31,17 +33,58 @@ export function publicPlan(value) {
   const { sku, term, amount_minor, slot_limit } = value
   if (
     !isSku(sku) ||
-    !['1m', '3m', '1y'].includes(term) ||
-    !Number.isSafeInteger(amount_minor) ||
-    amount_minor < 1 ||
-    !(slot_limit === 'unlimited' || (Number.isInteger(slot_limit) && slot_limit >= 1 && slot_limit <= 2147483647))
+    !['1m', '3m', '1y', 'custom', 'monthly'].includes(term) ||
+    !isAmount(amount_minor) ||
+    !(slot_limit === 'unlimited' || isQuantity(slot_limit))
   )
     throw invalidReply()
-  return { sku, term, amount_minor, slot_limit }
+  const plan = { sku, term, amount_minor, slot_limit }
+  if (value.remaining !== undefined) {
+    if (value.remaining !== null && (!Number.isSafeInteger(value.remaining) || value.remaining < 0))
+      throw invalidReply()
+    plan.remaining = value.remaining
+  }
+  if (value.renewable !== undefined) {
+    if (typeof value.renewable !== 'boolean') throw invalidReply()
+    plan.renewable = value.renewable
+  }
+  return plan
+}
+
+function priceSnapshot(value, required = false) {
+  const snapshot = {}
+  for (const key of ['months', 'subtotal_minor', 'discount_minor']) {
+    if (!required && value[key] === undefined) continue
+    const valid = key === 'months' ? isQuantity(value[key]) : Number.isSafeInteger(value[key]) && value[key] >= 0
+    if (!valid) throw invalidReply()
+    snapshot[key] = value[key]
+  }
+  if (
+    (snapshot.subtotal_minor !== undefined && snapshot.subtotal_minor < value.amount_minor) ||
+    (snapshot.subtotal_minor !== undefined &&
+      snapshot.discount_minor !== undefined &&
+      snapshot.subtotal_minor - snapshot.discount_minor !== value.amount_minor)
+  )
+    throw invalidReply()
+  return snapshot
+}
+
+function publicQuote(value, input) {
+  const { renewable, ...plan } = publicPlan(value)
+  const snapshot = priceSnapshot(value, true)
+  if (
+    plan.sku !== input.sku ||
+    (input.slots !== undefined && plan.slot_limit !== input.slots) ||
+    (input.months !== undefined && snapshot.months !== input.months)
+  )
+    throw invalidReply()
+  return { ...plan, ...snapshot }
 }
 
 function publicOrder(value, row) {
   const plan = publicPlan(value)
+  const snapshot = priceSnapshot(value)
+  const purchase = row.purchase_json ? JSON.parse(row.purchase_json) : { sku: row.sku }
   const { order_id, status, created_at, payment_method } = value
   if (
     order_id !== row.order_id ||
@@ -49,10 +92,13 @@ function publicOrder(value, row) {
     payment_method !== row.payment_method ||
     !ORDER_STATES.slice(1).includes(status) ||
     !Number.isSafeInteger(created_at) ||
-    created_at <= 0
+    created_at <= 0 ||
+    (row.expected_amount_minor != null && plan.amount_minor !== row.expected_amount_minor) ||
+    (purchase.slots !== undefined && plan.slot_limit !== purchase.slots) ||
+    (purchase.months !== undefined && snapshot.months !== undefined && snapshot.months !== purchase.months)
   )
     throw invalidReply()
-  return { ...plan, order_id, status, created_at, payment_method }
+  return { ...plan, ...snapshot, order_id, status, created_at, payment_method }
 }
 
 const FORM_KEYS = [
@@ -136,8 +182,16 @@ async function readReply(res) {
   }
 }
 
+const commerceErrors = new Map([
+  ['amount_out_of_range', [400, 'shop_amount_out_of_range', 'Payment amount out of range']],
+  ['quote_changed', [409, 'shop_price_changed', 'Price changed; request a new quote']],
+  ['out_of_stock', [409, 'shop_out_of_stock', 'Launch plan sold out']],
+  ['coupon_unavailable', [409, 'shop_coupon_unavailable', 'Coupon unavailable']],
+  ['renewal_unavailable', [409, 'shop_renewal_unavailable', 'Current plan cannot be renewed']],
+])
+
 function supplierError(status, operation) {
-  if (status === 404 && operation === 'create') {
+  if (status === 404 && ['create', 'quote'].includes(operation)) {
     return new ShopError(404, 'shop_item_unavailable', 'Plan or payment method unavailable')
   }
   if (status === 404 && operation !== 'plans') return new ShopError(404, 'shop_order_not_found', 'Order not found')
@@ -145,6 +199,10 @@ function supplierError(status, operation) {
     return new ShopError(409, 'shop_claim_not_ready', 'Order is not ready to claim')
   if (status === 409 && operation === 'create')
     return new ShopError(409, 'shop_order_conflict', 'Order input conflicts')
+  if ([400, 422].includes(status) && ['create', 'quote'].includes(operation))
+    return new ShopError(400, 'shop_invalid_purchase', 'Purchase options are unavailable or invalid')
+  if ([401, 403, 409].includes(status) && ['create', 'quote'].includes(operation))
+    return new ShopError(409, 'shop_purchase_unavailable', 'Purchase is unavailable; request a new quote')
   if (status === 429) return new ShopError(429, 'shop_rate_limited', 'CRAG shop is busy; try again later')
   if (status === 503) return new ShopError(503, 'shop_unavailable', 'CRAG shop unavailable; try again later')
   return invalidReply()
@@ -208,10 +266,19 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
         cache: 'no-store',
         signal: AbortSignal.timeout(SHOP_TIMEOUT),
       })
-      if (!response.ok) throw supplierError(response.status, operation)
+      if (!response.ok) {
+        if (['create', 'quote'].includes(operation) && [400, 409].includes(response.status)) {
+          const reply = await readReply(response).catch(() => null)
+          const known = commerceErrors.get(reply?.error)
+          if (known?.[0] === response.status) throw new ShopError(...known)
+        }
+        throw supplierError(response.status, operation)
+      }
       const value = await readReply(response)
       // Never surface an accidentally reflected pilot token in buyer data or payment forms.
-      if (pilotToken && JSON.stringify(value).includes(pilotToken)) throw invalidReply()
+      for (const secret of [pilotToken, body?.renewal_proof]) {
+        if (secret && JSON.stringify(value).includes(JSON.stringify(secret).slice(1, -1))) throw invalidReply()
+      }
       return value
     } catch (err) {
       if (err instanceof ShopError) throw err
@@ -233,15 +300,52 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
         throw invalidReply()
       const plans = value.plans.map(publicPlan)
       if (new Set(plans.map(({ sku }) => sku)).size !== plans.length) throw invalidReply()
-      return { plans, payment_methods: [...new Set(value.payment_methods)] }
+      const result = { plans, payment_methods: [...new Set(value.payment_methods)] }
+      if (value.commerce !== undefined) {
+        const commerce = value.commerce
+        if (
+          !object(commerce) ||
+          !isAmount(commerce.unit_amount_minor) ||
+          !isAmount(commerce.max_amount_minor) ||
+          commerce.unit_amount_minor > commerce.max_amount_minor ||
+          !isQuantity(commerce.max_months) ||
+          !isQuantity(commerce.max_slots) ||
+          (commerce.custom_renewable !== undefined && typeof commerce.custom_renewable !== 'boolean')
+        )
+          throw invalidReply()
+        result.commerce = Object.fromEntries(
+          ['unit_amount_minor', 'max_amount_minor', 'max_months', 'max_slots', 'custom_renewable']
+            .filter((key) => commerce[key] !== undefined)
+            .map((key) => [key, commerce[key]]),
+        )
+      }
+      return result
     },
-    async create(row, receipt) {
-      const { order_id, sku, payment_method } = row
+    async quote(input, renewalProof) {
+      const value = await send('quote', '/shop/quote', {
+        method: 'POST',
+        body: { ...input, ...(renewalProof ? { renewal_proof: renewalProof } : {}) },
+      })
+      return publicQuote(value, input)
+    },
+    async create(row, receipt, renewalProof, purchase = { sku: row.sku }) {
+      const { order_id, payment_method } = row
       const value = await send('create', '/shop/orders', {
         method: 'POST',
         receipt,
-        body: { order_id, sku, payment_method },
+        body: {
+          order_id,
+          ...purchase,
+          payment_method,
+          ...(row.expected_amount_minor != null ? { expected_amount_minor: row.expected_amount_minor } : {}),
+          ...(renewalProof ? { renewal_proof: renewalProof } : {}),
+        },
       })
+      const order = publicOrder(value, row)
+      return { order, form: checkout(value, order, receipt) }
+    },
+    async resume(row, receipt) {
+      const value = await send('resume', `/shop/orders/${row.order_id}/resume`, { method: 'POST', receipt })
       const order = publicOrder(value, row)
       return { order, form: checkout(value, order, receipt) }
     },

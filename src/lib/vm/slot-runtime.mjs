@@ -73,8 +73,8 @@ export async function stopSlot(vm) {
 }
 
 /** Destroy the slot container. Used only by explicit reset / delete. */
-export async function destroySlot(vm) {
-  return slotHost(vm).destroy(vm)
+export async function destroySlot(vm, opts) {
+  return slotHost(vm).destroy(vm, opts)
 }
 
 /** Reload guest worker so a new bind-mounted / virtiofs binary is picked up. Recreate only when the bound egress network moved; otherwise never docker rm. */

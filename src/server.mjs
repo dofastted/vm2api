@@ -91,6 +91,7 @@ import { createSlotShell } from './lib/vm/slot-shell.mjs'
 import { vmLockBusy } from './lib/vm/vm-file.mjs'
 import {
   assertCragSubscriptionTarget,
+  isCragSubscriptionSlotEnabled,
   refreshSlotGuestBinDir,
   syncLocalSlotRestartPolicies,
 } from './lib/vm/vm-runtime.mjs'
@@ -977,8 +978,12 @@ cliNodeGuard = createCliNodeGuard({
 
 const cragSubscription = createCragSubscription({
   projectRoot: cfg.paths.project,
-  listTargets: () => listVms(cfg.paths.project),
-  assertReady: (vm) => assertCragSubscriptionTarget(cfg.paths.project, vm, routingConfig),
+  listTargets: () =>
+    listVms(cfg.paths.project)
+      .map(({ id }) => getVm(cfg.paths.project, id))
+      .filter(Boolean),
+  assertReady: (vm, opts) => assertCragSubscriptionTarget(cfg.paths.project, vm, routingConfig, opts),
+  isSlotEnabled: (vm, opts) => isCragSubscriptionSlotEnabled(cfg.paths.project, vm, routingConfig, opts),
 })
 
 const handlePanel = createPanelHandler({
