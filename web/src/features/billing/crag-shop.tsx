@@ -5,22 +5,30 @@ import { api, isApiError } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { PageHeader } from '@/components/page-header'
+import { CragPlanPicker } from './crag-plan-picker'
 
 const root = '/api/panel/crag-shop'
+const catalogIntervalMs = 25_000
+const catalogTimeoutMs = 12_000
 const terms = { '1m': '月卡', '3m': '季卡', '1y': '年卡' }
 const methods = { wxpay: '微信支付', alipay: '支付宝' }
 type Method = keyof typeof methods
-type Plan = {
+type CragPlan = {
   sku: string
   term: keyof typeof terms
   amount_minor: number
   slot_limit: number | 'unlimited'
 }
+type Catalog = { plans: CragPlan[]; payment_methods: Method[] }
+type CatalogState =
+  | { status: 'loading' }
+  | { status: 'ready'; data: Catalog }
+  | { status: 'error' }
 type Order = {
   sku: string
-  term: Plan['term'] | null
-  amount_minor: Plan['amount_minor'] | null
-  slot_limit: Plan['slot_limit'] | null
+  term: CragPlan['term'] | null
+  amount_minor: CragPlan['amount_minor'] | null
+  slot_limit: CragPlan['slot_limit'] | null
   order_id: string
   request_id?: string
   payment_method: Method
@@ -36,10 +44,21 @@ const money = new Intl.NumberFormat('zh-CN', {
   minimumFractionDigits: 0,
 })
 
+function formatPlanDetails(
+  amountMinor: number,
+  slotLimit: CragPlan['slot_limit']
+) {
+  return {
+    price: money.format(amountMinor / 100),
+    locks: slotLimit === 'unlimited' ? '应用锁不限' : `${slotLimit} 把应用锁`,
+  }
+}
+
 function planTerms(plan: Pick<Order, 'amount_minor' | 'slot_limit'>) {
   if (plan.amount_minor === null || plan.slot_limit === null)
     return '金额与应用锁待确认'
-  return `${money.format(plan.amount_minor / 100)} · ${plan.slot_limit === 'unlimited' ? '应用锁不限' : `${plan.slot_limit} 把应用锁`}`
+  const { price, locks } = formatPlanDetails(plan.amount_minor, plan.slot_limit)
+  return `${price} · ${locks}`
 }
 
 export function CragShopLink() {
@@ -54,7 +73,7 @@ export function CragSubscriptionPage() {
   return (
     <PageHeader
       title={VIEW_TITLES['crag-subscription']}
-      description='每单一枚兑换码，仅限一台受支持的宿主机。购买前请确认内核支持宿主订阅；付款后在本人订单领取兑换码。'
+      description='CRAG 宿主订阅仅支持在线购买和联网兑换。每单一枚兑换码，仅限一台受支持的宿主机。购买前请确认内核支持宿主订阅，付款后可在本人订单领取兑换码。'
     >
       <ShopOrders />
     </PageHeader>
@@ -62,18 +81,16 @@ export function CragSubscriptionPage() {
 }
 
 function ShopOrders() {
-  const [catalog, setCatalog] = useState<{
-    plans: Plan[]
-    payment_methods: Method[]
-  }>()
+  const [catalog, setCatalog] = useState<CatalogState>({ status: 'loading' })
+  const refreshCatalog = useRef<(() => void) | null>(null)
   const [orders, setOrders] = useState<Order[]>()
   const [offset, setOffset] = useState(0)
   const [nextOffset, setNextOffset] = useState<number | null>(null)
   const [staleOrders, setStaleOrders] = useState<string[]>([])
-  const [failed, setFailed] = useState({ catalog: false, orders: false })
+  const [ordersFailed, setOrdersFailed] = useState(false)
   const [loading, setLoading] = useState(true)
   const [revision, refresh] = useState(0)
-  const [planSku, setPlanSku] = useState('')
+  const [planSku, setPlanSku] = useState<string>()
   const [method, setMethod] = useState<Method>()
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState('')
@@ -87,49 +104,117 @@ function ShopOrders() {
   const operating = useRef(false)
 
   useEffect(() => {
+    let active: { controller: AbortController; timeout: number } | undefined
+
+    function loadCatalog() {
+      // Focus, interval and manual refresh share one bounded request.
+      if (active) return
+      const controller = new AbortController()
+      const timeout = window.setTimeout(() => {
+        active = undefined
+        controller.abort()
+        setCatalog({ status: 'error' })
+      }, catalogTimeoutMs)
+      const request = { controller, timeout }
+      active = request
+
+      void api<Catalog>(`${root}/plans`, {
+        signal: controller.signal,
+        cache: 'no-store',
+      })
+        .then((data) => {
+          if (active !== request) return
+          if (
+            !Array.isArray(data?.plans) ||
+            !Array.isArray(data?.payment_methods)
+          ) {
+            setCatalog({ status: 'error' })
+            return
+          }
+          setCatalog({ status: 'ready', data })
+          if (data.plans.length && data.payment_methods.length) {
+            // Set defaults once from a sellable response. Never switch a
+            // selected SKU or payment method to a different one on refresh.
+            setPlanSku((sku) => sku ?? data.plans[0].sku)
+            setMethod((channel) => channel ?? data.payment_methods[0])
+          }
+        })
+        .catch(() => {
+          if (active === request) setCatalog({ status: 'error' })
+        })
+        .finally(() => {
+          window.clearTimeout(timeout)
+          if (active === request) active = undefined
+        })
+    }
+
+    function onVisible() {
+      if (document.visibilityState === 'visible') loadCatalog()
+    }
+
+    refreshCatalog.current = loadCatalog
+    loadCatalog()
+    const interval = window.setInterval(loadCatalog, catalogIntervalMs)
+    window.addEventListener('focus', loadCatalog)
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      refreshCatalog.current = null
+      window.clearInterval(interval)
+      window.removeEventListener('focus', loadCatalog)
+      document.removeEventListener('visibilitychange', onVisible)
+      if (active) {
+        window.clearTimeout(active.timeout)
+        active.controller.abort()
+        active = undefined
+      }
+    }
+  }, [])
+
+  useEffect(() => {
     const controller = new AbortController()
     const { signal } = controller
     setLoading(true)
-    void Promise.allSettled([
-      api<{ plans: Plan[]; payment_methods: Method[] }>(`${root}/plans`, {
-        signal,
-      }),
-      api<OrderPage>(`${root}/orders?offset=${offset}`, { signal }).then(
-        async (page) => {
-          const visible = page.orders.slice()
-          const stale: string[] = []
-          const pending = visible
-            .map((order, index) => ({ order, index }))
-            .filter(({ order }) => order.status !== 'fulfilled')
-          for (let i = 0; i < pending.length && !signal.aborted; i += 4) {
-            await Promise.all(
-              pending.slice(i, i + 4).map(async ({ order, index }) => {
-                try {
-                  visible[index] = await api<Order>(
-                    `${root}/orders/${encodeURIComponent(order.order_id)}`,
-                    { signal }
-                  )
-                } catch {
-                  stale.push(order.order_id)
-                }
-              })
-            )
-          }
-          return { ...page, orders: visible, stale }
+    void api<OrderPage>(`${root}/orders?offset=${offset}`, { signal })
+      .then(async (page) => {
+        const visible = page.orders.slice()
+        const stale: string[] = []
+        const pending = visible
+          .map((order, index) => ({ order, index }))
+          .filter(({ order }) => order.status !== 'fulfilled')
+        for (let i = 0; i < pending.length && !signal.aborted; i += 4) {
+          await Promise.all(
+            pending.slice(i, i + 4).map(async ({ order, index }) => {
+              try {
+                visible[index] = await api<Order>(
+                  `${root}/orders/${encodeURIComponent(order.order_id)}`,
+                  { signal }
+                )
+              } catch {
+                stale.push(order.order_id)
+              }
+            })
+          )
         }
-      ),
-    ]).then(([plans, mine]) => {
-      if (signal.aborted) return
-      setCatalog(plans.status === 'fulfilled' ? plans.value : undefined)
-      setOrders(mine.status === 'fulfilled' ? mine.value.orders : undefined)
-      setNextOffset(mine.status === 'fulfilled' ? mine.value.next_offset : null)
-      setStaleOrders(mine.status === 'fulfilled' ? mine.value.stale : [])
-      setFailed({
-        catalog: plans.status === 'rejected',
-        orders: mine.status === 'rejected',
+        return { ...page, orders: visible, stale }
       })
-      setLoading(false)
-    })
+      .then(
+        (mine) => {
+          if (signal.aborted) return
+          setOrders(mine.orders)
+          setNextOffset(mine.next_offset)
+          setStaleOrders(mine.stale)
+          setOrdersFailed(false)
+          setLoading(false)
+        },
+        () => {
+          if (signal.aborted) return
+          setOrders(undefined)
+          setNextOffset(null)
+          setStaleOrders([])
+          setOrdersFailed(true)
+          setLoading(false)
+        }
+      )
     return () => controller.abort()
   }, [offset, revision])
 
@@ -206,105 +291,101 @@ function ShopOrders() {
     )
   }
 
-  const plans = catalog?.plans ?? []
-  const channels = catalog?.payment_methods ?? []
-  const selectedPlan = plans.find((p) => p.sku === planSku) ?? plans[0]
+  const plans = catalog.status === 'ready' ? catalog.data.plans : []
+  const channels =
+    catalog.status === 'ready' ? catalog.data.payment_methods : []
+  const selectedPlan = plans.find((plan) => plan.sku === planSku)
   const selectedMethod =
-    method && channels.includes(method) ? method : channels[0]
+    method && channels.includes(method) ? method : undefined
+  const canOrder = plans.length > 0 && channels.length > 0
+  const catalogMessage =
+    catalog.status === 'loading'
+      ? '正在查询套餐…'
+      : catalog.status === 'error'
+        ? '暂时无法确认可售套餐，请刷新套餐重试。仍可查看本人订单。'
+        : !plans.length
+          ? '暂无可购买的套餐，仍可查看本人订单。'
+          : !channels.length
+            ? '暂无可用的付款方式，暂不能创建订单。'
+            : !selectedPlan || !selectedMethod
+              ? '套餐或付款方式已更新，请重新选择后再创建订单。'
+              : ''
   return (
     <div className='min-w-0 space-y-5'>
       <section aria-label='选择套餐' className='space-y-3'>
         <div className='flex flex-wrap items-center justify-between gap-2'>
-          <h2 className='font-medium'>可用套餐</h2>
-          {failed.catalog || (catalog && !selectedPlan) ? (
-            <Button
-              size='sm'
-              variant='ghost'
-              disabled={loading || busy}
-              onClick={() => refresh((n) => n + 1)}
-            >
-              刷新套餐
-            </Button>
-          ) : null}
+          <h2 className='font-medium'>订阅套餐</h2>
+          <Button
+            type='button'
+            size='sm'
+            variant='ghost'
+            onClick={() => refreshCatalog.current?.()}
+          >
+            刷新套餐
+          </Button>
         </div>
-        {loading && !catalog && !failed.catalog ? (
-          <Skeleton className='h-24 w-full' />
+        <div
+          role='status'
+          className='text-sm text-muted-foreground empty:sr-only'
+        >
+          {catalogMessage}
+        </div>
+        {catalog.status === 'loading' ? (
+          <Skeleton aria-hidden='true' className='h-24 w-full' />
         ) : null}
-        {failed.catalog ? (
-          <p className='text-sm text-muted-foreground'>
-            暂时无法查询可售套餐，仍可查看已有订单。
-          </p>
+        {plans.length > 0 ? (
+          <CragPlanPicker
+            plans={plans.map((plan) => ({
+              sku: plan.sku,
+              term: terms[plan.term],
+              ...formatPlanDetails(plan.amount_minor, plan.slot_limit),
+            }))}
+            selectedSku={selectedPlan?.sku}
+            onSelect={setPlanSku}
+            disabled={busy || !canOrder}
+          />
         ) : null}
-        {catalog && (!selectedPlan || !selectedMethod) ? (
-          <p className='text-sm text-muted-foreground'>
-            暂未开放下单，已有兑换码仍可从本人订单领取。
-          </p>
-        ) : null}
-        {selectedPlan && selectedMethod ? (
-          <>
-            <fieldset
-              className='divide-y rounded-md border'
-              disabled={busy || loading}
-            >
-              <legend className='sr-only'>套餐</legend>
-              {plans.map((p) => (
-                <label
-                  key={p.sku}
-                  className='flex cursor-pointer flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2.5 text-sm'
-                >
-                  <input
-                    type='radio'
-                    name='crag-plan'
-                    className='accent-primary'
-                    checked={p.sku === selectedPlan.sku}
-                    onChange={() => setPlanSku(p.sku)}
-                  />
-                  <span className='font-medium'>
-                    {terms[p.term]}
-                    {plans.filter((plan) => plan.term === p.term).length > 1
-                      ? ` · ${p.sku}`
-                      : ''}
-                  </span>
-                  <span className='ml-auto tabular-nums'>{planTerms(p)}</span>
-                </label>
-              ))}
-            </fieldset>
-            <div className='flex flex-wrap items-end gap-3'>
-              <label className='grid gap-1 text-sm'>
-                付款方式
-                <select
-                  className='h-9 rounded-md border bg-background px-2'
-                  value={selectedMethod}
-                  disabled={busy || loading}
-                  onChange={(e) => setMethod(e.target.value as Method)}
-                >
-                  {channels.map((channel) => (
-                    <option key={channel} value={channel}>
-                      {methods[channel]}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <Button
-                disabled={busy || loading}
-                onClick={() => {
-                  const last = intent.current
-                  start(
-                    last?.sku === selectedPlan.sku &&
-                      last.payment_method === selectedMethod
-                      ? last
-                      : {
-                          sku: selectedPlan.sku,
-                          payment_method: selectedMethod,
-                          request_id: crypto.randomUUID(),
-                        }
-                  )
-                }}
+        {canOrder ? (
+          <div className='flex flex-wrap items-end gap-3'>
+            <label className='grid gap-1 text-sm'>
+              付款方式
+              <select
+                className='h-9 rounded-md border bg-background px-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring'
+                value={selectedMethod ?? ''}
+                disabled={busy}
+                onChange={(event) => setMethod(event.target.value as Method)}
               >
-                创建订单
-              </Button>
-            </div>
-          </>
+                <option value='' disabled>
+                  请选择付款方式
+                </option>
+                {channels.map((channel) => (
+                  <option key={channel} value={channel}>
+                    {methods[channel]}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <Button
+              type='button'
+              disabled={busy || !selectedPlan || !selectedMethod}
+              onClick={() => {
+                if (!selectedPlan || !selectedMethod) return
+                const last = intent.current
+                start(
+                  last?.sku === selectedPlan.sku &&
+                    last.payment_method === selectedMethod
+                    ? last
+                    : {
+                        sku: selectedPlan.sku,
+                        payment_method: selectedMethod,
+                        request_id: crypto.randomUUID(),
+                      }
+                )
+              }}
+            >
+              创建订单
+            </Button>
+          </div>
         ) : null}
         {checkout ? (
           <div className='flex flex-wrap items-center justify-between gap-2 rounded-md border p-3 text-sm'>
@@ -343,10 +424,10 @@ function ShopOrders() {
             {notice}
           </p>
         ) : null}
-        {loading && !orders && !failed.orders ? (
+        {loading && !orders && !ordersFailed ? (
           <Skeleton className='h-12 w-full' />
         ) : null}
-        {failed.orders ? (
+        {ordersFailed ? (
           <p className='text-sm text-muted-foreground'>
             暂时无法读取本人订单，请刷新重试。
           </p>
