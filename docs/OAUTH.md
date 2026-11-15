@@ -77,12 +77,14 @@ SSH 扩展槽同样由控制面经绑定出口换票。拿到授权后，提交�
 
 「OAuth → Claude Code 授权 → 生成授权链接」打开交互终端、可复制的链接和回调输入栏。支持粘贴完整 `code#state` 或授权回调链接，也可直接在终端输入。原生 CC 在临时配置中换票；面板成功保存并同步凭证后才显示完成。关闭或重新连接会结束旧会话，旧链接不再使用。
 
+登录成功后的凭证回填不等待推理内核就绪，也不为保存凭证重启 VM。面板只显示凭证状态和账号信息；VM 内的原生 CC 继续通过现有相对软链接读取同一份凭证。
+
 此入口使用已装载的签名 CRAG 包内原版 Claude Code，不读取 CRAG 源码，也不回退到 `cli-node`。若缺少原生可执行文件，先按[二进制安装说明](DEPLOY.md#crag-v2-二进制更新)补齐包；仅升级面板 OAuth 代码无需替换已有的同版 CRAG 内核。
 
 - 原生客户端的 `.credentials.json` 链接到面板管理的 `credentials.json`。显式导入以面板新凭证为准，不让旧原生客户端留下的文件覆盖新账号。远程槽导入时先推送凭证；后续手动同步保留节点已轮换的凭证，再修复原生客户端链接。
 - 运维终端在连接时及打开后每 60 秒检查凭证链接，临期时通过槽位现有刷新链路刷新。`/sync` 可手动修复链接，不触发重新授权、不输出 token。若已打开的 CC 仍持有旧凭证，请退出后重开。
 - 终端中的 `claude` / `cc` 始终使用包内原生 CC。本地 Docker / KVM 槽使用 `/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude`，集群 Docker 槽使用 `/opt/kin-live/crag-v2/claude-code-2.1.321/claude`。本地缺少程序时从已校验发布包暂存原生客户端；缺包或不可执行会报错。
-- 推理内核仍使用各自客户端：wrap 使用 cli-node，cc 使用 cc-node，CRAG v2 使用对应包内原生 CC。切换内核会重建调用配置，终端面板随切换重新连接。
+- 推理使用当前所选内核对应的客户端：标准内核（wrap）启动 cli-node，cc 使用 cc-node，CRAG v2 启动包内原生 CC。切换时更新 `kernel.json` 的 `claude_bin`；旧的 `KIN_CLAUDE_BIN` 环境变量不覆盖这个选择。OAuth 入口始终使用原生 CC，与推理内核选择无关。
 - `/usage`、`/probe`、`/wrap`、`/reload`、`/sync`、`/help`、`/clear` 在 shell 提示符处可用，也支持粘贴后按回车。原生 CC 或其它前台程序运行时，斜杠输入直接交给该程序。
 - `login: true` 票据只打开专用登录终端，不能用于运维 shell。运维终端中的 `claude auth login` / `claude setup-token` 提示回到账号面板。
 
