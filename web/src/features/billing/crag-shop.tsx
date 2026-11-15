@@ -38,7 +38,7 @@ const root = '/api/panel/crag-shop'
 const catalogIntervalMs = 25_000
 const catalogTimeoutMs = 12_000
 const terms = { '1m': '月卡', '3m': '季卡', '1y': '年卡' }
-function termLabel(term: string | null, sku: string, months?: number) {
+export function termLabel(term: string | null, sku: string, months?: number) {
   if (months != null)
     return `${sku === 'renewal' ? '续费 · ' : ''}${months} 个月`
   const duration =
@@ -51,7 +51,7 @@ function termLabel(term: string | null, sku: string, months?: number) {
 }
 const methods = { wxpay: '微信支付', alipay: '支付宝' }
 type Method = keyof typeof methods
-type CragPlan = {
+export type CragPlan = {
   sku: string
   term: string
   amount_minor: number
@@ -63,7 +63,7 @@ type CragPlan = {
   enabled?: boolean
   months?: number
 }
-type Presentation = Partial<
+export type Presentation = Partial<
   Record<
     | 'title'
     | 'description'
@@ -368,7 +368,7 @@ function OrderProgress({
   )
 }
 
-function formatPlanDetails(
+export function formatPlanDetails(
   amountMinor: number,
   slotLimit: CragPlan['slot_limit']
 ) {
