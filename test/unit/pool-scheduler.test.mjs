@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { PoolScheduler, formatPoolSelectionSummary } from '../../src/lib/pool/pool-scheduler.mjs'
+import { PoolScheduler, filterByHostMemory, formatPoolSelectionSummary } from '../../src/lib/pool/pool-scheduler.mjs'
+import { installHostMemoryPressure } from '../../src/lib/cluster/host-memory-pressure.mjs'
 import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
@@ -3138,4 +3139,94 @@ test('a resting slot that cannot serve the model does not promise a Retry-After'
   const selected = await scheduler(root).selectAndReserve({ model: 'claude-test', allowWait: false })
   assert.equal(selected.ok, false)
   assert.equal(selected.retry_after_ms, null)
+})
+
+// ---- host memory pressure admission ----
+
+function hostLevels(t, levels) {
+  installHostMemoryPressure({ levelForVm: (vm) => levels[vm.id] || 'ok' })
+  t.after(() => installHostMemoryPressure(null))
+}
+
+test('filterByHostMemory prefers machines with room and keeps the sticky VM', () => {
+  const c = (vmId, hostPressure) => ({ vmId, hostPressure })
+  const ids = (list) => list.map((x) => x.vmId)
+  assert.deepEqual(ids(filterByHostMemory([c('a', 'tight'), c('b', 'ok')])), ['b'])
+  assert.deepEqual(ids(filterByHostMemory([c('a', 'tight'), c('b', 'critical')])), ['a'])
+  assert.deepEqual(ids(filterByHostMemory([c('a', 'critical'), c('b', 'critical')])), [])
+  assert.deepEqual(ids(filterByHostMemory([c('a', 'critical'), c('b', 'ok')], 'a')), ['a', 'b'])
+  assert.deepEqual(ids(filterByHostMemory([c('a', 'tight'), c('b', 'tight')], 'a')), ['a', 'b'])
+})
+
+test('direct selection avoids a tight machine while another has room', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  hostLevels(t, { 'vm-01': 'tight' })
+  const pool = scheduler(root)
+  for (let i = 0; i < 4; i++) {
+    const selected = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+    assert.equal(selected.accountId, 'account-2')
+    selected.release()
+  }
+})
+
+test('direct selection still uses tight machines when none has room, never critical ones', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const levels = { 'vm-01': 'tight', 'vm-02': 'critical' }
+  hostLevels(t, levels)
+  const pool = scheduler(root)
+  const selected = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(selected.accountId, 'account-1')
+  selected.release()
+  levels['vm-01'] = 'critical'
+  const blocked = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(blocked.ok, false)
+})
+
+test('a continuing conversation keeps its VM on a critical machine', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  hostLevels(t, { 'vm-02': 'critical' })
+  const pool = scheduler(root, { stickyRouter: { resolve: () => ({ vmId: 'vm-02', accountId: 'account-2' }) } })
+  const selected = await pool.selectAndReserve({ model: 'claude-test', stickyKey: 'conversation-1', allowWait: false })
+  assert.equal(selected.accountId, 'account-2')
+  assert.equal(selected.selectionReason, 'sticky')
+  selected.release()
+})
+
+test('seat selection opens new conversations on machines with room first', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const levels = { 'vm-01': 'tight' }
+  hostLevels(t, levels)
+  const pool = scheduler(root)
+  const first = await pool.selectAndReserve({ model: 'claude-test', seatKey: 'seat:sess:hm-1', allowWait: false })
+  assert.equal(first.ok, true)
+  assert.equal(first.vmId, 'vm-02')
+  first.release()
+  levels['vm-02'] = 'critical'
+  const second = await pool.selectAndReserve({ model: 'claude-test', seatKey: 'seat:sess:hm-2', allowWait: false })
+  assert.equal(second.ok, true)
+  assert.equal(second.vmId, 'vm-01', 'tight is used when nothing has room')
+  second.release()
+  levels['vm-01'] = 'critical'
+  const third = await pool.selectAndReserve({ model: 'claude-test', seatKey: 'seat:sess:hm-3', allowWait: false })
+  assert.equal(third.ok, false)
+})
+
+test('seat selection keeps a sticky conversation on its critical machine', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  hostLevels(t, { 'vm-01': 'critical', 'vm-02': 'critical' })
+  const pool = scheduler(root, { stickyRouter: { resolve: () => ({ vmId: 'vm-01', accountId: 'account-1' }) } })
+  const selected = await pool.selectAndReserve({
+    model: 'claude-test',
+    seatKey: 'seat:sess:hm-sticky',
+    stickyKey: 'conversation-hm',
+    allowWait: false,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-01')
+  selected.release()
 })
