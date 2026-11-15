@@ -689,3 +689,19 @@ test('tenant test-models: own slot lists models, foreign slot 404s, refresh neve
   assert.equal(admin.status, 200)
   assert.ok(dials > 0, 'admin refresh still goes live')
 })
+
+test('active usage query enforces slot ownership before reading credentials', async (t) => {
+  const root = makeProject(t)
+  claudeVm(root, 'vm-mine', 'u-1')
+  claudeVm(root, 'vm-other', 'u-2')
+  const url = (id) => `/api/panel/vms/${id}/usage/query`
+  const foreign = await makeHandler(root, TENANT, {}).call('POST', url('vm-other'))
+  assert.equal(foreign.status, 404)
+  const own = await makeHandler(root, TENANT, {}).call('POST', url('vm-mine'))
+  assert.equal(own.status, 400)
+  assert.equal(own.body.error.code, 'no_oauth_token')
+  const missing = await makeHandler(root, ADMIN, {}).call('POST', url('vm-missing'))
+  assert.equal(missing.status, 404)
+  const denied = await makeHandler(root, { ...TENANT, panelRole: 'super' }, {}).call('POST', url('vm-mine'))
+  assert.equal(denied.status, 403)
+})
