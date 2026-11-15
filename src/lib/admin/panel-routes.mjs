@@ -230,6 +230,7 @@ import { diagnoseSlotServices, powerOnSlot, recoverSlot, redactSecrets } from '.
 import { commitVmPackage, exportVmPackage, parseVmPackage } from '../vm/vm-package.mjs'
 import { slotMigrationBusy, slotMigrationJob, startSlotMigration } from '../cluster/slot-migration.mjs'
 import { isNativeNodeVm, preflightNode } from '../cluster/placement.mjs'
+import { normalizeAutoPlacement, pickPlacement, readLocalHost, requestedPlacement } from '../cluster/auto-placement.mjs'
 import { probeLocalKvm } from '../vm/kvm-host.mjs'
 import { normalizeVmConfig, resolveMachineSpec, validateVmConfigPatch } from '../vm/machine-spec.mjs'
 import { raiseDockerSlotMemory } from '../vm/docker-slot-memory.mjs'
@@ -4701,7 +4702,7 @@ export function createPanelHandler(ctx) {
         }
         const startNow = body.start !== false && body.status !== 'stopped'
         const wantKernel = body.kernel && OS_CATALOG[body.kernel] ? body.kernel : kernelForIndex(idx)
-        const nodeId = body.node_id ? String(body.node_id) : null
+        let nodeId = body.node_id ? String(body.node_id) : null
         const vmDefaults = normalizeVmConfig(ctx.routingConfig?.vm)
         const requestedRuntime = body.runtime_type
         let runtime
@@ -4733,7 +4734,34 @@ export function createPanelHandler(ctx) {
           }
           throw error
         }
-        if (nodeId) {
+        // No node named: auto placement may still pick one by memory/load headroom.
+        // Only for admin Docker creates whose exit is not pinned to this host.
+        let placement = null
+        let releasePlacement = () => {}
+        const placementPolicy = normalizeAutoPlacement(ctx.routingConfig?.cluster?.auto_placement)
+        const wanted = requestedPlacement(body, placementPolicy)
+        const exitPinsHost = typeof body.proxy_id === 'string' && isLocalEgressId(body.proxy_id.trim())
+        if (wanted.mode === 'auto' && ident.role === 'admin' && runtime !== RUNTIME_KVM && !exitPinsHost) {
+          const picked = await (ctx.pickPlacement || pickPlacement)({
+            vm: { machine },
+            vms: existing,
+            routing: ctx.routingConfig,
+            policy: placementPolicy,
+            nodes: clusterNodesOf(ctx),
+            localHost: (ctx.readLocalHost || readLocalHost)(),
+            preflight: (id) => preflightNode(id, { kernel: wantKernel, runtime }),
+          })
+          if (picked.error) {
+            return json(res, picked.error.status, {
+              ok: false,
+              error: { code: picked.error.code, message: picked.error.message, placement: picked.error.report },
+            })
+          }
+          placement = picked.report
+          releasePlacement = picked.release || releasePlacement
+          nodeId = picked.node_id || null
+        }
+        if (nodeId && !placement) {
           if (ident.role !== 'admin') {
             return json(res, 403, {
               ok: false,
@@ -4960,6 +4988,8 @@ export function createPanelHandler(ctx) {
           vm.policy.rpmOverride = explicitRpm
         }
         atomicWriteJson(vmPath, vm, { mode: 0o600 })
+        // The record now books this slot's memory itself.
+        releasePlacement()
         writeGuestMachineIdFile(cfg.paths.project, id, generated.guest_machine_id)
         let allocated = null
         let proxyError = null
@@ -5037,6 +5067,7 @@ export function createPanelHandler(ctx) {
               role: ident.role,
               nodes: clusterNodesOf(ctx),
             }),
+            ...(placement ? { placement } : {}),
             ...(startError ? { start_error: startError } : {}),
             ...(proxyError ? { proxy_error: proxyError } : {}),
           }),
