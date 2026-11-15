@@ -11,8 +11,9 @@
  * `max_load_per_core`. Booking keeps the choice stable when slots sit idle and
  * do not yet use their limit.
  *
- * Candidates are ranked by the share of booked capacity left, then by absolute
- * headroom, then local first. A node must also pass `preflightNode`; one that
+ * Candidates are ranked by usable room (the smaller of booked headroom and live
+ * MemAvailable above the floor, so other workloads on a shared node count) as a
+ * share of capacity, then by absolute usable room, then local first. A node must also pass `preflightNode`; one that
  * fails is skipped and the next candidate is tried. Placements still in flight
  * are booked in memory so two concurrent creates do not both take the last room.
  *
@@ -164,12 +165,15 @@ export function rankPlacement({ candidates, booked, needMiB, policy }) {
     if (headroomMiB < needMiB) Object.assign(row, { eligible: false, reason: 'memory_booked' })
     else if (availMiB - needMiB < minFree) Object.assign(row, { eligible: false, reason: 'memory_available' })
     else if (loadPerCore > policy.max_load_per_core) Object.assign(row, { eligible: false, reason: 'cpu_load' })
-    row.score = capacityMiB > 0 ? (headroomMiB - needMiB) / capacityMiB : -1
+    // A shared node also runs workloads that book nothing here: what is really
+    // left is the smaller of booked headroom and live MemAvailable.
+    row.usable_mib = Math.min(headroomMiB, availMiB - minFree)
+    row.score = capacityMiB > 0 ? (row.usable_mib - needMiB) / capacityMiB : -1
     return row
   })
   const order = rows
     .filter((r) => r.eligible)
-    .sort((a, b) => b.score - a.score || b.headroom_mib - a.headroom_mib || Number(b.local) - Number(a.local))
+    .sort((a, b) => b.score - a.score || b.usable_mib - a.usable_mib || Number(b.local) - Number(a.local))
   return { rows, order }
 }
 

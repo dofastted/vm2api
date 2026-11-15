@@ -136,6 +136,25 @@ test('rankPlacement: equal share prefers more absolute room, then local', () => 
   assert.equal(order[0].id, 'local')
 })
 
+test('rankPlacement: memory used by other workloads on a shared node lowers its rank', () => {
+  const policy = normalizeAutoPlacement({})
+  const { order } = rankPlacement({
+    // shared: nothing booked here, but 100G of 128G already used by other services
+    candidates: [
+      { id: 'shared', local: false, host: host(128, { usedGiB: 100 }) },
+      { id: 'quiet', local: false, host: host(64) },
+    ],
+    booked: new Map(),
+    needMiB: 8192,
+    policy,
+  })
+  assert.deepEqual(
+    order.map((r) => r.id),
+    ['quiet', 'shared'],
+  )
+  assert.equal(order[1].usable_mib, 28 * 1024 - 2048)
+})
+
 test('pickPlacement: node failing preflight is skipped for the next candidate', async () => {
   const policy = normalizeAutoPlacement({ enabled: true })
   const seen = []
