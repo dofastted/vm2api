@@ -274,8 +274,9 @@ test('pilot credential authorizes checkout operations but is never sent with rec
   fs.writeFileSync(file, `${token}\n`, { mode: 0o600 })
   process.env[PILOT_TOKEN_FILE_ENV] = file
   assert.deepEqual(await supplier.plans(), catalog)
+  assert.deepEqual(await supplier.plans({ allowPilot: true }), catalog)
   await supplier.create(row, PROOF)
-  checkRequests([planRequest(token), createRequest(token)])
+  checkRequests([planRequest(null), planRequest(token), createRequest(token)])
   await supplier.quote({ sku: row.sku })
   await supplier.resume(row, PROOF)
   checkRequests([
@@ -285,7 +286,7 @@ test('pilot credential authorizes checkout operations but is never sent with rec
   await checkReceiptOnlyRequests()
 
   plansReply = { ...catalog, plans: [{ ...PLAN, sku: token }] }
-  await assert.rejects(supplier.plans(), { code: 'shop_invalid_reply' })
+  await assert.rejects(supplier.plans({ allowPilot: true }), { code: 'shop_invalid_reply' })
   checkRequests([planRequest(token)])
 
   const unavailable = (error) => {
@@ -296,9 +297,10 @@ test('pilot credential authorizes checkout operations but is never sent with rec
     return true
   }
   const checkInvalidFile = async () => {
-    await assert.rejects(supplier.plans(), unavailable)
+    plansReply = { ...catalog, payment_methods: [] }
+    assert.deepEqual(await supplier.plans({ allowPilot: true }), plansReply)
     await assert.rejects(supplier.create(row, PROOF), unavailable)
-    checkRequests([])
+    checkRequests([planRequest(null)])
   }
   fs.chmodSync(file, 0o644)
   await checkInvalidFile()
@@ -401,12 +403,16 @@ test('SQLite reservation survives restart; owners isolate retries, list, status 
     }
     return handle(req, {}, url, cragShopRoute(method, url.pathname))
   }
-  assert.equal((await call({ apiKeyKind: 'master' }, 'GET', '/plans')).http, 403)
+  for (const actor of [{}, { apiKeyKind: 'master' }]) {
+    assert.equal((await call(actor, 'GET', '/orders')).error.code, 'shop_login_required')
+    assert.equal((await call(actor, 'POST', '/orders', INPUT)).error.code, 'shop_login_required')
+    assert.equal((await call(actor, 'POST', '/plans', {})).error.code, 'shop_login_required')
+  }
   assert.equal((await call(PERSON, 'POST', '/orders', INPUT, { origin: 'https://elsewhere.example.test' })).http, 403)
   assert.equal((await call(PERSON, 'POST', '/orders', INPUT, { 'content-type': 'text/plain' })).http, 415)
   assert.equal((await call(PERSON, 'POST', '/orders', { ...INPUT, owner: 'bob' })).http, 400)
   assert.equal(outcalls, 0)
-  assert.deepEqual((await call(PERSON, 'GET', '/plans')).data.plans, [PLAN])
+  assert.deepEqual((await call({}, 'GET', '/plans')).data.plans, [PLAN])
   const failed = await call(PERSON, 'POST', '/orders', INPUT)
   assert.equal(failed.http, 503)
   const [[id, firstReceipt]] = saved

@@ -711,10 +711,11 @@ function rejectAuth(req, res, error) {
 }
 
 /** `keyGate: false` (key self-service) skips the managed key's quota / RPM / concurrency gate and the gateway bucket. */
-function requireAuth(req, res, { keyGate = true, buyer = false } = {}) {
+function requireAuth(req, res, { keyGate = true, buyer = false, optionalBuyer = false } = {}) {
   req.presentedApiKey = extractApiKey(req)
   const token = extractPanelToken(req) || req.presentedApiKey
   if (!token) {
+    if (buyer && optionalBuyer) return false
     return rejectAuth(
       req,
       res,
@@ -750,6 +751,7 @@ function requireAuth(req, res, { keyGate = true, buyer = false } = {}) {
     return true
   }
   if (buyer) {
+    if (optionalBuyer) return false
     json(res, 403, {
       ok: false,
       error: { code: 'shop_login_required', message: 'Sign in to the panel to access CRAG shop' },

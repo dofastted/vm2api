@@ -244,7 +244,7 @@ async function readPilotToken(file) {
 }
 
 export function createShopSupplier(fetchImpl = globalThis.fetch) {
-  async function send(operation, path, { method = 'GET', receipt, body } = {}) {
+  async function send(operation, path, { method = 'GET', receipt, body, allowPilot = true } = {}) {
     const headers = { accept: 'application/json', 'cache-control': 'no-store' }
     if (receipt) headers.authorization = `Bearer ${receipt}`
     if (body) headers['content-type'] = 'application/json'
@@ -253,14 +253,20 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
       let pilotToken
       const pilotFile = process.env.VM2API_CRAG_SHOP_PILOT_TOKEN_FILE
       if (
+        allowPilot &&
         pilotFile !== undefined &&
         ((operation === 'plans' && method === 'GET' && path === '/shop/plans') ||
           (operation === 'quote' && method === 'POST' && path === '/shop/quote') ||
           (operation === 'create' && method === 'POST' && path === '/shop/orders') ||
           (operation === 'resume' && method === 'POST' && /^\/shop\/orders\/[0-9a-f-]{36}\/resume$/.test(path)))
       ) {
-        pilotToken = await readPilotToken(pilotFile)
-        headers['X-Crag-Shop-Pilot'] = pilotToken
+        try {
+          pilotToken = await readPilotToken(pilotFile)
+        } catch (error) {
+          // A broken pilot file must close checkout, not hide the public catalogue.
+          if (operation !== 'plans') throw error
+        }
+        if (pilotToken) headers['X-Crag-Shop-Pilot'] = pilotToken
       }
       response = await fetchImpl(`${ROOT}${path}`, {
         method,
@@ -293,8 +299,8 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
   }
 
   return {
-    async plans() {
-      const value = await send('plans', '/shop/plans')
+    async plans({ allowPilot = false } = {}) {
+      const value = await send('plans', '/shop/plans', { allowPilot })
       if (
         !object(value) ||
         !Array.isArray(value.plans) ||
