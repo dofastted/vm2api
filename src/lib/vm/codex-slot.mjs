@@ -315,6 +315,41 @@ function reconcileCodexLimitedUntil(vm, now = Date.now()) {
   else delete vm.codex.extra.codex_limited_until
 }
 
+/**
+ * Persist codex OAuth refresh health onto the vm ticket. Without this, a dead
+ * credential lived only in scheduler memory: vm.codex.has_access/has_refresh are
+ * import-time snapshots, so a revoked slot kept looking healthy on the panel for
+ * days (its quota snapshot just went stale). Writing the top-level refresh_error
+ * reuses the panel / availability fallback chains that already read it, and the
+ * next successful quota snapshot clears the mark again. Only structural OAuth
+ * failures should be marked — transient network/upstream errors stay unmarked.
+ */
+export function persistCodexCredentialState(projectRoot, vmId, { error = null, at = null } = {}) {
+  if (!projectRoot || !vmId) return null
+  const file = path.join(projectRoot, 'vms', `${vmId}.json`)
+  let vm
+  try {
+    vm = readJsonCached(file)
+  } catch {
+    return null
+  }
+  if (!vm || typeof vm !== 'object') return null
+  const code = error ? String(error) : null
+  if ((vm.refresh_error || null) === code && (vm.codex?.refresh_error || null) === code) return vm
+  vm.codex = vm.codex && typeof vm.codex === 'object' ? { ...vm.codex } : {}
+  if (code) {
+    vm.refresh_error = code
+    vm.codex.refresh_error = code
+    vm.codex.refresh_error_at = at || new Date().toISOString()
+  } else {
+    delete vm.refresh_error
+    delete vm.codex.refresh_error
+    delete vm.codex.refresh_error_at
+  }
+  atomicWriteJson(file, vm, { mode: 0o600 })
+  return vm
+}
+
 export function persistCodexQuotaSnapshot(projectRoot, vmId, { extra, resetCredits, credits, planType } = {}) {
   if (!projectRoot || !vmId) throw new Error('projectRoot and vmId required')
   const file = path.join(projectRoot, 'vms', `${vmId}.json`)
@@ -349,6 +384,13 @@ export function persistCodexQuotaSnapshot(projectRoot, vmId, { extra, resetCredi
         : [],
       fetched_at: resetCredits.fetched_at || new Date().toISOString(),
     }
+  }
+  // A live quota sample means the credential just worked: clear any stale refresh mark.
+  if (vm.refresh_error || vm.codex?.refresh_error) {
+    delete vm.refresh_error
+    vm.codex = { ...vm.codex }
+    delete vm.codex.refresh_error
+    delete vm.codex.refresh_error_at
   }
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm, { mode: 0o600 })
