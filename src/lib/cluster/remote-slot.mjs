@@ -41,6 +41,7 @@ import { kvmCragAppArmorCommand } from '../vm/kvm-crag-apparmor.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
 import { slotMemory, slotDockerCpus, memoryMiB, normalizeVmConfig } from '../vm/machine-spec.mjs'
+import { slotCreationLimits } from '../vm/slot-capacity.mjs'
 import { dockerEnvMap, ensureKvmMachineRecord, kvmEnvMapIncomplete, kvmMachineFields } from '../vm/kvm-machine.mjs'
 import { slotExecArgv, slotExecCmd } from '../vm/slot-exec.mjs'
 import {
@@ -730,7 +731,8 @@ function kvmSlotContainerBody(vm, { image, network, remoteDir, routing, accel, s
 export function slotContainerBody(vm, { image, network, remoteDir, user, routing, accel }) {
   if (isKvmRuntime(vm)) return kvmSlotContainerBody(vm, { image, network, remoteDir, routing, accel, slotUser: user })
   const slotName = displayName(vm.id)
-  const mem = parseMemoryBytes(slotMemory(vm, routing))
+  const limits = slotCreationLimits(vm, routing)
+  const mem = parseMemoryBytes(limits.memory)
   const cpus = slotDockerCpus(vm)
   const codex = isCodexVm(vm)
   const crag =
@@ -780,7 +782,7 @@ export function slotContainerBody(vm, { image, network, remoteDir, user, routing
       // (MemorySwap == Memory would forbid swap entirely).
       MemorySwap: mem * 2,
       ...(cpus > 0 ? { NanoCpus: Math.round(cpus * 1e9) } : {}),
-      PidsLimit: 256,
+      PidsLimit: limits.pids,
       ReadonlyRootfs: true,
       Tmpfs: { '/tmp': 'rw,noexec,nosuid,size=32m' },
       SecurityOpt: crag

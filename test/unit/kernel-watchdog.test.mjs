@@ -5,6 +5,11 @@ import path from 'node:path'
 import test from 'node:test'
 import { createKernelWatchdog, isKernelWatchdogTarget } from '../../src/lib/transport/kernel-watchdog.mjs'
 import { kernelFaults, rustKernelPaths } from '../../src/lib/transport/rust-kernel-client.mjs'
+import { configureSlotCapacity } from '../../src/lib/vm/slot-capacity.mjs'
+
+// These tests cover other behaviour on the legacy fixed 20 native slots;
+// plan-based capacity has its own tests (slot-capacity*.test.mjs).
+configureSlotCapacity({ enabled: false })
 
 // A stale runtime_start_failed lock with a now-healthy kernel is a leftover
 // from a start that timed out on a flaky node link; health proves it wrong.
