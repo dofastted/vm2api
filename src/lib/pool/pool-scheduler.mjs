@@ -53,6 +53,7 @@ import { SeatPlanner, rankSeatCandidates } from './seat-planner.mjs'
 import { GATE_DRAINING } from './quota-gate.mjs'
 import { activeHoursOf, evaluateActiveHours } from './active-hours.mjs'
 import { vmNodeReady } from '../cluster/placement.mjs'
+import { HOST_PRESSURE_CRITICAL, HOST_PRESSURE_OK, hostMemoryLevelForVm } from '../cluster/host-memory-pressure.mjs'
 
 const WAIT_TIMEOUT_MIN_MS = 1000
 const WAIT_TIMEOUT_MAX_MS = 120000
@@ -204,6 +205,28 @@ function seatHomes({ deviceVm = '', sessionVm = '', familyVm = '' } = {}) {
     seen.add(home.vmId)
     return true
   })
+}
+
+/**
+ * Host memory admission for a conversation that is not continuing on this VM.
+ * `strict` admits only machines with room; the relaxed pass also admits tight
+ * ones. A critical machine takes no new conversation in either pass.
+ */
+function hostAdmits(candidate, strict) {
+  const level = candidate?.hostPressure || HOST_PRESSURE_OK
+  if (level === HOST_PRESSURE_OK) return true
+  return !strict && level !== HOST_PRESSURE_CRITICAL
+}
+
+/**
+ * Direct selection: drop critical machines and, when any machine has room,
+ * tight ones too. The sticky VM of a continuing conversation always stays.
+ */
+export function filterByHostMemory(candidates, stickyVmId = '') {
+  const keep = (strict) =>
+    candidates.filter((candidate) => candidate.vmId === stickyVmId || hostAdmits(candidate, strict))
+  const strict = keep(true)
+  return strict.some((candidate) => candidate.vmId !== stickyVmId) ? strict : keep(false)
 }
 
 function byVmHas(candidates, vmId) {
@@ -565,7 +588,8 @@ export class PoolScheduler extends EventEmitter {
       // signal for the caller. Busy is not: it still yields a candidate.
       const familyVm = familyVmId ? String(familyVmId).trim() : ''
       if (familyVm && !pinned && !candidates.some((candidate) => candidate.vmId === familyVm)) familyGated = true
-      const available = candidates.filter((candidate) => this.isReservable(candidate))
+      const reservable = candidates.filter((candidate) => this.isReservable(candidate))
+      const available = pinned ? reservable : filterByHostMemory(reservable, boundBefore?.vmId || '')
       const preferred = avoid?.size
         ? available.filter((candidate) => !avoid.has(candidate.accountId) && !avoid.has(candidate.vmId))
         : available
@@ -682,7 +706,7 @@ export class PoolScheduler extends EventEmitter {
             })
           }
           const released = accountId ? live.get(accountId) : null
-          const available = [...live.values()].filter(
+          const woken = [...live.values()].filter(
             (candidate) =>
               (!accountId || candidate === released || (released && candidate.priority > released.priority)) &&
               !avoid?.has(candidate.accountId) &&
@@ -690,6 +714,7 @@ export class PoolScheduler extends EventEmitter {
               !blocked.has(candidate.accountId) &&
               !blocked.has(candidate.vmId),
           )
+          const available = pinned ? woken : filterByHostMemory(woken, boundBefore?.vmId || '')
           for (let remaining = available; remaining.length; ) {
             const next = this.pick(remaining, {
               stickyKey,
@@ -992,18 +1017,24 @@ export class PoolScheduler extends EventEmitter {
           homes.some((home) => home.vmId === candidate.vmId) &&
           this.planner.openCount(candidate.vmId) >= candidate.seatCap,
       )
-      for (const draining of [false, true]) {
-        const group = tier.filter((candidate) => candidate.draining === draining)
-        for (const home of homes) {
-          const match = group.find((candidate) => candidate.vmId === home.vmId)
-          const granted = match ? this.claimSeat(seatKey, match, home.reason, deviceKey) : null
-          if (granted) return granted
-        }
-        if (homeFull) continue
-        for (const candidate of group) {
-          if (homes.some((home) => home.vmId === candidate.vmId)) continue
-          const granted = this.claimSeat(seatKey, candidate, this.planner.strategy, deviceKey)
-          if (granted) return granted
+      // Host memory: machines with room first, then tight ones. A continuing
+      // conversation (sticky home) keeps its VM whatever the pressure.
+      for (const strict of [true, false]) {
+        for (const draining of [false, true]) {
+          const group = tier.filter((candidate) => candidate.draining === draining)
+          for (const home of homes) {
+            const match = group.find((candidate) => candidate.vmId === home.vmId)
+            if (!match || (home.reason !== 'sticky' && !hostAdmits(match, strict))) continue
+            const granted = this.claimSeat(seatKey, match, home.reason, deviceKey)
+            if (granted) return granted
+          }
+          if (homeFull) continue
+          for (const candidate of group) {
+            if (homes.some((home) => home.vmId === candidate.vmId)) continue
+            if (!hostAdmits(candidate, strict)) continue
+            const granted = this.claimSeat(seatKey, candidate, this.planner.strategy, deviceKey)
+            if (granted) return granted
+          }
         }
       }
       if (homeFull) return null
@@ -1021,6 +1052,8 @@ export class PoolScheduler extends EventEmitter {
     const current = this.planner.seatOf(seatKey)
     if (current && current.vmId !== candidate.vmId) return null
     if (!current && !this.planner.canOpen(candidate.vmId, candidate.seatCap, candidate.headroom)) return null
+    // A machine out of memory opens no seat for a new conversation (queued grants included).
+    if (!current && selectionReason !== 'sticky' && candidate.hostPressure === HOST_PRESSURE_CRITICAL) return null
     const reservation = this.reserve(candidate)
     if (!reservation) return null
     let seat
@@ -1256,6 +1289,7 @@ export class PoolScheduler extends EventEmitter {
         seatCap,
         headroom: eligibility.headroom ?? null,
         draining: eligibility.gateZone === GATE_DRAINING,
+        hostPressure: hostMemoryLevelForVm(vm),
         account: eligibility.account || null,
         loadRatio: (inflight + this.waiterCount(accountId)) / maxConcurrency,
         lastUsedAt: this.lastUsed.get(accountId) || state?.last_used_at || 0,

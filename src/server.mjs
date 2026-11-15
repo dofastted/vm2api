@@ -86,6 +86,7 @@ import { initVmDbSync, stopVmWatch } from './lib/vm/vm-db-sync.mjs'
 import { BackupService } from './lib/admin/backup-service.mjs'
 import { ClusterNodesRepo } from './lib/db/repos/cluster-nodes-repo.mjs'
 import { ClusterManager } from './lib/cluster/cluster-manager.mjs'
+import { createHostMemoryPressure, installHostMemoryPressure } from './lib/cluster/host-memory-pressure.mjs'
 import { createClusterRoutes } from './lib/cluster/cluster-routes.mjs'
 import { bindPlacement, nodeImageBuildRunning } from './lib/cluster/placement.mjs'
 import { ClusterError } from './lib/cluster/ssh-link.mjs'
@@ -976,6 +977,15 @@ bindPlacement({ manager: clusterManager, projectRoot: cfg.paths.project })
 await startNodeEgressSocks({ clientFor: (nodeId) => clusterManager.client(nodeId) })
 clusterManager.start()
 clusterManager.restoreSlotRelays()
+// Live memory pressure per machine: new conversations avoid hosts low on MemAvailable (overcommit guard).
+const hostMemoryPressure = installHostMemoryPressure(
+  createHostMemoryPressure({
+    getConfig: () => routingConfig.host_memory_pressure,
+    listNodes: () => clusterManager.list().map((node) => node.id),
+    readNode: (id) => clusterManager.nodeHostMemory(id),
+  }),
+)
+hostMemoryPressure.start()
 syncNodeLocalEgress()
 if (proxyPool.snapshot().config.ipv6_enabled !== true) {
   const exits = await syncIpv6ProxyEgress(cfg.paths.project, proxyPool)
@@ -1142,6 +1152,9 @@ const gracefulShutdown = createGracefulShutdown({
     try {
       kernelWatchdog?.stop?.()
       slotCapacityReconciler.stop()
+    } catch {}
+    try {
+      hostMemoryPressure?.stop?.()
     } catch {}
     try {
       cliNodeGuard?.stop?.()

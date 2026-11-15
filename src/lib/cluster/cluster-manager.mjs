@@ -761,6 +761,15 @@ export class ClusterManager {
     }
   }
 
+  /** Memory figures from the node's last health probe: { total, available, at } bytes, or null. */
+  nodeHostMemory(id) {
+    const health = this.health.get(id)
+    const total = Number(health?.host?.mem_total)
+    const used = Number(health?.host?.mem_used)
+    if (!(total > 0) || !Number.isFinite(used)) return null
+    return { total, available: Math.max(0, total - used), at: Date.parse(health.checked_at) || Date.now() }
+  }
+
   /** Host facts of the last SSH session (uid, root, platform), or null before the first connect. */
   nodeHostFacts(id) {
     return this.hostFacts.get(id) || null
