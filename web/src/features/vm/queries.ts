@@ -44,6 +44,22 @@ export function vmQueryOptions(id: string) {
   })
 }
 
+export type CragHostStatus = {
+  ready: boolean
+  state: 'unavailable' | 'unredeemed' | 'active' | 'expired' | 'sync_pending'
+  slot_limit?: number | 'unlimited'
+  expires_at?: number
+}
+
+export function cragHostStatusQueryOptions() {
+  return queryOptions({
+    queryKey: ['crag-host-subscription'] as const,
+    queryFn: ({ signal }) =>
+      api<CragHostStatus>('/api/panel/crag-subscription', { signal }),
+    retry: false,
+  })
+}
+
 export function vmCragLicenseQueryOptions(id: string) {
   return queryOptions({
     queryKey: ['panel', 'vm', id, 'crag-license'] as const,
