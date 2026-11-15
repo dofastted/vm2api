@@ -35,6 +35,7 @@ import {
 } from '@/lib/wrap-health'
 import { SlotIdentity } from '@/components/platform-chip'
 import { StatusMark } from '@/components/status-mark'
+import { ActiveUsageAction } from '@/features/vm/active-usage-action'
 import { ClaudeResetActions } from '@/features/vm/claude-reset-actions'
 import { CodexKernelHealthFields } from '@/features/vm/codex-kernel-health-card'
 import { kernelRouteLabel } from '@/features/vm/dataplane-contract'
@@ -390,6 +391,7 @@ export function VmStatusBoard(props: Props) {
                     />
                   </div>
                 ) : null}
+                <ActiveUsageAction vm={vm} />
                 <ClaudeResetActions
                   vm={vm}
                   now={now}

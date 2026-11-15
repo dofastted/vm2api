@@ -10,6 +10,7 @@ import { cn } from '@/lib/utils'
 import { isCodexVm } from '@/lib/vm-kind'
 import { vmCostLedger } from '@/lib/vm-usage'
 import { useNow } from '@/hooks/use-now'
+import { ActiveUsageAction } from '@/features/vm/active-usage-action'
 import { ClaudeResetActions } from '@/features/vm/claude-reset-actions'
 import { OpenaiQuotaActions } from '@/features/vm/openai-quota-actions'
 import { riskFg, UsageMeter } from '@/features/vm/usage-meter'
@@ -95,7 +96,10 @@ export function VmQuotaActions({ vm, now }: { vm: Vm; now: number }) {
   return isCodexVm(vm) ? (
     <OpenaiQuotaActions vm={vm} compact />
   ) : (
-    <ClaudeResetActions vm={vm} compact now={now} />
+    <div className='flex flex-wrap items-center gap-1'>
+      <ActiveUsageAction vm={vm} />
+      <ClaudeResetActions vm={vm} compact now={now} />
+    </div>
   )
 }
 
