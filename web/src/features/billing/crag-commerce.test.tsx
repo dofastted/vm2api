@@ -114,6 +114,19 @@ afterEach(() => {
 const lastButton = () => state.buttons[state.buttons.length - 1]
 
 describe('CragCommerce', () => {
+  it('renders custom dimensions in their own group without editing fixed plans', () => {
+    const html = render({ sku: fixed.sku })
+    const customGroup = html.split('</fieldset>')[1]
+    expect(customGroup).toContain('自定义槽位和时长')
+    expect(customGroup).toContain('槽位数')
+    expect(customGroup).toContain('月数')
+    expect(state.inputs.slice(0, 2).every((input) => input.disabled)).toBe(true)
+    render()
+    expect(state.inputs.slice(0, 2).every((input) => !input.disabled)).toBe(
+      true
+    )
+  })
+
   it('initializes published minima and quotes only within the UI ranges', async () => {
     const bounded = {
       ...rules,

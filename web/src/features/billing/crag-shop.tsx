@@ -508,6 +508,7 @@ function ShopOrders({
             setPlanSku(
               (sku) =>
                 sku ??
+                visiblePlans.find((plan) => plan.remaining !== 0)?.sku ??
                 (data.commerce && data.commerce.custom_enabled !== false
                   ? 'custom'
                   : visiblePlans[0]?.sku)
