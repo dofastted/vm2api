@@ -446,6 +446,8 @@ CI 配置以 [`.github/workflows/test.yml`](.github/workflows/test.yml) 为准�
 
 需要更广的验证时，在 GitHub Actions 的 `ci` 工作流选择 **Run workflow**：`full=true` 运行后端、前端全量单测、三个 Go 模块测试、payload/打包检查和全仓格式检查；`arm64=true` 独立启用原生 ARM 镜像构建及离线 smoke 测试，`full` 不会自动开启 ARM 检查。两项默认均为 `false`。
 
+`test:unit`、`test:ci` 和 `test:e2e` 逐个文件起独立进程组运行，单个文件超过 5 分钟或常驻内存超过 4096 MB（仅 Linux）即被 SIGKILL 并记为失败，避免卡在原生代码里的测试耗尽宿主内存。可用 `VM2API_TEST_FILE_TIMEOUT_MS`、`VM2API_TEST_FILE_MAX_RSS_MB` 调整，设为 `0` 关闭对应限制。
+
 原有 `npm test` / `npm run test:all` 仍执行后端全量单测和 `worker` race 测试，不包含前端、`api-kernel`、`redact` 或 E2E。CI 绿灯只表示该次实际执行的检查通过；日常 CI 不代表全量、ARM 或生产验证已经完成。
 
 Daily CI runs core tests plus added or modified test files for affected components. Full regression and formatting checks are available with `full=true`; native ARM packaging is enabled separately with `arm64=true`.
