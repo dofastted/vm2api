@@ -389,11 +389,11 @@ test('pasted setup token survives identity enrichment and persists inference cre
   }
 })
 
-test('panel Claude Code exchange automatically syncs native credentials and supports manual sync', async () => {
+test('panel import syncs credentials while Claude Code OAuth requires a native terminal', async () => {
   const gw = await startGateway({ oauth: false, readyMs: 30000 })
   try {
     const gen = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/generate-auth-url', {
-      body: { flavor: 'claude_code' },
+      body: { flavor: 'cai' },
     })
     assert.equal(gen.status, 200, gen.text)
     const generated = gen.json.data || gen.json
@@ -418,7 +418,7 @@ test('panel Claude Code exchange automatically syncs native credentials and supp
     assert.equal(failed.json.error.code, 'client_credential_sync_failed')
     assert.equal(failed.text.includes(claudeDir), false)
     const retryLink = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/generate-auth-url', {
-      body: { flavor: 'claude_code' },
+      body: { flavor: 'cai' },
     })
     assert.equal(retryLink.status, 200, retryLink.text)
     const syncFailure = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/exchange-code', {
@@ -432,9 +432,14 @@ test('panel Claude Code exchange automatically syncs native credentials and supp
     const repaired = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/credentials/sync', { body: {} })
     assert.equal(repaired.status, 200, repaired.text)
     assert.equal(fs.readlinkSync(official), 'credentials.json')
+    const native = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/oauth/generate-auth-url', {
+      body: { flavor: 'claude_code' },
+    })
+    assert.equal(native.status, 409, native.text)
+    assert.equal(native.json.error.code, 'native_login_required')
     const ticket = await api(gw, 'POST', '/api/panel/vms/vm-sim-01/shell-ticket', { body: { login: true } })
-    assert.equal(ticket.status, 409, ticket.text)
-    assert.equal(ticket.json.error.code, 'panel_login_required')
+    assert.equal(ticket.status, 200, ticket.text)
+    assert.match(ticket.json.data.cli_bin, /crag-v2\/claude-code-[^/]+\/claude$/)
   } finally {
     await gw.stop()
   }

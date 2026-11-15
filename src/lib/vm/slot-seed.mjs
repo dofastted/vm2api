@@ -5,7 +5,12 @@
  */
 import fs from 'node:fs'
 import path from 'node:path'
-import { defaultSeedPolicy, buildSlotSettingsEnv } from '../protocol/seed-policy.mjs'
+import {
+  defaultSeedPolicy,
+  buildSlotSettingsEnv,
+  isTelemetryEnabled,
+  NONESSENTIAL_TRAFFIC_ENV_KEY,
+} from '../protocol/seed-policy.mjs'
 import { buildKinSeedJson } from '../identity/workstation-profile.mjs'
 import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import crypto from 'node:crypto'
@@ -105,7 +110,12 @@ export function inferProjectRootFromCliHome(homeDir) {
   return path.dirname(vms)
 }
 
-export function writeSlotSeedFiles(projectRoot, vm, seedPolicy = null, { existingSettings, replaceEnv = false } = {}) {
+export function writeSlotSeedFiles(
+  projectRoot,
+  vm,
+  seedPolicy = null,
+  { existingSettings, replaceEnv = false, cragNativeTelemetry = false } = {},
+) {
   if (!projectRoot || !vm?.id) return { wrote: false }
   const pol = defaultSeedPolicy(seedPolicy || vm.seed_policy || {})
   const homeDir = path.join(projectRoot, 'vms', vm.id, 'cli-home')
@@ -134,6 +144,7 @@ export function writeSlotSeedFiles(projectRoot, vm, seedPolicy = null, { existin
     autoUpdates: false,
     grove_enabled: false,
   }
+  if (cragNativeTelemetry && isTelemetryEnabled(pol)) delete settings.env[NONESSENTIAL_TRAFFIC_ENV_KEY]
   const seedDoc = buildKinSeedJson(vm, pol, {
     timezone,
     locale,

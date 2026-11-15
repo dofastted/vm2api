@@ -829,3 +829,41 @@ test('a new device takes an open VM before a draining one, and a draining one wh
   fresh.release()
   last.release()
 })
+
+test('new seats exhaust the highest priority tier before using a lower affinity VM', async (t) => {
+  const { pool, quota } = gatedSetup(t, [
+    { id: 'vm-01', policy: { priority: 1, sessionSlots: 1 } },
+    { id: 'vm-02', policy: { priority: 10, sessionSlots: 1 } },
+    { id: 'vm-03', policy: { priority: 10, sessionSlots: 1 } },
+  ])
+  setUtil5h(quota, 'account-2', 0.78)
+  const options = { deviceVmId: 'vm-01', familyVmId: 'vm-01', allowWait: false }
+  const first = await seat(pool, 'first', options)
+  assert.equal(first.vmId, 'vm-03')
+  const next = await seat(pool, 'next', options)
+  assert.equal(next.vmId, 'vm-02')
+  const fallback = await seat(pool, 'fallback', options)
+  assert.equal(fallback.vmId, 'vm-01')
+  assert.equal(fallback.selectionReason, 'device-affinity')
+  for (const hold of [first, next, fallback]) hold.release()
+})
+
+test('a global waiter places its new seat by priority, not by the VM pumped first', async (t) => {
+  const pool = setup(t, [
+    { id: 'vm-01', policy: { priority: 1, sessionSlots: 1 } },
+    { id: 'vm-02', policy: { priority: 10, sessionSlots: 1 } },
+  ])
+  const pump = pool.planner.pump.bind(pool.planner)
+  const high = await seat(pool, 'high')
+  const low = await seat(pool, 'low')
+  const queued = seat(pool, 'queued')
+  await waitFor(() => pool.planner.globalQueue.length === 1)
+  pool.planner.pump = () => {}
+  low.release()
+  high.release()
+  pool.planner.pump = pump
+  pool.planner.pump('vm-01')
+  const granted = await queued
+  assert.equal(granted.vmId, 'vm-02')
+  granted.release()
+})

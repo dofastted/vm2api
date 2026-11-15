@@ -15,6 +15,7 @@ import {
 } from '../../src/lib/admin/crag-shop.mjs'
 import { createShopSupplier } from '../../src/lib/admin/crag-shop-supplier.mjs'
 import { deriveOrderReceipt, loadOrderReceiptKey } from '../../src/lib/admin/crag-shop-receipt.mjs'
+import { applyMigrations, createDatabase } from '../../src/lib/db/database.mjs'
 import { checkCragLicense } from '../../src/lib/vm/crag-license.mjs'
 import { createCragSubscription } from '../../src/lib/vm/crag-subscription.mjs'
 import { cragSubscriptionPublicDirectory } from '../../src/lib/vm/crag-subscription-paths.mjs'
@@ -35,9 +36,10 @@ const ACTION = 'https://gateway.example.test/submit.php'
 const PROOF = 'fixture-receipt'
 const PERSON = { panelUser: 'alice', panelBuyerOwner: 'panel:alice-id' }
 const OTHER = { panelUser: 'bob', panelBuyerOwner: 'panel:bob-id', panelRole: 'admin' }
-const MIGRATION = new URL('../../src/lib/db/migrations/055_crag_shop_orders.sql', import.meta.url)
-const COMMERCE_MIGRATION = new URL('../../src/lib/db/migrations/056_crag_shop_commerce.sql', import.meta.url)
-const ACTIVATION_MIGRATION = new URL('../../src/lib/db/migrations/057_crag_shop_activation.sql', import.meta.url)
+const MIGRATIONS = new URL('../../src/lib/db/migrations/', import.meta.url)
+const MIGRATION = new URL('056_crag_shop_orders.sql', MIGRATIONS)
+const COMMERCE_MIGRATION = new URL('057_crag_shop_commerce.sql', MIGRATIONS)
+const ACTIVATION_MIGRATION = new URL('058_crag_shop_activation.sql', MIGRATIONS)
 const PILOT_TOKEN_FILE_ENV = 'VM2API_CRAG_SHOP_PILOT_TOKEN_FILE'
 
 test.beforeEach((t) => {
@@ -47,6 +49,58 @@ test.beforeEach((t) => {
     if (previous === undefined) delete process.env[PILOT_TOKEN_FILE_ENV]
     else process.env[PILOT_TOKEN_FILE_ENV] = previous
   })
+})
+
+test('shop migration numbering preserves applied schemas and orders from either parent', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-shop-migrations-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+
+  for (const legacy of [true, false]) {
+    const migrationsDir = path.join(root, legacy ? 'local' : 'upstream')
+    fs.mkdirSync(migrationsDir)
+    for (const name of fs.readdirSync(MIGRATIONS)) {
+      if (name >= '057_' || (legacy && name === '055_account_lifetime_usage.sql')) continue
+      const dest = legacy && name === '056_crag_shop_orders.sql' ? '055_crag_shop_orders.sql' : name
+      fs.copyFileSync(new URL(name, MIGRATIONS), path.join(migrationsDir, dest))
+    }
+    if (legacy) {
+      fs.copyFileSync(COMMERCE_MIGRATION, path.join(migrationsDir, '056_crag_shop_commerce.sql'))
+      fs.copyFileSync(ACTIVATION_MIGRATION, path.join(migrationsDir, '057_crag_shop_activation.sql'))
+    }
+
+    const db = new DatabaseSync(':memory:')
+    t.after(() => db.close())
+    applyMigrations(db, { migrationsDir })
+    db.prepare(`INSERT INTO crag_shop_orders (order_id, owner, request_id, sku, payment_method, reserved_at)
+      VALUES ('fixture-order', ?, 'fixture-request', 'quarter', 'alipay', 1)`).run(PERSON.panelBuyerOwner)
+    if (legacy) {
+      db.prepare(`UPDATE crag_shop_orders SET activation_vm_id = 'vm-ready', activation_fingerprint = ?,
+        activation_phase = 'redeemed', activation_attempts = 2`).run('a'.repeat(64))
+    }
+
+    assert.deepEqual(
+      applyMigrations(db),
+      legacy ? ['055_account_lifetime_usage.sql'] : ['057_crag_shop_commerce.sql', '058_crag_shop_activation.sql'],
+    )
+    assert.deepEqual(applyMigrations(db), [])
+    assert.deepEqual(
+      db
+        .prepare("SELECT name FROM schema_migrations WHERE version >= '055' ORDER BY version")
+        .all()
+        .map((r) => r.name),
+      [
+        '055_account_lifetime_usage.sql',
+        '056_crag_shop_orders.sql',
+        '057_crag_shop_commerce.sql',
+        '058_crag_shop_activation.sql',
+      ],
+    )
+    const saved = db.prepare("SELECT * FROM crag_shop_orders WHERE order_id = 'fixture-order'").get()
+    assert.equal(saved.owner, PERSON.panelBuyerOwner)
+    assert.equal(saved.activation_vm_id, legacy ? 'vm-ready' : null)
+    assert.equal(saved.activation_phase, legacy ? 'redeemed' : 'waiting')
+    assert.equal(saved.activation_attempts, legacy ? 2 : 0)
+  }
 })
 
 function order(id, status = 'pending') {
@@ -270,15 +324,11 @@ test('SQLite reservation survives restart; owners isolate retries, list, status 
 }, async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-shop-'))
   const dbPath = path.join(root, 'kin.db')
-  let db = new DatabaseSync(dbPath)
+  let db = createDatabase({ dbPath })
   t.after(() => {
     db.close()
     fs.rmSync(root, { recursive: true, force: true })
   })
-  db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;')
-  db.exec(fs.readFileSync(MIGRATION, 'utf8'))
-  db.exec(fs.readFileSync(COMMERCE_MIGRATION, 'utf8'))
-  db.exec(fs.readFileSync(ACTIVATION_MIGRATION, 'utf8'))
   const saved = new Map()
   let lostReply = true
   let status = 'pending'
@@ -363,7 +413,7 @@ test('SQLite reservation survives restart; owners isolate retries, list, status 
   assert.equal(JSON.stringify(failed).includes(firstReceipt), false)
   assert.equal((await call(PERSON, 'GET', '/orders')).data.orders[0].status, 'reserved')
   db.close()
-  db = new DatabaseSync(dbPath)
+  db = createDatabase({ dbPath })
   handle = handler()
   const replay = await call(PERSON, 'POST', '/orders', INPUT)
   assert.equal(replay.data.order_id, id)

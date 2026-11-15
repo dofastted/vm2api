@@ -43,7 +43,7 @@ import {
   looksLikeOfficialSetupToken,
   SETUP_TOKEN_FLAVOR,
 } from '../oauth/claude-setup-token.mjs'
-import { AUTH_LOGIN_FLAVOR, AUTH_LOGIN_SOURCE } from '../oauth/claude-auth-login.mjs'
+import { AUTH_LOGIN_FLAVOR } from '../oauth/claude-auth-login.mjs'
 import {
   canOfficialCc,
   isApiKeyMode,
@@ -199,7 +199,7 @@ import {
   readHostUpgradeStatus,
   startHostUpgrade,
 } from './release.mjs'
-import { downloadReleaseKernel, kernelReleaseHttpStatus } from './release-kernel.mjs'
+import { downloadReleaseKernel, kernelReleaseHttpStatus, listKernelReleaseVersions } from './release-kernel.mjs'
 import { describeKernelCatalog, pullKernelRelease } from './kernel-catalog.mjs'
 import { installKernelTargets, releaseKernelInstallSafetyHold, validateKernelTargets } from '../vm/kernel-install.mjs'
 import { withSlotMaintenance } from '../vm/slot-maintenance.mjs'
@@ -2694,6 +2694,7 @@ export function createPanelHandler(ctx) {
           ids: Array.isArray(body.ids) ? body.ids : null,
           concurrency: body.concurrency,
           routing: ctx.routingConfig,
+          telemetryLifecycle: { watchdog: ctx.kernelWatchdog, poolScheduler: ctx.poolScheduler },
         })
         return json(res, 200, panel.ok(report))
       }
@@ -2711,6 +2712,17 @@ export function createPanelHandler(ctx) {
         }
         return json(res, 200, panel.ok({ kernels: describeKernelCatalog(cfg.paths.project), licenses, installations }))
       }
+      if (req.method === 'GET' && p === '/api/panel/kernels/releases') {
+        try {
+          const releases = await listKernelReleaseVersions({ fetchImpl: ctx.fetchImpl })
+          return json(res, 200, panel.ok(releases))
+        } catch {
+          return json(res, 502, {
+            ok: false,
+            error: { code: 'kernel_releases_unavailable', message: '暂时无法读取发行版本' },
+          })
+        }
+      }
       if (req.method === 'POST' && p === '/api/panel/kernels/pull') {
         const body = await readBody(req, 8 * 1024)
         if (
@@ -2725,7 +2737,7 @@ export function createPanelHandler(ctx) {
         }
         const result = await pullKernelRelease(
           cfg.paths.project,
-          { kernel: body.kernel, tag: body.tag || '' },
+          { kernel: body.kernel, tag: body.tag || '', latest: true },
           { fetchImpl: ctx.fetchImpl },
         )
         if (!result.ok)
@@ -3189,7 +3201,6 @@ export function createPanelHandler(ctx) {
         const body = await readBody(req, 1024).catch(() => ({}))
         const issued = await ctx.slotShell.issueTicket(p.split('/')[4], {
           login: body.login === true,
-          cliBin: body.cli_bin ?? '',
         })
         if (!issued.ok) return json(res, issued.status, { ok: false, error: issued.error })
         return json(
@@ -4367,6 +4378,7 @@ export function createPanelHandler(ctx) {
               projectRoot: cfg.paths.project,
               vm,
               routing: ctx.routingConfig,
+              lifecycle: { watchdog: ctx.kernelWatchdog, poolScheduler: ctx.poolScheduler },
               replaceEnv: Object.hasOwn(body, 'extra_env') || Object.hasOwn(body, 'settings_json_override'),
             })
           }
@@ -4886,9 +4898,6 @@ export function createPanelHandler(ctx) {
         }
         atomicWriteJson(vmPath, vm, { mode: 0o600 })
         writeGuestMachineIdFile(cfg.paths.project, id, generated.guest_machine_id)
-        try {
-          seedFreshCliHome(cfg.paths.project, vm)
-        } catch (e) {}
         let allocated = null
         let proxyError = null
         const wantProxy = body.auto_allocate_proxy === true || startNow || !!pickedProxyId
@@ -4919,13 +4928,21 @@ export function createPanelHandler(ctx) {
           vm.timezone_source = 'proxy_geo'
           if (vm.fingerprint && typeof vm.fingerprint === 'object') vm.fingerprint.timezone = zoned.timezone
         }
-        if (body.activate === true) {
+        let startError = null
+        try {
+          seedFreshCliHome(cfg.paths.project, vm, { routing: ctx.routingConfig, preinstallCrag: true })
+        } catch (error) {
+          const code = /^[a-z0-9_]+$/i.test(error.code || '') ? error.code : 'vm_init_failed'
+          startError = `虚拟机初始化失败（${code}）`
+          patchVmRecord(cfg.paths.project, id, { status: 'error' })
+          markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', { message: startError })
+        }
+        if (!startError && body.activate === true) {
           try {
             activateVmSlot(id)
           } catch (e) {}
         }
-        let startError = null
-        if (startNow && hasExit(vm)) {
+        if (!startError && startNow && hasExit(vm)) {
           let boot
           try {
             boot = await startSlotReady(vm, cfg.paths.project, { routing: ctx.routingConfig })
@@ -4943,7 +4960,7 @@ export function createPanelHandler(ctx) {
           } else {
             patchVmRecord(cfg.paths.project, id, { status: 'running' })
           }
-        } else if (startNow) {
+        } else if (!startError && startNow) {
           patchVmRecord(cfg.paths.project, id, { status: 'stopped' })
         }
         const saved = getVm(cfg.paths.project, id) || vm
@@ -5170,6 +5187,7 @@ export function createPanelHandler(ctx) {
             if (inference) {
               oauth.type = 'setup-token'
               oauth.mode = 'setup-token'
+              oauth.oauth_registration = 'console'
             }
           } else if (isSub2apiAccountExport(exportDoc)) {
             oauth = sub2apiAccountToOauth(exportDoc, existing)
@@ -5270,11 +5288,13 @@ export function createPanelHandler(ctx) {
             )
           }
           const flavor = body.flavor || body.type || 'cai'
-          const generated = generateAuthUrl({
-            vmId: id,
-            proxyUrl: slotProxy.proxyUrl,
-            flavor,
-          })
+          if (normalizeOauthFlavor(flavor) === AUTH_LOGIN_FLAVOR) {
+            return json(res, 409, {
+              ok: false,
+              error: { code: 'native_login_required', message: '请使用 Claude Code 授权终端生成链接' },
+            })
+          }
+          const generated = generateAuthUrl({ vmId: id, proxyUrl: slotProxy.proxyUrl, flavor })
           const px = existing.proxy || {}
           return json(
             res,
@@ -5360,6 +5380,12 @@ export function createPanelHandler(ctx) {
           const sessionKey = String(body.session_id || body.sessionId || '')
           let oauth
           let oauthFromVm = false
+          if (normalizeOauthFlavor(flavor) === AUTH_LOGIN_FLAVOR || /^native-[a-f0-9]{32}$/.test(sessionKey)) {
+            return json(res, 409, {
+              ok: false,
+              error: { code: 'native_login_required', message: '请在 Claude Code 授权终端提交回调' },
+            })
+          }
           if (looksLikeOfficialSetupToken(code)) {
             oauth = await completeClaudeSetupToken({
               projectRoot: cfg.paths.project,
@@ -5381,9 +5407,6 @@ export function createPanelHandler(ctx) {
           if (looksLikeOfficialSetupToken(code) || oauth.flavor === SETUP_TOKEN_FLAVOR) {
             oauth.type = 'official-setup-token'
             oauth.mode = 'official-setup-token'
-          } else if (oauth.flavor === AUTH_LOGIN_FLAVOR || oauth.source === AUTH_LOGIN_SOURCE) {
-            oauth.type = 'oauth'
-            oauth.mode = 'oauth'
           } else if (
             normalizeOauthFlavor(flavor) === 'setup_token' ||
             oauth.flavor === 'setup_token' ||

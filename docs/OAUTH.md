@@ -28,14 +28,15 @@ commitImportedOauth → 仅完整 OAuth 运行模式排队官方 Claude Code 初
 
 | 入口 | 路径 | 说明 |
 |------|------|------|
-| sessionKey（默认 Setup Token） | `POST /api/panel/vms/import` `{ type: "setup-token", sessionKey }` | `sk-ant-sid*` 经槽位 SOCKS5 申请完整 OAuth scope（profile、inference、sessions、MCP、文件），采集 bootstrap 身份；落盘后以 Setup Token 运行模式执行，不跑官方初装。 |
+| Setup Token + Cookie | `POST /api/panel/vms/import` `{ type: "setup-token", sessionKey }` | `sk-ant-sid*` 经槽位 SOCKS5 申请完整 OAuth scope（profile、inference、sessions、MCP、文件），采集 bootstrap 身份；落盘后以 Setup Token 运行模式执行，不跑官方初装。 |
 | 已有 OAuth → Setup Token | `POST /api/panel/vms/:id/oauth/to-setup-token` | 读 worker 活票，仅切换运行模式；保留 access、refresh、真实过期时间和全部实际 scope。不会凭空增加权限，也不会删 scope。官方一年期 token（`official-setup-token`）不能转。 |
 | 官方 `claude setup-token` | 槽内 PTY / 粘贴一年期 oat | 只有 `user:inference`、无 refresh。落盘 `credential_mode=official-setup-token`，与面板转换的完整 Setup Token 区分。 |
-| 授权链接 | `POST /api/panel/vms/:id/oauth/generate-auth-url` | CAI、Claude Code、Setup Token flavor 都请求完整 OAuth scope。Setup Token flavor 仍只改变运行模式；服务端 PKCE，30min；未绑定出口不能生成 URL，本地出口可以。 |
+| Claude Code OAuth（默认） | 账号面板 → OAuth → Claude Code 授权 | 打开专用终端，VM 内原生 `claude auth login` 生成链接并处理回调；面板保存并同步结果。 |
+| 通用授权链接 | `POST /api/panel/vms/:id/oauth/generate-auth-url` | CAI 和 Setup Token 使用面板 PKCE；要求绑定可用出口。 |
 
-换出的 access/refresh 只写入 credentials.json；导入时文档顶层和 `claudeAiOauth` 都写 `kinGeneration`，文件仍是 `0444`。`vm.json` / DB 只留 `has_access` / `has_refresh` / email / expiry / generation。Claude 面板默认选 Setup Token + Cookie。
+正式凭证的 access/refresh 写入 `credentials.json`；导入时文档顶层和 `claudeAiOauth` 都写 `kinGeneration`，文件仍是 `0444`。`vm.json` / DB 只留 `has_access` / `has_refresh` / email / expiry / generation。
 
-完整 OAuth 授权链接（`cai` / `claude_code`）的粘贴码按 sub2api 换票规则处理：`code#state` 只将 `#` 后的上游返回值作为 token 请求的 `state`；只有 code 时不发送 `state`，不补生成链接时的 nonce。手动粘贴不是浏览器自动回调，code 与授权会话仍由 PKCE verifier 绑定，30 分钟期限与 VM 绑定检查不变。`setup_token` flavor、Cookie 换票和官方 Setup Token 流程不变。该修复只改控制面，现有 `kin-oauth-auth` 已支持可选 `state`，无需重编或 `wrap-cli/sync`。
+CAI 粘贴码按 sub2api 规则换票：`code#state` 只将 `#` 后的上游返回值作为 token 请求的 `state`；只有 code 时不发送 `state`。Claude Code 由原生客户端保存 PKCE，面板将完整授权码交给原进程处理。Setup Token 和 Cookie 流程不变。
 
 Cookie authorize 的组织 UUID 同时出现在 `/v1/oauth/{uuid}/authorize` 路径和 JSON 的 `organization_uuid` 字段；只有路径 UUID 不够，上游会返回 400 `Invalid request format`。
 
@@ -72,14 +73,16 @@ SSH 扩展槽同样由控制面经绑定出口换票。拿到授权后，提交�
 
 ## 面板换票与原生 Claude Code 终端
 
-所有授权换票在账号面板完成。「OAuth → Claude Code 授权」使用面板管理的 PKCE 会话：生成链接、浏览器授权、粘贴授权码。凭证导入后自动同步给 VM 客户端；同步失败会返回错误，不显示完成。
+「OAuth → Claude Code 授权 → 生成授权链接」打开交互终端、可复制的链接和回调输入栏。支持粘贴完整 `code#state` 或授权回调链接，也可直接在终端输入。原生 CC 在临时配置中换票；面板成功保存并同步凭证后才显示完成。关闭或重新连接会结束旧会话，旧链接不再使用。
+
+此入口使用已装载的签名 CRAG 包内原版 Claude Code，不读取 CRAG 源码，也不回退到 `cli-node`。若缺少原生可执行文件，先按[二进制安装说明](DEPLOY.md#crag-v2-二进制更新)补齐包；仅升级面板 OAuth 代码无需替换已有的同版 CRAG 内核。
 
 - 原生客户端的 `.credentials.json` 链接到面板管理的 `credentials.json`。显式导入以面板新凭证为准，不让旧原生客户端留下的文件覆盖新账号。远程槽导入时先推送凭证；后续手动同步保留节点已轮换的凭证，再修复原生客户端链接。
-- 运维终端的 `/sync` 可重新同步凭证。它不触发 OAuth 换票、不输出 token；同步完成后重新启动 `claude` 或 `cc` 使用当前凭证。
+- 运维终端在连接时及打开后每 60 秒检查凭证链接，临期时通过槽位现有刷新链路刷新。`/sync` 可手动修复链接，不触发重新授权、不输出 token。若已打开的 CC 仍持有旧凭证，请退出后重开。
 - 终端中的 `claude` / `cc` 始终使用包内原生 CC。本地 Docker / KVM 槽使用 `/home/kincli/.kin/crag-v2/claude-code-2.1.321/claude`，集群 Docker 槽使用 `/opt/kin-live/crag-v2/claude-code-2.1.321/claude`。本地缺少程序时从已校验发布包暂存原生客户端；缺包或不可执行会报错。
 - 推理内核仍使用各自客户端：wrap 使用 cli-node，cc 使用 cc-node，CRAG v2 使用对应包内原生 CC。切换内核会重建调用配置，终端面板随切换重新连接。
 - `/usage`、`/probe`、`/wrap`、`/reload`、`/sync`、`/help`、`/clear` 在 shell 提示符处可用，也支持粘贴后按回车。原生 CC 或其它前台程序运行时，斜杠输入直接交给该程序。
-- 旧 `login: true` 终端票据返回 `panel_login_required`；终端包装命令 `claude auth login` / `claude setup-token` 提示前往面板换票。
+- `login: true` 票据只打开专用登录终端，不能用于运维 shell。运维终端中的 `claude auth login` / `claude setup-token` 提示回到账号面板。
 
 ## 官方 Claude Code 初装
 

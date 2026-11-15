@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 import { ProxyPool } from '../../src/lib/vm/proxy-pool.mjs'
+import { seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
 function makeCreateHandler(project, body, proxyPool, accountQuota, extra = {}) {
   const response = {}
@@ -334,9 +335,13 @@ test('create kvm returns 409 when local probe is unavailable', async () => {
   }
 })
 
-test('create kvm persists runtime and machine when probe succeeds', async () => {
+test('create kvm persists runtime and preinstalls original Claude Code when probe succeeds', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-kvm-ok-'))
   try {
+    const factory = seedEncryptedPackage(root)
+    const template = path.join(root, 'share/wrap-cli')
+    fs.mkdirSync(template, { recursive: true })
+    for (const name of ['kin-kernel.bin', 'cli-node']) fs.writeFileSync(path.join(template, name), 'fixture')
     const { handlePanel, response } = makeCreateHandler(
       root,
       {
@@ -361,8 +366,46 @@ test('create kvm persists runtime and machine when probe succeeds', async () => 
     assert.match(saved.machine.mac, /^52:54:00:/)
     assert.ok(saved.machine.smbios.uuid)
     assert.equal(response.body.data.vm.runtime_type, 'kvm')
+    assert.equal(response.body.data.start_error, undefined)
+    const home = path.join(root, 'vms', id, 'cli-home')
+    const claude = 'claude-code-2.1.321/claude'
+    assert.deepEqual(
+      fs.readFileSync(path.join(home, '.kin/crag-v2', claude)),
+      fs.readFileSync(path.join(factory, claude)),
+    )
+    assert.doesNotMatch(fs.readFileSync(path.join(home, '.kin/kin-kernel'), 'utf8'), /crag-v2/)
+    assert.ok(fs.existsSync(path.join(home, '.claude/settings.json')))
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('create honors inherited CRAG for init and does not hide a missing native package', async (t) => {
+  for (const available of [false, true]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-crag-'))
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    if (available) seedEncryptedPackage(root)
+    const { handlePanel, response } = makeCreateHandler(
+      root,
+      { runtime_type: 'docker', start: !available, auto_allocate_proxy: false },
+      undefined,
+      undefined,
+      { routingConfig: { inference: { dataplane: 'crag' } } },
+    )
+    await handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/create'))
+    assert.equal(response.status, 200)
+    const { vm, start_error } = response.body.data
+    assert.equal(vm.status, available ? 'stopped' : 'error')
+    if (!available) {
+      assert.match(start_error, /crag_v2_package_missing/)
+      assert.equal(vm.schedulable, false)
+      continue
+    }
+    assert.equal(start_error, undefined)
+    const home = path.join(root, 'vms', vm.id, 'cli-home')
+    assert.ok(fs.existsSync(path.join(home, '.claude/settings.json')))
+    assert.ok(fs.existsSync(path.join(home, '.kin/crag-v2/claude-code-2.1.321/claude')))
+    assert.equal(fs.existsSync(path.join(home, '.kin/kin-kernel')), false)
   }
 })
 

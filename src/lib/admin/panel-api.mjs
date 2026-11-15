@@ -10,6 +10,7 @@ import { THINKING_DISPLAY_MODES } from '../protocol/thinking.mjs'
 import { normalizeRedaction } from '../redaction/policy.mjs'
 import { redactionStatus } from '../redaction/runtime.mjs'
 import { readSlotProcessStatus } from '../vm/slot-process-status.mjs'
+import { openaiUsageAccountId } from '../vm/codex-slot.mjs'
 import os from 'node:os'
 import { usagePoolEnabled, usageRead } from '../db/sqlite-pool.mjs'
 import path from 'node:path'
@@ -56,7 +57,7 @@ import { lastClosedWindow } from '../pool/window-history.mjs'
 import { hardBlockOf } from '../pool/rate-limit-service.mjs'
 import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { accountIdOf, normalizePoolRouting } from '../pool/pool-scheduler.mjs'
-import { codexMaxSessions } from '../pool/codex-slot-pool.mjs'
+import { codexMaxSessions, codexScheduleLevel } from '../pool/codex-slot-pool.mjs'
 import { resolveCredentialScheduleLevel } from '../pool/credential-weight.mjs'
 import { activeHoursZoneOf, evaluateActiveHours } from '../pool/active-hours.mjs'
 import {
@@ -688,11 +689,12 @@ export async function buildDashboard({
     vms,
     (() => {
       try {
-        return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), snap.accounts || [])
+        return panelBillingStats(requestLog, accountQuota, vms)
       } catch {
         return null
       }
     })(),
+    snap.accounts || [],
   )
 
   let dbTotals = null
@@ -819,11 +821,12 @@ export async function buildVmList({
     vms,
     (() => {
       try {
-        return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), accounts)
+        return panelBillingStats(requestLog, accountQuota, vms)
       } catch {
         return null
       }
     })(),
+    accounts,
   )
   return ok({
     items: vms,
@@ -886,6 +889,9 @@ export async function buildVmDetail({
   const cost = lookupBilling(indexBillingAccounts(billing), acc || summary)
   const gpt = isCodexVm(vm)
   applyCostFields(summary, cost, { coveredSince: billing?.log_coverage_start })
+  if (billing?.lifetime_accounts) {
+    applyLifetimeUsage(summary, new Map(billing.lifetime_accounts.map((row) => [row.account_id, row])))
+  }
   const detail = buildAccountBilling(cost, billing, {
     vmId: summary.id,
     accountId: acc?.account_id || summary.account_uuid,
@@ -1599,11 +1605,12 @@ export async function snapshotAccountPool({
     vms,
     (() => {
       try {
-        return attachBillingMeta(panelBillingStats(requestLog, accountQuota, vms), accounts)
+        return panelBillingStats(requestLog, accountQuota, vms)
       } catch {
         return null
       }
     })(),
+    accounts,
   )
   let today = null
   try {
@@ -1860,11 +1867,10 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     vmQuotaConfig,
   )
   const fablePool = fablePoolFields(acc, runtime, extras.pool || {}, extras.routingConfig || {}, v)
-  const scheduleLevel = resolveCredentialScheduleLevel({
-    manualLevel: v.schedule_level_manual,
-    unified: acc?.unified || {},
-  })
   const isCodex = isCodexVm(v)
+  const scheduleLevel = isCodex
+    ? codexScheduleLevel(v)
+    : resolveCredentialScheduleLevel({ manualLevel: v.schedule_level_manual, unified: acc?.unified || {} })
   // OpenAI quota mirrors are observations; admission uses the current raw windows and policy.
   if (isCodex && isQuotaWindowReason(v.temp_unschedulable_reason)) {
     v = { ...v, temp_unschedulable_until: null, temp_unschedulable_reason: null }
@@ -2047,6 +2053,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
     has_token: hasToken,
     expires_at: expiresAt,
     oauth_source: v.oauth_source || null,
+    oauth_registration: v.oauth_registration || null,
     credential_mode: v.credential_mode || v.claude?.mode || 'oauth',
     auth_scheme: v.auth_scheme || v.claude?.auth_scheme || null,
     can_claude_reset: isCodex ? false : v.can_claude_reset === true,
@@ -2474,13 +2481,21 @@ function panelBillingStats(requestLog, accountQuota, vms) {
   return requestLog.billingStats({ accountWindows: accountWindowsForBilling(accountQuota, vms) })
 }
 
-function stampVmBilling(vms, billing) {
+function applyLifetimeUsage(vm, index) {
+  const key = vm.has_token ? (isCodexVm(vm) ? openaiUsageAccountId(vm.org_uuid) : vm.account_uuid) : null
+  const row = key ? index.get(key) : null
+  vm.lifetime_usage = { cost: Number(row?.total_cost || 0), tokens: Number(row?.total_tokens || 0) }
+}
+
+function stampVmBilling(vms, billing, accounts) {
   if (!billing) return null
   const index = indexBillingAccounts(billing)
+  const lifetime = billing.lifetime_accounts && new Map(billing.lifetime_accounts.map((row) => [row.account_id, row]))
   for (const vm of vms || []) {
     applyCostFields(vm, lookupBilling(index, vm), { coveredSince: billing.log_coverage_start })
+    if (lifetime) applyLifetimeUsage(vm, lifetime)
   }
-  return billing
+  return attachBillingMeta(billing, accounts)
 }
 
 function cacheCostOf(row) {

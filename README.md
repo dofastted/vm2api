@@ -417,6 +417,10 @@ See [docs/DEPLOY.md](docs/DEPLOY.md) for panel one-click updates and compose wor
 
 ---
 
+## VM 账号用量
+
+VM 页「总计」按当前账号累计本平台已记录的官方价费用和 token（含缓存）。同一账号迁槽不会清零，日志清理会保留账号汇总，5H／7D 仍按原窗口统计。部署前已删除的明细、以及只记录了槽位而没有账号 ID 的历史用量（包括旧 OpenAI 记录），无法归属到具体账号，不并入总计。
+
 ## 开发验证与 CI
 
 CI 配置以 [`.github/workflows/test.yml`](.github/workflows/test.yml) 为准，使用 Node.js 22、pnpm 10 和 Go 1.25。日常验证优先运行本次改动涉及的核心测试或指定测试文件，完整回归按需运行。

@@ -4,7 +4,11 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { readWorkerCredentialFile, writeWorkerCredentialFile } from '../../src/lib/oauth/oauth-credentials.mjs'
-import { syncClaudeClientCredentials } from '../../src/lib/transport/go-worker-client.mjs'
+import {
+  prepareClaudeClientCredentials,
+  syncClaudeClientCredentials,
+} from '../../src/lib/transport/go-worker-client.mjs'
+import { runSlotOauth } from '../../src/lib/transport/slot-oauth.mjs'
 
 function fixture(context) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'client-sync-'))
@@ -100,4 +104,180 @@ test('remote sync errors and missing remote credentials never report success or 
     assert.equal(result.error.code, 'client_credential_sync_failed')
     assert.doesNotMatch(JSON.stringify(result), /private|panel-refresh-fixture/)
   }
+})
+
+const dueGrant = () => ({ ...grant, expires_at: Date.now() + 60_000 })
+const unexpectedRefresh = async () => assert.fail('slot refresh must not be called')
+
+test('preflight never adopts a loose native credential in an empty panel slot', async (context) => {
+  const { official, worker, exec } = fixture(context)
+  fs.mkdirSync(path.dirname(official), { recursive: true })
+  const loose = JSON.stringify({ claudeAiOauth: { accessToken: 'native-access', refreshToken: 'native-refresh' } })
+  fs.writeFileSync(official, loose)
+  const result = await prepareClaudeClientCredentials(exec, { refreshInSlot: unexpectedRefresh })
+  assert.equal(result.status, 409)
+  assert.equal(result.error.code, 'credential_required')
+  assert.equal(fs.existsSync(worker), false)
+  assert.equal(fs.readFileSync(official, 'utf8'), loose)
+})
+
+test('KVM preflight repairs absolute host aliases to the guest-relative path', async (context) => {
+  const { homeDir, official, worker, exec } = fixture(context)
+  exec.vm.runtime = { type: 'kvm' }
+  writeWorkerCredentialFile(homeDir, grant)
+  const originalMode = fs.statSync(worker).mode & 0o777
+  fs.unlinkSync(official)
+  fs.symlinkSync(worker, official)
+  const result = await prepareClaudeClientCredentials(exec, { refreshInSlot: unexpectedRefresh })
+  assert.equal(result.ok, true)
+  assert.equal(result.refreshed, false)
+  assert.equal(fs.readlinkSync(official), 'credentials.json')
+  assert.equal(fs.readFileSync(official, 'utf8'), fs.readFileSync(worker, 'utf8'))
+  assert.equal(fs.statSync(worker).mode & 0o777, originalMode)
+})
+
+test('KVM preflight refreshes via the slot guest and rechecks the saved grant', async (context) => {
+  const { homeDir, official, exec } = fixture(context)
+  exec.vm.runtime = { type: 'kvm' }
+  writeWorkerCredentialFile(homeDir, dueGrant())
+  fs.unlinkSync(official)
+  fs.writeFileSync(
+    official,
+    JSON.stringify({
+      claudeAiOauth: { accessToken: 'native-access', refreshToken: 'native-refresh', expiresAt: 9900000000000 },
+    }),
+  )
+  let argvSeen
+  const result = await prepareClaudeClientCredentials(exec, {
+    refreshInSlot: (slot, op, options) =>
+      runSlotOauth(slot, op, {
+        ...options,
+        runDocker: async (argv) => {
+          argvSeen = argv
+          assert.equal(fs.readlinkSync(official), 'credentials.json')
+          assert.equal(readWorkerCredentialFile(homeDir).refresh_token, grant.refresh_token)
+          writeWorkerCredentialFile(homeDir, { ...grant, access_token: 'new-access', refresh_token: 'new-refresh' })
+          return { stdout: '{"ok":true,"status":200,"body":{"refreshed":true}}' }
+        },
+      }),
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.refreshed, true)
+  assert.ok(argvSeen.includes('/usr/local/bin/kin-guest-exec'))
+  assert.deepEqual(argvSeen.slice(-4), ['oauth', 'refresh', '--config', '/run/kin/worker.json'])
+  assert.equal(readWorkerCredentialFile(homeDir).refresh_token, 'new-refresh')
+  assert.doesNotMatch(JSON.stringify(result), /new-access|new-refresh/)
+})
+
+test('preflight pulls the rotated remote grant before deciding whether to refresh', async (context) => {
+  const { homeDir, official, exec } = fixture(context)
+  writeWorkerCredentialFile(homeDir, dueGrant())
+  const calls = []
+  const result = await prepareClaudeClientCredentials(exec, {
+    host: {
+      kind: 'node',
+      afterRefresh: async () => {
+        calls.push('pull')
+        writeWorkerCredentialFile(homeDir, { ...grant, refresh_token: 'node-rotated-refresh' })
+        return { pulled: true }
+      },
+    },
+    ensureRemoteLink: async () => {
+      calls.push('link')
+      return { linked: true }
+    },
+    refreshInSlot: unexpectedRefresh,
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.refreshed, false)
+  assert.deepEqual(calls, ['pull', 'link'])
+  assert.equal(readWorkerCredentialFile(homeDir).refresh_token, 'node-rotated-refresh')
+  assert.equal(fs.readlinkSync(official), 'credentials.json')
+})
+
+test('preflight never refreshes a cached grant when the authoritative remote file is missing', async (context) => {
+  const { homeDir, exec } = fixture(context)
+  writeWorkerCredentialFile(homeDir, dueGrant())
+  const result = await prepareClaudeClientCredentials(exec, {
+    host: { kind: 'node', afterRefresh: async () => ({ pulled: false, reason: 'remote_missing' }) },
+    ensureRemoteLink: async () => assert.fail('cannot link a missing credential'),
+    refreshInSlot: unexpectedRefresh,
+  })
+  assert.equal(result.status, 409)
+  assert.equal(result.error.code, 'credential_required')
+})
+
+test('preflight fails closed on unsuccessful refresh or an unchanged stale grant', async (context) => {
+  const { homeDir, worker, exec } = fixture(context)
+  writeWorkerCredentialFile(homeDir, dueGrant())
+  const before = fs.readFileSync(worker, 'utf8')
+  const fatal = async () => ({ ok: false, body: { error: { code: 'invalid_grant', message: grant.refresh_token } } })
+  const transport = async () => {
+    throw new Error(grant.access_token)
+  }
+  const noWrite = async () => ({ ok: true, body: { refreshed: true, expires_at: grant.expires_at } })
+  for (const [refreshInSlot, expectedClass, expectedCode] of [
+    [fatal, 'fatal', 'invalid_grant'],
+    [transport, 'retryable', undefined],
+    [noWrite, 'retryable', undefined],
+  ]) {
+    const result = await prepareClaudeClientCredentials(exec, { refreshInSlot })
+    assert.equal(result.ok, false)
+    assert.equal(result.error.code, 'client_credential_stale')
+    assert.equal(result.refresh_class, expectedClass)
+    assert.equal(result.error.refresh_code, expectedCode)
+    assert.doesNotMatch(JSON.stringify(result), /panel-(access|refresh)-fixture/)
+    assert.equal(fs.readFileSync(worker, 'utf8'), before)
+  }
+})
+
+test('concurrent preflights refresh a due grant only once', async (context) => {
+  const { homeDir, exec } = fixture(context)
+  writeWorkerCredentialFile(homeDir, dueGrant())
+  let refreshes = 0
+  const refreshInSlot = async () => {
+    refreshes++
+    writeWorkerCredentialFile(homeDir, grant)
+    return { ok: true, body: { refreshed: true } }
+  }
+  const results = await Promise.all([
+    prepareClaudeClientCredentials(exec, { refreshInSlot }),
+    prepareClaudeClientCredentials(exec, { refreshInSlot }),
+  ])
+  assert.equal(refreshes, 1)
+  assert.deepEqual(
+    results.map(({ ok, refreshed }) => [ok, refreshed]),
+    [
+      [true, true],
+      [true, false],
+    ],
+  )
+})
+
+test('preflight does not refresh API keys or unexpired official setup tokens', async (context) => {
+  const { homeDir, exec } = fixture(context)
+  for (const credential of [
+    { type: 'apikey', api_key: 'panel-api-fixture' },
+    { type: 'official-setup-token', access_token: 'official-oat', expires_at: Date.now() + 60_000 },
+  ]) {
+    writeWorkerCredentialFile(homeDir, credential)
+    const result = await prepareClaudeClientCredentials(exec, { refreshInSlot: unexpectedRefresh })
+    assert.equal(result.ok, true)
+    assert.equal(result.refreshed, false)
+    assert.equal(result.credential.mode, credential.type)
+  }
+})
+
+test('a refresh-only panel credential is recovered through the slot', async (context) => {
+  const { homeDir, exec, worker } = fixture(context)
+  fs.mkdirSync(path.dirname(worker), { recursive: true })
+  fs.writeFileSync(worker, JSON.stringify({ claudeAiOauth: { refreshToken: grant.refresh_token } }))
+  const result = await prepareClaudeClientCredentials(exec, {
+    refreshInSlot: async () => {
+      writeWorkerCredentialFile(homeDir, grant)
+      return { ok: true, body: { refreshed: true } }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.credential.has_access, true)
 })

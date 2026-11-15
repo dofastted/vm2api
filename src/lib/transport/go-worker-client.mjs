@@ -14,21 +14,21 @@ import { capOutboundBody } from '../protocol/outbound-snapshot.mjs'
 import { cacheTtlFromRouting } from '../protocol/cache-ttl.mjs'
 import { ccEntrypointFromRouting, stripSubagentBilling } from '../identity/crs-persona.mjs'
 import { sealClaudeCodeCch } from '../identity/cch.mjs'
-import { credentialModeFromOauth } from '../oauth/credential-mode.mjs'
+import { canRefreshCredential, credentialModeFromOauth, isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { isCrsMock, writeCrsTrace, mockCrsPayload, emitMockSse } from './crs-mock.mjs'
 import {
   classifyCredentialRefresh,
+  expiresAtToMs,
   hasAccessPresence,
   hasCredentialPresence,
   hasRefreshPresence,
   needsRefresh,
   readWorkerCredentialFile,
+  refreshErrorCodeOf,
   REFRESH_SKEW_MS,
   writeWorkerCredentialFile,
   ensureOfficialCredentialLink,
-  authLoginBlocksRefresh,
 } from '../oauth/oauth-credentials.mjs'
-import { isApiKeyMode } from '../oauth/credential-mode.mjs'
 import { runSlotOauth } from './slot-oauth.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { ensureRemoteOfficialCredentialLink } from '../cluster/remote-slot-files.mjs'
@@ -1546,7 +1546,7 @@ export async function ensureWorkerCredential(exec, { force = false } = {}) {
     }
   }
 
-  if (exec?.homeDir) ensureOfficialCredentialLink(exec.homeDir)
+  if (exec?.homeDir) ensureOfficialCredentialLink(exec.homeDir, { adoptOfficial: false })
   const credential = readWorkerCredentialFile(exec.homeDir)
   if (!credential) {
     return {
@@ -1559,15 +1559,6 @@ export async function ensureWorkerCredential(exec, { force = false } = {}) {
 
   const now = Date.now()
   const apiKey = isApiKeyMode(credential.type || credential.mode)
-  if (!apiKey && authLoginBlocksRefresh(exec?.homeDir, now)) {
-    return {
-      ok: true,
-      status: 200,
-      refreshed: false,
-      refresh_class: 'login_in_progress',
-      credential: credentialSummary(credential, now),
-    }
-  }
   const alreadyFresh = apiKey || (!force && !needsRefresh(credential.expires_at, now, REFRESH_SKEW_MS))
   if (alreadyFresh) {
     return {
@@ -1582,17 +1573,7 @@ export async function ensureWorkerCredential(exec, { force = false } = {}) {
   const snapshotRefresh = String(credential.refresh_token || '')
   const lockKey = String(exec.homeDir || exec.vm?.id || 'credential')
   return withCredentialRefreshLock(lockKey, async () => {
-    if (exec?.homeDir) ensureOfficialCredentialLink(exec.homeDir)
-    if (!apiKey && authLoginBlocksRefresh(exec?.homeDir)) {
-      const held = readWorkerCredentialFile(exec.homeDir) || credential
-      return {
-        ok: true,
-        status: 200,
-        refreshed: false,
-        refresh_class: 'login_in_progress',
-        credential: credentialSummary(held, Date.now()),
-      }
-    }
+    if (exec?.homeDir) ensureOfficialCredentialLink(exec.homeDir, { adoptOfficial: false })
     const live = readWorkerCredentialFile(exec.homeDir) || credential
     const liveRefresh = String(live?.refresh_token || '')
     if (snapshotRefresh && liveRefresh && snapshotRefresh !== liveRefresh) {
@@ -1681,26 +1662,98 @@ export async function importWorkerCredential(exec, credential, { timeoutMs = 600
   })
 }
 
-export async function syncClaudeClientCredentials(
+function clientCredentialRequired() {
+  return { ok: false, status: 409, error: { code: 'credential_required', message: '请先在面板导入凭证' } }
+}
+
+function staleClientCredential(result) {
+  const code = refreshErrorCodeOf(result)
+  // Only return known grant errors; worker output may contain credential values.
+  const refreshCode = ['invalid_grant', 'invalid_refresh_token', 'refresh_token_missing', 'oauth_revoked'].includes(
+    code,
+  )
+    ? code
+    : undefined
+  return {
+    ok: false,
+    status: refreshCode ? 409 : 502,
+    refreshed: false,
+    refresh_class: refreshCode ? 'fatal' : 'retryable',
+    error: {
+      code: 'client_credential_stale',
+      ...(refreshCode ? { refresh_code: refreshCode } : {}),
+      message: refreshCode ? '客户端凭证无法刷新，请在面板更新凭证' : '客户端凭证未能刷新，请检查 VM 连接后重试',
+    },
+  }
+}
+
+async function reconcileClaudeClientCredentials(
   exec,
-  { host = slotHost(exec.vm), ensureRemoteLink = ensureRemoteOfficialCredentialLink } = {},
+  { host = slotHost(exec.vm), ensureRemoteLink = ensureRemoteOfficialCredentialLink, refreshInSlot } = {},
 ) {
   return withCredentialRefreshLock(String(exec.homeDir || exec.vm?.id || 'credential'), async () => {
     try {
+      if (!exec.homeDir) return clientCredentialRequired()
       const slotDir = path.dirname(exec.homeDir)
+      const repairRemoteLink = async () => {
+        if (host.kind === 'node' && !(await ensureRemoteLink(exec.vm, slotDir))?.linked) {
+          throw new Error('remote_link_failed')
+        }
+      }
+      const repairLocalLink = () => {
+        // A loose native alias is never a panel import source.
+        if (!ensureOfficialCredentialLink(exec.homeDir, { adoptOfficial: false }).linked) {
+          throw new Error('credential_link_failed')
+        }
+      }
       if (host.kind === 'node') {
         const pulled = await host.afterRefresh(exec.vm, slotDir)
-        if (pulled?.reason === 'remote_missing') throw new Error('remote_missing')
-        const linked = await ensureRemoteLink(exec.vm, slotDir)
-        if (!linked?.linked) throw new Error('remote_link_failed')
+        if (pulled?.reason === 'remote_missing') {
+          if (refreshInSlot) return clientCredentialRequired()
+          throw new Error('remote_missing')
+        }
+        await repairRemoteLink()
       }
       const credential = readWorkerCredentialFile(exec.homeDir)
-      if (!credential?.access_token && !credential?.api_key) {
-        return { ok: false, status: 409, error: { code: 'credential_required', message: '请先在面板导入凭证' } }
+      const mode = credential?.type || credential?.mode
+      const refreshable = canRefreshCredential(mode)
+      const hasAccess = hasAccessPresence(credential || {})
+      const hasRefresh = hasRefreshPresence(credential || {})
+      if (!hasAccess && !(refreshInSlot && refreshable && hasRefresh)) return clientCredentialRequired()
+      repairLocalLink()
+      if (!refreshInSlot) return { ok: true, synced: true, credential: credentialSummary(credential) }
+
+      let live = credential
+      let refreshed = false
+      if (refreshable && (!hasAccess || needsRefresh(credential.expires_at))) {
+        if (!hasRefresh) return staleClientCredential({ error: { code: 'refresh_token_missing' } })
+        let result
+        try {
+          // This already holds the same lock as imports and worker refreshes.
+          result = await refreshInSlot(exec, 'refresh', { force: false })
+        } catch {
+          return staleClientCredential()
+        }
+        if (!result?.ok) return staleClientCredential({ error: result?.body?.error })
+        // Slot refresh also pulls the remote file back. Verify persisted expiry,
+        // not the subprocess's reported expiry, before admitting the client.
+        live = readWorkerCredentialFile(exec.homeDir)
+        if (!live || !hasAccessPresence(live) || needsRefresh(live.expires_at)) return staleClientCredential()
+        await repairRemoteLink()
+        repairLocalLink()
+        refreshed = !!result.body?.refreshed
+      } else if (!refreshable && !isApiKeyMode(mode)) {
+        const expiry = expiresAtToMs(credential.expires_at)
+        if (expiry && expiry <= Date.now()) return staleClientCredential({ error: { code: 'refresh_token_missing' } })
       }
-      const linked = ensureOfficialCredentialLink(exec.homeDir, { adoptOfficial: false })
-      if (!linked.linked) throw new Error('credential_link_failed')
-      return { ok: true, synced: true, credential: credentialSummary(credential) }
+      return {
+        ok: true,
+        status: 200,
+        synced: true,
+        refreshed,
+        refresh_class: refreshed ? 'rotated' : 'already_fresh',
+        credential: credentialSummary(live),
+      }
     } catch {
       return {
         ok: false,
@@ -1712,6 +1765,16 @@ export async function syncClaudeClientCredentials(
       }
     }
   })
+}
+
+/** Sync after a panel import or an explicit /sync, without exchanging a new token. */
+export function syncClaudeClientCredentials(exec, options) {
+  return reconcileClaudeClientCredentials(exec, options)
+}
+
+/** Prepare the native credential alias and refresh due OAuth grants via the slot. */
+export function prepareClaudeClientCredentials(exec, { refreshInSlot = runSlotOauth, ...options } = {}) {
+  return reconcileClaudeClientCredentials(exec, { ...options, refreshInSlot })
 }
 
 export async function callWorkerPost(exec, requestPath, body, { timeoutMs = 20000, signal } = {}) {

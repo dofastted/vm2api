@@ -1,7 +1,7 @@
 /**
  * Browser OAuth-link import.
- * CAI (sub2api) and official Claude Code share PKCE + paste-code,
- * then exchange using the target VM's bound egress. Legacy kernels use the
+ * CAI and Setup Token share PKCE + paste-code, then exchange using the target
+ * VM's bound egress. Native Claude Code login does not use this helper. Legacy kernels use the
  * controller helper with the same exit. The VM context selects the live binding;
  * proxyUrl validates the authorize session and null means unbound.
  */
@@ -22,18 +22,6 @@ export const OAUTH_FLAVORS = Object.freeze({
     tokenUrls: ['https://platform.claude.com/v1/oauth/token', 'https://api.anthropic.com/v1/oauth/token'],
     scope: FULL_OAUTH_SCOPE,
     source: 'oauth-auth-url',
-  },
-  claude_code: {
-    flavor: 'claude_code',
-    authorizeUrl: 'https://claude.ai/oauth/authorize',
-    redirectUri: 'https://console.anthropic.com/oauth/code/callback',
-    tokenUrls: [
-      'https://platform.claude.com/v1/oauth/token',
-      'https://api.anthropic.com/v1/oauth/token',
-      'https://console.anthropic.com/v1/oauth/token',
-    ],
-    scope: FULL_OAUTH_SCOPE,
-    source: 'oauth-claude-code',
   },
   setup_token: {
     flavor: 'setup_token',
@@ -101,7 +89,9 @@ export function normalizeOauthFlavor(raw) {
 }
 
 export function oauthFlavorSpec(raw) {
-  return OAUTH_FLAVORS[normalizeOauthFlavor(raw)]
+  const flavor = normalizeOauthFlavor(raw)
+  if (flavor === 'claude_code') throw fail('native_login_required', 'Claude Code 授权须在槽位原生终端完成')
+  return OAUTH_FLAVORS[flavor]
 }
 
 export function resetAuthUrlSessions() {

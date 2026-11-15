@@ -45,22 +45,12 @@ test('generateAuthUrl builds Claude authorize URL and stores PKCE', () => {
   assert.equal(session.redirectUri, REDIRECT_URI)
 })
 
-test('generateAuthUrl creates a panel-owned Claude Code PKCE session', () => {
-  resetAuthUrlSessions()
-  const generated = generateAuthUrl({
-    vmId: 'vm-01',
-    proxyUrl: 'socks5h://127.0.0.1:1080',
-    flavor: 'claude_code',
-  })
-  const url = new URL(generated.auth_url)
-  const session = peekAuthUrlSession(generated.session_id)
-  assert.equal(generated.flavor, 'claude_code')
-  assert.equal(url.origin + url.pathname, OAUTH_FLAVORS.claude_code.authorizeUrl)
-  assert.equal(url.searchParams.get('redirect_uri'), OAUTH_FLAVORS.claude_code.redirectUri)
-  assert.equal(url.searchParams.get('state'), session.state)
-  assert.equal(session.vmId, 'vm-01')
-  assert.ok(session.codeVerifier)
-  assert.equal(JSON.stringify(generated).includes(session.codeVerifier), false)
+test('Claude Code flavors cannot create a separate panel PKCE session', () => {
+  for (const flavor of ['claude_code', 'claude-code', 'cc', 'official']) {
+    assert.throws(() => generateAuthUrl({ vmId: 'vm-01', proxyUrl: '', flavor }), {
+      code: 'native_login_required',
+    })
+  }
 })
 
 test('generateAuthUrl setup_token uses full scope on CAI but keeps setup-token flavor', () => {

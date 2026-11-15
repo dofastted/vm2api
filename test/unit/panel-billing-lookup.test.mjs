@@ -57,11 +57,14 @@ test('billing rows of an older account on a reused slot keep their own email', (
   assert.deepEqual(emails, ['old@example.com', 'new@example.com', 'three@example.com'])
 })
 
-test('VM list carries lifetime tokens from the same billing row as total_cost', async (t) => {
+test('VM list separates current-account lifetime usage from older slot usage', async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-billing-tokens-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
   fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
-  fs.writeFileSync(path.join(root, 'vms', 'vm-07.json'), JSON.stringify({ id: 'vm-07' }))
+  fs.writeFileSync(
+    path.join(root, 'vms', 'vm-07.json'),
+    JSON.stringify({ id: 'vm-07', claude: { has_access: true, account_uuid: 'current-account' } }),
+  )
   fs.writeFileSync(path.join(root, 'vms', 'vm-08.json'), JSON.stringify({ id: 'vm-08' }))
   const listed = await buildVmList({
     cfg: { paths: { project: root } },
@@ -69,6 +72,10 @@ test('VM list carries lifetime tokens from the same billing row as total_cost', 
     routingConfig: {},
     requestLog: {
       billingStats: () => ({
+        lifetime_accounts: [
+          { account_id: 'vm-07', total_cost: 800, total_tokens: 5000000 },
+          { account_id: 'current-account', total_cost: 2, total_tokens: 9000 },
+        ],
         accounts: [
           {
             account_id: 'vm-07',
@@ -88,11 +95,13 @@ test('VM list carries lifetime tokens from the same billing row as total_cost', 
   const byId = Object.fromEntries(listed.data.items.map((vm) => [vm.id, vm]))
   assert.equal(byId['vm-07'].total_cost, 12.5)
   assert.equal(byId['vm-07'].total_tokens, 91500)
+  assert.deepEqual(byId['vm-07'].lifetime_usage, { cost: 2, tokens: 9000 })
   assert.equal(byId['vm-07'].window_5h_tokens, 40)
   assert.equal(byId['vm-07'].window_7d_tokens, 900)
   // Claude input excludes cache; 今日 must count the cache buckets too (input + output alone was 500).
   assert.equal(byId['vm-07'].today_tokens, 10000)
   assert.equal(byId['vm-08'].total_tokens, 0)
+  assert.deepEqual(byId['vm-08'].lifetime_usage, { cost: 0, tokens: 0 })
 })
 
 test('usage rows of a deleted VM are not listed', (t) => {

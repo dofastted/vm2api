@@ -1,7 +1,7 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.11.15-crag-3.0.4",
-  "crag_release": "v3.0.4",
+  "release": "payload-2026.11.15-crag-3.0.5",
+  "crag_release": "v3.0.5",
   "files": [
     {
       "path": "bin/kin-kernel",
@@ -113,15 +113,15 @@
     },
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2",
-      "asset": "crag-v2-amd64-v3.0.4-crag-v2",
-      "size": 854200,
-      "sha256": "d05b9ff8fa686ae79433f3998d0a9c194b01f550ffbac0b02966affb0722edc5"
+      "asset": "crag-v2-amd64-v3.0.5-crag-v2",
+      "size": 875840,
+      "sha256": "467bae4a35f7c6a30cb2b74dd56cbab304fec189cf703172c10f8708b349681a"
     },
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2.payload.enc",
-      "asset": "crag-v2-amd64-v3.0.4-crag-v2.payload.enc",
-      "size": 10202660,
-      "sha256": "4470e9a11f2ab7ccb34fa4c14dd3cb24d5572d72ec14c89b78a96681fb141432"
+      "asset": "crag-v2-amd64-v3.0.5-crag-v2.payload.enc",
+      "size": 10264276,
+      "sha256": "1d0eaad048ebd0790cae0413deeadd7a6d0e23bf5b9e77fe4ddfd3945d2ae57a"
     },
     {
       "path": "share/crag/kernels/v2/amd64/kernel.json.example",
@@ -131,15 +131,21 @@
     },
     {
       "path": "share/crag/kernels/v2/amd64/manifest.json",
-      "asset": "crag-v2-amd64-v3.0.4-manifest.json",
-      "size": 2630,
-      "sha256": "a6c9d23aed89cb89630eed759b7cae820080de0d90ab9b4a12788989ff184760"
+      "asset": "crag-v2-amd64-v3.0.5-manifest.json",
+      "size": 2720,
+      "sha256": "ec9b706591e9e147059e1be5f689f6ae59ee1e630f97fef07169f53133fba917"
+    },
+    {
+      "path": "share/crag/kernels/v2/amd64/unpack-note.md",
+      "asset": "crag-v2-amd64-unpack-note.md",
+      "size": 15874,
+      "sha256": "1f5cce1c9491f03ceeeffcafa80db4bcbff8f5042fa86ef344c97bcf3b62062d"
     },
     {
       "path": "dist/crag-v2-licensed-amd64.tar.gz",
       "asset": "crag-v2-licensed-amd64.tar.gz",
-      "size": 168012275,
-      "sha256": "bb79176d19798127b77a051d1468b33be5fe52c6a9d3d6b6977c85c8e5fcaee7"
+      "size": 168090914,
+      "sha256": "428b07b65586480473b3f5ebf1fe0a6c3c1444d1a45c611faad40737d22b818a"
     }
   ]
 }

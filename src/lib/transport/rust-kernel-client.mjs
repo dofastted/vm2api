@@ -71,6 +71,14 @@ export async function postRustKernelTelemetryEvent(exec, event, options = {}) {
   return remapVia(await callWorkerPost(withRustKernelExec(exec), '/internal/v1/telemetry/events', event, options))
 }
 
+export function supportsCragTelemetryApply(health) {
+  return health?.ok === true && health.crag_telemetry_apply_v1 === true && cragV2KernelActive({ health })
+}
+
+export function applyCragTelemetryPolicy(exec, enabled, options = {}) {
+  return callWorkerPost(withRustKernelExec(exec), '/internal/v1/telemetry/apply', { enabled }, options)
+}
+
 export function withCragCredential(exec, health) {
   if (!health || health.credential) return health
   const native = health.runtime_variant === 'crag-v2' || (health.dataplane === 'crag' && health.kernel_version === 'v2')

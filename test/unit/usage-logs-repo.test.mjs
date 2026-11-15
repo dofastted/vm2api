@@ -402,6 +402,37 @@ test('log coverage follows recorded prunes, not the oldest row or the current re
   }
 })
 
+test('lifetime usage follows the account across slots and survives repeated pruning', () => {
+  const { db, repo } = freshDb()
+  try {
+    const old = new Date(Date.now() - 30 * 86400_000).toISOString()
+    seed(repo, [
+      { created_at: old, vm_id: 'vm-01', final_account_id: 'claude-a', input_tokens: 10, total_cost: 1 },
+      { vm_id: 'vm-02', account_id: 'claude-a', cache_read_tokens: 20, total_cost: 2 },
+      { vm_id: 'vm-02', account_id: 'claude-b', output_tokens: 15, total_cost: 4 },
+      { created_at: old, vm_id: 'vm-01', usage_account_id: 'openai:a', cache_creation_tokens: 7, total_cost: 1 },
+      { vm_id: 'vm-03', usage_account_id: 'openai:a', output_tokens: 3, total_cost: 2 },
+      { created_at: old, vm_id: 'vm-03', account_id: 'vm-03', input_tokens: 20, total_cost: 4 },
+    ])
+    const lifetime = () =>
+      repo
+        .billingStats({ now: Date.now() })
+        .lifetime_accounts.sort((left, right) => left.account_id.localeCompare(right.account_id))
+    const expected = [
+      { account_id: 'claude-a', total_cost: 0.000036, total_tokens: 30 },
+      { account_id: 'claude-b', total_cost: 0.000225, total_tokens: 15 },
+      { account_id: 'openai:a', total_cost: 0.00007125, total_tokens: 10 },
+    ]
+    assert.deepEqual(lifetime(), expected)
+    assert.equal(repo.cleanup({ retainDays: 7 }).usage_logs, 3)
+    assert.deepEqual(lifetime(), expected)
+    assert.equal(repo.cleanup({ retainDays: 7 }).usage_logs, 0)
+    assert.deepEqual(lifetime(), expected)
+  } finally {
+    db.close()
+  }
+})
+
 test('window_fable only counts fable rows since reset_7d_oi', () => {
   const { db, repo } = freshDb()
   try {

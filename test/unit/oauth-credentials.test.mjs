@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { runInNewContext } from 'node:vm'
-import { listVms, isCodexVm } from '../../src/lib/vm/vm-registry.mjs'
+import { listVms, isCodexVm, summarizeVm } from '../../src/lib/vm/vm-registry.mjs'
 import {
   needsRefresh,
   expiresAtToMs,
@@ -82,6 +82,23 @@ test('persist + apply keep other vm fields', () => {
 
 test('persistOauthToVm returns null for a missing vm file', () => {
   assert.equal(persistOauthToVm('/nonexistent/vm.json', { access_token: 'x' }), null)
+})
+
+test('OAuth enrollment survives refresh but is replaced when the slot registers again', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-registration-'))
+  const vmPath = path.join(dir, 'vm-05.json')
+  fs.writeFileSync(vmPath, JSON.stringify({ id: 'vm-05' }))
+  try {
+    const setup = { mode: 'setup-token', access_token: 'access', refresh_token: 'refresh', scope: 'user:profile' }
+    const registered = persistOauthToVm(vmPath, { ...setup, oauth_registration: 'console' }, { operatorImport: true })
+    assert.equal(summarizeVm(registered).oauth_registration, 'console')
+    assert.equal(summarizeVm(persistOauthToVm(vmPath, setup)).oauth_registration, 'console')
+    const converted = persistOauthToVm(vmPath, { ...setup, source: 'oauth-to-setup-token' }, { operatorImport: true })
+    assert.equal(summarizeVm(converted).credential_mode, 'setup-token')
+    assert.equal(summarizeVm(converted).oauth_registration, 'oauth')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('persistOauthToVm clears leftover oauth_cleared after a live credential', () => {

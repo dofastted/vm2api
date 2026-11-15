@@ -22,7 +22,8 @@ import { slotExec } from '../../src/lib/vm/slot-runtime.mjs'
 test('guest OAuth helper preserves provider state, PKCE and cookie authorization', {
   timeout: 30000,
 }, async (t) => {
-  const binary = fileURLToPath(new URL('../../bin/kin-oauth-auth', import.meta.url))
+  const binary =
+    process.env.KIN_TEST_OAUTH_AUTH_BIN || fileURLToPath(new URL('../../bin/kin-oauth-auth', import.meta.url))
   fs.accessSync(binary, fs.constants.X_OK)
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-oauth-authorize-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
@@ -228,6 +229,7 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
           new Promise((resolve, reject) => {
             const guestPayload = JSON.parse(stdin)
             assert.equal(guestPayload.proxy_url, '')
+            if (process.env.KIN_TEST_OAUTH_AUTH_BIN) guestPayload.claude_version = '2.1.321'
             // This unit fixture uses a host-local SOCKS listener in place of
             // the transparent kin-eg-* network available to a real slot.
             guestPayload.proxy_url = proxyUrl
@@ -338,6 +340,10 @@ test('guest OAuth helper preserves provider state, PKCE and cookie authorization
       )
       assert.equal(token.headers.cookie, undefined)
       assert.equal(bootstrap.headers.authorization, `Bearer ${accessToken}`)
+      if (process.env.KIN_TEST_OAUTH_AUTH_BIN) {
+        assert.equal(token.headers['user-agent'], 'claude-cli/2.1.321 (external, sdk-cli)')
+        assert.equal(bootstrap.headers['user-agent'], 'claude-cli/2.1.321 (external, cli)')
+      }
       assert.equal(bootstrap.headers.cookie, undefined)
     })
   }

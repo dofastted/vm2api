@@ -4,6 +4,7 @@ import {
   credEndpointOf,
   defaultImportKind,
   defaultImportMethod,
+  IMPORT_KINDS,
   importMethodsFor,
   importSurfaceFor,
   importTypeFor,
@@ -11,9 +12,18 @@ import {
   resolveImportMethod,
 } from '@/lib/cred-type'
 
-describe('setup-token import defaults', () => {
-  it('defaults the panel to Setup Token + Cookie', () => {
-    expect(defaultImportKind()).toBe('setup-token')
+describe('credential import defaults', () => {
+  it('shows OAuth first and defaults to native Claude Code', () => {
+    expect(IMPORT_KINDS.map(({ id }) => id)).toEqual([
+      'oauth',
+      'setup-token',
+      'apikey',
+    ])
+    expect(defaultImportKind()).toBe('oauth')
+    expect(defaultImportMethod('oauth')).toBe('cc')
+  })
+
+  it('keeps Cookie as the Setup Token default', () => {
     expect(defaultImportMethod('setup-token')).toBe('session')
     expect(importTypeFor('setup-token')).toBe('setup-token')
     expect(oauthFlavorFor('setup-token', 'link')).toBe('setup_token')
@@ -28,7 +38,7 @@ describe('setup-token import defaults', () => {
     expect(resolveImportMethod('setup-token', 'link')).toBe('link')
   })
 
-  it('keeps OAuth Cookie / link / Claude Code as a secondary kind', () => {
+  it('keeps authorization link and Cookie as OAuth alternatives', () => {
     expect(importMethodsFor('oauth').map((m) => m.id)).toEqual([
       'cc',
       'link',

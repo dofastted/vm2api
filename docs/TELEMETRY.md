@@ -135,6 +135,26 @@ runtime application. An off policy is confirmed only by native disabled state
 and an empty queue; absence or an active old state remains unconfirmed. Both
 single-VM and bulk controls can republish an unconfirmed, already-saved policy.
 
+### CRAG native Claude launch policy
+
+CRAG uses a separate Unix-socket control route, not the queue/ACK protocol
+above. For a running CRAG slot whose authenticated health advertises
+`crag_telemetry_apply_v1`, the panel publishes the guest seed files. When
+enabling, it omits `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` from the official
+`settings.json`. Other kernels retain their existing settings policy.
+
+The panel checks `POST /internal/v1/telemetry/apply` and, only on a restart-required
+response, uses slot maintenance to drain requests, restart the selected CRAG
+kernel, verify again and restore the scheduling intent. Active native work or
+an unavailable worker remains unconfirmed. Stopped slots are not started.
+`scope: "native_claude_launch"` and `upload_confirmed: false` distinguish this
+result from a running sender or queue acknowledgement. The managed upload
+interval is not applied to CRAG's official Claude process. The currently pinned
+CRAG artifact requires a capability-bearing replacement before this path can
+confirm policy on a deployed slot.
+
+### Official initialization
+
 Official initialization's `sync_telemetry` remains default-off. When enabled, it
 publishes the existing policy; it does not opt the account in. The finalizer's
 `publish: false` option stages files only and claims neither publication nor

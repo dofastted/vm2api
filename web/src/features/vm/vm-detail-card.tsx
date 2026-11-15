@@ -13,7 +13,11 @@ import {
   Undo2,
   UserRoundPlus,
 } from 'lucide-react'
-import { credTypeLabel, credTypeOf } from '@/lib/cred-type'
+import {
+  credentialRegistrationOf,
+  credTypeLabel,
+  credTypeOf,
+} from '@/lib/cred-type'
 import { fmtExpiresAt, fmtNum, fmtUsd } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { compactEmail, isCodexVm, slotNameLabel } from '@/lib/vm-kind'
@@ -187,9 +191,12 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
                 '-'
               ) : (
                 <span className='flex flex-wrap items-center gap-1.5'>
-                  <CredLaneChip vm={vm} />
+                  <CredLaneChip endpoint={credentialRegistrationOf(vm)} />
                   <span className='text-xs text-muted-foreground'>
-                    凭证 {credTypeLabel(credType)}
+                    凭证{' '}
+                    {credType === 'apikey'
+                      ? 'API Key'
+                      : credTypeLabel(credType)}
                   </span>
                   {codex ? <OpenaiPlanBadge vm={vm} /> : null}
                 </span>

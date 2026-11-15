@@ -60,6 +60,8 @@ function addKeyUsage(into, row) {
 const PRUNED_THROUGH_KEY = 'usage_logs_pruned_through'
 const BILLING_STATS_CACHE_TTL_MS = 10_000
 const BILLING_BACKFILL_INTERVAL_MS = 60_000
+const LIFETIME_ACCOUNT_SQL = `COALESCE(NULLIF(usage_account_id, ''),
+  NULLIF(NULLIF(COALESCE(NULLIF(final_account_id, ''), NULLIF(account_id, '')), COALESCE(vm_id, '')), '—'))`
 
 function billingStatsCacheKey(accountWindows) {
   if (!Array.isArray(accountWindows) || accountWindows.length === 0) return 'rolling'
@@ -127,6 +129,7 @@ const SUMMARY_COLUMNS = [
   'attempt_count',
   'final_state',
   'final_account_id',
+  'usage_account_id',
   'input_cost',
   'output_cost',
   'cache_read_cost',
@@ -837,13 +840,14 @@ export class UsageLogsRepo {
     return this._costSelect(cond, params)
   }
 
-  costByAccount({ since = null, until = null } = {}) {
+  costByAccount({ since = null, until = null, withLifetime = false } = {}) {
     const { cond, params } = timeCond(since, until)
     const rows = this.db
       .prepare(`
       SELECT
         COALESCE(NULLIF(final_account_id, ''), NULLIF(account_id, ''), vm_id, '—') AS account_id,
         vm_id,
+        ${withLifetime ? `${LIFETIME_ACCOUNT_SQL} AS lifetime_account_id,` : ''}
         COUNT(*) AS requests,
         SUM(CASE WHEN ${SLA_SUCCESS_PRED} THEN 1 ELSE 0 END) AS success,
         SUM(CASE WHEN ${SLA_ERROR_PRED} THEN 1 ELSE 0 END) AS errors,
@@ -859,13 +863,14 @@ export class UsageLogsRepo {
         COALESCE(SUM(total_cost), 0) AS total_cost,
         COALESCE(SUM(CASE WHEN pricing_model = '${UNPRICED_MODEL}' AND (${TOTAL_TOKENS_SQL}) > 0 THEN 1 ELSE 0 END), 0) AS unpriced
       FROM usage_logs ${cond}
-      GROUP BY 1, vm_id
+      GROUP BY 1, vm_id${withLifetime ? ', lifetime_account_id' : ''}
       ORDER BY total_cost DESC
     `)
       .all(...params)
     return rows.map((r) => ({
       account_id: r.account_id,
       vm_id: r.vm_id || null,
+      ...(withLifetime ? { lifetime_account_id: r.lifetime_account_id } : {}),
       requests: Number(r.requests || 0),
       success: Number(r.success || 0),
       errors: Number(r.errors || 0),
@@ -1207,7 +1212,37 @@ export class UsageLogsRepo {
     const todayStart = shanghaiDayStartIso()
     const fiveHStart = new Date(now - WINDOW_5H_MS).toISOString()
     const sevenDStart = new Date(now - WINDOW_7D_MS).toISOString()
-    const accountsTotal = this.costByAccount()
+    const keyOf = (a) => a.account_id + '\0' + (a.vm_id || '')
+    const bySlot = new Map()
+    const lifetime = new Map(
+      this.db
+        .prepare('SELECT account_id, total_cost, total_tokens FROM account_lifetime_usage_archive')
+        .all()
+        .map((row) => [row.account_id, { ...row }]),
+    )
+    for (const { lifetime_account_id, ...row } of this.costByAccount({ withLifetime: true })) {
+      if (lifetime_account_id) {
+        const previous = lifetime.get(lifetime_account_id)
+        lifetime.set(lifetime_account_id, {
+          account_id: lifetime_account_id,
+          total_cost: (previous?.total_cost || 0) + row.total_cost,
+          total_tokens: (previous?.total_tokens || 0) + totalTokens(row),
+        })
+      }
+      const key = keyOf(row)
+      const previous = bySlot.get(key)
+      if (!previous) {
+        bySlot.set(key, row)
+        continue
+      }
+      bySlot.set(key, {
+        account_id: row.account_id,
+        vm_id: row.vm_id,
+        ...sumCostBuckets([previous, row]),
+        unpriced: previous.unpriced + row.unpriced,
+      })
+    }
+    const accountsTotal = [...bySlot.values()].sort((left, right) => right.total_cost - left.total_cost)
     const accountsToday = this.costByAccount({ since: todayStart })
     // The per-account queries already cover every row. Re-sum them for the
     // global buckets instead of scanning the entire usage table two more times.
@@ -1217,7 +1252,6 @@ export class UsageLogsRepo {
     const todayBucket = sumCostBuckets(accountsToday)
     const total = { ...totalBucket, ...cacheHitStats(totalBucket) }
     const today = { ...todayBucket, ...cacheHitStats(todayBucket) }
-    const keyOf = (a) => a.account_id + '\0' + (a.vm_id || '')
     const todayById = new Map(accountsToday.map((a) => [keyOf(a), a]))
     const aligned = Array.isArray(accountWindows) && accountWindows.length > 0
     let eventsSince = sevenDStart
@@ -1327,6 +1361,7 @@ export class UsageLogsRepo {
       window_7d: window7d,
       total,
       accounts,
+      lifetime_accounts: [...lifetime.values()],
     }
   }
 
@@ -1719,6 +1754,18 @@ export class UsageLogsRepo {
   _pruneUsage(cutoff) {
     this.db.exec('BEGIN')
     try {
+      this.db
+        .prepare(`
+        INSERT INTO account_lifetime_usage_archive (account_id, total_cost, total_tokens)
+        SELECT ${LIFETIME_ACCOUNT_SQL}, COALESCE(SUM(total_cost), 0), COALESCE(SUM(${TOTAL_TOKENS_SQL}), 0)
+        FROM usage_logs
+        WHERE created_at < ? AND (${LIFETIME_ACCOUNT_SQL}) IS NOT NULL
+        GROUP BY 1
+        ON CONFLICT(account_id) DO UPDATE SET
+          total_cost = total_cost + excluded.total_cost,
+          total_tokens = total_tokens + excluded.total_tokens
+      `)
+        .run(cutoff)
       const deleted = this._deleteOldUsage.run(cutoff).changes
       if (deleted > 0) {
         const prev = this._prunedThrough()

@@ -7,7 +7,13 @@ import { listVms, getVm } from './vm-registry.mjs'
 import { runtimeKind } from './runtime-kind.mjs'
 import { reloadSlotReady, slotExec } from './slot-runtime.mjs'
 import { collectSlotIdentity } from './guest-identity.mjs'
-import { rustKernelHealth } from '../transport/rust-kernel-client.mjs'
+import {
+  applyCragTelemetryPolicy,
+  rustKernelHealth,
+  rustKernelPaths,
+  supportsCragTelemetryApply,
+} from '../transport/rust-kernel-client.mjs'
+import { restartRustKernel, wrapHopInflight } from '../transport/rust-kernel-supervisor.mjs'
 import path from 'node:path'
 import { syncNativeTelemetry } from './vm-runtime.mjs'
 import { writeSlotSeedFiles } from './slot-seed.mjs'
@@ -17,12 +23,18 @@ import { readSlotProcessStatus, retireLegacyTelemetry } from './slot-process-sta
 import fs from 'node:fs'
 import { withVmLock } from './vm-file.mjs'
 import { normalizeVmKind } from './vm-kind.mjs'
+import { resolveKernelDataplane } from './slot-engine.mjs'
+import { cragV2KernelActive } from '../protocol/crag-print-prompt.mjs'
+import { isTelemetryEnabled } from '../protocol/seed-policy.mjs'
+import { withSlotMaintenance } from './slot-maintenance.mjs'
 
 function publicationRevision(vm) {
   return JSON.stringify({
     node_id: vm.node_id,
     runtime: vm.runtime,
     runtime_type: vm.runtime_type,
+    dataplane: vm.dataplane,
+    crag_kernel_version: vm.crag_kernel_version,
     seed_policy: vm.seed_policy,
     proxy: vm.proxy,
     timezone: vm.timezone,
@@ -44,13 +56,97 @@ function publicationPlacement(vm) {
 
 const ACTIONS = new Set(['collect', 'reload', 'roll', 'telemetry'])
 
-/** Acknowledged publication followed by native state, never a sidecar/egress restart. */
+const cragTelemetryErrors = {
+  telemetry_policy_not_published: 'CRAG 未读到已发布的槽内设置',
+  telemetry_native_settings_blocked: 'Claude Code 槽内设置或 OS 特征阻止开启遥测',
+  telemetry_restart_required: '槽内设置已发布；需排空并重启 CRAG 内核',
+}
+
+async function verifyCragTelemetry(exec, enabled, timeoutMs) {
+  const { status, body } = await applyCragTelemetryPolicy(exec, enabled, { timeoutMs })
+  if (
+    status === 200 &&
+    body?.ok === true &&
+    body.applied === true &&
+    body.enabled === enabled &&
+    body.scope === 'native_claude_launch' &&
+    body.upload_confirmed === false
+  ) {
+    return { ok: true, applied: true, action: 'applied', enabled, scope: body.scope, upload_confirmed: false }
+  }
+  const code = body?.error?.type
+  if (status === 409 && Object.hasOwn(cragTelemetryErrors, code)) {
+    return { ok: false, code, error: cragTelemetryErrors[code] }
+  }
+  return { ok: false, code: 'telemetry_observation_unavailable', error: 'CRAG 未确认原生遥测启动策略' }
+}
+
+async function restartForCragTelemetry({ projectRoot, vmPath, current, revision, enabled, timeoutMs, lifecycle, ops }) {
+  return withVmLock(vmPath, async () => {
+    const record = current()
+    const id = record.id
+    const changed = () => publicationRevision(current()) !== revision
+    const superseded = { ok: false, code: 'telemetry_publication_superseded', error: 'VM 配置已更改，未确认遥测应用' }
+    const busy = { ok: false, code: 'telemetry_slot_busy', error: '槽位仍有活动或正在维护，未重启 CRAG' }
+    if (changed()) return superseded
+    if (record.kernel_operation || record.schedule_hold || record.runtime?.stopped === true) return busy
+    const exec = slotExec(projectRoot, record)
+    return withSlotMaintenance({
+      projectRoot,
+      id,
+      ...lifecycle,
+      drainTimeoutMs: timeoutMs,
+      operation: async (tag) => {
+        const supersededOperation = () => changed() || current().schedule_hold?.detail?.tag !== tag
+        const verified = await verifyCragTelemetry(exec, enabled, timeoutMs)
+        if (supersededOperation()) return superseded
+        if (verified.code !== 'telemetry_restart_required') return verified
+        const observed = await rustKernelHealth(exec, { timeoutMs })
+        if (supersededOperation()) return superseded
+        if (
+          !supportsCragTelemetryApply(observed) ||
+          observed.ready === false ||
+          observed.recovering === true ||
+          !['active', 'waiting', 'queued'].every((key) => observed[key] === 0) ||
+          wrapHopInflight(exec) > 0
+        )
+          return busy
+        const configMismatch = {
+          ok: false,
+          code: 'crag_telemetry_kernel_mismatch',
+          error: '槽位启动配置不是 CRAG，未重启内核',
+        }
+        let kernelConfig
+        try {
+          kernelConfig = JSON.parse(fs.readFileSync(rustKernelPaths(exec).configPath, 'utf8'))
+        } catch {
+          return configMismatch
+        }
+        if (
+          kernelConfig?.vm_id !== id ||
+          kernelConfig.dataplane !== 'crag' ||
+          kernelConfig.runtime_variant !== 'crag-v2'
+        )
+          return configMismatch
+        const restarted = await (ops.restart || restartRustKernel)(exec)
+        if (!restarted?.ok) return { ok: false, code: 'telemetry_restart_failed', error: 'CRAG 重启未确认' }
+        if (supersededOperation()) return superseded
+        const applied = await verifyCragTelemetry(exec, enabled, timeoutMs)
+        if (supersededOperation()) return superseded
+        return { ...applied, restarted: true }
+      },
+    })
+  })
+}
+
 export async function applyNativeTelemetry({
   projectRoot,
   vm,
   routing = {},
   timeoutMs = 6000,
   replaceEnv = false,
+  lifecycle,
+  ops = {},
 } = {}) {
   const initial = { ok: false, wrote: false, published: false, applied: false, state: 'unknown' }
   if (!vm?.id || !projectRoot) return { ...initial, code: 'invalid_vm' }
@@ -75,7 +171,7 @@ export async function applyNativeTelemetry({
         }
       }
       const placement = publicationPlacement(record)
-      const retired = await retireLegacyTelemetry({ projectRoot, vm: record })
+      const retired = await (ops.retire || retireLegacyTelemetry)({ projectRoot, vm: record })
       if (!retired.ok) return { ...result, ...retired, published: false, applied: false }
       record = current()
       if (placement !== publicationPlacement(record)) {
@@ -86,6 +182,12 @@ export async function applyNativeTelemetry({
       // A node's effective settings are authoritative; never preserve an old controller mirror.
       const existing = await host.seedFiles(record, slotDir)
       const observedPlacement = publicationPlacement(record)
+      const exec = slotExec(projectRoot, record)
+      const selectedCrag = resolveKernelDataplane(record, routing) === 'crag'
+      const health = retired.running ? await rustKernelHealth(exec, { timeoutMs }) : null
+      const liveCrag = cragV2KernelActive({ health })
+      const crag = selectedCrag || liveCrag
+      const supportsApply = selectedCrag && supportsCragTelemetryApply(health)
       record = current()
       if (observedPlacement !== publicationPlacement(record)) {
         return { ...result, code: 'telemetry_publication_superseded', error: 'VM placement changed during publication' }
@@ -94,8 +196,44 @@ export async function applyNativeTelemetry({
       result.seed = writeSlotSeedFiles(projectRoot, record, null, {
         existingSettings: existing.files['settings.json'] === null ? {} : JSON.parse(existing.files['settings.json']),
         replaceEnv,
+        cragNativeTelemetry: supportsApply,
       })
       result.wrote = result.seed.wrote === true
+      if (crag) {
+        const publication = await host.syncSeed(record, slotDir)
+        if (publication?.published !== true)
+          return {
+            ...result,
+            code: 'telemetry_publish_failed',
+            error: 'VM configuration publication was not confirmed',
+          }
+        result.published = true
+        const superseded = {
+          ...result,
+          code: 'telemetry_publication_superseded',
+          error: 'VM 配置已更改，未确认遥测应用',
+        }
+        if (publicationRevision(current()) !== revision) return superseded
+        if (!retired.running) return { ...result, ok: true, action: 'published', state: 'stopped' }
+        if (!supportsApply)
+          return { ...result, code: 'crag_telemetry_apply_unavailable', error: '运行中的 CRAG 不支持遥测生效路由' }
+        const enabled = isTelemetryEnabled(record.seed_policy)
+        const verified = await verifyCragTelemetry(exec, enabled, timeoutMs)
+        if (publicationRevision(current()) !== revision) return superseded
+        if (verified.code !== 'telemetry_restart_required' || !lifecycle) return { ...result, ...verified }
+        const restarted = await restartForCragTelemetry({
+          projectRoot,
+          vmPath,
+          current,
+          revision,
+          enabled,
+          timeoutMs,
+          lifecycle,
+          ops,
+        })
+        if (publicationRevision(current()) !== revision) return superseded
+        return { ...result, ...restarted }
+      }
       const written = syncNativeTelemetry(record, projectRoot, routing, { publish: false })
       if (!written.supported || !written.wrote) return { ...result, code: written.error || 'telemetry_config_failed' }
       const geo = readVmProxyGeo(record)
@@ -205,6 +343,7 @@ export async function updateOneSlot(
     telemetryFn,
     telemetryEnabled,
     readyTimeoutMs = 15000,
+    telemetryLifecycle,
   } = {},
 ) {
   const id = vm.id
@@ -235,7 +374,7 @@ export async function updateOneSlot(
       const vmRef = getVm(projectRoot, id) || vm
       const changed = telemetryFn
         ? await telemetryFn({ projectRoot, vm: vmRef, telemetryEnabled: enabled, enabled })
-        : await applyNativeTelemetry({ projectRoot, vm: vmRef, routing })
+        : await applyNativeTelemetry({ projectRoot, vm: vmRef, routing, lifecycle: telemetryLifecycle })
       result.telemetry = changed
       if (changed?.skipped) {
         result.skipped = true
@@ -279,6 +418,7 @@ export async function runFleetUpdate(
     telemetryFn,
     telemetryEnabled,
     readyTimeoutMs,
+    telemetryLifecycle,
   } = {},
 ) {
   const nextAction = ACTIONS.has(action) ? action : 'roll'
@@ -294,6 +434,7 @@ export async function runFleetUpdate(
       telemetryFn,
       telemetryEnabled,
       readyTimeoutMs,
+      telemetryLifecycle,
     }),
   )
   const okCount = items.filter((row) => row.ok).length

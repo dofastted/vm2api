@@ -231,6 +231,33 @@ test('healthy sticky binding outranks weighted selection', async (t) => {
   selected.release()
 })
 
+test('direct VM selection compares priority before all forms of affinity', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const file = path.join(root, 'vms', 'vm-01.json')
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.policy.priority = 10
+  fs.writeFileSync(file, JSON.stringify(vm))
+  const pool = scheduler(root, {
+    stickyRouter: { resolve: () => ({ vmId: 'vm-02', accountId: 'account-2' }) },
+  })
+  const args = {
+    model: 'claude-test',
+    stickyKey: 'conversation-1',
+    deviceVmId: 'vm-02',
+    familyVmId: 'vm-02',
+    allowWait: false,
+  }
+  const selected = await pool.selectAndReserve(args)
+  assert.equal(selected.vmId, 'vm-01')
+  selected.release()
+  assert.equal((await pool.peekAccount(args)).vmId, 'vm-01')
+  const fallback = await pool.selectAndReserve({ ...args, excluded: new Set(['vm-01']) })
+  assert.equal(fallback.vmId, 'vm-02')
+  assert.equal(fallback.selectionReason, 'sticky')
+  fallback.release()
+})
+
 test('an exhausted kernel is excluded even when the conversation is pinned to it', async (t) => {
   const root = project()
   kernelFaults.set('vm-02', 'container recovery exhausted')
@@ -1874,6 +1901,41 @@ test('idle candidate is reserved before waiting when another account releases', 
   assert.equal(third.accountId, second.accountId)
   third.release()
   first.release()
+})
+
+test('a direct waiter takes the highest available priority even when the lower VM wakes it', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  for (const [id, priority] of [
+    ['vm-01', 10],
+    ['vm-02', 1],
+  ]) {
+    const file = path.join(root, 'vms', `${id}.json`)
+    const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+    Object.assign(vm.policy, { priority, maxConcurrency: 1 })
+    fs.writeFileSync(file, JSON.stringify(vm))
+  }
+  const pool = scheduler(root, {
+    stickyRouter: { resolve: () => ({ vmId: 'vm-02', accountId: 'account-2' }) },
+  })
+  applyShortWaits(pool, { sticky: 400, fallback: 400 })
+  const args = { model: 'claude-test' }
+  const high = await pool.selectAndReserve({ ...args, allowWait: false })
+  const low = await pool.selectAndReserve({ ...args, allowWait: false })
+  assert.equal(high.vmId, 'vm-01')
+  assert.equal(low.vmId, 'vm-02')
+  const pending = pool.selectAndReserve({ ...args, stickyKey: 'conversation-1' })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(pool.snapshot().waiters.total, 1)
+  const notify = pool.notifyCapacity.bind(pool)
+  pool.notifyCapacity = () => {}
+  low.release()
+  high.release()
+  pool.notifyCapacity = notify
+  notify(low.accountId)
+  const selected = await pending
+  assert.equal(selected.vmId, 'vm-01')
+  selected.release()
 })
 
 test('account concurrency is not clamped to ready_slots', async (t) => {

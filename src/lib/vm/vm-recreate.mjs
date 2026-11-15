@@ -15,7 +15,8 @@ import { applyUnschedulable, deriveScheduleFields, pickScheduleFields } from '..
 import { activeHoursOf } from '../pool/active-hours.mjs'
 import { isCodexVm, stampVmKind } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
-import { materializeResolvedKernel } from './wrap-cli-runtime.mjs'
+import { resolveKernelDataplane } from './slot-engine.mjs'
+import { materializeCragV2, materializeResolvedKernel } from './wrap-cli-runtime.mjs'
 import { listVms } from './vm-registry.mjs'
 import { slotHost } from './slot-host.mjs'
 import {
@@ -94,13 +95,17 @@ export function wipeSlotHome(projectRoot, id, { keepData = false } = {}) {
   invalidateVmSlotReadCache(projectRoot, id)
 }
 
-export function seedFreshCliHome(projectRoot, vm) {
+export function seedFreshCliHome(projectRoot, vm, { routing, preinstallCrag = false } = {}) {
   const written = writeSlotSeedFiles(projectRoot, vm)
   // A baked slot image carries its binaries; no .kin copy in the home.
   if (!slotHost(vm).bakedKernel) {
-    const required = vm?.dataplane === 'crag' || (isKvmRuntime(vm) && !isCodexVm(vm))
+    const selectedCrag = resolveKernelDataplane(vm, routing) === 'crag'
+    const required = selectedCrag || (isKvmRuntime(vm) && !isCodexVm(vm))
     try {
-      const laid = materializeResolvedKernel(projectRoot, vm)
+      const laid =
+        selectedCrag && preinstallCrag
+          ? materializeCragV2(projectRoot, vm, { select: false })
+          : materializeResolvedKernel(projectRoot, vm, { routing })
       if (laid?.ok === false && required) {
         throw Object.assign(new Error(laid.error || laid.code), { code: laid.code })
       }
