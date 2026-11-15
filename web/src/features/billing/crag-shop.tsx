@@ -1,11 +1,16 @@
 import { useEffect, useRef, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import {
+  useQuery,
+  useQueryClient,
+  type UseQueryResult,
+} from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { VIEW_TITLES } from '@/config/nav'
 import type { StatusTone } from '@/types/status'
 import { api, isApiError } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
+import { ConfirmDialog } from '@/components/confirm-dialog'
 import { PageHeader } from '@/components/page-header'
 import { StatusMark } from '@/components/status-mark'
 import { meQueryOptions } from '@/features/auth/queries'
@@ -13,21 +18,44 @@ import {
   cragHostStatusQueryOptions,
   type CragHostStatus,
 } from '@/features/vm/queries'
+import {
+  CragCommerce,
+  quoteProblem,
+  type CommerceRules,
+  type CommerceSelection,
+} from './crag-commerce'
 import { CragPlanPicker } from './crag-plan-picker'
 
 const root = '/api/panel/crag-shop'
 const catalogIntervalMs = 25_000
 const catalogTimeoutMs = 12_000
 const terms = { '1m': '月卡', '3m': '季卡', '1y': '年卡' }
+function termLabel(term: string | null, sku: string, months?: number) {
+  if (months != null)
+    return `${sku === 'renewal' ? '续费 · ' : ''}${months} 个月`
+  const duration =
+    term &&
+    (/^[1-9][0-9]*m$/.test(term)
+      ? `${term.slice(0, -1)} 个月`
+      : terms[term as keyof typeof terms])
+  if (sku === 'renewal') return duration ? `续费 · ${duration}` : '续费'
+  return (term && terms[term as keyof typeof terms]) || duration || sku
+}
 const methods = { wxpay: '微信支付', alipay: '支付宝' }
 type Method = keyof typeof methods
 type CragPlan = {
   sku: string
-  term: keyof typeof terms
+  term: string
   amount_minor: number
   slot_limit: number | 'unlimited'
+  remaining?: number
+  renewable?: boolean
 }
-type Catalog = { plans: CragPlan[]; payment_methods: Method[] }
+type Catalog = {
+  plans: CragPlan[]
+  payment_methods: Method[]
+  commerce?: CommerceRules
+}
 type CatalogState =
   | { status: 'loading' }
   | { status: 'ready'; data: Catalog }
@@ -35,6 +63,7 @@ type CatalogState =
 type Order = {
   sku: string
   term: CragPlan['term'] | null
+  months?: number
   amount_minor: CragPlan['amount_minor'] | null
   slot_limit: CragPlan['slot_limit'] | null
   order_id: string
@@ -45,7 +74,11 @@ type Order = {
 }
 type Checkout = Order & { url?: string; data?: Record<string, string> }
 type OrderPage = { orders: Order[]; next_offset: number | null }
-type Intent = { sku: string; payment_method: Method; request_id: string }
+type Intent = CommerceSelection & {
+  payment_method: Method
+  request_id: string
+  expected_amount_minor?: number
+}
 const money = new Intl.NumberFormat('zh-CN', {
   style: 'currency',
   currency: 'CNY',
@@ -87,8 +120,27 @@ function SubscriptionTime({ seconds }: { seconds: number }) {
   return <time dateTime={date.toISOString()}>{dateTime.format(date)}</time>
 }
 
-function HostOverview() {
-  const host = useQuery(cragHostStatusQueryOptions())
+function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
+  const [confirmUpgrade, setConfirmUpgrade] = useState(false)
+  const [upgrading, setUpgrading] = useState(false)
+  const [upgradeFailed, setUpgradeFailed] = useState(false)
+  async function upgrade() {
+    if (upgrading) return
+    setUpgrading(true)
+    setUpgradeFailed(false)
+    try {
+      await api('/api/panel/crag-subscription/upgrade', {
+        method: 'POST',
+        body: '{}',
+      })
+      setConfirmUpgrade(false)
+    } catch {
+      setUpgradeFailed(true)
+    } finally {
+      await host.refetch()
+      setUpgrading(false)
+    }
+  }
   const status = host.isError ? undefined : host.data
   const tone = status
     ? hostTones[status.state]
@@ -116,7 +168,13 @@ function HostOverview() {
           刷新本机订阅
         </Button>
       </div>
-      <dl className='grid grid-cols-2 gap-x-3 gap-y-2 border-y py-3 text-sm sm:grid-cols-3'>
+      {status?.sku ? (
+        <p className='text-sm text-muted-foreground'>
+          当前套餐：{status.sku === 'custom' ? '自定义' : status.sku}
+          {status.months != null ? ` · 每期 ${status.months} 个月` : ''}
+        </p>
+      ) : null}
+      <dl className='grid grid-cols-2 gap-x-3 gap-y-3 border-y py-3 text-sm sm:grid-cols-3'>
         <div>
           <dt className='text-xs text-muted-foreground'>到期时间</dt>
           <dd className='mt-1 font-medium tabular-nums'>
@@ -136,6 +194,21 @@ function HostOverview() {
           </dd>
         </div>
         <div>
+          <dt className='text-xs text-muted-foreground'>已占用 / 可用槽位</dt>
+          <dd className='mt-1 font-medium tabular-nums'>
+            {status?.used_slots ?? '—'} /{' '}
+            {status?.available_slots === null
+              ? '不限'
+              : (status?.available_slots ?? '—')}
+          </dd>
+        </div>
+        <div>
+          <dt className='text-xs text-muted-foreground'>本机已启用槽位</dt>
+          <dd className='mt-1 font-medium tabular-nums'>
+            {status?.enabled_slots ?? '—'}
+          </dd>
+        </div>
+        <div>
           <dt className='text-xs text-muted-foreground'>本机兑换条件</dt>
           <dd className='mt-1 font-medium'>
             {!status || status.state === 'unavailable'
@@ -148,6 +221,40 @@ function HostOverview() {
           </dd>
         </div>
       </dl>
+      {status?.upgrade_available && !status.reclaim_supported ? (
+        <Button
+          size='sm'
+          variant='outline'
+          disabled={upgrading}
+          onClick={() => setConfirmUpgrade(true)}
+        >
+          启用槽位回收
+        </Button>
+      ) : null}
+      {status?.reclaim_supported ? (
+        <p className='text-sm text-muted-foreground'>
+          删除槽位并同步成功后，其应用锁可重新分配。停止槽位不释放额度。
+        </p>
+      ) : null}
+      <ConfirmDialog
+        open={confirmUpgrade}
+        onOpenChange={(open) => {
+          if (!upgrading) {
+            setConfirmUpgrade(open)
+            setUpgradeFailed(false)
+          }
+        }}
+        title='启用本机槽位回收？'
+        confirmText='启用回收'
+        cancelBtnText='取消'
+        desc={
+          upgradeFailed
+            ? '未确认升级。请刷新本机订阅后检查状态。'
+            : '启用后，本机订阅仅支持具备槽位回收能力的新版内核；旧内核不会接受新版宿主权益。'
+        }
+        isLoading={upgrading}
+        handleConfirm={() => void upgrade()}
+      />
       <p className='text-sm text-muted-foreground'>
         {host.isError || status?.state === 'unavailable'
           ? '无法确认本机权益，请刷新后重试。'
@@ -211,23 +318,43 @@ export function CragShopLink() {
   )
 }
 
+function useHostStatus(enabled: boolean) {
+  return useQuery({
+    ...cragHostStatusQueryOptions(),
+    enabled,
+    refetchInterval: 10_000,
+  })
+}
+
 export function CragSubscriptionPage() {
   const me = useQuery(meQueryOptions())
   const isAdmin = me.data?.role === 'admin' && !me.isError
+  const host = useHostStatus(isAdmin)
   return (
     <PageHeader
       title={VIEW_TITLES['crag-subscription']}
       description='查看本人订单。付款后领取兑换码，联网兑换到目标宿主机。'
     >
       <div className='space-y-6'>
-        {isAdmin ? <HostOverview /> : null}
-        <ShopOrders isAdmin={isAdmin} />
+        {isAdmin ? <HostOverview host={host} /> : null}
+        <ShopOrders
+          isAdmin={isAdmin}
+          host={host.isError ? undefined : host.data}
+        />
       </div>
     </PageHeader>
   )
 }
 
-function ShopOrders({ isAdmin }: { isAdmin: boolean }) {
+function ShopOrders({
+  isAdmin,
+  host,
+}: {
+  isAdmin: boolean
+  host?: CragHostStatus
+}) {
+  const qc = useQueryClient()
+  const [applied, setApplied] = useState<string[]>([])
   const [catalog, setCatalog] = useState<CatalogState>({ status: 'loading' })
   const refreshCatalog = useRef<(() => void) | null>(null)
   const [orders, setOrders] = useState<Order[]>()
@@ -286,7 +413,9 @@ function ShopOrders({ isAdmin }: { isAdmin: boolean }) {
           setCatalog({ status: 'ready', data })
           if (data.plans.length) {
             // Keep the buyer's choice across refreshes, even while payment is closed.
-            setPlanSku((sku) => sku ?? data.plans[0].sku)
+            setPlanSku(
+              (sku) => sku ?? (data.commerce ? 'custom' : data.plans[0].sku)
+            )
           }
           if (data.payment_methods.length) {
             setMethod((channel) => channel ?? data.payment_methods[0])
@@ -383,7 +512,12 @@ function ShopOrders({ isAdmin }: { isAdmin: boolean }) {
       setProblem(
         isApiError(error) && error.status === 401
           ? '登录已过期，请重新登录后打开本人订单。'
-          : fallback
+          : isApiError(error) &&
+              /coupon|stock|sold_out|inventory|renew|price|amount|cap/.test(
+                error.code ?? ''
+              )
+            ? quoteProblem(error)
+            : fallback
       )
     } finally {
       operating.current = false
@@ -391,25 +525,39 @@ function ShopOrders({ isAdmin }: { isAdmin: boolean }) {
     }
   }
 
-  function start(input: Intent) {
-    void run(async () => {
-      intent.current = input
-      setCheckout(undefined)
-      const order = await api<Checkout>(`${root}/orders`, {
-        method: 'POST',
-        body: JSON.stringify(input),
-      })
-      if (order.status === 'pending' && order.url && order.data)
-        setCheckout(order)
-      else if (order.status === 'paid')
-        setNotice('已付款，发码中，请勿重复支付。')
-      else if (order.status === 'fulfilled')
-        setNotice('兑换码已就绪，请在原订单领取。')
-      else setNotice('当前无法打开收银台，请稍后从原订单重试。')
-      intent.current = null
-      refresh((n) => n + 1)
-      setOffset(0)
-    }, '未能确认下单结果。请重试同一订单，或先刷新本人订单。')
+  function start(input: Intent, resumeId?: string) {
+    void run(
+      async () => {
+        if (!resumeId) intent.current = input
+        setCheckout(undefined)
+        const order = await api<Checkout>(
+          resumeId
+            ? `${root}/orders/${encodeURIComponent(resumeId)}/resume`
+            : `${root}/orders`,
+          {
+            method: 'POST',
+            body: resumeId ? '{}' : JSON.stringify(input),
+          }
+        ).catch((error: unknown) => {
+          refresh((n) => n + 1)
+          refreshCatalog.current?.()
+          throw error
+        })
+        if (order.status === 'pending' && order.url && order.data)
+          setCheckout(order)
+        else if (order.status === 'paid')
+          setNotice('已付款，发码中，请勿重复支付。')
+        else if (order.status === 'fulfilled')
+          setNotice('兑换码已就绪，请在原订单领取。')
+        else setNotice('当前无法打开收银台，请稍后从原订单重试。')
+        intent.current = null
+        refresh((n) => n + 1)
+        setOffset(0)
+      },
+      input.expected_amount_minor == null
+        ? '未能确认下单结果。请重试同一订单，或先刷新本人订单。'
+        : '未能确认订单：价格、优惠或库存可能已变动。请重新核价；已创建的订单请在本人订单继续支付。'
+    )
   }
 
   function pay(order: Checkout) {
@@ -445,22 +593,33 @@ function ShopOrders({ isAdmin }: { isAdmin: boolean }) {
   }
 
   const plans = catalog.status === 'ready' ? catalog.data.plans : []
+  const commerce =
+    catalog.status === 'ready' ? catalog.data.commerce : undefined
+  const canRenew = !!(
+    isAdmin &&
+    host?.sku &&
+    (host.state === 'active' || host.state === 'expired') &&
+    (host.sku === 'custom'
+      ? commerce?.custom_renewable === true
+      : plans.some((plan) => plan.sku === host.sku && plan.renewable === true))
+  )
+  const commerceSku = planSku ?? 'custom'
   const channels =
     catalog.status === 'ready' ? catalog.data.payment_methods : []
   const selectedPlan = plans.find((plan) => plan.sku === planSku)
   const selectedMethod =
     method && channels.includes(method) ? method : undefined
-  const canOrder = plans.length > 0 && channels.length > 0
+  const canOrder = (plans.length > 0 || !!commerce) && channels.length > 0
   const catalogMessage =
     catalog.status === 'loading'
       ? '正在查询套餐…'
       : catalog.status === 'error'
         ? '暂时无法确认可售套餐，请刷新套餐重试。仍可查看本人订单。'
-        : !plans.length
+        : !plans.length && !commerce
           ? '暂无可购买的套餐，仍可查看本人订单。'
           : !channels.length
             ? '当前未开放收款。可以选择和比较套餐，暂不能创建订单。'
-            : !selectedPlan || !selectedMethod
+            : !commerce && (!selectedPlan || !selectedMethod)
               ? '套餐或付款方式已更新，请重新选择后再创建订单。'
               : ''
   return (
@@ -471,7 +630,7 @@ function ShopOrders({ isAdmin }: { isAdmin: boolean }) {
           className='flex flex-wrap items-center justify-between gap-2 rounded-md border bg-muted/40 p-3 text-sm'
         >
           <span>
-            {checkout.term ? terms[checkout.term] : checkout.sku} ·{' '}
+            {termLabel(checkout.term, checkout.sku, checkout.months)} ·{' '}
             {planTerms(checkout)}
           </span>
           <Button
@@ -538,7 +697,7 @@ function ShopOrders({ isAdmin }: { isAdmin: boolean }) {
                     <div className='min-w-0'>
                       <div className='flex flex-wrap items-center gap-2'>
                         <p className='font-semibold'>
-                          {order.term ? terms[order.term] : order.sku} ·{' '}
+                          {termLabel(order.term, order.sku, order.months)} ·{' '}
                           {planTerms(order)}
                         </p>
                         <StatusMark
@@ -554,7 +713,7 @@ function ShopOrders({ isAdmin }: { isAdmin: boolean }) {
                         订单号 {order.order_id}
                       </p>
                     </div>
-                    {order.status === 'fulfilled' ? (
+                    {order.status === 'fulfilled' && order.sku !== 'renewal' ? (
                       <Button
                         variant='outline'
                         size='sm'
@@ -591,11 +750,18 @@ function ShopOrders({ isAdmin }: { isAdmin: boolean }) {
                         }
                         onClick={() => {
                           if (order.request_id)
-                            start({
-                              sku: order.sku,
-                              payment_method: order.payment_method,
-                              request_id: order.request_id,
-                            })
+                            start(
+                              {
+                                sku: order.sku,
+                                payment_method: order.payment_method,
+                                request_id: order.request_id,
+                              },
+                              (commerce && order.status !== 'reserved') ||
+                                order.sku === 'custom' ||
+                                order.sku === 'renewal'
+                                ? order.order_id
+                                : undefined
+                            )
                         }}
                       >
                         继续支付
@@ -634,38 +800,79 @@ function ShopOrders({ isAdmin }: { isAdmin: boolean }) {
                   ) : null}
                   {order.status === 'fulfilled' ? (
                     <div className='space-y-2 border-t pt-3 text-sm'>
-                      <p className='font-medium'>怎样使用兑换码</p>
-                      <ol className='list-decimal space-y-1 ps-5 text-muted-foreground'>
-                        <li>
-                          点击「领取兑换码」，复制以 <code>CRAGR1.</code>{' '}
-                          开头的整串码。再次领取返回同一码。
-                        </li>
-                        <li>
-                          {isAdmin
-                            ? '在目标宿主机的面板中'
-                            : '请将码私下交给目标宿主机管理员，在该机面板中'}
-                          打开「虚拟机 → 目标槽位 → 运维 → 推理内核 → CRAG 授权
-                          / 续期 →
-                          宿主机订阅」。把码粘贴到「宿主机兑换码」，点击「兑换到本机」。
-                        </li>
-                        <li>
-                          兑换后，点击「给本槽绑定应用锁」。其他要用订阅的槽也需分别绑定。
-                        </li>
-                      </ol>
-                      <p className='text-xs text-muted-foreground'>
-                        每码仅能在一台宿主机兑换，不可转移。它不是调用 API 的
-                        Key，也不是旧授权注册码。
-                      </p>
-                      {isAdmin ? (
-                        <Button
-                          size='sm'
-                          variant='link'
-                          className='h-auto p-0'
-                          asChild
-                        >
-                          <Link to='/vm'>打开虚拟机列表</Link>
-                        </Button>
-                      ) : null}
+                      {order.sku === 'renewal' ? (
+                        isAdmin ? (
+                          <div className='space-y-2'>
+                            <p>
+                              此续费仅适用于下单时的宿主机。付款后需将续费应用到该宿主机；原有槽位绑定不变。
+                            </p>
+                            <Button
+                              size='sm'
+                              disabled={
+                                busy || applied.includes(order.order_id)
+                              }
+                              onClick={() =>
+                                void run(async () => {
+                                  const status = await api<CragHostStatus>(
+                                    `${root}/orders/${encodeURIComponent(order.order_id)}/apply-renewal`,
+                                    { method: 'POST', body: '{}' }
+                                  )
+                                  const { queryKey } =
+                                    cragHostStatusQueryOptions()
+                                  qc.setQueryData(queryKey, status)
+                                  await qc.invalidateQueries({ queryKey })
+                                  setApplied((prior) => [
+                                    ...prior,
+                                    order.order_id,
+                                  ])
+                                  setNotice('续费已应用到本机。')
+                                }, '暂未确认续费，请刷新本机订阅后重试同一笔订单。')
+                              }
+                            >
+                              {applied.includes(order.order_id)
+                                ? '已应用续费'
+                                : '应用续费到本机'}
+                            </Button>
+                          </div>
+                        ) : (
+                          <p>请由下单宿主机的管理员应用续费。</p>
+                        )
+                      ) : (
+                        <>
+                          <p className='font-medium'>怎样使用兑换码</p>
+                          <ol className='list-decimal space-y-1 ps-5 text-muted-foreground'>
+                            <li>
+                              点击「领取兑换码」，复制以 <code>CRAGR1.</code>{' '}
+                              开头的整串码。再次领取返回同一码。
+                            </li>
+                            <li>
+                              {isAdmin
+                                ? '在目标宿主机的面板中'
+                                : '请将码私下交给目标宿主机管理员，在该机面板中'}
+                              打开「虚拟机 → 目标槽位 → 运维 → 推理内核 → CRAG
+                              授权 / 续期 →
+                              宿主机订阅」。把码粘贴到「宿主机兑换码」，点击「兑换到本机」。
+                            </li>
+                            <li>
+                              兑换后，点击「给本槽绑定应用锁」。其他要用订阅的槽也需分别绑定。
+                            </li>
+                          </ol>
+                          <p className='text-xs text-muted-foreground'>
+                            每码仅能在一台宿主机兑换，不可转移。它不是调用 API
+                            的 Key，也不是旧授权注册码。
+                          </p>
+                          {isAdmin ? (
+                            <Button
+                              size='sm'
+                              variant='link'
+                              className='h-auto p-0'
+                              asChild
+                            >
+                              <Link to='/vm'>打开虚拟机列表</Link>
+                            </Button>
+                          ) : null}
+                        </>
+                      )}
                     </div>
                   ) : null}
                 </li>
@@ -716,11 +923,11 @@ function ShopOrders({ isAdmin }: { isAdmin: boolean }) {
           {catalog.status === 'loading' ? (
             <Skeleton aria-hidden='true' className='h-24 w-full' />
           ) : null}
-          {plans.length > 0 ? (
+          {plans.length > 0 && !commerce ? (
             <CragPlanPicker
               plans={plans.map((plan) => ({
                 sku: plan.sku,
-                term: terms[plan.term],
+                term: termLabel(plan.term, plan.sku),
                 ...formatPlanDetails(plan.amount_minor, plan.slot_limit),
               }))}
               selectedSku={selectedPlan?.sku}
@@ -748,29 +955,65 @@ function ShopOrders({ isAdmin }: { isAdmin: boolean }) {
                   ))}
                 </select>
               </label>
-              <Button
-                type='button'
-                disabled={busy || !selectedPlan || !selectedMethod}
-                onClick={() => {
-                  if (!selectedPlan || !selectedMethod) return
-                  const last = intent.current
-                  start(
-                    last?.sku === selectedPlan.sku &&
-                      last.payment_method === selectedMethod
-                      ? last
-                      : {
-                          sku: selectedPlan.sku,
-                          payment_method: selectedMethod,
-                          request_id: crypto.randomUUID(),
-                        }
-                  )
-                }}
-              >
-                创建订单
-              </Button>
+              {!commerce ? (
+                <Button
+                  type='button'
+                  disabled={busy || !selectedPlan || !selectedMethod}
+                  onClick={() => {
+                    if (!selectedPlan || !selectedMethod) return
+                    const last = intent.current
+                    start(
+                      last?.sku === selectedPlan.sku &&
+                        last.payment_method === selectedMethod
+                        ? last
+                        : {
+                            sku: selectedPlan.sku,
+                            payment_method: selectedMethod,
+                            request_id: crypto.randomUUID(),
+                          }
+                    )
+                  }}
+                >
+                  创建订单
+                </Button>
+              ) : null}
             </div>
           ) : null}
-          {plans.length > 0 && !canOrder ? (
+          {commerce ? (
+            <CragCommerce
+              rules={commerce}
+              plans={plans}
+              sku={commerceSku}
+              onSelect={setPlanSku}
+              allowRenewal={canRenew}
+              enabled={canOrder && !!selectedMethod}
+              busy={busy}
+              initialQuoteKey={revision}
+              onOrder={(selection, price) => {
+                if (!selectedMethod) return
+                const last = intent.current
+                const same =
+                  last &&
+                  last.sku === selection.sku &&
+                  last.slots === selection.slots &&
+                  last.months === selection.months &&
+                  last.coupon === selection.coupon &&
+                  last.payment_method === selectedMethod &&
+                  last.expected_amount_minor === price
+                start(
+                  same
+                    ? last
+                    : {
+                        ...selection,
+                        payment_method: selectedMethod,
+                        expected_amount_minor: price,
+                        request_id: crypto.randomUUID(),
+                      }
+                )
+              }}
+            />
+          ) : null}
+          {plans.length > 0 && !canOrder && !commerce ? (
             <Button type='button' disabled>
               暂不可下单
             </Button>

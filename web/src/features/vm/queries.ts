@@ -49,6 +49,13 @@ export type CragHostStatus = {
   state: 'unavailable' | 'unredeemed' | 'active' | 'expired' | 'sync_pending'
   slot_limit?: number | 'unlimited'
   expires_at?: number
+  sku?: string
+  months?: number
+  used_slots?: number
+  enabled_slots?: number
+  available_slots?: number | null
+  reclaim_supported?: boolean
+  upgrade_available?: boolean
 }
 
 export function cragHostStatusQueryOptions() {
