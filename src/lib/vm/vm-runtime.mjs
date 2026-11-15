@@ -190,6 +190,21 @@ export function containerName(vmId) {
   return `kin-${String(vmId || '').replace(/^vm-/, '')}`
 }
 
+/** Remove a stopped slot container so the next boot is created under a new id. */
+export function discardSlotContainer(vmId, { run = sh } = {}) {
+  const name = containerName(vmId)
+  const outcome = inspectContainerOutcome(name, { run })
+  if (outcome.status !== 'found') return { ok: true, removed: false }
+  if (outcome.container.running || outcome.container.restarting) {
+    return { ok: false, code: 'vm_running', error: '容器仍在运行，不能改编号' }
+  }
+  const removed = run(['docker', 'rm', name])
+  if (!removed.ok && !isDockerInspectNotFound(removed)) {
+    return { ok: false, code: 'container_remove_failed', error: removed.stderr || '移除旧容器失败' }
+  }
+  return { ok: true, removed: true }
+}
+
 export function officialCcUidGid(vmId) {
   const n = parseVmIndex(vmId) || 1
   return { uid: UID_BASE + n, gid: Number(process.env.KIN_VM_GID || GID) }

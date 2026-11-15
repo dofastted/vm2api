@@ -204,6 +204,7 @@ import { describeKernelCatalog, pullKernelRelease } from './kernel-catalog.mjs'
 import { installKernelTargets, releaseKernelInstallSafetyHold, validateKernelTargets } from '../vm/kernel-install.mjs'
 import { withSlotMaintenance } from '../vm/slot-maintenance.mjs'
 import { clearActiveVmFromDb, removeVmFromDb } from '../vm/vm-db-sync.mjs'
+import { renameVmId } from '../vm/vm-rename.mjs'
 import { normalizeCredentialMode } from '../oauth/credential-mode.mjs'
 import { reloadActiveVm } from '../core/config.mjs'
 import {
@@ -212,6 +213,7 @@ import {
   normalizeTimezone,
   nextNumericIndex,
   padVm,
+  discardSlotContainer,
   STANDARD_LOCALE,
 } from '../vm/vm-runtime.mjs'
 import {
@@ -3303,6 +3305,32 @@ export function createPanelHandler(ctx) {
         return await withVmLock(path.join(cfg.paths.project, 'vms', `${id}.json`), async () => {
           const currentVm = getVm(cfg.paths.project, id)
           if (!currentVm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const requestedId =
+            body && Object.prototype.hasOwnProperty.call(body, 'id') ? String(body.id ?? '').trim() : ''
+          if (requestedId && requestedId !== id) {
+            const renamed = renameVmId(cfg.paths.project, id, requestedId, {
+              discardContainer: discardSlotContainer,
+            })
+            if (!renamed.ok) {
+              return json(res, renamed.status || 400, {
+                ok: false,
+                error: { code: renamed.code || 'vm_rename_failed', message: renamed.message || '改编号失败' },
+              })
+            }
+            const detail = await panel.buildVmDetail({
+              cfg,
+              accountQuota,
+              id: renamed.id,
+              routingConfig: ctx.routingConfig,
+              poolScheduler: ctx.poolScheduler,
+              requestLog,
+              proxyPool,
+              kernelHealth: panelKernelHealth,
+              clusterNodes: clusterNodesOf(ctx),
+              role: panelIdentity(req).role,
+            })
+            return json(res, 200, detail)
+          }
           const strictInteger = (value, min, max, label, { nullable = false } = {}) => {
             if (nullable && value === null) return null
             if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value)) {

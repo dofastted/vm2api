@@ -100,3 +100,23 @@ test('PATCH name that looks like another slot does not change the id', async () 
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('PATCH id renames a stopped slot and keeps the display name', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-vm-name-'))
+  try {
+    seed(root, 'slot-src', { kernel: 'ubuntu-24.04' })
+    fs.mkdirSync(path.join(root, 'vms', 'slot-src'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'vms', 'slot-src', 'marker.txt'), 'kept')
+    const { handlePanel, response } = handler(root, { id: 'slot-dst' })
+    await handlePanel({ method: 'PATCH' }, {}, new URL('http://localhost/api/panel/vms/slot-src'))
+    assert.equal(response.status, 200, JSON.stringify(response.body).slice(0, 800))
+    assert.equal(fs.existsSync(path.join(root, 'vms', 'slot-src.json')), false)
+    const saved = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'slot-dst.json'), 'utf8'))
+    assert.equal(saved.id, 'slot-dst')
+    assert.equal(saved.name, '01')
+    assert.equal(fs.readFileSync(path.join(root, 'vms', 'slot-dst', 'marker.txt'), 'utf8'), 'kept')
+    assert.equal(response.body?.data?.vm?.id, 'slot-dst')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
