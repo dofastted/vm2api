@@ -4,7 +4,7 @@
  * The slot joins the bound SOCKS5's transparent network; the worker
  * dials origin directly. Missing bound proxy refuses start.
  */
-import { execFileSync } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -121,18 +121,19 @@ export function timezoneForIndex(i) {
  * hosts that cached an older tag. Unreachable registry falls back to the local image,
  * then to the in-repo Dockerfile.
  */
-export function ensureSlotImage(kernel, { run = sh, projectRoot, runtime } = {}) {
+export async function ensureSlotImage(kernel, { run = shAsync, projectRoot, runtime } = {}) {
   const kvm = runtime === 'kvm' || runtime === RUNTIME_KVM
   const image = kvm ? kvmImageForKernel(kernel) : imageForKernel(kernel)
-  if (run(['docker', 'pull', image], { timeout: 300_000 }).ok) return { ok: true, action: 'pulled', image }
-  if (run(['docker', 'image', 'inspect', image], { timeout: 10_000 }).ok) return { ok: true, action: 'present', image }
+  if ((await run(['docker', 'pull', image], { timeout: 300_000 })).ok) return { ok: true, action: 'pulled', image }
+  if ((await run(['docker', 'image', 'inspect', image], { timeout: 10_000 })).ok)
+    return { ok: true, action: 'present', image }
   if (kvm) {
     const dir = path.join(projectRoot || MODULE_ROOT, KVM_BUILD_DIR)
     if (!fs.existsSync(path.join(dir, 'Dockerfile'))) {
       return { ok: false, error: `guest image ${image} not available and no build context at ${dir}` }
     }
     const cloud = (OS_CATALOG[kernel] || OS_CATALOG['ubuntu-24.04']).kvm?.cloud_image || ''
-    const built = run(['docker', 'build', '-t', image, '--build-arg', `CLOUD_IMAGE_URL=${cloud}`, dir], {
+    const built = await run(['docker', 'build', '-t', image, '--build-arg', `CLOUD_IMAGE_URL=${cloud}`, dir], {
       timeout: 900_000,
     })
     if (!built.ok) return { ok: false, error: built.stderr || `docker build ${image} failed` }
@@ -142,7 +143,7 @@ export function ensureSlotImage(kernel, { run = sh, projectRoot, runtime } = {})
   if (!fs.existsSync(path.join(dir, 'Dockerfile'))) {
     return { ok: false, error: `guest image ${image} not available and no build context at ${dir}` }
   }
-  const built = run(['docker', 'build', '-t', image, dir], { timeout: 900_000 })
+  const built = await run(['docker', 'build', '-t', image, dir], { timeout: 900_000 })
   if (!built.ok) return { ok: false, error: built.stderr || `docker build ${image} failed` }
   return { ok: true, action: 'built', image }
 }
@@ -166,6 +167,28 @@ export function nextNumericIndex(vms) {
   let n = 1
   while (used.has(n)) n++
   return n
+}
+
+function shAsync(argv, opts = {}) {
+  return new Promise((resolve) => {
+    execFile(
+      argv[0],
+      argv.slice(1),
+      {
+        encoding: 'utf8',
+        timeout: opts.timeout ?? 90_000,
+        maxBuffer: 1024 * 1024,
+      },
+      (error, stdout, stderr) => {
+        resolve({
+          ok: !error,
+          stdout: String(stdout || '').trim(),
+          stderr: String(stderr || error?.message || '').trim(),
+          ...(error ? { code: error.code } : {}),
+        })
+      },
+    )
+  })
 }
 
 function sh(argv, opts = {}) {
@@ -1282,7 +1305,7 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
   if (!kvm && !computer?.mac) return { ok: false, error: 'computer MAC missing' }
   host = computer.hostname
 
-  const img = ensureSlotImage(kernel, { projectRoot, runtime: runtimeKind(vm) })
+  const img = await ensureSlotImage(kernel, { projectRoot, runtime: runtimeKind(vm) })
   if (!img.ok) return img
 
   try {
