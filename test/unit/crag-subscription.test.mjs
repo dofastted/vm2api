@@ -7,7 +7,12 @@ import test from 'node:test'
 import { createCragSubscription } from '../../src/lib/vm/crag-subscription.mjs'
 import { checkCragLicense } from '../../src/lib/vm/crag-license.mjs'
 import { cragSubscriptionPublicDirectory } from '../../src/lib/vm/crag-subscription-paths.mjs'
-import { issueHostEntitlement, issueSlotPermit, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
+import {
+  issueHostEntitlement,
+  issueSlotPermit,
+  seedEncryptedPackage,
+  signSubscriptionBytes,
+} from '../fixtures/crag-license.mjs'
 import { createCragSubscriptionHandler, cragSubscriptionRoute } from '../../src/lib/admin/crag-subscription-routes.mjs'
 
 const voucher = () => `CRAGR1.${crypto.randomBytes(32).toString('base64url')}`
@@ -35,7 +40,9 @@ test('a lost renewal response suspends real control admission until restart repl
     createCragSubscription({
       projectRoot: root,
       machineIdFile: source,
-      listTargets: () => slots,
+      listTargets: () => [...slots, { id: 'vm-non-crag' }],
+      isSubscriptionSlot: (vm) => vm.dataplane === 'crag',
+      isSlotEnabled: (vm) => checkCragLicense(root, vm).license?.scope === 'host' && checkCragLicense(root, vm).ok,
       assertReady: () => true,
       fetchImpl: async (url, opts) => {
         const body = JSON.parse(opts.body)
@@ -63,29 +70,121 @@ test('a lost renewal response suspends real control admission until restart repl
             },
           })
         }
+        if (url.endsWith('/status')) {
+          const { code, claims } = current
+          return Response.json({
+            ok: true,
+            data: {
+              entitlement: code,
+              revision: claims.revision,
+              expires_at: claims.expires_at,
+              slot_limit: claims.slot_limit,
+            },
+          })
+        }
         const seat = ++seats
         const { code } = issueSlotPermit(root, body.machine_code, body.host_id, { seat })
         return Response.json({ ok: true, data: { entitlement: current.code, slot_permit: code, seat } })
       },
     })
   const service = connect()
-  assert.deepEqual(await service.status(), { ready: true, state: 'unredeemed' })
+  assert.deepEqual(await service.status(), { ready: true, state: 'unredeemed', total_slots: 2, enabled_slots: 0 })
   await service.redeem(voucher())
   assert.deepEqual(await service.bind(slots[0]), { seat: 1 })
   assert.deepEqual(await service.bind(slots[1]), { seat: 2 })
   assert.equal(checkCragLicense(root, slots[1]).ok, true)
+  assert.equal((await service.status()).enabled_slots, 2)
   const renewal = voucher()
   lose = true
   await assert.rejects(service.redeem(renewal), { code: 'crag_subscription_authority_unavailable' })
   assert.equal((await service.status()).state, 'sync_pending')
+  assert.equal((await service.status()).enabled_slots, 0)
   assert.equal(checkCragLicense(root, slots[0]).ok, false)
   assert.equal(checkCragLicense(root, slots[1]).ok, false)
   const recovered = connect()
   await recovered.recover()
   assert.equal((await recovered.status()).revision, 2)
+  assert.equal((await recovered.status()).enabled_slots, 1)
   assert.equal(issued.size, 2)
   assert.equal(checkCragLicense(root, slots[0]).ok, true)
   assert.equal(checkCragLicense(root, slots[1]).ok, false)
+})
+
+test('H2 release requires confirmed teardown and recovers an interrupted cloud response', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-roster-contract-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const source = path.join(root, 'machine-id')
+  fs.writeFileSync(source, crypto.randomBytes(16).toString('hex'), { mode: 0o600 })
+  const publicDir = cragSubscriptionPublicDirectory(root)
+  fs.mkdirSync(path.dirname(path.dirname(publicDir)), { recursive: true })
+  seedEncryptedPackage(root)
+  const slots = ['vm-41', 'vm-42'].map((id) => ({ id, dataplane: 'crag', crag_kernel_version: 'v2' }))
+  for (const vm of slots) {
+    const dir = path.join(root, 'vms', vm.id)
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'machine-id'), crypto.randomBytes(16).toString('hex'))
+  }
+  let rights,
+    permitDigest,
+    releases = 0,
+    revision = 0,
+    version = 1
+  let roster = []
+  const connect = () =>
+    createCragSubscription({
+      projectRoot: root,
+      machineIdFile: source,
+      listTargets: () => slots,
+      assertReady: () => true,
+      fetchImpl: async (url, init) => {
+        const action = url.split('/').at(-1)
+        const { host_id, machine_code, permit_sha256, vm_id } = JSON.parse(init.body)
+        let extra = {}
+        if (action === 'upgrade') version = 2
+        if (action === 'bind') {
+          const { code } = issueSlotPermit(root, machine_code, host_id, { seat: 1 })
+          permitDigest = crypto.createHash('sha256').update(code).digest('hex')
+          roster = [{ seat: 1, permit_sha256: permitDigest }]
+          extra = { seat: 1, slot_permit: code }
+        }
+        if (action === 'release') {
+          assert.equal(vm_id, slots[0].id)
+          assert.equal(permit_sha256, permitDigest)
+          if (++releases === 1) roster = []
+        }
+        if (action !== 'status' && (action !== 'release' || releases === 1)) {
+          const base = issueHostEntitlement(root, host_id, { revision: ++revision, slot_limit: 1 })
+          const entitlement =
+            version === 1
+              ? base.code
+              : signSubscriptionBytes(root, 'CRAGH2', JSON.stringify({ ...base.claims, version, roster }))
+          rights = { entitlement, revision, slot_limit: 1, expires_at: base.claims.expires_at }
+        }
+        if (action === 'release' && releases === 1) throw Error('reply lost')
+        return Response.json({ ok: true, data: { ...rights, ...extra } })
+      },
+    })
+  const service = connect()
+  await service.redeem(voucher())
+  await service.upgrade()
+  await service.bind(slots[0])
+  assert.equal(checkCragLicense(root, slots[0]).ok, true)
+  await assert.rejects(
+    service.teardown(slots[0], async () => ({ ok: true })),
+    { code: 'crag_subscription_teardown_unconfirmed' },
+  )
+  assert.equal(releases, 0)
+  await assert.rejects(
+    service.teardown(slots[0], async () => ({ ok: true, teardownConfirmed: true })),
+    { code: 'crag_subscription_authority_unavailable' },
+  )
+  assert.equal(checkCragLicense(root, slots[0]).ok, false)
+  const recovered = connect()
+  await recovered.recover()
+  assert.equal((await recovered.status()).available_slots, 1)
+  await recovered.bind(slots[1])
+  assert.equal(checkCragLicense(root, slots[0]).ok, false)
+  assert.equal(checkCragLicense(root, slots[1]).ok, true)
 })
 
 test('only an authenticated same-origin admin session can redeem without revealing a failed voucher', async () => {

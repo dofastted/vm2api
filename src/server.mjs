@@ -89,8 +89,11 @@ import { ClusterError } from './lib/cluster/ssh-link.mjs'
 import { nodeEgressProxyUrl, startNodeEgressSocks } from './lib/cluster/node-egress-socks.mjs'
 import { createSlotShell } from './lib/vm/slot-shell.mjs'
 import { vmLockBusy } from './lib/vm/vm-file.mjs'
+import { isKvmRuntime } from './lib/vm/runtime-kind.mjs'
+import { resolveCragKernelVersion, resolveKernelDataplane } from './lib/vm/slot-engine.mjs'
 import {
   assertCragSubscriptionTarget,
+  isCragSubscriptionSlotEnabled,
   refreshSlotGuestBinDir,
   syncLocalSlotRestartPolicies,
 } from './lib/vm/vm-runtime.mjs'
@@ -114,7 +117,7 @@ import { createResponsesWsHandler } from './lib/protocol/responses-ws.mjs'
 import { handleUserUsage } from './lib/protocol/user-count-tokens.mjs'
 import { createKeySelfHandler, KEY_SELF_PATHS } from './lib/protocol/key-self.mjs'
 import { createPanelHandler } from './lib/admin/panel-routes.mjs'
-import { isCragShopPath, sessionBuyerOwner } from './lib/admin/crag-shop.mjs'
+import { createCragShopHandler, isCragShopPath, sessionBuyerOwner } from './lib/admin/crag-shop.mjs'
 
 const FEATURES = [
   'passthrough',
@@ -976,13 +979,52 @@ cliNodeGuard = createCliNodeGuard({
 
 const cragSubscription = createCragSubscription({
   projectRoot: cfg.paths.project,
-  listTargets: () => listVms(cfg.paths.project),
-  assertReady: (vm) => assertCragSubscriptionTarget(cfg.paths.project, vm, routingConfig),
+  listTargets: () =>
+    listVms(cfg.paths.project)
+      .map(({ id }) => getVm(cfg.paths.project, id))
+      .filter(Boolean),
+  getTarget: (id) => getVm(cfg.paths.project, id),
+  isSubscriptionSlot: (vm) =>
+    !vm.node_id &&
+    !isCodexVm(vm) &&
+    !isKvmRuntime(vm) &&
+    resolveKernelDataplane(vm, routingConfig) === 'crag' &&
+    resolveCragKernelVersion(vm, routingConfig) === 'v2',
+  assertReady: (vm, opts) => assertCragSubscriptionTarget(cfg.paths.project, vm, routingConfig, opts),
+  isSlotEnabled: (vm, opts) => isCragSubscriptionSlotEnabled(cfg.paths.project, vm, routingConfig, opts),
+})
+
+function isCragShopAdmin(owner) {
+  if (owner?.startsWith('panel:')) {
+    const record = panelUsers.getById(owner.slice('panel:'.length))
+    return !!record?.enabled && record.role === 'admin'
+  }
+  const configured = getPanelAdmin()
+  return (
+    !!configured.password &&
+    owner === `configured-admin:${configured.username}` &&
+    !panelUsers.getByUsername(configured.username)
+  )
+}
+
+const cragShopActivationEnabled =
+  process.env.KIN_CRS_MOCK !== '1' && process.env.VM2API_CRAG_SHOP_AUTO_ACTIVATION !== '0'
+const handleCragShop = createCragShopHandler({
+  getDb,
+  dataDir: cfg.paths.data,
+  publicBaseUrl: cfg.base_url,
+  json,
+  readRawBody,
+  subscription: cragSubscription,
+  isCurrentAdmin: (req) => isCragShopAdmin(req.panelBuyerOwner),
+  isActivationAdmin: isCragShopAdmin,
+  activationEnabled: cragShopActivationEnabled,
 })
 
 const handlePanel = createPanelHandler({
   getDb,
   cragSubscription,
+  handleCragShop,
   json,
   writeSSEHeaders,
   readBody,
@@ -1365,6 +1407,15 @@ server.listen(cfg.port, cfg.host, () => {
     void cragSubscription.recover().catch(() => {
       console.warn('[crag-subscription] startup recovery failed; use the administrator panel to retry')
     })
+  }
+  if (cragShopActivationEnabled) {
+    const poll = () =>
+      void handleCragShop.pollActivation().catch(() => {
+        console.warn('[crag-shop] activation polling deferred')
+      })
+    const timer = setInterval(poll, 2_000).unref()
+    server.once('close', () => clearInterval(timer))
+    poll()
   }
   // Installation intent is durable; reconnecting nodes must not depend on a lost HTTP callback.
   if (process.env.KIN_CRS_MOCK !== '1') {
