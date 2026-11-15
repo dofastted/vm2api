@@ -6,8 +6,11 @@ import { Input } from '@/components/ui/input'
 export type CommerceRules = {
   unit_amount_minor: number
   max_amount_minor: number
+  min_months?: number
   max_months: number
+  min_slots?: number
   max_slots: number
+  custom_enabled?: boolean
   custom_renewable?: boolean
 }
 
@@ -16,8 +19,12 @@ type Plan = {
   term: string
   slot_limit: number | 'unlimited'
   amount_minor: number
-  remaining?: number
+  remaining?: number | null
   renewable?: boolean
+  enabled?: boolean
+  name?: string
+  description?: string
+  months?: number
 }
 
 export type CommerceSelection = {
@@ -44,10 +51,12 @@ const currency = new Intl.NumberFormat('zh-CN', {
 })
 const yuan = (minor: number) => currency.format(minor / 100)
 
-function count(value: string, max: number) {
+function count(value: string, min: number, max: number) {
   if (!/^\d+$/.test(value)) return null
-  const n = Number(value)
-  return Number.isSafeInteger(n) && n >= 1 && n <= max ? n : null
+  const quantity = Number(value)
+  return Number.isSafeInteger(quantity) && quantity >= min && quantity <= max
+    ? quantity
+    : null
 }
 
 export function quoteProblem(error: unknown) {
@@ -72,6 +81,8 @@ export function CragCommerce({
   enabled,
   busy,
   initialQuoteKey,
+  catalogKey,
+  customTitle,
   onOrder,
 }: {
   rules: CommerceRules
@@ -82,11 +93,13 @@ export function CragCommerce({
   enabled: boolean
   busy: boolean
   initialQuoteKey: number
+  catalogKey?: string
+  customTitle?: string
   onOrder: (selection: CommerceSelection, price: number) => void
 }) {
   const id = useId()
-  const [slots, setSlots] = useState('1')
-  const [months, setMonths] = useState('1')
+  const [slots, setSlots] = useState(String(rules.min_slots ?? 1))
+  const [months, setMonths] = useState(String(rules.min_months ?? 1))
   const [coupon, setCoupon] = useState('')
   const [appliedCoupon, setAppliedCoupon] = useState('')
   const [refresh, setRefresh] = useState(0)
@@ -95,14 +108,15 @@ export function CragCommerce({
     quote?: Quote
     error?: string
   }>()
-  const slotsCount = count(slots, rules.max_slots)
-  const monthsCount = count(months, rules.max_months)
-  const plan = plans.find((p) => p.sku === sku)
+  const customEnabled = rules.custom_enabled !== false
+  const slotsCount = count(slots, rules.min_slots ?? 1, rules.max_slots)
+  const monthsCount = count(months, rules.min_months ?? 1, rules.max_months)
+  const plan = plans.find((plan) => plan.sku === sku && plan.enabled !== false)
   const authorizedRenewal = sku === 'renewal' && allowRenewal
   const available =
     authorizedRenewal ||
     (sku === 'custom'
-      ? slotsCount !== null && monthsCount !== null
+      ? customEnabled && slotsCount !== null && monthsCount !== null
       : !!plan && plan.remaining !== 0)
   const needsApply = coupon.trim() !== appliedCoupon
   const body = JSON.stringify({
@@ -114,15 +128,15 @@ export function CragCommerce({
     body,
     refresh,
     initialQuoteKey,
-    plan?.amount_minor,
-    plan?.remaining,
-    rules.unit_amount_minor,
-    rules.max_amount_minor,
+    catalogKey,
+    plan,
+    rules,
   ])
-  const current = result?.key === key && !needsApply ? result : undefined
+  const current =
+    result?.key === key && !needsApply && available ? result : undefined
   const canQuote = enabled && available && !needsApply
   const estimate =
-    sku === 'custom' && slotsCount && monthsCount
+    sku === 'custom' && customEnabled && slotsCount && monthsCount
       ? slotsCount * monthsCount * rules.unit_amount_minor
       : plan?.amount_minor
 
@@ -165,64 +179,82 @@ export function CragCommerce({
     }
   }, [body, canQuote, key, rules.max_amount_minor, sku])
 
-  const selectionUnavailable = !available && sku !== 'custom'
+  const selectionUnavailable =
+    !available && (sku !== 'custom' || !customEnabled)
 
   return (
     <div className='space-y-4'>
       <p className='text-sm text-muted-foreground'>
-        标准价 {yuan(rules.unit_amount_minor)} / 槽位 / 月（$6
-        参考，人民币结算）。优惠后单笔不超过 {yuan(rules.max_amount_minor)}。
+        标准价 {yuan(rules.unit_amount_minor)} / 槽位 / 月，人民币结算。
+        优惠后单笔不超过 {yuan(rules.max_amount_minor)}，实付以供应方报价为准。
       </p>
       <fieldset className='grid gap-2' disabled={busy}>
         <legend className='mb-2 text-sm font-medium'>购买方式</legend>
-        <label className='flex cursor-pointer items-center gap-2 rounded-md border p-3 text-sm has-checked:border-primary'>
-          <input
-            type='radio'
-            name={id}
-            className='accent-primary'
-            checked={sku === 'custom'}
-            onChange={() => onSelect('custom')}
-          />{' '}
-          自定义槽位和时长
-        </label>
-        {plans.map((p) => (
-          <label
-            key={p.sku}
-            className='flex items-center gap-2 rounded-md border p-3 text-sm has-checked:border-primary has-enabled:cursor-pointer'
-          >
+        {customEnabled ? (
+          <label className='flex cursor-pointer items-center gap-2 rounded-md border p-3 text-sm has-checked:border-primary'>
             <input
               type='radio'
               name={id}
               className='accent-primary'
-              checked={sku === p.sku}
-              disabled={p.remaining === 0}
-              onChange={() => onSelect(p.sku)}
-            />
-            <span className='min-w-0 flex-1'>
-              <span className='block font-medium'>
-                {p.slot_limit === 'unlimited'
-                  ? '不限槽位'
-                  : `${p.slot_limit} 槽位`}{' '}
-                / {p.term === '1y' ? '12' : p.term.replace(/m$/, '')} 个月
-              </span>
-              <span className='block text-xs text-muted-foreground'>
-                {p.remaining === 0
-                  ? '首批售罄'
-                  : p.remaining != null
-                    ? `首批剩余 ${p.remaining} 份`
-                    : '订阅套餐'}
-                {p.renewable === true
-                  ? ' · 可续费'
-                  : p.renewable === false
-                    ? ' · 不可续费'
-                    : ''}
-              </span>
-            </span>
-            <span className='shrink-0 font-semibold tabular-nums'>
-              {yuan(p.amount_minor)}
-            </span>
+              checked={sku === 'custom'}
+              onChange={() => onSelect('custom')}
+            />{' '}
+            {customTitle ?? '自定义槽位和时长'}
           </label>
-        ))}
+        ) : null}
+        {plans
+          .filter((plan) => plan.enabled !== false)
+          .map((plan) => (
+            <label
+              key={plan.sku}
+              className='flex items-center gap-2 rounded-md border p-3 text-sm has-checked:border-primary has-enabled:cursor-pointer'
+            >
+              <input
+                type='radio'
+                name={id}
+                className='accent-primary'
+                checked={sku === plan.sku}
+                disabled={plan.remaining === 0}
+                onChange={() => onSelect(plan.sku)}
+              />
+              <span className='min-w-0 flex-1'>
+                <span className='block font-medium'>
+                  {plan.name ? (
+                    <span className='block'>{plan.name}</span>
+                  ) : null}
+                  {plan.slot_limit === 'unlimited'
+                    ? '不限槽位'
+                    : `${plan.slot_limit} 槽位`}{' '}
+                  /{' '}
+                  {plan.months ??
+                    (plan.term === '1y'
+                      ? '12'
+                      : plan.term.replace(/m$/, ''))}{' '}
+                  个月
+                </span>
+                {plan.description ? (
+                  <span className='block whitespace-pre-line text-muted-foreground'>
+                    {plan.description}
+                  </span>
+                ) : null}
+                <span className='block text-xs text-muted-foreground'>
+                  {plan.remaining === 0
+                    ? '首批售罄'
+                    : plan.remaining != null
+                      ? `首批剩余 ${plan.remaining} 份`
+                      : '订阅套餐'}
+                  {plan.renewable === true
+                    ? ' · 可续费'
+                    : plan.renewable === false
+                      ? ' · 不可续费'
+                      : ''}
+                </span>
+              </span>
+              <span className='shrink-0 font-semibold tabular-nums'>
+                {yuan(plan.amount_minor)}
+              </span>
+            </label>
+          ))}
         {allowRenewal ? (
           <label className='flex cursor-pointer items-center gap-2 rounded-md border p-3 text-sm has-checked:border-primary'>
             <input
@@ -236,7 +268,7 @@ export function CragCommerce({
           </label>
         ) : null}
       </fieldset>
-      {sku === 'custom' ? (
+      {sku === 'custom' && customEnabled ? (
         <div className='grid grid-cols-2 gap-3'>
           <label className='grid gap-1.5 text-sm'>
             槽位数
@@ -258,8 +290,8 @@ export function CragCommerce({
           </label>
           {!available ? (
             <p className='col-span-2 text-sm text-destructive'>
-              槽位与月份必须为正整数，分别最多 {rules.max_slots} 和{' '}
-              {rules.max_months}。
+              槽位数须为 {rules.min_slots ?? 1}–{rules.max_slots} 的整数，
+              月份须为 {rules.min_months ?? 1}–{rules.max_months} 的整数。
             </p>
           ) : null}
         </div>
@@ -346,7 +378,7 @@ export function CragCommerce({
         type='button'
         disabled={!canQuote || !current?.quote || busy}
         onClick={() => {
-          if (!current?.quote) return
+          if (!canQuote || busy || !current?.quote) return
           const selection: CommerceSelection = {
             sku,
             ...(sku === 'custom' && slotsCount !== null && monthsCount !== null

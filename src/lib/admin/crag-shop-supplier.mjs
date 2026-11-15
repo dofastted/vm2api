@@ -3,6 +3,8 @@ import { open } from 'node:fs/promises'
 
 const ROOT = 'https://crag.fkcodex.com'
 const MAX_RESPONSE = 64 * 1024
+// Catalog descriptions can use the full published 128-plan limit with UTF-8 copy.
+const MAX_PLANS_RESPONSE = 384 * 1024
 const SHOP_TIMEOUT = 8000
 const PILOT_TOKEN_LENGTH = 43 // Unpadded base64url for 32 bytes.
 
@@ -165,14 +167,14 @@ function checkout(value, order, receipt) {
   return { url: value.url, data: Object.fromEntries(FORM_KEYS.map((key) => [key, fields[key]])) }
 }
 
-async function readReply(res) {
+async function readReply(res, maxBytes = MAX_RESPONSE) {
   if (!res.body || !/^application\/json(?:\s*;|$)/i.test(res.headers.get('content-type') || '')) throw invalidReply()
-  if (Number(res.headers.get('content-length')) > MAX_RESPONSE) throw invalidReply()
+  if (Number(res.headers.get('content-length')) > maxBytes) throw invalidReply()
   const chunks = []
   let bytes = 0
   for await (const chunk of res.body) {
     bytes += chunk.byteLength
-    if (bytes > MAX_RESPONSE) throw invalidReply()
+    if (bytes > maxBytes) throw invalidReply()
     chunks.push(chunk)
   }
   try {
@@ -253,7 +255,9 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
       if (
         pilotFile !== undefined &&
         ((operation === 'plans' && method === 'GET' && path === '/shop/plans') ||
-          (operation === 'create' && method === 'POST' && path === '/shop/orders'))
+          (operation === 'quote' && method === 'POST' && path === '/shop/quote') ||
+          (operation === 'create' && method === 'POST' && path === '/shop/orders') ||
+          (operation === 'resume' && method === 'POST' && /^\/shop\/orders\/[0-9a-f-]{36}\/resume$/.test(path)))
       ) {
         pilotToken = await readPilotToken(pilotFile)
         headers['X-Crag-Shop-Pilot'] = pilotToken
@@ -274,7 +278,7 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
         }
         throw supplierError(response.status, operation)
       }
-      const value = await readReply(response)
+      const value = await readReply(response, operation === 'plans' ? MAX_PLANS_RESPONSE : MAX_RESPONSE)
       // Never surface an accidentally reflected pilot token in buyer data or payment forms.
       for (const secret of [pilotToken, body?.renewal_proof]) {
         if (secret && JSON.stringify(value).includes(JSON.stringify(secret).slice(1, -1))) throw invalidReply()
@@ -298,7 +302,27 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
         !value.payment_methods.every(isPaymentMethod)
       )
         throw invalidReply()
-      const plans = value.plans.map(publicPlan)
+      const plans = value.plans.map((value) => {
+        const plan = publicPlan(value)
+        for (const key of ['name', 'description']) {
+          if (value[key] === undefined) continue
+          if (typeof value[key] !== 'string') throw invalidReply()
+          plan[key] = value[key]
+        }
+        if (value.enabled !== undefined) {
+          if (typeof value.enabled !== 'boolean') throw invalidReply()
+          plan.enabled = value.enabled
+        }
+        if (value.stock !== undefined) {
+          if (!Number.isSafeInteger(value.stock) || value.stock < 0) throw invalidReply()
+          plan.stock = value.stock
+        }
+        if (value.months !== undefined) {
+          if (!isQuantity(value.months)) throw invalidReply()
+          plan.months = value.months
+        }
+        return plan
+      })
       if (new Set(plans.map(({ sku }) => sku)).size !== plans.length) throw invalidReply()
       const result = { plans, payment_methods: [...new Set(value.payment_methods)] }
       if (value.commerce !== undefined) {
@@ -310,14 +334,52 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
           commerce.unit_amount_minor > commerce.max_amount_minor ||
           !isQuantity(commerce.max_months) ||
           !isQuantity(commerce.max_slots) ||
+          !isQuantity(commerce.min_months ?? 1) ||
+          !isQuantity(commerce.min_slots ?? 1) ||
+          commerce.min_months === null ||
+          commerce.min_slots === null ||
+          (commerce.min_months ?? 1) > commerce.max_months ||
+          (commerce.min_slots ?? 1) > commerce.max_slots ||
+          (commerce.custom_enabled !== undefined && typeof commerce.custom_enabled !== 'boolean') ||
           (commerce.custom_renewable !== undefined && typeof commerce.custom_renewable !== 'boolean')
         )
           throw invalidReply()
         result.commerce = Object.fromEntries(
-          ['unit_amount_minor', 'max_amount_minor', 'max_months', 'max_slots', 'custom_renewable']
+          [
+            'unit_amount_minor',
+            'max_amount_minor',
+            'min_months',
+            'max_months',
+            'min_slots',
+            'max_slots',
+            'custom_enabled',
+            'custom_renewable',
+          ]
             .filter((key) => commerce[key] !== undefined)
             .map((key) => [key, commerce[key]]),
         )
+      }
+      if (value.revision !== undefined) {
+        if (!Number.isSafeInteger(value.revision) || value.revision < 0) throw invalidReply()
+        result.revision = value.revision
+      }
+      if (value.presentation !== undefined) {
+        if (!object(value.presentation)) throw invalidReply()
+        result.presentation = {}
+        for (const key of [
+          'title',
+          'description',
+          'plans_title',
+          'orders_title',
+          'custom_title',
+          'unavailable_text',
+          'empty_plans_text',
+          'empty_orders_text',
+        ]) {
+          if (value.presentation[key] === undefined) continue
+          if (typeof value.presentation[key] !== 'string') throw invalidReply()
+          result.presentation[key] = value.presentation[key]
+        }
       }
       return result
     },

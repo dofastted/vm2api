@@ -174,7 +174,7 @@ test('supplier transport bounds, gateway pairing and response projection', async
   await assert.rejects(supplier.create(row, PROOF), { code: 'shop_invalid_reply' })
 })
 
-test('private pilot credential is sent only for plans and order creation and fails closed', {
+test('pilot credential authorizes checkout operations but is never sent with receipt-only status and claim', {
   skip: process.platform === 'win32',
 }, async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-shop-pilot-'))
@@ -189,6 +189,8 @@ test('private pilot credential is sent only for plans and order creation and fai
   const supplier = createShopSupplier(async (url, init) => {
     requests.push({ url, ...init, headers: new Headers(init.headers) })
     if (url === `${SHOP}/shop/plans`) return Response.json(plansReply)
+    if (url === `${SHOP}/shop/quote`)
+      return Response.json({ ...PLAN, months: 3, subtotal_minor: PLAN.amount_minor, discount_minor: 0 })
     return Response.json(order(id))
   })
   const checkRequests = (expected) => {
@@ -220,6 +222,12 @@ test('private pilot credential is sent only for plans and order creation and fai
   assert.deepEqual(await supplier.plans(), catalog)
   await supplier.create(row, PROOF)
   checkRequests([planRequest(token), createRequest(token)])
+  await supplier.quote({ sku: row.sku })
+  await supplier.resume(row, PROOF)
+  checkRequests([
+    ['POST', `${SHOP}/shop/quote`, token, null, JSON.stringify({ sku: row.sku })],
+    ['POST', `${SHOP}/shop/orders/${id}/resume`, token, `Bearer ${PROOF}`, undefined],
+  ])
   await checkReceiptOnlyRequests()
 
   plansReply = { ...catalog, plans: [{ ...PLAN, sku: token }] }
