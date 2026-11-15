@@ -29,7 +29,7 @@ const licenseMessages: Record<string, string> = {
   license_redeem_conflict:
     '此兑换码已绑定另一台设备或另一版内核。请回到原槽并使用原内核版本。',
   license_redeem_target_changed:
-    '目标槽、授权或内核载荷不匹配。请核对本槽安装的版本，再用原码重试。',
+    '激活期间目标槽、设备或授权发生变化，未覆盖现有授权。请联系管理员核对本次签发。',
   license_redeem_subscription:
     '本槽已使用宿主订阅许可。请在「宿主订阅」管理续期或占槽。',
   license_redeem_service:
@@ -37,7 +37,7 @@ const licenseMessages: Record<string, string> = {
   license_redeem_origin: '请在当前面板页提交兑换，不要从其他站点发起。',
   redeem_unavailable: '兑换码无效、已过期或不可用，请核对原码。',
   host_redeem_conflict: '兑换码不属于本机或已在其他宿主机使用。',
-  issuer_mismatch: '当前内核的发行方与订阅授权服务不匹配，本次未兑换。',
+  issuer_mismatch: '授权服务不认可目标内核的发行方，本次未兑换。',
   payload_key_unknown: '授权服务未配置当前内核载荷，本次未兑换。',
   payload_key_conflict: '本槽已有绑定对应不同的内核载荷。',
   slot_limit_reached: '宿主机应用锁额度已用完，本槽未绑定。',
