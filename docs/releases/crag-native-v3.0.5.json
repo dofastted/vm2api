@@ -2,22 +2,22 @@
   "schema": 1,
   "component": "crag-native",
   "version": "3.0.5",
-  "source_repository": "dofastted/claude-code",
-  "source_commit": "fa188934caed0ca0f8f4d6db7db77e94afd755d1",
-  "source_kernel_tree": "a920a560a621fa8c8d433acb0834a119280fcac0",
+  "source_repository": "dofastted/crag",
+  "source_commit": "08006f24216fe3fc1da23dcd1e6c2425c7657b1d",
+  "source_kernel_tree": "523a8ce7dc4675a78f3cfcac4f076eda8a7cb995",
   "functional_baseline": "253112b6",
   "supplier_repository": "dofastted/crag",
   "supplier_release": "v3.0.5",
   "supplier_release_commit": "15d5ae63b9ea8019c4d5a7204c5557c11a19b11e",
   "payload_release": "payload-2026.11.15-crag-3.0.5",
   "baseline_payload_release": "payload-2026.11.15-crag-3.0.4",
-  "core_sha256": "933a1cc7b1c7d52d639cedfa91f22c31c45ea413bb9e47963c9311f523a7442c",
-  "manifest_sha256": "3677550ac1a2f24ee44e52a004b2092a7ed36e22c2d0e41e38c326e304f4dd34",
+  "core_sha256": "8d1681f287376b11535225010f9e157dd5d3f30f538bff195393b3c936f23a08",
+  "manifest_sha256": "ec9b706591e9e147059e1be5f689f6ae59ee1e630f97fef07169f53133fba917",
   "archive": {
     "path": "dist/crag-v2-licensed-amd64.tar.gz",
     "asset": "crag-v2-licensed-amd64.tar.gz",
-    "size": 167961689,
-    "sha256": "547347000e8597a05bb3917a966b4f4c5bfcc5a9cc0a408565ffccc6077d35f0"
+    "size": 168090914,
+    "sha256": "428b07b65586480473b3f5ebf1fe0a6c3c1444d1a45c611faad40737d22b818a"
   },
   "build_environment": {
     "mode": "container",
@@ -28,6 +28,11 @@
     "sha256": "426c33815ca6645a772f722fbff10dbf2cbdb124a8aeab733c1365dbf8bbf61f"
   },
   "non_crag_payload_pins_unchanged": true,
+  "authorization_migration": {
+    "offline_activation": "Only the configured CRAGK1 master key is accepted through the CRAG CLI. Legacy CRAGU1 codes cannot activate or start this build.",
+    "payload_key_rotated": true,
+    "online_authorizations": "CRAGL1 device licenses and CRAGS1 slot leases for the previous payload key must be reissued through the authority before reinstalling. Publishing the payload does not migrate the authority."
+  },
   "capabilities_added": [
     "native_advisor_20260301"
   ]
