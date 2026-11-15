@@ -3,6 +3,7 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { slotHost } from '../vm/slot-host.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
+import { resolveSlotClaude } from '../vm/slot-engine.mjs'
 import { slotExec, startSlotReady } from '../vm/slot-runtime.mjs'
 import { getVm, patchVmRecord } from '../vm/vm-registry.mjs'
 import { hasBoundExit } from '../vm/egress.mjs'
@@ -145,6 +146,22 @@ export async function runGuestOAuthAuthService(
   }
   await record('start')
   try {
+    const selected = resolveSlotClaude(exec.vm, routing, host)
+    let claudeVersion
+    if (selected.native) {
+      const version = await runDocker(
+        slotExecArgv(exec.vm, [selected.bin, '--version'], { user: host.execUser(exec.vm) }),
+        {
+          env: host.dockerEnv(),
+          timeoutMs: Math.min(timeoutMs, 5000),
+        },
+      )
+      if (version.code === 0) {
+        claudeVersion = /^([0-9]+\.[0-9]+\.[0-9]+)(?:\s|$)/.exec(String(version.stdout || '').trim())?.[1]
+      }
+      if (!claudeVersion)
+        throw fail('oauth_cli_version_unavailable', 'Cannot read the selected native Claude CLI version')
+    }
     // Linux slots join a kin-eg-* transparent network. A proxy URL may be a
     // controller-local forwarder and is not reachable from inside the guest.
     const result = await runDocker(argv, {
@@ -154,6 +171,7 @@ export async function runGuestOAuthAuthService(
         JSON.stringify({
           ...payload,
           proxy_url: '',
+          claude_version: claudeVersion,
         }) + '\n',
     })
     if (result?.timed_out) throw fail('oauth_auth_timeout', 'Target VM OAuth helper timed out')
