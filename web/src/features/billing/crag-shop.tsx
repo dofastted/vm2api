@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import {
+  useMutation,
   useQuery,
   useQueryClient,
   type UseQueryResult,
@@ -7,7 +8,8 @@ import {
 import { Link } from '@tanstack/react-router'
 import { VIEW_TITLES } from '@/config/nav'
 import type { StatusTone } from '@/types/status'
-import { api, isApiError } from '@/lib/api'
+import { activateVmCragLicense, api, isApiError } from '@/lib/api'
+import { isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -21,9 +23,11 @@ import { ConfirmDialog } from '@/components/confirm-dialog'
 import { PageHeader } from '@/components/page-header'
 import { StatusMark } from '@/components/status-mark'
 import { meQueryOptions } from '@/features/auth/queries'
-import { CragHostSubscription } from '@/features/vm/crag-host-subscription'
+import { CragActivationForm } from '@/features/vm/crag-license-editor'
 import {
   cragHostStatusQueryOptions,
+  vmCragLicenseQueryOptions,
+  vmsListQueryOptions,
   type CragHostStatus,
 } from '@/features/vm/queries'
 import {
@@ -385,14 +389,6 @@ function planTerms(plan: Pick<Order, 'amount_minor' | 'slot_limit'>) {
   return `${price} · ${locks}`
 }
 
-export function CragShopLink() {
-  return (
-    <Button variant='outline' size='sm' asChild>
-      <Link to='/crag-subscription'>{VIEW_TITLES['crag-subscription']}</Link>
-    </Button>
-  )
-}
-
 function useHostStatus(enabled: boolean) {
   return useQuery({
     ...cragHostStatusQueryOptions(),
@@ -414,6 +410,93 @@ export function CragSubscriptionPage() {
       host={host.isError ? undefined : host.data}
       overview={isAdmin ? <HostOverview host={host} /> : null}
     />
+  )
+}
+
+function ManualCragActivation({
+  initialCode,
+  onClose,
+}: {
+  initialCode: string
+  onClose: () => void
+}) {
+  const qc = useQueryClient()
+  const vms = useQuery(vmsListQueryOptions())
+  const targets = (vms.data?.items ?? []).filter(
+    (vm) => !isCodexVm(vm) && vm.node_platform !== 'darwin'
+  )
+  const [code, setCode] = useState(initialCode)
+  const [targetId, setTargetId] = useState('')
+  const [active, setActive] = useState(false)
+  const activation = useMutation({
+    mutationFn: () => activateVmCragLicense(targetId, code.trim()),
+    onSuccess: async (data) => {
+      qc.setQueryData(vmCragLicenseQueryOptions(targetId).queryKey, data)
+      setCode('')
+      setActive(data.license.valid)
+      await qc.invalidateQueries({
+        queryKey: cragHostStatusQueryOptions().queryKey,
+      })
+    },
+  })
+  return (
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open && !activation.isPending) onClose()
+      }}
+    >
+      <DialogContent className='max-h-[90dvh] overflow-y-auto'>
+        <DialogHeader>
+          <DialogTitle>手动激活 CRAG</DialogTitle>
+          <DialogDescription>
+            选择目标槽位，粘贴激活码。激活不会安装或启动内核。
+          </DialogDescription>
+        </DialogHeader>
+        <label className='grid gap-1 text-sm'>
+          目标槽位
+          <select
+            className='h-9 w-full rounded-md border bg-background px-2 focus-visible:ring-ring focus-visible:outline-2 focus-visible:outline-offset-2'
+            value={targetId}
+            disabled={activation.isPending}
+            onChange={(event) => {
+              setTargetId(event.target.value)
+              setActive(false)
+              activation.reset()
+            }}
+          >
+            <option value=''>请选择槽位</option>
+            {targets.map((vm) => (
+              <option key={vm.id} value={vm.id}>
+                {vm.name ? `${vm.name} (${vm.id})` : vm.id}
+              </option>
+            ))}
+          </select>
+        </label>
+        {vms.isError ? (
+          <p role='alert' className='text-sm text-destructive'>
+            无法读取槽位，请关闭后重试。
+          </p>
+        ) : null}
+        <CragActivationForm
+          code={code}
+          disabled={vms.isError || !targets.some((vm) => vm.id === targetId)}
+          activating={activation.isPending}
+          error={activation.error}
+          onChange={(value) => {
+            setCode(value)
+            setActive(false)
+            activation.reset()
+          }}
+          onActivate={() => activation.mutate()}
+        />
+        {active ? (
+          <p role='status' className='text-sm'>
+            槽位 {targetId} 已激活。
+          </p>
+        ) : null}
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -455,7 +538,6 @@ function ShopOrders({
   const operating = useRef(false)
   const [targetVmId, setTargetVmId] = useState('')
   const [manualCode, setManualCode] = useState<string>()
-  const [manualVmId, setManualVmId] = useState('')
   const targets = useQuery({
     queryKey: ['panel', 'crag-shop', 'activation-targets', owner],
     queryFn: ({ signal }) =>
@@ -918,55 +1000,10 @@ function ShopOrders({
           ) : null}
         </section>
         {isAdmin && manualCode !== undefined ? (
-          <Dialog
-            open
-            onOpenChange={(open) => {
-              if (!open) {
-                setManualCode(undefined)
-                setManualVmId('')
-              }
-            }}
-          >
-            <DialogContent className='max-h-[90dvh] overflow-y-auto'>
-              <DialogHeader>
-                <DialogTitle>手动激活 CRAG 订阅</DialogTitle>
-                <DialogDescription>
-                  先将兑换码兑换到本机，再给目标槽位绑定应用锁。
-                </DialogDescription>
-              </DialogHeader>
-              <label className='grid gap-1 text-sm'>
-                目标槽位（可选）
-                <select
-                  className='h-9 w-full rounded-md border bg-background px-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring'
-                  value={
-                    eligibleTargets.some(
-                      (target) => target.vm_id === manualVmId
-                    )
-                      ? manualVmId
-                      : ''
-                  }
-                  onChange={(event) => setManualVmId(event.target.value)}
-                >
-                  <option value=''>仅兑换到本机，稍后绑定</option>
-                  {eligibleTargets.map((target) => (
-                    <option key={target.vm_id} value={target.vm_id}>
-                      {target.vm_id}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <CragHostSubscription
-                initialCode={manualCode}
-                vmId={
-                  eligibleTargets.find((target) => target.vm_id === manualVmId)
-                    ?.vm_id
-                }
-              />
-              <Link to='/vm' className='text-sm underline underline-offset-4'>
-                在虚拟机页面管理槽位授权
-              </Link>
-            </DialogContent>
-          </Dialog>
+          <ManualCragActivation
+            initialCode={manualCode}
+            onClose={() => setManualCode(undefined)}
+          />
         ) : null}
         {overview}
         {problem ? (
@@ -1375,7 +1412,7 @@ function ShopOrders({
                                   : '请将码私下交给目标宿主机管理员，在该机面板的「订阅 CRAG → 购买后激活」中手动兑换。'}
                               </li>
                               <li>
-                                兑换后，点击「给本槽绑定应用锁」。其他要用订阅的槽也需分别绑定。
+                                激活后会自动给目标槽绑定应用锁。其他槽可在各自的授权页使用已有订阅绑定。
                               </li>
                             </ol>
                             <p className='text-xs text-muted-foreground'>

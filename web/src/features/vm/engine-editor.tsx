@@ -34,6 +34,7 @@ import {
 } from '@/features/vm/engine-contract'
 import { isRemoteVm, REMOTE_UNSUPPORTED_TEXT } from '@/features/vm/placement'
 import {
+  cragHostStatusQueryOptions,
   vmCragLicenseQueryOptions,
   vmKernelSwitchQueryOptions,
   vmQueryOptions,
@@ -297,6 +298,9 @@ function SlotKernelSwitch({
       toast.success('CRAG 授权已激活')
       if (switchAfterActivation && (!onV2 || canRetry)) setPending('v2')
       await Promise.all([
+        qc.invalidateQueries({
+          queryKey: cragHostStatusQueryOptions().queryKey,
+        }),
         qc.invalidateQueries({ queryKey: vmQueryOptions(id).queryKey }),
         qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
       ])

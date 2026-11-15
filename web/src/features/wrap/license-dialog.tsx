@@ -10,7 +10,10 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { CragLicenseEditor } from '@/features/vm/crag-license-editor'
-import { vmCragLicenseQueryOptions } from '@/features/vm/queries'
+import {
+  cragHostStatusQueryOptions,
+  vmCragLicenseQueryOptions,
+} from '@/features/vm/queries'
 import { kernelCatalogQueryOptions } from './queries'
 
 export function KernelLicenseDialog({
@@ -29,9 +32,14 @@ export function KernelLicenseDialog({
     onSuccess: async (data) => {
       setRegistrationCode('')
       qc.setQueryData(vmCragLicenseQueryOptions(vm.id).queryKey, data)
-      await qc.invalidateQueries({
-        queryKey: kernelCatalogQueryOptions().queryKey,
-      })
+      await Promise.all([
+        qc.invalidateQueries({
+          queryKey: kernelCatalogQueryOptions().queryKey,
+        }),
+        qc.invalidateQueries({
+          queryKey: cragHostStatusQueryOptions().queryKey,
+        }),
+      ])
       toast.success(
         data.license.valid ? 'CRAG 授权已激活' : '授权未生效，请检查状态'
       )
@@ -57,7 +65,7 @@ export function KernelLicenseDialog({
       >
         <DialogTitle>{vm.name || vm.id}</DialogTitle>
         <DialogDescription className='sr-only'>
-          联网兑换码可直接在本槽兑换并激活。离线通用码适用于兼容槽位。激活不会安装或启动内核。
+          粘贴激活码，系统自动识别授权类型。激活不会安装或启动内核。
         </DialogDescription>
         <CragLicenseEditor
           vmId={vm.id}

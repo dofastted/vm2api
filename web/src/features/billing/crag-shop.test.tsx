@@ -45,6 +45,7 @@ vi.mock('react', async (importOriginal) => ({
 }))
 vi.mock('@tanstack/react-query', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@tanstack/react-query')>()),
+  useMutation: () => ({ mutate: vi.fn(), reset: vi.fn() }),
   useQueryClient: () => ({ setQueryData: vi.fn(), invalidateQueries: vi.fn() }),
   useQuery: (options: { queryKey: readonly unknown[] }) => {
     if (options.queryKey.includes('me'))
@@ -100,11 +101,6 @@ vi.mock('@/components/ui/dialog', () => {
     DialogTitle: Children,
   }
 })
-vi.mock('@/features/vm/crag-host-subscription', () => ({
-  CragHostSubscription: ({ initialCode }: { initialCode: string }) => (
-    <output aria-label='宿主机兑换码'>{initialCode}</output>
-  ),
-}))
 vi.mock('@/components/ui/button', () => ({
   Button: (props: ButtonHTMLAttributes<HTMLButtonElement>) => {
     state.buttons.push(props)
@@ -214,7 +210,10 @@ describe('CRAG buyer presentation and activation wire', () => {
     )
     expect(html).toContain('自动激活到 vm-a')
     click('手动激活')
-    expect(render()).toContain('手动激活 CRAG 订阅')
+    const dialog = render()
+    expect(dialog).toContain('手动激活 CRAG')
+    expect(dialog.match(/<textarea\b/g)).toHaveLength(1)
+    expect(dialog).not.toContain('宿主机兑换码')
     expect(api).not.toHaveBeenCalled()
   })
 
@@ -224,12 +223,13 @@ describe('CRAG buyer presentation and activation wire', () => {
     state.values[16] = { order_id: order.order_id, redemption_code: code }
     render()
     click('使用此码激活')
-    expect(render()).toContain(`<output aria-label="宿主机兑换码">${code}`)
+    state.values.length = 19
+    expect(render()).toMatch(new RegExp(`<textarea[^>]*>${code}</textarea>`))
     expect(api).not.toHaveBeenCalled()
     state.role = 'user'
     const buyer = render()
     expect(buyer).toContain('href="#crag-order-history"')
-    expect(buyer).not.toContain('手动激活 CRAG 订阅')
+    expect(buyer).not.toContain('手动激活 CRAG')
     expect(buyer).not.toContain('使用此码激活')
     expect(buyer).not.toContain('自动激活（新订单）')
   })
@@ -275,7 +275,7 @@ describe('CRAG buyer presentation and activation wire', () => {
     expect(history).toContain('¥6')
     expect(history).not.toContain('9,999')
     expect(history).toContain('领取兑换码')
-    expect(history).toContain('给本槽绑定应用锁')
+    expect(history).toContain('自动给目标槽绑定应用锁')
   })
 
   it('uses commerce for fixed plans when custom is disabled and keeps renewal metadata independent', () => {
