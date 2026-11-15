@@ -16,10 +16,10 @@
     "sha256": "9ea3a73c38ad72ef15c702990131ca8aa4907616f8bfbb349c537c0c7e5845c6"
   },
   "legacy": {
-    "payload_release": "payload-2026.11.15-crag-3.0.5-legacy",
+    "payload_release": "payload-2026.11.15-crag-3.0.6-legacy",
     "asset": "crag-v2-licensed-amd64.tar.gz",
-    "size": 167961689,
-    "sha256": "547347000e8597a05bb3917a966b4f4c5bfcc5a9cc0a408565ffccc6077d35f0"
+    "size": 167962811,
+    "sha256": "ca21ae8863ba94c7e99226d369ab7ee92056a5c04a07d16aa0a551828b41a785"
   },
   "build_environment": {
     "mode": "container",
@@ -32,6 +32,6 @@
   "non_crag_payload_pins_unchanged": true,
   "authorization_migration": {
     "payload_key_rotated": false,
-    "offline_activation": "The default package retains the CRAGK1 policy from the rotated 3.0.5 package. Unexpired CRAGU1 authorizations require the unchanged legacy package."
+    "offline_activation": "The default package retains the CRAGK1 policy from the rotated 3.0.5 package. Use the separately built legacy package for unexpired CRAGU1 authorizations."
   }
 }
