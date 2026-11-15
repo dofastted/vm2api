@@ -107,6 +107,18 @@ function readInternalToken(exec) {
   }
 }
 
+class InferencePostDenied extends Error {
+  constructor(result) {
+    super('inference admission denied')
+    this.result = result
+  }
+}
+
+async function checkInferencePost(beforeInferencePost) {
+  const rejection = await beforeInferencePost()
+  if (rejection) throw new InferencePostDenied(rejection)
+}
+
 async function workerRequest(
   exec,
   {
@@ -120,6 +132,7 @@ async function workerRequest(
     maxRequestBytes = 0,
     inference = false,
     onRequestStarted,
+    beforeInferencePost,
     requireInternalToken = false,
   } = {},
 ) {
@@ -134,6 +147,8 @@ async function workerRequest(
       : inference
         ? await inferenceCodec.encode(body, { signal })
         : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body))
+  // Non-managed inference may serialize on an async codec. Authorize after it, before opening HTTP.
+  if (beforeInferencePost && !signal?.aborted) await checkInferencePost(beforeInferencePost)
   if (signal?.aborted) throw Object.assign(new Error('The operation was aborted'), { code: 'ABORT_ERR' })
   return new Promise((resolve, reject) => {
     // Include the headers, session metadata and request_id added around the caller's body.
@@ -215,7 +230,7 @@ function nativeCragRequest(exec, cragPrint) {
   )
 }
 
-function inferenceRequest(
+async function inferenceRequest(
   exec,
   {
     envelope,
@@ -230,12 +245,16 @@ function inferenceRequest(
     idleTimeoutMs,
     routing,
     requestPath,
+    beforeInferencePost,
     ...options
   },
 ) {
   const headers = stream ? { te: 'trailers' } : {}
   const body = { ...envelope, request_id: requestId }
   const authenticatedPolicy = managedCrag && requestPath === '/internal/v1/messages'
+  // Managed CRAG serializes synchronously. Check first so the worker receives only the remaining queue budget.
+  if (authenticatedPolicy && beforeInferencePost && !options.signal?.aborted)
+    await checkInferencePost(beforeInferencePost)
   if (authenticatedPolicy) {
     body.stream = stream
     body.delivery_mode = deliveryMode === 'verified' ? 'verified' : 'realtime'
@@ -260,6 +279,7 @@ function inferenceRequest(
   }
   return workerRequest(exec, {
     ...options,
+    beforeInferencePost: authenticatedPolicy ? undefined : beforeInferencePost,
     requestPath,
     // Do not let async codec queue time be added back to the worker's budget.
     inference: options.inference && !authenticatedPolicy,
@@ -806,6 +826,7 @@ export async function callGoWorker({
   onEnvelope = null,
   redactionPrincipal = '',
   redactionSession = '',
+  beforeInferencePost,
 } = {}) {
   if (isCrsMock()) {
     const { body: outboundBody, headers } = finalizeWorkerPayload({
@@ -821,6 +842,8 @@ export async function callGoWorker({
       repaired,
     })
     reportEnvelope(onEnvelope, { body: outboundBody, headers })
+    const rejection = await beforeInferencePost?.()
+    if (rejection) return rejection
     writeCrsTrace({ body: outboundBody, headers, stream: false })
     const mock = mockCrsPayload({ scenario: mockScenario(exec) })
     return {
@@ -893,6 +916,7 @@ export async function callGoWorker({
       requestId,
       maxRequestBytes,
       inference: true,
+      beforeInferencePost,
       onRequestStarted: () => {
         nativeHandoff = useNativeHandoff
         stopCancel = cancelOnAbort(exec, signal, requestId)
@@ -942,6 +966,7 @@ export async function callGoWorker({
     if (blocked) return { ...blocked, ...nativeMetadata() }
     if (error.code === 'invalid_kernel_request') return { ...invalidKernelResult(error), ...nativeMetadata() }
     if (signal?.aborted) return clientCancelledResult({ via: 'go-worker', ...nativeMetadata() })
+    if (error instanceof InferencePostDenied) return error.result
     return {
       ok: false,
       status:
@@ -1007,6 +1032,7 @@ export async function streamGoWorker({
   onOutboundHeaders = null,
   redactionPrincipal = '',
   redactionSession = '',
+  beforeInferencePost,
 } = {}) {
   if (isCrsMock()) {
     const { body: outboundBody, headers } = finalizeWorkerPayload({
@@ -1022,6 +1048,8 @@ export async function streamGoWorker({
       repaired,
     })
     reportEnvelope(onEnvelope, { body: outboundBody, headers })
+    const rejection = await beforeInferencePost?.()
+    if (rejection) return rejection
     writeCrsTrace({ body: outboundBody, headers, stream: true })
     const scenario = mockScenario(exec)
     const mockStartedAt = Date.now()
@@ -1154,6 +1182,7 @@ export async function streamGoWorker({
       requestId,
       maxRequestBytes,
       inference: true,
+      beforeInferencePost,
       onRequestStarted: () => {
         nativeHandoff = useNativeHandoff
         stopCancel = cancelOnAbort(exec, signal, requestId)
@@ -1459,6 +1488,7 @@ export async function streamGoWorker({
         ...nativeMetadata(),
       })
     }
+    if (error instanceof InferencePostDenied) return error.result
     return {
       ok: false,
       status:
@@ -1496,7 +1526,7 @@ export async function streamGoWorker({
   }
 }
 
-export async function workerHealth(exec, { timeoutMs = 3000, signal } = {}) {
+export async function workerHealth(exec, { timeoutMs = 3000, signal, requireInternalToken = false } = {}) {
   if (isCrsMock()) {
     const claude = exec?.vm?.claude || {}
     const hasCredential = hasCredentialPresence(claude)
@@ -1519,9 +1549,33 @@ export async function workerHealth(exec, { timeoutMs = 3000, signal } = {}) {
       requestPath: '/internal/health',
       timeoutMs,
       signal,
+      requireInternalToken,
     })
     const body = parseJson(await readAll(response, 1024 * 1024))
-    return { ok: response.statusCode === 200 && body?.ok === true, status: response.statusCode || 0, ...body }
+    const status = response.statusCode || 0
+    const ok = status === 200 && body?.ok === true
+    const health = { ok, status, ...body }
+    // Transport metadata is client-owned, never supplied by the response body.
+    delete health.internalTokenAuthenticated
+    if (requireInternalToken) {
+      health.ok = ok
+      health.status = status
+      // CRAG v3.0.8 includes effective_config only on token-authenticated internal health.
+      const effectiveConfig = body?.effective_config
+      const crag =
+        health.runtime_variant === 'crag-v2' ||
+        (health.runtime_variant == null && health.dataplane === 'crag' && health.kernel_version === 'v2')
+      if (
+        (ok || status === 503) &&
+        crag &&
+        effectiveConfig &&
+        typeof effectiveConfig === 'object' &&
+        !Array.isArray(effectiveConfig)
+      ) {
+        health.internalTokenAuthenticated = true
+      }
+    }
+    return health
   } catch (error) {
     return {
       ok: false,

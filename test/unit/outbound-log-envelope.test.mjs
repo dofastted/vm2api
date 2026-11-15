@@ -7,6 +7,7 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { ThinkingOwnerStore } from '../../src/lib/pool/thinking-owner.mjs'
+import { activateFixture, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
 // Unix socket 在 Windows 上不可用，和 go-worker-client.test.mjs 的 unixTest 保持一致。
 const unixTest = process.platform === 'win32' ? test.skip : test
@@ -75,6 +76,7 @@ async function fakeKernel({ health = {} } = {}) {
   })
   const vm = {
     id: 'vm-01',
+    dataplane: 'wrap',
     runtime: { worker_socket: socket, kernel_socket: socket, worker_run_dir: runDir, worker_token_file: tokenFile },
   }
   return {
@@ -120,16 +122,24 @@ function fakeResponse() {
   }
 }
 
-function protocolHarness(kernel, routing = { compatibility: {}, failover: {} }, interceptRules = []) {
+function protocolHarness(
+  kernel,
+  routing = { compatibility: {}, failover: {} },
+  interceptRules = [],
+  admitCragInference,
+) {
   const finished = []
   const preparedCandidates = []
   const handler = createHandleProtocol({
-    json: (res, status) => {
+    admitCragInference,
+    json: (res, status, body) => {
       res.statusCode = status
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify(body))
       return status
     },
     writeSSEHeaders(res) {
-      res.headersSent = true
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
     },
     readBody: async (req) => req.body,
     requireAuth: () => true,
@@ -183,9 +193,75 @@ function protocolHarness(kernel, routing = { compatibility: {}, failover: {} }, 
   return { handler, finished, preparedCandidates, request }
 }
 
+unixTest('public JSON and SSE requests reject before worker POST, then resume when admission recovers', async (t) => {
+  const kernel = await fakeKernel({ health: { runtime_variant: 'crag-v2', ready_slots: 1 } })
+  const previous = process.env.KIN_KERNEL_BIN
+  t.after(async () => {
+    if (previous === undefined) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+    await kernel.close()
+  })
+  process.env.KIN_KERNEL_BIN = path.join(kernel.root, 'kin-kernel')
+  seedEncryptedPackage(kernel.root)
+  activateFixture(kernel.root, kernel.selected.vm)
+  kernel.selected.exec.projectRoot = kernel.root
+  const code = 'license_crag_host_over_quota'
+  let overQuota = true
+  const { handler } = protocolHarness(kernel, { inference: { engine: 'rust' }, failover: {} }, [], () =>
+    overQuota
+      ? {
+          ok: false,
+          status: 403,
+          terminalState: 'rejected',
+          upstreamExecutions: 0,
+          committed: false,
+          body: { type: 'error', error: { type: 'permission_error', code, message: 'CRAG host capacity exceeded' } },
+        }
+      : null,
+  )
+  const server = http.createServer(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    req.body = JSON.parse(Buffer.concat(chunks))
+    req.apiKeyKind = 'managed'
+    req.apiKeyRecord = { id: 'key-1' }
+    await handler.handleProtocol(req, res, 'anthropic.messages', '/v1/messages')
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => server.close(resolve)))
+  const send = (stream) =>
+    fetch(`http://127.0.0.1:${server.address().port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'user-agent': 'claude-cli/2.1.304 (external, cli)' },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5',
+        max_tokens: 32,
+        stream,
+        messages: [{ role: 'user', content: 'pong' }],
+      }),
+    })
+  for (const stream of [false, true]) {
+    const response = await send(stream)
+    assert.equal(response.status, 403)
+    assert.equal((await response.json()).error.code, code)
+  }
+  assert.equal(kernel.posted.length, 0)
+  overQuota = false
+  for (const stream of [false, true]) {
+    const response = await send(stream)
+    assert.equal(response.status, 200)
+    assert.match(await response.text(), /message/)
+  }
+  assert.equal(kernel.posted.length, 2)
+})
+
 unixTest('debug log uses final CLI headers, hides internal events and never substitutes envelope headers', async () => {
-  const kernel = await fakeKernel()
-  const { handler, finished, request } = protocolHarness(kernel)
+  const kernel = await fakeKernel({ health: { runtime_variant: 'cli-node', dataplane: 'wrap' } })
+  const { handler, finished, request } = protocolHarness(kernel, {
+    inference: { dataplane: 'wrap', health_ttl_ms: 0 },
+    compatibility: {},
+    failover: {},
+  })
   // 路由只检查宿主 kernel 路径非空才放行这一跳；真正接请求的是上面的假 kernel socket。
   const prevKernelBin = process.env.KIN_KERNEL_BIN
   process.env.KIN_KERNEL_BIN = path.join(kernel.root, 'kin-kernel')
@@ -252,6 +328,11 @@ async function protocolKernelFixture(t, { health, staleHealth, preset = 'officia
     else process.env.KIN_KERNEL_BIN = previous
     await kernel.close()
   })
+  if (health.runtime_variant === 'crag-v2') {
+    seedEncryptedPackage(kernel.root)
+    activateFixture(kernel.root, kernel.selected.vm)
+    kernel.selected.exec.projectRoot = kernel.root
+  }
   process.env.KIN_KERNEL_BIN = path.join(kernel.root, 'kin-kernel')
   kernel.setReportFinalHeaders(false)
   kernel.selected.exec.workerStatus = structuredClone(staleHealth)

@@ -67,6 +67,7 @@ import {
   syncCodexQuotaSchedule,
 } from './lib/vm/vm-registry.mjs'
 import { createCragSubscription } from './lib/vm/crag-subscription.mjs'
+import { createCragRuntimeInventory } from './lib/vm/crag-runtime-inventory.mjs'
 import { makeError, ErrorType, ErrorCode } from './lib/core/errors.mjs'
 import { HOLD_PROXY } from './lib/pool/schedule-state.mjs'
 import * as panel from './lib/admin/panel-api.mjs'
@@ -865,6 +866,7 @@ const handleKeySelf = createKeySelfHandler({
 })
 
 const { handleProtocol, handleSearch, handleImages } = createHandleProtocol({
+  admitCragInference: (input) => cragSubscription.admitInference(input),
   json,
   writeSSEHeaders,
   readBody,
@@ -981,12 +983,19 @@ cliNodeGuard = createCliNodeGuard({
   liveTokens: () => slotShell.liveShellTokens?.() || [],
 })
 
+const listCragTargets = () =>
+  listVms(cfg.paths.project)
+    .map(({ id }) => getVm(cfg.paths.project, id))
+    .filter(Boolean)
+
 const cragSubscription = createCragSubscription({
   projectRoot: cfg.paths.project,
-  listTargets: () =>
-    listVms(cfg.paths.project)
-      .map(({ id }) => getVm(cfg.paths.project, id))
-      .filter(Boolean),
+  listTargets: listCragTargets,
+  runtimeInventory: createCragRuntimeInventory({
+    projectRoot: cfg.paths.project,
+    listTargets: listCragTargets,
+    getRouting: () => routingConfig,
+  }),
   getTarget: (id) => getVm(cfg.paths.project, id),
   isSubscriptionSlot: (vm) =>
     !vm.node_id &&

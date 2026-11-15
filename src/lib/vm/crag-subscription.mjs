@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import {
   activateCragSubscriptionBinding,
+  cragLicenseDeniedResult,
   cragTargetIds,
   getCragLicense,
   MAX_CRAG_HOST_ENTITLEMENT_BYTES,
@@ -11,6 +12,8 @@ import {
   verifyCragHostEntitlement,
 } from './crag-license.mjs'
 import { cragSubscriptionPublicDirectory } from './crag-subscription-paths.mjs'
+import { cragV2PackageRoot } from './wrap-cli-runtime.mjs'
+import { resolveKernelDataplane } from './slot-engine.mjs'
 
 const AUTHORITY = 'https://crag.fkcodex.com'
 const localFilesystems = new Set([0xef53, 0x794c7630, 0x58465342, 0x9123683e, 0x2fc12fc1, 0xf2f52010])
@@ -40,9 +43,21 @@ const isDigest = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(v
 const validSku = (value) => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(value)
 const validMonths = (value) => Number.isSafeInteger(value) && value >= 1 && value <= 4294967295
 const invalidRights = () => fail('crag_subscription_invalid_entitlement', 502)
+const hostPackageUnready = () => fail('crag_subscription_host_package_unready', 409)
+const usageUnverified = () =>
+  cragLicenseDeniedResult({
+    code: 'license_crag_host_usage_unverified',
+    error: '暂时无法核对宿主机 CRAG 运行额度，请刷新订阅或确认槽位状态后重试。',
+  })
+const overQuota = () =>
+  cragLicenseDeniedResult({
+    code: 'license_crag_host_over_quota',
+    error: '宿主机运行中的 CRAG 内核超过订阅槽位。请停用、退役或切回标准内核，或兑换足够额度后重试。',
+  })
 
 function projection(data, claims) {
-  const result = {}
+  const reclaim = claims.version === 2
+  const result = { reclaim_supported: reclaim }
   if (Object.hasOwn(data, 'sku')) {
     if (!validSku(data.sku)) throw invalidRights()
     result.sku = data.sku
@@ -55,37 +70,32 @@ function projection(data, claims) {
     if (
       !safeTime(data.used_slots) ||
       data.used_slots > 4294967295 ||
-      (claims.slot_limit !== 'unlimited' && data.used_slots > claims.slot_limit)
+      (claims.slot_limit !== 'unlimited' && data.used_slots > claims.slot_limit) ||
+      (reclaim && data.used_slots !== claims.roster.length)
     )
       throw invalidRights()
     result.used_slots = data.used_slots
   }
-  if (Object.hasOwn(data, 'available_slots') && claims.version === 1) {
+  if (Object.hasOwn(data, 'available_slots')) {
     const available = data.available_slots
+    const capacity = reclaim
+      ? Math.min(claims.slot_limit === 'unlimited' ? 10000 : claims.slot_limit, 10000) - claims.roster.length
+      : claims.slot_limit === 'unlimited'
+        ? null
+        : claims.slot_limit - (result.used_slots ?? 0)
     if (
       available !== 0 &&
-      (claims.slot_limit === 'unlimited'
+      (capacity === null
         ? available !== null
         : !safeTime(available) ||
-          (result.used_slots !== undefined && available !== claims.slot_limit - result.used_slots))
+          available > capacity ||
+          ((reclaim || result.used_slots !== undefined) && available !== capacity))
     )
       throw invalidRights()
     result.available_slots = available
   }
-  if (Object.hasOwn(data, 'reclaim_supported') && data.reclaim_supported !== (claims.version === 2))
-    throw invalidRights()
-  if (claims.version === 2) {
-    const used_slots = claims.roster.length
-    const capacity = Math.min(claims.slot_limit === 'unlimited' ? 10000 : claims.slot_limit, 10000)
-    const available_slots = claims.expires_at <= Math.floor(Date.now() / 1000) ? 0 : capacity - used_slots
-    if (
-      (Object.hasOwn(data, 'used_slots') && data.used_slots !== used_slots) ||
-      (Object.hasOwn(data, 'available_slots') && data.available_slots !== available_slots && data.available_slots !== 0)
-    )
-      throw invalidRights()
-    return { ...result, used_slots, available_slots, reclaim_supported: true }
-  }
-  return { ...result, reclaim_supported: false }
+  if (Object.hasOwn(data, 'reclaim_supported') && data.reclaim_supported !== reclaim) throw invalidRights()
+  return result
 }
 const isOrderVmId = (id) => typeof id === 'string' && /^vm-[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(id)
 
@@ -125,6 +135,37 @@ function load(file, mode, limit, owner = uid()) {
   } finally {
     if (fd !== undefined) fs.closeSync(fd)
   }
+}
+
+function hostPackageDigest(projectRoot) {
+  // The verified manifest covers every file; issuer and payload key IDs alone can span multiple releases.
+  const readManifest = () => {
+    const root = cragV2PackageRoot(projectRoot)
+    if (!root) throw hostPackageUnready()
+    const file = path.join(root, 'manifest.json')
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK)
+    try {
+      const st = fs.fstatSync(fd)
+      if (!st.isFile() || st.size < 1 || st.size > 1024 * 1024) throw hostPackageUnready()
+      const bytes = Buffer.alloc(st.size)
+      if (fs.readSync(fd, bytes, 0, bytes.length, 0) !== bytes.length) throw hostPackageUnready()
+      return createHash('sha256').update(bytes).digest('hex')
+    } finally {
+      fs.closeSync(fd)
+    }
+  }
+  try {
+    const digest = readManifest()
+    cragTargetIds(projectRoot, undefined)
+    if (readManifest() !== digest) throw hostPackageUnready()
+    return digest
+  } catch {
+    throw hostPackageUnready()
+  }
+}
+
+function assertHostPackage(projectRoot, digest) {
+  if (!isDigest(digest) || hostPackageDigest(projectRoot) !== digest) throw hostPackageUnready()
 }
 
 function sync(dir) {
@@ -184,6 +225,7 @@ export function createCragSubscription({
   isSubscriptionSlot,
   assertReady,
   isSlotEnabled,
+  runtimeInventory,
   fetchImpl = globalThis.fetch,
   origin = AUTHORITY,
   machineIdFile,
@@ -277,8 +319,8 @@ export function createCragSubscription({
     return key
   }
 
-  async function ready(opts) {
-    for (const vm of await listTargets()) {
+  async function ready(opts, targets) {
+    for (const vm of targets ?? (await listTargets())) {
       try {
         if ((await assertReady(vm, opts)) !== false) return true
       } catch (error) {
@@ -309,57 +351,134 @@ export function createCragSubscription({
     return { vm, machineCode, payloadKeyId, issuerId, fingerprint }
   }
 
-  async function status() {
-    let total_slots
+  function readLocalRights() {
+    const hostId = identity()
+    storage()
+    const previous = current(hostId)
+    const pending =
+      load(marker, 0o644, 32) != null ||
+      load(intentFile, 0o600, 512) != null ||
+      load(rosterIntentFile, 0o600, 1024) != null
+    const claims = previous?.claims ?? null
+    if (claims && (!safeTime(claims.expires_at) || !safeTime(claims.revision))) throw fail()
+    return { hostId, claims, pending, previous }
+  }
+
+  function unchangedRights(before, after) {
+    return (
+      before.hostId === after.hostId &&
+      before.pending === after.pending &&
+      before.previous?.code === after.previous?.code
+    )
+  }
+
+  async function runtimeStatus(rights) {
+    if (!runtimeInventory) return {}
+    let result = {}
     try {
-      const targets = await listTargets()
-      if (isSubscriptionSlot) total_slots = targets.filter(isSubscriptionSlot).length
-      const hostId = identity()
-      storage()
-      const previous = current(hostId)
-      const pending =
-        load(marker, 0o644, 32) != null ||
-        load(intentFile, 0o600, 512) != null ||
-        load(rosterIntentFile, 0o600, 1024) != null
-      const claims = previous?.claims
-      if (claims && (!safeTime(claims.expires_at) || !safeTime(claims.revision))) throw fail()
-      if (load(hostFile, 0o644, 64)) credential(hostId)
-      let rights = claims ? projection({}, claims) : {}
-      if (claims && !pending) {
-        try {
-          const remote = await authority('status', hostId, credential(hostId))
-          if (remote.entitlement === previous.code) rights = projection(remote, claims)
-        } catch {
-          // Signed local rights still apply during an Authority outage. Do not guess remote metadata.
+      const { hostId, claims, pending } = rights || { claims: null, pending: true }
+      const runtime = await runtimeInventory.snapshot({ hostId, claims, pending })
+      result = { runtime }
+    } catch {
+      // Keep confirmed subscription fields if the independent runtime probe fails.
+    }
+    if (rights && !unchangedRights(rights, readLocalRights())) return null
+    return result
+  }
+
+  async function admitInference({ vm, routing, health } = {}) {
+    if (!runtimeInventory || !vm?.id) return null
+    const liveCrag =
+      health?.runtime_variant === 'crag-v2' ||
+      (!health?.runtime_variant && health?.dataplane === 'crag' && health?.kernel_version === 'v2')
+    if (!liveCrag && resolveKernelDataplane(vm, routing) !== 'crag') return null
+    let hostId
+    try {
+      hostId = identity()
+    } catch {
+      // No host identity need be available for an independent grant.
+    }
+    try {
+      if (!readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId)) return null
+      let rights = readLocalRights()
+      const deadline = performance.now() + 4000
+      for (let pass = 0; pass < 2; pass++) {
+        if (rights.pending || !rights.claims) return usageUnverified()
+        if (rights.claims.expires_at <= Math.floor(Date.now() / 1000)) return null
+        const timeoutMs = deadline - performance.now()
+        if (timeoutMs <= 0) return usageUnverified()
+        const runtime = await runtimeInventory.snapshot({
+          ...rights,
+          hostOnly: true,
+          currentHop: { id: vm.id, health },
+          timeoutMs,
+        })
+        const next = readLocalRights()
+        if (unchangedRights(rights, next)) {
+          if (runtime.host_over_limit === true) return overQuota()
+          return runtime.host_over_limit === false ? null : usageUnverified()
         }
+        rights = next
       }
-      let enabled_slots
-      if (isSlotEnabled && (claims || isSubscriptionSlot)) {
-        enabled_slots = 0
-        for (const vm of claims && !pending ? targets : []) {
-          if (await isSlotEnabled(vm, { reclaim: claims.version === 2 })) enabled_slots += 1
+    } catch {
+      // A malformed host permit or unreadable local quota cannot authorize a new hop.
+    }
+    return usageUnverified()
+  }
+
+  async function status(confirmed, mayRetry = true) {
+    try {
+      const local = readLocalRights()
+      const { hostId, claims, pending, previous } = local
+      if (load(hostFile, 0o644, 64)) credential(hostId)
+      let rights = claims ? { reclaim_supported: claims.version === 2 } : {}
+      if (claims && !pending) {
+        if (confirmed?.code === previous.code) {
+          rights = confirmed.rights
+        } else {
+          try {
+            const remote = await authority('status', hostId, credential(hostId))
+            if (remote.entitlement === previous.code) rights = projection(remote, claims)
+          } catch {
+            // Signed local rights still apply during an Authority outage. Do not guess remote metadata.
+          }
         }
       }
       const expired = claims && claims.expires_at <= Math.floor(Date.now() / 1000)
+      let total_slots, enabled_slots, upgrade_available
+      let targetReady = false
+      let target_probe_failed = false
+      // Slot inventory is not the authority for signed host rights.
+      try {
+        const targets = await listTargets()
+        if (isSubscriptionSlot) total_slots = targets.filter(isSubscriptionSlot).length
+        targetReady = !pending && (await ready({ allowPrepared: true }, targets))
+        if (claims?.version === 1 && !pending) upgrade_available = await ready({ reclaim: true }, targets)
+        if (isSlotEnabled && (claims || isSubscriptionSlot)) {
+          let enabled = 0
+          for (const vm of claims && !pending ? targets : []) {
+            if (await isSlotEnabled(vm, { reclaim: claims.version === 2 })) enabled += 1
+          }
+          enabled_slots = enabled
+        }
+      } catch {
+        target_probe_failed = true
+      }
+      const runtime = await runtimeStatus(local)
+      if (runtime === null && mayRetry) return status(confirmed, false)
       return {
-        ready: !pending && (await ready({ allowPrepared: true })),
-        state: pending
-          ? 'sync_pending'
-          : claims
-            ? Math.floor(Date.now() / 1000) >= claims.expires_at
-              ? 'expired'
-              : 'active'
-            : 'unredeemed',
+        ready: targetReady,
+        ...(target_probe_failed && { target_probe_failed }),
+        state: pending ? 'sync_pending' : claims ? (expired ? 'expired' : 'active') : 'unredeemed',
         ...(claims && { slot_limit: claims.slot_limit, expires_at: claims.expires_at, revision: claims.revision }),
         ...rights,
         ...(total_slots !== undefined && { total_slots }),
         ...(enabled_slots !== undefined && { enabled_slots }),
-        ...(expired && { available_slots: 0 }),
-        ...(pending && { available_slots: 0 }),
-        ...(claims?.version === 1 && !pending && (await ready({ reclaim: true })) && { upgrade_available: true }),
+        ...(upgrade_available && { upgrade_available }),
+        ...runtime,
       }
     } catch {
-      return { ready: false, state: 'unavailable', ...(total_slots !== undefined && { total_slots }) }
+      return { ready: false, state: 'unavailable', ...(await runtimeStatus()) }
     }
   }
 
@@ -397,11 +516,11 @@ export function createCragSubscription({
     ) {
       throw fail('crag_subscription_invalid_entitlement', 502)
     }
-    projection(data, next)
-    return next
+    return { code: data.entitlement, claims: next, rights: projection(data, next) }
   }
 
   async function finish(hostId, intent, previous, target) {
+    if (Object.hasOwn(intent, 'host_package_sha256')) assertHostPackage(projectRoot, intent.host_package_sha256)
     publish(marker, 'pending\n', 0o644)
     let data
     try {
@@ -416,10 +535,12 @@ export function createCragSubscription({
       }
       throw error
     }
-    verifyRights(hostId, data, previous, target?.vm)
-    publish(entitlementFile, data.entitlement, 0o644)
+    if (Object.hasOwn(intent, 'host_package_sha256')) assertHostPackage(projectRoot, intent.host_package_sha256)
+    const confirmed = verifyRights(hostId, data, previous, target?.vm)
+    publish(entitlementFile, confirmed.code, 0o644)
     remove(marker)
     remove(intentFile)
+    return confirmed
   }
 
   async function exclusive(work) {
@@ -466,14 +587,16 @@ export function createCragSubscription({
       credential(hostId),
       intent.action === 'release' ? { vm_id: intent.vm_id, permit_sha256: intent.permit_sha256 } : undefined,
     )
-    const next = verifyRights(hostId, data, previous, vm)
+    const confirmed = verifyRights(hostId, data, previous, vm)
+    const { claims: next } = confirmed
     if (
       next.version !== 2 ||
       (intent.action === 'release' && next.roster.some((entry) => entry.permit_sha256 === intent.permit_sha256))
     )
       throw invalidRights()
-    publish(entitlementFile, data.entitlement, 0o644)
+    publish(entitlementFile, confirmed.code, 0o644)
     clearRosterIntent()
+    return confirmed
   }
 
   function redeem(value, renewal) {
@@ -481,16 +604,15 @@ export function createCragSubscription({
       const redemption_code = typeof value === 'string' && value.trim()
       if (!validVoucher(redemption_code)) throw fail('crag_subscription_invalid_request', 400)
       const hostId = identity()
-      if (!renewal && !(await ready({ allowPrepared: true }))) throw fail('crag_subscription_target_unready', 409)
+      const packageDigest = renewal ? undefined : hostPackageDigest(projectRoot)
       storage(!renewal)
       const previous = current(hostId)
       if (renewal && !previous) throw fail('host_subscription_inactive', 409)
       checkNoIntent()
       credential(hostId, !renewal)
-      const intent = { host_id: hostId, redemption_code }
+      const intent = { host_id: hostId, redemption_code, ...(packageDigest && { host_package_sha256: packageDigest }) }
       publish(intentFile, JSON.stringify(intent), 0o600, true)
-      await finish(hostId, intent, previous)
-      return status()
+      return status(await finish(hostId, intent, previous))
     })
   }
 
@@ -534,8 +656,8 @@ export function createCragSubscription({
       if (data.entitlement !== previous.code) throw invalidRights()
       activated = activateCragSubscriptionBinding(projectRoot, vm, data.slot_permit, { seat: data.seat })
     } else {
-      const next = verifyRights(hostId, data, previous, vm)
-      publish(entitlementFile, data.entitlement, 0o644)
+      const { claims: next, code } = verifyRights(hostId, data, previous, vm)
+      publish(entitlementFile, code, 0o644)
       activated = activateCragSubscriptionBinding(projectRoot, vm, data.slot_permit, {
         seat: data.seat,
         verifiedRights: next,
@@ -600,7 +722,8 @@ export function createCragSubscription({
   }
 
   return {
-    status,
+    status: () => status(),
+    admitInference,
     async listOrderTargets() {
       let options
       try {
@@ -662,8 +785,7 @@ export function createCragSubscription({
         if (previous.claims.version === 2) return status()
         const intent = { host_id: hostId, action: 'upgrade' }
         beginRosterIntent(intent)
-        await syncRoster(hostId, intent, previous)
-        return status()
+        return status(await syncRoster(hostId, intent, previous))
       })
     },
     async teardown(vm, destroy) {
@@ -717,14 +839,22 @@ export function createCragSubscription({
         const hostId = identity()
         storage()
         const rosterIntent = readRosterIntent()
-        if (rosterIntent) return syncRoster(hostId, rosterIntent, current(hostId))
+        if (rosterIntent) {
+          await syncRoster(hostId, rosterIntent, current(hostId))
+          return
+        }
         const raw = load(intentFile, 0o600, 512)
         if (raw == null) return
         const intent = JSON.parse(raw)
         if (intent.host_id !== hostId || !validVoucher(intent.redemption_code)) throw fail()
         // An order may only resume redemption after re-authorizing its checkout pin.
         if (Object.hasOwn(intent, 'order_id') || Object.hasOwn(intent, 'target_fingerprint')) return
-        await finish(hostId, intent, current(hostId))
+        const pinned = Object.hasOwn(intent, 'host_package_sha256')
+        if (pinned) assertHostPackage(projectRoot, intent.host_package_sha256)
+        const previous = current(hostId)
+        // Old intents without local rights have no original digest, but still require a trusted package.
+        if (!pinned && !previous) hostPackageDigest(projectRoot)
+        await finish(hostId, intent, previous)
       })
     },
     bind(vm) {

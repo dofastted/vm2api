@@ -28,6 +28,15 @@ test('an empty pool is a 503 "no available account", never a load message', () =
   assert.equal(mapped.body.error.details, undefined)
 })
 
+test('CRAG host quota rejections stay distinct permission errors', () => {
+  for (const code of ['license_crag_host_over_quota', 'license_crag_host_usage_unverified']) {
+    const error = { type: 'permission_error', code, message: 'CRAG host capacity check failed' }
+    const result = rewritePoolErrorForClient(mapUpstreamError(403, { error }))
+    assert.equal(result.status, 403)
+    assert.deepEqual(result.body.error, error)
+  }
+})
+
 test('real capacity exhaustion and queue timeout are a 529 overloaded_error with retry-after', () => {
   for (const code of ['pool_overloaded', 'pool_wait_queue_full', 'pool_queue_timeout']) {
     const mapped = mapUpstreamError(529, { error: { type: 'overloaded_error', code, message: 'busy' } })

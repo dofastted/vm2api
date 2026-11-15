@@ -389,7 +389,9 @@ function classifyUpstreamResultRaw(
   }
   if (
     [code, workerCode].some((value) =>
-      /^license_(required|expired|not_yet_valid|invalid|binding_mismatch|unconfigured)$/.test(value),
+      /^license_(required|expired|not_yet_valid|invalid|binding_mismatch|unconfigured|crag_host_over_quota|crag_host_usage_unverified)$/.test(
+        value,
+      ),
     )
   ) {
     return {
