@@ -9,11 +9,19 @@ import { VIEW_TITLES } from '@/config/nav'
 import type { StatusTone } from '@/types/status'
 import { api, isApiError } from '@/lib/api'
 import { Button } from '@/components/ui/button'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { PageHeader } from '@/components/page-header'
 import { StatusMark } from '@/components/status-mark'
 import { meQueryOptions } from '@/features/auth/queries'
+import { CragHostSubscription } from '@/features/vm/crag-host-subscription'
 import {
   cragHostStatusQueryOptions,
   type CragHostStatus,
@@ -446,6 +454,8 @@ function ShopOrders({
   const intent = useRef<Intent | null>(null)
   const operating = useRef(false)
   const [targetVmId, setTargetVmId] = useState('')
+  const [manualCode, setManualCode] = useState<string>()
+  const [manualVmId, setManualVmId] = useState('')
   const targets = useQuery({
     queryKey: ['panel', 'crag-shop', 'activation-targets', owner],
     queryFn: ({ signal }) =>
@@ -819,8 +829,145 @@ function ShopOrders({
         presentation?.description ??
         '查看订阅套餐和本人历史订单。付款、交付与激活状态分别确认。'
       }
+      extra={
+        <Button size='sm' variant='outline' asChild>
+          <a href='#crag-purchase-activation'>购买后激活</a>
+        </Button>
+      }
     >
       <div className='grid min-w-0 gap-6'>
+        <section
+          id='crag-purchase-activation'
+          aria-labelledby='crag-purchase-activation-title'
+          className='scroll-mt-20 space-y-3 rounded-lg border bg-card p-4'
+        >
+          <h2 id='crag-purchase-activation-title' className='font-semibold'>
+            购买后激活
+          </h2>
+          <div className='flex flex-wrap items-center gap-2'>
+            {isAdmin ? (
+              <Button size='sm' onClick={() => setManualCode('')}>
+                手动激活
+              </Button>
+            ) : null}
+            <Button size='sm' variant='outline' asChild>
+              <a href='#crag-order-history'>查看订单与激活状态</a>
+            </Button>
+          </div>
+          <p className='text-sm text-muted-foreground'>
+            {isAdmin
+              ? '已有兑换码可直接手动激活；未领码请在已发码的原订单中领取。'
+              : '请在已发码的原订单中领取兑换码，交给目标宿主机的管理员激活。'}
+          </p>
+          {isAdmin ? (
+            <div className='max-w-xl space-y-2 border-t pt-3'>
+              <label className='grid gap-1 text-sm'>
+                自动激活（新订单）
+                <select
+                  className='h-9 w-full min-w-0 rounded-md border bg-background px-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring'
+                  value={targetVmId}
+                  disabled={busy}
+                  onChange={(event) => setTargetVmId(event.target.value)}
+                >
+                  <option value=''>手动激活（领码后自行兑换与绑定）</option>
+                  {targetVmId &&
+                  !eligibleTargets.some(
+                    (target) => target.vm_id === targetVmId
+                  ) ? (
+                    <option value={targetVmId} disabled>
+                      所选目标暂不可用：{targetVmId}
+                    </option>
+                  ) : null}
+                  {eligibleTargets.map((target) => (
+                    <option key={target.vm_id} value={target.vm_id}>
+                      自动激活到 {target.vm_id}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p className='text-sm text-muted-foreground'>
+                选择目标槽位后再下单；订单确认交付后，服务端自动兑换并绑定，无需保持页面打开。不影响历史订单和续费。
+              </p>
+              <p
+                role='status'
+                className='text-sm text-muted-foreground empty:sr-only'
+              >
+                {targets.isError
+                  ? '读取自动激活目标失败；请刷新目标或选择手动激活。'
+                  : targets.isFetching
+                    ? '正在查询自动激活目标；手动激活始终可选。'
+                    : !eligibleTargets.length
+                      ? '当前没有可用的自动激活目标，可选择手动激活。'
+                      : ''}
+              </p>
+              {!targetAvailable ? (
+                <p role='alert' className='text-sm text-destructive'>
+                  所选目标尚未确认可用。请先核对历史订单，再刷新激活目标或明确改选手动激活。
+                </p>
+              ) : null}
+              <Button
+                type='button'
+                variant='ghost'
+                size='sm'
+                disabled={targets.isFetching || busy}
+                onClick={() => void targets.refetch()}
+              >
+                刷新激活目标
+              </Button>
+            </div>
+          ) : null}
+        </section>
+        {isAdmin && manualCode !== undefined ? (
+          <Dialog
+            open
+            onOpenChange={(open) => {
+              if (!open) {
+                setManualCode(undefined)
+                setManualVmId('')
+              }
+            }}
+          >
+            <DialogContent className='max-h-[90dvh] overflow-y-auto'>
+              <DialogHeader>
+                <DialogTitle>手动激活 CRAG 订阅</DialogTitle>
+                <DialogDescription>
+                  先将兑换码兑换到本机，再给目标槽位绑定应用锁。
+                </DialogDescription>
+              </DialogHeader>
+              <label className='grid gap-1 text-sm'>
+                目标槽位（可选）
+                <select
+                  className='h-9 w-full rounded-md border bg-background px-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring'
+                  value={
+                    eligibleTargets.some(
+                      (target) => target.vm_id === manualVmId
+                    )
+                      ? manualVmId
+                      : ''
+                  }
+                  onChange={(event) => setManualVmId(event.target.value)}
+                >
+                  <option value=''>仅兑换到本机，稍后绑定</option>
+                  {eligibleTargets.map((target) => (
+                    <option key={target.vm_id} value={target.vm_id}>
+                      {target.vm_id}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <CragHostSubscription
+                initialCode={manualCode}
+                vmId={
+                  eligibleTargets.find((target) => target.vm_id === manualVmId)
+                    ?.vm_id
+                }
+              />
+              <Link to='/vm' className='text-sm underline underline-offset-4'>
+                在虚拟机页面管理槽位授权
+              </Link>
+            </DialogContent>
+          </Dialog>
+        ) : null}
         {overview}
         {problem ? (
           <p role='alert' className='text-sm text-destructive'>
@@ -893,57 +1040,6 @@ function ShopOrders({
                 disabled={busy}
               />
             ) : null}
-            {canOrder && isAdmin && commerceSku !== 'renewal' ? (
-              <div className='space-y-2'>
-                <label className='grid gap-1 text-sm'>
-                  激活方式
-                  <select
-                    className='h-9 w-full min-w-0 rounded-md border bg-background px-2 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring'
-                    value={targetVmId}
-                    disabled={busy}
-                    onChange={(event) => setTargetVmId(event.target.value)}
-                  >
-                    <option value=''>手动激活（领码后自行兑换与绑定）</option>
-                    {targetVmId &&
-                    !eligibleTargets.some(
-                      (target) => target.vm_id === targetVmId
-                    ) ? (
-                      <option value={targetVmId} disabled>
-                        所选目标暂不可用：{targetVmId}
-                      </option>
-                    ) : null}
-                    {eligibleTargets.map((target) => (
-                      <option key={target.vm_id} value={target.vm_id}>
-                        自动激活到 {target.vm_id}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <p role='status' className='text-sm text-muted-foreground'>
-                  {targets.isError
-                    ? '读取自动激活目标失败；仍可明确选择手动激活。'
-                    : targets.isFetching
-                      ? '正在查询自动激活目标；手动激活始终可选。'
-                      : !eligibleTargets.length
-                        ? '当前没有可用的自动激活目标，可选择手动激活。'
-                        : '仅对本次新订单使用所选目标，交付后由服务端自动激活；不会更改历史订单。'}
-                </p>
-                {!targetAvailable ? (
-                  <p role='alert' className='text-sm text-destructive'>
-                    所选目标尚未确认可用。请先核对历史订单，再刷新激活目标或明确改选手动激活。
-                  </p>
-                ) : null}
-                <Button
-                  type='button'
-                  variant='ghost'
-                  size='sm'
-                  disabled={targets.isFetching || busy}
-                  onClick={() => void targets.refetch()}
-                >
-                  刷新激活目标
-                </Button>
-              </div>
-            ) : null}
             {canOrder ? (
               <div className='flex flex-wrap items-end gap-3'>
                 <label className='grid gap-1 text-sm'>
@@ -1012,7 +1108,8 @@ function ShopOrders({
           </section>
           <section
             aria-label={presentation?.orders_title ?? '历史订单'}
-            className='min-w-0 space-y-3'
+            id='crag-order-history'
+            className='min-w-0 scroll-mt-20 space-y-3'
           >
             <div className='flex items-center justify-between gap-2'>
               <h2 className='font-medium'>
@@ -1208,6 +1305,14 @@ function ShopOrders({
                         >
                           复制兑换码
                         </Button>
+                        {isAdmin ? (
+                          <Button
+                            size='sm'
+                            onClick={() => setManualCode(claim.redemption_code)}
+                          >
+                            使用此码激活
+                          </Button>
+                        ) : null}
                       </div>
                     ) : null}
                     {order.status === 'paid' ? (
@@ -1266,11 +1371,8 @@ function ShopOrders({
                               </li>
                               <li>
                                 {isAdmin
-                                  ? '在目标宿主机的面板中'
-                                  : '请将码私下交给目标宿主机管理员，在该机面板中'}
-                                打开「虚拟机 → 目标槽位 → 运维 → 推理内核 → CRAG
-                                授权 / 续期 →
-                                宿主机订阅」。把码粘贴到「宿主机兑换码」，点击「兑换到本机」。
+                                  ? '点击「使用此码激活」，核对宿主机与目标槽位后兑换。也可以在订阅页顶部手动输入兑换码。'
+                                  : '请将码私下交给目标宿主机管理员，在该机面板的「订阅 CRAG → 购买后激活」中手动兑换。'}
                               </li>
                               <li>
                                 兑换后，点击「给本槽绑定应用锁」。其他要用订阅的槽也需分别绑定。
