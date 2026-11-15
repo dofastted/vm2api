@@ -1597,8 +1597,14 @@ export function createPanelHandler(ctx) {
 
     if (isCragShopPath(p)) {
       res.setHeader('Cache-Control', 'no-store')
-      if (!requireAuth(req, res, { buyer: true })) return true
       const route = cragShopRoute(req.method, p)
+      if (route === 'plans') {
+        // A valid buyer session gets the pilot catalogue; everyone else gets the public view.
+        requireAuth(req, res, { buyer: true, optionalBuyer: true })
+        if (res.headersSent) return true
+        return handleCragShop(req, res, url, route)
+      }
+      if (!requireAuth(req, res, { buyer: true })) return true
       if (route && !authorizePanelRoute(req.method, p, panelIdentity(req).role).ok) {
         return json(res, 403, { ok: false, error: { code: 'forbidden', message: 'Forbidden' } })
       }

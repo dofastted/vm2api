@@ -476,13 +476,13 @@ export function createCragShopHandler({
     try {
       res.setHeader?.('Cache-Control', 'no-store')
       const owner = buyerOwner(req)
+      const ok = (data) => json(res, 200, { ok: true, data })
+      if (route === 'plans' && req.method === 'GET') return ok(await supplier.plans({ allowPilot: !!owner }))
       if (!owner) throw failure(403, 'shop_login_required', 'Sign in to the panel to access CRAG shop')
       if (!route) throw missingOrder()
       if (req.method === 'POST' && !sameOriginPost(req, publicBaseUrl)) {
         throw failure(403, 'shop_origin_denied', 'CRAG shop requires a same-origin request')
       }
-      const ok = (data) => json(res, 200, { ok: true, data })
-      if (route === 'plans') return ok(await supplier.plans())
       if (route === 'activation-targets') {
         const targets =
           activationEnabled && isActivationAdmin(owner) && subscription?.listOrderTargets
