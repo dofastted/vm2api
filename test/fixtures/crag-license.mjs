@@ -122,7 +122,7 @@ export function issueSlotPermit(root, machineCode, hostId, overrides = {}, wrap 
   }
   return { claims, code: signSubscriptionBytes(root, 'CRAGS1', JSON.stringify(claims)) }
 }
-export function seedEncryptedPackage(root, { revision = '' } = {}) {
+export function seedEncryptedPackage(root, { revision = '', payloadKey = fixtureAuthority(root).payloadKey } = {}) {
   const authority = fixtureAuthority(root)
   const arch = process.arch === 'arm64' ? 'arm64' : 'amd64'
   const dir = path.join(root, 'share/crag/kernels/v2', arch)
@@ -132,12 +132,12 @@ export function seedEncryptedPackage(root, { revision = '' } = {}) {
   elf.writeUInt16LE(3, 16); elf.writeUInt16LE(arch === 'amd64' ? 62 : 183, 18); elf.writeUInt32LE(1, 20)
   elf.write(revision, 96)
   const nonce = crypto.randomBytes(12)
-  const cipher = crypto.createCipheriv('aes-256-gcm', authority.payloadKey, nonce)
+  const cipher = crypto.createCipheriv('aes-256-gcm', payloadKey, nonce)
   cipher.setAAD(Buffer.from('CRAG-V2-PAYLOAD-V1\0'))
   const encrypted = Buffer.concat([cipher.update(elf), cipher.final()])
   const payloadBytes = Buffer.concat([Buffer.from('CRAGV2E1'), nonce, cipher.getAuthTag(), encrypted])
   const pub = authority.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32)
-  const signed = { product: 'crag-v2', format: 'CRAGV2E1', algorithm: 'aes-256-gcm', key_id: sha(authority.payloadKey), plaintext_sha256: sha(elf), ciphertext_sha256: sha(payloadBytes) }
+  const signed = { product: 'crag-v2', format: 'CRAGV2E1', algorithm: 'aes-256-gcm', key_id: sha(payloadKey), plaintext_sha256: sha(elf), ciphertext_sha256: sha(payloadBytes) }
   const files = { 'crag-v2': elf, 'claude-code-2.1.321/claude': elf, 'crag-v2.payload.enc': payloadBytes, 'crag-license-public.pem': authority.publicKey.export({ format: 'pem', type: 'spki' }) }
   for (const [name, body] of Object.entries(files)) fs.writeFileSync(path.join(dir, name), body, { mode: name === 'crag-v2' || name.endsWith('/claude') ? 0o755 : 0o644 })
   const manifest = { family: 'crag', version: 'v2', arch, runtime: 'native', entrypoint: 'crag-v2', encrypted: true,

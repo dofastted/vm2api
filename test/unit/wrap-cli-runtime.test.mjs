@@ -820,9 +820,9 @@ test('CRAG v2 rolls back the package and preserves the wrapper when publication 
     const oldWrapper = fs.readFileSync(wrapper)
     const oldKernel = fs.readFileSync(path.join(dest, 'kin-kernel.bin'))
     const packageRoot = path.join(dest, 'crag-v2')
+    seedV2Package(project)
     fs.mkdirSync(packageRoot)
     fs.writeFileSync(path.join(packageRoot, 'old-package'), 'keep')
-    seedV2Package(project)
     fs.renameSync = (from, to) => {
       if (to === wrapper) throw Object.assign(new Error('publication denied'), { code: 'EACCES' })
       return rename(from, to)

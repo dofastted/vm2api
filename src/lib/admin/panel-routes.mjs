@@ -3303,7 +3303,7 @@ export function createPanelHandler(ctx) {
           }
           let activated
           if (online) {
-            const kind = await resolveCragVoucherKind(cfg.paths.project, registrationCode, ctx.fetchCragDeviceGrant)
+            const kind = await resolveCragVoucherKind(cfg.paths.project, vm, registrationCode, ctx.fetchCragDeviceGrant)
             if (kind === 'host') {
               activated = await ctx.cragSubscription.activateVoucher(vm.id, registrationCode)
             } else {

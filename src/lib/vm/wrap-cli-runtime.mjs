@@ -20,6 +20,7 @@ import { isKvmRuntime } from './runtime-kind.mjs'
 import { nativeCliForVm, NATIVE_CLI_FILES } from './native-cli.mjs'
 import { resolveKernelDataplane } from './slot-engine.mjs'
 import { checkCragLicense, decodeLicenseBytes } from './crag-license.mjs'
+import { isValidVmId } from './vm-file.mjs'
 
 export const WRAP_CLI_BIN = 'cli-node'
 export const CC_NODE_BIN = 'cc-node'
@@ -112,6 +113,30 @@ export function cragV2PackageRoot(projectRoot, arch = cragV2Arch()) {
   }
   const staged = path.join(base, arch)
   return isFile(path.join(staged, 'manifest.json')) ? staged : ''
+}
+
+export function matchesCragIssuer(projectRoot, issuerId, pem) {
+  const arch = cragV2Arch()
+  const factory =
+    String(process.env.KIN_CRAG_V2_ROOT || '').trim() || path.join(projectRoot, 'share/crag/kernels/v2', arch)
+  try {
+    const key = crypto.createPublicKey(fs.readFileSync(path.join(factory, 'crag-license-public.pem')))
+    const der = key.export({ format: 'der', type: 'spki' })
+    return (
+      key.asymmetricKeyType === 'ed25519' &&
+      crypto.createHash('sha256').update(der.subarray(-32)).digest('hex') === issuerId
+    )
+  } catch (error) {
+    if (error.code !== 'ENOENT') return false
+  }
+  try {
+    const release = JSON.parse(fs.readFileSync(path.join(projectRoot, 'deploy/payload.json'), 'utf8'))
+    const relative = `share/crag/kernels/v2/${arch}/crag-license-public.pem`
+    const pins = release.files.filter((file) => file?.path === relative)
+    return pins.length === 1 && pins[0].sha256 === crypto.createHash('sha256').update(pem).digest('hex')
+  } catch {
+    return false
+  }
 }
 
 export function cragV2KernelWrapperScript() {
@@ -475,7 +500,12 @@ export function materializeCragV2(projectRoot, vm, { uid = null, gid = null, sel
   // Preinstallation only copies encrypted distribution files. Selecting the entry
   // still requires authorization, including when those files already exist.
   if (select) {
-    const licensed = checkCragLicense(projectRoot, { ...vm, dataplane: 'crag', crag_kernel_version: 'v2' })
+    const licensed = checkCragLicense(
+      projectRoot,
+      { ...vm, dataplane: 'crag', crag_kernel_version: 'v2' },
+      {},
+      { preferInstalled: false },
+    )
     if (!licensed.ok) return licensed
   }
   // The node receives this tree, including native Claude Code, through the CRAG package push.
@@ -573,6 +603,12 @@ export function wrapCliTemplateDir(projectRoot) {
 export function wrapCliHomeDir(projectRoot, vmId) {
   if (!projectRoot || !vmId) return ''
   return path.join(projectRoot, 'vms', vmId, 'cli-home', '.kin')
+}
+
+export function installedCragV2Root(projectRoot, vm) {
+  if (!projectRoot || !isValidVmId(vm?.id) || vm.node_id || isKvmRuntime(vm)) return undefined
+  const installed = path.join(wrapCliHomeDir(projectRoot, vm.id), CRAG_V2_DIR)
+  return fs.lstatSync(installed, { throwIfNoEntry: false }) ? installed : undefined
 }
 
 function isFile(p) {
