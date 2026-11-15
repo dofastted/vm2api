@@ -16,8 +16,9 @@ function fixture(context) {
 }
 
 const grant = { access_token: 'panel-access-fixture', refresh_token: 'panel-refresh-fixture', expires_at: 1900000000 }
+const setupGrant = { ...grant, type: 'setup-token', scopes: ['user:inference', 'user:profile'] }
 
-for (const credential of [grant, { type: 'apikey', api_key: 'panel-api-fixture' }]) {
+for (const credential of [grant, setupGrant, { type: 'apikey', api_key: 'panel-api-fixture' }]) {
   test(`explicit ${credential.type || 'oauth'} import replaces a newer loose native grant`, (context) => {
     const { homeDir, official, worker } = fixture(context)
     fs.mkdirSync(path.dirname(official), { recursive: true })
@@ -34,9 +35,9 @@ for (const credential of [grant, { type: 'apikey', api_key: 'panel-api-fixture' 
   })
 }
 
-test('manual sync repairs native credential link without replacing the panel grant or exposing it', async (context) => {
+test('manual sync repairs native credential link without replacing the setup-token grant or exposing it', async (context) => {
   const { homeDir, official, worker, exec } = fixture(context)
-  writeWorkerCredentialFile(homeDir, grant)
+  writeWorkerCredentialFile(homeDir, setupGrant)
   const before = fs.readFileSync(worker, 'utf8')
   fs.unlinkSync(official)
   fs.writeFileSync(official, JSON.stringify({ claudeAiOauth: { accessToken: 'old-native', expiresAt: 9900000000000 } }))
@@ -44,8 +45,10 @@ test('manual sync repairs native credential link without replacing the panel gra
   assert.equal(result.ok, true)
   assert.equal(fs.readlinkSync(official), 'credentials.json')
   assert.equal(fs.readFileSync(worker, 'utf8'), before)
-  assert.equal(JSON.stringify(result).includes(grant.access_token), false)
-  assert.equal(JSON.stringify(result).includes(grant.refresh_token), false)
+  assert.equal(result.credential.type, 'setup-token')
+  assert.equal(result.credential.has_refresh, true)
+  assert.equal(JSON.stringify(result).includes(setupGrant.access_token), false)
+  assert.equal(JSON.stringify(result).includes(setupGrant.refresh_token), false)
 })
 
 test('sync requires an imported panel credential', async (context) => {
