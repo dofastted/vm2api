@@ -94,6 +94,8 @@ export function normalizeKernelWatchdogConfig(raw = {}) {
     timeout_ms: clampInt(raw.timeout_ms, 3000, 60_000, DEFAULT_KERNEL_WATCHDOG.timeout_ms),
     restart_backoff_sec: backoff.length ? backoff : [...DEFAULT_KERNEL_WATCHDOG.restart_backoff_sec],
     restart_window_sec: clampInt(raw.restart_window_sec, 60, 86_400, DEFAULT_KERNEL_WATCHDOG.restart_window_sec),
+    // fault 后保留低频重试的间隔；0 = 维持旧行为（fault 后永久跳过，等人工恢复）。
+    fault_retry_sec: raw.fault_retry_sec === 0 ? 0 : clampInt(raw.fault_retry_sec, 60, 86_400, 3600),
   }
 }
 
@@ -164,6 +166,8 @@ export function createKernelWatchdog({
   let inTick = false
   // vmId -> { attempts: [ms], nextAt }
   const restarts = new Map()
+  // fault-retry：vmId -> faulted 槽下次允许低频重试的时刻（ms）。健康恢复或 reset() 时清除。
+  const faultRetryAt = new Map()
   // Remote transport failures can be relay/gate jitter, not a dead kernel.
   const nodeProbeFailures = new Map()
   // VMs under an operator power cycle: the watchdog must not restart them mid-cycle.
@@ -184,7 +188,19 @@ export function createKernelWatchdog({
   }
 
   function restartBudget(vm, reason, at) {
-    if (kernelFaults.has(vm.id)) return false
+    if (kernelFaults.has(vm.id)) {
+      // fault 后不再永久死锁：按 fault_retry_sec 保留低频重试预算，让暂态故障
+      // （升级窗口、传输抖动、带宽拥塞）耗尽 backoff 后仍可自愈；一旦健康恢复，
+      // checkVm 的 kernelFaults.delete 分支会清 fault 并重置预算。真死的槽每小时
+      // 也只多试一次，不会风暴。fault_retry_sec=0 时维持旧行为（永久跳过）。
+      const retryMs = config.fault_retry_sec * 1000
+      if (retryMs <= 0) return false
+      const next = faultRetryAt.get(vm.id) || 0
+      if (at < next) return false
+      if (!restarts.has(vm.id)) restarts.set(vm.id, { attempts: [], nextAt: at })
+      faultRetryAt.set(vm.id, at + retryMs)
+      return true
+    }
     const state = restarts.get(vm.id) || { attempts: [], nextAt: at + config.restart_backoff_sec[0] * 1000 }
     state.attempts = state.attempts.filter((t) => at - t < config.restart_window_sec * 1000)
     restarts.set(vm.id, state)
@@ -193,6 +209,9 @@ export function createKernelWatchdog({
     if (state.attempts.length >= backoff.length) {
       const fault = `kernel unhealthy after ${state.attempts.length} recovery attempts: ${reason}`
       kernelFaults.set(vm.id, fault)
+      // fault 确立时刻即低频重试的冷却起点：下一个重试窗口从现在起算，避免
+      // 刚耗尽 backoff 又立刻多试一次（等于把 backoff 轮数悄悄 +1）。
+      faultRetryAt.set(vm.id, at + config.fault_retry_sec * 1000)
       console.error(`[kernel-watchdog] ${vm.id} faulted; scheduling skips it: ${fault}`)
       if (typeof onFault === 'function') {
         try {
@@ -264,6 +283,7 @@ export function createKernelWatchdog({
       // Plain recovery keeps past attempts so a crash loop stays bounded by the window.
       if (kernelFaults.delete(vm.id)) {
         restarts.delete(vm.id)
+        faultRetryAt.delete(vm.id)
         vmTimeoutTracker?.reset?.(vm.id)
       }
       // Config convergence, not a failure: outside the restart budget.
@@ -376,6 +396,7 @@ export function createKernelWatchdog({
     reset(vmId) {
       const faulted = kernelFaults.delete(vmId)
       restarts.delete(vmId)
+      faultRetryAt.delete(vmId)
       vmTimeoutTracker?.reset?.(vmId)
       return { faulted }
     },

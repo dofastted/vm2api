@@ -94,22 +94,114 @@ test('container restarts are bounded, spaced out, then the VM is faulted until h
     assert.equal(faults.length, 1)
     assert.match(faults[0][1], /2 recovery attempts: cli restarts spent/)
     assert.ok(kernelFaults.has('vm-loop'), 'faulted VM is skipped by scheduling')
+    now = 1_000_000
+    await wd.tick()
+    assert.deepEqual(ensured, [60_000, 360_000], 'a faulted VM stays quiet inside the hourly retry cooldown')
+    assert.equal(faults.length, 1, 'fault is reported once')
     now = 10_000_000
     await wd.tick()
-    assert.deepEqual(ensured, [60_000, 360_000], 'a faulted VM is not restarted again')
-    assert.equal(faults.length, 1, 'fault is reported once')
+    assert.deepEqual(ensured, [60_000, 360_000, 10_000_000], 'the hourly retry budget fires after fault_retry_sec')
+    assert.equal(faults.length, 1, 'retrying does not re-report the fault')
+    now = 10_060_000
+    await wd.tick()
+    assert.deepEqual(
+      ensured,
+      [60_000, 360_000, 10_000_000],
+      'only one retry per fault_retry_sec window, even mid-window ticks',
+    )
 
     health = { ok: true, healthy: true, ready_slots: 20, cli_pid: 7 }
     await wd.tick()
     assert.equal(kernelFaults.has('vm-loop'), false, 'healthy again clears the fault')
     health = { ok: true, healthy: false, unhealthy_reason: 'again' }
     await wd.tick()
-    assert.deepEqual(ensured, [60_000, 360_000], 'fresh recovery also respects the first backoff')
+    assert.deepEqual(ensured, [60_000, 360_000, 10_000_000], 'fresh recovery also respects the first backoff')
     now += 60_000
     await wd.tick()
-    assert.deepEqual(ensured, [60_000, 360_000, 10_060_000])
+    assert.deepEqual(ensured, [60_000, 360_000, 10_000_000, 10_120_000])
   } finally {
     kernelFaults.delete('vm-loop')
+  }
+})
+
+test('a faulted VM keeps one hourly revival retry for a down container', async () => {
+  let now = 0
+  const revived = []
+  const faults = []
+  const wd = createKernelWatchdog({
+    // 探针拿不到 relay → 走 observeRuntime，容器躺平（issue #1018 的形态）。
+    probeVm: () => null,
+    observeRuntime: async () => ({ state: 'stopped' }),
+    config: { restart_backoff_sec: [60, 300], restart_window_sec: 3600, fault_retry_sec: 3600 },
+    listTargets: () => [{ id: 'vm-down', inference_engine: 'rust', status: 'running' }],
+    homeDirFor: () => '/tmp/vm-down',
+    health: async () => null,
+    revive: async (vm) => {
+      revived.push([vm.id, now])
+      return { ok: true }
+    },
+    onFault: (vm, reason) => faults.push([vm.id, reason]),
+    now: () => now,
+  })
+  try {
+    await wd.tick() // 首退避未到
+    now = 60_000
+    await wd.tick() // revive #1
+    now = 360_000
+    await wd.tick() // revive #2
+    now = 380_000
+    await wd.tick() // budget 耗尽 → fault
+    assert.equal(revived.length, 2)
+    assert.equal(faults.length, 1)
+    assert.ok(kernelFaults.has('vm-down'))
+    now = 1_000_000
+    await wd.tick() // 冷却（380_000 + 3_600_000）未到：不重试
+    assert.equal(revived.length, 2, 'inside the cooldown a faulted container stays down')
+    now = 4_000_000
+    await wd.tick() // 到点：每小时一次的复活重试
+    assert.deepEqual(revived[2], ['vm-down', 4_000_000])
+    now = 4_100_000
+    await wd.tick() // 窗口内：不多试
+    assert.equal(revived.length, 3, 'only one revival retry per hour')
+  } finally {
+    kernelFaults.delete('vm-down')
+  }
+})
+
+test('fault_retry_sec=0 keeps the old behavior: a faulted VM never restarts again', async () => {
+  let now = 0
+  let health = { ok: true, healthy: false, unhealthy_reason: 'cli restarts spent' }
+  const ensured = []
+  const wd = createKernelWatchdog({
+    observeRuntime: async () => ({ state: 'running' }),
+    config: { restart_backoff_sec: [60, 300], restart_window_sec: 3600, fault_retry_sec: 0 },
+    listTargets: () => [{ id: 'vm-legacy', inference_engine: 'rust' }],
+    homeDirFor: () => '/tmp/vm-legacy',
+    health: async () => health,
+    ensure: async () => {
+      ensured.push(now)
+      return { ok: true }
+    },
+    now: () => now,
+  })
+  try {
+    await wd.tick()
+    now = 60_000
+    await wd.tick()
+    now = 360_000
+    await wd.tick()
+    now = 380_000
+    await wd.tick()
+    assert.deepEqual(ensured, [60_000, 360_000])
+    assert.ok(kernelFaults.has('vm-legacy'))
+    now = 100_000_000
+    await wd.tick()
+    assert.deepEqual(ensured, [60_000, 360_000], 'fault_retry_sec=0 disables the low-frequency retry')
+    health = { ok: true, healthy: true, ready_slots: 1, cli_pid: 1 }
+    await wd.tick()
+    assert.equal(kernelFaults.has('vm-legacy'), false, 'operator/health recovery still clears the fault')
+  } finally {
+    kernelFaults.delete('vm-legacy')
   }
 })
 
