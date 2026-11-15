@@ -225,11 +225,13 @@ import {
   switchInheritedInferenceEngines,
   slotExec,
 } from '../vm/slot-runtime.mjs'
-import { recreateVmFiles, seedFreshCliHome } from '../vm/vm-recreate.mjs'
+import { preflightFreshClaudeKernels, recreateVmFiles, seedFreshCliHome } from '../vm/vm-recreate.mjs'
 import { diagnoseSlotServices, powerOnSlot, recoverSlot, redactSecrets } from '../vm/slot-recovery.mjs'
 import { commitVmPackage, exportVmPackage, parseVmPackage } from '../vm/vm-package.mjs'
 import { slotMigrationBusy, slotMigrationJob, startSlotMigration } from '../cluster/slot-migration.mjs'
 import { isNativeNodeVm, preflightNode } from '../cluster/placement.mjs'
+import { stageFreshClaudeKernels } from '../cluster/remote-slot-files.mjs'
+import { cragSlotPayload } from '../cluster/slot-image.mjs'
 import { probeLocalKvm } from '../vm/kvm-host.mjs'
 import { normalizeVmConfig, resolveMachineSpec, validateVmConfigPatch } from '../vm/machine-spec.mjs'
 import { raiseDockerSlotMemory } from '../vm/docker-slot-memory.mjs'
@@ -2690,6 +2692,7 @@ export function createPanelHandler(ctx) {
           panel.ok({
             vm: normalizeVmConfig(ctx.routingConfig?.vm),
             kvm,
+            crag_supported: process.platform === 'linux' && process.arch === 'x64',
           }),
         )
       }
@@ -4702,6 +4705,22 @@ export function createPanelHandler(ctx) {
         const startNow = body.start !== false && body.status !== 'stopped'
         const wantKernel = body.kernel && OS_CATALOG[body.kernel] ? body.kernel : kernelForIndex(idx)
         const nodeId = body.node_id ? String(body.node_id) : null
+        const kindProbe = { node_id: nodeId }
+        stampVmKind(kindProbe, body)
+        const codexCreate = isCodexVm(kindProbe)
+        if (Object.hasOwn(body, 'dataplane') && (codexCreate || !['wrap', 'crag'].includes(body.dataplane))) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'invalid_create_dataplane', message: '仅 Anthropic 支持选择 cli-node 或 CRAG 推理内核' },
+          })
+        }
+        const selectedCrag = body.dataplane === 'crag'
+        let cragSupported = nodeId ? !isNativeNodeVm(kindProbe) : process.platform === 'linux' && process.arch === 'x64'
+        const unsupportedCrag = () =>
+          json(res, 409, {
+            ok: false,
+            error: { code: 'crag_v2_unsupported_placement', message: '此机器不支持 CRAG，只安装标准内核' },
+          })
         const vmDefaults = normalizeVmConfig(ctx.routingConfig?.vm)
         const requestedRuntime = body.runtime_type
         let runtime
@@ -4740,9 +4759,8 @@ export function createPanelHandler(ctx) {
               error: { code: 'placement_forbidden', message: '只有管理员可以把虚拟机放到集群节点' },
             })
           }
-          const kindProbe = { node_id: nodeId }
-          stampVmKind(kindProbe, body)
-          if (isCodexVm(kindProbe) && !slotHost(kindProbe).supports('codex')) {
+          if (selectedCrag && !cragSupported) return unsupportedCrag()
+          if (codexCreate && !slotHost(kindProbe).supports('codex')) {
             return json(res, 400, {
               ok: false,
               error: { code: 'remote_unsupported', message: '集群节点上的虚拟机暂不支持此操作' },
@@ -4757,6 +4775,9 @@ export function createPanelHandler(ctx) {
               error: { code: e?.code || 'placement_failed', message: String(e?.message || e) },
             })
           }
+          const arch = preflight.checks.find((check) => check.id === 'arch')
+          if (selectedCrag && arch && !arch.ok) return unsupportedCrag()
+          cragSupported = cragSupported && arch?.ok === true
           if (!preflight.ok) {
             return json(res, 409, {
               ok: false,
@@ -4768,6 +4789,8 @@ export function createPanelHandler(ctx) {
             })
           }
         }
+        if (selectedCrag && !cragSupported) return unsupportedCrag()
+        const preinstallBoth = !codexCreate && cragSupported
         // An explicit exit (e.g. local egress for a node: that VPS's own route) replaces auto-allocation.
         let pickedProxyId = typeof body.proxy_id === 'string' ? body.proxy_id.trim() : ''
         if (pickedProxyId && isLocalEgressId(pickedProxyId)) {
@@ -4900,6 +4923,12 @@ export function createPanelHandler(ctx) {
         }
         if (nodeId) vm.node_id = nodeId
         stampVmKind(vm, body)
+        if (!codexCreate) vm.dataplane = body.dataplane ?? 'wrap'
+        if (selectedCrag) {
+          vm.crag_kernel_version = 'v2'
+          // Do not publish a running record before the selected CRAG has passed licensing.
+          vm.status = 'stopped'
+        }
         const openaiPolicy = normalizeOpenAIQuotaPolicy(ctx.routingConfig?.codex?.quota)
         const explicitConcurrency =
           Object.prototype.hasOwnProperty.call(body, 'max_concurrency') ||
@@ -4959,6 +4988,19 @@ export function createPanelHandler(ctx) {
           vm.policy.maxRpm = explicitRpm ? rawRpm : Number(ctx.routingConfig?.concurrency?.default_max_rpm ?? 0)
           vm.policy.rpmOverride = explicitRpm
         }
+        if (preinstallBoth) {
+          const project = cfg.paths.project
+          const missing = '请在「内核」页拉取可信内核包后重试。'
+          try {
+            preflightFreshClaudeKernels(project, vm)
+            if (nodeId) cragSlotPayload(project, { required: true })
+          } catch (error) {
+            return json(res, 409, {
+              ok: false,
+              error: { code: error.code || 'kernel_package_missing', message: missing },
+            })
+          }
+        }
         atomicWriteJson(vmPath, vm, { mode: 0o600 })
         writeGuestMachineIdFile(cfg.paths.project, id, generated.guest_machine_id)
         let allocated = null
@@ -4993,12 +5035,19 @@ export function createPanelHandler(ctx) {
         }
         let startError = null
         try {
-          seedFreshCliHome(cfg.paths.project, vm, { routing: ctx.routingConfig, preinstallCrag: true })
+          seedFreshCliHome(cfg.paths.project, vm, {
+            routing: ctx.routingConfig,
+            preinstallBoth: preinstallBoth && !nodeId,
+          })
+          if (preinstallBoth && nodeId) await stageFreshClaudeKernels(vm, cfg.paths.project)
         } catch (error) {
           const code = /^[a-z0-9_]+$/i.test(error.code || '') ? error.code : 'vm_init_failed'
           startError = `虚拟机初始化失败（${code}）`
           patchVmRecord(cfg.paths.project, id, { status: 'error' })
           markUnschedulable(cfg.paths.project, id, 'runtime_start_failed', { message: startError })
+        }
+        if (!startError && selectedCrag && !checkCragLicense(cfg.paths.project, vm, ctx.routingConfig).ok) {
+          startError = '已预装 CRAG，激活本槽授权后再启动'
         }
         if (!startError && body.activate === true) {
           try {

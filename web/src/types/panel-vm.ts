@@ -176,6 +176,8 @@ export type KvmProbe = {
 export type VmCreateOptions = {
   vm: unknown
   kvm: KvmProbe
+  /** CRAG support for this machine only; cluster nodes use their placement preflight. */
+  crag_supported: boolean
 }
 
 export type VmSmbios = {

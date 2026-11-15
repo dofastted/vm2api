@@ -78,6 +78,37 @@ export type CreateVmAfter = 'idle' | 'start' | 'proxy' | 'active' | 'full'
 
 type Platform = 'anthropic' | 'openai'
 
+type CreateVmDataplane = 'wrap' | 'crag'
+
+const DATAPLANE_LABEL: Record<CreateVmDataplane, string> = {
+  wrap: 'cli-node（标准，默认）',
+  crag: 'CRAG（需授权）',
+}
+
+const CRAG_UNSUPPORTED = '此机器不支持 CRAG，只安装标准内核'
+
+function cragDisabledReason(
+  placement: Placement,
+  localSupported: boolean | undefined,
+  localPending: boolean
+): string | null {
+  if (!placement.nodeId) {
+    if (localSupported === true) return null
+    return localPending ? '正在检测本机 CRAG 支持情况…' : CRAG_UNSUPPORTED
+  }
+
+  const node = placement.nodes.find((n) => n.id === placement.nodeId)
+  const preflight = placement.preflight.data
+  if (
+    node?.platform === 'darwin' ||
+    preflight?.checks.some((c) => c.id === 'arch' && !c.ok)
+  ) {
+    return CRAG_UNSUPPORTED
+  }
+  // Older nodes without a platform are Linux; their preflight already checks amd64.
+  return preflight?.ok === true ? null : '目标节点通过 Linux amd64 预检后可选。'
+}
+
 type CreateVmResponse = {
   id?: string
   vm_id?: string
@@ -119,6 +150,9 @@ export interface CreateVmDraft {
   pinnedAfter?: CreateVmAfter
   platform: Platform
   setPlatform: (next: Platform) => void
+  dataplane: CreateVmDataplane
+  setDataplane: (next: CreateVmDataplane) => void
+  cragDisabledReason: string | null
   kernel: string
   setKernel: (next: string) => void
   name: string
@@ -168,6 +202,7 @@ export function useCreateVmDraft({
 } = {}): CreateVmDraft {
   const qc = useQueryClient()
   const [platform, setPlatform] = useState<Platform>('anthropic')
+  const [preferredDataplane, setDataplane] = useState<CreateVmDataplane>('wrap')
   const [kernel, setKernel] = useState<string>(KERNELS[0].id)
   const [name, setName] = useState('')
   const [after, setAfter] = useState<string>(pinnedAfter || 'start')
@@ -190,6 +225,17 @@ export function useCreateVmDraft({
 
   const typedName = name.trim()
   const placement = usePlacement(kernel, preferredRuntime, nodeId)
+  const disabledReason = cragDisabledReason(
+    placement,
+    createOptions.data?.crag_supported,
+    createOptions.isPending
+  )
+  const dataplane =
+    platform === 'anthropic' && disabledReason === null
+      ? preferredDataplane
+      : 'wrap'
+  // 清除失效的选择，切回受支持的目标也不会自动选中 CRAG。
+  if (preferredDataplane !== dataplane) setDataplane(dataplane)
   const kvmAvail: KvmAvailability = placement.nodeId
     ? kvmAvailabilityFromPreflight({
         fetching: placement.preflight.isFetching,
@@ -230,6 +276,7 @@ export function useCreateVmDraft({
           ...deriveAfter(after),
           platform,
           family: platform === 'openai' ? 'codex' : 'claude',
+          ...(platform === 'anthropic' ? { dataplane } : {}),
           ...(nodeId ? { node_id: nodeId } : {}),
           ...(wantsExit && exit.proxyId ? { proxy_id: exit.proxyId } : {}),
           ...createMachinePayload({ runtimeType, memory, vcpus, diskGb }),
@@ -276,6 +323,9 @@ export function useCreateVmDraft({
     pinnedAfter,
     platform,
     setPlatform,
+    dataplane,
+    setDataplane,
+    cragDisabledReason: disabledReason,
     kernel,
     setKernel,
     name,
@@ -364,6 +414,9 @@ export function draftSpecRows(d: CreateVmDraft): SpecRow[] {
         <PlatformChip kind={d.platform === 'openai' ? 'codex' : 'claude'} />
       ),
     },
+    ...(d.platform === 'anthropic'
+      ? [{ label: '推理内核', value: DATAPLANE_LABEL[d.dataplane] }]
+      : []),
     {
       label: '形态',
       value:
@@ -481,8 +534,8 @@ function kvmDetail(avail: KvmAvailability, remote: boolean): ReactNode {
 }
 
 /**
- * 创建槽位的表单。顺序即决策顺序：先定账号平台与机器形态，
- * 再定系统与规格，最后才是放置与名称这类可以不管的项。
+ * 创建槽位的表单。先定账号平台与推理内核，再定机器形态、系统与规格，
+ * 最后才是放置与名称这类可以不管的项。
  *
  * variant=flow：导入流程第 1 步，规格单在页面右栏，按钮是「创建空槽」。
  * variant=dialog：槽位页快捷创建，多一节「创建后」，带取消。
@@ -520,6 +573,32 @@ export function CreateVmForm({
           ]}
         />
       </Section>
+
+      {d.platform === 'anthropic' ? (
+        <Section
+          title='推理内核'
+          hint={
+            d.cragDisabledReason === null
+              ? '两套内核均预装，此处只选择运行内核'
+              : undefined
+          }
+        >
+          <ChoiceTiles
+            label='推理内核'
+            value={d.dataplane}
+            onChange={d.setDataplane}
+            choices={[
+              { value: 'wrap', title: DATAPLANE_LABEL.wrap },
+              {
+                value: 'crag',
+                title: DATAPLANE_LABEL.crag,
+                disabled: d.cragDisabledReason !== null,
+                detail: d.cragDisabledReason,
+              },
+            ]}
+          />
+        </Section>
+      ) : null}
 
       <Section title='形态' hint='容器轻、快；虚拟机给每个槽一台独立的机器。'>
         <ChoiceTiles

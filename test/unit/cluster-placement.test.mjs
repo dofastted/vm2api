@@ -34,6 +34,7 @@ import {
   pushSlotFiles,
   reconcileSlotCredentials,
   remoteSlotPath,
+  stageFreshClaudeKernels,
 } from '../../src/lib/cluster/remote-slot-files.mjs'
 import { cragSlotPayload, slotImageAction, slotImageSpec } from '../../src/lib/cluster/slot-image.mjs'
 import { tarStream } from '../../src/lib/cluster/tar.mjs'
@@ -173,6 +174,52 @@ function localSlot(cred) {
 }
 
 const vm = { id: 'vm-07', node_id: 'node-t' }
+
+test('fresh node staging requires both kernels without publishing guest selection or credentials', async (t) => {
+  if (process.arch !== 'x64') return t.skip('requires an amd64 CRAG fixture')
+  const node = fakeNode()
+  const root = tmpDir('kin-slot-fresh-kernels-')
+  const wrap = path.join(root, 'share/wrap-cli')
+  const saved = ['KIN_WRAP_CLI_ROOT', 'KIN_KERNEL_BIN', 'KIN_CRAG_V2_ROOT'].map((key) => [key, process.env[key]])
+  for (const [key] of saved) delete process.env[key]
+  bindPlacement({
+    projectRoot: root,
+    manager: { client: () => node.session.client, remoteHost: async () => node.session.host },
+  })
+  t.after(() => {
+    unbindPlacement()
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const target = { ...vm, runtime: { type: 'kvm' }, dataplane: 'crag' }
+  const remote = `${node.session.host.root}/vms/${vm.id}`
+  const selector = `${remote}/cli-home/.kin/kin-kernel`
+  node.files.set(selector, Buffer.from('existing-selector'))
+  node.files.set(node.remoteCred, Buffer.from('rotated-credential'))
+
+  await assert.rejects(stageFreshClaudeKernels(target, root), { code: 'kernel_package_missing' })
+  fs.mkdirSync(wrap, { recursive: true })
+  for (const name of ['cli-node', 'kin-kernel.bin']) fs.writeFileSync(path.join(wrap, name), name)
+  await assert.rejects(stageFreshClaudeKernels(target, root), { code: 'slot_payload_missing' })
+  seedEncryptedPackage(root)
+
+  const staged = await stageFreshClaudeKernels(target, root)
+  assert.equal(staged.ok, true)
+  assert.equal(node.files.get(`${remote}/slot-bin/cli-node`)?.toString(), 'cli-node')
+  assert.equal(node.files.get(`${remote}/slot-bin/kin-kernel.bin`)?.toString(), 'kin-kernel.bin')
+  assert.match(node.files.get(`${remote}/slot-bin/kin-kernel`)?.toString(), /kin-kernel\.bin/)
+  for (const file of cragSlotPayload(root).files) {
+    const dest = `${remote}/slot-bin/${file.name.slice('opt/kin/'.length)}`
+    assert.deepEqual(node.files.get(dest), file.body || fs.readFileSync(file.src))
+  }
+  assert.equal(node.files.get(selector)?.toString(), 'existing-selector')
+  assert.equal(node.files.get(node.remoteCred)?.toString(), 'rotated-credential')
+  assert.equal(node.files.has(`${remote}/run/kernel.json`), false)
+  assert.equal(node.published.includes(selector), false)
+})
 
 test('KVM binary publication requires a complete CRAG preinstall even while cli-node is selected', async (t) => {
   const node = fakeNode()
