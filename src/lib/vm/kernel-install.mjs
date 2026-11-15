@@ -1,8 +1,9 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
-import { describeKernelCatalog } from '../admin/kernel-catalog.mjs'
+import { describeKernelCatalog, reserveKernelInstallCache } from '../admin/kernel-catalog.mjs'
 import { isCragPayloadTag } from '../admin/release-kernel.mjs'
+import { isReleaseTag } from '../admin/release.mjs'
 import { writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 import {
   applyHold,
@@ -127,6 +128,12 @@ export function validateKernelTargets(projectRoot, targets) {
     if (!target || typeof target.id !== 'string' || !isValidVmId(target.id) || !PRODUCTS.has(target.kernel)) {
       return { ok: false, status: 400, code: 'kernel_target_invalid', error: '虚拟机 ID 或内核无效' }
     }
+    if (
+      target.expected_tag !== undefined &&
+      (typeof target.expected_tag !== 'string' || !isReleaseTag(target.expected_tag))
+    ) {
+      return { ok: false, status: 400, code: 'kernel_tag_invalid', error: '请选择有效的内核发行版本' }
+    }
     if (target.payload_tag !== undefined && (target.kernel !== 'crag' || !isCragPayloadTag(target.payload_tag))) {
       return { ok: false, status: 400, code: 'kernel_target_invalid', error: 'CRAG 载荷版本无效' }
     }
@@ -174,6 +181,7 @@ export async function installKernelTargets({
         let operationPersisted = false
         let interrupted = false
         let clusterVm = false
+        let releaseCache
         const inheritedSafetyHold = !!watchdog && safetyHolds.get(file) === watchdog
         let phase = 'kernel_preflight_failed'
         try {
@@ -193,11 +201,20 @@ export async function installKernelTargets({
           }
           const unsupported = placementFailure(vm, target.kernel)
           if (unsupported) return failure(target, unsupported.code, unsupported.error)
+          if (target.expected_tag || target.payload_tag) {
+            releaseCache = reserveKernelInstallCache(projectRoot, target.kernel)
+            if (!releaseCache) {
+              interrupted = Boolean(resumeId)
+              return failure(target, 'kernel_pull_busy', '正在重装同类内核，请稍后重试')
+            }
+          }
           const desired = desiredVm(vm, target.kernel)
           const catalog = (ops.describeKernelCatalog || describeKernelCatalog)(projectRoot)
           const product = catalog.find((item) => item.id === target.kernel)
           if (!product?.ready)
             return failure(target, product?.code || 'kernel_package_missing', product?.error || '请先拉取所选内核')
+          if (target.expected_tag && product.release_tag !== target.expected_tag)
+            return failure(target, 'kernel_release_changed', `缓存版本已变化，请重新拉取并确认 ${target.expected_tag}`)
           if (isKvmRuntime(vm) && target.kernel !== 'crag') {
             const crag = catalog.find((item) => item.id === 'crag')
             if (!crag?.ready)
@@ -219,6 +236,7 @@ export async function installKernelTargets({
             record.kernel_operation = {
               id: operationId,
               kernel: target.kernel,
+              ...(target.expected_tag ? { expected_tag: target.expected_tag } : {}),
               ...(target.payload_tag ? { payload_tag: target.payload_tag } : {}),
               phase: 'pending',
               recovery_attempts: resumeId ? (previous.recovery_attempts || 0) + 1 : 0,
@@ -232,10 +250,16 @@ export async function installKernelTargets({
           phase = 'kernel_drain_failed'
           const drained = await waitForSlotDrain(poolScheduler, [target.id])
           if (!drained.ok) return failure(target, phase, '在途请求未结束，未重启内核')
-          if (target.payload_tag) {
+          if (target.expected_tag || target.payload_tag) {
             const current = (ops.describeKernelCatalog || describeKernelCatalog)(projectRoot).find(
-              (item) => item.id === 'crag',
+              (item) => item.id === target.kernel,
             )
+            if (target.expected_tag && current?.release_tag !== target.expected_tag)
+              return failure(
+                target,
+                'kernel_release_changed',
+                `缓存版本已变化，请重新拉取并确认 ${target.expected_tag}`,
+              )
             if (!matchesPayload(current)) return changedPayload()
           }
           phase = 'kernel_stop_failed'
@@ -270,6 +294,13 @@ export async function installKernelTargets({
               target,
               installedProduct?.code || 'kernel_package_missing',
               installedProduct?.error || '内核缓存已变化，请重新拉取',
+              true,
+            )
+          if (target.expected_tag && installedProduct.release_tag !== target.expected_tag)
+            return failure(
+              target,
+              'kernel_release_changed',
+              `缓存版本已变化，请重新拉取并确认 ${target.expected_tag}`,
               true,
             )
           if (!matchesPayload(installedProduct)) return changedPayload(true)
@@ -358,6 +389,7 @@ export async function installKernelTargets({
             stopped,
           )
         } finally {
+          releaseCache?.()
           if (operationPersisted && !installed) {
             // Lost acknowledgements retain intent; deterministic failures need operator attention.
             try {
@@ -406,7 +438,12 @@ export async function resumePendingKernelInstalls({ projectRoot, routing = {}, w
     const result = await installKernelTargets({
       projectRoot,
       targets: [
-        { id: vm.id, kernel: pending.kernel, ...(pending.payload_tag ? { payload_tag: pending.payload_tag } : {}) },
+        {
+          id: vm.id,
+          kernel: pending.kernel,
+          ...(pending.expected_tag ? { expected_tag: pending.expected_tag } : {}),
+          ...(pending.payload_tag ? { payload_tag: pending.payload_tag } : {}),
+        },
       ],
       routing,
       watchdog,

@@ -12,7 +12,9 @@ import {
 
 test('CRAG metadata selects published component payloads and preserves kernel tags', async () => {
   const seen = []
-  const assets = [{ name: CRAG_V2_RELEASE_ASSET, size: 10 }]
+  const assets = [
+    { name: CRAG_V2_RELEASE_ASSET, size: 10, url: 'https://api.github.com/repos/dofastted/vm2api/releases/assets/1' },
+  ]
   const fetchImpl = async (url) => {
     seen.push(String(url))
     return Response.json([

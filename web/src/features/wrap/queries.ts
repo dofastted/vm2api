@@ -10,6 +10,7 @@ export type KernelProduct = {
   paid: boolean
   ready: boolean
   version: string | null
+  release_tag?: string
   updated_at: string | null
   release_options?: { tag: string; label: string }[]
   payload_tag?: string
@@ -33,6 +34,7 @@ export type KernelCatalog = {
 export type KernelTarget = {
   id: string
   kernel: KernelId
+  expected_tag?: string
   payload_tag?: string
 }
 
@@ -62,9 +64,17 @@ export function kernelCatalogQueryOptions() {
   })
 }
 
-export function pullKernelRelease(
-  body: { kernel: 'cli-node'; tag?: string } | { kernel: 'crag'; tag: string }
-) {
+export function kernelVersionsQueryOptions() {
+  return queryOptions({
+    queryKey: ['panel', 'kernel-releases'] as const,
+    queryFn: () =>
+      api<Record<KernelId, string[]>>('/api/panel/kernels/releases'),
+    staleTime: 5 * 60_000,
+    retry: false,
+  })
+}
+
+export function pullKernelRelease(body: { kernel: KernelId; tag?: string }) {
   return api<{
     kernel: KernelProduct
     release?: {

@@ -199,7 +199,7 @@ import {
   readHostUpgradeStatus,
   startHostUpgrade,
 } from './release.mjs'
-import { downloadReleaseKernel, kernelReleaseHttpStatus } from './release-kernel.mjs'
+import { downloadReleaseKernel, kernelReleaseHttpStatus, listKernelReleaseVersions } from './release-kernel.mjs'
 import { describeKernelCatalog, pullKernelRelease } from './kernel-catalog.mjs'
 import { installKernelTargets, releaseKernelInstallSafetyHold, validateKernelTargets } from '../vm/kernel-install.mjs'
 import { withSlotMaintenance } from '../vm/slot-maintenance.mjs'
@@ -2693,6 +2693,17 @@ export function createPanelHandler(ctx) {
         }
         return json(res, 200, panel.ok({ kernels: describeKernelCatalog(cfg.paths.project), licenses, installations }))
       }
+      if (req.method === 'GET' && p === '/api/panel/kernels/releases') {
+        try {
+          const releases = await listKernelReleaseVersions({ fetchImpl: ctx.fetchImpl })
+          return json(res, 200, panel.ok(releases))
+        } catch {
+          return json(res, 502, {
+            ok: false,
+            error: { code: 'kernel_releases_unavailable', message: '暂时无法读取发行版本' },
+          })
+        }
+      }
       if (req.method === 'POST' && p === '/api/panel/kernels/pull') {
         const body = await readBody(req, 8 * 1024)
         if (
@@ -2707,7 +2718,7 @@ export function createPanelHandler(ctx) {
         }
         const result = await pullKernelRelease(
           cfg.paths.project,
-          { kernel: body.kernel, tag: body.tag || '' },
+          { kernel: body.kernel, tag: body.tag || '', latest: true },
           { fetchImpl: ctx.fetchImpl },
         )
         if (!result.ok)
