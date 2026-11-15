@@ -332,6 +332,8 @@ Analytics 按官方 [`codex_thread_initialized`](https://github.com/openai/codex
 
 `compatibility.crag_persona_preset`（`official_full` / `zero`，缺省 `official_full`）只给 CRAG v2 print 清洗，不投影进 `kernel.json`。v2 worker 不读 `persona_preset` 或 `CLAUDE_CODE_SYSTEM_LAYOUT`。`official_full` 只 append 调用方尾巴；`zero` 送 `crag_prompt.mode=replace`。其它值保存时 400。槽位显式 `zero` 覆盖该档；其它槽位人设在 print 上收成 append。这不是 TUI：不关内置工具，也不加 `--no-chrome`。
 
+`compatibility.crag_fold_history_system`（缺省开，写 `false` 关闭）：CRAG print 前把历史里的 `role: "system"` 消息改成 `<system-reminder>` 文本，并入前一条 user 消息（前一条是 assistant 时并入下一条 user，放在 tool_result 之后）；带图片等非文本内容的、找不到 user 可并的保持原样。Claude Code 几乎每轮都追加一条这类消息，不折叠时 CRAG `--resume` 重放出的请求每轮只命中 tools + system，整段对话按 1h 重写。
+
 `compatibility.cc_entrypoint`（`cli` / `sdk-cli`，缺省 `cli`）：OAuth 请求的 Node 协议清洗与 worker envelope 每次读取当前配置，UA 入口覆盖槽位身份中旧的 `sdk-cli` / `cli`，版本仍由槽位身份 / 代码 pin 提供。网关生成的 billing 使用同一入口，调用方已有 billing 不改写；Setup Token / API Key 的 inference-only UA 不变。保存同时投影到 Claude 槽的 `kernel.json.cc_entrypoint`，由支持该字段的 cli-node 在下次请求生成最终 UA；不需要为此次 Node 修复重建 CLI。
 
 

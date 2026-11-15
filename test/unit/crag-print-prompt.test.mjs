@@ -8,6 +8,7 @@ import {
   callerCwdDeclaration,
   callerSystemTail,
   cragV2KernelActive,
+  foldHistorySystemMessages,
   prepareCragPrintBody,
   projectCallerSystem,
   readSlotKernelConfig,
@@ -291,7 +292,7 @@ test('summary cleanup preserves result text, media, errors and historical tool p
   current.is_error = true
   current.cache_control = { type: 'ephemeral', ttl: '1h' }
   const before = structuredClone(body)
-  const out = prepareCragPrintBody(body, { agentSummary: true, officialPassthrough: true })
+  const out = prepareCragPrintBody(body, { agentSummary: true, officialPassthrough: true, foldSystemMessages: false })
   assert.deepEqual(out.messages.slice(0, 4), before.messages.slice(0, 4))
   assert.deepEqual(out.messages[4].content, [
     { type: 'text', text: '[tool result test-tool (error)]', cache_control: current.cache_control },
@@ -301,5 +302,94 @@ test('summary cleanup preserves result text, media, errors and historical tool p
   assert.deepEqual(out.messages[5], before.messages[5])
   assert.deepEqual(body, before)
   // A normal continuation, including a tool reporting this error, remains live.
-  assert.deepEqual(prepareCragPrintBody(body).messages, before.messages)
+  assert.deepEqual(prepareCragPrintBody(body, { foldSystemMessages: false }).messages, before.messages)
+})
+
+const sysTurn = (text, extra = {}) => ({ role: 'system', content: [{ type: 'text', text, ...extra }] })
+const userTurn = (content) => ({ role: 'user', content })
+const asstTurn = (content) => ({ role: 'assistant', content })
+
+test('history system turns fold into the preceding user turn as reminders', () => {
+  const cc = { type: 'ephemeral', ttl: '1h' }
+  const messages = [
+    userTurn('hi'),
+    sysTurn('# Environment update\n - cwd: /a'),
+    asstTurn([{ type: 'text', text: 'ok' }]),
+    userTurn([{ type: 'text', text: 'next' }]),
+    sysTurn('<total_tokens>9 tokens left</total_tokens>', { cache_control: cc }),
+  ]
+  const out = prepareCragPrintBody({ messages, system: 'caller' }).messages
+  assert.deepEqual(
+    out.map((m) => m.role),
+    ['user', 'assistant', 'user'],
+  )
+  assert.deepEqual(out[0].content, [
+    { type: 'text', text: 'hi' },
+    { type: 'text', text: '<system-reminder>\n# Environment update\n - cwd: /a\n</system-reminder>' },
+  ])
+  assert.deepEqual(out[2].content.at(-1), {
+    type: 'text',
+    text: '<system-reminder>\n<total_tokens>9 tokens left</total_tokens>\n</system-reminder>',
+    cache_control: cc,
+  })
+  assert.equal(messages[0].content, 'hi', 'caller history is not mutated')
+})
+
+test('folding keeps earlier turns byte-stable as history grows', () => {
+  const turn1 = [userTurn('hi'), sysTurn('note 1')]
+  const turn2 = [...turn1, asstTurn('ok'), userTurn('again'), sysTurn('note 2')]
+  const a = prepareCragPrintBody({ messages: turn1 }).messages
+  const b = prepareCragPrintBody({ messages: turn2 }).messages
+  assert.deepEqual(b.slice(0, a.length), a)
+})
+
+test('a system turn after an assistant turn joins the next user turn after its tool results', () => {
+  const messages = [
+    userTurn('go'),
+    asstTurn([{ type: 'tool_use', id: 't1', name: 'Bash', input: {} }]),
+    sysTurn('<system-reminder>\nfile changed\n</system-reminder>'),
+    userTurn([
+      { type: 'tool_result', tool_use_id: 't1', content: 'done' },
+      { type: 'text', text: 'and' },
+    ]),
+  ]
+  const out = foldHistorySystemMessages(messages)
+  assert.deepEqual(
+    out.map((m) => m.role),
+    ['user', 'assistant', 'user'],
+  )
+  assert.deepEqual(
+    out[2].content.map((b) => b.type + (b.text ? `:${b.text}` : '')),
+    ['tool_result', 'text:<system-reminder>\nfile changed\n</system-reminder>', 'text:and'],
+  )
+})
+
+test('system turns that cannot fold keep their original shape', () => {
+  const image = {
+    role: 'system',
+    content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AA' } }],
+  }
+  const trailing = [userTurn('q'), asstTurn('a'), sysTurn('late')]
+  assert.deepEqual(foldHistorySystemMessages(trailing), trailing)
+  const withImage = [userTurn('q'), image]
+  assert.deepEqual(foldHistorySystemMessages(withImage), withImage)
+  const plain = [userTurn('q')]
+  assert.equal(foldHistorySystemMessages(plain), plain)
+  const off = prepareCragPrintBody({ messages: [userTurn('q'), sysTurn('n')] }, { foldSystemMessages: false })
+  assert.deepEqual(
+    off.messages.map((m) => m.role),
+    ['user', 'system'],
+  )
+})
+
+test('an agent summary keeps its trailing budget turns but folds shared history', () => {
+  const body = agentBody({ summary: true })
+  body.messages.splice(1, 0, sysTurn('# Environment update'))
+  const out = prepareCragPrintBody(body, { agentSummary: true }).messages
+  assert.equal(out.at(-1).role, 'system')
+  assert.equal(
+    out.slice(0, -1).some((m) => m.role === 'system'),
+    false,
+  )
+  assert.ok(out[0].content.at(-1).text.includes('# Environment update'))
 })

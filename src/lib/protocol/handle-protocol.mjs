@@ -1738,6 +1738,7 @@ export function createHandleProtocol(deps) {
                 officialPassthrough,
                 capabilities: Array.isArray(caps) ? caps : [],
                 agentSummary: !!summarySession,
+                foldSystemMessages: routingNow?.compatibility?.crag_fold_history_system !== false,
               })
               hopBody = await materializeRemoteImageSources(hopBody)
               if (identity) {
