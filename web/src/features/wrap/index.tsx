@@ -172,7 +172,8 @@ export function WrapSamplePage() {
     const pending = targets.find(
       ({ kernel }) =>
         selectedTags[kernel] !== 'latest' &&
-        products.get(kernel)?.release_tag !== selectedTags[kernel]
+        (products.get(kernel)?.payload_tag ||
+          products.get(kernel)?.release_tag) !== selectedTags[kernel]
     )
     if (pending) {
       toast.error(
