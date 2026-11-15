@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- CRAG [3.0.8 标准版](docs/releases/crag-native-v3.0.8.json)和 [3.0.8 旧离线授权兼容版](docs/releases/crag-native-v3.0.8-legacy.json)修复 Auto 分类请求携带 `metadata` 时返回 400（#1072），以及串行工具回调等待整批结果的互等；不新增终端 stdout 实时流。
+
 ## 1.4.104 — 2026-11-15 · CRAG 套餐只读预览
 
 - CRAG Auth 套餐编辑器可嵌入 `/#/crag-preview` 预览未发布草稿，查看固定套餐、自定义槽位与时长、库存及续费提示。预览只回传卡片选择，不请求面板 API，也不会发布套餐、下单或激活。

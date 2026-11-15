@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "component": "crag-native",
+  "version": "3.0.8",
+  "variant": "legacy",
+  "source_repository": "dofastted/crag",
+  "source_commit": "bb6324d113f99439c4a3c34c8a946372e3eac139",
+  "source_version_override": "3.0.8",
+  "shared_source_delta": {
+    "from": "bc6bc6456c93037a640867eda25b2d8aef583561",
+    "to": "b851d545818732ce9b125c9141a4b45fed7e267a",
+    "paths": ["src/v2", "runtime/linux-tui-tap.js", "runtime/native-tui-input.mjs", "runtime/tui-request-options.mjs", "tests"]
+  },
+  "payload_release": "payload-2026.11.15-crag-3.0.8-legacy",
+  "baseline_payload_release": "payload-2026.11.15-crag-3.0.7-legacy",
+  "core_sha256": "2843e1074433f3068a804309948fbc01469d51c7567f2b6353de308d9e2ac26b",
+  "manifest_sha256": "1893360f958668f1940c86081a0e7a7b72be67704a5c287d94bfc3dd550b91aa",
+  "archive": {
+    "asset": "crag-v2-licensed-amd64.tar.gz",
+    "size": 169274806,
+    "sha256": "c5cb88603a0c5eb73f3b9a9c2de5cdaa204d6a9935fabbaa45aa9805ec8f8b13"
+  },
+  "build_environment": {
+    "mode": "container",
+    "image": "rust:1-bookworm@sha256:c9155318d07341301a78b45ecdd81af2e43b8b297d64e8fd4c5e80d7735607c3"
+  },
+  "official_claude": {
+    "version": "2.1.321",
+    "sha256": "426c33815ca6645a772f722fbff10dbf2cbdb124a8aeab733c1365dbf8bbf61f"
+  },
+  "authorization_migration": {
+    "payload_key_rotated": false,
+    "offline_activation": "The legacy package retains the 3.0.7-legacy issuer and payload key and preserves the expiry of existing valid CRAGU1 authorizations."
+  }
+}
