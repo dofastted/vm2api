@@ -11,6 +11,8 @@ export type KernelProduct = {
   ready: boolean
   version: string | null
   updated_at: string | null
+  release_options?: { tag: string; label: string }[]
+  payload_tag?: string
   code?: string
   error?: string
 }
@@ -19,6 +21,7 @@ export type KernelInstallation = {
   kernel: KernelId
   version: string | null
   installed_at: string
+  payload_tag?: string
 }
 
 export type KernelCatalog = {
@@ -27,7 +30,11 @@ export type KernelCatalog = {
   installations?: Record<string, KernelInstallation>
 }
 
-export type KernelTarget = { id: string; kernel: KernelId }
+export type KernelTarget = {
+  id: string
+  kernel: KernelId
+  payload_tag?: string
+}
 
 export type KernelInstallItem = KernelTarget & {
   ok: boolean
@@ -55,10 +62,17 @@ export function kernelCatalogQueryOptions() {
   })
 }
 
-export function pullKernelRelease(body: { kernel: KernelId; tag?: string }) {
+export function pullKernelRelease(
+  body: { kernel: 'cli-node'; tag?: string } | { kernel: 'crag'; tag: string }
+) {
   return api<{
     kernel: KernelProduct
-    release?: { tag: string; version: string; asset: string }
+    release?: {
+      tag: string
+      version: string
+      asset: string
+      payload_tag?: string
+    }
   }>('/api/panel/kernels/pull', {
     method: 'POST',
     body: JSON.stringify(body),

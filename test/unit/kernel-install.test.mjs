@@ -722,6 +722,32 @@ test('package publication during asynchronous stop reports the version actually 
   assert.ok(fs.readFileSync(path.join(home, '.kin', 'kin-kernel.bin')).equals(elf('new-publication')))
 })
 
+test('a confirmed CRAG payload cannot install another variant of the same version', async (t) => {
+  const { root, vm } = fixture(t)
+  activateFixture(root, vm)
+  const standard = 'payload-2026.11.15-crag-3.0.5'
+  const legacy = `${standard}-legacy`
+  let cached = standard
+  const life = lifecycle(root, {
+    describeKernelCatalog: () => [{ id: 'crag', ready: true, version: '3.0.5', payload_tag: cached }],
+  })
+  const install = () =>
+    installKernelTargets({
+      projectRoot: root,
+      targets: [{ id: vm.id, kernel: 'crag', payload_tag: legacy }],
+      ops: life.ops,
+    })
+  const refused = await install()
+  assert.equal(refused.items[0].code, 'crag_payload_changed')
+  assert.equal(refused.items[0].stopped, false)
+  assert.equal(getVm(root, vm.id).status, 'running')
+  cached = legacy
+  const installed = await install()
+  assert.equal(installed.ok, true, JSON.stringify(installed))
+  assert.equal(installed.items[0].payload_tag, legacy)
+  assert.equal(summarizeVm(getVm(root, vm.id), root).kernel_installation.payload_tag, legacy)
+})
+
 test('failed STOPPED persistence keeps the watchdog held rather than reviving stale running intent', async (t) => {
   const { root, vm, home } = fixture(t)
   const file = path.join(root, 'vms', `${vm.id}.json`)

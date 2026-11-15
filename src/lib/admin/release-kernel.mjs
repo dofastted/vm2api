@@ -12,8 +12,9 @@ export const CLI_NODE_RELEASE_ASSET = 'cli-node'
 export const CC_NODE_RELEASE_ASSET = 'cc-node'
 export const KERNEL_CRAG_RELEASE_ASSET = 'kin-kernel-crag'
 export const CRAG_V2_RELEASE_ASSET = 'crag-v2-licensed-amd64.tar.gz'
-const CRAG_PAYLOAD_TAG_PATTERN = 'payload-\\d{4}\\.\\d{2}\\.\\d{2}-crag-(\\d+\\.\\d+\\.\\d+)'
+const CRAG_PAYLOAD_TAG_PATTERN = 'payload-\\d{4}\\.\\d{2}\\.\\d{2}-crag-(\\d+\\.\\d+\\.\\d+)(-legacy)?'
 const CRAG_PAYLOAD_TAG = new RegExp(`^${CRAG_PAYLOAD_TAG_PATTERN}$`)
+export const isCragPayloadTag = (tag) => typeof tag === 'string' && CRAG_PAYLOAD_TAG.test(tag)
 const CRAG_RELEASES_PAGE_SIZE = 30
 const CRAG_RELEASES_MAX_PAGES = 10
 export const MAX_KERNEL_DOWNLOAD_BYTES = 32 * 1024 * 1024
@@ -101,9 +102,18 @@ export function selectReleaseAsset(payload, { name, maxBytes, missingCode, tooLa
   const apiUrl = typeof asset.url === 'string' ? asset.url : ''
   const browserUrl = typeof asset.browser_download_url === 'string' ? asset.browser_download_url : ''
   const scope = { crag: name === CRAG_V2_RELEASE_ASSET }
-  // GitHub's public asset URL works without a token and always serves bytes.
+  // A component download must belong to the exact published tag, not just the same version.
+  const expected =
+    scope.crag && isCragPayloadTag(payload.payload_tag)
+      ? `https://github.com/${GITHUB_REPO}/releases/download/${payload.payload_tag}/${name}`
+      : ''
   const candidates = scope.crag ? [browserUrl, apiUrl] : [apiUrl, browserUrl]
-  const url = candidates.find((candidate) => isAllowedKernelUrl(candidate, scope))
+  const url =
+    expected && browserUrl !== ''
+      ? browserUrl === expected
+        ? browserUrl
+        : undefined
+      : candidates.find((candidate) => isAllowedKernelUrl(candidate, scope))
   if (!url)
     return {
       ok: false,
@@ -266,7 +276,7 @@ async function fetchCragPayloadRelease(releasesUrl, version, fetchImpl) {
     if (!Array.isArray(rows)) throw coded('github_bad_json', 'GitHub Release 列表格式无效')
     for (const row of rows) {
       const match = CRAG_PAYLOAD_TAG.exec(row?.tag_name || '')
-      if (!match || row.draft !== false) continue
+      if (!match || match[2] || row.draft !== false) continue
       const tag = `v${match[1]}`
       if (version && version !== tag) continue
       if (
@@ -274,7 +284,7 @@ async function fetchCragPayloadRelease(releasesUrl, version, fetchImpl) {
         (!Array.isArray(row.assets) || !row.assets.some((asset) => asset?.name === CRAG_V2_RELEASE_ASSET))
       )
         continue
-      return { ...row, tag_name: tag }
+      return { ...row, tag_name: tag, payload_tag: row.tag_name }
     }
     if (rows.length < CRAG_RELEASES_PAGE_SIZE) break
   }
@@ -290,11 +300,20 @@ export async function fetchKernelReleaseMetadata({
   const requested = String(tag || '').trim()
   const configured = kernel === 'crag' ? String(cragReleaseTag || '').trim() : ''
   const trimmed = requested || configured
-  const normalized = trimmed ? normalizeTag(trimmed) : ''
-  if (trimmed && (!normalized || !isReleaseTag(normalized)))
-    throw coded('kernel_tag_invalid', 'Release tag 必须是 vX.Y.Z')
   if (!fetchImpl) throw coded('fetch_unavailable', 'fetch unavailable')
   const releasesUrl = `https://api.github.com/repos/${GITHUB_REPO}/releases`
+  if (kernel === 'crag' && isCragPayloadTag(trimmed)) {
+    const row = await fetchReleaseJson(`${releasesUrl}/tags/${trimmed}`, fetchImpl, 4 * 1024 * 1024)
+    if (row?.tag_name !== trimmed || row.draft !== false)
+      throw coded('github_http_404', `vm2api 没有发布对应的 CRAG 载荷 (${trimmed})`)
+    return { ...row, tag_name: `v${CRAG_PAYLOAD_TAG.exec(trimmed)[1]}`, payload_tag: trimmed }
+  }
+  const normalized = trimmed ? normalizeTag(trimmed) : ''
+  if (trimmed && (!normalized || !isReleaseTag(normalized)))
+    throw coded(
+      'kernel_tag_invalid',
+      kernel === 'crag' ? '请选择有效的 CRAG 版本或完整载荷标签' : 'Release tag 必须是 vX.Y.Z',
+    )
   if (kernel === 'crag') return fetchCragPayloadRelease(releasesUrl, normalized, fetchImpl)
   const payload = await fetchReleaseJson(`${releasesUrl}/${normalized ? `tags/${normalized}` : 'latest'}`, fetchImpl)
   if (!isReleaseTag(payload?.tag_name) || (normalized && payload.tag_name !== normalized))

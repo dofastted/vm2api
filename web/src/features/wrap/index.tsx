@@ -73,6 +73,7 @@ export function WrapSamplePage() {
   const dashboard = useQuery(dashboardQueryOptions())
   const me = useQuery(meQueryOptions())
   const canEdit = me.data?.role === 'admin'
+  const [cragPullDraft, setCragPullDraft] = useState<string>()
   const [drafts, setDrafts] = useState<Record<string, KernelId>>({})
   const [confirm, setConfirm] = useState<KernelTarget[] | null>(null)
   const [licenseVm, setLicenseVm] = useState<Vm | null>(null)
@@ -98,16 +99,28 @@ export function WrapSamplePage() {
     () => new Map(rows.map(({ vm }) => [vm.id, vm])),
     [rows]
   )
+  const cragProduct = catalog.data?.kernels.find(
+    (product) => product.id === 'crag'
+  )
+  const cragOptions = cragProduct?.release_options
+  const cragPullTag =
+    cragOptions?.find(({ tag }) => tag === cragPullDraft)?.tag ??
+    cragOptions?.[0]?.tag
+
+  function cragReleaseLabel(tag?: string) {
+    return cragOptions?.find((option) => option.tag === tag)?.label || tag
+  }
+
   const pull = useMutation({
-    mutationFn: (kernel: KernelId) => pullKernelRelease({ kernel }),
+    mutationFn: pullKernelRelease,
     onMutate: () => setPullError(null),
-    onSuccess: async (_data, kernel) => {
+    onSuccess: async (_data, { kernel }) => {
       await qc.invalidateQueries({
         queryKey: kernelCatalogQueryOptions().queryKey,
       })
       toast.success(`${KERNEL_NAMES[kernel]} 安装包已更新`)
     },
-    onError: (error: Error, kernel) => {
+    onError: (error: Error, { kernel }) => {
       const message =
         isApiError(error) && error.code === 'crag_v2_asset_missing'
           ? '发布源尚无 CRAG 授权包，现有版本未改动。'
@@ -127,6 +140,9 @@ export function WrapSamplePage() {
   const succeededCount = job
     ? Object.values(job.results).filter((item) => item.ok).length
     : 0
+  const confirmedCrag = confirm?.find((target) => target.kernel === 'crag')
+  const confirmedCragTag = confirmedCrag?.payload_tag
+  const confirmedCragLabel = cragReleaseLabel(confirmedCragTag)
   const missingLicenses = (confirm || []).filter(
     (target) =>
       target.kernel === 'crag' && !catalog.data?.licenses[target.id]?.valid
@@ -161,7 +177,15 @@ export function WrapSamplePage() {
       if (vm) setLicenseVm(vm)
       return
     }
-    setConfirm(targets)
+    // Pin the cache shown in the dialog, not the independently selected pull tag.
+    const cachedTag = cragProduct?.payload_tag
+    setConfirm(
+      targets.map((target) =>
+        target.kernel === 'crag' && cachedTag
+          ? { ...target, payload_tag: cachedTag }
+          : target
+      )
+    )
   }
 
   async function runInstall(targets: KernelTarget[]) {
@@ -279,7 +303,12 @@ export function WrapSamplePage() {
             {catalog.data?.kernels.map((product) => (
               <div
                 key={product.id}
-                className='grid gap-3 p-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center sm:px-5'
+                className={cn(
+                  'grid gap-3 p-4 sm:items-center sm:px-5',
+                  product.id === 'crag'
+                    ? 'lg:grid-cols-[minmax(0,1fr)_auto]'
+                    : 'sm:grid-cols-[minmax(0,1fr)_auto]'
+                )}
               >
                 <div className='min-w-0'>
                   <div className='flex flex-wrap items-center gap-2.5'>
@@ -315,9 +344,18 @@ export function WrapSamplePage() {
                       )}
                       {product.ready ? '已下载' : '未就绪'}
                     </span>
-                    <span className='text-muted-foreground'>
-                      {product.version || '版本未记录'}
-                    </span>
+                    {product.id === 'crag' ? (
+                      <span className='min-w-0 wrap-anywhere text-muted-foreground'>
+                        当前缓存：
+                        {cragReleaseLabel(product.payload_tag) ||
+                          product.version ||
+                          (product.ready ? '版本未记录' : '未就绪')}
+                      </span>
+                    ) : (
+                      <span className='text-muted-foreground'>
+                        {product.version || '版本未记录'}
+                      </span>
+                    )}
                   </div>
                   {product.error && !product.ready ? (
                     <p className='mt-2 text-base break-words text-destructive sm:text-sm'>
@@ -339,17 +377,59 @@ export function WrapSamplePage() {
                     </p>
                   ) : null}
                 </div>
-                <div className='flex flex-wrap gap-2'>
+                <div className='flex min-w-0 flex-wrap gap-2'>
+                  {product.id === 'crag' ? (
+                    <Select
+                      value={cragPullTag ?? ''}
+                      onValueChange={setCragPullDraft}
+                      disabled={!canEdit || busy || !cragPullTag}
+                    >
+                      <SelectTrigger
+                        aria-label='选择 CRAG 拉取版本'
+                        className='w-full min-w-0 text-base data-[size=default]:h-11 sm:w-56 sm:text-sm'
+                      >
+                        <SelectValue placeholder='暂无可拉取版本' />
+                      </SelectTrigger>
+                      <SelectContent className='max-w-(--radix-select-content-available-width) motion-reduce:animate-none'>
+                        {cragOptions?.map(({ tag, label }) => (
+                          <SelectItem
+                            key={tag}
+                            value={tag}
+                            className='min-h-11 cursor-pointer text-base wrap-anywhere sm:text-sm'
+                          >
+                            {label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  ) : null}
                   <Button
                     variant='outline'
                     className='h-11'
-                    aria-label={`拉取 ${KERNEL_NAMES[product.id]} 最新二进制`}
-                    disabled={!canEdit || busy}
-                    loading={pull.isPending && pull.variables === product.id}
-                    onClick={() => pull.mutate(product.id)}
+                    aria-label={
+                      product.id === 'crag'
+                        ? '拉取 CRAG 所选版本'
+                        : '拉取 cli-node 最新二进制'
+                    }
+                    disabled={
+                      !canEdit ||
+                      busy ||
+                      (product.id === 'crag' && !cragPullTag)
+                    }
+                    loading={
+                      pull.isPending && pull.variables?.kernel === product.id
+                    }
+                    onClick={() => {
+                      if (!canEdit || busy) return
+                      if (product.id === 'cli-node') {
+                        pull.mutate({ kernel: 'cli-node' })
+                      } else if (cragPullTag) {
+                        pull.mutate({ kernel: 'crag', tag: cragPullTag })
+                      }
+                    }}
                   >
                     <Download aria-hidden='true' />
-                    拉取最新
+                    {product.id === 'crag' ? '拉取所选版本' : '拉取最新'}
                   </Button>
                   <Button
                     variant='outline'
@@ -519,9 +599,17 @@ export function WrapSamplePage() {
                                 : VM_STATUS[vm.status || 'unknown'] ||
                                   vm.status ||
                                   '未知'}
-                            {installed?.version &&
-                            installed.kernel === currentKernel ? (
-                              <span>{installed.version}</span>
+                            {installed && installed.kernel === currentKernel ? (
+                              installed.kernel === 'crag' ? (
+                                <span className='min-w-0 wrap-anywhere'>
+                                  已安装：
+                                  {cragReleaseLabel(installed.payload_tag) ||
+                                    installed.version ||
+                                    '版本未记录'}
+                                </span>
+                              ) : installed.version ? (
+                                <span>{installed.version}</span>
+                              ) : null
                             ) : null}
                             {kvm ? <Badge variant='outline'>KVM</Badge> : null}
                           </div>
@@ -695,14 +783,27 @@ export function WrapSamplePage() {
             ? `重装 ${vmById.get(confirm[0].id)?.name || confirm[0].id} 并重启？`
             : `重装全部 ${confirm?.length || 0} 台 VM 并重启？`
         }
-        desc='按所选内核安装并重启，健康检查完成后恢复调度；手动关闭和凭证限制保留。凭据、授权和工作数据不变。'
+        desc={
+          <>
+            按所选内核安装并重启，健康检查完成后恢复调度；手动关闭和凭证限制保留。凭据、授权和工作数据不变。
+            {confirmedCrag ? (
+              <p className='mt-2 wrap-anywhere'>
+                CRAG 当前缓存标签：{confirmedCragTag || '未记录'}
+                {confirmedCragLabel && confirmedCragLabel !== confirmedCragTag
+                  ? `（${confirmedCragLabel}）`
+                  : null}
+              </p>
+            ) : null}
+          </>
+        }
         confirmText='重装并重启'
         cancelBtnText='取消'
-        disabled={missingLicenses.length > 0}
+        disabled={!canEdit || busy || missingLicenses.length > 0}
         destructive
         className='motion-reduce:animate-none [&_button]:min-h-11'
         handleConfirm={() => {
-          if (confirm) void runInstall(confirm)
+          if (confirm && canEdit && !busy && !missingLicenses.length)
+            void runInstall(confirm)
         }}
       >
         <ul className='max-h-56 space-y-2 overflow-y-auto rounded-lg bg-muted/50 p-3 text-sm'>
