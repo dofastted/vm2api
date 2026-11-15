@@ -8,7 +8,15 @@ import { configureSlotCapacity } from '../../src/lib/vm/slot-capacity.mjs'
 
 const GiB = 1024 ** 3
 
-function fixture({ vms, stats = {}, hostGiB = 64, availableGiB = hostGiB, routing = {} }) {
+function fixture({
+  vms,
+  stats = {},
+  hostGiB = 64,
+  availableGiB = hostGiB,
+  routing = {},
+  nodeMemory = null,
+  now = Date.now,
+}) {
   const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'slot-cap-rec-'))
   const records = new Map(vms.map((vm) => [vm.id, structuredClone(vm)]))
   const calls = { memory: [], pids: [] }
@@ -29,7 +37,11 @@ function fixture({ vms, stats = {}, hostGiB = 64, availableGiB = hostGiB, routin
       records.get(vm.id).machine = { ...(records.get(vm.id).machine || {}), pids_limit: pids }
       return { ok: true, pids_limit: pids }
     },
-    hostMemory: () => ({ totalBytes: hostGiB * GiB, availableBytes: availableGiB * GiB }),
+    // With nodeMemory, nodes go through the reconciler's own default lookup.
+    ...(nodeMemory
+      ? { nodeMemory }
+      : { hostMemory: () => ({ totalBytes: hostGiB * GiB, availableBytes: availableGiB * GiB }) }),
+    now,
     onEvent: (e) => events.push(e),
     log: null,
   })
@@ -140,6 +152,52 @@ test('a host_memory_ratio above 1 overcommits slot limits past free RAM', async 
     fx.events.filter((e) => e.kind === 'host_memory_exhausted').map((e) => e.vm_id),
     ['cf-c'],
   )
+  fx.cleanup()
+})
+
+const onNode = (vm, nodeId = 'node-a') => ({ ...vm, node_id: nodeId })
+
+test('cluster node slots get their own host budget from the node health probe', async () => {
+  // node-a: 10 GiB, 4 GiB outside slots → (10 − 4) × 0.9 ≈ 5529 MiB; one raise to 4g fits.
+  const at = Date.now()
+  const fx = fixture({
+    vms: [onNode(max5('cf-a')), onNode(max5('cf-b'))],
+    nodeMemory: (id) => (id === 'node-a' ? { totalBytes: 10 * GiB, availableBytes: 6 * GiB, at } : null),
+  })
+  await fx.reconciler.tick()
+  assert.deepEqual(fx.calls.memory, [['cf-a', '4g']])
+  const exhausted = fx.events.filter((e) => e.kind === 'host_memory_exhausted')
+  assert.deepEqual(
+    exhausted.map((e) => [e.vm_id, e.host, e.non_slot_mib]),
+    [['cf-b', 'node-a', 4096]],
+  )
+  fx.cleanup()
+})
+
+test('a node with missing or stale memory figures raises no memory until they return', async () => {
+  let clock = 1_000_000
+  let figures = null
+  const fx = fixture({
+    vms: [onNode(max5('cf-a'))],
+    nodeMemory: () => figures,
+    now: () => clock,
+  })
+  const first = await fx.reconciler.tick()
+  assert.equal(first.results[0].memory, 'host_memory_unknown')
+  figures = { totalBytes: 64 * GiB, availableBytes: 60 * GiB, at: clock - 5 * 60_000 }
+  const stale = await fx.reconciler.tick()
+  assert.equal(stale.results[0].memory, 'host_memory_unknown')
+  assert.deepEqual(fx.calls.memory, [])
+  assert.equal(fx.events.filter((e) => e.kind === 'host_memory_exhausted').length, 0, 'unknown is not exhausted')
+  assert.deepEqual(
+    fx.calls.pids.map(([id]) => id),
+    ['cf-a'],
+    'pids cost no host memory and still converge',
+  )
+  clock += 1000
+  figures = { totalBytes: 64 * GiB, availableBytes: 60 * GiB, at: clock }
+  await fx.reconciler.tick()
+  assert.deepEqual(fx.calls.memory, [['cf-a', '4g']])
   fx.cleanup()
 })
 

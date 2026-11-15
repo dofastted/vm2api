@@ -8,7 +8,10 @@
  *   3. Memory raises respect a per-host budget: the sum of slot memory limits
  *      may not exceed (host RAM − memory used outside slots) × host_memory_ratio,
  *      so every slot can fill at once without exhausting the host (a ratio
- *      above 1 overcommits on purpose; live admission then guards). Over budget
+ *      above 1 overcommits on purpose; live admission then guards). Cluster
+ *      nodes get the same budget from their health probe (`nodeMemory`); a
+ *      node whose figures are missing or stale raises nothing until they
+ *      return. Over budget
  *      the slot keeps its limits; its slot count (and seats) stay clamped to
  *      what they hold, and an event asks for another machine.
  *
@@ -54,6 +57,8 @@ export function readLocalHostMemory() {
   return { totalBytes: os.totalmem(), availableBytes: os.freemem() }
 }
 const EVENT_REPEAT_MS = 60 * 60 * 1000
+/** Node memory older than this (a missed health probe or two) is not trusted for a raise. */
+export const NODE_MEMORY_STALE_MS = 120_000
 
 function reconcilable(vm) {
   if (!vm?.id || isCodexVm(vm) || isKvmRuntime(vm)) return false
@@ -83,8 +88,10 @@ export function createSlotCapacityReconciler({
   readStats = readSlotCgroupStats,
   raiseMemory = raiseDockerSlotMemory,
   raisePids = raiseDockerSlotPids,
-  /** { totalBytes, availableBytes } for a host key ('local' or a node id); null skips the budget. */
-  hostMemory = (key) => (key === 'local' ? readLocalHostMemory() : null),
+  /** (nodeId) => { totalBytes, availableBytes, at } from the node's last health probe, or null. */
+  nodeMemory = () => null,
+  /** { totalBytes, availableBytes, at? } for a host key ('local' or a node id), or null. */
+  hostMemory = (key) => (key === 'local' ? readLocalHostMemory() : nodeMemory(key)),
   onEvent = null,
   now = Date.now,
   log = console,
@@ -129,7 +136,10 @@ export function createSlotCapacityReconciler({
       const key = hostKey(vm)
       const deltaMiB = memoryMiB(wantMem) - memoryMiB(currentMem)
       const entry = budget.get(key)
-      if (entry && entry.limitMiB != null && entry.usedMiB + deltaMiB > entry.limitMiB) {
+      if (entry?.unknown) {
+        // A node with no fresh memory figures: wait for its next health probe.
+        out.memory = 'host_memory_unknown'
+      } else if (entry && entry.limitMiB != null && entry.usedMiB + deltaMiB > entry.limitMiB) {
         out.memory = 'host_budget_exhausted'
         emit(
           'host_memory_exhausted',
@@ -217,15 +227,19 @@ export function createSlotCapacityReconciler({
       const budget = new Map()
       for (const [key, h] of hosts) {
         const mem = hostMemory(key)
+        const at = Number(mem?.at)
+        const fresh = !(at > 0) || now() - at <= NODE_MEMORY_STALE_MS
         const totalMiB = Number(mem?.totalBytes) / MiB
         const availableMiB = Number(mem?.availableBytes) / MiB
         let limitMiB = null
         let nonSlotMiB = null
-        if (totalMiB > 0 && availableMiB >= 0) {
+        if (fresh && totalMiB > 0 && availableMiB >= 0) {
           nonSlotMiB = Math.max(0, Math.round(totalMiB - availableMiB - h.slotCurrentMiB))
           limitMiB = Math.floor(Math.max(0, totalMiB - nonSlotMiB) * cfg.host_memory_ratio)
         }
-        budget.set(key, { usedMiB: h.usedMiB, limitMiB, nonSlotMiB })
+        // This host is always readable; a node without fresh figures must not grow unbounded.
+        const unknown = key !== 'local' && limitMiB == null
+        budget.set(key, { usedMiB: h.usedMiB, limitMiB, nonSlotMiB, unknown })
       }
       const results = []
       for (const vm of all.filter(reconcilable)) {

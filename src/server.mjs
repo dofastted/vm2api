@@ -532,6 +532,18 @@ const slotCapacityReconciler = createSlotCapacityReconciler({
   projectRoot: cfg.paths.project,
   listTargets: () => listVms(cfg.paths.project),
   getRouting: () => routingConfig,
+  // Every cluster node gets a host budget from its 30s health probe (MemTotal / MemAvailable).
+  nodeMemory: (id) => {
+    try {
+      const health = clusterManager.get(id)?.health
+      const total = Number(health?.host?.mem_total)
+      const used = Number(health?.host?.mem_used)
+      if (!(total > 0) || !Number.isFinite(used)) return null
+      return { totalBytes: total, availableBytes: Math.max(0, total - used), at: Date.parse(health.checked_at) || 0 }
+    } catch {
+      return null
+    }
+  },
 })
 
 usageProbeMonitor = createUsageProbeMonitor({
