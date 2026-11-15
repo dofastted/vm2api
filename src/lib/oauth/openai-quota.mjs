@@ -8,7 +8,12 @@ import { getVm, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { isLocalEgressProxy } from '../vm/egress.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
-import { readCodexAccounts, upsertCodexAccount, persistCodexQuotaSnapshot } from '../vm/codex-slot.mjs'
+import {
+  readCodexAccounts,
+  upsertCodexAccount,
+  persistCodexQuotaSnapshot,
+  persistCodexCredentialState,
+} from '../vm/codex-slot.mjs'
 import {
   buildCodexUsageView,
   extraToCodexSnapshot,
@@ -296,7 +301,21 @@ async function rotateIfNeeded(slot, projectRoot, vmId, fetchImpl) {
     fetchImpl,
     timeoutMs: OPENAI_QUOTA_TIMEOUT_MS,
   })
-  if (!tok.ok) return { ...slot, rotateError: tok.error || 'refresh_failed' }
+  if (!tok.ok) {
+    // Surface dead credentials (refresh_rejected / refresh_empty / missing_refresh_token)
+    // on the vm ticket instead of failing silently in memory. Transient errors
+    // (timeout / fetch_failed) and ambiguous upstream 4xx/5xx stay unmarked; the
+    // next successful quota snapshot clears the mark again.
+    const structural = ['refresh_rejected', 'refresh_empty', 'missing_refresh_token'].includes(tok.error)
+    if (structural) {
+      try {
+        persistCodexCredentialState(projectRoot, vmId, { error: tok.error })
+      } catch {
+        // Persistence is best-effort; the in-memory rotateError still propagates.
+      }
+    }
+    return { ...slot, rotateError: tok.error || 'refresh_failed' }
+  }
   upsertCodexAccount(projectRoot, vmId, {
     access_token: tok.access_token,
     refresh_token: tok.refresh_token,
