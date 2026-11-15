@@ -11,7 +11,7 @@ import { CragHostSubscription } from './crag-host-subscription'
 
 const licenseMessages: Record<string, string> = {
   license_required:
-    '尚未授权。可粘贴一张离线通用码解锁全部槽位和机器，或复制机器码申请在线设备授权。',
+    '尚未授权。可用联网兑换码激活本槽，或用离线通用码授权全部兼容槽位。',
   license_expired: '授权已到期。请向授权方申请续期，并在下方替换注册码。',
   license_not_yet_valid:
     '授权尚未生效。请核对服务器 UTC 时间和生效时间；如签发时间有误，请联系授权方重新签发。',
@@ -23,6 +23,17 @@ const licenseMessages: Record<string, string> = {
     '注册码对应另一版 CRAG 内核。请复制含载荷 ID 的机器码，向授权方申请匹配当前版本的注册码。',
   license_unconfigured:
     '服务器尚未配置可信授权公钥或加密 CRAG 包。请联系管理员安装受信任的完整软件包后重试。',
+  license_redeem_unavailable:
+    '此设备兑换码不可用。请检查是否已过兑换期限，或是否应在「宿主订阅」中使用。',
+  license_redeem_conflict:
+    '此兑换码已绑定另一台设备或另一版内核。请回到原槽并使用原内核版本。',
+  license_redeem_target_changed:
+    '目标槽、授权或内核载荷不匹配。请核对本槽安装的版本，再用原码重试。',
+  license_redeem_subscription:
+    '本槽已使用宿主订阅许可。请在「宿主订阅」管理续期或占槽。',
+  license_redeem_service:
+    '暂未完成联网兑换。请稍后在同一个槽用原码重试，不必重新购买。',
+  license_redeem_origin: '请在当前面板页提交兑换，不要从其他站点发起。',
 }
 
 const statusLabels: Record<CragLicenseStatus['status'], string> = {
@@ -62,7 +73,8 @@ function utcTimestamp(seconds?: number) {
 function codeMode(code: string) {
   const value = code.trim()
   if (value.startsWith('CRAGU1.')) return 'offline' as const
-  if (value.startsWith('CRAGL1.')) return 'online' as const
+  if (value.startsWith('CRAGL1.') || value.startsWith('CRAGR1.'))
+    return 'online' as const
   return null
 }
 
@@ -149,6 +161,7 @@ export function CragLicenseEditor({
       : null
   const busy = loading || activating
   const detected = codeMode(registrationCode)
+  const redeeming = registrationCode.trim().startsWith('CRAGR1.')
   const [chosen, setChosen] = useState<'offline' | 'online' | null>(null)
   const mode =
     detected ?? chosen ?? (license?.kind === 'online' ? 'online' : 'offline')
@@ -298,7 +311,7 @@ export function CragLicenseEditor({
       >
         <div className='space-y-2'>
           <Label htmlFor={`${formId}-registration`}>
-            {mode === 'offline' ? '离线通用码' : '在线设备授权码'}
+            {mode === 'offline' ? '离线通用码' : '联网兑换码或设备注册码'}
           </Label>
           <Textarea
             id={`${formId}-registration`}
@@ -319,7 +332,7 @@ export function CragLicenseEditor({
           >
             {mode === 'offline'
               ? '粘贴一张 CRAGU1。不需要机器码，也不按槽或机器核销。校验通过后，同一授权同步到全部槽位。'
-              : '粘贴与上方机器码对应的 CRAGL1。不属于本槽的码会被拒绝，已有授权不会被破坏。'}
+              : '粘贴 CRAGR1，系统会读取本槽机器码并兑换激活；也可粘贴已签发给本槽的 CRAGL1。'}
           </p>
         </div>
         {activationError ? (
@@ -336,10 +349,14 @@ export function CragLicenseEditor({
           disabled={busy || !registrationCode.trim() || !data || !!loadError}
         >
           {activating
-            ? '正在校验并激活…'
-            : license?.valid
-              ? '校验并替换授权'
-              : '校验并激活'}
+            ? redeeming
+              ? '正在兑换并激活…'
+              : '正在校验并激活…'
+            : redeeming
+              ? '兑换并激活'
+              : license?.valid
+                ? '校验并替换授权'
+                : '校验并激活'}
         </Button>
       </form>
     </section>

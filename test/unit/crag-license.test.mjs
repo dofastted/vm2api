@@ -54,11 +54,12 @@ function fixture(t) {
   const pkg = seedEncryptedPackage(root)
   return { root, vm, pkg }
 }
-function route(root, method, suffix, body, role = 'admin', id = 'vm-13') {
+function route(root, method, suffix, body, role = 'admin', id = 'vm-13', { fetchCragDeviceGrant, origin } = {}) {
   const result = {}
   const handle = createPanelHandler({
     cfg: { paths: { project: root }, vm: { id: null } },
     routingConfig: {},
+    fetchCragDeviceGrant,
     requireAuth(req) {
       req.panelUser = 'fixture'
       req.panelRole = role
@@ -72,7 +73,8 @@ function route(root, method, suffix, body, role = 'admin', id = 'vm-13') {
     },
     proxyPool: { unbindVm() {} },
   })
-  return handle({ method }, {}, new URL(`http://localhost/api/panel/vms/${id}${suffix}`)).then(() => result)
+  const headers = { host: 'localhost', ...(origin && { origin }) }
+  return handle({ method, headers }, {}, new URL(`http://localhost/api/panel/vms/${id}${suffix}`)).then(() => result)
 }
 
 test('challenge and atomic activation expose only authenticated public status', async (t) => {
@@ -100,6 +102,48 @@ test('challenge and atomic activation expose only authenticated public status', 
   assert.equal(denied.body.error.code, 'license_invalid')
   assert.deepEqual(fs.readFileSync(path.join(dir, 'registration.code')), stored)
   assert.equal(getCragLicense(root, vm).license.valid, true)
+})
+
+test('lost voucher response can recover the original device grant without overwriting a changed slot', async (t) => {
+  const { root, vm } = fixture(t)
+  const credential = `CRAGR1.${crypto.randomBytes(32).toString('base64url')}`
+  const body = { registration_code: credential }
+  const dir = cragLicenseDirectory(root, vm)
+  const file = path.join(dir, 'registration.code')
+  const changed = { ...vm, owner_user_id: 'new-owner' }
+  const vmFile = path.join(root, 'vms', `${vm.id}.json`)
+  let grant
+  let requests = 0
+  const fetchCragDeviceGrant = async (_url, init) => {
+    const input = JSON.parse(init.body)
+    grant ??= issueFixtureCode(root, input.machine_code)
+    requests++
+    if (requests === 1) throw new Error('transport failed after Authority committed')
+    if (requests === 2) fs.writeFileSync(vmFile, JSON.stringify(changed))
+    return Response.json({ ok: true, data: { registration_code: grant.code, replayed: true } })
+  }
+  const redeem = (origin = 'http://localhost', role = 'admin') =>
+    route(root, 'POST', '/crag-license', body, role, vm.id, { fetchCragDeviceGrant, origin })
+  assert.equal((await redeem('https://other.example')).body.error.code, 'license_redeem_origin')
+  assert.equal((await redeem('http://localhost', 'user')).status, 403)
+  assert.equal(requests, 0)
+  assert.equal((await redeem()).status, 503)
+  assert.equal((await redeem()).body.error.code, 'license_redeem_target_changed')
+  assert.equal(fs.existsSync(file), false)
+  fs.writeFileSync(vmFile, JSON.stringify(vm))
+  const activated = await redeem()
+  assert.equal(activated.status, 200)
+  assert.equal(activated.body.data.license.license_id, grant.claims.license_id)
+  assert.doesNotMatch(JSON.stringify(activated.body), /CRAGR1|CRAGL1|private_key|wrapped_key/)
+  assert.equal(fs.readFileSync(file, 'utf8').trim(), grant.code)
+  const before = fs.statSync(file)
+  assert.equal((await redeem()).body.data.license.expires_at, grant.claims.expires_at)
+  assert.equal(fs.statSync(file).ino, before.ino)
+
+  const newer = issueFixtureCode(root, activated.body.data.machine_code, { issued_at: grant.claims.issued_at + 1 })
+  activateCragLicense(root, vm, newer.code)
+  assert.equal((await redeem()).body.error.code, 'license_redeem_target_changed')
+  assert.equal(fs.readFileSync(file, 'utf8').trim(), newer.code)
 })
 
 test('universal CRAGU1 activates without creating a device binding', async (t) => {

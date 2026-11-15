@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { runtimeFileOwner } from '../oauth/oauth-credentials.mjs'
 import { resolveKernelDataplane } from './slot-engine.mjs'
-import { cragV2PackageRoot, verifyCragV2Tree } from './wrap-cli-runtime.mjs'
+import { CRAG_V2_DIR, cragV2PackageRoot, verifyCragV2Tree, wrapCliHomeDir } from './wrap-cli-runtime.mjs'
 import { workerPaths } from '../transport/go-worker-client.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { getVm, listVms } from './vm-registry.mjs'
@@ -19,6 +19,12 @@ const MESSAGES = {
   license_payload_key_mismatch:
     'The signed registration is for a different CRAG package. Request a grant for this package.',
   license_unconfigured: 'CRAG requires a configured encrypted native package and private Linux runtime storage.',
+  license_redeem_unavailable: 'This online device voucher cannot be redeemed.',
+  license_redeem_conflict: 'This voucher has already been bound to another device or payload.',
+  license_redeem_target_changed: 'The target slot, package or license changed. Restore the original target and retry.',
+  license_redeem_subscription:
+    'This slot uses a host subscription. Its permit cannot be replaced by device redemption.',
+  license_redeem_service: 'CRAG Authority is unavailable. Retry the same voucher on this slot.',
 }
 const STATES = {
   license_required: 'unlicensed',
@@ -37,12 +43,14 @@ const text = (value) => typeof value === 'string' && value.length > 0 && value.l
 // deliberately verified afresh on every admission, including after cache hits.
 const packageTrustCache = new Map()
 const MAX_TRUST_ROOTS = 8
+const redeemingSlots = new Set()
+const DEVICE_REDEEM_URL = 'https://crag.fkcodex.com/v1/device-activation/redeem'
 
 export class CragLicenseError extends Error {
-  constructor(code) {
+  constructor(code, status = 403) {
     super(MESSAGES[code] || MESSAGES.license_invalid)
     this.code = MESSAGES[code] ? code : 'license_invalid'
-    this.status = 403
+    this.status = status
   }
 }
 const fail = (code = 'license_invalid') => {
@@ -329,10 +337,10 @@ function packageFingerprint(root) {
   return JSON.stringify(rows)
 }
 
-function trust(projectRoot) {
+function trust(projectRoot, installedRoot) {
   let canonicalRoot
   try {
-    const root = cragV2PackageRoot(projectRoot)
+    const root = installedRoot ?? cragV2PackageRoot(projectRoot)
     if (!root || fs.lstatSync(root).isSymbolicLink()) fail('license_unconfigured')
     canonicalRoot = fs.realpathSync(root)
     // Complete membership includes manifest, public key, ciphertext, bootstrap,
@@ -350,6 +358,7 @@ function trust(projectRoot) {
     const authority = {
       publicKey: crypto.createPublicKey(fs.readFileSync(path.join(canonicalRoot, 'crag-license-public.pem'))),
       keyId: verified.manifest.payload.key_id,
+      issuerId: verified.manifest.authorization.public_key_id,
     }
     // A package changed during verification must not publish a mixed snapshot.
     if (packageFingerprint(canonicalRoot) !== fingerprint) fail('license_unconfigured')
@@ -1079,6 +1088,134 @@ export function activateCragLicense(projectRoot, vm, code) {
   } catch (error) {
     if (error instanceof CragLicenseError) throw error
     fail()
+  }
+}
+
+async function requestDeviceGrant(body, fetchImpl) {
+  let response
+  try {
+    response = await fetchImpl(DEVICE_REDEEM_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify(body),
+      redirect: 'error',
+      signal: AbortSignal.timeout(8000),
+    })
+    if (!response.body || !/^application\/json(?:\s*;|$)/i.test(response.headers.get('content-type') ?? ''))
+      throw Error()
+    const chunks = []
+    let bytes = 0
+    for await (const chunk of response.body) {
+      bytes += chunk.byteLength
+      if (bytes > 32768) throw Error()
+      chunks.push(chunk)
+    }
+    const reply = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+    if (
+      response.ok &&
+      reply.ok === true &&
+      typeof reply.data?.registration_code === 'string' &&
+      typeof reply.data.replayed === 'boolean'
+    ) {
+      return { registration: reply.data.registration_code, replayed: reply.data.replayed }
+    }
+    if (response.status === 404 && reply.error?.code === 'redeem_unavailable') fail('license_redeem_unavailable')
+    if (response.status === 409 && ['redeem_conflict', 'payload_key_conflict'].includes(reply.error?.code))
+      throw new CragLicenseError('license_redeem_conflict', 409)
+    if (
+      (response.status === 409 && reply.error?.code === 'issuer_mismatch') ||
+      (response.status === 400 && reply.error?.code === 'payload_key_unknown')
+    )
+      throw new CragLicenseError('license_redeem_target_changed', 409)
+    if (response.status === 429) throw new CragLicenseError('license_redeem_service', 429)
+    throw Error()
+  } catch (error) {
+    if (error instanceof CragLicenseError) throw error
+    throw new CragLicenseError('license_redeem_service', 503)
+  } finally {
+    if (response?.body && !response.body.locked) void response.body.cancel().catch(() => {})
+  }
+}
+
+export async function redeemCragDeviceVoucher(
+  projectRoot,
+  vm,
+  voucher,
+  { fetchImpl = globalThis.fetch, getTarget, routing } = {},
+) {
+  if (typeof voucher !== 'string' || !/^CRAGR1\.[A-Za-z0-9_-]{43}$/.test(voucher)) fail()
+  if (process.platform !== 'linux' || vm.node_id || isKvmRuntime(vm) || isCodexVm(vm)) fail('license_unconfigured')
+  decodeLicenseBytes(voucher.slice(7), 32)
+  const slot = path.resolve(projectRoot, 'vms', vm.id)
+  const packagePath = path.join(wrapCliHomeDir(projectRoot, vm.id), CRAG_V2_DIR)
+  const targetAuthority = (target) => {
+    const selected = trust(projectRoot)
+    // A Wrap slot can be licensed before switching to the selected encrypted CRAG package.
+    if (!fs.lstatSync(packagePath, { throwIfNoEntry: false }) && resolveKernelDataplane(target, routing) !== 'crag')
+      return selected
+    const installed = trust(projectRoot, packagePath)
+    if (installed.keyId !== selected.keyId || installed.issuerId !== selected.issuerId)
+      throw new CragLicenseError('license_redeem_target_changed', 409)
+    return installed
+  }
+  if (redeemingSlots.has(slot)) throw new CragLicenseError('license_redeem_service', 409)
+  redeemingSlots.add(slot)
+  try {
+    const initial = targetAuthority(vm)
+    const context = deviceContext(projectRoot, vm, true)
+    const original = storedRegistration(context.dir)
+    if (selectsSubscription(original)) throw new CragLicenseError('license_redeem_subscription', 409)
+    const { registration, replayed } = await requestDeviceGrant(
+      {
+        redemption_code: voucher,
+        machine_code: context.machine_code,
+        payload_key_id: initial.keyId,
+        issuer_public_key_id: initial.issuerId,
+      },
+      fetchImpl,
+    )
+    const currentVm = getTarget ? getTarget() : vm
+    if (
+      !currentVm ||
+      currentVm.id !== vm.id ||
+      currentVm.node_id ||
+      isKvmRuntime(currentVm) ||
+      isCodexVm(currentVm) ||
+      currentVm.owner_user_id !== vm.owner_user_id
+    )
+      throw new CragLicenseError('license_redeem_target_changed', 409)
+    const current = deviceContext(projectRoot, currentVm, false)
+    const authority = targetAuthority(currentVm)
+    const saved = storedRegistration(current.dir)
+    if (
+      current.dir !== context.dir ||
+      current.machine_code !== context.machine_code ||
+      authority.keyId !== initial.keyId ||
+      authority.issuerId !== initial.issuerId ||
+      (saved !== original && saved !== registration)
+    )
+      throw new CragLicenseError('license_redeem_target_changed', 409)
+    const license = verifyCragRegistration(registration, { ...current, ...authority })
+    if (!license.valid) fail(license.code)
+    if (saved !== registration) {
+      // Recovery of an earlier voucher must not roll back a later device authorization.
+      if (replayed && saved.startsWith('CRAGL1.')) {
+        const existing = verifyCragRegistration(saved, { ...current, ...authority })
+        if (existing.valid && existing.issued_at >= license.issued_at)
+          throw new CragLicenseError('license_redeem_target_changed', 409)
+      }
+      try {
+        writePrivate(current.dir, 'registration.code', `${registration}\n`, currentVm, true)
+      } catch {
+        throw new CragLicenseError('license_redeem_service', 503)
+      }
+    }
+    return { license, ...machineExport(projectRoot, current.machine_code, authority.keyId) }
+  } catch (error) {
+    if (error instanceof CragLicenseError) throw error
+    fail()
+  } finally {
+    redeemingSlots.delete(slot)
   }
 }
 
