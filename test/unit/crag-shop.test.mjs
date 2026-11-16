@@ -16,9 +16,10 @@ import {
 import { createShopSupplier } from '../../src/lib/admin/crag-shop-supplier.mjs'
 import { deriveOrderReceipt, loadOrderReceiptKey } from '../../src/lib/admin/crag-shop-receipt.mjs'
 import { applyMigrations, createDatabase } from '../../src/lib/db/database.mjs'
-import { checkCragLicense } from '../../src/lib/vm/crag-license.mjs'
+import { checkCragLicense, cragTargetIds } from '../../src/lib/vm/crag-license.mjs'
 import { createCragSubscription } from '../../src/lib/vm/crag-subscription.mjs'
 import { cragSubscriptionPublicDirectory } from '../../src/lib/vm/crag-subscription-paths.mjs'
+import { materializeCragV2 } from '../../src/lib/vm/wrap-cli-runtime.mjs'
 import {
   issueHostEntitlement,
   issueSlotPermit,
@@ -508,6 +509,13 @@ test('pinned fulfillment survives lost redeem and H2 bind replies without reappl
     fs.mkdirSync(dir, { recursive: true })
     fs.writeFileSync(path.join(dir, 'machine-id'), randomBytes(16).toString('hex'))
   }
+  assert.equal(materializeCragV2(root, slots[0], { select: false }).ok, true)
+  const pinnedPayload = cragTargetIds(root, slots[0]).payloadKeyId
+  // Refreshing the download cache must not invalidate the installed target's unpaid order.
+  const refreshCache = () => {
+    seedEncryptedPackage(root, { payloadKey: randomBytes(32) })
+    assert.notEqual(cragTargetIds(root).payloadKeyId, pinnedPayload)
+  }
 
   const merchant = new Map()
   const deliveryRequests = []
@@ -560,12 +568,14 @@ test('pinned fulfillment survives lost redeem and H2 bind replies without reappl
         assert.equal(init.headers.authorization, bearer)
         if (url.endsWith('/redeem')) {
           assert.equal(input.redemption_code, CODE)
+          assert.equal(input.payload_key_id, pinnedPayload)
           if (++redeems === 1) {
             rights = signedRights(input.host_id, 1, [])
             throw new Error('lost redeem reply after authority commit')
           }
         }
         if (url.endsWith('/bind')) {
+          assert.equal(input.payload_key_id, pinnedPayload)
           ++bindAttempts
           if (!machineCode) {
             hostIdAtBind = input.host_id
@@ -650,6 +660,7 @@ test('pinned fulfillment survives lost redeem and H2 bind replies without reappl
   await handle.pollActivation()
   assert.deepEqual(deliveryRequests.splice(0), [{ id, operation: undefined, method: 'GET' }])
   assert.equal(redeems, 0)
+  refreshCache()
   merchant.get(id).status = 'fulfilled'
   due(id)
   await handle.pollActivation()

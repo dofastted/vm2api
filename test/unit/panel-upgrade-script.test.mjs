@@ -14,20 +14,26 @@ const FAKE_DOCKER = String.raw`#!/usr/bin/env node
 const fs = require('node:fs')
 const { spawnSync } = require('node:child_process')
 const args = process.argv.slice(2)
-args.push('--compose-file-env', process.env.COMPOSE_FILE || '')
+const recorded = [...args, '--compose-file-env', process.env.COMPOSE_FILE || '']
 if (process.env.DOCKER_DEFAULT_PLATFORM) {
-  args.push('--docker-default-platform', process.env.DOCKER_DEFAULT_PLATFORM)
+  recorded.push('--docker-default-platform', process.env.DOCKER_DEFAULT_PLATFORM)
 }
-fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(args) + '\n')
+fs.appendFileSync(process.env.TEST_LOG, JSON.stringify(recorded) + '\n')
 if (args[0] === 'compose') {
   if (args.includes('build') && process.env.FAIL_BUILD === '1') process.exit(1)
+  if (args.includes('config')) {
+    if (process.env.FAIL_CONFIG === '1') process.exit(1)
+    const volumes = process.env.HAS_CRAG_BIND === '1' ? [{ target: '/run/crag-host-machine-id' }] : []
+    console.log(JSON.stringify({ services: { vm2api: { volumes } } }))
+  }
   if (args.includes('up') && process.env.STALE_BACKEND !== '1') {
     fs.writeFileSync(process.env.BOOT_VERSION, 'v1.2.7')
   }
 } else if (args[0] === 'inspect') {
   console.log(process.env.SAME_CONTAINER === '1' ? 'old-id' : 'new-id')
 } else if (args[0] === 'exec') {
-  const cmd = args.slice(3)
+  const interactive = args[1] === '-i'
+  const cmd = args.slice(interactive ? 4 : 3)
   if (cmd.some((part) => String(part).includes('fleet-services.mjs'))) process.exit(0)
   const result = spawnSync(process.execPath, cmd, { stdio: 'inherit' })
   process.exit(result.status ?? 1)
@@ -134,6 +140,10 @@ async function runUpgrade({ source = true, arch = 'amd64', override, env = {} } 
       env: fs.readFileSync(path.join(root, '.env'), 'utf8'),
       version: fs.readFileSync(path.join(root, 'VERSION'), 'utf8'),
       routing: fs.readFileSync(path.join(root, 'src/config/routing.json'), 'utf8'),
+      cragOverlays: fs
+        .readdirSync(root)
+        .filter((file) => file.startsWith('.vm2api-crag-host-machine-id.'))
+        .map((file) => ({ file, content: fs.readFileSync(path.join(root, file), 'utf8') })),
     }
   } finally {
     await new Promise((resolve) => server.close(resolve))
@@ -217,6 +227,27 @@ test('image upgrade pulls the pinned ARM64 release and records VERSION only afte
   assert.ok(result.calls.some((args) => args.includes('pull')))
   assert.ok(!result.calls.some((args) => args.includes('build')))
   assert.equal(result.version, '1.2.7\n')
+  assert.equal(result.cragOverlays.length, 1)
+  const [overlay] = result.cragOverlays
+  assert.match(overlay.content, /source: \/etc\/machine-id\n\s+target: \/run\/crag-host-machine-id\n\s+read_only: true/)
+  assert.match(overlay.content, /create_host_path: false/)
+  const up = result.calls.find((args) => args.includes('up'))
+  assert.deepEqual(up.at(-1).split(':'), [
+    path.join(result.root, 'docker-compose.yml'),
+    path.join(result.root, 'docker-compose.override.yml'),
+    path.join(result.root, overlay.file),
+  ])
+})
+
+test('image upgrade preserves an existing CRAG machine ID mount and stops on unreadable Compose config', async () => {
+  const existing = await runUpgrade({ source: false, env: { HAS_CRAG_BIND: '1' } })
+  assert.equal(existing.code, 0, existing.stderr)
+  assert.deepEqual(existing.cragOverlays, [])
+
+  const unreadable = await runUpgrade({ source: false, env: { FAIL_CONFIG: '1' } })
+  assert.equal(unreadable.code, 1)
+  assert.ok(!unreadable.calls.some((args) => args.includes('up')))
+  assert.deepEqual(unreadable.cragOverlays, [])
 })
 
 test('compose upgrades ignore host DOCKER_DEFAULT_PLATFORM so ARM64 control images still pull', async () => {

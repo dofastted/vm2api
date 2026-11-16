@@ -356,6 +356,29 @@ test('selectHealthProbeTargets skips slots outside their working window', () => 
   )
 })
 
+for (const dataplane of ['crag', 'wrap']) {
+  test(`${dataplane} setup-token import recovers from an empty probe snapshot without another probe`, async () => {
+    const vm = { id: 'vm-01', status: 'running', dataplane, platform: 'anthropic', claude: {} }
+    let probeCalls = 0
+    const monitor = createHealthProbeMonitor({
+      config: { enabled: true, fail_closed: true, real: { vm_ids: [vm.id] } },
+      listTargets: () => [vm],
+      runChat: async () => {
+        probeCalls += 1
+      },
+    })
+    await monitor.runRealProbe()
+    assert.equal(monitor.rawSnapshot().error, 'no_schedulable_credential')
+    assert.equal(monitor.decide(unofficial, hiBody).action, 'fail')
+
+    vm.claude = { mode: 'setup-token', has_access: true, has_refresh: true }
+    assert.equal(monitor.decide(unofficial, hiBody).action, 'pass')
+    vm.schedulable = false
+    assert.equal(monitor.decide(unofficial, hiBody).action, 'fail')
+    assert.equal(probeCalls, 0)
+  })
+}
+
 test('probe_all_slots probes every target but snapshot uses first list success', async () => {
   const probed = []
   const monitor = createHealthProbeMonitor({

@@ -124,6 +124,36 @@ else
     printf '\nVM2API_IMAGE_TAG=%s\n' "$IMAGE_TAG" >> .env
   fi
   compose pull vm2api
+  # Image upgrades do not refresh Compose files. Add only the bind missing
+  # from the effective configuration; leave operator files and mounts alone.
+  CONFIG=$(compose config --format json vm2api)
+  HAS_CRAG_BIND=$(printf '%s' "$CONFIG" | docker exec -i "$CONTAINER" node -e '
+    try {
+      const { volumes = [] } = JSON.parse(require("node:fs").readFileSync(0, "utf8")).services.vm2api
+      console.log(volumes.some(({ target }) => target === "/run/crag-host-machine-id") ? "yes" : "no")
+    } catch {
+      console.error("Could not inspect the vm2api Compose mounts")
+      process.exit(1)
+    }
+  ')
+  unset CONFIG
+  if [ "$HAS_CRAG_BIND" = no ]; then
+    # Keep the overlay on disk: Compose records its path for later panel upgrades.
+    CRAG_BIND_FILE=$(mktemp "$ROOT/.vm2api-crag-host-machine-id.XXXXXX")
+    cat > "$CRAG_BIND_FILE" <<'EOF'
+services:
+  vm2api:
+    volumes:
+      - type: bind
+        source: /etc/machine-id
+        target: /run/crag-host-machine-id
+        read_only: true
+        bind:
+          create_host_path: false
+EOF
+    chmod 0644 "$CRAG_BIND_FILE"
+    COMPOSE_FILE_LIST="$COMPOSE_FILE_LIST:$CRAG_BIND_FILE"
+  fi
 fi
 
 compose up -d --no-deps --force-recreate vm2api

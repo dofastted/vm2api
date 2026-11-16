@@ -627,23 +627,28 @@ export function createHealthProbeMonitor(opts = {}) {
   const getSnapshot = (platform = 'anthropic') =>
     viewSnapshot(snapshots[platform] || null, config, nowFn(), nextAtIso())
 
+  const probeTargets = (platform, now) =>
+    selectHealthProbeTargets(opts.listTargets?.() || [], config, now).filter(
+      (vm) => (String(vm.platform || '').toLowerCase() === 'openai' ? 'openai' : 'anthropic') === platform,
+    )
+
   const decide = (headers, body, protocol = '') => {
     const platform = healthPlatformOf(body)
-    return decideHealthIntercept({
+    const now = nowFn()
+    const decision = decideHealthIntercept({
       headers,
       body,
       protocol,
       cfg: config,
       snapshot: snapshots[platform],
-      now: nowFn(),
+      now,
     })
+    if (decision.action === 'fail' && probeTargets(platform, now).length) return { action: 'pass' }
+    return decision
   }
 
   const probePlatform = async (platform, real, started) => {
-    const vms = typeof opts.listTargets === 'function' ? opts.listTargets() || [] : []
-    const targets = selectHealthProbeTargets(vms, config, nowFn()).filter(
-      (vm) => (String(vm.platform || '').toLowerCase() === 'openai' ? 'openai' : 'anthropic') === platform,
-    )
+    const targets = probeTargets(platform, nowFn())
     if (!targets.length) {
       // Every slot off-shift: a still-valid good reply keeps serving until it expires.
       const prev = snapshots[platform]

@@ -276,6 +276,10 @@ sudo bash /opt/vm2api/deploy/install.sh check
 
 面板：`GET /api/panel/version`、`GET /api/panel/changelog`、`POST /api/panel/update`。确认更新后，控制面会通过已挂载的 `docker.sock` 自省当前 Compose 项目和全部配置文件，拉起独立升级助手。助手记录更新前正常运行的槽位，按源码/镜像模式更新，保留已有 `src/config` 配置并 `--force-recreate` 控制面；通过健康检查、版本接口和槽位详情接口确认后端版本正确、此前健康的槽内内核仍能通过控制面鉴权，完成后才报告成功。忙碌但进程健康的槽位不视为故障；更新前已故障或停止的槽位不计入本次回归检查。助手失败时保留 `docker logs vm2api-upgrade-<project>`；容器里没有可识别的 Compose 服务时返回 `409 host_upgrade_required`，响应里带同一条 curl 命令。槽位内核健康检查不调用模型，不消耗上游额度。
 
+Docker 内的本机 CRAG 订阅需要宿主 `/etc/machine-id` 只读挂载到控制面的 `/run/crag-host-machine-id`，不能用容器自己的机器 ID。新版面板镜像升级助手发现现有 Compose 缺少该挂载时，会追加仅包含该挂载的持久覆盖文件，不改已有数据卷。仍在使用旧助手的部署，可通过官方 `install.sh upgrade` 更新 Compose，或在现有自定义 Compose 中加入同一只读挂载后重建控制面。手动使用旧 Compose 文件时也须带上覆盖文件。
+
+如果服务健康但本机 CRAG 订阅显示「状态不可用」，用 `namei -l` 核对实际数据目录的每级父目录。CRAG 会拒绝组或其他用户可写的父目录；确认安装根目录无需组写权限后，只移除该目录的组写位，不要递归修改数据目录和槽位权限。
+
 ## 已部署机升级到 1.2.22
 
 1.2.22 修复 Anthropic 工具循环缓存边界：Node 保留上一轮稳定断点，槽内 kernel 只补当前尾部。升级必须同时更新 `bin/kin-kernel` 和 `share/wrap-cli/kin-kernel.bin`，再同步所有槽；不要 `docker rm` 槽。
