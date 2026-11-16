@@ -108,6 +108,35 @@ test('#163: a bare 429 is unknown for every model; the model name never decides 
   }
 })
 
+test('#1139: real Fable rate evidence and unrelated bare 429s still cool the model', () => {
+  const error = { type: 'rate_limit_error', message: 'Error' }
+  const body = { type: 'error', error }
+  const facts = {
+    schema_version: 2,
+    source: 'provider_http',
+    http_status: 429,
+    response_headers: { 'content-type': 'application/json' },
+    error,
+  }
+  const result = { status: 429, body, providerResult: facts }
+  for (const [label, failure] of [
+    [
+      'native limit header',
+      {
+        ...result,
+        providerResult: { ...facts, response_headers: { 'Anthropic-RateLimit-Unified-7d_oi-Status': 'rejected' } },
+      },
+    ],
+    ['forwarded Retry-After', { ...result, headers: { 'Retry-After': '7' } }],
+    ['no native facts', { status: 429, body }],
+    ['different error text', { ...result, body: { ...body, error: { ...error, message: 'Rate limited' } } }],
+  ]) {
+    const policy = classifyUpstreamResult(failure, { model: 'claude-fable-5-2', now: 1000 })
+    assert.equal(policy.reason, 'fable_rate_limited', label)
+    assert.equal(policy.action, 'continue-and-cooldown', label)
+  }
+})
+
 test('#163: upstream text naming a model family limits only that model', () => {
   const policy = classifyUpstreamResult(
     {
