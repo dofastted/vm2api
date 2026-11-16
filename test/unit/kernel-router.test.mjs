@@ -1720,6 +1720,33 @@ test('reconcileCliHopRuntime reaps zombies and unpauses without CONNECT', async 
   fs.rmSync(root, { recursive: true, force: true })
 })
 
+test('reconcileCliHopRuntime accepts Claude onboarding inside a cluster-node slot once', async () => {
+  const calls = []
+  const runDockerExec = async (args) => {
+    calls.push(args)
+    if (args.includes('python3')) return { ok: true, stdout: 'patched /home/kincli/.claude/.claude.json' }
+    return { ok: true }
+  }
+  const exec = {
+    vmId: 'vm-node-onboard',
+    vm: {
+      id: 'vm-node-onboard',
+      node_id: 'node-test',
+      status: 'running',
+      runtime: { container: 'kin-vm-node-onboard', user: '10001:987' },
+    },
+  }
+  const first = await reconcileCliHopRuntime(exec, { runDockerExec })
+  assert.deepEqual(first.actions, ['reap_zombies', 'node_claude_setup'])
+  const setup = calls.find((args) => args.includes('python3'))
+  assert.ok(setup, JSON.stringify(calls))
+  assert.deepEqual(setup.slice(0, 4), ['exec', '-u', '10001:987', 'kin-vm-node-onboard'])
+  assert.match(setup.at(-1), /hasCompletedOnboarding/)
+  const second = await reconcileCliHopRuntime(exec, { runDockerExec })
+  assert.deepEqual(second.actions, ['reap_zombies'])
+  assert.equal(calls.filter((args) => args.includes('python3')).length, 1)
+})
+
 test('scheduleWrapRecycle bounces once then cools down', async () => {
   resetWrapRecycleState()
   const restarts = []

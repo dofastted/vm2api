@@ -152,6 +152,8 @@ const SUMMARY_COLUMNS = [
   'outbound_session_id',
   'reasoning_effort',
   'inbound_device_id',
+  'upstream_status',
+  'upstream_400_message',
   'intercept',
   'jev_state',
   'vm_owner_user_id',
@@ -1122,7 +1124,7 @@ export class UsageLogsRepo {
       OR COALESCE(via, '') IN ('hard-regex', 'jev', 'distill-detect', 'refusal-guard')
       OR COALESCE(final_state, '') IN ('policy_blocked', 'distill_blocked', 'refusal_guard', 'refusal_similar', 'refusal_device')
     )`
-    const inference = `path IN ('/v1/messages', '/v1/responses', '/v1/chat/completions')`
+    const inference = `path IN ('/v1/messages', '/v1/responses', '/v1/chat/completions', '/v1/completions')`
     const row = this.db
       .prepare(
         `SELECT
@@ -1153,6 +1155,7 @@ export class UsageLogsRepo {
       .prepare(
         `SELECT intercept, via, error_message AS message,
                 CASE WHEN ${block} THEN 1 ELSE 0 END AS blocked,
+                CASE WHEN COALESCE(attempt_count, 0) > 0 THEN 1 ELSE 0 END AS hopped,
                 COUNT(*) AS count
          FROM usage_logs
          WHERE created_at >= ?
@@ -1160,7 +1163,7 @@ export class UsageLogsRepo {
              ${block}
              OR (${inference} AND COALESCE(via, '') != 'warmup-intercept')
            )
-         GROUP BY intercept, via, error_message, blocked`,
+         GROUP BY intercept, via, error_message, blocked, hopped`,
       )
       .all(since)
     const folded = foldInterceptRows(grouped)
@@ -1172,6 +1175,7 @@ export class UsageLogsRepo {
       keywords: collapseBlockKeywords(keywords),
       blocks: folded.blocks,
       passes: folded.passes,
+      routes: folded.routes,
     }
   }
 

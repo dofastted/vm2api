@@ -8,7 +8,7 @@ import type {
 import type * as JsxDevRuntime from 'react/jsx-dev-runtime'
 import type * as JsxRuntime from 'react/jsx-runtime'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError, activateVmCragLicense, api, cragDeviceApi } from '@/lib/api'
 import type * as CragLicenseEditorModule from '@/features/vm/crag-license-editor'
 import type { CragHostStatus } from '@/features/vm/queries'
@@ -265,6 +265,10 @@ async function settle() {
   await Promise.resolve()
   await Promise.resolve()
 }
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
 
 beforeEach(() => {
   state.role = 'admin'
@@ -710,6 +714,25 @@ describe('CRAG buyer presentation and activation wire', () => {
     expect(html).toMatch(/<option value="vm-a" disabled="" selected="">/)
     click('创建订单')
     expect(api).not.toHaveBeenCalled()
+  })
+
+  it('creates an order when crypto.randomUUID is unavailable on HTTP', async () => {
+    vi.stubGlobal('crypto', {
+      getRandomValues: globalThis.crypto.getRandomValues.bind(
+        globalThis.crypto
+      ),
+    })
+    render()
+    click('创建订单')
+    await settle()
+    expect(api).toHaveBeenCalledWith(
+      '/api/panel/crag-shop/orders',
+      expect.objectContaining({ method: 'POST' })
+    )
+    const body = JSON.parse(String(vi.mocked(api).mock.calls[0][1]?.body))
+    expect(body.request_id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    )
   })
 
   it('adds only explicitly selected targets to new intents and matches them when retrying', async () => {

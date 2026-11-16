@@ -13,7 +13,7 @@ const KIND_NAME: Record<FeedKind, string> = {
 
 function who(row: UsageLogRow) {
   const parts = [row.userName, row.keyName].filter(Boolean)
-  return parts.length ? parts.join(' · ') : row.clientIp || '匿名'
+  return parts.length ? parts.join(' · ') : row.userId || '未标识账号'
 }
 
 /** One line per request; the whole row opens the request detail. */
@@ -55,7 +55,7 @@ export function RiskFeed({
     <ul className='divide-y'>
       {rows.map((row) => {
         const kind = feedKindOf(row)
-        const evidence = evidenceOf(row)
+        const evidence = row.upstream400Message || evidenceOf(row)
         return (
           <li key={row.id}>
             <button
@@ -76,7 +76,7 @@ export function RiskFeed({
                       : 'bg-muted text-foreground'
                   )}
                 >
-                  {KIND_NAME[kind]}
+                  {row.upstreamStatus === 400 ? '上游 400' : KIND_NAME[kind]}
                 </span>
               ) : (
                 <span className='hidden md:block' />
@@ -96,6 +96,22 @@ export function RiskFeed({
                   </span>
                 ) : null}
               </span>
+              {row.upstreamStatus === 400 ? (
+                <dl className='col-start-2 grid gap-x-4 gap-y-1 text-xs text-muted-foreground sm:grid-cols-2 md:col-span-2 md:col-start-3'>
+                  <div className='min-w-0 break-all'>
+                    <dt className='inline'>入站设备／机器：</dt>
+                    <dd className='inline font-mono'>
+                      {row.inboundDeviceId || '未提供'}
+                    </dd>
+                  </div>
+                  <div className='min-w-0 break-all'>
+                    <dt className='inline'>入站会话：</dt>
+                    <dd className='inline font-mono'>
+                      {row.clientSessionId || '未提供'}
+                    </dd>
+                  </div>
+                </dl>
+              ) : null}
             </button>
           </li>
         )

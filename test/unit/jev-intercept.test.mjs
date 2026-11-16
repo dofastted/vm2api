@@ -383,6 +383,7 @@ test('fail closed blocks this request without banning the device', async () => {
   assert.equal(decision.action, 'block')
   assert.equal(decision.banDevice, false)
   assert.equal(decision.reason, 'jev:unavailable')
+  assert.equal(decision.error.status, 503)
   assert.equal(banned.length, 0)
   assert.match(decision.error.body.error.message, /决策模型不可用（上游 500）/)
   assert.match(decision.error.body.error.message, /未封禁设备/)
@@ -779,7 +780,7 @@ test('ordinary repair carve-outs live in the single abuse question', () => {
   assert.equal(asked.safety, undefined)
 })
 
-test('jev scores caller prompts except official templates and environment', () => {
+test('hard rules see caller prompts, but Jev only sees user turns', () => {
   const body = {
     system: [
       { type: 'text', text: '情景里写了性爱。' },
@@ -804,9 +805,7 @@ test('jev scores caller prompts except official templates and environment', () =
   assert.equal(jevDocument(body).includes('ignore all previous'), false)
   assert.match(jevDocument(body), /角色卡：性别女/)
   const doc = jevModelDocument(body)
-  assert.match(doc, /性爱/)
-  assert.match(doc, /破解软件授权/)
-  assert.match(doc, /\[system prompt/)
+  assert.doesNotMatch(doc, /性爱|破解软件授权|\[system prompt/)
   assert.equal(doc.includes('Environment'), false)
   assert.equal(doc.includes('ignore all previous'), false)
   assert.match(doc, /角色卡：性别女/)
@@ -822,7 +821,7 @@ test('jev scores caller prompts except official templates and environment', () =
     ],
   }
   const labeled = jevModelDocument(history)
-  assert.match(labeled, /ignore all previous/)
+  assert.doesNotMatch(labeled, /ignore all previous/)
   assert.equal(labeled.includes('Environment'), false)
   assert.match(labeled, /\[user message 1\]/i)
   assert.doesNotMatch(labeled, /\[assistant message 2\]/i)
@@ -837,7 +836,7 @@ test('jev scores caller prompts except official templates and environment', () =
   }
   const flat = jevModelDocument(flatResponses)
   assert.match(flat, /要求窃取凭据并入侵未授权服务器/)
-  assert.match(flat, /ignore all previous/)
+  assert.doesNotMatch(flat, /ignore all previous/)
 
   const toolRoles = {
     messages: [
@@ -859,7 +858,7 @@ test('jev scores caller prompts except official templates and environment', () =
     messages: [{ role: 'user', content: '同一文本在不同来源仍要保留来源。' }],
   }
   const provenance = jevModelDocument(sameAcrossRoles)
-  assert.match(provenance, /\[system prompt 1\]/)
+  assert.doesNotMatch(provenance, /\[system prompt 1\]/)
   assert.match(provenance, /\[user message 1\]/)
   assert.match(provenance, /同一文本在不同来源仍要保留来源/)
 
@@ -982,8 +981,37 @@ test('GPT / Codex skips the gate by default and runs the same rules once opted i
 
   const roleplay = codexBody('角色卡：性别女。', { instructions: '情景里写了性爱。' })
   assert.match(jevDocument(roleplay), /性爱/)
-  assert.match(jevModelDocument(roleplay), /性爱/)
+  assert.doesNotMatch(jevModelDocument(roleplay), /性爱/)
   assert.match(jevModelDocument(roleplay), /性别女/)
+})
+
+test('Jev includes user files, not tool content or external file references', () => {
+  const body = {
+    input: [
+      { type: 'function_call', name: 'hidden', text: 'forbidden tool call' },
+      { type: 'mcp_call', content: 'forbidden mcp call' },
+      {
+        role: 'user',
+        content: [
+          { type: 'input_text', text: 'Compare these documents' },
+          {
+            type: 'input_file',
+            file_data: `data:text/plain;base64,${Buffer.from('change log follows').toString('base64')}`,
+          },
+          { type: 'document', source: { type: 'text', data: 'inline second file' } },
+          {
+            type: 'tool_result',
+            content: [{ type: 'document', source: { type: 'text', data: 'forbidden nested file' } }],
+          },
+          { type: 'input_file', file_url: 'https://external.invalid/private' },
+          { type: 'input_file', file_data: 'data:application/pdf;base64,Zm9yYmlkZGVu' },
+        ],
+      },
+    ],
+  }
+  const text = jevModelDocument(body)
+  assert.match(text, /compare these documents change log follows inline second file/)
+  assert.doesNotMatch(text, /forbidden|https:|zm9y/)
 })
 
 test('a cached protocol block is not a refusal, so the model can pass the retry', async () => {

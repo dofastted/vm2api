@@ -293,7 +293,9 @@ test('summary cleanup preserves result text, media, errors and historical tool p
   current.cache_control = { type: 'ephemeral', ttl: '1h' }
   const before = structuredClone(body)
   const out = prepareCragPrintBody(body, { agentSummary: true, officialPassthrough: true, foldSystemMessages: false })
-  assert.deepEqual(out.messages.slice(0, 4), before.messages.slice(0, 4))
+  assert.deepEqual(out.messages.slice(0, 3), before.messages.slice(0, 3))
+  // The call is read-only too, so no tool_use is left without its tool_result.
+  assert.deepEqual(out.messages[3].content, [{ type: 'text', text: '[tool call Write test-tool] {"content":"Draft"}' }])
   assert.deepEqual(out.messages[4].content, [
     { type: 'text', text: '[tool result test-tool (error)]', cache_control: current.cache_control },
     ...current.content,
@@ -483,4 +485,20 @@ test('a fold that would put a 1h breakpoint after a 5m one keeps the system turn
   )
   assert.equal(folded[2].content[0].type, 'tool_result')
   assert.equal(folded[2].content[1].cache_control.ttl, '1h')
+})
+
+test('an agent summary leaves no unpaired tool_use for CRAG (history tool_result set is incomplete)', () => {
+  const body = agentBody({ summary: true })
+  body.messages[1].content.push({ type: 'tool_use', id: 'other', name: 'Read', input: {} })
+  const out = prepareCragPrintBody(body, { agentSummary: true }).messages
+  const answered = out
+    .flatMap((m) => (Array.isArray(m.content) ? m.content : []))
+    .filter((b) => b.type === 'tool_result')
+  const calls = out.flatMap((m) => (m.role === 'assistant' && Array.isArray(m.content) ? m.content : []))
+  // Only the unanswered call stays live; the answered one is text now.
+  assert.deepEqual(
+    calls.filter((b) => b.type === 'tool_use').map((b) => b.id),
+    ['other'],
+  )
+  assert.equal(answered.length, 0)
 })

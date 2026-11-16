@@ -229,6 +229,69 @@ function admitKernelLaunch(exec, start) {
   )
 }
 
+// A cluster-node slot bakes its kernel into the image, so the start path skips
+// acceptNativeClaudeSetup (it edits host files, and the node's cli-home is not
+// on this host). Without these flags the TUI sits on the onboarding page and
+// CRAG refuses every prompt with a 502. Merge them inside the container instead.
+export const NODE_CLAUDE_SETUP_PY = `
+import json, os
+home = "/home/kincli"
+want = ("/run/kin/work", home)
+for f, create in ((home + "/.claude/.claude.json", True), (home + "/.claude.json", False)):
+    try:
+        doc = json.load(open(f))
+    except FileNotFoundError:
+        if not create or not os.path.isdir(os.path.dirname(f)):
+            continue
+        doc = {}
+    if not isinstance(doc, dict):
+        continue
+    changed = False
+    if doc.get("hasCompletedOnboarding") is not True:
+        doc["hasCompletedOnboarding"] = True
+        changed = True
+    if not isinstance(doc.get("theme"), str) or not doc["theme"]:
+        doc["theme"] = "dark"
+        changed = True
+    if not isinstance(doc.get("projects"), dict):
+        doc["projects"] = {}
+        changed = True
+    for folder in want:
+        p = doc["projects"].get(folder)
+        p = p if isinstance(p, dict) else {}
+        if p.get("hasTrustDialogAccepted") is not True:
+            p["hasTrustDialogAccepted"] = True
+            doc["projects"][folder] = p
+            changed = True
+    if not changed:
+        continue
+    mode = os.stat(f).st_mode & 0o777 if os.path.exists(f) else 0o600
+    tmp = f + ".kin-setup.tmp"
+    with open(tmp, "w") as fh:
+        fh.write(json.dumps(doc) + "\\n")
+    os.chmod(tmp, mode)
+    os.replace(tmp, f)
+    print("patched", f)
+`
+const NODE_SETUP_RECHECK_MS = 10 * 60_000
+const nodeSetupAcceptedAt = new Map()
+
+async function acceptNodeClaudeSetup(exec, runDockerExec) {
+  const host = slotHost(exec?.vm)
+  if (!host.bakedKernel || host.native || isCodexVm(exec?.vm || {}) || isKvmRuntime(exec?.vm)) return null
+  const vmId = exec?.vmId || exec?.vm?.id
+  if (!vmId) return null
+  const last = nodeSetupAcceptedAt.get(vmId) || 0
+  if (Date.now() - last < NODE_SETUP_RECHECK_MS) return null
+  const result = await runDockerExec(
+    execArgv(exec, ['python3', '-c', NODE_CLAUDE_SETUP_PY], { user: host.execUser(exec.vm) }),
+    { timeoutMs: 8000 },
+  )
+  if (!result?.ok) return 'node_claude_setup_failed'
+  nodeSetupAcceptedAt.set(vmId, Date.now())
+  return String(result.stdout || '').includes('patched') ? 'node_claude_setup' : null
+}
+
 /**
  * Already-up kernels can still have unreaped zombies, or a leftover UI
  * `paused` mark while schedulable is true. CONNECT bridges are gone.
@@ -239,6 +302,10 @@ export async function reconcileCliHopRuntime(exec, { runDockerExec = runDocker }
   const actions = []
   await runDockerExec(execArgv(exec, ['kill', '-CHLD', '1']), { timeoutMs: 2000 })
   actions.push('reap_zombies')
+  try {
+    const setup = await acceptNodeClaudeSetup(exec, runDockerExec)
+    if (setup) actions.push(setup)
+  } catch {}
   const root = projectRootFromExec(exec)
   const vmId = exec?.vmId || exec?.vm?.id
   if (root && vmId && exec?.vm?.schedulable !== false && String(exec?.vm?.status || '').toLowerCase() === 'paused') {
