@@ -25,6 +25,7 @@ import { isCodexVm } from '../vm/vm-kind.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
 import { ensureHostPrivateDir } from '../vm/private-dir.mjs'
+import { withCragRuntimeAdmission } from '../vm/slot-runtime-admission.mjs'
 import {
   CONTAINER_CLI_NODE_BIN,
   KERNEL_NATIVE_SLOT_COUNT,
@@ -216,6 +217,18 @@ function projectRootFromExec(exec = {}) {
   return ''
 }
 
+function admitKernelLaunch(exec, start) {
+  const vm = exec?.vm
+  const { dataplane } = readExistingKernelConfig(rustKernelPaths(exec).configPath)
+  const candidate = dataplane === 'crag' && vm ? { ...vm, dataplane } : vm
+  return withCragRuntimeAdmission(
+    candidate,
+    projectRootFromExec(exec),
+    { routing: { inference: { dataplane } } },
+    start,
+  )
+}
+
 // A cluster-node slot bakes its kernel into the image, so the start path skips
 // acceptNativeClaudeSetup (it edits host files, and the node's cli-home is not
 // on this host). Without these flags the TUI sits on the onboarding page and
@@ -270,7 +283,10 @@ async function acceptNodeClaudeSetup(exec, runDockerExec) {
   if (!vmId) return null
   const last = nodeSetupAcceptedAt.get(vmId) || 0
   if (Date.now() - last < NODE_SETUP_RECHECK_MS) return null
-  const result = await runDockerExec(execArgv(exec, ['python3', '-c', NODE_CLAUDE_SETUP_PY], { user: host.execUser(exec.vm) }), { timeoutMs: 8000 })
+  const result = await runDockerExec(
+    execArgv(exec, ['python3', '-c', NODE_CLAUDE_SETUP_PY], { user: host.execUser(exec.vm) }),
+    { timeoutMs: 8000 },
+  )
   if (!result?.ok) return 'node_claude_setup_failed'
   nodeSetupAcceptedAt.set(vmId, Date.now())
   return String(result.stdout || '').includes('patched') ? 'node_claude_setup' : null
@@ -523,6 +539,10 @@ export function wrapNewerThanKernel(exec) {
 }
 
 export async function restartRustKernel(exec, { timeoutMs = 30000, runDockerExec = runDocker } = {}) {
+  return admitKernelLaunch(exec, () => restartAdmittedRustKernel(exec, { timeoutMs, runDockerExec }))
+}
+
+async function restartAdmittedRustKernel(exec, { timeoutMs, runDockerExec }) {
   if (isKvmRuntime(exec?.vm)) {
     return ensureRustKernel(exec, { timeoutMs, runDockerExec, force: true })
   }
@@ -921,6 +941,46 @@ async function startRustKernel(
     return { ok: true, reason: 'already_up', health: existing, reconcile }
   }
   if (!paths.configPath || !fs.existsSync(paths.configPath)) return { ok: false, reason: 'config_missing' }
+  return admitKernelLaunch(exec, () =>
+    launchRustKernel(exec, {
+      paths,
+      expectedSlots,
+      host,
+      timeoutMs,
+      control,
+      runDockerExec,
+      force,
+      allowMissingCredential,
+      prepareGuestAppArmor,
+      licensed,
+      existing,
+      occupied,
+      staleWrap,
+      slotMismatch,
+    }),
+  )
+}
+
+async function launchRustKernel(
+  exec,
+  {
+    paths,
+    expectedSlots,
+    host,
+    timeoutMs,
+    control,
+    runDockerExec,
+    force,
+    allowMissingCredential,
+    prepareGuestAppArmor,
+    licensed,
+    existing,
+    occupied,
+    staleWrap,
+    slotMismatch,
+  },
+) {
+  if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
   syncKernelSlotCount(paths.configPath, expectedSlots)
   try {
     await host.syncRun(exec.vm, path.dirname(paths.runDir))

@@ -71,6 +71,8 @@ import {
 } from './lib/vm/vm-registry.mjs'
 import { createCragSubscription } from './lib/vm/crag-subscription.mjs'
 import { createCragRuntimeInventory } from './lib/vm/crag-runtime-inventory.mjs'
+import { configureCragRuntimeAdmission } from './lib/vm/slot-runtime-admission.mjs'
+import { syncRemoteSlotRestartPolicy } from './lib/cluster/remote-slot.mjs'
 import { installedCragV2Root } from './lib/vm/wrap-cli-runtime.mjs'
 import { makeError, ErrorType, ErrorCode } from './lib/core/errors.mjs'
 import { HOLD_PROXY } from './lib/pool/schedule-state.mjs'
@@ -977,6 +979,15 @@ const clusterManager = new ClusterManager({
     // Slot image tags change with every control-plane upgrade: rebuild what is missing now,
     // not when the first slot lands there.
     if (state === 'ready') warmNodeSlotImages(nodeId)
+    if (state === 'ready') {
+      void (async () => {
+        for (const vm of listVms(cfg.paths.project)) {
+          if (vm.node_id !== nodeId || resolveKernelDataplane(vm, routingConfig) !== 'crag') continue
+          const result = await syncRemoteSlotRestartPolicy(vm, routingConfig)
+          if (!result.ok) console.warn('[crag-restart-policy]', vm.id, result.code || 'sync_failed')
+        }
+      })().catch(() => console.warn('[crag-restart-policy] node reconciliation failed', nodeId))
+    }
   },
 })
 localEgressCluster = clusterManager
@@ -1044,6 +1055,7 @@ const cragSubscription = createCragSubscription({
   assertReady: (vm, opts) => assertCragSubscriptionTarget(cfg.paths.project, vm, routingConfig, opts),
   isSlotEnabled: (vm, opts) => isCragSubscriptionSlotEnabled(cfg.paths.project, vm, routingConfig, opts),
 })
+configureCragRuntimeAdmission(cfg.paths.project, cragSubscription.withRuntimeAdmission)
 
 function isCragShopAdmin(owner) {
   if (owner?.startsWith('panel:')) {
@@ -1456,7 +1468,7 @@ process.on('SIGTERM', () => gracefulShutdown.shutdown('SIGTERM'))
 process.on('SIGINT', () => gracefulShutdown.shutdown('SIGINT'))
 
 if (process.env.KIN_CRS_MOCK !== '1') {
-  syncLocalSlotRestartPolicies(listVms(cfg.paths.project))
+  syncLocalSlotRestartPolicies(listVms(cfg.paths.project), { routing: routingConfig })
 }
 await bootApiKernel(cfg)
 server.keepAliveTimeout = 120_000
