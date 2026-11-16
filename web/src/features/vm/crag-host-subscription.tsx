@@ -114,7 +114,7 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
       ) : null}
       <p className='text-sm text-muted-foreground'>
         {pending
-          ? '同步完成前，订阅槽不会接收新请求。手动激活中断请在原槽提交原码；自动激活中断请回原订单处理。'
+          ? '同步完成前，订阅槽不会接收新请求。手动激活中断时，请在原槽提交原码；自动激活中断时，请处理原订单。'
           : '订阅只绑定一台宿主机。仅支持本机 Linux Docker 的 Claude 槽；需要已安装支持订阅的可信 CRAG 包，并就绪只读挂载。'}
       </p>
       {status?.state === 'active' ? (

@@ -222,6 +222,7 @@ export function createCragSubscription({
   projectRoot,
   listTargets,
   getTarget,
+  isLocalCragSlot,
   isSubscriptionSlot,
   assertReady,
   isSlotEnabled,
@@ -427,6 +428,28 @@ export function createCragSubscription({
   }
 
   async function status(confirmed, mayRetry = true) {
+    let targets
+    let inventory = {}
+    let target_probe_failed = false
+    try {
+      targets = await listTargets()
+      if (isLocalCragSlot) {
+        const activated = []
+        for (const vm of targets.filter(isLocalCragSlot)) {
+          const { license } = getCragLicense(projectRoot, vm)
+          if (license.valid && safeTime(license.expires_at)) {
+            activated.push({ vm_id: vm.id, scope: license.scope, expires_at: license.expires_at })
+          }
+        }
+        inventory = {
+          activated_slots: activated.sort(
+            (first, second) => first.expires_at - second.expires_at || first.vm_id.localeCompare(second.vm_id),
+          ),
+        }
+      }
+    } catch {
+      target_probe_failed = true
+    }
     try {
       const local = readLocalRights()
       const { hostId, claims, pending, previous } = local
@@ -447,14 +470,12 @@ export function createCragSubscription({
       const expired = claims && claims.expires_at <= Math.floor(Date.now() / 1000)
       let total_slots, enabled_slots, upgrade_available
       let targetReady = false
-      let target_probe_failed = false
       // Slot inventory is not the authority for signed host rights.
       try {
-        const targets = await listTargets()
-        if (isSubscriptionSlot) total_slots = targets.filter(isSubscriptionSlot).length
-        targetReady = !pending && (await ready({ allowPrepared: true }, targets))
-        if (claims?.version === 1 && !pending) upgrade_available = await ready({ reclaim: true }, targets)
-        if (isSlotEnabled && (claims || isSubscriptionSlot)) {
+        if (targets && isSubscriptionSlot) total_slots = targets.filter(isSubscriptionSlot).length
+        targetReady = !!targets && !pending && (await ready({ allowPrepared: true }, targets))
+        if (targets && claims?.version === 1 && !pending) upgrade_available = await ready({ reclaim: true }, targets)
+        if (targets && isSlotEnabled && (claims || isSubscriptionSlot)) {
           let enabled = 0
           for (const vm of claims && !pending ? targets : []) {
             if (await isSlotEnabled(vm, { reclaim: claims.version === 2 })) enabled += 1
@@ -472,13 +493,20 @@ export function createCragSubscription({
         state: pending ? 'sync_pending' : claims ? (expired ? 'expired' : 'active') : 'unredeemed',
         ...(claims && { slot_limit: claims.slot_limit, expires_at: claims.expires_at, revision: claims.revision }),
         ...rights,
+        ...inventory,
         ...(total_slots !== undefined && { total_slots }),
         ...(enabled_slots !== undefined && { enabled_slots }),
         ...(upgrade_available && { upgrade_available }),
         ...runtime,
       }
     } catch {
-      return { ready: false, state: 'unavailable', ...(await runtimeStatus()) }
+      return {
+        ready: false,
+        state: 'unavailable',
+        ...(target_probe_failed && { target_probe_failed }),
+        ...inventory,
+        ...(await runtimeStatus()),
+      }
     }
   }
 

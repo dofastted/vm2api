@@ -10,9 +10,14 @@ import type * as JsxRuntime from 'react/jsx-runtime'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError, activateVmCragLicense, api } from '@/lib/api'
+import type * as CragLicenseEditorModule from '@/features/vm/crag-license-editor'
 import type { CragHostStatus } from '@/features/vm/queries'
 import type { CragCommerce } from './crag-commerce'
 import { CragSubscriptionPage } from './crag-shop'
+
+type ActivationFormProps = Parameters<
+  typeof CragLicenseEditorModule.CragActivationForm
+>[0]
 
 const state = vi.hoisted(() => ({
   values: [] as unknown[],
@@ -28,6 +33,8 @@ const state = vi.hoisted(() => ({
   invalidateQueries: vi.fn(),
   hostForm: undefined as FormHTMLAttributes<HTMLFormElement> | undefined,
   hostInput: undefined as InputHTMLAttributes<HTMLInputElement> | undefined,
+  activationForm: undefined as ActivationFormProps | undefined,
+  activationError: null as Error | null,
   queries: [] as Array<{
     queryKey: readonly unknown[]
     enabled?: boolean
@@ -89,7 +96,11 @@ vi.mock('react', async (importOriginal) => ({
 }))
 vi.mock('@tanstack/react-query', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@tanstack/react-query')>()),
-  useMutation: () => ({ mutate: vi.fn(), reset: vi.fn() }),
+  useMutation: (options: { mutationFn: () => Promise<unknown> }) => ({
+    mutate: () => void options.mutationFn(),
+    reset: vi.fn(),
+    error: state.activationError,
+  }),
   useQueryClient: () => ({
     setQueryData: state.setQueryData,
     invalidateQueries: state.invalidateQueries,
@@ -108,6 +119,17 @@ vi.mock('@tanstack/react-query', async (importOriginal) => ({
     }
     if (options.queryKey[0] === 'crag-host-subscription')
       return { data: state.hostStatus, refetch: vi.fn() }
+    if (options.queryKey[1] === 'vms') {
+      return {
+        data: {
+          items: [
+            { id: 'vm-a', name: '测试槽' },
+            { id: 'vm-b', name: '手动目标槽' },
+            { id: 'vm-mac', node_platform: 'darwin' },
+          ],
+        },
+      }
+    }
     return {
       data: undefined,
       isError: false,
@@ -144,10 +166,22 @@ vi.mock('@/components/ui/dialog', () => {
   const Children = ({ children }: { children: ReactNode }) => children
   return {
     Dialog: Children,
-    DialogContent: Children,
+    DialogContent: ({ children }: { children: ReactNode }) => (
+      <div role='dialog'>{children}</div>
+    ),
     DialogDescription: Children,
     DialogHeader: Children,
     DialogTitle: Children,
+  }
+})
+vi.mock('@/features/vm/crag-license-editor', async (importOriginal) => {
+  const actual = await importOriginal<typeof CragLicenseEditorModule>()
+  return {
+    ...actual,
+    CragActivationForm: (props: ActivationFormProps) => {
+      state.activationForm = props
+      return <actual.CragActivationForm {...props} />
+    },
   }
 })
 vi.mock('@/components/ui/button', () => ({
@@ -158,8 +192,8 @@ vi.mock('@/components/ui/button', () => ({
 }))
 vi.mock('@/lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/api')>()),
-  api: vi.fn(),
   activateVmCragLicense: vi.fn(),
+  api: vi.fn(),
 }))
 vi.mock('./crag-commerce', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./crag-commerce')>()),
@@ -198,6 +232,7 @@ function render() {
   state.refCursor = 0
   state.buttons = []
   state.queries = []
+  state.activationForm = undefined
   state.commerce = undefined
   state.hostForm = undefined
   state.hostInput = undefined
@@ -239,7 +274,7 @@ beforeEach(() => {
     state.hostStatus = data
   })
   state.invalidateQueries.mockReset()
-  vi.mocked(activateVmCragLicense).mockClear()
+  state.activationError = null
   state.targetResult = {
     data: { targets: [{ vm_id: 'vm-a' }] },
     isError: false,
@@ -263,44 +298,135 @@ beforeEach(() => {
     '',
     undefined,
     undefined,
-    '',
   ]
+  vi.mocked(activateVmCragLicense).mockReset()
   vi.mocked(api).mockReset()
   vi.mocked(api).mockResolvedValue({ ...order, status: 'paid' })
 })
 
 describe('CRAG buyer presentation and activation wire', () => {
-  it('keeps activation above the catalogue when checkout is closed', () => {
+  it('keeps administrator redemption available when the catalogue is down', () => {
     state.values[1] = { status: 'error' }
     const html = render()
-    expect(html).toContain('href="#crag-purchase-activation"')
-    expect(html).toContain('href="#crag-order-history"')
-    expect(html.indexOf('自动激活（新订单）')).toBeLessThan(
-      html.indexOf('<section aria-label="订阅套餐"')
-    )
     expect(html).toContain('自动激活到 vm-a')
     click('手动激活')
+    state.values.length = 19 // Reset slots previously used by HostOverview.
     const dialog = render()
     expect(dialog).toContain('手动激活 CRAG')
     expect(dialog.match(/<textarea\b/g)).toHaveLength(1)
+    expect(dialog).toContain('CRAG 激活码')
+    expect(dialog).toMatch(/role="dialog"[\s\S]*?<textarea/)
+    expect(dialog).toContain('宿主机兑换码')
+    expect(activateVmCragLicense).not.toHaveBeenCalled()
     expect(api).not.toHaveBeenCalled()
   })
 
-  it('passes a claimed code to manual activation without redeeming it automatically', () => {
+  it('scrolls to the order history within the subscription route', () => {
+    const section = { focus: vi.fn(), scrollIntoView: vi.fn() }
+    const getElementById = vi.fn(() => section)
+    vi.stubGlobal('document', { getElementById })
+    try {
+      expect(render()).toContain('id="crag-order-history"')
+      click('查看订单')
+      expect(getElementById).toHaveBeenCalledExactlyOnceWith(
+        'crag-order-history'
+      )
+      expect(section.focus).toHaveBeenCalledExactlyOnceWith({
+        preventScroll: true,
+      })
+      expect(section.scrollIntoView).toHaveBeenCalledExactlyOnceWith({
+        block: 'start',
+      })
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('prefills the claimed code but requires a separate explicit manual target', () => {
     const code = `CRAGR1.${'a'.repeat(43)}`
     state.values[3] = [order]
     state.values[16] = { order_id: order.order_id, redemption_code: code }
+    state.values[17] = 'vm-a' // Checkout target must not preselect a manual target.
     render()
     click('使用此码激活')
     state.values.length = 19
-    expect(render()).toMatch(new RegExp(`<textarea[^>]*>${code}</textarea>`))
+    const dialog = render()
+    expect(dialog).toMatch(new RegExp(`<textarea[^>]*>${code}</textarea>`))
+    expect(dialog).toMatch(/<option value="" selected="">请选择槽位/)
+    expect(dialog).not.toContain('vm-mac')
+    expect(
+      state.buttons.find((button) => button.children === '激活')?.disabled
+    ).toBe(true)
+    expect(activateVmCragLicense).not.toHaveBeenCalled()
+
+    state.values[20] = 'vm-b'
+    state.values[19] = ` ${code} `
+    render()
+    expect(
+      state.buttons.find((button) => button.children === '激活')?.disabled
+    ).toBe(false)
+    state.activationForm?.onActivate()
+    expect(activateVmCragLicense).toHaveBeenCalledExactlyOnceWith('vm-b', code)
     expect(api).not.toHaveBeenCalled()
     state.role = 'user'
     const buyer = render()
-    expect(buyer).toContain('href="#crag-order-history"')
+    expect(buyer).toContain('领取兑换码')
     expect(buyer).not.toContain('手动激活 CRAG')
+    expect(buyer).not.toContain('CRAG 激活码')
     expect(buyer).not.toContain('使用此码激活')
     expect(buyer).not.toContain('自动激活（新订单）')
+    expect(state.activationForm).toBeUndefined()
+  })
+
+  it('distinguishes authority rejection from a changed activation target', () => {
+    render()
+    click('手动激活')
+    state.values.length = 19
+    state.activationError = new ApiError('opaque', 409, 'issuer_mismatch')
+    const rejected = render()
+    expect(rejected).toContain('授权服务不认可目标内核的发行方，本次未兑换。')
+    state.activationError = new ApiError(
+      'opaque',
+      409,
+      'license_redeem_target_changed'
+    )
+    const changed = render()
+    expect(changed).toContain('激活期间目标槽、设备或授权发生变化')
+    expect(changed).not.toContain('授权服务不认可目标内核的发行方')
+  })
+
+  it('shows the slot probe failure without hiding the signed entitlement', () => {
+    for (const [status, label] of [
+      ['active', '订阅有效'],
+      ['expired', '已到期'],
+    ] as const) {
+      state.hostStatus = {
+        state: status,
+        ready: false,
+        target_probe_failed: true,
+      }
+      const html = render()
+      expect(html).toContain(label)
+      expect(html).toContain('探测失败')
+      expect(html).toContain('刷新本机订阅」重试探测')
+      expect(html).not.toContain('当前没有就绪的本机 CRAG 槽位')
+    }
+  })
+
+  it('lists activated slots with their license scope and expiry separately from runtime usage', () => {
+    state.hostStatus = {
+      state: 'unredeemed',
+      ready: false,
+      activated_slots: [
+        { vm_id: 'vm-licensed', scope: 'device', expires_at: 1_900_000_000 },
+      ],
+    }
+    const html = render()
+    expect(html).toContain('已激活且授权有效的 CRAG 槽位')
+    expect(html).toContain('vm-licensed')
+    expect(html).toContain('设备授权')
+    expect(html).toContain('dateTime="2030-03-17T17:46:40.000Z"')
+    expect(html).toContain('不表示槽位已启动')
   })
 
   it('redeems a trimmed host code without a ready slot or checkout target', async () => {
@@ -460,7 +586,7 @@ describe('CRAG buyer presentation and activation wire', () => {
     expect(html.indexOf('订单错误')).toBeLessThan(plans)
     expect(html).toContain('xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]')
     expect(html).not.toContain('order-first')
-    expect(html).toMatch(/<option value="" selected="">手动激活/)
+    expect(html).toMatch(/<option value="" selected="">仅领取兑换码/)
   })
 
   it('renders presentation as plain text without rewriting historical snapshots', () => {
@@ -531,16 +657,14 @@ describe('CRAG buyer presentation and activation wire', () => {
     expect(state.queries).toHaveLength(0)
   })
 
-  it('distinguishes loading, failure and no targets without removing the manual option', () => {
-    for (const [targetResult, text] of [
-      [{ isFetching: true }, '正在查询自动激活目标'],
-      [{ isError: true }, '读取自动激活目标失败'],
-      [{ data: { targets: [] } }, '当前没有可用的自动激活目标'],
-    ] as const) {
+  it('keeps code-only checkout available without automatic targets', () => {
+    for (const targetResult of [
+      { isFetching: true },
+      { isError: true },
+      { data: { targets: [] } },
+    ]) {
       state.targetResult = targetResult
-      const html = render()
-      expect(html).toContain(text)
-      expect(html).toContain('手动激活（领码后自行兑换与绑定）')
+      render()
       expect(
         state.buttons.find((button) => button.children === '创建订单')?.disabled
       ).toBe(false)
@@ -633,7 +757,7 @@ describe('CRAG buyer presentation and activation wire', () => {
       expect(history).toContain('目标槽位：vm-a')
       expect(history).not.toContain('领取兑换码')
       expect(history).not.toContain('怎样使用兑换码')
-      expect(history).not.toContain('给本槽绑定应用锁')
+      expect(history).not.toContain('自动给目标槽绑定应用锁')
       expect(api).not.toHaveBeenCalled()
     }
   })

@@ -77,6 +77,11 @@ export type CragHostStatus = {
   used_slots?: number
   total_slots?: number
   enabled_slots?: number
+  activated_slots?: Array<{
+    vm_id: string
+    scope: 'host' | 'device' | 'kernel'
+    expires_at: number
+  }>
   available_slots?: number | null
   reclaim_supported?: boolean
   upgrade_available?: boolean

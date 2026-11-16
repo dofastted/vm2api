@@ -52,9 +52,8 @@ import { VmAccountIdentity } from '@/features/vm/vm-account-identity'
 import { VmActionMenu } from '@/features/vm/vm-action-menu'
 import { useVmActions } from '@/features/vm/vm-actions-context'
 import {
-  depthStyle,
   resetRemainVisual,
-  scaleT,
+  schedulingPriorityTextClass,
 } from '@/features/vm/vm-type-visual'
 
 /** 列的宽度与弹性；顺序由 `useVmColumnOrder` 决定，不写死在这里。 */
@@ -125,29 +124,6 @@ function StatusReason({ vm, tone }: { vm: Vm; tone: StatusTone }) {
   )
 }
 
-function DepthChip({
-  label,
-  title,
-  t,
-}: {
-  label: string
-  title: string
-  t: number | null
-}) {
-  return (
-    <span
-      className={cn(
-        'inline-flex rounded px-1.5 py-0.5 font-mono text-[11px] leading-none font-semibold tabular-nums',
-        t == null && 'border border-border/70 text-muted-foreground'
-      )}
-      style={t == null ? undefined : depthStyle(t)}
-      title={title}
-    >
-      {label}
-    </span>
-  )
-}
-
 function ResetMeter({ resetAt, now }: { resetAt: unknown; now: number }) {
   const resetMs = expiresAtToMs(resetAt)
   const clock = fmtResetClock(resetAt)
@@ -186,15 +162,24 @@ function SchedulingPriorityCell({ vm, now }: { vm: Vm; now: number }) {
   const levelOk = Number.isInteger(level) && level >= 1 && level <= 10
   return (
     <div className='min-w-0 space-y-1'>
-      <DepthChip
-        label={`调度优先级 ${levelOk ? level : '—'}`}
+      <span
+        className='text-xs whitespace-nowrap text-muted-foreground'
         title={
           levelOk
             ? `${vm.schedule_level_mode === 'manual' ? '手动' : '自动'}调度优先级，数值越大越优先`
             : '没有调度优先级'
         }
-        t={levelOk ? scaleT(level, 1, 10) : null}
-      />
+      >
+        调度优先级{' '}
+        <span
+          className={cn(
+            'font-semibold tabular-nums',
+            schedulingPriorityTextClass(level)
+          )}
+        >
+          {levelOk ? level : '—'}
+        </span>
+      </span>
       {vm.has_token ? (
         <ResetMeter resetAt={vm.reset_7d || vm.reset_7d_oi} now={now} />
       ) : null}
