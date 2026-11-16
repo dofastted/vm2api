@@ -1,6 +1,7 @@
 import type {
   ClusterApiNode,
   ClusterLocalStatus,
+  HostMemoryPressure,
   NodeHostStats,
 } from '@/types/panel-cluster'
 import type { HostStats } from '@/types/panel-overview'
@@ -252,11 +253,19 @@ export type ClusterMachine = {
     load: [number, number | null, number | null]
   } | null
   mem: Meter | null
+  /** 调度用的整机内存压力；ok / 未采样为 null。 */
+  memPressure: HostMemoryPressure | null
   disk: Meter | null
   slots: Vm[]
   capacity: MachineCapacity | null
   todayUsd: number
   remote?: ClusterApiNode
+}
+
+function pressureOf(
+  p: HostMemoryPressure | null | undefined
+): HostMemoryPressure | null {
+  return p && p.level !== 'ok' ? p : null
 }
 
 function todayOf(vms: Vm[]): number {
@@ -314,6 +323,7 @@ export function buildLocalMachine(input: {
       h && memTotal
         ? { pct: Number(h.mem_pct) || 0, used: memUsed, total: memTotal }
         : null,
+    memPressure: pressureOf(h?.memory_pressure),
     disk: diskMeter(input.status?.disk),
     slots,
     capacity: memTotal
@@ -347,6 +357,7 @@ export function buildRemoteMachine(
     linkSub: linkLatencyText(node),
     cpu: h ? hostCpu(h) : null,
     mem: h ? { pct: h.mem_pct, used: h.mem_used, total: h.mem_total } : null,
+    memPressure: live ? pressureOf(node.memory_pressure) : null,
     disk: diskMeter(h),
     slots,
     capacity: h

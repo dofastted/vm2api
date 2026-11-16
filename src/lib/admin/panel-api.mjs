@@ -6,6 +6,7 @@
  *   { ok: false, error: { type, code, message, ... } }
  */
 
+import { hostMemoryPressureOf, LOCAL_HOST_KEY } from '../cluster/host-memory-pressure.mjs'
 import { THINKING_DISPLAY_MODES } from '../protocol/thinking.mjs'
 import { normalizeRedaction } from '../redaction/policy.mjs'
 import { redactionStatus } from '../redaction/runtime.mjs'
@@ -1644,6 +1645,7 @@ function hostStats() {
     heap_total: mem.heapTotal,
     uptime: os.uptime(),
     proc_uptime: process.uptime(),
+    memory_pressure: hostMemoryPressureOf(LOCAL_HOST_KEY),
   }
 }
 

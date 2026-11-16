@@ -186,6 +186,16 @@ export function installHostMemoryPressure(instance) {
   return active
 }
 
+/**
+ * Pressure of one machine for host status views: `{ level, ratio }`, or null
+ * when unsampled / disabled. Machine-wide, so it belongs on the host, not on
+ * each slot row.
+ */
+export function hostMemoryPressureOf(key = LOCAL_HOST_KEY) {
+  const entry = active?.snapshot?.().find((e) => e.key === key)
+  return entry ? { level: entry.level, ratio: entry.ratio } : null
+}
+
 export function hostMemoryLevelForVm(vm) {
   return active ? active.levelForVm(vm) : HOST_PRESSURE_OK
 }

@@ -44,6 +44,8 @@ export type ClusterApiNode = {
     active: number
   } | null
   install: DockerInstallJob | null
+  /** 宿主内存压力（调度用）；未采样为 null。 */
+  memory_pressure?: HostMemoryPressure | null
   /** 直连通道（kin-slot-gate，TLS）；未配置为 null。令牌与证书指纹从不返回。 */
   direct_link?: ClusterDirectLink | null
 }
@@ -252,4 +254,11 @@ export type ClusterLocalStatus = {
     accel: 'kvm' | 'tcg' | null
     error: string | null
   }
+}
+
+/** 整台机器的内存压力：tight 新对话优先去别的机器，critical 不再接新对话。 */
+export type HostMemoryPressure = {
+  level: 'ok' | 'tight' | 'critical'
+  /** MemAvailable / MemTotal */
+  ratio: number
 }

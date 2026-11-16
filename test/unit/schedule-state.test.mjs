@@ -296,21 +296,11 @@ test('resolveSlotState reads records written before the migration', () => {
   assert.equal(leftover.schedule_state, 'restricted')
 })
 
-test('host memory pressure shows as a new-session restriction on the panel', async (t) => {
+test('host memory pressure stays on the host, not on each slot', async (t) => {
   const { installHostMemoryPressure } = await import('../../src/lib/cluster/host-memory-pressure.mjs')
-  const levels = { 'node-a': 'tight', local: 'critical' }
-  installHostMemoryPressure({ levelForVm: (vm) => levels[vm.node_id || 'local'] || 'ok' })
+  installHostMemoryPressure({ levelForVm: () => 'critical', snapshot: () => [] })
   t.after(() => installHostMemoryPressure(null))
-  const tight = resolveSlotState({ vm: { schedulable: true, node_id: 'node-a' } })
-  assert.equal(tight.schedule_state, 'restricted')
-  assert.equal(tight.restriction_reason, 'host_memory_tight')
-  assert.equal(tight.restriction_scope, 'new_session')
-  assert.equal(tight.restriction_soft, true)
-  assert.equal(tight.restriction_text, '主机内存紧张')
-  const critical = resolveSlotState({ vm: { schedulable: true } })
-  assert.equal(critical.restriction_reason, 'host_memory_critical')
-  assert.equal(critical.restriction_soft, false)
-  assert.equal(critical.restriction_text, '主机内存告急')
-  levels.local = 'ok'
+  // Admission already filters by host memory in pool-scheduler; the slot row must not inherit it.
   assert.equal(resolveSlotState({ vm: { schedulable: true } }).schedule_state, 'on')
+  assert.equal(resolveSlotState({ vm: { schedulable: true, node_id: 'node-a' } }).schedule_state, 'on')
 })

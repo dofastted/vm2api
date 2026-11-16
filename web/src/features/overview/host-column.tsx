@@ -1,5 +1,6 @@
 import type { HostStats } from '@/types/panel-overview'
 import { fmtBytes } from '@/lib/format'
+import { cn } from '@/lib/utils'
 
 function barColor(p: number): string {
   if (p >= 100) return 'var(--status-bad)'
@@ -61,6 +62,24 @@ export function HostColumn({ host }: { host: HostStats | undefined }) {
     >
       <HostRow label='CPU' value={cpu} valueText={`${cpu.toFixed(0)}%`} />
       <HostRow label='内存' value={mem} valueText={`${mem.toFixed(0)}%`} />
+      {h.memory_pressure && h.memory_pressure.level !== 'ok' ? (
+        <div
+          className={cn(
+            'text-[11px] font-medium',
+            h.memory_pressure.level === 'critical'
+              ? 'text-[color:var(--status-bad)]'
+              : 'text-[color:var(--status-warn)]'
+          )}
+          title={
+            h.memory_pressure.level === 'critical'
+              ? '可用内存告急：本机不再接新对话，已有对话照常'
+              : '可用内存低于阈值：新对话优先派到其他机器，已有对话照常'
+          }
+        >
+          {h.memory_pressure.level === 'critical' ? '内存告急' : '内存紧张'} ·
+          可用 {(h.memory_pressure.ratio * 100).toFixed(0)}%
+        </div>
+      ) : null}
       <HostRow label='进程' value={heap} valueText={fmtBytes(h.rss)} />
     </div>
   )
