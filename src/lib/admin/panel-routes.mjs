@@ -4811,7 +4811,7 @@ export function createPanelHandler(ctx) {
         const cragCapableNodes = new Set()
         if (wanted.mode === 'auto' && ident.role === 'admin' && runtime !== RUNTIME_KVM && !exitPinsHost) {
           const picked = await (ctx.pickPlacement || pickPlacement)({
-            vm: { machine },
+            vm: { ...kindProbe, machine },
             vms: existing,
             routing: ctx.routingConfig,
             policy:

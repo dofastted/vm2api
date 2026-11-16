@@ -4,9 +4,10 @@
  * no `node_id`.
  *
  * Headroom is booked, not sampled: every slot already placed on a machine holds
- * its container memory limit (`slotMemory`, or `slot_reserve_memory` when that
- * is larger, since a capacity reconciler may raise the limit after create)
- * against `mem_total × max_commit_ratio` (above 1 overcommits: limits are
+ * the memory limit the capacity reconciler will raise it to (its plan target,
+ * or its recorded limit when larger; a slot whose plan is not known yet, such
+ * as one just created, holds `slot_reserve_memory` or else the largest plan
+ * target) against `mem_total × max_commit_ratio` (above 1 overcommits: limits are
  * ceilings, and live admission keeps new work off a machine short of memory).
  * Live figures only veto a machine:
  * MemAvailable below `min_free_memory`, or load1 per core above
@@ -26,6 +27,8 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import { memoryMiB, slotMemory } from '../vm/machine-spec.mjs'
+import { resourcesForSlots, slotCapacityConfig, slotCreationLimits, slotPlanOf } from '../vm/slot-capacity.mjs'
+import { isCodexVm } from '../vm/vm-kind.mjs'
 
 export const LOCAL_PLACEMENT = 'local'
 
@@ -79,11 +82,25 @@ export function requestedPlacement(body, policy) {
   return { mode: LOCAL_PLACEMENT }
 }
 
-/** MiB one slot books on its machine. */
+/**
+ * MiB one slot books on its machine: what the capacity reconciler will raise
+ * its container to, so a plan ratio change needs no matching reserve edit.
+ *   - plan known: plan target, or the recorded limit when larger
+ *   - plan not known yet (no account bound): `slot_reserve_memory`, else the
+ *     largest plan target; it drops to the plan once an account binds
+ *   - Codex slot, or slot capacity off: recorded limit, or `slot_reserve_memory`
+ *     when larger
+ */
 export function bookedMiB(vm, routing, policy) {
   const limit = memoryMiB(slotMemory(vm, routing))
   const reserve = policy.slot_reserve_memory ? memoryMiB(policy.slot_reserve_memory) : 0
-  return Math.max(limit, reserve)
+  const capacity = slotCapacityConfig(routing)
+  if (!capacity.enabled || isCodexVm(vm)) return Math.max(limit, reserve)
+  if (slotPlanOf(vm) === 'default') {
+    const largest = resourcesForSlots(Math.max(...Object.values(capacity.plans)), routing).memoryMiB
+    return Math.max(limit, reserve || largest)
+  }
+  return Math.max(limit, memoryMiB(slotCreationLimits(vm, routing).memory))
 }
 
 /** Booked MiB per machine key ('local' or node id). */
