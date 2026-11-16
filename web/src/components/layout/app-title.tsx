@@ -1,8 +1,17 @@
+import { useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { DOCS_URL, REPO_URL } from '@/config/repo'
-import { ArrowUpRight, BookOpen, Menu, X } from 'lucide-react'
+import { ArrowUpRight, BookOpen, Menu, Sparkles, X } from 'lucide-react'
 import { IconGithub } from '@/assets/brand-icons'
 import { Logo } from '@/assets/logo'
+import {
+  RELEASE_CHECK_INTERVAL_MS,
+  fetchLatestRelease,
+  hasNewerRelease,
+  readDismissedRelease,
+  writeDismissedRelease,
+} from '@/lib/release-check'
 import { cn } from '@/lib/utils'
 import {
   SidebarMenu,
@@ -55,6 +64,7 @@ export function AppTitle({ version }: { version?: string }) {
         </div>
         <div className='mt-2.5 grid gap-1.5 group-data-[collapsible=icon]:hidden'>
           <VersionChip version={version?.replace(/^v/i, '')} />
+          <UpdateNotice version={version?.replace(/^v/i, '')} />
           <div className='flex min-w-0 gap-1.5'>
             <a
               href={REPO_URL}
@@ -111,6 +121,56 @@ function VersionChip({ version }: { version?: string }) {
         className='ms-auto size-4 shrink-0 opacity-60'
       />
     </a>
+  )
+}
+
+function UpdateNotice({ version }: { version?: string }) {
+  const [dismissed, setDismissed] = useState(readDismissedRelease)
+  const { data: latest } = useQuery({
+    queryKey: ['github-latest-release'],
+    queryFn: () => fetchLatestRelease(REPO_URL),
+    enabled: Boolean(version),
+    staleTime: RELEASE_CHECK_INTERVAL_MS,
+    refetchInterval: RELEASE_CHECK_INTERVAL_MS,
+    refetchIntervalInBackground: true,
+    refetchOnWindowFocus: false,
+    retry: false,
+  })
+  if (!latest || !hasNewerRelease(version, latest, dismissed)) return null
+  return (
+    <div
+      role='status'
+      className={cn(
+        CHIP_CLASS,
+        'border-amber-500/45 bg-amber-500/10 pe-1 text-amber-700 dark:text-amber-300'
+      )}
+    >
+      <a
+        href={latest.url}
+        target='_blank'
+        rel='noreferrer'
+        title={`v${latest.version} 发布说明`}
+        className='inline-flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 rounded outline-hidden hover:underline focus-visible:ring-2 focus-visible:ring-sidebar-ring'
+      >
+        <Sparkles aria-hidden className='size-4 shrink-0' />
+        <span className='truncate'>现在有更新</span>
+        <span className='truncate font-mono text-xs opacity-75'>
+          v{latest.version}
+        </span>
+      </a>
+      <button
+        type='button'
+        aria-label='关闭更新提示'
+        title='关闭此提示'
+        className='grid size-6 shrink-0 cursor-pointer place-items-center rounded-md opacity-70 outline-hidden hover:bg-amber-500/15 hover:opacity-100 focus-visible:ring-2 focus-visible:ring-sidebar-ring'
+        onClick={() => {
+          writeDismissedRelease(latest.version)
+          setDismissed(latest.version)
+        }}
+      >
+        <X aria-hidden className='size-3.5' />
+      </button>
+    </div>
   )
 }
 
