@@ -359,7 +359,7 @@ export function RiskAuditPage() {
               title='设置'
               hint={
                 stage.id === 'refusal'
-                  ? '改动立即生效。'
+                  ? '开关立即生效；封禁阶梯、工具和降级目标需保存。'
                   : '改完在底部保存条里保存。'
               }
             >
@@ -372,6 +372,7 @@ export function RiskAuditPage() {
                 />
               ) : stage.id === 'refusal' ? (
                 <RefusalSettings
+                  onDirtyChange={onDirtyChange}
                   onOpen={(row) =>
                     setDetail({
                       row,
