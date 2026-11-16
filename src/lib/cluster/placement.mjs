@@ -19,7 +19,15 @@ import { slotRuntimeOwner } from '../oauth/oauth-credentials.mjs'
 import { routingConfigFile } from '../core/config.mjs'
 import { normalizeVmConfig, slotMemory } from '../vm/machine-spec.mjs'
 import { runtimeKind } from '../vm/runtime-kind.mjs'
-import { buildImage, dockerInfo, ensureImage, imagePresent, sshDocker } from './docker-remote.mjs'
+import {
+  buildImage,
+  dockerInfo,
+  ensureImage,
+  imagePresent,
+  listImages,
+  removeImageTag,
+  sshDocker,
+} from './docker-remote.mjs'
 import { runRemote, shellQuote } from './remote-fs.mjs'
 import { describeNativePayload } from './native-payload.mjs'
 import { LAUNCHD_GUI_REQUIRED } from './native-slot.mjs'
@@ -252,6 +260,26 @@ export function slotImageCheck(ref, present) {
   }
 }
 
+/**
+ * Untag the node's Docker slot images that are not `current`, limited to the repos of
+ * `current` (vm2api/kin-slot-<kernel>); KVM images and other repos are never touched.
+ * No force: an image a container still uses (even stopped) stays. Returns removed refs.
+ */
+export async function pruneStaleSlotImages(nodeId, current, { connect } = {}) {
+  const keep = new Set(current)
+  const repos = new Set(current.map((ref) => ref.slice(0, ref.lastIndexOf(':'))))
+  const docker = connect || sshDocker(clusterManager().client(nodeId))
+  const removed = []
+  for (const image of (await listImages(docker)) || []) {
+    for (const tag of image.RepoTags || []) {
+      const repo = tag.slice(0, tag.lastIndexOf(':'))
+      if (!repos.has(repo) || keep.has(tag)) continue
+      if (await removeImageTag(docker, tag)) removed.push(tag)
+    }
+  }
+  return removed
+}
+
 const warming = new Map()
 
 /**
@@ -263,11 +291,19 @@ const warming = new Map()
  * a second call while it runs returns the same promise. Off with
  * `cluster.slot_image_warm: false`.
  *
+ * When every kernel is current, older tags of those same image repos are removed
+ * (pruneStaleSlotImages): each hash change would otherwise leave ~5 GB behind per node.
+ *
  * Resolves to [{ kernel, status, ref, built }]; never rejects.
  */
 export function warmNodeSlotImages(
   nodeId,
-  { kernels = Object.keys(OS_CATALOG), start = startSlotImageBuild, logger = console } = {},
+  {
+    kernels = Object.keys(OS_CATALOG),
+    start = startSlotImageBuild,
+    prune = pruneStaleSlotImages,
+    logger = console,
+  } = {},
 ) {
   const running = warming.get(nodeId)
   if (running) return running
@@ -296,6 +332,18 @@ export function warmNodeSlotImages(
         if (bound?.manager?.linkReady?.(nodeId) === false) break
       } else if (built) {
         logger.log?.(JSON.stringify({ event: 'slot-image-warm', node: nodeId, kernel, ref: job.ref }))
+      }
+    }
+    // Old tags only go once every warmed kernel has its current image: never leave a node with none.
+    if (results.length === kernels.length && results.every((r) => r.status === 'done' && r.ref)) {
+      try {
+        const removed = await prune(
+          nodeId,
+          results.map((r) => r.ref),
+        )
+        if (removed.length) logger.log?.(JSON.stringify({ event: 'slot-image-prune', node: nodeId, removed }))
+      } catch (err) {
+        logger.warn?.(`[cluster] slot image prune ${nodeId} failed: ${err?.message || err}`)
       }
     }
     return results
