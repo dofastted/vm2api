@@ -13,7 +13,7 @@ import {
   rustKernelReachable,
   rustKernelBusy,
 } from './rust-kernel-client.mjs'
-import { maxRequestBytes, streamIdleTimeoutMs } from '../core/config.mjs'
+import { maxRequestBytes, readRoutingConfigFile, streamIdleTimeoutMs } from '../core/config.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
 import { resolveWorkstationProfile } from '../identity/workstation-profile.mjs'
 import { cacheTtlFromRouting, normalizeCacheTtl } from '../protocol/cache-ttl.mjs'
@@ -136,6 +136,27 @@ export function expectedKernelSlots(exec = {}) {
   return wrapSlotCount(vm || {})
 }
 
+/** crag-v2 session_slots before the physical cap: the VM's pin, else the panel default. */
+export function requestedCragSessionSlots(vm, routing) {
+  const followGlobal =
+    routing?.inference?.session_slots != null &&
+    (vm?.policy?.sessionSlotsOverride ?? vm?.session_slots_override) === false
+  return resolveSessionSlots(followGlobal ? {} : vm, routing)
+}
+
+/** The uncapped session_slots for a slot-count change; undefined when routing.json is unreadable. */
+function expectedCragSessionSlots(exec = {}) {
+  const root = projectRootFromExec(exec)
+  const id = exec?.vmId || exec?.vm?.id
+  let vm = exec?.vm
+  try {
+    if (root && id) vm = getVm(root, id) || vm
+    return requestedCragSessionSlots(vm || {}, readRoutingConfigFile(root))
+  } catch {
+    return undefined
+  }
+}
+
 function startCurrent(control) {
   return control.cancelled !== true
 }
@@ -151,11 +172,21 @@ export function slotContainerName(exec = {}) {
   return vmId ? `kin-${String(vmId).replace(/^vm-/, '')}` : ''
 }
 
-export function syncKernelSlotCount(configPath, expected = WRAP_SLOT_MAX) {
+/**
+ * Rewrite kernel.json's slot count. A crag-v2 kernel also gets its
+ * session_slots re-capped at the new count: crag-v2 refuses to start above it,
+ * and a grown count must lift a session limit that was only capped by the old
+ * one. `sessionSlots` is the uncapped request (VM pin, else panel default);
+ * without it the current value is only ever lowered.
+ */
+export function syncKernelSlotCount(configPath, expected = WRAP_SLOT_MAX, sessionSlots) {
   const prev = readExistingKernelConfig(configPath)
   if (!prev || typeof prev !== 'object') return false
   if (Number(prev.slots_per_worker) === expected) return false
   prev.slots_per_worker = expected
+  if (prev.runtime_variant === 'crag-v2' && Number.isInteger(prev.session_slots)) {
+    prev.session_slots = Math.min(Number.isInteger(sessionSlots) ? sessionSlots : prev.session_slots, expected)
+  }
   try {
     fs.writeFileSync(configPath, JSON.stringify(prev, null, 2) + '\n', { mode: 0o600 })
     return true
@@ -190,9 +221,9 @@ export function kernelSlotsDiffer(configPath, health, expected) {
  * count (an older release or a hand edit), only the file is rewritten so a
  * later crash restart reads the right count; that needs no reload.
  */
-export function kernelSlotsConverge(configPath, health, expected) {
+export function kernelSlotsConverge(configPath, health, expected, sessionSlots) {
   if (kernelSlotsDiffer(configPath, health, expected)) return true
-  syncKernelSlotCount(configPath, expected)
+  syncKernelSlotCount(configPath, expected, sessionSlots)
   return false
 }
 
@@ -816,7 +847,7 @@ async function startRustKernel(
   // A slot-count change is config convergence: never kill live sessions for it.
   // Write the file now and let the idle reload pick it up.
   if (slotMismatch && occupied && !force && !staleWrap && !prepareGuestAppArmor && !allowMissingCredential) {
-    syncKernelSlotCount(paths.configPath, expectedSlots)
+    syncKernelSlotCount(paths.configPath, expectedSlots, expectedCragSessionSlots(exec))
     requestKernelReloadWhenIdle(exec)
     const reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
     return { ok: true, reason: 'busy', slot_reload: 'pending', health: existing, reconcile }
@@ -837,7 +868,7 @@ async function startRustKernel(
     return { ok: true, reason: 'already_up', health: existing, reconcile }
   }
   if (!paths.configPath || !fs.existsSync(paths.configPath)) return { ok: false, reason: 'config_missing' }
-  syncKernelSlotCount(paths.configPath, expectedSlots)
+  syncKernelSlotCount(paths.configPath, expectedSlots, slotMismatch ? expectedCragSessionSlots(exec) : undefined)
   try {
     await host.syncRun(exec.vm, path.dirname(paths.runDir))
   } catch (error) {
@@ -1110,14 +1141,11 @@ export function writeKernelConfig(
     ...(!host.native && !isCodexVm(record) ? { telemetry: buildNativeTelemetry(record, projectRoot, routing) } : {}),
   }
   if (dataplane === 'crag' && resolveCragKernelVersion(target, kernelRouting) === 'v2' && !host.native) {
-    const followGlobal =
-      routing?.inference?.session_slots != null &&
-      (target.policy?.sessionSlotsOverride ?? target.session_slots_override) === false
     // crag-v2 refuses to start when session_slots exceeds the worker's physical
     // slots ("session_slots exceeds physical capacity"), so the panel default
     // (20) must not outgrow a plan-sized kernel (Pro 5, Max 5x 12).
     config.session_slots = Math.min(
-      resolveSessionSlots(followGlobal ? {} : target, kernelRouting),
+      routing != null ? requestedCragSessionSlots(target, routing) : resolveSessionSlots(target, kernelRouting),
       config.slots_per_worker,
     )
     config.prewarm_enabled = kernelRouting.inference?.prewarm_enabled === true

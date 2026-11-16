@@ -39,6 +39,8 @@ import {
   requestKernelReloadWhenIdle,
   kernelSlotsDiffer,
   kernelSlotsConverge,
+  requestedCragSessionSlots,
+  syncKernelSlotCount,
 } from '../../src/lib/transport/rust-kernel-supervisor.mjs'
 import { rustKernelPaths, isNeedsRefreshResult } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
@@ -1292,6 +1294,38 @@ test('CRAG session_slots never exceeds the plan-sized kernel slots', () => {
     assert.equal(pinnedHigh.session_slots, 5)
     const pinnedLow = write({ ...pro, policy: { sessionSlots: 3, sessionSlotsOverride: true } })
     assert.equal(pinnedLow.session_slots, 3)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('CRAG session_slots follows a slot-count change made outside a config rewrite', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-seat-sync-'))
+  const routing = { inference: { dataplane: 'crag', session_slots: 20 }, slot_capacity: { enabled: true } }
+  const small = {
+    id: 'vm-11',
+    machine: { memory: '1g', pids_limit: 256 },
+    claude: { rate_limit_tier: 'default_claude_ai' },
+  }
+  const read = (file) => JSON.parse(fs.readFileSync(file, 'utf8'))
+  try {
+    const { configPath } = writeKernelConfig(root, small, { routing })
+    const before = read(configPath)
+    assert.ok(before.slots_per_worker < 5, `1g Pro runs fewer than 5 slots, got ${before.slots_per_worker}`)
+    assert.equal(before.session_slots, before.slots_per_worker)
+    // The capacity reconciler raised the VM to 2g/448: only the slot count converges.
+    const raised = { ...small, machine: { memory: '2g', pids_limit: 448 } }
+    assert.equal(syncKernelSlotCount(configPath, 5, requestedCragSessionSlots(raised, routing)), true)
+    assert.deepEqual([read(configPath).slots_per_worker, read(configPath).session_slots], [5, 5])
+    // A lower pin survives the raise.
+    const pinned = { ...raised, policy: { sessionSlots: 3, sessionSlotsOverride: true } }
+    fs.writeFileSync(configPath, JSON.stringify({ ...before }))
+    assert.equal(kernelSlotsConverge(configPath, null, 5, requestedCragSessionSlots(pinned, routing)), true)
+    syncKernelSlotCount(configPath, 5, requestedCragSessionSlots(pinned, routing))
+    assert.equal(read(configPath).session_slots, 3)
+    // Shrinking without the request still keeps crag-v2 startable.
+    assert.equal(syncKernelSlotCount(configPath, 2), true)
+    assert.deepEqual([read(configPath).slots_per_worker, read(configPath).session_slots], [2, 2])
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
