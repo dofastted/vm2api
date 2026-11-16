@@ -253,6 +253,8 @@ vm2api 内置全栈自适应网关，原生支持以下所有主流生态：
 | `/v1/models` | 标准模型列表 API | 订阅密钥按 `group_type` 过滤（`openai` / `anthropic` / `all`）；`api` 类密钥按所配端点协议列出上游模型 |
 | `/v1/images/*` | OpenAI Images API | GPT Image 系列；亦可通过 Chat / Responses 图像桥接调用 |
 
+Gemini 的无 VM 导入是默认关闭的宿主机候选，尚未开放对外推理或收费。见 [Gemini 宿主机候选](docs/gemini-host.md)。
+
 ---
 
 <br/>

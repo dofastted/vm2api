@@ -20,6 +20,7 @@ hypervisor/*.env
 /bin/
 /web/dist/
 /share/crag/
+/share/gemini/
 /share/wrap-cli/*
 /share/wrap-cli-releases/
 !/share/wrap-cli/kin-kernel
