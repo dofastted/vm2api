@@ -3296,6 +3296,36 @@ test('session_affinity_first falls back to priority when the own VM cannot take 
   excluded.release()
 })
 
+test('session_affinity_first waits out a soft RPM cooldown on the own VM instead of moving', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  preferVm01(root)
+  const runtimeRepo = new RuntimeRepo()
+  runtimeRepo.upsert({
+    account_id: 'account-2',
+    vm_id: 'vm-02',
+    status: 'cooldown',
+    cooldown_until: Date.now() + 150,
+    cooldown_reason: 'rpm_limited',
+  })
+  const stickyRouter = { resolve: () => ({ vmId: 'vm-02', accountId: 'account-2' }) }
+  const pool = scheduler(root, {
+    runtimeRepo,
+    stickyRouter,
+    config: { session_affinity_first: true, sticky_wait_timeout_ms: 5000, fallback_wait_timeout_ms: 5000 },
+  })
+  const selected = await pool.selectAndReserve({
+    model: 'claude-test',
+    seatKey: 'seat:sess:soft',
+    stickyKey: 'conversation-soft',
+    allowWait: true,
+    failoverDeadline: Date.now() + 8000,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-02', 'an RPM cooldown is borrowed time, not a reason to rewrite the cache elsewhere')
+  selected.release()
+})
+
 test('pool routing normalizes session_affinity_first to a strict boolean', () => {
   assert.equal(normalizePoolRouting({}).session_affinity_first, false)
   assert.equal(normalizePoolRouting({ session_affinity_first: 'yes' }).session_affinity_first, false)

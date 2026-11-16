@@ -880,7 +880,7 @@ export class PoolScheduler extends EventEmitter {
           ticket?.kind === 'seat' &&
           (now >= ticket.stickyUntil ||
             !waitingHome ||
-            (!ticket.sessionHome &&
+            ((!ticket.sessionHome || waitingHome.draining) &&
               candidates.some((candidate) => candidate.priority > waitingHome.priority && !avoided(candidate))))
         ) {
           ticket.deadline = Math.min(failoverDeadline, now + this.config.fallback_wait_timeout_ms)
@@ -960,9 +960,14 @@ export class PoolScheduler extends EventEmitter {
             if (!allowWait || now >= failoverDeadline) return fail('all_accounts_busy')
             const waitTier = highestPriorityCandidates(candidates.filter((candidate) => !avoided(candidate)))
             const waitable = (candidate) => candidate && (!candidate.busy || stickyShouldWait(candidate.waitReason))
+            // The session's own VM also waits out a soft (RPM) cooldown, as reconcileSticky() does.
             const sessionHome = sessionVm
               ? candidates.find(
-                  (candidate) => candidate.vmId === sessionVm && !avoided(candidate) && waitable(candidate),
+                  (candidate) =>
+                    candidate.vmId === sessionVm &&
+                    !avoided(candidate) &&
+                    !candidate.draining &&
+                    (!candidate.busy || stickyShouldWait(candidate.waitReason, candidate.cooldownReason)),
                 )
               : null
             const home =
@@ -1045,7 +1050,7 @@ export class PoolScheduler extends EventEmitter {
         const granted = home && this.claimSeat(seatKey, home, 'sticky', deviceKey)
         if (granted) return granted
         // Full or briefly busy: wait on it (sticky wait) rather than move now.
-        if (waitForSession && (!own.busy || stickyShouldWait(own.waitReason))) return null
+        if (waitForSession && (!own.busy || stickyShouldWait(own.waitReason, own.cooldownReason))) return null
       }
     }
     const ranked = this.planner.rank(openable)
