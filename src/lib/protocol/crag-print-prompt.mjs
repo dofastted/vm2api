@@ -8,6 +8,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { normalizeCragKernelVersion, normalizeKernelDataplane, normalizeSlotPersonaPreset } from '../vm/slot-engine.mjs'
+import { hasUsableThinkingSignature } from './anthropic-policy.mjs'
 /**
  * Print is the CRAG v2 worker only. A live health report wins, then an
  * explicit dataplane on the VM, then the kernel.json that worker was started
@@ -390,6 +391,28 @@ function foldSummarySystemTurns(messages) {
 }
 
 /**
+ * Print bypasses stripInvalidThinkingBlocks. A history thinking block with no
+ * usable signature (empty, short, dummy) is always a 400 "Invalid `signature`
+ * in `thinking` block" upstream, e.g. history from a relay that never signs.
+ * Drop it, as Claude Code's own retry does. Signed blocks stay untouched: the
+ * kernel fingerprints them. A turn that would be left empty keeps its shape.
+ */
+export function dropUnsignedHistoryThinking(messages) {
+  if (!Array.isArray(messages)) return messages
+  let changed = false
+  const out = messages.map((message) => {
+    if (message?.role !== 'assistant' || !Array.isArray(message.content)) return message
+    const content = message.content.filter(
+      (block) => block?.type !== 'thinking' || hasUsableThinkingSignature(block.signature),
+    )
+    if (content.length === message.content.length || !content.length) return message
+    changed = true
+    return { ...message, content }
+  })
+  return changed ? out : messages
+}
+
+/**
  * @param {object} body caller body, before cli-node persona injection
  * @param {{ preset?: 'official_full' | 'zero', officialPassthrough?: boolean, capabilities?: string[], agentSummary?: boolean, foldSystemMessages?: boolean }} [options]
  */
@@ -404,6 +427,7 @@ export function prepareCragPrintBody(
   } = {},
 ) {
   const out = { ...(body || {}) }
+  if (Array.isArray(out.messages)) out.messages = dropUnsignedHistoryThinking(out.messages)
   if (agentSummary) out.messages = readOnlySummaryResults(out.messages)
   if (foldSystemMessages) {
     const folded = agentSummary ? foldSummarySystemTurns(out.messages) : foldSystemTurns(out.messages)

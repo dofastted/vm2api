@@ -8,6 +8,7 @@ import {
   callerCwdDeclaration,
   callerSystemTail,
   cragV2KernelActive,
+  dropUnsignedHistoryThinking,
   foldHistorySystemMessages,
   prepareCragPrintBody,
   projectCallerSystem,
@@ -483,4 +484,38 @@ test('a fold that would put a 1h breakpoint after a 5m one keeps the system turn
   )
   assert.equal(folded[2].content[0].type, 'tool_result')
   assert.equal(folded[2].content[1].cache_control.ttl, '1h')
+})
+
+test('print drops history thinking blocks without a usable signature', () => {
+  const signed = { type: 'thinking', thinking: 'kept', signature: 'S'.repeat(64) }
+  const body = {
+    model: 'claude-fable-5-2',
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'q' }] },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: 'relay history', signature: '' },
+          { type: 'tool_use', id: 't1', name: 'Read', input: {} },
+        ],
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] },
+      { role: 'assistant', content: [signed, { type: 'text', text: 'done' }] },
+      { role: 'user', content: [{ type: 'text', text: 'next' }] },
+    ],
+  }
+  const out = prepareCragPrintBody(body, { preset: 'official_full' })
+  assert.deepEqual(
+    out.messages[1].content.map((b) => b.type),
+    ['tool_use'],
+  )
+  assert.equal(out.messages[3].content[0], signed)
+  assert.equal(body.messages[1].content.length, 2, 'caller body is not mutated')
+})
+
+test('dropUnsignedHistoryThinking keeps a turn that would be emptied and returns unchanged arrays as-is', () => {
+  const only = [{ role: 'assistant', content: [{ type: 'thinking', thinking: 'x', signature: '' }] }]
+  assert.equal(dropUnsignedHistoryThinking(only), only)
+  const clean = [{ role: 'assistant', content: [{ type: 'text', text: 'a' }] }]
+  assert.equal(dropUnsignedHistoryThinking(clean), clean)
 })
