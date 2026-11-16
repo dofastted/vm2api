@@ -1066,6 +1066,7 @@ const handleCragShop = createCragShopHandler({
   subscription: cragSubscription,
   isCurrentAdmin: (req) => isCragShopAdmin(req.panelBuyerOwner),
   isActivationAdmin: isCragShopAdmin,
+  allowDeviceRequest: () => allowRate('crag-shop:device'),
   activationEnabled: cragShopActivationEnabled,
 })
 

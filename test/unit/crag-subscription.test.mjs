@@ -290,6 +290,40 @@ test('standalone redeem with a missing or corrupt host package does not start a 
   }
 })
 
+test('a device purchase applies signed rights only to its verified host and replays the same voucher after loss', async (t) => {
+  const redemptionCode = voucher()
+  const requests = []
+  let issued
+  const { root, publicDir, connect } = standaloneHost(t, async (url, { body, headers }) => {
+    const request = JSON.parse(body)
+    if (url.endsWith('/redeem')) {
+      requests.push({ request, authorization: headers.authorization })
+      if (!issued) {
+        issued = issueHostEntitlement(root, request.host_id, { slot_limit: 10 })
+        throw new Error('committed response interrupted')
+      }
+    }
+    return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims, used_slots: 0 } })
+  })
+  const service = connect()
+  const hostId = service.purchaseDeviceId()
+  assert.match(hostId, /^[a-f0-9]{64}$/)
+  assert.equal(fs.existsSync(path.join(publicDir, 'host_id')), false, 'checkout does not create a subscription')
+  seedEncryptedPackage(root)
+  const wrongHost = `${hostId[0] === 'a' ? 'b' : 'a'}${hostId.slice(1)}`
+  await assert.rejects(service.redeemDeviceOrder(wrongHost, redemptionCode))
+  assert.equal(requests.length, 0)
+  await assert.rejects(service.redeemDeviceOrder(hostId, redemptionCode), {
+    code: 'crag_subscription_authority_unavailable',
+  })
+  await assert.rejects(connect().redeemDeviceOrder(hostId, voucher()), { code: 'crag_subscription_sync_pending' })
+  await connect().redeemDeviceOrder(hostId, redemptionCode)
+  assert.equal(requests.length, 2)
+  assert.deepEqual(requests[1], requests[0])
+  assert.deepEqual(requests[0].request, { host_id: hostId, redemption_code: redemptionCode })
+  assert.equal((await service.status()).available_seats, 10)
+})
+
 test('standalone recovery waits for the original verified host package before replaying a lost response', async (t) => {
   const redemption_code = voucher()
   const requests = []

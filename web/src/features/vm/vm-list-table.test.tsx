@@ -41,7 +41,7 @@ describe('VM scheduling priority', () => {
         weight: 42,
       }
       const list = render(vm)
-      expect(list).toContain('>调度 · 优先级</span>')
+      expect(list).toContain('>调度 · 优先级</div>')
       expect(list).toMatch(
         /text-blue-800[^"]*shadow-\[inset_0_0_0_1px_currentColor\][^"]*"[^>]*>P8</
       )
@@ -80,8 +80,8 @@ describe('VM row interaction and health', () => {
       i === 47 ? [99, 1] : [0, 0]
     )
     const html = render({ health_24h: buckets })
-    expect(html).toContain('>99.0%</span>')
-    expect(html).toContain('99/100 成功')
+    expect(html).toContain('>99.0%</b>')
+    expect(html).toContain('>99/100</span>')
     expect(render({ health_24h: null })).toContain('24h 无请求')
     expect(render({ health_24h: null })).not.toContain('主机内存紧张')
   })
@@ -166,5 +166,21 @@ describe('VM account column kernel label', () => {
     expect(render({ platform: 'openai', has_token: true })).toContain(
       '>local</span>'
     )
+  })
+})
+
+describe('VM list summary and toggles', () => {
+  it('renders the fleet summary and both list toggles', () => {
+    const buckets = Array.from({ length: 48 }, (_, i): [number, number] =>
+      i === 47 ? [9, 1] : [0, 0]
+    )
+    const html = render({ health_24h: buckets, seats_used: 1, seats_max: 4 })
+    expect(html).toContain('aria-label="全局汇总"')
+    expect(html).toContain('>在池</div>')
+    expect(html).toContain('>90.0%</b>')
+    expect(html).toContain('失败 1')
+    expect(html).toMatch(/aria-pressed="false"[^>]*>.*按状态分组/)
+    expect(html).toMatch(/aria-pressed="false"[^>]*>.*次要信息常显/)
+    expect(html).toContain('data-pin="false"')
   })
 })

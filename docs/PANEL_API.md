@@ -257,9 +257,11 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 
 支付接口边界、`v1.4.104` 实付验收和复跑步骤见 [CRAG 支付与鉴权验收](crag-payment-acceptance.md)。
 
-仅 `GET /crag-shop/plans` 可匿名读取公开套餐，无需 CRAG Auth 或面板凭据。试点目录仅供有效的面板买家会话；试点凭据文件不可用时仍可读取公开目录。`payment_methods: []` 表示当前未开放收款，不表示套餐读取失败。
+有两种购买入口：登录后在「订阅 CRAG」查看本人订单，或从登录页进入「免登录购买 CRAG 订阅」（`/cc#/crag-purchase`）购买到当前宿主机。两个入口的订单分别在各自页面的「查看订单」中显示。
 
-其余接口只接受实际面板登录会话，不接受 Master 或托管 API 密钥。升级前发出的旧会话需要重新登录一次。管理员也只能访问自己的订单；不存在和不属于本人的订单均返回 `404`。响应禁止缓存，写入请求必须同源，有请求体时须用 `application/json`。
+`GET /crag-shop/plans` 可匿名读取公开套餐，无需 CRAG Auth 或面板凭据。试点目录仅供有效的面板买家会话；试点凭据文件不可用时仍可读取公开目录。`payment_methods: []` 表示当前未开放收款，不表示套餐读取失败。
+
+下表的其他接口只接受实际面板登录会话，不接受 Master 或托管 API 密钥。升级前发出的旧会话需要重新登录一次。管理员也只能访问自己的订单；不存在和不属于本人的订单均返回 `404`。响应禁止缓存，写入请求必须同源，有请求体时须用 `application/json`。
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -271,6 +273,8 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 | POST | `/crag-shop/orders/:id/resume` | 空请求体或 JSON `{}`；按订单 ID 恢复原付款表单（若仍可用），不会创建新订单。供应方未确认创建时返回 `404` |
 | POST | `/crag-shop/orders/:id/claim` | 空请求体或 JSON `{}`，普通订单返回 `{ order_id, redemption_code }`；未发货返回 `409`，不兑换到宿主机，续费订单不提供兑换码 |
 | POST | `/crag-shop/orders/:id/apply-renewal` | 空请求体或 JSON `{}`；仅管理员本人可将已发货的续费订单应用到当前宿主机，返回宿主订阅状态，不返回兑换码或续费证明 |
+
+免登录设备购买使用 `/crag-shop/device` 前缀：先 `GET /plans` 获取公开目录及独立的 HttpOnly 购买 Cookie，再用同一浏览器 `POST /quote`、`POST /orders`。`GET /orders`、`GET /orders/:id` 和 `POST /orders/:id/resume` 可查询或恢复该浏览器在同一宿主机上的订单。`POST /orders/:id/apply`（空请求体或 `{}`）只将供应方已确认交付的原订单兑换到当前宿主机，返回订单状态，不返回兑换码、不绑定槽位。不要清除购买 Cookie；不能用订单号或设备 ID 恢复其他浏览器的订单。宿主设备身份由服务端读取，不接受浏览器提供的设备 ID。试点购买、续费、手动兑换与槽位管理不走此入口。
 
 管理员新购非续费套餐时可选 `{ activation_target: { vm_id } }`；目标从 `GET /crag-shop/activation-targets` 获取。供应方确认 `fulfilled` 后服务端自动兑换并绑定所选槽，浏览器无需在线。已指定目标的订单不提供领码；状态在 `activation` 中返回，暂停后可使用 `POST /crag-shop/orders/:id/retry-activation`（JSON `{}`）重试同一目标。历史手动订单与续费不自动改绑。
 

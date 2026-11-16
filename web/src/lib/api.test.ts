@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, normalizePanelError, panelFetch } from './api'
+import { ApiError, cragDeviceApi, normalizePanelError, panelFetch } from './api'
 import {
   hasSession,
   onPanelSessionExpired,
@@ -87,5 +87,33 @@ describe('panelFetch 401', () => {
     expect(res.status).toBe(401)
     expect(hasSession()).toBe(true)
     expect(expired).not.toHaveBeenCalled()
+  })
+})
+
+describe('CRAG device checkout', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('uses the serving host without requiring or sending panel credentials', async () => {
+    const values = installBrowser()
+    values.set('kin_api_base', 'https://other-console.example')
+    const fetchMock = vi.fn(async () =>
+      Response.json({ ok: true, data: { orders: [] } })
+    )
+    vi.stubGlobal('fetch', fetchMock)
+    expect(hasSession()).toBe(false)
+    await expect(cragDeviceApi('/orders')).resolves.toEqual({ orders: [] })
+    setSession('kin-panel-test-token')
+    await cragDeviceApi('/orders')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    for (const call of fetchMock.mock.calls) {
+      expect(call).toEqual([
+        '/api/panel/crag-shop/device/orders',
+        {
+          credentials: 'same-origin',
+          cache: 'no-store',
+          headers: { 'Content-Type': 'application/json' },
+        },
+      ])
+    }
   })
 })
