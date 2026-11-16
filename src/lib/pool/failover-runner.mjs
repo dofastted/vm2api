@@ -665,6 +665,10 @@ export class FailoverRunner {
     const excluded = budget.excluded
     // Accounts left only because the kernel had no free slot; their pins stay.
     const spilled = budget.spilled
+    // session_affinity_first: a turn that spilled to another unit wrote the
+    // whole prompt cache there, so the conversation follows it instead of
+    // returning to the home it spilled from (and rewriting the cache again).
+    const followCache = this.scheduler?.config?.session_affinity_first === true
     const bindKeys = uniqueStickyKeys(stickyKey, stickyKeys)
     const pinKeys = familyKey ? [...bindKeys, familyKey] : bindKeys
     // Pins as this request last saw them. A pin moved by someone else since
@@ -710,7 +714,8 @@ export class FailoverRunner {
             !!prev?.accountId &&
             prev.accountId !== account.accountId &&
             opts?.borrowed !== true &&
-            (prev.accountId === outboundSessionAccountId || (!!lastSelected?.seatKey && !spilled.has(prev.accountId)))
+            (prev.accountId === outboundSessionAccountId ||
+              (!!lastSelected?.seatKey && (followCache || !spilled.has(prev.accountId))))
           if (prev?.accountId && prev.accountId !== account.accountId && !ownMove) continue
           let guard = opts
           if (prev) guard = { ...opts, ifGeneration: prev.generation || 0 }
@@ -891,7 +896,7 @@ export class FailoverRunner {
         if (selected.seatMoved) seatMovedTo = selected.vmId
         bindAll(
           { accountId: selected.accountId, vmId: selected.vmId, slotIndex: pinnedSlot },
-          { countHit: false, borrowed: lastPolicy?.reason === 'slot_busy' },
+          { countHit: false, borrowed: lastPolicy?.reason === 'slot_busy' && !followCache },
         )
         const started = Date.now()
         this.attemptsRepo?.begin?.({
@@ -1017,7 +1022,7 @@ export class FailoverRunner {
             { accountId: selected.accountId, vmId: selected.vmId, sessionId: outboundSessionId },
             {
               countHit: false,
-              borrowed: policy?.reason === 'slot_busy',
+              borrowed: policy?.reason === 'slot_busy' && !followCache,
               // Prebinding moved the VM already; replace the previous VM's session.
               replaceSession: !!attemptStickyBound?.vmId && attemptStickyBound.vmId !== selected.vmId,
             },
