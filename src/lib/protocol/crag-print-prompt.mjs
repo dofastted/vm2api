@@ -396,18 +396,34 @@ function foldSummarySystemTurns(messages) {
  * breakpoint on the previous assistant tool_use as well as the trailing
  * tool_result; the official API accepts both. Drop only the one on the native
  * block: the trailing breakpoint still covers the whole prefix.
+ * The same block hits a breakpoint on a tool_result whose content holds a
+ * tool_reference (a ToolSearch result): CRAG treats it as native history too.
+ * That one is dropped as well; the turn then writes no new cache entry, and the
+ * next turn's trailing breakpoint covers it again.
  */
+function isNativeAnchorBlock(role, block) {
+  if (block?.cache_control == null) return false
+  if (role === 'assistant') return block.caller != null
+  return (
+    role === 'user' &&
+    block.type === 'tool_result' &&
+    Array.isArray(block.content) &&
+    block.content.some((item) => item?.type === 'tool_reference')
+  )
+}
+
 export function dropNativeBlockCacheAnchors(messages) {
   if (!Array.isArray(messages)) return messages
   let changed = false
   const out = messages.map((message) => {
-    if (message?.role !== 'assistant' || !Array.isArray(message.content)) return message
-    if (!message.content.some((block) => block?.caller != null && block.cache_control != null)) return message
+    const role = message?.role
+    if (!Array.isArray(message?.content)) return message
+    if (!message.content.some((block) => isNativeAnchorBlock(role, block))) return message
     changed = true
     return {
       ...message,
       content: message.content.map((block) => {
-        if (block?.caller == null || block.cache_control == null) return block
+        if (!isNativeAnchorBlock(role, block)) return block
         const { cache_control: _dropped, ...rest } = block
         return rest
       }),

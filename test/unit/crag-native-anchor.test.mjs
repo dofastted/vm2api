@@ -52,3 +52,41 @@ test('prepareCragPrintBody applies it', () => {
   assert.equal(toolUse.cache_control, undefined)
   assert.deepEqual(out.messages[2].content[0].cache_control, CC)
 })
+
+test('drops cache_control on a tool_result that carries a tool_reference', () => {
+  const input = [
+    { role: 'user', content: [{ type: 'text', text: 'plan' }] },
+    {
+      role: 'assistant',
+      content: [
+        { type: 'tool_use', id: 'toolu_s', name: 'ToolSearch', input: { query: 'x' }, caller: { type: 'direct' } },
+      ],
+    },
+    {
+      role: 'user',
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: 'toolu_s',
+          content: [{ type: 'tool_reference', tool_name: 'ExitPlanMode' }],
+          cache_control: CC,
+        },
+      ],
+    },
+  ]
+  const out = dropNativeBlockCacheAnchors(input)
+  assert.equal(out[2].content[0].cache_control, undefined)
+  assert.deepEqual(out[2].content[0].content, input[2].content[0].content)
+  assert.deepEqual(input[2].content[0].cache_control, CC, 'input not mutated')
+})
+
+test('keeps cache_control on an ordinary tool_result and on user text', () => {
+  const input = [
+    {
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: 't', content: [{ type: 'text', text: 'a' }], cache_control: CC }],
+    },
+    { role: 'user', content: [{ type: 'text', text: 'go', cache_control: CC }] },
+  ]
+  assert.equal(dropNativeBlockCacheAnchors(input), input)
+})
