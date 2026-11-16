@@ -14,6 +14,7 @@ import {
   cragDeviceApi,
   isApiError,
 } from '@/lib/api'
+import { randomUUID } from '@/lib/random-uuid'
 import { isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import {
@@ -918,7 +919,7 @@ function ShopOrders({
         : {
             ...selection,
             payment_method: selectedMethod,
-            request_id: crypto.randomUUID(),
+            request_id: randomUUID(),
             ...(price !== undefined ? { expected_amount_minor: price } : {}),
             ...(activation_target ? { activation_target } : {}),
           }
