@@ -1149,6 +1149,10 @@ export function activateCragLicense(projectRoot, vm, code) {
     if (trimmed.startsWith('CRAGU1.')) {
       const license = verifyCragUniversal(trimmed, trust(projectRoot))
       if (!license.valid) fail(license.code)
+      // Activation must agree with the next status read before publishing the
+      // installation-wide grant or replacing any slot registration.
+      const targetLicense = verifyCragUniversal(trimmed, slotAuthority(projectRoot, vm))
+      if (!targetLicense.valid) fail(targetLicense.code)
       const dir = cragUniversalDirectory(projectRoot)
       checkDirectory(dir, true, { id: 'crag-universal' })
       writePrivate(dir, 'registration.code', `${trimmed}\n`, { id: 'crag-universal' }, true)
