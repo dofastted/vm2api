@@ -1,14 +1,12 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import crypto from 'node:crypto'
 import { inspectContainer } from '../vm/vm-runtime.mjs'
-import { officialCcHome } from './official-cc-bootstrap.mjs'
 import { execCapture, inspectContainerOrNull } from '../cluster/docker-remote.mjs'
 import { LOCAL_CRAG_CLAUDE, REMOTE_CRAG_CLAUDE } from '../vm/slot-engine.mjs'
 import { slotExecCmd, slotExecContainer } from '../vm/slot-exec.mjs'
 import { slotHost } from '../vm/slot-host.mjs'
 import { flattenOauthIdentity } from './oauth-identity.mjs'
-import { cragV2PackageRoot, verifyCragV2Tree } from '../vm/wrap-cli-runtime.mjs'
+import { installedCragV2Root, materializeCragV2, verifyCragV2Tree } from '../vm/wrap-cli-runtime.mjs'
 
 export const AUTH_LOGIN_SOURCE = 'claude-auth-login'
 export const AUTH_LOGIN_FLAVOR = 'claude_code'
@@ -22,26 +20,19 @@ export function resolveAuthLoginClaude(vm) {
   return slotHost(vm).bakedKernel ? REMOTE_CRAG_CLAUDE : LOCAL_CRAG_CLAUDE
 }
 
-/** Only stage the official executable; the auth session is not a CRAG worker. */
+/** Stage a complete package without selecting CRAG as the slot's inference engine. */
 function stageBundledAuthClaude(projectRoot, vm) {
   if (slotHost(vm).bakedKernel) return
-  const relative = path.posix.relative('/home/kincli/.kin', LOCAL_CRAG_CLAUDE)
-  const target = path.join(officialCcHome(projectRoot, vm.id), '.kin', relative)
-  if (fs.existsSync(target)) return
-  const source = cragV2PackageRoot(projectRoot, 'amd64')
-  if (!source) return
-  const verified = verifyCragV2Tree(source, { arch: 'amd64' })
-  if (!verified.ok) throw fail(verified.code, verified.error)
-  const member = path.posix.relative('crag-v2', relative)
-  fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o755 })
-  const temporary = `${target}.${crypto.randomUUID()}.new`
-  try {
-    fs.copyFileSync(path.join(source, member), temporary, fs.constants.COPYFILE_EXCL)
-    fs.chmodSync(temporary, 0o755)
-    fs.renameSync(temporary, target)
-  } finally {
-    fs.rmSync(temporary, { force: true })
+  const installed = installedCragV2Root(projectRoot, vm)
+  if (installed && fs.existsSync(path.join(installed, 'manifest.json'))) {
+    const verified = verifyCragV2Tree(installed, { allowPreviousClaude: true })
+    if (!verified.ok) throw fail(verified.code, verified.error)
+    return
   }
+  // Older login sessions copied only Claude into this directory. Complete that
+  // tree even when the executable exists, so license reads can verify it.
+  const staged = materializeCragV2(projectRoot, vm, { select: false })
+  if (!staged.ok) throw fail(staged.code, staged.error)
 }
 
 export async function assertAuthLoginReady(projectRoot, vm, { inspect = inspectContainer, cliExists = null } = {}) {
