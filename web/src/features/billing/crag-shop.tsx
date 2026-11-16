@@ -33,56 +33,28 @@ import {
   type CragHostStatus,
 } from '@/features/vm/queries'
 import {
+  formatPlanDetails,
+  termLabel,
+  type CommerceRules,
+  type CragPlan,
+  type Presentation,
+} from './crag-catalog'
+import {
   CragCommerce,
   quoteProblem,
-  type CommerceRules,
   type CommerceSelection,
 } from './crag-commerce'
 import { CragPlanPicker } from './crag-plan-picker'
+
+export { formatPlanDetails, termLabel } from './crag-catalog'
+export type { CragPlan, Presentation } from './crag-catalog'
 
 const root = '/api/panel/crag-shop'
 const hostRoot = '/api/panel/crag-subscription'
 const catalogIntervalMs = 25_000
 const catalogTimeoutMs = 12_000
-const terms = { '1m': '月卡', '3m': '季卡', '1y': '年卡' }
-export function termLabel(term: string | null, sku: string, months?: number) {
-  if (months != null)
-    return `${sku === 'renewal' ? '续费 · ' : ''}${months} 个月`
-  const duration =
-    term &&
-    (/^[1-9][0-9]*m$/.test(term)
-      ? `${term.slice(0, -1)} 个月`
-      : terms[term as keyof typeof terms])
-  if (sku === 'renewal') return duration ? `续费 · ${duration}` : '续费'
-  return (term && terms[term as keyof typeof terms]) || duration || sku
-}
 const methods = { wxpay: '微信支付', alipay: '支付宝' }
 type Method = keyof typeof methods
-export type CragPlan = {
-  sku: string
-  term: string
-  amount_minor: number
-  slot_limit: number | 'unlimited'
-  remaining?: number | null
-  renewable?: boolean
-  name?: string
-  description?: string
-  enabled?: boolean
-  months?: number
-}
-export type Presentation = Partial<
-  Record<
-    | 'title'
-    | 'description'
-    | 'plans_title'
-    | 'orders_title'
-    | 'custom_title'
-    | 'unavailable_text'
-    | 'empty_plans_text'
-    | 'empty_orders_text',
-    string
-  >
->
 type Catalog = {
   plans: CragPlan[]
   payment_methods: Method[]
@@ -124,12 +96,6 @@ type Intent = CommerceSelection & {
   expected_amount_minor?: number
   activation_target?: { vm_id: string }
 }
-const money = new Intl.NumberFormat('zh-CN', {
-  style: 'currency',
-  currency: 'CNY',
-  maximumFractionDigits: 2,
-  minimumFractionDigits: 0,
-})
 const dateTime = new Intl.DateTimeFormat('zh-CN', {
   dateStyle: 'medium',
   timeStyle: 'short',
@@ -522,16 +488,6 @@ function OrderProgress({
       ))}
     </ol>
   )
-}
-
-export function formatPlanDetails(
-  amountMinor: number,
-  slotLimit: CragPlan['slot_limit']
-) {
-  return {
-    price: money.format(amountMinor / 100),
-    locks: slotLimit === 'unlimited' ? '应用锁不限' : `${slotLimit} 把应用锁`,
-  }
 }
 
 function planTerms(plan: Pick<Order, 'amount_minor' | 'slot_limit'>) {

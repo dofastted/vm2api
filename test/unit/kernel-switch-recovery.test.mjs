@@ -17,6 +17,7 @@ import { getVm } from '../../src/lib/vm/vm-registry.mjs'
 import { kernelFaults, rustKernelBusy, rustKernelReachable } from '../../src/lib/transport/rust-kernel-client.mjs'
 import { writeKernelConfig } from '../../src/lib/transport/rust-kernel-supervisor.mjs'
 import { diagnoseSlotServices, powerOnSlot, recoverSlot } from '../../src/lib/vm/slot-recovery.mjs'
+import { initializeSlotSeedFiles } from '../../src/lib/vm/slot-seed.mjs'
 import { activateFixture, issueUniversalCode, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
 function fixture(t, extra = {}, { universalBeforeSlot = false } = {}) {
@@ -38,7 +39,19 @@ function fixture(t, extra = {}, { universalBeforeSlot = false } = {}) {
   return { root, vm, universalCode }
 }
 
+function kernelPolicyFixture(root, overrides) {
+  return {
+    initializeSlotSeedFiles: async (project, vm, host) => {
+      if (!vm.node_id) return initializeSlotSeedFiles(project, vm, host)
+      assert.equal(project, root)
+      assert.ok(getVm(project, vm.id))
+    },
+    ...overrides,
+  }
+}
+
 async function request(root, method, suffix, body, extra = {}, endpoint = '/vms/vm-switch') {
+  const { kernelPolicyOps, ...overrides } = extra
   const response = {}
   const handle = createPanelHandler({
     cfg: { paths: { project: root }, vm: { id: null } },
@@ -55,7 +68,8 @@ async function request(root, method, suffix, body, extra = {}, endpoint = '/vms/
       return true
     },
     proxyPool: { unbindVm() {} },
-    ...extra,
+    ...overrides,
+    kernelPolicyOps: kernelPolicyFixture(root, kernelPolicyOps),
   })
   await handle({ method }, {}, new URL(`http://localhost/api/panel${endpoint}${suffix}`))
   return response
@@ -92,6 +106,7 @@ test('switch holds admission and watchdog until the old request drains', async (
         restartRustKernel: async () => {
           assert.equal(inflight.get(vm.id), 0, 'no accepted request may be killed by cutover')
           assert.equal(getVm(root, vm.id).schedule_hold.reason, 'maintenance')
+          assert.ok(fs.existsSync(path.join(root, 'vms', vm.id, 'cli-home', '.claude', 'settings.json')))
           events.push('restart')
           return { ok: true }
         },
@@ -772,6 +787,7 @@ async function kernelSwitchApi(t, root, operations = {}) {
     },
     proxyPool: {},
     ...operations,
+    kernelPolicyOps: kernelPolicyFixture(root, operations.kernelPolicyOps),
   })
   const server = http.createServer((req, res) => {
     Promise.resolve(handler(req, res, new URL(req.url, 'http://localhost'))).catch((error) => {

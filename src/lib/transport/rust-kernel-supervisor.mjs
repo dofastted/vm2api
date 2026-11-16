@@ -29,6 +29,7 @@ import {
   CONTAINER_CLI_NODE_BIN,
   KERNEL_NATIVE_SLOT_COUNT,
   normalizeSessionIdleTtlSeconds,
+  resolveSessionSlots,
   LOCAL_CRAG_CLAUDE,
   REMOTE_CRAG_CLAUDE,
   REMOTE_CRAG_ENTRY,
@@ -548,6 +549,12 @@ function kernelJobsRunning(exec, health) {
   if (!rustKernelProcessUp(health)) return 0
   if (health.recovering === true) return 1
   if (health.runtime_variant === 'crag-v2') {
+    if (
+      typeof health.prewarm_enabled === 'boolean' &&
+      [health.active, health.waiting, health.active_requests, health.queued, health.cleaning].every(Number.isInteger)
+    ) {
+      return Math.max(health.active + health.waiting, health.active_requests) + health.queued + health.cleaning
+    }
     return (
       Math.max(
         Number(health.active || 0) + Number(health.waiting || 0),
@@ -563,7 +570,12 @@ function kernelJobsRunning(exec, health) {
 
 export function requestKernelReloadWhenIdle(
   exec,
-  { restart = restartRustKernel, health = rustKernelHealth, pollMs = KERNEL_RELOAD_POLL_MS } = {},
+  {
+    restart = restartRustKernel,
+    health = rustKernelHealth,
+    pollMs = KERNEL_RELOAD_POLL_MS,
+    requireLiveKernel = false,
+  } = {},
 ) {
   const id = wrapVmId(exec)
   if (!id) return { ok: false, reason: 'missing_vm' }
@@ -573,7 +585,16 @@ export function requestKernelReloadWhenIdle(
   const done = new Promise((r) => {
     resolve = r
   })
-  const entry = { exec, restart, health, pollMs, timer: null, running: false, resolve }
+  const entry = {
+    exec,
+    restart,
+    health,
+    pollMs,
+    requireLiveKernel: requireLiveKernel || prev?.requireLiveKernel,
+    timer: null,
+    running: false,
+    resolve,
+  }
   kernelReloadPending.set(id, entry)
   // A superseded request settles with the newer one's result.
   if (prev) done.then(prev.resolve)
@@ -594,9 +615,14 @@ async function tryKernelReload(id) {
     .catch(() => null)
   entry.running = false
   if (kernelReloadPending.get(id) !== entry) return
+  if (entry.requireLiveKernel && getVm(projectRootFromExec(entry.exec), id)?.status !== 'running') {
+    kernelReloadPending.delete(id)
+    entry.resolve({ ok: true, reason: 'deferred_until_start' })
+    return
+  }
   // A hop that began during the health check retries from endWrapHop.
   if ((wrapInflight.get(id) || 0) > 0) return
-  if (kernelJobsRunning(entry.exec, status) > 0) {
+  if ((entry.requireLiveKernel && !status?.ok) || kernelJobsRunning(entry.exec, status) > 0) {
     entry.timer = setTimeout(() => void tryKernelReload(id), entry.pollMs)
     entry.timer.unref?.()
     return
@@ -1003,7 +1029,8 @@ export function writeKernelConfig(
   if (secret) replaceSlotOwnedFile(tokenPath, secret + '\n', vm)
   const testEndpoints = process.env.KIN_KERNEL_TEST_ENDPOINTS === '1'
   const target = { ...record, ...vm }
-  const dataplane = resolveKernelDataplane(target, routing || {}) || 'wrap'
+  const kernelRouting = routing ?? { inference: previous }
+  const dataplane = resolveKernelDataplane(target, kernelRouting) || 'wrap'
   const host = slotHost(record)
   // A macOS node runs the kernel on the host itself: real node paths instead of the container mounts.
   // Unknown until that node has connected once; the slot's own start writes the config then.
@@ -1014,7 +1041,7 @@ export function writeKernelConfig(
     if (host.native) return null
     throw err
   }
-  const claudeBin = resolveSlotClaude(target, routing || {}, host).bin
+  const claudeBin = resolveSlotClaude(target, kernelRouting, host).bin
   const tz = String(timezone || vm.timezone || previous.timezone || '').trim()
   const defaultCacheTtl = routing != null ? cacheTtlFromRouting(routing) : normalizeCacheTtl(previous.default_cache_ttl)
   const thinkingDisplay =
@@ -1082,7 +1109,12 @@ export function writeKernelConfig(
     model_effort: modelEffort,
     ...(!host.native && !isCodexVm(record) ? { telemetry: buildNativeTelemetry(record, projectRoot, routing) } : {}),
   }
-  if (dataplane === 'crag' && resolveCragKernelVersion(target, routing || {}) === 'v2' && !host.native) {
+  if (dataplane === 'crag' && resolveCragKernelVersion(target, kernelRouting) === 'v2' && !host.native) {
+    const followGlobal =
+      routing?.inference?.session_slots != null &&
+      (target.policy?.sessionSlotsOverride ?? target.session_slots_override) === false
+    config.session_slots = resolveSessionSlots(followGlobal ? {} : target, kernelRouting)
+    config.prewarm_enabled = kernelRouting.inference?.prewarm_enabled === true
     config.crag_kernel_version = 'v2'
     config.runtime_variant = 'crag-v2'
     config.asset_dir = '/run/kin/crag-native-assets'
@@ -1139,14 +1171,23 @@ export function writeKernelConfig(
     tokenPath,
     provider: config.provider,
     changed,
+    sessionPolicyChanged:
+      changed &&
+      config.runtime_variant === 'crag-v2' &&
+      (previous.session_slots !== config.session_slots || previous.prewarm_enabled !== config.prewarm_enabled),
     persona_preset: config.persona_preset,
   }
 }
 
 const routingPersonaMtime = new Map()
 
+export function syncCragSessionPolicy(projectRoot, vm, routing) {
+  if (resolveKernelDataplane(vm, routing) !== 'crag') return false
+  return writeKernelConfig(projectRoot, vm, { routing })?.sessionPolicyChanged === true
+}
+
 /** Project the web/routing persona switch onto every Claude kernel.json. Codex slots are left alone. */
-export function syncClaudeKernelConfigs(projectRoot, routing) {
+export function syncClaudeKernelConfigs(projectRoot, routing, onSessionPolicyChanged) {
   if (!projectRoot) return { updated: 0, skipped: 0 }
   let updated = 0
   let skipped = 0
@@ -1159,6 +1200,7 @@ export function syncClaudeKernelConfigs(projectRoot, routing) {
     try {
       const written = writeKernelConfig(projectRoot, vm, { routing })
       if (written?.changed) updated += 1
+      if (written?.sessionPolicyChanged) onSessionPolicyChanged?.(vm)
     } catch (error) {
       skipped += 1
       console.error(

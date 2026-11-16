@@ -132,6 +132,7 @@ export function normalizeInferenceConfig(raw = {}) {
     health_ttl_ms: optionalTtlMs(raw.health_ttl_ms, 2000),
     tcp_nodelay: optionalBool(raw.tcp_nodelay, true),
     session_slots: normalizeSessionSlots(raw.session_slots),
+    prewarm_enabled: raw.prewarm_enabled === true,
     session_idle_ttl_seconds: normalizeSessionIdleTtlSeconds(raw.session_idle_ttl_seconds),
     dataplane: normalizeKernelDataplane(raw.dataplane),
     crag_kernel_version: normalizeCragKernelVersion(raw.crag_kernel_version) || 'v2',
@@ -399,6 +400,9 @@ export function validateInferenceRoutingPatch(body = {}) {
     if (!Number.isInteger(n) || n < SESSION_SLOT_MIN || n > SESSION_SLOT_MAX) {
       errors.push(`inference.session_slots 必须是 ${SESSION_SLOT_MIN}–${SESSION_SLOT_MAX} 的整数`)
     }
+  }
+  if (Object.hasOwn(body.inference, 'prewarm_enabled') && typeof body.inference.prewarm_enabled !== 'boolean') {
+    errors.push('inference.prewarm_enabled 必须是布尔值')
   }
   if (Object.prototype.hasOwnProperty.call(body.inference, 'session_idle_ttl_seconds')) {
     const n = body.inference.session_idle_ttl_seconds

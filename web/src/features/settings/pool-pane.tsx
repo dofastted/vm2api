@@ -501,7 +501,10 @@ export function PoolPane({
         strategy: poolDraft.strategy,
       })
     } else if (open === 'seats') {
-      onInferenceChange({ session_slots: inferenceDraft.session_slots })
+      onInferenceChange({
+        session_slots: inferenceDraft.session_slots,
+        prewarm_enabled: inferenceDraft.prewarm_enabled === true,
+      })
       onPoolChange({
         seat_grace_ms: poolDraft.seat_grace_ms,
         seat_budget_reserve_pct: poolDraft.seat_budget_reserve_pct,
@@ -689,6 +692,22 @@ export function PoolPane({
                         numOf(inferenceDraft, 'session_slots', SEAT_CAP_MAX)
                       )
                     )}
+                  />
+                </div>
+                <div className='flex items-center justify-between gap-4 rounded-md border px-3 py-2.5'>
+                  <div>
+                    <Label htmlFor='crag-prewarm'>CRAG 原生会话预热</Label>
+                    <p className='text-xs leading-5 text-muted-foreground'>
+                      开启后预热可运行槽位的一半，向下取整。VM
+                      内存不足时自动减少；关闭只停用预热，不关闭正常会话。保存后内核空闲时生效。
+                    </p>
+                  </div>
+                  <Switch
+                    id='crag-prewarm'
+                    checked={inferenceDraft.prewarm_enabled === true}
+                    onCheckedChange={(value) =>
+                      updateDraft('inference', { prewarm_enabled: value })
+                    }
                   />
                 </div>
                 <SliderSetting

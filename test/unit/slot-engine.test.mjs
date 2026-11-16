@@ -39,6 +39,10 @@ test('session slots default to native capacity and clamp persisted values', () =
   assert.equal(resolveSessionSlots({ policy: { sessionSlots: 4 } }, { inference: { session_slots: 8 } }), 4)
   assert.equal(resolveSessionSlots({}, { inference: { session_slots: 8 } }), 8)
   assert.equal(normalizeInferenceConfig({}).session_slots, 20)
+  assert.equal(normalizeInferenceConfig({}).prewarm_enabled, false)
+  assert.equal(normalizeInferenceConfig({ prewarm_enabled: true }).prewarm_enabled, true)
+  assert.deepEqual(validateInferenceRoutingPatch({ inference: { prewarm_enabled: false } }), [])
+  assert.ok(validateInferenceRoutingPatch({ inference: { prewarm_enabled: 'false' } }).length)
 })
 
 test('routing patch rejects session slots outside the native range', () => {

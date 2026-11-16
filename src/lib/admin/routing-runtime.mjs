@@ -51,7 +51,11 @@ import {
   normalizeOpenAIQuotaPolicy,
 } from '../pool/openai-quota-policy.mjs'
 import { gatewayPolicyReady, rustKernelHealth } from '../transport/rust-kernel-client.mjs'
-import { requestKernelReloadWhenIdle, syncClaudeKernelConfigs } from '../transport/rust-kernel-supervisor.mjs'
+import {
+  requestKernelReloadWhenIdle,
+  syncClaudeKernelConfigs,
+  syncCragSessionPolicy,
+} from '../transport/rust-kernel-supervisor.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
 import { wakeOpenAIWaiter } from '../pool/openai-account-runtime.mjs'
@@ -110,8 +114,11 @@ export function createRoutingRuntime(ctx) {
     return vm
   }
 
-  function applyVmSessionSlots(id, n, { override = true } = {}) {
-    return persistVmSessionSlots(ctx.cfg.paths.project, id, normalizeSessionSlots(n), { override })
+  function applyVmSessionSlots(id, n, { override = true, publish = true } = {}) {
+    const project = ctx.cfg.paths.project
+    const vm = persistVmSessionSlots(project, id, normalizeSessionSlots(n), { override })
+    if (publish && vm && syncCragSessionPolicy(project, vm, getRouting())) reloadCragSessionPolicy(vm)
+    return vm
   }
 
   function applyVmMaxSessions(id, n, { override = true } = {}) {
@@ -136,7 +143,7 @@ export function createRoutingRuntime(ctx) {
         continue
       }
       if (Number(vm.session_slots) === value) continue
-      applyVmSessionSlots(vm.id, value, { override: false })
+      applyVmSessionSlots(vm.id, value, { override: false, publish: false })
       applied.updated += 1
     }
     return applied
@@ -399,11 +406,16 @@ export function createRoutingRuntime(ctx) {
 
   function inferenceTouchesKernel(inference) {
     if (!inference || typeof inference !== 'object') return false
-    return Object.prototype.hasOwnProperty.call(inference, 'session_idle_ttl_seconds')
+    return ['session_idle_ttl_seconds', 'session_slots', 'prewarm_enabled'].some((key) => Object.hasOwn(inference, key))
+  }
+
+  function reloadCragSessionPolicy(vm) {
+    if (vm.status !== 'running' || resolveInferenceEngine(vm, getRouting()) !== 'rust') return
+    requestKernelReloadWhenIdle(slotExec(ctx.cfg.paths.project, vm), { requireLiveKernel: true })
   }
 
   function syncKernelPanelConfig(routingConfig) {
-    return syncClaudeKernelConfigs(ctx.cfg.paths.project, routingConfig)
+    return syncClaudeKernelConfigs(ctx.cfg.paths.project, routingConfig, reloadCragSessionPolicy)
   }
 
   // Legacy watchdogs read idle limits at startup. Native policy-capable
@@ -557,6 +569,10 @@ export function createRoutingRuntime(ctx) {
     ctx.stickyRouter.reloadConfig(routingConfig)
     ctx.accountQuota.reloadConfig(routingConfig)
     getPool()?.reloadConfig?.(poolSchedulerConfig())
+    const sessionSlotsApplied =
+      body.inference && Object.hasOwn(body.inference, 'session_slots')
+        ? applyRoutingSessionSlots(nextSessionSlots)
+        : { updated: 0, skipped: 0 }
     const idleChanged = streamIdleTimeoutMs(routingConfig) !== prevIdleMs
     const requestBytesChanged = maxRequestBytes(routingConfig) !== prevRequestBytes
     // Body limit is applied once, when axum builds DefaultBodyLimit.
@@ -585,10 +601,7 @@ export function createRoutingRuntime(ctx) {
       return {
         concurrency: applyRoutingTierConcurrency(routingConfig.tiers),
         rpm: applyRoutingTierRpm(routingConfig.tiers),
-        session_slots:
-          body.inference && Object.prototype.hasOwnProperty.call(body.inference, 'session_slots')
-            ? applyRoutingSessionSlots(nextSessionSlots)
-            : { updated: 0, skipped: 0 },
+        session_slots: sessionSlotsApplied,
         openai_quota: hasCodexQuota
           ? applyRoutingOpenAIQuota(routingConfig.codex.quota)
           : { concurrency: 0, rpm: 0, sessions: 0, skipped: 0 },
