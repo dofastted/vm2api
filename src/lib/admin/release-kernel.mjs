@@ -301,6 +301,7 @@ export async function listKernelReleaseVersions({ fetchImpl = globalThis.fetch }
       if (row?.draft !== false || !Array.isArray(row.assets)) continue
       const component = CRAG_PAYLOAD_TAG.exec(row.tag_name || '')
       if (component) {
+        if (component[2]) continue
         const tag = `v${component[1]}`
         const release = { ...row, tag_name: tag, payload_tag: row.tag_name }
         if (hasUniqueAssets(release, [selectCragV2Asset(release)])) versions.crag.add(row.tag_name)

@@ -1024,7 +1024,11 @@ test('H2 reissues the same KVM seat when changing payload keys and recovers a lo
   const oldPermit = fs.readFileSync(registration)
   seedEncryptedPackage(root, { payloadKey: payload })
 
-  await assert.rejects(service.authorizeInstall(vm), { code: 'license_payload_key_mismatch' })
+  await assert.rejects(service.authorizeInstall(vm), { code: 'crag_subscription_migration_required' })
+  assert.equal(explicitBinds, 0)
+  await assert.rejects(service.authorizeInstall(vm, { allowLegacyReissue: true }), {
+    code: 'license_payload_key_mismatch',
+  })
   assert.deepEqual(fs.readFileSync(entitlement), oldRights)
   assert.deepEqual(fs.readFileSync(registration), oldPermit)
   assert.equal((await service.status()).state, 'sync_pending')
@@ -1034,7 +1038,9 @@ test('H2 reissues the same KVM seat when changing payload keys and recovers a lo
 
   invalidPermit = false
   loseResponse = true
-  await assert.rejects(service.authorizeInstall(vm), { code: 'crag_subscription_authority_unavailable' })
+  await assert.rejects(service.authorizeInstall(vm, { allowLegacyReissue: true }), {
+    code: 'crag_subscription_authority_unavailable',
+  })
   assert.deepEqual(fs.readFileSync(entitlement), oldRights)
   assert.deepEqual(fs.readFileSync(registration), oldPermit)
   await service.recover()
@@ -1084,12 +1090,14 @@ test('an active host subscription can authorize a new download when the old devi
   seedEncryptedPackage(root, { payloadKey: payload })
   const registration = path.join(cragLicenseDirectory(root, vm), 'registration.code')
   const oldPermit = fs.readFileSync(registration)
-  await assert.rejects(service.authorizeInstall(vm), { code: 'slot_limit_reached' })
+  await assert.rejects(service.authorizeInstall(vm), { code: 'crag_subscription_migration_required' })
+  assert.equal(requests, 0)
+  await assert.rejects(service.authorizeInstall(vm, { allowLegacyReissue: true }), { code: 'slot_limit_reached' })
   assert.deepEqual(fs.readFileSync(registration), oldPermit)
   assert.equal(checkCragLicense(root, vm).ok, true)
 
   rejectBind = false
-  await service.authorizeInstall(vm)
+  await service.authorizeInstall(vm, { allowLegacyReissue: true })
   assert.equal(requests, 2)
   const next = checkCragLicense(root, vm, {}, { preferInstalled: false })
   assert.equal(next.ok, true)
@@ -1205,6 +1213,87 @@ test('H2 release requires confirmed teardown and recovers an interrupted cloud r
   await recovered.bind(slots[1])
   assert.equal(checkCragLicense(root, slots[0]).ok, false)
   assert.equal(checkCragLicense(root, slots[1]).ok, true)
+})
+
+test('one running slot may update at capacity, and only confirmed stopped seats can be reused', async (t) => {
+  let roster = []
+  let revision = 0
+  let signed
+  let releases = 0
+  let binds = 0
+  const { root, connect } = standaloneHost(t, async (url, { body }) => {
+    const action = url.split('/').at(-1)
+    const { host_id, machine_code, permit_sha256, vm_id } = JSON.parse(body)
+    let result = {}
+    if (action === 'release') {
+      assert.equal(vm_id, 'vm-61')
+      assert.equal(permit_sha256, roster[0].permit_sha256)
+      releases++
+      roster = []
+    }
+    if (action === 'bind') {
+      if (roster.length > 0) return Response.json({ ok: false, error: { code: 'slot_limit_reached' } }, { status: 409 })
+      binds++
+      const { code } = issueSlotPermit(root, machine_code, host_id, { seat: 1 })
+      roster = [{ seat: 1, permit_sha256: crypto.createHash('sha256').update(code).digest('hex') }]
+      result = { seat: 1, slot_permit: code }
+    }
+    if (action !== 'status') {
+      const { claims } = issueHostEntitlement(root, host_id, { revision: ++revision, slot_limit: 1 })
+      signed = {
+        entitlement: signSubscriptionBytes(root, 'CRAGH2', JSON.stringify({ ...claims, version: 2, roster })),
+        revision,
+        expires_at: claims.expires_at,
+        slot_limit: 1,
+        used_slots: roster.length,
+        available_slots: 1 - roster.length,
+      }
+    }
+    return Response.json({ ok: true, data: { ...signed, ...result } })
+  })
+  seedEncryptedPackage(root)
+  const [first, second] = ['vm-61', 'vm-62'].map((id) => ({ id, dataplane: 'crag', status: 'stopped' }))
+  for (const vm of [first, second]) {
+    const dir = path.join(root, 'vms', vm.id)
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'machine-id'), crypto.randomBytes(16).toString('hex'))
+  }
+  let vms = {}
+  let restartDisabled = false
+  const service = connect({
+    listTargets: () => [first, second],
+    assertReady: () => true,
+    runtimeInventory: { snapshot: async () => ({ vms }), confirmReclaimableStop: async () => restartDisabled },
+  })
+  await service.redeem(voucher())
+  const entered = Promise.withResolvers()
+  const ready = Promise.withResolvers()
+  const boot = service.withRuntimeAdmission(first, { bindSubscription: true }, async () => {
+    entered.resolve()
+    return ready.promise
+  })
+  await entered.promise
+  const startSecond = () => service.withRuntimeAdmission(second, { bindSubscription: true }, () => ({ ok: true }))
+  assert.equal((await startSecond()).code, 'license_crag_host_over_quota')
+  ready.resolve({ ok: true })
+  await boot
+  first.status = 'running'
+  vms = { [first.id]: { state: 'running', scope: 'host' } }
+  assert.equal((await service.withRuntimeAdmission(first, { install: true }, () => ({ ok: true }))).ok, true)
+  assert.equal(binds, 1)
+  first.status = 'stopped'
+  vms[first.id] = { state: 'not_running', scope: 'host' }
+  assert.equal((await startSecond()).code, 'license_crag_host_usage_unverified')
+  assert.equal(releases, 0)
+  vms[first.id].stopped_confirmed = true
+  assert.equal((await startSecond()).code, 'slot_limit_reached')
+  assert.equal(releases, 0)
+  restartDisabled = true
+  assert.equal((await startSecond()).ok, true)
+  assert.equal(releases, 1)
+  assert.equal(binds, 2)
+  assert.equal(checkCragLicense(root, first).code, 'license_required')
+  assert.equal(checkCragLicense(root, second).license.seat, 1)
 })
 
 test('only an authenticated same-origin admin session can redeem without revealing a failed voucher', async () => {

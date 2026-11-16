@@ -2805,14 +2805,14 @@ export function createPanelHandler(ctx) {
         const selection = validateKernelTargets(cfg.paths.project, body?.targets)
         if (!selection.ok)
           return json(res, selection.status, { ok: false, error: { code: selection.code, message: selection.error } })
-        if (body.targets.some((target) => target.reissue === true)) {
-          const identity = panelIdentity(req)
-          if (req.apiKeyKind || identity.role !== 'admin' || !identity.user || !sameOriginPost(req, cfg.base_url)) {
-            return json(res, 403, {
-              ok: false,
-              error: { code: 'forbidden', message: '只有从面板确认重装的管理员才能重新签发订阅许可。' },
-            })
-          }
+        const identity = panelIdentity(req)
+        const mayBindSubscription =
+          !req.apiKeyKind && identity.role === 'admin' && !!identity.user && sameOriginPost(req, cfg.base_url)
+        if (!mayBindSubscription && body.targets.some((target) => target.reissue === true)) {
+          return json(res, 403, {
+            ok: false,
+            error: { code: 'forbidden', message: '只有从面板确认安装的管理员才能绑定订阅许可。' },
+          })
         }
         // Check the entire explicit scope before the first target can be stopped.
         if (body.targets.some((target) => userMissesVmId(req, cfg.paths.project, target.id))) {
@@ -2825,7 +2825,7 @@ export function createPanelHandler(ctx) {
           watchdog: ctx.kernelWatchdog,
           poolScheduler: ctx.poolScheduler,
           ops: ctx.kernelInstallOps,
-          cragSubscription: ctx.cragSubscription,
+          cragSubscription: mayBindSubscription ? ctx.cragSubscription : undefined,
         })
         return json(res, 200, panel.ok(report))
       }
@@ -5237,6 +5237,9 @@ export function createPanelHandler(ctx) {
       // POST /api/panel/vms/:id/start
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/start$/.test(p)) {
         const id = p.split('/')[4]
+        const identity = panelIdentity(req)
+        const bindSubscription =
+          !req.apiKeyKind && identity.role === 'admin' && !!identity.user && sameOriginPost(req, cfg.base_url)
         const started = await withVmLock(path.join(cfg.paths.project, 'vms', `${id}.json`), async () => {
           const result = await powerOnSlot({
             projectRoot: cfg.paths.project,
@@ -5245,6 +5248,7 @@ export function createPanelHandler(ctx) {
             routing: ctx.routingConfig,
             fillTimezone: fillTimezoneFromExit,
             by: 'start',
+            runtimeOptions: { bindSubscription },
           })
           if (result.ok) releaseKernelInstallSafetyHold(cfg.paths.project, id, ctx.kernelWatchdog)
           return result

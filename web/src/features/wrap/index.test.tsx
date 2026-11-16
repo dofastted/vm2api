@@ -45,7 +45,13 @@ vi.mock('@tanstack/react-query', async (importOriginal) => ({
       data: queryKey.includes('kernels')
         ? {
             kernels: [
-              { id: 'crag', paid: true, ready: true, version: '3.0.8' },
+              {
+                id: 'crag',
+                paid: true,
+                ready: true,
+                version: '3.0.8',
+                payload_tag: 'payload-2026.11.16-crag-3.0.8',
+              },
             ],
             licenses: state.licenses,
             install_licenses: state.installLicenses,
@@ -86,37 +92,26 @@ beforeEach(() => {
   state.hostInterval = undefined
 })
 
-it.each(['host', 'device', 'kernel'] as const)(
-  'offers subscription fallback with a valid %s permit for the old package',
-  (scope) => {
+it.each(['license_required', 'license_payload_key_mismatch'])(
+  'does not gate installation or recommend reissue based on the cached %s hint',
+  (code) => {
     state.licenses['vm-old'] = {
       status: 'valid',
       valid: true,
       vm_id: 'vm-old',
-      scope,
+      scope: 'host',
     }
+    // Older backends may still return the hint. The install decision belongs to the server.
     state.installLicenses = {
-      'vm-old': {
-        status: 'invalid',
-        valid: false,
-        vm_id: 'vm-old',
-        code: 'license_payload_key_mismatch',
-      },
+      'vm-old': { status: 'invalid', valid: false, vm_id: 'vm-old', code },
     }
-    const vm = { runtime_type: 'docker', resolved_dataplane: 'crag' } as const
-    expect(render(vm)).toContain('确认重装时会尝试使用本机已激活的宿主订阅')
-    expect(render(vm)).toContain('授权有效')
-    for (const placement of [
-      { node_id: 'cluster-node' },
-      { runtime: { type: 'kvm' } },
-      { node_id: 'cluster-node', runtime: { type: 'kvm' } },
-    ]) {
-      expect(render({ ...vm, ...placement })).toContain(
-        '确认重装时会尝试使用本机已激活的宿主订阅'
-      )
-    }
-    state.installLicenses = { ...state.licenses }
-    expect(render(vm)).not.toContain('确认重装时会尝试使用本机已激活的宿主订阅')
+    const html = render({ runtime_type: 'docker', resolved_dataplane: 'crag' })
+    expect(html).toContain('授权有效')
+    expect(html).not.toContain('确认重装时会尝试使用本机已激活的宿主订阅')
+    expect(html).toContain('aria-label="安装 vm-old 并重启"')
+    expect(html).not.toMatch(
+      /<button[^>]*disabled=""[^>]*aria-label="安装 vm-old 并重启"/
+    )
   }
 )
 

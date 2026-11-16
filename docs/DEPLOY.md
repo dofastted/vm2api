@@ -42,15 +42,17 @@ CRAG V2 的资产、工作区和设备授权目录分别使用 Linux 私有 run 
 
 ### CRAG V2 二进制更新
 
-vm2api 从自己的公开 payload Release 下载 `crag-v2-licensed-amd64.tar.gz` 签名加密包，无需私有供应仓凭据。「内核」页默认提供 `payload-2026.11.17-crag-3.1.3`（3.1.3 Compact 修复版），并保留 `payload-2026.11.16-crag-3.1.3`（3.1.3 原标准版）。两个标准包沿用 `CRAGK1` 策略，支持可回收宿主名册 `CRAGH2`。需要保留旧离线授权时选 `payload-2026.11.16-crag-3.1.2-legacy`（3.1.2 旧授权兼容版，支持仍有效的 `CRAGU1` 及为旧载荷密钥签发的 `CRAGL1` / `CRAGS1`，同样支持 `CRAGH2`）。拉取只更新共用的下载指针，不影响运行中的槽；对相应槽重装才会应用。宿主订阅启用 `CRAGH2` 后不要回滚到 3.1.1 及更早内核。
+vm2api 从自己的公开 payload Release 下载 `crag-v2-licensed-amd64.tar.gz` 签名加密包，无需私有供应仓凭据。「内核」页默认提供 3.1.4 标准版，也可选择 3.1.2、3.1.3 原发行和 Compact 修复版。这些发行使用同一授权身份，已激活的槽不必重新输入许可或增加占位就能升降级。下载只更新共用下载指针，不影响运行中的槽；确认安装后才应用。启用 `CRAGH2` 后不要回滚到 3.1.1 及更早内核。
 
-WARP 可分别选择 CRAG 和 cli-node 的历史发行版本，默认拉取最新；下载只更新待安装缓存，确认重装后才应用到所选槽。一键 `install` / `upgrade` 和独立 `crag-update` 未指定 `--crag-version` 时也选择最新的标准载荷；普通 `vX.Y.Z` 不选择 `-legacy`。依赖旧离线授权的环境做后续升级时要继续显式指定兼容标签，或者跳过内核同步。`manifest.version` 的 `v2` 是协议族，实际下载发行版见缓存指针的 `release.payload_tag`。
+宿主配额按同时运行和正在启动的订阅槽计算，不按已下载的版本数计算。原槽更新只占一个位置；正式停机后保留原绑定，其他槽需要座席时才回收已确认停止且不在操作中的 `CRAGH2` 座席。机况未知不算已停止；`CRAGH1` 不支持回收。单设备许可不消耗订阅槽。由 vm2api 负责受管 CRAG 的重启，避免 Docker 自行恢复绕过槽位准入。
+
+旧授权资产只作历史恢复：`payload-2026.11.16-crag-3.1.2-legacy` 使用不同载荷密钥，现行官方版本不接受该密钥的历史 `CRAGU1`、`CRAGL1` 或 `CRAGS1`。为仍有效的旧许可可通过明确完整标签保留兼容包；常规更新不会预先重签或撤销旧槽。`manifest.version` 的 `v2` 是协议族，实际下载发行版见指针的 `release.payload_tag`。
 
 amd64 默认一键安装/升级会自动完成出厂包初始化和最新版获取，不需要先在面板手动拉取。也可在服务器独立更新，不升级或重启控制面：
 
 ```bash
-sudo bash /opt/vm2api/deploy/install.sh crag-update --crag-version payload-2026.11.17-crag-3.1.3
-# 原样保留旧离线授权（整机 CRAG 更新；只迁移指定槽请用面板）
+sudo bash /opt/vm2api/deploy/install.sh crag-update --crag-version payload-2026.11.17-crag-3.1.4
+# 仅用于历史授权恢复；正常面板版本列表不提供这个版本
 sudo bash /opt/vm2api/deploy/install.sh crag-update --crag-version payload-2026.11.16-crag-3.1.2-legacy
 # 省略 --crag-version：从 vm2api 公开 payload Release 选最新完整签名包
 sudo bash /opt/vm2api/deploy/install.sh crag-update
@@ -65,6 +67,8 @@ sudo bash /opt/vm2api/deploy/install.sh crag-update
 下载或信任校验失败不覆盖旧包、不停槽；未完成工具续接时拒绝强制重启。更新锁为 `share/crag/kernels/v2/.update-lock`，并发更新失败；强杀后须先确认无更新进程再清理锁。调度 hold 使用本次唯一 `crag_update_*` 标记，正常退出时只恢复自己的 hold；断电/强杀不承诺自动恢复。失败返回非零，不伪装成功。回滚用保留的前一完整包，仍须验证原发行公钥、空闲/续接状态并显式重载；禁止轮换授权身份、用 legacy ELF 降级或仅改指针后宣称已回滚。
 
 当前重装接口在同一槽生命周期锁内排空请求、停止服务、关闭 Docker 自动重启、替换文件并验证重启；成功报告 `restarted: true`、`stopped: false`、`status: running`，无需再发一次启动请求。失败可能保持 stopped，须按逐槽错误和实际运行状态处理，不能用 HTTP 200 判断成功。较旧控制面可能只安装并保持停止，按实际部署版本核对；详见[托管节点内核排障与验收](managed-kernel-troubleshooting.md)。安装不主动重置家目录、凭据、指纹或工作区；启动阶段若需更新容器布局可能保留持久目录重建，不能承诺容器 ID 恒定。
+
+CRAG 历史密钥不匹配且无法安全迁移时，在停槽前拒绝安装。
 
 ## 安装
 
