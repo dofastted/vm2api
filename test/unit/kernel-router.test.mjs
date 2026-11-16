@@ -1252,6 +1252,29 @@ test('writeKernelConfig projects thinking display and preserves it only without 
   }
 })
 
+test('CRAG session policy follows the panel unless the VM pins its seat limit', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-seats-'))
+  const vm = { id: 'vm-09' }
+  const routing = { inference: { dataplane: 'crag', session_slots: 10, prewarm_enabled: true } }
+  const write = (slot, options) =>
+    JSON.parse(fs.readFileSync(writeKernelConfig(root, slot, options).configPath, 'utf8'))
+  try {
+    const inherited = write({ ...vm, policy: { sessionSlots: 20, sessionSlotsOverride: false } }, { routing })
+    assert.equal(inherited.slots_per_worker, 20)
+    assert.equal(inherited.session_slots, 10)
+    assert.equal(inherited.prewarm_enabled, true)
+    assert.equal(write(vm).session_slots, 10)
+    assert.equal(write(vm).prewarm_enabled, true)
+    routing.inference.prewarm_enabled = false
+    const pinned = write({ ...vm, policy: { sessionSlots: 4, sessionSlotsOverride: true } }, { routing })
+    assert.equal(pinned.session_slots, 4)
+    assert.equal(pinned.prewarm_enabled, false)
+    assert.equal(write({ ...vm, dataplane: 'wrap' }, { routing }).prewarm_enabled, undefined)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('model effort changes rewrite kernel.json without a routing save or restart', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-effort-'))
   const routing = { compatibility: { persona_preset: 'official' } }
@@ -2597,6 +2620,9 @@ test('native V2 idle reload distinguishes runnable ceiling from live tool waits'
     active: 0,
     waiting: 1,
     queued: 0,
+    cleaning: 0,
+    active_requests: 1,
+    prewarm_enabled: true,
     pids: [42],
   }
   let observed
@@ -2619,7 +2645,7 @@ test('native V2 idle reload distinguishes runnable ceiling from live tool waits'
     })
     await firstProbe
     assert.deepEqual(restarts, [])
-    status = { ...status, ready_slots: 4, waiting: 0, pids: [] }
+    status = { ...status, ready_slots: 3, waiting: 0, active_requests: 0, prewarm_ready: 1, pids: [43] }
     const deadline = new Promise((_, reject) => {
       timer = setTimeout(() => reject(new Error('native idle reload did not complete')), 3000)
     })
