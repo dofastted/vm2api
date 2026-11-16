@@ -182,7 +182,24 @@ require_cmds() {
     err "Docker 未运行，或当前用户不能访问 docker.sock"
     exit 1
   fi
+  local server
+  server="$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)"
+  if ! docker_version_ok "$server"; then
+    err "Docker Engine ${server:-未知} 过旧：需要 ${MIN_DOCKER_VERSION} 或更新（多架构镜像与 --platform）"
+    info "升级参见 https://docs.docker.com/engine/install/"
+    exit 1
+  fi
   compose version >/dev/null
+}
+
+MIN_DOCKER_VERSION=20.10
+# 只比较主次版本；无法解析的版本号视为不满足。
+docker_version_ok() {
+  local major minor
+  major="$(printf '%s' "$1" | cut -d. -f1)"
+  minor="$(printf '%s' "$1" | cut -d. -f2)"
+  case "$major$minor" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$major" -gt 20 ] || { [ "$major" -eq 20 ] && [ "$minor" -ge 10 ]; }
 }
 
 github_api() {
@@ -911,6 +928,11 @@ cmd_status() {
     echo "探活:    ok  http://127.0.0.1:${port}/health"
   else
     echo "探活:    down"
+  fi
+  if [ "$(arch_of "$(uname -m)" || true)" = arm64 ] && [ -f "${INSTALL_DIR}/deploy/prepare-arm64.py" ] \
+    && command -v python3 >/dev/null 2>&1; then
+    echo "ARM64 主机检测:"
+    python3 "${INSTALL_DIR}/deploy/prepare-arm64.py" --check 2>&1 | sed 's/^/  /' || true
   fi
 }
 

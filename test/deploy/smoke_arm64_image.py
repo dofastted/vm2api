@@ -47,6 +47,10 @@ for name in ('kin-kernel', 'kin-codex-kernel'):
     loaded = subprocess.run(['/usr/lib64/ld-linux-x86-64.so.2', '--list', str(root / 'image-bin' / name)],
                             check=True, timeout=30, capture_output=True, text=True)
     assert 'not found' not in loaded.stdout + loaded.stderr, name + ': ' + loaded.stderr
+# The image ships only the x86 libraries in its closure; every x86 payload must resolve.
+subprocess.run([sys.executable, str(root / 'deploy' / 'check-x86-deps.py'), str(root / 'image-bin'),
+                str(root / 'image-wrap-cli'), str(root / 'image-crag'), str(root / 'cluster-bin-amd64')],
+               check=True, timeout=120)
 for name in ('cli-node', 'cc-node'):
     binary = root / 'image-wrap-cli' / name
     # The pinned payload no longer ships cc-node (#967); check it only when present.
