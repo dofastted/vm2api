@@ -1,0 +1,18 @@
+[Unit]
+Description=vm2api Gemini host environments
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+RuntimeDirectory=vm2api-gemini
+RuntimeDirectoryMode=0755
+StateDirectory=vm2api-gemini
+StateDirectoryMode=0711
+ExecStart=/usr/bin/python3 -I /opt/vm2api/scripts/gemini-host.py --state /var/lib/vm2api-gemini --payload /opt/vm2api/share/gemini/current --public-key /etc/vm2api/gemini-ed25519.pub --egress /opt/vm2api/bin/kin-egress --socket /run/vm2api-gemini/control.sock --gateway-group vm2api --uid-base 29000
+TimeoutStopSec=35
+KillMode=mixed
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

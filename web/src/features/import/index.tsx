@@ -6,6 +6,7 @@ import { PageHeader } from '@/components/page-header'
 import { SectionSkeleton } from '@/components/page-skeletons'
 import { QueryGate } from '@/components/query-gate'
 import { dashboardQueryOptions } from '@/features/overview/queries'
+import { GeminiEnvironments } from './gemini-environments'
 import { OnboardFlow } from './onboard-flow'
 import { VmPackageImportCard } from './vm-package-card'
 
@@ -21,6 +22,7 @@ export function ImportPage() {
         <TabsList>
           <TabsTrigger value='onboard'>上线一台</TabsTrigger>
           <TabsTrigger value='package'>导入 JSON 包</TabsTrigger>
+          <TabsTrigger value='gemini'>Gemini</TabsTrigger>
         </TabsList>
         <TabsContent value='onboard'>
           <QueryGate
@@ -39,6 +41,9 @@ export function ImportPage() {
         </TabsContent>
         <TabsContent value='package' className='max-w-2xl'>
           <VmPackageImportCard />
+        </TabsContent>
+        <TabsContent value='gemini'>
+          <GeminiEnvironments />
         </TabsContent>
       </Tabs>
     </PageHeader>
