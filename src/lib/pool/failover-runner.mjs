@@ -23,6 +23,9 @@ import { resolveOfficialCcInference } from '../vm/slot-engine.mjs'
 import { AttemptCoordinator } from './unit-decision.mjs'
 import { SOFT_COOLDOWN_REASONS } from './pool-scheduler.mjs'
 
+/** 429s whose scope is unproven; gradeBare429 decides request vs unit. */
+const BARE_429_REASONS = new Set(['rate_limited_unknown', 'fable_rate_limited_unknown'])
+
 // Seat wait for the one-shot repair hop when the rejected hop already spent the deadline.
 const REPAIR_HOP_WAIT_MS = 30_000
 const SEARCH_REPAIR_IDLE_MS = 60 * 60 * 1000
@@ -625,6 +628,8 @@ export class FailoverRunner {
   gradeBare429(selected, policy, { accounts, key }) {
     const accountId = selected?.accountId
     if (accountId) accounts.add(accountId)
+    // A Fable-only bare 429 and an account-wide one never confirm each other.
+    const hitKey = accountId && policy?.model ? `${accountId}#${policy.model}` : accountId
     const after = Number(this.config.bare_429_request_scope_after ?? 2)
     if (after > 0 && accounts.size >= after) {
       return {
@@ -640,9 +645,9 @@ export class FailoverRunner {
     const windowMs = Number(this.config.bare_429_window_ms ?? 120_000)
     const now = Date.now()
     if (!this.bare429Hits) this.bare429Hits = new Map()
-    const hits = (this.bare429Hits.get(accountId) || []).filter((hit) => now - hit.at < windowMs)
+    const hits = (this.bare429Hits.get(hitKey) || []).filter((hit) => now - hit.at < windowMs)
     hits.push({ key: String(key || ''), at: now })
-    this.bare429Hits.set(accountId, hits)
+    this.bare429Hits.set(hitKey, hits)
     if (this.bare429Hits.size > 500) {
       for (const [id, list] of this.bare429Hits)
         if (!list.some((hit) => now - hit.at < windowMs)) this.bare429Hits.delete(id)
@@ -1124,7 +1129,7 @@ export class FailoverRunner {
           },
           this.scheduler?.accountQuota,
         )
-        if (policy.reason === 'rate_limited_unknown' && !pinVmId && !result?.committed) {
+        if (BARE_429_REASONS.has(policy.reason) && !pinVmId && !result?.committed) {
           policy = this.gradeBare429(selected, policy, { accounts: bare429Accounts, key: bare429Key })
         }
         if (knownSearchRepair && policy.reason === 'search_repairable') {

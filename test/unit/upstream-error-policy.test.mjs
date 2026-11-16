@@ -518,6 +518,23 @@ test('7d_oi 429 cools fable family not the account', () => {
   assert.equal(policy.cooldownUntil, now + 90_000)
 })
 
+test('bare Fable 429 without the 7d_oi window is unproven, not a Fable window limit', () => {
+  const now = 1_700_000_000_000
+  const policy = classifyUpstreamResult(
+    {
+      status: 429,
+      body: { type: 'error', error: { type: 'rate_limit_error', message: 'Error' } },
+      headers: { 'request-id': 'req_x', 'content-type': 'application/json' },
+    },
+    { model: 'claude-fable-5-2', now },
+  )
+  assert.equal(policy.scope, 'model')
+  assert.equal(policy.model, 'fable')
+  assert.equal(policy.reason, 'fable_rate_limited_unknown')
+  assert.equal(policy.retrySameAccount, false)
+  assert.equal(policy.cooldownUntil, now + 60_000)
+})
+
 test('thinking-only verified hop retries the same account', () => {
   const policy = classifyUpstreamResult({
     ok: true,

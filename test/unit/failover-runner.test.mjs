@@ -2172,6 +2172,60 @@ test('bare 429 cools an account only once a second session hits it', async () =>
   assert.equal(scheduler.cooldowns[0].update.reason, 'rate_limited_unknown')
 })
 
+test('bare Fable 429 on two accounts of one request stops and cools no Fable family', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2), candidate(3), candidate(4)])
+  const runner = new FailoverRunner({ scheduler })
+  const seen = []
+  const result = await runner.run({
+    requestId: 'req-fable-bare',
+    stickyKey: 'session-f',
+    canonicalBody: { model: 'claude-fable-5-2' },
+    model: 'claude-fable-5-2',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      return bare429()
+    },
+  })
+  assert.deepEqual(seen, ['account-1', 'account-2'])
+  assert.equal(result.status, 429)
+  assert.equal(result.policy.reason, 'rate_limited_request')
+  assert.equal(scheduler.cooldowns.length, 0)
+})
+
+test('bare Fable 429 cools the Fable family only once a second session hits it', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({ scheduler })
+  const call = ({ candidate: selected }) => (selected.accountId === 'account-1' ? bare429() : success())
+  const base = { canonicalBody: { model: 'claude-fable-5-2' }, model: 'claude-fable-5-2', callAttempt: call }
+  assert.equal((await runner.run({ ...base, requestId: 'req-f1', stickyKey: 'session-1' })).ok, true)
+  assert.equal(scheduler.cooldowns.length, 0)
+  assert.equal((await runner.run({ ...base, requestId: 'req-f2', stickyKey: 'session-2' })).ok, true)
+  assert.equal(scheduler.cooldowns.length, 1)
+  assert.equal(scheduler.cooldowns[0].candidate.accountId, 'account-1')
+  assert.equal(scheduler.cooldowns[0].update.reason, 'fable_rate_limited_unknown')
+})
+
+test('a bare Fable 429 and a bare account 429 never confirm each other', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({ scheduler })
+  const call = ({ candidate: selected }) => (selected.accountId === 'account-1' ? bare429() : success())
+  await runner.run({
+    requestId: 'req-x1',
+    stickyKey: 'session-1',
+    canonicalBody: { model: 'claude-fable-5-2' },
+    model: 'claude-fable-5-2',
+    callAttempt: call,
+  })
+  await runner.run({
+    requestId: 'req-x2',
+    stickyKey: 'session-2',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    callAttempt: call,
+  })
+  assert.equal(scheduler.cooldowns.length, 0)
+})
+
 test('max_accounts_per_request stops after that many accounts ran', async () => {
   const scheduler = new Scheduler([1, 2, 3, 4, 5, 6].map(candidate))
   const runner = new FailoverRunner({

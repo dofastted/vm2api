@@ -626,7 +626,7 @@ function classifyUpstreamResultRaw(
         cooldownUntil: accountLimitUntil(reset, usage, now, message),
       }
     }
-    if (isFableWindowLimit(result.headers) || isFableModel(model)) {
+    if (isFableWindowLimit(result.headers)) {
       const fableReset = fableResetFromHeaders(result.headers, now) || reset
       return {
         scope: 'model',
@@ -634,6 +634,21 @@ function classifyUpstreamResultRaw(
         reason: 'fable_rate_limited',
         model: FABLE_FAMILY_KEY,
         cooldownUntil: fableReset || now + 60_000,
+      }
+    }
+    // A Fable 429 without the 7d_oi window proves nothing about the account:
+    // the provider also answers a bare "Error" 429 to one specific request on
+    // every account while the same accounts keep serving other Fable turns.
+    // The runner grades it like any bare 429 (same request on two accounts →
+    // stop; the family cools only once distinct sessions confirm).
+    if (isFableModel(model)) {
+      return {
+        scope: 'model',
+        action: 'continue-and-cooldown',
+        reason: 'fable_rate_limited_unknown',
+        model: FABLE_FAMILY_KEY,
+        cooldownUntil: reset || now + 60_000,
+        retrySameAccount: false,
       }
     }
     // The model name alone never decides scope (#163): only upstream text
