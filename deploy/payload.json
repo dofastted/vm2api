@@ -1,7 +1,7 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.11.17-kernel-1091-968",
-  "crag_release": "payload-2026.11.17-crag-3.1.3",
+  "release": "payload-2026.11.17-kernel-1091-968-crag-3.1.4",
+  "crag_release": "payload-2026.11.17-crag-3.1.4",
   "files": [
     {
       "path": "bin/kin-kernel",
@@ -113,15 +113,15 @@
     },
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2",
-      "asset": "crag-v2-amd64-v3.1.3-crag-v2",
-      "size": 894488,
-      "sha256": "f8ff24920ec35d7e3f875cd76305807a13f507e4461bdc4ee4bae7bf236afdbc"
+      "asset": "crag-v2-amd64-v3.1.4-crag-v2",
+      "size": 894472,
+      "sha256": "bf987f220835e0f30f95e2bd9f04a9ee37314c1ccdc867b3473855823d199a52"
     },
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2.payload.enc",
-      "asset": "crag-v2-amd64-v3.1.3-crag-v2.payload.enc",
-      "size": 12952468,
-      "sha256": "68646e2507972caaeb49c9133f07a5981a695a409ea0813aac9633791d451ec6"
+      "asset": "crag-v2-amd64-v3.1.4-crag-v2.payload.enc",
+      "size": 12998692,
+      "sha256": "9d427d9b126f61c054f2361381a5d75932b31e9779db5ee28d3525c9e192d6bb"
     },
     {
       "path": "share/crag/kernels/v2/amd64/kernel.json.example",
@@ -131,9 +131,9 @@
     },
     {
       "path": "share/crag/kernels/v2/amd64/manifest.json",
-      "asset": "crag-v2-amd64-v3.1.3-manifest.json",
+      "asset": "crag-v2-amd64-v3.1.4-manifest.json",
       "size": 2720,
-      "sha256": "b96330de47eac3e6977f419db9387ffa2346a4c394af09b680025f5d2d2691ad"
+      "sha256": "67224bbec4d1db42b7c446b22a674702d41d2ed0aaf61f26ab60764a5085a235"
     },
     {
       "path": "share/crag/kernels/v2/amd64/unpack-note.md",
@@ -144,8 +144,8 @@
     {
       "path": "dist/crag-v2-licensed-amd64.tar.gz",
       "asset": "crag-v2-licensed-amd64.tar.gz",
-      "size": 170786978,
-      "sha256": "49d87f716494d5ef8eeac8e579c88ac2a5d6971cf30341df50e4ae6a4526e6a6"
+      "size": 170833337,
+      "sha256": "295e40ba1b1830c0e8b58540d96633b1aa6f2c52f6a437c09e6c976d9f21238c"
     }
   ]
 }

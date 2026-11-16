@@ -622,7 +622,7 @@ test('handleProtocol intercepts before credential hop', () => {
   )
   assert.ok(guard.includes('isProxiedOfficialClaudeCode'))
   const countSrc = fs.readFileSync(path.join(root, 'src/lib/protocol/user-count-tokens.mjs'), 'utf8')
-  const countGuard = countSrc.indexOf('blockCountTokensBeforeHop(req, parsed.body, deps)')
+  const countGuard = countSrc.indexOf('await blockCountTokensBeforeHop(req, parsed.body,')
   const countHop = countSrc.indexOf('countTokensViaWorker)(peeked.exec')
   assert.ok(countGuard > 0 && countHop > countGuard)
 })

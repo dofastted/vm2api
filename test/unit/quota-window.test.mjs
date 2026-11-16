@@ -253,9 +253,29 @@ test('isAccountQuotaExhausted ignores 429s the pool synthesized itself', () => {
   assert.equal(isAccountQuotaExhausted(poolRateLimited, 'rate limited'), false)
 })
 
-test('isAccountQuotaExhausted keeps provider 429s and plan-limit text', () => {
-  assert.equal(isAccountQuotaExhausted({ ok: false, status: 429, via: 'go-worker-stream' }, ''), true)
-  assert.equal(isAccountQuotaExhausted({ ok: false, status: 429 }, ''), true)
+test('isAccountQuotaExhausted needs evidence: a bare provider 429 names no spent window', () => {
+  assert.equal(isAccountQuotaExhausted({ ok: false, status: 429, via: 'go-worker-stream' }, ''), false)
+  assert.equal(isAccountQuotaExhausted({ ok: false, status: 429 }, 'Error'), false)
+  const bare = { ok: false, status: 429, via: 'go-worker-stream', headers: { 'request-id': 'req_1' } }
+  assert.equal(isAccountQuotaExhausted({ ...bare, policy: { reason: 'rate_limited_request' } }, 'Error'), false)
+  assert.equal(isAccountQuotaExhausted({ ...bare, policy: { reason: 'fable_rate_limited_unknown' } }, 'Error'), false)
+  assert.equal(isAccountQuotaExhausted({ ...bare, policy: { reason: 'rate_limited_unknown' } }, 'Error'), false)
+})
+
+test('isAccountQuotaExhausted keeps provider 429s with evidence and plan-limit text', () => {
+  const rejected = { 'anthropic-ratelimit-unified-5h-status': 'rejected' }
+  assert.equal(isAccountQuotaExhausted({ ok: false, status: 429, via: 'go-worker-stream', headers: rejected }, ''), true)
+  const rejected7 = { 'Anthropic-Ratelimit-Unified-7d-Status': 'rate_limited' }
+  assert.equal(isAccountQuotaExhausted({ ok: false, status: 429, headers: rejected7 }, ''), true)
+  const allowed = { 'anthropic-ratelimit-unified-5h-status': 'allowed' }
+  assert.equal(isAccountQuotaExhausted({ ok: false, status: 429, headers: allowed }, ''), false)
+  const graded = { ok: false, status: 429, via: 'go-worker-stream', policy: { reason: 'account_quota_exhausted' } }
+  assert.equal(isAccountQuotaExhausted(graded, "This request would exceed your account's rate limit."), true)
+  // The classifier's grade wins over a stale header.
+  assert.equal(
+    isAccountQuotaExhausted({ ok: false, status: 429, headers: rejected, policy: { reason: 'rpm_limited' } }, ''),
+    false,
+  )
   const planText = "You've hit your limit · resets 3pm"
   assert.equal(isAccountQuotaExhausted({ ok: false, status: 400, via: 'pool-failover' }, planText), true)
   assert.equal(isAccountQuotaExhausted({ ok: true, status: 200 }, planText), false)

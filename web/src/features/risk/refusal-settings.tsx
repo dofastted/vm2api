@@ -1,6 +1,13 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import type { RefusalGuardConfig } from '@/types/panel-routing'
+import type {
+  RefusalDeviceBlock,
+  RefusalGuardConfig,
+} from '@/types/panel-routing'
+import type {
+  UsageLogRow,
+  UsageLogsBatchResult,
+} from '@/types/panel-usage-logs'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { fmtExpiresAt } from '@/lib/format'
@@ -9,6 +16,7 @@ import { Switch } from '@/components/ui/switch'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { Group, ToggleItem, ToggleList } from './blocks'
 import { refusalGuardsQueryOptions } from './queries'
+import { RiskPolicyForm } from './risk-policy-form'
 
 const SIMILARITY_CHOICES = [80, 85, 90, 95] as const
 
@@ -18,14 +26,37 @@ function shortFp(fp: string) {
   return `${s.slice(0, 10)}…${s.slice(-6)}`
 }
 
-/** Changes here save immediately: each switch and list action is one PUT/DELETE. */
-export function RefusalSettings() {
+export function RefusalSettings({
+  onOpen,
+  onDirtyChange,
+}: {
+  onOpen: (row: UsageLogRow) => void
+  onDirtyChange: (dirty: boolean) => void
+}) {
   const qc = useQueryClient()
   const q = useQuery(refusalGuardsQueryOptions())
   const [clearOpen, setClearOpen] = useState(false)
   const [clearDevicesOpen, setClearDevicesOpen] = useState(false)
   const [deleteFp, setDeleteFp] = useState<string | null>(null)
   const [unblockId, setUnblockId] = useState<string | null>(null)
+
+  const source = useMutation({
+    mutationFn: async (item: RefusalDeviceBlock) => {
+      const params = new URLSearchParams({
+        request_id: item.source_request_id || '',
+        include_muted: '1',
+        limit: '1',
+      })
+      if (item.session_id) params.set('session_id', item.session_id)
+      const result = await api<UsageLogsBatchResult>(
+        `/api/panel/usage-logs?${params}`
+      )
+      if (!result.logs[0]) throw new Error('原始请求日志已过保留期或未保存。')
+      return result.logs[0]
+    },
+    onSuccess: onOpen,
+    onError: (error: Error) => toast.error(error.message),
+  })
 
   const save = useMutation({
     mutationFn: (patch: Partial<RefusalGuardConfig>) =>
@@ -121,10 +152,13 @@ export function RefusalSettings() {
     <div className='space-y-8 p-4'>
       <Group
         title='何时拦截'
-        hint='上游拒答过的正文记成指纹。精确命中直接 503；近似只比较用户正文，短于 512 字不做。改动立即生效。'
+        hint='上游策略拒答回填为指纹。重复命中返回不可重试的 400；相似匹配只比较用户正文。'
       >
         <ToggleList>
-          <ToggleItem label='拦截重复拒答' desc='REFUSAL_GUARD=0 会关掉整关'>
+          <ToggleItem
+            label='拦截重复拒答'
+            desc='REFUSAL_GUARD=0 时不使用拒答缓存'
+          >
             <Switch
               checked={data.enabled}
               disabled={save.isPending}
@@ -139,8 +173,8 @@ export function RefusalSettings() {
             />
           </ToggleItem>
           <ToggleItem
-            label='封禁 device'
-            desc='命中任一关后，这个 device 的任意 prompt 都不再 hop'
+            label='启用分级封禁'
+            desc='设备／机器按违规次数升级；违规会话永久阻止。系统提示词改写不受此开关放行。'
           >
             <Switch
               checked={data.device_block_enabled !== false}
@@ -176,14 +210,22 @@ export function RefusalSettings() {
         </ToggleList>
       </Group>
 
+      <RiskPolicyForm
+        key={JSON.stringify(data.risk_audit)}
+        value={data.risk_audit}
+        pending={save.isPending}
+        onDirtyChange={onDirtyChange}
+        onSave={(risk_audit) => save.mutate({ risk_audit })}
+      />
+
       <div className='grid gap-8 xl:grid-cols-2'>
         <Group
-          title='已封禁 device'
+          title='设备与会话封禁'
           hint={
             deviceCount
               ? devices.length < deviceCount
-                ? `显示最近 ${devices.length} / ${deviceCount}`
-                : `${deviceCount} 个`
+                ? `显示最近 ${devices.length} / ${deviceCount} 条，含已到期记录`
+                : `${deviceCount} 条，含已到期记录`
               : '还没有'
           }
           action={
@@ -203,17 +245,36 @@ export function RefusalSettings() {
               {devices.map((item) => (
                 <li
                   key={item.device_id}
-                  className='flex items-center justify-between gap-2 px-3 py-2'
+                  className='flex flex-wrap items-center justify-between gap-2 px-3 py-2'
                 >
                   <div className='min-w-0 flex-1'>
-                    <p className='truncate font-mono text-xs'>
-                      {item.device_id}
+                    <p className='text-xs break-all'>
+                      {item.subject_kind === 'session' ? '会话' : '设备／机器'}{' '}
+                      · <code>{item.identity_value || item.device_id}</code>
                     </p>
                     <p className='text-xs text-muted-foreground tabular-nums'>
-                      {item.reason || 'refusal_guard'} · 命中 {item.hit_count} ·{' '}
-                      {fmtExpiresAt(item.last_seen_at)}
+                      {item.reason || 'refusal_guard'} · 第 {item.violations}{' '}
+                      次违规 · 命中 {item.hit_count} ·{' '}
+                      {item.expires_at
+                        ? `${Date.parse(item.expires_at) <= Date.now() ? '已到期' : '封禁至'} ${fmtExpiresAt(item.expires_at)}`
+                        : '永久'}
                     </p>
+                    {item.subject_kind !== 'session' && item.session_id ? (
+                      <p className='text-xs break-all text-muted-foreground'>
+                        触发会话：<code>{item.session_id}</code>
+                      </p>
+                    ) : null}
                   </div>
+                  {item.source_request_id ? (
+                    <Button
+                      size='sm'
+                      variant='outline'
+                      disabled={source.isPending}
+                      onClick={() => source.mutate(item)}
+                    >
+                      查看原始日志
+                    </Button>
+                  ) : null}
                   <Button
                     size='sm'
                     variant='ghost'

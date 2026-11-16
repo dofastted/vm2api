@@ -640,6 +640,7 @@ export class FailoverRunner {
     applyAttempt,
     callAttempt,
     onAttempt = null,
+    onUpstreamRisk = null,
     pinVmId = null,
     familyKey = null,
     familyVmId = null,
@@ -975,17 +976,20 @@ export class FailoverRunner {
           releaseStickySlots()
           return { ...clientCancelledResult(result), via: result?.via || 'pool-failover', ...attribution() }
         }
-        policy = classifyAttempt(
-          result,
-          selected,
-          {
-            model,
-            repaired,
-            oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
-            signatureRepair: signatureRepairEnabled(this.config),
-          },
-          this.scheduler?.accountQuota,
-        )
+        const audited = onUpstreamRisk?.(result)
+        policy = audited
+          ? { scope: 'request', action: 'stop', reason: 'usage_policy_refusal' }
+          : classifyAttempt(
+              result,
+              selected,
+              {
+                model,
+                repaired,
+                oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
+                signatureRepair: signatureRepairEnabled(this.config),
+              },
+              this.scheduler?.accountQuota,
+            )
         if (knownSearchRepair && policy.reason === 'search_repairable') {
           // Repeating the identical flatten cannot fix a second rejection.
           this.searchRepairs.delete(repairKey)

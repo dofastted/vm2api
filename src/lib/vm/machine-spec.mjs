@@ -289,6 +289,23 @@ export function resolveMachineSpec({ config, overrides, runtime } = {}) {
   }
 }
 
+/**
+ * Factory reset keeps the slot's sizing but draws a new hardware identity
+ * (MAC, SMBIOS, disk serial). The MAC keeps the old OUI when it had a valid one.
+ */
+export function regenerateMachineIdentity(machine) {
+  const base = isPlainObject(machine) ? { ...machine } : {}
+  const oldOui = /^([0-9a-f]{2}:){2}[0-9a-f]{2}/i.exec(String(base.mac || ''))?.[0]?.toLowerCase()
+  const oui = macOuiOk(oldOui) ? oldOui : VM_CONFIG_DEFAULTS.mac_oui
+  const brand = randomSmbios()
+  return {
+    ...base,
+    mac: randomMac(oui),
+    smbios: { ...brand, serial: randomSerial(), uuid: crypto.randomUUID() },
+    disk_serial: randomDiskSerial(),
+  }
+}
+
 /** Fill a missing per-slot SMBIOS. An existing manufacturer/product/family stays put. */
 export function ensureSlotSmbios(vm) {
   if (!vm?.id) return false

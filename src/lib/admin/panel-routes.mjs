@@ -410,6 +410,8 @@ function usageLogFilters(req, u) {
     endpoint: get('endpoint'),
     protocol: get('protocol'),
     status_code: get('status_code'),
+    upstream_400: get('upstream_400') === '1',
+    request_id: get('request_id'),
     exclude_status_200: get('exclude_status_200') === '1',
     model_mismatch: get('model_mismatch') === '1',
     min_attempt_count: get('min_attempt_count'),
