@@ -2556,6 +2556,7 @@ function applyCostFields(target, cost, { coveredSince = null } = {}) {
   target.window_7d_success = cost?.window_7d_success || 0
   target.window_7d_errors = cost?.window_7d_errors || 0
   target.window_7d_tokens = cost?.window_7d_tokens || 0
+  target.health_24h = Array.isArray(cost?.health_24h) ? cost.health_24h : null
   Object.assign(target, windowEstimates(target, cost, coveredSince, isCodexVm(target)))
 }
 

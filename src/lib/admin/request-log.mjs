@@ -720,6 +720,14 @@ export class RequestLogStore {
     return this.repo.billingStats(opts)
   }
 
+  healthBuckets(opts = {}) {
+    return this.repo.healthBuckets(opts)
+  }
+
+  topErrors(opts) {
+    return this.repo.topErrors(opts)
+  }
+
   ownerBilling(opts = {}) {
     return this.repo.ownerBilling(opts)
   }
