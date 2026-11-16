@@ -260,10 +260,31 @@ function isEmptyText(block) {
 }
 
 /** Leading tool_result blocks must stay first in a user turn. */
-function prependAfterToolResults(blocks, extra) {
+function leadingToolResults(blocks) {
   let index = 0
   while (blocks[index]?.type === 'tool_result') index += 1
+  return index
+}
+
+function prependAfterToolResults(blocks, extra) {
+  const index = leadingToolResults(blocks)
   return [...blocks.slice(0, index), ...extra, ...blocks.slice(index)]
+}
+
+/** Moving a 1h marker behind a 5m / TTL-less one breaks Anthropic's TTL order. */
+function invertsCacheTtl(moved, passed) {
+  const long = moved.some((block) => block?.cache_control?.ttl === '1h')
+  return long && passed.some((block) => block?.cache_control != null && block.cache_control.ttl !== '1h')
+}
+
+function hasOutputConfig(message) {
+  return message?.output_config != null && typeof message.output_config === 'object'
+}
+
+/** Media has no reminder form, and `clear_at` acts where it stands. */
+function foldable(message) {
+  if (message?.clear_at != null) return false
+  return contentBlocks(message?.content).every((block) => textOf(block) || isEmptyText(block))
 }
 
 /**
@@ -277,30 +298,42 @@ function prependAfterToolResults(blocks, extra) {
  *
  * A system turn joins the user turn before it; one that follows an assistant
  * turn joins the next user turn instead (after its tool_result blocks). Turns
- * with no user turn to join keep their original shape.
+ * with no user turn to join keep their original shape, as do turns carrying
+ * media or `clear_at`, and turns whose move would invert cache TTL order.
+ *
+ * A folded turn's `output_config` governs the turns after it, so the last one
+ * still in effect is returned as `outputConfig` for the top level.
  */
-export function foldHistorySystemMessages(messages) {
-  if (!Array.isArray(messages) || !messages.some((message) => message?.role === 'system')) return messages
+function foldSystemTurns(messages) {
+  if (!Array.isArray(messages) || !messages.some((message) => message?.role === 'system'))
+    return { messages, outputConfig: null }
   const out = []
   let pending = []
   let pendingSource = []
+  let outputConfig = null
+  const flush = () => {
+    out.push(...pendingSource)
+    if (pendingSource.some(hasOutputConfig)) outputConfig = null
+    pending = []
+    pendingSource = []
+  }
   for (const message of messages) {
-    if (
-      message?.role === 'system' &&
-      !contentBlocks(message.content).every((block) => textOf(block) || isEmptyText(block))
-    ) {
-      // Media or other structured system content has no reminder form; keep it as sent.
-      out.push(...pendingSource, message)
-      pending = []
-      pendingSource = []
+    if (message?.role === 'system' && !foldable(message)) {
+      flush()
+      out.push(message)
+      if (hasOutputConfig(message)) outputConfig = null
       continue
     }
     if (message?.role === 'system') {
       const blocks = reminderBlocks(message)
       const previous = out.at(-1)
-      if (!pending.length && previous?.role === 'user') {
+      if (!pending.length && !pendingSource.length && previous?.role === 'user') {
         if (blocks.length)
-          out[out.length - 1] = { ...previous, content: [...contentBlocks(previous.content), ...blocks] }
+          out[out.length - 1] = {
+            ...previous,
+            content: [...contentBlocks(previous.content), ...blocks],
+          }
+        if (hasOutputConfig(message)) outputConfig = { ...outputConfig, ...message.output_config }
       } else {
         pending = pending.concat(blocks)
         pendingSource.push(message)
@@ -308,21 +341,32 @@ export function foldHistorySystemMessages(messages) {
       continue
     }
     if (pendingSource.length) {
-      if (message?.role === 'user') {
-        const merged = prependAfterToolResults(contentBlocks(message.content), pending)
-        out.push({ ...message, content: merged })
+      const content = contentBlocks(message?.content)
+      if (message?.role === 'user' && !invertsCacheTtl(pending, content.slice(0, leadingToolResults(content)))) {
+        out.push({
+          ...message,
+          content: prependAfterToolResults(content, pending),
+        })
+        for (const source of pendingSource)
+          if (hasOutputConfig(source)) outputConfig = { ...outputConfig, ...source.output_config }
         pending = []
         pendingSource = []
-        continue
+      } else {
+        flush()
+        out.push(message)
       }
-      out.push(...pendingSource)
-      pending = []
-      pendingSource = []
+      if (hasOutputConfig(message)) outputConfig = null
+      continue
     }
+    if (hasOutputConfig(message)) outputConfig = null
     out.push(message)
   }
-  out.push(...pendingSource)
-  return out
+  flush()
+  return { messages: out, outputConfig }
+}
+
+export function foldHistorySystemMessages(messages) {
+  return foldSystemTurns(messages).messages
 }
 
 /**
@@ -331,14 +375,18 @@ export function foldHistorySystemMessages(messages) {
  * user text. Fold the shared history (so it matches the parent's prefix) but
  * leave the trailing system run where the fork sent it.
  */
-function foldSummaryHistorySystemMessages(messages) {
-  if (!Array.isArray(messages)) return messages
+function foldSummarySystemTurns(messages) {
+  if (!Array.isArray(messages)) return { messages, outputConfig: null }
   let end = messages.length
   while (end > 0 && messages[end - 1]?.role === 'system') end -= 1
-  if (end === messages.length) return foldHistorySystemMessages(messages)
+  if (end === messages.length) return foldSystemTurns(messages)
   const head = messages.slice(0, end)
-  const folded = foldHistorySystemMessages(head)
-  return folded === head ? messages : [...folded, ...messages.slice(end)]
+  const tail = messages.slice(end)
+  const folded = foldSystemTurns(head)
+  if (folded.messages === head) return { messages, outputConfig: null }
+  // A trailing turn's own output_config overrides anything lifted from the head.
+  const outputConfig = tail.some(hasOutputConfig) ? null : folded.outputConfig
+  return { messages: [...folded.messages, ...tail], outputConfig }
 }
 
 /**
@@ -357,10 +405,15 @@ export function prepareCragPrintBody(
 ) {
   const out = { ...(body || {}) }
   if (agentSummary) out.messages = readOnlySummaryResults(out.messages)
-  if (foldSystemMessages)
-    out.messages = agentSummary
-      ? foldSummaryHistorySystemMessages(out.messages)
-      : foldHistorySystemMessages(out.messages)
+  if (foldSystemMessages) {
+    const folded = agentSummary ? foldSummarySystemTurns(out.messages) : foldSystemTurns(out.messages)
+    out.messages = folded.messages
+    if (folded.outputConfig)
+      out.output_config = {
+        ...(out.output_config || {}),
+        ...folded.outputConfig,
+      }
+  }
   const mode = preset === 'zero' ? 'replace' : 'append'
   delete out.system
   stripCallerPromptAlias(out)
