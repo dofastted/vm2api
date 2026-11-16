@@ -833,10 +833,6 @@ function restoreCragPolicyBlock(result) {
   }
 }
 
-export async function callGoWorker(options) {
-  return restoreCragPolicyBlock(await callGoWorkerRaw(options))
-}
-
 async function callGoWorkerRaw({
   requestContext = null,
   exec,
@@ -1043,10 +1039,6 @@ async function callGoWorkerRaw({
   } finally {
     stopCancel()
   }
-}
-
-export async function streamGoWorker(options) {
-  return restoreCragPolicyBlock(await streamGoWorkerRaw(options))
 }
 
 async function streamGoWorkerRaw({
@@ -2019,4 +2011,84 @@ export async function countTokensViaWorker(exec, { body, headers = {}, timeoutMs
     return { ok: true, status: 200, body: { input_tokens: 8 }, headers: {}, via: 'go-worker-mock' }
   }
   return runSlotOauth(exec, 'count-tokens', { body, headers, timeoutMs })
+}
+
+const EMPTY_CONTENT_VERDICT = 'native request completed without response content'
+
+/**
+ * CRAG 3.0.7 rejects a provider 200 whose only output is a thinking block that
+ * consumed all of max_tokens (e.g. Claude Code's 64-token `<severity>` probe on
+ * an adaptive-thinking model) and projects it as 502. The official API returns
+ * 200 with `stop_reason: max_tokens`; clients treat it as "no answer" and move
+ * on, while a 502 makes every hop retry the same billable request. Rebuild the
+ * 200 from the authenticated provider facts (content left empty: the thinking
+ * block's signature is not forwarded by the kernel).
+ */
+export function recoverThinkingOnlyMaxTokens(result, { onEvent, onCommit } = {}) {
+  const facts = result?.providerResult
+  if (
+    !result ||
+    result.ok ||
+    result.committed ||
+    facts?.schema_version !== 2 ||
+    facts.http_status !== 200 ||
+    facts.provider_complete !== true ||
+    facts.usage_complete !== true ||
+    facts.stop_reason !== 'max_tokens' ||
+    facts.validation_error?.message !== EMPTY_CONTENT_VERDICT ||
+    !/^msg_[A-Za-z0-9_-]+$/.test(facts.message_id || '') ||
+    typeof facts.model !== 'string' ||
+    !facts.usage
+  )
+    return result
+  const usage = facts.usage
+  const body = {
+    id: facts.message_id,
+    type: 'message',
+    role: 'assistant',
+    model: facts.model,
+    content: [],
+    stop_reason: 'max_tokens',
+    stop_sequence: facts.stop_sequence ?? null,
+    usage,
+  }
+  return (async () => {
+    let committed = false
+    if (typeof onEvent === 'function') {
+      onCommit?.()
+      committed = true
+      const startUsage = { ...usage, output_tokens: 0 }
+      const events = [
+        { type: 'message_start', message: { ...body, stop_reason: null, stop_sequence: null, usage: startUsage } },
+        { type: 'message_delta', delta: { stop_reason: 'max_tokens', stop_sequence: body.stop_sequence }, usage },
+        { type: 'message_stop' },
+      ]
+      for (const event of events) {
+        await onEvent(`event: ${event.type}`)
+        await onEvent(`data: ${JSON.stringify(event)}`)
+        await onEvent('')
+      }
+    }
+    return {
+      ...result,
+      ok: true,
+      status: 200,
+      body,
+      usage,
+      model: facts.model,
+      stopReason: 'max_tokens',
+      sawMessageStop: true,
+      committed: committed || result.committed || false,
+      terminalState: 'verified',
+      recoveredEmptyContent: true,
+    }
+  })()
+}
+
+export async function callGoWorker(opts = {}) {
+  return recoverThinkingOnlyMaxTokens(restoreCragPolicyBlock(await callGoWorkerRaw(opts)), {})
+}
+
+export async function streamGoWorker(opts = {}) {
+  return recoverThinkingOnlyMaxTokens(restoreCragPolicyBlock(await streamGoWorkerRaw(opts)), opts)
 }
