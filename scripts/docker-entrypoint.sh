@@ -15,6 +15,19 @@ if [ -d /opt/vm2api/image-config ]; then
   done
 fi
 
+# ARM64 主机上 slot 是 amd64，依赖宿主 qemu-x86_64 binfmt handler（重启后可能丢失）。
+# 静态 amd64 kin-worker 无参数时以 2 退出；shell 返回 126/127 表示无法执行 x86 程序。
+# 只提示不阻塞：面板仍要能打开。
+X86_PROBE="${KIN_X86_PROBE_BIN:-/opt/vm2api/cluster-bin-amd64/kin-worker}"
+if [ "$(uname -m)" = aarch64 ] && [ -f "$X86_PROBE" ]; then
+  probe_rc=0
+  "$X86_PROBE" >/dev/null 2>&1 || probe_rc=$?
+  if [ "$probe_rc" -eq 126 ] || [ "$probe_rc" -eq 127 ]; then
+    echo "vm2api: 宿主缺少 qemu-x86_64 binfmt handler，amd64 slot 将无法启动。" >&2
+    echo "vm2api: 在宿主执行 python3 deploy/prepare-arm64.py（详见 docs/ARM64.md）。" >&2
+  fi
+fi
+
 # No seeded vm-01. A fresh fleet is empty. Seeding an active placeholder made
 # the only slot undeletable: DELETE refuses the active VM, and the next start
 # would recreate the files.

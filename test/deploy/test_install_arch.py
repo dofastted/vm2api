@@ -44,6 +44,15 @@ def run_prepare_arch_env(tmp: str, *, host_arch: str, mode: str) -> subprocess.C
     return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
 
 
+class DockerVersionTests(unittest.TestCase):
+    def test_minimum_engine_version(self):
+        cases = {"20.10.0": 0, "20.10.24+dfsg1": 0, "24.0.7": 0, "27.3.1": 0,
+                 "20.9.1": 1, "19.03.15": 1, "": 1, "unknown": 1}
+        for version, expected in cases.items():
+            result = run_defs(f'docker_version_ok "{version}"')
+            self.assertEqual(result.returncode, expected, version)
+
+
 class ArchMappingTests(unittest.TestCase):
     def test_arch_of_maps_common_uname_spellings(self):
         for machine, expected in (

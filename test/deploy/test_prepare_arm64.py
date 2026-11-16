@@ -51,9 +51,28 @@ class FakeOperations:
         self.fail_restore = False
         self.fail_install = None
         self.bad_interpreter = False
+        self.openrc = False
+        self.boot_binfmt = False
 
     def preflight(self):
         self.calls.append("preflight")
+
+    def report(self):
+        return [arm64.Check("arch", True, "linux/aarch64")]
+
+    def persistence_ok(self):
+        return not self.openrc or self.boot_binfmt
+
+    def enable_persistence(self):
+        if not self.openrc or self.boot_binfmt:
+            return False
+        self.calls.append("enable_persistence")
+        self.boot_binfmt = True
+        return True
+
+    def disable_persistence(self):
+        self.calls.append("disable_persistence")
+        self.boot_binfmt = False
 
     def managed_bytes(self, path):
         self.calls.append(("read", path))
@@ -296,6 +315,141 @@ class HostOperationTests(unittest.TestCase):
             target.mkdir()
             with self.assertRaisesRegex(arm64.PrepareError, "regular file"):
                 arm64.Operations().managed_bytes(target)
+
+
+class HostFacts:
+    """Facts a healthy Ubuntu/systemd 4K ARM64 host reports."""
+
+    def __init__(self, **overrides):
+        self.values = dict(machine="linux/aarch64", page=4096, container=None, status="enabled",
+                           init="systemd", sources=[], shadows=[])
+        self.values.update(overrides)
+
+    def machine(self): return self.values["machine"]
+    def page_size(self): return self.values["page"]
+    def container(self): return self.values["container"]
+    def binfmt_status(self): return self.values["status"]
+    def init_system(self): return self.values["init"]
+    def conf_sources(self): return self.values["sources"]
+    def shadowing_handlers(self): return self.values["shadows"]
+
+
+def failed(**overrides):
+    return {c.name: c for c in arm64.host_checks(HostFacts(**overrides)) if not c.ok}
+
+
+class HostCheckTests(unittest.TestCase):
+    def test_healthy_4k_systemd_host_passes(self):
+        self.assertEqual(failed(), {})
+
+    def test_large_pages_rejected_with_kernel_hint(self):
+        for page in (16384, 65536):
+            result = failed(page=page)
+            self.assertEqual(list(result), ["page-size"])
+            self.assertIn("4K-page kernel", result["page-size"].hint)
+
+    def test_container_binfmt_and_init_failures_are_all_reported_together(self):
+        result = failed(container="container (/.dockerenv)", status=None, init=None)
+        self.assertEqual(set(result), {"container", "binfmt_misc", "init"})
+        self.assertIn("modprobe binfmt_misc", result["binfmt_misc"].hint)
+        self.assertIn("echo 1", failed(status="disabled")["binfmt_misc"].hint)
+
+    def test_wrong_arch_and_shadowing_handler(self):
+        self.assertIn("arch", failed(machine="linux/x86_64"))
+        result = failed(shadows=["qemu-x86_64-static (/usr/bin/qemu-x86_64-static)"])
+        self.assertEqual(list(result), ["other-x86-handlers"])
+
+    def test_openrc_and_distro_conf_are_accepted(self):
+        self.assertEqual(failed(init="openrc"), {})
+        checks = {c.name: c for c in arm64.host_checks(HostFacts(
+            sources=[arm64.CONF, Path("/usr/lib/binfmt.d/qemu-x86_64.conf")]))}
+        self.assertTrue(checks["binfmt.d"].ok)
+        self.assertIn("overrides distro /usr/lib/binfmt.d/qemu-x86_64.conf", checks["binfmt.d"].detail)
+
+    def test_preflight_raises_before_any_host_mutation(self):
+        ops = arm64.Operations()
+        facts = HostFacts(page=65536, init=None)
+        with mock.patch.multiple(ops, **{name: getattr(facts, name) for name in (
+                "machine", "page_size", "container", "binfmt_status", "init_system",
+                "conf_sources", "shadowing_handlers")}), \
+             mock.patch.object(ops, "run") as run:
+            with self.assertRaises(arm64.PrepareError) as raised:
+                arm64.prepare(ops)
+            run.assert_not_called()
+        self.assertIn("page-size", str(raised.exception))
+        self.assertIn("init", str(raised.exception))
+
+
+class ForeignHandlerTests(unittest.TestCase):
+    def test_debian_static_handler_matches_x86_64(self):
+        text = ("enabled\ninterpreter /usr/libexec/qemu-binfmt/x86_64-binfmt-P\nflags: PF\noffset 0\n"
+                "magic " + arm64.MAGIC.hex() + "\nmask " + arm64.MASK.hex() + "\n")
+        handler = arm64.foreign_handler(text)
+        self.assertTrue(arm64.matches_x86_64(handler))
+
+    def test_aarch64_disabled_and_extension_handlers_ignored(self):
+        aarch64 = "enabled\ninterpreter /usr/bin/qemu-aarch64\nflags: F\noffset 0\nmagic 7f454c460201010000000000000000000200b700\nmask fffffffffffffffcfffffffffffffffffeffffff\n"
+        self.assertFalse(arm64.matches_x86_64(arm64.foreign_handler(aarch64)))
+        self.assertIsNone(arm64.foreign_handler("disabled\nmagic 7f45\n"))
+        self.assertIsNone(arm64.foreign_handler("enabled\ninterpreter /usr/bin/wine\nextension .exe\n"))
+
+
+class OpenRCTests(unittest.TestCase):
+    def test_first_install_enables_boot_runlevel(self):
+        ops = FakeOperations()
+        ops.openrc = True
+        self.assertEqual(arm64.prepare(ops), "Configured ARM64 QEMU for x86_64")
+        self.assertIn("enable_persistence", ops.calls)
+        self.assertTrue(ops.boot_binfmt)
+
+    def test_failed_check_rolls_back_runlevel_and_files(self):
+        ops = FakeOperations()
+        ops.openrc = True
+        original = arm64.check
+        with mock.patch.object(arm64, "check", side_effect=arm64.PrepareError("readback differs")):
+            with self.assertRaisesRegex(arm64.PrepareError, "rollback completed"):
+                arm64.prepare(ops)
+        self.assertIs(arm64.check, original)
+        self.assertIn("disable_persistence", ops.calls)
+        self.assertFalse(ops.boot_binfmt)
+        self.assertEqual(ops.files, {})
+
+    def test_preexisting_runlevel_is_not_removed_on_failure(self):
+        ops = FakeOperations()
+        ops.openrc = ops.boot_binfmt = True
+        ops.fail_registration = True
+        with self.assertRaises(arm64.PrepareError):
+            arm64.prepare(ops)
+        self.assertNotIn("disable_persistence", ops.calls)
+        self.assertTrue(ops.boot_binfmt)
+
+    def test_check_rejects_missing_boot_runlevel(self):
+        ops = FakeOperations(handler=managed_handler(), installed=True)
+        ops.openrc = True
+        with self.assertRaisesRegex(arm64.PrepareError, "rc-update add binfmt boot"):
+            arm64.check(ops)
+        self.assertEqual(arm64.prepare(ops), "Already configured")
+        self.assertTrue(ops.boot_binfmt)
+        arm64.check(ops)
+
+    def test_openrc_registration_writes_register_directly(self):
+        ops = arm64.Operations()
+        with mock.patch.object(ops, "init_system", return_value="openrc"), \
+             mock.patch.object(ops, "run") as run:
+            ops.register_managed()
+        args, kwargs = run.call_args
+        self.assertEqual(args[0], ["tee", str(arm64.KERNEL / "register")])
+        self.assertIn(str(arm64.QEMU).encode(), kwargs["data"])
+        self.assertTrue(kwargs["data"].endswith(b"POCF"))
+
+    def test_runlevel_parsing(self):
+        ops = arm64.Operations()
+        listing = b"             binfmt | boot\n              hwclock | boot\n"
+        with mock.patch.object(ops, "init_system", return_value="openrc"), \
+             mock.patch.object(ops, "run", return_value=listing) as run:
+            self.assertTrue(ops.persistence_ok())
+            self.assertFalse(ops.enable_persistence())
+        run.assert_called_with(["rc-update", "show", "boot"])
 
 
 if __name__ == "__main__":
