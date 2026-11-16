@@ -1,21 +1,20 @@
 import { describe, expect, it } from 'vitest'
 import {
   WEEK_MS,
-  depthStyle,
   resetRemainVisual,
-  scaleT,
+  schedulingPriorityTextClass,
 } from './vm-type-visual'
 
 describe('type column visuals', () => {
-  it('maps the low end to a lighter chip than the high end', () => {
-    const light = depthStyle(0)
-    const deep = depthStyle(1)
-    expect(scaleT(1, 1, 10)).toBe(0)
-    expect(scaleT(10, 1, 10)).toBe(1)
-    expect(scaleT(1, 1, 100)).toBe(0)
-    expect(scaleT(100, 1, 100)).toBe(1)
-    expect(light.backgroundColor).not.toBe(deep.backgroundColor)
-    expect(light.color).not.toBe(deep.color)
+  it.each([
+    [1, 'text-slate-600 dark:text-slate-300'],
+    [4, 'text-sky-800 dark:text-sky-300'],
+    [8, 'text-blue-800 dark:text-blue-200'],
+    [10, 'text-blue-800 dark:text-blue-200'],
+    [11, 'text-muted-foreground'],
+    [NaN, 'text-muted-foreground'],
+  ])('uses a theme-aware text color for priority %s', (level, expected) => {
+    expect(schedulingPriorityTextClass(level)).toBe(expected)
   })
 
   it('fills the reset bar while time remains and marks an overdue window', () => {

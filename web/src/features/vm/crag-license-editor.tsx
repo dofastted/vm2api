@@ -25,15 +25,15 @@ const licenseMessages: Record<string, string> = {
   license_unconfigured:
     '服务器尚未配置可信授权公钥或加密 CRAG 包。请联系管理员安装受信任的完整软件包后重试。',
   license_redeem_unavailable:
-    '兑换码无效、已过期或已使用。若兑换时连接中断，请联系签发方核对记录并找回已签发的注册码。',
+    '兑换码无效、已过期或已使用。若兑换时连接中断，请联系签发方核对兑换记录。',
   license_redeem_conflict:
     '此兑换码已绑定另一台设备或另一版内核。请回到原槽并使用原内核版本。',
   license_redeem_target_changed:
     '激活期间目标槽、设备或授权发生变化，未覆盖现有授权。请联系管理员核对本次签发。',
   license_redeem_subscription:
-    '本槽已使用宿主订阅许可。请在「宿主订阅」管理续期或占槽。',
+    '本槽已使用宿主订阅许可。请在「宿主机订阅」管理续期或绑定。',
   license_redeem_service:
-    '未确认联网激活。请在同一槽使用原码重试；若提示已使用，请联系签发方找回注册码。',
+    '未确认联网激活。请在同一槽使用原码重试；若提示已使用，请联系签发方核对兑换记录。',
   license_redeem_origin: '请在当前面板页提交兑换，不要从其他站点发起。',
   redeem_unavailable: '兑换码无效、已过期或不可用，请核对原码。',
   host_redeem_conflict: '兑换码不属于本机或已在其他宿主机使用。',
@@ -349,7 +349,7 @@ export function CragActivationForm({
           id={`${formId}-registration-help`}
           className='text-xs leading-relaxed text-muted-foreground'
         >
-          支持联网兑换码、购买的订阅码、设备注册码和离线通用码。系统自动识别。订阅码会兑换到本机并绑定目标槽；新套餐额度会替换现有额度。
+          系统自动识别订阅码、设备兑换码、设备注册码和离线通用码。订阅码兑换到本机后无法转移；系统会为目标槽绑定应用锁，新套餐额度会替换现有额度。离线通用码会同步到所有兼容槽位。
         </p>
       </div>
       {error ? (

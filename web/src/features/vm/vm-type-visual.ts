@@ -1,24 +1,11 @@
 export const WEEK_MS = 7 * 86_400_000
 
-/** 0 = 最浅，1 = 最深。同一冷蓝色相，避免被读成健康色或等级色。 */
-export function depthStyle(t: number): {
-  backgroundColor: string
-  color: string
-} {
-  const x = Math.min(1, Math.max(0, t))
-  const L = 0.94 - x * 0.56
-  const C = 0.015 + x * 0.11
-  const fgL = L < 0.62 ? 0.98 : 0.27
-  return {
-    backgroundColor: `oklch(${L.toFixed(3)} ${C.toFixed(3)} 250)`,
-    color: `oklch(${fgL.toFixed(3)} 0.02 250)`,
-  }
-}
-
-/** 把 [min, max] 收成 0–1。越界夹紧；非数字返回 null。 */
-export function scaleT(value: number, min: number, max: number): number | null {
-  if (!Number.isFinite(value) || !(max > min)) return null
-  return Math.min(1, Math.max(0, (value - min) / (max - min)))
+export function schedulingPriorityTextClass(level: number): string {
+  if (!Number.isInteger(level) || level < 1 || level > 10)
+    return 'text-muted-foreground'
+  if (level >= 8) return 'text-blue-800 dark:text-blue-200'
+  if (level >= 4) return 'text-sky-800 dark:text-sky-300'
+  return 'text-slate-600 dark:text-slate-300'
 }
 
 export type ResetRemainVisual = {

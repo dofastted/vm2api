@@ -250,6 +250,30 @@ test('a failed slot probe does not hide signed host rights', async (t) => {
   assert.equal((await service.status()).state, 'unavailable', 'unsafe host identity remains unavailable')
 })
 
+test('activated slots report valid local licenses independently of host entitlement and running slots', async (testContext) => {
+  const { root, connect } = standaloneHost(testContext, async () =>
+    assert.fail('status must not contact the Authority'),
+  )
+  seedEncryptedPackage(root)
+  const stopped = { id: 'vm-stopped', status: 'stopped', dataplane: 'crag' }
+  const unlicensed = { id: 'vm-unlicensed' }
+  const remote = { id: 'vm-remote', node_id: 'remote' }
+  activateFixture(root, stopped)
+  activateFixture(root, { id: remote.id })
+  const { license } = checkCragLicense(root, stopped)
+  assert.equal(license.valid, true)
+  const service = connect({
+    listTargets: () => [stopped, unlicensed, remote],
+    isLocalCragSlot: (vm) => !vm.node_id,
+    assertReady: () => false,
+    runtimeInventory: { snapshot: async () => ({ running_vms: 0 }) },
+  })
+  const status = await service.status()
+  assert.equal(status.state, 'unredeemed')
+  assert.equal(status.runtime.running_vms, 0)
+  assert.deepEqual(status.activated_slots, [{ vm_id: stopped.id, scope: 'device', expires_at: license.expires_at }])
+})
+
 test('a package changed during redemption cannot publish rights and recovery keeps the original pin', async (testContext) => {
   const issued = new Map()
   const requests = []

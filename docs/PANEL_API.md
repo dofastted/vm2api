@@ -272,6 +272,8 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 | POST | `/crag-shop/orders/:id/claim` | 空请求体或 JSON `{}`，普通订单返回 `{ order_id, redemption_code }`；未发货返回 `409`，不兑换到宿主机，续费订单不提供兑换码 |
 | POST | `/crag-shop/orders/:id/apply-renewal` | 空请求体或 JSON `{}`；仅管理员本人可将已发货的续费订单应用到当前宿主机，返回宿主订阅状态，不返回兑换码或续费证明 |
 
+管理员新购非续费套餐时可选 `{ activation_target: { vm_id } }`；目标从 `GET /crag-shop/activation-targets` 获取。供应方确认 `fulfilled` 后服务端自动兑换并绑定所选槽，浏览器无需在线。已指定目标的订单不提供领码；状态在 `activation` 中返回，暂停后可使用 `POST /crag-shop/orders/:id/retry-activation`（JSON `{}`）重试同一目标。历史手动订单与续费不自动改绑。
+
 历史订单优先按订单 ID 恢复。仅在供应方未收到建单时，才需要用原选项和 `request_id` 重新发起建单。未核价的旧方案仅在兼容模式下可建单。浏览器不能提交续费证明；控制面用已有的宿主凭据向固定供应方申请证明。
 
 订单视图包含 `order_id`、`request_id`、`status`、`sku`、`payment_method`、`created_at`（Unix 秒）、`term`、`amount_minor`、`slot_limit`。`reserved` 表示仅保留了本地订单标识、尚未确认供应方创建，后三个快照字段为 `null`；确认后的状态是 `pending`、`paid` 或 `fulfilled`。目录下架不影响已创建订单的历史快照。
@@ -288,6 +290,10 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 | POST | `/vms/:id/crag-license/bind` | 管理员同源登录会话，JSON `{}`，将有效宿主订阅绑定到合格的本机 Linux Docker CRAG v2 槽；回读槽授权确认 `license.valid` 与 `license.scope`。 |
 
 可选 `runtime` 返回实际运行的 `running_vms`、`ready_vms`、`unknown_vms`、`host_running_vms`、`host_unknown_vms`、`host_runtime_available`、`host_over_limit`、`checked_at` 和逐 VM 明细 `vms`。独立授权计入全局服役但不占宿主额度；未知不视为零。宿主订阅超额或无法核实在额度内时，新的宿主授权推理请求分别返回 `403 license_crag_host_over_quota` 或 `403 license_crag_host_usage_unverified`，不取消在途请求、不代替逐槽许可。
+
+`target_probe_failed: true` 表示至少一项本机槽位观测失败，不影响已验证的宿主权益状态。槽位授权接口 `POST /vms/:id/crag-license` 可提交联网兑换码；经 Authority 确认为宿主订阅码后，会兑换到本机并绑定所选槽。
+
+可选 `activated_slots` 列出授权仍有效的本机 CRAG v2 槽位：每项含 `vm_id`、`scope`（`host`、`device` 或 `kernel`）和 `expires_at`（Unix 秒）。它不表示槽正在运行，也不替代 Authority 确认的额度；空数组表示已读取但没有符合条件的槽，省略表示未取得清单。
 
 ## 路由 / 设置
 

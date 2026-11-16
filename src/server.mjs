@@ -70,6 +70,7 @@ import {
 } from './lib/vm/vm-registry.mjs'
 import { createCragSubscription } from './lib/vm/crag-subscription.mjs'
 import { createCragRuntimeInventory } from './lib/vm/crag-runtime-inventory.mjs'
+import { installedCragV2Root } from './lib/vm/wrap-cli-runtime.mjs'
 import { makeError, ErrorType, ErrorCode } from './lib/core/errors.mjs'
 import { HOLD_PROXY } from './lib/pool/schedule-state.mjs'
 import * as panel from './lib/admin/panel-api.mjs'
@@ -1020,6 +1021,12 @@ const listCragTargets = () =>
     .map(({ id }) => getVm(cfg.paths.project, id))
     .filter(Boolean)
 
+const isLocalCragV2Slot = (vm) =>
+  !vm.node_id &&
+  !isCodexVm(vm) &&
+  resolveKernelDataplane(vm, routingConfig) === 'crag' &&
+  resolveCragKernelVersion(vm, routingConfig) === 'v2'
+
 const cragSubscription = createCragSubscription({
   projectRoot: cfg.paths.project,
   listTargets: listCragTargets,
@@ -1029,12 +1036,9 @@ const cragSubscription = createCragSubscription({
     getRouting: () => routingConfig,
   }),
   getTarget: (id) => getVm(cfg.paths.project, id),
-  isSubscriptionSlot: (vm) =>
-    !vm.node_id &&
-    !isCodexVm(vm) &&
-    !isKvmRuntime(vm) &&
-    resolveKernelDataplane(vm, routingConfig) === 'crag' &&
-    resolveCragKernelVersion(vm, routingConfig) === 'v2',
+  isLocalCragSlot: (vm) =>
+    isLocalCragV2Slot(vm) && (isKvmRuntime(vm) || Boolean(installedCragV2Root(cfg.paths.project, vm))),
+  isSubscriptionSlot: (vm) => isLocalCragV2Slot(vm) && !isKvmRuntime(vm),
   assertReady: (vm, opts) => assertCragSubscriptionTarget(cfg.paths.project, vm, routingConfig, opts),
   isSlotEnabled: (vm, opts) => isCragSubscriptionSlotEnabled(cfg.paths.project, vm, routingConfig, opts),
 })
