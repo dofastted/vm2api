@@ -225,6 +225,8 @@ export function toUsageLogRow(row, names, chain = []) {
     context1mApplied: row.long_context == null ? null : row.long_context === 1,
     reasoningEffort: row.reasoning_effort ?? null,
     inboundDeviceId: row.inbound_device_id ?? null,
+    upstreamStatus: nullableNum(row.upstream_status),
+    upstream400Message: row.upstream_400_message ?? null,
     jevState: row.jev_state || null,
     errorClass: row.error_class ?? null,
     errorLabel: row.error_label ?? null,
@@ -329,6 +331,8 @@ function buildFilter(filters, defaultMuted) {
   }
   eq('path', filters.endpoint)
   eq('protocol', filters.protocol)
+  if (filters.upstream_400) where.push('upstream_status = 400')
+  eq('request_id', filters.request_id)
   if (filters.account_id) {
     where.push('(account_id = ? OR final_account_id = ?)')
     params.push(filters.account_id, filters.account_id)

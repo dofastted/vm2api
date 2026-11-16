@@ -167,6 +167,9 @@ export function parseUserId(raw) {
   if (typeof raw === 'object') {
     return {
       device_id: raw.device_id || raw.deviceId || '',
+      ...(raw.machine_id || raw.machineId || raw.meachine_id
+        ? { machine_id: raw.machine_id || raw.machineId || raw.meachine_id }
+        : {}),
       account_uuid: raw.account_uuid || raw.accountUuid || '',
       session_id: raw.session_id || raw.sessionId || '',
       parent_session_id: raw.parent_session_id || raw.parentSessionId || '',
@@ -176,15 +179,7 @@ export function parseUserId(raw) {
   const s = String(raw)
   try {
     const p = JSON.parse(s)
-    if (p && typeof p === 'object') {
-      return {
-        device_id: p.device_id || p.deviceId || '',
-        account_uuid: p.account_uuid || p.accountUuid || '',
-        session_id: p.session_id || p.sessionId || '',
-        parent_session_id: p.parent_session_id || p.parentSessionId || '',
-        root_session_id: p.root_session_id || p.rootSessionId || '',
-      }
-    }
+    if (p && typeof p === 'object') return parseUserId(p)
   } catch {}
   const m = /^user_(.*?)_account_(.*?)_session_(.*)$/.exec(s)
   if (m) return { device_id: m[1], account_uuid: m[2], session_id: m[3] }

@@ -9,22 +9,22 @@ export const STAGES: { id: StageId; name: string; does: string }[] = [
   {
     id: 'distill',
     name: '蒸馏',
-    does: '收割模板、结构特征、题目指纹。命中即 403，并封 device。',
+    does: '识别收割模板、结构特征和题目指纹，命中不出站。',
   },
   {
     id: 'hard-regex',
     name: '硬正则',
-    does: '按类别正则扫用户正文。命中即 403，不 hop。',
+    does: '检查系统提示词改写、禁用工具及类别正则，命中不出站。',
   },
   {
     id: 'refusal',
     name: '拒答缓存',
-    does: '上游拒过的正文、近似正文和被封的 device，直接 503。',
+    does: '已封设备／会话，以及上游拒过的相同或近似正文，返回不可重试的 400。',
   },
   {
     id: 'jev',
     name: '决策模型',
-    does: '三题各自打分，任一题低于阈值就拦。色情命中会封设备。',
+    does: '仅审核用户会话和可读取的内联文件文本，按评分拒绝、降级或常规放行。',
   },
 ]
 
@@ -105,7 +105,7 @@ export function feedKindOf(row: UsageLogRow): FeedKind {
 const REFUSAL_MATCH: Record<string, string> = {
   refusal_guard: '精确指纹',
   refusal_similar: '近似正文',
-  refusal_device: '封禁 device',
+  refusal_device: '设备或会话封禁',
 }
 
 /** The part of the stored block message that says why: `nsfw: 关键词`. */

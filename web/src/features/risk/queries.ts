@@ -29,6 +29,11 @@ export type GateStats = {
   keywords: { keyword: string; count: number }[]
   blocks?: GateRow[]
   passes?: GateRow[]
+  routes?: {
+    kind: 'pool' | 'endpoint' | 'model'
+    target: string
+    count: number
+  }[]
 }
 
 const LIVE = { refetchInterval: 30_000, refetchOnWindowFocus: false } as const
@@ -42,6 +47,23 @@ export function gateStatsQueryOptions() {
 }
 
 export type RiskFeed = { rows: UsageLogRow[]; more: boolean }
+
+export function upstream400QueryOptions(since: string | undefined) {
+  return queryOptions({
+    queryKey: ['panel', 'risk-upstream-400', since] as const,
+    queryFn: async () => {
+      const params = new URLSearchParams({
+        upstream_400: '1',
+        include_muted: '1',
+        limit: '100',
+      })
+      if (since) params.set('start_time', since)
+      return api<UsageLogsBatchResult>(`/api/panel/usage-logs?${params}`)
+    },
+    enabled: !!since,
+    ...LIVE,
+  })
+}
 
 /**
  * Blocked and upstream-refused requests since `since`. Gate blocks log as
