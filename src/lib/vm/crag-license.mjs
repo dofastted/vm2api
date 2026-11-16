@@ -696,7 +696,7 @@ function subscriptionBinding(
   projectRoot,
   vm,
   slotPermit,
-  { activate = false, seat, verifiedRights, authority = slotAuthority(projectRoot, vm) } = {},
+  { activate = false, seat, verifiedRights, candidateEntitlement, authority = slotAuthority(projectRoot, vm) } = {},
 ) {
   subscriptionSlot(vm)
   const ctx = deviceContext(projectRoot, vm, false)
@@ -717,7 +717,8 @@ function subscriptionBinding(
         const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
         const hostId = decoder.decode(hostStorage.read('host_id', 65)).trim()
         const entitlement = hostEntitlement(
-          decoder.decode(hostStorage.read('entitlement.code', MAX_CRAG_HOST_ENTITLEMENT_BYTES + 1)).trim(),
+          candidateEntitlement ??
+            decoder.decode(hostStorage.read('entitlement.code', MAX_CRAG_HOST_ENTITLEMENT_BYTES + 1)).trim(),
           hostId,
           authority.publicKey,
         )
@@ -766,7 +767,8 @@ function subscriptionBinding(
           (verifiedRights.revision !== entitlement.revision || verifiedRights.host_id !== entitlement.host_id)
         )
           fail('license_binding_mismatch')
-        if (!hex(permit.payload_key_id) || permit.payload_key_id !== authority.keyId) fail()
+        if (!hex(permit.payload_key_id)) fail()
+        if (permit.payload_key_id !== authority.keyId) fail('license_payload_key_mismatch')
         unwrapDeviceKey(permit.wrapped_key, ctx.device, ctx.privateKey, authority.keyId)
         if (deviceContext(projectRoot, vm, false).machine_code !== ctx.machine_code) fail('license_binding_mismatch')
         privateStorage.current()
@@ -774,8 +776,10 @@ function subscriptionBinding(
         const timeError = hostTimeError(entitlement)
         if (activate) {
           if (timeError) fail(timeError)
-          writePrivate(privateStorage.dir, 'registration.code', `${slotPermit}\n`, vm, true)
-          privateStorage.sync()
+          if (candidateEntitlement === undefined) {
+            writePrivate(privateStorage.dir, 'registration.code', `${slotPermit}\n`, vm, true)
+            privateStorage.sync()
+          }
         }
         const publicInteger = (value) => (typeof value === 'bigint' ? value.toString() : value)
         return {
@@ -803,10 +807,21 @@ function subscriptionBinding(
   })
 }
 
-export function activateCragSubscriptionBinding(projectRoot, vm, slotPermit, { seat, verifiedRights } = {}) {
+export function activateCragSubscriptionBinding(
+  projectRoot,
+  vm,
+  slotPermit,
+  { seat, verifiedRights, preferInstalled = true, candidateEntitlement } = {},
+) {
   try {
     if (typeof slotPermit !== 'string') fail()
-    return subscriptionBinding(projectRoot, vm, slotPermit.trim(), { activate: true, seat, verifiedRights })
+    return subscriptionBinding(projectRoot, vm, slotPermit.trim(), {
+      activate: true,
+      seat,
+      verifiedRights,
+      candidateEntitlement,
+      authority: slotAuthority(projectRoot, preferInstalled ? vm : undefined),
+    })
   } catch (error) {
     if (error instanceof CragLicenseError) throw error
     fail(error?.code === 'ENOENT' ? 'license_required' : 'license_invalid')
@@ -853,10 +868,10 @@ export function verifyCragUniversal(code, { publicKey, keyId, now = Math.floor(D
       claims.not_before !== claims.issued_at ||
       claims.expires_at <= claims.issued_at ||
       claims.expires_at !== calendarExpiry(claims.issued_at, claims.term) ||
-      !hex(claims.payload_key_id) ||
-      claims.payload_key_id !== keyId
+      !hex(claims.payload_key_id)
     )
       fail()
+    if (claims.payload_key_id !== keyId) fail('license_payload_key_mismatch')
     const aad = Buffer.concat([
       UNIVERSAL_WRAP,
       Buffer.from(claims.license_id),

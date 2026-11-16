@@ -262,7 +262,7 @@ test('fully signed wrong binding and unwrap data never replace S1 or reach the r
     [{}, { devicePublicKey: otherKey }, 'license_invalid'],
     [{}, { aad: 'incorrect binding' }, 'license_invalid'],
     [{}, { payload: crypto.randomBytes(32) }, 'license_invalid'],
-    [{}, { keyId: 'f'.repeat(64) }, 'license_invalid'],
+    [{}, { keyId: 'f'.repeat(64) }, 'license_payload_key_mismatch'],
     [
       { wrapped_key: { ...permit.claims.wrapped_key, ephemeral_public_key: Buffer.alloc(32).toString('base64url') } },
       {},

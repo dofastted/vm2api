@@ -71,7 +71,7 @@ function route(
   body,
   role = 'admin',
   id = 'vm-13',
-  { fetchCragDeviceGrant, origin, cragSubscription } = {},
+  { fetchCragDeviceGrant, origin, cragSubscription, kernelInstallOps } = {},
 ) {
   const result = {}
   const handle = createPanelHandler({
@@ -79,6 +79,7 @@ function route(
     routingConfig: {},
     fetchCragDeviceGrant,
     cragSubscription,
+    kernelInstallOps,
     requireAuth(req) {
       req.panelUser = 'fixture'
       req.panelRole = role
@@ -93,7 +94,8 @@ function route(
     proxyPool: { unbindVm() {} },
   })
   const headers = { host: 'localhost', ...(origin && { origin }) }
-  return handle({ method, headers }, {}, new URL(`http://localhost/api/panel/vms/${id}${suffix}`)).then(() => result)
+  const panelPath = suffix.startsWith('/kernels') ? `/api/panel${suffix}` : `/api/panel/vms/${id}${suffix}`
+  return handle({ method, headers }, {}, new URL(`http://localhost${panelPath}`)).then(() => result)
 }
 
 test('challenge and atomic activation expose only authenticated public status', async (t) => {
@@ -205,6 +207,11 @@ test('device activation uses the installed payload when the download cache selec
   const latest = await route(root, 'GET', '/crag-license')
   assert.equal(latest.body.data.license.valid, true)
   assert.equal(latest.body.data.payload_key_id, installed.payload.key_id)
+  const catalog = await route(root, 'GET', '/kernels')
+  assert.equal(catalog.status, 200)
+  assert.equal(catalog.body.data.licenses[vm.id].valid, true)
+  assert.equal(catalog.body.data.install_licenses[vm.id].code, 'license_payload_key_mismatch')
+  assert.doesNotMatch(JSON.stringify(catalog.body), /CRAGL1|CRAGM1|wrapped_key|private_key/)
   assert.equal(materializeCragV2(root, vm).code, 'license_payload_key_mismatch')
   assert.equal(
     verifyCragV2Tree(path.join(wrapCliHomeDir(root, vm.id), 'crag-v2')).manifest.payload.key_id,
@@ -233,6 +240,10 @@ test('the shared activation field redeems a purchase and binds the selected slot
   const calls = []
   let accepted
   let issuer
+  let reissueKey
+  let machineCode
+  let reissueError = true
+  const replacement = crypto.randomBytes(32)
   let rejectPayload = true
   const cragSubscription = createCragSubscription({
     projectRoot: root,
@@ -244,7 +255,7 @@ test('the shared activation field redeems a purchase and binds the selected slot
       calls.push(action)
       const body = JSON.parse(init.body)
       assert.match(init.headers.authorization, /^Bearer /)
-      assert.equal(body.payload_key_id, installed.payload.key_id)
+      assert.equal(body.payload_key_id, body.reissue ? reissueKey : installed.payload.key_id)
       if (action === 'redeem') {
         assert.equal(body.redemption_code, registration_code)
         assert.equal(body.issuer_public_key_id, issuer)
@@ -254,7 +265,19 @@ test('the shared activation field redeems a purchase and binds the selected slot
       const { code, claims } = accepted
       const data = { entitlement: code, revision: claims.revision, expires_at: claims.expires_at, slot_limit: 1 }
       if (action === 'bind') {
-        const permit = issueSlotPermit(root, body.machine_code, body.host_id, { seat: 1 })
+        if (!reissueKey) assert.equal(Object.hasOwn(body, 'reissue'), false)
+        if (reissueKey && (!body.reissue || reissueError)) {
+          return Response.json({ ok: false, error: { code: 'payload_key_conflict' } }, { status: 409 })
+        }
+        machineCode ??= body.machine_code
+        assert.equal(body.machine_code, machineCode)
+        const permit = issueSlotPermit(
+          root,
+          body.machine_code,
+          body.host_id,
+          { seat: 1 },
+          body.reissue ? { keyId: reissueKey, payload: replacement } : {},
+        )
         Object.assign(data, { seat: 1, slot_permit: permit.code })
       }
       return Response.json({ ok: true, data })
@@ -285,6 +308,62 @@ test('the shared activation field redeems a purchase and binds the selected slot
   assert.equal(getCragLicense(root, vm).license.valid, true)
   assert.deepEqual(calls, ['resolve', 'redeem', 'resolve', 'redeem', 'bind'])
   assert.doesNotMatch(JSON.stringify(activated.body), /CRAGR1|CRAGS1|CRAGH1|wrapped_key/)
+  const replacementPackage = seedEncryptedPackage(root, { payloadKey: replacement })
+  reissueKey = verifyCragV2Tree(replacementPackage).manifest.payload.key_id
+  const snapshot = await route(root, 'GET', '/kernels')
+  assert.equal(snapshot.body.data.licenses[vm.id].scope, 'host', JSON.stringify(snapshot.body.data.licenses[vm.id]))
+  assert.equal(snapshot.body.data.licenses[vm.id].valid, true)
+  assert.equal(snapshot.body.data.install_licenses[vm.id].code, 'license_payload_key_mismatch')
+  assert.deepEqual(calls, ['resolve', 'redeem', 'resolve', 'redeem', 'bind'])
+
+  await assert.rejects(cragSubscription.bind(vm), { code: 'payload_key_conflict' })
+  const payload_tag = 'payload-2026.11.16-crag-3.0.8'
+  let stops = 0
+  const install = (target, origin = 'http://localhost') =>
+    route(
+      root,
+      'POST',
+      '/kernels/install',
+      { targets: [{ id: vm.id, kernel: 'crag', payload_tag, ...target }] },
+      'admin',
+      vm.id,
+      {
+        origin,
+        cragSubscription,
+        kernelInstallOps: {
+          describeKernelCatalog: () => [{ id: 'crag', ready: true, payload_tag }],
+          stopSlot() {
+            assert.equal(getCragLicense(root, vm, { preferInstalled: false }).license.valid, true)
+            stops++
+            return { ok: true }
+          },
+          suspendVmRuntimeRestart: () => ({ ok: true }),
+          initializeSlotSeedFiles() {},
+          startSlotReady: () => ({ ok: true }),
+        },
+      },
+    )
+  const bindCount = () => calls.filter((call) => call === 'bind').length
+  const before = bindCount()
+  assert.equal((await install({})).body.data.items[0].code, 'license_payload_key_mismatch')
+  assert.equal((await install({ reissue: true }, 'http://elsewhere')).status, 403)
+  assert.equal((await install({ reissue: 'true' })).status, 400)
+  assert.equal(
+    (await install({ reissue: true, payload_tag: 'payload-2026.11.15-crag-3.0.5' })).body.data.items[0].code,
+    'crag_payload_changed',
+  )
+  assert.equal(bindCount(), before)
+  const failed = (await install({ reissue: true })).body.data.items[0]
+  assert.equal(failed.code, 'payload_key_conflict')
+  assert.equal(failed.stopped, false)
+  assert.equal(stops, 0)
+  assert.equal(getCragLicense(root, vm).license.valid, true)
+  reissueError = false
+  const installedResult = (await install({ reissue: true })).body.data.items[0]
+  assert.equal(installedResult.restarted, true, JSON.stringify(installedResult))
+  assert.equal(stops, 1)
+  assert.equal(bindCount(), before + 2)
+  assert.equal(getCragLicense(root, vm).license.valid, true)
 })
 
 test('universal CRAGU1 activates without creating a device binding', async (t) => {
@@ -315,6 +394,23 @@ test('universal CRAGU1 activates without creating a device binding', async (t) =
   const expired = issueUniversalCode(root, { issued_at: Math.floor(Date.now() / 1000) - 70 * 86400 })
   assert.throws(() => activateCragLicense(root, vm, expired.code), { code: 'license_expired' })
   assert.deepEqual(fs.readFileSync(path.join(dir, 'registration.code')), stored)
+})
+
+test('offline KVM keeps its installed authorization when the download changes', async (t) => {
+  const { root, vm: record } = fixture(t)
+  const vm = { ...record, runtime_type: 'kvm' }
+  fs.writeFileSync(path.join(root, 'vms', `${vm.id}.json`), JSON.stringify(vm))
+  const grant = issueUniversalCode(root)
+  activateCragLicense(root, vm, grant.code)
+  assert.equal(materializeCragV2(root, vm, { select: false }).ok, true)
+  seedEncryptedPackage(root, { payloadKey: crypto.randomBytes(32) })
+  const { licenses, install_licenses } = (await route(root, 'GET', '/kernels')).body.data
+  assert.equal(licenses[vm.id].valid, true)
+  assert.equal(licenses[vm.id].scope, 'kernel')
+  assert.equal(install_licenses[vm.id].code, 'license_payload_key_mismatch')
+  assert.equal(materializeCragV2(root, vm).code, 'license_payload_key_mismatch')
+  seedEncryptedPackage(root, { revision: 'compatible upgrade' })
+  assert.equal(materializeCragV2(root, vm).ok, true)
 })
 
 for (const [placement, extra] of [
