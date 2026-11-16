@@ -286,8 +286,10 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/crag-subscription/redeem` | 管理员同源登录会话，JSON `{ "redemption_code": "<CRAGR1 宿主码>" }`，无需已有 VM，不自动绑定或启动。没有可信发行包时返回 `409 crag_subscription_host_package_unready`，不核销。新套餐替换额度上限；兑换中断可用 `/crag-subscription/recover` 继续同步。 |
+| POST | `/crag-subscription/redeem` | 管理员同源登录会话，JSON `{ "redemption_code": "<CRAGR1 宿主码>" }`，无需已有 VM，不自动绑定或启动。没有可信发行包时返回 `409 crag_subscription_host_package_unready`，不核销。每张新码从兑换时独立计时，未到期额度相加；兑换中断可用 `/crag-subscription/recover` 继续同步。 |
 | POST | `/vms/:id/crag-license/bind` | 管理员同源登录会话，JSON `{}`。本机和集群 Linux Docker/KVM CRAG 槽从同一池绑定，绑定时才按实际载荷签发逐槽许可；绑定不启动或重启槽位。KVM 来宾使用本地临时目录，集群 Docker 使用只读挂载；都不接收兑换码或宿主鉴权凭据。回读槽授权确认 `license.valid` 与 `license.scope`；尚未加载许可的内核需按正常流程重启。 |
+
+宿主 `expires_at` 是当前签名额度的下一个到期点，不表示全部套餐同时失效。到期后控制面向 Authority 刷新剩余有效额度；刷新不可用时不沿用过期签名。
 
 可选 `runtime` 返回实际运行的 `running_vms`、`ready_vms`、`unknown_vms`、`host_running_vms`、`host_unknown_vms`、`host_runtime_available`、`host_over_limit`、`checked_at` 和逐 VM 明细 `vms`。独立授权计入全局服役但不占宿主额度；未知不视为零。宿主订阅超额或无法核实在额度内时，新的宿主授权推理请求分别返回 `403 license_crag_host_over_quota` 或 `403 license_crag_host_usage_unverified`，不取消在途请求、不代替逐槽许可。
 
