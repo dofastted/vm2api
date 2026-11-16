@@ -12,6 +12,7 @@ import {
   verifyCragHostEntitlement,
 } from './crag-license.mjs'
 import { cragSubscriptionPublicDirectory } from './crag-subscription-paths.mjs'
+import { isValidVmId } from './vm-file.mjs'
 import { cragV2PackageRoot } from './wrap-cli-runtime.mjs'
 import { resolveKernelDataplane } from './slot-engine.mjs'
 
@@ -601,7 +602,7 @@ export function createCragSubscription({
     remove(rosterIntentFile)
   }
 
-  function publishReissuedBinding(vm, slotPermit, seat, { claims, code }) {
+  function publishInstallBinding(vm, slotPermit, seat, { claims, code }) {
     const options = { seat, verifiedRights: claims, preferInstalled: false }
     activateCragSubscriptionBinding(projectRoot, vm, slotPermit, { ...options, candidateEntitlement: code })
     publish(entitlementFile, code, 0o644)
@@ -632,7 +633,8 @@ export function createCragSubscription({
     if (intent.action === 'bind' && Object.hasOwn(intent, 'reissue')) {
       const { vm_id, seat, permit_sha256, payload_key_id, machine_sha256 } = intent.reissue
       if (
-        !isOrderVmId(vm_id) ||
+        typeof vm_id !== 'string' ||
+        !isValidVmId(vm_id) ||
         !safeTime(seat) ||
         seat === 0 ||
         ![permit_sha256, payload_key_id, machine_sha256].every(isDigest)
@@ -647,7 +649,7 @@ export function createCragSubscription({
         if (createHash('sha256').update(machine_code).digest('hex') !== machine_sha256) throw changed()
         const binding = await authority('bind', hostId, credential(hostId), { machine_code, payload_key_id })
         if (binding.seat !== seat || binding.entitlement !== confirmed.code) throw invalidRights()
-        publishReissuedBinding(target, binding.slot_permit, seat, confirmed)
+        publishInstallBinding(target, binding.slot_permit, seat, confirmed)
         clearRosterIntent()
         return confirmed
       }
@@ -679,10 +681,17 @@ export function createCragSubscription({
       throw fail('host_subscription_inactive', 409)
   }
 
-  async function bindTarget(vm, hostId, previous, machineCode, payloadKeyId, { checkTarget, reissueSeat } = {}) {
+  async function bindTarget(
+    vm,
+    hostId,
+    previous,
+    machineCode,
+    payloadKeyId,
+    { checkTarget, reissueSeat, install = false } = {},
+  ) {
     assertActive(previous)
     const reissue = reissueSeat !== undefined
-    const { issuerId } = cragTargetIds(projectRoot, reissue ? undefined : vm)
+    const { issuerId } = cragTargetIds(projectRoot, install ? undefined : vm)
     const roster = previous.claims.version === 2
     if (roster) {
       const intent = { host_id: hostId, action: 'bind' }
@@ -725,14 +734,14 @@ export function createCragSubscription({
     }
     if (!Number.isInteger(data.seat) || data.seat <= 0 || (reissue && data.seat !== reissueSeat)) throw invalidRights()
     if (checkTarget) ({ vm } = await checkTarget())
-    const actual = cragTargetIds(projectRoot, reissue ? undefined : vm)
+    const actual = cragTargetIds(projectRoot, install ? undefined : vm)
     if (actual.payloadKeyId !== payloadKeyId || actual.issuerId !== issuerId)
       throw fail('crag_subscription_target_changed', 409)
-    const options = { seat: data.seat, preferInstalled: !reissue }
+    const options = { seat: data.seat, preferInstalled: !install }
     if (roster) {
-      const confirmed = verifyRights(hostId, data, previous, reissue ? undefined : vm)
-      if (reissue) {
-        const activated = publishReissuedBinding(vm, data.slot_permit, data.seat, confirmed)
+      const confirmed = verifyRights(hostId, data, previous, install ? undefined : vm)
+      if (install) {
+        const activated = publishInstallBinding(vm, data.slot_permit, data.seat, confirmed)
         clearRosterIntent()
         return { seat: data.seat, activated }
       }
@@ -955,24 +964,24 @@ export function createCragSubscription({
         return { seat }
       })
     },
-    reissueForInstall(vm) {
+    authorizeInstall(vm) {
       return exclusive(async () => {
-        if (!isOrderVmId(vm?.id)) throw fail('crag_subscription_target_unready', 409)
+        if (typeof vm?.id !== 'string' || !isValidVmId(vm.id)) throw fail('crag_subscription_target_unready', 409)
         const hostId = identity()
         storage()
         checkNoIntent()
+        const previous = current(hostId)
+        assertActive(previous)
         const { license } = getCragLicense(projectRoot, vm)
         const candidate = getCragLicense(projectRoot, vm, { preferInstalled: false }).license
-        if (!license.valid || license.scope !== 'host' || candidate.code !== 'license_payload_key_mismatch') {
+        if (!['license_required', 'license_payload_key_mismatch'].includes(candidate.code)) {
           throw fail('crag_subscription_target_unready', 409)
         }
-        const previous = current(hostId, vm)
-        assertActive(previous)
-        const { issuerId } = cragTargetIds(projectRoot, vm)
-        const { payloadKeyId, issuerId: targetIssuer } = cragTargetIds(projectRoot)
-        if (targetIssuer !== issuerId) throw fail('issuer_mismatch', 409)
+        const reissueSeat = license.valid && license.scope === 'host' ? license.seat : undefined
+        const { payloadKeyId } = cragTargetIds(projectRoot)
         await bindTarget(vm, hostId, previous, prepareCragSubscriptionBinding(projectRoot, vm), payloadKeyId, {
-          reissueSeat: license.seat,
+          install: true,
+          reissueSeat,
         })
       })
     },
