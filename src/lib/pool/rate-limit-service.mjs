@@ -15,7 +15,7 @@ export const DEFAULT_RATE_LIMIT = Object.freeze({
   fallback_cooldown_min: 30,
   overload_cooldown_min: 10,
   empty_response_cooldown_sec: 60,
-  // Every upstream 429 asks /usage which window (if any) is spent; one ask per account per this many seconds.
+  // Account or model 429s can ask /usage, at most once per account per interval.
   usage_probe_min_interval_sec: 180,
 })
 
@@ -104,13 +104,13 @@ export class RateLimitService {
    * sub2api HandleUpstreamError: writes the hard column for this failure. Returns the block, or null.
    * The classifier decides the scope; a model / Fable / RPM 429 stays a short cooldown.
    * An unknown bare 429 writes no hard block: the scope is unproven.
-   * Every upstream 429 asks the official usage probe (throttled per account)
+   * A 429 not scoped to the request asks the official usage probe (throttled per account)
    * which window is spent: a `rejected` window then keeps the scheduler off the
    * account until its reset, a short limit just passes. Retry-After alone
    * never proves a plan window.
    */
   handleUpstreamError({ accountId, vmId, result = {}, policy = null, now = Date.now() } = {}) {
-    if (!accountId || !this.runtimeRepo || result?.committed) return null
+    if (!accountId || !this.runtimeRepo || result?.committed || policy?.scope === 'request') return null
     const reason = String(policy?.reason || '')
     if (Number(result?.status) === 429) {
       this.requestUsageProbe({ accountId, vmId, now })

@@ -341,6 +341,15 @@ function classifyUpstreamResultRaw(
       retrySameAccount: false,
     }
   }
+  if (result.cragPolicyBlock === true && !result.committed) {
+    return {
+      scope: 'request',
+      action: 'stop',
+      reason: 'crag_policy_blocked',
+      cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
   const handoffCode = result?.body?.error?.code
   if (
     result.nativeHandoff === true &&

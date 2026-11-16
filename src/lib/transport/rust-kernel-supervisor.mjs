@@ -13,7 +13,7 @@ import {
   rustKernelReachable,
   rustKernelBusy,
 } from './rust-kernel-client.mjs'
-import { maxRequestBytes, streamIdleTimeoutMs } from '../core/config.mjs'
+import { maxRequestBytes, readRoutingConfigFile, streamIdleTimeoutMs } from '../core/config.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
 import { resolveWorkstationProfile } from '../identity/workstation-profile.mjs'
 import { cacheTtlFromRouting, normalizeCacheTtl } from '../protocol/cache-ttl.mjs'
@@ -126,7 +126,7 @@ export function wrapSlotCount(vm = {}, routing) {
  * pending idle reload carries a VM snapshot that a live capacity raise can
  * outdate; sizing from it would shrink the kernel back to the old limits.
  */
-export function expectedKernelSlots(exec = {}) {
+function kernelVm(exec) {
   const root = projectRootFromExec(exec)
   const id = exec?.vmId || exec?.vm?.id
   let vm = exec?.vm
@@ -135,7 +135,18 @@ export function expectedKernelSlots(exec = {}) {
       vm = getVm(root, id) || vm
     } catch {}
   }
-  return wrapSlotCount(vm || {})
+  return vm || {}
+}
+
+export function expectedKernelSlots(exec = {}) {
+  return wrapSlotCount(kernelVm(exec))
+}
+
+export function requestedCragSessionSlots(vm, routing, fallback) {
+  const followGlobal =
+    routing?.inference?.session_slots != null &&
+    (vm?.policy?.sessionSlotsOverride ?? vm?.session_slots_override) === false
+  return resolveSessionSlots(followGlobal ? {} : vm, routing ?? fallback)
 }
 
 function startCurrent(control) {
@@ -153,11 +164,17 @@ export function slotContainerName(exec = {}) {
   return vmId ? `kin-${String(vmId).replace(/^vm-/, '')}` : ''
 }
 
-export function syncKernelSlotCount(configPath, expected = WRAP_SLOT_MAX) {
+export function syncKernelSlotCount(configPath, expected = WRAP_SLOT_MAX, requested) {
   const prev = readExistingKernelConfig(configPath)
   if (!prev || typeof prev !== 'object') return false
-  if (Number(prev.slots_per_worker) === expected) return false
+  const sameCount = Number(prev.slots_per_worker) === expected
+  const sessionSlots =
+    prev.runtime_variant === 'crag-v2' && Number.isInteger(prev.session_slots)
+      ? Math.min(!sameCount && Number.isInteger(requested) ? requested : prev.session_slots, expected)
+      : prev.session_slots
+  if (sameCount && prev.session_slots === sessionSlots) return false
   prev.slots_per_worker = expected
+  if (sessionSlots !== undefined) prev.session_slots = sessionSlots
   try {
     fs.writeFileSync(configPath, JSON.stringify(prev, null, 2) + '\n', { mode: 0o600 })
     return true
@@ -192,9 +209,9 @@ export function kernelSlotsDiffer(configPath, health, expected) {
  * count (an older release or a hand edit), only the file is rewritten so a
  * later crash restart reads the right count; that needs no reload.
  */
-export function kernelSlotsConverge(configPath, health, expected) {
+export function kernelSlotsConverge(configPath, health, expected, requested) {
   if (kernelSlotsDiffer(configPath, health, expected)) return true
-  syncKernelSlotCount(configPath, expected)
+  syncKernelSlotCount(configPath, expected, requested)
   return false
 }
 
@@ -913,14 +930,23 @@ async function startRustKernel(
   const existing = await rustKernelHealth(exec, { timeoutMs: healthTimeoutMs })
   if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
   const staleWrap = wrapNewerThanKernel(exec)
-  const expectedSlots = expectedKernelSlots(exec)
+  const currentVm = kernelVm(exec)
+  const expectedSlots = wrapSlotCount(currentVm)
   const slotMismatch = !!paths.configPath && kernelSlotsDiffer(paths.configPath, existing, expectedSlots)
+  let requestedSessionSlots
+  if (slotMismatch && readExistingKernelConfig(paths.configPath)?.runtime_variant === 'crag-v2') {
+    try {
+      requestedSessionSlots = requestedCragSessionSlots(currentVm, readRoutingConfigFile(projectRootFromExec(exec)))
+    } catch (error) {
+      if (error.cause?.code !== 'ENOENT') console.warn('[kernel] could not read routing for CRAG session capacity')
+    }
+  }
   const occupied = rustKernelBusy(existing) || wrapHopInflight(exec) > 0
   const host = slotHost(exec?.vm)
   // A slot-count change is config convergence: never kill live sessions for it.
   // Write the file now and let the idle reload pick it up.
   if (slotMismatch && occupied && !force && !staleWrap && !prepareGuestAppArmor && !allowMissingCredential) {
-    syncKernelSlotCount(paths.configPath, expectedSlots)
+    syncKernelSlotCount(paths.configPath, expectedSlots, requestedSessionSlots)
     requestKernelReloadWhenIdle(exec)
     const reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
     return { ok: true, reason: 'busy', slot_reload: 'pending', health: existing, reconcile }
@@ -945,6 +971,7 @@ async function startRustKernel(
     launchRustKernel(exec, {
       paths,
       expectedSlots,
+      requestedSessionSlots,
       host,
       timeoutMs,
       control,
@@ -966,6 +993,7 @@ async function launchRustKernel(
   {
     paths,
     expectedSlots,
+    requestedSessionSlots,
     host,
     timeoutMs,
     control,
@@ -981,7 +1009,7 @@ async function launchRustKernel(
   },
 ) {
   if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
-  syncKernelSlotCount(paths.configPath, expectedSlots)
+  syncKernelSlotCount(paths.configPath, expectedSlots, requestedSessionSlots)
   try {
     await host.syncRun(exec.vm, path.dirname(paths.runDir))
   } catch (error) {
@@ -1255,10 +1283,7 @@ export function writeKernelConfig(
     ...(!host.native && !isCodexVm(record) ? { telemetry: buildNativeTelemetry(record, projectRoot, routing) } : {}),
   }
   if (dataplane === 'crag' && resolveCragKernelVersion(target, kernelRouting) === 'v2' && !host.native) {
-    const followGlobal =
-      routing?.inference?.session_slots != null &&
-      (target.policy?.sessionSlotsOverride ?? target.session_slots_override) === false
-    config.session_slots = resolveSessionSlots(followGlobal ? {} : target, kernelRouting)
+    config.session_slots = Math.min(requestedCragSessionSlots(target, routing, kernelRouting), config.slots_per_worker)
     config.prewarm_enabled = kernelRouting.inference?.prewarm_enabled === true
     config.crag_kernel_version = 'v2'
     config.runtime_variant = 'crag-v2'

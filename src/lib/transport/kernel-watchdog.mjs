@@ -19,6 +19,7 @@ import {
   ensureRustKernel,
   dataplaneUsesCcNode,
   kernelSlotsConverge,
+  requestedCragSessionSlots,
   wrapSlotCount,
   slotContainerName,
 } from './rust-kernel-supervisor.mjs'
@@ -148,10 +149,11 @@ export function watchdogProbeVm(vm, { relayPaths = clusterRelayPaths, exists = f
   }
 }
 
-function kernelSlotMismatch(exec, health) {
+function kernelSlotMismatch(exec, health, routing) {
   const configPath = rustKernelPaths(exec).configPath
   if (!configPath) return false
-  return kernelSlotsConverge(configPath, health, wrapSlotCount(exec.vm))
+  const requested = routing?.inference ? requestedCragSessionSlots(exec.vm, routing) : undefined
+  return kernelSlotsConverge(configPath, health, wrapSlotCount(exec.vm), requested)
 }
 
 export function createKernelWatchdog({
@@ -314,7 +316,7 @@ export function createKernelWatchdog({
         vmTimeoutTracker?.reset?.(vm.id)
       }
       // Config convergence, not a failure: outside the restart budget.
-      if (kernelSlotMismatch(exec, current)) {
+      if (kernelSlotMismatch(exec, current, routing)) {
         const observed = await observeRuntime(vm)
         if (!held.has(vm.id) && observed?.state === 'running')
           await admit(() => ensure(exec, { timeoutMs: config.timeout_ms }))

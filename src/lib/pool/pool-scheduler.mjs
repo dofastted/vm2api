@@ -352,8 +352,14 @@ function selectionSnapshot(candidates = [], available = [], extras = {}) {
   const waitPool = extras.waitPool || candidates
   const waitReasons = [...new Set((waitPool || []).map((candidate) => candidate.waitReason).filter(Boolean))]
   const soonest = (waitPool || []).map((candidate) => Number(candidate.availableAt) || 0).filter((value) => value > now)
+  const quotaLimited =
+    extras.reason === 'all_accounts_busy' &&
+    waitPool.length > 0 &&
+    waitPool.every(
+      (candidate) => candidate.waitReason === 'account_cooldown' && isQuotaWindowReason(candidate.cooldownReason),
+    )
   return {
-    reason: extras.reason,
+    reason: quotaLimited ? 'pool_rate_limited' : extras.reason,
     wait_ms: extras.waitMs ?? 0,
     soonest_available_ms: soonest.length ? Math.min(...soonest) - now : null,
     wait_reasons: waitReasons,

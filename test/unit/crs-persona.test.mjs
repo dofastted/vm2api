@@ -1870,3 +1870,33 @@ test('official prompt env message stays at a stable position across turns so the
   assert.deepEqual(turn2.messages.slice(0, turn1.messages.length), turn1.messages)
   assert.ok(systems(turn1).length > 0)
 })
+
+test('persona environment respects directive-only turns and extends an existing system turn', () => {
+  const directive = { role: 'system', content: [], output_config: { effort: 'high' } }
+  const caller = { role: 'system', content: 'caller environment' }
+  const user = { role: 'user', content: 'first' }
+  const assistant = { role: 'assistant', content: 'answer' }
+  const render = (messages) =>
+    applyCrsUnofficialPersona(
+      { model: 'claude-opus-5-5', system: 'caller rules', messages },
+      { mode: 'official_prompt', park: false },
+    ).messages
+  const withDirective = render([user, directive, assistant, user])
+  assert.deepEqual(
+    withDirective.map(({ role }) => role),
+    ['user', 'system', 'system', 'assistant', 'user'],
+  )
+  assert.deepEqual(withDirective[1], directive)
+  assert.match(withDirective[2].content, /Environment/)
+  const withCaller = render([user, caller, assistant, user])
+  assert.deepEqual(
+    withCaller.map(({ role }) => role),
+    ['user', 'system', 'assistant', 'user'],
+  )
+  assert.match(withCaller[1].content, /^caller environment\n\n[\s\S]*Environment/)
+  assert.equal(caller.content, 'caller environment')
+  assert.deepEqual(
+    render([user, user]).map(({ role }) => role),
+    ['user', 'user', 'system'],
+  )
+})

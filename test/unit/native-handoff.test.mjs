@@ -6,6 +6,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { createRespond, readBody } from '../../src/lib/http/respond.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { classifyUpstreamResult } from '../../src/lib/pool/upstream-error-policy.mjs'
 import { RateLimitService } from '../../src/lib/pool/rate-limit-service.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { callGoWorker, streamGoWorker } from '../../src/lib/transport/go-worker-client.mjs'
@@ -544,6 +545,38 @@ for (const stream of [false, true]) {
     }
   })
 }
+
+unixTest('CRAG cache policy rejection is returned without replay and without exposing diagnostics', async (t) => {
+  const rejection = { type: 'error', error: { type: 'api_error', message: 'Kernel rejected the request' } }
+  const facts = {
+    type: 'kin_provider_result',
+    schema_version: 2,
+    source: 'crag',
+    provider_complete: false,
+    usage_complete: false,
+    public_status: 502,
+    error: rejection.error,
+    observation: { policy_blocked: true, exception: { code: 'CRAG_CACHE_CONTROL', message: 'private observation' } },
+  }
+  const fx = await fixture(
+    (_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(resultFrame(facts) + frame(rejection))
+    },
+    { capabilities: ['native_handoff_v1', 'provider_result_v2'] },
+  )
+  t.after(() => fx.close())
+  const body = { model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'hello' }] }
+  const result = await streamGoWorker(options(fx, { envelope: { body, headers: {}, stream: true } }))
+  assert.equal(result.terminalState, 'rejected')
+  assert.equal(result.body.error.code, 'crag_policy_blocked')
+  assert.equal(result.body.error.details.retryable, false)
+  assert.doesNotMatch(JSON.stringify(result.body), /private observation/)
+  const policy = classifyUpstreamResult(result)
+  assert.equal(policy.action, 'stop')
+  assert.equal(policy.cooldownUntil, null)
+  assert.equal(policy.scope, 'request')
+})
 
 unixTest('#1139: opaque CRAG 429 returns once without restricting the account', async (t) => {
   const error = { type: 'rate_limit_error', message: 'Error' }
