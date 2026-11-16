@@ -49,6 +49,7 @@ import {
   normalizePersonaExpansion,
   normalizePersonaAgent,
   wrapMandatoryConstraint,
+  insertMidConversationSystem,
 } from '../../src/lib/identity/crs-persona.mjs'
 import { DEFAULT_AGENT_STANDING } from '../../src/lib/identity/persona-template.mjs'
 import { renderOfficial303Guidance } from '../../src/lib/identity/official-profiles.mjs'
@@ -1869,4 +1870,48 @@ test('official prompt env message stays at a stable position across turns so the
   // Everything sent on turn 1 is an unchanged prefix of turn 2.
   assert.deepEqual(turn2.messages.slice(0, turn1.messages.length), turn1.messages)
   assert.ok(systems(turn1).length > 0)
+})
+
+test('mid-conversation system lands before an assistant turn or at the end (#978)', () => {
+  const directive = { role: 'system', content: [], output_config: { effort: 'xhigh' } }
+  const messages = [
+    { role: 'user', content: 'u1' },
+    directive,
+    { role: 'user', content: 'u2' },
+    { role: 'assistant', content: 'a1' },
+    { role: 'user', content: 'u3' },
+  ]
+  const out = insertMidConversationSystem(messages, '# Environment\nx')
+  assert.deepEqual(
+    out.map((m) => m.role),
+    ['user', 'system', 'user', 'system', 'assistant', 'user'],
+  )
+  assert.equal(out[1], directive)
+  assert.equal(out[3].content, '# Environment\nx')
+
+  // Usual shape keeps the historic position right after the first user.
+  const plain = insertMidConversationSystem(
+    [
+      { role: 'user', content: 'u1' },
+      { role: 'assistant', content: 'a1' },
+    ],
+    'env',
+  )
+  assert.deepEqual(
+    plain.map((m) => m.role),
+    ['user', 'system', 'assistant'],
+  )
+
+  // No assistant after the anchor: append at the end.
+  const tail = insertMidConversationSystem(
+    [
+      { role: 'user', content: 'u1' },
+      { role: 'user', content: 'u2' },
+    ],
+    'env',
+  )
+  assert.deepEqual(
+    tail.map((m) => m.role),
+    ['user', 'user', 'system'],
+  )
 })

@@ -1784,13 +1784,25 @@ function firstUserIndex(messages) {
   return messages.findIndex((message) => message?.role === 'user')
 }
 
+/**
+ * Upstream accepts a non-empty role=system only right before an assistant turn
+ * or at the end of the array. Anchor after `userIdx`, but when the next turn is
+ * not an assistant (merged users, directive-only system rows), slide forward to
+ * just before the next assistant, or the end.
+ */
+function systemInsertAt(messages, userIdx) {
+  if (userIdx < 0) return -1
+  const next = messages.findIndex((message, i) => i > userIdx && message?.role === 'assistant')
+  return next < 0 ? messages.length : next
+}
+
 /** 2.1.263 leftover: after the first user, not inside system[]. */
 export function insertMidConversationSystem(messages, text) {
   const t = String(text || '').trim()
   if (!t || !Array.isArray(messages)) return messages
-  const idx = firstUserIndex(messages)
-  if (idx < 0) return messages
-  return [...messages.slice(0, idx + 1), { role: 'system', content: t }, ...messages.slice(idx + 1)]
+  const at = systemInsertAt(messages, firstUserIndex(messages))
+  if (at < 0) return messages
+  return [...messages.slice(0, at), { role: 'system', content: t }, ...messages.slice(at)]
 }
 
 /** Caller text stays in system segment 5. Do not lift it into role=system. */
@@ -2182,9 +2194,9 @@ function applyTemplatePersona(
       // without this injected block, so a tail position shifts every turn and
       // breaks the cache prefix from that point on. Zero templates keep the
       // caller-visible tail placement.
-      const at = zero ? outMessages.findLastIndex((message) => message?.role === 'user') : firstUserIndex(outMessages)
-      if (at >= 0)
-        outMessages = [...outMessages.slice(0, at + 1), { role: 'system', content }, ...outMessages.slice(at + 1)]
+      const user = zero ? outMessages.findLastIndex((message) => message?.role === 'user') : firstUserIndex(outMessages)
+      const at = systemInsertAt(outMessages, user)
+      if (at >= 0) outMessages = [...outMessages.slice(0, at), { role: 'system', content }, ...outMessages.slice(at)]
     }
   }
   if (midSystem) {
