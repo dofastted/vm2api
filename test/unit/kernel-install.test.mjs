@@ -1,5 +1,6 @@
 import test, { after, before } from 'node:test'
 import assert from 'node:assert/strict'
+import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -481,7 +482,7 @@ for (const invalid of [
   })
 }
 
-for (const state of ['unlicensed', 'expired', 'wrong-vm', 'package-tamper']) {
+for (const state of ['unlicensed', 'expired', 'wrong-vm', 'package-tamper', 'different-payload']) {
   test(`paid preflight rejects ${state} before stop and preserves payload, identity and grant bytes`, async (t) => {
     const { root, vm, home } = fixture(t)
     if (state !== 'unlicensed') {
@@ -494,6 +495,7 @@ for (const state of ['unlicensed', 'expired', 'wrong-vm', 'package-tamper']) {
         )
       if (state === 'wrong-vm')
         fs.writeFileSync(codeFile, issueFixtureCode(root, active.machine_code, { vm_id: 'vm-other' }).code)
+      if (state === 'different-payload') seedEncryptedPackage(root, { payloadKey: randomBytes(32) })
       if (state === 'package-tamper') {
         const pkg = path.join(
           root,
@@ -509,8 +511,16 @@ for (const state of ['unlicensed', 'expired', 'wrong-vm', 'package-tamper']) {
     const record = fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`))
     const result = await installKernelTargets({
       projectRoot: root,
-      targets: target(),
+      targets: state === 'different-payload' ? [{ ...target()[0], expected_tag: 'v1.4.104', reissue: true }] : target(),
+      cragSubscription: {
+        reissueForInstall() {
+          assert.fail('a device grant cannot be replaced by a host permit')
+        },
+      },
       ops: {
+        ...(state === 'different-payload' && {
+          describeKernelCatalog: () => [{ id: 'crag', ready: true, release_tag: 'v1.4.104' }],
+        }),
         stopSlot() {
           assert.fail('preflight cannot stop')
         },
@@ -518,6 +528,7 @@ for (const state of ['unlicensed', 'expired', 'wrong-vm', 'package-tamper']) {
     })
     assert.equal(result.ok, false)
     assert.equal(result.items[0].stopped, false)
+    if (state === 'different-payload') assert.equal(result.items[0].code, 'license_payload_key_mismatch')
     assert.equal(fs.readFileSync(path.join(home, '.kin', 'kin-kernel.bin'), 'utf8'), 'previous-kernel')
     assert.deepEqual(fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`)), record)
     if (beforeGrant) assert.deepEqual(fs.readFileSync(codeFile), beforeGrant)

@@ -139,6 +139,12 @@ export function validateKernelTargets(projectRoot, targets) {
     if (target.payload_tag !== undefined && (target.kernel !== 'crag' || !isCragPayloadTag(target.payload_tag))) {
       return { ok: false, status: 400, code: 'kernel_target_invalid', error: 'CRAG 载荷版本无效' }
     }
+    if (
+      target.reissue !== undefined &&
+      (target.reissue !== true || target.kernel !== 'crag' || !(target.payload_tag || target.expected_tag))
+    ) {
+      return { ok: false, status: 400, code: 'kernel_target_invalid', error: '重签必须明确指定 CRAG 安装包版本' }
+    }
     if (ids.has(target.id)) {
       return { ok: false, status: 400, code: 'kernel_target_duplicate', error: '同一虚拟机不能重复选择' }
     }
@@ -158,6 +164,7 @@ export async function installKernelTargets({
   routing = {},
   watchdog,
   poolScheduler,
+  cragSubscription,
   ops = {},
   resumeId = null,
 }) {
@@ -226,11 +233,17 @@ export async function installKernelTargets({
           const changedPayload = (stopped = false) =>
             failure(target, 'crag_payload_changed', 'CRAG 下载版本已变更，请刷新并重新确认安装', stopped)
           if (!matchesPayload(product)) return changedPayload()
+          const licenseCheck = ops.checkCragLicense || checkCragLicense
+          const checkTargetLicense = () => licenseCheck(projectRoot, desired, routing, { preferInstalled: false })
+          let reissue = false
           if (target.kernel === 'crag') {
-            const grant = (ops.checkCragLicense || checkCragLicense)(projectRoot, desired, routing, {
-              preferInstalled: false,
-            })
-            if (!grant.ok) return failure(target, grant.code || 'license_required', grant.error || '请先激活 CRAG 授权')
+            const grant = checkTargetLicense()
+            if (!grant.ok && target.reissue === true && !resumeId && grant.code === 'license_payload_key_mismatch') {
+              const current = licenseCheck(projectRoot, desired, routing)
+              reissue = current.ok && current.license?.scope === 'host' && !!cragSubscription?.reissueForInstall
+            }
+            if (!grant.ok && !reissue)
+              return failure(target, grant.code || 'license_required', grant.error || '请先激活 CRAG 授权')
           }
           phase = 'kernel_operation_persist_failed'
           operationId = resumeId || randomUUID()
@@ -265,6 +278,20 @@ export async function installKernelTargets({
                 `缓存版本已变化，请重新拉取并确认 ${target.expected_tag}`,
               )
             if (!matchesPayload(current)) return changedPayload()
+          }
+          if (reissue) {
+            try {
+              await cragSubscription.reissueForInstall(desired)
+            } catch (error) {
+              const code = error?.code || 'crag_subscription_reissue_failed'
+              const message =
+                code === 'crag_subscription_sync_pending' || code === 'crag_subscription_authority_unavailable'
+                  ? '订阅重签未确认。请先同步宿主订阅状态，再重试重装。'
+                  : `未能为下载包重签本槽许可（${code}）。未停止虚拟机。`
+              return failure(target, code, message)
+            }
+            const grant = checkTargetLicense()
+            if (!grant.ok) return failure(target, grant.code || 'license_required', grant.error || '重签许可校验失败')
           }
           phase = 'kernel_stop_failed'
           const halt = await (ops.stopSlot || stopSlot)(vm)

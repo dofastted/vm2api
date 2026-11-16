@@ -606,7 +606,7 @@ export function wrapCliHomeDir(projectRoot, vmId) {
 }
 
 export function installedCragV2Root(projectRoot, vm) {
-  if (!projectRoot || !isValidVmId(vm?.id) || vm.node_id || isKvmRuntime(vm)) return undefined
+  if (!projectRoot || !isValidVmId(vm?.id) || vm.node_id) return undefined
   const installed = path.join(wrapCliHomeDir(projectRoot, vm.id), CRAG_V2_DIR)
   return fs.lstatSync(installed, { throwIfNoEntry: false }) ? installed : undefined
 }

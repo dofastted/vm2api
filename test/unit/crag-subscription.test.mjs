@@ -6,8 +6,9 @@ import path from 'node:path'
 import test from 'node:test'
 import { createCragSubscription } from '../../src/lib/vm/crag-subscription.mjs'
 import { createCragRuntimeInventory } from '../../src/lib/vm/crag-runtime-inventory.mjs'
-import { checkCragLicense } from '../../src/lib/vm/crag-license.mjs'
+import { checkCragLicense, cragLicenseDirectory, cragTargetIds } from '../../src/lib/vm/crag-license.mjs'
 import { cragSubscriptionPublicDirectory } from '../../src/lib/vm/crag-subscription-paths.mjs'
+import { materializeCragV2 } from '../../src/lib/vm/wrap-cli-runtime.mjs'
 import {
   activateFixture,
   issueHostEntitlement,
@@ -755,6 +756,94 @@ test('runtime quota follows a signed downgrade, unknown observations, and Author
   observations.set(slots[1].id, 'running')
   observedAt += 2100
   assert.equal((await recovered.admitInference({ vm: slots[0] })).body.error.code, 'license_crag_host_over_quota')
+})
+
+test('H2 reissue verifies the new permit before updating the same seat in the local roster', async (t) => {
+  const payload = crypto.randomBytes(32)
+  let confirmed
+  let invalidPermit = true
+  let loseResponse = false
+  let explicitBinds = 0
+  let recoveryBinds = 0
+  const { root, publicDir, connect } = standaloneHost(t, async (url, { body }) => {
+    const { host_id, machine_code, payload_key_id, reissue } = JSON.parse(body)
+    const action = url.split('/').at(-1)
+    if (action === 'status') return Response.json({ ok: true, data: confirmed })
+    if (action === 'bind' && !reissue && loseResponse) {
+      assert.equal(reissue, undefined)
+      assert.equal(payload_key_id, cragTargetIds(root).payloadKeyId)
+      recoveryBinds++
+      return Response.json({ ok: true, data: confirmed })
+    }
+    const revision = (confirmed?.revision ?? 0) + 1
+    const { claims } = issueHostEntitlement(root, host_id, { revision, slot_limit: 1 })
+    const roster = []
+    let slot_permit
+    if (action === 'bind') {
+      if (reissue === true) {
+        explicitBinds++
+        assert.equal(payload_key_id, cragTargetIds(root).payloadKeyId)
+      }
+      const permit = issueSlotPermit(
+        root,
+        machine_code,
+        host_id,
+        { seat: 1 },
+        reissue && !invalidPermit ? { keyId: payload_key_id, payload } : {},
+      )
+      slot_permit = permit.code
+      roster.push({ seat: 1, permit_sha256: crypto.createHash('sha256').update(slot_permit).digest('hex') })
+    }
+    const entitlement = signSubscriptionBytes(root, 'CRAGH2', JSON.stringify({ ...claims, version: 2, roster }))
+    const data = {
+      entitlement,
+      revision,
+      expires_at: claims.expires_at,
+      slot_limit: 1,
+      used_slots: roster.length,
+      available_slots: 1 - roster.length,
+      ...(slot_permit && { seat: 1, slot_permit }),
+    }
+    if (!reissue || !invalidPermit) confirmed = data
+    if (reissue && loseResponse) throw Error('committed response interrupted')
+    return Response.json({ ok: true, data })
+  })
+  seedEncryptedPackage(root)
+  const vm = { id: 'vm-51', dataplane: 'crag', crag_kernel_version: 'v2' }
+  const directory = path.join(root, 'vms', vm.id)
+  fs.mkdirSync(directory, { recursive: true })
+  fs.writeFileSync(path.join(directory, 'machine-id'), crypto.randomBytes(16).toString('hex'))
+  assert.equal(materializeCragV2(root, vm, { select: false }).ok, true)
+  const service = connect({ listTargets: () => [vm], assertReady: () => true })
+  await service.redeem(voucher())
+  assert.deepEqual(await service.bind(vm), { seat: 1 })
+  const entitlement = path.join(publicDir, 'entitlement.code')
+  const registration = path.join(cragLicenseDirectory(root, vm), 'registration.code')
+  const oldRights = fs.readFileSync(entitlement)
+  const oldPermit = fs.readFileSync(registration)
+  seedEncryptedPackage(root, { payloadKey: payload })
+
+  await assert.rejects(service.reissueForInstall(vm), { code: 'license_payload_key_mismatch' })
+  assert.deepEqual(fs.readFileSync(entitlement), oldRights)
+  assert.deepEqual(fs.readFileSync(registration), oldPermit)
+  assert.equal((await service.status()).state, 'sync_pending')
+  await service.recover()
+  assert.equal(explicitBinds, 1, 'refresh does not replay a reissue')
+  assert.equal(checkCragLicense(root, vm).ok, true)
+
+  invalidPermit = false
+  loseResponse = true
+  await assert.rejects(service.reissueForInstall(vm), { code: 'crag_subscription_authority_unavailable' })
+  assert.deepEqual(fs.readFileSync(entitlement), oldRights)
+  assert.deepEqual(fs.readFileSync(registration), oldPermit)
+  await service.recover()
+  assert.equal(explicitBinds, 2)
+  assert.equal(recoveryBinds, 1)
+  const next = checkCragLicense(root, vm, {}, { preferInstalled: false })
+  assert.equal(next.ok, true)
+  assert.equal(next.license.seat, 1)
+  assert.equal((await service.status()).used_slots, 1)
+  assert.equal(checkCragLicense(root, vm).code, 'license_payload_key_mismatch')
 })
 
 test('H2 release requires confirmed teardown and recovers an interrupted cloud response', async (t) => {
