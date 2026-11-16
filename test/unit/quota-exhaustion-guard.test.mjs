@@ -10,6 +10,7 @@ import {
   quotaGuardUsage,
 } from '../../src/lib/pool/pool-scheduler.mjs'
 import { classifyUpstreamResult } from '../../src/lib/pool/upstream-error-policy.mjs'
+import { RateLimitService } from '../../src/lib/pool/rate-limit-service.mjs'
 import { adoptProviderResponseHeaders } from '../../src/lib/pool/failover-runner.mjs'
 
 const HOUR = 3600_000
@@ -186,7 +187,7 @@ test('switch off keeps the old behaviour below a rejected window', async (t) => 
   picked.release()
 })
 
-test('a 429 with a long Retry-After is the account plan window, not a bare 429', () => {
+test('a long Retry-After alone does not prove a plan window; the hop adopts provider headers', () => {
   const now = Date.now()
   const result = adoptProviderResponseHeaders({
     ok: false,
@@ -204,9 +205,59 @@ test('a 429 with a long Retry-After is the account plan window, not a bare 429',
   })
   assert.equal(result.headers['retry-after'], '7547')
   const policy = classifyUpstreamResult(result, { now, model: 'claude-sonnet-test' })
-  assert.equal(policy.reason, 'account_quota_exhausted')
-  assert.equal(policy.scope, 'account')
-  assert.ok(Math.abs(policy.cooldownUntil - (now + 7547_000)) < 1000)
+  assert.equal(policy.reason, 'rate_limited_unknown')
+})
+
+test('every upstream 429 asks the usage probe, at most once per account per 180s', () => {
+  const asked = []
+  const service = new RateLimitService({
+    runtimeRepo: { updateWindow() {}, updateOverload() {} },
+    onUsageProbe: ({ accountId }) => asked.push(accountId),
+  })
+  const r429 = { ok: false, status: 429, headers: {}, body: { error: { type: 'rate_limit_error', message: 'Error' } } }
+  const t0 = 1_000_000
+  for (const reason of ['rate_limited_unknown', 'rpm_limited', 'sonnet_rate_limited', 'rate_limited_request']) {
+    service.handleUpstreamError({
+      accountId: 'a1',
+      vmId: 'vm-01',
+      result: r429,
+      policy: { scope: 'account', reason },
+      now: t0,
+    })
+  }
+  assert.deepEqual(asked, ['a1'])
+  service.handleUpstreamError({
+    accountId: 'a2',
+    vmId: 'vm-02',
+    result: r429,
+    policy: { scope: 'model', reason: 'sonnet_rate_limited' },
+    now: t0,
+  })
+  assert.deepEqual(asked, ['a1', 'a2'])
+  service.handleUpstreamError({
+    accountId: 'a1',
+    vmId: 'vm-01',
+    result: r429,
+    policy: { scope: 'account', reason: 'rate_limited_unknown' },
+    now: t0 + 179_000,
+  })
+  assert.equal(asked.length, 2)
+  service.handleUpstreamError({
+    accountId: 'a1',
+    vmId: 'vm-01',
+    result: r429,
+    policy: { scope: 'account', reason: 'rate_limited_unknown' },
+    now: t0 + 180_000,
+  })
+  assert.deepEqual(asked, ['a1', 'a2', 'a1'])
+  service.handleUpstreamError({
+    accountId: 'a3',
+    vmId: 'vm-03',
+    result: { ok: false, status: 500 },
+    policy: { scope: 'account', reason: 'x' },
+    now: t0,
+  })
+  assert.equal(asked.includes('a3'), false)
 })
 
 test('a short Retry-After 429 stays an unproven bare 429', () => {

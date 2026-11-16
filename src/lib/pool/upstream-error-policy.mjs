@@ -116,9 +116,6 @@ function modelFamilyInMessage(message) {
   return null
 }
 
-/** Retry-After at or past this proves a plan window, not a short rate limit. */
-export const LONG_RETRY_AFTER_MS = 5 * 60_000
-
 const SHORT_WINDOW_MESSAGE = /per[- ]minute|\brpm\b|\btpm\b/i
 const SHORT_WINDOW_HEADERS = [
   'anthropic-ratelimit-requests-remaining',
@@ -652,17 +649,6 @@ function classifyUpstreamResultRaw(
         model: namedFamily === 'fable' ? FABLE_FAMILY_KEY : normalizeModelKey(model),
         cooldownUntil: reset || now + 60_000,
         retrySameAccount: false,
-      }
-    }
-    // A Retry-After this long is no per-minute limit: the account's own 5h /
-    // weekly window is spent ("This request would exceed your account's rate
-    // limit"), even when the unified-* headers did not survive the kernel.
-    if (reset && reset - now >= LONG_RETRY_AFTER_MS) {
-      return {
-        scope: 'account',
-        action: 'continue-and-cooldown',
-        reason: 'account_quota_exhausted',
-        cooldownUntil: reset,
       }
     }
     if (isShortWindowLimit(message, result.headers)) {
