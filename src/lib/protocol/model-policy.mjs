@@ -791,6 +791,7 @@ export function modelDirectiveForCrag(modelId = '') {
     capabilities: {
       thinking_mode: String(caps.thinking_mode || ''),
       supports_adaptive: caps.supports_adaptive === true,
+      requires_adaptive: caps.requires_adaptive === true,
       supports_effort: caps.supports_effort === true,
       supports_context_management: caps.supports_context_management === true,
       supports_1m: caps.supports_1m === true,
@@ -863,10 +864,22 @@ function adaptiveOnlyThinking(thinking) {
   return { type: 'adaptive' }
 }
 
+export function hasForcedToolChoice(body) {
+  return ['tool', 'any'].includes(body?.tool_choice?.type)
+}
+
+export function requiredAdaptiveThinking(body) {
+  if (body.thinking != null && body.thinking.type !== 'disabled') return
+  if (hasForcedToolChoice(body) || getCapabilities(body.model).requires_adaptive !== true) return
+  return adaptiveOnlyThinking(body.thinking)
+}
+
 export function normalizeThinkingByPolicy(body = {}) {
   if (!loaded) loadModelPolicy()
   if (!body || typeof body !== 'object') return body
   if (policy.defaults.normalize_thinking === false) return body
+  const required = requiredAdaptiveThinking(body)
+  if (required) body.thinking = required
   const thinking = body.thinking
   if (!thinking || typeof thinking !== 'object') return body
 
@@ -928,11 +941,17 @@ export function isHaiku55Model(model = '') {
   return /^claude-haiku-5(?:-5|\.5)(?=-|$)/i.test(bare || '')
 }
 
+function haiku55EffortRequiresThinking(body) {
+  const topLevel = String(body.output_config?.effort ?? '')
+    .trim()
+    .toLowerCase()
+  return [topLevel, reasoningEffortOf(body)].some((effort) => effort === 'xhigh' || effort === 'max')
+}
+
 function applyHaiku55Thinking(body) {
   if (!body.thinking || typeof body.thinking !== 'object') return body
   const type = String(body.thinking.type || '').toLowerCase()
-  const effort = String(reasoningEffortOf(body) || '').toLowerCase()
-  const disabledBlocked = type === 'disabled' && (effort === 'xhigh' || effort === 'max')
+  const disabledBlocked = type === 'disabled' && haiku55EffortRequiresThinking(body)
   if (type === 'enabled' || body.thinking.budget_tokens != null || disabledBlocked) {
     body.thinking = adaptiveOnlyThinking(body.thinking)
   }
@@ -1165,7 +1184,7 @@ export function validateToolChoice(body = {}) {
   if (choice.type !== 'none' && tools.length === 0) invalid('tool_choice requires a non-empty tools list.')
   if (choice.type === 'tool' && (!choice.name || !tools.some((tool) => tool?.name === choice.name)))
     invalid('tool_choice.name must identify a supplied tool.')
-  if (!['any', 'tool'].includes(choice.type)) return
+  if (!hasForcedToolChoice(body)) return
   const entry = getModelEntry(body.model)
   if (entry.capabilities?.requires_adaptive === true)
     invalid(
@@ -1174,4 +1193,10 @@ export function validateToolChoice(body = {}) {
     )
   if (['enabled', 'adaptive'].includes(body.thinking?.type))
     invalid('Forced tool_choice cannot be combined with enabled or adaptive thinking.', 'tool_choice_incompatible')
+  if (entry.id === HAIKU_55_ID || isHaiku55Model(body.model)) {
+    if (haiku55EffortRequiresThinking(body))
+      invalid('Forced tool_choice on Haiku 5.5 requires effort of high or lower.', 'tool_choice_incompatible')
+    if (body.thinking?.budget_tokens != null)
+      invalid('Forced tool_choice on Haiku 5.5 cannot include a thinking budget.', 'tool_choice_incompatible')
+  }
 }

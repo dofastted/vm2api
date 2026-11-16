@@ -5,7 +5,10 @@ import { BETA_THINKING_DISPLAY_UPDATES } from './claude-code-betas.mjs'
 import {
   normalizeThinkingByPolicy,
   getCapabilities,
+  getModelEntry,
   getModelParams,
+  hasForcedToolChoice,
+  requiredAdaptiveThinking,
   clampEnabledThinkingBudget,
   MIN_THINKING_BUDGET,
 } from './model-policy.mjs'
@@ -194,25 +197,31 @@ function thinkingNeedsOfficialDisplay(thinking) {
   return display == null || String(display).trim() === ''
 }
 
-function forcedToolChoice(body) {
-  const type = String(body?.tool_choice?.type || '').toLowerCase()
-  return type === 'tool' || type === 'any'
+function supportsAdaptiveDefault(model) {
+  const entry = getModelEntry(model)
+  return entry._heuristic ? modelSupportsAdaptiveThinking(model) : entry.capabilities.supports_adaptive === true
 }
 
 /** Official 2.1.241 unofficial fill: missing thinking → adaptive+omitted; missing display only → omitted. Never overwrite caller display. Forced tool_choice cannot carry adaptive thinking, so a third-party omit stays omitted. */
 export function ensureUnofficialAdaptiveThinking(body = {}) {
   if (!body || typeof body !== 'object') return body
   if (body.thinking == null) {
-    if (!modelSupportsAdaptiveThinking(body.model) || forcedToolChoice(body)) return body
+    if (hasForcedToolChoice(body) || !supportsAdaptiveDefault(body.model)) return body
     return { ...body, thinking: { type: 'adaptive', display: OFFICIAL_THINKING_DISPLAY } }
   }
   if (!thinkingNeedsOfficialDisplay(body.thinking)) return body
   return { ...body, thinking: { ...body.thinking, display: OFFICIAL_THINKING_DISPLAY } }
 }
-/** Official fill: missing thinking becomes adaptive. `cli` uses `updates`; `sdk-cli` uses `omitted`. Caller thinking is left alone. */
+/** Native fill must be explicit because the CLI supplies its own default for omitted thinking. */
 export function ensureOfficialPrintThinking(body = {}, entrypoint = 'sdk-cli') {
-  if (!body || typeof body !== 'object' || body.thinking != null) return body
-  if (!modelSupportsAdaptiveThinking(body.model)) return body
+  if (!body || typeof body !== 'object') return body
+  const required = requiredAdaptiveThinking(body)
+  if (required) return { ...body, thinking: { display: officialThinkingDisplay(entrypoint), ...required } }
+  if (body.thinking != null) return body
+  if (hasForcedToolChoice(body)) {
+    return getCapabilities(body.model).requires_adaptive === true ? body : { ...body, thinking: { type: 'disabled' } }
+  }
+  if (!supportsAdaptiveDefault(body.model)) return body
   return { ...body, thinking: { type: 'adaptive', display: officialThinkingDisplay(entrypoint) } }
 }
 
