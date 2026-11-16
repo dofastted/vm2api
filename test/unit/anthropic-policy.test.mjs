@@ -1068,3 +1068,29 @@ test('already-Claude image blocks and unusable image_url parts pass through', ()
   assert.deepEqual(body.messages[0].content[0], { type: 'image', source })
   assert.deepEqual(body.messages[0].content[1], { type: 'image_url', image_url: {} })
 })
+
+test('scrubUpstreamClientBody renames tool_addition and tool_removal references with their tools', () => {
+  const { body } = scrubUpstreamClientBody({
+    tools: [{ name: 'Read' }, { name: 'Artifact', defer_loading: true }],
+    messages: [
+      { role: 'system', content: [{ type: 'tool_addition', tool: { type: 'tool_reference', name: 'Artifact' } }] },
+      { role: 'system', content: [{ type: 'tool_removal', tool: { type: 'tool_reference', name: 'Artifact' } }] },
+    ],
+  })
+  assert.deepEqual(
+    body.tools.map((tool) => tool.name),
+    ['mcp__Read', 'mcp__Artifact'],
+  )
+  assert.equal(body.messages[0].content[0].tool.name, 'mcp__Artifact')
+  assert.equal(body.messages[1].content[0].tool.name, 'mcp__Artifact')
+  const official = scrubUpstreamClientBody(
+    {
+      tools: [{ name: 'Artifact' }],
+      messages: [
+        { role: 'system', content: [{ type: 'tool_addition', tool: { type: 'tool_reference', name: 'Artifact' } }] },
+      ],
+    },
+    { official: true },
+  ).body
+  assert.equal(official.messages[0].content[0].tool.name, 'Artifact')
+})

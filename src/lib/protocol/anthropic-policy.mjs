@@ -717,6 +717,15 @@ function scrubToolReferenceFields(block, rename) {
     })
     return changed ? { block: { ...block, content }, changed: true } : { block, changed: false }
   }
+  if (
+    (block.type === 'tool_addition' || block.type === 'tool_removal') &&
+    block.tool?.type === 'tool_reference' &&
+    typeof block.tool.name === 'string'
+  ) {
+    const name = rename(block.tool.name)
+    if (name === block.tool.name) return { block, changed: false }
+    return { block: { ...block, tool: { ...block.tool, name } }, changed: true }
+  }
   if (block.type === 'tool_search_tool_result' && Array.isArray(block.tool_references)) {
     let changed = false
     const tool_references = block.tool_references.map((ref) => {
