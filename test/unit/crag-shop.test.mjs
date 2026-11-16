@@ -499,7 +499,7 @@ test('pinned fulfillment survives lost redeem and H2 bind replies without reappl
   const source = path.join(root, 'host-machine-id')
   fs.writeFileSync(source, randomBytes(16).toString('hex'), { mode: 0o600 })
   seedEncryptedPackage(root)
-  const slots = ['vm-ready', 'vm-other', 'vm-stopped'].map((id) => ({
+  const slots = ['legacy-local_ready', 'vm-other', 'vm-stopped'].map((id) => ({
     id,
     dataplane: 'crag',
     crag_kernel_version: 'v2',
@@ -638,6 +638,10 @@ test('pinned fulfillment survives lost redeem and H2 bind replies without reappl
   assert.deepEqual((await call(PERSON, 'GET', '/activation-targets')).data.targets, [])
   const input = { ...INPUT, activation_target: { vm_id: slots[0].id } }
   assert.equal((await call(PERSON, 'POST', '/orders', input)).http, 403)
+  for (const vm_id of ['active', '../legacy-local_ready', 'a'.repeat(132)]) {
+    const rejected = await call(OTHER, 'POST', '/orders', { ...input, activation_target: { vm_id } })
+    assert.equal(rejected.error.code, 'shop_invalid_request')
+  }
   assert.equal(
     (await call(OTHER, 'POST', '/orders', { ...input, activation_target: { vm_id: slots[2].id } })).error.code,
     'shop_activation_target_unavailable',
