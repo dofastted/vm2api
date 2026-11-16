@@ -1,5 +1,5 @@
 import { useEffect, useId, useState } from 'react'
-import { api, isApiError } from '@/lib/api'
+import { api, cragDeviceApi, isApiError } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { yuan, type CommerceRules, type CragPlan as Plan } from './crag-catalog'
@@ -34,6 +34,10 @@ function count(value: string, min: number, max: number) {
 export function quoteProblem(error: unknown) {
   if (!isApiError(error)) return '暂时无法确认报价，请重试。'
   const code = error.code ?? ''
+  if (code === 'shop_device_unavailable')
+    return '无法验证本机宿主设备，请联系管理员检查设备配置。'
+  if (code === 'shop_device_checkout_required')
+    return '请允许浏览器 Cookie，刷新设备购买页后重试。'
   if (code.includes('coupon'))
     return '优惠码不可用、次数已用完，或优惠后金额低于 ¥0.01。'
   if (/stock|sold_out|inventory/.test(code)) return '此档首批名额已售罄。'
@@ -55,6 +59,7 @@ export function CragCommerce({
   initialQuoteKey,
   catalogKey,
   customTitle,
+  device = false,
   onOrder,
 }: {
   rules: CommerceRules
@@ -67,6 +72,7 @@ export function CragCommerce({
   initialQuoteKey: number
   catalogKey?: string
   customTitle?: string
+  device?: boolean
   onOrder: (selection: CommerceSelection, price: number) => void
 }) {
   const id = useId()
@@ -116,7 +122,8 @@ export function CragCommerce({
     if (!canQuote) return
     const controller = new AbortController()
     const timer = window.setTimeout(() => {
-      void api<Quote>('/api/panel/crag-shop/quote', {
+      const quoteRequest = device ? cragDeviceApi<Quote> : api<Quote>
+      void quoteRequest(device ? '/quote' : '/api/panel/crag-shop/quote', {
         method: 'POST',
         body,
         signal: controller.signal,
@@ -149,7 +156,7 @@ export function CragCommerce({
       window.clearTimeout(timer)
       controller.abort()
     }
-  }, [body, canQuote, key, rules.max_amount_minor, sku])
+  }, [body, canQuote, device, key, rules.max_amount_minor, sku])
 
   const selectionUnavailable =
     !available && (sku !== 'custom' || !customEnabled)

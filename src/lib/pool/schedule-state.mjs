@@ -88,12 +88,12 @@ const RESTRICTED_NEW_SESSION = [
  * request waits, and local transport errors.
  */
 const STATELESS = [
-  /^(distill_blocked|policy_blocked|refusal_guard|hard_regex.*|jev.*|decision_model.*)$/,
+  /^(distill_blocked|policy_blocked|crag_policy_blocked|crag_opaque_429|refusal_guard|hard_regex.*|jev.*|decision_model.*)$/,
   /^(content_filter_refusal|content_policy_refusal|usage_policy_refusal|invalid_request|entitlement_required|http_\d+)$/,
   /_repairable$/,
   /^(concurrency_limit|concurrency_disabled|rpm_limit|slot_busy|quota_band_inflight|refresh_pending)$/,
   /^(model_cooldown|fable_cooldown|fable_concurrency|fable_timeout|fable_plan_denied|fable_rate_limited|fable_requires_max|model_not_allowed|platform_mismatch|codex_vm)$/,
-  /^(quota_guard_request_too_large|no_eligible_accounts|pool_overload_cooldown|pool_rate_limited|vm_unschedulable)$/,
+  /^(quota_guard_request_too_large|no_eligible_accounts|pool_overload_cooldown|pool_rate_limited|rate_limited_request|vm_unschedulable)$/,
   /^(wrap_connection_error|worker_transport_failure|worker_timeout|worker_process_exit|upstream_network_error|stream_interrupted|empty_response|incomplete_assistant|downstream_committed_or_incomplete|provider_timeout|client_cancelled|oauth_unconfirmed)$/,
   // Seat placement labels (why this VM was picked), not a slot condition.
   /^sticky$/,

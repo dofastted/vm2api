@@ -45,7 +45,12 @@ const text = (value) => typeof value === 'string' && value.length > 0 && value.l
 // Cache package authority only. Registration bytes, binding and UTC validity are
 // deliberately verified afresh on every admission, including after cache hits.
 const packageTrustCache = new Map()
-const MAX_TRUST_ROOTS = 8
+// One entry per installed slot package plus the shared download root. The
+// kernel watchdog admits every slot each tick in a fixed order, so a bound below
+// the slot count turns the LRU into a miss on every admission and re-hashes each
+// full package (hundreds of MB, synchronously) every tick. Entries hold only a
+// public key and ids, so keep the bound well above any realistic host.
+const MAX_TRUST_ROOTS = 512
 const redeemingSlots = new Set()
 const DEVICE_ACTIVATION_URL = 'https://crag.fkcodex.com/v1/device-activation'
 
@@ -909,6 +914,25 @@ export function readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId) {
   return sha(registration)
 }
 
+// Only call after the new Authority roster has revoked this exact permit.
+export function removeReclaimedCragPermit(projectRoot, vm, digest) {
+  try {
+    return subscriptionStorage(cragLicenseDirectory(projectRoot, vm), vm, (storage) => {
+      const registration = new TextDecoder('utf-8', { fatal: true })
+        .decode(storage.read('registration.code', 65536))
+        .trim()
+      if (!selectsSubscription(registration) || sha(registration) !== digest) return false
+      storage.current()
+      fs.unlinkSync(`${storage.dir}/registration.code`)
+      storage.sync()
+      return true
+    })
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false
+    throw error
+  }
+}
+
 export function readCragSubscriptionFiles(projectRoot, vm) {
   const permit = storedRegistration(cragLicenseDirectory(projectRoot, vm))
   return selectsSubscription(permit) ? subscriptionBinding(projectRoot, vm, permit, { exportFiles: true }) : null
@@ -1172,16 +1196,20 @@ export function getCragLicense(projectRoot, vm, { initialize = false, preferInst
       const grant = sharedUniversalLicense(projectRoot, authority)
       if (grant) return withMachineCode(projectRoot, vm, grant, initialize)
     }
-    if (!stored && isKvmRuntime(vm) && vm.node_id)
-      return { license: publicFailure(vm, { code: 'ENOENT' }), machine_code: '' }
-    const hostOnly = !stored && isKvmRuntime(vm)
-    if (hostOnly) {
-      subscriptionSlot(vm)
-      if (initialize) prepareCragSubscriptionBinding(projectRoot, vm)
+    if (!stored) {
+      const target = authority()
+      const absent = { license: publicFailure(vm, { code: 'ENOENT' }), machine_code: '' }
+      if (vm.node_id) return absent
+      if (isKvmRuntime(vm)) {
+        return initialize
+          ? { ...absent, ...machineExport(prepareCragSubscriptionBinding(projectRoot, vm), target.keyId) }
+          : absent
+      }
+      if (!initialize && !fs.existsSync(path.join(projectRoot, 'vms', vm.id, 'machine-id'))) return absent
+      ctx = deviceContext(projectRoot, vm, initialize)
+      return { ...absent, ...machineExport(ctx.machine_code, target.keyId) }
     }
-    ctx = deviceContext(projectRoot, vm, initialize, hostOnly)
-    if (!stored)
-      return { license: publicFailure(vm, { code: 'ENOENT' }), ...machineExport(ctx.machine_code, authority().keyId) }
+    ctx = deviceContext(projectRoot, vm, initialize)
     const target = authority()
     return {
       license: verifyCragRegistration(stored, { ...ctx, ...target }),
@@ -1198,6 +1226,10 @@ export function activateCragLicense(projectRoot, vm, code) {
     if (trimmed.startsWith('CRAGU1.')) {
       const license = verifyCragUniversal(trimmed, trust(projectRoot))
       if (!license.valid) fail(license.code)
+      // Activation must agree with the next status read before publishing the
+      // installation-wide grant or replacing any slot registration.
+      const targetLicense = verifyCragUniversal(trimmed, slotAuthority(projectRoot, vm))
+      if (!targetLicense.valid) fail(targetLicense.code)
       const dir = cragUniversalDirectory(projectRoot)
       checkDirectory(dir, true, { id: 'crag-universal' })
       writePrivate(dir, 'registration.code', `${trimmed}\n`, { id: 'crag-universal' }, true)

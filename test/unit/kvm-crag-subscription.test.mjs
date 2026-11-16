@@ -225,6 +225,26 @@ linuxTest('one VM publication queue does not block a different VM on the same ho
   assert.equal(await first, true)
 })
 
+linuxTest('a slow guest rejects excess queued publications and accepts new work after draining', async (t) => {
+  const { root, vm } = fixture(t)
+  const entered = deferred()
+  const resume = deferred()
+  t.after(resume.resolve)
+  const fake = runner({
+    onAction: async () => {
+      entered.resolve()
+      await resume.promise
+    },
+  })
+  const pending = Array.from({ length: 16 }, () => publishKvmCragSubscription(root, vm, fake))
+  await entered.promise
+  await assert.rejects(publishKvmCragSubscription(root, vm, fake), { code: 'crag_subscription_projection_busy' })
+  assert.deepEqual(fake.actions(), ['publish'])
+  resume.resolve()
+  assert.equal((await Promise.all(pending)).every(Boolean), true)
+  assert.equal(await publishKvmCragSubscription(root, vm, fake), true)
+})
+
 linuxTest('publication holds are normalized, nested and released once before any private reads', async (t) => {
   const { root, vm, registration } = fixture(t)
   fs.writeFileSync(registration, 'CRAGS1.invalid')

@@ -65,6 +65,7 @@ usage() {
   install              安装到 ${INSTALL_DIR}（默认，amd64 自动获取最新正式版 CRAG）
   upgrade | update     升到最新 GitHub Release 并更新 CRAG（保留 .env / vms / data）
   crag-update          独立更新 CRAG V2 包及全部既有 CRAG 副本，不切换槽位内核
+  prepare-native       仅准备 Docker CRAG 的宿主 AppArmor userns 权限
   check                对比当前版本与最新 Release，打印 changelog
   changelog            打印本地 CHANGELOG.md
   status               当前版本、容器、探活
@@ -182,7 +183,24 @@ require_cmds() {
     err "Docker 未运行，或当前用户不能访问 docker.sock"
     exit 1
   fi
+  local server
+  server="$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)"
+  if ! docker_version_ok "$server"; then
+    err "Docker Engine ${server:-未知} 过旧：需要 ${MIN_DOCKER_VERSION} 或更新（多架构镜像与 --platform）"
+    info "升级参见 https://docs.docker.com/engine/install/"
+    exit 1
+  fi
   compose version >/dev/null
+}
+
+MIN_DOCKER_VERSION=20.10
+# 只比较主次版本；无法解析的版本号视为不满足。
+docker_version_ok() {
+  local major minor
+  major="$(printf '%s' "$1" | cut -d. -f1)"
+  minor="$(printf '%s' "$1" | cut -d. -f2)"
+  case "$major$minor" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$major" -gt 20 ] || { [ "$major" -eq 20 ] && [ "$minor" -ge 10 ]; }
 }
 
 github_api() {
@@ -664,6 +682,34 @@ fresh_clone() {
   chmod 755 bin/kin-* 2>/dev/null || true
 }
 
+# Run on the Docker host, not inside the control-plane container. Ubuntu's
+# userns policy restricts even apparmor=unconfined unless a named profile grants it.
+prepare_docker_crag_apparmor() {
+  local root="${1:-/}" enabled restricted directory profile candidate marker
+  enabled="${root%/}/sys/module/apparmor/parameters/enabled"
+  restricted="${root%/}/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
+  [ -f "$enabled" ] && [ "$(cat "$enabled")" = Y ] || return 0
+  [ -f "$restricted" ] && [ "$(cat "$restricted")" = 1 ] || return 0
+  command -v apparmor_parser >/dev/null || { err "安装 apparmor 后重试：缺少 apparmor_parser"; return 1; }
+  directory="${root%/}/etc/apparmor.d"
+  profile="$directory/vm2api-crag-docker"
+  marker='# Managed by vm2api Docker native userns preparation.'
+  [ -f "$directory/abi/4.0" ] || { err "CRAG userns 需要 AppArmor ABI 4.0"; return 1; }
+  if [ -L "$profile" ] || { [ -e "$profile" ] && { [ ! -f "$profile" ] || [ "$(head -n 1 "$profile")" != "$marker" ]; }; }; then
+    err "拒绝覆盖非 vm2api 管理的 AppArmor profile: $profile"
+    return 1
+  fi
+  candidate="$(mktemp "$directory/.vm2api-crag-docker.XXXXXX")" || return 1
+  printf '%s\n' "$marker" 'abi <abi/4.0>,' 'profile vm2api-crag-docker flags=(unconfined) {' '  userns,' '}' > "$candidate"
+  chmod 644 "$candidate"
+  # Fail before replacing persistent policy if parsing or loading is denied.
+  # On failure retain the candidate for diagnosis; never disable the host sysctl.
+  apparmor_parser -Q -K "$candidate" || { err "AppArmor profile 检查失败: $candidate"; return 1; }
+  apparmor_parser -r -K "$candidate" || { err "AppArmor profile 加载失败: $candidate"; return 1; }
+  mv -f "$candidate" "$profile" || return 1
+  ok "Docker CRAG userns profile 已加载并保存: $profile"
+}
+
 start_stack() {
   local mode auto_sync_wrap log
   mode="$(install_mode)"
@@ -671,6 +717,7 @@ start_stack() {
     warn "--no-start：跳过 compose up"
     return
   fi
+  prepare_docker_crag_apparmor || return 1
   cd "${INSTALL_DIR}"
   auto_sync_wrap="${KIN_AUTO_SYNC_WRAP:-0}"
   if [ "$mode" = image ]; then
@@ -912,6 +959,11 @@ cmd_status() {
   else
     echo "探活:    down"
   fi
+  if [ "$(arch_of "$(uname -m)" || true)" = arm64 ] && [ -f "${INSTALL_DIR}/deploy/prepare-arm64.py" ] \
+    && command -v python3 >/dev/null 2>&1; then
+    echo "ARM64 主机检测:"
+    python3 "${INSTALL_DIR}/deploy/prepare-arm64.py" --check 2>&1 | sed 's/^/  /' || true
+  fi
 }
 
 cmd_uninstall() {
@@ -935,7 +987,7 @@ cmd_uninstall() {
 COMMAND="install"
 while [ $# -gt 0 ]; do
   case "$1" in
-    install|upgrade|update|crag-update|check|changelog|status|uninstall)
+    install|upgrade|update|crag-update|prepare-native|check|changelog|status|uninstall)
       COMMAND="$1"
       shift
       ;;
@@ -1000,6 +1052,7 @@ case "$COMMAND" in
   install) cmd_install ;;
   upgrade|update) cmd_upgrade ;;
   crag-update) cmd_update_crag ;;
+  prepare-native) need_root; prepare_docker_crag_apparmor ;;
   check) cmd_check ;;
   changelog) cmd_changelog ;;
   status) cmd_status ;;

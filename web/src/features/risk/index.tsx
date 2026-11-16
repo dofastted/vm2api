@@ -35,6 +35,7 @@ import {
   jevInterceptQueryOptions,
   refusalGuardsQueryOptions,
   riskFeedQueryOptions,
+  upstream400QueryOptions,
 } from './queries'
 import { RefusalSettings } from './refusal-settings'
 
@@ -63,6 +64,7 @@ export function RiskAuditPage() {
 
   const stats = useQuery(gateStatsQueryOptions())
   const feed = useQuery(riskFeedQueryOptions(stats.data?.since))
+  const upstream400 = useQuery(upstream400QueryOptions(stats.data?.since))
   const distill = useQuery(distillQueryOptions())
   const jev = useQuery(jevInterceptQueryOptions())
   const refusal = useQuery(refusalGuardsQueryOptions())
@@ -105,7 +107,9 @@ export function RiskAuditPage() {
   const passes = stats.data?.passes || []
   const rows = feed.data?.rows || []
   const blockedRows = rows.filter((row) => feedKindOf(row) !== 'upstream')
-  const upstreamRows = rows.filter((row) => feedKindOf(row) === 'upstream')
+  const upstreamRows = rows.filter(
+    (row) => feedKindOf(row) === 'upstream' && row.upstreamStatus !== 400
+  )
   const open = (row: UsageLogRow) => setDetail({ row })
   const stage = STAGES.find((s) => s.id === view)
   const feedProps = {
@@ -117,18 +121,26 @@ export function RiskAuditPage() {
   return (
     <PageHeader
       title={VIEW_TITLES.risk}
-      description='入站请求在出站前依次过四道关。拦下的请求不占凭证、不出站；放行的才 hop 上游。'
+      description='出站前先查封禁和硬规则，再由 Jev 判定常规放行、降级放行或拒绝。上游拒答回填到前置缓存。'
       extra={
         <Button
           variant='outline'
           size='sm'
           className='cursor-pointer'
-          disabled={stats.isFetching || feed.isFetching}
+          disabled={
+            stats.isFetching || feed.isFetching || upstream400.isFetching
+          }
           onClick={() => {
             void qc.invalidateQueries({
               queryKey: gateStatsQueryOptions().queryKey,
             })
             void qc.invalidateQueries({ queryKey: ['panel', 'risk-feed'] })
+            void qc.invalidateQueries({
+              queryKey: ['panel', 'risk-upstream-400'],
+            })
+            void qc.invalidateQueries({
+              queryKey: refusalGuardsQueryOptions().queryKey,
+            })
           }}
         >
           <RefreshCw
@@ -188,6 +200,37 @@ export function RiskAuditPage() {
                 rows={passes}
                 total={(stats.data?.passed ?? 0) || 0}
               />
+            </Panel>
+            <Panel
+              title='降级放行'
+              hint='按实际发起上游请求的路线计数，不含无法调度的请求。'
+            >
+              {stats.data?.routes?.length ? (
+                <ul className='divide-y'>
+                  {stats.data.routes.map((route) => (
+                    <li
+                      key={`${route.kind}:${route.target}`}
+                      className='flex items-baseline justify-between gap-3 px-4 py-2 text-sm'
+                    >
+                      <span className='min-w-0 break-all'>
+                        {route.kind === 'pool'
+                          ? '账号池'
+                          : route.kind === 'endpoint'
+                            ? 'API 渠道'
+                            : '模型'}{' '}
+                        · <code className='text-xs'>{route.target}</code>
+                      </span>
+                      <span className='shrink-0 tabular-nums'>
+                        {route.count} 次
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className='px-4 py-6 text-sm text-muted-foreground'>
+                  今天暂无降级出站。
+                </p>
+              )}
             </Panel>
             <Panel
               title='上游拒答'
@@ -288,13 +331,35 @@ export function RiskAuditPage() {
           </div>
         )}
 
+        {view === 'all' || view === 'pass' ? (
+          <Panel
+            title='上游 HTTP 400'
+            hint='仅实际上游返回的 400；参数错误不是违规，不触发封禁。点开可查对应日志。'
+          >
+            <div className='max-h-[34rem] overflow-y-auto'>
+              <RiskFeed
+                rows={upstream400.data?.logs || []}
+                loading={upstream400.isLoading || stats.isLoading}
+                error={upstream400.error || stats.error}
+                empty='今天没有上游 HTTP 400。'
+                showKind
+                onOpen={open}
+              />
+            </div>
+            <FeedNote
+              shown={upstream400.data?.logs.length || 0}
+              more={!!upstream400.data?.hasMore}
+            />
+          </Panel>
+        ) : null}
+
         {stage ? (
           <div id='risk-settings' className='scroll-mt-4'>
             <Panel
               title='设置'
               hint={
                 stage.id === 'refusal'
-                  ? '改动立即生效。'
+                  ? '开关立即生效；封禁阶梯、工具和降级目标需保存。'
                   : '改完在底部保存条里保存。'
               }
             >
@@ -306,7 +371,15 @@ export function RiskAuditPage() {
                   onDirtyChange={onDirtyChange}
                 />
               ) : stage.id === 'refusal' ? (
-                <RefusalSettings />
+                <RefusalSettings
+                  onDirtyChange={onDirtyChange}
+                  onOpen={(row) =>
+                    setDetail({
+                      row,
+                      tab: row.logMode === 'debug' ? 'raw' : 'summary',
+                    })
+                  }
+                />
               ) : (
                 <ModelSettings onDirtyChange={onDirtyChange} />
               )}

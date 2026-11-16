@@ -90,10 +90,10 @@
 | GET/PUT | `/vms/:id/seed-settings` | 播种；面板默认锁定，解锁后改、播种前确认。`settings.json` 可编辑 env（经 `extra_env`）与 `theme`；`autoUpdates`/`grove_enabled` 与 TZ/LANG/LC_ALL、telemetry/bedrock/vertex 等契约 env 只读展示，TZ/LANG 经 PUT `timezone` / `timezone_follow_proxy` / `locale` 写入槽位后再播种，不经 `extra_env`；`claude_setting` 可编辑。`GET ?debug=1` 额外返回 `telemetry_log`（最近 40 行脱敏上传审计，默认不带） |
 | POST | `/vms/:id/collect-identity` | guest 采集（locale/tz/`guest_machine_id`、槽内 `/etc/os-release` 的 `VERSION_ID`、系统与架构）；Codex Analytics 只使用这次采集的运行环境 |
 | POST | `/vms/:id/reload` | 重载该槽 worker |
-| GET | `/kernels` | 仅 admin/master。返回两种产品 `kernels`（`cli-node` 默认免费、`crag` 签名加密 V2）、本地包的就绪状态、按 VM 的公开 `licenses` 与 `installations`。`install_licenses` 单独报告当前下载包的授权结果。CRAG 的 `release_options` 提供 3.1.2 标准版和 3.1.2 旧授权兼容版的完整发行标签，`payload_tag` 标识已下载或已安装的实际包（仅在可识别时返回）。不初始化身份、不签发许可，不返回机器码、注册码或私钥 |
-| GET | `/kernels/releases` | 返回近期具备完整附件的公开版本。`cli-node` 使用应用标签 `vX.Y.Z`，`crag` 使用完整载荷标签，同版本不同载荷分别列出 |
-| POST | `/kernels/pull` | `{ kernel: "cli-node" \| "crag", tag?: string }`。只更新安装包缓存，不安装、不停 VM。cli-node 接受 `vX.Y.Z`；CRAG 另接受完整 `payload-YYYY.MM.DD-crag-X.Y.Z[-legacy]` 标签。省略 `tag` 拉取最新，CRAG 默认和普通版本号不匹配 `-legacy`。返回 `release.payload_tag`；已固定的 CRAG 包另校验归档 SHA-256，拉取失败保留当前包 |
-| POST | `/kernels/install` | `{ targets: [{ id, kernel: "cli-node" \| "crag", expected_tag?, payload_tag?, reissue? }] }`。`expected_tag` 是确认时的 `vX.Y.Z`，`payload_tag` 是 CRAG 完整载荷标签；缓存不符时拒绝重装。同源管理员可在确认指定 CRAG 版本时提交 `reissue: true`，授权本机和集群 Linux Docker/KVM 槽在缺少许可或载荷不匹配时使用已激活的宿主订阅。向 Authority `/bind` 请求指定下载包的许可，有有效的同槽宿主许可才带 `reissue: true`，否则普通绑定，可能占用一个剩余名额。许可在停机前校验；恢复不发送重签标记。匹配的离线许可继续按原规则使用。重启健康检查通过后恢复调度，逐槽报告实际 `version` / `payload_tag` |
+| GET | `/kernels` | 仅 admin/master。返回两种产品 `kernels`（`cli-node` 默认免费、`crag` 签名加密 V2）、本地包的就绪状态、按 VM 的公开 `licenses` 与 `installations`。`install_licenses` 单独报告当前下载包的授权结果。CRAG 的 `release_options` 提供标准发行标签；`payload_tag` 标识可识别的已下载或已安装包。不初始化身份、不签发许可，不返回机器码、注册码或私钥 |
+| GET | `/kernels/releases` | 返回近期具备完整附件的公开版本。`cli-node` 使用应用标签 `vX.Y.Z`，`crag` 使用完整载荷标签，不列出 `-legacy` |
+| POST | `/kernels/pull` | `{ kernel: "cli-node" \| "crag", tag?: string }`。只更新安装包缓存，不安装、不停 VM。cli-node 接受 `vX.Y.Z`；CRAG 另接受完整 `payload-YYYY.MM.DD-crag-X.Y.Z[-legacy]` 标签。省略 `tag` 拉取最新，CRAG 默认和普通版本号不匹配 `-legacy`。返回 `release.payload_tag`；CRAG 校验受信归档摘要，已固定的发行另校验 manifest 摘要。拉取失败保留当前包 |
+| POST | `/kernels/install` | `{ targets: [{ id, kernel: "cli-node" \| "crag", expected_tag?, payload_tag? }] }`。缓存不符时拒绝重装。同一载荷密钥沿用已有许可；同源管理员会话确认指定发行时，后端可为缺少许可的槽自动绑定现有宿主订阅。密钥不符返回 `crag_subscription_migration_required`，不重签、不停槽。逐槽返回安装结果；本地已运行 CRAG 在可验证回滚成功时返回 `rolled_back: true`，集群槽不承诺自动回滚 |
 | GET | `/wrap-cli` | kernel / wrap 样本 inspect：`ok, dir, kernel_bin, glibc_shim, wrapper, meta, kernel`。`kernel.source` 为 `configured`（仓内 `KIN_KERNEL_BIN` / `bin/kin-kernel`）或 `sample` |
 | POST | `/wrap-cli/make` | `{ glibc_vm? }` 重整 share/wrap-cli；叠上仓内最新 kernel；可从指定槽拷 glibc shim |
 | POST | `/wrap-cli/kernel` | 原始 `application/octet-stream` linux amd64 ELF。替换仓内 `bin/kin-kernel` 与 `share/wrap-cli/kin-kernel.bin`。不自动同步槽位 |
@@ -257,9 +257,11 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 
 支付接口边界、`v1.4.104` 实付验收和复跑步骤见 [CRAG 支付与鉴权验收](crag-payment-acceptance.md)。
 
-仅 `GET /crag-shop/plans` 可匿名读取公开套餐，无需 CRAG Auth 或面板凭据。试点目录仅供有效的面板买家会话；试点凭据文件不可用时仍可读取公开目录。`payment_methods: []` 表示当前未开放收款，不表示套餐读取失败。
+有两种购买入口：登录后在「订阅 CRAG」查看本人订单，或从登录页进入「免登录购买 CRAG 订阅」（`/cc#/crag-purchase`）购买到当前宿主机。两个入口的订单分别在各自页面的「查看订单」中显示。
 
-其余接口只接受实际面板登录会话，不接受 Master 或托管 API 密钥。升级前发出的旧会话需要重新登录一次。管理员也只能访问自己的订单；不存在和不属于本人的订单均返回 `404`。响应禁止缓存，写入请求必须同源，有请求体时须用 `application/json`。
+`GET /crag-shop/plans` 可匿名读取公开套餐，无需 CRAG Auth 或面板凭据。试点目录仅供有效的面板买家会话；试点凭据文件不可用时仍可读取公开目录。`payment_methods: []` 表示当前未开放收款，不表示套餐读取失败。
+
+下表的其他接口只接受实际面板登录会话，不接受 Master 或托管 API 密钥。升级前发出的旧会话需要重新登录一次。管理员也只能访问自己的订单；不存在和不属于本人的订单均返回 `404`。响应禁止缓存，写入请求必须同源，有请求体时须用 `application/json`。
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -272,6 +274,8 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 | POST | `/crag-shop/orders/:id/claim` | 空请求体或 JSON `{}`，普通订单返回 `{ order_id, redemption_code }`；未发货返回 `409`，不兑换到宿主机，续费订单不提供兑换码 |
 | POST | `/crag-shop/orders/:id/apply-renewal` | 空请求体或 JSON `{}`；仅管理员本人可将已发货的续费订单应用到当前宿主机，返回宿主订阅状态，不返回兑换码或续费证明 |
 
+免登录设备购买使用 `/crag-shop/device` 前缀：先 `GET /plans` 获取公开目录及独立的 HttpOnly 购买 Cookie，再用同一浏览器 `POST /quote`、`POST /orders`。`GET /orders`、`GET /orders/:id` 和 `POST /orders/:id/resume` 可查询或恢复该浏览器在同一宿主机上的订单。`POST /orders/:id/apply`（空请求体或 `{}`）只将供应方已确认交付的原订单兑换到当前宿主机，返回订单状态，不返回兑换码、不绑定槽位。不要清除购买 Cookie；不能用订单号或设备 ID 恢复其他浏览器的订单。宿主设备身份由服务端读取，不接受浏览器提供的设备 ID。试点购买、续费、手动兑换与槽位管理不走此入口。
+
 管理员新购非续费套餐时可选 `{ activation_target: { vm_id } }`；目标从 `GET /crag-shop/activation-targets` 获取。供应方确认 `fulfilled` 后服务端自动兑换并绑定所选槽，浏览器无需在线。已指定目标的订单不提供领码；状态在 `activation` 中返回，暂停后可使用 `POST /crag-shop/orders/:id/retry-activation`（JSON `{}`）重试同一目标。历史手动订单与续费不自动改绑。
 
 历史订单优先按订单 ID 恢复。仅在供应方未收到建单时，才需要用原选项和 `request_id` 重新发起建单。未核价的旧方案仅在兼容模式下可建单。浏览器不能提交续费证明；控制面用已有的宿主凭据向固定供应方申请证明。
@@ -282,12 +286,14 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 
 收据主密钥保存在数据目录的 `crag-shop-private/receipt.key`，仅控制进程可读；迁移安装或恢复订单库时，须单独安全备份并恢复同一份密钥。标准数据库备份不含该密钥，已有订单而密钥丢失时服务拒绝重建密钥。
 
-宿主订阅状态 `GET /crag-subscription` 仅管理员可查。面板统一使用 `state` 和 `available_seats` 展示状态与剩余可绑定槽位；`null` 表示待核对，`"unlimited"` 表示不限。Docker、KVM 与集群槽共享同一订阅，不按 CRAG 发行版本分池。`used_slots` / `available_slots` 保留供兼容，`ready` 表示有兼容的绑定目标。H2 受签名名单 10,000 槽上限约束；支持的 H1 宿主可通过 `POST /crag-subscription/upgrade`（JSON `{}`）升级。H2 确认槽运行实例已销毁后才释放额度，停机不释放，未确认的销毁不会被判为成功；回收中断可通过 `POST /crag-subscription/recover`（JSON `{}`）继续。
+宿主订阅状态 `GET /crag-subscription` 仅管理员可查。面板统一使用 `state` 和 `available_seats` 展示状态与剩余可绑定槽位；`null` 表示待核对，`"unlimited"` 表示不限。Docker、KVM 与集群槽共享同一订阅，不按 CRAG 发行版本分池。`used_slots` / `available_slots` 保留供兼容，`ready` 表示有兼容的绑定目标。H2 受签名名单 10,000 槽上限约束；支持的 H1 宿主可通过 `POST /crag-subscription/upgrade`（JSON `{}`）升级。删除 H2 槽须确认运行实例销毁后才释放额度；停机本身不释放额度，名额不足时可按需回收确认已停机且未在操作的槽。回收中断可通过 `POST /crag-subscription/recover`（JSON `{}`）继续。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/crag-subscription/redeem` | 管理员同源登录会话，JSON `{ "redemption_code": "<CRAGR1 宿主码>" }`，无需已有 VM，不自动绑定或启动。没有可信发行包时返回 `409 crag_subscription_host_package_unready`，不核销。新套餐替换额度上限；兑换中断可用 `/crag-subscription/recover` 继续同步。 |
+| POST | `/crag-subscription/redeem` | 管理员同源登录会话，JSON `{ "redemption_code": "<CRAGR1 宿主码>" }`，无需已有 VM，不自动绑定或启动。没有可信发行包时返回 `409 crag_subscription_host_package_unready`，不核销。每张新码从兑换时独立计时，未到期额度相加；兑换中断可用 `/crag-subscription/recover` 继续同步。 |
 | POST | `/vms/:id/crag-license/bind` | 管理员同源登录会话，JSON `{}`。本机和集群 Linux Docker/KVM CRAG 槽从同一池绑定，绑定时才按实际载荷签发逐槽许可；绑定不启动或重启槽位。KVM 来宾使用本地临时目录，集群 Docker 使用只读挂载；都不接收兑换码或宿主鉴权凭据。本机 KVM 进一步验证 guest 身份、tmpfs 副本与只读挂载，同步失败时拒绝新请求。回读槽授权确认 `license.valid` 与 `license.scope`；尚未加载许可的内核需按正常流程重启。 |
+
+宿主 `expires_at` 是当前签名额度的下一个到期点，不表示全部套餐同时失效。到期后控制面向 Authority 刷新剩余有效额度；刷新不可用时不沿用过期签名。
 
 可选 `runtime` 返回实际运行的 `running_vms`、`ready_vms`、`unknown_vms`、`host_running_vms`、`host_unknown_vms`、`host_runtime_available`、`host_over_limit`、`checked_at` 和逐 VM 明细 `vms`。独立授权计入全局服役但不占宿主额度；未知不视为零。宿主订阅超额或无法核实在额度内时，新的宿主授权推理请求分别返回 `403 license_crag_host_over_quota` 或 `403 license_crag_host_usage_unverified`，不取消在途请求、不代替逐槽许可。
 
@@ -337,6 +343,8 @@ Analytics 按官方 [`codex_thread_initialized`](https://github.com/openai/codex
 ### 通用路由选项
 
 `failover.stream_idle_timeout_ms`（毫秒，30 秒–60 分钟，默认 180 秒）：上游流连续无事件即判超时；网关流路径、各槽 `kernel.json` 的 `idle_timeout_seconds` 与 job 看门狗共用。优先级：面板该字段 → 启动时写入 `cfg.limits.stream_idle_timeout_ms` → 控制面 `.env` 的 `KIN_STREAM_IDLE_TIMEOUT` → 180 秒。保存后热写各槽 `kernel.json`；运行中 kernel 在无任务时自动重启以读取新看门狗值。
+
+`failover.max_accounts_per_request`（正整数，默认 `0` 不限制）：单请求实际执行过的不同账号数达到上限后，不再向新账号发起推理；没执行的准入失败不计入。无配额、模型或重试时间证据的上游 429 不直接冷却账号或 Fable；同一请求在两个账号收到此类 429 时保留上游错误并停止调度。
 
 `compatibility.persona_preset`（`official` / `official_full` / `zero` / `custom`）和 `compatibility.cache_ttl`（`5m` / `1h`）保存后投影到每个 Claude 槽的 `vms/<id>/run/kernel.json`：`persona_preset`、`system_layout`（`zero`→`zero`，其余→`identity`）、`default_cache_ttl`。响应 `kernel_persona.updated` 是本次字节有变化的槽数。`PATCH /vms/:id` 的 `timezone` / `timezone_follow_proxy` 另把 `timezone` 热写进该槽 `kernel.json`，`timezone_sync.kernel_hot` 表示文件有变化。容器 `TZ` 不在这次写入里。Codex 槽不写。
 

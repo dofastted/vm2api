@@ -800,7 +800,39 @@ function mockScenario(exec) {
   }
 }
 
-export async function callGoWorker({
+function restoreCragPolicyBlock(result) {
+  if (!result || result.ok || result.committed || isClientCancelledResult(result)) return result
+  const facts = result.providerResult
+  if (
+    facts?.schema_version !== 2 ||
+    facts.source !== 'crag' ||
+    facts.provider_complete !== false ||
+    facts.observation?.policy_blocked !== true ||
+    facts.observation?.exception?.code !== 'CRAG_CACHE_CONTROL'
+  )
+    return result
+  return {
+    ...result,
+    status: 502,
+    terminalState: 'rejected',
+    cragPolicyBlock: true,
+    body: {
+      type: 'error',
+      error: {
+        type: 'api_error',
+        code: 'crag_policy_blocked',
+        message: 'Gateway kernel rejected the request cache controls before dispatch (CRAG_CACHE_CONTROL)',
+        details: { retryable: false },
+      },
+    },
+  }
+}
+
+export async function callGoWorker(options) {
+  return restoreCragPolicyBlock(await callGoWorkerRaw(options))
+}
+
+async function callGoWorkerRaw({
   requestContext = null,
   exec,
   body,
@@ -949,6 +981,7 @@ export async function callGoWorker({
         nativeHandoff && parsed?.type === 'error' && response.statusCode < 400
           ? nativeErrorStatus(handoff, parsed)
           : response.statusCode || 0,
+      upstreamStatus: response.statusCode ?? null,
       via: 'go-worker',
       body: parsed,
       headers,
@@ -1002,7 +1035,11 @@ export async function callGoWorker({
   }
 }
 
-export async function streamGoWorker({
+export async function streamGoWorker(options) {
+  return restoreCragPolicyBlock(await streamGoWorkerRaw(options))
+}
+
+async function streamGoWorkerRaw({
   requestContext = null,
   exec,
   body,
@@ -1204,6 +1241,7 @@ export async function streamGoWorker({
       const result = restoreKernelErrorStatus({
         ok: false,
         status: response.statusCode || 0,
+        upstreamStatus: response.statusCode ?? null,
         via: 'go-worker-stream',
         body: decoded,
         headers,
@@ -1262,6 +1300,7 @@ export async function streamGoWorker({
       return {
         ok: !failed,
         status: failed ? nativeErrorStatus(handoff, body) : response.statusCode,
+        upstreamStatus: response.statusCode ?? null,
         via: 'go-worker-stream',
         body,
         headers: mergeRateLimitHeaders(publicHeaders({ ...received.headers, ...headers, ...trailers })),
@@ -1453,6 +1492,7 @@ export async function streamGoWorker({
             : nativeTimeout && !committed
               ? 504
               : response.statusCode || 0,
+        upstreamStatus: response.statusCode ?? null,
         via: 'go-worker-stream',
 
         body: handoff

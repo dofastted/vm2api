@@ -35,6 +35,17 @@ def escaped(data):
 
 
 CONF_BYTES = (f":{NAME}:M::{escaped(MAGIC)}:{escaped(MASK)}:{QEMU}:POCF\n").encode("ascii")
+PAGE_SIZE = 4096
+# Same search order as systemd binfmt.d and OpenRC's binfmt service; /etc wins.
+BINFMT_DIRS = (Path("/etc"), Path("/run"), Path("/usr/local/lib"), Path("/usr/lib"))
+SYSTEMD_BINFMT = (Path("/usr/lib/systemd/systemd-binfmt"), Path("/lib/systemd/systemd-binfmt"))
+OPENRC_RUN = (Path("/sbin/openrc-run"), Path("/usr/sbin/openrc-run"))
+CONTAINER_MARKERS = (Path("/.dockerenv"), Path("/run/.containerenv"), Path("/run/systemd/container"))
+# x86_64 ELF headers (EXEC and DYN) a competing handler could claim before ours.
+X86_SAMPLES = (MAGIC, MAGIC[:16] + b"\x03" + MAGIC[17:])
+PAGE_HINT = ("Bun (oven-sh/bun#17627) and qemu-user are not supported on 16K/64K page kernels; "
+             "boot a 4K-page kernel (Ubuntu: linux-generic instead of linux-generic-64k; "
+             "Raspberry Pi 5: kernel=kernel8.img in config.txt). Asahi Linux is unsupported.")
 
 
 class PrepareError(RuntimeError):
@@ -144,6 +155,84 @@ def validate_elf(data):
         raise PrepareError("QEMU lacks an executable ELF load segment")
 
 
+@dataclass(frozen=True)
+class Check:
+    name: str
+    ok: bool
+    detail: str
+    hint: str = ""
+
+    def line(self):
+        text = f"[{'ok' if self.ok else 'fail'}] {self.name}: {self.detail}"
+        return text + (f"\n       -> {self.hint}" if self.hint and not self.ok else "")
+
+
+def foreign_handler(text):
+    """Lenient parse of another enabled magic handler; None for disabled/extension/odd ones."""
+    lines = text.strip().splitlines()
+    if not lines or lines[0] != "enabled":
+        return None
+    fields = {}
+    for line in lines[1:]:
+        parts = line.split(None, 1)
+        if len(parts) == 2 and not line.startswith("flags:"):
+            fields[parts[0]] = parts[1].strip()
+    if "magic" not in fields:
+        return None
+    try:
+        magic = bytes.fromhex(fields["magic"])
+        mask = bytes.fromhex(fields.get("mask", "ff" * len(magic)))
+        offset = int(fields.get("offset", "0"))
+    except ValueError:
+        return None
+    if len(mask) != len(magic):
+        return None
+    return Handler(True, fields.get("interpreter", ""), offset, magic, mask, "")
+
+
+def matches_x86_64(handler):
+    for sample in X86_SAMPLES:
+        if handler.offset + len(handler.magic) > len(sample):
+            continue
+        window = sample[handler.offset:handler.offset + len(handler.magic)]
+        if all((b & m) == (g & m) for b, g, m in zip(window, handler.magic, handler.mask)):
+            return True
+    return False
+
+
+def host_checks(ops):
+    """Everything that must hold before touching the host; pure over ops facts."""
+    checks = []
+    machine = ops.machine()
+    checks.append(Check("arch", machine in ("linux/aarch64", "linux/arm64"), machine,
+                        "run this preparer on a Linux AArch64 host"))
+    page = ops.page_size()
+    checks.append(Check("page-size", page == PAGE_SIZE, f"{page} bytes", PAGE_HINT))
+    container = ops.container()
+    checks.append(Check("container", container is None, container or "host",
+                        "binfmt handlers belong to the host kernel; run this on the host, not inside a container"))
+    status = ops.binfmt_status()
+    checks.append(Check("binfmt_misc", status == "enabled", status or "not mounted",
+                        "modprobe binfmt_misc && mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc"
+                        if status is None else "echo 1 > /proc/sys/fs/binfmt_misc/status"))
+    init = ops.init_system()
+    checks.append(Check("init", init is not None,
+                        init or "neither systemd-binfmt executable nor OpenRC binfmt service found",
+                        "registration would be lost on reboot; use a systemd or OpenRC host"))
+    sources = ops.conf_sources()
+    managed = CONF in sources
+    others = [str(path) for path in sources if path != CONF]
+    detail = ("vm2api " + str(CONF) if managed else "vm2api file not installed yet")
+    if others:
+        detail += "; overrides distro " + ", ".join(others)
+    checks.append(Check("binfmt.d", True, detail))
+    shadows = ops.shadowing_handlers() if status == "enabled" else []
+    checks.append(Check("other-x86-handlers", not shadows, ", ".join(shadows) or "none",
+                        "another enabled handler also claims x86_64 ELF; disable it with "
+                        "'echo -1 > /proc/sys/fs/binfmt_misc/<name>' and remove its binfmt.d entry or package"))
+    return checks
+
+
 def desired_handler(handler):
     return (handler is not None and handler.enabled and handler.interpreter == str(QEMU)
             and handler.offset == 0 and handler.magic == MAGIC and handler.mask == MASK
@@ -162,20 +251,63 @@ class Operations:
             raise PrepareError(f"{' '.join(args)} failed ({result.returncode}): {detail}")
         return result.stdout
 
-    def preflight(self):
-        if platform.system() != "Linux" or platform.machine().lower() not in ("aarch64", "arm64"):
-            raise PrepareError("This preparer requires Linux on AArch64")
+    def machine(self):
+        return f"{platform.system().lower()}/{platform.machine().lower()}"
+
+    def page_size(self):
+        return os.sysconf("SC_PAGE_SIZE")
+
+    def container(self):
+        for marker in CONTAINER_MARKERS:
+            if marker.exists():
+                return f"container ({marker})"
+        try:
+            environ = Path("/proc/1/environ").read_bytes()
+        except OSError:
+            return None
+        for item in environ.split(b"\0"):
+            if item.startswith(b"container="):
+                return "container (" + item.decode(errors="replace") + ")"
+        return None
+
+    def binfmt_status(self):
         if not (KERNEL / "register").exists():
-            raise PrepareError("binfmt_misc must already be mounted and enabled")
-        if (KERNEL / "status").read_text().strip() != "enabled":
-            raise PrepareError("binfmt_misc is globally disabled")
-        self.systemd_binfmt()
+            return None
+        return (KERNEL / "status").read_text().strip()
 
     def systemd_binfmt(self):
-        command = next((str(p) for p in (Path("/usr/lib/systemd/systemd-binfmt"), Path("/lib/systemd/systemd-binfmt")) if p.is_file()), None)
-        if command is None:
-            raise PrepareError("systemd-binfmt executable is unavailable")
-        return command
+        return next((str(p) for p in SYSTEMD_BINFMT if p.is_file()), None)
+
+    def init_system(self):
+        if self.systemd_binfmt():
+            return "systemd"
+        if any(p.is_file() for p in OPENRC_RUN) and Path("/etc/init.d/binfmt").is_file():
+            return "openrc"
+        return None
+
+    def conf_sources(self):
+        return [path for path in (d / "binfmt.d" / f"{NAME}.conf" for d in BINFMT_DIRS) if path.exists()]
+
+    def shadowing_handlers(self):
+        names = []
+        for entry in sorted(KERNEL.iterdir()):
+            if entry.name in ("register", "status", NAME):
+                continue
+            try:
+                handler = foreign_handler(entry.read_text())
+            except OSError:
+                continue
+            if handler is not None and matches_x86_64(handler):
+                names.append(f"{entry.name} ({handler.interpreter})")
+        return names
+
+    def report(self):
+        return host_checks(self)
+
+    def preflight(self):
+        failures = [check for check in host_checks(self) if not check.ok]
+        if failures:
+            raise PrepareError("Host is not supported:\n" + "\n".join(c.line() for c in failures))
 
     def managed_bytes(self, path):
         for part in (path, *path.parents):
@@ -272,7 +404,30 @@ if p.exists():
             self.run(["tee", str(KERNEL / NAME)], privileged=True, data=b"0")
 
     def register_managed(self):
-        self.run([self.systemd_binfmt(), str(CONF)], privileged=True)
+        if self.init_system() == "systemd":
+            self.run([self.systemd_binfmt(), str(CONF)], privileged=True)
+        else:
+            # OpenRC reads the same /etc/binfmt.d file at boot; register it now directly.
+            handler = Handler(True, str(QEMU), 0, MAGIC, MASK, "POCF")
+            self.run(["tee", str(KERNEL / "register")], privileged=True, data=registration_bytes(handler))
+
+    def _openrc_boot_has_binfmt(self):
+        listing = self.run(["rc-update", "show", "boot"]).decode(errors="replace")
+        return any(line.split("|")[0].strip() == "binfmt" for line in listing.splitlines())
+
+    def persistence_ok(self):
+        # systemd-binfmt.service is static and always applies /etc/binfmt.d at boot.
+        return self.init_system() != "openrc" or self._openrc_boot_has_binfmt()
+
+    def enable_persistence(self):
+        """Return True only when this call newly enabled boot-time registration."""
+        if self.init_system() != "openrc" or self._openrc_boot_has_binfmt():
+            return False
+        self.run(["rc-update", "add", "binfmt", "boot"], privileged=True)
+        return True
+
+    def disable_persistence(self):
+        self.run(["rc-update", "del", "binfmt", "boot"], privileged=True)
 
 
 def check(ops):
@@ -286,6 +441,9 @@ def check(ops):
         raise PrepareError("Managed QEMU is not executable")
     if not desired_handler(ops.kernel_handler()):
         raise PrepareError("Kernel qemu-x86_64 handler differs, is disabled, or lacks F")
+    if not ops.persistence_ok():
+        raise PrepareError("OpenRC binfmt service is not in the boot runlevel; "
+                           "the handler will be lost on reboot (rc-update add binfmt boot)")
 
 
 def prepare(ops):
@@ -302,12 +460,14 @@ def prepare(ops):
         raise PrepareError(f"Existing managed QEMU is not executable: {QEMU}")
     old_handler = ops.kernel_handler()
     if existing_conf is not None and existing_qemu is not None and desired_handler(old_handler):
+        ops.enable_persistence()
         return "Already configured"
     if old_handler is not None:
         if not ops.executable(old_handler.interpreter):
             raise PrepareError(f"Cannot safely replace old handler: interpreter unavailable: {old_handler.interpreter}")
         registration_bytes(old_handler)
     installed = []
+    persisted = False
     try:
         if existing_qemu is None:
             ops.install(QEMU, qemu, 0o755)
@@ -317,6 +477,7 @@ def prepare(ops):
             installed.append((CONF, CONF_BYTES))
         ops.remove_handler()
         ops.register_managed()
+        persisted = ops.enable_persistence()
         check(ops)
         return "Configured ARM64 QEMU for x86_64"
     except BaseException as failure:
@@ -329,6 +490,11 @@ def prepare(ops):
                 raise PrepareError("Kernel handler readback differs from snapshot")
         except BaseException as exc:
             rollback_errors.append(f"kernel handler: {exc}")
+        if persisted:
+            try:
+                ops.disable_persistence()
+            except BaseException as exc:
+                rollback_errors.append(f"OpenRC boot runlevel: {exc}")
         for path, contents in reversed(installed):
             try:
                 ops.remove_file(path, contents)
@@ -345,6 +511,8 @@ def main(argv=None, ops=None):
     ops = ops or Operations()
     try:
         if args.check:
+            for item in ops.report():
+                print(item.line())
             check(ops)
             print("ARM64 QEMU configuration is valid")
         else:

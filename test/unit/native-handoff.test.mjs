@@ -4,6 +4,11 @@ import http from 'node:http'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { createRespond, readBody } from '../../src/lib/http/respond.mjs'
+import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { classifyUpstreamResult } from '../../src/lib/pool/upstream-error-policy.mjs'
+import { RateLimitService } from '../../src/lib/pool/rate-limit-service.mjs'
+import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { callGoWorker, streamGoWorker } from '../../src/lib/transport/go-worker-client.mjs'
 import {
   finalizeAssembledAssistantHop,
@@ -540,6 +545,165 @@ for (const stream of [false, true]) {
     }
   })
 }
+
+unixTest('CRAG cache policy rejection is returned without replay and without exposing diagnostics', async (t) => {
+  const rejection = { type: 'error', error: { type: 'api_error', message: 'Kernel rejected the request' } }
+  const facts = {
+    type: 'kin_provider_result',
+    schema_version: 2,
+    source: 'crag',
+    provider_complete: false,
+    usage_complete: false,
+    public_status: 502,
+    error: rejection.error,
+    observation: { policy_blocked: true, exception: { code: 'CRAG_CACHE_CONTROL', message: 'private observation' } },
+  }
+  const fx = await fixture(
+    (_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(resultFrame(facts) + frame(rejection))
+    },
+    { capabilities: ['native_handoff_v1', 'provider_result_v2'] },
+  )
+  t.after(() => fx.close())
+  const body = { model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'hello' }] }
+  const result = await streamGoWorker(options(fx, { envelope: { body, headers: {}, stream: true } }))
+  assert.equal(result.terminalState, 'rejected')
+  assert.equal(result.body.error.code, 'crag_policy_blocked')
+  assert.equal(result.body.error.details.retryable, false)
+  assert.doesNotMatch(JSON.stringify(result.body), /private observation/)
+  const policy = classifyUpstreamResult(result)
+  assert.equal(policy.action, 'stop')
+  assert.equal(policy.cooldownUntil, null)
+  assert.equal(policy.scope, 'request')
+})
+
+unixTest('#1139: opaque CRAG 429 returns once without restricting the account', async (t) => {
+  const error = { type: 'rate_limit_error', message: 'Error' }
+  const rejection = { type: 'error', error, request_id: 'req_compact_fixture' }
+  const facts = {
+    type: 'kin_provider_result',
+    schema_version: 2,
+    provider_complete: true,
+    usage_complete: false,
+    source: 'provider_http',
+    http_status: 429,
+    public_status: 429,
+    request_id: rejection.request_id,
+    response_headers: { 'content-type': 'application/json', 'request-id': rejection.request_id },
+    error,
+  }
+  const fx = await fixture(
+    (_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(resultFrame(facts) + frame(rejection))
+    },
+    { capabilities: ['native_handoff_v1', 'provider_result_v2'] },
+  )
+  t.after(() => fx.close())
+
+  let seats = 1
+  let selections = 0
+  let releases = 0
+  const restrictions = []
+  const quotaSamples = []
+  const runner = new FailoverRunner({
+    scheduler: {
+      async selectAndReserve({ excluded }) {
+        selections++
+        for (let i = 1; i <= seats; i++) {
+          const vmId = `vm-0${i}`
+          if (excluded.has(vmId)) continue
+          return { ok: true, vmId, accountId: vmId, vm: { id: vmId }, release: () => releases++ }
+        }
+        return { ok: false, reason: 'pool_queue_timeout' }
+      },
+      markCooldown: (_candidate, update) => restrictions.push(update),
+    },
+    onSchedulePause: (update) => restrictions.push(update),
+    rateLimitService: new RateLimitService({
+      runtimeRepo: { updateWindow: (...args) => restrictions.push(args) },
+      onUsageProbe: (...args) => restrictions.push(args),
+    }),
+  })
+  const root = path.dirname(fx.exec.homeDir)
+  const cfg = {
+    rewrite: { enabled: false },
+    intercept: { rules: [] },
+    distill: { enabled: false },
+    limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000 },
+    paths: { project: root, data: root },
+  }
+  const routing = { failover: { stream_keepalive_ms: 0 } }
+  const handler = createHandleProtocol({
+    ...createRespond(cfg),
+    readBody,
+    cfg,
+    requireAuth: () => true,
+    requestLog: { start: () => ({ request_id: `compact-${selections}` }), finish() {} },
+    stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+    groupsRepo: { rateMultiplier: () => 1 },
+    routingConfigPath: path.join(root, 'routing.json'),
+    routingConfig: routing,
+    getRoutingConfig: () => routing,
+    stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
+    apiKeyStore: {},
+    accountQuota: { ingestHeaders: (...args) => quotaSamples.push(args) },
+    failoverRunner: {
+      run(opts) {
+        return runner.run({
+          ...opts,
+          applyAttempt: null,
+          callAttempt: ({ body, signal, onCommit }) =>
+            streamGoWorker(options(fx, { envelope: { body, headers: {}, stream: true }, signal, onCommit })),
+        })
+      },
+    },
+  })
+  const gateway = http.createServer((req, res) => {
+    req.apiKeyKind = 'master'
+    handler.handleProtocol(req, res, 'anthropic.messages', req.url).catch((error) => {
+      res.writeHead(500)
+      res.end(String(error.stack))
+    })
+  })
+  await new Promise((resolve) => gateway.listen(0, '127.0.0.1', resolve))
+  t.after(async () => {
+    gateway.closeAllConnections()
+    await new Promise((resolve) => gateway.close(resolve))
+  })
+
+  for (const [model, stream, poolSize] of [
+    ['claude-sonnet-5-5', false, 1],
+    ['claude-fable-5-2', true, 3],
+    ['claude-fable-5-2', false, 3],
+  ]) {
+    seats = poolSize
+    const previous = selections
+    const response = await fetch(`http://127.0.0.1:${gateway.address().port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        stream,
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'Create a detailed summary of the conversation so far.' }],
+      }),
+    })
+    const text = await response.text()
+    assert.equal(response.status, 429, text)
+    const body = JSON.parse(text)
+    assert.equal(body.error.type, error.type)
+    assert.equal(body.error.message, error.message)
+    assert.equal(body.error.request_id, rejection.request_id)
+    assert.equal(response.headers.get('retry-after'), null)
+    assert.equal(selections - previous, 1)
+  }
+  assert.equal(fx.requests.length, 3)
+  assert.equal(releases, 3)
+  assert.deepEqual(restrictions, [])
+  assert.deepEqual(quotaSamples, [])
+})
 
 unixTest('transport catch keeps validated partial provider metadata and never invents final usage', async () => {
   const result = summary({ stop_reason: null, usage: { input_tokens: 47, output_tokens: 2 }, usage_complete: false })

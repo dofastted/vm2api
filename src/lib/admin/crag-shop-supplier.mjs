@@ -389,18 +389,20 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
       }
       return result
     },
-    async quote(input, renewalProof) {
+    async quote(input, renewalProof, { allowPilot = true } = {}) {
       const value = await send('quote', '/shop/quote', {
         method: 'POST',
         body: { ...input, ...(renewalProof ? { renewal_proof: renewalProof } : {}) },
+        allowPilot,
       })
       return publicQuote(value, input)
     },
-    async create(row, receipt, renewalProof, purchase = { sku: row.sku }) {
+    async create(row, receipt, renewalProof, purchase = { sku: row.sku }, { allowPilot = true } = {}) {
       const { order_id, payment_method } = row
       const value = await send('create', '/shop/orders', {
         method: 'POST',
         receipt,
+        allowPilot,
         body: {
           order_id,
           ...purchase,
@@ -412,8 +414,8 @@ export function createShopSupplier(fetchImpl = globalThis.fetch) {
       const order = publicOrder(value, row)
       return { order, form: checkout(value, order, receipt) }
     },
-    async resume(row, receipt) {
-      const value = await send('resume', `/shop/orders/${row.order_id}/resume`, { method: 'POST', receipt })
+    async resume(row, receipt, { allowPilot = true } = {}) {
+      const value = await send('resume', `/shop/orders/${row.order_id}/resume`, { method: 'POST', receipt, allowPilot })
       const order = publicOrder(value, row)
       return { order, form: checkout(value, order, receipt) }
     },

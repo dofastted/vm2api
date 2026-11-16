@@ -1,6 +1,7 @@
 # 文档
 
 - [DEPLOY.md](DEPLOY.md) — 安装与升级（含 `deploy/install.sh` 一键安装 / 更新）
+- [托管节点内核排障与验收](managed-kernel-troubleshooting.md) — CRAG 缺包、控制面连接、单槽重装、Claude 版本与账号状态的分层检查
 - [nginx-shell.md](nginx-shell.md) — 集群 / 槽运维终端 WebSocket 连不上时查 nginx Upgrade
 - [开发验证与 CI](../README.md#开发验证与-ci) — 核心集、指定测试文件、按目录触发与手动全量 / ARM 检查
 - [FORMAT.md](FORMAT.md) — 仅格式化改动文件；手动全量 CI 使用同一套 Biome / gofmt / Prettier 配置（LF）

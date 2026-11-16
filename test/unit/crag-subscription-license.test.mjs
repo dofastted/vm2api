@@ -24,6 +24,7 @@ import {
 } from '../../src/lib/vm/crag-license.mjs'
 import { cragSubscriptionPublicDirectory } from '../../src/lib/vm/crag-subscription-paths.mjs'
 import { publishKvmCragLicense } from '../../src/lib/vm/kvm-crag-license.mjs'
+import { cragDockerAppArmorProfile, startVmRuntime } from '../../src/lib/vm/vm-runtime.mjs'
 import { bindPlacement, unbindPlacement } from '../../src/lib/cluster/placement.mjs'
 import { callRustKernel, streamRustKernel } from '../../src/lib/transport/rust-kernel-client.mjs'
 import {
@@ -92,6 +93,83 @@ function fixture(t, { slotLimit = 2, seat = 2, activate = true, placement = {} }
   const exec = { projectRoot: root, homeDir: path.join(root, 'vms', vm.id, 'cli-home'), vm }
   return { root, vm, pkg, machineCode, dir, registration, publicDir, hostId, host, entitlement, permit, exec }
 }
+
+test('starting a stopped host-licensed Docker slot repairs a missing entitlement mount', async (t) => {
+  const { root, vm, registration, publicDir } = fixture(t)
+  vm.proxy = { id: 'px-local', scheme: 'local' }
+  const grant = fs.readFileSync(registration)
+  assert.equal(checkCragLicense(root, vm).license.scope, 'host')
+  const slotDir = path.join(root, 'vms', vm.id)
+  const machineId = fs.readFileSync(path.join(slotDir, 'machine-id'))
+  const computer = path.join(slotDir, 'kvm', 'fingerprint', 'system')
+  for (const dir of ['etc', 'hardware', 'dmi/id']) fs.mkdirSync(path.join(computer, dir), { recursive: true })
+  fs.writeFileSync(path.join(computer, 'etc', 'hostname'), 'wks1234567890123\n')
+  fs.writeFileSync(path.join(computer, 'etc', 'machine-id'), machineId)
+  fs.writeFileSync(path.join(computer, 'hardware', 'mac'), '02:00:00:00:00:13\n')
+
+  const trace = path.join(root, 'docker.jsonl')
+  const oldPath = process.env.PATH
+  process.env.PATH = `${root}${path.delimiter}${oldPath}`
+  t.after(() => {
+    process.env.PATH = oldPath
+  })
+  const mounts = path.join(root, 'mounts.json')
+  fs.writeFileSync(mounts, '[]')
+  const profile = new URL('../../src/lib/vm/crag-v2-seccomp.json', import.meta.url)
+  const appArmor = cragDockerAppArmorProfile()
+  const securityOpts = JSON.stringify([
+    'no-new-privileges',
+    `seccomp=${profile.pathname}`,
+    ...(appArmor ? [`apparmor=${appArmor}`] : []),
+  ])
+  fs.writeFileSync(
+    path.join(root, 'docker'),
+    `#!${process.execPath}
+const fs = require('node:fs')
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(trace)}, JSON.stringify(args) + '\\n')
+if (args[0] === 'network' && args[1] === 'inspect') console.log('172.20.0.0/24|172.20.0.1')
+else if (args[0] === 'inspect' && args[2] === '{{json .Mounts}}') console.log(fs.readFileSync(${JSON.stringify(mounts)}, 'utf8'))
+else if (args[0] === 'inspect') console.log(${JSON.stringify(`false|0|kin-eg-px-local||ghcr.io/dofastted/kin-os-ubuntu:24.04|fixture|docker||false|unless-stopped|${securityOpts}|true`)})
+`,
+    { mode: 0o755 },
+  )
+  const commands = () => fs.readFileSync(trace, 'utf8').trim().split('\n').map(JSON.parse)
+
+  const result = await startVmRuntime(vm, root, { routing: {} })
+  assert.equal(result.ok, true, JSON.stringify(result))
+  assert.equal(result.action, 'created')
+  assert.equal(
+    commands().some(([op]) => op === 'start'),
+    false,
+  )
+  assert.ok(
+    commands()
+      .find(([op]) => op === 'run')
+      .includes(`type=bind,source=${publicDir},target=/run/kin/crag-host,readonly`),
+  )
+
+  fs.writeFileSync(trace, '')
+  fs.writeFileSync(
+    mounts,
+    JSON.stringify([{ Type: 'bind', Source: publicDir, Destination: '/run/kin/crag-host', RW: false }]),
+  )
+  assert.equal((await startVmRuntime(vm, root, { routing: {} })).action, 'started')
+  assert.equal(
+    commands().some(([op]) => op === 'rm' || op === 'run'),
+    false,
+  )
+
+  fs.writeFileSync(trace, '')
+  fs.writeFileSync(mounts, 'null')
+  assert.equal((await startVmRuntime(vm, root, { routing: {} })).code, 'crag_host_mount_inspect_failed')
+  assert.equal(
+    commands().some(([op]) => op === 'rm' || op === 'run' || op === 'start'),
+    false,
+  )
+  assert.deepEqual(fs.readFileSync(registration), grant)
+  assert.deepEqual(fs.readFileSync(path.join(slotDir, 'machine-id')), machineId)
+})
 
 async function assertDenied(context, code) {
   const check = checkCragLicense(context.root, context.vm)

@@ -103,7 +103,25 @@ export function isPlanLimitMessage(message) {
 export function isAccountQuotaExhausted(result = {}, limitText = '') {
   if (!result || result.ok) return false
   if (isPlanLimitMessage(limitText)) return true
-  return Number(result.status) === 429 && result.via !== 'pool-failover'
+  if (Number(result.status) !== 429 || result.via === 'pool-failover') return false
+  // A 429 alone does not say which window, or whether any plan window, is spent:
+  // the provider also answers a bare "Error" 429 to one request (or one model)
+  // while the account keeps serving. Marking it would park a healthy account
+  // until its 5h reset. Trust the classifier when it graded the hop; otherwise
+  // require a rejected unified window. The usage probe every 429 asks for
+  // still catches a real exhaustion that came without evidence.
+  const reason = String(result.policy?.reason || '')
+  if (reason) return reason === 'account_quota_exhausted'
+  return hasRejectedUnifiedWindow(result.headers)
+}
+
+function hasRejectedUnifiedWindow(headers = {}) {
+  if (!headers || typeof headers !== 'object') return false
+  for (const [key, value] of Object.entries(headers)) {
+    if (!/^anthropic-ratelimit-unified-(5h|7d)-status$/i.test(key)) continue
+    if (/^(rejected|rate_limited)$/i.test(String(value || '').trim())) return true
+  }
+  return false
 }
 
 /**

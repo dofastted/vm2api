@@ -1,13 +1,14 @@
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
-import { runtimeFileOwner } from '../oauth/oauth-credentials.mjs'
+import { slotRuntimeOwner } from '../oauth/oauth-credentials.mjs'
 import { readCragSubscriptionFiles, readKvmCragLicense } from './crag-license.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { slotExecArgv, slotExecContainer } from './slot-exec.mjs'
 import { isDockerInspectNotFound } from './docker-container.mjs'
 
 let script
+const MAX_PENDING_PROJECTIONS = 16
 const queues = new Map()
 const holds = new Map()
 const localKvm = (vm) => process.platform === 'linux' && !vm?.node_id && isKvmRuntime(vm)
@@ -83,16 +84,27 @@ async function running(vm, run) {
 
 function exclusive(projectRoot, vm, work) {
   const key = `${path.resolve(projectRoot)}:${vm.id}`
-  const previous = queues.get(key)
-  const next = (previous || Promise.resolve()).catch(() => {}).then(work)
-  queues.set(key, next)
+  const queue = queues.get(key) || { pending: 0, tail: Promise.resolve() }
+  if (queue.pending >= MAX_PENDING_PROJECTIONS) {
+    return Promise.reject(
+      Object.assign(new Error('CRAG guest license projection is busy'), {
+        status: 503,
+        code: 'crag_subscription_projection_busy',
+      }),
+    )
+  }
+  queue.pending++
+  const next = queue.tail.catch(() => {}).then(work)
+  queue.tail = next
+  queues.set(key, queue)
   return next.finally(() => {
-    if (queues.get(key) === next) queues.delete(key)
+    queue.pending--
+    if (queue.pending === 0) queues.delete(key)
   })
 }
 
 async function project(vm, action, files, run) {
-  const { uid, gid } = runtimeFileOwner(vm)
+  const { uid, gid } = slotRuntimeOwner(vm)
   const request = {
     action,
     vm_id: vm.id,

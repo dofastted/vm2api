@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import {
   DEFAULT_GEO_ENDPOINT,
+  DEFAULT_GEO_HTTPS_FALLBACK,
   DEFAULT_GEO_V6_IP_ENDPOINT,
   lookupProxyGeo,
   lookupProxyGeoV6,
@@ -32,13 +33,16 @@ test('default mode never falls back to a direct lookup on transport failure', as
   let count = 0
   const result = await lookupProxyGeo(proxy, {
     ipv6Mode: 'proxy',
-    fetchImpl: async () => {
+    fetchImpl: async (_url, options) => {
       count += 1
+      assert.ok(options.agent, 'every lookup must go through the proxy')
       throw new Error('read ECONNRESET')
     },
   })
   assert.equal(result.ok, false)
-  assert.equal(count, 1)
+  assert.match(result.error, /^geo_transport_error:/)
+  // Plain-HTTP attempt plus the HTTPS retry, both on the proxy (#1016).
+  assert.equal(count, 2)
 })
 
 test('IPv6 fallback verifies authenticated egress, then queries exactly that IP outside the proxy', async () => {
@@ -200,4 +204,40 @@ test('invalid lookup mode stops before any network request', async () => {
     fetchImpl: async () => assert.fail('no request is expected'),
   })
   assert.deepEqual(result, { ok: false, error: 'geo_ipv6_invalid_lookup_mode' })
+})
+
+test('default plain-HTTP lookup retries over HTTPS through the same proxy (#1016)', async () => {
+  const calls = []
+  const result = await lookupProxyGeo(proxy, {
+    fetchImpl: async (url, options) => {
+      calls.push({ url: String(url), agent: !!options.agent })
+      if (url === DEFAULT_GEO_ENDPOINT) return { ok: false, status: 403 }
+      return {
+        ok: true,
+        json: async () => ({ ip: '203.0.113.9', country_name: 'Japan', country_code: 'JP', timezone: 'Asia/Tokyo' }),
+      }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.geo.ip, '203.0.113.9')
+  assert.equal(result.geo.country_code, 'JP')
+  assert.deepEqual(calls, [
+    { url: DEFAULT_GEO_ENDPOINT, agent: true },
+    { url: DEFAULT_GEO_HTTPS_FALLBACK, agent: true },
+  ])
+})
+
+test('HTTPS fallback failure keeps the original error; custom endpoints are not retried', async () => {
+  const failed = await lookupProxyGeo(proxy, { fetchImpl: async () => ({ ok: false, status: 403 }) })
+  assert.deepEqual(failed, { ok: false, error: 'geo_http_403' })
+  let count = 0
+  const custom = await lookupProxyGeo(proxy, {
+    endpoint: 'http://geo.example.test/json',
+    fetchImpl: async () => {
+      count += 1
+      return { ok: false, status: 403 }
+    },
+  })
+  assert.equal(custom.ok, false)
+  assert.equal(count, 1)
 })

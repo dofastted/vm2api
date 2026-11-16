@@ -8,12 +8,12 @@ import type {
 import type * as JsxDevRuntime from 'react/jsx-dev-runtime'
 import type * as JsxRuntime from 'react/jsx-runtime'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, activateVmCragLicense, api } from '@/lib/api'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { ApiError, activateVmCragLicense, api, cragDeviceApi } from '@/lib/api'
 import type * as CragLicenseEditorModule from '@/features/vm/crag-license-editor'
 import type { CragHostStatus } from '@/features/vm/queries'
 import type { CragCommerce } from './crag-commerce'
-import { CragSubscriptionPage } from './crag-shop'
+import { CragDevicePurchasePage, CragSubscriptionPage } from './crag-shop'
 
 type ActivationFormProps = Parameters<
   typeof CragLicenseEditorModule.CragActivationForm
@@ -194,6 +194,7 @@ vi.mock('@/lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/lib/api')>()),
   activateVmCragLicense: vi.fn(),
   api: vi.fn(),
+  cragDeviceApi: vi.fn(),
 }))
 vi.mock('./crag-commerce', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./crag-commerce')>()),
@@ -227,7 +228,7 @@ const order = {
   status: 'fulfilled',
 }
 
-function render() {
+function render(device = false) {
   state.cursor = 0
   state.refCursor = 0
   state.buttons = []
@@ -236,7 +237,9 @@ function render() {
   state.commerce = undefined
   state.hostForm = undefined
   state.hostInput = undefined
-  return renderToStaticMarkup(<CragSubscriptionPage />)
+  return renderToStaticMarkup(
+    device ? <CragDevicePurchasePage /> : <CragSubscriptionPage />
+  )
 }
 
 function click(label: string) {
@@ -262,6 +265,10 @@ async function settle() {
   await Promise.resolve()
   await Promise.resolve()
 }
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
 
 beforeEach(() => {
   state.role = 'admin'
@@ -340,6 +347,28 @@ describe('CRAG buyer presentation and activation wire', () => {
     } finally {
       vi.unstubAllGlobals()
     }
+  })
+
+  it('shows device orders and applies the paid entitlement without a panel login or a voucher', async () => {
+    state.authenticated = false
+    state.values[3] = [{ ...order, activation: { state: 'ready_to_apply' } }]
+    vi.mocked(cragDeviceApi).mockResolvedValue({
+      ...order,
+      activation: { state: 'active' },
+    })
+    const page = render(true)
+    expect(page).toContain('免登录购买')
+    expect(page).toContain('查看订单')
+    expect(page).not.toContain('领取兑换码')
+    expect(page).not.toContain('手动激活')
+    click('应用到本机')
+    await settle()
+    expect(cragDeviceApi).toHaveBeenCalledExactlyOnceWith(
+      '/orders/order-1/apply',
+      { method: 'POST', body: '{}' }
+    )
+    expect(api).not.toHaveBeenCalled()
+    expect(render(true)).toContain('订阅额度已加入本机')
   })
 
   it('prefills the claimed code but requires a separate explicit manual target', () => {
@@ -444,7 +473,9 @@ describe('CRAG buyer presentation and activation wire', () => {
     const html = render()
     expect(html).toContain('当前没有可绑定的 CRAG 槽位')
     expect(html).toContain('宿主机兑换码')
-    expect(html).toContain('兑换后以新套餐额度为准；不绑定、不启动 VM。')
+    expect(html).toContain(
+      '每张码从兑换时独立计时，未到期额度相加；不绑定、不启动 VM。'
+    )
     expect(state.hostInput?.type).toBe('password')
     fillHostCode('   ')
     expect(
@@ -683,6 +714,25 @@ describe('CRAG buyer presentation and activation wire', () => {
     expect(html).toMatch(/<option value="vm-a" disabled="" selected="">/)
     click('创建订单')
     expect(api).not.toHaveBeenCalled()
+  })
+
+  it('creates an order when crypto.randomUUID is unavailable on HTTP', async () => {
+    vi.stubGlobal('crypto', {
+      getRandomValues: globalThis.crypto.getRandomValues.bind(
+        globalThis.crypto
+      ),
+    })
+    render()
+    click('创建订单')
+    await settle()
+    expect(api).toHaveBeenCalledWith(
+      '/api/panel/crag-shop/orders',
+      expect.objectContaining({ method: 'POST' })
+    )
+    const body = JSON.parse(String(vi.mocked(api).mock.calls[0][1]?.body))
+    expect(body.request_id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    )
   })
 
   it('adds only explicitly selected targets to new intents and matches them when retrying', async () => {

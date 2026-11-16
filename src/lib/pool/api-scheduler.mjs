@@ -165,11 +165,12 @@ export class ApiScheduler {
     return { object: 'list', data, source: 'api-endpoints' }
   }
 
-  pick(requestedModel, now = Date.now(), { groupType = 'all' } = {}) {
+  pick(requestedModel, now = Date.now(), { groupType = 'all', endpointId = null } = {}) {
     const targetGroup = String(groupType || 'all').toLowerCase()
     const parents = this.endpoints
       .filter((ep) => {
         if (ep.disabled) return false
+        if (endpointId && ep.id !== endpointId) return false
         const proto = normalizeProtocol(ep.protocol, ep.kind)
         if (targetGroup === 'anthropic' && proto !== 'anthropic') return false
         if (targetGroup === 'openai' && proto !== 'openai') return false

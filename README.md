@@ -110,17 +110,9 @@
 
 ### 3️⃣ 封控拦截与风险审计
 
-进槽之前，`/v1` 和 `count_tokens` 先过管理台「风险审计」（`/console/#/risk`）。命中即返回错误，不选槽、不打上游。顺序不能调：
+推理出站前检查设备／会话封禁、禁用工具、系统提示词改写、蒸馏、硬正则和拒答缓存。通过硬规则后，Jev 只审核用户会话和可解析的内联文件文本，并在常规放行、指定账号池／渠道、指定模型和拒绝之间选择。没有身份字段的第三方请求不因此被封禁。
 
-| 顺序 | 关 | 拦住什么 | 结果 |
-|:---|:---|:---|:---|
-| 1 | 蒸馏 | 收割模板、题目指纹、套取思维链的结构。OpenAI 平台模型不扫。默认再跳过官方 Claude Code 和 0 注入。 | 403，封 device |
-| 2 | 硬正则 | 色情、破解、破限和自定义正则。蒸馏类正则跟蒸馏总开关：关掉硬正则仍拦这些短语，关掉蒸馏才放行；官方客户端和 0 注入仍扫，OpenAI 不扫。 | 403 |
-| 3 | 拒答缓存 | 上游已经拒过的精确正文、近似正文，以及被封的 device。硬正则和决策模型自己的拦截不写入这张缓存。 | 400，不可重试，不是登录失效 |
-| 4 | 决策模型 | 安全模型逐题打分，低于阈值才拦。打分失败默认放行，并在「放行出站」里标出来。 | 403 |
-| 5 | 放行出站 | 前面都没拦。上游自己的拒答单独列出，用来看漏拦。 | 进入槽位 |
-
-每关可看今日命中和拦截流水。点开一条对正文；误伤就收这道关，不要删槽。判定记在请求日志里。这一版之前的旧日志没有判定，显示为「未经关卡」。
+「风险审计」（`/console/#/risk`）展示封禁原因和原请求、上游 HTTP 400，以及实际降级出站次数。默认设备封禁阶梯为 10 分钟、24 小时、永久；违规会话持续封锁。普通上游 400 不计违规。
 
 细则：[docs/RISK.md](docs/RISK.md)。
 
@@ -332,17 +324,9 @@ Nine pillars for anti-ban emulation and production operations:
 
 ### 3️⃣ Pre-hop risk gates
 
-`/v1` and `count_tokens` pass the console **Risk** page (`/console/#/risk`) before any slot is chosen. A hit returns an error and does not spend upstream quota. The order is fixed:
+Before inference egress, hard rules check device and session bans, blocked tools, system-prompt rewrites, distillation, regex rules, and cached refusals. Jev reviews only user turns and readable inline file text, then can allow the standard route, narrow it to a configured pool or channel, select a configured model, or reject the request.
 
-| Order | Gate | What it stops | Result |
-|:---|:---|:---|:---|
-| 1 | Distill | Harvest templates, problem fingerprints, and chain-of-thought extraction shapes. OpenAI platform models are skipped. Official Claude Code and zero-injection are skipped by default. | 403, and the device is banned |
-| 2 | Hard regex | NSFW, cracking, jailbreak, and custom patterns. Distill-category patterns follow the distill switch, not the hard-regex switch, and still scan official clients and zero-injection. OpenAI platform models skip that category. | 403 |
-| 3 | Refusal cache | Exact text, similar text, and devices the upstream has already refused. Hard-regex and decision-model blocks are not stored here. | 400, non-retryable, not a login failure |
-| 4 | Decision model | A safety model scores the text and blocks only below the threshold. If scoring fails, the request is allowed by default and marked on the pass column. | 403 |
-| 5 | Passed egress | Everything the gates allowed. The upstream's own refusals are listed separately, so a miss is visible. | Enters a slot |
-
-Open a hit and read the body. A false positive means tighten that gate, not delete the slot. Requests from before this recording show as unchecked. Full rules: [docs/RISK.md](docs/RISK.md).
+The **Risk** page (`/console/#/risk`) links bans to their source logs and lists upstream HTTP 400s and actual downgraded requests separately. The default device ban ladder is 10 minutes, 24 hours, then permanent. Ordinary upstream 400s do not count as violations. Full rules: [docs/RISK.md](docs/RISK.md).
 
 ### 4️⃣ Completely Isolated Network (1 VM = 1 Egress)
 - **Zero Cross-Account Contamination**: Every VM slot is strictly bound to its own dedicated SOCKS5 proxy or local egress gateway. 

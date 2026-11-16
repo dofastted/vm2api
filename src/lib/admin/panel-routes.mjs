@@ -190,6 +190,7 @@ import * as panel from './panel-api.mjs'
 import { GATEWAY_CAPABILITIES } from '../vm/execution-context.mjs'
 import { withVmLock, atomicWriteJson, isValidVmId, invalidateVmSlotReadCache } from '../vm/vm-file.mjs'
 import { snapshotDatabaseMetrics } from '../db/database-metrics.mjs'
+import { queryActiveUsage } from '../oauth/active-usage-query.mjs'
 import { getUsageCache } from '../oauth/usage-cache.mjs'
 import { getDb, getDbPath } from '../db/database.mjs'
 import { usagePoolEnabled, usageRead } from '../db/sqlite-pool.mjs'
@@ -283,7 +284,13 @@ import {
 import { inspectClusterPayloadChanges, refreshClusterSlotPayloads } from '../cluster/remote-slot.mjs'
 import { readRawBody as defaultReadRawBody } from '../http/respond.mjs'
 import { corsHeadersForRequest } from '../http/cors.mjs'
-import { createCragShopHandler, cragShopRoute, isCragShopPath, sameOriginPost } from './crag-shop.mjs'
+import {
+  createCragShopHandler,
+  cragShopRoute,
+  isCragDeviceShopPath,
+  isCragShopPath,
+  sameOriginPost,
+} from './crag-shop.mjs'
 import { createCragSubscriptionHandler, cragSubscriptionRoute } from './crag-subscription-routes.mjs'
 import { restartRustKernel, syncClaudeKernelConfigs, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
 
@@ -404,6 +411,8 @@ function usageLogFilters(req, u) {
     endpoint: get('endpoint'),
     protocol: get('protocol'),
     status_code: get('status_code'),
+    upstream_400: get('upstream_400') === '1',
+    request_id: get('request_id'),
     exclude_status_200: get('exclude_status_200') === '1',
     model_mismatch: get('model_mismatch') === '1',
     min_attempt_count: get('min_attempt_count'),
@@ -1617,6 +1626,7 @@ export function createPanelHandler(ctx) {
     if (isCragShopPath(p)) {
       res.setHeader('Cache-Control', 'no-store')
       const route = cragShopRoute(req.method, p)
+      if (isCragDeviceShopPath(p)) return handleCragShop(req, res, url, route)
       if (route === 'plans') {
         // A valid buyer session gets the pilot catalogue; everyone else gets the public view.
         requireAuth(req, res, { buyer: true, optionalBuyer: true })
@@ -2796,14 +2806,14 @@ export function createPanelHandler(ctx) {
         const selection = validateKernelTargets(cfg.paths.project, body?.targets)
         if (!selection.ok)
           return json(res, selection.status, { ok: false, error: { code: selection.code, message: selection.error } })
-        if (body.targets.some((target) => target.reissue === true)) {
-          const identity = panelIdentity(req)
-          if (req.apiKeyKind || identity.role !== 'admin' || !identity.user || !sameOriginPost(req, cfg.base_url)) {
-            return json(res, 403, {
-              ok: false,
-              error: { code: 'forbidden', message: '只有从面板确认重装的管理员才能重新签发订阅许可。' },
-            })
-          }
+        const identity = panelIdentity(req)
+        const mayBindSubscription =
+          !req.apiKeyKind && identity.role === 'admin' && !!identity.user && sameOriginPost(req, cfg.base_url)
+        if (!mayBindSubscription && body.targets.some((target) => target.reissue === true)) {
+          return json(res, 403, {
+            ok: false,
+            error: { code: 'forbidden', message: '只有从面板确认安装的管理员才能绑定订阅许可。' },
+          })
         }
         // Check the entire explicit scope before the first target can be stopped.
         if (body.targets.some((target) => userMissesVmId(req, cfg.paths.project, target.id))) {
@@ -2816,7 +2826,7 @@ export function createPanelHandler(ctx) {
           watchdog: ctx.kernelWatchdog,
           poolScheduler: ctx.poolScheduler,
           ops: ctx.kernelInstallOps,
-          cragSubscription: ctx.cragSubscription,
+          cragSubscription: mayBindSubscription ? ctx.cragSubscription : undefined,
         })
         return json(res, 200, panel.ok(report))
       }
@@ -3820,6 +3830,16 @@ export function createPanelHandler(ctx) {
           if (memoryRaiseResult && detail?.data) detail.data.memory_raise = memoryRaiseResult
           return json(res, 200, detail)
         })
+      }
+      // Explicit quota refresh: no inference request or cached-success response.
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/usage\/query$/.test(p)) {
+        const id = p.split('/')[4]
+        const result = await queryActiveUsage({
+          projectRoot: cfg.paths.project,
+          vm: getVm(cfg.paths.project, id),
+          accountQuota,
+        })
+        return json(res, result.status, result.body)
       }
       // POST /api/panel/vms/:id/probe
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/probe$/.test(p)) {
@@ -5228,6 +5248,9 @@ export function createPanelHandler(ctx) {
       // POST /api/panel/vms/:id/start
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/start$/.test(p)) {
         const id = p.split('/')[4]
+        const identity = panelIdentity(req)
+        const bindSubscription =
+          !req.apiKeyKind && identity.role === 'admin' && !!identity.user && sameOriginPost(req, cfg.base_url)
         const started = await withVmLock(path.join(cfg.paths.project, 'vms', `${id}.json`), async () => {
           const result = await powerOnSlot({
             projectRoot: cfg.paths.project,
@@ -5236,6 +5259,7 @@ export function createPanelHandler(ctx) {
             routing: ctx.routingConfig,
             fillTimezone: fillTimezoneFromExit,
             by: 'start',
+            runtimeOptions: { bindSubscription },
           })
           if (result.ok) releaseKernelInstallSafetyHold(cfg.paths.project, id, ctx.kernelWatchdog)
           return result

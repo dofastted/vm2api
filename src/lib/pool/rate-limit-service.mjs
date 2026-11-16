@@ -15,6 +15,8 @@ export const DEFAULT_RATE_LIMIT = Object.freeze({
   fallback_cooldown_min: 30,
   overload_cooldown_min: 10,
   empty_response_cooldown_sec: 60,
+  // Account or model 429s can ask /usage, at most once per account per interval.
+  usage_probe_min_interval_sec: 180,
 })
 
 export const EMPTY_RESPONSE_REASON = 'empty_response'
@@ -35,6 +37,10 @@ export function normalizeRateLimitConfig(raw = {}) {
     empty_response_cooldown_sec: positive(
       src.empty_response_cooldown_sec,
       DEFAULT_RATE_LIMIT.empty_response_cooldown_sec,
+    ),
+    usage_probe_min_interval_sec: positive(
+      src.usage_probe_min_interval_sec,
+      DEFAULT_RATE_LIMIT.usage_probe_min_interval_sec,
     ),
   }
 }
@@ -97,30 +103,45 @@ export class RateLimitService {
   /**
    * sub2api HandleUpstreamError: writes the hard column for this failure. Returns the block, or null.
    * The classifier decides the scope; a model / Fable / RPM 429 stays a short cooldown.
-   * An unknown bare 429 writes no hard block: the scope is unproven, so one
-   * bounded usage probe decides whether the account window is really spent.
+   * An unknown bare 429 writes no hard block: the scope is unproven.
+   * A 429 not scoped to the request asks the official usage probe (throttled per account)
+   * which window is spent: a `rejected` window then keeps the scheduler off the
+   * account until its reset, a short limit just passes. Retry-After alone
+   * never proves a plan window.
    */
   handleUpstreamError({ accountId, vmId, result = {}, policy = null, now = Date.now() } = {}) {
-    if (!accountId || !this.runtimeRepo || result?.committed) return null
+    if (!accountId || !this.runtimeRepo || result?.committed || policy?.scope === 'request') return null
     const reason = String(policy?.reason || '')
+    if (Number(result?.status) === 429) {
+      this.requestUsageProbe({ accountId, vmId, now })
+    }
     if (policy?.scope === 'account' && reason === 'account_quota_exhausted') {
       return this.handle429({ accountId, vmId, result, now })
     }
-    if (reason === 'rate_limited_unknown') {
-      this.requestUsageProbe({ accountId, vmId })
-      return null
-    }
+    if (reason === 'rate_limited_unknown') return null
     if (reason === 'provider_overloaded' && Number(result?.status) === 529) {
       return this.handle529({ accountId, vmId, now })
     }
     return null
   }
 
-  requestUsageProbe({ accountId, vmId }) {
-    if (typeof this.onUsageProbe !== 'function') return
+  /** One usage probe per account per `usage_probe_min_interval_sec`. Returns whether it asked. */
+  requestUsageProbe({ accountId, vmId, now = Date.now() }) {
+    if (typeof this.onUsageProbe !== 'function') return false
+    const key = String(accountId || vmId || '')
+    if (!key) return false
+    if (!this.probeAskedAt) this.probeAskedAt = new Map()
+    const gapMs = Number(this.config.usage_probe_min_interval_sec) * 1000
+    const last = this.probeAskedAt.get(key)
+    if (last != null && now - last < gapMs) return false
+    this.probeAskedAt.set(key, now)
+    if (this.probeAskedAt.size > 1000) {
+      for (const [id, at] of this.probeAskedAt) if (now - at >= gapMs) this.probeAskedAt.delete(id)
+    }
     try {
       this.onUsageProbe({ accountId, vmId })
     } catch {}
+    return true
   }
 
   handle429({ accountId, vmId, result = {}, now = Date.now() }) {
@@ -143,7 +164,7 @@ export class RateLimitService {
         countRequest: false,
       })
     } catch {}
-    if (fallback) this.requestUsageProbe({ accountId, vmId })
+    if (fallback) this.requestUsageProbe({ accountId, vmId, now })
     return { kind: 'rate_limited', until: resetAt, window: parsed?.window || null, fallback }
   }
 

@@ -27,7 +27,6 @@ const state = vi.hoisted(() => ({
   cursor: 0,
   buttons: [] as ButtonProps[],
   confirm: undefined as ConfirmProps | undefined,
-  payloadTag: undefined as string | undefined,
   invalidateQueries: vi.fn(),
 }))
 
@@ -77,8 +76,8 @@ vi.mock('@tanstack/react-query', async (importOriginal) => ({
                 id: 'crag',
                 paid: true,
                 ready: true,
-                version: '3.1.2',
-                payload_tag: state.payloadTag,
+                version: '3.0.8',
+                payload_tag: 'payload-2026.11.16-crag-3.0.8',
               },
             ],
             licenses: state.licenses,
@@ -144,7 +143,6 @@ beforeEach(() => {
   state.cursor = 0
   state.buttons = []
   state.confirm = undefined
-  state.payloadTag = undefined
   state.invalidateQueries.mockReset()
   vi.mocked(installKernelTargets).mockReset()
   vi.mocked(installKernelTargets).mockImplementation(async (targets) => ({
@@ -160,30 +158,6 @@ beforeEach(() => {
     })),
   }))
 })
-
-function legacyLicenseForNewPayload() {
-  state.payloadTag = 'crag-v2-amd64-v3.1.2'
-  state.licenses['vm-old'] = {
-    status: 'valid',
-    valid: true,
-    vm_id: 'vm-old',
-    scope: 'kernel',
-  }
-  state.installLicenses = {
-    'vm-old': {
-      status: 'invalid',
-      valid: false,
-      vm_id: 'vm-old',
-      code: 'license_payload_key_mismatch',
-    },
-  }
-  state.installations['vm-old'] = {
-    kernel: 'crag',
-    version: '3.1.2',
-    payload_tag: 'crag-v2-amd64-v3.1.2-legacy',
-    installed_at: '',
-  }
-}
 
 async function reinstallCrag(vm: Partial<Vm>) {
   const selected: Partial<Vm> = {
@@ -209,92 +183,61 @@ async function reinstallCrag(vm: Partial<Vm>) {
   )
 }
 
-describe('KVM subscription authorization when reinstalling the standard payload', () => {
+describe('KVM reinstall confirmation', () => {
   it.each([
     { runtime_type: 'kvm' },
     { runtime: { type: 'kvm' } },
     { runtime: { type: 'qemu' } },
     { runtime: { type: 'libvirt' } },
   ] satisfies Partial<Vm>[])(
-    'requests a new subscription permit for local runtime %j',
+    'pins the confirmed payload for local runtime %j',
     async (vm) => {
-      legacyLicenseForNewPayload()
       await reinstallCrag(vm)
       expect(installKernelTargets).toHaveBeenCalledExactlyOnceWith([
         {
           id: 'vm-old',
           kernel: 'crag',
-          payload_tag: state.payloadTag,
-          reissue: true,
+          payload_tag: 'payload-2026.11.16-crag-3.0.8',
         },
       ])
     }
   )
 
   it.each(['docker', 'kvm', 'qemu', 'libvirt'])(
-    'preserves upstream subscription reissue for remote %s slots',
+    'pins the confirmed payload for remote %s slots',
     async (type) => {
-      legacyLicenseForNewPayload()
       await reinstallCrag({ runtime: { type }, node_id: 'node-remote' })
       expect(installKernelTargets).toHaveBeenCalledExactlyOnceWith([
         {
           id: 'vm-old',
           kernel: 'crag',
-          payload_tag: state.payloadTag,
-          reissue: true,
+          payload_tag: 'payload-2026.11.16-crag-3.0.8',
         },
       ])
     }
   )
-
-  it.each([
-    { runtime_type: 'kvm', node_platform: 'darwin' },
-    { runtime: { type: 'native' } },
-    { runtime_type: 'kvm', kind: 'codex' },
-    { runtime_type: 'kvm', node_id: 'node-remote', node_platform: 'darwin' },
-    { runtime_type: 'kvm', node_id: 'node-remote', kind: 'codex' },
-  ] satisfies Partial<Vm>[])(
-    'does not offer subscription fallback to unsupported placement %j',
-    (vm) => {
-      legacyLicenseForNewPayload()
-      expect(render(vm)).not.toContain(
-        '确认重装时会尝试使用本机已激活的宿主订阅'
-      )
-    }
-  )
 })
 
-it.each(['host', 'device', 'kernel'] as const)(
-  'offers subscription fallback with a valid %s permit for the old package',
-  (scope) => {
+it.each(['license_required', 'license_payload_key_mismatch'])(
+  'does not gate installation or recommend reissue based on the cached %s hint',
+  (code) => {
     state.licenses['vm-old'] = {
       status: 'valid',
       valid: true,
       vm_id: 'vm-old',
-      scope,
+      scope: 'host',
     }
+    // Older backends may still return the hint. The install decision belongs to the server.
     state.installLicenses = {
-      'vm-old': {
-        status: 'invalid',
-        valid: false,
-        vm_id: 'vm-old',
-        code: 'license_payload_key_mismatch',
-      },
+      'vm-old': { status: 'invalid', valid: false, vm_id: 'vm-old', code },
     }
-    const vm = { runtime_type: 'docker', resolved_dataplane: 'crag' } as const
-    expect(render(vm)).toContain('确认重装时会尝试使用本机已激活的宿主订阅')
-    expect(render(vm)).toContain('授权有效')
-    for (const placement of [
-      { node_id: 'cluster-node' },
-      { runtime: { type: 'kvm' } },
-      { node_id: 'cluster-node', runtime: { type: 'kvm' } },
-    ]) {
-      expect(render({ ...vm, ...placement })).toContain(
-        '确认重装时会尝试使用本机已激活的宿主订阅'
-      )
-    }
-    state.installLicenses = { ...state.licenses }
-    expect(render(vm)).not.toContain('确认重装时会尝试使用本机已激活的宿主订阅')
+    const html = render({ runtime_type: 'docker', resolved_dataplane: 'crag' })
+    expect(html).toContain('授权有效')
+    expect(html).not.toContain('确认重装时会尝试使用本机已激活的宿主订阅')
+    expect(html).toContain('aria-label="安装 vm-old 并重启"')
+    expect(html).not.toMatch(
+      /<button[^>]*disabled=""[^>]*aria-label="安装 vm-old 并重启"/
+    )
   }
 )
 

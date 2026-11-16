@@ -22,6 +22,11 @@ import { validTimezone } from '../core/timezone.mjs'
 
 export const DEFAULT_GEO_ENDPOINT =
   'http://ip-api.com/json/?fields=status,message,query,country,countryCode,regionName,city,timezone,isp'
+/**
+ * HTTPS fallback for the plain-HTTP default. Proxies that only allow CONNECT 443
+ * reject port 80 (403 / reset). Same exit, so the answer still describes it.
+ */
+export const DEFAULT_GEO_HTTPS_FALLBACK = 'https://ipapi.co/json/'
 export const DEFAULT_GEO_TIMEOUT_MS = 8000
 /** Hostname resolves to AAAA only; unreachable over an IPv4-only exit. */
 export const DEFAULT_GEO_V6_IP_ENDPOINT = 'https://ipv6.icanhazip.com'
@@ -110,6 +115,20 @@ async function fetchThroughProxy(url, proxyUrl, { timeoutMs, fetchImpl, accept }
  */
 export async function lookupProxyGeo(proxyUrl, { endpoint, timeoutMs, fetchImpl, ipv6Mode } = {}) {
   const url = endpoint || process.env.KIN_PROXY_GEO_URL || DEFAULT_GEO_ENDPOINT
+  const first = await lookupGeoOnce(url, proxyUrl, { timeoutMs, fetchImpl, ipv6Mode })
+  if (first.terminal) {
+    const { terminal, ...result } = first
+    return result
+  }
+  if (first.ok || !proxyUrl || url !== DEFAULT_GEO_ENDPOINT) return first
+  // A proxy refusing CONNECT 80 answers 403 or drops the tunnel; provider errors (429, bad payload) stay final.
+  if (first.error !== 'geo_http_403' && !String(first.error).startsWith('geo_transport_error')) return first
+  // Only the built-in plain-HTTP endpoint gets a second try, over HTTPS through the same proxy.
+  const second = await lookupGeoOnce(DEFAULT_GEO_HTTPS_FALLBACK, proxyUrl, { timeoutMs, fetchImpl })
+  return second.ok ? second : { ok: false, error: first.error }
+}
+
+async function lookupGeoOnce(url, proxyUrl, { timeoutMs, fetchImpl, ipv6Mode } = {}) {
   const res = await fetchThroughProxy(url, proxyUrl, {
     timeoutMs,
     fetchImpl,
@@ -120,7 +139,10 @@ export async function lookupProxyGeo(proxyUrl, { endpoint, timeoutMs, fetchImpl,
     // mode, verify an IPv6 exit before querying metadata over the host route.
     // A bad SOCKS password therefore cannot turn into a successful direct lookup.
     if (proxyUrl && url === DEFAULT_GEO_ENDPOINT && ipv6LookupMode(ipv6Mode) === 'control-plane') {
-      return lookupProxyGeoV6(proxyUrl, { timeoutMs, fetchImpl, lookupMode: 'control-plane' })
+      return {
+        ...(await lookupProxyGeoV6(proxyUrl, { timeoutMs, fetchImpl, lookupMode: 'control-plane' })),
+        terminal: true,
+      }
     }
     return { ok: false, error: res.error }
   }

@@ -154,12 +154,14 @@ test('different user text under the same system is not a near match', () => {
 })
 
 test('panel policy defaults on at 90 and rejects an unknown threshold', () => {
-  assert.deepEqual(refusalGuardPolicy(), {
+  const { risk_audit, ...base } = refusalGuardPolicy()
+  assert.deepEqual(base, {
     enabled: true,
     similarity_enabled: true,
     similarity: 90,
     device_block_enabled: true,
   })
+  assert.deepEqual(risk_audit.ban_steps, [10, 1440, 0])
   const settings = new Map()
   const store = {
     get: (key, fallback) => (settings.has(key) ? settings.get(key) : fallback),
@@ -175,6 +177,7 @@ test('panel policy defaults on at 90 and rejects an unknown threshold', () => {
       similarity_enabled: false,
       similarity: 85,
       device_block_enabled: true,
+      risk_audit,
     },
   )
 })

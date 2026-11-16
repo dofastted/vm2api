@@ -173,6 +173,7 @@ function userVmPathAllowed(method, path) {
       rest === 'schedulable' ||
       rest === 'cooldown/clear' ||
       rest === 'circuit/reset' ||
+      rest === 'usage/query' ||
       rest === 'probe' ||
       rest === 'test-chat' ||
       rest === 'count-tokens' ||

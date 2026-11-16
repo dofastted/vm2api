@@ -1281,6 +1281,12 @@ test('CRAG session policy follows the panel unless the VM pins its seat limit', 
     const pinned = write({ ...vm, policy: { sessionSlots: 4, sessionSlotsOverride: true } }, { routing })
     assert.equal(pinned.session_slots, 4)
     assert.equal(pinned.prewarm_enabled, false)
+    const capped = write(
+      { ...vm, machine: { memory: '2g', pids_limit: 448 }, claude: { account_tier: 'pro' } },
+      { routing: { ...routing, slot_capacity: { enabled: true } } },
+    )
+    assert.equal(capped.slots_per_worker, 5)
+    assert.equal(capped.session_slots, 5)
     assert.equal(write({ ...vm, dataplane: 'wrap' }, { routing }).prewarm_enabled, undefined)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
@@ -1730,6 +1736,33 @@ test('reconcileCliHopRuntime reaps zombies and unpauses without CONNECT', async 
   const vm = JSON.parse(fs.readFileSync(path.join(root, 'vms', 'vm-10.json'), 'utf8'))
   assert.equal(vm.status, 'running')
   fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('reconcileCliHopRuntime accepts Claude onboarding inside a cluster-node slot once', async () => {
+  const calls = []
+  const runDockerExec = async (args) => {
+    calls.push(args)
+    if (args.includes('python3')) return { ok: true, stdout: 'patched /home/kincli/.claude/.claude.json' }
+    return { ok: true }
+  }
+  const exec = {
+    vmId: 'vm-node-onboard',
+    vm: {
+      id: 'vm-node-onboard',
+      node_id: 'node-test',
+      status: 'running',
+      runtime: { container: 'kin-vm-node-onboard', user: '10001:987' },
+    },
+  }
+  const first = await reconcileCliHopRuntime(exec, { runDockerExec })
+  assert.deepEqual(first.actions, ['reap_zombies', 'node_claude_setup'])
+  const setup = calls.find((args) => args.includes('python3'))
+  assert.ok(setup, JSON.stringify(calls))
+  assert.deepEqual(setup.slice(0, 4), ['exec', '-u', '10001:987', 'kin-vm-node-onboard'])
+  assert.match(setup.at(-1), /hasCompletedOnboarding/)
+  const second = await reconcileCliHopRuntime(exec, { runDockerExec })
+  assert.deepEqual(second.actions, ['reap_zombies'])
+  assert.equal(calls.filter((args) => args.includes('python3')).length, 1)
 })
 
 test('scheduleWrapRecycle bounces once then cools down', async () => {
@@ -2253,6 +2286,19 @@ unixTest('Rust supervisor does not recycle a busy CLI with ready_slots=0', async
     await new Promise((resolve) => server.close(resolve))
     fs.rmSync(root, { recursive: true, force: true })
   }
+})
+
+test('CRAG slot convergence repairs an over-cap session limit even when the slot count is unchanged', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-session-cap-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const file = path.join(root, 'kernel.json')
+  const config = { slots_per_worker: 5, session_slots: 20, runtime_variant: 'crag-v2' }
+  fs.writeFileSync(file, JSON.stringify(config))
+  const health = { ok: true, engine: 'rust', healthy: true, capacity: 5, cli_pid: 1 }
+  assert.equal(kernelSlotsConverge(file, health, 5), false)
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { ...config, session_slots: 5 })
+  assert.equal(kernelSlotsConverge(file, { ...health, capacity: 12 }, 12, 20), false)
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { ...config, slots_per_worker: 12, session_slots: 12 })
 })
 
 test('kernel slot count compares the live count before the file', () => {

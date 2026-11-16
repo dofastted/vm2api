@@ -1784,13 +1784,30 @@ function firstUserIndex(messages) {
   return messages.findIndex((message) => message?.role === 'user')
 }
 
+function insertSystemAfterUser(messages, user, content) {
+  if (user < 0) return messages
+  const assistant = messages.findIndex((message, index) => index > user && message?.role === 'assistant')
+  const at = assistant < 0 ? messages.length : assistant
+  const previous = messages[at - 1]
+  const existing = previous?.content
+  if (previous?.role === 'system' && (Array.isArray(existing) ? existing.length : String(existing || '').trim())) {
+    const joined =
+      typeof existing === 'string' && typeof content === 'string'
+        ? `${existing}\n\n${content}`
+        : [
+            ...(Array.isArray(existing) ? existing : [{ type: 'text', text: existing }]),
+            ...(Array.isArray(content) ? content : [{ type: 'text', text: content }]),
+          ]
+    return [...messages.slice(0, at - 1), { ...previous, content: joined }, ...messages.slice(at)]
+  }
+  return [...messages.slice(0, at), { role: 'system', content }, ...messages.slice(at)]
+}
+
 /** 2.1.263 leftover: after the first user, not inside system[]. */
 export function insertMidConversationSystem(messages, text) {
   const t = String(text || '').trim()
   if (!t || !Array.isArray(messages)) return messages
-  const idx = firstUserIndex(messages)
-  if (idx < 0) return messages
-  return [...messages.slice(0, idx + 1), { role: 'system', content: t }, ...messages.slice(idx + 1)]
+  return insertSystemAfterUser(messages, firstUserIndex(messages), t)
 }
 
 /** Caller text stays in system segment 5. Do not lift it into role=system. */
@@ -2182,9 +2199,8 @@ function applyTemplatePersona(
       // without this injected block, so a tail position shifts every turn and
       // breaks the cache prefix from that point on. Zero templates keep the
       // caller-visible tail placement.
-      const at = zero ? outMessages.findLastIndex((message) => message?.role === 'user') : firstUserIndex(outMessages)
-      if (at >= 0)
-        outMessages = [...outMessages.slice(0, at + 1), { role: 'system', content }, ...outMessages.slice(at + 1)]
+      const user = zero ? outMessages.findLastIndex((message) => message?.role === 'user') : firstUserIndex(outMessages)
+      outMessages = insertSystemAfterUser(outMessages, user, content)
     }
   }
   if (midSystem) {

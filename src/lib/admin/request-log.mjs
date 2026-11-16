@@ -549,6 +549,14 @@ export class RequestLogStore {
       model: extra.model || null,
       stream: !!extra.stream,
       status: extra.status ?? null,
+      upstream_status: extra.audit_upstream_400
+        ? 400
+        : Number(extra.upstream_status) === 400
+          ? null
+          : (extra.upstream_status ?? null),
+      upstream_400_message: extra.audit_upstream_400_message
+        ? String(extra.audit_upstream_400_message).slice(0, 300)
+        : null,
       duration_ms,
       api_key_kind: extra.api_key_kind || null,
       api_key_id: extra.api_key_id || null,
@@ -626,7 +634,6 @@ export class RequestLogStore {
             : null,
         hop_meta: extra.hop_meta || null,
         via: extra.via || extra.hop_meta?.via || null,
-        upstream_status: extra.upstream_status ?? null,
         outbound_summary: extra.outbound_summary || null,
         cache_prefix: extra.cache_prefix || null,
         cache_continuity: extra.cache_continuity || null,
