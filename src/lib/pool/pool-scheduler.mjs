@@ -286,10 +286,17 @@ function guardWindowReading(window, now) {
   const until = guardResetMs(window.reset)
   if (until != null && until <= now) return null
   const status = String(window.status || '').toLowerCase()
-  if (status === 'rejected' || status === 'rate_limited') return { ratio: 1, until, rejected: true }
-  let ratio = Number(window.utilization)
-  if (window.utilization == null || window.utilization === '' || !Number.isFinite(ratio)) return null
-  if (ratio > 1.5) ratio /= 100
+  const raw = Number(window.utilization)
+  const hasRatio = window.utilization != null && window.utilization !== '' && Number.isFinite(raw)
+  const percent = hasRatio && raw > 1.5
+  const ratio = hasRatio ? (percent ? raw / 100 : raw) : null
+  if (status === 'rejected' || status === 'rate_limited') {
+    // Same rule as headerHardBlocked: a legacy percent reading below 100 next to
+    // a rejected flag is that percentage, not a spent window.
+    if (percent && ratio < 1) return { ratio, until, rejected: false }
+    return { ratio: 1, until, rejected: true }
+  }
+  if (!hasRatio) return null
   return { ratio, until, rejected: false }
 }
 
@@ -1358,6 +1365,8 @@ export class PoolScheduler extends EventEmitter {
         }
         if (guard.level === 'continuing' && continuingVmIds && !continuingVmIds.has(vm.id)) continue
       }
+      // Admission re-reads the guard; it needs to know whether this request continues here.
+      const quotaContinuing = continuingVmIds ? continuingVmIds.has(vm.id) : null
       const eligibility = await this.checkEligibility({
         vm,
         accountId,
@@ -1415,6 +1424,7 @@ export class PoolScheduler extends EventEmitter {
         waitReason: eligibility.waitReason || null,
         cooldownReason: state?.cooldown_reason || null,
         quotaRequest,
+        quotaContinuing,
         signal,
         ownerScope,
         keyScope,
@@ -2021,6 +2031,13 @@ export class PoolScheduler extends EventEmitter {
     if (!pinned) {
       if (hardBlockOf(state, now)) return null
       if (account && account.status !== 'active') return null
+      // 额度耗尽保护 again at admission: a queued request holds the candidate it
+      // saw before waiting, and a usage update may have crossed a line since.
+      if (account) {
+        const guard = quotaGuardLevel(account.unified, quotaGuardConfigOf(this.accountQuota?.config), now)
+        if (guard.level === 'stop') return null
+        if (guard.level === 'continuing' && candidate.quotaContinuing === false) return null
+      }
       if (account) {
         const availability = evaluateAccount({
           vm,

@@ -63,7 +63,7 @@ function poolWith(root, unifiedByAccount, { guard = true, sticky = null } = {}) 
     writeHeartbeat() {},
     schedulingSnapshot: (ids) => new Map(ids.map((id) => [id, { state: null, account: accounts.get(id) || null }])),
   }
-  return new PoolScheduler({
+  const pool = new PoolScheduler({
     projectRoot: root,
     runtimeRepo,
     stickyRouter: sticky ? { resolve: (key) => (key === sticky.key ? sticky.bound : null) } : null,
@@ -82,6 +82,8 @@ function poolWith(root, unifiedByAccount, { guard = true, sticky = null } = {}) 
     workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
     config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
   })
+  pool.testAccounts = accounts
+  return pool
 }
 
 const at = (ratio, extra = {}) => ({
@@ -323,4 +325,37 @@ test('without the switch the same pool still sends a new conversation to the 90%
     assert.equal(picked.accountId, 'account-1')
     picked.release()
   }
+})
+
+test('a legacy percent reading below 100 next to rejected is that percentage', () => {
+  const now = Date.now()
+  const reset = new Date(now + HOUR).toISOString()
+  const legacy = { headers: { '5h': { utilization: 26, status: 'rejected', reset } } }
+  assert.equal(quotaGuardLevel(legacy, off, now).level, 'open')
+  assert.equal(quotaGuardUsage(legacy, now).ratio, 0.26)
+  const full = { headers: { '5h': { utilization: 100, status: 'rejected', reset } } }
+  assert.equal(quotaGuardLevel(full, off, now).level, 'stop')
+})
+
+test('admission re-reads the guard: a queued candidate cannot cross a line it saw open', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pool = poolWith(root, { 'account-1': at(0.5), 'account-2': at(0.1) })
+  const candidates = await pool.eligibleCandidates({ model: 'claude-test', continuingVmIds: new Set() })
+  const first = candidates.find((item) => item.vmId === 'vm-01')
+  const ok = pool.reserve(first)
+  assert.ok(ok)
+  ok.release()
+
+  pool.testAccounts.set('account-1', { account_id: 'account-1', status: 'active', unified: at(0.9) })
+  assert.equal(pool.reserve(first), null, 'new conversation in the 85% band')
+  const pinned = (await pool.eligibleCandidates({ model: 'claude-test', continuingVmIds: new Set(['vm-01']) })).find(
+    (item) => item.vmId === 'vm-01',
+  )
+  const kept = pool.reserve(pinned)
+  assert.ok(kept, 'pinned conversation keeps its account in the band')
+  kept.release()
+
+  pool.testAccounts.set('account-1', { account_id: 'account-1', status: 'active', unified: at(0.96) })
+  assert.equal(pool.reserve(pinned), null, 'nothing past the stop line')
 })
