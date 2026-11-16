@@ -86,6 +86,22 @@ export type RefusalDeviceBlock = {
   source_request_id: string | null
   fingerprint: string | null
   reason: string | null
+  subject_kind: 'device' | 'session'
+  identity_value: string
+  session_id: string | null
+  violations: number
+  expires_at: string | null
+}
+
+export type RiskAuditPolicy = {
+  ban_steps: number[]
+  blocked_tools: { name: string; message: string }[]
+  upstream_policy_phrases: string[]
+  downgrade_pool: string
+  downgrade_endpoint: string
+  downgrade_model: string
+  route_margin: number
+  model_margin: number
 }
 
 export type RefusalGuardConfig = {
@@ -94,6 +110,7 @@ export type RefusalGuardConfig = {
   /** 80、85、90 或 95。 */
   similarity: number
   device_block_enabled: boolean
+  risk_audit: RiskAuditPolicy
   count: number
   items: RefusalGuardItem[]
   device_count: number

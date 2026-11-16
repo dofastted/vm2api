@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
+import type { ApiEndpoint } from '@/types/panel-api-endpoints'
 import type { ApiKeyItem, VmPool } from '@/types/panel-keys'
 import type { Vm } from '@/types/panel-vm'
 import { isCodexVm } from '@/lib/vm-kind'
@@ -94,6 +95,9 @@ export function KeyLimitsDialog({
   onSubmit,
   vms = [],
   pools,
+  channels,
+  channelsLoading,
+  channelsError,
 }: {
   mode: 'create' | 'edit'
   open: boolean
@@ -103,6 +107,9 @@ export function KeyLimitsDialog({
   onSubmit: (draft: KeyLimitsDraft) => void
   vms?: Vm[]
   pools?: VmPool[]
+  channels?: ApiEndpoint[]
+  channelsLoading?: boolean
+  channelsError?: boolean
 }) {
   const [draft, setDraft] = useState<KeyLimitsDraft>(blankDraft())
 
@@ -114,6 +121,7 @@ export function KeyLimitsDialog({
       setDraft({
         name: initial.name || '',
         category: initial.category === 'api' ? 'api' : 'oauth',
+        api_endpoint_id: initial.api_endpoint_id || '',
         max_concurrency: Number(initial.max_concurrency ?? 20),
         quota_requests: Number(initial.quota_requests ?? 0),
         quota_usd: Number(initial.quota_usd ?? 0),
@@ -134,9 +142,22 @@ export function KeyLimitsDialog({
   const quotaOpts = mode === 'edit' ? QUOTA_EDIT : QUOTA_CREATE
   const rpmOpts = mode === 'edit' ? RPM_EDIT : RPM_CREATE
   const isApi = draft.category === 'api'
+  const enabledChannels = (channels || []).filter(
+    (channel) => !channel.disabled
+  )
+  const selectedChannel = enabledChannels.find(
+    (channel) => channel.id === draft.api_endpoint_id
+  )
+  const legacyApi =
+    mode === 'edit' && initial?.category === 'api' && !initial.api_endpoint_id
+  const unchangedChannel =
+    !!draft.api_endpoint_id &&
+    initial?.api_endpoint_id === draft.api_endpoint_id
   const listed = vmsInGroup(vms || [], draft.group_type)
   const scopeBlocked = isApi
-    ? false
+    ? !selectedChannel &&
+      !unchangedChannel &&
+      !(legacyApi && !draft.api_endpoint_id)
     : draft.group_type === 'pool'
       ? !draft.vm_pool_id
       : draft.group_type !== 'all' && draft.allowed_vms.length === 0
@@ -179,6 +200,7 @@ export function KeyLimitsDialog({
                   setDraft((d) => ({
                     ...d,
                     category: v === 'api' ? 'api' : 'oauth',
+                    api_endpoint_id: v === 'api' ? d.api_endpoint_id : '',
                     group_type:
                       v === 'api' && d.group_type === 'pool'
                         ? 'all'
@@ -245,121 +267,178 @@ export function KeyLimitsDialog({
               />
             </Field>
           ) : null}
-          <Field label={isApi ? 'API 协议' : '分组'}>
-            <Select
-              value={draft.group_type}
-              onValueChange={(v) => {
-                const group = v === 'pool' ? 'pool' : groupOf(v)
-                const keep = new Set(
-                  vmsInGroup(vms || [], group).map((vm) => vm.id)
-                )
-                setDraft((d) => ({
-                  ...d,
-                  group_type: group,
-                  allowed_vms:
-                    isApi || group === 'all' || group === 'pool'
-                      ? []
-                      : d.allowed_vms.filter((id) => keep.has(id)),
-                  ...(pools
-                    ? {
-                        vm_pool_id:
-                          !isApi && group === 'pool' ? d.vm_pool_id || '' : '',
-                      }
-                    : {}),
-                }))
-              }}
-            >
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value='all'>
-                  {isApi ? 'all · 全部协议' : 'all · 全局可调度'}
-                </SelectItem>
-                {!isApi && pools ? (
-                  <SelectItem value='pool'>账号池</SelectItem>
-                ) : null}
-                <SelectItem value='anthropic'>
-                  {isApi ? 'anthropic · Anthropic 协议' : 'anthropic'}
-                </SelectItem>
-                <SelectItem value='openai'>
-                  {isApi ? 'openai · OpenAI 协议' : 'openai'}
-                </SelectItem>
-              </SelectContent>
-            </Select>
-          </Field>
           {isApi ? (
-            <p className='text-xs text-muted-foreground sm:col-span-2'>
-              {draft.group_type === 'all'
-                ? 'API 直连密钥，可调度所有已启用的 API 端点。'
-                : `API 直连密钥，仅调度 ${draft.group_type} 协议的 API 端点。`}
-            </p>
-          ) : draft.group_type === 'pool' ? (
-            <Field label='账号池'>
+            <div className='space-y-1 sm:col-span-2'>
+              <Field label='API 渠道'>
+                <Select
+                  value={
+                    draft.api_endpoint_id || (legacyApi ? '__legacy__' : '')
+                  }
+                  onValueChange={(id) =>
+                    setDraft((d) => ({
+                      ...d,
+                      api_endpoint_id: id === '__legacy__' ? '' : id,
+                      group_type:
+                        id === '__legacy__'
+                          ? groupOf(initial?.group_type)
+                          : 'all',
+                    }))
+                  }
+                >
+                  <SelectTrigger className='w-full' aria-label='API 渠道'>
+                    <SelectValue placeholder='选择已启用的渠道' />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {legacyApi ? (
+                      <SelectItem value='__legacy__'>
+                        沿用原协议筛选（未绑定）
+                      </SelectItem>
+                    ) : null}
+                    {unchangedChannel && !selectedChannel ? (
+                      <SelectItem value={draft.api_endpoint_id!}>
+                        原渠道不可用 · {draft.api_endpoint_id}
+                      </SelectItem>
+                    ) : null}
+                    {enabledChannels.map((channel) => (
+                      <SelectItem key={channel.id} value={channel.id}>
+                        {channel.name || channel.id} · {channel.protocol} ·{' '}
+                        {channel.base_url}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </Field>
+              <p className='text-xs text-muted-foreground'>
+                {selectedChannel
+                  ? selectedChannel.models?.length
+                    ? `已保存 ${selectedChannel.models.length} 个模型；此密钥只调用所选渠道。`
+                    : '此渠道尚未保存模型。请先到 API 页面获取模型。'
+                  : channelsError
+                    ? '无法加载 API 渠道。请重试。'
+                    : channelsLoading
+                      ? '正在加载 API 渠道…'
+                      : unchangedChannel
+                        ? '原渠道已停用或删除，调用不会切换到其他渠道。'
+                        : !enabledChannels.length
+                          ? '暂无已启用的 API 渠道。请先配置渠道。'
+                          : '选择渠道后，此密钥只调用该渠道。'}
+              </p>
+            </div>
+          ) : null}
+          {!isApi || (legacyApi && !draft.api_endpoint_id) ? (
+            <Field label={isApi ? 'API 协议' : '分组'}>
               <Select
-                value={draft.vm_pool_id || ''}
-                onValueChange={(id) =>
-                  setDraft((d) => ({ ...d, vm_pool_id: id }))
-                }
+                value={draft.group_type}
+                onValueChange={(v) => {
+                  const group = v === 'pool' ? 'pool' : groupOf(v)
+                  const keep = new Set(
+                    vmsInGroup(vms || [], group).map((vm) => vm.id)
+                  )
+                  setDraft((d) => ({
+                    ...d,
+                    group_type: group,
+                    allowed_vms:
+                      isApi || group === 'all' || group === 'pool'
+                        ? []
+                        : d.allowed_vms.filter((id) => keep.has(id)),
+                    ...(pools
+                      ? {
+                          vm_pool_id:
+                            !isApi && group === 'pool'
+                              ? d.vm_pool_id || ''
+                              : '',
+                        }
+                      : {}),
+                  }))
+                }}
               >
                 <SelectTrigger>
-                  <SelectValue placeholder='选择账号池' />
+                  <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {(pools || []).map((pool) => (
-                    <SelectItem key={pool.id} value={pool.id}>
-                      {pool.name}
-                      {pool.enabled ? '' : ' · 停用'}
-                    </SelectItem>
-                  ))}
+                  <SelectItem value='all'>
+                    {isApi ? 'all · 全部协议' : 'all · 全局可调度'}
+                  </SelectItem>
+                  {!isApi && pools ? (
+                    <SelectItem value='pool'>账号池</SelectItem>
+                  ) : null}
+                  <SelectItem value='anthropic'>
+                    {isApi ? 'anthropic · Anthropic 协议' : 'anthropic'}
+                  </SelectItem>
+                  <SelectItem value='openai'>
+                    {isApi ? 'openai · OpenAI 协议' : 'openai'}
+                  </SelectItem>
                 </SelectContent>
               </Select>
             </Field>
-          ) : draft.group_type === 'all' ? (
-            <p className='text-xs text-muted-foreground sm:col-span-2'>
-              all 是最高权限，不再选择 VM。
-            </p>
-          ) : (
-            <div className='sm:col-span-2'>
-              <Field label='可用 VM'>
-                <div className='max-h-40 space-y-1 overflow-y-auto rounded-md border p-2'>
-                  {listed.length === 0 ? (
-                    <p className='text-xs text-muted-foreground'>
-                      该分组下没有 VM
-                    </p>
-                  ) : (
-                    listed.map((vm) => (
-                      <label
-                        key={vm.id}
-                        className='flex items-center gap-2 text-sm'
-                      >
-                        <input
-                          type='checkbox'
-                          className='size-3.5'
-                          checked={draft.allowed_vms.includes(vm.id)}
-                          onChange={(e) => {
-                            const on = e.target.checked
-                            setDraft((d) => ({
-                              ...d,
-                              allowed_vms: on
-                                ? [...d.allowed_vms, vm.id]
-                                : d.allowed_vms.filter((id) => id !== vm.id),
-                            }))
-                          }}
-                        />
-                        <span className='truncate'>
-                          {vm.name || vm.email || vm.id}
-                        </span>
-                        <span className='font-mono text-xs text-muted-foreground'>
-                          {vm.id}
-                        </span>
-                      </label>
-                    ))
-                  )}
-                </div>
+          ) : null}
+          {!isApi &&
+            (draft.group_type === 'pool' ? (
+              <Field label='账号池'>
+                <Select
+                  value={draft.vm_pool_id || ''}
+                  onValueChange={(id) =>
+                    setDraft((d) => ({ ...d, vm_pool_id: id }))
+                  }
+                >
+                  <SelectTrigger>
+                    <SelectValue placeholder='选择账号池' />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {(pools || []).map((pool) => (
+                      <SelectItem key={pool.id} value={pool.id}>
+                        {pool.name}
+                        {pool.enabled ? '' : ' · 停用'}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </Field>
-            </div>
-          )}
+            ) : draft.group_type === 'all' ? (
+              <p className='text-xs text-muted-foreground sm:col-span-2'>
+                all 是最高权限，不再选择 VM。
+              </p>
+            ) : (
+              <div className='sm:col-span-2'>
+                <Field label='可用 VM'>
+                  <div className='max-h-40 space-y-1 overflow-y-auto rounded-md border p-2'>
+                    {listed.length === 0 ? (
+                      <p className='text-xs text-muted-foreground'>
+                        该分组下没有 VM
+                      </p>
+                    ) : (
+                      listed.map((vm) => (
+                        <label
+                          key={vm.id}
+                          className='flex items-center gap-2 text-sm'
+                        >
+                          <input
+                            type='checkbox'
+                            className='size-3.5'
+                            checked={draft.allowed_vms.includes(vm.id)}
+                            onChange={(e) => {
+                              const on = e.target.checked
+                              setDraft((d) => ({
+                                ...d,
+                                allowed_vms: on
+                                  ? [...d.allowed_vms, vm.id]
+                                  : d.allowed_vms.filter((id) => id !== vm.id),
+                              }))
+                            }}
+                          />
+                          <span className='truncate'>
+                            {vm.name || vm.email || vm.id}
+                          </span>
+                          <span className='font-mono text-xs text-muted-foreground'>
+                            {vm.id}
+                          </span>
+                        </label>
+                      ))
+                    )}
+                  </div>
+                </Field>
+              </div>
+            ))}
           <div className='sm:col-span-2'>
             <Field label='允许的模型'>
               <Input
@@ -405,6 +484,7 @@ function blankDraft(): KeyLimitsDraft {
   return {
     name: '',
     category: 'oauth',
+    api_endpoint_id: '',
     max_concurrency: 20,
     quota_requests: 0,
     quota_usd: 0,

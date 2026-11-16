@@ -48,6 +48,15 @@ COPY --from=payload /payload/share/wrap-cli/cli-node /input/cli-node
 RUN python3 build-native-cli.py --payload /input/cli-node --output /native-cli \
     --manifest arm64-cli.json --cache /tmp/native-cli-tools
 
+# Only the x86 libraries the amd64 payloads load (verified by check-x86-deps.py below),
+# dereferenced so the image does not carry the whole 48M multiarch directory.
+# libz.so.1 is not in any DT_NEEDED: kin-computer is a onefile bundle whose unpacked
+# child loads it from the system at run time (traced with LD_DEBUG=libs).
+FROM --platform=linux/arm64 ${NODE_IMAGE} AS x86-libs
+COPY --from=amd64-runtime /usr/lib/x86_64-linux-gnu/ /src/
+RUN mkdir /out && cd /src && cp -L ld-linux-x86-64.so.2 libc.so.6 libm.so.6 libgcc_s.so.1 \
+    libstdc++.so.6 libdl.so.2 libpthread.so.0 librt.so.1 libz.so.1 /out/
+
 FROM --platform=linux/arm64 docker:27-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c AS dockercli
 FROM --platform=linux/arm64 ${NODE_IMAGE}
 RUN apt-get update \
@@ -65,6 +74,7 @@ COPY docker/kin-os ./docker/kin-os
 COPY docker/kin-kvm/guest/kin-kernel-cpu ./docker/kin-kvm/guest/kin-kernel-cpu
 COPY docker/kin-kvm/guest/kin-crag-apparmor ./docker/kin-kvm/guest/kin-crag-apparmor
 COPY docker/kin-kvm/guest/kin-crag-license ./docker/kin-kvm/guest/kin-crag-license
+COPY docker/kin-kvm/guest/kin-crag-subscription ./docker/kin-kvm/guest/kin-crag-subscription
 COPY --from=web /src/web/dist ./web/dist
 COPY --from=payload /payload/bin/ /opt/vm2api/image-bin/
 COPY --from=helpers /out/amd64/ /opt/vm2api/cluster-bin-amd64/
@@ -73,9 +83,11 @@ COPY --from=payload /payload/share/wrap-cli/ /opt/vm2api/image-wrap-cli/
 COPY --from=payload /payload/share/crag/ /opt/vm2api/image-crag/
 COPY --from=native-cli /native-cli/ /opt/vm2api/image-native-cli/
 # Only the remaining x86 executables need these libraries and loader under QEMU.
-COPY --from=amd64-runtime /usr/lib/x86_64-linux-gnu/ /usr/lib/x86_64-linux-gnu/
-COPY --from=amd64-runtime /usr/lib64/ /usr/lib64/
-RUN test -e /lib64 || ln -s usr/lib64 /lib64
+COPY --from=x86-libs /out/ /usr/lib/x86_64-linux-gnu/
+RUN mkdir -p /usr/lib64 \
+    && ln -sf ../lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /usr/lib64/ld-linux-x86-64.so.2 \
+    && { test -e /lib64 || ln -s usr/lib64 /lib64; }
+COPY deploy/check-x86-deps.py ./deploy/check-x86-deps.py
 # The standard entrypoint refreshes bind-mounted helpers from image-bin on boot.
 COPY --from=helpers /out/kin-egress /out/kin-worker /out/kin-api-kernel /out/kin-redact /opt/vm2api/image-bin/
 COPY scripts/docker-entrypoint.sh /usr/local/bin/vm2api-entrypoint
@@ -83,7 +95,9 @@ RUN chmod 755 /usr/local/bin/vm2api-entrypoint /opt/vm2api/image-bin/* \
     /opt/vm2api/image-wrap-cli/cli-node \
     && rm -f /opt/vm2api/src/lib/oauth/auth.js \
     && cp -a /opt/vm2api/src/config /opt/vm2api/image-config \
-    && mkdir -p /opt/vm2api/vms /opt/vm2api/data /opt/vm2api/bin /opt/vm2api/share
+    && mkdir -p /opt/vm2api/vms /opt/vm2api/data /opt/vm2api/bin /opt/vm2api/share \
+    && python3 /opt/vm2api/deploy/check-x86-deps.py /opt/vm2api/image-bin \
+       /opt/vm2api/image-wrap-cli /opt/vm2api/image-crag /opt/vm2api/cluster-bin-amd64
 ENV NODE_ENV=production \
     HOST=127.0.0.1 \
     PORT=8787 \

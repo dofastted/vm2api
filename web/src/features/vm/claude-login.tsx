@@ -16,7 +16,10 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { type LoginTerminalHandle, WsTerminal } from '@/components/ws-terminal'
+import {
+  type LoginTerminalHandle,
+  WsTerminal,
+} from '@/components/ws-terminal-lazy'
 import { prepareLoginTerminal } from './login-terminal-start'
 
 /** Native CC obtains the grant; the panel importer remains its owner. */

@@ -164,7 +164,7 @@ test('auth readiness refuses stopped containers and never falls back to cli-node
         inspect: () => ({ running: true }),
         cliExists: async (bin) => fs.existsSync(path.join(home, path.posix.relative('/home/kincli/.kin', bin))),
       }),
-      { code: 'claude_cli_missing' },
+      { code: 'crag_v2_package_missing' },
     )
   } finally {
     fs.rmSync(root, { recursive: true, force: true })

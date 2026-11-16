@@ -24,7 +24,13 @@ function isToolPayload(block) {
   if (!block || typeof block !== 'object' || Array.isArray(block)) return false
   const type = String(block.type || '')
   if (!type) return false
-  return type === 'tool_result' || type === 'function_call_output' || type.endsWith('_tool_result')
+  return (
+    type === 'tool_use' ||
+    type === 'tool_result' ||
+    type === 'reasoning' ||
+    type === 'thinking' ||
+    /(?:^|_)(?:tool_use|tool_result|call|call_output)$/.test(type)
+  )
 }
 
 function contentToText(content, includeToolResults = true) {

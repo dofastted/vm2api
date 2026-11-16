@@ -109,6 +109,8 @@ export type UsageLogRow = {
   clientSessionId: string | null
   /** 入站剥离前的客户端 device id。 */
   inboundDeviceId: string | null
+  upstreamStatus?: number | null
+  upstream400Message?: string | null
   /** 最终服务的账号展示名（`final_account_id` 优先）。 */
   providerName: string | null
   accountId: string | null

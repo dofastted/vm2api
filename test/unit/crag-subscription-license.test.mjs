@@ -2,7 +2,6 @@ import test, { after, before } from 'node:test'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import { EventEmitter } from 'node:events'
-import { Writable } from 'node:stream'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -16,10 +15,16 @@ import {
   projectCragUniversalVm,
   projectLocalGrant,
   readCragClusterSubscription,
+  readCragSubscriptionFiles,
+  readCragSubscriptionReleaseCandidate,
+  readKvmCragLicense,
+  readKvmSubscriptionMachineId,
+  redeemCragDeviceVoucher,
   verifyCragHostEntitlement,
 } from '../../src/lib/vm/crag-license.mjs'
 import { cragSubscriptionPublicDirectory } from '../../src/lib/vm/crag-subscription-paths.mjs'
 import { publishKvmCragLicense } from '../../src/lib/vm/kvm-crag-license.mjs'
+import { cragDockerAppArmorProfile, startVmRuntime } from '../../src/lib/vm/vm-runtime.mjs'
 import { bindPlacement, unbindPlacement } from '../../src/lib/cluster/placement.mjs'
 import { callRustKernel, streamRustKernel } from '../../src/lib/transport/rust-kernel-client.mjs'
 import {
@@ -58,13 +63,20 @@ function replace(file, contents) {
   fs.renameSync(temporary, file)
 }
 
-function fixture(t, { slotLimit = 2, seat = 2, activate = true } = {}) {
+function fixture(t, { slotLimit = 2, seat = 2, activate = true, placement = {} } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-subscription-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
-  const vm = { id: 'vm-13', dataplane: 'crag', runtime: { type: 'docker' } }
+  const machineId = crypto.randomBytes(16).toString('hex')
+  const vm = {
+    id: 'vm-13',
+    dataplane: 'crag',
+    runtime: { type: 'docker' },
+    fingerprint: { guest_machine_id: machineId },
+    ...placement,
+  }
   fs.mkdirSync(path.join(root, 'vms', vm.id), { recursive: true })
   fs.writeFileSync(path.join(root, 'vms', `${vm.id}.json`), JSON.stringify(vm))
-  fs.writeFileSync(path.join(root, 'vms', vm.id, 'machine-id'), crypto.randomBytes(16).toString('hex') + '\n')
+  fs.writeFileSync(path.join(root, 'vms', vm.id, 'machine-id'), `${machineId}\n`)
   const pkg = seedEncryptedPackage(root)
   const machineCode = prepareCragSubscriptionBinding(root, vm)
   const dir = cragLicenseDirectory(root, vm)
@@ -81,6 +93,83 @@ function fixture(t, { slotLimit = 2, seat = 2, activate = true } = {}) {
   const exec = { projectRoot: root, homeDir: path.join(root, 'vms', vm.id, 'cli-home'), vm }
   return { root, vm, pkg, machineCode, dir, registration, publicDir, hostId, host, entitlement, permit, exec }
 }
+
+test('starting a stopped host-licensed Docker slot repairs a missing entitlement mount', async (t) => {
+  const { root, vm, registration, publicDir } = fixture(t)
+  vm.proxy = { id: 'px-local', scheme: 'local' }
+  const grant = fs.readFileSync(registration)
+  assert.equal(checkCragLicense(root, vm).license.scope, 'host')
+  const slotDir = path.join(root, 'vms', vm.id)
+  const machineId = fs.readFileSync(path.join(slotDir, 'machine-id'))
+  const computer = path.join(slotDir, 'kvm', 'fingerprint', 'system')
+  for (const dir of ['etc', 'hardware', 'dmi/id']) fs.mkdirSync(path.join(computer, dir), { recursive: true })
+  fs.writeFileSync(path.join(computer, 'etc', 'hostname'), 'wks1234567890123\n')
+  fs.writeFileSync(path.join(computer, 'etc', 'machine-id'), machineId)
+  fs.writeFileSync(path.join(computer, 'hardware', 'mac'), '02:00:00:00:00:13\n')
+
+  const trace = path.join(root, 'docker.jsonl')
+  const oldPath = process.env.PATH
+  process.env.PATH = `${root}${path.delimiter}${oldPath}`
+  t.after(() => {
+    process.env.PATH = oldPath
+  })
+  const mounts = path.join(root, 'mounts.json')
+  fs.writeFileSync(mounts, '[]')
+  const profile = new URL('../../src/lib/vm/crag-v2-seccomp.json', import.meta.url)
+  const appArmor = cragDockerAppArmorProfile()
+  const securityOpts = JSON.stringify([
+    'no-new-privileges',
+    `seccomp=${profile.pathname}`,
+    ...(appArmor ? [`apparmor=${appArmor}`] : []),
+  ])
+  fs.writeFileSync(
+    path.join(root, 'docker'),
+    `#!${process.execPath}
+const fs = require('node:fs')
+const args = process.argv.slice(2)
+fs.appendFileSync(${JSON.stringify(trace)}, JSON.stringify(args) + '\\n')
+if (args[0] === 'network' && args[1] === 'inspect') console.log('172.20.0.0/24|172.20.0.1')
+else if (args[0] === 'inspect' && args[2] === '{{json .Mounts}}') console.log(fs.readFileSync(${JSON.stringify(mounts)}, 'utf8'))
+else if (args[0] === 'inspect') console.log(${JSON.stringify(`false|0|kin-eg-px-local||ghcr.io/dofastted/kin-os-ubuntu:24.04|fixture|docker||false|unless-stopped|${securityOpts}|true`)})
+`,
+    { mode: 0o755 },
+  )
+  const commands = () => fs.readFileSync(trace, 'utf8').trim().split('\n').map(JSON.parse)
+
+  const result = await startVmRuntime(vm, root, { routing: {} })
+  assert.equal(result.ok, true, JSON.stringify(result))
+  assert.equal(result.action, 'created')
+  assert.equal(
+    commands().some(([op]) => op === 'start'),
+    false,
+  )
+  assert.ok(
+    commands()
+      .find(([op]) => op === 'run')
+      .includes(`type=bind,source=${publicDir},target=/run/kin/crag-host,readonly`),
+  )
+
+  fs.writeFileSync(trace, '')
+  fs.writeFileSync(
+    mounts,
+    JSON.stringify([{ Type: 'bind', Source: publicDir, Destination: '/run/kin/crag-host', RW: false }]),
+  )
+  assert.equal((await startVmRuntime(vm, root, { routing: {} })).action, 'started')
+  assert.equal(
+    commands().some(([op]) => op === 'rm' || op === 'run'),
+    false,
+  )
+
+  fs.writeFileSync(trace, '')
+  fs.writeFileSync(mounts, 'null')
+  assert.equal((await startVmRuntime(vm, root, { routing: {} })).code, 'crag_host_mount_inspect_failed')
+  assert.equal(
+    commands().some(([op]) => op === 'rm' || op === 'run' || op === 'start'),
+    false,
+  )
+  assert.deepEqual(fs.readFileSync(registration), grant)
+  assert.deepEqual(fs.readFileSync(path.join(slotDir, 'machine-id')), machineId)
+})
 
 async function assertDenied(context, code) {
   const check = checkCragLicense(context.root, context.vm)
@@ -123,6 +212,183 @@ for (const slotLimit of [2, 'unlimited']) {
     }
   })
 }
+
+for (const placement of [
+  { runtime: { type: 'kvm' } },
+  { runtime: { type: 'qemu' } },
+  { runtime: { type: 'libvirt' } },
+  { runtime_type: 'kvm', runtime: undefined },
+]) {
+  test(`local KVM host permits retain signed device binding ${JSON.stringify(placement)}`, async (t) => {
+    const context = fixture(t, { placement })
+    const { root, vm, machineCode, permit, hostId, registration } = context
+    assert.equal(prepareCragSubscriptionBinding(root, vm), machineCode)
+    const status = getCragLicense(root, vm)
+    assert.equal(status.license.valid, true)
+    assert.equal(status.license.scope, 'host')
+    assert.equal(checkCragLicense(root, vm).ok, true)
+    assert.equal(
+      readCragSubscriptionReleaseCandidate(root, vm, hostId),
+      crypto.createHash('sha256').update(permit.code).digest('hex'),
+    )
+    const saved = fs.readFileSync(registration)
+    assert.throws(() => activateCragLicense(root, vm, issueFixtureCode(root, machineCode).code), {
+      code: 'license_unconfigured',
+    })
+    await assert.rejects(
+      redeemCragDeviceVoucher(root, vm, `CRAGR1.${crypto.randomBytes(32).toString('base64url')}`, {
+        fetchImpl: () => assert.fail('KVM device vouchers must not contact the authority'),
+      }),
+      { code: 'license_unconfigured' },
+    )
+    assert.deepEqual(fs.readFileSync(registration), saved)
+  })
+}
+
+test('an unbound local KVM reports missing host authorization and initializes only its own challenge', (t) => {
+  const { root, vm, dir, registration } = fixture(t, { activate: false, placement: { runtime: { type: 'kvm' } } })
+  fs.rmSync(dir, { recursive: true })
+  assert.equal(getCragLicense(root, vm).license.code, 'license_required')
+  assert.equal(fs.existsSync(dir), false)
+  const initial = getCragLicense(root, vm, { initialize: true })
+  assert.equal(initial.license.code, 'license_required')
+  assert.match(initial.machine_code, /^CRAGM1\./)
+  assert.equal(prepareCragSubscriptionBinding(root, vm), initial.machine_code)
+  assert.equal(fs.existsSync(registration), false)
+  assert.equal(readCragSubscriptionFiles(root, vm), null)
+  assert.doesNotMatch(JSON.stringify(initial), /private_key|wrapped_key|CRAGS1|CRAGH1/)
+})
+
+test('KVM host permits enforce H2 roster replacement, revocation and pending synchronization', async (t) => {
+  const context = fixture(t, { placement: { runtime: { type: 'kvm' } } })
+  const { root, vm, entitlement, host, permit, machineCode, hostId, registration, publicDir } = context
+  const roster = (code) => [
+    { seat: permit.claims.seat, permit_sha256: crypto.createHash('sha256').update(code).digest('hex') },
+  ]
+  const rights = (revision, entries) =>
+    signSubscriptionBytes(root, 'CRAGH2', JSON.stringify({ ...host.claims, version: 2, revision, roster: entries }))
+  replace(entitlement, rights(2, roster(permit.code)))
+  assert.equal(getCragLicense(root, vm).license.revision, 2)
+  assert.equal(readCragSubscriptionFiles(root, vm).permit, permit.code)
+  const renewed = issueSlotPermit(root, machineCode, hostId, { seat: permit.claims.seat })
+  replace(entitlement, rights(3, roster(renewed.code)))
+  await assertDenied(context, 'license_binding_mismatch')
+  assert.throws(() => readCragSubscriptionFiles(root, vm), { code: 'license_binding_mismatch' })
+  activateCragSubscriptionBinding(root, vm, renewed.code)
+  assert.equal(checkCragLicense(root, vm).ok, true)
+  assert.equal(readCragSubscriptionFiles(root, vm).permit, renewed.code)
+  fs.writeFileSync(path.join(publicDir, 'sync-pending'), 'pending\n')
+  await assertDenied(context, 'license_invalid')
+  assert.throws(() => readCragSubscriptionFiles(root, vm), { code: 'license_invalid' })
+  fs.unlinkSync(path.join(publicDir, 'sync-pending'))
+  replace(entitlement, rights(4, []))
+  await assertDenied(context, 'license_binding_mismatch')
+  assert.throws(() => readCragSubscriptionFiles(root, vm), { code: 'license_binding_mismatch' })
+  assert.equal(fs.readFileSync(registration, 'utf8').trim(), renewed.code)
+})
+
+test('KVM subscription export verifies identities and signatures and exposes only guest authorization files', (t) => {
+  const { root, vm, permit, host, hostId, dir, registration, entitlement } = fixture(t, {
+    placement: { runtime: { type: 'kvm' } },
+  })
+  const exported = readCragSubscriptionFiles(root, vm)
+  assert.deepEqual(Object.keys(exported).sort(), ['device', 'entitlement', 'hostId', 'permit'])
+  assert.equal(exported.permit, permit.code)
+  assert.equal(exported.entitlement, host.code)
+  assert.equal(exported.hostId, hostId)
+  assert.deepEqual(JSON.parse(exported.device), JSON.parse(fs.readFileSync(path.join(dir, 'device.json'), 'utf8')))
+  assert.equal(readCragClusterSubscription(root, vm), null)
+  const different = vm.fingerprint.guest_machine_id === '1'.repeat(32) ? '2'.repeat(32) : '1'.repeat(32)
+  assert.throws(() => readCragSubscriptionFiles(root, { ...vm, fingerprint: { guest_machine_id: different } }), {
+    code: 'license_binding_mismatch',
+  })
+  for (const [file, code] of [
+    [registration, permit.code],
+    [entitlement, host.code],
+  ]) {
+    const parts = code.split('.')
+    parts[2] = Buffer.alloc(64).toString('base64url')
+    replace(file, parts.join('.'))
+    assert.throws(() => readCragSubscriptionFiles(root, vm), { code: 'license_invalid' })
+    replace(file, code)
+  }
+  assert.deepEqual(readCragSubscriptionFiles(root, vm), exported)
+})
+
+test('KVM subscription initialization refuses noncanonical or mismatched guest identity without replacing files', (t) => {
+  const { root, vm, dir, registration } = fixture(t, { placement: { runtime: { type: 'kvm' } } })
+  const machineFile = path.join(root, 'vms', vm.id, 'machine-id')
+  const machine = vm.fingerprint.guest_machine_id
+  const different = machine === '1'.repeat(32) ? '2'.repeat(32) : '1'.repeat(32)
+  const savedDevice = fs.readFileSync(path.join(dir, 'device.json'))
+  const savedRegistration = fs.readFileSync(registration)
+  const cases = [
+    [{}, `${machine}\n`, 'license_unconfigured'],
+    [{ machine_id: machine }, `${machine}\n`, 'license_unconfigured'],
+    [{ guest_machine_id: `A${machine.slice(1)}` }, `${machine}\n`, 'license_unconfigured'],
+    [{ guest_machine_id: `${machine}\n` }, `${machine}\n`, 'license_unconfigured'],
+    [{ guest_machine_id: '0'.repeat(32) }, `${machine}\n`, 'license_unconfigured'],
+    [{ guest_machine_id: machine }, `A${machine.slice(1)}\n`, 'license_unconfigured'],
+    [{ guest_machine_id: machine }, `${machine}\n\n`, 'license_unconfigured'],
+    [{ guest_machine_id: machine }, `${machine}\r\n`, 'license_unconfigured'],
+    [{ guest_machine_id: machine }, different, 'license_binding_mismatch'],
+  ]
+  for (const [fingerprint, contents, code] of cases) {
+    const changed = { ...vm, fingerprint }
+    fs.writeFileSync(machineFile, contents)
+    assert.throws(() => prepareCragSubscriptionBinding(root, changed), { code })
+    assert.equal(getCragLicense(root, changed).license.code, code)
+    assert.equal(fs.readFileSync(machineFile, 'utf8'), contents)
+    assert.deepEqual(fs.readFileSync(path.join(dir, 'device.json')), savedDevice)
+    assert.deepEqual(fs.readFileSync(registration), savedRegistration)
+  }
+  fs.writeFileSync(machineFile, `${machine}\n`)
+  const moved = { ...vm, fingerprint: { guest_machine_id: different } }
+  assert.equal(getCragLicense(root, moved).license.code, 'license_binding_mismatch')
+  assert.equal(getCragLicense(root, vm).license.valid, true)
+})
+
+test('KVM subscription initialization does not repair an existing machine-id directory or link', (t) => {
+  const { root, vm } = fixture(t, { placement: { runtime: { type: 'kvm' } } })
+  const machineFile = path.join(root, 'vms', vm.id, 'machine-id')
+  fs.unlinkSync(machineFile)
+  fs.mkdirSync(machineFile)
+  fs.writeFileSync(path.join(machineFile, 'keep'), 'protected')
+  assert.throws(() => prepareCragSubscriptionBinding(root, vm), { code: 'license_unconfigured' })
+  assert.equal(fs.readFileSync(path.join(machineFile, 'keep'), 'utf8'), 'protected')
+  fs.rmSync(machineFile, { recursive: true })
+  const target = path.join(root, 'linked-machine-id')
+  fs.writeFileSync(target, `${vm.fingerprint.guest_machine_id}\n`)
+  fs.symlinkSync(target, machineFile)
+  assert.throws(() => prepareCragSubscriptionBinding(root, vm), { code: 'license_unconfigured' })
+  assert.equal(fs.lstatSync(machineFile).isSymbolicLink(), true)
+})
+
+test('KVM readiness identity checks do not initialize or rewrite missing and mismatched machine files', (t) => {
+  const { root, vm } = fixture(t, { placement: { runtime: { type: 'kvm' } } })
+  const machineFile = path.join(root, 'vms', vm.id, 'machine-id')
+  const machine = vm.fingerprint.guest_machine_id
+  assert.equal(readKvmSubscriptionMachineId(root, vm), machine)
+  fs.unlinkSync(machineFile)
+  assert.throws(() => readKvmSubscriptionMachineId(root, vm), { code: 'license_unconfigured' })
+  assert.equal(readKvmSubscriptionMachineId(root, vm, { allowMissingFile: true }), machine)
+  assert.equal(fs.existsSync(machineFile), false)
+  const different = machine === '1'.repeat(32) ? '2'.repeat(32) : '1'.repeat(32)
+  fs.writeFileSync(machineFile, `${different}\n`)
+  assert.throws(() => readKvmSubscriptionMachineId(root, vm), { code: 'license_binding_mismatch' })
+  assert.throws(() => readKvmSubscriptionMachineId(root, vm, { allowMissingFile: true }), {
+    code: 'license_binding_mismatch',
+  })
+  assert.equal(fs.readFileSync(machineFile, 'utf8'), `${different}\n`)
+  fs.unlinkSync(machineFile)
+  const target = path.join(root, 'machine-link-target')
+  fs.writeFileSync(target, machine)
+  fs.symlinkSync(target, machineFile)
+  assert.throws(() => readKvmSubscriptionMachineId(root, vm, { allowMissingFile: true }), {
+    code: 'license_unconfigured',
+  })
+  assert.equal(fs.lstatSync(machineFile).isSymbolicLink(), true)
+})
 
 test('host time checks enforce the exclusive expiry boundary and never relax future issuance', (t) => {
   const { root, hostId } = fixture(t)
@@ -362,6 +628,7 @@ for (const placement of [
       code: 'license_unconfigured',
     })
     assert.equal(getCragLicense(root, unsupported).license.valid, false)
+    assert.throws(() => readCragSubscriptionFiles(root, unsupported), { code: 'license_unconfigured' })
   })
 }
 
@@ -379,7 +646,8 @@ test('KVM guest publication sends only the verified slot bundle over stdin and c
   const guest = { ...vm, runtime: { type: 'kvm', container: 'test-kvm' } }
   guest.fingerprint = { guest_machine_id: fs.readFileSync(path.join(root, 'vms', vm.id, 'machine-id'), 'utf8').trim() }
   const sent = []
-  const run = (_, argv, opts, done) => {
+  const runDockerExec = async (argv, opts) => {
+    if (argv[0] === 'container') return { ok: true, code: 0, stdout: 'true' }
     assert.deepEqual(argv.slice(0, 9), [
       'exec',
       '-i',
@@ -391,32 +659,57 @@ test('KVM guest publication sends only the verified slot bundle over stdin and c
       '--',
       'python3',
     ])
-    assert.ok(opts.timeout > 0)
+    assert.ok(opts.timeoutMs > 0)
     assert.ok(!argv.join(' ').includes(permit.code))
-    return {
-      stdin: new Writable({
-        write(chunk, _, callback) {
-          sent.push(JSON.parse(chunk.toString()))
-          callback()
-        },
-        final(callback) {
-          callback()
-          done(null)
-        },
-      }),
-    }
+    const request = JSON.parse(opts.input)
+    assert.equal(request.action, 'publish')
+    sent.push(request.files)
+    return { ok: true, code: 0 }
   }
-  await Promise.all([publishKvmCragLicense(root, guest, { run }), publishKvmCragLicense(root, guest, { run })])
-  assert.equal(sent.length, 1)
+  await Promise.all([
+    publishKvmCragLicense(root, guest, { runDockerExec }),
+    publishKvmCragLicense(root, guest, { runDockerExec }),
+  ])
+  assert.equal(sent.length, 2)
   assert.deepEqual(Object.keys(sent[0]).sort(), ['device', 'entitlement', 'hostId', 'permit'])
   assert.equal(sent[0].hostId, hostId)
   assert.equal(sent[0].permit, permit.code)
   assert.equal(sent[0].entitlement, host.code)
   const renewal = issueHostEntitlement(root, hostId, { revision: 2 })
   replace(entitlement, renewal.code)
-  await publishKvmCragLicense(root, guest, { run })
-  assert.equal(sent.length, 2)
-  assert.equal(sent[1].entitlement, renewal.code)
+  await publishKvmCragLicense(root, guest, { runDockerExec })
+  assert.equal(sent.length, 3)
+  assert.equal(sent[2].entitlement, renewal.code)
+})
+
+test('remote KVM keeps the upstream normalized identity and signed subscription export', (t) => {
+  const { root, vm, machineCode, hostId, permit } = fixture(t)
+  const machine = vm.fingerprint.guest_machine_id
+  const remote = {
+    ...vm,
+    node_id: 'remote-kvm',
+    runtime: { type: 'qemu' },
+    fingerprint: { machine_id: ` ${machine.match(/.{8}/g).join('-').toUpperCase()} ` },
+  }
+  assert.equal(prepareCragSubscriptionBinding(root, remote), machineCode)
+  assert.equal(getCragLicense(root, remote).license.valid, true)
+  assert.equal(readCragSubscriptionFiles(root, remote).permit, permit.code)
+  assert.equal(readKvmCragLicense(root, remote).permit, permit.code)
+  assert.equal(readCragClusterSubscription(root, remote), null)
+  assert.equal(
+    readCragSubscriptionReleaseCandidate(root, remote, hostId),
+    crypto.createHash('sha256').update(permit.code).digest('hex'),
+  )
+})
+
+test('KVM independent export preserves U1 on both local and remote placements', (t) => {
+  const { root, vm } = fixture(t, { activate: false })
+  const universal = issueUniversalCode(root)
+  activateCragLicense(root, vm, universal.code)
+  for (const node_id of [undefined, 'remote-kvm']) {
+    const target = { ...vm, node_id, runtime: { type: 'kvm' } }
+    assert.deepEqual(readKvmCragLicense(root, target), { permit: universal.code })
+  }
 })
 
 test('host storage refuses links, writable files/directories and pending symlinks', async (t) => {

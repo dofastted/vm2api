@@ -3,7 +3,7 @@
  * Peek only — never bind/unbind sticky or bill tokens_in.
  */
 import { makeError, mapUpstreamError, rewritePoolErrorForClient, ErrorType, ErrorCode } from '../core/errors.mjs'
-import { refusalGuardPolicy } from '../core/refusal-guard.mjs'
+import { refusalAuditIdentity, refusalGuardPolicy, riskPrincipal } from '../core/refusal-guard.mjs'
 import { RefusalGuardsRepo } from '../db/repos/refusal-guards-repo.mjs'
 import { RefusalDeviceBlocksRepo } from '../db/repos/refusal-device-blocks-repo.mjs'
 import { SettingsRepo } from '../db/repos/settings-repo.mjs'
@@ -220,6 +220,11 @@ export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
     inbound,
     body: inbound,
     headers: req?.headers,
+    identity: refusalAuditIdentity({
+      inbound: deps.rawInbound || inbound,
+      headers: req?.headers,
+      principal: riskPrincipal(req),
+    }),
     ...distillContext(req, inbound),
     distillRules: deps.cfg?.distill,
     policy: refusalPolicy(deps),
@@ -228,15 +233,7 @@ export async function blockCountTokensBeforeHop(req, inbound, deps = {}) {
     devices: deviceRepo(deps),
     account: deps.account || null,
   })
-  let wait = false
-  if (decision?.action !== 'block' && decision?.intercept) {
-    try {
-      wait = JSON.parse(decision.intercept).by === 'scope-wait'
-    } catch {
-      wait = false
-    }
-  }
-  return { error: decision?.action === 'block' ? decision.error : null, wait }
+  return { error: decision?.action === 'block' ? decision.error : null, wait: decision.wait === true }
 }
 
 export async function handleUserCountTokens(req, res, deps) {
@@ -271,7 +268,7 @@ export async function handleUserCountTokens(req, res, deps) {
     const err = claudeCodeOnlyError()
     return json(res, err.status, err.body)
   }
-  const gate = await blockCountTokensBeforeHop(req, parsed.body, deps)
+  const gate = await blockCountTokensBeforeHop(req, parsed.body, { ...deps, rawInbound: inbound })
   if (gate?.error) return json(res, gate.error.status, gate.error.body)
   const peeked = await peekCurrentAccount({
     poolScheduler: typeof deps.getPoolScheduler === 'function' ? deps.getPoolScheduler() : deps.poolScheduler,
@@ -285,6 +282,7 @@ export async function handleUserCountTokens(req, res, deps) {
   if (gate.wait) {
     const again = await blockCountTokensBeforeHop(req, parsed.body, {
       ...deps,
+      rawInbound: inbound,
       account: scopeAccountFromVm(peeked.vm, findAccount(deps.accountQuota, peeked.vm)?.unified),
     })
     if (again?.error) return json(res, again.error.status, again.error.body)

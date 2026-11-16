@@ -241,7 +241,13 @@ for (const summaryFirst of [false, true]) {
       assert.deepEqual(sideUser.content.at(-1), before.messages[2].content.at(-1))
       assert.equal(mainUser.content[0].type, 'tool_result')
       assert.equal(mainUser.content[0].tool_use_id, 'test-tool')
-      assert.deepEqual(side.messages.slice(0, 2), main.messages.slice(0, 2))
+      assert.deepEqual(side.messages.slice(0, 1), main.messages.slice(0, 1))
+      // The answered call goes read-only with its result: CRAG rejects an unpaired tool_use.
+      assert.equal(
+        side.messages[1].content.some((block) => block.type === 'tool_use'),
+        false,
+      )
+      assert.equal(main.messages[1].content[0].type, 'tool_use')
       assert.deepEqual(summaryBody, before)
       h.parentGate.resolve()
       assert.equal((await parent).statusCode, 200)

@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import test from 'node:test'
 import * as watchdog from '../../src/lib/transport/kernel-watchdog.mjs'
 import { kernelFaults } from '../../src/lib/transport/rust-kernel-client.mjs'
+import { activateCragLicense } from '../../src/lib/vm/crag-license.mjs'
+import { configureCragRuntimeAdmission } from '../../src/lib/vm/slot-runtime-admission.mjs'
+import { issueUniversalCode, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
 test.afterEach(() => {
   for (const id of ['vm-observation', 'vm-bad', 'vm-good']) kernelFaults.delete(id)
@@ -113,6 +119,60 @@ test('a permission-like container_unavailable result cannot trigger boot without
   assert.deepEqual(f.actions, [])
 })
 
+test('watchdog admits a running kernel restart and a physical revival before spending either attempt', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-watchdog-admission-'))
+  const previousRunRoot = process.env.KIN_SLOT_RUN_ROOT
+  process.env.KIN_SLOT_RUN_ROOT = path.join(root, 'run')
+  t.after(() => {
+    configureCragRuntimeAdmission(root, null)
+    if (previousRunRoot === undefined) delete process.env.KIN_SLOT_RUN_ROOT
+    else process.env.KIN_SLOT_RUN_ROOT = previousRunRoot
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const vm = { id: 'vm-observation', status: 'running', dataplane: 'crag' }
+  const home = path.join(root, 'vms', vm.id, 'cli-home')
+  fs.mkdirSync(home, { recursive: true })
+  seedEncryptedPackage(root)
+  assert.equal(activateCragLicense(root, vm, issueUniversalCode(root).code).license.valid, true)
+  let state = 'running'
+  let at = 0
+  let admitted = 0
+  let allow = false
+  const actions = []
+  configureCragRuntimeAdmission(root, (target, options, run) => {
+    assert.equal(target.id, vm.id)
+    assert.equal(options.action, 'recovery')
+    admitted++
+    return allow ? run() : { ok: false, code: 'crag_runtime_limit' }
+  })
+  const wd = watchdog.createKernelWatchdog({
+    listTargets: () => [vm],
+    now: () => at,
+    config: { restart_backoff_sec: [10] },
+    homeDirFor: () => home,
+    health: async () => null,
+    observeRuntime: async () => ({ state }),
+    ensure: async () => actions.push('ensure'),
+    revive: async () => {
+      actions.push('revive')
+      return { ok: true }
+    },
+  })
+  await wd.tick()
+  at = 10_000
+  await wd.tick()
+  state = 'missing'
+  await wd.tick()
+  assert.equal(admitted, 2)
+  assert.equal(wd.restartsInWindow(vm.id), 0)
+  assert.deepEqual(actions, [])
+  allow = true
+  await wd.tick()
+  assert.equal(admitted, 3)
+  assert.equal(wd.restartsInWindow(vm.id), 1)
+  assert.deepEqual(actions, ['revive'])
+})
+
 test('hold during an observation prevents restart and releases the in-flight tick', async () => {
   let finish
   const f = fixture({
@@ -188,6 +248,9 @@ test('Docker observation distinguishes 404, HTTP failures, malformed payloads an
     [200, { State: { Running: true } }, 'running'],
     [200, { State: { Running: true, Paused: true } }, 'paused'],
     [200, { State: { Running: true, Restarting: true } }, 'restarting'],
+    [200, { State: { Running: false, Status: 'paused' } }, 'paused'],
+    [200, { State: { Running: true, Status: 'restarting' } }, 'restarting'],
+    [200, { State: { Running: false, Status: 'exited', Restarting: true } }, 'restarting'],
     [200, { State: { Running: false, Status: 'exited' } }, 'stopped'],
     [200, { State: { Running: false } }, 'unknown'],
   ]

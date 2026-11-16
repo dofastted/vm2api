@@ -230,6 +230,25 @@ function readOnlySummaryResults(messages) {
   })
   const out = messages.slice()
   out[index] = { ...message, content }
+  // The calls those results answer must go read-only too: CRAG rejects a
+  // history tool_use with no tool_result ("history tool_result set is incomplete").
+  const ids = new Set(message.content.filter((block) => block?.type === 'tool_result').map((b) => b.tool_use_id))
+  const callIndex = out.findLastIndex((m, i) => i < index && m?.role === 'assistant')
+  const call = out[callIndex]
+  if (Array.isArray(call?.content) && call.content.some((b) => b?.type === 'tool_use' && ids.has(b.id))) {
+    out[callIndex] = {
+      ...call,
+      content: call.content.map((block) => {
+        if (block?.type !== 'tool_use' || !ids.has(block.id)) return block
+        const text = {
+          type: 'text',
+          text: `[tool call ${block.name} ${block.id}] ${JSON.stringify(block.input ?? {})}`,
+        }
+        if (block.cache_control) text.cache_control = block.cache_control
+        return text
+      }),
+    }
+  }
   return out
 }
 

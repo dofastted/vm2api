@@ -31,8 +31,13 @@ Claude 推理 CLI 使用镜像内单独构建的 ARM64 overlay；远程节点保
 worker 和 egress 二进制均为 ARM64。已有 Rust kernels、OAuth 和 CLI 预编译
 资产默认仍为 amd64；本机 Docker 推理 CLI 由 ARM64 overlay 替代，其他部分由 QEMU
 执行。slot 默认平台仍是 `linux/amd64`。
-构建从固定的 Ubuntu 24.04 amd64 stage 提取 glibc 2.39 等 x86 库，Go builder
-和最终控制平面 stage 使用 ARM64。
+构建从固定的 Ubuntu 24.04 amd64 stage 只提取 x86 payload 实际加载的 9 个库
+（glibc 2.39 的 `ld-linux-x86-64.so.2`、`libc`、`libm`、`libdl`、`libpthread`、`librt`，
+以及 `libgcc_s`、`libstdc++`、`libz`），约 6M，取代原先整个 48M 的
+`/usr/lib/x86_64-linux-gnu`（镜像压缩后约 476MB → 461MB）。构建末尾运行
+`deploy/check-x86-deps.py` 校验所有 x86 ELF 的 `DT_NEEDED` 闭包，缺库即构建失败；
+`libz` 由 `kin-computer` 解包后的子进程在运行时加载，不在 `DT_NEEDED` 中，
+由镜像 smoke 的计算机身份创建覆盖。Go builder 和最终控制平面 stage 使用 ARM64。
 
 | 场景 | 验证状态 |
 | --- | --- |
@@ -49,10 +54,25 @@ worker 和 egress 二进制均为 ARM64。已有 Rust kernels、OAuth 和 CLI �
 
 ## 主机要求
 
-- Linux `aarch64` 主机，启用 `systemd-binfmt`。
-- 已安装 Git、Python 3、可用的 Docker Engine 和 Compose V2。
+- Linux `aarch64` 主机，**4K 页内核**（见下表）。
+- `binfmt_misc` 已挂载并启用；init 为 systemd（`systemd-binfmt`）或 OpenRC（`binfmt` 服务）。
+- 直接在宿主上运行，不在 LXC/Docker 容器里（binfmt handler 属于宿主内核）。
+- 已安装 Git、Python 3、Docker Engine 20.10 或更新和 Compose V2。
 - 当前用户可访问 Docker daemon；准备脚本需要 root 或可用的 `sudo -n`。
 - 可访问构建镜像来源，并具备运行 amd64 slot 所需的内存、磁盘和 CPU。
+
+`prepare-arm64.py` 在改动主机之前检查以上各项，所有不满足项一次列出并附处理建议：
+
+| 检查项 | 失败原因 | 处理 |
+| --- | --- | --- |
+| `page-size` | 16K/64K 页内核。Bun 尚未支持非 4K 页（oven-sh/bun#17627），qemu-user 大页未验证 | 换 4K 页内核：Ubuntu 用 `linux-generic` 而非 `linux-generic-64k`；Raspberry Pi 5 在 `config.txt` 写 `kernel=kernel8.img`；Asahi Linux 不支持 |
+| `container` | 在容器内运行 | 到宿主上运行 |
+| `binfmt_misc` | 未挂载或全局禁用 | `modprobe binfmt_misc && mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc` |
+| `init` | 既无 `systemd-binfmt` 也无 OpenRC `binfmt` 服务 | 重启后注册会丢失，不支持 |
+| `other-x86-handlers` | 另一个已启用的 handler（如 `qemu-x86_64-static`）也匹配 x86_64 ELF | `echo -1 > /proc/sys/fs/binfmt_misc/<名字>`，并移除其 binfmt.d 条目或软件包 |
+
+`binfmt.d` 一项只做说明：发行版 `qemu-user-binfmt` 的 `/usr/lib/binfmt.d/qemu-x86_64.conf`
+会被同名的 `/etc/binfmt.d/qemu-x86_64.conf` 覆盖，脚本不改动发行版文件。
 
 Docker 的安装方式参见 [Docker Engine 安装文档](https://docs.docker.com/engine/install/)。
 此 override 不强制设置 CPU 或内存上限；容量应按实际 slot 数量和负载规划。
@@ -69,7 +89,8 @@ sudo bash /opt/vm2api/deploy/install.sh status
 
 在 ARM64 上脚本额外下载 `deploy/prepare-arm64.py`，启动前准备 QEMU handler
 （见下一节），然后拉取 `-arm64` 镜像。没有 ARM64 发布的旧版本会明确报错，
-不会回退到 amd64 镜像。`status` 显示宿主架构和当前镜像 tag。
+不会回退到 amd64 镜像。`status` 显示宿主架构、当前镜像 tag，并在 ARM64 上附带
+`prepare-arm64.py --check` 的主机检测结果。
 
 预构建镜像安装应使用 `docker-compose.yml`（及可选的 `docker-compose.override.yml` /
 自定义 overlay，**不要**含 `docker-compose.arm64.yml`）与
@@ -98,6 +119,14 @@ python3 deploy/prepare-arm64.py --check
 只切换 `qemu-x86_64` handler。脚本检查受管理路径，遇到符号链接或不同内容
 时拒绝覆盖。安装失败时恢复原内核 handler 描述及启用状态，
 并只移除本次新安装的文件。发行版的 binfmt 数据库和其他架构 handler 不参与此事务。
+
+持久化：systemd 主机由 `systemd-binfmt.service` 开机读取 `/etc/binfmt.d`。OpenRC 主机
+（如 Alpine）读取同一文件；脚本直接写 `register` 完成本次注册，并在 `binfmt` 服务不在
+boot runlevel 时执行 `rc-update add binfmt boot`（失败回滚时撤销本次新增）。`--check`
+在 OpenRC 上缺少该 runlevel 时报错。
+
+控制容器启动时会试跑一个静态 amd64 helper；宿主 handler 丢失（例如重启后未恢复）时
+日志提示重新运行 `prepare-arm64.py`，但不阻止面板启动。
 
 QEMU 下 slot 进程的 `/proc/<pid>/exe` 指向模拟器，程序路径在 `argv[1]`。
 控制面在终止 slot 数据面进程和判断 PID 1 拓扑时按此识别。

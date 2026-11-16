@@ -21,6 +21,12 @@ export function CragRuntimeCounts({ status }: { status?: CragHostStatus }) {
           : '状态待核对'}
       {' · 剩余可用槽位：'}
       {numberLabel(status?.available_seats)}
+      {status?.runtime && (
+        <>
+          {' · 运行中的订阅槽：'}
+          {numberLabel(status.runtime.host_running_vms)}
+        </>
+      )}
     </p>
   )
 }

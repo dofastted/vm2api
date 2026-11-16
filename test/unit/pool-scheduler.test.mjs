@@ -3,7 +3,12 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { PoolScheduler, filterByHostMemory, formatPoolSelectionSummary } from '../../src/lib/pool/pool-scheduler.mjs'
+import {
+  PoolScheduler,
+  filterByHostMemory,
+  formatPoolSelectionSummary,
+  normalizePoolRouting,
+} from '../../src/lib/pool/pool-scheduler.mjs'
 import { installHostMemoryPressure } from '../../src/lib/cluster/host-memory-pressure.mjs'
 import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
@@ -123,7 +128,7 @@ function scheduler(root, extras = {}) {
     stickyRouter: extras.stickyRouter || null,
     accountQuota: extras.accountQuota || { canAccept: () => ({ ok: true }) },
     workerHealth: extras.workerHealth || (async () => ({ ok: true, credential: { generation: 1, has_access: true } })),
-    config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5 },
+    config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5, ...extras.config },
   })
 }
 
@@ -540,6 +545,35 @@ test('long cooldown beyond wait budget fails immediately', async (t) => {
   assert.deepEqual(unbound, ['conversation-quota'])
   assert.equal(selected.eligible, 2)
   assert.equal(selected.available, 0)
+})
+
+test('pinned quota cooldown returns rate limited with retry time without dispatching', async (t) => {
+  const root = project()
+  let pool
+  t.after(() => cleanupProject(root, pool))
+  const repo = new RuntimeRepo()
+  repo.markCooldown('account-1', { vmId: 'vm-01', until: Date.now() + 60_000, reason: 'quota_5h_header' })
+  pool = new PoolScheduler({
+    projectRoot: root,
+    runtimeRepo: repo,
+    accountQuota: { canAccept: () => ({ ok: true }) },
+    workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
+  })
+  let dispatched = false
+  const result = await new FailoverRunner({ scheduler: pool }).run({
+    requestId: 'quota-cooldown-pin',
+    model: 'claude-test',
+    pinVmId: 'vm-01',
+    callAttempt: async () => {
+      dispatched = true
+      throw new Error('must not dispatch')
+    },
+  })
+  assert.equal(dispatched, false)
+  assert.equal(result.status, 429)
+  assert.equal(result.body.error.code, 'pool_rate_limited')
+  assert.ok(result.retryAfterSec > 0)
+  assert.deepEqual(result.body.error.details.wait_reasons, ['account_cooldown'])
 })
 
 test('wait timeouts clamp to 1s–120s and invalid values fall back', () => {
@@ -3229,4 +3263,100 @@ test('seat selection keeps a sticky conversation on its critical machine', async
   assert.equal(selected.ok, true)
   assert.equal(selected.vmId, 'vm-01')
   selected.release()
+})
+
+function preferVm01(root) {
+  const file = path.join(root, 'vms', 'vm-01.json')
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.policy.priority = 10
+  fs.writeFileSync(file, JSON.stringify(vm))
+}
+
+test('session_affinity_first keeps a continuing conversation on its own VM over priority and device', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  preferVm01(root)
+  const stickyRouter = {
+    resolve: (key) => (key === 'conversation-keep' ? { vmId: 'vm-02', accountId: 'account-2' } : null),
+  }
+  const args = {
+    model: 'claude-test',
+    seatKey: 'seat:sess:keep',
+    stickyKey: 'conversation-keep',
+    deviceVmId: 'vm-01',
+    allowWait: false,
+  }
+
+  const kept = await scheduler(root, { stickyRouter, config: { session_affinity_first: true } }).selectAndReserve(args)
+  assert.equal(kept.ok, true)
+  assert.equal(kept.vmId, 'vm-02')
+  assert.equal(kept.selectionReason, 'sticky')
+  kept.release()
+
+  const moved = await scheduler(root, { stickyRouter }).selectAndReserve(args)
+  assert.equal(moved.ok, true)
+  assert.equal(moved.vmId, 'vm-01', 'off by default: priority still wins')
+  moved.release()
+
+  const fresh = await scheduler(root, { stickyRouter, config: { session_affinity_first: true } }).selectAndReserve({
+    ...args,
+    seatKey: 'seat:sess:new',
+    stickyKey: 'conversation-new',
+  })
+  assert.equal(fresh.vmId, 'vm-01', 'a new conversation still follows priority')
+  fresh.release()
+})
+
+test('session_affinity_first falls back to priority when the own VM cannot take the turn', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  preferVm01(root)
+  const stickyRouter = { resolve: () => ({ vmId: 'vm-02', accountId: 'account-2' }) }
+  const pool = scheduler(root, { stickyRouter, config: { session_affinity_first: true } })
+  const excluded = await pool.selectAndReserve({
+    model: 'claude-test',
+    seatKey: 'seat:sess:own-excluded',
+    stickyKey: 'conversation-own-excluded',
+    excluded: new Set(['vm-02']),
+    allowWait: false,
+  })
+  assert.equal(excluded.ok, true)
+  assert.equal(excluded.vmId, 'vm-01')
+  excluded.release()
+})
+
+test('session_affinity_first waits out a soft RPM cooldown on the own VM instead of moving', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  preferVm01(root)
+  const runtimeRepo = new RuntimeRepo()
+  runtimeRepo.upsert({
+    account_id: 'account-2',
+    vm_id: 'vm-02',
+    status: 'cooldown',
+    cooldown_until: Date.now() + 150,
+    cooldown_reason: 'rpm_limited',
+  })
+  const stickyRouter = { resolve: () => ({ vmId: 'vm-02', accountId: 'account-2' }) }
+  const pool = scheduler(root, {
+    runtimeRepo,
+    stickyRouter,
+    config: { session_affinity_first: true, sticky_wait_timeout_ms: 5000, fallback_wait_timeout_ms: 5000 },
+  })
+  const selected = await pool.selectAndReserve({
+    model: 'claude-test',
+    seatKey: 'seat:sess:soft',
+    stickyKey: 'conversation-soft',
+    allowWait: true,
+    failoverDeadline: Date.now() + 8000,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-02', 'an RPM cooldown is borrowed time, not a reason to rewrite the cache elsewhere')
+  selected.release()
+})
+
+test('pool routing normalizes session_affinity_first to a strict boolean', () => {
+  assert.equal(normalizePoolRouting({}).session_affinity_first, false)
+  assert.equal(normalizePoolRouting({ session_affinity_first: 'yes' }).session_affinity_first, false)
+  assert.equal(normalizePoolRouting({ session_affinity_first: true }).session_affinity_first, true)
 })

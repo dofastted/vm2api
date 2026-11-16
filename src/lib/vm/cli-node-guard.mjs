@@ -11,13 +11,17 @@
  * whose environ cannot be read is left alone.
  */
 import { execDetached } from '../cluster/docker-remote.mjs'
-import { slotContainerName } from '../transport/rust-kernel-supervisor.mjs'
+import { NODE_CLAUDE_SETUP_PY, slotContainerName } from '../transport/rust-kernel-supervisor.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { slotExecCmd } from './slot-exec.mjs'
 import { slotHost } from './slot-host.mjs'
 
 export const CLI_NODE_GUARD_INTERVAL_MS = 15_000
+// Node Docker slots also get the Claude onboarding flags re-asserted (see
+// NODE_CLAUDE_SETUP_PY): a running kernel is never restarted, so this is the
+// path that reaches a slot whose cli-home lost them.
+export const NODE_SETUP_INTERVAL_MS = 60_000
 
 // Same set the kernel watchdog skips: no container to exec into, so every tick
 // would only log `No such container` / `is not running`.
@@ -74,9 +78,11 @@ export function createCliNodeGuard({
   exec = execDetached,
   intervalMs = CLI_NODE_GUARD_INTERVAL_MS,
   logger = console,
+  hostFor = slotHost,
 } = {}) {
   let timer = null
   let inTick = false
+  const setupAt = new Map()
 
   async function tick() {
     if (inTick) return
@@ -86,7 +92,7 @@ export function createCliNodeGuard({
       const vms = (listTargets?.() || []).filter(isCliNodeGuardTarget)
       for (const vm of vms) {
         try {
-          const host = slotHost(vm)
+          const host = hostFor(vm)
           // The guard script walks /proc inside a Linux slot; a macOS node has neither.
           if (host.native) continue
           const connect = host.dockerApi()
@@ -96,6 +102,14 @@ export function createCliNodeGuard({
             user: isKvmRuntime(vm) ? '0' : undefined,
           })
           await exec(connect, container, Cmd, { user: User })
+          if (host.bakedKernel && !isKvmRuntime(vm) && Date.now() - (setupAt.get(vm.id) || 0) >= NODE_SETUP_INTERVAL_MS) {
+            const setup = slotExecCmd(vm, ['python3', '-c', NODE_CLAUDE_SETUP_PY], {
+              detach: true,
+              user: host.execUser(vm),
+            })
+            await exec(connect, container, setup.Cmd, { user: setup.User })
+            setupAt.set(vm.id, Date.now())
+          }
         } catch (err) {
           logger.warn?.(`[cli-node-guard] ${vm.id} ${err?.message || err}`)
         }

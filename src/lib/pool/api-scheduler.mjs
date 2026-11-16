@@ -140,12 +140,13 @@ export class ApiScheduler {
     this.endpoints = Array.isArray(endpoints) ? endpoints : []
   }
 
-  catalog({ groupType = 'all' } = {}) {
+  catalog({ groupType = 'all', endpointId = null } = {}) {
     const data = []
     const seen = new Set()
     const targetGroup = String(groupType || 'all').toLowerCase()
     for (const ep of this.endpoints) {
       if (ep.disabled) continue
+      if (endpointId && ep.id !== endpointId) continue
       const proto = normalizeProtocol(ep.protocol, ep.kind)
       if (targetGroup === 'anthropic' && proto !== 'anthropic') continue
       if (targetGroup === 'openai' && proto !== 'openai') continue
@@ -165,11 +166,12 @@ export class ApiScheduler {
     return { object: 'list', data, source: 'api-endpoints' }
   }
 
-  pick(requestedModel, now = Date.now(), { groupType = 'all' } = {}) {
+  pick(requestedModel, now = Date.now(), { groupType = 'all', endpointId = null } = {}) {
     const targetGroup = String(groupType || 'all').toLowerCase()
     const parents = this.endpoints
       .filter((ep) => {
         if (ep.disabled) return false
+        if (endpointId && ep.id !== endpointId) return false
         const proto = normalizeProtocol(ep.protocol, ep.kind)
         if (targetGroup === 'anthropic' && proto !== 'anthropic') return false
         if (targetGroup === 'openai' && proto !== 'openai') return false

@@ -40,6 +40,7 @@ DEFAULT_ADMIN_PASSWORD="123456"
 WROTE_DEFAULT_PASSWORD=0
 HOST_ARCH=""
 REQUESTED_ARCH=""
+GEMINI_PAYLOAD_SOURCE=""
 
 info() { echo -e "${BLUE}[信息]${NC} $*"; }
 ok() { echo -e "${GREEN}[成功]${NC} $*"; }
@@ -65,6 +66,8 @@ usage() {
   install              安装到 ${INSTALL_DIR}（默认，amd64 自动获取最新正式版 CRAG）
   upgrade | update     升到最新 GitHub Release 并更新 CRAG（保留 .env / vms / data）
   crag-update          独立更新 CRAG V2 包及全部既有 CRAG 副本，不切换槽位内核
+  prepare-native       仅准备 Docker CRAG 的宿主 AppArmor userns 权限
+  prepare-gemini       启用宿主 Gemini 服务，签名载荷在首次创建环境时安装
   check                对比当前版本与最新 Release，打印 changelog
   changelog            打印本地 CHANGELOG.md
   status               当前版本、容器、探活
@@ -73,6 +76,7 @@ usage() {
 选项:
   --version vX.Y.Z     指定 tag（可带 -amd64 / -arm64 后缀，须与宿主架构一致）
   --crag-version TAG   指定 CRAG Release：vX.Y.Z 或 payload-YYYY.MM.DD-crag-X.Y.Z[-legacy]（省略为最新正式版）
+  --gemini-payload-source DIR  已解包的 Gemini 签名载荷目录（Linux amd64，需独立配置发行公钥）
   --dir PATH           安装目录（默认 ${INSTALL_DIR}）
   --yes                非交互
   --no-start           只拉代码，不 compose up
@@ -182,7 +186,24 @@ require_cmds() {
     err "Docker 未运行，或当前用户不能访问 docker.sock"
     exit 1
   fi
+  local server
+  server="$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)"
+  if ! docker_version_ok "$server"; then
+    err "Docker Engine ${server:-未知} 过旧：需要 ${MIN_DOCKER_VERSION} 或更新（多架构镜像与 --platform）"
+    info "升级参见 https://docs.docker.com/engine/install/"
+    exit 1
+  fi
   compose version >/dev/null
+}
+
+MIN_DOCKER_VERSION=20.10
+# 只比较主次版本；无法解析的版本号视为不满足。
+docker_version_ok() {
+  local major minor
+  major="$(printf '%s' "$1" | cut -d. -f1)"
+  minor="$(printf '%s' "$1" | cut -d. -f2)"
+  case "$major$minor" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$major" -gt 20 ] || { [ "$major" -eq 20 ] && [ "$minor" -ge 10 ]; }
 }
 
 github_api() {
@@ -545,6 +566,66 @@ fetch_release_files() {
     "${INSTALL_DIR}/share" "${INSTALL_DIR}/src/config"
 }
 
+prepare_gemini_host() {
+  local PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  local tag="$1" mode="$2" source="${GEMINI_PAYLOAD_SOURCE:-$(env_get VM2API_GEMINI_PAYLOAD_SOURCE)}"
+  if [ -z "$source" ]; then
+    if [ "${3:-}" != required ] && [ ! -f /etc/systemd/system/vm2api-gemini.service ]; then return 0; fi
+    if [ ! -d "${INSTALL_DIR}/share/gemini/current" ]; then
+      err "请指定 --gemini-payload-source DIR"
+      return 1
+    fi
+  fi
+  if [ "$HOST_ARCH" != amd64 ] || { [ -n "$source" ] && [[ ! "$source" =~ ^/[A-Za-z0-9._/-]+$ ]]; } ||
+    [[ ! "$INSTALL_DIR" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+    err "Gemini 需要 Linux amd64，安装目录和签名载荷目录必须为不含空格的绝对路径"
+    return 1
+  fi
+  local host_dir=/usr/local/lib/vm2api-gemini staging file dependency
+  for dependency in systemctl node python3 curl ip nft setpriv bwrap; do
+    command -v "$dependency" >/dev/null || { err "Gemini 宿主机缺少 $dependency"; return 1; }
+  done
+  if systemctl is-active --quiet gemini-host.service; then
+    err "旧版 gemini-host.service 正在运行；请先迁移该服务，避免争用控制 socket"
+    return 1
+  fi
+  if { [ -n "$source" ] && [ ! -d "$source" ] && [ ! -d "${INSTALL_DIR}/share/gemini/current" ]; } ||
+    [ ! -f /etc/vm2api/gemini-ed25519.pub ]; then
+    err "Gemini 需要已解包的签名载荷和 /etc/vm2api/gemini-ed25519.pub"
+    return 1
+  fi
+  staging="$(mktemp -d)"
+  local -a files=(deploy/gemini-host.service.example scripts/gemini-host.py scripts/gemini_host_account.py
+    scripts/gemini-host-egress.sh scripts/install-gemini-payload.mjs src/lib/gemini/payload.mjs)
+  for file in "${files[@]}"; do
+    mkdir -p "${staging}/${file%/*}"
+    if [ "$mode" = source ]; then
+      cp "${INSTALL_DIR}/${file}" "${staging}/${file}" || { rm -rf -- "$staging"; return 1; }
+    else
+      if ! curl -fsSL --connect-timeout 10 --max-time 60 "${RAW_BASE}/${tag}/${file}" -o "${staging}/${file}"; then
+        rm -rf -- "$staging"
+        err "当前版本缺少 Gemini 宿主服务文件: $file"
+        return 1
+      fi
+    fi
+  done
+  (
+    trap 'rm -rf -- "$staging"' EXIT
+    getent group vm2api >/dev/null || groupadd --system vm2api || exit 1
+    install -d -m 755 "$host_dir" "${INSTALL_DIR}/share/gemini" || exit 1
+    for file in "${files[@]:1}"; do
+      install -D -m 644 "${staging}/${file}" "${host_dir}/${file}" || exit 1
+    done
+    local source_arg="${source:+--payload-source $source}"
+    sed -e "s|@INSTALL_DIR@|${INSTALL_DIR}|g" -e "s|@PAYLOAD_SOURCE_ARG@|${source_arg}|g" \
+      "${staging}/${files[0]}" > "${staging}/vm2api-gemini.service" || exit 1
+    install -m 644 "${staging}/vm2api-gemini.service" /etc/systemd/system/vm2api-gemini.service || exit 1
+    systemctl daemon-reload && systemctl enable vm2api-gemini.service && systemctl restart vm2api-gemini.service
+  ) || return 1
+  if [ -n "$source" ]; then env_set VM2API_GEMINI_PAYLOAD_SOURCE "$source"; fi
+  ok "Gemini 宿主服务已启动；首次创建 Gemini 环境时安装签名载荷"
+}
+
 # 从 COMPOSE_FILE 去掉源码 ARM64 override 段，保留其它 overlay；全去掉后只剩 docker-compose.yml。
 compose_file_without_arm64_override() {
   local cf="$1" part base out=""
@@ -664,6 +745,34 @@ fresh_clone() {
   chmod 755 bin/kin-* 2>/dev/null || true
 }
 
+# Run on the Docker host, not inside the control-plane container. Ubuntu's
+# userns policy restricts even apparmor=unconfined unless a named profile grants it.
+prepare_docker_crag_apparmor() {
+  local root="${1:-/}" enabled restricted directory profile candidate marker
+  enabled="${root%/}/sys/module/apparmor/parameters/enabled"
+  restricted="${root%/}/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
+  [ -f "$enabled" ] && [ "$(cat "$enabled")" = Y ] || return 0
+  [ -f "$restricted" ] && [ "$(cat "$restricted")" = 1 ] || return 0
+  command -v apparmor_parser >/dev/null || { err "安装 apparmor 后重试：缺少 apparmor_parser"; return 1; }
+  directory="${root%/}/etc/apparmor.d"
+  profile="$directory/vm2api-crag-docker"
+  marker='# Managed by vm2api Docker native userns preparation.'
+  [ -f "$directory/abi/4.0" ] || { err "CRAG userns 需要 AppArmor ABI 4.0"; return 1; }
+  if [ -L "$profile" ] || { [ -e "$profile" ] && { [ ! -f "$profile" ] || [ "$(head -n 1 "$profile")" != "$marker" ]; }; }; then
+    err "拒绝覆盖非 vm2api 管理的 AppArmor profile: $profile"
+    return 1
+  fi
+  candidate="$(mktemp "$directory/.vm2api-crag-docker.XXXXXX")" || return 1
+  printf '%s\n' "$marker" 'abi <abi/4.0>,' 'profile vm2api-crag-docker flags=(unconfined) {' '  userns,' '}' > "$candidate"
+  chmod 644 "$candidate"
+  # Fail before replacing persistent policy if parsing or loading is denied.
+  # On failure retain the candidate for diagnosis; never disable the host sysctl.
+  apparmor_parser -Q -K "$candidate" || { err "AppArmor profile 检查失败: $candidate"; return 1; }
+  apparmor_parser -r -K "$candidate" || { err "AppArmor profile 加载失败: $candidate"; return 1; }
+  mv -f "$candidate" "$profile" || return 1
+  ok "Docker CRAG userns profile 已加载并保存: $profile"
+}
+
 start_stack() {
   local mode auto_sync_wrap log
   mode="$(install_mode)"
@@ -671,6 +780,7 @@ start_stack() {
     warn "--no-start：跳过 compose up"
     return
   fi
+  prepare_docker_crag_apparmor || return 1
   cd "${INSTALL_DIR}"
   auto_sync_wrap="${KIN_AUTO_SYNC_WRAP:-0}"
   if [ "$mode" = image ]; then
@@ -790,6 +900,7 @@ cmd_install() {
   prepare_arch_env "$mode"
   prepare_arm64_host
   start_stack
+  if [ "$NO_START" = 0 ]; then prepare_gemini_host "$tag" "$mode" || exit 1; fi
   if [ "$NO_START" = 0 ] && [ "$SYNC_WRAP" = 1 ]; then
     update_default_crag || { err "CRAG 二进制更新失败，安装未完成"; exit 1; }
     sync_wrap_cli || { err "槽内 wrap CLI / kernel 同步失败，安装未完成"; exit 1; }
@@ -839,6 +950,7 @@ cmd_upgrade() {
   fi
   prepare_arm64_host
   start_stack
+  if [ "$NO_START" = 0 ]; then prepare_gemini_host "$tag" "$mode" || exit 1; fi
   if [ "$NO_START" = 0 ] && [ "$SYNC_WRAP" = 1 ]; then
     update_default_crag || { err "CRAG 二进制更新失败，升级未完成"; exit 1; }
     sync_wrap_cli || { err "槽内 wrap CLI / kernel 同步失败，升级未完成"; exit 1; }
@@ -912,6 +1024,11 @@ cmd_status() {
   else
     echo "探活:    down"
   fi
+  if [ "$(arch_of "$(uname -m)" || true)" = arm64 ] && [ -f "${INSTALL_DIR}/deploy/prepare-arm64.py" ] \
+    && command -v python3 >/dev/null 2>&1; then
+    echo "ARM64 主机检测:"
+    python3 "${INSTALL_DIR}/deploy/prepare-arm64.py" --check 2>&1 | sed 's/^/  /' || true
+  fi
 }
 
 cmd_uninstall() {
@@ -935,7 +1052,7 @@ cmd_uninstall() {
 COMMAND="install"
 while [ $# -gt 0 ]; do
   case "$1" in
-    install|upgrade|update|crag-update|check|changelog|status|uninstall)
+    install|upgrade|update|crag-update|prepare-native|prepare-gemini|check|changelog|status|uninstall)
       COMMAND="$1"
       shift
       ;;
@@ -962,6 +1079,14 @@ while [ $# -gt 0 ]; do
       ;;
     --dir)
       INSTALL_DIR="$2"
+      shift 2
+      ;;
+    --gemini-payload-source)
+      if [ "$#" -lt 2 ]; then
+        err "--gemini-payload-source 需要本机已解包的签名载荷目录"
+        exit 1
+      fi
+      GEMINI_PAYLOAD_SOURCE="$2"
       shift 2
       ;;
     --yes|-y)
@@ -1000,6 +1125,16 @@ case "$COMMAND" in
   install) cmd_install ;;
   upgrade|update) cmd_upgrade ;;
   crag-update) cmd_update_crag ;;
+  prepare-native) need_root; prepare_docker_crag_apparmor ;;
+  prepare-gemini)
+    need_root
+    resolve_host_arch
+    if [ ! -f "${INSTALL_DIR}/.env" ] || [ "$(local_version)" = not_installed ]; then
+      err "请先安装 vm2api"
+      exit 1
+    fi
+    prepare_gemini_host "$(normalize_tag "$(local_version)")" "$(install_mode)" required
+    ;;
   check) cmd_check ;;
   changelog) cmd_changelog ;;
   status) cmd_status ;;

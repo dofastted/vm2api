@@ -17,7 +17,13 @@ import { isValidVmId } from './vm-file.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { kernelBinPath, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
-import { checkCragLicense, cragTargetIds, projectCragUniversalVm } from './crag-license.mjs'
+import {
+  checkCragLicense,
+  cragTargetIds,
+  projectCragUniversalVm,
+  readKvmSubscriptionMachineId,
+} from './crag-license.mjs'
+import { withCragRuntimeAdmission } from './slot-runtime-admission.mjs'
 import { CRAG_HOST_MOUNT, cragSubscriptionPublicDirectory } from './crag-subscription-paths.mjs'
 import { isNativeNodeVm } from '../cluster/placement.mjs'
 import { workerPaths as transportWorkerPaths } from '../transport/go-worker-client.mjs'
@@ -30,7 +36,7 @@ import {
 } from './slot-engine.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
 import { ensureSlotClaudeOwnership, chownSlotRuntimeFile, replaceSlotOwnedFile } from '../oauth/oauth-credentials.mjs'
-import { installedCragV2Root, materializeResolvedKernel } from './wrap-cli-runtime.mjs'
+import { cragV2KernelWrapperScript, installedCragV2Root, materializeResolvedKernel } from './wrap-cli-runtime.mjs'
 import { ensureGuestMachineIdFile } from '../identity/workstation-fingerprint.mjs'
 import { ensureSlotComputer, rememberComputer } from '../identity/slot-computer.mjs'
 import { coerceRfc4122Uuid } from '../identity/rfc4122-uuid.mjs'
@@ -56,6 +62,7 @@ import { isDockerInspectNotFound } from './docker-container.mjs'
 import { kernelCpuCommand, usesKernelCpuLimit } from './kernel-cpu.mjs'
 import { kvmCragAppArmorCommand } from './kvm-crag-apparmor.mjs'
 import { publishKvmCragLicense } from './kvm-crag-license.mjs'
+import { clearKvmCragSubscription, kvmCragSubscriptionStatusCommand } from './kvm-crag-subscription.mjs'
 
 export const RUNTIME = 'docker'
 const WORKER_BIN = process.env.KIN_WORKER_BIN || '/opt/kin-gateway/bin/kin-worker'
@@ -69,7 +76,7 @@ const CRAG_V2_SECCOMP_PATH = fileURLToPath(new URL('./crag-v2-seccomp.json', imp
 const CRAG_V2_SECCOMP = JSON.parse(fs.readFileSync(CRAG_V2_SECCOMP_PATH, 'utf8'))
 function apparmorUserNamespaceRestricted() {
   try {
-    return fs.readFileSync('/proc/sys/kernel/unprivileged_userns_apparmor_policy', 'utf8').trim() === '1'
+    return fs.readFileSync('/proc/sys/kernel/apparmor_restrict_unprivileged_userns', 'utf8').trim() === '1'
   } catch {
     return false
   }
@@ -93,6 +100,15 @@ export function cragV2NeedsApparmorUnconfined(options = {}) {
     return options.appArmorEnabled === true || options.userNamespaceRestricted === true
   }
   return hostAppArmorEnabled() || apparmorUserNamespaceRestricted()
+}
+
+/** Ubuntu restricts even unconfined tasks after entering a user namespace. */
+export function cragDockerAppArmorProfile(options = {}) {
+  const restricted = Object.hasOwn(options, 'userNamespaceRestricted')
+    ? options.userNamespaceRestricted === true
+    : apparmorUserNamespaceRestricted()
+  if (restricted) return 'vm2api-crag-docker'
+  return cragV2NeedsApparmorUnconfined(options) ? 'unconfined' : null
 }
 
 // Root in the runner must write into the slot-uid 0700 dirs and drop qemu to the slot uid.
@@ -292,16 +308,25 @@ export function inspectContainer(name, opts) {
   return outcome.status === 'found' ? outcome.container : null
 }
 
-/** Docker daemon restarts must wait for the control plane to restore transparent egress first. */
-export function slotRestartPolicy(vm) {
-  return isLocalEgressProxy(vm?.proxy) ? 'unless-stopped' : 'no'
+/** CRAG startup must reach admission; SOCKS slots also need their control-plane egress restored. */
+export function slotRestartPolicy(vm, routing) {
+  return resolveKernelDataplane(vm, routing) === 'crag' || !isLocalEgressProxy(vm?.proxy) ? 'no' : 'unless-stopped'
 }
 
-function updateSlotRestartPolicy(vm, existing, run) {
-  const policy = slotRestartPolicy(vm)
+function updateSlotRestartPolicy(existing, policy, run) {
   if (!existing || existing.restartPolicy === policy) return { ok: true, changed: false }
   const result = run(['docker', 'update', '--restart', policy, existing.name])
   return { ...result, changed: result.ok === true }
+}
+
+function hasCragHostMount(projectRoot, slot) {
+  const result = sh(['docker', 'inspect', '--format', '{{json .Mounts}}', slot], { timeout: 3000 })
+  if (!result.ok) throw new Error('Could not inspect Docker slot mounts')
+  const mounts = JSON.parse(result.stdout)
+  if (!Array.isArray(mounts)) throw new Error('Invalid Docker slot mount list')
+  const mount = mounts.find((item) => item.Destination === CRAG_HOST_MOUNT)
+  const source = toHostPath(cragSubscriptionPublicDirectory(projectRoot), { projectRoot })
+  return mount?.Type === 'bind' && mount.RW === false && mount.Source === source
 }
 
 /** Binding needs a compatible package, not a running worker. */
@@ -330,6 +355,15 @@ export function assertCragSubscriptionTarget(
   )
     throw unsupported()
 
+  let guestMachineId
+  if (isKvmRuntime(vm) && !vm.node_id) {
+    try {
+      guestMachineId = readKvmSubscriptionMachineId(projectRoot, vm, { allowMissingFile: allowPrepared && !reclaim })
+    } catch {
+      throw unsupported()
+    }
+  }
+
   if (allowPrepared && !reclaim) {
     try {
       cragTargetIds(projectRoot, vm)
@@ -345,25 +379,19 @@ export function assertCragSubscriptionTarget(
   const outcome = inspectContainerOutcome(slot, { run: (args) => sh(args, { timeout: 3000 }) })
   if (outcome.status !== 'found' || !outcome.container?.running) throw unsupported()
   if (isKvmRuntime(vm)) {
-    const result = sh(['docker', ...slotExecArgv(vm, ['/home/kincli/.kin/kin-kernel', '--license-capabilities'])], {
-      timeout: 3000,
-    })
+    const projected = sh(
+      ['docker', ...slotExecArgv(vm, kvmCragSubscriptionStatusCommand(vm, guestMachineId), { user: '0' })],
+      {
+        timeout: 5000,
+      },
+    )
+    if (!projected.ok) throw unsupported()
+  } else {
     try {
-      const flags = result.ok && JSON.parse(result.stdout)
-      if (flags.host_subscription === 1 && (!reclaim || flags.host_subscription_reclaim === 1)) return true
-    } catch {}
-    throw unsupported()
-  }
-  const result = sh(['docker', 'inspect', '--format', '{{json .Mounts}}', slot], { timeout: 3000 })
-  try {
-    if (!result.ok) throw unsupported()
-    const mounts = JSON.parse(result.stdout)
-    const mount = Array.isArray(mounts) && mounts.find((item) => item.Destination === CRAG_HOST_MOUNT)
-    const source = cragSubscriptionPublicDirectory(projectRoot)
-    if (mount?.Type !== 'bind' || mount.RW !== false || mount.Source !== toHostPath(source, { projectRoot }))
+      if (!hasCragHostMount(projectRoot, slot)) throw unsupported()
+    } catch {
       throw unsupported()
-  } catch {
-    throw unsupported()
+    }
   }
   try {
     if (!installedCragV2Root(projectRoot, vm)) throw unsupported()
@@ -371,9 +399,10 @@ export function assertCragSubscriptionTarget(
   } catch {
     throw unsupported()
   }
-  const capabilities = sh(['docker', 'exec', slot, '/home/kincli/.kin/crag-v2/crag-v2', '--license-capabilities'], {
-    timeout: 3000,
-  })
+  const capabilities = sh(
+    ['docker', ...slotExecArgv(vm, ['/home/kincli/.kin/crag-v2/crag-v2', '--license-capabilities'])],
+    { timeout: 5000 },
+  )
   try {
     if (capabilities.ok) {
       const flags = JSON.parse(capabilities.stdout)
@@ -425,19 +454,19 @@ export function nativeSlotSandboxNeedsRecreate(existing, vm, routing = {}, optio
     }
   })
   if (!seccompOk) return true
-  const needsUnconfined = cragV2NeedsApparmorUnconfined(options)
-  return (needsUnconfined && !opts.includes('apparmor=unconfined')) || existing.init !== true
+  const profile = cragDockerAppArmorProfile(options)
+  return (profile !== null && !opts.includes(`apparmor=${profile}`)) || existing.init !== true
 }
 
 /** Migrate existing local slots in place, including paused ones; never start or recreate them. */
-export function syncLocalSlotRestartPolicies(vms, { run = sh } = {}) {
+export function syncLocalSlotRestartPolicies(vms, { routing, run = sh } = {}) {
   const changed = []
   for (const vm of vms) {
-    if (!vm?.id || vm.node_id || isLocalEgressProxy(vm.proxy)) continue
+    if (!vm?.id || vm.node_id || slotRestartPolicy(vm, routing) !== 'no') continue
     const inspected = inspectContainerOutcome(containerName(vm.id), { run })
     if (inspected.status === 'missing') continue
     if (inspected.status === 'error') throw new Error(`slot restart policy ${vm.id}: ${inspected.error}`)
-    const result = updateSlotRestartPolicy(vm, inspected.container, run)
+    const result = updateSlotRestartPolicy(inspected.container, 'no', run)
     if (!result.ok) throw new Error(`slot restart policy ${vm.id}: ${result.stderr || 'docker update failed'}`)
     if (result.changed) changed.push(vm.id)
   }
@@ -665,11 +694,22 @@ export function slotWorkerNeedsRecreate(existing, vm, paths) {
  * KVM restarts the guest kin-kernel unit; docker restart would reboot the VM.
  */
 export async function reloadSlotWorker(vm, projectRoot, { routing } = {}) {
-  const licensed = checkCragLicense(projectRoot, vm, resolveSlotRouting(projectRoot, routing))
+  const resolvedRouting = resolveSlotRouting(projectRoot, routing)
+  return withCragRuntimeAdmission(vm, projectRoot, { routing: resolvedRouting, action: 'reload' }, () =>
+    reloadSlotWorkerAdmitted(vm, projectRoot, { routing: resolvedRouting }),
+  )
+}
+
+async function reloadSlotWorkerAdmitted(vm, projectRoot, { routing }) {
+  const licensed = checkCragLicense(projectRoot, vm, routing)
   if (!licensed.ok) return licensed
   if (!vm?.id) return { ok: false, error: 'vm required' }
   // Outside the cached-config fallback: invalid quotas must never reach restart.
   if (!isKvmRuntime(vm)) slotDockerCpus(vm)
+  if (vm.kernel_installation?.kernel === 'crag' && resolveKernelDataplane(vm, routing) === 'crag') {
+    const installed = inspectInstalledCragEntry(projectRoot, vm)
+    if (!installed.ok) return installed
+  }
   const paths = workerPaths(projectRoot, vm.id, vm)
   const name = containerName(vm.id)
   let worker
@@ -684,15 +724,18 @@ export async function reloadSlotWorker(vm, projectRoot, { routing } = {}) {
     worker = paths
   }
   const existing = inspectContainer(name)
-  if (!existing) return await startVmRuntime(vm, projectRoot, { recreate: false, routing })
+  if (!existing) return startVmRuntimeAdmitted(vm, projectRoot, { recreate: false, routing })
   // Before the KVM branch so a runner on the wrong kin-eg-* is recreated too.
   // Docker restart keeps HostConfig, so a pre-sandbox CRAG v2 container stays EPERM until rm.
-  if (
-    slotWorkerNeedsRecreate(existing, vm, paths) ||
-    nativeSlotSandboxNeedsRecreate(existing, vm, resolveSlotRouting(projectRoot, routing))
-  ) {
-    return await startVmRuntime(vm, projectRoot, { recreate: true, routing })
+  if (slotWorkerNeedsRecreate(existing, vm, paths) || nativeSlotSandboxNeedsRecreate(existing, vm, routing)) {
+    return startVmRuntimeAdmitted(vm, projectRoot, { recreate: true, routing })
   }
+  // A stopped local Docker slot with a host permit may still need the read-only entitlement bind.
+  if (licensed.license?.scope === 'host' && !existing.running && !isKvmRuntime(vm)) {
+    return startVmRuntimeAdmitted(vm, projectRoot, { recreate: false, routing })
+  }
+  const restartPolicy = updateSlotRestartPolicy(existing, slotRestartPolicy(vm, routing), sh)
+  if (!restartPolicy.ok) return { ok: false, error: restartPolicy.stderr || 'slot restart policy update failed' }
   if (isKvmRuntime(vm)) {
     if (!existing.running) {
       const r = sh(['docker', 'start', name], { timeout: 60_000 })
@@ -710,9 +753,17 @@ export async function reloadSlotWorker(vm, projectRoot, { routing } = {}) {
     if (chownErr) return chownErr
     if (resolveKernelDataplane(vm, routing) === 'crag') {
       try {
-        await publishKvmCragLicense(projectRoot, vm, { force: true })
-      } catch {
-        return { ok: false, code: 'crag_guest_license_sync_failed', error: 'CRAG guest license projection failed' }
+        if (!(await publishKvmCragLicense(projectRoot, vm, { force: true }))) {
+          return { ok: false, code: 'crag_guest_license_sync_failed', error: 'CRAG guest is not ready' }
+        }
+      } catch (error) {
+        return { ok: false, code: error.code || 'crag_guest_license_sync_failed', error: error.message }
+      }
+    } else if (!vm.node_id) {
+      try {
+        await clearKvmCragSubscription(projectRoot, vm)
+      } catch (error) {
+        return { ok: false, code: error.code || 'crag_subscription_projection_failed', error: error.message }
       }
     }
     const r = sh(
@@ -760,7 +811,7 @@ function readProjectRouting(projectRoot) {
   }
 }
 
-function resolveSlotRouting(projectRoot, routing) {
+export function resolveSlotRouting(projectRoot, routing) {
   if (routing != null) return routing
   return readProjectRouting(projectRoot) || {}
 }
@@ -1126,7 +1177,7 @@ export function buildKvmRunArgs({
     '--network',
     network,
     '--restart',
-    slotRestartPolicy(vm),
+    slotRestartPolicy(vm, routing),
     '--stop-timeout',
     '30',
     '--memory',
@@ -1189,23 +1240,54 @@ export function dockerSlotResourceArgs(vm, routing) {
   ]
 }
 
-export async function startVmRuntime(vm, projectRoot, { recreate = false, routing, accel: accelOpt } = {}) {
-  const licensed = checkCragLicense(projectRoot, vm, resolveSlotRouting(projectRoot, routing))
+export async function startVmRuntime(vm, projectRoot, { recreate = false, routing, accel, useInstalledCrag } = {}) {
+  const resolvedRouting = resolveSlotRouting(projectRoot, routing)
+  return withCragRuntimeAdmission(vm, projectRoot, { routing: resolvedRouting, action: 'start' }, () =>
+    startVmRuntimeAdmitted(vm, projectRoot, { recreate, routing: resolvedRouting, accel, useInstalledCrag }),
+  )
+}
+
+// The installer restores a known-good package and selector before rollback. The
+// license check authenticates that installed tree; the download cache may now hold different bytes.
+export function inspectInstalledCragEntry(projectRoot, vm) {
+  const failure = { ok: false, code: 'crag_v2_package_missing', error: 'Installed CRAG package or selector is missing' }
+  try {
+    const installed = installedCragV2Root(projectRoot, vm)
+    if (!installed) return failure
+    const wrapper = path.join(path.dirname(installed), 'kin-kernel')
+    const stat = fs.lstatSync(wrapper)
+    if (stat.isFile() && stat.mode & 0o111 && fs.readFileSync(wrapper, 'utf8') === cragV2KernelWrapperScript()) {
+      return { ok: true, wrapper: true }
+    }
+  } catch {}
+  return failure
+}
+
+async function startVmRuntimeAdmitted(
+  vm,
+  projectRoot,
+  { recreate, routing: resolvedRouting, accel, useInstalledCrag },
+) {
+  const dataplane = resolveKernelDataplane(vm, resolvedRouting)
+  const preserveCrag = dataplane === 'crag' && (useInstalledCrag === true || vm.kernel_installation?.kernel === 'crag')
+  if (preserveCrag) {
+    const installed = inspectInstalledCragEntry(projectRoot, vm)
+    if (!installed.ok) return installed
+  }
+  const licensed = checkCragLicense(projectRoot, vm, resolvedRouting)
   if (!licensed.ok) return licensed
   if (licensed.license?.scope === 'kernel') await projectCragUniversalVm(projectRoot, vm)
-  if (!isKvmRuntime(vm)) slotDockerCpus(vm) // reject corrupt persisted quotas before any lifecycle changes
-  if (isKvmRuntime(vm) && accelOpt !== 'kvm' && accelOpt !== 'tcg') {
-    const recorded = vm.runtime?.accel
-    if (recorded !== 'kvm' && recorded !== 'tcg') {
-      const resolved = resolveSlotRouting(projectRoot, routing)
-      return probeLocalKvm({ routing: resolved }).then((probe) => {
-        if (!probe.ok) return { ok: false, code: 'kvm_unavailable', error: probe.error || '本机不支持 KVM' }
-        return startVmRuntime(vm, projectRoot, { recreate, routing: resolved, accel: probe.accel })
-      })
-    }
-    return startVmRuntime(vm, projectRoot, { recreate, routing, accel: recorded })
-  }
   const kvm = isKvmRuntime(vm)
+  if (!kvm) slotDockerCpus(vm) // reject corrupt persisted quotas before any lifecycle changes
+  let accelOpt = accel
+  if (kvm && accelOpt !== 'kvm' && accelOpt !== 'tcg') {
+    accelOpt = vm.runtime?.accel
+    if (accelOpt !== 'kvm' && accelOpt !== 'tcg') {
+      const probe = await probeLocalKvm({ routing: resolvedRouting })
+      if (!probe.ok) return { ok: false, code: 'kvm_unavailable', error: probe.error || '本机不支持 KVM' }
+      accelOpt = probe.accel
+    }
+  }
   const name = containerName(vm.id)
   const slotName = displayName(vm.id)
   let host = String(vm.fingerprint?.hostname || '').trim() || slotName
@@ -1214,7 +1296,6 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
   const zone = validTimezone(vm.timezone)
   if (zone) vm.timezone = zone
   vm.locale = vm.locale || STANDARD_LOCALE
-  const resolvedRouting = resolveSlotRouting(projectRoot, routing)
   const mem = slotMemory(vm, resolvedRouting)
   const image = kvm ? kvmImageForKernel(kernel) : imageForKernel(kernel)
   const home = path.join(projectRoot, 'vms', vm.id, 'cli-home')
@@ -1235,14 +1316,24 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
   if (kvm && existing) {
     ensureKvmMachineRecord(vm, { projectRoot, containerName: name, run: sh, persist: true })
   }
-  const restartPolicy = updateSlotRestartPolicy(vm, existing, sh)
+  const restartPolicy = updateSlotRestartPolicy(existing, slotRestartPolicy(vm, resolvedRouting), sh)
   if (!restartPolicy.ok) return { ok: false, error: restartPolicy.stderr || 'slot restart policy update failed' }
   const paths = workerPaths(projectRoot, vm.id, vm)
-  const replace =
+  let replace =
     recreate ||
+    existing?.restarting ||
     (existing?.running && !slotKernelAlive(existing, paths, vm)) ||
     codexContainerStale(existing, vm) ||
     nativeSlotSandboxNeedsRecreate(existing, vm, resolvedRouting)
+  // A valid host permit still needs the shared entitlement inside the slot.
+  // Docker start cannot add bind mounts to an existing stopped container.
+  if (!replace && existing && !existing.running && !kvm && !vm.node_id && licensed.license?.scope === 'host') {
+    try {
+      replace = !hasCragHostMount(projectRoot, name)
+    } catch {
+      return { ok: false, code: 'crag_host_mount_inspect_failed', error: '无法确认 Docker 槽的 CRAG 宿主授权挂载' }
+    }
+  }
   // Node restart / 开机 must not bounce a live slot with a healthy worker.
   if (existing?.running && !replace) {
     runtimePatch(vm, existing, {
@@ -1257,8 +1348,7 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
     return { ok: true, action: 'already-running', runtime: vm.runtime }
   }
   const codex = isCodexVm(vm)
-  if (!codex) {
-    const dataplane = resolveKernelDataplane(vm, resolvedRouting) || 'wrap'
+  if (!codex && !preserveCrag) {
     try {
       const laid = materializeResolvedKernel(projectRoot, vm, {
         uid: runtimeUidNum(vm),
@@ -1409,7 +1499,7 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
       '--network',
       netName,
       '--restart',
-      slotRestartPolicy(vm),
+      slotRestartPolicy(vm, resolvedRouting),
       ...dockerSlotResourceArgs(vm, resolvedRouting),
       '--user',
       runtimeUser(vm),
@@ -1430,7 +1520,7 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
         ? [
             '--security-opt',
             `seccomp=${CRAG_V2_SECCOMP_PATH}`,
-            ...(cragV2NeedsApparmorUnconfined() ? ['--security-opt', 'apparmor=unconfined'] : []),
+            ...(cragDockerAppArmorProfile() ? ['--security-opt', `apparmor=${cragDockerAppArmorProfile()}`] : []),
           ]
         : []),
       '--cap-drop',
@@ -1545,12 +1635,17 @@ export function destroyVmRuntime(vm, { requireConfirmation = false, run = sh } =
 
 export function stopVmRuntime(vm) {
   const name = containerName(vm.id)
-  const info = inspectContainer(name)
-  if (!info) {
+  const outcome = inspectContainerOutcome(name)
+  if (outcome.status === 'error') return { ok: false, error: outcome.error }
+  if (outcome.status === 'missing') {
     if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true }
     return { ok: true, action: 'absent', runtime: vm.runtime || null }
   }
-  if (!info.running) {
+  const info = outcome.container
+  // Do not leave a legacy restart policy on a stopped slot that may be reclaimed.
+  const restartPolicy = updateSlotRestartPolicy(info, 'no', sh)
+  if (!restartPolicy.ok) return { ok: false, error: restartPolicy.stderr || 'slot restart policy update failed' }
+  if (!info.running && !info.restarting) {
     runtimePatch(vm, info)
     vm.runtime.stopped = true
     return { ok: true, action: 'already-stopped', runtime: vm.runtime }

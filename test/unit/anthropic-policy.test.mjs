@@ -814,6 +814,33 @@ test('#953 third-party scrub rewrites tool_reference inside tool_result history'
   assert.equal(result.reverse.mcp__WebSearch, 'WebSearch')
 })
 
+test('third-party tool additions and removals follow the declared tool name', () => {
+  const body = {
+    tools: [{ name: 'lookup_doc', input_schema: { type: 'object' } }],
+    messages: [
+      { role: 'user', content: 'lookup' },
+      {
+        role: 'system',
+        content: ['tool_addition', 'tool_removal'].map((type) => ({
+          type,
+          tool: { type: 'tool_reference', name: 'lookup_doc' },
+        })),
+      },
+    ],
+  }
+  const normalized = toStandardAnthropicBody(body).body
+  assert.equal(normalized.tools[0].name, 'mcp__lookup_doc')
+  assert.deepEqual(
+    normalized.messages[1].content.map((block) => block.tool.name),
+    ['mcp__lookup_doc', 'mcp__lookup_doc'],
+  )
+  assert.deepEqual(
+    body.messages[1].content.map((block) => block.tool.name),
+    ['lookup_doc', 'lookup_doc'],
+  )
+  assert.deepEqual(toStandardAnthropicBody(body, { official: true }).body.messages[1], body.messages[1])
+})
+
 test('#953 client-supplied mcp__ names in tool_reference stay unchanged', () => {
   const result = scrubUpstreamClientBody({
     tools: [

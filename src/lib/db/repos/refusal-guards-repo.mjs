@@ -103,10 +103,11 @@ export class RefusalGuardsRepo {
     const query = Array.isArray(signature) ? signature : decodeSignature(signature)
     if (!query) return null
     let best = null
-    for (const row of this._signatures.all(new Date().toISOString())) {
+    for (const row of this._signatures.iterate(new Date().toISOString())) {
       const score = signatureSimilarity(query, decodeSignature(row.signature))
       if (score < threshold) continue
       if (!best || score > best.score) best = { fingerprint: row.fingerprint, score }
+      if (score === 1) break
     }
     if (!best) return null
     const rec = this.get(best.fingerprint)

@@ -59,7 +59,8 @@ test('plan limit writes rate_limit_reset_at from the text and survives a passive
     assert.equal(state.rate_limit_reset_at, Math.floor(block.until / 1000) * 1000)
     assert.equal(state.session_window_status, 'rejected')
     assert.deepEqual(hardBlockOf(state, now), { reason: 'rate_limited', until: state.rate_limit_reset_at })
-    assert.equal(probes.length, 0)
+    // Every upstream 429 asks /usage once (throttled per account), even with a parsed reset.
+    assert.equal(probes.length, 1)
     // Passive Extra saying "under safety" must not lift the 429 block.
     accountQuota.clearQuotaExhaustedCooldown('acc-1')
     assert.equal(runtimeRepo.get('acc-1').rate_limit_reset_at, state.rate_limit_reset_at)

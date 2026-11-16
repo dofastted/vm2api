@@ -28,7 +28,11 @@ import { PageHeader } from '@/components/page-header'
 import { SlotIdentity } from '@/components/platform-chip'
 import { QueryGate } from '@/components/query-gate'
 import { meQueryOptions } from '@/features/auth/queries'
-import { usageQueryOptions } from '@/features/overview/queries'
+import { GeminiEnvironments } from '@/features/import/gemini-environments'
+import {
+  dashboardQueryOptions,
+  usageQueryOptions,
+} from '@/features/overview/queries'
 import { planDeleteActiveVm } from '@/features/vm/active-vm'
 import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
 import { DeleteActiveVmHint } from '@/features/vm/delete-active-hint'
@@ -155,7 +159,10 @@ export function VmListPage() {
       )
       setDeleteTarget(null)
       setDeleteInput('')
-      await qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey })
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey }),
+        qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
+      ])
     },
     onError: (error: Error) => toast.error(error.message),
   })
@@ -347,6 +354,7 @@ export function VmListPage() {
           )}
         </VmActionsProvider>
       </QueryGate>
+      {me.data?.role === 'admin' ? <GeminiEnvironments view='vm' /> : null}
       <ConfirmDialog
         open={!!resetTarget}
         onOpenChange={(open) => {

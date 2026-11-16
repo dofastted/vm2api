@@ -9,15 +9,17 @@ import {
   MAX_CRAG_HOST_ENTITLEMENT_BYTES,
   prepareCragSubscriptionBinding,
   readCragSubscriptionReleaseCandidate,
+  removeReclaimedCragPermit,
   verifyCragHostEntitlement,
 } from './crag-license.mjs'
 import { cragSubscriptionPublicDirectory } from './crag-subscription-paths.mjs'
-import { isValidVmId } from './vm-file.mjs'
+import { isValidVmId, vmLockBusy } from './vm-file.mjs'
 import { cragV2PackageRoot } from './wrap-cli-runtime.mjs'
 import { resolveKernelDataplane } from './slot-engine.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { publishKvmCragLicense } from './kvm-crag-license.mjs'
 import { publishClusterSubscription } from '../cluster/crag-subscription-files.mjs'
+import { blockKvmCragSubscription, holdKvmCragSubscriptionPublications } from './kvm-crag-subscription.mjs'
 
 const AUTHORITY = 'https://crag.fkcodex.com'
 const localFilesystems = new Set([0xef53, 0x794c7630, 0x58465342, 0x9123683e, 0x2fc12fc1, 0xf2f52010])
@@ -60,6 +62,13 @@ const overQuota = () =>
     code: 'license_crag_host_over_quota',
     error: '宿主机运行中的 CRAG 内核超过订阅槽位。请停用、退役或切回标准内核，或兑换足够额度后重试。',
   })
+
+function runtimeDenial(denial) {
+  const { code, message } = denial.body.error
+  return { ok: false, status: denial.status, code, error: message }
+}
+
+const denyRuntime = (license) => ({ ok: false, status: 403, code: license.code, error: license.message })
 
 function projection(data, claims) {
   const reclaim = claims.version === 2
@@ -184,6 +193,26 @@ function assertHostPackage(projectRoot, digest) {
   if (!isDigest(digest) || hostPackageDigest(projectRoot) !== digest) throw hostPackageUnready()
 }
 
+function standardEnrollment(projectRoot, { issuerId, payloadKeyId }, strict = false) {
+  let standard
+  try {
+    standard = JSON.parse(fs.readFileSync(path.join(projectRoot, 'deploy/payload.json'), 'utf8')).crag_authorization
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw hostPackageUnready()
+  }
+  if (!standard) return {}
+  if (standard.issuer_public_key_id !== issuerId || standard.payload_key_id !== payloadKeyId) {
+    if (strict) throw hostPackageUnready()
+    return {}
+  }
+  return { issuer_public_key_id: issuerId, payload_key_id: payloadKeyId }
+}
+
+function hostEnrollmentIdentity(projectRoot, digest) {
+  assertHostPackage(projectRoot, digest)
+  return standardEnrollment(projectRoot, cragTargetIds(projectRoot, undefined), true)
+}
+
 function sync(dir) {
   const handle = fs.openSync(dir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW)
   try {
@@ -245,6 +274,7 @@ export function createCragSubscription({
   runtimeInventory,
   publishClusterBinding = publishClusterSubscription,
   publishKvmBinding = publishKvmCragLicense,
+  blockKvmBinding = blockKvmCragSubscription,
   fetchImpl = globalThis.fetch,
   origin = AUTHORITY,
   machineIdFile,
@@ -261,6 +291,9 @@ export function createCragSubscription({
   const rosterIntentFile = path.join(privateDir, 'roster.json')
   const marker = path.join(publicDir, 'sync-pending')
   let busy = false
+  const runtimeReservations = new Set()
+  let admissionWaiters = 0
+  let admissionQueue = Promise.resolve()
   let expiryProbe
   let lastExpiryProbe
 
@@ -364,7 +397,7 @@ export function createCragSubscription({
     if ((await assertReady(vm, options)) === false) throw fail('crag_subscription_target_unready', 409)
     preserveOtherLicense(vm)
     const machineCode = prepareCragSubscriptionBinding(projectRoot, vm)
-    const { payloadKeyId } = cragTargetIds(projectRoot, vm)
+    const { payloadKeyId, issuerId } = cragTargetIds(projectRoot, vm)
     // Pin both the actual device key and the persisted VM owner, not Docker's mutable container ID.
     const fingerprint = createHash('sha256')
       .update(
@@ -377,7 +410,7 @@ export function createCragSubscription({
         ]),
       )
       .digest('hex')
-    return { vm, machineCode, payloadKeyId, fingerprint }
+    return { vm, machineCode, payloadKeyId, issuerId, fingerprint }
   }
 
   function readLocalRights() {
@@ -445,6 +478,84 @@ export function createCragSubscription({
     return result
   }
 
+  function withRuntimeAdmission(vm, { install = false, bindSubscription = false } = {}, start) {
+    if (!runtimeInventory) return start()
+    const options = { preferInstalled: !install }
+    const { license } = getCragLicense(projectRoot, vm, options)
+    if (license.valid && license.scope !== 'host') return start()
+    if (!license.valid && !((bindSubscription || install) && license.code === 'license_required')) {
+      return denyRuntime(license)
+    }
+    if (admissionWaiters >= 32)
+      return { ok: false, status: 409, code: 'crag_subscription_busy', error: 'CRAG 启动操作繁忙，请稍后重试。' }
+    admissionWaiters++
+    let reserved = false
+    const admit = admissionQueue
+      .then(async () => {
+        const rights = readLocalRights()
+        if (rights.pending) return runtimeDenial(usageUnverified())
+        const checked = getCragLicense(projectRoot, vm, options).license
+        const needsBinding = checked.code === 'license_required' && (bindSubscription || install)
+        if (!checked.valid && !needsBinding) return denyRuntime(checked)
+        if (checked.valid && checked.scope !== 'host') return null
+        if (!rights.claims && needsBinding) {
+          return denyRuntime(checked)
+        }
+        assertActive(rights.previous)
+        if (runtimeReservations.has(vm.id))
+          return { ok: false, status: 409, code: 'crag_slot_start_busy', error: '此 CRAG 槽位正在启动或更新。' }
+        const runtime = await runtimeInventory.snapshot({ ...rights, hostOnly: true, fresh: true, timeoutMs: 4000 })
+        if (!unchangedRights(rights, readLocalRights())) return runtimeDenial(usageUnverified())
+        const roster = rights.claims.roster
+        const occupying = new Set(runtimeReservations)
+        let uncertain = false
+        for (const [id, entry] of Object.entries(runtime.vms)) {
+          if (id === vm.id || entry.scope === 'independent') continue
+          if (entry.state === 'running') occupying.add(id)
+          else if (!entry.stopped_confirmed && !entry.non_crag_confirmed) {
+            occupying.add(id)
+            uncertain = true
+          }
+        }
+        const limit = roster
+          ? Math.min(rights.claims.slot_limit === 'unlimited' ? 10000 : rights.claims.slot_limit, 10000)
+          : rights.claims.slot_limit
+        if (limit !== 'unlimited' && occupying.size >= limit) {
+          return runtimeDenial(uncertain ? usageUnverified() : overQuota())
+        }
+        runtimeReservations.add(vm.id)
+        reserved = true
+        if (!needsBinding || install || !bindSubscription) return null
+        await exclusive(async () => {
+          if (!unchangedRights(rights, readLocalRights())) throw fail('crag_subscription_sync_pending', 409)
+          checkNoIntent()
+          await bindForStart(
+            vm,
+            rights.previous,
+            rights.hostId,
+            cragTargetIds(projectRoot, vm).payloadKeyId,
+            {},
+            runtime,
+          )
+        })
+        return null
+      })
+      .catch((error) => {
+        if (authorityErrors.has(error?.code) || error?.code?.startsWith('crag_subscription_')) {
+          return { ok: false, status: error.status || 409, code: error.code, error: error.message }
+        }
+        return runtimeDenial(usageUnverified())
+      })
+    admissionQueue = admit.finally(() => {
+      admissionWaiters--
+    })
+    return admit
+      .then((denial) => denial || start())
+      .finally(() => {
+        if (reserved) runtimeReservations.delete(vm.id)
+      })
+  }
+
   async function admitInference({ vm, routing, health } = {}) {
     if (!runtimeInventory || !vm?.id) return null
     const liveCrag = health?.runtime_variant === 'crag-v2' || (!health?.runtime_variant && health?.dataplane === 'crag')
@@ -456,14 +567,36 @@ export function createCragSubscription({
       // No host identity need be available for an independent grant.
     }
     try {
+      const localKvm = !vm.node_id && isKvmRuntime(vm)
       if (!readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId)) {
         if (isKvmRuntime(vm) && vm.status === 'running' && getCragLicense(projectRoot, vm).license.valid) {
-          await publishKvmBinding(projectRoot, vm)
+          if ((await publishKvmBinding(projectRoot, vm)) === false && localKvm) return usageUnverified()
         }
         return null
       }
       let rights = readLocalRights()
-      if (vm.node_id || isKvmRuntime(vm)) {
+      if (localKvm) {
+        if (busy || rights.pending || !rights.claims) return usageUnverified()
+        const { license } = getCragLicense(projectRoot, vm)
+        if (!license.valid) {
+          try {
+            await blockKvmBinding(projectRoot, vm)
+          } catch {
+            // A delivery failure does not change the verified reason this request is denied.
+          }
+          return cragLicenseDeniedResult({ code: license.code, error: license.message })
+        }
+        try {
+          if ((await publishKvmBinding(projectRoot, vm)) !== true) return usageUnverified()
+        } catch {
+          return cragLicenseDeniedResult({
+            code: 'license_crag_kvm_sync_failed',
+            error: 'KVM 槽授权未同步，请检查 guest 状态后重试。',
+          })
+        }
+        if (busy || !unchangedRights(rights, readLocalRights())) return usageUnverified()
+      }
+      if (vm.node_id) {
         if (rights.pending || !rights.claims) return usageUnverified()
         if (vm.status === 'running' && getCragLicense(projectRoot, vm).license.valid) {
           try {
@@ -491,6 +624,7 @@ export function createCragSubscription({
           timeoutMs,
         })
         const next = readLocalRights()
+        if (localKvm && (busy || !unchangedRights(rights, next))) return usageUnverified()
         if (unchangedRights(rights, next)) {
           if (runtime.host_over_limit === true) return overQuota()
           return runtime.host_over_limit === false ? null : usageUnverified()
@@ -634,13 +768,16 @@ export function createCragSubscription({
     return { code: data.entitlement, claims: next, rights: projection(data, next) }
   }
 
-  async function finish(hostId, intent, previous) {
-    if (Object.hasOwn(intent, 'host_package_sha256')) assertHostPackage(projectRoot, intent.host_package_sha256)
+  async function finish(hostId, intent, previous, asserted = {}) {
+    const enrollment = Object.hasOwn(intent, 'host_package_sha256')
+      ? hostEnrollmentIdentity(projectRoot, intent.host_package_sha256)
+      : asserted
     publish(marker, 'pending\n', 0o644)
     let data
     try {
       data = await authority('redeem', hostId, credential(hostId), {
         redemption_code: intent.redemption_code,
+        ...enrollment,
       })
     } catch (error) {
       if (terminalRedeem.has(error.code)) {
@@ -657,14 +794,69 @@ export function createCragSubscription({
     return confirmed
   }
 
-  async function exclusive(work) {
+  async function kvmBindings() {
+    if (process.platform !== 'linux') return []
+    const hostId = load(hostFile, 0o644, 65)?.trim()
+    if (!hostId) return []
+    const targets = await listTargets()
+    if (!Array.isArray(targets)) throw fail('crag_subscription_target_unready', 409)
+    return targets.filter((vm) => {
+      if (vm.node_id || !isKvmRuntime(vm)) return false
+      try {
+        return !!readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId)
+      } catch {
+        // A damaged permit must not leave a previously published guest grant usable.
+        return true
+      }
+    })
+  }
+
+  async function blockKvmBindings() {
+    for (const vm of await kvmBindings()) await blockKvmBinding(projectRoot, vm)
+  }
+
+  async function restoreKvmBindings() {
+    const targets = await kvmBindings()
+    if (!targets.length) return
+    const rights = readLocalRights()
+    let failed = false
+    for (const vm of targets) {
+      try {
+        const { license } = getCragLicense(projectRoot, vm)
+        if (!rights.pending && license.valid && license.scope === 'host') {
+          await publishKvmBinding(projectRoot, vm)
+        } else {
+          // Revocation, expiry and an install awaiting a new payload keep the guest blocked.
+          await blockKvmBinding(projectRoot, vm)
+        }
+      } catch {
+        failed = true
+      }
+    }
+    if (failed) throw fail('license_crag_kvm_sync_failed', 503)
+  }
+
+  async function exclusive(work, { blockBefore = true } = {}) {
     if (busy) throw fail('crag_subscription_busy', 409)
     busy = true
+    const release = holdKvmCragSubscriptionPublications(projectRoot)
+    let result, failure
     try {
-      return await work()
+      if (blockBefore) await blockKvmBindings()
+      result = await work()
+    } catch (error) {
+      failure = error
     } finally {
+      release()
+      try {
+        await restoreKvmBindings()
+      } catch (error) {
+        failure ??= error
+      }
       busy = false
     }
+    if (failure) throw failure
+    return result
   }
 
   function readRosterIntent() {
@@ -744,8 +936,62 @@ export function createCragSubscription({
       }
     }
     publish(entitlementFile, confirmed.code, 0o644)
+    if (intent.action === 'release' && intent.reclaim === true) {
+      const target = getTarget
+        ? await getTarget(intent.vm_id)
+        : (await listTargets()).find(({ id }) => id === intent.vm_id)
+      if (target?.id === intent.vm_id) removeReclaimedCragPermit(projectRoot, target, intent.permit_sha256)
+    }
     clearRosterIntent()
     return confirmed
+  }
+
+  async function reclaimStoppedSeat(vm, rights, runtime) {
+    const { hostId, previous, claims } = rights
+    for (const target of await listTargets()) {
+      if (target.id === vm.id || target.status !== 'stopped' || runtimeReservations.has(target.id)) continue
+      if (
+        target.kernel_operation?.phase === 'pending' ||
+        vmLockBusy(path.join(projectRoot, 'vms', `${target.id}.json`)) ||
+        !runtime.vms[target.id]?.stopped_confirmed
+      )
+        continue
+      if (!(await runtimeInventory.confirmReclaimableStop(target))) continue
+      if (runtimeReservations.has(target.id) || vmLockBusy(path.join(projectRoot, 'vms', `${target.id}.json`))) continue
+      if (!unchangedRights(rights, readLocalRights())) throw fail('crag_subscription_sync_pending', 409)
+      const permit_sha256 = readCragSubscriptionReleaseCandidate(projectRoot, target, hostId)
+      if (!claims.roster.some((entry) => entry.permit_sha256 === permit_sha256)) continue
+      const intent = {
+        host_id: hostId,
+        action: 'release',
+        vm_id: target.id,
+        permit_sha256,
+        proven: true,
+        reclaim: true,
+      }
+      beginRosterIntent(intent)
+      return syncRoster(hostId, intent, previous)
+    }
+    throw fail('slot_limit_reached', 409)
+  }
+
+  async function bindForStart(vm, previous, hostId, payloadKeyId, options, runtime) {
+    const machineCode = prepareCragSubscriptionBinding(projectRoot, vm)
+    const bind = (rights) =>
+      bindTarget(vm, hostId, rights, machineCode, payloadKeyId, { ...options, allowReissue: false })
+    try {
+      return await bind(previous)
+    } catch (error) {
+      if (error.code !== 'slot_limit_reached' || previous.claims.version !== 2 || !runtimeReservations.has(vm.id))
+        throw error
+    }
+    // Bind can replay a remote seat whose earlier response was lost. Only a
+    // definitive full response permits reclaiming another device's seat.
+    const rights = readLocalRights()
+    if (rights.pending || rights.previous?.code !== previous.code) throw fail('crag_subscription_sync_pending', 409)
+    runtime ??= await runtimeInventory.snapshot({ ...rights, hostOnly: true, fresh: true, timeoutMs: 4000 })
+    if (!unchangedRights(rights, readLocalRights())) throw fail('crag_subscription_sync_pending', 409)
+    return bind(await reclaimStoppedSeat(vm, rights, runtime))
   }
 
   function redeem(value, renewal, expectedHost) {
@@ -792,7 +1038,7 @@ export function createCragSubscription({
     previous,
     machineCode,
     payloadKeyId,
-    { checkTarget, reissueSeat, install = false } = {},
+    { checkTarget, reissueSeat, install = false, allowReissue = true } = {},
   ) {
     assertActive(previous)
     const reissue = reissueSeat !== undefined
@@ -828,7 +1074,7 @@ export function createCragSubscription({
       try {
         data = await authority('bind', hostId, key, request)
       } catch (error) {
-        if (install || reissue || error.code !== 'payload_key_conflict') throw error
+        if (!allowReissue || install || reissue || error.code !== 'payload_key_conflict') throw error
         if (!vm.node_id && getCragLicense(projectRoot, vm).license.code !== 'license_payload_key_mismatch') throw error
         data = await authority('bind', hostId, key, { ...request, reissue: true })
       }
@@ -893,14 +1139,16 @@ export function createCragSubscription({
         storage(true)
         const redemption_code = await claim()
         if (!validVoucher(redemption_code)) throw invalidRights()
-        await checkTarget()
+        const resolved = await checkTarget()
+        const standard = standardEnrollment(projectRoot, resolved)
         const raw = load(intentFile, 0o600, 512)
         const binding = orderId ? { order_id: orderId } : { target_fingerprint: target.fingerprint }
-        const intent = { host_id: hostId, redemption_code, ...binding }
+        let intent = { host_id: hostId, redemption_code, ...binding }
         if (raw == null) {
           const pending = readRosterIntent()
           if (!orderId && pending?.action === 'bind') await syncRoster(hostId, pending, current(hostId))
           checkNoIntent()
+          if (!current(hostId) && standard.payload_key_id) Object.assign(intent, standard)
           credential(hostId, true)
           publish(intentFile, JSON.stringify(intent), 0o600, true)
         } else {
@@ -912,8 +1160,17 @@ export function createCragSubscription({
             saved.redemption_code !== redemption_code
           )
             throw fail('crag_subscription_sync_pending', 409)
+          // Replay what was actually sent; old claims must not acquire new selectors.
+          intent = saved
         }
-        await finish(hostId, intent, current(hostId))
+        const asserted = Object.hasOwn(intent, 'payload_key_id') || Object.hasOwn(intent, 'issuer_public_key_id')
+        if (
+          asserted &&
+          (intent.payload_key_id !== standard.payload_key_id ||
+            intent.issuer_public_key_id !== standard.issuer_public_key_id)
+        )
+          throw hostPackageUnready()
+        await finish(hostId, intent, current(hostId), asserted ? standard : {})
         onRedeemed?.()
       }
 
@@ -932,6 +1189,7 @@ export function createCragSubscription({
   return {
     status: () => status(),
     admitInference,
+    withRuntimeAdmission,
     purchaseDeviceId() {
       const hostId = identity()
       storage()
@@ -994,17 +1252,21 @@ export function createCragSubscription({
       return proof
     },
     upgrade() {
-      return exclusive(async () => {
-        const hostId = identity()
-        storage()
-        checkNoIntent()
-        const previous = current(hostId)
-        if (!previous || !(await ready({ reclaim: true }))) throw fail('crag_subscription_target_unready', 409)
-        if (previous.claims.version === 2) return status()
-        const intent = { host_id: hostId, action: 'upgrade' }
-        beginRosterIntent(intent)
-        return status(await syncRoster(hostId, intent, previous))
-      })
+      return exclusive(
+        async () => {
+          const hostId = identity()
+          storage()
+          checkNoIntent()
+          const previous = current(hostId)
+          if (!previous || !(await ready({ reclaim: true }))) throw fail('crag_subscription_target_unready', 409)
+          if (previous.claims.version === 2) return status()
+          await blockKvmBindings()
+          const intent = { host_id: hostId, action: 'upgrade' }
+          beginRosterIntent(intent)
+          return status(await syncRoster(hostId, intent, previous))
+        },
+        { blockBefore: false },
+      )
     },
     async teardown(vm, destroy) {
       if (process.platform !== 'linux') return destroy(false)
@@ -1021,31 +1283,35 @@ export function createCragSubscription({
       const permit = readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId)
       const priorIntent = readRosterIntent()
       if (!permit && priorIntent?.vm_id !== vm.id) return destroy(false)
-      return exclusive(async () => {
-        const saved = readRosterIntent()
-        if (
-          saved &&
-          (saved.action !== 'release' || saved.vm_id !== vm.id || (permit && saved.permit_sha256 !== permit))
-        )
-          throw fail('crag_subscription_sync_pending', 409)
-        if (!saved) checkNoIntent()
-        const now = current(hostId)
-        const intent = saved ?? {
-          host_id: hostId,
-          action: 'release',
-          vm_id: vm.id,
-          permit_sha256: permit,
-          proven: false,
-        }
-        if (!saved) beginRosterIntent(intent)
-        const result = await destroy(true)
-        if (!result.ok) return result
-        if (result.teardownConfirmed !== true) throw fail('crag_subscription_teardown_unconfirmed', 409)
-        intent.proven = true
-        publish(rosterIntentFile, JSON.stringify(intent), 0o600)
-        await syncRoster(hostId, intent, now)
-        return result
-      })
+      return exclusive(
+        async () => {
+          const saved = readRosterIntent()
+          if (
+            saved &&
+            (saved.action !== 'release' || saved.vm_id !== vm.id || (permit && saved.permit_sha256 !== permit))
+          )
+            throw fail('crag_subscription_sync_pending', 409)
+          if (!saved) checkNoIntent()
+          const now = current(hostId)
+          const intent = saved ?? {
+            host_id: hostId,
+            action: 'release',
+            vm_id: vm.id,
+            permit_sha256: permit,
+            proven: false,
+          }
+          if (!saved) beginRosterIntent(intent)
+          const result = await destroy(true)
+          if (!result.ok) return result
+          if (result.teardownConfirmed !== true) throw fail('crag_subscription_teardown_unconfirmed', 409)
+          intent.proven = true
+          publish(rosterIntentFile, JSON.stringify(intent), 0o600)
+          await blockKvmBindings()
+          await syncRoster(hostId, intent, now)
+          return result
+        },
+        { blockBefore: false },
+      )
     },
     recover() {
       return exclusive(async () => {
@@ -1096,7 +1362,7 @@ export function createCragSubscription({
         return { seat }
       })
     },
-    authorizeInstall(vm) {
+    authorizeInstall(vm, { allowLegacyReissue = false } = {}) {
       return exclusive(async () => {
         if (typeof vm?.id !== 'string' || !isValidVmId(vm.id)) throw fail('crag_subscription_target_unready', 409)
         const hostId = identity()
@@ -1113,11 +1379,16 @@ export function createCragSubscription({
         const reissueSeat =
           previous.claims.roster?.find((entry) => entry.permit_sha256 === permitDigest)?.seat ??
           (license.valid && license.scope === 'host' ? license.seat : undefined)
+        if (!allowLegacyReissue && (reissueSeat !== undefined || candidate.code === 'license_payload_key_mismatch'))
+          throw fail('crag_subscription_migration_required', 409)
         const { payloadKeyId } = cragTargetIds(projectRoot, vm, { preferInstalled: false })
-        await bindTarget(vm, hostId, previous, prepareCragSubscriptionBinding(projectRoot, vm), payloadKeyId, {
-          install: true,
-          reissueSeat,
-        })
+        if (allowLegacyReissue) {
+          return bindTarget(vm, hostId, previous, prepareCragSubscriptionBinding(projectRoot, vm), payloadKeyId, {
+            install: true,
+            reissueSeat,
+          })
+        }
+        await bindForStart(vm, previous, hostId, payloadKeyId, { install: true })
       })
     },
   }

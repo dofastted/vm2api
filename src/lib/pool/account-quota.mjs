@@ -1461,8 +1461,13 @@ function healOfficialOverwriteExtra(acc, accountId, repo) {
 function applyHeaderExhausted(acc, h = {}) {
   const s5 = String(h['anthropic-ratelimit-unified-5h-status'] || '').toLowerCase()
   const s7 = String(h['anthropic-ratelimit-unified-7d-status'] || '').toLowerCase()
+  // Callers only pass exhausted with evidence: a window status, plan-limit
+  // text, or the classifier's account_quota_exhausted. When no window is named,
+  // the representative claim picks it; only a claimless proof falls back to 5h.
+  const claim = String(h['anthropic-ratelimit-unified-representative-claim'] || '').toLowerCase()
+  const claim7 = /^seven_day$|^7d$/.test(claim)
   const hit5 = s5 === 'rejected' || s5 === 'rate_limited'
-  const hit7 = s7 === 'rejected' || s7 === 'rate_limited'
+  const hit7 = s7 === 'rejected' || s7 === 'rate_limited' || (!hit5 && claim7)
   if (hit7) {
     writeHeaderWindow(acc, '7d', {
       utilization: num(h['anthropic-ratelimit-unified-7d-utilization']),

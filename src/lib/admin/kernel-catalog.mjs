@@ -40,21 +40,35 @@ const baseFor = (root, kernel) =>
 const archFor = (kernel) => (kernel === 'crag' ? cragV2Arch() : 'amd64')
 const CRAG_PINNED_RELEASES = [
   {
+    tag: 'payload-2026.11.17-crag-3.1.4',
+    label: '3.1.4 标准版',
+    size: 170833337,
+    manifestSha256: '67224bbec4d1db42b7c446b22a674702d41d2ed0aaf61f26ab60764a5085a235',
+    sha256: '295e40ba1b1830c0e8b58540d96633b1aa6f2c52f6a437c09e6c976d9f21238c',
+  },
+  {
+    tag: 'payload-2026.11.17-crag-3.1.3',
+    label: '3.1.3 Compact 修复版',
+    size: 170786978,
+    manifestSha256: 'b96330de47eac3e6977f419db9387ffa2346a4c394af09b680025f5d2d2691ad',
+    sha256: '49d87f716494d5ef8eeac8e579c88ac2a5d6971cf30341df50e4ae6a4526e6a6',
+  },
+  {
     tag: 'payload-2026.11.16-crag-3.1.3',
-    label: '3.1.3 标准版',
+    label: '3.1.3（原发行）',
     size: 170914192,
     manifestSha256: '6c9273c7629d3f017c361df1000766b89e10eabd3e18db41aae66060bd3316d2',
     sha256: '2643dd84b8dd641645aff692983f2825d043264590844d520aefe293150c08b9',
   },
   {
     tag: 'payload-2026.11.16-crag-3.1.2',
+    label: '3.1.2',
     size: 170881721,
     manifestSha256: 'e5c65d050b322f907518943ad6340330a51e0b7f2aa97c459fab49a10c120067',
     sha256: '74e9ba52f18a52126fe61a3d95a89fe854972387459aed1def83bf3714cba8c3',
   },
   {
     tag: 'payload-2026.11.16-crag-3.1.2-legacy',
-    label: '3.1.2 旧授权兼容版',
     size: 170897634,
     manifestSha256: 'c38f0dece88c0ada665c544f0c16d4295784e7b230de316ea6297532b4abca61',
     sha256: '29035f48824ff83d1e9fbfb84a9236e245938387c7f39d4ff9c4ffff7d9a770b',
@@ -624,16 +638,41 @@ export async function pullKernelRelease(
     } else {
       const pin = CRAG_PINNED_RELEASES.find((entry) => entry.tag === release.payload_tag)
       if (pin && specs[0].size !== pin.size) throw coded('kernel_size_mismatch', 'CRAG 发行包大小不匹配')
+      const standard = releasePayload(projectRoot)?.crag_authorization
+      const remoteDigest = payload.assets.find((asset) => asset?.name === CRAG_V2_RELEASE_ASSET)?.digest
+      const sha256 =
+        pin?.sha256 ||
+        (typeof remoteDigest === 'string' && /^sha256:[a-f0-9]{64}$/.test(remoteDigest) ? remoteDigest.slice(7) : '')
+      if (standard && !sha256) throw coded('crag_v2_digest_missing', 'CRAG 发行未提供可信归档摘要')
       const response = await openKernelReleaseAsset(specs[0].url, fetchImpl, CRAG_V2_RELEASE_ASSET)
       await pipeline(
         responseBody(response, MAX_ARCHIVE, 'crag_v2_too_large'),
-        limitBytes(MAX_ARCHIVE, 'crag_v2_too_large', specs[0].size, pin?.sha256),
+        limitBytes(MAX_ARCHIVE, 'crag_v2_too_large', specs[0].size, sha256),
         createGunzip(),
         limitBytes(MAX_EXPANDED, 'crag_v2_archive_invalid'),
         new PackageTar(stage),
       )
       const verified = verifyCragV2Tree(stage)
       if (!verified.ok) throw coded(verified.code, 'CRAG 签名加密包校验失败')
+      const { manifest } = verified
+      if (
+        pin &&
+        crypto
+          .createHash('sha256')
+          .update(fs.readFileSync(path.join(stage, 'manifest.json')))
+          .digest('hex') !== pin.manifestSha256
+      ) {
+        throw coded('crag_v2_digest_mismatch', 'CRAG 签名包的 manifest 与发行记录不一致')
+      }
+      if (
+        standard &&
+        !pin &&
+        (manifest.family !== standard.family ||
+          manifest.authorization.product !== standard.product ||
+          manifest.authorization.public_key_id !== standard.issuer_public_key_id ||
+          manifest.payload.key_id !== standard.payload_key_id)
+      )
+        throw coded('crag_v2_identity_mismatch', 'CRAG 载荷不属于当前官方发行身份')
       if (!pinned(fs.readFileSync(path.join(stage, 'crag-license-public.pem')))) {
         throw coded('crag_v2_authority_mismatch', 'CRAG 发行公钥与本机可信公钥不匹配')
       }
@@ -670,6 +709,7 @@ export async function pullKernelRelease(
     let message = 'CRAG 拉取失败；需官方签名加密发行包'
     if (code === 'crag_v2_authority_missing') message = '缺少可信 CRAG 发行公钥，请先更新到官方镜像或发行版'
     if (code === 'crag_v2_authority_mismatch') message = 'CRAG 发行公钥与本机可信公钥不匹配'
+    if (code === 'crag_v2_identity_mismatch') message = 'CRAG 载荷不属于当前官方发行身份'
     if (code === 'github_http_404') message = '所选 CRAG 发行版本未发布或不可用'
     if (code === 'crag_v2_digest_mismatch' || code === 'kernel_size_mismatch')
       message = '下载内容与所选 CRAG 发行包不匹配'

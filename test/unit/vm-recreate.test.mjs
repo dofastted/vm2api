@@ -288,3 +288,41 @@ test('destroy missing container is a no-op', () => {
   assert.equal(r.ok, true)
   assert.equal(r.action, 'absent')
 })
+
+test('KVM reset keeps machine sizing and always leaves a bootable identity (#1089)', () => {
+  const machine = {
+    memory: '4g',
+    vcpus: 4,
+    disk_gb: 40,
+    cpu_model: 'host',
+    mac: '52:54:00:aa:bb:cc',
+    disk_serial: 'KINoldserial0001',
+    smbios: {
+      manufacturer: 'Dell Inc.',
+      product: 'OptiPlex 7090',
+      version: '1.0',
+      family: 'OptiPlex',
+      serial: 'OLD1',
+      uuid: 'u',
+    },
+  }
+  const prev = { id: 'vm-31', name: '31', kernel: 'ubuntu-24.04', runtime: { type: 'kvm' }, machine, fingerprint: {} }
+
+  const traits = buildRecreatedVmRecord(prev).machine
+  assert.equal(traits.memory, '4g')
+  assert.equal(traits.vcpus, 4)
+  assert.equal(traits.disk_gb, 40)
+  assert.match(traits.mac, /^52:54:00(:[0-9a-f]{2}){3}$/)
+  assert.notEqual(traits.mac, machine.mac)
+  assert.match(traits.disk_serial, /^KIN[0-9a-f]+$/)
+  assert.notEqual(traits.disk_serial, machine.disk_serial)
+  assert.ok(traits.smbios.manufacturer && traits.smbios.serial && traits.smbios.uuid)
+
+  assert.deepEqual(buildRecreatedVmRecord(prev, null, { mode: 'keep' }).machine, machine)
+
+  const legacy = buildRecreatedVmRecord({ ...prev, machine: undefined }, null, { mode: 'keep' }).machine
+  assert.match(legacy.mac, /^52:54:00(:[0-9a-f]{2}){3}$/)
+  assert.ok(legacy.disk_serial)
+
+  assert.equal(buildRecreatedVmRecord({ id: 'vm-32', name: '32', runtime: { type: 'docker' } }).machine, undefined)
+})

@@ -27,6 +27,15 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
     { model: true, enabled: true, block: true, scoped: true },
   ],
   ['anthropic.messages', 'claude-review', 'anthropic', false, { model: true, enabled: true, scoped: true }],
+  ...['endpoint', 'model', 'unavailable', 'standard'].map((route) => [
+    'anthropic.messages',
+    'claude-review',
+    'anthropic',
+    false,
+    { model: true, enabled: true, scoped: true, route },
+  ]),
+  ['anthropic.messages', 'claude-review', 'anthropic', false, { upstream: 'policy' }],
+  ['anthropic.messages', 'claude-review', 'anthropic', false, { upstream: 'invalid' }],
   ['anthropic.messages', 'claude-opus-5-5', 'anthropic', false, { invalid: 'thinking' }],
   ['anthropic.messages', 'claude-sonnet-5-5', 'anthropic', false, { invalid: 'tools' }],
   ['openai.chat', 'claude-sonnet-5-5', 'anthropic', false, { invalid: 'tools' }],
@@ -46,7 +55,7 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
   ].map((unsafe) => ['openai.responses', 'gpt-5.4', 'openai', false, { invalid: 'shared', unsafe }]),
   ['openai.responses', 'gpt-5.4', 'openai', false, { stateless: true }],
 ]) {
-  test(`API key routes ${protocol} ${model}, review=${review.enabled ?? 'default'}, risky=${!!review.risky}, decision=${!!review.model}, block=${!!review.block}, input=${JSON.stringify(review.unsafe || review.stateless || null)}`, async () => {
+  test(`API key routes ${protocol} ${model}, review=${review.enabled ?? 'default'}, risky=${!!review.risky}, decision=${!!review.model}, block=${!!review.block}, route=${review.route || '-'}, upstream=${review.upstream || '-'}, input=${JSON.stringify(review.unsafe || review.stateless || null)}`, async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'api-channel-'))
     fs.mkdirSync(path.join(root, 'run'))
     const routingFile = path.join(root, 'routing.json')
@@ -61,7 +70,14 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
       for await (const chunk of req) chunks.push(chunk)
       audited.push(JSON.parse(Buffer.concat(chunks)))
       res.writeHead(200, { 'content-type': 'application/json' })
-      res.end(JSON.stringify({ answers: { safety: { noul: review.block ? 0.1 : 0.99 } } }))
+      const score = review.block
+        ? 0.1
+        : review.route === 'model'
+          ? 0.52
+          : ['endpoint', 'unavailable'].includes(review.route)
+            ? 0.6
+            : 0.99
+      res.end(JSON.stringify({ answers: { safety: { noul: score } } }))
     })
     if (review.model) {
       await new Promise((resolve) => audit.listen(0, '127.0.0.1', resolve))
@@ -72,6 +88,21 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
       const chunks = []
       for await (const chunk of req) chunks.push(chunk)
       captured.push(JSON.parse(Buffer.concat(chunks)))
+      if (review.upstream) {
+        res.writeHead(400, { 'content-type': 'application/json' })
+        res.end(
+          JSON.stringify({
+            error: {
+              type: 'api_error',
+              message:
+                review.upstream === 'policy'
+                  ? 'API Error: request rejected under the Usage Policy.'
+                  : 'API Error: invalid max_tokens.',
+            },
+          }),
+        )
+        return
+      }
       res.writeHead(200, { 'content-type': 'text/event-stream' })
       const events =
         upstreamProtocol === 'openai'
@@ -100,17 +131,25 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
     })
     await new Promise((resolve) => kernel.listen(path.join(root, 'run/api-kernel.sock'), resolve))
     const scheduler = new ApiScheduler()
-    scheduler.reload([
-      {
-        id: 'ep',
-        kind: 'custom',
-        protocol: upstreamProtocol,
-        risk_review_enabled: review.enabled,
-        base_url: 'https://relay.invalid',
-        models: [{ name: 'upstream-model', alias: modelOverride ? 'routed-model' : model }],
-        api_key_entries: [{ id: 'ek', api_key: 'sk-upstream', proxy_url: 'socks5://proxy.invalid:1080' }],
-      },
-    ])
+    const primary = {
+      id: 'ep',
+      kind: 'custom',
+      protocol: upstreamProtocol,
+      risk_review_enabled: review.enabled,
+      base_url: 'https://relay.invalid',
+      models: [{ name: 'upstream-model', alias: modelOverride ? 'routed-model' : model }],
+      api_key_entries: [{ id: 'ek', api_key: 'sk-upstream', proxy_url: 'socks5://proxy.invalid:1080' }],
+    }
+    const secondary = {
+      ...primary,
+      id: 'ep-alt',
+      base_url: 'https://alt.invalid',
+      models: [
+        { name: 'upstream-model', alias: model },
+        { name: 'upstream-light', alias: 'claude-light' },
+      ],
+    }
+    scheduler.reload(review.route ? [primary, secondary] : [primary])
     const response = { headersSent: false, on() {}, once() {}, off() {}, end() {}, write() {} }
     const body =
       protocol === 'openai.responses'
@@ -160,6 +199,7 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
     }
     let acquired = 0
     let released = 0
+    const refusalCache = new Map()
     const handler = createHandleProtocol({
       json: (_res, status, body) => {
         response.status = status
@@ -193,6 +233,10 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
       },
       apiScheduler: scheduler,
       apiEndpointStore: {},
+      refusalGuards: {
+        get: (fingerprint) => refusalCache.get(fingerprint),
+        remember: (entry) => refusalCache.set(entry.fingerprint, entry),
+      },
       settings: {
         get: (key, fallback) =>
           key === 'jev_intercept'
@@ -206,7 +250,12 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
                 fail_open: false,
                 questions: [{ id: 'safety', instructions: 'Is this content safe?', enabled: true }],
               }
-            : fallback,
+            : key === 'risk_audit_policy' && review.route
+              ? {
+                  downgrade_endpoint: review.route === 'unavailable' ? 'missing' : 'ep-alt',
+                  downgrade_model: 'claude-light',
+                }
+              : fallback,
       },
       stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
       routingConfigPath: routingFile,
@@ -229,6 +278,25 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
     }
     try {
       await handler.handleProtocol(req, response, protocol, req.url)
+      if (review.upstream) {
+        assert.equal(response.status, 400, JSON.stringify(response.body))
+        assert.equal(captured.length, 1)
+        assert.equal(refusalCache.size, review.upstream === 'policy' ? 1 : 0)
+        if (review.upstream === 'policy') {
+          assert.equal(response.body.error.details.retryable, false)
+          await handler.handleProtocol(req, response, protocol, req.url)
+          assert.equal(response.body.error.details.reason, 'exact')
+          assert.equal(captured.length, 1, 'a cached upstream refusal blocks even on an opt-out endpoint')
+        }
+        return
+      }
+      if (review.route === 'unavailable') {
+        assert.equal(response.status, 503)
+        assert.equal(response.body.error.code, 'risk_route_unavailable')
+        assert.equal(captured.length, 0)
+        assert.equal(acquired, 0)
+        return
+      }
       if (review.invalid) {
         assert.equal(response.status, 400, JSON.stringify(response.body))
         assert.equal(
@@ -257,10 +325,10 @@ for (const [protocol, model, upstreamProtocol, modelOverride, review = {}] of [
       assert.equal(captured[0].proxy_url, 'socks5://proxy.invalid:1080')
       assert.equal(
         captured[0].url,
-        `https://relay.invalid/v1/${upstreamProtocol === 'openai' ? 'responses' : 'messages?beta=true'}`,
+        `https://${['endpoint', 'model'].includes(review.route) ? 'alt' : 'relay'}.invalid/v1/${upstreamProtocol === 'openai' ? 'responses' : 'messages?beta=true'}`,
       )
       const outbound = JSON.parse(captured[0].body)
-      assert.equal(outbound.model, 'upstream-model')
+      assert.equal(outbound.model, review.route === 'model' ? 'upstream-light' : 'upstream-model')
       assert.equal(acquired, 1)
       assert.equal(released, 1)
       if (upstreamProtocol === 'openai') {

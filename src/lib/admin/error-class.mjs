@@ -89,6 +89,8 @@ const CODE_MAP = {
   refusal_guard: 'refusal',
   content_filter_refusal: 'refusal',
   policy_blocked: 'refusal',
+  risk_tool_blocked: 'refusal',
+  system_prompt_rewrite_blocked: 'refusal',
 }
 
 export const IGNORED_ERROR_CODES = new Set([
@@ -127,6 +129,8 @@ export const SLA_OK_ERROR_CODES = new Set([
   'refusal_guard',
   'content_filter_refusal',
   'policy_blocked',
+  'risk_tool_blocked',
+  'system_prompt_rewrite_blocked',
   'key_group_mismatch',
   'vm_pool_unavailable',
   'api_key_model_not_allowed',

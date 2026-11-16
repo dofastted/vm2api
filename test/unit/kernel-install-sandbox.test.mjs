@@ -4,6 +4,7 @@ import fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import {
   inspectContainerOutcome,
+  cragDockerAppArmorProfile,
   nativeSlotSandboxNeedsRecreate,
   suspendVmRuntimeRestart,
 } from '../../src/lib/vm/vm-runtime.mjs'
@@ -71,7 +72,8 @@ test('later native manual start upgrades a default or unconfined container but k
   })
   assert.equal(
     nativeSlotSandboxNeedsRecreate(unrestricted.container, native, {}, { userNamespaceRestricted: true }),
-    false,
+    true,
+    'unconfined still enters Ubuntu unprivileged_userns confinement',
   )
   assert.equal(
     nativeSlotSandboxNeedsRecreate(null, native),
@@ -124,4 +126,32 @@ test('policy suspension is idempotent and refuses uncertain Docker state rather 
     assert.equal(result.ok, expected)
     if (!expected) assert.equal(result.code, 'kernel_restart_policy_failed')
   }
+})
+
+test('named userns profile is stable and ordinary AppArmor hosts retain their sandbox', () => {
+  assert.equal(
+    cragDockerAppArmorProfile({ userNamespaceRestricted: true, appArmorEnabled: true }),
+    'vm2api-crag-docker',
+  )
+  assert.equal(cragDockerAppArmorProfile({ userNamespaceRestricted: false, appArmorEnabled: true }), 'unconfined')
+  assert.equal(cragDockerAppArmorProfile({ userNamespaceRestricted: false, appArmorEnabled: false }), null)
+  const secured = inspectContainerOutcome('kin-13', {
+    run: () => ({
+      ok: true,
+      stdout: output(['no-new-privileges', `seccomp=${JSON.stringify(profile)}`, 'apparmor=vm2api-crag-docker']),
+    }),
+  })
+  assert.equal(nativeSlotSandboxNeedsRecreate(secured.container, native, {}, { userNamespaceRestricted: true }), false)
+})
+
+test('profile selection reads the Ubuntu host restriction sysctl', (t) => {
+  const original = fs.readFileSync
+  const reads = []
+  t.mock.method(fs, 'readFileSync', (file, ...args) => {
+    reads.push(String(file))
+    if (file === '/proc/sys/kernel/apparmor_restrict_unprivileged_userns') return '1\n'
+    return original(file, ...args)
+  })
+  assert.equal(cragDockerAppArmorProfile(), 'vm2api-crag-docker')
+  assert.deepEqual(reads, ['/proc/sys/kernel/apparmor_restrict_unprivileged_userns'])
 })
