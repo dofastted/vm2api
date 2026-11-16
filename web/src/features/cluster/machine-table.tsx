@@ -12,14 +12,32 @@ import {
   type Meter,
 } from '@/features/cluster/model'
 
+const PRESSURE_TEXT = {
+  ok: '',
+  tight: '内存紧张',
+  critical: '内存告急',
+} as const
+const PRESSURE_CLASS = {
+  ok: '',
+  tight: 'font-medium text-[color:var(--status-warn)]',
+  critical: 'font-medium text-[color:var(--status-bad)]',
+} as const
+const PRESSURE_TITLE = {
+  ok: '',
+  tight: '可用内存低于阈值：新对话优先派到其他机器，已有对话照常',
+  critical: '可用内存告急：这台机器不再接新对话，已有对话照常',
+} as const
+
 function MeterCell({
   pct,
   sub,
   title,
+  subClass,
 }: {
   pct: number
   sub: string
   title?: string
+  subClass?: string
 }) {
   const hot = pct >= HOT_PCT
   return (
@@ -41,7 +59,12 @@ function MeterCell({
           {Math.round(pct)}%
         </span>
       </div>
-      <div className='field-metric mt-0.5 truncate text-[11px] text-muted-foreground'>
+      <div
+        className={cn(
+          'field-metric mt-0.5 truncate text-[11px] text-muted-foreground',
+          subClass
+        )}
+      >
         {sub}
       </div>
     </div>
@@ -178,8 +201,21 @@ export function MachineTable({
               {m.mem ? (
                 <MeterCell
                   pct={m.mem.pct}
-                  sub={memSub(m.mem)}
-                  title='实际用量（不含可回收缓存）'
+                  sub={
+                    m.memPressure
+                      ? `${PRESSURE_TEXT[m.memPressure.level]} · 可用 ${(m.memPressure.ratio * 100).toFixed(0)}%`
+                      : memSub(m.mem)
+                  }
+                  subClass={
+                    m.memPressure
+                      ? PRESSURE_CLASS[m.memPressure.level]
+                      : undefined
+                  }
+                  title={
+                    m.memPressure
+                      ? PRESSURE_TITLE[m.memPressure.level]
+                      : '实际用量（不含可回收缓存）'
+                  }
                 />
               ) : (
                 <Dash />

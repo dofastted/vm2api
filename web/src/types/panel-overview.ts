@@ -1,3 +1,4 @@
+import type { HostMemoryPressure } from './panel-cluster'
 import type { ErrorCollection } from './panel-logs'
 import type { QuotaTierPolicy, Vm } from './panel-vm'
 
@@ -17,6 +18,7 @@ export type HostStats = {
   heap_total?: number
   uptime?: number
   proc_uptime?: number
+  memory_pressure?: HostMemoryPressure | null
 }
 
 /** `dashboard.billing.accounts[]` / `billing.total`/`billing.today` 的一行。 */

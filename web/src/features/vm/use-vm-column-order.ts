@@ -3,9 +3,7 @@ import { useCallback, useState } from 'react'
 export const VM_COLUMN_KEYS = [
   'vm',
   'sched',
-  'type',
   'status',
-  'req',
   'usage',
   'cost',
 ] as const
@@ -15,7 +13,7 @@ export type VmColumnKey = (typeof VM_COLUMN_KEYS)[number]
 const STORAGE_KEY = 'kin.vm.column-order'
 
 /** 丢弃未知键、补齐缺失键，旧版本存下的顺序在列增减后仍然可用。 */
-function normalize(raw: unknown): VmColumnKey[] {
+export function normalizeColumnOrder(raw: unknown): VmColumnKey[] {
   const known = new Set<string>(VM_COLUMN_KEYS)
   const seen = new Set<string>()
   const order: VmColumnKey[] = []
@@ -32,7 +30,9 @@ function normalize(raw: unknown): VmColumnKey[] {
 
 function read(): VmColumnKey[] {
   try {
-    return normalize(JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null'))
+    return normalizeColumnOrder(
+      JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null')
+    )
   } catch {
     return [...VM_COLUMN_KEYS]
   }

@@ -11,8 +11,6 @@
  * `schedule_manual` are derived on every write so older readers keep working.
  */
 
-import { HOST_PRESSURE_CRITICAL, HOST_PRESSURE_TIGHT, hostMemoryLevelForVm } from '../cluster/host-memory-pressure.mjs'
-
 export const SCHEDULE_STATES = Object.freeze(['on', 'off', 'unschedulable', 'restricted'])
 
 /** Deterministic failures. Text is the panel label after 「不可调度 ·」. */
@@ -82,8 +80,6 @@ const RESTRICTED_NEW_SESSION = [
   { match: /^seats_full$/, text: '席位满', soft: false },
   { match: /^sessions_full$/, text: '对话窗口满', soft: false },
   // Machine memory (host-memory-pressure.mjs): tight still takes new conversations when no machine has room.
-  { match: /^host_memory_tight$/, text: '主机内存紧张', soft: true },
-  { match: /^host_memory_critical$/, text: '主机内存告急', soft: false },
 ]
 
 /**
@@ -401,8 +397,5 @@ export function resolveSlotState({
   if (sessionMax > 0 && (Number(sessions?.active) || 0) >= sessionMax) {
     return restricted('sessions_full', null, 'new_session')
   }
-  const hostLevel = hostMemoryLevelForVm(vm)
-  if (hostLevel === HOST_PRESSURE_CRITICAL) return restricted('host_memory_critical', null, 'new_session')
-  if (hostLevel === HOST_PRESSURE_TIGHT) return restricted('host_memory_tight', null, 'new_session', true)
   return { ...base, schedule_state: 'on' }
 }

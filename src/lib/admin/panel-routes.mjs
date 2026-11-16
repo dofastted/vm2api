@@ -4332,6 +4332,27 @@ export function createPanelHandler(ctx) {
         )
       }
 
+      // GET /api/panel/vms/:id/health?range=24h|7d — request success / error buckets for the row detail.
+      if (req.method === 'GET' && /^\/api\/panel\/vms\/[^/]+\/health$/.test(p)) {
+        const id = p.split('/')[4]
+        const vm = getVm(cfg.paths.project, id)
+        if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+        if (!requestLog?.healthBuckets)
+          return json(res, 503, { ok: false, error: { message: 'request log unavailable' } })
+        const range = new URL(req.url || '/', 'http://localhost').searchParams.get('range') === '7d' ? '7d' : '24h'
+        const shape = range === '7d' ? { slots: 84, slotMin: 120 } : { slots: 48, slotMin: 30 }
+        const now = Date.now()
+        const start = new Date(now - shape.slots * shape.slotMin * 60_000).toISOString()
+        const buckets = requestLog.healthBuckets({ now, vmId: id, ...shape }).get(id) || null
+        return json(res, 200, {
+          range,
+          slot_min: shape.slotMin,
+          start,
+          buckets,
+          top_errors: requestLog.topErrors({ vmId: id, since: start }),
+        })
+      }
+
       // GET /api/panel/vms/:id/seed-settings
       if (req.method === 'GET' && /^\/api\/panel\/vms\/[^/]+\/seed-settings$/.test(p)) {
         const id = p.split('/')[4]

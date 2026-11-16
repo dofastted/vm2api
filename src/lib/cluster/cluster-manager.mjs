@@ -4,6 +4,7 @@
  * terminal WebSocket go through this object only.
  */
 
+import { hostMemoryPressureOf } from './host-memory-pressure.mjs'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import net from 'node:net'
@@ -290,6 +291,7 @@ export class ClusterManager {
       platform: this.nodePlatform(node.id),
       link: link ? { ...link.snapshot(), host_key: link.hostKey } : { state: 'idle' },
       health: this.health.get(node.id) || null,
+      memory_pressure: hostMemoryPressureOf(node.id),
       bridge: this.bridges.get(node.id)?.snapshot() || null,
       install: this.installs.get(node.id) || null,
       direct_link: this._directView(node.id, directLinks.get(node.id)),
