@@ -6,6 +6,7 @@ import path from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 import { authorizePanelRoute } from '../../src/lib/admin/panel-acl.mjs'
+import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 import {
   buyerOwner,
   createCragShopHandler,
@@ -469,6 +470,125 @@ test('SQLite reservation survives restart; owners isolate retries, list, status 
   fs.writeFileSync(keyPath, key, { mode: 0o600 })
   fs.chmodSync(keyPath, 0o644)
   assert.equal((await call(PERSON, 'GET', `/orders/${id}`)).error.code, 'shop_private_storage_unavailable')
+})
+
+test('device checkout skips panel login, scopes orders to browser and host, and applies without exposing the code', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'crag-device-shop-'))
+  const db = createDatabase({ dbPath: path.join(root, 'kin.db') })
+  t.after(() => {
+    db.close()
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  const deviceId = 'a'.repeat(64)
+  let host = deviceId
+  let created = 0
+  let applied = 0
+  let status = 'pending'
+  const handler = createPanelHandler({
+    cfg: { base_url: PANEL },
+    requireAuth() {
+      assert.fail('device checkout must not invoke panel auth')
+    },
+    handleCragShop: createCragShopHandler({
+      getDb: () => db,
+      dataDir: root,
+      publicBaseUrl: PANEL,
+      json: (_, http, body) => ({ http, ...body }),
+      readRawBody: (req) => req.raw,
+      subscription: {
+        purchaseDeviceId: () => host,
+        async redeemDeviceOrder(expectedHost, code) {
+          assert.equal(expectedHost, deviceId)
+          assert.equal(code, CODE)
+          applied++
+        },
+      },
+      supplier: {
+        async plans(options) {
+          assert.equal(options.allowPilot, false)
+          return { plans: [PLAN], payment_methods: ['alipay'] }
+        },
+        async quote(_input, proof, options) {
+          assert.equal(proof, undefined)
+          assert.equal(options.allowPilot, false)
+          return PLAN
+        },
+        async create(row, _receipt, _proof, _purchase, options) {
+          assert.equal(options.allowPilot, false)
+          created++
+          return { order: order(row.order_id) }
+        },
+        async resume(row, _receipt, options) {
+          assert.equal(options.allowPilot, false)
+          return { order: order(row.order_id) }
+        },
+        async status(row) {
+          return order(row.order_id, status)
+        },
+        async claim(row) {
+          return { order_id: row.order_id, redemption_code: CODE }
+        },
+      },
+    }),
+  })
+  let cookie
+  async function call(method, endpoint, body, headers = {}, sendCookie = true) {
+    const url = new URL(`${PANEL}${BASE}/device${endpoint}`)
+    const req = {
+      method,
+      raw: Buffer.from(body === undefined ? '' : JSON.stringify(body)),
+      headers: {
+        host: 'panel.example.test',
+        origin: PANEL,
+        'sec-fetch-site': 'same-origin',
+        'content-type': 'application/json',
+        ...(sendCookie && cookie ? { cookie } : {}),
+        ...headers,
+      },
+    }
+    return handler(
+      req,
+      {
+        setHeader(name, value) {
+          if (name !== 'Set-Cookie') return
+          assert.match(value, /; HttpOnly; SameSite=Strict/)
+          cookie = value.split(';')[0]
+        },
+      },
+      url,
+    )
+  }
+  const input = { ...INPUT, expected_amount_minor: PLAN.amount_minor }
+  assert.equal((await call('GET', '/plans')).http, 200)
+  assert.equal((await call('POST', '/orders', { ...input, host_id: deviceId })).http, 400)
+  assert.equal((await call('POST', '/orders', { ...input, sku: 'renewal' })).http, 403)
+  assert.equal((await call('POST', '/orders', { ...input, activation_target: { vm_id: 'vm-ready' } })).http, 403)
+  assert.equal((await call('POST', '/orders', input, { origin: 'https://elsewhere.example.test' })).http, 403)
+  assert.equal((await call('POST', '/orders', input, {}, false)).http, 409)
+  assert.equal((await call('POST', '/quote', { sku: PLAN.sku })).http, 200)
+  host = undefined
+  assert.equal((await call('POST', '/orders', input)).error.code, 'shop_device_unavailable')
+  host = deviceId
+  const first = await call('POST', '/orders', input)
+  assert.equal(first.http, 200)
+  const id = first.data.order_id
+  assert.equal((await call('POST', '/orders', input)).data.order_id, id)
+  assert.equal(created, 1)
+  assert.equal((await call('GET', '/orders')).data.orders.length, 1)
+  assert.equal((await call('GET', '/orders', undefined, {}, false)).data.orders.length, 0)
+  host = 'b'.repeat(64)
+  assert.equal((await call('GET', `/orders/${id}`)).http, 404)
+  assert.equal((await call('POST', `/orders/${id}/apply`, {})).http, 404)
+  host = deviceId
+  assert.equal((await call('POST', `/orders/${id}/apply`, {})).http, 409)
+  status = 'fulfilled'
+  assert.equal((await call('GET', `/orders/${id}`)).data.activation.state, 'ready_to_apply')
+  assert.equal((await call('POST', `/orders/${id}/claim`, {})).http, 404)
+  const activation = await call('POST', `/orders/${id}/apply`, {})
+  assert.equal(activation.data.activation.state, 'active')
+  assert.equal(JSON.stringify(activation).includes(CODE), false)
+  assert.equal((await call('POST', `/orders/${id}/apply`, {})).data.activation.state, 'active')
+  assert.equal(applied, 1)
 })
 
 test('pinned fulfillment survives lost redeem and H2 bind replies without reapplying or rebinding another slot', {

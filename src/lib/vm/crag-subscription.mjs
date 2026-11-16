@@ -748,20 +748,36 @@ export function createCragSubscription({
     return confirmed
   }
 
-  function redeem(value, renewal) {
+  function redeem(value, renewal, expectedHost) {
     return exclusive(async () => {
       const redemption_code = typeof value === 'string' && value.trim()
       if (!validVoucher(redemption_code)) throw fail('crag_subscription_invalid_request', 400)
       const hostId = identity()
+      if (expectedHost && hostId !== expectedHost) throw fail()
       const packageDigest = renewal ? undefined : hostPackageDigest(projectRoot)
       storage(!renewal)
       const previous = current(hostId)
       if (renewal && !previous) throw fail('host_subscription_inactive', 409)
+      const pending = expectedHost && load(intentFile, 0o600, 512)
+      if (pending) {
+        const intent = JSON.parse(pending)
+        if (
+          intent.host_id !== hostId ||
+          intent.redemption_code !== redemption_code ||
+          intent.host_package_sha256 !== packageDigest ||
+          Object.keys(intent).length !== 3 ||
+          readRosterIntent()
+        )
+          throw fail('crag_subscription_sync_pending', 409)
+        await finish(hostId, intent, previous)
+        return
+      }
       checkNoIntent()
       credential(hostId, !renewal)
       const intent = { host_id: hostId, redemption_code, ...(packageDigest && { host_package_sha256: packageDigest }) }
       publish(intentFile, JSON.stringify(intent), 0o600, true)
-      return status(await finish(hostId, intent, previous))
+      const confirmed = await finish(hostId, intent, previous)
+      if (!expectedHost) return status(confirmed)
     })
   }
 
@@ -916,6 +932,17 @@ export function createCragSubscription({
   return {
     status: () => status(),
     admitInference,
+    purchaseDeviceId() {
+      const hostId = identity()
+      storage()
+      const saved = load(hostFile, 0o644, 64)
+      if (saved != null && saved !== hostId) throw fail()
+      return hostId
+    },
+    redeemDeviceOrder(hostId, voucher) {
+      if (!isDigest(hostId)) throw fail()
+      return redeem(voucher, false, hostId)
+    },
     async listOrderTargets() {
       try {
         const hostId = identity()

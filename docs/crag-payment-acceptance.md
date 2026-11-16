@@ -15,7 +15,7 @@ vm2api 内置的是**商城代理和授权消费端**，不是收款服务。面
 
 ## 调用顺序
 
-下面路径都在 `/api/panel` 下。除公开套餐外，商城接口必须用真实面板买家会话；写操作同源，以 `Content-Type: application/json` 提交 JSON。以 [面板 API](PANEL_API.md#crag-订阅订单) 为完整字段参考。
+下面路径都在 `/api/panel` 下。这里复跑的是登录后手动领码的购买流程，除公开套餐外，须用真实面板买家会话。当前的免登录设备购买另走 `/crag-shop/device`，只应用已交付订单到本机，不返回兑换码。写操作同源，以 `Content-Type: application/json` 提交 JSON。以 [面板 API](PANEL_API.md#crag-订阅订单) 为完整字段参考。
 
 | 顺序 | 请求 | 预期 |
 | --- | --- | --- |

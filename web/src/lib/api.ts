@@ -145,6 +145,19 @@ export async function api<T = unknown>(
   return unwrapEnvelope(json, res.status) as T
 }
 
+export async function cragDeviceApi<T>(path: string, opts: RequestInit = {}) {
+  const res = await fetch(`/api/panel/crag-shop/device${path}`, {
+    ...opts,
+    credentials: 'same-origin',
+    cache: 'no-store',
+    headers: { 'Content-Type': 'application/json' },
+  })
+  const json: unknown = await res.json().catch(() => ({}))
+  if (!res.ok)
+    throw apiErrorFrom(json, res.status, res.statusText || '请求失败')
+  return unwrapEnvelope(json, res.status) as T
+}
+
 export type VmPatch = {
   inference_engine?: 'go' | 'rust' | ''
   persona_preset?: string

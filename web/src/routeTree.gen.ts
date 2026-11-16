@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as AuthenticatedRouteRouteImport } from './routes/_authenticated/route'
 import { Route as CragPreviewRouteImport } from './routes/crag-preview'
+import { Route as CragPurchaseRouteImport } from './routes/crag-purchase'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as WelcomeRouteImport } from './routes/welcome'
 import { Route as AuthenticatedIndexRouteImport } from './routes/_authenticated/index'
@@ -44,6 +45,11 @@ const AuthenticatedRouteRoute = AuthenticatedRouteRouteImport.update({
 const CragPreviewRoute = CragPreviewRouteImport.update({
   id: '/crag-preview',
   path: '/crag-preview',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const CragPurchaseRoute = CragPurchaseRouteImport.update({
+  id: '/crag-purchase',
+  path: '/crag-purchase',
   getParentRoute: () => rootRouteImport,
 } as any)
 const LoginRoute = LoginRouteImport.update({
@@ -178,6 +184,7 @@ const AuthenticatedVmIdRoute = AuthenticatedVmIdRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof AuthenticatedIndexRoute
   '/crag-preview': typeof CragPreviewRoute
+  '/crag-purchase': typeof CragPurchaseRoute
   '/login': typeof LoginRoute
   '/welcome': typeof WelcomeRoute
   '/anthropic': typeof AuthenticatedAnthropicRoute
@@ -205,6 +212,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/crag-preview': typeof CragPreviewRoute
+  '/crag-purchase': typeof CragPurchaseRoute
   '/login': typeof LoginRoute
   '/welcome': typeof WelcomeRoute
   '/anthropic': typeof AuthenticatedAnthropicRoute
@@ -235,6 +243,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_authenticated': typeof AuthenticatedRouteRouteWithChildren
   '/crag-preview': typeof CragPreviewRoute
+  '/crag-purchase': typeof CragPurchaseRoute
   '/login': typeof LoginRoute
   '/welcome': typeof WelcomeRoute
   '/_authenticated/anthropic': typeof AuthenticatedAnthropicRoute
@@ -266,6 +275,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/crag-preview'
+    | '/crag-purchase'
     | '/login'
     | '/welcome'
     | '/anthropic'
@@ -293,6 +303,7 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/crag-preview'
+    | '/crag-purchase'
     | '/login'
     | '/welcome'
     | '/anthropic'
@@ -322,6 +333,7 @@ export interface FileRouteTypes {
     | '__root__'
     | '/_authenticated'
     | '/crag-preview'
+    | '/crag-purchase'
     | '/login'
     | '/welcome'
     | '/_authenticated/anthropic'
@@ -352,6 +364,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   AuthenticatedRouteRoute: typeof AuthenticatedRouteRouteWithChildren
   CragPreviewRoute: typeof CragPreviewRoute
+  CragPurchaseRoute: typeof CragPurchaseRoute
   LoginRoute: typeof LoginRoute
   WelcomeRoute: typeof WelcomeRoute
 }
@@ -370,6 +383,13 @@ declare module '@tanstack/react-router' {
       path: '/crag-preview'
       fullPath: '/crag-preview'
       preLoaderRoute: typeof CragPreviewRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/crag-purchase': {
+      id: '/crag-purchase'
+      path: '/crag-purchase'
+      fullPath: '/crag-purchase'
+      preLoaderRoute: typeof CragPurchaseRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/login': {
@@ -608,6 +628,7 @@ const AuthenticatedRouteRouteWithChildren =
 const rootRouteChildren: RootRouteChildren = {
   AuthenticatedRouteRoute: AuthenticatedRouteRouteWithChildren,
   CragPreviewRoute: CragPreviewRoute,
+  CragPurchaseRoute: CragPurchaseRoute,
   LoginRoute: LoginRoute,
   WelcomeRoute: WelcomeRoute,
 }
