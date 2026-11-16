@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 1.4.123 — 2026-11-17 · ARM64 部署修复
+
+- ARM64 安装前检查 4K 页、宿主环境、binfmt_misc 与 init 系统；支持 OpenRC 持久恢复 x86 handler。控制面在宿主模拟失效时提示修复，不阻止面板启动。
+- ARM64 镜像只保留运行 x86 载荷所需的库，构建时校验依赖。沿用 CRAG 3.1.3 Compact 修复版和旧授权下载选项。
+
 ## 1.4.122 — 2026-11-17 · CRAG 自动压缩修复
 
 - 出厂包与默认下载使用 [CRAG 3.1.3 Compact 修复版](https://github.com/dofastted/vm2api/releases/tag/payload-2026.11.17-crag-3.1.3)，修复 `/compact` 的上下文传输。保留 3.1.3 原标准版与 3.1.2 旧授权兼容版，不自动重装已安装内核。
