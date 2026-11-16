@@ -239,7 +239,6 @@ test('the shared activation field redeems a purchase and binds the selected slot
   const registration_code = `CRAGR1.${crypto.randomBytes(32).toString('base64url')}`
   const calls = []
   let accepted
-  let issuer
   let reissueKey
   let machineCode
   let reissueError = true
@@ -255,16 +254,16 @@ test('the shared activation field redeems a purchase and binds the selected slot
       calls.push(action)
       const body = JSON.parse(init.body)
       assert.match(init.headers.authorization, /^Bearer /)
-      assert.equal(body.payload_key_id, body.reissue ? reissueKey : installed.payload.key_id)
       if (action === 'redeem') {
         assert.equal(body.redemption_code, registration_code)
-        assert.equal(body.issuer_public_key_id, issuer)
-        if (rejectPayload) return Response.json({ ok: false, error: { code: 'payload_key_unknown' } }, { status: 400 })
+        assert.deepEqual(Object.keys(body).sort(), ['host_id', 'redemption_code'])
         accepted ??= issueHostEntitlement(root, body.host_id, { slot_limit: 1 })
       }
       const { code, claims } = accepted
       const data = { entitlement: code, revision: claims.revision, expires_at: claims.expires_at, slot_limit: 1 }
       if (action === 'bind') {
+        assert.equal(body.payload_key_id, body.reissue ? reissueKey : installed.payload.key_id)
+        if (rejectPayload) return Response.json({ ok: false, error: { code: 'payload_key_unknown' } }, { status: 400 })
         if (!reissueKey) assert.equal(Object.hasOwn(body, 'reissue'), false)
         if (reissueKey && (!body.reissue || reissueError)) {
           return Response.json({ ok: false, error: { code: 'payload_key_conflict' } }, { status: 409 })
@@ -288,7 +287,7 @@ test('the shared activation field redeems a purchase and binds the selected slot
     calls.push('resolve')
     const body = JSON.parse(init.body)
     assert.equal(body.redemption_code, registration_code)
-    issuer = body.issuer_public_key_id
+    assert.equal(body.issuer_public_key_id, installed.authorization.public_key_id)
     return Response.json({ ok: true, data: { kind: 'host' } })
   }
   const submit = () =>
@@ -299,6 +298,10 @@ test('the shared activation field redeems a purchase and binds the selected slot
     })
   const rejected = await submit()
   assert.equal(rejected.body.error.code, 'payload_key_unknown')
+  assert.equal(
+    fs.readFileSync(path.join(cragSubscriptionPublicDirectory(root), 'entitlement.code'), 'utf8'),
+    accepted.code,
+  )
   assert.equal(fs.existsSync(path.join(cragSubscriptionPublicDirectory(root), 'sync-pending')), false)
   rejectPayload = false
   const activated = await submit()
@@ -306,7 +309,7 @@ test('the shared activation field redeems a purchase and binds the selected slot
   assert.equal(activated.body.data.license.valid, true)
   assert.equal(activated.body.data.license.scope, 'host')
   assert.equal(getCragLicense(root, vm).license.valid, true)
-  assert.deepEqual(calls, ['resolve', 'redeem', 'resolve', 'redeem', 'bind'])
+  assert.deepEqual(calls, ['resolve', 'redeem', 'bind', 'resolve', 'redeem', 'bind'])
   assert.doesNotMatch(JSON.stringify(activated.body), /CRAGR1|CRAGS1|CRAGH1|wrapped_key/)
   const replacementPackage = seedEncryptedPackage(root, { payloadKey: replacement })
   reissueKey = verifyCragV2Tree(replacementPackage).manifest.payload.key_id
@@ -314,7 +317,7 @@ test('the shared activation field redeems a purchase and binds the selected slot
   assert.equal(snapshot.body.data.licenses[vm.id].scope, 'host', JSON.stringify(snapshot.body.data.licenses[vm.id]))
   assert.equal(snapshot.body.data.licenses[vm.id].valid, true)
   assert.equal(snapshot.body.data.install_licenses[vm.id].code, 'license_payload_key_mismatch')
-  assert.deepEqual(calls, ['resolve', 'redeem', 'resolve', 'redeem', 'bind'])
+  assert.deepEqual(calls, ['resolve', 'redeem', 'bind', 'resolve', 'redeem', 'bind'])
 
   await assert.rejects(cragSubscription.bind(vm), { code: 'payload_key_conflict' })
   const payload_tag = 'payload-2026.11.16-crag-3.0.8'

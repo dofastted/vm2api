@@ -55,6 +55,7 @@ import { slotExecArgv } from './slot-exec.mjs'
 import { isDockerInspectNotFound } from './docker-container.mjs'
 import { kernelCpuCommand, usesKernelCpuLimit } from './kernel-cpu.mjs'
 import { kvmCragAppArmorCommand } from './kvm-crag-apparmor.mjs'
+import { publishKvmCragLicense } from './kvm-crag-license.mjs'
 
 export const RUNTIME = 'docker'
 const WORKER_BIN = process.env.KIN_WORKER_BIN || '/opt/kin-gateway/bin/kin-worker'
@@ -311,7 +312,7 @@ export function assertCragSubscriptionTarget(
   { reclaim = false, allowPrepared = false } = {},
 ) {
   const unsupported = () =>
-    Object.assign(new Error('A compatible Linux Docker CRAG v2 slot is required.'), {
+    Object.assign(new Error('A compatible Linux CRAG slot is required.'), {
       status: 409,
       code: 'crag_subscription_target_unready',
     })
@@ -321,11 +322,11 @@ export function assertCragSubscriptionTarget(
     !isValidVmId(vm.id) ||
     isNativeNodeVm(vm) ||
     ['darwin', 'macos'].includes(vm.node_platform) ||
-    isKvmRuntime(vm) ||
     isCodexVm(vm) ||
-    String(vm.runtime?.type || vm.runtime_type || 'docker')
-      .trim()
-      .toLowerCase() !== 'docker'
+    (!isKvmRuntime(vm) &&
+      String(vm.runtime?.type || vm.runtime_type || 'docker')
+        .trim()
+        .toLowerCase() !== 'docker')
   )
     throw unsupported()
 
@@ -343,6 +344,16 @@ export function assertCragSubscriptionTarget(
   const slot = containerName(vm.id)
   const outcome = inspectContainerOutcome(slot, { run: (args) => sh(args, { timeout: 3000 }) })
   if (outcome.status !== 'found' || !outcome.container?.running) throw unsupported()
+  if (isKvmRuntime(vm)) {
+    const result = sh(['docker', ...slotExecArgv(vm, ['/home/kincli/.kin/kin-kernel', '--license-capabilities'])], {
+      timeout: 3000,
+    })
+    try {
+      const flags = result.ok && JSON.parse(result.stdout)
+      if (flags.host_subscription === 1 && (!reclaim || flags.host_subscription_reclaim === 1)) return true
+    } catch {}
+    throw unsupported()
+  }
   const result = sh(['docker', 'inspect', '--format', '{{json .Mounts}}', slot], { timeout: 3000 })
   try {
     if (!result.ok) throw unsupported()
@@ -374,7 +385,7 @@ export function assertCragSubscriptionTarget(
 
 /** An enabled slot has both current host authorization and a ready local runtime. */
 export function isCragSubscriptionSlotEnabled(projectRoot, vm, routing, opts) {
-  if (vm.status !== 'running' || vm.node_id || isCodexVm(vm) || isKvmRuntime(vm)) return false
+  if (vm.status !== 'running' || vm.node_id || isCodexVm(vm)) return false
   const { ok, license } = checkCragLicense(projectRoot, vm, routing)
   if (!ok || license?.scope !== 'host') return false
   try {
@@ -697,6 +708,13 @@ export async function reloadSlotWorker(vm, projectRoot, { routing } = {}) {
     }
     const chownErr = applyKvmBindChown(name, vm)
     if (chownErr) return chownErr
+    if (resolveKernelDataplane(vm, routing) === 'crag') {
+      try {
+        await publishKvmCragLicense(projectRoot, vm, { force: true })
+      } catch {
+        return { ok: false, code: 'crag_guest_license_sync_failed', error: 'CRAG guest license projection failed' }
+      }
+    }
     const r = sh(
       [
         'docker',

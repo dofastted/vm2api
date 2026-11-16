@@ -568,7 +568,7 @@ test('pinned fulfillment survives lost redeem and H2 bind replies without reappl
         assert.equal(init.headers.authorization, bearer)
         if (url.endsWith('/redeem')) {
           assert.equal(input.redemption_code, CODE)
-          assert.equal(input.payload_key_id, pinnedPayload)
+          assert.deepEqual(Object.keys(input).sort(), ['host_id', 'redemption_code'])
           if (++redeems === 1) {
             rights = signedRights(input.host_id, 1, [])
             throw new Error('lost redeem reply after authority commit')

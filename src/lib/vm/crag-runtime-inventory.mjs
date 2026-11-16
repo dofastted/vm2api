@@ -34,8 +34,7 @@ const unknown = (state = 'unknown') => ({
   ready_slots: null,
 })
 const cragIdentity = (value) =>
-  value?.runtime_variant === 'crag-v2' ||
-  (value?.runtime_variant == null && value?.dataplane === 'crag' && value?.kernel_version === 'v2')
+  value?.runtime_variant === 'crag-v2' || (value?.runtime_variant == null && value?.dataplane === 'crag')
 const localDocker = (vm) => process.platform === 'linux' && !vmNodeId(vm) && !isKvmRuntime(vm)
 
 function healthObservation(value) {
@@ -176,7 +175,7 @@ function publishedConfig(exec) {
 function subscriptionScope(projectRoot, vm, hostId) {
   let permit = null
   let permitError = false
-  if (!isKvmRuntime(vm) && !isNativeNodeVm(vm)) {
+  if (!isNativeNodeVm(vm)) {
     try {
       permit = readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId)
     } catch {
@@ -325,7 +324,6 @@ export function createCragRuntimeInventory({
       const candidates = []
       const selectedVms = new Map()
       for (const vm of registered.values()) {
-        if (hostOnly && !localDocker(vm)) continue
         const scope = subscriptionScope(projectRoot, vm, hostId)
         if (hostOnly && !scope.permit && !scope.permitError) continue
         const exec = inventoryExec(projectRoot, vm)
@@ -381,17 +379,14 @@ export function createCragRuntimeInventory({
         const candidate = selectedVms.get(vm.id)
         // A permit may have been installed while another slot was probed.
         // Without an observation it belongs in the upper bound, not outside it.
-        if (!candidate && !localDocker(vm)) continue
         const scope = subscriptionScope(projectRoot, vm, hostId)
         if ((hostOnly || !candidate) && !scope.permit && !scope.permitError) continue
         const observed = hasHopEvidence(vm, scope) ? hop : observations.get(vm.id) || unknown()
         if (observed.state !== 'unknown') anyKnown = true
         if (candidate?.watchOnly && !scope.permit && !scope.permitError && observed.state !== 'running') continue
-        if (localDocker(vm)) {
-          if (scope.permit && observed.state === 'running') hostRunning++
-          if ((scope.permit && observed.state === 'unknown') || (scope.permitError && observed.state !== 'not_running'))
-            hostUnknown++
-        }
+        if (scope.permit && observed.state === 'running') hostRunning++
+        if ((scope.permit && observed.state === 'unknown') || (scope.permitError && observed.state !== 'not_running'))
+          hostUnknown++
         const license =
           observed.state === 'running'
             ? checkCragLicense(projectRoot, { ...vm, dataplane: 'crag', crag_kernel_version: 'v2' }, routing)

@@ -15,6 +15,8 @@ import { cragSubscriptionPublicDirectory } from './crag-subscription-paths.mjs'
 import { isValidVmId } from './vm-file.mjs'
 import { cragV2PackageRoot } from './wrap-cli-runtime.mjs'
 import { resolveKernelDataplane } from './slot-engine.mjs'
+import { isKvmRuntime } from './runtime-kind.mjs'
+import { publishKvmCragLicense } from './kvm-crag-license.mjs'
 import { publishClusterSubscription } from '../cluster/crag-subscription-files.mjs'
 
 const AUTHORITY = 'https://crag.fkcodex.com'
@@ -100,6 +102,16 @@ function projection(data, claims) {
   }
   if (Object.hasOwn(data, 'reclaim_supported') && data.reclaim_supported !== reclaim) throw invalidRights()
   return result
+}
+
+function availableSeats(claims, rights, active) {
+  if (!active) return 0
+  if (Object.hasOwn(rights, 'available_slots')) return rights.available_slots ?? 'unlimited'
+  if (claims.version === 2) {
+    return Math.min(claims.slot_limit === 'unlimited' ? 10000 : claims.slot_limit, 10000) - claims.roster.length
+  }
+  if (claims.slot_limit === 'unlimited') return 'unlimited'
+  return rights.used_slots === undefined ? null : claims.slot_limit - rights.used_slots
 }
 export const isCragOrderVmId = (id) => typeof id === 'string' && id.length <= 131 && isValidVmId(id)
 
@@ -232,6 +244,7 @@ export function createCragSubscription({
   isSlotEnabled,
   runtimeInventory,
   publishClusterBinding = publishClusterSubscription,
+  publishKvmBinding = publishKvmCragLicense,
   fetchImpl = globalThis.fetch,
   origin = AUTHORITY,
   machineIdFile,
@@ -349,7 +362,7 @@ export function createCragSubscription({
     if ((await assertReady(vm, options)) === false) throw fail('crag_subscription_target_unready', 409)
     preserveOtherLicense(vm)
     const machineCode = prepareCragSubscriptionBinding(projectRoot, vm)
-    const { payloadKeyId, issuerId } = cragTargetIds(projectRoot, vm)
+    const { payloadKeyId } = cragTargetIds(projectRoot, vm)
     // Pin both the actual device key and the persisted VM owner, not Docker's mutable container ID.
     const fingerprint = createHash('sha256')
       .update(
@@ -362,7 +375,7 @@ export function createCragSubscription({
         ]),
       )
       .digest('hex')
-    return { vm, machineCode, payloadKeyId, issuerId, fingerprint }
+    return { vm, machineCode, payloadKeyId, fingerprint }
   }
 
   function readLocalRights() {
@@ -402,9 +415,7 @@ export function createCragSubscription({
 
   async function admitInference({ vm, routing, health } = {}) {
     if (!runtimeInventory || !vm?.id) return null
-    const liveCrag =
-      health?.runtime_variant === 'crag-v2' ||
-      (!health?.runtime_variant && health?.dataplane === 'crag' && health?.kernel_version === 'v2')
+    const liveCrag = health?.runtime_variant === 'crag-v2' || (!health?.runtime_variant && health?.dataplane === 'crag')
     if (!liveCrag && resolveKernelDataplane(vm, routing) !== 'crag') return null
     let hostId
     try {
@@ -413,22 +424,27 @@ export function createCragSubscription({
       // No host identity need be available for an independent grant.
     }
     try {
-      if (!readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId)) return null
+      if (!readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId)) {
+        if (isKvmRuntime(vm) && vm.status === 'running' && getCragLicense(projectRoot, vm).license.valid) {
+          await publishKvmBinding(projectRoot, vm)
+        }
+        return null
+      }
       let rights = readLocalRights()
-      if (vm.node_id) {
+      if (vm.node_id || isKvmRuntime(vm)) {
         if (rights.pending || !rights.claims) return usageUnverified()
         if (vm.status === 'running' && getCragLicense(projectRoot, vm).license.valid) {
           try {
-            await publishClusterBinding(projectRoot, vm)
+            const publishSlot = isKvmRuntime(vm) ? publishKvmBinding : publishClusterBinding
+            if ((await publishSlot(projectRoot, vm)) === false) return usageUnverified()
           } catch {
             return cragLicenseDeniedResult({
-              code: 'license_crag_cluster_sync_failed',
-              error: '集群槽授权未同步，请检查节点连接后重试。',
+              code: 'license_crag_slot_sync_failed',
+              error: '槽位授权未同步，请检查槽位连接后重试。',
             })
           }
           if (!unchangedRights(rights, readLocalRights())) return usageUnverified()
         }
-        return null
       }
       const deadline = performance.now() + 4000
       for (let pass = 0; pass < 2; pass++) {
@@ -521,6 +537,7 @@ export function createCragSubscription({
         state: pending ? 'sync_pending' : claims ? (expired ? 'expired' : 'active') : 'unredeemed',
         ...(claims && { slot_limit: claims.slot_limit, expires_at: claims.expires_at, revision: claims.revision }),
         ...rights,
+        available_seats: pending || runtime === null ? null : availableSeats(claims, rights, claims && !expired),
         ...inventory,
         ...(total_slots !== undefined && { total_slots }),
         ...(enabled_slots !== undefined && { enabled_slots }),
@@ -531,6 +548,7 @@ export function createCragSubscription({
       return {
         ready: false,
         state: 'unavailable',
+        available_seats: null,
         ...(target_probe_failed && { target_probe_failed }),
         ...inventory,
         ...(await runtimeStatus()),
@@ -575,14 +593,13 @@ export function createCragSubscription({
     return { code: data.entitlement, claims: next, rights: projection(data, next) }
   }
 
-  async function finish(hostId, intent, previous, target) {
+  async function finish(hostId, intent, previous) {
     if (Object.hasOwn(intent, 'host_package_sha256')) assertHostPackage(projectRoot, intent.host_package_sha256)
     publish(marker, 'pending\n', 0o644)
     let data
     try {
       data = await authority('redeem', hostId, credential(hostId), {
         redemption_code: intent.redemption_code,
-        ...(target && { payload_key_id: target.payloadKeyId, issuer_public_key_id: target.issuerId }),
       })
     } catch (error) {
       if (terminalRedeem.has(error.code)) {
@@ -592,7 +609,7 @@ export function createCragSubscription({
       throw error
     }
     if (Object.hasOwn(intent, 'host_package_sha256')) assertHostPackage(projectRoot, intent.host_package_sha256)
-    const confirmed = verifyRights(hostId, data, previous, target?.vm)
+    const confirmed = verifyRights(hostId, data, previous)
     publish(entitlementFile, confirmed.code, 0o644)
     remove(marker)
     remove(intentFile)
@@ -671,7 +688,11 @@ export function createCragSubscription({
       if (entry && entry.permit_sha256 !== permit_sha256) {
         const target = getTarget ? await getTarget(vm_id) : (await listTargets()).find(({ id }) => id === vm_id)
         const changed = () => fail('crag_subscription_target_changed', 409)
-        if (target?.id !== vm_id || cragTargetIds(projectRoot).payloadKeyId !== payload_key_id) throw changed()
+        if (
+          target?.id !== vm_id ||
+          cragTargetIds(projectRoot, target, { preferInstalled: false }).payloadKeyId !== payload_key_id
+        )
+          throw changed()
         const machine_code = prepareCragSubscriptionBinding(projectRoot, target)
         if (createHash('sha256').update(machine_code).digest('hex') !== machine_sha256) throw changed()
         const binding = await authority('bind', hostId, credential(hostId), { machine_code, payload_key_id })
@@ -718,7 +739,8 @@ export function createCragSubscription({
   ) {
     assertActive(previous)
     const reissue = reissueSeat !== undefined
-    const { issuerId } = cragTargetIds(projectRoot, install ? undefined : vm)
+    const targetOptions = { preferInstalled: !install }
+    const { issuerId } = cragTargetIds(projectRoot, vm, targetOptions)
     const roster = previous.claims.version === 2
     if (roster) {
       const intent = { host_id: hostId, action: 'bind' }
@@ -771,7 +793,7 @@ export function createCragSubscription({
     }
     if (!Number.isInteger(data.seat) || data.seat <= 0 || (reissue && data.seat !== reissueSeat)) throw invalidRights()
     if (checkTarget) ({ vm } = await checkTarget())
-    const actual = cragTargetIds(projectRoot, install ? undefined : vm)
+    const actual = cragTargetIds(projectRoot, vm, targetOptions)
     if (actual.payloadKeyId !== payloadKeyId || actual.issuerId !== issuerId)
       throw fail('crag_subscription_target_changed', 409)
     const options = { seat: data.seat, preferInstalled: !install }
@@ -814,14 +836,13 @@ export function createCragSubscription({
         storage(true)
         const redemption_code = await claim()
         if (!validVoucher(redemption_code)) throw invalidRights()
-        const confirmed = await checkTarget()
+        await checkTarget()
         const raw = load(intentFile, 0o600, 512)
         const binding = orderId ? { order_id: orderId } : { target_fingerprint: target.fingerprint }
         const intent = { host_id: hostId, redemption_code, ...binding }
         if (raw == null) {
           const pending = readRosterIntent()
-          if (!orderId && pending?.action === 'bind')
-            await syncRoster(hostId, pending, current(hostId, confirmed.vm), confirmed.vm)
+          if (!orderId && pending?.action === 'bind') await syncRoster(hostId, pending, current(hostId))
           checkNoIntent()
           credential(hostId, true)
           publish(intentFile, JSON.stringify(intent), 0o600, true)
@@ -835,7 +856,7 @@ export function createCragSubscription({
           )
             throw fail('crag_subscription_sync_pending', 409)
         }
-        await finish(hostId, intent, current(hostId, confirmed.vm), confirmed)
+        await finish(hostId, intent, current(hostId))
         onRedeemed?.()
       }
 
@@ -1017,8 +1038,11 @@ export function createCragSubscription({
         if (!['license_required', 'license_payload_key_mismatch'].includes(candidate.code)) {
           throw fail('crag_subscription_target_unready', 409)
         }
-        const reissueSeat = license.valid && license.scope === 'host' ? license.seat : undefined
-        const { payloadKeyId } = cragTargetIds(projectRoot)
+        const permitDigest = readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId)
+        const reissueSeat =
+          previous.claims.roster?.find((entry) => entry.permit_sha256 === permitDigest)?.seat ??
+          (license.valid && license.scope === 'host' ? license.seat : undefined)
+        const { payloadKeyId } = cragTargetIds(projectRoot, vm, { preferInstalled: false })
         await bindTarget(vm, hostId, previous, prepareCragSubscriptionBinding(projectRoot, vm), payloadKeyId, {
           install: true,
           reissueSeat,
