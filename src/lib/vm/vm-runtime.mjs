@@ -13,6 +13,7 @@ import { slotHost } from './slot-host.mjs'
 import { maxRequestBytes, readRoutingConfigFile, streamIdleTimeoutMs } from '../core/config.mjs'
 import { US_TIMEZONES, validTimezone } from '../core/timezone.mjs'
 import { runtimeKind, isKvmRuntime, RUNTIME_KVM } from './runtime-kind.mjs'
+import { isValidVmId } from './vm-file.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { kernelBinPath, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
@@ -316,7 +317,8 @@ export function assertCragSubscriptionTarget(
     })
   if (
     process.platform !== 'linux' ||
-    !/^vm-[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(vm?.id || '') ||
+    typeof vm?.id !== 'string' ||
+    !isValidVmId(vm.id) ||
     isNativeNodeVm(vm) ||
     ['darwin', 'macos'].includes(vm.node_platform) ||
     isKvmRuntime(vm) ||

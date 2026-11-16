@@ -101,7 +101,7 @@ function projection(data, claims) {
   if (Object.hasOwn(data, 'reclaim_supported') && data.reclaim_supported !== reclaim) throw invalidRights()
   return result
 }
-const isOrderVmId = (id) => typeof id === 'string' && /^vm-[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(id)
+export const isCragOrderVmId = (id) => typeof id === 'string' && id.length <= 131 && isValidVmId(id)
 
 function checkParents(directory) {
   for (let current = directory; ; current = path.dirname(current)) {
@@ -342,7 +342,7 @@ export function createCragSubscription({
   }
 
   async function orderTarget(hostId, vmId) {
-    if (!isOrderVmId(vmId)) throw fail('crag_subscription_target_unready', 409)
+    if (!isCragOrderVmId(vmId)) throw fail('crag_subscription_target_unready', 409)
     const vm = getTarget ? await getTarget(vmId) : (await listTargets()).find(({ id }) => id === vmId)
     if (vm?.id !== vmId) throw fail('crag_subscription_target_unready', 409)
     const options = { allowPrepared: true }
@@ -863,7 +863,7 @@ export function createCragSubscription({
       }
       const targets = []
       for (const vm of await listTargets()) {
-        if (!isOrderVmId(vm.id)) continue
+        if (!isCragOrderVmId(vm.id)) continue
         try {
           if ((await assertReady(vm, { allowPrepared: true })) === false) continue
           preserveOtherLicense(vm)

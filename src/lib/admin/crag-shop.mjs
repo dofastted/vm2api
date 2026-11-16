@@ -1,4 +1,5 @@
 import { createHmac, randomUUID } from 'node:crypto'
+import { isCragOrderVmId } from '../vm/crag-subscription.mjs'
 import { loadOrderReceiptKey, deriveOrderReceipt } from './crag-shop-receipt.mjs'
 import {
   createShopSupplier,
@@ -19,7 +20,6 @@ const PAGE_SIZE = 100
 const ACTIVATION_WINDOW = 24 * 60 * 60
 const ACTIVATION_LEASE = 120
 const nowSeconds = () => Math.floor(Date.now() / 1000)
-const validVmId = (id) => typeof id === 'string' && /^vm-[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(id)
 
 export const isCragShopPath = (pathname) => pathname === ROOT || pathname.startsWith(`${ROOT}/`)
 
@@ -144,7 +144,7 @@ function createInput(body) {
   const target = body.activation_target
   if (
     Object.hasOwn(body, 'activation_target') &&
-    (!object(target) || Object.keys(target).length !== 1 || !validVmId(target.vm_id) || sku === 'renewal')
+    (!object(target) || Object.keys(target).length !== 1 || !isCragOrderVmId(target.vm_id) || sku === 'renewal')
   )
     throw badBody()
   return {
@@ -489,7 +489,9 @@ export function createCragShopHandler({
           activationEnabled && isActivationAdmin(owner) && subscription?.listOrderTargets
             ? await subscription.listOrderTargets()
             : []
-        return ok({ targets: (isActivationAdmin(owner) ? targets : []).filter(validVmId).map((vm_id) => ({ vm_id })) })
+        return ok({
+          targets: (isActivationAdmin(owner) ? targets : []).filter(isCragOrderVmId).map((vm_id) => ({ vm_id })),
+        })
       }
       if (route === 'quote') {
         const input = purchaseInput(await readInput(req, readRawBody, false))
