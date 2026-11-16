@@ -501,8 +501,19 @@ export function egressContainerName(proxyId) {
  * container: config body, mounts and the binary on disk (an upgrade swaps it).
  * The image only supplies a root filesystem for the static binary, so it stays
  * out of the digest: a control-plane image bump must not cut every slot's exit.
+ * `platform` pins the native image: the ARM64 control plane exports
+ * DOCKER_DEFAULT_PLATFORM=linux/amd64 for slots, which `docker run` would inherit.
  */
-export function egressContainerSpec({ proxyId, body, hostDir, hostBinDir, binName, image, binFingerprint = '' }) {
+export function egressContainerSpec({
+  proxyId,
+  body,
+  hostDir,
+  hostBinDir,
+  binName,
+  image,
+  binFingerprint = '',
+  platform = nativeDockerPlatform(),
+}) {
   const name = egressContainerName(proxyId)
   const digest = crypto
     .createHash('sha256')
@@ -538,6 +549,9 @@ export function egressContainerSpec({ proxyId, body, hostDir, hostBinDir, binNam
     `kin.egress.proxy=${proxyId}`,
     '--label',
     `kin.egress.cfg=${digest}`,
+    '--label',
+    `kin.egress.bin=${binFingerprint}`,
+    ...(platform ? ['--platform', platform] : []),
     '-v',
     `${hostDir}:${EGRESS_CONTAINER_CFG_DIR}:ro`,
     '-v',
@@ -551,12 +565,46 @@ export function egressContainerSpec({ proxyId, body, hostDir, hostBinDir, binNam
   return { name, digest, args }
 }
 
+/** Docker platform of this control plane; the helper image and binary are native to it. */
+export function nativeDockerPlatform(arch = process.arch) {
+  const name = { x64: 'amd64', arm64: 'arm64' }[arch]
+  return name ? `linux/${name}` : ''
+}
+
+const binFingerprintCache = new Map()
+
+/**
+ * Content hash of the helper binary. The entrypoint re-copies bin/ on every start,
+ * so size and mtime change on a plain restart; only the bytes mean an upgrade.
+ * Cached per stat so the per-probe inspect path hashes once per binary swap.
+ */
+export function egressBinFingerprint(bin) {
+  let st
+  try {
+    st = fs.statSync(bin)
+  } catch {
+    return ''
+  }
+  const key = `${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}`
+  const cached = binFingerprintCache.get(bin)
+  if (cached?.key === key) return cached.value
+  let value
+  try {
+    value = crypto.createHash('sha256').update(fs.readFileSync(bin)).digest('hex').slice(0, 16)
+  } catch {
+    return ''
+  }
+  binFingerprintCache.set(bin, { key, value })
+  return value
+}
+
 /** null when the container does not exist. */
 export function inspectEgressContainer(name, runDocker = docker) {
-  const format = '{{.State.Running}}|{{.State.Restarting}}|{{.State.Pid}}|{{index .Config.Labels "kin.egress.cfg"}}'
+  const format =
+    '{{.State.Running}}|{{.State.Restarting}}|{{.State.Pid}}|{{index .Config.Labels "kin.egress.cfg"}}|{{index .Config.Labels "kin.egress.bin"}}'
   const r = runDocker(['inspect', '-f', format, name])
   if (!r.ok) return null
-  const [running, restarting, pid, digest] = String(r.stdout || '')
+  const [running, restarting, pid, digest, bin] = String(r.stdout || '')
     .trim()
     .split('|')
   return {
@@ -565,6 +613,7 @@ export function inspectEgressContainer(name, runDocker = docker) {
     restarting: restarting === 'true',
     pid: Number(pid) || 0,
     digest: String(digest || '').trim(),
+    bin: String(bin || '').trim(),
   }
 }
 
@@ -597,12 +646,8 @@ async function startEgressContainer({
 }) {
   const dir = egressRunDir(projectRoot, proxyId)
   const cfgPath = path.join(dir, 'egress.json')
-  let binStat
-  try {
-    binStat = fs.statSync(bin)
-  } catch {
-    return { ok: false, error: `kin-egress binary not found: ${bin}` }
-  }
+  const binFingerprint = egressBinFingerprint(bin)
+  if (!binFingerprint) return { ok: false, error: `kin-egress binary not found: ${bin}` }
   const imageRef = image || selfImage(runDocker)
   if (!imageRef) return { ok: false, error: 'egress_image_unknown' }
   const body = `${JSON.stringify(cfg, null, 2)}\n`
@@ -613,7 +658,7 @@ async function startEgressContainer({
     hostBinDir: hostPath(path.dirname(bin)),
     binName: path.basename(bin),
     image: imageRef,
-    binFingerprint: `${binStat.size}:${Math.floor(binStat.mtimeMs)}`,
+    binFingerprint,
   })
   const done = (reused) => ({
     ok: true,
@@ -783,11 +828,20 @@ async function stopOwnedEgress(pid) {
   return waitEgressExit(pid)
 }
 
-export function inspectEgressProcess(projectRoot, proxyId, { runtime = egressRuntime(), runDocker = docker } = {}) {
+export function inspectEgressProcess(
+  projectRoot,
+  proxyId,
+  { runtime = egressRuntime(), runDocker = docker, bin = EGRESS_BIN } = {},
+) {
   if (runtime === 'container') {
     const container = egressContainerName(proxyId)
     const info = inspectEgressContainer(container, runDocker)
     if (!egressContainerHealthy(info)) return { ok: false, pid: info?.pid || null, reason: 'not_running', container }
+    // A surviving helper keeps executing the replaced inode; report it down so probe and watchdog repair it,
+    // as the process runtime does for a deleted executable.
+    const current = egressBinFingerprint(bin)
+    if (info.bin && current && info.bin !== current)
+      return { ok: false, pid: info.pid, reason: 'stale_binary', container }
     return { ok: true, pid: info.pid, listen_tcp: readEgressListenTcp(projectRoot, proxyId), container }
   }
   const dir = egressRunDir(projectRoot, proxyId)

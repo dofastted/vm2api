@@ -9,6 +9,7 @@ import {
   egressRunDir,
   egressRuntime,
   inspectEgressProcess,
+  nativeDockerPlatform,
   startEgressProcess,
   stopEgressProcess,
 } from '../../src/lib/vm/egress.mjs'
@@ -25,12 +26,19 @@ function fakeDocker() {
       if (args[2] === '{{.Image}}') return { ok: true, stdout: 'sha256:selfimage' }
       const c = containers.get(name)
       if (!c) return { ok: false, stdout: '', stderr: `Error: No such object: ${name}` }
-      return { ok: true, stdout: `${c.running}|${c.restarting}|${c.pid}|${c.digest}` }
+      return { ok: true, stdout: `${c.running}|${c.restarting}|${c.pid}|${c.digest}|${c.bin}` }
     }
     if (cmd === 'run') {
       const name = args[args.indexOf('--name') + 1]
-      const label = args.find((a) => String(a).startsWith('kin.egress.cfg='))
-      containers.set(name, { running: true, restarting: false, pid: 4242, digest: label.split('=')[1], args })
+      const label = (key) => args.find((a) => String(a).startsWith(`${key}=`)).split('=')[1]
+      containers.set(name, {
+        running: true,
+        restarting: false,
+        pid: 4242,
+        digest: label('kin.egress.cfg'),
+        bin: label('kin.egress.bin'),
+        args,
+      })
       return { ok: true, stdout: 'cid' }
     }
     if (cmd === 'rm') {
@@ -198,4 +206,55 @@ test('container runtime refuses to start without the helper binary', async (t) =
   assert.equal(r.ok, false)
   assert.match(r.error, /binary not found/)
   assert.equal(fx.d.containers.size, 0)
+})
+
+test('helper pins the native platform so the ARM64 slot default cannot reach it', async (t) => {
+  assert.equal(nativeDockerPlatform('arm64'), 'linux/arm64')
+  assert.equal(nativeDockerPlatform('x64'), 'linux/amd64')
+  const spec = egressContainerSpec({
+    proxyId: 'px-arm',
+    body: 'b',
+    hostDir: '/d',
+    hostBinDir: '/b',
+    binName: 'kin-egress',
+    image: 'sha256:img',
+    platform: 'linux/arm64',
+  })
+  const a = spec.args
+  assert.equal(a[a.indexOf('--platform') + 1], 'linux/arm64')
+  assert.ok(a.indexOf('--platform') < a.indexOf('sha256:img'))
+  const fx = fixture(t)
+  await fx.start()
+  const args = fx.helper().args
+  assert.equal(args[args.indexOf('--platform') + 1], nativeDockerPlatform())
+})
+
+test('restart re-copy of an unchanged binary keeps the helper', async (t) => {
+  const fx = fixture(t)
+  await fx.start()
+  // docker-entrypoint ensure_bin: cp to .new, then mv over bin/ (new inode, new mtime, same bytes).
+  const tmp = `${fx.bin}.new`
+  fs.writeFileSync(tmp, 'static-binary-v1', { mode: 0o755 })
+  const later = new Date(Date.now() + 60_000)
+  fs.utimesSync(tmp, later, later)
+  fs.renameSync(tmp, fx.bin)
+  const before = fx.d.mutations()
+  const again = await fx.start()
+  assert.equal(again.reused, true)
+  assert.equal(fx.d.mutations(), before)
+})
+
+test('inspect reports a surviving helper on a replaced binary as stale', async (t) => {
+  const fx = fixture(t)
+  const opts = { runtime: 'container', runDocker: fx.d.run, bin: fx.bin }
+  await fx.start()
+  assert.equal(inspectEgressProcess(fx.root, 'px-ctr', opts).ok, true)
+  fs.writeFileSync(fx.bin, 'static-binary-v2')
+  const st = inspectEgressProcess(fx.root, 'px-ctr', opts)
+  assert.equal(st.ok, false)
+  assert.equal(st.reason, 'stale_binary')
+  // The repair path the probe and watchdog take recreates it on the new binary.
+  const repaired = await fx.start()
+  assert.equal(repaired.reused, false)
+  assert.equal(inspectEgressProcess(fx.root, 'px-ctr', opts).ok, true)
 })
