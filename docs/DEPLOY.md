@@ -42,7 +42,7 @@ CRAG V2 的资产、工作区和设备授权目录分别使用 Linux 私有 run 
 
 ### CRAG V2 二进制更新
 
-vm2api 从自己的公开 payload Release 下载 `crag-v2-licensed-amd64.tar.gz` 签名加密包，无需私有供应仓凭据。「内核」页可选 3.1.2、3.1.3 原发行和 Compact 修复版。这些发行使用同一授权身份，已激活的槽不必重新输入许可或增加占位就能升降级。下载只更新共用下载指针，不影响运行中的槽；确认安装后才应用。启用 `CRAGH2` 后不要回滚到 3.1.1 及更早内核。
+vm2api 从自己的公开 payload Release 下载 `crag-v2-licensed-amd64.tar.gz` 签名加密包，无需私有供应仓凭据。「内核」页默认提供 3.1.4 标准版，也可选择 3.1.2、3.1.3 原发行和 Compact 修复版。这些发行使用同一授权身份，已激活的槽不必重新输入许可或增加占位就能升降级。下载只更新共用下载指针，不影响运行中的槽；确认安装后才应用。启用 `CRAGH2` 后不要回滚到 3.1.1 及更早内核。
 
 宿主配额按同时运行和正在启动的订阅槽计算，不按已下载的版本数计算。原槽更新只占一个位置；正式停机后保留原绑定，其他槽需要座席时才回收已确认停止且不在操作中的 `CRAGH2` 座席。机况未知不算已停止；`CRAGH1` 不支持回收。单设备许可不消耗订阅槽。由 vm2api 负责受管 CRAG 的重启，避免 Docker 自行恢复绕过槽位准入。
 
@@ -51,7 +51,7 @@ vm2api 从自己的公开 payload Release 下载 `crag-v2-licensed-amd64.tar.gz`
 amd64 默认一键安装/升级会自动完成出厂包初始化和最新版获取，不需要先在面板手动拉取。也可在服务器独立更新，不升级或重启控制面：
 
 ```bash
-sudo bash /opt/vm2api/deploy/install.sh crag-update --crag-version payload-2026.11.17-crag-3.1.3
+sudo bash /opt/vm2api/deploy/install.sh crag-update --crag-version payload-2026.11.17-crag-3.1.4
 # 仅用于历史授权恢复；正常面板版本列表不提供这个版本
 sudo bash /opt/vm2api/deploy/install.sh crag-update --crag-version payload-2026.11.16-crag-3.1.2-legacy
 # 省略 --crag-version：从 vm2api 公开 payload Release 选最新完整签名包
@@ -621,3 +621,26 @@ curl -sS -X POST http://127.0.0.1:8787/api/panel/wrap-cli/sync \
 ---
 
 交流见仓库 [README](../README.md)。
+
+### Ubuntu AppArmor 与 Docker 原生 Claude
+
+在 `kernel.apparmor_restrict_unprivileged_userns=1` 的宿主上，单独设置
+`apparmor=unconfined` 仍可能使原生 Claude 在创建 user/mount namespace 后进入
+`unprivileged_userns` 限制，导致 bind mount 返回 `Permission denied (os error 13)`。
+
+安装/升级脚本在启动控制面前，加载并持久保存 `vm2api-crag-docker` AppArmor
+profile，显式允许 `userns`。不关闭宿主 sysctl，不授予槽位 privileged 或额外
+capability，现有 seccomp 和 `no-new-privileges` 保持不变。策略检查或加载失败会
+终止安装，并保留错误信息；已有同名非托管策略不会被覆盖。
+
+手动 Compose 部署需先在 **Docker 宿主机** 执行新版本安装脚本中的准备命令：
+
+```bash
+sudo bash deploy/install.sh prepare-native
+```
+
+随后更新控制面，并通过面板重载正在使用的 CRAG v2 槽位。Docker restart 无法
+更改 AppArmor profile；旧 `unconfined` 槽位会在正常重载/启动路径中重建。
+已停用槽位不会由准备命令启动，在下次手动启动时应用新配置。profile 未加载时
+Docker 会明确拒绝创建槽位，不退回 `unconfined`。命令必须在 Docker daemon
+所在宿主执行，不能在控制面容器或远端 Docker 客户端机器上执行。

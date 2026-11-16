@@ -19,11 +19,20 @@ import { slotRuntimeOwner } from '../oauth/oauth-credentials.mjs'
 import { routingConfigFile } from '../core/config.mjs'
 import { normalizeVmConfig, slotMemory } from '../vm/machine-spec.mjs'
 import { runtimeKind } from '../vm/runtime-kind.mjs'
-import { buildImage, dockerInfo, ensureImage, imagePresent, sshDocker } from './docker-remote.mjs'
+import {
+  buildImage,
+  dockerInfo,
+  ensureImage,
+  imagePresent,
+  listImages,
+  removeImageTag,
+  sshDocker,
+} from './docker-remote.mjs'
 import { runRemote, shellQuote } from './remote-fs.mjs'
 import { describeNativePayload } from './native-payload.mjs'
 import { LAUNCHD_GUI_REQUIRED } from './native-slot.mjs'
 import { slotBuildContext, slotImageAction, slotImageSpec } from './slot-image.mjs'
+import { OS_CATALOG } from '../vm/os-catalog.mjs'
 import { ClusterError } from './ssh-link.mjs'
 
 const MIN_DISK_KB = 3 * 1024 * 1024
@@ -238,6 +247,112 @@ export function startSlotImageBuild(nodeId, kernel, { runtime, connect } = {}) {
 }
 
 /**
+ * Preflight verdict for the node's slot image. A missing tag does not block: slot creation
+ * builds it (ensureNodeSlotImage). After a control-plane upgrade every tag changes, and an
+ * error here made auto placement skip every node until images were rebuilt by hand.
+ */
+export function slotImageCheck(ref, present) {
+  return {
+    id: 'image',
+    ok: !!present,
+    level: 'warn',
+    message: present ? `镜像 ${ref} 已就绪` : `镜像 ${ref} 未构建，创建槽位时自动构建（需几分钟）`,
+  }
+}
+
+/**
+ * Untag the node's Docker slot images that are not `current`, limited to the repos of
+ * `current` (vm2api/kin-slot-<kernel>); KVM images and other repos are never touched.
+ * No force: an image a container still uses (even stopped) stays. Returns removed refs.
+ */
+export async function pruneStaleSlotImages(nodeId, current, { connect } = {}) {
+  const keep = new Set(current)
+  const repos = new Set(current.map((ref) => ref.slice(0, ref.lastIndexOf(':'))))
+  const docker = connect || sshDocker(clusterManager().client(nodeId))
+  const removed = []
+  for (const image of (await listImages(docker)) || []) {
+    for (const tag of image.RepoTags || []) {
+      const repo = tag.slice(0, tag.lastIndexOf(':'))
+      if (!repos.has(repo) || keep.has(tag)) continue
+      if (await removeImageTag(docker, tag)) removed.push(tag)
+    }
+  }
+  return removed
+}
+
+const warming = new Map()
+
+/**
+ * Build every catalog kernel's Docker slot image on a Linux node, one kernel at a time,
+ * in the background. Runs when the node's link turns ready: image tags follow the payload
+ * hash, so a control-plane upgrade leaves every node without the current images, and the
+ * first slot placed there would otherwise wait minutes for the build. Images the node
+ * already has cost one inspect each (startSlotImageBuild checks first). One run per node;
+ * a second call while it runs returns the same promise. Off with
+ * `cluster.slot_image_warm: false`.
+ *
+ * When every kernel is current, older tags of those same image repos are removed
+ * (pruneStaleSlotImages): each hash change would otherwise leave ~5 GB behind per node.
+ *
+ * Resolves to [{ kernel, status, ref, built }]; never rejects.
+ */
+export function warmNodeSlotImages(
+  nodeId,
+  {
+    kernels = Object.keys(OS_CATALOG),
+    start = startSlotImageBuild,
+    prune = pruneStaleSlotImages,
+    logger = console,
+  } = {},
+) {
+  const running = warming.get(nodeId)
+  if (running) return running
+  if (!bound || placementRouting()?.cluster?.slot_image_warm === false) return Promise.resolve([])
+  if (nodePlatform(nodeId) !== 'linux') return Promise.resolve([])
+  const health = bound.manager.health?.get?.(nodeId)
+  if (health && health.docker?.ok !== true) return Promise.resolve([])
+  const run = (async () => {
+    const results = []
+    for (const kernel of kernels) {
+      let job
+      try {
+        job = await awaitSlotImageBuild(start(nodeId, kernel))
+      } catch (err) {
+        job = { status: 'failed', ref: null, log: String(err?.message || err) }
+      }
+      const built = job.status === 'done' && !/跳过传输/.test(job.log || '')
+      results.push({ kernel, status: job.status, ref: job.ref || null, built })
+      if (job.status !== 'done') {
+        const last = String(job.log || '')
+          .trim()
+          .split('\n')
+          .pop()
+        logger.warn?.(`[cluster] slot image warm ${nodeId} ${kernel} failed: ${last}`)
+        // Link gone: the remaining kernels would fail the same way; the next ready retries.
+        if (bound?.manager?.linkReady?.(nodeId) === false) break
+      } else if (built) {
+        logger.log?.(JSON.stringify({ event: 'slot-image-warm', node: nodeId, kernel, ref: job.ref }))
+      }
+    }
+    // Old tags only go once every warmed kernel has its current image: never leave a node with none.
+    if (results.length === kernels.length && results.every((r) => r.status === 'done' && r.ref)) {
+      try {
+        const removed = await prune(
+          nodeId,
+          results.map((r) => r.ref),
+        )
+        if (removed.length) logger.log?.(JSON.stringify({ event: 'slot-image-prune', node: nodeId, removed }))
+      } catch (err) {
+        logger.warn?.(`[cluster] slot image prune ${nodeId} failed: ${err?.message || err}`)
+      }
+    }
+    return results
+  })().finally(() => warming.delete(nodeId))
+  warming.set(nodeId, run)
+  return run
+}
+
+/**
  * Can a slot of `kernel` be created on `nodeId` right now? Every check runs
  * against the live node; error-level failures block creation, warn-level ones
  * are shown but do not.
@@ -359,7 +474,8 @@ export async function preflightNode(nodeId, { kernel, runtime } = {}) {
   } else if (info) {
     try {
       image.present = await imagePresent(docker, spec.ref)
-      add('image', image.present, 'error', image.present ? `镜像 ${spec.ref} 已就绪` : `镜像 ${spec.ref} 未构建`)
+      const check = slotImageCheck(spec.ref, image.present)
+      add(check.id, check.ok, check.level, check.message)
     } catch (err) {
       add('image', false, 'error', err.message)
     }

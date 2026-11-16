@@ -650,6 +650,26 @@ export async function imagePresent(connect, ref) {
   return true
 }
 
+/** Every image on the engine (repo tags included); the caller filters. */
+export async function listImages(connect) {
+  return dockerJson(connect, { path: '/images/json', timeoutMs: 30_000 })
+}
+
+/**
+ * Untag one image reference without force. False when the engine refuses (409: a container,
+ * even a stopped one, still uses it) or the tag is already gone.
+ */
+export async function removeImageTag(connect, ref) {
+  const res = await dockerRequest(connect, {
+    method: 'DELETE',
+    path: `/images/${encodeURIComponent(ref)}`,
+    timeoutMs: 60_000,
+  })
+  if (res.status === 200) return true
+  if (res.status === 404 || res.status === 409) return false
+  throw new ClusterError(502, 'docker_api_error', dockerMessage(res))
+}
+
 export async function inspectNetworkOrNull(connect, name) {
   const res = await dockerRequest(connect, { path: `/networks/${encodeURIComponent(name)}`, timeoutMs: 15_000 })
   if (res.status === 404) return null

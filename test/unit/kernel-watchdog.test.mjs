@@ -17,7 +17,10 @@ function staleLockFixture(root, id, lockAgeMs, reason = 'runtime_start_failed') 
   fs.mkdirSync(path.join(root, 'vms', id, 'cli-home'), { recursive: true })
   const at = new Date(Date.now() - lockAgeMs).toISOString()
   const vmFile = path.join(root, 'vms', `${id}.json`)
-  fs.writeFileSync(vmFile, JSON.stringify({ id, status: 'running', schedulable: false, unschedulable: { reason, detail: null, at } }))
+  fs.writeFileSync(
+    vmFile,
+    JSON.stringify({ id, status: 'running', schedulable: false, unschedulable: { reason, detail: null, at } }),
+  )
   return vmFile
 }
 
@@ -28,7 +31,18 @@ test('a healthy kernel lifts a stale runtime_start_failed lock', async (t) => {
   const wd = createKernelWatchdog({
     probeVm: (vm) => ({ vmId: vm.id }),
     health: async () => ({ healthy: true, ok: true, ready_slots: 1, closed_slots: 0 }),
-    listTargets: () => [{ id: 'vm-locked', inference_engine: 'rust', status: 'running', unschedulable: { reason: 'runtime_start_failed', detail: null, at: new Date(Date.now() - 11 * 60_000).toISOString() } }],
+    listTargets: () => [
+      {
+        id: 'vm-locked',
+        inference_engine: 'rust',
+        status: 'running',
+        unschedulable: {
+          reason: 'runtime_start_failed',
+          detail: null,
+          at: new Date(Date.now() - 11 * 60_000).toISOString(),
+        },
+      },
+    ],
     homeDirFor: () => path.join(root, 'vms', 'vm-locked', 'cli-home'),
     config: { restart_backoff_sec: [60], restart_window_sec: 3600 },
   })
@@ -49,7 +63,14 @@ test('a fresh runtime_start_failed lock is left alone (start may still be in fli
   const wd = createKernelWatchdog({
     probeVm: (vm) => ({ vmId: vm.id }),
     health: async () => ({ healthy: true, ok: true, ready_slots: 1, closed_slots: 0 }),
-    listTargets: () => [{ id: 'vm-fresh', inference_engine: 'rust', status: 'running', unschedulable: { reason: 'runtime_start_failed', at: new Date(Date.now() - 2 * 60_000).toISOString() } }],
+    listTargets: () => [
+      {
+        id: 'vm-fresh',
+        inference_engine: 'rust',
+        status: 'running',
+        unschedulable: { reason: 'runtime_start_failed', at: new Date(Date.now() - 2 * 60_000).toISOString() },
+      },
+    ],
     homeDirFor: () => path.join(root, 'vms', 'vm-fresh', 'cli-home'),
     config: { restart_backoff_sec: [60], restart_window_sec: 3600 },
   })
@@ -68,7 +89,14 @@ test('a healthy kernel never lifts locks it does not own (no_credential)', async
   const wd = createKernelWatchdog({
     probeVm: (vm) => ({ vmId: vm.id }),
     health: async () => ({ healthy: true, ok: true, ready_slots: 1, closed_slots: 0 }),
-    listTargets: () => [{ id: 'vm-ticket', inference_engine: 'rust', status: 'running', unschedulable: { reason: 'no_credential', at: new Date(Date.now() - 11 * 60_000).toISOString() } }],
+    listTargets: () => [
+      {
+        id: 'vm-ticket',
+        inference_engine: 'rust',
+        status: 'running',
+        unschedulable: { reason: 'no_credential', at: new Date(Date.now() - 11 * 60_000).toISOString() },
+      },
+    ],
     homeDirFor: () => path.join(root, 'vms', 'vm-ticket', 'cli-home'),
     config: { restart_backoff_sec: [60], restart_window_sec: 3600 },
   })

@@ -3,7 +3,6 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import type {
   RefusalDeviceBlock,
   RefusalGuardConfig,
-  RiskAuditPolicy,
 } from '@/types/panel-routing'
 import type {
   UsageLogRow,
@@ -13,13 +12,11 @@ import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { fmtExpiresAt } from '@/lib/format'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
-import { Textarea } from '@/components/ui/textarea'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { Group, ToggleItem, ToggleList } from './blocks'
 import { refusalGuardsQueryOptions } from './queries'
+import { RiskPolicyForm } from './risk-policy-form'
 
 const SIMILARITY_CHOICES = [80, 85, 90, 95] as const
 
@@ -29,11 +26,12 @@ function shortFp(fp: string) {
   return `${s.slice(0, 10)}…${s.slice(-6)}`
 }
 
-/** Changes here save immediately: each switch and list action is one PUT/DELETE. */
 export function RefusalSettings({
   onOpen,
+  onDirtyChange,
 }: {
   onOpen: (row: UsageLogRow) => void
+  onDirtyChange: (dirty: boolean) => void
 }) {
   const qc = useQueryClient()
   const q = useQuery(refusalGuardsQueryOptions())
@@ -216,6 +214,7 @@ export function RefusalSettings({
         key={JSON.stringify(data.risk_audit)}
         value={data.risk_audit}
         pending={save.isPending}
+        onDirtyChange={onDirtyChange}
         onSave={(risk_audit) => save.mutate({ risk_audit })}
       />
 
@@ -404,130 +403,5 @@ export function RefusalSettings({
         }}
       />
     </div>
-  )
-}
-
-function RiskPolicyForm({
-  value,
-  pending,
-  onSave,
-}: {
-  value: RiskAuditPolicy
-  pending: boolean
-  onSave: (value: RiskAuditPolicy) => void
-}) {
-  const [form, setForm] = useState({
-    steps: value.ban_steps.join(', '),
-    tools: value.blocked_tools
-      .map((tool) => `${tool.name} = ${tool.message}`)
-      .join('\n'),
-    phrases: value.upstream_policy_phrases.join('\n'),
-    pool: value.downgrade_pool,
-    endpoint: value.downgrade_endpoint,
-    model: value.downgrade_model,
-    route: String(value.route_margin),
-    margin: String(value.model_margin),
-  })
-  const change = (key: keyof typeof form, next: string) =>
-    setForm({ ...form, [key]: next })
-  const lines = (text: string) =>
-    text
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-  return (
-    <Group
-      title='封禁、工具与降级策略'
-      hint='仅对已通过硬规则的有效 Jev 评分使用降级分差；目标为空则不启用该路线。'
-    >
-      <form
-        className='grid gap-4 sm:grid-cols-2'
-        onSubmit={(event) => {
-          event.preventDefault()
-          onSave({
-            ban_steps: form.steps
-              .split(/[,，]/)
-              .map((item) => (item.trim() ? Number(item) : NaN)),
-            blocked_tools: lines(form.tools).map((line) => {
-              const split = line.indexOf('=')
-              return {
-                name: split < 0 ? line : line.slice(0, split).trim(),
-                message: split < 0 ? '' : line.slice(split + 1).trim(),
-              }
-            }),
-            upstream_policy_phrases: lines(form.phrases),
-            downgrade_pool: form.pool.trim(),
-            downgrade_endpoint: form.endpoint.trim(),
-            downgrade_model: form.model.trim(),
-            route_margin: Number(form.route),
-            model_margin: Number(form.margin),
-          })
-        }}
-      >
-        <div className='space-y-2 sm:col-span-2'>
-          <Label htmlFor='risk-ban-steps'>
-            按违规次数封禁（分钟，0 表示永久）
-          </Label>
-          <Input
-            id='risk-ban-steps'
-            required
-            value={form.steps}
-            onChange={(event) => change('steps', event.target.value)}
-          />
-        </div>
-        <div className='space-y-2'>
-          <Label htmlFor='risk-denied-tools'>
-            禁用工具（每行：工具名 = 错误提示）
-          </Label>
-          <Textarea
-            id='risk-denied-tools'
-            value={form.tools}
-            onChange={(event) => change('tools', event.target.value)}
-          />
-        </div>
-        <div className='space-y-2'>
-          <Label htmlFor='risk-upstream-phrases'>
-            上游策略短语（每行一条）
-          </Label>
-          <Textarea
-            id='risk-upstream-phrases'
-            value={form.phrases}
-            onChange={(event) => change('phrases', event.target.value)}
-          />
-        </div>
-        {(
-          [
-            { key: 'pool', label: '降级账号池 ID' },
-            { key: 'endpoint', label: '降级 API 渠道 ID' },
-            { key: 'model', label: '降级模型 ID' },
-            { key: 'route', label: '路线降级最大安全分差' },
-            { key: 'margin', label: '模型降级最大安全分差' },
-          ] as const
-        ).map(({ key, label }) => (
-          <div key={key} className='space-y-2'>
-            <Label htmlFor={`risk-policy-${key}`}>{label}</Label>
-            <Input
-              id={`risk-policy-${key}`}
-              value={form[key]}
-              {...(key === 'route' || key === 'margin'
-                ? {
-                    type: 'number',
-                    min: 0,
-                    max: 1,
-                    step: 'any',
-                    required: true,
-                  }
-                : {})}
-              onChange={(event) => change(key, event.target.value)}
-            />
-          </div>
-        ))}
-        <div className='sm:col-span-2'>
-          <Button type='submit' size='sm' disabled={pending}>
-            {pending ? '保存中…' : '保存审核策略'}
-          </Button>
-        </div>
-      </form>
-    </Group>
   )
 }

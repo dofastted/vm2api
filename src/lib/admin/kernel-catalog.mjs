@@ -40,6 +40,13 @@ const baseFor = (root, kernel) =>
 const archFor = (kernel) => (kernel === 'crag' ? cragV2Arch() : 'amd64')
 const CRAG_PINNED_RELEASES = [
   {
+    tag: 'payload-2026.11.17-crag-3.1.4',
+    label: '3.1.4 标准版',
+    size: 170833337,
+    manifestSha256: '67224bbec4d1db42b7c446b22a674702d41d2ed0aaf61f26ab60764a5085a235',
+    sha256: '295e40ba1b1830c0e8b58540d96633b1aa6f2c52f6a437c09e6c976d9f21238c',
+  },
+  {
     tag: 'payload-2026.11.17-crag-3.1.3',
     label: '3.1.3 Compact 修复版',
     size: 170786978,

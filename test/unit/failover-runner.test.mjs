@@ -323,6 +323,72 @@ test('slot_busy spill serves the turn elsewhere but keeps the session pinned', a
   })
 })
 
+test('with session_affinity_first a slot_busy spill moves the pin to the unit that served the turn', async (t) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-slot-busy-follow-'))
+  const sticky = new StickyRouter({ dataDir, config: { sticky: { enabled: true } } })
+  t.after(() => {
+    sticky.db.close()
+    fs.rmSync(dataDir, { recursive: true, force: true })
+  })
+  const callerSession = 'slot-busy-follow'
+  const stickyKey = sticky.canonicalSessionKey(callerSession)
+  sticky.bind(stickyKey, { accountId: 'account-1', vmId: 'vm-01', sessionId: 'stored-home' }, { countHit: false })
+  const selections = [1, 2].map((n) => ({
+    ok: true,
+    accountId: `account-${n}`,
+    vmId: `vm-0${n}`,
+    seatKey: `seat:sess:${callerSession}`,
+    release() {},
+  }))
+  let index = 0
+  const scheduler = {
+    config: { session_affinity_first: true },
+    async selectAndReserve() {
+      return selections[Math.min(index++, selections.length - 1)]
+    },
+    markSuccess() {},
+    markCooldown() {},
+    releaseAccountSessions() {
+      assert.fail('capacity spill must not unbind')
+    },
+  }
+  const runner = new FailoverRunner({ scheduler, stickyRouter: sticky, config: { same_account_retry_delay_ms: 0 } })
+  let clock = 1_000
+  const result = await runner.run({
+    requestId: 'req-spill-follow',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey,
+    seatKey: `seat:sess:${callerSession}`,
+    applyAttempt: (body, selected, extra) => ({
+      body,
+      meta: {
+        sessionId: resolveOutboundSessionId(callerSession, {
+          boundSessionId: extra.stickyBound?.sessionId,
+          boundVmId: extra.stickyBound?.vmId,
+          vmId: selected.vmId,
+          epoch: `${clock++}:${selected.vmId}`,
+        }),
+      },
+    }),
+    callAttempt: ({ candidate: selected }) =>
+      selected.accountId === 'account-1'
+        ? {
+            ok: false,
+            status: 503,
+            terminalState: 'rejected',
+            body: { error: { type: 'api_error', code: 'slot_busy', message: 'no free slot' } },
+          }
+        : success(),
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.accountId, 'account-2')
+  const bound = sticky.resolve(stickyKey)
+  assert.equal(bound.accountId, 'account-2')
+  assert.equal(bound.vmId, 'vm-02')
+  assert.notEqual(bound.sessionId, 'stored-home')
+})
+
 test('a late device-affinity hop does not overwrite a newer cross-account session pin', async (t) => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-device-move-race-'))
   const sticky = new StickyRouter({ dataDir, config: { sticky: { enabled: true } } })

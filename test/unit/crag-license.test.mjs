@@ -40,6 +40,7 @@ import {
 } from '../fixtures/crag-license.mjs'
 import { createCragSubscription } from '../../src/lib/vm/crag-subscription.mjs'
 import { cragSubscriptionPublicDirectory } from '../../src/lib/vm/crag-subscription-paths.mjs'
+import { assertAuthLoginReady } from '../../src/lib/oauth/claude-auth-login.mjs'
 
 const savedEnv = { run: process.env.KIN_SLOT_RUN_ROOT, pkg: process.env.KIN_CRAG_V2_ROOT }
 before(() => {
@@ -403,6 +404,80 @@ test('universal CRAGU1 activates without creating a device binding', async (t) =
   const expired = issueUniversalCode(root, { issued_at: Math.floor(Date.now() / 1000) - 70 * 86400 })
   assert.throws(() => activateCragLicense(root, vm, expired.code), { code: 'license_expired' })
   assert.deepEqual(fs.readFileSync(path.join(dir, 'registration.code')), stored)
+})
+
+for (const existingCli of [false, true]) {
+  test(`native login stages a complete CRAG package before activation (existing CLI: ${existingCli})`, async (t) => {
+    const { root, vm, pkg } = fixture(t)
+    const installed = path.join(wrapCliHomeDir(root, vm.id), 'crag-v2')
+    const member = 'claude-code-2.1.321/claude'
+    if (existingCli) {
+      fs.mkdirSync(path.dirname(path.join(installed, member)), { recursive: true })
+      fs.copyFileSync(path.join(pkg, member), path.join(installed, member))
+    }
+    await assertAuthLoginReady(root, vm, {
+      inspect: () => ({ running: true }),
+      cliExists: async () => fs.existsSync(path.join(installed, member)),
+    })
+    assert.equal(verifyCragV2Tree(installed).ok, true)
+    const activated = await route(root, 'POST', '/crag-license', {
+      registration_code: issueUniversalCode(root).code,
+    })
+    assert.equal(activated.status, 200)
+    assert.equal(activated.body.data.license.valid, true)
+    const current = await route(root, 'GET', '/crag-license')
+    assert.equal(current.body.data.license.status, 'valid')
+    assert.equal(fs.existsSync(path.join(wrapCliHomeDir(root, vm.id), 'kin-kernel')), false)
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`))).dataplane, 'wrap')
+  })
+}
+
+test('native login preserves an installed package when the download changes and rejects corruption', async (t) => {
+  const { root, vm } = fixture(t)
+  assert.equal(materializeCragV2(root, vm, { select: false }).ok, true)
+  const installed = path.join(wrapCliHomeDir(root, vm.id), 'crag-v2')
+  const manifest = fs.readFileSync(path.join(installed, 'manifest.json'))
+  seedEncryptedPackage(root, { revision: 'new download' })
+  const ready = () =>
+    assertAuthLoginReady(root, vm, {
+      inspect: () => ({ running: true }),
+      cliExists: async () => true,
+    })
+  await ready()
+  assert.deepEqual(fs.readFileSync(path.join(installed, 'manifest.json')), manifest)
+  fs.appendFileSync(path.join(installed, 'crag-v2.payload.enc'), 'corrupt')
+  await assert.rejects(ready(), { code: 'crag_v2_hash_mismatch' })
+  assert.deepEqual(fs.readFileSync(path.join(installed, 'manifest.json')), manifest)
+})
+
+test('universal activation rejects an incomplete slot package before publishing any grant', async (t) => {
+  const { root, vm } = fixture(t)
+  const installed = path.join(wrapCliHomeDir(root, vm.id), 'crag-v2')
+  fs.mkdirSync(path.join(installed, 'claude-code-2.1.321'), { recursive: true })
+  const result = await route(root, 'POST', '/crag-license', {
+    registration_code: issueUniversalCode(root).code,
+  })
+  assert.equal(result.status, 403)
+  assert.equal(result.body.error.code, 'license_unconfigured')
+  assert.equal(fs.existsSync(path.join(cragUniversalDirectory(root), 'registration.code')), false)
+  assert.equal(fs.existsSync(path.join(cragLicenseDirectory(root, vm), 'registration.code')), false)
+})
+
+test('universal activation rejects a different installed payload without replacing existing grants', async (t) => {
+  const { root, vm } = fixture(t)
+  const prior = issueUniversalCode(root)
+  activateCragLicense(root, vm, prior.code)
+  seedEncryptedPackage(root, { payloadKey: crypto.randomBytes(32) })
+  assert.equal(materializeCragV2(root, vm, { select: false }).ok, true)
+  seedEncryptedPackage(root)
+  const result = await route(root, 'POST', '/crag-license', {
+    registration_code: issueUniversalCode(root).code,
+  })
+  assert.equal(result.status, 403)
+  assert.equal(result.body.error.code, 'license_payload_key_mismatch')
+  for (const dir of [cragUniversalDirectory(root), cragLicenseDirectory(root, vm)]) {
+    assert.equal(fs.readFileSync(path.join(dir, 'registration.code'), 'utf8').trim(), prior.code)
+  }
 })
 
 test('offline KVM keeps its installed authorization when the download changes', async (t) => {
@@ -846,4 +921,27 @@ test('symlinked device files and DrvFS storage are refused; non-admin activation
   const denied = await route(root, 'GET', '/crag-license', null, 'super')
   assert.equal(denied.status, 403)
   assert.equal(getCragLicense('/mnt/c/not-created', vm, { initialize: true }).license.valid, false)
+})
+
+test('package trust stays cached for every slot when more than eight slots cycle through admission', (t) => {
+  const slots = Array.from({ length: 12 }, () => {
+    const { root, vm } = fixture(t)
+    activateFixture(root, vm)
+    return { root, vm: { ...vm, dataplane: 'crag', crag_kernel_version: 'v2' } }
+  })
+  for (const { root, vm } of slots) assert.equal(checkCragLicense(root, vm).ok, true)
+  const readFileSync = fs.readFileSync
+  let payloadReads = 0
+  fs.readFileSync = function (file, ...rest) {
+    if (String(file).endsWith('crag-v2.payload.enc')) payloadReads += 1
+    return readFileSync.call(this, file, ...rest)
+  }
+  t.after(() => {
+    fs.readFileSync = readFileSync
+  })
+  // The kernel watchdog walks slots in a fixed order; an undersized LRU evicts
+  // exactly the next slot and re-hashes every package on every tick.
+  for (let round = 0; round < 2; round += 1)
+    for (const { root, vm } of slots) assert.equal(checkCragLicense(root, vm).ok, true)
+  assert.equal(payloadReads, 0)
 })

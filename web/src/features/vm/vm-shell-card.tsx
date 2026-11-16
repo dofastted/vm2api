@@ -4,7 +4,7 @@ import { api } from '@/lib/api'
 import { fmtResetClock, resetCountdown } from '@/lib/fable-status'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { type SlashCommand, WsTerminal } from '@/components/ws-terminal'
+import { type SlashCommand, WsTerminal } from '@/components/ws-terminal-lazy'
 import { probeSourceLabel } from '@/features/vm/probe-status'
 
 const RED = '\x1b[31m'
