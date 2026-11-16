@@ -3331,22 +3331,22 @@ export function createPanelHandler(ctx) {
               message: isCodexVm(vm) ? '请选择 Claude 虚拟机' : 'CRAG v2 不支持 macOS 原生节点',
             },
           })
-        const offlineOnlyPlacement = Boolean(vm.node_id) || isKvmRuntime(vm)
+        const deviceUnsupported = Boolean(vm.node_id) || isKvmRuntime(vm)
         try {
           if (req.method === 'GET')
             return json(res, 200, panel.ok(getCragLicense(cfg.paths.project, vm, { initialize: true })))
           const body = await readBody(req, 32768)
           const registrationCode = typeof body?.registration_code === 'string' ? body.registration_code.trim() : ''
-          if (offlineOnlyPlacement && !registrationCode.startsWith('CRAGU1.')) {
+          const online = registrationCode.startsWith('CRAGR1.')
+          if (deviceUnsupported && !online && !registrationCode.startsWith('CRAGU1.')) {
             return json(res, 400, {
               ok: false,
               error: {
                 code: 'crag_v2_unsupported_placement',
-                message: 'KVM 和集群槽只能激活 CRAGU1 离线通用码。设备注册码仍需要本机 Linux Docker 槽。',
+                message: '设备注册码需要本机 Linux Docker 槽；也可使用 CRAGU1 离线码。',
               },
             })
           }
-          const online = registrationCode.startsWith('CRAGR1.')
           if (online && (req.apiKeyKind || !panelIdentity(req).user || !sameOriginPost(req, cfg.base_url))) {
             return json(res, 403, {
               ok: false,
@@ -3359,6 +3359,12 @@ export function createPanelHandler(ctx) {
             if (kind === 'host') {
               activated = await ctx.cragSubscription.activateVoucher(vm.id, registrationCode)
             } else {
+              if (deviceUnsupported) {
+                return json(res, 400, {
+                  ok: false,
+                  error: { code: 'crag_v2_unsupported_placement', message: '设备兑换码需要本机 Linux Docker 槽。' },
+                })
+              }
               activated = await redeemCragDeviceVoucher(cfg.paths.project, vm, registrationCode, {
                 getTarget: () => getVm(cfg.paths.project, vm.id),
                 routing: ctx.routingConfig,

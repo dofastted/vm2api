@@ -54,7 +54,7 @@ import {
   STANDARD_LOCALE,
   writeWorkerFiles,
 } from '../vm/vm-runtime.mjs'
-import { projectCragUniversalVm } from '../vm/crag-license.mjs'
+import { projectCragUniversalVm, readCragClusterSubscription } from '../vm/crag-license.mjs'
 import { patchVmRecord } from '../vm/vm-registry.mjs'
 import {
   containerAction,
@@ -93,6 +93,11 @@ import {
   removeRemoteSlotDir,
 } from './remote-slot-files.mjs'
 import { slotImageSpec } from './slot-image.mjs'
+import {
+  clusterSubscriptionBinds,
+  hasClusterSubscriptionBinds,
+  publishClusterSubscription,
+} from './crag-subscription-files.mjs'
 
 const CRAG_V2_SECCOMP = JSON.stringify(
   JSON.parse(fs.readFileSync(new URL('../vm/crag-v2-seccomp.json', import.meta.url), 'utf8')),
@@ -728,7 +733,7 @@ function kvmSlotContainerBody(vm, { image, network, remoteDir, routing, accel, s
   return body
 }
 
-export function slotContainerBody(vm, { image, network, remoteDir, user, routing, accel }) {
+export function slotContainerBody(vm, { image, network, remoteDir, user, routing, accel, subscription = false }) {
   if (isKvmRuntime(vm)) return kvmSlotContainerBody(vm, { image, network, remoteDir, routing, accel, slotUser: user })
   const slotName = displayName(vm.id)
   const limits = slotCreationLimits(vm, routing)
@@ -774,6 +779,7 @@ export function slotContainerBody(vm, { image, network, remoteDir, user, routing
         `${remoteDir}/machine-id:/etc/machine-id:ro`,
         `${remoteDir}/machine-id:/var/lib/dbus/machine-id:ro`,
         `${remoteDir}/slot-bin:${LIVE_BIN}:ro`,
+        ...(subscription ? clusterSubscriptionBinds(remoteDir) : []),
       ],
       NetworkMode: network,
       RestartPolicy: { Name: 'unless-stopped' },
@@ -1120,6 +1126,8 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
     if (resolveKernelDataplane(vm, routing) === 'crag') await projectCragUniversalVm(projectRoot, vm)
     const { nodeId, session, image, egressImage, user, remoteDir, slotDir } = p
     const kvm = isKvmRuntime(vm)
+    const crag = !kvm && resolveKernelDataplane(vm, routing) === 'crag'
+    const subscription = crag && !!readCragClusterSubscription(projectRoot, vm)
     let accel = vm.runtime?.accel
     if (kvm && accel !== 'kvm' && accel !== 'tcg') {
       const probe = await probeRemoteAccel(session, routing)
@@ -1148,6 +1156,7 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
       runtimeLabelOf(existing) === runtimeKind(vm) &&
       codexRoleMatches(existing, vm) &&
       clusterDockerCommandReady(vm, existing, routing) &&
+      (!subscription || hasClusterSubscriptionBinds(existing, remoteDir)) &&
       // Running stays true during Docker restart-policy backoff. Recreate the
       // loop just like the local runtime; otherwise watchdog revival is a no-op.
       !existing.State?.Restarting &&
@@ -1166,6 +1175,7 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
       accel,
     }
     if (matches && existing.State?.Running) {
+      if (subscription) await publishClusterSubscription(projectRoot, vm, session)
       await reconcileSlotCredentials(vm, slotDir, session)
       applyRuntime(vm, { ...common, info: existing })
       return { ok: true, action: 'already-running', runtime: vm.runtime }
@@ -1180,6 +1190,7 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
     writeWorkerFiles(vm, projectRoot, { transparent: true, routing })
     ensureGuestMachineIdFile(projectRoot, vm)
     await pushSlotFiles(vm, slotDir, ['run', 'seed'], session)
+    if (subscription) await publishClusterSubscription(projectRoot, vm, session, { force: true })
     if (!existing) await migrateClaudeDir(session, vm, remoteDir)
     if (kvm) {
       await runRemote(
@@ -1194,7 +1205,7 @@ export async function startRemoteSlot(vm, projectRoot, { recreate = false, routi
       await createContainerRaw(
         session.docker,
         name,
-        slotContainerBody(vm, { image, network: eg.network, remoteDir, user, routing, accel }),
+        slotContainerBody(vm, { image, network: eg.network, remoteDir, user, routing, accel, subscription }),
       )
       action = 'created'
     }
@@ -1214,6 +1225,10 @@ export async function reloadRemoteSlot(vm, projectRoot, { routing } = {}) {
     const p = await prepare(vm, projectRoot, routing)
     if (p.fail) return p.fail
     const { nodeId, session, image, user, remoteDir, slotDir } = p
+    const subscription =
+      !isKvmRuntime(vm) &&
+      resolveKernelDataplane(vm, routing) === 'crag' &&
+      !!readCragClusterSubscription(projectRoot, vm)
     const binaries =
       typeof pushSlotBinaries === 'function' ? await pushSlotBinaries(vm, projectRoot, session) : { digest: '' }
     const eg = await ensureRemoteEgress(session, vm, {
@@ -1230,13 +1245,15 @@ export async function reloadRemoteSlot(vm, projectRoot, { routing } = {}) {
       existing.Config?.Labels?.['kin.vm.layout'] !== SLOT_LAYOUT ||
       runtimeLabelOf(existing) !== runtimeKind(vm) ||
       !codexRoleMatches(existing, vm) ||
-      !clusterDockerCommandReady(vm, existing, routing)
+      !clusterDockerCommandReady(vm, existing, routing) ||
+      (subscription && !hasClusterSubscriptionBinds(existing, remoteDir))
     ) {
       return startRemoteSlot(vm, projectRoot, { recreate: !!existing, routing })
     }
     const relays = await clusterManager().ensureSlotRelays(nodeId, vm.id)
     writeWorkerFiles(vm, projectRoot, { transparent: true, routing })
     await pushSlotFiles(vm, slotDir, ['run', 'seed'], session)
+    if (subscription) await publishClusterSubscription(projectRoot, vm, session, { force: true })
     await reconcileSlotCredentials(vm, slotDir, session)
     const running = !!existing.State?.Running
     if (isKvmRuntime(vm) && running) {
@@ -1351,7 +1368,7 @@ export async function destroyRemoteSlot(vm) {
     await removeRemoteSlotDir(vm, session)
     await clusterManager().dropSlotRelays(vm.id)
     if (vm.runtime) vm.runtime = { ...vm.runtime, pid: null, ip: null, stopped: true, removed: true }
-    return { ok: true, action: info ? 'removed' : 'absent', runtime: vm.runtime || null }
+    return { ok: true, action: info ? 'removed' : 'absent', teardownConfirmed: true, runtime: vm.runtime || null }
   } catch (err) {
     return failure(err)
   }

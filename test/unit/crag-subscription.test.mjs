@@ -8,6 +8,7 @@ import { createCragSubscription } from '../../src/lib/vm/crag-subscription.mjs'
 import { createCragRuntimeInventory } from '../../src/lib/vm/crag-runtime-inventory.mjs'
 import { checkCragLicense, cragLicenseDirectory, cragTargetIds } from '../../src/lib/vm/crag-license.mjs'
 import { cragSubscriptionPublicDirectory } from '../../src/lib/vm/crag-subscription-paths.mjs'
+import { assertCragSubscriptionTarget } from '../../src/lib/vm/vm-runtime.mjs'
 import { materializeCragV2 } from '../../src/lib/vm/wrap-cli-runtime.mjs'
 import {
   activateFixture,
@@ -62,6 +63,57 @@ function postSubscription(subscription) {
       cragSubscriptionRoute('POST', `/api/panel/crag-subscription/${action}`),
     )
 }
+
+test('a cluster slot can bind without running and explicitly reissues an old package permit on the same seat', async (t) => {
+  const vm = { id: 'vm-52', node_id: 'node-a', dataplane: 'wrap', status: 'stopped' }
+  const requests = []
+  let entitlement
+  let inactive = true
+  let projected = false
+  const { root, connect } = standaloneHost(t, async (url, { body }) => {
+    const request = JSON.parse(body)
+    if (url.endsWith('/redeem')) entitlement = issueHostEntitlement(root, request.host_id, { slot_limit: 1 })
+    const data = { entitlement: entitlement.code, ...entitlement.claims, used_slots: Number(requests.length > 0) }
+    if (!url.endsWith('/bind')) return Response.json({ ok: true, data })
+    if (inactive) return Response.json({ ok: false, error: { code: 'host_subscription_inactive' } }, { status: 403 })
+    requests.push(request)
+    if (!request.reissue) {
+      return Response.json({ ok: false, error: { code: 'payload_key_conflict' } }, { status: 409 })
+    }
+    const permit = issueSlotPermit(root, request.machine_code, request.host_id, { seat: 1 })
+    return Response.json({ ok: true, data: { ...data, seat: 1, slot_permit: permit.code } })
+  })
+  seedEncryptedPackage(root)
+  fs.mkdirSync(path.join(root, 'vms', vm.id), { recursive: true })
+  fs.writeFileSync(path.join(root, 'vms', vm.id, 'machine-id'), crypto.randomBytes(16).toString('hex'))
+  const service = connect({
+    listTargets: () => [vm],
+    assertReady: (target, options) => assertCragSubscriptionTarget(root, target, {}, options),
+    runtimeInventory: { snapshot: async () => ({}) },
+    publishClusterBinding: async (projectRoot, target) => {
+      assert.equal(projectRoot, root)
+      assert.equal(target, vm)
+      projected = true
+    },
+  })
+  await service.redeem(voucher())
+  assert.deepEqual(await service.listOrderTargets(), [vm.id])
+  await assert.rejects(service.bind(vm), { code: 'host_subscription_inactive', status: 403 })
+  inactive = false
+  assert.deepEqual(await service.bind(vm), { seat: 1 })
+  assert.equal(projected, false)
+  assert.equal(requests.length, 2)
+  assert.deepEqual(requests[1], { ...requests[0], reissue: true })
+  assert.equal((await service.status()).used_slots, 1)
+  assert.equal(vm.dataplane, 'wrap')
+  vm.dataplane = 'crag'
+  assert.equal(checkCragLicense(root, vm).license.scope, 'host')
+  assert.equal(await service.admitInference({ vm }), null)
+  assert.equal(projected, false)
+  vm.status = 'running'
+  assert.equal(await service.admitInference({ vm }), null)
+  assert.equal(projected, true)
+})
 
 test('an admin can redeem without VMs and a second voucher replaces the signed capacity', async (t) => {
   const first = voucher()

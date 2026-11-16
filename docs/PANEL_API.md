@@ -282,12 +282,12 @@ OpenAI 图像模型不进入 GPT 对话矩阵，单独由 `image_tools` 管理�
 
 收据主密钥保存在数据目录的 `crag-shop-private/receipt.key`，仅控制进程可读；迁移安装或恢复订单库时，须单独安全备份并恢复同一份密钥。标准数据库备份不含该密钥，已有订单而密钥丢失时服务拒绝重建密钥。
 
-宿主订阅状态 `GET /crag-subscription` 仅管理员可查。`used_slots` / `available_slots` 表示应用锁用量；旧 `enabled_slots` 不用于统计实际服役。`ready` 仍表示有可绑定的 VM。H2 受签名名单 10,000 槽上限约束。仅受支持的 H1 宿主可通过 `POST /crag-subscription/upgrade`（JSON `{}`）升级；确认本机 Docker 槽已销毁后才释放 H2 应用锁，停机不释放。回收中断可以通过 `POST /crag-subscription/recover`（JSON `{}`）继续，未确认的销毁不会被判为成功。
+宿主订阅状态 `GET /crag-subscription` 仅管理员可查。`used_slots` / `available_slots` 表示当前宿主机的总绑定用量，含此面板管理的集群订阅槽；旧 `enabled_slots` 不用于统计实际服役。`ready` 表示有兼容的绑定目标。H2 受签名名单 10,000 槽上限约束。仅受支持的 H1 宿主可通过 `POST /crag-subscription/upgrade`（JSON `{}`）升级；确认 Docker 槽已销毁后才释放 H2 应用锁，停机不释放。回收中断可以通过 `POST /crag-subscription/recover`（JSON `{}`）继续，未确认的销毁不会被判为成功。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/crag-subscription/redeem` | 管理员同源登录会话，JSON `{ "redemption_code": "<CRAGR1 宿主码>" }`，无需已有 VM，不自动绑定或启动。没有可信发行包时返回 `409 crag_subscription_host_package_unready`，不核销。新套餐替换额度上限；兑换中断可用 `/crag-subscription/recover` 继续同步。 |
-| POST | `/vms/:id/crag-license/bind` | 管理员同源登录会话，JSON `{}`，将有效宿主订阅绑定到合格的本机 Linux Docker CRAG v2 槽；回读槽授权确认 `license.valid` 与 `license.scope`。 |
+| POST | `/vms/:id/crag-license/bind` | 管理员同源登录会话，JSON `{}`。本机和集群 Linux Docker CRAG v2 槽共享当前宿主订阅额度；绑定不启动或重启槽位。集群槽启动时挂载只读许可与权益，不下发兑换码或鉴权凭据。回读槽授权确认 `license.valid` 与 `license.scope`；已运行且缺少挂载的槽需按正常流程重启。 |
 
 可选 `runtime` 返回实际运行的 `running_vms`、`ready_vms`、`unknown_vms`、`host_running_vms`、`host_unknown_vms`、`host_runtime_available`、`host_over_limit`、`checked_at` 和逐 VM 明细 `vms`。独立授权计入全局服役但不占宿主额度；未知不视为零。宿主订阅超额或无法核实在额度内时，新的宿主授权推理请求分别返回 `403 license_crag_host_over_quota` 或 `403 license_crag_host_usage_unverified`，不取消在途请求、不代替逐槽许可。
 

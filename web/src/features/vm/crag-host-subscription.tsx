@@ -16,6 +16,20 @@ const statusLabels: Record<CragHostStatus['state'], string> = {
   sync_pending: '等待同步',
 }
 const root = '/api/panel/crag-subscription'
+const operationErrors: Record<string, string> = {
+  slot_limit_reached: '订阅槽位额度已用完。',
+  host_subscription_inactive: '本机没有有效订阅，请兑换或续费。',
+  host_binding_conflict: '此槽的设备身份与原绑定不一致。',
+  crag_subscription_target_unready:
+    '此槽不兼容订阅，或尚未配置可信的 CRAG 包。',
+  crag_subscription_target_changed: '槽位或内核已变更，请确认目标后重试。',
+  crag_subscription_sync_pending: '上次订阅变更尚未同步，请先完成同步。',
+  payload_key_unknown: '鉴权服务未登记此 CRAG 包的载荷密钥。',
+  payload_key_conflict: '此槽仍绑定旧 CRAG 包，未能换签。',
+  license_payload_key_mismatch: '签发的许可与此槽的 CRAG 包不匹配。',
+  not_found: '鉴权服务找不到当前宿主机的订阅或槽位。',
+  auth_forbidden: '鉴权服务不接受当前宿主机的订阅凭据。',
+}
 
 export function CragHostSubscription({ vmId }: { vmId: string }) {
   const id = useId()
@@ -26,7 +40,6 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
   const [notice, setNotice] = useState<{ text: string; error?: boolean }>()
   const status = host.data
   const pending = status?.state === 'sync_pending'
-  const ready = status?.ready && !pending && !host.isError
   const busy = host.isFetching || working
 
   async function perform(action: 'bind' | 'recover') {
@@ -42,7 +55,9 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
             body: '{}',
           }
         )
-        setNotice({ text: `本槽已绑定应用锁 ${result.seat}。` })
+        setNotice({
+          text: `本槽已绑定，槽位编号 ${result.seat}。如内核尚未加载授权，请重启本槽。`,
+        })
       } else {
         const next = await api<CragHostStatus>(`${root}/${action}`, {
           method: 'POST',
@@ -53,9 +68,8 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
     } catch (error) {
       setNotice({
         text:
-          isApiError(error) && error.code === 'slot_limit_reached'
-            ? '应用锁额度已用完。本槽未绑定。'
-            : '操作未确认。请先刷新宿主机订阅状态，再按提示重试。',
+          (isApiError(error) && operationErrors[error.code]) ||
+          '无法确认订阅操作，请检查连接后重试。',
         error: true,
       })
     } finally {
@@ -93,8 +107,9 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
       <p role='status' className='text-sm break-words tabular-nums'>
         {status ? statusLabels[status.state] : '正在读取宿主机订阅…'}
         {status?.slot_limit != null
-          ? ` · ${status.slot_limit === 'unlimited' ? '不限应用锁' : `${status.slot_limit} 把应用锁`}`
+          ? ` · ${status.slot_limit === 'unlimited' ? '槽位不限' : `${status.slot_limit} 个槽位`}`
           : ''}
+        {status?.used_slots != null ? ` · 已绑定 ${status.used_slots} 个` : ''}
         {status?.expires_at
           ? ` · 到期 ${new Date(status.expires_at * 1000).toLocaleString()}`
           : ''}
@@ -115,13 +130,13 @@ export function CragHostSubscription({ vmId }: { vmId: string }) {
       <p className='text-sm text-muted-foreground'>
         {pending
           ? '同步完成前，订阅槽不会接收新请求。手动激活中断时，请在原槽提交原码；自动激活中断时，请处理原订单。'
-          : '订阅只绑定一台宿主机。仅支持本机 Linux Docker 的 Claude 槽；需要已安装支持订阅的可信 CRAG 包，并就绪只读挂载。'}
+          : '当前宿主机的订阅额度由本机与集群 Linux Docker CRAG 槽共享。绑定不会自动启动或重启槽位。'}
       </p>
       {status?.state === 'active' ? (
         <Button
           type='button'
           variant='outline'
-          disabled={!ready || busy}
+          disabled={busy || host.isError}
           onClick={() => void perform('bind')}
         >
           用现有订阅绑定本槽
