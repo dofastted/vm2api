@@ -12,7 +12,7 @@ import {
 } from '@/components/ui/dialog'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { StatusMark } from '@/components/status-mark'
-import { WsTerminal } from '@/components/ws-terminal'
+import { WsTerminal } from '@/components/ws-terminal-lazy'
 import { DirectLinkConfig } from '@/features/cluster/direct-link-config'
 import { DockerTab } from '@/features/cluster/docker-tab'
 import { LINK_STATE_TEXT, remoteLinkTone } from '@/features/cluster/model'

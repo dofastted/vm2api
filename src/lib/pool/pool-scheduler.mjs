@@ -78,6 +78,14 @@ export const DEFAULT_POOL_ROUTING = Object.freeze({
   sticky_wait_timeout_ms: 45000,
   circuit_failure_threshold: 3,
   circuit_open_ms: 30000,
+  /**
+   * A continuing conversation keeps its own VM while that VM can take it,
+   * ahead of priority level and device affinity. Moving it costs a full
+   * prompt-cache rewrite on another account, which outweighs draining a
+   * soon-to-reset quota first. Matters most when many conversations share
+   * one device key (a relay in front of the pool).
+   */
+  session_affinity_first: false,
 })
 
 const DEFAULT_CONFIG = {
@@ -109,6 +117,7 @@ export function normalizePoolRouting(pool = {}) {
   const next = { ...(pool && typeof pool === 'object' ? pool : {}) }
   delete next.max_waiters_per_account
   next.strategy = next.strategy === 'fill' ? 'fill' : 'balanced'
+  next.session_affinity_first = next.session_affinity_first === true
   next.queue_max = clampNumber(next.queue_max, DEFAULT_POOL_ROUTING.queue_max, QUEUE_MAX_MIN, QUEUE_MAX_MAX)
   next.seat_grace_ms = clampNumber(next.seat_grace_ms, DEFAULT_POOL_ROUTING.seat_grace_ms, 0, SEAT_GRACE_MAX_MS)
   next.seat_budget_reserve_pct = clampNumber(
@@ -193,10 +202,11 @@ function sessionIdFromStickyKey(key) {
 }
 
 /** Machine VM, then this session's pin, then family. Empty and duplicate VMs drop out with their reason. */
-function seatHomes({ deviceVm = '', sessionVm = '', familyVm = '' } = {}) {
+function seatHomes({ deviceVm = '', sessionVm = '', familyVm = '', sessionFirst = false } = {}) {
+  const device = { vmId: String(deviceVm || '').trim(), reason: 'device-affinity' }
+  const session = { vmId: String(sessionVm || '').trim(), reason: 'sticky' }
   const homes = [
-    { vmId: String(deviceVm || '').trim(), reason: 'device-affinity' },
-    { vmId: String(sessionVm || '').trim(), reason: 'sticky' },
+    ...(sessionFirst ? [session, device] : [device, session]),
     { vmId: String(familyVm || '').trim(), reason: 'family-affinity' },
   ]
   const seen = new Set()
@@ -252,6 +262,89 @@ function emptyPoolFailure(candidates, now = Date.now()) {
   if (limited != null) return { reason: 'pool_rate_limited', retry_after_ms: Math.max(0, limited - now) }
   const restUntil = Number(candidates?.rest_until) || 0
   return { reason: 'no_eligible_accounts', retry_after_ms: restUntil > now ? restUntil - now : null }
+}
+
+/**
+ * 额度耗尽保护 (quota exhaustion guard). Defaults match the panel; off unless
+ * `quota.exhaustion_guard` is true. A window reported `rejected` (headers or the
+ * official /usage probe) always stops the account until its reset: every
+ * request there fails anyway, whatever the switch says.
+ */
+export const QUOTA_GUARD_DEFAULTS = { new_session_ratio: 0.85, stop_ratio: 0.95 }
+
+export function quotaGuardConfigOf(quota = {}) {
+  const ratio = (value, fallback) => {
+    const n = Number(value)
+    return Number.isFinite(n) && n > 0 && n <= 1 ? n : fallback
+  }
+  const stop = ratio(quota?.exhaustion_guard_stop, QUOTA_GUARD_DEFAULTS.stop_ratio)
+  const fresh = Math.min(stop, ratio(quota?.exhaustion_guard_new_session, QUOTA_GUARD_DEFAULTS.new_session_ratio))
+  return { enabled: quota?.exhaustion_guard === true, new_session_ratio: fresh, stop_ratio: stop }
+}
+
+function guardResetMs(value) {
+  if (value == null || value === '') return null
+  const n = Number(value)
+  if (Number.isFinite(n)) return n < 1e12 ? n * 1000 : n
+  const parsed = Date.parse(String(value))
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+/** One window sample as { ratio, until }; null when empty or already reset. */
+function guardWindowReading(window, now) {
+  if (!window || typeof window !== 'object') return null
+  const until = guardResetMs(window.reset)
+  if (until != null && until <= now) return null
+  const status = String(window.status || '').toLowerCase()
+  const raw = Number(window.utilization)
+  const hasRatio = window.utilization != null && window.utilization !== '' && Number.isFinite(raw)
+  const percent = hasRatio && raw > 1.5
+  const ratio = hasRatio ? (percent ? raw / 100 : raw) : null
+  if (status === 'rejected' || status === 'rate_limited') {
+    // Same rule as headerHardBlocked: a legacy percent reading below 100 next to
+    // a rejected flag is that percentage, not a spent window.
+    if (percent && ratio < 1) return { ratio, until, rejected: false }
+    return { ratio: 1, until, rejected: true }
+  }
+  if (!hasRatio) return null
+  return { ratio, until, rejected: false }
+}
+
+/**
+ * Highest live 5h / 7d reading across the response-header sample, the official
+ * /usage sample and the merged view. They disagree: a Pro seat read 0.97
+ * `allowed_warning` on its last good response while /usage said 100% `rejected`.
+ */
+export function quotaGuardUsage(unified = {}, now = Date.now()) {
+  let worst = null
+  for (const key of ['5h', '7d']) {
+    for (const sample of [unified?.headers?.[key], unified?.official?.[key], unified?.[key]]) {
+      const reading = guardWindowReading(sample, now)
+      if (!reading) continue
+      const better =
+        !worst ||
+        reading.ratio > worst.ratio ||
+        (reading.ratio === worst.ratio && (reading.until || 0) > (worst.until || 0))
+      if (better) worst = { ...reading, window: key }
+    }
+  }
+  return worst
+}
+
+/**
+ * What the guard allows on one account: `open`, `continuing` (only sessions
+ * already pinned there keep their cache; no new conversations) or `stop`.
+ */
+export function quotaGuardLevel(unified, config, now = Date.now()) {
+  const usage = quotaGuardUsage(unified, now)
+  if (!usage) return { level: 'open', usage: null }
+  // Extra usage still open keeps a rejected plan window serving: only the switch stops it.
+  const overageOpen = String(unified?.overage_status || '').toLowerCase() === 'allowed'
+  if (usage.rejected && !overageOpen) return { level: 'stop', usage }
+  if (!config?.enabled) return { level: 'open', usage }
+  if (usage.ratio >= config.stop_ratio) return { level: 'stop', usage }
+  if (usage.ratio >= config.new_session_ratio) return { level: 'continuing', usage }
+  return { level: 'open', usage }
 }
 
 function selectionSnapshot(candidates = [], available = [], extras = {}) {
@@ -579,6 +672,7 @@ export class PoolScheduler extends EventEmitter {
         ownerScope,
         keyScope,
         quotaRequest,
+        continuingVmIds: this.continuingVmIds({ stickyKey, stickyKeys }),
       })
       if (signal?.aborted) throw makeAbortError()
       if ((failoverDeadline || waitStartedAt !== null) && Date.now() >= waitCutoff) {
@@ -845,12 +939,21 @@ export class PoolScheduler extends EventEmitter {
             keyScope,
             quotaRequest,
             onlyVmIds: new Set([held.vmId]),
+            continuingVmIds: this.continuingVmIds({ seatKey, stickyKey, stickyKeys }),
           })
           const home = candidates[0]
           checkedHomeOnly = !!home && (!home.busy || stickyShouldWait(home.waitReason, home.cooldownReason))
         }
         if (!checkedHomeOnly) {
-          candidates = await this.eligibleCandidates({ model, excluded, signal, ownerScope, keyScope, quotaRequest })
+          candidates = await this.eligibleCandidates({
+            model,
+            excluded,
+            signal,
+            ownerScope,
+            keyScope,
+            quotaRequest,
+            continuingVmIds: this.continuingVmIds({ seatKey, stickyKey, stickyKeys }),
+          })
         }
         if (signal?.aborted) throw makeAbortError()
         const now = Date.now()
@@ -870,7 +973,8 @@ export class PoolScheduler extends EventEmitter {
           ticket?.kind === 'seat' &&
           (now >= ticket.stickyUntil ||
             !waitingHome ||
-            candidates.some((candidate) => candidate.priority > waitingHome.priority && !avoided(candidate)))
+            ((!ticket.sessionHome || waitingHome.draining) &&
+              candidates.some((candidate) => candidate.priority > waitingHome.priority && !avoided(candidate))))
         ) {
           ticket.deadline = Math.min(failoverDeadline, now + this.config.fallback_wait_timeout_ms)
           this.planner.toGlobal(ticket)
@@ -923,14 +1027,24 @@ export class PoolScheduler extends EventEmitter {
           this.planner.pump(seat.vmId)
         } else {
           // Within a priority level, prefer the machine, session, then family.
+          // With session_affinity_first a continuing conversation's own VM
+          // comes first, across priority levels.
+          const sessionVm = this.config.session_affinity_first ? String(sticky.vmId || '').trim() : ''
           const homes = seatHomes({
             deviceVm: deviceVmOf(),
             sessionVm: sticky.vmId || '',
             familyVm: familyGated ? '' : familyVm,
+            sessionFirst: !!sessionVm,
           })
 
           if (!ticket) {
-            const granted = this.openNewSeat(seatKey, candidates, { avoided, homes, deviceKey: machineKey })
+            const granted = this.openNewSeat(seatKey, candidates, {
+              avoided,
+              homes,
+              deviceKey: machineKey,
+              sessionVm,
+              waitForSession: allowWait && now < failoverDeadline,
+            })
             if (granted) return finish(granted)
             if (!candidates.length) {
               const empty = emptyPoolFailure(candidates)
@@ -938,9 +1052,20 @@ export class PoolScheduler extends EventEmitter {
             }
             if (!allowWait || now >= failoverDeadline) return fail('all_accounts_busy')
             const waitTier = highestPriorityCandidates(candidates.filter((candidate) => !avoided(candidate)))
-            const home = homes
-              .map((entry) => waitTier.find((candidate) => candidate.vmId === entry.vmId))
-              .find((candidate) => candidate && (!candidate.busy || stickyShouldWait(candidate.waitReason)))
+            const waitable = (candidate) => candidate && (!candidate.busy || stickyShouldWait(candidate.waitReason))
+            // The session's own VM also waits out a soft (RPM) cooldown, as reconcileSticky() does.
+            const sessionHome = sessionVm
+              ? candidates.find(
+                  (candidate) =>
+                    candidate.vmId === sessionVm &&
+                    !avoided(candidate) &&
+                    !candidate.draining &&
+                    (!candidate.busy || stickyShouldWait(candidate.waitReason, candidate.cooldownReason)),
+                )
+              : null
+            const home =
+              sessionHome ||
+              homes.map((entry) => waitTier.find((candidate) => candidate.vmId === entry.vmId)).find(waitable)
             ticket = home
               ? this.enqueueTicket({
                   seatKey,
@@ -963,6 +1088,7 @@ export class PoolScheduler extends EventEmitter {
                   deadline: Math.min(failoverDeadline, now + this.config.fallback_wait_timeout_ms),
                   avoided,
                 })
+            if (sessionHome) ticket.sessionHome = true
           } else if (ticket.kind === 'conc') {
             // Its seat moved away: wait for a new seat on the same terms as a new device.
             this.planner.place(ticket, { kind: 'global', vmId: null })
@@ -1006,8 +1132,21 @@ export class PoolScheduler extends EventEmitter {
    * Try every level in descending order. A full home can retain its sticky
    * seat wait within its own level, but cannot block higher levels.
    */
-  openNewSeat(seatKey, candidates, { avoided, homes = [], deviceKey = '' }) {
-    const ranked = this.planner.rank(this.openableCandidates(candidates, avoided))
+  openNewSeat(seatKey, candidates, { avoided, homes = [], deviceKey = '', sessionVm = '', waitForSession = false }) {
+    const openable = this.openableCandidates(candidates, avoided)
+    if (sessionVm) {
+      const own = candidates.find(
+        (candidate) => candidate.vmId === sessionVm && !avoided(candidate) && !candidate.draining,
+      )
+      if (own) {
+        const home = openable.find((candidate) => candidate.vmId === sessionVm)
+        const granted = home && this.claimSeat(seatKey, home, 'sticky', deviceKey)
+        if (granted) return granted
+        // Full or briefly busy: wait on it (sticky wait) rather than move now.
+        if (waitForSession && (!own.busy || stickyShouldWait(own.waitReason, own.cooldownReason))) return null
+      }
+    }
+    const ranked = this.planner.rank(openable)
     for (const priority of new Set(ranked.map((candidate) => candidate.priority))) {
       const tier = ranked.filter((candidate) => candidate.priority === priority)
       const homeFull = candidates.some(
@@ -1202,6 +1341,19 @@ export class PoolScheduler extends EventEmitter {
     return { cleared: false, vmId: bound.vmId, match }
   }
 
+  /** VMs this request's conversation already sits on: its held seat and its session pins. */
+  continuingVmIds({ seatKey = null, stickyKey = null, stickyKeys = null } = {}) {
+    const ids = new Set()
+    const held = seatKey ? this.planner?.seatOf?.(seatKey) : null
+    if (held?.vmId) ids.add(held.vmId)
+    for (const key of [stickyKey, ...(Array.isArray(stickyKeys) ? stickyKeys : [])]) {
+      if (!key) continue
+      const bound = this.stickyRouter?.resolve?.(key)
+      if (bound?.vmId) ids.add(bound.vmId)
+    }
+    return ids
+  }
+
   async eligibleCandidates({
     model = null,
     excluded = new Set(),
@@ -1211,9 +1363,11 @@ export class PoolScheduler extends EventEmitter {
     keyScope = null,
     quotaRequest = null,
     onlyVmIds = null,
+    continuingVmIds = null,
   } = {}) {
     const now = Date.now()
     const summaries = listVms(this.projectRoot)
+    const guardConfig = quotaGuardConfigOf(this.accountQuota?.config)
     const candidates = Object.assign([], {
       cooldowns: { rate_limited: /** @type {number|null} */ (null), overloaded: /** @type {number|null} */ (null) },
       rejections: { quota_guard_request_too_large: 0 },
@@ -1242,6 +1396,23 @@ export class PoolScheduler extends EventEmitter {
       const snapshot = snapshots.get(accountId)
       const state = snapshot?.state || null
       const account = snapshot?.account || null
+      if (!pin) {
+        // 额度耗尽保护: past the stop line nothing runs here until reset; in the
+        // new-session band only a conversation already pinned here continues.
+        // Without session context (continuingVmIds null) only the stop applies.
+        const guard = quotaGuardLevel(account?.unified, guardConfig, now)
+        if (guard.level === 'stop') {
+          const until = Number(guard.usage?.until) || 0
+          if (until > now) {
+            const prev = candidates.cooldowns.rate_limited
+            candidates.cooldowns.rate_limited = prev == null ? until : Math.min(prev, until)
+          }
+          continue
+        }
+        if (guard.level === 'continuing' && continuingVmIds && !continuingVmIds.has(vm.id)) continue
+      }
+      // Admission re-reads the guard; it needs to know whether this request continues here.
+      const quotaContinuing = continuingVmIds ? continuingVmIds.has(vm.id) : null
       const eligibility = await this.checkEligibility({
         vm,
         accountId,
@@ -1299,6 +1470,7 @@ export class PoolScheduler extends EventEmitter {
         waitReason: eligibility.waitReason || null,
         cooldownReason: state?.cooldown_reason || null,
         quotaRequest,
+        quotaContinuing,
         signal,
         ownerScope,
         keyScope,
@@ -1905,6 +2077,13 @@ export class PoolScheduler extends EventEmitter {
     if (!pinned) {
       if (hardBlockOf(state, now)) return null
       if (account && account.status !== 'active') return null
+      // 额度耗尽保护 again at admission: a queued request holds the candidate it
+      // saw before waiting, and a usage update may have crossed a line since.
+      if (account) {
+        const guard = quotaGuardLevel(account.unified, quotaGuardConfigOf(this.accountQuota?.config), now)
+        if (guard.level === 'stop') return null
+        if (guard.level === 'continuing' && candidate.quotaContinuing === false) return null
+      }
       if (account) {
         const availability = evaluateAccount({
           vm,

@@ -853,6 +853,29 @@ test('new seats exhaust the highest priority tier before using a lower affinity 
   for (const hold of [first, next, fallback]) hold.release()
 })
 
+test('session_affinity_first does not hold a turn on its draining own VM', async (t) => {
+  const { pool, quota } = gatedSetup(t, [
+    { id: 'vm-01', policy: { priority: 10, sessionSlots: 1 } },
+    { id: 'vm-02', policy: { priority: 1, sessionSlots: 1 } },
+  ])
+  pool.config.session_affinity_first = true
+  pool.stickyRouter = { resolve: (key) => (key === 'conv-drain' ? { vmId: 'vm-02', accountId: 'account-2' } : null) }
+  const high = await seat(pool, 'high')
+  const low = await seat(pool, 'low')
+  assert.equal(high.vmId, 'vm-01')
+  assert.equal(low.vmId, 'vm-02')
+  setUtil5h(quota, 'account-2', 0.78)
+  const queued = seat(pool, 'drain', { stickyKey: 'conv-drain' })
+  await waitFor(() => pool.planner.globalQueue.length + (pool.planner.vmQueues.get('vm-02') || []).length === 1)
+  assert.equal(pool.planner.globalQueue.length, 1, 'no session-home wait on a draining VM')
+  high.release()
+  const got = await queued
+  assert.equal(got.ok, true)
+  assert.equal(got.vmId, 'vm-01')
+  got.release()
+  low.release()
+})
+
 test('a global waiter places its new seat by priority, not by the VM pumped first', async (t) => {
   const pool = setup(t, [
     { id: 'vm-01', policy: { priority: 1, sessionSlots: 1 } },

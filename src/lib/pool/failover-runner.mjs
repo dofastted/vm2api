@@ -404,6 +404,27 @@ function incompleteHopResult(result, policy, extras = {}) {
   }
 }
 
+/**
+ * The kernel keeps the provider's real HTTP headers (retry-after, request-id,
+ * rate-limit) in providerResult.response_headers and may return the hop with
+ * none of its own. Classification reads result.headers, so a 429 that said
+ * "retry-after: 7547" read as a bare 429 and only stepped aside for 60s.
+ * Fill in what the hop itself did not carry; the hop's own headers win.
+ */
+export function adoptProviderResponseHeaders(result) {
+  if (!result || result.ok) return result
+  const provider = result.providerResult?.response_headers
+  if (!provider || typeof provider !== 'object') return result
+  const own = result.headers && typeof result.headers === 'object' ? result.headers : {}
+  const ownKeys = new Set(Object.keys(own).map((key) => key.toLowerCase()))
+  const merged = { ...own }
+  for (const [key, value] of Object.entries(provider)) {
+    if (!ownKeys.has(String(key).toLowerCase())) merged[key] = value
+  }
+  result.headers = merged
+  return result
+}
+
 /** Selection found no seat. Busy until the wait ran out is capacity; nothing eligible is not. */
 function selectionFailure(selected, { excluded, lastPolicy, lastResult, hops }) {
   const reason = selected?.reason || 'no_eligible_accounts'
@@ -665,6 +686,10 @@ export class FailoverRunner {
     const excluded = budget.excluded
     // Accounts left only because the kernel had no free slot; their pins stay.
     const spilled = budget.spilled
+    // session_affinity_first: a turn that spilled to another unit wrote the
+    // whole prompt cache there, so the conversation follows it instead of
+    // returning to the home it spilled from (and rewriting the cache again).
+    const followCache = this.scheduler?.config?.session_affinity_first === true
     const bindKeys = uniqueStickyKeys(stickyKey, stickyKeys)
     const pinKeys = familyKey ? [...bindKeys, familyKey] : bindKeys
     // Pins as this request last saw them. A pin moved by someone else since
@@ -710,7 +735,8 @@ export class FailoverRunner {
             !!prev?.accountId &&
             prev.accountId !== account.accountId &&
             opts?.borrowed !== true &&
-            (prev.accountId === outboundSessionAccountId || (!!lastSelected?.seatKey && !spilled.has(prev.accountId)))
+            (prev.accountId === outboundSessionAccountId ||
+              (!!lastSelected?.seatKey && (followCache || !spilled.has(prev.accountId))))
           if (prev?.accountId && prev.accountId !== account.accountId && !ownMove) continue
           let guard = opts
           if (prev) guard = { ...opts, ifGeneration: prev.generation || 0 }
@@ -891,7 +917,7 @@ export class FailoverRunner {
         if (selected.seatMoved) seatMovedTo = selected.vmId
         bindAll(
           { accountId: selected.accountId, vmId: selected.vmId, slotIndex: pinnedSlot },
-          { countHit: false, borrowed: lastPolicy?.reason === 'slot_busy' },
+          { countHit: false, borrowed: lastPolicy?.reason === 'slot_busy' && !followCache },
         )
         const started = Date.now()
         this.attemptsRepo?.begin?.({
@@ -964,6 +990,7 @@ export class FailoverRunner {
         })
         noteHop(result)
         if (result) result.committed = result.committed || committed
+        adoptProviderResponseHeaders(result)
         if (signal?.aborted || isClientCancelledResult(result)) {
           this.attemptsRepo?.complete?.(requestId, attemptNo, {
             upstreamStatus: result?.status ?? null,
@@ -1017,7 +1044,7 @@ export class FailoverRunner {
             { accountId: selected.accountId, vmId: selected.vmId, sessionId: outboundSessionId },
             {
               countHit: false,
-              borrowed: policy?.reason === 'slot_busy',
+              borrowed: policy?.reason === 'slot_busy' && !followCache,
               // Prebinding moved the VM already; replace the previous VM's session.
               replaceSession: !!attemptStickyBound?.vmId && attemptStickyBound.vmId !== selected.vmId,
             },
