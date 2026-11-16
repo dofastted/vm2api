@@ -53,7 +53,7 @@ function elf(revision = '') {
   data.write(revision, 96)
   return data
 }
-function transport(files, { tag = 'v1.2.3', size, redirect } = {}) {
+function transport(files, { tag = 'v1.2.3', size, redirect, digest } = {}) {
   const seen = []
   const entries = Object.entries(files)
   const fetchImpl = async (url, options) => {
@@ -64,6 +64,7 @@ function transport(files, { tag = 'v1.2.3', size, redirect } = {}) {
       const assets = entries.map(([name, body], index) => ({
         name,
         size: size ?? body.length,
+        ...(digest && { digest }),
         url: `https://api.github.com/repos/dofastted/vm2api/releases/assets/${index + 1}`,
       }))
       return Response.json(
@@ -288,6 +289,32 @@ test('native pull can restore a missing factory only with the shipped issuer pin
   assert.equal((await pull(attacker)).code, 'crag_v2_authority_mismatch')
   fs.appendFileSync(path.join(supplier, 'unpack-note.md'), 'tampered')
   assert.equal((await pull(supplier)).code, 'crag_v2_hash_mismatch')
+  assert.equal(cragV2PackageRoot(root), selected)
+})
+
+test('a future CRAG download cannot switch the standard payload key under the same issuer', {
+  skip: cragV2Arch() !== 'amd64',
+}, async (t) => {
+  const root = fixture(t)
+  const factory = seedEncryptedPackage(root)
+  const manifest = JSON.parse(fs.readFileSync(path.join(factory, 'manifest.json'), 'utf8'))
+  const bytes = archive(factory)
+  fs.mkdirSync(path.join(root, 'deploy'))
+  const identity = {
+    family: manifest.family,
+    product: manifest.authorization.product,
+    issuer_public_key_id: manifest.authorization.public_key_id,
+    payload_key_id: manifest.payload.key_id,
+  }
+  fs.writeFileSync(path.join(root, 'deploy/payload.json'), JSON.stringify({ crag_authorization: identity }))
+  const pull = (archiveBytes, digest = `sha256:${createHash('sha256').update(archiveBytes).digest('hex')}`) =>
+    pullKernelRelease(root, { kernel: 'crag' }, transport({ [CRAG_V2_RELEASE_ASSET]: archiveBytes }, { digest }))
+  assert.equal((await pull(bytes, null)).code, 'crag_v2_digest_missing')
+  assert.equal((await pull(bytes, `sha256:${'0'.repeat(64)}`)).code, 'crag_v2_digest_mismatch')
+  assert.equal((await pull(bytes)).ok, true)
+  const selected = cragV2PackageRoot(root)
+  const other = seedEncryptedPackage(root, { payloadKey: Buffer.alloc(32, 1) })
+  assert.equal((await pull(archive(other))).code, 'crag_v2_identity_mismatch')
   assert.equal(cragV2PackageRoot(root), selected)
 })
 

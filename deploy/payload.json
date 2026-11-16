@@ -2,6 +2,12 @@
   "repo": "dofastted/vm2api",
   "release": "payload-2026.11.17-crag-3.1.3",
   "crag_release": "payload-2026.11.17-crag-3.1.3",
+  "crag_authorization": {
+    "family": "crag",
+    "product": "crag-v2",
+    "issuer_public_key_id": "9dbb4bc2109f1637e64174d80d659168910843b34dbe4870f70a14af49ccb902",
+    "payload_key_id": "835451e266145220a2e75b1f39ff22a0d7b17be48395553a24666b1946e0333a"
+  },
   "files": [
     {
       "path": "bin/kin-kernel",
