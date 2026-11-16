@@ -55,6 +55,7 @@ import { checkCragLicense } from '../vm/crag-license.mjs'
 import { publishKvmCragLicense } from '../vm/kvm-crag-license.mjs'
 import { kernelCpuCommand, kernelCpuCommandMatches, usesKernelCpuLimit } from '../vm/kernel-cpu.mjs'
 import { kvmCragAppArmorCommand } from '../vm/kvm-crag-apparmor.mjs'
+import { clearKvmCragSubscription } from '../vm/kvm-crag-subscription.mjs'
 import { workerPaths } from './go-worker-client.mjs'
 import { effectiveSlotCount } from '../vm/slot-capacity.mjs'
 
@@ -260,10 +261,10 @@ export function stopRustKernel(exec = {}) {
   return { ok: result.status === 0, code: result.status }
 }
 
-function runDocker(args, { timeoutMs = 5000, env } = {}) {
+function runDocker(args, { timeoutMs = 5000, env, input } = {}) {
   return new Promise((resolve) => {
     const child = spawn(process.env.KIN_DOCKER_BIN || 'docker', args, {
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
       ...(env ? { env } : {}),
     })
     const stdout = []
@@ -274,6 +275,8 @@ function runDocker(args, { timeoutMs = 5000, env } = {}) {
     }
     child.stdout?.on?.('data', (value) => keep(stdout, value))
     child.stderr?.on?.('data', (value) => keep(stderr, value))
+    child.stdin?.on?.('error', () => {})
+    if (input !== undefined) child.stdin?.end(input)
     let settled = false
     const finish = (result) => {
       if (settled) return
@@ -723,6 +726,23 @@ async function startKvmGuestKernel(
   },
 ) {
   const budget = kvmBootBudget(exec.vm, timeoutMs)
+  if (crag) {
+    const deadline = Date.now() + budget
+    while (startCurrent(control)) {
+      try {
+        if (!(await publishKvmCragLicense(projectRootFromExec(exec), exec.vm, { force: true, runDockerExec }))) {
+          return { ok: false, reason: 'crag_guest_license_sync_failed', error: 'CRAG guest is not running' }
+        }
+        break
+      } catch (error) {
+        if (!error.retryable || Date.now() >= deadline) {
+          return { ok: false, reason: error.code || 'crag_guest_license_sync_failed', error: error.message }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 250))
+      }
+    }
+    if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
+  }
   if (!force && !crag) {
     const waited = await waitForHealth(exec, budget, allowMissingCredential)
     if (waited?.ok && !prepareGuestAppArmor) {
@@ -751,13 +771,12 @@ async function startKvmGuestKernel(
       error: String(prepared?.error || prepared?.stderr || 'Guest AppArmor preparation failed'),
     }
   }
-  if (crag) {
+  if (!exec.vm.node_id && !crag) {
     try {
-      await publishKvmCragLicense(projectRootFromExec(exec), exec.vm, { force: true })
-    } catch {
-      return { ok: false, reason: 'crag_guest_license_sync_failed', error: 'CRAG guest license projection failed' }
+      await clearKvmCragSubscription(projectRootFromExec(exec), exec.vm, { runDockerExec })
+    } catch (error) {
+      return { ok: false, reason: error.code || 'crag_subscription_projection_failed', error: error.message }
     }
-    if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
   }
   const retired = await retireLegacyTelemetryBeforeStart(exec, runDockerExec)
   if (!retired.ok) return retired

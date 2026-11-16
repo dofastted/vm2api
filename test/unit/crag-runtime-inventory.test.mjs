@@ -248,6 +248,78 @@ test('a permit installed during probing contributes to the host upper bound', as
   assert.equal(result.vms[second.id].state, 'unknown')
 })
 
+test('local KVM subscriptions share the host limit and missing guest evidence stays uncertain', async (t) => {
+  const f = fixture(t)
+  seedEncryptedPackage(f.root)
+  f.entitlement(2)
+  const docker = f.add('vm-11')
+  const kvm = f.add('vm-12', { runtime: { type: 'kvm' } })
+  kvm.fingerprint = { guest_machine_id: fs.readFileSync(path.join(f.root, 'vms', kvm.id, 'machine-id'), 'utf8').trim() }
+  f.bind(docker, 1)
+  const roster = [f.bind(kvm, 2)]
+  const relay = http.createServer(() => assert.fail('fixture should use injected health'))
+  relay.listen(f.run(kvm, 'kernel.sock'))
+  await once(relay, 'listening')
+  t.after(() => relay.close())
+  let reply = live
+  const inv = f.inventory({
+    health: async ({ vm }, options) => {
+      assert.equal(options.requireInternalToken, true)
+      if (vm.id === kvm.id) {
+        assert.equal(vm.runtime.kernel_socket, f.run(kvm, 'kernel.sock'))
+        return reply
+      }
+      return live
+    },
+  })
+  const over = await inv.snapshot({ ...f.entitlement(1, { revision: 2 }), hostOnly: true })
+  assert.equal(over.host_running_vms, 2)
+  assert.equal(over.host_over_limit, true)
+  assert.equal(over.host_runtime_available, 0)
+  assert.equal(over.vms[kvm.id].scope, 'host')
+  assert.equal(over.vms[kvm.id].ready, false)
+
+  reply = { status: 0, code: 'ECONNREFUSED' }
+  f.advance()
+  const uncertain = await inv.snapshot({ ...f.entitlement(2, { revision: 3 }), hostOnly: true })
+  assert.equal(uncertain.host_running_vms, 1)
+  assert.equal(uncertain.host_unknown_vms, 1)
+  assert.equal(uncertain.host_runtime_available, null)
+  assert.equal(uncertain.vms[kvm.id].state, 'unknown')
+
+  reply = live
+  f.advance()
+  const revoked = await inv.snapshot({ ...f.entitlement(2, { revision: 4, roster: [] }), hostOnly: true })
+  assert.equal(revoked.vms[kvm.id].state, 'running')
+  assert.equal(revoked.vms[kvm.id].ready, false)
+  const restored = await inv.snapshot({ ...f.entitlement(2, { revision: 5, roster }), hostOnly: true })
+  assert.equal(restored.vms[kvm.id].ready, true)
+  assert.equal(restored.vms[docker.id].ready, false)
+})
+
+test('a local KVM permit arriving during a probe is counted without inventing guest readiness', async (t) => {
+  const f = fixture(t)
+  seedEncryptedPackage(f.root)
+  const rights = f.entitlement(2)
+  const first = f.add('vm-11')
+  const kvm = f.add('vm-12', { runtime_type: 'kvm' })
+  kvm.fingerprint = { guest_machine_id: fs.readFileSync(path.join(f.root, 'vms', kvm.id, 'machine-id'), 'utf8').trim() }
+  f.bind(first, 1)
+  const inv = f.inventory({
+    health: async ({ vm }) => {
+      assert.equal(vm.id, first.id)
+      f.bind(kvm, 2)
+      return live
+    },
+  })
+  const result = await inv.snapshot({ ...rights, hostOnly: true })
+  assert.equal(result.host_running_vms, 1)
+  assert.equal(result.host_unknown_vms, 1)
+  assert.equal(result.host_runtime_available, null)
+  assert.equal(result.vms[kvm.id].scope, 'host')
+  assert.equal(result.vms[kvm.id].ready, false)
+})
+
 test('strict current-hop evidence supersedes an older negative without polluting the normal cache', async (t) => {
   const f = fixture(t)
   seedEncryptedPackage(f.root)

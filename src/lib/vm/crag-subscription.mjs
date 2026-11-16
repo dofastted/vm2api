@@ -18,6 +18,7 @@ import { resolveKernelDataplane } from './slot-engine.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { publishKvmCragLicense } from './kvm-crag-license.mjs'
 import { publishClusterSubscription } from '../cluster/crag-subscription-files.mjs'
+import { blockKvmCragSubscription, holdKvmCragSubscriptionPublications } from './kvm-crag-subscription.mjs'
 
 const AUTHORITY = 'https://crag.fkcodex.com'
 const localFilesystems = new Set([0xef53, 0x794c7630, 0x58465342, 0x9123683e, 0x2fc12fc1, 0xf2f52010])
@@ -245,6 +246,7 @@ export function createCragSubscription({
   runtimeInventory,
   publishClusterBinding = publishClusterSubscription,
   publishKvmBinding = publishKvmCragLicense,
+  blockKvmBinding = blockKvmCragSubscription,
   fetchImpl = globalThis.fetch,
   origin = AUTHORITY,
   machineIdFile,
@@ -431,7 +433,28 @@ export function createCragSubscription({
         return null
       }
       let rights = readLocalRights()
-      if (vm.node_id || isKvmRuntime(vm)) {
+      if (!vm.node_id && isKvmRuntime(vm)) {
+        if (busy || rights.pending || !rights.claims) return usageUnverified()
+        const { license } = getCragLicense(projectRoot, vm)
+        if (!license.valid) {
+          try {
+            await blockKvmBinding(projectRoot, vm)
+          } catch {
+            // A delivery failure does not change the verified reason this request is denied.
+          }
+          return cragLicenseDeniedResult({ code: license.code, error: license.message })
+        }
+        try {
+          if ((await publishKvmBinding(projectRoot, vm)) !== true) return usageUnverified()
+        } catch {
+          return cragLicenseDeniedResult({
+            code: 'license_crag_kvm_sync_failed',
+            error: 'KVM 槽授权未同步，请检查 guest 状态后重试。',
+          })
+        }
+        if (busy || !unchangedRights(rights, readLocalRights())) return usageUnverified()
+      }
+      if (vm.node_id) {
         if (rights.pending || !rights.claims) return usageUnverified()
         if (vm.status === 'running' && getCragLicense(projectRoot, vm).license.valid) {
           try {
@@ -616,14 +639,69 @@ export function createCragSubscription({
     return confirmed
   }
 
-  async function exclusive(work) {
+  async function kvmBindings() {
+    if (process.platform !== 'linux') return []
+    const hostId = load(hostFile, 0o644, 65)?.trim()
+    if (!hostId) return []
+    const targets = await listTargets()
+    if (!Array.isArray(targets)) throw fail('crag_subscription_target_unready', 409)
+    return targets.filter((vm) => {
+      if (vm.node_id || !isKvmRuntime(vm)) return false
+      try {
+        return !!readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId)
+      } catch {
+        // A damaged permit must not leave a previously published guest grant usable.
+        return true
+      }
+    })
+  }
+
+  async function blockKvmBindings() {
+    for (const vm of await kvmBindings()) await blockKvmBinding(projectRoot, vm)
+  }
+
+  async function restoreKvmBindings() {
+    const targets = await kvmBindings()
+    if (!targets.length) return
+    const rights = readLocalRights()
+    let failed = false
+    for (const vm of targets) {
+      try {
+        const { license } = getCragLicense(projectRoot, vm)
+        if (!rights.pending && license.valid && license.scope === 'host') {
+          await publishKvmBinding(projectRoot, vm)
+        } else {
+          // Revocation, expiry and an install awaiting a new payload keep the guest blocked.
+          await blockKvmBinding(projectRoot, vm)
+        }
+      } catch {
+        failed = true
+      }
+    }
+    if (failed) throw fail('license_crag_kvm_sync_failed', 503)
+  }
+
+  async function exclusive(work, { blockBefore = true } = {}) {
     if (busy) throw fail('crag_subscription_busy', 409)
     busy = true
+    const release = holdKvmCragSubscriptionPublications(projectRoot)
+    let result, failure
     try {
-      return await work()
+      if (blockBefore) await blockKvmBindings()
+      result = await work()
+    } catch (error) {
+      failure = error
     } finally {
+      release()
+      try {
+        await restoreKvmBindings()
+      } catch (error) {
+        failure ??= error
+      }
       busy = false
     }
+    if (failure) throw failure
+    return result
   }
 
   function readRosterIntent() {
@@ -925,17 +1003,21 @@ export function createCragSubscription({
       return proof
     },
     upgrade() {
-      return exclusive(async () => {
-        const hostId = identity()
-        storage()
-        checkNoIntent()
-        const previous = current(hostId)
-        if (!previous || !(await ready({ reclaim: true }))) throw fail('crag_subscription_target_unready', 409)
-        if (previous.claims.version === 2) return status()
-        const intent = { host_id: hostId, action: 'upgrade' }
-        beginRosterIntent(intent)
-        return status(await syncRoster(hostId, intent, previous))
-      })
+      return exclusive(
+        async () => {
+          const hostId = identity()
+          storage()
+          checkNoIntent()
+          const previous = current(hostId)
+          if (!previous || !(await ready({ reclaim: true }))) throw fail('crag_subscription_target_unready', 409)
+          if (previous.claims.version === 2) return status()
+          await blockKvmBindings()
+          const intent = { host_id: hostId, action: 'upgrade' }
+          beginRosterIntent(intent)
+          return status(await syncRoster(hostId, intent, previous))
+        },
+        { blockBefore: false },
+      )
     },
     async teardown(vm, destroy) {
       if (process.platform !== 'linux') return destroy(false)
@@ -952,31 +1034,35 @@ export function createCragSubscription({
       const permit = readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId)
       const priorIntent = readRosterIntent()
       if (!permit && priorIntent?.vm_id !== vm.id) return destroy(false)
-      return exclusive(async () => {
-        const saved = readRosterIntent()
-        if (
-          saved &&
-          (saved.action !== 'release' || saved.vm_id !== vm.id || (permit && saved.permit_sha256 !== permit))
-        )
-          throw fail('crag_subscription_sync_pending', 409)
-        if (!saved) checkNoIntent()
-        const now = current(hostId)
-        const intent = saved ?? {
-          host_id: hostId,
-          action: 'release',
-          vm_id: vm.id,
-          permit_sha256: permit,
-          proven: false,
-        }
-        if (!saved) beginRosterIntent(intent)
-        const result = await destroy(true)
-        if (!result.ok) return result
-        if (result.teardownConfirmed !== true) throw fail('crag_subscription_teardown_unconfirmed', 409)
-        intent.proven = true
-        publish(rosterIntentFile, JSON.stringify(intent), 0o600)
-        await syncRoster(hostId, intent, now)
-        return result
-      })
+      return exclusive(
+        async () => {
+          const saved = readRosterIntent()
+          if (
+            saved &&
+            (saved.action !== 'release' || saved.vm_id !== vm.id || (permit && saved.permit_sha256 !== permit))
+          )
+            throw fail('crag_subscription_sync_pending', 409)
+          if (!saved) checkNoIntent()
+          const now = current(hostId)
+          const intent = saved ?? {
+            host_id: hostId,
+            action: 'release',
+            vm_id: vm.id,
+            permit_sha256: permit,
+            proven: false,
+          }
+          if (!saved) beginRosterIntent(intent)
+          const result = await destroy(true)
+          if (!result.ok) return result
+          if (result.teardownConfirmed !== true) throw fail('crag_subscription_teardown_unconfirmed', 409)
+          intent.proven = true
+          publish(rosterIntentFile, JSON.stringify(intent), 0o600)
+          await blockKvmBindings()
+          await syncRoster(hostId, intent, now)
+          return result
+        },
+        { blockBefore: false },
+      )
     },
     recover() {
       return exclusive(async () => {

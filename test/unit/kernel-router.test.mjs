@@ -48,8 +48,20 @@ import { closeDatabase, openDatabase } from '../../src/lib/db/database.mjs'
 import { socksUidFor } from '../../src/lib/vm/vm-runtime.mjs'
 import { REMOTE_CRAG_ENTRY } from '../../src/lib/vm/slot-engine.mjs'
 import { kvmCragAppArmorCommand } from '../../src/lib/vm/kvm-crag-apparmor.mjs'
-import { activateFixture, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
+import {
+  activateFixture,
+  issueHostEntitlement,
+  issueSlotPermit,
+  issueUniversalCode,
+  seedEncryptedPackage,
+} from '../fixtures/crag-license.mjs'
 import { configureSlotCapacity } from '../../src/lib/vm/slot-capacity.mjs'
+import {
+  activateCragLicense,
+  activateCragSubscriptionBinding,
+  prepareCragSubscriptionBinding,
+} from '../../src/lib/vm/crag-license.mjs'
+import { cragSubscriptionPublicDirectory } from '../../src/lib/vm/crag-subscription-paths.mjs'
 
 // These tests cover other behaviour on the legacy fixed 20 native slots;
 // plan-based capacity has its own tests (slot-capacity*.test.mjs).
@@ -1887,6 +1899,7 @@ for (const [preparation, mode] of [
     let prepareAttempts = 0
     const runDockerExec = async (args) => {
       calls.push(args)
+      if (args[0] === 'container' && args[1] === 'inspect') return { ok: true, stdout: 'true' }
       if (args.includes(prepareCommand[2])) {
         prepareAttempts += 1
         if (preparation === 'failed') return { ok: false, error: 'fixture apparmor_parser refused the policy' }
@@ -1948,6 +1961,100 @@ for (const [preparation, mode] of [
   })
 }
 
+for (const [mode, projectionOk, scope = 'subscription'] of [
+  ['restart', true],
+  ['cold-boot', true],
+  ['cold-boot-wait', true],
+  ['restart', false],
+  ['cold-boot-wait', true, 'universal'],
+  ['restart', false, 'universal'],
+]) {
+  linuxTest(`KVM ${scope} projection precedes guest launch: ${mode}/${projectionOk}`, async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kvm-subscription-launch-'))
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    const vm = {
+      id: 'vm-host-launch',
+      dataplane: 'crag',
+      crag_kernel_version: 'v2',
+      fingerprint: { guest_machine_id: 'a'.repeat(32) },
+      runtime: { type: 'kvm', container: 'kin-host-launch' },
+    }
+    seedEncryptedPackage(root)
+    fs.mkdirSync(path.join(root, 'vms', vm.id), { recursive: true })
+    if (scope === 'universal') {
+      delete vm.fingerprint
+      activateCragLicense(root, vm, issueUniversalCode(root).code)
+    } else {
+      fs.writeFileSync(path.join(root, 'vms', vm.id, 'machine-id'), `${vm.fingerprint.guest_machine_id}\n`)
+      const publicDir = cragSubscriptionPublicDirectory(root)
+      fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
+      const hostId = 'b'.repeat(64)
+      const entitlement = issueHostEntitlement(root, hostId)
+      fs.writeFileSync(path.join(publicDir, 'host_id'), hostId, { mode: 0o644 })
+      fs.writeFileSync(path.join(publicDir, 'entitlement.code'), entitlement.code, { mode: 0o644 })
+      const machine = prepareCragSubscriptionBinding(root, vm)
+      activateCragSubscriptionBinding(root, vm, issueSlotPermit(root, machine, hostId).code)
+    }
+    const action = scope === 'universal' ? 'publish-universal' : 'publish'
+    const written = writeKernelConfig(root, vm, { token: 'tok', proxyUrl: '', proxyRequired: false })
+    const exec = {
+      projectRoot: root,
+      vmId: vm.id,
+      homeDir: path.join(root, 'vms', vm.id, 'cli-home'),
+      vm: { ...vm, runtime: { ...vm.runtime, kernel_socket: written.socketPath } },
+    }
+    let projected = mode === 'restart'
+    const server = http.createServer((_req, res) => {
+      res.writeHead(projected ? 200 : 503, { 'content-type': 'application/json' })
+      res.end(
+        JSON.stringify({ ok: projected, engine: 'rust', ready_slots: projected ? 1 : 0, worker_version: 'fixture' }),
+      )
+    })
+    await new Promise((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(written.socketPath, resolve)
+    })
+    t.after(() => new Promise((resolve) => server.close(resolve)))
+    const calls = []
+    let publicationAttempts = 0
+    const runDockerExec = async (args, options = {}) => {
+      if (args[0] === 'container') return { ok: true, stdout: 'true' }
+      if (options.input) {
+        const request = JSON.parse(options.input)
+        calls.push(request.action)
+        assert.equal(args.includes(request.files?.device), false, 'private identity is sent through stdin only')
+        if (request.action === action) {
+          assert.equal(request.wait_for_setup, true)
+          publicationAttempts += 1
+          if (mode === 'cold-boot-wait' && publicationAttempts === 1) {
+            return { ok: false, code: 75, error: 'guest command failed', stderr: 'CRAG guest setup is not ready' }
+          }
+          projected = projectionOk
+          return { ok: projectionOk, error: projectionOk ? '' : 'fixture projection denied' }
+        }
+        return { ok: true }
+      }
+      if (args.includes('systemctl')) calls.push('restart')
+      if (args.some((arg) => String(arg).includes('kill -KILL'))) calls.push('kill')
+      return { ok: true }
+    }
+    const result =
+      mode === 'restart'
+        ? await restartRustKernel(exec, { timeoutMs: 2000, runDockerExec })
+        : await ensureRustKernel(exec, { timeoutMs: 2000, runDockerExec, prepareGuestAppArmor: true })
+    assert.equal(result.ok, projectionOk, JSON.stringify(result))
+    assert.equal(calls[0], action)
+    if (projectionOk) {
+      assert.equal(publicationAttempts, mode === 'cold-boot-wait' ? 2 : 1)
+      assert.ok(calls.indexOf(action) < calls.indexOf('kill'))
+      assert.ok(calls.indexOf('kill') < calls.indexOf('restart'))
+    } else {
+      assert.equal(result.reason, 'crag_subscription_projection_failed')
+      assert.deepEqual(calls, [action, 'block'])
+    }
+  })
+}
+
 for (const firstPrepares of [false, true]) {
   unixTest(
     `KVM AppArmor preparation coalesces behind a pending ${firstPrepares ? 'preparing' : 'ordinary'} ensure`,
@@ -1986,6 +2093,7 @@ for (const firstPrepares of [false, true]) {
           observeFirst()
           await firstReleased
         }
+        if (args[0] === 'container' && args[1] === 'inspect') return { ok: true, stdout: 'true' }
         return { ok: true }
       }
       try {

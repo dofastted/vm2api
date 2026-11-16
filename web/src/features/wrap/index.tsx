@@ -62,6 +62,7 @@ const LICENSE_LABELS: Record<CragLicenseStatus['status'], string> = {
 function supportsSubscription(vm?: Vm) {
   return (
     !!vm &&
+    !isCodexVm(vm) &&
     !['darwin', 'macos'].includes(vm.node_platform || '') &&
     ['docker', 'kvm', 'qemu', 'libvirt'].includes(
       String(vm.runtime?.type || vm.runtime_type || 'docker')

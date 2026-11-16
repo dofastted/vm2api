@@ -15,12 +15,21 @@ import { getVm, patchVmRecord, summarizeVm } from '../../src/lib/vm/vm-registry.
 import { withVmLock } from '../../src/lib/vm/vm-file.mjs'
 import { initializeSlotSeedFiles } from '../../src/lib/vm/slot-seed.mjs'
 import { slotHost } from '../../src/lib/vm/slot-host.mjs'
-import { activateCragLicense, cragLicenseDirectory } from '../../src/lib/vm/crag-license.mjs'
+import {
+  activateCragLicense,
+  activateCragSubscriptionBinding,
+  cragLicenseDirectory,
+  getCragLicense,
+  prepareCragSubscriptionBinding,
+} from '../../src/lib/vm/crag-license.mjs'
+import { cragSubscriptionPublicDirectory } from '../../src/lib/vm/crag-subscription-paths.mjs'
 import { cragV2PackageRoot } from '../../src/lib/vm/wrap-cli-runtime.mjs'
 import { writeKernelConfig } from '../../src/lib/transport/rust-kernel-supervisor.mjs'
 import {
   activateFixture,
   issueFixtureCode,
+  issueHostEntitlement,
+  issueSlotPermit,
   issueUniversalCode,
   seedEncryptedPackage,
 } from '../fixtures/crag-license.mjs'
@@ -575,6 +584,81 @@ test('a confirmed CRAG reinstall obtains and rechecks a subscription permit befo
   assert.equal(result.ok, true, JSON.stringify(result))
   assert.deepEqual(events, ['verify', 'bind', 'verify', 'stop'])
 })
+
+for (const node_id of [undefined, 'remote-kvm']) {
+  test(`a confirmed ${node_id ? 'remote' : 'local'} KVM reinstall verifies a signed host permit before stopping`, async (t) => {
+    const machineId = randomBytes(16).toString('hex')
+    const { root, vm, run } = fixture(t, {
+      ...(node_id && { node_id }),
+      runtime: { type: 'kvm' },
+      fingerprint: { hostname: 'existing-computer', guest_machine_id: machineId },
+    })
+    fs.writeFileSync(path.join(root, 'vms', vm.id, 'machine-id'), `${machineId}\n`)
+    const publicDir = cragSubscriptionPublicDirectory(root)
+    fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
+    const hostId = randomBytes(32).toString('hex')
+    const entitlement = issueHostEntitlement(root, hostId)
+    fs.writeFileSync(path.join(publicDir, 'host_id'), `${hostId}\n`, { mode: 0o644 })
+    fs.writeFileSync(path.join(publicDir, 'entitlement.code'), `${entitlement.code}\n`, { mode: 0o644 })
+    const events = []
+    const life = lifecycle(root)
+    const result = await installKernelTargets({
+      projectRoot: root,
+      targets: [{ ...target()[0], expected_tag: 'v1.4.117', reissue: true }],
+      cragSubscription: {
+        authorizeInstall(candidate) {
+          events.push('bind')
+          const machineCode = prepareCragSubscriptionBinding(root, candidate)
+          const permit = issueSlotPermit(root, machineCode, hostId)
+          activateCragSubscriptionBinding(root, candidate, permit.code)
+        },
+      },
+      ops: {
+        ...life.ops,
+        ...(node_id && {
+          deployBakedKernel: () => ({ ok: true }),
+          writeKernelConfig: () => ({ configPath: path.join(run, 'kernel.json'), runDir: run }),
+        }),
+        describeKernelCatalog: () => [{ id: 'crag', ready: true, release_tag: 'v1.4.117' }],
+        stopSlot(candidate) {
+          const license = getCragLicense(root, candidate).license
+          assert.equal(license.valid, true)
+          assert.equal(license.scope, 'host')
+          events.push('stop')
+          return life.ops.stopSlot(candidate)
+        },
+      },
+    })
+    assert.equal(result.ok, true, JSON.stringify(result))
+    assert.deepEqual(events, ['bind', 'stop'])
+    const installed = getVm(root, vm.id)
+    assert.equal(installed.runtime.type, 'kvm')
+    assert.equal(getCragLicense(root, installed).license.scope, 'host')
+    assert.equal(fs.readFileSync(path.join(root, 'vms', vm.id, 'machine-id'), 'utf8'), `${machineId}\n`)
+  })
+}
+
+for (const [name, placement, reissue] of [
+  ['local KVM without explicit reissue', { runtime: { type: 'kvm' } }, false],
+  ['remote KVM without explicit reissue', { node_id: 'remote-node', runtime: { type: 'kvm' } }, false],
+]) {
+  test(`${name} cannot implicitly obtain a host permit during installation`, async (t) => {
+    const { root } = fixture(t, placement)
+    const result = await installKernelTargets({
+      projectRoot: root,
+      targets: [{ ...target()[0], ...(reissue && { expected_tag: 'v1.4.117', reissue: true }) }],
+      cragSubscription: { authorizeInstall: () => assert.fail('unexpected host permit request') },
+      ops: {
+        describeKernelCatalog: () => [{ id: 'crag', ready: true, release_tag: 'v1.4.117' }],
+        checkCragLicense: () => ({ ok: false, code: 'license_required' }),
+        stopSlot: () => assert.fail('unlicensed slot cannot be stopped'),
+      },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.items[0].code, 'license_required')
+    assert.equal(result.items[0].stopped, false)
+  })
+}
 
 for (const [patch, kernel, code] of [
   [{ platform: 'openai', family: 'codex', codex_kernel: true }, 'cli-node', 'kernel_codex_unsupported'],
