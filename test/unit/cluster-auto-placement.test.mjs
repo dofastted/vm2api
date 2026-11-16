@@ -5,6 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import {
   bookedByMachine,
+  bookedMiB,
   createPlacementLedger,
   normalizeAutoPlacement,
   pickPlacement,
@@ -56,11 +57,38 @@ test('requestedPlacement: node_id wins, body overrides config', () => {
   assert.equal(requestedPlacement({ placement: 'auto' }, off).mode, 'auto')
 })
 
-test('bookedByMachine: limit or reserve, whichever is larger, per machine', () => {
+const tier = (rlt) => ({ claude: { rate_limit_tier: rlt } })
+
+test('bookedByMachine: unknown plan books the reserve, or the limit when larger, per machine', () => {
   const policy = normalizeAutoPlacement({ slot_reserve_memory: '4g' })
   const booked = bookedByMachine([slot('2g'), slot('8g'), slot('1g', 'n1')], null, policy)
   assert.equal(booked.get('local'), 4096 + 8192)
   assert.equal(booked.get('n1'), 4096)
+})
+
+test('bookedMiB: a known plan books its target, not the reserve', () => {
+  const policy = normalizeAutoPlacement({ slot_reserve_memory: '4g' })
+  // Pro targets 2g, Max 5x 4g, Max 20x 8g; a recorded limit above the target still counts.
+  assert.equal(bookedMiB({ ...slot('2g'), ...tier('default_claude_ai') }, null, policy), 2048)
+  assert.equal(bookedMiB({ ...slot('512m'), ...tier('default_claude_max_5x') }, null, policy), 4096)
+  assert.equal(bookedMiB({ ...slot('4g'), ...tier('default_claude_max_20x') }, null, policy), 8192)
+  assert.equal(bookedMiB({ ...slot('8g'), ...tier('default_claude_ai') }, null, policy), 8192)
+})
+
+test('bookedMiB: unknown plan without a reserve books the largest plan target', () => {
+  const policy = normalizeAutoPlacement({})
+  assert.equal(bookedMiB(slot('512m'), null, policy), 8192)
+  // Plan ratios come from routing.slot_capacity: a smaller top plan books less.
+  const routing = { slot_capacity: { plans: { pro: 5, max_5x: 12, max_20x: 12, default: 5 } } }
+  assert.equal(bookedMiB(slot('512m'), routing, policy), 4096)
+})
+
+test('bookedMiB: Codex slots and capacity off keep limit-or-reserve', () => {
+  const policy = normalizeAutoPlacement({ slot_reserve_memory: '4g' })
+  assert.equal(bookedMiB({ ...slot('1g'), platform: 'openai' }, null, policy), 4096)
+  assert.equal(bookedMiB({ ...slot('1g'), platform: 'openai' }, null, normalizeAutoPlacement({})), 1024)
+  const off = { slot_capacity: { enabled: false } }
+  assert.equal(bookedMiB({ ...slot('2g'), ...tier('default_claude_max_20x') }, off, policy), 4096)
 })
 
 test('placementCandidates: skips nodes that cannot take a slot, honours allow/deny lists', () => {
