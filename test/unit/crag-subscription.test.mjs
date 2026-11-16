@@ -64,8 +64,8 @@ function postSubscription(subscription) {
     )
 }
 
-test('a cluster slot can bind without running and explicitly reissues an old package permit on the same seat', async (t) => {
-  const vm = { id: 'vm-52', node_id: 'node-a', dataplane: 'wrap', status: 'stopped' }
+test('a legacy cluster slot can bind while stopped and reissue an old package permit on the same seat', async (t) => {
+  const vm = { id: 'legacy_cluster-52', node_id: 'node-a', dataplane: 'wrap', status: 'stopped' }
   const requests = []
   let entitlement
   let inactive = true
@@ -97,6 +97,9 @@ test('a cluster slot can bind without running and explicitly reissues an old pac
     },
   })
   await service.redeem(voucher())
+  for (const id of ['active', '../legacy_cluster-52']) {
+    await assert.rejects(service.bind({ ...vm, id }), { code: 'crag_subscription_target_unready', status: 409 })
+  }
   assert.deepEqual(await service.listOrderTargets(), [vm.id])
   await assert.rejects(service.bind(vm), { code: 'host_subscription_inactive', status: 403 })
   inactive = false
