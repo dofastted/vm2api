@@ -684,7 +684,7 @@ test('off mode writes nothing', () => {
   assert.equal(store.listNormal({ limit: 5 }).length, 0)
 })
 
-test('classifier debug diagnostics omit system and transcript bodies', () => {
+test('classifier debug records keep the request body like any other request', () => {
   const store = tmpStore('debug')
   const ctx = store.start(
     { method: 'POST', headers: {}, socket: {} },
@@ -692,8 +692,8 @@ test('classifier debug diagnostics omit system and transcript bodies', () => {
   )
   const body = {
     model: 'claude-sonnet-4-6',
-    system: 'sensitive policy',
-    messages: [{ role: 'user', content: 'sensitive transcript' }],
+    system: 'classifier policy',
+    messages: [{ role: 'user', content: 'classifier transcript' }],
   }
   const classifier = {
     purpose: 'auto_mode_classifier',
@@ -705,10 +705,22 @@ test('classifier debug diagnostics omit system and transcript bodies', () => {
   store.finish(ctx, { status: 200, classifier, inbound_body: body, outbound_body: body })
   const [debug] = store.listDebug({ limit: 1 })
   assert.deepEqual(debug.classifier, classifier)
-  assert.equal(debug.request_body_snapshot, null)
-  assert.equal(debug.inbound_body, null)
-  assert.equal(debug.outbound_body, null)
-  assert.equal(JSON.stringify(debug).includes('sensitive transcript'), false)
+  assert.equal(JSON.stringify(debug.inbound_body).includes('classifier transcript'), true)
+})
+
+test('debug records carry the failed upstream hops failover-runner kept', () => {
+  const store = tmpStore('debug')
+  const ctx = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+  )
+  const key = Symbol.for('vm2api.failover.hopErrors')
+  if (!(globalThis[key] instanceof Map)) globalThis[key] = new Map()
+  globalThis[key].set(ctx.request_id, [{ attempt: 1, status: 429, body: '{"error":"x"}' }])
+  store.finish(ctx, { status: 429 })
+  const debug = store.listDebug({ limit: 5 }).find((item) => item.request_id === ctx.request_id)
+  assert.equal(debug.hop_errors[0].status, 429)
+  assert.equal(globalThis[key].has(ctx.request_id), false)
 })
 
 function logOne(store, extra = {}) {

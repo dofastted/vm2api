@@ -60,6 +60,83 @@ const DEFAULTS = {
   same_account_retry_delay_ms: 500,
   same_account_retry_max_hop_ms: 10_000,
   signature_repair: false,
+  // Hard cap on distinct accounts one request may run on (0 = unlimited).
+  // The switch/total caps above still let untried units through; this one does not.
+  max_accounts_per_request: 0,
+  // A bare 429 (no quota/RPM/model proof) on this many accounts in one request
+  // means the request, not the accounts, is the problem: stop (0 = off).
+  bare_429_request_scope_after: 2,
+  // A bare 429 cools an account only after this many distinct sessions hit one
+  // there within bare_429_window_ms; until then it only steps aside for the request.
+  bare_429_account_sessions: 2,
+  bare_429_window_ms: 120_000,
+}
+
+const HOP_ERRORS_KEY = Symbol.for('vm2api.failover.hopErrors')
+const HOP_ERRORS_MAX = 2000
+const HOP_ERROR_TEXT_MAX = 4000
+const HOP_ERROR_HEADER_RE = /ratelimit|retry-after|request-id|x-should-retry|^cf-|^server$|^via$/i
+
+/** Failed hops by request id; request-log takes them into the debug record. */
+function hopErrorStore() {
+  if (!(globalThis[HOP_ERRORS_KEY] instanceof Map)) globalThis[HOP_ERRORS_KEY] = new Map()
+  return globalThis[HOP_ERRORS_KEY]
+}
+
+function clipText(value, max = HOP_ERROR_TEXT_MAX) {
+  if (value == null) return null
+  let text
+  try {
+    text = typeof value === 'string' ? value : JSON.stringify(value)
+  } catch {
+    text = String(value)
+  }
+  return text.length > max ? `${text.slice(0, max)}…[+${text.length - max}]` : text
+}
+
+function pickHopHeaders(headers) {
+  if (!headers || typeof headers !== 'object') return null
+  const out = {}
+  for (const [key, value] of Object.entries(headers)) {
+    if (HOP_ERROR_HEADER_RE.test(key)) out[key] = clipText(value, 300)
+  }
+  return Object.keys(out).length ? out : null
+}
+
+export function recordHopError(requestId, entry) {
+  if (!requestId) return
+  const store = hopErrorStore()
+  const list = store.get(requestId) || []
+  if (!store.has(requestId)) {
+    while (store.size >= HOP_ERRORS_MAX) store.delete(store.keys().next().value)
+    store.set(requestId, list)
+  }
+  if (list.length < 20) list.push(entry)
+}
+
+export function takeHopErrors(requestId) {
+  const store = hopErrorStore()
+  const list = store.get(requestId) || null
+  store.delete(requestId)
+  return list
+}
+
+function hopErrorEntry(attemptNo, selected, result, policy, latencyMs) {
+  return {
+    attempt: attemptNo,
+    at: new Date().toISOString(),
+    vm_id: selected?.vmId || null,
+    account_id: selected?.accountId || null,
+    status: result?.status ?? null,
+    terminal_state: result?.terminalState || null,
+    scope: policy?.scope || null,
+    action: policy?.action || null,
+    reason: policy?.reason || null,
+    latency_ms: latencyMs ?? null,
+    headers: pickHopHeaders(result?.headers),
+    body: clipText(result?.body),
+    provider_result: clipText(result?.providerResult, 2000),
+  }
 }
 
 function clone(value) {
@@ -404,6 +481,20 @@ function incompleteHopResult(result, policy, extras = {}) {
   }
 }
 
+/** max_accounts_per_request spent: answer with the last hop (a bare 429 stays a 429). */
+function stopAtAccountCap(result, policy, accounts, hops, extras = {}) {
+  const capped = { account_cap: accounts, attempt_count: hops }
+  if (Number(result?.status) === 429) {
+    return { ...result, ok: false, finalState: 'exhausted', policy, ...capped, ...extras }
+  }
+  return preferLastResult(
+    result,
+    policy,
+    poolError('account_pool_exhausted', 'Per-request account cap reached', capped),
+    { ...capped, ...extras },
+  )
+}
+
 /** Selection found no seat. Busy until the wait ran out is capacity; nothing eligible is not. */
 function selectionFailure(selected, { excluded, lastPolicy, lastResult, hops }) {
   const reason = selected?.reason || 'no_eligible_accounts'
@@ -519,6 +610,45 @@ export class FailoverRunner {
         }
       }
     }
+  }
+
+  accountCapReached(ranAccounts) {
+    const cap = Number(this.config.max_accounts_per_request ?? 0)
+    return cap > 0 && ranAccounts.size >= cap
+  }
+
+  /**
+   * Bare 429 = scope unproven. Same request on N accounts → the request is the
+   * problem: stop and cool nothing. Otherwise the account only steps aside for
+   * this request until distinct sessions confirm it (then the normal cooldown).
+   */
+  gradeBare429(selected, policy, { accounts, key }) {
+    const accountId = selected?.accountId
+    if (accountId) accounts.add(accountId)
+    const after = Number(this.config.bare_429_request_scope_after ?? 2)
+    if (after > 0 && accounts.size >= after) {
+      return {
+        scope: 'request',
+        action: 'stop',
+        reason: 'rate_limited_request',
+        cooldownUntil: null,
+        retrySameAccount: false,
+      }
+    }
+    const need = Number(this.config.bare_429_account_sessions ?? 2)
+    if (!(need > 1) || !accountId) return policy
+    const windowMs = Number(this.config.bare_429_window_ms ?? 120_000)
+    const now = Date.now()
+    if (!this.bare429Hits) this.bare429Hits = new Map()
+    const hits = (this.bare429Hits.get(accountId) || []).filter((hit) => now - hit.at < windowMs)
+    hits.push({ key: String(key || ''), at: now })
+    this.bare429Hits.set(accountId, hits)
+    if (this.bare429Hits.size > 500) {
+      for (const [id, list] of this.bare429Hits)
+        if (!list.some((hit) => now - hit.at < windowMs)) this.bare429Hits.delete(id)
+    }
+    if (new Set(hits.map((hit) => hit.key)).size >= need) return policy
+    return { ...policy, action: 'continue', cooldownUntil: null }
   }
 
   /**
@@ -665,6 +795,11 @@ export class FailoverRunner {
     // Accounts left only because the kernel had no free slot; their pins stay.
     const spilled = budget.spilled
     const bindKeys = uniqueStickyKeys(stickyKey, stickyKeys)
+    // Accounts that answered this request with a bare 429.
+    const bare429Accounts = new Set()
+    // Accounts that really ran this request upstream (admission misses excluded).
+    const ranAccounts = new Set()
+    const bare429Key = stickyKey || requestId
     const pinKeys = familyKey ? [...bindKeys, familyKey] : bindKeys
     // Pins as this request last saw them. A pin moved by someone else since
     // (quota migration, credential death) is never written back by a late hop.
@@ -852,7 +987,10 @@ export class FailoverRunner {
         if (hopNoted) return
         hopNoted = true
         const executions = executionsOf(value)
-        if (executions > 0) budget.noteHop(selected.accountId, selected.vmId, executions)
+        if (executions > 0) {
+          budget.noteHop(selected.accountId, selected.vmId, executions)
+          if (selected.accountId) ranAccounts.add(selected.accountId)
+        }
       }
       try {
         if (signal?.aborted) {
@@ -986,6 +1124,9 @@ export class FailoverRunner {
           },
           this.scheduler?.accountQuota,
         )
+        if (policy.reason === 'rate_limited_unknown' && !pinVmId && !result?.committed) {
+          policy = this.gradeBare429(selected, policy, { accounts: bare429Accounts, key: bare429Key })
+        }
         if (knownSearchRepair && policy.reason === 'search_repairable') {
           // Repeating the identical flatten cannot fix a second rejection.
           this.searchRepairs.delete(repairKey)
@@ -1037,6 +1178,9 @@ export class FailoverRunner {
           ttftMs: result?.ttftMs ?? null,
           latencyMs: Date.now() - attemptStarted,
         })
+        if (!result?.ok) {
+          recordHopError(requestId, hopErrorEntry(attemptNo, selected, result, policy, Date.now() - attemptStarted))
+        }
         if (typeof onAttempt === 'function') {
           await onAttempt({ attemptNo, selected, result, policy })
         }
@@ -1110,6 +1254,10 @@ export class FailoverRunner {
           budget.noteSameUnit(selected.accountId)
           avoid = new Set([selected.accountId, selected.vmId])
           continue
+        }
+        if (this.accountCapReached(ranAccounts)) {
+          releaseStickySlots()
+          return stopAtAccountCap(result, policy, ranAccounts.size, budget.hops, attribution())
         }
         budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
       } catch (error) {
@@ -1209,6 +1357,7 @@ export class FailoverRunner {
           terminalState: result.terminalState,
           latencyMs: Date.now() - attemptStarted,
         })
+        recordHopError(requestId, hopErrorEntry(attemptNo, selected, result, policy, Date.now() - attemptStarted))
         if (committed || !shouldContinue(policy)) {
           releaseStickySlots()
           return { ...result, ...attribution(), finalState: result.terminalState, policy }
@@ -1227,6 +1376,10 @@ export class FailoverRunner {
           budget.noteSameUnit(selected.accountId)
           avoid = new Set([selected.accountId, selected.vmId])
           continue
+        }
+        if (this.accountCapReached(ranAccounts)) {
+          releaseStickySlots()
+          return stopAtAccountCap(result, policy, ranAccounts.size, budget.hops, attribution())
         }
         budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
       } finally {

@@ -27,6 +27,16 @@ import { disjointOpenaiUsage } from '../protocol/openai-usage.mjs'
 import { REASONING_EFFORTS, sessionIdForLog } from '../protocol/log-fields.mjs'
 
 /** Persist the token a client actually sent — only for failed ingress auth. */
+
+/** Failed upstream hops recorded by failover-runner, keyed by request id (shared via globalThis). */
+function takeHopErrors(requestId) {
+  const store = globalThis[Symbol.for('vm2api.failover.hopErrors')]
+  if (!requestId || !(store instanceof Map)) return null
+  const list = store.get(requestId) || null
+  store.delete(requestId)
+  return list
+}
+
 export function presentedApiKeyForLog(token) {
   const t = String(token || '').trim()
   if (!t || t.startsWith('kin-panel-')) return ''
@@ -613,18 +623,19 @@ export class RequestLogStore {
         this.repo.insertSummaryIfAbsent(summary)
       } catch {}
       if (this.jsonlMirror) this._appendJsonl(summary)
-      if (ctx.mode !== 'debug') return
+      if (ctx.mode !== 'debug') {
+        takeHopErrors(summary.request_id)
+        return
+      }
       const debugRec = {
         ...summary,
         headers: ctx.headers,
         inbound_summary: extra.inbound_summary || summarizeBody(extra.inbound_body),
-        request_body_snapshot:
-          !extra.classifier && extra.inbound_body != null ? sanitizeRequestBodySnapshot(extra.inbound_body) : null,
-        inbound_body:
-          !extra.classifier && extra.inbound_body != null
-            ? clampBody(extra.inbound_body, this.maxDebugBodyChars)
-            : null,
+        request_body_snapshot: extra.inbound_body != null ? sanitizeRequestBodySnapshot(extra.inbound_body) : null,
+        inbound_body: extra.inbound_body != null ? clampBody(extra.inbound_body, this.maxDebugBodyChars) : null,
         hop_meta: extra.hop_meta || null,
+        // Every failed upstream hop with its status, headers and body (failover-runner).
+        hop_errors: takeHopErrors(summary.request_id) || null,
         via: extra.via || extra.hop_meta?.via || null,
         upstream_status: extra.upstream_status ?? null,
         outbound_summary: extra.outbound_summary || null,
@@ -639,7 +650,7 @@ export class RequestLogStore {
             ? redactHeaders(extra.worker_envelope_headers)
             : null,
         outbound_body:
-          ctx.capture_outbound && !extra.classifier && extra.outbound_body != null
+          ctx.capture_outbound && extra.outbound_body != null
             ? clampBody(extra.outbound_body, this.maxDebugBodyChars)
             : null,
         outbound_body_source: ctx.capture_outbound ? extra.outbound_body_source || null : null,

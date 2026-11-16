@@ -2122,3 +2122,99 @@ test('a slot that cannot refresh its credential hops and cools down', async () =
   assert.equal(scheduler.cooldowns[0].update.reason, 'credential_refresh_failed')
   assert.equal(scheduler.cooldowns[0].update.status, 'cooldown')
 })
+
+function bare429() {
+  return {
+    ok: false,
+    status: 429,
+    committed: false,
+    terminalState: 'incomplete',
+    headers: { 'request-id': 'req_up_1', 'x-unrelated': 'drop' },
+    body: { type: 'error', error: { type: 'rate_limit_error', message: 'Error' } },
+  }
+}
+
+test('bare 429 on two accounts of one request stops as request scope and cools nobody', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2), candidate(3), candidate(4)])
+  const runner = new FailoverRunner({ scheduler })
+  const seen = []
+  const result = await runner.run({
+    requestId: 'req-bare-429',
+    stickyKey: 'session-a',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      return bare429()
+    },
+  })
+  assert.deepEqual(seen, ['account-1', 'account-2'])
+  assert.equal(result.status, 429)
+  assert.equal(result.policy.reason, 'rate_limited_request')
+  assert.equal(scheduler.cooldowns.length, 0)
+})
+
+test('bare 429 cools an account only once a second session hits it', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({ scheduler })
+  const call = ({ candidate: selected }) => (selected.accountId === 'account-1' ? bare429() : success())
+  const base = { canonicalBody: { model: 'claude-sonnet-test' }, model: 'claude-sonnet-test', callAttempt: call }
+  const first = await runner.run({ ...base, requestId: 'req-s1', stickyKey: 'session-1' })
+  assert.equal(first.ok, true)
+  assert.equal(scheduler.cooldowns.length, 0)
+  const again = await runner.run({ ...base, requestId: 'req-s1b', stickyKey: 'session-1' })
+  assert.equal(again.ok, true)
+  assert.equal(scheduler.cooldowns.length, 0)
+  const second = await runner.run({ ...base, requestId: 'req-s2', stickyKey: 'session-2' })
+  assert.equal(second.ok, true)
+  assert.equal(scheduler.cooldowns.length, 1)
+  assert.equal(scheduler.cooldowns[0].candidate.accountId, 'account-1')
+  assert.equal(scheduler.cooldowns[0].update.reason, 'rate_limited_unknown')
+})
+
+test('max_accounts_per_request stops after that many accounts ran', async () => {
+  const scheduler = new Scheduler([1, 2, 3, 4, 5, 6].map(candidate))
+  const runner = new FailoverRunner({
+    scheduler,
+    config: { max_accounts_per_request: 3, same_account_retry_delay_ms: 0 },
+  })
+  const seen = []
+  const result = await runner.run({
+    requestId: 'req-cap',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      return {
+        ok: false,
+        status: 401,
+        committed: false,
+        terminalState: 'rejected',
+        body: { type: 'error', error: { type: 'authentication_error', message: 'invalid x-api-key' } },
+      }
+    },
+  })
+  assert.equal(new Set(seen).size, 3)
+  assert.equal(result.ok, false)
+  assert.equal(result.account_cap, 3)
+})
+
+test('failed hops are kept for the request log', async () => {
+  const { takeHopErrors } = await import('../../src/lib/pool/failover-runner.mjs')
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({ scheduler })
+  await runner.run({
+    requestId: 'req-hop-log',
+    stickyKey: 'session-log',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    callAttempt: ({ candidate: selected }) => (selected.accountId === 'account-1' ? bare429() : success()),
+  })
+  const hops = takeHopErrors('req-hop-log')
+  assert.equal(hops.length, 1)
+  assert.equal(hops[0].status, 429)
+  assert.equal(hops[0].vm_id, 'vm-01')
+  assert.deepEqual(hops[0].headers, { 'request-id': 'req_up_1' })
+  assert.match(hops[0].body, /rate_limit_error/)
+  assert.equal(takeHopErrors('req-hop-log'), null)
+})
