@@ -42,7 +42,7 @@ CRAG V2 的资产、工作区和设备授权目录分别使用 Linux 私有 run 
 
 ### CRAG V2 二进制更新
 
-vm2api 从自己的公开 payload Release 下载 `crag-v2-licensed-amd64.tar.gz` 签名加密包，无需私有供应仓凭据。「内核」页提供 `payload-2026.11.16-crag-3.1.2`（默认标准版，沿用 `CRAGK1` 策略，支持可回收宿主名册 `CRAGH2`）和 `payload-2026.11.16-crag-3.0.9-legacy`（支持仍有效的 `CRAGU1`）。需要保留旧离线授权时选「3.0.9 旧离线授权兼容版」拉取，再对相应槽重装；拉取本身不影响运行中的槽。两包共用当前下载指针，不代表全局安装或同时为不同槽选定下载源。宿主订阅启用 `CRAGH2` 后不要回滚到 3.1.1 及更早内核。
+vm2api 从自己的公开 payload Release 下载 `crag-v2-licensed-amd64.tar.gz` 签名加密包，无需私有供应仓凭据。「内核」页提供 `payload-2026.11.16-crag-3.1.2`（默认标准版，沿用 `CRAGK1` 策略，支持可回收宿主名册 `CRAGH2`）和 `payload-2026.11.16-crag-3.1.2-legacy`（旧载荷密钥，支持仍有效的 `CRAGU1` 及为该密钥签发的 `CRAGL1` / `CRAGS1`，同样支持 `CRAGH2`）。需要保留旧离线授权时选「3.1.2 旧授权兼容版」拉取，再对相应槽重装；拉取本身不影响运行中的槽。两包共用当前下载指针，不代表全局安装或同时为不同槽选定下载源。宿主订阅启用 `CRAGH2` 后不要回滚到 3.1.1 及更早内核。
 
 WARP 可分别选择 CRAG 和 cli-node 的历史发行版本，默认拉取最新；下载只更新待安装缓存，确认重装后才应用到所选槽。一键 `install` / `upgrade` 和独立 `crag-update` 未指定 `--crag-version` 时也选择最新的标准载荷；普通 `vX.Y.Z` 不选择 `-legacy`。依赖旧离线授权的环境做后续升级时要继续显式指定兼容标签，或者跳过内核同步。`manifest.version` 的 `v2` 是协议族，实际下载发行版见缓存指针的 `release.payload_tag`。
 
@@ -51,7 +51,7 @@ amd64 默认一键安装/升级会自动完成出厂包初始化和最新版获�
 ```bash
 sudo bash /opt/vm2api/deploy/install.sh crag-update --crag-version v3.1.2
 # 原样保留旧离线授权（整机 CRAG 更新；只迁移指定槽请用面板）
-sudo bash /opt/vm2api/deploy/install.sh crag-update --crag-version payload-2026.11.16-crag-3.0.9-legacy
+sudo bash /opt/vm2api/deploy/install.sh crag-update --crag-version payload-2026.11.16-crag-3.1.2-legacy
 # 省略 --crag-version：从 vm2api 公开 payload Release 选最新完整签名包
 sudo bash /opt/vm2api/deploy/install.sh crag-update
 ```

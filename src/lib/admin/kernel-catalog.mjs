@@ -47,6 +47,13 @@ const CRAG_PINNED_RELEASES = [
     sha256: '74e9ba52f18a52126fe61a3d95a89fe854972387459aed1def83bf3714cba8c3',
   },
   {
+    tag: 'payload-2026.11.16-crag-3.1.2-legacy',
+    label: '3.1.2 旧授权兼容版',
+    size: 170897634,
+    manifestSha256: 'c38f0dece88c0ada665c544f0c16d4295784e7b230de316ea6297532b4abca61',
+    sha256: '29035f48824ff83d1e9fbfb84a9236e245938387c7f39d4ff9c4ffff7d9a770b',
+  },
+  {
     tag: 'payload-2026.11.16-crag-3.1.1',
     size: 170863146,
     manifestSha256: '3c6ee46a9eea024273f2377bd8fa544230899c690c2bc46ff7dd205bcf12fa1d',
@@ -66,7 +73,6 @@ const CRAG_PINNED_RELEASES = [
   },
   {
     tag: 'payload-2026.11.16-crag-3.0.9-legacy',
-    label: '3.0.9 旧离线授权兼容版',
     size: 169718051,
     manifestSha256: '9c608280cfbfb38463f44a5a0125edd84279bd469d18607d9a07bce2e2960ef8',
     sha256: '95b320100f188ac868a9b8d801c1795ddea03b4fcdb7a311cb53c7912739bd18',
