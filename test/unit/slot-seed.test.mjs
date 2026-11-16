@@ -3,7 +3,13 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { writeSlotSeedFiles, inferProjectRootFromCliHome } from '../../src/lib/vm/slot-seed.mjs'
+import {
+  initializeSlotSeedFiles,
+  writeSlotSeedFiles,
+  inferProjectRootFromCliHome,
+} from '../../src/lib/vm/slot-seed.mjs'
+import { seedFreshCliHome } from '../../src/lib/vm/vm-recreate.mjs'
+import { runtimeFileOwner } from '../../src/lib/oauth/oauth-credentials.mjs'
 import { standardSeedPolicy } from '../../src/lib/protocol/seed-policy.mjs'
 import { KIN_SEED_SCHEMA } from '../../src/lib/identity/workstation-profile.mjs'
 import { applySeedAfterOfficialInit } from '../../src/lib/oauth/official-cc-bootstrap.mjs'
@@ -14,6 +20,77 @@ test('inferProjectRootFromCliHome walks vms/<id>/cli-home', () => {
   assert.equal(inferProjectRootFromCliHome(home), path.resolve(root))
   assert.equal(inferProjectRootFromCliHome('/tmp/not-a-slot'), null)
 })
+
+for (const dataplane of ['wrap', 'crag']) {
+  test(`fresh ${dataplane} VM has private, VM-owned first-launch settings`, (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-fresh-settings-'))
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    const vm = { id: 'vm-13', node_id: 'node-a', dataplane, timezone: 'Asia/Shanghai' }
+    const { homeDir } = seedFreshCliHome(root, vm)
+    const file = path.join(homeDir, '.claude', 'settings.json')
+    const settings = JSON.parse(fs.readFileSync(file, 'utf8'))
+    assert.equal(settings.env.TZ, 'Asia/Shanghai')
+    assert.equal(settings.autoUpdates, false)
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600)
+    for (const dir of [homeDir, path.dirname(file)]) {
+      assert.equal(fs.statSync(dir).mode & 0o777, 0o700)
+      if (process.getuid?.() === 0) {
+        assert.equal(fs.statSync(dir).uid, runtimeFileOwner(vm).uid)
+        assert.equal(fs.statSync(dir).gid, runtimeFileOwner(vm).gid)
+      }
+    }
+  })
+}
+
+test('seed initialization merges authoritative node settings and waits for publication', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-node-settings-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const vm = { id: 'vm-13', node_id: 'node-a', timezone: 'UTC' }
+  writeSlotSeedFiles(root, vm, null, { existingSettings: { controller_only: true } })
+  let published = false
+  const seed = await initializeSlotSeedFiles(root, vm, {
+    async seedFiles() {
+      return {
+        files: { 'settings.json': JSON.stringify({ permissions: { allow: ['Read'] }, env: { CUSTOM: 'node' } }) },
+      }
+    },
+    async syncSeed(_vm, slotDir) {
+      const settings = JSON.parse(fs.readFileSync(path.join(slotDir, 'cli-home', '.claude', 'settings.json')))
+      assert.equal(settings.controller_only, undefined)
+      assert.equal(settings.env.CUSTOM, 'node')
+      assert.deepEqual(settings.permissions, { allow: ['Read'] })
+      published = true
+      return { published: true }
+    },
+  })
+  assert.equal(seed.wrote, true)
+  assert.equal(published, true)
+})
+
+for (const stage of ['read', 'parse', 'publish']) {
+  test(`seed initialization propagates ${stage} failures`, async (t) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-init-failure-'))
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    let published = false
+    await assert.rejects(
+      initializeSlotSeedFiles(
+        root,
+        { id: 'vm-13' },
+        {
+          async seedFiles() {
+            if (stage === 'read') throw new Error('node_read_failed')
+            return { files: { 'settings.json': stage === 'parse' ? '{invalid' : null } }
+          },
+          async syncSeed() {
+            published = true
+            return { published: false }
+          },
+        },
+      ),
+    )
+    assert.equal(published, stage === 'publish')
+  })
+}
 
 test('writeSlotSeedFiles writes latest settings and workstation kin-seed', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-slot-seed-'))

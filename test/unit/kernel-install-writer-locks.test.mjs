@@ -6,6 +6,7 @@ import path from 'node:path'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 import { installKernelTargets } from '../../src/lib/vm/kernel-install.mjs'
 import { getVm, patchVmRecord } from '../../src/lib/vm/vm-registry.mjs'
+import { activateFixture, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 
 const saved = Object.fromEntries(
   ['KIN_KERNEL_BIN', 'KIN_WRAP_CLI_ROOT', 'KIN_CRAG_V2_ROOT', 'KIN_SLOT_RUN_ROOT', 'KIN_NATIVE_CLI_ROOT'].map((key) => [
@@ -116,6 +117,51 @@ function beginRequest(root, method, endpoint, body, extra = {}) {
   })
   return { operation, read: read.promise, response, restarts: () => restarted, settled: () => settled }
 }
+
+for (const mode of ['PATCH', 'slot-policy', 'dataplane']) {
+  for (const dataplane of ['wrap', 'crag']) {
+    test(`${mode} switching to ${dataplane} initializes settings without an install`, async (t) => {
+      const { root, vm } = fixture(t)
+      patchVmRecord(root, vm.id, {
+        status: 'stopped',
+        dataplane: 'cc',
+        runtime: { type: 'docker', worker_run_dir: path.join(root, 'linux-run') },
+      })
+      if (dataplane === 'crag') {
+        seedEncryptedPackage(root)
+        activateFixture(root, getVm(root, vm.id))
+      }
+      const request =
+        mode === 'PATCH'
+          ? beginRequest(root, 'PATCH', `/vms/${vm.id}`, { dataplane })
+          : mode === 'slot-policy'
+            ? beginRequest(root, 'POST', '/vms/slot-policy', { ids: [vm.id], dataplane })
+            : beginRequest(root, 'POST', '/dataplane', { ids: [vm.id], dataplane, restart: false })
+      await request.operation
+      assert.equal(request.response.status, 200, JSON.stringify(request.response.body))
+      if (mode === 'slot-policy') assert.deepEqual(request.response.body.data.failed, [])
+      const file = path.join(root, 'vms', vm.id, 'cli-home', '.claude', 'settings.json')
+      assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).autoUpdates, false)
+      assert.equal(getVm(root, vm.id).dataplane, dataplane)
+      assert.equal(getVm(root, vm.id).status, 'stopped')
+      assert.equal(request.restarts(), 0)
+    })
+  }
+}
+
+test('failed settings initialization prevents a policy switch and preserves invalid VM settings', async (t) => {
+  const { root, vm } = fixture(t)
+  patchVmRecord(root, vm.id, { status: 'stopped', dataplane: 'cc' })
+  const dir = path.join(root, 'vms', vm.id, 'cli-home', '.claude')
+  fs.mkdirSync(dir)
+  fs.writeFileSync(path.join(dir, 'settings.json'), '{invalid')
+  const request = beginRequest(root, 'POST', '/vms/slot-policy', { ids: [vm.id], dataplane: 'wrap' })
+  await request.operation
+  assert.equal(request.response.body.data.failed[0].code, 'kernel_seed_failed')
+  assert.equal(getVm(root, vm.id).dataplane, 'cc')
+  assert.equal(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8'), '{invalid')
+  assert.equal(request.restarts(), 0)
+})
 
 for (const mode of ['PATCH', 'slot-policy']) {
   test(`${mode} waits for the installer record lock before metadata, materialization or restart`, async (t) => {

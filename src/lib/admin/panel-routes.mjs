@@ -240,7 +240,7 @@ import { isKvmRuntime, RUNTIME_KVM } from '../vm/runtime-kind.mjs'
 import { hostProxyUrlForVm, slotHost } from '../vm/slot-host.mjs'
 import { syncIpv6ProxyEgress } from '../vm/proxy-policy-runtime.mjs'
 import { proxyBlockedReason } from '../vm/proxy-policy.mjs'
-import { writeSlotSeedFiles } from '../vm/slot-seed.mjs'
+import { initializeSlotSeedFiles, writeSlotSeedFiles } from '../vm/slot-seed.mjs'
 import {
   egressEnabled,
   ensureProxyEgress,
@@ -1246,6 +1246,14 @@ export function createPanelHandler(ctx) {
         await projectKvmCragSwitchLicense(current, desired, previousRouting, ctx.routingConfig)
       } catch (error) {
         return { ok: false, id, code: error.code, error: error.message }
+      }
+    }
+    if (kernelSwitch && !isCodexVm(desired)) {
+      try {
+        const initialize = ctx.kernelPolicyOps?.initializeSlotSeedFiles || initializeSlotSeedFiles
+        await initialize(cfg.paths.project, desired, slotHost(desired))
+      } catch {
+        return { ok: false, id, code: 'kernel_seed_failed', error: 'Claude Code 初始化配置生成或发布失败' }
       }
     }
     const restartFailed = (result) => {
@@ -2887,6 +2895,25 @@ export function createPanelHandler(ctx) {
                   },
                 })
               }
+            }
+            try {
+              const nextRouting = targets.all
+                ? { ...previous, inference: { ...previous.inference, dataplane: parsed.value } }
+                : previous
+              const initialize = ctx.kernelPolicyOps?.initializeSlotSeedFiles || initializeSlotSeedFiles
+              for (const id of syncArgs.body.ids) {
+                const vm = getVm(cfg.paths.project, id)
+                if (!vm || isCodexVm(vm)) continue
+                const desired = targets.all ? vm : vmWithSlotPolicyPatch(vm, { dataplane: parsed.value })
+                if (resolveKernelDataplane(vm, previous) === resolveKernelDataplane(desired, nextRouting)) continue
+                if (checkCragLicense(cfg.paths.project, desired, nextRouting).ok)
+                  await initialize(cfg.paths.project, desired, slotHost(desired))
+              }
+            } catch {
+              return json(res, 503, {
+                ok: false,
+                error: { code: 'kernel_seed_failed', message: 'Claude Code 初始化配置生成或发布失败' },
+              })
             }
             try {
               if (targets.all) {
