@@ -20,7 +20,7 @@ import { hasRefreshPresence, readWorkerCredentialFile } from '../oauth/oauth-cre
 import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
 import { kernelFaults } from '../transport/rust-kernel-client.mjs'
 import { resolveOfficialCcInference } from '../vm/slot-engine.mjs'
-import { AttemptCoordinator } from './unit-decision.mjs'
+import { attachFailureDecision, AttemptCoordinator } from './unit-decision.mjs'
 import { SOFT_COOLDOWN_REASONS } from './pool-scheduler.mjs'
 
 // Seat wait for the one-shot repair hop when the rejected hop already spent the deadline.
@@ -50,6 +50,7 @@ export const vmTimeoutTracker = {
 const DEFAULTS = {
   max_account_switches: 10,
   max_total_attempts: 12,
+  max_accounts_per_request: 0,
   total_retry_deadline_ms: 120000,
   // Same-session serialization waits out the previous turn. Cap a wedged tail
   // so the queue cannot sit forever. 0 disables the cap. Long enough that a
@@ -684,6 +685,8 @@ export class FailoverRunner {
     })
     const deadline = budget.deadline
     const excluded = budget.excluded
+    const accountCap = Number(this.config.max_accounts_per_request)
+    const bare429Accounts = new Set()
     // Accounts left only because the kernel had no free slot; their pins stay.
     const spilled = budget.spilled
     // session_affinity_first: a turn that spilled to another unit wrote the
@@ -885,6 +888,16 @@ export class FailoverRunner {
         if (signal?.aborted) {
           return { ...clientCancelledResult(), via: 'pool-failover', ...attribution() }
         }
+        if (
+          selected?.ok &&
+          Number.isSafeInteger(accountCap) &&
+          accountCap > 0 &&
+          budget.executions.size >= accountCap &&
+          !budget.executions.has(selected.accountId)
+        ) {
+          releaseStickySlots()
+          return preferLastResult(lastResult, lastPolicy, null, { ...attribution(), account_cap: accountCap })
+        }
         if (selected?.familyGated && familyKey && familyVmId) {
           // The family home left the pool (quota, credential): the family moves
           // with the next bind. An exclusion this request made itself is not proof.
@@ -1017,6 +1030,18 @@ export class FailoverRunner {
               },
               this.scheduler?.accountQuota,
             )
+        if (
+          !pinVmId &&
+          selected.accountId &&
+          policy.reason === 'rate_limited_unknown' &&
+          policy.action === 'continue' &&
+          executionsOf(result) > 0
+        ) {
+          bare429Accounts.add(selected.accountId)
+          if (bare429Accounts.size >= 2) {
+            policy = attachFailureDecision({ scope: 'request', action: 'stop', reason: 'rate_limited_request' })
+          }
+        }
         if (knownSearchRepair && policy.reason === 'search_repairable') {
           // Repeating the identical flatten cannot fix a second rejection.
           this.searchRepairs.delete(repairKey)
