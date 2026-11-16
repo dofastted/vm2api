@@ -982,6 +982,7 @@ export function createPanelHandler(ctx) {
     if (panelIdentity(req).role !== 'admin') {
       delete normalized.group_id
       delete normalized.vm_pool_id
+      delete normalized.api_endpoint_id
     }
     const hasRequestQuota = Object.prototype.hasOwnProperty.call(body, 'quota_requests')
     const hasLegacyQuota = Object.prototype.hasOwnProperty.call(body, 'quota')
@@ -1001,6 +1002,21 @@ export function createPanelHandler(ctx) {
         .trim()
         .toLowerCase() === 'api'
     )
+  }
+
+  function validateKeyEndpoint(value, isApi, previous = null) {
+    if (value == null) return null
+    if (typeof value !== 'string' || !value.trim() || !isApi) {
+      throw Object.assign(new Error('请选择有效的 API 渠道'), { code: 'invalid_api_endpoint_id' })
+    }
+    const id = value.trim()
+    if (id !== previous) {
+      const endpoint = apiEndpointStore.getRaw(id)
+      if (!endpoint || endpoint.disabled) {
+        throw Object.assign(new Error('所选 API 渠道不存在或已停用'), { code: 'api_endpoint_unavailable' })
+      }
+    }
+    return id
   }
 
   /** Slots a key may be scoped to; a tenant's foreign slots read as missing. */
@@ -2031,6 +2047,7 @@ export function createPanelHandler(ctx) {
             name: body?.name,
             key: body?.key || body?.custom_key || undefined,
             category: body?.category,
+            api_endpoint_id: validateKeyEndpoint(input.api_endpoint_id, isApi),
             user_id: input.user_id,
             group_id: input.group_id,
             group_type: scope.group_type,
@@ -2085,6 +2102,9 @@ export function createPanelHandler(ctx) {
           const input = normalizePanelApiKeyInput(body || {}, req)
           const currentRec = apiKeyStore.getById(id)
           const isApi = isApiCategory(body?.category ?? currentRec?.category)
+          if (Object.hasOwn(input, 'api_endpoint_id')) {
+            input.api_endpoint_id = validateKeyEndpoint(input.api_endpoint_id, isApi, currentRec?.api_endpoint_id)
+          }
           const scopeInput = {
             group_type: body?.group_type,
             allowed_vms: body?.allowed_vms,
@@ -2182,7 +2202,7 @@ export function createPanelHandler(ctx) {
             base_url: body?.base_url || saved?.base_url,
             api_key: body?.api_key || saved?.api_key,
             proxy_url: proxyUrl,
-            headers: body?.headers,
+            headers: body?.headers ?? saved?.headers,
             auth_scheme: body?.auth_scheme || body?.authScheme || saved?.auth_scheme,
             forward: ctx.forwardApi,
           })
@@ -2267,8 +2287,27 @@ export function createPanelHandler(ctx) {
             api_key: key.api_key,
             proxy_url: key.proxy_url,
             headers: ep.headers,
+            forward: ctx.forwardApi,
           })
           const apply = body?.apply !== false
+          if (apply) {
+            const current = apiEndpointStore.getRaw(id)
+            if (!current) return json(res, 404, { ok: false, error: { message: 'endpoint not found' } })
+            const currentKey = current.api_key_entries.find((item) => item.id === key.id && !item.disabled)
+            if (
+              current.base_url !== ep.base_url ||
+              current.kind !== ep.kind ||
+              current.protocol !== ep.protocol ||
+              JSON.stringify(current.headers) !== JSON.stringify(ep.headers) ||
+              currentKey?.api_key !== key.api_key ||
+              currentKey.proxy_url !== key.proxy_url
+            ) {
+              return json(res, 409, {
+                ok: false,
+                error: { message: '渠道配置已变更，请重新获取模型', code: 'endpoint_changed' },
+              })
+            }
+          }
           const rec = apply ? apiEndpointStore.mergeFetchedModels(id, result.models) : ep
           if (apply) apiScheduler.reload(apiEndpointStore.listRaw())
           return json(res, 200, {

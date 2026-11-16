@@ -34,6 +34,11 @@ export function resolveInferenceBackend(req) {
     : 'oauth'
 }
 
+export function apiScheduleScope(req, groupType) {
+  const endpointId = req.apiKeyRecord?.api_endpoint_id || null
+  return { endpointId, groupType: endpointId ? 'all' : groupType }
+}
+
 export { messagesUrl, responsesUrl } from './api-presets.mjs'
 
 const STATELESS_RESPONSES_FIELDS = new Set([

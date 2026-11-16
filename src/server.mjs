@@ -55,7 +55,7 @@ import { GroupsRepo } from './lib/db/repos/groups-repo.mjs'
 import { SettingsRepo } from './lib/db/repos/settings-repo.mjs'
 import { ApiEndpointStore } from './lib/admin/api-endpoints.mjs'
 import { ApiScheduler } from './lib/pool/api-scheduler.mjs'
-import { resolveInferenceBackend } from './lib/pool/api-protocol.mjs'
+import { apiScheduleScope, resolveInferenceBackend } from './lib/pool/api-protocol.mjs'
 import { bootApiKernel, apiKernelPaths, apiKernelSnapshot } from './lib/transport/api-kernel-client.mjs'
 import { PanelUserStore } from './lib/admin/panel-users.mjs'
 import { RequestLogStore } from './lib/admin/request-log.mjs'
@@ -1326,7 +1326,7 @@ const server = http.createServer(async (req, res) => {
       if (!requireAuth(req, res)) return
       const groupType = keyScopeFromRequest(req).group_type
       if (resolveInferenceBackend(req) === 'api') {
-        return json(res, 200, filterModelCatalogForKey(apiScheduler.catalog({ groupType }), req))
+        return json(res, 200, filterModelCatalogForKey(apiScheduler.catalog(apiScheduleScope(req, groupType)), req))
       }
       const result = await fetchWorkerModels({ groupType })
       return json(res, 200, filterModelCatalogForKey(result, req))

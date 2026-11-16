@@ -135,6 +135,7 @@ export function publicKeyView(rec, { reveal = false } = {}) {
     tokens_in: rec.tokens_in || 0,
     tokens_out: rec.tokens_out || 0,
     category: rec.category === 'api' ? 'api' : 'oauth',
+    api_endpoint_id: rec.category === 'api' ? (rec.api_endpoint_id ?? null) : null,
     ...keyScopeFromRecord(rec),
     allowed_models: parseKeyAllowedModels(rec.allowed_models),
     inflight: undefined, // filled by store.snapshot
@@ -246,6 +247,12 @@ export class ApiKeyStore {
       throw Object.assign(new Error('key already exists'), { code: 'key_exists' })
     }
 
+    const category =
+      String(input.category || 'oauth')
+        .trim()
+        .toLowerCase() === 'api'
+        ? 'api'
+        : 'oauth'
     const rec = {
       id: 'key_' + crypto.randomBytes(6).toString('hex'),
       name,
@@ -273,18 +280,19 @@ export class ApiKeyStore {
       requests: 0,
       tokens_in: 0,
       tokens_out: 0,
-      category: String(input.category || 'oauth').toLowerCase() === 'api' ? 'api' : 'oauth',
+      category,
       ...storedKeyScope(
         normalizeKeyScope(
           {
             group_type: input.group_type,
             allowed_vms: input.allowed_vms,
-            category: String(input.category || 'oauth').toLowerCase() === 'api' ? 'api' : 'oauth',
+            category,
             ...(Object.prototype.hasOwnProperty.call(input, 'vm_pool_id') ? { vm_pool_id: input.vm_pool_id } : {}),
           },
-          { isApi: String(input.category || 'oauth').toLowerCase() === 'api' },
+          { isApi: category === 'api' },
         ),
       ),
+      api_endpoint_id: category === 'api' ? (input.api_endpoint_id ?? null) : null,
       allowed_models: JSON.stringify(normalizeKeyAllowedModels(input.allowed_models)),
     }
     if (rec.expires_at && Number.isNaN(Date.parse(rec.expires_at))) {
@@ -335,8 +343,10 @@ export class ApiKeyStore {
       rec.status = 'active'
     }
     if (patch.category != null) {
-      rec.category = String(patch.category).toLowerCase() === 'api' ? 'api' : 'oauth'
+      rec.category = String(patch.category).trim().toLowerCase() === 'api' ? 'api' : 'oauth'
     }
+    if (rec.category !== 'api') rec.api_endpoint_id = null
+    else if (Object.hasOwn(patch, 'api_endpoint_id')) rec.api_endpoint_id = patch.api_endpoint_id ?? null
     const scope = normalizeKeyScope(patch, { partial: true, current: rec, isApi: rec.category === 'api' })
     if (scope) Object.assign(rec, storedKeyScope(scope))
     if (Object.hasOwn(patch, 'allowed_models')) {

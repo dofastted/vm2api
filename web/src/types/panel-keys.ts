@@ -15,6 +15,7 @@ export type ApiKeyItem = {
   revealable?: boolean
   status?: string
   category?: 'oauth' | 'api'
+  api_endpoint_id?: string | null
   max_concurrency?: number
   quota_requests?: number
   quota_used?: number

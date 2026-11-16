@@ -116,6 +116,7 @@ export function savedEndpointKey(store, keyId) {
       proxy_url: key.proxy_url || '',
       base_url: endpoint.base_url || '',
       protocol: endpoint.protocol || 'anthropic',
+      headers: endpoint.headers,
       auth_scheme: endpoint.auth_scheme || endpoint.headers?.auth_scheme || '',
     }
   }
