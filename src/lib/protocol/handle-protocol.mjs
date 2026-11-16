@@ -340,13 +340,16 @@ export function createHandleProtocol(deps) {
   }
 
   function mapProtocolClientError(result, logBag, fallbackCode) {
-    const originalCode = result?.body?.error?.code || fallbackCode
+    const opaqueCrag429 = result?.policy?.reason === 'crag_opaque_429'
+    const originalCode = opaqueCrag429 ? result.policy.reason : result?.body?.error?.code || fallbackCode
     const originalMessage = result?.body?.error?.message || null
     const details = result?.body?.error?.details || {}
     const mapped = rewritePoolErrorForClient(
       mapUpstreamError(result?.status || 503, result?.body, result?.headers || {}),
       result?.body,
     )
+    // Do not turn this opaque rejection into advice to wait or switch accounts.
+    if (opaqueCrag429) mapped.body.error.message = originalMessage
     const summary = formatPoolSelectionSummary(details)
     const mappedCode = mapped.body?.error?.code
     if (mappedCode === ErrorCode.REFUSAL_GUARD) {
@@ -2173,7 +2176,8 @@ export function createHandleProtocol(deps) {
     }
     rememberRefusal({ inbound, body: ctx.body, headers: req.headers, result, logBag, requestId: logCtx.request_id })
 
-    if (result?.accountId) {
+    // This request never reached generation and supplies no account quota evidence.
+    if (result?.accountId && result.policy?.reason !== 'crag_opaque_429') {
       try {
         const limitText = [
           logBag.error_message,

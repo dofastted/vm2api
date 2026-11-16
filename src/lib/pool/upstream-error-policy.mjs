@@ -618,6 +618,27 @@ function classifyUpstreamResultRaw(
     if (ENTITLEMENT_PATTERNS.some((pattern) => pattern.test(message))) {
       return { scope: 'request', action: 'stop', reason: 'entitlement_required', cooldownUntil: null }
     }
+    const facts = result.providerResult
+    const upstreamHeaders = facts?.response_headers
+    // #1139: CRAG reports this rejection before generation. Require the
+    // provider's own HTTP observation; a bare 429 alone proves no request error.
+    if (
+      facts?.schema_version === 2 &&
+      facts.source === 'provider_http' &&
+      facts.http_status === 429 &&
+      facts.error?.type === 'rate_limit_error' &&
+      facts.error.message === 'Error' &&
+      result.body?.error?.type === 'rate_limit_error' &&
+      message === 'Error' &&
+      upstreamHeaders &&
+      typeof upstreamHeaders === 'object' &&
+      !Array.isArray(upstreamHeaders) &&
+      ![upstreamHeaders, result.headers].some((headers) =>
+        Object.keys(headers || {}).some((name) => /^(anthropic-ratelimit-|retry-after$)/i.test(name)),
+      )
+    ) {
+      return { scope: 'request', action: 'stop', reason: 'crag_opaque_429', cooldownUntil: null }
+    }
     if (isUnifiedAccountLimit(result.headers)) {
       return {
         scope: 'account',
