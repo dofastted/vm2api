@@ -304,6 +304,16 @@ function updateSlotRestartPolicy(vm, existing, run) {
   return { ...result, changed: result.ok === true }
 }
 
+function hasCragHostMount(projectRoot, slot) {
+  const result = sh(['docker', 'inspect', '--format', '{{json .Mounts}}', slot], { timeout: 3000 })
+  if (!result.ok) throw new Error('Could not inspect Docker slot mounts')
+  const mounts = JSON.parse(result.stdout)
+  if (!Array.isArray(mounts)) throw new Error('Invalid Docker slot mount list')
+  const mount = mounts.find((item) => item.Destination === CRAG_HOST_MOUNT)
+  const source = toHostPath(cragSubscriptionPublicDirectory(projectRoot), { projectRoot })
+  return mount?.Type === 'bind' && mount.RW === false && mount.Source === source
+}
+
 /** Binding needs a compatible package, not a running worker. */
 export function assertCragSubscriptionTarget(
   projectRoot,
@@ -354,14 +364,8 @@ export function assertCragSubscriptionTarget(
     } catch {}
     throw unsupported()
   }
-  const result = sh(['docker', 'inspect', '--format', '{{json .Mounts}}', slot], { timeout: 3000 })
   try {
-    if (!result.ok) throw unsupported()
-    const mounts = JSON.parse(result.stdout)
-    const mount = Array.isArray(mounts) && mounts.find((item) => item.Destination === CRAG_HOST_MOUNT)
-    const source = cragSubscriptionPublicDirectory(projectRoot)
-    if (mount?.Type !== 'bind' || mount.RW !== false || mount.Source !== toHostPath(source, { projectRoot }))
-      throw unsupported()
+    if (!hasCragHostMount(projectRoot, slot)) throw unsupported()
   } catch {
     throw unsupported()
   }
@@ -1238,11 +1242,20 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
   const restartPolicy = updateSlotRestartPolicy(vm, existing, sh)
   if (!restartPolicy.ok) return { ok: false, error: restartPolicy.stderr || 'slot restart policy update failed' }
   const paths = workerPaths(projectRoot, vm.id, vm)
-  const replace =
+  let replace =
     recreate ||
     (existing?.running && !slotKernelAlive(existing, paths, vm)) ||
     codexContainerStale(existing, vm) ||
     nativeSlotSandboxNeedsRecreate(existing, vm, resolvedRouting)
+  // A valid host permit still needs the shared entitlement inside the slot.
+  // Docker start cannot add bind mounts to an existing stopped container.
+  if (!replace && existing && !existing.running && !kvm && !vm.node_id && licensed.license?.scope === 'host') {
+    try {
+      replace = !hasCragHostMount(projectRoot, name)
+    } catch {
+      return { ok: false, code: 'crag_host_mount_inspect_failed', error: '无法确认 Docker 槽的 CRAG 宿主授权挂载' }
+    }
+  }
   // Node restart / 开机 must not bounce a live slot with a healthy worker.
   if (existing?.running && !replace) {
     runtimePatch(vm, existing, {
