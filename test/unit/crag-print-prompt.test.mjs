@@ -10,6 +10,7 @@ import {
   cragV2KernelActive,
   foldHistorySystemMessages,
   prepareCragPrintBody,
+  liftInlineToolDefinitions,
   projectCallerSystem,
   readSlotKernelConfig,
   resolveCragPrintPersona,
@@ -483,4 +484,76 @@ test('a fold that would put a 1h breakpoint after a 5m one keeps the system turn
   )
   assert.equal(folded[2].content[0].type, 'tool_result')
   assert.equal(folded[2].content[1].cache_control.ttl, '1h')
+})
+
+test('prepareCragPrintBody lifts inline tool_definition additions into top-level tools (#1118)', () => {
+  const definition = { name: 'Artifact', description: 'Publish', input_schema: { type: 'object', properties: {} } }
+  const read = { name: 'Read', description: 'Read', input_schema: { type: 'object', properties: {} } }
+  const addition = { type: 'tool_addition', tool: { type: 'tool_definition', definition } }
+  const body = {
+    model: 'claude-opus-5-5',
+    tools: [read],
+    messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'system', content: [{ type: 'text', text: 'Tools changed.' }, addition] },
+      { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+      { role: 'system', content: [{ type: 'tool_addition', tool: { type: 'tool_definition', definition } }] },
+      { role: 'user', content: 'go' },
+    ],
+  }
+  const out = prepareCragPrintBody(body, { preset: 'official_full', foldSystemMessages: false })
+  assert.deepEqual(out.tools, [read, definition])
+  assert.deepEqual(out.messages[1].content[1], {
+    type: 'tool_addition',
+    tool: { type: 'tool_reference', name: 'Artifact' },
+  })
+  assert.deepEqual(out.messages[3].content[0], {
+    type: 'tool_addition',
+    tool: { type: 'tool_reference', name: 'Artifact' },
+  })
+  assert.equal(JSON.stringify(out).includes('tool_definition'), false)
+  assert.equal(body.tools.length, 1, 'caller body is not mutated')
+  assert.equal(body.messages[1].content[1], addition)
+})
+
+test('liftInlineToolDefinitions leaves tool_reference additions and declared tools alone', () => {
+  const ref = { type: 'tool_addition', tool: { type: 'tool_reference', name: 'EnterWorktree' } }
+  const body = {
+    tools: [{ name: 'EnterWorktree', defer_loading: true }],
+    messages: [{ role: 'system', content: [ref] }],
+  }
+  assert.equal(liftInlineToolDefinitions(body), body)
+  const declared = {
+    tools: [{ name: 'Artifact' }],
+    messages: [
+      {
+        role: 'system',
+        content: [{ type: 'tool_addition', tool: { type: 'tool_definition', definition: { name: 'Artifact' } } }],
+      },
+    ],
+  }
+  const out = liftInlineToolDefinitions(declared)
+  assert.deepEqual(out.tools, [{ name: 'Artifact' }])
+  assert.deepEqual(out.messages[0].content[0].tool, { type: 'tool_reference', name: 'Artifact' })
+})
+
+test('liftInlineToolDefinitions marks a lifted tool eager when the declared custom tools are', () => {
+  const addition = {
+    type: 'tool_addition',
+    tool: { type: 'tool_definition', definition: { name: 'Artifact', input_schema: { type: 'object' } } },
+  }
+  const messages = [{ role: 'system', content: [addition] }]
+  const eager = liftInlineToolDefinitions({
+    tools: [{ name: 'Read', input_schema: {}, eager_input_streaming: true }],
+    messages,
+  })
+  assert.deepEqual(eager.tools[1], { name: 'Artifact', input_schema: { type: 'object' }, eager_input_streaming: true })
+  const mixed = liftInlineToolDefinitions({
+    tools: [
+      { name: 'Read', input_schema: {}, eager_input_streaming: true },
+      { name: 'Bash', input_schema: {} },
+    ],
+    messages,
+  })
+  assert.equal('eager_input_streaming' in mixed.tools[2], false)
 })

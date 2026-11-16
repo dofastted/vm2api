@@ -390,6 +390,61 @@ function foldSummarySystemTurns(messages) {
 }
 
 /**
+ * Temporary (dofastted/vm2api#1118): CRAG 3.0.7 only understands
+ * `tool_addition.tool.type: "tool_reference"` and rejects Claude Code 2.1.325's
+ * inline `tool_definition` with 400 "tool_addition requires a tool name"; the
+ * block then stays in history, so every later turn of that session fails.
+ * Lift each inline definition into top-level `tools` and point the block at it
+ * by name. A tool already declared at top level is not duplicated. The lifted
+ * tool is a plain (not deferred) tool: through CRAG a deferred tool named by a
+ * tool_reference addition is not reliably offered to the model. The tools
+ * prefix changes once, on the turn the tool is added.
+ * The gateway's eager_input_streaming policy has already run on the declared
+ * tools; a lifted tool follows it when every declared custom tool is eager.
+ */
+export function liftInlineToolDefinitions(body) {
+  if (!Array.isArray(body?.messages)) return body
+  const lifted = []
+  const declared = Array.isArray(body.tools) ? body.tools : []
+  const known = new Set(declared.map((tool) => tool?.name).filter(Boolean))
+  const custom = declared.filter((tool) => tool?.input_schema)
+  const eager = custom.length > 0 && custom.every((tool) => tool.eager_input_streaming === true)
+  let changed = false
+  const messages = body.messages.map((message) => {
+    if (!Array.isArray(message?.content)) return message
+    if (!message.content.some(isInlineToolDefinition)) return message
+    changed = true
+    return {
+      ...message,
+      content: message.content.map((block) => {
+        if (!isInlineToolDefinition(block)) return block
+        const definition = block.tool.definition
+        if (!known.has(definition.name)) {
+          known.add(definition.name)
+          const tool = { ...definition }
+          if (eager && typeof definition.eager_input_streaming !== 'boolean') tool.eager_input_streaming = true
+          lifted.push(tool)
+        }
+        return { ...block, tool: { type: 'tool_reference', name: definition.name } }
+      }),
+    }
+  })
+  if (!changed) return body
+  const out = { ...body, messages }
+  if (lifted.length) out.tools = [...(Array.isArray(body.tools) ? body.tools : []), ...lifted]
+  return out
+}
+
+function isInlineToolDefinition(block) {
+  return (
+    block?.type === 'tool_addition' &&
+    block.tool?.type === 'tool_definition' &&
+    typeof block.tool.definition?.name === 'string' &&
+    block.tool.definition.name !== ''
+  )
+}
+
+/**
  * @param {object} body caller body, before cli-node persona injection
  * @param {{ preset?: 'official_full' | 'zero', officialPassthrough?: boolean, capabilities?: string[], agentSummary?: boolean, foldSystemMessages?: boolean }} [options]
  */
@@ -403,7 +458,7 @@ export function prepareCragPrintBody(
     foldSystemMessages = true,
   } = {},
 ) {
-  const out = { ...(body || {}) }
+  const out = liftInlineToolDefinitions({ ...(body || {}) })
   if (agentSummary) out.messages = readOnlySummaryResults(out.messages)
   if (foldSystemMessages) {
     const folded = agentSummary ? foldSummarySystemTurns(out.messages) : foldSystemTurns(out.messages)
