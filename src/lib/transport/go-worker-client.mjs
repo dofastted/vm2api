@@ -800,7 +800,39 @@ function mockScenario(exec) {
   }
 }
 
-export async function callGoWorker({
+function restoreCragPolicyBlock(result) {
+  if (!result || result.ok || result.committed || isClientCancelledResult(result)) return result
+  const facts = result.providerResult
+  if (
+    facts?.schema_version !== 2 ||
+    facts.source !== 'crag' ||
+    facts.provider_complete !== false ||
+    facts.observation?.policy_blocked !== true ||
+    facts.observation?.exception?.code !== 'CRAG_CACHE_CONTROL'
+  )
+    return result
+  return {
+    ...result,
+    status: 502,
+    terminalState: 'rejected',
+    cragPolicyBlock: true,
+    body: {
+      type: 'error',
+      error: {
+        type: 'api_error',
+        code: 'crag_policy_blocked',
+        message: 'Gateway kernel rejected the request cache controls before dispatch (CRAG_CACHE_CONTROL)',
+        details: { retryable: false },
+      },
+    },
+  }
+}
+
+export async function callGoWorker(options) {
+  return restoreCragPolicyBlock(await callGoWorkerRaw(options))
+}
+
+async function callGoWorkerRaw({
   requestContext = null,
   exec,
   body,
@@ -1003,7 +1035,11 @@ export async function callGoWorker({
   }
 }
 
-export async function streamGoWorker({
+export async function streamGoWorker(options) {
+  return restoreCragPolicyBlock(await streamGoWorkerRaw(options))
+}
+
+async function streamGoWorkerRaw({
   requestContext = null,
   exec,
   body,
