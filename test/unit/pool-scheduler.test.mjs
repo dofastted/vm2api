@@ -547,6 +547,35 @@ test('long cooldown beyond wait budget fails immediately', async (t) => {
   assert.equal(selected.available, 0)
 })
 
+test('pinned quota cooldown returns rate limited with retry time without dispatching', async (t) => {
+  const root = project()
+  let pool
+  t.after(() => cleanupProject(root, pool))
+  const repo = new RuntimeRepo()
+  repo.markCooldown('account-1', { vmId: 'vm-01', until: Date.now() + 60_000, reason: 'quota_5h_header' })
+  pool = new PoolScheduler({
+    projectRoot: root,
+    runtimeRepo: repo,
+    accountQuota: { canAccept: () => ({ ok: true }) },
+    workerHealth: async () => ({ ok: true, credential: { generation: 1, has_access: true } }),
+  })
+  let dispatched = false
+  const result = await new FailoverRunner({ scheduler: pool }).run({
+    requestId: 'quota-cooldown-pin',
+    model: 'claude-test',
+    pinVmId: 'vm-01',
+    callAttempt: async () => {
+      dispatched = true
+      throw new Error('must not dispatch')
+    },
+  })
+  assert.equal(dispatched, false)
+  assert.equal(result.status, 429)
+  assert.equal(result.body.error.code, 'pool_rate_limited')
+  assert.ok(result.retryAfterSec > 0)
+  assert.deepEqual(result.body.error.details.wait_reasons, ['account_cooldown'])
+})
+
 test('wait timeouts clamp to 1s–120s and invalid values fall back', () => {
   const pool = new PoolScheduler({
     config: { sticky_wait_timeout_ms: 500, fallback_wait_timeout_ms: 999999 },
