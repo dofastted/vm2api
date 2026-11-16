@@ -303,7 +303,7 @@ function CostCard({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
       total: true,
     },
   ]
-  const perReq = week.req > 0 ? week.cost / week.req : null
+  const perReq = week.req > 0 && week.cost > 0 ? week.cost / week.req : null
   return (
     <section className={CARD} aria-label='成本拆分'>
       <div className={CARD_HEAD}>
