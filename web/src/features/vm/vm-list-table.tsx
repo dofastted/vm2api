@@ -181,32 +181,21 @@ function ResetMeter({ resetAt, now }: { resetAt: unknown; now: number }) {
   )
 }
 
-/** 调度等级和权重用同一套由浅到深的色阶。重置用剩余时间条。 */
-function TypeCell({ vm, now }: { vm: Vm; now: number }) {
+function SchedulingPriorityCell({ vm, now }: { vm: Vm; now: number }) {
   const level = Number(vm.schedule_level)
   const levelOk = Number.isInteger(level) && level >= 1 && level <= 10
-  const weight = Number(vm.weight)
-  const weightOk = Number.isInteger(weight) && weight >= 1 && weight <= 100
-  const hasToken = Boolean(vm.has_token)
   return (
     <div className='min-w-0 space-y-1'>
-      <div className='flex flex-wrap items-center gap-1'>
-        <DepthChip
-          label={levelOk ? `等级 ${level}` : '等级 —'}
-          title={
-            levelOk
-              ? `${vm.schedule_level_mode === 'manual' ? '手动' : '自动'}调度等级，1 最浅，10 最深`
-              : '没有调度等级'
-          }
-          t={levelOk ? scaleT(level, 1, 10) : null}
-        />
-        <DepthChip
-          label={weightOk ? `权重 ${weight}` : '权重 —'}
-          title={weightOk ? '同级选槽权重，1 最浅，100 最深' : '没有权重'}
-          t={weightOk ? scaleT(weight, 1, 100) : null}
-        />
-      </div>
-      {hasToken ? (
+      <DepthChip
+        label={`调度优先级 ${levelOk ? level : '—'}`}
+        title={
+          levelOk
+            ? `${vm.schedule_level_mode === 'manual' ? '手动' : '自动'}调度优先级，数值越大越优先`
+            : '没有调度优先级'
+        }
+        t={levelOk ? scaleT(level, 1, 10) : null}
+      />
+      {vm.has_token ? (
         <ResetMeter resetAt={vm.reset_7d || vm.reset_7d_oi} now={now} />
       ) : null}
     </div>
@@ -398,8 +387,8 @@ const COLUMNS: Record<
     ),
   },
   type: {
-    label: '类型',
-    cell: ({ vm, now }) => <TypeCell vm={vm} now={now} />,
+    label: '调度优先级',
+    cell: ({ vm, now }) => <SchedulingPriorityCell vm={vm} now={now} />,
   },
   status: {
     label: '状态',
