@@ -41,11 +41,12 @@ const licenseMessages: Record<string, string> = {
   host_subscription_inactive: '本机没有有效订阅，请兑换或续费。',
   host_binding_conflict: '此槽的设备身份与原绑定不一致。',
   issuer_mismatch: '授权服务不认可目标内核的发行方，本次未兑换。',
-  payload_key_unknown: '授权服务未配置当前内核载荷，本次未兑换。',
+  payload_key_unknown:
+    '授权服务未登记此内核载荷。已到账的订阅额度会保留，可在兼容槽位使用。',
   payload_key_conflict: '本槽已有绑定对应不同的内核载荷。',
   slot_limit_reached: '宿主机应用锁额度已用完，本槽未绑定。',
   crag_subscription_target_unready:
-    '此槽暂不能绑定订阅。请选择使用可信 CRAG 包的 Linux Docker Claude 槽，或核对是否已有其他有效授权。',
+    '此槽暂不能绑定订阅。请确认使用可信 CRAG 包，且未绑定其他有效授权。',
   crag_subscription_target_changed: '目标槽或内核已变化，请核对后重试。',
   crag_subscription_sync_pending:
     '宿主机还有未完成的同步。请在原目标槽使用原码完成激活，或先完成原订单的激活。',

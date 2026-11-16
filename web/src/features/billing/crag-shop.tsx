@@ -100,13 +100,6 @@ const dateTime = new Intl.DateTimeFormat('zh-CN', {
   dateStyle: 'medium',
   timeStyle: 'short',
 })
-const hostTones: Record<CragHostStatus['state'], StatusTone> = {
-  unavailable: { key: 'unavailable', cls: 'bad', text: '状态不可用' },
-  unredeemed: { key: 'unredeemed', cls: 'none', text: '尚未兑换' },
-  active: { key: 'active', cls: 'ok', text: '订阅有效' },
-  expired: { key: 'expired', cls: 'bad', text: '已到期' },
-  sync_pending: { key: 'sync_pending', cls: 'caution', text: '等待同步' },
-}
 const orderSteps = [
   { label: '建单', done: '已建单' },
   { label: '付款', done: '已付款' },
@@ -152,12 +145,6 @@ function SubscriptionTime({ seconds }: { seconds: number }) {
   return <time dateTime={date.toISOString()}>{dateTime.format(date)}</time>
 }
 
-const licenseScopeLabels = {
-  host: '宿主订阅',
-  device: '设备授权',
-  kernel: 'Legacy 离线授权',
-} as const
-
 function hostRedemptionError(error: unknown) {
   switch (isApiError(error) ? error.code : undefined) {
     case 'crag_subscription_invalid_request':
@@ -182,7 +169,6 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
   const [action, setAction] = useState<'redeem' | 'recover' | 'upgrade'>()
   const operating = useRef(false)
   const status = host.isError ? undefined : host.data
-  const activatedSlots = status?.activated_slots
   const syncPending = host.data?.state === 'sync_pending'
   const upgrading = action === 'upgrade'
 
@@ -239,11 +225,6 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
     }
   }
   const probeFailed = status?.target_probe_failed && !status.ready
-  const tone = status
-    ? hostTones[status.state]
-    : host.isError
-      ? { key: 'error', cls: 'bad', text: '读取失败' }
-      : { key: 'loading', cls: 'none', text: '读取中' }
   return (
     <section
       aria-labelledby='crag-host-overview'
@@ -254,7 +235,6 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
           <h2 id='crag-host-overview' className='font-semibold'>
             本机订阅
           </h2>
-          <StatusMark tone={tone} variant='pill' />
         </div>
         <Button
           size='sm'
@@ -271,84 +251,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
           {status.months != null ? ` · 每期 ${status.months} 个月` : ''}
         </p>
       ) : null}
-      <dl className='grid grid-cols-2 gap-x-3 gap-y-3 border-y py-3 text-sm sm:grid-cols-3'>
-        <div>
-          <dt className='text-xs text-muted-foreground'>宿主订阅到期时间</dt>
-          <dd className='mt-1 font-medium tabular-nums'>
-            {status?.expires_at == null ? (
-              '—'
-            ) : (
-              <SubscriptionTime seconds={status.expires_at} />
-            )}
-          </dd>
-        </div>
-        <div>
-          <dt className='text-xs text-muted-foreground'>
-            已绑定 / 可绑定应用锁
-          </dt>
-          <dd className='mt-1 font-medium tabular-nums'>
-            {status?.used_slots ?? '—'} /{' '}
-            {status?.available_slots === null
-              ? '不限'
-              : (status?.available_slots ?? '—')}
-          </dd>
-        </div>
-        <div>
-          <dt className='text-xs text-muted-foreground'>槽位绑定条件</dt>
-          <dd className='mt-1 font-medium'>
-            {probeFailed
-              ? '探测失败'
-              : !status || status.state === 'unavailable'
-                ? '未知'
-                : status.state === 'sync_pending'
-                  ? '等待同步'
-                  : status.ready
-                    ? '已就绪'
-                    : '未就绪'}
-          </dd>
-        </div>
-      </dl>
       <CragRuntimeCounts status={status} />
-      <p className='text-xs text-muted-foreground'>
-        运行名额只统计实际运行的 CRAG。停止不会解绑应用锁；支持 H2
-        的宿主在退役删除并同步后才释放应用锁。
-      </p>
-      <section aria-labelledby='crag-activated-slots' className='space-y-2'>
-        <h3 id='crag-activated-slots' className='text-sm font-medium'>
-          已激活且授权有效的 CRAG 槽位{' '}
-          <span className='tabular-nums'>{activatedSlots?.length ?? '—'}</span>
-        </h3>
-        {activatedSlots?.length ? (
-          <ul className='divide-y border-y text-sm'>
-            {activatedSlots.map((slot) => (
-              <li
-                key={slot.vm_id}
-                className='flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 py-2'
-              >
-                <span className='min-w-0 break-all'>
-                  {slot.vm_id}{' '}
-                  <span className='text-muted-foreground'>
-                    {licenseScopeLabels[slot.scope]}
-                  </span>
-                </span>
-                <span className='shrink-0 text-muted-foreground tabular-nums'>
-                  到期 <SubscriptionTime seconds={slot.expires_at} />
-                </span>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className='text-sm text-muted-foreground'>
-            {activatedSlots
-              ? '当前没有已激活且授权有效的 CRAG v2 槽位。'
-              : '暂未读取到槽位授权，请刷新本机订阅。'}
-          </p>
-        )}
-        <p className='text-xs text-muted-foreground'>
-          按本机和集群槽位验签统计，不表示槽位已启动。设备和 Legacy
-          授权不计入宿主订阅额度。
-        </p>
-      </section>
       {status?.upgrade_available && !status.reclaim_supported ? (
         <Button
           size='sm'
@@ -385,7 +288,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
       />
       {probeFailed ? (
         <p role='status' className='text-sm text-muted-foreground'>
-          未能确认本机槽位是否就绪。请点击「刷新本机订阅」重试探测。
+          槽位探测失败。请点击「刷新本机订阅」重试探测。
         </p>
       ) : null}
       <p className='text-sm text-muted-foreground empty:sr-only'>
@@ -396,7 +299,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
             : probeFailed
               ? ''
               : status && !status.ready
-                ? '当前没有可绑定的 CRAG 槽位，仍可兑换宿主机额度。本机与集群 Linux Docker CRAG 槽共享该额度。'
+                ? '当前没有可绑定的 CRAG 槽位，仍可兑换。本机与集群的 Docker、KVM 槽共享额度。'
                 : '付款或领码不会更新本机权益。可在此兑换宿主机额度，再到所需槽位的授权页绑定应用锁。'}
       </p>
       {syncPending ? (

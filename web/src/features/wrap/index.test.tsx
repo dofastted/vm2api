@@ -106,9 +106,15 @@ it.each(['host', 'device', 'kernel'] as const)(
     const vm = { runtime_type: 'docker', resolved_dataplane: 'crag' } as const
     expect(render(vm)).toContain('确认重装时会尝试使用本机已激活的宿主订阅')
     expect(render(vm)).toContain('授权有效')
-    expect(render({ ...vm, node_id: 'cluster-node' })).toContain(
-      '当前下载包需要匹配的离线许可'
-    )
+    for (const placement of [
+      { node_id: 'cluster-node' },
+      { runtime: { type: 'kvm' } },
+      { node_id: 'cluster-node', runtime: { type: 'kvm' } },
+    ]) {
+      expect(render({ ...vm, ...placement })).toContain(
+        '确认重装时会尝试使用本机已激活的宿主订阅'
+      )
+    }
     state.installLicenses = { ...state.licenses }
     expect(render(vm)).not.toContain('确认重装时会尝试使用本机已激活的宿主订阅')
   }
@@ -174,11 +180,12 @@ describe('KVM CRAG repair on the kernel page', () => {
 })
 
 describe('CRAG runtime on the kernel page', () => {
-  it('shows signed slots, runtime capacity and live details independent of the selected kernel', () => {
+  it('shows one remaining capacity and per-slot health independent of the selected kernel', () => {
     state.host = {
       ready: true,
       state: 'active',
       slot_limit: 1,
+      available_seats: 0,
       runtime: {
         running_vms: 3,
         ready_vms: 1,
@@ -204,19 +211,16 @@ describe('CRAG runtime on the kernel page', () => {
     const html = render({ status: 'stopped' })
     expect(state.hostEnabled).toBe(true)
     expect(state.hostInterval).toBe(10_000)
-    expect(html).toMatch(/已兑换槽位<\/dt><dd[^>]*>1<\/dd>/)
-    expect(html).toMatch(/宿主机服役<\/dt><dd[^>]*>2<\/dd>/)
-    expect(html).toMatch(/可用运行名额<\/dt><dd[^>]*>0<\/dd>/)
-    expect(html).toMatch(/CRAG 服役 \/ 可用<\/dt><dd[^>]*>3 \/ 1<\/dd>/)
+    expect(html).toMatch(/剩余可用槽位：(?:<!-- -->)?0/)
+    expect(html).not.toContain('可用运行名额')
     expect(html).toContain('已暂停宿主机 CRAG 调用')
-    expect(html).toContain('运行状态 1 台')
     expect(html).toContain('兑换槽位')
     expect(html).toContain('服役中 / 暂不可用')
     expect(html).toContain('版本 3.0.8 · 处理中 0 · 排队 0 · 就绪处理槽 0')
 
     state.role = 'user'
     const userHtml = render()
-    expect(userHtml).not.toContain('宿主机服役')
+    expect(userHtml).not.toContain('剩余可用槽位')
     expect(userHtml).not.toContain('服役中 / 暂不可用')
     expect(userHtml).not.toContain('兑换槽位')
     expect(state.hostEnabled).toBe(false)
@@ -231,13 +235,13 @@ describe('CRAG runtime on the kernel page', () => {
       status: 'running',
     } as const
     const html = render(cragVm)
-    expect(html).toMatch(/可用运行名额<\/dt><dd[^>]*>待核对<\/dd>/)
+    expect(html).toMatch(/剩余可用槽位：(?:<!-- -->)?待核对/)
     expect(html).toContain('CRAG：运行状态未知')
 
     state.hostError = true
     const errorHtml = render(cragVm)
     expect(errorHtml).toContain('重装 vm-old 的 CRAG 并重启')
     expect(errorHtml).toContain('CRAG：运行状态未知')
-    expect(errorHtml).toMatch(/已兑换槽位<\/dt><dd[^>]*>待核对<\/dd>/)
+    expect(errorHtml).toMatch(/剩余可用槽位：(?:<!-- -->)?待核对/)
   })
 })

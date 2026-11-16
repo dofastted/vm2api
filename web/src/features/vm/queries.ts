@@ -83,6 +83,7 @@ export type CragHostStatus = {
     expires_at: number
   }>
   available_slots?: number | null
+  available_seats?: number | 'unlimited' | null
   reclaim_supported?: boolean
   upgrade_available?: boolean
   runtime?: CragRuntime
