@@ -102,7 +102,7 @@ export function parseUpstreamModels(payload, protocol = 'anthropic') {
   const out = []
   const seen = new Set()
   for (const row of rows) {
-    const name = String(row?.id || row?.name || '').trim()
+    const name = String((typeof row === 'string' ? row : row?.id || row?.name) || '').trim()
     if (!name) continue
     if (protocol === 'openai' && SKIP_OPENAI.test(name)) continue
     const key = name.toLowerCase()

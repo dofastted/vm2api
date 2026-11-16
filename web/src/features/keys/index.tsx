@@ -23,6 +23,7 @@ import { PageHeader } from '@/components/page-header'
 import { TableSkeleton } from '@/components/page-skeletons'
 import { QueryGate } from '@/components/query-gate'
 import { StatusMark } from '@/components/status-mark'
+import { apiEndpointsQueryOptions } from '@/features/api-endpoints/queries'
 import { meQueryOptions } from '@/features/auth/queries'
 import { apiKeysQueryOptions } from '@/features/keys/queries'
 import { vmsListQueryOptions } from '@/features/vm/queries'
@@ -63,6 +64,10 @@ export function KeysPage() {
   const [rotateId, setRotateId] = useState('')
   const [revealed, setRevealed] = useState<RevealedKey | null>(null)
   const [delId, setDelId] = useState('')
+  const channels = useQuery({
+    ...apiEndpointsQueryOptions(),
+    enabled: isAdmin && (createOpen || !!editId),
+  })
   const keys = q.data?.keys || []
   const editing = keys.find((k) => k.id === editId) || null
   const rotating = keys.find((k) => k.id === rotateId) || null
@@ -97,7 +102,7 @@ export function KeysPage() {
         body: JSON.stringify(keyLimitsPayload(draft, 'edit', { isAdmin })),
       }),
     onSuccess: async () => {
-      toast.success('并发已更新')
+      toast.success('密钥已更新')
       setEditId('')
       await refresh()
     },
@@ -270,6 +275,9 @@ export function KeysPage() {
         pending={create.isPending}
         vms={vmItems}
         pools={isAdmin ? pools.data?.pools || [] : undefined}
+        channels={isAdmin ? channels.data?.items || [] : undefined}
+        channelsLoading={channels.isPending}
+        channelsError={channels.isError}
         onSubmit={(draft) => create.mutate(draft)}
       />
       <KeyLimitsDialog
@@ -281,6 +289,9 @@ export function KeysPage() {
         initial={editing}
         vms={vmItems}
         pools={isAdmin ? pools.data?.pools || [] : undefined}
+        channels={isAdmin ? channels.data?.items || [] : undefined}
+        channelsLoading={channels.isPending}
+        channelsError={channels.isError}
         pending={edit.isPending}
         onSubmit={(draft) => {
           if (!editId) return

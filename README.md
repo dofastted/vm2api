@@ -76,7 +76,7 @@
 对照 **1.4.053**（`main` 当前版本）。下列为 1.4.038–1.4.053 已上线、调用方或管理员能直接感知的变化摘要；完整条目见 [CHANGELOG.md](CHANGELOG.md)，操作说明见 [入门文档](https://vm2api.fkcodex.com/zh/)。下文升级概述不能替代逐版说明，**具体以各版本 CHANGELOG 的升级注意为准**。
 
 - **内容脱敏（可选）**：设置 →「脱敏」页（`/console/#/settings/redaction`）可配置凭据、个人信息与自定义规则；默认关闭。启用需本机 `bin/kin-redact`，helper 未就绪时不能保存为开启，请求也不会回落明文。
-- **API 直连**：管理台 API 配置统一到 `#/api`；`api` 类密钥按端点协议调度上游，不经 OAuth / Codex 槽位。Anthropic 端点可单独开关「风控前置审查」。
+- **API 直连**：在 `#/api` 为渠道「获取模型」，已保存且未改配置的渠道会立即写入模型列表，新建或修改的渠道需点「保存」。生成密钥时选择「API 直连」和具体渠道；此密钥的 `/v1/models` 和推理都只用所选渠道，不经 OAuth / Codex 槽位。已有未绑定密钥沿用原协议范围，可编辑后绑定。Anthropic 端点可单独开关「风控前置审查」。
 - **协议与计费**：官方 Claude Code 透传、缓存断点 TTL 与 `max_tokens` 默认值（如 Haiku 5.5 为 100K）与面板一致；GPT Image 模型可在 Chat / Responses 路径出图；第三方计费限制类上游错误写入拒答缓存（`refusal_guard`）。
 - **封控与配额**：决策模型支持多组 URL / Key；托管密钥可 `GET /v1/me/quota` 与 `GET /v1/me/usage`；租户可看用量统计，虚拟机只读（无代理与重新授权）。
 - **面板与运维**：按角色隐藏无权页面；槽位官方登录执行 `claude auth login`；平滑停机时 `/health` 返回 503 `shutting_down`；控制面升级多为更新镜像并重启（多数版本不必 `wrap-cli/sync` 或换 payload，勿覆盖 `routing.json`、`vms/`、`data/`、`.env`）。
