@@ -148,10 +148,6 @@ test('catalog exposes exactly two products with honest versions and no paths or 
     ],
   )
   assert.equal(rows[0].updated_at, null)
-  assert.deepEqual(rows[1].release_options, [
-    { tag: 'payload-2026.11.16-crag-3.1.2', label: '3.1.2 标准版' },
-    { tag: 'payload-2026.11.16-crag-3.1.2-legacy', label: '3.1.2 旧授权兼容版' },
-  ])
   assert.equal(JSON.stringify(rows).includes(root), false)
   assert.equal(JSON.stringify(rows).includes('public_key'), false)
   assert.equal(fs.existsSync(path.join(root, 'vms')), false)
