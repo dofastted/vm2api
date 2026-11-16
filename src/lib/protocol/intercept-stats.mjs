@@ -51,6 +51,7 @@ export function gateVerdict(fields = {}) {
     by: String(fields.by || '').slice(0, 40),
     keyword: String(fields.keyword || '').slice(0, 40),
     rule: String(fields.rule || '').slice(0, 120),
+    ...(fields.route ? { route: fields.route } : {}),
   })
 }
 
@@ -89,10 +90,18 @@ export function foldInterceptRows(rows) {
   const passes = new Map()
   let blocked = 0
   let passed = 0
+  const routes = new Map()
   for (const row of rows || []) {
     const count = Number(row?.count || 0)
     if (!count) continue
     const verdict = parseVerdict(row.intercept) || legacyVerdict(row)
+    if (verdict.kind === 'pass' && verdict.route && Number(row.hopped)) {
+      const { kind, target } = verdict.route
+      const routeKey = `${kind}:${target}`
+      const route = routes.get(routeKey) || { kind, target, count: 0 }
+      route.count += count
+      routes.set(routeKey, route)
+    }
     const key = `${verdict.kind}:${verdict.by}:${verdict.keyword || ''}:${verdict.rule || ''}`
     const bucket = verdict.kind === 'block' ? blocks : passes
     const prev = bucket.get(key)
@@ -116,5 +125,8 @@ export function foldInterceptRows(rows) {
     passed,
     blocks: sort([...blocks.values()]),
     passes: sort([...passes.values()]),
+    routes: [...routes.values()].sort(
+      (left, right) => right.count - left.count || left.target.localeCompare(right.target),
+    ),
   }
 }

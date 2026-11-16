@@ -949,6 +949,7 @@ export async function callGoWorker({
         nativeHandoff && parsed?.type === 'error' && response.statusCode < 400
           ? nativeErrorStatus(handoff, parsed)
           : response.statusCode || 0,
+      upstreamStatus: response.statusCode ?? null,
       via: 'go-worker',
       body: parsed,
       headers,
@@ -1204,6 +1205,7 @@ export async function streamGoWorker({
       const result = restoreKernelErrorStatus({
         ok: false,
         status: response.statusCode || 0,
+        upstreamStatus: response.statusCode ?? null,
         via: 'go-worker-stream',
         body: decoded,
         headers,
@@ -1262,6 +1264,7 @@ export async function streamGoWorker({
       return {
         ok: !failed,
         status: failed ? nativeErrorStatus(handoff, body) : response.statusCode,
+        upstreamStatus: response.statusCode ?? null,
         via: 'go-worker-stream',
         body,
         headers: mergeRateLimitHeaders(publicHeaders({ ...received.headers, ...headers, ...trailers })),
@@ -1453,6 +1456,7 @@ export async function streamGoWorker({
             : nativeTimeout && !committed
               ? 504
               : response.statusCode || 0,
+        upstreamStatus: response.statusCode ?? null,
         via: 'go-worker-stream',
 
         body: handoff
