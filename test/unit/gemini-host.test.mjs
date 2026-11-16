@@ -38,12 +38,28 @@ function setup(callHost, proxy = bound) {
 test('Gemini import is admin-only and unavailable without the host service', async () => {
   assert.equal(authorizePanelRoute('GET', root, 'user').ok, false)
   assert.equal(authorizePanelRoute('POST', `${root}/environments`, 'super').ok, false)
+  assert.equal(authorizePanelRoute('POST', `${root}/environments/${record.id}/refresh`, 'user').ok, false)
   assert.equal(authorizePanelRoute('POST', `${root}/environments`, 'admin').ok, true)
   const run = setup(() => {
     throw new Error('private socket path')
   })
   const result = await run('GET', root)
   assert.deepEqual(result, { status: 200, body: { ok: true, data: { available: false, environments: [] } } })
+})
+
+test('reachable Gemini host reports lazy install without dependencies on an existing environment', async () => {
+  const run = setup(() => ({ payload_state: 'install_on_create', environments: [] }))
+  assert.deepEqual((await run('GET', root)).body.data, {
+    available: true,
+    payload_state: 'install_on_create',
+    environments: [],
+  })
+  const invalidPayload = setup(() => {
+    throw Object.assign(new Error(), { code: 'gemini_payload_invalid' })
+  })
+  const result = await invalidPayload('POST', `${root}/environments`, { name: record.name, proxy_id: record.proxy_id })
+  assert.equal(result.status, 503)
+  assert.equal(result.body.error.code, 'gemini_payload_invalid')
 })
 
 test('only explicit platform SOCKS5 environments are created and credentials stay private', async () => {
@@ -55,7 +71,17 @@ test('only explicit platform SOCKS5 environments are created and credentials sta
   })
   const result = await run('POST', `${root}/environments`, create)
   assert.equal(result.status, 200)
-  assert.deepEqual(result.body.data, { ...record, runtime_ready: false, models: [], billing_ready: false })
+  assert.deepEqual(result.body.data, {
+    ...record,
+    auth_method: 'oauth',
+    kernel_version: null,
+    account: null,
+    created_at: null,
+    updated_at: null,
+    runtime_ready: false,
+    models: [],
+    billing_ready: false,
+  })
   for (const proxy of [
     { ...bound, enabled: false },
     { ...bound, owner_user_id: 'tenant' },
@@ -64,6 +90,44 @@ test('only explicit platform SOCKS5 environments are created and credentials sta
     const blocked = setup(() => assert.fail('unavailable proxy must not reach the host'), proxy)
     assert.equal((await blocked('POST', `${root}/environments`, create)).status, 409)
   }
+})
+
+test('API key import returns only approved account and quota fields', async () => {
+  const secret = 'AIza-fixture-never-returned'
+  const create = { name: record.name, proxy_id: record.proxy_id, auth_method: 'api_key', api_key: secret }
+  const run = setup((operation, payload) => {
+    assert.equal(operation, 'create')
+    assert.equal(payload.api_key, secret)
+    assert.equal(payload.auth_method, 'api_key')
+    assert.equal(payload.proxy_url, 'socks5h://fixture:private@192.0.2.11:1080')
+    return {
+      ...record,
+      auth_method: 'api_key',
+      auth_state: 'authorized',
+      api_key: secret,
+      models: ['gemini-3.1-pro'],
+      account: {
+        state: 'ok',
+        access_token: secret,
+        email: 'fixture@example.test',
+        quotas: [
+          { model: 'gemini-3.1-pro', remaining_fraction: 0, token: secret },
+          { model: 'gemini-3.1-pro', remaining_fraction: 3 },
+        ],
+        credits: [{ type: 'AI', amount: '0', raw: secret }],
+      },
+    }
+  })
+  const result = await run('POST', `${root}/environments`, create)
+  assert.equal(result.status, 200)
+  assert.equal(result.body.data.account.email, 'fixture@example.test')
+  assert.deepEqual(result.body.data.account.quotas, [
+    { model: 'gemini-3.1-pro', remaining_fraction: 0, reset_at: null },
+  ])
+  assert.deepEqual(result.body.data.account.credits, [{ type: 'AI', amount: '0' }])
+  assert.equal(result.body.data.billing_ready, false)
+  assert.doesNotMatch(JSON.stringify(result.body), new RegExp(secret))
+  assert.equal((await run('POST', `${root}/environments`, { ...create, api_key: 'invalid' })).status, 400)
 })
 
 test('official login links are validated and code is returned only to its selected environment', async () => {
@@ -80,6 +144,7 @@ test('official login links are validated and code is returned only to its select
     if (operation === 'authorize') return { url: official, attempt_id: 'login-fixture' }
     assert.equal(payload.attempt_id, 'login-fixture')
     assert.equal(payload.code, 'fixture/code')
+    if (operations.length > 4) assert.equal(payload.state, 'fixture')
     return { ...record, auth_state: 'authorizing' }
   })
   assert.deepEqual((await run('POST', auth)).body.data, { url: official, attempt_id: 'login-fixture' })
@@ -87,6 +152,24 @@ test('official login links are validated and code is returned only to its select
   const result = await run('PUT', auth, { attempt_id: 'login-fixture', code: 'fixture/code' })
   assert.equal(result.body.data.auth_state, 'authorizing')
   assert.deepEqual(operations, ['get', 'authorize', 'get', 'complete'])
+  assert.equal(
+    (
+      await run('PUT', auth, {
+        attempt_id: 'login-fixture',
+        code: 'https://antigravity.google/oauth-callback?code=fixture%2Fcode&state=fixture',
+      })
+    ).status,
+    200,
+  )
+  assert.equal(
+    (
+      await run('PUT', auth, {
+        attempt_id: 'login-fixture',
+        code: 'https://antigravity.google/oauth-callback?code=one&code=two&state=fixture',
+      })
+    ).status,
+    400,
+  )
 })
 
 test('missing official settlement cannot be enabled by a host response or a paid route request', () => {
