@@ -294,7 +294,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
           </dd>
         </div>
         <div>
-          <dt className='text-xs text-muted-foreground'>本机槽位绑定条件</dt>
+          <dt className='text-xs text-muted-foreground'>槽位绑定条件</dt>
           <dd className='mt-1 font-medium'>
             {probeFailed
               ? '探测失败'
@@ -340,12 +340,12 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
         ) : (
           <p className='text-sm text-muted-foreground'>
             {activatedSlots
-              ? '当前没有已激活且授权有效的本机 CRAG v2 槽位。'
+              ? '当前没有已激活且授权有效的 CRAG v2 槽位。'
               : '暂未读取到槽位授权，请刷新本机订阅。'}
           </p>
         )}
         <p className='text-xs text-muted-foreground'>
-          按本机槽位验签统计，不表示槽位已启动。设备和 Legacy
+          按本机和集群槽位验签统计，不表示槽位已启动。设备和 Legacy
           授权不计入宿主订阅额度。
         </p>
       </section>
@@ -396,7 +396,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
             : probeFailed
               ? ''
               : status && !status.ready
-                ? '当前没有就绪的本机 CRAG 槽位，仍可兑换宿主机额度。绑定应用锁需要已预装可信 CRAG v2 包的本机 Linux Docker Claude 槽位。'
+                ? '当前没有可绑定的 CRAG 槽位，仍可兑换宿主机额度。本机与集群 Linux Docker CRAG 槽共享该额度。'
                 : '付款或领码不会更新本机权益。可在此兑换宿主机额度，再到所需槽位的授权页绑定应用锁。'}
       </p>
       {syncPending ? (

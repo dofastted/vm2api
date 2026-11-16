@@ -37,19 +37,22 @@ const licenseMessages: Record<string, string> = {
   license_redeem_origin: '请在当前面板页提交兑换，不要从其他站点发起。',
   redeem_unavailable: '兑换码无效、已过期或不可用，请核对原码。',
   host_redeem_conflict: '兑换码不属于本机或已在其他宿主机使用。',
+  auth_forbidden: '鉴权服务不接受当前宿主机的订阅凭据。',
+  host_subscription_inactive: '本机没有有效订阅，请兑换或续费。',
+  host_binding_conflict: '此槽的设备身份与原绑定不一致。',
   issuer_mismatch: '授权服务不认可目标内核的发行方，本次未兑换。',
   payload_key_unknown: '授权服务未配置当前内核载荷，本次未兑换。',
   payload_key_conflict: '本槽已有绑定对应不同的内核载荷。',
   slot_limit_reached: '宿主机应用锁额度已用完，本槽未绑定。',
   crag_subscription_target_unready:
-    '此槽暂不能绑定订阅。请选择已预装受信 CRAG v2 包的本机 Linux Docker Claude 槽，并核对是否已有其他有效授权。',
+    '此槽暂不能绑定订阅。请选择使用可信 CRAG 包的 Linux Docker Claude 槽，或核对是否已有其他有效授权。',
   crag_subscription_target_changed: '目标槽或内核已变化，请核对后重试。',
   crag_subscription_sync_pending:
     '宿主机还有未完成的同步。请在原目标槽使用原码完成激活，或先完成原订单的激活。',
   crag_subscription_authority_unavailable:
     '尚未确认订阅已激活，请在同一目标槽使用原码重试，不必重新购买。',
   crag_v2_unsupported_placement:
-    '此槽不支持该授权方式。KVM 和集群槽仅支持离线通用码。',
+    '此槽不支持该授权方式。单设备兑换码需要本机 Linux Docker 槽。',
 }
 
 const statusLabels: Record<CragLicenseStatus['status'], string> = {

@@ -409,7 +409,7 @@ describe('CRAG buyer presentation and activation wire', () => {
       expect(html).toContain(label)
       expect(html).toContain('探测失败')
       expect(html).toContain('刷新本机订阅」重试探测')
-      expect(html).not.toContain('当前没有就绪的本机 CRAG 槽位')
+      expect(html).not.toContain('当前没有可绑定的 CRAG 槽位')
     }
   })
 
@@ -442,7 +442,7 @@ describe('CRAG buyer presentation and activation wire', () => {
     vi.mocked(api).mockResolvedValueOnce(active)
 
     const html = render()
-    expect(html).toContain('当前没有就绪的本机 CRAG 槽位')
+    expect(html).toContain('当前没有可绑定的 CRAG 槽位')
     expect(html).toContain('宿主机兑换码')
     expect(html).toContain('兑换后以新套餐额度为准；不绑定、不启动 VM。')
     expect(state.hostInput?.type).toBe('password')
@@ -570,7 +570,7 @@ describe('CRAG buyer presentation and activation wire', () => {
       expect(html).toContain(label)
       expect(html).toContain('探测失败')
       expect(html).toContain('刷新本机订阅」重试探测')
-      expect(html).not.toContain('当前没有就绪的本机 CRAG 槽位')
+      expect(html).not.toContain('当前没有可绑定的 CRAG 槽位')
     }
   })
 
