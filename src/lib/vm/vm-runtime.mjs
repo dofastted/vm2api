@@ -17,7 +17,12 @@ import { isValidVmId } from './vm-file.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { kernelBinPath, writeKernelConfig } from '../transport/rust-kernel-supervisor.mjs'
-import { checkCragLicense, cragTargetIds, projectCragUniversalVm } from './crag-license.mjs'
+import {
+  checkCragLicense,
+  cragTargetIds,
+  projectCragUniversalVm,
+  readKvmSubscriptionMachineId,
+} from './crag-license.mjs'
 import { withCragRuntimeAdmission } from './slot-runtime-admission.mjs'
 import { CRAG_HOST_MOUNT, cragSubscriptionPublicDirectory } from './crag-subscription-paths.mjs'
 import { isNativeNodeVm } from '../cluster/placement.mjs'
@@ -57,6 +62,7 @@ import { isDockerInspectNotFound } from './docker-container.mjs'
 import { kernelCpuCommand, usesKernelCpuLimit } from './kernel-cpu.mjs'
 import { kvmCragAppArmorCommand } from './kvm-crag-apparmor.mjs'
 import { publishKvmCragLicense } from './kvm-crag-license.mjs'
+import { clearKvmCragSubscription, kvmCragSubscriptionStatusCommand } from './kvm-crag-subscription.mjs'
 
 export const RUNTIME = 'docker'
 const WORKER_BIN = process.env.KIN_WORKER_BIN || '/opt/kin-gateway/bin/kin-worker'
@@ -349,6 +355,15 @@ export function assertCragSubscriptionTarget(
   )
     throw unsupported()
 
+  let guestMachineId
+  if (isKvmRuntime(vm) && !vm.node_id) {
+    try {
+      guestMachineId = readKvmSubscriptionMachineId(projectRoot, vm, { allowMissingFile: allowPrepared && !reclaim })
+    } catch {
+      throw unsupported()
+    }
+  }
+
   if (allowPrepared && !reclaim) {
     try {
       cragTargetIds(projectRoot, vm)
@@ -364,19 +379,19 @@ export function assertCragSubscriptionTarget(
   const outcome = inspectContainerOutcome(slot, { run: (args) => sh(args, { timeout: 3000 }) })
   if (outcome.status !== 'found' || !outcome.container?.running) throw unsupported()
   if (isKvmRuntime(vm)) {
-    const result = sh(['docker', ...slotExecArgv(vm, ['/home/kincli/.kin/kin-kernel', '--license-capabilities'])], {
-      timeout: 3000,
-    })
+    const projected = sh(
+      ['docker', ...slotExecArgv(vm, kvmCragSubscriptionStatusCommand(vm, guestMachineId), { user: '0' })],
+      {
+        timeout: 5000,
+      },
+    )
+    if (!projected.ok) throw unsupported()
+  } else {
     try {
-      const flags = result.ok && JSON.parse(result.stdout)
-      if (flags.host_subscription === 1 && (!reclaim || flags.host_subscription_reclaim === 1)) return true
-    } catch {}
-    throw unsupported()
-  }
-  try {
-    if (!hasCragHostMount(projectRoot, slot)) throw unsupported()
-  } catch {
-    throw unsupported()
+      if (!hasCragHostMount(projectRoot, slot)) throw unsupported()
+    } catch {
+      throw unsupported()
+    }
   }
   try {
     if (!installedCragV2Root(projectRoot, vm)) throw unsupported()
@@ -384,9 +399,10 @@ export function assertCragSubscriptionTarget(
   } catch {
     throw unsupported()
   }
-  const capabilities = sh(['docker', 'exec', slot, '/home/kincli/.kin/crag-v2/crag-v2', '--license-capabilities'], {
-    timeout: 3000,
-  })
+  const capabilities = sh(
+    ['docker', ...slotExecArgv(vm, ['/home/kincli/.kin/crag-v2/crag-v2', '--license-capabilities'])],
+    { timeout: 5000 },
+  )
   try {
     if (capabilities.ok) {
       const flags = JSON.parse(capabilities.stdout)
@@ -737,9 +753,17 @@ async function reloadSlotWorkerAdmitted(vm, projectRoot, { routing }) {
     if (chownErr) return chownErr
     if (resolveKernelDataplane(vm, routing) === 'crag') {
       try {
-        await publishKvmCragLicense(projectRoot, vm, { force: true })
-      } catch {
-        return { ok: false, code: 'crag_guest_license_sync_failed', error: 'CRAG guest license projection failed' }
+        if (!(await publishKvmCragLicense(projectRoot, vm, { force: true }))) {
+          return { ok: false, code: 'crag_guest_license_sync_failed', error: 'CRAG guest is not ready' }
+        }
+      } catch (error) {
+        return { ok: false, code: error.code || 'crag_guest_license_sync_failed', error: error.message }
+      }
+    } else if (!vm.node_id) {
+      try {
+        await clearKvmCragSubscription(projectRoot, vm)
+      } catch (error) {
+        return { ok: false, code: error.code || 'crag_subscription_projection_failed', error: error.message }
       }
     }
     const r = sh(
