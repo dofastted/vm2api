@@ -14,6 +14,7 @@ import {
   prepareCragSubscriptionBinding,
   projectCragUniversalVm,
   projectLocalGrant,
+  readCragClusterSubscription,
   verifyCragHostEntitlement,
 } from '../../src/lib/vm/crag-license.mjs'
 import { cragSubscriptionPublicDirectory } from '../../src/lib/vm/crag-subscription-paths.mjs'
@@ -344,7 +345,6 @@ test('signature tampering, foreign signers and package replacement invalidate bo
 })
 
 for (const placement of [
-  { node_id: 'node-1' },
   { node_id: 'mac', node_platform: 'darwin' },
   { node_platform: 'darwin' },
   { runtime: { type: 'kvm' } },
@@ -393,6 +393,20 @@ test('host storage refuses links, writable files/directories and pending symlink
   fs.renameSync(publicDir, moved)
   fs.symlinkSync(moved, publicDir)
   await assertDenied(context, 'license_invalid')
+})
+
+test('a Linux cluster slot uses signed host rights and exports only its own device and permit', (t) => {
+  const { root, vm, host, hostId, permit, machineCode } = fixture(t, { activate: false })
+  const cluster = { ...vm, node_id: 'linux-worker' }
+  assert.equal(prepareCragSubscriptionBinding(root, cluster), machineCode)
+  assert.equal(activateCragSubscriptionBinding(root, cluster, permit.code).license.valid, true)
+  assert.equal(getCragLicense(root, cluster).license.scope, 'host')
+  const files = readCragClusterSubscription(root, cluster)
+  assert.deepEqual(Object.keys(files).sort(), ['device', 'entitlement', 'hostId', 'permit'])
+  assert.equal(JSON.parse(files.device).vm_id, vm.id)
+  assert.equal(files.hostId, hostId)
+  assert.equal(files.entitlement, host.code)
+  assert.equal(files.permit, permit.code)
 })
 
 test('private registration/device links and malformed device JSON cannot unlock S1', async (t) => {

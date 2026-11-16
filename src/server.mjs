@@ -90,7 +90,7 @@ import { ClusterNodesRepo } from './lib/db/repos/cluster-nodes-repo.mjs'
 import { ClusterManager } from './lib/cluster/cluster-manager.mjs'
 import { createHostMemoryPressure, installHostMemoryPressure } from './lib/cluster/host-memory-pressure.mjs'
 import { createClusterRoutes } from './lib/cluster/cluster-routes.mjs'
-import { bindPlacement, nodeImageBuildRunning } from './lib/cluster/placement.mjs'
+import { bindPlacement, isNativeNodeVm, nodeImageBuildRunning } from './lib/cluster/placement.mjs'
 import { ClusterError } from './lib/cluster/ssh-link.mjs'
 import { nodeEgressProxyUrl, startNodeEgressSocks } from './lib/cluster/node-egress-socks.mjs'
 import { createSlotShell } from './lib/vm/slot-shell.mjs'
@@ -1021,8 +1021,8 @@ const listCragTargets = () =>
     .map(({ id }) => getVm(cfg.paths.project, id))
     .filter(Boolean)
 
-const isLocalCragV2Slot = (vm) =>
-  !vm.node_id &&
+const isCragV2Slot = (vm) =>
+  !isNativeNodeVm(vm) &&
   !isCodexVm(vm) &&
   resolveKernelDataplane(vm, routingConfig) === 'crag' &&
   resolveCragKernelVersion(vm, routingConfig) === 'v2'
@@ -1037,8 +1037,10 @@ const cragSubscription = createCragSubscription({
   }),
   getTarget: (id) => getVm(cfg.paths.project, id),
   isLocalCragSlot: (vm) =>
-    isLocalCragV2Slot(vm) && (isKvmRuntime(vm) || Boolean(installedCragV2Root(cfg.paths.project, vm))),
-  isSubscriptionSlot: (vm) => isLocalCragV2Slot(vm) && !isKvmRuntime(vm),
+    !isNativeNodeVm(vm) &&
+    !isCodexVm(vm) &&
+    (vm.node_id || isKvmRuntime(vm) || Boolean(installedCragV2Root(cfg.paths.project, vm))),
+  isSubscriptionSlot: (vm) => isCragV2Slot(vm) && !isKvmRuntime(vm),
   assertReady: (vm, opts) => assertCragSubscriptionTarget(cfg.paths.project, vm, routingConfig, opts),
   isSlotEnabled: (vm, opts) => isCragSubscriptionSlotEnabled(cfg.paths.project, vm, routingConfig, opts),
 })

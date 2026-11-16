@@ -176,7 +176,7 @@ function publishedConfig(exec) {
 function subscriptionScope(projectRoot, vm, hostId) {
   let permit = null
   let permitError = false
-  if (localDocker(vm)) {
+  if (!isKvmRuntime(vm) && !isNativeNodeVm(vm)) {
     try {
       permit = readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId)
     } catch {
@@ -387,9 +387,11 @@ export function createCragRuntimeInventory({
         const observed = hasHopEvidence(vm, scope) ? hop : observations.get(vm.id) || unknown()
         if (observed.state !== 'unknown') anyKnown = true
         if (candidate?.watchOnly && !scope.permit && !scope.permitError && observed.state !== 'running') continue
-        if (scope.permit && observed.state === 'running') hostRunning++
-        if ((scope.permit && observed.state === 'unknown') || (scope.permitError && observed.state !== 'not_running'))
-          hostUnknown++
+        if (localDocker(vm)) {
+          if (scope.permit && observed.state === 'running') hostRunning++
+          if ((scope.permit && observed.state === 'unknown') || (scope.permitError && observed.state !== 'not_running'))
+            hostUnknown++
+        }
         const license =
           observed.state === 'running'
             ? checkCragLicense(projectRoot, { ...vm, dataplane: 'crag', crag_kernel_version: 'v2' }, routing)
