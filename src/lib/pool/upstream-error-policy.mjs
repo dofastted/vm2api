@@ -341,6 +341,16 @@ function classifyUpstreamResultRaw(
       retrySameAccount: false,
     }
   }
+  if (result?.cragPolicyBlock && !result.committed) {
+    // CRAG rejected the body itself before dispatch; another slot runs the same check.
+    return {
+      scope: 'request',
+      action: 'stop',
+      reason: 'crag_policy_blocked',
+      cooldownUntil: null,
+      retrySameAccount: false,
+    }
+  }
   const handoffCode = result?.body?.error?.code
   if (
     result.nativeHandoff === true &&
