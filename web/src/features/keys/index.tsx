@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { lazy, Suspense, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { VIEW_TITLES } from '@/config/nav'
 import type { ApiKeyItem } from '@/types/panel-keys'
@@ -39,8 +39,12 @@ import {
 import { KeyLimitsDialog } from './key-limits-dialog'
 import { keyLimitsPayload, type KeyLimitsDraft } from './key-payload'
 import { KeyRevealDialog, type RevealedKey } from './key-reveal-dialog'
-import { KeyStatsDialog } from './key-stats-dialog'
 import { VmPoolsCard, vmPoolsQueryOptions } from './vm-pools-card'
+
+// 统计弹窗带 recharts（约 100 KB gzip），只在点开时加载。
+const KeyStatsDialog = lazy(() =>
+  import('./key-stats-dialog').then((m) => ({ default: m.KeyStatsDialog }))
+)
 
 export function KeysPage() {
   const qc = useQueryClient()
@@ -53,6 +57,9 @@ export function KeysPage() {
   const [createOpen, setCreateOpen] = useState(false)
   const [editId, setEditId] = useState('')
   const [statsId, setStatsId] = useState('')
+  // 首次打开后保持挂载，关闭动画照常播放。
+  const [statsOpened, setStatsOpened] = useState(false)
+  if (statsId && !statsOpened) setStatsOpened(true)
   const [rotateId, setRotateId] = useState('')
   const [revealed, setRevealed] = useState<RevealedKey | null>(null)
   const [delId, setDelId] = useState('')
@@ -281,13 +288,17 @@ export function KeysPage() {
         }}
       />
       <KeyRevealDialog value={revealed} onClose={() => setRevealed(null)} />
-      <KeyStatsDialog
-        item={keys.find((k) => k.id === statsId) || null}
-        vms={vmItems}
-        onOpenChange={(open) => {
-          if (!open) setStatsId('')
-        }}
-      />
+      {statsOpened ? (
+        <Suspense fallback={null}>
+          <KeyStatsDialog
+            item={keys.find((k) => k.id === statsId) || null}
+            vms={vmItems}
+            onOpenChange={(open) => {
+              if (!open) setStatsId('')
+            }}
+          />
+        </Suspense>
+      ) : null}
       <ConfirmDialog
         open={!!rotateId}
         onOpenChange={() => setRotateId('')}
