@@ -220,7 +220,7 @@ function projectRootFromExec(exec = {}) {
 // acceptNativeClaudeSetup (it edits host files, and the node's cli-home is not
 // on this host). Without these flags the TUI sits on the onboarding page and
 // CRAG refuses every prompt with a 502. Merge them inside the container instead.
-const NODE_CLAUDE_SETUP_PY = `
+export const NODE_CLAUDE_SETUP_PY = `
 import json, os
 home = "/home/kincli"
 want = ("/run/kin/work", home)

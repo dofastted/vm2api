@@ -122,3 +122,32 @@ test('skips stopped / dead slots instead of exec-ing into a missing container', 
   assert.deepEqual(execed, [])
   assert.deepEqual(warned, [])
 })
+
+test('re-asserts Claude onboarding in a cluster-node Docker slot, at most once a minute', async () => {
+  const execed = []
+  const warned = []
+  const node = {
+    id: 'vm-node-01',
+    status: 'running',
+    node_id: 'node-test',
+    runtime: { container: 'kin-vm-node-01', user: '10001:987' },
+  }
+  const guard = createCliNodeGuard({
+    listTargets: () => [node, { id: 'vm-local-01', status: 'running', runtime: { container: 'kin-vm-local-01' } }],
+    exec: async (_connect, container, Cmd, opts) => execed.push({ container, Cmd, opts }),
+    logger: { warn: (m) => warned.push(m) },
+    hostFor: (vm) =>
+      vm.node_id
+        ? { bakedKernel: true, native: false, dockerApi: () => ({}), execUser: (v) => v.runtime.user }
+        : { bakedKernel: false, native: false, dockerApi: () => ({}), execUser: () => '10000:10000' },
+  })
+  await guard.tick()
+  const setup = execed.filter((e) => e.Cmd[0] === 'python3')
+  assert.equal(setup.length, 1, JSON.stringify({ execed, warned }))
+  assert.equal(setup[0].container, 'kin-vm-node-01')
+  assert.equal(setup[0].opts.user, '10001:987')
+  assert.match(setup[0].Cmd.at(-1), /hasCompletedOnboarding/)
+  await guard.tick()
+  assert.equal(execed.filter((e) => e.Cmd[0] === 'python3').length, 1)
+  assert.equal(execed.filter((e) => e.Cmd[0] === '/bin/sh').length, 4)
+})
