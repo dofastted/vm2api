@@ -32,6 +32,8 @@ VM2API_DB_SECRET='再一串'
 
 KVM 槽需要宿主 `/dev/kvm` 可读写（控制面在容器内时，用一次 `--device /dev/kvm` 的探测容器确认）。runner 降权给槽位用户跑 QEMU 时会带上 `/dev/kvm` 的设备组，属组与槽位主 GID 不同也能用。已有 KVM 槽要更新 `kin-kvm-*` 镜像并重建一次。没有 KVM 时不要在生产打开 `vm.allow_tcg`：那是 TCG 软件模拟，仅供测试。
 
+KVM 的 `kin-guest-exec` 前台命令由调用方控制执行时限，包含官方 Claude Code 初装的 hello / 用量步骤；SSH 建连仍保留 3 秒超时。后台启动（`-d`）保留 8 秒上限，超时返回 `124` 并提示命令启动超时，SSH 失败才提示 `guest ssh unavailable`。修复旧 runner 的前台 8 秒限制需要更新 `docker/kin-kvm` 镜像并在维护窗口按官方流程重建相关 KVM 容器；只升级控制面不会替换已运行容器内的脚本。不要重置或删除槽的家目录、凭据、指纹与虚拟磁盘。
+
 出现 `native stdin: Broken pipe` 时同时检查容器 OOM 事件与 CLI 子进程，不能只看 Rust PID 1 是否存活。CLI 退出或输出管道关闭后，内核必须清零 `cli_pid` / `ready_slots`、终止在途请求并拒绝新任务，由宿主 watchdog 恢复槽；不重放已发送的推理请求。
 
 CRAG V2 的资产、工作区和设备授权目录分别使用 Linux 私有 run 映射下的 `/run/kin/crag-native-assets`、`/run/kin/work`、`/run/kin/crag-license`；配置重写不能改回 DrvFS 家目录。目录归槽 UID 所有、权限 `0700`，设备文件/注册码为 `0600`。本机 Docker 创建 CRAG V2 容器时加载 `src/lib/vm/crag-v2-seccomp.json` 的默认拒绝策略，仅增加 `unshare(0x10020000)` 和 `mount` 标志 `0x44000` / `0x1000` / `0x1021` 所需例外；继续非 root、cap-drop ALL、no-new-privileges，不允许额外网络命名空间。创建/启动流程仅对缺少该策略的旧容器按需保留数据重建，已有精确策略的容器复用；单纯 Docker restart 不会更改 seccomp。不要用 privileged、cap-add SYS_ADMIN 或 seccomp=unconfined 替代。可用 `docker exec <槽容器> unshare --user --map-root-user --mount -- /home/kincli/.kin/crag-v2/claude-code-2.1.321/claude --version` 做无模型流量探针；仅看内核 PID 1 或空闲健康状态不足以证明 CLI 能启动。
