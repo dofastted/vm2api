@@ -86,27 +86,33 @@ beforeEach(() => {
   state.hostInterval = undefined
 })
 
-it('keeps a valid host subscription distinct from an incompatible download', () => {
-  state.licenses['vm-old'] = {
-    status: 'valid',
-    valid: true,
-    vm_id: 'vm-old',
-    scope: 'host',
-  }
-  state.installLicenses = {
-    'vm-old': {
-      status: 'invalid',
-      valid: false,
+it.each(['host', 'device', 'kernel'] as const)(
+  'offers subscription fallback with a valid %s permit for the old package',
+  (scope) => {
+    state.licenses['vm-old'] = {
+      status: 'valid',
+      valid: true,
       vm_id: 'vm-old',
-      code: 'license_payload_key_mismatch',
-    },
+      scope,
+    }
+    state.installLicenses = {
+      'vm-old': {
+        status: 'invalid',
+        valid: false,
+        vm_id: 'vm-old',
+        code: 'license_payload_key_mismatch',
+      },
+    }
+    const vm = { runtime_type: 'docker', resolved_dataplane: 'crag' } as const
+    expect(render(vm)).toContain('确认重装时会尝试使用本机已激活的宿主订阅')
+    expect(render(vm)).toContain('授权有效')
+    expect(render({ ...vm, node_id: 'cluster-node' })).toContain(
+      '当前下载包需要匹配的离线许可'
+    )
+    state.installLicenses = { ...state.licenses }
+    expect(render(vm)).not.toContain('确认重装时会尝试使用本机已激活的宿主订阅')
   }
-  const vm = { runtime_type: 'docker', resolved_dataplane: 'crag' } as const
-  expect(render(vm)).toContain('宿主订阅仍有效；当前下载包需要重新签发本槽许可')
-  expect(render(vm)).toContain('授权有效')
-  state.installLicenses = { ...state.licenses }
-  expect(render(vm)).not.toContain('当前下载包需要重新签发本槽许可')
-})
+)
 
 describe('KVM CRAG repair on the kernel page', () => {
   it('offers explicit CRAG reinstall when the current kernel is cli-node', () => {

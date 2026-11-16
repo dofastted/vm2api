@@ -235,15 +235,22 @@ export async function installKernelTargets({
           if (!matchesPayload(product)) return changedPayload()
           const licenseCheck = ops.checkCragLicense || checkCragLicense
           const checkTargetLicense = () => licenseCheck(projectRoot, desired, routing, { preferInstalled: false })
-          let reissue = false
-          if (target.kernel === 'crag') {
-            const grant = checkTargetLicense()
-            if (!grant.ok && target.reissue === true && !resumeId && grant.code === 'license_payload_key_mismatch') {
-              const current = licenseCheck(projectRoot, desired, routing)
-              reissue = current.ok && current.license?.scope === 'host' && !!cragSubscription?.reissueForInstall
-            }
-            if (!grant.ok && !reissue)
-              return failure(target, grant.code || 'license_required', grant.error || '请先激活 CRAG 授权')
+          const grant = target.kernel === 'crag' ? checkTargetLicense() : null
+          const useSubscription =
+            grant &&
+            !grant.ok &&
+            ['license_required', 'license_payload_key_mismatch'].includes(grant.code) &&
+            target.reissue === true &&
+            !resumeId &&
+            !clusterVm &&
+            !isKvmRuntime(vm) &&
+            !!cragSubscription?.authorizeInstall
+          if (grant && !grant.ok && !useSubscription) {
+            const message =
+              grant.code === 'license_payload_key_mismatch'
+                ? '下载包与已有许可使用不同的加密密钥。请选用兼容包或为当前包激活许可。'
+                : grant.error || '请先激活 CRAG 授权'
+            return failure(target, grant.code || 'license_required', message)
           }
           phase = 'kernel_operation_persist_failed'
           operationId = resumeId || randomUUID()
@@ -279,15 +286,18 @@ export async function installKernelTargets({
               )
             if (!matchesPayload(current)) return changedPayload()
           }
-          if (reissue) {
+          if (useSubscription) {
             try {
-              await cragSubscription.reissueForInstall(desired)
+              await cragSubscription.authorizeInstall(desired)
             } catch (error) {
-              const code = error?.code || 'crag_subscription_reissue_failed'
-              const message =
-                code === 'crag_subscription_sync_pending' || code === 'crag_subscription_authority_unavailable'
-                  ? '订阅重签未确认。请先同步宿主订阅状态，再重试重装。'
-                  : `未能为下载包重签本槽许可（${code}）。未停止虚拟机。`
+              const code = error?.code || 'crag_subscription_install_failed'
+              const messages = {
+                host_subscription_inactive: '本机没有已激活且有效的宿主订阅。请先激活订阅，或选用现有许可兼容的包。',
+                slot_limit_reached: '宿主订阅没有剩余绑定槽位。请释放额度，或选用现有许可兼容的包。',
+                crag_subscription_sync_pending: '上一次订阅操作未确认。请先同步宿主订阅状态，再重试重装。',
+                crag_subscription_authority_unavailable: '授权服务器未确认本次操作。请先刷新宿主订阅状态，再重试重装。',
+              }
+              const message = Object.hasOwn(messages, code) ? messages[code] : `未能为下载包签发本槽许可（${code}）。`
               return failure(target, code, message)
             }
             const grant = checkTargetLicense()

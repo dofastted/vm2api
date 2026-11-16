@@ -513,8 +513,8 @@ for (const state of ['unlicensed', 'expired', 'wrong-vm', 'package-tamper', 'dif
       projectRoot: root,
       targets: state === 'different-payload' ? [{ ...target()[0], expected_tag: 'v1.4.104', reissue: true }] : target(),
       cragSubscription: {
-        reissueForInstall() {
-          assert.fail('a device grant cannot be replaced by a host permit')
+        authorizeInstall() {
+          throw Object.assign(new Error('inactive'), { code: 'host_subscription_inactive' })
         },
       },
       ops: {
@@ -528,13 +528,53 @@ for (const state of ['unlicensed', 'expired', 'wrong-vm', 'package-tamper', 'dif
     })
     assert.equal(result.ok, false)
     assert.equal(result.items[0].stopped, false)
-    if (state === 'different-payload') assert.equal(result.items[0].code, 'license_payload_key_mismatch')
+    if (state === 'different-payload') assert.equal(result.items[0].code, 'host_subscription_inactive')
     assert.equal(fs.readFileSync(path.join(home, '.kin', 'kin-kernel.bin'), 'utf8'), 'previous-kernel')
-    assert.deepEqual(fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`)), record)
+    const saved = fs.readFileSync(path.join(root, 'vms', `${vm.id}.json`))
+    if (state === 'different-payload') {
+      assert.equal(getVm(root, vm.id).status, 'running')
+      assert.equal(getVm(root, vm.id).kernel_operation, undefined)
+      assert.equal(getVm(root, vm.id).schedule_hold, undefined)
+    } else {
+      assert.deepEqual(saved, record)
+    }
     if (beforeGrant) assert.deepEqual(fs.readFileSync(codeFile), beforeGrant)
     else assert.equal(fs.existsSync(cragLicenseDirectory(root, vm)), false)
   })
 }
+
+test('a confirmed CRAG reinstall obtains and rechecks a subscription permit before stopping the slot', async (t) => {
+  const { root } = fixture(t)
+  const events = []
+  let authorized = false
+  const life = lifecycle(root)
+  const result = await installKernelTargets({
+    projectRoot: root,
+    targets: [{ ...target()[0], expected_tag: 'v1.4.104', reissue: true }],
+    cragSubscription: {
+      authorizeInstall(vm) {
+        events.push('bind')
+        activateFixture(root, vm)
+        authorized = true
+      },
+    },
+    ops: {
+      ...life.ops,
+      describeKernelCatalog: () => [{ id: 'crag', ready: true, release_tag: 'v1.4.104' }],
+      checkCragLicense(_root, _vm, _routing, options) {
+        assert.equal(options.preferInstalled, false)
+        events.push('verify')
+        return authorized ? { ok: true } : { ok: false, code: 'license_payload_key_mismatch' }
+      },
+      stopSlot(vm) {
+        events.push('stop')
+        return life.ops.stopSlot(vm)
+      },
+    },
+  })
+  assert.equal(result.ok, true, JSON.stringify(result))
+  assert.deepEqual(events, ['verify', 'bind', 'verify', 'stop'])
+})
 
 for (const [patch, kernel, code] of [
   [{ platform: 'openai', family: 'codex', codex_kernel: true }, 'cli-node', 'kernel_codex_unsupported'],
