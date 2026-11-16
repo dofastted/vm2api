@@ -31,6 +31,7 @@ const COLUMNS = [
   'key_prefix',
   'key_suffix',
   'category',
+  'api_endpoint_id',
   'group_type',
   'allowed_vms',
   'vm_pool_id',

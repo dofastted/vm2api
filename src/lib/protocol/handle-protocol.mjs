@@ -52,7 +52,12 @@ import {
   formatHealthSse,
   healthUnavailableError,
 } from '../admin/health-probe.mjs'
-import { resolveInferenceBackend, runApiInference, validateApiOpenAIRequest } from '../pool/api-protocol.mjs'
+import {
+  apiScheduleScope,
+  resolveInferenceBackend,
+  runApiInference,
+  validateApiOpenAIRequest,
+} from '../pool/api-protocol.mjs'
 import { classifyClaudeRequestPurpose, prepareClassifierBody, classifierRequestSummary } from './request-purpose.mjs'
 import { agentSummarySession } from './agent-summary.mjs'
 import { summarizeBody, redactHeaders, presentedApiKeyForLog } from '../admin/request-log.mjs'
@@ -841,10 +846,8 @@ export function createHandleProtocol(deps) {
     if (inferenceBackend === 'api') ctx = applyIntercept(cfg.intercept.rules, 'before_upstream', ctx)
     let apiInbound = inferenceBackend === 'api' ? ctx.body : null
     let keyScope = keyScopeFromRequest(req)
-    let apiPicked =
-      inferenceBackend === 'api'
-        ? apiScheduler.pick(ctx.body?.model, Date.now(), { groupType: keyScope.group_type })
-        : null
+    const apiScope = inferenceBackend === 'api' ? apiScheduleScope(req, keyScope.group_type) : null
+    let apiPicked = apiScope ? apiScheduler.pick(ctx.body?.model, Date.now(), apiScope) : null
     if (apiPicked && !apiPicked.ok) {
       stats.errors++
       logBag.error_code = apiPicked.code
@@ -1020,10 +1023,12 @@ export function createHandleProtocol(deps) {
         logBag.upstream_model = route.target
       }
       if (inferenceBackend === 'api') {
+        if (apiScope.endpointId && route.kind === 'endpoint' && route.target !== apiScope.endpointId)
+          return unavailable()
         apiInbound = ctx.body
         apiPicked = apiScheduler.pick(ctx.body.model, Date.now(), {
           groupType: platform.platform,
-          endpointId: route.kind === 'endpoint' ? route.target : null,
+          endpointId: route.kind === 'endpoint' ? route.target : apiScope.endpointId,
         })
         if (!apiPicked.ok) return unavailable()
         if (apiOpenAI && validateApiOpenAIRequest(protocol, apiInbound)) return unavailable()

@@ -5,6 +5,7 @@ export const KEY_ALLOWED_MODELS_MAX = 200
 export type KeyLimitsDraft = {
   name: string
   category: 'oauth' | 'api'
+  api_endpoint_id?: string
   max_concurrency: number
   quota_requests: number
   quota_usd: number
@@ -57,6 +58,11 @@ export function keyLimitsPayload(
   const isApi = draft.category === 'api'
   // API 直连不经过槽位，只有管理员可以设置
   if (isAdmin) body.category = draft.category
+  if (isAdmin && isApi && draft.api_endpoint_id !== undefined) {
+    const endpointId = draft.api_endpoint_id.trim()
+    if (mode === 'create' && !endpointId) throw new Error('请选择 API 渠道')
+    body.api_endpoint_id = endpointId || null
+  }
   if (isAdmin && draft.group_type === 'pool') {
     const vm_pool_id = String(draft.vm_pool_id || '').trim()
     if (!vm_pool_id) throw new Error('选择一个账号池')

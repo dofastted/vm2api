@@ -982,6 +982,7 @@ export function createPanelHandler(ctx) {
     if (panelIdentity(req).role !== 'admin') {
       delete normalized.group_id
       delete normalized.vm_pool_id
+      delete normalized.api_endpoint_id
     }
     const hasRequestQuota = Object.prototype.hasOwnProperty.call(body, 'quota_requests')
     const hasLegacyQuota = Object.prototype.hasOwnProperty.call(body, 'quota')
@@ -1001,6 +1002,21 @@ export function createPanelHandler(ctx) {
         .trim()
         .toLowerCase() === 'api'
     )
+  }
+
+  function validateKeyEndpoint(value, isApi, previous = null) {
+    if (value == null) return null
+    if (typeof value !== 'string' || !value.trim() || !isApi) {
+      throw Object.assign(new Error('请选择有效的 API 渠道'), { code: 'invalid_api_endpoint_id' })
+    }
+    const id = value.trim()
+    if (id !== previous) {
+      const endpoint = apiEndpointStore.getRaw(id)
+      if (!endpoint || endpoint.disabled) {
+        throw Object.assign(new Error('所选 API 渠道不存在或已停用'), { code: 'api_endpoint_unavailable' })
+      }
+    }
+    return id
   }
 
   /** Slots a key may be scoped to; a tenant's foreign slots read as missing. */
@@ -2031,6 +2047,7 @@ export function createPanelHandler(ctx) {
             name: body?.name,
             key: body?.key || body?.custom_key || undefined,
             category: body?.category,
+            api_endpoint_id: validateKeyEndpoint(input.api_endpoint_id, isApi),
             user_id: input.user_id,
             group_id: input.group_id,
             group_type: scope.group_type,
@@ -2085,6 +2102,9 @@ export function createPanelHandler(ctx) {
           const input = normalizePanelApiKeyInput(body || {}, req)
           const currentRec = apiKeyStore.getById(id)
           const isApi = isApiCategory(body?.category ?? currentRec?.category)
+          if (Object.hasOwn(input, 'api_endpoint_id')) {
+            input.api_endpoint_id = validateKeyEndpoint(input.api_endpoint_id, isApi, currentRec?.api_endpoint_id)
+          }
           const scopeInput = {
             group_type: body?.group_type,
             allowed_vms: body?.allowed_vms,

@@ -166,3 +166,96 @@ test('generated API key lists configured models and calls both protocols through
     fs.rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('saved models and channel-bound keys survive restart without falling back to another channel', async (t) => {
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'api-channel-bound-'))
+  const socket = path.join(project, 'kernel.sock')
+  const captures = []
+  const kernel = http.createServer(async (req, res) => {
+    const chunks = []
+    for await (const chunk of req) chunks.push(chunk)
+    const env = JSON.parse(Buffer.concat(chunks))
+    const channel = new URL(env.url).hostname.split('.')[0]
+    if (env.method === 'GET') {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      return res.end(JSON.stringify({ models: [`${channel}-upstream`, `${channel}-only`] }))
+    }
+    captures.push({ channel, model: JSON.parse(env.body).model, credential: env.headers['x-api-key'] })
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    for (const event of [
+      { type: 'message_start', message: { id: 'msg_bound', type: 'message', role: 'assistant', content: [] } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: channel } },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+      { type: 'message_stop' },
+    ])
+      res.write(`data: ${JSON.stringify(event)}\n\n`)
+    res.end()
+  })
+  await new Promise((resolve) => kernel.listen(socket, resolve))
+  const opts = { project, readyMs: 60_000, env: { KIN_API_KERNEL_SOCK: socket } }
+  let gw
+  t.after(async () => {
+    await gw?.stop()
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(project, { recursive: true, force: true })
+  })
+  gw = await startGateway(opts)
+  const channels = {}
+  for (const name of ['other', 'chosen']) {
+    const created = await api(gw, 'POST', '/api/panel/api-endpoints', {
+      body: {
+        name,
+        base_url: `https://${name}.invalid`,
+        priority: name === 'other' ? 100 : 0,
+        api_key_entries: [{ api_key: `sk-${name}` }],
+        models: [{ name: `${name}-upstream`, alias: 'shared' }],
+      },
+    })
+    assert.equal(created.status, 201, created.text)
+    channels[name] = created.json.item.id
+    const fetched = await api(gw, 'POST', `/api/panel/api-endpoints/${channels[name]}/fetch-models`)
+    assert.equal(fetched.status, 200, fetched.text)
+  }
+  const invalid = await api(gw, 'POST', '/api/panel/api-keys', {
+    body: { name: 'bad binding', category: 'api', api_endpoint_id: 'ep_missing' },
+  })
+  assert.equal(invalid.status, 400, invalid.text)
+  assert.equal(invalid.json.error.code, 'api_endpoint_unavailable', invalid.text)
+  const key = await api(gw, 'POST', '/api/panel/api-keys', {
+    body: { name: 'bound key', category: 'api', api_endpoint_id: channels.chosen },
+  })
+  assert.equal(key.status, 201, key.text)
+  const headers = { authorization: `Bearer ${key.json.item.key}` }
+  await gw.stop()
+  gw = await startGateway(opts)
+
+  const list = async () => {
+    const res = await api(gw, 'GET', '/v1/models', { headers })
+    assert.equal(res.status, 200, res.text)
+    return res.json.data.map((m) => m.id)
+  }
+  const call = (model) =>
+    api(gw, 'POST', '/v1/messages', {
+      headers,
+      body: { model, messages: [{ role: 'user', content: 'hello' }], max_tokens: 128, stream: false },
+    })
+  assert.deepEqual(await list(), ['shared', 'chosen-only'])
+  const result = await call('shared')
+  assert.equal(result.status, 200, result.text)
+  assert.equal(result.json.content[0].text, 'chosen')
+  assert.equal((await call('other-only')).status, 404)
+  for (const method of ['PATCH', 'DELETE']) {
+    const changed = await api(gw, method, `/api/panel/api-endpoints/${channels.chosen}`, {
+      body: method === 'PATCH' ? { disabled: true } : undefined,
+    })
+    assert.equal(changed.status, 200, changed.text)
+    assert.deepEqual(await list(), [])
+    assert.equal((await call('shared')).status, 404)
+  }
+  assert.deepEqual(captures, [{ channel: 'chosen', model: 'chosen-upstream', credential: 'sk-chosen' }])
+  const edited = await api(gw, 'PATCH', `/api/panel/api-keys/${key.json.item.id}`, {
+    body: { api_endpoint_id: channels.other },
+  })
+  assert.equal(edited.status, 200, edited.text)
+  assert.deepEqual(await list(), ['shared', 'other-only'])
+})
