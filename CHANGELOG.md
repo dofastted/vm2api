@@ -3,6 +3,8 @@
 ## Unreleased
 
 - 修复 KVM 官方 Claude Code 初装等前台命令被 runner 固定 8 秒超时提前截断、误报 `guest ssh unavailable` 的问题。前台命令遵循调用方时限，保留 SSH 建连超时与后台启动保护；启动超时保留退出码 `124`。需更新并部署 `kin-kvm` runner，单独升级控制面不生效。
+- Codex WebSocket 优先传输遵守槽位出口代理配置；握手重试与 HTTP 回退不绕过代理（#1091）。
+- Rust kin-kernel 流式队列满时暂停读取 CLI 输出，继续按序发送；短时突发不再导致整轮输出中断（#968）。
 
 ## 1.4.125 — 2026-11-17 · 风险策略选项与 CRAG 3.1.4
 
