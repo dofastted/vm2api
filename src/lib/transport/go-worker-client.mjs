@@ -52,6 +52,7 @@ import { mergeUsage } from '../protocol/openai-usage.mjs'
 import { ensureRedaction, maskJson, restoreJsonValue, createSseRestorer } from '../redaction/runtime.mjs'
 import { inferenceCodec } from './inference-codec.mjs'
 import { parseWorkerJson as parseJson } from './inference-codec-json.mjs'
+import { vmNodeId } from '../cluster/placement.mjs'
 import {
   createNativeHandoffState,
   consumeNativeHandoffStream,
@@ -889,6 +890,8 @@ async function callGoWorkerRaw({
   }
   const requestId = randomUUID()
   let stopCancel = () => {}
+  const clusterSlot = requestPath === '/internal/v1/messages' && !!vmNodeId(exec?.vm)
+  let requestStarted = false
   let nativeHandoff = false
   let handoff = null
   let observedHeaders = {}
@@ -950,6 +953,7 @@ async function callGoWorkerRaw({
       inference: true,
       beforeInferencePost,
       onRequestStarted: () => {
+        requestStarted = true
         nativeHandoff = useNativeHandoff
         stopCancel = cancelOnAbort(exec, signal, requestId)
       },
@@ -989,6 +993,7 @@ async function callGoWorkerRaw({
       model: parsed?.model || null,
       stopReason: parsed?.stop_reason || null,
       terminalState: headers['x-terminal-state'] || null,
+      clusterDeliveryUnconfirmed: clusterSlot && !handoff && ok && !isCompleteAssistantMessage({ body: parsed }),
       transportError: false,
       threadBetas: prepared.thread,
       ...nativeMetadata(),
@@ -1021,6 +1026,7 @@ async function callGoWorkerRaw({
         },
       },
       headers: observedHeaders,
+      clusterDeliveryUnconfirmed: clusterSlot && requestStarted,
       ...nativeMetadata(),
       terminalState:
         nativeHandoff && String(error.code).startsWith('native_handoff_')
@@ -1158,6 +1164,8 @@ async function streamGoWorkerRaw({
   const timing = createStreamTiming()
   const requestId = randomUUID()
   let stopCancel = () => {}
+  const clusterSlot = requestPath === '/internal/v1/messages' && !!vmNodeId(exec?.vm)
+  let requestStarted = false
   let nativeHandoff = false
   let handoff = null
   let observedHeaders = {}
@@ -1221,6 +1229,7 @@ async function streamGoWorkerRaw({
       inference: true,
       beforeInferencePost,
       onRequestStarted: () => {
+        requestStarted = true
         nativeHandoff = useNativeHandoff
         stopCancel = cancelOnAbort(exec, signal, requestId)
       },
@@ -1508,6 +1517,7 @@ async function streamGoWorkerRaw({
         ...timing.snapshot(),
         committed,
         terminalState: nativeTimeout && !committed ? 'rejected' : terminalState,
+        clusterDeliveryUnconfirmed: clusterSlot && !complete && !sawMessageStop && !lastError,
         transportError: false,
         threadBetas: prepared.thread,
         ...nativeMetadata(),
@@ -1550,6 +1560,7 @@ async function streamGoWorkerRaw({
         },
       },
       headers: observedHeaders,
+      clusterDeliveryUnconfirmed: clusterSlot && requestStarted,
       ...nativeMetadata(),
       ...timing.snapshot(),
       committed,

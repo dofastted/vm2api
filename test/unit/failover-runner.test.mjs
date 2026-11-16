@@ -634,6 +634,30 @@ test('committed realtime stream failure never switches accounts', async () => {
   assert.equal(scheduler.selectCalls, 1)
 })
 
+test('unconfirmed cluster delivery stops account failover even before any client output', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({ scheduler })
+  const result = await runner.run({
+    requestId: 'cluster-unconfirmed',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stream: true,
+    callAttempt: () => ({
+      ok: false,
+      status: 0,
+      transportError: true,
+      committed: false,
+      clusterDeliveryUnconfirmed: true,
+      terminalState: 'transport_error',
+      body: { error: { code: 'worker_timeout', message: 'slot worker timeout' } },
+    }),
+  })
+  assert.equal(result.policy.reason, 'cluster_delivery_unconfirmed')
+  assert.equal(result.attemptCount, 1)
+  assert.equal(scheduler.selectCalls, 1)
+  assert.equal(scheduler.cooldowns.length, 0)
+})
+
 test('cloudflare 403 does not trigger SOCKS disconnect', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const failures = []

@@ -144,7 +144,8 @@ test('a node row probes its node link; a down link marks it failed without parki
 
 test('a node link still dialling leaves the row alone until it settles', async (t) => {
   let health = { pending: true, error: 'node_link_connecting' }
-  const pool = makePool(t, { localExitHealth: () => health })
+  const resumed = []
+  const pool = makePool(t, { localExitHealth: () => health, onEnableVm: (vmId) => resumed.push(vmId) })
   pool.ensureLocal()
   pool.bind('px-local', 'vm-a1')
   const row = pool.state.proxies.find((p) => p.id === 'px-local-node-a')
@@ -158,6 +159,7 @@ test('a node link still dialling leaves the row alone until it settles', async (
   assert.equal((await pool.probeLocalNode('node-a')).ok, true)
   assert.equal(row.status, 'ok')
   assert.equal(row.latency_ms, 30)
+  assert.deepEqual(resumed, [], 'SSH recovery does not clear a VM exit hold')
   assert.equal(await pool.probeLocalNode('node-missing'), null)
 })
 

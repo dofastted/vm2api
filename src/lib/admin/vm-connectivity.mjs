@@ -1,7 +1,7 @@
 import { vmNodeReady } from '../cluster/placement.mjs'
 import { kernelFaults } from '../transport/rust-kernel-client.mjs'
 
-/** Read the same node link and terminal kernel fault used by the scheduler.
+/** Read the same node path and terminal kernel fault used by the scheduler.
  * Unknown runtime state is never evidence of either failure or recovery.
  */
 export function snapshotVmConnectivity(vms, { nodeReady = vmNodeReady, faults = kernelFaults } = {}) {

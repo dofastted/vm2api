@@ -10,6 +10,7 @@ import {
   normalizePoolRouting,
 } from '../../src/lib/pool/pool-scheduler.mjs'
 import { installHostMemoryPressure } from '../../src/lib/cluster/host-memory-pressure.mjs'
+import { bindPlacement, unbindPlacement } from '../../src/lib/cluster/placement.mjs'
 import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
@@ -129,6 +130,97 @@ function scheduler(root, extras = {}) {
     accountQuota: extras.accountQuota || { canAccept: () => ({ ok: true }) },
     workerHealth: extras.workerHealth || (async () => ({ ok: true, credential: { generation: 1, has_access: true } })),
     config: { fallback_wait_timeout_ms: 5, sticky_wait_timeout_ms: 5, ...extras.config },
+  })
+}
+
+for (const seated of [false, true]) {
+  test(`cluster reconnect preserves the original VM for ${seated ? 'seated' : 'direct'} admission`, {
+    timeout: 5000,
+  }, async (t) => {
+    const root = project()
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+    t.after(() => unbindPlacement())
+    const file = path.join(root, 'vms', 'vm-01.json')
+    const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+    fs.writeFileSync(file, JSON.stringify({ ...vm, node_id: 'node-1' }))
+    const other = path.join(root, 'vms', 'vm-02.json')
+    const otherVm = JSON.parse(fs.readFileSync(other, 'utf8'))
+    otherVm.policy.priority = 100
+    fs.writeFileSync(other, JSON.stringify(otherVm))
+    let dataPath = 'ssh'
+    let workerResponds = true
+    const probes = []
+    bindPlacement({ manager: { slotDataPath: () => dataPath }, projectRoot: root })
+    const sticky = new StickyRouter({ dataDir: path.join(root, 'data'), config: { sticky: { enabled: true } } })
+    const stickyKey = 'sess:cluster'
+    sticky.bind(stickyKey, { vmId: 'vm-01', accountId: 'account-1', sessionId: 'original-session' })
+    const pool = scheduler(root, {
+      stickyRouter: sticky,
+      workerHealth: async ({ vmId }) => {
+        if (vmId === 'vm-01') {
+          probes.push(dataPath)
+          if (!workerResponds) return { ok: false, status: 0, code: 'ECONNRESET' }
+        }
+        return { ok: true, credential: { generation: 1, has_access: true } }
+      },
+    })
+    const args = { model: 'claude-test', stickyKey, ...(seated ? { seatKey: 'seat:cluster' } : {}) }
+    const initial = await pool.selectAndReserve({ ...args, excluded: new Set(['vm-02']), allowWait: false })
+    assert.equal(initial.vmId, 'vm-01')
+    initial.release()
+
+    dataPath = 'direct'
+    workerResponds = false
+    const unready = await pool.selectAndReserve({ ...args, allowWait: false })
+    assert.equal(unready.reason, 'cluster_slot_reconnecting', 'fresh application health is required, not the gate ping')
+    assert.equal(sticky.resolve(stickyKey).sessionId, 'original-session')
+    assert.deepEqual(probes, ['ssh', 'direct'])
+
+    workerResponds = true
+    const direct = await pool.selectAndReserve({ ...args, allowWait: false })
+    assert.equal(direct.vmId, 'vm-01', 'keep the original VM even with a higher-priority alternative')
+    direct.release()
+
+    dataPath = 'offline'
+    const blocked = await pool.selectAndReserve({ ...args, deadline: Date.now() + 25 })
+    assert.equal(blocked.reason, 'cluster_slot_reconnecting')
+    assert.equal(sticky.resolve(stickyKey).sessionId, 'original-session')
+    const family = await pool.selectAndReserve({
+      ...args,
+      stickyKey: 'sess:child',
+      familyVmId: 'vm-01',
+      allowWait: false,
+    })
+    assert.equal(family.reason, 'cluster_slot_reconnecting')
+    assert.equal(family.familyGated, false)
+    const fresh = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+    assert.equal(fresh.vmId, 'vm-02')
+    fresh.release()
+
+    const waiting = pool.selectAndReserve({ ...args, deadline: Date.now() + 1000 })
+    while (!pool.queuedTotal()) await new Promise((resolve) => setImmediate(resolve))
+    dataPath = 'ssh'
+    pool.notifyCapacity()
+    const recovered = await waiting
+    assert.equal(recovered.vmId, 'vm-01')
+    assert.equal(probes.at(-1), 'ssh', 'recheck health when the SSH path comes back')
+    assert.equal(sticky.resolve(stickyKey).sessionId, 'original-session')
+    recovered.release()
+
+    dataPath = 'offline'
+    const controller = new AbortController()
+    const cancelled = pool.selectAndReserve({ ...args, signal: controller.signal, deadline: Date.now() + 1000 })
+    const rejected = assert.rejects(cancelled, { code: 'selection_cancelled' })
+    while (!pool.queuedTotal()) await new Promise((resolve) => setImmediate(resolve))
+    controller.abort()
+    await rejected
+    assert.equal(pool.queuedTotal(), 0)
+    assert.equal(sticky.resolve(stickyKey).sessionId, 'original-session')
+
+    fs.writeFileSync(file, JSON.stringify({ ...vm, node_id: 'node-1', schedulable: false, schedule_off: true }))
+    const paused = await pool.selectAndReserve({ ...args, allowWait: false })
+    assert.equal(paused.vmId, 'vm-02', 'connection recovery does not supersede a manual pause')
+    paused.release()
   })
 }
 

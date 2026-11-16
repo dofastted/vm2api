@@ -1,10 +1,12 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
+import { once } from 'node:events'
 import fs from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+import { PassThrough } from 'node:stream'
 import tls from 'node:tls'
 import { DatabaseSync } from 'node:sqlite'
 import { ClusterManager, DIRECT_LINK_BACKOFF_MS } from '../../src/lib/cluster/cluster-manager.mjs'
@@ -17,6 +19,7 @@ import {
 } from '../../src/lib/cluster/direct-link.mjs'
 import { SocketRelay } from '../../src/lib/cluster/socket-relay.mjs'
 import { ClusterNodesRepo } from '../../src/lib/db/repos/cluster-nodes-repo.mjs'
+import { bindPlacement, unbindPlacement, vmNodeDataPath } from '../../src/lib/cluster/placement.mjs'
 
 const TOKEN = 'a'.repeat(64)
 
@@ -181,7 +184,7 @@ test('gate container: root keeps only DAC_OVERRIDE, only tls/ is writable, spec 
   assert.notEqual(gateContainer({ host: root, imageRef: 'i', body: 'other', binaryDigest: 'd' }).digest, a.digest)
 })
 
-test('SocketRelay: direct dial, SSH fallback on null, local drop when the slot socket is missing', async (t) => {
+test('SocketRelay waits for the gate before forwarding bytes and can fall back to SSH safely', async (t) => {
   const gate = await fakeGate(t)
   const dir = shortDir(t)
   const sshAsked = []
@@ -191,6 +194,11 @@ test('SocketRelay: direct dial, SSH fallback on null, local drop when the slot s
       remotePath: '/r',
       getClient: () => {
         sshAsked.push(name)
+        if (name === 'm.sock') {
+          const stream = new PassThrough()
+          stream.close = () => stream.destroy()
+          return { openssh_forwardOutStreamLocal: (_path, done) => done(null, stream) }
+        }
         return null
       },
       dialDirect,
@@ -207,17 +215,22 @@ test('SocketRelay: direct dial, SSH fallback on null, local drop when the slot s
   const reply = readAll(c)
   c.end('over the gate')
   assert.equal(await reply, 'OVER THE GATE')
+  assert.equal(gate.seen[0].early, '')
 
-  for (const relay of [fallback, missing]) {
-    const s = net.connect(relay.socketPath)
-    s.on('error', () => {})
-    s.end('x')
-    await new Promise((resolve) => s.once('close', resolve))
-  }
-  assert.deepEqual(sshAsked, ['f.sock'])
+  const switched = net.connect(missing.socketPath)
+  const switchedReply = readAll(switched)
+  switched.end('same vm via ssh')
+  assert.equal(await switchedReply, 'same vm via ssh')
+  assert.equal(gate.seen[1].early, '')
+
+  const dropped = net.connect(fallback.socketPath)
+  dropped.on('error', () => {})
+  dropped.end('unavailable')
+  await new Promise((resolve) => dropped.once('close', resolve))
+  assert.deepEqual(sshAsked, ['m.sock', 'f.sock'])
 })
 
-function managerWithRepo(t) {
+function managerWithRepo(t, options = {}) {
   const db = new DatabaseSync(':memory:')
   for (const name of ['026_cluster_nodes.sql', '039_cluster_node_direct_links.sql']) {
     db.exec(fs.readFileSync(new URL(`../../src/lib/db/migrations/${name}`, import.meta.url), 'utf8'))
@@ -241,9 +254,48 @@ function managerWithRepo(t) {
     repo,
     dataDir: os.tmpdir(),
     logger: { log() {}, warn: (m) => warnings.push(m) },
+    ...options,
   })
   return { db, repo, manager, warnings }
 }
+
+test('an authenticated gate is still probed without SSH and keeps the original live stream', async (t) => {
+  const gate = await fakeGate(t, { extra: 'connected:' })
+  const socketDir = shortDir(t)
+  const { repo, manager } = managerWithRepo(t, { socketDir })
+  repo.setDirectLink('node-a', { address: gate.address, port: gate.port, token: TOKEN })
+  repo.setDirectLinkCert('node-a', gate.certSha256)
+  const link = { state: 'ready', stop() {} }
+  t.mock.method(manager, '_attach', (node) => manager.links.set(node.id, link))
+  t.after(() => manager.stop())
+  bindPlacement({ manager, projectRoot: socketDir })
+  t.after(() => unbindPlacement())
+  manager.start()
+  await manager.directProbes.get('node-a')
+  const vm = { id: 'vm-1', node_id: 'node-a' }
+  const { kernel } = await manager.ensureSlotRelays(vm.node_id, vm.id)
+  const original = net.connect(kernel)
+  t.after(() => original.destroy())
+  assert.equal((await once(original, 'data'))[0].toString(), 'connected:')
+  assert.equal(vmNodeDataPath(vm), 'ssh')
+
+  link.state = 'backoff'
+  await manager._probeDirect('node-a')
+  assert.equal(gate.seen.filter(({ kind }) => kind === 'ping').length, 2)
+  assert.equal(vmNodeDataPath(vm), 'direct')
+  const reply = readAll(original)
+  original.end('existing')
+  assert.equal(await reply, 'EXISTING')
+
+  const fresh = net.connect(kernel)
+  t.after(() => fresh.destroy())
+  const response = readAll(fresh)
+  fresh.end('new')
+  assert.equal(await response, 'connected:NEW')
+  assert.equal(vmNodeDataPath({ ...vm, id: 'missing-relay' }), 'offline')
+  link.state = 'error'
+  assert.equal(vmNodeDataPath(vm), 'offline', 'fatal SSH errors are not treated as transient')
+})
 
 test('direct link: token and pin survive edits and never leave; failures fall back to SSH with backoff', async (t) => {
   const { db, repo, manager, warnings } = managerWithRepo(t)

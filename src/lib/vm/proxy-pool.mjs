@@ -1683,12 +1683,11 @@ export class ProxyPool extends EventEmitter {
     if (result.scope === 'pending') return
     p.last_probe_at = new Date().toISOString()
     p.latency_ms = result.latency_ms
-    // Node rows are only ever disabled by an operator; a link result must not undo that.
-    if (result.scope === 'node' && !p.enabled) return
-    if (result.scope === 'node' && !result.ok) {
-      // The cluster link owns node health; a node hiccup must not disable the row or park its slots.
-      p.status = 'fail'
-      p.last_error = result.error || 'node_unreachable'
+    // SSH only measures the control-plane route; it cannot park or resume the slot's exit.
+    if (result.scope === 'node') {
+      if (!p.enabled) return
+      p.status = result.ok ? 'ok' : 'fail'
+      p.last_error = result.ok ? null : result.error || 'node_unreachable'
       return
     }
     if (result.scope === 'egress') {

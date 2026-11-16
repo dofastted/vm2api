@@ -14,6 +14,7 @@ import {
   isCompleteAssistantMessage,
   isIncompleteAssistantMessage,
   incompleteAssistantClientError,
+  ErrorCode,
   KERNEL_FAILURE_STATUS,
 } from '../core/errors.mjs'
 import { hasRefreshPresence, readWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
@@ -446,6 +447,12 @@ function selectionFailure(selected, { excluded, lastPolicy, lastResult, hops }) 
   if (CAPACITY_SELECTION_REASONS.has(reason)) return poolOverloadedError(details)
   if (reason === 'pool_rate_limited') return poolRateLimitedError(details)
   if (reason === 'quota_guard_request_too_large') return quotaGuardTooLargeError(details)
+  if (reason === ErrorCode.CLUSTER_SLOT_RECONNECTING) {
+    return {
+      ...poolError(ErrorCode.CLUSTER_SLOT_RECONNECTING, 'The session VM is temporarily unreachable', details),
+      retryAfterSec: 1,
+    }
+  }
   const failed = poolError('account_pool_exhausted', 'No eligible Claude accounts remain', details)
   // An all-rest pool knows when the first working window opens.
   const retryMs = Number(details.retry_after_ms)
@@ -520,7 +527,7 @@ export class FailoverRunner {
     }
 
     const vmId = selected?.vmId
-    if (vmId) {
+    if (vmId && result?.clusterDeliveryUnconfirmed !== true) {
       if (verifiedSuccess(result)) {
         vmTimeoutTracker.recordSuccess(vmId)
       } else {

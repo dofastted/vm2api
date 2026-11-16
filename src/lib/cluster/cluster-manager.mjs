@@ -23,6 +23,7 @@ import {
 import { NODE_HOST_TIMEOUT_MS, nodeHostCommand, parseNodeHost } from './node-host.mjs'
 import {
   dialGate,
+  GATE_DIAL_TIMEOUT_MS,
   ensureNodeGate,
   newGateToken,
   parseDirectLinkInput,
@@ -48,6 +49,8 @@ export const SHELL_TICKET_TTL_MS = 30_000
 export const LOCAL_STATUS_TTL_MS = 30_000
 // A failed gate dial sends that node's slot traffic over SSH until the next good health ping or this long.
 export const DIRECT_LINK_BACKOFF_MS = 30_000
+const DIRECT_PROBE_INTERVAL_MS = 5_000
+const DIRECT_PROBE_FRESH_MS = 2 * DIRECT_PROBE_INTERVAL_MS + GATE_DIAL_TIMEOUT_MS
 const INSTALL_LOG_MAX = 64 * 1024
 const NATIVE_NO_DOCKER = 'macOS 原生节点不使用 Docker'
 
@@ -127,6 +130,7 @@ export class ClusterManager {
   }) {
     this.gateBin = gateBin
     this.directState = new Map()
+    this.directProbes = new Map()
     this.listen = listen
     // Node add / remove: per-node resources (each VPS's local egress row) follow the list.
     this.onNodesChanged = onNodesChanged
@@ -152,6 +156,7 @@ export class ClusterManager {
     this.installs = new Map()
     this.tickets = new Map()
     this._healthTimer = null
+    this._directTimer = null
   }
 
   start() {
@@ -160,11 +165,23 @@ export class ClusterManager {
       for (const id of this.links.keys()) this._checkHealth(id)
     }, HEALTH_INTERVAL_MS)
     this._healthTimer.unref?.()
+    const probeDirectLinks = () => {
+      for (const id of this.repo.directLinks().keys()) {
+        this._probeDirect(id).catch((err) => this.logger.warn(`[cluster] direct probe ${id}: ${err.code || 'failed'}`))
+      }
+    }
+    probeDirectLinks()
+    this._directTimer = setInterval(probeDirectLinks, DIRECT_PROBE_INTERVAL_MS)
+    this._directTimer.unref?.()
   }
 
   async stop() {
     clearInterval(this._healthTimer)
     this._healthTimer = null
+    clearInterval(this._directTimer)
+    this._directTimer = null
+    this.directProbes.clear()
+    this.directState.clear()
     for (const link of this.links.values()) link.stop()
     const relays = [...this.bridges.values(), ...[...this.slotRelays.values()].flatMap((r) => [r.kernel, r.worker])]
     await Promise.all(relays.map((r) => r.stop().catch(() => {})))
@@ -179,6 +196,7 @@ export class ClusterManager {
 
   _attach(node) {
     const link = new SshLink({ id: node.id, resolveTarget: () => this._targetFor(node.id) })
+    let sshWasReady = false
     link.on('state', (state) => {
       this.logger.log(JSON.stringify({ event: 'cluster-link', node: node.id, state, error: link.error?.code || null }))
       if (state === 'ready') {
@@ -188,7 +206,8 @@ export class ClusterManager {
           .then(() => this._checkHealth(node.id))
           .catch(() => {})
           .finally(() => this._linkState(node.id, state))
-        this._ensureGate(node.id).catch(() => {})
+        if (!sshWasReady || !this._directHealthy(node.id)) this._ensureGate(node.id).catch(() => {})
+        sshWasReady = true
       } else {
         this.health.delete(node.id)
         this._linkState(node.id, state)
@@ -251,7 +270,6 @@ export class ClusterManager {
     const hostRead = execCollect(client, nodeHostCommand(platform), { timeoutMs: NODE_HOST_TIMEOUT_MS }).catch(
       () => null,
     )
-    const directRead = this._probeDirect(id)
     let docker
     let containers = null
     if (platform === 'darwin') {
@@ -265,7 +283,6 @@ export class ClusterManager {
         docker = { ok: false, error: err.message }
       }
     }
-    await directRead
     const hostOut = await hostRead
     const host = hostOut?.code === 0 ? parseNodeHost(hostOut.stdout) : null
     if (link.client !== client) return
@@ -312,11 +329,10 @@ export class ClusterManager {
   _directView(id, cfg) {
     if (!cfg) return null
     const st = this.directState.get(id) || {}
-    const fallback = (st.downUntil || 0) > Date.now()
     return {
       address: cfg.address,
       port: cfg.port,
-      state: st.checked_at ? (fallback || st.error ? 'down' : 'ok') : 'pending',
+      state: st.error ? 'down' : this._directHealthy(id) ? 'ok' : 'pending',
       latency_ms: st.latency_ms ?? null,
       error: st.error || null,
       gate_error: st.gate_error || null,
@@ -328,22 +344,46 @@ export class ClusterManager {
     this.directState.set(id, { ...(this.directState.get(id) || {}), ...patch })
   }
 
+  _directHealthy(id) {
+    const state = this.directState.get(id)
+    return !!state?.checked_at && !state.error && Date.now() - Date.parse(state.checked_at) < DIRECT_PROBE_FRESH_MS
+  }
+
+  _directConfigMatches(id, config) {
+    const current = this.repo.getDirectLink(id)
+    return (
+      current?.address === config.address &&
+      current.port === config.port &&
+      current.token === config.token &&
+      current.certSha256 === config.certSha256
+    )
+  }
+
   /** Ping the gate; a good answer lifts the SSH fallback early, a bad one starts it. */
   async _probeDirect(id) {
+    const pending = this.directProbes.get(id)
+    if (pending) return pending
     const cfg = this.repo.getDirectLink(id)
     if (!cfg?.certSha256) return
-    const checked_at = new Date().toISOString()
-    try {
-      const ms = await pingGate(cfg)
-      this._directPatch(id, { latency_ms: Math.round(ms), error: null, downUntil: 0, checked_at })
-    } catch (err) {
-      this._directPatch(id, {
-        latency_ms: null,
-        error: err.code || 'gate_unreachable',
-        downUntil: Date.now() + DIRECT_LINK_BACKOFF_MS,
-        checked_at,
+    const probe = pingGate(cfg)
+      .then(
+        (ms) => ({ latency_ms: Math.round(ms), error: null, downUntil: 0 }),
+        (err) => ({
+          latency_ms: null,
+          error: err.code || 'gate_unreachable',
+          downUntil: Date.now() + DIRECT_LINK_BACKOFF_MS,
+        }),
+      )
+      .then((patch) => {
+        if (this.directProbes.get(id) === probe && this._directConfigMatches(id, cfg)) {
+          this._directPatch(id, { ...patch, checked_at: new Date().toISOString() })
+        }
       })
-    }
+      .finally(() => {
+        if (this.directProbes.get(id) === probe) this.directProbes.delete(id)
+      })
+    this.directProbes.set(id, probe)
+    return probe
   }
 
   /**
@@ -353,19 +393,38 @@ export class ClusterManager {
    * the backoff too; a missing slot socket does not, it is not a link fault.
    */
   async _dialDirect(nodeId, vmId, kind) {
+    if (this.links.get(nodeId)?.state === 'error') return null
     const cfg = this.repo.getDirectLink(nodeId)
     if (!cfg?.certSha256) return null
     if ((this.directState.get(nodeId)?.downUntil || 0) > Date.now()) return null
+    const link = this.links.get(nodeId)
     const down = (err) => {
+      if (this.links.get(nodeId) !== link || link?.state === 'idle' || !this._directConfigMatches(nodeId, cfg)) return
       this._directPatch(nodeId, { error: err.code, downUntil: Date.now() + DIRECT_LINK_BACKOFF_MS })
       this.logger.warn(`[cluster] direct link ${nodeId} unavailable (${err.code}), using ssh`)
     }
     try {
       const conn = await dialGate({ ...cfg, vmId, kind })
-      conn.ready.catch((err) => {
-        if (err.code !== 'gate_no_socket') down(err)
-      })
-      return conn
+      const ready = conn.ready.then(
+        (sock) => {
+          if (
+            this.links.get(nodeId) !== link ||
+            link?.state === 'idle' ||
+            link?.state === 'error' ||
+            !this._directConfigMatches(nodeId, cfg)
+          ) {
+            sock.destroy()
+            throw new ClusterError(503, 'gate_changed', '节点直连链路已变化')
+          }
+          return sock
+        },
+        (err) => {
+          if (err.code !== 'gate_no_socket') down(err)
+          throw err
+        },
+      )
+      ready.catch(() => {})
+      return { sock: conn.sock, ready }
     } catch (err) {
       down(err)
       return null
@@ -381,8 +440,11 @@ export class ClusterManager {
     try {
       const host = await this.remoteHost(id)
       const result = await ensureNodeGate({ client, host, docker: sshDocker(client) }, cfg, this.gateBin)
+      if (link.client !== client || !this._directConfigMatches(id, cfg)) return
       if (result.certSha256 !== cfg.certSha256) {
         this.repo.setDirectLinkCert(id, result.certSha256)
+        this.directProbes.delete(id)
+        this.directState.delete(id)
         this.logger.log(`[cluster] slot gate on ${id}: pinned certificate ${result.certSha256.slice(0, 16)}…`)
       }
       this._directPatch(id, { gate_error: null })
@@ -401,6 +463,7 @@ export class ClusterManager {
     const { address, port } = parseDirectLinkInput(body)
     const token = this.repo.getDirectLink(id)?.token || newGateToken()
     this.repo.setDirectLink(id, { address, port, token })
+    this.directProbes.delete(id)
     this.directState.delete(id)
     await this._ensureGate(id).catch(() => {})
     // The gate needs a moment to bind after a (re)create.
@@ -415,6 +478,7 @@ export class ClusterManager {
   async clearDirectLink(id) {
     if (!this.repo.get(id)) throw new ClusterError(404, 'node_not_found', '节点不存在')
     this.repo.clearDirectLink(id)
+    this.directProbes.delete(id)
     this.directState.delete(id)
     const link = this.links.get(id)
     if (link?.state === 'ready' && link.client) {
@@ -690,6 +754,7 @@ export class ClusterManager {
     this.bridges.delete(id)
     this.health.delete(id)
     this.installs.delete(id)
+    this.directProbes.delete(id)
     this.directState.delete(id)
     this.hostFacts.delete(id)
     this.repo.remove(id)
@@ -718,9 +783,23 @@ export class ClusterManager {
     return sshDocker(this.client(id))
   }
 
-  /** True while the node's SSH link is up; the scheduler skips slots of a node that is not. */
+  /** True while the management link is up. */
   linkReady(id) {
     return this.links.get(id)?.state === 'ready'
+  }
+
+  slotDataPath(nodeId, vmId) {
+    const state = this.links.get(nodeId)?.state
+    if (state === 'ready') return 'ssh'
+    const relays = this.slotRelays.get(vmId)
+    if (
+      (state === 'backoff' || state === 'connecting') &&
+      relays?.nodeId === nodeId &&
+      relays.kernel.alive() &&
+      this._directHealthy(nodeId)
+    )
+      return 'direct'
+    return 'offline'
   }
 
   /**
@@ -790,7 +869,7 @@ export class ClusterManager {
 
   /**
    * Local unix sockets for a remote slot's kernel.sock / worker.sock. The unchanged
-   * transport dials these; each connection opens one streamlocal channel on the link.
+   * transport dials these; each connection uses the gate or one SSH channel.
    */
   async ensureSlotRelays(nodeId, vmId) {
     const current = this.slotRelays.get(vmId)
@@ -845,6 +924,7 @@ export class ClusterManager {
     const relays = this.slotRelays.get(vmId)
     return {
       link: link ? link.snapshot() : null,
+      data_path: this.slotDataPath(nodeId, vmId),
       bridge: this.bridges.get(nodeId)?.snapshot() || null,
       relays: relays?.nodeId === nodeId ? { kernel: relays.kernel.snapshot(), worker: relays.worker.snapshot() } : null,
     }

@@ -118,7 +118,7 @@ async function invoke(handler, res) {
   res.finish?.()
 }
 
-async function activeAttemptFailure({ block, delta }) {
+async function activeAttemptFailure({ block, delta, clusterDisconnect = false }) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-active-keepalive-'))
   const socketPath = path.join(root, 'kernel.sock')
   const tokenPath = path.join(root, 'internal.token')
@@ -178,6 +178,7 @@ async function activeAttemptFailure({ block, delta }) {
       failFirstAttempt = () => {
         clearTimeout(pingTimer)
         firstAttemptActive = false
+        if (clusterDisconnect) return response.destroy()
         writeEvents(response, [failure])
         response.end()
       }
@@ -195,13 +196,15 @@ async function activeAttemptFailure({ block, delta }) {
     const written = write(chunk)
     if (firstAttemptActive && String(chunk).includes('event: ping')) {
       sawActivePing = true
-      failFirstAttempt()
+      if (!clusterDisconnect) failFirstAttempt()
     }
+    if (firstAttemptActive && clusterDisconnect && String(chunk).includes('already delivered text')) failFirstAttempt()
     return written
   }
   const candidates = [1, 2].map((number) => {
     const vm = {
       id: `active-keepalive-${number}`,
+      ...(clusterDisconnect ? { node_id: 'cluster-node' } : {}),
       runtime: { kernel_socket: socketPath, worker_run_dir: root, worker_token_file: tokenPath },
     }
     return {
@@ -341,6 +344,24 @@ for (const scenario of [
     )
   })
 }
+
+test('a cluster disconnect after visible SSE output reports delivery uncertainty without replay', async () => {
+  const h = await activeAttemptFailure({
+    block: { type: 'text', text: '' },
+    delta: { type: 'text_delta', text: 'already delivered text' },
+    clusterDisconnect: true,
+  })
+  assert.equal(h.upstreamRequests, 1)
+  assert.equal(h.result.committed, true)
+  assert.equal(h.result.status, 502)
+  assert.deepEqual(h.released, ['account-1'])
+  assert.equal(h.res.statusCode, 200)
+  assert.equal(h.res.writableEnded, true)
+  const output = h.events.filter((event) => event.type !== 'ping')
+  assert.deepEqual(output.slice(0, -1), h.firstEvents)
+  assert.equal(output.at(-1).type, 'error')
+  assert.equal(output.at(-1).error.code, 'cluster_delivery_unconfirmed')
+})
 
 test('a Claude stream pings during the queue and reports a later failure as SSE error', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-queue-keepalive-'))
