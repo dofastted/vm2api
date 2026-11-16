@@ -776,8 +776,7 @@ export function CreateVmForm({
           className='max-w-sm'
         />
         <p className='text-xs text-muted-foreground'>
-          并发跟随设置里的全局默认（创建后可在槽位详情钉住单槽值），权重为默认
-          1。
+          并发跟随设置里的全局默认（创建后可在槽位详情钉住单槽值）。
         </p>
       </Section>
 

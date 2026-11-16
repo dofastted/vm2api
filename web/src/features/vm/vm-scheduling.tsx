@@ -294,7 +294,7 @@ function Tile({
 }
 
 /**
- * VM 内的「调度」块：席位、并发、RPM、调度等级与配额闸的生效值；
+ * VM 内的「调度」块：席位、并发、RPM、调度优先级与配额闸的生效值；
  * 本槽覆盖的项高亮，悬停看全局值，一个弹窗改全部。
  */
 export function VmSchedulingBlock({
@@ -413,18 +413,16 @@ export function VmSchedulingBlock({
             }
           />
         ) : null}
-        {!codex ? (
-          <Tile
-            label='调度等级'
-            value={
-              Number.isInteger(level)
-                ? `${level} 级 · ${vm.schedule_level_mode === 'manual' ? '手动' : '自动'}`
-                : '—'
-            }
-            own={vm.schedule_level_mode === 'manual'}
-            title='等级高的 VM 先开席位；自动模式按 7D 重置倒计时算'
-          />
-        ) : null}
+        <Tile
+          label='调度优先级'
+          value={
+            Number.isInteger(level) && level >= 1 && level <= 10
+              ? `${level} · ${vm.schedule_level_mode === 'manual' ? '手动' : '自动'}`
+              : '—'
+          }
+          own={vm.schedule_level_mode === 'manual'}
+          title='数值越大越优先；自动模式按 7D 重置倒计时计算'
+        />
         <Tile
           label='工作时段'
           value={
@@ -732,36 +730,33 @@ export function VmSchedulingEditor({ vm }: { vm: Vm }) {
                   disabled={pending}
                 />
               </KnobRow>
-              {!codex ? (
-                <div className='space-y-2 rounded-lg border p-3'>
-                  <div className='space-y-0.5'>
-                    <Label>调度等级</Label>
-                    <p className='text-[11px] leading-4 text-muted-foreground'>
-                      等级高的 VM 先开新席位，同等级才看开席策略。自动 = 按 7D
-                      重置倒计时算（1–7）；手动 1–10。
-                    </p>
-                  </div>
-                  <ChipGroup
-                    label='调度等级'
-                    value={draft.level}
-                    options={[
-                      [
-                        'auto',
-                        vm.schedule_level_mode === 'auto' &&
-                        Number.isInteger(Number(vm.schedule_level))
-                          ? `自动（当前 ${vm.schedule_level}）`
-                          : '自动',
-                      ] as ['auto' | number, string],
-                      ...LEVELS.map((n): ['auto' | number, string] => [
-                        n,
-                        String(n),
-                      ]),
-                    ]}
-                    onChange={(level) => setDraft({ ...draft, level })}
-                    disabled={pending}
-                  />
+              <div className='space-y-2 rounded-lg border p-3'>
+                <div className='space-y-0.5'>
+                  <Label>调度优先级</Label>
+                  <p className='text-[11px] leading-4 text-muted-foreground'>
+                    数值越大越优先。自动按 7D 重置倒计时计算（1–7）；手动 1–10。
+                  </p>
                 </div>
-              ) : null}
+                <ChipGroup
+                  label='调度优先级'
+                  value={draft.level}
+                  options={[
+                    [
+                      'auto',
+                      vm.schedule_level_mode === 'auto' &&
+                      Number.isInteger(Number(vm.schedule_level))
+                        ? `自动（当前 ${vm.schedule_level}）`
+                        : '自动',
+                    ] as ['auto' | number, string],
+                    ...LEVELS.map((level): ['auto' | number, string] => [
+                      level,
+                      String(level),
+                    ]),
+                  ]}
+                  onChange={(level) => setDraft({ ...draft, level })}
+                  disabled={pending}
+                />
+              </div>
               <KnobRow
                 label='工作时段'
                 desc='只在此时段内接单，窗口外此号不参与调度（模拟真人作息）。开始晚于结束 = 跨夜班次；时区跟随槽位。'
