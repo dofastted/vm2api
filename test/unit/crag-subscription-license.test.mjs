@@ -2,6 +2,7 @@ import test, { after, before } from 'node:test'
 import assert from 'node:assert/strict'
 import crypto from 'node:crypto'
 import { EventEmitter } from 'node:events'
+import { Writable } from 'node:stream'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -18,6 +19,7 @@ import {
   verifyCragHostEntitlement,
 } from '../../src/lib/vm/crag-license.mjs'
 import { cragSubscriptionPublicDirectory } from '../../src/lib/vm/crag-subscription-paths.mjs'
+import { publishKvmCragLicense } from '../../src/lib/vm/kvm-crag-license.mjs'
 import { bindPlacement, unbindPlacement } from '../../src/lib/cluster/placement.mjs'
 import { callRustKernel, streamRustKernel } from '../../src/lib/transport/rust-kernel-client.mjs'
 import {
@@ -347,9 +349,6 @@ test('signature tampering, foreign signers and package replacement invalidate bo
 for (const placement of [
   { node_id: 'mac', node_platform: 'darwin' },
   { node_platform: 'darwin' },
-  { runtime: { type: 'kvm' } },
-  { runtime: { type: 'qemu' } },
-  { runtime_type: 'kvm', runtime: undefined },
   { platform: 'openai' },
   { family: 'codex' },
   { runtime: { type: 'native' } },
@@ -365,6 +364,60 @@ for (const placement of [
     assert.equal(getCragLicense(root, unsupported).license.valid, false)
   })
 }
+
+test('KVM rejects a permit when its guest machine ID differs from the bound identity', (t) => {
+  const { root, vm } = fixture(t)
+  const guest = { ...vm, runtime: { type: 'kvm' } }
+  guest.fingerprint = { guest_machine_id: fs.readFileSync(path.join(root, 'vms', vm.id, 'machine-id'), 'utf8').trim() }
+  assert.equal(checkCragLicense(root, guest).ok, true)
+  guest.fingerprint.guest_machine_id = crypto.randomBytes(16).toString('hex')
+  assert.equal(checkCragLicense(root, guest).code, 'license_binding_mismatch')
+})
+
+test('KVM guest publication sends only the verified slot bundle over stdin and checks for entitlement changes', async (t) => {
+  const { root, vm, hostId, host, permit, entitlement } = fixture(t)
+  const guest = { ...vm, runtime: { type: 'kvm', container: 'test-kvm' } }
+  guest.fingerprint = { guest_machine_id: fs.readFileSync(path.join(root, 'vms', vm.id, 'machine-id'), 'utf8').trim() }
+  const sent = []
+  const run = (_, argv, opts, done) => {
+    assert.deepEqual(argv.slice(0, 9), [
+      'exec',
+      '-i',
+      'test-kvm',
+      '/usr/local/bin/kin-guest-exec',
+      '-u',
+      '0',
+      '-i',
+      '--',
+      'python3',
+    ])
+    assert.ok(opts.timeout > 0)
+    assert.ok(!argv.join(' ').includes(permit.code))
+    return {
+      stdin: new Writable({
+        write(chunk, _, callback) {
+          sent.push(JSON.parse(chunk.toString()))
+          callback()
+        },
+        final(callback) {
+          callback()
+          done(null)
+        },
+      }),
+    }
+  }
+  await Promise.all([publishKvmCragLicense(root, guest, { run }), publishKvmCragLicense(root, guest, { run })])
+  assert.equal(sent.length, 1)
+  assert.deepEqual(Object.keys(sent[0]).sort(), ['device', 'entitlement', 'hostId', 'permit'])
+  assert.equal(sent[0].hostId, hostId)
+  assert.equal(sent[0].permit, permit.code)
+  assert.equal(sent[0].entitlement, host.code)
+  const renewal = issueHostEntitlement(root, hostId, { revision: 2 })
+  replace(entitlement, renewal.code)
+  await publishKvmCragLicense(root, guest, { run })
+  assert.equal(sent.length, 2)
+  assert.equal(sent[1].entitlement, renewal.code)
+})
 
 test('host storage refuses links, writable files/directories and pending symlinks', async (t) => {
   const context = fixture(t)

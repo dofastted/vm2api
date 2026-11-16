@@ -52,6 +52,7 @@ import { buildNativeTelemetry } from '../vm/native-telemetry.mjs'
 import { defaultSeedPolicy, isTelemetryEnabled } from '../protocol/seed-policy.mjs'
 import { RETIRE_LEGACY_TELEMETRY } from '../vm/slot-process-status.mjs'
 import { checkCragLicense } from '../vm/crag-license.mjs'
+import { publishKvmCragLicense } from '../vm/kvm-crag-license.mjs'
 import { kernelCpuCommand, kernelCpuCommandMatches, usesKernelCpuLimit } from '../vm/kernel-cpu.mjs'
 import { kvmCragAppArmorCommand } from '../vm/kvm-crag-apparmor.mjs'
 import { workerPaths } from './go-worker-client.mjs'
@@ -708,17 +709,28 @@ async function retireLegacyTelemetryBeforeStart(exec, runDockerExec) {
 
 async function startKvmGuestKernel(
   exec,
-  { timeoutMs, control, runDockerExec, force, host, paths, container, allowMissingCredential, prepareGuestAppArmor },
+  {
+    timeoutMs,
+    control,
+    runDockerExec,
+    force,
+    host,
+    paths,
+    container,
+    allowMissingCredential,
+    prepareGuestAppArmor,
+    crag,
+  },
 ) {
   const budget = kvmBootBudget(exec.vm, timeoutMs)
-  if (!force) {
+  if (!force && !crag) {
     const waited = await waitForHealth(exec, budget, allowMissingCredential)
     if (waited?.ok && !prepareGuestAppArmor) {
       waited.reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
       return waited
     }
   }
-  const sshDeadline = Date.now() + 15_000
+  const sshDeadline = Date.now() + (crag ? budget : 15_000)
   let prepared
   do {
     prepared = await runDockerExec(execArgv(exec, kvmCragAppArmorCommand(), { user: '0', interactive: true }), {
@@ -728,7 +740,7 @@ async function startKvmGuestKernel(
     if (prepared?.ok) break
     // The guest health relay can become ready before sshd during cold boot.
     const sshUnavailable = `${prepared?.error || ''}\n${prepared?.stderr || ''}`.includes('guest ssh unavailable')
-    if (!prepareGuestAppArmor || !sshUnavailable || Date.now() >= sshDeadline) break
+    if ((!prepareGuestAppArmor && !crag) || !sshUnavailable || Date.now() >= sshDeadline) break
     await new Promise((resolve) => setTimeout(resolve, 250))
   } while (startCurrent(control))
   if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
@@ -738,6 +750,14 @@ async function startKvmGuestKernel(
       reason: 'guest_apparmor_failed',
       error: String(prepared?.error || prepared?.stderr || 'Guest AppArmor preparation failed'),
     }
+  }
+  if (crag) {
+    try {
+      await publishKvmCragLicense(projectRootFromExec(exec), exec.vm, { force: true })
+    } catch {
+      return { ok: false, reason: 'crag_guest_license_sync_failed', error: 'CRAG guest license projection failed' }
+    }
+    if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
   }
   const retired = await retireLegacyTelemetryBeforeStart(exec, runDockerExec)
   if (!retired.ok) return retired
@@ -857,6 +877,7 @@ async function startRustKernel(
       container,
       allowMissingCredential,
       prepareGuestAppArmor,
+      crag: !!licensed.license,
     })
   }
   const wedged = rustKernelProcessUp(existing) && !rustKernelReachable(existing) && !occupied

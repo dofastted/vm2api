@@ -242,8 +242,6 @@ export async function installKernelTargets({
             ['license_required', 'license_payload_key_mismatch'].includes(grant.code) &&
             target.reissue === true &&
             !resumeId &&
-            !clusterVm &&
-            !isKvmRuntime(vm) &&
             !!cragSubscription?.authorizeInstall
           if (grant && !grant.ok && !useSubscription) {
             const message =

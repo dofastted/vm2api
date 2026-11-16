@@ -55,6 +55,7 @@ import {
   writeWorkerFiles,
 } from '../vm/vm-runtime.mjs'
 import { projectCragUniversalVm, readCragClusterSubscription } from '../vm/crag-license.mjs'
+import { publishKvmCragLicense } from '../vm/kvm-crag-license.mjs'
 import { patchVmRecord } from '../vm/vm-registry.mjs'
 import {
   containerAction,
@@ -1258,6 +1259,9 @@ export async function reloadRemoteSlot(vm, projectRoot, { routing } = {}) {
     const running = !!existing.State?.Running
     if (isKvmRuntime(vm) && running) {
       await chownRemoteKvmBinds(session, name, vm)
+      if (resolveKernelDataplane(vm, routing) === 'crag') {
+        await publishKvmCragLicense(projectRoot, vm, { force: true })
+      }
       const argv = slotExecArgv(
         { ...vm, runtime: { ...(vm.runtime || {}), container: name, type: 'kvm' } },
         kvmCragAppArmorCommand({ restart: true }),

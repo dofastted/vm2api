@@ -172,6 +172,29 @@ test('signed downgrade counts both live processes but keeps independent and prei
   assert.equal((await inv.snapshot(rights)).host_over_limit, true)
 })
 
+test('the same quota counts Docker and KVM even when the guest version is not reported', async (t) => {
+  const f = fixture(t)
+  seedEncryptedPackage(f.root)
+  f.entitlement()
+  const docker = f.add('vm-docker')
+  const guest = f.add('vm-kvm', {
+    runtime_type: 'kvm',
+    fingerprint: { guest_machine_id: randomBytes(16).toString('hex') },
+  })
+  fs.writeFileSync(path.join(f.root, 'vms', guest.id, 'machine-id'), guest.fingerprint.guest_machine_id)
+  f.bind(docker, 1)
+  f.bind(guest, 2)
+  const rights = f.entitlement(1, { revision: 2 })
+  const result = await f.inventory({ health: async () => live }).snapshot({
+    ...rights,
+    hostOnly: true,
+    currentHop: { id: guest.id, health: { ...live, runtime_variant: undefined, dataplane: 'crag' } },
+  })
+  assert.equal(result.host_running_vms, 2)
+  assert.equal(result.host_runtime_available, 0)
+  assert.equal(result.host_over_limit, true)
+})
+
 test('H1 and H2 limits use fresh rights and corrupted permits give an upper bound, not confirmed use', async (t) => {
   const f = fixture(t)
   seedEncryptedPackage(f.root)

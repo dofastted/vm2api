@@ -1,0 +1,70 @@
+import fcntl
+import json
+import os
+from pathlib import Path
+import pwd
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+def native_dir(path, mode, uid=0, gid=0):
+    path.mkdir(mode=0o700, exist_ok=True)
+    if not stat.S_ISDIR(path.lstat().st_mode):
+        raise ValueError('invalid mountpoint')
+    if not path.is_mount():
+        subprocess.run(['mount', '-t', 'tmpfs', '-o',
+                        f'nodev,nosuid,noexec,size=4m,mode={mode:o},uid={uid},gid={gid}',
+                        'tmpfs', path], check=True, timeout=2)
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != uid or stat.S_IMODE(info.st_mode) != mode:
+            raise ValueError('invalid license directory')
+        if subprocess.check_output(['stat', '-f', '-c', '%T', path], timeout=2).strip() != b'tmpfs':
+            raise ValueError('license directory must use guest tmpfs')
+    finally:
+        os.close(fd)
+
+
+def publish(path, value, mode, uid=0, gid=0):
+    fd, temporary = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as output:
+            os.fchmod(output.fileno(), mode)
+            os.fchown(output.fileno(), uid, gid)
+            output.write(value + '\n')
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def sync(run, files, uid, gid):
+    private = run / 'crag-license'
+    native_dir(private, 0o700, uid, gid)
+    if set(files) == {'permit'} and files['permit'].startswith('CRAGU1.'):
+        publish(private / 'registration.code', files['permit'], 0o600, uid, gid)
+        return
+    if set(files) != {'device', 'permit', 'hostId', 'entitlement'} or not files['permit'].startswith('CRAGS1.'):
+        raise ValueError('invalid license projection')
+    host = run / 'crag-host'
+    native_dir(host, 0o755)
+    marker = host / 'sync-pending'
+    publish(marker, 'pending', 0o644)
+    publish(private / 'device.json', files['device'], 0o600, uid, gid)
+    publish(private / 'registration.code', files['permit'], 0o600, uid, gid)
+    publish(host / 'host_id', files['hostId'], 0o644)
+    publish(host / 'entitlement.code', files['entitlement'], 0o644)
+    marker.unlink()
+
+
+if __name__ == '__main__':
+    try:
+        files = json.loads(sys.stdin.buffer.read(2 * 1024 * 1024))
+        user = pwd.getpwnam('kincli')
+        with open('/run/vm2api-crag-license.lock', 'a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            sync(Path('/run/kin'), files, user.pw_uid, user.pw_gid)
+    except Exception:
+        sys.exit('CRAG guest license projection failed')

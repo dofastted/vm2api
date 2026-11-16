@@ -691,7 +691,7 @@ test('legacy KVM without a CRAG version migrates stale config and missing payloa
   const built = fixture(t, { dataplane: 'crag', runtime_type: 'kvm' })
   delete built.vm.runtime.type
   fs.writeFileSync(path.join(built.root, 'vms', `${built.vm.id}.json`), JSON.stringify(built.vm))
-  activateFixture(built.root, built.vm)
+  activateCragLicense(built.root, built.vm, issueUniversalCode(built.root).code)
   fs.mkdirSync(built.run, { recursive: true })
   fs.writeFileSync(
     path.join(built.run, 'kernel.json'),

@@ -97,7 +97,7 @@ import { nodeEgressProxyUrl, startNodeEgressSocks } from './lib/cluster/node-egr
 import { createSlotShell } from './lib/vm/slot-shell.mjs'
 import { vmLockBusy } from './lib/vm/vm-file.mjs'
 import { isKvmRuntime } from './lib/vm/runtime-kind.mjs'
-import { resolveCragKernelVersion, resolveKernelDataplane } from './lib/vm/slot-engine.mjs'
+import { resolveKernelDataplane } from './lib/vm/slot-engine.mjs'
 import {
   assertCragSubscriptionTarget,
   isCragSubscriptionSlotEnabled,
@@ -1022,11 +1022,7 @@ const listCragTargets = () =>
     .map(({ id }) => getVm(cfg.paths.project, id))
     .filter(Boolean)
 
-const isCragV2Slot = (vm) =>
-  !isNativeNodeVm(vm) &&
-  !isCodexVm(vm) &&
-  resolveKernelDataplane(vm, routingConfig) === 'crag' &&
-  resolveCragKernelVersion(vm, routingConfig) === 'v2'
+const isCragSlot = (vm) => !isNativeNodeVm(vm) && !isCodexVm(vm) && resolveKernelDataplane(vm, routingConfig) === 'crag'
 
 const cragSubscription = createCragSubscription({
   projectRoot: cfg.paths.project,
@@ -1041,7 +1037,7 @@ const cragSubscription = createCragSubscription({
     !isNativeNodeVm(vm) &&
     !isCodexVm(vm) &&
     (vm.node_id || isKvmRuntime(vm) || Boolean(installedCragV2Root(cfg.paths.project, vm))),
-  isSubscriptionSlot: (vm) => isCragV2Slot(vm) && !isKvmRuntime(vm),
+  isSubscriptionSlot: isCragSlot,
   assertReady: (vm, opts) => assertCragSubscriptionTarget(cfg.paths.project, vm, routingConfig, opts),
   isSlotEnabled: (vm, opts) => isCragSubscriptionSlotEnabled(cfg.paths.project, vm, routingConfig, opts),
 })
