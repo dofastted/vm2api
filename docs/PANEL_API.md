@@ -344,6 +344,8 @@ Analytics 按官方 [`codex_thread_initialized`](https://github.com/openai/codex
 
 `failover.stream_idle_timeout_ms`（毫秒，30 秒–60 分钟，默认 180 秒）：上游流连续无事件即判超时；网关流路径、各槽 `kernel.json` 的 `idle_timeout_seconds` 与 job 看门狗共用。优先级：面板该字段 → 启动时写入 `cfg.limits.stream_idle_timeout_ms` → 控制面 `.env` 的 `KIN_STREAM_IDLE_TIMEOUT` → 180 秒。保存后热写各槽 `kernel.json`；运行中 kernel 在无任务时自动重启以读取新看门狗值。
 
+`failover.max_accounts_per_request`（正整数，默认 `0` 不限制）：单请求实际执行过的不同账号数达到上限后，不再向新账号发起推理；没执行的准入失败不计入。无配额、模型或重试时间证据的上游 429 不直接冷却账号或 Fable；同一请求在两个账号收到此类 429 时保留上游错误并停止调度。
+
 `compatibility.persona_preset`（`official` / `official_full` / `zero` / `custom`）和 `compatibility.cache_ttl`（`5m` / `1h`）保存后投影到每个 Claude 槽的 `vms/<id>/run/kernel.json`：`persona_preset`、`system_layout`（`zero`→`zero`，其余→`identity`）、`default_cache_ttl`。响应 `kernel_persona.updated` 是本次字节有变化的槽数。`PATCH /vms/:id` 的 `timezone` / `timezone_follow_proxy` 另把 `timezone` 热写进该槽 `kernel.json`，`timezone_sync.kernel_hot` 表示文件有变化。容器 `TZ` 不在这次写入里。Codex 槽不写。
 
 `compatibility.crag_persona_preset`（`official_full` / `zero`，缺省 `official_full`）只给 CRAG v2 print 清洗，不投影进 `kernel.json`。v2 worker 不读 `persona_preset` 或 `CLAUDE_CODE_SYSTEM_LAYOUT`。`official_full` 只 append 调用方尾巴；`zero` 送 `crag_prompt.mode=replace`。其它值保存时 400。槽位显式 `zero` 覆盖该档；其它槽位人设在 print 上收成 append。这不是 TUI：不关内置工具，也不加 `--no-chrome`。

@@ -566,6 +566,50 @@ test('request-scoped entitlement error does not walk the pool', async () => {
   assert.equal(scheduler.cooldowns.length, 0)
 })
 
+test('bare 429s on two accounts stop without cooling accounts or Fable', async () => {
+  for (const model of ['claude-sonnet-test', 'claude-fable-test']) {
+    const scheduler = new Scheduler([candidate(1), candidate(2), candidate(3)])
+    const runner = new FailoverRunner({ scheduler })
+    const result = await runner.run({
+      requestId: `req-bare-${model}`,
+      model,
+      callAttempt: () => ({
+        ok: false,
+        status: 429,
+        terminalState: 'rejected',
+        body: { error: { type: 'rate_limit_error', message: 'Error' } },
+      }),
+    })
+    assert.equal(result.status, 429)
+    assert.equal(result.policy.reason, 'rate_limited_request')
+    assert.equal(result.attemptCount, 2)
+    assert.equal(scheduler.selectCalls, 2)
+    assert.deepEqual(scheduler.cooldowns, [])
+    assert.deepEqual(scheduler.releasedAccounts, [])
+  }
+})
+
+test('the optional account cap counts executions, not admission misses', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2), candidate(3), candidate(4)])
+  const runner = new FailoverRunner({ scheduler, config: { max_accounts_per_request: 1 } })
+  const seen = []
+  const result = await runner.run({
+    requestId: 'req-account-cap',
+    model: 'claude-sonnet-test',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      if (selected.accountId === 'account-1') {
+        return { ok: false, status: 503, upstreamExecutions: 0, body: { error: { code: 'slot_busy' } } }
+      }
+      return { ok: false, status: 529, terminalState: 'rejected', body: { error: { message: 'Overloaded' } } }
+    },
+  })
+  assert.deepEqual(seen, ['account-1', 'account-2'])
+  assert.equal(result.account_cap, 1)
+  assert.equal(result.attemptCount, 1)
+  assert.equal(result.status, 529)
+})
+
 test('committed realtime stream failure never switches accounts', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const runner = new FailoverRunner({ scheduler })

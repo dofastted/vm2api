@@ -96,19 +96,26 @@ test('unified account 429 cools account until authoritative reset', () => {
 })
 
 test('#163: a bare 429 is unknown for every model; the model name never decides scope', () => {
-  for (const model of ['claude-sonnet-4-5-20250929', 'claude-haiku-4-5', 'claude-opus-4-6', 'unknown-model']) {
+  for (const model of [
+    'claude-sonnet-4-5-20250929',
+    'claude-haiku-4-5',
+    'claude-opus-4-6',
+    'claude-fable-5-2',
+    'unknown-model',
+  ]) {
     const policy = classifyUpstreamResult(
       { status: 429, body: { error: { type: 'rate_limit_error', message: 'Rate limited' } }, headers: {} },
       { model, now: 1000 },
     )
     assert.equal(policy.reason, 'rate_limited_unknown', model)
     assert.equal(policy.scope, 'account', model)
-    assert.equal(policy.cooldownUntil, 61_000, model)
+    assert.equal(policy.action, 'continue', model)
+    assert.equal(policy.cooldownUntil, null, model)
     assert.equal(policy.circuit, undefined, model)
   }
 })
 
-test('#1139: real Fable rate evidence and unrelated bare 429s still cool the model', () => {
+test('#1139: only a proven Fable window cools the Fable family', () => {
   const error = { type: 'rate_limit_error', message: 'Error' }
   const body = { type: 'error', error }
   const facts = {
@@ -119,21 +126,33 @@ test('#1139: real Fable rate evidence and unrelated bare 429s still cool the mod
     error,
   }
   const result = { status: 429, body, providerResult: facts }
-  for (const [label, failure] of [
+  for (const [label, failure, reason, action] of [
     [
       'native limit header',
       {
         ...result,
         providerResult: { ...facts, response_headers: { 'Anthropic-RateLimit-Unified-7d_oi-Status': 'rejected' } },
       },
+      'fable_rate_limited',
+      'continue-and-cooldown',
     ],
-    ['forwarded Retry-After', { ...result, headers: { 'Retry-After': '7' } }],
-    ['no native facts', { status: 429, body }],
-    ['different error text', { ...result, body: { ...body, error: { ...error, message: 'Rate limited' } } }],
+    [
+      'forwarded Retry-After',
+      { ...result, headers: { 'Retry-After': '7' } },
+      'rate_limited_unknown',
+      'continue-and-cooldown',
+    ],
+    ['no native facts', { status: 429, body }, 'rate_limited_unknown', 'continue'],
+    [
+      'different error text',
+      { ...result, body: { ...body, error: { ...error, message: 'Rate limited' } } },
+      'rate_limited_unknown',
+      'continue',
+    ],
   ]) {
     const policy = classifyUpstreamResult(failure, { model: 'claude-fable-5-2', now: 1000 })
-    assert.equal(policy.reason, 'fable_rate_limited', label)
-    assert.equal(policy.action, 'continue-and-cooldown', label)
+    assert.equal(policy.reason, reason, label)
+    assert.equal(policy.action, action, label)
   }
 })
 

@@ -656,8 +656,9 @@ function classifyUpstreamResultRaw(
         cooldownUntil: accountLimitUntil(reset, usage, now, message),
       }
     }
-    if (isFableWindowLimit(result.headers) || isFableModel(model)) {
-      const fableReset = fableResetFromHeaders(result.headers, now) || reset
+    if (isFableWindowLimit(result.headers) || isFableWindowLimit(upstreamHeaders)) {
+      const fableReset =
+        fableResetFromHeaders(result.headers, now) || fableResetFromHeaders(upstreamHeaders, now) || reset
       return {
         scope: 'model',
         action: 'continue-and-cooldown',
@@ -692,9 +693,9 @@ function classifyUpstreamResultRaw(
     }
     return {
       scope: 'account',
-      action: 'continue-and-cooldown',
+      action: reset > now ? 'continue-and-cooldown' : 'continue',
       reason: 'rate_limited_unknown',
-      cooldownUntil: reset || now + 60_000,
+      cooldownUntil: reset > now ? reset : null,
       retrySameAccount: false,
     }
   }
