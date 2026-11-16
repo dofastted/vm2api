@@ -254,6 +254,82 @@ function emptyPoolFailure(candidates, now = Date.now()) {
   return { reason: 'no_eligible_accounts', retry_after_ms: restUntil > now ? restUntil - now : null }
 }
 
+/**
+ * 额度耗尽保护 (quota exhaustion guard). Defaults match the panel; off unless
+ * `quota.exhaustion_guard` is true. A window reported `rejected` (headers or the
+ * official /usage probe) always stops the account until its reset: every
+ * request there fails anyway, whatever the switch says.
+ */
+export const QUOTA_GUARD_DEFAULTS = { new_session_ratio: 0.85, stop_ratio: 0.95 }
+
+export function quotaGuardConfigOf(quota = {}) {
+  const ratio = (value, fallback) => {
+    const n = Number(value)
+    return Number.isFinite(n) && n > 0 && n <= 1 ? n : fallback
+  }
+  const stop = ratio(quota?.exhaustion_guard_stop, QUOTA_GUARD_DEFAULTS.stop_ratio)
+  const fresh = Math.min(stop, ratio(quota?.exhaustion_guard_new_session, QUOTA_GUARD_DEFAULTS.new_session_ratio))
+  return { enabled: quota?.exhaustion_guard === true, new_session_ratio: fresh, stop_ratio: stop }
+}
+
+function guardResetMs(value) {
+  if (value == null || value === '') return null
+  const n = Number(value)
+  if (Number.isFinite(n)) return n < 1e12 ? n * 1000 : n
+  const parsed = Date.parse(String(value))
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+/** One window sample as { ratio, until }; null when empty or already reset. */
+function guardWindowReading(window, now) {
+  if (!window || typeof window !== 'object') return null
+  const until = guardResetMs(window.reset)
+  if (until != null && until <= now) return null
+  const status = String(window.status || '').toLowerCase()
+  if (status === 'rejected' || status === 'rate_limited') return { ratio: 1, until, rejected: true }
+  let ratio = Number(window.utilization)
+  if (window.utilization == null || window.utilization === '' || !Number.isFinite(ratio)) return null
+  if (ratio > 1.5) ratio /= 100
+  return { ratio, until, rejected: false }
+}
+
+/**
+ * Highest live 5h / 7d reading across the response-header sample, the official
+ * /usage sample and the merged view. They disagree: a Pro seat read 0.97
+ * `allowed_warning` on its last good response while /usage said 100% `rejected`.
+ */
+export function quotaGuardUsage(unified = {}, now = Date.now()) {
+  let worst = null
+  for (const key of ['5h', '7d']) {
+    for (const sample of [unified?.headers?.[key], unified?.official?.[key], unified?.[key]]) {
+      const reading = guardWindowReading(sample, now)
+      if (!reading) continue
+      const better =
+        !worst ||
+        reading.ratio > worst.ratio ||
+        (reading.ratio === worst.ratio && (reading.until || 0) > (worst.until || 0))
+      if (better) worst = { ...reading, window: key }
+    }
+  }
+  return worst
+}
+
+/**
+ * What the guard allows on one account: `open`, `continuing` (only sessions
+ * already pinned there keep their cache; no new conversations) or `stop`.
+ */
+export function quotaGuardLevel(unified, config, now = Date.now()) {
+  const usage = quotaGuardUsage(unified, now)
+  if (!usage) return { level: 'open', usage: null }
+  // Extra usage still open keeps a rejected plan window serving: only the switch stops it.
+  const overageOpen = String(unified?.overage_status || '').toLowerCase() === 'allowed'
+  if (usage.rejected && !overageOpen) return { level: 'stop', usage }
+  if (!config?.enabled) return { level: 'open', usage }
+  if (usage.ratio >= config.stop_ratio) return { level: 'stop', usage }
+  if (usage.ratio >= config.new_session_ratio) return { level: 'continuing', usage }
+  return { level: 'open', usage }
+}
+
 function selectionSnapshot(candidates = [], available = [], extras = {}) {
   const now = Date.now()
   const waitPool = extras.waitPool || candidates
@@ -579,6 +655,7 @@ export class PoolScheduler extends EventEmitter {
         ownerScope,
         keyScope,
         quotaRequest,
+        continuingVmIds: this.continuingVmIds({ stickyKey, stickyKeys }),
       })
       if (signal?.aborted) throw makeAbortError()
       if ((failoverDeadline || waitStartedAt !== null) && Date.now() >= waitCutoff) {
@@ -845,12 +922,21 @@ export class PoolScheduler extends EventEmitter {
             keyScope,
             quotaRequest,
             onlyVmIds: new Set([held.vmId]),
+            continuingVmIds: this.continuingVmIds({ seatKey, stickyKey, stickyKeys }),
           })
           const home = candidates[0]
           checkedHomeOnly = !!home && (!home.busy || stickyShouldWait(home.waitReason, home.cooldownReason))
         }
         if (!checkedHomeOnly) {
-          candidates = await this.eligibleCandidates({ model, excluded, signal, ownerScope, keyScope, quotaRequest })
+          candidates = await this.eligibleCandidates({
+            model,
+            excluded,
+            signal,
+            ownerScope,
+            keyScope,
+            quotaRequest,
+            continuingVmIds: this.continuingVmIds({ seatKey, stickyKey, stickyKeys }),
+          })
         }
         if (signal?.aborted) throw makeAbortError()
         const now = Date.now()
@@ -1202,6 +1288,19 @@ export class PoolScheduler extends EventEmitter {
     return { cleared: false, vmId: bound.vmId, match }
   }
 
+  /** VMs this request's conversation already sits on: its held seat and its session pins. */
+  continuingVmIds({ seatKey = null, stickyKey = null, stickyKeys = null } = {}) {
+    const ids = new Set()
+    const held = seatKey ? this.planner?.seatOf?.(seatKey) : null
+    if (held?.vmId) ids.add(held.vmId)
+    for (const key of [stickyKey, ...(Array.isArray(stickyKeys) ? stickyKeys : [])]) {
+      if (!key) continue
+      const bound = this.stickyRouter?.resolve?.(key)
+      if (bound?.vmId) ids.add(bound.vmId)
+    }
+    return ids
+  }
+
   async eligibleCandidates({
     model = null,
     excluded = new Set(),
@@ -1211,9 +1310,11 @@ export class PoolScheduler extends EventEmitter {
     keyScope = null,
     quotaRequest = null,
     onlyVmIds = null,
+    continuingVmIds = null,
   } = {}) {
     const now = Date.now()
     const summaries = listVms(this.projectRoot)
+    const guardConfig = quotaGuardConfigOf(this.accountQuota?.config)
     const candidates = Object.assign([], {
       cooldowns: { rate_limited: /** @type {number|null} */ (null), overloaded: /** @type {number|null} */ (null) },
       rejections: { quota_guard_request_too_large: 0 },
@@ -1242,6 +1343,21 @@ export class PoolScheduler extends EventEmitter {
       const snapshot = snapshots.get(accountId)
       const state = snapshot?.state || null
       const account = snapshot?.account || null
+      if (!pin) {
+        // 额度耗尽保护: past the stop line nothing runs here until reset; in the
+        // new-session band only a conversation already pinned here continues.
+        // Without session context (continuingVmIds null) only the stop applies.
+        const guard = quotaGuardLevel(account?.unified, guardConfig, now)
+        if (guard.level === 'stop') {
+          const until = Number(guard.usage?.until) || 0
+          if (until > now) {
+            const prev = candidates.cooldowns.rate_limited
+            candidates.cooldowns.rate_limited = prev == null ? until : Math.min(prev, until)
+          }
+          continue
+        }
+        if (guard.level === 'continuing' && continuingVmIds && !continuingVmIds.has(vm.id)) continue
+      }
       const eligibility = await this.checkEligibility({
         vm,
         accountId,
