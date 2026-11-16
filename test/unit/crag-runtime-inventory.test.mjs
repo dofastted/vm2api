@@ -127,7 +127,7 @@ test('signed downgrade counts both live processes but keeps independent and prei
     health: async ({ vm }, options) => {
       assert.equal(options.timeoutMs, 2500)
       assert.equal(options.requireInternalToken, true)
-      if (vm.id === standard.id) return { status: 200, ok: true, runtime_variant: 'cli-node' }
+      if (vm.id === standard.id) return { status: 200, ok: true, healthy: true, runtime_variant: 'cli-node' }
       if (vm.id === extra.id) return { ...live, status: 503, ok: false, license_valid: false, ready_slots: 0 }
       return live
     },
@@ -142,6 +142,8 @@ test('signed downgrade counts both live processes but keeps independent and prei
   assert.equal(new Date(over.checked_at).toISOString(), over.checked_at)
   assert.equal(over.vms[parked.id], undefined)
   assert.equal(over.vms[standard.id].state, 'not_running')
+  assert.equal(over.vms[standard.id].non_crag_confirmed, true)
+  assert.equal(over.vms[standard.id].stopped_confirmed, undefined)
   assert.deepEqual(over.vms[independent.id], {
     state: 'running',
     ready: true,
@@ -164,6 +166,7 @@ test('signed downgrade counts both live processes but keeps independent and prei
   const inQuota = await inv.snapshot(rights)
   assert.equal(inQuota.host_running_vms, 1)
   assert.equal(inQuota.host_over_limit, false)
+  assert.equal(inQuota.vms[extra.id].stopped_confirmed, true)
   assert.equal(inQuota.vms[main.id].ready, true)
   main.schedulable = false
   assert.equal((await inv.snapshot(rights)).vms[main.id].ready, false)
@@ -362,6 +365,10 @@ test('genuine local ENOENT/ECONNREFUSED remain negative; stale paths and unauthe
   }
   const data = (await f.inventory().snapshot()).vms
   for (const vm of [absent, refused]) assert.equal(data[vm.id].state, 'not_running', vm.id)
+  for (const vm of [absent, refused]) {
+    assert.equal(data[vm.id].stopped_confirmed, undefined, vm.id)
+    assert.equal(data[vm.id].non_crag_confirmed, undefined, vm.id)
+  }
   for (const vm of [regular, kvm, noToken, denied, anonymous]) assert.equal(data[vm.id].state, 'unknown', vm.id)
   assert.equal(data[signed.id].state, 'running')
 })
@@ -446,4 +453,51 @@ test('overlapping snapshots coalesce up to eight probes; expiry skips outstandin
   }
   await nextTurn()
   assert.equal(calls, 22, 'expired queued work did not start after the timeout')
+})
+
+test('fresh inventory ignores cached and in-flight observations and current-hop evidence', async (t) => {
+  const f = fixture(t)
+  seedEncryptedPackage(f.root)
+  const rights = f.entitlement()
+  const vm = f.add('vm-11')
+  const standard = { status: 200, ok: true, healthy: false, runtime_variant: 'cli-node' }
+  f.bind(vm, 1)
+  let finishOldProbe
+  let calls = 0
+  let state = 'missing'
+  let report = live
+  const inventory = f.inventory({
+    observe: async () => {
+      if (++calls === 1) {
+        return new Promise((resolve) => {
+          finishOldProbe = resolve
+        })
+      }
+      return { state }
+    },
+    health: async () => report,
+  })
+  const snapshot = (options) => inventory.snapshot({ ...rights, hostOnly: true, ...options })
+  const old = snapshot()
+  await nextTurn()
+  try {
+    const fresh = await snapshot({ fresh: true, currentHop: { id: vm.id, health: live } })
+    assert.equal(fresh.vms[vm.id].stopped_confirmed, true)
+  } finally {
+    finishOldProbe({ state: 'stopped' })
+  }
+  assert.equal((await old).vms[vm.id].stopped_confirmed, true)
+  for (state of ['paused', 'restarting', 'unknown', 'running']) {
+    const fresh = (await snapshot({ fresh: true })).vms[vm.id]
+    assert.equal(fresh.stopped_confirmed, undefined, state)
+    assert.equal(fresh.non_crag_confirmed, undefined, state)
+    assert.equal(fresh.state, ['paused', 'restarting'].includes(state) ? 'not_running' : state)
+    assert.equal((await snapshot()).vms[vm.id].stopped_confirmed, true, 'display cache is independent')
+  }
+  assert.equal(calls, 6)
+  report = standard
+  const degraded = (await snapshot({ fresh: true })).vms[vm.id]
+  assert.equal(degraded.state, 'not_running')
+  assert.equal(degraded.non_crag_confirmed, undefined)
+  assert.equal(degraded.stopped_confirmed, undefined)
 })

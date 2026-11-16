@@ -25,6 +25,7 @@ import { isCodexVm } from '../vm/vm-kind.mjs'
 import { isKvmRuntime, runtimeKind } from '../vm/runtime-kind.mjs'
 import { slotExecArgv } from '../vm/slot-exec.mjs'
 import { ensureHostPrivateDir } from '../vm/private-dir.mjs'
+import { withCragRuntimeAdmission } from '../vm/slot-runtime-admission.mjs'
 import {
   CONTAINER_CLI_NODE_BIN,
   KERNEL_NATIVE_SLOT_COUNT,
@@ -214,6 +215,18 @@ function projectRootFromExec(exec = {}) {
   const at = home.indexOf(marker)
   if (at > 0) return home.slice(0, at)
   return ''
+}
+
+function admitKernelLaunch(exec, start) {
+  const vm = exec?.vm
+  const { dataplane } = readExistingKernelConfig(rustKernelPaths(exec).configPath)
+  const candidate = dataplane === 'crag' && vm ? { ...vm, dataplane } : vm
+  return withCragRuntimeAdmission(
+    candidate,
+    projectRootFromExec(exec),
+    { routing: { inference: { dataplane } } },
+    start,
+  )
 }
 
 /**
@@ -459,6 +472,10 @@ export function wrapNewerThanKernel(exec) {
 }
 
 export async function restartRustKernel(exec, { timeoutMs = 30000, runDockerExec = runDocker } = {}) {
+  return admitKernelLaunch(exec, () => restartAdmittedRustKernel(exec, { timeoutMs, runDockerExec }))
+}
+
+async function restartAdmittedRustKernel(exec, { timeoutMs, runDockerExec }) {
   if (isKvmRuntime(exec?.vm)) {
     return ensureRustKernel(exec, { timeoutMs, runDockerExec, force: true })
   }
@@ -857,6 +874,46 @@ async function startRustKernel(
     return { ok: true, reason: 'already_up', health: existing, reconcile }
   }
   if (!paths.configPath || !fs.existsSync(paths.configPath)) return { ok: false, reason: 'config_missing' }
+  return admitKernelLaunch(exec, () =>
+    launchRustKernel(exec, {
+      paths,
+      expectedSlots,
+      host,
+      timeoutMs,
+      control,
+      runDockerExec,
+      force,
+      allowMissingCredential,
+      prepareGuestAppArmor,
+      licensed,
+      existing,
+      occupied,
+      staleWrap,
+      slotMismatch,
+    }),
+  )
+}
+
+async function launchRustKernel(
+  exec,
+  {
+    paths,
+    expectedSlots,
+    host,
+    timeoutMs,
+    control,
+    runDockerExec,
+    force,
+    allowMissingCredential,
+    prepareGuestAppArmor,
+    licensed,
+    existing,
+    occupied,
+    staleWrap,
+    slotMismatch,
+  },
+) {
+  if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
   syncKernelSlotCount(paths.configPath, expectedSlots)
   try {
     await host.syncRun(exec.vm, path.dirname(paths.runDir))

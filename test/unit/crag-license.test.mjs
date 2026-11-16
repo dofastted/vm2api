@@ -36,6 +36,7 @@ import {
   seedEncryptedPackage,
   issueUniversalCode,
   signedCode,
+  signSubscriptionBytes,
 } from '../fixtures/crag-license.mjs'
 import { createCragSubscription } from '../../src/lib/vm/crag-subscription.mjs'
 import { cragSubscriptionPublicDirectory } from '../../src/lib/vm/crag-subscription-paths.mjs'
@@ -226,7 +227,7 @@ test('an installed package cannot supply its own trust anchor', (t) => {
   assert.throws(() => cragTargetIds(root, vm), { code: 'license_unconfigured' })
 })
 
-test('the shared activation field redeems a purchase and binds the selected slot', async (t) => {
+test('purchase activation binds the slot and pinned installs reuse or preserve its signed H2 permit', async (t) => {
   const { root, vm, pkg } = fixture(t)
   assert.equal(materializeCragV2(root, vm, { select: false }).ok, true)
   const installed = verifyCragV2Tree(pkg).manifest
@@ -239,10 +240,7 @@ test('the shared activation field redeems a purchase and binds the selected slot
   const registration_code = `CRAGR1.${crypto.randomBytes(32).toString('base64url')}`
   const calls = []
   let accepted
-  let reissueKey
   let machineCode
-  let reissueError = true
-  const replacement = crypto.randomBytes(32)
   let rejectPayload = true
   const cragSubscription = createCragSubscription({
     projectRoot: root,
@@ -257,27 +255,33 @@ test('the shared activation field redeems a purchase and binds the selected slot
       if (action === 'redeem') {
         assert.equal(body.redemption_code, registration_code)
         assert.deepEqual(Object.keys(body).sort(), ['host_id', 'redemption_code'])
-        accepted ??= issueHostEntitlement(root, body.host_id, { slot_limit: 1 })
+        accepted ??= issueHostEntitlement(root, body.host_id, { slot_limit: 1, version: 2, roster: [] })
+        accepted.code = signSubscriptionBytes(root, 'CRAGH2', JSON.stringify(accepted.claims))
       }
       const { code, claims } = accepted
       const data = { entitlement: code, revision: claims.revision, expires_at: claims.expires_at, slot_limit: 1 }
       if (action === 'bind') {
-        assert.equal(body.payload_key_id, body.reissue ? reissueKey : installed.payload.key_id)
+        assert.equal(body.payload_key_id, installed.payload.key_id)
         if (rejectPayload) return Response.json({ ok: false, error: { code: 'payload_key_unknown' } }, { status: 400 })
-        if (!reissueKey) assert.equal(Object.hasOwn(body, 'reissue'), false)
-        if (reissueKey && (!body.reissue || reissueError)) {
-          return Response.json({ ok: false, error: { code: 'payload_key_conflict' } }, { status: 409 })
-        }
+        assert.equal(Object.hasOwn(body, 'reissue'), false)
         machineCode ??= body.machine_code
         assert.equal(body.machine_code, machineCode)
-        const permit = issueSlotPermit(
-          root,
-          body.machine_code,
-          body.host_id,
-          { seat: 1 },
-          body.reissue ? { keyId: reissueKey, payload: replacement } : {},
-        )
-        Object.assign(data, { seat: 1, slot_permit: permit.code })
+        const boundPermit = issueSlotPermit(root, body.machine_code, body.host_id, { seat: 1 })
+        const roster = [{ seat: 1, permit_sha256: crypto.createHash('sha256').update(boundPermit.code).digest('hex') }]
+        const revised = { ...claims, revision: claims.revision + 1, roster }
+        Object.assign(data, {
+          entitlement: signSubscriptionBytes(root, 'CRAGH2', JSON.stringify(revised)),
+          revision: revised.revision,
+          used_slots: 1,
+          available_slots: 0,
+          seat: 1,
+          slot_permit: boundPermit.code,
+        })
+      } else if (action === 'redeem') {
+        data.used_slots = 0
+        data.available_slots = 1
+      } else {
+        assert.fail(`install should not contact Authority: ${action}`)
       }
       return Response.json({ ok: true, data })
     },
@@ -310,19 +314,17 @@ test('the shared activation field redeems a purchase and binds the selected slot
   assert.equal(activated.body.data.license.scope, 'host')
   assert.equal(getCragLicense(root, vm).license.valid, true)
   assert.deepEqual(calls, ['resolve', 'redeem', 'bind', 'resolve', 'redeem', 'bind'])
-  assert.doesNotMatch(JSON.stringify(activated.body), /CRAGR1|CRAGS1|CRAGH1|wrapped_key/)
-  const replacementPackage = seedEncryptedPackage(root, { payloadKey: replacement })
-  reissueKey = verifyCragV2Tree(replacementPackage).manifest.payload.key_id
+  assert.doesNotMatch(JSON.stringify(activated.body), /CRAGR1|CRAGS1|CRAGH2|wrapped_key/)
+  seedEncryptedPackage(root, { payloadKey: crypto.randomBytes(32) })
   const snapshot = await route(root, 'GET', '/kernels')
   assert.equal(snapshot.body.data.licenses[vm.id].scope, 'host', JSON.stringify(snapshot.body.data.licenses[vm.id]))
   assert.equal(snapshot.body.data.licenses[vm.id].valid, true)
   assert.equal(snapshot.body.data.install_licenses[vm.id].code, 'license_payload_key_mismatch')
   assert.deepEqual(calls, ['resolve', 'redeem', 'bind', 'resolve', 'redeem', 'bind'])
 
-  await assert.rejects(cragSubscription.bind(vm), { code: 'payload_key_conflict' })
   const payload_tag = 'payload-2026.11.16-crag-3.0.8'
   let stops = 0
-  const install = (target, origin = 'http://localhost') =>
+  const install = (target = {}) =>
     route(
       root,
       'POST',
@@ -331,7 +333,7 @@ test('the shared activation field redeems a purchase and binds the selected slot
       'admin',
       vm.id,
       {
-        origin,
+        origin: 'http://localhost',
         cragSubscription,
         kernelInstallOps: {
           describeKernelCatalog: () => [{ id: 'crag', ready: true, payload_tag }],
@@ -346,26 +348,30 @@ test('the shared activation field redeems a purchase and binds the selected slot
         },
       },
     )
-  const bindCount = () => calls.filter((call) => call === 'bind').length
-  const before = bindCount()
-  assert.equal((await install({})).body.data.items[0].code, 'license_payload_key_mismatch')
-  assert.equal((await install({ reissue: true }, 'http://elsewhere')).status, 403)
-  assert.equal((await install({ reissue: 'true' })).status, 400)
+  const before = [...calls]
+  const entitlementFile = path.join(cragSubscriptionPublicDirectory(root), 'entitlement.code')
+  const licenseFile = path.join(cragLicenseDirectory(root, vm), 'registration.code')
+  const originalEntitlement = fs.readFileSync(entitlementFile)
+  assert.match(originalEntitlement.toString(), /^CRAGH2\./)
+  const originalLicense = fs.readFileSync(licenseFile)
+  const originalTree = fs.readFileSync(path.join(wrapCliHomeDir(root, vm.id), 'crag-v2', 'manifest.json'))
   assert.equal(
-    (await install({ reissue: true, payload_tag: 'payload-2026.11.15-crag-3.0.5' })).body.data.items[0].code,
+    (await install({ payload_tag: 'payload-2026.11.15-crag-3.0.5' })).body.data.items[0].code,
     'crag_payload_changed',
   )
-  assert.equal(bindCount(), before)
-  const failed = (await install({ reissue: true })).body.data.items[0]
-  assert.equal(failed.code, 'payload_key_conflict')
-  assert.equal(failed.stopped, false)
+  const denied = (await install()).body.data.items[0]
+  assert.equal(denied.code, 'crag_subscription_migration_required')
+  assert.equal(denied.stopped, false)
   assert.equal(stops, 0)
-  assert.equal(getCragLicense(root, vm).license.valid, true)
-  reissueError = false
-  const installedResult = (await install({ reissue: true })).body.data.items[0]
-  assert.equal(installedResult.restarted, true, JSON.stringify(installedResult))
+  assert.deepEqual(fs.readFileSync(path.join(wrapCliHomeDir(root, vm.id), 'crag-v2', 'manifest.json')), originalTree)
+
+  seedEncryptedPackage(root, { revision: 'next compatible release' })
+  const updated = (await install()).body.data.items[0]
+  assert.equal(updated.restarted, true, JSON.stringify(updated))
   assert.equal(stops, 1)
-  assert.equal(bindCount(), before + 2)
+  assert.deepEqual(calls, before)
+  assert.deepEqual(fs.readFileSync(entitlementFile), originalEntitlement)
+  assert.deepEqual(fs.readFileSync(licenseFile), originalLicense)
   assert.equal(getCragLicense(root, vm).license.valid, true)
 })
 

@@ -864,6 +864,25 @@ export function readCragSubscriptionReleaseCandidate(projectRoot, vm, hostId) {
   return sha(registration)
 }
 
+// Only call after the new Authority roster has revoked this exact permit.
+export function removeReclaimedCragPermit(projectRoot, vm, digest) {
+  try {
+    return subscriptionStorage(cragLicenseDirectory(projectRoot, vm), vm, (storage) => {
+      const registration = new TextDecoder('utf-8', { fatal: true })
+        .decode(storage.read('registration.code', 65536))
+        .trim()
+      if (!selectsSubscription(registration) || sha(registration) !== digest) return false
+      storage.current()
+      fs.unlinkSync(`${storage.dir}/registration.code`)
+      storage.sync()
+      return true
+    })
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false
+    throw error
+  }
+}
+
 export function readCragClusterSubscription(projectRoot, vm) {
   if (!vm.node_id || isKvmRuntime(vm)) return null
   const permit = storedRegistration(cragLicenseDirectory(projectRoot, vm))
@@ -1124,10 +1143,15 @@ export function getCragLicense(projectRoot, vm, { initialize = false, preferInst
       const grant = sharedUniversalLicense(projectRoot, authority)
       if (grant) return withMachineCode(projectRoot, vm, grant, initialize)
     }
-    if (!stored && isKvmRuntime(vm)) return { license: publicFailure(vm, { code: 'ENOENT' }), machine_code: '' }
+    if (!stored) {
+      const target = authority()
+      const absent = { license: publicFailure(vm, { code: 'ENOENT' }), machine_code: '' }
+      if (vm.node_id || isKvmRuntime(vm)) return absent
+      if (!initialize && !fs.existsSync(path.join(projectRoot, 'vms', vm.id, 'machine-id'))) return absent
+      ctx = deviceContext(projectRoot, vm, initialize)
+      return { ...absent, ...machineExport(ctx.machine_code, target.keyId) }
+    }
     ctx = deviceContext(projectRoot, vm, initialize)
-    if (!stored)
-      return { license: publicFailure(vm, { code: 'ENOENT' }), ...machineExport(ctx.machine_code, authority().keyId) }
     const target = authority()
     return {
       license: verifyCragRegistration(stored, { ...ctx, ...target }),

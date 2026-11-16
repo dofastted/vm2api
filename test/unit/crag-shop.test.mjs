@@ -630,7 +630,14 @@ test('pinned fulfillment survives lost redeem and H2 bind replies without reappl
     fs.writeFileSync(path.join(dir, 'machine-id'), randomBytes(16).toString('hex'))
   }
   assert.equal(materializeCragV2(root, slots[0], { select: false }).ok, true)
-  const pinnedPayload = cragTargetIds(root, slots[0]).payloadKeyId
+  const { payloadKeyId: pinnedPayload, issuerId: pinnedIssuer } = cragTargetIds(root, slots[0])
+  fs.mkdirSync(path.join(root, 'deploy'))
+  fs.writeFileSync(
+    path.join(root, 'deploy/payload.json'),
+    JSON.stringify({
+      crag_authorization: { payload_key_id: pinnedPayload, issuer_public_key_id: pinnedIssuer },
+    }),
+  )
   // Refreshing the download cache must not invalidate the installed target's unpaid order.
   const refreshCache = () => {
     seedEncryptedPackage(root, { payloadKey: randomBytes(32) })
@@ -688,7 +695,8 @@ test('pinned fulfillment survives lost redeem and H2 bind replies without reappl
         assert.equal(init.headers.authorization, bearer)
         if (url.endsWith('/redeem')) {
           assert.equal(input.redemption_code, CODE)
-          assert.deepEqual(Object.keys(input).sort(), ['host_id', 'redemption_code'])
+          assert.equal(input.payload_key_id, pinnedPayload)
+          assert.equal(input.issuer_public_key_id, pinnedIssuer)
           if (++redeems === 1) {
             rights = signedRights(input.host_id, 1, [])
             throw new Error('lost redeem reply after authority commit')

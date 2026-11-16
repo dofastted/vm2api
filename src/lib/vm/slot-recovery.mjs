@@ -34,6 +34,7 @@ import { resolveInferenceEngine } from './slot-engine.mjs'
 import { slotExecContainer } from './slot-exec.mjs'
 import { slotHost } from './slot-host.mjs'
 import { slotExec, startSlotReady, stopSlot } from './slot-runtime.mjs'
+import { withCragRuntimeAdmission } from './slot-runtime-admission.mjs'
 import { isCodexVm } from './vm-kind.mjs'
 import { isKvmRuntime } from './runtime-kind.mjs'
 import { slotDockerCpus } from './machine-spec.mjs'
@@ -430,7 +431,7 @@ export async function powerOnSlot({
   if (!boot.ok || boot.rust_ok === false || boot.rust?.ok === false || boot.kernel?.ok === false) {
     return {
       ok: false,
-      status: 500,
+      status: boot.status || 500,
       code: boot.code || boot.rust?.code || boot.rust?.reason || 'runtime_start_failed',
       error: boot.error || boot.rust?.error || boot.rust?.reason || 'runtime start failed',
       boot,
@@ -529,92 +530,95 @@ export async function recoverSlot({
       id,
       watchdog,
       poolScheduler,
-      operation: async () => {
-        const manager = (ops.cluster || cluster)()
-        const stop = ops.stopSlot || stopSlot
-        const powerOn = ops.powerOn || ((args) => powerOnSlot(args))
-        const diagnose =
-          ops.diagnose || ((current) => diagnoseSlotServices(current, { projectRoot, routing, watchdog, internal }))
-        const started = now()
-        const steps = []
-        const step = async (stepId, fn) => {
-          const t0 = now()
-          let r
-          try {
-            r = await fn()
-          } catch (error) {
-            r = { ok: false, code: error?.code, message: String(error?.message || error) }
+      operation: () =>
+        withCragRuntimeAdmission(vm, projectRoot, { routing, action: 'recovery' }, async () => {
+          const manager = (ops.cluster || cluster)()
+          const stop = ops.stopSlot || stopSlot
+          const powerOn = ops.powerOn || ((args) => powerOnSlot(args))
+          const diagnose =
+            ops.diagnose || ((current) => diagnoseSlotServices(current, { projectRoot, routing, watchdog, internal }))
+          const started = now()
+          const steps = []
+          const step = async (stepId, fn) => {
+            const t0 = now()
+            let r
+            try {
+              r = await fn()
+            } catch (error) {
+              r = { ok: false, code: error?.code, message: String(error?.message || error) }
+            }
+            const code = r.ok ? null : r.code || `${stepId}_failed`
+            let message = r.message || ''
+            if (!r.ok)
+              message = internal
+                ? redactSecrets(message)
+                : `${STEP_LABELS[stepId]}失败（${code}），详情请联系管理员查看`
+            steps.push({ id: stepId, label: STEP_LABELS[stepId], ok: r.ok === true, code, message, ms: now() - t0 })
+            return r.ok === true
           }
-          const code = r.ok ? null : r.code || `${stepId}_failed`
-          let message = r.message || ''
-          if (!r.ok)
-            message = internal ? redactSecrets(message) : `${STEP_LABELS[stepId]}失败（${code}），详情请联系管理员查看`
-          steps.push({ id: stepId, label: STEP_LABELS[stepId], ok: r.ok === true, code, message, ms: now() - t0 })
-          return r.ok === true
-        }
-        const nodeId = vmNodeId(vm)
-        let proceed = true
-        if (nodeId) {
-          proceed = await step('node_link', async () => {
-            if (!manager) return { ok: false, code: 'cluster_unavailable', message: '集群未初始化' }
-            await manager.ensureLinkReady(nodeId)
-            return { ok: true, message: '节点 SSH 已连接' }
-          })
+          const nodeId = vmNodeId(vm)
+          let proceed = true
+          if (nodeId) {
+            proceed = await step('node_link', async () => {
+              if (!manager) return { ok: false, code: 'cluster_unavailable', message: '集群未初始化' }
+              await manager.ensureLinkReady(nodeId)
+              return { ok: true, message: '节点 SSH 已连接' }
+            })
+            if (proceed) {
+              proceed = await step('relay', async () => {
+                const healed = await manager.healSlotBridges(nodeId, id, { force: true })
+                return {
+                  ok: true,
+                  message: `已重建：${healed.map((h) => (h === 'bridge' ? 'docker 桥' : '槽位中继')).join('、')}`,
+                }
+              })
+            }
+          }
           if (proceed) {
-            proceed = await step('relay', async () => {
-              const healed = await manager.healSlotBridges(nodeId, id, { force: true })
-              return {
-                ok: true,
-                message: `已重建：${healed.map((h) => (h === 'bridge' ? 'docker 桥' : '槽位中继')).join('、')}`,
-              }
+            proceed = await step('stop', async () => {
+              const halted = await stop(vm)
+              if (!halted?.ok) return { ok: false, code: 'stop_failed', message: halted?.error || '关机失败' }
+              return { ok: true, message: STOP_MESSAGES[halted.action] || '已关机' }
             })
           }
-        }
-        if (proceed) {
-          proceed = await step('stop', async () => {
-            const halted = await stop(vm)
-            if (!halted?.ok) return { ok: false, code: 'stop_failed', message: halted?.error || '关机失败' }
-            return { ok: true, message: STOP_MESSAGES[halted.action] || '已关机' }
-          })
-        }
-        if (proceed) {
-          proceed = await step('start', async () =>
-            startStepResult(await powerOn({ projectRoot, id, proxyPool, routing, fillTimezone })),
-          )
-        }
-        if (steps.some((s) => s.id === 'start' && !s.ok)) {
-          patchVmRecord(projectRoot, id, (record) => {
-            if (!record.unschedulable) applyUnschedulable(record, 'runtime_start_failed')
-          })
-        }
-        const settleMs = ops.settleMs ?? BOOT_SETTLE_MS
-        if (proceed && settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs))
-        const current = getVm(projectRoot, id) || vm
-        let diagnosis = await diagnose(current)
-        const errors = (diagnosis.checks ?? []).filter((c) => c.status === 'error')
-        const onlyOldFault = errors.length === 1 && errors[0].id === 'watchdog' && errors[0].code === 'kernel_faulted'
-        // Verify the repaired services first. Only the old L5 marker may remain before reset.
-        if (watchdog?.reset && proceed && (diagnosis.ok || onlyOldFault)) {
-          const reset = await step('watchdog_reset', async () => {
-            const { faulted } = watchdog.reset(id)
-            return { ok: true, message: faulted ? '已清除内核故障标记与重启计数' : '重启计数已清零' }
-          })
-          if (reset) {
-            const checks = (diagnosis.checks ?? []).map((c) =>
-              c.id === 'watchdog' ? watchdogCheck(current, slotEngine(current, routing), watchdog, internal) : c,
+          if (proceed) {
+            proceed = await step('start', async () =>
+              startStepResult(await powerOn({ projectRoot, id, proxyPool, routing, fillTimezone })),
             )
-            const failed = checks.find((c) => c.status === 'error')
-            diagnosis = { ...diagnosis, checks, ok: !failed, first_failure: failed?.id || null }
           }
-        }
-        const ok = steps.every((s) => s.ok) && diagnosis.ok
-        if (ok) {
-          patchVmRecord(projectRoot, id, (record) => {
-            applyClearUnschedulable(record, { by: 'recover_ok' })
-          })
-        }
-        return { ok: true, report: { vm_id: id, ok, duration_ms: now() - started, steps, diagnosis } }
-      },
+          if (steps.some((s) => s.id === 'start' && !s.ok)) {
+            patchVmRecord(projectRoot, id, (record) => {
+              if (!record.unschedulable) applyUnschedulable(record, 'runtime_start_failed')
+            })
+          }
+          const settleMs = ops.settleMs ?? BOOT_SETTLE_MS
+          if (proceed && settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs))
+          const current = getVm(projectRoot, id) || vm
+          let diagnosis = await diagnose(current)
+          const errors = (diagnosis.checks ?? []).filter((c) => c.status === 'error')
+          const onlyOldFault = errors.length === 1 && errors[0].id === 'watchdog' && errors[0].code === 'kernel_faulted'
+          // Verify the repaired services first. Only the old L5 marker may remain before reset.
+          if (watchdog?.reset && proceed && (diagnosis.ok || onlyOldFault)) {
+            const reset = await step('watchdog_reset', async () => {
+              const { faulted } = watchdog.reset(id)
+              return { ok: true, message: faulted ? '已清除内核故障标记与重启计数' : '重启计数已清零' }
+            })
+            if (reset) {
+              const checks = (diagnosis.checks ?? []).map((c) =>
+                c.id === 'watchdog' ? watchdogCheck(current, slotEngine(current, routing), watchdog, internal) : c,
+              )
+              const failed = checks.find((c) => c.status === 'error')
+              diagnosis = { ...diagnosis, checks, ok: !failed, first_failure: failed?.id || null }
+            }
+          }
+          const ok = steps.every((s) => s.ok) && diagnosis.ok
+          if (ok) {
+            patchVmRecord(projectRoot, id, (record) => {
+              applyClearUnschedulable(record, { by: 'recover_ok' })
+            })
+          }
+          return { ok: true, report: { vm_id: id, ok, duration_ms: now() - started, steps, diagnosis } }
+        }),
     })
   } finally {
     recovering.delete(id)

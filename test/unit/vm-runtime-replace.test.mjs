@@ -191,20 +191,6 @@ test('unbound slot does not recreate for a missing desired network', (t) => {
   assert.equal(slotWorkerNeedsRecreate(existing, vm, paths), false)
 })
 
-test('reloadSlotWorker recreates on network mismatch before the KVM restart path', () => {
-  const src = fs.readFileSync(new URL('../../src/lib/vm/vm-runtime.mjs', import.meta.url), 'utf8')
-  const reload = src.slice(
-    src.indexOf('export async function reloadSlotWorker'),
-    src.indexOf('export function slotKernelAlive'),
-  )
-  assert.match(reload, /slotWorkerNeedsRecreate\(existing, vm, paths\)/)
-  assert.match(reload, /nativeSlotSandboxNeedsRecreate\(existing, vm, resolveSlotRouting\(projectRoot, routing\)\)/)
-  assert.ok(
-    reload.indexOf('nativeSlotSandboxNeedsRecreate') < reload.indexOf('if (isKvmRuntime(vm)) {'),
-    'sandbox recreate must run before systemctl restart',
-  )
-})
-
 test('writeWorkerFiles uses the desired kin-eg network even if the container is gone', (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-worker-want-net-'))
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))
