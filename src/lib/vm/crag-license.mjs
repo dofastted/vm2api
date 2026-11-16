@@ -45,7 +45,12 @@ const text = (value) => typeof value === 'string' && value.length > 0 && value.l
 // Cache package authority only. Registration bytes, binding and UTC validity are
 // deliberately verified afresh on every admission, including after cache hits.
 const packageTrustCache = new Map()
-const MAX_TRUST_ROOTS = 8
+// One entry per installed slot package plus the shared download root. The
+// kernel watchdog admits every slot each tick in a fixed order, so a bound below
+// the slot count turns the LRU into a miss on every admission and re-hashes each
+// full package (hundreds of MB, synchronously) every tick. Entries hold only a
+// public key and ids, so keep the bound well above any realistic host.
+const MAX_TRUST_ROOTS = 512
 const redeemingSlots = new Set()
 const DEVICE_ACTIVATION_URL = 'https://crag.fkcodex.com/v1/device-activation'
 

@@ -841,3 +841,26 @@ test('symlinked device files and DrvFS storage are refused; non-admin activation
   assert.equal(denied.status, 403)
   assert.equal(getCragLicense('/mnt/c/not-created', vm, { initialize: true }).license.valid, false)
 })
+
+test('package trust stays cached for every slot when more than eight slots cycle through admission', (t) => {
+  const slots = Array.from({ length: 12 }, () => {
+    const { root, vm } = fixture(t)
+    activateFixture(root, vm)
+    return { root, vm: { ...vm, dataplane: 'crag', crag_kernel_version: 'v2' } }
+  })
+  for (const { root, vm } of slots) assert.equal(checkCragLicense(root, vm).ok, true)
+  const readFileSync = fs.readFileSync
+  let payloadReads = 0
+  fs.readFileSync = function (file, ...rest) {
+    if (String(file).endsWith('crag-v2.payload.enc')) payloadReads += 1
+    return readFileSync.call(this, file, ...rest)
+  }
+  t.after(() => {
+    fs.readFileSync = readFileSync
+  })
+  // The kernel watchdog walks slots in a fixed order; an undersized LRU evicts
+  // exactly the next slot and re-hashes every package on every tick.
+  for (let round = 0; round < 2; round += 1)
+    for (const { root, vm } of slots) assert.equal(checkCragLicense(root, vm).ok, true)
+  assert.equal(payloadReads, 0)
+})
