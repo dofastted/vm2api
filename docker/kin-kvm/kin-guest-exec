@@ -106,9 +106,9 @@ if [ "$detach" -eq 0 ] && [ "$interactive" -eq 1 ]; then
 fi
 
 run_ssh() {
-  # Interactive foreground: no wall-clock timeout (ConnectTimeout still bounds connect).
-  # Detach and non-interactive paths keep a bounded timeout for short guest commands.
-  if [ "$detach" -eq 1 ] || [ "$interactive" -eq 0 ]; then
+  # Foreground commands use the caller's deadline (e.g. official Claude bootstrap).
+  # ConnectTimeout still bounds SSH setup; only detached launch is a short command.
+  if [ "$detach" -eq 1 ]; then
     timeout 8 ssh "$@" root@127.0.0.1 "$remote"
   else
     ssh "$@" root@127.0.0.1 "$remote"
@@ -120,9 +120,12 @@ if run_ssh "$@"; then
   exit 0
 else
   st=$?
-  if [ "$st" -eq 255 ] || [ "$st" -eq 124 ]; then
+  if [ "$st" -eq 255 ]; then
     echo "guest ssh unavailable" >&2
     exit 1
+  fi
+  if [ "$detach" -eq 1 ] && [ "$st" -eq 124 ]; then
+    echo "kin-guest-exec: guest command launch timed out" >&2
   fi
   exit "$st"
 fi

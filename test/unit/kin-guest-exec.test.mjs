@@ -7,7 +7,7 @@ import assert from 'node:assert/strict'
 
 const SOURCE = path.resolve(import.meta.dirname, '../../docker/kin-kvm/kin-guest-exec')
 
-function prepareHarness({ sshExit = 0, timeoutExit = null } = {}) {
+function prepareHarness({ sshExit = 0, timeoutExit = null, sshDelaySeconds = 0 } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-guest-exec-'))
   const bin = path.join(root, 'bin')
   const key = path.join(root, 'id_ed25519')
@@ -42,6 +42,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 printf '%s' "$remote" > ${remoteLog.replace(/'/g, `'\\''`)}
+sleep ${sshDelaySeconds}
+printf 'guest command complete\\n'
 exit ${sshExit}
 `,
     { mode: 0o755 },
@@ -63,6 +65,7 @@ function runHarness(h, args, { env = {} } = {}) {
   }
   return spawnSync(h.execPath, args, {
     encoding: 'utf8',
+    timeout: 15_000,
     env: { ...process.env, PATH: `${h.bin}:${process.env.PATH}`, ...env },
   })
 }
@@ -80,9 +83,27 @@ test('interactive foreground ssh is not wrapped in timeout', () => {
   fs.rmSync(h.root, { recursive: true, force: true })
 })
 
-test('non-interactive path still uses timeout 8', () => {
-  const h = prepareHarness()
+test('non-interactive foreground uses the caller deadline and keeps the SSH connect timeout', () => {
+  const h = prepareHarness({ timeoutExit: 124 })
   const ran = runHarness(h, ['-u', '1000:1000', '--', '/bin/true'])
+  assert.equal(ran.status, 0, ran.stderr)
+  assert.equal(fs.existsSync(h.timeoutLog), false)
+  assert.match(fs.readFileSync(h.sshLog, 'utf8'), /-o ConnectTimeout=3/)
+  fs.rmSync(h.root, { recursive: true, force: true })
+})
+
+test('non-interactive foreground returns output from a command lasting more than eight seconds', (t) => {
+  const h = prepareHarness({ timeoutExit: 124, sshDelaySeconds: 9 })
+  t.after(() => fs.rmSync(h.root, { recursive: true, force: true }))
+  const ran = runHarness(h, ['-u', '1000:1000', '--', '/bin/slow-hello'])
+  assert.equal(ran.status, 0, ran.stderr)
+  assert.equal(ran.stdout, 'guest command complete\n')
+  assert.equal(ran.stderr, '')
+})
+
+test('interactive detach still bounds the launch command', () => {
+  const h = prepareHarness()
+  const ran = runHarness(h, ['-i', '-d', '--', '/bin/true'])
   assert.equal(ran.status, 0, ran.stderr)
   assert.match(fs.readFileSync(h.timeoutLog, 'utf8'), /^timeout 8 ssh /m)
   fs.rmSync(h.root, { recursive: true, force: true })
@@ -119,13 +140,6 @@ test('multiline KIN_PANEL_RC-style env survives quoting', () => {
   fs.rmSync(h.root, { recursive: true, force: true })
 })
 
-test('kin-guest-exec applies wall-clock timeout only for detach and non-interactive', () => {
-  const src = fs.readFileSync(SOURCE, 'utf8')
-  assert.doesNotMatch(src, /if ! timeout 8 ssh "\$@" root@127\.0\.0\.1 "\$remote"/)
-  assert.match(src, /if \[ "\$detach" -eq 1 \] \|\| \[ "\$interactive" -eq 0 \]; then/)
-  assert.match(src, /else\s*\n\s*ssh "\$@" root@127\.0\.0\.1 "\$remote"/)
-})
-
 test('non-zero guest command exit is propagated (not masked as 0)', () => {
   const h = prepareHarness({ sshExit: 37 })
   const ran = runHarness(h, ['-u', '1000:1000', '--', '/bin/false'])
@@ -141,11 +155,20 @@ test('ssh failure 255 maps to exit 1 with guest ssh unavailable', () => {
   fs.rmSync(h.root, { recursive: true, force: true })
 })
 
-test('timeout 124 maps to exit 1 with guest ssh unavailable', () => {
+test('foreground guest exit 124 is preserved without an SSH error', () => {
+  const h = prepareHarness({ sshExit: 124 })
+  const ran = runHarness(h, ['--', '/bin/false'])
+  assert.equal(ran.status, 124, ran.stderr)
+  assert.equal(ran.stderr, '')
+  fs.rmSync(h.root, { recursive: true, force: true })
+})
+
+test('detached launch timeout preserves exit 124 and reports a command timeout', () => {
   const h = prepareHarness({ timeoutExit: 124 })
-  const ran = runHarness(h, ['-u', '1000:1000', '--', '/bin/true'])
-  assert.equal(ran.status, 1, ran.stderr)
-  assert.match(ran.stderr, /guest ssh unavailable/)
+  const ran = runHarness(h, ['-d', '-u', '1000:1000', '--', '/bin/true'])
+  assert.equal(ran.status, 124, ran.stderr)
+  assert.match(ran.stderr, /guest command launch timed out/)
+  assert.doesNotMatch(ran.stderr, /guest ssh unavailable/)
   fs.rmSync(h.root, { recursive: true, force: true })
 })
 
