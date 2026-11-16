@@ -1,7 +1,7 @@
 {
   "repo": "dofastted/vm2api",
-  "release": "payload-2026.11.16-crag-3.1.1",
-  "crag_release": "v3.1.1",
+  "release": "payload-2026.11.16-crag-3.1.2",
+  "crag_release": "v3.1.2",
   "files": [
     {
       "path": "bin/kin-kernel",
@@ -113,15 +113,15 @@
     },
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2",
-      "asset": "crag-v2-amd64-v3.1.1-crag-v2",
-      "size": 876144,
-      "sha256": "c22248c627a1d7c673aa0c2e4d9558dcbfaeecdfa4e84fa7ff10a911e456d9e5"
+      "asset": "crag-v2-amd64-v3.1.2-crag-v2",
+      "size": 894472,
+      "sha256": "1a1668df47a25e3914372e565e10f1a46a6bf67ff32dbb79ac2c6ffa31b4412a"
     },
     {
       "path": "share/crag/kernels/v2/amd64/crag-v2.payload.enc",
-      "asset": "crag-v2-amd64-v3.1.1-crag-v2.payload.enc",
-      "size": 13046220,
-      "sha256": "8284085cf865e4538b4662a82afb385c55d964ee5f42a87b8e43b031b240468f"
+      "asset": "crag-v2-amd64-v3.1.2-crag-v2.payload.enc",
+      "size": 13047300,
+      "sha256": "b6ef2fded7975af714258a5cc4882a403e0bcc73351eb7ca1454cf9f533e2f72"
     },
     {
       "path": "share/crag/kernels/v2/amd64/kernel.json.example",
@@ -131,21 +131,21 @@
     },
     {
       "path": "share/crag/kernels/v2/amd64/manifest.json",
-      "asset": "crag-v2-amd64-v3.1.1-manifest.json",
+      "asset": "crag-v2-amd64-v3.1.2-manifest.json",
       "size": 2720,
-      "sha256": "3c6ee46a9eea024273f2377bd8fa544230899c690c2bc46ff7dd205bcf12fa1d"
+      "sha256": "e5c65d050b322f907518943ad6340330a51e0b7f2aa97c459fab49a10c120067"
     },
     {
       "path": "share/crag/kernels/v2/amd64/unpack-note.md",
       "asset": "crag-v2-amd64-unpack-note.md",
-      "size": 15874,
-      "sha256": "1f5cce1c9491f03ceeeffcafa80db4bcbff8f5042fa86ef344c97bcf3b62062d"
+      "size": 15748,
+      "sha256": "ee7ca2fce548bc4b35ad4236c9a36d76d38e55315cb5175faec454952582e731"
     },
     {
       "path": "dist/crag-v2-licensed-amd64.tar.gz",
       "asset": "crag-v2-licensed-amd64.tar.gz",
-      "size": 170863146,
-      "sha256": "9ed1a4fe2931d44c946aef5288dfc3665f877451b73f0fc55338dc93f135f720"
+      "size": 170881721,
+      "sha256": "74e9ba52f18a52126fe61a3d95a89fe854972387459aed1def83bf3714cba8c3"
     }
   ]
 }
