@@ -444,7 +444,9 @@ describe('CRAG buyer presentation and activation wire', () => {
     const html = render()
     expect(html).toContain('当前没有可绑定的 CRAG 槽位')
     expect(html).toContain('宿主机兑换码')
-    expect(html).toContain('兑换后以新套餐额度为准；不绑定、不启动 VM。')
+    expect(html).toContain(
+      '每张码从兑换时独立计时，未到期额度相加；不绑定、不启动 VM。'
+    )
     expect(state.hostInput?.type).toBe('password')
     fillHostCode('   ')
     expect(

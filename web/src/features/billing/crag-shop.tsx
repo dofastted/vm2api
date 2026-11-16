@@ -339,7 +339,7 @@ function HostOverview({ host }: { host: UseQueryResult<CragHostStatus> }) {
             id='crag-host-redeem-help'
             className='text-sm text-muted-foreground'
           >
-            兑换后以新套餐额度为准；不绑定、不启动 VM。
+            每张码从兑换时独立计时，未到期额度相加；不绑定、不启动 VM。
           </p>
           <Button type='submit' size='sm' disabled={!code.trim() || !!action}>
             {action === 'redeem' ? '正在兑换…' : '兑换到本机'}
@@ -1389,7 +1389,7 @@ function ShopOrders({
                             isAdmin ? (
                               <div className='space-y-2'>
                                 <p>
-                                  此续费仅适用于下单时的宿主机。付款后需将续费应用到该宿主机；原有槽位绑定不变。
+                                  此续费仅适用于下单时的宿主机。应用后新增独立计时的额度，原有槽位绑定不变。
                                 </p>
                                 <Button
                                   size='sm'

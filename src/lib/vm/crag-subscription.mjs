@@ -261,6 +261,8 @@ export function createCragSubscription({
   const rosterIntentFile = path.join(privateDir, 'roster.json')
   const marker = path.join(publicDir, 'sync-pending')
   let busy = false
+  let expiryProbe
+  let lastExpiryProbe
 
   function identity() {
     if (process.platform !== 'linux') throw fail()
@@ -399,6 +401,36 @@ export function createCragSubscription({
     )
   }
 
+  async function refreshExpired(hostId, previous, background = false) {
+    if (!previous || previous.claims.expires_at * 1000 > Date.now()) return previous
+    const remote = await authority('status', hostId, credential(hostId))
+    const confirmed = verifyRights(hostId, remote, previous)
+    if (background && (busy || !unchangedRights({ hostId, pending: false, previous }, readLocalRights()))) return
+    if (confirmed.code === previous.code) return confirmed
+    if (current(hostId)?.code !== previous.code) throw invalidRights()
+    checkNoIntent()
+    publish(entitlementFile, confirmed.code, 0o644)
+    return confirmed
+  }
+
+  async function refreshExpiredEntitlement() {
+    if (expiryProbe) return expiryProbe
+    if (busy || !fs.existsSync(entitlementFile)) return
+    const { hostId, claims, pending, previous } = readLocalRights()
+    const now = Date.now()
+    if (pending || !claims || claims.expires_at * 1000 > now) return
+    if (lastExpiryProbe?.code === previous.code && now < lastExpiryProbe.retryAfter) return
+    lastExpiryProbe = { code: previous.code, retryAfter: now + 30_000 }
+    expiryProbe = refreshExpired(hostId, previous, true)
+    try {
+      const confirmed = await expiryProbe
+      if (!confirmed) lastExpiryProbe = undefined
+      return confirmed
+    } finally {
+      expiryProbe = undefined
+    }
+  }
+
   async function runtimeStatus(rights) {
     if (!runtimeInventory) return {}
     let result = {}
@@ -498,11 +530,20 @@ export function createCragSubscription({
       const local = readLocalRights()
       const { hostId, claims, pending, previous } = local
       if (load(hostFile, 0o644, 64)) credential(hostId)
+      const needsRefresh = claims && claims.expires_at * 1000 <= Date.now()
+      if (needsRefresh && !pending && !confirmed && mayRetry) {
+        try {
+          confirmed = await refreshExpiredEntitlement()
+        } catch {
+          // An expired signed window stays expired if the Authority is unreachable.
+        }
+        if (!unchangedRights(local, readLocalRights())) return status(confirmed, false)
+      }
       let rights = claims ? { reclaim_supported: claims.version === 2 } : {}
       if (claims && !pending) {
         if (confirmed?.code === previous.code) {
           rights = confirmed.rights
-        } else {
+        } else if (!needsRefresh) {
           try {
             const remote = await authority('status', hostId, credential(hostId))
             if (remote.entitlement === previous.code) rights = projection(remote, claims)
@@ -866,6 +907,7 @@ export function createCragSubscription({
         await syncRoster(hostId, pending, current(hostId, vm), vm)
       }
       checkNoIntent()
+      await refreshExpired(hostId, current(hostId))
       const { vm, machineCode, payloadKeyId } = await checkTarget()
       return bindTarget(vm, hostId, current(hostId, vm), machineCode, payloadKeyId, { checkTarget })
     })
@@ -1006,6 +1048,7 @@ export function createCragSubscription({
         await finish(hostId, intent, previous)
       })
     },
+    refreshExpiredEntitlement,
     bind(vm) {
       return exclusive(async () => {
         if ((await assertReady(vm, { allowPrepared: true })) === false)
@@ -1013,6 +1056,7 @@ export function createCragSubscription({
         const hostId = identity()
         storage()
         checkNoIntent()
+        await refreshExpired(hostId, current(hostId))
         const previous = current(hostId, vm)
         assertActive(previous)
         const { seat } = await bindTarget(
@@ -1031,7 +1075,7 @@ export function createCragSubscription({
         const hostId = identity()
         storage()
         checkNoIntent()
-        const previous = current(hostId)
+        const previous = await refreshExpired(hostId, current(hostId))
         assertActive(previous)
         const { license } = getCragLicense(projectRoot, vm)
         const candidate = getCragLicense(projectRoot, vm, { preferInstalled: false }).license

@@ -169,7 +169,7 @@ test('Docker and KVM bind against the same redeemed pool without a version-speci
   assert.deepEqual(projected, [targets[1].id])
 })
 
-test('an admin can redeem without VMs and a second voucher replaces the signed capacity', async (t) => {
+test('an admin can redeem without VMs and use the cumulative capacity signed by Authority', async (t) => {
   const first = voucher()
   const second = voucher()
   const device = voucher()
@@ -182,7 +182,7 @@ test('an admin can redeem without VMs and a second voucher replaces the signed c
     }
     const { code, claims } = issueHostEntitlement(root, request.host_id, {
       revision: request.redemption_code === first ? 1 : 2,
-      slot_limit: request.redemption_code === first ? 2 : 3,
+      slot_limit: request.redemption_code === first ? 5 : 15,
     })
     return Response.json({ ok: true, data: { entitlement: code, ...claims, used_slots: 0 } })
   })
@@ -191,16 +191,17 @@ test('an admin can redeem without VMs and a second voucher replaces the signed c
   const initial = await post('redeem', { redemption_code: ` ${first}\n` })
   assert.equal(initial.status, 200)
   assert.equal(initial.data.state, 'active')
-  assert.equal(initial.data.slot_limit, 2)
+  assert.equal(initial.data.slot_limit, 5)
   assert.equal(initial.data.ready, false)
   assert.equal(initial.data.total_slots, 0)
   assert.equal(initial.data.enabled_slots, 0)
   assert.equal(initial.data.used_slots, 0)
 
-  const replacement = await post('redeem', { redemption_code: second })
-  assert.equal(replacement.status, 200)
-  assert.equal(replacement.data.slot_limit, 3)
-  assert.equal(replacement.data.revision, 2)
+  const stacked = await post('redeem', { redemption_code: second })
+  assert.equal(stacked.status, 200)
+  assert.equal(stacked.data.slot_limit, 15)
+  assert.equal(stacked.data.available_seats, 15)
+  assert.equal(stacked.data.revision, 2)
   const saved = fs.readFileSync(path.join(publicDir, 'entitlement.code'), 'utf8')
   const rejected = await post('redeem', { redemption_code: device })
   assert.equal(rejected.status, 404)
@@ -215,6 +216,51 @@ test('an admin can redeem without VMs and a second voucher replaces the signed c
     [first, second, device].map((redemption_code) => ['/v1/host-subscriptions/redeem', { host_id, redemption_code }]),
   )
   assert.equal(fs.existsSync(path.join(root, 'vms')), false)
+})
+
+test('an expired aggregate refreshes once and only a newer signed quota can restore availability', async (t) => {
+  for (const result of ['remaining', 'offline', 'older', 'same revision']) {
+    await t.test(result, async (subtest) => {
+      let issued
+      let next
+      let statusCalls = 0
+      const { root, publicDir, connect } = standaloneHost(subtest, async (url, { body }) => {
+        const { host_id } = JSON.parse(body)
+        if (url.endsWith('/redeem')) {
+          const now = Math.floor(Date.now() / 1000)
+          issued = issueHostEntitlement(root, host_id, {
+            revision: 2,
+            slot_limit: 15,
+            issued_at: now - 300,
+            expires_at: now - 120,
+          })
+        } else {
+          statusCalls++
+          await new Promise((resolve) => setImmediate(resolve))
+          if (result === 'offline') return new Response(null, { status: 503 })
+          next = issueHostEntitlement(root, host_id, {
+            revision: result === 'older' ? 1 : result === 'same revision' ? 2 : 3,
+            slot_limit: 10,
+          })
+        }
+        const { code, claims } = next ?? issued
+        return Response.json({ ok: true, data: { entitlement: code, ...claims, used_slots: 6 } })
+      })
+      seedEncryptedPackage(root)
+      const service = connect()
+      assert.equal((await service.redeem(voucher())).available_seats, 0)
+      const [background, panel] = await Promise.allSettled([service.refreshExpiredEntitlement(), service.status()])
+      assert.equal(background.status, result === 'remaining' ? 'fulfilled' : 'rejected')
+      assert.equal(panel.status, 'fulfilled')
+      const status = panel.value
+      const file = path.join(publicDir, 'entitlement.code')
+      const updated = result === 'remaining'
+      assert.equal(statusCalls, 1)
+      assert.equal(status.state, updated ? 'active' : 'expired')
+      assert.equal(status.available_seats, updated ? 4 : 0)
+      assert.equal(fs.readFileSync(file, 'utf8'), updated ? next.code : issued.code)
+    })
+  }
 })
 
 test('standalone redeem with a missing or corrupt host package does not start a transaction', async (t) => {

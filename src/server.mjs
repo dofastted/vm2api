@@ -1464,6 +1464,13 @@ server.listen(cfg.port, cfg.host, () => {
     void cragSubscription.recover().catch(() => {
       console.warn('[crag-subscription] startup recovery failed; use the administrator panel to retry')
     })
+    const refresh = () =>
+      void cragSubscription.refreshExpiredEntitlement().catch(() => {
+        console.warn('[crag-subscription] expired quota refresh deferred')
+      })
+    const timer = setInterval(refresh, 1_000).unref()
+    server.once('close', () => clearInterval(timer))
+    refresh()
   }
   if (cragShopActivationEnabled) {
     const poll = () =>
