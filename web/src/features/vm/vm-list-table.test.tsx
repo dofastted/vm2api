@@ -11,7 +11,10 @@ vi.mock('./vm-action-menu', () => ({ VmActionMenu: () => null }))
 vi.mock('./vm-owner-line', () => ({ VmRentedMark: () => null }))
 vi.mock('./vm-perms', () => ({ useVmPerms: () => ({ admin: false }) }))
 vi.mock('./use-vm-column-order', () => ({
-  useVmColumnOrder: () => ({ order: ['vm', 'type'], isDefault: true }),
+  useVmColumnOrder: () => ({
+    order: ['vm', 'sched', 'status'],
+    isDefault: true,
+  }),
 }))
 vi.mock('@/components/ui/dialog', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/components/ui/dialog')>()),
@@ -20,7 +23,9 @@ vi.mock('@/components/ui/dialog', async (importOriginal) => ({
 
 function render(over: Partial<Vm> = {}) {
   return renderToStaticMarkup(
-    <VmTable vms={[{ id: 'vm-01', email: 'account@example.com', ...over }]} />
+    <QueryClientProvider client={new QueryClient()}>
+      <VmTable vms={[{ id: 'vm-01', email: 'account@example.com', ...over }]} />
+    </QueryClientProvider>
   )
 }
 
@@ -36,11 +41,10 @@ describe('VM scheduling priority', () => {
         weight: 42,
       }
       const list = render(vm)
-      expect(list).toContain('>调度优先级</')
-      expect(list).toContain(
-        '>调度优先级 <span class="font-semibold tabular-nums text-blue-800 dark:text-blue-200">8</span>'
+      expect(list).toContain('>调度 · 优先级</span>')
+      expect(list).toMatch(
+        /text-blue-800[^"]*shadow-\[inset_0_0_0_1px_currentColor\][^"]*"[^>]*>P8</
       )
-      expect(list).not.toMatch(/background-color:[^";]+[^>]*>调度优先级/)
       expect(list).not.toMatch(/等级|权重/)
 
       const detail = renderToStaticMarkup(<VmSchedulingBlock vm={vm} />)
@@ -58,9 +62,28 @@ describe('VM scheduling priority', () => {
   )
 
   it('does not substitute legacy weight when priority is missing', () => {
-    expect(render({ weight: 4 })).toContain(
-      '>调度优先级 <span class="font-semibold tabular-nums text-muted-foreground">—</span>'
+    expect(render({ weight: 4 })).toMatch(/>P—</)
+  })
+})
+
+describe('VM row interaction and health', () => {
+  it('opens detail from a left button and exposes a separate expand control', () => {
+    const html = render()
+    expect(html).toContain('aria-label="打开 vm-01 详情页"')
+    expect(html).toContain('aria-expanded="false"')
+    expect(html).toContain('aria-controls="vm-row-detail-vm-01"')
+    expect(html).not.toContain('role="button"')
+  })
+
+  it('shows request success rate and never infers health without requests', () => {
+    const buckets = Array.from({ length: 48 }, (_, i): [number, number] =>
+      i === 47 ? [99, 1] : [0, 0]
     )
+    const html = render({ health_24h: buckets })
+    expect(html).toContain('>99.0%</span>')
+    expect(html).toContain('99/100 成功')
+    expect(render({ health_24h: null })).toContain('24h 无请求')
+    expect(render({ health_24h: null })).not.toContain('主机内存紧张')
   })
 })
 

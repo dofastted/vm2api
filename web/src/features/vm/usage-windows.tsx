@@ -14,6 +14,7 @@ import { ClaudeResetActions } from '@/features/vm/claude-reset-actions'
 import { OpenaiQuotaActions } from '@/features/vm/openai-quota-actions'
 import { riskFg, UsageMeter } from '@/features/vm/usage-meter'
 import { vmWindows, type WindowReadout } from '@/features/vm/vm-rack-model'
+import { windowTiming, type WindowTiming } from '@/features/vm/window-timing'
 
 /**
  * 请求 / 用量窗口 / 成本三块共用的行高。列表里三列并排时，
@@ -227,6 +228,116 @@ export function VmUsagePanel({
         </h3>
         <VmCostLedger vm={vm} accounts={accounts} />
       </div>
+    </div>
+  )
+}
+
+function TimeTick({ pct }: { pct: number | null }) {
+  if (pct == null) return null
+  return (
+    <span
+      aria-hidden
+      className='pointer-events-none absolute -top-0.5 -bottom-0.5 w-0.5 rounded-full bg-foreground/55'
+      style={{ left: `calc(${pct}% - 1px)` }}
+    />
+  )
+}
+
+/** 带时间进度竖线的用量条；竖线在填充左边 = 用得比时间快。 */
+export function WindowBar({
+  w,
+  timing,
+  size = 'sm',
+}: {
+  w: WindowReadout
+  timing: WindowTiming
+  size?: 'sm' | 'md'
+}) {
+  return (
+    <div className='relative'>
+      {w.pct == null ? (
+        <div
+          className={cn(
+            'w-full rounded-full track-recessed',
+            size === 'sm' ? 'h-[5px]' : 'h-2'
+          )}
+          aria-hidden
+        />
+      ) : (
+        <UsageMeter value={w.pct} size={size} ticks={false} />
+      )}
+      <TimeTick pct={timing.elapsedPct} />
+    </div>
+  )
+}
+
+/** 列表行内：5H / 7D / Fable 横排，每格 百分比 + 条 + 倒计时。 */
+export function VmUsageWindowsInline({ vm, now }: { vm: Vm; now: number }) {
+  const hasToken = Boolean(vm.has_token)
+  return (
+    <div className='grid min-w-0 grid-cols-3 gap-2.5'>
+      {vmWindows(vm).map((w) => {
+        const timing = windowTiming(w, now)
+        const left = hasToken ? resetCountdown(w.reset, now) : null
+        const full = w.pct != null && w.pct >= 100
+        return (
+          <div
+            key={w.key}
+            className='min-w-0'
+            title={
+              hasToken && expiresAtToMs(w.reset)
+                ? `重置于 ${fmtResetClock(w.reset)}`
+                : undefined
+            }
+          >
+            <div className='flex items-baseline justify-between gap-1 text-[11px]'>
+              <span className='font-medium text-muted-foreground'>
+                {w.label}
+              </span>
+              {w.note ? null : (
+                <span
+                  className={cn(
+                    'font-mono font-semibold tabular-nums',
+                    w.pct == null ? MUTED_NUM : w.pct >= 70 && riskFg(w.pct)
+                  )}
+                >
+                  {w.pct == null ? '—' : `${w.pct.toFixed(0)}%`}
+                </span>
+              )}
+            </div>
+            {w.note ? (
+              <div
+                className='mt-0.5 truncate text-[11px] font-medium text-[color:var(--status-warn)]'
+                title={w.note}
+              >
+                {w.note}
+              </div>
+            ) : (
+              <>
+                <div className='mt-1'>
+                  <WindowBar w={w} timing={timing} />
+                </div>
+                <div
+                  className={cn(
+                    'mt-0.5 truncate font-mono text-[10.5px] tabular-nums',
+                    full
+                      ? 'text-[color:var(--status-bad)]'
+                      : 'text-muted-foreground'
+                  )}
+                >
+                  {w.pct == null
+                    ? '未探测'
+                    : left
+                      ? full
+                        ? `${left}后恢复`
+                        : left
+                      : '未开窗'}
+                </div>
+              </>
+            )}
+          </div>
+        )
+      })}
     </div>
   )
 }

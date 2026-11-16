@@ -1,26 +1,38 @@
-import { useState, type KeyboardEvent, type ReactNode } from 'react'
+import {
+  useState,
+  type KeyboardEvent,
+  type MouseEvent,
+  type ReactNode,
+} from 'react'
 import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
 import type { StatusTone } from '@/types/status'
-import { GripVertical, RotateCcw } from 'lucide-react'
 import {
-  expiresAtToMs,
-  fmtResetClock,
-  resetCountdown,
-} from '@/lib/fable-status'
-import { fmtNum } from '@/lib/format'
+  ChevronDown,
+  ExternalLink,
+  GripVertical,
+  RotateCcw,
+} from 'lucide-react'
+import { fmtNum, fmtUsd } from '@/lib/format'
 import { tierVisual } from '@/lib/tier-visual'
 import { cn } from '@/lib/utils'
 import {
-  credentialStatus,
+  fmtHealthPct,
+  HEALTH_FG,
+  healthSummary,
+  SLOT_BG,
+} from '@/lib/vm-health'
+import {
   fleetGroup,
   poolStatus,
+  scheduleStateLabel,
   seatTitle,
   vmCircuitTitle,
   vmCooldown,
   vmCooldownTitle,
+  type ScheduleStateLabel,
 } from '@/lib/vm-status'
-import { vmTodayStats, vmWeekOutcome, type VmWeekOutcome } from '@/lib/vm-usage'
+import { vmCostLedger, vmWeekOutcome } from '@/lib/vm-usage'
 import { useNow } from '@/hooks/use-now'
 import { Button } from '@/components/ui/button'
 import {
@@ -39,11 +51,7 @@ import {
   useStatusBarShow,
   type StatusBarShow,
 } from '@/features/vm/status-bar-options'
-import {
-  METRIC_ROW,
-  VmCostLedger,
-  VmUsageWindows,
-} from '@/features/vm/usage-windows'
+import { VmUsageWindowsInline } from '@/features/vm/usage-windows'
 import {
   useVmColumnOrder,
   type VmColumnKey,
@@ -51,58 +59,22 @@ import {
 import { VmAccountIdentity } from '@/features/vm/vm-account-identity'
 import { VmActionMenu } from '@/features/vm/vm-action-menu'
 import { useVmActions } from '@/features/vm/vm-actions-context'
-import {
-  resetRemainVisual,
-  schedulingPriorityTextClass,
-} from '@/features/vm/vm-type-visual'
+import { VmRowDetail } from '@/features/vm/vm-row-detail'
+import { schedulingPriorityTextClass } from '@/features/vm/vm-type-visual'
+
+/** 行内点到这些元素时不切换展开。 */
+const ROW_INTERACTIVE =
+  'button, a, input, select, textarea, label, [role="switch"], [role="menuitem"], [data-row-stop]'
 
 /** 列的宽度与弹性；顺序由 `useVmColumnOrder` 决定，不写死在这里。 */
-const COL_CLS: Record<VmColumnKey | 'actions', string> = {
-  vm: 'min-w-[170px] flex-[1.15]',
-  sched: 'min-w-[62px] flex-[0.3]',
-  type: 'min-w-[156px] flex-[0.85]',
-  status: 'min-w-[140px] flex-[1.1]',
-  req: 'min-w-[124px] flex-[0.7]',
-  usage: 'min-w-[208px] flex-[1.3]',
-  cost: 'min-w-[212px] flex-[1.1]',
-  actions: 'w-[44px] shrink-0 pr-2',
-}
-
-type DotTone = 'ok' | 'caution' | 'warn' | 'bad' | 'none'
-
-const DOT_BG: Record<DotTone, string> = {
-  ok: 'var(--status-ok-solid)',
-  caution: 'var(--status-caution-solid)',
-  warn: 'var(--status-warn-solid)',
-  bad: 'var(--status-bad-solid)',
-  none: 'transparent',
-}
-
-const DOT_FG: Record<DotTone, string> = {
-  ok: 'text-[color:var(--status-ok)]',
-  caution: 'text-[color:var(--status-caution)]',
-  warn: 'text-[color:var(--status-warn)]',
-  bad: 'text-[color:var(--status-bad)]',
-  none: 'text-muted-foreground',
-}
-
-function credDot(cls: string): DotTone {
-  if (cls === 'ok') return 'ok'
-  if (cls === 'caution') return 'caution'
-  if (cls === 'warn') return 'warn'
-  if (cls === 'bad') return 'bad'
-  return 'none'
-}
-
-/** 状态条只回答这张票现在能不能用，不把请求成败画成可用性。 */
-function healthModel(vm: Vm): { dots: DotTone[]; text: string; tone: DotTone } {
-  const cred = credentialStatus(vm)
-  const tone = credDot(cred.cls)
-  return {
-    dots: Array.from({ length: 16 }, () => tone),
-    text: cred.text || (tone === 'none' ? '无凭证' : '可用'),
-    tone,
-  }
+const COL_CLS: Record<VmColumnKey | 'actions' | 'open', string> = {
+  open: 'w-[36px] shrink-0 pl-1',
+  vm: 'min-w-[170px] flex-[1.1]',
+  sched: 'min-w-[150px] flex-[0.8]',
+  status: 'min-w-[190px] flex-[1.05]',
+  usage: 'min-w-[250px] flex-[1.4]',
+  cost: 'min-w-[170px] flex-[0.9]',
+  actions: 'w-[64px] shrink-0 pr-2',
 }
 
 function StatusReason({ vm, tone }: { vm: Vm; tone: StatusTone }) {
@@ -124,81 +96,57 @@ function StatusReason({ vm, tone }: { vm: Vm; tone: StatusTone }) {
   )
 }
 
-function ResetMeter({ resetAt, now }: { resetAt: unknown; now: number }) {
-  const resetMs = expiresAtToMs(resetAt)
-  const clock = fmtResetClock(resetAt)
-  if (!clock || !resetMs) return null
-  const visual = resetRemainVisual(resetMs, now)
-  const left = resetCountdown(resetAt, now)
-  return (
-    <div className='min-w-0 space-y-1' title='周窗口重置'>
-      <div
-        className='h-1.5 overflow-hidden rounded-full track-recessed'
-        aria-hidden
-      >
-        <div
-          className='h-full rounded-full transition-[width,background-color] duration-200 motion-reduce:transition-none'
-          style={{
-            width: `${visual.overdue ? 100 : visual.pct}%`,
-            backgroundColor: visual.color,
-          }}
-        />
-      </div>
-      <div
-        className={cn(
-          'truncate font-mono text-[11px] tabular-nums',
-          visual.textClass
-        )}
-      >
-        重置 {clock.slice(0, 11)}
-        {left ? ` · ${left}` : ''}
-      </div>
-    </div>
-  )
+const SCHED_TEXT: Record<ScheduleStateLabel, string> = {
+  开: 'text-[color:var(--status-ok)]',
+  受限: 'text-[color:var(--status-warn)]',
+  关: 'text-muted-foreground',
+  不可调度: 'text-[color:var(--status-bad)]',
 }
 
-function SchedulingPriorityCell({ vm, now }: { vm: Vm; now: number }) {
+/** 调度 + 优先级：开关、状态字、P 值（手动带框），第二行写受限 / 不可调度原因。 */
+function SchedCell({ vm }: { vm: Vm }) {
   const level = Number(vm.schedule_level)
   const levelOk = Number.isInteger(level) && level >= 1 && level <= 10
+  const manual = vm.schedule_level_mode === 'manual'
+  const label = scheduleStateLabel(vm)
+  const tone = poolStatus(vm)
+  const reason =
+    label === '受限' || label === '不可调度'
+      ? vm.restriction_text || vm.unschedulable_text || tone.text
+      : null
   return (
-    <div className='min-w-0 space-y-1'>
-      <span
-        className='text-xs whitespace-nowrap text-muted-foreground'
-        title={
-          levelOk
-            ? `${vm.schedule_level_mode === 'manual' ? '手动' : '自动'}调度优先级，数值越大越优先`
-            : '没有调度优先级'
-        }
-      >
-        调度优先级{' '}
+    <div className='min-w-0'>
+      <div className='flex items-center gap-2'>
+        <SchedulableSwitch {...vmSchedulableProps(vm)} />
+        <span className={cn('text-xs font-semibold', SCHED_TEXT[label])}>
+          {label}
+        </span>
         <span
           className={cn(
-            'font-semibold tabular-nums',
-            schedulingPriorityTextClass(level)
+            'ml-auto rounded-md bg-muted px-1.5 py-px text-[11px] font-bold tabular-nums',
+            levelOk
+              ? schedulingPriorityTextClass(level)
+              : 'text-muted-foreground',
+            levelOk && manual && 'shadow-[inset_0_0_0_1px_currentColor]'
           )}
+          title={
+            levelOk
+              ? `${manual ? '手动' : '自动'}调度优先级，数值越大越优先`
+              : '没有调度优先级'
+          }
         >
-          {levelOk ? level : '—'}
+          P{levelOk ? level : '—'}
         </span>
-      </span>
-      {vm.has_token ? (
-        <ResetMeter resetAt={vm.reset_7d || vm.reset_7d_oi} now={now} />
+      </div>
+      {reason ? (
+        <div
+          className='mt-1 truncate text-[11px] text-muted-foreground'
+          title={reason}
+        >
+          {reason}
+        </div>
       ) : null}
     </div>
-  )
-}
-
-function CountPill({ tone, n }: { tone: 'ok' | 'bad'; n: number }) {
-  return (
-    <span
-      className={cn(
-        'inline-flex min-w-7 items-center justify-center rounded-full px-1.5 py-0.5 text-xs font-semibold tabular-nums',
-        tone === 'ok'
-          ? 'bg-[color:var(--status-ok-bg)] text-[color:var(--status-ok)]'
-          : 'bg-[color:var(--status-bad-bg)] text-[color:var(--status-bad)]'
-      )}
-    >
-      {fmtNum(n)}
-    </span>
   )
 }
 
@@ -225,7 +173,7 @@ function SeatTag({ vm }: { vm: Vm }) {
 function StatusCell({ vm, show }: { vm: Vm; show: StatusBarShow }) {
   const tone = poolStatus(vm)
   const inflight = Number(vm.inflight) || 0
-  const health = healthModel(vm)
+  const health = healthSummary(vm.health_24h)
   const showInflight =
     inflight > 0 &&
     tone.cls !== 'bad' &&
@@ -248,27 +196,32 @@ function StatusCell({ vm, show }: { vm: Vm; show: StatusBarShow }) {
         </div>
       ) : null}
       {show.bar ? (
-        <div className='flex items-center gap-1.5' title={health.text}>
-          <div
-            className='flex h-1.5 min-w-0 flex-1 gap-px overflow-hidden rounded-full track-recessed'
-            aria-hidden
-          >
-            {health.dots.map((dot, i) => (
-              <span
-                key={i}
-                className='h-full flex-1'
-                style={{ backgroundColor: DOT_BG[dot] }}
-              />
-            ))}
+        <div className='min-w-0'>
+          <div className='flex items-center gap-2'>
+            <div className='flex h-3 w-[104px] shrink-0 gap-px' aria-hidden>
+              {health.slots.map((slot, i) => (
+                <span
+                  key={i}
+                  className='h-full flex-1 rounded-[1px]'
+                  style={{ backgroundColor: SLOT_BG[slot] }}
+                />
+              ))}
+            </div>
+            <span
+              className={cn(
+                'font-mono text-xs font-bold tabular-nums',
+                HEALTH_FG[health.tone]
+              )}
+              title='近 24h 成功请求 ÷ 总请求'
+            >
+              {fmtHealthPct(health.pct)}
+            </span>
           </div>
-          <span
-            className={cn(
-              'max-w-[6rem] shrink-0 truncate text-xs font-medium',
-              DOT_FG[health.tone]
-            )}
-          >
-            {health.text}
-          </span>
+          <div className='mt-0.5 font-mono text-[11px] text-muted-foreground tabular-nums'>
+            {health.req
+              ? `${fmtNum(health.ok)}/${fmtNum(health.req)} 成功`
+              : '24h 无请求'}
+          </div>
         </div>
       ) : null}
       {show.proxy ? <ProxyChip vm={vm} compact /> : null}
@@ -276,69 +229,31 @@ function StatusCell({ vm, show }: { vm: Vm; show: StatusBarShow }) {
   )
 }
 
-/** 只放次数：今日请求与 7D 成功 / 失败。行高与用量窗口、成本账逐行对齐。 */
-function RequestCell({
-  vm,
-  accounts,
-  week,
-}: {
-  vm: Vm
-  accounts?: UsageAccountRow[]
-  week: VmWeekOutcome
-}) {
-  const s = vmTodayStats(vm, accounts)
+/** 行内成本：7D 花费、token、每请求成本与总计；拆分在展开区。 */
+function CostCell({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
+  const [, d7, total] = vmCostLedger(vm, accounts)
+  const week = vmWeekOutcome(vm, accounts)
+  const perReq = week.req > 0 && d7.cost ? d7.cost / week.req : null
   return (
-    <div className='grid min-w-0 gap-1'>
-      <div
-        className={cn(
-          'flex items-center gap-1.5 font-mono text-xs tabular-nums',
-          METRIC_ROW
-        )}
-      >
-        <span className='w-7 shrink-0 font-sans text-xs font-medium text-muted-foreground'>
-          今日
+    <div className='min-w-0'>
+      <div className='flex items-baseline gap-2'>
+        <b
+          className={cn(
+            'font-mono text-[13px] tabular-nums',
+            !d7.cost && 'text-[color:var(--text-tertiary)]'
+          )}
+        >
+          {d7.cost ? fmtUsd(d7.cost, 2) : '—'}
+        </b>
+        <span className='truncate font-mono text-[11px] text-muted-foreground tabular-nums'>
+          {d7.tokens ? `${fmtNum(d7.tokens)} tok` : ''}
         </span>
-        {s.req > 0 ? (
-          <span className='font-medium'>
-            {fmtNum(s.req)}
-            <span className='font-normal text-muted-foreground'> req</span>
-          </span>
-        ) : (
-          <span className='text-[color:var(--text-tertiary)]'>—</span>
-        )}
       </div>
-      <div
-        className={cn('flex items-center gap-1.5', METRIC_ROW)}
-        title='7D 窗口：成功 / 失败'
-      >
-        <span className='w-7 shrink-0 text-xs font-medium text-muted-foreground'>
-          7D
-        </span>
-        <WeekPills week={week} />
+      <div className='mt-0.5 truncate font-mono text-[11px] text-muted-foreground tabular-nums'>
+        {perReq == null ? '—' : `$${perReq.toFixed(3)}/req`} · 总计{' '}
+        {total.cost ? fmtUsd(total.cost, 0) : '—'}
       </div>
     </div>
-  )
-}
-
-function WeekPills({ week }: { week: VmWeekOutcome }) {
-  if (!week.known) {
-    return week.req <= 0 ? (
-      <>
-        <CountPill tone='ok' n={0} />
-        <CountPill tone='bad' n={0} />
-      </>
-    ) : (
-      <>
-        <CountPill tone='ok' n={week.req} />
-        <span className='text-xs text-muted-foreground'>失败 —</span>
-      </>
-    )
-  }
-  return (
-    <>
-      <CountPill tone='ok' n={week.success} />
-      <CountPill tone='bad' n={week.fail} />
-    </>
   )
 }
 
@@ -354,7 +269,6 @@ type CellCtx = {
   vm: Vm
   accounts?: UsageAccountRow[]
   now: number
-  week: VmWeekOutcome
   statusShow: StatusBarShow
 }
 
@@ -364,36 +278,20 @@ const COLUMNS: Record<
 > = {
   vm: { label: '账号', cell: ({ vm }) => <SlotCell vm={vm} /> },
   sched: {
-    label: '调度',
-    cell: ({ vm }) => (
-      <div onClick={(e) => e.stopPropagation()}>
-        <SchedulableSwitch {...vmSchedulableProps(vm)} />
-      </div>
-    ),
-  },
-  type: {
-    label: '调度优先级',
-    cell: ({ vm, now }) => <SchedulingPriorityCell vm={vm} now={now} />,
+    label: '调度 · 优先级',
+    cell: ({ vm }) => <SchedCell vm={vm} />,
   },
   status: {
-    label: '状态',
+    label: '健康 · 24h 请求',
     cell: ({ vm, statusShow }) => <StatusCell vm={vm} show={statusShow} />,
-  },
-  req: {
-    label: '今日 / 7D 请求',
-    cell: ({ vm, accounts, week }) => (
-      <RequestCell vm={vm} accounts={accounts} week={week} />
-    ),
   },
   usage: {
     label: '用量窗口',
-    cell: ({ vm, now }) => (
-      <VmUsageWindows vm={vm} now={now} quiet quotaActions />
-    ),
+    cell: ({ vm, now }) => <VmUsageWindowsInline vm={vm} now={now} />,
   },
   cost: {
-    label: '成本',
-    cell: ({ vm, accounts }) => <VmCostLedger vm={vm} accounts={accounts} />,
+    label: '成本 · 7D',
+    cell: ({ vm, accounts }) => <CostCell vm={vm} accounts={accounts} />,
   },
 }
 
@@ -410,11 +308,46 @@ export function VmTable({
   const columns = useVmColumnOrder()
   const [dragKey, setDragKey] = useState<VmColumnKey | null>(null)
   const [overKey, setOverKey] = useState<VmColumnKey | null>(null)
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set())
+  const setOpen = (id: string, open: boolean) =>
+    setExpanded((prev) => {
+      if (prev.has(id) === open) return prev
+      const next = new Set(prev)
+      if (open) next.add(id)
+      else next.delete(id)
+      return next
+    })
+  const toggle = (id: string) => setOpen(id, !expanded.has(id))
+  // 点行任意位置展开；控件、链接和拖选文字不算。
+  const onRowClick = (e: MouseEvent<HTMLDivElement>, vm: Vm) => {
+    if ((e.target as HTMLElement).closest(ROW_INTERACTIVE)) return
+    if (String(window.getSelection?.() ?? '')) return
+    toggle(vm.id)
+  }
   const onRowKey = (e: KeyboardEvent<HTMLDivElement>, vm: Vm) => {
     if (e.target !== e.currentTarget) return
-    if (e.key !== 'Enter' && e.key !== ' ') return
-    e.preventDefault()
-    actions.openDetail(vm)
+    if (e.key === 'Enter' && e.shiftKey) {
+      e.preventDefault()
+      actions.openDetail(vm)
+    } else if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault()
+      toggle(vm.id)
+    } else if (e.key === 'Escape') {
+      setOpen(vm.id, false)
+    } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      const rows =
+        e.currentTarget.parentElement?.parentElement?.querySelectorAll<HTMLElement>(
+          '[data-vm-row]'
+        )
+      if (!rows) return
+      const list = [...rows]
+      const i = list.indexOf(e.currentTarget)
+      const next = list[i + (e.key === 'ArrowDown' ? 1 : -1)]
+      if (next) {
+        e.preventDefault()
+        next.focus()
+      }
+    }
   }
   const endDrag = () => {
     setDragKey(null)
@@ -432,7 +365,8 @@ export function VmTable({
   return (
     <div className='overflow-x-auto rounded-lg border border-border/60'>
       <div className='min-w-[1180px]'>
-        <div className='sticky top-0 z-10 flex h-8 items-center border-b bg-muted/30 pl-1.5 text-xs font-medium tracking-wide text-muted-foreground'>
+        <div className='sticky top-0 z-10 flex h-8 items-center border-b bg-muted/30 text-xs font-medium tracking-wide text-muted-foreground'>
+          <div className={COL_CLS.open} aria-hidden />
           {columns.order.map((key) => {
             const dragging = dragKey === key
             const target = overKey === key && dragKey && dragKey !== key
@@ -504,42 +438,91 @@ export function VmTable({
           </div>
         </div>
         {vms.map((vm) => {
-          const week = vmWeekOutcome(vm, accounts)
           const group = fleetGroup(vm)
           const muted = group === 'off' || group === 'none'
+          const open = expanded.has(vm.id)
+          const detailId = `vm-row-detail-${vm.id}`
           const ctx: CellCtx = {
             vm,
             accounts,
             now,
-            week,
             statusShow: statusBar.show,
           }
           return (
-            <div
-              key={vm.id}
-              role='button'
-              tabIndex={0}
-              aria-label={`查看 ${vm.id} 详情`}
-              className={cn(
-                'group flex cursor-pointer items-start border-b border-border/40 py-2 pl-1.5 transition-colors duration-150 last:border-b-0 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring',
-                // 等级色只走行首 2px，不染整行底色：行是密集数字，底色一染就没对比空间了。
-                tierVisual(vm).row || 'hover:bg-accent/40',
-                muted && 'opacity-60'
-              )}
-              onClick={() => actions.openDetail(vm)}
-              onKeyDown={(e) => onRowKey(e, vm)}
-            >
-              {columns.order.map((key) => (
-                <div key={key} className={cn('px-1.5', COL_CLS[key])}>
-                  {COLUMNS[key].cell(ctx)}
-                </div>
-              ))}
+            <div key={vm.id}>
               <div
-                className={cn(COL_CLS.actions, 'flex justify-end')}
-                onClick={(e) => e.stopPropagation()}
+                data-vm-row
+                tabIndex={0}
+                aria-label={`${vm.id}，Enter 展开明细，Shift+Enter 打开详情`}
+                className={cn(
+                  'group flex cursor-pointer items-start border-b border-border/40 py-2 transition-colors duration-150 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-ring',
+                  // 等级色只走行首 2px，不染整行底色：行是密集数字，底色一染就没对比空间了。
+                  tierVisual(vm).row || 'hover:bg-accent/40',
+                  open && 'bg-accent/30'
+                )}
+                onClick={(e) => onRowClick(e, vm)}
+                onKeyDown={(e) => onRowKey(e, vm)}
               >
-                <VmActionMenu vm={vm} />
+                <div className={cn(COL_CLS.open, 'flex items-start pt-0.5')}>
+                  <Button
+                    type='button'
+                    size='icon'
+                    variant='ghost'
+                    className='size-7 text-muted-foreground group-hover:text-foreground'
+                    title='打开详情页（Shift+Enter）'
+                    aria-label={`打开 ${vm.id} 详情页`}
+                    onClick={() => actions.openDetail(vm)}
+                  >
+                    <ExternalLink className='size-4' />
+                  </Button>
+                </div>
+                {columns.order.map((key) => (
+                  <div
+                    key={key}
+                    className={cn(
+                      'px-1.5',
+                      COL_CLS[key],
+                      muted && 'opacity-60'
+                    )}
+                  >
+                    {COLUMNS[key].cell(ctx)}
+                  </div>
+                ))}
+                <div
+                  className={cn(
+                    COL_CLS.actions,
+                    'flex items-start justify-end gap-0.5'
+                  )}
+                >
+                  <Button
+                    type='button'
+                    size='icon'
+                    variant='ghost'
+                    className='size-7 text-muted-foreground'
+                    aria-expanded={open}
+                    aria-controls={detailId}
+                    aria-label={`${open ? '收起' : '展开'} ${vm.id} 明细`}
+                    onClick={() => toggle(vm.id)}
+                  >
+                    <ChevronDown
+                      className={cn(
+                        'size-4 transition-transform duration-150 motion-reduce:transition-none',
+                        open && 'rotate-180'
+                      )}
+                    />
+                  </Button>
+                  <VmActionMenu vm={vm} />
+                </div>
               </div>
+              {open ? (
+                <VmRowDetail
+                  id={detailId}
+                  vm={vm}
+                  accounts={accounts}
+                  now={now}
+                  onOpenDetail={() => actions.openDetail(vm)}
+                />
+              ) : null}
             </div>
           )
         })}
