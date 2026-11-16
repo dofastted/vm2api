@@ -617,3 +617,26 @@ curl -sS -X POST http://127.0.0.1:8787/api/panel/wrap-cli/sync \
 ---
 
 交流见仓库 [README](../README.md)。
+
+### Ubuntu AppArmor 与 Docker 原生 Claude
+
+在 `kernel.apparmor_restrict_unprivileged_userns=1` 的宿主上，单独设置
+`apparmor=unconfined` 仍可能使原生 Claude 在创建 user/mount namespace 后进入
+`unprivileged_userns` 限制，导致 bind mount 返回 `Permission denied (os error 13)`。
+
+安装/升级脚本在启动控制面前，加载并持久保存 `vm2api-crag-docker` AppArmor
+profile，显式允许 `userns`。不关闭宿主 sysctl，不授予槽位 privileged 或额外
+capability，现有 seccomp 和 `no-new-privileges` 保持不变。策略检查或加载失败会
+终止安装，并保留错误信息；已有同名非托管策略不会被覆盖。
+
+手动 Compose 部署需先在 **Docker 宿主机** 执行新版本安装脚本中的准备命令：
+
+```bash
+sudo bash deploy/install.sh prepare-native
+```
+
+随后更新控制面，并通过面板重载正在使用的 CRAG v2 槽位。Docker restart 无法
+更改 AppArmor profile；旧 `unconfined` 槽位会在正常重载/启动路径中重建。
+已停用槽位不会由准备命令启动，在下次手动启动时应用新配置。profile 未加载时
+Docker 会明确拒绝创建槽位，不退回 `unconfined`。命令必须在 Docker daemon
+所在宿主执行，不能在控制面容器或远端 Docker 客户端机器上执行。

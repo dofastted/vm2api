@@ -69,7 +69,7 @@ const CRAG_V2_SECCOMP_PATH = fileURLToPath(new URL('./crag-v2-seccomp.json', imp
 const CRAG_V2_SECCOMP = JSON.parse(fs.readFileSync(CRAG_V2_SECCOMP_PATH, 'utf8'))
 function apparmorUserNamespaceRestricted() {
   try {
-    return fs.readFileSync('/proc/sys/kernel/unprivileged_userns_apparmor_policy', 'utf8').trim() === '1'
+    return fs.readFileSync('/proc/sys/kernel/apparmor_restrict_unprivileged_userns', 'utf8').trim() === '1'
   } catch {
     return false
   }
@@ -93,6 +93,15 @@ export function cragV2NeedsApparmorUnconfined(options = {}) {
     return options.appArmorEnabled === true || options.userNamespaceRestricted === true
   }
   return hostAppArmorEnabled() || apparmorUserNamespaceRestricted()
+}
+
+/** Ubuntu restricts even unconfined tasks after entering a user namespace. */
+export function cragDockerAppArmorProfile(options = {}) {
+  const restricted = Object.hasOwn(options, 'userNamespaceRestricted')
+    ? options.userNamespaceRestricted === true
+    : apparmorUserNamespaceRestricted()
+  if (restricted) return 'vm2api-crag-docker'
+  return cragV2NeedsApparmorUnconfined(options) ? 'unconfined' : null
 }
 
 // Root in the runner must write into the slot-uid 0700 dirs and drop qemu to the slot uid.
@@ -425,8 +434,8 @@ export function nativeSlotSandboxNeedsRecreate(existing, vm, routing = {}, optio
     }
   })
   if (!seccompOk) return true
-  const needsUnconfined = cragV2NeedsApparmorUnconfined(options)
-  return (needsUnconfined && !opts.includes('apparmor=unconfined')) || existing.init !== true
+  const profile = cragDockerAppArmorProfile(options)
+  return (profile !== null && !opts.includes(`apparmor=${profile}`)) || existing.init !== true
 }
 
 /** Migrate existing local slots in place, including paused ones; never start or recreate them. */
@@ -1430,7 +1439,7 @@ export async function startVmRuntime(vm, projectRoot, { recreate = false, routin
         ? [
             '--security-opt',
             `seccomp=${CRAG_V2_SECCOMP_PATH}`,
-            ...(cragV2NeedsApparmorUnconfined() ? ['--security-opt', 'apparmor=unconfined'] : []),
+            ...(cragDockerAppArmorProfile() ? ['--security-opt', `apparmor=${cragDockerAppArmorProfile()}`] : []),
           ]
         : []),
       '--cap-drop',
