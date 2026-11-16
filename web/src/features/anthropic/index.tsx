@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { VIEW_TITLES } from '@/config/nav'
 import { toast } from 'sonner'
@@ -67,11 +67,26 @@ export function AnthropicConsolePage() {
     freshEndpoint('anthropic'),
     freshEndpoint('openai'),
   ])
-  const endpoints = allEndpoints.filter((item) => item.protocol === protocol)
+  const endpoints = useMemo(
+    () => allEndpoints.filter((item) => item.protocol === protocol),
+    [allEndpoints, protocol]
+  )
   const defaultUrl = API_DEFAULTS[protocol].baseUrl
   const [openProxy, setOpenProxy] = useState<string | null>(null)
-  const [models, setModels] = useState<string[]>([])
-  const [model, setModel] = useState('')
+  const [selectedModel, setModel] = useState('')
+  const models = useMemo(
+    () => [
+      ...new Set(
+        endpoints
+          .flatMap((endpoint) => endpoint.fetchedModels || [])
+          .map((name) => name.trim())
+          .filter(Boolean)
+      ),
+    ],
+    [endpoints]
+  )
+  const model =
+    models.length && !models.includes(selectedModel) ? models[0] : selectedModel
   const [maxTokens, setMaxTokens] = useState('256')
   const [message, setMessage] = useState('Hi')
   const [testing, setTesting] = useState<number | 'all' | null>(null)
@@ -87,18 +102,6 @@ export function AnthropicConsolePage() {
     setLoaded(true)
   }, [loaded, stored.data])
 
-  useEffect(() => {
-    const activeModels = endpoints
-      .filter((e) => (e.protocol || 'anthropic') === protocol)
-      .flatMap((e) => e.fetchedModels || [])
-      .map((s) => s.trim())
-      .filter(Boolean)
-    const unique = [...new Set(activeModels)]
-    setModels(unique)
-    if (unique.length && (!model || !unique.includes(model))) {
-      setModel(unique[0])
-    }
-  }, [endpoints, protocol])
   function patchEndpoint(id: string, patch: Partial<EndpointDraft>) {
     setEndpoints((current) =>
       current.map((item) => (item.id === id ? { ...item, ...patch } : item))
@@ -191,9 +194,7 @@ export function AnthropicConsolePage() {
         seen[id] = true
         ids.push(id)
       }
-      setModels(ids)
       if (ids.length) patchEndpoint(endpointId, { fetchedModels: ids })
-      if (!ids.includes(model) && ids[0]) setModel(ids[0])
       if (!ids.length) toast.error('上游没有返回模型')
       else toast.success(`获取到 ${ids.length} 个模型`)
       qc.invalidateQueries({
@@ -274,7 +275,6 @@ export function AnthropicConsolePage() {
               onClick={() => {
                 setProtocol(kind)
                 setModel('')
-                setModels([])
               }}
             >
               {kind}
