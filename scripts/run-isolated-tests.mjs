@@ -108,12 +108,15 @@ function runFile(file) {
   })
 }
 
-let failed = 0
+const failures = []
 for (const file of files) {
-  if (!(await runFile(file))) failed += 1
+  if (!(await runFile(file))) failures.push(file)
 }
 
-if (failed) {
-  console.error(`\n${failed}/${files.length} isolated test file(s) failed`)
+if (failures.length) {
+  // Every file above prints its own output, so the per-file stdio is far more than
+  // one CI screen. List the failing files at the end to make the log actionable.
+  console.error(`\n${failures.length}/${files.length} isolated test file(s) failed:`)
+  for (const file of failures) console.error(`  - ${file}`)
   process.exit(1)
 }
