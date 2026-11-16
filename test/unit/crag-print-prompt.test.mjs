@@ -393,3 +393,94 @@ test('an agent summary keeps its trailing budget turns but folds shared history'
   )
   assert.ok(out[0].content.at(-1).text.includes('# Environment update'))
 })
+
+test('folded turn controls are lifted unless a later turn overrides them', () => {
+  const effortOnly = {
+    role: 'system',
+    content: [],
+    output_config: { effort: 'max' },
+  }
+  const dated = {
+    role: 'system',
+    content: "Today's date is 2026-11-15.",
+    output_config: { effort: 'medium' },
+  }
+  const lifted = prepareCragPrintBody({
+    output_config: { effort: 'high', format: { type: 'json_schema' } },
+    messages: [userTurn('q'), dated, asstTurn('a'), userTurn('r'), effortOnly],
+  })
+  assert.deepEqual(
+    lifted.messages.map((m) => m.role),
+    ['user', 'assistant', 'user'],
+  )
+  assert.deepEqual(lifted.output_config, {
+    effort: 'max',
+    format: { type: 'json_schema' },
+  })
+  assert.ok(lifted.messages[0].content.at(-1).text.includes("Today's date"))
+
+  const overridden = prepareCragPrintBody({
+    output_config: { effort: 'high' },
+    messages: [userTurn('q'), dated, asstTurn('a'), { ...userTurn('r'), output_config: { effort: 'low' } }],
+  })
+  assert.deepEqual(overridden.output_config, { effort: 'high' })
+
+  const clearAt = { role: 'system', content: 'cleared', clear_at: 'tool_uses' }
+  const kept = [userTurn('q'), clearAt]
+  assert.deepEqual(foldHistorySystemMessages(kept), kept)
+
+  const summary = agentBody({ summary: true })
+  summary.messages.splice(1, 0, dated)
+  summary.messages.push({
+    role: 'system',
+    content: [],
+    output_config: { effort: 'low' },
+  })
+  const summaryOut = prepareCragPrintBody(summary, { agentSummary: true })
+  assert.equal(summaryOut.output_config?.effort, summary.output_config?.effort)
+})
+
+test('a fold that would put a 1h breakpoint after a 5m one keeps the system turn', () => {
+  const longSystem = {
+    role: 'system',
+    content: [
+      {
+        type: 'text',
+        text: 'note',
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+    ],
+  }
+  const shortResult = {
+    role: 'user',
+    content: [
+      {
+        type: 'tool_result',
+        tool_use_id: 't1',
+        content: 'ok',
+        cache_control: { type: 'ephemeral' },
+      },
+    ],
+  }
+  const inverted = [userTurn('q'), asstTurn('a'), longSystem, shortResult]
+  assert.deepEqual(foldHistorySystemMessages(inverted), inverted)
+
+  const longResult = {
+    role: 'user',
+    content: [
+      {
+        type: 'tool_result',
+        tool_use_id: 't1',
+        content: 'ok',
+        cache_control: { type: 'ephemeral', ttl: '1h' },
+      },
+    ],
+  }
+  const folded = foldHistorySystemMessages([userTurn('q'), asstTurn('a'), longSystem, longResult])
+  assert.deepEqual(
+    folded.map((m) => m.role),
+    ['user', 'assistant', 'user'],
+  )
+  assert.equal(folded[2].content[0].type, 'tool_result')
+  assert.equal(folded[2].content[1].cache_control.ttl, '1h')
+})
