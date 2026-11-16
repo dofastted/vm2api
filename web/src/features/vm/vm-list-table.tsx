@@ -60,6 +60,9 @@ import {
   vmWindows,
   type WindowKey,
   type WindowReadout,
+  ZONES,
+  zoneOf,
+  type VmZone,
 } from '@/features/vm/vm-rack-model'
 import { VmRowDetail } from '@/features/vm/vm-row-detail'
 import { schedulingPriorityTextClass } from '@/features/vm/vm-type-visual'
@@ -184,7 +187,7 @@ function HealthCell({ vm }: { vm: Vm }) {
       <span
         role='img'
         aria-label='近 24 小时 48 格请求健康时间线'
-        className='inline-grid h-4 shrink-0 auto-cols-[2px] grid-flow-col items-end gap-px'
+        className='inline-grid h-4 shrink-0 auto-cols-[2px] grid-flow-col items-end gap-0 min-[1800px]:gap-px'
       >
         {h.slots.map((s, i) => (
           <i
@@ -206,7 +209,10 @@ function HealthCell({ vm }: { vm: Vm }) {
             {fmtHealthPct(h.pct)}
           </b>
           <span
-            className={cn('font-mono text-muted-foreground tabular-nums', SEC)}
+            className={cn(
+              'hidden font-mono text-muted-foreground tabular-nums min-[1800px]:inline',
+              SEC
+            )}
             title={`成功 ${fmtNum(h.ok)} / 总数 ${fmtNum(h.req)}`}
           >
             {`${h.ok}/${h.req}`}
@@ -524,7 +530,7 @@ function ProdCell({ vm }: { vm: Vm }) {
       </span>
       <span
         className={cn(
-          'flex shrink-0 items-center gap-1 text-[11px] text-muted-foreground',
+          'flex min-w-0 shrink items-center gap-1 overflow-hidden text-[11px] text-muted-foreground',
           SEC
         )}
       >
@@ -536,19 +542,11 @@ function ProdCell({ vm }: { vm: Vm }) {
           {node}
         </span>
       </span>
-      <span className={cn('shrink-0', SEC)}>
+      <span className={cn('min-w-0 shrink overflow-hidden', SEC)}>
         <ProxyChip vm={vm} compact />
       </span>
     </>
   )
-}
-
-const GROUP_ORDER: ScheduleStateLabel[] = ['开', '受限', '关', '不可调度']
-const GROUP_TEXT: Record<ScheduleStateLabel, string> = {
-  开: '可用',
-  受限: '受限',
-  关: '关闭调度',
-  不可调度: '不可调度',
 }
 
 type Agg = {
@@ -561,7 +559,7 @@ type Agg = {
   cap: number
   queue: number
   queued: number
-  by: Record<ScheduleStateLabel, number>
+  by: Record<VmZone, number>
   top: RowData | null
 }
 
@@ -576,7 +574,7 @@ function aggregate(rows: RowData[]): Agg {
     cap: 0,
     queue: 0,
     queued: 0,
-    by: { 开: 0, 受限: 0, 关: 0, 不可调度: 0 },
+    by: { pool: 0, restricted: 0, off: 0, none: 0, dead: 0 },
     top: null,
   }
   for (const r of rows) {
@@ -588,7 +586,7 @@ function aggregate(rows: RowData[]): Agg {
     a.cap += r.seatsMax ?? 0
     a.queue += r.queue
     if (r.queue) a.queued++
-    a.by[scheduleStateLabel(r.vm)]++
+    a.by[zoneOf(r.vm)]++
     if (r.spend && (!a.top || r.spend > a.top.spend)) a.top = r
   }
   return a
@@ -646,14 +644,14 @@ function SummaryBar({ a }: { a: Agg }) {
       className='flex flex-wrap gap-y-2 rounded-lg border border-border/60 bg-card py-2'
     >
       <Kpi
-        k='可接单'
+        k='在池'
         v={
           <>
-            {a.by['开']}
+            {a.by.pool}
             <span className='text-muted-foreground'>/{a.n}</span>
           </>
         }
-        x={`受限 ${a.by['受限']} · 关闭 ${a.by['关']} · 不可调度 ${a.by['不可调度']}`}
+        x={`受限 ${a.by.restricted} · 关闭 ${a.by.off} · 未使用 ${a.by.none} · 不可调度 ${a.by.dead}`}
       />
       <Kpi
         k='24h 成功率'
@@ -726,10 +724,10 @@ export function VmTable({
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set())
   const [grouped, setGrouped] = useFlag('kin.vm.list-group', false)
   const [pinSec, setPinSec] = useFlag('kin.vm.list-pin-sec', false)
-  const [collapsed, setCollapsed] = useState<ReadonlySet<ScheduleStateLabel>>(
-    () => new Set<ScheduleStateLabel>(['关', '不可调度'])
+  const [collapsed, setCollapsed] = useState<ReadonlySet<VmZone>>(
+    () => new Set<VmZone>(['off', 'none', 'dead'])
   )
-  const toggleGroup = (k: ScheduleStateLabel) =>
+  const toggleGroup = (k: VmZone) =>
     setCollapsed((prev) => {
       const next = new Set(prev)
       if (next.has(k)) next.delete(k)
@@ -753,8 +751,8 @@ export function VmTable({
 
   const total = useMemo(() => aggregate(rows), [rows])
   const sections = grouped
-    ? GROUP_ORDER.map((k) => {
-        const list = rows.filter((r) => scheduleStateLabel(r.vm) === k)
+    ? ZONES.map(({ key: k }) => {
+        const list = rows.filter((r) => zoneOf(r.vm) === k)
         return { key: k, rows: list, agg: aggregate(list), head: true }
       }).filter((g) => g.rows.length)
     : [{ key: 'all' as const, rows, agg: total, head: false }]
@@ -889,8 +887,7 @@ export function VmTable({
             </div>
           </div>
           {sections.map((sec) => {
-            const isCol =
-              sec.head && collapsed.has(sec.key as ScheduleStateLabel)
+            const isCol = sec.head && collapsed.has(sec.key as VmZone)
             const pct = aggPct(sec.agg)
             return (
               <Fragment key={sec.key}>
@@ -901,9 +898,7 @@ export function VmTable({
                         type='button'
                         aria-expanded={!isCol}
                         className='inline-flex items-center gap-1.5 rounded-sm font-semibold text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring'
-                        onClick={() =>
-                          toggleGroup(sec.key as ScheduleStateLabel)
-                        }
+                        onClick={() => toggleGroup(sec.key as VmZone)}
                       >
                         <ChevronRight
                           className={cn(
@@ -911,7 +906,7 @@ export function VmTable({
                             !isCol && 'rotate-90'
                           )}
                         />
-                        {GROUP_TEXT[sec.key as ScheduleStateLabel]}
+                        {ZONES.find((z) => z.key === sec.key)?.label}
                         <span className='font-mono font-normal text-muted-foreground'>
                           {sec.rows.length} 台
                         </span>
@@ -999,7 +994,7 @@ export function VmTable({
                               role='cell'
                               className={cn(
                                 stickyLeft,
-                                'left-[34px] flex min-w-0 items-center gap-1.5 px-2 whitespace-nowrap',
+                                'left-[34px] flex min-w-0 items-center gap-1.5 overflow-hidden px-2 whitespace-nowrap',
                                 dim && 'opacity-50'
                               )}
                             >
