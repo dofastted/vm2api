@@ -1,4 +1,6 @@
 import {
+  Fragment,
+  useEffect,
   useMemo,
   useState,
   type CSSProperties,
@@ -13,6 +15,9 @@ import {
   ArrowUp,
   Ban,
   ChevronDown,
+  ChevronRight,
+  Eye,
+  Layers,
   CircleCheck,
   CircleOff,
   ExternalLink,
@@ -28,6 +33,7 @@ import {
   fmtHealthPct,
   HEALTH_FG,
   healthSummary,
+  healthTone,
   SLOT_BG,
   type SlotState,
 } from '@/lib/vm-health'
@@ -74,7 +80,7 @@ const GRID: CSSProperties = {
 
 /** 悬停才出现的次要信息。 */
 const SEC =
-  'opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100 group-aria-expanded:opacity-100 motion-reduce:transition-none'
+  'group-data-[pin=true]/tbl:opacity-100 opacity-0 transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100 group-aria-expanded:opacity-100 motion-reduce:transition-none'
 
 const NUM = 'justify-end font-mono tabular-nums'
 const TERT = 'text-[color:var(--text-tertiary)]'
@@ -296,6 +302,8 @@ function QuotaCell({
 type RowData = {
   vm: Vm
   health: number | null
+  hOk: number
+  hReq: number
   win: Partial<Record<WindowKey, WindowReadout>>
   today: number
   seatsUsed: number
@@ -313,9 +321,12 @@ function rowData(vm: Vm, accounts?: UsageAccountRow[]): RowData {
   const week = vmWeekOutcome(vm, accounts)
   const win: RowData['win'] = {}
   for (const w of vmWindows(vm)) win[w.key] = w
+  const h = healthSummary(vm.health_24h)
   return {
     vm,
-    health: healthSummary(vm.health_24h).pct,
+    health: h.pct,
+    hOk: h.ok,
+    hReq: h.req,
     win,
     today: vmTodayStats(vm, accounts).req,
     seatsUsed: Number(vm.seats_used) || 0,
@@ -532,6 +543,176 @@ function ProdCell({ vm }: { vm: Vm }) {
   )
 }
 
+const GROUP_ORDER: ScheduleStateLabel[] = ['开', '受限', '关', '不可调度']
+const GROUP_TEXT: Record<ScheduleStateLabel, string> = {
+  开: '可用',
+  受限: '受限',
+  关: '关闭调度',
+  不可调度: '不可调度',
+}
+
+type Agg = {
+  n: number
+  ok: number
+  req: number
+  today: number
+  spend: number
+  used: number
+  cap: number
+  queue: number
+  queued: number
+  by: Record<ScheduleStateLabel, number>
+  top: RowData | null
+}
+
+function aggregate(rows: RowData[]): Agg {
+  const a: Agg = {
+    n: rows.length,
+    ok: 0,
+    req: 0,
+    today: 0,
+    spend: 0,
+    used: 0,
+    cap: 0,
+    queue: 0,
+    queued: 0,
+    by: { 开: 0, 受限: 0, 关: 0, 不可调度: 0 },
+    top: null,
+  }
+  for (const r of rows) {
+    a.ok += r.hOk
+    a.req += r.hReq
+    a.today += r.today
+    a.spend += r.spend
+    a.used += r.seatsUsed
+    a.cap += r.seatsMax ?? 0
+    a.queue += r.queue
+    if (r.queue) a.queued++
+    a.by[scheduleStateLabel(r.vm)]++
+    if (r.spend && (!a.top || r.spend > a.top.spend)) a.top = r
+  }
+  return a
+}
+
+const aggPct = (a: Agg) => (a.req ? (a.ok / a.req) * 100 : null)
+
+/** 本机记住的列表开关。 */
+function useFlag(key: string, initial: boolean) {
+  const [on, setOn] = useState(() => {
+    try {
+      const raw = localStorage.getItem(key)
+      return raw == null ? initial : raw === '1'
+    } catch {
+      return initial
+    }
+  })
+  useEffect(() => {
+    try {
+      localStorage.setItem(key, on ? '1' : '0')
+    } catch {
+      /* 隐私模式下写不进去，只影响下次默认值 */
+    }
+  }, [key, on])
+  return [on, setOn] as const
+}
+
+function Kpi({
+  k,
+  v,
+  x,
+  tone,
+}: {
+  k: string
+  v: ReactNode
+  x: ReactNode
+  tone?: string
+}) {
+  return (
+    <div className='min-w-0 flex-1 border-l px-3 first:border-l-0'>
+      <div className='text-[11px] text-muted-foreground'>{k}</div>
+      <div className='flex items-baseline gap-2 whitespace-nowrap'>
+        <b className={cn('font-mono text-[15px] tabular-nums', tone)}>{v}</b>
+        <span className='truncate text-[11px] text-muted-foreground'>{x}</span>
+      </div>
+    </div>
+  )
+}
+
+function SummaryBar({ a }: { a: Agg }) {
+  const pct = aggPct(a)
+  return (
+    <section
+      aria-label='全局汇总'
+      className='flex flex-wrap gap-y-2 rounded-lg border border-border/60 bg-card py-2'
+    >
+      <Kpi
+        k='可接单'
+        v={
+          <>
+            {a.by['开']}
+            <span className='text-muted-foreground'>/{a.n}</span>
+          </>
+        }
+        x={`受限 ${a.by['受限']} · 关闭 ${a.by['关']} · 不可调度 ${a.by['不可调度']}`}
+      />
+      <Kpi
+        k='24h 成功率'
+        v={fmtHealthPct(pct)}
+        x={`失败 ${fmtNum(a.req - a.ok)}`}
+        tone={HEALTH_FG[healthTone(pct)]}
+      />
+      <Kpi k='24h 请求' v={fmtNum(a.req)} x={`今日 ${fmtNum(a.today)}`} />
+      <Kpi
+        k='7D 花费'
+        v={a.spend ? fmtUsd(a.spend, 2) : '—'}
+        x={a.top ? `最高 ${a.top.vm.id} ${fmtUsd(a.top.spend, 0)}` : ''}
+      />
+      <Kpi
+        k='席位占用'
+        v={
+          <>
+            {a.used}
+            <span className='text-muted-foreground'>/{a.cap}</span>
+          </>
+        }
+        x={a.cap ? `${Math.round((a.used / a.cap) * 100)}%` : ''}
+      />
+      <Kpi
+        k='排队'
+        v={a.queue}
+        x={a.queued ? `${a.queued} 台有排队` : '无排队'}
+        tone={a.queue ? 'text-[color:var(--status-warn)]' : undefined}
+      />
+    </section>
+  )
+}
+
+function ToggleBtn({
+  on,
+  onClick,
+  icon: Icon,
+  children,
+}: {
+  on: boolean
+  onClick: () => void
+  icon: typeof Eye
+  children: ReactNode
+}) {
+  return (
+    <Button
+      type='button'
+      size='sm'
+      variant={on ? 'default' : 'outline'}
+      aria-pressed={on}
+      className='h-7 gap-1 px-2 text-xs'
+      onClick={onClick}
+    >
+      <Icon className='size-3.5' />
+      {children}
+    </Button>
+  )
+}
+
 export function VmTable({
   vms,
   accounts,
@@ -543,6 +724,18 @@ export function VmTable({
   const now = useNow()
   const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 } | null>(null)
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set())
+  const [grouped, setGrouped] = useFlag('kin.vm.list-group', false)
+  const [pinSec, setPinSec] = useFlag('kin.vm.list-pin-sec', false)
+  const [collapsed, setCollapsed] = useState<ReadonlySet<ScheduleStateLabel>>(
+    () => new Set<ScheduleStateLabel>(['关', '不可调度'])
+  )
+  const toggleGroup = (k: ScheduleStateLabel) =>
+    setCollapsed((prev) => {
+      const next = new Set(prev)
+      if (next.has(k)) next.delete(k)
+      else next.add(k)
+      return next
+    })
   const rows = useMemo(() => {
     const list = vms.map((vm) => rowData(vm, accounts))
     if (!sort) return list
@@ -557,6 +750,14 @@ export function VmTable({
       })
       .map((x) => x.r)
   }, [vms, accounts, sort])
+
+  const total = useMemo(() => aggregate(rows), [rows])
+  const sections = grouped
+    ? GROUP_ORDER.map((k) => {
+        const list = rows.filter((r) => scheduleStateLabel(r.vm) === k)
+        return { key: k, rows: list, agg: aggregate(list), head: true }
+      }).filter((g) => g.rows.length)
+    : [{ key: 'all' as const, rows, agg: total, head: false }]
 
   const onSort = (key: SortKey) =>
     setSort((prev) =>
@@ -608,178 +809,260 @@ export function VmTable({
 
   const stickyLeft = 'sticky z-[2] bg-[var(--row-bg)]'
   return (
-    <div
-      data-vm-table
-      className='overflow-x-auto rounded-lg border border-border/60 bg-card text-[12.5px]'
-    >
-      <div className='min-w-[1408px]' role='table' aria-label='槽位列表'>
-        <div
-          role='row'
-          className='sticky top-0 z-[6] grid h-8 border-b bg-muted/40 text-[11.5px] text-muted-foreground [--row-bg:var(--card)]'
-          style={GRID}
+    <div className='space-y-2'>
+      <SummaryBar a={total} />
+      <div className='flex items-center justify-end gap-1.5'>
+        <ToggleBtn
+          on={grouped}
+          icon={Layers}
+          onClick={() => setGrouped(!grouped)}
         >
-          <div role='columnheader' className={cn(stickyLeft, 'left-0')}>
-            <span className='sr-only'>详情页</span>
-          </div>
+          按状态分组
+        </ToggleBtn>
+        <ToggleBtn on={pinSec} icon={Eye} onClick={() => setPinSec(!pinSec)}>
+          次要信息常显
+        </ToggleBtn>
+      </div>
+      <div
+        data-vm-table
+        data-pin={pinSec}
+        className='group/tbl overflow-x-auto rounded-lg border border-border/60 bg-card text-[12.5px]'
+      >
+        <div className='min-w-[1408px]' role='table' aria-label='槽位列表'>
           <div
-            role='columnheader'
-            className={cn(stickyLeft, 'left-[34px] flex items-center px-2')}
+            role='row'
+            className='sticky top-0 z-[6] grid h-8 border-b bg-muted/40 text-[11.5px] text-muted-foreground [--row-bg:var(--card)]'
+            style={GRID}
           >
-            槽位
+            <div role='columnheader' className={cn(stickyLeft, 'left-0')}>
+              <span className='sr-only'>详情页</span>
+            </div>
+            <div
+              role='columnheader'
+              className={cn(stickyLeft, 'left-[34px] flex items-center px-2')}
+            >
+              槽位
+            </div>
+            {COLS.map((c) => {
+              const active = sort && c.sort === sort.key
+              return (
+                <div
+                  key={c.label}
+                  role='columnheader'
+                  aria-sort={
+                    active
+                      ? sort.dir > 0
+                        ? 'ascending'
+                        : 'descending'
+                      : undefined
+                  }
+                  className={cn(
+                    'flex min-w-0 items-center px-2 whitespace-nowrap',
+                    c.num && 'justify-end',
+                    active && 'font-semibold text-foreground'
+                  )}
+                >
+                  {c.sort ? (
+                    <button
+                      type='button'
+                      className='inline-flex items-center gap-0.5 rounded-sm hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring'
+                      title='点击排序'
+                      onClick={() => onSort(c.sort!)}
+                    >
+                      {c.label}
+                      {active ? (
+                        sort.dir > 0 ? (
+                          <ArrowUp className='size-2.5' />
+                        ) : (
+                          <ArrowDown className='size-2.5' />
+                        )
+                      ) : null}
+                    </button>
+                  ) : (
+                    c.label
+                  )}
+                </div>
+              )
+            })}
+            <div role='columnheader'>
+              <span className='sr-only'>操作</span>
+            </div>
           </div>
-          {COLS.map((c) => {
-            const active = sort && c.sort === sort.key
+          {sections.map((sec) => {
+            const isCol =
+              sec.head && collapsed.has(sec.key as ScheduleStateLabel)
+            const pct = aggPct(sec.agg)
             return (
-              <div
-                key={c.label}
-                role='columnheader'
-                aria-sort={
-                  active
-                    ? sort.dir > 0
-                      ? 'ascending'
-                      : 'descending'
-                    : undefined
-                }
-                className={cn(
-                  'flex min-w-0 items-center px-2 whitespace-nowrap',
-                  c.num && 'justify-end',
-                  active && 'font-semibold text-foreground'
-                )}
-              >
-                {c.sort ? (
-                  <button
-                    type='button'
-                    className='inline-flex items-center gap-0.5 rounded-sm hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring'
-                    title='点击排序'
-                    onClick={() => onSort(c.sort!)}
-                  >
-                    {c.label}
-                    {active ? (
-                      sort.dir > 0 ? (
-                        <ArrowUp className='size-2.5' />
-                      ) : (
-                        <ArrowDown className='size-2.5' />
+              <Fragment key={sec.key}>
+                {sec.head ? (
+                  <div className='border-b bg-muted/50'>
+                    <div className='sticky left-0 flex h-8 w-max items-center gap-4 px-2.5 text-[11.5px] whitespace-nowrap text-muted-foreground'>
+                      <button
+                        type='button'
+                        aria-expanded={!isCol}
+                        className='inline-flex items-center gap-1.5 rounded-sm font-semibold text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring'
+                        onClick={() =>
+                          toggleGroup(sec.key as ScheduleStateLabel)
+                        }
+                      >
+                        <ChevronRight
+                          className={cn(
+                            'size-3 transition-transform motion-reduce:transition-none',
+                            !isCol && 'rotate-90'
+                          )}
+                        />
+                        {GROUP_TEXT[sec.key as ScheduleStateLabel]}
+                        <span className='font-mono font-normal text-muted-foreground'>
+                          {sec.rows.length} 台
+                        </span>
+                      </button>
+                      <span>
+                        成功率{' '}
+                        <b className='font-mono text-foreground'>
+                          {fmtHealthPct(pct)}
+                        </b>
+                      </span>
+                      <span>
+                        24h 请求{' '}
+                        <b className='font-mono text-foreground'>
+                          {fmtNum(sec.agg.req)}
+                        </b>
+                      </span>
+                      <span>
+                        7D 花费{' '}
+                        <b className='font-mono text-foreground'>
+                          {sec.agg.spend ? fmtUsd(sec.agg.spend, 2) : '—'}
+                        </b>
+                      </span>
+                      <span>
+                        席位{' '}
+                        <b className='font-mono text-foreground'>
+                          {sec.agg.used}/{sec.agg.cap}
+                        </b>
+                      </span>
+                      {isCol ? (
+                        <span className='text-[color:var(--text-tertiary)]'>
+                          已折叠
+                        </span>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+                {isCol
+                  ? null
+                  : sec.rows.map((r) => {
+                      const vm = r.vm
+                      const open = expanded.has(vm.id)
+                      const label = scheduleStateLabel(vm)
+                      const dim = label === '关'
+                      const detailId = `vm-row-detail-${vm.id}`
+                      const max = claudeTier(vm).key === 'max'
+                      return (
+                        <div key={vm.id} role='rowgroup'>
+                          <div
+                            data-vm-row
+                            role='row'
+                            tabIndex={0}
+                            aria-expanded={open}
+                            aria-label={`${vm.id}，${label}。Enter 展开明细，Shift+Enter 打开详情`}
+                            className={cn(
+                              'group relative grid h-[38px] cursor-pointer border-b border-[color:var(--hairline)] bg-[var(--row-bg)] outline-none [--row-bg:var(--card)] hover:[--row-bg:color-mix(in_oklab,var(--muted)_55%,var(--card))] focus-visible:after:pointer-events-none focus-visible:after:absolute focus-visible:after:inset-0 focus-visible:after:z-[4] focus-visible:after:border-2 focus-visible:after:border-ring',
+                              open &&
+                                '[--row-bg:color-mix(in_oklab,var(--muted)_75%,var(--card))]'
+                            )}
+                            style={GRID}
+                            onClick={(e) => onRowClick(e, vm)}
+                            onKeyDown={(e) => onRowKey(e, vm)}
+                          >
+                            <div
+                              role='cell'
+                              className={cn(
+                                stickyLeft,
+                                'left-0 flex items-center justify-center',
+                                max &&
+                                  'shadow-[inset_2px_0_0_var(--tier-max-border)]'
+                              )}
+                            >
+                              <Button
+                                type='button'
+                                size='icon'
+                                variant='ghost'
+                                className='size-6 text-muted-foreground hover:text-foreground'
+                                title='打开详情页（Shift+Enter）'
+                                aria-label={`打开 ${vm.id} 详情页`}
+                                onClick={() => actions.openDetail(vm)}
+                              >
+                                <ExternalLink className='size-3.5' />
+                              </Button>
+                            </div>
+                            <div
+                              role='cell'
+                              className={cn(
+                                stickyLeft,
+                                'left-[34px] flex min-w-0 items-center gap-1.5 px-2 whitespace-nowrap',
+                                dim && 'opacity-50'
+                              )}
+                            >
+                              <ProdCell vm={vm} />
+                            </div>
+                            {COLS.map((c, i) => (
+                              <div
+                                key={c.label}
+                                role='cell'
+                                className={cn(
+                                  'flex min-w-0 items-center gap-[7px] overflow-hidden px-2 whitespace-nowrap',
+                                  c.num && NUM,
+                                  c.dim && 'text-muted-foreground',
+                                  // 调度列（第一列）保持可读，其余在关闭时淡出。
+                                  dim && i > 0 && 'opacity-50'
+                                )}
+                              >
+                                {c.cell(r, now)}
+                              </div>
+                            ))}
+                            <div
+                              role='cell'
+                              className='flex items-center justify-end gap-px pr-1'
+                            >
+                              <Button
+                                type='button'
+                                size='icon'
+                                variant='ghost'
+                                className='size-6 text-muted-foreground'
+                                aria-expanded={open}
+                                aria-controls={detailId}
+                                aria-label={`${open ? '收起' : '展开'} ${vm.id} 明细`}
+                                title='展开明细（Enter）'
+                                onClick={() => toggle(vm.id)}
+                              >
+                                <ChevronDown
+                                  className={cn(
+                                    'size-3.5 transition-transform duration-150 motion-reduce:transition-none',
+                                    open && 'rotate-180'
+                                  )}
+                                />
+                              </Button>
+                              <span className={SEC}>
+                                <VmActionMenu vm={vm} />
+                              </span>
+                            </div>
+                          </div>
+                          {open ? (
+                            <VmRowDetail
+                              id={detailId}
+                              vm={vm}
+                              accounts={accounts}
+                              now={now}
+                              onOpenDetail={() => actions.openDetail(vm)}
+                            />
+                          ) : null}
+                        </div>
                       )
-                    ) : null}
-                  </button>
-                ) : (
-                  c.label
-                )}
-              </div>
+                    })}
+              </Fragment>
             )
           })}
-          <div role='columnheader'>
-            <span className='sr-only'>操作</span>
-          </div>
         </div>
-        {rows.map((r) => {
-          const vm = r.vm
-          const open = expanded.has(vm.id)
-          const label = scheduleStateLabel(vm)
-          const dim = label === '关'
-          const detailId = `vm-row-detail-${vm.id}`
-          const max = claudeTier(vm).key === 'max'
-          return (
-            <div key={vm.id} role='rowgroup'>
-              <div
-                data-vm-row
-                role='row'
-                tabIndex={0}
-                aria-expanded={open}
-                aria-label={`${vm.id}，${label}。Enter 展开明细，Shift+Enter 打开详情`}
-                className={cn(
-                  'group relative grid h-[38px] cursor-pointer border-b border-[color:var(--hairline)] bg-[var(--row-bg)] outline-none [--row-bg:var(--card)] hover:[--row-bg:color-mix(in_oklab,var(--muted)_55%,var(--card))] focus-visible:after:pointer-events-none focus-visible:after:absolute focus-visible:after:inset-0 focus-visible:after:z-[4] focus-visible:after:border-2 focus-visible:after:border-ring',
-                  open &&
-                    '[--row-bg:color-mix(in_oklab,var(--muted)_75%,var(--card))]'
-                )}
-                style={GRID}
-                onClick={(e) => onRowClick(e, vm)}
-                onKeyDown={(e) => onRowKey(e, vm)}
-              >
-                <div
-                  role='cell'
-                  className={cn(
-                    stickyLeft,
-                    'left-0 flex items-center justify-center',
-                    max && 'shadow-[inset_2px_0_0_var(--tier-max-border)]'
-                  )}
-                >
-                  <Button
-                    type='button'
-                    size='icon'
-                    variant='ghost'
-                    className='size-6 text-muted-foreground hover:text-foreground'
-                    title='打开详情页（Shift+Enter）'
-                    aria-label={`打开 ${vm.id} 详情页`}
-                    onClick={() => actions.openDetail(vm)}
-                  >
-                    <ExternalLink className='size-3.5' />
-                  </Button>
-                </div>
-                <div
-                  role='cell'
-                  className={cn(
-                    stickyLeft,
-                    'left-[34px] flex min-w-0 items-center gap-1.5 px-2 whitespace-nowrap',
-                    dim && 'opacity-50'
-                  )}
-                >
-                  <ProdCell vm={vm} />
-                </div>
-                {COLS.map((c, i) => (
-                  <div
-                    key={c.label}
-                    role='cell'
-                    className={cn(
-                      'flex min-w-0 items-center gap-[7px] overflow-hidden px-2 whitespace-nowrap',
-                      c.num && NUM,
-                      c.dim && 'text-muted-foreground',
-                      // 调度列（第一列）保持可读，其余在关闭时淡出。
-                      dim && i > 0 && 'opacity-50'
-                    )}
-                  >
-                    {c.cell(r, now)}
-                  </div>
-                ))}
-                <div
-                  role='cell'
-                  className='flex items-center justify-end gap-px pr-1'
-                >
-                  <Button
-                    type='button'
-                    size='icon'
-                    variant='ghost'
-                    className='size-6 text-muted-foreground'
-                    aria-expanded={open}
-                    aria-controls={detailId}
-                    aria-label={`${open ? '收起' : '展开'} ${vm.id} 明细`}
-                    title='展开明细（Enter）'
-                    onClick={() => toggle(vm.id)}
-                  >
-                    <ChevronDown
-                      className={cn(
-                        'size-3.5 transition-transform duration-150 motion-reduce:transition-none',
-                        open && 'rotate-180'
-                      )}
-                    />
-                  </Button>
-                  <span className={SEC}>
-                    <VmActionMenu vm={vm} />
-                  </span>
-                </div>
-              </div>
-              {open ? (
-                <VmRowDetail
-                  id={detailId}
-                  vm={vm}
-                  accounts={accounts}
-                  now={now}
-                  onOpenDetail={() => actions.openDetail(vm)}
-                />
-              ) : null}
-            </div>
-          )
-        })}
       </div>
     </div>
   )

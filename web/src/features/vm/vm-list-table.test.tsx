@@ -168,3 +168,19 @@ describe('VM account column kernel label', () => {
     )
   })
 })
+
+describe('VM list summary and toggles', () => {
+  it('renders the fleet summary and both list toggles', () => {
+    const buckets = Array.from({ length: 48 }, (_, i): [number, number] =>
+      i === 47 ? [9, 1] : [0, 0]
+    )
+    const html = render({ health_24h: buckets, seats_used: 1, seats_max: 4 })
+    expect(html).toContain('aria-label="全局汇总"')
+    expect(html).toContain('>可接单</div>')
+    expect(html).toContain('>90.0%</b>')
+    expect(html).toContain('失败 1')
+    expect(html).toMatch(/aria-pressed="false"[^>]*>.*按状态分组/)
+    expect(html).toMatch(/aria-pressed="false"[^>]*>.*次要信息常显/)
+    expect(html).toContain('data-pin="false"')
+  })
+})
