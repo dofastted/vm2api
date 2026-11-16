@@ -20,7 +20,7 @@ import {
 } from '../../src/lib/vm/crag-license.mjs'
 import { cragSubscriptionPublicDirectory } from '../../src/lib/vm/crag-subscription-paths.mjs'
 import { publishKvmCragLicense } from '../../src/lib/vm/kvm-crag-license.mjs'
-import { startVmRuntime } from '../../src/lib/vm/vm-runtime.mjs'
+import { cragDockerAppArmorProfile, startVmRuntime } from '../../src/lib/vm/vm-runtime.mjs'
 import { bindPlacement, unbindPlacement } from '../../src/lib/cluster/placement.mjs'
 import { callRustKernel, streamRustKernel } from '../../src/lib/transport/rust-kernel-client.mjs'
 import {
@@ -105,7 +105,12 @@ test('starting a stopped host-licensed Docker slot repairs a missing entitlement
   const mounts = path.join(root, 'mounts.json')
   fs.writeFileSync(mounts, '[]')
   const profile = new URL('../../src/lib/vm/crag-v2-seccomp.json', import.meta.url)
-  const securityOpts = JSON.stringify(['no-new-privileges', `seccomp=${profile.pathname}`, 'apparmor=unconfined'])
+  const appArmor = cragDockerAppArmorProfile()
+  const securityOpts = JSON.stringify([
+    'no-new-privileges',
+    `seccomp=${profile.pathname}`,
+    ...(appArmor ? [`apparmor=${appArmor}`] : []),
+  ])
   fs.writeFileSync(
     path.join(root, 'docker'),
     `#!${process.execPath}
