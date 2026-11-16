@@ -706,6 +706,14 @@ function scrubTextBlock(block) {
 
 function scrubToolReferenceFields(block, rename) {
   if (!block || typeof block !== 'object') return { block, changed: false }
+  if (
+    (block.type === 'tool_addition' || block.type === 'tool_removal') &&
+    block.tool?.type === 'tool_reference' &&
+    typeof block.tool.name === 'string'
+  ) {
+    const name = rename(block.tool.name)
+    if (name !== block.tool.name) return { block: { ...block, tool: { ...block.tool, name } }, changed: true }
+  }
   if (block.type === 'tool_result' && Array.isArray(block.content)) {
     let changed = false
     const content = block.content.map((inner) => {
