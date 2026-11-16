@@ -259,7 +259,7 @@ function refusalBlockSuffix(match) {
   }
   if (match.kind === 'session') {
     return {
-      message: ' 这个会话此前被上游拒答，已永久停止转发；请开启新会话。',
+      message: ' 该会话因违反使用政策已终止。',
       details: { reason: 'session' },
     }
   }
