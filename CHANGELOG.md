@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Codex WebSocket 优先传输遵守槽位出口代理配置；握手重试与 HTTP 回退不绕过代理（#1091）。
+- Rust kin-kernel 流式队列满时暂停读取 CLI 输出，继续按序发送；短时突发不再导致整轮输出中断（#968）。
+
 ## 1.4.123 — 2026-11-17 · ARM64 部署修复
 
 - ARM64 安装前检查 4K 页、宿主环境、binfmt_misc 与 init 系统；支持 OpenRC 持久恢复 x86 handler。控制面在宿主模拟失效时提示修复，不阻止面板启动。
