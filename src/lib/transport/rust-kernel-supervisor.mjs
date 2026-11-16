@@ -1113,7 +1113,13 @@ export function writeKernelConfig(
     const followGlobal =
       routing?.inference?.session_slots != null &&
       (target.policy?.sessionSlotsOverride ?? target.session_slots_override) === false
-    config.session_slots = resolveSessionSlots(followGlobal ? {} : target, kernelRouting)
+    // crag-v2 refuses to start when session_slots exceeds the worker's physical
+    // slots ("session_slots exceeds physical capacity"), so the panel default
+    // (20) must not outgrow a plan-sized kernel (Pro 5, Max 5x 12).
+    config.session_slots = Math.min(
+      resolveSessionSlots(followGlobal ? {} : target, kernelRouting),
+      config.slots_per_worker,
+    )
     config.prewarm_enabled = kernelRouting.inference?.prewarm_enabled === true
     config.crag_kernel_version = 'v2'
     config.runtime_variant = 'crag-v2'

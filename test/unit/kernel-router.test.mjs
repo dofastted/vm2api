@@ -1275,6 +1275,28 @@ test('CRAG session policy follows the panel unless the VM pins its seat limit', 
   }
 })
 
+test('CRAG session_slots never exceeds the plan-sized kernel slots', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-crag-seat-cap-'))
+  const routing = { inference: { dataplane: 'crag', session_slots: 20 }, slot_capacity: { enabled: true } }
+  const pro = {
+    id: 'vm-10',
+    machine: { memory: '2g', pids_limit: 448 },
+    claude: { rate_limit_tier: 'default_claude_ai' },
+  }
+  const write = (slot) => JSON.parse(fs.readFileSync(writeKernelConfig(root, slot, { routing }).configPath, 'utf8'))
+  try {
+    const inherited = write(pro)
+    assert.equal(inherited.slots_per_worker, 5)
+    assert.equal(inherited.session_slots, 5)
+    const pinnedHigh = write({ ...pro, policy: { sessionSlots: 20, sessionSlotsOverride: true } })
+    assert.equal(pinnedHigh.session_slots, 5)
+    const pinnedLow = write({ ...pro, policy: { sessionSlots: 3, sessionSlotsOverride: true } })
+    assert.equal(pinnedLow.session_slots, 3)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('model effort changes rewrite kernel.json without a routing save or restart', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-effort-'))
   const routing = { compatibility: { persona_preset: 'official' } }
