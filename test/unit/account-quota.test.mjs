@@ -923,6 +923,22 @@ test('429 unified exhausted marks headers rejected without inventing official 10
   assert.equal(q.canAccept('acc-429').ok, false)
 })
 
+test('exhausted 429 with only a seven_day claim rejects 7d, not 5h', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ingestHeaders('acc-claim7', {
+    'anthropic-ratelimit-unified-5h-utilization': '0.1',
+    'anthropic-ratelimit-unified-5h-status': 'allowed',
+  })
+  q.ingestHeaders('acc-claim7', { 'anthropic-ratelimit-unified-representative-claim': 'seven_day' }, null, {
+    exhausted: true,
+    status: 429,
+    countRequest: false,
+  })
+  const acc = q.repo.get('acc-claim7')
+  assert.equal(acc.unified.headers['7d'].status, 'rejected')
+  assert.equal(acc.unified.headers['5h'].status, 'allowed')
+})
+
 test('local 429 without quota evidence does not reject the 5h window', () => {
   const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
   q.ingestHeaders('acc-local-429', {
