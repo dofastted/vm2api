@@ -328,7 +328,9 @@ describe('CRAG buyer presentation and activation wire', () => {
     try {
       expect(render()).toContain('id="crag-order-history"')
       click('查看订单')
-      expect(getElementById).toHaveBeenCalledExactlyOnceWith('crag-order-history')
+      expect(getElementById).toHaveBeenCalledExactlyOnceWith(
+        'crag-order-history'
+      )
       expect(section.focus).toHaveBeenCalledExactlyOnceWith({
         preventScroll: true,
       })
