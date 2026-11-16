@@ -27,6 +27,7 @@ import {
   verifyCragV2Tree,
 } from './wrap-cli-runtime.mjs'
 import { listVms } from './vm-registry.mjs'
+import { regenerateMachineIdentity } from './machine-spec.mjs'
 import { slotHost } from './slot-host.mjs'
 import {
   applyGeneratedFingerprint,
@@ -161,6 +162,15 @@ function keptAccount(prev) {
   return { claude, codex }
 }
 
+function recreatedMachine(prev, keep) {
+  const machine = prev?.machine && typeof prev.machine === 'object' ? prev.machine : null
+  const kvm = prev?.runtime?.type === 'kvm'
+  if (keep && machine && (!kvm || (machine.mac && machine.disk_serial))) return { machine: { ...machine } }
+  // traits, or a KVM record that never stored its identity: the container is already gone, so draw one.
+  if (machine || kvm) return { machine: regenerateMachineIdentity(machine) }
+  return {}
+}
+
 export function buildRecreatedVmRecord(prev, generated, { mode = 'traits' } = {}) {
   const keep = mode === 'keep'
   const pack = keep
@@ -220,6 +230,8 @@ export function buildRecreatedVmRecord(prev, generated, { mode = 'traits' } = {}
     proxy_cli_enabled: hasBoundExit(prev.proxy),
     seed_policy: defaultSeedPolicy(prev.seed_policy || {}),
     runtime: { type: prev.runtime?.type === 'kvm' ? 'kvm' : 'docker' },
+    // Sizing survives a reset; traits draws a new MAC / SMBIOS / disk serial. KVM cannot boot without them.
+    ...recreatedMachine(prev, keep),
     proxy_required: prev.proxy_required,
     ...(prev.inference_engine ? { inference_engine: prev.inference_engine } : {}),
     ...(prev.dataplane ? { dataplane: prev.dataplane } : {}),
