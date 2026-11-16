@@ -390,6 +390,33 @@ function foldSummarySystemTurns(messages) {
 }
 
 /**
+ * Temporary: CRAG 3.0.7 blocks a caller cache_control placed on a model-emitted
+ * history block (one carrying `caller`, e.g. tool_use) with CRAG_CACHE_CONTROL
+ * "Caller cache anchor changed in native history". Claude Code 2.1.325 puts a
+ * breakpoint on the previous assistant tool_use as well as the trailing
+ * tool_result; the official API accepts both. Drop only the one on the native
+ * block: the trailing breakpoint still covers the whole prefix.
+ */
+export function dropNativeBlockCacheAnchors(messages) {
+  if (!Array.isArray(messages)) return messages
+  let changed = false
+  const out = messages.map((message) => {
+    if (message?.role !== 'assistant' || !Array.isArray(message.content)) return message
+    if (!message.content.some((block) => block?.caller != null && block.cache_control != null)) return message
+    changed = true
+    return {
+      ...message,
+      content: message.content.map((block) => {
+        if (block?.caller == null || block.cache_control == null) return block
+        const { cache_control: _dropped, ...rest } = block
+        return rest
+      }),
+    }
+  })
+  return changed ? out : messages
+}
+
+/**
  * @param {object} body caller body, before cli-node persona injection
  * @param {{ preset?: 'official_full' | 'zero', officialPassthrough?: boolean, capabilities?: string[], agentSummary?: boolean, foldSystemMessages?: boolean }} [options]
  */
@@ -404,6 +431,7 @@ export function prepareCragPrintBody(
   } = {},
 ) {
   const out = { ...(body || {}) }
+  if (Array.isArray(out.messages)) out.messages = dropNativeBlockCacheAnchors(out.messages)
   if (agentSummary) out.messages = readOnlySummaryResults(out.messages)
   if (foldSystemMessages) {
     const folded = agentSummary ? foldSummarySystemTurns(out.messages) : foldSystemTurns(out.messages)
