@@ -9,7 +9,7 @@ import { claudeTier } from '@/lib/vm-status'
 import { ActiveVmBadge } from '@/features/vm/active-vm-badge'
 import { VmRentedMark } from '@/features/vm/vm-owner-line'
 
-function PlatformMark({ vm }: { vm: Vm }) {
+export function PlatformMark({ vm }: { vm: Vm }) {
   const gpt = isCodexVm(vm)
   const Icon = gpt ? OpenAI : ClaudeColor
   const label = gpt ? 'openai' : 'anthropic'
