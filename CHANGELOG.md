@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+## 1.4.122 — 2026-11-17 · CRAG 自动压缩修复
+
+- 出厂包与默认下载使用 [CRAG 3.1.3 Compact 修复版](https://github.com/dofastted/vm2api/releases/tag/payload-2026.11.17-crag-3.1.3)，修复 `/compact` 的上下文传输。保留 3.1.3 原标准版与 3.1.2 旧授权兼容版，不自动重装已安装内核。
 - 修复 [#1139](https://github.com/dofastted/vm2api/issues/1139)：CRAG 自动压缩遇到没有限流证据的 `429 rate_limit_error: Error` 时，停止本次请求的调度并返回原状态和错误，不换号、不冷却槽位、不标记额度耗尽。真实限流处理不变。
 
 ## 1.4.121 — 2026-11-17 · CRAG 设备购买与 VM 紧凑列表
