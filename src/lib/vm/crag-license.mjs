@@ -17,6 +17,7 @@ const MESSAGES = {
   license_not_yet_valid: 'The CRAG license is not yet valid. Check the UTC clock and activation date.',
   license_invalid: 'The CRAG registration code or device data is invalid.',
   license_binding_mismatch: 'This CRAG registration code belongs to a different VM or device.',
+  license_crag_host_over_quota: 'This VM exceeds the CRAG host subscription seat limit.',
   license_payload_key_mismatch:
     'The signed registration is for a different CRAG package. Request a grant for this package.',
   license_unconfigured: 'CRAG requires a configured encrypted native package and private Linux runtime storage.',
@@ -35,6 +36,7 @@ const STATES = {
   license_not_yet_valid: 'not_yet_valid',
   license_invalid: 'invalid',
   license_binding_mismatch: 'invalid',
+  license_crag_host_over_quota: 'invalid',
   license_payload_key_mismatch: 'invalid',
   license_unconfigured: 'unconfigured',
 }
@@ -823,10 +825,11 @@ function subscriptionBinding(
           permit.host_id !== entitlement.host_id ||
           permit.vm_id !== ctx.device.vm_id ||
           permit.machine_id_hash !== ctx.device.machine_id_hash ||
-          permit.device_public_key !== ctx.device.public_key ||
-          (entitlement.slot_limit !== 'unlimited' && permit.seat > entitlement.slot_limit)
+          permit.device_public_key !== ctx.device.public_key
         )
           fail('license_binding_mismatch')
+        if (entitlement.slot_limit !== 'unlimited' && permit.seat > entitlement.slot_limit)
+          fail('license_crag_host_over_quota')
         if (
           entitlement.version === 2 &&
           !entitlement.roster.some((entry) => entry.seat === permit.seat && entry.permit_sha256 === sha(slotPermit))

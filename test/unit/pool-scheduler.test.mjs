@@ -16,7 +16,10 @@ import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
 import { PanelUserStore } from '../../src/lib/admin/panel-users.mjs'
 import { persistVmOwner } from '../../src/lib/vm/vm-registry.mjs'
+import { activateCragSubscriptionBinding, prepareCragSubscriptionBinding } from '../../src/lib/vm/crag-license.mjs'
+import { cragSubscriptionPublicDirectory } from '../../src/lib/vm/crag-subscription-paths.mjs'
 import { kernelFaults } from '../../src/lib/transport/rust-kernel-client.mjs'
+import { issueHostEntitlement, issueSlotPermit, seedEncryptedPackage } from '../fixtures/crag-license.mjs'
 import {
   applyCrsIdentityReplace,
   rebuildOutboundSession,
@@ -454,6 +457,52 @@ test('adaptive reset level and manual level order ordinary candidates', async (t
   selected = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
   assert.equal(selected.accountId, 'account-1')
   selected.release()
+})
+
+test('only the CRAG seat outside the signed quota leaves the pool, including a live worker with stale selection', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  seedEncryptedPackage(root)
+  const hostId = 'a'.repeat(64)
+  const publicDir = cragSubscriptionPublicDirectory(root)
+  fs.mkdirSync(publicDir, { recursive: true, mode: 0o755 })
+  fs.writeFileSync(path.join(publicDir, 'host_id'), hostId)
+  const publish = (revision, slotLimit) => {
+    const { code } = issueHostEntitlement(root, hostId, { revision, slot_limit: slotLimit })
+    fs.writeFileSync(path.join(publicDir, 'entitlement.code'), code)
+  }
+  publish(1, 2)
+  for (const [index, id] of ['vm-01', 'vm-02'].entries()) {
+    const record = path.join(root, 'vms', `${id}.json`)
+    const vm = JSON.parse(fs.readFileSync(record, 'utf8'))
+    vm.dataplane = index === 0 ? 'crag' : 'wrap'
+    vm.policy.priority = index
+    fs.writeFileSync(record, JSON.stringify(vm))
+    const directory = path.join(root, 'vms', id)
+    fs.mkdirSync(directory, { recursive: true })
+    fs.writeFileSync(path.join(directory, 'machine-id'), `${index + 1}`.repeat(32))
+    const machineCode = prepareCragSubscriptionBinding(root, vm)
+    const { code } = issueSlotPermit(root, machineCode, hostId, { seat: index + 1 })
+    activateCragSubscriptionBinding(root, vm, code)
+  }
+  const pool = scheduler(root, { workerHealth: async () => ({ ok: true, runtime_variant: 'crag-v2' }) })
+  const candidates = await pool.eligibleCandidates({ model: 'claude-test' })
+  assert.deepEqual(
+    candidates.map(({ vmId }) => vmId),
+    ['vm-01', 'vm-02'],
+  )
+  publish(2, 1)
+  assert.equal(pool.reserve(candidates[1]), null, 'revalidate an already selected candidate after a downgrade')
+  const select = () => pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  const retained = await select()
+  assert.equal(retained.vmId, 'vm-01')
+  retained.release()
+  const overflow = path.join(root, 'vms', 'vm-02.json')
+  assert.equal(JSON.parse(fs.readFileSync(overflow, 'utf8')).schedulable, true)
+  publish(3, 2)
+  const restored = await pool.selectAndReserve({ model: 'claude-test', allowWait: false, excluded: new Set(['vm-01']) })
+  assert.equal(restored.vmId, 'vm-02')
+  restored.release()
 })
 
 test('soft-paused but schedulable account stays eligible', async (t) => {

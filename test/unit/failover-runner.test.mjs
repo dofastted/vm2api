@@ -74,6 +74,33 @@ function success(text = 'ok') {
   }
 }
 
+test('a CRAG quota change after selection skips that VM without a cooldown or upstream replay', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({ scheduler })
+  const visited = []
+  const result = await runner.run({
+    requestId: 'crag-seat-downgrade',
+    model: 'claude-sonnet-test',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    callAttempt: ({ candidate: selected }) => {
+      visited.push(selected.vmId)
+      return selected.vmId === 'vm-01'
+        ? {
+            ok: false,
+            status: 403,
+            terminalState: 'rejected',
+            upstreamExecutions: 0,
+            body: { type: 'error', error: { type: 'permission_error', code: 'license_crag_host_over_quota' } },
+          }
+        : success()
+    },
+  })
+  assert.deepEqual(visited, ['vm-01', 'vm-02'])
+  assert.equal(result.ok, true)
+  assert.equal(result.attemptCount, 1)
+  assert.deepEqual(scheduler.cooldowns, [])
+})
+
 test('failed attempt logging returns the permit without dispatch or failover', async () => {
   let releases = 0
   const scheduler = new Scheduler([])

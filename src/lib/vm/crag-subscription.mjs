@@ -64,7 +64,7 @@ const usageUnverified = () =>
 const overQuota = () =>
   cragLicenseDeniedResult({
     code: 'license_crag_host_over_quota',
-    error: '宿主机运行中的 CRAG 内核超过订阅槽位。请停用、退役或切回标准内核，或兑换足够额度后重试。',
+    error: '宿主订阅的运行槽位已满，无法启动此 CRAG 槽位。请释放运行名额或增加订阅额度。',
   })
 
 function runtimeDenial(denial) {
@@ -559,7 +559,7 @@ export function createCragSubscription({
         const occupying = new Set(runtimeReservations)
         let uncertain = false
         for (const [id, entry] of Object.entries(runtime.vms)) {
-          if (id === vm.id || entry.scope === 'independent') continue
+          if (id === vm.id || entry.scope === 'independent' || entry.quota_blocked) continue
           if (entry.state === 'running') occupying.add(id)
           else if (!entry.stopped_confirmed && !entry.non_crag_confirmed) {
             occupying.add(id)
@@ -606,7 +606,7 @@ export function createCragSubscription({
   }
 
   async function admitInference({ vm, routing, health } = {}) {
-    if (!runtimeInventory || !vm?.id) return null
+    if (!vm?.id) return null
     const liveCrag = health?.runtime_variant === 'crag-v2' || (!health?.runtime_variant && health?.dataplane === 'crag')
     if (!liveCrag && resolveKernelDataplane(vm, routing) !== 'crag') return null
     let hostId
@@ -623,18 +623,21 @@ export function createCragSubscription({
         }
         return null
       }
-      let rights = readLocalRights()
-      if (localKvm) {
-        if (busy || rights.pending || !rights.claims) return usageUnverified()
-        const { license } = getCragLicense(projectRoot, vm)
-        if (!license.valid) {
+      const rights = readLocalRights()
+      if (rights.pending || !rights.claims || (localKvm && busy)) return usageUnverified()
+      const { license } = getCragLicense(projectRoot, vm)
+      if (!license.valid) {
+        if (localKvm) {
           try {
             await blockKvmBinding(projectRoot, vm)
           } catch {
             // A delivery failure does not change the verified reason this request is denied.
           }
-          return cragLicenseDeniedResult({ code: license.code, error: license.message })
         }
+        return cragLicenseDeniedResult({ code: license.code, error: license.message })
+      }
+      if (license.scope !== 'host') return usageUnverified()
+      if (localKvm) {
         try {
           if ((await publishKvmBinding(projectRoot, vm)) !== true) return usageUnverified()
         } catch {
@@ -645,41 +648,19 @@ export function createCragSubscription({
         }
         if (busy || !unchangedRights(rights, readLocalRights())) return usageUnverified()
       }
-      if (vm.node_id) {
-        if (rights.pending || !rights.claims) return usageUnverified()
-        if (vm.status === 'running' && getCragLicense(projectRoot, vm).license.valid) {
-          try {
-            const publishSlot = isKvmRuntime(vm) ? publishKvmBinding : publishClusterBinding
-            if ((await publishSlot(projectRoot, vm)) === false) return usageUnverified()
-          } catch {
-            return cragLicenseDeniedResult({
-              code: 'license_crag_slot_sync_failed',
-              error: '槽位授权未同步，请检查槽位连接后重试。',
-            })
-          }
-          if (!unchangedRights(rights, readLocalRights())) return usageUnverified()
+      if (vm.node_id && vm.status === 'running') {
+        try {
+          const publishSlot = isKvmRuntime(vm) ? publishKvmBinding : publishClusterBinding
+          if ((await publishSlot(projectRoot, vm)) === false) return usageUnverified()
+        } catch {
+          return cragLicenseDeniedResult({
+            code: 'license_crag_slot_sync_failed',
+            error: '槽位授权未同步，请检查槽位连接后重试。',
+          })
         }
+        if (!unchangedRights(rights, readLocalRights())) return usageUnverified()
       }
-      const deadline = performance.now() + 4000
-      for (let pass = 0; pass < 2; pass++) {
-        if (rights.pending || !rights.claims) return usageUnverified()
-        if (rights.claims.expires_at <= Math.floor(Date.now() / 1000)) return null
-        const timeoutMs = deadline - performance.now()
-        if (timeoutMs <= 0) return usageUnverified()
-        const runtime = await runtimeInventory.snapshot({
-          ...rights,
-          hostOnly: true,
-          currentHop: { id: vm.id, health },
-          timeoutMs,
-        })
-        const next = readLocalRights()
-        if (localKvm && (busy || !unchangedRights(rights, next))) return usageUnverified()
-        if (unchangedRights(rights, next)) {
-          if (runtime.host_over_limit === true) return overQuota()
-          return runtime.host_over_limit === false ? null : usageUnverified()
-        }
-        rights = next
-      }
+      return null
     } catch {
       // A malformed host permit or unreadable local quota cannot authorize a new hop.
     }

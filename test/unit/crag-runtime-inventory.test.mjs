@@ -135,7 +135,7 @@ test('signed downgrade counts both live processes but keeps independent and prei
   const rights = f.entitlement(1, { revision: 2 })
   const over = await inv.snapshot(rights)
   assert.equal(over.running_vms, 3)
-  assert.equal(over.ready_vms, 1)
+  assert.equal(over.ready_vms, 2)
   assert.equal(over.host_running_vms, 2)
   assert.equal(over.host_runtime_available, 0)
   assert.equal(over.host_over_limit, true)
@@ -153,7 +153,10 @@ test('signed downgrade counts both live processes but keeps independent and prei
     queued: 0,
     ready_slots: 1,
   })
-  assert.equal(over.vms[main.id].ready, false)
+  assert.equal(over.vms[main.id].ready, true)
+  assert.equal(over.vms[main.id].quota_blocked, undefined)
+  assert.equal(over.vms[extra.id].ready, false)
+  assert.equal(over.vms[extra.id].quota_blocked, true)
   const hostOnly = await inv.snapshot({ ...rights, hostOnly: true })
   assert.deepEqual(Object.keys(hostOnly.vms).sort(), [main.id, extra.id])
   states.set(extra.id, 'unknown')
@@ -161,6 +164,7 @@ test('signed downgrade counts both live processes but keeps independent and prei
   const uncertain = await inv.snapshot(rights)
   assert.equal(uncertain.host_unknown_vms, 1)
   assert.equal(uncertain.host_over_limit, null)
+  assert.equal(uncertain.vms[main.id].ready, true)
   states.set(extra.id, 'stopped')
   f.advance()
   const inQuota = await inv.snapshot(rights)
@@ -196,6 +200,8 @@ test('the same quota counts Docker and KVM even when the guest version is not re
   assert.equal(result.host_running_vms, 2)
   assert.equal(result.host_runtime_available, 0)
   assert.equal(result.host_over_limit, true)
+  assert.equal(result.vms[docker.id].ready, true)
+  assert.equal(result.vms[guest.id].quota_blocked, true)
 })
 
 test('H1 and H2 limits use fresh rights and corrupted permits give an upper bound, not confirmed use', async (t) => {
@@ -258,7 +264,7 @@ test('local KVM subscriptions share the host limit and missing guest evidence st
   const docker = f.add('vm-11')
   const kvm = f.add('vm-12', { runtime: { type: 'kvm' } })
   kvm.fingerprint = { guest_machine_id: fs.readFileSync(path.join(f.root, 'vms', kvm.id, 'machine-id'), 'utf8').trim() }
-  f.bind(docker, 1)
+  const dockerPermit = f.bind(docker, 1)
   const roster = [f.bind(kvm, 2)]
   const relay = http.createServer(() => assert.fail('fixture should use injected health'))
   relay.listen(f.run(kvm, 'kernel.sock'))
@@ -275,16 +281,21 @@ test('local KVM subscriptions share the host limit and missing guest evidence st
       return live
     },
   })
-  const over = await inv.snapshot({ ...f.entitlement(1, { revision: 2 }), hostOnly: true })
+  const over = await inv.snapshot({ ...f.entitlement(1, { revision: 2, roster: [dockerPermit] }), hostOnly: true })
   assert.equal(over.host_running_vms, 2)
   assert.equal(over.host_over_limit, true)
   assert.equal(over.host_runtime_available, 0)
+  assert.equal(over.vms[docker.id].ready, true)
   assert.equal(over.vms[kvm.id].scope, 'host')
   assert.equal(over.vms[kvm.id].ready, false)
+  assert.equal(over.vms[kvm.id].quota_blocked, true)
 
   reply = { status: 0, code: 'ECONNREFUSED' }
   f.advance()
-  const uncertain = await inv.snapshot({ ...f.entitlement(2, { revision: 3 }), hostOnly: true })
+  const uncertain = await inv.snapshot({
+    ...f.entitlement(2, { revision: 3, roster: [dockerPermit, ...roster] }),
+    hostOnly: true,
+  })
   assert.equal(uncertain.host_running_vms, 1)
   assert.equal(uncertain.host_unknown_vms, 1)
   assert.equal(uncertain.host_runtime_available, null)

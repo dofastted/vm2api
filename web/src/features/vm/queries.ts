@@ -47,6 +47,7 @@ export function vmQueryOptions(id: string) {
 export type CragRuntimeVm = {
   state: 'running' | 'not_running' | 'unknown'
   ready: boolean
+  quota_blocked?: true
   scope: 'host' | 'independent' | 'unknown'
   version: string | null
   active_requests: number | null

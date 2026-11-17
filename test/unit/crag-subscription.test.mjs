@@ -217,7 +217,7 @@ test('KVM entitlement changes block old copies, serialize publishers and recover
   let blockFails = false
   let publishFails = false
   let authorityRejects = false
-  let renewDuringProbe = false
+  let renewDuringPublish = false
   let mutations = 0
   const { root, connect, publicDir } = standaloneHost(t, async (url, { body }) => {
     const request = JSON.parse(body)
@@ -250,15 +250,6 @@ test('KVM entitlement changes block old copies, serialize publishers and recover
   service = connect({
     listTargets: () => [vm],
     assertReady: () => true,
-    runtimeInventory: {
-      async snapshot({ currentHop } = {}) {
-        if (renewDuringProbe && currentHop) {
-          renewDuringProbe = false
-          await service.redeem(voucher())
-        }
-        return { host_over_limit: false }
-      },
-    },
     blockKvmBinding: async () => {
       if (blockFails) throw Object.assign(new Error('guest transport failed'), { code: 'test_block_failed' })
       blocked = true
@@ -266,6 +257,10 @@ test('KVM entitlement changes block old copies, serialize publishers and recover
     },
     publishKvmBinding: async () => {
       if (publishFails) throw new Error('guest delivery failed')
+      if (renewDuringPublish) {
+        renewDuringPublish = false
+        await service.redeem(voucher())
+      }
       copy = readCragSubscriptionFiles(root, vm)
       assert.ok(copy)
       blocked = false
@@ -310,7 +305,7 @@ test('KVM entitlement changes block old copies, serialize publishers and recover
   assert.equal(blocked, false)
   assert.equal(copy.entitlement, rights.code)
 
-  renewDuringProbe = true
+  renewDuringPublish = true
   assert.equal((await service.admitInference({ vm })).body.error.code, 'license_crag_host_usage_unverified')
   assert.equal(await service.admitInference({ vm }), null)
 
@@ -857,58 +852,6 @@ test('status retries changed signed rights or pending state once and omits faile
   }
 })
 
-test('admission retries local rights once within the original quota deadline', async (testContext) => {
-  for (const mode of ['downgrade', 'changing', 'pending']) {
-    await testContext.test(mode, async (subtest) => {
-      let issued
-      const { root, publicDir, connect } = standaloneHost(subtest, async (url, { body }) => {
-        const request = JSON.parse(body)
-        issued ??= issueHostEntitlement(root, request.host_id)
-        if (url.endsWith('/bind')) {
-          const permit = issueSlotPermit(root, request.machine_code, request.host_id, { seat: 1 })
-          return Response.json({ ok: true, data: { entitlement: issued.code, slot_permit: permit.code, seat: 1 } })
-        }
-        return Response.json({ ok: true, data: { entitlement: issued.code, ...issued.claims } })
-      })
-      seedEncryptedPackage(root)
-      const vm = { id: 'vm-51', dataplane: 'crag', crag_kernel_version: 'v2' }
-      const directory = path.join(root, 'vms', vm.id)
-      fs.mkdirSync(directory, { recursive: true })
-      fs.writeFileSync(path.join(directory, 'machine-id'), crypto.randomBytes(16).toString('hex'))
-      const options = { listTargets: () => [vm], assertReady: () => true, isSlotEnabled: undefined }
-      const initial = connect(options)
-      await initial.redeem(voucher())
-      await initial.bind(vm)
-      const waits = []
-      const service = connect({
-        ...options,
-        runtimeInventory: {
-          snapshot: async ({ hostId, claims, hostOnly, timeoutMs }) => {
-            assert.equal(hostOnly, true)
-            waits.push(timeoutMs)
-            if (waits.length === 1) await new Promise((resolve) => setTimeout(resolve, 25))
-            if (mode === 'pending') {
-              fs.writeFileSync(path.join(publicDir, 'sync-pending'), 'pending\n', { mode: 0o644 })
-            } else if (waits.length === 1 || mode === 'changing') {
-              issued = issueHostEntitlement(root, hostId, { revision: claims.revision + 1, slot_limit: 1 })
-              fs.writeFileSync(path.join(publicDir, 'entitlement.code'), issued.code)
-            }
-            return { host_over_limit: claims.slot_limit === 1 }
-          },
-        },
-      })
-      const result = await service.admitInference({ vm })
-      assert.equal(
-        result.body.error.code,
-        mode === 'downgrade' ? 'license_crag_host_over_quota' : 'license_crag_host_usage_unverified',
-      )
-      assert.equal(waits.length, mode === 'pending' ? 1 : 2)
-      assert.ok(waits[0] > 0 && waits[0] <= 4000)
-      if (waits.length === 2) assert.ok(waits[1] > 0 && waits[1] <= waits[0] - 10)
-    })
-  }
-})
-
 test('remaining capacity requires confirmed usage or a signed roster, never runtime observations', async (testContext) => {
   for (const version of [1, 2]) {
     for (const expired of [false, true]) {
@@ -1182,14 +1125,16 @@ test('runtime quota follows a signed downgrade, unknown observations, and Author
   assert.equal(status.runtime.running_vms, 3)
   assert.equal(status.runtime.host_runtime_available, 0)
   assert.equal(status.runtime.host_over_limit, true)
-  assert.equal((await recovered.admitInference({ vm: slots[0] })).body.error.code, 'license_crag_host_over_quota')
+  assert.equal(await recovered.admitInference({ vm: slots[0] }), null)
+  assert.equal((await recovered.admitInference({ vm: slots[1] })).body.error.code, 'license_crag_host_over_quota')
   assert.equal(await recovered.admitInference({ vm: independent }), null)
   assert.equal(await recovered.admitInference({ vm: dormant }), null)
 
   authorityOffline = true
   observations.set(slots[1].id, 'unknown')
   observedAt += 2100
-  assert.equal((await recovered.admitInference({ vm: slots[0] })).body.error.code, 'license_crag_host_usage_unverified')
+  assert.equal(await recovered.admitInference({ vm: slots[0] }), null)
+  assert.equal((await recovered.admitInference({ vm: slots[1] })).body.error.code, 'license_crag_host_over_quota')
   observations.set(slots[1].id, 'stopped')
   observedAt += 2100
   const stopped = await recovered.status()
@@ -1197,10 +1142,24 @@ test('runtime quota follows a signed downgrade, unknown observations, and Author
   assert.equal(stopped.runtime.host_over_limit, false)
   assert.equal(stopped.available_slots, undefined, 'local probes do not substitute for Authority capacity')
   assert.equal(await recovered.admitInference({ vm: slots[0] }), null)
-  assert.equal(checkCragLicense(root, slots[1]).ok, false, 'stopping does not legalize the out-of-range seat')
+  assert.equal(checkCragLicense(root, slots[1]).code, 'license_crag_host_over_quota')
   observations.set(slots[1].id, 'running')
   observedAt += 2100
-  assert.equal((await recovered.admitInference({ vm: slots[0] })).body.error.code, 'license_crag_host_over_quota')
+  assert.equal(await recovered.admitInference({ vm: slots[0] }), null)
+  assert.equal((await recovered.admitInference({ vm: slots[1] })).body.error.code, 'license_crag_host_over_quota')
+
+  const limited = connect({ runtimeInventory: { snapshot: () => assert.fail('inference must not probe other slots') } })
+  assert.equal(await limited.admitInference({ vm: slots[0] }), null)
+  assert.equal((await limited.admitInference({ vm: slots[1] })).body.error.code, 'license_crag_host_over_quota')
+  assert.equal(
+    (await recovered.withRuntimeAdmission(slots[0], {}, () => ({ ok: true }))).ok,
+    true,
+    'the out-of-range process cannot prevent recovery of the in-quota slot',
+  )
+  assert.equal(
+    (await recovered.withRuntimeAdmission(slots[1], {}, () => assert.fail('over-quota slot must not start'))).code,
+    'license_crag_host_over_quota',
+  )
 })
 
 test('H2 reissues the same KVM seat when changing payload keys and recovers a lost response', async (t) => {

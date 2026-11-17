@@ -47,6 +47,24 @@ test('CRAG host capacity rejections stop without an account or egress cooldown',
   }
 })
 
+test('a locally rejected CRAG quota hop can move to another slot without cooling down', () => {
+  const code = 'license_crag_host_over_quota'
+  const rejected = {
+    ok: false,
+    status: 403,
+    terminalState: 'rejected',
+    upstreamExecutions: 0,
+    body: { type: 'error', error: { type: 'permission_error', code } },
+  }
+  const policy = classifyUpstreamResult(rejected)
+  assert.equal(policy.reason, code)
+  assert.equal(policy.scope, 'worker')
+  assert.equal(policy.action, 'continue')
+  assert.equal(policy.retrySameAccount, false)
+  assert.equal(policy.cooldownUntil, null)
+  assert.equal(classifyUpstreamResult({ ...rejected, committed: true }).action, 'stop')
+})
+
 test('unified account 429 without reset header uses usage window then 30 minutes', () => {
   const now = 1_700_000_000_000
   const usageReset = now + 3_600_000
