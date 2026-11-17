@@ -1,4 +1,5 @@
 import { inferClaudeTier } from './claude-tier.mjs'
+import { isFableModel } from './upstream-error-policy.mjs'
 import { getModelEntry, getPolicyCatalogIds, resolvePolicyModelId } from '../protocol/model-policy.mjs'
 import { getGptPolicyCatalogIds, listImageToolModels, resolveGptFastAlias } from '../protocol/gpt-model-policy.mjs'
 import { isCodexCatalogModel } from '../protocol/models.mjs'
@@ -140,7 +141,7 @@ export function resolveSlotTier(vm, account = null) {
   ).key
 }
 
-export function slotAllowsModel({ vm, account = null, model } = {}) {
+export function slotAllowsModel({ vm, account = null, model, fableRequiresMax = false } = {}) {
   const requestedModel = String(model || '').trim()
   const fast = resolveGptFastAlias(requestedModel)
   if (fast.kind === 'unavailable') return { ok: false, reason: 'model_fast_unavailable' }
@@ -152,6 +153,11 @@ export function slotAllowsModel({ vm, account = null, model } = {}) {
     return { ok: false, reason: 'claude_model_required' }
   }
   const canonical = resolvePolicyModelId(modelKey) || modelKey
+  // Before the per-account denial: a Pro slot is out for the plan, which is
+  // what the caller should hear, whatever else was recorded on it.
+  if (fableRequiresMax && isFableModel(modelKey) && resolveSlotTier(vm, account) !== 'max') {
+    return { ok: false, reason: 'fable_requires_max' }
+  }
   const deniedUntil = Number(account?.unified?.model_denied_until?.[canonical]) || 0
   if (deniedUntil > Date.now()) return { ok: false, reason: 'model_not_supported' }
   const allowed = normalizeAllowedModels(vm?.policy?.allowed_models)
