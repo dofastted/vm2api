@@ -29,7 +29,7 @@ export type ApiKeyItem = {
   requests?: number
   inflight?: number
   /** all = 全局可调度。anthropic / openai 必须带 allowed_vms。 */
-  group_type?: 'all' | 'anthropic' | 'openai'
+  group_type?: 'all' | 'anthropic' | 'openai' | 'gemini'
   allowed_vms?: string[]
   vm_pool_id?: string | null
   vm_pool_name?: string | null

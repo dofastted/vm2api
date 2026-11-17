@@ -84,7 +84,9 @@ function StatsBody({ item, vms }: { item: ApiKeyItem; vms: Vm[] }) {
           ? 'Anthropic'
           : item.group_type === 'openai'
             ? 'OpenAI'
-            : '全局'}
+            : item.group_type === 'gemini'
+              ? 'Gemini'
+              : '全局'}
         {' · '}近 {usage?.days ?? 30} 天 · 官方价
       </div>
       {q.isLoading ? (

@@ -1,5 +1,10 @@
 import { useState } from 'react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  queryOptions,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import { api } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -9,7 +14,7 @@ import { Label } from '@/components/ui/label'
 const ROOT = '/api/panel/gemini'
 const QUERY_KEY = ['panel', 'gemini-environments'] as const
 
-type Environment = {
+export type GeminiEnvironment = {
   id: string
   name: string
   proxy_id: string
@@ -43,7 +48,7 @@ type Inventory = {
   available: boolean
   payload_state?:
     'installed' | 'install_on_create' | 'not_configured' | 'invalid'
-  environments: Environment[]
+  environments: GeminiEnvironment[]
 }
 type Authorization = { url: string; attempt_id: string }
 type Proxy = {
@@ -57,7 +62,7 @@ type Proxy = {
   blocked_reason?: string
 }
 
-const AUTH_LABELS: Record<Environment['auth_state'], string> = {
+const AUTH_LABELS: Record<GeminiEnvironment['auth_state'], string> = {
   unverified: '未授权',
   authorizing: '等待 Google 授权',
   authorized: '已授权',
@@ -78,10 +83,24 @@ function localTime(value?: string | null) {
   return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString()
 }
 
-function EnvironmentData({ environment }: { environment: Environment }) {
+function EnvironmentData({ environment }: { environment: GeminiEnvironment }) {
   const account = environment.account
   return (
     <dl className='grid gap-2 text-sm sm:grid-cols-2 lg:grid-cols-3'>
+      <div>
+        <dt className='text-muted-foreground'>凭证</dt>
+        <dd>{AUTH_LABELS[environment.auth_state]}</dd>
+      </div>
+      <div>
+        <dt className='text-muted-foreground'>推理</dt>
+        <dd>{environment.runtime_ready ? '就绪' : '当前载荷未启用推理'}</dd>
+      </div>
+      <div>
+        <dt className='text-muted-foreground'>付费调用</dt>
+        <dd>
+          {environment.billing_ready ? '可用' : '关闭 · 缺少官方逐回合结算'}
+        </dd>
+      </div>
       <div>
         <dt className='text-muted-foreground'>环境 ID</dt>
         <dd className='break-all'>{environment.id}</dd>
@@ -157,13 +176,8 @@ function EnvironmentData({ environment }: { environment: Environment }) {
   )
 }
 
-export function GeminiEnvironments({
-  view = 'import',
-}: {
-  view?: 'import' | 'vm'
-}) {
-  const client = useQueryClient()
-  const inventory = useQuery({
+export function geminiInventoryOptions() {
+  return queryOptions({
     queryKey: QUERY_KEY,
     queryFn: () => api<Inventory>(ROOT),
     retry: false,
@@ -174,10 +188,20 @@ export function GeminiEnvironments({
         ? 1500
         : false,
   })
+}
+
+export function GeminiEnvironments({
+  environmentId,
+}: {
+  environmentId?: string
+}) {
+  const isImport = !environmentId
+  const client = useQueryClient()
+  const inventory = useQuery(geminiInventoryOptions())
   const proxies = useQuery({
     queryKey: ['panel', 'gemini-egress-options'],
     queryFn: () => api<{ proxies: Proxy[] }>('/api/panel/proxies'),
-    enabled: view === 'import' && inventory.data?.available === true,
+    enabled: isImport && inventory.data?.available === true,
   })
   const exits = (proxies.data?.proxies ?? []).filter(
     (proxy) =>
@@ -192,13 +216,14 @@ export function GeminiEnvironments({
   const [name, setName] = useState('')
   const [proxyId, setProxyId] = useState('')
   const [authMethod, setAuthMethod] =
-    useState<Environment['auth_method']>('oauth')
+    useState<GeminiEnvironment['auth_method']>('oauth')
   const [apiKey, setApiKey] = useState('')
   const [challenge, setChallenge] = useState<
     (Authorization & { id: string }) | null
   >(null)
   const [code, setCode] = useState('')
   const [deleteId, setDeleteId] = useState<string | null>(null)
+  const [createdId, setCreatedId] = useState<string | null>(null)
 
   const operation = useMutation({
     mutationFn: async (action: {
@@ -208,7 +233,7 @@ export function GeminiEnvironments({
     }) => {
       const resource = `${ROOT}/environments${action.id ? `/${encodeURIComponent(action.id)}` : ''}`
       if (action.type === 'create') {
-        const environment = await api<Environment>(resource, {
+        const environment = await api<GeminiEnvironment>(resource, {
           method: 'POST',
           body: JSON.stringify({
             name,
@@ -228,6 +253,7 @@ export function GeminiEnvironments({
         )
         setName('')
         setApiKey('')
+        setCreatedId(environment.id)
         return
       }
       if (action.type === 'authorize' && action.id) {
@@ -242,7 +268,7 @@ export function GeminiEnvironments({
         if (!challenge || challenge.id !== action.id) {
           throw new Error('授权会话已失效，请重新发起 Google 授权。')
         }
-        await api<Environment>(`${resource}/authorization`, {
+        await api<GeminiEnvironment>(`${resource}/authorization`, {
           method: 'PUT',
           body: JSON.stringify({
             attempt_id: challenge.attempt_id,
@@ -262,12 +288,11 @@ export function GeminiEnvironments({
     onSettled: () => client.invalidateQueries({ queryKey: QUERY_KEY }),
   })
 
-  if (inventory.isPending && view === 'import')
+  if (inventory.isPending)
     return <p role='status'>正在检测 Gemini 宿主机服务…</p>
-  if (inventory.isError && view === 'import')
-    return <p role='alert'>读取 Gemini 环境失败。</p>
+  if (inventory.isError) return <p role='alert'>读取 Gemini 环境失败。</p>
   if (!inventory.data?.available)
-    return view === 'vm' ? null : (
+    return (
       <p role='status'>
         此宿主机尚未启用 Gemini。请先在宿主运行{' '}
         <code>deploy/install.sh prepare-gemini</code>，再刷新面板。
@@ -275,30 +300,22 @@ export function GeminiEnvironments({
     )
   const payloadState = inventory.data.payload_state
   const canInstall = payloadState !== 'not_configured'
+  const selectedId = environmentId || createdId
+  const environment = inventory.data.environments.find(
+    (item) => item.id === selectedId
+  )
 
   return (
-    <section
-      className={
-        view === 'vm' ? 'mt-8 space-y-4 border-t pt-5' : 'max-w-3xl space-y-4'
-      }
-      aria-label='Gemini 宿主环境'
-    >
-      {view === 'vm' ? (
-        <div className='flex flex-wrap items-center justify-between gap-2'>
-          <h2 className='text-lg font-semibold'>Gemini 宿主环境</h2>
-          <Link
-            to='/import'
-            hash='gemini'
-            className='text-sm text-primary underline'
-          >
-            导入 Gemini
-          </Link>
-        </div>
+    <section className='max-w-3xl space-y-4' aria-label='Gemini 宿主环境'>
+      {isImport ? (
+        <p className='text-sm text-muted-foreground'>
+          在宿主机创建环境，不创建虚拟机。必须绑定 IPv4 SOCKS5 代理。已有账号在{' '}
+          <Link to='/vm' className='text-primary underline'>
+            虚拟机
+          </Link>{' '}
+          管理。
+        </p>
       ) : null}
-      <p className='text-sm text-muted-foreground'>
-        在宿主机创建环境，不创建虚拟机。支持 Google 授权和 Gemini API
-        Key，必须绑定 IPv4 SOCKS5 代理。
-      </p>
       {payloadState === 'install_on_create' ? (
         <p role='status'>首次创建时自动校验并安装 Gemini 内核和官方 CLI。</p>
       ) : null}
@@ -308,7 +325,7 @@ export function GeminiEnvironments({
       {payloadState === 'invalid' ? (
         <p role='alert'>Gemini 载荷校验失败，请检查安装源及宿主服务日志。</p>
       ) : null}
-      {view === 'import' ? (
+      {isImport ? (
         <form
           className='space-y-3'
           onSubmit={(event) => {
@@ -401,27 +418,21 @@ export function GeminiEnvironments({
             创建 Gemini 环境
           </Button>
         </form>
-      ) : !inventory.data.environments.length ? (
-        <p className='text-sm text-muted-foreground'>尚无 Gemini 环境。</p>
+      ) : !environment ? (
+        <p role='status' className='text-sm text-muted-foreground'>
+          Gemini 环境已删除或不可用。
+        </p>
       ) : null}
       {operation.isError ? (
         <p role='alert' className='text-sm text-destructive'>
           {operation.error.message}
         </p>
       ) : null}
-      {inventory.data.environments.map((environment) => (
-        <article
-          key={environment.id}
-          className='space-y-3 rounded-md border p-4'
-        >
-          <h3 className='font-medium'>{environment.name}</h3>
-          <p className='text-sm text-muted-foreground'>
-            {environment.auth_method === 'api_key' ? 'API Key' : 'Google OAuth'}{' '}
-            · 代理 {environment.proxy_id} ·{' '}
-            {AUTH_LABELS[environment.auth_state]} ·{' '}
-            {environment.runtime_ready ? '运行就绪' : '运行未就绪'} ·{' '}
-            {environment.billing_ready ? '计费可用' : '官方计费未核实'}
-          </p>
+      {environment ? (
+        <div className='space-y-3'>
+          {isImport ? (
+            <h3 className='font-medium'>{environment.name}</h3>
+          ) : null}
           <EnvironmentData environment={environment} />
           <div className='flex flex-wrap gap-2'>
             {environment.auth_method !== 'api_key' ? (
@@ -522,8 +533,8 @@ export function GeminiEnvironments({
               </Button>
             </form>
           ) : null}
-        </article>
-      ))}
+        </div>
+      ) : null}
     </section>
   )
 }

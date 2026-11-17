@@ -160,7 +160,9 @@ export function KeyLimitsDialog({
       !(legacyApi && !draft.api_endpoint_id)
     : draft.group_type === 'pool'
       ? !draft.vm_pool_id
-      : draft.group_type !== 'all' && draft.allowed_vms.length === 0
+      : draft.group_type !== 'all' &&
+        draft.group_type !== 'gemini' &&
+        draft.allowed_vms.length === 0
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -202,7 +204,8 @@ export function KeyLimitsDialog({
                     category: v === 'api' ? 'api' : 'oauth',
                     api_endpoint_id: v === 'api' ? d.api_endpoint_id : '',
                     group_type:
-                      v === 'api' && d.group_type === 'pool'
+                      v === 'api' &&
+                      (d.group_type === 'pool' || d.group_type === 'gemini')
                         ? 'all'
                         : d.group_type,
                     allowed_vms: v === 'api' ? [] : d.allowed_vms,
@@ -326,7 +329,7 @@ export function KeyLimitsDialog({
             </div>
           ) : null}
           {!isApi || (legacyApi && !draft.api_endpoint_id) ? (
-            <Field label={isApi ? 'API 协议' : '分组'}>
+            <Field label={isApi ? 'API 协议' : '平台 / 分组'}>
               <Select
                 value={draft.group_type}
                 onValueChange={(v) => {
@@ -338,7 +341,10 @@ export function KeyLimitsDialog({
                     ...d,
                     group_type: group,
                     allowed_vms:
-                      isApi || group === 'all' || group === 'pool'
+                      isApi ||
+                      group === 'all' ||
+                      group === 'pool' ||
+                      group === 'gemini'
                         ? []
                         : d.allowed_vms.filter((id) => keep.has(id)),
                     ...(pools
@@ -368,6 +374,9 @@ export function KeyLimitsDialog({
                   <SelectItem value='openai'>
                     {isApi ? 'openai · OpenAI 协议' : 'openai'}
                   </SelectItem>
+                  {!isApi && pools ? (
+                    <SelectItem value='gemini'>Gemini · CRAGAnti</SelectItem>
+                  ) : null}
                 </SelectContent>
               </Select>
             </Field>
@@ -394,6 +403,11 @@ export function KeyLimitsDialog({
                   </SelectContent>
                 </Select>
               </Field>
+            ) : draft.group_type === 'gemini' ? (
+              <p className='text-xs text-muted-foreground sm:col-span-2'>
+                仅用于 Gemini 宿主机 OAuth，不使用 VM
+                或直连渠道。当前载荷尚不支持 Google OAuth 推理。
+              </p>
             ) : draft.group_type === 'all' ? (
               <p className='text-xs text-muted-foreground sm:col-span-2'>
                 all 是最高权限，不再选择 VM。
@@ -497,7 +511,8 @@ function blankDraft(): KeyLimitsDraft {
 }
 
 function groupOf(value: string | undefined): KeyGroupType {
-  if (value === 'anthropic' || value === 'openai') return value
+  if (value === 'anthropic' || value === 'openai' || value === 'gemini')
+    return value
   return 'all'
 }
 

@@ -1,4 +1,4 @@
-export type KeyGroupType = 'all' | 'anthropic' | 'openai' | 'pool'
+export type KeyGroupType = 'all' | 'anthropic' | 'openai' | 'gemini' | 'pool'
 
 export const KEY_ALLOWED_MODELS_MAX = 200
 
@@ -37,7 +37,8 @@ export function parseModelList(text: string): string[] {
 }
 
 function groupTypeOf(value: string): KeyGroupType {
-  if (value === 'anthropic' || value === 'openai') return value
+  if (value === 'anthropic' || value === 'openai' || value === 'gemini')
+    return value
   return 'all'
 }
 
@@ -56,6 +57,9 @@ export function keyLimitsPayload(
     rpm: nonNegative(draft.rpm, 'RPM'),
   }
   const isApi = draft.category === 'api'
+  if (draft.group_type === 'gemini' && (!isAdmin || isApi)) {
+    throw new Error('Gemini 平台只允许管理员创建宿主机 OAuth 密钥')
+  }
   // API 直连不经过槽位，只有管理员可以设置
   if (isAdmin) body.category = draft.category
   if (isAdmin && isApi && draft.api_endpoint_id !== undefined) {
@@ -72,10 +76,15 @@ export function keyLimitsPayload(
   } else {
     const group_type = groupTypeOf(draft.group_type)
     const allowed_vms =
-      group_type === 'all'
+      group_type === 'all' || group_type === 'gemini'
         ? []
         : [...new Set(draft.allowed_vms.map((id) => id.trim()).filter(Boolean))]
-    if (!isApi && group_type !== 'all' && allowed_vms.length === 0) {
+    if (
+      !isApi &&
+      group_type !== 'all' &&
+      group_type !== 'gemini' &&
+      allowed_vms.length === 0
+    ) {
       throw new Error('至少选择一台 VM')
     }
     body.group_type = group_type

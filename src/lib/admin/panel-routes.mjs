@@ -88,7 +88,7 @@ import { readCatalogSync, syncClaudeCatalog, syncGptCatalog } from './catalog-mo
 import { setPriceOverride, listPriceOverrides, syncModelsDev } from './price-catalog.mjs'
 import { buildPricing } from './pricing-view.mjs'
 import { publicKeyView } from './api-keys.mjs'
-import { assertVmScope, normalizeKeyScope } from './key-scope.mjs'
+import { assertVmScope, normalizeGroupType, normalizeKeyScope } from './key-scope.mjs'
 import {
   assertVmPoolExists,
   createVmPool,
@@ -2007,6 +2007,12 @@ export function createPanelHandler(ctx) {
       if (req.method === 'POST' && p === '/api/panel/api-keys') {
         const body = await readBody(req, API_KEY_BODY_MAX).catch(() => ({}))
         const ident = panelIdentity(req)
+        if (ident.role !== 'admin' && normalizeGroupType(body?.group_type) === 'gemini') {
+          return json(res, 403, {
+            ok: false,
+            error: { code: 'gemini_key_forbidden', message: '只有管理员可以生成 Gemini 密钥' },
+          })
+        }
         if (ident.role !== 'admin' && body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') {
           return json(res, 403, {
             ok: false,
@@ -2086,6 +2092,16 @@ export function createPanelHandler(ctx) {
         if (denyIfUserMissesKey(req, res, { apiKeyStore, json, keyId: id })) return true
         const body = await readBody(req, API_KEY_BODY_MAX).catch(() => ({}))
         const ident = panelIdentity(req)
+        const currentRec = apiKeyStore.getById(id)
+        if (
+          ident.role !== 'admin' &&
+          (normalizeGroupType(body?.group_type) === 'gemini' || currentRec?.group_type === 'gemini')
+        ) {
+          return json(res, 403, {
+            ok: false,
+            error: { code: 'gemini_key_forbidden', message: '只有管理员可以修改 Gemini 密钥' },
+          })
+        }
         if (ident.role !== 'admin' && body?.vm_pool_id != null && String(body.vm_pool_id).trim() !== '') {
           return json(res, 403, {
             ok: false,
@@ -2100,7 +2116,6 @@ export function createPanelHandler(ctx) {
         }
         try {
           const input = normalizePanelApiKeyInput(body || {}, req)
-          const currentRec = apiKeyStore.getById(id)
           const isApi = isApiCategory(body?.category ?? currentRec?.category)
           if (Object.hasOwn(input, 'api_endpoint_id')) {
             input.api_endpoint_id = validateKeyEndpoint(input.api_endpoint_id, isApi, currentRec?.api_endpoint_id)
@@ -2108,7 +2123,7 @@ export function createPanelHandler(ctx) {
           const scopeInput = {
             group_type: body?.group_type,
             allowed_vms: body?.allowed_vms,
-            ...(isApi ? { category: 'api' } : {}),
+            category: isApi ? 'api' : 'oauth',
           }
           if (ident.role === 'admin' && Object.prototype.hasOwnProperty.call(body || {}, 'vm_pool_id')) {
             scopeInput.vm_pool_id = body.vm_pool_id

@@ -64,7 +64,9 @@ function showGemini(available: boolean, view: 'import' | 'vm' = 'import') {
   })
   return renderToStaticMarkup(
     <QueryClientProvider client={client}>
-      <GeminiEnvironments view={view} />
+      <GeminiEnvironments
+        environmentId={view === 'vm' ? 'gemini-one' : undefined}
+      />
     </QueryClientProvider>
   )
 }
@@ -75,7 +77,7 @@ test('Gemini is unavailable without the separate host service', () => {
   expect(html).not.toContain('创建 Gemini 环境')
 })
 
-test('Gemini import displays only platform SOCKS5 and separates authorization from paid readiness', () => {
+test('Gemini import only displays eligible platform SOCKS5 and leaves inventory management to VM', () => {
   const html = showGemini(true)
   expect(html).toContain('不创建虚拟机')
   expect(html).toContain('首次创建时自动校验并安装')
@@ -83,14 +85,15 @@ test('Gemini import displays only platform SOCKS5 and separates authorization fr
   expect(html).toContain('允许的平台代理')
   expect(html).not.toContain('租户代理')
   expect(html).not.toContain('宿主直连')
-  expect(html).toContain('已授权')
-  expect(html).toContain('运行未就绪')
-  expect(html).toContain('官方计费未核实')
+  expect(html).not.toContain('fixture@example.test')
 })
 
 test('VM page renders Gemini inventory and measured data without treating the host as a VM slot', () => {
   const html = showGemini(true, 'vm')
   expect(html).toContain('Gemini 宿主环境')
+  expect(html).toContain('已授权')
+  expect(html).toContain('当前载荷未启用推理')
+  expect(html).toContain('缺少官方逐回合结算')
   expect(html).toContain('fixture@example.test')
   expect(html).toContain('fixture-project')
   expect(html).toContain('Google AI Pro')

@@ -1,3 +1,4 @@
+import type { GeminiEnvironment } from '@/features/import/gemini-environments'
 import type { WindowEstimate } from './panel-pricing'
 
 /**
@@ -247,6 +248,7 @@ export type ScheduleState = 'on' | 'off' | 'unschedulable' | 'restricted'
 
 export type Vm = {
   id: string
+  gemini?: GeminiEnvironment
   name?: string
   owner_user_id?: string | null
   /** 所在集群节点；null / 缺省 = 本机。 */

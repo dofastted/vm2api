@@ -1,6 +1,6 @@
 # Gemini 宿主机候选
 
-「导入 → Gemini」管理宿主机环境。「虚拟机」页的 Gemini 宿主环境区展示相同的数据，不创建 VM、Docker 槽、VM 调度记录或 `vm.json`。默认不启用，仅管理员可操作。服务运行在 Linux amd64 宿主，Docker 控制面通过只读挂载的 Unix socket 目录连接；ARM64 和远端集群不受支持。
+「导入 → Gemini」创建宿主机环境。「虚拟机」页将 Gemini 账号显示在同一机架和列表中，管理员可按平台筛选，并从账号详情授权或刷新。不创建 VM、Docker 槽、VM 调度记录或 `vm.json`。默认不启用，仅管理员可操作。服务运行在 Linux amd64 宿主，Docker 控制面通过只读挂载的 Unix socket 目录连接；ARM64 和远端集群不受支持。
 
 ## 启用服务与自动安装
 
@@ -19,4 +19,4 @@
 - `0.3.0-rc.1` 已用真实 `agy` 验证受管 PTY 和隔离回环上游 SSE。自动安装和数据读取可用本地夹具验证；真实 Google 换票和 OAuth 推理未验收，不标记推理就绪。
 - 可使用非 root 账号运行 `bash test/deploy/gemini-host-egress-smoke.sh /absolute/path/kin-egress`，在一次性 Linux 命名空间用 `iptables` 模拟 Docker 的默认转发丢弃策略，检查选定 SOCKS5 的透明转发、转发器退出后失败和网络清理。该测试不访问 Google 或主机代理池。
 - 有测试签名产物时，可在带 Node 和 Python 的一次性 Linux amd64 容器内以 root 运行 `bash test/deploy/gemini-host-install-smoke.sh /path/to/signed-payload /path/to/public-key`。禁用容器网络即可验证 Unix socket 启动、签名失败不建环境、首次创建自动安装和重启持久化。
-- `/v1/gemini/sessions` 命名空间保持付费关闭，鉴权后返回 `gemini_official_billing_unavailable`，不分配会话或扣费。没有逐回合可核销的官方金额，不启用 Gemini 专用调用密钥、对外推理或美元结算；不把订阅等级、Token 数或余额变化当成实扣凭证。
+- 管理员可生成 `Gemini · CRAGAnti` 专用密钥，只能访问 Gemini 会话入口及密钥查询，不会落入 Claude、Codex 或 API 直连。当前二进制的推理桥仅验收过 Gemini API Key provider；即使 Google OAuth 已授权，`/v1/gemini/sessions` 也会返回 `gemini_runtime_not_supported`，不会分配会话或扣费。对外推理还需支持 OAuth 的载荷及逐回合可核销的官方结算；不把订阅等级、Token 数或余额变化当成实扣凭证。

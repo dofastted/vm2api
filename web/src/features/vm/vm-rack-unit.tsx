@@ -10,6 +10,7 @@ import { VmAccountIdentity } from '@/features/vm/vm-account-identity'
 import {
   BLADE_STATE_CLASS,
   BladeControls,
+  GeminiSlotStatus,
   tierStyle,
   useOpenOnKey,
   VmSeats,
@@ -96,7 +97,11 @@ export const VmUnit = memo(function VmUnit({
       <div className='col-span-2 min-w-0'>
         <VmAccountIdentity vm={vm} />
       </div>
-      {state === 'live' ? (
+      {vm.gemini ? (
+        <div className='col-span-2'>
+          <GeminiSlotStatus vm={vm} />
+        </div>
+      ) : state === 'live' ? (
         <span className='flex items-end gap-1.5'>
           {vmWindows(vm).map((w) => (
             <MiniColumn key={w.key} w={w} now={now} />
